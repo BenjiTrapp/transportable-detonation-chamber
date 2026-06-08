@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Detonation Chamber</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Left Sidebar -->
+        <aside id="sidebar">
+            <div class="sidebar-header">
+                <h1 class="logo">DETONATION<br><span class="logo-sub">CHAMBER</span></h1>
+                <nav class="sidebar-tabs">
+                    <button class="tab active" data-tab="dashboard">Dashboard</button>
+                    <button class="tab" data-tab="tracing">Tracing</button>
+                    <button class="tab" data-tab="sysmon">Sysmon</button>
+                    <button class="tab" data-tab="submit">Submit</button>
+                </nav>
+            </div>
+
+            <!-- Process List -->
+            <div class="sidebar-section" id="process-list-section">
+                <div class="section-header">
+                    <span class="section-title">PROCESSES</span>
+                    <span class="badge" id="process-count">0</span>
+                </div>
+                <div id="process-list" class="process-list"></div>
+            </div>
+
+            <!-- Timeline -->
+            <div class="sidebar-section" id="timeline-section">
+                <div class="section-header">
+                    <span class="section-title">TIMELINE</span>
+                </div>
+                <div id="timeline" class="timeline"></div>
+            </div>
+
+            <!-- Compact status row -->
+            <div class="sidebar-footer" id="service-status">
+                <div class="status-item" id="status-rustinel"><span class="dot"></span> Rustinel</div>
+                <div class="status-item" id="status-sysmon"><span class="dot"></span> Sysmon</div>
+                <div class="status-item" id="status-fibratus"><span class="dot"></span> Fibratus</div>
+                <div class="status-item" id="status-agent"><span class="dot"></span> Agent</div>
+                <div class="status-item" id="status-litterbox"><span class="dot"></span> LitterBox</div>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main id="main-content">
+            <!-- Dashboard Tab -->
+            <div class="tab-content active" id="tab-dashboard">
+                <div class="content-header">
+                    <h2>Service Dashboard</h2>
+                    <div class="header-actions">
+                        <span class="header-meta" id="dashboard-time"></span>
+                        <button class="btn btn-sm" onclick="refreshStatus()">Refresh</button>
+                    </div>
+                </div>
+                <div class="dashboard-grid" id="dashboard-grid">
+                    <!-- Service cards rendered by JS -->
+                </div>
+            </div>
+
+            <!-- Tracing Tab -->
+            <div class="tab-content" id="tab-tracing">
+                <div class="content-header">
+                    <h2>Event Tracing</h2>
+                    <div class="header-actions">
+                        <select id="filter-severity" class="filter-select">
+                            <option value="">All Severities</option>
+                            <option value="critical">Critical</option>
+                            <option value="high">High</option>
+                            <option value="medium">Medium</option>
+                            <option value="low">Low</option>
+                        </select>
+                        <select id="filter-engine" class="filter-select">
+                            <option value="">All Engines</option>
+                            <option value="sigma">Sigma</option>
+                            <option value="yara">YARA</option>
+                            <option value="ioc">IOC</option>
+                        </select>
+                        <button class="btn btn-sm" onclick="refreshAlerts()">Refresh</button>
+                    </div>
+                </div>
+                <div id="alerts-table" class="events-table"></div>
+            </div>
+
+            <!-- Sysmon Tab -->
+            <div class="tab-content" id="tab-sysmon">
+                <div class="content-header">
+                    <h2>Sysmon Events</h2>
+                    <div class="header-actions">
+                        <select id="sysmon-filter-type" class="filter-select">
+                            <option value="">All Types</option>
+                            <option value="1">ProcessCreate</option>
+                            <option value="3">NetworkConnect</option>
+                            <option value="5">ProcessTerminate</option>
+                            <option value="7">ImageLoad</option>
+                            <option value="8">CreateRemoteThread</option>
+                            <option value="10">ProcessAccess</option>
+                            <option value="11">FileCreate</option>
+                            <option value="13">RegistryValueSet</option>
+                            <option value="22">DNSQuery</option>
+                        </select>
+                        <input type="text" id="sysmon-filter-pid" class="filter-input" placeholder="PID filter...">
+                        <select id="sysmon-max-events" class="filter-select">
+                            <option value="50">50 events</option>
+                            <option value="100" selected>100 events</option>
+                            <option value="200">200 events</option>
+                        </select>
+                        <button class="btn btn-sm" onclick="refreshSysmon()">Refresh</button>
+                    </div>
+                </div>
+                <div class="sysmon-stats" id="sysmon-stats"></div>
+                <div id="sysmon-table" class="events-table"></div>
+            </div>
+
+            <!-- Submit Tab -->
+            <div class="tab-content" id="tab-submit">
+                <div class="content-header">
+                    <h2>Submit Sample</h2>
+                </div>
+                <div class="submit-form">
+                    <div class="upload-zone" id="upload-zone">
+                        <div class="upload-icon">&#x2B06;</div>
+                        <p>Drop file here or click to browse</p>
+                        <input type="file" id="file-input" hidden>
+                    </div>
+                    <div class="submit-options">
+                        <label class="option-group">
+                            <span class="option-label">Target:</span>
+                            <select id="submit-target" class="filter-select">
+                                <option value="both">Both (Agent + LitterBox)</option>
+                                <option value="agent">DetonatorAgent only</option>
+                                <option value="litterbox">LitterBox only</option>
+                            </select>
+                        </label>
+                        <label class="option-group">
+                            <span class="option-label">EDR Mode:</span>
+                            <select id="submit-edr" class="filter-select">
+                                <option value="fibratus">Fibratus</option>
+                                <option value="defender">Defender</option>
+                            </select>
+                        </label>
+                        <button class="btn btn-primary" id="submit-btn" disabled>Detonate</button>
+                    </div>
+                    <div id="submit-result" class="submit-result"></div>
+                </div>
+            </div>
+        </main>
+
+        <!-- Detail Panel (slides in from right) -->
+        <div id="detail-panel" class="detail-panel hidden">
+            <div class="detail-header" id="detail-header">
+                <div class="detail-header-left">
+                    <button class="btn btn-sm" onclick="goDetailBack()">&lt; Back</button>
+                    <span class="detail-badge" id="detail-badge"></span>
+                    <span class="detail-title" id="detail-title"></span>
+                </div>
+                <div class="detail-header-right">
+                    <span class="detail-meta" id="detail-meta"></span>
+                    <button class="btn btn-sm btn-close" onclick="closeDetail()">&#x2715; close</button>
+                </div>
+            </div>
+            <div class="detail-body" id="detail-body"></div>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,39 @@
+title: Reconnaissance Commands Execution
+id: a1b2c3d4-0008-4000-a000-000000000008
+status: stable
+description: Detects common system reconnaissance commands typically executed by malware or attackers during initial access.
+author: DetonationChamber
+logsource:
+  category: process_creation
+  product: windows
+detection:
+  selection_whoami:
+    Image|endswith: '\whoami.exe'
+  selection_ipconfig:
+    Image|endswith: '\ipconfig.exe'
+  selection_systeminfo:
+    Image|endswith: '\systeminfo.exe'
+  selection_tasklist:
+    Image|endswith: '\tasklist.exe'
+  selection_netstat:
+    Image|endswith: '\netstat.exe'
+  selection_net:
+    Image|endswith: '\net.exe'
+    CommandLine|contains:
+      - 'user'
+      - 'localgroup'
+      - 'group'
+      - 'share'
+      - 'view'
+  selection_nltest:
+    Image|endswith: '\nltest.exe'
+  selection_qprocess:
+    Image|endswith: '\qprocess.exe'
+  condition: selection_whoami or selection_ipconfig or selection_systeminfo or selection_tasklist or selection_netstat or selection_net or selection_nltest or selection_qprocess
+level: low
+tags:
+  - attack.discovery
+  - attack.t1082
+  - attack.t1016
+  - attack.t1049
+  - attack.t1033

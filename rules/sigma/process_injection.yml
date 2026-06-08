@@ -1,0 +1,29 @@
+title: Process Injection Indicators
+id: a1b2c3d4-0005-4000-a000-000000000005
+status: stable
+description: Detects API calls and patterns associated with process injection techniques.
+author: DetonationChamber
+logsource:
+  category: process_creation
+  product: windows
+detection:
+  selection_hollowing:
+    Image|endswith:
+      - '\svchost.exe'
+      - '\explorer.exe'
+      - '\notepad.exe'
+      - '\dllhost.exe'
+    CommandLine: ''
+  selection_inject_tools:
+    Image|endswith:
+      - '\rundll32.exe'
+    CommandLine|contains:
+      - 'NTDLL'
+      - 'kernel32'
+      - '#'
+  condition: selection_hollowing or selection_inject_tools
+level: critical
+tags:
+  - attack.defense_evasion
+  - attack.privilege_escalation
+  - attack.t1055

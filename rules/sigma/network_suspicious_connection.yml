@@ -1,0 +1,35 @@
+title: Suspicious Network Connection by Non-Browser Process
+id: a1b2c3d4-0007-4000-a000-000000000007
+status: stable
+description: Detects outbound network connections initiated by processes that are not browsers or known update services.
+author: DetonationChamber
+logsource:
+  category: network_connection
+  product: windows
+detection:
+  selection:
+    Initiated: 'true'
+  filter_browsers:
+    Image|endswith:
+      - '\chrome.exe'
+      - '\msedge.exe'
+      - '\firefox.exe'
+      - '\iexplore.exe'
+  filter_system:
+    Image|startswith:
+      - 'C:\Windows\System32\svchost.exe'
+      - 'C:\Program Files\'
+      - 'C:\Program Files (x86)\'
+      - 'C:\Windows\SystemApps\'
+  filter_tools:
+    Image|endswith:
+      - '\python.exe'
+      - '\python3.12.exe'
+      - '\git.exe'
+      - '\rustinel.exe'
+      - '\DetonatorAgent.exe'
+  condition: selection and not (filter_browsers or filter_system or filter_tools)
+level: medium
+tags:
+  - attack.command_and_control
+  - attack.t1071

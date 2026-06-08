@@ -1,0 +1,28 @@
+title: Registry Persistence via Run Keys
+id: a1b2c3d4-0003-4000-a000-000000000003
+status: stable
+description: Detects modification of common registry Run/RunOnce keys used for persistence.
+author: DetonationChamber
+logsource:
+  category: registry_set
+  product: windows
+detection:
+  selection:
+    TargetObject|contains:
+      - '\CurrentVersion\Run\'
+      - '\CurrentVersion\RunOnce\'
+      - '\CurrentVersion\RunServices\'
+      - '\CurrentVersion\Explorer\Shell Folders'
+      - '\CurrentVersion\Explorer\User Shell Folders'
+      - '\CurrentVersion\Winlogon\Shell'
+      - '\CurrentVersion\Winlogon\Userinit'
+  filter_legitimate:
+    Image|startswith:
+      - 'C:\Windows\System32\'
+      - 'C:\Program Files\'
+      - 'C:\Program Files (x86)\'
+  condition: selection and not filter_legitimate
+level: high
+tags:
+  - attack.persistence
+  - attack.t1547.001

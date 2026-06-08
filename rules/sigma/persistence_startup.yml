@@ -1,0 +1,20 @@
+title: Suspicious File Created in Startup Folder
+id: a1b2c3d4-0006-4000-a000-000000000006
+status: stable
+description: Detects files being created in user or system startup folders.
+author: DetonationChamber
+logsource:
+  category: file_event
+  product: windows
+detection:
+  selection:
+    TargetFilename|contains:
+      - '\Start Menu\Programs\Startup\'
+      - '\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\'
+  filter_explorer:
+    Image|endswith: '\explorer.exe'
+  condition: selection and not filter_explorer
+level: high
+tags:
+  - attack.persistence
+  - attack.t1547.001

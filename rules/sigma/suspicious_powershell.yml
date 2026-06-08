@@ -1,0 +1,41 @@
+title: Suspicious PowerShell Execution Flags
+id: a1b2c3d4-0004-4000-a000-000000000004
+status: stable
+description: Detects PowerShell with encoded commands, hidden windows, or download cradles commonly used by malware.
+author: DetonationChamber
+logsource:
+  category: process_creation
+  product: windows
+detection:
+  selection_ps:
+    Image|endswith:
+      - '\powershell.exe'
+      - '\pwsh.exe'
+  selection_encoded:
+    CommandLine|contains:
+      - '-enc '
+      - '-EncodedCommand'
+      - 'FromBase64String'
+  selection_download:
+    CommandLine|contains:
+      - 'downloadstring'
+      - 'Net.WebClient'
+      - 'Start-BitsTransfer'
+      - 'Invoke-WebRequest'
+      - 'wget '
+      - 'curl '
+  selection_hidden_exec:
+    CommandLine|contains|all:
+      - '-w hidden'
+      - 'IEX'
+  filter_detonation:
+    ParentImage|contains:
+      - '\rustinel'
+      - '\DetonatorAgent'
+      - '\DetonationChamber'
+  condition: selection_ps and (selection_encoded or selection_download or selection_hidden_exec) and not filter_detonation
+level: medium
+tags:
+  - attack.execution
+  - attack.t1059.001
+  - attack.defense_evasion

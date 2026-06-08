@@ -1,0 +1,23 @@
+# Fibratus configuration for Detonation Chamber
+# This config enables JSON-formatted event log alerts (required by DetonatorAgent)
+#
+# Docs: https://fibratus.io/docs
+
+# Alert senders - write detections to Windows Event Log in JSON format
+# DetonatorAgent reads these events via its fibratus plugin
+alertsenders:
+  eventlog:
+    format: json
+    enabled: true
+
+# Move Fibratus API to port 8180 to avoid conflict with DetonatorAgent on 8080
+api:
+  transport: "localhost:8180"
+
+# YARA scanner
+yara:
+  enabled: true
+
+# Logging
+logging:
+  level: info

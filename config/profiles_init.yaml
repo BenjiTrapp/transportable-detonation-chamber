@@ -1,0 +1,12 @@
+# Detonator profiles configuration
+# Defines the DetonatorAgent targets for malware detonation
+#
+# Each profile represents a VM/system with a specific EDR installed.
+# Since this is an all-in-one setup, both profiles point to localhost
+# but use different EDR plugins via DetonatorAgent's --edr flag.
+
+localdetonator:
+  type: Live
+  comment: "Detonation Chamber - Fibratus EDR"
+  port: 8080
+  vm_ip: 127.0.0.1

@@ -1,0 +1,44 @@
+title: Living-Off-The-Land Binary Execution
+id: a1b2c3d4-0002-4000-a000-000000000002
+status: stable
+description: Detects execution of common LOLBins used by malware for download, execution, or evasion.
+author: DetonationChamber
+logsource:
+  category: process_creation
+  product: windows
+detection:
+  selection_certutil:
+    Image|endswith: '\certutil.exe'
+    CommandLine|contains:
+      - 'urlcache'
+      - 'decode'
+      - '-encode'
+      - '-decodehex'
+  selection_bitsadmin:
+    Image|endswith: '\bitsadmin.exe'
+    CommandLine|contains:
+      - '/transfer'
+      - '/download'
+  selection_mshta:
+    Image|endswith: '\mshta.exe'
+    CommandLine|contains:
+      - 'http'
+      - 'javascript'
+      - 'vbscript'
+  selection_regsvr32:
+    Image|endswith: '\regsvr32.exe'
+    CommandLine|contains:
+      - '/s /n /u /i:http'
+      - 'scrobj.dll'
+  selection_wmic:
+    Image|endswith: '\wmic.exe'
+    CommandLine|contains:
+      - 'process call create'
+      - '/format:http'
+  condition: selection_certutil or selection_bitsadmin or selection_mshta or selection_regsvr32 or selection_wmic
+level: high
+tags:
+  - attack.execution
+  - attack.defense_evasion
+  - attack.t1218
+  - attack.t1105

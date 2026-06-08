@@ -1,0 +1,77 @@
+# Rustinel configuration for Detonation Chamber
+# Docs: https://docs.rustinel.io/getting-started/
+#
+# Rule paths are set by install-detection-rules.ps1 during provisioning.
+# This file serves as the template; the script overwrites config.toml in-VM.
+
+[logging]
+level = "info"
+
+[alerts]
+output_dir = "C:\\tools\\rustinel\\logs"
+match_debug = "summary"
+
+[scanner]
+# Sigma behavioral detection rules (from rustinel-rules pack)
+sigma_enabled = true
+sigma_rules_path = "C:\\tools\\detection-rules\\rustinel-rules\\dist\\windows-advanced\\rules\\sigma"
+
+# YARA file/memory scanning (combined: rustinel-rules + Elastic protections-artifacts)
+yara_enabled = true
+yara_rules_path = "C:\\tools\\detection-rules\\yara-combined"
+
+[ioc]
+enabled = true
+hash_check_enabled = true
+max_file_size_mb = 100
+default_severity = "high"
+hashes_path = "C:\\tools\\detection-rules\\rustinel-rules\\dist\\windows-advanced\\rules\\ioc\\hashes.txt"
+ips_path = "C:\\tools\\detection-rules\\rustinel-rules\\dist\\windows-advanced\\rules\\ioc\\ips.txt"
+domains_path = "C:\\tools\\detection-rules\\rustinel-rules\\dist\\windows-advanced\\rules\\ioc\\domains.txt"
+paths_regex_path = "C:\\tools\\detection-rules\\rustinel-rules\\dist\\windows-advanced\\rules\\ioc\\paths_regex.txt"
+
+[allowlist]
+paths = [
+    "C:\\Windows\\",
+    "C:\\Program Files\\",
+    "C:\\Program Files (x86)\\",
+    "C:\\ProgramData\\chocolatey\\",
+    "C:\\tools\\rustinel\\",
+]
+
+[response]
+enabled = false
+prevention_enabled = false
+min_severity = "critical"
+channel_capacity = 128
+allowlist_images = [
+    "system",
+    "smss.exe",
+    "csrss.exe",
+    "wininit.exe",
+    "winlogon.exe",
+    "services.exe",
+    "lsass.exe",
+    "svchost.exe",
+    "explorer.exe",
+    "dwm.exe",
+    "fontdrvhost.exe",
+    "sihost.exe",
+    "DetonatorAgent.exe",
+    "dotnet.exe",
+    "python.exe",
+    "fibratus.exe",
+    "rustinel.exe",
+]
+allowlist_paths = [
+    "C:\\Windows\\",
+    "C:\\Program Files\\",
+    "C:\\Program Files (x86)\\",
+    "C:\\detonator\\",
+    "C:\\DetonatorAgent\\",
+    "C:\\tools\\detection-rules\\",
+]
+
+[reload]
+enabled = true
+debounce_ms = 2000
