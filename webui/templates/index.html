@@ -4,19 +4,31 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Detonation Chamber</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=2">
+    <link rel="stylesheet" href="/static/css/style.css?v=9">
 </head>
 <body>
+    <!-- Global loading overlay (shown on slow fetches) -->
+    <div id="loading-overlay" class="loading-overlay hidden">
+        <div class="loading-spinner-container">
+            <div class="loading-spinner"></div>
+            <span class="loading-text">Loading...</span>
+        </div>
+    </div>
     <div id="app">
         <!-- Left Sidebar -->
         <aside id="sidebar">
             <div class="sidebar-header">
-                <h1 class="logo">DETONATION<br><span class="logo-sub">CHAMBER</span></h1>
+                <div class="logo-container">
+                    <img src="/static/icon.png" alt="TDC Logo" class="logo-img">
+                    <h1 class="logo">DETONATION<br><span class="logo-sub">CHAMBER</span></h1>
+                    <button class="btn-help" onclick="openHelp()" title="Help &amp; Documentation">? Help</button>
+                </div>
                 <nav class="sidebar-tabs">
                     <button class="tab active" data-tab="dashboard">Dashboard</button>
                     <button class="tab" data-tab="tracing">Tracing</button>
                     <button class="tab" data-tab="graph">Graph</button>
                     <button class="tab" data-tab="sysmon">Sysmon</button>
+                    <button class="tab" data-tab="scanner">Scanner</button>
                     <button class="tab" data-tab="hexeditor">Hex</button>
                     <button class="tab" data-tab="submit">Submit</button>
                 </nav>
@@ -57,11 +69,28 @@
                     <h2>Service Dashboard</h2>
                     <div class="header-actions">
                         <span class="header-meta" id="dashboard-time"></span>
-                        <button class="btn btn-sm" onclick="refreshStatus()">Refresh</button>
+                        <button class="btn btn-sm" onclick="refreshDashboard()">Refresh</button>
                     </div>
                 </div>
-                <div class="dashboard-grid" id="dashboard-grid">
-                    <!-- Service cards rendered by JS -->
+                <div class="dashboard-body">
+                    <!-- Stats Strip -->
+                    <div class="dashboard-stats" id="dashboard-stats">
+                        <!-- Rendered by JS -->
+                    </div>
+                    <!-- Service Cards -->
+                    <div class="dashboard-grid" id="dashboard-grid">
+                        <!-- Service cards rendered by JS -->
+                    </div>
+                    <!-- Recent Activity -->
+                    <div class="dashboard-activity">
+                        <div class="activity-header">
+                            <h3>Recent Activity</h3>
+                            <button class="btn btn-sm" onclick="switchTab('tracing')">View All</button>
+                        </div>
+                        <div class="activity-feed" id="dashboard-activity-feed">
+                            <div class="activity-empty">No recent activity. Submit a sample to begin.</div>
+                        </div>
+                    </div>
                 </div>
             </div>
 
@@ -207,7 +236,15 @@
                         <select id="graph-layout" class="filter-select">
                             <option value="force">Force-directed</option>
                             <option value="hierarchy" selected>Hierarchical</option>
+                            <option value="radial">Radial</option>
+                            <option value="circular">Circular</option>
+                            <option value="grid">Grid</option>
                         </select>
+                        <div class="graph-zoom-controls">
+                            <button class="btn btn-sm graph-zoom-btn" onclick="graphZoomIn()" title="Zoom in">+</button>
+                            <span class="graph-zoom-level" id="graph-zoom-level">100%</span>
+                            <button class="btn btn-sm graph-zoom-btn" onclick="graphZoomOut()" title="Zoom out">&minus;</button>
+                        </div>
                         <button class="btn btn-sm" onclick="graphFitView()">Fit</button>
                         <button class="btn btn-sm" onclick="graphRefresh()">Refresh</button>
                     </div>
@@ -264,11 +301,71 @@
                 <div id="sysmon-table" class="events-table"></div>
             </div>
 
+            <!-- Scanner Tab (ThreatCheck / DefenderCheck) -->
+            <div class="tab-content" id="tab-scanner">
+                <div class="content-header">
+                    <h2>AV/AMSI Scanner</h2>
+                    <div class="header-actions">
+                        <span class="scanner-status" id="scanner-status"></span>
+                    </div>
+                </div>
+                <div class="scanner-body">
+                    <!-- File Input -->
+                    <div class="scanner-drop-zone" id="scanner-drop-zone">
+                        <div class="scanner-drop-icon">&#x1F50D;</div>
+                        <p>Drop a file to scan or <span class="hex-browse-link" onclick="document.getElementById('scanner-file-input').click()">browse</span></p>
+                        <input type="file" id="scanner-file-input" hidden>
+                        <div class="hex-path-row">
+                            <span class="hex-path-or">or enter VM path:</span>
+                            <input type="text" id="scanner-filepath" class="filter-input hex-path-input" placeholder="C:\path\to\file...">
+                        </div>
+                    </div>
+                    <!-- Options -->
+                    <div class="scanner-options">
+                        <label class="option-group">
+                            <span class="option-label">Tool:</span>
+                            <select id="scanner-tool" class="filter-select">
+                                <option value="threatcheck">ThreatCheck</option>
+                                <option value="defendercheck">DefenderCheck</option>
+                            </select>
+                        </label>
+                        <label class="option-group" id="scanner-engine-group">
+                            <span class="option-label">Engine:</span>
+                            <select id="scanner-engine" class="filter-select">
+                                <option value="Defender">Defender</option>
+                                <option value="AMSI">AMSI</option>
+                            </select>
+                        </label>
+                        <label class="option-group" id="scanner-type-group">
+                            <span class="option-label">Type:</span>
+                            <select id="scanner-type" class="filter-select">
+                                <option value="Bin">Binary</option>
+                                <option value="Script">Script</option>
+                            </select>
+                        </label>
+                        <button class="btn btn-primary" id="scanner-run-btn" onclick="runScan()">Scan</button>
+                    </div>
+                    <!-- Results -->
+                    <div class="scanner-results" id="scanner-results">
+                        <div class="scanner-placeholder">Select a file and click Scan to analyze it against Defender/AMSI signatures.</div>
+                    </div>
+                    <!-- Scan History -->
+                    <div class="scanner-history">
+                        <div class="scanner-history-header">
+                            <h3>Scan History</h3>
+                            <button class="btn btn-sm" onclick="clearScanHistory()">Clear</button>
+                        </div>
+                        <div class="scanner-history-list" id="scanner-history-list"></div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Hex Editor Tab -->
             <div class="tab-content" id="tab-hexeditor">
                 <div class="content-header">
                     <h2>Hex Editor</h2>
                     <div class="header-actions">
+                        <button class="btn btn-sm btn-accent" id="pe-analyze-btn" onclick="peAnalyze()" title="Parse PE header">PE Analysis</button>
                         <input type="number" id="hex-offset" class="filter-input hex-offset-input" placeholder="Offset" value="0" min="0">
                         <select id="hex-bytes-per-page" class="filter-select">
                             <option value="256">256 bytes</option>
@@ -328,6 +425,16 @@
                             <div class="hex-insp-row"><span class="hex-insp-label">ASCII</span><span class="hex-insp-value" id="hex-insp-ascii">--</span></div>
                             <div class="hex-insp-row"><span class="hex-insp-label">UTF-16 LE</span><span class="hex-insp-value" id="hex-insp-utf16">--</span></div>
                         </div>
+                    </div>
+                </div>
+                <!-- PE Analysis Panel -->
+                <div class="pe-panel" id="pe-panel" style="display:none;">
+                    <div class="pe-panel-header">
+                        <h3>PE Header Analysis</h3>
+                        <button class="btn btn-sm btn-close" onclick="document.getElementById('pe-panel').style.display='none'">&#x2715;</button>
+                    </div>
+                    <div class="pe-panel-body" id="pe-panel-body">
+                        <div class="pe-empty">Load a PE file and click "PE Analysis" to inspect headers.</div>
                     </div>
                 </div>
             </div>
@@ -393,6 +500,6 @@
         </div>
     </div>
 
-    <script src="/static/js/app.js?v=2"></script>
+    <script src="/static/js/app.js?v=7"></script>
 </body>
 </html>

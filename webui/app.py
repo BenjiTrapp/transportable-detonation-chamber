@@ -12,6 +12,8 @@ import os
 import glob
 import time
 import hashlib
+import math
+import struct
 import threading
 import subprocess
 from pathlib import Path
@@ -1108,7 +1110,8 @@ def proxy_litterbox(path):
 
 @app.route("/api/submit", methods=["POST"])
 def api_submit():
-    """Unified submission endpoint - sends to DetonatorAgent and optionally LitterBox."""
+    """Unified submission endpoint - sends to DetonatorAgent and optionally LitterBox.
+    When LitterBox is targeted, also triggers static + dynamic analysis automatically."""
     if "file" not in request.files:
         return jsonify({"error": "No file provided"}), 400
 
@@ -1125,6 +1128,7 @@ def api_submit():
     results["ioc_feed"] = ioc_result
 
     # Submit to DetonatorAgent
+    agent_pid = None
     if target in ("agent", "both"):
         try:
             r = requests.post(
@@ -1133,18 +1137,74 @@ def api_submit():
                 timeout=60,
             )
             results["agent"] = {"status": r.status_code, "data": r.json() if r.ok else r.text}
+            if r.ok:
+                agent_data = r.json() if r.ok else {}
+                if isinstance(agent_data, dict):
+                    agent_pid = agent_data.get("pid")
         except Exception as e:
             results["agent"] = {"status": 502, "error": str(e)}
 
-    # Submit to LitterBox
+    # Submit to LitterBox + trigger analysis
+    lb_hash = None
     if target in ("litterbox", "both"):
         try:
+            # Step 1: Upload file to LitterBox
             r = requests.post(
                 f"{LITTERBOX_API}/upload",
                 files={"file": (filename, file_bytes)},
                 timeout=120,
             )
-            results["litterbox"] = {"status": r.status_code, "data": r.json() if r.ok else r.text}
+            lb_upload = {"status": r.status_code}
+            if r.ok:
+                lb_data = r.json()
+                lb_upload["data"] = lb_data
+                lb_hash = lb_data.get("file_info", {}).get("sha256") or lb_data.get("file_info", {}).get("hash")
+            else:
+                lb_upload["error"] = r.text
+            results["litterbox"] = lb_upload
+
+            # Step 2: Trigger static analysis (non-blocking for response, but fire it)
+            if lb_hash:
+                try:
+                    rs = requests.post(
+                        f"{LITTERBOX_API}/analyze/static/{lb_hash}",
+                        timeout=180,
+                    )
+                    results["litterbox_static"] = {
+                        "status": rs.status_code,
+                        "triggered": rs.status_code < 500,
+                    }
+                except Exception as e:
+                    results["litterbox_static"] = {"status": 502, "error": str(e), "triggered": False}
+
+                # Step 3: Trigger dynamic analysis (uses PID from agent if available, else file hash)
+                if agent_pid:
+                    try:
+                        rd = requests.post(
+                            f"{LITTERBOX_API}/analyze/dynamic/{agent_pid}",
+                            timeout=300,
+                        )
+                        results["litterbox_dynamic"] = {
+                            "status": rd.status_code,
+                            "triggered": rd.status_code < 500,
+                            "target": f"pid:{agent_pid}",
+                        }
+                    except Exception as e:
+                        results["litterbox_dynamic"] = {"status": 502, "error": str(e), "triggered": False}
+                else:
+                    try:
+                        rd = requests.post(
+                            f"{LITTERBOX_API}/analyze/dynamic/{lb_hash}",
+                            timeout=300,
+                        )
+                        results["litterbox_dynamic"] = {
+                            "status": rd.status_code,
+                            "triggered": rd.status_code < 500,
+                            "target": f"hash:{lb_hash}",
+                        }
+                    except Exception as e:
+                        results["litterbox_dynamic"] = {"status": 502, "error": str(e), "triggered": False}
+
         except Exception as e:
             results["litterbox"] = {"status": 502, "error": str(e)}
 
@@ -1153,6 +1213,8 @@ def api_submit():
         "name": filename,
         "size": len(file_bytes),
         "sha256": file_sha256,
+        "litterbox_hash": lb_hash,
+        "agent_pid": agent_pid,
     }
 
     # Record submission in history
@@ -1167,6 +1229,85 @@ def api_submissions():
     with submissions_lock:
         subs = _load_submissions()
     return jsonify(subs)
+
+
+@app.route("/api/detonation/results")
+def api_detonation_results():
+    """Poll for combined detonation results: LitterBox static/dynamic + Fibratus/Rustinel alerts.
+    Query params: sha256 (file hash), pid (agent PID), litterbox_hash (LB hash if different)."""
+    sha256 = request.args.get("sha256", "")
+    pid = request.args.get("pid", "")
+    lb_hash = request.args.get("litterbox_hash", "") or sha256
+
+    results = {"sha256": sha256, "pid": pid, "ready": {}}
+
+    # --- LitterBox Static Results ---
+    if lb_hash:
+        try:
+            r = requests.get(f"{LITTERBOX_API}/api/results/static/{lb_hash}", timeout=5)
+            if r.status_code == 200:
+                results["litterbox_static"] = r.json()
+                results["ready"]["static"] = True
+            else:
+                results["ready"]["static"] = False
+        except Exception:
+            results["ready"]["static"] = False
+
+    # --- LitterBox Dynamic Results ---
+    if pid:
+        try:
+            r = requests.get(f"{LITTERBOX_API}/api/results/dynamic/{pid}", timeout=5)
+            if r.status_code == 200:
+                results["litterbox_dynamic"] = r.json()
+                results["ready"]["dynamic"] = True
+            else:
+                results["ready"]["dynamic"] = False
+        except Exception:
+            results["ready"]["dynamic"] = False
+    elif lb_hash:
+        try:
+            r = requests.get(f"{LITTERBOX_API}/api/results/dynamic/{lb_hash}", timeout=5)
+            if r.status_code == 200:
+                results["litterbox_dynamic"] = r.json()
+                results["ready"]["dynamic"] = True
+            else:
+                results["ready"]["dynamic"] = False
+        except Exception:
+            results["ready"]["dynamic"] = False
+
+    # --- LitterBox File Info (includes basic PE info, hashes) ---
+    if lb_hash:
+        try:
+            r = requests.get(f"{LITTERBOX_API}/api/results/info/{lb_hash}", timeout=5)
+            if r.status_code == 200:
+                results["litterbox_info"] = r.json()
+        except Exception:
+            pass
+
+    # --- Fibratus / Rustinel Alerts matching this detonation ---
+    matching_alerts = []
+    search_terms = set()
+    if pid:
+        search_terms.add(str(pid))
+    if sha256:
+        search_terms.add(sha256[:16])  # Partial match on hash prefix
+
+    for alert in events_store.get("alerts", []):
+        # Match by PID
+        alert_pid = str(alert.get("process", {}).get("pid", ""))
+        alert_hash = alert.get("file", {}).get("hash", {}).get("sha256", "") or ""
+        alert_name = alert.get("process", {}).get("name", "") or ""
+
+        if pid and alert_pid == str(pid):
+            matching_alerts.append(alert)
+        elif sha256 and sha256.lower() in alert_hash.lower():
+            matching_alerts.append(alert)
+
+    results["fibratus_alerts"] = matching_alerts[:50]
+    results["fibratus_alert_count"] = len(matching_alerts)
+    results["ready"]["fibratus"] = len(matching_alerts) > 0
+
+    return jsonify(results)
 
 
 def _add_hash_to_ioc(sha256_hash, filename=""):
@@ -1366,6 +1507,410 @@ def api_file_hex_write():
         })
     except (IOError, OSError) as e:
         return jsonify({"error": str(e)}), 500
+
+
+# --- ThreatCheck / DefenderCheck Integration ---
+THREATCHECK_EXE = r"C:\tools\ThreatCheck\bin\ThreatCheck.exe"
+DEFENDERCHECK_EXE = r"C:\tools\DefenderCheck\bin\DefenderCheck.exe"
+
+
+@app.route("/api/scan/threatcheck", methods=["POST"])
+def api_scan_threatcheck():
+    """Run ThreatCheck on an uploaded file or a VM path."""
+    engine = request.form.get("engine", "Defender")  # Defender or AMSI
+    file_type = request.form.get("type", "Bin")  # Bin or Script
+    filepath = request.form.get("path", "")
+
+    if not os.path.isfile(THREATCHECK_EXE):
+        return jsonify({"error": "ThreatCheck not installed"}), 500
+
+    # If file uploaded, save to temp
+    if "file" in request.files:
+        file = request.files["file"]
+        file_bytes = file.read()
+        import tempfile
+        temp_dir = os.path.join(tempfile.gettempdir(), "scan_uploads")
+        os.makedirs(temp_dir, exist_ok=True)
+        filepath = os.path.join(temp_dir, file.filename or "scan_target")
+        with open(filepath, "wb") as f:
+            f.write(file_bytes)
+    elif not filepath or not os.path.isfile(filepath):
+        return jsonify({"error": "No file provided or path not found"}), 400
+
+    try:
+        args = [THREATCHECK_EXE, "-f", filepath, "-e", engine]
+        if file_type == "Script":
+            args.extend(["-t", "Script"])
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=120,
+            cwd=os.path.dirname(THREATCHECK_EXE)
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        detected = "Identified" in output or "DETECTED" in output.upper()
+        clean = "No threat found" in output
+
+        return jsonify({
+            "tool": "ThreatCheck",
+            "engine": engine,
+            "file_type": file_type,
+            "filepath": filepath,
+            "output": output.strip(),
+            "detected": detected,
+            "clean": clean,
+            "exit_code": result.returncode,
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "ThreatCheck timed out (120s)"}), 504
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/scan/defendercheck", methods=["POST"])
+def api_scan_defendercheck():
+    """Run DefenderCheck on an uploaded file or a VM path."""
+    filepath = request.form.get("path", "")
+
+    if not os.path.isfile(DEFENDERCHECK_EXE):
+        return jsonify({"error": "DefenderCheck not installed"}), 500
+
+    # If file uploaded, save to temp
+    if "file" in request.files:
+        file = request.files["file"]
+        file_bytes = file.read()
+        import tempfile
+        temp_dir = os.path.join(tempfile.gettempdir(), "scan_uploads")
+        os.makedirs(temp_dir, exist_ok=True)
+        filepath = os.path.join(temp_dir, file.filename or "scan_target")
+        with open(filepath, "wb") as f:
+            f.write(file_bytes)
+    elif not filepath or not os.path.isfile(filepath):
+        return jsonify({"error": "No file provided or path not found"}), 400
+
+    try:
+        result = subprocess.run(
+            [DEFENDERCHECK_EXE, filepath],
+            capture_output=True, text=True, timeout=120,
+            cwd=os.path.dirname(DEFENDERCHECK_EXE)
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        detected = "Identified" in output or "detected" in output.lower()
+        clean = "No threat found" in output
+
+        return jsonify({
+            "tool": "DefenderCheck",
+            "filepath": filepath,
+            "output": output.strip(),
+            "detected": detected,
+            "clean": clean,
+            "exit_code": result.returncode,
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "DefenderCheck timed out (120s)"}), 504
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/scan/status")
+def api_scan_status():
+    """Return availability status of scanning tools."""
+    return jsonify({
+        "threatcheck": {
+            "installed": os.path.isfile(THREATCHECK_EXE),
+            "path": THREATCHECK_EXE,
+        },
+        "defendercheck": {
+            "installed": os.path.isfile(DEFENDERCHECK_EXE),
+            "path": DEFENDERCHECK_EXE,
+        },
+    })
+
+
+# --- PE Analysis ---
+# Suspicious API calls grouped by category (IOC indicators)
+SUSPICIOUS_IMPORTS = {
+    "process_injection": [
+        "VirtualAllocEx", "WriteProcessMemory", "CreateRemoteThread",
+        "NtCreateThreadEx", "QueueUserAPC", "SetThreadContext",
+        "NtUnmapViewOfSection", "NtWriteVirtualMemory", "RtlCreateUserThread",
+    ],
+    "process_hollowing": [
+        "NtUnmapViewOfSection", "ZwUnmapViewOfSection", "NtWriteVirtualMemory",
+    ],
+    "code_injection": [
+        "VirtualAlloc", "VirtualProtect", "VirtualProtectEx",
+        "NtProtectVirtualMemory", "WriteProcessMemory",
+    ],
+    "privilege_escalation": [
+        "AdjustTokenPrivileges", "OpenProcessToken", "LookupPrivilegeValue",
+        "ImpersonateLoggedOnUser", "DuplicateToken",
+    ],
+    "defense_evasion": [
+        "NtSetInformationThread", "CheckRemoteDebuggerPresent",
+        "IsDebuggerPresent", "OutputDebugString", "NtQueryInformationProcess",
+        "GetTickCount", "QueryPerformanceCounter",
+    ],
+    "persistence": [
+        "RegSetValueEx", "RegCreateKeyEx", "CreateService",
+        "StartServiceCtrlDispatcher", "RegisterServiceCtrlHandler",
+    ],
+    "credential_access": [
+        "CredEnumerate", "CryptUnprotectData", "LsaEnumerateLogonSessions",
+        "SamIConnect", "SamrQueryInformationUser",
+    ],
+    "networking": [
+        "InternetOpen", "InternetOpenUrl", "HttpSendRequest",
+        "URLDownloadToFile", "WinHttpOpen", "WinHttpConnect",
+        "WSAStartup", "connect", "send", "recv", "socket",
+    ],
+    "crypto": [
+        "CryptEncrypt", "CryptDecrypt", "CryptCreateHash",
+        "CryptHashData", "CryptDeriveKey", "CryptGenKey",
+        "BCryptEncrypt", "BCryptDecrypt",
+    ],
+    "shellcode": [
+        "GetProcAddress", "LoadLibrary", "LoadLibraryA", "LoadLibraryW",
+        "GetModuleHandle", "GetModuleHandleA",
+    ],
+}
+
+# Known packer/protector section names
+PACKER_SECTIONS = {
+    "UPX0": "UPX", "UPX1": "UPX", "UPX2": "UPX",
+    ".aspack": "ASPack", ".adata": "ASPack",
+    ".nsp0": "NsPack", ".nsp1": "NsPack",
+    ".themida": "Themida", ".tls": "Possible Themida/VMProtect",
+    ".vmp0": "VMProtect", ".vmp1": "VMProtect", ".vmp2": "VMProtect",
+    "pec": "PECompact", "pec2": "PECompact",
+    ".petite": "Petite", ".shrink": "Shrinker",
+    ".enigma1": "Enigma Protector", ".enigma2": "Enigma Protector",
+    "MEW": "MEW Packer", ".mpress1": "MPRESS", ".mpress2": "MPRESS",
+    ".rpcsscn": "RPCScan", ".packed": "Generic Packer",
+    ".RLPack": "RLPack",
+}
+
+ENTROPY_HIGH_THRESHOLD = 7.0  # Shannon entropy indicating encrypted/compressed
+ENTROPY_WARN_THRESHOLD = 6.5
+
+
+def calculate_entropy(data):
+    """Calculate Shannon entropy of a byte sequence."""
+    if not data:
+        return 0.0
+    freq = [0] * 256
+    for byte in data:
+        freq[byte] += 1
+    length = len(data)
+    entropy = 0.0
+    for count in freq:
+        if count > 0:
+            p = count / length
+            entropy -= p * math.log2(p)
+    return round(entropy, 4)
+
+
+@app.route("/api/file/pe")
+def api_file_pe():
+    """Parse PE header and return structured analysis with IOC indicators."""
+    filepath = request.args.get("path", "")
+    if not filepath:
+        return jsonify({"error": "No path specified"}), 400
+
+    norm_path = os.path.normpath(filepath)
+    if not os.path.isfile(norm_path):
+        return jsonify({"error": "File not found"}), 404
+
+    try:
+        import pefile
+    except ImportError:
+        return jsonify({"error": "pefile module not installed"}), 500
+
+    try:
+        pe = pefile.PE(norm_path, fast_load=False)
+    except pefile.PEFormatError as e:
+        return jsonify({"error": f"Not a valid PE file: {e}"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    result = {"valid": True, "path": filepath}
+
+    # --- DOS Header ---
+    result["dos_header"] = {
+        "e_magic": hex(pe.DOS_HEADER.e_magic),
+        "e_lfanew": hex(pe.DOS_HEADER.e_lfanew),
+    }
+
+    # --- File Header ---
+    machine_map = {0x14c: "i386", 0x8664: "AMD64", 0xaa64: "ARM64", 0x1c0: "ARM"}
+    fh = pe.FILE_HEADER
+    result["file_header"] = {
+        "machine": machine_map.get(fh.Machine, hex(fh.Machine)),
+        "machine_raw": hex(fh.Machine),
+        "num_sections": fh.NumberOfSections,
+        "timestamp": fh.TimeDateStamp,
+        "timestamp_utc": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(fh.TimeDateStamp)),
+        "characteristics": hex(fh.Characteristics),
+        "is_dll": bool(fh.Characteristics & 0x2000),
+        "is_exe": bool(fh.Characteristics & 0x0002),
+        "is_large_address_aware": bool(fh.Characteristics & 0x0020),
+        "symbols_stripped": bool(fh.Characteristics & 0x0008),
+    }
+
+    # --- Optional Header ---
+    oh = pe.OPTIONAL_HEADER
+    result["optional_header"] = {
+        "magic": hex(oh.Magic),
+        "is_pe32_plus": oh.Magic == 0x20b,
+        "linker_version": f"{oh.MajorLinkerVersion}.{oh.MinorLinkerVersion}",
+        "entry_point": hex(oh.AddressOfEntryPoint),
+        "image_base": hex(oh.ImageBase),
+        "section_alignment": oh.SectionAlignment,
+        "file_alignment": oh.FileAlignment,
+        "os_version": f"{oh.MajorOperatingSystemVersion}.{oh.MinorOperatingSystemVersion}",
+        "subsystem": oh.Subsystem,
+        "subsystem_name": pefile.SUBSYSTEM_TYPE.get(oh.Subsystem, "Unknown"),
+        "dll_characteristics": hex(oh.DllCharacteristics),
+        "aslr": bool(oh.DllCharacteristics & 0x0040),
+        "dep_nx": bool(oh.DllCharacteristics & 0x0100),
+        "no_seh": bool(oh.DllCharacteristics & 0x0400),
+        "cfg": bool(oh.DllCharacteristics & 0x4000),
+        "size_of_image": oh.SizeOfImage,
+        "size_of_headers": oh.SizeOfHeaders,
+        "checksum": hex(oh.CheckSum),
+        "checksum_valid": pe.verify_checksum(),
+    }
+
+    # --- Sections with entropy ---
+    sections = []
+    file_data = open(norm_path, "rb").read()
+    total_entropy = calculate_entropy(file_data)
+    result["total_entropy"] = total_entropy
+
+    for section in pe.sections:
+        sec_name = section.Name.decode("utf-8", errors="replace").rstrip("\x00")
+        sec_data = section.get_data()
+        entropy = calculate_entropy(sec_data)
+        sec_info = {
+            "name": sec_name,
+            "virtual_address": hex(section.VirtualAddress),
+            "virtual_size": section.Misc_VirtualSize,
+            "raw_size": section.SizeOfRawData,
+            "raw_offset": hex(section.PointerToRawData),
+            "characteristics": hex(section.Characteristics),
+            "executable": bool(section.Characteristics & 0x20000000),
+            "writable": bool(section.Characteristics & 0x80000000),
+            "readable": bool(section.Characteristics & 0x40000000),
+            "entropy": entropy,
+            "entropy_status": "high" if entropy >= ENTROPY_HIGH_THRESHOLD else "warn" if entropy >= ENTROPY_WARN_THRESHOLD else "normal",
+            "size_ratio": round(section.SizeOfRawData / max(section.Misc_VirtualSize, 1), 3) if section.Misc_VirtualSize > 0 else 0,
+        }
+        # Check for packer section names
+        for packer_name, packer_label in PACKER_SECTIONS.items():
+            if sec_name.lower().startswith(packer_name.lower()):
+                sec_info["packer_indicator"] = packer_label
+                break
+        # Flag if section is both writable and executable (RWX)
+        if sec_info["executable"] and sec_info["writable"]:
+            sec_info["rwx_warning"] = True
+        sections.append(sec_info)
+
+    result["sections"] = sections
+
+    # --- Imports analysis ---
+    imports = []
+    suspicious_found = {}
+    if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
+        for entry in pe.DIRECTORY_ENTRY_IMPORT:
+            dll_name = entry.dll.decode("utf-8", errors="replace")
+            funcs = []
+            for imp in entry.imports:
+                func_name = imp.name.decode("utf-8", errors="replace") if imp.name else f"Ordinal_{imp.ordinal}"
+                funcs.append({"name": func_name, "address": hex(imp.address) if imp.address else None})
+                # Check against suspicious list
+                for category, api_list in SUSPICIOUS_IMPORTS.items():
+                    if func_name in api_list:
+                        if category not in suspicious_found:
+                            suspicious_found[category] = []
+                        suspicious_found[category].append({"dll": dll_name, "function": func_name})
+            imports.append({"dll": dll_name, "functions": funcs, "count": len(funcs)})
+
+    result["imports"] = imports
+    result["suspicious_imports"] = suspicious_found
+    result["import_count"] = sum(i["count"] for i in imports)
+    result["dll_count"] = len(imports)
+
+    # --- Exports ---
+    exports = []
+    if hasattr(pe, "DIRECTORY_ENTRY_EXPORT"):
+        for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
+            exp_name = exp.name.decode("utf-8", errors="replace") if exp.name else f"Ordinal_{exp.ordinal}"
+            exports.append({"name": exp_name, "ordinal": exp.ordinal, "address": hex(exp.address)})
+    result["exports"] = exports
+
+    # --- Resources (brief) ---
+    resources = []
+    if hasattr(pe, "DIRECTORY_ENTRY_RESOURCE"):
+        def _walk_resources(entries, level=0):
+            for entry in entries:
+                r = {"id": entry.id, "name": entry.name.string.decode() if entry.name else None}
+                if hasattr(entry, "directory"):
+                    _walk_resources(entry.directory.entries, level + 1)
+                else:
+                    data_entry = entry.data
+                    r["size"] = data_entry.struct.Size
+                    r["offset"] = hex(data_entry.struct.OffsetToData)
+                    r["entropy"] = calculate_entropy(
+                        pe.get_data(data_entry.struct.OffsetToData, data_entry.struct.Size)
+                    )
+                    resources.append(r)
+        _walk_resources(pe.DIRECTORY_ENTRY_RESOURCE.entries)
+    result["resources"] = resources[:50]  # Cap at 50
+
+    # --- TLS callbacks (anti-debug indicator) ---
+    tls_callbacks = []
+    if hasattr(pe, "DIRECTORY_ENTRY_TLS"):
+        tls = pe.DIRECTORY_ENTRY_TLS
+        if tls.struct.AddressOfCallBacks:
+            callback_rva = tls.struct.AddressOfCallBacks - pe.OPTIONAL_HEADER.ImageBase
+            try:
+                idx = 0
+                while True:
+                    cb_addr = pe.get_dword_at_rva(callback_rva + idx * 4)
+                    if cb_addr == 0:
+                        break
+                    tls_callbacks.append(hex(cb_addr))
+                    idx += 1
+                    if idx > 20:
+                        break
+            except Exception:
+                pass
+    result["tls_callbacks"] = tls_callbacks
+
+    # --- IOC Summary / Flags ---
+    flags = []
+    if suspicious_found:
+        for cat, items in suspicious_found.items():
+            flags.append({"type": "suspicious_import", "category": cat, "severity": "high" if cat in ("process_injection", "process_hollowing", "credential_access") else "medium", "detail": f"{len(items)} suspicious API(s) in category '{cat}'"})
+    for sec in sections:
+        if sec.get("rwx_warning"):
+            flags.append({"type": "rwx_section", "severity": "high", "detail": f"Section '{sec['name']}' is Read+Write+Execute"})
+        if sec["entropy_status"] == "high":
+            flags.append({"type": "high_entropy", "severity": "medium", "detail": f"Section '{sec['name']}' entropy {sec['entropy']:.2f} (encrypted/packed)"})
+        if sec.get("packer_indicator"):
+            flags.append({"type": "packer", "severity": "medium", "detail": f"Section '{sec['name']}' matches packer: {sec['packer_indicator']}"})
+    if tls_callbacks:
+        flags.append({"type": "tls_callback", "severity": "medium", "detail": f"{len(tls_callbacks)} TLS callback(s) detected (possible anti-debug)"})
+    if not result["optional_header"]["aslr"]:
+        flags.append({"type": "no_aslr", "severity": "low", "detail": "ASLR not enabled"})
+    if not result["optional_header"]["dep_nx"]:
+        flags.append({"type": "no_dep", "severity": "low", "detail": "DEP/NX not enabled"})
+    if total_entropy >= ENTROPY_HIGH_THRESHOLD:
+        flags.append({"type": "high_total_entropy", "severity": "medium", "detail": f"Overall file entropy {total_entropy:.2f} suggests packing/encryption"})
+
+    result["flags"] = flags
+    result["flag_count"] = {"high": len([f for f in flags if f["severity"] == "high"]), "medium": len([f for f in flags if f["severity"] == "medium"]), "low": len([f for f in flags if f["severity"] == "low"])}
+
+    pe.close()
+    return jsonify(result)
 
 
 # --- Main ---

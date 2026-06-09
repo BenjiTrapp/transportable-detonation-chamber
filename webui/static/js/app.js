@@ -26,13 +26,62 @@ let state = {
     hexSelectedByte: -1,
 };
 
+// --- Loading Overlay ---
+const LoadingSpinner = (() => {
+    let activeRequests = 0;
+    let showTimer = null;
+    const DELAY_MS = 300; // Only show spinner if loading takes longer than this
+
+    function getOverlay() {
+        return document.getElementById('loading-overlay');
+    }
+
+    function show() {
+        const overlay = getOverlay();
+        if (overlay) overlay.classList.remove('hidden');
+    }
+
+    function hide() {
+        const overlay = getOverlay();
+        if (overlay) overlay.classList.add('hidden');
+    }
+
+    return {
+        start() {
+            activeRequests++;
+            if (activeRequests === 1) {
+                showTimer = setTimeout(show, DELAY_MS);
+            }
+        },
+        stop() {
+            activeRequests = Math.max(0, activeRequests - 1);
+            if (activeRequests === 0) {
+                clearTimeout(showTimer);
+                showTimer = null;
+                hide();
+            }
+        },
+        /** Wrap a fetch/promise - shows spinner if it takes >300ms */
+        async wrap(promiseOrFn) {
+            this.start();
+            try {
+                const result = await (typeof promiseOrFn === 'function' ? promiseOrFn() : promiseOrFn);
+                return result;
+            } finally {
+                this.stop();
+            }
+        }
+    };
+})();
+
 // --- Initialization ---
 document.addEventListener('DOMContentLoaded', () => {
     initTabs();
     initUpload();
     initHexDropZone();
-    initRtraceTabs();
+    initScannerDropZone();
     initGraphControls();
+    initRtraceTabs();
     refreshAll();
     setInterval(refreshAlerts, 5000);
     setInterval(refreshDashboard, 10000);
@@ -71,7 +120,9 @@ function switchTab(tabName) {
 
 // --- Data fetching ---
 async function refreshAll() {
-    await Promise.all([refreshAlerts(), refreshProcesses(), refreshDashboard()]);
+    await LoadingSpinner.wrap(
+        Promise.all([refreshAlerts(), refreshProcesses(), refreshDashboard()])
+    );
 }
 
 async function refreshDashboard() {
@@ -142,10 +193,69 @@ async function refreshStatus() {
 // --- Dashboard Rendering ---
 function renderDashboard() {
     const container = document.getElementById('dashboard-grid');
+    const statsContainer = document.getElementById('dashboard-stats');
+    const activityFeed = document.getElementById('dashboard-activity-feed');
     if (!container) return;
 
     const status = state.serviceStatus;
     const rustinel = state.rustinelInfo || {};
+    const alerts = state.alerts || [];
+
+    // --- Stats Strip ---
+    if (statsContainer) {
+        const totalAlerts = alerts.length;
+        const processCount = Object.keys(state.processes || {}).length;
+        const servicesOnline = [
+            status.rustinel?.online,
+            status.detonator_agent?.online,
+            status.litterbox?.online,
+            status.sysmon?.online,
+        ].filter(Boolean).length;
+        const highSev = alerts.filter(a => a.severity === 'high' || a.severity === 'critical').length;
+        const medSev = alerts.filter(a => a.severity === 'medium').length;
+        const lowSev = alerts.filter(a => a.severity === 'low' || a.severity === 'info').length;
+        const rulesLoaded = (rustinel.rules?.sigma || 0) + (rustinel.rules?.yara || 0);
+
+        statsContainer.innerHTML = `
+            <div class="stat-card stat-alerts">
+                <div class="stat-value">${totalAlerts}</div>
+                <div class="stat-label">TOTAL ALERTS</div>
+                <div class="stat-breakdown">
+                    ${highSev ? `<span class="stat-tag high">${highSev} high</span>` : ''}
+                    ${medSev ? `<span class="stat-tag med">${medSev} med</span>` : ''}
+                    ${lowSev ? `<span class="stat-tag low">${lowSev} low</span>` : ''}
+                </div>
+            </div>
+            <div class="stat-card stat-processes">
+                <div class="stat-value">${processCount}</div>
+                <div class="stat-label">PROCESSES TRACKED</div>
+                <div class="stat-breakdown"><span class="stat-tag dim">via ETW telemetry</span></div>
+            </div>
+            <div class="stat-card stat-services">
+                <div class="stat-value">${servicesOnline}<span class="stat-value-sub">/5</span></div>
+                <div class="stat-label">SERVICES ONLINE</div>
+                <div class="stat-breakdown"><span class="stat-tag ${servicesOnline >= 4 ? 'ok' : 'warn'}">${servicesOnline >= 4 ? 'Healthy' : 'Degraded'}</span></div>
+            </div>
+            <div class="stat-card stat-rules">
+                <div class="stat-value">${rulesLoaded}</div>
+                <div class="stat-label">DETECTION RULES</div>
+                <div class="stat-breakdown">
+                    <span class="stat-tag dim">${rustinel.rules?.sigma || 0} sigma</span>
+                    <span class="stat-tag dim">${rustinel.rules?.yara || 0} yara</span>
+                </div>
+            </div>
+            <div class="stat-card stat-tools">
+                <div class="stat-value">2</div>
+                <div class="stat-label">SCANNER TOOLS</div>
+                <div class="stat-breakdown">
+                    <span class="stat-tag dim">ThreatCheck</span>
+                    <span class="stat-tag dim">DefenderCheck</span>
+                </div>
+            </div>
+        `;
+    }
+
+    // --- Service Cards ---
     const cards = [];
 
     // Rustinel Card
@@ -240,7 +350,69 @@ function renderDashboard() {
         </div>
     `);
 
+    // Fibratus Card
+    const fOnline = status.fibratus?.online || rOnline; // assumes running if Rustinel is
+    cards.push(`
+        <div class="service-card fibratus-card ${fOnline ? '' : 'offline'}">
+            <div class="service-card-glow"></div>
+            <div class="service-card-header">
+                <div class="service-card-title"><div class="service-icon fibratus">F</div><h3>Fibratus</h3></div>
+                <span class="service-status-badge ${fOnline ? 'online' : 'offline'}">${fOnline ? 'Online' : 'Offline'}</span>
+            </div>
+            <div class="service-card-desc">Kernel-level ETW consumer. Captures process, thread, file, registry, network events.</div>
+            <div class="service-card-metrics">
+                <div class="service-metric"><div class="service-metric-value">${fOnline ? '8180' : '--'}</div><div class="service-metric-label">PORT</div></div>
+                <div class="service-metric"><div class="service-metric-value">Kernel</div><div class="service-metric-label">LEVEL</div></div>
+                <div class="service-metric"><div class="service-metric-value">v3.0</div><div class="service-metric-label">VERSION</div></div>
+            </div>
+        </div>
+    `);
+
+    // Scanner Tools Card
+    cards.push(`
+        <div class="service-card scanner-card" onclick="switchTab('scanner')">
+            <div class="service-card-glow"></div>
+            <div class="service-card-header">
+                <div class="service-card-title"><div class="service-icon scanner">T</div><h3>AV/AMSI Scanner</h3></div>
+                <span class="service-status-badge online">Ready</span>
+            </div>
+            <div class="service-card-desc">ThreatCheck + DefenderCheck. Pinpoint exact bytes flagged by Defender/AMSI signatures.</div>
+            <div class="service-card-metrics">
+                <div class="service-metric"><div class="service-metric-value">TC</div><div class="service-metric-label">THREATCHECK</div></div>
+                <div class="service-metric"><div class="service-metric-value">DC</div><div class="service-metric-label">DEFENDERCHK</div></div>
+                <div class="service-metric"><div class="service-metric-value">AMSI</div><div class="service-metric-label">ENGINE</div></div>
+            </div>
+            <div class="service-card-actions">
+                <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('scanner')">Open Scanner</button>
+            </div>
+        </div>
+    `);
+
     container.innerHTML = cards.join('');
+
+    // --- Recent Activity Feed ---
+    if (activityFeed) {
+        if (alerts.length === 0) {
+            activityFeed.innerHTML = '<div class="activity-empty">No recent activity. Submit a sample to begin.</div>';
+        } else {
+            const recent = alerts.slice(0, 8);
+            let html = '';
+            recent.forEach(alert => {
+                const ts = alert.timestamp ? new Date(alert.timestamp).toLocaleTimeString('en-GB', {hour12:false}) : '--';
+                const sevClass = (alert.severity === 'high' || alert.severity === 'critical') ? 'sev-high' : alert.severity === 'medium' ? 'sev-med' : 'sev-low';
+                const ruleName = alert.rule_name || alert.name || 'Unknown Rule';
+                const proc = alert.process_name || '';
+                const pid = alert.pid || '';
+                html += `<div class="activity-entry ${sevClass}">`;
+                html += `<span class="activity-time">${ts}</span>`;
+                html += `<span class="activity-sev">${escapeHtml((alert.severity || 'info').toUpperCase())}</span>`;
+                html += `<span class="activity-rule">${escapeHtml(ruleName)}</span>`;
+                html += proc ? `<span class="activity-proc">${escapeHtml(proc)}${pid ? ' (' + pid + ')' : ''}</span>` : '';
+                html += `</div>`;
+            });
+            activityFeed.innerHTML = html;
+        }
+    }
 }
 
 // =============================================
@@ -902,6 +1074,174 @@ function clearAllTracing() {
 }
 
 // =============================================
+// AV/AMSI SCANNER (ThreatCheck / DefenderCheck)
+// =============================================
+
+let scanHistory = [];
+let scannerFile = null;
+
+function initScannerDropZone() {
+    const zone = document.getElementById('scanner-drop-zone');
+    const input = document.getElementById('scanner-file-input');
+    if (!zone || !input) return;
+
+    zone.addEventListener('dragover', e => {
+        e.preventDefault();
+        zone.classList.add('dragover');
+    });
+    zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+    zone.addEventListener('drop', e => {
+        e.preventDefault();
+        zone.classList.remove('dragover');
+        if (e.dataTransfer.files.length) {
+            scannerFile = e.dataTransfer.files[0];
+            zone.classList.add('has-file');
+            zone.querySelector('p').innerHTML = `<strong>${escapeHtml(scannerFile.name)}</strong> (${formatSize(scannerFile.size)}) <span class="hex-change-file" onclick="scannerResetDrop()">change</span>`;
+        }
+    });
+    input.addEventListener('change', () => {
+        if (input.files.length) {
+            scannerFile = input.files[0];
+            zone.classList.add('has-file');
+            zone.querySelector('p').innerHTML = `<strong>${escapeHtml(scannerFile.name)}</strong> (${formatSize(scannerFile.size)}) <span class="hex-change-file" onclick="scannerResetDrop()">change</span>`;
+            input.value = '';
+        }
+    });
+
+    // Show/hide engine/type options based on tool selection
+    document.getElementById('scanner-tool').addEventListener('change', () => {
+        const tool = document.getElementById('scanner-tool').value;
+        document.getElementById('scanner-engine-group').style.display = tool === 'threatcheck' ? '' : 'none';
+        document.getElementById('scanner-type-group').style.display = tool === 'threatcheck' ? '' : 'none';
+    });
+}
+
+function scannerResetDrop() {
+    scannerFile = null;
+    const zone = document.getElementById('scanner-drop-zone');
+    zone.classList.remove('has-file');
+    zone.querySelector('p').innerHTML = 'Drop a file to scan or <span class="hex-browse-link" onclick="document.getElementById(\'scanner-file-input\').click()">browse</span>';
+}
+
+async function runScan() {
+    const tool = document.getElementById('scanner-tool').value;
+    const engine = document.getElementById('scanner-engine').value;
+    const fileType = document.getElementById('scanner-type').value;
+    const pathInput = document.getElementById('scanner-filepath').value.trim();
+    const resultsEl = document.getElementById('scanner-results');
+    const btn = document.getElementById('scanner-run-btn');
+
+    if (!scannerFile && !pathInput) {
+        resultsEl.innerHTML = '<div class="scanner-error">Please select a file or enter a VM path.</div>';
+        return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = 'Scanning...';
+    resultsEl.innerHTML = '<div class="scanner-running">Running scan... This may take up to 2 minutes.</div>';
+
+    const formData = new FormData();
+    if (scannerFile) {
+        formData.append('file', scannerFile);
+    } else {
+        formData.append('path', pathInput);
+    }
+
+    let url;
+    if (tool === 'threatcheck') {
+        formData.append('engine', engine);
+        formData.append('type', fileType);
+        url = '/api/scan/threatcheck';
+    } else {
+        url = '/api/scan/defendercheck';
+    }
+
+    try {
+        LoadingSpinner.start();
+        const resp = await fetch(url, { method: 'POST', body: formData });
+        const data = await resp.json();
+
+        if (data.error) {
+            resultsEl.innerHTML = `<div class="scanner-error">Error: ${escapeHtml(data.error)}</div>`;
+        } else {
+            renderScanResult(data, resultsEl);
+            // Add to history
+            scanHistory.unshift({
+                ...data,
+                timestamp: new Date().toISOString(),
+                filename: scannerFile ? scannerFile.name : pathInput.split('\\').pop(),
+            });
+            if (scanHistory.length > 50) scanHistory.length = 50;
+            renderScanHistory();
+        }
+    } catch (e) {
+        resultsEl.innerHTML = `<div class="scanner-error">Network error: ${escapeHtml(e.message)}</div>`;
+    }
+
+    LoadingSpinner.stop();
+    btn.disabled = false;
+    btn.textContent = 'Scan';
+}
+
+function renderScanResult(data, container) {
+    const statusClass = data.clean ? 'scan-clean' : data.detected ? 'scan-detected' : 'scan-unknown';
+    const statusText = data.clean ? 'CLEAN - No threat found' : data.detected ? 'DETECTED - Threat signature identified' : 'UNKNOWN';
+    const statusIcon = data.clean ? '&#x2705;' : data.detected ? '&#x26A0;' : '&#x2753;';
+
+    let html = `<div class="scan-result ${statusClass}">`;
+    html += `<div class="scan-result-header">`;
+    html += `<span class="scan-result-icon">${statusIcon}</span>`;
+    html += `<span class="scan-result-status">${statusText}</span>`;
+    html += `<span class="scan-result-tool">${escapeHtml(data.tool)}${data.engine ? ' (' + escapeHtml(data.engine) + ')' : ''}</span>`;
+    html += `</div>`;
+
+    // Output console
+    if (data.output) {
+        html += `<div class="scan-output-header">Raw Output:</div>`;
+        html += `<pre class="scan-output">${escapeHtml(data.output)}</pre>`;
+    }
+
+    // If detected, offer to open in hex editor
+    if (data.detected && data.filepath) {
+        html += `<div class="scan-actions">`;
+        html += `<button class="btn btn-sm" onclick="hexOpenFile('${escapeHtml(data.filepath.replace(/\\/g, '\\\\'))}')">Open in Hex Editor</button>`;
+        html += `</div>`;
+    }
+
+    html += `</div>`;
+    container.innerHTML = html;
+}
+
+function renderScanHistory() {
+    const container = document.getElementById('scanner-history-list');
+    if (!container || scanHistory.length === 0) {
+        if (container) container.innerHTML = '';
+        return;
+    }
+
+    let html = '';
+    scanHistory.forEach((entry, idx) => {
+        const ts = new Date(entry.timestamp).toLocaleTimeString('en-GB', {hour12: false});
+        const statusClass = entry.clean ? 'history-clean' : entry.detected ? 'history-detected' : 'history-unknown';
+        const statusText = entry.clean ? 'Clean' : entry.detected ? 'Detected' : '?';
+        const toolLabel = entry.tool + (entry.engine ? '/' + entry.engine : '');
+        html += `<div class="scan-history-entry ${statusClass}">`;
+        html += `<span class="scan-history-time">${ts}</span>`;
+        html += `<span class="scan-history-file">${escapeHtml(entry.filename || '--')}</span>`;
+        html += `<span class="scan-history-tool">${escapeHtml(toolLabel)}</span>`;
+        html += `<span class="scan-history-status">${statusText}</span>`;
+        html += `</div>`;
+    });
+    container.innerHTML = html;
+}
+
+function clearScanHistory() {
+    scanHistory = [];
+    const container = document.getElementById('scanner-history-list');
+    if (container) container.innerHTML = '';
+}
+
+// =============================================
 // HEX EDITOR
 // =============================================
 
@@ -1232,8 +1572,181 @@ function hexNextPage() {
 }
 
 // =============================================
-// DETAIL PANELS (kept from original)
+// PE ANALYSIS
 // =============================================
+
+async function peAnalyze() {
+    const filepath = state.hexFilePath || document.getElementById('hex-filepath').value.trim();
+    const panel = document.getElementById('pe-panel');
+    const body = document.getElementById('pe-panel-body');
+
+    if (!filepath) {
+        panel.style.display = 'block';
+        body.innerHTML = '<div class="pe-error">No file loaded. Load a file in the hex editor first.</div>';
+        return;
+    }
+
+    panel.style.display = 'block';
+    body.innerHTML = '<div class="pe-loading"><div class="loading-spinner"></div><span>Parsing PE headers...</span></div>';
+
+    try {
+        LoadingSpinner.start();
+        const resp = await fetch(`/api/file/pe?path=${encodeURIComponent(filepath)}`);
+        const data = await resp.json();
+        LoadingSpinner.stop();
+
+        if (data.error) {
+            body.innerHTML = `<div class="pe-error">${escapeHtml(data.error)}</div>`;
+            return;
+        }
+
+        renderPeAnalysis(data, body);
+    } catch (e) {
+        LoadingSpinner.stop();
+        body.innerHTML = `<div class="pe-error">Failed: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function renderPeAnalysis(pe, container) {
+    let html = '';
+
+    // --- IOC Flags Banner ---
+    if (pe.flags && pe.flags.length > 0) {
+        html += '<div class="pe-flags-banner">';
+        html += `<div class="pe-flags-header"><span class="pe-flags-icon">&#x26A0;</span> <strong>${pe.flags.length} IOC Flag${pe.flags.length > 1 ? 's' : ''} Detected</strong>`;
+        html += `<span class="pe-flag-counts">`;
+        if (pe.flag_count.high) html += `<span class="pe-flag-badge high">${pe.flag_count.high} HIGH</span>`;
+        if (pe.flag_count.medium) html += `<span class="pe-flag-badge med">${pe.flag_count.medium} MED</span>`;
+        if (pe.flag_count.low) html += `<span class="pe-flag-badge low">${pe.flag_count.low} LOW</span>`;
+        html += `</span></div>`;
+        html += '<div class="pe-flags-list">';
+        pe.flags.sort((a, b) => {
+            const order = {high: 0, medium: 1, low: 2};
+            return (order[a.severity] || 3) - (order[b.severity] || 3);
+        }).forEach(f => {
+            html += `<div class="pe-flag-item sev-${f.severity}"><span class="pe-flag-sev">${f.severity.toUpperCase()}</span><span class="pe-flag-detail">${escapeHtml(f.detail)}</span></div>`;
+        });
+        html += '</div></div>';
+    } else {
+        html += '<div class="pe-flags-banner clean"><span class="pe-flags-icon">&#x2705;</span> No IOC flags detected.</div>';
+    }
+
+    // --- Overview grid ---
+    html += '<div class="pe-overview-grid">';
+
+    // File Header card
+    const fh = pe.file_header;
+    html += `<div class="pe-card">
+        <div class="pe-card-title">FILE HEADER</div>
+        <div class="pe-field"><span class="pe-label">Machine</span><span class="pe-value">${escapeHtml(fh.machine)} (${fh.machine_raw})</span></div>
+        <div class="pe-field"><span class="pe-label">Compiled</span><span class="pe-value">${escapeHtml(fh.timestamp_utc)}</span></div>
+        <div class="pe-field"><span class="pe-label">Sections</span><span class="pe-value">${fh.num_sections}</span></div>
+        <div class="pe-field"><span class="pe-label">Type</span><span class="pe-value">${fh.is_dll ? 'DLL' : fh.is_exe ? 'EXE' : 'Unknown'}</span></div>
+        <div class="pe-field"><span class="pe-label">Characteristics</span><span class="pe-value mono">${fh.characteristics}</span></div>
+    </div>`;
+
+    // Optional Header card
+    const oh = pe.optional_header;
+    html += `<div class="pe-card">
+        <div class="pe-card-title">OPTIONAL HEADER</div>
+        <div class="pe-field"><span class="pe-label">Format</span><span class="pe-value">${oh.is_pe32_plus ? 'PE32+ (64-bit)' : 'PE32 (32-bit)'}</span></div>
+        <div class="pe-field"><span class="pe-label">Entry Point</span><span class="pe-value mono">${oh.entry_point}</span></div>
+        <div class="pe-field"><span class="pe-label">Image Base</span><span class="pe-value mono">${oh.image_base}</span></div>
+        <div class="pe-field"><span class="pe-label">Linker</span><span class="pe-value">${oh.linker_version}</span></div>
+        <div class="pe-field"><span class="pe-label">Subsystem</span><span class="pe-value">${oh.subsystem_name || oh.subsystem}</span></div>
+        <div class="pe-field"><span class="pe-label">Checksum</span><span class="pe-value ${oh.checksum_valid ? '' : 'pe-warn'}">${oh.checksum} ${oh.checksum_valid ? '(valid)' : '(INVALID)'}</span></div>
+    </div>`;
+
+    // Security features card
+    html += `<div class="pe-card">
+        <div class="pe-card-title">SECURITY FEATURES</div>
+        <div class="pe-field"><span class="pe-label">ASLR</span><span class="pe-value ${oh.aslr ? 'pe-ok' : 'pe-bad'}">${oh.aslr ? 'Enabled' : 'Disabled'}</span></div>
+        <div class="pe-field"><span class="pe-label">DEP/NX</span><span class="pe-value ${oh.dep_nx ? 'pe-ok' : 'pe-bad'}">${oh.dep_nx ? 'Enabled' : 'Disabled'}</span></div>
+        <div class="pe-field"><span class="pe-label">SEH</span><span class="pe-value ${oh.no_seh ? 'pe-bad' : 'pe-ok'}">${oh.no_seh ? 'No SEH' : 'Enabled'}</span></div>
+        <div class="pe-field"><span class="pe-label">CFG</span><span class="pe-value ${oh.cfg ? 'pe-ok' : 'pe-dim'}">${oh.cfg ? 'Enabled' : 'Disabled'}</span></div>
+        <div class="pe-field"><span class="pe-label">Total Entropy</span><span class="pe-value ${pe.total_entropy >= 7.0 ? 'pe-bad' : pe.total_entropy >= 6.5 ? 'pe-warn' : ''}">${pe.total_entropy.toFixed(3)}</span></div>
+    </div>`;
+
+    html += '</div>'; // end overview grid
+
+    // --- Sections Table with entropy bars ---
+    html += '<div class="pe-section-table">';
+    html += '<div class="pe-card-title">SECTIONS</div>';
+    html += '<table class="pe-table"><thead><tr><th>Name</th><th>V.Addr</th><th>V.Size</th><th>Raw Size</th><th>Flags</th><th>Entropy</th><th>Status</th></tr></thead><tbody>';
+    pe.sections.forEach(sec => {
+        const rowClass = sec.entropy_status === 'high' ? 'pe-row-high' : sec.entropy_status === 'warn' ? 'pe-row-warn' : '';
+        const rwx = sec.rwx_warning ? ' <span class="pe-rwx-badge">RWX</span>' : '';
+        const packer = sec.packer_indicator ? ` <span class="pe-packer-badge">${escapeHtml(sec.packer_indicator)}</span>` : '';
+        const flags = (sec.readable ? 'R' : '-') + (sec.writable ? 'W' : '-') + (sec.executable ? 'X' : '-');
+        const entropyPct = Math.min(100, (sec.entropy / 8) * 100);
+        const barColor = sec.entropy_status === 'high' ? '#ef4444' : sec.entropy_status === 'warn' ? '#fbbf24' : '#22c55e';
+
+        html += `<tr class="${rowClass}">
+            <td class="mono">${escapeHtml(sec.name)}${packer}${rwx}</td>
+            <td class="mono">${sec.virtual_address}</td>
+            <td>${formatSize(sec.virtual_size)}</td>
+            <td>${formatSize(sec.raw_size)}</td>
+            <td class="mono">${flags}</td>
+            <td>
+                <div class="pe-entropy-cell">
+                    <div class="pe-entropy-bar"><div class="pe-entropy-fill" style="width:${entropyPct}%;background:${barColor}"></div></div>
+                    <span class="pe-entropy-val">${sec.entropy.toFixed(2)}</span>
+                </div>
+            </td>
+            <td><span class="pe-status-tag ${sec.entropy_status}">${sec.entropy_status === 'high' ? 'ENCRYPTED/PACKED' : sec.entropy_status === 'warn' ? 'SUSPICIOUS' : 'Normal'}</span></td>
+        </tr>`;
+    });
+    html += '</tbody></table></div>';
+
+    // --- Suspicious Imports ---
+    if (pe.suspicious_imports && Object.keys(pe.suspicious_imports).length > 0) {
+        html += '<div class="pe-suspicious-imports">';
+        html += '<div class="pe-card-title">SUSPICIOUS IMPORTS</div>';
+        Object.entries(pe.suspicious_imports).forEach(([category, items]) => {
+            const catClass = ['process_injection', 'process_hollowing', 'credential_access'].includes(category) ? 'high' : 'med';
+            html += `<div class="pe-import-category">
+                <div class="pe-import-cat-header"><span class="pe-flag-badge ${catClass}">${category.replace(/_/g, ' ').toUpperCase()}</span><span class="pe-import-count">${items.length} API(s)</span></div>
+                <div class="pe-import-items">`;
+            items.forEach(item => {
+                html += `<span class="pe-import-item"><span class="pe-import-dll">${escapeHtml(item.dll)}</span>!<span class="pe-import-func">${escapeHtml(item.function)}</span></span>`;
+            });
+            html += '</div></div>';
+        });
+        html += '</div>';
+    }
+
+    // --- Imports Summary (collapsible) ---
+    html += `<details class="pe-imports-detail">
+        <summary class="pe-card-title pe-clickable">IMPORTS (${pe.dll_count} DLLs, ${pe.import_count} functions)</summary>
+        <div class="pe-imports-list">`;
+    pe.imports.forEach(imp => {
+        html += `<div class="pe-dll-entry"><span class="pe-dll-name">${escapeHtml(imp.dll)}</span><span class="pe-dll-count">${imp.count}</span></div>`;
+    });
+    html += '</div></details>';
+
+    // --- Exports (if any) ---
+    if (pe.exports && pe.exports.length > 0) {
+        html += `<details class="pe-imports-detail">
+            <summary class="pe-card-title pe-clickable">EXPORTS (${pe.exports.length})</summary>
+            <div class="pe-imports-list">`;
+        pe.exports.slice(0, 100).forEach(exp => {
+            html += `<div class="pe-dll-entry"><span class="pe-dll-name mono">${escapeHtml(exp.name)}</span><span class="pe-dll-count">#${exp.ordinal}</span></div>`;
+        });
+        html += '</div></details>';
+    }
+
+    // --- TLS Callbacks ---
+    if (pe.tls_callbacks && pe.tls_callbacks.length > 0) {
+        html += '<div class="pe-tls-section">';
+        html += `<div class="pe-card-title">TLS CALLBACKS (Anti-Debug Indicator)</div>`;
+        pe.tls_callbacks.forEach(cb => {
+            html += `<div class="pe-tls-entry mono">${cb}</div>`;
+        });
+        html += '</div>';
+    }
+
+    container.innerHTML = html;
+}
 
 // --- Detail Panels for Dashboard Services ---
 async function openAgentDetail() {
@@ -1700,41 +2213,303 @@ async function submitSample() {
     formData.append('target', target);
 
     try {
+        LoadingSpinner.start();
         const resp = await fetch('/api/submit', { method: 'POST', body: formData });
         const data = await resp.json();
+        LoadingSpinner.stop();
 
         if (resp.ok) {
             result.className = 'submit-result visible success';
-            let html = `<div class="detonation-header"><div class="detonation-filename">${escapeHtml(input.files[0].name)}</div></div>`;
-            if (data.file_info) {
-                html += `<div class="detail-fields"><div class="detail-field"><span class="field-label">SHA-256</span><span class="field-value mono">${escapeHtml(data.file_info.sha256)}</span></div></div>`;
-            }
-            if (data.agent) {
-                const agentOk = data.agent.status >= 200 && data.agent.status < 400;
-                html += `<div style="margin-top:8px;"><strong>Agent:</strong> <span style="color:${agentOk ? 'var(--accent-green)' : 'var(--accent-red)'}">${agentOk ? 'Success' : 'Failed'}</span> (HTTP ${data.agent.status})</div>`;
-                if (data.agent.data?.pid) html += `<div>PID: ${data.agent.data.pid}</div>`;
-            }
-            if (data.litterbox) {
-                const lbOk = data.litterbox.status >= 200 && data.litterbox.status < 400;
-                html += `<div style="margin-top:8px;"><strong>LitterBox:</strong> <span style="color:${lbOk ? 'var(--accent-green)' : 'var(--accent-red)'}">${lbOk ? 'Uploaded' : 'Failed'}</span></div>`;
-            }
-            result.innerHTML = html;
-            // Refresh alerts after a delay
-            setTimeout(refreshAlerts, 3000);
+            renderDetonationResults(data, result);
         } else {
             result.className = 'submit-result visible error';
             result.textContent = `Error: ${JSON.stringify(data)}`;
         }
     } catch (e) {
+        LoadingSpinner.stop();
         result.className = 'submit-result visible error';
         result.textContent = `Network error: ${e.message}`;
     }
 
     btn.disabled = false;
     btn.textContent = 'Detonate';
-
-    // Refresh submissions list after successful submit
     refreshSubmissions();
+}
+
+function renderDetonationResults(data, container) {
+    const pid = data.file_info?.agent_pid;
+    const sha256 = data.file_info?.sha256;
+    const lbHash = data.file_info?.litterbox_hash;
+    const filename = data.file_info?.name || 'unknown';
+
+    let html = `<div class="det-results">`;
+    // Header
+    html += `<div class="det-results-header">
+        <div class="det-filename">${escapeHtml(filename)}</div>
+        <div class="det-meta">
+            ${sha256 ? `<span class="det-hash mono">${sha256.substring(0, 16)}...</span>` : ''}
+            ${pid ? `<span class="det-pid">PID: ${pid}</span>` : ''}
+        </div>
+    </div>`;
+
+    // Stage cards
+    html += `<div class="det-stages">`;
+
+    // Agent stage
+    if (data.agent) {
+        const ok = data.agent.status >= 200 && data.agent.status < 400;
+        html += `<div class="det-stage ${ok ? 'ok' : 'fail'}">
+            <div class="det-stage-icon">${ok ? '&#x2705;' : '&#x274C;'}</div>
+            <div class="det-stage-info">
+                <div class="det-stage-title">DetonatorAgent</div>
+                <div class="det-stage-detail">${ok ? 'Executed' : 'Failed'} (HTTP ${data.agent.status})${pid ? ` — PID ${pid}` : ''}</div>
+            </div>
+        </div>`;
+    }
+
+    // LitterBox upload stage
+    if (data.litterbox) {
+        const ok = data.litterbox.status >= 200 && data.litterbox.status < 400;
+        html += `<div class="det-stage ${ok ? 'ok' : 'fail'}">
+            <div class="det-stage-icon">${ok ? '&#x2705;' : '&#x274C;'}</div>
+            <div class="det-stage-info">
+                <div class="det-stage-title">LitterBox Upload</div>
+                <div class="det-stage-detail">${ok ? 'Uploaded' : 'Failed'}</div>
+            </div>
+        </div>`;
+    }
+
+    // LitterBox static analysis stage
+    if (data.litterbox_static) {
+        const ok = data.litterbox_static.triggered;
+        html += `<div class="det-stage ${ok ? 'ok' : 'pending'}">
+            <div class="det-stage-icon">${ok ? '&#x2705;' : '&#x23F3;'}</div>
+            <div class="det-stage-info">
+                <div class="det-stage-title">Static Analysis</div>
+                <div class="det-stage-detail">${ok ? 'Triggered (YARA + CheckPlz + Strings)' : 'Not triggered'}</div>
+            </div>
+        </div>`;
+    }
+
+    // LitterBox dynamic analysis stage
+    if (data.litterbox_dynamic) {
+        const ok = data.litterbox_dynamic.triggered;
+        html += `<div class="det-stage ${ok ? 'ok' : 'pending'}">
+            <div class="det-stage-icon">${ok ? '&#x2705;' : '&#x23F3;'}</div>
+            <div class="det-stage-info">
+                <div class="det-stage-title">Dynamic Analysis</div>
+                <div class="det-stage-detail">${ok ? `Triggered (PE-Sieve, Moneta, HollowsHunter) — ${data.litterbox_dynamic.target}` : 'Not triggered'}</div>
+            </div>
+        </div>`;
+    }
+
+    // Fibratus/EDR stage (always pending initially)
+    html += `<div class="det-stage pending" id="det-fibratus-stage">
+        <div class="det-stage-icon">&#x23F3;</div>
+        <div class="det-stage-info">
+            <div class="det-stage-title">Fibratus / Rustinel EDR</div>
+            <div class="det-stage-detail">Waiting for detection alerts...</div>
+        </div>
+    </div>`;
+
+    html += `</div>`; // end stages
+
+    // Results panels (filled by polling)
+    html += `<div class="det-panels" id="det-results-panels">
+        <div class="det-panel-loading"><div class="loading-spinner"></div><span>Polling for analysis results...</span></div>
+    </div>`;
+
+    html += `</div>`; // end det-results
+    container.innerHTML = html;
+
+    // Start polling for results
+    if (sha256 || pid || lbHash) {
+        pollDetonationResults(sha256, pid, lbHash, 0);
+    }
+}
+
+let _detonationPollTimer = null;
+
+function pollDetonationResults(sha256, pid, lbHash, attempt) {
+    if (_detonationPollTimer) clearTimeout(_detonationPollTimer);
+    const maxAttempts = 30; // Poll for up to ~2.5 minutes
+    if (attempt >= maxAttempts) {
+        const panels = document.getElementById('det-results-panels');
+        if (panels) panels.innerHTML = '<div class="det-poll-done">Polling complete. Results shown above reflect final state.</div>';
+        return;
+    }
+
+    const params = new URLSearchParams();
+    if (sha256) params.set('sha256', sha256);
+    if (pid) params.set('pid', pid);
+    if (lbHash) params.set('litterbox_hash', lbHash);
+
+    fetch(`/api/detonation/results?${params}`)
+        .then(r => r.json())
+        .then(data => {
+            renderDetonationPanels(data);
+            // Update Fibratus stage indicator
+            const fStage = document.getElementById('det-fibratus-stage');
+            if (fStage && data.fibratus_alert_count > 0) {
+                fStage.className = 'det-stage ok';
+                fStage.querySelector('.det-stage-icon').innerHTML = '&#x2705;';
+                fStage.querySelector('.det-stage-detail').textContent = `${data.fibratus_alert_count} alert(s) detected`;
+            }
+            // Keep polling if not all results are ready
+            const allReady = data.ready && data.ready.static !== false && data.ready.dynamic !== false;
+            if (!allReady || attempt < 5) {
+                _detonationPollTimer = setTimeout(() => pollDetonationResults(sha256, pid, lbHash, attempt + 1), 5000);
+            }
+        })
+        .catch(() => {
+            _detonationPollTimer = setTimeout(() => pollDetonationResults(sha256, pid, lbHash, attempt + 1), 5000);
+        });
+}
+
+function renderDetonationPanels(data) {
+    const panels = document.getElementById('det-results-panels');
+    if (!panels) return;
+
+    let html = '';
+
+    // --- Fibratus / Rustinel Alerts ---
+    if (data.fibratus_alerts && data.fibratus_alerts.length > 0) {
+        html += `<div class="det-panel">
+            <div class="det-panel-title">FIBRATUS / RUSTINEL ALERTS (${data.fibratus_alert_count})</div>
+            <div class="det-alerts-list">`;
+        data.fibratus_alerts.slice(0, 20).forEach(alert => {
+            const sev = (alert.severity || alert.rule?.level || 'unknown').toLowerCase();
+            const ruleName = alert.rule_name || alert.rule?.name || 'Unknown Rule';
+            const procName = alert.process?.name || '';
+            html += `<div class="det-alert-item sev-${sev}">
+                <span class="det-alert-sev">${sev.toUpperCase()}</span>
+                <span class="det-alert-rule">${escapeHtml(ruleName)}</span>
+                <span class="det-alert-proc">${escapeHtml(procName)}</span>
+            </div>`;
+        });
+        html += `</div></div>`;
+    }
+
+    // --- LitterBox Static Results ---
+    if (data.litterbox_static) {
+        const st = data.litterbox_static;
+        html += `<div class="det-panel">
+            <div class="det-panel-title">STATIC ANALYSIS (LitterBox)</div>
+            <div class="det-panel-body">`;
+
+        // YARA matches
+        if (st.yara_results || st.yara) {
+            const yara = st.yara_results || st.yara;
+            if (Array.isArray(yara) && yara.length > 0) {
+                html += `<div class="det-subsection"><span class="det-sub-label">YARA Matches:</span>`;
+                yara.forEach(m => {
+                    const name = typeof m === 'string' ? m : (m.rule || m.name || JSON.stringify(m));
+                    html += `<span class="det-yara-match">${escapeHtml(name)}</span>`;
+                });
+                html += `</div>`;
+            } else if (typeof yara === 'object' && !Array.isArray(yara)) {
+                const matches = yara.matches || yara.rules || [];
+                if (matches.length > 0) {
+                    html += `<div class="det-subsection"><span class="det-sub-label">YARA Matches:</span>`;
+                    matches.forEach(m => {
+                        html += `<span class="det-yara-match">${escapeHtml(typeof m === 'string' ? m : m.rule || m.name || '')}</span>`;
+                    });
+                    html += `</div>`;
+                }
+            }
+        }
+
+        // CheckPlz results
+        if (st.checkplz_results || st.checkplz) {
+            const cp = st.checkplz_results || st.checkplz;
+            html += `<div class="det-subsection"><span class="det-sub-label">CheckPlz:</span><span class="det-sub-value">${escapeHtml(typeof cp === 'string' ? cp : JSON.stringify(cp).substring(0, 200))}</span></div>`;
+        }
+
+        // Strings analysis
+        if (st.stringnalyzer_results || st.strings) {
+            const strs = st.stringnalyzer_results || st.strings;
+            if (typeof strs === 'object' && strs.suspicious_count) {
+                html += `<div class="det-subsection"><span class="det-sub-label">Suspicious Strings:</span><span class="det-sub-value">${strs.suspicious_count} found</span></div>`;
+            }
+        }
+
+        // Raw data fallback
+        if (!st.yara_results && !st.yara && !st.checkplz_results && !st.checkplz) {
+            html += `<pre class="det-raw">${escapeHtml(JSON.stringify(st, null, 2)).substring(0, 2000)}</pre>`;
+        }
+
+        html += `</div></div>`;
+    }
+
+    // --- LitterBox Dynamic Results ---
+    if (data.litterbox_dynamic) {
+        const dyn = data.litterbox_dynamic;
+        html += `<div class="det-panel">
+            <div class="det-panel-title">DYNAMIC ANALYSIS (LitterBox)</div>
+            <div class="det-panel-body">`;
+
+        // PE-Sieve results
+        if (dyn.pe_sieve || dyn.pe_sieve_results) {
+            const ps = dyn.pe_sieve || dyn.pe_sieve_results;
+            html += `<div class="det-subsection"><span class="det-sub-label">PE-Sieve:</span>`;
+            if (typeof ps === 'object') {
+                const suspicious = ps.suspicious || ps.total_suspicious || ps.modified || 0;
+                const replaced = ps.replaced || 0;
+                html += `<span class="det-sub-value ${suspicious > 0 ? 'det-warn' : ''}">Suspicious: ${suspicious}, Replaced: ${replaced}</span>`;
+            } else {
+                html += `<span class="det-sub-value">${escapeHtml(String(ps).substring(0, 200))}</span>`;
+            }
+            html += `</div>`;
+        }
+
+        // Moneta results
+        if (dyn.moneta || dyn.moneta_results) {
+            const mon = dyn.moneta || dyn.moneta_results;
+            html += `<div class="det-subsection"><span class="det-sub-label">Moneta:</span>`;
+            if (typeof mon === 'object') {
+                const iocs = mon.ioc_count || mon.iocs || 0;
+                html += `<span class="det-sub-value ${iocs > 0 ? 'det-warn' : ''}">IOCs: ${iocs}</span>`;
+            } else {
+                html += `<span class="det-sub-value">${escapeHtml(String(mon).substring(0, 200))}</span>`;
+            }
+            html += `</div>`;
+        }
+
+        // HollowsHunter results
+        if (dyn.hollows_hunter || dyn.hollows_hunter_results) {
+            const hh = dyn.hollows_hunter || dyn.hollows_hunter_results;
+            html += `<div class="det-subsection"><span class="det-sub-label">HollowsHunter:</span>`;
+            if (typeof hh === 'object') {
+                const suspicious = hh.suspicious || hh.total_suspicious || 0;
+                html += `<span class="det-sub-value ${suspicious > 0 ? 'det-warn' : ''}">Suspicious: ${suspicious}</span>`;
+            } else {
+                html += `<span class="det-sub-value">${escapeHtml(String(hh).substring(0, 200))}</span>`;
+            }
+            html += `</div>`;
+        }
+
+        // RedEdr results
+        if (dyn.rededr || dyn.rededr_results) {
+            const re = dyn.rededr || dyn.rededr_results;
+            html += `<div class="det-subsection"><span class="det-sub-label">RedEdr:</span>`;
+            html += `<span class="det-sub-value">${escapeHtml(typeof re === 'string' ? re.substring(0, 200) : JSON.stringify(re).substring(0, 200))}</span>`;
+            html += `</div>`;
+        }
+
+        // Raw data fallback
+        if (!dyn.pe_sieve && !dyn.pe_sieve_results && !dyn.moneta && !dyn.moneta_results && !dyn.hollows_hunter && !dyn.hollows_hunter_results) {
+            html += `<pre class="det-raw">${escapeHtml(JSON.stringify(dyn, null, 2)).substring(0, 2000)}</pre>`;
+        }
+
+        html += `</div></div>`;
+    }
+
+    // Show polling status if nothing yet
+    if (!html) {
+        html = `<div class="det-panel-loading"><div class="loading-spinner"></div><span>Waiting for results... Analysis may take 1-3 minutes.</span></div>`;
+    }
+
+    panels.innerHTML = html;
 }
 
 // --- Submissions History ---
@@ -2138,6 +2913,12 @@ function buildGraph(processes, networkEvents, dnsEvents, injectEvents, networkAl
     const layout = document.getElementById('graph-layout')?.value || 'hierarchy';
     if (layout === 'hierarchy') {
         applyHierarchyLayout(nodes, edges, nodeMap);
+    } else if (layout === 'radial') {
+        applyRadialLayout(nodes, edges, nodeMap);
+    } else if (layout === 'circular') {
+        applyCircularLayout(nodes, edges);
+    } else if (layout === 'grid') {
+        applyGridLayout(nodes, edges);
     } else {
         applyForceLayout(nodes, edges);
     }
@@ -2258,6 +3039,122 @@ function applyForceLayout(nodes, edges) {
     }
 }
 
+function applyRadialLayout(nodes, edges, nodeMap) {
+    // Radial layout: root processes at center, children on concentric rings
+    const procNodes = nodes.filter(n => n.type === 'process');
+    const otherNodes = nodes.filter(n => n.type !== 'process');
+
+    // Find roots
+    const roots = procNodes.filter(n => !n.parentPid || !nodeMap[n.parentPid]);
+    const visited = new Set();
+    const levels = []; // levels[depth] = [nodes...]
+
+    function assignLevel(node, depth) {
+        if (visited.has(node.id)) return;
+        visited.add(node.id);
+        if (!levels[depth]) levels[depth] = [];
+        levels[depth].push(node);
+        const children = procNodes.filter(n => n.parentPid && `proc_${n.parentPid}` === node.id && !visited.has(n.id));
+        children.forEach(child => assignLevel(child, depth + 1));
+    }
+    roots.forEach(root => assignLevel(root, 0));
+    // Orphans go to level 0
+    procNodes.filter(n => !visited.has(n.id)).forEach(n => { if (!levels[0]) levels[0] = []; levels[0].push(n); });
+
+    // Place nodes on concentric circles
+    const ringSpacing = 160;
+    levels.forEach((levelNodes, depth) => {
+        const radius = depth * ringSpacing;
+        if (radius === 0) {
+            // Center the roots
+            const count = levelNodes.length;
+            levelNodes.forEach((n, i) => {
+                const angle = (i / count) * Math.PI * 2;
+                n.x = Math.cos(angle) * 40 * count;
+                n.y = Math.sin(angle) * 40 * count;
+            });
+        } else {
+            const count = levelNodes.length;
+            levelNodes.forEach((n, i) => {
+                const angle = (i / count) * Math.PI * 2 - Math.PI / 2;
+                n.x = Math.cos(angle) * radius;
+                n.y = Math.sin(angle) * radius;
+            });
+        }
+    });
+
+    // Place non-process nodes around their connected process
+    otherNodes.forEach(node => {
+        const connEdge = edges.find(e => e.target === node.id || e.source === node.id);
+        if (connEdge) {
+            const parentId = connEdge.source === node.id ? connEdge.target : connEdge.source;
+            const parent = nodes.find(n => n.id === parentId);
+            if (parent) {
+                const angle = Math.random() * Math.PI * 2;
+                const dist = 60 + Math.random() * 40;
+                node.x = parent.x + Math.cos(angle) * dist;
+                node.y = parent.y + Math.sin(angle) * dist;
+                return;
+            }
+        }
+        node.x = Math.random() * 300;
+        node.y = Math.random() * 300;
+    });
+}
+
+function applyCircularLayout(nodes, edges) {
+    // All nodes placed on a single circle, ordered by type then name
+    const sorted = [...nodes].sort((a, b) => {
+        if (a.type !== b.type) return a.type.localeCompare(b.type);
+        return (a.label || '').localeCompare(b.label || '');
+    });
+
+    const count = sorted.length;
+    const radius = Math.max(150, count * 20);
+
+    sorted.forEach((n, i) => {
+        const angle = (i / count) * Math.PI * 2 - Math.PI / 2;
+        n.x = Math.cos(angle) * radius;
+        n.y = Math.sin(angle) * radius;
+    });
+}
+
+function applyGridLayout(nodes, edges) {
+    // Grid layout: processes in a grid, non-processes attached nearby
+    const procNodes = nodes.filter(n => n.type === 'process');
+    const otherNodes = nodes.filter(n => n.type !== 'process');
+
+    const cols = Math.max(1, Math.ceil(Math.sqrt(procNodes.length)));
+    const spacing = 160;
+
+    procNodes.forEach((n, i) => {
+        const row = Math.floor(i / cols);
+        const col = i % cols;
+        n.x = col * spacing;
+        n.y = row * spacing;
+    });
+
+    // Attach non-process nodes to their connected process
+    otherNodes.forEach(node => {
+        const connEdge = edges.find(e => e.target === node.id || e.source === node.id);
+        if (connEdge) {
+            const parentId = connEdge.source === node.id ? connEdge.target : connEdge.source;
+            const parent = nodes.find(n => n.id === parentId);
+            if (parent) {
+                const angle = Math.random() * Math.PI * 2;
+                const dist = 50 + Math.random() * 30;
+                node.x = parent.x + Math.cos(angle) * dist;
+                node.y = parent.y + Math.sin(angle) * dist;
+                return;
+            }
+        }
+        // Orphan: place after the grid
+        const idx = otherNodes.indexOf(node);
+        node.x = (idx % cols) * spacing;
+        node.y = (Math.floor(procNodes.length / cols) + 1 + Math.floor(idx / cols)) * spacing;
+    });
+}
+
 function initGraphCanvas() {
     const canvas = document.getElementById('graph-canvas');
     const container = document.getElementById('graph-container');
@@ -2341,6 +3238,7 @@ function initGraphCanvas() {
         graphState.camera.x = mx - (mx - graphState.camera.x) * (graphState.camera.zoom / oldZoom);
         graphState.camera.y = my - (my - graphState.camera.y) * (graphState.camera.zoom / oldZoom);
 
+        updateZoomLevel();
         renderGraph();
     });
 }
@@ -2391,7 +3289,40 @@ function graphFitView() {
     graphState.camera.zoom = zoom;
     graphState.camera.x = canvas.width / 2 - (minX + maxX) / 2 * zoom;
     graphState.camera.y = canvas.height / 2 - (minY + maxY) / 2 * zoom;
+    updateZoomLevel();
     renderGraph();
+}
+
+function graphZoomIn() {
+    const canvas = document.getElementById('graph-canvas');
+    if (!canvas) return;
+    const oldZoom = graphState.camera.zoom;
+    graphState.camera.zoom = Math.min(5, oldZoom * 1.25);
+    // Zoom toward center
+    const cx = canvas.width / 2;
+    const cy = canvas.height / 2;
+    graphState.camera.x = cx - (cx - graphState.camera.x) * (graphState.camera.zoom / oldZoom);
+    graphState.camera.y = cy - (cy - graphState.camera.y) * (graphState.camera.zoom / oldZoom);
+    updateZoomLevel();
+    renderGraph();
+}
+
+function graphZoomOut() {
+    const canvas = document.getElementById('graph-canvas');
+    if (!canvas) return;
+    const oldZoom = graphState.camera.zoom;
+    graphState.camera.zoom = Math.max(0.1, oldZoom * 0.8);
+    const cx = canvas.width / 2;
+    const cy = canvas.height / 2;
+    graphState.camera.x = cx - (cx - graphState.camera.x) * (graphState.camera.zoom / oldZoom);
+    graphState.camera.y = cy - (cy - graphState.camera.y) * (graphState.camera.zoom / oldZoom);
+    updateZoomLevel();
+    renderGraph();
+}
+
+function updateZoomLevel() {
+    const el = document.getElementById('graph-zoom-level');
+    if (el) el.textContent = Math.round(graphState.camera.zoom * 100) + '%';
 }
 
 function renderGraph() {

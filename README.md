@@ -1,5 +1,9 @@
 # Transportable Detonation Chamber
 
+<p align="center">
+  <img src="tdc-logo.png" alt="Transportable Detonation Chamber" width="180">
+</p>
+
 A pre-configured Windows 11 VM for malware detonation testing against multiple EDR solutions.
 Supports **Windows hosts** (Hyper-V) and **macOS Apple Silicon hosts** (QEMU/UTM) with
 architecture-aware provisioning.

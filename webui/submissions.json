@@ -1,0 +1,14 @@
+[
+  {
+    "id": "88f52877f8ed",
+    "timestamp": "2026-06-09T16:44:30.886477",
+    "filename": "tdc-logo.png",
+    "sha256": "e0b31c3209ba45844b7f1ac765704cf72f14e321070f5039f122f157d0514e84",
+    "size": 117169,
+    "target": "both",
+    "agent_status": "failed",
+    "agent_pid": null,
+    "litterbox_status": "failed",
+    "file_path": "C:\\Users\\vagrant\\Desktop\\infected\\tdc-logo.png"
+  }
+]
