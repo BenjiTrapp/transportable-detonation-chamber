@@ -16,6 +16,14 @@ Set-StrictMode -Version Latest
 
 Write-Host "=== Installing Rustinel ===" -ForegroundColor Cyan
 
+# Architecture detection
+$isArm64 = ($env:PROCESSOR_ARCHITECTURE -eq "ARM64")
+if ($isArm64) {
+    Write-Host "[!] ARM64 detected - Rustinel has no native ARM64 build" -ForegroundColor Yellow
+    Write-Host "[*] Installing x86_64 build (runs under Windows ARM emulation layer)" -ForegroundColor Yellow
+    Write-Host "[*] Note: ETW tracing should work under emulation but with slight overhead" -ForegroundColor Yellow
+}
+
 $rustinelVersion = "1.1.1"
 $rustinelInstallDir = "C:\tools\rustinel"
 $rustinelZipUrl = "https://github.com/Karib0u/rustinel/releases/download/v${rustinelVersion}/rustinel-${rustinelVersion}-x86_64-pc-windows-msvc.zip"

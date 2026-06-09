@@ -84,6 +84,7 @@ Add-MpPreference -ExclusionPath $infectedDir -ErrorAction SilentlyContinue
 Add-MpPreference -ExclusionPath "C:\samples" -ErrorAction SilentlyContinue
 Add-MpPreference -ExclusionPath "C:\Users\Public\Downloads" -ErrorAction SilentlyContinue
 Add-MpPreference -ExclusionPath "C:\LitterBox" -ErrorAction SilentlyContinue
+Add-MpPreference -ExclusionPath "C:\tools\detection-rules" -ErrorAction SilentlyContinue
 Write-Host "[+] Sample directories created and excluded from Defender" -ForegroundColor Green
 Write-Host "    Desktop\infected: $infectedDir" -ForegroundColor Gray
 Write-Host "    Samples:          C:\samples" -ForegroundColor Gray
@@ -137,20 +138,26 @@ if (Test-Path $rustinelExe) {
         Copy-Item "C:\vagrant_config\rustinel-config.toml" "$rustinelDir\config.toml" -Force
     }
 
-    # Rustinel needs a PowerShell wrapper (CMD pipe redirection causes early exit)
+    # Stop existing Rustinel process
+    Stop-Process -Name "rustinel" -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+
+    # Run Rustinel directly as a scheduled task (no wrapper needed)
+    # WorkingDirectory must be set so it finds config.toml and writes to logs/ dir
+    # Uses "run" subcommand for foreground mode (task keeps it alive)
     Unregister-ScheduledTask -TaskName "Rustinel" -Confirm:$false -ErrorAction SilentlyContinue
-    $ps1Content = @"
-Start-Process -FilePath "$rustinelExe" -ArgumentList "run" -WorkingDirectory "$rustinelDir" -WindowStyle Hidden -RedirectStandardOutput "$logsDir\Rustinel-stdout.log" -RedirectStandardError "$logsDir\Rustinel-stderr.log" -Wait
-"@
-    Set-Content -Path "$logsDir\run-Rustinel.ps1" -Value $ps1Content
-    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File $logsDir\run-Rustinel.ps1" -WorkingDirectory $rustinelDir
+    $action = New-ScheduledTaskAction -Execute $rustinelExe -Argument "run" -WorkingDirectory $rustinelDir
     $trigger = New-ScheduledTaskTrigger -AtStartup
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 5 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 365)
     $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
     Register-ScheduledTask -TaskName "Rustinel" -Action $action -Trigger $trigger -Settings $settings -Principal $principal | Out-Null
     Start-ScheduledTask -TaskName "Rustinel"
-    Start-Sleep -Seconds 3
-    Write-Host "[+] Rustinel registered and started" -ForegroundColor Green
+    Start-Sleep -Seconds 5
+    if (Get-Process -Name "rustinel" -ErrorAction SilentlyContinue) {
+        Write-Host "[+] Rustinel registered and running (ETW trace active)" -ForegroundColor Green
+    } else {
+        Write-Host "[!] Rustinel task started but process not detected" -ForegroundColor Yellow
+    }
 } else {
     Write-Host "[!] Rustinel not found at $rustinelExe - skipping" -ForegroundColor Yellow
 }
@@ -161,8 +168,19 @@ $agentExe = "$detonatorAgentDir\publish\DetonatorAgent.exe"
 $agentDll = "$detonatorAgentDir\publish\DetonatorAgent.dll"
 
 if (Test-Path $agentExe) {
-    Register-ServiceTask -Name "DetonatorAgent" -Command $agentExe -Arguments "--port 8080 --edr fibratus" -WorkingDirectory "$detonatorAgentDir\publish"
-    Start-Sleep -Seconds 3
+    # DetonatorAgent runs directly (no CMD wrapper needed for .NET apps)
+    Stop-Process -Name "DetonatorAgent" -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    Unregister-ScheduledTask -TaskName "DetonatorAgent" -Confirm:$false -ErrorAction SilentlyContinue
+    $action = New-ScheduledTaskAction -Execute $agentExe -Argument "--port 8080 --edr fibratus" -WorkingDirectory "$detonatorAgentDir\publish"
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 365)
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName "DetonatorAgent" -Action $action -Trigger $trigger -Settings $settings -Principal $principal | Out-Null
+    Start-ScheduledTask -TaskName "DetonatorAgent"
+    Start-Sleep -Seconds 5
+    # Firewall rule for the exe
+    New-NetFirewallRule -DisplayName "DetonatorAgent EXE" -Direction Inbound -Protocol TCP -Program $agentExe -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null
 } elseif (Test-Path $agentDll) {
     $dotnetExe = (Get-Command dotnet -ErrorAction SilentlyContinue).Source
     if ($dotnetExe) {

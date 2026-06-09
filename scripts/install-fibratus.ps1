@@ -14,6 +14,14 @@ Set-StrictMode -Version Latest
 
 Write-Host "=== Installing Fibratus ===" -ForegroundColor Cyan
 
+# Architecture detection
+$isArm64 = ($env:PROCESSOR_ARCHITECTURE -eq "ARM64")
+if ($isArm64) {
+    Write-Host "[!] ARM64 detected - Fibratus has no native ARM64 build" -ForegroundColor Yellow
+    Write-Host "[*] Installing x86_64 build (runs under Windows ARM emulation layer)" -ForegroundColor Yellow
+    Write-Host "[*] Note: ETW kernel tracing may have limitations under emulation" -ForegroundColor Yellow
+}
+
 $fibratusVersion = "3.0.0"
 $fibratusInstallDir = "$env:ProgramFiles\Fibratus"
 $fibratusMsiUrl = "https://github.com/rabbitstack/fibratus/releases/download/v${fibratusVersion}/fibratus-${fibratusVersion}-amd64.msi"

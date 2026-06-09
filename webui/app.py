@@ -27,6 +27,7 @@ DETONATOR_API = os.environ.get("DETONATOR_API", "http://127.0.0.1:8000")
 DETONATOR_AGENT_API = os.environ.get("DETONATOR_AGENT_API", "http://127.0.0.1:8080")
 LITTERBOX_API = os.environ.get("LITTERBOX_API", "http://127.0.0.1:1337")
 WEBUI_PORT = int(os.environ.get("WEBUI_PORT", "9000"))
+SUBMISSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "submissions.json")
 
 # In-memory event store (populated from Rustinel NDJSON + Fibratus)
 events_store = {
@@ -41,6 +42,69 @@ events_store = {
     "sessions": [],
 }
 store_lock = threading.Lock()
+
+# --- Submissions History ---
+submissions_lock = threading.Lock()
+
+
+def _load_submissions():
+    """Load submission history from JSON file."""
+    if os.path.isfile(SUBMISSIONS_FILE):
+        try:
+            with open(SUBMISSIONS_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return []
+    return []
+
+
+def _save_submissions(submissions):
+    """Persist submission history to JSON file."""
+    try:
+        with open(SUBMISSIONS_FILE, "w") as f:
+            json.dump(submissions, f, indent=2)
+    except IOError:
+        pass
+
+
+def _record_submission(filename, sha256, size, target, results):
+    """Record a new submission in the history."""
+    import datetime
+    entry = {
+        "id": hashlib.md5(f"{sha256}{time.time()}".encode()).hexdigest()[:12],
+        "timestamp": datetime.datetime.now().isoformat(),
+        "filename": filename,
+        "sha256": sha256,
+        "size": size,
+        "target": target,
+        "agent_status": None,
+        "agent_pid": None,
+        "litterbox_status": None,
+        "file_path": None,
+    }
+    # Extract results
+    if "agent" in results:
+        entry["agent_status"] = "success" if 200 <= results["agent"].get("status", 0) < 400 else "failed"
+        agent_data = results["agent"].get("data")
+        if isinstance(agent_data, dict):
+            if agent_data.get("pid"):
+                entry["agent_pid"] = agent_data["pid"]
+            entry["file_path"] = agent_data.get("file_path") or agent_data.get("path")
+    if "litterbox" in results:
+        entry["litterbox_status"] = "success" if 200 <= results["litterbox"].get("status", 0) < 400 else "failed"
+
+    # If no file_path from agent, guess the common location
+    if not entry["file_path"]:
+        entry["file_path"] = f"C:\\Users\\vagrant\\Desktop\\infected\\{filename}"
+
+    with submissions_lock:
+        subs = _load_submissions()
+        subs.insert(0, entry)  # newest first
+        # Keep max 200 entries
+        subs = subs[:200]
+        _save_submissions(subs)
+
+    return entry
 
 
 # --- Rustinel NDJSON Parser ---
@@ -141,8 +205,241 @@ def load_rustinel_alerts():
     return unique_alerts
 
 
+# --- Fibratus Event Log Ingestion ---
+# Fibratus writes alerts to Windows Event Log: Application log, Provider "Fibratus", JSON format.
+
+_fibratus_last_read_time = None  # Track last read timestamp to avoid re-reading
+
+
+def parse_fibratus_alert(data):
+    """Parse a Fibratus JSON alert into the normalized alert format."""
+    if not isinstance(data, dict):
+        return None
+
+    alert_id = data.get("id") or hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
+
+    # Get first event (Fibratus alerts contain an array of triggering events)
+    events = data.get("events", [])
+    first_event = events[0] if events else {}
+    proc = first_event.get("proc", {})
+
+    # Map Fibratus category to ECS-like category
+    fibratus_cat = first_event.get("category", "").lower()
+    category_map = {
+        "process": "process",
+        "file": "file",
+        "registry": "registry",
+        "net": "network",
+        "network": "network",
+        "image": "process",
+        "thread": "process",
+        "dns": "dns",
+    }
+    category = category_map.get(fibratus_cat, fibratus_cat)
+
+    # Extract MITRE tags from labels if present
+    tags = []
+    labels = data.get("labels", {})
+    for key, val in labels.items():
+        if "mitre" in key.lower() or "attack" in key.lower():
+            if isinstance(val, list):
+                tags.extend(val)
+            elif isinstance(val, str):
+                tags.append(val)
+    # Also check for tags in the title/text for common MITRE patterns
+    title = data.get("title", "")
+
+    alert = {
+        "id": f"fib_{alert_id}",
+        "timestamp": first_event.get("timestamp", ""),
+        "severity": data.get("severity", "unknown").lower(),
+        "rule_name": title or "Fibratus Detection",
+        "rule_description": data.get("description", "") or data.get("text", ""),
+        "engine": "fibratus",
+        "tags": tags,
+        "category": category,
+        "pid": proc.get("pid"),
+        "process_name": proc.get("name", ""),
+        "process_image": proc.get("exe", ""),
+        "command_line": proc.get("cmdline", ""),
+        "parent_pid": proc.get("ppid"),
+        "parent_name": proc.get("parent_name", ""),
+        "parent_command_line": proc.get("parent_cmdline", ""),
+        "user": proc.get("username", ""),
+        "detonated": True,
+        "detonation_source": "fibratus",
+        "raw": data,
+    }
+    return alert
+
+
+def load_fibratus_alerts():
+    """Load Fibratus alerts from Windows Event Log (Application log, Provider: Fibratus)."""
+    global _fibratus_last_read_time
+    alerts = []
+
+    # Build PowerShell command to query Fibratus events
+    # Use Get-WinEvent with FilterHashtable for efficiency
+    ps_cmd = (
+        "Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='Fibratus'} "
+        "-MaxEvents 500 -ErrorAction SilentlyContinue | "
+        "ForEach-Object { $_.Message } "
+    )
+
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return alerts
+
+        # Each event message is a JSON blob; they may be separated by newlines
+        # PowerShell outputs each Message on its own line(s)
+        raw_output = result.stdout.strip()
+
+        # Try to split by JSON object boundaries
+        # Fibratus JSON alerts start with { and end with }
+        depth = 0
+        current_json = []
+        for line in raw_output.split("\n"):
+            line = line.rstrip()
+            if not line:
+                continue
+            current_json.append(line)
+            depth += line.count("{") - line.count("}")
+            if depth <= 0 and current_json:
+                json_str = "\n".join(current_json)
+                current_json = []
+                depth = 0
+                try:
+                    data = json.loads(json_str)
+                    alert = parse_fibratus_alert(data)
+                    if alert:
+                        alerts.append(alert)
+                except json.JSONDecodeError:
+                    continue
+
+        # Handle any remaining buffer
+        if current_json:
+            json_str = "\n".join(current_json)
+            try:
+                data = json.loads(json_str)
+                alert = parse_fibratus_alert(data)
+                if alert:
+                    alerts.append(alert)
+            except json.JSONDecodeError:
+                pass
+
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        print(f"[fibratus_loader] Error reading event log: {e}")
+        return alerts
+
+    return alerts
+
+
+def load_litterbox_results():
+    """Poll LitterBox API for completed analysis results and convert to alert format."""
+    alerts = []
+    try:
+        r = requests.get(f"{LITTERBOX_API}/api/analyses", params={"status": "completed"}, timeout=5)
+        if r.status_code != 200:
+            return alerts
+        analyses = r.json() if isinstance(r.json(), list) else r.json().get("results", [])
+    except (requests.RequestException, ValueError):
+        return alerts
+
+    for analysis in analyses:
+        try:
+            analysis_id = analysis.get("id") or analysis.get("task_id", "")
+            score = analysis.get("score", 0) or analysis.get("threat_score", 0)
+            sample = analysis.get("sample", {}) or {}
+            filename = sample.get("name") or analysis.get("filename", "unknown")
+            sha256 = sample.get("sha256") or analysis.get("sha256", "")
+            started = analysis.get("started") or analysis.get("timestamp", "")
+            completed = analysis.get("completed") or started
+
+            # Only create alert-level entries for analyses with findings
+            if score <= 0:
+                continue
+
+            # Map score to severity
+            if score >= 8:
+                severity = "critical"
+            elif score >= 5:
+                severity = "high"
+            elif score >= 3:
+                severity = "medium"
+            else:
+                severity = "low"
+
+            # Get process info from behavioral analysis if available
+            behaviors = analysis.get("behaviors", []) or analysis.get("signatures", [])
+            proc_name = analysis.get("process_name", "")
+            proc_pid = analysis.get("pid")
+            proc_image = analysis.get("process_image", "")
+            cmdline = analysis.get("command_line", "")
+
+            # Try to extract from first behavior if top-level is empty
+            if not proc_name and behaviors:
+                first_b = behaviors[0] if isinstance(behaviors[0], dict) else {}
+                proc_name = first_b.get("process_name", "")
+                proc_pid = first_b.get("pid") or proc_pid
+                proc_image = first_b.get("process_image", "") or proc_image
+
+            # Build description from signatures/behaviors
+            sigs = []
+            for b in (behaviors[:5] if behaviors else []):
+                if isinstance(b, dict):
+                    sigs.append(b.get("name") or b.get("description", ""))
+                elif isinstance(b, str):
+                    sigs.append(b)
+            description = "; ".join(s for s in sigs if s) if sigs else f"LitterBox analysis score: {score}/10"
+
+            # Extract tags (MITRE, etc)
+            tags = analysis.get("tags", []) or []
+            mitre = analysis.get("mitre_attacks", []) or analysis.get("ttps", [])
+            if mitre:
+                tags.extend([t.get("technique_id", t) if isinstance(t, dict) else str(t) for t in mitre])
+
+            alert = {
+                "id": f"lb_{analysis_id}",
+                "timestamp": completed,
+                "severity": severity,
+                "rule_name": f"LitterBox: {filename}",
+                "rule_description": description,
+                "engine": "litterbox",
+                "tags": tags,
+                "category": "process",
+                "pid": proc_pid,
+                "process_name": proc_name or filename,
+                "process_image": proc_image,
+                "command_line": cmdline,
+                "parent_pid": None,
+                "parent_name": "",
+                "parent_command_line": "",
+                "user": analysis.get("user", ""),
+                "detonated": True,
+                "detonation_source": "litterbox",
+                "litterbox_score": score,
+                "litterbox_id": analysis_id,
+                "sha256": sha256,
+                "raw": analysis,
+            }
+            alerts.append(alert)
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    return alerts
+
+
 def build_process_tree(alerts):
-    """Build process tree from alerts data."""
+    """Build process tree from alerts data.
+    
+    Handles PID reuse: if a PID's executable changes between alerts,
+    use the most recent process info (latest alert wins).
+    """
     processes = {}
     for alert in alerts:
         pid = alert.get("pid")
@@ -166,30 +463,67 @@ def build_process_tree(alerts):
                     "file": 0, "network": 0, "dns": 0, "http": 0,
                     "registry": 0, "modules": 0, "scripts": 0, "injection": 0,
                     "wmi": 0, "services": 0, "tasks": 0, "logons": 0,
-                    "artifacts": 0, "threats": 0,
+                    "artifacts": 0, "threats": 0, "detonated": 0,
                 },
                 "alerts": [],
+                "detonated": False,
+                "detonation_sources": [],
             }
         if pid:
-            # Count activity by category
-            cat = alert.get("category", "")
-            if isinstance(cat, list):
-                cat = cat[0] if cat else ""
-            cat_lower = cat.lower()
+            # Handle PID reuse: if the executable changed, update process identity
+            # (later alerts overwrite older ones so the most recent process info wins)
             proc_entry = processes.get(pid)
             if proc_entry:
+                alert_image = alert.get("process_image", "")
+                alert_ts = alert.get("timestamp", "")
+                if alert_image and alert_image != proc_entry["image"]:
+                    # Different executable on same PID = PID reuse; update to latest
+                    if alert_ts >= (proc_entry.get("last_seen") or ""):
+                        proc_entry["name"] = alert.get("process_name", proc_entry["name"])
+                        proc_entry["image"] = alert_image
+                        proc_entry["command_line"] = alert.get("command_line") or proc_entry["command_line"]
+                        proc_entry["user"] = alert.get("user") or proc_entry["user"]
+                        if alert.get("parent_pid"):
+                            proc_entry["parent_pid"] = alert.get("parent_pid")
+                            proc_entry["parent_name"] = alert.get("parent_name", "")
+
                 proc_entry["alerts"].append(alert)
+
+                # Count activity by category
+                cat = alert.get("category", "")
+                if isinstance(cat, list):
+                    cat = cat[0] if cat else ""
+                cat_lower = cat.lower()
+
                 proc_entry["activity"]["threats"] += 1
                 if "file" in cat_lower:
                     proc_entry["activity"]["file"] += 1
                 elif "network" in cat_lower:
                     proc_entry["activity"]["network"] += 1
+                    # Check if HTTP specifically (ports 80/443/8080/8443)
+                    raw = alert.get("raw", {})
+                    dest_port = _get_nested(raw, "destination.port") or _get_nested(raw, "network.destination.port")
+                    if dest_port in (80, 443, 8080, 8443, "80", "443", "8080", "8443"):
+                        proc_entry["activity"]["http"] += 1
                 elif "dns" in cat_lower:
                     proc_entry["activity"]["dns"] += 1
                 elif "registry" in cat_lower:
                     proc_entry["activity"]["registry"] += 1
                 elif "process" in cat_lower:
                     proc_entry["activity"]["modules"] += 1
+
+                # Count artifacts (YARA/IOC matches)
+                engine = alert.get("engine", "").lower()
+                if engine in ("yara", "ioc"):
+                    proc_entry["activity"]["artifacts"] += 1
+
+                # Track detonation enrichment (Fibratus / LitterBox)
+                if alert.get("detonated"):
+                    proc_entry["activity"]["detonated"] += 1
+                    proc_entry["detonated"] = True
+                    det_src = alert.get("detonation_source", "")
+                    if det_src and det_src not in proc_entry["detonation_sources"]:
+                        proc_entry["detonation_sources"].append(det_src)
 
                 # Track last seen timestamp
                 ts = alert.get("timestamp", "")
@@ -232,13 +566,32 @@ def build_process_tree(alerts):
 
 # --- Background alert loader ---
 def alert_loader_thread():
-    """Periodically reload alerts from Rustinel."""
+    """Periodically reload alerts from Rustinel, Fibratus, and LitterBox."""
     while True:
         try:
-            alerts = load_rustinel_alerts()
-            processes = build_process_tree(alerts)
+            # Load from all sources
+            rustinel_alerts = load_rustinel_alerts()
+            fibratus_alerts = load_fibratus_alerts()
+            litterbox_alerts = load_litterbox_results()
+
+            # Merge and deduplicate
+            all_alerts = rustinel_alerts + fibratus_alerts + litterbox_alerts
+            seen = set()
+            unique_alerts = []
+            for alert in all_alerts:
+                aid = alert.get("id")
+                if aid and aid not in seen:
+                    seen.add(aid)
+                    unique_alerts.append(alert)
+                elif not aid:
+                    unique_alerts.append(alert)
+
+            # Sort by timestamp
+            unique_alerts.sort(key=lambda a: a.get("timestamp", ""))
+
+            processes = build_process_tree(unique_alerts)
             with store_lock:
-                events_store["alerts"] = alerts
+                events_store["alerts"] = unique_alerts
                 events_store["processes"] = processes
         except Exception as e:
             print(f"[alert_loader] Error: {e}")
@@ -462,16 +815,19 @@ def api_alerts():
     """Get all Rustinel/Fibratus alerts."""
     with store_lock:
         alerts = events_store.get("alerts", [])
-    # Filter by severity/engine if requested
+    # Filter by severity/engine/detonated if requested
     severity = request.args.get("severity")
     engine = request.args.get("engine")
     pid = request.args.get("pid", type=int)
     since = request.args.get("since")  # ISO timestamp - only alerts after this time
+    detonated = request.args.get("detonated")
 
     if severity:
         alerts = [a for a in alerts if a.get("severity", "").lower() == severity.lower()]
     if engine:
         alerts = [a for a in alerts if a.get("engine", "").lower() == engine.lower()]
+    if detonated and detonated.lower() in ("true", "1", "yes"):
+        alerts = [a for a in alerts if a.get("detonated")]
     if pid:
         alerts = [a for a in alerts if a.get("pid") == pid]
     if since:
@@ -799,7 +1155,18 @@ def api_submit():
         "sha256": file_sha256,
     }
 
+    # Record submission in history
+    _record_submission(filename, file_sha256, len(file_bytes), target, results)
+
     return jsonify(results)
+
+
+@app.route("/api/submissions")
+def api_submissions():
+    """Return submission history list."""
+    with submissions_lock:
+        subs = _load_submissions()
+    return jsonify(subs)
 
 
 def _add_hash_to_ioc(sha256_hash, filename=""):
@@ -867,9 +1234,10 @@ def api_file_download():
 
 @app.route("/api/file/hex")
 def api_file_hex():
-    """Return hex dump of a file's first N bytes."""
+    """Return hex dump of a file's bytes starting from a given offset."""
     filepath = request.args.get("path", "")
     num_bytes = min(request.args.get("bytes", 8192, type=int), 65536)
+    start_offset = max(request.args.get("offset", 0, type=int), 0)
 
     if not filepath:
         return jsonify({"error": "No path specified"}), 400
@@ -879,25 +1247,125 @@ def api_file_hex():
         return jsonify({"error": "File not found", "hex": ""}), 404
 
     try:
+        file_size = os.path.getsize(norm_path)
         with open(norm_path, "rb") as f:
+            f.seek(start_offset)
             data = f.read(num_bytes)
 
         # Generate hex dump
         lines = []
-        for offset in range(0, len(data), 16):
-            chunk = data[offset:offset + 16]
+        for line_offset in range(0, len(data), 16):
+            chunk = data[line_offset:line_offset + 16]
             hex_part = " ".join(f"{b:02x}" for b in chunk[:8])
             hex_part += "  " + " ".join(f"{b:02x}" for b in chunk[8:])
             ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
-            lines.append(f"{offset:08x}  {hex_part:<49s} |{ascii_part}|")
+            abs_offset = start_offset + line_offset
+            lines.append(f"{abs_offset:08x}  {hex_part:<49s} |{ascii_part}|")
+
+        # Also provide raw bytes as list for the data inspector
+        raw_bytes = list(data)
 
         return jsonify({
             "hex": "\n".join(lines),
-            "size": os.path.getsize(norm_path),
+            "size": file_size,
             "bytes_shown": len(data),
+            "offset": start_offset,
+            "raw_bytes": raw_bytes,
         })
     except (IOError, OSError) as e:
         return jsonify({"error": str(e), "hex": ""}), 500
+
+
+@app.route("/api/file/hex/upload", methods=["POST"])
+def api_file_hex_upload():
+    """Accept a file upload, save to temp, return hex dump + path for further pagination."""
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    filename = file.filename or "uploaded_file"
+    file_bytes = file.read()
+
+    # Save to a temp directory for subsequent pagination requests
+    import tempfile
+    hex_temp_dir = os.path.join(tempfile.gettempdir(), "hex_uploads")
+    os.makedirs(hex_temp_dir, exist_ok=True)
+
+    # Use hash-based name to avoid conflicts but keep extension
+    file_hash = hashlib.sha256(file_bytes).hexdigest()[:16]
+    safe_name = "".join(c for c in filename if c.isalnum() or c in ".-_")[:80]
+    dest_path = os.path.join(hex_temp_dir, f"{file_hash}_{safe_name}")
+
+    with open(dest_path, "wb") as f:
+        f.write(file_bytes)
+
+    # Generate initial hex dump
+    num_bytes = min(request.form.get("bytes", 512, type=int), 65536)
+    lines = []
+    for line_offset in range(0, min(len(file_bytes), num_bytes), 16):
+        chunk = file_bytes[line_offset:line_offset + 16]
+        hex_part = " ".join(f"{b:02x}" for b in chunk[:8])
+        hex_part += "  " + " ".join(f"{b:02x}" for b in chunk[8:])
+        ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        lines.append(f"{line_offset:08x}  {hex_part:<49s} |{ascii_part}|")
+
+    return jsonify({
+        "hex": "\n".join(lines),
+        "size": len(file_bytes),
+        "bytes_shown": min(len(file_bytes), num_bytes),
+        "offset": 0,
+        "raw_bytes": list(file_bytes[:num_bytes]),
+        "path": dest_path,
+        "filename": filename,
+    })
+
+
+@app.route("/api/file/hex/write", methods=["POST"])
+def api_file_hex_write():
+    """Write modified bytes back to a file at a specific offset (hex editor save)."""
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "No JSON body provided"}), 400
+
+    filepath = data.get("path", "")
+    offset = data.get("offset", 0)
+    byte_values = data.get("bytes", [])  # List of int values 0-255
+
+    if not filepath:
+        return jsonify({"error": "No path specified"}), 400
+    if not byte_values:
+        return jsonify({"error": "No bytes to write"}), 400
+
+    norm_path = os.path.normpath(filepath)
+
+    # Security: only allow writes to user-writable directories
+    allowed_write_prefixes = [
+        r"C:\Users",
+        r"C:\Temp",
+        r"C:\Windows\Temp",
+    ]
+    if not any(norm_path.startswith(prefix) for prefix in allowed_write_prefixes):
+        return jsonify({"error": "Access denied: write not allowed to this path"}), 403
+
+    if not os.path.isfile(norm_path):
+        return jsonify({"error": "File not found"}), 404
+
+    try:
+        # Validate byte values
+        raw_bytes = bytes([b & 0xFF for b in byte_values])
+
+        with open(norm_path, "r+b") as f:
+            f.seek(offset)
+            f.write(raw_bytes)
+
+        return jsonify({
+            "status": "ok",
+            "path": norm_path,
+            "offset": offset,
+            "bytes_written": len(raw_bytes),
+        })
+    except (IOError, OSError) as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # --- Main ---

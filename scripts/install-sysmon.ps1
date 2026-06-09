@@ -22,12 +22,25 @@ Set-StrictMode -Version Latest
 
 Write-Host "=== Installing Sysmon ===" -ForegroundColor Cyan
 
+# Detect architecture - ARM64 uses Sysmon64a.exe, x86_64 uses Sysmon64.exe
+$isArm64 = ($env:PROCESSOR_ARCHITECTURE -eq "ARM64")
 $sysmonDir = "C:\tools\sysmon"
-$sysmonExe = "$sysmonDir\Sysmon64.exe"
+if ($isArm64) {
+    $sysmonExe = "$sysmonDir\Sysmon64a.exe"
+    $sysmonServiceName = "Sysmon64a"
+    Write-Host "[*] ARM64 detected - will use Sysmon64a.exe (native ARM64 build)" -ForegroundColor Yellow
+} else {
+    $sysmonExe = "$sysmonDir\Sysmon64.exe"
+    $sysmonServiceName = "Sysmon64"
+}
 $configPath = "$sysmonDir\sysmonconfig.xml"
 
 # Check if already installed and running
-$sysmonSvc = Get-Service -Name "Sysmon64" -ErrorAction SilentlyContinue
+$sysmonSvc = Get-Service -Name $sysmonServiceName -ErrorAction SilentlyContinue
+if (-not $sysmonSvc) {
+    # Also check alternate service name (ARM64 may register as Sysmon64)
+    $sysmonSvc = Get-Service -Name "Sysmon64" -ErrorAction SilentlyContinue
+}
 if ($sysmonSvc -and $sysmonSvc.Status -eq "Running") {
     Write-Host "[+] Sysmon already installed and running" -ForegroundColor Green
     Write-Host "[*] Updating configuration..." -ForegroundColor Yellow
@@ -72,11 +85,21 @@ Expand-Archive -Path $sysmonZipPath -DestinationPath $sysmonDir -Force
 Remove-Item $sysmonZipPath -Force -ErrorAction SilentlyContinue
 
 if (-not (Test-Path $sysmonExe)) {
-    Write-Host "[!] Sysmon64.exe not found after extraction" -ForegroundColor Red
-    # Check for alternate name
-    if (Test-Path "$sysmonDir\sysmon64.exe") {
-        $sysmonExe = "$sysmonDir\sysmon64.exe"
-    } else {
+    Write-Host "[!] $([System.IO.Path]::GetFileName($sysmonExe)) not found after extraction" -ForegroundColor Red
+    # Check for alternate names
+    $candidates = @("$sysmonDir\Sysmon64a.exe", "$sysmonDir\Sysmon64.exe", "$sysmonDir\sysmon64.exe", "$sysmonDir\sysmon64a.exe")
+    $found = $false
+    foreach ($candidate in $candidates) {
+        if (Test-Path $candidate) {
+            $sysmonExe = $candidate
+            $found = $true
+            Write-Host "[*] Using $candidate" -ForegroundColor Yellow
+            break
+        }
+    }
+    if (-not $found) {
+        Write-Host "[!] No Sysmon binary found. Contents:" -ForegroundColor Red
+        Get-ChildItem $sysmonDir | ForEach-Object { Write-Host "    $_" }
         exit 1
     }
 }
@@ -126,14 +149,18 @@ Write-Host "[*] Installing Sysmon service..." -ForegroundColor Yellow
 
 # Verify installation
 Start-Sleep -Seconds 3
-$sysmonSvc = Get-Service -Name "Sysmon64" -ErrorAction SilentlyContinue
+$sysmonSvc = Get-Service -Name $sysmonServiceName -ErrorAction SilentlyContinue
+if (-not $sysmonSvc) {
+    $sysmonSvc = Get-Service -Name "Sysmon64" -ErrorAction SilentlyContinue
+}
 if ($sysmonSvc -and $sysmonSvc.Status -eq "Running") {
-    Write-Host "[+] Sysmon installed and running" -ForegroundColor Green
+    Write-Host "[+] Sysmon installed and running (service: $($sysmonSvc.Name))" -ForegroundColor Green
 } else {
     # Try starting it
-    Start-Service -Name "Sysmon64" -ErrorAction SilentlyContinue
+    $svcName = if (Get-Service -Name $sysmonServiceName -ErrorAction SilentlyContinue) { $sysmonServiceName } else { "Sysmon64" }
+    Start-Service -Name $svcName -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
-    $sysmonSvc = Get-Service -Name "Sysmon64" -ErrorAction SilentlyContinue
+    $sysmonSvc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
     if ($sysmonSvc -and $sysmonSvc.Status -eq "Running") {
         Write-Host "[+] Sysmon installed and started" -ForegroundColor Green
     } else {

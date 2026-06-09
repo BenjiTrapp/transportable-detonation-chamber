@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Detonation Chamber</title>
-    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="/static/css/style.css?v=2">
 </head>
 <body>
     <div id="app">
@@ -15,7 +15,9 @@
                 <nav class="sidebar-tabs">
                     <button class="tab active" data-tab="dashboard">Dashboard</button>
                     <button class="tab" data-tab="tracing">Tracing</button>
+                    <button class="tab" data-tab="graph">Graph</button>
                     <button class="tab" data-tab="sysmon">Sysmon</button>
+                    <button class="tab" data-tab="hexeditor">Hex</button>
                     <button class="tab" data-tab="submit">Submit</button>
                 </nav>
             </div>
@@ -63,28 +65,173 @@
                 </div>
             </div>
 
-            <!-- Tracing Tab -->
+            <!-- Tracing Tab - RUSTINEL TRACE Analysis Console -->
             <div class="tab-content" id="tab-tracing">
-                <div class="content-header">
-                    <h2>Event Tracing</h2>
-                    <div class="header-actions">
-                        <select id="filter-severity" class="filter-select">
-                            <option value="">All Severities</option>
-                            <option value="critical">Critical</option>
-                            <option value="high">High</option>
-                            <option value="medium">Medium</option>
-                            <option value="low">Low</option>
+                <!-- Console Header Bar -->
+                <div class="rtrace-header">
+                    <div class="rtrace-title">
+                        <span class="rtrace-brand"><span class="rtrace-brand-highlight">RUSTINEL TRACE</span> Analysis Console</span>
+                    </div>
+                    <div class="rtrace-header-actions">
+                        <select id="rtrace-process-select" class="rtrace-process-dropdown">
+                            <option value="">-- select process --</option>
                         </select>
-                        <select id="filter-engine" class="filter-select">
-                            <option value="">All Engines</option>
-                            <option value="sigma">Sigma</option>
-                            <option value="yara">YARA</option>
-                            <option value="ioc">IOC</option>
-                        </select>
-                        <button class="btn btn-sm" onclick="refreshAlerts()">Refresh</button>
+                        <button class="btn btn-sm" onclick="refreshAlerts()">&#x21BB; Refresh</button>
+                        <button class="btn btn-sm" onclick="clearStoppedProcesses()">&#x23F8; Clear stopped</button>
+                        <button class="btn btn-sm" onclick="clearAllTracing()">&#x23F9; Clear all</button>
                     </div>
                 </div>
-                <div id="alerts-table" class="events-table"></div>
+
+                <!-- Process Info Bar -->
+                <div class="rtrace-info-bar" id="rtrace-info-bar">
+                    <span class="rtrace-proc-name" id="rtrace-proc-name">--</span>
+                    <span class="rtrace-verdict-badge" id="rtrace-verdict-badge">--</span>
+                    <span class="rtrace-tag" id="rtrace-tag-status">--</span>
+                    <span class="rtrace-tag" id="rtrace-tag-platform">windows</span>
+                    <span class="rtrace-stat" id="rtrace-stat-procs">0 processes</span>
+                    <span class="rtrace-stat" id="rtrace-stat-events">0 events</span>
+                    <span class="rtrace-stat" id="rtrace-stat-duration">0m 0s</span>
+                    <span class="rtrace-path" id="rtrace-path">--</span>
+                </div>
+
+                <!-- Severity Summary Bar -->
+                <div class="rtrace-severity-bar" id="rtrace-severity-bar">
+                    <div class="rtrace-sev-section">
+                        <div class="rtrace-sev-counts" id="rtrace-sev-counts"></div>
+                    </div>
+                    <div class="rtrace-sev-section">
+                        <div class="rtrace-engines" id="rtrace-engines"></div>
+                    </div>
+                    <div class="rtrace-sev-section">
+                        <div class="rtrace-top-rules" id="rtrace-top-rules"></div>
+                    </div>
+                </div>
+
+                <!-- Timeline -->
+                <div class="rtrace-timeline-section">
+                    <div class="rtrace-timeline-label">
+                        <span>TIMELINE</span>
+                        <span class="rtrace-timeline-time-range" id="rtrace-timeline-range"></span>
+                    </div>
+                    <div class="rtrace-timeline-bar" id="rtrace-timeline-bar">
+                        <div class="rtrace-timeline-cursor" id="rtrace-timeline-cursor"></div>
+                    </div>
+                    <div class="rtrace-timeline-legend">
+                        <span class="rtrace-legend-item"><span class="rtrace-legend-dot" style="background:#ef4444"></span>Critical/High</span>
+                        <span class="rtrace-legend-item"><span class="rtrace-legend-dot" style="background:#3b82f6"></span>Process</span>
+                        <span class="rtrace-legend-item"><span class="rtrace-legend-dot" style="background:#22c55e"></span>Network</span>
+                        <span class="rtrace-legend-item"><span class="rtrace-legend-dot" style="background:#a78bfa"></span>DNS</span>
+                        <span class="rtrace-legend-item"><span class="rtrace-legend-dot" style="background:#f97316"></span>File</span>
+                        <span class="rtrace-legend-item"><span class="rtrace-legend-dot" style="background:#f472b6"></span>Registry</span>
+                    </div>
+                </div>
+
+                <!-- Split View: Process Tree + Detail -->
+                <div class="rtrace-split">
+                    <!-- Left: Process Tree -->
+                    <div class="rtrace-tree-panel">
+                        <div class="rtrace-tree-header">
+                            <span>PROCESS TREE (<span id="rtrace-tree-count">0</span>) &mdash; TIME FROM START</span>
+                        </div>
+                        <div class="rtrace-tree-list" id="rtrace-tree-list">
+                            <!-- Rendered by JS -->
+                        </div>
+                    </div>
+
+                    <!-- Right: Detail Tabs + Event Table -->
+                    <div class="rtrace-detail-panel">
+                        <div class="rtrace-detail-placeholder" id="rtrace-detail-placeholder">
+                            Select a process to inspect its details.
+                        </div>
+                        <div class="rtrace-detail-content" id="rtrace-detail-content" style="display:none;">
+                            <!-- Detail tabs -->
+                            <div class="rtrace-detail-tabs" id="rtrace-detail-tabs">
+                                <button class="rtrace-tab active" data-rtab="verdict">Verdict</button>
+                                <button class="rtrace-tab" data-rtab="live">Live</button>
+                                <button class="rtrace-tab" data-rtab="http">HTTP Requests <span class="rtrace-tab-count">0</span></button>
+                                <button class="rtrace-tab" data-rtab="connections">Connections <span class="rtrace-tab-count">0</span></button>
+                                <button class="rtrace-tab" data-rtab="dns">DNS Requests <span class="rtrace-tab-count">0</span></button>
+                                <button class="rtrace-tab" data-rtab="files">Files <span class="rtrace-tab-count">0</span></button>
+                                <button class="rtrace-tab" data-rtab="registry">Registry <span class="rtrace-tab-count">0</span></button>
+                                <button class="rtrace-tab" data-rtab="artifacts">Artifacts <span class="rtrace-tab-count">0</span></button>
+                                <button class="rtrace-tab" data-rtab="modules">Modules <span class="rtrace-tab-count">0</span></button>
+                            </div>
+                            <!-- Event Table -->
+                            <div class="rtrace-event-table-wrapper" id="rtrace-event-table-wrapper">
+                                <!-- Column headers -->
+                                <div class="rtrace-event-table-header">
+                                    <div class="rtrace-col rtrace-col-sev">Sev</div>
+                                    <div class="rtrace-col rtrace-col-time">Time</div>
+                                    <div class="rtrace-col rtrace-col-action">Action</div>
+                                    <div class="rtrace-col rtrace-col-rule">Rule / Engine</div>
+                                    <div class="rtrace-col rtrace-col-pid">PID</div>
+                                    <div class="rtrace-col rtrace-col-process">Process</div>
+                                    <div class="rtrace-col rtrace-col-details">Details</div>
+                                </div>
+                                <div class="rtrace-event-table-body" id="rtrace-event-table-body">
+                                    <!-- Rendered by JS -->
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Graph Tab -->
+            <div class="tab-content" id="tab-graph">
+                <div class="graph-toolbar">
+                    <div class="graph-toolbar-left">
+                        <span class="graph-title">PROCESS ROLLUP GRAPH</span>
+                        <span class="graph-subtitle" id="graph-node-count">0 nodes, 0 edges</span>
+                    </div>
+                    <div class="graph-toolbar-right">
+                        <div class="graph-search-wrapper">
+                            <input type="text" id="graph-search" class="graph-search-input" placeholder="Search process / filename..." autocomplete="off" spellcheck="false">
+                            <span class="graph-search-icon">&#128269;</span>
+                            <span class="graph-search-clear" id="graph-search-clear">&times;</span>
+                        </div>
+                        <div class="graph-time-filter">
+                            <button class="graph-time-btn" data-seconds="30">30s</button>
+                            <button class="graph-time-btn" data-seconds="60">1m</button>
+                            <button class="graph-time-btn" data-seconds="300">5m</button>
+                            <button class="graph-time-btn" data-seconds="900">15m</button>
+                            <button class="graph-time-btn" data-seconds="3600">1h</button>
+                            <button class="graph-time-btn" data-seconds="86400">24h</button>
+                            <button class="graph-time-btn active" data-seconds="0">All</button>
+                        </div>
+                        <label class="graph-toggle"><input type="checkbox" id="graph-show-network" checked> Network</label>
+                        <label class="graph-toggle"><input type="checkbox" id="graph-show-dns" checked> DNS</label>
+                        <label class="graph-toggle"><input type="checkbox" id="graph-show-files"> Files</label>
+                        <label class="graph-toggle"><input type="checkbox" id="graph-show-registry"> Registry</label>
+                        <label class="graph-toggle detonated"><input type="checkbox" id="graph-show-detonated"> Detonated</label>
+                        <select id="graph-layout" class="filter-select">
+                            <option value="force">Force-directed</option>
+                            <option value="hierarchy" selected>Hierarchical</option>
+                        </select>
+                        <button class="btn btn-sm" onclick="graphFitView()">Fit</button>
+                        <button class="btn btn-sm" onclick="graphRefresh()">Refresh</button>
+                    </div>
+                </div>
+                <div class="graph-container" id="graph-container">
+                    <canvas id="graph-canvas"></canvas>
+                    <div class="graph-tooltip" id="graph-tooltip"></div>
+                    <div class="graph-legend">
+                        <span class="graph-legend-item"><span class="graph-legend-dot" style="background:#3b82f6"></span>Process</span>
+                        <span class="graph-legend-item"><span class="graph-legend-dot" style="background:#ef4444"></span>Malicious</span>
+                        <span class="graph-legend-item"><span class="graph-legend-dot detonated-dot" style="background:#fbbf24"></span>Detonated</span>
+                        <span class="graph-legend-item"><span class="graph-legend-dot" style="background:#22c55e"></span>Network</span>
+                        <span class="graph-legend-item"><span class="graph-legend-dot" style="background:#a78bfa"></span>DNS</span>
+                        <span class="graph-legend-item"><span class="graph-legend-dot" style="background:#f97316"></span>File</span>
+                        <span class="graph-legend-item"><span class="graph-legend-dot" style="background:#f472b6"></span>Registry</span>
+                        <span class="graph-legend-item line"><span class="graph-legend-line spawn"></span>Spawned</span>
+                        <span class="graph-legend-item line"><span class="graph-legend-line network"></span>Connection</span>
+                        <span class="graph-legend-item line"><span class="graph-legend-line inject"></span>Injection</span>
+                    </div>
+                </div>
+                <div class="graph-detail-panel" id="graph-detail-panel">
+                    <div class="graph-detail-header" id="graph-detail-header">Select a node</div>
+                    <div class="graph-detail-body" id="graph-detail-body"></div>
+                </div>
             </div>
 
             <!-- Sysmon Tab -->
@@ -115,6 +262,74 @@
                 </div>
                 <div class="sysmon-stats" id="sysmon-stats"></div>
                 <div id="sysmon-table" class="events-table"></div>
+            </div>
+
+            <!-- Hex Editor Tab -->
+            <div class="tab-content" id="tab-hexeditor">
+                <div class="content-header">
+                    <h2>Hex Editor</h2>
+                    <div class="header-actions">
+                        <input type="number" id="hex-offset" class="filter-input hex-offset-input" placeholder="Offset" value="0" min="0">
+                        <select id="hex-bytes-per-page" class="filter-select">
+                            <option value="256">256 bytes</option>
+                            <option value="512" selected>512 bytes</option>
+                            <option value="1024">1 KB</option>
+                            <option value="4096">4 KB</option>
+                            <option value="8192">8 KB</option>
+                        </select>
+                        <button class="btn btn-sm" onclick="hexPrevPage()">&#x25C0; Prev</button>
+                        <button class="btn btn-sm" onclick="hexNextPage()">Next &#x25B6;</button>
+                    </div>
+                </div>
+                <!-- Drop zone + path input -->
+                <div class="hex-drop-zone" id="hex-drop-zone">
+                    <div class="hex-drop-icon">&#x1F4C2;</div>
+                    <p>Drop a file here or <span class="hex-browse-link" onclick="document.getElementById('hex-file-input').click()">browse</span></p>
+                    <input type="file" id="hex-file-input" hidden>
+                    <div class="hex-path-row">
+                        <span class="hex-path-or">or enter VM path:</span>
+                        <input type="text" id="hex-filepath" class="filter-input hex-path-input" placeholder="C:\path\to\file...">
+                        <button class="btn btn-sm btn-primary" onclick="hexLoad()">Load</button>
+                    </div>
+                </div>
+                <div class="hex-editor-container">
+                    <!-- File Info Bar -->
+                    <div class="hex-file-info" id="hex-file-info">
+                        <span class="hex-info-item">No file loaded</span>
+                    </div>
+                    <!-- Hex Editor Body -->
+                    <div class="hex-editor-body">
+                        <!-- Offset Column -->
+                        <div class="hex-offset-col" id="hex-offset-col"></div>
+                        <!-- Hex View -->
+                        <div class="hex-view" id="hex-view"></div>
+                        <!-- ASCII View -->
+                        <div class="hex-ascii-col" id="hex-ascii-col"></div>
+                    </div>
+                    <!-- Hex Status Bar -->
+                    <div class="hex-status-bar" id="hex-status-bar">
+                        <span class="hex-status-item" id="hex-status-offset">Offset: 0x00000000</span>
+                        <span class="hex-status-item" id="hex-status-selection">No selection</span>
+                        <span class="hex-status-item" id="hex-status-value">--</span>
+                        <span class="hex-status-item" id="hex-status-size">Size: --</span>
+                    </div>
+                    <!-- Hex Inspector -->
+                    <div class="hex-inspector" id="hex-inspector">
+                        <div class="hex-inspector-title">DATA INSPECTOR</div>
+                        <div class="hex-inspector-fields" id="hex-inspector-fields">
+                            <div class="hex-insp-row"><span class="hex-insp-label">Int8</span><span class="hex-insp-value" id="hex-insp-int8">--</span></div>
+                            <div class="hex-insp-row"><span class="hex-insp-label">UInt8</span><span class="hex-insp-value" id="hex-insp-uint8">--</span></div>
+                            <div class="hex-insp-row"><span class="hex-insp-label">Int16 LE</span><span class="hex-insp-value" id="hex-insp-int16le">--</span></div>
+                            <div class="hex-insp-row"><span class="hex-insp-label">UInt16 LE</span><span class="hex-insp-value" id="hex-insp-uint16le">--</span></div>
+                            <div class="hex-insp-row"><span class="hex-insp-label">Int32 LE</span><span class="hex-insp-value" id="hex-insp-int32le">--</span></div>
+                            <div class="hex-insp-row"><span class="hex-insp-label">UInt32 LE</span><span class="hex-insp-value" id="hex-insp-uint32le">--</span></div>
+                            <div class="hex-insp-row"><span class="hex-insp-label">Float32</span><span class="hex-insp-value" id="hex-insp-float32">--</span></div>
+                            <div class="hex-insp-row"><span class="hex-insp-label">Float64</span><span class="hex-insp-value" id="hex-insp-float64">--</span></div>
+                            <div class="hex-insp-row"><span class="hex-insp-label">ASCII</span><span class="hex-insp-value" id="hex-insp-ascii">--</span></div>
+                            <div class="hex-insp-row"><span class="hex-insp-label">UTF-16 LE</span><span class="hex-insp-value" id="hex-insp-utf16">--</span></div>
+                        </div>
+                    </div>
+                </div>
             </div>
 
             <!-- Submit Tab -->
@@ -148,6 +363,16 @@
                     </div>
                     <div id="submit-result" class="submit-result"></div>
                 </div>
+                <!-- Submissions History -->
+                <div class="submissions-history">
+                    <div class="submissions-header">
+                        <h3>Submission History</h3>
+                        <button class="btn btn-sm" onclick="refreshSubmissions()">Refresh</button>
+                    </div>
+                    <div class="submissions-list" id="submissions-list">
+                        <div style="padding:12px;color:var(--text-muted);font-size:11px;">Loading submissions...</div>
+                    </div>
+                </div>
             </div>
         </main>
 
@@ -168,6 +393,6 @@
         </div>
     </div>
 
-    <script src="/static/js/app.js"></script>
+    <script src="/static/js/app.js?v=2"></script>
 </body>
 </html>

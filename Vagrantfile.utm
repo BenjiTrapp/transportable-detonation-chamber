@@ -1,0 +1,143 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+# Transportable Detonation Chamber - UTM / QEMU (Apple Silicon)
+# Windows 11 ARM VM with Detonator + DetonatorAgent + Fibratus + Rustinel + LitterBox
+#
+# This Vagrantfile targets macOS hosts with Apple Silicon (M1/M2/M3/M4)
+# using the vagrant-qemu provider and a Windows 11 ARM64 guest.
+#
+# Prerequisites:
+#   - macOS on Apple Silicon
+#   - Homebrew: brew install qemu
+#   - Vagrant: brew install --cask vagrant
+#   - Plugin: vagrant plugin install vagrant-qemu
+#   - A Windows 11 ARM64 Vagrant box (see below)
+#
+# Setting up the Windows 11 ARM box:
+#   Option A - Use a pre-built community box (if available):
+#     vagrant box add win11-arm path/to/windows11-arm.box --provider qemu
+#
+#   Option B - Build from ISO using Packer:
+#     1. Download Windows 11 ARM64 ISO from:
+#        https://www.microsoft.com/software-download/windows11arm64
+#     2. Use packer template from: https://github.com/StefanScherer/packer-windows
+#        (ARM64 variant)
+#     3. Import: vagrant box add win11-arm output/windows11-arm.box --provider qemu
+#
+#   Option C - Convert a UTM/QCOW2 image:
+#     1. Create Windows 11 ARM VM in UTM manually
+#     2. Install WinRM: winrm quickconfig -force
+#     3. Set vagrant/vagrant credentials
+#     4. Package: vagrant package --base <vm-name> --output win11-arm.box
+#
+# Usage:
+#   vagrant up --provider=qemu
+#   vagrant rdp
+#   vagrant halt
+#   vagrant destroy
+
+Vagrant.configure("2") do |config|
+  # Windows 11 ARM64 box - adjust name to match your imported box
+  config.vm.box = "win11-arm"
+  config.vm.hostname = "detonation-chamber"
+
+  # Communicator settings for Windows
+  config.vm.communicator = "winrm"
+  config.winrm.username = "vagrant"
+  config.winrm.password = "vagrant"
+  config.winrm.timeout = 1800
+  config.winrm.retry_limit = 30
+
+  # Network: expose service ports
+  config.vm.network "forwarded_port", guest: 5000, host: 5000  # Detonator Web UI
+  config.vm.network "forwarded_port", guest: 8000, host: 8000  # Detonator REST API
+  config.vm.network "forwarded_port", guest: 8080, host: 8080  # DetonatorAgent API
+  config.vm.network "forwarded_port", guest: 1337, host: 1337  # LitterBox Web UI
+  config.vm.network "forwarded_port", guest: 9000, host: 9000  # Unified Web UI
+
+  # QEMU provider settings (vagrant-qemu plugin)
+  config.vm.provider "qemu" do |qe|
+    qe.arch = "aarch64"
+    qe.machine = "virt,highmem=on"
+    qe.cpu = "host"
+    qe.smp = "cpus=4,sockets=1,cores=4,threads=1"
+    qe.memory = "4G"
+    qe.net_device = "virtio-net-pci"
+    qe.ssh_port = 50222
+
+    # Enable Apple Hypervisor.framework acceleration (native speed)
+    qe.accel = "hvf"
+
+    # Disk: use virtio-blk for best performance
+    qe.drive_interface = "virtio"
+    qe.disk_size = "80G"
+
+    # EFI boot (required for Windows 11 ARM)
+    qe.extra_qemu_args = %w(
+      -bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd
+      -device virtio-gpu-pci
+      -device qemu-xhci
+      -device usb-kbd
+      -device usb-tablet
+    )
+  end
+
+  # Increase boot timeout for Windows
+  config.vm.boot_timeout = 1200
+
+  # Disable default synced folder
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+
+  # Copy config and webui into the VM via file provisioners
+  config.vm.provision "file", source: "config", destination: "C:\\vagrant_config"
+  config.vm.provision "file", source: "webui", destination: "C:\\vagrant\\webui"
+
+  # Provisioning: run scripts in order
+  # All scripts are architecture-aware (detect ARM64 vs x86_64 automatically)
+  config.vm.provision "prerequisites",
+    type: "shell",
+    path: "scripts/install-prerequisites.ps1",
+    privileged: true
+
+  config.vm.provision "sysmon",
+    type: "shell",
+    path: "scripts/install-sysmon.ps1",
+    privileged: true
+
+  config.vm.provision "fibratus",
+    type: "shell",
+    path: "scripts/install-fibratus.ps1",
+    privileged: true
+
+  config.vm.provision "rustinel",
+    type: "shell",
+    path: "scripts/install-rustinel.ps1",
+    privileged: true
+
+  config.vm.provision "detection-rules",
+    type: "shell",
+    path: "scripts/install-detection-rules.ps1",
+    privileged: true
+
+  config.vm.provision "detonator",
+    type: "shell",
+    path: "scripts/install-detonator.ps1",
+    privileged: true
+
+  config.vm.provision "litterbox",
+    type: "shell",
+    path: "scripts/install-litterbox.ps1",
+    privileged: true
+
+  config.vm.provision "webui",
+    type: "shell",
+    path: "scripts/install-webui.ps1",
+    privileged: true
+
+  config.vm.provision "configure",
+    type: "shell",
+    path: "scripts/configure-services.ps1",
+    privileged: true,
+    run: "always"
+end

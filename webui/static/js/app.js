@@ -10,18 +10,30 @@ let state = {
     selectedProcess: null,
     activeTab: 'dashboard',
     detailOpen: false,
-    detailHistory: [], // For back navigation
-    sessionStart: null, // First event timestamp for relative time calc
-    serviceStatus: {},  // Cached service status
-    rustinelInfo: null, // Cached Rustinel detail
+    detailHistory: [],
+    sessionStart: null,
+    serviceStatus: {},
+    rustinelInfo: null,
+    // RTRACE Console state
+    rtraceSelectedPid: null,
+    rtraceActiveDetailTab: 'live',
+    rtraceEvents: [], // All events for the selected process
+    // Hex Editor state
+    hexData: null,
+    hexFileSize: 0,
+    hexFilePath: '',
+    hexOffset: 0,
+    hexSelectedByte: -1,
 };
 
 // --- Initialization ---
 document.addEventListener('DOMContentLoaded', () => {
     initTabs();
     initUpload();
+    initHexDropZone();
+    initRtraceTabs();
+    initGraphControls();
     refreshAll();
-    // Poll for updates
     setInterval(refreshAlerts, 5000);
     setInterval(refreshDashboard, 10000);
     refreshDashboard();
@@ -43,9 +55,17 @@ function switchTab(tabName) {
     document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
     document.querySelector(`.tab[data-tab="${tabName}"]`).classList.add('active');
     document.getElementById(`tab-${tabName}`).classList.add('active');
-    // Load Sysmon data on tab switch
     if (tabName === 'sysmon' && sysmonEvents.length === 0) {
         refreshSysmon();
+    }
+    if (tabName === 'tracing') {
+        renderRtraceConsole();
+    }
+    if (tabName === 'graph') {
+        graphRefresh();
+    }
+    if (tabName === 'submit') {
+        refreshSubmissions();
     }
 }
 
@@ -68,7 +88,6 @@ async function refreshDashboard() {
             state.rustinelInfo = await rustinelResp.json();
         }
         renderDashboard();
-        // Update timestamp
         const timeEl = document.getElementById('dashboard-time');
         if (timeEl) timeEl.textContent = 'Updated ' + new Date().toLocaleTimeString('en-GB');
     } catch (e) {
@@ -78,22 +97,17 @@ async function refreshDashboard() {
 
 async function refreshAlerts() {
     try {
-        const severity = document.getElementById('filter-severity')?.value || '';
-        const engine = document.getElementById('filter-engine')?.value || '';
-        let url = '/api/alerts?';
-        if (severity) url += `severity=${severity}&`;
-        if (engine) url += `engine=${engine}&`;
-
-        const resp = await fetch(url);
+        const resp = await fetch('/api/alerts');
         if (resp.ok) {
             state.alerts = await resp.json();
-            // Compute session start time
             if (state.alerts.length) {
                 const times = state.alerts.map(a => new Date(a.timestamp).getTime()).filter(t => !isNaN(t));
                 state.sessionStart = times.length ? Math.min(...times) : null;
             }
-            renderAlerts();
             renderTimeline();
+            if (state.activeTab === 'tracing') {
+                renderRtraceConsole();
+            }
         }
     } catch (e) {
         console.error('Failed to fetch alerts:', e);
@@ -132,14 +146,11 @@ function renderDashboard() {
 
     const status = state.serviceStatus;
     const rustinel = state.rustinelInfo || {};
-
     const cards = [];
 
     // Rustinel Card
     const rOnline = rustinel.online || status.rustinel?.online || false;
     const rRules = rustinel.rules || {};
-    const rIoc = rRules.ioc || {};
-    const totalIoc = (rIoc.hashes || 0) + (rIoc.ips || 0) + (rIoc.domains || 0);
     cards.push(`
         <div class="service-card rustinel-card ${rOnline ? '' : 'offline'}" onclick="openRustinelDetail()">
             <div class="service-card-glow"></div>
@@ -150,27 +161,15 @@ function renderDashboard() {
                 </div>
                 <span class="service-status-badge ${rOnline ? 'online' : 'offline'}">${rOnline ? 'Online' : 'Offline'}</span>
             </div>
-            <div class="service-card-desc">
-                Sigma/YARA/IOC detection engine via ETW.
-                ${rustinel.version ? `<br>${escapeHtml(rustinel.version)}` : ''}
-            </div>
+            <div class="service-card-desc">Sigma/YARA/IOC detection engine via ETW.${rustinel.version ? `<br>${escapeHtml(rustinel.version)}` : ''}</div>
             <div class="service-card-metrics">
-                <div class="service-metric">
-                    <div class="service-metric-value ${rRules.sigma === 0 ? 'zero' : ''}">${rRules.sigma || 0}</div>
-                    <div class="service-metric-label">SIGMA</div>
-                </div>
-                <div class="service-metric">
-                    <div class="service-metric-value ${rRules.yara === 0 ? 'zero' : ''}">${rRules.yara || 0}</div>
-                    <div class="service-metric-label">YARA</div>
-                </div>
-                <div class="service-metric">
-                    <div class="service-metric-value ${rustinel.alerts_count === 0 ? 'zero' : ''}">${rustinel.alerts_count || 0}</div>
-                    <div class="service-metric-label">ALERTS</div>
-                </div>
+                <div class="service-metric"><div class="service-metric-value ${rRules.sigma === 0 ? 'zero' : ''}">${rRules.sigma || 0}</div><div class="service-metric-label">SIGMA</div></div>
+                <div class="service-metric"><div class="service-metric-value ${rRules.yara === 0 ? 'zero' : ''}">${rRules.yara || 0}</div><div class="service-metric-label">YARA</div></div>
+                <div class="service-metric"><div class="service-metric-value ${rustinel.alerts_count === 0 ? 'zero' : ''}">${rustinel.alerts_count || 0}</div><div class="service-metric-label">ALERTS</div></div>
             </div>
             <div class="service-card-actions">
                 <button class="btn btn-sm" onclick="event.stopPropagation(); openRustinelDetail()">Details</button>
-                <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('tracing')">View Alerts</button>
+                <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('tracing')">Trace Console</button>
             </div>
         </div>
     `);
@@ -182,28 +181,14 @@ function renderDashboard() {
         <div class="service-card agent-card ${aOnline ? '' : 'offline'}" onclick="openAgentDetail()">
             <div class="service-card-glow"></div>
             <div class="service-card-header">
-                <div class="service-card-title">
-                    <div class="service-icon agent">D</div>
-                    <h3>DetonatorAgent</h3>
-                </div>
+                <div class="service-card-title"><div class="service-icon agent">D</div><h3>DetonatorAgent</h3></div>
                 <span class="service-status-badge ${aOnline ? 'online' : 'offline'}">${aOnline ? 'Online' : 'Offline'}</span>
             </div>
-            <div class="service-card-desc">
-                .NET execution agent. Detonates samples and collects EDR telemetry on port 8080.
-            </div>
+            <div class="service-card-desc">.NET execution agent. Detonates samples and collects EDR telemetry on port 8080.</div>
             <div class="service-card-metrics">
-                <div class="service-metric">
-                    <div class="service-metric-value">${aOnline ? '8080' : '--'}</div>
-                    <div class="service-metric-label">PORT</div>
-                </div>
-                <div class="service-metric">
-                    <div class="service-metric-value ${aInUse ? '' : 'zero'}">${aInUse ? 'Yes' : 'No'}</div>
-                    <div class="service-metric-label">IN USE</div>
-                </div>
-                <div class="service-metric">
-                    <div class="service-metric-value">${aOnline ? 'Fibratus' : '--'}</div>
-                    <div class="service-metric-label">EDR</div>
-                </div>
+                <div class="service-metric"><div class="service-metric-value">${aOnline ? '8080' : '--'}</div><div class="service-metric-label">PORT</div></div>
+                <div class="service-metric"><div class="service-metric-value ${aInUse ? '' : 'zero'}">${aInUse ? 'Yes' : 'No'}</div><div class="service-metric-label">IN USE</div></div>
+                <div class="service-metric"><div class="service-metric-value">${aOnline ? 'Fibratus' : '--'}</div><div class="service-metric-label">EDR</div></div>
             </div>
             <div class="service-card-actions">
                 <button class="btn btn-sm" onclick="event.stopPropagation(); openAgentDetail()">Details</button>
@@ -218,68 +203,18 @@ function renderDashboard() {
         <div class="service-card litterbox-card ${lOnline ? '' : 'offline'}" onclick="openLitterboxDetail()">
             <div class="service-card-glow"></div>
             <div class="service-card-header">
-                <div class="service-card-title">
-                    <div class="service-icon litterbox">L</div>
-                    <h3>LitterBox</h3>
-                </div>
+                <div class="service-card-title"><div class="service-icon litterbox">L</div><h3>LitterBox</h3></div>
                 <span class="service-status-badge ${lOnline ? 'online' : 'offline'}">${lOnline ? 'Online' : 'Offline'}</span>
             </div>
-            <div class="service-card-desc">
-                Self-hosted payload analysis sandbox. Static analysis, memory scanning, YARA, detection scoring.
-            </div>
+            <div class="service-card-desc">Self-hosted payload analysis sandbox. Static analysis, memory scanning, YARA.</div>
             <div class="service-card-metrics">
-                <div class="service-metric">
-                    <div class="service-metric-value">${lOnline ? '1337' : '--'}</div>
-                    <div class="service-metric-label">PORT</div>
-                </div>
-                <div class="service-metric">
-                    <div class="service-metric-value">PE-Sieve</div>
-                    <div class="service-metric-label">SCANNER</div>
-                </div>
-                <div class="service-metric">
-                    <div class="service-metric-value">MCP</div>
-                    <div class="service-metric-label">LLM API</div>
-                </div>
+                <div class="service-metric"><div class="service-metric-value">${lOnline ? '1337' : '--'}</div><div class="service-metric-label">PORT</div></div>
+                <div class="service-metric"><div class="service-metric-value">PE-Sieve</div><div class="service-metric-label">SCANNER</div></div>
+                <div class="service-metric"><div class="service-metric-value">MCP</div><div class="service-metric-label">LLM API</div></div>
             </div>
             <div class="service-card-actions">
                 <button class="btn btn-sm" onclick="event.stopPropagation(); openLitterboxDetail()">Details</button>
                 <button class="btn btn-sm" onclick="event.stopPropagation(); window.open('http://localhost:1337', '_blank')">Open UI</button>
-            </div>
-        </div>
-    `);
-
-    // Fibratus Card
-    const fOnline = status.rustinel?.online || false; // Inferred from Rustinel
-    cards.push(`
-        <div class="service-card fibratus-card ${fOnline ? '' : 'offline'}" onclick="openFibratusDetail()">
-            <div class="service-card-glow"></div>
-            <div class="service-card-header">
-                <div class="service-card-title">
-                    <div class="service-icon fibratus">F</div>
-                    <h3>Fibratus</h3>
-                </div>
-                <span class="service-status-badge ${fOnline ? 'online' : 'offline'}">${fOnline ? 'Inferred' : 'Offline'}</span>
-            </div>
-            <div class="service-card-desc">
-                Windows kernel-level activity tracing. Captures process, network, file, registry, and driver events.
-            </div>
-            <div class="service-card-metrics">
-                <div class="service-metric">
-                    <div class="service-metric-value">${(rustinel.etw_providers || []).length || '--'}</div>
-                    <div class="service-metric-label">PROVIDERS</div>
-                </div>
-                <div class="service-metric">
-                    <div class="service-metric-value">ETW</div>
-                    <div class="service-metric-label">SOURCE</div>
-                </div>
-                <div class="service-metric">
-                    <div class="service-metric-value">Kernel</div>
-                    <div class="service-metric-label">LEVEL</div>
-                </div>
-            </div>
-            <div class="service-card-actions">
-                <button class="btn btn-sm" onclick="event.stopPropagation(); openFibratusDetail()">Details</button>
-                <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('tracing')">View Traces</button>
             </div>
         </div>
     `);
@@ -290,28 +225,14 @@ function renderDashboard() {
         <div class="service-card sysmon-card ${sOnline ? '' : 'offline'}" onclick="switchTab('sysmon'); refreshSysmon();">
             <div class="service-card-glow"></div>
             <div class="service-card-header">
-                <div class="service-card-title">
-                    <div class="service-icon sysmon">S</div>
-                    <h3>Sysmon</h3>
-                </div>
+                <div class="service-card-title"><div class="service-icon sysmon">S</div><h3>Sysmon</h3></div>
                 <span class="service-status-badge ${sOnline ? 'online' : 'offline'}">${sOnline ? 'Online' : 'Offline'}</span>
             </div>
-            <div class="service-card-desc">
-                System Monitor v15.14. Logs process creation, network, file, registry, DNS events to Windows Event Log.
-            </div>
+            <div class="service-card-desc">System Monitor v15.14. Logs process creation, network, file, registry, DNS events.</div>
             <div class="service-card-metrics">
-                <div class="service-metric">
-                    <div class="service-metric-value">${sOnline ? 'Sysmon64' : '--'}</div>
-                    <div class="service-metric-label">SERVICE</div>
-                </div>
-                <div class="service-metric">
-                    <div class="service-metric-value">ETW</div>
-                    <div class="service-metric-label">SOURCE</div>
-                </div>
-                <div class="service-metric">
-                    <div class="service-metric-value">SwiftOnSec</div>
-                    <div class="service-metric-label">CONFIG</div>
-                </div>
+                <div class="service-metric"><div class="service-metric-value">${sOnline ? 'Sysmon64' : '--'}</div><div class="service-metric-label">SERVICE</div></div>
+                <div class="service-metric"><div class="service-metric-value">ETW</div><div class="service-metric-label">SOURCE</div></div>
+                <div class="service-metric"><div class="service-metric-value">SwiftOnSec</div><div class="service-metric-label">CONFIG</div></div>
             </div>
             <div class="service-card-actions">
                 <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('sysmon'); refreshSysmon();">View Events</button>
@@ -322,6 +243,998 @@ function renderDashboard() {
     container.innerHTML = cards.join('');
 }
 
+// =============================================
+// RUSTINEL TRACE ANALYSIS CONSOLE
+// =============================================
+
+function initRtraceTabs() {
+    document.querySelectorAll('.rtrace-detail-tabs .rtrace-tab').forEach(tab => {
+        tab.addEventListener('click', () => {
+            const target = tab.dataset.rtab;
+            state.rtraceActiveDetailTab = target;
+            document.querySelectorAll('.rtrace-tab').forEach(t => t.classList.remove('active'));
+            tab.classList.add('active');
+            renderRtraceEventTable();
+        });
+    });
+
+    // Process dropdown change
+    const dropdown = document.getElementById('rtrace-process-select');
+    if (dropdown) {
+        dropdown.addEventListener('change', () => {
+            const pid = dropdown.value;
+            if (pid) {
+                selectRtraceProcess(parseInt(pid));
+            }
+        });
+    }
+}
+
+function renderRtraceConsole() {
+    renderRtraceProcessDropdown();
+    renderRtraceTimeline();
+    renderRtraceProcessTree();
+    if (state.rtraceSelectedPid) {
+        updateRtraceInfoBar();
+        renderRtraceDetailTabs();
+        renderRtraceEventTable();
+    }
+}
+
+function renderRtraceProcessDropdown() {
+    const dropdown = document.getElementById('rtrace-process-select');
+    if (!dropdown) return;
+
+    const procs = Object.values(state.processes);
+    let html = '<option value="">-- select process --</option>';
+    procs.forEach(proc => {
+        const hasExited = !!proc.exit_time;
+        const alertCount = (proc.alerts || []).length;
+        const status = hasExited ? 'stopped' : 'running';
+        const selected = state.rtraceSelectedPid == proc.pid ? 'selected' : '';
+        html += `<option value="${proc.pid}" ${selected}>${escapeHtml(proc.name || 'unknown')} &mdash; ${status} (${alertCount} ev)</option>`;
+    });
+    dropdown.innerHTML = html;
+}
+
+function selectRtraceProcess(pid) {
+    state.rtraceSelectedPid = pid;
+    state.selectedProcess = pid;
+
+    // Show detail content, hide placeholder
+    const placeholder = document.getElementById('rtrace-detail-placeholder');
+    const content = document.getElementById('rtrace-detail-content');
+    if (placeholder) placeholder.style.display = 'none';
+    if (content) content.style.display = 'flex';
+
+    // Update dropdown
+    const dropdown = document.getElementById('rtrace-process-select');
+    if (dropdown) dropdown.value = pid;
+
+    // Update info bar
+    updateRtraceInfoBar();
+
+    // Highlight in tree
+    document.querySelectorAll('.rtrace-tree-item').forEach(el => el.classList.remove('active'));
+    const treeItem = document.querySelector(`.rtrace-tree-item[data-pid="${pid}"]`);
+    if (treeItem) treeItem.classList.add('active');
+
+    // Render tabs and events
+    renderRtraceDetailTabs();
+    renderRtraceEventTable();
+    renderProcessList();
+}
+
+function updateRtraceInfoBar() {
+    const proc = state.processes[state.rtraceSelectedPid] || state.processes[String(state.rtraceSelectedPid)];
+    if (!proc) return;
+
+    const hasExited = !!proc.exit_time;
+    const alertCount = (proc.alerts || []).length;
+    const childCount = (proc.children || []).length + 1;
+    const duration = computeLifespan(proc.first_seen, proc.exit_time || proc.last_seen || new Date().toISOString());
+
+    // Calculate verdict score based on threats
+    const threats = proc.activity?.threats || 0;
+    let verdictScore = Math.min(100, threats * 10);
+    let verdictClass = verdictScore >= 50 ? '' : verdictScore > 0 ? '' : 'unknown';
+    if (verdictScore === 0) verdictClass = 'clean';
+
+    document.getElementById('rtrace-proc-name').textContent = proc.name || 'unknown';
+
+    const verdictBadge = document.getElementById('rtrace-verdict-badge');
+    verdictBadge.textContent = verdictScore > 0 ? `Malicious \u00B7 ${verdictScore}/100` : 'Clean';
+    verdictBadge.className = `rtrace-verdict-badge ${verdictClass}`;
+
+    document.getElementById('rtrace-tag-status').textContent = hasExited ? 'stopped' : 'running';
+    document.getElementById('rtrace-stat-procs').textContent = `${childCount} processes`;
+    document.getElementById('rtrace-stat-events').textContent = `${alertCount} events`;
+    document.getElementById('rtrace-stat-duration').textContent = duration || '0m 0s';
+    document.getElementById('rtrace-path').textContent = proc.image || proc.command_line || '--';
+
+    // Update severity bar
+    updateRtraceSeverityBar(proc);
+}
+
+function updateRtraceSeverityBar(proc) {
+    const sevCountsEl = document.getElementById('rtrace-sev-counts');
+    const enginesEl = document.getElementById('rtrace-engines');
+    const rulesEl = document.getElementById('rtrace-top-rules');
+    if (!sevCountsEl) return;
+
+    const alerts = proc.alerts || [];
+
+    // Count severities
+    const sevCounts = { critical: 0, high: 0, medium: 0, low: 0 };
+    const engines = {};
+    const rules = {};
+
+    alerts.forEach(a => {
+        const sev = (a.severity || 'unknown').toLowerCase();
+        if (sevCounts[sev] !== undefined) sevCounts[sev]++;
+        const eng = (a.engine || 'unknown').toLowerCase();
+        engines[eng] = (engines[eng] || 0) + 1;
+        const rule = a.rule_name || '';
+        if (rule) rules[rule] = (rules[rule] || { count: 0, sev: sev });
+        if (rule) rules[rule].count++;
+    });
+
+    // Render severity pills
+    let sevHtml = '';
+    if (sevCounts.critical > 0) sevHtml += `<span class="rtrace-sev-pill critical"><span class="sev-dot"></span>${sevCounts.critical} Critical</span>`;
+    if (sevCounts.high > 0) sevHtml += `<span class="rtrace-sev-pill high"><span class="sev-dot"></span>${sevCounts.high} High</span>`;
+    if (sevCounts.medium > 0) sevHtml += `<span class="rtrace-sev-pill medium"><span class="sev-dot"></span>${sevCounts.medium} Medium</span>`;
+    if (sevCounts.low > 0) sevHtml += `<span class="rtrace-sev-pill low"><span class="sev-dot"></span>${sevCounts.low} Low</span>`;
+    if (!sevHtml) sevHtml = '<span style="font-size:10px;color:var(--text-muted);">No detections</span>';
+    sevCountsEl.innerHTML = sevHtml;
+
+    // Render engine chips
+    let engHtml = '';
+    for (const [eng, count] of Object.entries(engines)) {
+        engHtml += `<span class="rtrace-engine-chip">${escapeHtml(eng)} (${count})</span>`;
+    }
+    enginesEl.innerHTML = engHtml;
+
+    // Render top rules (max 4, sorted by count)
+    const sortedRules = Object.entries(rules).sort((a, b) => b[1].count - a[1].count).slice(0, 4);
+    let ruleHtml = '';
+    sortedRules.forEach(([name, info]) => {
+        const sevClass = info.sev === 'critical' ? ' critical' : info.sev === 'high' ? ' high' : '';
+        ruleHtml += `<span class="rtrace-rule-chip${sevClass}" title="${escapeHtml(name)}">${escapeHtml(name)} (${info.count})</span>`;
+    });
+    rulesEl.innerHTML = ruleHtml;
+}
+
+function renderRtraceTimeline() {
+    const container = document.getElementById('rtrace-timeline-bar');
+    const rangeEl = document.getElementById('rtrace-timeline-range');
+    if (!container || !state.alerts.length) {
+        if (container) container.innerHTML = '<div class="rtrace-timeline-cursor" id="rtrace-timeline-cursor"></div>';
+        if (rangeEl) rangeEl.textContent = '';
+        return;
+    }
+
+    // Category config: lane order and colors
+    const lanes = [
+        { key: 'critical', label: 'CRIT', color: '#ef4444' },
+        { key: 'process', label: 'PROC', color: '#3b82f6' },
+        { key: 'network', label: 'NET', color: '#22c55e' },
+        { key: 'dns', label: 'DNS', color: '#a78bfa' },
+        { key: 'file', label: 'FILE', color: '#f97316' },
+        { key: 'registry', label: 'REG', color: '#f472b6' },
+    ];
+
+    // Parse all alert timestamps and categorize
+    const sorted = [...state.alerts].sort((a, b) => (a.timestamp || '').localeCompare(b.timestamp || ''));
+    const timestamps = sorted.map(a => new Date(a.timestamp).getTime()).filter(t => !isNaN(t));
+    if (!timestamps.length) {
+        container.innerHTML = '<div class="rtrace-timeline-cursor" id="rtrace-timeline-cursor"></div>';
+        return;
+    }
+
+    const tMin = Math.min(...timestamps);
+    const tMax = Math.max(...timestamps);
+    const duration = tMax - tMin || 1; // avoid div by zero
+
+    // Show time range
+    if (rangeEl) {
+        const startStr = new Date(tMin).toLocaleTimeString();
+        const endStr = new Date(tMax).toLocaleTimeString();
+        const durSec = Math.round(duration / 1000);
+        const durStr = durSec >= 60 ? `${Math.floor(durSec/60)}m ${durSec%60}s` : `${durSec}s`;
+        rangeEl.textContent = `${startStr} \u2014 ${endStr} (${durStr})`;
+    }
+
+    // Categorize each alert into a lane
+    function getLaneKey(alert) {
+        // High/Critical severity always goes to the CRIT lane
+        const sev = (alert.severity || '').toLowerCase();
+        if (sev === 'critical' || sev === 'high') return 'critical';
+        const cat = (Array.isArray(alert.category) ? alert.category[0] : alert.category || '').toLowerCase();
+        if (cat === 'dns') return 'dns';
+        if (cat === 'network') return 'network';
+        if (cat === 'file') return 'file';
+        if (cat === 'registry') return 'registry';
+        if (cat === 'process') return 'process';
+        return 'process'; // default
+    }
+
+    // Group alerts by lane
+    const laneEvents = {};
+    lanes.forEach(l => { laneEvents[l.key] = []; });
+    sorted.forEach(alert => {
+        const t = new Date(alert.timestamp).getTime();
+        if (isNaN(t)) return;
+        const key = getLaneKey(alert);
+        if (laneEvents[key]) {
+            laneEvents[key].push({ t, alert });
+        }
+    });
+
+    // Render lanes
+    const containerWidth = container.clientWidth || 600;
+    let html = '';
+
+    lanes.forEach(lane => {
+        const events = laneEvents[lane.key];
+        if (!events.length && lane.key !== 'process') {
+            // Skip empty lanes (but always show process lane)
+            return;
+        }
+
+        html += `<div class="rtrace-timeline-lane">`;
+        html += `<span class="rtrace-timeline-lane-label">${lane.label}</span>`;
+
+        // Cluster nearby events to avoid overlapping marks
+        // Group events within 0.5% of timeline width
+        const clusterThreshold = duration * 0.005;
+        const clusters = [];
+        events.forEach(ev => {
+            if (clusters.length && (ev.t - clusters[clusters.length-1].tEnd) < clusterThreshold) {
+                clusters[clusters.length-1].count++;
+                clusters[clusters.length-1].tEnd = ev.t;
+            } else {
+                clusters.push({ tStart: ev.t, tEnd: ev.t, count: 1 });
+            }
+        });
+
+        clusters.forEach(cluster => {
+            const leftPct = ((cluster.tStart - tMin) / duration) * 100;
+            const widthPct = Math.max(0.4, ((cluster.tEnd - cluster.tStart) / duration) * 100 + 0.4);
+            const opacity = Math.min(1, 0.5 + (cluster.count / 10));
+            html += `<div class="rtrace-timeline-event" style="left:${leftPct}%;width:${widthPct}%;background:${lane.color};opacity:${opacity};" title="${lane.label}: ${cluster.count} event${cluster.count>1?'s':''} at ${new Date(cluster.tStart).toLocaleTimeString()}"></div>`;
+        });
+
+        html += `</div>`;
+    });
+
+    html += `<div class="rtrace-timeline-cursor" id="rtrace-timeline-cursor"></div>`;
+    container.innerHTML = html;
+
+    // Mouse tracking for cursor line
+    container.addEventListener('mousemove', function(e) {
+        const cursor = document.getElementById('rtrace-timeline-cursor');
+        if (cursor) {
+            const rect = container.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            cursor.style.left = x + 'px';
+            cursor.style.opacity = '0.8';
+        }
+    });
+    container.addEventListener('mouseleave', function() {
+        const cursor = document.getElementById('rtrace-timeline-cursor');
+        if (cursor) cursor.style.opacity = '0';
+    });
+}
+
+function renderRtraceProcessTree() {
+    const container = document.getElementById('rtrace-tree-list');
+    const countEl = document.getElementById('rtrace-tree-count');
+    if (!container) return;
+
+    const procs = Object.values(state.processes);
+    if (countEl) countEl.textContent = procs.length;
+
+    if (!procs.length) {
+        container.innerHTML = '<div style="padding:12px;color:var(--text-muted);font-size:11px;">No processes tracked yet. Submit a sample to begin.</div>';
+        return;
+    }
+
+    // Sort by first_seen
+    const sorted = [...procs].sort((a, b) => (a.first_seen || '').localeCompare(b.first_seen || ''));
+
+    // Compute max severity per process
+    function getMaxSeverity(proc) {
+        const alerts = proc.alerts || [];
+        let max = 'low';
+        const order = { 'critical': 4, 'high': 3, 'medium': 2, 'low': 1, 'unknown': 0 };
+        alerts.forEach(a => {
+            const sev = (a.severity || 'unknown').toLowerCase();
+            if ((order[sev] || 0) > (order[max] || 0)) max = sev;
+        });
+        return max;
+    }
+
+    let html = '';
+    sorted.forEach(proc => {
+        const relTime = formatRelativeTime(proc.first_seen);
+        const isActive = state.rtraceSelectedPid == proc.pid;
+        const indent = proc.parent_pid && state.processes[proc.parent_pid] ? '<span class="tree-indent"></span>' : '';
+        const threats = proc.activity?.threats || 0;
+        const maxSev = getMaxSeverity(proc);
+        const sevDot = threats > 0 ? `<span class="ev-sev-dot ${maxSev}" style="width:6px;height:6px;display:inline-block;"></span>` : '';
+
+        html += `<div class="rtrace-tree-item ${isActive ? 'active' : ''}" data-pid="${proc.pid}" onclick="selectRtraceProcess(${proc.pid})">
+            ${sevDot}
+            <span class="tree-time">${relTime}</span>
+            ${indent}<span class="tree-pid">${proc.pid}</span>
+            <span class="tree-name">${escapeHtml(proc.name || 'unknown')}</span>
+            ${threats > 0 ? `<span class="tree-threat-count">${threats}</span>` : ''}
+        </div>`;
+    });
+    container.innerHTML = html;
+}
+
+function renderRtraceDetailTabs() {
+    const proc = state.processes[state.rtraceSelectedPid] || state.processes[String(state.rtraceSelectedPid)];
+    if (!proc) return;
+
+    const act = proc.activity || {};
+    // Update tab counts
+    const tabCountMap = {
+        'http': act.http || 0,
+        'connections': act.network || 0,
+        'dns': act.dns || 0,
+        'files': act.file || 0,
+        'registry': act.registry || 0,
+        'artifacts': act.artifacts || 0,
+        'modules': act.modules || 0,
+    };
+
+    document.querySelectorAll('.rtrace-tab').forEach(tab => {
+        const rtab = tab.dataset.rtab;
+        const countEl = tab.querySelector('.rtrace-tab-count');
+        if (countEl && tabCountMap[rtab] !== undefined) {
+            countEl.textContent = tabCountMap[rtab];
+        }
+    });
+}
+
+function renderRtraceEventTable() {
+    const container = document.getElementById('rtrace-event-table-body');
+    if (!container) return;
+
+    const proc = state.processes[state.rtraceSelectedPid] || state.processes[String(state.rtraceSelectedPid)];
+    if (!proc) {
+        container.innerHTML = '<div style="padding:20px;color:var(--text-muted);">Select a process to view events.</div>';
+        return;
+    }
+
+    // Get alerts for this process (and children)
+    let events = (proc.alerts || []).slice();
+    // Include children's events too
+    (proc.children || []).forEach(childPid => {
+        const child = state.processes[childPid] || state.processes[String(childPid)];
+        if (child && child.alerts) {
+            events = events.concat(child.alerts);
+        }
+    });
+
+    // Filter by active detail tab
+    const activeTab = state.rtraceActiveDetailTab;
+    if (activeTab === 'verdict') {
+        // Verdict tab: render summary view instead of event table
+        renderRtraceVerdictView(container, proc, events);
+        return;
+    } else if (activeTab === 'dns') {
+        events = events.filter(e => {
+            const cat = (Array.isArray(e.category) ? e.category[0] : e.category || '').toLowerCase();
+            const raw = e.raw || {};
+            const action = (raw.event?.action || '').toLowerCase();
+            return cat === 'dns' || action === 'dns_query' || action.includes('dns') || !!raw.dns;
+        });
+    } else if (activeTab === 'http') {
+        events = events.filter(e => {
+            const raw = e.raw || {};
+            const cat = (Array.isArray(e.category) ? e.category[0] : e.category || '').toLowerCase();
+            const destPort = raw.destination?.port || raw.network?.destination?.port || '';
+            const action = (raw.event?.action || '').toLowerCase();
+            // HTTP = network connections on ports 80/443, or explicit http data
+            return (cat === 'network' && (destPort == 80 || destPort == 443 || destPort == 8080 || destPort == 8443))
+                || !!raw.http || !!raw.url || action.includes('http');
+        });
+    } else if (activeTab === 'files') {
+        events = events.filter(e => {
+            const cat = (Array.isArray(e.category) ? e.category[0] : e.category || '').toLowerCase();
+            const raw = e.raw || {};
+            const action = (raw.event?.action || '').toLowerCase();
+            return cat === 'file' || action.includes('file') || !!raw.file;
+        });
+    } else if (activeTab === 'registry') {
+        events = events.filter(e => {
+            const cat = (Array.isArray(e.category) ? e.category[0] : e.category || '').toLowerCase();
+            const raw = e.raw || {};
+            const action = (raw.event?.action || '').toLowerCase();
+            return cat === 'registry' || action.startsWith('registry') || !!raw.registry;
+        });
+    } else if (activeTab === 'connections') {
+        events = events.filter(e => {
+            const cat = (Array.isArray(e.category) ? e.category[0] : e.category || '').toLowerCase();
+            const raw = e.raw || {};
+            const action = (raw.event?.action || '').toLowerCase();
+            return cat === 'network' || action === 'connection_attempted' || action === 'network_connect'
+                || action.includes('connect') || !!raw.network;
+        });
+    } else if (activeTab === 'modules') {
+        events = events.filter(e => {
+            const raw = e.raw || {};
+            const cat = (Array.isArray(e.category) ? e.category[0] : e.category || '').toLowerCase();
+            const action = (raw.event?.action || '').toLowerCase();
+            return cat === 'process' || action === 'load' || action === 'image_load'
+                || action === 'image_loaded' || action.includes('module') || action.includes('dll');
+        });
+    } else if (activeTab === 'artifacts') {
+        events = events.filter(e => {
+            const engine = (e.engine || '').toLowerCase();
+            const raw = e.raw || {};
+            const action = (raw.event?.action || '').toLowerCase();
+            // Artifacts = YARA/IOC matches, dropped files, or suspicious scripts
+            return engine === 'yara' || engine === 'ioc'
+                || action.includes('drop') || action.includes('write')
+                || (e.rule_name && (e.rule_name.toLowerCase().includes('artifact')
+                    || e.rule_name.toLowerCase().includes('drop')));
+        });
+    }
+    // 'live' tab: no filter (shows all events)
+
+    // Sort by timestamp
+    events.sort((a, b) => (a.timestamp || '').localeCompare(b.timestamp || ''));
+
+    if (!events.length) {
+        container.innerHTML = '<div style="padding:20px;color:var(--text-muted);font-size:11px;">No events for this filter.</div>';
+        return;
+    }
+
+    let html = '';
+    events.forEach((ev, idx) => {
+        const relTime = formatRelativeTime(ev.timestamp);
+        const raw = ev.raw || {};
+        const action = raw.event?.action || ev.engine || 'event';
+        const actionShort = action.replace('_', ' ').split(' ')[0];
+        const actionClass = getActionBadgeClass(actionShort);
+        const severity = (ev.severity || 'unknown').toLowerCase();
+        const ruleName = ev.rule_name || '';
+        const engine = (ev.engine || '').toUpperCase();
+        const pid = ev.pid || '?';
+        const procName = ev.process_name || '';
+        const details = getEventDetails(ev);
+        const sevRowClass = (severity === 'critical' || severity === 'high') ? ` sev-${severity}` : '';
+
+        html += `<div class="rtrace-event-row${sevRowClass}" onclick="openAlertDetail(${state.alerts.indexOf(ev) >= 0 ? state.alerts.indexOf(ev) : 0})" title="${escapeHtml(ruleName)}\n${escapeHtml(ev.rule_description || '')}">
+            <span class="ev-sev"><span class="ev-sev-dot ${severity}"></span></span>
+            <span class="ev-time">${relTime}</span>
+            <span class="ev-action">
+                <span class="rtrace-action-badge ${actionClass}">${escapeHtml(actionShort)}</span>
+            </span>
+            <span class="ev-rule"><span class="ev-rule-name">${escapeHtml(ruleName)}</span>${engine ? `<span class="ev-engine-tag">${engine}</span>` : ''}</span>
+            <span class="ev-pid">${pid}</span>
+            <span class="ev-process">${escapeHtml(procName)}</span>
+            <span class="ev-details">${escapeHtml(details)}</span>
+        </div>`;
+    });
+    container.innerHTML = html;
+}
+
+// --- Verdict Summary View ---
+function renderRtraceVerdictView(container, proc, events) {
+    const act = proc.activity || {};
+    const threats = act.threats || 0;
+    const verdictScore = Math.min(100, threats * 10);
+
+    // Collect MITRE techniques
+    const techniques = new Set();
+    const tactics = new Set();
+    const engines = {};
+    const severityCounts = { critical: 0, high: 0, medium: 0, low: 0 };
+
+    events.forEach(ev => {
+        (ev.tags || []).forEach(tag => {
+            if (tag.startsWith('attack.t')) techniques.add(tag.replace('attack.', '').toUpperCase());
+            else if (tag.startsWith('attack.')) tactics.add(tag.replace('attack.', '').toUpperCase());
+        });
+        const eng = ev.engine || 'unknown';
+        engines[eng] = (engines[eng] || 0) + 1;
+        const sev = (ev.severity || 'low').toLowerCase();
+        if (severityCounts[sev] !== undefined) severityCounts[sev]++;
+    });
+
+    let scoreColor = verdictScore >= 70 ? 'var(--accent-red)' : verdictScore >= 40 ? 'var(--accent-orange)' : verdictScore > 0 ? 'var(--accent-yellow)' : 'var(--accent-green)';
+    let scoreLabel = verdictScore >= 70 ? 'Malicious' : verdictScore >= 40 ? 'Suspicious' : verdictScore > 0 ? 'Low Risk' : 'Clean';
+
+    let html = `<div style="padding:16px;">`;
+
+    // Score display
+    html += `<div style="display:flex;align-items:center;gap:20px;margin-bottom:20px;padding:16px;background:var(--bg-card);border:1px solid var(--border-primary);border-radius:var(--radius-lg);">
+        <div style="text-align:center;">
+            <div style="font-size:36px;font-weight:700;color:${scoreColor};">${verdictScore}</div>
+            <div style="font-size:10px;color:var(--text-muted);">/ 100</div>
+        </div>
+        <div>
+            <div style="font-size:14px;font-weight:700;color:${scoreColor};">${scoreLabel}</div>
+            <div style="font-size:11px;color:var(--text-secondary);margin-top:4px;">${threats} detection${threats !== 1 ? 's' : ''} triggered across ${Object.keys(engines).length} engine${Object.keys(engines).length !== 1 ? 's' : ''}</div>
+        </div>
+    </div>`;
+
+    // Severity breakdown
+    html += `<div style="margin-bottom:16px;">
+        <div style="font-size:10px;font-weight:600;color:var(--text-muted);letter-spacing:1px;margin-bottom:8px;">SEVERITY BREAKDOWN</div>
+        <div style="display:flex;gap:8px;">
+            ${severityCounts.critical > 0 ? `<span class="sev-badge critical">${severityCounts.critical} Critical</span>` : ''}
+            ${severityCounts.high > 0 ? `<span class="sev-badge high">${severityCounts.high} High</span>` : ''}
+            ${severityCounts.medium > 0 ? `<span class="sev-badge medium">${severityCounts.medium} Medium</span>` : ''}
+            ${severityCounts.low > 0 ? `<span class="sev-badge low">${severityCounts.low} Low</span>` : ''}
+            ${threats === 0 ? '<span style="color:var(--text-muted);font-size:11px;">No detections</span>' : ''}
+        </div>
+    </div>`;
+
+    // Engine breakdown
+    if (Object.keys(engines).length > 0) {
+        html += `<div style="margin-bottom:16px;">
+            <div style="font-size:10px;font-weight:600;color:var(--text-muted);letter-spacing:1px;margin-bottom:8px;">DETECTION ENGINES</div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">`;
+        for (const [eng, count] of Object.entries(engines)) {
+            html += `<span style="font-size:10px;padding:3px 8px;border-radius:var(--radius);background:var(--bg-counter);border:1px solid var(--border-primary);color:var(--text-primary);">${escapeHtml(eng.toUpperCase())} <strong>${count}</strong></span>`;
+        }
+        html += `</div></div>`;
+    }
+
+    // MITRE ATT&CK
+    if (tactics.size > 0 || techniques.size > 0) {
+        html += `<div style="margin-bottom:16px;">
+            <div style="font-size:10px;font-weight:600;color:var(--text-muted);letter-spacing:1px;margin-bottom:8px;">MITRE ATT&CK</div>
+            <div style="display:flex;gap:4px;flex-wrap:wrap;">`;
+        [...tactics].sort().forEach(t => { html += `<span class="tag tactic">${t}</span>`; });
+        [...techniques].sort().forEach(t => { html += `<span class="tag technique">${t}</span>`; });
+        html += `</div></div>`;
+    }
+
+    // Activity summary
+    html += `<div style="margin-bottom:16px;">
+        <div style="font-size:10px;font-weight:600;color:var(--text-muted);letter-spacing:1px;margin-bottom:8px;">ACTIVITY SUMMARY</div>
+        <div class="activity-grid" style="grid-template-columns:repeat(4,1fr);">
+            ${activityCounter('FILE', act.file)}
+            ${activityCounter('NETWORK', act.network)}
+            ${activityCounter('DNS', act.dns)}
+            ${activityCounter('HTTP', act.http)}
+            ${activityCounter('REGISTRY', act.registry)}
+            ${activityCounter('MODULES', act.modules)}
+            ${activityCounter('ARTIFACTS', act.artifacts)}
+            ${activityCounter('THREATS', act.threats)}
+        </div>
+    </div>`;
+
+    html += `</div>`;
+    container.innerHTML = html;
+}
+
+function getActionBadgeClass(action) {
+    const a = action.toLowerCase();
+    if (a === 'miss' || a === 'error' || a === 'fail') return 'miss';
+    if (a === 'load' || a === 'image') return 'load';
+    if (a === 'create' || a === 'new') return 'create';
+    if (a === 'write' || a === 'modify') return 'write';
+    if (a === 'connect' || a === 'network') return 'connect';
+    if (a === 'query' || a === 'dns') return 'query';
+    if (a === 'set' || a === 'registry') return 'set';
+    if (a === 'terminate' || a === 'exit') return 'terminate';
+    return 'default';
+}
+
+function getEventDetails(ev) {
+    const raw = ev.raw || {};
+
+    // Try structured fields first
+    if (raw.file?.path) return raw.file.path;
+    if (raw.dns?.question?.name) return `Query: ${raw.dns.question.name}`;
+    if (raw.registry?.path) return raw.registry.path;
+    if (raw.destination?.ip) {
+        const port = raw.destination?.port || '';
+        return `${raw.destination.ip}${port ? ':' + port : ''}`;
+    }
+    if (raw.network?.destination?.ip) {
+        const port = raw.network.destination?.port || '';
+        return `${raw.network.destination.ip}${port ? ':' + port : ''}`;
+    }
+
+    // ECS-style fields (flat dotted keys from Rustinel)
+    const procExe = raw['process.executable'] || raw.process?.executable || '';
+    const procCmd = raw['process.command_line'] || raw.process?.command_line || '';
+    const matchSummary = raw['edr.match']?.summary || (typeof raw['edr.match'] === 'string' ? raw['edr.match'] : '');
+    const targetImage = raw['edr.process.target_image'] || '';
+
+    if (matchSummary) return matchSummary;
+    if (targetImage) return `Target: ${targetImage}`;
+    if (procCmd && procCmd.length > 5) return procCmd;
+    if (procExe) return procExe;
+    if (ev.command_line) return ev.command_line;
+    if (ev.process_image) return ev.process_image;
+
+    // Fibratus-style: events array
+    if (raw.events && raw.events.length) {
+        const firstEv = raw.events[0];
+        if (firstEv.params?.exe) return firstEv.params.exe;
+        if (firstEv.params?.cmdline) return firstEv.params.cmdline;
+        if (firstEv.params?.file_name) return firstEv.params.file_name;
+    }
+
+    // Fallback: rule description or truncated JSON
+    if (ev.rule_description) return ev.rule_description;
+    if (ev.rule_name) return ev.rule_name;
+
+    // Last resort: compact JSON excerpt
+    const jsonStr = JSON.stringify(raw);
+    return jsonStr.length > 140 ? jsonStr.substring(0, 140) + '...' : jsonStr;
+}
+
+function clearStoppedProcesses() {
+    // Filter out stopped processes from view (client-side only)
+    const procs = Object.values(state.processes);
+    procs.forEach(proc => {
+        if (proc.exit_time) {
+            delete state.processes[proc.pid];
+            delete state.processes[String(proc.pid)];
+        }
+    });
+    renderRtraceConsole();
+    renderProcessList();
+}
+
+function clearAllTracing() {
+    state.alerts = [];
+    state.processes = {};
+    state.rtraceSelectedPid = null;
+    const placeholder = document.getElementById('rtrace-detail-placeholder');
+    const content = document.getElementById('rtrace-detail-content');
+    if (placeholder) placeholder.style.display = 'flex';
+    if (content) content.style.display = 'none';
+    renderRtraceConsole();
+    renderProcessList();
+}
+
+// =============================================
+// HEX EDITOR
+// =============================================
+
+function initHexDropZone() {
+    const zone = document.getElementById('hex-drop-zone');
+    const input = document.getElementById('hex-file-input');
+    if (!zone || !input) return;
+
+    zone.addEventListener('dragover', e => {
+        e.preventDefault();
+        zone.classList.add('dragover');
+    });
+    zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+    zone.addEventListener('drop', e => {
+        e.preventDefault();
+        zone.classList.remove('dragover');
+        if (e.dataTransfer.files.length) {
+            hexUploadFile(e.dataTransfer.files[0]);
+        }
+    });
+    input.addEventListener('change', () => {
+        if (input.files.length) {
+            hexUploadFile(input.files[0]);
+            input.value = ''; // reset so same file can be re-selected
+        }
+    });
+}
+
+async function hexUploadFile(file) {
+    const zone = document.getElementById('hex-drop-zone');
+    const fileInfo = document.getElementById('hex-file-info');
+    const bytesPerPage = parseInt(document.getElementById('hex-bytes-per-page').value) || 512;
+
+    // Show loading state
+    zone.classList.add('loading');
+    zone.querySelector('p').textContent = `Uploading ${file.name} (${formatSize(file.size)})...`;
+
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('bytes', bytesPerPage);
+
+    try {
+        const resp = await fetch('/api/file/hex/upload', { method: 'POST', body: formData });
+        const data = await resp.json();
+
+        if (data.error) {
+            fileInfo.innerHTML = `<span class="hex-info-item" style="color:var(--accent-red);">Error: ${escapeHtml(data.error)}</span>`;
+            zone.classList.remove('loading');
+            zone.querySelector('p').textContent = 'Drop a file here or browse';
+            return;
+        }
+
+        // Store the server-side path for pagination
+        state.hexFilePath = data.path;
+        state.hexFileSize = data.size || 0;
+        state.hexOffset = 0;
+        state.hexData = data.raw_bytes || null;
+        state.hexSelectedByte = -1;
+
+        // Update path input so pagination works
+        document.getElementById('hex-filepath').value = data.path;
+        document.getElementById('hex-offset').value = 0;
+
+        // Collapse drop zone and show file info
+        zone.classList.add('has-file');
+        zone.classList.remove('loading');
+        zone.querySelector('p').innerHTML = `<strong>${escapeHtml(data.filename || file.name)}</strong> (${formatSize(data.size)}) <span class="hex-change-file" onclick="hexResetDropZone()">change</span>`;
+
+        // Update file info bar
+        fileInfo.innerHTML = `
+            <span class="hex-info-item"><strong>File:</strong> ${escapeHtml(data.filename || file.name)}</span>
+            <span class="hex-info-item"><strong>Size:</strong> ${formatSize(data.size)}</span>
+            <span class="hex-info-item"><strong>Showing:</strong> ${data.bytes_shown} bytes from offset 0x00000000</span>
+        `;
+
+        // Render hex dump
+        renderHexView(data.hex, 0, data.bytes_shown);
+
+        // Update status bar
+        document.getElementById('hex-status-size').textContent = `Size: ${formatSize(data.size)}`;
+        document.getElementById('hex-status-offset').textContent = `Offset: 0x00000000`;
+        document.getElementById('hex-inspector').classList.add('visible');
+
+    } catch (e) {
+        fileInfo.innerHTML = `<span class="hex-info-item" style="color:var(--accent-red);">Upload failed: ${escapeHtml(e.message)}</span>`;
+        zone.classList.remove('loading');
+        zone.querySelector('p').textContent = 'Drop a file here or browse';
+    }
+}
+
+function hexResetDropZone() {
+    const zone = document.getElementById('hex-drop-zone');
+    zone.classList.remove('has-file', 'loading');
+    zone.querySelector('p').innerHTML = 'Drop a file here or <span class="hex-browse-link" onclick="document.getElementById(\'hex-file-input\').click()">browse</span>';
+}
+
+function hexOpenFile(path) {
+    // Switch to hex tab and load a specific file
+    switchTab('hexeditor');
+    document.getElementById('hex-filepath').value = path;
+    document.getElementById('hex-offset').value = 0;
+    // Collapse drop zone
+    const zone = document.getElementById('hex-drop-zone');
+    zone.classList.add('has-file');
+    zone.querySelector('p').innerHTML = `<strong>${escapeHtml(path.split('\\').pop())}</strong> <span class="hex-change-file" onclick="hexResetDropZone()">change</span>`;
+    hexLoad();
+}
+
+async function hexLoad() {
+    const filepath = document.getElementById('hex-filepath').value.trim();
+    const offset = parseInt(document.getElementById('hex-offset').value) || 0;
+    const bytesPerPage = parseInt(document.getElementById('hex-bytes-per-page').value) || 512;
+
+    if (!filepath) {
+        alert('Enter a file path to load.');
+        return;
+    }
+
+    state.hexFilePath = filepath;
+    state.hexOffset = offset;
+
+    try {
+        const resp = await fetch(`/api/file/hex?path=${encodeURIComponent(filepath)}&offset=${offset}&bytes=${bytesPerPage}`);
+        const data = await resp.json();
+
+        if (data.error) {
+            document.getElementById('hex-file-info').innerHTML = `<span class="hex-info-item" style="color:var(--accent-red);">Error: ${escapeHtml(data.error)}</span>`;
+            return;
+        }
+
+        state.hexFileSize = data.size || 0;
+        state.hexData = data.raw_bytes || null;
+        state.hexSelectedByte = -1;
+
+        // Update file info
+        document.getElementById('hex-file-info').innerHTML = `
+            <span class="hex-info-item"><strong>File:</strong> ${escapeHtml(filepath.split('\\').pop())}</span>
+            <span class="hex-info-item"><strong>Size:</strong> ${formatSize(data.size)}</span>
+            <span class="hex-info-item"><strong>Showing:</strong> ${data.bytes_shown} bytes from offset 0x${offset.toString(16).padStart(8, '0')}</span>
+        `;
+
+        // Render hex dump
+        renderHexView(data.hex, offset, data.bytes_shown);
+
+        // Update status bar
+        document.getElementById('hex-status-size').textContent = `Size: ${formatSize(data.size)}`;
+        document.getElementById('hex-status-offset').textContent = `Offset: 0x${offset.toString(16).padStart(8, '0')}`;
+
+        // Show inspector
+        document.getElementById('hex-inspector').classList.add('visible');
+
+    } catch (e) {
+        document.getElementById('hex-file-info').innerHTML = `<span class="hex-info-item" style="color:var(--accent-red);">Failed: ${escapeHtml(e.message)}</span>`;
+    }
+}
+
+function renderHexView(hexDump, baseOffset, bytesShown) {
+    const offsetCol = document.getElementById('hex-offset-col');
+    const hexView = document.getElementById('hex-view');
+    const asciiCol = document.getElementById('hex-ascii-col');
+
+    if (!hexDump) {
+        offsetCol.innerHTML = '';
+        hexView.innerHTML = '<div style="padding:20px;color:var(--text-muted);">No data loaded</div>';
+        asciiCol.innerHTML = '';
+        return;
+    }
+
+    // Parse hex dump lines
+    const lines = hexDump.split('\n');
+    let offsetHtml = '';
+    let hexHtml = '';
+    let asciiHtml = '';
+    let validLineIdx = 0; // Separate counter for actual data lines
+
+    lines.forEach((line) => {
+        if (!line.trim()) return;
+
+        // Parse line: "00000000  4d 5a 90 00 ... |MZ..............|"
+        const match = line.match(/^([0-9a-f]+)\s+(.+?)\s+\|(.+)\|$/i);
+        if (!match) {
+            // Fallback: just display raw
+            offsetHtml += line.substring(0, 8) + '\n';
+            hexHtml += line.substring(10) + '\n';
+            validLineIdx++;
+            return;
+        }
+
+        const offsetStr = match[1];
+        const hexPart = match[2];
+        const asciiPart = match[3];
+
+        offsetHtml += offsetStr + '\n';
+
+        // Render hex bytes as clickable spans
+        const hexBytes = hexPart.trim().split(/\s+/);
+        let lineHexHtml = '';
+        hexBytes.forEach((byte, byteIdx) => {
+            if (byte === '') return;
+            const globalIdx = (validLineIdx * 16) + byteIdx;
+            const isNull = byte === '00';
+            lineHexHtml += `<span class="hex-byte${isNull ? ' null-byte' : ''}" data-idx="${globalIdx}" onclick="hexSelectByte(${globalIdx})">${byte}</span>`;
+            // Add gap between bytes 7 and 8
+            if (byteIdx === 7) lineHexHtml += '<span class="hex-gap"></span>';
+        });
+        hexHtml += lineHexHtml + '\n';
+
+        // Render ASCII
+        let lineAsciiHtml = '';
+        for (let i = 0; i < asciiPart.length; i++) {
+            const ch = asciiPart[i];
+            const globalIdx = (validLineIdx * 16) + i;
+            const isPrintable = ch !== '.';
+            lineAsciiHtml += `<span class="ascii-char${isPrintable ? '' : ' non-printable'}" data-idx="${globalIdx}" onclick="hexSelectByte(${globalIdx})">${escapeHtml(ch)}</span>`;
+        }
+        asciiHtml += lineAsciiHtml + '\n';
+
+        validLineIdx++;
+    });
+
+    offsetCol.innerHTML = offsetHtml;
+    hexView.innerHTML = hexHtml;
+    asciiCol.innerHTML = asciiHtml;
+}
+
+function hexSelectByte(idx) {
+    state.hexSelectedByte = idx;
+
+    // Clear previous selection
+    document.querySelectorAll('.hex-byte.selected, .ascii-char.selected').forEach(el => el.classList.remove('selected'));
+
+    // Highlight new selection
+    document.querySelectorAll(`[data-idx="${idx}"]`).forEach(el => el.classList.add('selected'));
+
+    // Update status bar
+    const byteEl = document.querySelector(`.hex-byte[data-idx="${idx}"]`);
+    if (byteEl) {
+        const byteVal = parseInt(byteEl.textContent, 16);
+        const globalOffset = state.hexOffset + idx;
+        document.getElementById('hex-status-offset').textContent = `Offset: 0x${globalOffset.toString(16).padStart(8, '0')}`;
+        document.getElementById('hex-status-selection').textContent = `Selected: byte ${idx}`;
+        document.getElementById('hex-status-value').textContent = `Value: 0x${byteEl.textContent} (${byteVal})`;
+
+        // Update inspector
+        updateHexInspector(idx);
+    }
+}
+
+function updateHexInspector(idx) {
+    // Get surrounding bytes from the displayed hex view
+    const allBytes = document.querySelectorAll('.hex-byte');
+    const bytes = [];
+    for (let i = idx; i < Math.min(idx + 8, allBytes.length); i++) {
+        bytes.push(parseInt(allBytes[i].textContent, 16));
+    }
+
+    if (bytes.length === 0) return;
+
+    // Int8 / UInt8
+    const uint8 = bytes[0];
+    const int8 = uint8 > 127 ? uint8 - 256 : uint8;
+    document.getElementById('hex-insp-int8').textContent = int8;
+    document.getElementById('hex-insp-uint8').textContent = uint8;
+
+    // Int16 LE / UInt16 LE
+    if (bytes.length >= 2) {
+        const uint16 = bytes[0] | (bytes[1] << 8);
+        const int16 = uint16 > 32767 ? uint16 - 65536 : uint16;
+        document.getElementById('hex-insp-int16le').textContent = int16;
+        document.getElementById('hex-insp-uint16le').textContent = uint16;
+    }
+
+    // Int32 LE / UInt32 LE
+    if (bytes.length >= 4) {
+        const uint32 = (bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) | (bytes[3] << 24)) >>> 0;
+        const int32 = uint32 > 2147483647 ? uint32 - 4294967296 : uint32;
+        document.getElementById('hex-insp-int32le').textContent = int32;
+        document.getElementById('hex-insp-uint32le').textContent = uint32;
+    }
+
+    // Float32
+    if (bytes.length >= 4) {
+        const buf = new ArrayBuffer(4);
+        const view = new DataView(buf);
+        bytes.slice(0, 4).forEach((b, i) => view.setUint8(i, b));
+        document.getElementById('hex-insp-float32').textContent = view.getFloat32(0, true).toPrecision(6);
+    }
+
+    // Float64
+    if (bytes.length >= 8) {
+        const buf = new ArrayBuffer(8);
+        const view = new DataView(buf);
+        bytes.slice(0, 8).forEach((b, i) => view.setUint8(i, b));
+        document.getElementById('hex-insp-float64').textContent = view.getFloat64(0, true).toPrecision(10);
+    }
+
+    // ASCII
+    const asciiStr = bytes.slice(0, 8).map(b => (b >= 32 && b < 127) ? String.fromCharCode(b) : '.').join('');
+    document.getElementById('hex-insp-ascii').textContent = asciiStr;
+
+    // UTF-16 LE
+    if (bytes.length >= 2) {
+        let utf16 = '';
+        for (let i = 0; i < Math.min(bytes.length - 1, 8); i += 2) {
+            const code = bytes[i] | (bytes[i + 1] << 8);
+            utf16 += code >= 32 && code < 127 ? String.fromCharCode(code) : '.';
+        }
+        document.getElementById('hex-insp-utf16').textContent = utf16;
+    }
+}
+
+function hexPrevPage() {
+    const bytesPerPage = parseInt(document.getElementById('hex-bytes-per-page').value) || 512;
+    const newOffset = Math.max(0, state.hexOffset - bytesPerPage);
+    document.getElementById('hex-offset').value = newOffset;
+    state.hexOffset = newOffset;
+    hexLoad();
+}
+
+function hexNextPage() {
+    const bytesPerPage = parseInt(document.getElementById('hex-bytes-per-page').value) || 512;
+    const newOffset = state.hexOffset + bytesPerPage;
+    if (newOffset < state.hexFileSize) {
+        document.getElementById('hex-offset').value = newOffset;
+        state.hexOffset = newOffset;
+        hexLoad();
+    }
+}
+
+// =============================================
+// DETAIL PANELS (kept from original)
+// =============================================
+
 // --- Detail Panels for Dashboard Services ---
 async function openAgentDetail() {
     pushDetailHistory('agent', 0);
@@ -329,35 +1242,14 @@ async function openAgentDetail() {
     setDetailBody('<div class="muted">Loading...</div>');
     showDetail();
 
-    let html = '';
     const online = state.serviceStatus.detonator_agent?.online;
-
-    html += `<div class="detail-fields">
+    let html = `<div class="detail-fields">
         <div class="detail-field"><span class="field-label">Status</span><span class="field-value" style="color:${online ? 'var(--accent-green)' : 'var(--accent-red)'}">${online ? 'Running' : 'Stopped'}</span></div>
         <div class="detail-field"><span class="field-label">Port</span><span class="field-value">8080</span></div>
         <div class="detail-field"><span class="field-label">Framework</span><span class="field-value">.NET 8.0</span></div>
         <div class="detail-field"><span class="field-label">Install Dir</span><span class="field-value mono">C:\\DetonatorAgent</span></div>
         <div class="detail-field"><span class="field-label">EDR Plugin</span><span class="field-value">Fibratus</span></div>
-        <div class="detail-field"><span class="field-label">In Use</span><span class="field-value">${state.serviceStatus.detonator_agent?.data?.in_use ? 'Yes' : 'No'}</span></div>
     </div>`;
-
-    html += `<div class="detail-section">
-        <div class="detail-section-title">CAPABILITIES</div>
-        <div class="detail-fields">
-            <div class="detail-field"><span class="field-label">Execute</span><span class="field-value">PE, DLL, PowerShell, Batch, VBS</span></div>
-            <div class="detail-field"><span class="field-label">Collection</span><span class="field-value">EDR logs, process trees, network activity</span></div>
-            <div class="detail-field"><span class="field-label">API</span><span class="field-value mono">/api/execute/exec, /api/lock/status, /api/logs</span></div>
-        </div>
-    </div>`;
-
-    html += `<div class="detail-section">
-        <div class="detail-section-title">QUICK ACTIONS</div>
-        <div style="display:flex; gap:8px;">
-            <button class="btn" onclick="switchTab('submit'); closeDetail();">Submit Sample</button>
-            <button class="btn" onclick="window.open('http://localhost:8080', '_blank')">Open API</button>
-        </div>
-    </div>`;
-
     setDetailBody(html);
 }
 
@@ -368,120 +1260,293 @@ async function openLitterboxDetail() {
     showDetail();
 
     const online = state.serviceStatus.litterbox?.online;
-    let html = '';
-
-    html += `<div class="detail-fields">
+    let html = `<div class="detail-fields">
         <div class="detail-field"><span class="field-label">Status</span><span class="field-value" style="color:${online ? 'var(--accent-green)' : 'var(--accent-red)'}">${online ? 'Running' : 'Stopped'}</span></div>
         <div class="detail-field"><span class="field-label">Port</span><span class="field-value">1337</span></div>
         <div class="detail-field"><span class="field-label">Install Dir</span><span class="field-value mono">C:\\LitterBox</span></div>
-        <div class="detail-field"><span class="field-label">Web UI</span><span class="field-value mono">http://localhost:1337</span></div>
     </div>`;
-
-    html += `<div class="detail-section">
-        <div class="detail-section-title">SCANNERS</div>
-        <div class="activity-grid" style="grid-template-columns: repeat(3, 1fr);">
-            <div class="activity-counter"><div class="counter-label">PE-SIEVE</div><div class="counter-value" style="font-size:12px">Static</div></div>
-            <div class="activity-counter"><div class="counter-label">HOLLOWS</div><div class="counter-value" style="font-size:12px">Memory</div></div>
-            <div class="activity-counter"><div class="counter-label">MONETA</div><div class="counter-value" style="font-size:12px">Memory</div></div>
-            <div class="activity-counter"><div class="counter-label">PATRIOT</div><div class="counter-value" style="font-size:12px">Dynamic</div></div>
-            <div class="activity-counter"><div class="counter-label">YARA</div><div class="counter-value" style="font-size:12px">Rules</div></div>
-            <div class="activity-counter"><div class="counter-label">HUNT-SB</div><div class="counter-value" style="font-size:12px">Beacons</div></div>
-        </div>
-    </div>`;
-
-    html += `<div class="detail-section">
-        <div class="detail-section-title">FEATURES</div>
-        <div class="detail-fields">
-            <div class="detail-field"><span class="field-label">Analysis</span><span class="field-value">Static + Dynamic + Memory</span></div>
-            <div class="detail-field"><span class="field-label">Scoring</span><span class="field-value">Detection scoring with trigger breakdown</span></div>
-            <div class="detail-field"><span class="field-label">MCP Server</span><span class="field-value">LLM-driven analysis via MCP protocol</span></div>
-            <div class="detail-field"><span class="field-label">EDR Integration</span><span class="field-value">Fibratus, Elastic Defend</span></div>
-        </div>
-    </div>`;
-
-    html += `<div class="detail-section">
-        <div class="detail-section-title">QUICK ACTIONS</div>
-        <div style="display:flex; gap:8px;">
-            <button class="btn" onclick="switchTab('submit'); closeDetail();">Submit Sample</button>
-            <button class="btn" onclick="window.open('http://localhost:1337', '_blank')">Open LitterBox UI</button>
-        </div>
-    </div>`;
-
     setDetailBody(html);
 }
 
-async function openFibratusDetail() {
-    pushDetailHistory('fibratus', 0);
-    setDetailHeader('Service', 'background:rgba(244,114,182,0.15);color:var(--accent-pink)', 'Fibratus', '');
+async function openRustinelDetail() {
+    pushDetailHistory('rustinel', 0);
+    setDetailHeader('Engine', 'background:rgba(34,211,238,0.15);color:var(--accent-cyan)', 'Rustinel', 'loading...');
+    setDetailBody('<div class="muted">Fetching Rustinel status...</div>');
     showDetail();
 
-    const rustinel = state.rustinelInfo || {};
-    const providers = rustinel.etw_providers || [];
-    let html = '';
+    try {
+        const resp = await fetch('/api/rustinel');
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const info = await resp.json();
+        renderRustinelDetail(info);
+    } catch (e) {
+        setDetailBody(`<div class="muted">Failed to fetch Rustinel info: ${escapeHtml(e.message)}</div>`);
+    }
+}
 
-    html += `<div class="detail-fields">
-        <div class="detail-field"><span class="field-label">Status</span><span class="field-value" style="color:var(--accent-green)">Active (via Rustinel ETW)</span></div>
-        <div class="detail-field"><span class="field-label">Type</span><span class="field-value">Kernel-level Windows tracing</span></div>
-        <div class="detail-field"><span class="field-label">Providers</span><span class="field-value">${providers.length} ETW providers</span></div>
+function renderRustinelDetail(info) {
+    const online = info.online;
+    const statusColor = online ? 'var(--accent-green)' : 'var(--accent-red)';
+    setDetailHeader('Engine', 'background:rgba(34,211,238,0.15);color:var(--accent-cyan)', 'Rustinel', '');
+
+    let html = `<div class="detail-fields">
+        <div class="detail-field"><span class="field-label">Version</span><span class="field-value">${escapeHtml(info.version || 'unknown')}</span></div>
+        <div class="detail-field"><span class="field-label">Status</span><span class="field-value" style="color:${statusColor}">${online ? 'running' : 'stopped'}</span></div>
+        <div class="detail-field"><span class="field-label">Install Dir</span><span class="field-value mono">${escapeHtml(info.install_dir || '')}</span></div>
+        <div class="detail-field"><span class="field-label">Alerts Dir</span><span class="field-value mono">${escapeHtml(info.alerts_dir || '')}</span></div>
+        <div class="detail-field"><span class="field-label">Alerts Total</span><span class="field-value">${info.alerts_count || 0}</span></div>
     </div>`;
 
+    const rules = info.rules || {};
+    html += `<div class="detail-section">
+        <div class="detail-section-title">DETECTION RULES</div>
+        <div class="activity-grid" style="grid-template-columns: repeat(3, 1fr);">
+            <div class="activity-counter"><div class="counter-label">SIGMA</div><div class="counter-value">${rules.sigma || 0}</div></div>
+            <div class="activity-counter"><div class="counter-label">YARA</div><div class="counter-value">${rules.yara || 0}</div></div>
+            <div class="activity-counter"><div class="counter-label">IOC</div><div class="counter-value">${((rules.ioc?.hashes||0)+(rules.ioc?.ips||0)+(rules.ioc?.domains||0))}</div></div>
+        </div>
+    </div>`;
+
+    const providers = info.etw_providers || [];
     if (providers.length > 0) {
-        html += `<div class="detail-section">
-            <div class="detail-section-title">ETW PROVIDERS (${providers.length})</div>
-            <div class="detail-fields">`;
+        html += `<div class="detail-section"><div class="detail-section-title">ETW PROVIDERS (${providers.length})</div><div class="detail-fields">`;
         providers.forEach(p => {
-            const shortName = p.name.replace('Microsoft-Windows-', '');
-            html += `<div class="detail-field">
-                <span class="field-label">${escapeHtml(shortName)}</span>
-                <span class="field-value" style="color:var(--text-muted)">keywords: ${escapeHtml(p.keywords)}</span>
-            </div>`;
+            html += `<div class="detail-field"><span class="field-label" style="font-size:10px">${escapeHtml(p.name.replace('Microsoft-Windows-', ''))}</span><span class="field-value" style="font-size:10px;color:var(--text-muted)">kw: ${escapeHtml(p.keywords)}</span></div>`;
         });
         html += `</div></div>`;
     }
 
-    html += `<div class="detail-section">
-        <div class="detail-section-title">EVENT CATEGORIES</div>
-        <div class="activity-grid" style="grid-template-columns: repeat(3, 1fr);">
-            <div class="activity-counter"><div class="counter-label">PROCESS</div><div class="counter-value" style="font-size:12px">Create/Exit</div></div>
-            <div class="activity-counter"><div class="counter-label">NETWORK</div><div class="counter-value" style="font-size:12px">TCP/UDP</div></div>
-            <div class="activity-counter"><div class="counter-label">FILE</div><div class="counter-value" style="font-size:12px">I/O Ops</div></div>
-            <div class="activity-counter"><div class="counter-label">REGISTRY</div><div class="counter-value" style="font-size:12px">Keys/Values</div></div>
-            <div class="activity-counter"><div class="counter-label">DNS</div><div class="counter-value" style="font-size:12px">Queries</div></div>
-            <div class="activity-counter"><div class="counter-label">POWERSHELL</div><div class="counter-value" style="font-size:12px">Scripts</div></div>
-        </div>
-    </div>`;
-
     setDetailBody(html);
 }
 
-// --- Render: Alerts table ---
-function renderAlerts() {
-    const container = document.getElementById('alerts-table');
-    if (!state.alerts.length) {
-        container.innerHTML = `
-            <div class="empty-state">
-                <h3>No alerts detected</h3>
-                <p>Submit a sample to start tracing, or check that Rustinel/Fibratus are running.</p>
+// --- Alert Detail ---
+function openAlertDetail(idx) {
+    const alert = state.alerts[idx];
+    if (!alert) return;
+
+    pushDetailHistory('alert', idx);
+    const severity = (alert.severity || 'unknown').toLowerCase();
+    const severityColors = { critical: '#ef4444', high: '#f97316', medium: '#eab308', low: '#22c55e' };
+
+    setDetailHeader(
+        severity.charAt(0).toUpperCase() + severity.slice(1),
+        `background:${severityColors[severity] || '#64748b'}20;color:${severityColors[severity] || '#94a3b8'}`,
+        alert.rule_name || 'Unknown Rule',
+        formatRelativeTime(alert.timestamp)
+    );
+
+    let html = '';
+    if (alert.rule_description) {
+        html += `<div class="alert-description">${escapeHtml(alert.rule_description)}</div>`;
+    }
+
+    const tags = (alert.tags || []).map(tag => {
+        if (tag.startsWith('attack.t')) return `<span class="tag technique">${tag.replace('attack.', '').toUpperCase()}</span>`;
+        if (tag.startsWith('attack.')) return `<span class="tag tactic">${tag.replace('attack.', '').toUpperCase()}</span>`;
+        return `<span class="tag mitre">${escapeHtml(tag)}</span>`;
+    }).join('');
+
+    // --- Structured fields ---
+    html += `<div class="detail-fields">
+        <div class="detail-field"><span class="field-label">Severity</span><span class="field-value"><span class="ev-sev-dot ${severity}" style="display:inline-block;width:8px;height:8px;vertical-align:middle;margin-right:4px;"></span>${severity.charAt(0).toUpperCase() + severity.slice(1)}</span></div>
+        <div class="detail-field"><span class="field-label">Engine</span><span class="field-value">${escapeHtml((alert.engine || 'unknown').toUpperCase())}</span></div>
+        <div class="detail-field"><span class="field-label">Rule</span><span class="field-value mono">${escapeHtml(alert.rule_name || '')}</span></div>
+        <div class="detail-field"><span class="field-label">PID</span><span class="field-value">${alert.pid || 'N/A'}</span></div>
+        <div class="detail-field"><span class="field-label">Process</span><span class="field-value">${escapeHtml(alert.process_name || '')}</span></div>
+        <div class="detail-field"><span class="field-label">Image</span><span class="field-value mono">${escapeHtml(alert.process_image || '')}</span></div>
+        <div class="detail-field"><span class="field-label">Category</span><span class="field-value">${formatCategory(alert.category)}</span></div>
+        ${alert.command_line ? `<div class="detail-field"><span class="field-label">Command</span><span class="field-value mono">${escapeHtml(alert.command_line)}</span></div>` : ''}
+        ${alert.parent_name ? `<div class="detail-field"><span class="field-label">Parent</span><span class="field-value">${alert.parent_pid || '?'} (${escapeHtml(alert.parent_name)})</span></div>` : ''}
+        ${alert.parent_command_line ? `<div class="detail-field"><span class="field-label">Parent Cmd</span><span class="field-value mono">${escapeHtml(alert.parent_command_line)}</span></div>` : ''}
+        ${alert.user ? `<div class="detail-field"><span class="field-label">User</span><span class="field-value">${escapeHtml(alert.user)}</span></div>` : ''}
+        ${tags ? `<div class="detail-field"><span class="field-label">ATT&CK</span><span class="field-value">${tags}</span></div>` : ''}
+        <div class="detail-field"><span class="field-label">Timestamp</span><span class="field-value">${alert.timestamp || ''}</span></div>
+    </div>`;
+
+    // --- Parsed raw event as structured sections ---
+    const raw = alert.raw || {};
+    html += renderStructuredRawEvent(raw);
+
+    setDetailBody(html);
+    showDetail();
+}
+
+function renderStructuredRawEvent(raw) {
+    let html = '';
+
+    // Group ECS fields into logical sections
+    const sections = {
+        'Match Details': {},
+        'Event': {},
+        'Process': {},
+        'Host': {},
+        'Rule': {},
+        'Other': {},
+    };
+
+    // Categorize each key
+    const flatEntries = flattenObject(raw);
+    flatEntries.forEach(([key, value]) => {
+        if (key.startsWith('edr.match') || key.startsWith('edr.rule')) {
+            sections['Match Details'][key] = value;
+        } else if (key.startsWith('event.') || key === '@timestamp') {
+            sections['Event'][key] = value;
+        } else if (key.startsWith('process.')) {
+            sections['Process'][key] = value;
+        } else if (key.startsWith('host.') || key.startsWith('agent.')) {
+            sections['Host'][key] = value;
+        } else if (key.startsWith('rule.')) {
+            sections['Rule'][key] = value;
+        } else {
+            sections['Other'][key] = value;
+        }
+    });
+
+    // Render each non-empty section
+    for (const [title, fields] of Object.entries(sections)) {
+        const entries = Object.entries(fields);
+        if (!entries.length) continue;
+
+        html += `<div class="detail-section">
+            <div class="detail-section-title">${title.toUpperCase()}</div>
+            <div class="raw-structured">`;
+
+        entries.forEach(([key, value]) => {
+            const displayValue = formatRawValue(value);
+            const isImportant = key.includes('severity') || key.includes('rule.name') || key.includes('match') || key.includes('executable') || key.includes('command_line');
+            html += `<div class="raw-field${isImportant ? ' important' : ''}">
+                <span class="raw-key">${escapeHtml(key)}</span>
+                <span class="raw-value">${displayValue}</span>
             </div>`;
+        });
+
+        html += `</div></div>`;
+    }
+
+    // Collapsible full JSON (for copy/paste)
+    html += `<div class="detail-section">
+        <div class="detail-section-title raw-json-toggle" onclick="this.parentElement.classList.toggle('expanded')">
+            RAW JSON <span style="font-weight:400;font-size:9px;color:var(--text-muted);margin-left:6px;">(click to expand)</span>
+        </div>
+        <div class="raw-json-collapsible"><pre class="raw-json-pretty">${syntaxHighlightJson(JSON.stringify(raw, null, 2))}</pre></div>
+    </div>`;
+
+    return html;
+}
+
+function flattenObject(obj, prefix = '', result = []) {
+    if (obj === null || obj === undefined) return result;
+    for (const [key, value] of Object.entries(obj)) {
+        const fullKey = prefix ? `${prefix}.${key}` : key;
+        if (value && typeof value === 'object' && !Array.isArray(value)) {
+            flattenObject(value, fullKey, result);
+        } else {
+            result.push([fullKey, value]);
+        }
+    }
+    return result;
+}
+
+function formatRawValue(value) {
+    if (value === null || value === undefined) return '<span class="raw-null">null</span>';
+    if (typeof value === 'boolean') return `<span class="raw-bool">${value}</span>`;
+    if (typeof value === 'number') return `<span class="raw-num">${value}</span>`;
+    if (Array.isArray(value)) {
+        if (value.length === 0) return '<span class="raw-null">[]</span>';
+        // Render arrays inline if simple, or as list if complex
+        if (value.every(v => typeof v === 'string' || typeof v === 'number')) {
+            return value.map(v => `<span class="raw-str">${escapeHtml(String(v))}</span>`).join(', ');
+        }
+        return `<span class="raw-str">${escapeHtml(JSON.stringify(value))}</span>`;
+    }
+    // Strings
+    const str = String(value);
+    // Color paths
+    if (str.match(/^[A-Z]:\\/i) || str.startsWith('/')) {
+        return `<span class="raw-path">${escapeHtml(str)}</span>`;
+    }
+    // Color IPs
+    if (str.match(/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/)) {
+        return `<span class="raw-ip">${escapeHtml(str)}</span>`;
+    }
+    return `<span class="raw-str">${escapeHtml(str)}</span>`;
+}
+
+function syntaxHighlightJson(json) {
+    return json
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?)/g, function(match) {
+            let cls = 'json-str';
+            if (match.endsWith(':')) {
+                cls = 'json-key';
+                match = match.slice(0, -1) + '<span class="json-colon">:</span>';
+            }
+            return `<span class="${cls}">${match}</span>`;
+        })
+        .replace(/\b(true|false)\b/g, '<span class="json-bool">$1</span>')
+        .replace(/\b(null)\b/g, '<span class="json-null">$1</span>')
+        .replace(/\b(-?\d+\.?\d*)\b/g, '<span class="json-num">$1</span>');
+}
+
+// --- Process Detail ---
+function openProcessDetail(pid) {
+    state.selectedProcess = pid;
+    renderProcessList();
+    pushDetailHistory('process', pid);
+
+    const proc = state.processes[pid] || state.processes[String(pid)];
+    if (!proc) {
+        setDetailHeader(`PID ${pid}`, 'background:rgba(59,130,246,0.2);color:#3b82f6', `Process ${pid}`, '');
+        setDetailBody(`<div class="muted">No detailed information available for PID ${pid}.</div>`);
+        showDetail();
         return;
     }
 
-    // Sort by timestamp descending
-    const sorted = [...state.alerts].sort((a, b) =>
-        (b.timestamp || '').localeCompare(a.timestamp || ''));
+    const hasExited = !!proc.exit_time;
+    const statusText = hasExited ? 'exited' : 'running';
+    setDetailHeader(`PID ${proc.pid}`, 'background:rgba(59,130,246,0.2);color:#3b82f6', proc.name || 'unknown', statusText);
 
-    container.innerHTML = sorted.map((alert, idx) => `
-        <div class="event-row" onclick="openAlertDetail(${state.alerts.indexOf(alert)})">
-            <span class="event-severity ${(alert.severity || 'unknown').toLowerCase()}">${alert.severity || '?'}</span>
-            <span class="event-engine">${alert.engine || 'unknown'}</span>
-            <span class="event-rule">${escapeHtml(alert.rule_name || 'Unknown')}</span>
-            <span class="event-process">${escapeHtml(alert.process_name || '')} (${alert.pid || '?'})</span>
-            <span class="event-time">${formatRelativeTime(alert.timestamp)}</span>
-        </div>
-    `).join('');
+    let html = `<div class="detail-fields">
+        <div class="detail-field"><span class="field-label">Image</span><span class="field-value mono">${escapeHtml(proc.image || '')}</span></div>
+        <div class="detail-field"><span class="field-label">Command line</span><span class="field-value mono">${escapeHtml(proc.command_line || '')}</span></div>
+        <div class="detail-field"><span class="field-label">User</span><span class="field-value">${escapeHtml(proc.user || '')}</span></div>
+        <div class="detail-field"><span class="field-label">Parent</span><span class="field-value">${proc.parent_pid || 'N/A'} ${proc.parent_name ? '(' + escapeHtml(proc.parent_name) + ')' : ''}</span></div>
+        <div class="detail-field"><span class="field-label">Started</span><span class="field-value">${formatRelativeTime(proc.first_seen)}</span></div>
+        ${hasExited ? `<div class="detail-field"><span class="field-label">Exited</span><span class="field-value">${formatRelativeTime(proc.exit_time)}</span></div>` : ''}
+    </div>`;
+
+    const act = proc.activity || {};
+    html += `<div class="detail-section"><div class="detail-section-title">ACTIVITY</div>
+        <div class="activity-grid">
+            ${activityCounter('FILE', act.file)}
+            ${activityCounter('NETWORK', act.network)}
+            ${activityCounter('DNS', act.dns)}
+            ${activityCounter('REGISTRY', act.registry)}
+            ${activityCounter('MODULES', act.modules)}
+            ${activityCounter('THREATS', act.threats)}
+        </div></div>`;
+
+    const procAlerts = proc.alerts || [];
+    if (procAlerts.length > 0) {
+        html += `<div class="detail-section"><div class="detail-section-title">ALERTS (${procAlerts.length})</div>`;
+        procAlerts.forEach(alert => {
+            const sev = (alert.severity || 'unknown').toLowerCase();
+            const alertIdx = state.alerts.findIndex(a => a.id === alert.id);
+            html += `<div class="child-card" onclick="openAlertDetail(${alertIdx >= 0 ? alertIdx : 0})">
+                <div class="child-header">
+                    <span class="event-severity ${sev}">${alert.severity}</span>
+                    <span class="child-name" style="margin-left:8px">${escapeHtml(alert.rule_name || '')}</span>
+                </div>
+            </div>`;
+        });
+        html += `</div>`;
+    }
+
+    setDetailBody(html);
+    showDetail();
 }
 
-// --- Render: Process list ---
+// --- Render: Process list (sidebar) ---
 function renderProcessList() {
     const container = document.getElementById('process-list');
     const count = document.getElementById('process-count');
@@ -496,8 +1561,7 @@ function renderProcessList() {
     container.innerHTML = procs.map(proc => {
         const hasThreats = (proc.activity?.threats || 0) > 0;
         const isActive = state.selectedProcess === proc.pid;
-        return `
-            <div class="process-item ${isActive ? 'active' : ''}" onclick="openProcessDetail(${proc.pid})">
+        return `<div class="process-item ${isActive ? 'active' : ''}" onclick="openProcessDetail(${proc.pid})">
                 <div class="proc-icon ${hasThreats ? 'threat' : ''}"></div>
                 <span class="proc-name">${escapeHtml(proc.name || 'unknown')}</span>
                 <span class="proc-pid">${proc.pid}</span>
@@ -505,20 +1569,18 @@ function renderProcessList() {
     }).join('');
 }
 
-// --- Render: Timeline ---
+// --- Render: Timeline (sidebar) ---
 function renderTimeline() {
     const container = document.getElementById('timeline');
     if (!state.alerts.length) {
         container.innerHTML = '';
         return;
     }
-
-    // Create bars representing alerts over time
     const maxBars = 60;
     const alerts = state.alerts.slice(0, maxBars);
     container.innerHTML = alerts.map(alert => {
         const sev = (alert.severity || 'low').toLowerCase();
-        const width = 30 + Math.random() * 70; // Visual variety
+        const width = 30 + Math.random() * 70;
         return `<div class="timeline-bar severity-${sev}" style="width:${width}%" title="${escapeHtml(alert.rule_name || '')}"></div>`;
     }).join('');
 }
@@ -529,7 +1591,6 @@ function updateServiceStatus(status) {
     setStatus('status-sysmon', status.sysmon?.online);
     setStatus('status-agent', status.detonator_agent?.online);
     setStatus('status-litterbox', status.litterbox?.online);
-    // Fibratus doesn't have direct API - assume online if rustinel is
     setStatus('status-fibratus', status.rustinel?.online);
 }
 
@@ -541,650 +1602,8 @@ function setStatus(elementId, online) {
     }
 }
 
-// --- Detail Panel: Alert ---
-function openAlertDetail(idx) {
-    const alert = state.alerts[idx];
-    if (!alert) return;
-
-    // Push to history for back navigation
-    pushDetailHistory('alert', idx);
-
-    const severity = (alert.severity || 'unknown').toLowerCase();
-    const severityColors = { critical: '#ef4444', high: '#f97316', medium: '#eab308', low: '#22c55e' };
-
-    setDetailHeader(
-        severity.charAt(0).toUpperCase() + severity.slice(1),
-        `background:${severityColors[severity] || '#64748b'}20;color:${severityColors[severity] || '#94a3b8'}`,
-        alert.rule_name || 'Unknown Rule',
-        ''
-    );
-
-    // Build description with highlighted keywords
-    let desc = escapeHtml(alert.rule_description || 'No description available.');
-    // Highlight command patterns in backticks
-    desc = desc.replace(/`([^`]+)`/g, '<code>$1</code>');
-
-    // Extract ATT&CK tags
-    const tags = (alert.tags || []).map(tag => {
-        if (tag.startsWith('attack.t')) return `<span class="tag technique">${tag.replace('attack.', '').toUpperCase()}</span>`;
-        if (tag.startsWith('attack.')) return `<span class="tag tactic">${tag.replace('attack.', '').toUpperCase()}</span>`;
-        return `<span class="tag mitre">${escapeHtml(tag)}</span>`;
-    }).join('');
-
-    let html = '';
-
-    // Description
-    if (alert.rule_description) {
-        html += `<div class="alert-description">${desc}</div>`;
-    }
-
-    // Metadata fields
-    html += `<div class="detail-fields">
-        <div class="detail-field"><span class="field-label">Engine</span><span class="field-value">${alert.engine || 'unknown'}</span></div>
-        <div class="detail-field"><span class="field-label">PID</span><span class="field-value">${alert.pid || 'N/A'}</span></div>
-        <div class="detail-field"><span class="field-label">Category</span><span class="field-value">${formatCategory(alert.category)}</span></div>
-        ${tags ? `<div class="detail-field"><span class="field-label">ATT&CK</span><span class="field-value">${tags}</span></div>` : ''}
-    </div>`;
-
-    // Related process card
-    if (alert.pid) {
-        html += `
-        <div class="detail-section">
-            <div class="detail-section-title">RELATED</div>
-            <div class="related-card">
-                <div class="related-card-header">
-                    <span class="related-card-title">Process</span>
-                    <button class="btn btn-sm" onclick="openProcessDetail(${alert.pid})">Open process &gt;</button>
-                </div>
-                <div class="detail-field"><span class="field-label">PID</span><span class="field-value">${alert.pid}</span></div>
-                <div class="detail-field"><span class="field-label">Image</span><span class="field-value">${escapeHtml(alert.process_name || '')}</span></div>
-                <div class="detail-field"><span class="field-label">Command</span><span class="field-value mono">${escapeHtml(alert.command_line || '')}</span></div>
-            </div>
-        </div>`;
-    }
-
-    // Raw event JSON
-    html += `
-    <div class="detail-section">
-        <div class="detail-section-title">RAW EVENT / MATCH</div>
-        <div class="raw-json">${escapeHtml(JSON.stringify(alert.raw || alert, null, 2))}</div>
-    </div>`;
-
-    setDetailBody(html);
-    showDetail();
-}
-
-// --- Detail Panel: DNS Event ---
-function openDnsDetail(alert) {
-    if (!alert) return;
-    pushDetailHistory('dns', state.alerts.indexOf(alert));
-
-    const raw = alert.raw || {};
-    const dns = raw.dns || {};
-    const question = dns.question || {};
-    const answers = dns.answers || [];
-    const proc = raw.process || {};
-
-    setDetailHeader(
-        '\u2014',
-        'background:rgba(34,211,238,0.15);color:var(--accent-cyan)',
-        question.name || 'DNS Query',
-        formatRelativeTime(alert.timestamp)
-    );
-
-    let html = '';
-
-    // Basic info
-    html += `<div class="detail-fields">
-        <div class="detail-field"><span class="field-label">PID</span><span class="field-value">${alert.pid || 'N/A'}</span></div>
-        <div class="detail-field"><span class="field-label">Process</span><span class="field-value">${escapeHtml(alert.process_name || '')}</span></div>
-        <div class="detail-field"><span class="field-label">Status</span><span class="field-value">0</span></div>
-    </div>`;
-
-    // Answers
-    if (answers.length > 0) {
-        html += `<div class="detail-section">
-            <div class="detail-section-title">ANSWERS</div>
-            <div class="detail-fields">`;
-        answers.forEach((ans, i) => {
-            html += `<div class="detail-field"><span class="field-label">#${i + 1}</span><span class="field-value mono">${escapeHtml(ans.data || ans.ip || JSON.stringify(ans))}</span></div>`;
-        });
-        html += `</div></div>`;
-    }
-
-    // Related process card
-    html += `
-    <div class="detail-section">
-        <div class="detail-section-title">RELATED</div>
-        <div class="related-card">
-            <div class="related-card-header">
-                <span class="related-card-title">Process</span>
-                <button class="btn btn-sm" onclick="openProcessDetail(${alert.pid})">Open process &gt;</button>
-            </div>
-            <div class="detail-field"><span class="field-label">PID</span><span class="field-value">${alert.pid || 'N/A'}</span></div>
-            <div class="detail-field"><span class="field-label">Image</span><span class="field-value">${escapeHtml(proc.name || alert.process_name || '')}</span></div>
-            <div class="detail-field"><span class="field-label">Command</span><span class="field-value mono">${escapeHtml(proc.command_line || alert.command_line || '')}</span></div>
-        </div>
-    </div>`;
-
-    // Connections info
-    html += `
-    <div class="detail-section">
-        <div class="detail-section-title">Connections</div>
-        <p class="muted">None of the resolved IPs were dialled in this session.</p>
-    </div>`;
-
-    setDetailBody(html);
-    showDetail();
-}
-
-// --- Detail Panel: File/Sample Event ---
-function openFileDetail(alert) {
-    if (!alert) return;
-    pushDetailHistory('file', state.alerts.indexOf(alert));
-
-    const raw = alert.raw || {};
-    const fileData = raw.file || {};
-    const hash = fileData.hash || {};
-    const proc = raw.process || {};
-    const fileName = fileData.path ? fileData.path.split('\\').pop() : alert.process_name || 'unknown';
-    const fileSize = fileData.size || 0;
-
-    setDetailHeader(
-        'sample',
-        'background:rgba(167,139,250,0.15);color:var(--accent-purple)',
-        fileName,
-        formatRelativeTime(alert.timestamp)
-    );
-
-    let html = '';
-
-    // File metadata
-    html += `<div class="detail-fields">
-        <div class="detail-field"><span class="field-label">Path</span><span class="field-value mono">${escapeHtml(fileData.path || '')}</span></div>
-        <div class="detail-field"><span class="field-label">PID</span><span class="field-value">${alert.pid || 'N/A'}</span></div>
-        <div class="detail-field"><span class="field-label">Size</span><span class="field-value">${formatSize(fileSize)}</span></div>
-        <div class="detail-field"><span class="field-label">Type</span><span class="field-value">${detectFileType(fileData.path || '')}</span></div>
-        ${hash.sha256 ? `<div class="detail-field"><span class="field-label">SHA-256</span><span class="field-value mono hash-value">${escapeHtml(hash.sha256)}</span></div>` : ''}
-        ${hash.md5 ? `<div class="detail-field"><span class="field-label">MD5</span><span class="field-value mono hash-value">${escapeHtml(hash.md5)}</span></div>` : ''}
-    </div>`;
-
-    // Download link
-    if (fileData.path) {
-        html += `<div class="detail-section" style="margin-top:12px;">
-            <a href="/api/file/download?path=${encodeURIComponent(fileData.path)}" class="btn btn-sm file-download-btn" download>
-                Download file
-            </a>
-        </div>`;
-    }
-
-    // Related process card
-    html += `
-    <div class="detail-section">
-        <div class="detail-section-title">RELATED</div>
-        <div class="related-card">
-            <div class="related-card-header">
-                <span class="related-card-title">Process</span>
-                <button class="btn btn-sm" onclick="openProcessDetail(${alert.pid})">Open process &gt;</button>
-            </div>
-            <div class="detail-field"><span class="field-label">PID</span><span class="field-value">${alert.pid || 'N/A'}</span></div>
-            <div class="detail-field"><span class="field-label">Image</span><span class="field-value">${escapeHtml(proc.name || alert.process_name || '')}</span></div>
-            <div class="detail-field"><span class="field-label">Command</span><span class="field-value mono">${escapeHtml(proc.command_line || alert.command_line || '')}</span></div>
-        </div>
-    </div>`;
-
-    // IOC alert section
-    html += `
-    <div class="detail-section">
-        <div class="related-card ioc-card">
-            <span class="related-card-title">IOC alert</span>
-            <p class="muted" style="margin-top:8px">No IOC rule matched this artifact.</p>
-        </div>
-    </div>`;
-
-    // File events section
-    html += `
-    <div class="detail-section">
-        <div class="detail-section-title" style="display:flex;align-items:center;justify-content:space-between;">
-            <span>File events</span>
-            <button class="btn btn-sm" onclick="showInFiles('${escapeHtml(fileName)}')">Show in Files &gt;</button>
-        </div>
-        <div class="detail-fields">
-            <div class="detail-field"><span class="field-label">Path</span><span class="field-value mono">${escapeHtml(fileName)}</span></div>
-        </div>
-    </div>`;
-
-    // Hex preview (loads real file bytes via API)
-    const hexId = `hex-preview-${Date.now()}`;
-    html += `
-    <div class="detail-section">
-        <div class="detail-section-title" style="display:flex;align-items:center;justify-content:space-between;">
-            <span>PREVIEW</span>
-            <span class="muted" style="font-style:normal;font-size:10px" id="${hexId}-meta">loading...</span>
-        </div>
-        <div class="hex-preview" id="${hexId}">Loading hex preview...</div>
-    </div>`;
-
-    setDetailBody(html);
-    showDetail();
-
-    // Fetch real hex data asynchronously
-    if (fileData.path) {
-        fetchHexPreview(fileData.path, hexId);
-    } else {
-        document.getElementById(hexId).textContent = generateHexPreviewPlaceholder();
-        const metaEl = document.getElementById(`${hexId}-meta`);
-        if (metaEl) metaEl.textContent = 'placeholder (no file path)';
-    }
-}
-
-// --- Detail Panel: Registry Event ---
-function openRegistryDetail(alert) {
-    if (!alert) return;
-    pushDetailHistory('registry', state.alerts.indexOf(alert));
-
-    const raw = alert.raw || {};
-    const proc = raw.process || {};
-    const event = raw.event || {};
-
-    // Determine action from event action field
-    const action = event.action || 'registry_set';
-    const actionShort = action.replace('registry_', '');
-
-    // Extract registry-specific fields from raw data
-    const registry = raw.registry || {};
-    const commandLine = proc.command_line || alert.command_line || '';
-
-    // Try to extract TargetObject from command line for reg.exe
-    let targetObject = registry.path || registry.key || '';
-    let details = registry.value || registry.data || '';
-
-    // Parse reg.exe command line for target/details
-    if (proc.name === 'reg.exe' && commandLine) {
-        const hkuMatch = commandLine.match(/(HK[A-Z_]+\\[^\s]+)/i);
-        if (hkuMatch) targetObject = hkuMatch[1];
-        const valueMatch = commandLine.match(/\/v\s+(\S+)/i);
-        const dataMatch = commandLine.match(/\/d\s+(.+?)(?:\s+\/|$)/i);
-        if (valueMatch && targetObject) targetObject += '\\' + valueMatch[1];
-        if (dataMatch) details = dataMatch[1];
-    }
-
-    setDetailHeader(
-        `<span class="category-badge registry">Registry</span>`,
-        '',
-        actionShort,
-        `${formatRelativeTime(alert.timestamp)}  ${alert.timestamp || ''}`
-    );
-
-    // Use raw HTML for header since we need styled badge
-    const headerLeft = document.querySelector('.detail-header-left');
-    if (headerLeft) {
-        headerLeft.innerHTML = `
-            <button class="btn btn-sm" onclick="goDetailBack()">&lt; Back</button>
-            <span class="category-badge registry">Registry</span>
-            <span class="detail-title">${escapeHtml(actionShort)}</span>`;
-    }
-
-    let html = '';
-
-    // Process info
-    html += `<div class="detail-fields">
-        <div class="detail-field"><span class="field-label">PID</span><span class="field-value">${alert.pid || 'N/A'}</span></div>
-        <div class="detail-field"><span class="field-label">Process</span><span class="field-value mono">${escapeHtml(proc.executable || alert.process_image || '')}</span></div>
-    </div>`;
-
-    // Fields section
-    html += `<div class="detail-section">
-        <div class="detail-section-title">FIELDS</div>
-        <div class="detail-fields">
-            ${targetObject ? `<div class="detail-field"><span class="field-label">TargetObject</span><span class="field-value mono">${escapeHtml(targetObject)}</span></div>` : ''}
-            ${details ? `<div class="detail-field"><span class="field-label">Details</span><span class="field-value">${escapeHtml(details)}</span></div>` : ''}
-            <div class="detail-field"><span class="field-label">ProcessId</span><span class="field-value">${alert.pid || 'N/A'}</span></div>
-            <div class="detail-field"><span class="field-label">Image</span><span class="field-value mono">${escapeHtml(proc.executable || alert.process_image || '')}</span></div>
-            <div class="detail-field"><span class="field-label">EventType</span><span class="field-value">${escapeHtml(capitalizeAction(actionShort))}</span></div>
-            <div class="detail-field"><span class="field-label">User</span><span class="field-value">${escapeHtml(alert.user || '')}</span></div>
-        </div>
-    </div>`;
-
-    setDetailBody(html);
-    showDetail();
-}
-
-// --- Detail Panel: Injection Event ---
-function openInjectionDetail(alert) {
-    if (!alert) return;
-    pushDetailHistory('injection', state.alerts.indexOf(alert));
-
-    const raw = alert.raw || {};
-    const proc = raw.process || {};
-
-    setDetailHeader(
-        'Critical',
-        'background:rgba(239,68,68,0.2);color:#ef4444',
-        alert.rule_name || 'Injection Detected',
-        formatRelativeTime(alert.timestamp)
-    );
-
-    let html = '';
-
-    // Description
-    html += `<div class="alert-description">${escapeHtml(alert.rule_description || '')}</div>`;
-
-    // Process info
-    html += `<div class="detail-fields">
-        <div class="detail-field"><span class="field-label">PID</span><span class="field-value">${alert.pid || 'N/A'}</span></div>
-        <div class="detail-field"><span class="field-label">Process</span><span class="field-value mono">${escapeHtml(proc.executable || alert.process_image || '')}</span></div>
-        <div class="detail-field"><span class="field-label">Technique</span><span class="field-value">WriteProcessMemory + CreateRemoteThread</span></div>
-        <div class="detail-field"><span class="field-label">Category</span><span class="field-value">${formatCategory(alert.category)}</span></div>
-    </div>`;
-
-    // ATT&CK tags
-    const tags = (alert.tags || []).map(tag => {
-        if (tag.startsWith('attack.t')) return `<span class="tag technique">${tag.replace('attack.', '').toUpperCase()}</span>`;
-        if (tag.startsWith('attack.')) return `<span class="tag tactic">${tag.replace('attack.', '').toUpperCase()}</span>`;
-        return `<span class="tag mitre">${escapeHtml(tag)}</span>`;
-    }).join('');
-    if (tags) {
-        html += `<div class="detail-field" style="margin-bottom:16px"><span class="field-label">ATT&CK</span><span class="field-value">${tags}</span></div>`;
-    }
-
-    // Related process card
-    html += `
-    <div class="detail-section">
-        <div class="detail-section-title">RELATED</div>
-        <div class="related-card">
-            <div class="related-card-header">
-                <span class="related-card-title">Process</span>
-                <button class="btn btn-sm" onclick="openProcessDetail(${alert.pid})">Open process &gt;</button>
-            </div>
-            <div class="detail-field"><span class="field-label">PID</span><span class="field-value">${alert.pid || 'N/A'}</span></div>
-            <div class="detail-field"><span class="field-label">Image</span><span class="field-value">${escapeHtml(proc.name || alert.process_name || '')}</span></div>
-            <div class="detail-field"><span class="field-label">Command</span><span class="field-value mono">${escapeHtml(proc.command_line || alert.command_line || '')}</span></div>
-        </div>
-    </div>`;
-
-    // Raw JSON
-    html += `
-    <div class="detail-section">
-        <div class="detail-section-title">RAW EVENT / MATCH</div>
-        <div class="raw-json">${escapeHtml(JSON.stringify(alert.raw || alert, null, 2))}</div>
-    </div>`;
-
-    setDetailBody(html);
-    showDetail();
-}
-
-// --- Smart Alert Router (routes to specialized panels) ---
-function openAlertDetail(idx) {
-    const alert = state.alerts[idx];
-    if (!alert) return;
-
-    const raw = alert.raw || {};
-    const event = raw.event || {};
-    const action = (event.action || '').toLowerCase();
-    const category = Array.isArray(alert.category) ? alert.category[0] : (alert.category || '');
-    const catLower = category.toLowerCase();
-
-    // Route to specialized panels based on event type
-    if (catLower === 'network' && (action === 'dns_query' || raw.dns)) {
-        openDnsDetail(alert);
-        return;
-    }
-    if (catLower === 'file' && (action === 'file_create' || action === 'file_write' || raw.file)) {
-        openFileDetail(alert);
-        return;
-    }
-    if (catLower === 'registry' || action.startsWith('registry_')) {
-        openRegistryDetail(alert);
-        return;
-    }
-    if (action === 'injection_detected' || action.includes('inject')) {
-        openInjectionDetail(alert);
-        return;
-    }
-
-    // Default: generic alert detail
-    openGenericAlertDetail(idx);
-}
-
-function openGenericAlertDetail(idx) {
-    const alert = state.alerts[idx];
-    if (!alert) return;
-
-    pushDetailHistory('alert', idx);
-
-    const severity = (alert.severity || 'unknown').toLowerCase();
-    const severityColors = { critical: '#ef4444', high: '#f97316', medium: '#eab308', low: '#22c55e' };
-
-    setDetailHeader(
-        severity.charAt(0).toUpperCase() + severity.slice(1),
-        `background:${severityColors[severity] || '#64748b'}20;color:${severityColors[severity] || '#94a3b8'}`,
-        alert.rule_name || 'Unknown Rule',
-        ''
-    );
-
-    // Build description with highlighted keywords
-    let desc = escapeHtml(alert.rule_description || 'No description available.');
-    desc = desc.replace(/`([^`]+)`/g, '<code>$1</code>');
-
-    // Extract ATT&CK tags
-    const tags = (alert.tags || []).map(tag => {
-        if (tag.startsWith('attack.t')) return `<span class="tag technique">${tag.replace('attack.', '').toUpperCase()}</span>`;
-        if (tag.startsWith('attack.')) return `<span class="tag tactic">${tag.replace('attack.', '').toUpperCase()}</span>`;
-        return `<span class="tag mitre">${escapeHtml(tag)}</span>`;
-    }).join('');
-
-    let html = '';
-
-    // Description
-    if (alert.rule_description) {
-        html += `<div class="alert-description">${desc}</div>`;
-    }
-
-    // Metadata fields
-    html += `<div class="detail-fields">
-        <div class="detail-field"><span class="field-label">Engine</span><span class="field-value">${alert.engine || 'unknown'}</span></div>
-        <div class="detail-field"><span class="field-label">PID</span><span class="field-value">${alert.pid || 'N/A'}</span></div>
-        <div class="detail-field"><span class="field-label">Category</span><span class="field-value">${formatCategory(alert.category)}</span></div>
-        ${tags ? `<div class="detail-field"><span class="field-label">ATT&CK</span><span class="field-value">${tags}</span></div>` : ''}
-    </div>`;
-
-    // Related process card
-    if (alert.pid) {
-        html += `
-        <div class="detail-section">
-            <div class="detail-section-title">RELATED</div>
-            <div class="related-card">
-                <div class="related-card-header">
-                    <span class="related-card-title">Process</span>
-                    <button class="btn btn-sm" onclick="openProcessDetail(${alert.pid})">Open process &gt;</button>
-                </div>
-                <div class="detail-field"><span class="field-label">PID</span><span class="field-value">${alert.pid}</span></div>
-                <div class="detail-field"><span class="field-label">Image</span><span class="field-value">${escapeHtml(alert.process_name || '')}</span></div>
-                <div class="detail-field"><span class="field-label">Command</span><span class="field-value mono">${escapeHtml(alert.command_line || '')}</span></div>
-            </div>
-        </div>`;
-    }
-
-    // Raw event JSON
-    html += `
-    <div class="detail-section">
-        <div class="detail-section-title">RAW EVENT / MATCH</div>
-        <div class="raw-json">${escapeHtml(JSON.stringify(alert.raw || alert, null, 2))}</div>
-    </div>`;
-
-    setDetailBody(html);
-    showDetail();
-}
-
-// --- Detail Panel: Process ---
-function openProcessDetail(pid) {
-    state.selectedProcess = pid;
-    renderProcessList(); // Update active state
-    pushDetailHistory('process', pid);
-
-    const proc = state.processes[pid] || state.processes[String(pid)];
-    if (!proc) {
-        fetch(`/api/processes/${pid}`)
-            .then(r => r.json())
-            .then(data => {
-                if (!data.error) renderProcessDetailPanel(data);
-                else showMinimalProcessDetail(pid);
-            })
-            .catch(() => showMinimalProcessDetail(pid));
-        return;
-    }
-    renderProcessDetailPanel(proc);
-}
-
-function renderProcessDetailPanel(proc) {
-    // Determine status from exit_time
-    const hasExited = !!proc.exit_time;
-    const statusText = hasExited ? 'exited' : 'running';
-    const lifespan = hasExited ? computeLifespan(proc.first_seen, proc.exit_time) : '';
-    const exitMeta = hasExited
-        ? `exited ${formatRelativeTime(proc.exit_time)}  \u00B7  lifespan ${lifespan}`
-        : `running  \u00B7  started ${formatRelativeTime(proc.first_seen)}`;
-
-    setDetailHeader(
-        `PID ${proc.pid}`,
-        'background:rgba(59,130,246,0.2);color:#3b82f6',
-        proc.name || 'unknown',
-        exitMeta
-    );
-
-    // Update header with back button, status, and exit info
-    const headerLeft = document.querySelector('.detail-header-left');
-    if (headerLeft) {
-        headerLeft.innerHTML = `
-            <button class="btn btn-sm" onclick="goDetailBack()">&lt; Back</button>
-            <span class="detail-badge" style="background:rgba(59,130,246,0.2);color:#3b82f6">PID ${proc.pid}</span>
-            <span class="detail-status ${statusText}">${statusText}</span>
-            <span class="detail-title">${escapeHtml(proc.name || 'unknown')}</span>
-            ${hasExited ? `<span class="detail-lifespan">${lifespan}</span>` : ''}`;
-    }
-
-    let html = '';
-
-    // Process metadata
-    html += `<div class="detail-fields">
-        <div class="detail-field"><span class="field-label">Image</span><span class="field-value mono">${escapeHtml(proc.image || '')}</span></div>
-        <div class="detail-field"><span class="field-label">Command line</span><span class="field-value mono">${escapeHtml(proc.command_line || '')}</span></div>
-        <div class="detail-field"><span class="field-label">User</span><span class="field-value">${escapeHtml(proc.user || '')}</span></div>
-        <div class="detail-field"><span class="field-label">Integrity</span><span class="field-value">${escapeHtml(proc.integrity || '')}</span></div>
-        <div class="detail-field"><span class="field-label">Working dir</span><span class="field-value mono">${escapeHtml(proc.working_dir || '')}</span></div>
-        <div class="detail-field"><span class="field-label">Parent</span><span class="field-value">${proc.parent_pid || 'N/A'} ${proc.parent_name ? '(' + escapeHtml(proc.parent_name) + ')' : ''}</span></div>
-        <div class="detail-field"><span class="field-label">Started</span><span class="field-value">${formatRelativeTime(proc.first_seen)} (${proc.first_seen || ''})</span></div>
-        ${hasExited ? `<div class="detail-field"><span class="field-label">Exited</span><span class="field-value">${formatRelativeTime(proc.exit_time)} (${proc.exit_time || ''})</span></div>` : ''}
-        ${hasExited ? `<div class="detail-field"><span class="field-label">Lifespan</span><span class="field-value">${lifespan}</span></div>` : ''}
-        ${proc.exit_code != null ? `<div class="detail-field"><span class="field-label">Exit code</span><span class="field-value">${proc.exit_code}</span></div>` : ''}
-    </div>`;
-
-    // Activity counters grid
-    const act = proc.activity || {};
-    html += `
-    <div class="detail-section">
-        <div class="detail-section-title">ACTIVITY</div>
-        <div class="activity-grid">
-            ${activityCounter('FILE', act.file)}
-            ${activityCounter('NETWORK', act.network)}
-            ${activityCounter('DNS', act.dns)}
-            ${activityCounter('HTTP', act.http)}
-            ${activityCounter('REGISTRY', act.registry)}
-            ${activityCounter('MODULES', act.modules)}
-            ${activityCounter('SCRIPTS', act.scripts)}
-            ${activityCounter('INJECTION', act.injection)}
-            ${activityCounter('WMI', act.wmi)}
-            ${activityCounter('SERVICES', act.services)}
-            ${activityCounter('TASKS', act.tasks)}
-            ${activityCounter('LOGONS', act.logons)}
-            ${activityCounter('ARTIFACTS', act.artifacts)}
-            ${activityCounter('THREATS', act.threats)}
-        </div>
-        <p class="muted" style="font-size:10px;">Tip: clicking a counter switches to that tab and pre-filters the table by this PID. Clear the per-column filter to see the rest of the session.</p>
-    </div>`;
-
-    // Environment (collapsible)
-    html += `
-    <div class="detail-section">
-        <details class="collapsible-section">
-            <summary class="detail-section-title" style="cursor:pointer;border-bottom:none;">\u25B8 ENVIRONMENT</summary>
-            <div class="detail-fields" style="padding-top:8px;">
-                <div class="detail-field"><span class="field-label">Working Dir</span><span class="field-value mono">${escapeHtml(proc.working_dir || '')}</span></div>
-                <div class="detail-field"><span class="field-label">Integrity</span><span class="field-value">${escapeHtml(proc.integrity || '')}</span></div>
-            </div>
-        </details>
-    </div>`;
-
-    // Children
-    const children = proc.children || [];
-    if (children.length > 0) {
-        html += `<div class="detail-section">
-            <div class="detail-section-title">CHILDREN</div>`;
-        children.forEach(childPid => {
-            const child = state.processes[childPid] || state.processes[String(childPid)];
-            if (child) {
-                const relativeStart = computeRelativeOffset(proc.first_seen, child.first_seen);
-                const childExited = !!child.exit_time;
-                const childLifespan = childExited ? computeLifespan(child.first_seen, child.exit_time) : '';
-                const childStatus = childExited ? 'exited' : 'running';
-                html += `
-                <div class="child-card" onclick="openProcessDetail(${childPid})">
-                    <div class="child-header">
-                        <span class="child-name">${escapeHtml(child.name || 'unknown')} &middot; PID ${childPid}</span>
-                        <span class="detail-status ${childStatus}" style="font-size:10px;margin-left:auto;margin-right:8px;">${childStatus}</span>
-                        <button class="btn btn-sm">Open &gt;</button>
-                    </div>
-                    <div class="detail-field"><span class="field-label">Started</span><span class="field-value">${relativeStart}</span></div>
-                    ${childExited ? `<div class="detail-field"><span class="field-label">Exited</span><span class="field-value">${formatRelativeTime(child.exit_time)} (lifespan ${childLifespan})</span></div>` : ''}
-                    <div class="detail-field"><span class="field-label">Image</span><span class="field-value mono">${escapeHtml(child.image || '')}</span></div>
-                </div>`;
-            } else {
-                html += `
-                <div class="child-card" onclick="openProcessDetail(${childPid})">
-                    <div class="child-header">
-                        <span class="child-name">PID ${childPid}</span>
-                        <button class="btn btn-sm">Open &gt;</button>
-                    </div>
-                </div>`;
-            }
-        });
-        html += `</div>`;
-    }
-
-    // Alerts for this process
-    const procAlerts = proc.alerts || [];
-    if (procAlerts.length > 0) {
-        html += `<div class="detail-section">
-            <div class="detail-section-title">ALERTS (${procAlerts.length})</div>`;
-        procAlerts.forEach((alert) => {
-            const sev = (alert.severity || 'unknown').toLowerCase();
-            const alertIdx = state.alerts.findIndex(a => a.id === alert.id);
-            html += `
-            <div class="child-card" onclick="openAlertDetail(${alertIdx >= 0 ? alertIdx : 0})">
-                <div class="child-header">
-                    <span class="event-severity ${sev}" style="font-size:10px">${alert.severity}</span>
-                    <span class="child-name" style="margin-left:8px">${escapeHtml(alert.rule_name || '')}</span>
-                </div>
-                <div class="detail-field"><span class="field-label">Engine</span><span class="field-value">${alert.engine || ''}</span></div>
-            </div>`;
-        });
-        html += `</div>`;
-    }
-
-    setDetailBody(html);
-    showDetail();
-}
-
-function showMinimalProcessDetail(pid) {
-    setDetailHeader(`PID ${pid}`, 'background:rgba(59,130,246,0.2);color:#3b82f6', `Process ${pid}`, '');
-    setDetailBody(`<div class="muted">No detailed information available for PID ${pid}.</div>`);
-    showDetail();
-}
-
 // --- Detail Panel: Navigation ---
 function pushDetailHistory(type, id) {
-    // Don't push duplicates
     const last = state.detailHistory[state.detailHistory.length - 1];
     if (last && last.type === type && last.id === id) return;
     state.detailHistory.push({ type, id });
@@ -1192,39 +1611,19 @@ function pushDetailHistory(type, id) {
 
 function goDetailBack() {
     if (state.detailHistory.length > 1) {
-        state.detailHistory.pop(); // Remove current
-        const prev = state.detailHistory.pop(); // Get previous (will be re-pushed by open)
-        if (prev.type === 'process') {
-            openProcessDetail(prev.id);
-        } else if (prev.type === 'rustinel') {
-            openRustinelDetail();
-        } else if (prev.type === 'agent') {
-            openAgentDetail();
-        } else if (prev.type === 'litterbox') {
-            openLitterboxDetail();
-        } else if (prev.type === 'fibratus') {
-            openFibratusDetail();
-        } else if (prev.type === 'alert' || prev.type === 'dns' || prev.type === 'file' || prev.type === 'registry' || prev.type === 'injection') {
-            openAlertDetail(prev.id);
-        }
+        state.detailHistory.pop();
+        const prev = state.detailHistory.pop();
+        if (prev.type === 'process') openProcessDetail(prev.id);
+        else if (prev.type === 'rustinel') openRustinelDetail();
+        else if (prev.type === 'agent') openAgentDetail();
+        else if (prev.type === 'litterbox') openLitterboxDetail();
+        else if (prev.type === 'alert') openAlertDetail(prev.id);
     } else {
         closeDetail();
     }
 }
 
-// --- Detail Panel: helpers ---
 function setDetailHeader(badgeText, badgeStyle, title, meta) {
-    const badge = document.getElementById('detail-badge');
-    const titleEl = document.getElementById('detail-title');
-    const metaEl = document.getElementById('detail-meta');
-    if (badge) {
-        badge.innerHTML = badgeText;
-        badge.style.cssText = badgeStyle;
-    }
-    if (titleEl) titleEl.textContent = title;
-    if (metaEl) metaEl.textContent = meta;
-
-    // Restore back button
     const headerLeft = document.querySelector('.detail-header-left');
     if (headerLeft) {
         headerLeft.innerHTML = `
@@ -1232,6 +1631,8 @@ function setDetailHeader(badgeText, badgeStyle, title, meta) {
             <span class="detail-badge" id="detail-badge" style="${badgeStyle}">${badgeText}</span>
             <span class="detail-title" id="detail-title">${escapeHtml(title)}</span>`;
     }
+    const metaEl = document.getElementById('detail-meta');
+    if (metaEl) metaEl.textContent = meta || '';
 }
 
 function setDetailBody(html) {
@@ -1292,23 +1693,34 @@ async function submitSample() {
     btn.disabled = true;
     btn.textContent = 'Detonating...';
     result.className = 'submit-result visible';
-    result.innerHTML = '<div class="detonation-status">Submitting sample...</div>';
+    result.innerHTML = '<div>Submitting sample...</div>';
 
     const formData = new FormData();
     formData.append('file', input.files[0]);
     formData.append('target', target);
-
-    // Record submission time for post-detonation alert polling
-    const submissionTime = new Date().toISOString();
-    const fileName = input.files[0].name;
 
     try {
         const resp = await fetch('/api/submit', { method: 'POST', body: formData });
         const data = await resp.json();
 
         if (resp.ok) {
-            // Render enhanced results panel
-            renderDetonationResults(data, submissionTime, fileName, target);
+            result.className = 'submit-result visible success';
+            let html = `<div class="detonation-header"><div class="detonation-filename">${escapeHtml(input.files[0].name)}</div></div>`;
+            if (data.file_info) {
+                html += `<div class="detail-fields"><div class="detail-field"><span class="field-label">SHA-256</span><span class="field-value mono">${escapeHtml(data.file_info.sha256)}</span></div></div>`;
+            }
+            if (data.agent) {
+                const agentOk = data.agent.status >= 200 && data.agent.status < 400;
+                html += `<div style="margin-top:8px;"><strong>Agent:</strong> <span style="color:${agentOk ? 'var(--accent-green)' : 'var(--accent-red)'}">${agentOk ? 'Success' : 'Failed'}</span> (HTTP ${data.agent.status})</div>`;
+                if (data.agent.data?.pid) html += `<div>PID: ${data.agent.data.pid}</div>`;
+            }
+            if (data.litterbox) {
+                const lbOk = data.litterbox.status >= 200 && data.litterbox.status < 400;
+                html += `<div style="margin-top:8px;"><strong>LitterBox:</strong> <span style="color:${lbOk ? 'var(--accent-green)' : 'var(--accent-red)'}">${lbOk ? 'Uploaded' : 'Failed'}</span></div>`;
+            }
+            result.innerHTML = html;
+            // Refresh alerts after a delay
+            setTimeout(refreshAlerts, 3000);
         } else {
             result.className = 'submit-result visible error';
             result.textContent = `Error: ${JSON.stringify(data)}`;
@@ -1320,604 +1732,1114 @@ async function submitSample() {
 
     btn.disabled = false;
     btn.textContent = 'Detonate';
+
+    // Refresh submissions list after successful submit
+    refreshSubmissions();
 }
 
-// --- Enhanced Detonation Results Panel ---
-let _detonationPollTimer = null;
-let _detonationPollCount = 0;
+// --- Submissions History ---
+async function refreshSubmissions() {
+    const container = document.getElementById('submissions-list');
+    if (!container) return;
 
-function renderDetonationResults(data, submissionTime, fileName, target) {
-    const result = document.getElementById('submit-result');
-    result.className = 'submit-result visible';
-
-    // Determine agent result
-    const agentResult = data.agent || null;
-    const litterboxResult = data.litterbox || null;
-    const agentPid = agentResult?.data?.pid || null;
-    const agentStatus = agentResult?.data?.status || agentResult?.data?.message || null;
-    const agentOk = agentResult && agentResult.status >= 200 && agentResult.status < 400;
-    const litterboxOk = litterboxResult && litterboxResult.status >= 200 && litterboxResult.status < 400;
-
-    // Determine execution status
-    let execStatus = 'unknown';
-    let execColor = 'var(--text-muted)';
-    let execIcon = '\u2022';
-    if (agentResult) {
-        const st = (typeof agentResult.data === 'object' ? agentResult.data?.status : '') || '';
-        if (st === 'virus' || st === 'quarantined') {
-            execStatus = 'Quarantined by AV';
-            execColor = 'var(--accent-orange)';
-            execIcon = '\u26A0';
-        } else if (agentOk && agentPid) {
-            execStatus = `Executed (PID ${agentPid})`;
-            execColor = 'var(--accent-green)';
-            execIcon = '\u2713';
-        } else if (agentOk) {
-            execStatus = 'Submitted';
-            execColor = 'var(--accent-green)';
-            execIcon = '\u2713';
-        } else {
-            execStatus = `Failed (HTTP ${agentResult.status})`;
-            execColor = 'var(--accent-red)';
-            execIcon = '\u2717';
+    try {
+        const resp = await fetch('/api/submissions');
+        if (!resp.ok) {
+            container.innerHTML = '<div style="padding:12px;color:var(--text-muted);font-size:11px;">Failed to load submissions.</div>';
+            return;
         }
+        const submissions = await resp.json();
+
+        if (!submissions.length) {
+            container.innerHTML = '<div style="padding:12px;color:var(--text-muted);font-size:11px;">No samples submitted yet. Use the form above to detonate a sample.</div>';
+            return;
+        }
+
+        let html = '<table class="submissions-table"><thead><tr>';
+        html += '<th>Time</th><th>Filename</th><th>SHA-256</th><th>Size</th><th>Target</th><th>Status</th><th>Actions</th>';
+        html += '</tr></thead><tbody>';
+
+        submissions.forEach(sub => {
+            const ts = sub.timestamp ? new Date(sub.timestamp).toLocaleString('en-GB', {hour12: false, day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit', second:'2-digit'}) : '--';
+            const agentBadge = sub.agent_status === 'success'
+                ? '<span class="badge badge-green">Agent OK</span>'
+                : sub.agent_status === 'failed'
+                ? '<span class="badge badge-red">Agent Fail</span>'
+                : '';
+            const lbBadge = sub.litterbox_status === 'success'
+                ? '<span class="badge badge-green">LB OK</span>'
+                : sub.litterbox_status === 'failed'
+                ? '<span class="badge badge-red">LB Fail</span>'
+                : '';
+            const pid = sub.agent_pid ? `<span class="badge badge-dim">PID ${sub.agent_pid}</span>` : '';
+            const shortHash = sub.sha256 ? sub.sha256.substring(0, 12) + '...' : '--';
+            const actions = sub.file_path
+                ? `<button class="btn btn-xs" onclick="hexOpenFile('${escapeHtml(sub.file_path.replace(/\\/g, '\\\\'))}')" title="Open in Hex Editor">Hex</button>`
+                : '';
+
+            html += `<tr>`;
+            html += `<td class="td-time">${ts}</td>`;
+            html += `<td class="td-filename" title="${escapeHtml(sub.filename || '')}">${escapeHtml(sub.filename || '--')}</td>`;
+            html += `<td class="td-hash mono" title="${escapeHtml(sub.sha256 || '')}">${shortHash}</td>`;
+            html += `<td class="td-size">${sub.size ? formatSize(sub.size) : '--'}</td>`;
+            html += `<td class="td-target">${escapeHtml(sub.target || '--')}</td>`;
+            html += `<td class="td-status">${agentBadge} ${lbBadge} ${pid}</td>`;
+            html += `<td class="td-actions">${actions}</td>`;
+            html += `</tr>`;
+        });
+
+        html += '</tbody></table>';
+        container.innerHTML = html;
+    } catch (e) {
+        container.innerHTML = `<div style="padding:12px;color:var(--accent-red);font-size:11px;">Error: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+// =============================================
+// PROCESS ROLLUP GRAPH
+// =============================================
+
+const graphState = {
+    nodes: [],
+    edges: [],
+    camera: { x: 0, y: 0, zoom: 1 },
+    dragging: null,
+    panning: false,
+    panStart: { x: 0, y: 0 },
+    hoveredNode: null,
+    selectedNode: null,
+    animFrame: null,
+    initialized: false,
+    timeRangeSeconds: 0, // 0 = all time
+    searchQuery: '', // search filter for process/filename
+};
+
+async function graphRefresh() {
+    // Fetch process tree + sysmon network/DNS data in parallel
+    const [procResp, sysmonNetResp, sysmonDnsResp, sysmonInjectResp] = await Promise.all([
+        fetch('/api/processes'),
+        fetch('/api/sysmon?event_id=3&max=300'),
+        fetch('/api/sysmon?event_id=22&max=200'),
+        fetch('/api/sysmon?event_id=8&max=100'),
+    ]);
+
+    let processes = {};
+    let networkEvents = [];
+    let dnsEvents = [];
+    let injectEvents = [];
+
+    if (procResp.ok) processes = await procResp.json();
+    if (sysmonNetResp.ok) networkEvents = await sysmonNetResp.json();
+    if (sysmonDnsResp.ok) dnsEvents = await sysmonDnsResp.json();
+    if (sysmonInjectResp.ok) injectEvents = await sysmonInjectResp.json();
+
+    // Also use the alerts already in state for network info
+    const networkAlerts = (state.alerts || []).filter(a => {
+        const cat = (Array.isArray(a.category) ? a.category[0] : a.category || '').toLowerCase();
+        return cat === 'network';
+    });
+
+    buildGraph(processes, networkEvents, dnsEvents, injectEvents, networkAlerts);
+    if (!graphState.initialized) {
+        initGraphCanvas();
+        graphState.initialized = true;
+    }
+    graphFitView();
+    renderGraph();
+}
+
+function buildGraph(processes, networkEvents, dnsEvents, injectEvents, networkAlerts) {
+    const nodes = [];
+    const edges = [];
+    const nodeMap = {};
+
+    const showNetwork = document.getElementById('graph-show-network')?.checked;
+    const showDns = document.getElementById('graph-show-dns')?.checked;
+    const showFiles = document.getElementById('graph-show-files')?.checked;
+    const showRegistry = document.getElementById('graph-show-registry')?.checked;
+    const showDetonatedOnly = document.getElementById('graph-show-detonated')?.checked;
+
+    // Time range filtering
+    const timeRange = graphState.timeRangeSeconds;
+    let cutoffTime = null;
+    if (timeRange > 0) {
+        cutoffTime = new Date(Date.now() - timeRange * 1000).toISOString();
     }
 
-    let html = '';
-
-    // Header
-    html += `<div class="detonation-header">
-        <div class="detonation-filename">${escapeHtml(fileName)}</div>
-        <div class="detonation-meta">Detonated at ${new Date(submissionTime).toLocaleTimeString('en-GB')} \u00B7 Target: ${escapeHtml(target)}</div>
-        ${data.file_info ? `<div class="detonation-meta mono" style="margin-top:4px;">SHA-256: ${escapeHtml(data.file_info.sha256 || '')}</div>` : ''}
-    </div>`;
-
-    // Investigation Pipeline
-    html += `<div class="detonation-section pipeline-section">
-        <div class="detonation-section-title">Investigation Pipeline</div>
-        <div class="pipeline-steps">
-            <div class="pipeline-step done">
-                <div class="pipeline-step-icon">\u2713</div>
-                <div class="pipeline-step-body">
-                    <div class="pipeline-step-name">Hash registered</div>
-                    <div class="pipeline-step-desc">SHA-256 added to Rustinel IOC feed${data.ioc_feed?.status === 'exists' ? ' (already known)' : ''}</div>
-                </div>
-            </div>
-            <div class="pipeline-step ${agentOk || (target === 'litterbox') ? 'done' : 'failed'}">
-                <div class="pipeline-step-icon">${agentOk || (target === 'litterbox') ? '\u2713' : '\u2717'}</div>
-                <div class="pipeline-step-body">
-                    <div class="pipeline-step-name">Sample delivered</div>
-                    <div class="pipeline-step-desc">${target === 'litterbox' ? 'Uploaded to LitterBox' : wasQuarantined ? 'Blocked by AV before execution' : agentOk ? 'Written to C:\\Users\\Public\\Downloads' : 'Delivery failed'}</div>
-                </div>
-            </div>
-            <div class="pipeline-step ${wasQuarantined ? 'failed' : agentPid ? 'done' : 'pending'}">
-                <div class="pipeline-step-icon">${wasQuarantined ? '\u2717' : agentPid ? '\u2713' : '\u2022'}</div>
-                <div class="pipeline-step-body">
-                    <div class="pipeline-step-name">Process execution</div>
-                    <div class="pipeline-step-desc">${agentPid ? `Spawned PID ${agentPid}` : wasQuarantined ? 'AV prevented execution' : 'Waiting for agent'}</div>
-                </div>
-            </div>
-            <div class="pipeline-step ${shouldPoll ? 'active' : wasQuarantined ? 'skipped' : 'pending'}">
-                <div class="pipeline-step-icon">${shouldPoll ? '\u25B6' : '\u2014'}</div>
-                <div class="pipeline-step-body">
-                    <div class="pipeline-step-name">ETW monitoring (Fibratus)</div>
-                    <div class="pipeline-step-desc">Process, network, registry, file, DNS events</div>
-                </div>
-            </div>
-            <div class="pipeline-step ${shouldPoll ? 'active' : wasQuarantined ? 'skipped' : 'pending'}">
-                <div class="pipeline-step-icon">${shouldPoll ? '\u25B6' : '\u2014'}</div>
-                <div class="pipeline-step-body">
-                    <div class="pipeline-step-name">Rustinel detection</div>
-                    <div class="pipeline-step-desc">${state.rustinelInfo ? `${state.rustinelInfo.rules?.sigma || 0} Sigma + ${state.rustinelInfo.rules?.yara || 0} YARA rules + IOC matching` : 'Sigma + YARA + IOC matching'}</div>
-                </div>
-            </div>
-        </div>
-    </div>`;
-
-    // Execution section
-    if (target === 'agent' || target === 'both') {
-        html += `<div class="detonation-section">
-            <div class="detonation-section-title">
-                <span class="detonation-icon agent">D</span> DetonatorAgent
-            </div>
-            <div class="detonation-status-row">
-                <span style="color:${execColor}">${execIcon} ${escapeHtml(execStatus)}</span>
-                ${agentPid ? `<span class="detonation-pid">PID ${agentPid}</span>` : ''}
-            </div>`;
-        if (agentResult?.data?.message) {
-            html += `<div class="detonation-detail muted">${escapeHtml(agentResult.data.message)}</div>`;
-        }
-        html += `</div>`;
+    function isInTimeRange(timestamp) {
+        if (!cutoffTime || !timestamp) return true;
+        return timestamp >= cutoffTime;
     }
 
-    // LitterBox section
-    if (target === 'litterbox' || target === 'both') {
-        html += `<div class="detonation-section">
-            <div class="detonation-section-title">
-                <span class="detonation-icon litterbox">L</span> LitterBox
-            </div>
-            <div class="detonation-status-row">
-                <span style="color:${litterboxOk ? 'var(--accent-green)' : 'var(--accent-red)'}">
-                    ${litterboxOk ? '\u2713 Uploaded' : '\u2717 Failed'}
-                </span>
-            </div>`;
-        if (litterboxOk && litterboxResult?.data) {
-            const lbData = typeof litterboxResult.data === 'object' ? litterboxResult.data : {};
-            if (lbData.file_info) {
-                const fi = lbData.file_info;
-                html += `<div class="detonation-detail">
-                    ${fi.sha256 ? `<div class="detail-field"><span class="field-label">SHA-256</span><span class="field-value mono" style="font-size:10px">${escapeHtml(fi.sha256)}</span></div>` : ''}
-                    ${fi.file_type ? `<div class="detail-field"><span class="field-label">Type</span><span class="field-value">${escapeHtml(fi.file_type)}</span></div>` : ''}
-                </div>`;
+    // Filter sysmon events by time
+    if (cutoffTime) {
+        networkEvents = networkEvents.filter(e => isInTimeRange(e.timestamp));
+        dnsEvents = dnsEvents.filter(e => isInTimeRange(e.timestamp));
+        injectEvents = injectEvents.filter(e => isInTimeRange(e.timestamp));
+        networkAlerts = networkAlerts.filter(a => isInTimeRange(a.timestamp));
+    }
+
+    // 1. Create process nodes - only include interesting ones
+    //    (has alerts OR is parent/child of one that does OR has sysmon network/dns activity)
+    //    Also apply time range filter to processes
+    const sysmonPids = new Set();
+    networkEvents.forEach(ev => { if (ev.pid) sysmonPids.add(String(ev.pid)); });
+    dnsEvents.forEach(ev => { if (ev.pid) sysmonPids.add(String(ev.pid)); });
+    injectEvents.forEach(ev => {
+        if (ev.pid) sysmonPids.add(String(ev.pid));
+        if (ev.source_pid) sysmonPids.add(String(ev.source_pid));
+        if (ev.target_pid) sysmonPids.add(String(ev.target_pid));
+    });
+
+    // First pass: identify processes with alerts in the time range
+    const alertPids = new Set();
+    for (const [pid, proc] of Object.entries(processes)) {
+        if ((proc.activity?.threats || 0) > 0) {
+            // Check if any of this process's alerts are in time range
+            if (cutoffTime) {
+                const hasRecentAlert = (proc.alerts || []).some(a => isInTimeRange(a.timestamp));
+                if (hasRecentAlert) alertPids.add(pid);
+            } else {
+                alertPids.add(pid);
             }
-        } else if (litterboxResult?.error) {
-            html += `<div class="detonation-detail muted">${escapeHtml(litterboxResult.error)}</div>`;
         }
-        html += `</div>`;
     }
 
-    // Rustinel / Fibratus detection results (polling section)
-    const wasQuarantined = agentResult && (typeof agentResult.data === 'object') &&
-        (agentResult.data?.status === 'virus' || agentResult.data?.status === 'quarantined');
-    const shouldPoll = !wasQuarantined && (agentOk || target === 'litterbox');
+    // Also include processes that were active in the time range (first_seen or last_seen)
+    if (cutoffTime) {
+        for (const [pid, proc] of Object.entries(processes)) {
+            if (isInTimeRange(proc.last_seen) || isInTimeRange(proc.first_seen)) {
+                if (sysmonPids.has(pid)) alertPids.add(pid); // only if they have sysmon activity
+            }
+        }
+    }
 
-    html += `<div class="detonation-section" id="detonation-detections">
-        <div class="detonation-section-title">
-            <span class="detonation-icon rustinel">R</span> Rustinel + Fibratus Detections
-            <span class="detonation-poll-badge" id="detonation-poll-status">${shouldPoll ? 'polling...' : 'skipped'}</span>
-        </div>
-        <div id="detonation-alerts-content">`;
+    // Second pass: include parents/children of alert processes + sysmon-active processes
+    const includePids = new Set([...alertPids, ...sysmonPids]);
+    for (const pid of [...alertPids]) {
+        const proc = processes[pid];
+        if (proc?.parent_pid && processes[proc.parent_pid]) includePids.add(String(proc.parent_pid));
+        (proc?.children || []).forEach(c => includePids.add(String(c)));
+    }
 
-    if (wasQuarantined) {
-        html += `<div class="detonation-no-alerts">
-            <strong>Sample was quarantined before execution.</strong><br>
-            No process was spawned, so Rustinel/Fibratus have no events to detect.<br>
-            <span class="muted">Disable real-time AV or add an exclusion to allow detonation.</span>
-        </div>`;
-    } else if (!agentOk && target !== 'litterbox' && target !== 'both') {
-        html += `<div class="detonation-no-alerts">
-            Agent submission failed. No process executed — nothing to detect.
-        </div>`;
+    // Search filter: narrow down to processes matching query + their parents/children
+    const searchQuery = graphState.searchQuery;
+    if (searchQuery) {
+        const matchedPids = new Set();
+        for (const [pid, proc] of Object.entries(processes)) {
+            if (!includePids.has(pid)) continue;
+            const name = (proc.name || '').toLowerCase();
+            const image = (proc.image || '').toLowerCase();
+            const cmdline = (proc.command_line || '').toLowerCase();
+            const pidStr = String(pid);
+            if (name.includes(searchQuery) || image.includes(searchQuery) || cmdline.includes(searchQuery) || pidStr.includes(searchQuery)) {
+                matchedPids.add(pid);
+            }
+        }
+        // Include parents and children of matched processes for context
+        const expandedPids = new Set(matchedPids);
+        for (const pid of matchedPids) {
+            const proc = processes[pid];
+            if (proc?.parent_pid && processes[proc.parent_pid]) expandedPids.add(String(proc.parent_pid));
+            (proc?.children || []).forEach(c => { if (includePids.has(String(c))) expandedPids.add(String(c)); });
+        }
+        // Replace includePids with search-filtered set
+        includePids.clear();
+        for (const pid of expandedPids) includePids.add(pid);
+    }
+
+    // Detonated-only filter: narrow to processes that have detonation results
+    if (showDetonatedOnly) {
+        const detonatedPids = new Set();
+        for (const [pid, proc] of Object.entries(processes)) {
+            if (!includePids.has(pid)) continue;
+            if (proc.detonated) detonatedPids.add(pid);
+        }
+        // Include parents/children of detonated processes for context
+        const expandedDet = new Set(detonatedPids);
+        for (const pid of detonatedPids) {
+            const proc = processes[pid];
+            if (proc?.parent_pid && processes[proc.parent_pid]) expandedDet.add(String(proc.parent_pid));
+            (proc?.children || []).forEach(c => { if (includePids.has(String(c))) expandedDet.add(String(c)); });
+        }
+        includePids.clear();
+        for (const pid of expandedDet) includePids.add(pid);
+    }
+
+    for (const [pid, proc] of Object.entries(processes)) {
+        if (!includePids.has(pid)) continue;
+        const threats = proc.activity?.threats || 0;
+        const maxSev = getNodeMaxSeverity(proc);
+        const node = {
+            id: `proc_${pid}`,
+            type: 'process',
+            pid: pid,
+            label: proc.name || 'unknown',
+            image: proc.image || '',
+            cmdline: proc.command_line || '',
+            user: proc.user || '',
+            threats: threats,
+            severity: maxSev,
+            children: proc.children || [],
+            parentPid: proc.parent_pid,
+            activity: proc.activity || {},
+            firstSeen: proc.first_seen || '',
+            exited: !!proc.exit_time,
+            detonated: !!proc.detonated,
+            detonationSources: proc.detonation_sources || [],
+            x: 0, y: 0, vx: 0, vy: 0,
+            radius: Math.max(14, Math.min(30, 14 + threats * 2)),
+        };
+        nodes.push(node);
+        nodeMap[pid] = node;
+    }
+
+    // 2. Create parent-child edges
+    for (const node of nodes) {
+        if (node.parentPid && nodeMap[node.parentPid]) {
+            edges.push({
+                source: `proc_${node.parentPid}`,
+                target: node.id,
+                type: 'spawn',
+                label: 'spawned',
+            });
+        }
+    }
+
+    // 3. Network connection nodes (from Sysmon event 3)
+    if (showNetwork) {
+        const netTargets = {};  // deduplicate by ip:port
+        networkEvents.forEach(ev => {
+            const key = `${ev.dst_ip}:${ev.dst_port}`;
+            if (!netTargets[key]) {
+                netTargets[key] = { ip: ev.dst_ip, port: ev.dst_port, hostname: ev.dst_hostname || '', pids: new Set(), protocol: ev.protocol || 'tcp' };
+            }
+            if (ev.pid) netTargets[key].pids.add(String(ev.pid));
+        });
+
+        // Also add network info from alerts
+        networkAlerts.forEach(a => {
+            const raw = a.raw || {};
+            const ip = raw.destination?.ip || raw.network?.destination?.ip || '';
+            const port = raw.destination?.port || raw.network?.destination?.port || '';
+            if (ip) {
+                const key = `${ip}:${port}`;
+                if (!netTargets[key]) {
+                    netTargets[key] = { ip, port, hostname: '', pids: new Set(), protocol: 'tcp' };
+                }
+                if (a.pid) netTargets[key].pids.add(String(a.pid));
+            }
+        });
+
+        for (const [key, info] of Object.entries(netTargets)) {
+            const nodeId = `net_${key}`;
+            nodes.push({
+                id: nodeId,
+                type: 'network',
+                label: info.hostname || info.ip,
+                ip: info.ip,
+                port: info.port,
+                protocol: info.protocol,
+                x: 0, y: 0, vx: 0, vy: 0,
+                radius: 10,
+            });
+            info.pids.forEach(pid => {
+                if (nodeMap[pid]) {
+                    edges.push({ source: `proc_${pid}`, target: nodeId, type: 'network', label: `${info.protocol}:${info.port}` });
+                }
+            });
+        }
+    }
+
+    // 4. DNS nodes (from Sysmon event 22)
+    if (showDns) {
+        const dnsTargets = {};
+        dnsEvents.forEach(ev => {
+            const query = ev.query || '';
+            if (!query) return;
+            if (!dnsTargets[query]) {
+                dnsTargets[query] = { query, result: ev.result || '', pids: new Set() };
+            }
+            if (ev.pid) dnsTargets[query].pids.add(String(ev.pid));
+        });
+
+        for (const [query, info] of Object.entries(dnsTargets)) {
+            const nodeId = `dns_${query}`;
+            nodes.push({
+                id: nodeId,
+                type: 'dns',
+                label: query,
+                result: info.result,
+                x: 0, y: 0, vx: 0, vy: 0,
+                radius: 8,
+            });
+            info.pids.forEach(pid => {
+                if (nodeMap[pid]) {
+                    edges.push({ source: `proc_${pid}`, target: nodeId, type: 'dns', label: 'query' });
+                }
+            });
+        }
+    }
+
+    // 5. Injection edges (from Sysmon event 8: CreateRemoteThread)
+    injectEvents.forEach(ev => {
+        const srcPid = String(ev.source_pid || ev.pid);
+        const tgtPid = String(ev.target_pid);
+        if (srcPid && tgtPid && nodeMap[srcPid] && nodeMap[tgtPid]) {
+            edges.push({ source: `proc_${srcPid}`, target: `proc_${tgtPid}`, type: 'inject', label: 'inject' });
+        }
+    });
+
+    // 6. File nodes (from alerts with category=file)
+    if (showFiles) {
+        const fileTargets = {};
+        (state.alerts || []).forEach(a => {
+            const cat = (Array.isArray(a.category) ? a.category[0] : a.category || '').toLowerCase();
+            if (cat !== 'file') return;
+            const raw = a.raw || {};
+            const path = raw.file?.path || raw['file.path'] || '';
+            if (!path || !a.pid) return;
+            if (!fileTargets[path]) fileTargets[path] = { path, pids: new Set() };
+            fileTargets[path].pids.add(String(a.pid));
+        });
+        for (const [path, info] of Object.entries(fileTargets)) {
+            const nodeId = `file_${path}`;
+            const shortName = path.split('\\').pop() || path.split('/').pop() || path;
+            nodes.push({ id: nodeId, type: 'file', label: shortName, fullPath: path, x: 0, y: 0, vx: 0, vy: 0, radius: 7 });
+            info.pids.forEach(pid => {
+                if (nodeMap[pid]) edges.push({ source: `proc_${pid}`, target: nodeId, type: 'file', label: 'write' });
+            });
+        }
+    }
+
+    // 7. Registry nodes
+    if (showRegistry) {
+        const regTargets = {};
+        (state.alerts || []).forEach(a => {
+            const cat = (Array.isArray(a.category) ? a.category[0] : a.category || '').toLowerCase();
+            if (cat !== 'registry') return;
+            const raw = a.raw || {};
+            const path = raw.registry?.path || raw['registry.path'] || '';
+            if (!path || !a.pid) return;
+            const shortKey = path.split('\\').slice(-2).join('\\') || path;
+            if (!regTargets[shortKey]) regTargets[shortKey] = { path, pids: new Set() };
+            regTargets[shortKey].pids.add(String(a.pid));
+        });
+        for (const [key, info] of Object.entries(regTargets)) {
+            const nodeId = `reg_${key}`;
+            nodes.push({ id: nodeId, type: 'registry', label: key, fullPath: info.path, x: 0, y: 0, vx: 0, vy: 0, radius: 7 });
+            info.pids.forEach(pid => {
+                if (nodeMap[pid]) edges.push({ source: `proc_${pid}`, target: nodeId, type: 'registry', label: 'modify' });
+            });
+        }
+    }
+
+    // Apply layout
+    const layout = document.getElementById('graph-layout')?.value || 'hierarchy';
+    if (layout === 'hierarchy') {
+        applyHierarchyLayout(nodes, edges, nodeMap);
     } else {
-        html += `<div class="detonation-loading">
-                <div class="detonation-spinner"></div>
-                Waiting for detections... (polling every 3s)
-            </div>`;
+        applyForceLayout(nodes, edges);
     }
 
-    html += `</div></div>`;
+    graphState.nodes = nodes;
+    graphState.edges = edges;
 
-    // Also show existing alerts count for context
-    html += `<div class="detonation-section" style="background:transparent;border:none;padding:4px 12px;">
-        <div class="muted" style="font-size:10px;">Session total: ${state.alerts.length} alerts loaded from Rustinel logs</div>
-    </div>`;
-
-    result.innerHTML = html;
-
-    // Start polling for new alerts (only if sample likely executed)
-    if (shouldPoll) {
-        startDetonationPolling(submissionTime, agentPid);
+    // Update counter
+    const countEl = document.getElementById('graph-node-count');
+    if (countEl) {
+        let label = `${nodes.length} nodes, ${edges.length} edges`;
+        if (graphState.searchQuery) label += ` (filtered: "${graphState.searchQuery}")`;
+        countEl.textContent = label;
     }
 }
 
-function startDetonationPolling(sinceTime, pid) {
-    // Clear any previous polling
-    if (_detonationPollTimer) clearInterval(_detonationPollTimer);
-    _detonationPollCount = 0;
+function getNodeMaxSeverity(proc) {
+    let max = 'low';
+    const order = { critical: 4, high: 3, medium: 2, low: 1, unknown: 0 };
+    (proc.alerts || []).forEach(a => {
+        const sev = (a.severity || 'unknown').toLowerCase();
+        if ((order[sev] || 0) > (order[max] || 0)) max = sev;
+    });
+    return max;
+}
 
-    const maxPolls = 20; // Poll for 60s max (20 * 3s)
-    let lastAlertCount = 0;
-    let stableCount = 0; // How many polls with no new alerts
+function applyHierarchyLayout(nodes, edges, nodeMap) {
+    // Build tree levels from process parent relationships
+    const procNodes = nodes.filter(n => n.type === 'process');
+    const otherNodes = nodes.filter(n => n.type !== 'process');
 
-    const poll = async () => {
-        _detonationPollCount++;
-        const statusEl = document.getElementById('detonation-poll-status');
-        const contentEl = document.getElementById('detonation-alerts-content');
-        if (!contentEl) { clearInterval(_detonationPollTimer); return; }
+    // Find roots (no parent or parent not in nodeMap)
+    const roots = procNodes.filter(n => !n.parentPid || !nodeMap[n.parentPid]);
+    const visited = new Set();
+    let col = 0;
 
-        try {
-            // Poll for ALL alerts since submission time (not just PID, since
-            // child processes and injected processes get different PIDs)
-            let url = `/api/alerts?since=${encodeURIComponent(sinceTime)}`;
-            const resp = await fetch(url);
-            const alerts = await resp.json();
+    function layoutTree(node, depth) {
+        if (visited.has(node.id)) return;
+        visited.add(node.id);
+        node.x = depth * 200;
+        node.y = col * 80;
+        col++;
+        // Find children
+        const children = procNodes.filter(n => n.parentPid && `proc_${n.parentPid}` === node.id && !visited.has(n.id));
+        children.forEach(child => layoutTree(child, depth + 1));
+    }
 
-            if (alerts.length > 0) {
-                renderDetonationAlerts(alerts, contentEl);
-                // Check if count stabilized
-                if (alerts.length === lastAlertCount) {
-                    stableCount++;
-                } else {
-                    stableCount = 0;
-                }
-                lastAlertCount = alerts.length;
+    roots.forEach(root => layoutTree(root, 0));
+    // Any orphans
+    procNodes.filter(n => !visited.has(n.id)).forEach(n => { n.x = 0; n.y = col * 80; col++; });
+
+    // Place non-process nodes around their connected process
+    otherNodes.forEach(node => {
+        const connEdge = edges.find(e => e.target === node.id || e.source === node.id);
+        if (connEdge) {
+            const parentId = connEdge.source === node.id ? connEdge.target : connEdge.source;
+            const parent = nodes.find(n => n.id === parentId);
+            if (parent) {
+                const angle = Math.random() * Math.PI * 2;
+                const dist = 100 + Math.random() * 60;
+                node.x = parent.x + Math.cos(angle) * dist;
+                node.y = parent.y + Math.sin(angle) * dist;
+                return;
             }
-
-            // Update poll status
-            if (statusEl) {
-                const elapsed = _detonationPollCount * 3;
-                statusEl.textContent = `${elapsed}s \u00B7 ${alerts.length} alert${alerts.length !== 1 ? 's' : ''}`;
-            }
-
-            // Stop conditions: max polls reached or results stabilized for 3 consecutive polls
-            if (_detonationPollCount >= maxPolls || (stableCount >= 3 && lastAlertCount > 0)) {
-                clearInterval(_detonationPollTimer);
-                if (statusEl) {
-                    statusEl.textContent = `done \u00B7 ${lastAlertCount} alert${lastAlertCount !== 1 ? 's' : ''}`;
-                    statusEl.classList.add('done');
-                }
-                if (lastAlertCount === 0 && contentEl) {
-                    contentEl.innerHTML = `<div class="detonation-no-alerts">No detections triggered after ${_detonationPollCount * 3}s. Sample may be benign, evasive, or execution was blocked.</div>`;
-                }
-                // Final refresh of main alerts view
-                refreshAlerts();
-            }
-        } catch (e) {
-            console.error('Detonation poll error:', e);
         }
-    };
-
-    // First poll after 3s (give Rustinel + background loader time to process)
-    setTimeout(poll, 3000);
-    // Then every 3s
-    _detonationPollTimer = setInterval(poll, 3000);
+        node.x = Math.random() * 600;
+        node.y = Math.random() * 400;
+    });
 }
 
-function renderDetonationAlerts(alerts, container) {
-    // Group by engine
-    const byEngine = {};
-    alerts.forEach(a => {
-        const eng = a.engine || 'unknown';
-        if (!byEngine[eng]) byEngine[eng] = [];
-        byEngine[eng].push(a);
+function applyForceLayout(nodes, edges) {
+    // Initial random placement
+    nodes.forEach((n, i) => {
+        n.x = Math.cos(i * 0.7) * (150 + i * 10);
+        n.y = Math.sin(i * 0.7) * (150 + i * 10);
     });
 
-    // Severity summary
-    const severityCounts = { critical: 0, high: 0, medium: 0, low: 0 };
-    alerts.forEach(a => {
-        const sev = (a.severity || 'low').toLowerCase();
-        if (severityCounts[sev] !== undefined) severityCounts[sev]++;
-    });
+    // Run force simulation for N iterations
+    const nodeIndex = {};
+    nodes.forEach(n => { nodeIndex[n.id] = n; });
 
-    let html = '';
+    for (let iter = 0; iter < 120; iter++) {
+        const alpha = 0.3 * (1 - iter / 120);
 
-    // Severity summary bar
-    html += `<div class="detonation-severity-bar">`;
-    if (severityCounts.critical > 0) html += `<span class="sev-badge critical">${severityCounts.critical} Critical</span>`;
-    if (severityCounts.high > 0) html += `<span class="sev-badge high">${severityCounts.high} High</span>`;
-    if (severityCounts.medium > 0) html += `<span class="sev-badge medium">${severityCounts.medium} Medium</span>`;
-    if (severityCounts.low > 0) html += `<span class="sev-badge low">${severityCounts.low} Low</span>`;
-    html += `</div>`;
-
-    // Alerts grouped by engine
-    for (const [engine, engineAlerts] of Object.entries(byEngine)) {
-        html += `<div class="detonation-engine-group">
-            <div class="detonation-engine-title">${escapeHtml(engine.toUpperCase())} (${engineAlerts.length})</div>`;
-        engineAlerts.forEach(alert => {
-            const sev = (alert.severity || 'low').toLowerCase();
-            html += `<div class="detonation-alert-row" onclick="switchTab('tracing'); setTimeout(() => openAlertDetail(${state.alerts.findIndex(a => a.id === alert.id)}), 200);">
-                <span class="event-severity ${sev}" style="font-size:10px;padding:2px 6px;">${alert.severity || '?'}</span>
-                <span class="detonation-alert-name">${escapeHtml(alert.rule_name || 'Unknown')}</span>
-                <span class="detonation-alert-pid">${alert.process_name || ''} (${alert.pid || '?'})</span>
-            </div>`;
-        });
-        html += `</div>`;
-    }
-
-    // MITRE ATT&CK tags collected from all alerts
-    const allTags = new Set();
-    alerts.forEach(a => (a.tags || []).forEach(t => allTags.add(t)));
-    if (allTags.size > 0) {
-        html += `<div class="detonation-tags">`;
-        [...allTags].sort().forEach(tag => {
-            if (tag.startsWith('attack.t')) html += `<span class="tag technique">${tag.replace('attack.', '').toUpperCase()}</span>`;
-            else if (tag.startsWith('attack.')) html += `<span class="tag tactic">${tag.replace('attack.', '').toUpperCase()}</span>`;
-        });
-        html += `</div>`;
-    }
-
-    container.innerHTML = html;
-}
-
-// --- Utilities ---
-function escapeHtml(str) {
-    if (!str) return '';
-    return String(str)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
-}
-
-function formatTime(ts) {
-    if (!ts) return '';
-    try {
-        const d = new Date(ts);
-        if (isNaN(d.getTime())) return ts.substring(0, 19);
-        return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    } catch {
-        return ts.substring(0, 19);
-    }
-}
-
-function formatRelativeTime(ts) {
-    if (!ts || !state.sessionStart) return formatTime(ts);
-    try {
-        const t = new Date(ts).getTime();
-        if (isNaN(t)) return formatTime(ts);
-        const diff = (t - state.sessionStart) / 1000;
-        if (diff < 0) return '+0.000s';
-        return `+${diff.toFixed(3)}s`;
-    } catch {
-        return formatTime(ts);
-    }
-}
-
-function computeRelativeOffset(parentTs, childTs) {
-    if (!parentTs || !childTs) return formatTime(childTs);
-    try {
-        const pt = new Date(parentTs).getTime();
-        const ct = new Date(childTs).getTime();
-        if (isNaN(pt) || isNaN(ct)) return formatTime(childTs);
-        const diff = (ct - pt) / 1000;
-        return `+${diff.toFixed(3)}s`;
-    } catch {
-        return formatTime(childTs);
-    }
-}
-
-function computeLifespan(startTs, endTs) {
-    if (!startTs || !endTs) return '';
-    try {
-        const start = new Date(startTs).getTime();
-        const end = new Date(endTs).getTime();
-        if (isNaN(start) || isNaN(end)) return '';
-        const diffMs = end - start;
-        if (diffMs < 0) return '0ms';
-        if (diffMs < 1000) return `${diffMs}ms`;
-        const diffS = diffMs / 1000;
-        if (diffS < 60) return `${diffS.toFixed(2)}s`;
-        const mins = Math.floor(diffS / 60);
-        const secs = (diffS % 60).toFixed(1);
-        if (mins < 60) return `${mins}m ${secs}s`;
-        const hours = Math.floor(mins / 60);
-        const remainMins = mins % 60;
-        return `${hours}h ${remainMins}m`;
-    } catch {
-        return '';
-    }
-}
-
-function formatSize(bytes) {
-    if (!bytes || bytes === 0) return '0 B';
-    if (bytes < 1024) return bytes + ' B';
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-}
-
-function formatCategory(cat) {
-    if (Array.isArray(cat)) return cat.map(c => c.charAt(0).toUpperCase() + c.slice(1)).join(', ');
-    if (typeof cat === 'string') return cat.charAt(0).toUpperCase() + cat.slice(1);
-    return '';
-}
-
-function capitalizeAction(action) {
-    if (!action) return '';
-    // "set" -> "SetValue", "create" -> "CreateKey"
-    const map = { 'set': 'SetValue', 'create': 'CreateKey', 'delete': 'DeleteKey', 'rename': 'RenameKey' };
-    return map[action.toLowerCase()] || action.charAt(0).toUpperCase() + action.slice(1);
-}
-
-function detectFileType(path) {
-    if (!path) return 'Unknown';
-    const ext = path.split('.').pop().toLowerCase();
-    const types = {
-        'exe': 'PE', 'dll': 'PE', 'sys': 'PE', 'scr': 'PE',
-        'ps1': 'PowerShell', 'bat': 'Batch', 'cmd': 'Batch',
-        'js': 'JavaScript', 'vbs': 'VBScript',
-        'doc': 'Office', 'docx': 'Office', 'xls': 'Office', 'xlsx': 'Office',
-        'pdf': 'PDF', 'zip': 'Archive', 'rar': 'Archive', '7z': 'Archive',
-    };
-    return types[ext] || ext.toUpperCase();
-}
-
-function activityCounter(label, value) {
-    const v = value || 0;
-    const highlight = (label === 'THREATS' && v > 0) ? ' threats' :
-                      (label === 'INJECTION' && v > 0) ? ' injection' : '';
-    return `
-        <div class="activity-counter${highlight ? ' ' + highlight : ''}">
-            <div class="counter-label">${label}</div>
-            <div class="counter-value ${v === 0 ? 'zero' : ''}">${v}</div>
-        </div>`;
-}
-
-function generateHexPreviewPlaceholder() {
-    // Generate a realistic-looking hex dump placeholder (MZ header)
-    const lines = [
-        '00000000  4d 5a 90 00 03 00 00 00  04 00 00 00 ff ff 00 00  |MZ..............|',
-        '00000010  b8 00 00 00 00 00 00 00  40 00 00 00 00 00 00 00  |........@.......|',
-        '00000020  00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00  |................|',
-        '00000030  00 00 00 00 00 00 00 00  00 00 00 00 80 00 00 00  |................|',
-        '00000040  0e 1f ba 0e 00 b4 09 cd  21 b8 01 4c cd 21 54 68  |........!..L.!Th|',
-        '00000050  69 73 20 70 72 6f 67 72  61 6d 20 63 61 6e 6e 6f  |is program canno|',
-        '00000060  74 20 62 65 20 72 75 6e  20 69 6e 20 44 4f 53 20  |t be run in DOS |',
-        '00000070  6d 6f 64 65 2e 0d 0d 0a  24 00 00 00 00 00 00 00  |mode....$.......|',
-    ];
-    return lines.join('\n');
-}
-
-async function fetchHexPreview(filepath, elementId) {
-    try {
-        const resp = await fetch(`/api/file/hex?path=${encodeURIComponent(filepath)}&bytes=8192`);
-        const data = await resp.json();
-        const el = document.getElementById(elementId);
-        const metaEl = document.getElementById(`${elementId}-meta`);
-        if (el) {
-            if (data.hex) {
-                el.textContent = data.hex;
-                if (metaEl) metaEl.textContent = `first ${data.bytes_shown.toLocaleString()} of ${data.size.toLocaleString()} bytes`;
-            } else if (data.error) {
-                el.textContent = generateHexPreviewPlaceholder();
-                if (metaEl) metaEl.textContent = `unavailable: ${data.error}`;
+        // Repulsion between all nodes
+        for (let i = 0; i < nodes.length; i++) {
+            for (let j = i + 1; j < nodes.length; j++) {
+                const dx = nodes[j].x - nodes[i].x;
+                const dy = nodes[j].y - nodes[i].y;
+                const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+                const force = 3000 / (dist * dist);
+                const fx = (dx / dist) * force * alpha;
+                const fy = (dy / dist) * force * alpha;
+                nodes[i].x -= fx;
+                nodes[i].y -= fy;
+                nodes[j].x += fx;
+                nodes[j].y += fy;
             }
         }
-    } catch (e) {
-        const el = document.getElementById(elementId);
-        if (el) el.textContent = generateHexPreviewPlaceholder();
-        const metaEl = document.getElementById(`${elementId}-meta`);
-        if (metaEl) metaEl.textContent = 'failed to load';
+
+        // Attraction along edges
+        edges.forEach(e => {
+            const src = nodeIndex[e.source];
+            const tgt = nodeIndex[e.target];
+            if (!src || !tgt) return;
+            const dx = tgt.x - src.x;
+            const dy = tgt.y - src.y;
+            const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+            const idealDist = e.type === 'spawn' ? 150 : 120;
+            const force = (dist - idealDist) * 0.01 * alpha;
+            const fx = (dx / dist) * force;
+            const fy = (dy / dist) * force;
+            src.x += fx;
+            src.y += fy;
+            tgt.x -= fx;
+            tgt.y -= fy;
+        });
     }
 }
 
-function showInFiles(filename) {
-    // Switch to tracing tab and filter alerts to file category matching this filename
-    switchTab('tracing');
-    closeDetail();
-    // Set engine filter to show file events
-    const engineFilter = document.getElementById('filter-engine');
-    if (engineFilter) {
-        engineFilter.value = '';
+function initGraphCanvas() {
+    const canvas = document.getElementById('graph-canvas');
+    const container = document.getElementById('graph-container');
+    if (!canvas || !container) return;
+
+    function resize() {
+        canvas.width = container.clientWidth;
+        canvas.height = container.clientHeight;
+        renderGraph();
     }
-    // Refresh with file category context
-    refreshAlerts();
+    resize();
+    window.addEventListener('resize', resize);
+
+    // Mouse interactions
+    let lastMouse = { x: 0, y: 0 };
+
+    canvas.addEventListener('mousedown', e => {
+        const pos = screenToWorld(e.offsetX, e.offsetY);
+        const node = findNodeAt(pos.x, pos.y);
+        if (node) {
+            graphState.dragging = node;
+            graphState.selectedNode = node;
+            showGraphDetail(node);
+        } else {
+            graphState.panning = true;
+            graphState.panStart = { x: e.offsetX, y: e.offsetY };
+            graphState.selectedNode = null;
+            hideGraphDetail();
+        }
+        lastMouse = { x: e.offsetX, y: e.offsetY };
+    });
+
+    canvas.addEventListener('mousemove', e => {
+        const pos = screenToWorld(e.offsetX, e.offsetY);
+
+        if (graphState.dragging) {
+            graphState.dragging.x = pos.x;
+            graphState.dragging.y = pos.y;
+            renderGraph();
+        } else if (graphState.panning) {
+            const dx = e.offsetX - graphState.panStart.x;
+            const dy = e.offsetY - graphState.panStart.y;
+            graphState.camera.x += dx;
+            graphState.camera.y += dy;
+            graphState.panStart = { x: e.offsetX, y: e.offsetY };
+            renderGraph();
+        } else {
+            // Hover detection
+            const node = findNodeAt(pos.x, pos.y);
+            if (node !== graphState.hoveredNode) {
+                graphState.hoveredNode = node;
+                showGraphTooltip(node, e.offsetX, e.offsetY);
+                renderGraph();
+            }
+        }
+        lastMouse = { x: e.offsetX, y: e.offsetY };
+    });
+
+    canvas.addEventListener('mouseup', () => {
+        graphState.dragging = null;
+        graphState.panning = false;
+    });
+
+    canvas.addEventListener('mouseleave', () => {
+        graphState.dragging = null;
+        graphState.panning = false;
+        graphState.hoveredNode = null;
+        hideGraphTooltip();
+        renderGraph();
+    });
+
+    canvas.addEventListener('wheel', e => {
+        e.preventDefault();
+        const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+        const oldZoom = graphState.camera.zoom;
+        graphState.camera.zoom = Math.max(0.1, Math.min(5, oldZoom * zoomFactor));
+
+        // Zoom toward mouse position
+        const mx = e.offsetX;
+        const my = e.offsetY;
+        graphState.camera.x = mx - (mx - graphState.camera.x) * (graphState.camera.zoom / oldZoom);
+        graphState.camera.y = my - (my - graphState.camera.y) * (graphState.camera.zoom / oldZoom);
+
+        renderGraph();
+    });
 }
 
-// --- Filter event listeners ---
-document.getElementById('filter-severity')?.addEventListener('change', refreshAlerts);
-document.getElementById('filter-engine')?.addEventListener('change', refreshAlerts);
-
-// --- Rustinel Detail Panel ---
-async function openRustinelDetail() {
-    pushDetailHistory('rustinel', 0);
-
-    // Show loading state
-    setDetailHeader(
-        'Engine',
-        'background:rgba(34,211,238,0.15);color:var(--accent-cyan)',
-        'Rustinel',
-        'loading...'
-    );
-    setDetailBody('<div class="muted">Fetching Rustinel status...</div>');
-    showDetail();
-
-    try {
-        const resp = await fetch('/api/rustinel');
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const info = await resp.json();
-        renderRustinelDetail(info);
-    } catch (e) {
-        setDetailBody(`<div class="muted">Failed to fetch Rustinel info: ${escapeHtml(e.message)}</div>`);
-    }
+function screenToWorld(sx, sy) {
+    return {
+        x: (sx - graphState.camera.x) / graphState.camera.zoom,
+        y: (sy - graphState.camera.y) / graphState.camera.zoom,
+    };
 }
 
-function renderRustinelDetail(info) {
-    const online = info.online;
-    const statusText = online ? 'running' : 'stopped';
-    const statusColor = online ? 'var(--accent-green)' : 'var(--accent-red)';
+function worldToScreen(wx, wy) {
+    return {
+        x: wx * graphState.camera.zoom + graphState.camera.x,
+        y: wy * graphState.camera.zoom + graphState.camera.y,
+    };
+}
 
-    setDetailHeader(
-        'Engine',
-        'background:rgba(34,211,238,0.15);color:var(--accent-cyan)',
-        'Rustinel',
-        ''
-    );
+function findNodeAt(wx, wy) {
+    for (let i = graphState.nodes.length - 1; i >= 0; i--) {
+        const n = graphState.nodes[i];
+        const dx = wx - n.x;
+        const dy = wy - n.y;
+        if (dx * dx + dy * dy < n.radius * n.radius) return n;
+    }
+    return null;
+}
 
-    // Update header with status
-    const headerLeft = document.querySelector('.detail-header-left');
-    if (headerLeft) {
-        headerLeft.innerHTML = `
-            <button class="btn btn-sm" onclick="goDetailBack()">&lt; Back</button>
-            <span class="detail-badge" style="background:rgba(34,211,238,0.15);color:var(--accent-cyan)">Engine</span>
-            <span class="detail-title">Rustinel</span>
-            <span class="detail-status" style="color:${statusColor}">${statusText}</span>`;
+function graphFitView() {
+    const nodes = graphState.nodes;
+    if (!nodes.length) return;
+    const canvas = document.getElementById('graph-canvas');
+    if (!canvas) return;
+
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    nodes.forEach(n => {
+        minX = Math.min(minX, n.x - n.radius);
+        maxX = Math.max(maxX, n.x + n.radius);
+        minY = Math.min(minY, n.y - n.radius);
+        maxY = Math.max(maxY, n.y + n.radius);
+    });
+
+    const padding = 60;
+    const w = maxX - minX + padding * 2;
+    const h = maxY - minY + padding * 2;
+    const zoom = Math.min(canvas.width / w, canvas.height / h, 2);
+
+    graphState.camera.zoom = zoom;
+    graphState.camera.x = canvas.width / 2 - (minX + maxX) / 2 * zoom;
+    graphState.camera.y = canvas.height / 2 - (minY + maxY) / 2 * zoom;
+    renderGraph();
+}
+
+function renderGraph() {
+    const canvas = document.getElementById('graph-canvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const { nodes, edges, camera } = graphState;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.save();
+    ctx.translate(camera.x, camera.y);
+    ctx.scale(camera.zoom, camera.zoom);
+
+    const nodeColors = {
+        process: '#3b82f6',
+        network: '#22c55e',
+        dns: '#a78bfa',
+        file: '#f97316',
+        registry: '#f472b6',
+    };
+
+    const edgeColors = {
+        spawn: '#475569',
+        network: '#22c55e',
+        dns: '#a78bfa',
+        inject: '#ef4444',
+        file: '#f97316',
+        registry: '#f472b6',
+    };
+
+    // Build node index for edge lookup
+    const nodeIndex = {};
+    nodes.forEach(n => { nodeIndex[n.id] = n; });
+
+    // Draw edges
+    edges.forEach(edge => {
+        const src = nodeIndex[edge.source];
+        const tgt = nodeIndex[edge.target];
+        if (!src || !tgt) return;
+
+        ctx.beginPath();
+        ctx.moveTo(src.x, src.y);
+        ctx.lineTo(tgt.x, tgt.y);
+        ctx.strokeStyle = edgeColors[edge.type] || '#475569';
+        ctx.lineWidth = edge.type === 'inject' ? 2 : 1;
+        if (edge.type === 'inject') {
+            ctx.setLineDash([4, 3]);
+        } else if (edge.type !== 'spawn') {
+            ctx.setLineDash([2, 2]);
+        } else {
+            ctx.setLineDash([]);
+        }
+        ctx.globalAlpha = 0.6;
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.globalAlpha = 1;
+
+        // Arrow head for spawn edges
+        if (edge.type === 'spawn') {
+            const angle = Math.atan2(tgt.y - src.y, tgt.x - src.x);
+            const headLen = 8;
+            const arrX = tgt.x - Math.cos(angle) * tgt.radius;
+            const arrY = tgt.y - Math.sin(angle) * tgt.radius;
+            ctx.beginPath();
+            ctx.moveTo(arrX, arrY);
+            ctx.lineTo(arrX - headLen * Math.cos(angle - 0.4), arrY - headLen * Math.sin(angle - 0.4));
+            ctx.lineTo(arrX - headLen * Math.cos(angle + 0.4), arrY - headLen * Math.sin(angle + 0.4));
+            ctx.closePath();
+            ctx.fillStyle = edgeColors[edge.type];
+            ctx.globalAlpha = 0.7;
+            ctx.fill();
+            ctx.globalAlpha = 1;
+        }
+    });
+
+    // Draw nodes
+    nodes.forEach(node => {
+        const isHovered = graphState.hoveredNode === node;
+        const isSelected = graphState.selectedNode === node;
+        let color = nodeColors[node.type] || '#64748b';
+
+        // Override color for malicious processes
+        if (node.type === 'process' && node.threats > 0) {
+            if (node.severity === 'critical') color = '#ef4444';
+            else if (node.severity === 'high') color = '#f97316';
+            else if (node.severity === 'medium') color = '#eab308';
+        }
+
+        const r = node.radius * (isHovered ? 1.2 : 1);
+
+        // Glow for malicious
+        if (node.type === 'process' && node.threats > 0) {
+            ctx.beginPath();
+            ctx.arc(node.x, node.y, r + 4, 0, Math.PI * 2);
+            ctx.fillStyle = color + '20';
+            ctx.fill();
+        }
+
+        // Node circle
+        ctx.beginPath();
+        ctx.arc(node.x, node.y, r, 0, Math.PI * 2);
+        ctx.fillStyle = color + '30';
+        ctx.fill();
+        ctx.strokeStyle = isSelected ? '#fff' : color;
+        ctx.lineWidth = isSelected ? 2.5 : 1.5;
+        ctx.stroke();
+
+        // Icon/shape based on type
+        ctx.fillStyle = color;
+        if (node.type === 'process') {
+            // Draw process icon (small square)
+            const s = r * 0.4;
+            ctx.fillRect(node.x - s, node.y - s, s * 2, s * 2);
+        } else if (node.type === 'network') {
+            // Draw network icon (diamond)
+            ctx.beginPath();
+            const d = r * 0.5;
+            ctx.moveTo(node.x, node.y - d);
+            ctx.lineTo(node.x + d, node.y);
+            ctx.lineTo(node.x, node.y + d);
+            ctx.lineTo(node.x - d, node.y);
+            ctx.closePath();
+            ctx.fill();
+        } else if (node.type === 'dns') {
+            // Dot
+            ctx.beginPath();
+            ctx.arc(node.x, node.y, r * 0.35, 0, Math.PI * 2);
+            ctx.fill();
+        } else {
+            // Small triangle for file/registry
+            ctx.beginPath();
+            const t = r * 0.4;
+            ctx.moveTo(node.x, node.y - t);
+            ctx.lineTo(node.x + t, node.y + t);
+            ctx.lineTo(node.x - t, node.y + t);
+            ctx.closePath();
+            ctx.fill();
+        }
+
+        // Label
+        ctx.font = `${node.type === 'process' ? '10' : '8'}px monospace`;
+        ctx.fillStyle = isHovered ? '#fff' : '#94a3b8';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        const labelY = node.y + r + 4;
+        ctx.fillText(node.label.length > 20 ? node.label.substring(0, 18) + '..' : node.label, node.x, labelY);
+
+        // Threat count badge
+        if (node.type === 'process' && node.threats > 0) {
+            const bx = node.x + r * 0.7;
+            const by = node.y - r * 0.7;
+            ctx.beginPath();
+            ctx.arc(bx, by, 7, 0, Math.PI * 2);
+            ctx.fillStyle = '#ef4444';
+            ctx.fill();
+            ctx.font = 'bold 7px monospace';
+            ctx.fillStyle = '#fff';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(String(node.threats), bx, by);
+        }
+    });
+
+    ctx.restore();
+}
+
+function showGraphTooltip(node, sx, sy) {
+    const tooltip = document.getElementById('graph-tooltip');
+    if (!tooltip) return;
+    if (!node) { hideGraphTooltip(); return; }
+
+    let html = `<div class="tt-title">${escapeHtml(node.label)}</div>`;
+    if (node.type === 'process') {
+        html += `<div class="tt-field"><span>PID:</span> ${node.pid}</div>`;
+        if (node.image) html += `<div class="tt-field"><span>Image:</span> ${escapeHtml(node.image)}</div>`;
+        if (node.threats) html += `<div class="tt-field"><span>Threats:</span> ${node.threats}</div>`;
+    } else if (node.type === 'network') {
+        html += `<div class="tt-field"><span>IP:</span> ${node.ip}:${node.port}</div>`;
+        html += `<div class="tt-field"><span>Protocol:</span> ${node.protocol || 'tcp'}</div>`;
+    } else if (node.type === 'dns') {
+        html += `<div class="tt-field"><span>Query:</span> ${escapeHtml(node.label)}</div>`;
+        if (node.result) html += `<div class="tt-field"><span>Result:</span> ${escapeHtml(node.result)}</div>`;
+    } else if (node.type === 'file') {
+        html += `<div class="tt-field"><span>Path:</span> ${escapeHtml(node.fullPath || node.label)}</div>`;
+    } else if (node.type === 'registry') {
+        html += `<div class="tt-field"><span>Key:</span> ${escapeHtml(node.fullPath || node.label)}</div>`;
     }
 
+    tooltip.innerHTML = html;
+    tooltip.style.display = 'block';
+    tooltip.style.left = (sx + 16) + 'px';
+    tooltip.style.top = (sy - 10) + 'px';
+}
+
+function hideGraphTooltip() {
+    const tooltip = document.getElementById('graph-tooltip');
+    if (tooltip) tooltip.style.display = 'none';
+}
+
+function showGraphDetail(node) {
+    const panel = document.getElementById('graph-detail-panel');
+    const header = document.getElementById('graph-detail-header');
+    const body = document.getElementById('graph-detail-body');
+    if (!panel || !header || !body) return;
+
+    panel.classList.add('visible');
+    let headerText = '';
     let html = '';
 
-    // Version & process info
-    html += `<div class="detail-fields">
-        <div class="detail-field"><span class="field-label">Version</span><span class="field-value">${escapeHtml(info.version || 'unknown')}</span></div>
-        <div class="detail-field"><span class="field-label">Status</span><span class="field-value" style="color:${statusColor}">${statusText}</span></div>`;
+    if (node.type === 'process') {
+        headerText = `${node.label} (PID ${node.pid})`;
+        html += `<div class="gd-field"><span class="gd-label">Image</span><span class="gd-value">${escapeHtml(node.image)}</span></div>`;
+        if (node.cmdline) html += `<div class="gd-field"><span class="gd-label">Cmdline</span><span class="gd-value gd-cmdline">${escapeHtml(node.cmdline)}</span></div>`;
+        if (node.user) html += `<div class="gd-field"><span class="gd-label">User</span><span class="gd-value">${escapeHtml(node.user)}</span></div>`;
+        html += `<div class="gd-field"><span class="gd-label">Status</span><span class="gd-value">${node.exited ? '<span style="color:#94a3b8">Exited</span>' : '<span style="color:#4ade80">Running</span>'}</span></div>`;
+        html += `<div class="gd-field"><span class="gd-label">First seen</span><span class="gd-value">${node.firstSeen || '--'}</span></div>`;
+        if (node.parentPid) {
+            const parentNode = graphState.nodes.find(n => n.type === 'process' && String(n.pid) === String(node.parentPid));
+            if (parentNode) {
+                html += `<div class="gd-field"><span class="gd-label">Parent</span><span class="gd-value"><a class="gd-link" data-node-id="${parentNode.id}">${escapeHtml(parentNode.label)} (${parentNode.pid})</a></span></div>`;
+            } else {
+                html += `<div class="gd-field"><span class="gd-label">Parent PID</span><span class="gd-value">${node.parentPid}</span></div>`;
+            }
+        }
 
-    if (info.process) {
-        const proc = info.process;
-        html += `<div class="detail-field"><span class="field-label">PID</span><span class="field-value">${proc.Id || 'N/A'}</span></div>`;
-        if (proc.StartTime) {
-            html += `<div class="detail-field"><span class="field-label">Started</span><span class="field-value">${escapeHtml(proc.StartTime)}</span></div>`;
+        // Activity summary
+        const act = node.activity || {};
+        const totalActivity = (act.threats||0) + (act.network||0) + (act.dns||0) + (act.file||0) + (act.registry||0);
+        html += `<div class="gd-section">Activity <span class="gd-count">${totalActivity} events</span></div>`;
+        html += `<div class="gd-activity-grid">`;
+        html += `<div class="gd-activity-cell ${(act.threats||0) > 0 ? 'critical' : ''}"><span class="gd-act-num">${act.threats || 0}</span><span class="gd-act-label">Threats</span></div>`;
+        html += `<div class="gd-activity-cell"><span class="gd-act-num">${act.network || 0}</span><span class="gd-act-label">Network</span></div>`;
+        html += `<div class="gd-activity-cell"><span class="gd-act-num">${act.dns || 0}</span><span class="gd-act-label">DNS</span></div>`;
+        html += `<div class="gd-activity-cell"><span class="gd-act-num">${act.file || 0}</span><span class="gd-act-label">File</span></div>`;
+        html += `<div class="gd-activity-cell"><span class="gd-act-num">${act.registry || 0}</span><span class="gd-act-label">Registry</span></div>`;
+        html += `<div class="gd-activity-cell"><span class="gd-act-num">${act.injection || 0}</span><span class="gd-act-label">Injection</span></div>`;
+        html += `</div>`;
+
+        // Connections from this node
+        const connections = graphState.edges.filter(e => e.source === node.id || e.target === node.id);
+        const netConns = connections.filter(e => e.type === 'network');
+        const dnsConns = connections.filter(e => e.type === 'dns');
+
+        // Children tree - recursive with details
+        const childConns = connections.filter(e => e.type === 'spawn' && e.source === node.id);
+        if (childConns.length) {
+            html += `<div class="gd-section">Children Processes <span class="gd-count">${childConns.length}</span></div>`;
+            html += buildChildrenTree(node.id, 0);
         }
-        if (proc.WorkingSet64) {
-            html += `<div class="detail-field"><span class="field-label">Memory</span><span class="field-value">${formatSize(proc.WorkingSet64)}</span></div>`;
+
+        if (netConns.length) {
+            html += `<div class="gd-section">Network Connections <span class="gd-count">${netConns.length}</span></div>`;
+            html += `<div class="gd-conn-list">`;
+            netConns.forEach(e => {
+                const target = graphState.nodes.find(n => n.id === e.target);
+                if (target) html += `<div class="gd-conn-item"><span class="gd-conn-icon net"></span><span class="gd-conn-text">${escapeHtml(target.ip || target.label)}:${target.port || ''}</span><span class="gd-conn-proto">${target.protocol || 'tcp'}</span></div>`;
+            });
+            html += `</div>`;
         }
+
+        if (dnsConns.length) {
+            html += `<div class="gd-section">DNS Queries <span class="gd-count">${dnsConns.length}</span></div>`;
+            html += `<div class="gd-conn-list">`;
+            dnsConns.forEach(e => {
+                const target = graphState.nodes.find(n => n.id === e.target);
+                if (target) html += `<div class="gd-conn-item"><span class="gd-conn-icon dns"></span><span class="gd-conn-text">${escapeHtml(target.label)}</span>${target.result ? `<span class="gd-conn-proto">${escapeHtml(target.result)}</span>` : ''}</div>`;
+            });
+            html += `</div>`;
+        }
+
+    } else if (node.type === 'network') {
+        headerText = `Network: ${node.ip}:${node.port}`;
+        html += `<div class="gd-field"><span class="gd-label">IP</span><span class="gd-value">${node.ip}</span></div>`;
+        html += `<div class="gd-field"><span class="gd-label">Port</span><span class="gd-value">${node.port}</span></div>`;
+        html += `<div class="gd-field"><span class="gd-label">Protocol</span><span class="gd-value">${node.protocol || 'tcp'}</span></div>`;
+        const conns = graphState.edges.filter(e => e.target === node.id);
+        if (conns.length) {
+            html += `<div class="gd-section">Connected from <span class="gd-count">${conns.length}</span></div>`;
+            conns.forEach(e => {
+                const src = graphState.nodes.find(n => n.id === e.source);
+                if (src) html += `<div class="gd-conn-item"><span class="gd-conn-icon proc"></span><a class="gd-link" data-node-id="${src.id}">${escapeHtml(src.label)} (${src.pid})</a></div>`;
+            });
+        }
+    } else if (node.type === 'dns') {
+        headerText = `DNS: ${node.label}`;
+        html += `<div class="gd-field"><span class="gd-label">Query</span><span class="gd-value">${escapeHtml(node.label)}</span></div>`;
+        if (node.result) html += `<div class="gd-field"><span class="gd-label">Result</span><span class="gd-value">${escapeHtml(node.result)}</span></div>`;
+        const conns = graphState.edges.filter(e => e.target === node.id);
+        if (conns.length) {
+            html += `<div class="gd-section">Queried by <span class="gd-count">${conns.length}</span></div>`;
+            conns.forEach(e => {
+                const src = graphState.nodes.find(n => n.id === e.source);
+                if (src) html += `<div class="gd-conn-item"><span class="gd-conn-icon proc"></span><a class="gd-link" data-node-id="${src.id}">${escapeHtml(src.label)} (${src.pid})</a></div>`;
+            });
+        }
+    } else {
+        headerText = `${node.type}: ${node.label}`;
+        if (node.fullPath) html += `<div class="gd-field"><span class="gd-label">Path</span><span class="gd-value">${escapeHtml(node.fullPath)}</span></div>`;
     }
 
-    html += `<div class="detail-field"><span class="field-label">Install Dir</span><span class="field-value mono">${escapeHtml(info.install_dir || '')}</span></div>`;
-    html += `<div class="detail-field"><span class="field-label">Alerts Dir</span><span class="field-value mono">${escapeHtml(info.alerts_dir || '')}</span></div>`;
-    html += `<div class="detail-field"><span class="field-label">Alerts Total</span><span class="field-value">${info.alerts_count || 0}</span></div>`;
-    html += `</div>`;
+    header.textContent = headerText;
+    body.innerHTML = html;
 
-    // Rules section
-    const rules = info.rules || {};
-    const ioc = rules.ioc || {};
-    const totalIoc = (ioc.hashes || 0) + (ioc.ips || 0) + (ioc.domains || 0) + (ioc.paths || 0);
-
-    html += `
-    <div class="detail-section">
-        <div class="detail-section-title">DETECTION RULES</div>
-        <div class="activity-grid" style="grid-template-columns: repeat(3, 1fr);">
-            <div class="activity-counter">
-                <div class="counter-label">SIGMA</div>
-                <div class="counter-value ${rules.sigma === 0 ? 'zero' : ''}">${rules.sigma || 0}</div>
-            </div>
-            <div class="activity-counter">
-                <div class="counter-label">YARA</div>
-                <div class="counter-value ${rules.yara === 0 ? 'zero' : ''}">${rules.yara || 0}</div>
-            </div>
-            <div class="activity-counter">
-                <div class="counter-label">IOC</div>
-                <div class="counter-value ${totalIoc === 0 ? 'zero' : ''}">${totalIoc}</div>
-            </div>
-        </div>`;
-
-    if (totalIoc > 0) {
-        html += `<div class="detail-fields" style="margin-top:8px;">
-            <div class="detail-field"><span class="field-label">Hashes</span><span class="field-value">${ioc.hashes || 0}</span></div>
-            <div class="detail-field"><span class="field-label">IPs / CIDRs</span><span class="field-value">${ioc.ips || 0}</span></div>
-            <div class="detail-field"><span class="field-label">Domains</span><span class="field-value">${ioc.domains || 0}</span></div>
-            <div class="detail-field"><span class="field-label">Path Regex</span><span class="field-value">${ioc.paths || 0}</span></div>
-        </div>`;
-    }
-    html += `</div>`;
-
-    // ETW Providers section
-    const providers = info.etw_providers || [];
-    if (providers.length > 0) {
-        html += `
-        <div class="detail-section">
-            <div class="detail-section-title">ETW PROVIDERS (${providers.length})</div>
-            <div class="detail-fields">`;
-        providers.forEach(p => {
-            html += `<div class="detail-field">
-                <span class="field-label" style="font-size:10px">${escapeHtml(p.name.replace('Microsoft-Windows-', ''))}</span>
-                <span class="field-value" style="font-size:10px;color:var(--text-muted)">kw: ${escapeHtml(p.keywords)}</span>
-            </div>`;
+    // Wire up clickable links in the detail panel
+    body.querySelectorAll('.gd-link[data-node-id]').forEach(link => {
+        link.addEventListener('click', (e) => {
+            e.preventDefault();
+            const targetNode = graphState.nodes.find(n => n.id === link.dataset.nodeId);
+            if (targetNode) {
+                graphState.selectedNode = targetNode;
+                showGraphDetail(targetNode);
+                renderGraph();
+            }
         });
-        html += `</div></div>`;
-    }
+    });
 
-    // Recent log lines
-    const logLines = info.recent_log || [];
-    if (logLines.length > 0) {
-        html += `
-        <div class="detail-section">
-            <div class="detail-section-title">RECENT LOG</div>
-            <div class="raw-json" style="max-height:300px;">${logLines.map(l => escapeHtml(l.replace(/\x1b\[[0-9;]*m/g, ''))).join('\n')}</div>
-        </div>`;
-    }
+    // Wire up collapsible child entries
+    body.querySelectorAll('.gd-child-header').forEach(hdr => {
+        hdr.addEventListener('click', () => {
+            const entry = hdr.closest('.gd-child-entry');
+            if (entry) entry.classList.toggle('expanded');
+        });
+    });
 
-    setDetailBody(html);
+    // Wire up "focus" links to navigate to a child node in the graph
+    body.querySelectorAll('.gd-child-focus[data-node-id]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const targetNode = graphState.nodes.find(n => n.id === btn.dataset.nodeId);
+            if (targetNode) {
+                graphState.selectedNode = targetNode;
+                showGraphDetail(targetNode);
+                renderGraph();
+            }
+        });
+    });
 }
 
+function buildChildrenTree(parentNodeId, depth) {
+    if (depth > 4) return '<div class="gd-child-truncated">... (depth limit)</div>';
+    const childEdges = graphState.edges.filter(e => e.type === 'spawn' && e.source === parentNodeId);
+    if (!childEdges.length) return '';
+
+    let html = `<div class="gd-children-tree depth-${depth}">`;
+    childEdges.forEach(e => {
+        const child = graphState.nodes.find(n => n.id === e.target);
+        if (!child) return;
+        const act = child.activity || {};
+        const threats = act.threats || 0;
+        const severityClass = threats > 0 ? (child.severity === 'critical' ? 'critical' : 'high') : '';
+        const grandchildEdges = graphState.edges.filter(gc => gc.type === 'spawn' && gc.source === child.id);
+        const hasChildren = grandchildEdges.length > 0;
+
+        html += `<div class="gd-child-entry ${severityClass}">`;
+        html += `<div class="gd-child-header">`;
+        html += `<span class="gd-child-expand">${hasChildren ? '&#9654;' : '&#8226;'}</span>`;
+        html += `<span class="gd-child-name">${escapeHtml(child.label)}</span>`;
+        html += `<span class="gd-child-pid">PID ${child.pid}</span>`;
+        if (threats > 0) html += `<span class="gd-child-threats">${threats}</span>`;
+        html += `<span class="gd-child-focus" data-node-id="${child.id}" title="Focus this node">&#8599;</span>`;
+        html += `</div>`;
+
+        // Collapsible detail body
+        html += `<div class="gd-child-body">`;
+        if (child.image) html += `<div class="gd-child-detail"><span class="gd-child-dlabel">Image:</span> ${escapeHtml(child.image)}</div>`;
+        if (child.cmdline) html += `<div class="gd-child-detail gd-cmdline"><span class="gd-child-dlabel">Cmd:</span> ${escapeHtml(child.cmdline)}</div>`;
+        html += `<div class="gd-child-detail"><span class="gd-child-dlabel">Status:</span> ${child.exited ? 'Exited' : 'Running'}</div>`;
+        if (child.firstSeen) html += `<div class="gd-child-detail"><span class="gd-child-dlabel">First seen:</span> ${child.firstSeen}</div>`;
+
+        // Activity mini-summary
+        const actTotal = (act.network||0) + (act.dns||0) + (act.file||0) + (act.registry||0);
+        if (actTotal > 0 || threats > 0) {
+            html += `<div class="gd-child-activity">`;
+            if (threats > 0) html += `<span class="gd-mini-badge threat">${threats} threats</span>`;
+            if (act.network > 0) html += `<span class="gd-mini-badge net">${act.network} net</span>`;
+            if (act.dns > 0) html += `<span class="gd-mini-badge dns">${act.dns} dns</span>`;
+            if (act.file > 0) html += `<span class="gd-mini-badge file">${act.file} file</span>`;
+            if (act.registry > 0) html += `<span class="gd-mini-badge reg">${act.registry} reg</span>`;
+            html += `</div>`;
+        }
+
+        // Recurse into grandchildren
+        if (hasChildren) {
+            html += buildChildrenTree(child.id, depth + 1);
+        }
+        html += `</div>`; // .gd-child-body
+        html += `</div>`; // .gd-child-entry
+    });
+    html += `</div>`;
+    return html;
+}
+
+function hideGraphDetail() {
+    const panel = document.getElementById('graph-detail-panel');
+    if (panel) panel.classList.remove('visible');
+}
+
+function initGraphControls() {
+    // Re-render graph when toggles change
+    ['graph-show-network', 'graph-show-dns', 'graph-show-files', 'graph-show-registry', 'graph-show-detonated'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.addEventListener('change', () => { if (state.activeTab === 'graph') graphRefresh(); });
+    });
+    const layoutEl = document.getElementById('graph-layout');
+    if (layoutEl) layoutEl.addEventListener('change', () => { if (state.activeTab === 'graph') graphRefresh(); });
+
+    // Time range buttons
+    document.querySelectorAll('.graph-time-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.graph-time-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            graphState.timeRangeSeconds = parseInt(btn.dataset.seconds) || 0;
+            if (state.activeTab === 'graph') graphRefresh();
+        });
+    });
+
+    // Search input
+    const searchInput = document.getElementById('graph-search');
+    const searchClear = document.getElementById('graph-search-clear');
+    let searchDebounce = null;
+    if (searchInput) {
+        searchInput.addEventListener('input', () => {
+            const val = searchInput.value.trim();
+            if (searchClear) searchClear.classList.toggle('visible', val.length > 0);
+            clearTimeout(searchDebounce);
+            searchDebounce = setTimeout(() => {
+                graphState.searchQuery = val.toLowerCase();
+                if (state.activeTab === 'graph') graphRefresh();
+            }, 250);
+        });
+        searchInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                searchInput.value = '';
+                graphState.searchQuery = '';
+                if (searchClear) searchClear.classList.remove('visible');
+                if (state.activeTab === 'graph') graphRefresh();
+            }
+        });
+    }
+    if (searchClear) {
+        searchClear.addEventListener('click', () => {
+            if (searchInput) searchInput.value = '';
+            graphState.searchQuery = '';
+            searchClear.classList.remove('visible');
+            if (state.activeTab === 'graph') graphRefresh();
+        });
+    }
+}
 
 // --- Sysmon Events Tab ---
 let sysmonEvents = [];
@@ -1944,16 +2866,6 @@ async function refreshSysmon() {
         if (statsResp.ok) {
             sysmonStats = await statsResp.json();
             renderSysmonStats();
-            // Update sidebar status
-            const statusEl = document.getElementById('status-sysmon');
-            if (statusEl) {
-                const dot = statusEl.querySelector('.dot');
-                if (sysmonStats.online) {
-                    dot.className = 'dot online';
-                } else {
-                    dot.className = 'dot offline';
-                }
-            }
         }
     } catch (e) {
         console.error('Sysmon fetch error:', e);
@@ -1967,13 +2879,11 @@ function renderSysmonStats() {
     const stats = sysmonStats.stats;
     const total = stats.reduce((sum, s) => sum + s.count, 0);
 
-    let html = `<div class="sysmon-stats-bar">`;
-    html += `<span class="stats-total">${total} events (last 500)</span>`;
+    let html = `<div class="sysmon-stats-bar"><span class="stats-total">${total} events (last 500)</span>`;
     stats.sort((a, b) => b.count - a.count);
     stats.forEach(s => {
-        const pct = total > 0 ? ((s.count / total) * 100).toFixed(1) : 0;
         const typeClass = getSysmonTypeClass(s.event_id);
-        html += `<span class="stats-chip ${typeClass}" title="${s.name}: ${s.count} (${pct}%)" onclick="filterSysmonByType('${s.event_id}')">${s.name} <strong>${s.count}</strong></span>`;
+        html += `<span class="stats-chip ${typeClass}" onclick="filterSysmonByType('${s.event_id}')">${s.name} <strong>${s.count}</strong></span>`;
     });
     html += `</div>`;
     container.innerHTML = html;
@@ -1981,50 +2891,37 @@ function renderSysmonStats() {
 
 function filterSysmonByType(eventId) {
     const select = document.getElementById('sysmon-filter-type');
-    if (select) {
-        select.value = eventId;
-        refreshSysmon();
-    }
+    if (select) { select.value = eventId; refreshSysmon(); }
 }
 
 function renderSysmonTable() {
     const container = document.getElementById('sysmon-table');
     if (!container) return;
 
-    if (!sysmonEvents || sysmonEvents.length === 0) {
+    if (!sysmonEvents || !sysmonEvents.length) {
         container.innerHTML = '<div class="empty-state">No Sysmon events found</div>';
         return;
     }
 
-    if (sysmonEvents[0] && sysmonEvents[0].error) {
+    if (sysmonEvents[0]?.error) {
         container.innerHTML = `<div class="empty-state">Error: ${escapeHtml(sysmonEvents[0].error)}</div>`;
         return;
     }
 
-    let html = `<table class="data-table sysmon-events-table">
-        <thead><tr>
-            <th>Time</th>
-            <th>Type</th>
-            <th>PID</th>
-            <th>Image</th>
-            <th>Details</th>
-        </tr></thead><tbody>`;
-
+    let html = `<table class="sysmon-events-table"><thead><tr><th>Time</th><th>Type</th><th>PID</th><th>Image</th><th>Details</th></tr></thead><tbody>`;
     sysmonEvents.forEach(ev => {
         const typeClass = getSysmonTypeClass(String(ev.event_id));
         const time = ev.timestamp ? formatSysmonTime(ev.timestamp) : '';
         const image = ev.image ? ev.image.split('\\').pop() : '';
         const details = getSysmonDetails(ev);
-
-        html += `<tr class="sysmon-row ${typeClass}" onclick="showSysmonDetail(${JSON.stringify(ev).replace(/"/g, '&quot;')})">
+        html += `<tr onclick="showSysmonDetail(${JSON.stringify(ev).replace(/"/g, '&quot;')})">
             <td class="col-time">${time}</td>
-            <td class="col-type"><span class="type-badge ${typeClass}">${escapeHtml(ev.type || '')}</span></td>
+            <td><span class="type-badge ${typeClass}">${escapeHtml(ev.type || '')}</span></td>
             <td class="col-pid">${ev.pid || ''}</td>
-            <td class="col-image" title="${escapeHtml(ev.image || '')}">${escapeHtml(image)}</td>
+            <td class="col-image">${escapeHtml(image)}</td>
             <td class="col-details">${escapeHtml(details)}</td>
         </tr>`;
     });
-
     html += '</tbody></table>';
     container.innerHTML = html;
 }
@@ -2032,90 +2929,99 @@ function renderSysmonTable() {
 function getSysmonDetails(ev) {
     switch (ev.event_id) {
         case 1: return ev.commandline ? truncate(ev.commandline, 80) : '';
-        case 3: return `${ev.dst_ip || ''}:${ev.dst_port || ''} (${ev.protocol || ''})`;
+        case 3: return `${ev.dst_ip || ''}:${ev.dst_port || ''}`;
         case 5: return 'Process terminated';
         case 7: return ev.loaded_image ? ev.loaded_image.split('\\').pop() : '';
-        case 8: return `Source PID ${ev.source_pid} -> Target PID ${ev.target_pid}`;
-        case 10: return `${(ev.source_image||'').split('\\').pop()} -> ${(ev.target_image||'').split('\\').pop()}`;
         case 11: return ev.target ? truncate(ev.target, 80) : '';
-        case 12: case 13: case 14: return ev.target ? truncate(ev.target, 60) : '';
         case 22: return ev.query || '';
         default: return '';
     }
 }
 
 function getSysmonTypeClass(eventId) {
-    const classes = {
-        '1': 'type-process', '3': 'type-network', '5': 'type-terminate',
-        '7': 'type-imageload', '8': 'type-injection', '10': 'type-access',
-        '11': 'type-file', '12': 'type-registry', '13': 'type-registry',
-        '14': 'type-registry', '22': 'type-dns',
-    };
+    const classes = { '1': 'type-process', '3': 'type-network', '5': 'type-terminate', '7': 'type-imageload', '8': 'type-injection', '10': 'type-access', '11': 'type-file', '12': 'type-registry', '13': 'type-registry', '22': 'type-dns' };
     return classes[eventId] || 'type-other';
 }
 
 function formatSysmonTime(isoStr) {
-    try {
-        const d = new Date(isoStr);
-        return d.toLocaleTimeString('en-US', { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0');
-    } catch { return isoStr; }
+    try { const d = new Date(isoStr); return d.toLocaleTimeString('en-US', { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0'); } catch { return isoStr; }
 }
 
 function truncate(str, max) {
-    if (!str) return '';
-    return str.length > max ? str.substring(0, max) + '...' : str;
+    return str && str.length > max ? str.substring(0, max) + '...' : (str || '');
 }
 
 function showSysmonDetail(ev) {
-    let html = `
-    <div class="detail-section">
-        <div class="detail-section-title">${escapeHtml(ev.type || 'Event')} - PID ${ev.pid || '?'}</div>
+    let html = `<div class="detail-section"><div class="detail-section-title">${escapeHtml(ev.type || 'Event')} - PID ${ev.pid || '?'}</div>
         <div class="detail-fields">
             <div class="detail-field"><span class="field-label">Timestamp</span><span class="field-value">${escapeHtml(ev.timestamp || '')}</span></div>
             <div class="detail-field"><span class="field-label">Event ID</span><span class="field-value">${ev.event_id}</span></div>
             <div class="detail-field"><span class="field-label">PID</span><span class="field-value">${ev.pid || ''}</span></div>
             <div class="detail-field"><span class="field-label">Image</span><span class="field-value">${escapeHtml(ev.image || '')}</span></div>
-            <div class="detail-field"><span class="field-label">User</span><span class="field-value">${escapeHtml(ev.user || '')}</span></div>`;
+        </div></div>`;
 
-    // Type-specific fields
-    if (ev.event_id === 1) {
-        html += `
-            <div class="detail-field"><span class="field-label">Command Line</span><span class="field-value cmd-line">${escapeHtml(ev.commandline || '')}</span></div>
-            <div class="detail-field"><span class="field-label">Parent Image</span><span class="field-value">${escapeHtml(ev.parent_image || '')}</span></div>
-            <div class="detail-field"><span class="field-label">Parent PID</span><span class="field-value">${ev.parent_pid || ''}</span></div>
-            <div class="detail-field"><span class="field-label">Integrity</span><span class="field-value">${escapeHtml(ev.integrity || '')}</span></div>
-            <div class="detail-field"><span class="field-label">Hashes</span><span class="field-value hash-value">${escapeHtml(ev.hashes || '')}</span></div>`;
-    } else if (ev.event_id === 3) {
-        html += `
-            <div class="detail-field"><span class="field-label">Destination</span><span class="field-value">${escapeHtml(ev.dst_ip || '')}:${ev.dst_port || ''}</span></div>
-            <div class="detail-field"><span class="field-label">Hostname</span><span class="field-value">${escapeHtml(ev.dst_hostname || '')}</span></div>
-            <div class="detail-field"><span class="field-label">Protocol</span><span class="field-value">${ev.protocol || ''}</span></div>`;
-    } else if (ev.event_id === 11) {
-        html += `<div class="detail-field"><span class="field-label">Target File</span><span class="field-value">${escapeHtml(ev.target || '')}</span></div>`;
-    } else if (ev.event_id === 22) {
-        html += `
-            <div class="detail-field"><span class="field-label">DNS Query</span><span class="field-value">${escapeHtml(ev.query || '')}</span></div>
-            <div class="detail-field"><span class="field-label">Result</span><span class="field-value">${escapeHtml(ev.result || '')}</span></div>`;
-    } else if (ev.event_id === 8) {
-        html += `
-            <div class="detail-field"><span class="field-label">Source PID</span><span class="field-value">${ev.source_pid || ''}</span></div>
-            <div class="detail-field"><span class="field-label">Target PID</span><span class="field-value">${ev.target_pid || ''}</span></div>
-            <div class="detail-field"><span class="field-label">Target Image</span><span class="field-value">${escapeHtml(ev.target_image || '')}</span></div>`;
-    } else if (ev.event_id === 10) {
-        html += `
-            <div class="detail-field"><span class="field-label">Source</span><span class="field-value">${escapeHtml(ev.source_image || '')}</span></div>
-            <div class="detail-field"><span class="field-label">Target</span><span class="field-value">${escapeHtml(ev.target_image || '')}</span></div>
-            <div class="detail-field"><span class="field-label">Access Mask</span><span class="field-value">${escapeHtml(ev.access || '')}</span></div>`;
-    } else if (ev.raw) {
-        html += `<div class="detail-field"><span class="field-label">Raw Data</span></div>
-            <div class="raw-json">${escapeHtml(JSON.stringify(ev.raw, null, 2))}</div>`;
-    }
-
-    html += `</div></div>`;
-
-    openDetail(`Sysmon ${ev.type || 'Event'}`, html, `event-${ev.event_id}`);
+    setDetailHeader('Sysmon', 'background:rgba(34,197,94,0.15);color:var(--accent-green)', ev.type || 'Event', '');
+    setDetailBody(html);
+    showDetail();
 }
 
+// --- Utilities ---
+function escapeHtml(str) {
+    if (!str) return '';
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function formatTime(ts) {
+    if (!ts) return '';
+    try { const d = new Date(ts); return isNaN(d.getTime()) ? ts.substring(0, 19) : d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' }); } catch { return ts.substring(0, 19); }
+}
+
+function formatRelativeTime(ts) {
+    if (!ts || !state.sessionStart) return formatTime(ts);
+    try {
+        const t = new Date(ts).getTime();
+        if (isNaN(t)) return formatTime(ts);
+        const diff = (t - state.sessionStart) / 1000;
+        if (diff < 0) return '+0.000s';
+        return `+${diff.toFixed(3)}s`;
+    } catch { return formatTime(ts); }
+}
+
+function computeLifespan(startTs, endTs) {
+    if (!startTs || !endTs) return '';
+    try {
+        const start = new Date(startTs).getTime();
+        const end = new Date(endTs).getTime();
+        if (isNaN(start) || isNaN(end)) return '';
+        const diffMs = end - start;
+        if (diffMs < 0) return '0ms';
+        if (diffMs < 1000) return `${diffMs}ms`;
+        const diffS = diffMs / 1000;
+        if (diffS < 60) return `${diffS.toFixed(1)}s`;
+        const mins = Math.floor(diffS / 60);
+        const secs = Math.floor(diffS % 60);
+        return `${mins}m ${secs}s`;
+    } catch { return ''; }
+}
+
+function formatSize(bytes) {
+    if (!bytes || bytes === 0) return '0 B';
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function formatCategory(cat) {
+    if (Array.isArray(cat)) return cat.map(c => c.charAt(0).toUpperCase() + c.slice(1)).join(', ');
+    if (typeof cat === 'string') return cat.charAt(0).toUpperCase() + cat.slice(1);
+    return '';
+}
+
+function activityCounter(label, value) {
+    const v = value || 0;
+    const highlight = (label === 'THREATS' && v > 0) ? ' threats' : (label === 'INJECTION' && v > 0) ? ' injection' : '';
+    return `<div class="activity-counter${highlight ? ' ' + highlight : ''}"><div class="counter-label">${label}</div><div class="counter-value ${v === 0 ? 'zero' : ''}">${v}</div></div>`;
+}
 
 // --- Keyboard shortcuts ---
 document.addEventListener('keydown', e => {
