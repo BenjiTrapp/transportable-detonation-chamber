@@ -79,6 +79,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initTabs();
     initUpload();
     initHexDropZone();
+    initHexResizeHandle();
     initScannerDropZone();
     initGraphControls();
     initRtraceTabs();
@@ -1450,14 +1451,15 @@ function renderHexView(hexDump, baseOffset, bytesShown) {
         hexHtml += lineHexHtml + '\n';
 
         // Render ASCII
-        let lineAsciiHtml = '';
+        let lineAsciiHtml = '<div class="ascii-line">';
         for (let i = 0; i < asciiPart.length; i++) {
             const ch = asciiPart[i];
             const globalIdx = (validLineIdx * 16) + i;
             const isPrintable = ch !== '.';
             lineAsciiHtml += `<span class="ascii-char${isPrintable ? '' : ' non-printable'}" data-idx="${globalIdx}" onclick="hexSelectByte(${globalIdx})">${escapeHtml(ch)}</span>`;
         }
-        asciiHtml += lineAsciiHtml + '\n';
+        lineAsciiHtml += '</div>';
+        asciiHtml += lineAsciiHtml;
 
         validLineIdx++;
     });
@@ -1571,6 +1573,49 @@ function hexNextPage() {
     }
 }
 
+// --- Hex Editor Resize Handle ---
+function initHexResizeHandle() {
+    const handle = document.getElementById('hex-ascii-resize');
+    const asciiCol = document.getElementById('hex-ascii-col');
+    const editorBody = document.querySelector('.hex-editor-body');
+    if (!handle || !asciiCol || !editorBody) return;
+
+    let startX = 0;
+    let startWidth = 0;
+    let isResizing = false;
+
+    handle.addEventListener('mousedown', function(e) {
+        e.preventDefault();
+        isResizing = true;
+        startX = e.clientX;
+        startWidth = asciiCol.offsetWidth;
+        handle.classList.add('active');
+        document.body.classList.add('hex-resizing');
+
+        document.addEventListener('mousemove', onMouseMove);
+        document.addEventListener('mouseup', onMouseUp);
+    });
+
+    function onMouseMove(e) {
+        if (!isResizing) return;
+        // Dragging left increases ASCII width, dragging right decreases it
+        const delta = startX - e.clientX;
+        const newWidth = Math.max(80, Math.min(startWidth + delta, editorBody.offsetWidth * 0.6));
+        asciiCol.style.width = newWidth + 'px';
+        asciiCol.style.minWidth = newWidth + 'px';
+        asciiCol.style.flexShrink = '0';
+        asciiCol.style.flexGrow = '0';
+    }
+
+    function onMouseUp() {
+        isResizing = false;
+        handle.classList.remove('active');
+        document.body.classList.remove('hex-resizing');
+        document.removeEventListener('mousemove', onMouseMove);
+        document.removeEventListener('mouseup', onMouseUp);
+    }
+}
+
 // =============================================
 // PE ANALYSIS
 // =============================================
@@ -1672,8 +1717,8 @@ function renderPeAnalysis(pe, container) {
     // --- Sections Table with entropy bars ---
     html += '<div class="pe-section-table">';
     html += '<div class="pe-card-title">SECTIONS</div>';
-    html += '<table class="pe-table"><thead><tr><th>Name</th><th>V.Addr</th><th>V.Size</th><th>Raw Size</th><th>Flags</th><th>Entropy</th><th>Status</th></tr></thead><tbody>';
-    pe.sections.forEach(sec => {
+    html += '<table class="pe-table"><thead><tr><th>Name</th><th>V.Addr</th><th>V.Size</th><th>Raw Size</th><th>Flags</th><th>Entropy</th><th>Status</th><th></th></tr></thead><tbody>';
+    pe.sections.forEach((sec, idx) => {
         const rowClass = sec.entropy_status === 'high' ? 'pe-row-high' : sec.entropy_status === 'warn' ? 'pe-row-warn' : '';
         const rwx = sec.rwx_warning ? ' <span class="pe-rwx-badge">RWX</span>' : '';
         const packer = sec.packer_indicator ? ` <span class="pe-packer-badge">${escapeHtml(sec.packer_indicator)}</span>` : '';
@@ -1681,7 +1726,7 @@ function renderPeAnalysis(pe, container) {
         const entropyPct = Math.min(100, (sec.entropy / 8) * 100);
         const barColor = sec.entropy_status === 'high' ? '#ef4444' : sec.entropy_status === 'warn' ? '#fbbf24' : '#22c55e';
 
-        html += `<tr class="${rowClass}">
+        html += `<tr class="${rowClass}" id="pe-sec-row-${idx}">
             <td class="mono">${escapeHtml(sec.name)}${packer}${rwx}</td>
             <td class="mono">${sec.virtual_address}</td>
             <td>${formatSize(sec.virtual_size)}</td>
@@ -1694,6 +1739,10 @@ function renderPeAnalysis(pe, container) {
                 </div>
             </td>
             <td><span class="pe-status-tag ${sec.entropy_status}">${sec.entropy_status === 'high' ? 'ENCRYPTED/PACKED' : sec.entropy_status === 'warn' ? 'SUSPICIOUS' : 'Normal'}</span></td>
+            <td><button class="btn btn-sm pe-inspect-btn" onclick="peInspectSection(${idx})">Inspect</button></td>
+        </tr>
+        <tr class="pe-sec-detail-row" id="pe-sec-detail-${idx}" style="display:none;">
+            <td colspan="8"><div class="pe-sec-detail-container" id="pe-sec-detail-body-${idx}"></div></td>
         </tr>`;
     });
     html += '</tbody></table></div>';
@@ -1746,6 +1795,166 @@ function renderPeAnalysis(pe, container) {
     }
 
     container.innerHTML = html;
+}
+
+async function peInspectSection(idx) {
+    const detailRow = document.getElementById(`pe-sec-detail-${idx}`);
+    const detailBody = document.getElementById(`pe-sec-detail-body-${idx}`);
+
+    // Toggle visibility
+    if (detailRow.style.display !== 'none') {
+        detailRow.style.display = 'none';
+        return;
+    }
+
+    detailRow.style.display = '';
+    detailBody.innerHTML = '<div class="pe-loading"><div class="loading-spinner"></div><span>Loading section data...</span></div>';
+
+    const filepath = state.hexFilePath || document.getElementById('hex-filepath').value.trim();
+    if (!filepath) {
+        detailBody.innerHTML = '<div class="pe-error">No file path available.</div>';
+        return;
+    }
+
+    try {
+        const resp = await fetch(`/api/file/pe/section?path=${encodeURIComponent(filepath)}&index=${idx}`);
+        const data = await resp.json();
+
+        if (data.error) {
+            detailBody.innerHTML = `<div class="pe-error">${escapeHtml(data.error)}</div>`;
+            return;
+        }
+
+        renderSectionDetail(data, detailBody);
+    } catch (e) {
+        detailBody.innerHTML = `<div class="pe-error">Failed: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function renderSectionDetail(sec, container) {
+    let html = '';
+
+    // Section header info
+    html += '<div class="pe-sec-info-grid">';
+    html += `<div class="pe-sec-info-item"><span class="pe-label">Section</span><span class="pe-value mono">${escapeHtml(sec.name)}</span></div>`;
+    html += `<div class="pe-sec-info-item"><span class="pe-label">Raw Offset</span><span class="pe-value mono">${sec.raw_offset}</span></div>`;
+    html += `<div class="pe-sec-info-item"><span class="pe-label">Raw Size</span><span class="pe-value">${formatSize(sec.raw_size)}</span></div>`;
+    html += `<div class="pe-sec-info-item"><span class="pe-label">Virtual Addr</span><span class="pe-value mono">${sec.virtual_address}</span></div>`;
+    html += `<div class="pe-sec-info-item"><span class="pe-label">Virtual Size</span><span class="pe-value">${formatSize(sec.virtual_size)}</span></div>`;
+    html += `<div class="pe-sec-info-item"><span class="pe-label">Entropy</span><span class="pe-value">${sec.entropy.toFixed(4)}</span></div>`;
+    html += '</div>';
+
+    // Characteristics flags
+    if (sec.characteristic_flags && sec.characteristic_flags.length > 0) {
+        html += '<div class="pe-sec-flags">';
+        html += '<div class="pe-sec-subtitle">Characteristics</div>';
+        html += '<div class="pe-sec-flag-list">';
+        sec.characteristic_flags.forEach(f => {
+            html += `<span class="pe-sec-flag-tag" title="${escapeHtml(f.description)}">${escapeHtml(f.flag)}</span>`;
+        });
+        html += '</div></div>';
+    }
+
+    // Hex dump preview
+    html += '<div class="pe-sec-hex-section">';
+    html += `<div class="pe-sec-subtitle">Hex Dump <span class="pe-sec-meta">(showing ${formatSize(sec.display_size)} of ${formatSize(sec.total_data_size)})</span></div>`;
+    html += `<pre class="pe-sec-hexdump">${escapeHtml(sec.hex_dump)}</pre>`;
+    if (sec.total_data_size > sec.display_size) {
+        html += `<button class="btn btn-sm pe-sec-load-more" onclick="peLoadMoreSection(${sec.index}, ${sec.display_size})">Load more...</button>`;
+    }
+    html += '</div>';
+
+    // Strings tab view
+    const totalStrings = sec.string_count + sec.wide_string_count;
+    html += '<div class="pe-sec-strings-section">';
+    html += `<div class="pe-sec-subtitle">Strings <span class="pe-sec-meta">(${sec.string_count} ASCII, ${sec.wide_string_count} UTF-16LE)</span></div>`;
+
+    if (totalStrings > 0) {
+        html += '<div class="pe-sec-strings-tabs">';
+        html += `<button class="pe-sec-str-tab active" onclick="peSwitchStrTab(${sec.index}, 'ascii')">ASCII (${sec.string_count})</button>`;
+        html += `<button class="pe-sec-str-tab" onclick="peSwitchStrTab(${sec.index}, 'wide')">UTF-16 (${sec.wide_string_count})</button>`;
+        html += '</div>';
+
+        // ASCII strings
+        html += `<div class="pe-sec-str-panel" id="pe-sec-str-ascii-${sec.index}">`;
+        if (sec.strings.length > 0) {
+            html += '<div class="pe-sec-str-list">';
+            sec.strings.forEach(s => {
+                html += `<div class="pe-sec-str-entry"><span class="pe-sec-str-offset">${s.offset.toString(16).padStart(6, '0')}</span><span class="pe-sec-str-val">${escapeHtml(s.value)}</span></div>`;
+            });
+            html += '</div>';
+        } else {
+            html += '<div class="pe-sec-str-empty">No ASCII strings found.</div>';
+        }
+        html += '</div>';
+
+        // Wide strings
+        html += `<div class="pe-sec-str-panel" id="pe-sec-str-wide-${sec.index}" style="display:none;">`;
+        if (sec.wide_strings.length > 0) {
+            html += '<div class="pe-sec-str-list">';
+            sec.wide_strings.forEach(s => {
+                html += `<div class="pe-sec-str-entry"><span class="pe-sec-str-offset">${s.offset.toString(16).padStart(6, '0')}</span><span class="pe-sec-str-val">${escapeHtml(s.value)}</span></div>`;
+            });
+            html += '</div>';
+        } else {
+            html += '<div class="pe-sec-str-empty">No UTF-16 strings found.</div>';
+        }
+        html += '</div>';
+    } else {
+        html += '<div class="pe-sec-str-empty">No strings found in this section.</div>';
+    }
+
+    html += '</div>';
+
+    // Jump to hex editor button
+    html += `<div class="pe-sec-actions">`;
+    html += `<button class="btn btn-sm btn-primary" onclick="peJumpToSection(${sec.raw_offset_dec})">View in Hex Editor</button>`;
+    html += `</div>`;
+
+    container.innerHTML = html;
+}
+
+function peSwitchStrTab(secIdx, tab) {
+    const asciiPanel = document.getElementById(`pe-sec-str-ascii-${secIdx}`);
+    const widePanel = document.getElementById(`pe-sec-str-wide-${secIdx}`);
+    if (!asciiPanel || !widePanel) return;
+
+    // Toggle panels
+    asciiPanel.style.display = tab === 'ascii' ? '' : 'none';
+    widePanel.style.display = tab === 'wide' ? '' : 'none';
+
+    // Toggle tab active states
+    const container = asciiPanel.closest('.pe-sec-strings-section');
+    if (container) {
+        container.querySelectorAll('.pe-sec-str-tab').forEach((btn, i) => {
+            btn.classList.toggle('active', (i === 0 && tab === 'ascii') || (i === 1 && tab === 'wide'));
+        });
+    }
+}
+
+async function peLoadMoreSection(secIdx, currentBytes) {
+    const filepath = state.hexFilePath || document.getElementById('hex-filepath').value.trim();
+    if (!filepath) return;
+
+    const newMax = currentBytes + 8192;
+    try {
+        const resp = await fetch(`/api/file/pe/section?path=${encodeURIComponent(filepath)}&index=${secIdx}&max_bytes=${newMax}`);
+        const data = await resp.json();
+        if (data.error) return;
+
+        const detailBody = document.getElementById(`pe-sec-detail-body-${secIdx}`);
+        if (detailBody) renderSectionDetail(data, detailBody);
+    } catch (e) { /* silently fail */ }
+}
+
+function peJumpToSection(rawOffset) {
+    // Load in hex editor at this offset
+    document.getElementById('hex-offset').value = rawOffset;
+    state.hexOffset = rawOffset;
+    hexLoad();
+    // Scroll to hex editor body
+    const editorBody = document.querySelector('.hex-editor-body');
+    if (editorBody) editorBody.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
 // --- Detail Panels for Dashboard Services ---
@@ -3956,9 +4165,42 @@ function activityCounter(label, value) {
 
 // --- Keyboard shortcuts ---
 document.addEventListener('keydown', e => {
-    if (e.key === 'Escape' && state.detailOpen) closeDetail();
+    if (e.key === 'Escape') {
+        const helpModal = document.getElementById('help-modal');
+        if (helpModal && !helpModal.classList.contains('hidden')) {
+            closeHelp();
+            return;
+        }
+        if (state.detailOpen) closeDetail();
+    }
     if (e.key === 'Backspace' && state.detailOpen && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) {
         e.preventDefault();
         goDetailBack();
     }
+});
+
+// --- Help Modal ---
+function openHelp() {
+    const modal = document.getElementById('help-modal');
+    if (modal) modal.classList.remove('hidden');
+}
+
+function closeHelp() {
+    const modal = document.getElementById('help-modal');
+    if (modal) modal.classList.add('hidden');
+}
+
+// Help tab switching
+document.addEventListener('DOMContentLoaded', () => {
+    const helpTabs = document.querySelectorAll('.help-tab');
+    helpTabs.forEach(tab => {
+        tab.addEventListener('click', () => {
+            const target = tab.dataset.help;
+            helpTabs.forEach(t => t.classList.remove('active'));
+            tab.classList.add('active');
+            document.querySelectorAll('.help-section').forEach(s => s.classList.remove('active'));
+            const section = document.getElementById('help-' + target);
+            if (section) section.classList.add('active');
+        });
+    });
 });

@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Detonation Chamber</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=9">
+    <link rel="stylesheet" href="/static/css/style.css?v=10">
 </head>
 <body>
     <!-- Global loading overlay (shown on slow fetches) -->
@@ -400,6 +400,8 @@
                         <div class="hex-offset-col" id="hex-offset-col"></div>
                         <!-- Hex View -->
                         <div class="hex-view" id="hex-view"></div>
+                        <!-- Resize Handle -->
+                        <div class="hex-resize-handle" id="hex-ascii-resize" title="Drag to resize ASCII panel"></div>
                         <!-- ASCII View -->
                         <div class="hex-ascii-col" id="hex-ascii-col"></div>
                     </div>
@@ -500,6 +502,259 @@
         </div>
     </div>
 
-    <script src="/static/js/app.js?v=7"></script>
+    <!-- Help Modal -->
+    <div id="help-modal" class="help-modal hidden">
+        <div class="help-modal-backdrop" onclick="closeHelp()"></div>
+        <div class="help-modal-content">
+            <div class="help-header">
+                <div class="help-title-row">
+                    <img src="/static/icon.png" alt="TDC" class="help-logo">
+                    <div>
+                        <h2 class="help-title">Transportable Detonation Chamber</h2>
+                        <span class="help-version">v1.0 &mdash; Malware Analysis &amp; EDR Testing Platform</span>
+                    </div>
+                </div>
+                <button class="btn btn-sm btn-close" onclick="closeHelp()">&#x2715;</button>
+            </div>
+            <nav class="help-tabs">
+                <button class="help-tab active" data-help="overview">Overview</button>
+                <button class="help-tab" data-help="usage">Usage Guide</button>
+                <button class="help-tab" data-help="api">API Reference</button>
+                <button class="help-tab" data-help="architecture">Architecture</button>
+                <button class="help-tab" data-help="services">Services</button>
+            </nav>
+            <div class="help-body">
+                <!-- Overview -->
+                <div class="help-section active" id="help-overview">
+                    <h3>What is Detonation Chamber?</h3>
+                    <p>A pre-configured <strong>Windows 11 VM</strong> for malware detonation testing against multiple EDR solutions. The unified web UI aggregates telemetry from all engines into a single dark-themed interface for real-time analysis.</p>
+
+                    <h4>Key Capabilities</h4>
+                    <div class="help-grid">
+                        <div class="help-card">
+                            <div class="help-card-icon" style="color:#22d3ee">&#x1F50D;</div>
+                            <div class="help-card-title">Real-time Detection</div>
+                            <div class="help-card-desc">Sigma rules, YARA signatures, and IOC hash matching via Rustinel ETW engine</div>
+                        </div>
+                        <div class="help-card">
+                            <div class="help-card-icon" style="color:#f472b6">&#x1F9EC;</div>
+                            <div class="help-card-title">Deep Telemetry</div>
+                            <div class="help-card-desc">Kernel-level ETW tracing via Fibratus &mdash; process, file, registry, network events</div>
+                        </div>
+                        <div class="help-card">
+                            <div class="help-card-icon" style="color:#fbbf24">&#x1F6E1;</div>
+                            <div class="help-card-title">Multi-Engine Scanning</div>
+                            <div class="help-card-desc">PE-Sieve, Moneta, HollowsHunter, RedEdr, ThreatCheck, DefenderCheck</div>
+                        </div>
+                        <div class="help-card">
+                            <div class="help-card-icon" style="color:#a855f7">&#x1F4CA;</div>
+                            <div class="help-card-title">PE Analysis</div>
+                            <div class="help-card-desc">Header parsing, entropy detection, import/export analysis, packer identification</div>
+                        </div>
+                    </div>
+
+                    <h4>Workflow</h4>
+                    <ol class="help-steps">
+                        <li><strong>Submit</strong> a sample via the Submit tab (drag &amp; drop or browse)</li>
+                        <li><strong>DetonatorAgent</strong> executes the sample in the VM</li>
+                        <li><strong>LitterBox</strong> runs static analysis (YARA, strings) + dynamic analysis (PE-Sieve, Moneta, HollowsHunter)</li>
+                        <li><strong>Fibratus + Rustinel</strong> capture ETW telemetry and fire Sigma/YARA detection rules</li>
+                        <li><strong>View results</strong> in real-time across Dashboard, Tracing, Graph, and Sysmon tabs</li>
+                    </ol>
+                </div>
+
+                <!-- Usage Guide -->
+                <div class="help-section" id="help-usage">
+                    <h3>Tab Guide</h3>
+
+                    <div class="help-tab-guide">
+                        <div class="help-guide-item">
+                            <h4>Dashboard</h4>
+                            <p>System overview with stats strip (alerts, processes, services, rules, tools), service health cards, and recent activity feed. Auto-refreshes every 10 seconds.</p>
+                        </div>
+                        <div class="help-guide-item">
+                            <h4>Tracing</h4>
+                            <p>Real-time console showing all ETW events and detection alerts. Select a process from the sidebar to filter events. Timeline visualization shows alert distribution over time.</p>
+                        </div>
+                        <div class="help-guide-item">
+                            <h4>Graph</h4>
+                            <p>Process relationship visualization with 5 layout modes (Force-directed, Hierarchical, Radial, Circular, Grid). Zoom controls, search, and time-range filtering. Nodes represent processes, edges show parent-child relationships.</p>
+                        </div>
+                        <div class="help-guide-item">
+                            <h4>Sysmon</h4>
+                            <p>Windows Sysmon event log viewer. Shows process creation, network connections, file creation, and registry events from Sysmon's ETW provider.</p>
+                        </div>
+                        <div class="help-guide-item">
+                            <h4>Scanner</h4>
+                            <p>Run ThreatCheck or DefenderCheck against files. Supports Defender and AMSI engines. Results show detection status, byte offset of trigger, and link to hex editor for inspection.</p>
+                        </div>
+                        <div class="help-guide-item">
+                            <h4>Hex Editor</h4>
+                            <p>Binary file viewer with offset navigation, data inspector (Int8/16/32, Float, ASCII, UTF-16), and drag-and-drop file upload. <strong>PE Analysis</strong> button parses headers, sections, imports, and flags IOC indicators.</p>
+                        </div>
+                        <div class="help-guide-item">
+                            <h4>Submit</h4>
+                            <p>Detonate samples against DetonatorAgent and/or LitterBox. Triggers full analysis pipeline and polls for results. Shows stage-by-stage progress with Fibratus alerts, static analysis (YARA), and dynamic analysis (PE-Sieve, Moneta, HollowsHunter).</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- API Reference -->
+                <div class="help-section" id="help-api">
+                    <h3>API Metamodel</h3>
+                    <p class="help-muted">All endpoints are served on port <code>9000</code>. Responses are JSON unless noted.</p>
+
+                    <h4>Core APIs</h4>
+                    <table class="help-api-table">
+                        <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td class="api-get">GET</td><td><code>/api/alerts</code></td><td>All detection alerts (Rustinel + Fibratus + LitterBox)</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/processes</code></td><td>Tracked processes with activity counts</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/status</code></td><td>Service health status (all components)</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/rustinel</code></td><td>Rustinel engine info (rules, version)</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/submissions</code></td><td>Submission history (last 200)</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h4>Submission &amp; Detonation</h4>
+                    <table class="help-api-table">
+                        <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td class="api-post">POST</td><td><code>/api/submit</code></td><td>Submit sample (multipart). Params: <code>file</code>, <code>target</code> (agent/litterbox/both)</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/detonation/results</code></td><td>Poll results. Params: <code>sha256</code>, <code>pid</code>, <code>litterbox_hash</code></td></tr>
+                        </tbody>
+                    </table>
+
+                    <h4>Hex Editor &amp; PE Analysis</h4>
+                    <table class="help-api-table">
+                        <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td class="api-get">GET</td><td><code>/api/file/hex</code></td><td>Hex dump. Params: <code>path</code>, <code>offset</code>, <code>bytes</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/file/hex/upload</code></td><td>Upload file for hex viewing</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/file/pe</code></td><td>PE header analysis. Param: <code>path</code></td></tr>
+                        </tbody>
+                    </table>
+
+                    <h4>Scanner</h4>
+                    <table class="help-api-table">
+                        <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td class="api-post">POST</td><td><code>/api/scan/threatcheck</code></td><td>ThreatCheck scan. Params: <code>file</code>/<code>path</code>, <code>engine</code>, <code>type</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/scan/defendercheck</code></td><td>DefenderCheck scan. Params: <code>file</code>/<code>path</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/scan/status</code></td><td>Scanner tool availability</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h4>Proxy Endpoints</h4>
+                    <table class="help-api-table">
+                        <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td class="api-get">GET/POST</td><td><code>/api/litterbox/&lt;path&gt;</code></td><td>Proxy to LitterBox API (:1337)</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/fibratus/&lt;path&gt;</code></td><td>Proxy to Fibratus API (:8180)</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <!-- Architecture -->
+                <div class="help-section" id="help-architecture">
+                    <h3>Architecture</h3>
+                    <pre class="help-arch-diagram">
+&#x250C;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2510;
+&#x2502;  Windows 11 VM (Hyper-V / QEMU)                          &#x2502;
+&#x2502;                                                           &#x2502;
+&#x2502;  &#x250C;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2510;   &#x250C;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2510;   &#x250C;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2510;   &#x2502;
+&#x2502;  &#x2502;  Web UI    &#x2502;   &#x2502; DetonatorAgent &#x2502;   &#x2502; LitterBox  &#x2502;   &#x2502;
+&#x2502;  &#x2502;  :9000    &#x2502;&#x2500;&#x2500;&#x25B6;&#x2502;  :8080        &#x2502;   &#x2502;  :1337    &#x2502;   &#x2502;
+&#x2502;  &#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2518;   &#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2518;   &#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2518;   &#x2502;
+&#x2502;       &#x2502;                  &#x2502;                   &#x2502;            &#x2502;
+&#x2502;       &#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x25BC;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2518;            &#x2502;
+&#x2502;                  &#x250C;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2510;                        &#x2502;
+&#x2502;                  &#x2502;    Fibratus     &#x2502;                        &#x2502;
+&#x2502;                  &#x2502;  Kernel ETW     &#x2502;                        &#x2502;
+&#x2502;                  &#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2518;                        &#x2502;
+&#x2502;                  &#x250C;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2510;                        &#x2502;
+&#x2502;                  &#x2502;   Rustinel      &#x2502;                        &#x2502;
+&#x2502;                  &#x2502; Sigma+YARA+IOC  &#x2502;                        &#x2502;
+&#x2502;                  &#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2518;                        &#x2502;
+&#x2502;                  &#x250C;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2510;                        &#x2502;
+&#x2502;                  &#x2502;    Sysmon       &#x2502;                        &#x2502;
+&#x2502;                  &#x2502;  Event Log      &#x2502;                        &#x2502;
+&#x2502;                  &#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2518;                        &#x2502;
+&#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2518;</pre>
+
+                    <h4>Data Flow</h4>
+                    <ol class="help-steps">
+                        <li>Sample submitted via Web UI &rarr; forwarded to DetonatorAgent + LitterBox</li>
+                        <li>DetonatorAgent executes the sample, returns PID</li>
+                        <li>LitterBox runs static (YARA, CheckPlz, Stringnalyzer) + dynamic (PE-Sieve, Moneta, HollowsHunter, RedEdr) analysis</li>
+                        <li>Fibratus captures kernel-level ETW events for the process</li>
+                        <li>Rustinel matches events against 20 Sigma + 717 YARA rules + IOC hashes</li>
+                        <li>Web UI aggregates alerts from all engines into unified timeline</li>
+                    </ol>
+
+                    <h4>File Layout</h4>
+                    <pre class="help-code">C:\DetonationChamberUI\         Web UI (Flask, this interface)
+C:\tools\rustinel\              Rustinel ETW engine + rules
+C:\tools\fibratus\              Fibratus kernel tracer
+C:\DetonatorAgent\              .NET 8 execution agent
+C:\LitterBox\                   Analysis sandbox
+C:\tools\ThreatCheck\           AV signature scanner
+C:\tools\DefenderCheck\         Defender evasion tester
+C:\tools\detection-rules\       Sigma + YARA + IOC rules
+C:\Users\vagrant\Desktop\infected\  Malware samples (Defender-excluded)</pre>
+                </div>
+
+                <!-- Services -->
+                <div class="help-section" id="help-services">
+                    <h3>Services</h3>
+                    <table class="help-api-table">
+                        <thead><tr><th>Service</th><th>Port</th><th>Purpose</th><th>Technology</th></tr></thead>
+                        <tbody>
+                            <tr><td><strong>Web UI</strong></td><td>9000</td><td>Unified dashboard &amp; API gateway</td><td>Python / Flask</td></tr>
+                            <tr><td><strong>DetonatorAgent</strong></td><td>8080</td><td>Executes malware samples, returns PID</td><td>.NET 8.0</td></tr>
+                            <tr><td><strong>LitterBox</strong></td><td>1337</td><td>Static + dynamic analysis sandbox</td><td>Python / Flask</td></tr>
+                            <tr><td><strong>Fibratus</strong></td><td>8180</td><td>Kernel ETW telemetry &amp; behavior rules</td><td>Go</td></tr>
+                            <tr><td><strong>Rustinel</strong></td><td>&mdash;</td><td>Sigma/YARA/IOC real-time detection</td><td>Rust</td></tr>
+                            <tr><td><strong>Sysmon</strong></td><td>&mdash;</td><td>Windows event logging (process, network, file)</td><td>Sysinternals</td></tr>
+                            <tr><td><strong>Detonator</strong></td><td>5000/8000</td><td>Orchestration UI + REST API</td><td>Python</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h4>Detection Rules</h4>
+                    <div class="help-grid">
+                        <div class="help-card">
+                            <div class="help-card-title">Sigma Rules (20)</div>
+                            <div class="help-card-desc">Process injection, credential dumping, lateral movement, persistence, defense evasion patterns</div>
+                        </div>
+                        <div class="help-card">
+                            <div class="help-card-title">YARA Rules (717)</div>
+                            <div class="help-card-desc">Compiled rule set covering malware families, packers, exploits, shellcode patterns</div>
+                        </div>
+                        <div class="help-card">
+                            <div class="help-card-title">IOC Engine</div>
+                            <div class="help-card-desc">Hash-based matching. Auto-fed when samples are submitted. Supports SHA-256.</div>
+                        </div>
+                    </div>
+
+                    <h4>PE Analysis Capabilities</h4>
+                    <ul class="help-list">
+                        <li><strong>Headers:</strong> DOS, File, Optional (PE32/PE32+), section table</li>
+                        <li><strong>Security:</strong> ASLR, DEP/NX, SEH, CFG status</li>
+                        <li><strong>Entropy:</strong> Per-section Shannon entropy with color-coded bars (>7.0 = packed/encrypted)</li>
+                        <li><strong>Imports:</strong> Categorized suspicious API detection (injection, evasion, credential access, networking)</li>
+                        <li><strong>Packers:</strong> Section name matching (UPX, Themida, VMProtect, ASPack, MPRESS, etc.)</li>
+                        <li><strong>TLS Callbacks:</strong> Anti-debug indicator detection</li>
+                        <li><strong>RWX Sections:</strong> Read+Write+Execute flagging</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="help-footer">
+                <span>Transportable Detonation Chamber &mdash; <a href="https://github.com/BenjiTrapp/transportable-detonation-chamber" target="_blank">GitHub</a></span>
+                <span class="help-footer-right">Press <kbd>Esc</kbd> to close</span>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js?v=8"></script>
 </body>
 </html>

@@ -1913,6 +1913,136 @@ def api_file_pe():
     return jsonify(result)
 
 
+@app.route("/api/file/pe/section")
+def api_file_pe_section():
+    """Return detailed data for a specific PE section including hex dump and strings."""
+    filepath = request.args.get("path", "")
+    section_idx = request.args.get("index", type=int)
+    max_bytes = request.args.get("max_bytes", 4096, type=int)
+
+    if not filepath:
+        return jsonify({"error": "No path specified"}), 400
+    if section_idx is None:
+        return jsonify({"error": "No section index specified"}), 400
+
+    norm_path = os.path.normpath(filepath)
+    if not os.path.isfile(norm_path):
+        return jsonify({"error": "File not found"}), 404
+
+    try:
+        import pefile
+    except ImportError:
+        return jsonify({"error": "pefile module not installed"}), 500
+
+    try:
+        pe = pefile.PE(norm_path, fast_load=False)
+    except pefile.PEFormatError as e:
+        return jsonify({"error": f"Not a valid PE file: {e}"}), 400
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    if section_idx < 0 or section_idx >= len(pe.sections):
+        pe.close()
+        return jsonify({"error": f"Section index {section_idx} out of range (0-{len(pe.sections)-1})"}), 400
+
+    section = pe.sections[section_idx]
+    sec_name = section.Name.decode("utf-8", errors="replace").rstrip("\x00")
+    sec_data = section.get_data()
+    entropy = calculate_entropy(sec_data)
+
+    # Build characteristic flags detail
+    char_flags = []
+    char_val = section.Characteristics
+    flag_defs = [
+        (0x00000020, "CNT_CODE", "Contains executable code"),
+        (0x00000040, "CNT_INITIALIZED_DATA", "Contains initialized data"),
+        (0x00000080, "CNT_UNINITIALIZED_DATA", "Contains uninitialized data"),
+        (0x00000200, "LNK_INFO", "Contains comments or other info"),
+        (0x00000800, "LNK_REMOVE", "Will not become part of image"),
+        (0x00001000, "LNK_COMDAT", "Contains COMDAT data"),
+        (0x00004000, "NO_DEFER_SPEC_EXC", "Reset speculative exception handling"),
+        (0x00008000, "GPREL", "Contains GP-relative data"),
+        (0x01000000, "LNK_NRELOC_OVFL", "Extended relocations"),
+        (0x02000000, "MEM_DISCARDABLE", "Can be discarded as needed"),
+        (0x04000000, "MEM_NOT_CACHED", "Cannot be cached"),
+        (0x08000000, "MEM_NOT_PAGED", "Not pageable"),
+        (0x10000000, "MEM_SHARED", "Can be shared in memory"),
+        (0x20000000, "MEM_EXECUTE", "Can be executed as code"),
+        (0x40000000, "MEM_READ", "Readable"),
+        (0x80000000, "MEM_WRITE", "Writable"),
+    ]
+    for mask, name, desc in flag_defs:
+        if char_val & mask:
+            char_flags.append({"flag": name, "description": desc})
+
+    # Generate hex dump of section data (limited)
+    display_size = min(len(sec_data), max_bytes)
+    hex_lines = []
+    for offset in range(0, display_size, 16):
+        chunk = sec_data[offset:offset + 16]
+        hex_part = " ".join(f"{b:02x}" for b in chunk)
+        ascii_part = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        hex_lines.append(f"{offset:08x}  {hex_part:<48s} |{ascii_part}|")
+
+    # Extract printable strings (min length 4)
+    strings_found = []
+    current = []
+    str_offset = 0
+    for i, b in enumerate(sec_data):
+        if 32 <= b < 127:
+            if not current:
+                str_offset = i
+            current.append(chr(b))
+        else:
+            if len(current) >= 4:
+                strings_found.append({"offset": str_offset, "value": "".join(current)})
+            current = []
+    if len(current) >= 4:
+        strings_found.append({"offset": str_offset, "value": "".join(current)})
+
+    # Also look for wide (UTF-16 LE) strings
+    wide_strings = []
+    current = []
+    str_offset = 0
+    i = 0
+    while i < len(sec_data) - 1:
+        lo, hi = sec_data[i], sec_data[i + 1]
+        if hi == 0 and 32 <= lo < 127:
+            if not current:
+                str_offset = i
+            current.append(chr(lo))
+        else:
+            if len(current) >= 4:
+                wide_strings.append({"offset": str_offset, "value": "".join(current), "encoding": "UTF-16LE"})
+            current = []
+        i += 2
+    if len(current) >= 4:
+        wide_strings.append({"offset": str_offset, "value": "".join(current), "encoding": "UTF-16LE"})
+
+    result = {
+        "index": section_idx,
+        "name": sec_name,
+        "virtual_address": hex(section.VirtualAddress),
+        "virtual_size": section.Misc_VirtualSize,
+        "raw_offset": hex(section.PointerToRawData),
+        "raw_offset_dec": section.PointerToRawData,
+        "raw_size": section.SizeOfRawData,
+        "characteristics": hex(section.Characteristics),
+        "characteristic_flags": char_flags,
+        "entropy": entropy,
+        "total_data_size": len(sec_data),
+        "display_size": display_size,
+        "hex_dump": "\n".join(hex_lines),
+        "strings": strings_found[:500],
+        "wide_strings": wide_strings[:200],
+        "string_count": len(strings_found),
+        "wide_string_count": len(wide_strings),
+    }
+
+    pe.close()
+    return jsonify(result)
+
+
 # --- Main ---
 if __name__ == "__main__":
     # Start background alert loader

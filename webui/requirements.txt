@@ -1,3 +1,4 @@
 flask>=3.0
 requests>=2.31
 watchdog>=4.0
+pefile>=2023.2.7
