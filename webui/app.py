@@ -442,10 +442,23 @@ def build_process_tree(alerts):
     Handles PID reuse: if a PID's executable changes between alerts,
     use the most recent process info (latest alert wins).
     """
+    # Pre-load known detonated PIDs from submission history
+    _detonated_pids = set()
+    try:
+        for sub in _load_submissions():
+            apid = sub.get("agent_pid")
+            if apid:
+                _detonated_pids.add(str(apid))
+    except Exception:
+        pass
+
     processes = {}
     for alert in alerts:
-        pid = alert.get("pid")
-        if pid and pid not in processes:
+        raw_pid = alert.get("pid")
+        if not raw_pid:
+            continue
+        pid = str(raw_pid)
+        if pid not in processes:
             processes[pid] = {
                 "pid": pid,
                 "name": alert.get("process_name", "unknown"),
@@ -519,13 +532,15 @@ def build_process_tree(alerts):
                 if engine in ("yara", "ioc"):
                     proc_entry["activity"]["artifacts"] += 1
 
-                # Track detonation enrichment (Fibratus / LitterBox)
-                if alert.get("detonated"):
+                # Track detonation enrichment (Fibratus / LitterBox / submission PIDs)
+                if alert.get("detonated") or str(pid) in _detonated_pids:
                     proc_entry["activity"]["detonated"] += 1
                     proc_entry["detonated"] = True
                     det_src = alert.get("detonation_source", "")
                     if det_src and det_src not in proc_entry["detonation_sources"]:
                         proc_entry["detonation_sources"].append(det_src)
+                    if str(pid) in _detonated_pids and "agent" not in proc_entry["detonation_sources"]:
+                        proc_entry["detonation_sources"].append("agent")
 
                 # Track last seen timestamp
                 ts = alert.get("timestamp", "")
@@ -540,10 +555,66 @@ def build_process_tree(alerts):
                     proc_entry["exit_code"] = _get_nested(raw, "process.exit_code")
 
     # Link children to parents
-    for pid, proc in processes.items():
+    stub_parents = {}
+    for pid, proc in list(processes.items()):
         ppid = proc.get("parent_pid")
-        if ppid and ppid in processes:
-            processes[ppid]["children"].append(pid)
+        if ppid is not None:
+            ppid_str = str(ppid)
+            if ppid_str == str(pid):
+                continue  # self-reference
+            if ppid_str in processes:
+                if pid not in processes[ppid_str]["children"]:
+                    processes[ppid_str]["children"].append(pid)
+            elif ppid_str not in stub_parents:
+                # Create a stub parent entry so the graph can show the relationship
+                stub_parents[ppid_str] = {
+                    "pid": ppid,
+                    "name": proc.get("parent_name", "unknown"),
+                    "image": "",
+                    "command_line": proc.get("parent_command_line", ""),
+                    "user": "",
+                    "parent_pid": None,
+                    "parent_name": "",
+                    "integrity": "",
+                    "working_dir": "",
+                    "first_seen": proc.get("first_seen", ""),
+                    "last_seen": proc.get("last_seen", ""),
+                    "exit_time": None,
+                    "exit_code": None,
+                    "children": [pid],
+                    "activity": {
+                        "file": 0, "network": 0, "dns": 0, "http": 0,
+                        "registry": 0, "modules": 0, "scripts": 0, "injection": 0,
+                        "wmi": 0, "services": 0, "tasks": 0, "logons": 0,
+                        "artifacts": 0, "threats": 0, "detonated": 0,
+                    },
+                    "alerts": [],
+                    "detonated": False,
+                    "detonation_sources": [],
+                    "is_stub": True,
+                }
+            else:
+                # Stub parent already created by a sibling; just add this PID as child
+                if pid not in stub_parents[ppid_str]["children"]:
+                    stub_parents[ppid_str]["children"].append(pid)
+
+    # Merge stub parents into processes dict
+    processes.update(stub_parents)
+
+    # Cross-reference with submission history: mark processes whose PID matches
+    # a known detonated sample (agent_pid) as detonated, including child processes
+    # (reuse the _detonated_pids set pre-loaded at the top of this function)
+    for pid in _detonated_pids:
+        if pid in processes:
+            processes[pid]["detonated"] = True
+            if "agent" not in processes[pid]["detonation_sources"]:
+                processes[pid]["detonation_sources"].append("agent")
+            # Mark direct children as detonated too (spawned by detonated sample)
+            for child_pid in processes[pid].get("children", []):
+                if child_pid in processes:
+                    processes[child_pid]["detonated"] = True
+                    if "child_of_detonated" not in processes[child_pid]["detonation_sources"]:
+                        processes[child_pid]["detonation_sources"].append("child_of_detonated")
 
     # Infer exit for processes whose last_seen is significantly before session end
     # (heuristic: if no new events for this process after others continue, mark as exited)
@@ -612,28 +683,34 @@ def api_status():
     """Get status of all integrated services."""
     status = {}
 
-    # Check DetonatorAgent
+    # Check DetonatorAgent - validate response is actually valid JSON with 200
     try:
-        r = requests.get(f"{DETONATOR_AGENT_API}/api/lock/status", timeout=1)
-        status["detonator_agent"] = {"online": True, "data": r.json()}
+        r = requests.get(f"{DETONATOR_AGENT_API}/api/lock/status", timeout=2)
+        if r.status_code == 200:
+            status["detonator_agent"] = {"online": True, "data": r.json()}
+        else:
+            status["detonator_agent"] = {"online": False, "status_code": r.status_code}
     except Exception:
         status["detonator_agent"] = {"online": False}
 
-    # Check Detonator (skip if known offline to save time)
+    # Check Detonator - validate 200 status
     try:
-        r = requests.get(f"{DETONATOR_API}/api/submissions", timeout=1)
-        status["detonator"] = {"online": True}
+        r = requests.get(f"{DETONATOR_API}/api/submissions", timeout=2)
+        status["detonator"] = {"online": r.status_code == 200}
     except Exception:
         status["detonator"] = {"online": False}
 
-    # Check LitterBox
+    # Check LitterBox - validate 200 status
     try:
-        r = requests.get(LITTERBOX_API, timeout=1)
+        r = requests.get(LITTERBOX_API, timeout=2)
         status["litterbox"] = {"online": r.status_code == 200}
     except Exception:
         status["litterbox"] = {"online": False}
 
-    # Rustinel - check process existence via filesystem (fast)
+    # Check Fibratus - independent check via service or API
+    status["fibratus"] = {"online": _is_fibratus_running()}
+
+    # Rustinel - check process existence
     rustinel_online = os.path.isdir(RUSTINEL_ALERTS_DIR) and _is_rustinel_running()
     status["rustinel"] = {
         "online": rustinel_online,
@@ -646,14 +723,141 @@ def api_status():
     return jsonify(status)
 
 
+# --- Service launch configuration ---
+# Paths are auto-detected: VM paths first, then dev/local paths
+def _find_service_launch_config():
+    """Detect available service launch commands based on installed paths."""
+    configs = {}
+
+    # Rustinel
+    for exe in [r"C:\tools\rustinel\rustinel.exe", os.path.join(RUSTINEL_INSTALL_DIR, "rustinel.exe")]:
+        if os.path.isfile(exe):
+            configs["rustinel"] = {"exe": exe, "args": "run", "cwd": os.path.dirname(exe)}
+            break
+
+    # DetonatorAgent
+    for exe in [r"C:\DetonatorAgent\publish\DetonatorAgent.exe"]:
+        if os.path.isfile(exe):
+            configs["detonator_agent"] = {"exe": exe, "args": "--port 8080 --edr fibratus", "cwd": os.path.dirname(exe)}
+            break
+
+    # Detonator API
+    for venv_py in [r"C:\detonator\.venv\Scripts\python.exe"]:
+        if os.path.isfile(venv_py):
+            configs["detonator"] = {
+                "exe": venv_py,
+                "args": '-c "from detonatorapi.fastapi_app import app; import uvicorn; uvicorn.run(app, host=\'0.0.0.0\', port=8000)"',
+                "cwd": r"C:\detonator",
+            }
+            break
+
+    # LitterBox - check multiple possible locations
+    litterbox_dirs = [
+        r"C:\LitterBox",
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "LitterBox"),
+    ]
+    for lb_dir in litterbox_dirs:
+        lb_script = os.path.join(lb_dir, "litterbox.py")
+        if os.path.isfile(lb_script):
+            # Prefer venv python, fallback to system
+            venv_py = os.path.join(lb_dir, "venv", "Scripts", "python.exe")
+            py_exe = venv_py if os.path.isfile(venv_py) else "python"
+            configs["litterbox"] = {"exe": py_exe, "args": "litterbox.py", "cwd": lb_dir}
+            break
+
+    # Fibratus - Windows Service
+    configs["fibratus"] = {"service": "fibratus"}
+
+    # Sysmon - Windows Service
+    configs["sysmon"] = {"service": "Sysmon64"}
+
+    return configs
+
+
+@app.route("/api/service/launch", methods=["POST"])
+def api_service_launch():
+    """Launch a service by name."""
+    data = request.get_json(force=True) if request.is_json else request.form
+    service_name = data.get("service", "").strip()
+
+    if not service_name:
+        return jsonify({"error": "No service specified"}), 400
+
+    configs = _find_service_launch_config()
+    if service_name not in configs:
+        return jsonify({"error": f"Unknown service: {service_name}", "available": list(configs.keys())}), 404
+
+    config = configs[service_name]
+
+    try:
+        # Windows Service start
+        if "service" in config:
+            svc_name = config["service"]
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", f"Start-Service -Name '{svc_name}' -ErrorAction Stop"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode != 0:
+                return jsonify({"error": f"Failed to start service: {result.stderr.strip()}"}), 500
+            return jsonify({"success": True, "message": f"Service '{svc_name}' started"})
+
+        # Process launch
+        exe = config["exe"]
+        args = config.get("args", "")
+        cwd = config.get("cwd", "")
+
+        if not os.path.isfile(exe) and exe != "python":
+            return jsonify({"error": f"Executable not found: {exe}"}), 404
+
+        # Launch detached process
+        cmd_parts = [exe] + (args.split() if args and not args.startswith('-c') else ([args] if args else []))
+        if args.startswith('-c'):
+            cmd_parts = [exe, "-c", args[3:].strip().strip('"')]
+
+        subprocess.Popen(
+            cmd_parts,
+            cwd=cwd or None,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=0x00000008 | 0x00000200,  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        )
+
+        # Invalidate status caches so next poll picks up new state
+        _rustinel_proc_cache["checked_at"] = 0
+        _sysmon_proc_cache["checked_at"] = 0
+        _fibratus_proc_cache["checked_at"] = 0
+
+        return jsonify({"success": True, "message": f"Launched {service_name}"})
+
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Launch timed out"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/service/configs")
+def api_service_configs():
+    """Return detected service launch configurations."""
+    configs = _find_service_launch_config()
+    # Sanitize for frontend (just report which are launchable)
+    result = {}
+    for name, cfg in configs.items():
+        if "service" in cfg:
+            result[name] = {"type": "service", "service_name": cfg["service"], "launchable": True}
+        else:
+            launchable = os.path.isfile(cfg["exe"]) or cfg["exe"] == "python"
+            result[name] = {"type": "process", "launchable": launchable, "cwd": cfg.get("cwd", "")}
+    return jsonify(result)
+
+
 # Cache for rustinel process check (avoid spawning powershell on every request)
 _rustinel_proc_cache = {"online": False, "checked_at": 0}
 
 
 def _is_rustinel_running():
-    """Fast check if Rustinel is running (cached for 10s)."""
+    """Fast check if Rustinel is running (cached for 5s)."""
     now = time.time()
-    if now - _rustinel_proc_cache["checked_at"] < 10:
+    if now - _rustinel_proc_cache["checked_at"] < 5:
         return _rustinel_proc_cache["online"]
     try:
         result = subprocess.run(
@@ -666,8 +870,9 @@ def _is_rustinel_running():
         _rustinel_proc_cache["checked_at"] = now
         return online
     except Exception:
+        _rustinel_proc_cache["online"] = False
         _rustinel_proc_cache["checked_at"] = now
-        return _rustinel_proc_cache["online"]
+        return False
 
 
 def _get_rustinel_process():
@@ -692,9 +897,9 @@ _sysmon_proc_cache = {"online": False, "checked_at": 0}
 
 
 def _is_sysmon_running():
-    """Fast check if Sysmon64 service is running (cached for 30s)."""
+    """Fast check if Sysmon64 service is running (cached for 10s)."""
     now = time.time()
-    if now - _sysmon_proc_cache["checked_at"] < 30:
+    if now - _sysmon_proc_cache["checked_at"] < 10:
         return _sysmon_proc_cache["online"]
     try:
         result = subprocess.run(
@@ -707,8 +912,36 @@ def _is_sysmon_running():
         _sysmon_proc_cache["checked_at"] = now
         return online
     except Exception:
+        _sysmon_proc_cache["online"] = False
         _sysmon_proc_cache["checked_at"] = now
-        return _sysmon_proc_cache["online"]
+        return False
+
+
+# Cache for Fibratus check
+_fibratus_proc_cache = {"online": False, "checked_at": 0}
+
+
+def _is_fibratus_running():
+    """Check if Fibratus is running as a service or process (cached for 10s)."""
+    now = time.time()
+    if now - _fibratus_proc_cache["checked_at"] < 10:
+        return _fibratus_proc_cache["online"]
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "$svc = Get-Service -Name fibratus -ErrorAction SilentlyContinue; "
+             "if ($svc -and $svc.Status -eq 'Running') { 'True' } "
+             "else { (Get-Process -Name fibratus -ErrorAction SilentlyContinue) -ne $null }"],
+            capture_output=True, text=True, timeout=3
+        )
+        online = "True" in result.stdout
+        _fibratus_proc_cache["online"] = online
+        _fibratus_proc_cache["checked_at"] = now
+        return online
+    except Exception:
+        _fibratus_proc_cache["online"] = False
+        _fibratus_proc_cache["checked_at"] = now
+        return False
 
 
 def _get_rustinel_rules():
@@ -1234,9 +1467,10 @@ def api_submissions():
 @app.route("/api/detonation/results")
 def api_detonation_results():
     """Poll for combined detonation results: LitterBox static/dynamic + Fibratus/Rustinel alerts.
-    Query params: sha256 (file hash), pid (agent PID), litterbox_hash (LB hash if different)."""
+    Query params: sha256 (file hash), pid (agent PID), litterbox_hash (LB hash if different), filename."""
     sha256 = request.args.get("sha256", "")
     pid = request.args.get("pid", "")
+    filename = request.args.get("filename", "")
     lb_hash = request.args.get("litterbox_hash", "") or sha256
 
     results = {"sha256": sha256, "pid": pid, "ready": {}}
@@ -1293,14 +1527,42 @@ def api_detonation_results():
         search_terms.add(sha256[:16])  # Partial match on hash prefix
 
     for alert in events_store.get("alerts", []):
-        # Match by PID
-        alert_pid = str(alert.get("process", {}).get("pid", ""))
-        alert_hash = alert.get("file", {}).get("hash", {}).get("sha256", "") or ""
-        alert_name = alert.get("process", {}).get("name", "") or ""
+        # Match by PID (flat field from parse_rustinel_alert / parse_fibratus_alert)
+        alert_pid = str(alert.get("pid", ""))
+        alert_ppid = str(alert.get("parent_pid", ""))
+        # Also check the raw event for nested process.pid (ECS format)
+        raw = alert.get("raw", {})
+        raw_pid = str(_get_nested(raw, "process.pid", ""))
+        raw_ppid = str(_get_nested(raw, "process.parent.pid", ""))
+        # Check file hash from raw event
+        alert_hash = _get_nested(raw, "file.hash.sha256", "") or ""
+        # Also check process.hash.sha256 (some rules attach it there)
+        proc_hash = _get_nested(raw, "process.hash.sha256", "") or ""
+        # Check command_line and process_image for sample filename
+        cmdline = (alert.get("command_line", "") or "").lower()
+        proc_image = (alert.get("process_image", "") or "").lower()
+        proc_name = (alert.get("process_name", "") or "").lower()
 
-        if pid and alert_pid == str(pid):
-            matching_alerts.append(alert)
-        elif sha256 and sha256.lower() in alert_hash.lower():
+        matched = False
+        if pid:
+            pid_str = str(pid)
+            if alert_pid == pid_str or raw_pid == pid_str or alert_ppid == pid_str or raw_ppid == pid_str:
+                matched = True
+        if not matched and sha256 and len(sha256) >= 16:
+            sha_lower = sha256.lower()
+            if (sha_lower[:16] in alert_hash.lower() or
+                sha_lower[:16] in proc_hash.lower()):
+                matched = True
+        if not matched and filename and len(filename) >= 3:
+            # Match by sample filename in command line, process image, or process name
+            fn_lower = filename.lower()
+            # Strip extension for broader matching (e.g. "mimikatz" matches "mimikatz.exe")
+            fn_stem = fn_lower.rsplit(".", 1)[0] if "." in fn_lower else fn_lower
+            if len(fn_stem) >= 3 and (fn_lower in cmdline or fn_lower in proc_image or
+                fn_stem in proc_name or fn_stem in cmdline):
+                matched = True
+
+        if matched:
             matching_alerts.append(alert)
 
     results["fibratus_alerts"] = matching_alerts[:50]
@@ -1795,6 +2057,7 @@ def api_file_pe():
             "virtual_size": section.Misc_VirtualSize,
             "raw_size": section.SizeOfRawData,
             "raw_offset": hex(section.PointerToRawData),
+            "raw_offset_dec": section.PointerToRawData,
             "characteristics": hex(section.Characteristics),
             "executable": bool(section.Characteristics & 0x20000000),
             "writable": bool(section.Characteristics & 0x80000000),
@@ -2041,6 +2304,528 @@ def api_file_pe_section():
 
     pe.close()
     return jsonify(result)
+
+
+# --- ELF Analysis ---
+
+# Suspicious ELF symbols/function imports (similar to PE suspicious imports)
+SUSPICIOUS_ELF_IMPORTS = {
+    "process_injection": ["ptrace", "process_vm_writev", "process_vm_readv", "__libc_dlopen_mode"],
+    "code_execution": ["mprotect", "mmap", "execve", "execvp", "execl", "system", "popen", "dlopen", "dlsym"],
+    "anti_debug": ["ptrace", "prctl", "getppid", "kill"],
+    "networking": ["socket", "connect", "bind", "listen", "accept", "send", "recv", "sendto", "recvfrom", "getaddrinfo"],
+    "file_operations": ["unlink", "rename", "chmod", "chown", "fchmod", "link", "symlink", "mount"],
+    "privilege_escalation": ["setuid", "setgid", "seteuid", "setreuid", "setregid", "capset"],
+    "crypto": ["EVP_EncryptInit", "EVP_DecryptInit", "AES_encrypt", "AES_decrypt", "RSA_public_encrypt", "RC4"],
+    "evasion": ["fork", "daemon", "setsid", "dup2", "memfd_create", "fexecve"],
+}
+
+# Known ELF section names indicating packers/protectors
+ELF_PACKER_SECTIONS = {
+    "upx": "UPX",
+    ".upx": "UPX",
+    "UPX!": "UPX",
+    ".themida": "Themida",
+    ".enigma": "Enigma Protector",
+    ".vmprotect": "VMProtect",
+    ".packed": "Generic Packer",
+    ".crypted": "Encrypted/Packed",
+}
+
+
+@app.route("/api/file/elf")
+def api_file_elf():
+    """Parse ELF header and return structured analysis with IOC indicators."""
+    filepath = request.args.get("path", "")
+    if not filepath:
+        return jsonify({"error": "No path specified"}), 400
+
+    norm_path = os.path.normpath(filepath)
+    if not os.path.isfile(norm_path):
+        return jsonify({"error": "File not found"}), 404
+
+    try:
+        with open(norm_path, "rb") as f:
+            data = f.read()
+    except Exception as e:
+        return jsonify({"error": f"Cannot read file: {e}"}), 500
+
+    # Verify ELF magic
+    if len(data) < 64 or data[:4] != b"\x7fELF":
+        return jsonify({"error": "Not a valid ELF file (missing \\x7fELF magic)"}), 400
+
+    result = {"valid": True, "path": filepath, "file_size": len(data)}
+
+    # --- ELF Identification (e_ident) ---
+    ei_class = data[4]  # 1=32bit, 2=64bit
+    ei_data = data[5]   # 1=little-endian, 2=big-endian
+    ei_version = data[6]
+    ei_osabi = data[7]
+
+    is_64 = ei_class == 2
+    is_le = ei_data == 1
+    endian = "<" if is_le else ">"
+
+    class_map = {1: "ELF32", 2: "ELF64"}
+    data_map = {1: "Little-endian (LSB)", 2: "Big-endian (MSB)"}
+    osabi_map = {
+        0: "UNIX System V", 1: "HP-UX", 2: "NetBSD", 3: "Linux",
+        6: "Solaris", 7: "AIX", 8: "IRIX", 9: "FreeBSD",
+        10: "Tru64", 11: "Novell Modesto", 12: "OpenBSD",
+        64: "ARM EABI", 97: "ARM", 255: "Standalone"
+    }
+
+    result["ident"] = {
+        "class": class_map.get(ei_class, f"Unknown ({ei_class})"),
+        "is_64bit": is_64,
+        "data": data_map.get(ei_data, f"Unknown ({ei_data})"),
+        "is_little_endian": is_le,
+        "version": ei_version,
+        "osabi": osabi_map.get(ei_osabi, f"Unknown ({ei_osabi})"),
+        "osabi_raw": ei_osabi,
+    }
+
+    # --- ELF Header ---
+    type_map = {0: "NONE", 1: "REL (Relocatable)", 2: "EXEC (Executable)", 3: "DYN (Shared Object/PIE)", 4: "CORE"}
+    machine_map = {
+        0: "None", 2: "SPARC", 3: "x86 (i386)", 6: "Intel 80486",
+        8: "MIPS", 20: "PowerPC", 21: "PowerPC64", 22: "S390",
+        40: "ARM", 43: "SPARC V9", 50: "IA-64", 62: "x86-64 (AMD64)",
+        183: "AArch64 (ARM64)", 243: "RISC-V", 247: "eBPF",
+    }
+
+    if is_64:
+        if len(data) < 64:
+            return jsonify({"error": "File too small for ELF64 header"}), 400
+        # ELF64 header: e_type(2) e_machine(2) e_version(4) e_entry(8) e_phoff(8) e_shoff(8) e_flags(4) e_ehsize(2) e_phentsize(2) e_phnum(2) e_shentsize(2) e_shnum(2) e_shstrndx(2)
+        hdr = struct.unpack(f"{endian}HHI QQQ I HHHHHH", data[16:64])
+        e_type, e_machine, e_version, e_entry, e_phoff, e_shoff, e_flags, e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx = hdr
+    else:
+        if len(data) < 52:
+            return jsonify({"error": "File too small for ELF32 header"}), 400
+        # ELF32 header
+        hdr = struct.unpack(f"{endian}HHI III I HHHHHH", data[16:52])
+        e_type, e_machine, e_version, e_entry, e_phoff, e_shoff, e_flags, e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx = hdr
+
+    result["header"] = {
+        "type": type_map.get(e_type, f"Unknown ({e_type})"),
+        "type_raw": e_type,
+        "machine": machine_map.get(e_machine, f"Unknown ({e_machine})"),
+        "machine_raw": e_machine,
+        "version": e_version,
+        "entry_point": hex(e_entry),
+        "program_header_offset": e_phoff,
+        "section_header_offset": e_shoff,
+        "flags": hex(e_flags),
+        "header_size": e_ehsize,
+        "ph_entry_size": e_phentsize,
+        "ph_count": e_phnum,
+        "sh_entry_size": e_shentsize,
+        "sh_count": e_shnum,
+        "sh_str_index": e_shstrndx,
+        "is_executable": e_type == 2,
+        "is_shared_object": e_type == 3,
+        "is_pie": e_type == 3,  # DYN with entry point often means PIE
+        "is_relocatable": e_type == 1,
+    }
+
+    # --- Security Features ---
+    has_pie = e_type == 3
+    has_nx = False  # Will check PT_GNU_STACK
+    has_relro = False
+    has_full_relro = False
+    has_stack_canary = False  # Will check symbols
+    has_fortify = False  # Will check symbols
+    is_stripped = True  # Assume stripped unless we find .symtab
+
+    # --- Section Headers ---
+    sections = []
+    shstrtab_data = b""
+
+    # Read section header string table first
+    if e_shstrndx < e_shnum and e_shoff > 0:
+        if is_64:
+            str_sec_offset = e_shoff + e_shstrndx * e_shentsize
+            if str_sec_offset + e_shentsize <= len(data):
+                sh_entry = struct.unpack(f"{endian}IIQQQQIIQQ", data[str_sec_offset:str_sec_offset + 64])
+                shstrtab_offset = sh_entry[4]  # sh_offset
+                shstrtab_size = sh_entry[5]    # sh_size
+                if shstrtab_offset + shstrtab_size <= len(data):
+                    shstrtab_data = data[shstrtab_offset:shstrtab_offset + shstrtab_size]
+        else:
+            str_sec_offset = e_shoff + e_shstrndx * e_shentsize
+            if str_sec_offset + e_shentsize <= len(data):
+                sh_entry = struct.unpack(f"{endian}IIIIIIIIII", data[str_sec_offset:str_sec_offset + 40])
+                shstrtab_offset = sh_entry[4]
+                shstrtab_size = sh_entry[5]
+                if shstrtab_offset + shstrtab_size <= len(data):
+                    shstrtab_data = data[shstrtab_offset:shstrtab_offset + shstrtab_size]
+
+    def get_shstr(offset):
+        """Get null-terminated string from section header string table."""
+        if offset >= len(shstrtab_data):
+            return ""
+        end = shstrtab_data.find(b"\x00", offset)
+        if end == -1:
+            end = min(offset + 64, len(shstrtab_data))
+        return shstrtab_data[offset:end].decode("utf-8", errors="replace")
+
+    # Section type map
+    sh_type_map = {
+        0: "NULL", 1: "PROGBITS", 2: "SYMTAB", 3: "STRTAB", 4: "RELA",
+        5: "HASH", 6: "DYNAMIC", 7: "NOTE", 8: "NOBITS", 9: "REL",
+        10: "SHLIB", 11: "DYNSYM", 14: "INIT_ARRAY", 15: "FINI_ARRAY",
+        0x6ffffff6: "GNU_HASH", 0x6ffffffd: "VERDEF", 0x6ffffffe: "VERNEED",
+        0x6fffffff: "VERSYM",
+    }
+
+    total_entropy = calculate_entropy(data)
+    result["total_entropy"] = total_entropy
+
+    for i in range(e_shnum):
+        offset = e_shoff + i * e_shentsize
+        if offset + e_shentsize > len(data):
+            break
+
+        if is_64:
+            sh = struct.unpack(f"{endian}IIQQQQIIQQ", data[offset:offset + 64])
+            sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size, sh_link, sh_info, sh_addralign, sh_entsize = sh
+        else:
+            sh = struct.unpack(f"{endian}IIIIIIIIII", data[offset:offset + 40])
+            sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size, sh_link, sh_info, sh_addralign, sh_entsize = sh
+
+        sec_name = get_shstr(sh_name)
+
+        # Calculate entropy for this section
+        sec_entropy = 0.0
+        if sh_type != 8 and sh_size > 0 and sh_offset + sh_size <= len(data):  # Not NOBITS
+            sec_data_bytes = data[sh_offset:sh_offset + sh_size]
+            sec_entropy = calculate_entropy(sec_data_bytes)
+
+        sec_info = {
+            "index": i,
+            "name": sec_name,
+            "type": sh_type_map.get(sh_type, f"0x{sh_type:x}"),
+            "type_raw": sh_type,
+            "flags": sh_flags,
+            "flags_str": _elf_section_flags_str(sh_flags),
+            "address": hex(sh_addr),
+            "offset": hex(sh_offset),
+            "offset_dec": sh_offset,
+            "size": sh_size,
+            "link": sh_link,
+            "info": sh_info,
+            "alignment": sh_addralign,
+            "entry_size": sh_entsize,
+            "entropy": sec_entropy,
+            "entropy_status": "high" if sec_entropy >= ENTROPY_HIGH_THRESHOLD else "warn" if sec_entropy >= ENTROPY_WARN_THRESHOLD else "normal",
+            "executable": bool(sh_flags & 0x4),
+            "writable": bool(sh_flags & 0x1),
+            "allocatable": bool(sh_flags & 0x2),
+        }
+
+        # Check for packer indicators
+        for packer_name, packer_label in ELF_PACKER_SECTIONS.items():
+            if sec_name.lower().startswith(packer_name.lower()):
+                sec_info["packer_indicator"] = packer_label
+                break
+
+        # Flag WX (writable + executable) sections
+        if sec_info["executable"] and sec_info["writable"]:
+            sec_info["wx_warning"] = True
+
+        # Check if .symtab exists (means not fully stripped)
+        if sec_name == ".symtab":
+            is_stripped = False
+
+        sections.append(sec_info)
+
+    result["sections"] = sections
+    result["is_stripped"] = is_stripped
+
+    # --- Program Headers (Segments) ---
+    segments = []
+    pt_type_map = {
+        0: "NULL", 1: "LOAD", 2: "DYNAMIC", 3: "INTERP", 4: "NOTE",
+        5: "SHLIB", 6: "PHDR", 7: "TLS",
+        0x6474e550: "GNU_EH_FRAME", 0x6474e551: "GNU_STACK",
+        0x6474e552: "GNU_RELRO", 0x6474e553: "GNU_PROPERTY",
+    }
+
+    for i in range(e_phnum):
+        offset = e_phoff + i * e_phentsize
+        if offset + e_phentsize > len(data):
+            break
+
+        if is_64:
+            ph = struct.unpack(f"{endian}IIQQQQQQ", data[offset:offset + 56])
+            p_type, p_flags, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_align = ph
+        else:
+            ph = struct.unpack(f"{endian}IIIIIIII", data[offset:offset + 32])
+            p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align = ph
+
+        seg_info = {
+            "index": i,
+            "type": pt_type_map.get(p_type, f"0x{p_type:x}"),
+            "type_raw": p_type,
+            "flags": p_flags,
+            "flags_str": _elf_segment_flags_str(p_flags),
+            "offset": hex(p_offset),
+            "vaddr": hex(p_vaddr),
+            "paddr": hex(p_paddr),
+            "filesz": p_filesz,
+            "memsz": p_memsz,
+            "align": p_align,
+            "readable": bool(p_flags & 4),
+            "writable": bool(p_flags & 2),
+            "executable": bool(p_flags & 1),
+        }
+
+        # Check security features
+        if p_type == 0x6474e551:  # GNU_STACK
+            if not (p_flags & 1):  # Not executable
+                has_nx = True
+            seg_info["security_note"] = "NX stack" if not (p_flags & 1) else "Executable stack (no NX!)"
+
+        if p_type == 0x6474e552:  # GNU_RELRO
+            has_relro = True
+            seg_info["security_note"] = "RELRO (read-only relocations)"
+
+        # Extract interpreter path
+        if p_type == 3 and p_filesz > 0 and p_offset + p_filesz <= len(data):  # PT_INTERP
+            interp = data[p_offset:p_offset + p_filesz].rstrip(b"\x00").decode("utf-8", errors="replace")
+            seg_info["interpreter"] = interp
+            result["interpreter"] = interp
+
+        segments.append(seg_info)
+
+    result["segments"] = segments
+
+    # --- Dynamic Section (imports, needed libraries) ---
+    dynamic_entries = []
+    needed_libs = []
+    soname = None
+    rpath = None
+    runpath = None
+    dynamic_strtab_offset = 0
+    dynamic_strtab_size = 0
+
+    # Find .dynstr section for resolving dynamic string table
+    dynstr_data = b""
+    for sec in sections:
+        if sec["name"] == ".dynstr" and sec["offset_dec"] + sec["size"] <= len(data):
+            dynstr_data = data[sec["offset_dec"]:sec["offset_dec"] + sec["size"]]
+            break
+
+    def get_dynstr(offset):
+        if offset >= len(dynstr_data):
+            return ""
+        end = dynstr_data.find(b"\x00", offset)
+        if end == -1:
+            end = min(offset + 256, len(dynstr_data))
+        return dynstr_data[offset:end].decode("utf-8", errors="replace")
+
+    # Find and parse .dynamic section
+    for sec in sections:
+        if sec["name"] == ".dynamic" and sec["offset_dec"] + sec["size"] <= len(data):
+            dyn_offset = sec["offset_dec"]
+            dyn_size = sec["size"]
+            entry_size = 16 if is_64 else 8
+
+            dt_tag_map = {
+                0: "NULL", 1: "NEEDED", 2: "PLTRELSZ", 3: "PLTGOT", 4: "HASH",
+                5: "STRTAB", 6: "SYMTAB", 7: "RELA", 8: "RELASZ", 9: "RELAENT",
+                10: "STRSZ", 11: "SYMENT", 12: "INIT", 13: "FINI", 14: "SONAME",
+                15: "RPATH", 16: "SYMBOLIC", 17: "REL", 20: "PLTREL", 21: "DEBUG",
+                23: "JMPREL", 24: "BIND_NOW", 25: "INIT_ARRAY", 26: "FINI_ARRAY",
+                29: "RUNPATH", 30: "FLAGS", 0x6ffffffb: "FLAGS_1",
+                0x6ffffff0: "VERSYM", 0x6ffffffe: "VERNEED", 0x6fffffff: "VERNEEDNUM",
+            }
+
+            i = 0
+            while i < dyn_size:
+                if is_64:
+                    if dyn_offset + i + 16 > len(data):
+                        break
+                    d_tag, d_val = struct.unpack(f"{endian}qQ", data[dyn_offset + i:dyn_offset + i + 16])
+                else:
+                    if dyn_offset + i + 8 > len(data):
+                        break
+                    d_tag, d_val = struct.unpack(f"{endian}iI", data[dyn_offset + i:dyn_offset + i + 8])
+
+                if d_tag == 0:  # DT_NULL
+                    break
+
+                tag_name = dt_tag_map.get(d_tag, f"0x{d_tag:x}")
+
+                if d_tag == 1:  # DT_NEEDED
+                    lib = get_dynstr(d_val)
+                    needed_libs.append(lib)
+                elif d_tag == 14:  # DT_SONAME
+                    soname = get_dynstr(d_val)
+                elif d_tag == 15:  # DT_RPATH
+                    rpath = get_dynstr(d_val)
+                elif d_tag == 29:  # DT_RUNPATH
+                    runpath = get_dynstr(d_val)
+                elif d_tag == 24:  # DT_BIND_NOW
+                    has_full_relro = has_relro  # RELRO + BIND_NOW = Full RELRO
+                elif d_tag == 0x6ffffffb:  # DT_FLAGS_1
+                    if d_val & 0x1:  # DF_1_NOW
+                        has_full_relro = has_relro
+
+                i += entry_size
+            break
+
+    result["needed_libraries"] = needed_libs
+    result["soname"] = soname
+    result["rpath"] = rpath
+    result["runpath"] = runpath
+
+    # --- Symbol Analysis (from .dynsym) ---
+    imported_symbols = []
+    exported_symbols = []
+    dynsym_data = b""
+    dynsym_entsize = 24 if is_64 else 16
+
+    for sec in sections:
+        if sec["name"] == ".dynsym" and sec["offset_dec"] + sec["size"] <= len(data):
+            dynsym_data = data[sec["offset_dec"]:sec["offset_dec"] + sec["size"]]
+            break
+
+    if dynsym_data:
+        num_syms = len(dynsym_data) // dynsym_entsize
+        for i in range(1, min(num_syms, 2000)):  # Skip index 0, cap at 2000
+            sym_offset = i * dynsym_entsize
+            if is_64:
+                st_name, st_info, st_other, st_shndx, st_value, st_size = struct.unpack(
+                    f"{endian}IBBHQQ", dynsym_data[sym_offset:sym_offset + 24]
+                )
+            else:
+                st_name, st_value, st_size, st_info, st_other, st_shndx = struct.unpack(
+                    f"{endian}IIIBBH", dynsym_data[sym_offset:sym_offset + 16]
+                )
+
+            sym_name = get_dynstr(st_name)
+            if not sym_name:
+                continue
+
+            st_bind = st_info >> 4
+            st_type = st_info & 0xf
+
+            sym_entry = {
+                "name": sym_name,
+                "bind": ["LOCAL", "GLOBAL", "WEAK"][st_bind] if st_bind < 3 else f"OTHER({st_bind})",
+                "type": ["NOTYPE", "OBJECT", "FUNC", "SECTION", "FILE"][st_type] if st_type < 5 else f"OTHER({st_type})",
+                "value": hex(st_value),
+                "size": st_size,
+                "shndx": st_shndx,
+            }
+
+            if st_shndx == 0:  # UND - imported
+                imported_symbols.append(sym_entry)
+            else:
+                exported_symbols.append(sym_entry)
+
+            # Check for stack canary / fortify
+            if sym_name == "__stack_chk_fail" or sym_name == "__stack_chk_guard":
+                has_stack_canary = True
+            if "__fortify" in sym_name.lower() or sym_name.endswith("_chk"):
+                has_fortify = True
+
+    result["imported_symbols"] = imported_symbols[:500]
+    result["exported_symbols"] = exported_symbols[:500]
+    result["import_count"] = len(imported_symbols)
+    result["export_count"] = len(exported_symbols)
+
+    # --- Suspicious Import Detection ---
+    suspicious_found = {}
+    for sym in imported_symbols:
+        for category, api_list in SUSPICIOUS_ELF_IMPORTS.items():
+            if sym["name"] in api_list:
+                if category not in suspicious_found:
+                    suspicious_found[category] = []
+                suspicious_found[category].append(sym["name"])
+    result["suspicious_imports"] = suspicious_found
+
+    # --- Security Summary ---
+    result["security"] = {
+        "pie": has_pie,
+        "nx": has_nx,
+        "relro": "Full" if has_full_relro else ("Partial" if has_relro else "None"),
+        "stack_canary": has_stack_canary,
+        "fortify": has_fortify,
+        "stripped": is_stripped,
+    }
+
+    # --- IOC Flags ---
+    flags = []
+
+    if not has_nx:
+        flags.append({"type": "no_nx", "severity": "high", "detail": "NX (non-executable stack) not enabled — stack is executable"})
+    if not has_pie:
+        flags.append({"type": "no_pie", "severity": "medium", "detail": "Not a position-independent executable (no ASLR for main binary)"})
+    if not has_relro:
+        flags.append({"type": "no_relro", "severity": "medium", "detail": "No RELRO — GOT is writable (GOT overwrite attacks possible)"})
+    elif not has_full_relro:
+        flags.append({"type": "partial_relro", "severity": "low", "detail": "Partial RELRO — GOT partially protected"})
+    if not has_stack_canary:
+        flags.append({"type": "no_canary", "severity": "medium", "detail": "No stack canary detected (__stack_chk_fail not imported)"})
+    if is_stripped:
+        flags.append({"type": "stripped", "severity": "low", "detail": "Binary is stripped (no .symtab — harder to analyze)"})
+    if rpath:
+        flags.append({"type": "rpath", "severity": "medium", "detail": f"RPATH set: {rpath} (potential DLL hijacking)"})
+    if runpath:
+        flags.append({"type": "runpath", "severity": "low", "detail": f"RUNPATH set: {runpath}"})
+
+    if suspicious_found:
+        for cat, syms in suspicious_found.items():
+            sev = "high" if cat in ("process_injection", "privilege_escalation", "anti_debug") else "medium"
+            flags.append({"type": "suspicious_import", "category": cat, "severity": sev, "detail": f"{len(syms)} suspicious symbol(s): {', '.join(syms[:5])}"})
+
+    for sec in sections:
+        if sec.get("wx_warning"):
+            flags.append({"type": "wx_section", "severity": "high", "detail": f"Section '{sec['name']}' is Writable+Executable (W^X violation)"})
+        if sec["entropy_status"] == "high":
+            flags.append({"type": "high_entropy", "severity": "medium", "detail": f"Section '{sec['name']}' entropy {sec['entropy']:.2f} (packed/encrypted)"})
+        if sec.get("packer_indicator"):
+            flags.append({"type": "packer", "severity": "medium", "detail": f"Section '{sec['name']}' matches packer: {sec['packer_indicator']}"})
+
+    if total_entropy >= ENTROPY_HIGH_THRESHOLD:
+        flags.append({"type": "high_total_entropy", "severity": "medium", "detail": f"Overall file entropy {total_entropy:.2f} suggests packing/encryption"})
+
+    result["flags"] = flags
+    result["flag_count"] = {
+        "high": len([f for f in flags if f["severity"] == "high"]),
+        "medium": len([f for f in flags if f["severity"] == "medium"]),
+        "low": len([f for f in flags if f["severity"] == "low"]),
+    }
+
+    return jsonify(result)
+
+
+def _elf_section_flags_str(flags):
+    """Convert ELF section flags to human-readable string."""
+    parts = []
+    if flags & 0x1: parts.append("W")
+    if flags & 0x2: parts.append("A")
+    if flags & 0x4: parts.append("X")
+    if flags & 0x10: parts.append("M")
+    if flags & 0x20: parts.append("S")
+    if flags & 0x40: parts.append("I")
+    if flags & 0x80: parts.append("L")
+    if flags & 0x100: parts.append("O")
+    if flags & 0x200: parts.append("G")
+    if flags & 0x400: parts.append("T")
+    return "".join(parts) if parts else "—"
+
+
+def _elf_segment_flags_str(flags):
+    """Convert ELF segment flags to human-readable string."""
+    parts = []
+    if flags & 4: parts.append("R")
+    if flags & 2: parts.append("W")
+    if flags & 1: parts.append("X")
+    return "".join(parts) if parts else "—"
 
 
 # --- Main ---

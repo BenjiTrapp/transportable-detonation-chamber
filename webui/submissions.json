@@ -1,5 +1,53 @@
 [
   {
+    "id": "66187199fb12",
+    "timestamp": "2026-06-10T11:21:06.849116",
+    "filename": "npp.8.9.6.2.Installer.x64.exe",
+    "sha256": "7c243203265ce8fdac76c839bf744ae35dcf620760eb97c2ea279af498560e45",
+    "size": 6898288,
+    "target": "both",
+    "agent_status": "success",
+    "agent_pid": 20928,
+    "litterbox_status": "success",
+    "file_path": "C:\\Users\\vagrant\\Desktop\\infected\\npp.8.9.6.2.Installer.x64.exe"
+  },
+  {
+    "id": "8d17177fbadf",
+    "timestamp": "2026-06-10T11:18:16.974881",
+    "filename": "mimikatz.exe",
+    "sha256": "61c0810a23580cf492a6ba4f7654566108331e7a4134c968c2d6a05261b2d8a1",
+    "size": 1355264,
+    "target": "both",
+    "agent_status": "success",
+    "agent_pid": null,
+    "litterbox_status": "success",
+    "file_path": "C:\\Users\\vagrant\\Desktop\\infected\\mimikatz.exe"
+  },
+  {
+    "id": "fb3cf386bb11",
+    "timestamp": "2026-06-10T10:03:22.530395",
+    "filename": "mimikatz.exe",
+    "sha256": "61c0810a23580cf492a6ba4f7654566108331e7a4134c968c2d6a05261b2d8a1",
+    "size": 1355264,
+    "target": "litterbox",
+    "agent_status": null,
+    "agent_pid": null,
+    "litterbox_status": "success",
+    "file_path": "C:\\Users\\vagrant\\Desktop\\infected\\mimikatz.exe"
+  },
+  {
+    "id": "055d7221bf3c",
+    "timestamp": "2026-06-10T08:34:02.112603",
+    "filename": "Bytecode Viewer.jar",
+    "sha256": "dc5f6669409d7d0bbba40c735875a39960c1777f11bb13a1819bb12917808c5c",
+    "size": 58554098,
+    "target": "both",
+    "agent_status": "failed",
+    "agent_pid": null,
+    "litterbox_status": "failed",
+    "file_path": "C:\\Users\\vagrant\\Desktop\\infected\\Bytecode Viewer.jar"
+  },
+  {
     "id": "88f52877f8ed",
     "timestamp": "2026-06-09T16:44:30.886477",
     "filename": "tdc-logo.png",

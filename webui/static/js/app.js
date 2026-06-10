@@ -281,6 +281,7 @@ function renderDashboard() {
             <div class="service-card-actions">
                 <button class="btn btn-sm" onclick="event.stopPropagation(); openRustinelDetail()">Details</button>
                 <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('tracing')">Trace Console</button>
+                ${!rOnline ? '<button class="btn btn-sm btn-launch" onclick="event.stopPropagation(); launchService(\'rustinel\')">Launch</button>' : ''}
             </div>
         </div>
     `);
@@ -304,6 +305,7 @@ function renderDashboard() {
             <div class="service-card-actions">
                 <button class="btn btn-sm" onclick="event.stopPropagation(); openAgentDetail()">Details</button>
                 <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('submit')">Submit Sample</button>
+                ${!aOnline ? '<button class="btn btn-sm btn-launch" onclick="event.stopPropagation(); launchService(\'detonator_agent\')">Launch</button>' : ''}
             </div>
         </div>
     `);
@@ -326,6 +328,7 @@ function renderDashboard() {
             <div class="service-card-actions">
                 <button class="btn btn-sm" onclick="event.stopPropagation(); openLitterboxDetail()">Details</button>
                 <button class="btn btn-sm" onclick="event.stopPropagation(); window.open('http://localhost:1337', '_blank')">Open UI</button>
+                ${!lOnline ? '<button class="btn btn-sm btn-launch" onclick="event.stopPropagation(); launchService(\'litterbox\')">Launch</button>' : ''}
             </div>
         </div>
     `);
@@ -347,12 +350,13 @@ function renderDashboard() {
             </div>
             <div class="service-card-actions">
                 <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('sysmon'); refreshSysmon();">View Events</button>
+                ${!sOnline ? '<button class="btn btn-sm btn-launch" onclick="event.stopPropagation(); launchService(\'sysmon\')">Launch</button>' : ''}
             </div>
         </div>
     `);
 
     // Fibratus Card
-    const fOnline = status.fibratus?.online || rOnline; // assumes running if Rustinel is
+    const fOnline = status.fibratus?.online || false;
     cards.push(`
         <div class="service-card fibratus-card ${fOnline ? '' : 'offline'}">
             <div class="service-card-glow"></div>
@@ -366,6 +370,7 @@ function renderDashboard() {
                 <div class="service-metric"><div class="service-metric-value">Kernel</div><div class="service-metric-label">LEVEL</div></div>
                 <div class="service-metric"><div class="service-metric-value">v3.0</div><div class="service-metric-label">VERSION</div></div>
             </div>
+            ${!fOnline ? '<div class="service-card-actions"><button class="btn btn-sm btn-launch" onclick="event.stopPropagation(); launchService(\'fibratus\')">Launch</button></div>' : ''}
         </div>
     `);
 
@@ -1726,8 +1731,9 @@ function renderPeAnalysis(pe, container) {
         const entropyPct = Math.min(100, (sec.entropy / 8) * 100);
         const barColor = sec.entropy_status === 'high' ? '#ef4444' : sec.entropy_status === 'warn' ? '#fbbf24' : '#22c55e';
 
+        const secOffsetDec = sec.raw_offset_dec != null ? sec.raw_offset_dec : parseInt(sec.raw_offset, 16);
         html += `<tr class="${rowClass}" id="pe-sec-row-${idx}">
-            <td class="mono">${escapeHtml(sec.name)}${packer}${rwx}</td>
+            <td class="mono"><a class="section-link" href="#" onclick="peJumpToSection(${secOffsetDec}); return false;" title="View in Hex Editor">${escapeHtml(sec.name)}</a>${packer}${rwx}</td>
             <td class="mono">${sec.virtual_address}</td>
             <td>${formatSize(sec.virtual_size)}</td>
             <td>${formatSize(sec.raw_size)}</td>
@@ -1957,6 +1963,248 @@ function peJumpToSection(rawOffset) {
     if (editorBody) editorBody.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
+// --- ELF Analysis ---
+
+async function elfAnalyze() {
+    const filepath = state.hexFilePath || document.getElementById('hex-filepath').value.trim();
+    const panel = document.getElementById('elf-panel');
+    const body = document.getElementById('elf-panel-body');
+
+    // Hide PE panel if open
+    document.getElementById('pe-panel').style.display = 'none';
+
+    if (!filepath) {
+        panel.style.display = 'block';
+        body.innerHTML = '<div class="elf-error">No file loaded. Load a file in the hex editor first.</div>';
+        return;
+    }
+
+    panel.style.display = 'block';
+    body.innerHTML = '<div class="elf-loading"><div class="loading-spinner"></div><span>Parsing ELF binary...</span></div>';
+
+    try {
+        LoadingSpinner.start();
+        const resp = await fetch(`/api/file/elf?path=${encodeURIComponent(filepath)}`);
+        const data = await resp.json();
+        LoadingSpinner.stop();
+
+        if (data.error) {
+            body.innerHTML = `<div class="elf-error">${escapeHtml(data.error)}</div>`;
+            return;
+        }
+
+        renderElfAnalysis(data, body);
+    } catch (e) {
+        LoadingSpinner.stop();
+        body.innerHTML = `<div class="elf-error">Failed: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function renderElfAnalysis(elf, container) {
+    let html = '';
+
+    // --- IOC Flags Banner ---
+    if (elf.flags && elf.flags.length > 0) {
+        html += '<div class="elf-flags-banner">';
+        html += `<div class="elf-flags-header"><span class="elf-flags-icon">&#x26A0;</span> <strong>${elf.flags.length} IOC Flag${elf.flags.length > 1 ? 's' : ''} Detected</strong>`;
+        html += `<span class="elf-flag-counts">`;
+        if (elf.flag_count.high) html += `<span class="elf-flag-badge high">${elf.flag_count.high} HIGH</span>`;
+        if (elf.flag_count.medium) html += `<span class="elf-flag-badge med">${elf.flag_count.medium} MED</span>`;
+        if (elf.flag_count.low) html += `<span class="elf-flag-badge low">${elf.flag_count.low} LOW</span>`;
+        html += `</span></div>`;
+        html += '<div class="elf-flags-list">';
+        elf.flags.sort((a, b) => {
+            const order = {high: 0, medium: 1, low: 2};
+            return (order[a.severity] || 3) - (order[b.severity] || 3);
+        }).forEach(f => {
+            html += `<div class="elf-flag-item sev-${f.severity}"><span class="elf-flag-sev">${f.severity.toUpperCase()}</span><span class="elf-flag-detail">${escapeHtml(f.detail)}</span></div>`;
+        });
+        html += '</div></div>';
+    } else {
+        html += '<div class="elf-flags-banner clean"><span class="elf-flags-icon">&#x2705;</span> No IOC flags detected.</div>';
+    }
+
+    // --- Overview Grid ---
+    html += '<div class="elf-overview-grid">';
+
+    // ELF Identification card
+    const ident = elf.ident;
+    html += `<div class="elf-card">
+        <div class="elf-card-title">ELF IDENTIFICATION</div>
+        <div class="elf-field"><span class="elf-label">Class</span><span class="elf-value">${escapeHtml(ident.class)}</span></div>
+        <div class="elf-field"><span class="elf-label">Data</span><span class="elf-value">${escapeHtml(ident.data)}</span></div>
+        <div class="elf-field"><span class="elf-label">OS/ABI</span><span class="elf-value">${escapeHtml(ident.osabi)}</span></div>
+        <div class="elf-field"><span class="elf-label">File Size</span><span class="elf-value">${formatSize(elf.file_size)}</span></div>
+        <div class="elf-field"><span class="elf-label">Total Entropy</span><span class="elf-value ${elf.total_entropy >= 7.0 ? 'elf-bad' : elf.total_entropy >= 6.5 ? 'elf-warn' : ''}">${elf.total_entropy.toFixed(3)}</span></div>
+    </div>`;
+
+    // ELF Header card
+    const hdr = elf.header;
+    html += `<div class="elf-card">
+        <div class="elf-card-title">ELF HEADER</div>
+        <div class="elf-field"><span class="elf-label">Type</span><span class="elf-value">${escapeHtml(hdr.type)}</span></div>
+        <div class="elf-field"><span class="elf-label">Machine</span><span class="elf-value">${escapeHtml(hdr.machine)}</span></div>
+        <div class="elf-field"><span class="elf-label">Entry Point</span><span class="elf-value mono">${hdr.entry_point}</span></div>
+        <div class="elf-field"><span class="elf-label">Sections</span><span class="elf-value">${hdr.sh_count}</span></div>
+        <div class="elf-field"><span class="elf-label">Segments</span><span class="elf-value">${hdr.ph_count}</span></div>
+        <div class="elf-field"><span class="elf-label">Flags</span><span class="elf-value mono">${hdr.flags}</span></div>
+    </div>`;
+
+    // Security Features card
+    const sec = elf.security;
+    html += `<div class="elf-card">
+        <div class="elf-card-title">SECURITY FEATURES</div>
+        <div class="elf-field"><span class="elf-label">PIE (ASLR)</span><span class="elf-value ${sec.pie ? 'elf-ok' : 'elf-bad'}">${sec.pie ? 'Yes' : 'No'}</span></div>
+        <div class="elf-field"><span class="elf-label">NX (Stack)</span><span class="elf-value ${sec.nx ? 'elf-ok' : 'elf-bad'}">${sec.nx ? 'Enabled' : 'Disabled'}</span></div>
+        <div class="elf-field"><span class="elf-label">RELRO</span><span class="elf-value ${sec.relro === 'Full' ? 'elf-ok' : sec.relro === 'Partial' ? 'elf-warn' : 'elf-bad'}">${sec.relro}</span></div>
+        <div class="elf-field"><span class="elf-label">Stack Canary</span><span class="elf-value ${sec.stack_canary ? 'elf-ok' : 'elf-bad'}">${sec.stack_canary ? 'Yes' : 'No'}</span></div>
+        <div class="elf-field"><span class="elf-label">Fortify</span><span class="elf-value ${sec.fortify ? 'elf-ok' : 'elf-dim'}">${sec.fortify ? 'Yes' : 'No'}</span></div>
+        <div class="elf-field"><span class="elf-label">Stripped</span><span class="elf-value">${sec.stripped ? 'Yes' : 'No'}</span></div>
+    </div>`;
+
+    // Linking info card
+    html += `<div class="elf-card">
+        <div class="elf-card-title">LINKING</div>
+        <div class="elf-field"><span class="elf-label">Interpreter</span><span class="elf-value mono">${escapeHtml(elf.interpreter || 'None (static)')}</span></div>
+        <div class="elf-field"><span class="elf-label">SONAME</span><span class="elf-value">${escapeHtml(elf.soname || '—')}</span></div>
+        <div class="elf-field"><span class="elf-label">RPATH</span><span class="elf-value ${elf.rpath ? 'elf-warn' : ''}">${escapeHtml(elf.rpath || '—')}</span></div>
+        <div class="elf-field"><span class="elf-label">RUNPATH</span><span class="elf-value">${escapeHtml(elf.runpath || '—')}</span></div>
+        <div class="elf-field"><span class="elf-label">Libraries</span><span class="elf-value">${elf.needed_libraries ? elf.needed_libraries.length : 0}</span></div>
+        <div class="elf-field"><span class="elf-label">Imports</span><span class="elf-value">${elf.import_count || 0} symbols</span></div>
+    </div>`;
+
+    html += '</div>'; // end overview grid
+
+    // --- Needed Libraries ---
+    if (elf.needed_libraries && elf.needed_libraries.length > 0) {
+        html += '<div class="elf-section-block">';
+        html += '<div class="elf-card-title">NEEDED LIBRARIES</div>';
+        html += '<div class="elf-libs-list">';
+        elf.needed_libraries.forEach(lib => {
+            html += `<span class="elf-lib-badge">${escapeHtml(lib)}</span>`;
+        });
+        html += '</div></div>';
+    }
+
+    // --- Sections Table ---
+    if (elf.sections && elf.sections.length > 0) {
+        html += '<div class="elf-section-block">';
+        html += '<div class="elf-card-title">SECTIONS</div>';
+        html += '<table class="elf-table"><thead><tr><th>#</th><th>Name</th><th>Type</th><th>Address</th><th>Offset</th><th>Size</th><th>Flags</th><th>Entropy</th><th>Status</th></tr></thead><tbody>';
+        elf.sections.forEach(s => {
+            const rowClass = s.entropy_status === 'high' ? 'elf-row-high' : s.entropy_status === 'warn' ? 'elf-row-warn' : '';
+            const wxBadge = s.wx_warning ? ' <span class="elf-wx-badge">W+X</span>' : '';
+            const packerBadge = s.packer_indicator ? ` <span class="elf-packer-badge">${escapeHtml(s.packer_indicator)}</span>` : '';
+            const elfSecOffsetDec = s.offset_dec != null ? s.offset_dec : parseInt(s.offset, 16);
+            const nameHtml = s.name && s.size > 0
+                ? `<a class="section-link" href="#" onclick="elfJumpToSection(${elfSecOffsetDec}); return false;" title="View in Hex Editor">${escapeHtml(s.name)}</a>`
+                : (escapeHtml(s.name) || '<em>null</em>');
+            html += `<tr class="${rowClass}">
+                <td>${s.index}</td>
+                <td class="mono">${nameHtml}${wxBadge}${packerBadge}</td>
+                <td>${escapeHtml(s.type)}</td>
+                <td class="mono">${s.address}</td>
+                <td class="mono">${s.offset}</td>
+                <td>${formatSize(s.size)}</td>
+                <td class="mono">${s.flags_str}</td>
+                <td><div class="elf-entropy-bar"><div class="elf-entropy-fill ${s.entropy_status}" style="width:${(s.entropy / 8 * 100).toFixed(1)}%"></div><span class="elf-entropy-val">${s.entropy.toFixed(2)}</span></div></td>
+                <td><span class="elf-status-badge ${s.entropy_status}">${s.entropy_status}</span></td>
+            </tr>`;
+        });
+        html += '</tbody></table></div>';
+    }
+
+    // --- Segments Table ---
+    if (elf.segments && elf.segments.length > 0) {
+        html += '<div class="elf-section-block">';
+        html += '<div class="elf-card-title">PROGRAM HEADERS (SEGMENTS)</div>';
+        html += '<table class="elf-table"><thead><tr><th>#</th><th>Type</th><th>Offset</th><th>VAddr</th><th>FileSz</th><th>MemSz</th><th>Flags</th><th>Note</th></tr></thead><tbody>';
+        elf.segments.forEach(seg => {
+            const noteHtml = seg.security_note ? `<span class="elf-seg-note">${escapeHtml(seg.security_note)}</span>` :
+                             seg.interpreter ? `<span class="elf-seg-note mono">${escapeHtml(seg.interpreter)}</span>` : '';
+            html += `<tr>
+                <td>${seg.index}</td>
+                <td class="mono">${escapeHtml(seg.type)}</td>
+                <td class="mono">${seg.offset}</td>
+                <td class="mono">${seg.vaddr}</td>
+                <td>${formatSize(seg.filesz)}</td>
+                <td>${formatSize(seg.memsz)}</td>
+                <td class="mono">${seg.flags_str}</td>
+                <td>${noteHtml}</td>
+            </tr>`;
+        });
+        html += '</tbody></table></div>';
+    }
+
+    // --- Suspicious Imports ---
+    if (elf.suspicious_imports && Object.keys(elf.suspicious_imports).length > 0) {
+        html += '<div class="elf-section-block">';
+        html += '<div class="elf-card-title elf-suspicious-title">SUSPICIOUS IMPORTS</div>';
+        html += '<div class="elf-suspicious-grid">';
+        for (const [category, symbols] of Object.entries(elf.suspicious_imports)) {
+            const catLabel = category.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+            html += `<div class="elf-suspicious-card">
+                <div class="elf-suspicious-cat">${escapeHtml(catLabel)}</div>
+                <div class="elf-suspicious-syms">${symbols.map(s => `<code>${escapeHtml(s)}</code>`).join(', ')}</div>
+            </div>`;
+        }
+        html += '</div></div>';
+    }
+
+    // --- Imported Symbols (collapsible) ---
+    if (elf.imported_symbols && elf.imported_symbols.length > 0) {
+        html += '<div class="elf-section-block">';
+        html += `<div class="elf-card-title elf-collapsible" onclick="elfToggleSection(this)">IMPORTED SYMBOLS (${elf.import_count}) &#x25B6;</div>`;
+        html += '<div class="elf-collapse-body" style="display:none;">';
+        html += '<table class="elf-table elf-sym-table"><thead><tr><th>Name</th><th>Bind</th><th>Type</th></tr></thead><tbody>';
+        elf.imported_symbols.forEach(sym => {
+            html += `<tr><td class="mono">${escapeHtml(sym.name)}</td><td>${sym.bind}</td><td>${sym.type}</td></tr>`;
+        });
+        if (elf.import_count > elf.imported_symbols.length) {
+            html += `<tr><td colspan="3" class="muted">... and ${elf.import_count - elf.imported_symbols.length} more</td></tr>`;
+        }
+        html += '</tbody></table></div></div>';
+    }
+
+    // --- Exported Symbols (collapsible) ---
+    if (elf.exported_symbols && elf.exported_symbols.length > 0) {
+        html += '<div class="elf-section-block">';
+        html += `<div class="elf-card-title elf-collapsible" onclick="elfToggleSection(this)">EXPORTED SYMBOLS (${elf.export_count}) &#x25B6;</div>`;
+        html += '<div class="elf-collapse-body" style="display:none;">';
+        html += '<table class="elf-table elf-sym-table"><thead><tr><th>Name</th><th>Bind</th><th>Type</th><th>Value</th><th>Size</th></tr></thead><tbody>';
+        elf.exported_symbols.forEach(sym => {
+            html += `<tr><td class="mono">${escapeHtml(sym.name)}</td><td>${sym.bind}</td><td>${sym.type}</td><td class="mono">${sym.value}</td><td>${sym.size}</td></tr>`;
+        });
+        if (elf.export_count > elf.exported_symbols.length) {
+            html += `<tr><td colspan="5" class="muted">... and ${elf.export_count - elf.exported_symbols.length} more</td></tr>`;
+        }
+        html += '</tbody></table></div></div>';
+    }
+
+    container.innerHTML = html;
+}
+
+function elfToggleSection(el) {
+    const body = el.nextElementSibling;
+    if (body.style.display === 'none') {
+        body.style.display = 'block';
+        el.innerHTML = el.innerHTML.replace('\u25B6', '\u25BC');
+    } else {
+        body.style.display = 'none';
+        el.innerHTML = el.innerHTML.replace('\u25BC', '\u25B6');
+    }
+}
+
+function elfJumpToSection(rawOffset) {
+    // Load section in hex editor at this offset
+    document.getElementById('hex-offset').value = rawOffset;
+    state.hexOffset = rawOffset;
+    hexLoad();
+    // Scroll to hex editor body
+    const editorBody = document.querySelector('.hex-editor-body');
+    if (editorBody) editorBody.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
 // --- Detail Panels for Dashboard Services ---
 async function openAgentDetail() {
     pushDetailHistory('agent', 0);
@@ -1985,9 +2233,269 @@ async function openLitterboxDetail() {
     let html = `<div class="detail-fields">
         <div class="detail-field"><span class="field-label">Status</span><span class="field-value" style="color:${online ? 'var(--accent-green)' : 'var(--accent-red)'}">${online ? 'Running' : 'Stopped'}</span></div>
         <div class="detail-field"><span class="field-label">Port</span><span class="field-value">1337</span></div>
-        <div class="detail-field"><span class="field-label">Install Dir</span><span class="field-value mono">C:\\LitterBox</span></div>
+        <div class="detail-field"><span class="field-label">URL</span><span class="field-value"><a href="http://localhost:1337" target="_blank" style="color:var(--accent-cyan)">http://localhost:1337</a></span></div>
     </div>`;
+
+    // Fetch recent analyses from LitterBox
+    if (online) {
+        try {
+            const resp = await fetch('/api/litterbox/analyses?status=completed');
+            if (resp.ok) {
+                const analyses = await resp.json();
+                const items = Array.isArray(analyses) ? analyses : (analyses.analyses || analyses.results || []);
+                if (items.length > 0) {
+                    html += `<div class="detail-section"><div class="detail-section-title">RECENT ANALYSES (${items.length})</div>`;
+                    html += '<div class="lb-analyses-list">';
+                    items.slice(0, 20).forEach(a => {
+                        const hash = a.sha256 || a.hash || a.id || '';
+                        const filename = a.filename || a.name || hash.substring(0, 12) + '...';
+                        const score = a.score !== undefined ? a.score : '--';
+                        const status = a.status || 'completed';
+                        const scoreClass = score >= 7 ? 'high' : score >= 4 ? 'med' : 'low';
+                        const ts = a.timestamp || a.created_at || '';
+                        const timeStr = ts ? new Date(ts).toLocaleString('en-GB', {hour12:false, day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit'}) : '--';
+                        html += `<div class="lb-analysis-entry" onclick="viewLitterboxResult('${escapeHtml(hash)}')">
+                            <div class="lb-entry-main">
+                                <span class="lb-entry-name" title="${escapeHtml(hash)}">${escapeHtml(filename)}</span>
+                                <span class="lb-entry-time">${timeStr}</span>
+                            </div>
+                            <div class="lb-entry-meta">
+                                <span class="lb-entry-score ${scoreClass}">${score}</span>
+                                <span class="lb-entry-hash mono">${hash.substring(0, 16)}...</span>
+                                <span class="lb-entry-status">${status}</span>
+                            </div>
+                        </div>`;
+                    });
+                    html += '</div></div>';
+                } else {
+                    html += '<div class="detail-section"><div class="detail-section-title">RECENT ANALYSES</div><div class="muted" style="padding:8px;font-size:11px;">No completed analyses found.</div></div>';
+                }
+            }
+        } catch (e) {
+            html += `<div class="detail-section"><div class="muted" style="padding:8px;font-size:11px;">Could not fetch analyses: ${escapeHtml(e.message)}</div></div>`;
+        }
+    } else {
+        html += '<div class="detail-section"><div class="muted" style="padding:12px;font-size:11px;">LitterBox is offline. Start the service to view analyses.</div></div>';
+    }
+
     setDetailBody(html);
+}
+
+async function viewLitterboxResult(hash) {
+    pushDetailHistory('litterbox-result', hash);
+    setDetailHeader('Analysis', 'background:rgba(167,139,250,0.15);color:var(--accent-purple)', 'LitterBox Result', hash.substring(0, 12) + '...');
+    setDetailBody('<div class="muted">Fetching analysis results...</div>');
+    showDetail();
+
+    let html = '';
+
+    // Fetch static results
+    let staticData = null;
+    try {
+        const resp = await fetch(`/api/litterbox/results/static/${encodeURIComponent(hash)}`);
+        if (resp.ok) staticData = await resp.json();
+    } catch (e) {}
+
+    // Fetch dynamic results
+    let dynamicData = null;
+    try {
+        const resp = await fetch(`/api/litterbox/results/dynamic/${encodeURIComponent(hash)}`);
+        if (resp.ok) dynamicData = await resp.json();
+    } catch (e) {}
+
+    // Fetch file info
+    let fileInfo = null;
+    try {
+        const resp = await fetch(`/api/litterbox/results/info/${encodeURIComponent(hash)}`);
+        if (resp.ok) fileInfo = await resp.json();
+    } catch (e) {}
+
+    // File info section
+    if (fileInfo) {
+        html += `<div class="detail-fields">`;
+        if (fileInfo.filename || fileInfo.name) html += `<div class="detail-field"><span class="field-label">Filename</span><span class="field-value">${escapeHtml(fileInfo.filename || fileInfo.name)}</span></div>`;
+        if (fileInfo.sha256) html += `<div class="detail-field"><span class="field-label">SHA-256</span><span class="field-value mono" style="font-size:10px;word-break:break-all">${escapeHtml(fileInfo.sha256)}</span></div>`;
+        if (fileInfo.md5) html += `<div class="detail-field"><span class="field-label">MD5</span><span class="field-value mono" style="font-size:10px">${escapeHtml(fileInfo.md5)}</span></div>`;
+        if (fileInfo.size !== undefined) html += `<div class="detail-field"><span class="field-label">Size</span><span class="field-value">${formatSize(fileInfo.size)}</span></div>`;
+        if (fileInfo.file_type || fileInfo.type) html += `<div class="detail-field"><span class="field-label">Type</span><span class="field-value">${escapeHtml(fileInfo.file_type || fileInfo.type)}</span></div>`;
+        if (fileInfo.score !== undefined) html += `<div class="detail-field"><span class="field-label">Score</span><span class="field-value" style="color:${fileInfo.score >= 7 ? 'var(--accent-red)' : fileInfo.score >= 4 ? '#fbbf24' : 'var(--accent-green)'};font-weight:700">${fileInfo.score}/10</span></div>`;
+        html += `</div>`;
+    } else {
+        html += `<div class="detail-fields"><div class="detail-field"><span class="field-label">Hash</span><span class="field-value mono" style="font-size:10px;word-break:break-all">${escapeHtml(hash)}</span></div></div>`;
+    }
+
+    // Static analysis results
+    html += '<div class="detail-section"><div class="detail-section-title">STATIC ANALYSIS</div>';
+    if (staticData && !staticData.error) {
+        html += '<div class="lb-result-content">';
+        html += renderLbStaticResults(staticData);
+        html += '</div>';
+    } else {
+        html += `<div class="muted" style="padding:8px;font-size:11px;">${staticData?.error ? escapeHtml(staticData.error) : 'No static analysis results available.'}</div>`;
+    }
+    html += '</div>';
+
+    // Dynamic analysis results
+    html += '<div class="detail-section"><div class="detail-section-title">DYNAMIC ANALYSIS</div>';
+    if (dynamicData && !dynamicData.error) {
+        html += '<div class="lb-result-content">';
+        html += renderLbDynamicResults(dynamicData);
+        html += '</div>';
+    } else {
+        html += `<div class="muted" style="padding:8px;font-size:11px;">${dynamicData?.error ? escapeHtml(dynamicData.error) : 'No dynamic analysis results available.'}</div>`;
+    }
+    html += '</div>';
+
+    // Link to LitterBox UI
+    html += `<div style="margin-top:12px;"><a href="http://localhost:1337" target="_blank" class="btn btn-sm" style="color:var(--accent-purple);border-color:rgba(167,139,250,0.3);">Open in LitterBox UI</a></div>`;
+
+    setDetailBody(html);
+}
+
+function renderLbStaticResults(data) {
+    let html = '';
+
+    // YARA matches
+    const yara = data.yara_results || data.yara || data.yara_matches;
+    if (yara) {
+        const matches = Array.isArray(yara) ? yara : (yara.matches || yara.rules || []);
+        if (matches.length > 0) {
+            html += `<div class="lb-subsection"><div class="lb-sub-title">YARA Matches (${matches.length})</div><div class="lb-tag-list">`;
+            matches.forEach(m => {
+                const name = typeof m === 'string' ? m : (m.rule || m.name || JSON.stringify(m));
+                html += `<span class="lb-yara-tag">${escapeHtml(name)}</span>`;
+            });
+            html += '</div></div>';
+        }
+    }
+
+    // CheckPlz results
+    const checkplz = data.checkplz_results || data.checkplz;
+    if (checkplz) {
+        html += '<div class="lb-subsection"><div class="lb-sub-title">CheckPlz</div>';
+        if (typeof checkplz === 'object') {
+            const detections = checkplz.detections || checkplz.results || [];
+            if (Array.isArray(detections) && detections.length > 0) {
+                html += '<div class="lb-tag-list">';
+                detections.forEach(d => {
+                    const label = typeof d === 'string' ? d : (d.name || d.rule || JSON.stringify(d));
+                    html += `<span class="lb-detection-tag">${escapeHtml(label)}</span>`;
+                });
+                html += '</div>';
+            } else {
+                html += `<pre class="lb-raw">${escapeHtml(JSON.stringify(checkplz, null, 2)).substring(0, 1500)}</pre>`;
+            }
+        } else {
+            html += `<pre class="lb-raw">${escapeHtml(String(checkplz)).substring(0, 1500)}</pre>`;
+        }
+        html += '</div>';
+    }
+
+    // Strings / Stringnalyzer
+    const strings = data.stringnalyzer_results || data.strings || data.stringnalyzer;
+    if (strings) {
+        html += '<div class="lb-subsection"><div class="lb-sub-title">Strings Analysis</div>';
+        if (typeof strings === 'object') {
+            const suspicious = strings.suspicious || strings.suspicious_strings || [];
+            const count = strings.count || strings.total || (Array.isArray(suspicious) ? suspicious.length : 0);
+            html += `<div class="lb-meta">Suspicious strings: <strong>${count}</strong></div>`;
+            if (Array.isArray(suspicious) && suspicious.length > 0) {
+                html += '<div class="lb-strings-list">';
+                suspicious.slice(0, 30).forEach(s => {
+                    const val = typeof s === 'string' ? s : (s.value || s.string || JSON.stringify(s));
+                    html += `<div class="lb-string-entry mono">${escapeHtml(val)}</div>`;
+                });
+                if (suspicious.length > 30) html += `<div class="lb-string-entry muted">... and ${suspicious.length - 30} more</div>`;
+                html += '</div>';
+            }
+        } else {
+            html += `<pre class="lb-raw">${escapeHtml(String(strings)).substring(0, 1500)}</pre>`;
+        }
+        html += '</div>';
+    }
+
+    // Fallback: raw data if nothing matched above
+    if (!yara && !checkplz && !strings) {
+        html += `<pre class="lb-raw">${escapeHtml(JSON.stringify(data, null, 2)).substring(0, 3000)}</pre>`;
+    }
+
+    return html;
+}
+
+function renderLbDynamicResults(data) {
+    let html = '';
+
+    // PE-Sieve
+    const peSieve = data.pe_sieve || data.pe_sieve_results;
+    if (peSieve) {
+        html += '<div class="lb-subsection"><div class="lb-sub-title">PE-Sieve</div>';
+        if (typeof peSieve === 'object') {
+            const suspicious = peSieve.suspicious || peSieve.total_suspicious || 0;
+            const replaced = peSieve.replaced || peSieve.total_replaced || 0;
+            const implanted = peSieve.implanted || 0;
+            html += `<div class="lb-dynamic-stats">`;
+            html += `<span class="lb-stat ${suspicious > 0 ? 'warn' : 'ok'}">Suspicious: ${suspicious}</span>`;
+            html += `<span class="lb-stat ${replaced > 0 ? 'bad' : 'ok'}">Replaced: ${replaced}</span>`;
+            html += `<span class="lb-stat ${implanted > 0 ? 'bad' : 'ok'}">Implanted: ${implanted}</span>`;
+            html += `</div>`;
+            if (peSieve.details || peSieve.modules) {
+                html += `<details class="lb-raw-details"><summary>Raw output</summary><pre class="lb-raw">${escapeHtml(JSON.stringify(peSieve.details || peSieve.modules, null, 2)).substring(0, 2000)}</pre></details>`;
+            }
+        } else {
+            html += `<pre class="lb-raw">${escapeHtml(String(peSieve)).substring(0, 1500)}</pre>`;
+        }
+        html += '</div>';
+    }
+
+    // Moneta
+    const moneta = data.moneta || data.moneta_results;
+    if (moneta) {
+        html += '<div class="lb-subsection"><div class="lb-sub-title">Moneta</div>';
+        if (typeof moneta === 'object') {
+            const iocs = moneta.ioc_count || moneta.iocs || moneta.findings || 0;
+            const iocCount = typeof iocs === 'number' ? iocs : (Array.isArray(iocs) ? iocs.length : 0);
+            html += `<div class="lb-dynamic-stats"><span class="lb-stat ${iocCount > 0 ? 'bad' : 'ok'}">IOCs: ${iocCount}</span></div>`;
+            if (Array.isArray(iocs) && iocs.length > 0) {
+                html += '<div class="lb-tag-list">';
+                iocs.slice(0, 20).forEach(ioc => {
+                    const label = typeof ioc === 'string' ? ioc : (ioc.description || ioc.type || JSON.stringify(ioc));
+                    html += `<span class="lb-detection-tag">${escapeHtml(label)}</span>`;
+                });
+                html += '</div>';
+            }
+        } else {
+            html += `<pre class="lb-raw">${escapeHtml(String(moneta)).substring(0, 1500)}</pre>`;
+        }
+        html += '</div>';
+    }
+
+    // HollowsHunter
+    const hollows = data.hollows_hunter || data.hollows_hunter_results;
+    if (hollows) {
+        html += '<div class="lb-subsection"><div class="lb-sub-title">HollowsHunter</div>';
+        if (typeof hollows === 'object') {
+            const suspicious = hollows.suspicious || hollows.total_suspicious || 0;
+            html += `<div class="lb-dynamic-stats"><span class="lb-stat ${suspicious > 0 ? 'bad' : 'ok'}">Suspicious: ${suspicious}</span></div>`;
+        } else {
+            html += `<pre class="lb-raw">${escapeHtml(String(hollows)).substring(0, 1500)}</pre>`;
+        }
+        html += '</div>';
+    }
+
+    // RedEdr
+    const rededr = data.rededr || data.rededr_results;
+    if (rededr) {
+        html += '<div class="lb-subsection"><div class="lb-sub-title">RedEdr</div>';
+        html += `<pre class="lb-raw">${escapeHtml(typeof rededr === 'object' ? JSON.stringify(rededr, null, 2) : String(rededr)).substring(0, 2000)}</pre>`;
+        html += '</div>';
+    }
+
+    // Fallback
+    if (!peSieve && !moneta && !hollows && !rededr) {
+        html += `<pre class="lb-raw">${escapeHtml(JSON.stringify(data, null, 2)).substring(0, 3000)}</pre>`;
+    }
+
+    return html;
 }
 
 async function openRustinelDetail() {
@@ -2313,7 +2821,7 @@ function updateServiceStatus(status) {
     setStatus('status-sysmon', status.sysmon?.online);
     setStatus('status-agent', status.detonator_agent?.online);
     setStatus('status-litterbox', status.litterbox?.online);
-    setStatus('status-fibratus', status.rustinel?.online);
+    setStatus('status-fibratus', status.fibratus?.online);
 }
 
 function setStatus(elementId, online) {
@@ -2321,6 +2829,51 @@ function setStatus(elementId, online) {
     if (el) {
         el.classList.toggle('online', !!online);
         el.classList.toggle('offline', !online);
+    }
+}
+
+async function launchService(serviceName) {
+    const btn = event.currentTarget;
+    const originalText = btn.textContent;
+    btn.textContent = 'Starting...';
+    btn.disabled = true;
+    btn.classList.add('launching');
+
+    try {
+        const resp = await fetch('/api/service/launch', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({service: serviceName}),
+        });
+        const data = await resp.json();
+
+        if (data.success) {
+            btn.textContent = 'Launched';
+            btn.classList.remove('launching');
+            btn.classList.add('launched');
+            // Refresh status after a brief delay to let service start
+            setTimeout(() => refreshDashboard(), 3000);
+        } else {
+            btn.textContent = 'Failed';
+            btn.classList.remove('launching');
+            btn.classList.add('launch-failed');
+            console.error('Launch failed:', data.error);
+            setTimeout(() => {
+                btn.textContent = originalText;
+                btn.disabled = false;
+                btn.classList.remove('launch-failed');
+            }, 3000);
+        }
+    } catch (e) {
+        btn.textContent = 'Error';
+        btn.classList.remove('launching');
+        btn.classList.add('launch-failed');
+        console.error('Launch error:', e);
+        setTimeout(() => {
+            btn.textContent = originalText;
+            btn.disabled = false;
+            btn.classList.remove('launch-failed');
+        }, 3000);
     }
 }
 
@@ -2533,13 +3086,13 @@ function renderDetonationResults(data, container) {
 
     // Start polling for results
     if (sha256 || pid || lbHash) {
-        pollDetonationResults(sha256, pid, lbHash, 0);
+        pollDetonationResults(sha256, pid, lbHash, filename, 0);
     }
 }
 
 let _detonationPollTimer = null;
 
-function pollDetonationResults(sha256, pid, lbHash, attempt) {
+function pollDetonationResults(sha256, pid, lbHash, filename, attempt) {
     if (_detonationPollTimer) clearTimeout(_detonationPollTimer);
     const maxAttempts = 30; // Poll for up to ~2.5 minutes
     if (attempt >= maxAttempts) {
@@ -2552,6 +3105,7 @@ function pollDetonationResults(sha256, pid, lbHash, attempt) {
     if (sha256) params.set('sha256', sha256);
     if (pid) params.set('pid', pid);
     if (lbHash) params.set('litterbox_hash', lbHash);
+    if (filename) params.set('filename', filename);
 
     fetch(`/api/detonation/results?${params}`)
         .then(r => r.json())
@@ -2564,14 +3118,24 @@ function pollDetonationResults(sha256, pid, lbHash, attempt) {
                 fStage.querySelector('.det-stage-icon').innerHTML = '&#x2705;';
                 fStage.querySelector('.det-stage-detail').textContent = `${data.fibratus_alert_count} alert(s) detected`;
             }
-            // Keep polling if not all results are ready
-            const allReady = data.ready && data.ready.static !== false && data.ready.dynamic !== false;
-            if (!allReady || attempt < 5) {
-                _detonationPollTimer = setTimeout(() => pollDetonationResults(sha256, pid, lbHash, attempt + 1), 5000);
+            // Keep polling until all results are ready (static + dynamic + fibratus)
+            // Minimum 8 attempts (~40s) to allow EDR rules to fire and alert_loader to pick them up
+            const staticReady = data.ready && data.ready.static !== false;
+            const dynamicReady = data.ready && data.ready.dynamic !== false;
+            const fibratusReady = data.ready && data.ready.fibratus;
+            const allReady = staticReady && dynamicReady && fibratusReady;
+            if (!allReady || attempt < 8) {
+                _detonationPollTimer = setTimeout(() => pollDetonationResults(sha256, pid, lbHash, filename, attempt + 1), 5000);
+            } else {
+                // Final update: show polling complete message
+                const panels = document.getElementById('det-results-panels');
+                if (panels && !panels.querySelector('.det-poll-done')) {
+                    panels.insertAdjacentHTML('beforeend', '<div class="det-poll-done">Polling complete. All results collected.</div>');
+                }
             }
         })
         .catch(() => {
-            _detonationPollTimer = setTimeout(() => pollDetonationResults(sha256, pid, lbHash, attempt + 1), 5000);
+            _detonationPollTimer = setTimeout(() => pollDetonationResults(sha256, pid, lbHash, filename, attempt + 1), 5000);
         });
 }
 
@@ -2587,13 +3151,16 @@ function renderDetonationPanels(data) {
             <div class="det-panel-title">FIBRATUS / RUSTINEL ALERTS (${data.fibratus_alert_count})</div>
             <div class="det-alerts-list">`;
         data.fibratus_alerts.slice(0, 20).forEach(alert => {
-            const sev = (alert.severity || alert.rule?.level || 'unknown').toLowerCase();
-            const ruleName = alert.rule_name || alert.rule?.name || 'Unknown Rule';
-            const procName = alert.process?.name || '';
+            const sev = (alert.severity || 'unknown').toLowerCase();
+            const ruleName = alert.rule_name || 'Unknown Rule';
+            const procName = alert.process_name || '';
+            const engine = alert.engine || '';
+            const pid = alert.pid || '';
             html += `<div class="det-alert-item sev-${sev}">
                 <span class="det-alert-sev">${sev.toUpperCase()}</span>
                 <span class="det-alert-rule">${escapeHtml(ruleName)}</span>
-                <span class="det-alert-proc">${escapeHtml(procName)}</span>
+                <span class="det-alert-proc">${escapeHtml(procName)}${pid ? ' (PID:' + pid + ')' : ''}</span>
+                ${engine ? '<span class="det-alert-engine">' + escapeHtml(engine) + '</span>' : ''}
             </div>`;
         });
         html += `</div></div>`;
@@ -2757,9 +3324,14 @@ async function refreshSubmissions() {
                 : '';
             const pid = sub.agent_pid ? `<span class="badge badge-dim">PID ${sub.agent_pid}</span>` : '';
             const shortHash = sub.sha256 ? sub.sha256.substring(0, 12) + '...' : '--';
-            const actions = sub.file_path
+            let actions = sub.file_path
                 ? `<button class="btn btn-xs" onclick="hexOpenFile('${escapeHtml(sub.file_path.replace(/\\/g, '\\\\'))}')" title="Open in Hex Editor">Hex</button>`
                 : '';
+            // Add LitterBox results button if submission went to LitterBox
+            const lbHash = sub.litterbox_hash || sub.sha256;
+            if (lbHash && (sub.target === 'litterbox' || sub.target === 'both' || sub.litterbox_status === 'success')) {
+                actions += ` <button class="btn btn-xs btn-lb-results" onclick="viewLitterboxResult('${escapeHtml(lbHash)}')" title="View LitterBox scan results">Results</button>`;
+            }
 
             html += `<tr>`;
             html += `<td class="td-time">${ts}</td>`;
@@ -2902,7 +3474,10 @@ function buildGraph(processes, networkEvents, dnsEvents, injectEvents, networkAl
     const includePids = new Set([...alertPids, ...sysmonPids]);
     for (const pid of [...alertPids]) {
         const proc = processes[pid];
-        if (proc?.parent_pid && processes[proc.parent_pid]) includePids.add(String(proc.parent_pid));
+        if (proc?.parent_pid != null) {
+            const ppidStr = String(proc.parent_pid);
+            if (processes[ppidStr]) includePids.add(ppidStr);
+        }
         (proc?.children || []).forEach(c => includePids.add(String(c)));
     }
 
@@ -2924,7 +3499,10 @@ function buildGraph(processes, networkEvents, dnsEvents, injectEvents, networkAl
         const expandedPids = new Set(matchedPids);
         for (const pid of matchedPids) {
             const proc = processes[pid];
-            if (proc?.parent_pid && processes[proc.parent_pid]) expandedPids.add(String(proc.parent_pid));
+            if (proc?.parent_pid != null) {
+                const ppidStr = String(proc.parent_pid);
+                if (processes[ppidStr]) expandedPids.add(ppidStr);
+            }
             (proc?.children || []).forEach(c => { if (includePids.has(String(c))) expandedPids.add(String(c)); });
         }
         // Replace includePids with search-filtered set
@@ -2943,7 +3521,10 @@ function buildGraph(processes, networkEvents, dnsEvents, injectEvents, networkAl
         const expandedDet = new Set(detonatedPids);
         for (const pid of detonatedPids) {
             const proc = processes[pid];
-            if (proc?.parent_pid && processes[proc.parent_pid]) expandedDet.add(String(proc.parent_pid));
+            if (proc?.parent_pid != null) {
+                const ppidStr = String(proc.parent_pid);
+                if (processes[ppidStr]) expandedDet.add(ppidStr);
+            }
             (proc?.children || []).forEach(c => { if (includePids.has(String(c))) expandedDet.add(String(c)); });
         }
         includePids.clear();
@@ -2980,9 +3561,10 @@ function buildGraph(processes, networkEvents, dnsEvents, injectEvents, networkAl
 
     // 2. Create parent-child edges
     for (const node of nodes) {
-        if (node.parentPid && nodeMap[node.parentPid]) {
+        const ppid = node.parentPid != null ? String(node.parentPid) : null;
+        if (ppid && nodeMap[ppid]) {
             edges.push({
-                source: `proc_${node.parentPid}`,
+                source: `proc_${ppid}`,
                 target: node.id,
                 type: 'spawn',
                 label: 'spawned',
@@ -3541,6 +4123,23 @@ function renderGraph() {
     const { nodes, edges, camera } = graphState;
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Empty state message
+    if (nodes.length === 0) {
+        ctx.save();
+        ctx.fillStyle = '#64748b';
+        ctx.font = '14px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        const showDetonatedOnly = document.getElementById('graph-filter-detonated')?.checked;
+        const msg = showDetonatedOnly
+            ? 'No detonated processes found. Submit a sample to see detonation activity.'
+            : 'No process data available.';
+        ctx.fillText(msg, canvas.width / 2, canvas.height / 2);
+        ctx.restore();
+        return;
+    }
+
     ctx.save();
     ctx.translate(camera.x, camera.y);
     ctx.scale(camera.zoom, camera.zoom);
@@ -3620,6 +4219,11 @@ function renderGraph() {
             else if (node.severity === 'medium') color = '#eab308';
         }
 
+        // Override color for detonated processes (gold)
+        if (node.detonated) {
+            color = '#fbbf24';
+        }
+
         const r = node.radius * (isHovered ? 1.2 : 1);
 
         // Glow for malicious
@@ -3627,6 +4231,14 @@ function renderGraph() {
             ctx.beginPath();
             ctx.arc(node.x, node.y, r + 4, 0, Math.PI * 2);
             ctx.fillStyle = color + '20';
+            ctx.fill();
+        }
+
+        // Glow for detonated
+        if (node.detonated) {
+            ctx.beginPath();
+            ctx.arc(node.x, node.y, r + 5, 0, Math.PI * 2);
+            ctx.fillStyle = '#fbbf2425';
             ctx.fill();
         }
 

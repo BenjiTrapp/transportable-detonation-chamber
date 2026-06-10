@@ -62,6 +62,11 @@ Vagrant.configure("2") do |config|
     path: "scripts/install-prerequisites.ps1",
     privileged: true
 
+  config.vm.provision "brave",
+    type: "shell",
+    path: "scripts/install-brave.ps1",
+    privileged: true
+
   config.vm.provision "fibratus",
     type: "shell",
     path: "scripts/install-fibratus.ps1",

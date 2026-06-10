@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Detonation Chamber</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=10">
+    <link rel="stylesheet" href="/static/css/style.css?v=11">
 </head>
 <body>
     <!-- Global loading overlay (shown on slow fetches) -->
@@ -366,6 +366,7 @@
                     <h2>Hex Editor</h2>
                     <div class="header-actions">
                         <button class="btn btn-sm btn-accent" id="pe-analyze-btn" onclick="peAnalyze()" title="Parse PE header">PE Analysis</button>
+                        <button class="btn btn-sm btn-accent" id="elf-analyze-btn" onclick="elfAnalyze()" title="Parse ELF header">ELF Analysis</button>
                         <input type="number" id="hex-offset" class="filter-input hex-offset-input" placeholder="Offset" value="0" min="0">
                         <select id="hex-bytes-per-page" class="filter-select">
                             <option value="256">256 bytes</option>
@@ -437,6 +438,16 @@
                     </div>
                     <div class="pe-panel-body" id="pe-panel-body">
                         <div class="pe-empty">Load a PE file and click "PE Analysis" to inspect headers.</div>
+                    </div>
+                </div>
+                <!-- ELF Analysis Panel -->
+                <div class="elf-panel" id="elf-panel" style="display:none;">
+                    <div class="elf-panel-header">
+                        <h3>ELF Binary Analysis</h3>
+                        <button class="btn btn-sm btn-close" onclick="document.getElementById('elf-panel').style.display='none'">&#x2715;</button>
+                    </div>
+                    <div class="elf-panel-body" id="elf-panel-body">
+                        <div class="elf-empty">Load an ELF binary and click "ELF Analysis" to inspect headers, segments, symbols, and security features.</div>
                     </div>
                 </div>
             </div>
@@ -755,6 +766,6 @@ C:\Users\vagrant\Desktop\infected\  Malware samples (Defender-excluded)</pre>
         </div>
     </div>
 
-    <script src="/static/js/app.js?v=8"></script>
+    <script src="/static/js/app.js?v=9"></script>
 </body>
 </html>

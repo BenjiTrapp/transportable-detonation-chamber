@@ -77,7 +77,7 @@ A single-page dark-themed interface that aggregates telemetry from all engines:
 | **Graph** | Process relationship graph with 5 layouts (Force/Hierarchical/Radial/Circular/Grid), zoom, search |
 | **Sysmon** | Windows Sysmon event log viewer (process, network, file, registry, DNS events) |
 | **Scanner** | ThreatCheck + DefenderCheck integration (Defender/AMSI engines), scan history |
-| **Hex Editor** | Binary viewer with data inspector, drag-and-drop upload, PE Analysis button |
+| **Hex Editor** | Binary viewer with data inspector, drag-and-drop upload, PE/ELF Analysis buttons |
 | **Submit** | Multi-target detonation (DetonatorAgent + LitterBox), stage-by-stage progress |
 
 ### Detection Engines
@@ -92,10 +92,12 @@ A single-page dark-themed interface that aggregates telemetry from all engines:
 ### Analysis Capabilities
 
 - **PE Header Analysis**: DOS/File/Optional headers, section table with entropy bars, ASLR/DEP/SEH/CFG detection
+- **ELF Binary Analysis**: ELF32/64 header, program headers (segments), section table, dynamic linking, symbol imports/exports
+- **ELF Security Audit**: PIE, NX stack, RELRO (Full/Partial), stack canary, Fortify, stripped detection
 - **Suspicious Import Detection**: Categorized (injection, evasion, credential access, networking, crypto, shellcode)
 - **Packer Identification**: UPX, Themida, VMProtect, ASPack, MPRESS, etc. via section name matching
-- **RWX Section Flagging**: Read+Write+Execute permissions highlighted
-- **TLS Callback Detection**: Anti-debug indicator
+- **RWX Section Flagging**: Read+Write+Execute permissions highlighted (PE and ELF)
+- **TLS Callback Detection**: Anti-debug indicator (PE)
 - **Entropy Visualization**: Per-section Shannon entropy with color coding (red >= 7.0 = packed/encrypted)
 
 ### Developer Experience
@@ -197,6 +199,7 @@ Full binary file viewer:
 - **Drag-and-drop** file upload or specify VM path
 - **Data inspector**: Int8/16/32/64, Float32/64, ASCII, UTF-16 at cursor position
 - **PE Analysis**: Button parses full PE structure (headers, sections, imports, entropy, IOC flags)
+- **ELF Analysis**: Button parses ELF binaries (header, segments, sections, symbols, security features, suspicious imports)
 - **Cross-tab integration**: Scanner "View in Hex" jumps directly to the flagged offset
 
 ### Submit
@@ -364,6 +367,13 @@ make submit FILE=./samples/mimikatz.exe TARGET=both
 3. Click **PE Analysis** button
 4. Review: headers, security features (ASLR/DEP/SEH/CFG), section entropy, suspicious imports, packer indicators
 
+### ELF Analysis
+
+1. Go to **Hex Editor** tab
+2. Upload an ELF binary (Linux/BSD executables, shared objects)
+3. Click **ELF Analysis** button
+4. Review: ELF header, security audit (PIE/NX/RELRO/canary/Fortify), sections, segments, dynamic libraries, suspicious symbol imports
+
 ---
 
 ## API Reference
@@ -385,15 +395,16 @@ All endpoints served on port `9000`. Responses are JSON.
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/api/submit` | Submit sample (multipart). Params: `file`, `target` (agent/litterbox/both) |
-| GET | `/api/detonation/results` | Poll results. Params: `sha256`, `pid`, `litterbox_hash` |
+| GET | `/api/detonation/results` | Poll results. Params: `sha256`, `pid`, `litterbox_hash`, `filename` |
 
-### Hex Editor & PE
+### Hex Editor & Binary Analysis
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/file/hex` | Hex dump. Params: `path`, `offset`, `bytes` |
 | POST | `/api/file/hex/upload` | Upload file for hex viewing |
 | GET | `/api/file/pe` | PE header analysis. Param: `path` |
+| GET | `/api/file/elf` | ELF binary analysis. Param: `path` |
 
 ### Scanner
 
