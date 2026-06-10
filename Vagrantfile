@@ -32,6 +32,7 @@ Vagrant.configure("2") do |config|
   config.vm.network "forwarded_port", guest: 8080, host: 8080  # DetonatorAgent API
   config.vm.network "forwarded_port", guest: 1337, host: 1337  # LitterBox Web UI
   config.vm.network "forwarded_port", guest: 9000, host: 9000  # Unified Web UI
+  config.vm.network "forwarded_port", guest: 8888, host: 8888  # theZoo-WebUI
 
   # Hyper-V provider settings
   config.vm.provider "hyperv" do |hv|
@@ -95,6 +96,11 @@ Vagrant.configure("2") do |config|
   config.vm.provision "litterbox",
     type: "shell",
     path: "scripts/install-litterbox.ps1",
+    privileged: true
+
+  config.vm.provision "thezoo",
+    type: "shell",
+    path: "scripts/install-thezoo.ps1",
     privileged: true
 
   config.vm.provision "webui",
