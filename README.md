@@ -101,6 +101,14 @@ A single-page dark-themed interface that aggregates telemetry from all engines:
 - **Entropy Visualization**: Per-section Shannon entropy with color coding (red >= 7.0 = packed/encrypted)
 - **Hunt-Sleeping-Beacons**: Callstack scanner for identifying sleeping C2 beacons (unbacked memory, module stomping, APC/Timer sleepmasks, return address spoofing)
 
+### Reverse Engineering Tools
+
+| Tool | Purpose |
+|------|---------|
+| **Detect It Easy (DiE)** | PE/ELF/Mach-O identification — packers, compilers, protectors, linkers |
+| **WinDbg (Preview)** | Kernel/user-mode debugger — crash dumps, live debugging, TTD |
+| **Ghidra** | NSA reverse engineering framework — disassembly, decompilation, scripting |
+
 ### Developer Experience
 
 - **`make deploy-restart`**: Edit locally, push to VM, restart Flask in one command
@@ -545,6 +553,7 @@ transportable-detonation-chamber/
 │   ├── install-litterbox.ps1      # LitterBox sandbox
 │   ├── install-thezoo.ps1        # theZoo malware repository + WebUI
 │   ├── install-hunt-sleeping-beacons.ps1 # Hunt-Sleeping-Beacons (VS Build Tools + compile)
+│   ├── install-re-tools.ps1      # Detect It Easy, WinDbg, Ghidra
 │   ├── install-webui.ps1          # Web UI deployment
 │   └── configure-services.ps1    # Service registration (runs on every boot)
 │
@@ -565,6 +574,9 @@ C:\tools\Hunt-Sleeping-Beacons\     Sleeping beacon scanner (callstack analysis)
 C:\tools\Hunt-Sleeping-Beacons-src\ HSB source code + VS solution
 C:\tools\theZoo-WebUI\              theZoo malware sample browser (PHP, :8888)
 C:\tools\detection-rules\           Sigma + YARA + IOC rules
+C:\ProgramData\chocolatey\lib\die\  Detect It Easy (DiE 3.21)
+C:\ProgramData\chocolatey\lib\ghidra\ Ghidra 12.1.2 (NSA RE framework)
+WinDbgX.exe                         WinDbg Preview (via Microsoft Store/winget)
 C:\Users\vagrant\Desktop\infected\  Malware samples (Defender-excluded)
 ```
 
@@ -693,3 +705,6 @@ make install    # or: .\make.ps1 install
 - [thefLink/Hunt-Sleeping-Beacons](https://github.com/thefLink/Hunt-Sleeping-Beacons) — Sleeping beacon callstack scanner
 - [ytisf/theZoo](https://github.com/ytisf/theZoo) — Malware sample repository
 - [kawaiipantsu/theZoo-WebUI](https://github.com/kawaiipantsu/theZoo-WebUI) — theZoo web frontend
+- [horsicq/DIE-engine](https://github.com/horsicq/DIE-engine) — Detect It Easy (packer/compiler identification)
+- [NationalSecurityAgency/ghidra](https://github.com/NationalSecurityAgency/ghidra) — Ghidra RE framework
+- [Microsoft WinDbg](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/) — Windows debugger

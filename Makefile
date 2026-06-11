@@ -219,7 +219,7 @@ status:
 
 .PHONY: services
 services:
-	vagrant winrm -c "Write-Host ''; Write-Host '  SERVICE               STATE'; Write-Host '  -------               -----'; @('DetonationChamberUI','Rustinel','DetonatorAgent','LitterBox','Fibratus') | ForEach-Object { $$st = Get-ScheduledTask -TaskName $$_ -EA SilentlyContinue; if($$st){Write-Host ('  '+$$_.PadRight(22)+$$st.State)}else{Write-Host ('  '+$$_.PadRight(22)+'NOT FOUND')}}; Write-Host ('  Sysmon'.PadRight(24)+(Get-Service Sysmon64 -EA SilentlyContinue).Status); Write-Host ''"
+	vagrant winrm -c "Write-Host ''; Write-Host '  SERVICE               STATE'; Write-Host '  -------               -----'; @('DetonationChamberUI','Rustinel','DetonatorAgent','LitterBox','Fibratus','theZoo-WebUI') | ForEach-Object { $$st = Get-ScheduledTask -TaskName $$_ -EA SilentlyContinue; if($$st){Write-Host ('  '+$$_.PadRight(22)+$$st.State)}else{Write-Host ('  '+$$_.PadRight(22)+'NOT FOUND')}}; Write-Host ('  Sysmon'.PadRight(24)+(Get-Service Sysmon64 -EA SilentlyContinue).Status); Write-Host ''"
 
 .PHONY: alerts
 alerts:

@@ -361,7 +361,7 @@ switch ($Target) {
             Write-Host ""
             Write-Host "  SERVICE               STATE"
             Write-Host "  -------               -----"
-            $tasks = @('DetonationChamberUI','Rustinel','DetonatorAgent','LitterBox','Fibratus')
+            $tasks = @('DetonationChamberUI','Rustinel','DetonatorAgent','LitterBox','Fibratus','theZoo-WebUI')
             foreach ($t in $tasks) {
                 $st = Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue
                 if ($st) {
