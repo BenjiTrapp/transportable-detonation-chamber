@@ -2352,6 +2352,128 @@ async function viewLitterboxResult(hash) {
     setDetailBody(html);
 }
 
+async function viewDetonationResult(lbHash, sha256, pid, filename) {
+    const displayHash = sha256 || lbHash || 'unknown';
+    pushDetailHistory('detonation-result', displayHash);
+    setDetailHeader('Analysis', 'background:rgba(167,139,250,0.15);color:var(--accent-purple)', 'Detonation Results', (filename || displayHash.substring(0, 12) + '...'));
+    setDetailBody('<div class="muted">Fetching analysis results...</div>');
+    showDetail();
+
+    let html = '';
+
+    // --- Fetch Fibratus/Rustinel alerts via /api/detonation/results ---
+    let fibratusAlerts = [];
+    let fibratusCount = 0;
+    try {
+        const params = new URLSearchParams();
+        if (sha256) params.set('sha256', sha256);
+        if (pid) params.set('pid', pid);
+        if (lbHash) params.set('litterbox_hash', lbHash);
+        if (filename) params.set('filename', filename);
+        const resp = await fetch(`/api/detonation/results?${params}`);
+        if (resp.ok) {
+            const data = await resp.json();
+            fibratusAlerts = data.fibratus_alerts || [];
+            fibratusCount = data.fibratus_alert_count || fibratusAlerts.length;
+        }
+    } catch (e) {}
+
+    // --- Fetch LitterBox results (if hash available) ---
+    let staticData = null, dynamicData = null, fileInfo = null;
+    if (lbHash) {
+        try {
+            const resp = await fetch(`/api/litterbox/results/static/${encodeURIComponent(lbHash)}`);
+            if (resp.ok) staticData = await resp.json();
+        } catch (e) {}
+        try {
+            const resp = await fetch(`/api/litterbox/results/dynamic/${encodeURIComponent(lbHash)}`);
+            if (resp.ok) dynamicData = await resp.json();
+        } catch (e) {}
+        try {
+            const resp = await fetch(`/api/litterbox/results/info/${encodeURIComponent(lbHash)}`);
+            if (resp.ok) fileInfo = await resp.json();
+        } catch (e) {}
+    }
+
+    // --- File info section ---
+    html += `<div class="detail-fields">`;
+    if (fileInfo) {
+        if (fileInfo.filename || fileInfo.name || filename) html += `<div class="detail-field"><span class="field-label">Filename</span><span class="field-value">${escapeHtml(fileInfo.filename || fileInfo.name || filename)}</span></div>`;
+        if (fileInfo.sha256 || sha256) html += `<div class="detail-field"><span class="field-label">SHA-256</span><span class="field-value mono" style="font-size:10px;word-break:break-all">${escapeHtml(fileInfo.sha256 || sha256)}</span></div>`;
+        if (fileInfo.md5) html += `<div class="detail-field"><span class="field-label">MD5</span><span class="field-value mono" style="font-size:10px">${escapeHtml(fileInfo.md5)}</span></div>`;
+        if (fileInfo.size !== undefined) html += `<div class="detail-field"><span class="field-label">Size</span><span class="field-value">${formatSize(fileInfo.size)}</span></div>`;
+        if (fileInfo.file_type || fileInfo.type) html += `<div class="detail-field"><span class="field-label">Type</span><span class="field-value">${escapeHtml(fileInfo.file_type || fileInfo.type)}</span></div>`;
+        if (pid) html += `<div class="detail-field"><span class="field-label">PID</span><span class="field-value">${escapeHtml(pid)}</span></div>`;
+        if (fileInfo.score !== undefined) html += `<div class="detail-field"><span class="field-label">Score</span><span class="field-value" style="color:${fileInfo.score >= 7 ? 'var(--accent-red)' : fileInfo.score >= 4 ? '#fbbf24' : 'var(--accent-green)'};font-weight:700">${fileInfo.score}/10</span></div>`;
+    } else {
+        if (filename) html += `<div class="detail-field"><span class="field-label">Filename</span><span class="field-value">${escapeHtml(filename)}</span></div>`;
+        if (sha256) html += `<div class="detail-field"><span class="field-label">SHA-256</span><span class="field-value mono" style="font-size:10px;word-break:break-all">${escapeHtml(sha256)}</span></div>`;
+        if (pid) html += `<div class="detail-field"><span class="field-label">PID</span><span class="field-value">${escapeHtml(pid)}</span></div>`;
+    }
+    html += `</div>`;
+
+    // --- Fibratus / Rustinel Alerts Section ---
+    html += '<div class="detail-section"><div class="detail-section-title">FIBRATUS / RUSTINEL ALERTS';
+    if (fibratusCount > 0) html += ` <span class="badge badge-red" style="margin-left:6px;">${fibratusCount}</span>`;
+    html += '</div>';
+    if (fibratusAlerts.length > 0) {
+        html += '<div class="det-alerts-list" style="padding:0 8px 8px;">';
+        fibratusAlerts.slice(0, 30).forEach(alert => {
+            const sev = (alert.severity || 'unknown').toLowerCase();
+            const ruleName = alert.rule_name || 'Unknown Rule';
+            const procName = alert.process_name || '';
+            const engine = alert.engine || '';
+            const alertPid = alert.pid || '';
+            const ts = alert.timestamp ? new Date(alert.timestamp).toLocaleTimeString('en-GB', {hour12:false}) : '';
+            html += `<div class="det-alert-item sev-${sev}">
+                <span class="det-alert-sev">${sev.toUpperCase()}</span>
+                <span class="det-alert-rule">${escapeHtml(ruleName)}</span>
+                <span class="det-alert-proc">${escapeHtml(procName)}${alertPid ? ' (PID:' + alertPid + ')' : ''}</span>
+                ${engine ? '<span class="det-alert-engine">' + escapeHtml(engine) + '</span>' : ''}
+                ${ts ? '<span class="det-alert-ts" style="color:var(--text-muted);font-size:10px;margin-left:auto;">' + ts + '</span>' : ''}
+            </div>`;
+        });
+        if (fibratusCount > 30) {
+            html += `<div class="muted" style="padding:6px 0;font-size:10px;">... and ${fibratusCount - 30} more alerts</div>`;
+        }
+        html += '</div>';
+    } else {
+        html += `<div class="muted" style="padding:8px;font-size:11px;">No Fibratus/Rustinel alerts matched for this sample.</div>`;
+    }
+    html += '</div>';
+
+    // --- Static analysis results ---
+    if (lbHash) {
+        html += '<div class="detail-section"><div class="detail-section-title">STATIC ANALYSIS (LitterBox)</div>';
+        if (staticData && !staticData.error) {
+            html += '<div class="lb-result-content">';
+            html += renderLbStaticResults(staticData);
+            html += '</div>';
+        } else {
+            html += `<div class="muted" style="padding:8px;font-size:11px;">${staticData?.error ? escapeHtml(staticData.error) : 'No static analysis results available.'}</div>`;
+        }
+        html += '</div>';
+
+        // --- Dynamic analysis results ---
+        html += '<div class="detail-section"><div class="detail-section-title">DYNAMIC ANALYSIS (LitterBox)</div>';
+        if (dynamicData && !dynamicData.error) {
+            html += '<div class="lb-result-content">';
+            html += renderLbDynamicResults(dynamicData);
+            html += '</div>';
+        } else {
+            html += `<div class="muted" style="padding:8px;font-size:11px;">${dynamicData?.error ? escapeHtml(dynamicData.error) : 'No dynamic analysis results available.'}</div>`;
+        }
+        html += '</div>';
+    }
+
+    // Link to LitterBox UI
+    if (lbHash) {
+        html += `<div style="margin-top:12px;"><a href="http://localhost:1337" target="_blank" class="btn btn-sm" style="color:var(--accent-purple);border-color:rgba(167,139,250,0.3);">Open in LitterBox UI</a></div>`;
+    }
+
+    setDetailBody(html);
+}
+
 function renderLbStaticResults(data) {
     let html = '';
 
@@ -3330,7 +3452,10 @@ async function refreshSubmissions() {
             // Add LitterBox results button if submission went to LitterBox
             const lbHash = sub.litterbox_hash || sub.sha256;
             if (lbHash && (sub.target === 'litterbox' || sub.target === 'both' || sub.litterbox_status === 'success')) {
-                actions += ` <button class="btn btn-xs btn-lb-results" onclick="viewLitterboxResult('${escapeHtml(lbHash)}')" title="View LitterBox scan results">Results</button>`;
+                actions += ` <button class="btn btn-xs btn-lb-results" onclick="viewDetonationResult('${escapeHtml(lbHash)}', '${escapeHtml(sub.sha256 || '')}', '${escapeHtml(sub.agent_pid || '')}', '${escapeHtml(sub.filename || '')}')" title="View analysis results (LitterBox + Fibratus)">Results</button>`;
+            } else if (sub.sha256 || sub.agent_pid) {
+                // Even without LitterBox, show results button for Fibratus/Rustinel alerts
+                actions += ` <button class="btn btn-xs btn-lb-results" onclick="viewDetonationResult('', '${escapeHtml(sub.sha256 || '')}', '${escapeHtml(sub.agent_pid || '')}', '${escapeHtml(sub.filename || '')}')" title="View Fibratus/Rustinel alerts">Results</button>`;
             }
 
             html += `<tr>`;

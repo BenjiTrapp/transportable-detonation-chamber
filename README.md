@@ -99,6 +99,7 @@ A single-page dark-themed interface that aggregates telemetry from all engines:
 - **RWX Section Flagging**: Read+Write+Execute permissions highlighted (PE and ELF)
 - **TLS Callback Detection**: Anti-debug indicator (PE)
 - **Entropy Visualization**: Per-section Shannon entropy with color coding (red >= 7.0 = packed/encrypted)
+- **Hunt-Sleeping-Beacons**: Callstack scanner for identifying sleeping C2 beacons (unbacked memory, module stomping, APC/Timer sleepmasks, return address spoofing)
 
 ### Developer Experience
 
@@ -156,6 +157,8 @@ A single-page dark-themed interface that aggregates telemetry from all engines:
 | **Fibratus** | 8180 | Kernel ETW telemetry & behavior rules | Go |
 | **Rustinel** | — | Sigma/YARA/IOC real-time detection | Rust |
 | **Sysmon** | — | Windows event logging | Sysinternals |
+| **Hunt-Sleeping-Beacons** | — | Sleeping C2 beacon callstack scanner | C++ / MSVC |
+| **theZoo-WebUI** | 8888 | Malware sample browser | PHP |
 | **Detonator** | 5000/8000 | Orchestration UI + REST API | Python |
 
 ---
@@ -374,6 +377,29 @@ make submit FILE=./samples/mimikatz.exe TARGET=both
 3. Click **ELF Analysis** button
 4. Review: ELF header, security audit (PIE/NX/RELRO/canary/Fortify), sections, segments, dynamic libraries, suspicious symbol imports
 
+### Hunt-Sleeping-Beacons
+
+Scan running processes for sleeping C2 beacons (RDP or SSH into VM):
+
+```powershell
+# Scan all processes
+Hunt-Sleeping-Beacons.exe
+
+# Scan a specific PID (e.g., after detonation)
+Hunt-Sleeping-Beacons.exe -p 1234
+
+# Include .NET processes (more false positives)
+Hunt-Sleeping-Beacons.exe --dotnet
+
+# Show command lines for suspicious processes
+Hunt-Sleeping-Beacons.exe --commandline
+
+# Shortcut alias
+hsb --commandline
+```
+
+Detections include: unbacked memory in callstacks, non-executable memory pages, module stomping (SharedOriginal check), suspicious APC dispatchers, timer-based sleepmask callbacks, abnormal intermodular calls (module proxying), and return address spoofing (jmp gadget patterns).
+
 ---
 
 ## API Reference
@@ -517,6 +543,8 @@ transportable-detonation-chamber/
 │   ├── install-detection-rules.ps1 # Sigma + YARA rules
 │   ├── install-detonator.ps1      # Detonator + DetonatorAgent
 │   ├── install-litterbox.ps1      # LitterBox sandbox
+│   ├── install-thezoo.ps1        # theZoo malware repository + WebUI
+│   ├── install-hunt-sleeping-beacons.ps1 # Hunt-Sleeping-Beacons (VS Build Tools + compile)
 │   ├── install-webui.ps1          # Web UI deployment
 │   └── configure-services.ps1    # Service registration (runs on every boot)
 │
@@ -533,6 +561,9 @@ C:\DetonatorAgent\                  .NET 8 execution agent
 C:\LitterBox\                       Analysis sandbox
 C:\tools\ThreatCheck\               AV signature scanner
 C:\tools\DefenderCheck\             Defender evasion tester
+C:\tools\Hunt-Sleeping-Beacons\     Sleeping beacon scanner (callstack analysis)
+C:\tools\Hunt-Sleeping-Beacons-src\ HSB source code + VS solution
+C:\tools\theZoo-WebUI\              theZoo malware sample browser (PHP, :8888)
 C:\tools\detection-rules\           Sigma + YARA + IOC rules
 C:\Users\vagrant\Desktop\infected\  Malware samples (Defender-excluded)
 ```
@@ -561,6 +592,7 @@ Expected output:
   LitterBox             Running
   Fibratus              Running
   Sysmon                Running
+  theZoo-WebUI          Running
 ```
 
 ### Services not starting
@@ -658,3 +690,6 @@ make install    # or: .\make.ps1 install
 - [rabbitstack/fibratus](https://github.com/rabbitstack/fibratus) — ETW detection engine
 - [Karib0u/rustinel](https://github.com/Karib0u/rustinel) — Sigma/YARA EDR agent
 - [BlackSnufkin/LitterBox](https://github.com/BlackSnufkin/LitterBox) — Payload analysis sandbox
+- [thefLink/Hunt-Sleeping-Beacons](https://github.com/thefLink/Hunt-Sleeping-Beacons) — Sleeping beacon callstack scanner
+- [ytisf/theZoo](https://github.com/ytisf/theZoo) — Malware sample repository
+- [kawaiipantsu/theZoo-WebUI](https://github.com/kawaiipantsu/theZoo-WebUI) — theZoo web frontend
