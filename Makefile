@@ -7,6 +7,8 @@
 #
 # Usage:
 #   make help         Show all available targets
+#   make prerequisites Check system requirements
+#   make build        Full Mac setup: prerequisites + build VM (recommended)
 #   make install      Install dependencies locally (no VM needed)
 #   make run          Run the Web UI locally
 #   make up           Build and start the VM
@@ -22,7 +24,7 @@
 #   make clean        Destroy VM and remove local Vagrant artifacts
 #
 # Prerequisites:
-#   macOS:  Vagrant + QEMU (brew install qemu; vagrant plugin install vagrant-qemu)
+#   macOS:  Run 'make prerequisites-fix' to install automatically
 #   Linux:  Vagrant + Hyper-V or libvirt
 # ============================================================================
 
@@ -57,6 +59,7 @@ help:
 	@echo ""
 	@echo "  Setup:"
 	@echo "    make prerequisites   Check/install all prerequisites"
+	@echo "    make build           Full Mac setup: check prereqs + build VM (QEMU)"
 	@echo ""
 	@echo "  Local (no VM required):"
 	@echo "    make install         Install Python venv + dependencies"
@@ -107,6 +110,70 @@ prerequisites:
 prerequisites-fix:
 	@echo "[prerequisites] Checking and fixing system requirements..."
 	@bash scripts/check-prerequisites.sh --fix
+
+# --- Mac VM Build (full guided setup) ---
+
+.PHONY: build
+build:
+ifeq ($(PLATFORM),macos)
+	@echo ""
+	@echo "============================================"
+	@echo "  Detonation Chamber - Mac VM Build"
+	@echo "============================================"
+	@echo ""
+	@echo "[build] Step 1/4: Checking prerequisites..."
+	@bash scripts/check-prerequisites.sh || { echo ""; echo "[build] Prerequisites not met. Run 'make prerequisites-fix' first."; exit 1; }
+	@echo ""
+	@echo "[build] Step 2/4: Verifying Vagrant box..."
+	@if vagrant box list 2>/dev/null | grep -q "win11-arm"; then \
+		echo "[build] win11-arm box found."; \
+	else \
+		echo "[build] ERROR: win11-arm box not found."; \
+		echo ""; \
+		echo "  You need a Windows 11 ARM64 Vagrant box before building."; \
+		echo "  Options:"; \
+		echo ""; \
+		echo "  A) Import from a .box file:"; \
+		echo "     vagrant box add win11-arm /path/to/windows11-arm.box --provider qemu"; \
+		echo ""; \
+		echo "  B) Build from ISO using Packer:"; \
+		echo "     Run 'make prerequisites-fix' to set up the Packer template,"; \
+		echo "     then follow the instructions to build and import."; \
+		echo ""; \
+		echo "  C) Create manually in UTM and package:"; \
+		echo "     See Vagrantfile.utm header comments for instructions."; \
+		echo ""; \
+		exit 1; \
+	fi
+	@echo ""
+	@echo "[build] Step 3/4: Starting VM with QEMU provider..."
+	@echo "  Vagrantfile: $(VAGRANT_FILE)"
+	@echo "  Provider:    $(PROVIDER)"
+	@echo "  Memory:      8 GB"
+	@echo "  CPUs:        4 cores"
+	@echo "  Disk:        80 GB"
+	@echo ""
+	@echo "  This will take 30-45 minutes on first run."
+	@echo "  The VM will download tools, compile code, and configure services."
+	@echo ""
+	vagrant up --provider=$(PROVIDER)
+	@echo ""
+	@echo "[build] Step 4/4: Verifying services..."
+	@sleep 10
+	@echo ""
+	@curl -sf $(WEBUI_URL)/api/status | python3 -m json.tool && echo "[build] Web UI: ONLINE" || echo "[build] Web UI: OFFLINE (may need more time to start)"
+	@echo ""
+	@echo "============================================"
+	@echo "  Build complete!"
+	@echo "  Open: $(WEBUI_URL)"
+	@echo "  RDP:  make rdp"
+	@echo "  Halt: make halt"
+	@echo "============================================"
+	@echo ""
+else
+	@echo "[build] This target is for macOS. On Windows use: .\\make.ps1 up"
+	@echo "  (The Windows Hyper-V setup uses 'make up' or '.\\make.ps1 up' directly)"
+endif
 
 VENV_DIR := webui/.venv
 PYTHON   := $(VENV_DIR)/bin/python
