@@ -67,12 +67,12 @@ function Register-ServiceTask {
 Write-Host "`n--- Configuring Firewall ---" -ForegroundColor Cyan
 # Remove old rules and create consolidated one
 Get-NetFirewallRule -DisplayName "Detonation Chamber*" -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-New-NetFirewallRule -DisplayName "Detonation Chamber - All Services" -Direction Inbound -LocalPort 5000,8000,8080,9000,1337 -Protocol TCP -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null
+New-NetFirewallRule -DisplayName "Detonation Chamber - All Services" -Direction Inbound -LocalPort 5000,8000,8080,9000,1337,8888 -Protocol TCP -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null
 # Program-level rule for Python processes
 New-NetFirewallRule -DisplayName "Detonation Chamber - Python" -Direction Inbound -Program "C:\DetonationChamberUI\venv\Scripts\python.exe" -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null
 New-NetFirewallRule -DisplayName "Detonation Chamber - Python (Detonator)" -Direction Inbound -Program "C:\detonator\.venv\Scripts\python.exe" -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null
 New-NetFirewallRule -DisplayName "Detonation Chamber - Python (LitterBox)" -Direction Inbound -Program "C:\LitterBox\venv\Scripts\python.exe" -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null
-Write-Host "[+] Firewall rules configured for ports 5000, 8000, 8080, 9000, 1337" -ForegroundColor Green
+Write-Host "[+] Firewall rules configured for ports 5000, 8000, 8080, 9000, 1337, 8888" -ForegroundColor Green
 
 # --- Sample / Infected folder ---
 Write-Host "`n--- Sample Directories ---" -ForegroundColor Cyan

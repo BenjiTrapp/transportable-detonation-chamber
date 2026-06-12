@@ -19,7 +19,7 @@
 param(
     [Parameter(Position=0)]
     [ValidateSet(
-        'help','install','run','run-debug','uninstall',
+        'help','prerequisites','install','run','run-debug','uninstall',
         'up','halt','destroy','reload','provision','provision-webui',
         'deploy','deploy-app','restart','deploy-restart','open','logs',
         'ssh','rdp','status','services','alerts','test','submit',
@@ -72,6 +72,9 @@ switch ($Target) {
         Write-Host "  ================================"
         Write-Host "  Platform: windows  Provider: $Provider  VM: $VMIp"
         Write-Host ""
+        Write-Host "  Setup:" -ForegroundColor Yellow
+        Write-Host "    .\make.ps1 prerequisites   Check/install all prerequisites"
+        Write-Host ""
         Write-Host "  Local (no VM required):" -ForegroundColor Yellow
         Write-Host "    .\make.ps1 install         Install Python venv + dependencies"
         Write-Host "    .\make.ps1 run             Run the Web UI locally (port 9000)"
@@ -111,6 +114,16 @@ switch ($Target) {
     }
 
     # --- Local Install ---
+
+    'prerequisites' {
+        Write-Host "[prerequisites] Checking system requirements..." -ForegroundColor Cyan
+        $scriptPath = Join-Path $PSScriptRoot "scripts\check-prerequisites.ps1"
+        if (Test-Path $scriptPath) {
+            & $scriptPath
+        } else {
+            Write-Host "ERROR: scripts\check-prerequisites.ps1 not found" -ForegroundColor Red
+        }
+    }
 
     'install' {
         $VenvDir = "webui\.venv"
@@ -373,7 +386,9 @@ switch ($Target) {
                     Write-Host "NOT FOUND" -ForegroundColor DarkGray
                 }
             }
+            # Check both Sysmon64 (x64) and Sysmon64a (ARM64) service names
             $sysmon = Get-Service Sysmon64 -ErrorAction SilentlyContinue
+            if (-not $sysmon) { $sysmon = Get-Service Sysmon64a -ErrorAction SilentlyContinue }
             Write-Host ("  Sysmon".PadRight(24)) -NoNewline
             if ($sysmon -and $sysmon.Status -eq 'Running') {
                 Write-Host $sysmon.Status -ForegroundColor Green

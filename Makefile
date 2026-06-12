@@ -55,6 +55,9 @@ help:
 	@echo "  ================================"
 	@echo "  Platform: $(PLATFORM)  Provider: $(PROVIDER)  VM: $(VM_IP)"
 	@echo ""
+	@echo "  Setup:"
+	@echo "    make prerequisites   Check/install all prerequisites"
+	@echo ""
 	@echo "  Local (no VM required):"
 	@echo "    make install         Install Python venv + dependencies"
 	@echo "    make run             Run the Web UI locally (port 9000)"
@@ -94,6 +97,16 @@ help:
 	@echo ""
 
 # --- Local Install (no VM required) ---
+
+.PHONY: prerequisites
+prerequisites:
+	@echo "[prerequisites] Checking system requirements..."
+	@bash scripts/check-prerequisites.sh
+
+.PHONY: prerequisites-fix
+prerequisites-fix:
+	@echo "[prerequisites] Checking and fixing system requirements..."
+	@bash scripts/check-prerequisites.sh --fix
 
 VENV_DIR := webui/.venv
 PYTHON   := $(VENV_DIR)/bin/python
@@ -219,7 +232,7 @@ status:
 
 .PHONY: services
 services:
-	vagrant winrm -c "Write-Host ''; Write-Host '  SERVICE               STATE'; Write-Host '  -------               -----'; @('DetonationChamberUI','Rustinel','DetonatorAgent','LitterBox','Fibratus','theZoo-WebUI') | ForEach-Object { $$st = Get-ScheduledTask -TaskName $$_ -EA SilentlyContinue; if($$st){Write-Host ('  '+$$_.PadRight(22)+$$st.State)}else{Write-Host ('  '+$$_.PadRight(22)+'NOT FOUND')}}; Write-Host ('  Sysmon'.PadRight(24)+(Get-Service Sysmon64 -EA SilentlyContinue).Status); Write-Host ''"
+	vagrant winrm -c "Write-Host ''; Write-Host '  SERVICE               STATE'; Write-Host '  -------               -----'; @('DetonationChamberUI','Rustinel','DetonatorAgent','LitterBox','Fibratus','theZoo-WebUI') | ForEach-Object { $$st = Get-ScheduledTask -TaskName $$_ -EA SilentlyContinue; if($$st){Write-Host ('  '+$$_.PadRight(22)+$$st.State)}else{Write-Host ('  '+$$_.PadRight(22)+'NOT FOUND')}}; $$sysmon = Get-Service Sysmon64 -EA SilentlyContinue; if(-not $$sysmon){$$sysmon = Get-Service Sysmon64a -EA SilentlyContinue}; Write-Host ('  Sysmon'.PadRight(24)+$$(if($$sysmon){$$sysmon.Status}else{'NOT FOUND'})); Write-Host ''"
 
 .PHONY: alerts
 alerts:
