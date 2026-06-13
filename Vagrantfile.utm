@@ -1,61 +1,99 @@
 # -*- mode: ruby -*-
 # vi: set ft=ruby :
 
-# Transportable Detonation Chamber - UTM / QEMU (Apple Silicon)
+# Transportable Detonation Chamber - macOS Apple Silicon (QEMU/HVF)
 # Windows 11 ARM VM with Detonator + DetonatorAgent + Fibratus + Rustinel + LitterBox
 #
 # This Vagrantfile targets macOS hosts with Apple Silicon (M1/M2/M3/M4)
 # using the vagrant-qemu provider and a Windows 11 ARM64 guest.
 #
 # Prerequisites:
-#   - macOS on Apple Silicon
-#   - Homebrew: brew install qemu
-#   - Vagrant: brew install --cask vagrant
-#   - Plugin: vagrant plugin install vagrant-qemu
-#   - A Windows 11 ARM64 Vagrant box (see below)
+#   Run the automated setup script:
+#     ./scripts/check-prerequisites.sh --fix
 #
-# Setting up the Windows 11 ARM box:
-#   Option A - Use a pre-built community box (if available):
-#     vagrant box add win11-arm path/to/windows11-arm.box --provider qemu
-#
-#   Option B - Build from ISO using Packer:
-#     1. Download Windows 11 ARM64 ISO from:
-#        https://www.microsoft.com/software-download/windows11arm64
-#     2. Use packer template from: https://github.com/StefanScherer/packer-windows
-#        (ARM64 variant)
-#     3. Import: vagrant box add win11-arm output/windows11-arm.box --provider qemu
-#
-#   Option C - Convert a UTM/QCOW2 image:
-#     1. Create Windows 11 ARM VM in UTM manually
-#     2. Install WinRM: winrm quickconfig -force
-#     3. Set vagrant/vagrant credentials
-#     4. Package: vagrant package --base <vm-name> --output win11-arm.box
+#   Or manually install:
+#     1. Homebrew: /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+#     2. QEMU:    brew install qemu
+#     3. swtpm:   brew install swtpm    (for TPM 2.0 emulation)
+#     4. Vagrant: brew install --cask vagrant
+#     5. Plugin:  vagrant plugin install vagrant-qemu
+#     6. Box:     ./scripts/build-box-macos.sh   (builds win11-arm box from ISO)
 #
 # Usage:
-#   vagrant up --provider=qemu
-#   vagrant rdp
-#   vagrant halt
-#   vagrant destroy
+#   make up              # or: VAGRANT_VAGRANTFILE=Vagrantfile.utm vagrant up --provider=qemu
+#   make rdp             # Connect via RDP
+#   make status          # Check services
+#   make halt            # Stop the VM
+#   make destroy         # Delete the VM
+
+# --- Helper: Locate EFI firmware ---
+# Homebrew on Apple Silicon installs to /opt/homebrew, Intel to /usr/local
+def find_efi_firmware
+  candidates = [
+    "/opt/homebrew/share/qemu/edk2-aarch64-code.fd",
+    "/usr/local/share/qemu/edk2-aarch64-code.fd",
+    "#{ENV['HOMEBREW_PREFIX']}/share/qemu/edk2-aarch64-code.fd",
+  ].compact
+
+  candidates.each do |path|
+    return path if File.exist?(path)
+  end
+
+  # Fallback: try to find via brew
+  brew_prefix = `brew --prefix 2>/dev/null`.strip rescue "/opt/homebrew"
+  efi = "#{brew_prefix}/share/qemu/edk2-aarch64-code.fd"
+  return efi if File.exist?(efi)
+
+  abort <<~ERR
+    ERROR: EFI firmware not found. Searched:
+      #{candidates.join("\n    ")}
+
+    Install QEMU via Homebrew:
+      brew install qemu
+  ERR
+end
+
+# --- Helper: Locate or create EFI vars file ---
+def ensure_efi_vars(vagrant_dir)
+  vars_file = File.join(vagrant_dir, "efivars.fd")
+  unless File.exist?(vars_file)
+    # Create a 64MB empty file for EFI variable storage
+    File.open(vars_file, "wb") { |f| f.write("\x00" * (64 * 1024 * 1024)) }
+  end
+  vars_file
+end
+
+# --- Helper: Set up TPM socket ---
+def tpm_socket_path(vagrant_dir)
+  File.join(vagrant_dir, "tpm")
+end
+
+EFI_CODE = find_efi_firmware
 
 Vagrant.configure("2") do |config|
-  # Windows 11 ARM64 box - adjust name to match your imported box
+  # Windows 11 ARM64 box - built by scripts/build-box-macos.sh
   config.vm.box = "win11-arm"
   config.vm.hostname = "detonation-chamber"
 
-  # Communicator settings for Windows
+  # Communicator: WinRM over HTTP (port 5985)
   config.vm.communicator = "winrm"
   config.winrm.username = "vagrant"
   config.winrm.password = "vagrant"
   config.winrm.timeout = 1800
   config.winrm.retry_limit = 30
+  config.winrm.transport = :plaintext
+  config.winrm.basic_auth_only = true
 
   # Network: expose service ports
-  config.vm.network "forwarded_port", guest: 5000, host: 5000  # Detonator Web UI
-  config.vm.network "forwarded_port", guest: 8000, host: 8000  # Detonator REST API
-  config.vm.network "forwarded_port", guest: 8080, host: 8080  # DetonatorAgent API
-  config.vm.network "forwarded_port", guest: 1337, host: 1337  # LitterBox Web UI
-  config.vm.network "forwarded_port", guest: 9000, host: 9000  # Unified Web UI
-  config.vm.network "forwarded_port", guest: 8888, host: 8888  # theZoo-WebUI
+  # Note: vagrant-qemu translates these to QEMU hostfwd rules automatically
+  config.vm.network "forwarded_port", guest: 5985, host: 55985, id: "winrm", auto_correct: true
+  config.vm.network "forwarded_port", guest: 5000, host: 5000   # Detonator Web UI
+  config.vm.network "forwarded_port", guest: 8000, host: 8000   # Detonator REST API
+  config.vm.network "forwarded_port", guest: 8080, host: 8080   # DetonatorAgent API
+  config.vm.network "forwarded_port", guest: 1337, host: 1337   # LitterBox Web UI
+  config.vm.network "forwarded_port", guest: 9000, host: 9000   # Unified Web UI
+  config.vm.network "forwarded_port", guest: 8888, host: 8888   # theZoo-WebUI
+  config.vm.network "forwarded_port", guest: 3389, host: 53389  # RDP
 
   # QEMU provider settings (vagrant-qemu plugin)
   config.vm.provider "qemu" do |qe|
@@ -65,38 +103,64 @@ Vagrant.configure("2") do |config|
     qe.smp = "cpus=4,sockets=1,cores=4,threads=1"
     qe.memory = "8G"
     qe.net_device = "virtio-net-pci"
-    qe.ssh_port = 50222
 
-    # Enable Apple Hypervisor.framework acceleration (native speed)
+    # Apple Hypervisor.framework - native speed on Apple Silicon
     qe.accel = "hvf"
 
-    # Disk: use virtio-blk for best performance
+    # Disk: virtio-blk (must match how the box was built)
     qe.drive_interface = "virtio"
     qe.disk_size = "80G"
 
-    # EFI boot (required for Windows 11 ARM)
-    qe.extra_qemu_args = %w(
-      -bios /opt/homebrew/share/qemu/edk2-aarch64-code.fd
-      -device virtio-gpu-pci
-      -device qemu-xhci
-      -device usb-kbd
-      -device usb-tablet
-    )
+    # Extra QEMU arguments for Windows 11 ARM64 boot
+    vagrant_dir = File.join(Dir.pwd, ".vagrant", "machines", "default", "qemu")
+    FileUtils.mkdir_p(vagrant_dir)
+    efi_vars = ensure_efi_vars(vagrant_dir)
+
+    extra_args = [
+      # EFI firmware (pflash: read-only code + writable vars for NVRAM)
+      "-drive", "if=pflash,format=raw,readonly=on,file=#{EFI_CODE}",
+      "-drive", "if=pflash,format=raw,file=#{efi_vars}",
+      # Display and input devices
+      "-device", "virtio-gpu-pci",
+      "-device", "qemu-xhci",
+      "-device", "usb-kbd",
+      "-device", "usb-tablet",
+    ]
+
+    # TPM 2.0 support (required for Windows 11 unless bypassed in the box)
+    # Uses swtpm if available - if not, the box must have TPM requirement bypassed
+    tpm_dir = tpm_socket_path(vagrant_dir)
+    swtpm_bin = `which swtpm 2>/dev/null`.strip
+    if !swtpm_bin.empty? && File.exist?(swtpm_bin)
+      FileUtils.mkdir_p(tpm_dir)
+      # swtpm will be started by the provisioning wrapper; add device to QEMU
+      extra_args += [
+        "-chardev", "socket,id=chrtpm,path=#{tpm_dir}/swtpm-sock",
+        "-tpmdev", "emulator,id=tpm0,chardev=chrtpm",
+        "-device", "tpm-tis-device,tpmdev=tpm0",
+      ]
+    end
+
+    qe.extra_qemu_args = extra_args
   end
 
-  # Increase boot timeout for Windows
+  # Increase boot timeout (Windows ARM64 can be slow on first boot)
   config.vm.boot_timeout = 1200
 
-  # Disable default synced folder
+  # Disable default synced folder (not supported by QEMU user-mode networking)
   config.vm.synced_folder ".", "/vagrant", disabled: true
 
-  # Copy config, webui, and rules into the VM via file provisioners
+  # --- File provisioners: copy project files into VM ---
   config.vm.provision "file", source: "config", destination: "C:\\vagrant_config"
   config.vm.provision "file", source: "webui", destination: "C:\\vagrant\\webui"
   config.vm.provision "file", source: "rules", destination: "C:\\vagrant\\rules"
 
-  # Provisioning: run scripts in order
-  # All scripts are architecture-aware (detect ARM64 vs x86_64 automatically)
+  # --- Shell provisioners: install everything ---
+  # All scripts detect ARM64 vs x86_64 and handle architecture differences.
+  # Tools without native ARM64 builds (Fibratus, Rustinel) run under
+  # Windows' x86_64 emulation layer. ETW kernel tracing works but with
+  # slight overhead under emulation.
+
   config.vm.provision "prerequisites",
     type: "shell",
     path: "scripts/install-prerequisites.ps1",

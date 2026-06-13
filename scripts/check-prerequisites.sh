@@ -114,29 +114,42 @@ fi
 
 # Check EFI firmware
 EFI_PATH="/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
+ALT_EFI="/usr/local/share/qemu/edk2-aarch64-code.fd"
 if [[ -f "$EFI_PATH" ]]; then
     ok "EFI firmware found: $EFI_PATH"
+elif [[ -f "$ALT_EFI" ]]; then
+    ok "EFI firmware found: $ALT_EFI"
+    # Vagrantfile.utm auto-detects both locations now
 else
-    # Try alternate locations
-    ALT_EFI="/usr/local/share/qemu/edk2-aarch64-code.fd"
-    if [[ -f "$ALT_EFI" ]]; then
-        ok "EFI firmware found: $ALT_EFI"
-        warn "EFI firmware is at $ALT_EFI, but Vagrantfile.utm expects $EFI_PATH"
-        info "You may need to update Vagrantfile.utm or create a symlink"
-    else
-        fail "EFI firmware not found at $EFI_PATH"
-        if $FIX_MODE; then
-            info "Reinstalling QEMU to ensure firmware files are present..."
-            brew reinstall qemu
-            if [[ -f "$EFI_PATH" ]]; then
-                ok "EFI firmware now available"
-                ((ERRORS--))
-            else
-                fail "EFI firmware still not found after reinstall"
-            fi
+    fail "EFI firmware not found"
+    if $FIX_MODE; then
+        info "Reinstalling QEMU to ensure firmware files are present..."
+        brew reinstall qemu
+        if [[ -f "$EFI_PATH" ]] || [[ -f "$ALT_EFI" ]]; then
+            ok "EFI firmware now available"
+            ((ERRORS--))
         else
-            info "This should be installed with QEMU. Try: brew reinstall qemu"
+            fail "EFI firmware still not found after reinstall"
         fi
+    else
+        info "This should be installed with QEMU. Try: brew reinstall qemu"
+    fi
+fi
+
+# Check swtpm (TPM 2.0 emulator - optional but recommended)
+if command -v swtpm &>/dev/null; then
+    ok "swtpm found (TPM 2.0 emulation)"
+else
+    warn "swtpm not found (optional - Windows 11 TPM requirement will be bypassed)"
+    if $FIX_MODE; then
+        info "Installing swtpm via Homebrew..."
+        brew install swtpm
+        if command -v swtpm &>/dev/null; then
+            ok "swtpm installed"
+            ((WARNINGS--))
+        fi
+    else
+        info "Install with: brew install swtpm"
     fi
 fi
 
@@ -188,183 +201,61 @@ if command -v vagrant &>/dev/null; then
     else
         fail "win11-arm Vagrant box not found"
         echo ""
-        info "A Windows 11 ARM64 Vagrant box is required. Options:"
+        info "A Windows 11 ARM64 Vagrant box is required."
         echo ""
-        echo "  Option A - Download ISO and build with Packer (recommended):"
-        echo "    1. Download Windows 11 ARM64 ISO from:"
-        echo "       $WIN11_DOWNLOAD_PAGE"
-        echo "    2. Use this script with --fix to set up the Packer build"
+        echo "  ${BOLD}Recommended: Use the automated box builder:${NC}"
+        echo "    ./scripts/build-box-macos.sh"
         echo ""
-        echo "  Option B - Import a pre-built .box file:"
+        echo "  This script will:"
+        echo "    1. Guide you to download the ISO from Microsoft"
+        echo "       ($WIN11_DOWNLOAD_PAGE)"
+        echo "    2. Create an unattended install (Autounattend.xml)"
+        echo "    3. Install Windows 11 ARM64 via QEMU automatically"
+        echo "    4. Configure WinRM, RDP, and vagrant user"
+        echo "    5. Package and import the Vagrant box"
+        echo ""
+        echo "  Alternative: Import a pre-built .box file:"
         echo "    vagrant box add win11-arm /path/to/windows11-arm.box --provider qemu"
-        echo ""
-        echo "  Option C - Create manually in UTM, then package:"
-        echo "    1. Create Windows 11 ARM VM in UTM"
-        echo "    2. Install & configure WinRM:"
-        echo "       winrm quickconfig -force"
-        echo "       winrm set winrm/config/service '@{AllowUnencrypted=\"true\"}'"
-        echo "       winrm set winrm/config/service/auth '@{Basic=\"true\"}'"
-        echo "    3. Create vagrant user (password: vagrant) with admin rights"
-        echo "    4. Export QCOW2 and package:"
-        echo "       vagrant package --base <vm-name> --output win11-arm.box"
         echo ""
 
         if $FIX_MODE; then
             echo ""
-            info "Checking for Windows 11 ARM64 ISO..."
-            mkdir -p "$WIN11_ISO_DIR"
+            info "Searching for Windows 11 ARM64 ISO..."
 
-            if [[ -f "$WIN11_ISO_PATH" ]]; then
-                ok "ISO already downloaded: $WIN11_ISO_PATH"
-            else
-                # Check if user has an ISO anywhere obvious
-                FOUND_ISO=""
-                for search_dir in "$HOME/Downloads" "$HOME/Desktop" "$HOME/Documents"; do
-                    if [[ -d "$search_dir" ]]; then
-                        found=$(find "$search_dir" -maxdepth 2 -iname "*win*11*arm*iso" -o -iname "*windows*11*arm*iso" 2>/dev/null | head -1)
-                        if [[ -n "$found" ]]; then
-                            FOUND_ISO="$found"
-                            break
-                        fi
+            # Search common locations for the ISO
+            FOUND_ISO=""
+            for search_dir in "$HOME/Downloads" "$HOME/Desktop" "$HOME/Documents" "$HOME/.cache/detonation-chamber"; do
+                if [[ -d "$search_dir" ]]; then
+                    found=$(find "$search_dir" -maxdepth 2 \( \
+                        -iname "*Win11*ARM*iso" -o \
+                        -iname "*Windows*11*ARM*iso" -o \
+                        -iname "*Win11*aarch64*iso" \
+                    \) 2>/dev/null | head -1)
+                    if [[ -n "$found" ]]; then
+                        FOUND_ISO="$found"
+                        break
                     fi
-                done
-
-                if [[ -n "$FOUND_ISO" ]]; then
-                    info "Found existing ISO: $FOUND_ISO"
-                    info "Copying to cache directory..."
-                    cp "$FOUND_ISO" "$WIN11_ISO_PATH"
-                    ok "ISO cached at: $WIN11_ISO_PATH"
-                else
-                    warn "No Windows 11 ARM64 ISO found locally."
-                    echo ""
-                    echo "  Microsoft requires manual download (no direct URL available)."
-                    echo "  Please download from: $WIN11_DOWNLOAD_PAGE"
-                    echo ""
-                    echo "  After downloading, either:"
-                    echo "    - Place it in ~/Downloads/ and re-run this script with --fix"
-                    echo "    - Or copy it to: $WIN11_ISO_PATH"
-                    echo ""
-
-                    # Attempt to open the download page in the browser
-                    info "Opening Microsoft download page in browser..."
-                    open "$WIN11_DOWNLOAD_PAGE" 2>/dev/null || true
                 fi
-            fi
+            done
 
-            # If we have the ISO, offer to set up Packer
-            if [[ -f "$WIN11_ISO_PATH" ]]; then
+            if [[ -n "$FOUND_ISO" ]]; then
+                ok "Found ISO: $FOUND_ISO"
                 echo ""
-                info "ISO available. Setting up Packer build environment..."
+                info "Run the box builder to create the Vagrant box:"
+                echo "    ./scripts/build-box-macos.sh --iso \"$FOUND_ISO\""
+                echo ""
+            else
+                warn "No Windows 11 ARM64 ISO found locally."
+                echo ""
+                echo "  Download from: $WIN11_DOWNLOAD_PAGE"
+                echo ""
+                echo "  Then run:"
+                echo "    ./scripts/build-box-macos.sh --iso ~/Downloads/<iso-filename>.iso"
+                echo ""
 
-                # Check for Packer
-                if ! command -v packer &>/dev/null; then
-                    info "Installing Packer via Homebrew..."
-                    brew install hashicorp/tap/packer
-                fi
-
-                # Create a minimal Packer template for Windows 11 ARM64
-                PACKER_DIR="$WIN11_ISO_DIR/packer-win11-arm"
-                mkdir -p "$PACKER_DIR"
-
-                if [[ ! -f "$PACKER_DIR/win11-arm.pkr.hcl" ]]; then
-                    cat > "$PACKER_DIR/win11-arm.pkr.hcl" << 'PACKER_EOF'
-# Packer template for Windows 11 ARM64 Vagrant box (QEMU provider)
-# This creates a minimal Windows 11 ARM64 box with WinRM enabled
-#
-# Usage:
-#   cd ~/.cache/detonation-chamber/packer-win11-arm
-#   packer init .
-#   packer build .
-#   vagrant box add win11-arm output/win11-arm.box --provider qemu
-
-packer {
-  required_plugins {
-    qemu = {
-      version = ">= 1.1.0"
-      source  = "github.com/hashicorp/qemu"
-    }
-  }
-}
-
-variable "iso_path" {
-  type    = string
-  default = "../Win11_ARM64.iso"
-}
-
-variable "output_dir" {
-  type    = string
-  default = "output"
-}
-
-source "qemu" "win11-arm" {
-  iso_url          = var.iso_path
-  iso_checksum     = "none"
-  output_directory = var.output_dir
-  vm_name          = "win11-arm.qcow2"
-
-  accelerator  = "hvf"
-  machine_type = "virt,highmem=on"
-  cpu_type     = "host"
-
-  memory   = 4096
-  cpus     = 4
-  disk_size = "80G"
-
-  qemu_binary  = "qemu-system-aarch64"
-  qemuargs = [
-    ["-bios", "/opt/homebrew/share/qemu/edk2-aarch64-code.fd"],
-    ["-device", "virtio-gpu-pci"],
-    ["-device", "qemu-xhci"],
-    ["-device", "usb-kbd"],
-    ["-device", "usb-tablet"],
-    ["-drive", "file=${var.iso_path},media=cdrom,if=none,id=cdrom0"],
-    ["-device", "usb-storage,drive=cdrom0"],
-  ]
-
-  communicator = "winrm"
-  winrm_username = "vagrant"
-  winrm_password = "vagrant"
-  winrm_timeout  = "60m"
-
-  boot_wait = "5s"
-  shutdown_command = "shutdown /s /t 10 /f"
-}
-
-build {
-  sources = ["source.qemu.win11-arm"]
-
-  # Enable WinRM and configure vagrant user
-  provisioner "powershell" {
-    inline = [
-      "Set-ExecutionPolicy Bypass -Scope Process -Force",
-      "winrm quickconfig -force",
-      "winrm set winrm/config/service '@{AllowUnencrypted=\"true\"}'",
-      "winrm set winrm/config/service/auth '@{Basic=\"true\"}'",
-      "Set-ItemProperty -Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System' -Name 'LocalAccountTokenFilterPolicy' -Value 1 -Force",
-    ]
-  }
-
-  post-processor "vagrant" {
-    output = "${var.output_dir}/win11-arm.box"
-    vagrantfile_template = null
-    provider_override = "qemu"
-  }
-}
-PACKER_EOF
-                    ok "Packer template created at: $PACKER_DIR/win11-arm.pkr.hcl"
-                    echo ""
-                    info "To build the box:"
-                    echo "  cd $PACKER_DIR"
-                    echo "  packer init ."
-                    echo "  packer build ."
-                    echo "  vagrant box add win11-arm output/win11-arm.box --provider qemu"
-                    echo ""
-                    warn "NOTE: Windows 11 ARM64 ISO requires manual interaction during install."
-                    info "For a fully automated build, you need an Autounattend.xml file."
-                    info "See: https://github.com/StefanScherer/packer-windows for reference templates."
-                else
-                    ok "Packer template already exists at: $PACKER_DIR/win11-arm.pkr.hcl"
-                fi
+                # Attempt to open the download page in the browser
+                info "Opening Microsoft download page in browser..."
+                open "$WIN11_DOWNLOAD_PAGE" 2>/dev/null || true
             fi
         fi
     fi
@@ -463,6 +354,9 @@ else
         echo "Run with --fix to auto-install missing dependencies:"
         echo "  ./scripts/check-prerequisites.sh --fix"
     fi
+    echo ""
+    echo "If the only missing item is the Vagrant box, build it with:"
+    echo "  ./scripts/build-box-macos.sh --iso /path/to/Win11_ARM64.iso"
 fi
 echo ""
 
