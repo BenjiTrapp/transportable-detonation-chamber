@@ -233,6 +233,12 @@ if (Test-Path $venvPython) {
 }
 
 # --- 5. Start LitterBox ---
+# LitterBox MUST run with full admin privileges (SYSTEM + RunLevel Highest)
+# because its scanners (PE-Sieve, Hollows-Hunter, Moneta) require:
+#   - SeDebugPrivilege (process memory inspection)
+#   - Access to protected process memory
+#   - Kernel driver communication (for some scanners)
+# Additionally, it must auto-restart on crash (payload analysis can cause instability)
 Write-Host "`n--- LitterBox ---" -ForegroundColor Cyan
 $litterboxPython = "$litterboxDir\venv\Scripts\python.exe"
 
@@ -242,12 +248,63 @@ if (Test-Path $litterboxPython) {
         Copy-Item "C:\vagrant_config\litterbox-config.yaml" "$litterboxDir\Config\config.yaml" -Force
     }
 
-    Register-ServiceTask -Name "LitterBox" -Command $litterboxPython -Arguments "litterbox.py" -WorkingDirectory $litterboxDir
-    Start-Sleep -Seconds 3
+    # Stop existing LitterBox process cleanly before re-registering
+    $existingProc = Get-Process -Name "python*" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -eq $litterboxPython }
+    if ($existingProc) {
+        Write-Host "[*] Stopping existing LitterBox process (PID: $($existingProc.Id))..." -ForegroundColor Yellow
+        Stop-Process -Id $existingProc.Id -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
 
-    Write-Host "    URL: http://localhost:1337" -ForegroundColor Gray
+    # Unregister previous task
+    Unregister-ScheduledTask -TaskName "LitterBox" -Confirm:$false -ErrorAction SilentlyContinue
+
+    # Create CMD wrapper with logging
+    $wrapperPath = "$logsDir\run-LitterBox.cmd"
+    $logPath = "$logsDir\LitterBox.log"
+    $cmdContent = "@echo off & cd /d `"$litterboxDir`" & `"$litterboxPython`" litterbox.py > `"$logPath`" 2>&1"
+    Set-Content -Path $wrapperPath -Value $cmdContent
+
+    # Register scheduled task with SYSTEM privileges, highest run level, and restart policy
+    $action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$wrapperPath`"" -WorkingDirectory $litterboxDir
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable `
+        -RestartCount 5 `
+        -RestartInterval (New-TimeSpan -Minutes 1) `
+        -ExecutionTimeLimit (New-TimeSpan -Days 365)
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+    Register-ScheduledTask -TaskName "LitterBox" -Action $action -Trigger $trigger -Settings $settings -Principal $principal | Out-Null
+    Start-ScheduledTask -TaskName "LitterBox"
+    Start-Sleep -Seconds 5
+
+    # Verify LitterBox started successfully with admin privileges
+    $litterboxTask = Get-ScheduledTask -TaskName "LitterBox" -ErrorAction SilentlyContinue
+    if ($litterboxTask -and $litterboxTask.State -eq "Running") {
+        Write-Host "[+] LitterBox registered and running (SYSTEM, RunLevel=Highest)" -ForegroundColor Green
+        Write-Host "    Principal: SYSTEM (full admin privileges)" -ForegroundColor Gray
+        Write-Host "    RestartPolicy: 5 retries, 1-min interval" -ForegroundColor Gray
+        Write-Host "    URL: http://localhost:1337" -ForegroundColor Gray
+    } else {
+        Write-Host "[!] LitterBox task registered but may not be running yet" -ForegroundColor Yellow
+        Write-Host "    Check logs: $logPath" -ForegroundColor Gray
+    }
+
+    # Verify API is responding
+    Start-Sleep -Seconds 3
+    try {
+        $null = Invoke-WebRequest -Uri "http://127.0.0.1:1337" -UseBasicParsing -TimeoutSec 5
+        Write-Host "[+] LitterBox API verified: responding on port 1337" -ForegroundColor Green
+    } catch {
+        Write-Host "[!] LitterBox API not yet responding (may need more startup time)" -ForegroundColor Yellow
+    }
 } else {
-    Write-Host "[!] LitterBox Python venv not found - skipping" -ForegroundColor Yellow
+    Write-Host "[!] LitterBox Python venv not found at $litterboxPython - skipping" -ForegroundColor Yellow
+    Write-Host "    Run 'vagrant provision --provision-with litterbox' to install" -ForegroundColor Gray
 }
 
 # --- 6. Start Detonation Chamber UI ---

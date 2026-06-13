@@ -108,6 +108,16 @@ Vagrant.configure("2") do |config|
     path: "scripts/install-hunt-sleeping-beacons.ps1",
     privileged: true
 
+  config.vm.provision "beaconeye",
+    type: "shell",
+    path: "scripts/install-beaconeye.ps1",
+    privileged: true
+
+  config.vm.provision "scanner-tools",
+    type: "shell",
+    path: "scripts/install-scanner-tools.ps1",
+    privileged: true
+
   config.vm.provision "re-tools",
     type: "shell",
     path: "scripts/install-re-tools.ps1",

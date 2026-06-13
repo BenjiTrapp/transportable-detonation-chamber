@@ -765,8 +765,13 @@ def _find_service_launch_config():
             configs["litterbox"] = {"exe": py_exe, "args": "litterbox.py", "cwd": lb_dir}
             break
 
-    # Fibratus - Windows Service
-    configs["fibratus"] = {"service": "fibratus"}
+    # Fibratus - Windows Service (with exe path for auto-registration if service is missing)
+    fibratus_exe = None
+    for exe_path in [r"C:\Program Files\Fibratus\Bin\fibratus.exe", r"C:\Program Files\Fibratus\fibratus.exe"]:
+        if os.path.isfile(exe_path):
+            fibratus_exe = exe_path
+            break
+    configs["fibratus"] = {"service": "fibratus", "exe": fibratus_exe}
 
     # Sysmon - Windows Service
     configs["sysmon"] = {"service": "Sysmon64"}
@@ -798,7 +803,38 @@ def api_service_launch():
                 capture_output=True, text=True, timeout=10
             )
             if result.returncode != 0:
-                return jsonify({"error": f"Failed to start service: {result.stderr.strip()}"}), 500
+                # Service might not be registered yet — try to install it first
+                exe_path = config.get("exe")
+                if exe_path and os.path.isfile(exe_path) and "NoServiceFoundForGivenName" in result.stderr:
+                    # Attempt to register the service via the executable
+                    install_result = subprocess.run(
+                        [exe_path, "install-service"],
+                        capture_output=True, text=True, timeout=15
+                    )
+                    if install_result.returncode == 0:
+                        # Set to automatic and start
+                        subprocess.run(
+                            ["powershell", "-NoProfile", "-Command",
+                             f"Set-Service -Name '{svc_name}' -StartupType Automatic -ErrorAction SilentlyContinue"],
+                            capture_output=True, text=True, timeout=5
+                        )
+                        start_result = subprocess.run(
+                            ["powershell", "-NoProfile", "-Command",
+                             f"Start-Service -Name '{svc_name}' -ErrorAction Stop"],
+                            capture_output=True, text=True, timeout=10
+                        )
+                        if start_result.returncode == 0:
+                            return jsonify({"success": True, "message": f"Service '{svc_name}' registered and started"})
+                        else:
+                            return jsonify({"error": f"Service registered but failed to start: {start_result.stderr.strip()}"}), 500
+                    else:
+                        return jsonify({"error": f"Service not found and registration failed: {install_result.stderr.strip() or install_result.stdout.strip()}"}), 500
+                elif exe_path and not os.path.isfile(exe_path):
+                    return jsonify({"error": f"Service '{svc_name}' not found and executable not installed. Expected at: {exe_path}"}), 500
+                elif not exe_path:
+                    return jsonify({"error": f"Service '{svc_name}' not found and no executable path configured for auto-registration."}), 500
+                else:
+                    return jsonify({"error": f"Failed to start service: {result.stderr.strip()}"}), 500
             return jsonify({"success": True, "message": f"Service '{svc_name}' started"})
 
         # Process launch
@@ -1097,10 +1133,92 @@ def api_alerts():
 
 @app.route("/api/processes")
 def api_processes():
-    """Get process tree built from alerts."""
+    """Get process tree built from alerts.
+    
+    Query params:
+        max: Maximum number of processes to return (default: 200, 0=unlimited)
+        min_threats: Minimum threat count to include (default: 1)
+        sort: Sort order - 'threats' (default), 'recent', 'severity'
+        detonated: If 'true', only return detonated processes
+        include_parents: If 'true' (default), include parent processes for context
+    """
+    max_procs = request.args.get("max", 200, type=int)
+    min_threats = request.args.get("min_threats", 1, type=int)
+    sort_by = request.args.get("sort", "threats")
+    detonated_only = request.args.get("detonated", "").lower() == "true"
+    include_parents = request.args.get("include_parents", "true").lower() != "false"
+
     with store_lock:
-        processes = events_store.get("processes", {})
-    return jsonify(processes)
+        all_processes = events_store.get("processes", {})
+
+    if not all_processes:
+        return jsonify({})
+
+    # Filter by minimum threats
+    filtered = {
+        pid: proc for pid, proc in all_processes.items()
+        if (proc.get("activity", {}).get("threats", 0) >= min_threats)
+    }
+
+    # Filter by detonated if requested
+    if detonated_only:
+        filtered = {pid: proc for pid, proc in filtered.items() if proc.get("detonated")}
+
+    # Sort to prioritize interesting processes
+    severity_order = {"critical": 4, "high": 3, "medium": 2, "low": 1, "unknown": 0}
+
+    def sort_key(item):
+        pid, proc = item
+        if sort_by == "recent":
+            return proc.get("last_seen", "")
+        elif sort_by == "severity":
+            max_sev = 0
+            for alert in proc.get("alerts", []):
+                sev = severity_order.get(alert.get("severity", "unknown"), 0)
+                if sev > max_sev:
+                    max_sev = sev
+            return (max_sev, proc.get("activity", {}).get("threats", 0))
+        else:  # threats (default)
+            return proc.get("activity", {}).get("threats", 0)
+
+    sorted_procs = sorted(filtered.items(), key=sort_key, reverse=True)
+
+    # Apply limit (0 = no limit)
+    if max_procs > 0:
+        selected_pids = set(pid for pid, _ in sorted_procs[:max_procs])
+
+        # Include parent processes for graph context (not counted toward limit)
+        if include_parents:
+            parents_to_add = set()
+            for pid in list(selected_pids):
+                proc = all_processes.get(pid, {})
+                ppid = proc.get("parent_pid")
+                if ppid is not None:
+                    ppid_str = str(ppid)
+                    if ppid_str in all_processes and ppid_str not in selected_pids:
+                        parents_to_add.add(ppid_str)
+            selected_pids.update(parents_to_add)
+
+        result = {pid: proc for pid, proc in all_processes.items() if pid in selected_pids}
+    else:
+        result = filtered
+
+    # Strip the full alert objects from response to reduce payload size
+    # (keep only essential fields for graph rendering)
+    compact_result = {}
+    for pid, proc in result.items():
+        compact_proc = dict(proc)
+        # Reduce alerts to lightweight format (just timestamp + severity for time filtering)
+        if compact_proc.get("alerts"):
+            compact_proc["alerts"] = [
+                {"timestamp": a.get("timestamp", ""), "severity": a.get("severity", "unknown"),
+                 "rule_name": a.get("rule_name", ""), "category": a.get("category", "")}
+                for a in compact_proc["alerts"]
+            ]
+        # Remove raw field from alerts to save bandwidth
+        compact_result[pid] = compact_proc
+
+    return jsonify(compact_result)
 
 
 @app.route("/api/sysmon")
@@ -1117,8 +1235,46 @@ def api_sysmon():
 
 @app.route("/api/sysmon/stats")
 def api_sysmon_stats():
-    """Get Sysmon event counts by type."""
+    """Get Sysmon event counts by type, with diagnostic info."""
     try:
+        # First check if the event log channel exists and get record count
+        diag_cmd = (
+            "$log = Get-WinEvent -ListLog 'Microsoft-Windows-Sysmon/Operational' -ErrorAction SilentlyContinue; "
+            "if ($log) { @{Exists=$true; RecordCount=$log.RecordCount; Enabled=$log.IsEnabled; LogMode=$log.LogMode} | ConvertTo-Json -Compress } "
+            "else { @{Exists=$false} | ConvertTo-Json -Compress }"
+        )
+        diag_result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", diag_cmd],
+            capture_output=True, text=True, timeout=5
+        )
+        diag = {}
+        if diag_result.stdout.strip():
+            diag = json.loads(diag_result.stdout.strip())
+
+        if not diag.get("Exists"):
+            return jsonify({
+                "online": False,
+                "stats": [],
+                "diagnostic": "Event log 'Microsoft-Windows-Sysmon/Operational' does not exist. Sysmon may not be properly installed.",
+            })
+
+        if not diag.get("Enabled"):
+            return jsonify({
+                "online": False,
+                "stats": [],
+                "diagnostic": "Sysmon event log exists but is disabled.",
+            })
+
+        record_count = diag.get("RecordCount", 0)
+        if record_count == 0:
+            return jsonify({
+                "online": True,
+                "stats": [],
+                "diagnostic": "Sysmon event log is empty (0 records). Service is running but no events have been logged yet. Check Sysmon config.",
+                "record_count": 0,
+            })
+
+        # Log exists with records — query stats
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              "Get-WinEvent -LogName 'Microsoft-Windows-Sysmon/Operational' -MaxEvents 500 -ErrorAction SilentlyContinue | "
@@ -1147,10 +1303,17 @@ def api_sysmon_stats():
                     "name": event_names.get(eid, f"Event {eid}"),
                     "count": item.get("Count", 0),
                 })
-            return jsonify({"online": True, "stats": stats})
+            return jsonify({"online": True, "stats": stats, "record_count": record_count})
+
+        # Command returned empty despite records existing
+        return jsonify({
+            "online": True,
+            "stats": [],
+            "diagnostic": f"Event log has {record_count} records but query returned no results. Possible permission issue.",
+            "record_count": record_count,
+        })
     except Exception as e:
         return jsonify({"online": False, "error": str(e), "stats": []})
-    return jsonify({"online": False, "stats": []})
 
 
 def _read_sysmon_events(max_events=100, since=None, pid=None, event_id=None):
@@ -1441,6 +1604,24 @@ def api_submit():
         except Exception as e:
             results["litterbox"] = {"status": 502, "error": str(e)}
 
+    # --- Beacon Scanning (async, after agent execution) ---
+    beacon_tools_available = os.path.isfile(HUNT_SLEEPING_BEACONS_EXE) or os.path.isfile(BEACONEYE_EXE)
+    if agent_pid and beacon_tools_available:
+        _run_beacon_scans_async(agent_pid, file_sha256)
+        results["beacon_scan"] = {
+            "triggered": True,
+            "tools": [],
+        }
+        if os.path.isfile(HUNT_SLEEPING_BEACONS_EXE):
+            results["beacon_scan"]["tools"].append("Hunt-Sleeping-Beacons")
+        if os.path.isfile(BEACONEYE_EXE):
+            results["beacon_scan"]["tools"].append("BeaconEye")
+    else:
+        results["beacon_scan"] = {
+            "triggered": False,
+            "reason": "No PID available" if not agent_pid else "Beacon tools not installed",
+        }
+
     # Include file metadata in response
     results["file_info"] = {
         "name": filename,
@@ -1475,8 +1656,17 @@ def api_detonation_results():
 
     results = {"sha256": sha256, "pid": pid, "ready": {}}
 
+    # --- Check LitterBox availability first ---
+    litterbox_online = False
+    try:
+        r = requests.get(LITTERBOX_API, timeout=2)
+        litterbox_online = r.status_code == 200
+    except Exception:
+        pass
+    results["litterbox_online"] = litterbox_online
+
     # --- LitterBox Static Results ---
-    if lb_hash:
+    if lb_hash and litterbox_online:
         try:
             r = requests.get(f"{LITTERBOX_API}/api/results/static/{lb_hash}", timeout=5)
             if r.status_code == 200:
@@ -1486,37 +1676,69 @@ def api_detonation_results():
                 results["ready"]["static"] = False
         except Exception:
             results["ready"]["static"] = False
+    elif lb_hash and not litterbox_online:
+        results["ready"]["static"] = True  # Don't block polling if LitterBox is offline
+    else:
+        results["ready"]["static"] = True  # No hash to look up
 
     # --- LitterBox Dynamic Results ---
-    if pid:
-        try:
-            r = requests.get(f"{LITTERBOX_API}/api/results/dynamic/{pid}", timeout=5)
-            if r.status_code == 200:
-                results["litterbox_dynamic"] = r.json()
-                results["ready"]["dynamic"] = True
-            else:
+    if litterbox_online:
+        if pid:
+            try:
+                r = requests.get(f"{LITTERBOX_API}/api/results/dynamic/{pid}", timeout=5)
+                if r.status_code == 200:
+                    results["litterbox_dynamic"] = r.json()
+                    results["ready"]["dynamic"] = True
+                else:
+                    results["ready"]["dynamic"] = False
+            except Exception:
                 results["ready"]["dynamic"] = False
-        except Exception:
-            results["ready"]["dynamic"] = False
-    elif lb_hash:
-        try:
-            r = requests.get(f"{LITTERBOX_API}/api/results/dynamic/{lb_hash}", timeout=5)
-            if r.status_code == 200:
-                results["litterbox_dynamic"] = r.json()
-                results["ready"]["dynamic"] = True
-            else:
+        elif lb_hash:
+            try:
+                r = requests.get(f"{LITTERBOX_API}/api/results/dynamic/{lb_hash}", timeout=5)
+                if r.status_code == 200:
+                    results["litterbox_dynamic"] = r.json()
+                    results["ready"]["dynamic"] = True
+                else:
+                    results["ready"]["dynamic"] = False
+            except Exception:
                 results["ready"]["dynamic"] = False
-        except Exception:
-            results["ready"]["dynamic"] = False
+        else:
+            results["ready"]["dynamic"] = True  # No target to look up
+    else:
+        results["ready"]["dynamic"] = True  # Don't block polling if LitterBox is offline
 
     # --- LitterBox File Info (includes basic PE info, hashes) ---
-    if lb_hash:
+    if lb_hash and litterbox_online:
         try:
             r = requests.get(f"{LITTERBOX_API}/api/results/info/{lb_hash}", timeout=5)
             if r.status_code == 200:
                 results["litterbox_info"] = r.json()
         except Exception:
             pass
+
+    # --- Beacon Scan Results (from async cache) ---
+    with _beacon_cache_lock:
+        hsb_result = None
+        beaconeye_result = None
+        if pid:
+            hsb_result = _beacon_results_cache.get(f"hsb_{pid}")
+            beaconeye_result = _beacon_results_cache.get(f"beaconeye_{pid}")
+        if not hsb_result and sha256:
+            hsb_result = _beacon_results_cache.get(f"hsb_{sha256}")
+        if not beaconeye_result and sha256:
+            beaconeye_result = _beacon_results_cache.get(f"beaconeye_{sha256}")
+
+    if hsb_result:
+        results["hunt_sleeping_beacons"] = hsb_result
+    if beaconeye_result:
+        results["beaconeye"] = beaconeye_result
+
+    # Beacon tools status
+    results["beacon_tools"] = {
+        "hsb_installed": os.path.isfile(HUNT_SLEEPING_BEACONS_EXE),
+        "beaconeye_installed": os.path.isfile(BEACONEYE_EXE),
+    }
 
     # --- Fibratus / Rustinel Alerts matching this detonation ---
     matching_alerts = []
@@ -1567,7 +1789,22 @@ def api_detonation_results():
 
     results["fibratus_alerts"] = matching_alerts[:50]
     results["fibratus_alert_count"] = len(matching_alerts)
-    results["ready"]["fibratus"] = len(matching_alerts) > 0
+
+    # Include EDR service status so frontend can detect offline state early
+    fibratus_online = _is_fibratus_running()
+    rustinel_online = os.path.isdir(RUSTINEL_ALERTS_DIR) and _is_rustinel_running()
+    results["edr_status"] = {
+        "fibratus_online": fibratus_online,
+        "rustinel_online": rustinel_online,
+    }
+
+    # EDR is "ready" if we have alerts OR if both services are offline (no point waiting)
+    if len(matching_alerts) > 0:
+        results["ready"]["fibratus"] = True
+    elif not fibratus_online and not rustinel_online:
+        results["ready"]["fibratus"] = True  # Don't block polling if both are offline
+    else:
+        results["ready"]["fibratus"] = False
 
     return jsonify(results)
 
@@ -1775,6 +2012,14 @@ def api_file_hex_write():
 THREATCHECK_EXE = r"C:\tools\ThreatCheck\bin\ThreatCheck.exe"
 DEFENDERCHECK_EXE = r"C:\tools\DefenderCheck\bin\DefenderCheck.exe"
 
+# --- Beacon Scanner Integration ---
+HUNT_SLEEPING_BEACONS_EXE = r"C:\tools\Hunt-Sleeping-Beacons\Hunt-Sleeping-Beacons.exe"
+BEACONEYE_EXE = r"C:\tools\BeaconEye\BeaconEye.exe"
+
+# Cache for beacon scan results (keyed by PID or sha256)
+_beacon_results_cache = {}
+_beacon_cache_lock = threading.Lock()
+
 
 @app.route("/api/scan/threatcheck", methods=["POST"])
 def api_scan_threatcheck():
@@ -1884,7 +2129,218 @@ def api_scan_status():
             "installed": os.path.isfile(DEFENDERCHECK_EXE),
             "path": DEFENDERCHECK_EXE,
         },
+        "hunt_sleeping_beacons": {
+            "installed": os.path.isfile(HUNT_SLEEPING_BEACONS_EXE),
+            "path": HUNT_SLEEPING_BEACONS_EXE,
+        },
+        "beaconeye": {
+            "installed": os.path.isfile(BEACONEYE_EXE),
+            "path": BEACONEYE_EXE,
+        },
     })
+
+
+# --- Beacon Scanner Endpoints ---
+
+@app.route("/api/scan/beacons", methods=["POST"])
+def api_scan_beacons():
+    """Run Hunt-Sleeping-Beacons on a specific PID or all processes."""
+    data = request.get_json(force=True) if request.is_json else request.form
+    pid = data.get("pid")
+
+    if not os.path.isfile(HUNT_SLEEPING_BEACONS_EXE):
+        return jsonify({"error": "Hunt-Sleeping-Beacons not installed", "path": HUNT_SLEEPING_BEACONS_EXE}), 500
+
+    try:
+        args = [HUNT_SLEEPING_BEACONS_EXE, "--commandline"]
+        if pid:
+            args.extend(["-p", str(pid)])
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=60,
+            cwd=os.path.dirname(HUNT_SLEEPING_BEACONS_EXE)
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        findings = _parse_hsb_output(output)
+
+        scan_result = {
+            "tool": "Hunt-Sleeping-Beacons",
+            "pid": pid,
+            "output": output.strip(),
+            "findings": findings,
+            "suspicious_count": len(findings),
+            "exit_code": result.returncode,
+        }
+
+        # Cache results for polling
+        if pid:
+            with _beacon_cache_lock:
+                key = f"hsb_{pid}"
+                _beacon_results_cache[key] = scan_result
+
+        return jsonify(scan_result)
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Hunt-Sleeping-Beacons timed out (60s)"}), 504
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/scan/beaconeye", methods=["POST"])
+def api_scan_beaconeye():
+    """Run BeaconEye to scan process memory for CobaltStrike beacon configs."""
+    data = request.get_json(force=True) if request.is_json else request.form
+    pid = data.get("pid")
+
+    if not os.path.isfile(BEACONEYE_EXE):
+        return jsonify({"error": "BeaconEye not installed", "path": BEACONEYE_EXE}), 500
+
+    try:
+        args = [BEACONEYE_EXE, "scan"]
+        if pid:
+            args = [BEACONEYE_EXE, "scan", "--pid", str(pid)]
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=90,
+            cwd=os.path.dirname(BEACONEYE_EXE)
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        findings = _parse_beaconeye_output(output)
+
+        scan_result = {
+            "tool": "BeaconEye",
+            "pid": pid,
+            "output": output.strip(),
+            "findings": findings,
+            "beacons_found": len(findings),
+            "exit_code": result.returncode,
+        }
+
+        # Cache results for polling
+        if pid:
+            with _beacon_cache_lock:
+                key = f"beaconeye_{pid}"
+                _beacon_results_cache[key] = scan_result
+
+        return jsonify(scan_result)
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "BeaconEye timed out (90s)"}), 504
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def _parse_hsb_output(output):
+    """Parse Hunt-Sleeping-Beacons output into structured findings."""
+    findings = []
+    current = None
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            if current:
+                findings.append(current)
+                current = None
+            continue
+        # Detect process lines (typically "PID: XXXX ..." or process name lines)
+        if "suspicious" in line.lower() or "ioc" in line.lower() or "beacon" in line.lower():
+            if current is None:
+                current = {"indicators": [], "raw": ""}
+            current["indicators"].append(line)
+            current["raw"] += line + "\n"
+        elif "pid" in line.lower() and ":" in line:
+            if current:
+                findings.append(current)
+            current = {"process": line, "indicators": [], "raw": line + "\n"}
+        elif current:
+            current["raw"] += line + "\n"
+            if any(kw in line.lower() for kw in ["unbacked", "private", "stomping", "spoofing", "apc", "timer", "proxy"]):
+                current["indicators"].append(line)
+    if current:
+        findings.append(current)
+    return findings
+
+
+def _parse_beaconeye_output(output):
+    """Parse BeaconEye output into structured beacon findings."""
+    findings = []
+    current = None
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # BeaconEye typically outputs beacon configs when found
+        if "beacon" in line.lower() and ("found" in line.lower() or "config" in line.lower() or "pid" in line.lower()):
+            if current:
+                findings.append(current)
+            current = {"summary": line, "config": {}, "raw": line + "\n"}
+        elif current:
+            current["raw"] += line + "\n"
+            # Parse key-value config lines
+            if ":" in line or "=" in line:
+                sep = ":" if ":" in line else "="
+                parts = line.split(sep, 1)
+                if len(parts) == 2:
+                    current["config"][parts[0].strip()] = parts[1].strip()
+    if current:
+        findings.append(current)
+    return findings
+
+
+def _run_beacon_scans_async(pid, sha256):
+    """Run beacon scans in a background thread after sample execution."""
+    def _scan():
+        import time as _time
+        # Wait a few seconds for the beacon to initialize and enter sleep
+        _time.sleep(5)
+
+        # Hunt-Sleeping-Beacons
+        if os.path.isfile(HUNT_SLEEPING_BEACONS_EXE):
+            try:
+                args = [HUNT_SLEEPING_BEACONS_EXE, "--commandline", "-p", str(pid)]
+                result = subprocess.run(
+                    args, capture_output=True, text=True, timeout=60,
+                    cwd=os.path.dirname(HUNT_SLEEPING_BEACONS_EXE)
+                )
+                output = (result.stdout or "") + (result.stderr or "")
+                findings = _parse_hsb_output(output)
+                with _beacon_cache_lock:
+                    _beacon_results_cache[f"hsb_{pid}"] = {
+                        "tool": "Hunt-Sleeping-Beacons",
+                        "pid": pid,
+                        "output": output.strip(),
+                        "findings": findings,
+                        "suspicious_count": len(findings),
+                        "exit_code": result.returncode,
+                    }
+                    if sha256:
+                        _beacon_results_cache[f"hsb_{sha256}"] = _beacon_results_cache[f"hsb_{pid}"]
+            except Exception as e:
+                with _beacon_cache_lock:
+                    _beacon_results_cache[f"hsb_{pid}"] = {"tool": "Hunt-Sleeping-Beacons", "error": str(e)}
+
+        # BeaconEye
+        if os.path.isfile(BEACONEYE_EXE):
+            try:
+                args = [BEACONEYE_EXE, "scan", "--pid", str(pid)]
+                result = subprocess.run(
+                    args, capture_output=True, text=True, timeout=90,
+                    cwd=os.path.dirname(BEACONEYE_EXE)
+                )
+                output = (result.stdout or "") + (result.stderr or "")
+                findings = _parse_beaconeye_output(output)
+                with _beacon_cache_lock:
+                    _beacon_results_cache[f"beaconeye_{pid}"] = {
+                        "tool": "BeaconEye",
+                        "pid": pid,
+                        "output": output.strip(),
+                        "findings": findings,
+                        "beacons_found": len(findings),
+                        "exit_code": result.returncode,
+                    }
+                    if sha256:
+                        _beacon_results_cache[f"beaconeye_{sha256}"] = _beacon_results_cache[f"beaconeye_{pid}"]
+            except Exception as e:
+                with _beacon_cache_lock:
+                    _beacon_results_cache[f"beaconeye_{pid}"] = {"tool": "BeaconEye", "error": str(e)}
+
+    thread = threading.Thread(target=_scan, daemon=True)
+    thread.start()
 
 
 # --- PE Analysis ---

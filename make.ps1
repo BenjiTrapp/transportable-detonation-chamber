@@ -19,7 +19,7 @@
 param(
     [Parameter(Position=0)]
     [ValidateSet(
-        'help','prerequisites','install','run','run-debug','uninstall',
+        'help','prerequisites','install','run','run-debug','dev','uninstall',
         'up','halt','destroy','reload','provision','provision-webui',
         'deploy','deploy-app','restart','deploy-restart','open','logs',
         'ssh','rdp','status','services','alerts','test','submit',
@@ -79,6 +79,7 @@ switch ($Target) {
         Write-Host "    .\make.ps1 install         Install Python venv + dependencies"
         Write-Host "    .\make.ps1 run             Run the Web UI locally (port 9000)"
         Write-Host "    .\make.ps1 run-debug       Run with auto-reload on file changes"
+        Write-Host "    .\make.ps1 dev             Dev mode: live-reload + file watcher"
         Write-Host "    .\make.ps1 uninstall       Remove local venv"
         Write-Host ""
         Write-Host "  VM Lifecycle:" -ForegroundColor Yellow
@@ -246,6 +247,11 @@ switch ($Target) {
             Pop-Location
             Remove-Item Env:\FLASK_DEBUG -ErrorAction SilentlyContinue
         }
+    }
+
+    'dev' {
+        Write-Host "[dev] Starting frontend development mode..." -ForegroundColor Cyan
+        & "$PSScriptRoot\dev.ps1" -Port $( if ($env:WEBUI_PORT) { $env:WEBUI_PORT } else { 9000 } )
     }
 
     'uninstall' {

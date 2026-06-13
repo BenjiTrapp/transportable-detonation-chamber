@@ -3533,6 +3533,31 @@ body.hex-resizing {
     border-radius: 3px;
     margin: 2px 2px;
 }
+.det-beacon-findings {
+    width: 100%;
+    margin-top: 6px;
+    padding-left: 12px;
+    border-left: 2px solid rgba(251,191,36,0.3);
+}
+.det-beacon-finding {
+    padding: 3px 0;
+    font-size: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    border-bottom: 1px solid rgba(255,255,255,0.02);
+}
+.det-beacon-finding:last-child { border-bottom: none; }
+.det-beacon-proc {
+    color: var(--accent-cyan);
+    font-family: var(--font-mono);
+    font-weight: 500;
+}
+.det-beacon-indicators {
+    color: #fbbf24;
+    font-family: var(--font-mono);
+    font-size: 9px;
+}
 .det-raw {
     font-size: 10px;
     font-family: var(--font-mono);
@@ -3805,6 +3830,35 @@ body.hex-resizing {
 .stats-chip.type-injection { border-color: rgba(239,68,68,0.5); color: #f87171; }
 .stats-chip.type-access { border-color: rgba(251,191,36,0.4); color: #fbbf24; }
 .stats-chip.type-other { border-color: var(--border-primary); }
+
+/* Sysmon diagnostic messages */
+.sysmon-diagnostic {
+    padding: 12px 20px;
+    font-size: 12px;
+    border-bottom: 1px solid var(--border-primary);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.sysmon-diagnostic::before {
+    font-size: 14px;
+    flex-shrink: 0;
+}
+.sysmon-diagnostic.info {
+    color: var(--accent-cyan);
+    background: rgba(34,211,238,0.04);
+}
+.sysmon-diagnostic.info::before { content: "\2139\FE0F"; }
+.sysmon-diagnostic.warning {
+    color: #fbbf24;
+    background: rgba(251,191,36,0.04);
+}
+.sysmon-diagnostic.warning::before { content: "\26A0\FE0F"; }
+.sysmon-diagnostic.error {
+    color: #ef4444;
+    background: rgba(239,68,68,0.04);
+}
+.sysmon-diagnostic.error::before { content: "\274C"; }
 .sysmon-events-table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .sysmon-events-table thead th { position: sticky; top: 0; background: var(--bg-primary); padding: 8px 10px; text-align: left; font-size: 10px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); border-bottom: 1px solid var(--border-primary); }
 .sysmon-events-table tbody tr { cursor: pointer; transition: background 0.1s; border-bottom: 1px solid var(--border-primary); }
@@ -4507,4 +4561,79 @@ body.hex-resizing {
     font-size: 10px;
     font-family: var(--font-mono);
     color: var(--text-secondary);
+}
+
+/* --- Toast Notifications --- */
+.toast-container {
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    z-index: 99999;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    pointer-events: none;
+    max-width: 420px;
+}
+.toast {
+    pointer-events: auto;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 12px 16px;
+    border-radius: 8px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    font-size: 12px;
+    color: var(--text-primary);
+    animation: toastSlideIn 0.25s ease-out;
+    transition: opacity 0.3s, transform 0.3s;
+}
+.toast.removing {
+    opacity: 0;
+    transform: translateX(30px);
+}
+.toast-icon {
+    font-size: 16px;
+    flex-shrink: 0;
+    margin-top: 1px;
+}
+.toast-body {
+    flex: 1;
+    min-width: 0;
+}
+.toast-title {
+    font-weight: 600;
+    margin-bottom: 2px;
+}
+.toast-detail {
+    color: var(--text-secondary);
+    font-size: 11px;
+    word-break: break-word;
+    font-family: var(--font-mono);
+}
+.toast.toast-success {
+    border-color: rgba(34,197,94,0.4);
+    background: linear-gradient(135deg, rgba(34,197,94,0.08), var(--bg-card));
+}
+.toast.toast-success .toast-icon { color: #22c55e; }
+.toast.toast-error {
+    border-color: rgba(239,68,68,0.4);
+    background: linear-gradient(135deg, rgba(239,68,68,0.08), var(--bg-card));
+}
+.toast.toast-error .toast-icon { color: #ef4444; }
+.toast.toast-warning {
+    border-color: rgba(251,191,36,0.4);
+    background: linear-gradient(135deg, rgba(251,191,36,0.08), var(--bg-card));
+}
+.toast.toast-warning .toast-icon { color: #fbbf24; }
+.toast.toast-info {
+    border-color: rgba(34,211,238,0.4);
+    background: linear-gradient(135deg, rgba(34,211,238,0.08), var(--bg-card));
+}
+.toast.toast-info .toast-icon { color: #22d3ee; }
+@keyframes toastSlideIn {
+    from { opacity: 0; transform: translateX(30px); }
+    to { opacity: 1; transform: translateX(0); }
 }

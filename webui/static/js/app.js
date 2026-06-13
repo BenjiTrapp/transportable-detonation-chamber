@@ -3,6 +3,33 @@
  * Frontend logic for the tracing/analysis interface
  */
 
+// --- Toast Notification System ---
+function showToast(type, title, detail, duration) {
+    // type: 'success' | 'error' | 'warning' | 'info'
+    let container = document.getElementById('toast-container');
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'toast-container';
+        container.className = 'toast-container';
+        document.body.appendChild(container);
+    }
+    const icons = { success: '\u2705', error: '\u274C', warning: '\u26A0\uFE0F', info: '\u2139\uFE0F' };
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+    toast.innerHTML = `
+        <span class="toast-icon">${icons[type] || icons.info}</span>
+        <div class="toast-body">
+            <div class="toast-title">${title}</div>
+            ${detail ? `<div class="toast-detail">${detail}</div>` : ''}
+        </div>`;
+    container.appendChild(toast);
+    const autoDismiss = duration || (type === 'error' ? 8000 : 4000);
+    setTimeout(() => {
+        toast.classList.add('removing');
+        setTimeout(() => toast.remove(), 300);
+    }, autoDismiss);
+}
+
 // --- State ---
 let state = {
     alerts: [],
@@ -281,7 +308,7 @@ function renderDashboard() {
             <div class="service-card-actions">
                 <button class="btn btn-sm" onclick="event.stopPropagation(); openRustinelDetail()">Details</button>
                 <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('tracing')">Trace Console</button>
-                ${!rOnline ? '<button class="btn btn-sm btn-launch" onclick="event.stopPropagation(); launchService(\'rustinel\')">Launch</button>' : ''}
+                ${!rOnline ? '<button class="btn btn-sm btn-launch" onclick="event.stopPropagation(); launchService(\'rustinel\', this)">Launch</button>' : ''}
             </div>
         </div>
     `);
@@ -305,7 +332,7 @@ function renderDashboard() {
             <div class="service-card-actions">
                 <button class="btn btn-sm" onclick="event.stopPropagation(); openAgentDetail()">Details</button>
                 <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('submit')">Submit Sample</button>
-                ${!aOnline ? '<button class="btn btn-sm btn-launch" onclick="event.stopPropagation(); launchService(\'detonator_agent\')">Launch</button>' : ''}
+                ${!aOnline ? '<button class="btn btn-sm btn-launch" onclick="event.stopPropagation(); launchService(\'detonator_agent\', this)">Launch</button>' : ''}
             </div>
         </div>
     `);
@@ -328,7 +355,7 @@ function renderDashboard() {
             <div class="service-card-actions">
                 <button class="btn btn-sm" onclick="event.stopPropagation(); openLitterboxDetail()">Details</button>
                 <button class="btn btn-sm" onclick="event.stopPropagation(); window.open('http://localhost:1337', '_blank')">Open UI</button>
-                ${!lOnline ? '<button class="btn btn-sm btn-launch" onclick="event.stopPropagation(); launchService(\'litterbox\')">Launch</button>' : ''}
+                ${!lOnline ? '<button class="btn btn-sm btn-launch" onclick="event.stopPropagation(); launchService(\'litterbox\', this)">Launch</button>' : ''}
             </div>
         </div>
     `);
@@ -350,7 +377,7 @@ function renderDashboard() {
             </div>
             <div class="service-card-actions">
                 <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('sysmon'); refreshSysmon();">View Events</button>
-                ${!sOnline ? '<button class="btn btn-sm btn-launch" onclick="event.stopPropagation(); launchService(\'sysmon\')">Launch</button>' : ''}
+                ${!sOnline ? '<button class="btn btn-sm btn-launch" onclick="event.stopPropagation(); launchService(\'sysmon\', this)">Launch</button>' : ''}
             </div>
         </div>
     `);
@@ -370,7 +397,7 @@ function renderDashboard() {
                 <div class="service-metric"><div class="service-metric-value">Kernel</div><div class="service-metric-label">LEVEL</div></div>
                 <div class="service-metric"><div class="service-metric-value">v3.0</div><div class="service-metric-label">VERSION</div></div>
             </div>
-            ${!fOnline ? '<div class="service-card-actions"><button class="btn btn-sm btn-launch" onclick="event.stopPropagation(); launchService(\'fibratus\')">Launch</button></div>' : ''}
+            ${!fOnline ? '<div class="service-card-actions"><button class="btn btn-sm btn-launch" onclick="event.stopPropagation(); launchService(\'fibratus\', this)">Launch</button></div>' : ''}
         </div>
     `);
 
@@ -2954,12 +2981,15 @@ function setStatus(elementId, online) {
     }
 }
 
-async function launchService(serviceName) {
-    const btn = event.currentTarget;
+async function launchService(serviceName, btnElement) {
+    const btn = btnElement || (typeof event !== 'undefined' && event ? event.currentTarget : null);
+    if (!btn) { console.error('launchService: no button reference'); return; }
     const originalText = btn.textContent;
+    const displayName = serviceName.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
     btn.textContent = 'Starting...';
     btn.disabled = true;
     btn.classList.add('launching');
+    showToast('info', `Starting ${displayName}...`, 'Sending launch request');
 
     try {
         const resp = await fetch('/api/service/launch', {
@@ -2973,29 +3003,31 @@ async function launchService(serviceName) {
             btn.textContent = 'Launched';
             btn.classList.remove('launching');
             btn.classList.add('launched');
+            showToast('success', `${displayName} launched`, data.message || 'Service started successfully');
             // Refresh status after a brief delay to let service start
             setTimeout(() => refreshDashboard(), 3000);
         } else {
             btn.textContent = 'Failed';
             btn.classList.remove('launching');
             btn.classList.add('launch-failed');
-            console.error('Launch failed:', data.error);
+            const errorDetail = data.error || 'Unknown error';
+            showToast('error', `${displayName} failed to start`, errorDetail);
             setTimeout(() => {
                 btn.textContent = originalText;
                 btn.disabled = false;
                 btn.classList.remove('launch-failed');
-            }, 3000);
+            }, 5000);
         }
     } catch (e) {
         btn.textContent = 'Error';
         btn.classList.remove('launching');
         btn.classList.add('launch-failed');
-        console.error('Launch error:', e);
+        showToast('error', `${displayName} — connection error`, e.message || 'Could not reach the server');
         setTimeout(() => {
             btn.textContent = originalText;
             btn.disabled = false;
             btn.classList.remove('launch-failed');
-        }, 3000);
+        }, 5000);
     }
 }
 
@@ -3154,11 +3186,12 @@ function renderDetonationResults(data, container) {
     // LitterBox upload stage
     if (data.litterbox) {
         const ok = data.litterbox.status >= 200 && data.litterbox.status < 400;
+        const errorDetail = data.litterbox.error ? ` — ${data.litterbox.error}` : '';
         html += `<div class="det-stage ${ok ? 'ok' : 'fail'}">
             <div class="det-stage-icon">${ok ? '&#x2705;' : '&#x274C;'}</div>
             <div class="det-stage-info">
                 <div class="det-stage-title">LitterBox Upload</div>
-                <div class="det-stage-detail">${ok ? 'Uploaded' : 'Failed'}</div>
+                <div class="det-stage-detail">${ok ? 'Uploaded' : 'Failed (HTTP ' + data.litterbox.status + ')' + escapeHtml(errorDetail)}</div>
             </div>
         </div>`;
     }
@@ -3166,11 +3199,12 @@ function renderDetonationResults(data, container) {
     // LitterBox static analysis stage
     if (data.litterbox_static) {
         const ok = data.litterbox_static.triggered;
-        html += `<div class="det-stage ${ok ? 'ok' : 'pending'}">
-            <div class="det-stage-icon">${ok ? '&#x2705;' : '&#x23F3;'}</div>
+        const errorDetail = data.litterbox_static.error ? ` — ${data.litterbox_static.error}` : '';
+        html += `<div class="det-stage ${ok ? 'ok' : 'fail'}">
+            <div class="det-stage-icon">${ok ? '&#x2705;' : '&#x274C;'}</div>
             <div class="det-stage-info">
                 <div class="det-stage-title">Static Analysis</div>
-                <div class="det-stage-detail">${ok ? 'Triggered (YARA + CheckPlz + Strings)' : 'Not triggered'}</div>
+                <div class="det-stage-detail">${ok ? 'Triggered (YARA + CheckPlz + Strings)' : 'Not triggered' + escapeHtml(errorDetail)}</div>
             </div>
         </div>`;
     }
@@ -3178,21 +3212,35 @@ function renderDetonationResults(data, container) {
     // LitterBox dynamic analysis stage
     if (data.litterbox_dynamic) {
         const ok = data.litterbox_dynamic.triggered;
-        html += `<div class="det-stage ${ok ? 'ok' : 'pending'}">
-            <div class="det-stage-icon">${ok ? '&#x2705;' : '&#x23F3;'}</div>
+        const errorDetail = data.litterbox_dynamic.error ? ` — ${data.litterbox_dynamic.error}` : '';
+        html += `<div class="det-stage ${ok ? 'ok' : 'fail'}">
+            <div class="det-stage-icon">${ok ? '&#x2705;' : '&#x274C;'}</div>
             <div class="det-stage-info">
                 <div class="det-stage-title">Dynamic Analysis</div>
-                <div class="det-stage-detail">${ok ? `Triggered (PE-Sieve, Moneta, HollowsHunter) — ${data.litterbox_dynamic.target}` : 'Not triggered'}</div>
+                <div class="det-stage-detail">${ok ? `Triggered (PE-Sieve, Moneta, HollowsHunter) — ${data.litterbox_dynamic.target}` : 'Not triggered' + escapeHtml(errorDetail)}</div>
             </div>
         </div>`;
     }
 
-    // Fibratus/EDR stage (always pending initially)
+    // Beacon scan stage
+    if (data.beacon_scan) {
+        const ok = data.beacon_scan.triggered;
+        const tools = data.beacon_scan.tools ? data.beacon_scan.tools.join(', ') : '';
+        html += `<div class="det-stage ${ok ? 'ok' : 'pending'}" id="det-beacon-stage">
+            <div class="det-stage-icon">${ok ? '&#x2705;' : '&#x23F3;'}</div>
+            <div class="det-stage-info">
+                <div class="det-stage-title">Beacon Scanning</div>
+                <div class="det-stage-detail">${ok ? `Triggered (${tools}) — scanning PID for C2 beacons...` : (data.beacon_scan.reason || 'Not triggered')}</div>
+            </div>
+        </div>`;
+    }
+
+    // Fibratus/EDR stage (always pending initially, status check happens on first poll)
     html += `<div class="det-stage pending" id="det-fibratus-stage">
         <div class="det-stage-icon">&#x23F3;</div>
         <div class="det-stage-info">
             <div class="det-stage-title">Fibratus / Rustinel EDR</div>
-            <div class="det-stage-detail">Waiting for detection alerts...</div>
+            <div class="det-stage-detail">Checking EDR service status...</div>
         </div>
     </div>`;
 
@@ -3233,26 +3281,73 @@ function pollDetonationResults(sha256, pid, lbHash, filename, attempt) {
         .then(r => r.json())
         .then(data => {
             renderDetonationPanels(data);
-            // Update Fibratus stage indicator
+            // Check service status
+            const edrStatus = data.edr_status || {};
+            const fibratusOffline = edrStatus.fibratus_online === false;
+            const rustinelOffline = edrStatus.rustinel_online === false;
+            const bothEdrOffline = fibratusOffline && rustinelOffline;
+            const litterboxOffline = data.litterbox_online === false;
+
+            // Update LitterBox stage indicators if LitterBox is offline
+            if (litterboxOffline && attempt === 0) {
+                // Show warning on static/dynamic stages if they haven't succeeded
+                const stageCards = document.querySelectorAll('.det-stage');
+                stageCards.forEach(card => {
+                    const title = card.querySelector('.det-stage-title')?.textContent || '';
+                    const detail = card.querySelector('.det-stage-detail');
+                    if ((title.includes('Static') || title.includes('Dynamic')) && card.classList.contains('fail')) {
+                        if (detail && !detail.textContent.includes('offline')) {
+                            detail.textContent += ' — LitterBox offline';
+                        }
+                    }
+                });
+            }
+
+            // Update Fibratus/Rustinel stage indicator based on EDR status
             const fStage = document.getElementById('det-fibratus-stage');
-            if (fStage && data.fibratus_alert_count > 0) {
-                fStage.className = 'det-stage ok';
-                fStage.querySelector('.det-stage-icon').innerHTML = '&#x2705;';
-                fStage.querySelector('.det-stage-detail').textContent = `${data.fibratus_alert_count} alert(s) detected`;
+            if (fStage) {
+                if (data.fibratus_alert_count > 0) {
+                    fStage.className = 'det-stage ok';
+                    fStage.querySelector('.det-stage-icon').innerHTML = '&#x2705;';
+                    fStage.querySelector('.det-stage-detail').textContent = `${data.fibratus_alert_count} alert(s) detected`;
+                } else if (bothEdrOffline) {
+                    fStage.className = 'det-stage fail';
+                    fStage.querySelector('.det-stage-icon').innerHTML = '&#x26A0;';
+                    fStage.querySelector('.det-stage-detail').textContent = 'Fibratus and Rustinel are offline — no detection possible';
+                } else if (fibratusOffline) {
+                    fStage.querySelector('.det-stage-detail').textContent = 'Fibratus offline — waiting for Rustinel alerts...';
+                } else if (rustinelOffline) {
+                    fStage.querySelector('.det-stage-detail').textContent = 'Rustinel offline — waiting for Fibratus alerts...';
+                }
             }
             // Keep polling until all results are ready (static + dynamic + fibratus)
             // Minimum 8 attempts (~40s) to allow EDR rules to fire and alert_loader to pick them up
+            // But skip minimum wait if services are offline
             const staticReady = data.ready && data.ready.static !== false;
             const dynamicReady = data.ready && data.ready.dynamic !== false;
             const fibratusReady = data.ready && data.ready.fibratus;
             const allReady = staticReady && dynamicReady && fibratusReady;
-            if (!allReady || attempt < 8) {
+            const allOffline = bothEdrOffline && litterboxOffline;
+            const minAttempts = allOffline ? 1 : (bothEdrOffline || litterboxOffline) ? 2 : 8;
+            if (!allReady || attempt < minAttempts) {
                 _detonationPollTimer = setTimeout(() => pollDetonationResults(sha256, pid, lbHash, filename, attempt + 1), 5000);
             } else {
                 // Final update: show polling complete message
                 const panels = document.getElementById('det-results-panels');
                 if (panels && !panels.querySelector('.det-poll-done')) {
-                    panels.insertAdjacentHTML('beforeend', '<div class="det-poll-done">Polling complete. All results collected.</div>');
+                    let msg;
+                    if (allOffline) {
+                        msg = '<div class="det-poll-done">Polling complete. All analysis services offline — no results available.</div>';
+                    } else if (litterboxOffline && bothEdrOffline) {
+                        msg = '<div class="det-poll-done">Polling complete. LitterBox and EDR services offline.</div>';
+                    } else if (litterboxOffline) {
+                        msg = '<div class="det-poll-done">Polling complete. LitterBox offline — static/dynamic analysis unavailable.</div>';
+                    } else if (bothEdrOffline) {
+                        msg = '<div class="det-poll-done">Polling complete. EDR services offline — no detection alerts available.</div>';
+                    } else {
+                        msg = '<div class="det-poll-done">Polling complete. All results collected.</div>';
+                    }
+                    panels.insertAdjacentHTML('beforeend', msg);
                 }
             }
         })
@@ -3402,6 +3497,90 @@ function renderDetonationPanels(data) {
         html += `</div></div>`;
     }
 
+    // --- Beacon Scan Results ---
+    const hasBeaconResults = data.hunt_sleeping_beacons || data.beaconeye;
+    if (hasBeaconResults) {
+        html += `<div class="det-panel">
+            <div class="det-panel-title">BEACON SCANNING</div>
+            <div class="det-panel-body">`;
+
+        // Hunt-Sleeping-Beacons results
+        if (data.hunt_sleeping_beacons) {
+            const hsb = data.hunt_sleeping_beacons;
+            html += `<div class="det-subsection"><span class="det-sub-label">Hunt-Sleeping-Beacons:</span>`;
+            if (hsb.error) {
+                html += `<span class="det-sub-value det-warn">${escapeHtml(hsb.error)}</span>`;
+            } else {
+                const count = hsb.suspicious_count || 0;
+                html += `<span class="det-sub-value ${count > 0 ? 'det-warn' : ''}">`;
+                html += count > 0 ? `${count} suspicious indicator(s) found` : 'No sleeping beacons detected';
+                html += `</span>`;
+                if (hsb.findings && hsb.findings.length > 0) {
+                    html += `<div class="det-beacon-findings">`;
+                    hsb.findings.slice(0, 10).forEach(f => {
+                        const process = f.process || '';
+                        const indicators = (f.indicators || []).join('; ');
+                        html += `<div class="det-beacon-finding">`;
+                        if (process) html += `<span class="det-beacon-proc">${escapeHtml(process)}</span>`;
+                        if (indicators) html += `<span class="det-beacon-indicators">${escapeHtml(indicators)}</span>`;
+                        html += `</div>`;
+                    });
+                    html += `</div>`;
+                }
+            }
+            html += `</div>`;
+        }
+
+        // BeaconEye results
+        if (data.beaconeye) {
+            const be = data.beaconeye;
+            html += `<div class="det-subsection"><span class="det-sub-label">BeaconEye:</span>`;
+            if (be.error) {
+                html += `<span class="det-sub-value det-warn">${escapeHtml(be.error)}</span>`;
+            } else {
+                const count = be.beacons_found || 0;
+                html += `<span class="det-sub-value ${count > 0 ? 'det-warn' : ''}">`;
+                html += count > 0 ? `${count} CobaltStrike beacon(s) found` : 'No CobaltStrike beacons detected';
+                html += `</span>`;
+                if (be.findings && be.findings.length > 0) {
+                    html += `<div class="det-beacon-findings">`;
+                    be.findings.slice(0, 5).forEach(f => {
+                        html += `<div class="det-beacon-finding">`;
+                        html += `<span class="det-beacon-proc">${escapeHtml(f.summary || '')}</span>`;
+                        if (f.config && Object.keys(f.config).length > 0) {
+                            const cfgStr = Object.entries(f.config).slice(0, 6).map(([k, v]) => `${k}: ${v}`).join(', ');
+                            html += `<span class="det-beacon-indicators">${escapeHtml(cfgStr)}</span>`;
+                        }
+                        html += `</div>`;
+                    });
+                    html += `</div>`;
+                }
+            }
+            html += `</div>`;
+        }
+
+        html += `</div></div>`;
+    }
+
+    // Update beacon stage card if results arrived
+    if (hasBeaconResults) {
+        const bStage = document.getElementById('det-beacon-stage');
+        if (bStage) {
+            const hsbCount = data.hunt_sleeping_beacons?.suspicious_count || 0;
+            const beCount = data.beaconeye?.beacons_found || 0;
+            const totalFindings = hsbCount + beCount;
+            if (totalFindings > 0) {
+                bStage.className = 'det-stage ok';
+                bStage.querySelector('.det-stage-icon').innerHTML = '&#x26A0;';
+                bStage.querySelector('.det-stage-detail').textContent = `${totalFindings} beacon indicator(s) found`;
+            } else {
+                bStage.className = 'det-stage ok';
+                bStage.querySelector('.det-stage-icon').innerHTML = '&#x2705;';
+                bStage.querySelector('.det-stage-detail').textContent = 'Scan complete — no beacons detected';
+            }
+        }
+    }
+
     // Show polling status if nothing yet
     if (!html) {
         html = `<div class="det-panel-loading"><div class="loading-spinner"></div><span>Waiting for results... Analysis may take 1-3 minutes.</span></div>`;
@@ -3496,9 +3675,9 @@ const graphState = {
 };
 
 async function graphRefresh() {
-    // Fetch process tree + sysmon network/DNS data in parallel
+    // Fetch process tree (limited to top 200 by threats) + sysmon network/DNS data in parallel
     const [procResp, sysmonNetResp, sysmonDnsResp, sysmonInjectResp] = await Promise.all([
-        fetch('/api/processes'),
+        fetch('/api/processes?max=200&sort=threats&include_parents=true'),
         fetch('/api/sysmon?event_id=3&max=300'),
         fetch('/api/sysmon?event_id=22&max=200'),
         fetch('/api/sysmon?event_id=8&max=100'),
@@ -3837,6 +4016,30 @@ function buildGraph(processes, networkEvents, dnsEvents, injectEvents, networkAl
         applyGridLayout(nodes, edges);
     } else {
         applyForceLayout(nodes, edges);
+    }
+
+    // Safety cap: if still too many nodes after filtering, truncate to prevent browser hang
+    const MAX_RENDER_NODES = 500;
+    if (nodes.length > MAX_RENDER_NODES) {
+        // Keep process nodes first (sorted by threats desc), then auxiliary nodes
+        const procNodes = nodes.filter(n => n.type === 'process').sort((a, b) => (b.threats || 0) - (a.threats || 0));
+        const otherNodes = nodes.filter(n => n.type !== 'process');
+        const kept = procNodes.slice(0, MAX_RENDER_NODES);
+        const keptIds = new Set(kept.map(n => n.id));
+        // Keep auxiliary nodes connected to kept processes
+        const keptOther = otherNodes.filter(n => {
+            const edge = edges.find(e => e.source === n.id || e.target === n.id);
+            if (!edge) return false;
+            const otherId = edge.source === n.id ? edge.target : edge.source;
+            return keptIds.has(otherId);
+        });
+        nodes.length = 0;
+        nodes.push(...kept, ...keptOther.slice(0, 200));
+        // Filter edges to only reference existing nodes
+        const allNodeIds = new Set(nodes.map(n => n.id));
+        const validEdges = edges.filter(e => allNodeIds.has(e.source) && allNodeIds.has(e.target));
+        edges.length = 0;
+        edges.push(...validEdges);
     }
 
     graphState.nodes = nodes;
@@ -4256,7 +4459,7 @@ function renderGraph() {
         ctx.font = '14px monospace';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        const showDetonatedOnly = document.getElementById('graph-filter-detonated')?.checked;
+        const showDetonatedOnly = document.getElementById('graph-show-detonated')?.checked;
         const msg = showDetonatedOnly
             ? 'No detonated processes found. Submit a sample to see detonation activity.'
             : 'No process data available.';
@@ -4746,12 +4949,31 @@ async function refreshSysmon() {
         }
     } catch (e) {
         console.error('Sysmon fetch error:', e);
+        const container = document.getElementById('sysmon-stats');
+        if (container) {
+            container.innerHTML = `<div class="sysmon-diagnostic warning">Connection error: ${escapeHtml(e.message)}</div>`;
+        }
     }
 }
 
 function renderSysmonStats() {
     const container = document.getElementById('sysmon-stats');
-    if (!container || !sysmonStats || !sysmonStats.stats) return;
+    if (!container || !sysmonStats) return;
+
+    // Show diagnostic message if present (log doesn't exist, is empty, etc.)
+    if (sysmonStats.diagnostic) {
+        const level = sysmonStats.online ? 'info' : 'warning';
+        container.innerHTML = `<div class="sysmon-diagnostic ${level}">${escapeHtml(sysmonStats.diagnostic)}</div>`;
+        return;
+    }
+    if (sysmonStats.error) {
+        container.innerHTML = `<div class="sysmon-diagnostic error">Error: ${escapeHtml(sysmonStats.error)}</div>`;
+        return;
+    }
+    if (!sysmonStats.stats || !sysmonStats.stats.length) {
+        container.innerHTML = `<div class="sysmon-diagnostic info">No event statistics available.</div>`;
+        return;
+    }
 
     const stats = sysmonStats.stats;
     const total = stats.reduce((sum, s) => sum + s.count, 0);
