@@ -4106,6 +4106,20 @@ body.hex-resizing {
 .stats-chip.type-other { border-color: var(--border-primary); }
 
 /* Sysmon diagnostic messages */
+.sysmon-loading {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 32px 20px;
+    font-size: 12px;
+    color: var(--text-muted);
+    justify-content: center;
+}
+.sysmon-loading .loading-spinner {
+    width: 20px;
+    height: 20px;
+    border-width: 2px;
+}
 .sysmon-diagnostic {
     padding: 12px 20px;
     font-size: 12px;
@@ -4154,8 +4168,148 @@ body.hex-resizing {
 .type-badge.type-access { background: rgba(251,191,36,0.15); color: #fbbf24; }
 .type-badge.type-other { background: rgba(148,163,184,0.1); color: var(--text-muted); }
 .filter-input { background: var(--bg-secondary); border: 1px solid var(--border-primary); color: var(--text-primary); padding: 4px 8px; border-radius: var(--radius); font-size: 11px; width: 80px; }
+.filter-input.filter-input-wide { width: 180px; }
 .filter-input:focus { border-color: var(--border-accent); outline: none; }
 .cmd-line { font-family: var(--font-mono); font-size: 10px; word-break: break-all; white-space: pre-wrap; }
+
+/* Sysmon search info */
+.sysmon-search-info {
+    font-size: 10px;
+    color: var(--text-muted);
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border-primary);
+    background: rgba(34,211,238,0.03);
+}
+.sysmon-filter-count {
+    font-family: var(--font-mono);
+    color: var(--accent-cyan);
+}
+
+/* Correlation column in Sysmon table */
+.sysmon-events-table .col-corr {
+    width: 90px;
+    text-align: center;
+}
+.corr-badge {
+    display: inline-block;
+    font-size: 8px;
+    font-weight: 600;
+    font-family: var(--font-mono);
+    padding: 1px 4px;
+    margin: 0 1px;
+    border-radius: 2px;
+    background: rgba(96,165,250,0.12);
+    color: #60a5fa;
+    cursor: help;
+}
+
+/* Correlation panel */
+.sysmon-correlation {
+    border-bottom: 1px solid var(--border-primary);
+    background: var(--bg-secondary);
+}
+.corr-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border-primary);
+}
+.corr-panel-title {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+.corr-panel-body {
+    padding: 12px 16px;
+    max-height: 320px;
+    overflow-y: auto;
+}
+.corr-ref-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+}
+.corr-ref-table th {
+    text-align: left;
+    padding: 6px 8px;
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border-primary);
+}
+.corr-ref-table td {
+    padding: 6px 8px;
+    border-bottom: 1px solid rgba(255,255,255,0.02);
+    vertical-align: top;
+}
+.corr-ref-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    margin: 2px 4px 2px 0;
+    color: var(--text-primary);
+}
+.corr-ref-eid {
+    font-family: var(--font-mono);
+    font-weight: 700;
+    color: #60a5fa;
+    background: rgba(96,165,250,0.1);
+    padding: 1px 4px;
+    border-radius: 2px;
+    font-size: 9px;
+}
+.corr-ref-log {
+    font-size: 9px;
+    color: var(--text-dim);
+}
+
+/* Detail panel correlation */
+.detail-corr-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 6px 0;
+}
+.detail-corr-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    padding: 4px 8px;
+    background: rgba(96,165,250,0.04);
+    border-radius: 3px;
+    border-left: 3px solid #60a5fa;
+}
+.detail-corr-item .corr-eid {
+    font-family: var(--font-mono);
+    font-weight: 700;
+    color: #60a5fa;
+    min-width: 40px;
+}
+.detail-corr-item .corr-name {
+    color: var(--text-primary);
+    flex: 1;
+}
+.detail-corr-item .corr-log {
+    font-size: 9px;
+    color: var(--text-muted);
+}
+
+/* Button outline variant */
+.btn-outline {
+    background: transparent;
+    border: 1px solid var(--border-primary);
+    color: var(--text-secondary);
+}
+.btn-outline:hover {
+    border-color: var(--accent-cyan);
+    color: var(--accent-cyan);
+    background: rgba(34,211,238,0.05);
+}
 
 /* --- Submissions History --- */
 .submissions-history {

@@ -1396,7 +1396,7 @@ def api_sysmon_stats():
         )
         diag_result = subprocess.run(
             ["powershell", "-NoProfile", "-Command", diag_cmd],
-            capture_output=True, text=True, timeout=5
+            capture_output=True, text=True, timeout=15
         )
         diag = {}
         if diag_result.stdout.strip():
@@ -1425,14 +1425,31 @@ def api_sysmon_stats():
                 "record_count": 0,
             })
 
-        # Log exists with records — query stats
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "Get-WinEvent -LogName 'Microsoft-Windows-Sysmon/Operational' -MaxEvents 500 -ErrorAction SilentlyContinue | "
-             "Group-Object Id | Select-Object Name, Count | ConvertTo-Json"],
-            capture_output=True, text=True, timeout=10
-        )
-        if result.stdout.strip():
+        # Log exists with records — query stats (retry up to 3 times on timeout)
+        stats_cmd = [
+            "powershell", "-NoProfile", "-Command",
+            "Get-WinEvent -LogName 'Microsoft-Windows-Sysmon/Operational' -MaxEvents 500 -ErrorAction SilentlyContinue | "
+            "Group-Object Id | Select-Object Name, Count | ConvertTo-Json"
+        ]
+        result = None
+        for attempt in range(3):
+            try:
+                result = subprocess.run(
+                    stats_cmd, capture_output=True, text=True, timeout=15
+                )
+                if result.stdout.strip():
+                    break
+            except subprocess.TimeoutExpired:
+                if attempt < 2:
+                    continue  # retry
+                return jsonify({
+                    "online": True,
+                    "stats": [],
+                    "diagnostic": f"Event log query timed out after 3 attempts. Log has {record_count} records.",
+                    "record_count": record_count,
+                })
+
+        if result and result.stdout.strip():
             data = json.loads(result.stdout.strip())
             if isinstance(data, dict):
                 data = [data]
@@ -1489,12 +1506,23 @@ def _read_sysmon_events(max_events=100, since=None, pid=None, event_id=None):
         "} | ConvertTo-Json -Depth 3 -Compress"
     )
 
+    for attempt in range(3):
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                capture_output=True, text=True, timeout=20
+            )
+            if result.stdout.strip():
+                break
+        except subprocess.TimeoutExpired:
+            if attempt < 2:
+                continue
+            return [{"error": "Sysmon event query timed out after 3 attempts"}]
+        except Exception as e:
+            return [{"error": str(e)}]
+
     try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_cmd],
-            capture_output=True, text=True, timeout=20
-        )
-        if result.stdout.strip():
+        if result and result.stdout.strip():
             data = json.loads(result.stdout.strip())
             if isinstance(data, dict):
                 data = [data]

@@ -5104,6 +5104,16 @@ async function refreshSysmon() {
     if (eventType) url += `&event_id=${eventType}`;
     if (pidFilter) url += `&pid=${pidFilter}`;
 
+    // Show loading spinner while fetching
+    const statsContainer = document.getElementById('sysmon-stats');
+    const tableContainer = document.getElementById('sysmon-table');
+    if (statsContainer && !sysmonStats) {
+        statsContainer.innerHTML = '<div class="sysmon-loading"><div class="loading-spinner"></div><span>Loading Sysmon statistics...</span></div>';
+    }
+    if (tableContainer && !sysmonEvents.length) {
+        tableContainer.innerHTML = '<div class="sysmon-loading"><div class="loading-spinner"></div><span>Querying Sysmon event log...</span></div>';
+    }
+
     try {
         const [eventsResp, statsResp] = await Promise.all([
             fetch(url),
@@ -5112,6 +5122,8 @@ async function refreshSysmon() {
         if (eventsResp.ok) {
             sysmonEvents = await eventsResp.json();
             renderSysmonTable();
+        } else if (tableContainer) {
+            tableContainer.innerHTML = '<div class="empty-state">Failed to load Sysmon events.</div>';
         }
         if (statsResp.ok) {
             sysmonStats = await statsResp.json();
@@ -5119,9 +5131,11 @@ async function refreshSysmon() {
         }
     } catch (e) {
         console.error('Sysmon fetch error:', e);
-        const container = document.getElementById('sysmon-stats');
-        if (container) {
-            container.innerHTML = `<div class="sysmon-diagnostic warning">Connection error: ${escapeHtml(e.message)}</div>`;
+        if (statsContainer) {
+            statsContainer.innerHTML = `<div class="sysmon-diagnostic warning">Connection error: ${escapeHtml(e.message)}</div>`;
+        }
+        if (tableContainer) {
+            tableContainer.innerHTML = `<div class="empty-state">Connection error: ${escapeHtml(e.message)}</div>`;
         }
     }
 }
@@ -5177,21 +5191,49 @@ function renderSysmonTable() {
         return;
     }
 
-    let html = `<table class="sysmon-events-table"><thead><tr><th>Time</th><th>Type</th><th>PID</th><th>Image</th><th>Details</th></tr></thead><tbody>`;
-    sysmonEvents.forEach(ev => {
+    // Apply local search filter
+    const searchTerm = (document.getElementById('sysmon-search')?.value || '').toLowerCase().trim();
+    let filtered = sysmonEvents;
+    if (searchTerm) {
+        filtered = sysmonEvents.filter(ev => {
+            const haystack = [
+                ev.image, ev.commandline, ev.type, ev.target, ev.query,
+                ev.dst_ip, ev.dst_hostname, ev.loaded_image, ev.source_image,
+                ev.target_image, ev.parent_image, ev.user, ev.hashes,
+                String(ev.pid || ''), String(ev.event_id || ''),
+                ev.details, ev.result
+            ].filter(Boolean).join(' ').toLowerCase();
+            return haystack.includes(searchTerm);
+        });
+    }
+
+    if (!filtered.length) {
+        container.innerHTML = `<div class="empty-state">No events matching "${escapeHtml(searchTerm)}" (${sysmonEvents.length} total)</div>`;
+        return;
+    }
+
+    const countInfo = searchTerm ? ` <span class="sysmon-filter-count">(${filtered.length}/${sysmonEvents.length})</span>` : '';
+    let html = `<table class="sysmon-events-table"><thead><tr><th>Time</th><th>Type</th><th>PID</th><th>Image</th><th>Details</th><th class="col-corr">Win. EID</th></tr></thead><tbody>`;
+    filtered.forEach(ev => {
         const typeClass = getSysmonTypeClass(String(ev.event_id));
         const time = ev.timestamp ? formatSysmonTime(ev.timestamp) : '';
         const image = ev.image ? ev.image.split('\\').pop() : '';
         const details = getSysmonDetails(ev);
+        const correlated = getCorrelatedWindowsEvents(ev.event_id);
+        const corrHtml = correlated.length > 0
+            ? correlated.map(c => `<span class="corr-badge" title="${escapeHtml(c.name)}">${c.id}</span>`).join('')
+            : '';
         html += `<tr onclick="showSysmonDetail(${JSON.stringify(ev).replace(/"/g, '&quot;')})">
             <td class="col-time">${time}</td>
             <td><span class="type-badge ${typeClass}">${escapeHtml(ev.type || '')}</span></td>
             <td class="col-pid">${ev.pid || ''}</td>
             <td class="col-image">${escapeHtml(image)}</td>
             <td class="col-details">${escapeHtml(details)}</td>
+            <td class="col-corr">${corrHtml}</td>
         </tr>`;
     });
     html += '</tbody></table>';
+    if (searchTerm) html = `<div class="sysmon-search-info">Showing ${filtered.length} of ${sysmonEvents.length} events${countInfo}</div>` + html;
     container.innerHTML = html;
 }
 
@@ -5229,9 +5271,128 @@ function showSysmonDetail(ev) {
             <div class="detail-field"><span class="field-label">Image</span><span class="field-value">${escapeHtml(ev.image || '')}</span></div>
         </div></div>`;
 
+    // Show correlated Windows Event IDs
+    const correlated = getCorrelatedWindowsEvents(ev.event_id);
+    if (correlated.length > 0) {
+        html += `<div class="detail-section"><div class="detail-section-title">Correlated Windows Events</div><div class="detail-corr-list">`;
+        correlated.forEach(c => {
+            html += `<div class="detail-corr-item"><span class="corr-eid">${c.id}</span><span class="corr-name">${escapeHtml(c.name)}</span><span class="corr-log">${escapeHtml(c.log)}</span></div>`;
+        });
+        html += `</div></div>`;
+    }
+
     setDetailHeader('Sysmon', 'background:rgba(34,197,94,0.15);color:var(--accent-green)', ev.type || 'Event', '');
     setDetailBody(html);
     showDetail();
+}
+
+/** Local client-side search filter (instant, no API call) */
+function filterSysmonLocal() {
+    renderSysmonTable();
+}
+
+/**
+ * Sysmon Event ID <-> Windows Event ID Correlation Map.
+ * Maps Sysmon events to related standard Windows security/system events.
+ */
+const SYSMON_WINDOWS_CORRELATION = {
+    1: [ // ProcessCreate
+        {id: 4688, name: 'Process Creation', log: 'Security'},
+        {id: 4689, name: 'Process Exit (pair)', log: 'Security'},
+    ],
+    3: [ // NetworkConnect
+        {id: 5156, name: 'WFP Connection Allowed', log: 'Security'},
+        {id: 5157, name: 'WFP Connection Blocked', log: 'Security'},
+        {id: 5158, name: 'WFP Bind Allowed', log: 'Security'},
+    ],
+    5: [ // ProcessTerminate
+        {id: 4689, name: 'Process Exit', log: 'Security'},
+    ],
+    7: [ // ImageLoad (DLL)
+        {id: 7045, name: 'Service Installed', log: 'System'},
+        {id: 4697, name: 'Service Installed (audit)', log: 'Security'},
+    ],
+    8: [ // CreateRemoteThread
+        {id: 4688, name: 'Source Process Creation', log: 'Security'},
+    ],
+    10: [ // ProcessAccess
+        {id: 4663, name: 'Object Access Attempt', log: 'Security'},
+        {id: 4656, name: 'Handle Requested', log: 'Security'},
+    ],
+    11: [ // FileCreate
+        {id: 4663, name: 'Object Access (File)', log: 'Security'},
+        {id: 4656, name: 'Handle to Object Requested', log: 'Security'},
+        {id: 11707, name: 'Installation Completed (MSI)', log: 'Application'},
+    ],
+    12: [ // RegistryEvent (CreateKey/DeleteKey)
+        {id: 4657, name: 'Registry Value Modified', log: 'Security'},
+        {id: 4663, name: 'Object Access (Registry)', log: 'Security'},
+    ],
+    13: [ // RegistryValueSet
+        {id: 4657, name: 'Registry Value Modified', log: 'Security'},
+        {id: 4663, name: 'Object Access (Registry)', log: 'Security'},
+    ],
+    14: [ // RegistryRename
+        {id: 4657, name: 'Registry Value Modified', log: 'Security'},
+    ],
+    22: [ // DNSQuery
+        {id: 3008, name: 'DNS Query (DNS Client)', log: 'DNS Client Events'},
+    ],
+    6: [ // DriverLoad
+        {id: 7045, name: 'New Service Installed', log: 'System'},
+        {id: 7034, name: 'Service Crashed', log: 'System'},
+    ],
+    15: [ // FileCreateStreamHash (ADS)
+        {id: 4663, name: 'Object Access (File Stream)', log: 'Security'},
+    ],
+    17: [ // PipeCreated
+        {id: 4656, name: 'Handle to Named Pipe', log: 'Security'},
+    ],
+    23: [ // FileDelete
+        {id: 4663, name: 'Object Access (Delete)', log: 'Security'},
+        {id: 4660, name: 'Object Deleted', log: 'Security'},
+    ],
+    25: [ // ProcessTampering
+        {id: 4688, name: 'Source Process Creation', log: 'Security'},
+    ],
+};
+
+function getCorrelatedWindowsEvents(sysmonEventId) {
+    return SYSMON_WINDOWS_CORRELATION[sysmonEventId] || [];
+}
+
+/** Toggle the correlation reference panel */
+function toggleSysmonCorrelation() {
+    const panel = document.getElementById('sysmon-correlation-panel');
+    if (!panel) return;
+
+    if (panel.style.display !== 'none') {
+        panel.style.display = 'none';
+        return;
+    }
+
+    let html = '<div class="corr-panel-header"><span class="corr-panel-title">Sysmon / Windows Event ID Correlation</span><button class="btn btn-sm" onclick="toggleSysmonCorrelation()">Close</button></div>';
+    html += '<div class="corr-panel-body"><table class="corr-ref-table"><thead><tr><th>Sysmon ID</th><th>Sysmon Event</th><th>Related Windows Events</th></tr></thead><tbody>';
+
+    const sysmonNames = {
+        1: 'ProcessCreate', 3: 'NetworkConnect', 5: 'ProcessTerminate',
+        6: 'DriverLoad', 7: 'ImageLoad', 8: 'CreateRemoteThread',
+        10: 'ProcessAccess', 11: 'FileCreate', 12: 'RegistryCreate/Delete',
+        13: 'RegistryValueSet', 14: 'RegistryRename', 15: 'FileStreamHash',
+        17: 'PipeCreated', 22: 'DNSQuery', 23: 'FileDelete', 25: 'ProcessTampering'
+    };
+
+    for (const [sysId, sysName] of Object.entries(sysmonNames)) {
+        const corr = SYSMON_WINDOWS_CORRELATION[sysId] || [];
+        const corrHtml = corr.map(c =>
+            `<span class="corr-ref-item"><span class="corr-ref-eid">${c.id}</span> ${escapeHtml(c.name)} <span class="corr-ref-log">[${escapeHtml(c.log)}]</span></span>`
+        ).join('');
+        html += `<tr><td class="mono">${sysId}</td><td>${escapeHtml(sysName)}</td><td>${corrHtml || '<span class="muted">—</span>'}</td></tr>`;
+    }
+
+    html += '</tbody></table></div>';
+    panel.innerHTML = html;
+    panel.style.display = 'block';
 }
 
 // --- Utilities ---
