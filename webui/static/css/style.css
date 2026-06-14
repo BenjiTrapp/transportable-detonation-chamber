@@ -1785,6 +1785,280 @@ body.hex-resizing {
 }
 .btn-accent:hover { background: rgba(34,211,238,0.2); }
 
+/* ============================================= */
+/* DiE-style Detection Overview (shared PE/ELF) */
+/* ============================================= */
+.die-overview {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    margin-bottom: 16px;
+}
+
+.die-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border-primary);
+}
+.die-title {
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--text-muted);
+    letter-spacing: 1px;
+}
+.die-assessment {
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 1.2px;
+    padding: 4px 12px;
+    border-radius: 4px;
+    border: 1px solid;
+}
+
+/* Detection Cards */
+.die-detections {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 8px;
+    margin-bottom: 14px;
+}
+.die-detection-card {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 8px 10px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-left: 3px solid;
+    border-radius: 4px;
+    transition: background 0.15s;
+}
+.die-detection-card:hover {
+    background: rgba(255,255,255,0.02);
+}
+.die-det-icon {
+    font-size: 14px;
+    line-height: 1;
+    margin-top: 1px;
+}
+.die-det-body {
+    flex: 1;
+    min-width: 0;
+}
+.die-det-type {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+}
+.die-det-name {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-top: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.die-det-ver {
+    font-size: 9px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    margin-top: 1px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.die-det-conf {
+    font-size: 8px;
+    font-weight: 700;
+    color: var(--text-muted);
+    background: rgba(255,255,255,0.04);
+    padding: 2px 5px;
+    border-radius: 3px;
+    letter-spacing: 0.3px;
+    align-self: center;
+}
+.die-no-detections {
+    font-size: 11px;
+    color: var(--text-muted);
+    padding: 8px 0;
+    margin-bottom: 12px;
+}
+
+/* Entropy Heatmap */
+.die-entropy-section {
+    margin-bottom: 14px;
+}
+.die-section-title {
+    font-size: 9px;
+    font-weight: 700;
+    color: var(--text-muted);
+    letter-spacing: 0.8px;
+    margin-bottom: 6px;
+}
+.die-section-title.die-clickable {
+    cursor: pointer;
+    user-select: none;
+}
+.die-section-title.die-clickable:hover {
+    color: var(--text-primary);
+}
+.die-entropy-legend {
+    display: flex;
+    justify-content: space-between;
+    font-size: 8px;
+    color: var(--text-dim);
+    margin-bottom: 4px;
+    padding: 0 2px;
+}
+.die-entropy-heatmap {
+    display: flex;
+    height: 24px;
+    border-radius: 4px;
+    overflow: hidden;
+    border: 1px solid var(--border-primary);
+    background: var(--bg-primary);
+}
+.die-entropy-block {
+    height: 100%;
+    transition: opacity 0.15s;
+    cursor: crosshair;
+}
+.die-entropy-block:hover {
+    opacity: 0.7;
+    outline: 1px solid rgba(255,255,255,0.5);
+    outline-offset: -1px;
+    z-index: 1;
+    position: relative;
+}
+.die-entropy-scale {
+    display: flex;
+    justify-content: space-between;
+    font-size: 8px;
+    color: var(--text-dim);
+    margin-top: 3px;
+    padding: 0 2px;
+    font-family: var(--font-mono);
+}
+
+/* Section Layout Diagram */
+.die-layout-section {
+    margin-bottom: 14px;
+}
+.die-layout-bar {
+    position: relative;
+    height: 32px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    overflow: hidden;
+}
+.die-layout-seg {
+    position: absolute;
+    top: 0;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    transition: opacity 0.15s;
+    border-right: 1px solid rgba(0,0,0,0.3);
+    cursor: pointer;
+}
+.die-layout-seg:hover {
+    opacity: 0.75;
+    z-index: 2;
+}
+.die-layout-seg:last-child {
+    border-right: none;
+}
+.die-layout-label {
+    font-size: 8px;
+    font-weight: 600;
+    color: rgba(255,255,255,0.9);
+    text-shadow: 0 1px 2px rgba(0,0,0,0.6);
+    letter-spacing: 0.3px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    padding: 0 3px;
+}
+.die-overlay-seg {
+    opacity: 0.6;
+    background-image: repeating-linear-gradient(
+        45deg,
+        transparent,
+        transparent 3px,
+        rgba(255,255,255,0.05) 3px,
+        rgba(255,255,255,0.05) 6px
+    );
+}
+.die-layout-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 6px;
+    padding: 0 2px;
+}
+.die-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 9px;
+    color: var(--text-muted);
+}
+.die-legend-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    display: inline-block;
+}
+
+/* Rich Header (PE only) */
+.die-rich-header {
+    margin-top: 4px;
+}
+.die-rich-header summary {
+    cursor: pointer;
+    user-select: none;
+}
+.die-rich-entries {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 3px;
+    margin-top: 6px;
+    padding: 8px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+    max-height: 150px;
+    overflow-y: auto;
+}
+.die-rich-entry {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    padding: 2px 6px;
+    border-radius: 2px;
+}
+.die-rich-entry:nth-child(odd) {
+    background: rgba(255,255,255,0.01);
+}
+.die-rich-tool {
+    color: var(--text-primary);
+    font-weight: 500;
+}
+.die-rich-build {
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+    font-size: 9px;
+}
+
 /* --- ELF Analysis Panel --- */
 .elf-panel {
     margin-top: 12px;

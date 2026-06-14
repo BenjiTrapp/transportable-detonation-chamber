@@ -126,11 +126,31 @@ New-NetFirewallRule -DisplayName "Detonator REST API" -Direction Inbound -LocalP
 
 # --- Enable OpenSSH Server ---
 Write-Host "[*] Installing OpenSSH Server..." -ForegroundColor Yellow
-$sshCapability = Get-WindowsCapability -Online | Where-Object Name -like "OpenSSH.Server*"
-if ($sshCapability.State -ne "Installed") {
-    Add-WindowsCapability -Online -Name "OpenSSH.Server~~~~0.0.1.0" -ErrorAction SilentlyContinue
-    Start-Service sshd -ErrorAction SilentlyContinue
+# Check if sshd service already exists (fast check, avoids slow Get-WindowsCapability -Online)
+$sshdService = Get-Service sshd -ErrorAction SilentlyContinue
+if ($sshdService) {
+    Write-Host "[+] OpenSSH Server already installed" -ForegroundColor Green
+    if ($sshdService.Status -ne 'Running') {
+        Start-Service sshd -ErrorAction SilentlyContinue
+    }
     Set-Service -Name sshd -StartupType Automatic -ErrorAction SilentlyContinue
+} else {
+    # Service not found - try installing via Add-WindowsCapability with a timeout
+    Write-Host "[*] sshd service not found, attempting capability install..." -ForegroundColor Yellow
+    $job = Start-Job -ScriptBlock {
+        Add-WindowsCapability -Online -Name "OpenSSH.Server~~~~0.0.1.0" -ErrorAction SilentlyContinue
+    }
+    $completed = Wait-Job $job -Timeout 120
+    if ($completed) {
+        Receive-Job $job -ErrorAction SilentlyContinue
+        Start-Service sshd -ErrorAction SilentlyContinue
+        Set-Service -Name sshd -StartupType Automatic -ErrorAction SilentlyContinue
+        Write-Host "[+] OpenSSH Server installed" -ForegroundColor Green
+    } else {
+        Stop-Job $job -ErrorAction SilentlyContinue
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+        Write-Host "[!] OpenSSH install timed out (120s) - skipping. Install manually if needed." -ForegroundColor Yellow
+    }
 }
 
 Write-Host "[+] Prerequisites installation complete!" -ForegroundColor Green

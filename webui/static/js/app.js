@@ -1684,8 +1684,173 @@ async function peAnalyze() {
     }
 }
 
+/**
+ * DiE-style Detection Overview — renders a visual panel showing:
+ * 1. Assessment badge (CLEAN/PACKED/ENCRYPTED/PROTECTED)
+ * 2. Detection results (Compiler, Linker, Packer, Protector, Overlay)
+ * 3. Entropy heatmap (64-block visual gradient)
+ * 4. Section layout diagram (proportional file map)
+ */
+function renderDetectionOverview(detection, prefix) {
+    let html = `<div class="die-overview ${prefix}-die-overview">`;
+
+    // --- Assessment Badge ---
+    const assessmentColors = {
+        clean: {bg: 'rgba(34,197,94,0.08)', border: '#22c55e', text: '#22c55e', label: 'CLEAN'},
+        packed: {bg: 'rgba(168,85,247,0.08)', border: '#a855f7', text: '#a855f7', label: 'PACKED'},
+        encrypted: {bg: 'rgba(239,68,68,0.08)', border: '#ef4444', text: '#ef4444', label: 'ENCRYPTED'},
+        protected: {bg: 'rgba(251,191,36,0.08)', border: '#f59e0b', text: '#f59e0b', label: 'PROTECTED'},
+        suspicious: {bg: 'rgba(251,191,36,0.06)', border: '#fbbf24', text: '#fbbf24', label: 'SUSPICIOUS'},
+    };
+    const assess = assessmentColors[detection.assessment] || assessmentColors.clean;
+
+    html += `<div class="die-header">`;
+    html += `<div class="die-title">BINARY ANALYSIS</div>`;
+    html += `<div class="die-assessment" style="background:${assess.bg};border-color:${assess.border};color:${assess.text}">${assess.label}</div>`;
+    html += `</div>`;
+
+    // --- Detection Results (cards like DiE) ---
+    if (detection.detections && detection.detections.length > 0) {
+        html += `<div class="die-detections">`;
+
+        // Group by type
+        const groups = {};
+        detection.detections.forEach(d => {
+            if (!groups[d.type]) groups[d.type] = [];
+            groups[d.type].push(d);
+        });
+
+        const typeIcons = {
+            compiler: '\u2699', linker: '\u26D3', packer: '\u26A0',
+            protector: '\u26E8', overlay: '\u2630', language: '\u2328', runtime: '\u27F3'
+        };
+        const typeLabels = {
+            compiler: 'Compiler', linker: 'Linker', packer: 'Packer/Crypter',
+            protector: 'Protector', overlay: 'Overlay', language: 'Language', runtime: 'Runtime'
+        };
+        const typeColors = {
+            compiler: '#60a5fa', linker: '#818cf8', packer: '#a855f7',
+            protector: '#f59e0b', overlay: '#6b7280', language: '#22d3ee', runtime: '#34d399'
+        };
+
+        for (const [type, items] of Object.entries(groups)) {
+            const icon = typeIcons[type] || '\u2022';
+            const label = typeLabels[type] || type;
+            const color = typeColors[type] || '#94a3b8';
+
+            items.forEach(item => {
+                const conf = item.confidence === 'high' ? 'H' : item.confidence === 'medium' ? 'M' : 'L';
+                html += `<div class="die-detection-card" style="border-left-color:${color}">`;
+                html += `<div class="die-det-icon" style="color:${color}">${icon}</div>`;
+                html += `<div class="die-det-body">`;
+                html += `<div class="die-det-type" style="color:${color}">${escapeHtml(label)}</div>`;
+                html += `<div class="die-det-name">${escapeHtml(item.name)}</div>`;
+                if (item.version) html += `<div class="die-det-ver">${escapeHtml(item.version)}</div>`;
+                html += `</div>`;
+                html += `<div class="die-det-conf" title="Confidence: ${item.confidence}">${conf}</div>`;
+                html += `</div>`;
+            });
+        }
+        html += `</div>`;
+    } else {
+        html += `<div class="die-no-detections">No specific tool signatures detected.</div>`;
+    }
+
+    // --- Entropy Heatmap ---
+    if (detection.entropy_map && detection.entropy_map.length > 0) {
+        html += `<div class="die-entropy-section">`;
+        html += `<div class="die-section-title">ENTROPY MAP</div>`;
+        html += `<div class="die-entropy-legend"><span class="die-legend-low">0.0 (empty)</span><span class="die-legend-mid">4.0 (code)</span><span class="die-legend-high">8.0 (random)</span></div>`;
+        html += `<div class="die-entropy-heatmap">`;
+        detection.entropy_map.forEach((val, idx) => {
+            const pct = (val / 8) * 100;
+            // Color gradient: green (low) -> yellow (mid) -> red (high)
+            let color;
+            if (val < 3.0) color = `hsl(140, 60%, ${30 + val * 5}%)`;
+            else if (val < 5.5) color = `hsl(${140 - (val - 3) * 28}, 60%, 45%)`;
+            else if (val < 7.0) color = `hsl(${70 - (val - 5.5) * 30}, 70%, 50%)`;
+            else color = `hsl(${25 - (val - 7.0) * 25}, 80%, 50%)`;
+            const blockPct = (100 / detection.entropy_map.length).toFixed(3);
+            html += `<div class="die-entropy-block" style="width:${blockPct}%;background:${color}" title="Block ${idx}: entropy ${val.toFixed(3)}"></div>`;
+        });
+        html += `</div>`;
+
+        // Mini scale bar below
+        html += `<div class="die-entropy-scale">`;
+        html += `<span>0x0</span>`;
+        if (detection.file_size) html += `<span>${formatSize(detection.file_size)}</span>`;
+        html += `</div>`;
+        html += `</div>`;
+    }
+
+    // --- Section Layout Diagram ---
+    if (detection.section_layout && detection.section_layout.length > 0) {
+        html += `<div class="die-layout-section">`;
+        html += `<div class="die-section-title">FILE STRUCTURE</div>`;
+        html += `<div class="die-layout-bar">`;
+
+        detection.section_layout.forEach(sec => {
+            if (sec.pct_size < 0.3) return; // Skip tiny sections
+            let secColor;
+            if (sec.packer) secColor = '#a855f7'; // purple for packer sections
+            else if (sec.entropy_status === 'high') secColor = '#ef4444'; // red for high entropy
+            else if (sec.entropy_status === 'warn') secColor = '#fbbf24'; // yellow for warning
+            else if (sec.executable) secColor = '#3b82f6'; // blue for code
+            else if (sec.writable) secColor = '#22c55e'; // green for data
+            else secColor = '#64748b'; // gray for read-only
+
+            const tooltip = `${sec.name}: ${formatSize(sec.size)} | Entropy: ${sec.entropy.toFixed(2)}${sec.packer ? ' | ' + sec.packer : ''}`;
+            html += `<div class="die-layout-seg" style="left:${sec.pct_start}%;width:${Math.max(sec.pct_size, 0.5)}%;background:${secColor}" title="${escapeHtml(tooltip)}">`;
+            if (sec.pct_size > 5) html += `<span class="die-layout-label">${escapeHtml(sec.name)}</span>`;
+            html += `</div>`;
+        });
+
+        // Show overlay if present
+        if (detection.overlay && detection.overlay.size > 0 && detection.file_size > 0) {
+            const overlayPct = (detection.overlay.size / detection.file_size * 100).toFixed(2);
+            const overlayStart = (detection.overlay.offset / detection.file_size * 100).toFixed(2);
+            html += `<div class="die-layout-seg die-overlay-seg" style="left:${overlayStart}%;width:${overlayPct}%;background:#6b7280" title="Overlay: ${formatSize(detection.overlay.size)}">`;
+            if (parseFloat(overlayPct) > 5) html += `<span class="die-layout-label">overlay</span>`;
+            html += `</div>`;
+        }
+
+        html += `</div>`; // end layout-bar
+
+        // Legend
+        html += `<div class="die-layout-legend">`;
+        html += `<span class="die-legend-item"><span class="die-legend-dot" style="background:#3b82f6"></span>Code</span>`;
+        html += `<span class="die-legend-item"><span class="die-legend-dot" style="background:#22c55e"></span>Data</span>`;
+        html += `<span class="die-legend-item"><span class="die-legend-dot" style="background:#64748b"></span>Read-only</span>`;
+        html += `<span class="die-legend-item"><span class="die-legend-dot" style="background:#ef4444"></span>High Entropy</span>`;
+        html += `<span class="die-legend-item"><span class="die-legend-dot" style="background:#a855f7"></span>Packer</span>`;
+        if (detection.overlay) html += `<span class="die-legend-item"><span class="die-legend-dot" style="background:#6b7280"></span>Overlay</span>`;
+        html += `</div>`;
+
+        html += `</div>`;
+    }
+
+    // --- Rich Header (PE only, collapsible) ---
+    if (detection.rich_header && detection.rich_header.length > 0) {
+        html += `<details class="die-rich-header">`;
+        html += `<summary class="die-section-title die-clickable">RICH HEADER (${detection.rich_header.length} entries)</summary>`;
+        html += `<div class="die-rich-entries">`;
+        detection.rich_header.forEach(entry => {
+            html += `<div class="die-rich-entry"><span class="die-rich-tool">${escapeHtml(entry.tool)}</span><span class="die-rich-build">Build ${entry.build}${entry.count ? ' (\u00D7' + entry.count + ')' : ''}</span></div>`;
+        });
+        html += `</div></details>`;
+    }
+
+    html += `</div>`; // end die-overview
+    return html;
+}
+
 function renderPeAnalysis(pe, container) {
     let html = '';
+
+    // --- DiE-style Detection Overview ---
+    if (pe.detection) {
+        html += renderDetectionOverview(pe.detection, 'pe');
+    }
 
     // --- IOC Flags Banner ---
     if (pe.flags && pe.flags.length > 0) {
@@ -2029,6 +2194,11 @@ async function elfAnalyze() {
 
 function renderElfAnalysis(elf, container) {
     let html = '';
+
+    // --- DiE-style Detection Overview ---
+    if (elf.detection) {
+        html += renderDetectionOverview(elf.detection, 'elf');
+    }
 
     // --- IOC Flags Banner ---
     if (elf.flags && elf.flags.length > 0) {

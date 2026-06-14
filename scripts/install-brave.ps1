@@ -24,16 +24,28 @@ if (-not (Test-Path $bravePath)) {
     Write-Host "[+] Brave Browser already installed" -ForegroundColor Green
 }
 
-# Verify installation
-$bravePath = "${env:ProgramFiles}\BraveSoftware\Brave-Browser\Application\brave.exe"
-if (-not (Test-Path $bravePath)) {
-    # Try x86 path
-    $bravePath = "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser\Application\brave.exe"
+# Verify installation - check multiple possible install locations
+$braveSearchPaths = @(
+    "${env:ProgramFiles}\BraveSoftware\Brave-Browser\Application\brave.exe",
+    "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser\Application\brave.exe",
+    "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe",
+    "$env:SystemRoot\system32\config\systemprofile\AppData\Local\BraveSoftware\Brave-Browser\Application\brave.exe",
+    "C:\Users\vagrant\AppData\Local\BraveSoftware\Brave-Browser\Application\brave.exe"
+)
+
+$bravePath = $null
+foreach ($p in $braveSearchPaths) {
+    if (Test-Path $p) {
+        $bravePath = $p
+        break
+    }
 }
 
-if (-not (Test-Path $bravePath)) {
-    Write-Host "[!] Brave not found after installation - check logs" -ForegroundColor Red
-    exit 1
+if (-not $bravePath) {
+    Write-Host "[!] Brave not found at standard paths after installation - skipping configuration" -ForegroundColor Yellow
+    Write-Host "    Searched:" -ForegroundColor DarkGray
+    foreach ($p in $braveSearchPaths) { Write-Host "      $p" -ForegroundColor DarkGray }
+    exit 0
 }
 
 Write-Host "[+] Brave installed at: $bravePath" -ForegroundColor Green

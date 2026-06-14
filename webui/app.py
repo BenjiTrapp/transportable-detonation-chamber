@@ -29,7 +29,35 @@ DETONATOR_API = os.environ.get("DETONATOR_API", "http://127.0.0.1:8000")
 DETONATOR_AGENT_API = os.environ.get("DETONATOR_AGENT_API", "http://127.0.0.1:8080")
 LITTERBOX_API = os.environ.get("LITTERBOX_API", "http://127.0.0.1:1337")
 WEBUI_PORT = int(os.environ.get("WEBUI_PORT", "9000"))
+VM_IP = os.environ.get("TDC_VM_IP", "")
+VM_WEBUI_URL = os.environ.get("TDC_VM_WEBUI", "")
 SUBMISSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "submissions.json")
+
+
+def _detect_vm_ip():
+    """Auto-detect Hyper-V VM IP if not configured via environment variable."""
+    global VM_IP, VM_WEBUI_URL
+    if VM_IP:
+        return  # Already set via env var
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-VM -Name 'DetonationChamber' -ErrorAction SilentlyContinue | "
+             "Get-VMNetworkAdapter).IPAddresses | Where-Object { $_ -match '^\\d+\\.\\d+\\.\\d+\\.\\d+$' } | Select-Object -First 1"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            VM_IP = result.stdout.strip()
+            VM_WEBUI_URL = f"http://{VM_IP}:9000"
+            print(f"[config] Auto-detected VM IP: {VM_IP}")
+    except Exception:
+        pass
+    if not VM_IP:
+        VM_IP = "172.17.251.7"  # Fallback
+        VM_WEBUI_URL = f"http://{VM_IP}:9000"
+
+
+_detect_vm_ip()
 
 # In-memory event store (populated from Rustinel NDJSON + Fibratus)
 events_store = {
@@ -637,18 +665,68 @@ def build_process_tree(alerts):
     return processes
 
 
+# --- VM alert fallback ---
+_vm_fetch_failures = 0  # Track consecutive failures to avoid spamming logs
+
+
+def _fetch_vm_alerts():
+    """Fetch alerts from the VM's webui API as fallback when local sources are empty."""
+    global _vm_fetch_failures
+    try:
+        r = requests.get(f"{VM_WEBUI_URL}/api/alerts", timeout=5)
+        if r.status_code == 200:
+            alerts = r.json()
+            if isinstance(alerts, list) and alerts:
+                if _vm_fetch_failures > 0:
+                    print(f"[alert_loader] VM connection restored, got {len(alerts)} alerts from {VM_WEBUI_URL}")
+                _vm_fetch_failures = 0
+                return alerts
+    except Exception:
+        _vm_fetch_failures += 1
+        if _vm_fetch_failures <= 3:
+            print(f"[alert_loader] VM unreachable at {VM_WEBUI_URL} (attempt {_vm_fetch_failures})")
+    return []
+
+
 # --- Background alert loader ---
 def alert_loader_thread():
     """Periodically reload alerts from Rustinel, Fibratus, and LitterBox."""
     while True:
         try:
-            # Load from all sources
+            # Quick check: are local data sources actually available with data?
+            # Just having the directory isn't enough - check for actual alert files
+            has_local_data = (
+                os.path.isdir(RUSTINEL_ALERTS_DIR) and
+                any(True for f in os.listdir(RUSTINEL_ALERTS_DIR)
+                    if f.endswith(('.ndjson', '.json')))
+            )
+
+            # If no local alert data, try VM first (much faster than waiting for
+            # PowerShell timeouts from Fibratus/Sysmon queries that won't return data anyway)
+            if not has_local_data and VM_WEBUI_URL:
+                vm_alerts = _fetch_vm_alerts()
+                if vm_alerts:
+                    processes = build_process_tree(vm_alerts)
+                    with store_lock:
+                        events_store["alerts"] = vm_alerts
+                        events_store["processes"] = processes
+                    time.sleep(5)
+                    continue
+
+            # Load from local sources
             rustinel_alerts = load_rustinel_alerts()
             fibratus_alerts = load_fibratus_alerts()
             litterbox_alerts = load_litterbox_results()
 
             # Merge and deduplicate
             all_alerts = rustinel_alerts + fibratus_alerts + litterbox_alerts
+
+            # Fallback: if no local data, try fetching from VM's webui
+            if not all_alerts and VM_WEBUI_URL:
+                vm_alerts = _fetch_vm_alerts()
+                if vm_alerts:
+                    all_alerts = vm_alerts
+
             seen = set()
             unique_alerts = []
             for alert in all_alerts:
@@ -779,6 +857,31 @@ def _find_service_launch_config():
     return configs
 
 
+def _try_vm_service_start(svc_name):
+    """Try to start a service on the VM via WinRM/PSRemoting. Returns a Flask response or None."""
+    try:
+        # Use PowerShell remoting to start the service on the VM
+        ps_cmd = (
+            f"$pass = ConvertTo-SecureString 'vagrant' -AsPlainText -Force; "
+            f"$cred = New-Object System.Management.Automation.PSCredential('vagrant', $pass); "
+            f"Invoke-Command -ComputerName '{VM_IP}' -Credential $cred -ScriptBlock {{ "
+            f"  Start-Service -Name '{svc_name}' -ErrorAction Stop; "
+            f"  (Get-Service -Name '{svc_name}').Status "
+            f"}} -ErrorAction Stop"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode == 0 and "Running" in result.stdout:
+            return jsonify({"success": True, "message": f"Service '{svc_name}' started on VM ({VM_IP})"})
+        elif result.returncode == 0:
+            return jsonify({"success": True, "message": f"Service '{svc_name}' command sent to VM ({VM_IP}): {result.stdout.strip()}"})
+    except (subprocess.TimeoutExpired, Exception):
+        pass
+    return None
+
+
 @app.route("/api/service/launch", methods=["POST"])
 def api_service_launch():
     """Launch a service by name."""
@@ -830,9 +933,17 @@ def api_service_launch():
                     else:
                         return jsonify({"error": f"Service not found and registration failed: {install_result.stderr.strip() or install_result.stdout.strip()}"}), 500
                 elif exe_path and not os.path.isfile(exe_path):
-                    return jsonify({"error": f"Service '{svc_name}' not found and executable not installed. Expected at: {exe_path}"}), 500
+                    # Try to start on VM as fallback
+                    vm_result = _try_vm_service_start(svc_name)
+                    if vm_result:
+                        return vm_result
+                    return jsonify({"error": f"Service '{svc_name}' not found locally (expected at: {exe_path}). VM also unreachable."}), 500
                 elif not exe_path:
-                    return jsonify({"error": f"Service '{svc_name}' not found and no executable path configured for auto-registration."}), 500
+                    # Service not installed locally - try VM
+                    vm_result = _try_vm_service_start(svc_name)
+                    if vm_result:
+                        return vm_result
+                    return jsonify({"error": f"Service '{svc_name}' is not installed locally. Ensure the VM is running (VM IP: {VM_IP})."}), 500
                 else:
                     return jsonify({"error": f"Failed to start service: {result.stderr.strip()}"}), 500
             return jsonify({"success": True, "message": f"Service '{svc_name}' started"})
@@ -891,17 +1002,18 @@ _rustinel_proc_cache = {"online": False, "checked_at": 0}
 
 
 def _is_rustinel_running():
-    """Fast check if Rustinel is running (cached for 5s)."""
+    """Fast check if Rustinel is running (cached for 5s).
+    Uses tasklist (native, instant) instead of PowerShell (4s+ cold start).
+    """
     now = time.time()
     if now - _rustinel_proc_cache["checked_at"] < 5:
         return _rustinel_proc_cache["online"]
     try:
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "(Get-Process -Name rustinel -ErrorAction SilentlyContinue) -ne $null"],
-            capture_output=True, text=True, timeout=3
+            ["tasklist", "/FI", "IMAGENAME eq rustinel.exe", "/NH"],
+            capture_output=True, text=True, timeout=5
         )
-        online = "True" in result.stdout
+        online = "rustinel.exe" in result.stdout.lower()
         _rustinel_proc_cache["online"] = online
         _rustinel_proc_cache["checked_at"] = now
         return online
@@ -933,17 +1045,18 @@ _sysmon_proc_cache = {"online": False, "checked_at": 0}
 
 
 def _is_sysmon_running():
-    """Fast check if Sysmon64 service is running (cached for 10s)."""
+    """Fast check if Sysmon64 service is running (cached for 10s).
+    Uses 'sc query' (native, instant) instead of PowerShell (4s+ cold start).
+    """
     now = time.time()
     if now - _sysmon_proc_cache["checked_at"] < 10:
         return _sysmon_proc_cache["online"]
     try:
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "(Get-Service Sysmon64 -ErrorAction SilentlyContinue).Status -eq 'Running'"],
-            capture_output=True, text=True, timeout=3
+            ["sc", "query", "Sysmon64"],
+            capture_output=True, text=True, timeout=5
         )
-        online = "True" in result.stdout
+        online = "RUNNING" in result.stdout
         _sysmon_proc_cache["online"] = online
         _sysmon_proc_cache["checked_at"] = now
         return online
@@ -958,19 +1071,28 @@ _fibratus_proc_cache = {"online": False, "checked_at": 0}
 
 
 def _is_fibratus_running():
-    """Check if Fibratus is running as a service or process (cached for 10s)."""
+    """Check if Fibratus is running as a service or process (cached for 10s).
+    Uses 'sc query' + tasklist (native, instant) instead of PowerShell (4s+ cold start).
+    """
     now = time.time()
     if now - _fibratus_proc_cache["checked_at"] < 10:
         return _fibratus_proc_cache["online"]
     try:
+        # First try service check (fast)
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "$svc = Get-Service -Name fibratus -ErrorAction SilentlyContinue; "
-             "if ($svc -and $svc.Status -eq 'Running') { 'True' } "
-             "else { (Get-Process -Name fibratus -ErrorAction SilentlyContinue) -ne $null }"],
-            capture_output=True, text=True, timeout=3
+            ["sc", "query", "fibratus"],
+            capture_output=True, text=True, timeout=5
         )
-        online = "True" in result.stdout
+        if "RUNNING" in result.stdout:
+            _fibratus_proc_cache["online"] = True
+            _fibratus_proc_cache["checked_at"] = now
+            return True
+        # Fallback: check if running as a process
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq fibratus.exe", "/NH"],
+            capture_output=True, text=True, timeout=5
+        )
+        online = "fibratus.exe" in result.stdout.lower()
         _fibratus_proc_cache["online"] = online
         _fibratus_proc_cache["checked_at"] = now
         return online
@@ -1229,6 +1351,17 @@ def api_sysmon():
     pid = request.args.get("pid", type=int)
     event_id = request.args.get("event_id", type=int)
 
+    # If Sysmon not available locally, proxy from VM
+    if not _is_sysmon_running():
+        try:
+            params = {k: v for k, v in {"max": max_events, "since": since, "pid": pid, "event_id": event_id}.items() if v is not None}
+            r = requests.get(f"{VM_WEBUI_URL}/api/sysmon", params=params, timeout=10)
+            if r.status_code == 200:
+                return jsonify(r.json())
+        except Exception:
+            pass
+        return jsonify([{"error": f"Sysmon not available locally and VM ({VM_IP}) unreachable."}])
+
     events = _read_sysmon_events(max_events=max_events, since=since, pid=pid, event_id=event_id)
     return jsonify(events)
 
@@ -1237,7 +1370,25 @@ def api_sysmon():
 def api_sysmon_stats():
     """Get Sysmon event counts by type, with diagnostic info."""
     try:
-        # First check if the event log channel exists and get record count
+        # Quick pre-check: if Sysmon service is not running, don't even try querying the log
+        if not _is_sysmon_running():
+            # Try fetching from VM instead
+            try:
+                r = requests.get(f"{VM_WEBUI_URL}/api/sysmon/stats", timeout=5)
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("online"):
+                        data["source"] = "vm"
+                        return jsonify(data)
+            except Exception:
+                pass
+            return jsonify({
+                "online": False,
+                "stats": [],
+                "diagnostic": f"Sysmon service is not running locally. VM ({VM_IP}) also unreachable.",
+            })
+
+        # Check if the event log channel exists and get record count
         diag_cmd = (
             "$log = Get-WinEvent -ListLog 'Microsoft-Windows-Sysmon/Operational' -ErrorAction SilentlyContinue; "
             "if ($log) { @{Exists=$true; RecordCount=$log.RecordCount; Enabled=$log.IsEnabled; LogMode=$log.LogMode} | ConvertTo-Json -Compress } "
@@ -2409,6 +2560,89 @@ PACKER_SECTIONS = {
 ENTROPY_HIGH_THRESHOLD = 7.0  # Shannon entropy indicating encrypted/compressed
 ENTROPY_WARN_THRESHOLD = 6.5
 
+# --- DiE-style Detection Signatures ---
+# Compiler/Linker detection based on linker version and import patterns
+PE_LINKER_SIGNATURES = {
+    (14, 0): "Microsoft Visual C++ 2015-2022",
+    (14, 16): "Microsoft Visual C++ 2019-2022",
+    (14, 29): "Microsoft Visual C++ 2019-2022 (v16.x)",
+    (14, 30): "Microsoft Visual C++ 2022 (v17.0+)",
+    (14, 36): "Microsoft Visual C++ 2022 (v17.6+)",
+    (12, 0): "Microsoft Visual C++ 2013",
+    (11, 0): "Microsoft Visual C++ 2012",
+    (10, 0): "Microsoft Visual C++ 2010",
+    (9, 0): "Microsoft Visual C++ 2008",
+    (8, 0): "Microsoft Visual C++ 2005",
+    (7, 10): "Microsoft Visual C++ 2003",
+    (7, 0): "Microsoft Visual C++ 2002",
+    (6, 0): "Microsoft Visual C++ 6.0",
+    (2, 25): "Borland Delphi / C++ Builder",
+    (2, 56): "Borland Delphi 7+",
+    (1, 71): "MinGW / GCC (Cygwin)",
+    (2, 22): "MinGW-w64 / GCC",
+    (2, 36): "MinGW-w64 / GCC 10+",
+}
+
+# Import-based compiler detection patterns
+PE_COMPILER_IMPORT_PATTERNS = {
+    "mscoree.dll": ("Language", ".NET CLR Assembly"),
+    "msvbvm60.dll": ("Compiler", "Visual Basic 6.0"),
+    "python3": ("Language", "Python (CPython)"),
+    "python2": ("Language", "Python 2.x (CPython)"),
+    "libgcc_s_dw2-1.dll": ("Compiler", "GCC (MinGW 32-bit)"),
+    "libgcc_s_seh-1.dll": ("Compiler", "GCC (MinGW-w64)"),
+    "libstdc++-6.dll": ("Compiler", "GCC (C++ Runtime)"),
+    "go.buildid": ("Language", "Go (Golang)"),
+    "cygwin1.dll": ("Compiler", "GCC (Cygwin)"),
+    "vcruntime140.dll": ("Runtime", "MSVC 2015-2022 Runtime"),
+    "vcruntime140d.dll": ("Runtime", "MSVC Debug Runtime"),
+    "ucrtbased.dll": ("Runtime", "Universal CRT (Debug)"),
+}
+
+# Packer/Protector entry point heuristics
+PE_EP_SECTION_DETECTORS = {
+    "UPX1": "UPX (Ultimate Packer for Executables)",
+    "UPX0": "UPX (Ultimate Packer for Executables)",
+    ".aspack": "ASPack",
+    ".adata": "ASPack",
+    ".nsp0": "NsPack",
+    ".themida": "Themida / WinLicense",
+    ".vmp0": "VMProtect",
+    ".vmp1": "VMProtect",
+    ".enigma1": "Enigma Protector",
+    "pec": "PECompact",
+    ".mpress1": "MPRESS",
+    ".petite": "Petite",
+    ".packed": "Unknown Packer",
+    ".RLPack": "RLPack",
+}
+
+# Byte signatures for common packers (at entry point or file offsets)
+PE_PACKER_BYTE_SIGS = [
+    # (offset_type, offset, bytes, name, version)
+    ("ep", 0, b"\x60\xBE", "UPX", "0.89-3.x"),
+    ("ep", 0, b"\xE9\x00\x00\x00\x00\x60", "UPX", "modified"),
+    ("ep", 0, b"\x83\xEC\x04\x53\x55\x56\x57", "ASPack", "2.x"),
+    ("ep", 0, b"\x90\x90\x90\x90\x68", "PECompact", "1.x"),
+    ("ep", 0, b"\xB8\x00\x00\x00\x00\x60\x0B\xC0", "Petite", "2.x"),
+    ("ep", 0, b"\xEB\x06\x68", "Themida", "2.x+"),
+    ("ep", 0, b"\x68\x00\x00\x00\x00\xE8\x01\x00\x00\x00\xC3\xC3", "VMProtect", "2.x+"),
+    ("ep", 0, b"\x55\x8B\xEC\x83\xC4", "Borland Delphi", "EP signature"),
+    ("ep", 0, b"\x55\x8B\xEC\x6A\xFF\x68", "MSVC", "Standard EP"),
+    ("ep", 0, b"\x48\x83\xEC\x28\xE8", "MSVC x64", "Standard EP"),
+    ("file", 0, b"MZ", "PE", "DOS Header"),
+]
+
+# ELF compiler detection based on .comment section or build-id
+ELF_COMPILER_PATTERNS = [
+    (b"GCC:", "Compiler", "GCC"),
+    (b"clang version", "Compiler", "LLVM/Clang"),
+    (b"rustc", "Compiler", "Rust (rustc)"),
+    (b"Go build", "Compiler", "Go (gc)"),
+    (b"Free Pascal", "Compiler", "Free Pascal"),
+    (b"Zig", "Compiler", "Zig"),
+]
+
 
 def calculate_entropy(data):
     """Calculate Shannon entropy of a byte sequence."""
@@ -2424,6 +2658,456 @@ def calculate_entropy(data):
             p = count / length
             entropy -= p * math.log2(p)
     return round(entropy, 4)
+
+
+def calculate_entropy_map(data, num_blocks=64):
+    """Calculate entropy for equal-sized blocks across the file (for visual heatmap)."""
+    if not data or len(data) < num_blocks:
+        return []
+    block_size = len(data) // num_blocks
+    entropy_map = []
+    for i in range(num_blocks):
+        start = i * block_size
+        end = start + block_size if i < num_blocks - 1 else len(data)
+        block = data[start:end]
+        entropy_map.append(round(calculate_entropy(block), 3))
+    return entropy_map
+
+
+def detect_pe_characteristics(pe, file_data, sections_info):
+    """
+    DiE-style detection: identify compiler, linker, packer, protector, overlay.
+    Returns a dict with detection results.
+    """
+    detections = []  # list of {type, name, version, confidence}
+    assessment = "clean"  # clean, packed, encrypted, protected, suspicious
+
+    # --- 1. Linker Version Detection ---
+    oh = pe.OPTIONAL_HEADER
+    linker_key = (oh.MajorLinkerVersion, oh.MinorLinkerVersion)
+    linker_name = PE_LINKER_SIGNATURES.get(linker_key)
+    if linker_name:
+        detections.append({
+            "type": "linker",
+            "name": linker_name,
+            "version": f"{oh.MajorLinkerVersion}.{oh.MinorLinkerVersion:02d}",
+            "confidence": "high",
+        })
+    else:
+        # Try range-based matching for MSVC
+        if oh.MajorLinkerVersion == 14:
+            detections.append({
+                "type": "linker",
+                "name": "Microsoft Visual C++ (2015+)",
+                "version": f"{oh.MajorLinkerVersion}.{oh.MinorLinkerVersion:02d}",
+                "confidence": "medium",
+            })
+        elif oh.MajorLinkerVersion >= 2 and oh.MajorLinkerVersion <= 6:
+            detections.append({
+                "type": "linker",
+                "name": f"Unknown Linker v{oh.MajorLinkerVersion}.{oh.MinorLinkerVersion}",
+                "version": f"{oh.MajorLinkerVersion}.{oh.MinorLinkerVersion:02d}",
+                "confidence": "low",
+            })
+
+    # --- 2. Compiler/Language Detection via Imports ---
+    if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
+        for entry in pe.DIRECTORY_ENTRY_IMPORT:
+            dll_lower = entry.dll.decode("utf-8", errors="replace").lower()
+            for pattern, (det_type, det_name) in PE_COMPILER_IMPORT_PATTERNS.items():
+                if pattern.lower() in dll_lower:
+                    detections.append({
+                        "type": det_type.lower(),
+                        "name": det_name,
+                        "version": "",
+                        "confidence": "high",
+                    })
+                    break
+
+    # --- 3. .NET Detection ---
+    has_dotnet = hasattr(pe, "DIRECTORY_ENTRY_COM_DESCRIPTOR")
+    if not has_dotnet and hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
+        has_dotnet = any(b"mscoree.dll" in (e.dll or b"") for e in pe.DIRECTORY_ENTRY_IMPORT)
+    if not has_dotnet:
+        # Check CLR data directory (index 14) even if pefile didn't parse it
+        try:
+            clr_dir = pe.OPTIONAL_HEADER.DATA_DIRECTORY[14]
+            if clr_dir.VirtualAddress > 0 and clr_dir.Size > 0:
+                has_dotnet = True
+        except (IndexError, AttributeError):
+            pass
+    if has_dotnet:
+        detections.append({
+            "type": "language",
+            "name": ".NET Assembly (CLR)",
+            "version": "",
+            "confidence": "high",
+        })
+
+    # --- 4. Packer/Protector Detection ---
+    packer_detected = False
+
+    # 4a. Section name matching
+    for sec_info in sections_info:
+        sec_name = sec_info["name"]
+        for packer_sec, packer_label in PE_EP_SECTION_DETECTORS.items():
+            if sec_name.lower().startswith(packer_sec.lower()):
+                detections.append({
+                    "type": "packer",
+                    "name": packer_label,
+                    "version": f"Section: {sec_name}",
+                    "confidence": "high",
+                })
+                packer_detected = True
+                break
+
+    # 4b. Entry point section analysis
+    ep_offset = oh.AddressOfEntryPoint
+    ep_section_name = ""
+    for section in pe.sections:
+        sec_start = section.VirtualAddress
+        sec_end = sec_start + section.Misc_VirtualSize
+        if sec_start <= ep_offset < sec_end:
+            ep_section_name = section.Name.decode("utf-8", errors="replace").rstrip("\x00")
+            break
+
+    if ep_section_name and ep_section_name not in (".text", ".code", "CODE", ".init"):
+        # Entry point in unusual section
+        for packer_sec, packer_name in PE_EP_SECTION_DETECTORS.items():
+            if ep_section_name.lower().startswith(packer_sec.lower()):
+                if not any(d["type"] == "packer" and packer_name in d["name"] for d in detections):
+                    detections.append({
+                        "type": "packer",
+                        "name": packer_name,
+                        "version": f"EP in section: {ep_section_name}",
+                        "confidence": "high",
+                    })
+                    packer_detected = True
+                break
+
+    # 4c. Entry point byte signature matching
+    if ep_section_name:
+        try:
+            ep_file_offset = pe.get_offset_from_rva(ep_offset)
+            if ep_file_offset and ep_file_offset < len(file_data) - 16:
+                ep_bytes = file_data[ep_file_offset:ep_file_offset + 16]
+                for (sig_type, sig_off, sig_bytes, sig_name, sig_ver) in PE_PACKER_BYTE_SIGS:
+                    if sig_type == "ep" and ep_bytes[sig_off:sig_off + len(sig_bytes)] == sig_bytes:
+                        # Don't duplicate MSVC standard EP if linker already detected
+                        if "MSVC" in sig_name and any(d["type"] == "linker" and "Visual C" in d["name"] for d in detections):
+                            continue
+                        if not any(d["name"] == sig_name for d in detections):
+                            detections.append({
+                                "type": "packer" if sig_name not in ("MSVC", "MSVC x64", "Borland Delphi") else "compiler",
+                                "name": sig_name,
+                                "version": sig_ver,
+                                "confidence": "medium",
+                            })
+                            if sig_name not in ("MSVC", "MSVC x64", "Borland Delphi", "PE"):
+                                packer_detected = True
+        except Exception:
+            pass
+
+    # --- 5. Entropy-based Packing/Encryption Detection ---
+    high_entropy_sections = [s for s in sections_info if s["entropy"] >= ENTROPY_HIGH_THRESHOLD]
+    total_raw = sum(s["raw_size"] for s in sections_info)
+    high_entropy_raw = sum(s["raw_size"] for s in high_entropy_sections)
+
+    if total_raw > 0 and high_entropy_raw / total_raw > 0.6:
+        if not packer_detected:
+            detections.append({
+                "type": "packer",
+                "name": "Unknown Packer/Crypter",
+                "version": f"{len(high_entropy_sections)} section(s) with entropy > 7.0",
+                "confidence": "medium",
+            })
+        assessment = "encrypted" if high_entropy_raw / total_raw > 0.8 else "packed"
+    elif packer_detected:
+        assessment = "packed"
+
+    # --- 6. Overlay Detection ---
+    overlay_offset = 0
+    overlay_size = 0
+    if pe.sections:
+        last_section = max(pe.sections, key=lambda s: s.PointerToRawData + s.SizeOfRawData)
+        last_end = last_section.PointerToRawData + last_section.SizeOfRawData
+        if last_end < len(file_data):
+            overlay_offset = last_end
+            overlay_size = len(file_data) - last_end
+            if overlay_size > 512:  # Significant overlay
+                overlay_entropy = calculate_entropy(file_data[overlay_offset:overlay_offset + min(overlay_size, 65536)])
+                detections.append({
+                    "type": "overlay",
+                    "name": "Data Overlay",
+                    "version": f"{overlay_size} bytes, entropy {overlay_entropy:.2f}",
+                    "confidence": "high",
+                })
+                if overlay_entropy >= ENTROPY_HIGH_THRESHOLD:
+                    if assessment == "clean":
+                        assessment = "suspicious"
+
+    # --- 7. Anti-Debug / Protector Indicators ---
+    has_tls = hasattr(pe, "DIRECTORY_ENTRY_TLS") and pe.DIRECTORY_ENTRY_TLS.struct.AddressOfCallBacks != 0
+    has_rwx = any(s.get("rwx_warning") for s in sections_info)
+    has_no_imports = not hasattr(pe, "DIRECTORY_ENTRY_IMPORT") or len(pe.DIRECTORY_ENTRY_IMPORT) < 3
+
+    if has_tls and (has_rwx or packer_detected):
+        if not any(d["type"] == "protector" for d in detections):
+            detections.append({
+                "type": "protector",
+                "name": "Anti-Debug Protection",
+                "version": "TLS callbacks + suspicious characteristics",
+                "confidence": "medium",
+            })
+        if assessment == "clean":
+            assessment = "protected"
+
+    if has_no_imports and packer_detected:
+        assessment = "packed"
+
+    # --- 8. Rich Header analysis (MSVC build tool versions) ---
+    rich_header_info = None
+    try:
+        rich = pe.parse_rich_header()
+        if rich and rich.get("values"):
+            rich_entries = []
+            values = rich["values"]
+            # Values come in pairs: (compID, count), where compID = (prodID << 16 | buildID)
+            for i in range(0, len(values) - 1, 2):
+                comp_id = values[i]
+                count = values[i + 1]
+                prod_id = (comp_id >> 16) & 0xFFFF
+                build_id = comp_id & 0xFFFF
+                # Map known product IDs
+                tool_names = {
+                    0x01: "Import", 0x02: "Linker (old)", 0x04: "Linker",
+                    0x06: "MASM", 0x07: "MASM (x64)",
+                    0x0A: "C Compiler", 0x0B: "C++ Compiler",
+                    0x0D: "Resource", 0x0F: "ASM (x64)",
+                    0x5D: "C Compiler (x64)", 0x5E: "C++ Compiler (x64)",
+                    0x93: "LTCG", 0x95: "C/C++ Compiler (new)",
+                    0xFF: "Export", 0x100: "CVTRES",
+                    0x101: "Linker (x64)", 0x103: "MASM (ARM)",
+                    0x104: "C Compiler (ARM)", 0x105: "C++ Compiler (ARM)",
+                    0xFD: "CVTRES (new)",
+                }
+                tool_name = tool_names.get(prod_id, f"Tool_{prod_id:04X}")
+                rich_entries.append({
+                    "tool": tool_name,
+                    "id": prod_id,
+                    "build": build_id,
+                    "count": count,
+                })
+            rich_header_info = rich_entries[:30]  # Cap entries
+    except Exception:
+        pass
+
+    # --- Build section layout for visualization ---
+    section_layout = []
+    file_size = len(file_data)
+    for sec_info in sections_info:
+        raw_offset = sec_info.get("raw_offset_dec", 0)
+        raw_size = sec_info["raw_size"]
+        if file_size > 0:
+            section_layout.append({
+                "name": sec_info["name"],
+                "offset": raw_offset,
+                "size": raw_size,
+                "pct_start": round(raw_offset / file_size * 100, 2),
+                "pct_size": round(raw_size / file_size * 100, 2),
+                "entropy": sec_info["entropy"],
+                "entropy_status": sec_info["entropy_status"],
+                "executable": sec_info.get("executable", False),
+                "writable": sec_info.get("writable", False),
+                "packer": sec_info.get("packer_indicator", ""),
+            })
+
+    # Entropy map (64 blocks for heatmap visualization)
+    entropy_map = calculate_entropy_map(file_data, 64)
+
+    return {
+        "detections": detections,
+        "assessment": assessment,
+        "ep_section": ep_section_name,
+        "overlay": {"offset": overlay_offset, "size": overlay_size} if overlay_size > 0 else None,
+        "rich_header": rich_header_info,
+        "section_layout": section_layout,
+        "entropy_map": entropy_map,
+        "file_size": file_size,
+    }
+
+
+def detect_elf_characteristics(data, sections_info, security_info, has_pie, interpreter, needed_libs):
+    """
+    DiE-style detection for ELF: identify compiler, packer, protector.
+    """
+    detections = []
+    assessment = "clean"
+
+    # --- 1. Compiler Detection via .comment section ---
+    # Search for .comment section content in raw data
+    comment_content = b""
+    for sec in sections_info:
+        if sec.get("name") == ".comment" and sec.get("offset_dec", 0) > 0 and sec.get("size", 0) > 0:
+            start = sec["offset_dec"]
+            end = start + min(sec["size"], 4096)
+            if end <= len(data):
+                comment_content = data[start:end]
+            break
+
+    if comment_content:
+        for pattern, det_type, det_name in ELF_COMPILER_PATTERNS:
+            if pattern in comment_content:
+                # Extract version string
+                version = ""
+                try:
+                    idx = comment_content.index(pattern)
+                    ver_str = comment_content[idx:idx + 80].decode("utf-8", errors="replace")
+                    ver_str = ver_str.split("\x00")[0].strip()
+                    version = ver_str
+                except Exception:
+                    pass
+                detections.append({
+                    "type": det_type.lower(),
+                    "name": det_name,
+                    "version": version,
+                    "confidence": "high",
+                })
+                break
+
+    # --- 2. Compiler detection via section names and patterns ---
+    section_names = [s["name"] for s in sections_info]
+
+    if ".gopclntab" in section_names or ".go.buildinfo" in section_names:
+        if not any(d["name"] == "Go (gc)" for d in detections):
+            detections.append({
+                "type": "compiler",
+                "name": "Go (gc)",
+                "version": "Detected via .gopclntab/.go.buildinfo",
+                "confidence": "high",
+            })
+    elif ".rustc" in section_names or any(".rodata" in s and s.get("size", 0) > 100000 for s in sections_info):
+        # Rust binaries often have large .rodata
+        # Check for rust-specific symbols or panic messages in data
+        if b"rustc" in data[:65536] or b"panicked at" in data[:262144]:
+            if not any("Rust" in d["name"] for d in detections):
+                detections.append({
+                    "type": "compiler",
+                    "name": "Rust (rustc)",
+                    "version": "Detected via binary patterns",
+                    "confidence": "medium",
+                })
+
+    # --- 3. Interpreter/Linker Detection ---
+    if interpreter:
+        if "ld-linux" in interpreter or "ld.so" in interpreter:
+            detections.append({
+                "type": "linker",
+                "name": "GNU ld (glibc dynamic linker)",
+                "version": interpreter,
+                "confidence": "high",
+            })
+        elif "ld-musl" in interpreter:
+            detections.append({
+                "type": "linker",
+                "name": "musl libc linker",
+                "version": interpreter,
+                "confidence": "high",
+            })
+    elif not interpreter and not needed_libs:
+        detections.append({
+            "type": "linker",
+            "name": "Static binary (no dynamic linker)",
+            "version": "",
+            "confidence": "high",
+        })
+
+    # --- 4. Packer Detection ---
+    packer_detected = False
+    for sec in sections_info:
+        sec_name = sec.get("name", "")
+        for packer_sec, packer_label in ELF_PACKER_SECTIONS.items():
+            if sec_name.lower() == packer_sec.lower() or sec_name.lower().startswith(packer_sec.lower()):
+                detections.append({
+                    "type": "packer",
+                    "name": packer_label,
+                    "version": f"Section: {sec_name}",
+                    "confidence": "high",
+                })
+                packer_detected = True
+                break
+
+    # UPX detection via magic bytes
+    if b"UPX!" in data[:4096]:
+        if not any("UPX" in d["name"] for d in detections):
+            detections.append({
+                "type": "packer",
+                "name": "UPX (Ultimate Packer for Executables)",
+                "version": "Magic 'UPX!' found",
+                "confidence": "high",
+            })
+            packer_detected = True
+
+    # --- 5. Entropy-based detection ---
+    high_entropy_sections = [s for s in sections_info if s.get("entropy", 0) >= ENTROPY_HIGH_THRESHOLD and s.get("size", 0) > 1024]
+    total_raw = sum(s.get("size", 0) for s in sections_info if s.get("size", 0) > 0)
+    high_entropy_raw = sum(s.get("size", 0) for s in high_entropy_sections)
+
+    if total_raw > 0 and high_entropy_raw / total_raw > 0.6:
+        if not packer_detected:
+            detections.append({
+                "type": "packer",
+                "name": "Unknown Packer/Crypter",
+                "version": f"{len(high_entropy_sections)} section(s) with entropy > 7.0",
+                "confidence": "medium",
+            })
+        assessment = "encrypted" if high_entropy_raw / total_raw > 0.8 else "packed"
+    elif packer_detected:
+        assessment = "packed"
+
+    # --- 6. Protector indicators ---
+    has_wx = any(s.get("wx_warning") for s in sections_info)
+    has_anti_debug = any("ptrace" in s.get("name", "") or "anti" in s.get("name", "").lower() for s in sections_info)
+
+    if has_wx and packer_detected:
+        if not any(d["type"] == "protector" for d in detections):
+            detections.append({
+                "type": "protector",
+                "name": "Self-modifying code / Protector",
+                "version": "W+X sections with packer indicators",
+                "confidence": "medium",
+            })
+        assessment = "protected"
+
+    # --- 7. Section layout for visualization ---
+    section_layout = []
+    file_size = len(data)
+    for sec in sections_info:
+        offset = sec.get("offset_dec", 0)
+        size = sec.get("size", 0)
+        if file_size > 0 and size > 0:
+            section_layout.append({
+                "name": sec.get("name", ""),
+                "offset": offset,
+                "size": size,
+                "pct_start": round(offset / file_size * 100, 2),
+                "pct_size": round(size / file_size * 100, 2),
+                "entropy": sec.get("entropy", 0),
+                "entropy_status": sec.get("entropy_status", "normal"),
+                "executable": "X" in sec.get("flags_str", ""),
+                "writable": "W" in sec.get("flags_str", ""),
+                "packer": sec.get("packer_indicator", ""),
+            })
+
+    entropy_map = calculate_entropy_map(data, 64)
+
+    return {
+        "detections": detections,
+        "assessment": assessment,
+        "section_layout": section_layout,
+        "entropy_map": entropy_map,
+        "file_size": file_size,
+    }
 
 
 @app.route("/api/file/pe")
@@ -2627,6 +3311,14 @@ def api_file_pe():
 
     result["flags"] = flags
     result["flag_count"] = {"high": len([f for f in flags if f["severity"] == "high"]), "medium": len([f for f in flags if f["severity"] == "medium"]), "low": len([f for f in flags if f["severity"] == "low"])}
+
+    # --- DiE-style Detection Analysis ---
+    try:
+        detection_result = detect_pe_characteristics(pe, file_data, sections)
+        result["detection"] = detection_result
+    except Exception as e:
+        result["detection"] = {"detections": [], "assessment": "clean", "error": str(e),
+                               "entropy_map": [], "section_layout": [], "file_size": len(file_data)}
 
     pe.close()
     return jsonify(result)
@@ -3256,6 +3948,17 @@ def api_file_elf():
         "low": len([f for f in flags if f["severity"] == "low"]),
     }
 
+    # --- DiE-style Detection Analysis ---
+    try:
+        detection_result = detect_elf_characteristics(
+            data, sections, result.get("security", {}),
+            has_pie, result.get("interpreter", ""), needed_libs
+        )
+        result["detection"] = detection_result
+    except Exception as e:
+        result["detection"] = {"detections": [], "assessment": "clean", "error": str(e),
+                               "entropy_map": [], "section_layout": [], "file_size": len(data)}
+
     return jsonify(result)
 
 
@@ -3285,11 +3988,16 @@ def _elf_segment_flags_str(flags):
 
 
 # --- Main ---
-if __name__ == "__main__":
-    # Start background alert loader
+# Start background alert loader (works with both direct run and import by dev_server)
+# When Flask reloader is active, only start in the child process to avoid duplicate threads
+_is_reloader_child = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
+_reloader_active = os.environ.get("FLASK_DEBUG") == "1" or os.environ.get("FLASK_ENV") == "development"
+
+if _is_reloader_child or not _reloader_active:
     loader = threading.Thread(target=alert_loader_thread, daemon=True)
     loader.start()
 
+if __name__ == "__main__":
     print(f"[*] Detonation Chamber UI starting on http://0.0.0.0:{WEBUI_PORT}")
     print(f"    Rustinel alerts: {RUSTINEL_ALERTS_DIR}")
     print(f"    Detonator API:   {DETONATOR_API}")
