@@ -1,13 +1,39 @@
-# Transportable Detonation Chamber
+<p align="center">
+  <img src="tdc-logo.png" alt="Transportable Detonation Chamber" width="200">
+</p>
+
+<h1 align="center">Transportable Detonation Chamber</h1>
 
 <p align="center">
-  <img src="tdc-logo.png" alt="Transportable Detonation Chamber">
+  <strong>A pre-configured Windows 11 VM for malware detonation testing against multiple EDR solutions.</strong>
 </p>
 
 <p align="center">
-  <strong>A pre-configured Windows 11 VM for malware detonation testing against multiple EDR solutions.</strong><br>
-  Unified dark-themed Web UI &bull; Real-time Sigma/YARA/IOC detection &bull; Kernel ETW telemetry<br>
-  Supports <b>Windows</b> (Hyper-V) and <b>macOS Apple Silicon</b> (QEMU/UTM)
+  <a href="#quick-start"><img src="https://img.shields.io/badge/Quick_Start-blue?style=for-the-badge" alt="Quick Start"></a>
+  <a href="#features"><img src="https://img.shields.io/badge/Features-purple?style=for-the-badge" alt="Features"></a>
+  <a href="#demo"><img src="https://img.shields.io/badge/Demo-green?style=for-the-badge" alt="Demo"></a>
+  <a href="#api-reference"><img src="https://img.shields.io/badge/API-orange?style=for-the-badge" alt="API"></a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/platform-Windows%2011-0078D6?logo=windows&logoColor=white" alt="Windows 11">
+  <img src="https://img.shields.io/badge/platform-macOS%20ARM64-000000?logo=apple&logoColor=white" alt="macOS ARM64">
+  <img src="https://img.shields.io/badge/hypervisor-Hyper--V-0078D6?logo=microsoft&logoColor=white" alt="Hyper-V">
+  <img src="https://img.shields.io/badge/hypervisor-QEMU%2FUTM-FF6600?logo=qemu&logoColor=white" alt="QEMU">
+  <img src="https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white" alt="Python 3.12">
+  <img src="https://img.shields.io/badge/.NET-8.0-512BD4?logo=dotnet&logoColor=white" alt=".NET 8">
+  <img src="https://img.shields.io/badge/rust-Rustinel-DEA584?logo=rust&logoColor=white" alt="Rust">
+</p>
+
+---
+
+<p align="center">
+  <em>Unified dark-themed Web UI &bull; Real-time Sigma/YARA/IOC detection &bull; Kernel ETW telemetry &bull; PE/ELF binary analysis</em>
+</p>
+
+<p align="center">
+  <img src="static/dashboard.png" alt="Dashboard" width="90%">
+  <br><sub>Service Dashboard &mdash; real-time health monitoring, alert feed, and detection metrics</sub>
 </p>
 
 ---
@@ -17,11 +43,11 @@
 - [Quick Start](#quick-start)
 - [Features](#features)
 - [Architecture](#architecture)
-- [Web UI](#web-ui)
 - [Platform Support](#platform-support)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Usage](#usage)
+- [Demo](#demo)
 - [API Reference](#api-reference)
 - [Configuration](#configuration)
 - [Detection Rules](#detection-rules)
@@ -60,25 +86,11 @@ make open       # Opens http://<vm-ip>:9000 in browser
 .\make.ps1 open
 ```
 
-First boot takes ~20-30 minutes (Windows) or ~30-45 minutes (macOS ARM).
+> First boot takes ~20-30 minutes (Windows) or ~30-45 minutes (macOS ARM).
 
 ---
 
 ## Features
-
-### Unified Web UI (port 9000)
-
-A single-page dark-themed interface that aggregates telemetry from all engines:
-
-| Tab | Description |
-|-----|-------------|
-| **Dashboard** | Stats strip (alerts/processes/services/rules/tools), 6 service health cards, recent activity feed |
-| **Tracing** | Real-time ETW event console, process filtering, timeline visualization |
-| **Graph** | Process relationship graph with 5 layouts (Force/Hierarchical/Radial/Circular/Grid), zoom, search |
-| **Sysmon** | Windows Sysmon event log viewer (process, network, file, registry, DNS events) |
-| **Scanner** | ThreatCheck + DefenderCheck integration (Defender/AMSI engines), scan history |
-| **Hex Editor** | Binary viewer with data inspector, drag-and-drop upload, PE/ELF Analysis buttons |
-| **Submit** | Multi-target detonation (DetonatorAgent + LitterBox), stage-by-stage progress |
 
 ### Detection Engines
 
@@ -89,33 +101,47 @@ A single-page dark-themed interface that aggregates telemetry from all engines:
 | **Sysmon** | Sysinternals | Event logging (process creation, network, file, registry, image loads) |
 | **LitterBox** | Python | Static (YARA, strings) + Dynamic (PE-Sieve, Moneta, HollowsHunter, RedEdr) |
 
-### Analysis Capabilities
+### Web UI Tabs
 
-- **PE Header Analysis**: DOS/File/Optional headers, section table with entropy bars, ASLR/DEP/SEH/CFG detection
-- **ELF Binary Analysis**: ELF32/64 header, program headers (segments), section table, dynamic linking, symbol imports/exports
-- **ELF Security Audit**: PIE, NX stack, RELRO (Full/Partial), stack canary, Fortify, stripped detection
-- **Suspicious Import Detection**: Categorized (injection, evasion, credential access, networking, crypto, shellcode)
-- **Packer Identification**: UPX, Themida, VMProtect, ASPack, MPRESS, etc. via section name matching
-- **RWX Section Flagging**: Read+Write+Execute permissions highlighted (PE and ELF)
-- **TLS Callback Detection**: Anti-debug indicator (PE)
-- **Entropy Visualization**: Per-section Shannon entropy with color coding (red >= 7.0 = packed/encrypted)
-- **Hunt-Sleeping-Beacons**: Callstack scanner for identifying sleeping C2 beacons (unbacked memory, module stomping, APC/Timer sleepmasks, return address spoofing)
+| Tab | Description |
+|-----|-------------|
+| **Dashboard** | Stats strip, 6 service health cards, recent activity feed, toast notifications |
+| **Tracing** | Real-time ETW event console, process filtering, timeline visualization |
+| **Graph** | Process relationship graph (Force/Hierarchical/Radial/Circular/Grid layouts) |
+| **Sysmon** | Windows Sysmon event viewer with search, filtering, and Event ID correlation |
+| **Scanner** | ThreatCheck + DefenderCheck integration with scan history |
+| **Hex Editor** | Binary viewer with data inspector, PE/ELF analysis, drag-and-drop |
+| **Submit** | Multi-target detonation with stage-by-stage pipeline progress |
+
+### Binary Analysis
+
+| Capability | Details |
+|-----------|---------|
+| **PE Header Analysis** | DOS/COFF/Optional headers, ASLR/DEP/SEH/CFG detection |
+| **DiE-Style Detection** | Compiler, packer, protector, linker identification with assessment |
+| **Entropy Heatmap** | 64-block Shannon entropy visualization (red >= 7.0 = packed) |
+| **Section Layout** | Visual section diagram with RWX permission flagging |
+| **ELF Security Audit** | PIE, NX stack, RELRO, stack canary, Fortify, stripped detection |
+| **Suspicious Imports** | Categorized: injection, evasion, credential access, networking, crypto |
+| **Packer Detection** | UPX, Themida, VMProtect, ASPack, MPRESS via section + heuristic matching |
+| **TLS Callbacks** | Anti-debug indicator detection |
 
 ### Reverse Engineering Tools
 
 | Tool | Purpose |
 |------|---------|
-| **Detect It Easy (DiE)** | PE/ELF/Mach-O identification — packers, compilers, protectors, linkers |
+| **Detect It Easy (DiE)** | PE/ELF/Mach-O identification — packers, compilers, protectors |
 | **WinDbg (Preview)** | Kernel/user-mode debugger — crash dumps, live debugging, TTD |
-| **Ghidra** | NSA reverse engineering framework — disassembly, decompilation, scripting |
+| **Ghidra** | NSA RE framework — disassembly, decompilation, scripting |
+| **Hunt-Sleeping-Beacons** | Callstack scanner for sleeping C2 beacons |
 
 ### Developer Experience
 
 - **`make deploy-restart`**: Edit locally, push to VM, restart Flask in one command
-- **`make run-debug`**: Flask auto-reload on file changes (local dev)
-- **Loading Spinner**: Global overlay with 300ms delay threshold
+- **`make run-debug`**: Flask auto-reload on file changes
+- **Toast Notifications**: Throttled error/warning/info toasts with 15s dedup
 - **Help Modal**: Built-in documentation (press "? Help" in sidebar)
-- **Submissions History**: Persisted to JSON, with Hex button for quick inspection
+- **Submissions History**: Persisted to JSON with quick hex inspection
 
 ---
 
@@ -168,67 +194,6 @@ A single-page dark-themed interface that aggregates telemetry from all engines:
 | **Hunt-Sleeping-Beacons** | — | Sleeping C2 beacon callstack scanner | C++ / MSVC |
 | **theZoo-WebUI** | 8888 | Malware sample browser | PHP |
 | **Detonator** | 5000/8000 | Orchestration UI + REST API | Python |
-
----
-
-## Web UI
-
-### Dashboard
-
-The main landing page shows:
-- **Stats strip**: Alerts count (by severity), active processes, service health, loaded rules, available tools
-- **Service cards**: Health status for Rustinel, DetonatorAgent, LitterBox, Fibratus, Sysmon, Scanner Tools
-- **Activity feed**: Recent detection alerts with severity coloring and rule names
-
-### Tracing
-
-Real-time console showing ETW events and detection alerts:
-- Filter by process (select from sidebar)
-- Timeline visualization shows alert distribution over time
-- Click any alert for full detail panel (raw JSON, ATT&CK tags, related processes)
-
-### Graph
-
-Interactive process relationship visualization:
-- **5 layout modes**: Force-directed, Hierarchical, Radial, Circular, Grid
-- **Zoom controls** with mouse wheel support
-- **Search**: Find processes by name or PID
-- **Time-range filtering**: 5m, 15m, 1h, All
-- **Detail panel**: Click any node for full process info, connections, children tree
-
-### Scanner
-
-Run signature detection tools against files:
-- **ThreatCheck**: Identifies the exact bytes triggering Defender/AMSI detection
-- **DefenderCheck**: Tests if Defender would flag a file
-- **Results**: Detection status, byte offset of trigger, link to hex editor for inspection
-- **History**: All previous scan results persisted in-session
-
-### Hex Editor
-
-Full binary file viewer:
-- **Drag-and-drop** file upload or specify VM path
-- **Data inspector**: Int8/16/32/64, Float32/64, ASCII, UTF-16 at cursor position
-- **PE Analysis**: Button parses full PE structure (headers, sections, imports, entropy, IOC flags)
-- **ELF Analysis**: Button parses ELF binaries (header, segments, sections, symbols, security features, suspicious imports)
-- **Cross-tab integration**: Scanner "View in Hex" jumps directly to the flagged offset
-
-### Submit
-
-Multi-target sample detonation with progress tracking:
-- **Targets**: DetonatorAgent only, LitterBox only, or Both
-- **Pipeline visualization**: Stage-by-stage progress (Upload → Execute → Static → Dynamic → EDR)
-- **Results aggregation**: YARA matches, PE-Sieve findings, Moneta results, HollowsHunter output, Fibratus alerts
-- **Polling**: Auto-refreshes every 5 seconds for up to 2.5 minutes
-
-### Help Modal
-
-Built-in documentation accessible via "? Help" button in the sidebar:
-- **Overview**: Capabilities and workflow
-- **Usage Guide**: Per-tab documentation
-- **API Reference**: All endpoints with methods and parameters
-- **Architecture**: Diagram and data flow
-- **Services**: Component details and detection rules
 
 ---
 
@@ -376,7 +341,7 @@ make submit FILE=./samples/mimikatz.exe TARGET=both
 1. Go to **Hex Editor** tab
 2. Upload a PE file
 3. Click **PE Analysis** button
-4. Review: headers, security features (ASLR/DEP/SEH/CFG), section entropy, suspicious imports, packer indicators
+4. Review: headers, security features (ASLR/DEP/SEH/CFG), section entropy, suspicious imports, packer indicators, DiE-style detection overview
 
 ### ELF Analysis
 
@@ -410,6 +375,143 @@ Detections include: unbacked memory in callstacks, non-executable memory pages, 
 
 ---
 
+## Demo
+
+### Service Dashboard
+
+<p align="center">
+  <img src="static/dashboard.png" alt="Dashboard" width="100%">
+</p>
+
+> The main landing page with a stats strip showing 39,773 total alerts, 206 tracked processes, 3/5 services online (degraded state), 15 detection rules (13 Sigma + 2 YARA), and 2 scanner tools. Below are 6 service health cards for Rustinel, DetonatorAgent, LitterBox, Sysmon, Fibratus, and AV/AMSI Scanner — each showing port, version, and quick-action buttons. The Recent Activity feed streams live detections with severity coloring (LOW Sigma rules like Whoami Execution, CRITICAL YARA hits like SuspiciousPEImports). The left sidebar lists all tracked processes with alert counts and a color-coded timeline per engine.
+
+---
+
+### Sample Detonation (Mimikatz)
+
+<p align="center">
+  <img src="static/mimikatz_detonation.png" alt="Mimikatz Detonation" width="100%">
+</p>
+
+> The Submit tab after detonating `mimikatz.exe` (1.3 MB) with target "Both (Agent + LitterBox)" and Fibratus EDR mode. The pipeline shows all 5 stages completed: DetonatorAgent execution (HTTP 200, PID 18612), LitterBox upload, Static Analysis (YARA + CheckPlz + Strings), Dynamic Analysis (PE-Sieve, Moneta, HollowsHunter), and Fibratus/Rustinel EDR (24 alerts). Below lists all CRITICAL detections — SuspiciousPEImports on docker.exe, mimikatz.exe, and gk.exe. Dynamic results: PE-Sieve (Suspicious: 0) and Moneta (IOCs: 0).
+
+---
+
+### Rustinel Trace Analysis
+
+<table>
+<tr>
+<td width="50%">
+<p align="center">
+  <img src="static/rustinel_analysis.png" alt="Rustinel Analysis" width="100%">
+</p>
+</td>
+<td width="50%">
+<p align="center">
+  <img src="static/rustinel_analysis_details.png" alt="Rustinel Details" width="100%">
+</p>
+</td>
+</tr>
+</table>
+
+> **Left:** The Tracing console for `docker.exe` scored "Malicious 100/100" (23 events over 4090m). Filter pills: "23 Critical", "SuspiciousPEImports (23)". The timeline bar shows event distribution by type (Critical/High, Process, Network, DNS, File, Registry). Verdict table lists each hit with severity, timestamp offset, rule name, and PID. Tabs for Live, HTTP Requests, Connections, DNS, Files, Registry, Artifacts (23), Modules.
+>
+> **Right:** Alert detail panel for a Sigma hit: "Example - Whoami Execution (CommandLine + Image)". Shows severity (Low), engine (SIGMA), PID (1304), process (whoami.exe), command line, parent info (powershell.exe PID 10912), full parent command. MATCH DETAILS shows condition logic (`selection_img AND selection_cmd`) with JSON patterns. EVENT section has complete ECS fields (@timestamp, event.action: process-start, event.kind: alert, event.provider: etw).
+
+---
+
+### Process Relationship Graph
+
+<table>
+<tr>
+<td width="50%">
+<p align="center">
+  <img src="static/process_rollup.png" alt="Process Rollup Graph" width="100%">
+</p>
+</td>
+<td width="50%">
+<p align="center">
+  <img src="static/process_rollup_details_scan_correlation.png" alt="Process Details & Correlation" width="100%">
+</p>
+</td>
+</tr>
+</table>
+
+> **Left:** Hierarchical layout showing 178 nodes, 107 edges at 115% zoom. Color-coded nodes: blue squares (system processes — winlogon.exe, explorer.exe, userinit.exe), yellow/orange with red badges (malicious/detonated — fibratus.exe, MsMpEng.exe), green diamonds (network connections — pypi.org, github.com, loldrivers.io, files.pythonhosted), purple circles (DNS). Edges: solid (spawn), dashed (connection), red (injection). Filters for Network, DNS, Files, Registry, Detonated. Time ranges: 30s to All.
+>
+> **Right:** Force-directed layout with `docker.exe (PID 1148)` selected. Detail panel: image path, status (Exited), activity (23 Threats, 0 Network/DNS/File/Registry/Injection). Three large red nodes (docker.exe instances with 21, 24, 23 alerts) surrounded by dense network/DNS web (discord.com, shodan.io, github.com, google.com, storage.googleapis, docs.hetzner.de, and dozens more).
+
+---
+
+### PE Binary Analysis
+
+<table>
+<tr>
+<td width="50%">
+<p align="center">
+  <img src="static/pe_header_analyzer.png" alt="PE Header Analyzer" width="100%">
+</p>
+</td>
+<td width="50%">
+<p align="center">
+  <img src="static/PE_header_packing_analyzer.png" alt="DiE-Style Packing Analysis" width="100%">
+</p>
+</td>
+</tr>
+</table>
+
+> **Left:** PE Header Analysis for `npp.8.9.6.2.Installer.x64.exe` (6.6 MB). IOC banner: "4 IOC Flags Detected" — suspicious APIs in privilege_escalation (2), defense_evasion (1), shellcode (2), plus entropy 7.99 (packing). Three-column layout: FILE HEADER (i386, 2025-03-08, 5 Sections), OPTIONAL HEADER (PE32, Entry 0x369f, Linker 6.0, WINDOWS_GUI), SECURITY FEATURES (ASLR/DEP enabled, NO SEH, CFG disabled, Entropy 7.990 red). Section table with entropy bars and "Inspect" buttons.
+>
+> **Right:** DiE-style detection overview. Assessment: "SUSPICIOUS" (red badge). Detection cards: "LINKER: Microsoft Visual C++ 6.0", "OVERLAY: Data Overlay". ENTROPY MAP color bar — green (low entropy .text/.rdata), massive red block (.ndata = NSIS compressed data). FILE STRUCTURE section layout diagram with legend (Code, Data, High Entropy, Overlay). Expandable "+ RICH HEADER (5 entries)".
+
+---
+
+### Section Inspection & Hex Editor
+
+<table>
+<tr>
+<td width="50%">
+<p align="center">
+  <img src="static/pe_analyzer_text_header_section.png" alt="Section Inspection" width="100%">
+</p>
+</td>
+<td width="50%">
+<p align="center">
+  <img src="static/hex_editor.png" alt="Hex Editor" width="100%">
+</p>
+</td>
+</tr>
+</table>
+
+> **Left:** .text section expanded via "Inspect". Metadata: Raw Offset 0x400, Raw Size 26.0 KB, Virtual Addr 0x1000, Entropy 6.4543. Characteristic badges: CNT_CODE, MEM_EXECUTE, MEM_READ. Live hex dump of first 4.0 KB with offsets, bytes, and ASCII. "Load more..." for paging. Below: "Strings (136 ASCII, # UTF-16LE)" for string extraction.
+>
+> **Right:** Raw hex editor showing 512 bytes at offset 0x00000000. MZ header visible (4D 5A 90...) with DOS stub. Right column: ASCII interpretation. Data Inspector below showing cursor value as Int8/16/32/64, Float32/64, ASCII, UTF-16 LE. Top-right: PE/ELF Analysis buttons, offset input, 512-byte pages with Prev/Next.
+
+---
+
+### Sysmon Event Monitoring
+
+<table>
+<tr>
+<td width="50%">
+<p align="center">
+  <img src="static/sysmon_event_ids.png" alt="Sysmon Events" width="100%">
+</p>
+</td>
+<td width="50%">
+<p align="center">
+  <img src="static/sysmon_windows_event_id_correlation.png" alt="Sysmon Event Correlation" width="100%">
+</p>
+</td>
+</tr>
+</table>
+
+> **Left:** Sysmon tab with 500 events. Filter pills: ProcessCreate (386), RegistryValueSet (75), FileCreate (24), NetworkConnect (8), DNSQuery (7). Table: TIME, TYPE (color-coded green/cyan/orange), PID, IMAGE, DETAILS (full command lines — powershell.exe, docker.exe, sc.exe, git.exe), WIN. EID column (4688, 4689, 4663, 4656, 11707). Search, type/PID dropdowns, max events slider, Refresh and Correlate buttons.
+>
+> **Right:** Detail panel for FileCreate event (PID 8156). Shows: timestamp, Sysmon Event ID 11, Image (powershell.exe). "Correlated Windows Events" maps to related log entries: 4663 "Object Access (File)" (Security), 4656 "Handle to Object Requested" (Security), 11707 "Installation Completed (MSI)" (Application) — cross-log context for the same operation.
+
+---
+
 ## API Reference
 
 All endpoints served on port `9000`. Responses are JSON.
@@ -439,6 +541,13 @@ All endpoints served on port `9000`. Responses are JSON.
 | POST | `/api/file/hex/upload` | Upload file for hex viewing |
 | GET | `/api/file/pe` | PE header analysis. Param: `path` |
 | GET | `/api/file/elf` | ELF binary analysis. Param: `path` |
+
+### Sysmon
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/sysmon` | Sysmon events. Params: `max`, `event_id`, `pid` |
+| GET | `/api/sysmon/stats` | Sysmon statistics and diagnostics |
 
 ### Scanner
 
@@ -526,14 +635,29 @@ transportable-detonation-chamber/
 ├── README.md
 ├── tdc-logo.png
 │
+├── static/                         # Screenshots for documentation
+│   ├── dashboard.png
+│   ├── mimikatz_detonation.png
+│   ├── rustinel_analysis.png
+│   ├── rustinel_analysis_details.png
+│   ├── process_rollup.png
+│   ├── process_rollup_details_scan_correlation.png
+│   ├── pe_header_analyzer.png
+│   ├── PE_header_packing_analyzer.png
+│   ├── pe_analyzer_text_header_section.png
+│   ├── hex_editor.png
+│   ├── sysmon_event_ids.png
+│   └── sysmon_windows_event_id_correlation.png
+│
 ├── webui/                          # Unified Web UI
-│   ├── app.py                     # Flask backend (APIs, proxying, PE analysis)
+│   ├── app.py                     # Flask backend (APIs, proxying, PE/ELF analysis)
+│   ├── dev_server.py              # Dev server with live-reload
 │   ├── requirements.txt           # Python deps (flask, requests, watchdog, pefile)
 │   ├── templates/
 │   │   └── index.html             # SPA with all tabs + Help modal
 │   └── static/
-│       ├── css/style.css          # Dark theme (~3800 lines)
-│       ├── js/app.js              # Frontend logic (~4000 lines)
+│       ├── css/style.css          # Dark theme (~5000 lines)
+│       ├── js/app.js              # Frontend logic (~5500 lines)
 │       └── icon.png               # Logo
 │
 ├── config/
@@ -570,13 +694,12 @@ C:\DetonatorAgent\                  .NET 8 execution agent
 C:\LitterBox\                       Analysis sandbox
 C:\tools\ThreatCheck\               AV signature scanner
 C:\tools\DefenderCheck\             Defender evasion tester
-C:\tools\Hunt-Sleeping-Beacons\     Sleeping beacon scanner (callstack analysis)
-C:\tools\Hunt-Sleeping-Beacons-src\ HSB source code + VS solution
-C:\tools\theZoo-WebUI\              theZoo malware sample browser (PHP, :8888)
+C:\tools\Hunt-Sleeping-Beacons\     Sleeping beacon scanner
+C:\tools\theZoo-WebUI\              theZoo malware sample browser (:8888)
 C:\tools\detection-rules\           Sigma + YARA + IOC rules
 C:\ProgramData\chocolatey\lib\die\  Detect It Easy (DiE 3.21)
-C:\ProgramData\chocolatey\lib\ghidra\ Ghidra 12.1.2 (NSA RE framework)
-WinDbgX.exe                         WinDbg Preview (via Microsoft Store/winget)
+C:\ProgramData\chocolatey\lib\ghidra\ Ghidra 12.1.2
+WinDbgX.exe                         WinDbg Preview (via winget)
 C:\Users\vagrant\Desktop\infected\  Malware samples (Defender-excluded)
 ```
 
@@ -686,7 +809,8 @@ make install    # or: .\make.ps1 install
 
 ## Security Notes
 
-- This VM is designed for **malware analysis** — treat it as compromised
+> **This VM is designed for malware analysis — treat it as compromised.**
+
 - Use **snapshots** before each detonation (`vagrant snapshot save clean_state`)
 - **Network isolation** recommended (Hyper-V internal/private switch)
 - Defender exclusions configured for detonation paths only
@@ -697,14 +821,22 @@ make install    # or: .\make.ps1 install
 
 ## Credits
 
-- [dobin/detonator](https://github.com/dobin/detonator) — Orchestration framework
-- [dobin/DetonatorAgent](https://github.com/dobin/DetonatorAgent) — Execution agent
-- [rabbitstack/fibratus](https://github.com/rabbitstack/fibratus) — ETW detection engine
-- [Karib0u/rustinel](https://github.com/Karib0u/rustinel) — Sigma/YARA EDR agent
-- [BlackSnufkin/LitterBox](https://github.com/BlackSnufkin/LitterBox) — Payload analysis sandbox
-- [thefLink/Hunt-Sleeping-Beacons](https://github.com/thefLink/Hunt-Sleeping-Beacons) — Sleeping beacon callstack scanner
-- [ytisf/theZoo](https://github.com/ytisf/theZoo) — Malware sample repository
-- [kawaiipantsu/theZoo-WebUI](https://github.com/kawaiipantsu/theZoo-WebUI) — theZoo web frontend
-- [horsicq/DIE-engine](https://github.com/horsicq/DIE-engine) — Detect It Easy (packer/compiler identification)
-- [NationalSecurityAgency/ghidra](https://github.com/NationalSecurityAgency/ghidra) — Ghidra RE framework
-- [Microsoft WinDbg](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/) — Windows debugger
+| Project | Role |
+|---------|------|
+| [dobin/detonator](https://github.com/dobin/detonator) | Orchestration framework |
+| [dobin/DetonatorAgent](https://github.com/dobin/DetonatorAgent) | Execution agent |
+| [rabbitstack/fibratus](https://github.com/rabbitstack/fibratus) | ETW detection engine |
+| [Karib0u/rustinel](https://github.com/Karib0u/rustinel) | Sigma/YARA EDR agent |
+| [BlackSnufkin/LitterBox](https://github.com/BlackSnufkin/LitterBox) | Payload analysis sandbox |
+| [thefLink/Hunt-Sleeping-Beacons](https://github.com/thefLink/Hunt-Sleeping-Beacons) | Sleeping beacon callstack scanner |
+| [ytisf/theZoo](https://github.com/ytisf/theZoo) | Malware sample repository |
+| [kawaiipantsu/theZoo-WebUI](https://github.com/kawaiipantsu/theZoo-WebUI) | theZoo web frontend |
+| [horsicq/DIE-engine](https://github.com/horsicq/DIE-engine) | Detect It Easy |
+| [NationalSecurityAgency/ghidra](https://github.com/NationalSecurityAgency/ghidra) | Ghidra RE framework |
+| [Microsoft WinDbg](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/) | Windows debugger |
+
+---
+
+<p align="center">
+  <sub>Built for security research and EDR testing. Use responsibly.</sub>
+</p>

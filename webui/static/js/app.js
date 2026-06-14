@@ -4,8 +4,15 @@
  */
 
 // --- Toast Notification System ---
+const _toastThrottle = {}; // track last toast time by title to avoid spam
 function showToast(type, title, detail, duration) {
     // type: 'success' | 'error' | 'warning' | 'info'
+    // Throttle: suppress duplicate toasts within 15s
+    const key = type + ':' + title;
+    const now = Date.now();
+    if (_toastThrottle[key] && now - _toastThrottle[key] < 15000) return;
+    _toastThrottle[key] = now;
+
     let container = document.getElementById('toast-container');
     if (!container) {
         container = document.createElement('div');
@@ -21,7 +28,8 @@ function showToast(type, title, detail, duration) {
         <div class="toast-body">
             <div class="toast-title">${title}</div>
             ${detail ? `<div class="toast-detail">${detail}</div>` : ''}
-        </div>`;
+        </div>
+        <button class="toast-close" onclick="this.parentElement.classList.add('removing');setTimeout(()=>this.parentElement.remove(),300)">&times;</button>`;
     container.appendChild(toast);
     const autoDismiss = duration || (type === 'error' ? 8000 : 4000);
     setTimeout(() => {
@@ -162,6 +170,8 @@ async function refreshDashboard() {
         if (statusResp.ok) {
             state.serviceStatus = await statusResp.json();
             updateServiceStatus(state.serviceStatus);
+        } else {
+            showToast('error', 'Status update failed', `Server returned ${statusResp.status}`, 5000);
         }
         if (rustinelResp.ok) {
             state.rustinelInfo = await rustinelResp.json();
@@ -170,7 +180,7 @@ async function refreshDashboard() {
         const timeEl = document.getElementById('dashboard-time');
         if (timeEl) timeEl.textContent = 'Updated ' + new Date().toLocaleTimeString('en-GB');
     } catch (e) {
-        console.error('Failed to refresh dashboard:', e);
+        showToast('error', 'Dashboard unreachable', e.message || 'Connection to server lost', 6000);
     }
 }
 
@@ -178,7 +188,13 @@ async function refreshAlerts() {
     try {
         const resp = await fetch('/api/alerts');
         if (resp.ok) {
-            state.alerts = await resp.json();
+            const newAlerts = await resp.json();
+            // Toast on new alerts arriving
+            if (state.alerts.length > 0 && newAlerts.length > state.alerts.length) {
+                const diff = newAlerts.length - state.alerts.length;
+                showToast('info', `${diff} new alert${diff > 1 ? 's' : ''}`, 'New detections received');
+            }
+            state.alerts = newAlerts;
             if (state.alerts.length) {
                 const times = state.alerts.map(a => new Date(a.timestamp).getTime()).filter(t => !isNaN(t));
                 state.sessionStart = times.length ? Math.min(...times) : null;
@@ -187,9 +203,11 @@ async function refreshAlerts() {
             if (state.activeTab === 'tracing') {
                 renderRtraceConsole();
             }
+        } else if (resp.status >= 500) {
+            showToast('error', 'Alert fetch failed', `Server error ${resp.status}`, 5000);
         }
     } catch (e) {
-        console.error('Failed to fetch alerts:', e);
+        showToast('error', 'Alerts unreachable', e.message || 'Connection lost', 6000);
     }
 }
 
@@ -201,7 +219,7 @@ async function refreshProcesses() {
             renderProcessList();
         }
     } catch (e) {
-        console.error('Failed to fetch processes:', e);
+        showToast('error', 'Process list failed', e.message || 'Connection lost', 5000);
     }
 }
 
@@ -3136,11 +3154,28 @@ function renderTimeline() {
 
 // --- Render: Service status ---
 function updateServiceStatus(status) {
-    setStatus('status-rustinel', status.rustinel?.online);
-    setStatus('status-sysmon', status.sysmon?.online);
-    setStatus('status-agent', status.detonator_agent?.online);
-    setStatus('status-litterbox', status.litterbox?.online);
-    setStatus('status-fibratus', status.fibratus?.online);
+    // Detect transitions and show toasts
+    const services = [
+        {key: 'rustinel', id: 'status-rustinel', name: 'Rustinel'},
+        {key: 'sysmon', id: 'status-sysmon', name: 'Sysmon'},
+        {key: 'detonator_agent', id: 'status-agent', name: 'Agent'},
+        {key: 'litterbox', id: 'status-litterbox', name: 'Litterbox'},
+        {key: 'fibratus', id: 'status-fibratus', name: 'Fibratus'},
+    ];
+    services.forEach(svc => {
+        const nowOnline = !!status[svc.key]?.online;
+        const prev = state._prevServiceStatus?.[svc.key]?.online;
+        // Only toast on actual transitions (not initial load)
+        if (state._prevServiceStatus && prev !== undefined && prev !== nowOnline) {
+            if (nowOnline) {
+                showToast('success', `${svc.name} online`, 'Service is now running');
+            } else {
+                showToast('warning', `${svc.name} offline`, 'Service is no longer running');
+            }
+        }
+        setStatus(svc.id, nowOnline);
+    });
+    state._prevServiceStatus = JSON.parse(JSON.stringify(status));
 }
 
 function setStatus(elementId, online) {
@@ -5121,16 +5156,28 @@ async function refreshSysmon() {
         ]);
         if (eventsResp.ok) {
             sysmonEvents = await eventsResp.json();
+            // Check if the response contains an error from backend retries
+            if (sysmonEvents.length === 1 && sysmonEvents[0]?.error) {
+                showToast('warning', 'Sysmon query issue', sysmonEvents[0].error, 6000);
+            }
             renderSysmonTable();
         } else if (tableContainer) {
+            showToast('error', 'Sysmon events failed', `Server returned ${eventsResp.status}`, 5000);
             tableContainer.innerHTML = '<div class="empty-state">Failed to load Sysmon events.</div>';
         }
         if (statsResp.ok) {
             sysmonStats = await statsResp.json();
             renderSysmonStats();
+            // Toast if stats returned an error/diagnostic
+            if (sysmonStats.error) {
+                showToast('error', 'Sysmon stats error', sysmonStats.error, 6000);
+            } else if (sysmonStats.diagnostic && !sysmonStats.online) {
+                showToast('warning', 'Sysmon', sysmonStats.diagnostic, 5000);
+            }
         }
     } catch (e) {
         console.error('Sysmon fetch error:', e);
+        showToast('error', 'Sysmon unreachable', e.message || 'Connection failed', 6000);
         if (statsContainer) {
             statsContainer.innerHTML = `<div class="sysmon-diagnostic warning">Connection error: ${escapeHtml(e.message)}</div>`;
         }
