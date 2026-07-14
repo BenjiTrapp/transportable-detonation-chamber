@@ -77,7 +77,10 @@ make run        # Starts on http://localhost:9000
 ### Option B: Full VM (recommended for analysis)
 
 ```bash
-# macOS / Linux
+# macOS Apple Silicon (M1-M4) — UTM-based setup (recommended)
+./scripts/setup-macos-utm.sh    # Guided: installs tools, creates VM, provisions
+
+# macOS / Linux — Vagrant-based (requires pre-built box)
 make up         # Provisions the full Windows 11 VM
 make open       # Opens http://<vm-ip>:9000 in browser
 
@@ -234,11 +237,50 @@ Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All
 ### macOS Host (Apple Silicon)
 
 - macOS on Apple Silicon (M1/M2/M3/M4)
-- **QEMU**: `brew install qemu`
-- **Vagrant**: `brew install --cask vagrant`
-- **vagrant-qemu plugin**: `vagrant plugin install vagrant-qemu`
-- **Windows 11 ARM64 Vagrant box** (see [Vagrantfile.utm](Vagrantfile.utm) header for setup instructions)
+- **UTM** (recommended): `brew install --cask utm` or [mac.getutm.app](https://mac.getutm.app)
+- **QEMU tools**: `brew install qemu` (for `qemu-img`)
+- **Python 3** with `pywinrm`: `pip3 install pywinrm requests-ntlm`
+- **Windows 11 ARM64 ISO** from [Microsoft](https://www.microsoft.com/software-download/windows11arm64)
 - ~80 GB disk, ~8 GB RAM
+
+#### Recommended Setup (UTM + automated provisioning)
+
+The fastest path on Apple Silicon uses UTM as the hypervisor with automated
+provisioning via WinRM. A single script handles everything after the initial
+Windows installation:
+
+```bash
+# Full guided setup (installs prerequisites, guides VM creation, provisions)
+./scripts/setup-macos-utm.sh
+
+# Or step by step:
+./scripts/setup-macos-utm.sh --skip-prerequisites   # if tools already installed
+./scripts/setup-macos-utm.sh --provision-only --vm-ip 192.168.64.4  # re-provision existing VM
+```
+
+**Manual steps** (the script guides you through these):
+
+1. Install UTM and create a Windows 11 ARM64 VM (8 GB RAM, 4 cores, 80 GB disk)
+2. Install Windows normally with a local admin account (`vagrant`/`vagrant` recommended)
+3. Run `scripts/prepare-vagrant-winrm.ps1` inside the VM (enables WinRM remote management)
+4. Run `./scripts/setup-macos-utm.sh --provision-only --vm-ip <vm-ip>`
+
+The provisioning installs all detection engines, analysis tools, and the unified
+Web UI (~20-40 minutes on first run).
+
+#### Alternative: Vagrant/QEMU (headless, experimental)
+
+For a fully headless Vagrant-managed workflow, see [Vagrantfile.utm](Vagrantfile.utm).
+This path requires building a custom `win11-arm` Vagrant box from the ISO:
+
+```bash
+make prerequisites-fix          # Install QEMU, Vagrant, vagrant-qemu plugin
+./scripts/build-box-macos.sh --iso ~/Downloads/Win11_ARM64.iso
+make build                      # Provision the VM
+```
+
+> **Note:** Headless QEMU boot of Windows 11 ARM64 ISOs can be unreliable on
+> some QEMU/firmware combinations. The UTM path above is recommended.
 
 ### Local Development Only
 

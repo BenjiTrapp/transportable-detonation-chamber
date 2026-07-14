@@ -58,8 +58,9 @@ help:
 	@echo "  Platform: $(PLATFORM)  Provider: $(PROVIDER)  VM: $(VM_IP)"
 	@echo ""
 	@echo "  Setup:"
+	@echo "    make setup           Full Mac setup: UTM + provisioning (recommended)"
 	@echo "    make prerequisites   Check/install all prerequisites"
-	@echo "    make build           Full Mac setup: check prereqs + build VM (QEMU)"
+	@echo "    make build           Mac VM build via Vagrant/QEMU (experimental)"
 	@echo ""
 	@echo "  Local (no VM required):"
 	@echo "    make install         Install Python venv + dependencies"
@@ -111,7 +112,19 @@ prerequisites-fix:
 	@echo "[prerequisites] Checking and fixing system requirements..."
 	@bash scripts/check-prerequisites.sh --fix
 
-# --- Mac VM Build (full guided setup) ---
+# --- Mac UTM Setup (recommended for Apple Silicon) ---
+
+.PHONY: setup
+setup:
+ifeq ($(PLATFORM),macos)
+	@bash scripts/setup-macos-utm.sh
+else
+	@echo "[setup] The UTM setup is for macOS Apple Silicon only."
+	@echo "  On Windows use: .\\make.ps1 up"
+	@echo "  On Linux use:   make up"
+endif
+
+# --- Mac VM Build (Vagrant/QEMU, experimental) ---
 
 .PHONY: build
 build:

@@ -182,4 +182,4 @@ Write-Host "`n[+] Sysmon installation complete!" -ForegroundColor Green
 Write-Host "    Directory:  $sysmonDir" -ForegroundColor Gray
 Write-Host "    Config:     $configPath" -ForegroundColor Gray
 Write-Host "    Event Log:  Microsoft-Windows-Sysmon/Operational" -ForegroundColor Gray
-Write-Host "    Service:    Sysmon64" -ForegroundColor Gray
+Write-Host "    Service:    $sysmonServiceName" -ForegroundColor Gray

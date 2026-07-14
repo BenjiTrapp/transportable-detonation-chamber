@@ -10,6 +10,7 @@ Access: http://localhost:9000
 import json
 import os
 import glob
+import platform
 import time
 import hashlib
 import math
@@ -851,8 +852,9 @@ def _find_service_launch_config():
             break
     configs["fibratus"] = {"service": "fibratus", "exe": fibratus_exe}
 
-    # Sysmon - Windows Service
-    configs["sysmon"] = {"service": "Sysmon64"}
+    # Sysmon - Windows Service (ARM64 uses Sysmon64a, x86/x64 uses Sysmon64)
+    sysmon_svc = "Sysmon64a" if platform.machine() == "ARM64" else "Sysmon64"
+    configs["sysmon"] = {"service": sysmon_svc}
 
     return configs
 
@@ -1045,21 +1047,26 @@ _sysmon_proc_cache = {"online": False, "checked_at": 0}
 
 
 def _is_sysmon_running():
-    """Fast check if Sysmon64 service is running (cached for 10s).
+    """Fast check if Sysmon service is running (cached for 10s).
     Uses 'sc query' (native, instant) instead of PowerShell (4s+ cold start).
+    Checks Sysmon64a (ARM64) first, then Sysmon64 (x86/x64).
     """
     now = time.time()
     if now - _sysmon_proc_cache["checked_at"] < 10:
         return _sysmon_proc_cache["online"]
     try:
-        result = subprocess.run(
-            ["sc", "query", "Sysmon64"],
-            capture_output=True, text=True, timeout=5
-        )
-        online = "RUNNING" in result.stdout
-        _sysmon_proc_cache["online"] = online
+        for svc_name in ("Sysmon64a", "Sysmon64"):
+            result = subprocess.run(
+                ["sc", "query", svc_name],
+                capture_output=True, text=True, timeout=5
+            )
+            if "RUNNING" in result.stdout:
+                _sysmon_proc_cache["online"] = True
+                _sysmon_proc_cache["checked_at"] = now
+                return True
+        _sysmon_proc_cache["online"] = False
         _sysmon_proc_cache["checked_at"] = now
-        return online
+        return False
     except Exception:
         _sysmon_proc_cache["online"] = False
         _sysmon_proc_cache["checked_at"] = now

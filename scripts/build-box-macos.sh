@@ -335,12 +335,12 @@ cat > "$AUTOUNATTEND" << 'XMLEOF'
                xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
       <SetupUILanguage>
-        <UILanguage>en-US</UILanguage>
+        <UILanguage>de-DE</UILanguage>
       </SetupUILanguage>
-      <InputLocale>en-US</InputLocale>
-      <SystemLocale>en-US</SystemLocale>
-      <UILanguage>en-US</UILanguage>
-      <UserLocale>en-US</UserLocale>
+      <InputLocale>de-DE</InputLocale>
+      <SystemLocale>de-DE</SystemLocale>
+      <UILanguage>de-DE</UILanguage>
+      <UserLocale>de-DE</UserLocale>
     </component>
 
     <component name="Microsoft-Windows-Setup"
@@ -591,10 +591,10 @@ cat > "$AUTOUNATTEND" << 'XMLEOF'
                versionScope="nonSxS"
                xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-      <InputLocale>en-US</InputLocale>
-      <SystemLocale>en-US</SystemLocale>
-      <UILanguage>en-US</UILanguage>
-      <UserLocale>en-US</UserLocale>
+      <InputLocale>de-DE</InputLocale>
+      <SystemLocale>de-DE</SystemLocale>
+      <UILanguage>de-DE</UILanguage>
+      <UserLocale>de-DE</UserLocale>
     </component>
   </settings>
 </unattend>
@@ -747,13 +747,13 @@ qemu-system-aarch64 \
     -drive if=pflash,format=raw,readonly=on,file="$EFI_CODE" \
     -drive if=pflash,format=raw,file="$EFI_VARS" \
     -drive if=virtio,file="$DISK_IMAGE",format=qcow2,cache=writeback \
+    -device qemu-xhci,id=usb \
     -drive file="$ISO_PATH",media=cdrom,if=none,id=installcd \
     -device usb-storage,drive=installcd \
     -drive file="$ANSWER_ISO",media=cdrom,if=none,id=answercd \
     -device usb-storage,drive=answercd \
     $VIRTIO_DRIVE_ARGS \
     -device virtio-gpu-pci \
-    -device qemu-xhci \
     -device usb-kbd \
     -device usb-tablet \
     -device virtio-net-pci,netdev=net0 \
@@ -761,12 +761,25 @@ qemu-system-aarch64 \
     $TPM_ARGS \
     $DISPLAY_ARG \
     -serial null \
+    -monitor unix:"$BUILD_DIR/monitor.sock",server,nowait \
     -daemonize \
     -pidfile "$BUILD_DIR/qemu.pid" \
     || { fail "Failed to start QEMU"; exit 1; }
 
 QEMU_PID=$(cat "$BUILD_DIR/qemu.pid" 2>/dev/null)
 ok "QEMU started (PID: $QEMU_PID)"
+
+# Windows boot media shows "Press any key to boot from CD or DVD..." which
+# blocks headless installs. Send Enter repeatedly for the first ~90s via the
+# QEMU monitor socket to get past it and trigger the unattended install.
+info "Sending boot keystrokes to pass 'Press any key to boot from CD'..."
+(
+    for _ in $(seq 1 30); do
+        printf 'sendkey ret\n' | nc -U "$BUILD_DIR/monitor.sock" >/dev/null 2>&1 || true
+        sleep 3
+    done
+) &
+KEYPRESS_PID=$!
 info "Windows is installing. Monitor progress:"
 if $HEADLESS; then
     echo "    Re-run with --gui flag to see the display"
@@ -877,18 +890,23 @@ info "Compacting disk image..."
 qemu-img convert -O qcow2 -c "$DISK_IMAGE" "$BUILD_DIR/box.img"
 ok "Compacted image: $(du -h "$BUILD_DIR/box.img" | cut -f1)"
 
-# Package everything into a .box file (tar archive)
-pushd "$BUILD_DIR" > /dev/null
-tar -czf "$BOX_FILE" \
-    -s '/box.img/box.img/' \
-    box.img \
-    -s "/box-Vagrantfile/Vagrantfile/" \
-    box-Vagrantfile \
-    metadata.json
+# Package everything into a .box file (tar archive).
+# The box needs three members with exact names: box.img, Vagrantfile, metadata.json.
+# Stage them in a temp dir so the archive works with both GNU and BSD tar
+# (the -s substitution flag is not portable across tar implementations).
+PKG_DIR="$BUILD_DIR/box-package"
+rm -rf "$PKG_DIR"
+mkdir -p "$PKG_DIR"
+mv "$BUILD_DIR/box.img" "$PKG_DIR/box.img"
+cp "$EMBEDDED_VAGRANTFILE" "$PKG_DIR/Vagrantfile"
+cp "$METADATA" "$PKG_DIR/metadata.json"
+
+pushd "$PKG_DIR" > /dev/null
+tar -czf "$BOX_FILE" box.img Vagrantfile metadata.json
 popd > /dev/null
 
-# Clean up temp image
-rm -f "$BUILD_DIR/box.img"
+# Clean up temp package dir
+rm -rf "$PKG_DIR"
 
 BOX_SIZE=$(du -h "$BOX_FILE" | cut -f1)
 ok "Box created: $BOX_FILE ($BOX_SIZE)"
