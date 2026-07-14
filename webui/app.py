@@ -1373,6 +1373,192 @@ def api_sysmon():
     return jsonify(events)
 
 
+# --- ETW Browser ---
+
+ETW_CHANNELS = {
+    "sysmon": {
+        "name": "Microsoft-Windows-Sysmon/Operational",
+        "label": "Sysmon",
+        "description": "Process creation, network, file, registry, DNS, image loads (all Sysmon event types)",
+    },
+    "security": {
+        "name": "Security",
+        "label": "Security (Audit)",
+        "description": "Logon events (4624/4625), privilege use (4672), process audit (4688), account management",
+    },
+    "powershell": {
+        "name": "Microsoft-Windows-PowerShell/Operational",
+        "label": "PowerShell",
+        "description": "Script block logging (4104), module loads, command invocations — detects obfuscated scripts",
+    },
+    "defender": {
+        "name": "Microsoft-Windows-Windows Defender/Operational",
+        "label": "Defender",
+        "description": "Malware detections (1116/1117), scan results, real-time protection events, exclusions",
+    },
+    "wmi": {
+        "name": "Microsoft-Windows-WMI-Activity/Operational",
+        "label": "WMI Activity",
+        "description": "WMI queries, event subscriptions (T1546.003), provider loads — persistence detection",
+    },
+    "task-scheduler": {
+        "name": "Microsoft-Windows-TaskScheduler/Operational",
+        "label": "Task Scheduler",
+        "description": "Task creation/modification/execution (T1053.005) — persistence and lateral movement",
+    },
+    "bits": {
+        "name": "Microsoft-Windows-Bits-Client/Operational",
+        "label": "BITS Client",
+        "description": "Background file transfers — often abused for stealthy C2 downloads (T1197)",
+    },
+    "dns-client": {
+        "name": "Microsoft-Windows-DNS-Client/Operational",
+        "label": "DNS Client",
+        "description": "DNS resolution queries — detect C2 beaconing, DGA domains, DNS tunneling",
+    },
+    "firewall": {
+        "name": "Microsoft-Windows-Windows Firewall With Advanced Security/Firewall",
+        "label": "Firewall",
+        "description": "Firewall rule changes, blocked connections — detect evasion and lateral movement",
+    },
+    "applocker": {
+        "name": "Microsoft-Windows-AppLocker/EXE and DLL",
+        "label": "AppLocker",
+        "description": "Application execution control — blocked/allowed executables and DLLs",
+    },
+    "winrm": {
+        "name": "Microsoft-Windows-WinRM/Operational",
+        "label": "WinRM",
+        "description": "Remote management activity — detect lateral movement via PS remoting",
+    },
+    "application": {
+        "name": "Application",
+        "label": "Application (Fibratus)",
+        "description": "Application log — includes Fibratus alerts and crash dumps",
+    },
+}
+
+
+@app.route("/api/etw/channels")
+def api_etw_channels():
+    """List available ETW channels with availability status."""
+    probe = request.args.get("probe", "false") == "true"
+    if not probe:
+        return jsonify(ETW_CHANNELS)
+
+    ps_parts = []
+    for key, ch in ETW_CHANNELS.items():
+        log_name = ch["name"].replace("'", "''")
+        ps_parts.append(
+            f"try {{ $n = (Get-WinEvent -FilterHashtable @{{LogName='{log_name}'}} -MaxEvents 1 -EA Stop).Count; "
+            f"'{key}=1' }} catch {{ '{key}=0' }}"
+        )
+    ps_cmd = "; ".join(ps_parts)
+
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=20
+        )
+        status_map = {}
+        for line in (result.stdout or "").strip().splitlines():
+            line = line.strip()
+            if "=" in line:
+                k, v = line.split("=", 1)
+                status_map[k] = v == "1"
+    except Exception:
+        status_map = {}
+
+    enriched = {}
+    for key, ch in ETW_CHANNELS.items():
+        enriched[key] = {**ch, "available": status_map.get(key, None)}
+    return jsonify(enriched)
+
+
+@app.route("/api/etw/events")
+def api_etw_events():
+    """Query events from a specific ETW channel / Windows Event Log."""
+    channel_key = request.args.get("channel", "etw-ti")
+    max_events = request.args.get("max", 50, type=int)
+    since = request.args.get("since")
+    keyword_filter = request.args.get("filter", "")
+
+    channel_info = ETW_CHANNELS.get(channel_key)
+    if not channel_info:
+        return jsonify({"error": f"Unknown channel: {channel_key}"}), 400
+
+    log_name = channel_info["name"]
+    max_events = min(max_events, 500)
+
+    time_filter = ""
+    if since:
+        time_filter = f";StartTime='{since}'"
+
+    ps_cmd = (
+        f"try {{ Get-WinEvent -FilterHashtable @{{LogName='{log_name}'{time_filter}}} "
+        f"-MaxEvents {max_events} -ErrorAction Stop | "
+        "ForEach-Object {"
+        "  $x = [xml]$_.ToXml();"
+        "  $d = @{};"
+        "  if ($x.Event.EventData) {"
+        "    $x.Event.EventData.Data | ForEach-Object {"
+        "      if ($_.Name) { $d[$_.Name] = $_.'#text' }"
+        "      else { $d['_Message'] = $_.'#text' }"
+        "    }"
+        "  };"
+        "  if ($x.Event.System) {"
+        "    $d['_Provider'] = $x.Event.System.Provider.Name;"
+        "    $d['_EventId'] = [int]$x.Event.System.EventID.'#text';"
+        "    if (-not $d['_EventId']) { $d['_EventId'] = [int]$x.Event.System.EventID }"
+        "  };"
+        "  $d['_TimeCreated'] = $_.TimeCreated.ToString('o');"
+        "  $d['_Level'] = $_.LevelDisplayName;"
+        "  $d['_Message_Short'] = ($_.Message -split \"`n\")[0];"
+        "  [PSCustomObject]$d"
+        "} | ConvertTo-Json -Depth 3 -Compress"
+        "} catch {"
+        "  @{error=$_.Exception.Message} | ConvertTo-Json -Compress"
+        "}"
+    )
+
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=15
+        )
+        output = (result.stdout or "").strip()
+        if not output:
+            return jsonify({"events": [], "channel": channel_info, "note": "No events found or channel not available"})
+
+        data = json.loads(output)
+        if isinstance(data, dict):
+            if "error" in data:
+                return jsonify({"events": [], "channel": channel_info, "error": data["error"]})
+            data = [data]
+
+        if keyword_filter:
+            kw = keyword_filter.lower()
+            data = [e for e in data if kw in json.dumps(e).lower()]
+
+        events = []
+        for item in data:
+            events.append({
+                "timestamp": item.get("_TimeCreated", ""),
+                "event_id": item.get("_EventId", 0),
+                "level": item.get("_Level", ""),
+                "provider": item.get("_Provider", ""),
+                "message": item.get("_Message_Short", ""),
+                "data": {k: v for k, v in item.items() if not k.startswith("_")},
+            })
+
+        return jsonify({"events": events, "channel": channel_info, "count": len(events)})
+
+    except subprocess.TimeoutExpired:
+        return jsonify({"events": [], "channel": channel_info, "error": "Query timed out (15s)"})
+    except Exception as e:
+        return jsonify({"events": [], "channel": channel_info, "error": str(e)})
+
+
 @app.route("/api/sysmon/stats")
 def api_sysmon_stats():
     """Get Sysmon event counts by type, with diagnostic info."""
@@ -3327,22 +3513,28 @@ def api_file_pe():
     flags = []
     if suspicious_found:
         for cat, items in suspicious_found.items():
-            flags.append({"type": "suspicious_import", "category": cat, "severity": "high" if cat in ("process_injection", "process_hollowing", "credential_access") else "medium", "detail": f"{len(items)} suspicious API(s) in category '{cat}'"})
+            sev = "high" if cat in ("process_injection", "process_hollowing", "credential_access") else "medium"
+            evidence = {
+                "matched_apis": [f"{i['dll']}!{i['function']}" for i in items],
+                "why": f"Imports from category '{cat}' are commonly used in malicious techniques ({cat.replace('_', ' ')})",
+                "reference_apis": SUSPICIOUS_IMPORTS.get(cat, []),
+            }
+            flags.append({"type": "suspicious_import", "category": cat, "severity": sev, "detail": f"{len(items)} suspicious API(s) in category '{cat}'", "evidence": evidence})
     for sec in sections:
         if sec.get("rwx_warning"):
-            flags.append({"type": "rwx_section", "severity": "high", "detail": f"Section '{sec['name']}' is Read+Write+Execute"})
+            flags.append({"type": "rwx_section", "severity": "high", "detail": f"Section '{sec['name']}' is Read+Write+Execute", "evidence": {"section": sec["name"], "permissions": sec.get("permissions", "RWX"), "why": "Sections with Read+Write+Execute permissions allow self-modifying code, a hallmark of shellcode and packers"}})
         if sec["entropy_status"] == "high":
-            flags.append({"type": "high_entropy", "severity": "medium", "detail": f"Section '{sec['name']}' entropy {sec['entropy']:.2f} (encrypted/packed)"})
+            flags.append({"type": "high_entropy", "severity": "medium", "detail": f"Section '{sec['name']}' entropy {sec['entropy']:.2f} (encrypted/packed)", "evidence": {"section": sec["name"], "entropy": sec["entropy"], "threshold": ENTROPY_HIGH_THRESHOLD, "why": f"Entropy {sec['entropy']:.2f} exceeds threshold {ENTROPY_HIGH_THRESHOLD} indicating compressed, encrypted, or packed content"}})
         if sec.get("packer_indicator"):
-            flags.append({"type": "packer", "severity": "medium", "detail": f"Section '{sec['name']}' matches packer: {sec['packer_indicator']}"})
+            flags.append({"type": "packer", "severity": "medium", "detail": f"Section '{sec['name']}' matches packer: {sec['packer_indicator']}", "evidence": {"section": sec["name"], "packer": sec["packer_indicator"], "why": f"Section name matches known packer/protector signature: {sec['packer_indicator']}"}})
     if tls_callbacks:
-        flags.append({"type": "tls_callback", "severity": "medium", "detail": f"{len(tls_callbacks)} TLS callback(s) detected (possible anti-debug)"})
+        flags.append({"type": "tls_callback", "severity": "medium", "detail": f"{len(tls_callbacks)} TLS callback(s) detected (possible anti-debug)", "evidence": {"callbacks": tls_callbacks, "why": "TLS callbacks execute before the entry point and are commonly used for anti-debugging or to run code before analysis tools attach"}})
     if not result["optional_header"]["aslr"]:
-        flags.append({"type": "no_aslr", "severity": "low", "detail": "ASLR not enabled"})
+        flags.append({"type": "no_aslr", "severity": "low", "detail": "ASLR not enabled", "evidence": {"why": "Address Space Layout Randomization is disabled, making ROP/exploit development easier"}})
     if not result["optional_header"]["dep_nx"]:
-        flags.append({"type": "no_dep", "severity": "low", "detail": "DEP/NX not enabled"})
+        flags.append({"type": "no_dep", "severity": "low", "detail": "DEP/NX not enabled", "evidence": {"why": "Data Execution Prevention is disabled, allowing shellcode execution from data segments"}})
     if total_entropy >= ENTROPY_HIGH_THRESHOLD:
-        flags.append({"type": "high_total_entropy", "severity": "medium", "detail": f"Overall file entropy {total_entropy:.2f} suggests packing/encryption"})
+        flags.append({"type": "high_total_entropy", "severity": "medium", "detail": f"Overall file entropy {total_entropy:.2f} suggests packing/encryption", "evidence": {"entropy": total_entropy, "threshold": ENTROPY_HIGH_THRESHOLD, "why": f"Whole-file entropy {total_entropy:.2f} exceeds {ENTROPY_HIGH_THRESHOLD}, typical of packed/encrypted executables (normal code is 5.0-6.5)"}})
 
     result["flags"] = flags
     result["flag_count"] = {"high": len([f for f in flags if f["severity"] == "high"]), "medium": len([f for f in flags if f["severity"] == "medium"]), "low": len([f for f in flags if f["severity"] == "low"])}
@@ -3944,37 +4136,42 @@ def api_file_elf():
     flags = []
 
     if not has_nx:
-        flags.append({"type": "no_nx", "severity": "high", "detail": "NX (non-executable stack) not enabled — stack is executable"})
+        flags.append({"type": "no_nx", "severity": "high", "detail": "NX (non-executable stack) not enabled — stack is executable", "evidence": {"why": "Without NX, the stack is executable — shellcode placed on the stack via buffer overflows can run directly"}})
     if not has_pie:
-        flags.append({"type": "no_pie", "severity": "medium", "detail": "Not a position-independent executable (no ASLR for main binary)"})
+        flags.append({"type": "no_pie", "severity": "medium", "detail": "Not a position-independent executable (no ASLR for main binary)", "evidence": {"why": "Without PIE, the main binary loads at a fixed address, making ROP gadgets and return-to-libc attacks trivial"}})
     if not has_relro:
-        flags.append({"type": "no_relro", "severity": "medium", "detail": "No RELRO — GOT is writable (GOT overwrite attacks possible)"})
+        flags.append({"type": "no_relro", "severity": "medium", "detail": "No RELRO — GOT is writable (GOT overwrite attacks possible)", "evidence": {"why": "The Global Offset Table remains writable at runtime, allowing attackers to redirect function calls by overwriting GOT entries"}})
     elif not has_full_relro:
-        flags.append({"type": "partial_relro", "severity": "low", "detail": "Partial RELRO — GOT partially protected"})
+        flags.append({"type": "partial_relro", "severity": "low", "detail": "Partial RELRO — GOT partially protected", "evidence": {"why": "GOT is partially protected (read-only after relocation for some entries), but lazy-bound entries remain writable"}})
     if not has_stack_canary:
-        flags.append({"type": "no_canary", "severity": "medium", "detail": "No stack canary detected (__stack_chk_fail not imported)"})
+        flags.append({"type": "no_canary", "severity": "medium", "detail": "No stack canary detected (__stack_chk_fail not imported)", "evidence": {"why": "No stack-smashing protector — buffer overflows won't be detected by canary checks before return"}})
     if is_stripped:
-        flags.append({"type": "stripped", "severity": "low", "detail": "Binary is stripped (no .symtab — harder to analyze)"})
+        flags.append({"type": "stripped", "severity": "low", "detail": "Binary is stripped (no .symtab — harder to analyze)", "evidence": {"why": "Symbol table removed — function names and debug info unavailable, complicating reverse engineering (common in malware)"}})
     if rpath:
-        flags.append({"type": "rpath", "severity": "medium", "detail": f"RPATH set: {rpath} (potential DLL hijacking)"})
+        flags.append({"type": "rpath", "severity": "medium", "detail": f"RPATH set: {rpath} (potential DLL hijacking)", "evidence": {"path": rpath, "why": f"RPATH '{rpath}' overrides standard library search order — an attacker can place a malicious .so in this path to hijack execution"}})
     if runpath:
-        flags.append({"type": "runpath", "severity": "low", "detail": f"RUNPATH set: {runpath}"})
+        flags.append({"type": "runpath", "severity": "low", "detail": f"RUNPATH set: {runpath}", "evidence": {"path": runpath, "why": f"RUNPATH '{runpath}' is set (lower priority than RPATH but still influences library loading)"}})
 
     if suspicious_found:
         for cat, syms in suspicious_found.items():
             sev = "high" if cat in ("process_injection", "privilege_escalation", "anti_debug") else "medium"
-            flags.append({"type": "suspicious_import", "category": cat, "severity": sev, "detail": f"{len(syms)} suspicious symbol(s): {', '.join(syms[:5])}"})
+            evidence = {
+                "matched_apis": syms,
+                "why": f"Imports from category '{cat}' are commonly used in malicious techniques ({cat.replace('_', ' ')})",
+                "reference_apis": SUSPICIOUS_ELF_IMPORTS.get(cat, []),
+            }
+            flags.append({"type": "suspicious_import", "category": cat, "severity": sev, "detail": f"{len(syms)} suspicious symbol(s): {', '.join(syms[:5])}", "evidence": evidence})
 
     for sec in sections:
         if sec.get("wx_warning"):
-            flags.append({"type": "wx_section", "severity": "high", "detail": f"Section '{sec['name']}' is Writable+Executable (W^X violation)"})
+            flags.append({"type": "wx_section", "severity": "high", "detail": f"Section '{sec['name']}' is Writable+Executable (W^X violation)", "evidence": {"section": sec["name"], "why": "Writable+Executable sections violate W^X policy, allowing self-modifying code — a strong indicator of shellcode or runtime unpacking"}})
         if sec["entropy_status"] == "high":
-            flags.append({"type": "high_entropy", "severity": "medium", "detail": f"Section '{sec['name']}' entropy {sec['entropy']:.2f} (packed/encrypted)"})
+            flags.append({"type": "high_entropy", "severity": "medium", "detail": f"Section '{sec['name']}' entropy {sec['entropy']:.2f} (packed/encrypted)", "evidence": {"section": sec["name"], "entropy": sec["entropy"], "threshold": ENTROPY_HIGH_THRESHOLD, "why": f"Entropy {sec['entropy']:.2f} exceeds threshold {ENTROPY_HIGH_THRESHOLD} indicating compressed, encrypted, or packed content"}})
         if sec.get("packer_indicator"):
-            flags.append({"type": "packer", "severity": "medium", "detail": f"Section '{sec['name']}' matches packer: {sec['packer_indicator']}"})
+            flags.append({"type": "packer", "severity": "medium", "detail": f"Section '{sec['name']}' matches packer: {sec['packer_indicator']}", "evidence": {"section": sec["name"], "packer": sec["packer_indicator"], "why": f"Section name matches known packer/protector signature: {sec['packer_indicator']}"}})
 
     if total_entropy >= ENTROPY_HIGH_THRESHOLD:
-        flags.append({"type": "high_total_entropy", "severity": "medium", "detail": f"Overall file entropy {total_entropy:.2f} suggests packing/encryption"})
+        flags.append({"type": "high_total_entropy", "severity": "medium", "detail": f"Overall file entropy {total_entropy:.2f} suggests packing/encryption", "evidence": {"entropy": total_entropy, "threshold": ENTROPY_HIGH_THRESHOLD, "why": f"Whole-file entropy {total_entropy:.2f} exceeds {ENTROPY_HIGH_THRESHOLD}, typical of packed/encrypted executables (normal code is 4.5-6.0)"}})
 
     result["flags"] = flags
     result["flag_count"] = {

@@ -29,6 +29,7 @@
                     <button class="tab" data-tab="graph">Graph</button>
                     <button class="tab" data-tab="sysmon">Sysmon</button>
                     <button class="tab" data-tab="scanner">Scanner</button>
+                    <button class="tab" data-tab="etw">ETW</button>
                     <button class="tab" data-tab="hexeditor">Hex</button>
                     <button class="tab" data-tab="submit">Submit</button>
                 </nav>
@@ -453,6 +454,30 @@
                     <div class="elf-panel-body" id="elf-panel-body">
                         <div class="elf-empty">Load an ELF binary and click "ELF Analysis" to inspect headers, segments, symbols, and security features.</div>
                     </div>
+                </div>
+            </div>
+
+            <!-- ETW Browser Tab -->
+            <div class="tab-content" id="tab-etw">
+                <div class="content-header">
+                    <h2>ETW Browser</h2>
+                    <span class="content-subtitle">Windows Event Tracing — live event stream viewer</span>
+                </div>
+                <div class="etw-controls">
+                    <select id="etw-channel-select" class="etw-select"></select>
+                    <input type="text" id="etw-filter-input" class="etw-filter" placeholder="Filter (keyword, PID, process name...)">
+                    <button id="etw-refresh-btn" class="etw-btn" onclick="refreshEtw()">Refresh</button>
+                    <label class="etw-auto-label"><input type="checkbox" id="etw-auto-refresh" checked> Auto (5s)</label>
+                    <select id="etw-max-select" class="etw-select etw-max">
+                        <option value="25">25</option>
+                        <option value="50" selected>50</option>
+                        <option value="100">100</option>
+                        <option value="200">200</option>
+                    </select>
+                </div>
+                <div class="etw-channel-info" id="etw-channel-info"></div>
+                <div class="etw-event-list" id="etw-event-list">
+                    <div class="etw-loading">Select a channel and click Refresh</div>
                 </div>
             </div>
 

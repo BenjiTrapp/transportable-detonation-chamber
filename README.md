@@ -108,15 +108,39 @@ make open       # Opens http://<vm-ip>:9000 in browser
 
 | Tab | Description |
 |-----|-------------|
-| **Dashboard** | Stats strip, 6 service health cards, recent activity feed, toast notifications |
+| **Dashboard** | Stats strip, 6 service health labels, recent activity feed, toast notifications |
 | **Tracing** | Real-time ETW event console, process filtering, timeline visualization |
 | **Graph** | Process relationship graph (Force/Hierarchical/Radial/Circular/Grid layouts) |
 | **Sysmon** | Windows Sysmon event viewer with search, filtering, and Event ID correlation |
 | **Scanner** | ThreatCheck + DefenderCheck integration with scan history |
+| **ETW** | Multi-channel Event Log browser with live threat highlighting (see below) |
 | **Hex Editor** | Binary viewer with data inspector, PE/ELF analysis, drag-and-drop |
 | **Submit** | Multi-target detonation with stage-by-stage pipeline progress |
 
-### Binary Analysis
+### ETW Browser
+
+The ETW tab provides a multi-channel Windows Event Log viewer with automatic threat classification:
+
+| Feature | Details |
+|---------|---------|
+| **12 Channels** | Sysmon, Security, PowerShell, Defender, WMI, Task Scheduler, BITS, DNS, Firewall, AppLocker, WinRM, Application |
+| **Availability Probe** | Channels show ● ACTIVE / ○ NO DATA status on load |
+| **Auto-Refresh** | Polls every 5s (toggleable), keyword filter across all fields |
+| **Threat Highlighting** | Malicious events highlighted red with threat classification badge |
+| **Expandable Details** | Click any event to inspect all data fields; suspicious values marked red |
+
+Threat detection rules cover:
+
+- **Encoded/obfuscated PowerShell** (base64, IEX, downloadstring, bypass, hidden)
+- **LOLBin abuse** (certutil, mshta, regsvr32, rundll32, bitsadmin, wmic)
+- **Credential access** (LSASS access, mimikatz, sekurlsa, procdump)
+- **Persistence** (registry Run keys, scheduled tasks, services, WMI subscriptions)
+- **Defense evasion** (AMSI bypass, ETW patching, process tampering)
+- **Lateral movement** (explicit credential logon, WinRM, net use)
+- **C2 indicators** (suspicious ports, .onion/.tk domains, DNS tunneling)
+- **Sysmon IOCs** (CreateRemoteThread, DLL sideloading, ADS creation, process tampering)
+
+### Binary Analysis (PE / ELF)
 
 | Capability | Details |
 |-----------|---------|
@@ -126,6 +150,7 @@ make open       # Opens http://<vm-ip>:9000 in browser
 | **Section Layout** | Visual section diagram with RWX permission flagging |
 | **ELF Security Audit** | PIE, NX stack, RELRO, stack canary, Fortify, stripped detection |
 | **Suspicious Imports** | Categorized: injection, evasion, credential access, networking, crypto |
+| **IOC Flags (clickable)** | Expandable detail panels showing matched APIs, detection rules, and explanations |
 | **Packer Detection** | UPX, Themida, VMProtect, ASPack, MPRESS via section + heuristic matching |
 | **TLS Callbacks** | Anti-debug indicator detection |
 
@@ -590,6 +615,13 @@ All endpoints served on port `9000`. Responses are JSON.
 |--------|----------|-------------|
 | GET | `/api/sysmon` | Sysmon events. Params: `max`, `event_id`, `pid` |
 | GET | `/api/sysmon/stats` | Sysmon statistics and diagnostics |
+
+### ETW Browser
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/etw/channels` | List available channels. Param: `probe=true` adds availability status |
+| GET | `/api/etw/events` | Query events. Params: `channel`, `max`, `since`, `filter` |
 
 ### Scanner
 

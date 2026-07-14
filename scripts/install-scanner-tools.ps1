@@ -70,22 +70,53 @@ if (Test-Path $tcExe) {
     }
 
     # Fallback: build from source if dotnet SDK is available
+    # The original project targets .NET Framework 4.8 which is unavailable on ARM64.
+    # We retarget to net8.0 (SDK-style csproj) which works on both x64 and ARM64.
     if (-not $tcDownloaded) {
         Write-Host "[*] Pre-built release not available, trying to build from source..." -ForegroundColor Yellow
         $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
         if ($dotnet) {
             try {
+                # Defender may quarantine AMSI-related source files — exclude build dirs
+                Add-MpPreference -ExclusionPath "$env:TEMP" -ErrorAction SilentlyContinue
+                Add-MpPreference -ExclusionPath $tcBinDir -ErrorAction SilentlyContinue
+                Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+
                 $tcSrcDir = "$env:TEMP\ThreatCheck_src"
                 Remove-Item $tcSrcDir -Recurse -Force -ErrorAction SilentlyContinue
                 git clone --depth 1 "https://github.com/rasta-mouse/ThreatCheck.git" $tcSrcDir 2>$null
 
                 $csproj = Get-ChildItem -Path $tcSrcDir -Recurse -Filter "ThreatCheck.csproj" | Select-Object -First 1
                 if ($csproj) {
-                    Write-Host "[*] Building ThreatCheck with dotnet..." -ForegroundColor Yellow
+                    # Retarget to net8.0 SDK-style (original is .NET Framework 4.8)
+                    Write-Host "[*] Retargeting ThreatCheck to .NET 8.0..." -ForegroundColor Yellow
+                    $sdkCsproj = @"
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>ThreatCheck</AssemblyName>
+    <RootNamespace>ThreatCheck</RootNamespace>
+    <LangVersion>12</LangVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="CommandLineParser" Version="2.9.1" />
+    <PackageReference Include="System.Management.Automation" Version="7.4.1" />
+  </ItemGroup>
+</Project>
+"@
+                    Set-Content $csproj.FullName -Value $sdkCsproj
+                    # Remove auto-generated AssemblyInfo (SDK generates it)
+                    $propsDir = Join-Path $csproj.DirectoryName "Properties"
+                    Remove-Item $propsDir -Recurse -Force -ErrorAction SilentlyContinue
+
+                    Write-Host "[*] Building ThreatCheck (.NET 8.0)..." -ForegroundColor Yellow
                     & dotnet publish $csproj.FullName -c Release -o $tcBinDir --self-contained false 2>$null
-                    if (Test-Path $tcExe) {
+                    if ((Test-Path $tcExe) -or (Test-Path "$tcBinDir\ThreatCheck.dll")) {
                         $tcDownloaded = $true
-                        Write-Host "[+] ThreatCheck built from source" -ForegroundColor Green
+                        Write-Host "[+] ThreatCheck built from source (net8.0)" -ForegroundColor Green
+                    } else {
+                        Write-Host "[!] Build produced no output — Defender may have blocked it" -ForegroundColor Yellow
                     }
                 }
                 Remove-Item $tcSrcDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -153,22 +184,45 @@ if (Test-Path $dcExe) {
     }
 
     # Fallback: build from source
+    # Same retarget approach as ThreatCheck (original is .NET Framework 4.7.2)
     if (-not $dcDownloaded) {
         Write-Host "[*] Pre-built release not available, trying to build from source..." -ForegroundColor Yellow
         $dotnet = Get-Command dotnet -ErrorAction SilentlyContinue
         if ($dotnet) {
             try {
+                Add-MpPreference -ExclusionPath "$env:TEMP" -ErrorAction SilentlyContinue
+                Add-MpPreference -ExclusionPath $dcBinDir -ErrorAction SilentlyContinue
+                Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+
                 $dcSrcDir = "$env:TEMP\DefenderCheck_src"
                 Remove-Item $dcSrcDir -Recurse -Force -ErrorAction SilentlyContinue
                 git clone --depth 1 "https://github.com/matterpreter/DefenderCheck.git" $dcSrcDir 2>$null
 
                 $csproj = Get-ChildItem -Path $dcSrcDir -Recurse -Filter "DefenderCheck.csproj" | Select-Object -First 1
                 if ($csproj) {
-                    Write-Host "[*] Building DefenderCheck with dotnet..." -ForegroundColor Yellow
+                    # Retarget to net8.0 SDK-style (original is .NET Framework 4.7.2)
+                    Write-Host "[*] Retargeting DefenderCheck to .NET 8.0..." -ForegroundColor Yellow
+                    $sdkCsproj = @"
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <AssemblyName>DefenderCheck</AssemblyName>
+    <RootNamespace>DefenderCheck</RootNamespace>
+  </PropertyGroup>
+</Project>
+"@
+                    Set-Content $csproj.FullName -Value $sdkCsproj
+                    $propsDir = Join-Path $csproj.DirectoryName "Properties"
+                    Remove-Item $propsDir -Recurse -Force -ErrorAction SilentlyContinue
+
+                    Write-Host "[*] Building DefenderCheck (.NET 8.0)..." -ForegroundColor Yellow
                     & dotnet publish $csproj.FullName -c Release -o $dcBinDir --self-contained false 2>$null
-                    if (Test-Path $dcExe) {
+                    if ((Test-Path $dcExe) -or (Test-Path "$dcBinDir\DefenderCheck.dll")) {
                         $dcDownloaded = $true
-                        Write-Host "[+] DefenderCheck built from source" -ForegroundColor Green
+                        Write-Host "[+] DefenderCheck built from source (net8.0)" -ForegroundColor Green
+                    } else {
+                        Write-Host "[!] Build produced no output — Defender may have blocked it" -ForegroundColor Yellow
                     }
                 }
                 Remove-Item $dcSrcDir -Recurse -Force -ErrorAction SilentlyContinue

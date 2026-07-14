@@ -152,6 +152,9 @@ function switchTab(tabName) {
     if (tabName === 'submit') {
         refreshSubmissions();
     }
+    if (tabName === 'etw') {
+        initEtwBrowser();
+    }
 }
 
 // --- Data fetching ---
@@ -251,12 +254,16 @@ function renderDashboard() {
     if (statsContainer) {
         const totalAlerts = alerts.length;
         const processCount = Object.keys(state.processes || {}).length;
-        const servicesOnline = [
-            status.rustinel?.online,
-            status.detonator_agent?.online,
-            status.litterbox?.online,
-            status.sysmon?.online,
-        ].filter(Boolean).length;
+        const servicesList = [
+            { name: 'Rustinel', key: 'rustinel', online: status.rustinel?.online },
+            { name: 'Fibratus', key: 'fibratus', online: status.fibratus?.online },
+            { name: 'DetonatorAgent', key: 'detonator_agent', online: status.detonator_agent?.online },
+            { name: 'Detonator', key: 'detonator', online: status.detonator?.online },
+            { name: 'LitterBox', key: 'litterbox', online: status.litterbox?.online },
+            { name: 'Sysmon', key: 'sysmon', online: status.sysmon?.online },
+        ];
+        const servicesOnline = servicesList.filter(s => s.online).length;
+        const servicesTotal = servicesList.length;
         const highSev = alerts.filter(a => a.severity === 'high' || a.severity === 'critical').length;
         const medSev = alerts.filter(a => a.severity === 'medium').length;
         const lowSev = alerts.filter(a => a.severity === 'low' || a.severity === 'info').length;
@@ -278,9 +285,11 @@ function renderDashboard() {
                 <div class="stat-breakdown"><span class="stat-tag dim">via ETW telemetry</span></div>
             </div>
             <div class="stat-card stat-services">
-                <div class="stat-value">${servicesOnline}<span class="stat-value-sub">/5</span></div>
+                <div class="stat-value">${servicesOnline}<span class="stat-value-sub">/${servicesTotal}</span></div>
                 <div class="stat-label">SERVICES ONLINE</div>
-                <div class="stat-breakdown"><span class="stat-tag ${servicesOnline >= 4 ? 'ok' : 'warn'}">${servicesOnline >= 4 ? 'Healthy' : 'Degraded'}</span></div>
+                <div class="stat-breakdown">
+                    ${servicesList.map(s => `<span class="stat-tag ${s.online ? 'svc-on' : 'svc-off'}">${s.name}</span>`).join('')}
+                </div>
             </div>
             <div class="stat-card stat-rules">
                 <div class="stat-value">${rulesLoaded}</div>
@@ -1883,8 +1892,18 @@ function renderPeAnalysis(pe, container) {
         pe.flags.sort((a, b) => {
             const order = {high: 0, medium: 1, low: 2};
             return (order[a.severity] || 3) - (order[b.severity] || 3);
-        }).forEach(f => {
-            html += `<div class="pe-flag-item sev-${f.severity}"><span class="pe-flag-sev">${f.severity.toUpperCase()}</span><span class="pe-flag-detail">${escapeHtml(f.detail)}</span></div>`;
+        }).forEach((f, idx) => {
+            const hasEvidence = f.evidence && Object.keys(f.evidence).length > 0;
+            html += `<div class="pe-flag-item sev-${f.severity}${hasEvidence ? ' expandable' : ''}" ${hasEvidence ? `onclick="toggleFlagEvidence(this)"` : ''}>`;
+            html += `<span class="pe-flag-sev">${f.severity.toUpperCase()}</span>`;
+            html += `<span class="pe-flag-detail">${escapeHtml(f.detail)}</span>`;
+            if (hasEvidence) html += `<span class="pe-flag-expand-icon">&#x25BC;</span>`;
+            html += `</div>`;
+            if (hasEvidence) {
+                html += `<div class="pe-flag-evidence" style="display:none;">`;
+                html += renderFlagEvidence(f);
+                html += `</div>`;
+            }
         });
         html += '</div></div>';
     } else {
@@ -2231,8 +2250,18 @@ function renderElfAnalysis(elf, container) {
         elf.flags.sort((a, b) => {
             const order = {high: 0, medium: 1, low: 2};
             return (order[a.severity] || 3) - (order[b.severity] || 3);
-        }).forEach(f => {
-            html += `<div class="elf-flag-item sev-${f.severity}"><span class="elf-flag-sev">${f.severity.toUpperCase()}</span><span class="elf-flag-detail">${escapeHtml(f.detail)}</span></div>`;
+        }).forEach((f, idx) => {
+            const hasEvidence = f.evidence && Object.keys(f.evidence).length > 0;
+            html += `<div class="elf-flag-item sev-${f.severity}${hasEvidence ? ' expandable' : ''}" ${hasEvidence ? `onclick="toggleFlagEvidence(this)"` : ''}>`;
+            html += `<span class="elf-flag-sev">${f.severity.toUpperCase()}</span>`;
+            html += `<span class="elf-flag-detail">${escapeHtml(f.detail)}</span>`;
+            if (hasEvidence) html += `<span class="elf-flag-expand-icon">&#x25BC;</span>`;
+            html += `</div>`;
+            if (hasEvidence) {
+                html += `<div class="elf-flag-evidence" style="display:none;">`;
+                html += renderFlagEvidence(f);
+                html += `</div>`;
+            }
         });
         html += '</div></div>';
     } else {
@@ -5443,6 +5472,273 @@ function toggleSysmonCorrelation() {
 }
 
 // --- Utilities ---
+// --- ETW Browser ---
+let _etwInitialized = false;
+let _etwAutoInterval = null;
+let _etwChannels = {};
+
+async function initEtwBrowser() {
+    if (_etwInitialized) return;
+    _etwInitialized = true;
+    try {
+        const resp = await fetch('/api/etw/channels?probe=true');
+        _etwChannels = await resp.json();
+        const select = document.getElementById('etw-channel-select');
+        if (select) {
+            select.innerHTML = Object.entries(_etwChannels).map(([key, ch]) => {
+                const dot = ch.available === true ? '●' : ch.available === false ? '○' : '○';
+                const cls = ch.available === true ? 'etw-ch-active' : 'etw-ch-inactive';
+                return `<option value="${key}" class="${cls}">${dot} ${escapeHtml(ch.label)}</option>`;
+            }).join('');
+            select.addEventListener('change', () => {
+                updateEtwChannelInfo();
+                refreshEtw();
+            });
+        }
+        updateEtwChannelInfo();
+        refreshEtw();
+        setupEtwAutoRefresh();
+    } catch (e) {
+        document.getElementById('etw-event-list').innerHTML =
+            `<div class="etw-error">Failed to load ETW channels: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function updateEtwChannelInfo() {
+    const key = document.getElementById('etw-channel-select')?.value;
+    const info = _etwChannels[key];
+    const el = document.getElementById('etw-channel-info');
+    if (el && info) {
+        let statusHtml = '';
+        if (info.available === true) {
+            statusHtml = '<span class="etw-info-status active">ACTIVE</span>';
+        } else if (info.available === false) {
+            statusHtml = '<span class="etw-info-status inactive">NO DATA</span>';
+        } else {
+            statusHtml = '<span class="etw-info-status unknown">UNKNOWN</span>';
+        }
+        el.innerHTML = `${statusHtml}<span class="etw-info-name">${escapeHtml(info.name)}</span><span class="etw-info-desc">${escapeHtml(info.description)}</span>`;
+    }
+}
+
+function setupEtwAutoRefresh() {
+    const cb = document.getElementById('etw-auto-refresh');
+    if (!cb) return;
+    cb.addEventListener('change', () => {
+        if (cb.checked) {
+            _etwAutoInterval = setInterval(() => {
+                if (state.activeTab === 'etw') refreshEtw();
+            }, 5000);
+        } else {
+            clearInterval(_etwAutoInterval);
+            _etwAutoInterval = null;
+        }
+    });
+    _etwAutoInterval = setInterval(() => {
+        if (state.activeTab === 'etw') refreshEtw();
+    }, 5000);
+}
+
+async function refreshEtw() {
+    const channel = document.getElementById('etw-channel-select')?.value || 'etw-ti';
+    const filter = document.getElementById('etw-filter-input')?.value || '';
+    const max = document.getElementById('etw-max-select')?.value || '50';
+    const listEl = document.getElementById('etw-event-list');
+    if (!listEl) return;
+
+    try {
+        const params = new URLSearchParams({channel, max, filter});
+        const resp = await fetch(`/api/etw/events?${params}`);
+        const data = await resp.json();
+
+        if (data.error) {
+            listEl.innerHTML = `<div class="etw-error">${escapeHtml(data.error)}</div>`;
+            return;
+        }
+        if (!data.events || data.events.length === 0) {
+            listEl.innerHTML = `<div class="etw-empty">No events found${data.note ? ' — ' + escapeHtml(data.note) : ''}</div>`;
+            return;
+        }
+
+        let malCount = 0;
+        let html = `<div class="etw-event-count">${data.count} events</div>`;
+        html += '<div class="etw-events">';
+        data.events.forEach(ev => {
+            const levelClass = (ev.level || '').toLowerCase().replace(/[^a-z]/g, '');
+            const hasData = ev.data && Object.keys(ev.data).length > 0;
+            const mal = classifyEtwThreat(ev);
+            if (mal) malCount++;
+            html += `<div class="etw-event ${levelClass}${mal ? ' malicious' : ''}" onclick="this.classList.toggle('expanded')">`;
+            html += `<div class="etw-event-header">`;
+            html += `<span class="etw-event-time">${formatEtwTime(ev.timestamp)}</span>`;
+            html += `<span class="etw-event-id">ID:${ev.event_id}</span>`;
+            html += `<span class="etw-event-level ${levelClass}">${escapeHtml(ev.level || 'Info')}</span>`;
+            if (mal) html += `<span class="etw-event-threat">${escapeHtml(mal)}</span>`;
+            html += `<span class="etw-event-msg">${escapeHtml(ev.message || ev.provider || '')}</span>`;
+            if (hasData) html += `<span class="etw-event-expand">+</span>`;
+            html += `</div>`;
+            if (hasData) {
+                html += `<div class="etw-event-data">`;
+                Object.entries(ev.data).forEach(([k, v]) => {
+                    if (v) {
+                        const isInteresting = /pid|process|image|command|user|target|address|path|hash|url|dns|remote|local/i.test(k);
+                        const vStr = String(v);
+                        const isMalVal = isEtwValueSuspicious(k, vStr);
+                        html += `<div class="etw-data-row${isMalVal ? ' mal-val' : isInteresting ? ' highlight' : ''}"><span class="etw-data-key">${escapeHtml(k)}</span><span class="etw-data-val">${escapeHtml(vStr)}</span></div>`;
+                    }
+                });
+                html += `</div>`;
+            }
+            html += `</div>`;
+        });
+        html += '</div>';
+        if (malCount > 0) {
+            html = `<div class="etw-threat-banner">${malCount} suspicious event${malCount > 1 ? 's' : ''} detected</div>` + html;
+        }
+        listEl.innerHTML = html;
+    } catch (e) {
+        listEl.innerHTML = `<div class="etw-error">Fetch error: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+const ETW_MALICIOUS_EVENT_IDS = {
+    1116: 'Defender: Malware detected',
+    1117: 'Defender: Action taken',
+    4625: 'Failed logon',
+    4648: 'Explicit credential logon',
+    4697: 'Service installed',
+    4698: 'Scheduled task created',
+    4720: 'User account created',
+    4732: 'Member added to admin group',
+    7045: 'New service installed',
+};
+
+const ETW_SUSPICIOUS_COMMANDS = [
+    /powershell.*-enc/i, /powershell.*-e\s+[A-Za-z0-9+\/=]{20,}/i,
+    /powershell.*downloadstring/i, /powershell.*iex/i, /powershell.*invoke-expression/i,
+    /powershell.*bypass/i, /powershell.*hidden/i, /powershell.*nop\s/i,
+    /cmd.*\/c.*powershell/i, /cmd.*\/c.*certutil.*-urlcache/i,
+    /mshta\s+http/i, /regsvr32.*\/s.*\/u.*scrobj/i, /rundll32.*javascript/i,
+    /bitsadmin.*\/transfer/i, /certutil.*-decode/i, /certutil.*-urlcache/i,
+    /wmic.*process.*call.*create/i, /wmic.*shadowcopy.*delete/i,
+    /vssadmin.*delete.*shadows/i, /bcdedit.*recoveryenabled.*no/i,
+    /schtasks.*\/create/i, /reg\s+add.*\\run/i,
+    /mimikatz/i, /sekurlsa/i, /lsadump/i, /kerberos.*golden/i,
+    /invoke-mimikatz/i, /invoke-shellcode/i, /invoke-pstokenprivilege/i,
+    /net\s+(user|localgroup).*\/add/i, /net\s+use.*\\\\.*\$/i,
+    /whoami\s*\/priv/i, /nltest.*\/dclist/i, /dsquery/i,
+];
+
+const ETW_SUSPICIOUS_VALUES = [
+    /\\AppData\\Local\\Temp\\[a-z0-9]{6,}\.(exe|dll|ps1|bat|vbs|js)/i,
+    /\\ProgramData\\[a-z0-9]{6,}\.(exe|dll)/i,
+    /\\Windows\\Temp\\[^\\]+\.(exe|dll|ps1)/i,
+    /\\Users\\Public\\[^\\]+\.(exe|dll|bat|ps1)/i,
+    /FromBase64String/i, /Reflection\.Assembly/i, /\[System\.Convert\]/i,
+    /AmsiScanBuffer/i, /amsi\.dll/i, /EtwEventWrite/i,
+    /VirtualAlloc.*0x3000.*0x40/i, /PAGE_EXECUTE_READWRITE/i,
+    /CreateRemoteThread/i, /NtQueueApcThread/i,
+    /HKLM\\.*\\Run/i, /CurrentVersion\\Run/i,
+    /\.onion/i, /tor2web/i, /pastebin\.com\/raw/i,
+];
+
+const ETW_SUSPICIOUS_SYSMON_IDS = {
+    1: (d) => ETW_SUSPICIOUS_COMMANDS.some(r => r.test(d.CommandLine || '')),
+    3: (d) => /:(4444|5555|6666|8888|9999|1234|31337|443[1-9])/i.test(d.DestinationPort || '') || /^(10\.|192\.168\.|172\.(1[6-9]|2|3[01]))/.test(d.DestinationIp || '') === false && d.Initiated === 'true',
+    7: (d) => /\\Temp\\|\\AppData\\.*\.(dll|exe)/i.test(d.ImageLoaded || ''),
+    8: (d) => true,
+    10: (d) => /lsass\.exe/i.test(d.TargetImage || ''),
+    11: (d) => /\.(exe|dll|ps1|bat|vbs|js|hta)$/i.test(d.TargetFilename || '') && /\\(Temp|AppData|ProgramData|Public)/i.test(d.TargetFilename || ''),
+    12: (d) => /\\Run\\|\\RunOnce\\|\\Services\\|\\Image File Execution/i.test(d.TargetObject || ''),
+    13: (d) => /\\Run\\|\\RunOnce\\|\\Services\\|\\Image File Execution/i.test(d.TargetObject || ''),
+    15: (d) => /\.(exe|dll|ps1|bat|hta|js|vbs)/i.test(d.TargetFilename || ''),
+    22: (d) => /\.(onion|bit|top|xyz|tk|ml|ga|cf)\b/i.test(d.QueryName || ''),
+    25: (d) => true,
+};
+
+function classifyEtwThreat(ev) {
+    if (ETW_MALICIOUS_EVENT_IDS[ev.event_id]) return ETW_MALICIOUS_EVENT_IDS[ev.event_id];
+    const d = ev.data || {};
+    const allVals = Object.values(d).join(' ');
+    if (ETW_SUSPICIOUS_COMMANDS.some(r => r.test(allVals))) return 'Suspicious command';
+    if (ETW_SUSPICIOUS_VALUES.some(r => r.test(allVals))) return 'Suspicious indicator';
+    const sysmonCheck = ETW_SUSPICIOUS_SYSMON_IDS[ev.event_id];
+    if (sysmonCheck && sysmonCheck(d)) return 'Sysmon IOC';
+    if ((ev.level || '').toLowerCase() === 'warning' && /malware|threat|virus|trojan|exploit|suspicious/i.test(ev.message || '')) return 'Threat keyword';
+    return null;
+}
+
+function isEtwValueSuspicious(key, value) {
+    if (ETW_SUSPICIOUS_COMMANDS.some(r => r.test(value))) return true;
+    if (ETW_SUSPICIOUS_VALUES.some(r => r.test(value))) return true;
+    if (/lsass|mimikatz|sekurlsa|procdump.*lsass/i.test(value)) return true;
+    return false;
+}
+
+function formatEtwTime(ts) {
+    if (!ts) return '';
+    try {
+        const d = new Date(ts);
+        return d.toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit', second:'2-digit', fractionalSecondDigits: 3});
+    } catch { return ts.substring(11, 23); }
+}
+
+function toggleFlagEvidence(el) {
+    const evidence = el.nextElementSibling;
+    if (!evidence || !evidence.classList.contains('pe-flag-evidence') && !evidence.classList.contains('elf-flag-evidence')) return;
+    const isOpen = evidence.style.display !== 'none';
+    evidence.style.display = isOpen ? 'none' : 'block';
+    const icon = el.querySelector('.pe-flag-expand-icon, .elf-flag-expand-icon');
+    if (icon) icon.innerHTML = isOpen ? '&#x25BC;' : '&#x25B2;';
+    el.classList.toggle('expanded', !isOpen);
+}
+
+function renderFlagEvidence(flag) {
+    const ev = flag.evidence;
+    if (!ev) return '';
+    let html = '';
+    if (ev.why) {
+        html += `<div class="flag-evidence-why"><strong>Why:</strong> ${escapeHtml(ev.why)}</div>`;
+    }
+    if (ev.matched_apis && ev.matched_apis.length > 0) {
+        html += `<div class="flag-evidence-section"><strong>Matched (${ev.matched_apis.length}):</strong>`;
+        html += '<div class="flag-evidence-apis">';
+        ev.matched_apis.forEach(api => {
+            html += `<span class="flag-evidence-api">${escapeHtml(api)}</span>`;
+        });
+        html += '</div></div>';
+    }
+    if (ev.reference_apis && ev.reference_apis.length > 0) {
+        html += `<div class="flag-evidence-section"><strong>Detection rule watches for:</strong>`;
+        html += '<div class="flag-evidence-apis ref">';
+        ev.reference_apis.forEach(api => {
+            const isMatched = ev.matched_apis && ev.matched_apis.some(m => m.includes(api));
+            html += `<span class="flag-evidence-api${isMatched ? ' matched' : ''}">${escapeHtml(api)}</span>`;
+        });
+        html += '</div></div>';
+    }
+    if (ev.callbacks && ev.callbacks.length > 0) {
+        html += `<div class="flag-evidence-section"><strong>Callbacks:</strong> `;
+        html += ev.callbacks.map(c => `<code>${escapeHtml(c)}</code>`).join(', ');
+        html += '</div>';
+    }
+    if (ev.section) {
+        html += `<div class="flag-evidence-section"><strong>Section:</strong> <code>${escapeHtml(ev.section)}</code>`;
+        if (ev.entropy) html += ` | Entropy: ${ev.entropy.toFixed(2)}`;
+        if (ev.threshold) html += ` (threshold: ${ev.threshold})`;
+        if (ev.packer) html += ` | Packer: ${escapeHtml(ev.packer)}`;
+        if (ev.permissions) html += ` | Permissions: ${escapeHtml(ev.permissions)}`;
+        html += '</div>';
+    }
+    if (ev.path) {
+        html += `<div class="flag-evidence-section"><strong>Path:</strong> <code>${escapeHtml(ev.path)}</code></div>`;
+    }
+    if (ev.entropy && !ev.section) {
+        html += `<div class="flag-evidence-section"><strong>Entropy:</strong> ${ev.entropy.toFixed(2)} (threshold: ${ev.threshold})</div>`;
+    }
+    return html;
+}
+
 function escapeHtml(str) {
     if (!str) return '';
     return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
