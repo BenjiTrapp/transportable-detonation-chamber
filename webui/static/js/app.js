@@ -155,6 +155,9 @@ function switchTab(tabName) {
     if (tabName === 'etw') {
         initEtwBrowser();
     }
+    if (tabName === 'litterbox') {
+        initLitterbox();
+    }
 }
 
 // --- Data fetching ---
@@ -517,7 +520,25 @@ function renderRtraceProcessDropdown() {
     const dropdown = document.getElementById('rtrace-process-select');
     if (!dropdown) return;
 
-    const procs = Object.values(state.processes);
+    const searchTerm = (document.getElementById('rtrace-search')?.value || '').toLowerCase().trim();
+    let procs = Object.values(state.processes);
+
+    // Apply same search filter as tree
+    if (searchTerm) {
+        procs = procs.filter(proc => {
+            const haystack = [
+                proc.name, proc.image, proc.command_line, proc.user,
+                String(proc.pid || ''),
+            ].filter(Boolean).join(' ').toLowerCase();
+            if (haystack.includes(searchTerm)) return true;
+            const alertHaystack = (proc.alerts || []).map(a => [
+                a.name, a.rule, a.process_name,
+                JSON.stringify(a.raw || {}),
+            ].join(' ')).join(' ').toLowerCase();
+            return alertHaystack.includes(searchTerm);
+        });
+    }
+
     let html = '<option value="">-- select process --</option>';
     procs.forEach(proc => {
         const hasExited = !!proc.exit_time;
@@ -759,21 +780,49 @@ function renderRtraceTimeline() {
     });
 }
 
+function filterRtraceTree() {
+    renderRtraceProcessTree();
+    renderRtraceProcessDropdown();
+}
+
 function renderRtraceProcessTree() {
     const container = document.getElementById('rtrace-tree-list');
     const countEl = document.getElementById('rtrace-tree-count');
     if (!container) return;
 
+    const searchTerm = (document.getElementById('rtrace-search')?.value || '').toLowerCase().trim();
     const procs = Object.values(state.processes);
-    if (countEl) countEl.textContent = procs.length;
 
-    if (!procs.length) {
-        container.innerHTML = '<div style="padding:12px;color:var(--text-muted);font-size:11px;">No processes tracked yet. Submit a sample to begin.</div>';
+    // Filter processes by search term (match process name, image path, command line, file activity)
+    let filtered = procs;
+    if (searchTerm) {
+        filtered = procs.filter(proc => {
+            const haystack = [
+                proc.name, proc.image, proc.command_line, proc.user,
+                String(proc.pid || ''),
+            ].filter(Boolean).join(' ').toLowerCase();
+            if (haystack.includes(searchTerm)) return true;
+            // Also search in alerts for file paths, rule names, raw data
+            const alertHaystack = (proc.alerts || []).map(a => [
+                a.name, a.rule, a.process_name,
+                JSON.stringify(a.raw || {}),
+            ].join(' ')).join(' ').toLowerCase();
+            return alertHaystack.includes(searchTerm);
+        });
+    }
+
+    if (countEl) countEl.textContent = filtered.length + (searchTerm ? `/${procs.length}` : '');
+
+    if (!filtered.length) {
+        const msg = searchTerm
+            ? `No processes matching "${escapeHtml(searchTerm)}" (${procs.length} total)`
+            : 'No processes tracked yet. Submit a sample to begin.';
+        container.innerHTML = `<div style="padding:12px;color:var(--text-muted);font-size:11px;">${msg}</div>`;
         return;
     }
 
     // Sort by first_seen
-    const sorted = [...procs].sort((a, b) => (a.first_seen || '').localeCompare(b.first_seen || ''));
+    const sorted = [...filtered].sort((a, b) => (a.first_seen || '').localeCompare(b.first_seen || ''));
 
     // Compute max severity per process
     function getMaxSeverity(proc) {
@@ -3910,11 +3959,12 @@ const graphState = {
 
 async function graphRefresh() {
     // Fetch process tree (limited to top 200 by threats) + sysmon network/DNS data in parallel
-    const [procResp, sysmonNetResp, sysmonDnsResp, sysmonInjectResp] = await Promise.all([
+    const [procResp, sysmonNetResp, sysmonDnsResp, sysmonInjectResp, sysmonAllResp] = await Promise.all([
         fetch('/api/processes?max=200&sort=threats&include_parents=true'),
         fetch('/api/sysmon?event_id=3&max=300'),
         fetch('/api/sysmon?event_id=22&max=200'),
         fetch('/api/sysmon?event_id=8&max=100'),
+        fetch('/api/sysmon?max=500'),
     ]);
 
     let processes = {};
@@ -3926,6 +3976,13 @@ async function graphRefresh() {
     if (sysmonNetResp.ok) networkEvents = await sysmonNetResp.json();
     if (sysmonDnsResp.ok) dnsEvents = await sysmonDnsResp.json();
     if (sysmonInjectResp.ok) injectEvents = await sysmonInjectResp.json();
+
+    // Store all sysmon events for detail panel lookups
+    graphState._allSysmonEvents = [];
+    if (sysmonAllResp.ok) {
+        const allEvts = await sysmonAllResp.json();
+        if (Array.isArray(allEvts) && !allEvts[0]?.error) graphState._allSysmonEvents = allEvts;
+    }
 
     // Also use the alerts already in state for network info
     const networkAlerts = (state.alerts || []).filter(a => {
@@ -4976,6 +5033,62 @@ function showGraphDetail(node) {
             html += `</div>`;
         }
 
+        // Sysmon Event IDs triggered by this process + correlated Windows Event IDs
+        const pidSysmonEvents = (graphState._allSysmonEvents || []).filter(ev => String(ev.pid) === String(node.pid));
+        if (pidSysmonEvents.length) {
+            // Collect unique Sysmon Event IDs with counts
+            const eidCounts = {};
+            pidSysmonEvents.forEach(ev => {
+                const eid = ev.event_id;
+                if (!eidCounts[eid]) eidCounts[eid] = { count: 0, type: ev.type || `Event_${eid}` };
+                eidCounts[eid].count++;
+            });
+
+            html += `<div class="gd-section">Triggered Sysmon Events <span class="gd-count">${pidSysmonEvents.length}</span></div>`;
+            html += `<div class="gd-eid-grid">`;
+            for (const [eid, info] of Object.entries(eidCounts).sort((a,b) => b[1].count - a[1].count)) {
+                const typeClass = getSysmonTypeClass(eid);
+                html += `<div class="gd-eid-item"><span class="type-badge ${typeClass}">EID ${eid}</span><span class="gd-eid-name">${escapeHtml(info.type)}</span><span class="gd-eid-count">${info.count}x</span></div>`;
+            }
+            html += `</div>`;
+
+            // Correlated Windows Event IDs
+            const allWinEids = new Map();
+            for (const eid of Object.keys(eidCounts)) {
+                const corr = getCorrelatedWindowsEvents(parseInt(eid));
+                corr.forEach(c => {
+                    if (!allWinEids.has(c.id)) allWinEids.set(c.id, c);
+                });
+            }
+            if (allWinEids.size) {
+                html += `<div class="gd-section">Correlated Windows Event IDs <span class="gd-count">${allWinEids.size}</span></div>`;
+                html += `<div class="gd-eid-grid">`;
+                for (const [weid, info] of allWinEids) {
+                    html += `<div class="gd-eid-item"><span class="corr-badge">${weid}</span><span class="gd-eid-name">${escapeHtml(info.name)}</span><span class="gd-eid-log">[${escapeHtml(info.log)}]</span></div>`;
+                }
+                html += `</div>`;
+            }
+        }
+
+        // PowerShell commands associated with this process (or child powershell processes)
+        const psPid = String(node.pid);
+        const psEvents = (graphState._allSysmonEvents || []).filter(ev => {
+            if (ev.event_id !== 1) return false;
+            const img = (ev.image || '').toLowerCase();
+            const cmd = (ev.commandline || '').toLowerCase();
+            return (img.includes('powershell') || cmd.includes('powershell')) &&
+                   (String(ev.pid) === psPid || String(ev.parent_pid) === psPid);
+        });
+        if (psEvents.length) {
+            html += `<div class="gd-section">PowerShell Commands <span class="gd-count">${psEvents.length}</span></div>`;
+            html += `<div class="gd-ps-list">`;
+            psEvents.forEach(ev => {
+                const time = ev.timestamp ? formatSysmonTime(ev.timestamp) : '';
+                html += `<div class="gd-ps-item"><span class="gd-ps-time">${time}</span><span class="gd-ps-cmd">${escapeHtml(ev.commandline || '')}</span></div>`;
+            });
+            html += `</div>`;
+        }
+
     } else if (node.type === 'network') {
         headerText = `Network: ${node.ip}:${node.port}`;
         html += `<div class="gd-field"><span class="gd-label">IP</span><span class="gd-value">${node.ip}</span></div>`;
@@ -5161,11 +5274,18 @@ let sysmonStats = null;
 
 async function refreshSysmon() {
     const eventType = document.getElementById('sysmon-filter-type')?.value || '';
+    const eidFilterRaw = (document.getElementById('sysmon-filter-eid')?.value || '').trim();
     const pidFilter = document.getElementById('sysmon-filter-pid')?.value || '';
     const maxEvents = document.getElementById('sysmon-max-events')?.value || '100';
 
     let url = `/api/sysmon?max=${maxEvents}`;
-    if (eventType) url += `&event_id=${eventType}`;
+    // Dropdown takes precedence; otherwise use the EID text input for server-side filter
+    if (eventType) {
+        url += `&event_id=${eventType}`;
+    } else if (eidFilterRaw) {
+        const eids = eidFilterRaw.split(',').map(s => s.trim()).filter(s => /^\d+$/.test(s));
+        if (eids.length) url += `&event_id=${eids.join(',')}`;
+    }
     if (pidFilter) url += `&pid=${pidFilter}`;
 
     // Show loading spinner while fetching
@@ -5267,11 +5387,34 @@ function renderSysmonTable() {
         return;
     }
 
-    // Apply local search filter
+    // Apply local filters
     const searchTerm = (document.getElementById('sysmon-search')?.value || '').toLowerCase().trim();
+    const eidFilter = (document.getElementById('sysmon-filter-eid')?.value || '').trim();
+    const winEidFilter = (document.getElementById('sysmon-filter-wineid')?.value || '').trim();
     let filtered = sysmonEvents;
+
+    // Filter by Sysmon Event IDs (comma-separated)
+    if (eidFilter) {
+        const eids = eidFilter.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
+        if (eids.length) {
+            filtered = filtered.filter(ev => eids.includes(ev.event_id));
+        }
+    }
+
+    // Filter by correlated Windows Event IDs (comma-separated)
+    if (winEidFilter) {
+        const winEids = winEidFilter.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
+        if (winEids.length) {
+            filtered = filtered.filter(ev => {
+                const correlated = getCorrelatedWindowsEvents(ev.event_id);
+                return correlated.some(c => winEids.includes(c.id));
+            });
+        }
+    }
+
+    // Text search filter
     if (searchTerm) {
-        filtered = sysmonEvents.filter(ev => {
+        filtered = filtered.filter(ev => {
             const haystack = [
                 ev.image, ev.commandline, ev.type, ev.target, ev.query,
                 ev.dst_ip, ev.dst_hostname, ev.loaded_image, ev.source_image,
@@ -5283,12 +5426,14 @@ function renderSysmonTable() {
         });
     }
 
+    const hasAnyFilter = searchTerm || eidFilter || winEidFilter;
     if (!filtered.length) {
-        container.innerHTML = `<div class="empty-state">No events matching "${escapeHtml(searchTerm)}" (${sysmonEvents.length} total)</div>`;
+        const filterDesc = [searchTerm && `"${searchTerm}"`, eidFilter && `Sysmon EID: ${eidFilter}`, winEidFilter && `Win EID: ${winEidFilter}`].filter(Boolean).join(', ');
+        container.innerHTML = `<div class="empty-state">No events matching ${escapeHtml(filterDesc)} (${sysmonEvents.length} total)</div>`;
         return;
     }
 
-    const countInfo = searchTerm ? ` <span class="sysmon-filter-count">(${filtered.length}/${sysmonEvents.length})</span>` : '';
+    const countInfo = hasAnyFilter ? ` <span class="sysmon-filter-count">(${filtered.length}/${sysmonEvents.length})</span>` : '';
     let html = `<table class="sysmon-events-table"><thead><tr><th>Time</th><th>Type</th><th>PID</th><th>Image</th><th>Details</th><th class="col-corr">Win. EID</th></tr></thead><tbody>`;
     filtered.forEach(ev => {
         const typeClass = getSysmonTypeClass(String(ev.event_id));
@@ -5309,7 +5454,7 @@ function renderSysmonTable() {
         </tr>`;
     });
     html += '</tbody></table>';
-    if (searchTerm) html = `<div class="sysmon-search-info">Showing ${filtered.length} of ${sysmonEvents.length} events${countInfo}</div>` + html;
+    if (hasAnyFilter) html = `<div class="sysmon-search-info">Showing ${filtered.length} of ${sysmonEvents.length} events${countInfo}</div>` + html;
     container.innerHTML = html;
 }
 
@@ -5469,6 +5614,225 @@ function toggleSysmonCorrelation() {
     html += '</tbody></table></div>';
     panel.innerHTML = html;
     panel.style.display = 'block';
+}
+
+// --- LitterBox Integration ---
+let _lbData = null;
+let _lbHealth = null;
+
+async function refreshLitterbox() {
+    const badge = document.getElementById('lb-status-badge');
+    try {
+        const [filesResp, healthResp] = await Promise.all([
+            fetch('/api/litterbox/files'),
+            fetch('/api/litterbox/health'),
+        ]);
+        if (filesResp.ok) {
+            _lbData = await filesResp.json();
+        }
+        if (healthResp.ok) {
+            _lbHealth = await healthResp.json();
+        }
+        if (badge) {
+            const ok = _lbHealth?.status === 'ok';
+            badge.textContent = ok ? 'Online' : 'Offline';
+            badge.className = 'lb-status-badge ' + (ok ? 'online' : 'offline');
+        }
+        renderLitterboxScanners();
+        renderLitterboxFiles();
+    } catch (e) {
+        if (badge) { badge.textContent = 'Unreachable'; badge.className = 'lb-status-badge offline'; }
+        const table = document.getElementById('lb-files-table');
+        if (table) table.innerHTML = `<div class="empty-state">LitterBox unreachable: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function renderLitterboxScanners() {
+    const container = document.getElementById('lb-scanners-bar');
+    if (!container || !_lbHealth) return;
+    const scanners = _lbHealth.scanners?.rows || [];
+    const counts = _lbHealth.scanners?.counts || {};
+    let html = `<div class="lb-scanners-row"><span class="lb-scanners-title">Scanners: ${counts.ok || 0}/${counts.total || 0} active</span>`;
+    scanners.forEach(sc => {
+        const cls = sc.status === 'ok' ? 'lb-sc-ok' : 'lb-sc-err';
+        html += `<span class="lb-sc-chip ${cls}" title="${escapeHtml(sc.tool_path || '')}">${escapeHtml(sc.name)}</span>`;
+    });
+    html += '</div>';
+    container.innerHTML = html;
+}
+
+function renderLitterboxFiles() {
+    const container = document.getElementById('lb-files-table');
+    if (!container) return;
+    if (!_lbData) { container.innerHTML = '<div class="empty-state">No data loaded. Click Refresh.</div>'; return; }
+
+    const payloads = _lbData.payload_based?.payloads || {};
+    const drivers = _lbData.driver_based?.drivers || {};
+    const pids = _lbData.pid_based?.processes || {};
+    const searchTerm = (document.getElementById('lb-search')?.value || '').toLowerCase().trim();
+
+    let entries = [];
+    for (const [key, p] of Object.entries(payloads)) {
+        if (!p || typeof p !== 'object') continue;
+        entries.push({ ...p, _type: 'payload', _key: key });
+    }
+    for (const [key, d] of Object.entries(drivers)) {
+        if (!d || typeof d !== 'object') continue;
+        entries.push({ ...d, _type: 'driver', _key: key });
+    }
+    for (const [key, pr] of Object.entries(pids)) {
+        if (!pr || typeof pr !== 'object') continue;
+        entries.push({ ...pr, _type: 'pid', _key: key });
+    }
+
+    if (searchTerm) {
+        entries = entries.filter(e => {
+            const hay = [e.filename, e.md5, e.sha256, e.detection_risk, e._key, String(e.file_size||'')].filter(Boolean).join(' ').toLowerCase();
+            return hay.includes(searchTerm);
+        });
+    }
+
+    if (!entries.length) {
+        container.innerHTML = `<div class="empty-state">${searchTerm ? `No files matching "${escapeHtml(searchTerm)}"` : 'No files uploaded to LitterBox yet.'}</div>`;
+        return;
+    }
+
+    let html = `<table class="sysmon-events-table"><thead><tr><th>File</th><th>Type</th><th>Size</th><th>Risk</th><th>Entropy</th><th>Static</th><th>Dynamic</th><th>EDR</th><th>Actions</th></tr></thead><tbody>`;
+    entries.forEach(e => {
+        const riskClass = (e.detection_risk || '').toLowerCase();
+        const riskBadge = `<span class="lb-risk-badge lb-risk-${riskClass}">${escapeHtml(e.detection_risk || '?')}</span>`;
+        const size = e.file_size ? formatSize(e.file_size) : '--';
+        const entropy = e.entropy_value != null ? e.entropy_value.toFixed(2) : '--';
+        const staticBadge = e.has_static_analysis ? '<span class="lb-check">&#10003;</span>' : '<span class="lb-x">&#10007;</span>';
+        const dynamicBadge = e.has_dynamic_analysis ? '<span class="lb-check">&#10003;</span>' : '<span class="lb-x">&#10007;</span>';
+        const edrBadge = e.has_edr_analysis ? '<span class="lb-check">&#10003;</span>' : '<span class="lb-x">&#10007;</span>';
+        const md5 = e.md5 || '';
+
+        html += `<tr>
+            <td class="col-image" title="${escapeHtml(e.sha256 || '')}">${escapeHtml(e.filename || e._key)}</td>
+            <td><span class="lb-type-badge">${e._type}</span></td>
+            <td>${size}</td>
+            <td>${riskBadge}</td>
+            <td class="mono">${entropy}</td>
+            <td class="center">${staticBadge}</td>
+            <td class="center">${dynamicBadge}</td>
+            <td class="center">${edrBadge}</td>
+            <td class="lb-actions">
+                <button class="btn btn-xs" onclick="lbRunAnalysis('static','${md5}')" title="Run static analysis">Static</button>
+                <button class="btn btn-xs" onclick="lbRunAnalysis('dynamic','${md5}')" title="Run dynamic analysis">Dynamic</button>
+                <button class="btn btn-xs btn-outline" onclick="lbShowDetail('${md5}')" title="View results">Detail</button>
+            </td>
+        </tr>`;
+    });
+    html += '</tbody></table>';
+    container.innerHTML = html;
+}
+
+function filterLitterboxFiles() {
+    renderLitterboxFiles();
+}
+
+async function lbUploadFile(file) {
+    if (!file) return;
+    const dropZone = document.getElementById('lb-drop-zone');
+    if (dropZone) dropZone.classList.add('uploading');
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+        const resp = await fetch('/api/litterbox/upload', { method: 'POST', body: formData });
+        if (resp.ok) {
+            showToast('success', 'LitterBox', `Uploaded: ${file.name}`, 4000);
+            setTimeout(refreshLitterbox, 1500);
+        } else {
+            const text = await resp.text();
+            showToast('error', 'Upload failed', text.substring(0, 100), 5000);
+        }
+    } catch (e) {
+        showToast('error', 'Upload error', e.message, 5000);
+    } finally {
+        if (dropZone) dropZone.classList.remove('uploading');
+    }
+}
+
+async function lbRunAnalysis(type, md5) {
+    if (!md5) return;
+    showToast('info', 'LitterBox', `Starting ${type} analysis...`, 3000);
+    try {
+        const resp = await fetch(`/api/litterbox/analyze/${type}/${md5}`, { method: 'POST' });
+        if (resp.ok) {
+            showToast('success', 'LitterBox', `${type} analysis started for ${md5.substring(0,8)}...`, 4000);
+            setTimeout(refreshLitterbox, 5000);
+        } else {
+            const text = await resp.text();
+            showToast('error', 'Analysis failed', text.substring(0, 150), 5000);
+        }
+    } catch (e) {
+        showToast('error', 'Analysis error', e.message, 5000);
+    }
+}
+
+async function lbShowDetail(md5) {
+    const panel = document.getElementById('lb-detail-panel');
+    if (!panel) return;
+    panel.style.display = 'block';
+    panel.innerHTML = '<div class="sysmon-loading"><div class="loading-spinner"></div><span>Loading results...</span></div>';
+
+    try {
+        const [riskResp, edrResp] = await Promise.all([
+            fetch(`/api/litterbox/api/results/risk/${md5}`),
+            fetch(`/api/litterbox/api/results/edr/${md5}`),
+        ]);
+
+        let html = `<div class="lb-detail-header"><span>Results for ${md5}</span><button class="btn btn-xs" onclick="document.getElementById('lb-detail-panel').style.display='none'">Close</button></div>`;
+
+        if (riskResp.ok) {
+            const risk = await riskResp.json();
+            html += `<div class="lb-detail-section"><div class="lb-detail-title">Risk Assessment</div>`;
+            html += `<div class="lb-detail-field"><span class="lb-dl">Score</span><span class="lb-dv lb-risk-badge lb-risk-${(risk.risk_level||'').toLowerCase()}">${risk.risk_score ?? '?'} / 10 (${risk.risk_level || '?'})</span></div>`;
+            if (risk.risk_factors?.length) {
+                html += `<div class="lb-detail-field"><span class="lb-dl">Factors</span><ul class="lb-factors">`;
+                risk.risk_factors.forEach(f => { html += `<li>${escapeHtml(f)}</li>`; });
+                html += `</ul></div>`;
+            }
+            html += `</div>`;
+        }
+
+        if (edrResp.ok) {
+            const edr = await edrResp.json();
+            if (edr && !edr.error) {
+                html += `<div class="lb-detail-section"><div class="lb-detail-title">EDR Results</div>`;
+                html += `<pre class="lb-pre">${escapeHtml(JSON.stringify(edr, null, 2).substring(0, 2000))}</pre>`;
+                html += `</div>`;
+            }
+        }
+
+        // Link to full LitterBox UI
+        html += `<div class="lb-detail-section"><a href="http://192.168.64.4:1337/results/static/${md5}" target="_blank" class="btn btn-sm btn-outline">Open in LitterBox UI</a></div>`;
+
+        panel.innerHTML = html;
+    } catch (e) {
+        panel.innerHTML = `<div class="empty-state">Error loading results: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+// Init LitterBox on tab switch
+function initLitterbox() {
+    if (_lbData) return;
+    refreshLitterbox();
+
+    // Setup drag-and-drop
+    const dropZone = document.getElementById('lb-drop-zone');
+    if (dropZone) {
+        dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+        dropZone.addEventListener('dragleave', () => { dropZone.classList.remove('drag-over'); });
+        dropZone.addEventListener('drop', e => {
+            e.preventDefault();
+            dropZone.classList.remove('drag-over');
+            if (e.dataTransfer.files.length) lbUploadFile(e.dataTransfer.files[0]);
+        });
+    }
 }
 
 // --- Utilities ---

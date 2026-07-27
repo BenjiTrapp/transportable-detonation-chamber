@@ -4,6 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Detonation Chamber</title>
+    <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
+    <link rel="icon" type="image/png" sizes="192x192" href="/static/favicon-192.png">
+    <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
     <link rel="stylesheet" href="/static/css/style.css?v=11">
 </head>
 <body>
@@ -31,6 +35,7 @@
                     <button class="tab" data-tab="scanner">Scanner</button>
                     <button class="tab" data-tab="etw">ETW</button>
                     <button class="tab" data-tab="hexeditor">Hex</button>
+                    <button class="tab" data-tab="litterbox">LitterBox</button>
                     <button class="tab" data-tab="submit">Submit</button>
                 </nav>
             </div>
@@ -103,6 +108,7 @@
                         <span class="rtrace-brand"><span class="rtrace-brand-highlight">RUSTINEL TRACE</span> Analysis Console</span>
                     </div>
                     <div class="rtrace-header-actions">
+                        <input type="text" id="rtrace-search" class="filter-input" placeholder="Search process, file, path..." title="Filter by process name, image path, or file activity" oninput="filterRtraceTree()">
                         <select id="rtrace-process-select" class="rtrace-process-dropdown">
                             <option value="">-- select process --</option>
                         </select>
@@ -290,6 +296,8 @@
                             <option value="13">RegistryValueSet</option>
                             <option value="22">DNSQuery</option>
                         </select>
+                        <input type="text" id="sysmon-filter-eid" class="filter-input" placeholder="Sysmon EID (1,3,11...)" title="Filter by Sysmon Event IDs (comma-separated)" oninput="filterSysmonLocal()" onchange="refreshSysmon()">
+                        <input type="text" id="sysmon-filter-wineid" class="filter-input" placeholder="Win EID (4688,4663...)" title="Filter by correlated Windows Event IDs (comma-separated)" oninput="filterSysmonLocal()">
                         <input type="text" id="sysmon-filter-pid" class="filter-input" placeholder="PID...">
                         <select id="sysmon-max-events" class="filter-select">
                             <option value="50">50 events</option>
@@ -479,6 +487,33 @@
                 <div class="etw-event-list" id="etw-event-list">
                     <div class="etw-loading">Select a channel and click Refresh</div>
                 </div>
+            </div>
+
+            <!-- LitterBox Tab -->
+            <div class="tab-content" id="tab-litterbox">
+                <div class="content-header">
+                    <h2>LitterBox</h2>
+                    <div class="header-actions">
+                        <input type="text" id="lb-search" class="filter-input filter-input-wide" placeholder="Search filename, hash..." oninput="filterLitterboxFiles()">
+                        <button class="btn btn-sm" onclick="refreshLitterbox()">Refresh</button>
+                        <span class="lb-status-badge" id="lb-status-badge">--</span>
+                    </div>
+                </div>
+                <!-- Upload zone -->
+                <div class="lb-upload-section" id="lb-upload-section">
+                    <div class="lb-drop-zone" id="lb-drop-zone">
+                        <span class="lb-drop-icon">&#x1F4E6;</span>
+                        <span class="lb-drop-text">Drop file to upload to LitterBox</span>
+                        <input type="file" id="lb-file-input" style="display:none" onchange="lbUploadFile(this.files[0])">
+                        <button class="btn btn-sm" onclick="document.getElementById('lb-file-input').click()">Browse</button>
+                    </div>
+                </div>
+                <!-- Scanners Info -->
+                <div class="lb-scanners-bar" id="lb-scanners-bar"></div>
+                <!-- Files/Payloads Table -->
+                <div id="lb-files-table" class="events-table"></div>
+                <!-- Detail Panel (shows when a file is selected) -->
+                <div id="lb-detail-panel" class="lb-detail-panel" style="display:none;"></div>
             </div>
 
             <!-- Submit Tab -->

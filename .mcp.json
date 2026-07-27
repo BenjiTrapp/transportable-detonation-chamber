@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "tdc": {
+      "command": "/Users/derbenji/gitRepos/transportable-detonation-chamber/mcp/.venv/bin/python",
+      "args": ["/Users/derbenji/gitRepos/transportable-detonation-chamber/mcp/server.py"],
+      "env": {
+        "TDC_URL": "http://192.168.64.4:9000"
+      }
+    }
+  }
+}

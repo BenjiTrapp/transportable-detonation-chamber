@@ -371,91 +371,80 @@ def load_fibratus_alerts():
 
 
 def load_litterbox_results():
-    """Poll LitterBox API for completed analysis results and convert to alert format."""
+    """Poll LitterBox /files and /api/results/risk endpoints for analysis results."""
     alerts = []
     try:
-        r = requests.get(f"{LITTERBOX_API}/api/analyses", params={"status": "completed"}, timeout=5)
+        r = requests.get(f"{LITTERBOX_API}/files", timeout=5)
         if r.status_code != 200:
             return alerts
-        analyses = r.json() if isinstance(r.json(), list) else r.json().get("results", [])
+        data = r.json()
     except (requests.RequestException, ValueError):
         return alerts
 
-    for analysis in analyses:
-        try:
-            analysis_id = analysis.get("id") or analysis.get("task_id", "")
-            score = analysis.get("score", 0) or analysis.get("threat_score", 0)
-            sample = analysis.get("sample", {}) or {}
-            filename = sample.get("name") or analysis.get("filename", "unknown")
-            sha256 = sample.get("sha256") or analysis.get("sha256", "")
-            started = analysis.get("started") or analysis.get("timestamp", "")
-            completed = analysis.get("completed") or started
+    # Process payload-based results
+    payloads = {}
+    if isinstance(data, dict):
+        payloads = data.get("payload_based", {}).get("payloads", {})
 
-            # Only create alert-level entries for analyses with findings
-            if score <= 0:
+    for key, analysis in payloads.items():
+        if not isinstance(analysis, dict):
+            continue
+        try:
+            md5 = analysis.get("md5", "")
+            filename = analysis.get("filename", "unknown")
+            detection_risk = (analysis.get("detection_risk", "") or "").lower()
+            entropy = analysis.get("entropy_value", 0)
+            has_static = analysis.get("has_static_analysis", False)
+            has_dynamic = analysis.get("has_dynamic_analysis", False)
+
+            # Map detection_risk to severity and score
+            risk_map = {"critical": ("critical", 9), "high": ("high", 7), "medium": ("medium", 5), "low": ("low", 2)}
+            severity, score = risk_map.get(detection_risk, ("low", 1))
+
+            # Skip if no meaningful risk
+            if score <= 1 and not has_static and not has_dynamic:
                 continue
 
-            # Map score to severity
-            if score >= 8:
-                severity = "critical"
-            elif score >= 5:
-                severity = "high"
-            elif score >= 3:
-                severity = "medium"
-            else:
-                severity = "low"
-
-            # Get process info from behavioral analysis if available
-            behaviors = analysis.get("behaviors", []) or analysis.get("signatures", [])
-            proc_name = analysis.get("process_name", "")
-            proc_pid = analysis.get("pid")
-            proc_image = analysis.get("process_image", "")
-            cmdline = analysis.get("command_line", "")
-
-            # Try to extract from first behavior if top-level is empty
-            if not proc_name and behaviors:
-                first_b = behaviors[0] if isinstance(behaviors[0], dict) else {}
-                proc_name = first_b.get("process_name", "")
-                proc_pid = first_b.get("pid") or proc_pid
-                proc_image = first_b.get("process_image", "") or proc_image
-
-            # Build description from signatures/behaviors
-            sigs = []
-            for b in (behaviors[:5] if behaviors else []):
-                if isinstance(b, dict):
-                    sigs.append(b.get("name") or b.get("description", ""))
-                elif isinstance(b, str):
-                    sigs.append(b)
-            description = "; ".join(s for s in sigs if s) if sigs else f"LitterBox analysis score: {score}/10"
-
-            # Extract tags (MITRE, etc)
-            tags = analysis.get("tags", []) or []
-            mitre = analysis.get("mitre_attacks", []) or analysis.get("ttps", [])
-            if mitre:
-                tags.extend([t.get("technique_id", t) if isinstance(t, dict) else str(t) for t in mitre])
+            # Try to get detailed risk info
+            description = f"Detection risk: {detection_risk}, Entropy: {entropy:.2f}"
+            tags = []
+            try:
+                rr = requests.get(f"{LITTERBOX_API}/api/results/risk/{md5}", timeout=3)
+                if rr.status_code == 200:
+                    risk_data = rr.json()
+                    risk_factors = risk_data.get("risk_factors", [])
+                    if risk_factors:
+                        description = "; ".join(risk_factors[:3])
+                    risk_score = risk_data.get("risk_score", score)
+                    if risk_score >= 7:
+                        severity = "critical" if risk_score >= 9 else "high"
+                    score = risk_score
+            except Exception:
+                pass
 
             alert = {
-                "id": f"lb_{analysis_id}",
-                "timestamp": completed,
+                "id": f"lb_{md5}",
+                "timestamp": "",
                 "severity": severity,
                 "rule_name": f"LitterBox: {filename}",
                 "rule_description": description,
                 "engine": "litterbox",
                 "tags": tags,
                 "category": "process",
-                "pid": proc_pid,
-                "process_name": proc_name or filename,
-                "process_image": proc_image,
-                "command_line": cmdline,
+                "pid": None,
+                "process_name": filename,
+                "process_image": "",
+                "command_line": "",
                 "parent_pid": None,
                 "parent_name": "",
                 "parent_command_line": "",
-                "user": analysis.get("user", ""),
+                "user": "",
                 "detonated": True,
                 "detonation_source": "litterbox",
                 "litterbox_score": score,
-                "litterbox_id": analysis_id,
-                "sha256": sha256,
+                "litterbox_id": md5,
+                "sha256": "",
+                "md5": md5,
                 "raw": analysis,
             }
             alerts.append(alert)
@@ -1356,12 +1345,15 @@ def api_sysmon():
     max_events = request.args.get("max", 100, type=int)
     since = request.args.get("since")
     pid = request.args.get("pid", type=int)
-    event_id = request.args.get("event_id", type=int)
+    event_id_raw = request.args.get("event_id", "")
+    # Support comma-separated event IDs (e.g. "1,3,11")
+    event_ids = [int(x) for x in event_id_raw.split(",") if x.strip().isdigit()] if event_id_raw else []
+    event_id = event_ids[0] if len(event_ids) == 1 else None
 
     # If Sysmon not available locally, proxy from VM
     if not _is_sysmon_running():
         try:
-            params = {k: v for k, v in {"max": max_events, "since": since, "pid": pid, "event_id": event_id}.items() if v is not None}
+            params = {k: v for k, v in {"max": max_events, "since": since, "pid": pid, "event_id": event_id_raw or None}.items() if v is not None}
             r = requests.get(f"{VM_WEBUI_URL}/api/sysmon", params=params, timeout=10)
             if r.status_code == 200:
                 return jsonify(r.json())
@@ -1369,7 +1361,7 @@ def api_sysmon():
             pass
         return jsonify([{"error": f"Sysmon not available locally and VM ({VM_IP}) unreachable."}])
 
-    events = _read_sysmon_events(max_events=max_events, since=since, pid=pid, event_id=event_id)
+    events = _read_sysmon_events(max_events=max_events, since=since, pid=pid, event_id=event_id, event_ids=event_ids)
     return jsonify(events)
 
 
@@ -1677,7 +1669,7 @@ def api_sysmon_stats():
         return jsonify({"online": False, "error": str(e), "stats": []})
 
 
-def _read_sysmon_events(max_events=100, since=None, pid=None, event_id=None):
+def _read_sysmon_events(max_events=100, since=None, pid=None, event_id=None, event_ids=None):
     """Read Sysmon events from Windows Event Log with full XML field extraction."""
     # Build PowerShell script that parses XML and returns structured JSON
     filter_parts = "LogName='Microsoft-Windows-Sysmon/Operational'"
@@ -1719,6 +1711,10 @@ def _read_sysmon_events(max_events=100, since=None, pid=None, event_id=None):
             data = json.loads(result.stdout.strip())
             if isinstance(data, dict):
                 data = [data]
+
+            # Filter by multiple Event IDs if requested (when more than one)
+            if event_ids and len(event_ids) > 1:
+                data = [e for e in data if e.get("_EventId", 0) in event_ids]
 
             # Filter by PID if requested
             if pid:
@@ -1864,13 +1860,19 @@ def proxy_agent(path):
 
 @app.route("/api/litterbox/<path:path>", methods=["GET", "POST"])
 def proxy_litterbox(path):
-    """Proxy requests to LitterBox API."""
-    url = f"{LITTERBOX_API}/api/{path}"
+    """Proxy requests to LitterBox API.
+    Routes are passed through directly - LitterBox uses both /api/* and root-level routes."""
+    # Try /api/ prefix first, fall back to root path if 404
+    url = f"{LITTERBOX_API}/{path}"
     try:
         if request.method == "GET":
             r = requests.get(url, params=request.args, timeout=10)
+            if r.status_code == 404:
+                r = requests.get(f"{LITTERBOX_API}/api/{path}", params=request.args, timeout=10)
         else:
             r = requests.post(url, data=request.form, files=request.files, timeout=120)
+            if r.status_code == 404:
+                r = requests.post(f"{LITTERBOX_API}/api/{path}", data=request.form, files=request.files, timeout=120)
         return (r.content, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
     except requests.RequestException as e:
         return jsonify({"error": f"LitterBox unavailable: {e}"}), 502
