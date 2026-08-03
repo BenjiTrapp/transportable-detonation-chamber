@@ -5594,3 +5594,174 @@ option.etw-ch-inactive { color: #94a3b8; }
     font-weight: 600;
     color: #ef4444;
 }
+
+/* --- Detonation results: verdict, IOC badge, tabs, raw modal --- */
+.det-verdict {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    border-radius: var(--radius);
+    margin: 8px 0;
+    border: 1px solid var(--border-primary);
+}
+.det-verdict-badge {
+    font-weight: 800;
+    font-size: 11px;
+    letter-spacing: 0.5px;
+    padding: 2px 10px;
+    border-radius: 999px;
+    white-space: nowrap;
+}
+.det-verdict-clean { background: rgba(34,197,94,0.08); border-color: rgba(34,197,94,0.3); }
+.det-verdict-clean .det-verdict-badge { background: rgba(34,197,94,0.2); color: var(--accent-green); }
+.det-verdict-suspicious { background: rgba(249,115,22,0.08); border-color: rgba(249,115,22,0.3); }
+.det-verdict-suspicious .det-verdict-badge { background: rgba(249,115,22,0.2); color: var(--accent-orange); }
+.det-verdict-malicious { background: rgba(239,68,68,0.08); border-color: rgba(239,68,68,0.35); }
+.det-verdict-malicious .det-verdict-badge { background: rgba(239,68,68,0.2); color: var(--accent-red); }
+.det-verdict-reasons { font-size: 11px; color: var(--text-secondary); }
+
+.det-ioc-badge {
+    display: inline-block;
+    font-size: 10px;
+    color: var(--accent-cyan);
+    background: rgba(34,211,238,0.08);
+    border: 1px solid rgba(34,211,238,0.25);
+    border-radius: var(--radius);
+    padding: 3px 8px;
+    margin: 4px 0 8px;
+}
+.det-ioc-badge.warn { color: var(--accent-red); background: rgba(239,68,68,0.08); border-color: rgba(239,68,68,0.25); }
+
+.det-full-btn {
+    background: rgba(167,139,250,0.12);
+    color: var(--accent-purple);
+    border: 1px solid rgba(167,139,250,0.3);
+    border-radius: var(--radius);
+    font-size: 10px;
+    padding: 3px 8px;
+    cursor: pointer;
+    margin-left: 8px;
+}
+.det-full-btn:hover { background: rgba(167,139,250,0.22); }
+
+/* Tabs */
+.det-tabs { margin-top: 10px; }
+.det-tab-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+    border-bottom: 1px solid var(--border-primary);
+    margin-bottom: 10px;
+}
+.det-tab-btn {
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 600;
+    padding: 6px 12px;
+    cursor: pointer;
+}
+.det-tab-btn:hover { color: var(--text-secondary); }
+.det-tab-btn.active { color: var(--accent-cyan); border-bottom-color: var(--accent-cyan); }
+.det-tab-count {
+    background: var(--bg-tertiary);
+    border-radius: 999px;
+    font-size: 9px;
+    padding: 1px 6px;
+    margin-left: 4px;
+    color: var(--text-secondary);
+}
+.det-tab-content.hidden { display: none; }
+
+.det-sub-title { font-size: 10px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; margin: 8px 0 3px; }
+.det-kv { display: flex; gap: 8px; font-size: 11px; margin: 2px 0; }
+.det-kv-label { color: var(--text-muted); min-width: 80px; }
+.det-kv-value { color: var(--text-secondary); font-family: var(--font-mono, monospace); }
+
+.det-raw-tall { max-height: 420px; overflow: auto; }
+
+/* Alert table */
+.det-alert-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.det-alert-table th {
+    text-align: left;
+    color: var(--text-muted);
+    font-weight: 600;
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--border-primary);
+    text-transform: uppercase;
+    font-size: 9px;
+}
+.det-alert-table td { padding: 4px 8px; border-bottom: 1px solid var(--border-primary); color: var(--text-secondary); vertical-align: top; }
+.det-alert-table .det-alert-sev { font-weight: 700; font-size: 9px; padding: 1px 6px; border-radius: 3px; }
+.det-alert-sev.sev-critical { background: rgba(239,68,68,0.2); color: var(--accent-red); }
+.det-alert-sev.sev-high { background: rgba(249,115,22,0.2); color: var(--accent-orange); }
+.det-alert-sev.sev-medium { background: rgba(249,115,22,0.15); color: var(--accent-orange); }
+.det-alert-sev.sev-low, .det-alert-sev.sev-unknown { background: var(--bg-tertiary); color: var(--text-secondary); }
+
+.det-raw-btn {
+    background: rgba(34,211,238,0.1);
+    color: var(--accent-cyan);
+    border: 1px solid rgba(34,211,238,0.25);
+    border-radius: 3px;
+    font-size: 10px;
+    padding: 2px 8px;
+    cursor: pointer;
+    margin-top: 6px;
+}
+.det-raw-btn:hover { background: rgba(34,211,238,0.2); }
+
+/* Raw JSON modal */
+.det-raw-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    background: rgba(4,8,16,0.8);
+}
+.det-raw-modal.hidden { display: none; }
+.det-raw-modal-box {
+    background: var(--bg-card);
+    border: 1px solid var(--border-accent);
+    border-radius: var(--radius-lg);
+    width: 90%;
+    max-width: 1100px;
+    height: 85vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+}
+.det-raw-modal-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border-primary);
+    font-weight: 600;
+    color: var(--text-primary, #e2e8f0);
+}
+.det-raw-modal-close { background: none; border: none; color: var(--text-muted); font-size: 22px; line-height: 1; cursor: pointer; }
+.det-raw-modal-close:hover { color: var(--accent-red); }
+.det-raw-modal-body { flex: 1; overflow: auto; padding: 12px 16px; }
+.det-raw-modal-body pre { font-size: 11px; color: var(--text-secondary); white-space: pre; margin: 0; }
+
+/* Recent detonations list (agent detail) */
+.det-recent-list { display: flex; flex-direction: column; gap: 2px; padding: 4px 8px; }
+.det-recent-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 8px;
+    border-radius: var(--radius);
+    cursor: pointer;
+    font-size: 11px;
+}
+.det-recent-item:hover { background: var(--bg-card-hover); }
+.det-recent-name { color: var(--text-secondary); font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.det-recent-pid { color: var(--text-muted); font-size: 10px; }
+.det-recent-ts { font-size: 9px; }

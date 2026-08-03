@@ -18,3 +18,7 @@ Thumbs.db
 
 # Vagrant
 .vagrant/
+
+# Local build/tooling artifacts
+.build-box/
+.serena/

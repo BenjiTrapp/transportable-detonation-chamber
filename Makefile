@@ -26,6 +26,12 @@
 # Prerequisites:
 #   macOS:  Run 'make prerequisites-fix' to install automatically
 #   Linux:  Vagrant + Hyper-V or libvirt
+#
+# Deploy modes:
+#   Dev targets (deploy, restart, logs, services, status) auto-detect whether
+#   the VM is Vagrant-managed or a UTM VM reached over WinRM. On Apple Silicon
+#   the UTM path is used automatically. Override / configure with:
+#     make deploy DEPLOY_MODE=utm UTM_VM_IP=192.168.64.4 UTM_USER=vagrant UTM_PASS=vagrant
 # ============================================================================
 
 .DEFAULT_GOAL := help
@@ -47,6 +53,23 @@ VM_IP          ?= 127.0.0.1
 WEBUI_URL      := http://$(VM_IP):9000
 
 export VAGRANT_VAGRANTFILE := $(VAGRANT_FILE)
+
+# --- Deploy mode (Vagrant vs UTM/WinRM) --------------------------------------
+# The macOS Apple Silicon path runs the VM under UTM (managed over WinRM), not
+# Vagrant, so `vagrant upload`/`vagrant winrm` do not apply there. DEPLOY_MODE
+# auto-detects: a running Vagrant VM => vagrant, otherwise => utm.
+#   Override with:  make deploy DEPLOY_MODE=utm
+#   UTM connection: UTM_VM_IP / UTM_USER / UTM_PASS
+DEPLOY_MODE    ?= auto
+UTM_VM_IP      ?= 192.168.64.4
+UTM_USER       ?= vagrant
+UTM_PASS       ?= vagrant
+UTM_DEPLOY     := python3 scripts/deploy-utm.py --vm-ip $(UTM_VM_IP) --vm-user $(UTM_USER) --vm-pass $(UTM_PASS)
+
+# Shell snippet that echoes the effective mode ("vagrant" or "utm").
+DETECT_MODE    = if [ "$(DEPLOY_MODE)" != "auto" ]; then echo "$(DEPLOY_MODE)"; \
+	elif vagrant status 2>/dev/null | grep -qi 'running'; then echo vagrant; \
+	else echo utm; fi
 
 # ============================================================================
 
@@ -265,21 +288,38 @@ provision-webui:
 
 .PHONY: deploy
 deploy:
-	@echo "[deploy] Uploading webui files to VM..."
-	vagrant upload webui/templates/index.html C:\\DetonationChamberUI\\templates\\index.html
-	vagrant upload webui/static/css/style.css C:\\DetonationChamberUI\\static\\css\\style.css
-	vagrant upload webui/static/js/app.js C:\\DetonationChamberUI\\static\\js\\app.js
-	-vagrant upload webui/static/icon.png C:\\DetonationChamberUI\\static\\icon.png
-	@echo "[deploy] Done."
+	@mode=$$( $(DETECT_MODE) ); echo "[deploy] mode=$$mode"; \
+	if [ "$$mode" = "utm" ]; then \
+		$(UTM_DEPLOY) --action deploy; \
+	else \
+		echo "[deploy] Uploading webui files to Vagrant VM..."; \
+		vagrant upload webui/templates/index.html C:\\DetonationChamberUI\\templates\\index.html; \
+		vagrant upload webui/static/css/style.css C:\\DetonationChamberUI\\static\\css\\style.css; \
+		vagrant upload webui/static/js/app.js C:\\DetonationChamberUI\\static\\js\\app.js; \
+		vagrant upload webui/app.py C:\\DetonationChamberUI\\app.py; \
+		vagrant upload webui/static/icon.png C:\\DetonationChamberUI\\static\\icon.png || true; \
+		echo "[deploy] Done."; \
+	fi
 
+# deploy-app is kept for compatibility; both modes now sync app.py in `deploy`.
 .PHONY: deploy-app
 deploy-app:
-	vagrant upload webui/app.py C:\\DetonationChamberUI\\app.py
-	@echo "[deploy-app] app.py synced."
+	@mode=$$( $(DETECT_MODE) ); \
+	if [ "$$mode" = "utm" ]; then \
+		$(UTM_DEPLOY) --action deploy; \
+	else \
+		vagrant upload webui/app.py C:\\DetonationChamberUI\\app.py; \
+		echo "[deploy-app] app.py synced."; \
+	fi
 
 .PHONY: restart
 restart:
-	vagrant winrm -c "Get-Process -Name python* -EA SilentlyContinue | Stop-Process -Force; Start-Sleep 2; Start-ScheduledTask -TaskName DetonationChamberUI; Start-Sleep 3; Write-Host ('Web UI: ' + (Get-ScheduledTask -TaskName DetonationChamberUI).State)"
+	@mode=$$( $(DETECT_MODE) ); echo "[restart] mode=$$mode"; \
+	if [ "$$mode" = "utm" ]; then \
+		$(UTM_DEPLOY) --action restart; \
+	else \
+		vagrant winrm -c "Get-Process -Name python* -EA SilentlyContinue | Stop-Process -Force; Start-Sleep 2; Start-ScheduledTask -TaskName DetonationChamberUI; Start-Sleep 3; Write-Host ('Web UI: ' + (Get-ScheduledTask -TaskName DetonationChamberUI).State)"; \
+	fi
 
 .PHONY: deploy-restart
 deploy-restart: deploy restart
@@ -290,7 +330,12 @@ open:
 
 .PHONY: logs
 logs:
-	vagrant winrm -c "if (Test-Path C:\\DetonationChamberUI\\webui.log) { Get-Content C:\\DetonationChamberUI\\webui.log -Tail 50 } else { Write-Host 'No log file'; Get-ScheduledTask -TaskName DetonationChamberUI | Format-List State,LastRunTime,LastTaskResult }"
+	@mode=$$( $(DETECT_MODE) ); \
+	if [ "$$mode" = "utm" ]; then \
+		$(UTM_DEPLOY) --action logs; \
+	else \
+		vagrant winrm -c "if (Test-Path C:\\DetonationChamberUI\\webui.log) { Get-Content C:\\DetonationChamberUI\\webui.log -Tail 50 } else { Write-Host 'No log file'; Get-ScheduledTask -TaskName DetonationChamberUI | Format-List State,LastRunTime,LastTaskResult }"; \
+	fi
 
 # --- Interaction ---
 
@@ -304,15 +349,24 @@ rdp:
 
 .PHONY: status
 status:
-	@echo "--- Vagrant VM ---"
-	@vagrant status
+	@mode=$$( $(DETECT_MODE) ); \
+	if [ "$$mode" = "utm" ]; then \
+		echo "--- UTM VM ($(UTM_VM_IP)) ---"; \
+	else \
+		echo "--- Vagrant VM ---"; vagrant status; \
+	fi
 	@echo ""
 	@echo "--- Web UI Health ---"
 	@curl -sf $(WEBUI_URL)/api/status | python3 -m json.tool && echo "Status: ONLINE" || echo "Status: OFFLINE"
 
 .PHONY: services
 services:
-	vagrant winrm -c "Write-Host ''; Write-Host '  SERVICE               STATE'; Write-Host '  -------               -----'; @('DetonationChamberUI','Rustinel','DetonatorAgent','LitterBox','Fibratus','theZoo-WebUI') | ForEach-Object { $$st = Get-ScheduledTask -TaskName $$_ -EA SilentlyContinue; if($$st){Write-Host ('  '+$$_.PadRight(22)+$$st.State)}else{Write-Host ('  '+$$_.PadRight(22)+'NOT FOUND')}}; $$sysmon = Get-Service Sysmon64 -EA SilentlyContinue; if(-not $$sysmon){$$sysmon = Get-Service Sysmon64a -EA SilentlyContinue}; Write-Host ('  Sysmon'.PadRight(24)+$$(if($$sysmon){$$sysmon.Status}else{'NOT FOUND'})); Write-Host ''"
+	@mode=$$( $(DETECT_MODE) ); \
+	if [ "$$mode" = "utm" ]; then \
+		$(UTM_DEPLOY) --action services; \
+	else \
+		vagrant winrm -c "Write-Host ''; Write-Host '  SERVICE               STATE'; Write-Host '  -------               -----'; @('DetonationChamberUI','Rustinel','DetonatorAgent','LitterBox','Fibratus','theZoo-WebUI') | ForEach-Object { $$st = Get-ScheduledTask -TaskName $$_ -EA SilentlyContinue; if($$st){Write-Host ('  '+$$_.PadRight(22)+$$st.State)}else{Write-Host ('  '+$$_.PadRight(22)+'NOT FOUND')}}; $$sysmon = Get-Service Sysmon64 -EA SilentlyContinue; if(-not $$sysmon){$$sysmon = Get-Service Sysmon64a -EA SilentlyContinue}; Write-Host ('  Sysmon'.PadRight(24)+$$(if($$sysmon){$$sysmon.Status}else{'NOT FOUND'})); Write-Host ''" ; \
+	fi
 
 .PHONY: alerts
 alerts:

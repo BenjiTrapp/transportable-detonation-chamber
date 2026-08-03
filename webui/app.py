@@ -110,7 +110,11 @@ def _record_submission(filename, sha256, size, target, results):
         "target": target,
         "agent_status": None,
         "agent_pid": None,
+        "agent_result": None,
         "litterbox_status": None,
+        "litterbox_hash": None,
+        "ioc_feed": None,
+        "verdict": None,
         "file_path": None,
     }
     # Extract results
@@ -121,8 +125,29 @@ def _record_submission(filename, sha256, size, target, results):
             if agent_data.get("pid"):
                 entry["agent_pid"] = agent_data["pid"]
             entry["file_path"] = agent_data.get("file_path") or agent_data.get("path")
+            # The agent's /execute/exec response only carries status/pid/message;
+            # stdout/stderr are fetched live from /api/logs/execution at poll time.
+            entry["agent_result"] = {
+                "http_status": results["agent"].get("status"),
+                "pid": agent_data.get("pid"),
+                "message": agent_data.get("message") or agent_data.get("Message"),
+                "file_path": entry["file_path"],
+            }
+        else:
+            # Non-dict payload (error string etc.) — still capture what we can
+            entry["agent_result"] = {
+                "http_status": results["agent"].get("status"),
+                "error": results["agent"].get("error"),
+                "raw": agent_data,
+            }
     if "litterbox" in results:
         entry["litterbox_status"] = "success" if 200 <= results["litterbox"].get("status", 0) < 400 else "failed"
+    if "ioc_feed" in results:
+        entry["ioc_feed"] = results["ioc_feed"]
+    # Carry over the litterbox hash if the submit handler computed one
+    fi = results.get("file_info") if isinstance(results, dict) else None
+    if isinstance(fi, dict):
+        entry["litterbox_hash"] = fi.get("litterbox_hash")
 
     # If no file_path from agent, guess the common location
     if not entry["file_path"]:
@@ -2180,7 +2205,133 @@ def api_detonation_results():
     else:
         results["ready"]["fibratus"] = False
 
+    # --- DetonatorAgent block (live lock status + persisted execution result) ---
+    agent_block = {"in_use": None}
+    try:
+        r = requests.get(f"{DETONATOR_AGENT_API}/api/lock/status", timeout=2)
+        if r.status_code == 200:
+            agent_block["online"] = True
+            lock = r.json()
+            if isinstance(lock, dict):
+                agent_block["in_use"] = lock.get("in_use", lock.get("locked"))
+        else:
+            agent_block["online"] = False
+    except Exception:
+        agent_block["online"] = False
+
+    # Pull the persisted IOC-feed status from submission history
+    try:
+        with submissions_lock:
+            subs = _load_submissions()
+        for sub in subs:
+            if (pid and str(sub.get("agent_pid")) == str(pid)) or (sha256 and sub.get("sha256") == sha256):
+                agent_block["ioc_feed"] = sub.get("ioc_feed")
+                break
+    except Exception:
+        pass
+
+    # Fetch live execution logs from the agent. GetExecutionLogs returns the LAST
+    # execution's stdout/stderr/pid, so only surface it when its PID matches the
+    # sample we're polling for (avoids showing an unrelated detonation's output).
+    if agent_block.get("online"):
+        execution = {}
+        try:
+            r = requests.get(f"{DETONATOR_AGENT_API}/api/logs/execution", timeout=3)
+            if r.status_code == 200:
+                log_data = r.json()
+                log_pid = str(log_data.get("pid", ""))
+                if not pid or log_pid == str(pid):
+                    execution["pid"] = log_data.get("pid")
+                    execution["stdout"] = log_data.get("stdout")
+                    execution["stderr"] = log_data.get("stderr")
+        except Exception:
+            pass
+        # Agent's own log buffer (server-side agent logs)
+        try:
+            r = requests.get(f"{DETONATOR_AGENT_API}/api/logs/agent", timeout=3)
+            if r.status_code == 200:
+                execution["agent_logs"] = r.text[:20000]
+        except Exception:
+            pass
+        if execution:
+            agent_block["execution"] = execution
+    results["agent"] = agent_block
+    if agent_block.get("ioc_feed") and "ioc_feed" not in results:
+        results["ioc_feed"] = agent_block["ioc_feed"]
+
+    # --- Aggregated verdict (CLEAN / SUSPICIOUS / MALICIOUS) ---
+    results["verdict"] = _compute_verdict(results, matching_alerts)
+
     return jsonify(results)
+
+
+def _compute_verdict(results, matching_alerts):
+    """Aggregate a single verdict from EDR alerts, LitterBox findings, and beacon scans.
+    Mirrors the Detonator reference UI's edr_verdict concept."""
+    score = 0
+    reasons = []
+
+    # EDR alerts weighted by severity
+    crit = high = 0
+    for alert in matching_alerts:
+        sev = (alert.get("severity") or "").lower()
+        if sev in ("critical", "crit"):
+            crit += 1
+        elif sev in ("high", "medium"):
+            high += 1
+    if crit:
+        score += 3
+        reasons.append(f"{crit} critical EDR alert(s)")
+    if high:
+        score += 2
+        reasons.append(f"{high} high/medium EDR alert(s)")
+    other_alerts = len(matching_alerts) - crit - high
+    if other_alerts > 0:
+        score += 1
+        reasons.append(f"{other_alerts} low/other EDR alert(s)")
+
+    # LitterBox dynamic indicators
+    dyn = results.get("litterbox_dynamic") or {}
+    if isinstance(dyn, dict):
+        ps = dyn.get("pe_sieve") or dyn.get("pe_sieve_results") or {}
+        if isinstance(ps, dict) and (ps.get("suspicious") or ps.get("total_suspicious") or ps.get("replaced")):
+            score += 3
+            reasons.append("PE-Sieve flagged injected/replaced code")
+        mon = dyn.get("moneta") or dyn.get("moneta_results") or {}
+        if isinstance(mon, dict):
+            iocs = mon.get("ioc_count") or mon.get("iocs") or 0
+            iocs = iocs if isinstance(iocs, int) else (len(iocs) if isinstance(iocs, list) else 0)
+            if iocs:
+                score += 2
+                reasons.append(f"Moneta reported {iocs} IOC(s)")
+
+    # LitterBox static score (0-10 scale from LitterBox info)
+    info = results.get("litterbox_info") or {}
+    if isinstance(info, dict) and isinstance(info.get("score"), (int, float)):
+        if info["score"] >= 7:
+            score += 3
+            reasons.append(f"LitterBox score {info['score']}/10")
+        elif info["score"] >= 4:
+            score += 1
+            reasons.append(f"LitterBox score {info['score']}/10")
+
+    # Beacon scans
+    hsb = results.get("hunt_sleeping_beacons") or {}
+    if isinstance(hsb, dict) and hsb.get("suspicious_count"):
+        score += 3
+        reasons.append(f"{hsb['suspicious_count']} sleeping-beacon indicator(s)")
+    be = results.get("beaconeye") or {}
+    if isinstance(be, dict) and be.get("beacons_found"):
+        score += 3
+        reasons.append(f"{be['beacons_found']} CobaltStrike beacon(s)")
+
+    if score >= 3:
+        label = "MALICIOUS"
+    elif score >= 1:
+        label = "SUSPICIOUS"
+    else:
+        label = "CLEAN"
+    return {"label": label, "score": score, "reasons": reasons}
 
 
 def _add_hash_to_ioc(sha256_hash, filename=""):

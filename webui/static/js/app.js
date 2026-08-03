@@ -356,7 +356,7 @@ function renderDashboard() {
             <div class="service-card-desc">.NET execution agent. Detonates samples and collects EDR telemetry on port 8080.</div>
             <div class="service-card-metrics">
                 <div class="service-metric"><div class="service-metric-value">${aOnline ? '8080' : '--'}</div><div class="service-metric-label">PORT</div></div>
-                <div class="service-metric"><div class="service-metric-value ${aInUse ? '' : 'zero'}">${aInUse ? 'Yes' : 'No'}</div><div class="service-metric-label">IN USE</div></div>
+                <div class="service-metric"><div class="service-metric-value ${aInUse ? '' : 'zero'}" style="${aInUse ? 'color:var(--accent-orange)' : ''}">${aOnline ? (aInUse ? 'Detonating' : 'Idle') : '--'}</div><div class="service-metric-label">ACTIVITY</div></div>
                 <div class="service-metric"><div class="service-metric-value">${aOnline ? 'Fibratus' : '--'}</div><div class="service-metric-label">EDR</div></div>
             </div>
             <div class="service-card-actions">
@@ -2506,14 +2506,42 @@ async function openAgentDetail() {
     showDetail();
 
     const online = state.serviceStatus.detonator_agent?.online;
+    const inUse = state.serviceStatus.detonator_agent?.data?.in_use;
     let html = `<div class="detail-fields">
         <div class="detail-field"><span class="field-label">Status</span><span class="field-value" style="color:${online ? 'var(--accent-green)' : 'var(--accent-red)'}">${online ? 'Running' : 'Stopped'}</span></div>
+        <div class="detail-field"><span class="field-label">Activity</span><span class="field-value" style="color:${inUse ? 'var(--accent-orange)' : 'var(--text-muted)'}">${inUse ? 'Detonating' : 'Idle'}</span></div>
         <div class="detail-field"><span class="field-label">Port</span><span class="field-value">8080</span></div>
         <div class="detail-field"><span class="field-label">Framework</span><span class="field-value">.NET 8.0</span></div>
         <div class="detail-field"><span class="field-label">Install Dir</span><span class="field-value mono">C:\\DetonatorAgent</span></div>
         <div class="detail-field"><span class="field-label">EDR Plugin</span><span class="field-value">Fibratus</span></div>
     </div>`;
     setDetailBody(html);
+
+    // Load the most recent detonations so the agent card links straight to their results
+    try {
+        const resp = await fetch('/api/submissions');
+        if (resp.ok) {
+            const subs = await resp.json();
+            const executed = (subs || []).filter(s => s.agent_pid || s.agent_status);
+            if (executed.length > 0) {
+                let recent = '<div class="detail-section"><div class="detail-section-title">RECENT DETONATIONS</div><div class="det-recent-list">';
+                executed.slice(0, 8).forEach(s => {
+                    const args = `'${escapeHtml(s.litterbox_hash || '')}', '${escapeHtml(s.sha256 || '')}', '${escapeHtml(s.agent_pid || '')}', '${escapeHtml((s.filename || '').replace(/'/g, ''))}'`;
+                    const ts = s.timestamp ? new Date(s.timestamp).toLocaleString('en-GB', {hour12:false}) : '';
+                    const vlabel = s.verdict && s.verdict.label ? s.verdict.label : '';
+                    const vcls = vlabel === 'MALICIOUS' ? 'malicious' : (vlabel === 'SUSPICIOUS' ? 'suspicious' : 'clean');
+                    recent += `<div class="det-recent-item" onclick="viewDetonationResult(${args})">
+                        <span class="det-recent-name">${escapeHtml(s.filename || s.sha256 || 'unknown')}</span>
+                        ${s.agent_pid ? `<span class="det-recent-pid">PID ${escapeHtml(String(s.agent_pid))}</span>` : ''}
+                        ${vlabel ? `<span class="det-verdict-badge det-verdict-${vcls}" style="font-size:9px;padding:1px 6px;">${vlabel}</span>` : ''}
+                        <span class="det-recent-ts muted">${ts}</span>
+                    </div>`;
+                });
+                recent += '</div></div>';
+                setDetailBody(html + recent);
+            }
+        }
+    } catch (e) {}
 }
 
 async function openLitterboxDetail() {
@@ -2657,6 +2685,9 @@ async function viewDetonationResult(lbHash, sha256, pid, filename) {
     // --- Fetch Fibratus/Rustinel alerts via /api/detonation/results ---
     let fibratusAlerts = [];
     let fibratusCount = 0;
+    let verdict = null;
+    let agentBlock = null;
+    let iocFeed = null;
     try {
         const params = new URLSearchParams();
         if (sha256) params.set('sha256', sha256);
@@ -2668,6 +2699,9 @@ async function viewDetonationResult(lbHash, sha256, pid, filename) {
             const data = await resp.json();
             fibratusAlerts = data.fibratus_alerts || [];
             fibratusCount = data.fibratus_alert_count || fibratusAlerts.length;
+            verdict = data.verdict || null;
+            agentBlock = data.agent || null;
+            iocFeed = data.ioc_feed || null;
         }
     } catch (e) {}
 
@@ -2704,6 +2738,35 @@ async function viewDetonationResult(lbHash, sha256, pid, filename) {
         if (pid) html += `<div class="detail-field"><span class="field-label">PID</span><span class="field-value">${escapeHtml(pid)}</span></div>`;
     }
     html += `</div>`;
+
+    // --- Verdict banner ---
+    if (verdict && verdict.label) {
+        const cls = verdict.label === 'MALICIOUS' ? 'malicious' : (verdict.label === 'SUSPICIOUS' ? 'suspicious' : 'clean');
+        html += `<div class="det-verdict det-verdict-${cls}" style="margin:8px 0;">
+            <span class="det-verdict-badge">${verdict.label}</span>
+            <span class="det-verdict-reasons">${verdict.reasons && verdict.reasons.length ? escapeHtml(verdict.reasons.join(' · ')) : 'No malicious indicators detected'}</span>
+        </div>`;
+    }
+    if (iocFeed && iocFeed.status) {
+        const st = iocFeed.status;
+        const label = st === 'added' ? 'Hash added to Rustinel IOC watchlist'
+            : st === 'exists' ? 'Hash already on IOC watchlist' : `IOC feed: ${st}`;
+        html += `<div class="det-ioc-badge ${st === 'error' ? 'warn' : ''}">&#x1F4CC; ${escapeHtml(label)}</div>`;
+    }
+
+    // --- DetonatorAgent execution section ---
+    const exec = agentBlock && agentBlock.execution;
+    if (agentBlock) {
+        html += '<div class="detail-section"><div class="detail-section-title">DETONATORAGENT EXECUTION</div><div class="detail-fields">';
+        html += `<div class="detail-field"><span class="field-label">Status</span><span class="field-value">${agentBlock.online ? 'Online' : 'Offline'}${agentBlock.in_use ? ' · Detonating' : (agentBlock.online ? ' · Idle' : '')}</span></div>`;
+        if (exec && exec.pid) html += `<div class="detail-field"><span class="field-label">PID</span><span class="field-value">${escapeHtml(String(exec.pid))}</span></div>`;
+        html += '</div>';
+        if (exec && exec.stdout) html += `<div class="det-sub-title" style="padding:4px 8px;">stdout</div><pre class="lb-raw" style="margin:0 8px;">${escapeHtml(String(exec.stdout))}</pre>`;
+        if (exec && exec.stderr) html += `<div class="det-sub-title" style="padding:4px 8px;">stderr</div><pre class="lb-raw" style="margin:0 8px;">${escapeHtml(String(exec.stderr))}</pre>`;
+        if (exec && exec.agent_logs) html += `<div class="det-sub-title" style="padding:4px 8px;">Agent Logs</div><pre class="lb-raw" style="margin:0 8px;max-height:300px;overflow:auto;">${escapeHtml(String(exec.agent_logs))}</pre>`;
+        if (!exec || (!exec.stdout && !exec.stderr && !exec.agent_logs)) html += `<div class="muted" style="padding:8px;font-size:11px;">No execution output captured (GUI app, or no detonation matched this sample).</div>`;
+        html += '</div>';
+    }
 
     // --- Fibratus / Rustinel Alerts Section ---
     html += '<div class="detail-section"><div class="detail-section-title">FIBRATUS / RUSTINEL ALERTS';
@@ -3443,11 +3506,13 @@ function renderDetonationResults(data, container) {
 
     let html = `<div class="det-results">`;
     // Header
+    const fullArgs = `'${lbHash || ''}', '${sha256 || ''}', '${pid || ''}', '${escapeHtml(filename).replace(/'/g, "\\'")}'`;
     html += `<div class="det-results-header">
         <div class="det-filename">${escapeHtml(filename)}</div>
         <div class="det-meta">
             ${sha256 ? `<span class="det-hash mono">${sha256.substring(0, 16)}...</span>` : ''}
             ${pid ? `<span class="det-pid">PID: ${pid}</span>` : ''}
+            <button class="det-full-btn" onclick="viewDetonationResult(${fullArgs})">Full Results &rarr;</button>
         </div>
     </div>`;
 
@@ -3639,210 +3704,192 @@ function pollDetonationResults(sha256, pid, lbHash, filename, attempt) {
         });
 }
 
+// Raw-JSON modal support: payloads are rebuilt on every render, opened by index.
+let _detRawPayloads = [];
+function _detRawButton(label, obj) {
+    const idx = _detRawPayloads.push(typeof obj === 'string' ? obj : JSON.stringify(obj, null, 2)) - 1;
+    return `<button class="det-raw-btn" onclick="detShowRaw(${idx})">${escapeHtml(label || 'View Raw')}</button>`;
+}
+function detShowRaw(idx) {
+    let modal = document.getElementById('det-raw-modal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'det-raw-modal';
+        modal.className = 'det-raw-modal hidden';
+        modal.innerHTML = `<div class="det-raw-modal-box">
+            <div class="det-raw-modal-head"><span>Raw Data</span>
+                <button class="det-raw-modal-close" onclick="detHideRaw()">&times;</button></div>
+            <div class="det-raw-modal-body"><pre id="det-raw-modal-pre"></pre></div>
+        </div>`;
+        document.body.appendChild(modal);
+        modal.addEventListener('click', (e) => { if (e.target === modal) detHideRaw(); });
+        document.addEventListener('keydown', (e) => { if (e.key === 'Escape') detHideRaw(); });
+    }
+    document.getElementById('det-raw-modal-pre').textContent = _detRawPayloads[idx] || '(no data)';
+    modal.classList.remove('hidden');
+}
+function detHideRaw() {
+    const modal = document.getElementById('det-raw-modal');
+    if (modal) modal.classList.add('hidden');
+}
+function detShowTab(tabId, btn) {
+    const root = btn.closest('.det-tabs');
+    if (!root) return;
+    root.querySelectorAll('.det-tab-content').forEach(c => c.classList.add('hidden'));
+    root.querySelectorAll('.det-tab-btn').forEach(b => b.classList.remove('active'));
+    const target = root.querySelector('#' + tabId);
+    if (target) target.classList.remove('hidden');
+    btn.classList.add('active');
+}
+
 function renderDetonationPanels(data) {
     const panels = document.getElementById('det-results-panels');
     if (!panels) return;
 
+    _detRawPayloads = [];
     let html = '';
 
-    // --- Fibratus / Rustinel Alerts ---
-    if (data.fibratus_alerts && data.fibratus_alerts.length > 0) {
-        html += `<div class="det-panel">
-            <div class="det-panel-title">FIBRATUS / RUSTINEL ALERTS (${data.fibratus_alert_count})</div>
-            <div class="det-alerts-list">`;
-        data.fibratus_alerts.slice(0, 20).forEach(alert => {
+    // --- Verdict banner (aggregated CLEAN / SUSPICIOUS / MALICIOUS) ---
+    if (data.verdict && data.verdict.label) {
+        const v = data.verdict;
+        const cls = v.label === 'MALICIOUS' ? 'malicious' : (v.label === 'SUSPICIOUS' ? 'suspicious' : 'clean');
+        html += `<div class="det-verdict det-verdict-${cls}">
+            <span class="det-verdict-badge">${v.label}</span>
+            <span class="det-verdict-reasons">${v.reasons && v.reasons.length ? escapeHtml(v.reasons.join(' · ')) : 'No malicious indicators detected'}</span>
+        </div>`;
+    }
+
+    // --- IOC feed badge ---
+    if (data.ioc_feed && data.ioc_feed.status) {
+        const st = data.ioc_feed.status;
+        const label = st === 'added' ? 'Hash added to Rustinel IOC watchlist'
+            : st === 'exists' ? 'Hash already on IOC watchlist'
+            : `IOC feed: ${st}`;
+        html += `<div class="det-ioc-badge ${st === 'error' ? 'warn' : ''}">&#x1F4CC; ${escapeHtml(label)}</div>`;
+    }
+
+    // --- Build tabs (only those with data) ---
+    const tabs = [];
+
+    // Alerts tab
+    const alerts = data.fibratus_alerts || [];
+    if (alerts.length > 0) {
+        let body = `<table class="det-alert-table"><thead><tr>
+            <th>Severity</th><th>Rule / Threat</th><th>Process</th><th>Engine</th><th>Time</th><th>Raw</th>
+            </tr></thead><tbody>`;
+        alerts.forEach(alert => {
             const sev = (alert.severity || 'unknown').toLowerCase();
             const ruleName = alert.rule_name || 'Unknown Rule';
             const procName = alert.process_name || '';
             const engine = alert.engine || '';
-            const pid = alert.pid || '';
-            html += `<div class="det-alert-item sev-${sev}">
-                <span class="det-alert-sev">${sev.toUpperCase()}</span>
-                <span class="det-alert-rule">${escapeHtml(ruleName)}</span>
-                <span class="det-alert-proc">${escapeHtml(procName)}${pid ? ' (PID:' + pid + ')' : ''}</span>
-                ${engine ? '<span class="det-alert-engine">' + escapeHtml(engine) + '</span>' : ''}
-            </div>`;
+            const apid = alert.pid || '';
+            const ts = alert.timestamp ? new Date(alert.timestamp).toLocaleTimeString('en-GB', {hour12:false}) : '';
+            body += `<tr class="sev-${sev}">
+                <td><span class="det-alert-sev sev-${sev}">${sev.toUpperCase()}</span></td>
+                <td>${escapeHtml(ruleName)}</td>
+                <td>${escapeHtml(procName)}${apid ? ' <span class="muted">(PID:' + apid + ')</span>' : ''}</td>
+                <td>${escapeHtml(engine)}</td>
+                <td class="muted">${ts}</td>
+                <td>${_detRawButton('View', alert.raw || alert)}</td>
+            </tr>`;
         });
-        html += `</div></div>`;
+        body += `</tbody></table>`;
+        tabs.push({ id: 'det-tab-alerts', label: 'Alerts', count: data.fibratus_alert_count || alerts.length, body });
     }
 
-    // --- LitterBox Static Results ---
-    if (data.litterbox_static) {
-        const st = data.litterbox_static;
-        html += `<div class="det-panel">
-            <div class="det-panel-title">STATIC ANALYSIS (LitterBox)</div>
-            <div class="det-panel-body">`;
-
-        // YARA matches
-        if (st.yara_results || st.yara) {
-            const yara = st.yara_results || st.yara;
-            if (Array.isArray(yara) && yara.length > 0) {
-                html += `<div class="det-subsection"><span class="det-sub-label">YARA Matches:</span>`;
-                yara.forEach(m => {
-                    const name = typeof m === 'string' ? m : (m.rule || m.name || JSON.stringify(m));
-                    html += `<span class="det-yara-match">${escapeHtml(name)}</span>`;
-                });
-                html += `</div>`;
-            } else if (typeof yara === 'object' && !Array.isArray(yara)) {
-                const matches = yara.matches || yara.rules || [];
-                if (matches.length > 0) {
-                    html += `<div class="det-subsection"><span class="det-sub-label">YARA Matches:</span>`;
-                    matches.forEach(m => {
-                        html += `<span class="det-yara-match">${escapeHtml(typeof m === 'string' ? m : m.rule || m.name || '')}</span>`;
-                    });
-                    html += `</div>`;
-                }
-            }
-        }
-
-        // CheckPlz results
-        if (st.checkplz_results || st.checkplz) {
-            const cp = st.checkplz_results || st.checkplz;
-            html += `<div class="det-subsection"><span class="det-sub-label">CheckPlz:</span><span class="det-sub-value">${escapeHtml(typeof cp === 'string' ? cp : JSON.stringify(cp).substring(0, 200))}</span></div>`;
-        }
-
-        // Strings analysis
-        if (st.stringnalyzer_results || st.strings) {
-            const strs = st.stringnalyzer_results || st.strings;
-            if (typeof strs === 'object' && strs.suspicious_count) {
-                html += `<div class="det-subsection"><span class="det-sub-label">Suspicious Strings:</span><span class="det-sub-value">${strs.suspicious_count} found</span></div>`;
-            }
-        }
-
-        // Raw data fallback
-        if (!st.yara_results && !st.yara && !st.checkplz_results && !st.checkplz) {
-            html += `<pre class="det-raw">${escapeHtml(JSON.stringify(st, null, 2)).substring(0, 2000)}</pre>`;
-        }
-
-        html += `</div></div>`;
+    // Static analysis tab (reuse the richer detail-panel renderer)
+    if (data.litterbox_static && !data.litterbox_static.error) {
+        let body = `<div class="lb-result-content">${renderLbStaticResults(data.litterbox_static)}</div>`;
+        body += _detRawButton('View full static JSON', data.litterbox_static);
+        tabs.push({ id: 'det-tab-static', label: 'Static', body });
     }
 
-    // --- LitterBox Dynamic Results ---
-    if (data.litterbox_dynamic) {
-        const dyn = data.litterbox_dynamic;
-        html += `<div class="det-panel">
-            <div class="det-panel-title">DYNAMIC ANALYSIS (LitterBox)</div>
-            <div class="det-panel-body">`;
-
-        // PE-Sieve results
-        if (dyn.pe_sieve || dyn.pe_sieve_results) {
-            const ps = dyn.pe_sieve || dyn.pe_sieve_results;
-            html += `<div class="det-subsection"><span class="det-sub-label">PE-Sieve:</span>`;
-            if (typeof ps === 'object') {
-                const suspicious = ps.suspicious || ps.total_suspicious || ps.modified || 0;
-                const replaced = ps.replaced || 0;
-                html += `<span class="det-sub-value ${suspicious > 0 ? 'det-warn' : ''}">Suspicious: ${suspicious}, Replaced: ${replaced}</span>`;
-            } else {
-                html += `<span class="det-sub-value">${escapeHtml(String(ps).substring(0, 200))}</span>`;
-            }
-            html += `</div>`;
-        }
-
-        // Moneta results
-        if (dyn.moneta || dyn.moneta_results) {
-            const mon = dyn.moneta || dyn.moneta_results;
-            html += `<div class="det-subsection"><span class="det-sub-label">Moneta:</span>`;
-            if (typeof mon === 'object') {
-                const iocs = mon.ioc_count || mon.iocs || 0;
-                html += `<span class="det-sub-value ${iocs > 0 ? 'det-warn' : ''}">IOCs: ${iocs}</span>`;
-            } else {
-                html += `<span class="det-sub-value">${escapeHtml(String(mon).substring(0, 200))}</span>`;
-            }
-            html += `</div>`;
-        }
-
-        // HollowsHunter results
-        if (dyn.hollows_hunter || dyn.hollows_hunter_results) {
-            const hh = dyn.hollows_hunter || dyn.hollows_hunter_results;
-            html += `<div class="det-subsection"><span class="det-sub-label">HollowsHunter:</span>`;
-            if (typeof hh === 'object') {
-                const suspicious = hh.suspicious || hh.total_suspicious || 0;
-                html += `<span class="det-sub-value ${suspicious > 0 ? 'det-warn' : ''}">Suspicious: ${suspicious}</span>`;
-            } else {
-                html += `<span class="det-sub-value">${escapeHtml(String(hh).substring(0, 200))}</span>`;
-            }
-            html += `</div>`;
-        }
-
-        // RedEdr results
-        if (dyn.rededr || dyn.rededr_results) {
-            const re = dyn.rededr || dyn.rededr_results;
-            html += `<div class="det-subsection"><span class="det-sub-label">RedEdr:</span>`;
-            html += `<span class="det-sub-value">${escapeHtml(typeof re === 'string' ? re.substring(0, 200) : JSON.stringify(re).substring(0, 200))}</span>`;
-            html += `</div>`;
-        }
-
-        // Raw data fallback
-        if (!dyn.pe_sieve && !dyn.pe_sieve_results && !dyn.moneta && !dyn.moneta_results && !dyn.hollows_hunter && !dyn.hollows_hunter_results) {
-            html += `<pre class="det-raw">${escapeHtml(JSON.stringify(dyn, null, 2)).substring(0, 2000)}</pre>`;
-        }
-
-        html += `</div></div>`;
+    // Dynamic analysis tab
+    if (data.litterbox_dynamic && !data.litterbox_dynamic.error) {
+        let body = `<div class="lb-result-content">${renderLbDynamicResults(data.litterbox_dynamic)}</div>`;
+        body += _detRawButton('View full dynamic JSON', data.litterbox_dynamic);
+        tabs.push({ id: 'det-tab-dynamic', label: 'Dynamic', body });
     }
 
-    // --- Beacon Scan Results ---
+    // Process Output tab (agent stdout/stderr + agent server logs)
+    const exec = data.agent && data.agent.execution;
+    if (exec && (exec.stdout || exec.stderr || exec.agent_logs)) {
+        let body = '';
+        if (exec.pid) body += `<div class="det-kv"><span class="det-kv-label">PID</span><span class="det-kv-value">${escapeHtml(String(exec.pid))}</span></div>`;
+        if (exec.stdout) body += `<div class="det-sub-title">stdout</div><pre class="det-raw det-raw-tall">${escapeHtml(String(exec.stdout))}</pre>`;
+        if (exec.stderr) body += `<div class="det-sub-title">stderr</div><pre class="det-raw det-raw-tall">${escapeHtml(String(exec.stderr))}</pre>`;
+        if (exec.agent_logs) body += `<div class="det-sub-title">Agent Logs</div><pre class="det-raw det-raw-tall">${escapeHtml(String(exec.agent_logs))}</pre>`;
+        if (!exec.stdout && !exec.stderr) body = `<div class="det-sub-value muted">No process stdout/stderr captured (sample may be a GUI app or still running).</div>` + body;
+        tabs.push({ id: 'det-tab-procout', label: 'Process Output', body });
+    }
+
+    // RedEdr / EDR telemetry tab (from agent or dynamic)
+    const rededr = (data.litterbox_dynamic && (data.litterbox_dynamic.rededr || data.litterbox_dynamic.rededr_results)) || (exec && exec.edr);
+    if (rededr) {
+        const text = typeof rededr === 'string' ? rededr : JSON.stringify(rededr, null, 2);
+        const body = `<pre class="det-raw det-raw-tall">${escapeHtml(text)}</pre>` + _detRawButton('View full RedEdr JSON', rededr);
+        tabs.push({ id: 'det-tab-rededr', label: 'RedEdr / EDR', body });
+    }
+
+    // Beacon scanning tab
     const hasBeaconResults = data.hunt_sleeping_beacons || data.beaconeye;
     if (hasBeaconResults) {
-        html += `<div class="det-panel">
-            <div class="det-panel-title">BEACON SCANNING</div>
-            <div class="det-panel-body">`;
-
-        // Hunt-Sleeping-Beacons results
+        let body = '';
         if (data.hunt_sleeping_beacons) {
             const hsb = data.hunt_sleeping_beacons;
-            html += `<div class="det-subsection"><span class="det-sub-label">Hunt-Sleeping-Beacons:</span>`;
+            body += `<div class="det-sub-title">Hunt-Sleeping-Beacons</div>`;
             if (hsb.error) {
-                html += `<span class="det-sub-value det-warn">${escapeHtml(hsb.error)}</span>`;
+                body += `<div class="det-sub-value det-warn">${escapeHtml(hsb.error)}</div>`;
             } else {
                 const count = hsb.suspicious_count || 0;
-                html += `<span class="det-sub-value ${count > 0 ? 'det-warn' : ''}">`;
-                html += count > 0 ? `${count} suspicious indicator(s) found` : 'No sleeping beacons detected';
-                html += `</span>`;
-                if (hsb.findings && hsb.findings.length > 0) {
-                    html += `<div class="det-beacon-findings">`;
-                    hsb.findings.slice(0, 10).forEach(f => {
-                        const process = f.process || '';
-                        const indicators = (f.indicators || []).join('; ');
-                        html += `<div class="det-beacon-finding">`;
-                        if (process) html += `<span class="det-beacon-proc">${escapeHtml(process)}</span>`;
-                        if (indicators) html += `<span class="det-beacon-indicators">${escapeHtml(indicators)}</span>`;
-                        html += `</div>`;
-                    });
-                    html += `</div>`;
-                }
+                body += `<div class="det-sub-value ${count > 0 ? 'det-warn' : ''}">${count > 0 ? count + ' suspicious indicator(s) found' : 'No sleeping beacons detected'}</div>`;
+                (hsb.findings || []).forEach(f => {
+                    const process = f.process || '';
+                    const indicators = (f.indicators || []).join('; ');
+                    body += `<div class="det-beacon-finding">`;
+                    if (process) body += `<span class="det-beacon-proc">${escapeHtml(process)}</span>`;
+                    if (indicators) body += `<span class="det-beacon-indicators">${escapeHtml(indicators)}</span>`;
+                    body += `</div>`;
+                });
+                if (hsb.findings && hsb.findings.length) body += _detRawButton('View HSB raw', hsb);
             }
-            html += `</div>`;
         }
-
-        // BeaconEye results
         if (data.beaconeye) {
             const be = data.beaconeye;
-            html += `<div class="det-subsection"><span class="det-sub-label">BeaconEye:</span>`;
+            body += `<div class="det-sub-title">BeaconEye</div>`;
             if (be.error) {
-                html += `<span class="det-sub-value det-warn">${escapeHtml(be.error)}</span>`;
+                body += `<div class="det-sub-value det-warn">${escapeHtml(be.error)}</div>`;
             } else {
                 const count = be.beacons_found || 0;
-                html += `<span class="det-sub-value ${count > 0 ? 'det-warn' : ''}">`;
-                html += count > 0 ? `${count} CobaltStrike beacon(s) found` : 'No CobaltStrike beacons detected';
-                html += `</span>`;
-                if (be.findings && be.findings.length > 0) {
-                    html += `<div class="det-beacon-findings">`;
-                    be.findings.slice(0, 5).forEach(f => {
-                        html += `<div class="det-beacon-finding">`;
-                        html += `<span class="det-beacon-proc">${escapeHtml(f.summary || '')}</span>`;
-                        if (f.config && Object.keys(f.config).length > 0) {
-                            const cfgStr = Object.entries(f.config).slice(0, 6).map(([k, v]) => `${k}: ${v}`).join(', ');
-                            html += `<span class="det-beacon-indicators">${escapeHtml(cfgStr)}</span>`;
-                        }
-                        html += `</div>`;
-                    });
-                    html += `</div>`;
-                }
+                body += `<div class="det-sub-value ${count > 0 ? 'det-warn' : ''}">${count > 0 ? count + ' CobaltStrike beacon(s) found' : 'No CobaltStrike beacons detected'}</div>`;
+                (be.findings || []).forEach(f => {
+                    body += `<div class="det-beacon-finding"><span class="det-beacon-proc">${escapeHtml(f.summary || '')}</span>`;
+                    if (f.config && Object.keys(f.config).length > 0) {
+                        const cfgStr = Object.entries(f.config).map(([k, v]) => `${k}: ${v}`).join(', ');
+                        body += `<span class="det-beacon-indicators">${escapeHtml(cfgStr)}</span>`;
+                    }
+                    body += `</div>`;
+                });
+                if (be.findings && be.findings.length) body += _detRawButton('View BeaconEye raw', be);
             }
-            html += `</div>`;
         }
+        tabs.push({ id: 'det-tab-beacons', label: 'Beacons', body });
+    }
 
-        html += `</div></div>`;
+    // Raw JSON tab (full response)
+    tabs.push({ id: 'det-tab-raw', label: 'Raw JSON', body: `<pre class="det-raw det-raw-tall">${escapeHtml(JSON.stringify(data, null, 2))}</pre>` });
+
+    // Render the tab component
+    if (tabs.length > 0) {
+        html += `<div class="det-tabs"><div class="det-tab-nav">`;
+        tabs.forEach((t, i) => {
+            html += `<button class="det-tab-btn ${i === 0 ? 'active' : ''}" onclick="detShowTab('${t.id}', this)">${escapeHtml(t.label)}${t.count !== undefined ? ` <span class="det-tab-count">${t.count}</span>` : ''}</button>`;
+        });
+        html += `</div>`;
+        tabs.forEach((t, i) => {
+            html += `<div class="det-tab-content ${i === 0 ? '' : 'hidden'}" id="${t.id}">${t.body}</div>`;
+        });
+        html += `</div>`;
     }
 
     // Update beacon stage card if results arrived
