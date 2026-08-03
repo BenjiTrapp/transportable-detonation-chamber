@@ -3501,9 +3501,17 @@ def api_file_pe():
         return jsonify({"error": "pefile module not installed"}), 500
 
     try:
-        pe = pefile.PE(norm_path, fast_load=False)
+        # Read the bytes ourselves and hand them to pefile via data= rather than
+        # letting pefile mmap the path. mmap fails with [Errno 22] on Windows when
+        # the file is locked (e.g. AV scanning a sample in TEMP), and reading the
+        # bytes also avoids holding a file handle open on the sample.
+        with open(norm_path, "rb") as f:
+            pe_bytes = f.read()
+        pe = pefile.PE(data=pe_bytes, fast_load=False)
     except pefile.PEFormatError as e:
         return jsonify({"error": f"Not a valid PE file: {e}"}), 400
+    except (IOError, OSError) as e:
+        return jsonify({"error": f"Unable to read file: {e}"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -3726,9 +3734,15 @@ def api_file_pe_section():
         return jsonify({"error": "pefile module not installed"}), 500
 
     try:
-        pe = pefile.PE(norm_path, fast_load=False)
+        # See api_file_pe: read bytes and pass via data= to avoid mmap [Errno 22]
+        # on Windows when the sample file is locked by AV.
+        with open(norm_path, "rb") as f:
+            pe_bytes = f.read()
+        pe = pefile.PE(data=pe_bytes, fast_load=False)
     except pefile.PEFormatError as e:
         return jsonify({"error": f"Not a valid PE file: {e}"}), 400
+    except (IOError, OSError) as e:
+        return jsonify({"error": f"Unable to read file: {e}"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
