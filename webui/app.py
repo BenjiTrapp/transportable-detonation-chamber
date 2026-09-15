@@ -4036,6 +4036,159 @@ def api_file_pe():
     return jsonify(result)
 
 
+def _parse_cert_subject(dn):
+    """Pull a human-friendly name out of an X.500 DN string.
+    Returns the CN if present, else the O, else the raw DN."""
+    if not dn:
+        return ""
+    fields = {}
+    # DNs look like "CN=Microsoft Corporation, O=Microsoft Corporation, C=US".
+    for part in dn.split(","):
+        if "=" in part:
+            k, _, v = part.partition("=")
+            fields.setdefault(k.strip().upper(), v.strip())
+    return fields.get("CN") or fields.get("O") or dn.strip()
+
+
+def _pe_embedded_signature(pe):
+    """Report whether the PE carries an embedded Authenticode signature
+    (the IMAGE_DIRECTORY_ENTRY_SECURITY / certificate table)."""
+    import pefile
+    try:
+        idx = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_SECURITY"]
+        sec_dir = pe.OPTIONAL_HEADER.DATA_DIRECTORY[idx]
+        return {
+            "has_embedded": bool(sec_dir.VirtualAddress and sec_dir.Size),
+            "offset": hex(sec_dir.VirtualAddress) if sec_dir.VirtualAddress else None,
+            "size": sec_dir.Size,
+        }
+    except Exception:
+        return {"has_embedded": False, "offset": None, "size": 0}
+
+
+def _authenticode_verify(norm_path):
+    """Run Get-AuthenticodeSignature to determine the signer and trust status.
+    Windows-only; returns None when PowerShell is unavailable (e.g. dev on macOS)."""
+    escaped = norm_path.replace("'", "''")
+    # Force UTF-8 output: Get-AuthenticodeSignature's StatusMessage is localized
+    # (e.g. German "Signatur wurde überprüft.") and non-ASCII bytes crash the
+    # subprocess reader thread under text=True, yielding empty stdout. We capture
+    # bytes and decode with errors='replace' below. Also silence the progress stream.
+    ps_cmd = (
+        "$OutputEncoding=[Text.Encoding]::UTF8;"
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+        "$ProgressPreference='SilentlyContinue';"
+        f"$s = Get-AuthenticodeSignature -LiteralPath '{escaped}';"
+        "$o = [ordered]@{ status = $s.Status.ToString(); status_message = $s.StatusMessage };"
+        "if ($s.SignerCertificate) { $c = $s.SignerCertificate;"
+        "  $o.signer_subject = $c.Subject; $o.signer_issuer = $c.Issuer;"
+        "  $o.signer_thumbprint = $c.Thumbprint; $o.signer_serial = $c.SerialNumber;"
+        "  $o.not_before = $c.NotBefore.ToString('o'); $o.not_after = $c.NotAfter.ToString('o') };"
+        "if ($s.TimeStamperCertificate) { $t = $s.TimeStamperCertificate;"
+        "  $o.timestamp_subject = $t.Subject; $o.timestamp_thumbprint = $t.Thumbprint };"
+        "[PSCustomObject]$o | ConvertTo-Json -Compress"
+    )
+    try:
+        # Capture bytes (not text=True) and decode ourselves with errors='replace'
+        # so localized non-ASCII output can't crash the reader thread.
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True, timeout=25,
+        )
+    except (FileNotFoundError, OSError):
+        return None  # No PowerShell here (non-Windows host).
+    except subprocess.TimeoutExpired:
+        return {"status": "UnknownError", "status_message": "Signature verification timed out"}
+    out = (result.stdout or b"").decode("utf-8", errors="replace").strip()
+    if not out:
+        err = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+        return {"status": "UnknownError",
+                "status_message": err or "No output from Get-AuthenticodeSignature"}
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return {"status": "UnknownError", "status_message": "Unparseable signature output"}
+
+
+@app.route("/api/file/signature")
+def api_file_signature():
+    """Report who signed a file (Authenticode) and whether the signature is trusted.
+
+    Combines the embedded certificate-table check (cross-platform, via pefile)
+    with Windows' Get-AuthenticodeSignature for signer identity + trust status
+    (which also covers catalog-signed OS binaries with no embedded signature).
+    """
+    filepath = request.args.get("path", "")
+    if not filepath:
+        return jsonify({"error": "No path specified"}), 400
+
+    norm_path = os.path.normpath(filepath)
+    if not os.path.isfile(norm_path):
+        return jsonify({"error": _quarantine_hint(norm_path, "File not found")}), 404
+
+    try:
+        import pefile  # noqa: F401  (module-level alias used by helpers)
+    except ImportError:
+        return jsonify({"error": "pefile module not installed"}), 500
+
+    result = {"path": filepath}
+
+    # 1. Embedded certificate table (works anywhere). Non-fatal for non-PE files —
+    # Get-AuthenticodeSignature still works for scripts, MSI, catalog-signed files.
+    try:
+        with open(norm_path, "rb") as f:
+            pe_bytes = f.read()
+        pe = pefile.PE(data=pe_bytes, fast_load=True)
+        result["embedded"] = _pe_embedded_signature(pe)
+        pe.close()
+    except pefile.PEFormatError:
+        result["embedded"] = {"has_embedded": False, "offset": None, "size": 0, "not_pe": True}
+    except (IOError, OSError) as e:
+        return jsonify({"error": _quarantine_hint(norm_path, f"Unable to read file: {e}")}), 500
+    except Exception as e:
+        result["embedded"] = {"has_embedded": False, "offset": None, "size": 0, "error": str(e)}
+
+    # 2. Authenticode signer + trust status (Windows only).
+    auth = _authenticode_verify(norm_path)
+    if auth is None:
+        # No PowerShell: fall back to the embedded-table indicator alone.
+        has = result["embedded"]["has_embedded"]
+        result["signed"] = has
+        result["status"] = "EmbeddedSignaturePresent" if has else "NotSigned"
+        result["verification_available"] = False
+        result["note"] = ("Signer identity and trust could not be verified here "
+                           "(PowerShell/Get-AuthenticodeSignature unavailable on this host). "
+                           "Run the analysis on the Windows VM for full signer details.")
+        return jsonify(result)
+
+    status = auth.get("status", "UnknownError")
+    result["verification_available"] = True
+    result["status"] = status
+    result["status_message"] = auth.get("status_message", "")
+    result["signed"] = status not in ("NotSigned", "NotSupportedFileFormat")
+    result["trusted"] = status == "Valid"
+
+    if auth.get("signer_subject"):
+        result["signer"] = {
+            "name": _parse_cert_subject(auth.get("signer_subject")),
+            "subject": auth.get("signer_subject"),
+            "issuer": auth.get("signer_issuer", ""),
+            "issuer_name": _parse_cert_subject(auth.get("signer_issuer", "")),
+            "thumbprint": auth.get("signer_thumbprint", ""),
+            "serial": auth.get("signer_serial", ""),
+            "valid_from": auth.get("not_before", ""),
+            "valid_to": auth.get("not_after", ""),
+        }
+    if auth.get("timestamp_subject"):
+        result["timestamp"] = {
+            "name": _parse_cert_subject(auth.get("timestamp_subject")),
+            "subject": auth.get("timestamp_subject"),
+            "thumbprint": auth.get("timestamp_thumbprint", ""),
+        }
+
+    return jsonify(result)
+
+
 @app.route("/api/file/pe/section")
 def api_file_pe_section():
     """Return detailed data for a specific PE section including hex dump and strings."""

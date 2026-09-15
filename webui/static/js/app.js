@@ -1761,6 +1761,84 @@ async function peAnalyze() {
     }
 }
 
+// Check the file's Authenticode signature (who signed it + trust status).
+async function checkFileSignature() {
+    const filepath = state.hexFilePath || document.getElementById('hex-filepath').value.trim();
+    const sigBody = document.getElementById('pe-sig-body');
+    if (!sigBody) return;
+    if (!filepath) {
+        sigBody.innerHTML = '<div class="pe-error">No file loaded.</div>';
+        return;
+    }
+    sigBody.innerHTML = '<div class="pe-loading"><div class="loading-spinner"></div><span>Verifying signature...</span></div>';
+    try {
+        LoadingSpinner.start();
+        const resp = await fetch(`/api/file/signature?path=${encodeURIComponent(filepath)}`);
+        const data = await resp.json();
+        LoadingSpinner.stop();
+        if (data.error) {
+            sigBody.innerHTML = `<div class="pe-error">${escapeHtml(data.error)}</div>`;
+            return;
+        }
+        sigBody.innerHTML = renderSignature(data);
+    } catch (e) {
+        LoadingSpinner.stop();
+        sigBody.innerHTML = `<div class="pe-error">Failed: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function renderSignature(data) {
+    // Map Authenticode status to a verdict badge.
+    const status = data.status || 'UnknownError';
+    const statusMeta = {
+        Valid: { cls: 'ok', label: 'VALID & TRUSTED' },
+        NotSigned: { cls: 'bad', label: 'NOT SIGNED' },
+        HashMismatch: { cls: 'bad', label: 'HASH MISMATCH (tampered)' },
+        NotTrusted: { cls: 'warn', label: 'SIGNED — NOT TRUSTED' },
+        UnknownError: { cls: 'warn', label: 'UNKNOWN' },
+        NotSupportedFileFormat: { cls: 'dim', label: 'UNSUPPORTED FORMAT' },
+        EmbeddedSignaturePresent: { cls: 'warn', label: 'EMBEDDED SIGNATURE (unverified)' },
+    };
+    const meta = statusMeta[status] || { cls: 'warn', label: escapeHtml(status) };
+
+    let html = `<div class="pe-sig-status ${meta.cls}">${meta.label}</div>`;
+    if (data.status_message) {
+        html += `<div class="pe-sig-msg">${escapeHtml(data.status_message)}</div>`;
+    }
+
+    const s = data.signer;
+    if (s) {
+        html += '<div class="pe-sig-fields">';
+        html += `<div class="pe-field"><span class="pe-label">Signed by</span><span class="pe-value pe-sig-signer">${escapeHtml(s.name || '')}</span></div>`;
+        if (s.subject) html += `<div class="pe-field"><span class="pe-label">Subject</span><span class="pe-value mono">${escapeHtml(s.subject)}</span></div>`;
+        if (s.issuer_name) html += `<div class="pe-field"><span class="pe-label">Issued by (CA)</span><span class="pe-value">${escapeHtml(s.issuer_name)}</span></div>`;
+        if (s.valid_from || s.valid_to) html += `<div class="pe-field"><span class="pe-label">Cert validity</span><span class="pe-value">${escapeHtml((s.valid_from || '?').slice(0,10))} → ${escapeHtml((s.valid_to || '?').slice(0,10))}</span></div>`;
+        if (s.thumbprint) html += `<div class="pe-field"><span class="pe-label">Thumbprint</span><span class="pe-value mono">${escapeHtml(s.thumbprint)}</span></div>`;
+        if (s.serial) html += `<div class="pe-field"><span class="pe-label">Serial</span><span class="pe-value mono">${escapeHtml(s.serial)}</span></div>`;
+        html += '</div>';
+    } else if (data.signed) {
+        html += '<div class="pe-sig-msg">A signature is present but signer details could not be extracted.</div>';
+    }
+
+    if (data.timestamp) {
+        html += `<div class="pe-sig-fields"><div class="pe-field"><span class="pe-label">Timestamped by</span><span class="pe-value">${escapeHtml(data.timestamp.name || '')}</span></div></div>`;
+    }
+
+    // Embedded vs catalog signing indicator.
+    if (data.embedded) {
+        const emb = data.embedded.has_embedded
+            ? `Embedded (certificate table, ${data.embedded.size} bytes)`
+            : (data.signed ? 'Catalog-signed (no embedded certificate table)' : 'None');
+        html += `<div class="pe-sig-fields"><div class="pe-field"><span class="pe-label">Signature location</span><span class="pe-value">${escapeHtml(emb)}</span></div></div>`;
+    }
+
+    if (data.verification_available === false && data.note) {
+        html += `<div class="pe-sig-note">${escapeHtml(data.note)}</div>`;
+    }
+
+    return html;
+}
+
 /**
  * DiE-style Detection Overview — renders a visual panel showing:
  * 1. Assessment badge (CLEAN/PACKED/ENCRYPTED/PROTECTED)
@@ -1997,6 +2075,14 @@ function renderPeAnalysis(pe, container) {
     </div>`;
 
     html += '</div>'; // end overview grid
+
+    // --- Digital Signature (on-demand: signer verification needs PowerShell) ---
+    html += `<div class="pe-sig-section" id="pe-sig-section">
+        <div class="pe-card-title">DIGITAL SIGNATURE</div>
+        <div class="pe-sig-body" id="pe-sig-body">
+            <button class="pe-sig-btn" onclick="checkFileSignature()">&#128273; Check who signed this file</button>
+        </div>
+    </div>`;
 
     // --- Sections Table with entropy bars ---
     html += '<div class="pe-section-table">';
@@ -4013,6 +4099,7 @@ const graphState = {
     downDepth: 0,         // descendant depth (0 = all, capped server-side)
     data: null,           // last /api/process-graph payload
     emptyMessage: '',     // message shown on the canvas when there are no nodes
+    isLoading: false,     // true while /api/process-graph is being fetched
 };
 
 // Programmatically focus the process graph on a PID (used by alert/process pivots).
@@ -4052,8 +4139,14 @@ async function graphRefresh() {
     }
     hideGraphLanding();
 
+    // Show the spinner while fetching; the empty "no data" message is only
+    // rendered once the request has resolved with nothing to show.
     const depth = graphState.downDepth || 0;
     let payload = null;
+    graphState.isLoading = true;
+    graphState.emptyMessage = '';
+    showGraphLoading();
+    renderBreadcrumb();
     try {
         const resp = await fetch(`/api/process-graph?pid=${encodeURIComponent(graphState.focusPid)}&down_depth=${depth}&max_nodes=400`);
         payload = await resp.json();
@@ -4073,6 +4166,9 @@ async function graphRefresh() {
         graphState.emptyMessage = 'Failed to load process graph: ' + e.message;
         renderGraph();
         return;
+    } finally {
+        graphState.isLoading = false;
+        hideGraphLoading();
     }
 
     graphState.data = payload;
@@ -4080,6 +4176,16 @@ async function graphRefresh() {
     graphFitView();
     renderGraph();
     renderBreadcrumb();
+}
+
+function showGraphLoading() {
+    const el = document.getElementById('graph-loading');
+    if (el) el.hidden = false;
+}
+
+function hideGraphLoading() {
+    const el = document.getElementById('graph-loading');
+    if (el) el.hidden = true;
 }
 
 async function renderGraphLanding() {
@@ -4665,8 +4771,10 @@ function renderGraph() {
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Empty state message
+    // Empty state message (suppressed while a fetch is in flight — the
+    // #graph-loading overlay shows a spinner during that window instead).
     if (nodes.length === 0) {
+        if (graphState.isLoading) return;
         ctx.save();
         ctx.fillStyle = '#64748b';
         ctx.font = '14px monospace';
@@ -4912,6 +5020,26 @@ function hideGraphTooltip() {
     if (tooltip) tooltip.style.display = 'none';
 }
 
+// Check the Authenticode signature of a process image from the graph detail panel.
+// Reuses renderSignature() from the PE-analysis view (shared .pe-sig-* markup).
+async function graphCheckSignature(path) {
+    const sigBody = document.getElementById('gd-sig-body');
+    if (!sigBody) return;
+    if (!path) { sigBody.innerHTML = '<div class="pe-error">No image path for this process.</div>'; return; }
+    sigBody.innerHTML = '<div class="pe-loading"><div class="loading-spinner"></div><span>Verifying signature...</span></div>';
+    try {
+        LoadingSpinner.start();
+        const resp = await fetch(`/api/file/signature?path=${encodeURIComponent(path)}`);
+        const data = await resp.json();
+        LoadingSpinner.stop();
+        if (data.error) { sigBody.innerHTML = `<div class="pe-error">${escapeHtml(data.error)}</div>`; return; }
+        sigBody.innerHTML = renderSignature(data);
+    } catch (e) {
+        LoadingSpinner.stop();
+        sigBody.innerHTML = `<div class="pe-error">Failed: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
 function showGraphDetail(node) {
     const panel = document.getElementById('graph-detail-panel');
     const header = document.getElementById('graph-detail-header');
@@ -4955,6 +5083,12 @@ function showGraphDetail(node) {
         html += `<div class="gd-activity-cell"><span class="gd-act-num">${act.registry || 0}</span><span class="gd-act-label">Registry</span></div>`;
         html += `<div class="gd-activity-cell"><span class="gd-act-num">${act.injection || 0}</span><span class="gd-act-label">Injection</span></div>`;
         html += `</div>`;
+
+        // Digital signature (on-demand: signer verification runs Get-AuthenticodeSignature)
+        if (node.image) {
+            html += `<div class="gd-section">Digital Signature</div>`;
+            html += `<div class="gd-sig-body" id="gd-sig-body"><button class="gd-sig-btn" data-sig-path="${escapeHtml(node.image)}">&#128273; Check who signed this</button></div>`;
+        }
 
         // Connections from this node
         const connections = graphState.edges.filter(e => e.source === node.id || e.target === node.id);
@@ -5081,6 +5215,12 @@ function showGraphDetail(node) {
     const focusBtn = body.querySelector('.gd-focus-btn[data-focus-pid]');
     if (focusBtn) {
         focusBtn.addEventListener('click', () => focusProcessGraph(focusBtn.dataset.focusPid));
+    }
+
+    // Check who signed this process's image (Authenticode)
+    const sigBtn = body.querySelector('.gd-sig-btn[data-sig-path]');
+    if (sigBtn) {
+        sigBtn.addEventListener('click', () => graphCheckSignature(sigBtn.dataset.sigPath));
     }
 
     // Wire up clickable links in the detail panel
