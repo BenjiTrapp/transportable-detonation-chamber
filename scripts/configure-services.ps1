@@ -79,17 +79,25 @@ Write-Host "`n--- Sample Directories ---" -ForegroundColor Cyan
 $infectedDir = "C:\Users\vagrant\Desktop\infected"
 New-Item -ItemType Directory -Path $infectedDir -Force | Out-Null
 New-Item -ItemType Directory -Path "C:\samples" -Force | Out-Null
+# The Web UI (running as SYSTEM) stages Hex Editor / PE Analysis uploads under
+# %TEMP%\hex_uploads, which is C:\WINDOWS\TEMP\hex_uploads for the SYSTEM account.
+# Pre-create and exclude it so uploaded malware (e.g. mimikatz) isn't quarantined
+# before it can be read for analysis.
+$hexUploadsSystem = "C:\WINDOWS\TEMP\hex_uploads"
+New-Item -ItemType Directory -Path $hexUploadsSystem -Force | Out-Null
 # Exclude sample directories from Windows Defender so malware samples aren't quarantined
 Add-MpPreference -ExclusionPath $infectedDir -ErrorAction SilentlyContinue
 Add-MpPreference -ExclusionPath "C:\samples" -ErrorAction SilentlyContinue
 Add-MpPreference -ExclusionPath "C:\Users\Public\Downloads" -ErrorAction SilentlyContinue
 Add-MpPreference -ExclusionPath "C:\LitterBox" -ErrorAction SilentlyContinue
 Add-MpPreference -ExclusionPath "C:\tools\detection-rules" -ErrorAction SilentlyContinue
+Add-MpPreference -ExclusionPath $hexUploadsSystem -ErrorAction SilentlyContinue
 Write-Host "[+] Sample directories created and excluded from Defender" -ForegroundColor Green
 Write-Host "    Desktop\infected: $infectedDir" -ForegroundColor Gray
 Write-Host "    Samples:          C:\samples" -ForegroundColor Gray
 Write-Host "    Agent drop dir:   C:\Users\Public\Downloads" -ForegroundColor Gray
 Write-Host "    LitterBox:        C:\LitterBox" -ForegroundColor Gray
+Write-Host "    Hex uploads:      $hexUploadsSystem" -ForegroundColor Gray
 
 # --- 1. Start Fibratus ---
 Write-Host "`n--- Fibratus ---" -ForegroundColor Cyan

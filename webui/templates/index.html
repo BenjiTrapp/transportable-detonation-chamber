@@ -217,35 +217,30 @@
             <div class="tab-content" id="tab-graph">
                 <div class="graph-toolbar">
                     <div class="graph-toolbar-left">
-                        <span class="graph-title">PROCESS ROLLUP GRAPH</span>
-                        <span class="graph-subtitle" id="graph-node-count">0 nodes, 0 edges</span>
+                        <span class="graph-title">PROCESS GRAPH</span>
+                        <span class="graph-subtitle" id="graph-node-count">Select a process to investigate</span>
                     </div>
                     <div class="graph-toolbar-right">
                         <div class="graph-search-wrapper">
-                            <input type="text" id="graph-search" class="graph-search-input" placeholder="Search process / filename..." autocomplete="off" spellcheck="false">
+                            <input type="text" id="graph-search" class="graph-search-input" placeholder="Focus PID or process name..." autocomplete="off" spellcheck="false">
                             <span class="graph-search-icon">&#128269;</span>
                             <span class="graph-search-clear" id="graph-search-clear">&times;</span>
                         </div>
-                        <div class="graph-time-filter">
-                            <button class="graph-time-btn" data-seconds="30">30s</button>
-                            <button class="graph-time-btn" data-seconds="60">1m</button>
-                            <button class="graph-time-btn" data-seconds="300">5m</button>
-                            <button class="graph-time-btn" data-seconds="900">15m</button>
-                            <button class="graph-time-btn" data-seconds="3600">1h</button>
-                            <button class="graph-time-btn" data-seconds="86400">24h</button>
-                            <button class="graph-time-btn active" data-seconds="0">All</button>
-                        </div>
+                        <button class="btn btn-sm" id="graph-focus-go" onclick="graphSubmitFocus()">Focus</button>
                         <label class="graph-toggle"><input type="checkbox" id="graph-show-network" checked> Network</label>
                         <label class="graph-toggle"><input type="checkbox" id="graph-show-dns" checked> DNS</label>
                         <label class="graph-toggle"><input type="checkbox" id="graph-show-files"> Files</label>
                         <label class="graph-toggle"><input type="checkbox" id="graph-show-registry"> Registry</label>
-                        <label class="graph-toggle detonated"><input type="checkbox" id="graph-show-detonated"> Detonated</label>
+                        <select id="graph-depth" class="filter-select" title="Descendant depth">
+                            <option value="0" selected>All subtasks</option>
+                            <option value="1">1 level</option>
+                            <option value="2">2 levels</option>
+                            <option value="3">3 levels</option>
+                            <option value="5">5 levels</option>
+                        </select>
                         <select id="graph-layout" class="filter-select">
+                            <option value="tree" selected>Process tree</option>
                             <option value="force">Force-directed</option>
-                            <option value="hierarchy" selected>Hierarchical</option>
-                            <option value="radial">Radial</option>
-                            <option value="circular">Circular</option>
-                            <option value="grid">Grid</option>
                         </select>
                         <div class="graph-zoom-controls">
                             <button class="btn btn-sm graph-zoom-btn" onclick="graphZoomIn()" title="Zoom in">+</button>
@@ -256,8 +251,10 @@
                         <button class="btn btn-sm" onclick="graphRefresh()">Refresh</button>
                     </div>
                 </div>
+                <div class="graph-breadcrumb" id="graph-breadcrumb"></div>
                 <div class="graph-container" id="graph-container">
                     <canvas id="graph-canvas"></canvas>
+                    <div class="graph-landing" id="graph-landing"></div>
                     <div class="graph-tooltip" id="graph-tooltip"></div>
                     <div class="graph-legend">
                         <span class="graph-legend-item"><span class="graph-legend-dot" style="background:#3b82f6"></span>Process</span>

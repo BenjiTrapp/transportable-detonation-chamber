@@ -1364,6 +1364,316 @@ def api_processes():
     return jsonify(compact_result)
 
 
+def _basename(path):
+    """Return the last path component of a Windows/Unix path."""
+    if not path:
+        return ""
+    return path.replace("/", "\\").rstrip("\\").split("\\")[-1] or path
+
+
+def _proc_max_severity(proc):
+    """Highest alert severity for a process (as string)."""
+    order = {"critical": 4, "high": 3, "medium": 2, "low": 1, "unknown": 0}
+    best = "unknown"
+    for a in proc.get("alerts", []):
+        sev = (a.get("severity") or "unknown").lower()
+        if order.get(sev, 0) > order.get(best, 0):
+            best = sev
+    return best
+
+
+def _build_full_process_map():
+    """Merge the authoritative Sysmon EID-1 process tree with alert-derived
+    enrichment into a single {pid(str): proc} map with a `children` list.
+
+    Returns (proc_map, sysmon_events) where sysmon_events is the raw event list
+    (all relevant EIDs) so the caller can attach scoped activity. If Sysmon is
+    unavailable locally, falls back to the alert-only process tree.
+    """
+    proc_map = {}
+    sysmon_events = []
+
+    if _is_sysmon_running():
+        # One PowerShell call covering process-create + all activity EIDs we render.
+        sysmon_events = _read_sysmon_events(
+            max_events=4000,
+            event_ids=[1, 3, 8, 11, 12, 13, 14, 22],
+        )
+        if not isinstance(sysmon_events, list):
+            sysmon_events = []
+        # Events with an "error" key mean the query failed — ignore them.
+        sysmon_events = [e for e in sysmon_events if isinstance(e, dict) and "error" not in e]
+
+        # Build process nodes from EID 1 (ProcessCreate). Events arrive
+        # newest-first; keep the newest identity per PID (handles PID reuse).
+        for ev in sysmon_events:
+            if ev.get("event_id") != 1:
+                continue
+            pid = ev.get("pid")
+            if pid is None or str(pid) == "":
+                continue
+            pid = str(pid)
+            ts = ev.get("timestamp", "")
+            existing = proc_map.get(pid)
+            if existing and (existing.get("first_seen") or "") >= ts:
+                continue
+            ppid = ev.get("parent_pid")
+            proc_map[pid] = {
+                "pid": pid,
+                "name": _basename(ev.get("image", "")) or "unknown",
+                "image": ev.get("image", ""),
+                "command_line": ev.get("commandline", ""),
+                "user": ev.get("user", ""),
+                "parent_pid": str(ppid) if ppid not in (None, "") else None,
+                "parent_name": _basename(ev.get("parent_image", "")),
+                "integrity": ev.get("integrity", ""),
+                "hashes": ev.get("hashes", ""),
+                "first_seen": ts,
+                "last_seen": ts,
+                "exit_time": None,
+                "children": [],
+                "activity": {"file": 0, "network": 0, "dns": 0, "registry": 0,
+                             "injection": 0, "threats": 0},
+                "alerts_count": 0,
+                "severity": "unknown",
+                "detonated": False,
+                "detonation_sources": [],
+                "source": "sysmon",
+            }
+
+    # Merge alert-derived enrichment (threats, severity, detonation, activity).
+    with store_lock:
+        alert_procs = dict(events_store.get("processes", {}))
+
+    for pid, aproc in alert_procs.items():
+        pid = str(pid)
+        node = proc_map.get(pid)
+        if node is None:
+            # Alert-only process (no Sysmon ProcessCreate seen) — include it.
+            node = {
+                "pid": pid,
+                "name": aproc.get("name", "unknown"),
+                "image": aproc.get("image", ""),
+                "command_line": aproc.get("command_line", ""),
+                "user": aproc.get("user", ""),
+                "parent_pid": str(aproc["parent_pid"]) if aproc.get("parent_pid") not in (None, "") else None,
+                "parent_name": aproc.get("parent_name", ""),
+                "integrity": aproc.get("integrity", ""),
+                "hashes": "",
+                "first_seen": aproc.get("first_seen", ""),
+                "last_seen": aproc.get("last_seen", ""),
+                "exit_time": aproc.get("exit_time"),
+                "children": [],
+                "activity": {"file": 0, "network": 0, "dns": 0, "registry": 0,
+                             "injection": 0, "threats": 0},
+                "alerts_count": 0,
+                "severity": "unknown",
+                "detonated": False,
+                "detonation_sources": [],
+                "source": "alert",
+            }
+            proc_map[pid] = node
+        else:
+            node["source"] = "sysmon+alert"
+            # Prefer alert parent linkage if Sysmon lacked one.
+            if not node.get("parent_pid") and aproc.get("parent_pid") not in (None, ""):
+                node["parent_pid"] = str(aproc["parent_pid"])
+            if not node.get("name") or node["name"] == "unknown":
+                node["name"] = aproc.get("name", node["name"])
+            if not node.get("image"):
+                node["image"] = aproc.get("image", "")
+            if not node.get("command_line"):
+                node["command_line"] = aproc.get("command_line", "")
+
+        # Enrichment from the alert tree.
+        act = aproc.get("activity", {})
+        node["activity"]["threats"] = act.get("threats", 0)
+        node["activity"]["file"] = act.get("file", 0)
+        node["activity"]["network"] = act.get("network", 0)
+        node["activity"]["dns"] = act.get("dns", 0)
+        node["activity"]["registry"] = act.get("registry", 0)
+        node["activity"]["injection"] = act.get("injection", 0)
+        node["alerts_count"] = len(aproc.get("alerts", []))
+        node["severity"] = _proc_max_severity(aproc)
+        node["detonated"] = bool(aproc.get("detonated"))
+        node["detonation_sources"] = aproc.get("detonation_sources", [])
+        if aproc.get("exit_time"):
+            node["exit_time"] = aproc["exit_time"]
+        if aproc.get("last_seen") and aproc["last_seen"] > (node.get("last_seen") or ""):
+            node["last_seen"] = aproc["last_seen"]
+
+    # Rebuild children links across the merged map.
+    for node in proc_map.values():
+        node["children"] = []
+    for pid, node in proc_map.items():
+        ppid = node.get("parent_pid")
+        if ppid and ppid != pid and ppid in proc_map:
+            proc_map[ppid]["children"].append(pid)
+
+    return proc_map, sysmon_events
+
+
+@app.route("/api/process-graph")
+def api_process_graph():
+    """Focused process-graph drilldown rooted on a single PID.
+
+    Query params:
+        pid: root process id (required)
+        down_depth: descendant depth to expand (default 0 = unlimited)
+        up_depth: ancestor levels to include (default 0 = all the way to root)
+        max_nodes: safety cap on total process nodes (default 400)
+
+    Returns the root's ancestor chain + descendant subtree plus the network,
+    DNS, file, registry and injection activity scoped to that process set.
+    """
+    root_pid = request.args.get("pid", type=str)
+    if not root_pid:
+        return jsonify({"error": "pid parameter is required"}), 400
+    root_pid = str(root_pid)
+    down_depth = request.args.get("down_depth", 0, type=int)
+    up_depth = request.args.get("up_depth", 0, type=int)
+    max_nodes = request.args.get("max_nodes", 400, type=int)
+
+    # If Sysmon is offline locally, proxy to the VM (same codebase there).
+    if not _is_sysmon_running() and VM_WEBUI_URL:
+        try:
+            r = requests.get(f"{VM_WEBUI_URL}/api/process-graph",
+                             params=request.args, timeout=15)
+            if r.status_code == 200:
+                return jsonify(r.json())
+        except Exception:
+            pass
+
+    proc_map, sysmon_events = _build_full_process_map()
+
+    if root_pid not in proc_map:
+        return jsonify({
+            "error": f"Process {root_pid} not found",
+            "root_pid": root_pid,
+            "processes": {}, "network": [], "dns": [],
+            "files": [], "registry": [], "injections": [],
+        }), 404
+
+    selected = {}  # pid -> role metadata
+
+    # Ancestors: walk parent_pid up.
+    ancestors = []
+    cur = proc_map[root_pid].get("parent_pid")
+    seen_anc = {root_pid}
+    level = 0
+    while cur and cur in proc_map and cur not in seen_anc:
+        if up_depth and level >= up_depth:
+            break
+        ancestors.append(cur)
+        seen_anc.add(cur)
+        level += 1
+        cur = proc_map[cur].get("parent_pid")
+    for i, apid in enumerate(ancestors):
+        selected[apid] = {"is_root": False, "is_ancestor": True, "depth": -(i + 1)}
+
+    # Root + descendants: BFS down children.
+    selected[root_pid] = {"is_root": True, "is_ancestor": False, "depth": 0}
+    truncated = False
+    queue = [(root_pid, 0)]
+    while queue:
+        pid, depth = queue.pop(0)
+        if down_depth and depth >= down_depth:
+            continue
+        for child in proc_map[pid].get("children", []):
+            if child in selected:
+                continue
+            if len(selected) >= max_nodes:
+                truncated = True
+                break
+            selected[child] = {"is_root": False, "is_ancestor": False, "depth": depth + 1}
+            queue.append((child, depth + 1))
+        if len(selected) >= max_nodes:
+            truncated = True
+            break
+
+    selected_pids = set(selected.keys())
+
+    # Assemble process payload (children restricted to the selected set).
+    processes = {}
+    for pid in selected_pids:
+        node = dict(proc_map[pid])
+        node["children"] = [c for c in node.get("children", []) if c in selected_pids]
+        node.update(selected[pid])
+        processes[pid] = node
+
+    # Scope activity events to the selected process set.
+    network, dns, files, registry, injections = [], [], [], [], []
+    for ev in sysmon_events:
+        eid = ev.get("event_id")
+        pid = str(ev.get("pid")) if ev.get("pid") is not None else ""
+        if eid == 3 and pid in selected_pids:
+            network.append({"pid": pid, "dst_ip": ev.get("dst_ip", ""),
+                            "dst_port": ev.get("dst_port", ""),
+                            "dst_hostname": ev.get("dst_hostname", ""),
+                            "protocol": ev.get("protocol", "tcp"),
+                            "timestamp": ev.get("timestamp", "")})
+        elif eid == 22 and pid in selected_pids:
+            dns.append({"pid": pid, "query": ev.get("query", ""),
+                        "result": ev.get("result", ""),
+                        "timestamp": ev.get("timestamp", "")})
+        elif eid == 11 and pid in selected_pids:
+            files.append({"pid": pid, "target": ev.get("target", ""),
+                          "timestamp": ev.get("timestamp", "")})
+        elif eid in (12, 13, 14) and pid in selected_pids:
+            registry.append({"pid": pid, "target": ev.get("target", ""),
+                             "details": ev.get("details", ""),
+                             "timestamp": ev.get("timestamp", "")})
+        elif eid == 8:
+            spid = str(ev.get("source_pid")) if ev.get("source_pid") is not None else pid
+            tpid = str(ev.get("target_pid")) if ev.get("target_pid") is not None else ""
+            if spid in selected_pids and tpid in selected_pids:
+                injections.append({"source_pid": spid, "target_pid": tpid,
+                                   "target_image": ev.get("target_image", ""),
+                                   "timestamp": ev.get("timestamp", "")})
+
+    return jsonify({
+        "root_pid": root_pid,
+        "truncated": truncated,
+        "node_count": len(processes),
+        "processes": processes,
+        "network": network,
+        "dns": dns,
+        "files": files,
+        "registry": registry,
+        "injections": injections,
+    })
+
+
+@app.route("/api/process-graph/roots")
+def api_process_graph_roots():
+    """Candidate root processes for the drilldown landing picker:
+    detonated samples and highest-threat processes."""
+    with store_lock:
+        procs = dict(events_store.get("processes", {}))
+
+    candidates = []
+    for pid, proc in procs.items():
+        threats = proc.get("activity", {}).get("threats", 0)
+        detonated = bool(proc.get("detonated"))
+        if threats <= 0 and not detonated:
+            continue
+        candidates.append({
+            "pid": str(pid),
+            "name": proc.get("name", "unknown"),
+            "image": proc.get("image", ""),
+            "threats": threats,
+            "severity": _proc_max_severity(proc),
+            "detonated": detonated,
+            "detonation_sources": proc.get("detonation_sources", []),
+            "children_count": len(proc.get("children", [])),
+            "first_seen": proc.get("first_seen", ""),
+        })
+
+    # Detonated first, then by threat count.
+    candidates.sort(key=lambda c: (c["detonated"], c["threats"]), reverse=True)
+    return jsonify(candidates[:50])
+
+
 @app.route("/api/sysmon")
 def api_sysmon():
     """Get recent Sysmon events from Windows Event Log."""
@@ -3484,6 +3794,20 @@ def detect_elf_characteristics(data, sections_info, security_info, has_pie, inte
     }
 
 
+def _quarantine_hint(path, base_msg):
+    """Append a Defender-quarantine hint when an upload vanished or can't be read.
+
+    Uploaded malware (e.g. mimikatz) staged under %TEMP%\\hex_uploads is deleted
+    by Defender real-time protection unless that folder is excluded, which
+    surfaces as 'File not found' or '[Errno 22]'. Point the user at the cause."""
+    lowered = (path or "").lower()
+    if "hex_uploads" in lowered:
+        return (f"{base_msg}. The uploaded file appears to have been removed or locked by "
+                f"Windows Defender. Exclude the upload folder (C:\\WINDOWS\\TEMP\\hex_uploads) "
+                f"from Defender, or disable real-time monitoring, then re-upload the sample.")
+    return base_msg
+
+
 @app.route("/api/file/pe")
 def api_file_pe():
     """Parse PE header and return structured analysis with IOC indicators."""
@@ -3493,7 +3817,7 @@ def api_file_pe():
 
     norm_path = os.path.normpath(filepath)
     if not os.path.isfile(norm_path):
-        return jsonify({"error": "File not found"}), 404
+        return jsonify({"error": _quarantine_hint(norm_path, "File not found")}), 404
 
     try:
         import pefile
@@ -3511,7 +3835,7 @@ def api_file_pe():
     except pefile.PEFormatError as e:
         return jsonify({"error": f"Not a valid PE file: {e}"}), 400
     except (IOError, OSError) as e:
-        return jsonify({"error": f"Unable to read file: {e}"}), 500
+        return jsonify({"error": _quarantine_hint(norm_path, f"Unable to read file: {e}")}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -3726,7 +4050,7 @@ def api_file_pe_section():
 
     norm_path = os.path.normpath(filepath)
     if not os.path.isfile(norm_path):
-        return jsonify({"error": "File not found"}), 404
+        return jsonify({"error": _quarantine_hint(norm_path, "File not found")}), 404
 
     try:
         import pefile
@@ -3742,7 +4066,7 @@ def api_file_pe_section():
     except pefile.PEFormatError as e:
         return jsonify({"error": f"Not a valid PE file: {e}"}), 400
     except (IOError, OSError) as e:
-        return jsonify({"error": f"Unable to read file: {e}"}), 500
+        return jsonify({"error": _quarantine_hint(norm_path, f"Unable to read file: {e}")}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

@@ -1001,6 +1001,7 @@ function renderRtraceEventTable() {
             <span class="ev-pid">${pid}</span>
             <span class="ev-process">${escapeHtml(procName)}</span>
             <span class="ev-details">${escapeHtml(details)}</span>
+            ${ev.pid ? `<span class="ev-graph-btn" title="Investigate PID ${ev.pid} in process graph" onclick="event.stopPropagation(); focusProcessGraph('${ev.pid}', {reset:true})">&#9673; Graph</span>` : '<span class="ev-graph-btn-empty"></span>'}
         </div>`;
     });
     container.innerHTML = html;
@@ -3048,6 +3049,12 @@ function openAlertDetail(idx) {
         html += `<div class="alert-description">${escapeHtml(alert.rule_description)}</div>`;
     }
 
+    // Pivot into the process graph on this alert's PID (and its parent).
+    const pivots = [];
+    if (alert.pid) pivots.push(`<button class="pivot-graph-btn" onclick="focusProcessGraph('${alert.pid}', {reset:true})">&#9673; PID ${alert.pid} in graph</button>`);
+    if (alert.parent_pid) pivots.push(`<button class="pivot-graph-btn secondary" onclick="focusProcessGraph('${alert.parent_pid}', {reset:true})">&#9673; Parent ${alert.parent_pid} in graph</button>`);
+    if (pivots.length) html += `<div class="pivot-graph-bar">${pivots.join('')}</div>`;
+
     const tags = (alert.tags || []).map(tag => {
         if (tag.startsWith('attack.t')) return `<span class="tag technique">${tag.replace('attack.', '').toUpperCase()}</span>`;
         if (tag.startsWith('attack.')) return `<span class="tag tactic">${tag.replace('attack.', '').toUpperCase()}</span>`;
@@ -3214,7 +3221,8 @@ function openProcessDetail(pid) {
     const statusText = hasExited ? 'exited' : 'running';
     setDetailHeader(`PID ${proc.pid}`, 'background:rgba(59,130,246,0.2);color:#3b82f6', proc.name || 'unknown', statusText);
 
-    let html = `<div class="detail-fields">
+    let html = `<div class="pivot-graph-bar"><button class="pivot-graph-btn" onclick="focusProcessGraph('${proc.pid}', {reset:true})">&#9673; View in process graph</button></div>`;
+    html += `<div class="detail-fields">
         <div class="detail-field"><span class="field-label">Image</span><span class="field-value mono">${escapeHtml(proc.image || '')}</span></div>
         <div class="detail-field"><span class="field-label">Command line</span><span class="field-value mono">${escapeHtml(proc.command_line || '')}</span></div>
         <div class="detail-field"><span class="field-label">User</span><span class="field-value">${escapeHtml(proc.user || '')}</span></div>
@@ -4000,53 +4008,187 @@ const graphState = {
     selectedNode: null,
     animFrame: null,
     initialized: false,
-    timeRangeSeconds: 0, // 0 = all time
-    searchQuery: '', // search filter for process/filename
+    focusPid: null,       // root PID of the current drilldown (null = landing picker)
+    focusStack: [],       // breadcrumb lineage of previously-focused PIDs
+    downDepth: 0,         // descendant depth (0 = all, capped server-side)
+    data: null,           // last /api/process-graph payload
+    emptyMessage: '',     // message shown on the canvas when there are no nodes
 };
 
-async function graphRefresh() {
-    // Fetch process tree (limited to top 200 by threats) + sysmon network/DNS data in parallel
-    const [procResp, sysmonNetResp, sysmonDnsResp, sysmonInjectResp, sysmonAllResp] = await Promise.all([
-        fetch('/api/processes?max=200&sort=threats&include_parents=true'),
-        fetch('/api/sysmon?event_id=3&max=300'),
-        fetch('/api/sysmon?event_id=22&max=200'),
-        fetch('/api/sysmon?event_id=8&max=100'),
-        fetch('/api/sysmon?max=500'),
-    ]);
-
-    let processes = {};
-    let networkEvents = [];
-    let dnsEvents = [];
-    let injectEvents = [];
-
-    if (procResp.ok) processes = await procResp.json();
-    if (sysmonNetResp.ok) networkEvents = await sysmonNetResp.json();
-    if (sysmonDnsResp.ok) dnsEvents = await sysmonDnsResp.json();
-    if (sysmonInjectResp.ok) injectEvents = await sysmonInjectResp.json();
-
-    // Store all sysmon events for detail panel lookups
-    graphState._allSysmonEvents = [];
-    if (sysmonAllResp.ok) {
-        const allEvts = await sysmonAllResp.json();
-        if (Array.isArray(allEvts) && !allEvts[0]?.error) graphState._allSysmonEvents = allEvts;
+// Programmatically focus the process graph on a PID (used by alert/process pivots).
+function focusProcessGraph(pid, opts = {}) {
+    const { push = true, reset = false } = opts;
+    pid = String(pid);
+    if (reset) graphState.focusStack = [];
+    else if (push && graphState.focusPid && graphState.focusPid !== pid) {
+        graphState.focusStack.push(graphState.focusPid);
     }
+    graphState.focusPid = pid;
+    graphState.selectedNode = null;
+    hideGraphDetail();
+    const input = document.getElementById('graph-search');
+    if (input) input.value = pid;
+    if (state.activeTab !== 'graph') {
+        switchTab('graph'); // switchTab() lazily calls graphRefresh() for the graph tab
+    } else {
+        graphRefresh();
+    }
+}
 
-    // Also use the alerts already in state for network info
-    const networkAlerts = (state.alerts || []).filter(a => {
-        const cat = (Array.isArray(a.category) ? a.category[0] : a.category || '').toLowerCase();
-        return cat === 'network';
-    });
-
-    buildGraph(processes, networkEvents, dnsEvents, injectEvents, networkAlerts);
+async function graphRefresh() {
     if (!graphState.initialized) {
         initGraphCanvas();
         graphState.initialized = true;
     }
+
+    // No focus yet -> show the landing picker with candidate root processes.
+    if (!graphState.focusPid) {
+        graphState.nodes = [];
+        graphState.edges = [];
+        renderGraph();
+        renderBreadcrumb();
+        await renderGraphLanding();
+        return;
+    }
+    hideGraphLanding();
+
+    const depth = graphState.downDepth || 0;
+    let payload = null;
+    try {
+        const resp = await fetch(`/api/process-graph?pid=${encodeURIComponent(graphState.focusPid)}&down_depth=${depth}&max_nodes=400`);
+        payload = await resp.json();
+        if (!resp.ok || payload.error) {
+            graphState.nodes = [];
+            graphState.edges = [];
+            graphState.emptyMessage = payload.error || `Process ${graphState.focusPid} not found.`;
+            renderGraph();
+            renderBreadcrumb();
+            const countEl = document.getElementById('graph-node-count');
+            if (countEl) countEl.textContent = graphState.emptyMessage;
+            return;
+        }
+    } catch (e) {
+        graphState.nodes = [];
+        graphState.edges = [];
+        graphState.emptyMessage = 'Failed to load process graph: ' + e.message;
+        renderGraph();
+        return;
+    }
+
+    graphState.data = payload;
+    buildGraph(payload);
     graphFitView();
     renderGraph();
+    renderBreadcrumb();
 }
 
-function buildGraph(processes, networkEvents, dnsEvents, injectEvents, networkAlerts) {
+async function renderGraphLanding() {
+    const landing = document.getElementById('graph-landing');
+    if (!landing) return;
+    landing.classList.add('visible');
+    landing.innerHTML = '<div class="graph-landing-loading">Loading candidate processes...</div>';
+
+    let roots = [];
+    try {
+        const resp = await fetch('/api/process-graph/roots');
+        if (resp.ok) roots = await resp.json();
+    } catch (e) { /* ignore */ }
+    if (!Array.isArray(roots)) roots = [];
+
+    // Optional name/pid filter typed into the focus field.
+    const q = (document.getElementById('graph-search')?.value || '').trim().toLowerCase();
+    let filtered = roots;
+    if (q) {
+        filtered = roots.filter(r =>
+            String(r.pid).includes(q) ||
+            (r.name || '').toLowerCase().includes(q) ||
+            (r.image || '').toLowerCase().includes(q));
+    }
+
+    let html = '<div class="graph-landing-inner">';
+    html += '<div class="graph-landing-title">Investigate a process</div>';
+    html += '<div class="graph-landing-hint">Pick a process below, or type a PID / name in the focus field above.</div>';
+    if (!filtered.length) {
+        html += `<div class="graph-landing-empty">${roots.length ? 'No processes match your filter.' : 'No detonated or alerting processes yet. Submit a sample to populate the graph.'}</div>`;
+    } else {
+        html += '<div class="graph-landing-list">';
+        filtered.forEach(r => {
+            const sevClass = r.severity && r.severity !== 'unknown' ? `sev-${r.severity}` : '';
+            const badges = [];
+            if (r.detonated) badges.push('<span class="glc-badge det">detonated</span>');
+            if (r.threats > 0) badges.push(`<span class="glc-badge threat">${r.threats} threats</span>`);
+            if (r.children_count > 0) badges.push(`<span class="glc-badge">${r.children_count} children</span>`);
+            html += `<div class="graph-landing-card ${sevClass}" data-pid="${escapeHtml(String(r.pid))}">
+                <div class="glc-head"><span class="glc-name">${escapeHtml(r.name || 'unknown')}</span><span class="glc-pid">PID ${escapeHtml(String(r.pid))}</span></div>
+                ${r.image ? `<div class="glc-image">${escapeHtml(r.image)}</div>` : ''}
+                <div class="glc-badges">${badges.join('')}</div>
+            </div>`;
+        });
+        html += '</div>';
+    }
+    html += '</div>';
+    landing.innerHTML = html;
+
+    landing.querySelectorAll('.graph-landing-card[data-pid]').forEach(card => {
+        card.addEventListener('click', () => focusProcessGraph(card.dataset.pid, { reset: true }));
+    });
+}
+
+function hideGraphLanding() {
+    const landing = document.getElementById('graph-landing');
+    if (landing) { landing.classList.remove('visible'); landing.innerHTML = ''; }
+}
+
+// Handle the focus field: a numeric value focuses that PID directly; free text
+// falls back to the landing picker filtered by that query.
+function graphSubmitFocus() {
+    const input = document.getElementById('graph-search');
+    const val = (input?.value || '').trim();
+    if (!val) { graphState.focusPid = null; graphRefresh(); return; }
+    if (/^\d+$/.test(val)) {
+        focusProcessGraph(val, { reset: true });
+    } else {
+        // Name search: drop to landing filtered by the query.
+        graphState.focusPid = null;
+        graphRefresh();
+    }
+}
+
+function renderBreadcrumb() {
+    const bc = document.getElementById('graph-breadcrumb');
+    if (!bc) return;
+    if (!graphState.focusPid) { bc.innerHTML = ''; bc.classList.remove('visible'); return; }
+    bc.classList.add('visible');
+    const rootLabel = (n) => {
+        const node = (graphState.nodes || []).find(x => x.type === 'process' && String(x.pid) === String(n));
+        return node ? `${node.label} (${n})` : `PID ${n}`;
+    };
+    let html = '<span class="gbc-home" title="Back to process picker">&#8962; All</span>';
+    graphState.focusStack.forEach((pid, i) => {
+        html += `<span class="gbc-sep">&rsaquo;</span><span class="gbc-item" data-idx="${i}">PID ${escapeHtml(String(pid))}</span>`;
+    });
+    html += `<span class="gbc-sep">&rsaquo;</span><span class="gbc-current">${escapeHtml(rootLabel(graphState.focusPid))}</span>`;
+    if (graphState.data?.truncated) html += '<span class="gbc-trunc" title="Tree truncated at the node cap">&#9888; truncated</span>';
+    bc.innerHTML = html;
+
+    bc.querySelector('.gbc-home')?.addEventListener('click', () => {
+        graphState.focusPid = null;
+        graphState.focusStack = [];
+        const input = document.getElementById('graph-search');
+        if (input) input.value = '';
+        graphRefresh();
+    });
+    bc.querySelectorAll('.gbc-item[data-idx]').forEach(el => {
+        el.addEventListener('click', () => {
+            const idx = parseInt(el.dataset.idx);
+            const pid = graphState.focusStack[idx];
+            graphState.focusStack = graphState.focusStack.slice(0, idx);
+            focusProcessGraph(pid, { push: false });
+        });
+    });
+}
+
+function buildGraph(payload) {
     const nodes = [];
     const edges = [];
     const nodeMap = {};
@@ -4055,128 +4197,12 @@ function buildGraph(processes, networkEvents, dnsEvents, injectEvents, networkAl
     const showDns = document.getElementById('graph-show-dns')?.checked;
     const showFiles = document.getElementById('graph-show-files')?.checked;
     const showRegistry = document.getElementById('graph-show-registry')?.checked;
-    const showDetonatedOnly = document.getElementById('graph-show-detonated')?.checked;
 
-    // Time range filtering
-    const timeRange = graphState.timeRangeSeconds;
-    let cutoffTime = null;
-    if (timeRange > 0) {
-        cutoffTime = new Date(Date.now() - timeRange * 1000).toISOString();
-    }
+    const procs = payload.processes || {};
 
-    function isInTimeRange(timestamp) {
-        if (!cutoffTime || !timestamp) return true;
-        return timestamp >= cutoffTime;
-    }
-
-    // Filter sysmon events by time
-    if (cutoffTime) {
-        networkEvents = networkEvents.filter(e => isInTimeRange(e.timestamp));
-        dnsEvents = dnsEvents.filter(e => isInTimeRange(e.timestamp));
-        injectEvents = injectEvents.filter(e => isInTimeRange(e.timestamp));
-        networkAlerts = networkAlerts.filter(a => isInTimeRange(a.timestamp));
-    }
-
-    // 1. Create process nodes - only include interesting ones
-    //    (has alerts OR is parent/child of one that does OR has sysmon network/dns activity)
-    //    Also apply time range filter to processes
-    const sysmonPids = new Set();
-    networkEvents.forEach(ev => { if (ev.pid) sysmonPids.add(String(ev.pid)); });
-    dnsEvents.forEach(ev => { if (ev.pid) sysmonPids.add(String(ev.pid)); });
-    injectEvents.forEach(ev => {
-        if (ev.pid) sysmonPids.add(String(ev.pid));
-        if (ev.source_pid) sysmonPids.add(String(ev.source_pid));
-        if (ev.target_pid) sysmonPids.add(String(ev.target_pid));
-    });
-
-    // First pass: identify processes with alerts in the time range
-    const alertPids = new Set();
-    for (const [pid, proc] of Object.entries(processes)) {
-        if ((proc.activity?.threats || 0) > 0) {
-            // Check if any of this process's alerts are in time range
-            if (cutoffTime) {
-                const hasRecentAlert = (proc.alerts || []).some(a => isInTimeRange(a.timestamp));
-                if (hasRecentAlert) alertPids.add(pid);
-            } else {
-                alertPids.add(pid);
-            }
-        }
-    }
-
-    // Also include processes that were active in the time range (first_seen or last_seen)
-    if (cutoffTime) {
-        for (const [pid, proc] of Object.entries(processes)) {
-            if (isInTimeRange(proc.last_seen) || isInTimeRange(proc.first_seen)) {
-                if (sysmonPids.has(pid)) alertPids.add(pid); // only if they have sysmon activity
-            }
-        }
-    }
-
-    // Second pass: include parents/children of alert processes + sysmon-active processes
-    const includePids = new Set([...alertPids, ...sysmonPids]);
-    for (const pid of [...alertPids]) {
-        const proc = processes[pid];
-        if (proc?.parent_pid != null) {
-            const ppidStr = String(proc.parent_pid);
-            if (processes[ppidStr]) includePids.add(ppidStr);
-        }
-        (proc?.children || []).forEach(c => includePids.add(String(c)));
-    }
-
-    // Search filter: narrow down to processes matching query + their parents/children
-    const searchQuery = graphState.searchQuery;
-    if (searchQuery) {
-        const matchedPids = new Set();
-        for (const [pid, proc] of Object.entries(processes)) {
-            if (!includePids.has(pid)) continue;
-            const name = (proc.name || '').toLowerCase();
-            const image = (proc.image || '').toLowerCase();
-            const cmdline = (proc.command_line || '').toLowerCase();
-            const pidStr = String(pid);
-            if (name.includes(searchQuery) || image.includes(searchQuery) || cmdline.includes(searchQuery) || pidStr.includes(searchQuery)) {
-                matchedPids.add(pid);
-            }
-        }
-        // Include parents and children of matched processes for context
-        const expandedPids = new Set(matchedPids);
-        for (const pid of matchedPids) {
-            const proc = processes[pid];
-            if (proc?.parent_pid != null) {
-                const ppidStr = String(proc.parent_pid);
-                if (processes[ppidStr]) expandedPids.add(ppidStr);
-            }
-            (proc?.children || []).forEach(c => { if (includePids.has(String(c))) expandedPids.add(String(c)); });
-        }
-        // Replace includePids with search-filtered set
-        includePids.clear();
-        for (const pid of expandedPids) includePids.add(pid);
-    }
-
-    // Detonated-only filter: narrow to processes that have detonation results
-    if (showDetonatedOnly) {
-        const detonatedPids = new Set();
-        for (const [pid, proc] of Object.entries(processes)) {
-            if (!includePids.has(pid)) continue;
-            if (proc.detonated) detonatedPids.add(pid);
-        }
-        // Include parents/children of detonated processes for context
-        const expandedDet = new Set(detonatedPids);
-        for (const pid of detonatedPids) {
-            const proc = processes[pid];
-            if (proc?.parent_pid != null) {
-                const ppidStr = String(proc.parent_pid);
-                if (processes[ppidStr]) expandedDet.add(ppidStr);
-            }
-            (proc?.children || []).forEach(c => { if (includePids.has(String(c))) expandedDet.add(String(c)); });
-        }
-        includePids.clear();
-        for (const pid of expandedDet) includePids.add(pid);
-    }
-
-    for (const [pid, proc] of Object.entries(processes)) {
-        if (!includePids.has(pid)) continue;
+    // 1. Process nodes — the focused subtree: ancestors + root + descendants
+    for (const [pid, proc] of Object.entries(procs)) {
         const threats = proc.activity?.threats || 0;
-        const maxSev = getNodeMaxSeverity(proc);
         const node = {
             id: `proc_${pid}`,
             type: 'process',
@@ -4186,7 +4212,7 @@ function buildGraph(processes, networkEvents, dnsEvents, injectEvents, networkAl
             cmdline: proc.command_line || '',
             user: proc.user || '',
             threats: threats,
-            severity: maxSev,
+            severity: proc.severity || 'unknown',
             children: proc.children || [],
             parentPid: proc.parent_pid,
             activity: proc.activity || {},
@@ -4194,8 +4220,12 @@ function buildGraph(processes, networkEvents, dnsEvents, injectEvents, networkAl
             exited: !!proc.exit_time,
             detonated: !!proc.detonated,
             detonationSources: proc.detonation_sources || [],
+            isRoot: !!proc.is_root,
+            isAncestor: !!proc.is_ancestor,
+            depth: proc.depth || 0,
+            alertsCount: proc.alerts_count || 0,
             x: 0, y: 0, vx: 0, vy: 0,
-            radius: Math.max(14, Math.min(30, 14 + threats * 2)),
+            radius: proc.is_root ? 26 : Math.max(13, Math.min(26, 13 + threats * 2)),
         };
         nodes.push(node);
         nodeMap[pid] = node;
@@ -4214,29 +4244,15 @@ function buildGraph(processes, networkEvents, dnsEvents, injectEvents, networkAl
         }
     }
 
-    // 3. Network connection nodes (from Sysmon event 3)
+    // 3. Network connection nodes (Sysmon event 3), scoped to the subtree
     if (showNetwork) {
         const netTargets = {};  // deduplicate by ip:port
-        networkEvents.forEach(ev => {
+        (payload.network || []).forEach(ev => {
             const key = `${ev.dst_ip}:${ev.dst_port}`;
             if (!netTargets[key]) {
                 netTargets[key] = { ip: ev.dst_ip, port: ev.dst_port, hostname: ev.dst_hostname || '', pids: new Set(), protocol: ev.protocol || 'tcp' };
             }
             if (ev.pid) netTargets[key].pids.add(String(ev.pid));
-        });
-
-        // Also add network info from alerts
-        networkAlerts.forEach(a => {
-            const raw = a.raw || {};
-            const ip = raw.destination?.ip || raw.network?.destination?.ip || '';
-            const port = raw.destination?.port || raw.network?.destination?.port || '';
-            if (ip) {
-                const key = `${ip}:${port}`;
-                if (!netTargets[key]) {
-                    netTargets[key] = { ip, port, hostname: '', pids: new Set(), protocol: 'tcp' };
-                }
-                if (a.pid) netTargets[key].pids.add(String(a.pid));
-            }
         });
 
         for (const [key, info] of Object.entries(netTargets)) {
@@ -4259,10 +4275,10 @@ function buildGraph(processes, networkEvents, dnsEvents, injectEvents, networkAl
         }
     }
 
-    // 4. DNS nodes (from Sysmon event 22)
+    // 4. DNS nodes (Sysmon event 22)
     if (showDns) {
         const dnsTargets = {};
-        dnsEvents.forEach(ev => {
+        (payload.dns || []).forEach(ev => {
             const query = ev.query || '';
             if (!query) return;
             if (!dnsTargets[query]) {
@@ -4289,26 +4305,23 @@ function buildGraph(processes, networkEvents, dnsEvents, injectEvents, networkAl
         }
     }
 
-    // 5. Injection edges (from Sysmon event 8: CreateRemoteThread)
-    injectEvents.forEach(ev => {
-        const srcPid = String(ev.source_pid || ev.pid);
+    // 5. Injection edges (Sysmon event 8: CreateRemoteThread)
+    (payload.injections || []).forEach(ev => {
+        const srcPid = String(ev.source_pid);
         const tgtPid = String(ev.target_pid);
         if (srcPid && tgtPid && nodeMap[srcPid] && nodeMap[tgtPid]) {
             edges.push({ source: `proc_${srcPid}`, target: `proc_${tgtPid}`, type: 'inject', label: 'inject' });
         }
     });
 
-    // 6. File nodes (from alerts with category=file)
+    // 6. File nodes (Sysmon event 11: FileCreate)
     if (showFiles) {
         const fileTargets = {};
-        (state.alerts || []).forEach(a => {
-            const cat = (Array.isArray(a.category) ? a.category[0] : a.category || '').toLowerCase();
-            if (cat !== 'file') return;
-            const raw = a.raw || {};
-            const path = raw.file?.path || raw['file.path'] || '';
-            if (!path || !a.pid) return;
+        (payload.files || []).forEach(ev => {
+            const path = ev.target || '';
+            if (!path || !ev.pid) return;
             if (!fileTargets[path]) fileTargets[path] = { path, pids: new Set() };
-            fileTargets[path].pids.add(String(a.pid));
+            fileTargets[path].pids.add(String(ev.pid));
         });
         for (const [path, info] of Object.entries(fileTargets)) {
             const nodeId = `file_${path}`;
@@ -4320,18 +4333,15 @@ function buildGraph(processes, networkEvents, dnsEvents, injectEvents, networkAl
         }
     }
 
-    // 7. Registry nodes
+    // 7. Registry nodes (Sysmon events 12/13/14)
     if (showRegistry) {
         const regTargets = {};
-        (state.alerts || []).forEach(a => {
-            const cat = (Array.isArray(a.category) ? a.category[0] : a.category || '').toLowerCase();
-            if (cat !== 'registry') return;
-            const raw = a.raw || {};
-            const path = raw.registry?.path || raw['registry.path'] || '';
-            if (!path || !a.pid) return;
+        (payload.registry || []).forEach(ev => {
+            const path = ev.target || '';
+            if (!path || !ev.pid) return;
             const shortKey = path.split('\\').slice(-2).join('\\') || path;
             if (!regTargets[shortKey]) regTargets[shortKey] = { path, pids: new Set() };
-            regTargets[shortKey].pids.add(String(a.pid));
+            regTargets[shortKey].pids.add(String(ev.pid));
         });
         for (const [key, info] of Object.entries(regTargets)) {
             const nodeId = `reg_${key}`;
@@ -4342,108 +4352,88 @@ function buildGraph(processes, networkEvents, dnsEvents, injectEvents, networkAl
         }
     }
 
-    // Apply layout
-    const layout = document.getElementById('graph-layout')?.value || 'hierarchy';
-    if (layout === 'hierarchy') {
-        applyHierarchyLayout(nodes, edges, nodeMap);
-    } else if (layout === 'radial') {
-        applyRadialLayout(nodes, edges, nodeMap);
-    } else if (layout === 'circular') {
-        applyCircularLayout(nodes, edges);
-    } else if (layout === 'grid') {
-        applyGridLayout(nodes, edges);
-    } else {
+    // Apply layout: rooted process tree (default) or force-directed
+    const layout = document.getElementById('graph-layout')?.value || 'tree';
+    if (layout === 'force') {
         applyForceLayout(nodes, edges);
-    }
-
-    // Safety cap: if still too many nodes after filtering, truncate to prevent browser hang
-    const MAX_RENDER_NODES = 500;
-    if (nodes.length > MAX_RENDER_NODES) {
-        // Keep process nodes first (sorted by threats desc), then auxiliary nodes
-        const procNodes = nodes.filter(n => n.type === 'process').sort((a, b) => (b.threats || 0) - (a.threats || 0));
-        const otherNodes = nodes.filter(n => n.type !== 'process');
-        const kept = procNodes.slice(0, MAX_RENDER_NODES);
-        const keptIds = new Set(kept.map(n => n.id));
-        // Keep auxiliary nodes connected to kept processes
-        const keptOther = otherNodes.filter(n => {
-            const edge = edges.find(e => e.source === n.id || e.target === n.id);
-            if (!edge) return false;
-            const otherId = edge.source === n.id ? edge.target : edge.source;
-            return keptIds.has(otherId);
-        });
-        nodes.length = 0;
-        nodes.push(...kept, ...keptOther.slice(0, 200));
-        // Filter edges to only reference existing nodes
-        const allNodeIds = new Set(nodes.map(n => n.id));
-        const validEdges = edges.filter(e => allNodeIds.has(e.source) && allNodeIds.has(e.target));
-        edges.length = 0;
-        edges.push(...validEdges);
+    } else {
+        applyRootedLayout(nodes, edges, nodeMap);
     }
 
     graphState.nodes = nodes;
     graphState.edges = edges;
 
-    // Update counter
+    // Update counter / subtitle
     const countEl = document.getElementById('graph-node-count');
     if (countEl) {
-        let label = `${nodes.length} nodes, ${edges.length} edges`;
-        if (graphState.searchQuery) label += ` (filtered: "${graphState.searchQuery}")`;
+        const procCount = nodes.filter(n => n.type === 'process').length;
+        let label = `${procCount} processes, ${nodes.length} nodes`;
+        if (payload.truncated) label += ' (truncated at cap)';
         countEl.textContent = label;
     }
 }
 
-function getNodeMaxSeverity(proc) {
-    let max = 'low';
-    const order = { critical: 4, high: 3, medium: 2, low: 1, unknown: 0 };
-    (proc.alerts || []).forEach(a => {
-        const sev = (a.severity || 'unknown').toLowerCase();
-        if ((order[sev] || 0) > (order[max] || 0)) max = sev;
-    });
-    return max;
-}
+// Rooted process-tree layout: ancestors sit above the focus root, descendants
+// fan out below, and activity nodes cluster around their owning process.
+function applyRootedLayout(nodes, edges, nodeMap) {
+    const X_SPACING = 150;
+    const Y_LEVEL = 150;
 
-function applyHierarchyLayout(nodes, edges, nodeMap) {
-    // Build tree levels from process parent relationships
     const procNodes = nodes.filter(n => n.type === 'process');
-    const otherNodes = nodes.filter(n => n.type !== 'process');
+    // Layout roots = process nodes whose parent is not in the selected set
+    // (normally the top-most ancestor of the focused process).
+    const layoutRoots = procNodes.filter(n => !n.parentPid || !nodeMap[n.parentPid]);
+    if (!layoutRoots.length && procNodes.length) layoutRoots.push(procNodes[0]);
 
-    // Find roots (no parent or parent not in nodeMap)
-    const roots = procNodes.filter(n => !n.parentPid || !nodeMap[n.parentPid]);
+    // Assign a column (leaf index) per node via DFS; internal nodes are centered.
+    const colById = {};
     const visited = new Set();
-    let col = 0;
-
-    function layoutTree(node, depth) {
+    let leaf = 0;
+    function dfs(node) {
         if (visited.has(node.id)) return;
         visited.add(node.id);
-        node.x = depth * 200;
-        node.y = col * 80;
-        col++;
-        // Find children
-        const children = procNodes.filter(n => n.parentPid && `proc_${n.parentPid}` === node.id && !visited.has(n.id));
-        children.forEach(child => layoutTree(child, depth + 1));
-    }
-
-    roots.forEach(root => layoutTree(root, 0));
-    // Any orphans
-    procNodes.filter(n => !visited.has(n.id)).forEach(n => { n.x = 0; n.y = col * 80; col++; });
-
-    // Place non-process nodes around their connected process
-    otherNodes.forEach(node => {
-        const connEdge = edges.find(e => e.target === node.id || e.source === node.id);
-        if (connEdge) {
-            const parentId = connEdge.source === node.id ? connEdge.target : connEdge.source;
-            const parent = nodes.find(n => n.id === parentId);
-            if (parent) {
-                const angle = Math.random() * Math.PI * 2;
-                const dist = 100 + Math.random() * 60;
-                node.x = parent.x + Math.cos(angle) * dist;
-                node.y = parent.y + Math.sin(angle) * dist;
-                return;
-            }
+        const kids = (node.children || [])
+            .map(c => nodeMap[c])
+            .filter(k => k && String(k.parentPid) === String(node.pid) && !visited.has(k.id));
+        if (!kids.length) {
+            colById[node.id] = leaf++;
+        } else {
+            kids.forEach(dfs);
+            colById[node.id] = (colById[kids[0].id] + colById[kids[kids.length - 1].id]) / 2;
         }
-        node.x = Math.random() * 600;
-        node.y = Math.random() * 400;
+    }
+    layoutRoots.forEach(dfs);
+    // Any process not reached (cycles / detached) gets its own column.
+    procNodes.forEach(n => { if (colById[n.id] === undefined) colById[n.id] = leaf++; });
+
+    // Place process nodes: x by column, y by tree depth (ancestors are negative -> above).
+    procNodes.forEach(n => {
+        n.x = colById[n.id] * X_SPACING;
+        n.y = (n.depth || 0) * Y_LEVEL;
     });
+
+    // Cluster activity nodes in a fan below their owning process.
+    const fullIndex = {};
+    nodes.forEach(n => { fullIndex[n.id] = n; });
+    const auxByOwner = {};
+    nodes.filter(n => n.type !== 'process').forEach(n => {
+        const e = edges.find(ed => ed.source === n.id || ed.target === n.id);
+        if (!e) { n.x = Math.random() * 200; n.y = Math.random() * 200; return; }
+        const ownerId = e.source === n.id ? e.target : e.source;
+        (auxByOwner[ownerId] = auxByOwner[ownerId] || []).push(n);
+    });
+    for (const [ownerId, list] of Object.entries(auxByOwner)) {
+        const owner = fullIndex[ownerId];
+        if (!owner) continue;
+        const count = list.length;
+        list.forEach((n, i) => {
+            const t = count > 1 ? i / (count - 1) : 0.5;
+            const angle = Math.PI * 0.15 + Math.PI * 0.7 * t;  // fan below the owner
+            const dist = 70 + (i % 3) * 22;
+            n.x = owner.x + Math.cos(angle) * dist;
+            n.y = owner.y + 48 + Math.sin(angle) * dist;
+        });
+    }
 }
 
 function applyForceLayout(nodes, edges) {
@@ -4496,121 +4486,6 @@ function applyForceLayout(nodes, edges) {
     }
 }
 
-function applyRadialLayout(nodes, edges, nodeMap) {
-    // Radial layout: root processes at center, children on concentric rings
-    const procNodes = nodes.filter(n => n.type === 'process');
-    const otherNodes = nodes.filter(n => n.type !== 'process');
-
-    // Find roots
-    const roots = procNodes.filter(n => !n.parentPid || !nodeMap[n.parentPid]);
-    const visited = new Set();
-    const levels = []; // levels[depth] = [nodes...]
-
-    function assignLevel(node, depth) {
-        if (visited.has(node.id)) return;
-        visited.add(node.id);
-        if (!levels[depth]) levels[depth] = [];
-        levels[depth].push(node);
-        const children = procNodes.filter(n => n.parentPid && `proc_${n.parentPid}` === node.id && !visited.has(n.id));
-        children.forEach(child => assignLevel(child, depth + 1));
-    }
-    roots.forEach(root => assignLevel(root, 0));
-    // Orphans go to level 0
-    procNodes.filter(n => !visited.has(n.id)).forEach(n => { if (!levels[0]) levels[0] = []; levels[0].push(n); });
-
-    // Place nodes on concentric circles
-    const ringSpacing = 160;
-    levels.forEach((levelNodes, depth) => {
-        const radius = depth * ringSpacing;
-        if (radius === 0) {
-            // Center the roots
-            const count = levelNodes.length;
-            levelNodes.forEach((n, i) => {
-                const angle = (i / count) * Math.PI * 2;
-                n.x = Math.cos(angle) * 40 * count;
-                n.y = Math.sin(angle) * 40 * count;
-            });
-        } else {
-            const count = levelNodes.length;
-            levelNodes.forEach((n, i) => {
-                const angle = (i / count) * Math.PI * 2 - Math.PI / 2;
-                n.x = Math.cos(angle) * radius;
-                n.y = Math.sin(angle) * radius;
-            });
-        }
-    });
-
-    // Place non-process nodes around their connected process
-    otherNodes.forEach(node => {
-        const connEdge = edges.find(e => e.target === node.id || e.source === node.id);
-        if (connEdge) {
-            const parentId = connEdge.source === node.id ? connEdge.target : connEdge.source;
-            const parent = nodes.find(n => n.id === parentId);
-            if (parent) {
-                const angle = Math.random() * Math.PI * 2;
-                const dist = 60 + Math.random() * 40;
-                node.x = parent.x + Math.cos(angle) * dist;
-                node.y = parent.y + Math.sin(angle) * dist;
-                return;
-            }
-        }
-        node.x = Math.random() * 300;
-        node.y = Math.random() * 300;
-    });
-}
-
-function applyCircularLayout(nodes, edges) {
-    // All nodes placed on a single circle, ordered by type then name
-    const sorted = [...nodes].sort((a, b) => {
-        if (a.type !== b.type) return a.type.localeCompare(b.type);
-        return (a.label || '').localeCompare(b.label || '');
-    });
-
-    const count = sorted.length;
-    const radius = Math.max(150, count * 20);
-
-    sorted.forEach((n, i) => {
-        const angle = (i / count) * Math.PI * 2 - Math.PI / 2;
-        n.x = Math.cos(angle) * radius;
-        n.y = Math.sin(angle) * radius;
-    });
-}
-
-function applyGridLayout(nodes, edges) {
-    // Grid layout: processes in a grid, non-processes attached nearby
-    const procNodes = nodes.filter(n => n.type === 'process');
-    const otherNodes = nodes.filter(n => n.type !== 'process');
-
-    const cols = Math.max(1, Math.ceil(Math.sqrt(procNodes.length)));
-    const spacing = 160;
-
-    procNodes.forEach((n, i) => {
-        const row = Math.floor(i / cols);
-        const col = i % cols;
-        n.x = col * spacing;
-        n.y = row * spacing;
-    });
-
-    // Attach non-process nodes to their connected process
-    otherNodes.forEach(node => {
-        const connEdge = edges.find(e => e.target === node.id || e.source === node.id);
-        if (connEdge) {
-            const parentId = connEdge.source === node.id ? connEdge.target : connEdge.source;
-            const parent = nodes.find(n => n.id === parentId);
-            if (parent) {
-                const angle = Math.random() * Math.PI * 2;
-                const dist = 50 + Math.random() * 30;
-                node.x = parent.x + Math.cos(angle) * dist;
-                node.y = parent.y + Math.sin(angle) * dist;
-                return;
-            }
-        }
-        // Orphan: place after the grid
-        const idx = otherNodes.indexOf(node);
-        node.x = (idx % cols) * spacing;
-        node.y = (Math.floor(procNodes.length / cols) + 1 + Math.floor(idx / cols)) * spacing;
-    });
-}
 
 function initGraphCanvas() {
     const canvas = document.getElementById('graph-canvas');
@@ -4797,10 +4672,8 @@ function renderGraph() {
         ctx.font = '14px monospace';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        const showDetonatedOnly = document.getElementById('graph-show-detonated')?.checked;
-        const msg = showDetonatedOnly
-            ? 'No detonated processes found. Submit a sample to see detonation activity.'
-            : 'No process data available.';
+        const msg = graphState.emptyMessage
+            || (graphState.focusPid ? `No graph data for PID ${graphState.focusPid}.` : 'Select a process to investigate.');
         ctx.fillText(msg, canvas.width / 2, canvas.height / 2);
         ctx.restore();
         return;
@@ -4892,6 +4765,20 @@ function renderGraph() {
 
         const r = node.radius * (isHovered ? 1.2 : 1);
 
+        // Ancestors are drawn faded to keep the focus subtree prominent
+        ctx.globalAlpha = node.isAncestor ? 0.5 : 1;
+
+        // Focus ring for the root node
+        if (node.isRoot) {
+            ctx.beginPath();
+            ctx.arc(node.x, node.y, r + 8, 0, Math.PI * 2);
+            ctx.strokeStyle = '#38bdf8';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([3, 3]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+        }
+
         // Glow for malicious
         if (node.type === 'process' && node.threats > 0) {
             ctx.beginPath();
@@ -4971,6 +4858,22 @@ function renderGraph() {
             ctx.textBaseline = 'middle';
             ctx.fillText(String(node.threats), bx, by);
         }
+
+        // FOCUS badge for the root node
+        if (node.isRoot) {
+            ctx.font = 'bold 8px monospace';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'bottom';
+            const badgeY = node.y - r - 8;
+            const text = 'FOCUS';
+            const tw = ctx.measureText(text).width;
+            ctx.fillStyle = '#38bdf8';
+            ctx.fillRect(node.x - tw / 2 - 4, badgeY - 11, tw + 8, 12);
+            ctx.fillStyle = '#0b1220';
+            ctx.fillText(text, node.x, badgeY);
+        }
+
+        ctx.globalAlpha = 1;
     });
 
     ctx.restore();
@@ -5021,6 +4924,11 @@ function showGraphDetail(node) {
 
     if (node.type === 'process') {
         headerText = `${node.label} (PID ${node.pid})`;
+        if (!node.isRoot) {
+            html += `<div class="gd-actions"><button class="gd-focus-btn" data-focus-pid="${escapeHtml(String(node.pid))}">&#9673; Focus this process</button></div>`;
+        } else {
+            html += `<div class="gd-actions"><span class="gd-focus-current">&#9673; Current focus root</span></div>`;
+        }
         html += `<div class="gd-field"><span class="gd-label">Image</span><span class="gd-value">${escapeHtml(node.image)}</span></div>`;
         if (node.cmdline) html += `<div class="gd-field"><span class="gd-label">Cmdline</span><span class="gd-value gd-cmdline">${escapeHtml(node.cmdline)}</span></div>`;
         if (node.user) html += `<div class="gd-field"><span class="gd-label">User</span><span class="gd-value">${escapeHtml(node.user)}</span></div>`;
@@ -5169,6 +5077,12 @@ function showGraphDetail(node) {
     header.textContent = headerText;
     body.innerHTML = html;
 
+    // Re-root the drilldown on the selected process
+    const focusBtn = body.querySelector('.gd-focus-btn[data-focus-pid]');
+    if (focusBtn) {
+        focusBtn.addEventListener('click', () => focusProcessGraph(focusBtn.dataset.focusPid));
+    }
+
     // Wire up clickable links in the detail panel
     body.querySelectorAll('.gd-link[data-node-id]').forEach(link => {
         link.addEventListener('click', (e) => {
@@ -5264,43 +5178,40 @@ function hideGraphDetail() {
 }
 
 function initGraphControls() {
-    // Re-render graph when toggles change
-    ['graph-show-network', 'graph-show-dns', 'graph-show-files', 'graph-show-registry', 'graph-show-detonated'].forEach(id => {
+    // Activity toggles re-render the current focus subtree
+    ['graph-show-network', 'graph-show-dns', 'graph-show-files', 'graph-show-registry'].forEach(id => {
         const el = document.getElementById(id);
-        if (el) el.addEventListener('change', () => { if (state.activeTab === 'graph') graphRefresh(); });
+        if (el) el.addEventListener('change', () => { if (state.activeTab === 'graph' && graphState.focusPid) graphRefresh(); });
     });
     const layoutEl = document.getElementById('graph-layout');
-    if (layoutEl) layoutEl.addEventListener('change', () => { if (state.activeTab === 'graph') graphRefresh(); });
+    if (layoutEl) layoutEl.addEventListener('change', () => { if (state.activeTab === 'graph' && graphState.focusPid) graphRefresh(); });
 
-    // Time range buttons
-    document.querySelectorAll('.graph-time-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            document.querySelectorAll('.graph-time-btn').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
-            graphState.timeRangeSeconds = parseInt(btn.dataset.seconds) || 0;
-            if (state.activeTab === 'graph') graphRefresh();
-        });
+    // Descendant depth control (0 = all, capped server-side)
+    const depthEl = document.getElementById('graph-depth');
+    if (depthEl) depthEl.addEventListener('change', () => {
+        graphState.downDepth = parseInt(depthEl.value) || 0;
+        if (state.activeTab === 'graph' && graphState.focusPid) graphRefresh();
     });
 
-    // Search input
+    // Focus field: Enter/Go submits (PID -> focus, text -> filtered landing);
+    // clearing the field returns to the landing picker.
     const searchInput = document.getElementById('graph-search');
     const searchClear = document.getElementById('graph-search-clear');
-    let searchDebounce = null;
     if (searchInput) {
         searchInput.addEventListener('input', () => {
             const val = searchInput.value.trim();
             if (searchClear) searchClear.classList.toggle('visible', val.length > 0);
-            clearTimeout(searchDebounce);
-            searchDebounce = setTimeout(() => {
-                graphState.searchQuery = val.toLowerCase();
-                if (state.activeTab === 'graph') graphRefresh();
-            }, 250);
+            // Live-filter the landing picker while no focus is set.
+            if (state.activeTab === 'graph' && !graphState.focusPid) renderGraphLanding();
         });
         searchInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Escape') {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                graphSubmitFocus();
+            } else if (e.key === 'Escape') {
                 searchInput.value = '';
-                graphState.searchQuery = '';
                 if (searchClear) searchClear.classList.remove('visible');
+                graphState.focusPid = null;
                 if (state.activeTab === 'graph') graphRefresh();
             }
         });
@@ -5308,11 +5219,13 @@ function initGraphControls() {
     if (searchClear) {
         searchClear.addEventListener('click', () => {
             if (searchInput) searchInput.value = '';
-            graphState.searchQuery = '';
             searchClear.classList.remove('visible');
+            graphState.focusPid = null;
             if (state.activeTab === 'graph') graphRefresh();
         });
     }
+    const focusGo = document.getElementById('graph-focus-go');
+    if (focusGo) focusGo.addEventListener('click', () => graphSubmitFocus());
 }
 
 // --- Sysmon Events Tab ---

@@ -3323,6 +3323,208 @@ body.hex-resizing {
     display: block;
 }
 
+/* --- Process graph landing picker --- */
+.graph-landing {
+    position: absolute;
+    inset: 0;
+    display: none;
+    overflow-y: auto;
+    background: var(--bg-primary);
+    z-index: 20;
+}
+.graph-landing.visible { display: block; }
+.graph-landing-inner {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 40px 24px 48px;
+}
+.graph-landing-loading {
+    padding: 48px;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 13px;
+}
+.graph-landing-title {
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 6px;
+}
+.graph-landing-hint {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-bottom: 20px;
+}
+.graph-landing-empty {
+    padding: 32px;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 13px;
+    border: 1px dashed var(--border-primary);
+    border-radius: var(--radius);
+}
+.graph-landing-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+    gap: 12px;
+}
+.graph-landing-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-left: 3px solid var(--border-primary);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    cursor: pointer;
+    transition: border-color 0.12s, background 0.12s, transform 0.08s;
+}
+.graph-landing-card:hover {
+    border-color: #38bdf8;
+    background: rgba(56,189,248,0.06);
+    transform: translateY(-1px);
+}
+.graph-landing-card.sev-critical { border-left-color: #ef4444; }
+.graph-landing-card.sev-high { border-left-color: #f97316; }
+.graph-landing-card.sev-medium { border-left-color: #eab308; }
+.graph-landing-card.sev-low { border-left-color: #22c55e; }
+.glc-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+}
+.glc-name {
+    font-weight: 600;
+    color: var(--text-primary);
+    font-size: 13px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.glc-pid {
+    font-family: monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+    flex-shrink: 0;
+}
+.glc-image {
+    font-family: monospace;
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-top: 4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.glc-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+}
+.glc-badge {
+    font-size: 10px;
+    padding: 2px 7px;
+    border-radius: 10px;
+    background: rgba(148,163,184,0.15);
+    color: var(--text-secondary);
+}
+.glc-badge.det { background: rgba(251,191,36,0.18); color: #fbbf24; }
+.glc-badge.threat { background: rgba(239,68,68,0.18); color: #f87171; }
+
+/* --- Process graph breadcrumb --- */
+.graph-breadcrumb {
+    display: none;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 6px 12px;
+    font-size: 12px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-primary);
+    color: var(--text-secondary);
+}
+.graph-breadcrumb.visible { display: flex; }
+.gbc-home {
+    cursor: pointer;
+    color: #38bdf8;
+}
+.gbc-home:hover { text-decoration: underline; }
+.gbc-sep { color: var(--text-muted); }
+.gbc-item {
+    cursor: pointer;
+    font-family: monospace;
+    color: var(--text-secondary);
+}
+.gbc-item:hover { color: #38bdf8; text-decoration: underline; }
+.gbc-current {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+.gbc-trunc {
+    margin-left: 10px;
+    color: #fbbf24;
+    font-size: 11px;
+}
+
+/* --- Focus-this-process action in the detail panel --- */
+.gd-actions { margin: 0 0 10px; }
+.gd-focus-btn {
+    width: 100%;
+    padding: 7px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #0b1220;
+    background: #38bdf8;
+    border: none;
+    border-radius: var(--radius);
+    cursor: pointer;
+}
+.gd-focus-btn:hover { background: #0ea5e9; }
+.gd-focus-current {
+    display: block;
+    font-size: 11px;
+    color: #38bdf8;
+    text-align: center;
+    padding: 4px;
+}
+
+/* --- Pivot-into-graph buttons (alert / process detail) --- */
+.pivot-graph-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+.pivot-graph-btn {
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #0b1220;
+    background: #38bdf8;
+    border: none;
+    border-radius: var(--radius);
+    cursor: pointer;
+}
+.pivot-graph-btn:hover { background: #0ea5e9; }
+.pivot-graph-btn.secondary {
+    color: #38bdf8;
+    background: transparent;
+    border: 1px solid #38bdf8;
+}
+.pivot-graph-btn.secondary:hover { background: rgba(56,189,248,0.1); }
+
+/* --- Inline "Graph" pivot on alert rows --- */
+.ev-graph-btn {
+    font-size: 10px;
+    color: #38bdf8;
+    cursor: pointer;
+    opacity: 0;
+    white-space: nowrap;
+    transition: opacity 0.12s;
+}
+.rtrace-event-row:hover .ev-graph-btn { opacity: 1; }
+.ev-graph-btn:hover { text-decoration: underline; }
+
 .graph-tooltip {
     position: absolute;
     display: none;
