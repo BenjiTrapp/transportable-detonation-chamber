@@ -48,6 +48,8 @@ let state = {
     detailHistory: [],
     sessionStart: null,
     serviceStatus: {},
+    emberStatus: null,
+    capaStatus: null,
     rustinelInfo: null,
     // RTRACE Console state
     rtraceSelectedPid: null,
@@ -116,12 +118,15 @@ document.addEventListener('DOMContentLoaded', () => {
     initHexDropZone();
     initHexResizeHandle();
     initScannerDropZone();
+    initEmberDropZone();
+    initCapaDropZone();
     initGraphControls();
     initRtraceTabs();
     refreshAll();
     setInterval(refreshAlerts, 5000);
     setInterval(refreshDashboard, 10000);
     refreshDashboard();
+    loadScanToolStatus();
 });
 
 // --- Tab navigation ---
@@ -157,6 +162,47 @@ function switchTab(tabName) {
     }
     if (tabName === 'litterbox') {
         initLitterbox();
+    }
+    if (tabName === 'ember' || tabName === 'capa') {
+        loadScanToolStatus();
+    }
+}
+
+// Fetch scanner/EMBER tool availability and update badges + dashboard state.
+async function loadScanToolStatus() {
+    try {
+        const resp = await fetch('/api/scan/status');
+        const data = await resp.json();
+        state.emberStatus = data.ember || null;
+
+        const emberBadge = document.getElementById('ember-status');
+        if (emberBadge) {
+            if (data.ember && data.ember.installed) {
+                const n = (data.ember.models || []).length;
+                emberBadge.textContent = `Ready · ${n} model${n === 1 ? '' : 's'}`;
+                emberBadge.className = 'scanner-status online';
+            } else {
+                emberBadge.textContent = 'Not installed';
+                emberBadge.className = 'scanner-status offline';
+            }
+        }
+        const scannerBadge = document.getElementById('scanner-status');
+        if (scannerBadge) {
+            const tc = data.threatcheck && data.threatcheck.installed;
+            const dc = data.defendercheck && data.defendercheck.installed;
+            scannerBadge.textContent = `ThreatCheck: ${tc ? 'ready' : 'n/a'} · DefenderCheck: ${dc ? 'ready' : 'n/a'}`;
+            scannerBadge.className = 'scanner-status ' + ((tc || dc) ? 'online' : 'offline');
+        }
+
+        state.capaStatus = data.capa || null;
+        const capaBadge = document.getElementById('capa-status');
+        if (capaBadge) {
+            const installed = data.capa && data.capa.installed;
+            capaBadge.textContent = installed ? 'Ready' : 'Not installed';
+            capaBadge.className = 'scanner-status ' + (installed ? 'online' : 'offline');
+        }
+    } catch (e) {
+        /* non-fatal */
     }
 }
 
@@ -303,11 +349,13 @@ function renderDashboard() {
                 </div>
             </div>
             <div class="stat-card stat-tools">
-                <div class="stat-value">2</div>
+                <div class="stat-value">4</div>
                 <div class="stat-label">SCANNER TOOLS</div>
                 <div class="stat-breakdown">
                     <span class="stat-tag dim">ThreatCheck</span>
                     <span class="stat-tag dim">DefenderCheck</span>
+                    <span class="stat-tag dim">EMBER2024</span>
+                    <span class="stat-tag dim">capa</span>
                 </div>
             </div>
         `;
@@ -447,6 +495,51 @@ function renderDashboard() {
             </div>
             <div class="service-card-actions">
                 <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('scanner')">Open Scanner</button>
+            </div>
+        </div>
+    `);
+
+    // EMBER2024 ML Classifier Card
+    const emberStatus = state.emberStatus || {};
+    const emberOnline = emberStatus.installed !== false; // treat unknown as ready
+    const emberModelCount = (emberStatus.models || []).length;
+    cards.push(`
+        <div class="service-card ember-card ${emberOnline ? '' : 'offline'}" onclick="switchTab('ember')">
+            <div class="service-card-glow"></div>
+            <div class="service-card-header">
+                <div class="service-card-title"><div class="service-icon ember">E</div><h3>EMBER2024</h3></div>
+                <span class="service-status-badge ${emberOnline ? 'online' : 'offline'}">${emberOnline ? 'Ready' : 'Not installed'}</span>
+            </div>
+            <div class="service-card-desc">ML malware classifier (thrember). LightGBM scores a file's malicious probability from EMBERv3 static features.</div>
+            <div class="service-card-metrics">
+                <div class="service-metric"><div class="service-metric-value">LGBM</div><div class="service-metric-label">MODEL</div></div>
+                <div class="service-metric"><div class="service-metric-value ${emberModelCount ? '' : 'zero'}">${emberModelCount || '--'}</div><div class="service-metric-label">CLASSIFIERS</div></div>
+                <div class="service-metric"><div class="service-metric-value">0&ndash;1</div><div class="service-metric-label">SCORE</div></div>
+            </div>
+            <div class="service-card-actions">
+                <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('ember')">Open EMBER</button>
+            </div>
+        </div>
+    `);
+
+    // capa Capability Detection Card
+    const capaStatus = state.capaStatus || {};
+    const capaOnline = capaStatus.installed !== false; // treat unknown as ready
+    cards.push(`
+        <div class="service-card capa-card ${capaOnline ? '' : 'offline'}" onclick="switchTab('capa')">
+            <div class="service-card-glow"></div>
+            <div class="service-card-header">
+                <div class="service-card-title"><div class="service-icon capa">C</div><h3>capa</h3></div>
+                <span class="service-status-badge ${capaOnline ? 'online' : 'offline'}">${capaOnline ? 'Ready' : 'Not installed'}</span>
+            </div>
+            <div class="service-card-desc">Mandiant capa. Static capability detection mapped to MITRE ATT&CK &amp; MBC. Answers "what can it do?"</div>
+            <div class="service-card-metrics">
+                <div class="service-metric"><div class="service-metric-value">ATT&CK</div><div class="service-metric-label">MAPPING</div></div>
+                <div class="service-metric"><div class="service-metric-value">Rules</div><div class="service-metric-label">ENGINE</div></div>
+                <div class="service-metric"><div class="service-metric-value">Static</div><div class="service-metric-label">MODE</div></div>
+            </div>
+            <div class="service-card-actions">
+                <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('capa')">Open capa</button>
             </div>
         </div>
     `);
@@ -1348,6 +1441,346 @@ function renderScanHistory() {
 function clearScanHistory() {
     scanHistory = [];
     const container = document.getElementById('scanner-history-list');
+    if (container) container.innerHTML = '';
+}
+
+// =============================================
+// EMBER2024 ML CLASSIFIER
+// =============================================
+let emberHistory = [];
+let emberFile = null;
+
+function initEmberDropZone() {
+    const zone = document.getElementById('ember-drop-zone');
+    const input = document.getElementById('ember-file-input');
+    if (!zone || !input) return;
+
+    zone.addEventListener('dragover', e => {
+        e.preventDefault();
+        zone.classList.add('dragover');
+    });
+    zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+    zone.addEventListener('drop', e => {
+        e.preventDefault();
+        zone.classList.remove('dragover');
+        if (e.dataTransfer.files.length) {
+            emberFile = e.dataTransfer.files[0];
+            zone.classList.add('has-file');
+            zone.querySelector('p').innerHTML = `<strong>${escapeHtml(emberFile.name)}</strong> (${formatSize(emberFile.size)}) <span class="hex-change-file" onclick="emberResetDrop()">change</span>`;
+        }
+    });
+    input.addEventListener('change', () => {
+        if (input.files.length) {
+            emberFile = input.files[0];
+            zone.classList.add('has-file');
+            zone.querySelector('p').innerHTML = `<strong>${escapeHtml(emberFile.name)}</strong> (${formatSize(emberFile.size)}) <span class="hex-change-file" onclick="emberResetDrop()">change</span>`;
+            input.value = '';
+        }
+    });
+}
+
+function emberResetDrop() {
+    emberFile = null;
+    const zone = document.getElementById('ember-drop-zone');
+    zone.classList.remove('has-file');
+    zone.querySelector('p').innerHTML = 'Drop a file to score or <span class="hex-browse-link" onclick="document.getElementById(\'ember-file-input\').click()">browse</span>';
+}
+
+async function runEmberScan() {
+    const model = document.getElementById('ember-model').value;
+    const threshold = document.getElementById('ember-threshold').value || '0.5';
+    const pathInput = document.getElementById('ember-filepath').value.trim();
+    const resultsEl = document.getElementById('ember-results');
+    const btn = document.getElementById('ember-run-btn');
+
+    if (!emberFile && !pathInput) {
+        resultsEl.innerHTML = '<div class="scanner-error">Please select a file or enter a VM path.</div>';
+        return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = 'Scoring...';
+    resultsEl.innerHTML = '<div class="scanner-running">Extracting features &amp; scoring with LightGBM...</div>';
+
+    const formData = new FormData();
+    if (emberFile) {
+        formData.append('file', emberFile);
+    } else {
+        formData.append('path', pathInput);
+    }
+    formData.append('model', model);
+    formData.append('threshold', threshold);
+
+    try {
+        LoadingSpinner.start();
+        const resp = await fetch('/api/scan/ember', { method: 'POST', body: formData });
+        const data = await resp.json();
+
+        if (data.error) {
+            resultsEl.innerHTML = `<div class="scanner-error">Error: ${escapeHtml(data.error)}</div>`;
+        } else {
+            renderEmberResult(data, resultsEl);
+            emberHistory.unshift({
+                ...data,
+                timestamp: new Date().toISOString(),
+                filename: emberFile ? emberFile.name : pathInput.split('\\').pop(),
+            });
+            if (emberHistory.length > 50) emberHistory.length = 50;
+            renderEmberHistory();
+        }
+    } catch (e) {
+        resultsEl.innerHTML = `<div class="scanner-error">Network error: ${escapeHtml(e.message)}</div>`;
+    }
+
+    LoadingSpinner.stop();
+    btn.disabled = false;
+    btn.textContent = 'Score';
+}
+
+function renderEmberResult(data, container) {
+    const score = typeof data.score === 'number' ? data.score : 0;
+    const pct = Math.round(score * 1000) / 10;
+    const malicious = !!data.malicious;
+    const statusClass = malicious ? 'scan-detected' : 'scan-clean';
+    const statusText = malicious ? `MALICIOUS (${pct}%)` : `BENIGN (${pct}%)`;
+    const statusIcon = malicious ? '&#x26A0;' : '&#x2705;';
+    // Gauge color: green (low) -> orange -> red (high)
+    const barClass = score >= 0.8 ? 'ember-bar-high' : score >= 0.5 ? 'ember-bar-med' : 'ember-bar-low';
+
+    let html = `<div class="scan-result ${statusClass}">`;
+    html += `<div class="scan-result-header">`;
+    html += `<span class="scan-result-icon">${statusIcon}</span>`;
+    html += `<span class="scan-result-status">${statusText}</span>`;
+    html += `<span class="scan-result-tool">EMBER2024 (${escapeHtml(data.model || '')})</span>`;
+    html += `</div>`;
+
+    // Score gauge
+    html += `<div class="ember-gauge">`;
+    html += `<div class="ember-gauge-track"><div class="ember-gauge-fill ${barClass}" style="width:${pct}%"></div>`;
+    html += `<div class="ember-gauge-threshold" style="left:${(data.threshold || 0.5) * 100}%" title="Threshold ${data.threshold}"></div></div>`;
+    html += `<div class="ember-gauge-labels"><span>0.0 benign</span><span>malicious 1.0</span></div>`;
+    html += `</div>`;
+
+    // Details
+    html += `<div class="ember-detail-grid">`;
+    html += `<div class="ember-detail"><span class="ember-detail-k">Score</span><span class="ember-detail-v">${score.toFixed(4)}</span></div>`;
+    html += `<div class="ember-detail"><span class="ember-detail-k">Threshold</span><span class="ember-detail-v">${data.threshold}</span></div>`;
+    if (data.elapsed_ms != null) html += `<div class="ember-detail"><span class="ember-detail-k">Time</span><span class="ember-detail-v">${data.elapsed_ms} ms</span></div>`;
+    if (data.size != null) html += `<div class="ember-detail"><span class="ember-detail-k">Size</span><span class="ember-detail-v">${formatSize(data.size)}</span></div>`;
+    html += `</div>`;
+
+    if (data.sha256) {
+        html += `<div class="scan-output-header">SHA256:</div>`;
+        html += `<pre class="scan-output">${escapeHtml(data.sha256)}</pre>`;
+    }
+
+    html += `</div>`;
+    container.innerHTML = html;
+}
+
+function renderEmberHistory() {
+    const container = document.getElementById('ember-history-list');
+    if (!container || emberHistory.length === 0) {
+        if (container) container.innerHTML = '';
+        return;
+    }
+
+    let html = '';
+    emberHistory.forEach(entry => {
+        const ts = new Date(entry.timestamp).toLocaleTimeString('en-GB', {hour12: false});
+        const malicious = !!entry.malicious;
+        const statusClass = malicious ? 'history-detected' : 'history-clean';
+        const pct = typeof entry.score === 'number' ? (Math.round(entry.score * 1000) / 10) + '%' : '?';
+        html += `<div class="scan-history-entry ${statusClass}">`;
+        html += `<span class="scan-history-time">${ts}</span>`;
+        html += `<span class="scan-history-file">${escapeHtml(entry.filename || '--')}</span>`;
+        html += `<span class="scan-history-tool">${escapeHtml(entry.model || 'EMBER')}</span>`;
+        html += `<span class="scan-history-status">${pct}</span>`;
+        html += `</div>`;
+    });
+    container.innerHTML = html;
+}
+
+function clearEmberHistory() {
+    emberHistory = [];
+    const container = document.getElementById('ember-history-list');
+    if (container) container.innerHTML = '';
+}
+
+// =============================================
+// CAPA CAPABILITY DETECTION
+// =============================================
+let capaHistory = [];
+let capaFile = null;
+
+function initCapaDropZone() {
+    const zone = document.getElementById('capa-drop-zone');
+    const input = document.getElementById('capa-file-input');
+    if (!zone || !input) return;
+
+    zone.addEventListener('dragover', e => {
+        e.preventDefault();
+        zone.classList.add('dragover');
+    });
+    zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+    zone.addEventListener('drop', e => {
+        e.preventDefault();
+        zone.classList.remove('dragover');
+        if (e.dataTransfer.files.length) {
+            capaFile = e.dataTransfer.files[0];
+            zone.classList.add('has-file');
+            zone.querySelector('p').innerHTML = `<strong>${escapeHtml(capaFile.name)}</strong> (${formatSize(capaFile.size)}) <span class="hex-change-file" onclick="capaResetDrop()">change</span>`;
+        }
+    });
+    input.addEventListener('change', () => {
+        if (input.files.length) {
+            capaFile = input.files[0];
+            zone.classList.add('has-file');
+            zone.querySelector('p').innerHTML = `<strong>${escapeHtml(capaFile.name)}</strong> (${formatSize(capaFile.size)}) <span class="hex-change-file" onclick="capaResetDrop()">change</span>`;
+            input.value = '';
+        }
+    });
+}
+
+function capaResetDrop() {
+    capaFile = null;
+    const zone = document.getElementById('capa-drop-zone');
+    zone.classList.remove('has-file');
+    zone.querySelector('p').innerHTML = 'Drop a file to analyze or <span class="hex-browse-link" onclick="document.getElementById(\'capa-file-input\').click()">browse</span>';
+}
+
+async function runCapaScan() {
+    const pathInput = document.getElementById('capa-filepath').value.trim();
+    const resultsEl = document.getElementById('capa-results');
+    const btn = document.getElementById('capa-run-btn');
+
+    if (!capaFile && !pathInput) {
+        resultsEl.innerHTML = '<div class="scanner-error">Please select a file or enter a VM path.</div>';
+        return;
+    }
+
+    btn.disabled = true;
+    btn.textContent = 'Analyzing...';
+    resultsEl.innerHTML = '<div class="scanner-running">Disassembling &amp; matching capa rules... This may take up to a few minutes.</div>';
+
+    const formData = new FormData();
+    if (capaFile) {
+        formData.append('file', capaFile);
+    } else {
+        formData.append('path', pathInput);
+    }
+
+    try {
+        LoadingSpinner.start();
+        const resp = await fetch('/api/scan/capa', { method: 'POST', body: formData });
+        const data = await resp.json();
+
+        if (data.error) {
+            resultsEl.innerHTML = `<div class="scanner-error">Error: ${escapeHtml(data.error)}</div>`;
+        } else {
+            renderCapaResult(data, resultsEl);
+            capaHistory.unshift({
+                ...data,
+                timestamp: new Date().toISOString(),
+                filename: capaFile ? capaFile.name : pathInput.split('\\').pop(),
+            });
+            if (capaHistory.length > 50) capaHistory.length = 50;
+            renderCapaHistory();
+        }
+    } catch (e) {
+        resultsEl.innerHTML = `<div class="scanner-error">Network error: ${escapeHtml(e.message)}</div>`;
+    }
+
+    LoadingSpinner.stop();
+    btn.disabled = false;
+    btn.textContent = 'Analyze';
+}
+
+function renderCapaResult(data, container) {
+    const caps = data.capabilities || [];
+    const count = data.capability_count != null ? data.capability_count : caps.length;
+
+    let html = `<div class="scan-result ${count > 0 ? 'scan-detected' : 'scan-clean'}">`;
+    html += `<div class="scan-result-header">`;
+    html += `<span class="scan-result-icon">&#x1F9E9;</span>`;
+    html += `<span class="scan-result-status">${count} capabilit${count === 1 ? 'y' : 'ies'} found</span>`;
+    html += `<span class="scan-result-tool">capa &middot; ${escapeHtml(data.format || '')} ${escapeHtml(data.arch || '')}</span>`;
+    html += `</div>`;
+
+    // ATT&CK tactic summary chips
+    if ((data.tactics || []).length) {
+        html += `<div class="capa-tactics">`;
+        data.tactics.forEach(t => { html += `<span class="capa-tactic-chip">${escapeHtml(t)}</span>`; });
+        html += `</div>`;
+    }
+
+    if (count === 0) {
+        html += `<div class="scanner-placeholder">No capabilities matched. (File may be packed, tiny, or an unsupported format.)</div>`;
+    } else {
+        // Group capabilities by ATT&CK tactic; unmapped go under "Other".
+        const groups = {};
+        caps.forEach(c => {
+            const tactics = (c.attack || []).map(a => a.split(':')[0].trim()).filter(Boolean);
+            const keys = tactics.length ? [...new Set(tactics)] : ['Other capabilities'];
+            keys.forEach(k => { (groups[k] = groups[k] || []).push(c); });
+        });
+        const order = Object.keys(groups).sort((a, b) => {
+            if (a === 'Other capabilities') return 1;
+            if (b === 'Other capabilities') return -1;
+            return a.localeCompare(b);
+        });
+        html += `<div class="capa-groups">`;
+        order.forEach(tactic => {
+            html += `<div class="capa-group">`;
+            html += `<div class="capa-group-title">${escapeHtml(tactic)} <span class="capa-group-count">${groups[tactic].length}</span></div>`;
+            groups[tactic].forEach(c => {
+                const attackLine = (c.attack || []).join(' · ');
+                const mbcLine = (c.mbc || []).join(' · ');
+                html += `<div class="capa-cap">`;
+                html += `<div class="capa-cap-name">${escapeHtml(c.name)}${c.matches > 1 ? ` <span class="capa-cap-matches">×${c.matches}</span>` : ''}</div>`;
+                if (c.namespace) html += `<div class="capa-cap-ns">${escapeHtml(c.namespace)}</div>`;
+                if (attackLine) html += `<div class="capa-cap-tag capa-cap-attack">ATT&amp;CK: ${escapeHtml(attackLine)}</div>`;
+                if (mbcLine) html += `<div class="capa-cap-tag capa-cap-mbc">MBC: ${escapeHtml(mbcLine)}</div>`;
+                html += `</div>`;
+            });
+            html += `</div>`;
+        });
+        html += `</div>`;
+    }
+
+    if (data.sha256) {
+        html += `<div class="scan-output-header">SHA256:</div>`;
+        html += `<pre class="scan-output">${escapeHtml(data.sha256)}</pre>`;
+    }
+
+    html += `</div>`;
+    container.innerHTML = html;
+}
+
+function renderCapaHistory() {
+    const container = document.getElementById('capa-history-list');
+    if (!container || capaHistory.length === 0) {
+        if (container) container.innerHTML = '';
+        return;
+    }
+    let html = '';
+    capaHistory.forEach(entry => {
+        const ts = new Date(entry.timestamp).toLocaleTimeString('en-GB', {hour12: false});
+        const count = entry.capability_count != null ? entry.capability_count : (entry.capabilities || []).length;
+        const statusClass = count > 0 ? 'history-detected' : 'history-clean';
+        html += `<div class="scan-history-entry ${statusClass}">`;
+        html += `<span class="scan-history-time">${ts}</span>`;
+        html += `<span class="scan-history-file">${escapeHtml(entry.filename || '--')}</span>`;
+        html += `<span class="scan-history-tool">capa</span>`;
+        html += `<span class="scan-history-status">${count} caps</span>`;
+        html += `</div>`;
+    });
+    container.innerHTML = html;
+}
+
+function clearCapaHistory() {
+    capaHistory = [];
+    const container = document.getElementById('capa-history-list');
     if (container) container.innerHTML = '';
 }
 

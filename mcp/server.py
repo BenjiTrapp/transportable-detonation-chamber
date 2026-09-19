@@ -379,6 +379,54 @@ def tdc_scan_defendercheck(file_path: str) -> str:
     return json.dumps(result, indent=2, default=str)[:4000]
 
 
+@mcp.tool()
+def tdc_scan_ember(
+    file_path: str,
+    model: str = "EMBER2024_all",
+    threshold: float = 0.5,
+) -> str:
+    """Score a file with an EMBER2024 (thrember) LightGBM ML classifier.
+
+    Extracts EMBERv3 static features and returns a malicious probability (0..1)
+    plus a benign/malicious verdict. Works on PE/ELF/PDF/APK samples.
+
+    Args:
+        file_path: Local path to the file to scan
+        model: Benchmark model to use. One of EMBER2024_all, EMBER2024_PE,
+            EMBER2024_Win32, EMBER2024_Win64, EMBER2024_Dot_Net, EMBER2024_ELF,
+            EMBER2024_PDF, EMBER2024_APK (default EMBER2024_all)
+        threshold: Malicious decision threshold (default 0.5)
+    """
+    if not os.path.isfile(file_path):
+        return f"Error: File not found: {file_path}"
+
+    with open(file_path, "rb") as f:
+        files = {"file": (os.path.basename(file_path), f)}
+        data = {"model": model, "threshold": str(threshold)}
+        result = _post("/api/scan/ember", data=data, files=files, timeout=120.0)
+    return json.dumps(result, indent=2, default=str)[:4000]
+
+
+@mcp.tool()
+def tdc_scan_capa(file_path: str) -> str:
+    """Detect capabilities in a file with Mandiant capa (static, ATT&CK-mapped).
+
+    Identifies what a PE/.NET/ELF/shellcode sample can do (e.g. process injection,
+    persistence, C2) and maps findings to MITRE ATT&CK and the Malware Behavior
+    Catalog. Complements tdc_scan_ember (which gives an ML malicious score).
+
+    Args:
+        file_path: Local path to the file to analyze
+    """
+    if not os.path.isfile(file_path):
+        return f"Error: File not found: {file_path}"
+
+    with open(file_path, "rb") as f:
+        files = {"file": (os.path.basename(file_path), f)}
+        result = _post("/api/scan/capa", files=files, timeout=300.0)
+    return json.dumps(result, indent=2, default=str)[:6000]
+
+
 # --- PE Analysis ---
 
 

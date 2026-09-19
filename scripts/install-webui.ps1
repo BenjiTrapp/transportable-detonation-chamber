@@ -19,6 +19,16 @@ Write-Host "=== Installing Detonation Chamber Web UI ===" -ForegroundColor Cyan
 $webuiDir = "C:\DetonationChamberUI"
 $sourceDir = "C:\vagrant\webui"  # Synced from host via Vagrant
 
+# Stop any running web UI so its venv/app.py aren't locked during redeploy.
+# A running Flask process locks venv\Scripts\python.exe: Remove-Item then fails
+# to clear the tree but still deletes unlocked site-packages, leaving a gutted
+# venv, and the subsequent Copy-Item nests the new files under $webuiDir\webui.
+Stop-ScheduledTask -TaskName "DetonationChamberUI" -ErrorAction SilentlyContinue
+Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -match 'DetonationChamberUI' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Seconds 2
+
 # Copy web UI files
 if (Test-Path $sourceDir) {
     Write-Host "[*] Copying web UI from synced folder..." -ForegroundColor Yellow
