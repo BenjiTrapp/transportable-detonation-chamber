@@ -127,6 +127,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(refreshDashboard, 10000);
     refreshDashboard();
     loadScanToolStatus();
+    loadScanHistory();
 });
 
 // --- Tab navigation ---
@@ -1415,34 +1416,162 @@ function renderScanResult(data, container) {
     container.innerHTML = html;
 }
 
-function renderScanHistory() {
-    const container = document.getElementById('scanner-history-list');
-    if (!container || scanHistory.length === 0) {
-        if (container) container.innerHTML = '';
+// ---------------------------------------------------------------
+// Unified, server-persisted scan history (shared timeline across
+// ThreatCheck / DefenderCheck / EMBER / capa, and any curl/API/MCP
+// scan). Rendered identically into all three per-tab containers.
+// ---------------------------------------------------------------
+const SCAN_HISTORY_CONTAINERS = ['scanner-history-list', 'ember-history-list', 'capa-history-list'];
+
+async function loadScanHistory() {
+    try {
+        const resp = await fetch('/api/scan/history?limit=100');
+        const data = await resp.json();
+        renderUnifiedHistory(data.history || []);
+    } catch (e) {
+        // history must never break the page
+    }
+}
+
+function _histStatus(entry) {
+    const v = (entry.verdict || '').toLowerCase();
+    const pct = (entry.score != null) ? ` ${(entry.score * 100).toFixed(1)}%` : '';
+    if (entry.status === 'timeout') return { cls: 'history-unknown', text: 'TIMEOUT' };
+    if (entry.status && entry.status !== 'ok') return { cls: 'history-unknown', text: entry.status.toUpperCase() };
+    if (v === 'malicious' || entry.detected === true) return { cls: 'history-detected', text: (v === 'malicious' ? 'MALICIOUS' : 'DETECTED') + pct };
+    if (v === 'benign' || v === 'clean' || entry.clean === true) return { cls: 'history-clean', text: (v === 'benign' ? 'BENIGN' : 'CLEAN') + pct };
+    if (v === 'analyzed' || v) return { cls: 'history-unknown', text: (v || '?').toUpperCase() };
+    return { cls: 'history-unknown', text: '?' };
+}
+
+function renderUnifiedHistory(history) {
+    const containers = SCAN_HISTORY_CONTAINERS
+        .map(id => document.getElementById(id)).filter(Boolean);
+    if (!containers.length) return;
+
+    if (!history.length) {
+        containers.forEach(c => { c.innerHTML = '<div class="scan-history-empty">No scans yet.</div>'; });
         return;
     }
 
     let html = '';
-    scanHistory.forEach((entry, idx) => {
-        const ts = new Date(entry.timestamp).toLocaleTimeString('en-GB', {hour12: false});
-        const statusClass = entry.clean ? 'history-clean' : entry.detected ? 'history-detected' : 'history-unknown';
-        const statusText = entry.clean ? 'Clean' : entry.detected ? 'Detected' : '?';
-        const toolLabel = entry.tool + (entry.engine ? '/' + entry.engine : '');
-        html += `<div class="scan-history-entry ${statusClass}">`;
-        html += `<span class="scan-history-time">${ts}</span>`;
-        html += `<span class="scan-history-file">${escapeHtml(entry.filename || '--')}</span>`;
-        html += `<span class="scan-history-tool">${escapeHtml(toolLabel)}</span>`;
-        html += `<span class="scan-history-status">${statusText}</span>`;
+    history.forEach(entry => {
+        const ts = new Date(entry.timestamp).toLocaleString('en-GB', { hour12: false });
+        const st = _histStatus(entry);
+        html += `<div class="scan-history-entry ${st.cls}" onclick="toggleHistoryDetail(this)">`;
+        html += `<span class="scan-history-more">&#9656;</span>`;
+        html += `<span class="scan-history-time">${escapeHtml(ts)}</span>`;
+        html += `<span class="scan-history-tool">${escapeHtml(entry.tool || '?')}</span>`;
+        html += `<span class="scan-history-file" title="${escapeHtml(entry.filename || '')}">${escapeHtml(entry.filename || '--')}</span>`;
+        html += `<span class="scan-history-status">${escapeHtml(st.text)}</span>`;
         html += `</div>`;
+        html += `<div class="scan-history-detail" style="display:none">${renderHistoryDetail(entry)}</div>`;
     });
-    container.innerHTML = html;
+    containers.forEach(c => { c.innerHTML = html; });
 }
 
-function clearScanHistory() {
-    scanHistory = [];
-    const container = document.getElementById('scanner-history-list');
-    if (container) container.innerHTML = '';
+function toggleHistoryDetail(el) {
+    const panel = el.nextElementSibling;
+    if (!panel || !panel.classList.contains('scan-history-detail')) return;
+    const open = panel.style.display !== 'none';
+    panel.style.display = open ? 'none' : 'block';
+    const caret = el.querySelector('.scan-history-more');
+    if (caret) caret.innerHTML = open ? '&#9656;' : '&#9662;';
 }
+
+function renderHistoryDetail(entry) {
+    const r = entry.result || {};
+    let h = '<div class="scan-history-detail-inner">';
+
+    const kv = [];
+    if (entry.sha256) kv.push(['SHA256', entry.sha256]);
+    if (entry.size != null) kv.push(['Size', formatSize(entry.size)]);
+    if (r.model) kv.push(['Model', r.model]);
+    if (entry.score != null) kv.push(['Score', Number(entry.score).toFixed(4)]);
+    if (r.engine) kv.push(['Engine', r.engine]);
+    if (r.threat_name) kv.push(['Threat', r.threat_name]);
+    if (r.capability_count != null) kv.push(['Capabilities', r.capability_count]);
+    if (Array.isArray(r.tactics) && r.tactics.length) kv.push(['ATT&CK', r.tactics.join(', ')]);
+    if (r.elapsed_ms != null) kv.push(['Elapsed', r.elapsed_ms + ' ms']);
+    if (kv.length) {
+        h += '<div class="scan-hist-kv">';
+        kv.forEach(([k, v]) => {
+            h += `<div><span class="k">${escapeHtml(k)}</span><span class="v">${escapeHtml(String(v))}</span></div>`;
+        });
+        h += '</div>';
+    }
+
+    // EMBER "why" explanation (reuse the rich renderer)
+    if (r.explanation && typeof renderEmberExplanation === 'function') {
+        h += renderEmberExplanation(r.explanation);
+    }
+
+    // capa capabilities
+    if (Array.isArray(r.capabilities) && r.capabilities.length) {
+        h += '<div class="ember-more-sub">Capabilities</div><div class="ember-api-list">';
+        r.capabilities.slice(0, 60).forEach(c => {
+            const name = (typeof c === 'string') ? c : (c.name || c.rule || '');
+            const ns = (typeof c === 'object' && c.namespace) ? c.namespace : '';
+            h += `<span class="ember-api-chip" title="${escapeHtml(ns)}">${escapeHtml(name)}</span>`;
+        });
+        h += '</div>';
+    }
+
+    // raw tool output / error
+    if (r.output) h += `<pre class="scan-hist-output">${escapeHtml(String(r.output))}</pre>`;
+    if (r.error) h += `<div class="scanner-error">${escapeHtml(String(r.error))}</div>`;
+
+    h += '</div>';
+    return h;
+}
+
+async function clearScanHistory() {
+    try {
+        await fetch('/api/scan/history/clear', { method: 'POST' });
+    } catch (e) { /* ignore */ }
+    loadScanHistory();
+}
+
+// Roll up per-tool scan summaries into one verdict label (mirrors the backend
+// _overall_verdict). Used for graph node/sample badges.
+function _nodeVerdict(scans) {
+    if (!scans || !scans.length) return 'unknown';
+    if (scans.some(s => s.verdict === 'malicious' || s.detected === true)) return 'malicious';
+    if (scans.some(s => s.verdict === 'detected')) return 'detected';
+    if (scans.some(s => s.verdict === 'clean' || s.verdict === 'benign' || s.clean === true)) return 'clean';
+    if (scans.some(s => s.verdict === 'analyzed')) return 'analyzed';
+    return 'unknown';
+}
+
+const _VERDICT_META = {
+    malicious: { text: 'MALICIOUS', cls: 'history-detected' },
+    detected:  { text: 'DETECTED',  cls: 'history-detected' },
+    clean:     { text: 'CLEAN',     cls: 'history-clean' },
+    analyzed:  { text: 'ANALYZED',  cls: 'history-unknown' },
+    unknown:   { text: 'UNSCANNED', cls: 'history-unknown' },
+};
+
+// Render a scan list (each entry shaped like a history row, carrying .result)
+// as collapsible rows reusing the shared history renderers.
+function renderGraphScans(scans, heading = 'Static Scans') {
+    if (!scans || !scans.length) return '';
+    let h = `<div class="gd-section">${escapeHtml(heading)} <span class="gd-count">${scans.length}</span></div>`;
+    h += '<div class="gd-scan-list">';
+    scans.forEach(sc => {
+        const st = _histStatus(sc);
+        h += `<div class="scan-history-entry ${st.cls}" onclick="toggleHistoryDetail(this)">`;
+        h += `<span class="scan-history-more">&#9656;</span>`;
+        h += `<span class="scan-history-tool">${escapeHtml(sc.tool || '?')}</span>`;
+        h += `<span class="scan-history-status">${escapeHtml(st.text)}</span>`;
+        h += `</div>`;
+        h += `<div class="scan-history-detail" style="display:none">${renderHistoryDetail(sc)}</div>`;
+    });
+    h += '</div>';
+    return h;
+}
+
+// Back-compat shims: older call sites just refresh the shared timeline.
+function renderScanHistory() { loadScanHistory(); }
 
 // =============================================
 // EMBER2024 ML CLASSIFIER
@@ -1569,6 +1698,9 @@ function renderEmberResult(data, container) {
     if (data.size != null) html += `<div class="ember-detail"><span class="ember-detail-k">Size</span><span class="ember-detail-v">${formatSize(data.size)}</span></div>`;
     html += `</div>`;
 
+    // --- Why: model explanation (per-feature-group SHAP + raw highlights) ---
+    html += renderEmberExplanation(data.explanation || {});
+
     if (data.sha256) {
         html += `<div class="scan-output-header">SHA256:</div>`;
         html += `<pre class="scan-output">${escapeHtml(data.sha256)}</pre>`;
@@ -1578,34 +1710,144 @@ function renderEmberResult(data, container) {
     container.innerHTML = html;
 }
 
-function renderEmberHistory() {
-    const container = document.getElementById('ember-history-list');
-    if (!container || emberHistory.length === 0) {
-        if (container) container.innerHTML = '';
-        return;
+// Render the EMBER "why" panel: signed per-feature-group contributions
+// (log-odds space; + pushes toward malicious, - toward benign) plus concrete
+// raw-feature highlights, with a "> more" expander for the full detail.
+function renderEmberExplanation(ex) {
+    if (!ex || (!ex.contributions && !ex.details)) return '';
+    const det = ex.details || {};
+    let html = '';
+
+    // Feature-group contribution bars (top drivers).
+    const contribs = (ex.contributions || []).filter(c => Math.abs(c.value) > 0.001);
+    if (contribs.length) {
+        const maxAbs = Math.max(...contribs.map(c => Math.abs(c.value))) || 1;
+        html += `<div class="ember-why-header">Why this verdict &mdash; feature-group contributions <span class="ember-why-sub">(+ &rarr; malicious, &minus; &rarr; benign)</span></div>`;
+        html += `<div class="ember-why-list">`;
+        contribs.slice(0, 6).forEach(c => {
+            const w = Math.round(Math.abs(c.value) / maxAbs * 100);
+            const mal = c.value >= 0;
+            html += `<div class="ember-why-row">`;
+            html += `<span class="ember-why-group">${escapeHtml(c.group)}</span>`;
+            html += `<div class="ember-why-bar-track"><div class="ember-why-bar ${mal ? 'why-mal' : 'why-ben'}" style="width:${w}%"></div></div>`;
+            html += `<span class="ember-why-val ${mal ? 'why-mal-t' : 'why-ben-t'}">${c.value >= 0 ? '+' : ''}${c.value.toFixed(2)}</span>`;
+            html += `</div>`;
+        });
+        html += `</div>`;
     }
 
-    let html = '';
-    emberHistory.forEach(entry => {
-        const ts = new Date(entry.timestamp).toLocaleTimeString('en-GB', {hour12: false});
-        const malicious = !!entry.malicious;
-        const statusClass = malicious ? 'history-detected' : 'history-clean';
-        const pct = typeof entry.score === 'number' ? (Math.round(entry.score * 1000) / 10) + '%' : '?';
-        html += `<div class="scan-history-entry ${statusClass}">`;
-        html += `<span class="scan-history-time">${ts}</span>`;
-        html += `<span class="scan-history-file">${escapeHtml(entry.filename || '--')}</span>`;
-        html += `<span class="scan-history-tool">${escapeHtml(entry.model || 'EMBER')}</span>`;
-        html += `<span class="scan-history-status">${pct}</span>`;
+    // Compact highlight chips.
+    const chips = [];
+    if (det.file_entropy != null) {
+        const packed = det.packed_sections && det.packed_sections.length;
+        chips.push({ t: `entropy ${det.file_entropy}`, c: (det.file_entropy >= 7 ? 'chip-warn' : '') });
+        if (packed) chips.push({ t: `packed: ${det.packed_sections.join(', ')}`, c: 'chip-warn' });
+    }
+    if (det.dll_count != null) chips.push({ t: `${det.dll_count} DLLs / ${det.import_count} imports`, c: '' });
+    const auth = det.authenticode || {};
+    const signed = auth.num_certs && auth.num_certs > 0;
+    chips.push({ t: signed ? 'signed' : 'unsigned', c: signed ? '' : 'chip-warn' });
+    if (det.strings && det.strings.count != null) chips.push({ t: `${det.strings.count} strings`, c: '' });
+    if (chips.length) {
+        html += `<div class="ember-chip-row">`;
+        chips.forEach(ch => html += `<span class="ember-chip ${ch.c}">${escapeHtml(ch.t)}</span>`);
         html += `</div>`;
-    });
-    container.innerHTML = html;
+    }
+
+    // Notable / suspicious APIs actually present in the import table.
+    const apis = det.notable_apis || [];
+    if (apis.length) {
+        html += `<div class="ember-why-header">Notable APIs <span class="ember-why-sub">(${apis.length})</span></div>`;
+        html += `<div class="ember-api-list">`;
+        apis.slice(0, 14).forEach(n => html += `<span class="ember-api-chip" title="${escapeHtml(n.dll || '')}">${escapeHtml(n.api)}</span>`);
+        if (apis.length > 14) {
+            html += `<span class="ember-api-chip ember-api-more" onclick="toggleApiMore(this)">+${apis.length - 14}</span>`;
+            apis.slice(14).forEach(n => html += `<span class="ember-api-chip api-extra" style="display:none" title="${escapeHtml(n.dll || '')}">${escapeHtml(n.api)}</span>`);
+        }
+        html += `</div>`;
+    }
+
+    // "> more" expander with the full detail dump. DOM-relative toggle (no id):
+    // this block is rendered many times (live result + every history row, in
+    // three containers), so element ids would collide.
+    html += `<div class="ember-more-toggle" onclick="toggleEmberMore(this)">&#9656; more detail</div>`;
+    html += `<div class="ember-more" style="display:none">`;
+
+    // All feature-group contributions
+    if (ex.contributions && ex.contributions.length) {
+        html += `<div class="ember-more-sub">All feature-group contributions (base ${ex.base_value != null ? ex.base_value : '?'})</div>`;
+        html += `<table class="ember-more-table"><tr><th>group</th><th>contribution</th></tr>`;
+        ex.contributions.forEach(c => {
+            html += `<tr><td>${escapeHtml(c.group)}</td><td class="${c.value >= 0 ? 'why-mal-t' : 'why-ben-t'}">${c.value >= 0 ? '+' : ''}${c.value}</td></tr>`;
+        });
+        html += `</table>`;
+    }
+
+    // All sections (entropy-sorted)
+    if (det.sections && det.sections.length) {
+        html += `<div class="ember-more-sub">Sections (entry: ${escapeHtml(det.entry_section || '?')})</div>`;
+        html += `<table class="ember-more-table"><tr><th>name</th><th>entropy</th><th>size</th><th>vsize</th></tr>`;
+        det.sections.forEach(s => {
+            const hot = s.entropy >= 7 ? ' class="chip-warn"' : '';
+            html += `<tr><td>${escapeHtml(s.name)}</td><td${hot}>${s.entropy}</td><td>${formatSize(s.size)}</td><td>${formatSize(s.vsize)}</td></tr>`;
+        });
+        html += `</table>`;
+    }
+
+    // Top DLLs
+    if (det.top_dlls && det.top_dlls.length) {
+        html += `<div class="ember-more-sub">Top imported DLLs</div>`;
+        html += `<table class="ember-more-table"><tr><th>dll</th><th>imports</th></tr>`;
+        det.top_dlls.forEach(d => html += `<tr><td>${escapeHtml(d.dll)}</td><td>${d.count}</td></tr>`);
+        html += `</table>`;
+    }
+
+    // All notable APIs
+    if (apis.length) {
+        html += `<div class="ember-more-sub">All notable APIs</div>`;
+        html += `<div class="ember-api-list">`;
+        apis.forEach(n => html += `<span class="ember-api-chip" title="${escapeHtml(n.dll || '')}">${escapeHtml(n.api)}</span>`);
+        html += `</div>`;
+    }
+
+    // Strings + PE warnings
+    if (det.strings) {
+        const s = det.strings;
+        html += `<div class="ember-more-sub">Strings</div>`;
+        html += `<div class="ember-more-kv">count: ${s.count ?? '?'} &middot; avg len: ${s.avg_length ?? '?'} &middot; entropy: ${s.entropy ?? '?'} &middot; urls: ${s.urls ?? 0} &middot; paths: ${s.paths ?? 0} &middot; registry: ${s.registry ?? 0}</div>`;
+    }
+    if (det.pe_warnings && det.pe_warnings.length) {
+        html += `<div class="ember-more-sub">PE parser warnings</div>`;
+        html += `<div class="ember-more-kv">${det.pe_warnings.map(escapeHtml).join(', ')}</div>`;
+    }
+    if (ex.contributions_error) html += `<div class="ember-more-kv chip-warn">contributions error: ${escapeHtml(ex.contributions_error)}</div>`;
+    if (ex.details_error) html += `<div class="ember-more-kv chip-warn">details error: ${escapeHtml(ex.details_error)}</div>`;
+
+    html += `</div>`;
+    return html;
 }
 
-function clearEmberHistory() {
-    emberHistory = [];
-    const container = document.getElementById('ember-history-list');
-    if (container) container.innerHTML = '';
+function toggleEmberMore(el) {
+    const panel = el.nextElementSibling;
+    if (!panel || !panel.classList.contains('ember-more')) return;
+    const open = panel.style.display !== 'none';
+    panel.style.display = open ? 'none' : 'block';
+    el.innerHTML = (open ? '&#9656;' : '&#9662;') + ' more detail';
 }
+
+function toggleApiMore(el) {
+    // Reveal/hide the notable-API chips beyond the first 14, scoped to the
+    // clicked chip's own list (no ids -> safe across repeated renders).
+    const extras = el.parentElement.querySelectorAll('.api-extra');
+    if (!extras.length) return;
+    const hidden = extras[0].style.display === 'none';
+    extras.forEach(e => { e.style.display = hidden ? '' : 'none'; });
+    el.textContent = hidden ? 'less' : ('+' + extras.length);
+}
+
+function renderEmberHistory() { loadScanHistory(); }
+
+function clearEmberHistory() { clearScanHistory(); }
 
 // =============================================
 // CAPA CAPABILITY DETECTION
@@ -1757,32 +1999,9 @@ function renderCapaResult(data, container) {
     container.innerHTML = html;
 }
 
-function renderCapaHistory() {
-    const container = document.getElementById('capa-history-list');
-    if (!container || capaHistory.length === 0) {
-        if (container) container.innerHTML = '';
-        return;
-    }
-    let html = '';
-    capaHistory.forEach(entry => {
-        const ts = new Date(entry.timestamp).toLocaleTimeString('en-GB', {hour12: false});
-        const count = entry.capability_count != null ? entry.capability_count : (entry.capabilities || []).length;
-        const statusClass = count > 0 ? 'history-detected' : 'history-clean';
-        html += `<div class="scan-history-entry ${statusClass}">`;
-        html += `<span class="scan-history-time">${ts}</span>`;
-        html += `<span class="scan-history-file">${escapeHtml(entry.filename || '--')}</span>`;
-        html += `<span class="scan-history-tool">capa</span>`;
-        html += `<span class="scan-history-status">${count} caps</span>`;
-        html += `</div>`;
-    });
-    container.innerHTML = html;
-}
+function renderCapaHistory() { loadScanHistory(); }
 
-function clearCapaHistory() {
-    capaHistory = [];
-    const container = document.getElementById('capa-history-list');
-    if (container) container.innerHTML = '';
-}
+function clearCapaHistory() { clearScanHistory(); }
 
 // =============================================
 // HEX EDITOR
@@ -4628,11 +4847,17 @@ async function renderGraphLanding() {
     landing.innerHTML = '<div class="graph-landing-loading">Loading candidate processes...</div>';
 
     let roots = [];
+    let samples = [];
     try {
-        const resp = await fetch('/api/process-graph/roots');
-        if (resp.ok) roots = await resp.json();
+        const [rootsResp, sampResp] = await Promise.all([
+            fetch('/api/process-graph/roots'),
+            fetch('/api/graph/samples'),
+        ]);
+        if (rootsResp.ok) roots = await rootsResp.json();
+        if (sampResp.ok) { const d = await sampResp.json(); samples = d.samples || []; }
     } catch (e) { /* ignore */ }
     if (!Array.isArray(roots)) roots = [];
+    if (!Array.isArray(samples)) samples = [];
 
     // Optional name/pid filter typed into the focus field.
     const q = (document.getElementById('graph-search')?.value || '').trim().toLowerCase();
@@ -4643,8 +4868,50 @@ async function renderGraphLanding() {
             (r.name || '').toLowerCase().includes(q) ||
             (r.image || '').toLowerCase().includes(q));
     }
+    let filteredSamples = samples;
+    if (q) {
+        filteredSamples = samples.filter(s =>
+            (s.filename || '').toLowerCase().includes(q) ||
+            (s.sha256 || '').toLowerCase().includes(q) ||
+            String(s.pid || '').includes(q));
+    }
+    graphState._landingSamples = filteredSamples;
 
     let html = '<div class="graph-landing-inner">';
+
+    // Samples rail: submitted/scanned files (executed ones pivot to their tree,
+    // static-only ones expand their scan verdicts inline).
+    if (filteredSamples.length) {
+        html += '<div class="graph-landing-title">Samples</div>';
+        html += '<div class="graph-landing-hint">Files submitted or scanned. Executed samples open their process tree; static-only samples expand their scan verdicts.</div>';
+        html += '<div class="graph-sample-list">';
+        filteredSamples.forEach((s, i) => {
+            const vm = _VERDICT_META[s.verdict] || _VERDICT_META.unknown;
+            const badges = [];
+            if (s.executed) badges.push('<span class="glc-badge exec">executed</span>');
+            else badges.push('<span class="glc-badge static">static-only</span>');
+            if (s.detonated) badges.push('<span class="glc-badge det">detonated</span>');
+            if (s.target) badges.push(`<span class="glc-badge">${escapeHtml(String(s.target))}</span>`);
+            let tools = '';
+            (s.scans || []).forEach(sc => {
+                const st = _histStatus(sc);
+                tools += `<span class="gsc-tool ${st.cls}">${escapeHtml(sc.tool || '?')} · ${escapeHtml(st.text)}</span>`;
+            });
+            html += `<div class="graph-sample-card v-${escapeHtml(s.verdict)}" data-idx="${i}" data-pid="${s.executed ? escapeHtml(String(s.pid)) : ''}">
+                <div class="gsc-head">
+                    <span class="gsc-name" title="${escapeHtml(s.filename || '')}">${escapeHtml(s.filename || '--')}</span>
+                    <span class="gsc-verdict ${vm.cls}">${escapeHtml(vm.text)}</span>
+                </div>
+                ${s.sha256 ? `<div class="gsc-sha" title="${escapeHtml(s.sha256)}">${escapeHtml(s.sha256)}</div>` : ''}
+                <div class="gsc-badges">${badges.join('')}${s.size != null ? `<span class="glc-badge">${escapeHtml(formatSize(s.size))}</span>` : ''}</div>
+                ${tools ? `<div class="gsc-tools">${tools}</div>` : ''}
+                <div class="gsc-detail" style="display:none"></div>
+                <div class="gsc-foot">${s.executed ? '&#9673; Open process tree (PID ' + escapeHtml(String(s.pid)) + ')' : '&#9656; Show scan details'}</div>
+            </div>`;
+        });
+        html += '</div>';
+    }
+
     html += '<div class="graph-landing-title">Investigate a process</div>';
     html += '<div class="graph-landing-hint">Pick a process below, or type a PID / name in the focus field above.</div>';
     if (!filtered.length) {
@@ -4670,6 +4937,31 @@ async function renderGraphLanding() {
 
     landing.querySelectorAll('.graph-landing-card[data-pid]').forEach(card => {
         card.addEventListener('click', () => focusProcessGraph(card.dataset.pid, { reset: true }));
+    });
+
+    // Sample cards: executed samples pivot to their process tree; static-only
+    // samples toggle an inline scan-detail panel.
+    landing.querySelectorAll('.graph-sample-card').forEach(card => {
+        card.addEventListener('click', (e) => {
+            // Clicks inside an expanded detail drive its own row toggles.
+            if (e.target.closest('.gsc-detail')) return;
+            const pid = card.dataset.pid;
+            if (pid) { focusProcessGraph(pid, { reset: true }); return; }
+            const idx = parseInt(card.dataset.idx);
+            const s = (graphState._landingSamples || [])[idx];
+            const det = card.querySelector('.gsc-detail');
+            const foot = card.querySelector('.gsc-foot');
+            if (!det) return;
+            if (!det.dataset.filled) {
+                det.innerHTML = (s && s.scans && s.scans.length)
+                    ? renderGraphScans(s.scans, 'Scan Results')
+                    : '<div class="scan-history-empty">No scan details recorded.</div>';
+                det.dataset.filled = '1';
+            }
+            const open = det.style.display !== 'none';
+            det.style.display = open ? 'none' : 'block';
+            if (foot) foot.innerHTML = (open ? '&#9656;' : '&#9662;') + ' Show scan details';
+        });
     });
 }
 
@@ -4763,6 +5055,8 @@ function buildGraph(payload) {
             isAncestor: !!proc.is_ancestor,
             depth: proc.depth || 0,
             alertsCount: proc.alerts_count || 0,
+            scans: proc.scans || [],
+            scanVerdict: _nodeVerdict(proc.scans || []),
             x: 0, y: 0, vx: 0, vy: 0,
             radius: proc.is_root ? 26 : Math.max(13, Math.min(26, 13 + threats * 2)),
         };
@@ -5400,6 +5694,27 @@ function renderGraph() {
             ctx.fillText(String(node.threats), bx, by);
         }
 
+        // Scan verdict indicator (bottom-left): matched EMBER/capa/TC/DC result
+        if (node.type === 'process' && node.scans && node.scans.length) {
+            const vColors = { malicious: '#ef4444', detected: '#ef4444',
+                              clean: '#4ade80', analyzed: '#38bdf8', unknown: '#64748b' };
+            const vc = vColors[node.scanVerdict] || '#64748b';
+            const sbx = node.x - r * 0.7;
+            const sby = node.y + r * 0.7;
+            ctx.beginPath();
+            ctx.arc(sbx, sby, 6, 0, Math.PI * 2);
+            ctx.fillStyle = vc;
+            ctx.fill();
+            ctx.strokeStyle = '#0b1220';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+            ctx.font = 'bold 7px monospace';
+            ctx.fillStyle = '#0b1220';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('S', sbx, sby);
+        }
+
         // FOCUS badge for the root node
         if (node.isRoot) {
             ctx.font = 'bold 8px monospace';
@@ -5430,6 +5745,10 @@ function showGraphTooltip(node, sx, sy) {
         html += `<div class="tt-field"><span>PID:</span> ${node.pid}</div>`;
         if (node.image) html += `<div class="tt-field"><span>Image:</span> ${escapeHtml(node.image)}</div>`;
         if (node.threats) html += `<div class="tt-field"><span>Threats:</span> ${node.threats}</div>`;
+        if (node.scans && node.scans.length) {
+            const vm = _VERDICT_META[node.scanVerdict] || _VERDICT_META.unknown;
+            html += `<div class="tt-field"><span>Scan:</span> ${escapeHtml(vm.text)} (${node.scans.length})</div>`;
+        }
     } else if (node.type === 'network') {
         html += `<div class="tt-field"><span>IP:</span> ${node.ip}:${node.port}</div>`;
         html += `<div class="tt-field"><span>Protocol:</span> ${node.protocol || 'tcp'}</div>`;
@@ -5521,6 +5840,11 @@ function showGraphDetail(node) {
         if (node.image) {
             html += `<div class="gd-section">Digital Signature</div>`;
             html += `<div class="gd-sig-body" id="gd-sig-body"><button class="gd-sig-btn" data-sig-path="${escapeHtml(node.image)}">&#128273; Check who signed this</button></div>`;
+        }
+
+        // Static-analysis verdicts matched to this image by SHA256
+        if (node.scans && node.scans.length) {
+            html += renderGraphScans(node.scans);
         }
 
         // Connections from this node

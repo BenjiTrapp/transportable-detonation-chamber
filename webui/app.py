@@ -19,6 +19,7 @@ import threading
 import subprocess
 from pathlib import Path
 from flask import Flask, render_template, jsonify, request, send_from_directory
+from werkzeug.utils import secure_filename
 import requests
 
 app = Flask(__name__)
@@ -33,6 +34,8 @@ WEBUI_PORT = int(os.environ.get("WEBUI_PORT", "9000"))
 VM_IP = os.environ.get("TDC_VM_IP", "")
 VM_WEBUI_URL = os.environ.get("TDC_VM_WEBUI", "")
 SUBMISSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "submissions.json")
+SCAN_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan_history.json")
+SCAN_HISTORY_MAX = 200
 
 
 def _detect_vm_ip():
@@ -73,6 +76,262 @@ events_store = {
     "sessions": [],
 }
 store_lock = threading.Lock()
+
+# --- Scan History (shared timeline across all static scanners) ---
+# Persists every scan (EMBER, capa, ThreatCheck, DefenderCheck) regardless of
+# how it was triggered (web UI, curl/API, or MCP - the MCP server proxies to
+# these same /api/scan/* endpoints). Read back by GET /api/scan/history.
+scan_history_lock = threading.Lock()
+
+
+def _load_scan_history():
+    if os.path.isfile(SCAN_HISTORY_FILE):
+        try:
+            with open(SCAN_HISTORY_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return []
+    return []
+
+
+def _save_scan_history(history):
+    try:
+        with open(SCAN_HISTORY_FILE, "w") as f:
+            json.dump(history, f, indent=2)
+    except IOError:
+        pass
+
+
+def _normalize_scan(tool, result):
+    """Derive a normalized (verdict, detected, clean, score) from a raw scan
+    result so the shared timeline can render a consistent status column."""
+    verdict, detected, clean, score = "unknown", None, None, None
+    if not isinstance(result, dict):
+        return verdict, detected, clean, score
+    if result.get("score") is not None:
+        try:
+            score = float(result["score"])
+        except (TypeError, ValueError):
+            score = None
+    if str(result.get("verdict", "")).lower() in ("malicious", "benign"):  # EMBER
+        verdict = str(result["verdict"]).lower()
+        detected = bool(result.get("malicious"))
+        clean = not detected
+    elif "detected" in result or "clean" in result:  # ThreatCheck / DefenderCheck
+        detected = bool(result.get("detected"))
+        clean = bool(result.get("clean"))
+        verdict = "detected" if detected else ("clean" if clean else "unknown")
+    elif tool and tool.lower() == "capa":  # capa reports capabilities, not a verdict
+        cc = result.get("capability_count")
+        verdict = "analyzed" if cc is not None else "unknown"
+    return verdict, detected, clean, score
+
+
+def _record_scan(tool, filename, result, status="ok"):
+    """Append a scan to the shared history timeline (best-effort).
+
+    ``result`` is the full JSON dict returned to the client (stored verbatim
+    for the "> more" expander); ``status`` is "ok", "timeout", or "error".
+    """
+    import datetime
+    try:
+        result = result if isinstance(result, dict) else {}
+        verdict, detected, clean, score = _normalize_scan(tool, result)
+        sha256 = result.get("sha256", "") or ""
+        entry = {
+            "id": hashlib.md5(f"{sha256}{tool}{time.time()}".encode()).hexdigest()[:12],
+            "timestamp": datetime.datetime.now().isoformat(),
+            "tool": tool or result.get("tool") or "?",
+            "filename": filename or "--",
+            "sha256": sha256,
+            "size": result.get("size"),
+            "status": status,
+            "verdict": verdict,
+            "detected": detected,
+            "clean": clean,
+            "score": score,
+            "result": result,   # full result for the detail expander
+        }
+        with scan_history_lock:
+            history = _load_scan_history()
+            history.insert(0, entry)
+            if len(history) > SCAN_HISTORY_MAX:
+                del history[SCAN_HISTORY_MAX:]
+            _save_scan_history(history)
+    except Exception:
+        pass  # history must never break a scan
+
+
+# --- Scan <-> process/sample correlation (graph enrichment) ---
+
+def _extract_sha256(hashes):
+    """Pull the SHA256 out of a Sysmon EID-1 Hashes string such as
+    'SHA1=..,MD5=..,SHA256=ABC..,IMPHASH=..'. Returns lowercase hex or ''."""
+    if not hashes:
+        return ""
+    for part in str(hashes).replace(";", ",").split(","):
+        part = part.strip()
+        if part[:7].upper() == "SHA256=":
+            return part.split("=", 1)[1].strip().lower()
+    return ""
+
+
+def _summarize_scan_entry(e):
+    """Compact per-tool scan summary for the graph. Carries the full ``result``
+    so the detail-panel expander can reuse renderHistoryDetail()."""
+    return {
+        "tool": e.get("tool"),
+        "verdict": e.get("verdict"),
+        "detected": e.get("detected"),
+        "clean": e.get("clean"),
+        "score": e.get("score"),
+        "status": e.get("status"),
+        "timestamp": e.get("timestamp"),
+        "id": e.get("id"),
+        "sha256": e.get("sha256"),
+        "size": e.get("size"),
+        "filename": e.get("filename"),
+        "result": e.get("result"),
+    }
+
+
+def _scan_index():
+    """Index the scan-history timeline by sha256 and by filename. Each key maps
+    to {tool: latest-summary}. History is newest-first, so the first entry seen
+    per (key, tool) is the most recent one."""
+    by_sha, by_name = {}, {}
+    for e in _load_scan_history():
+        if not isinstance(e, dict):
+            continue
+        tool = (e.get("tool") or "?").lower()
+        summ = _summarize_scan_entry(e)
+        sha = (e.get("sha256") or "").lower()
+        if sha:
+            by_sha.setdefault(sha, {}).setdefault(tool, summ)
+        nm = (e.get("filename") or "").lower()
+        if nm and nm != "--":
+            by_name.setdefault(nm, {}).setdefault(tool, summ)
+    return by_sha, by_name
+
+
+def _overall_verdict(summaries):
+    """Roll up per-tool verdicts into one label for a badge."""
+    if not summaries:
+        return "unknown"
+    if any(s.get("verdict") == "malicious" or s.get("detected") for s in summaries):
+        return "malicious"
+    if any(s.get("verdict") == "detected" for s in summaries):
+        return "detected"
+    if any((s.get("verdict") in ("clean", "benign")) or s.get("clean") for s in summaries):
+        return "clean"
+    if any(s.get("verdict") == "analyzed" for s in summaries):
+        return "analyzed"
+    return "unknown"
+
+
+def _scans_for_node(node, by_sha):
+    """Scans authoritatively matched to a process node by image SHA256 only —
+    matching a running process to a scanned file by name would produce false
+    positives (e.g. an OS notepad.exe vs. a scanned notepad.exe)."""
+    sha = _extract_sha256(node.get("hashes"))
+    if sha and sha in by_sha:
+        return list(by_sha[sha].values())
+    return []
+
+
+def _build_samples(proc_map, by_sha, by_name):
+    """Union of submitted + scanned files, grouped by sha256 (falling back to
+    filename), each carrying its per-tool scans and — if it actually ran — its
+    live PID. Files that were only statically scanned (never executed, e.g. a
+    ransomware sample that must not be detonated) still appear here."""
+    subs = _load_submissions()
+    hist = _load_scan_history()
+
+    # filename(lower) -> sha, so name-only scans merge into the sha'd group.
+    name2sha = {}
+    for it in subs + hist:
+        if not isinstance(it, dict):
+            continue
+        sha = (it.get("sha256") or "").lower()
+        nm = (it.get("filename") or "").lower()
+        if sha and nm and nm != "--":
+            name2sha.setdefault(nm, sha)
+
+    samples = {}
+
+    def bucket(sha, nm, disp):
+        sha = (sha or "").lower()
+        nml = (nm or "").lower()
+        if not sha and nml in name2sha:
+            sha = name2sha[nml]
+        key = ("sha:" + sha) if sha else ("name:" + nml)
+        s = samples.get(key)
+        if s is None:
+            s = {"sha256": sha, "filename": disp or nm or "--", "size": None,
+                 "target": None, "submitted_at": None, "agent_pid": None,
+                 "scan_map": {}, "sources": set()}
+            samples[key] = s
+        return s
+
+    for sub in subs:  # newest-first: first submission per bucket wins
+        if not isinstance(sub, dict):
+            continue
+        s = bucket(sub.get("sha256"), sub.get("filename"), sub.get("filename"))
+        s["sources"].add("submission")
+        if s["submitted_at"] is None:
+            s["submitted_at"] = sub.get("timestamp")
+            s["target"] = sub.get("target")
+            s["agent_pid"] = sub.get("agent_pid")
+        if s["size"] is None and sub.get("size") is not None:
+            s["size"] = sub.get("size")
+
+    for e in hist:  # newest-first: keep latest per tool
+        if not isinstance(e, dict):
+            continue
+        s = bucket(e.get("sha256"), e.get("filename"), e.get("filename"))
+        s["sources"].add("scan")
+        tool = (e.get("tool") or "?").lower()
+        if tool not in s["scan_map"]:
+            s["scan_map"][tool] = _summarize_scan_entry(e)
+        if s["size"] is None and e.get("size") is not None:
+            s["size"] = e.get("size")
+
+    # Resolve each sample to a live PID via SHA256 match on process hashes.
+    sha2pid = {}
+    for pid, node in proc_map.items():
+        nsha = _extract_sha256(node.get("hashes"))
+        if nsha:
+            sha2pid.setdefault(nsha, pid)
+
+    out = []
+    for s in samples.values():
+        scans = list(s["scan_map"].values())
+        pid = sha2pid.get(s["sha256"]) if s["sha256"] else None
+        detonated = bool(proc_map.get(pid, {}).get("detonated")) if pid else False
+        out.append({
+            "sha256": s["sha256"],
+            "filename": s["filename"],
+            "size": s["size"],
+            "target": s["target"],
+            "submitted_at": s["submitted_at"],
+            "agent_pid": s["agent_pid"],
+            "pid": pid,
+            "executed": pid is not None,
+            "detonated": detonated,
+            "verdict": _overall_verdict(scans),
+            "scans": scans,
+            "sources": sorted(s["sources"]),
+        })
+
+    def _sort_ts(x):
+        ts = [x.get("submitted_at") or ""]
+        for sc in x.get("scans", []):
+            ts.append(sc.get("timestamp") or "")
+        return max(ts)
+
+    out.sort(key=_sort_ts, reverse=True)
+    return out
+
 
 # --- Submissions History ---
 submissions_lock = threading.Lock()
@@ -1601,6 +1860,12 @@ def api_process_graph():
         node.update(selected[pid])
         processes[pid] = node
 
+    # Attach static-scan verdicts (EMBER/capa/ThreatCheck/DefenderCheck) matched
+    # to each process by image SHA256, for graph verdict badges + detail panel.
+    scan_by_sha, _ = _scan_index()
+    for node in processes.values():
+        node["scans"] = _scans_for_node(node, scan_by_sha)
+
     # Scope activity events to the selected process set.
     network, dns, files, registry, injections = [], [], [], [], []
     for ev in sysmon_events:
@@ -1672,6 +1937,24 @@ def api_process_graph_roots():
     # Detonated first, then by threat count.
     candidates.sort(key=lambda c: (c["detonated"], c["threats"]), reverse=True)
     return jsonify(candidates[:50])
+
+
+@app.route("/api/graph/samples")
+def api_graph_samples():
+    """Submitted + scanned files for the graph landing 'Samples' rail. Includes
+    files that were only statically scanned and never executed, so a
+    static-only sample (e.g. a ransomware binary we must not detonate) is still
+    visible with its EMBER/capa/ThreatCheck verdicts."""
+    if not _is_sysmon_running() and VM_WEBUI_URL:
+        try:
+            r = requests.get(f"{VM_WEBUI_URL}/api/graph/samples", timeout=15)
+            if r.status_code == 200:
+                return jsonify(r.json())
+        except Exception:
+            pass
+    proc_map, _ = _build_full_process_map()
+    by_sha, by_name = _scan_index()
+    return jsonify({"samples": _build_samples(proc_map, by_sha, by_name)})
 
 
 @app.route("/api/sysmon")
@@ -2910,7 +3193,10 @@ def api_scan_threatcheck():
         import tempfile
         temp_dir = os.path.join(tempfile.gettempdir(), "scan_uploads")
         os.makedirs(temp_dir, exist_ok=True)
-        filepath = os.path.join(temp_dir, file.filename or "scan_target")
+        # Sanitize the browser-supplied name: raw names with spaces or
+        # characters illegal on Windows (e.g. "file 2.exe") make open() fail
+        # with OSError [Errno 22]. secure_filename yields a safe ASCII name.
+        filepath = os.path.join(temp_dir, secure_filename(file.filename or "") or "scan_target")
         with open(filepath, "wb") as f:
             f.write(file_bytes)
     elif not filepath or not os.path.isfile(filepath):
@@ -2928,7 +3214,7 @@ def api_scan_threatcheck():
         detected = "Identified" in output or "DETECTED" in output.upper()
         clean = "No threat found" in output
 
-        return jsonify({
+        resp = {
             "tool": "ThreatCheck",
             "engine": engine,
             "file_type": file_type,
@@ -2937,7 +3223,9 @@ def api_scan_threatcheck():
             "detected": detected,
             "clean": clean,
             "exit_code": result.returncode,
-        })
+        }
+        _record_scan("ThreatCheck", os.path.basename(filepath), resp)
+        return jsonify(resp)
     except subprocess.TimeoutExpired:
         return jsonify({"error": "ThreatCheck timed out (120s)"}), 504
     except Exception as e:
@@ -2959,7 +3247,10 @@ def api_scan_defendercheck():
         import tempfile
         temp_dir = os.path.join(tempfile.gettempdir(), "scan_uploads")
         os.makedirs(temp_dir, exist_ok=True)
-        filepath = os.path.join(temp_dir, file.filename or "scan_target")
+        # Sanitize the browser-supplied name: raw names with spaces or
+        # characters illegal on Windows (e.g. "file 2.exe") make open() fail
+        # with OSError [Errno 22]. secure_filename yields a safe ASCII name.
+        filepath = os.path.join(temp_dir, secure_filename(file.filename or "") or "scan_target")
         with open(filepath, "wb") as f:
             f.write(file_bytes)
     elif not filepath or not os.path.isfile(filepath):
@@ -2975,14 +3266,16 @@ def api_scan_defendercheck():
         detected = "Identified" in output or "detected" in output.lower()
         clean = "No threat found" in output
 
-        return jsonify({
+        resp = {
             "tool": "DefenderCheck",
             "filepath": filepath,
             "output": output.strip(),
             "detected": detected,
             "clean": clean,
             "exit_code": result.returncode,
-        })
+        }
+        _record_scan("DefenderCheck", os.path.basename(filepath), resp)
+        return jsonify(resp)
     except subprocess.TimeoutExpired:
         return jsonify({"error": "DefenderCheck timed out (120s)"}), 504
     except Exception as e:
@@ -3016,7 +3309,10 @@ def api_scan_ember():
         import tempfile
         temp_dir = os.path.join(tempfile.gettempdir(), "scan_uploads")
         os.makedirs(temp_dir, exist_ok=True)
-        filepath = os.path.join(temp_dir, file.filename or "scan_target")
+        # Sanitize the browser-supplied name: raw names with spaces or
+        # characters illegal on Windows (e.g. "file 2.exe") make open() fail
+        # with OSError [Errno 22]. secure_filename yields a safe ASCII name.
+        filepath = os.path.join(temp_dir, secure_filename(file.filename or "") or "scan_target")
         with open(filepath, "wb") as f:
             f.write(file_bytes)
     elif not filepath or not os.path.isfile(filepath):
@@ -3053,6 +3349,7 @@ def api_scan_ember():
             f"Verdict: {str(data.get('verdict', '')).upper()}\n"
             f"SHA256: {data.get('sha256')}"
         )
+        _record_scan("EMBER2024", os.path.basename(filepath), data)
         return jsonify(data)
     except subprocess.TimeoutExpired:
         return jsonify({"error": "EMBER scan timed out (120s)"}), 504
@@ -3071,30 +3368,69 @@ def api_scan_capa():
         return jsonify({"error": "capa not installed"}), 500
 
     filepath = request.form.get("path", "")
+    cleanup_dir = None
     if "file" in request.files:
         file = request.files["file"]
         file_bytes = file.read()
         import tempfile
-        temp_dir = os.path.join(tempfile.gettempdir(), "scan_uploads")
-        os.makedirs(temp_dir, exist_ok=True)
-        filepath = os.path.join(temp_dir, file.filename or "scan_target")
+        # Each upload gets its OWN directory. capa can run for a very long time
+        # on large/packed samples (it is x86-emulated on this ARM64 VM), and a
+        # still-running capa.exe keeps the sample file locked. With a shared
+        # fixed filename, the next upload's open(...,"wb") then fails with
+        # OSError [Errno 22] and every subsequent scan 500s. A unique dir per
+        # request isolates that and lets us clean up afterwards.
+        base = os.path.join(tempfile.gettempdir(), "scan_uploads")
+        os.makedirs(base, exist_ok=True)
+        cleanup_dir = tempfile.mkdtemp(dir=base)
+        # secure_filename strips spaces / Windows-illegal chars from the name.
+        filepath = os.path.join(cleanup_dir, secure_filename(file.filename or "") or "scan_target")
         with open(filepath, "wb") as f:
             f.write(file_bytes)
     elif not filepath or not os.path.isfile(filepath):
         return jsonify({"error": "No file provided or path not found"}), 400
 
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [CAPA_EXE, "-q", "-j", filepath],
-            capture_output=True, text=True, timeout=300,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             cwd=os.path.dirname(CAPA_EXE),
         )
-        stdout = (result.stdout or "").strip()
+        try:
+            out, err = proc.communicate(timeout=300)
+        except subprocess.TimeoutExpired:
+            # Force-kill the whole tree: capa may spawn analysis children, and
+            # proc.kill() alone can orphan one that keeps holding the sample.
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True)
+            try:
+                proc.communicate(timeout=10)
+            except Exception:
+                pass
+            _record_scan("capa", os.path.basename(filepath),
+                         {"tool": "capa", "error": "capa timed out (300s)"},
+                         status="timeout")
+            return jsonify({"error": "capa timed out (300s) - sample too large or packed for static capa analysis on this ARM64 VM"}), 504
+        returncode = proc.returncode
+        stdout = (out or "").strip()
         try:
             doc = json.loads(stdout)
         except ValueError:
-            err = (result.stderr or stdout or "no output").strip()
-            return jsonify({"error": f"capa produced no JSON: {err[:500]}"}), 500
+            errtxt = (err or stdout or "no output").strip()
+            low = errtxt.lower()
+            # capa is x86 and only understands x86/x64/.NET PEs. On this ARM64
+            # VM most local binaries are ARM64, which capa rejects outright.
+            if "arm64" in low or "unsupported" in low and "architecture" in low:
+                msg = ("capa cannot analyze this file: unsupported architecture "
+                       "(capa supports x86/x64 and .NET PEs, not ARM64/other).")
+            elif not stdout and not (err or "").strip():
+                msg = "capa produced no output (it may not support this file type)."
+            else:
+                msg = f"capa produced no JSON: {errtxt[:500]}"
+            _record_scan("capa", os.path.basename(filepath),
+                         {"tool": "capa", "error": msg, "exit_code": returncode,
+                          "stderr": errtxt[:1000]},
+                         status="error")
+            return jsonify({"error": msg}), 422
 
         meta = doc.get("meta", {}) or {}
         sample = meta.get("sample", {}) or {}
@@ -3136,7 +3472,7 @@ def api_scan_capa():
             "capability_count": len(capabilities),
             "tactics": tactics,
             "capabilities": capabilities,
-            "exit_code": result.returncode,
+            "exit_code": returncode,
         }
         data["output"] = (
             f"Format: {data['format']} / {data['arch']} / {data['os']}\n"
@@ -3144,11 +3480,16 @@ def api_scan_capa():
             f"ATT&CK tactics: {', '.join(tactics) if tactics else 'none'}\n"
             f"SHA256: {data['sha256']}"
         )
+        _record_scan("capa", os.path.basename(filepath), data)
         return jsonify(data)
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "capa timed out (300s)"}), 504
     except Exception as e:
+        _record_scan("capa", os.path.basename(filepath),
+                     {"tool": "capa", "error": str(e)}, status="error")
         return jsonify({"error": str(e)}), 500
+    finally:
+        if cleanup_dir:
+            import shutil
+            shutil.rmtree(cleanup_dir, ignore_errors=True)
 
 
 @app.route("/api/scan/status")
@@ -3188,6 +3529,30 @@ def api_scan_status():
             "path": BEACONEYE_EXE,
         },
     })
+
+
+@app.route("/api/scan/history")
+def api_scan_history():
+    """Return the shared scan-history timeline (most recent first).
+
+    Optional ?limit=N caps the number of entries returned.
+    """
+    history = _load_scan_history()
+    try:
+        limit = int(request.args.get("limit", "0"))
+        if limit > 0:
+            history = history[:limit]
+    except (TypeError, ValueError):
+        pass
+    return jsonify({"count": len(history), "history": history})
+
+
+@app.route("/api/scan/history/clear", methods=["POST"])
+def api_scan_history_clear():
+    """Clear the shared scan-history timeline."""
+    with scan_history_lock:
+        _save_scan_history([])
+    return jsonify({"ok": True})
 
 
 # --- Beacon Scanner Endpoints ---

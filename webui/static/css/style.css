@@ -3509,6 +3509,92 @@ body.hex-resizing {
 }
 .glc-badge.det { background: rgba(251,191,36,0.18); color: #fbbf24; }
 .glc-badge.threat { background: rgba(239,68,68,0.18); color: #f87171; }
+.glc-badge.exec { background: rgba(56,189,248,0.18); color: #38bdf8; }
+.glc-badge.static { background: rgba(148,163,184,0.18); color: #94a3b8; }
+
+/* --- Process graph landing: sample cards --- */
+.graph-sample-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 10px;
+    margin: 8px 0 18px;
+}
+.graph-sample-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-left: 3px solid #64748b;
+    border-radius: 8px;
+    padding: 10px 12px;
+    cursor: pointer;
+    transition: border-color .12s, background .12s;
+}
+.graph-sample-card:hover { background: var(--bg-tertiary, rgba(148,163,184,0.06)); border-color: #38bdf8; }
+.graph-sample-card.v-malicious, .graph-sample-card.v-detected { border-left-color: #ef4444; }
+.graph-sample-card.v-clean { border-left-color: #4ade80; }
+.graph-sample-card.v-analyzed { border-left-color: #38bdf8; }
+.gsc-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+.gsc-name {
+    font-weight: 600;
+    font-size: 13px;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.gsc-verdict {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 10px;
+    flex-shrink: 0;
+}
+.gsc-verdict.history-detected { background: rgba(239,68,68,0.18); color: #f87171; }
+.gsc-verdict.history-clean { background: rgba(74,222,128,0.16); color: #4ade80; }
+.gsc-verdict.history-unknown { background: rgba(148,163,184,0.16); color: #94a3b8; }
+.gsc-sha {
+    font-family: monospace;
+    font-size: 10px;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    margin-top: 4px;
+}
+.gsc-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+}
+.gsc-tools {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-top: 8px;
+}
+.gsc-tool {
+    font-size: 10px;
+    padding: 2px 7px;
+    border-radius: 4px;
+    background: rgba(148,163,184,0.15);
+    color: var(--text-secondary);
+}
+.gsc-tool.history-detected { background: rgba(239,68,68,0.18); color: #f87171; }
+.gsc-tool.history-clean { background: rgba(74,222,128,0.16); color: #4ade80; }
+.gsc-foot {
+    margin-top: 8px;
+    font-size: 11px;
+    color: #38bdf8;
+}
+.gsc-detail { margin-top: 8px; }
+
+/* Scan list inside the graph detail panel */
+.gd-scan-list { margin-top: 6px; }
 
 /* --- Process graph breadcrumb --- */
 .graph-breadcrumb {
@@ -5221,7 +5307,10 @@ body.hex-resizing {
     font-size: 11px;
     border-radius: 3px;
     border-left: 3px solid transparent;
+    cursor: pointer;
 }
+.scan-history-entry:hover { background: rgba(148,163,184,0.06); }
+.scan-history-more { color: var(--text-muted); font-size: 10px; min-width: 12px; user-select: none; }
 .scan-history-entry.history-clean { border-left-color: #22c55e; }
 .scan-history-entry.history-detected { border-left-color: #ef4444; background: rgba(239,68,68,0.03); }
 .scan-history-entry.history-unknown { border-left-color: #fbbf24; }
@@ -5232,6 +5321,35 @@ body.hex-resizing {
 .history-clean .scan-history-status { color: #22c55e; }
 .history-detected .scan-history-status { color: #ef4444; }
 .history-unknown .scan-history-status { color: #fbbf24; }
+
+.scan-history-empty { color: var(--text-muted); font-size: 11px; padding: 8px 10px; font-style: italic; }
+
+.scan-history-detail {
+    margin: 2px 0 8px 14px;
+    padding: 10px 12px;
+    border-left: 2px solid rgba(148,163,184,0.25);
+    background: rgba(148,163,184,0.04);
+    border-radius: 3px;
+}
+.scan-history-detail-inner { display: flex; flex-direction: column; gap: 8px; }
+.scan-hist-kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 4px 16px; }
+.scan-hist-kv > div { display: flex; gap: 8px; font-size: 11px; min-width: 0; }
+.scan-hist-kv .k { color: var(--text-muted); min-width: 88px; }
+.scan-hist-kv .v { color: var(--text-primary); word-break: break-all; }
+.scan-hist-output {
+    margin: 0;
+    max-height: 320px;
+    overflow: auto;
+    background: rgba(0,0,0,0.25);
+    border: 1px solid rgba(148,163,184,0.15);
+    border-radius: 3px;
+    padding: 8px 10px;
+    font-size: 10.5px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text-primary);
+}
 
 /* =============================================
    HELP MODAL
@@ -6110,6 +6228,109 @@ option.etw-ch-inactive { color: #94a3b8; }
     font-weight: 600;
     margin-top: 2px;
 }
+
+/* --- EMBER "why" explanation panel --- */
+.ember-why-header {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary, #a8b0bd);
+    margin: 14px 0 6px;
+    font-weight: 600;
+}
+.ember-why-sub {
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--text-muted);
+    font-weight: 400;
+    font-size: 10px;
+}
+.ember-why-list { display: flex; flex-direction: column; gap: 4px; }
+.ember-why-row { display: flex; align-items: center; gap: 8px; }
+.ember-why-group {
+    flex: 0 0 110px;
+    font-size: 12px;
+    color: var(--text-primary);
+    font-family: var(--font-mono, monospace);
+}
+.ember-why-bar-track {
+    flex: 1;
+    height: 10px;
+    background: rgba(255,255,255,0.04);
+    border-radius: 3px;
+    overflow: hidden;
+}
+.ember-why-bar { height: 100%; border-radius: 3px; }
+.ember-why-bar.why-mal { background: #ef4444; }
+.ember-why-bar.why-ben { background: #22c55e; }
+.ember-why-val { flex: 0 0 48px; text-align: right; font-size: 11px; font-family: var(--font-mono, monospace); }
+.why-mal-t { color: #ef4444; }
+.why-ben-t { color: #22c55e; }
+
+.ember-chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+.ember-chip {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    background: rgba(255,255,255,0.05);
+    color: var(--text-secondary, #a8b0bd);
+    border: 1px solid rgba(255,255,255,0.06);
+}
+.ember-chip.chip-warn, td.chip-warn {
+    background: rgba(239,68,68,0.12);
+    color: #fca5a5;
+    border-color: rgba(239,68,68,0.3);
+}
+.ember-api-list { display: flex; flex-wrap: wrap; gap: 5px; margin: 4px 0 2px; }
+.ember-api-chip {
+    font-size: 11px;
+    padding: 2px 7px;
+    border-radius: 4px;
+    background: rgba(251,191,36,0.1);
+    color: #fcd34d;
+    border: 1px solid rgba(251,191,36,0.25);
+    font-family: var(--font-mono, monospace);
+}
+.ember-api-chip.ember-api-more { background: rgba(255,255,255,0.05); color: var(--text-muted); border-color: rgba(255,255,255,0.08); cursor: pointer; user-select: none; }
+.ember-api-chip.ember-api-more:hover { color: var(--accent-cyan); border-color: var(--accent-cyan); }
+
+.ember-more-toggle {
+    margin: 12px 0 4px;
+    font-size: 11px;
+    color: var(--accent-cyan);
+    cursor: pointer;
+    user-select: none;
+}
+.ember-more-toggle:hover { text-decoration: underline; }
+.ember-more {
+    margin-top: 6px;
+    padding: 10px;
+    background: rgba(255,255,255,0.02);
+    border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.05);
+}
+.ember-more-sub {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    margin: 10px 0 4px;
+}
+.ember-more-sub:first-child { margin-top: 0; }
+.ember-more-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.ember-more-table th {
+    text-align: left;
+    color: var(--text-muted);
+    font-weight: 500;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+    padding: 3px 6px;
+}
+.ember-more-table td {
+    padding: 3px 6px;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+    font-family: var(--font-mono, monospace);
+}
+.ember-more-kv { font-size: 11px; color: var(--text-secondary, #a8b0bd); font-family: var(--font-mono, monospace); word-break: break-word; }
 
 /* --- capa Capability Detection --- */
 .service-icon.capa { background: rgba(59,130,246,0.15); color: var(--accent-blue); }
