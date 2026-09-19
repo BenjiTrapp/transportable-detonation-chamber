@@ -162,6 +162,177 @@ def _record_scan(tool, filename, result, status="ok"):
         pass  # history must never break a scan
 
 
+# --- Scan <-> process/sample correlation (graph enrichment) ---
+
+def _extract_sha256(hashes):
+    """Pull the SHA256 out of a Sysmon EID-1 Hashes string such as
+    'SHA1=..,MD5=..,SHA256=ABC..,IMPHASH=..'. Returns lowercase hex or ''."""
+    if not hashes:
+        return ""
+    for part in str(hashes).replace(";", ",").split(","):
+        part = part.strip()
+        if part[:7].upper() == "SHA256=":
+            return part.split("=", 1)[1].strip().lower()
+    return ""
+
+
+def _summarize_scan_entry(e):
+    """Compact per-tool scan summary for the graph. Carries the full ``result``
+    so the detail-panel expander can reuse renderHistoryDetail()."""
+    return {
+        "tool": e.get("tool"),
+        "verdict": e.get("verdict"),
+        "detected": e.get("detected"),
+        "clean": e.get("clean"),
+        "score": e.get("score"),
+        "status": e.get("status"),
+        "timestamp": e.get("timestamp"),
+        "id": e.get("id"),
+        "sha256": e.get("sha256"),
+        "size": e.get("size"),
+        "filename": e.get("filename"),
+        "result": e.get("result"),
+    }
+
+
+def _scan_index():
+    """Index the scan-history timeline by sha256 and by filename. Each key maps
+    to {tool: latest-summary}. History is newest-first, so the first entry seen
+    per (key, tool) is the most recent one."""
+    by_sha, by_name = {}, {}
+    for e in _load_scan_history():
+        if not isinstance(e, dict):
+            continue
+        tool = (e.get("tool") or "?").lower()
+        summ = _summarize_scan_entry(e)
+        sha = (e.get("sha256") or "").lower()
+        if sha:
+            by_sha.setdefault(sha, {}).setdefault(tool, summ)
+        nm = (e.get("filename") or "").lower()
+        if nm and nm != "--":
+            by_name.setdefault(nm, {}).setdefault(tool, summ)
+    return by_sha, by_name
+
+
+def _overall_verdict(summaries):
+    """Roll up per-tool verdicts into one label for a badge."""
+    if not summaries:
+        return "unknown"
+    if any(s.get("verdict") == "malicious" or s.get("detected") for s in summaries):
+        return "malicious"
+    if any(s.get("verdict") == "detected" for s in summaries):
+        return "detected"
+    if any((s.get("verdict") in ("clean", "benign")) or s.get("clean") for s in summaries):
+        return "clean"
+    if any(s.get("verdict") == "analyzed" for s in summaries):
+        return "analyzed"
+    return "unknown"
+
+
+def _scans_for_node(node, by_sha):
+    """Scans authoritatively matched to a process node by image SHA256 only —
+    matching a running process to a scanned file by name would produce false
+    positives (e.g. an OS notepad.exe vs. a scanned notepad.exe)."""
+    sha = _extract_sha256(node.get("hashes"))
+    if sha and sha in by_sha:
+        return list(by_sha[sha].values())
+    return []
+
+
+def _build_samples(proc_map, by_sha, by_name):
+    """Union of submitted + scanned files, grouped by sha256 (falling back to
+    filename), each carrying its per-tool scans and — if it actually ran — its
+    live PID. Files that were only statically scanned (never executed, e.g. a
+    ransomware sample that must not be detonated) still appear here."""
+    subs = _load_submissions()
+    hist = _load_scan_history()
+
+    # filename(lower) -> sha, so name-only scans merge into the sha'd group.
+    name2sha = {}
+    for it in subs + hist:
+        if not isinstance(it, dict):
+            continue
+        sha = (it.get("sha256") or "").lower()
+        nm = (it.get("filename") or "").lower()
+        if sha and nm and nm != "--":
+            name2sha.setdefault(nm, sha)
+
+    samples = {}
+
+    def bucket(sha, nm, disp):
+        sha = (sha or "").lower()
+        nml = (nm or "").lower()
+        if not sha and nml in name2sha:
+            sha = name2sha[nml]
+        key = ("sha:" + sha) if sha else ("name:" + nml)
+        s = samples.get(key)
+        if s is None:
+            s = {"sha256": sha, "filename": disp or nm or "--", "size": None,
+                 "target": None, "submitted_at": None, "agent_pid": None,
+                 "scan_map": {}, "sources": set()}
+            samples[key] = s
+        return s
+
+    for sub in subs:  # newest-first: first submission per bucket wins
+        if not isinstance(sub, dict):
+            continue
+        s = bucket(sub.get("sha256"), sub.get("filename"), sub.get("filename"))
+        s["sources"].add("submission")
+        if s["submitted_at"] is None:
+            s["submitted_at"] = sub.get("timestamp")
+            s["target"] = sub.get("target")
+            s["agent_pid"] = sub.get("agent_pid")
+        if s["size"] is None and sub.get("size") is not None:
+            s["size"] = sub.get("size")
+
+    for e in hist:  # newest-first: keep latest per tool
+        if not isinstance(e, dict):
+            continue
+        s = bucket(e.get("sha256"), e.get("filename"), e.get("filename"))
+        s["sources"].add("scan")
+        tool = (e.get("tool") or "?").lower()
+        if tool not in s["scan_map"]:
+            s["scan_map"][tool] = _summarize_scan_entry(e)
+        if s["size"] is None and e.get("size") is not None:
+            s["size"] = e.get("size")
+
+    # Resolve each sample to a live PID via SHA256 match on process hashes.
+    sha2pid = {}
+    for pid, node in proc_map.items():
+        nsha = _extract_sha256(node.get("hashes"))
+        if nsha:
+            sha2pid.setdefault(nsha, pid)
+
+    out = []
+    for s in samples.values():
+        scans = list(s["scan_map"].values())
+        pid = sha2pid.get(s["sha256"]) if s["sha256"] else None
+        detonated = bool(proc_map.get(pid, {}).get("detonated")) if pid else False
+        out.append({
+            "sha256": s["sha256"],
+            "filename": s["filename"],
+            "size": s["size"],
+            "target": s["target"],
+            "submitted_at": s["submitted_at"],
+            "agent_pid": s["agent_pid"],
+            "pid": pid,
+            "executed": pid is not None,
+            "detonated": detonated,
+            "verdict": _overall_verdict(scans),
+            "scans": scans,
+            "sources": sorted(s["sources"]),
+        })
+
+    def _sort_ts(x):
+        ts = [x.get("submitted_at") or ""]
+        for sc in x.get("scans", []):
+            ts.append(sc.get("timestamp") or "")
+        return max(ts)
+
+    out.sort(key=_sort_ts, reverse=True)
+    return out
+
+
 # --- Submissions History ---
 submissions_lock = threading.Lock()
 
@@ -1689,6 +1860,12 @@ def api_process_graph():
         node.update(selected[pid])
         processes[pid] = node
 
+    # Attach static-scan verdicts (EMBER/capa/ThreatCheck/DefenderCheck) matched
+    # to each process by image SHA256, for graph verdict badges + detail panel.
+    scan_by_sha, _ = _scan_index()
+    for node in processes.values():
+        node["scans"] = _scans_for_node(node, scan_by_sha)
+
     # Scope activity events to the selected process set.
     network, dns, files, registry, injections = [], [], [], [], []
     for ev in sysmon_events:
@@ -1760,6 +1937,24 @@ def api_process_graph_roots():
     # Detonated first, then by threat count.
     candidates.sort(key=lambda c: (c["detonated"], c["threats"]), reverse=True)
     return jsonify(candidates[:50])
+
+
+@app.route("/api/graph/samples")
+def api_graph_samples():
+    """Submitted + scanned files for the graph landing 'Samples' rail. Includes
+    files that were only statically scanned and never executed, so a
+    static-only sample (e.g. a ransomware binary we must not detonate) is still
+    visible with its EMBER/capa/ThreatCheck verdicts."""
+    if not _is_sysmon_running() and VM_WEBUI_URL:
+        try:
+            r = requests.get(f"{VM_WEBUI_URL}/api/graph/samples", timeout=15)
+            if r.status_code == 200:
+                return jsonify(r.json())
+        except Exception:
+            pass
+    proc_map, _ = _build_full_process_map()
+    by_sha, by_name = _scan_index()
+    return jsonify({"samples": _build_samples(proc_map, by_sha, by_name)})
 
 
 @app.route("/api/sysmon")

@@ -1532,6 +1532,44 @@ async function clearScanHistory() {
     loadScanHistory();
 }
 
+// Roll up per-tool scan summaries into one verdict label (mirrors the backend
+// _overall_verdict). Used for graph node/sample badges.
+function _nodeVerdict(scans) {
+    if (!scans || !scans.length) return 'unknown';
+    if (scans.some(s => s.verdict === 'malicious' || s.detected === true)) return 'malicious';
+    if (scans.some(s => s.verdict === 'detected')) return 'detected';
+    if (scans.some(s => s.verdict === 'clean' || s.verdict === 'benign' || s.clean === true)) return 'clean';
+    if (scans.some(s => s.verdict === 'analyzed')) return 'analyzed';
+    return 'unknown';
+}
+
+const _VERDICT_META = {
+    malicious: { text: 'MALICIOUS', cls: 'history-detected' },
+    detected:  { text: 'DETECTED',  cls: 'history-detected' },
+    clean:     { text: 'CLEAN',     cls: 'history-clean' },
+    analyzed:  { text: 'ANALYZED',  cls: 'history-unknown' },
+    unknown:   { text: 'UNSCANNED', cls: 'history-unknown' },
+};
+
+// Render a scan list (each entry shaped like a history row, carrying .result)
+// as collapsible rows reusing the shared history renderers.
+function renderGraphScans(scans, heading = 'Static Scans') {
+    if (!scans || !scans.length) return '';
+    let h = `<div class="gd-section">${escapeHtml(heading)} <span class="gd-count">${scans.length}</span></div>`;
+    h += '<div class="gd-scan-list">';
+    scans.forEach(sc => {
+        const st = _histStatus(sc);
+        h += `<div class="scan-history-entry ${st.cls}" onclick="toggleHistoryDetail(this)">`;
+        h += `<span class="scan-history-more">&#9656;</span>`;
+        h += `<span class="scan-history-tool">${escapeHtml(sc.tool || '?')}</span>`;
+        h += `<span class="scan-history-status">${escapeHtml(st.text)}</span>`;
+        h += `</div>`;
+        h += `<div class="scan-history-detail" style="display:none">${renderHistoryDetail(sc)}</div>`;
+    });
+    h += '</div>';
+    return h;
+}
+
 // Back-compat shims: older call sites just refresh the shared timeline.
 function renderScanHistory() { loadScanHistory(); }
 
@@ -4809,11 +4847,17 @@ async function renderGraphLanding() {
     landing.innerHTML = '<div class="graph-landing-loading">Loading candidate processes...</div>';
 
     let roots = [];
+    let samples = [];
     try {
-        const resp = await fetch('/api/process-graph/roots');
-        if (resp.ok) roots = await resp.json();
+        const [rootsResp, sampResp] = await Promise.all([
+            fetch('/api/process-graph/roots'),
+            fetch('/api/graph/samples'),
+        ]);
+        if (rootsResp.ok) roots = await rootsResp.json();
+        if (sampResp.ok) { const d = await sampResp.json(); samples = d.samples || []; }
     } catch (e) { /* ignore */ }
     if (!Array.isArray(roots)) roots = [];
+    if (!Array.isArray(samples)) samples = [];
 
     // Optional name/pid filter typed into the focus field.
     const q = (document.getElementById('graph-search')?.value || '').trim().toLowerCase();
@@ -4824,8 +4868,50 @@ async function renderGraphLanding() {
             (r.name || '').toLowerCase().includes(q) ||
             (r.image || '').toLowerCase().includes(q));
     }
+    let filteredSamples = samples;
+    if (q) {
+        filteredSamples = samples.filter(s =>
+            (s.filename || '').toLowerCase().includes(q) ||
+            (s.sha256 || '').toLowerCase().includes(q) ||
+            String(s.pid || '').includes(q));
+    }
+    graphState._landingSamples = filteredSamples;
 
     let html = '<div class="graph-landing-inner">';
+
+    // Samples rail: submitted/scanned files (executed ones pivot to their tree,
+    // static-only ones expand their scan verdicts inline).
+    if (filteredSamples.length) {
+        html += '<div class="graph-landing-title">Samples</div>';
+        html += '<div class="graph-landing-hint">Files submitted or scanned. Executed samples open their process tree; static-only samples expand their scan verdicts.</div>';
+        html += '<div class="graph-sample-list">';
+        filteredSamples.forEach((s, i) => {
+            const vm = _VERDICT_META[s.verdict] || _VERDICT_META.unknown;
+            const badges = [];
+            if (s.executed) badges.push('<span class="glc-badge exec">executed</span>');
+            else badges.push('<span class="glc-badge static">static-only</span>');
+            if (s.detonated) badges.push('<span class="glc-badge det">detonated</span>');
+            if (s.target) badges.push(`<span class="glc-badge">${escapeHtml(String(s.target))}</span>`);
+            let tools = '';
+            (s.scans || []).forEach(sc => {
+                const st = _histStatus(sc);
+                tools += `<span class="gsc-tool ${st.cls}">${escapeHtml(sc.tool || '?')} · ${escapeHtml(st.text)}</span>`;
+            });
+            html += `<div class="graph-sample-card v-${escapeHtml(s.verdict)}" data-idx="${i}" data-pid="${s.executed ? escapeHtml(String(s.pid)) : ''}">
+                <div class="gsc-head">
+                    <span class="gsc-name" title="${escapeHtml(s.filename || '')}">${escapeHtml(s.filename || '--')}</span>
+                    <span class="gsc-verdict ${vm.cls}">${escapeHtml(vm.text)}</span>
+                </div>
+                ${s.sha256 ? `<div class="gsc-sha" title="${escapeHtml(s.sha256)}">${escapeHtml(s.sha256)}</div>` : ''}
+                <div class="gsc-badges">${badges.join('')}${s.size != null ? `<span class="glc-badge">${escapeHtml(formatSize(s.size))}</span>` : ''}</div>
+                ${tools ? `<div class="gsc-tools">${tools}</div>` : ''}
+                <div class="gsc-detail" style="display:none"></div>
+                <div class="gsc-foot">${s.executed ? '&#9673; Open process tree (PID ' + escapeHtml(String(s.pid)) + ')' : '&#9656; Show scan details'}</div>
+            </div>`;
+        });
+        html += '</div>';
+    }
+
     html += '<div class="graph-landing-title">Investigate a process</div>';
     html += '<div class="graph-landing-hint">Pick a process below, or type a PID / name in the focus field above.</div>';
     if (!filtered.length) {
@@ -4851,6 +4937,31 @@ async function renderGraphLanding() {
 
     landing.querySelectorAll('.graph-landing-card[data-pid]').forEach(card => {
         card.addEventListener('click', () => focusProcessGraph(card.dataset.pid, { reset: true }));
+    });
+
+    // Sample cards: executed samples pivot to their process tree; static-only
+    // samples toggle an inline scan-detail panel.
+    landing.querySelectorAll('.graph-sample-card').forEach(card => {
+        card.addEventListener('click', (e) => {
+            // Clicks inside an expanded detail drive its own row toggles.
+            if (e.target.closest('.gsc-detail')) return;
+            const pid = card.dataset.pid;
+            if (pid) { focusProcessGraph(pid, { reset: true }); return; }
+            const idx = parseInt(card.dataset.idx);
+            const s = (graphState._landingSamples || [])[idx];
+            const det = card.querySelector('.gsc-detail');
+            const foot = card.querySelector('.gsc-foot');
+            if (!det) return;
+            if (!det.dataset.filled) {
+                det.innerHTML = (s && s.scans && s.scans.length)
+                    ? renderGraphScans(s.scans, 'Scan Results')
+                    : '<div class="scan-history-empty">No scan details recorded.</div>';
+                det.dataset.filled = '1';
+            }
+            const open = det.style.display !== 'none';
+            det.style.display = open ? 'none' : 'block';
+            if (foot) foot.innerHTML = (open ? '&#9656;' : '&#9662;') + ' Show scan details';
+        });
     });
 }
 
@@ -4944,6 +5055,8 @@ function buildGraph(payload) {
             isAncestor: !!proc.is_ancestor,
             depth: proc.depth || 0,
             alertsCount: proc.alerts_count || 0,
+            scans: proc.scans || [],
+            scanVerdict: _nodeVerdict(proc.scans || []),
             x: 0, y: 0, vx: 0, vy: 0,
             radius: proc.is_root ? 26 : Math.max(13, Math.min(26, 13 + threats * 2)),
         };
@@ -5581,6 +5694,27 @@ function renderGraph() {
             ctx.fillText(String(node.threats), bx, by);
         }
 
+        // Scan verdict indicator (bottom-left): matched EMBER/capa/TC/DC result
+        if (node.type === 'process' && node.scans && node.scans.length) {
+            const vColors = { malicious: '#ef4444', detected: '#ef4444',
+                              clean: '#4ade80', analyzed: '#38bdf8', unknown: '#64748b' };
+            const vc = vColors[node.scanVerdict] || '#64748b';
+            const sbx = node.x - r * 0.7;
+            const sby = node.y + r * 0.7;
+            ctx.beginPath();
+            ctx.arc(sbx, sby, 6, 0, Math.PI * 2);
+            ctx.fillStyle = vc;
+            ctx.fill();
+            ctx.strokeStyle = '#0b1220';
+            ctx.lineWidth = 1.5;
+            ctx.stroke();
+            ctx.font = 'bold 7px monospace';
+            ctx.fillStyle = '#0b1220';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText('S', sbx, sby);
+        }
+
         // FOCUS badge for the root node
         if (node.isRoot) {
             ctx.font = 'bold 8px monospace';
@@ -5611,6 +5745,10 @@ function showGraphTooltip(node, sx, sy) {
         html += `<div class="tt-field"><span>PID:</span> ${node.pid}</div>`;
         if (node.image) html += `<div class="tt-field"><span>Image:</span> ${escapeHtml(node.image)}</div>`;
         if (node.threats) html += `<div class="tt-field"><span>Threats:</span> ${node.threats}</div>`;
+        if (node.scans && node.scans.length) {
+            const vm = _VERDICT_META[node.scanVerdict] || _VERDICT_META.unknown;
+            html += `<div class="tt-field"><span>Scan:</span> ${escapeHtml(vm.text)} (${node.scans.length})</div>`;
+        }
     } else if (node.type === 'network') {
         html += `<div class="tt-field"><span>IP:</span> ${node.ip}:${node.port}</div>`;
         html += `<div class="tt-field"><span>Protocol:</span> ${node.protocol || 'tcp'}</div>`;
@@ -5702,6 +5840,11 @@ function showGraphDetail(node) {
         if (node.image) {
             html += `<div class="gd-section">Digital Signature</div>`;
             html += `<div class="gd-sig-body" id="gd-sig-body"><button class="gd-sig-btn" data-sig-path="${escapeHtml(node.image)}">&#128273; Check who signed this</button></div>`;
+        }
+
+        // Static-analysis verdicts matched to this image by SHA256
+        if (node.scans && node.scans.length) {
+            html += renderGraphScans(node.scans);
         }
 
         // Connections from this node
