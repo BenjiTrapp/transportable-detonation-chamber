@@ -5221,7 +5221,10 @@ body.hex-resizing {
     font-size: 11px;
     border-radius: 3px;
     border-left: 3px solid transparent;
+    cursor: pointer;
 }
+.scan-history-entry:hover { background: rgba(148,163,184,0.06); }
+.scan-history-more { color: var(--text-muted); font-size: 10px; min-width: 12px; user-select: none; }
 .scan-history-entry.history-clean { border-left-color: #22c55e; }
 .scan-history-entry.history-detected { border-left-color: #ef4444; background: rgba(239,68,68,0.03); }
 .scan-history-entry.history-unknown { border-left-color: #fbbf24; }
@@ -5232,6 +5235,35 @@ body.hex-resizing {
 .history-clean .scan-history-status { color: #22c55e; }
 .history-detected .scan-history-status { color: #ef4444; }
 .history-unknown .scan-history-status { color: #fbbf24; }
+
+.scan-history-empty { color: var(--text-muted); font-size: 11px; padding: 8px 10px; font-style: italic; }
+
+.scan-history-detail {
+    margin: 2px 0 8px 14px;
+    padding: 10px 12px;
+    border-left: 2px solid rgba(148,163,184,0.25);
+    background: rgba(148,163,184,0.04);
+    border-radius: 3px;
+}
+.scan-history-detail-inner { display: flex; flex-direction: column; gap: 8px; }
+.scan-hist-kv { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 4px 16px; }
+.scan-hist-kv > div { display: flex; gap: 8px; font-size: 11px; min-width: 0; }
+.scan-hist-kv .k { color: var(--text-muted); min-width: 88px; }
+.scan-hist-kv .v { color: var(--text-primary); word-break: break-all; }
+.scan-hist-output {
+    margin: 0;
+    max-height: 320px;
+    overflow: auto;
+    background: rgba(0,0,0,0.25);
+    border: 1px solid rgba(148,163,184,0.15);
+    border-radius: 3px;
+    padding: 8px 10px;
+    font-size: 10.5px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text-primary);
+}
 
 /* =============================================
    HELP MODAL

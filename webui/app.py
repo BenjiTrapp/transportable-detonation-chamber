@@ -34,6 +34,8 @@ WEBUI_PORT = int(os.environ.get("WEBUI_PORT", "9000"))
 VM_IP = os.environ.get("TDC_VM_IP", "")
 VM_WEBUI_URL = os.environ.get("TDC_VM_WEBUI", "")
 SUBMISSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "submissions.json")
+SCAN_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan_history.json")
+SCAN_HISTORY_MAX = 200
 
 
 def _detect_vm_ip():
@@ -74,6 +76,91 @@ events_store = {
     "sessions": [],
 }
 store_lock = threading.Lock()
+
+# --- Scan History (shared timeline across all static scanners) ---
+# Persists every scan (EMBER, capa, ThreatCheck, DefenderCheck) regardless of
+# how it was triggered (web UI, curl/API, or MCP - the MCP server proxies to
+# these same /api/scan/* endpoints). Read back by GET /api/scan/history.
+scan_history_lock = threading.Lock()
+
+
+def _load_scan_history():
+    if os.path.isfile(SCAN_HISTORY_FILE):
+        try:
+            with open(SCAN_HISTORY_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return []
+    return []
+
+
+def _save_scan_history(history):
+    try:
+        with open(SCAN_HISTORY_FILE, "w") as f:
+            json.dump(history, f, indent=2)
+    except IOError:
+        pass
+
+
+def _normalize_scan(tool, result):
+    """Derive a normalized (verdict, detected, clean, score) from a raw scan
+    result so the shared timeline can render a consistent status column."""
+    verdict, detected, clean, score = "unknown", None, None, None
+    if not isinstance(result, dict):
+        return verdict, detected, clean, score
+    if result.get("score") is not None:
+        try:
+            score = float(result["score"])
+        except (TypeError, ValueError):
+            score = None
+    if str(result.get("verdict", "")).lower() in ("malicious", "benign"):  # EMBER
+        verdict = str(result["verdict"]).lower()
+        detected = bool(result.get("malicious"))
+        clean = not detected
+    elif "detected" in result or "clean" in result:  # ThreatCheck / DefenderCheck
+        detected = bool(result.get("detected"))
+        clean = bool(result.get("clean"))
+        verdict = "detected" if detected else ("clean" if clean else "unknown")
+    elif tool and tool.lower() == "capa":  # capa reports capabilities, not a verdict
+        cc = result.get("capability_count")
+        verdict = "analyzed" if cc is not None else "unknown"
+    return verdict, detected, clean, score
+
+
+def _record_scan(tool, filename, result, status="ok"):
+    """Append a scan to the shared history timeline (best-effort).
+
+    ``result`` is the full JSON dict returned to the client (stored verbatim
+    for the "> more" expander); ``status`` is "ok", "timeout", or "error".
+    """
+    import datetime
+    try:
+        result = result if isinstance(result, dict) else {}
+        verdict, detected, clean, score = _normalize_scan(tool, result)
+        sha256 = result.get("sha256", "") or ""
+        entry = {
+            "id": hashlib.md5(f"{sha256}{tool}{time.time()}".encode()).hexdigest()[:12],
+            "timestamp": datetime.datetime.now().isoformat(),
+            "tool": tool or result.get("tool") or "?",
+            "filename": filename or "--",
+            "sha256": sha256,
+            "size": result.get("size"),
+            "status": status,
+            "verdict": verdict,
+            "detected": detected,
+            "clean": clean,
+            "score": score,
+            "result": result,   # full result for the detail expander
+        }
+        with scan_history_lock:
+            history = _load_scan_history()
+            history.insert(0, entry)
+            if len(history) > SCAN_HISTORY_MAX:
+                del history[SCAN_HISTORY_MAX:]
+            _save_scan_history(history)
+    except Exception:
+        pass  # history must never break a scan
+
 
 # --- Submissions History ---
 submissions_lock = threading.Lock()
@@ -2932,7 +3019,7 @@ def api_scan_threatcheck():
         detected = "Identified" in output or "DETECTED" in output.upper()
         clean = "No threat found" in output
 
-        return jsonify({
+        resp = {
             "tool": "ThreatCheck",
             "engine": engine,
             "file_type": file_type,
@@ -2941,7 +3028,9 @@ def api_scan_threatcheck():
             "detected": detected,
             "clean": clean,
             "exit_code": result.returncode,
-        })
+        }
+        _record_scan("ThreatCheck", os.path.basename(filepath), resp)
+        return jsonify(resp)
     except subprocess.TimeoutExpired:
         return jsonify({"error": "ThreatCheck timed out (120s)"}), 504
     except Exception as e:
@@ -2982,14 +3071,16 @@ def api_scan_defendercheck():
         detected = "Identified" in output or "detected" in output.lower()
         clean = "No threat found" in output
 
-        return jsonify({
+        resp = {
             "tool": "DefenderCheck",
             "filepath": filepath,
             "output": output.strip(),
             "detected": detected,
             "clean": clean,
             "exit_code": result.returncode,
-        })
+        }
+        _record_scan("DefenderCheck", os.path.basename(filepath), resp)
+        return jsonify(resp)
     except subprocess.TimeoutExpired:
         return jsonify({"error": "DefenderCheck timed out (120s)"}), 504
     except Exception as e:
@@ -3063,6 +3154,7 @@ def api_scan_ember():
             f"Verdict: {str(data.get('verdict', '')).upper()}\n"
             f"SHA256: {data.get('sha256')}"
         )
+        _record_scan("EMBER2024", os.path.basename(filepath), data)
         return jsonify(data)
     except subprocess.TimeoutExpired:
         return jsonify({"error": "EMBER scan timed out (120s)"}), 504
@@ -3119,6 +3211,9 @@ def api_scan_capa():
                 proc.communicate(timeout=10)
             except Exception:
                 pass
+            _record_scan("capa", os.path.basename(filepath),
+                         {"tool": "capa", "error": "capa timed out (300s)"},
+                         status="timeout")
             return jsonify({"error": "capa timed out (300s) - sample too large or packed for static capa analysis on this ARM64 VM"}), 504
         returncode = proc.returncode
         stdout = (out or "").strip()
@@ -3176,6 +3271,7 @@ def api_scan_capa():
             f"ATT&CK tactics: {', '.join(tactics) if tactics else 'none'}\n"
             f"SHA256: {data['sha256']}"
         )
+        _record_scan("capa", os.path.basename(filepath), data)
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -3222,6 +3318,30 @@ def api_scan_status():
             "path": BEACONEYE_EXE,
         },
     })
+
+
+@app.route("/api/scan/history")
+def api_scan_history():
+    """Return the shared scan-history timeline (most recent first).
+
+    Optional ?limit=N caps the number of entries returned.
+    """
+    history = _load_scan_history()
+    try:
+        limit = int(request.args.get("limit", "0"))
+        if limit > 0:
+            history = history[:limit]
+    except (TypeError, ValueError):
+        pass
+    return jsonify({"count": len(history), "history": history})
+
+
+@app.route("/api/scan/history/clear", methods=["POST"])
+def api_scan_history_clear():
+    """Clear the shared scan-history timeline."""
+    with scan_history_lock:
+        _save_scan_history([])
+    return jsonify({"ok": True})
 
 
 # --- Beacon Scanner Endpoints ---

@@ -127,6 +127,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(refreshDashboard, 10000);
     refreshDashboard();
     loadScanToolStatus();
+    loadScanHistory();
 });
 
 // --- Tab navigation ---
@@ -1415,34 +1416,124 @@ function renderScanResult(data, container) {
     container.innerHTML = html;
 }
 
-function renderScanHistory() {
-    const container = document.getElementById('scanner-history-list');
-    if (!container || scanHistory.length === 0) {
-        if (container) container.innerHTML = '';
+// ---------------------------------------------------------------
+// Unified, server-persisted scan history (shared timeline across
+// ThreatCheck / DefenderCheck / EMBER / capa, and any curl/API/MCP
+// scan). Rendered identically into all three per-tab containers.
+// ---------------------------------------------------------------
+const SCAN_HISTORY_CONTAINERS = ['scanner-history-list', 'ember-history-list', 'capa-history-list'];
+
+async function loadScanHistory() {
+    try {
+        const resp = await fetch('/api/scan/history?limit=100');
+        const data = await resp.json();
+        renderUnifiedHistory(data.history || []);
+    } catch (e) {
+        // history must never break the page
+    }
+}
+
+function _histStatus(entry) {
+    const v = (entry.verdict || '').toLowerCase();
+    const pct = (entry.score != null) ? ` ${(entry.score * 100).toFixed(1)}%` : '';
+    if (entry.status === 'timeout') return { cls: 'history-unknown', text: 'TIMEOUT' };
+    if (entry.status && entry.status !== 'ok') return { cls: 'history-unknown', text: entry.status.toUpperCase() };
+    if (v === 'malicious' || entry.detected === true) return { cls: 'history-detected', text: (v === 'malicious' ? 'MALICIOUS' : 'DETECTED') + pct };
+    if (v === 'benign' || v === 'clean' || entry.clean === true) return { cls: 'history-clean', text: (v === 'benign' ? 'BENIGN' : 'CLEAN') + pct };
+    if (v === 'analyzed' || v) return { cls: 'history-unknown', text: (v || '?').toUpperCase() };
+    return { cls: 'history-unknown', text: '?' };
+}
+
+function renderUnifiedHistory(history) {
+    const containers = SCAN_HISTORY_CONTAINERS
+        .map(id => document.getElementById(id)).filter(Boolean);
+    if (!containers.length) return;
+
+    if (!history.length) {
+        containers.forEach(c => { c.innerHTML = '<div class="scan-history-empty">No scans yet.</div>'; });
         return;
     }
 
     let html = '';
-    scanHistory.forEach((entry, idx) => {
-        const ts = new Date(entry.timestamp).toLocaleTimeString('en-GB', {hour12: false});
-        const statusClass = entry.clean ? 'history-clean' : entry.detected ? 'history-detected' : 'history-unknown';
-        const statusText = entry.clean ? 'Clean' : entry.detected ? 'Detected' : '?';
-        const toolLabel = entry.tool + (entry.engine ? '/' + entry.engine : '');
-        html += `<div class="scan-history-entry ${statusClass}">`;
-        html += `<span class="scan-history-time">${ts}</span>`;
-        html += `<span class="scan-history-file">${escapeHtml(entry.filename || '--')}</span>`;
-        html += `<span class="scan-history-tool">${escapeHtml(toolLabel)}</span>`;
-        html += `<span class="scan-history-status">${statusText}</span>`;
+    history.forEach(entry => {
+        const ts = new Date(entry.timestamp).toLocaleString('en-GB', { hour12: false });
+        const st = _histStatus(entry);
+        html += `<div class="scan-history-entry ${st.cls}" onclick="toggleHistoryDetail(this)">`;
+        html += `<span class="scan-history-more">&#9656;</span>`;
+        html += `<span class="scan-history-time">${escapeHtml(ts)}</span>`;
+        html += `<span class="scan-history-tool">${escapeHtml(entry.tool || '?')}</span>`;
+        html += `<span class="scan-history-file" title="${escapeHtml(entry.filename || '')}">${escapeHtml(entry.filename || '--')}</span>`;
+        html += `<span class="scan-history-status">${escapeHtml(st.text)}</span>`;
         html += `</div>`;
+        html += `<div class="scan-history-detail" style="display:none">${renderHistoryDetail(entry)}</div>`;
     });
-    container.innerHTML = html;
+    containers.forEach(c => { c.innerHTML = html; });
 }
 
-function clearScanHistory() {
-    scanHistory = [];
-    const container = document.getElementById('scanner-history-list');
-    if (container) container.innerHTML = '';
+function toggleHistoryDetail(el) {
+    const panel = el.nextElementSibling;
+    if (!panel || !panel.classList.contains('scan-history-detail')) return;
+    const open = panel.style.display !== 'none';
+    panel.style.display = open ? 'none' : 'block';
+    const caret = el.querySelector('.scan-history-more');
+    if (caret) caret.innerHTML = open ? '&#9656;' : '&#9662;';
 }
+
+function renderHistoryDetail(entry) {
+    const r = entry.result || {};
+    let h = '<div class="scan-history-detail-inner">';
+
+    const kv = [];
+    if (entry.sha256) kv.push(['SHA256', entry.sha256]);
+    if (entry.size != null) kv.push(['Size', formatSize(entry.size)]);
+    if (r.model) kv.push(['Model', r.model]);
+    if (entry.score != null) kv.push(['Score', Number(entry.score).toFixed(4)]);
+    if (r.engine) kv.push(['Engine', r.engine]);
+    if (r.threat_name) kv.push(['Threat', r.threat_name]);
+    if (r.capability_count != null) kv.push(['Capabilities', r.capability_count]);
+    if (Array.isArray(r.tactics) && r.tactics.length) kv.push(['ATT&CK', r.tactics.join(', ')]);
+    if (r.elapsed_ms != null) kv.push(['Elapsed', r.elapsed_ms + ' ms']);
+    if (kv.length) {
+        h += '<div class="scan-hist-kv">';
+        kv.forEach(([k, v]) => {
+            h += `<div><span class="k">${escapeHtml(k)}</span><span class="v">${escapeHtml(String(v))}</span></div>`;
+        });
+        h += '</div>';
+    }
+
+    // EMBER "why" explanation (reuse the rich renderer)
+    if (r.explanation && typeof renderEmberExplanation === 'function') {
+        h += renderEmberExplanation(r.explanation);
+    }
+
+    // capa capabilities
+    if (Array.isArray(r.capabilities) && r.capabilities.length) {
+        h += '<div class="ember-more-sub">Capabilities</div><div class="ember-api-list">';
+        r.capabilities.slice(0, 60).forEach(c => {
+            const name = (typeof c === 'string') ? c : (c.name || c.rule || '');
+            const ns = (typeof c === 'object' && c.namespace) ? c.namespace : '';
+            h += `<span class="ember-api-chip" title="${escapeHtml(ns)}">${escapeHtml(name)}</span>`;
+        });
+        h += '</div>';
+    }
+
+    // raw tool output / error
+    if (r.output) h += `<pre class="scan-hist-output">${escapeHtml(String(r.output))}</pre>`;
+    if (r.error) h += `<div class="scanner-error">${escapeHtml(String(r.error))}</div>`;
+
+    h += '</div>';
+    return h;
+}
+
+async function clearScanHistory() {
+    try {
+        await fetch('/api/scan/history/clear', { method: 'POST' });
+    } catch (e) { /* ignore */ }
+    loadScanHistory();
+}
+
+// Back-compat shims: older call sites just refresh the shared timeline.
+function renderScanHistory() { loadScanHistory(); }
 
 // =============================================
 // EMBER2024 ML CLASSIFIER
@@ -1702,34 +1793,9 @@ function toggleEmberMore(id, el) {
     if (el) el.innerHTML = (open ? '&#9656;' : '&#9662;') + ' more detail';
 }
 
-function renderEmberHistory() {
-    const container = document.getElementById('ember-history-list');
-    if (!container || emberHistory.length === 0) {
-        if (container) container.innerHTML = '';
-        return;
-    }
+function renderEmberHistory() { loadScanHistory(); }
 
-    let html = '';
-    emberHistory.forEach(entry => {
-        const ts = new Date(entry.timestamp).toLocaleTimeString('en-GB', {hour12: false});
-        const malicious = !!entry.malicious;
-        const statusClass = malicious ? 'history-detected' : 'history-clean';
-        const pct = typeof entry.score === 'number' ? (Math.round(entry.score * 1000) / 10) + '%' : '?';
-        html += `<div class="scan-history-entry ${statusClass}">`;
-        html += `<span class="scan-history-time">${ts}</span>`;
-        html += `<span class="scan-history-file">${escapeHtml(entry.filename || '--')}</span>`;
-        html += `<span class="scan-history-tool">${escapeHtml(entry.model || 'EMBER')}</span>`;
-        html += `<span class="scan-history-status">${pct}</span>`;
-        html += `</div>`;
-    });
-    container.innerHTML = html;
-}
-
-function clearEmberHistory() {
-    emberHistory = [];
-    const container = document.getElementById('ember-history-list');
-    if (container) container.innerHTML = '';
-}
+function clearEmberHistory() { clearScanHistory(); }
 
 // =============================================
 // CAPA CAPABILITY DETECTION
@@ -1881,32 +1947,9 @@ function renderCapaResult(data, container) {
     container.innerHTML = html;
 }
 
-function renderCapaHistory() {
-    const container = document.getElementById('capa-history-list');
-    if (!container || capaHistory.length === 0) {
-        if (container) container.innerHTML = '';
-        return;
-    }
-    let html = '';
-    capaHistory.forEach(entry => {
-        const ts = new Date(entry.timestamp).toLocaleTimeString('en-GB', {hour12: false});
-        const count = entry.capability_count != null ? entry.capability_count : (entry.capabilities || []).length;
-        const statusClass = count > 0 ? 'history-detected' : 'history-clean';
-        html += `<div class="scan-history-entry ${statusClass}">`;
-        html += `<span class="scan-history-time">${ts}</span>`;
-        html += `<span class="scan-history-file">${escapeHtml(entry.filename || '--')}</span>`;
-        html += `<span class="scan-history-tool">capa</span>`;
-        html += `<span class="scan-history-status">${count} caps</span>`;
-        html += `</div>`;
-    });
-    container.innerHTML = html;
-}
+function renderCapaHistory() { loadScanHistory(); }
 
-function clearCapaHistory() {
-    capaHistory = [];
-    const container = document.getElementById('capa-history-list');
-    if (container) container.innerHTML = '';
-}
+function clearCapaHistory() { clearScanHistory(); }
 
 // =============================================
 // HEX EDITOR
