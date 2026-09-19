@@ -6111,6 +6111,108 @@ option.etw-ch-inactive { color: #94a3b8; }
     margin-top: 2px;
 }
 
+/* --- EMBER "why" explanation panel --- */
+.ember-why-header {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-secondary, #a8b0bd);
+    margin: 14px 0 6px;
+    font-weight: 600;
+}
+.ember-why-sub {
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--text-muted);
+    font-weight: 400;
+    font-size: 10px;
+}
+.ember-why-list { display: flex; flex-direction: column; gap: 4px; }
+.ember-why-row { display: flex; align-items: center; gap: 8px; }
+.ember-why-group {
+    flex: 0 0 110px;
+    font-size: 12px;
+    color: var(--text-primary);
+    font-family: var(--font-mono, monospace);
+}
+.ember-why-bar-track {
+    flex: 1;
+    height: 10px;
+    background: rgba(255,255,255,0.04);
+    border-radius: 3px;
+    overflow: hidden;
+}
+.ember-why-bar { height: 100%; border-radius: 3px; }
+.ember-why-bar.why-mal { background: #ef4444; }
+.ember-why-bar.why-ben { background: #22c55e; }
+.ember-why-val { flex: 0 0 48px; text-align: right; font-size: 11px; font-family: var(--font-mono, monospace); }
+.why-mal-t { color: #ef4444; }
+.why-ben-t { color: #22c55e; }
+
+.ember-chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+.ember-chip {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 4px;
+    background: rgba(255,255,255,0.05);
+    color: var(--text-secondary, #a8b0bd);
+    border: 1px solid rgba(255,255,255,0.06);
+}
+.ember-chip.chip-warn, td.chip-warn {
+    background: rgba(239,68,68,0.12);
+    color: #fca5a5;
+    border-color: rgba(239,68,68,0.3);
+}
+.ember-api-list { display: flex; flex-wrap: wrap; gap: 5px; margin: 4px 0 2px; }
+.ember-api-chip {
+    font-size: 11px;
+    padding: 2px 7px;
+    border-radius: 4px;
+    background: rgba(251,191,36,0.1);
+    color: #fcd34d;
+    border: 1px solid rgba(251,191,36,0.25);
+    font-family: var(--font-mono, monospace);
+}
+.ember-api-chip.ember-api-more { background: rgba(255,255,255,0.05); color: var(--text-muted); border-color: rgba(255,255,255,0.08); }
+
+.ember-more-toggle {
+    margin: 12px 0 4px;
+    font-size: 11px;
+    color: var(--accent-cyan);
+    cursor: pointer;
+    user-select: none;
+}
+.ember-more-toggle:hover { text-decoration: underline; }
+.ember-more {
+    margin-top: 6px;
+    padding: 10px;
+    background: rgba(255,255,255,0.02);
+    border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.05);
+}
+.ember-more-sub {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    margin: 10px 0 4px;
+}
+.ember-more-sub:first-child { margin-top: 0; }
+.ember-more-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.ember-more-table th {
+    text-align: left;
+    color: var(--text-muted);
+    font-weight: 500;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+    padding: 3px 6px;
+}
+.ember-more-table td {
+    padding: 3px 6px;
+    border-bottom: 1px solid rgba(255,255,255,0.03);
+    font-family: var(--font-mono, monospace);
+}
+.ember-more-kv { font-size: 11px; color: var(--text-secondary, #a8b0bd); font-family: var(--font-mono, monospace); word-break: break-word; }
+
 /* --- capa Capability Detection --- */
 .service-icon.capa { background: rgba(59,130,246,0.15); color: var(--accent-blue); }
 

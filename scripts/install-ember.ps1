@@ -146,6 +146,15 @@ $wrapper = @'
 
 Extracts EMBERv3 features from a file and scores it with a pre-trained
 LightGBM benchmark model. Prints a single JSON object to stdout.
+
+Beyond the malicious/benign verdict it also emits an ``explanation`` block:
+  * per-feature-group SHAP contributions (why the model decided as it did),
+    obtained from ``booster.predict(..., pred_contrib=True)`` and summed over
+    each of thrember's 12 feature groups; and
+  * concrete raw-feature highlights (file entropy, high-entropy/packed
+    sections, notable imported APIs, signature status, PE warnings).
+The explanation is best-effort: if anything in it fails the scan verdict is
+still returned.
 """
 import argparse
 import hashlib
@@ -164,10 +173,160 @@ BINARY_MODELS = [
     "EMBER2024_Dot_Net", "EMBER2024_ELF", "EMBER2024_PDF", "EMBER2024_APK",
 ]
 
+# APIs that are common in malware; surfaced when present so the analyst sees
+# "what bit". Grouped only for readability of the source list.
+SUSPICIOUS_APIS = {
+    # code injection / process manipulation
+    "VirtualAlloc", "VirtualAllocEx", "VirtualProtect", "WriteProcessMemory",
+    "CreateRemoteThread", "CreateRemoteThreadEx", "NtCreateThreadEx",
+    "QueueUserAPC", "SetWindowsHookEx", "OpenProcess", "ReadProcessMemory",
+    "NtUnmapViewOfSection", "NtMapViewOfSection", "RtlCreateUserThread",
+    # dynamic resolution / anti-analysis
+    "LoadLibraryA", "LoadLibraryW", "LoadLibraryExW", "GetProcAddress",
+    "IsDebuggerPresent", "CheckRemoteDebuggerPresent", "NtQueryInformationProcess",
+    "GetTickCount", "OutputDebugStringA",
+    # execution
+    "WinExec", "ShellExecuteA", "ShellExecuteW", "ShellExecuteExW",
+    "CreateProcessA", "CreateProcessW", "CreateProcessInternalW",
+    # persistence / registry
+    "RegSetValueExA", "RegSetValueExW", "RegCreateKeyExA", "RegCreateKeyExW",
+    # crypto (ransomware)
+    "CryptEncrypt", "CryptDecrypt", "CryptGenKey", "CryptAcquireContextA",
+    "CryptAcquireContextW", "BCryptEncrypt", "CryptImportKey",
+    # networking (C2 / download)
+    "InternetOpenA", "InternetOpenW", "InternetOpenUrlA", "InternetOpenUrlW",
+    "InternetConnectA", "InternetConnectW", "HttpSendRequestA", "URLDownloadToFileW",
+    "URLDownloadToFileA", "WSAStartup", "connect", "send", "recv",
+    # discovery / evasion
+    "GetAdaptersInfo", "FindFirstFileW", "CreateToolhelp32Snapshot",
+    "Process32FirstW", "GetSystemInfo", "GetComputerNameW", "IsWow64Process",
+}
+
 
 def fail(msg):
     print(json.dumps({"tool": "EMBER2024", "error": msg}))
     sys.exit(1)
+
+
+def _build_explanation(booster, extractor, data, feature_vector):
+    """Return a dict explaining the score: per-group SHAP + raw highlights.
+
+    Best-effort; the caller must guard against exceptions.
+    """
+    import numpy as np
+
+    explanation = {}
+
+    # --- per-group SHAP contributions (log-odds / margin space) ---
+    # pred_contrib gives one value per feature plus a trailing bias term.
+    try:
+        contrib = np.array(booster.predict([feature_vector], pred_contrib=True))[0]
+        bias = float(contrib[-1])
+        per_feature = contrib[:-1]
+        groups = []
+        offset = 0
+        for f in extractor.features:
+            dim = getattr(f, "dim", 0)
+            seg = per_feature[offset:offset + dim]
+            offset += dim
+            val = float(seg.sum())
+            groups.append({
+                "group": f.name,
+                "value": round(val, 4),
+                "direction": "malicious" if val >= 0 else "benign",
+            })
+        groups.sort(key=lambda g: abs(g["value"]), reverse=True)
+        explanation["base_value"] = round(bias, 4)
+        explanation["contributions"] = groups
+    except Exception as e:  # pragma: no cover
+        explanation["contributions_error"] = str(e)
+
+    # --- concrete raw-feature highlights ---
+    try:
+        raw = extractor.raw_features(data)
+        details = {}
+
+        general = raw.get("general", {}) or {}
+        details["size"] = general.get("size")
+        details["file_entropy"] = round(float(general.get("entropy", 0.0)), 3)
+        details["has_debug"] = general.get("has_debug")
+        details["has_tls"] = general.get("has_tls")
+        details["has_resources"] = general.get("has_resources")
+        details["exports"] = general.get("exports")
+        details["imports"] = general.get("imports")
+        details["symbols"] = general.get("symbols")
+
+        # sections: flag high-entropy (likely packed/encrypted) sections
+        sec = raw.get("section", {}) or {}
+        seclist = sec.get("sections", []) or []
+        details["entry_section"] = sec.get("entry")
+        sections = []
+        for s in seclist:
+            sections.append({
+                "name": s.get("name", ""),
+                "size": s.get("size", 0),
+                "vsize": s.get("vsize", 0),
+                "entropy": round(float(s.get("entropy", 0.0)), 2),
+            })
+        # highest-entropy sections first (packing indicator)
+        sections.sort(key=lambda x: x["entropy"], reverse=True)
+        details["sections"] = sections[:12]
+        details["packed_sections"] = [
+            s["name"] for s in sections if s["entropy"] >= 7.0
+        ]
+
+        # imports: DLL counts + notable/suspicious APIs actually present
+        imp = raw.get("imports", {}) or {}
+        top_dlls = sorted(
+            ((dll, len(funcs or [])) for dll, funcs in imp.items()),
+            key=lambda kv: kv[1], reverse=True,
+        )
+        details["dll_count"] = len(imp)
+        details["import_count"] = sum(len(f or []) for f in imp.values())
+        details["top_dlls"] = [{"dll": d, "count": c} for d, c in top_dlls[:10]]
+        notable = []
+        for dll, funcs in imp.items():
+            for fn in (funcs or []):
+                if fn in SUSPICIOUS_APIS:
+                    notable.append({"dll": dll, "api": fn})
+        # de-dup while preserving order, cap
+        seen = set()
+        uniq = []
+        for n in notable:
+            key = (n["dll"], n["api"])
+            if key not in seen:
+                seen.add(key)
+                uniq.append(n)
+        details["notable_apis"] = uniq[:30]
+
+        # strings: high-level counts
+        strs = raw.get("strings", {}) or {}
+        details["strings"] = {
+            "count": strs.get("numstrings"),
+            "avg_length": round(float(strs.get("avlength", 0.0)), 1),
+            "entropy": round(float(strs.get("entropy", 0.0)), 2),
+            "paths": strs.get("paths"),
+            "urls": strs.get("urls"),
+            "registry": strs.get("registry"),
+            "MZ": strs.get("MZ"),
+        }
+
+        # authenticode / signature
+        auth = raw.get("authenticode", {}) or {}
+        details["authenticode"] = auth if isinstance(auth, dict) else {"raw": auth}
+
+        # PE parser warnings (malformed / suspicious structure)
+        warns = raw.get("pefilewarnings", {}) or {}
+        if isinstance(warns, dict):
+            details["pe_warnings"] = [k for k, v in warns.items() if v]
+        elif isinstance(warns, list):
+            details["pe_warnings"] = warns[:20]
+
+        explanation["details"] = details
+    except Exception as e:  # pragma: no cover
+        explanation["details_error"] = str(e)
+
+    return explanation
 
 
 def main():
@@ -176,6 +335,7 @@ def main():
     ap.add_argument("--model", default="EMBER2024_all")
     ap.add_argument("--models-dir", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"))
     ap.add_argument("--threshold", type=float, default=0.5)
+    ap.add_argument("--no-explain", action="store_true", help="skip the explanation block")
     args = ap.parse_args()
 
     if args.model not in BINARY_MODELS:
@@ -190,6 +350,7 @@ def main():
     try:
         import lightgbm as lgb
         import thrember
+        import numpy as np
     except Exception as e:  # pragma: no cover - platform dependent
         fail("thrember/lightgbm not available: %s" % e)
 
@@ -201,8 +362,10 @@ def main():
 
     try:
         booster = lgb.Booster(model_file=model_path)
+        extractor = thrember.PEFeatureExtractor()
         t0 = time.time()
-        score = thrember.predict_sample(booster, data)
+        feature_vector = np.array(extractor.feature_vector(data), dtype=np.float32)
+        score = float(booster.predict([feature_vector])[0])
         elapsed_ms = int((time.time() - t0) * 1000)
     except Exception as e:
         fail("Scoring failed: %s" % e)
@@ -222,6 +385,14 @@ def main():
         "verdict": "malicious" if malicious else "benign",
         "elapsed_ms": elapsed_ms,
     }
+
+    if not args.no_explain:
+        try:
+            result["explanation"] = _build_explanation(
+                booster, extractor, data, feature_vector)
+        except Exception as e:
+            result["explanation"] = {"error": str(e)}
+
     print(json.dumps(result))
 
 

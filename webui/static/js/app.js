@@ -1569,6 +1569,9 @@ function renderEmberResult(data, container) {
     if (data.size != null) html += `<div class="ember-detail"><span class="ember-detail-k">Size</span><span class="ember-detail-v">${formatSize(data.size)}</span></div>`;
     html += `</div>`;
 
+    // --- Why: model explanation (per-feature-group SHAP + raw highlights) ---
+    html += renderEmberExplanation(data.explanation || {});
+
     if (data.sha256) {
         html += `<div class="scan-output-header">SHA256:</div>`;
         html += `<pre class="scan-output">${escapeHtml(data.sha256)}</pre>`;
@@ -1576,6 +1579,127 @@ function renderEmberResult(data, container) {
 
     html += `</div>`;
     container.innerHTML = html;
+}
+
+// Render the EMBER "why" panel: signed per-feature-group contributions
+// (log-odds space; + pushes toward malicious, - toward benign) plus concrete
+// raw-feature highlights, with a "> more" expander for the full detail.
+function renderEmberExplanation(ex) {
+    if (!ex || (!ex.contributions && !ex.details)) return '';
+    const det = ex.details || {};
+    let html = '';
+
+    // Feature-group contribution bars (top drivers).
+    const contribs = (ex.contributions || []).filter(c => Math.abs(c.value) > 0.001);
+    if (contribs.length) {
+        const maxAbs = Math.max(...contribs.map(c => Math.abs(c.value))) || 1;
+        html += `<div class="ember-why-header">Why this verdict &mdash; feature-group contributions <span class="ember-why-sub">(+ &rarr; malicious, &minus; &rarr; benign)</span></div>`;
+        html += `<div class="ember-why-list">`;
+        contribs.slice(0, 6).forEach(c => {
+            const w = Math.round(Math.abs(c.value) / maxAbs * 100);
+            const mal = c.value >= 0;
+            html += `<div class="ember-why-row">`;
+            html += `<span class="ember-why-group">${escapeHtml(c.group)}</span>`;
+            html += `<div class="ember-why-bar-track"><div class="ember-why-bar ${mal ? 'why-mal' : 'why-ben'}" style="width:${w}%"></div></div>`;
+            html += `<span class="ember-why-val ${mal ? 'why-mal-t' : 'why-ben-t'}">${c.value >= 0 ? '+' : ''}${c.value.toFixed(2)}</span>`;
+            html += `</div>`;
+        });
+        html += `</div>`;
+    }
+
+    // Compact highlight chips.
+    const chips = [];
+    if (det.file_entropy != null) {
+        const packed = det.packed_sections && det.packed_sections.length;
+        chips.push({ t: `entropy ${det.file_entropy}`, c: (det.file_entropy >= 7 ? 'chip-warn' : '') });
+        if (packed) chips.push({ t: `packed: ${det.packed_sections.join(', ')}`, c: 'chip-warn' });
+    }
+    if (det.dll_count != null) chips.push({ t: `${det.dll_count} DLLs / ${det.import_count} imports`, c: '' });
+    const auth = det.authenticode || {};
+    const signed = auth.num_certs && auth.num_certs > 0;
+    chips.push({ t: signed ? 'signed' : 'unsigned', c: signed ? '' : 'chip-warn' });
+    if (det.strings && det.strings.count != null) chips.push({ t: `${det.strings.count} strings`, c: '' });
+    if (chips.length) {
+        html += `<div class="ember-chip-row">`;
+        chips.forEach(ch => html += `<span class="ember-chip ${ch.c}">${escapeHtml(ch.t)}</span>`);
+        html += `</div>`;
+    }
+
+    // Notable / suspicious APIs actually present in the import table.
+    const apis = det.notable_apis || [];
+    if (apis.length) {
+        html += `<div class="ember-why-header">Notable APIs <span class="ember-why-sub">(${apis.length})</span></div>`;
+        html += `<div class="ember-api-list">`;
+        apis.slice(0, 14).forEach(n => html += `<span class="ember-api-chip" title="${escapeHtml(n.dll || '')}">${escapeHtml(n.api)}</span>`);
+        if (apis.length > 14) html += `<span class="ember-api-chip ember-api-more">+${apis.length - 14}</span>`;
+        html += `</div>`;
+    }
+
+    // "> more" expander with the full detail dump.
+    const moreId = 'ember-more-' + Math.random().toString(36).slice(2, 8);
+    html += `<div class="ember-more-toggle" onclick="toggleEmberMore('${moreId}', this)">&#9656; more detail</div>`;
+    html += `<div class="ember-more" id="${moreId}" style="display:none">`;
+
+    // All feature-group contributions
+    if (ex.contributions && ex.contributions.length) {
+        html += `<div class="ember-more-sub">All feature-group contributions (base ${ex.base_value != null ? ex.base_value : '?'})</div>`;
+        html += `<table class="ember-more-table"><tr><th>group</th><th>contribution</th></tr>`;
+        ex.contributions.forEach(c => {
+            html += `<tr><td>${escapeHtml(c.group)}</td><td class="${c.value >= 0 ? 'why-mal-t' : 'why-ben-t'}">${c.value >= 0 ? '+' : ''}${c.value}</td></tr>`;
+        });
+        html += `</table>`;
+    }
+
+    // All sections (entropy-sorted)
+    if (det.sections && det.sections.length) {
+        html += `<div class="ember-more-sub">Sections (entry: ${escapeHtml(det.entry_section || '?')})</div>`;
+        html += `<table class="ember-more-table"><tr><th>name</th><th>entropy</th><th>size</th><th>vsize</th></tr>`;
+        det.sections.forEach(s => {
+            const hot = s.entropy >= 7 ? ' class="chip-warn"' : '';
+            html += `<tr><td>${escapeHtml(s.name)}</td><td${hot}>${s.entropy}</td><td>${formatSize(s.size)}</td><td>${formatSize(s.vsize)}</td></tr>`;
+        });
+        html += `</table>`;
+    }
+
+    // Top DLLs
+    if (det.top_dlls && det.top_dlls.length) {
+        html += `<div class="ember-more-sub">Top imported DLLs</div>`;
+        html += `<table class="ember-more-table"><tr><th>dll</th><th>imports</th></tr>`;
+        det.top_dlls.forEach(d => html += `<tr><td>${escapeHtml(d.dll)}</td><td>${d.count}</td></tr>`);
+        html += `</table>`;
+    }
+
+    // All notable APIs
+    if (apis.length) {
+        html += `<div class="ember-more-sub">All notable APIs</div>`;
+        html += `<div class="ember-api-list">`;
+        apis.forEach(n => html += `<span class="ember-api-chip" title="${escapeHtml(n.dll || '')}">${escapeHtml(n.api)}</span>`);
+        html += `</div>`;
+    }
+
+    // Strings + PE warnings
+    if (det.strings) {
+        const s = det.strings;
+        html += `<div class="ember-more-sub">Strings</div>`;
+        html += `<div class="ember-more-kv">count: ${s.count ?? '?'} &middot; avg len: ${s.avg_length ?? '?'} &middot; entropy: ${s.entropy ?? '?'} &middot; urls: ${s.urls ?? 0} &middot; paths: ${s.paths ?? 0} &middot; registry: ${s.registry ?? 0}</div>`;
+    }
+    if (det.pe_warnings && det.pe_warnings.length) {
+        html += `<div class="ember-more-sub">PE parser warnings</div>`;
+        html += `<div class="ember-more-kv">${det.pe_warnings.map(escapeHtml).join(', ')}</div>`;
+    }
+    if (ex.contributions_error) html += `<div class="ember-more-kv chip-warn">contributions error: ${escapeHtml(ex.contributions_error)}</div>`;
+    if (ex.details_error) html += `<div class="ember-more-kv chip-warn">details error: ${escapeHtml(ex.details_error)}</div>`;
+
+    html += `</div>`;
+    return html;
+}
+
+function toggleEmberMore(id, el) {
+    const panel = document.getElementById(id);
+    if (!panel) return;
+    const open = panel.style.display !== 'none';
+    panel.style.display = open ? 'none' : 'block';
+    if (el) el.innerHTML = (open ? '&#9656;' : '&#9662;') + ' more detail';
 }
 
 function renderEmberHistory() {
