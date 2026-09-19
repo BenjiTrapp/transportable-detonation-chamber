@@ -273,9 +273,14 @@ HOST_IP="192.168.64.1"
 info "Downloading and extracting in VM..."
 $PYTHON -c "
 import winrm
-s = winrm.Session('http://$VM_IP:5985/wsman', auth=('$VM_USER','$VM_PASS'), transport='ntlm')
-ps = '''
+# Longer timeouts: the 4.5M download + Expand-Archive (with Defender scanning
+# every extracted file) routinely exceeds pywinrm's 20s/30s defaults on a
+# freshly-booted VM, which makes the WSMan operation return empty output.
+s = winrm.Session('http://$VM_IP:5985/wsman', auth=('$VM_USER','$VM_PASS'), transport='ntlm',
+                  operation_timeout_sec=120, read_timeout_sec=130)
+ps = r'''
 \$ErrorActionPreference=\"Stop\"
+try {
 Invoke-WebRequest -Uri \"http://${HOST_IP}:8765/tdc-provision.zip\" -OutFile C:\\tdc-provision.zip -UseBasicParsing
 if (Test-Path C:\\tdc) { Remove-Item C:\\tdc -Recurse -Force }
 Expand-Archive -Path C:\\tdc-provision.zip -DestinationPath C:\\tdc -Force
@@ -288,6 +293,7 @@ Copy-Item C:\\tdc\\config   C:\\vagrant_config -Recurse -Force
 Copy-Item C:\\tdc\\webui\\*  C:\\vagrant\\webui -Recurse -Force
 Copy-Item C:\\tdc\\rules\\*  C:\\vagrant\\rules -Recurse -Force
 \"OK\"
+} catch { \"CAUGHT: \" + \$_.Exception.Message + \" @ \" + \$_.InvocationInfo.Line }
 '''
 r = s.run_ps(ps)
 out = r.std_out.decode(errors='replace').strip()
@@ -321,6 +327,8 @@ SCRIPTS=(
     "install-hunt-sleeping-beacons.ps1"
     "install-beaconeye.ps1"
     "install-scanner-tools.ps1"
+    "install-ember.ps1"
+    "install-capa.ps1"
     "install-re-tools.ps1"
     "install-webui.ps1"
     "configure-services.ps1"
@@ -336,7 +344,7 @@ s = winrm.Session('http://$VM_IP:5985/wsman', auth=('$VM_USER','$VM_PASS'), tran
                   operation_timeout_sec=30, read_timeout_sec=35)
 
 # Register and start as Scheduled Task (survives WinRM session end)
-ps = '''
+ps = r'''
 \$ErrorActionPreference=\"Continue\"
 New-Item -ItemType Directory -Path C:\\tdc\\logs -Force | Out-Null
 \$log  = \"C:\\tdc\\logs\\${script}.log\"
@@ -366,10 +374,10 @@ if 'STARTED' not in r.std_out.decode(errors='replace'):
 start = time.time()
 while time.time() - start < $timeout:
     time.sleep(15)
-    r = s.run_ps('if (Test-Path \"C:\\tdc\\logs\\${script}.done\") { \"DONE\" } else { \"RUNNING\" }')
+    r = s.run_ps(r'if (Test-Path \"C:\\tdc\\logs\\${script}.done\") { \"DONE\" } else { \"RUNNING\" }')
     if 'DONE' in r.std_out.decode(errors='replace'):
         # Get last lines of log
-        r2 = s.run_ps('Get-Content \"C:\\tdc\\logs\\${script}.log\" -Tail 5')
+        r2 = s.run_ps(r'Get-Content \"C:\\tdc\\logs\\${script}.log\" -Tail 5')
         print(r2.std_out.decode(errors='replace').strip())
         sys.exit(0)
     elapsed = int(time.time() - start)
@@ -405,7 +413,7 @@ info "Installing nssm and configuring Rustinel as a service..."
 $PYTHON -c "
 import winrm
 s = winrm.Session('http://$VM_IP:5985/wsman', auth=('$VM_USER','$VM_PASS'), transport='ntlm')
-ps = '''
+ps = r'''
 # Rustinel needs nssm to run as a persistent service on ARM64
 if (-not (Get-Command nssm -EA SilentlyContinue)) {
     choco install nssm -y --no-progress 2>&1 | Out-Null
@@ -432,7 +440,7 @@ info "Patching Sysmon service detection for ARM64..."
 $PYTHON -c "
 import winrm
 s = winrm.Session('http://$VM_IP:5985/wsman', auth=('$VM_USER','$VM_PASS'), transport='ntlm')
-ps = '''
+ps = r'''
 \$f = \"C:\\DetonationChamberUI\\app.py\"
 if (Test-Path \$f) {
     \$c = [System.IO.File]::ReadAllText(\$f)

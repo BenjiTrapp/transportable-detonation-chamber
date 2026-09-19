@@ -33,6 +33,8 @@
                     <button class="tab" data-tab="graph">Graph</button>
                     <button class="tab" data-tab="sysmon">Sysmon</button>
                     <button class="tab" data-tab="scanner">Scanner</button>
+                    <button class="tab" data-tab="ember">EMBER</button>
+                    <button class="tab" data-tab="capa">capa</button>
                     <button class="tab" data-tab="etw">ETW</button>
                     <button class="tab" data-tab="hexeditor">Hex</button>
                     <button class="tab" data-tab="litterbox">LitterBox</button>
@@ -374,6 +376,100 @@
                 </div>
             </div>
 
+            <!-- EMBER2024 Tab (ML malware classifier) -->
+            <div class="tab-content" id="tab-ember">
+                <div class="content-header">
+                    <h2>EMBER2024 ML Classifier</h2>
+                    <div class="header-actions">
+                        <span class="scanner-status" id="ember-status"></span>
+                    </div>
+                </div>
+                <div class="scanner-body">
+                    <!-- File Input -->
+                    <div class="scanner-drop-zone" id="ember-drop-zone">
+                        <div class="scanner-drop-icon">&#x1F9EC;</div>
+                        <p>Drop a file to score or <span class="hex-browse-link" onclick="document.getElementById('ember-file-input').click()">browse</span></p>
+                        <input type="file" id="ember-file-input" hidden>
+                        <div class="hex-path-row">
+                            <span class="hex-path-or">or enter VM path:</span>
+                            <input type="text" id="ember-filepath" class="filter-input hex-path-input" placeholder="C:\path\to\file...">
+                        </div>
+                    </div>
+                    <!-- Options -->
+                    <div class="scanner-options">
+                        <label class="option-group">
+                            <span class="option-label">Model:</span>
+                            <select id="ember-model" class="filter-select">
+                                <option value="EMBER2024_all">EMBER2024_all (any file)</option>
+                                <option value="EMBER2024_PE">EMBER2024_PE</option>
+                                <option value="EMBER2024_Win32">EMBER2024_Win32</option>
+                                <option value="EMBER2024_Win64">EMBER2024_Win64</option>
+                                <option value="EMBER2024_Dot_Net">EMBER2024_Dot_Net</option>
+                                <option value="EMBER2024_ELF">EMBER2024_ELF</option>
+                                <option value="EMBER2024_PDF">EMBER2024_PDF</option>
+                                <option value="EMBER2024_APK">EMBER2024_APK</option>
+                            </select>
+                        </label>
+                        <label class="option-group">
+                            <span class="option-label">Threshold:</span>
+                            <input type="number" id="ember-threshold" class="filter-input" value="0.5" min="0" max="1" step="0.05" style="width:80px;">
+                        </label>
+                        <button class="btn btn-primary" id="ember-run-btn" onclick="runEmberScan()">Score</button>
+                    </div>
+                    <!-- Results -->
+                    <div class="scanner-results" id="ember-results">
+                        <div class="scanner-placeholder">Select a file and click Score to compute its EMBER2024 malicious probability (LightGBM).</div>
+                    </div>
+                    <!-- Scan History -->
+                    <div class="scanner-history">
+                        <div class="scanner-history-header">
+                            <h3>Scan History</h3>
+                            <button class="btn btn-sm" onclick="clearEmberHistory()">Clear</button>
+                        </div>
+                        <div class="scanner-history-list" id="ember-history-list"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- capa Tab (static capability detection) -->
+            <div class="tab-content" id="tab-capa">
+                <div class="content-header">
+                    <h2>capa Capability Detection</h2>
+                    <div class="header-actions">
+                        <span class="scanner-status" id="capa-status"></span>
+                    </div>
+                </div>
+                <div class="scanner-body">
+                    <!-- File Input -->
+                    <div class="scanner-drop-zone" id="capa-drop-zone">
+                        <div class="scanner-drop-icon">&#x1F9E9;</div>
+                        <p>Drop a file to analyze or <span class="hex-browse-link" onclick="document.getElementById('capa-file-input').click()">browse</span></p>
+                        <input type="file" id="capa-file-input" hidden>
+                        <div class="hex-path-row">
+                            <span class="hex-path-or">or enter VM path:</span>
+                            <input type="text" id="capa-filepath" class="filter-input hex-path-input" placeholder="C:\path\to\file...">
+                        </div>
+                    </div>
+                    <!-- Options -->
+                    <div class="scanner-options">
+                        <span class="option-label" style="opacity:0.7;">Detects capabilities in PE/.NET/ELF/shellcode &mdash; mapped to MITRE ATT&amp;CK &amp; MBC.</span>
+                        <button class="btn btn-primary" id="capa-run-btn" onclick="runCapaScan()">Analyze</button>
+                    </div>
+                    <!-- Results -->
+                    <div class="scanner-results" id="capa-results">
+                        <div class="scanner-placeholder">Select a file and click Analyze to detect its capabilities (static, no execution).</div>
+                    </div>
+                    <!-- Scan History -->
+                    <div class="scanner-history">
+                        <div class="scanner-history-header">
+                            <h3>Scan History</h3>
+                            <button class="btn btn-sm" onclick="clearCapaHistory()">Clear</button>
+                        </div>
+                        <div class="scanner-history-list" id="capa-history-list"></div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Hex Editor Tab -->
             <div class="tab-content" id="tab-hexeditor">
                 <div class="content-header">
@@ -665,6 +761,14 @@
                             <p>Run ThreatCheck or DefenderCheck against files. Supports Defender and AMSI engines. Results show detection status, byte offset of trigger, and link to hex editor for inspection.</p>
                         </div>
                         <div class="help-guide-item">
+                            <h4>EMBER</h4>
+                            <p>Score a file with the EMBER2024 (thrember) LightGBM classifier. Returns a machine-learning malicious probability (0&ndash;1) for PE/ELF/PDF/APK samples. Choose a benchmark model and decision threshold; results and history show the score, verdict, and SHA256.</p>
+                        </div>
+                        <div class="help-guide-item">
+                            <h4>capa</h4>
+                            <p>Detect <em>capabilities</em> in a file with Mandiant capa (static, no execution). Answers "what can it do?" &mdash; e.g. process injection, persistence, C2 &mdash; and maps each finding to MITRE ATT&amp;CK and the Malware Behavior Catalog. Complements EMBER's malicious score with an explainable capability breakdown.</p>
+                        </div>
+                        <div class="help-guide-item">
                             <h4>Hex Editor</h4>
                             <p>Binary file viewer with offset navigation, data inspector (Int8/16/32, Float, ASCII, UTF-16), and drag-and-drop file upload. <strong>PE Analysis</strong> button parses headers, sections, imports, and flags IOC indicators.</p>
                         </div>
@@ -717,6 +821,8 @@
                         <tbody>
                             <tr><td class="api-post">POST</td><td><code>/api/scan/threatcheck</code></td><td>ThreatCheck scan. Params: <code>file</code>/<code>path</code>, <code>engine</code>, <code>type</code></td></tr>
                             <tr><td class="api-post">POST</td><td><code>/api/scan/defendercheck</code></td><td>DefenderCheck scan. Params: <code>file</code>/<code>path</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/scan/ember</code></td><td>EMBER2024 ML score. Params: <code>file</code>/<code>path</code>, <code>model</code>, <code>threshold</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/scan/capa</code></td><td>capa capability detection (ATT&amp;CK/MBC). Params: <code>file</code>/<code>path</code></td></tr>
                             <tr><td class="api-get">GET</td><td><code>/api/scan/status</code></td><td>Scanner tool availability</td></tr>
                         </tbody>
                     </table>

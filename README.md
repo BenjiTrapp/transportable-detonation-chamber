@@ -113,6 +113,8 @@ make open       # Opens http://<vm-ip>:9000 in browser
 | **Graph** | Process relationship graph (Force/Hierarchical/Radial/Circular/Grid layouts) |
 | **Sysmon** | Windows Sysmon event viewer with search, filtering, and Event ID correlation |
 | **Scanner** | ThreatCheck + DefenderCheck integration with scan history |
+| **EMBER** | EMBER2024 (thrember) LightGBM ML classifier — malicious probability score for PE/ELF/PDF/APK |
+| **capa** | Mandiant capa static capability detection — ATT&CK/MBC-mapped capabilities for PE/.NET/ELF/shellcode |
 | **ETW** | Multi-channel Event Log browser with live threat highlighting (see below) |
 | **Hex Editor** | Binary viewer with data inspector, PE/ELF analysis, drag-and-drop |
 | **Submit** | Multi-target detonation with stage-by-stage pipeline progress |
@@ -629,7 +631,9 @@ All endpoints served on port `9000`. Responses are JSON.
 |--------|----------|-------------|
 | POST | `/api/scan/threatcheck` | ThreatCheck scan. Params: `file`/`path`, `engine`, `type` |
 | POST | `/api/scan/defendercheck` | DefenderCheck scan. Params: `file`/`path` |
-| GET | `/api/scan/status` | Scanner tool availability |
+| POST | `/api/scan/ember` | EMBER2024 ML score. Params: `file`/`path`, `model`, `threshold` |
+| POST | `/api/scan/capa` | capa capability detection (ATT&CK/MBC). Params: `file`/`path` |
+| GET | `/api/scan/status` | Scanner tool availability (ThreatCheck / DefenderCheck / EMBER2024 / capa) |
 
 ### Proxy Endpoints
 
@@ -768,6 +772,8 @@ C:\DetonatorAgent\                  .NET 8 execution agent
 C:\LitterBox\                       Analysis sandbox
 C:\tools\ThreatCheck\               AV signature scanner
 C:\tools\DefenderCheck\             Defender evasion tester
+C:\tools\EMBER2024\                 EMBER2024 ML classifier (thrember venv + models)
+C:\tools\capa\                      Mandiant capa (static capability detection)
 C:\tools\Hunt-Sleeping-Beacons\     Sleeping beacon scanner
 C:\tools\theZoo-WebUI\              theZoo malware sample browser (:8888)
 C:\tools\detection-rules\           Sigma + YARA + IOC rules
@@ -902,6 +908,8 @@ make install    # or: .\make.ps1 install
 | [rabbitstack/fibratus](https://github.com/rabbitstack/fibratus) | ETW detection engine |
 | [Karib0u/rustinel](https://github.com/Karib0u/rustinel) | Sigma/YARA EDR agent |
 | [BlackSnufkin/LitterBox](https://github.com/BlackSnufkin/LitterBox) | Payload analysis sandbox |
+| [FutureComputing4AI/EMBER2024](https://github.com/FutureComputing4AI/EMBER2024) | ML malware classifier (thrember / LightGBM) |
+| [mandiant/capa](https://github.com/mandiant/capa) | Static capability detection (ATT&CK / MBC) |
 | [thefLink/Hunt-Sleeping-Beacons](https://github.com/thefLink/Hunt-Sleeping-Beacons) | Sleeping beacon callstack scanner |
 | [ytisf/theZoo](https://github.com/ytisf/theZoo) | Malware sample repository |
 | [kawaiipantsu/theZoo-WebUI](https://github.com/kawaiipantsu/theZoo-WebUI) | theZoo web frontend |

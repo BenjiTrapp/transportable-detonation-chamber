@@ -2847,6 +2847,43 @@ def api_file_hex_write():
 THREATCHECK_EXE = r"C:\tools\ThreatCheck\bin\ThreatCheck.exe"
 DEFENDERCHECK_EXE = r"C:\tools\DefenderCheck\bin\DefenderCheck.exe"
 
+# --- EMBER2024 (thrember) ML classifier Integration ---
+EMBER_ROOT = r"C:\tools\EMBER2024"
+EMBER_PYTHON = r"C:\tools\EMBER2024\venv\Scripts\python.exe"
+EMBER_SCRIPT = r"C:\tools\EMBER2024\ember_scan.py"
+EMBER_MODELS_DIR = r"C:\tools\EMBER2024\models"
+# Binary (malicious/benign) benchmark models exposed by the scanner UI.
+EMBER_MODELS = [
+    "EMBER2024_all", "EMBER2024_PE", "EMBER2024_Win32", "EMBER2024_Win64",
+    "EMBER2024_Dot_Net", "EMBER2024_ELF", "EMBER2024_PDF", "EMBER2024_APK",
+]
+
+# --- Mandiant capa (static capability detection) Integration ---
+CAPA_EXE = r"C:\tools\capa\capa.exe"
+
+
+def _parse_capa_attack(entries):
+    """Format capa ATT&CK/MBC spec entries into 'Tactic: Technique::Sub [ID]' strings."""
+    out = []
+    for e in entries or []:
+        if not isinstance(e, dict):
+            out.append(str(e))
+            continue
+        # ATT&CK uses tactic/technique/subtechnique; MBC uses objective/behavior.
+        head = e.get("tactic") or e.get("objective") or ""
+        mid = e.get("technique") or e.get("behavior") or ""
+        sub = e.get("subtechnique") or e.get("method") or ""
+        ident = e.get("id") or ""
+        s = head
+        if mid:
+            s += f": {mid}"
+        if sub:
+            s += f"::{sub}"
+        if ident:
+            s += f" [{ident}]"
+        out.append(s.strip(": ").strip() or str(e.get("parts", "")))
+    return out
+
 # --- Beacon Scanner Integration ---
 HUNT_SLEEPING_BEACONS_EXE = r"C:\tools\Hunt-Sleeping-Beacons\Hunt-Sleeping-Beacons.exe"
 BEACONEYE_EXE = r"C:\tools\BeaconEye\BeaconEye.exe"
@@ -2952,9 +2989,178 @@ def api_scan_defendercheck():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/scan/ember", methods=["POST"])
+def api_scan_ember():
+    """Score a file with an EMBER2024 (thrember) LightGBM classifier.
+
+    Returns the malicious probability (0..1) and a verdict. Params:
+      file / path  - uploaded file or a VM-local path
+      model        - one of EMBER_MODELS (default EMBER2024_all)
+      threshold    - malicious decision threshold (default 0.5)
+    """
+    model = request.form.get("model", "EMBER2024_all")
+    if model not in EMBER_MODELS:
+        return jsonify({"error": f"Unknown model '{model}'"}), 400
+    try:
+        threshold = float(request.form.get("threshold", "0.5"))
+    except ValueError:
+        return jsonify({"error": "Invalid threshold"}), 400
+
+    if not os.path.isfile(EMBER_PYTHON) or not os.path.isfile(EMBER_SCRIPT):
+        return jsonify({"error": "EMBER2024 not installed"}), 500
+
+    filepath = request.form.get("path", "")
+    if "file" in request.files:
+        file = request.files["file"]
+        file_bytes = file.read()
+        import tempfile
+        temp_dir = os.path.join(tempfile.gettempdir(), "scan_uploads")
+        os.makedirs(temp_dir, exist_ok=True)
+        filepath = os.path.join(temp_dir, file.filename or "scan_target")
+        with open(filepath, "wb") as f:
+            f.write(file_bytes)
+    elif not filepath or not os.path.isfile(filepath):
+        return jsonify({"error": "No file provided or path not found"}), 400
+
+    try:
+        result = subprocess.run(
+            [EMBER_PYTHON, EMBER_SCRIPT, filepath,
+             "--model", model,
+             "--threshold", str(threshold),
+             "--models-dir", EMBER_MODELS_DIR],
+            capture_output=True, text=True, timeout=120,
+            cwd=EMBER_ROOT,
+        )
+        stdout = (result.stdout or "").strip()
+        try:
+            data = json.loads(stdout.splitlines()[-1]) if stdout else {}
+        except (ValueError, IndexError):
+            data = {}
+
+        if not data or "error" in data:
+            err = data.get("error") if data else ((result.stderr or stdout or "no output").strip())
+            return jsonify({"error": f"EMBER scan failed: {err}"}), 500
+
+        # Normalize to the shared scanner-result shape used by the UI/history.
+        score = data.get("score")
+        malicious = bool(data.get("malicious"))
+        data["detected"] = malicious
+        data["clean"] = not malicious
+        data["output"] = (
+            f"Model: {data.get('model')}\n"
+            f"Malicious probability: {score:.4f}\n"
+            f"Threshold: {data.get('threshold')}\n"
+            f"Verdict: {str(data.get('verdict', '')).upper()}\n"
+            f"SHA256: {data.get('sha256')}"
+        )
+        return jsonify(data)
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "EMBER scan timed out (120s)"}), 504
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/scan/capa", methods=["POST"])
+def api_scan_capa():
+    """Detect capabilities in a file with Mandiant capa (static, ATT&CK-mapped).
+
+    Params:
+      file / path  - uploaded file or a VM-local path
+    """
+    if not os.path.isfile(CAPA_EXE):
+        return jsonify({"error": "capa not installed"}), 500
+
+    filepath = request.form.get("path", "")
+    if "file" in request.files:
+        file = request.files["file"]
+        file_bytes = file.read()
+        import tempfile
+        temp_dir = os.path.join(tempfile.gettempdir(), "scan_uploads")
+        os.makedirs(temp_dir, exist_ok=True)
+        filepath = os.path.join(temp_dir, file.filename or "scan_target")
+        with open(filepath, "wb") as f:
+            f.write(file_bytes)
+    elif not filepath or not os.path.isfile(filepath):
+        return jsonify({"error": "No file provided or path not found"}), 400
+
+    try:
+        result = subprocess.run(
+            [CAPA_EXE, "-q", "-j", filepath],
+            capture_output=True, text=True, timeout=300,
+            cwd=os.path.dirname(CAPA_EXE),
+        )
+        stdout = (result.stdout or "").strip()
+        try:
+            doc = json.loads(stdout)
+        except ValueError:
+            err = (result.stderr or stdout or "no output").strip()
+            return jsonify({"error": f"capa produced no JSON: {err[:500]}"}), 500
+
+        meta = doc.get("meta", {}) or {}
+        sample = meta.get("sample", {}) or {}
+        analysis = meta.get("analysis", {}) or {}
+        rules = doc.get("rules", {}) or {}
+
+        capabilities = []
+        for name, r in rules.items():
+            rm = (r.get("meta", {}) or {})
+            if rm.get("lib"):
+                continue  # skip library/helper rules
+            attack = rm.get("att&ck") or rm.get("attack") or []
+            mbc = rm.get("mbc") or []
+            capabilities.append({
+                "name": rm.get("name", name),
+                "namespace": rm.get("namespace", "") or "",
+                "matches": len(r.get("matches", []) or []),
+                "attack": _parse_capa_attack(attack),
+                "mbc": _parse_capa_attack(mbc),
+            })
+        capabilities.sort(key=lambda c: (c["namespace"], c["name"]))
+
+        # Collect the distinct ATT&CK tactics seen, for a quick summary line.
+        tactics = []
+        for c in capabilities:
+            for a in c["attack"]:
+                tac = a.split(":")[0].strip()
+                if tac and tac not in tactics:
+                    tactics.append(tac)
+
+        data = {
+            "tool": "capa",
+            "filepath": filepath,
+            "sha256": sample.get("sha256", ""),
+            "md5": sample.get("md5", ""),
+            "format": analysis.get("format", ""),
+            "arch": analysis.get("arch", ""),
+            "os": analysis.get("os", ""),
+            "capability_count": len(capabilities),
+            "tactics": tactics,
+            "capabilities": capabilities,
+            "exit_code": result.returncode,
+        }
+        data["output"] = (
+            f"Format: {data['format']} / {data['arch']} / {data['os']}\n"
+            f"Capabilities: {len(capabilities)}\n"
+            f"ATT&CK tactics: {', '.join(tactics) if tactics else 'none'}\n"
+            f"SHA256: {data['sha256']}"
+        )
+        return jsonify(data)
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "capa timed out (300s)"}), 504
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/scan/status")
 def api_scan_status():
     """Return availability status of scanning tools."""
+    ember_installed = os.path.isfile(EMBER_PYTHON) and os.path.isfile(EMBER_SCRIPT)
+    ember_models = []
+    if os.path.isdir(EMBER_MODELS_DIR):
+        ember_models = [
+            m for m in EMBER_MODELS
+            if os.path.isfile(os.path.join(EMBER_MODELS_DIR, m + ".model"))
+        ]
     return jsonify({
         "threatcheck": {
             "installed": os.path.isfile(THREATCHECK_EXE),
@@ -2963,6 +3169,15 @@ def api_scan_status():
         "defendercheck": {
             "installed": os.path.isfile(DEFENDERCHECK_EXE),
             "path": DEFENDERCHECK_EXE,
+        },
+        "ember": {
+            "installed": ember_installed,
+            "path": EMBER_SCRIPT,
+            "models": ember_models,
+        },
+        "capa": {
+            "installed": os.path.isfile(CAPA_EXE),
+            "path": CAPA_EXE,
         },
         "hunt_sleeping_beacons": {
             "installed": os.path.isfile(HUNT_SLEEPING_BEACONS_EXE),
