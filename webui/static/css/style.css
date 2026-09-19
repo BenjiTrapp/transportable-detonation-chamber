@@ -6205,7 +6205,8 @@ option.etw-ch-inactive { color: #94a3b8; }
     border: 1px solid rgba(251,191,36,0.25);
     font-family: var(--font-mono, monospace);
 }
-.ember-api-chip.ember-api-more { background: rgba(255,255,255,0.05); color: var(--text-muted); border-color: rgba(255,255,255,0.08); }
+.ember-api-chip.ember-api-more { background: rgba(255,255,255,0.05); color: var(--text-muted); border-color: rgba(255,255,255,0.08); cursor: pointer; user-select: none; }
+.ember-api-chip.ember-api-more:hover { color: var(--accent-cyan); border-color: var(--accent-cyan); }
 
 .ember-more-toggle {
     margin: 12px 0 4px;

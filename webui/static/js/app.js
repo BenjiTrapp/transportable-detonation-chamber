@@ -1722,14 +1722,18 @@ function renderEmberExplanation(ex) {
         html += `<div class="ember-why-header">Notable APIs <span class="ember-why-sub">(${apis.length})</span></div>`;
         html += `<div class="ember-api-list">`;
         apis.slice(0, 14).forEach(n => html += `<span class="ember-api-chip" title="${escapeHtml(n.dll || '')}">${escapeHtml(n.api)}</span>`);
-        if (apis.length > 14) html += `<span class="ember-api-chip ember-api-more">+${apis.length - 14}</span>`;
+        if (apis.length > 14) {
+            html += `<span class="ember-api-chip ember-api-more" onclick="toggleApiMore(this)">+${apis.length - 14}</span>`;
+            apis.slice(14).forEach(n => html += `<span class="ember-api-chip api-extra" style="display:none" title="${escapeHtml(n.dll || '')}">${escapeHtml(n.api)}</span>`);
+        }
         html += `</div>`;
     }
 
-    // "> more" expander with the full detail dump.
-    const moreId = 'ember-more-' + Math.random().toString(36).slice(2, 8);
-    html += `<div class="ember-more-toggle" onclick="toggleEmberMore('${moreId}', this)">&#9656; more detail</div>`;
-    html += `<div class="ember-more" id="${moreId}" style="display:none">`;
+    // "> more" expander with the full detail dump. DOM-relative toggle (no id):
+    // this block is rendered many times (live result + every history row, in
+    // three containers), so element ids would collide.
+    html += `<div class="ember-more-toggle" onclick="toggleEmberMore(this)">&#9656; more detail</div>`;
+    html += `<div class="ember-more" style="display:none">`;
 
     // All feature-group contributions
     if (ex.contributions && ex.contributions.length) {
@@ -1785,12 +1789,22 @@ function renderEmberExplanation(ex) {
     return html;
 }
 
-function toggleEmberMore(id, el) {
-    const panel = document.getElementById(id);
-    if (!panel) return;
+function toggleEmberMore(el) {
+    const panel = el.nextElementSibling;
+    if (!panel || !panel.classList.contains('ember-more')) return;
     const open = panel.style.display !== 'none';
     panel.style.display = open ? 'none' : 'block';
-    if (el) el.innerHTML = (open ? '&#9656;' : '&#9662;') + ' more detail';
+    el.innerHTML = (open ? '&#9656;' : '&#9662;') + ' more detail';
+}
+
+function toggleApiMore(el) {
+    // Reveal/hide the notable-API chips beyond the first 14, scoped to the
+    // clicked chip's own list (no ids -> safe across repeated renders).
+    const extras = el.parentElement.querySelectorAll('.api-extra');
+    if (!extras.length) return;
+    const hidden = extras[0].style.display === 'none';
+    extras.forEach(e => { e.style.display = hidden ? '' : 'none'; });
+    el.textContent = hidden ? 'less' : ('+' + extras.length);
 }
 
 function renderEmberHistory() { loadScanHistory(); }
