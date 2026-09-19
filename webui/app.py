@@ -3221,7 +3221,21 @@ def api_scan_capa():
             doc = json.loads(stdout)
         except ValueError:
             errtxt = (err or stdout or "no output").strip()
-            return jsonify({"error": f"capa produced no JSON: {errtxt[:500]}"}), 500
+            low = errtxt.lower()
+            # capa is x86 and only understands x86/x64/.NET PEs. On this ARM64
+            # VM most local binaries are ARM64, which capa rejects outright.
+            if "arm64" in low or "unsupported" in low and "architecture" in low:
+                msg = ("capa cannot analyze this file: unsupported architecture "
+                       "(capa supports x86/x64 and .NET PEs, not ARM64/other).")
+            elif not stdout and not (err or "").strip():
+                msg = "capa produced no output (it may not support this file type)."
+            else:
+                msg = f"capa produced no JSON: {errtxt[:500]}"
+            _record_scan("capa", os.path.basename(filepath),
+                         {"tool": "capa", "error": msg, "exit_code": returncode,
+                          "stderr": errtxt[:1000]},
+                         status="error")
+            return jsonify({"error": msg}), 422
 
         meta = doc.get("meta", {}) or {}
         sample = meta.get("sample", {}) or {}
@@ -3274,6 +3288,8 @@ def api_scan_capa():
         _record_scan("capa", os.path.basename(filepath), data)
         return jsonify(data)
     except Exception as e:
+        _record_scan("capa", os.path.basename(filepath),
+                     {"tool": "capa", "error": str(e)}, status="error")
         return jsonify({"error": str(e)}), 500
     finally:
         if cleanup_dir:
