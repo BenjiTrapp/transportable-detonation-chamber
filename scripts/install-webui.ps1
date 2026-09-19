@@ -92,5 +92,12 @@ if ($LASTEXITCODE -eq 0) {
 # Configure firewall
 New-NetFirewallRule -DisplayName "Detonation Chamber UI" -Direction Inbound -LocalPort 9000 -Protocol TCP -Action Allow -ErrorAction SilentlyContinue | Out-Null
 
+# Defender exclusions for the scanner upload staging dirs. The static scanners
+# (EMBER, capa) write real malware samples here; without an exclusion Defender
+# can quarantine/lock a sample mid-scan, breaking analysis. The web UI runs as
+# SYSTEM (scheduled task -> %TEMP% = C:\WINDOWS\TEMP); cover the user temp too.
+Add-MpPreference -ExclusionPath "C:\WINDOWS\TEMP\scan_uploads" -ErrorAction SilentlyContinue
+Add-MpPreference -ExclusionPath "$env:TEMP\scan_uploads" -ErrorAction SilentlyContinue
+
 Write-Host "[+] Web UI installed at $webuiDir" -ForegroundColor Green
 Write-Host "    URL: http://localhost:9000" -ForegroundColor Gray

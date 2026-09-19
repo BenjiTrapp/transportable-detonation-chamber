@@ -19,6 +19,7 @@ import threading
 import subprocess
 from pathlib import Path
 from flask import Flask, render_template, jsonify, request, send_from_directory
+from werkzeug.utils import secure_filename
 import requests
 
 app = Flask(__name__)
@@ -2910,7 +2911,10 @@ def api_scan_threatcheck():
         import tempfile
         temp_dir = os.path.join(tempfile.gettempdir(), "scan_uploads")
         os.makedirs(temp_dir, exist_ok=True)
-        filepath = os.path.join(temp_dir, file.filename or "scan_target")
+        # Sanitize the browser-supplied name: raw names with spaces or
+        # characters illegal on Windows (e.g. "file 2.exe") make open() fail
+        # with OSError [Errno 22]. secure_filename yields a safe ASCII name.
+        filepath = os.path.join(temp_dir, secure_filename(file.filename or "") or "scan_target")
         with open(filepath, "wb") as f:
             f.write(file_bytes)
     elif not filepath or not os.path.isfile(filepath):
@@ -2959,7 +2963,10 @@ def api_scan_defendercheck():
         import tempfile
         temp_dir = os.path.join(tempfile.gettempdir(), "scan_uploads")
         os.makedirs(temp_dir, exist_ok=True)
-        filepath = os.path.join(temp_dir, file.filename or "scan_target")
+        # Sanitize the browser-supplied name: raw names with spaces or
+        # characters illegal on Windows (e.g. "file 2.exe") make open() fail
+        # with OSError [Errno 22]. secure_filename yields a safe ASCII name.
+        filepath = os.path.join(temp_dir, secure_filename(file.filename or "") or "scan_target")
         with open(filepath, "wb") as f:
             f.write(file_bytes)
     elif not filepath or not os.path.isfile(filepath):
@@ -3016,7 +3023,10 @@ def api_scan_ember():
         import tempfile
         temp_dir = os.path.join(tempfile.gettempdir(), "scan_uploads")
         os.makedirs(temp_dir, exist_ok=True)
-        filepath = os.path.join(temp_dir, file.filename or "scan_target")
+        # Sanitize the browser-supplied name: raw names with spaces or
+        # characters illegal on Windows (e.g. "file 2.exe") make open() fail
+        # with OSError [Errno 22]. secure_filename yields a safe ASCII name.
+        filepath = os.path.join(temp_dir, secure_filename(file.filename or "") or "scan_target")
         with open(filepath, "wb") as f:
             f.write(file_bytes)
     elif not filepath or not os.path.isfile(filepath):
@@ -3071,30 +3081,52 @@ def api_scan_capa():
         return jsonify({"error": "capa not installed"}), 500
 
     filepath = request.form.get("path", "")
+    cleanup_dir = None
     if "file" in request.files:
         file = request.files["file"]
         file_bytes = file.read()
         import tempfile
-        temp_dir = os.path.join(tempfile.gettempdir(), "scan_uploads")
-        os.makedirs(temp_dir, exist_ok=True)
-        filepath = os.path.join(temp_dir, file.filename or "scan_target")
+        # Each upload gets its OWN directory. capa can run for a very long time
+        # on large/packed samples (it is x86-emulated on this ARM64 VM), and a
+        # still-running capa.exe keeps the sample file locked. With a shared
+        # fixed filename, the next upload's open(...,"wb") then fails with
+        # OSError [Errno 22] and every subsequent scan 500s. A unique dir per
+        # request isolates that and lets us clean up afterwards.
+        base = os.path.join(tempfile.gettempdir(), "scan_uploads")
+        os.makedirs(base, exist_ok=True)
+        cleanup_dir = tempfile.mkdtemp(dir=base)
+        # secure_filename strips spaces / Windows-illegal chars from the name.
+        filepath = os.path.join(cleanup_dir, secure_filename(file.filename or "") or "scan_target")
         with open(filepath, "wb") as f:
             f.write(file_bytes)
     elif not filepath or not os.path.isfile(filepath):
         return jsonify({"error": "No file provided or path not found"}), 400
 
     try:
-        result = subprocess.run(
+        proc = subprocess.Popen(
             [CAPA_EXE, "-q", "-j", filepath],
-            capture_output=True, text=True, timeout=300,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             cwd=os.path.dirname(CAPA_EXE),
         )
-        stdout = (result.stdout or "").strip()
+        try:
+            out, err = proc.communicate(timeout=300)
+        except subprocess.TimeoutExpired:
+            # Force-kill the whole tree: capa may spawn analysis children, and
+            # proc.kill() alone can orphan one that keeps holding the sample.
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True)
+            try:
+                proc.communicate(timeout=10)
+            except Exception:
+                pass
+            return jsonify({"error": "capa timed out (300s) - sample too large or packed for static capa analysis on this ARM64 VM"}), 504
+        returncode = proc.returncode
+        stdout = (out or "").strip()
         try:
             doc = json.loads(stdout)
         except ValueError:
-            err = (result.stderr or stdout or "no output").strip()
-            return jsonify({"error": f"capa produced no JSON: {err[:500]}"}), 500
+            errtxt = (err or stdout or "no output").strip()
+            return jsonify({"error": f"capa produced no JSON: {errtxt[:500]}"}), 500
 
         meta = doc.get("meta", {}) or {}
         sample = meta.get("sample", {}) or {}
@@ -3136,7 +3168,7 @@ def api_scan_capa():
             "capability_count": len(capabilities),
             "tactics": tactics,
             "capabilities": capabilities,
-            "exit_code": result.returncode,
+            "exit_code": returncode,
         }
         data["output"] = (
             f"Format: {data['format']} / {data['arch']} / {data['os']}\n"
@@ -3145,10 +3177,12 @@ def api_scan_capa():
             f"SHA256: {data['sha256']}"
         )
         return jsonify(data)
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "capa timed out (300s)"}), 504
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    finally:
+        if cleanup_dir:
+            import shutil
+            shutil.rmtree(cleanup_dir, ignore_errors=True)
 
 
 @app.route("/api/scan/status")
