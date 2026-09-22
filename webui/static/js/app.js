@@ -117,9 +117,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initUpload();
     initHexDropZone();
     initHexResizeHandle();
-    initScannerDropZone();
-    initEmberDropZone();
-    initCapaDropZone();
+    initThreatScan();
     initGraphControls();
     initRtraceTabs();
     refreshAll();
@@ -164,7 +162,7 @@ function switchTab(tabName) {
     if (tabName === 'litterbox') {
         initLitterbox();
     }
-    if (tabName === 'ember' || tabName === 'capa') {
+    if (tabName === 'threatscan') {
         loadScanToolStatus();
     }
 }
@@ -175,32 +173,46 @@ async function loadScanToolStatus() {
         const resp = await fetch('/api/scan/status');
         const data = await resp.json();
         state.emberStatus = data.ember || null;
-
-        const emberBadge = document.getElementById('ember-status');
-        if (emberBadge) {
-            if (data.ember && data.ember.installed) {
-                const n = (data.ember.models || []).length;
-                emberBadge.textContent = `Ready · ${n} model${n === 1 ? '' : 's'}`;
-                emberBadge.className = 'scanner-status online';
-            } else {
-                emberBadge.textContent = 'Not installed';
-                emberBadge.className = 'scanner-status offline';
-            }
-        }
-        const scannerBadge = document.getElementById('scanner-status');
-        if (scannerBadge) {
-            const tc = data.threatcheck && data.threatcheck.installed;
-            const dc = data.defendercheck && data.defendercheck.installed;
-            scannerBadge.textContent = `ThreatCheck: ${tc ? 'ready' : 'n/a'} · DefenderCheck: ${dc ? 'ready' : 'n/a'}`;
-            scannerBadge.className = 'scanner-status ' + ((tc || dc) ? 'online' : 'offline');
-        }
-
         state.capaStatus = data.capa || null;
-        const capaBadge = document.getElementById('capa-status');
-        if (capaBadge) {
-            const installed = data.capa && data.capa.installed;
-            capaBadge.textContent = installed ? 'Ready' : 'Not installed';
-            capaBadge.className = 'scanner-status ' + (installed ? 'online' : 'offline');
+
+        const tc = !!(data.threatcheck && data.threatcheck.installed);
+        const dc = !!(data.defendercheck && data.defendercheck.installed);
+        const em = !!(data.ember && data.ember.installed);
+        const cp = !!(data.capa && data.capa.installed);
+        const nModels = (data.ember && data.ember.models || []).length;
+
+        // Mark unavailable tool toggles (disable checkbox, annotate label)
+        const avail = {
+            threatcheck: tc,
+            defendercheck: dc,
+            ember: em,
+            capa: cp,
+        };
+        Object.keys(avail).forEach(id => {
+            const cb = document.getElementById('ts-tool-' + id);
+            if (!cb) return;
+            const label = cb.closest('.ts-tool-toggle');
+            if (avail[id]) {
+                cb.disabled = false;
+                if (label) { label.classList.remove('unavailable'); label.title = ''; }
+            } else {
+                cb.disabled = true;
+                cb.checked = false;
+                if (label) { label.classList.add('unavailable'); label.title = 'Not installed on this VM'; }
+            }
+        });
+        if (typeof updateThreatScanOptions === 'function') updateThreatScanOptions();
+
+        const badge = document.getElementById('threatscan-status');
+        if (badge) {
+            const parts = [
+                `ThreatCheck ${tc ? '✓' : '✗'}`,
+                `DefenderCheck ${dc ? '✓' : '✗'}`,
+                `EMBER ${em ? '✓ ' + nModels + ' model' + (nModels === 1 ? '' : 's') : '✗'}`,
+                `capa ${cp ? '✓' : '✗'}`,
+            ];
+            badge.textContent = parts.join(' · ');
+            badge.className = 'scanner-status ' + ((tc || dc || em || cp) ? 'online' : 'offline');
         }
     } catch (e) {
         /* non-fatal */
@@ -1281,12 +1293,19 @@ function clearAllTracing() {
 // AV/AMSI SCANNER (ThreatCheck / DefenderCheck)
 // =============================================
 
-let scanHistory = [];
-let scannerFile = null;
+let threatscanFile = null;
 
-function initScannerDropZone() {
-    const zone = document.getElementById('scanner-drop-zone');
-    const input = document.getElementById('scanner-file-input');
+// Unified tool registry. `render` reuses the existing per-tool result renderers.
+const THREATSCAN_TOOLS = [
+    { id: 'threatcheck',   label: 'ThreatCheck',   icon: '&#x1F50D;', url: '/api/scan/threatcheck',   render: renderScanResult },
+    { id: 'defendercheck', label: 'DefenderCheck', icon: '&#x1F6E1;', url: '/api/scan/defendercheck', render: renderScanResult },
+    { id: 'ember',         label: 'EMBER2024',     icon: '&#x1F9EC;', url: '/api/scan/ember',         render: renderEmberResult },
+    { id: 'capa',          label: 'capa',          icon: '&#x1F9E9;', url: '/api/scan/capa',          render: renderCapaResult },
+];
+
+function initThreatScan() {
+    const zone = document.getElementById('threatscan-drop-zone');
+    const input = document.getElementById('threatscan-file-input');
     if (!zone || !input) return;
 
     zone.addEventListener('dragover', e => {
@@ -1298,93 +1317,172 @@ function initScannerDropZone() {
         e.preventDefault();
         zone.classList.remove('dragover');
         if (e.dataTransfer.files.length) {
-            scannerFile = e.dataTransfer.files[0];
-            zone.classList.add('has-file');
-            zone.querySelector('p').innerHTML = `<strong>${escapeHtml(scannerFile.name)}</strong> (${formatSize(scannerFile.size)}) <span class="hex-change-file" onclick="scannerResetDrop()">change</span>`;
+            threatscanFile = e.dataTransfer.files[0];
+            _threatscanShowFile();
         }
     });
     input.addEventListener('change', () => {
         if (input.files.length) {
-            scannerFile = input.files[0];
-            zone.classList.add('has-file');
-            zone.querySelector('p').innerHTML = `<strong>${escapeHtml(scannerFile.name)}</strong> (${formatSize(scannerFile.size)}) <span class="hex-change-file" onclick="scannerResetDrop()">change</span>`;
+            threatscanFile = input.files[0];
+            _threatscanShowFile();
             input.value = '';
         }
     });
 
-    // Show/hide engine/type options based on tool selection
-    document.getElementById('scanner-tool').addEventListener('change', () => {
-        const tool = document.getElementById('scanner-tool').value;
-        document.getElementById('scanner-engine-group').style.display = tool === 'threatcheck' ? '' : 'none';
-        document.getElementById('scanner-type-group').style.display = tool === 'threatcheck' ? '' : 'none';
+    updateThreatScanOptions();
+}
+
+function _threatscanShowFile() {
+    const zone = document.getElementById('threatscan-drop-zone');
+    zone.classList.add('has-file');
+    zone.querySelector('p').innerHTML = `<strong>${escapeHtml(threatscanFile.name)}</strong> (${formatSize(threatscanFile.size)}) <span class="hex-change-file" onclick="threatscanResetDrop()">change</span>`;
+}
+
+function threatscanResetDrop() {
+    threatscanFile = null;
+    const zone = document.getElementById('threatscan-drop-zone');
+    zone.classList.remove('has-file');
+    zone.querySelector('p').innerHTML = 'Drop a file to scan or <span class="hex-browse-link" onclick="document.getElementById(\'threatscan-file-input\').click()">browse</span>';
+}
+
+// Show per-tool option rows only when their tool is selected.
+function updateThreatScanOptions() {
+    const tc = document.getElementById('ts-tool-threatcheck');
+    const em = document.getElementById('ts-tool-ember');
+    const tcOpts = document.getElementById('ts-opts-threatcheck');
+    const emOpts = document.getElementById('ts-opts-ember');
+    if (tcOpts) tcOpts.style.display = (tc && tc.checked) ? '' : 'none';
+    if (emOpts) emOpts.style.display = (em && em.checked) ? '' : 'none';
+}
+
+function threatscanSelectAll(on) {
+    THREATSCAN_TOOLS.forEach(t => {
+        const cb = document.getElementById('ts-tool-' + t.id);
+        if (cb && !cb.disabled) cb.checked = on;
+    });
+    updateThreatScanOptions();
+}
+
+function _threatscanSelectedTools() {
+    return THREATSCAN_TOOLS.filter(t => {
+        const cb = document.getElementById('ts-tool-' + t.id);
+        return cb && cb.checked && !cb.disabled;
     });
 }
 
-function scannerResetDrop() {
-    scannerFile = null;
-    const zone = document.getElementById('scanner-drop-zone');
-    zone.classList.remove('has-file');
-    zone.querySelector('p').innerHTML = 'Drop a file to scan or <span class="hex-browse-link" onclick="document.getElementById(\'scanner-file-input\').click()">browse</span>';
+// Short verdict label shown in each tool card header.
+function _threatscanVerdict(toolId, data) {
+    if (toolId === 'ember') {
+        const pct = typeof data.score === 'number' ? ' ' + (data.score * 100).toFixed(1) + '%' : '';
+        return data.malicious
+            ? { text: 'MALICIOUS' + pct, cls: 'ts-state-bad' }
+            : { text: 'BENIGN' + pct, cls: 'ts-state-good' };
+    }
+    if (toolId === 'capa') {
+        const c = data.capability_count != null ? data.capability_count : (data.capabilities || []).length;
+        return { text: c + ' capabilit' + (c === 1 ? 'y' : 'ies'), cls: 'ts-state-info' };
+    }
+    // threatcheck / defendercheck
+    if (data.detected) return { text: 'DETECTED', cls: 'ts-state-bad' };
+    if (data.clean) return { text: 'CLEAN', cls: 'ts-state-good' };
+    return { text: 'UNKNOWN', cls: 'ts-state-info' };
 }
 
-async function runScan() {
-    const tool = document.getElementById('scanner-tool').value;
-    const engine = document.getElementById('scanner-engine').value;
-    const fileType = document.getElementById('scanner-type').value;
-    const pathInput = document.getElementById('scanner-filepath').value.trim();
-    const resultsEl = document.getElementById('scanner-results');
-    const btn = document.getElementById('scanner-run-btn');
+async function runThreatScan() {
+    const pathInput = document.getElementById('threatscan-filepath').value.trim();
+    const resultsEl = document.getElementById('threatscan-results');
+    const btn = document.getElementById('threatscan-run-btn');
 
-    if (!scannerFile && !pathInput) {
+    if (!threatscanFile && !pathInput) {
         resultsEl.innerHTML = '<div class="scanner-error">Please select a file or enter a VM path.</div>';
         return;
     }
+    const tools = _threatscanSelectedTools();
+    if (!tools.length) {
+        resultsEl.innerHTML = '<div class="scanner-error">Select at least one tool to run.</div>';
+        return;
+    }
+
+    // Snapshot options once, up front.
+    const engine = (document.getElementById('scanner-engine') || {}).value || 'Defender';
+    const fileType = (document.getElementById('scanner-type') || {}).value || 'Bin';
+    const model = (document.getElementById('ember-model') || {}).value || 'EMBER2024_all';
+    const threshold = (document.getElementById('ember-threshold') || {}).value || '0.5';
 
     btn.disabled = true;
-    btn.textContent = 'Scanning...';
-    resultsEl.innerHTML = '<div class="scanner-running">Running scan... This may take up to 2 minutes.</div>';
+    btn.textContent = 'Scanning…';
 
-    const formData = new FormData();
-    if (scannerFile) {
-        formData.append('file', scannerFile);
-    } else {
-        formData.append('path', pathInput);
-    }
+    // Build one card per selected tool, all starting in the running state.
+    resultsEl.innerHTML = tools.map(t => `
+        <div class="ts-tool-card" id="ts-card-${t.id}">
+            <div class="ts-tool-card-head">
+                <span class="ts-tool-icon">${t.icon}</span>
+                <span class="ts-tool-name">${escapeHtml(t.label)}</span>
+                <span class="ts-tool-state ts-state-running" id="ts-state-${t.id}"><span class="ts-spinner ts-spinner-sm"></span>running</span>
+            </div>
+            <div class="ts-tool-card-body" id="ts-body-${t.id}">
+                <div class="ts-tool-running"><span class="ts-spinner"></span><span>Running ${escapeHtml(t.label)}… this may take up to 2 minutes.</span></div>
+            </div>
+        </div>`).join('');
 
-    let url;
-    if (tool === 'threatcheck') {
-        formData.append('engine', engine);
-        formData.append('type', fileType);
-        url = '/api/scan/threatcheck';
-    } else {
-        url = '/api/scan/defendercheck';
-    }
+    const jobs = tools.map(async (t) => {
+        const fd = new FormData();
+        if (threatscanFile) fd.append('file', threatscanFile);
+        else fd.append('path', pathInput);
+        if (t.id === 'threatcheck') { fd.append('engine', engine); fd.append('type', fileType); }
+        if (t.id === 'ember') { fd.append('model', model); fd.append('threshold', threshold); }
 
-    try {
-        LoadingSpinner.start();
-        const resp = await fetch(url, { method: 'POST', body: formData });
-        const data = await resp.json();
-
-        if (data.error) {
-            resultsEl.innerHTML = `<div class="scanner-error">Error: ${escapeHtml(data.error)}</div>`;
-        } else {
-            renderScanResult(data, resultsEl);
-            // Add to history
-            scanHistory.unshift({
-                ...data,
-                timestamp: new Date().toISOString(),
-                filename: scannerFile ? scannerFile.name : pathInput.split('\\').pop(),
-            });
-            if (scanHistory.length > 50) scanHistory.length = 50;
-            renderScanHistory();
+        const body = document.getElementById('ts-body-' + t.id);
+        const state = document.getElementById('ts-state-' + t.id);
+        try {
+            const resp = await fetch(t.url, { method: 'POST', body: fd });
+            const data = await resp.json();
+            if (data.error) {
+                if (body) body.innerHTML = `<div class="scanner-error">Error: ${escapeHtml(data.error)}</div>` + renderRawToggle(data);
+                if (state) { state.textContent = 'error'; state.className = 'ts-tool-state ts-state-error'; }
+            } else {
+                if (body) t.render(data, body);
+                if (state) { const v = _threatscanVerdict(t.id, data); state.textContent = v.text; state.className = 'ts-tool-state ' + v.cls; }
+            }
+        } catch (e) {
+            if (body) body.innerHTML = `<div class="scanner-error">Network error: ${escapeHtml(e.message)}</div>`;
+            if (state) { state.textContent = 'error'; state.className = 'ts-tool-state ts-state-error'; }
         }
-    } catch (e) {
-        resultsEl.innerHTML = `<div class="scanner-error">Network error: ${escapeHtml(e.message)}</div>`;
-    }
+    });
 
-    LoadingSpinner.stop();
+    await Promise.all(jobs);
+
     btn.disabled = false;
     btn.textContent = 'Scan';
+    loadScanHistory();
+}
+
+// Collapsible "raw output" block: the full, unmodified response object the
+// tool/endpoint produced, pretty-printed as JSON. Appended to every scan card
+// (ThreatCheck/DefenderCheck/EMBER/capa) and history detail so the original
+// output is always inspectable as text behind a toggle. DOM-relative toggle
+// (no ids) since it's rendered many times across cards + history rows.
+function renderRawToggle(data, label) {
+    if (data == null) return '';
+    label = label || 'Raw output (JSON)';
+    let json;
+    try {
+        json = JSON.stringify(data, null, 2);
+    } catch (e) {
+        json = String(data);
+    }
+    if (!json) return '';
+    return `<div class="raw-json-toggle" data-label="${escapeHtml(label)}" onclick="toggleRawJson(this)">&#9656; ${escapeHtml(label)}</div>`
+         + `<pre class="raw-json" style="display:none">${escapeHtml(json)}</pre>`;
+}
+
+function toggleRawJson(el) {
+    const pre = el.nextElementSibling;
+    if (!pre || !pre.classList.contains('raw-json')) return;
+    const open = pre.style.display !== 'none';
+    pre.style.display = open ? 'none' : 'block';
+    const label = el.getAttribute('data-label') || 'Raw output (JSON)';
+    el.innerHTML = (open ? '&#9656; ' : '&#9662; ') + escapeHtml(label);
 }
 
 function renderScanResult(data, container) {
@@ -1412,6 +1510,7 @@ function renderScanResult(data, container) {
         html += `</div>`;
     }
 
+    html += renderRawToggle(data);
     html += `</div>`;
     container.innerHTML = html;
 }
@@ -1421,7 +1520,7 @@ function renderScanResult(data, container) {
 // ThreatCheck / DefenderCheck / EMBER / capa, and any curl/API/MCP
 // scan). Rendered identically into all three per-tab containers.
 // ---------------------------------------------------------------
-const SCAN_HISTORY_CONTAINERS = ['scanner-history-list', 'ember-history-list', 'capa-history-list'];
+const SCAN_HISTORY_CONTAINERS = ['threatscan-history-list'];
 
 async function loadScanHistory() {
     try {
@@ -1521,6 +1620,9 @@ function renderHistoryDetail(entry) {
     if (r.output) h += `<pre class="scan-hist-output">${escapeHtml(String(r.output))}</pre>`;
     if (r.error) h += `<div class="scanner-error">${escapeHtml(String(r.error))}</div>`;
 
+    // Full original response as text (behind a toggle).
+    if (Object.keys(r).length) h += renderRawToggle(r);
+
     h += '</div>';
     return h;
 }
@@ -1576,96 +1678,6 @@ function renderScanHistory() { loadScanHistory(); }
 // =============================================
 // EMBER2024 ML CLASSIFIER
 // =============================================
-let emberHistory = [];
-let emberFile = null;
-
-function initEmberDropZone() {
-    const zone = document.getElementById('ember-drop-zone');
-    const input = document.getElementById('ember-file-input');
-    if (!zone || !input) return;
-
-    zone.addEventListener('dragover', e => {
-        e.preventDefault();
-        zone.classList.add('dragover');
-    });
-    zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
-    zone.addEventListener('drop', e => {
-        e.preventDefault();
-        zone.classList.remove('dragover');
-        if (e.dataTransfer.files.length) {
-            emberFile = e.dataTransfer.files[0];
-            zone.classList.add('has-file');
-            zone.querySelector('p').innerHTML = `<strong>${escapeHtml(emberFile.name)}</strong> (${formatSize(emberFile.size)}) <span class="hex-change-file" onclick="emberResetDrop()">change</span>`;
-        }
-    });
-    input.addEventListener('change', () => {
-        if (input.files.length) {
-            emberFile = input.files[0];
-            zone.classList.add('has-file');
-            zone.querySelector('p').innerHTML = `<strong>${escapeHtml(emberFile.name)}</strong> (${formatSize(emberFile.size)}) <span class="hex-change-file" onclick="emberResetDrop()">change</span>`;
-            input.value = '';
-        }
-    });
-}
-
-function emberResetDrop() {
-    emberFile = null;
-    const zone = document.getElementById('ember-drop-zone');
-    zone.classList.remove('has-file');
-    zone.querySelector('p').innerHTML = 'Drop a file to score or <span class="hex-browse-link" onclick="document.getElementById(\'ember-file-input\').click()">browse</span>';
-}
-
-async function runEmberScan() {
-    const model = document.getElementById('ember-model').value;
-    const threshold = document.getElementById('ember-threshold').value || '0.5';
-    const pathInput = document.getElementById('ember-filepath').value.trim();
-    const resultsEl = document.getElementById('ember-results');
-    const btn = document.getElementById('ember-run-btn');
-
-    if (!emberFile && !pathInput) {
-        resultsEl.innerHTML = '<div class="scanner-error">Please select a file or enter a VM path.</div>';
-        return;
-    }
-
-    btn.disabled = true;
-    btn.textContent = 'Scoring...';
-    resultsEl.innerHTML = '<div class="scanner-running">Extracting features &amp; scoring with LightGBM...</div>';
-
-    const formData = new FormData();
-    if (emberFile) {
-        formData.append('file', emberFile);
-    } else {
-        formData.append('path', pathInput);
-    }
-    formData.append('model', model);
-    formData.append('threshold', threshold);
-
-    try {
-        LoadingSpinner.start();
-        const resp = await fetch('/api/scan/ember', { method: 'POST', body: formData });
-        const data = await resp.json();
-
-        if (data.error) {
-            resultsEl.innerHTML = `<div class="scanner-error">Error: ${escapeHtml(data.error)}</div>`;
-        } else {
-            renderEmberResult(data, resultsEl);
-            emberHistory.unshift({
-                ...data,
-                timestamp: new Date().toISOString(),
-                filename: emberFile ? emberFile.name : pathInput.split('\\').pop(),
-            });
-            if (emberHistory.length > 50) emberHistory.length = 50;
-            renderEmberHistory();
-        }
-    } catch (e) {
-        resultsEl.innerHTML = `<div class="scanner-error">Network error: ${escapeHtml(e.message)}</div>`;
-    }
-
-    LoadingSpinner.stop();
-    btn.disabled = false;
-    btn.textContent = 'Score';
-}
-
 function renderEmberResult(data, container) {
     const score = typeof data.score === 'number' ? data.score : 0;
     const pct = Math.round(score * 1000) / 10;
@@ -1706,6 +1718,7 @@ function renderEmberResult(data, container) {
         html += `<pre class="scan-output">${escapeHtml(data.sha256)}</pre>`;
     }
 
+    html += renderRawToggle(data);
     html += `</div>`;
     container.innerHTML = html;
 }
@@ -1852,92 +1865,6 @@ function clearEmberHistory() { clearScanHistory(); }
 // =============================================
 // CAPA CAPABILITY DETECTION
 // =============================================
-let capaHistory = [];
-let capaFile = null;
-
-function initCapaDropZone() {
-    const zone = document.getElementById('capa-drop-zone');
-    const input = document.getElementById('capa-file-input');
-    if (!zone || !input) return;
-
-    zone.addEventListener('dragover', e => {
-        e.preventDefault();
-        zone.classList.add('dragover');
-    });
-    zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
-    zone.addEventListener('drop', e => {
-        e.preventDefault();
-        zone.classList.remove('dragover');
-        if (e.dataTransfer.files.length) {
-            capaFile = e.dataTransfer.files[0];
-            zone.classList.add('has-file');
-            zone.querySelector('p').innerHTML = `<strong>${escapeHtml(capaFile.name)}</strong> (${formatSize(capaFile.size)}) <span class="hex-change-file" onclick="capaResetDrop()">change</span>`;
-        }
-    });
-    input.addEventListener('change', () => {
-        if (input.files.length) {
-            capaFile = input.files[0];
-            zone.classList.add('has-file');
-            zone.querySelector('p').innerHTML = `<strong>${escapeHtml(capaFile.name)}</strong> (${formatSize(capaFile.size)}) <span class="hex-change-file" onclick="capaResetDrop()">change</span>`;
-            input.value = '';
-        }
-    });
-}
-
-function capaResetDrop() {
-    capaFile = null;
-    const zone = document.getElementById('capa-drop-zone');
-    zone.classList.remove('has-file');
-    zone.querySelector('p').innerHTML = 'Drop a file to analyze or <span class="hex-browse-link" onclick="document.getElementById(\'capa-file-input\').click()">browse</span>';
-}
-
-async function runCapaScan() {
-    const pathInput = document.getElementById('capa-filepath').value.trim();
-    const resultsEl = document.getElementById('capa-results');
-    const btn = document.getElementById('capa-run-btn');
-
-    if (!capaFile && !pathInput) {
-        resultsEl.innerHTML = '<div class="scanner-error">Please select a file or enter a VM path.</div>';
-        return;
-    }
-
-    btn.disabled = true;
-    btn.textContent = 'Analyzing...';
-    resultsEl.innerHTML = '<div class="scanner-running">Disassembling &amp; matching capa rules... This may take up to a few minutes.</div>';
-
-    const formData = new FormData();
-    if (capaFile) {
-        formData.append('file', capaFile);
-    } else {
-        formData.append('path', pathInput);
-    }
-
-    try {
-        LoadingSpinner.start();
-        const resp = await fetch('/api/scan/capa', { method: 'POST', body: formData });
-        const data = await resp.json();
-
-        if (data.error) {
-            resultsEl.innerHTML = `<div class="scanner-error">Error: ${escapeHtml(data.error)}</div>`;
-        } else {
-            renderCapaResult(data, resultsEl);
-            capaHistory.unshift({
-                ...data,
-                timestamp: new Date().toISOString(),
-                filename: capaFile ? capaFile.name : pathInput.split('\\').pop(),
-            });
-            if (capaHistory.length > 50) capaHistory.length = 50;
-            renderCapaHistory();
-        }
-    } catch (e) {
-        resultsEl.innerHTML = `<div class="scanner-error">Network error: ${escapeHtml(e.message)}</div>`;
-    }
-
-    LoadingSpinner.stop();
-    btn.disabled = false;
-    btn.textContent = 'Analyze';
-}
-
 function renderCapaResult(data, container) {
     const caps = data.capabilities || [];
     const count = data.capability_count != null ? data.capability_count : caps.length;
@@ -1995,6 +1922,7 @@ function renderCapaResult(data, container) {
         html += `<pre class="scan-output">${escapeHtml(data.sha256)}</pre>`;
     }
 
+    html += renderRawToggle(data);
     html += `</div>`;
     container.innerHTML = html;
 }

@@ -8,7 +8,7 @@
     <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
     <link rel="icon" type="image/png" sizes="192x192" href="/static/favicon-192.png">
     <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
-    <link rel="stylesheet" href="/static/css/style.css?v=13">
+    <link rel="stylesheet" href="/static/css/style.css?v=18">
 </head>
 <body>
     <!-- Global loading overlay (shown on slow fetches) -->
@@ -32,9 +32,7 @@
                     <button class="tab" data-tab="tracing">Tracing</button>
                     <button class="tab" data-tab="graph">Graph</button>
                     <button class="tab" data-tab="sysmon">Sysmon</button>
-                    <button class="tab" data-tab="scanner">Scanner</button>
-                    <button class="tab" data-tab="ember">EMBER</button>
-                    <button class="tab" data-tab="capa">capa</button>
+                    <button class="tab" data-tab="threatscan">ThreatScan</button>
                     <button class="tab" data-tab="etw">ETW</button>
                     <button class="tab" data-tab="hexeditor">Hex</button>
                     <button class="tab" data-tab="litterbox">LitterBox</button>
@@ -317,86 +315,61 @@
                 <div id="sysmon-table" class="events-table"></div>
             </div>
 
-            <!-- Scanner Tab (ThreatCheck / DefenderCheck) -->
-            <div class="tab-content" id="tab-scanner">
+            <!-- ThreatScan Tab (unified static analysis: ThreatCheck / DefenderCheck / EMBER2024 / capa) -->
+            <div class="tab-content" id="tab-threatscan">
                 <div class="content-header">
-                    <h2>AV/AMSI Scanner</h2>
+                    <h2>ThreatScan</h2>
                     <div class="header-actions">
-                        <span class="scanner-status" id="scanner-status"></span>
+                        <span class="scanner-status" id="threatscan-status"></span>
                     </div>
                 </div>
                 <div class="scanner-body">
                     <!-- File Input -->
-                    <div class="scanner-drop-zone" id="scanner-drop-zone">
-                        <div class="scanner-drop-icon">&#x1F50D;</div>
-                        <p>Drop a file to scan or <span class="hex-browse-link" onclick="document.getElementById('scanner-file-input').click()">browse</span></p>
-                        <input type="file" id="scanner-file-input" hidden>
+                    <div class="scanner-drop-zone" id="threatscan-drop-zone">
+                        <div class="scanner-drop-icon">&#x1F52C;</div>
+                        <p>Drop a file to scan or <span class="hex-browse-link" onclick="document.getElementById('threatscan-file-input').click()">browse</span></p>
+                        <input type="file" id="threatscan-file-input" hidden>
                         <div class="hex-path-row">
                             <span class="hex-path-or">or enter VM path:</span>
-                            <input type="text" id="scanner-filepath" class="filter-input hex-path-input" placeholder="C:\path\to\file...">
+                            <input type="text" id="threatscan-filepath" class="filter-input hex-path-input" placeholder="C:\path\to\file...">
                         </div>
                     </div>
-                    <!-- Options -->
-                    <div class="scanner-options">
+
+                    <!-- Tool selection -->
+                    <div class="ts-tools">
+                        <span class="option-label">Tools:</span>
+                        <label class="ts-tool-toggle"><input type="checkbox" id="ts-tool-threatcheck" checked onchange="updateThreatScanOptions()"> <span>ThreatCheck</span></label>
+                        <label class="ts-tool-toggle"><input type="checkbox" id="ts-tool-defendercheck"> <span>DefenderCheck</span></label>
+                        <label class="ts-tool-toggle"><input type="checkbox" id="ts-tool-ember" checked onchange="updateThreatScanOptions()"> <span>EMBER2024</span></label>
+                        <label class="ts-tool-toggle"><input type="checkbox" id="ts-tool-capa" checked> <span>capa</span></label>
+                        <span class="ts-tool-actions">
+                            <button class="btn btn-sm" onclick="threatscanSelectAll(true)">All</button>
+                            <button class="btn btn-sm" onclick="threatscanSelectAll(false)">None</button>
+                        </span>
+                    </div>
+
+                    <!-- ThreatCheck options -->
+                    <div class="scanner-options ts-options" id="ts-opts-threatcheck">
+                        <span class="ts-opts-label">ThreatCheck:</span>
                         <label class="option-group">
-                            <span class="option-label">Tool:</span>
-                            <select id="scanner-tool" class="filter-select">
-                                <option value="threatcheck">ThreatCheck</option>
-                                <option value="defendercheck">DefenderCheck</option>
-                            </select>
-                        </label>
-                        <label class="option-group" id="scanner-engine-group">
                             <span class="option-label">Engine:</span>
                             <select id="scanner-engine" class="filter-select">
                                 <option value="Defender">Defender</option>
                                 <option value="AMSI">AMSI</option>
                             </select>
                         </label>
-                        <label class="option-group" id="scanner-type-group">
+                        <label class="option-group">
                             <span class="option-label">Type:</span>
                             <select id="scanner-type" class="filter-select">
                                 <option value="Bin">Binary</option>
                                 <option value="Script">Script</option>
                             </select>
                         </label>
-                        <button class="btn btn-primary" id="scanner-run-btn" onclick="runScan()">Scan</button>
                     </div>
-                    <!-- Results -->
-                    <div class="scanner-results" id="scanner-results">
-                        <div class="scanner-placeholder">Select a file and click Scan to analyze it against Defender/AMSI signatures.</div>
-                    </div>
-                    <!-- Scan History -->
-                    <div class="scanner-history">
-                        <div class="scanner-history-header">
-                            <h3>Scan History</h3>
-                            <button class="btn btn-sm" onclick="clearScanHistory()">Clear</button>
-                        </div>
-                        <div class="scanner-history-list" id="scanner-history-list"></div>
-                    </div>
-                </div>
-            </div>
 
-            <!-- EMBER2024 Tab (ML malware classifier) -->
-            <div class="tab-content" id="tab-ember">
-                <div class="content-header">
-                    <h2>EMBER2024 ML Classifier</h2>
-                    <div class="header-actions">
-                        <span class="scanner-status" id="ember-status"></span>
-                    </div>
-                </div>
-                <div class="scanner-body">
-                    <!-- File Input -->
-                    <div class="scanner-drop-zone" id="ember-drop-zone">
-                        <div class="scanner-drop-icon">&#x1F9EC;</div>
-                        <p>Drop a file to score or <span class="hex-browse-link" onclick="document.getElementById('ember-file-input').click()">browse</span></p>
-                        <input type="file" id="ember-file-input" hidden>
-                        <div class="hex-path-row">
-                            <span class="hex-path-or">or enter VM path:</span>
-                            <input type="text" id="ember-filepath" class="filter-input hex-path-input" placeholder="C:\path\to\file...">
-                        </div>
-                    </div>
-                    <!-- Options -->
-                    <div class="scanner-options">
+                    <!-- EMBER options -->
+                    <div class="scanner-options ts-options" id="ts-opts-ember">
+                        <span class="ts-opts-label">EMBER2024:</span>
                         <label class="option-group">
                             <span class="option-label">Model:</span>
                             <select id="ember-model" class="filter-select">
@@ -414,58 +387,26 @@
                             <span class="option-label">Threshold:</span>
                             <input type="number" id="ember-threshold" class="filter-input" value="0.5" min="0" max="1" step="0.05" style="width:80px;">
                         </label>
-                        <button class="btn btn-primary" id="ember-run-btn" onclick="runEmberScan()">Score</button>
                     </div>
-                    <!-- Results -->
-                    <div class="scanner-results" id="ember-results">
-                        <div class="scanner-placeholder">Select a file and click Score to compute its EMBER2024 malicious probability (LightGBM).</div>
-                    </div>
-                    <!-- Scan History -->
-                    <div class="scanner-history">
-                        <div class="scanner-history-header">
-                            <h3>Scan History</h3>
-                            <button class="btn btn-sm" onclick="clearEmberHistory()">Clear</button>
-                        </div>
-                        <div class="scanner-history-list" id="ember-history-list"></div>
-                    </div>
-                </div>
-            </div>
 
-            <!-- capa Tab (static capability detection) -->
-            <div class="tab-content" id="tab-capa">
-                <div class="content-header">
-                    <h2>capa Capability Detection</h2>
-                    <div class="header-actions">
-                        <span class="scanner-status" id="capa-status"></span>
-                    </div>
-                </div>
-                <div class="scanner-body">
-                    <!-- File Input -->
-                    <div class="scanner-drop-zone" id="capa-drop-zone">
-                        <div class="scanner-drop-icon">&#x1F9E9;</div>
-                        <p>Drop a file to analyze or <span class="hex-browse-link" onclick="document.getElementById('capa-file-input').click()">browse</span></p>
-                        <input type="file" id="capa-file-input" hidden>
-                        <div class="hex-path-row">
-                            <span class="hex-path-or">or enter VM path:</span>
-                            <input type="text" id="capa-filepath" class="filter-input hex-path-input" placeholder="C:\path\to\file...">
-                        </div>
-                    </div>
-                    <!-- Options -->
+                    <!-- Run -->
                     <div class="scanner-options">
-                        <span class="option-label" style="opacity:0.7;">Detects capabilities in PE/.NET/ELF/shellcode &mdash; mapped to MITRE ATT&amp;CK &amp; MBC.</span>
-                        <button class="btn btn-primary" id="capa-run-btn" onclick="runCapaScan()">Analyze</button>
+                        <button class="btn btn-primary" id="threatscan-run-btn" onclick="runThreatScan()">Scan</button>
+                        <span class="option-label" style="opacity:0.7;">Runs the selected static analyzers on one file &mdash; no execution. Each tool's result appears below.</span>
                     </div>
-                    <!-- Results -->
-                    <div class="scanner-results" id="capa-results">
-                        <div class="scanner-placeholder">Select a file and click Analyze to detect its capabilities (static, no execution).</div>
+
+                    <!-- Results (one card per selected tool) -->
+                    <div class="scanner-results ts-results" id="threatscan-results">
+                        <div class="scanner-placeholder">Select a file, choose one or more tools, and click Scan.</div>
                     </div>
-                    <!-- Scan History -->
+
+                    <!-- Shared Scan History -->
                     <div class="scanner-history">
                         <div class="scanner-history-header">
                             <h3>Scan History</h3>
-                            <button class="btn btn-sm" onclick="clearCapaHistory()">Clear</button>
+                            <button class="btn btn-sm" onclick="clearScanHistory()">Clear</button>
                         </div>
-                        <div class="scanner-history-list" id="capa-history-list"></div>
+                        <div class="scanner-history-list" id="threatscan-history-list"></div>
                     </div>
                 </div>
             </div>
@@ -937,6 +878,6 @@ C:\Users\vagrant\Desktop\infected\  Malware samples (Defender-excluded)</pre>
         </div>
     </div>
 
-    <script src="/static/js/app.js?v=12"></script>
+    <script src="/static/js/app.js?v=15"></script>
 </body>
 </html>

@@ -5198,6 +5198,141 @@ body.hex-resizing {
     gap: 12px;
     flex-wrap: wrap;
 }
+/* --- ThreatScan unified tool selector --- */
+.ts-tools {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+    padding: 10px 12px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+    margin-bottom: 12px;
+}
+.ts-tool-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-primary);
+    cursor: pointer;
+    user-select: none;
+}
+.ts-tool-toggle input { cursor: pointer; }
+.ts-tool-toggle.unavailable {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+.ts-tool-toggle.unavailable::after {
+    content: 'n/a';
+    font-size: 10px;
+    color: var(--accent-red);
+    margin-left: 2px;
+}
+.ts-tool-actions {
+    margin-left: auto;
+    display: inline-flex;
+    gap: 6px;
+}
+.ts-options {
+    padding: 6px 12px 6px 0;
+}
+.ts-opts-label {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    min-width: 96px;
+}
+/* Block layout (not flex): flex items with overflow:hidden collapse to
+   min-height:0 and get frozen at their initial "running…" height, clipping
+   the result that fills in afterwards. Block flow lets each card grow to fit.
+   flex:0 0 auto: .scanner-body is a scrollable flex column, and this container's
+   explicit min-height:80px overrides the auto minimum, so with the default
+   flex-shrink:1 it would shrink to 80px and its cards would overflow onto the
+   history below. Pin it to content height and let .scanner-body scroll. */
+.ts-results {
+    display: block;
+    flex: 0 0 auto;
+}
+.ts-tool-card {
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+    overflow: hidden;
+    background: var(--bg-secondary);
+    margin-bottom: 14px;
+}
+.ts-tool-card:last-child { margin-bottom: 0; }
+/* The per-tool renderers each emit their own bordered .scan-result box; inside
+   a card that would double-border. Flatten it so the card is the only frame. */
+.ts-tool-card-body .scan-result {
+    border: none;
+    border-radius: 0;
+    overflow: visible;
+}
+/* Card head already shows tool + verdict; drop the inner header's side margins
+   so its colored status bar spans the card body cleanly. */
+.ts-tool-card-body .scan-result-header {
+    padding-left: 0;
+    padding-right: 0;
+}
+/* The renderers indent output blocks by 16px for the standalone container;
+   inside the padded card body, align them to the body edge instead. */
+.ts-tool-card-body .scan-output-header,
+.ts-tool-card-body .scan-actions { padding-left: 0; padding-right: 0; }
+.ts-tool-card-body .scan-output { margin-left: 0; margin-right: 0; }
+.ts-tool-card-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--bg-tertiary, rgba(255,255,255,0.03));
+    border-bottom: 1px solid var(--border-primary);
+    font-size: 12px;
+    font-weight: 600;
+}
+.ts-tool-icon { font-size: 14px; }
+.ts-tool-name { color: var(--text-primary); }
+.ts-tool-state {
+    margin-left: auto;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    color: var(--text-muted);
+}
+.ts-tool-state.ts-state-good { color: var(--accent-green); }
+.ts-tool-state.ts-state-bad  { color: var(--accent-red); }
+.ts-tool-state.ts-state-info { color: var(--accent-cyan); }
+.ts-tool-state.ts-state-error { color: var(--accent-red); }
+.ts-tool-card-body { padding: 12px; }
+.ts-tool-running {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 4px;
+    color: var(--accent-cyan);
+    font-size: 12px;
+}
+.ts-spinner {
+    display: inline-block;
+    width: 18px;
+    height: 18px;
+    border: 2px solid var(--border-primary);
+    border-top-color: var(--accent-cyan);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    flex-shrink: 0;
+}
+.ts-spinner-sm {
+    width: 11px;
+    height: 11px;
+    border-width: 2px;
+    margin-right: 5px;
+    vertical-align: -1px;
+}
+.ts-tool-state.ts-state-running { color: var(--accent-cyan); }
 .scanner-results {
     min-height: 80px;
 }
@@ -6302,6 +6437,32 @@ option.etw-ch-inactive { color: #94a3b8; }
     user-select: none;
 }
 .ember-more-toggle:hover { text-decoration: underline; }
+
+/* Collapsible raw-output (full JSON response) toggle, shared by every scan
+   card (ThreatCheck/DefenderCheck/EMBER/capa) and the history detail rows. */
+.raw-json-toggle {
+    margin: 12px 0 4px;
+    font-size: 11px;
+    color: var(--accent-cyan);
+    cursor: pointer;
+    user-select: none;
+}
+.raw-json-toggle:hover { text-decoration: underline; }
+.raw-json {
+    margin: 6px 0 0;
+    padding: 10px 12px;
+    background: var(--bg-primary, rgba(0,0,0,0.25));
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 6px;
+    font-family: var(--font-mono, monospace);
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--text-secondary, #b8c0cc);
+    white-space: pre;
+    overflow-x: auto;
+    max-height: 420px;
+    overflow-y: auto;
+}
 .ember-more {
     margin-top: 6px;
     padding: 10px;
