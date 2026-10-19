@@ -47,6 +47,7 @@
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
 - [Usage](#usage)
+- [Live Memory Analysis](#live-memory-analysis)
 - [Demo](#demo)
 - [API Reference](#api-reference)
 - [Configuration](#configuration)
@@ -103,6 +104,9 @@ make open       # Opens http://<vm-ip>:9000 in browser
 | **Fibratus** | Go + Kernel ETW | Process/file/registry/network telemetry, behavior rules |
 | **Sysmon** | Sysinternals | Event logging (process creation, network, file, registry, image loads) |
 | **LitterBox** | Python | Static (YARA, strings) + Dynamic (PE-Sieve, Moneta, HollowsHunter, RedEdr) |
+| **Aether** | Zig | Live-process memory forensics: thread start-address validation, heap API tables, disk-vs-memory diff, 380 in-memory signatures |
+| **Process Dump** | C++ | Dumps unpacked modules, hidden modules and header-less code from memory, skipping a clean-hash baseline |
+| **Exit Capture** | Windows (built-in) | Full-memory dump at the moment a sample exits, analyzed offline — covers samples too short-lived for live scanners |
 
 ### Web UI Tabs
 
@@ -112,11 +116,12 @@ make open       # Opens http://<vm-ip>:9000 in browser
 | **Tracing** | Real-time ETW event console, process filtering, timeline visualization |
 | **Graph** | Process relationship graph (Force/Hierarchical/Radial/Circular/Grid layouts) |
 | **Sysmon** | Windows Sysmon event viewer with search, filtering, and Event ID correlation |
-| **Scanner** | ThreatCheck + DefenderCheck integration with scan history |
+| **ThreatScan** | ThreatCheck, DefenderCheck, EMBER2024, capa + Live Process Memory panel (Aether scan, memory dump, baseline, system sweep) |
 | **EMBER** | EMBER2024 (thrember) LightGBM ML classifier — malicious probability score for PE/ELF/PDF/APK |
 | **capa** | Mandiant capa static capability detection — ATT&CK/MBC-mapped capabilities for PE/.NET/ELF/shellcode |
 | **ETW** | Multi-channel Event Log browser with live threat highlighting (see below) |
-| **Hex Editor** | Binary viewer with data inspector, PE/ELF analysis, drag-and-drop |
+| **Hex Editor** | Binary viewer with data inspector, PE/ELF analysis, structure minimap, drag-and-drop |
+| **FileMap** | Byteplot / entropy / PE-ELF structure planes side by side, import/export trees, click-to-offset |
 | **Submit** | Multi-target detonation with stage-by-stage pipeline progress |
 
 ### ETW Browser
@@ -155,6 +160,8 @@ Threat detection rules cover:
 | **IOC Flags (clickable)** | Expandable detail panels showing matched APIs, detection rules, and explanations |
 | **Packer Detection** | UPX, Themida, VMProtect, ASPack, MPRESS via section + heuristic matching |
 | **TLS Callbacks** | Anti-debug indicator detection |
+| **File Map** | Per-byte class plot, local entropy and structure regions (headers, sections, data directories, overlay, entry point) mapped onto file offsets |
+| **Import / Export Trees** | DLL → function trees with suspicious APIs tagged; ELF `DT_NEEDED` + dynamic symbols |
 
 ### Reverse Engineering Tools
 
@@ -222,6 +229,8 @@ Threat detection rules cover:
 | **Rustinel** | — | Sigma/YARA/IOC real-time detection | Rust |
 | **Sysmon** | — | Windows event logging | Sysinternals |
 | **Hunt-Sleeping-Beacons** | — | Sleeping C2 beacon callstack scanner | C++ / MSVC |
+| **Aether** | — | Live-process memory forensics scanner | Zig |
+| **Process Dump** | — | Memory component dumper with clean-hash database | C++ |
 | **theZoo-WebUI** | 8888 | Malware sample browser | PHP |
 | **Detonator** | 5000/8000 | Orchestration UI + REST API | Python |
 
@@ -244,6 +253,9 @@ Threat detection rules cover:
 | .NET 8 / Python 3.12 | Native | Full ARM64 SDK and runtime |
 | DetonatorAgent | Native | Compiled from source via .NET 8 |
 | Detonator / LitterBox | Native | Python-based |
+| Aether | Emulated (x86_64) | Deliberately x64: its thread-context probe uses the AMD64 `CONTEXT` layout, so a native ARM64 build would misread it |
+| Process Dump | Emulated (x86_64) | `-closemon` is **not used**: it writes x64 hook bytes into every process and cannot tell ARM64 processes apart (Exit Capture replaces it) |
+| Exit Capture | Native | OS feature (Silent Process Exit); emulator translation cache is recognized and not scored |
 
 ---
 
@@ -444,6 +456,82 @@ Detections include: unbacked memory in callstacks, non-executable memory pages, 
 
 ---
 
+## Live Memory Analysis
+
+Packers decrypt themselves in memory and injected implants never touch disk, so
+the chamber also looks at processes while they run - and at the moment they exit.
+
+### What runs after a detonation
+
+When the DetonatorAgent returns a PID, these run automatically (Submit tab →
+**Memory** sub-tab, stage cards **Exit Capture** and **Live Memory**):
+
+| Step | Tool | Notes |
+|------|------|-------|
+| Armed before execution | **Exit Capture** | Windows writes a full-memory dump when the sample exits (`C:\dumps\exit`). Armed per image name for 120 s, then the registry keys are removed again |
+| Live, read-only | Hunt-Sleeping-Beacons, BeaconEye, **Aether** | Aether samples the process 3× (3 s apart) |
+| Live, writes files | **Process Dump** | Runs last; skips modules in the clean-hash database (`C:\dumps\<time>_pid<PID>`) |
+| From the log | **Network beaconing** | Sysmon EID 3 connections scored for check-in periodicity - still available after the process exited |
+
+### How findings become a verdict
+
+All sources go through one tool-independent model (`webui/memory_evidence.py`);
+no scanner's own severity label is trusted directly.
+
+| Factor | Effect |
+|--------|--------|
+| **Evidence class** | structural fact (thread starts in private RX memory, PE in private memory) > behavioural (pointer tables, beaconing) > extracted artifact > byte pattern. String rules are weighted by their own `risk_score` |
+| **Persistence** | finding in every sample ×1.0, in ≥ half ×0.55, once ×0.25 |
+| **Corroboration** | kinds that also occur in legitimate software (hidden module, private RWX, heap API table, low-risk strings) count 40 % until an independent source agrees on the same process |
+| **Host baseline** | findings this box produces on its own are suppressed (shown collapsed, never silently dropped) |
+| **Saturation** | one kind repeated N times in one process counts at most 2× its strongest instance |
+| **Observation** | a scan that read no memory reports **NOT OBSERVED**, not CLEAN |
+
+Thresholds: score ≥ 2.0 SUSPICIOUS, ≥ 6.0 MALICIOUS. Every finding lists the
+factors behind its score.
+
+Measured on the ARM64 UTM VM with three harmless test programs:
+
+| Sample | Behaviour | Verdict |
+|--------|-----------|---------|
+| exits after 6 s | nothing | CLEAN 0.75 |
+| exits after 6 s | private RWX thread, PE copy in private memory, implant string in heap | MALICIOUS 6.54 (from the exit dump; the live scan came too late) |
+| connects every 2 s | 8 outbound connections | SUSPICIOUS 2.9 |
+
+A system-wide sweep of the clean VM (139 processes) scores 0 after a baseline
+sweep; security tools that keep detection rules in memory (Fibratus, Rustinel,
+the web UI itself) are listed as excluded instead of scored.
+
+### Before the first detonation (clean box)
+
+```
+ThreatScan → Live Process Memory → "Sweep as baseline"     # memory baseline, ~4 min
+ThreatScan → Live Process Memory → "Full dump baseline"    # Process Dump -db gen, ~20+ min
+```
+
+Provisioning only runs `pd64.exe -db genquick` (running processes). Anything
+captured into either baseline stops counting as evidence later - never run
+them after a sample has executed.
+
+### ARM64 hosts
+
+x64 samples run under emulation, and the emulator's ARM64 translation cache is
+private executable memory. Exit Capture and Process Dump code chunks are
+classified by content (ARM64 instruction density, single-RET stub pages) and
+listed as host artifacts rather than injected code.
+
+`pd64.exe -closemon` is intentionally not used: it overwrites `NtTerminateProcess`
+with x64 instructions in every process and decides the architecture from
+"PE32+" alone, which is also true for native ARM64 processes.
+
+### Limitations
+
+- Exit Capture is armed by image name; child processes with other names are
+  only covered by the live scanners and the network log.
+- Live-memory findings depend on timing. Use several samples for anything you
+  want to compare.
+- The memory baseline is per host. Rebuild it after installing software.
+
 ## Demo
 
 ### Service Dashboard
@@ -633,7 +721,21 @@ All endpoints served on port `9000`. Responses are JSON.
 | POST | `/api/scan/defendercheck` | DefenderCheck scan. Params: `file`/`path` |
 | POST | `/api/scan/ember` | EMBER2024 ML score. Params: `file`/`path`, `model`, `threshold` |
 | POST | `/api/scan/capa` | capa capability detection (ATT&CK/MBC). Params: `file`/`path` |
-| GET | `/api/scan/status` | Scanner tool availability (ThreatCheck / DefenderCheck / EMBER2024 / capa) |
+| GET | `/api/scan/status` | Tool availability (ThreatCheck, DefenderCheck, EMBER2024, capa, Aether, Process Dump, Exit Capture) |
+
+### Live Memory
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/scan/aether` | Aether scan of a PID, scored. Params: `pid`, `samples` (1-10), `interval` (s) |
+| POST | `/api/scan/processdump` | Dump a PID's memory components. Params: `pid` or `system`, `ignore_clean_db` |
+| POST | `/api/memory/evidence` | Re-score all cached memory results for a PID across sources. Params: `pid` |
+| GET / DELETE | `/api/memory/baseline` | Host memory baseline statistics / clear it |
+| POST | `/api/memory/baseline/capture` | Record findings of named processes as baseline. Params: `names`, `samples` |
+| POST / GET | `/api/memory/sweep` | Background sweep of every process (`aether`, `processdump`, `baseline`) / status + result |
+| GET / POST | `/api/processdump/baseline` | Process Dump clean-hash database status / build it (`mode`: `gen`, `genquick`) |
+| GET | `/api/process/lookup` | Running PIDs by image name. Params: `name` |
+| GET | `/api/file/visualize` | File map planes + structure + import/export trees. Params: `path`, `cols`, `rows` |
 
 ### Proxy Endpoints
 
@@ -729,6 +831,8 @@ transportable-detonation-chamber/
 │
 ├── webui/                          # Unified Web UI
 │   ├── app.py                     # Flask backend (APIs, proxying, PE/ELF analysis)
+│   ├── memory_evidence.py         # Tool-independent scoring of memory findings
+│   ├── minidump_analysis.py       # Offline analysis of exit-time minidumps
 │   ├── dev_server.py              # Dev server with live-reload
 │   ├── requirements.txt           # Python deps (flask, requests, watchdog, pefile)
 │   ├── templates/
@@ -755,6 +859,9 @@ transportable-detonation-chamber/
 │   ├── install-litterbox.ps1      # LitterBox sandbox
 │   ├── install-thezoo.ps1        # theZoo malware repository + WebUI
 │   ├── install-hunt-sleeping-beacons.ps1 # Hunt-Sleeping-Beacons (VS Build Tools + compile)
+│   ├── install-aether.ps1        # Aether (prebuilt/ or Zig 0.16 build in the VM)
+│   ├── install-process-dump.ps1  # Process Dump + clean-hash baseline (genquick)
+│   ├── build-aether.sh           # Cross-compile Aether on the host into prebuilt/
 │   ├── install-re-tools.ps1      # Detect It Easy, WinDbg, Ghidra
 │   ├── install-webui.ps1          # Web UI deployment
 │   └── configure-services.ps1    # Service registration (runs on every boot)
@@ -775,6 +882,10 @@ C:\tools\DefenderCheck\             Defender evasion tester
 C:\tools\EMBER2024\                 EMBER2024 ML classifier (thrember venv + models)
 C:\tools\capa\                      Mandiant capa (static capability detection)
 C:\tools\Hunt-Sleeping-Beacons\     Sleeping beacon scanner
+C:\tools\Aether\                    Memory forensics scanner + rules\
+C:\tools\ProcessDump\               pd64.exe + clean-hash database
+C:\tools\zig\                       Zig 0.16 (only when Aether was built in the VM)
+C:\dumps\                            Process Dump output; exit\ holds exit-time dumps
 C:\tools\theZoo-WebUI\              theZoo malware sample browser (:8888)
 C:\tools\detection-rules\           Sigma + YARA + IOC rules
 C:\ProgramData\chocolatey\lib\die\  Detect It Easy (DiE 3.21)
@@ -911,6 +1022,8 @@ make install    # or: .\make.ps1 install
 | [FutureComputing4AI/EMBER2024](https://github.com/FutureComputing4AI/EMBER2024) | ML malware classifier (thrember / LightGBM) |
 | [mandiant/capa](https://github.com/mandiant/capa) | Static capability detection (ATT&CK / MBC) |
 | [thefLink/Hunt-Sleeping-Beacons](https://github.com/thefLink/Hunt-Sleeping-Beacons) | Sleeping beacon callstack scanner |
+| [0xsp-SRD/aether](https://github.com/0xsp-SRD/aether) | Live-process memory forensics (GPL-3.0; invoked as a separate binary) |
+| [glmcdona/Process-Dump](https://github.com/glmcdona/Process-Dump) | Memory component dumper (MIT) |
 | [ytisf/theZoo](https://github.com/ytisf/theZoo) | Malware sample repository |
 | [kawaiipantsu/theZoo-WebUI](https://github.com/kawaiipantsu/theZoo-WebUI) | theZoo web frontend |
 | [horsicq/DIE-engine](https://github.com/horsicq/DIE-engine) | Detect It Easy |
