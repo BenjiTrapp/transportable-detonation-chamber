@@ -36,6 +36,8 @@ PORT = 8766
 # repo-relative source -> remote runtime path used by the DetonationChamberUI task
 FILES = {
     "webui/app.py": r"C:\DetonationChamberUI\app.py",
+    "webui/memory_evidence.py": r"C:\DetonationChamberUI\memory_evidence.py",
+    "webui/minidump_analysis.py": r"C:\DetonationChamberUI\minidump_analysis.py",
     "webui/static/js/app.js": r"C:\DetonationChamberUI\static\js\app.js",
     "webui/static/css/style.css": r"C:\DetonationChamberUI\static\css\style.css",
     "webui/templates/index.html": r"C:\DetonationChamberUI\templates\index.html",
@@ -112,6 +114,59 @@ def do_deploy(sess, args):
         httpd.shutdown()
 
 
+def do_install(sess, args):
+    """Push prebuilt artifacts, then run an installer script inside the VM.
+
+    The VM pulls both from the host HTTP server, so this works the same way
+    `do_deploy` does and stays clear of the WinRM command-length limit.
+    """
+    script = args.install
+    local_script = os.path.join(REPO, "scripts", script)
+    if not os.path.isfile(local_script):
+        print(f"[!] No such script: scripts/{script}")
+        return
+
+    httpd = serve()
+    try:
+        # Host-built binaries first: install-aether.ps1 prefers them over
+        # building inside the VM.
+        prebuilt_dir = os.path.join(REPO, "prebuilt")
+        if os.path.isdir(prebuilt_dir):
+            print("[*] Pushing prebuilt/ ...")
+            run_ps(sess, 'New-Item -ItemType Directory -Force -Path '
+                         'C:\\vagrant\\prebuilt,C:\\vagrant\\prebuilt\\rules | Out-Null')
+            for root, _dirs, files in os.walk(prebuilt_dir):
+                for name in files:
+                    full = os.path.join(root, name)
+                    rel = os.path.relpath(full, REPO).replace(os.sep, "/")
+                    remote = "C:\\vagrant\\" + os.path.relpath(full, REPO).replace("/", "\\")
+                    ps = (
+                        '$ErrorActionPreference="Stop";'
+                        f'Invoke-WebRequest -Uri "http://{HOST_IP}:{PORT}/{rel}" '
+                        f'-OutFile "{remote}" -UseBasicParsing;'
+                        f'(Get-Item "{remote}").Length'
+                    )
+                    out = run_ps(sess, ps, label=rel)
+                    print(f"  [+] {rel} ({out} bytes)")
+
+        print(f"[*] Running scripts/{script} in the VM ...")
+        remote_script = f"C:\\Windows\\Temp\\{script}"
+        run_ps(sess, (
+            '$ErrorActionPreference="Stop";'
+            f'Invoke-WebRequest -Uri "http://{HOST_IP}:{PORT}/scripts/{script}" '
+            f'-OutFile "{remote_script}" -UseBasicParsing'
+        ), label=script)
+
+        # Installer scripts are chatty and can run for minutes; stream whatever
+        # they printed once they finish.
+        out = run_ps(sess, f'& powershell -ExecutionPolicy Bypass -File "{remote_script}"',
+                     label=script)
+        for line in out.splitlines():
+            print(f"    {line}")
+    finally:
+        httpd.shutdown()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--vm-ip", default="192.168.64.4")
@@ -119,12 +174,20 @@ def main():
     ap.add_argument("--vm-pass", default="vagrant")
     ap.add_argument("--restart", action="store_true",
                     help="deploy, then restart the Web UI")
+    ap.add_argument("--install", metavar="SCRIPT",
+                    help="run scripts/SCRIPT in the VM (e.g. install-aether.ps1), "
+                         "pushing prebuilt/ first")
     ap.add_argument("--action", choices=["deploy", "restart", "logs", "services"],
                     default="deploy",
                     help="restart/logs/services skip the file deploy")
     args = ap.parse_args()
 
     sess = make_session(args)
+
+    if args.install:
+        do_install(sess, args)
+        print("[+] Done.")
+        return
 
     if args.action == "restart":
         print("[*] Restarting DetonationChamberUI ...")

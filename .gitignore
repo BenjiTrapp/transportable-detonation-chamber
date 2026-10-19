@@ -22,3 +22,9 @@ Thumbs.db
 # Local build/tooling artifacts
 .build-box/
 .serena/
+.openchamber/
+# Host-built binaries staged for the VM (scripts/build-aether.sh)
+prebuilt/
+# Runtime state written by the Web UI
+webui/scan_history.json
+webui/memory_baseline.json

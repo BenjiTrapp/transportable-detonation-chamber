@@ -57,6 +57,12 @@ Vagrant.configure("2") do |config|
   config.vm.provision "file", source: "webui", destination: "C:\\vagrant\\webui"
   config.vm.provision "file", source: "rules", destination: "C:\\vagrant\\rules"
 
+  # Host-built binaries (scripts/build-aether.sh). Optional: the installers
+  # fall back to building or downloading inside the VM when absent.
+  if Dir.exist?("prebuilt")
+    config.vm.provision "file", source: "prebuilt", destination: "C:\\vagrant\\prebuilt"
+  end
+
   # Provisioning: run scripts in order
   config.vm.provision "prerequisites",
     type: "shell",
@@ -111,6 +117,18 @@ Vagrant.configure("2") do |config|
   config.vm.provision "beaconeye",
     type: "shell",
     path: "scripts/install-beaconeye.ps1",
+    privileged: true
+
+  config.vm.provision "aether",
+    type: "shell",
+    path: "scripts/install-aether.ps1",
+    privileged: true
+
+  # Must run while the box is still clean: it hashes the known-good modules
+  # that later dumps are allowed to skip.
+  config.vm.provision "process-dump",
+    type: "shell",
+    path: "scripts/install-process-dump.ps1",
     privileged: true
 
   config.vm.provision "scanner-tools",
