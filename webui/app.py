@@ -22,6 +22,12 @@ from flask import Flask, render_template, jsonify, request, send_from_directory
 from werkzeug.utils import secure_filename
 import requests
 
+# Tool-agnostic scoring layer for live-memory findings. Scanners are plugged in
+# as normalizers there, so the verdict logic does not depend on any one tool.
+import memory_evidence
+# Offline analysis of exit-time minidumps (no scanner binary involved).
+import minidump_analysis
+
 app = Flask(__name__)
 
 # --- Configuration ---
@@ -36,6 +42,11 @@ VM_WEBUI_URL = os.environ.get("TDC_VM_WEBUI", "")
 SUBMISSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "submissions.json")
 SCAN_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan_history.json")
 SCAN_HISTORY_MAX = 200
+
+# Keys of memory findings this host produces on its own. Captured while the box
+# is considered clean, then subtracted from later scans - the memory-side
+# counterpart to Process Dump's clean-hash database.
+MEMORY_BASELINE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory_baseline.json")
 
 
 def _detect_vm_ip():
@@ -124,6 +135,39 @@ def _normalize_scan(tool, result):
     elif tool and tool.lower() == "capa":  # capa reports capabilities, not a verdict
         cc = result.get("capability_count")
         verdict = "analyzed" if cc is not None else "unknown"
+    elif tool and tool.lower() == "aether":  # live-memory findings, not a file verdict
+        # The evidence layer is authoritative: it already accounts for the host
+        # baseline, persistence and corroboration.
+        ev = result.get("evidence") or {}
+        label = (ev.get("label") or "").upper()
+        if label == "MALICIOUS":
+            verdict, detected, clean = "detected", True, False
+        elif label == "SUSPICIOUS":
+            verdict, detected, clean = "suspicious", True, False
+        elif label == "CLEAN":
+            verdict, detected, clean = "clean", False, True
+        if ev.get("score") is not None:
+            score = ev["score"]
+    elif tool and tool.lower() == "exit capture":  # post-mortem dump analysis
+        ev = result.get("evidence") or {}
+        label = (ev.get("label") or "").upper()
+        if label == "MALICIOUS":
+            verdict, detected, clean = "detected", True, False
+        elif label == "SUSPICIOUS":
+            verdict, detected, clean = "suspicious", True, False
+        elif label == "CLEAN":
+            verdict, detected, clean = "clean", False, True
+        if ev.get("score") is not None:
+            score = ev["score"]
+    elif tool and tool.lower() == "process dump":  # extraction, not a verdict
+        # Hidden modules and header-less code chunks are the interesting cases;
+        # a plain module dump just means something new was on the box.
+        if result.get("hidden_modules") or result.get("code_chunks"):
+            verdict, detected, clean = "detected", True, False
+        elif result.get("dump_count"):
+            verdict = "dumped"
+        elif result.get("dump_count") == 0:
+            verdict, clean = "clean", True
     return verdict, detected, clean, score
 
 
@@ -2517,7 +2561,17 @@ def api_submit():
 
     # Submit to DetonatorAgent
     agent_pid = None
+    exit_capture_armed_at = None
     if target in ("agent", "both"):
+        # Arm dump-on-exit before the sample starts: a sample that exits within
+        # a second is exactly the case the live scanners cannot reach.
+        ok, err = _exit_capture_arm(filename)
+        if ok:
+            exit_capture_armed_at = time.time()
+            results["exit_capture"] = {"armed": True, "image": os.path.basename(filename),
+                                       "window": EXIT_CAPTURE_WINDOW}
+        else:
+            results["exit_capture"] = {"armed": False, "reason": err}
         try:
             r = requests.post(
                 f"{DETONATOR_AGENT_API}/api/execute/exec",
@@ -2596,10 +2650,25 @@ def api_submit():
         except Exception as e:
             results["litterbox"] = {"status": 502, "error": str(e)}
 
-    # --- Beacon Scanning (async, after agent execution) ---
-    beacon_tools_available = os.path.isfile(HUNT_SLEEPING_BEACONS_EXE) or os.path.isfile(BEACONEYE_EXE)
-    if agent_pid and beacon_tools_available:
-        _run_beacon_scans_async(agent_pid, file_sha256)
+    # --- Memory scanning (async, after agent execution) ---
+    # Exit capture first: it only waits for the dump, so it never delays the
+    # live scanners, and it needs the PID to pick the right dump folder.
+    if exit_capture_armed_at is not None:
+        if agent_pid:
+            _exit_capture_watch(filename, agent_pid, file_sha256, exit_capture_armed_at)
+        else:
+            # Nothing ran, so nothing will exit; do not leave the key behind.
+            _exit_capture_disarm(filename)
+            results["exit_capture"] = {"armed": False, "reason": "agent returned no PID"}
+
+    # Named beacon_scan for backwards compatibility with existing clients,
+    # but it now covers every live-memory tool, not just the beacon hunters.
+    memory_tools_available = (os.path.isfile(HUNT_SLEEPING_BEACONS_EXE)
+                              or os.path.isfile(BEACONEYE_EXE)
+                              or os.path.isfile(AETHER_EXE)
+                              or os.path.isfile(PROCESSDUMP_EXE))
+    if agent_pid and memory_tools_available:
+        _run_memory_scans_async(agent_pid, file_sha256)
         results["beacon_scan"] = {
             "triggered": True,
             "tools": [],
@@ -2608,10 +2677,14 @@ def api_submit():
             results["beacon_scan"]["tools"].append("Hunt-Sleeping-Beacons")
         if os.path.isfile(BEACONEYE_EXE):
             results["beacon_scan"]["tools"].append("BeaconEye")
+        if os.path.isfile(AETHER_EXE):
+            results["beacon_scan"]["tools"].append("Aether")
+        if os.path.isfile(PROCESSDUMP_EXE):
+            results["beacon_scan"]["tools"].append("Process Dump")
     else:
         results["beacon_scan"] = {
             "triggered": False,
-            "reason": "No PID available" if not agent_pid else "Beacon tools not installed",
+            "reason": "No PID available" if not agent_pid else "Memory tools not installed",
         }
 
     # Include file metadata in response
@@ -2709,27 +2782,50 @@ def api_detonation_results():
         except Exception:
             pass
 
-    # --- Beacon Scan Results (from async cache) ---
+    # --- Memory scan results (from async cache) ---
     with _beacon_cache_lock:
         hsb_result = None
         beaconeye_result = None
+        aether_result = None
+        processdump_result = None
         if pid:
             hsb_result = _beacon_results_cache.get(f"hsb_{pid}")
             beaconeye_result = _beacon_results_cache.get(f"beaconeye_{pid}")
+            aether_result = _beacon_results_cache.get(f"aether_{pid}")
+            processdump_result = _beacon_results_cache.get(f"processdump_{pid}")
         if not hsb_result and sha256:
             hsb_result = _beacon_results_cache.get(f"hsb_{sha256}")
         if not beaconeye_result and sha256:
             beaconeye_result = _beacon_results_cache.get(f"beaconeye_{sha256}")
+        if not aether_result and sha256:
+            aether_result = _beacon_results_cache.get(f"aether_{sha256}")
+        if not processdump_result and sha256:
+            processdump_result = _beacon_results_cache.get(f"processdump_{sha256}")
+        exitcapture_result = _beacon_results_cache.get(f"exitcapture_{pid}") if pid else None
+        if not exitcapture_result and sha256:
+            exitcapture_result = _beacon_results_cache.get(f"exitcapture_{sha256}")
 
     if hsb_result:
         results["hunt_sleeping_beacons"] = hsb_result
     if beaconeye_result:
         results["beaconeye"] = beaconeye_result
+    if aether_result:
+        results["aether"] = aether_result
+    if processdump_result:
+        results["process_dump"] = processdump_result
+    if exitcapture_result:
+        results["exit_capture_result"] = exitcapture_result
 
-    # Beacon tools status
+    # --- Network beaconing from Sysmon EID 3 (survives process exit) ---
+    if pid:
+        results["network_beaconing"] = _network_beaconing_for_pid(pid)
+
+    # Memory tool status
     results["beacon_tools"] = {
         "hsb_installed": os.path.isfile(HUNT_SLEEPING_BEACONS_EXE),
         "beaconeye_installed": os.path.isfile(BEACONEYE_EXE),
+        "aether_installed": os.path.isfile(AETHER_EXE),
+        "process_dump_installed": os.path.isfile(PROCESSDUMP_EXE),
     }
 
     # --- Fibratus / Rustinel Alerts matching this detonation ---
@@ -2858,6 +2954,52 @@ def api_detonation_results():
     return jsonify(results)
 
 
+def _network_beaconing_for_pid(pid):
+    """Score a process's outbound connections for check-in periodicity.
+
+    Reads Sysmon NetworkConnect events, which are logged as they happen and
+    therefore remain available after the process has exited.
+    """
+    import datetime as _dt
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return {"error": "invalid pid"}
+    if not _is_sysmon_running():
+        return {"available": False, "reason": "Sysmon not running"}
+    try:
+        events = _read_sysmon_events(max_events=500, pid=pid, event_id=3, event_ids=[3])
+    except Exception as e:
+        return {"available": False, "reason": str(e)}
+
+    conns, image = [], ""
+    for e in events or []:
+        if not isinstance(e, dict) or e.get("error"):
+            continue
+        image = image or os.path.basename(e.get("image") or "")
+        ts = e.get("timestamp") or ""
+        try:
+            # Sysmon reports 7 fractional digits; fromisoformat wants at most 6.
+            if "." in ts:
+                head, rest = ts.split(".", 1)
+                frac = "".join(c for c in rest if c.isdigit())[:6]
+                tz = rest[len("".join(c for c in rest if c.isdigit())):]
+                ts = f"{head}.{frac}{tz}"
+            t = _dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        conns.append((t, e.get("dst_ip"), e.get("dst_port")))
+
+    findings = memory_evidence.beaconing_from_connections(conns, process=image)
+    endpoints = sorted({f"{ip}:{port}" for _, ip, port in conns})
+    return {
+        "available": True,
+        "connections": len(conns),
+        "endpoints": endpoints[:50],
+        "evidence_findings": findings,
+    }
+
+
 def _compute_verdict(results, matching_alerts):
     """Aggregate a single verdict from EDR alerts, LitterBox findings, and beacon scans.
     Mirrors the Detonator reference UI's edr_verdict concept."""
@@ -2884,19 +3026,9 @@ def _compute_verdict(results, matching_alerts):
         reasons.append(f"{other_alerts} low/other EDR alert(s)")
 
     # LitterBox dynamic indicators
-    dyn = results.get("litterbox_dynamic") or {}
-    if isinstance(dyn, dict):
-        ps = dyn.get("pe_sieve") or dyn.get("pe_sieve_results") or {}
-        if isinstance(ps, dict) and (ps.get("suspicious") or ps.get("total_suspicious") or ps.get("replaced")):
-            score += 3
-            reasons.append("PE-Sieve flagged injected/replaced code")
-        mon = dyn.get("moneta") or dyn.get("moneta_results") or {}
-        if isinstance(mon, dict):
-            iocs = mon.get("ioc_count") or mon.get("iocs") or 0
-            iocs = iocs if isinstance(iocs, int) else (len(iocs) if isinstance(iocs, list) else 0)
-            if iocs:
-                score += 2
-                reasons.append(f"Moneta reported {iocs} IOC(s)")
+    # PE-Sieve and Moneta are not scored here: they feed the memory evidence
+    # model below, so a finding both of them report counts as one corroborated
+    # fact rather than twice.
 
     # LitterBox static score (0-10 scale from LitterBox info)
     info = results.get("litterbox_info") or {}
@@ -2908,15 +3040,64 @@ def _compute_verdict(results, matching_alerts):
             score += 1
             reasons.append(f"LitterBox score {info['score']}/10")
 
-    # Beacon scans
-    hsb = results.get("hunt_sleeping_beacons") or {}
-    if isinstance(hsb, dict) and hsb.get("suspicious_count"):
-        score += 3
-        reasons.append(f"{hsb['suspicious_count']} sleeping-beacon indicator(s)")
-    be = results.get("beaconeye") or {}
-    if isinstance(be, dict) and be.get("beacons_found"):
-        score += 3
-        reasons.append(f"{be['beacons_found']} CobaltStrike beacon(s)")
+    # --- Live-memory evidence (all scanners, one model) ---
+    # Every memory scanner's output goes through memory_evidence, which weighs
+    # findings by evidence class, persistence across samples, cross-tool
+    # corroboration and novelty against this host's baseline. That replaces the
+    # old per-tool point rules, which trusted each tool's own severity and so
+    # graded a clean explorer.exe as malicious.
+    process_name = ""
+    agent = results.get("agent") or {}
+    if isinstance(agent, dict):
+        process_name = (agent.get("execution") or {}).get("process_name") or ""
+    if not process_name:
+        process_name = (results.get("file_info") or {}).get("name") or ""
+
+    mem_findings = memory_evidence.collect(results, process=process_name)
+    mem_sources = [k for k in ("aether", "process_dump", "hunt_sleeping_beacons",
+                               "beaconeye", "exit_capture_result") if results.get(k)]
+    if (results.get("network_beaconing") or {}).get("evidence_findings"):
+        mem_sources.append("network_beaconing")
+    if mem_sources:
+        evidence = memory_evidence.score(mem_findings, baseline=_memory_baseline)
+
+        # Distinguish "scanned and found nothing" from "could not observe".
+        # A process that exited before the live scan produces no findings,
+        # which must not be read as a clean result - unless the exit dump
+        # captured it, in which case it was observed after all.
+        aether_res = results.get("aether") or {}
+        exit_res = results.get("exit_capture_result") or {}
+        exit_observed = isinstance(exit_res, dict) and exit_res.get("observed")
+        if (isinstance(aether_res, dict) and aether_res.get("observed") is False
+                and not exit_observed):
+            evidence["label"] = "NOT OBSERVED"
+            evidence["note"] = aether_res.get("observation_note")
+            reasons.append(
+                "Live-memory scan observed nothing - the process exited before "
+                "it ran (not evidence of being clean)"
+            )
+        elif exit_observed and aether_res.get("observed") is False:
+            evidence["note"] = ("Process exited before the live scan; it was "
+                                "analyzed from its exit-time memory dump instead.")
+        evidence["sources_present"] = mem_sources
+
+        # Emitted even when empty, so the UI can tell "tools ran, nothing
+        # scored" apart from "tools never ran".
+        results["memory_evidence"] = evidence
+
+        # The evidence score is already calibrated (2.0 suspicious / 6.0
+        # malicious); fold it in at the same scale as the other signals.
+        if evidence["score"] >= memory_evidence.VERDICT_MALICIOUS:
+            score += 4
+        elif evidence["score"] >= memory_evidence.VERDICT_SUSPICIOUS:
+            score += 2
+        elif evidence["score"] > 0:
+            score += 1
+        reasons.extend(evidence["reasons"][:4])
+        if evidence["suppressed_count"]:
+            reasons.append(
+                f"{evidence['suppressed_count']} finding(s) suppressed by the host baseline"
+            )
 
     if score >= 3:
         label = "MALICIOUS"
@@ -2977,6 +3158,8 @@ def api_file_download():
         r"C:\Users",
         r"C:\Windows\Temp",
         r"C:\Temp",
+        # Memory dumps and the artifacts extracted from them
+        PROCESSDUMP_DIR,
     ]
     norm_path = os.path.normpath(filepath)
     if not any(norm_path.startswith(prefix) for prefix in allowed_prefixes):
@@ -3171,9 +3354,217 @@ def _parse_capa_attack(entries):
 HUNT_SLEEPING_BEACONS_EXE = r"C:\tools\Hunt-Sleeping-Beacons\Hunt-Sleeping-Beacons.exe"
 BEACONEYE_EXE = r"C:\tools\BeaconEye\BeaconEye.exe"
 
+# --- Live-memory forensics / dumping ---
+AETHER_EXE = r"C:\tools\Aether\Aether.exe"
+AETHER_RULES_DIR = r"C:\tools\Aether\rules"
+PROCESSDUMP_EXE = r"C:\tools\ProcessDump\pd64.exe"
+PROCESSDUMP_DIR = r"C:\dumps"
+
 # Cache for beacon scan results (keyed by PID or sha256)
 _beacon_results_cache = {}
 _beacon_cache_lock = threading.Lock()
+
+# Per-host baseline of benign memory findings, shared by every scanner.
+_memory_baseline = memory_evidence.MemoryBaseline(MEMORY_BASELINE_FILE)
+
+
+# --- Exit capture (dump-on-exit via Windows Silent Process Exit) -----------
+#
+# Short-lived samples exit before any live scanner reaches them. Windows can
+# write a full-memory dump at the moment a process exits; it is switched on per
+# image name through two registry keys. Unlike Process Dump's -closemon this
+# injects nothing into other processes - which matters here, because -closemon
+# writes x64 hook bytes into every process, including native ARM64 ones it
+# cannot tell apart from x64 (its architecture check only looks at PE32+).
+
+EXIT_CAPTURE_DIR = r"C:\dumps\exit"
+EXIT_CAPTURE_WINDOW = 120      # seconds a submission stays armed
+EXIT_CAPTURE_KEEP = 20         # capture folders retained before pruning
+# FullMemory | FullMemoryInfo (region types/protection) | ThreadInfo (start addresses)
+EXIT_CAPTURE_DUMP_TYPE = 0x2 | 0x800 | 0x1000
+FLG_MONITOR_SILENT_PROCESS_EXIT = 0x200
+
+_IFEO_KEY = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+_SPE_KEY = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\SilentProcessExit"
+
+_exit_capture_lock = threading.Lock()
+_exit_capture_armed = {}       # image name -> {"armed_at", "prior_globalflag", "spe_existed"}
+
+
+def _exit_capture_supported():
+    try:
+        import winreg  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _exit_capture_arm(image_name):
+    """Switch dump-on-exit on for one image name. Returns (ok, error)."""
+    if not _exit_capture_supported():
+        return False, "exit capture requires Windows"
+    import winreg
+    image_name = os.path.basename(image_name or "")
+    if not image_name.lower().endswith((".exe", ".com", ".scr")):
+        return False, "only executables can be monitored by image name"
+    try:
+        os.makedirs(EXIT_CAPTURE_DIR, exist_ok=True)
+    except OSError as e:
+        return False, f"cannot create {EXIT_CAPTURE_DIR}: {e}"
+
+    with _exit_capture_lock:
+        state = _exit_capture_armed.get(image_name.lower())
+        try:
+            ifeo = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE,
+                                      f"{_IFEO_KEY}\\{image_name}", 0,
+                                      winreg.KEY_READ | winreg.KEY_WRITE)
+            # Keep whatever GlobalFlag someone else set, and restore it later.
+            try:
+                prior, _ = winreg.QueryValueEx(ifeo, "GlobalFlag")
+            except OSError:
+                prior = None
+            if state is None:
+                state = {"prior_globalflag": prior}
+            winreg.SetValueEx(ifeo, "GlobalFlag", 0, winreg.REG_DWORD,
+                              (prior or 0) | FLG_MONITOR_SILENT_PROCESS_EXIT)
+            winreg.CloseKey(ifeo)
+
+            spe = winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE,
+                                     f"{_SPE_KEY}\\{image_name}", 0, winreg.KEY_WRITE)
+            winreg.SetValueEx(spe, "ReportingMode", 0, winreg.REG_DWORD, 2)  # local dump
+            winreg.SetValueEx(spe, "LocalDumpFolder", 0, winreg.REG_EXPAND_SZ, EXIT_CAPTURE_DIR)
+            winreg.SetValueEx(spe, "DumpType", 0, winreg.REG_DWORD, EXIT_CAPTURE_DUMP_TYPE)
+            winreg.SetValueEx(spe, "IgnoreSelfExits", 0, winreg.REG_DWORD, 0)
+            winreg.CloseKey(spe)
+        except OSError as e:
+            return False, f"registry write failed: {e}"
+        state["armed_at"] = time.time()
+        _exit_capture_armed[image_name.lower()] = state
+    return True, None
+
+
+def _exit_capture_disarm(image_name):
+    """Undo _exit_capture_arm, restoring any GlobalFlag that was there before."""
+    if not _exit_capture_supported():
+        return
+    import winreg
+    image_name = os.path.basename(image_name or "")
+    with _exit_capture_lock:
+        state = _exit_capture_armed.pop(image_name.lower(), None) or {}
+        prior = state.get("prior_globalflag")
+        try:
+            ifeo = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, f"{_IFEO_KEY}\\{image_name}",
+                                  0, winreg.KEY_READ | winreg.KEY_WRITE)
+            if prior:
+                winreg.SetValueEx(ifeo, "GlobalFlag", 0, winreg.REG_DWORD, prior)
+                winreg.CloseKey(ifeo)
+            else:
+                try:
+                    winreg.DeleteValue(ifeo, "GlobalFlag")
+                except OSError:
+                    pass
+                # Remove the key only when we leave it empty.
+                empty = winreg.QueryInfoKey(ifeo)[:2] == (0, 0)
+                winreg.CloseKey(ifeo)
+                if empty:
+                    winreg.DeleteKey(winreg.HKEY_LOCAL_MACHINE, f"{_IFEO_KEY}\\{image_name}")
+        except OSError:
+            pass
+        try:
+            winreg.DeleteKey(winreg.HKEY_LOCAL_MACHINE, f"{_SPE_KEY}\\{image_name}")
+        except OSError:
+            pass
+
+
+def _exit_capture_find_dump(image_name, pid=None, since=0.0):
+    """Newest exit dump for an image (optionally one PID) written after `since`."""
+    if not os.path.isdir(EXIT_CAPTURE_DIR):
+        return None
+    prefix = os.path.basename(image_name).lower() + "-(pid-"
+    best = None
+    for folder in os.listdir(EXIT_CAPTURE_DIR):
+        if not folder.lower().startswith(prefix):
+            continue
+        if pid and f"-(pid-{int(pid)})" not in folder.lower():
+            continue
+        full = os.path.join(EXIT_CAPTURE_DIR, folder)
+        for name in os.listdir(full) if os.path.isdir(full) else []:
+            if not name.lower().endswith(".dmp"):
+                continue
+            path = os.path.join(full, name)
+            mtime = os.path.getmtime(path)
+            if mtime >= since and (best is None or mtime > best[0]):
+                best = (mtime, path)
+    return best[1] if best else None
+
+
+def _exit_capture_prune():
+    """Keep the newest EXIT_CAPTURE_KEEP capture folders; full dumps are large."""
+    if not os.path.isdir(EXIT_CAPTURE_DIR):
+        return
+    import shutil
+    folders = [os.path.join(EXIT_CAPTURE_DIR, f) for f in os.listdir(EXIT_CAPTURE_DIR)]
+    folders = sorted((f for f in folders if os.path.isdir(f)),
+                     key=os.path.getmtime, reverse=True)
+    for old in folders[EXIT_CAPTURE_KEEP:]:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def _exit_capture_analyze(dump_path, process_name):
+    """Analyze one exit dump and cache-friendly shape the result."""
+    extract_dir = os.path.join(os.path.dirname(dump_path), "artifacts")
+    rules_dir = AETHER_RULES_DIR if os.path.isdir(AETHER_RULES_DIR) else None
+    result = minidump_analysis.analyze(
+        dump_path, process=process_name, rules_dir=rules_dir, extract_dir=extract_dir)
+    result["evidence"] = memory_evidence.score(
+        result["evidence_findings"], baseline=_memory_baseline)
+    return result
+
+
+def _exit_capture_watch(image_name, pid, sha256, armed_at):
+    """Wait for the sample to exit (or the window to close), then analyze."""
+    def _watch():
+        deadline = armed_at + EXIT_CAPTURE_WINDOW
+        dump = None
+        while time.time() < deadline:
+            dump = _exit_capture_find_dump(image_name, pid=pid, since=armed_at - 1)
+            if dump:
+                # The dump is written while the process is held at exit; give
+                # the writer a moment to finish before reading it.
+                size = -1
+                for _ in range(20):
+                    cur = os.path.getsize(dump)
+                    if cur == size and cur > 0:
+                        break
+                    size = cur
+                    time.sleep(0.5)
+                break
+            time.sleep(2)
+        _exit_capture_disarm(image_name)
+
+        if not dump:
+            entry = {
+                "tool": "Exit Capture", "process": image_name, "pid": pid,
+                "observed": False, "captured": False,
+                "note": f"Process did not exit within {EXIT_CAPTURE_WINDOW}s "
+                        "(still running - the live scanners cover it).",
+            }
+        else:
+            try:
+                entry = _exit_capture_analyze(dump, image_name)
+                entry["captured"] = True
+                entry["pid"] = pid
+                _record_scan("Exit Capture", f"PID {pid}", entry)
+            except Exception as e:
+                entry = {"tool": "Exit Capture", "pid": pid, "captured": True,
+                         "observed": False, "dump_path": dump, "error": str(e)}
+        with _beacon_cache_lock:
+            _beacon_results_cache[f"exitcapture_{pid}"] = entry
+            if sha256:
+                _beacon_results_cache[f"exitcapture_{sha256}"] = entry
+        _exit_capture_prune()
+
+    threading.Thread(target=_watch, daemon=True).start()
 
 
 @app.route("/api/scan/threatcheck", methods=["POST"])
@@ -3492,6 +3883,51 @@ def api_scan_capa():
             shutil.rmtree(cleanup_dir, ignore_errors=True)
 
 
+@app.route("/api/process/lookup")
+def api_process_lookup():
+    """Find running PIDs by (partial) image name.
+
+    The sidebar process list is built from Sysmon/ETW telemetry and keeps
+    historical entries, so it is not a reliable source of currently running
+    PIDs. This asks the OS directly.
+    """
+    name = (request.args.get("name") or "").strip().lower()
+    if not name:
+        return jsonify({"error": "No name specified"}), 400
+
+    try:
+        proc = subprocess.run(
+            ["tasklist", "/fo", "csv", "/nh"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except FileNotFoundError:
+        return jsonify({"error": "tasklist unavailable (not running on Windows)"}), 501
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "tasklist timed out"}), 504
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    import csv as _csv
+    matches = []
+    for row in _csv.reader((proc.stdout or "").splitlines()):
+        if len(row) < 2:
+            continue
+        image, pid_str = row[0], row[1]
+        if name not in image.lower():
+            continue
+        try:
+            matches.append({
+                "pid": int(pid_str),
+                "name": image,
+                "memory": row[4] if len(row) > 4 else "",
+            })
+        except ValueError:
+            continue
+
+    matches.sort(key=lambda m: m["pid"])
+    return jsonify({"name": name, "count": len(matches), "matches": matches[:50]})
+
+
 @app.route("/api/scan/status")
 def api_scan_status():
     """Return availability status of scanning tools."""
@@ -3527,6 +3963,26 @@ def api_scan_status():
         "beaconeye": {
             "installed": os.path.isfile(BEACONEYE_EXE),
             "path": BEACONEYE_EXE,
+        },
+        "aether": {
+            "installed": os.path.isfile(AETHER_EXE),
+            "path": AETHER_EXE,
+            "rules": len(glob.glob(os.path.join(AETHER_RULES_DIR, "*.json")))
+                     if os.path.isdir(AETHER_RULES_DIR) else 0,
+        },
+        "process_dump": {
+            "installed": os.path.isfile(PROCESSDUMP_EXE),
+            "path": PROCESSDUMP_EXE,
+            # Without the baseline every known-good module gets dumped too.
+            "clean_db": os.path.isfile(os.path.join(os.path.dirname(PROCESSDUMP_EXE), "clean.hashes")),
+            "dump_dir": PROCESSDUMP_DIR,
+        },
+        "exit_capture": {
+            # OS-native, so "installed" just means we run on Windows.
+            "installed": _exit_capture_supported(),
+            "dump_dir": EXIT_CAPTURE_DIR,
+            "window_seconds": EXIT_CAPTURE_WINDOW,
+            "armed": sorted(_exit_capture_armed.keys()),
         },
     })
 
@@ -3641,6 +4097,876 @@ def api_scan_beaconeye():
         return jsonify({"error": str(e)}), 500
 
 
+# --- Live-memory forensics: Aether ---
+
+def _summarize_aether(payload):
+    """Condense Aether's JSON report into counts the UI can render directly.
+
+    Aether's "findings" array is heterogeneous: structural memory IOCs carry a
+    "type" (MISSING_PEB, HEAP_API_TABLE, TSAV_*), while signature matches carry
+    a "category" plus a "hits" list. They are split apart here so each can be
+    presented on its own terms.
+
+    Severity comes from Aether itself rather than being inferred from the
+    finding type: it grades the same type differently depending on how much
+    corroboration its L3 layer found (a MISSING_PEB image, for instance, is
+    reported as INFO on its own and escalated only when another signal agrees).
+    """
+    findings = payload.get("findings") or []
+
+    structural = [f for f in findings if f.get("type")]
+    sig_groups = [f for f in findings if f.get("category")]
+
+    by_severity, by_type = {}, {}
+    struct_severity = {}
+    for f in findings:
+        sev = (f.get("severity") or "unknown").lower()
+        by_severity[sev] = by_severity.get(sev, 0) + 1
+    for f in structural:
+        by_type[f["type"]] = by_type.get(f["type"], 0) + 1
+        sev = (f.get("severity") or "unknown").lower()
+        struct_severity[sev] = struct_severity.get(sev, 0) + 1
+
+    categories, mitre = {}, set()
+    sig_hits = 0
+    # Generic string patterns match plenty of benign software, so track the
+    # high-risk hits separately from the raw count.
+    high_risk_hits = 0
+    for g in sig_groups:
+        cat = g.get("category")
+        hits = g.get("hits") or []
+        count = g.get("hit_count") or len(hits)
+        categories[cat] = categories.get(cat, 0) + count
+        sig_hits += count
+        if g.get("mitre"):
+            mitre.add(g["mitre"])
+        for h in hits:
+            try:
+                if int(h.get("risk_score") or 0) >= 8:
+                    high_risk_hits += 1
+            except (TypeError, ValueError):
+                pass
+
+    return {
+        "findings_total": len(findings),
+        "structural_total": len(structural),
+        "by_severity": by_severity,
+        "by_type": by_type,
+        "critical": by_severity.get("critical", 0),
+        "high": by_severity.get("high", 0),
+        "medium": by_severity.get("medium", 0),
+        "info": by_severity.get("info", 0),
+        # Severity split over structural IOCs only. Signature groups are graded
+        # critical even for low-risk string patterns, which makes the combined
+        # counts above unsuitable for scoring.
+        "structural_critical": struct_severity.get("critical", 0),
+        "structural_high": struct_severity.get("high", 0),
+        "structural_by_severity": struct_severity,
+        # Thread start-address verdicts are the highest-signal subset.
+        "tsav": {t: c for t, c in by_type.items() if t.startswith("TSAV_")},
+        "signature_groups": len(sig_groups),
+        "signature_hits": sig_hits,
+        "signature_high_risk": high_risk_hits,
+        "signature_categories": categories,
+        "mitre": sorted(mitre),
+        "pe_headers_in_private": payload.get("pe_headers_in_private", 0),
+        "dotnet_assemblies_in_private": payload.get("dotnet_assemblies_in_private", 0),
+        "regions_scanned": payload.get("regions_scanned", 0),
+        "bytes_scanned": payload.get("bytes_scanned", 0),
+        "scan_time_ms": payload.get("scan_time_ms", 0),
+    }
+
+
+def _run_aether_once(pid=None, scan_all=False, timeout=180):
+    """Single Aether invocation in JSON mode. Returns (result_dict, error)."""
+    if not os.path.isfile(AETHER_EXE):
+        return None, "Aether not installed"
+
+    args = [AETHER_EXE, "--scan", "--json"]
+    if scan_all:
+        args = [AETHER_EXE, "--scan-all", "--json"]
+    elif pid:
+        args += ["--pid", str(pid)]
+    else:
+        return None, "No PID specified"
+
+    if os.path.isdir(AETHER_RULES_DIR):
+        args += ["--rules", AETHER_RULES_DIR]
+
+    try:
+        proc = subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout,
+            cwd=os.path.dirname(AETHER_EXE),
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"Aether timed out ({timeout}s)"
+    except Exception as e:
+        return None, str(e)
+
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+
+    # Aether prints a banner before the JSON object, so locate the report by
+    # its first brace rather than parsing the whole stream.
+    payload, parse_error = None, None
+    start = stdout.find("{")
+    if start >= 0:
+        try:
+            payload = json.loads(stdout[start:])
+        except json.JSONDecodeError as e:
+            parse_error = f"Could not parse Aether JSON: {e}"
+    else:
+        parse_error = "Aether produced no JSON output"
+
+    result = {
+        "tool": "Aether",
+        "pid": pid,
+        "scan_all": scan_all,
+        "exit_code": proc.returncode,
+        "raw_output": stdout.strip()[:20000],
+    }
+    if stderr.strip():
+        result["stderr"] = stderr.strip()[:2000]
+    if payload is not None:
+        result["report"] = payload
+        result["summary"] = _summarize_aether(payload)
+    if parse_error:
+        result["parse_error"] = parse_error
+
+    return result, None
+
+
+def _run_aether(pid=None, scan_all=False, timeout=180, samples=1, interval=3.0,
+                process_name=""):
+    """Scan with Aether, optionally sampling repeatedly.
+
+    Live memory changes between scans, so a single snapshot cannot distinguish
+    "this process has an implant" from "this region looked odd for a moment".
+    With samples > 1 the same target is scanned several times and each finding
+    records how many samples contained it; the scoring layer then discounts
+    transient ones.
+    """
+    samples = max(1, min(int(samples or 1), 10))
+    runs, errors = [], []
+
+    for i in range(samples):
+        if i:
+            time.sleep(max(0.0, min(float(interval or 0), 30.0)))
+        result, error = _run_aether_once(pid=pid, scan_all=scan_all, timeout=timeout)
+        if error:
+            errors.append(error)
+            # A tool that is missing or times out will not succeed on retry.
+            break
+        runs.append(result)
+
+    if not runs:
+        return None, (errors[0] if errors else "Aether produced no result")
+
+    # The last run carries the report shown in the UI; earlier ones only
+    # contribute persistence information.
+    final = dict(runs[-1])
+    final["samples"] = len(runs)
+    final["sample_interval"] = interval if len(runs) > 1 else 0
+
+    # A scan that read no regions observed nothing - usually because the
+    # process exited first. That is a failed observation, not a clean result,
+    # and must not be reported as evidence of absence.
+    scanned_any = any((r.get("report") or {}).get("regions_scanned") for r in runs)
+    final["observed"] = bool(scanned_any)
+    if not scanned_any:
+        final["observation_note"] = (
+            "No memory regions could be read - the process most likely exited "
+            "before the scan. This is not evidence that it was clean."
+        )
+
+    per_sample = [
+        memory_evidence.from_aether(r.get("report") or {}, process=process_name)
+        for r in runs
+    ]
+    merged = memory_evidence.merge_samples(per_sample)
+    final["evidence_findings"] = merged
+    final["evidence"] = memory_evidence.score(merged, baseline=_memory_baseline)
+    if not scanned_any:
+        final["evidence"]["label"] = "NOT OBSERVED"
+        final["evidence"]["note"] = final["observation_note"]
+
+    if errors:
+        final["sample_errors"] = errors
+    return final, None
+
+
+@app.route("/api/scan/aether", methods=["POST"])
+def api_scan_aether():
+    """Scan a live process with Aether (injection / implant memory forensics).
+
+    Accepts ``samples`` (and ``interval`` seconds) to scan repeatedly: findings
+    then carry how many samples contained them, and the scoring layer discounts
+    the transient ones.
+    """
+    data = request.get_json(force=True) if request.is_json else request.form
+    pid = data.get("pid")
+    scan_all = str(data.get("scan_all", "")).lower() in ("1", "true", "yes")
+    samples = data.get("samples") or 1
+    interval = data.get("interval") or 3
+    process_name = (data.get("process") or "").strip()
+
+    if not pid and not scan_all:
+        return jsonify({"error": "Provide a pid, or set scan_all"}), 400
+
+    # Resolve the image name so findings are attributed to a process rather
+    # than a PID, which is what makes baselines reusable across reboots.
+    if pid and not process_name:
+        process_name = _image_name_for_pid(pid)
+
+    # A whole-system sweep touches every accessible process, so it gets longer.
+    result, error = _run_aether(
+        pid=pid, scan_all=scan_all, timeout=600 if scan_all else 180,
+        samples=samples, interval=interval, process_name=process_name,
+    )
+    if error:
+        status = 500 if "not installed" in error else 504 if "timed out" in error else 400
+        return jsonify({"error": error, "path": AETHER_EXE}), status
+
+    result["process"] = process_name
+    if pid:
+        with _beacon_cache_lock:
+            _beacon_results_cache[f"aether_{pid}"] = result
+
+    _record_scan("Aether", f"PID {pid}" if pid else "all processes", result)
+
+    return jsonify(result)
+
+
+def _image_name_for_pid(pid):
+    """Best-effort image name for a PID (used to key findings and baselines)."""
+    try:
+        proc = subprocess.run(
+            ["tasklist", "/fi", f"PID eq {int(pid)}", "/fo", "csv", "/nh"],
+            capture_output=True, text=True, timeout=15,
+        )
+        import csv as _csv
+        for row in _csv.reader((proc.stdout or "").splitlines()):
+            if row and row[0] and not row[0].startswith("INFO"):
+                return row[0]
+    except Exception:
+        pass
+    return ""
+
+
+# --- Memory baseline management ---------------------------------------
+
+
+def _parse_json_stream(text):
+    """Parse concatenated JSON objects (Aether's --scan-all emits one per PID)."""
+    decoder = json.JSONDecoder()
+    objs, i, n = [], 0, len(text)
+    start = text.find("{")
+    if start < 0:
+        return objs
+    i = start
+    while i < n:
+        while i < n and text[i] in " \r\n\t,[]":
+            i += 1
+        if i >= n:
+            break
+        try:
+            obj, i = decoder.raw_decode(text, i)
+        except json.JSONDecodeError:
+            # Skip to the next object rather than losing the rest of the sweep.
+            nxt = text.find("{", i + 1)
+            if nxt < 0:
+                break
+            i = nxt
+            continue
+        if isinstance(obj, dict):
+            objs.append(obj)
+    return objs
+
+
+def _running_process_names():
+    """PID -> image name for every running process (tasklist)."""
+    names = {}
+    try:
+        proc = subprocess.run(["tasklist", "/fo", "csv", "/nh"],
+                              capture_output=True, text=True, timeout=30)
+        import csv as _csv
+        for row in _csv.reader((proc.stdout or "").splitlines()):
+            if len(row) >= 2:
+                try:
+                    names[int(row[1])] = row[0]
+                except ValueError:
+                    continue
+    except Exception:
+        pass
+    return names
+
+
+# --- System-wide memory sweep (background job) ------------------------
+#
+# Scans every accessible process. On a clean box this is also the most
+# complete way to capture the host baseline in one go.
+
+_sweep_lock = threading.Lock()
+_sweep_state = {"running": False}
+
+# The chamber's own security tooling keeps detection rules in memory (rule
+# strings such as "sekurlsa::logonpasswords" are exactly what the signature
+# scanner looks for), so it matches its own signatures. Those processes are
+# reported as excluded rather than scored.
+HOST_TOOL_IMAGES = {
+    "fibratus.exe", "rustinel.exe", "msmpeng.exe", "mssense.exe", "nissrv.exe",
+    "aether.exe", "pd64.exe", "pd32.exe", "sysmon64.exe", "sysmon64a.exe",
+    "sysmon.exe", "hunt-sleeping-beacons.exe", "beaconeye.exe",
+}
+
+
+def _is_host_tool(pid, image):
+    if pid == os.getpid():
+        return True  # this web UI: it loads the signature rules itself
+    return (image or "").lower() in HOST_TOOL_IMAGES
+
+
+def _run_sweep(use_aether, use_processdump, capture_baseline):
+    started = time.time()
+    names = _running_process_names()
+    per_pid, errors, stats = {}, [], {}
+
+    if use_aether and os.path.isfile(AETHER_EXE):
+        args = [AETHER_EXE, "--scan-all", "--json"]
+        if os.path.isdir(AETHER_RULES_DIR):
+            args += ["--rules", AETHER_RULES_DIR]
+        try:
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=1200,
+                                  cwd=os.path.dirname(AETHER_EXE))
+            reports = _parse_json_stream(proc.stdout or "")
+            stats["aether_processes"] = len(reports)
+            for rep in reports:
+                pid = rep.get("pid")
+                if pid is None:
+                    continue
+                image = names.get(int(pid), "")
+                per_pid.setdefault(int(pid), {"process": image, "findings": []})
+                per_pid[int(pid)]["findings"] += memory_evidence.from_aether(rep, process=image)
+                per_pid[int(pid)]["regions_scanned"] = rep.get("regions_scanned", 0)
+        except subprocess.TimeoutExpired:
+            errors.append("Aether sweep timed out (1200s)")
+        except Exception as e:
+            errors.append(f"Aether sweep failed: {e}")
+
+    if use_processdump and os.path.isfile(PROCESSDUMP_EXE):
+        result, error = _run_process_dump(dump_system=True, timeout=1800)
+        if error:
+            errors.append(f"Process Dump sweep failed: {error}")
+        else:
+            stats["dumps"] = result["dump_count"]
+            stats["dump_dir"] = result["output_dir"]
+            by_pid = {}
+            for d in result["dumps"]:
+                if d.get("pid") is not None:
+                    by_pid.setdefault(d["pid"], []).append(d)
+            for pid, dumps in by_pid.items():
+                image = names.get(pid, "")
+                per_pid.setdefault(pid, {"process": image, "findings": []})
+                per_pid[pid]["findings"] += memory_evidence.from_process_dump(
+                    {"dumps": dumps}, process=image)
+
+    captured = 0
+    processes, excluded = [], []
+    for pid, entry in per_pid.items():
+        if _is_host_tool(pid, entry["process"]):
+            excluded.append({"pid": pid, "process": entry["process"] or "(this web UI)"})
+            continue
+        if capture_baseline:
+            captured += _memory_baseline.add(entry["findings"])
+            continue
+        ev = memory_evidence.score(entry["findings"], baseline=_memory_baseline)
+        if not ev["findings"] and not ev["suppressed_count"]:
+            continue
+        processes.append({
+            "pid": pid,
+            "process": entry["process"],
+            "label": ev["label"],
+            "score": ev["score"],
+            "suppressed": ev["suppressed_count"],
+            "regions_scanned": entry.get("regions_scanned"),
+            "reasons": ev["reasons"][:4],
+            "findings": [
+                {k: f.get(k) for k in ("kind", "label", "source", "score",
+                                       "confidence", "detail", "evidence")}
+                for f in ev["findings"][:8]
+            ],
+        })
+    processes.sort(key=lambda p: (-p["score"], p["process"].lower()))
+
+    return {
+        "started": started,
+        "finished": time.time(),
+        "duration_s": round(time.time() - started, 1),
+        "mode": "baseline" if capture_baseline else "scan",
+        "processes_seen": len(per_pid),
+        "flagged": sum(1 for p in processes if p["label"] != "CLEAN"),
+        "processes": processes[:200],
+        # Security tools match their own detection rules; listed, not scored.
+        "excluded_host_tools": sorted(excluded, key=lambda e: e["process"].lower()),
+        "baseline_keys_added": captured if capture_baseline else None,
+        "baseline": _memory_baseline.stats(),
+        "stats": stats,
+        "errors": errors,
+    }
+
+
+@app.route("/api/memory/sweep", methods=["POST"])
+def api_memory_sweep_start():
+    """Start a background sweep of every process.
+
+    Body: {"aether": true, "processdump": false, "baseline": false}
+    With "baseline": true the findings are recorded as the host baseline
+    instead of being scored - run that on a clean box.
+    """
+    data = request.get_json(force=True) if request.is_json else request.form
+    truthy = lambda v, d: d if v is None else str(v).lower() in ("1", "true", "yes")
+    use_aether = truthy(data.get("aether"), True)
+    use_pd = truthy(data.get("processdump"), False)
+    capture_baseline = truthy(data.get("baseline"), False)
+
+    if not (use_aether and os.path.isfile(AETHER_EXE)) and not (use_pd and os.path.isfile(PROCESSDUMP_EXE)):
+        return jsonify({"error": "No selected sweep tool is installed"}), 400
+
+    with _sweep_lock:
+        if _sweep_state.get("running"):
+            return jsonify({"error": "A sweep is already running",
+                            "started": _sweep_state.get("started")}), 409
+        _sweep_state.clear()
+        _sweep_state.update({
+            "running": True, "started": time.time(),
+            "options": {"aether": use_aether, "processdump": use_pd,
+                        "baseline": capture_baseline},
+        })
+
+    def _job():
+        try:
+            result = _run_sweep(use_aether, use_pd, capture_baseline)
+            with _sweep_lock:
+                _sweep_state.update({"running": False, "result": result})
+        except Exception as e:
+            with _sweep_lock:
+                _sweep_state.update({"running": False, "error": str(e)})
+
+    threading.Thread(target=_job, daemon=True).start()
+    return jsonify({"started": True, "options": _sweep_state["options"]})
+
+
+@app.route("/api/memory/sweep", methods=["GET"])
+def api_memory_sweep_status():
+    """Progress or result of the last sweep."""
+    with _sweep_lock:
+        state = dict(_sweep_state)
+    if state.get("running"):
+        state["elapsed_s"] = round(time.time() - state.get("started", time.time()), 1)
+    return jsonify(state)
+
+
+# --- Process Dump clean-hash database ---------------------------------
+#
+# Provisioning only runs "-db genquick" (running processes). The full "-db gen"
+# also hashes every PE under WINDIR and Program Files, so modules that simply
+# were not loaded during provisioning stop showing up in dumps. It takes tens of
+# minutes, hence a background job. Only run it while the box is clean.
+
+_pd_db_lock = threading.Lock()
+_pd_db_state = {"running": False}
+
+
+def _pd_db_counts():
+    """Hash counts per database file, parsed from the files themselves."""
+    root = os.path.dirname(PROCESSDUMP_EXE)
+    out = {}
+    for name in ("clean.hashes", "entrypoints.hashes", "shortentrypoints.hashes"):
+        path = os.path.join(root, name)
+        out[name] = os.path.getsize(path) if os.path.isfile(path) else None
+    return out
+
+
+@app.route("/api/processdump/baseline", methods=["GET"])
+def api_pd_baseline_status():
+    with _pd_db_lock:
+        state = dict(_pd_db_state)
+    if state.get("running"):
+        state["elapsed_s"] = round(time.time() - state.get("started", time.time()), 1)
+    state["files"] = _pd_db_counts()
+    return jsonify(state)
+
+
+@app.route("/api/processdump/baseline", methods=["POST"])
+def api_pd_baseline_build():
+    """Extend the clean-hash database. Body: {"mode": "gen" | "genquick"}."""
+    data = request.get_json(force=True) if request.is_json else request.form
+    mode = (data.get("mode") or "gen").lower()
+    if mode not in ("gen", "genquick"):
+        return jsonify({"error": "mode must be gen or genquick"}), 400
+    if not os.path.isfile(PROCESSDUMP_EXE):
+        return jsonify({"error": "Process Dump not installed"}), 500
+
+    with _pd_db_lock:
+        if _pd_db_state.get("running"):
+            return jsonify({"error": "Database generation already running"}), 409
+        _pd_db_state.clear()
+        _pd_db_state.update({"running": True, "mode": mode, "started": time.time(),
+                             "files_before": _pd_db_counts()})
+
+    def _job():
+        root = os.path.dirname(PROCESSDUMP_EXE)
+        try:
+            proc = subprocess.run([PROCESSDUMP_EXE, "-db", mode, "-nh"],
+                                  capture_output=True, text=True, timeout=7200, cwd=root)
+            out = (proc.stdout or "") + (proc.stderr or "")
+            # Process Dump reports the resulting total on its last summary line.
+            total = None
+            for line in out.splitlines():
+                if "clean hash database now has" in line:
+                    digits = "".join(c for c in line.split("has", 1)[1] if c.isdigit())
+                    total = int(digits) if digits else None
+            with _pd_db_lock:
+                _pd_db_state.update({
+                    "running": False, "finished": time.time(),
+                    "exit_code": proc.returncode, "clean_hashes": total,
+                    "output_tail": out.strip()[-3000:],
+                })
+        except subprocess.TimeoutExpired:
+            with _pd_db_lock:
+                _pd_db_state.update({"running": False, "error": "timed out after 2h"})
+        except Exception as e:
+            with _pd_db_lock:
+                _pd_db_state.update({"running": False, "error": str(e)})
+
+    threading.Thread(target=_job, daemon=True).start()
+    return jsonify({"started": True, "mode": mode})
+
+
+@app.route("/api/memory/baseline", methods=["GET"])
+def api_memory_baseline():
+    """Report what the host baseline currently suppresses."""
+    stats = _memory_baseline.stats()
+    stats["path"] = MEMORY_BASELINE_FILE
+    return jsonify(stats)
+
+
+@app.route("/api/memory/baseline/capture", methods=["POST"])
+def api_memory_baseline_capture():
+    """Scan processes and record their findings as benign for this host.
+
+    Run this while the box is clean. Everything seen now stops counting as
+    evidence later, which is what removes the standing noise (explorer.exe's
+    heap API tables, framework string matches) from every later verdict.
+    """
+    data = request.get_json(force=True) if request.is_json else request.form
+    pids = data.get("pids") or []
+    names = data.get("names") or []
+    samples = data.get("samples") or 2
+
+    if isinstance(pids, str):
+        pids = [p.strip() for p in pids.split(",") if p.strip()]
+    if isinstance(names, str):
+        names = [n.strip() for n in names.split(",") if n.strip()]
+
+    # Default to the processes that generate the standing noise.
+    if not pids and not names:
+        names = ["explorer.exe", "svchost.exe", "RuntimeBroker.exe", "msedge.exe"]
+
+    targets = []
+    for pid in pids:
+        try:
+            targets.append((int(pid), _image_name_for_pid(pid)))
+        except (TypeError, ValueError):
+            continue
+    for name in names:
+        try:
+            proc = subprocess.run(
+                ["tasklist", "/fi", f"IMAGENAME eq {name}", "/fo", "csv", "/nh"],
+                capture_output=True, text=True, timeout=20,
+            )
+            import csv as _csv
+            for row in _csv.reader((proc.stdout or "").splitlines()):
+                if len(row) >= 2 and not row[0].startswith("INFO"):
+                    try:
+                        targets.append((int(row[1]), row[0]))
+                    except ValueError:
+                        continue
+        except Exception:
+            continue
+
+    if not targets:
+        return jsonify({"error": "No matching running processes"}), 404
+
+    # Cap the work: a baseline sweep is interactive, not a batch job.
+    targets = targets[:12]
+
+    captured, scanned, failures = 0, [], []
+    for pid, image in targets:
+        result, error = _run_aether(
+            pid=pid, samples=samples, interval=2, process_name=image, timeout=180
+        )
+        if error:
+            failures.append({"pid": pid, "process": image, "error": error})
+            continue
+        findings = result.get("evidence_findings") or []
+        added = _memory_baseline.add(findings)
+        captured += added
+        scanned.append({
+            "pid": pid, "process": image,
+            "findings": len(findings), "new_keys": added,
+        })
+
+    stats = _memory_baseline.stats()
+    return jsonify({
+        "captured": captured,
+        "scanned": scanned,
+        "failures": failures,
+        "samples_per_process": samples,
+        "baseline": stats,
+    })
+
+
+@app.route("/api/memory/baseline", methods=["DELETE"])
+def api_memory_baseline_clear():
+    """Forget the host baseline (every finding counts as evidence again)."""
+    _memory_baseline.clear()
+    return jsonify({"ok": True, "baseline": _memory_baseline.stats()})
+
+
+@app.route("/api/memory/evidence", methods=["POST"])
+def api_memory_evidence():
+    """Re-score the cached memory findings for a PID across all scanners.
+
+    Useful after a baseline change, and the place where cross-tool
+    corroboration becomes visible without re-running any scanner.
+    """
+    data = request.get_json(force=True) if request.is_json else request.form
+    pid = data.get("pid")
+    if not pid:
+        return jsonify({"error": "Provide a pid"}), 400
+
+    with _beacon_cache_lock:
+        cached = {
+            "aether": _beacon_results_cache.get(f"aether_{pid}"),
+            "process_dump": _beacon_results_cache.get(f"processdump_{pid}"),
+            "hunt_sleeping_beacons": _beacon_results_cache.get(f"hsb_{pid}"),
+            "beaconeye": _beacon_results_cache.get(f"beaconeye_{pid}"),
+        }
+    cached = {k: v for k, v in cached.items() if v}
+    if not cached:
+        return jsonify({"error": f"No cached memory results for PID {pid}"}), 404
+
+    process_name = _image_name_for_pid(pid)
+    findings = memory_evidence.collect(cached, process=process_name)
+    return jsonify({
+        "pid": pid,
+        "process": process_name,
+        "sources": sorted(cached.keys()),
+        "evidence": memory_evidence.score(findings, baseline=_memory_baseline),
+    })
+
+
+# --- Memory dumping: Process Dump ---
+
+def _parse_processdump_filename(name):
+    """Pull the metadata Process Dump encodes into each dump's filename.
+
+    Examples:
+      notepad_exe_PID2990_hiddenmodule_16B8ABB0000_x86.dll
+      notepad_exe_PID2c54_codechunk_17BD0000_x64.exe
+    """
+    info = {"filename": name, "kind": "module"}
+    stem = os.path.splitext(name)[0]
+    parts = stem.split("_")
+
+    for part in parts:
+        if part.startswith("PID"):
+            info["pid_hex"] = part[3:]
+            try:
+                # Process Dump writes the PID in hex in the filename.
+                info["pid"] = int(part[3:], 16)
+            except ValueError:
+                pass
+    if "hiddenmodule" in stem:
+        # Module was never registered in the PEB: stomping or manual mapping.
+        info["kind"] = "hiddenmodule"
+    elif "codechunk" in stem:
+        # Executable memory with no PE header; headers were synthesized.
+        info["kind"] = "codechunk"
+    if parts and parts[-1] in ("x86", "x64"):
+        info["arch"] = parts[-1]
+        if len(parts) >= 2:
+            info["base_address"] = parts[-2]
+    return info
+
+
+PROCESSDUMP_KEEP = 30  # per-run dump folders retained under C:\dumps
+
+
+def _processdump_prune():
+    """Keep the newest PROCESSDUMP_KEEP run folders (the exit\\ folder is separate)."""
+    if not os.path.isdir(PROCESSDUMP_DIR):
+        return
+    import shutil
+    runs = []
+    for name in os.listdir(PROCESSDUMP_DIR):
+        full = os.path.join(PROCESSDUMP_DIR, name)
+        # Run folders are named <YYYYmmdd-HHMMSS>_<label>; leave anything else alone.
+        if os.path.isdir(full) and len(name) > 16 and name[8] == "-" and name[:8].isdigit():
+            runs.append(full)
+    runs.sort(key=os.path.getmtime, reverse=True)
+    for old in runs[PROCESSDUMP_KEEP:]:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def _classify_codechunk(entry, raw):
+    """Mark Process Dump code chunks that are host artifacts, not sample code.
+
+    Process Dump wraps a header-less executable region in a synthetic PE whose
+    first section holds the region. On ARM64 hosts running x64 samples, that
+    region is frequently the emulator's ARM64 translation cache; the same
+    classifier the exit-capture analysis uses decides that from the bytes.
+    """
+    if platform.machine().upper() not in ("ARM64", "AARCH64"):
+        return
+    try:
+        import pefile
+        pe = pefile.PE(data=raw, fast_load=True)
+        payload = pe.sections[0].get_data() if pe.sections else b""
+        pe.close()
+    except Exception:
+        return
+    cls, why = minidump_analysis.classify_private_exec({}, payload, emulated=True)
+    if cls != "code":
+        entry["host_class"] = cls
+        entry["host_reason"] = why
+
+
+def _run_process_dump(pid=None, dump_system=False, ignore_db=False,
+                      process_name="", timeout=None):
+    """Run Process Dump and describe what it produced.
+
+    Returns (result_dict, error_or_None). Shared by the HTTP endpoint and the
+    post-detonation scan chain so both produce identically shaped results.
+    """
+    if not os.path.isfile(PROCESSDUMP_EXE):
+        return None, "Process Dump not installed"
+    if not pid and not dump_system:
+        return None, "No PID specified"
+
+    # Each run gets its own folder so the result lists exactly what this dump
+    # produced, instead of everything ever dumped.
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    label = f"pid{pid}" if pid else "system"
+    out_dir = os.path.join(PROCESSDUMP_DIR, f"{stamp}_{label}")
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:
+        return None, f"Cannot create dump folder: {e}"
+
+    args = [PROCESSDUMP_EXE, "-o", out_dir]
+    if dump_system:
+        args.append("-system")
+    else:
+        args += ["-pid", str(pid)]
+    if ignore_db:
+        # Dump known-good modules too; useful when the baseline is suspect.
+        args += ["-db", "ignore"]
+
+    if timeout is None:
+        timeout = 900 if dump_system else 300
+
+    try:
+        proc = subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout,
+            cwd=os.path.dirname(PROCESSDUMP_EXE),
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"Process Dump timed out ({timeout}s)"
+    except Exception as e:
+        return None, str(e)
+
+    output = (proc.stdout or "") + (proc.stderr or "")
+
+    dumps = []
+    try:
+        for name in sorted(os.listdir(out_dir)):
+            full = os.path.join(out_dir, name)
+            if not os.path.isfile(full):
+                continue
+            entry = _parse_processdump_filename(name)
+            entry["path"] = full
+            entry["size"] = os.path.getsize(full)
+            try:
+                with open(full, "rb") as f:
+                    raw = f.read()
+                entry["sha256"] = hashlib.sha256(raw).hexdigest()
+                if entry["kind"] == "codechunk":
+                    _classify_codechunk(entry, raw)
+            except OSError:
+                pass
+            dumps.append(entry)
+    except OSError:
+        pass
+
+    host_chunks = sum(1 for d in dumps if d.get("host_class"))
+    _processdump_prune()
+    return {
+        "tool": "Process Dump",
+        "pid": pid,
+        "process": process_name,
+        "system": dump_system,
+        # Flagged so the evidence layer can discount the dumps: without the
+        # baseline the dump is "everything", not "what is new".
+        "clean_db_ignored": ignore_db,
+        "output_dir": out_dir,
+        "dumps": dumps,
+        "dump_count": len(dumps),
+        "hidden_modules": sum(1 for d in dumps if d["kind"] == "hiddenmodule"),
+        # Header-less chunks the host explains (emulator cache) are listed but
+        # not counted, so the headline matches what the evidence model scores.
+        "code_chunks": sum(1 for d in dumps if d["kind"] == "codechunk" and not d.get("host_class")),
+        "host_code_chunks": host_chunks,
+        "output": output.strip()[:20000],
+        "exit_code": proc.returncode,
+    }, None
+
+
+@app.route("/api/scan/processdump", methods=["POST"])
+def api_scan_processdump():
+    """Dump a live process's memory components to disk with Process Dump.
+
+    The resulting PE files are regular samples on disk, so each one can be fed
+    straight back into the file map, PE analyzer, capa or EMBER.
+    """
+    data = request.get_json(force=True) if request.is_json else request.form
+    pid = data.get("pid")
+    dump_system = str(data.get("system", "")).lower() in ("1", "true", "yes")
+    ignore_db = str(data.get("ignore_clean_db", "")).lower() in ("1", "true", "yes")
+
+    if not os.path.isfile(PROCESSDUMP_EXE):
+        return jsonify({"error": "Process Dump not installed", "path": PROCESSDUMP_EXE}), 500
+    if not pid and not dump_system:
+        return jsonify({"error": "Provide a pid, or set system"}), 400
+
+    result, error = _run_process_dump(
+        pid=pid, dump_system=dump_system, ignore_db=ignore_db,
+        process_name=_image_name_for_pid(pid) if pid else "",
+    )
+    if error:
+        status = 504 if "timed out" in error else 500
+        return jsonify({"error": error}), status
+
+    if pid:
+        with _beacon_cache_lock:
+            _beacon_results_cache[f"processdump_{pid}"] = result
+
+    _record_scan("Process Dump", f"PID {pid}" if pid else "all processes", result)
+
+    return jsonify(result)
+
+
 def _parse_hsb_output(output):
     """Parse Hunt-Sleeping-Beacons output into structured findings."""
     findings = []
@@ -3697,8 +5023,12 @@ def _parse_beaconeye_output(output):
     return findings
 
 
-def _run_beacon_scans_async(pid, sha256):
-    """Run beacon scans in a background thread after sample execution."""
+def _run_memory_scans_async(pid, sha256):
+    """Run every live-memory tool against a detonated process, in background.
+
+    Order matters: the read-only scanners go first so their view of the process
+    is undisturbed, and Process Dump runs last because it writes files.
+    """
     def _scan():
         import time as _time
         # Wait a few seconds for the beacon to initialize and enter sleep
@@ -3753,6 +5083,48 @@ def _run_beacon_scans_async(pid, sha256):
             except Exception as e:
                 with _beacon_cache_lock:
                     _beacon_results_cache[f"beaconeye_{pid}"] = {"tool": "BeaconEye", "error": str(e)}
+
+        # Aether: injection / implant structure scan of the live process.
+        # Sampled three times so the evidence layer can tell a persistent
+        # implant from memory that briefly looked odd.
+        process_name = _image_name_for_pid(pid)
+        if os.path.isfile(AETHER_EXE):
+            try:
+                aether_result, aether_error = _run_aether(
+                    pid=pid, timeout=180, samples=3, interval=3,
+                    process_name=process_name,
+                )
+                entry = aether_result or {"tool": "Aether", "error": aether_error}
+                with _beacon_cache_lock:
+                    _beacon_results_cache[f"aether_{pid}"] = entry
+                    if sha256:
+                        _beacon_results_cache[f"aether_{sha256}"] = entry
+                if aether_result:
+                    _record_scan("Aether", f"PID {pid}", aether_result)
+            except Exception as e:
+                with _beacon_cache_lock:
+                    _beacon_results_cache[f"aether_{pid}"] = {"tool": "Aether", "error": str(e)}
+
+        # Process Dump last: it writes files, and running it after the scanners
+        # keeps their view of the process undisturbed. The clean-hash database
+        # stays active, so the dump holds what is new on this box rather than
+        # every module the process loaded.
+        if os.path.isfile(PROCESSDUMP_EXE):
+            try:
+                dump_result, dump_error = _run_process_dump(
+                    pid=pid, process_name=process_name, timeout=300
+                )
+                entry = dump_result or {"tool": "Process Dump", "error": dump_error}
+                with _beacon_cache_lock:
+                    _beacon_results_cache[f"processdump_{pid}"] = entry
+                    if sha256:
+                        _beacon_results_cache[f"processdump_{sha256}"] = entry
+                if dump_result:
+                    _record_scan("Process Dump", f"PID {pid}", dump_result)
+            except Exception as e:
+                with _beacon_cache_lock:
+                    _beacon_results_cache[f"processdump_{pid}"] = {
+                        "tool": "Process Dump", "error": str(e)}
 
     thread = threading.Thread(target=_scan, daemon=True)
     thread.start()
@@ -3823,6 +5195,10 @@ PACKER_SECTIONS = {
 
 ENTROPY_HIGH_THRESHOLD = 7.0  # Shannon entropy indicating encrypted/compressed
 ENTROPY_WARN_THRESHOLD = 6.5
+
+# Upper bound for the file map visualizer: samples beyond this are plotted
+# from their first 64 MB so one huge file cannot stall the UI thread.
+VISUALIZE_MAX_BYTES = 64 * 1024 * 1024
 
 # --- DiE-style Detection Signatures ---
 # Compiler/Linker detection based on linker version and import patterns
@@ -5441,6 +6817,758 @@ def _elf_segment_flags_str(flags):
     if flags & 2: parts.append("W")
     if flags & 1: parts.append("X")
     return "".join(parts) if parts else "—"
+
+
+# =====================================================================
+# FILE MAP VISUALIZER
+# Builds the three planes shown side by side in the file map views:
+#   BytePlot  - every cell colored by the byte class it contains
+#   Entropy   - local Shannon entropy heatmap (0..1, normalized by 8 bits)
+#   Structure - PE/ELF structural regions mapped onto raw file offsets
+# The planes are returned as base64 byte arrays so the browser can paint
+# them onto a canvas without shipping the whole sample to the client.
+# =====================================================================
+
+# Byte classes used by the BytePlot plane (index -> legend entry).
+BYTEPLOT_CLASS_NULL = 0      # 0x00
+BYTEPLOT_CLASS_FF = 1        # 0xFF
+BYTEPLOT_CLASS_VISIBLE = 2   # printable ASCII
+BYTEPLOT_CLASS_INVISIBLE = 3 # control characters
+BYTEPLOT_CLASS_NONASCII = 4  # >= 0x80
+
+BYTEPLOT_LEGEND = [
+    {"id": BYTEPLOT_CLASS_FF, "label": "0xFF", "color": "#ffffff"},
+    {"id": BYTEPLOT_CLASS_NULL, "label": "0x00", "color": "#000000"},
+    {"id": BYTEPLOT_CLASS_VISIBLE, "label": "visible ASCII", "color": "#1a3bff"},
+    {"id": BYTEPLOT_CLASS_INVISIBLE, "label": "invisible ASCII", "color": "#00c814"},
+    {"id": BYTEPLOT_CLASS_NONASCII, "label": "non-ASCII", "color": "#e6e600"},
+]
+
+ENTROPY_LEGEND = [
+    {"value": 0.2, "label": "0.2 (repetition)", "color": "#2f4f54"},
+    {"value": 0.5, "label": "0.5 (code)", "color": "#1f9aa8"},
+    {"value": 0.8, "label": "0.8 (packed)", "color": "#22d3e0"},
+]
+
+# Structure colors: one hue family per structural role.
+STRUCT_COLORS = {
+    "msdos": "#1a3bff",
+    "dos_stub": "#2b4fd4",
+    "coff": "#00c814",
+    "optional": "#ee2222",
+    "section_table": "#e6e600",
+    "section": "#dcdcdc",
+    "resources": "#19c85a",
+    "imports": "#00e000",
+    "exports": "#ff9d00",
+    "relocations": "#8b22ee",
+    "debug": "#3b6dff",
+    "tls": "#ff5fc8",
+    "certificate": "#00bcbc",
+    "load_config": "#b8a600",
+    "iat": "#00b894",
+    "delay_imports": "#7fd400",
+    "exception": "#c05fff",
+    "entry_point": "#ff2b3c",
+    "overlay": "#6b7280",
+    "elf_header": "#1a3bff",
+    "program_headers": "#00c814",
+    "section_headers": "#e6e600",
+    "dynamic": "#8b22ee",
+    "symbols": "#ff9d00",
+    "notes": "#00bcbc",
+}
+
+# Greys cycled through consecutive sections so neighbours stay distinguishable.
+SECTION_GREYS = ["#e4e4e4", "#c6c6c6", "#a9a9a9", "#8d8d8d"]
+
+
+def _byteplot_plane(data, cols, max_rows):
+    """Build the byteplot grid.
+
+    Returns (plane_bytes, rows, bytes_per_cell, mode).
+
+    When one cell maps to exactly one byte the plane is a stream of class
+    indices ("class" mode) and the browser paints the legend colors directly.
+    For bigger files a cell covers several bytes, so the plane carries blended
+    RGB triples ("rgb" mode): the cell color is the average of its bytes'
+    class colors. Averaging is what preserves texture - picking the majority
+    class instead flattens mixed data into solid blocks.
+    """
+    size = len(data)
+    if size == 0:
+        return b"", 0, 1, "class"
+
+    bytes_per_cell = max(1, math.ceil(size / (cols * max_rows)))
+    rows = math.ceil(size / (bytes_per_cell * cols))
+
+    # Translation table: byte value -> class index, so counting is done in C.
+    table = bytearray(256)
+    for b in range(256):
+        if b == 0x00:
+            table[b] = BYTEPLOT_CLASS_NULL
+        elif b == 0xFF:
+            table[b] = BYTEPLOT_CLASS_FF
+        elif 0x20 <= b <= 0x7E:
+            table[b] = BYTEPLOT_CLASS_VISIBLE
+        elif b < 0x80:
+            table[b] = BYTEPLOT_CLASS_INVISIBLE
+        else:
+            table[b] = BYTEPLOT_CLASS_NONASCII
+    classified = data.translate(bytes(table))
+
+    if bytes_per_cell == 1:
+        # One byte per cell: the classified buffer already is the plane.
+        return classified, rows, 1, "class"
+
+    # Class colors in plane order, used to average a cell's bytes.
+    rgb = [(0, 0, 0)] * 5
+    for entry in BYTEPLOT_LEGEND:
+        h = entry["color"].lstrip("#")
+        rgb[entry["id"]] = (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+    plane = bytearray(rows * cols * 3)
+    class_bytes = [bytes([c]) for c in range(5)]
+    for idx in range(rows * cols):
+        start = idx * bytes_per_cell
+        if start >= size:
+            break
+        chunk = classified[start:start + bytes_per_cell]
+        n = len(chunk)
+        r = g = b = 0
+        for cls in range(5):
+            count = chunk.count(class_bytes[cls])
+            if count:
+                cr, cg, cb = rgb[cls]
+                r += cr * count
+                g += cg * count
+                b += cb * count
+        p = idx * 3
+        plane[p] = r // n
+        plane[p + 1] = g // n
+        plane[p + 2] = b // n
+
+    return bytes(plane), rows, bytes_per_cell, "rgb"
+
+
+def _entropy_plane(data, rows, cols, min_window=64):
+    """Local Shannon entropy per cell, scaled to 0..255 (1.0 == 8 bits/byte).
+
+    Cells covering fewer than min_window bytes are widened with surrounding
+    bytes, so a short block still yields a meaningful value instead of noise.
+    """
+    from collections import Counter
+
+    size = len(data)
+    total_cells = rows * cols
+    if size == 0 or total_cells == 0:
+        return b""
+
+    cell_bytes = size / total_cells
+    plane = bytearray(total_cells)
+    log2 = math.log2
+
+    for idx in range(total_cells):
+        start = int(idx * cell_bytes)
+        end = int((idx + 1) * cell_bytes)
+        if end <= start:
+            end = start + 1
+        if end - start < min_window:
+            # Widen symmetrically around the cell, clamped to the file.
+            pad = (min_window - (end - start)) // 2
+            start = max(0, start - pad)
+            end = min(size, start + min_window)
+            start = max(0, end - min_window)
+        chunk = data[start:end]
+        if not chunk:
+            continue
+        length = len(chunk)
+        entropy = 0.0
+        for count in Counter(chunk).values():
+            p = count / length
+            entropy -= p * log2(p)
+        plane[idx] = min(255, int(entropy / 8.0 * 255))
+
+    return bytes(plane)
+
+
+def _clip_region(offset, size, file_size):
+    """Clamp a region to the real file bounds; return None when it is outside."""
+    if offset is None or size is None:
+        return None
+    try:
+        offset, size = int(offset), int(size)
+    except (TypeError, ValueError):
+        return None
+    if size <= 0 or offset < 0 or offset >= file_size:
+        return None
+    return offset, min(size, file_size - offset)
+
+
+def _region(name, kind, offset, size, file_size, color=None, detail=None, priority=0):
+    """Build a structure region entry, or None when it does not fit the file."""
+    clipped = _clip_region(offset, size, file_size)
+    if not clipped:
+        return None
+    offset, size = clipped
+    return {
+        "name": name,
+        "kind": kind,
+        "offset": offset,
+        "size": size,
+        "end": offset + size,
+        "color": color or STRUCT_COLORS.get(kind, "#9ca3af"),
+        "detail": detail or {},
+        # Higher priority regions are painted last (on top of enclosing ones).
+        "priority": priority,
+    }
+
+
+def _pe_structure_regions(pe, data):
+    """Map PE headers, sections, data directories and overlay onto file offsets."""
+    import pefile
+
+    file_size = len(data)
+    regions = []
+
+    def add(*args, **kwargs):
+        r = _region(*args, **kwargs)
+        if r:
+            regions.append(r)
+
+    e_lfanew = pe.DOS_HEADER.e_lfanew
+    add("MSDOS Header", "msdos", 0, min(64, e_lfanew or 64), file_size)
+    if e_lfanew > 64:
+        add("DOS Stub", "dos_stub", 64, e_lfanew - 64, file_size,
+            detail={"note": "DOS stub / rich header area"})
+
+    # PE signature + COFF file header.
+    coff_size = 4 + 20
+    add("COFF File Header", "coff", e_lfanew, coff_size, file_size, detail={
+        "machine": hex(pe.FILE_HEADER.Machine),
+        "sections": pe.FILE_HEADER.NumberOfSections,
+    })
+
+    opt_offset = e_lfanew + coff_size
+    opt_size = pe.FILE_HEADER.SizeOfOptionalHeader
+    add("Optional Header", "optional", opt_offset, opt_size, file_size, detail={
+        "magic": hex(pe.OPTIONAL_HEADER.Magic),
+        "entry_point_rva": hex(pe.OPTIONAL_HEADER.AddressOfEntryPoint),
+    })
+
+    table_offset = opt_offset + opt_size
+    add("Section Table", "section_table", table_offset,
+        pe.FILE_HEADER.NumberOfSections * 40, file_size,
+        detail={"entries": pe.FILE_HEADER.NumberOfSections})
+
+    # Sections (raw data on disk).
+    end_of_sections = 0
+    for i, section in enumerate(pe.sections):
+        name = section.Name.decode("utf-8", errors="replace").rstrip("\x00") or f"section{i}"
+        raw_off, raw_size = section.PointerToRawData, section.SizeOfRawData
+        perms = "".join([
+            "R" if section.Characteristics & 0x40000000 else "-",
+            "W" if section.Characteristics & 0x80000000 else "-",
+            "X" if section.Characteristics & 0x20000000 else "-",
+        ])
+        add(name, "section", raw_off, raw_size, file_size,
+            color=SECTION_GREYS[i % len(SECTION_GREYS)],
+            detail={
+                "virtual_address": hex(section.VirtualAddress),
+                "virtual_size": section.Misc_VirtualSize,
+                "raw_size": raw_size,
+                "permissions": perms,
+                "entropy": round(calculate_entropy(section.get_data()), 3),
+            })
+        if raw_size:
+            end_of_sections = max(end_of_sections, raw_off + raw_size)
+
+    # Data directories, translated from RVA to raw file offsets.
+    dir_map = [
+        ("IMAGE_DIRECTORY_ENTRY_EXPORT", "Exports", "exports"),
+        ("IMAGE_DIRECTORY_ENTRY_IMPORT", "Imports", "imports"),
+        ("IMAGE_DIRECTORY_ENTRY_RESOURCE", "Resources", "resources"),
+        ("IMAGE_DIRECTORY_ENTRY_EXCEPTION", "Exception Table", "exception"),
+        ("IMAGE_DIRECTORY_ENTRY_BASERELOC", "Relocations", "relocations"),
+        ("IMAGE_DIRECTORY_ENTRY_DEBUG", "Debug Info", "debug"),
+        ("IMAGE_DIRECTORY_ENTRY_TLS", "TLS Directory", "tls"),
+        ("IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG", "Load Config", "load_config"),
+        ("IMAGE_DIRECTORY_ENTRY_IAT", "Import Address Table", "iat"),
+        ("IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT", "Delay Imports", "delay_imports"),
+    ]
+    for entry_name, label, kind in dir_map:
+        try:
+            idx = pefile.DIRECTORY_ENTRY[entry_name]
+            d = pe.OPTIONAL_HEADER.DATA_DIRECTORY[idx]
+            if not d.VirtualAddress or not d.Size:
+                continue
+            offset = pe.get_offset_from_rva(d.VirtualAddress)
+            add(label, kind, offset, d.Size, file_size, priority=2,
+                detail={"rva": hex(d.VirtualAddress), "size": d.Size})
+        except Exception:
+            continue
+
+    # The certificate table is stored as a raw file offset, not an RVA.
+    try:
+        idx = pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_SECURITY"]
+        d = pe.OPTIONAL_HEADER.DATA_DIRECTORY[idx]
+        if d.VirtualAddress and d.Size:
+            add("Certificate Table", "certificate", d.VirtualAddress, d.Size, file_size,
+                priority=2, detail={"file_offset": hex(d.VirtualAddress), "size": d.Size})
+    except Exception:
+        pass
+
+    # Entry point marker (small but always visible).
+    try:
+        ep_rva = pe.OPTIONAL_HEADER.AddressOfEntryPoint
+        if ep_rva:
+            ep_offset = pe.get_offset_from_rva(ep_rva)
+            ep_section = ""
+            for section in pe.sections:
+                if section.contains_rva(ep_rva):
+                    ep_section = section.Name.decode("utf-8", errors="replace").rstrip("\x00")
+                    break
+            add("Entry Point", "entry_point", ep_offset, 16, file_size, priority=5,
+                detail={"rva": hex(ep_rva), "file_offset": hex(ep_offset), "section": ep_section})
+    except Exception:
+        pass
+
+    # Overlay: everything appended behind the last section.
+    if end_of_sections and end_of_sections < file_size:
+        overlay_size = file_size - end_of_sections
+        add("Overlay", "overlay", end_of_sections, overlay_size, file_size, priority=1,
+            detail={
+                "size": overlay_size,
+                "entropy": round(calculate_entropy(data[end_of_sections:]), 3),
+            })
+
+    return regions
+
+
+def _elf_structure_regions(data):
+    """Map ELF header, program/section headers and sections onto file offsets."""
+    file_size = len(data)
+    if file_size < 16 or data[:4] != b"\x7fELF":
+        return []
+
+    is_64 = data[4] == 2
+    endian = "<" if data[5] == 1 else ">"
+    regions = []
+
+    def add(*args, **kwargs):
+        r = _region(*args, **kwargs)
+        if r:
+            regions.append(r)
+
+    try:
+        if is_64:
+            hdr = struct.unpack(f"{endian}HHI QQQ I HHHHHH", data[16:64])
+        else:
+            hdr = struct.unpack(f"{endian}HHI III I HHHHHH", data[16:52])
+    except struct.error:
+        return []
+
+    (_e_type, _e_machine, _e_version, e_entry, e_phoff, e_shoff,
+     _e_flags, e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx) = hdr
+
+    add("ELF Header", "elf_header", 0, e_ehsize or (64 if is_64 else 52), file_size)
+    if e_phoff:
+        add("Program Headers", "program_headers", e_phoff, e_phnum * e_phentsize, file_size,
+            detail={"entries": e_phnum})
+    if e_shoff:
+        add("Section Headers", "section_headers", e_shoff, e_shnum * e_shentsize, file_size,
+            detail={"entries": e_shnum})
+
+    sh_fmt = f"{endian}IIQQQQIIQQ" if is_64 else f"{endian}IIIIIIIIII"
+    sh_len = 64 if is_64 else 40
+
+    # Section header string table, needed for section names.
+    shstrtab = b""
+    if e_shoff and e_shstrndx < e_shnum:
+        try:
+            off = e_shoff + e_shstrndx * e_shentsize
+            entry = struct.unpack(sh_fmt, data[off:off + sh_len])
+            if entry[4] + entry[5] <= file_size:
+                shstrtab = data[entry[4]:entry[4] + entry[5]]
+        except struct.error:
+            pass
+
+    def shname(name_off):
+        if name_off >= len(shstrtab):
+            return ""
+        end = shstrtab.find(b"\x00", name_off)
+        if end == -1:
+            end = len(shstrtab)
+        return shstrtab[name_off:end].decode("utf-8", errors="replace")
+
+    # Sections that get their own color instead of the grey cycle.
+    special = {
+        ".dynamic": "dynamic", ".dynsym": "symbols", ".dynstr": "symbols",
+        ".symtab": "symbols", ".strtab": "symbols",
+        ".note.ABI-tag": "notes", ".note.gnu.build-id": "notes",
+        ".rela.dyn": "relocations", ".rela.plt": "relocations",
+        ".rel.dyn": "relocations", ".rel.plt": "relocations",
+    }
+
+    grey_idx = 0
+    sections = []
+    for i in range(e_shnum):
+        off = e_shoff + i * e_shentsize
+        if off + sh_len > file_size:
+            break
+        try:
+            sh = struct.unpack(sh_fmt, data[off:off + sh_len])
+        except struct.error:
+            break
+        sh_name, sh_type, sh_flags, sh_addr, sh_offset, sh_size = sh[0], sh[1], sh[2], sh[3], sh[4], sh[5]
+        name = shname(sh_name)
+        sections.append({"name": name, "addr": sh_addr, "offset": sh_offset, "size": sh_size})
+        # SHT_NULL has no content, SHT_NOBITS (.bss) occupies no file space.
+        if sh_type in (0, 8) or sh_size == 0:
+            continue
+        perms = "".join([
+            "A" if sh_flags & 0x2 else "-",
+            "W" if sh_flags & 0x1 else "-",
+            "X" if sh_flags & 0x4 else "-",
+        ])
+        kind = special.get(name)
+        if kind:
+            color = None
+        else:
+            kind = "section"
+            color = SECTION_GREYS[grey_idx % len(SECTION_GREYS)]
+            grey_idx += 1
+        if name.startswith(".debug"):
+            kind, color = "debug", None
+        add(name or f"section{i}", kind, sh_offset, sh_size, file_size, color=color, detail={
+            "address": hex(sh_addr),
+            "size": sh_size,
+            "flags": perms,
+            "entropy": round(calculate_entropy(data[sh_offset:sh_offset + sh_size]), 3),
+        })
+
+    # Entry point: translate the virtual address through its containing section.
+    if e_entry:
+        for sec in sections:
+            if sec["addr"] and sec["addr"] <= e_entry < sec["addr"] + sec["size"]:
+                ep_offset = sec["offset"] + (e_entry - sec["addr"])
+                add("Entry Point", "entry_point", ep_offset, 16, file_size, priority=5, detail={
+                    "virtual_address": hex(e_entry),
+                    "file_offset": hex(ep_offset),
+                    "section": sec["name"],
+                })
+                break
+
+    return regions
+
+
+def _pe_import_tree(pe):
+    """DLL -> function tree for the import graph, with suspicious APIs tagged."""
+    tree = []
+    if not hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):
+        return tree
+
+    # Flatten the suspicious API catalog once for quick lookups.
+    api_category = {}
+    for category, api_list in SUSPICIOUS_IMPORTS.items():
+        for api in api_list:
+            api_category[api] = category
+
+    for entry in pe.DIRECTORY_ENTRY_IMPORT:
+        dll = entry.dll.decode("utf-8", errors="replace") if entry.dll else "?"
+        funcs = []
+        suspicious = 0
+        for imp in entry.imports:
+            name = imp.name.decode("utf-8", errors="replace") if imp.name else f"Ordinal_{imp.ordinal}"
+            category = api_category.get(name)
+            if category:
+                suspicious += 1
+            funcs.append({
+                "name": name,
+                "address": hex(imp.address) if imp.address else None,
+                "category": category,
+            })
+        funcs.sort(key=lambda f: (f["category"] is None, f["name"].lower()))
+        tree.append({
+            "dll": dll,
+            "count": len(funcs),
+            "suspicious_count": suspicious,
+            "functions": funcs[:400],
+        })
+
+    tree.sort(key=lambda d: (-d["suspicious_count"], d["dll"].lower()))
+    return tree
+
+
+def _pe_export_tree(pe):
+    """Exported symbols, grouped under the reported DLL name."""
+    if not hasattr(pe, "DIRECTORY_ENTRY_EXPORT"):
+        return None
+    exp_dir = pe.DIRECTORY_ENTRY_EXPORT
+    dll_name = ""
+    try:
+        if exp_dir.name:
+            dll_name = exp_dir.name.decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    symbols = []
+    for exp in exp_dir.symbols:
+        name = exp.name.decode("utf-8", errors="replace") if exp.name else f"Ordinal_{exp.ordinal}"
+        symbols.append({
+            "name": name,
+            "ordinal": exp.ordinal,
+            "address": hex(exp.address) if exp.address else None,
+        })
+    symbols.sort(key=lambda s: s["name"].lower())
+    return {
+        "dll": dll_name or "(this image)",
+        "count": len(symbols),
+        "functions": symbols[:400],
+    }
+
+
+def _elf_symbol_trees(data):
+    """Needed libraries and dynamic symbols for the ELF import/export graph.
+
+    ELF does not record which library a symbol comes from, so imports are
+    grouped as 'undefined dynamic symbols' with the DT_NEEDED list alongside.
+    """
+    file_size = len(data)
+    if file_size < 64 or data[:4] != b"\x7fELF":
+        return [], None
+
+    is_64 = data[4] == 2
+    endian = "<" if data[5] == 1 else ">"
+    try:
+        if is_64:
+            hdr = struct.unpack(f"{endian}HHI QQQ I HHHHHH", data[16:64])
+        else:
+            hdr = struct.unpack(f"{endian}HHI III I HHHHHH", data[16:52])
+    except struct.error:
+        return [], None
+
+    e_shoff, e_shentsize, e_shnum, e_shstrndx = hdr[5], hdr[10], hdr[11], hdr[12]
+    sh_fmt = f"{endian}IIQQQQIIQQ" if is_64 else f"{endian}IIIIIIIIII"
+    sh_len = 64 if is_64 else 40
+
+    shstrtab = b""
+    if e_shoff and e_shstrndx < e_shnum:
+        try:
+            off = e_shoff + e_shstrndx * e_shentsize
+            entry = struct.unpack(sh_fmt, data[off:off + sh_len])
+            if entry[4] + entry[5] <= file_size:
+                shstrtab = data[entry[4]:entry[4] + entry[5]]
+        except struct.error:
+            pass
+
+    def cstr(buf, offset):
+        if offset >= len(buf):
+            return ""
+        end = buf.find(b"\x00", offset)
+        if end == -1:
+            end = len(buf)
+        return buf[offset:end].decode("utf-8", errors="replace")
+
+    named = {}
+    for i in range(e_shnum):
+        off = e_shoff + i * e_shentsize
+        if off + sh_len > file_size:
+            break
+        try:
+            sh = struct.unpack(sh_fmt, data[off:off + sh_len])
+        except struct.error:
+            break
+        named[cstr(shstrtab, sh[0])] = {"offset": sh[4], "size": sh[5], "entsize": sh[9]}
+
+    dynstr = b""
+    if ".dynstr" in named:
+        s = named[".dynstr"]
+        if s["offset"] + s["size"] <= file_size:
+            dynstr = data[s["offset"]:s["offset"] + s["size"]]
+
+    # DT_NEEDED entries from .dynamic
+    needed = []
+    if ".dynamic" in named and dynstr:
+        s = named[".dynamic"]
+        ent = 16 if is_64 else 8
+        fmt = f"{endian}qQ" if is_64 else f"{endian}iI"
+        pos = s["offset"]
+        end = min(s["offset"] + s["size"], file_size)
+        while pos + ent <= end:
+            try:
+                d_tag, d_val = struct.unpack(fmt, data[pos:pos + ent])
+            except struct.error:
+                break
+            if d_tag == 0:  # DT_NULL
+                break
+            if d_tag == 1:  # DT_NEEDED
+                needed.append(cstr(dynstr, d_val))
+            pos += ent
+
+    # Dynamic symbols, split into undefined (imports) and defined (exports).
+    imports, exports = [], []
+    if ".dynsym" in named and dynstr:
+        s = named[".dynsym"]
+        ent = s["entsize"] or (24 if is_64 else 16)
+        count = s["size"] // ent if ent else 0
+        for i in range(min(count, 2000)):
+            off = s["offset"] + i * ent
+            if off + ent > file_size:
+                break
+            try:
+                if is_64:
+                    st_name, st_info, _st_other, st_shndx, st_value, _st_size = struct.unpack(
+                        f"{endian}IBBHQQ", data[off:off + 24])
+                else:
+                    st_name, st_value, _st_size, st_info, _st_other, st_shndx = struct.unpack(
+                        f"{endian}IIIBBH", data[off:off + 16])
+            except struct.error:
+                break
+            name = cstr(dynstr, st_name)
+            if not name:
+                continue
+            sym_type = {1: "OBJECT", 2: "FUNC", 6: "TLS"}.get(st_info & 0xF, "OTHER")
+            if st_shndx == 0:  # SHN_UNDEF -> resolved at load time
+                imports.append({"name": name, "category": None, "address": None, "type": sym_type})
+            else:
+                exports.append({"name": name, "ordinal": i, "address": hex(st_value), "type": sym_type})
+
+    # Tag imported symbols that match the suspicious API catalog.
+    api_category = {}
+    for category, api_list in SUSPICIOUS_IMPORTS.items():
+        for api in api_list:
+            api_category[api] = category
+    for sym in imports:
+        sym["category"] = api_category.get(sym["name"])
+
+    import_tree = []
+    for lib in needed:
+        import_tree.append({
+            "dll": lib,
+            "count": 0,
+            "suspicious_count": 0,
+            "functions": [],
+            "note": "DT_NEEDED (symbol attribution not recorded in ELF)",
+        })
+    if imports:
+        imports.sort(key=lambda f: (f["category"] is None, f["name"].lower()))
+        import_tree.insert(0, {
+            "dll": "undefined dynamic symbols",
+            "count": len(imports),
+            "suspicious_count": len([s for s in imports if s["category"]]),
+            "functions": imports[:400],
+        })
+
+    export_tree = None
+    if exports:
+        exports.sort(key=lambda s: s["name"].lower())
+        export_tree = {
+            "dll": ".dynsym (defined symbols)",
+            "count": len(exports),
+            "functions": exports[:400],
+        }
+
+    return import_tree, export_tree
+
+
+@app.route("/api/file/visualize")
+def api_file_visualize():
+    """File map planes (byteplot, entropy, structure) plus import/export trees."""
+    import base64
+
+    filepath = request.args.get("path", "")
+    cols = min(max(request.args.get("cols", 256, type=int), 32), 512)
+    max_rows = min(max(request.args.get("rows", 512, type=int), 64), 1024)
+    entropy_cols = min(max(request.args.get("entropy_cols", 96, type=int), 4), 256)
+
+    if not filepath:
+        return jsonify({"error": "No path specified"}), 400
+
+    norm_path = os.path.normpath(filepath)
+    if not os.path.isfile(norm_path):
+        return jsonify({"error": _quarantine_hint(norm_path, "File not found")}), 404
+
+    try:
+        with open(norm_path, "rb") as f:
+            data = f.read(VISUALIZE_MAX_BYTES + 1)
+    except (IOError, OSError) as e:
+        return jsonify({"error": _quarantine_hint(norm_path, f"Unable to read file: {e}")}), 500
+
+    truncated = len(data) > VISUALIZE_MAX_BYTES
+    if truncated:
+        data = data[:VISUALIZE_MAX_BYTES]
+
+    if not data:
+        return jsonify({"error": "File is empty"}), 400
+
+    # --- Format detection + structure mapping ---
+    fmt, regions, import_tree, export_tree = "raw", [], [], None
+    parse_error = None
+
+    if data[:2] == b"MZ":
+        fmt = "PE"
+        try:
+            import pefile
+            pe = pefile.PE(data=data, fast_load=False)
+            regions = _pe_structure_regions(pe, data)
+            import_tree = _pe_import_tree(pe)
+            export_tree = _pe_export_tree(pe)
+            pe.close()
+        except ImportError:
+            parse_error = "pefile module not installed"
+        except Exception as e:
+            parse_error = f"PE parsing failed: {e}"
+    elif data[:4] == b"\x7fELF":
+        fmt = "ELF"
+        try:
+            regions = _elf_structure_regions(data)
+            import_tree, export_tree = _elf_symbol_trees(data)
+        except Exception as e:
+            parse_error = f"ELF parsing failed: {e}"
+
+    # --- Planes ---
+    byteplot, rows, bytes_per_cell, byteplot_mode = _byteplot_plane(data, cols, max_rows)
+    entropy = _entropy_plane(data, rows, entropy_cols)
+
+    # Legend entries for the structure column, deduplicated in paint order.
+    # The offset lets the UI jump straight to a region from the legend.
+    struct_legend, seen = [], set()
+    for r in sorted(regions, key=lambda x: (x["priority"], x["offset"])):
+        key = (r["name"], r["color"])
+        if key in seen:
+            continue
+        seen.add(key)
+        struct_legend.append({
+            "label": r["name"],
+            "color": r["color"],
+            "kind": r["kind"],
+            "offset": r["offset"],
+        })
+
+    return jsonify({
+        "format": fmt,
+        "path": filepath,
+        "filename": os.path.basename(norm_path),
+        "file_size": len(data),
+        "truncated": truncated,
+        "rows": rows,
+        "cols": cols,
+        "bytes_per_cell": bytes_per_cell,
+        "entropy_cols": entropy_cols,
+        "byteplot": base64.b64encode(byteplot).decode("ascii"),
+        "byteplot_mode": byteplot_mode,
+        "entropy": base64.b64encode(entropy).decode("ascii"),
+        "total_entropy": round(calculate_entropy(data), 3),
+        "regions": sorted(regions, key=lambda r: (r["priority"], r["offset"])),
+        "import_tree": import_tree,
+        "export_tree": export_tree,
+        "legend": {
+            "byteplot": BYTEPLOT_LEGEND,
+            "entropy": ENTROPY_LEGEND,
+            "structure": struct_legend,
+        },
+        "parse_error": parse_error,
+    })
 
 
 # --- Main ---

@@ -6565,3 +6565,559 @@ option.etw-ch-inactive { color: #94a3b8; }
 }
 .capa-cap-attack { color: var(--accent-purple); }
 .capa-cap-mbc { color: var(--accent-yellow); }
+
+/* =============================================
+   PORTEX-STYLE FILE MAP
+   Byteplot / entropy / structure planes, legend,
+   hex editor minimap and import/export trees.
+   ============================================= */
+
+/* --- Shared canvas + tooltip --- */
+.fmap-canvas {
+    display: block;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    background: #0b1120;
+    border: 1px solid var(--border-primary);
+    cursor: crosshair;
+}
+
+.fmap-tooltip {
+    position: fixed;
+    z-index: 9999;
+    display: none;
+    max-width: 380px;
+    padding: 8px 10px;
+    background: rgba(8, 12, 20, 0.97);
+    border: 1px solid var(--border-accent);
+    border-radius: var(--radius);
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.6);
+    font-size: 11px;
+    line-height: 1.5;
+    pointer-events: none;
+}
+.fmap-tooltip.visible { display: block; }
+.fmap-tip-off {
+    font-weight: 700;
+    color: var(--accent-cyan);
+    margin-bottom: 2px;
+}
+.fmap-tip-region {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-primary);
+    font-weight: 600;
+}
+.fmap-tip-dim { color: var(--text-muted); font-weight: 400; }
+.fmap-tip-detail {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 10px;
+    margin-top: 3px;
+}
+.fmap-tip-kv { color: var(--text-secondary); font-size: 10px; }
+.fmap-tip-hint {
+    margin-top: 5px;
+    padding-top: 4px;
+    border-top: 1px solid var(--border-primary);
+    color: var(--text-dim);
+    font-size: 10px;
+}
+.fmap-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    flex: 0 0 auto;
+}
+
+/* --- Vertical (standalone) view --- */
+.fmap-view {
+    display: flex;
+    gap: 24px;
+    align-items: flex-start;
+    padding: 14px;
+    background: #05070d;
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+    overflow-x: auto;
+}
+.fmap-planes { display: flex; gap: 2px; }
+.fmap-plane { display: flex; flex-direction: column; gap: 4px; }
+.fmap-plane-label {
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+}
+
+/* --- Legend --- */
+.fmap-legend {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    min-width: 190px;
+    padding-top: 18px;
+}
+.fmap-legend-group { display: flex; flex-direction: column; gap: 3px; }
+.fmap-legend-title {
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    padding-bottom: 3px;
+    margin-bottom: 2px;
+    border-bottom: 1px solid var(--border-primary);
+}
+.fmap-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 11px;
+    color: var(--text-primary);
+}
+.fmap-legend-swatch {
+    width: 11px;
+    height: 11px;
+    border-radius: 2px;
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    flex: 0 0 auto;
+}
+/* Inline variant sits below the strip and wraps horizontally */
+.fmap-legend-inline {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 10px 26px;
+    min-width: 0;
+    padding: 10px 2px 2px;
+}
+.fmap-legend-inline .fmap-legend-group { max-width: 230px; }
+
+/* --- Horizontal strip (minimap + inline) --- */
+.fmap-strip { position: relative; width: 100%; }
+.fmap-strip-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 2px;
+}
+.fmap-strip-label {
+    width: 58px;
+    flex: 0 0 58px;
+    font-size: 9px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    text-align: right;
+}
+.fmap-strip-canvas { width: 100%; height: 16px; flex: 1 1 auto; min-width: 0; }
+.fmap-strip-names {
+    position: relative;
+    height: 16px;
+    margin-left: 66px;
+    overflow: hidden;
+}
+.fmap-strip-name {
+    position: absolute;
+    top: 0;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 9px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    padding-left: 2px;
+    cursor: pointer;
+}
+.fmap-strip-name:hover { color: var(--accent-cyan); }
+.fmap-legend-jump { cursor: pointer; }
+.fmap-legend-jump:hover { color: var(--accent-cyan); }
+.fmap-strip-viewport {
+    position: absolute;
+    top: 0;
+    bottom: 16px;
+    display: none;
+    margin-left: 66px;
+    background: rgba(34, 211, 238, 0.16);
+    border-left: 1px solid var(--accent-cyan);
+    border-right: 1px solid var(--accent-cyan);
+    pointer-events: none;
+}
+.fmap-strip-viewport.visible { display: block; }
+
+/* --- Hex editor minimap --- */
+.hex-minimap-wrap {
+    display: none;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border-primary);
+    background: var(--bg-secondary);
+}
+.hex-minimap.visible { display: block; }
+.hex-minimap-wrap:has(.hex-minimap.visible) { display: block; }
+.hex-minimap-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+}
+.hex-minimap-title {
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    color: var(--text-secondary);
+}
+.hex-minimap-info {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 10px;
+    color: var(--text-muted);
+}
+.hex-minimap { display: none; position: relative; }
+
+/* --- Inline map inside the PE/ELF panels --- */
+.fmap-inline {
+    margin: 12px 0;
+    padding: 12px;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+}
+.fmap-inline-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+}
+.fmap-inline-body { min-height: 60px; }
+.fmap-inline-wait { font-size: 11px; color: var(--text-muted); }
+.fmap-inline-trees { margin-top: 10px; }
+.fmap-inline-trees > summary { cursor: pointer; }
+
+/* --- FileMap tab --- */
+.filemap-drop-zone { margin-bottom: 12px; }
+.filemap-container { display: flex; flex-direction: column; gap: 12px; }
+.filemap-body { min-height: 200px; }
+.filemap-empty {
+    padding: 40px;
+    text-align: center;
+    color: var(--text-muted);
+    border: 1px dashed var(--border-dashed);
+    border-radius: var(--radius);
+}
+.filemap-ctl {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+}
+.filemap-trees { padding-bottom: 20px; }
+
+/* --- Import / export trees --- */
+.fmap-trees {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+    gap: 14px;
+}
+.fmap-tree {
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+    padding: 10px 12px;
+}
+.fmap-tree-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding-bottom: 7px;
+    margin-bottom: 7px;
+    border-bottom: 1px solid var(--border-primary);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-primary);
+}
+.fmap-tree-meta {
+    font-size: 10px;
+    font-weight: 400;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--text-muted);
+}
+.fmap-susp { color: var(--accent-orange); font-weight: 600; }
+.fmap-tree-empty { font-size: 11px; color: var(--text-muted); padding: 10px 0; }
+.fmap-node { border-left: 1px solid var(--border-primary); margin-left: 3px; }
+.fmap-node-head {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    padding: 4px 6px;
+    cursor: pointer;
+    list-style: none;
+    font-size: 11px;
+}
+.fmap-node-head::-webkit-details-marker { display: none; }
+.fmap-node-head:hover { background: var(--bg-card-hover); }
+.fmap-node-icon {
+    color: var(--text-dim);
+    font-size: 9px;
+    transition: transform 0.12s ease;
+}
+.fmap-node[open] > .fmap-node-head .fmap-node-icon { transform: rotate(90deg); }
+.fmap-node-name { color: var(--accent-cyan); font-weight: 600; }
+.fmap-node-count {
+    font-size: 10px;
+    color: var(--text-muted);
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 8px;
+    padding: 0 7px;
+}
+.fmap-node-susp {
+    font-size: 10px;
+    color: var(--accent-orange);
+    border: 1px solid var(--accent-orange);
+    border-radius: 8px;
+    padding: 0 6px;
+}
+.fmap-node-note {
+    font-size: 10px;
+    color: var(--text-dim);
+    padding: 2px 6px 6px 22px;
+}
+.fmap-leaves {
+    display: flex;
+    flex-direction: column;
+    max-height: 280px;
+    overflow-y: auto;
+    padding: 2px 0 4px 18px;
+}
+.fmap-leaf {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 6px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    border-left: 1px solid transparent;
+}
+.fmap-leaf:hover { background: rgba(255, 255, 255, 0.03); }
+.fmap-leaf.suspicious {
+    color: var(--accent-orange);
+    border-left-color: var(--accent-orange);
+}
+.fmap-leaf-tag {
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--accent-orange);
+    border: 1px solid rgba(249, 115, 22, 0.5);
+    border-radius: 7px;
+    padding: 0 5px;
+}
+.fmap-leaf-dim { font-size: 9px; color: var(--text-dim); margin-left: auto; }
+
+/* =============================================
+   LIVE-MEMORY TOOLS (Aether / Process Dump)
+   ============================================= */
+
+.mem-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+}
+.mem-warn-inline {
+    font-size: 10px;
+    color: var(--accent-yellow);
+}
+.mem-result:empty { display: none; }
+
+/* Severity accents shared by chips, findings and dump kinds */
+.sev-critical { color: var(--severity-critical); border-color: rgba(239, 68, 68, 0.55) !important; }
+.sev-high     { color: var(--severity-high);     border-color: rgba(249, 115, 22, 0.55) !important; }
+.sev-medium   { color: var(--severity-medium);   border-color: rgba(234, 179, 8, 0.55) !important; }
+.sev-low      { color: var(--severity-low);      border-color: rgba(34, 197, 94, 0.55) !important; }
+.sev-info     { color: var(--text-secondary);    border-color: var(--border-primary) !important; }
+
+.mem-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 6px 0 10px;
+}
+.mem-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 8px;
+    font-size: 10px;
+    color: var(--text-secondary);
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border-primary);
+    border-radius: 10px;
+}
+.mem-chip-val { font-weight: 700; }
+.mem-mitre { color: var(--accent-purple); }
+
+.mem-section-label {
+    margin: 12px 0 5px;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+}
+.mem-foot-inline {
+    margin-left: 8px;
+    text-transform: none;
+    letter-spacing: 0;
+    color: var(--text-dim);
+}
+
+.mem-finding {
+    padding: 7px 9px;
+    margin-bottom: 5px;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid var(--border-primary);
+    border-left-width: 2px;
+    border-radius: var(--radius);
+}
+.mem-finding.sev-critical { border-left-color: var(--severity-critical); }
+.mem-finding.sev-high     { border-left-color: var(--severity-high); }
+.mem-finding.sev-medium   { border-left-color: var(--severity-medium); }
+.mem-finding.sev-info     { border-left-color: var(--border-accent); }
+.mem-finding-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 3px;
+}
+.mem-sev {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+}
+.mem-type {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+.mem-addr {
+    font-size: 10px;
+    color: var(--accent-cyan);
+}
+.mem-size { font-size: 10px; color: var(--text-muted); }
+.mem-desc {
+    font-size: 11px;
+    color: var(--text-secondary);
+    line-height: 1.45;
+}
+.mem-evidence {
+    margin-top: 4px;
+    padding: 5px 7px;
+    font-size: 10px;
+    color: var(--text-muted);
+    white-space: pre-wrap;
+    background: rgba(0, 0, 0, 0.25);
+    border-radius: 3px;
+}
+.mem-kv { margin-top: 3px; font-size: 10px; color: var(--text-dim); }
+.mem-pattern { color: var(--accent-orange); }
+.mem-foot { margin-top: 8px; font-size: 10px; color: var(--text-dim); }
+
+/* Dumped-file table */
+.mem-dump-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+}
+.mem-dump-table th {
+    padding: 4px 6px;
+    font-size: 9px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    text-align: left;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border-primary);
+}
+.mem-dump-table td {
+    padding: 4px 6px;
+    border-bottom: 1px solid rgba(26, 39, 68, 0.5);
+    vertical-align: middle;
+}
+.mem-dump-name {
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+}
+.mem-dump-actions { white-space: nowrap; }
+.mem-dump-actions .btn { margin-left: 4px; }
+
+/* Live-memory panel in the ThreatScan tab */
+.scanner-livemem {
+    margin-top: 18px;
+    padding: 12px 14px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+}
+.scanner-livemem .scanner-history-header { margin-bottom: 8px; }
+.scanner-livemem .mem-result { margin-top: 10px; }
+
+/* Scored memory evidence */
+.mem-verdict {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    padding: 7px 10px;
+    margin-bottom: 8px;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border-primary);
+    border-left-width: 3px;
+    border-radius: var(--radius);
+}
+.mem-verdict.sev-critical { border-left-color: var(--severity-critical); }
+.mem-verdict.sev-high     { border-left-color: var(--severity-high); }
+.mem-verdict.sev-low      { border-left-color: var(--severity-low); }
+.mem-verdict-label {
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+}
+.mem-verdict-score { font-size: 11px; color: var(--text-secondary); }
+.mem-score {
+    min-width: 34px;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--accent-cyan);
+}
+.mem-suppressed {
+    margin-top: 8px;
+    padding: 6px 8px;
+    background: rgba(0, 0, 0, 0.2);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+}
+.mem-suppressed > summary {
+    cursor: pointer;
+    font-size: 10px;
+    color: var(--text-muted);
+}
+.mem-note {
+    padding: 6px 9px;
+    margin-bottom: 8px;
+    font-size: 11px;
+    color: var(--accent-yellow);
+    background: rgba(234, 179, 8, 0.08);
+    border: 1px solid rgba(234, 179, 8, 0.35);
+    border-radius: var(--radius);
+}

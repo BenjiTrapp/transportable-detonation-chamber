@@ -50,6 +50,8 @@ let state = {
     serviceStatus: {},
     emberStatus: null,
     capaStatus: null,
+    aetherStatus: null,
+    processDumpStatus: null,
     rustinelInfo: null,
     // RTRACE Console state
     rtraceSelectedPid: null,
@@ -117,6 +119,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initUpload();
     initHexDropZone();
     initHexResizeHandle();
+    initFileMapDropZone();
     initThreatScan();
     initGraphControls();
     initRtraceTabs();
@@ -165,6 +168,9 @@ function switchTab(tabName) {
     if (tabName === 'threatscan') {
         loadScanToolStatus();
     }
+    if (tabName === 'filemap') {
+        initFileMapTab();
+    }
 }
 
 // Fetch scanner/EMBER tool availability and update badges + dashboard state.
@@ -174,6 +180,12 @@ async function loadScanToolStatus() {
         const data = await resp.json();
         state.emberStatus = data.ember || null;
         state.capaStatus = data.capa || null;
+        // Live-memory tools are PID-based, so they are surfaced in the process
+        // detail view rather than the file-oriented ThreatScan tab.
+        state.aetherStatus = data.aether || null;
+        state.processDumpStatus = data.process_dump || null;
+        if (typeof updateLiveMemStatus === 'function') updateLiveMemStatus();
+        if (typeof memoryBaselineStatus === 'function') memoryBaselineStatus();
 
         const tc = !!(data.threatcheck && data.threatcheck.installed);
         const dc = !!(data.defendercheck && data.defendercheck.installed);
@@ -2015,6 +2027,8 @@ async function hexUploadFile(file) {
         document.getElementById('hex-status-offset').textContent = `Offset: 0x00000000`;
         document.getElementById('hex-inspector').classList.add('visible');
 
+        // Structure minimap for the freshly uploaded file
+        hexRenderMinimap();
     } catch (e) {
         fileInfo.innerHTML = `<span class="hex-info-item" style="color:var(--accent-red);">Upload failed: ${escapeHtml(e.message)}</span>`;
         zone.classList.remove('loading');
@@ -2082,6 +2096,15 @@ async function hexLoad() {
 
         // Show inspector
         document.getElementById('hex-inspector').classList.add('visible');
+
+        // Structure minimap: render once per file, then just move the viewport
+        const minimap = document.getElementById('hex-minimap');
+        if (minimap && minimap.dataset.path === filepath) {
+            hexUpdateMinimapViewport();
+        } else {
+            if (minimap) minimap.dataset.path = filepath;
+            hexRenderMinimap();
+        }
 
     } catch (e) {
         document.getElementById('hex-file-info').innerHTML = `<span class="hex-info-item" style="color:var(--accent-red);">Failed: ${escapeHtml(e.message)}</span>`;
@@ -2587,6 +2610,9 @@ function renderPeAnalysis(pe, container) {
         html += renderDetectionOverview(pe.detection, 'pe');
     }
 
+    // --- File map (planes are painted asynchronously below) ---
+    html += fileMapInlineBlock(pe.path);
+
     // --- IOC Flags Banner ---
     if (pe.flags && pe.flags.length > 0) {
         html += '<div class="pe-flags-banner">';
@@ -2746,6 +2772,7 @@ function renderPeAnalysis(pe, container) {
     }
 
     container.innerHTML = html;
+    fileMapInlineMount(pe.path);
 }
 
 async function peInspectSection(idx) {
@@ -2953,6 +2980,9 @@ function renderElfAnalysis(elf, container) {
         html += renderDetectionOverview(elf.detection, 'elf');
     }
 
+    // --- File map (planes are painted asynchronously below) ---
+    html += fileMapInlineBlock(elf.path);
+
     // --- IOC Flags Banner ---
     if (elf.flags && elf.flags.length > 0) {
         html += '<div class="elf-flags-banner">';
@@ -3142,6 +3172,7 @@ function renderElfAnalysis(elf, container) {
     }
 
     container.innerHTML = html;
+    fileMapInlineMount(elf.path);
 }
 
 function elfToggleSection(el) {
@@ -3924,6 +3955,28 @@ function openProcessDetail(pid) {
         html += `</div>`;
     }
 
+    // Live-memory tools only make sense while the process still exists.
+    html += `<div class="detail-section"><div class="detail-section-title">LIVE MEMORY</div>`;
+    if (hasExited) {
+        html += `<div class="muted" style="font-size:11px;">Process has exited — memory scanning and dumping are unavailable.</div>`;
+    } else {
+        const aetherOk = state.aetherStatus ? state.aetherStatus.installed !== false : true;
+        const pdOk = state.processDumpStatus ? state.processDumpStatus.installed !== false : true;
+        html += `<div class="mem-actions">`;
+        html += `<button class="btn btn-sm btn-accent" ${aetherOk ? '' : 'disabled'} `
+            + `onclick="runAetherScan(${proc.pid}, 'proc-mem-result')" `
+            + `title="${aetherOk ? 'Scan this process for injection and implant structures' : 'Aether is not installed on this VM'}">Aether scan</button>`;
+        html += `<button class="btn btn-sm btn-accent" ${pdOk ? '' : 'disabled'} `
+            + `onclick="runProcessDump(${proc.pid}, 'proc-mem-result')" `
+            + `title="${pdOk ? 'Dump this process memory components to disk' : 'Process Dump is not installed on this VM'}">Dump memory</button>`;
+        // Without a baseline every known-good module would be dumped as well.
+        if (pdOk && state.processDumpStatus && state.processDumpStatus.clean_db === false) {
+            html += `<span class="mem-warn-inline">no clean-hash baseline — dumps will include known-good modules</span>`;
+        }
+        html += `</div><div class="mem-result" id="proc-mem-result"></div>`;
+    }
+    html += `</div>`;
+
     setDetailBody(html);
     showDetail();
 }
@@ -4244,15 +4297,29 @@ function renderDetonationResults(data, container) {
         </div>`;
     }
 
-    // Beacon scan stage
+    // Exit-capture stage: dump-on-exit armed before the sample started
+    if (data.exit_capture) {
+        const ec = data.exit_capture;
+        html += `<div class="det-stage ${ec.armed ? 'ok' : 'pending'}" id="det-exitcap-stage">
+            <div class="det-stage-icon">${ec.armed ? '&#x23F3;' : '&#x2796;'}</div>
+            <div class="det-stage-info">
+                <div class="det-stage-title">Exit Capture</div>
+                <div class="det-stage-detail">${ec.armed
+                    ? `Armed for ${escapeHtml(ec.image || '')} (${ec.window}s) — dumps memory the moment it exits`
+                    : escapeHtml(ec.reason || 'Not armed')}</div>
+            </div>
+        </div>`;
+    }
+
+    // Live-memory stage (beacon hunters, Aether, Process Dump)
     if (data.beacon_scan) {
         const ok = data.beacon_scan.triggered;
         const tools = data.beacon_scan.tools ? data.beacon_scan.tools.join(', ') : '';
         html += `<div class="det-stage ${ok ? 'ok' : 'pending'}" id="det-beacon-stage">
             <div class="det-stage-icon">${ok ? '&#x2705;' : '&#x23F3;'}</div>
             <div class="det-stage-info">
-                <div class="det-stage-title">Beacon Scanning</div>
-                <div class="det-stage-detail">${ok ? `Triggered (${tools}) — scanning PID for C2 beacons...` : (data.beacon_scan.reason || 'Not triggered')}</div>
+                <div class="det-stage-title">Live Memory</div>
+                <div class="det-stage-detail">${ok ? `Triggered (${tools}) — scanning and dumping process memory...` : (data.beacon_scan.reason || 'Not triggered')}</div>
             </div>
         </div>`;
     }
@@ -4505,10 +4572,19 @@ function renderDetonationPanels(data) {
         tabs.push({ id: 'det-tab-rededr', label: 'RedEdr / EDR', body });
     }
 
-    // Beacon scanning tab
-    const hasBeaconResults = data.hunt_sleeping_beacons || data.beaconeye;
+    // Memory scanning tab (beacon scanners + live-memory forensics + dumps)
+    const hasBeaconResults = data.hunt_sleeping_beacons || data.beaconeye
+        || data.aether || data.process_dump || data.exit_capture_result
+        || (data.network_beaconing && (data.network_beaconing.evidence_findings || []).length);
     if (hasBeaconResults) {
         let body = '';
+        // The aggregated, cross-source verdict comes first: it is what the
+        // overall assessment uses, and it is the only place where one tool
+        // corroborating another becomes visible.
+        if (data.memory_evidence) {
+            body += `<div class="det-sub-title">Memory evidence &mdash; all sources</div>`;
+            body += renderMemoryEvidence(data.memory_evidence, data.aether);
+        }
         if (data.hunt_sleeping_beacons) {
             const hsb = data.hunt_sleeping_beacons;
             body += `<div class="det-sub-title">Hunt-Sleeping-Beacons</div>`;
@@ -4547,7 +4623,21 @@ function renderDetonationPanels(data) {
                 if (be.findings && be.findings.length) body += _detRawButton('View BeaconEye raw', be);
             }
         }
-        tabs.push({ id: 'det-tab-beacons', label: 'Beacons', body });
+        if (data.aether) {
+            // Per-source evidence is skipped here: the aggregated block above
+            // already scored these findings together with the other tools.
+            body += renderAetherBlock(data.aether, { showEvidence: !data.memory_evidence });
+        }
+        if (data.process_dump) {
+            body += renderProcessDumpBlock(data.process_dump);
+        }
+        if (data.exit_capture_result) {
+            body += renderExitCaptureBlock(data.exit_capture_result);
+        }
+        if (data.network_beaconing && data.network_beaconing.available) {
+            body += renderNetworkBeaconingBlock(data.network_beaconing);
+        }
+        tabs.push({ id: 'det-tab-beacons', label: 'Memory', body });
     }
 
     // Raw JSON tab (full response)
@@ -4566,21 +4656,57 @@ function renderDetonationPanels(data) {
         html += `</div>`;
     }
 
-    // Update beacon stage card if results arrived
+    // Update the memory stage card once results arrive. The scored evidence
+    // is the headline when available, since raw counts overstate findings the
+    // host baseline already suppressed.
     if (hasBeaconResults) {
         const bStage = document.getElementById('det-beacon-stage');
         if (bStage) {
-            const hsbCount = data.hunt_sleeping_beacons?.suspicious_count || 0;
-            const beCount = data.beaconeye?.beacons_found || 0;
-            const totalFindings = hsbCount + beCount;
-            if (totalFindings > 0) {
-                bStage.className = 'det-stage ok';
-                bStage.querySelector('.det-stage-icon').innerHTML = '&#x26A0;';
-                bStage.querySelector('.det-stage-detail').textContent = `${totalFindings} beacon indicator(s) found`;
+            const ev = data.memory_evidence;
+            const icon = bStage.querySelector('.det-stage-icon');
+            const detail = bStage.querySelector('.det-stage-detail');
+            bStage.className = 'det-stage ok';
+            if (ev && ev.label && ev.label !== 'CLEAN') {
+                icon.innerHTML = '&#x26A0;';
+                const parts = [`${ev.label} — memory evidence score ${ev.score}`];
+                if (ev.sources && ev.sources.length) parts.push(ev.sources.join(', '));
+                if (ev.suppressed_count) parts.push(`${ev.suppressed_count} baseline-suppressed`);
+                detail.textContent = parts.join(' · ');
+            } else if (ev) {
+                icon.innerHTML = '&#x2705;';
+                const dumps = data.process_dump?.dump_count || 0;
+                detail.textContent = 'No memory evidence scored'
+                    + (ev.suppressed_count ? ` (${ev.suppressed_count} suppressed by baseline)` : '')
+                    + (dumps ? ` · ${dumps} component(s) dumped` : '');
             } else {
-                bStage.className = 'det-stage ok';
-                bStage.querySelector('.det-stage-icon').innerHTML = '&#x2705;';
-                bStage.querySelector('.det-stage-detail').textContent = 'Scan complete — no beacons detected';
+                // No aggregated block yet: fall back to the raw tool counts.
+                const raw = (data.hunt_sleeping_beacons?.suspicious_count || 0)
+                    + (data.beaconeye?.beacons_found || 0);
+                icon.innerHTML = raw > 0 ? '&#x26A0;' : '&#x2705;';
+                detail.textContent = raw > 0
+                    ? `${raw} beacon indicator(s) found`
+                    : 'Scan complete — no beacons detected';
+            }
+        }
+    }
+
+    if (data.exit_capture_result) {
+        const ecStage = document.getElementById('det-exitcap-stage');
+        if (ecStage) {
+            const r = data.exit_capture_result;
+            const ev = r.evidence || {};
+            const icon = ecStage.querySelector('.det-stage-icon');
+            const detail = ecStage.querySelector('.det-stage-detail');
+            if (r.error) {
+                icon.innerHTML = '&#x26A0;';
+                detail.textContent = `Dump captured but analysis failed: ${r.error}`;
+            } else if (!r.captured) {
+                icon.innerHTML = '&#x2796;';
+                detail.textContent = r.note || 'No exit dump';
+            } else {
+                icon.innerHTML = ev.label && ev.label !== 'CLEAN' ? '&#x26A0;' : '&#x2705;';
+                detail.textContent = `Captured at exit · ${ev.label || '?'} (score ${ev.score ?? '?'})`
+                    + ` · ${(r.artifacts || []).length} artifact(s) extracted`;
             }
         }
     }
@@ -6986,3 +7112,1476 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 });
+
+// =============================================
+// FILE MAP (BytePlot / Entropy / Structure)
+// Renders the three planes side by side. The same module backs the standalone
+// FileMap tab, the hex editor minimap and the inline map in the PE/ELF
+// analysis panels.
+// =============================================
+
+const FileMapView = (() => {
+    // Byte classes must stay in sync with BYTEPLOT_* in app.py.
+    const BYTE_COLORS = [
+        [0, 0, 0],        // 0 - 0x00
+        [255, 255, 255],  // 1 - 0xFF
+        [26, 59, 255],    // 2 - visible ASCII
+        [0, 200, 20],     // 3 - invisible ASCII
+        [230, 230, 0],    // 4 - non-ASCII
+    ];
+
+    // Entropy gradient: dark (repetition) -> teal (code) -> cyan (packed).
+    const ENTROPY_STOPS = [
+        [0.0, [18, 32, 36]],
+        [0.2, [47, 79, 84]],
+        [0.5, [31, 154, 168]],
+        [0.8, [34, 211, 224]],
+        [1.0, [224, 255, 255]],
+    ];
+
+    const cache = new Map();   // path -> visualization payload
+    let tooltipEl = null;
+
+    function b64ToBytes(b64) {
+        const bin = atob(b64 || '');
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+        return out;
+    }
+
+    function entropyColor(v) {
+        for (let i = 1; i < ENTROPY_STOPS.length; i++) {
+            const [hi, hiC] = ENTROPY_STOPS[i];
+            if (v <= hi) {
+                const [lo, loC] = ENTROPY_STOPS[i - 1];
+                const t = hi === lo ? 0 : (v - lo) / (hi - lo);
+                return [
+                    Math.round(loC[0] + (hiC[0] - loC[0]) * t),
+                    Math.round(loC[1] + (hiC[1] - loC[1]) * t),
+                    Math.round(loC[2] + (hiC[2] - loC[2]) * t),
+                ];
+            }
+        }
+        return ENTROPY_STOPS[ENTROPY_STOPS.length - 1][1];
+    }
+
+    function hexOff(n) {
+        return '0x' + (n >>> 0).toString(16).padStart(8, '0').toUpperCase();
+    }
+
+    async function load(path, opts = {}) {
+        const key = `${path}|${opts.cols || 256}|${opts.rows || 512}`;
+        if (cache.has(key) && !opts.force) return cache.get(key);
+        const params = new URLSearchParams({ path });
+        if (opts.cols) params.set('cols', opts.cols);
+        if (opts.rows) params.set('rows', opts.rows);
+        const resp = await fetch(`/api/file/visualize?${params}`);
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+        data.bytePlane = b64ToBytes(data.byteplot);
+        data.entropyPlane = b64ToBytes(data.entropy);
+        cache.set(key, data);
+        return data;
+    }
+
+    // --- Plane painters -------------------------------------------------
+
+    function paintBytePlot(vis) {
+        const { rows, cols } = vis;
+        const canvas = document.createElement('canvas');
+        canvas.width = cols;
+        canvas.height = rows;
+        const ctx = canvas.getContext('2d');
+        const img = ctx.createImageData(cols, rows);
+        const plane = vis.bytePlane;
+        const rgbMode = vis.byteplot_mode === 'rgb';
+        const cells = rgbMode ? Math.floor(plane.length / 3) : plane.length;
+        for (let i = 0; i < rows * cols; i++) {
+            const p = i * 4;
+            if (i >= cells) {
+                // Past end of file: leave transparent so the backdrop shows.
+                img.data[p + 3] = 0;
+                continue;
+            }
+            if (rgbMode) {
+                // Cells already carry the blended color of the bytes they cover.
+                const s = i * 3;
+                img.data[p] = plane[s];
+                img.data[p + 1] = plane[s + 1];
+                img.data[p + 2] = plane[s + 2];
+            } else {
+                const c = BYTE_COLORS[plane[i]] || BYTE_COLORS[0];
+                img.data[p] = c[0];
+                img.data[p + 1] = c[1];
+                img.data[p + 2] = c[2];
+            }
+            img.data[p + 3] = 255;
+        }
+        ctx.putImageData(img, 0, 0);
+        return canvas;
+    }
+
+    // Color of one byteplot cell, whichever plane mode is in use.
+    function cellColor(vis, cellIdx) {
+        if (vis.byteplot_mode === 'rgb') {
+            const s = cellIdx * 3;
+            if (s + 2 >= vis.bytePlane.length) return null;
+            return [vis.bytePlane[s], vis.bytePlane[s + 1], vis.bytePlane[s + 2]];
+        }
+        if (cellIdx >= vis.bytePlane.length) return null;
+        return BYTE_COLORS[vis.bytePlane[cellIdx]] || BYTE_COLORS[0];
+    }
+
+    function byteCellCount(vis) {
+        return vis.byteplot_mode === 'rgb'
+            ? Math.floor(vis.bytePlane.length / 3)
+            : vis.bytePlane.length;
+    }
+
+    function paintEntropy(vis) {
+        const rows = vis.rows;
+        const cols = vis.entropy_cols;
+        const canvas = document.createElement('canvas');
+        canvas.width = cols;
+        canvas.height = rows;
+        const ctx = canvas.getContext('2d');
+        const img = ctx.createImageData(cols, rows);
+        const plane = vis.entropyPlane;
+        for (let i = 0; i < rows * cols; i++) {
+            const p = i * 4;
+            if (i >= plane.length) {
+                img.data[p + 3] = 0;
+                continue;
+            }
+            const c = entropyColor(plane[i] / 255);
+            img.data[p] = c[0];
+            img.data[p + 1] = c[1];
+            img.data[p + 2] = c[2];
+            img.data[p + 3] = 255;
+        }
+        ctx.putImageData(img, 0, 0);
+        return canvas;
+    }
+
+    // Structure plane: regions painted as vertical bands over the file.
+    // Regions arrive sorted by priority, so markers land on top of sections.
+    function paintStructure(vis, width = 64) {
+        const rows = vis.rows;
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = rows * 4;   // 4x oversampling keeps thin regions visible
+        const ctx = canvas.getContext('2d');
+        const h = canvas.height;
+        const size = vis.file_size || 1;
+
+        ctx.fillStyle = '#10182b';
+        ctx.fillRect(0, 0, width, h);
+
+        (vis.regions || []).forEach(r => {
+            const y = (r.offset / size) * h;
+            const rh = Math.max((r.size / size) * h, 1.2);
+            ctx.fillStyle = r.color;
+            ctx.fillRect(0, y, width, rh);
+        });
+        return canvas;
+    }
+
+    // --- Lookups for hover/click --------------------------------------
+
+    function regionAt(vis, offset) {
+        let hit = null;
+        (vis.regions || []).forEach(r => {
+            if (offset >= r.offset && offset < r.offset + r.size) hit = r;
+        });
+        return hit;
+    }
+
+    function byteClassLabel(vis, offset) {
+        // Only the per-byte plane carries exact classes; blended cells do not.
+        if (vis.byteplot_mode === 'rgb') return null;
+        const bpc = vis.bytes_per_cell || 1;
+        const idx = Math.floor(offset / bpc);
+        if (idx >= vis.bytePlane.length) return null;
+        const entry = (vis.legend.byteplot || []).find(l => l.id === vis.bytePlane[idx]);
+        return entry ? entry.label : null;
+    }
+
+    function entropyAt(vis, offset) {
+        const cells = vis.rows * vis.entropy_cols;
+        if (!cells) return null;
+        const idx = Math.min(cells - 1, Math.floor((offset / (vis.file_size || 1)) * cells));
+        if (idx >= vis.entropyPlane.length) return null;
+        return vis.entropyPlane[idx] / 255;
+    }
+
+    // --- Tooltip -------------------------------------------------------
+
+    function ensureTooltip() {
+        if (!tooltipEl) {
+            tooltipEl = document.createElement('div');
+            tooltipEl.className = 'fmap-tooltip';
+            document.body.appendChild(tooltipEl);
+        }
+        return tooltipEl;
+    }
+
+    function showTooltip(evt, vis, offset) {
+        const tip = ensureTooltip();
+        const region = regionAt(vis, offset);
+        const cls = byteClassLabel(vis, offset);
+        const ent = entropyAt(vis, offset);
+        let html = `<div class="fmap-tip-off">${hexOff(offset)}</div>`;
+        if (region) {
+            html += `<div class="fmap-tip-region"><span class="fmap-dot" style="background:${region.color}"></span>${escapeHtml(region.name)}`;
+            html += ` <span class="fmap-tip-dim">(${formatSize(region.size)})</span></div>`;
+            const d = region.detail || {};
+            const bits = Object.keys(d).slice(0, 4).map(k =>
+                `<span class="fmap-tip-kv">${escapeHtml(k.replace(/_/g, ' '))}: ${escapeHtml(String(d[k]))}</span>`);
+            if (bits.length) html += `<div class="fmap-tip-detail">${bits.join('')}</div>`;
+        } else {
+            html += `<div class="fmap-tip-region fmap-tip-dim">unmapped</div>`;
+        }
+        if (cls) html += `<div class="fmap-tip-kv">byte class: ${escapeHtml(cls)}</div>`;
+        if (ent != null) html += `<div class="fmap-tip-kv">entropy: ${ent.toFixed(2)}</div>`;
+        html += `<div class="fmap-tip-hint">click to open in hex editor</div>`;
+        tip.innerHTML = html;
+        tip.classList.add('visible');
+        const pad = 14;
+        let x = evt.clientX + pad;
+        let y = evt.clientY + pad;
+        const rect = tip.getBoundingClientRect();
+        if (x + rect.width > window.innerWidth) x = evt.clientX - rect.width - pad;
+        if (y + rect.height > window.innerHeight) y = evt.clientY - rect.height - pad;
+        tip.style.left = `${x}px`;
+        tip.style.top = `${y}px`;
+    }
+
+    function hideTooltip() {
+        if (tooltipEl) tooltipEl.classList.remove('visible');
+    }
+
+    // Wire hover + click on a canvas. offsetFor() maps a canvas-relative
+    // position to a file offset, which differs per plane and orientation.
+    function attachInteraction(canvas, vis, offsetFor) {
+        canvas.addEventListener('mousemove', evt => {
+            const rect = canvas.getBoundingClientRect();
+            const offset = offsetFor(evt, rect);
+            if (offset == null) { hideTooltip(); return; }
+            showTooltip(evt, vis, offset);
+        });
+        canvas.addEventListener('mouseleave', hideTooltip);
+        canvas.addEventListener('click', evt => {
+            const rect = canvas.getBoundingClientRect();
+            const offset = offsetFor(evt, rect);
+            if (offset != null) jumpToHex(vis.path, offset);
+        });
+    }
+
+    function jumpToHex(path, offset) {
+        hideTooltip();
+        const aligned = Math.max(0, Math.floor(offset / 16) * 16);
+        const pathInput = document.getElementById('hex-filepath');
+        const offsetInput = document.getElementById('hex-offset');
+        if (!pathInput || !offsetInput) return;
+        switchTab('hexeditor');
+        pathInput.value = path;
+        offsetInput.value = aligned;
+        const zone = document.getElementById('hex-drop-zone');
+        if (zone) {
+            zone.classList.add('has-file');
+            const p = zone.querySelector('p');
+            if (p) {
+                const name = path.split(/[\\/]/).pop();
+                p.innerHTML = `<strong>${escapeHtml(name)}</strong> <span class="hex-change-file" onclick="hexResetDropZone()">change</span>`;
+            }
+        }
+        hexLoad();
+    }
+
+    // --- Legend --------------------------------------------------------
+
+    function legendHtml(vis) {
+        const l = vis.legend || {};
+        let html = '<div class="fmap-legend">';
+        const group = (title, items) => {
+            html += `<div class="fmap-legend-group"><div class="fmap-legend-title">${title}</div>`;
+            items.forEach(it => {
+                // Structure entries carry an offset and double as jump targets.
+                const jump = it.offset != null
+                    ? ` class="fmap-legend-item fmap-legend-jump" title="jump to ${hexOff(it.offset)}" onclick="FileMapView.jumpToHex('${escapeHtml(vis.path.replace(/\\/g, '\\\\'))}', ${it.offset})"`
+                    : ' class="fmap-legend-item"';
+                html += `<div${jump}><span class="fmap-legend-swatch" style="background:${it.color}"></span>${escapeHtml(it.label)}</div>`;
+            });
+            html += '</div>';
+        };
+        group('BytePlot (left)', l.byteplot || []);
+        group('Entropy (middle)', l.entropy || []);
+        group(`${vis.format} Structure (right)`, l.structure || []);
+        html += '</div>';
+        return html;
+    }
+
+    // --- Standalone / vertical view -----------------------------------
+
+    function renderVertical(container, vis, opts = {}) {
+        const height = opts.height || 740;
+        container.innerHTML = '';
+        container.classList.add('fmap-view');
+
+        const planes = document.createElement('div');
+        planes.className = 'fmap-planes';
+
+        const addPlane = (label, canvas, cssWidth, offsetFor) => {
+            const wrap = document.createElement('div');
+            wrap.className = 'fmap-plane';
+            const cap = document.createElement('div');
+            cap.className = 'fmap-plane-label';
+            cap.textContent = label;
+            canvas.className = 'fmap-canvas';
+            canvas.style.width = `${cssWidth}px`;
+            canvas.style.height = `${height}px`;
+            attachInteraction(canvas, vis, offsetFor);
+            wrap.appendChild(cap);
+            wrap.appendChild(canvas);
+            planes.appendChild(wrap);
+        };
+
+        // BytePlot: row-major, so both axes carry information.
+        // Display each plane at its native cell width to avoid resampling.
+        const byteWidth = opts.byteWidth || Math.min(Math.max(vis.cols, 192), 512);
+        addPlane('BytePlot', paintBytePlot(vis), byteWidth, (evt, rect) => {
+            const col = Math.floor(((evt.clientX - rect.left) / rect.width) * vis.cols);
+            const row = Math.floor(((evt.clientY - rect.top) / rect.height) * vis.rows);
+            if (row < 0 || col < 0) return null;
+            const offset = (row * vis.cols + col) * (vis.bytes_per_cell || 1);
+            return offset < vis.file_size ? offset : null;
+        });
+
+        // Entropy + Structure are read vertically only.
+        const linear = (evt, rect) => {
+            const frac = (evt.clientY - rect.top) / rect.height;
+            const offset = Math.floor(frac * vis.file_size);
+            return offset >= 0 && offset < vis.file_size ? offset : null;
+        };
+        const entropyWidth = opts.entropyWidth || Math.min(Math.max(vis.entropy_cols, 96), 160);
+        addPlane('Entropy', paintEntropy(vis), entropyWidth, linear);
+        addPlane('Structure', paintStructure(vis), opts.structWidth || 128, linear);
+
+        container.appendChild(planes);
+
+        const legend = document.createElement('div');
+        legend.innerHTML = legendHtml(vis);
+        container.appendChild(legend.firstChild);
+    }
+
+    // --- Horizontal strip (hex minimap + inline analyzer map) ----------
+
+    function renderStrip(container, vis, opts = {}) {
+        const trackH = opts.trackHeight || 16;
+        const width = opts.width || 1200;
+        container.innerHTML = '';
+        container.classList.add('fmap-strip');
+
+        const mkTrack = (label, painter) => {
+            const row = document.createElement('div');
+            row.className = 'fmap-strip-row';
+            const cap = document.createElement('span');
+            cap.className = 'fmap-strip-label';
+            cap.textContent = label;
+            const canvas = painter();
+            canvas.className = 'fmap-canvas fmap-strip-canvas';
+            canvas.style.height = `${trackH}px`;
+            attachInteraction(canvas, vis, (evt, rect) => {
+                const frac = (evt.clientX - rect.left) / rect.width;
+                const offset = Math.floor(frac * vis.file_size);
+                return offset >= 0 && offset < vis.file_size ? offset : null;
+            });
+            row.appendChild(cap);
+            row.appendChild(canvas);
+            container.appendChild(row);
+            return canvas;
+        };
+
+        // Horizontal planes: collapse each plane to a single row of cells.
+        mkTrack('bytes', () => {
+            const total = byteCellCount(vis);
+            const cells = Math.min(width, total) || 1;
+            const canvas = document.createElement('canvas');
+            canvas.width = cells;
+            canvas.height = 1;
+            const ctx = canvas.getContext('2d');
+            const img = ctx.createImageData(cells, 1);
+            for (let i = 0; i < cells; i++) {
+                const c = cellColor(vis, Math.floor((i / cells) * total)) || BYTE_COLORS[0];
+                img.data[i * 4] = c[0];
+                img.data[i * 4 + 1] = c[1];
+                img.data[i * 4 + 2] = c[2];
+                img.data[i * 4 + 3] = 255;
+            }
+            ctx.putImageData(img, 0, 0);
+            return canvas;
+        });
+
+        mkTrack('entropy', () => {
+            const cells = Math.min(width, Math.max(1, vis.entropyPlane.length));
+            const canvas = document.createElement('canvas');
+            canvas.width = cells;
+            canvas.height = 1;
+            const ctx = canvas.getContext('2d');
+            const img = ctx.createImageData(cells, 1);
+            for (let i = 0; i < cells; i++) {
+                const src = Math.floor((i / cells) * vis.entropyPlane.length);
+                const c = entropyColor((vis.entropyPlane[src] || 0) / 255);
+                img.data[i * 4] = c[0];
+                img.data[i * 4 + 1] = c[1];
+                img.data[i * 4 + 2] = c[2];
+                img.data[i * 4 + 3] = 255;
+            }
+            ctx.putImageData(img, 0, 0);
+            return canvas;
+        });
+
+        const structCanvas = mkTrack('structure', () => {
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(width, 1200);
+            canvas.height = 1;
+            const ctx = canvas.getContext('2d');
+            const size = vis.file_size || 1;
+            ctx.fillStyle = '#10182b';
+            ctx.fillRect(0, 0, canvas.width, 1);
+            (vis.regions || []).forEach(r => {
+                ctx.fillStyle = r.color;
+                ctx.fillRect((r.offset / size) * canvas.width,
+                             0,
+                             Math.max((r.size / size) * canvas.width, 1.2),
+                             1);
+            });
+            return canvas;
+        });
+
+        // Named labels under the structure track. Labels are placed at their
+        // region's offset, so they can collide: biggest regions claim their
+        // slot first and any label that would overlap one already placed is
+        // dropped (its name stays reachable via tooltip and legend).
+        const labels = document.createElement('div');
+        labels.className = 'fmap-strip-names';
+        container.appendChild(labels);
+
+        const trackWidth = labels.clientWidth || 900;
+        const placed = [];   // [left, right] in px, kept sorted-free for simple checks
+        const CHAR_PX = 5.3; // approx. width of one 9px monospace glyph
+        const DOT_PX = 12;   // color dot + gap
+        const GAP_PX = 8;    // breathing room between two labels
+
+        (vis.regions || [])
+            .filter(r => r.size / vis.file_size > 0.015)
+            .slice()
+            .sort((a, b) => b.size - a.size)
+            .forEach(r => {
+                const left = (r.offset / vis.file_size) * trackWidth;
+                const textPx = r.name.length * CHAR_PX + DOT_PX;
+                // Never let a label reach past the track's right edge.
+                const right = Math.min(left + textPx, trackWidth);
+                const collides = placed.some(([l, rr]) =>
+                    left < rr + GAP_PX && right + GAP_PX > l);
+                if (collides) return;
+                placed.push([left, right]);
+
+                const span = document.createElement('span');
+                span.className = 'fmap-strip-name';
+                span.style.left = `${(left / trackWidth) * 100}%`;
+                span.style.maxWidth = `${trackWidth - left}px`;
+                span.title = `${r.name} @ ${hexOff(r.offset)} (${formatSize(r.size)}) — click to open in hex editor`;
+                span.innerHTML = `<span class="fmap-dot" style="background:${r.color}"></span>${escapeHtml(r.name)}`;
+                span.addEventListener('click', () => jumpToHex(vis.path, r.offset));
+                labels.appendChild(span);
+            });
+
+        if (opts.viewport) {
+            const marker = document.createElement('div');
+            marker.className = 'fmap-strip-viewport';
+            container.appendChild(marker);
+            container._viewportMarker = marker;
+        }
+        container._structCanvas = structCanvas;
+        return container;
+    }
+
+    function updateViewport(container, offset, length, fileSize) {
+        const marker = container && container._viewportMarker;
+        if (!marker || !fileSize) return;
+        marker.style.left = `${(offset / fileSize) * 100}%`;
+        marker.style.width = `${Math.max((length / fileSize) * 100, 0.4)}%`;
+        marker.classList.add('visible');
+    }
+
+    // --- Import / Export trees ----------------------------------------
+
+    function treeHtml(vis) {
+        const imports = vis.import_tree || [];
+        const exports = vis.export_tree;
+        if (!imports.length && !exports) {
+            return '<div class="fmap-tree-empty">No import or export table in this file.</div>';
+        }
+
+        let html = '<div class="fmap-trees">';
+
+        if (imports.length) {
+            const totalFuncs = imports.reduce((a, d) => a + d.count, 0);
+            const totalSusp = imports.reduce((a, d) => a + d.suspicious_count, 0);
+            html += `<div class="fmap-tree">`;
+            html += `<div class="fmap-tree-head">Import Tree <span class="fmap-tree-meta">${imports.length} module(s) &middot; ${totalFuncs} symbol(s)`;
+            if (totalSusp) html += ` &middot; <span class="fmap-susp">${totalSusp} suspicious</span>`;
+            html += `</span></div>`;
+            imports.forEach((dll, i) => {
+                const open = i === 0 && dll.count > 0 ? ' open' : '';
+                html += `<details class="fmap-node"${open}>`;
+                html += `<summary class="fmap-node-head"><span class="fmap-node-icon">\u25B8</span>`;
+                html += `<span class="fmap-node-name">${escapeHtml(dll.dll)}</span>`;
+                html += `<span class="fmap-node-count">${dll.count}</span>`;
+                if (dll.suspicious_count) html += `<span class="fmap-node-susp">${dll.suspicious_count} susp</span>`;
+                html += `</summary>`;
+                if (dll.note) html += `<div class="fmap-node-note">${escapeHtml(dll.note)}</div>`;
+                if (dll.functions && dll.functions.length) {
+                    html += '<div class="fmap-leaves">';
+                    dll.functions.forEach(fn => {
+                        const susp = fn.category ? ' suspicious' : '';
+                        html += `<div class="fmap-leaf${susp}">${escapeHtml(fn.name)}`;
+                        if (fn.category) html += `<span class="fmap-leaf-tag">${escapeHtml(fn.category.replace(/_/g, ' '))}</span>`;
+                        if (fn.type) html += `<span class="fmap-leaf-dim">${escapeHtml(fn.type)}</span>`;
+                        html += `</div>`;
+                    });
+                    if (dll.count > dll.functions.length) {
+                        html += `<div class="fmap-leaf fmap-leaf-dim">… ${dll.count - dll.functions.length} more</div>`;
+                    }
+                    html += '</div>';
+                }
+                html += '</details>';
+            });
+            html += '</div>';
+        }
+
+        if (exports) {
+            html += `<div class="fmap-tree">`;
+            html += `<div class="fmap-tree-head">Export Tree <span class="fmap-tree-meta">${exports.count} symbol(s)</span></div>`;
+            html += `<details class="fmap-node" open><summary class="fmap-node-head"><span class="fmap-node-icon">\u25B8</span>`;
+            html += `<span class="fmap-node-name">${escapeHtml(exports.dll)}</span>`;
+            html += `<span class="fmap-node-count">${exports.count}</span></summary>`;
+            html += '<div class="fmap-leaves">';
+            exports.functions.forEach(fn => {
+                html += `<div class="fmap-leaf">${escapeHtml(fn.name)}`;
+                if (fn.address) html += `<span class="fmap-leaf-dim">${escapeHtml(fn.address)}</span>`;
+                html += `</div>`;
+            });
+            if (exports.count > exports.functions.length) {
+                html += `<div class="fmap-leaf fmap-leaf-dim">… ${exports.count - exports.functions.length} more</div>`;
+            }
+            html += '</div></details></div>';
+        }
+
+        html += '</div>';
+        return html;
+    }
+
+    return {
+        load, renderVertical, renderStrip, updateViewport,
+        treeHtml, legendHtml, hexOff, jumpToHex,
+        clearCache: () => cache.clear(),
+    };
+})();
+
+// --- FileMap tab ----------------------------------------------------
+
+async function fileMapRender(path) {
+    const target = path || document.getElementById('filemap-path').value.trim()
+        || state.hexFilePath;
+    const body = document.getElementById('filemap-body');
+    const meta = document.getElementById('filemap-meta');
+    const trees = document.getElementById('filemap-trees');
+    if (!target) {
+        body.innerHTML = '<div class="filemap-empty">Enter a file path (or load a file in the hex editor) and click Render.</div>';
+        meta.innerHTML = '';
+        trees.innerHTML = '';
+        return;
+    }
+
+    document.getElementById('filemap-path').value = target;
+    body.innerHTML = '<div class="pe-loading"><div class="loading-spinner"></div><span>Building visualization...</span></div>';
+    trees.innerHTML = '';
+
+    try {
+        LoadingSpinner.start();
+        // One plane row per displayed pixel row: avoids upscaling the planes,
+        // which is what made large files look blocky.
+        const height = parseInt(document.getElementById('filemap-height').value) || 740;
+        const vis = await FileMapView.load(target, {
+            cols: parseInt(document.getElementById('filemap-cols').value) || 256,
+            rows: height,
+        });
+        LoadingSpinner.stop();
+
+        meta.innerHTML = `
+            <span class="hex-info-item"><strong>File:</strong> ${escapeHtml(vis.filename)}</span>
+            <span class="hex-info-item"><strong>Format:</strong> ${escapeHtml(vis.format)}</span>
+            <span class="hex-info-item"><strong>Size:</strong> ${formatSize(vis.file_size)}</span>
+            <span class="hex-info-item"><strong>Entropy:</strong> ${vis.total_entropy}</span>
+            <span class="hex-info-item"><strong>Bytes/cell:</strong> ${vis.bytes_per_cell}</span>
+            <span class="hex-info-item"><strong>Regions:</strong> ${(vis.regions || []).length}</span>
+            ${vis.truncated ? '<span class="hex-info-item" style="color:var(--accent-yellow);">truncated to first 64 MB</span>' : ''}
+            ${vis.parse_error ? `<span class="hex-info-item" style="color:var(--accent-red);">${escapeHtml(vis.parse_error)}</span>` : ''}
+        `;
+
+        FileMapView.renderVertical(body, vis, {
+            height: height,
+        });
+        trees.innerHTML = FileMapView.treeHtml(vis);
+    } catch (e) {
+        LoadingSpinner.stop();
+        body.innerHTML = `<div class="pe-error">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function initFileMapTab() {
+    const path = document.getElementById('filemap-path');
+    if (path && !path.value && state.hexFilePath) path.value = state.hexFilePath;
+    const body = document.getElementById('filemap-body');
+    // Auto-render once when a file is already known from the hex editor.
+    if (body && !body.dataset.rendered && (path.value || state.hexFilePath)) {
+        body.dataset.rendered = '1';
+        fileMapRender(path.value || state.hexFilePath);
+    }
+}
+
+function initFileMapDropZone() {
+    const zone = document.getElementById('filemap-drop-zone');
+    const input = document.getElementById('filemap-file-input');
+    if (!zone || !input) return;
+
+    const upload = async file => {
+        const fd = new FormData();
+        fd.append('file', file);
+        fd.append('bytes', 256);
+        zone.classList.add('loading');
+        try {
+            const resp = await fetch('/api/file/hex/upload', { method: 'POST', body: fd });
+            const data = await resp.json();
+            zone.classList.remove('loading');
+            if (data.error) return;
+            state.hexFilePath = data.path;
+            document.getElementById('filemap-path').value = data.path;
+            fileMapRender(data.path);
+        } catch (e) {
+            zone.classList.remove('loading');
+        }
+    };
+
+    zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('dragover'); });
+    zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+    zone.addEventListener('drop', e => {
+        e.preventDefault();
+        zone.classList.remove('dragover');
+        if (e.dataTransfer.files.length) upload(e.dataTransfer.files[0]);
+    });
+    input.addEventListener('change', () => {
+        if (input.files.length) { upload(input.files[0]); input.value = ''; }
+    });
+}
+
+// --- Hex editor minimap ---------------------------------------------
+
+async function hexRenderMinimap() {
+    const container = document.getElementById('hex-minimap');
+    if (!container || !state.hexFilePath) return;
+    container.dataset.path = state.hexFilePath;
+    try {
+        const vis = await FileMapView.load(state.hexFilePath, { cols: 256, rows: 512 });
+        FileMapView.renderStrip(container, vis, { viewport: true, trackHeight: 14 });
+        container.classList.add('visible');
+        hexUpdateMinimapViewport();
+        const info = document.getElementById('hex-minimap-info');
+        if (info) {
+            info.innerHTML = `${escapeHtml(vis.format)} &middot; ${(vis.regions || []).length} regions`
+                + `<button class="btn btn-sm" onclick="fileMapRender('${escapeHtml(state.hexFilePath.replace(/\\/g, '\\\\'))}');switchTab('filemap');">Full map</button>`;
+        }
+    } catch (e) {
+        container.classList.remove('visible');
+    }
+}
+
+function hexUpdateMinimapViewport() {
+    const container = document.getElementById('hex-minimap');
+    if (!container) return;
+    const bytesPerPage = parseInt(document.getElementById('hex-bytes-per-page').value) || 512;
+    FileMapView.updateViewport(container, state.hexOffset, bytesPerPage, state.hexFileSize);
+}
+
+// --- Inline map for the PE/ELF analysis panels -----------------------
+
+// Markup placeholder; the canvases need the nodes to exist in the DOM first.
+function fileMapInlineBlock(path) {
+    const safe = escapeHtml((path || '').replace(/\\/g, '\\\\'));
+    let html = '<div class="fmap-inline">';
+    html += '<div class="fmap-inline-head"><span class="die-section-title">FILE MAP</span>';
+    html += `<button class="btn btn-sm" onclick="fileMapRender('${safe}');switchTab('filemap');">Open full map</button></div>`;
+    html += '<div class="fmap-inline-body" id="fmap-inline-map"><div class="fmap-inline-wait">building planes…</div></div>';
+    html += '<details class="fmap-inline-trees"><summary class="die-section-title die-clickable">IMPORT / EXPORT TREE</summary>';
+    html += '<div id="fmap-inline-trees"></div></details>';
+    html += '</div>';
+    return html;
+}
+
+function fileMapInlineMount(path) {
+    if (!path) return;
+    renderInlineFileMap('fmap-inline-map', path);
+    FileMapView.load(path, { cols: 256, rows: 512 }).then(vis => {
+        const target = document.getElementById('fmap-inline-trees');
+        if (target) target.innerHTML = FileMapView.treeHtml(vis);
+    }).catch(() => {});
+}
+
+async function renderInlineFileMap(containerId, path) {
+    const container = document.getElementById(containerId);
+    if (!container || !path) return;
+    try {
+        const vis = await FileMapView.load(path, { cols: 256, rows: 512 });
+        container.innerHTML = '';
+        const strip = document.createElement('div');
+        container.appendChild(strip);
+        FileMapView.renderStrip(strip, vis, { trackHeight: 18 });
+        const legend = document.createElement('div');
+        legend.innerHTML = FileMapView.legendHtml(vis);
+        legend.firstChild.classList.add('fmap-legend-inline');
+        container.appendChild(legend.firstChild);
+    } catch (e) {
+        container.innerHTML = `<div class="pe-error">File map failed: ${escapeHtml(e.message)}</div>`;
+    }
+}
+
+// =============================================
+// LIVE-MEMORY TOOLS (Aether / Process Dump)
+// Aether scans a running process for injection and implant structures;
+// Process Dump writes its memory components back to disk so they can be fed
+// into the file map, PE analyzer, capa and the scanners.
+// =============================================
+
+// Severity order used for sorting findings worst-first.
+const AETHER_SEVERITY_RANK = { critical: 0, high: 1, medium: 2, low: 3, info: 4, unknown: 5 };
+
+function aetherSeverityClass(sev) {
+    const s = (sev || '').toLowerCase();
+    if (s === 'critical') return 'sev-critical';
+    if (s === 'high') return 'sev-high';
+    if (s === 'medium') return 'sev-medium';
+    if (s === 'low') return 'sev-low';
+    return 'sev-info';
+}
+
+function renderAetherBlock(aether, opts = {}) {
+    let html = `<div class="det-sub-title">Aether &mdash; live-memory forensics</div>`;
+
+    if (aether.error) {
+        return html + `<div class="det-sub-value det-warn">${escapeHtml(aether.error)}</div>`;
+    }
+    if (aether.parse_error) {
+        html += `<div class="det-sub-value det-warn">${escapeHtml(aether.parse_error)}</div>`;
+    }
+
+    // The scored evidence comes first: it is what the verdict is based on,
+    // while the raw tool output below is the material it was derived from.
+    // Skipped when an aggregated cross-source block is shown above.
+    if (aether.evidence && opts.showEvidence !== false) {
+        html += renderMemoryEvidence(aether.evidence, aether);
+    }
+
+    const s = aether.summary || {};
+    const report = aether.report || {};
+
+    // Headline counts
+    html += `<div class="mem-chips">`;
+    const chip = (label, value, cls) =>
+        `<span class="mem-chip ${cls || ''}"><span class="mem-chip-val">${value}</span>${escapeHtml(label)}</span>`;
+    // Structural IOCs carry Aether's own corroborated severity; signature
+    // groups are graded critical even for low-risk patterns, so they are
+    // counted separately to keep the headline honest.
+    if (s.structural_critical) html += chip('critical IOC', s.structural_critical, 'sev-critical');
+    if (s.structural_high) html += chip('high IOC', s.structural_high, 'sev-high');
+    if (s.structural_total) html += chip('structural findings', s.structural_total);
+    if (s.signature_high_risk) html += chip('high-risk sig hits', s.signature_high_risk, 'sev-high');
+    if (s.signature_hits) html += chip('sig hits total', s.signature_hits, 'sev-info');
+    if (s.dotnet_assemblies_in_private)
+        html += chip('.NET in private mem', s.dotnet_assemblies_in_private, 'sev-high');
+    if (s.pe_headers_in_private)
+        html += chip('PE headers in private mem', s.pe_headers_in_private, 'sev-medium');
+    html += `</div>`;
+
+    if (!s.findings_total) {
+        html += `<div class="det-sub-value">No memory IOCs reported`;
+        if (s.regions_scanned) html += ` (${s.regions_scanned} regions scanned)`;
+        html += `</div>`;
+    }
+
+    // Thread start-address verdicts: the highest-signal subset, so call it out.
+    if (s.tsav && Object.keys(s.tsav).length) {
+        html += `<div class="mem-section-label">Thread start-address verdicts</div><div class="mem-chips">`;
+        Object.entries(s.tsav).forEach(([type, count]) => {
+            html += chip(type.replace(/^TSAV_/, '').replace(/_/g, ' ').toLowerCase(), count, 'sev-critical');
+        });
+        html += `</div>`;
+    }
+
+    // Aether reports structural IOCs and signature groups in one array;
+    // they have different shapes, so split them apart for display.
+    const all = report.findings || [];
+    const structural = all.filter(f => f.type);
+    const sigGroups = all.filter(f => f.category);
+
+    structural.sort((a, b) =>
+        (AETHER_SEVERITY_RANK[(a.severity || 'unknown').toLowerCase()] ?? 5) -
+        (AETHER_SEVERITY_RANK[(b.severity || 'unknown').toLowerCase()] ?? 5));
+
+    if (structural.length) {
+        html += `<div class="mem-section-label">Structural memory IOCs (${structural.length})</div>`;
+        structural.slice(0, 40).forEach(f => {
+            html += `<div class="mem-finding ${aetherSeverityClass(f.severity)}">`;
+            html += `<div class="mem-finding-head">`;
+            html += `<span class="mem-sev">${escapeHtml((f.severity || '?').toUpperCase())}</span>`;
+            html += `<span class="mem-type">${escapeHtml(f.type || '?')}</span>`;
+            if (f.address) html += `<span class="mem-addr">${escapeHtml(f.address)}</span>`;
+            if (f.size) html += `<span class="mem-size">${formatSize(f.size)}</span>`;
+            html += `</div>`;
+            if (f.description) html += `<div class="mem-desc">${escapeHtml(f.description)}</div>`;
+            if (f.evidence) html += `<div class="mem-evidence">${escapeHtml(f.evidence)}</div>`;
+            const extra = [];
+            ['private_pages', 'region_pages', 'pointer_count', 'module_count', 'thread_id']
+                .forEach(k => { if (f[k] != null) extra.push(`${k.replace(/_/g, ' ')}: ${f[k]}`); });
+            if (extra.length) html += `<div class="mem-kv">${escapeHtml(extra.join('  \u00B7  '))}</div>`;
+            html += `</div>`;
+        });
+        if (structural.length > 40) {
+            html += `<div class="det-sub-value">… ${structural.length - 40} more</div>`;
+        }
+    }
+
+    // Signature groups: one block per category, highest risk_score first.
+    if (sigGroups.length) {
+        html += `<div class="mem-section-label">In-memory signatures (${sigGroups.length} categor`
+            + `${sigGroups.length === 1 ? 'y' : 'ies'}, ${s.signature_hits || 0} hit(s))</div>`;
+        sigGroups.slice().sort((a, b) => (b.score || 0) - (a.score || 0)).forEach(g => {
+            const hits = (g.hits || []).slice()
+                .sort((a, b) => (b.risk_score || 0) - (a.risk_score || 0));
+            const topRisk = hits.length ? (hits[0].risk_score || 0) : 0;
+            // Low-risk patterns are common in benign software; mark them as such.
+            const cls = topRisk >= 8 ? 'sev-high' : 'sev-info';
+            html += `<div class="mem-finding ${cls}">`;
+            html += `<div class="mem-finding-head">`;
+            html += `<span class="mem-type">${escapeHtml(g.category || '?')}</span>`;
+            if (g.mitre) html += `<span class="mem-mitre">${escapeHtml(g.mitre)}</span>`;
+            html += `<span class="mem-size">${g.hit_count || hits.length} hit(s)</span>`;
+            if (g.score != null) html += `<span class="mem-size">score ${g.score}</span>`;
+            html += `<span class="mem-size">max risk ${topRisk}</span>`;
+            html += `</div>`;
+            hits.slice(0, 6).forEach(h => {
+                html += `<div class="mem-kv">`;
+                html += `<span class="mem-pattern">${escapeHtml(h.pattern || '')}</span>`;
+                if (h.risk_score != null) html += ` risk ${h.risk_score}`;
+                if (h.encoding) html += ` · ${escapeHtml(h.encoding)}`;
+                if (h.offset) html += ` @ ${escapeHtml(h.offset)}`;
+                if (h.description) html += ` — ${escapeHtml(h.description)}`;
+                html += `</div>`;
+            });
+            if (hits.length > 6) html += `<div class="mem-kv">… ${hits.length - 6} more hit(s)</div>`;
+            html += `</div>`;
+        });
+    }
+
+    if (s.mitre && s.mitre.length) {
+        html += `<div class="mem-section-label">MITRE techniques</div><div class="mem-chips">`;
+        s.mitre.forEach(t => { html += `<span class="mem-chip mem-mitre">${escapeHtml(t)}</span>`; });
+        html += `</div>`;
+    }
+
+    if (s.scan_time_ms) {
+        html += `<div class="mem-foot">${s.regions_scanned || 0} regions in ${s.scan_time_ms} ms</div>`;
+    }
+    html += _detRawButton('View Aether raw', aether);
+    return html;
+}
+
+function renderProcessDumpBlock(pd) {
+    let html = `<div class="det-sub-title">Process Dump &mdash; memory extraction</div>`;
+    if (pd.error) {
+        return html + `<div class="det-sub-value det-warn">${escapeHtml(pd.error)}</div>`;
+    }
+
+    html += `<div class="mem-chips">`;
+    const chip = (label, value, cls) =>
+        `<span class="mem-chip ${cls || ''}"><span class="mem-chip-val">${value}</span>${escapeHtml(label)}</span>`;
+    html += chip('dumps', pd.dump_count || 0);
+    // Both of these mean "code that no loader put there in a normal way".
+    if (pd.hidden_modules) html += chip('hidden modules', pd.hidden_modules, 'sev-high');
+    if (pd.code_chunks) html += chip('loose code chunks', pd.code_chunks, 'sev-high');
+    html += `</div>`;
+
+    if (!pd.dump_count) {
+        html += `<div class="det-sub-value">Nothing dumped — every module matched the clean-hash baseline.</div>`;
+        return html + _detRawButton('View Process Dump raw', pd);
+    }
+
+    html += `<div class="mem-section-label">Dumped files <span class="mem-foot-inline">${escapeHtml(pd.output_dir || '')}</span></div>`;
+    html += `<table class="mem-dump-table"><tr><th>file</th><th>kind</th><th>arch</th><th>size</th><th></th></tr>`;
+    (pd.dumps || []).forEach(d => {
+        const kindCls = d.host_class ? 'sev-info'
+            : d.kind === 'hiddenmodule' ? 'sev-high'
+            : d.kind === 'codechunk' ? 'sev-medium' : '';
+        const esc = (d.path || '').replace(/\\/g, '\\\\');
+        html += `<tr>`;
+        html += `<td class="mem-dump-name" title="${escapeHtml(d.sha256 || '')}">${escapeHtml(d.filename)}</td>`;
+        html += `<td><span class="mem-chip ${kindCls}" title="${escapeHtml(d.host_reason || '')}">`
+            + `${escapeHtml(d.host_class ? `${d.kind} (host: ${d.host_class})` : (d.kind || ''))}</span></td>`;
+        html += `<td>${escapeHtml(d.arch || '')}</td>`;
+        html += `<td>${formatSize(d.size || 0)}</td>`;
+        // A dump is just a PE on disk, so hand it to the existing analyzers.
+        html += `<td class="mem-dump-actions">`;
+        html += `<button class="btn btn-sm" onclick="fileMapRender('${esc}');switchTab('filemap');">Map</button>`;
+        html += `<button class="btn btn-sm" onclick="hexOpenFile('${esc}')">Hex</button>`;
+        html += `</td></tr>`;
+    });
+    html += `</table>`;
+    return html + _detRawButton('View Process Dump raw', pd);
+}
+
+// --- On-demand scans from the process views ---
+
+async function runAetherScan(pid, targetId, opts = {}) {
+    const target = document.getElementById(targetId);
+    const samples = opts.samples
+        || parseInt((document.getElementById('livemem-samples') || {}).value) || 1;
+    const interval = opts.interval
+        || parseInt((document.getElementById('livemem-interval') || {}).value) || 3;
+    if (target) {
+        const note = samples > 1
+            ? `Scanning process memory ${samples}x (${interval}s apart) to separate persistent from transient findings...`
+            : 'Scanning process memory with Aether...';
+        target.innerHTML = '<div class="pe-loading"><div class="loading-spinner"></div>'
+            + `<span>${escapeHtml(note)}</span></div>`;
+    }
+    try {
+        LoadingSpinner.start();
+        const resp = await fetch('/api/scan/aether', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pid: pid, samples: samples, interval: interval }),
+        });
+        const data = await resp.json();
+        LoadingSpinner.stop();
+        if (target) {
+            target.innerHTML = data.error
+                ? `<div class="pe-error">${escapeHtml(data.error)}</div>`
+                : renderAetherBlock(data);
+        }
+        loadScanHistory();
+        return data;
+    } catch (e) {
+        LoadingSpinner.stop();
+        if (target) target.innerHTML = `<div class="pe-error">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+async function runProcessDump(pid, targetId) {
+    const target = document.getElementById(targetId);
+    if (target) {
+        target.innerHTML = '<div class="pe-loading"><div class="loading-spinner"></div>'
+            + '<span>Dumping memory components...</span></div>';
+    }
+    try {
+        LoadingSpinner.start();
+        const resp = await fetch('/api/scan/processdump', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pid: pid }),
+        });
+        const data = await resp.json();
+        LoadingSpinner.stop();
+        if (target) {
+            target.innerHTML = data.error
+                ? `<div class="pe-error">${escapeHtml(data.error)}</div>`
+                : renderProcessDumpBlock(data);
+        }
+        loadScanHistory();
+        return data;
+    } catch (e) {
+        LoadingSpinner.stop();
+        if (target) target.innerHTML = `<div class="pe-error">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+// --- Live-memory panel in the ThreatScan tab -------------------------
+// The sidebar process list is telemetry-driven and keeps exited processes,
+// so this panel talks to the OS process table instead.
+
+async function livememLookup() {
+    const name = document.getElementById('livemem-name').value.trim();
+    const result = document.getElementById('livemem-result');
+    if (!name) {
+        result.innerHTML = '<div class="pe-error">Enter a process name to look up.</div>';
+        return;
+    }
+    try {
+        const resp = await fetch(`/api/process/lookup?name=${encodeURIComponent(name)}`);
+        const data = await resp.json();
+        if (data.error) {
+            result.innerHTML = `<div class="pe-error">${escapeHtml(data.error)}</div>`;
+            return;
+        }
+        if (!data.count) {
+            result.innerHTML = `<div class="det-sub-value">No running process matches "${escapeHtml(name)}".</div>`;
+            return;
+        }
+        let html = `<div class="mem-section-label">${data.count} match(es)</div>`;
+        html += '<div class="mem-chips">';
+        data.matches.forEach(m => {
+            html += `<span class="mem-chip fmap-legend-jump" onclick="livememSelect(${m.pid})" `
+                + `title="Use PID ${m.pid}"><span class="mem-chip-val">${m.pid}</span>`
+                + `${escapeHtml(m.name)}</span>`;
+        });
+        html += '</div>';
+        // One match is unambiguous, so select it right away.
+        if (data.count === 1) livememSelect(data.matches[0].pid);
+        result.innerHTML = html;
+    } catch (e) {
+        result.innerHTML = `<div class="pe-error">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+function livememSelect(pid) {
+    document.getElementById('livemem-pid').value = pid;
+}
+
+function _livememPid() {
+    const pid = parseInt(document.getElementById('livemem-pid').value);
+    if (!pid) {
+        document.getElementById('livemem-result').innerHTML =
+            '<div class="pe-error">Enter a PID (or look one up by name).</div>';
+        return null;
+    }
+    return pid;
+}
+
+function livememAether() {
+    const pid = _livememPid();
+    if (pid) runAetherScan(pid, 'livemem-result');
+}
+
+function livememDump() {
+    const pid = _livememPid();
+    if (pid) runProcessDump(pid, 'livemem-result');
+}
+
+// Reflect tool availability in the panel's badge and buttons.
+function updateLiveMemStatus() {
+    const badge = document.getElementById('livemem-status');
+    const aetherOk = state.aetherStatus ? state.aetherStatus.installed !== false : true;
+    const pdOk = state.processDumpStatus ? state.processDumpStatus.installed !== false : true;
+    if (badge) {
+        const parts = [`Aether ${aetherOk ? '\u2713' : '\u2717'}`];
+        if (aetherOk && state.aetherStatus && state.aetherStatus.rules != null) {
+            parts[0] += ` (${state.aetherStatus.rules} rule files)`;
+        }
+        parts.push(`Process Dump ${pdOk ? '\u2713' : '\u2717'}`);
+        if (pdOk && state.processDumpStatus && state.processDumpStatus.clean_db === false) {
+            parts.push('no clean-hash baseline');
+        }
+        badge.textContent = parts.join('  \u00B7  ');
+    }
+    const ab = document.getElementById('livemem-aether-btn');
+    if (ab) {
+        ab.disabled = !aetherOk;
+        ab.title = aetherOk ? '' : 'Aether is not installed on this VM';
+    }
+    const db = document.getElementById('livemem-dump-btn');
+    if (db) {
+        db.disabled = !pdOk;
+        db.title = pdOk ? '' : 'Process Dump is not installed on this VM';
+    }
+}
+
+// --- Scored memory evidence -----------------------------------------
+// Rendered from the tool-agnostic evidence model: every finding shows the
+// factors that produced its confidence, so a verdict can be audited instead
+// of taken on faith.
+
+function evidenceClassLabel(cls) {
+    return {
+        structural: 'structural fact',
+        behavioral: 'behavioural',
+        artifact: 'extracted artifact',
+        string: 'byte pattern',
+    }[cls] || cls;
+}
+
+function confidenceClass(conf) {
+    if (conf >= 0.9) return 'sev-critical';
+    if (conf >= 0.5) return 'sev-high';
+    if (conf > 0) return 'sev-medium';
+    return 'sev-info';
+}
+
+function renderMemoryEvidence(ev, meta) {
+    const verdictCls = ev.label === 'MALICIOUS' ? 'sev-critical'
+        : ev.label === 'SUSPICIOUS' ? 'sev-high'
+        : ev.label === 'NOT OBSERVED' ? 'sev-medium' : 'sev-low';
+
+    let html = `<div class="mem-verdict ${verdictCls}">`;
+    html += `<span class="mem-verdict-label">${escapeHtml(ev.label)}</span>`;
+    html += `<span class="mem-verdict-score">score ${ev.score}`;
+    if (ev.thresholds) {
+        html += ` <span class="mem-foot-inline">(suspicious \u2265 ${ev.thresholds.suspicious}, `
+            + `malicious \u2265 ${ev.thresholds.malicious})</span>`;
+    }
+    html += `</span></div>`;
+
+    // A failed observation is not a clean result; say so prominently.
+    if (ev.note) {
+        html += `<div class="mem-note">${escapeHtml(ev.note)}</div>`;
+    }
+
+    html += `<div class="mem-chips">`;
+    const chip = (label, value, cls) =>
+        `<span class="mem-chip ${cls || ''}"><span class="mem-chip-val">${value}</span>${escapeHtml(label)}</span>`;
+    (ev.sources_present || ev.sources || []).forEach(src => { html += chip(src, '', ''); });
+    Object.entries(ev.by_evidence || {}).forEach(([cls, pts]) => {
+        html += chip(evidenceClassLabel(cls), pts, confidenceClass(pts > 0 ? 1 : 0));
+    });
+    if (meta && (meta.samples || 0) > 1) {
+        html += chip(`samples (${meta.sample_interval}s apart)`, meta.samples);
+    }
+    if (ev.suppressed_count) {
+        html += chip('suppressed by baseline', ev.suppressed_count, 'sev-info');
+    }
+    html += `</div>`;
+
+    const scored = ev.findings || [];
+    if (scored.length) {
+        html += `<div class="mem-section-label">Scored evidence (${scored.length})</div>`;
+        scored.slice(0, 30).forEach(f => {
+            html += `<div class="mem-finding ${confidenceClass(f.confidence)}">`;
+            html += `<div class="mem-finding-head">`;
+            html += `<span class="mem-score">${f.score.toFixed(2)}</span>`;
+            html += `<span class="mem-type">${escapeHtml(f.label)}</span>`;
+            html += `<span class="mem-chip">${escapeHtml(f.source)}</span>`;
+            html += `<span class="mem-chip">${escapeHtml(evidenceClassLabel(f.evidence))}</span>`;
+            if (f.address) html += `<span class="mem-addr">${escapeHtml(f.address)}</span>`;
+            html += `</div>`;
+            if (f.detail) html += `<div class="mem-desc">${escapeHtml(f.detail)}</div>`;
+
+            // Why this finding scored what it scored.
+            const why = [`confidence ${f.confidence.toFixed(2)}`];
+            if ((f.samples || 1) > 1) {
+                why.push(`seen in ${f.seen_in}/${f.samples} samples`
+                    + (f.persistence < 1 ? ' (transient)' : ' (persistent)'));
+            }
+            if (f.corroborated_by && f.corroborated_by.length) {
+                why.push('corroborated by ' + f.corroborated_by.join(', '));
+            } else if (f.needs_corroboration) {
+                why.push('uncorroborated \u2014 weight reduced');
+            }
+            if (f.risk_score != null) why.push(`rule risk ${f.risk_score}`);
+            const sat = f.saturation;
+            if (sat && sat.group_size > 1) {
+                // Explain zeroed rows: the group's cap was already used up.
+                why.push(`${sat.rank} of ${sat.group_size} findings of this kind`
+                    + ` · group capped at ${sat.group_cap}`
+                    + (f.score === 0 ? ' (cap reached, not counted)' : ''));
+            }
+            html += `<div class="mem-kv">${escapeHtml(why.join('  \u00B7  '))}</div>`;
+            html += `</div>`;
+        });
+        if (scored.length > 30) {
+            html += `<div class="det-sub-value">… ${scored.length - 30} more</div>`;
+        }
+    } else {
+        html += `<div class="det-sub-value">No finding carried enough weight to score.</div>`;
+    }
+
+    // Baseline-suppressed findings stay visible but collapsed: they are the
+    // host's own noise, and hiding them entirely would make the baseline
+    // impossible to sanity-check.
+    if (ev.suppressed_count) {
+        html += `<details class="mem-suppressed"><summary>`
+            + `${ev.suppressed_count} finding(s) suppressed by the host baseline</summary>`;
+        (ev.suppressed || []).slice(0, 30).forEach(f => {
+            html += `<div class="mem-kv">${escapeHtml(f.label)}`;
+            if (f.detail) html += ` \u2014 ${escapeHtml(f.detail)}`;
+            html += ` <span class="mem-foot-inline">${escapeHtml(f.source)}</span></div>`;
+        });
+        html += `</details>`;
+    }
+    return html;
+}
+
+// --- Baseline controls ----------------------------------------------
+
+async function memoryBaselineStatus() {
+    const target = document.getElementById('livemem-baseline');
+    if (!target) return;
+    try {
+        const resp = await fetch('/api/memory/baseline');
+        const d = await resp.json();
+        if (!d.total) {
+            target.innerHTML = '<span class="mem-warn-inline">No host baseline — '
+                + 'the box\'s own memory noise will count as evidence.</span>';
+            return;
+        }
+        const kinds = Object.entries(d.by_kind || {})
+            .sort((a, b) => b[1] - a[1])
+            .map(([k, v]) => `${k} ${v}`).join(', ');
+        target.innerHTML = `<span class="mem-foot-inline">Baseline: ${d.total} key(s)`
+            + (kinds ? ` — ${escapeHtml(kinds)}` : '')
+            + (d.updated ? ` · updated ${escapeHtml(d.updated)}` : '') + '</span>';
+    } catch (e) {
+        target.innerHTML = '';
+    }
+}
+
+async function memoryBaselineCapture() {
+    const target = document.getElementById('livemem-result');
+    if (!confirm('Capture a memory baseline now?\n\n'
+        + 'Everything the selected processes currently show will stop counting '
+        + 'as evidence. Only do this while the box is clean.')) return;
+    target.innerHTML = '<div class="pe-loading"><div class="loading-spinner"></div>'
+        + '<span>Scanning processes for the baseline (2 samples each)...</span></div>';
+    try {
+        LoadingSpinner.start();
+        const names = (document.getElementById('livemem-baseline-names').value || '').trim();
+        const resp = await fetch('/api/memory/baseline/capture', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(names ? { names: names } : {}),
+        });
+        const d = await resp.json();
+        LoadingSpinner.stop();
+        if (d.error) {
+            target.innerHTML = `<div class="pe-error">${escapeHtml(d.error)}</div>`;
+            return;
+        }
+        let html = `<div class="mem-section-label">Baseline captured</div>`;
+        html += `<div class="mem-chips"><span class="mem-chip"><span class="mem-chip-val">`
+            + `${d.captured}</span>new key(s)</span>`
+            + `<span class="mem-chip"><span class="mem-chip-val">${d.baseline.total}</span>total</span></div>`;
+        html += `<table class="mem-dump-table"><tr><th>process</th><th>pid</th><th>findings</th><th>new keys</th></tr>`;
+        (d.scanned || []).forEach(s => {
+            html += `<tr><td class="mem-dump-name">${escapeHtml(s.process || '')}</td>`
+                + `<td>${s.pid}</td><td>${s.findings}</td><td>${s.new_keys}</td></tr>`;
+        });
+        html += `</table>`;
+        (d.failures || []).forEach(f => {
+            html += `<div class="mem-kv det-warn">PID ${f.pid} ${escapeHtml(f.process || '')}: `
+                + `${escapeHtml(f.error)}</div>`;
+        });
+        target.innerHTML = html;
+        memoryBaselineStatus();
+    } catch (e) {
+        LoadingSpinner.stop();
+        target.innerHTML = `<div class="pe-error">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+async function memoryBaselineClear() {
+    if (!confirm('Clear the host baseline? Every finding will count as evidence again.')) return;
+    try {
+        await fetch('/api/memory/baseline', { method: 'DELETE' });
+        memoryBaselineStatus();
+    } catch (e) { /* status refresh is best-effort */ }
+}
+
+// --- Exit capture (post-mortem analysis of the exit-time memory dump) ----
+
+function renderExitCaptureBlock(ec) {
+    let html = `<div class="det-sub-title">Exit Capture &mdash; memory at process exit</div>`;
+    if (ec.error) {
+        return html + `<div class="det-sub-value det-warn">${escapeHtml(ec.error)}</div>`;
+    }
+    if (!ec.captured) {
+        return html + `<div class="det-sub-value">${escapeHtml(ec.note || 'No exit dump was written.')}</div>`;
+    }
+
+    const chip = (label, value, cls) =>
+        `<span class="mem-chip ${cls || ''}"><span class="mem-chip-val">${value}</span>${escapeHtml(label)}</span>`;
+    html += `<div class="mem-chips">`;
+    html += chip('modules', ec.modules);
+    html += chip('regions', ec.regions);
+    html += chip('threads', ec.threads);
+    html += chip('MB captured', ((ec.captured_bytes || 0) / 1048576).toFixed(1));
+    if (ec.emulated) html += chip(`under emulation on ${ec.host_arch}`, '', 'sev-info');
+    html += `</div>`;
+
+    // Host-explained regions are shown so the classification can be checked.
+    if ((ec.host_regions || []).length) {
+        html += `<details class="mem-suppressed"><summary>${ec.host_regions.length} private executable `
+            + `region(s) explained by the host, not scored</summary>`;
+        ec.host_regions.forEach(h => {
+            html += `<div class="mem-kv">${escapeHtml(h.base)} · ${formatSize(h.size)} · `
+                + `${escapeHtml(h.protect)} — ${escapeHtml(h.reason)}</div>`;
+        });
+        html += `</details>`;
+    }
+    (ec.notes || []).forEach(n => { html += `<div class="mem-kv">${escapeHtml(n)}</div>`; });
+
+    const arts = ec.artifacts || [];
+    if (arts.length) {
+        html += `<div class="mem-section-label">Extracted from memory (${arts.length})</div>`;
+        html += `<table class="mem-dump-table"><tr><th>file</th><th>kind</th><th>size</th><th></th></tr>`;
+        arts.forEach(a => {
+            const esc = (a.path || '').replace(/\\/g, '\\\\');
+            const cls = a.kind === 'main_image' ? '' : 'sev-high';
+            html += `<tr><td class="mem-dump-name" title="${escapeHtml(a.sha256 || '')}">${escapeHtml(a.filename)}</td>`
+                + `<td><span class="mem-chip ${cls}">${escapeHtml(a.kind)}</span></td>`
+                + `<td>${formatSize(a.size || 0)}</td><td class="mem-dump-actions">`;
+            if (a.is_pe) {
+                html += `<button class="btn btn-sm" onclick="fileMapRender('${esc}');switchTab('filemap');">Map</button>`;
+            }
+            html += `<button class="btn btn-sm" onclick="hexOpenFile('${esc}')">Hex</button></td></tr>`;
+        });
+        html += `</table>`;
+    }
+    if (ec.dump_path) {
+        html += `<div class="mem-foot">Dump: ${escapeHtml(ec.dump_path)} (${formatSize(ec.dump_size || 0)}) `
+            + `— opens in WinDbg for manual analysis</div>`;
+    }
+    return html + _detRawButton('View Exit Capture raw', ec);
+}
+
+
+// --- Network beaconing (periodicity of outbound connections, from Sysmon) ---
+
+function renderNetworkBeaconingBlock(net) {
+    let html = `<div class="det-sub-title">Network &mdash; connection periodicity</div>`;
+    const hits = net.evidence_findings || [];
+    html += `<div class="det-sub-value">${net.connections} outbound connection(s) to `
+        + `${(net.endpoints || []).length} endpoint(s)`
+        + (hits.length ? '' : ' — no regular check-in pattern') + `</div>`;
+    hits.forEach(f => {
+        html += `<div class="mem-finding sev-high"><div class="mem-finding-head">`
+            + `<span class="mem-type">${escapeHtml(f.endpoint || '')}</span>`
+            + `<span class="mem-size">${f.connections} conns</span>`
+            + `<span class="mem-size">every ${f.mean_interval_s}s</span>`
+            + `<span class="mem-size">CoV ${f.cov}</span></div>`
+            + `<div class="mem-desc">${escapeHtml(f.detail)}</div></div>`;
+    });
+    if (!hits.length && (net.endpoints || []).length) {
+        html += `<div class="mem-kv">${escapeHtml(net.endpoints.slice(0, 8).join(', '))}</div>`;
+    }
+    return html;
+}
+
+// --- System-wide sweep + Process Dump database --------------------------
+
+let _sweepPoll = null;
+
+async function memorySweepStart(asBaseline) {
+    const usePd = !!(document.getElementById('livemem-sweep-pd') || {}).checked;
+    if (asBaseline && !confirm('Record a system-wide baseline now?\n\n'
+        + 'Every finding in every running process will stop counting as evidence. '
+        + 'Only do this on a clean box.')) return;
+    if (usePd && !asBaseline && !confirm('Dumping every unknown module writes many files '
+        + 'to C:\\dumps and can take a long time. Continue?')) return;
+    try {
+        const resp = await fetch('/api/memory/sweep', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ aether: true, processdump: usePd, baseline: asBaseline }),
+        });
+        const d = await resp.json();
+        if (d.error) {
+            document.getElementById('livemem-sweep-status').textContent = d.error;
+            return;
+        }
+        memorySweepPoll();
+    } catch (e) {
+        document.getElementById('livemem-sweep-status').textContent = e.message;
+    }
+}
+
+async function memorySweepPoll() {
+    clearTimeout(_sweepPoll);
+    const status = document.getElementById('livemem-sweep-status');
+    try {
+        const d = await (await fetch('/api/memory/sweep')).json();
+        if (d.running) {
+            status.textContent = `sweep running · ${Math.round(d.elapsed_s || 0)}s`;
+            _sweepPoll = setTimeout(memorySweepPoll, 5000);
+            return;
+        }
+        if (d.error) { status.textContent = `sweep failed: ${d.error}`; return; }
+        if (d.result) {
+            const r = d.result;
+            status.textContent = `last sweep: ${r.processes_seen} processes · ${r.duration_s}s`;
+            document.getElementById('livemem-result').innerHTML = renderSweepResult(r);
+            memoryBaselineStatus();
+        }
+    } catch (e) { /* polling is best-effort */ }
+}
+
+function renderSweepResult(r) {
+    let html = `<div class="mem-section-label">System sweep (${escapeHtml(r.mode)}) — `
+        + `${r.processes_seen} processes in ${r.duration_s}s</div>`;
+    (r.errors || []).forEach(e => { html += `<div class="mem-kv det-warn">${escapeHtml(e)}</div>`; });
+    if (r.mode === 'baseline') {
+        return html + `<div class="det-sub-value">${r.baseline_keys_added} new baseline key(s) · `
+            + `${r.baseline.total} total</div>`;
+    }
+    const excl = r.excluded_host_tools || [];
+    if (excl.length) {
+        html += `<div class="mem-kv">Excluded (security tooling that holds detection rules in memory): `
+            + `${escapeHtml(excl.map(e => e.process).join(', '))}</div>`;
+    }
+    // Only processes that still score after the baseline are worth a row.
+    const flagged = r.processes.filter(p => p.score > 0);
+    if (!flagged.length) {
+        return html + `<div class="det-sub-value">No process carries findings beyond the host baseline `
+            + `(${r.processes.length} with baseline-known findings only).</div>`;
+    }
+    html += `<table class="mem-dump-table"><tr><th>process</th><th>pid</th><th>verdict</th>`
+        + `<th>score</th><th>suppressed</th><th>top evidence</th><th></th></tr>`;
+    flagged.forEach(p => {
+        const cls = p.label === 'MALICIOUS' ? 'sev-critical' : p.label === 'SUSPICIOUS' ? 'sev-high' : 'sev-low';
+        const top = (p.findings || [])[0];
+        html += `<tr><td class="mem-dump-name">${escapeHtml(p.process || '?')}</td><td>${p.pid}</td>`
+            + `<td><span class="mem-chip ${cls}">${escapeHtml(p.label)}</span></td>`
+            + `<td>${p.score}</td><td>${p.suppressed}</td>`
+            + `<td class="mem-dump-name">${top ? escapeHtml(top.label) : ''}</td>`
+            + `<td class="mem-dump-actions"><button class="btn btn-sm" `
+            + `onclick="document.getElementById('livemem-pid').value=${p.pid};livememAether()">Rescan</button></td></tr>`;
+    });
+    return html + `</table>`;
+}
+
+async function pdBaselineBuild() {
+    if (!confirm('Build the full Process Dump clean-hash database?\n\n'
+        + 'Hashes every PE under WINDIR and Program Files (20+ minutes). '
+        + 'Only on a clean box - anything hashed now is skipped in later dumps.')) return;
+    const status = document.getElementById('livemem-sweep-status');
+    try {
+        const d = await (await fetch('/api/processdump/baseline', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ mode: 'gen' }),
+        })).json();
+        status.textContent = d.error ? d.error : 'dump baseline build started';
+        if (!d.error) pdBaselinePoll();
+    } catch (e) { status.textContent = e.message; }
+}
+
+async function pdBaselinePoll() {
+    const status = document.getElementById('livemem-sweep-status');
+    try {
+        const d = await (await fetch('/api/processdump/baseline')).json();
+        if (d.running) {
+            status.textContent = `dump baseline (${d.mode}) running · ${Math.round(d.elapsed_s || 0)}s`;
+            setTimeout(pdBaselinePoll, 10000);
+        } else if (d.error) {
+            status.textContent = `dump baseline failed: ${d.error}`;
+        } else if (d.finished) {
+            status.textContent = `dump baseline done · ${d.clean_hashes ?? '?'} clean hashes`;
+            loadScanToolStatus();
+        }
+    } catch (e) { /* best-effort */ }
+}

@@ -8,7 +8,7 @@
     <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
     <link rel="icon" type="image/png" sizes="192x192" href="/static/favicon-192.png">
     <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
-    <link rel="stylesheet" href="/static/css/style.css?v=18">
+    <link rel="stylesheet" href="/static/css/style.css?v=25">
 </head>
 <body>
     <!-- Global loading overlay (shown on slow fetches) -->
@@ -35,6 +35,7 @@
                     <button class="tab" data-tab="threatscan">ThreatScan</button>
                     <button class="tab" data-tab="etw">ETW</button>
                     <button class="tab" data-tab="hexeditor">Hex</button>
+                    <button class="tab" data-tab="filemap">FileMap</button>
                     <button class="tab" data-tab="litterbox">LitterBox</button>
                     <button class="tab" data-tab="submit">Submit</button>
                 </nav>
@@ -400,6 +401,67 @@
                         <div class="scanner-placeholder">Select a file, choose one or more tools, and click Scan.</div>
                     </div>
 
+                    <!-- Live process memory (PID-based, independent of the
+                         telemetry-driven process list in the sidebar) -->
+                    <div class="scanner-livemem">
+                        <div class="scanner-history-header">
+                            <h3>Live Process Memory</h3>
+                            <span class="scanner-status" id="livemem-status"></span>
+                        </div>
+                        <div class="scanner-options">
+                            <label class="option-group">
+                                <span class="option-label">PID:</span>
+                                <input type="number" id="livemem-pid" class="filter-input" placeholder="1234" style="width:110px;">
+                            </label>
+                            <label class="option-group">
+                                <span class="option-label">or name:</span>
+                                <input type="text" id="livemem-name" class="filter-input" placeholder="notepad.exe" style="width:150px;">
+                                <button class="btn btn-sm" onclick="livememLookup()">Look up</button>
+                            </label>
+                            <button class="btn btn-sm btn-accent" id="livemem-aether-btn" onclick="livememAether()">Aether scan</button>
+                            <button class="btn btn-sm btn-accent" id="livemem-dump-btn" onclick="livememDump()">Dump memory</button>
+                            <label class="option-group">
+                                <span class="option-label">Samples:</span>
+                                <select id="livemem-samples" class="filter-select" title="Scanning repeatedly separates persistent findings from memory that briefly looked odd">
+                                    <option value="1">1 (snapshot)</option>
+                                    <option value="3" selected>3</option>
+                                    <option value="5">5</option>
+                                </select>
+                            </label>
+                            <label class="option-group">
+                                <span class="option-label">Interval:</span>
+                                <select id="livemem-interval" class="filter-select">
+                                    <option value="2">2s</option>
+                                    <option value="3" selected>3s</option>
+                                    <option value="10">10s</option>
+                                </select>
+                            </label>
+                        </div>
+                        <div class="scanner-options">
+                            <span class="option-label">Host baseline:</span>
+                            <input type="text" id="livemem-baseline-names" class="filter-input"
+                                   placeholder="explorer.exe,svchost.exe,msedge.exe" style="width:260px;"
+                                   title="Processes to sample for the baseline (default: the usual noisy ones)">
+                            <button class="btn btn-sm" onclick="memoryBaselineCapture()">Capture</button>
+                            <button class="btn btn-sm" onclick="memoryBaselineClear()">Clear</button>
+                            <span id="livemem-baseline"></span>
+                        </div>
+                        <div class="scanner-options">
+                            <span class="option-label">Whole system:</span>
+                            <button class="btn btn-sm btn-accent" onclick="memorySweepStart(false)" title="Aether scan of every accessible process, scored against the baseline">Sweep all processes</button>
+                            <label class="option-group" title="Also dump every unknown module (slow, writes many files)">
+                                <input type="checkbox" id="livemem-sweep-pd"> <span class="option-label">+ dump unknown</span>
+                            </label>
+                            <button class="btn btn-sm" onclick="memorySweepStart(true)" title="Sweep everything and record it as the host baseline - only on a clean box">Sweep as baseline</button>
+                            <button class="btn btn-sm" onclick="pdBaselineBuild()" title="Full Process Dump clean-hash database (hashes all PEs under WINDIR and Program Files, ~20+ min)">Full dump baseline</button>
+                            <span id="livemem-sweep-status" class="mem-foot-inline"></span>
+                        </div>
+                        <div class="scanner-options">
+                            <span class="option-label" style="opacity:0.7;">Scans or dumps a running process. Aether reports injection and implant structures; Process Dump writes memory components to disk for the file map and the static analyzers.</span>
+                        </div>
+                        <div class="mem-result" id="livemem-result"></div>
+                    </div>
+
                     <!-- Shared Scan History -->
                     <div class="scanner-history">
                         <div class="scanner-history-header">
@@ -442,6 +504,14 @@
                     </div>
                 </div>
                 <div class="hex-editor-container">
+                    <!-- Structure Minimap -->
+                    <div class="hex-minimap-wrap">
+                        <div class="hex-minimap-head">
+                            <span class="hex-minimap-title">STRUCTURE MAP</span>
+                            <span class="hex-minimap-info" id="hex-minimap-info"></span>
+                        </div>
+                        <div class="hex-minimap" id="hex-minimap"></div>
+                    </div>
                     <!-- File Info Bar -->
                     <div class="hex-file-info" id="hex-file-info">
                         <span class="hex-info-item">No file loaded</span>
@@ -500,6 +570,49 @@
                     <div class="elf-panel-body" id="elf-panel-body">
                         <div class="elf-empty">Load an ELF binary and click "ELF Analysis" to inspect headers, segments, symbols, and security features.</div>
                     </div>
+                </div>
+            </div>
+
+            <!-- FileMap Tab -->
+            <div class="tab-content" id="tab-filemap">
+                <div class="content-header">
+                    <h2>File Map</h2>
+                    <span class="content-subtitle">Byteplot, entropy and PE/ELF structure planes</span>
+                    <div class="header-actions">
+                        <label class="filemap-ctl">cols
+                            <select id="filemap-cols" class="filter-select" onchange="fileMapRender()">
+                                <option value="128">128</option>
+                                <option value="256" selected>256</option>
+                                <option value="512">512</option>
+                            </select>
+                        </label>
+                        <label class="filemap-ctl">height
+                            <select id="filemap-height" class="filter-select" onchange="fileMapRender()">
+                                <option value="520">520</option>
+                                <option value="740" selected>740</option>
+                                <option value="1000">1000</option>
+                            </select>
+                        </label>
+                        <button class="btn btn-sm btn-primary" onclick="fileMapRender()">Render</button>
+                    </div>
+                </div>
+                <!-- Drop zone + path input -->
+                <div class="hex-drop-zone filemap-drop-zone" id="filemap-drop-zone">
+                    <div class="hex-drop-icon">&#x1F5FA;</div>
+                    <p>Drop a PE/ELF file here or <span class="hex-browse-link" onclick="document.getElementById('filemap-file-input').click()">browse</span></p>
+                    <input type="file" id="filemap-file-input" hidden>
+                    <div class="hex-path-row">
+                        <span class="hex-path-or">or enter VM path:</span>
+                        <input type="text" id="filemap-path" class="filter-input hex-path-input" placeholder="C:\path\to\file.exe">
+                        <button class="btn btn-sm btn-primary" onclick="fileMapRender()">Render</button>
+                    </div>
+                </div>
+                <div class="filemap-container">
+                    <div class="hex-file-info" id="filemap-meta"></div>
+                    <div class="filemap-body" id="filemap-body">
+                        <div class="filemap-empty">Enter a file path (or load a file in the hex editor) and click Render.</div>
+                    </div>
+                    <div class="filemap-trees" id="filemap-trees"></div>
                 </div>
             </div>
 
@@ -878,6 +991,6 @@ C:\Users\vagrant\Desktop\infected\  Malware samples (Defender-excluded)</pre>
         </div>
     </div>
 
-    <script src="/static/js/app.js?v=15"></script>
+    <script src="/static/js/app.js?v=28"></script>
 </body>
 </html>
