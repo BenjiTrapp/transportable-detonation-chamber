@@ -36,6 +36,24 @@ def _post(path: str, data: dict | None = None, files: dict | None = None, timeou
     return r.json()
 
 
+def _call(method: str, path: str, timeout: float = 60.0, **kwargs) -> dict:
+    """Request that returns the API's JSON error body instead of raising.
+
+    The live-memory endpoints answer 4xx with an explanatory {"error": ...}
+    (e.g. no cached results for a PID); surfacing that text is more useful to
+    an MCP client than an HTTP exception.
+    """
+    r = httpx.request(method, f"{TDC_BASE_URL}{path}", timeout=timeout, **kwargs)
+    try:
+        body = r.json()
+    except ValueError:
+        r.raise_for_status()
+        return {"error": f"Unexpected non-JSON response ({r.status_code})"}
+    if r.is_error and isinstance(body, dict) and "error" not in body:
+        body["error"] = f"HTTP {r.status_code}"
+    return body
+
+
 # --- Status & Services ---
 
 
@@ -600,6 +618,235 @@ def tdc_powershell_activity(pid: Optional[int] = None, max_events: int = 30) -> 
         lines.append(f"\n[{ts}] PID:{epid} (parent:{ppid}) User:{user}")
         lines.append(f"  {cmd}")
 
+    return "\n".join(lines)
+
+
+# --- Live memory (Aether, Process Dump, exit capture, evidence model) ---
+
+
+def _fmt_evidence(ev: dict, limit: int = 8) -> list[str]:
+    """Render a memory-evidence verdict as readable lines."""
+    lines = [f"Verdict: {ev.get('label')} (score {ev.get('score')}; "
+             f"suspicious >= {ev.get('thresholds', {}).get('suspicious')}, "
+             f"malicious >= {ev.get('thresholds', {}).get('malicious')})"]
+    if ev.get("note"):
+        lines.append(f"Note: {ev['note']}")
+    if ev.get("suppressed_count"):
+        lines.append(f"{ev['suppressed_count']} finding(s) suppressed by the host baseline")
+    for f in (ev.get("findings") or [])[:limit]:
+        if not f.get("score"):
+            continue
+        why = [f"confidence {f.get('confidence')}"]
+        if (f.get("samples") or 1) > 1:
+            why.append(f"seen {f.get('seen_in')}/{f.get('samples')} samples")
+        if f.get("corroborated_by"):
+            why.append("corroborated by " + ", ".join(f["corroborated_by"]))
+        lines.append(f"  {f['score']:5.2f}  {f.get('label')} [{f.get('source')}] - "
+                     f"{(f.get('detail') or '')[:120]} ({'; '.join(why)})")
+    return lines
+
+
+@mcp.tool()
+def tdc_memory_scan(pid: int, samples: int = 3, interval: int = 3) -> str:
+    """Scan a running process's memory with Aether and score the findings.
+
+    Repeated sampling separates findings that persist from memory that only
+    briefly looked suspicious. The verdict comes from TDC's evidence model
+    (evidence class, persistence, corroboration, host baseline), not from
+    Aether's own severity labels.
+
+    Args:
+        pid: Process ID inside the analysis VM
+        samples: Number of scans (1-10, default 3)
+        interval: Seconds between scans (default 3)
+    """
+    result = _call("POST", "/api/scan/aether",
+                   data={"pid": pid, "samples": samples, "interval": interval},
+                   timeout=60.0 + samples * (interval + 60))
+    if result.get("error"):
+        return f"Error: {result['error']}"
+    head = [f"Aether scan of PID {pid} ({result.get('process') or '?'}), "
+            f"{result.get('samples')} sample(s)"]
+    if result.get("observed") is False:
+        head.append(result.get("observation_note") or "Nothing observed.")
+    return "\n".join(head + _fmt_evidence(result.get("evidence") or {}))
+
+
+@mcp.tool()
+def tdc_memory_dump(pid: int, ignore_clean_db: bool = False) -> str:
+    """Dump a running process's memory components to disk with Process Dump.
+
+    Modules matching the clean-hash database are skipped, so the dump holds
+    what is new on the box: unpacked payloads, hidden modules and header-less
+    code chunks. Returned paths can be passed to tdc_file_map.
+
+    Args:
+        pid: Process ID inside the analysis VM
+        ignore_clean_db: Also dump known-good modules (default False)
+    """
+    result = _call("POST", "/api/scan/processdump",
+                   data={"pid": pid, "ignore_clean_db": str(ignore_clean_db).lower()},
+                   timeout=360.0)
+    if result.get("error"):
+        return f"Error: {result['error']}"
+    lines = [f"{result.get('dump_count')} dump(s) in {result.get('output_dir')}: "
+             f"{result.get('hidden_modules')} hidden module(s), "
+             f"{result.get('code_chunks')} code chunk(s)"
+             + (f", {result['host_code_chunks']} host-explained chunk(s) (emulator cache)"
+                if result.get("host_code_chunks") else "")]
+    for d in (result.get("dumps") or [])[:40]:
+        tag = f" [host: {d['host_class']}]" if d.get("host_class") else ""
+        lines.append(f"  {d.get('kind'):13} {d.get('arch') or '':4} {d.get('size'):>9}  {d.get('path')}{tag}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def tdc_memory_evidence(pid: int) -> str:
+    """Re-score every cached memory result for a PID across all sources.
+
+    Combines Aether, Process Dump, exit-capture and beacon scanners into one
+    verdict. Use after a detonation or after changing the host baseline.
+
+    Args:
+        pid: Process ID the results were recorded under
+    """
+    result = _call("POST", "/api/memory/evidence", data={"pid": pid}, timeout=60.0)
+    if result.get("error"):
+        return f"Error: {result['error']}"
+    head = [f"PID {pid} ({result.get('process') or '?'}) - sources: "
+            + ", ".join(result.get("sources") or [])]
+    return "\n".join(head + _fmt_evidence(result.get("evidence") or {}, limit=12))
+
+
+@mcp.tool()
+def tdc_detonation_memory(pid: int, sha256: str = "") -> str:
+    """Memory results of a detonation: live scans, exit capture, beaconing.
+
+    Includes the analysis of the exit-time memory dump, which covers samples
+    that terminated before any live scanner could reach them.
+
+    Args:
+        pid: PID returned by tdc_submit
+        sha256: Sample hash (optional, helps match cached results)
+    """
+    params = {"pid": pid}
+    if sha256:
+        params["sha256"] = sha256
+    d = _call("GET", "/api/detonation/results", params=params, timeout=60.0)
+    lines = []
+    ev = d.get("memory_evidence")
+    if ev:
+        lines.append("Sources: " + ", ".join(ev.get("sources_present") or []))
+        lines += _fmt_evidence(ev, limit=12)
+    else:
+        lines.append("No memory results yet (scans run for ~1-2 minutes after detonation).")
+    ec = d.get("exit_capture_result") or {}
+    if ec.get("captured"):
+        lines.append(f"Exit capture: {len(ec.get('artifacts') or [])} artifact(s) extracted")
+        for a in (ec.get("artifacts") or [])[:10]:
+            lines.append(f"  {a.get('kind'):18} {a.get('size'):>9}  {a.get('path')}")
+    net = d.get("network_beaconing") or {}
+    if net.get("available"):
+        lines.append(f"Network: {net.get('connections')} connection(s) to "
+                     f"{len(net.get('endpoints') or [])} endpoint(s)")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def tdc_memory_baseline(action: str = "status", names: str = "") -> str:
+    """Inspect or manage the host memory baseline.
+
+    The baseline holds findings this host produces on its own (framework
+    strings, pointer tables in explorer.exe ...). They stop counting as
+    evidence. Capture only while the box is clean.
+
+    Args:
+        action: "status", "capture" (named processes), "sweep" (every process,
+            runs in background) or "clear"
+        names: Comma-separated image names for "capture" (default: the usual
+            noisy processes)
+    """
+    if action == "status":
+        d = _call("GET", "/api/memory/baseline")
+        return (f"Baseline: {d.get('total')} key(s), updated {d.get('updated')}\n"
+                + json.dumps(d.get("by_kind"), indent=2))
+    if action == "capture":
+        d = _call("POST", "/api/memory/baseline/capture",
+                  data={"names": names} if names else {}, timeout=1200.0)
+        if d.get("error"):
+            return f"Error: {d['error']}"
+        return (f"Captured {d.get('captured')} new key(s); total {d['baseline']['total']}\n"
+                + "\n".join(f"  {s['process']} (PID {s['pid']}): {s['new_keys']} new"
+                            for s in d.get("scanned") or []))
+    if action == "sweep":
+        d = _call("POST", "/api/memory/sweep", data={"aether": "true", "baseline": "true"})
+        return "Baseline sweep started; check with tdc_memory_sweep_status." if d.get("started") \
+            else f"Error: {d.get('error')}"
+    if action == "clear":
+        d = _call("DELETE", "/api/memory/baseline", timeout=15.0)
+        return f"Error: {d['error']}" if d.get("error") else "Baseline cleared."
+    return "Unknown action (use status, capture, sweep or clear)."
+
+
+@mcp.tool()
+def tdc_memory_sweep(dump_unknown: bool = False) -> str:
+    """Start a background memory sweep of every process in the VM.
+
+    Each process is scored against the host baseline. Takes several minutes;
+    poll with tdc_memory_sweep_status.
+
+    Args:
+        dump_unknown: Also run Process Dump -system (slow, writes many files)
+    """
+    d = _call("POST", "/api/memory/sweep",
+              data={"aether": "true", "processdump": str(dump_unknown).lower()})
+    return "Sweep started." if d.get("started") else f"Error: {d.get('error')}"
+
+
+@mcp.tool()
+def tdc_memory_sweep_status() -> str:
+    """Progress or result of the last memory sweep."""
+    d = _call("GET", "/api/memory/sweep")
+    if d.get("running"):
+        return f"Sweep running for {d.get('elapsed_s')}s."
+    if d.get("error"):
+        return f"Sweep failed: {d['error']}"
+    r = d.get("result")
+    if not r:
+        return "No sweep has run yet."
+    flagged = [p for p in r.get("processes") or [] if p.get("score")]
+    lines = [f"{r['mode']} sweep: {r['processes_seen']} processes in {r['duration_s']}s; "
+             f"{len(flagged)} with findings beyond the baseline"]
+    if r.get("excluded_host_tools"):
+        lines.append("Excluded host tools: " + ", ".join(e["process"] for e in r["excluded_host_tools"]))
+    for p in flagged[:20]:
+        lines.append(f"  {p['label']:10} {p['score']:5}  {p['process']} (PID {p['pid']})")
+        for reason in p.get("reasons", [])[:2]:
+            lines.append(f"      {reason}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def tdc_file_map(path: str) -> str:
+    """Structure overview of a PE/ELF file in the VM (sections, directories, imports).
+
+    Works on dumped artifacts too, e.g. paths returned by tdc_memory_dump.
+
+    Args:
+        path: File path inside the analysis VM
+    """
+    d = _call("GET", "/api/file/visualize", params={"path": path, "rows": 64}, timeout=60.0)
+    if d.get("error"):
+        return f"Error: {d['error']}"
+    lines = [f"{d.get('filename')}: {d.get('format')}, {d.get('file_size')} bytes, "
+             f"entropy {d.get('total_entropy')}"]
+    if d.get("parse_error"):
+        lines.append(f"Parse error: {d['parse_error']}")
+    for r in d.get("regions") or []:
+        lines.append(f"  {r['offset']:#010x} {r['size']:>9}  {r['name']}")
+    for t in (d.get("import_tree") or [])[:15]:
+        susp = f", {t['suspicious_count']} suspicious" if t.get("suspicious_count") else ""
+        lines.append(f"  import {t['dll']} ({t['count']}{susp})")
     return "\n".join(lines)
 
 
