@@ -263,8 +263,13 @@ async function refreshDashboard() {
 
 async function refreshAlerts() {
     try {
-        const resp = await fetch('/api/alerts');
+        // Conditional request: the server answers 304 when nothing changed,
+        // which skips both the transfer and re-parsing tens of MB of JSON.
+        const headers = state.alertsEtag ? { 'If-None-Match': state.alertsEtag } : {};
+        const resp = await fetch('/api/alerts', { headers, cache: 'no-store' });
+        if (resp.status === 304) return;
         if (resp.ok) {
+            state.alertsEtag = resp.headers.get('ETag') || null;
             const newAlerts = await resp.json();
             // Toast on new alerts arriving
             if (state.alerts.length > 0 && newAlerts.length > state.alerts.length) {

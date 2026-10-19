@@ -518,37 +518,52 @@ def parse_rustinel_alert(line):
     return alert
 
 
+_rustinel_file_cache = {}       # path -> (mtime_ns, size, [alerts])
+
+
+def _parse_rustinel_file(filepath):
+    """Parse one Rustinel alert file, reusing the last result if unchanged.
+
+    The loader runs every 5 s; re-parsing every file each time cost ~2 s of
+    CPU per cycle on the VM even when nothing had been written.
+    """
+    try:
+        st = os.stat(filepath)
+    except OSError:
+        return []
+    cached = _rustinel_file_cache.get(filepath)
+    if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+        return cached[2]
+    parsed = []
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if line.strip():
+                    alert = parse_rustinel_alert(line)
+                    if alert:
+                        parsed.append(alert)
+    except (IOError, OSError):
+        return cached[2] if cached else []
+    _rustinel_file_cache[filepath] = (st.st_mtime_ns, st.st_size, parsed)
+    return parsed
+
+
 def load_rustinel_alerts():
     """Load all NDJSON alert files from Rustinel alerts directory."""
     alerts = []
     if not os.path.isdir(RUSTINEL_ALERTS_DIR):
         return alerts
 
-    for filepath in glob.glob(os.path.join(RUSTINEL_ALERTS_DIR, "*.ndjson")):
-        try:
-            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    if line.strip():
-                        alert = parse_rustinel_alert(line)
-                        if alert:
-                            alerts.append(alert)
-        except (IOError, OSError):
-            continue
-
-    # Also check for .json files (including date-suffixed like alerts.json.2026-06-08)
+    files = set(glob.glob(os.path.join(RUSTINEL_ALERTS_DIR, "*.ndjson")))
+    # Also .json files (including date-suffixed like alerts.json.2026-06-08);
+    # each may be a single JSON object or NDJSON, which the line parser covers.
     for pattern in ("*.json", "alerts.json.*"):
-        for filepath in glob.glob(os.path.join(RUSTINEL_ALERTS_DIR, pattern)):
-            try:
-                with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read().strip()
-                    # Could be single JSON object or NDJSON
-                    for line in content.split("\n"):
-                        if line.strip():
-                            alert = parse_rustinel_alert(line)
-                            if alert:
-                                alerts.append(alert)
-            except (IOError, OSError):
-                continue
+        files.update(glob.glob(os.path.join(RUSTINEL_ALERTS_DIR, pattern)))
+    for filepath in sorted(files):
+        alerts.extend(_parse_rustinel_file(filepath))
+    # Forget files that were rotated away.
+    for gone in set(_rustinel_file_cache) - files:
+        _rustinel_file_cache.pop(gone, None)
 
     # Deduplicate by id
     seen = set()
@@ -632,8 +647,45 @@ def parse_fibratus_alert(data):
     return alert
 
 
+_fibratus_cache = {"record_id": None, "alerts": []}
+
+
+def _fibratus_newest_record_id():
+    """EventRecordID of the newest Fibratus event (cheap: one wevtutil call)."""
+    try:
+        proc = subprocess.run(
+            ["wevtutil", "qe", "Application",
+             "/q:*[System[Provider[@Name='Fibratus']]]", "/c:1", "/rd:true", "/f:xml"],
+            capture_output=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return None
+    raw = (proc.stdout or b"").decode("utf-8", errors="replace")
+    start = raw.find("<EventRecordID>")
+    if start < 0:
+        return ""  # provider has no events
+    end = raw.find("</EventRecordID>", start)
+    return raw[start + len("<EventRecordID>"):end].strip()
+
+
 def load_fibratus_alerts():
-    """Load Fibratus alerts from Windows Event Log (Application log, Provider: Fibratus)."""
+    """Load Fibratus alerts from Windows Event Log (Application log, Provider: Fibratus).
+
+    Rendering 500 event messages through PowerShell takes ~3 s, so it only
+    runs when the newest Fibratus record differs from the last load.
+    """
+    newest = _fibratus_newest_record_id()
+    if newest is not None and newest == _fibratus_cache["record_id"]:
+        return _fibratus_cache["alerts"]
+    alerts = _load_fibratus_alerts_full()
+    if newest is not None:
+        _fibratus_cache.update(record_id=newest, alerts=alerts)
+    return alerts
+
+
+def _load_fibratus_alerts_full():
+    """Query and parse the most recent 500 Fibratus events."""
     global _fibratus_last_read_time
     alerts = []
 
@@ -698,8 +750,18 @@ def load_fibratus_alerts():
     return alerts
 
 
+_litterbox_backoff = {"until": 0.0, "results": []}
+_LITTERBOX_RETRY_S = 60
+
+
 def load_litterbox_results():
-    """Poll LitterBox /files and /api/results/risk endpoints for analysis results."""
+    """Poll LitterBox /files and /api/results/risk endpoints for analysis results.
+
+    When LitterBox is not running each attempt costs a ~2 s connect timeout,
+    so after a failure it is only retried once a minute.
+    """
+    if time.time() < _litterbox_backoff["until"]:
+        return _litterbox_backoff["results"]
     alerts = []
     try:
         r = requests.get(f"{LITTERBOX_API}/files", timeout=5)
@@ -707,7 +769,9 @@ def load_litterbox_results():
             return alerts
         data = r.json()
     except (requests.RequestException, ValueError):
-        return alerts
+        _litterbox_backoff["until"] = time.time() + _LITTERBOX_RETRY_S
+        return _litterbox_backoff["results"]
+    _litterbox_backoff["until"] = 0.0
 
     # Process payload-based results
     payloads = {}
@@ -779,6 +843,8 @@ def load_litterbox_results():
         except (KeyError, TypeError, ValueError):
             continue
 
+    # Served while LitterBox is unreachable, so results do not flicker away.
+    _litterbox_backoff["results"] = alerts
     return alerts
 
 
@@ -1006,6 +1072,24 @@ def _fetch_vm_alerts():
     return []
 
 
+def _alerts_version(alerts):
+    """Content token for an alert list: changes whenever any alert is added,
+    removed or replaced. Hashing the ids costs a few ms for ~10k alerts."""
+    h = hashlib.md5()
+    for a in alerts:
+        h.update(str(a.get("id") or a.get("timestamp") or "").encode("utf-8", "replace"))
+        h.update(b"\n")
+    return f"{len(alerts)}-{h.hexdigest()[:16]}"
+
+
+def _store_alerts(alerts, processes):
+    version = _alerts_version(alerts)
+    with store_lock:
+        events_store["alerts"] = alerts
+        events_store["processes"] = processes
+        events_store["alerts_version"] = version
+
+
 # --- Background alert loader ---
 def alert_loader_thread():
     """Periodically reload alerts from Rustinel, Fibratus, and LitterBox."""
@@ -1024,10 +1108,7 @@ def alert_loader_thread():
             if not has_local_data and VM_WEBUI_URL:
                 vm_alerts = _fetch_vm_alerts()
                 if vm_alerts:
-                    processes = build_process_tree(vm_alerts)
-                    with store_lock:
-                        events_store["alerts"] = vm_alerts
-                        events_store["processes"] = processes
+                    _store_alerts(vm_alerts, build_process_tree(vm_alerts))
                     time.sleep(5)
                     continue
 
@@ -1058,10 +1139,7 @@ def alert_loader_thread():
             # Sort by timestamp
             unique_alerts.sort(key=lambda a: a.get("timestamp", ""))
 
-            processes = build_process_tree(unique_alerts)
-            with store_lock:
-                events_store["alerts"] = unique_alerts
-                events_store["processes"] = processes
+            _store_alerts(unique_alerts, build_process_tree(unique_alerts))
         except Exception as e:
             print(f"[alert_loader] Error: {e}")
         time.sleep(5)
@@ -1074,48 +1152,60 @@ def index():
 
 
 # --- Routes: API ---
+_status_cache = {"at": 0.0, "data": None}
+_STATUS_TTL = 5  # seconds; the dashboard polls every 10 s
+
+
+def _probe_http(url, timeout=2):
+    try:
+        return requests.get(url, timeout=timeout)
+    except Exception:
+        return None
+
+
 @app.route("/api/status")
 def api_status():
-    """Get status of all integrated services."""
-    status = {}
+    """Get status of all integrated services.
 
-    # Check DetonatorAgent - validate response is actually valid JSON with 200
-    try:
-        r = requests.get(f"{DETONATOR_AGENT_API}/api/lock/status", timeout=2)
-        if r.status_code == 200:
-            status["detonator_agent"] = {"online": True, "data": r.json()}
-        else:
+    The HTTP probes run concurrently: done one after another, each offline
+    service added its full connect timeout to every dashboard refresh.
+    """
+    if _status_cache["data"] is not None and time.time() - _status_cache["at"] < _STATUS_TTL:
+        return jsonify(_status_cache["data"])
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        f_agent = pool.submit(_probe_http, f"{DETONATOR_AGENT_API}/api/lock/status")
+        f_det = pool.submit(_probe_http, f"{DETONATOR_API}/api/submissions")
+        f_lb = pool.submit(_probe_http, LITTERBOX_API)
+        f_fib = pool.submit(_is_fibratus_running)
+        f_rust = pool.submit(lambda: os.path.isdir(RUSTINEL_ALERTS_DIR) and _is_rustinel_running())
+        f_sysmon = pool.submit(_is_sysmon_running)
+
+        status = {}
+        r = f_agent.result()
+        if r is not None and r.status_code == 200:
+            try:
+                status["detonator_agent"] = {"online": True, "data": r.json()}
+            except ValueError:
+                status["detonator_agent"] = {"online": False, "status_code": r.status_code}
+        elif r is not None:
             status["detonator_agent"] = {"online": False, "status_code": r.status_code}
-    except Exception:
-        status["detonator_agent"] = {"online": False}
+        else:
+            status["detonator_agent"] = {"online": False}
 
-    # Check Detonator - validate 200 status
-    try:
-        r = requests.get(f"{DETONATOR_API}/api/submissions", timeout=2)
-        status["detonator"] = {"online": r.status_code == 200}
-    except Exception:
-        status["detonator"] = {"online": False}
+        r = f_det.result()
+        status["detonator"] = {"online": r is not None and r.status_code == 200}
+        r = f_lb.result()
+        status["litterbox"] = {"online": r is not None and r.status_code == 200}
+        status["fibratus"] = {"online": f_fib.result()}
+        status["rustinel"] = {
+            "online": bool(f_rust.result()),
+            "alerts_count": len(events_store.get("alerts", [])),
+        }
+        status["sysmon"] = {"online": f_sysmon.result()}
 
-    # Check LitterBox - validate 200 status
-    try:
-        r = requests.get(LITTERBOX_API, timeout=2)
-        status["litterbox"] = {"online": r.status_code == 200}
-    except Exception:
-        status["litterbox"] = {"online": False}
-
-    # Check Fibratus - independent check via service or API
-    status["fibratus"] = {"online": _is_fibratus_running()}
-
-    # Rustinel - check process existence
-    rustinel_online = os.path.isdir(RUSTINEL_ALERTS_DIR) and _is_rustinel_running()
-    status["rustinel"] = {
-        "online": rustinel_online,
-        "alerts_count": len(events_store.get("alerts", [])),
-    }
-
-    # Sysmon - check if service is running
-    status["sysmon"] = {"online": _is_sysmon_running()}
-
+    _status_cache.update(at=time.time(), data=status)
     return jsonify(status)
 
 
@@ -1527,9 +1617,34 @@ def api_rustinel():
     return jsonify(info)
 
 
+_alerts_body_cache = {"version": None, "body": b""}
+
+
 @app.route("/api/alerts")
 def api_alerts():
-    """Get all Rustinel/Fibratus alerts."""
+    """Get all Rustinel/Fibratus alerts.
+
+    The unfiltered list is polled every 5 s per open tab and is tens of MB,
+    so it carries an ETag: an unchanged list is answered with 304 and no
+    body, and the serialized form is reused across clients.
+    """
+    filtered = any(request.args.get(k) for k in ("severity", "engine", "pid", "since", "detonated"))
+    if not filtered:
+        with store_lock:
+            alerts = events_store.get("alerts", [])
+            version = events_store.get("alerts_version") or _alerts_version(alerts)
+        etag = f'"{version}"'
+        if request.headers.get("If-None-Match") == etag:
+            resp = app.response_class(status=304)
+        else:
+            if _alerts_body_cache["version"] != version:
+                _alerts_body_cache["body"] = json.dumps(alerts).encode("utf-8")
+                _alerts_body_cache["version"] = version
+            resp = app.response_class(_alerts_body_cache["body"], mimetype="application/json")
+        resp.headers["ETag"] = etag
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
     with store_lock:
         alerts = events_store.get("alerts", [])
     # Filter by severity/engine/detonated if requested
@@ -2954,50 +3069,86 @@ def api_detonation_results():
     return jsonify(results)
 
 
+_net_beacon_cache = {}          # pid -> (fetched_at, result)
+_NET_BEACON_TTL = 20            # seconds; polling runs every 5 s
+
+
+def _sysmon_network_events(pid):
+    """Sysmon NetworkConnect events of one PID as (timestamp, ip, port).
+
+    Uses wevtutil with an XPath filter on ProcessId, so the event log does the
+    filtering. The generic _read_sysmon_events path starts PowerShell and
+    filters in Python, which costs ~8 s per call on the ARM64 VM.
+    """
+    import datetime as _dt
+    import xml.etree.ElementTree as ET
+    query = ("*[System[(EventID=3)] and "
+             f"EventData[Data[@Name='ProcessId']='{int(pid)}']]")
+    proc = subprocess.run(
+        ["wevtutil", "qe", "Microsoft-Windows-Sysmon/Operational",
+         f"/q:{query}", "/f:xml", "/c:500", "/rd:true"],
+        capture_output=True, timeout=15,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    raw = (proc.stdout or b"").decode("utf-8", errors="replace")
+    ns = "{http://schemas.microsoft.com/win/2004/08/events/event}"
+    conns, image = [], ""
+    for chunk in raw.split("</Event>"):
+        start = chunk.find("<Event")
+        if start < 0:
+            continue
+        try:
+            ev = ET.fromstring(chunk[start:] + "</Event>")
+        except ET.ParseError:
+            continue
+        data = {d.get("Name"): (d.text or "") for d in ev.iter(f"{ns}Data")}
+        image = image or os.path.basename(data.get("Image", ""))
+        utc = data.get("UtcTime", "")
+        try:
+            t = _dt.datetime.strptime(utc[:23], "%Y-%m-%d %H:%M:%S.%f").replace(
+                tzinfo=_dt.timezone.utc).timestamp()
+        except ValueError:
+            continue
+        conns.append((t, data.get("DestinationIp"), data.get("DestinationPort")))
+    return conns, image
+
+
 def _network_beaconing_for_pid(pid):
     """Score a process's outbound connections for check-in periodicity.
 
     Reads Sysmon NetworkConnect events, which are logged as they happen and
-    therefore remain available after the process has exited.
+    therefore remain available after the process has exited. Cached briefly
+    because the result page polls this every few seconds.
     """
-    import datetime as _dt
     try:
         pid = int(pid)
     except (TypeError, ValueError):
         return {"error": "invalid pid"}
+
+    cached = _net_beacon_cache.get(pid)
+    if cached and time.time() - cached[0] < _NET_BEACON_TTL:
+        return cached[1]
+
     if not _is_sysmon_running():
         return {"available": False, "reason": "Sysmon not running"}
     try:
-        events = _read_sysmon_events(max_events=500, pid=pid, event_id=3, event_ids=[3])
+        conns, image = _sysmon_network_events(pid)
     except Exception as e:
         return {"available": False, "reason": str(e)}
 
-    conns, image = [], ""
-    for e in events or []:
-        if not isinstance(e, dict) or e.get("error"):
-            continue
-        image = image or os.path.basename(e.get("image") or "")
-        ts = e.get("timestamp") or ""
-        try:
-            # Sysmon reports 7 fractional digits; fromisoformat wants at most 6.
-            if "." in ts:
-                head, rest = ts.split(".", 1)
-                frac = "".join(c for c in rest if c.isdigit())[:6]
-                tz = rest[len("".join(c for c in rest if c.isdigit())):]
-                ts = f"{head}.{frac}{tz}"
-            t = _dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            continue
-        conns.append((t, e.get("dst_ip"), e.get("dst_port")))
-
     findings = memory_evidence.beaconing_from_connections(conns, process=image)
     endpoints = sorted({f"{ip}:{port}" for _, ip, port in conns})
-    return {
+    result = {
         "available": True,
         "connections": len(conns),
         "endpoints": endpoints[:50],
         "evidence_findings": findings,
     }
+    _net_beacon_cache[pid] = (time.time(), result)
+    if len(_net_beacon_cache) > 200:
+        oldest = min(_net_beacon_cache, key=lambda k: _net_beacon_cache[k][0])
+        _net_beacon_cache.pop(oldest, None)
+    return result
 
 
 def _compute_verdict(results, matching_alerts):
@@ -5200,6 +5351,11 @@ ENTROPY_WARN_THRESHOLD = 6.5
 # from their first 64 MB so one huge file cannot stall the UI thread.
 VISUALIZE_MAX_BYTES = 64 * 1024 * 1024
 
+# Recently computed file maps, keyed by path + mtime + size + grid parameters.
+from collections import OrderedDict as _OrderedDict
+_visualize_cache = _OrderedDict()
+VISUALIZE_CACHE_SIZE = 12
+
 # --- DiE-style Detection Signatures ---
 # Compiler/Linker detection based on linker version and import patterns
 PE_LINKER_SIGNATURES = {
@@ -5288,15 +5444,14 @@ def calculate_entropy(data):
     """Calculate Shannon entropy of a byte sequence."""
     if not data:
         return 0.0
-    freq = [0] * 256
-    for byte in data:
-        freq[byte] += 1
+    # Counter tallies the bytes in C; the former per-byte Python loop was the
+    # single largest cost when analyzing multi-MB samples.
+    from collections import Counter
     length = len(data)
     entropy = 0.0
-    for count in freq:
-        if count > 0:
-            p = count / length
-            entropy -= p * math.log2(p)
+    for count in Counter(data).values():
+        p = count / length
+        entropy -= p * math.log2(p)
     return round(entropy, 4)
 
 
@@ -7488,6 +7643,18 @@ def api_file_visualize():
     if not os.path.isfile(norm_path):
         return jsonify({"error": _quarantine_hint(norm_path, "File not found")}), 404
 
+    # The same file is mapped by the hex minimap, the analysis panel and the
+    # FileMap tab; computing the planes takes seconds for large samples.
+    try:
+        st = os.stat(norm_path)
+        cache_key = (norm_path.lower(), st.st_mtime_ns, st.st_size, cols, max_rows, entropy_cols)
+    except OSError:
+        cache_key = None
+    cached = _visualize_cache.get(cache_key) if cache_key else None
+    if cached is not None:
+        _visualize_cache.move_to_end(cache_key)
+        return jsonify(dict(cached, path=filepath))
+
     try:
         with open(norm_path, "rb") as f:
             data = f.read(VISUALIZE_MAX_BYTES + 1)
@@ -7509,7 +7676,13 @@ def api_file_visualize():
         fmt = "PE"
         try:
             import pefile
-            pe = pefile.PE(data=data, fast_load=False)
+            # Full parsing also walks resources, relocations and debug data,
+            # which the map does not use and which dominate on large DLLs.
+            pe = pefile.PE(data=data, fast_load=True)
+            pe.parse_data_directories(directories=[
+                pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"],
+                pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"],
+            ])
             regions = _pe_structure_regions(pe, data)
             import_tree = _pe_import_tree(pe)
             export_tree = _pe_export_tree(pe)
@@ -7545,7 +7718,7 @@ def api_file_visualize():
             "offset": r["offset"],
         })
 
-    return jsonify({
+    result = {
         "format": fmt,
         "path": filepath,
         "filename": os.path.basename(norm_path),
@@ -7568,7 +7741,12 @@ def api_file_visualize():
             "structure": struct_legend,
         },
         "parse_error": parse_error,
-    })
+    }
+    if cache_key:
+        _visualize_cache[cache_key] = result
+        while len(_visualize_cache) > VISUALIZE_CACHE_SIZE:
+            _visualize_cache.popitem(last=False)
+    return jsonify(result)
 
 
 # --- Main ---
