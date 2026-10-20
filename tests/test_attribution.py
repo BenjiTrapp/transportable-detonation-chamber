@@ -12,6 +12,18 @@ import pytest
 from conftest import make_alert
 
 
+def utc(local_naive):
+    """A local wall-clock time (as submissions record it) as an ISO UTC string.
+
+    Submissions store naive local time, alerts carry UTC; computing the
+    alert times from local time keeps the tests independent of the
+    machine's time zone (CI runs in UTC).
+    """
+    import datetime
+    dt = datetime.datetime.fromisoformat(local_naive).astimezone(datetime.timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 SUB = {"agent_pid": 4242, "timestamp": "2026-10-20T10:00:00", "filename": "evil.exe",
        "file_path": r"C:\Users\Public\Downloads\evil.exe", "sha256": "ab" * 32}
 
@@ -63,9 +75,9 @@ def test_fibratus_alerts_do_not_mark_processes_detonated(tdc):
 def test_sample_and_its_children_are_detonated(tdc, monkeypatch):
     monkeypatch.setattr(tdc, "_load_submissions", lambda: [SUB])
     procs = tdc.build_process_tree([
-        make_alert(1, 4242, "2026-10-20T08:00:05Z", SUB["file_path"]),
-        make_alert(2, 4300, "2026-10-20T08:00:09Z", r"C:\x\cmd.exe", 4242, "evil.exe"),
-        make_alert(3, 4242, "2026-10-21T08:00:00Z", r"C:\x\svchost.exe"),   # reused PID
+        make_alert(1, 4242, utc("2026-10-20T10:00:05"), SUB["file_path"]),
+        make_alert(2, 4300, utc("2026-10-20T10:00:09"), r"C:\x\cmd.exe", 4242, "evil.exe"),
+        make_alert(3, 4242, utc("2026-10-21T10:00:00"), r"C:\x\svchost.exe"),   # reused PID
     ])
     det = sorted(p["name"] for p in procs.values() if p.get("detonated"))
     assert det == ["cmd.exe", "evil.exe"]
@@ -81,7 +93,7 @@ def test_detonation_results_ignore_alerts_of_earlier_pid_holders(tdc, client, mo
     monkeypatch.setattr(tdc, "_is_rustinel_running", lambda: False)
     monkeypatch.setattr(tdc, "_network_beaconing_for_pid", lambda pid: {"available": False})
     old = make_alert(1, 4242, "2026-09-14T07:55:51Z", r"C:\x\powershell.exe")
-    new = make_alert(2, 4242, "2026-10-20T08:00:05Z", SUB["file_path"])
+    new = make_alert(2, 4242, utc("2026-10-20T10:00:05"), SUB["file_path"])
     tdc._store_alerts([old, new])
     d = client.get(f"/api/detonation/results?pid=4242&sha256={SUB['sha256']}").get_json()
     assert [a["id"] for a in d["fibratus_alerts"]] == ["a2"]

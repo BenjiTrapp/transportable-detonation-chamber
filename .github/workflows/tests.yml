@@ -7,6 +7,12 @@ on:
 jobs:
   unit:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Submissions store local time, alerts UTC: run in more than one zone.
+        tz: ["UTC", "Europe/Berlin"]
+    env:
+      TZ: ${{ matrix.tz }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
