@@ -186,6 +186,26 @@ VERDICT_MALICIOUS = 6.0
 VERDICT_SUSPICIOUS = 2.0
 
 
+# Version of the finding-key scheme. Baselines record it; a baseline built
+# with another version is ignored until it is captured again, because its
+# keys can no longer match (or could match the wrong thing).
+#   1: process identified by image *name*
+#   2: process identified by full image path where known - a sample that
+#      names itself svchost.exe no longer inherits svchost's baseline
+KEY_VERSION = 2
+
+
+def _process_identity(process):
+    """(display name, key part) for a process given as a name or full path."""
+    text = (process or "").strip()
+    if "\\" in text or "/" in text:
+        norm = text.replace("/", "\\").lower()
+        if norm.startswith("\\??\\"):
+            norm = norm[4:]
+        return text.replace("/", "\\").rsplit("\\", 1)[-1], norm
+    return text, text.lower()
+
+
 def _short_hash(*parts):
     """Stable short digest over the identity-defining parts of a finding."""
     raw = "|".join(str(p) for p in parts)
@@ -209,14 +229,17 @@ class MemoryFinding(dict):
         self["evidence"] = spec.get("evidence", EVIDENCE_STRING)
         self["base_weight"] = spec.get("weight", 1.0) if weight is None else weight
         self["needs_corroboration"] = spec.get("corroborate", True)
-        self["process"] = process
+        display, process_key = _process_identity(process)
+        self["process"] = display
+        if process_key != display.lower():
+            self["image_path"] = process
         self["detail"] = detail
         self["address"] = address
         self["raw_severity"] = raw_severity
         # Identity deliberately excludes the address: ASLR and heap churn move
         # the same logical finding around between scans, which is exactly what
         # made one-shot results look unstable.
-        self["key"] = _short_hash(kind, (process or "").lower(), *identity)
+        self["key"] = _short_hash(kind, process_key, *identity)
         if extra:
             self.update(extra)
 
@@ -397,17 +420,35 @@ def from_moneta(result, process=""):
 
 
 def from_hsb(result, process=""):
-    """Normalize Hunt-Sleeping-Beacons findings."""
+    """Normalize Hunt-Sleeping-Beacons findings (one per process).
+
+    Identity is the set of detection titles, not thread IDs, so the same
+    sleeping implant matches across scans and against the baseline.
+    """
     out = []
     if not isinstance(result, dict):
         return out
+    limited = bool(result.get("limitation"))
     for f in result.get("findings") or []:
+        dets = f.get("detections") or []
+        titles = sorted({d.get("title", "") for d in dets}) or sorted(set(f.get("indicators") or []))
         indicators = "; ".join(f.get("indicators") or [])
+        high = f.get("severity") == "high"
         out.append(MemoryFinding(
             source="hunt-sleeping-beacons", kind="sleeping_beacon",
-            process=f.get("process") or process,
+            process=process or f.get("process") or "",
             detail=indicators[:400],
-            identity=(indicators[:120],),
+            identity=tuple(titles)[:6],
+            raw_severity=f.get("severity") or "",
+            weight=(KINDS["sleeping_beacon"]["weight"] * (1.0 if high else 0.6)
+                    * (0.5 if limited else 1.0)),
+            extra={
+                "threads": [d.get("thread") for d in dets][:20],
+                # A cross-architecture view or a low-severity hit is a lead,
+                # not proof: it needs a second source.
+                "needs_corroboration": True if (limited or not high) else KINDS["sleeping_beacon"].get("corroborate", True),
+                "limitation": result.get("limitation"),
+            },
         ))
     return out
 
@@ -458,7 +499,7 @@ def beaconing_from_connections(connections, process=""):
             continue
         # A tight, sustained rhythm is machine-driven on its own; looser timing
         # also fits update checks and telemetry, so it needs a second opinion.
-        tight = robust_cov <= 0.2 and on_rhythm >= 0.7 and len(times) >= 6
+        tight = robust_cov <= 0.2 and on_rhythm >= 0.7 and len(intervals) + 1 >= 6
         weight = KINDS["c2_beaconing"]["weight"] * (1.0 if tight else 0.7)
         out.append(MemoryFinding(
             source="sysmon-network", kind="c2_beaconing", process=process,
@@ -479,17 +520,20 @@ def beaconing_from_connections(connections, process=""):
 
 
 def from_beaconeye(result, process=""):
-    """Normalize BeaconEye findings."""
+    """Normalize BeaconEye findings: a parsed beacon configuration is strong evidence."""
     out = []
     if not isinstance(result, dict):
         return out
+    limited = bool(result.get("limitation"))
     for f in result.get("findings") or []:
         cfg = f.get("config") or {}
         out.append(MemoryFinding(
-            source="beaconeye", kind="beacon_config", process=process,
+            source="beaconeye", kind="beacon_config", process=process or f.get("process") or "",
             detail=f.get("summary") or "CobaltStrike beacon configuration",
-            identity=(cfg.get("c2") or f.get("summary") or "",),
-            extra={"config": cfg or None},
+            identity=(cfg.get("C2Server") or cfg.get("c2") or "", cfg.get("Watermark") or ""),
+            weight=KINDS["beacon_config"]["weight"] * (0.5 if limited else 1.0),
+            extra={"config": cfg or None, "keys_found": f.get("keys_found"),
+                   "limitation": result.get("limitation")},
         ))
     return out
 
@@ -553,8 +597,16 @@ class MemoryBaseline:
     def __init__(self, path):
         self.path = path
         self._lock = threading.Lock()
-        self._data = {"created": None, "updated": None, "keys": {}}
+        self._data = self._empty()
         self.load()
+
+    @staticmethod
+    def _empty():
+        return {"created": None, "updated": None, "key_version": KEY_VERSION, "keys": {}}
+
+    def _stale(self):
+        """True if the stored keys were built with another key scheme."""
+        return self._data.get("key_version", 1) != KEY_VERSION
 
     def load(self):
         if not os.path.isfile(self.path):
@@ -564,21 +616,40 @@ class MemoryBaseline:
                 data = json.load(f)
             if isinstance(data, dict) and isinstance(data.get("keys"), dict):
                 self._data = data
-        except (json.JSONDecodeError, IOError):
-            pass
+                if self._stale():
+                    print(f"[memory_baseline] {self.path} uses key scheme "
+                          f"v{data.get('key_version', 1)}, current is v{KEY_VERSION}: "
+                          f"ignored until the baseline is captured again")
+        except (ValueError, IOError) as e:
+            # Keep the unreadable file for inspection instead of silently
+            # starting empty and overwriting it on the next add().
+            print(f"[memory_baseline] unreadable baseline {self.path}: {e}")
+            try:
+                os.replace(self.path, self.path + ".corrupt")
+            except OSError:
+                pass
 
     def save(self):
+        # Write to a temp file and swap it in: an interrupted in-place write
+        # used to leave invalid JSON, which load() then treated as empty.
+        tmp = self.path + ".tmp"
         try:
-            with open(self.path, "w") as f:
-                json.dump(self._data, f, indent=2)
-        except IOError:
-            pass
+            with open(tmp, "w") as f:
+                json.dump(self._data, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.path)
+        except (IOError, OSError) as e:
+            print(f"[memory_baseline] could not save {self.path}: {e}")
 
     def add(self, findings):
         """Record findings as benign-for-this-host. Returns the number added."""
         added = 0
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         with self._lock:
+            if self._stale():
+                # Old keys cannot match new findings; start the new scheme fresh.
+                self._data = self._empty()
             keys = self._data.setdefault("keys", {})
             for f in findings:
                 entry = keys.get(f["key"])
@@ -599,24 +670,38 @@ class MemoryBaseline:
         return added
 
     def knows(self, key):
+        if self._stale():
+            return False
         return key in (self._data.get("keys") or {})
 
     def clear(self):
         with self._lock:
-            self._data = {"created": None, "updated": None, "keys": {}}
+            self._data = self._empty()
             self.save()
 
     def stats(self):
-        keys = self._data.get("keys") or {}
+        # Under the lock: a sweep thread adds keys while requests read stats.
+        with self._lock:
+            keys = dict(self._data.get("keys") or {})
+            created, updated = self._data.get("created"), self._data.get("updated")
+            stale = self._stale()
+            stored_version = self._data.get("key_version", 1)
         by_kind = {}
         for entry in keys.values():
             by_kind[entry.get("kind", "?")] = by_kind.get(entry.get("kind", "?"), 0) + 1
-        return {
-            "total": len(keys),
-            "by_kind": by_kind,
-            "created": self._data.get("created"),
-            "updated": self._data.get("updated"),
+        out = {
+            "total": 0 if stale else len(keys),
+            "by_kind": {} if stale else by_kind,
+            "created": created,
+            "updated": updated,
+            "key_version": KEY_VERSION,
         }
+        if stale:
+            out["stale"] = True
+            out["stale_keys"] = len(keys)
+            out["note"] = (f"Baseline was captured with key scheme v{stored_version} "
+                           f"and is ignored; capture it again on a clean system.")
+        return out
 
 
 # --- Scoring ----------------------------------------------------------
@@ -762,8 +847,10 @@ def collect(results, process=""):
     aether = results.get("aether") or {}
     if isinstance(aether, dict):
         # A multi-sample scan already carries merged findings.
-        if aether.get("evidence_findings"):
-            findings += aether["evidence_findings"]
+        # An empty merged list is still the authoritative result; falling back
+        # to the raw report would re-score only the last sample.
+        if "evidence_findings" in aether:
+            findings += aether["evidence_findings"] or []
         elif aether.get("report"):
             findings += from_aether(aether["report"], process)
     findings += from_process_dump(results.get("process_dump") or {}, process)

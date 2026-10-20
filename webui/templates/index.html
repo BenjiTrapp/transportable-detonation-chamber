@@ -8,7 +8,7 @@
     <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
     <link rel="icon" type="image/png" sizes="192x192" href="/static/favicon-192.png">
     <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
-    <link rel="stylesheet" href="/static/css/style.css?v=25">
+    <link rel="stylesheet" href="/static/css/style.css?v=27">
 </head>
 <body>
     <!-- Global loading overlay (shown on slow fetches) -->
@@ -242,6 +242,7 @@
                         <select id="graph-layout" class="filter-select">
                             <option value="tree" selected>Process tree</option>
                             <option value="force">Force-directed</option>
+                            <option value="iso">Isometric</option>
                         </select>
                         <div class="graph-zoom-controls">
                             <button class="btn btn-sm graph-zoom-btn" onclick="graphZoomIn()" title="Zoom in">+</button>
@@ -753,40 +754,43 @@
                 <!-- Overview -->
                 <div class="help-section active" id="help-overview">
                     <h3>What is Detonation Chamber?</h3>
-                    <p>A pre-configured <strong>Windows 11 VM</strong> for malware detonation testing against multiple EDR solutions. The unified web UI aggregates telemetry from all engines into a single dark-themed interface for real-time analysis.</p>
+                    <p>A pre-configured <strong>Windows 11 VM</strong> for detonating samples and watching them with several EDR-style engines at once. This web UI combines their telemetry with live-memory forensics into one verdict per detonation.</p>
 
                     <h4>Key Capabilities</h4>
                     <div class="help-grid">
                         <div class="help-card">
                             <div class="help-card-icon" style="color:#22d3ee">&#x1F50D;</div>
                             <div class="help-card-title">Real-time Detection</div>
-                            <div class="help-card-desc">Sigma rules, YARA signatures, and IOC hash matching via Rustinel ETW engine</div>
+                            <div class="help-card-desc">Sigma, YARA and IOC matching via Rustinel; kernel ETW behavior rules via Fibratus; Sysmon events</div>
                         </div>
                         <div class="help-card">
-                            <div class="help-card-icon" style="color:#f472b6">&#x1F9EC;</div>
-                            <div class="help-card-title">Deep Telemetry</div>
-                            <div class="help-card-desc">Kernel-level ETW tracing via Fibratus &mdash; process, file, registry, network events</div>
+                            <div class="help-card-icon" style="color:#f472b6">&#x1F9E0;</div>
+                            <div class="help-card-title">Live Memory</div>
+                            <div class="help-card-desc">Aether, Process Dump, Hunt-Sleeping-Beacons, BeaconEye and an exit-time dump, scored by one evidence model with a host baseline</div>
                         </div>
                         <div class="help-card">
                             <div class="help-card-icon" style="color:#fbbf24">&#x1F6E1;</div>
-                            <div class="help-card-title">Multi-Engine Scanning</div>
-                            <div class="help-card-desc">PE-Sieve, Moneta, HollowsHunter, RedEdr, ThreatCheck, DefenderCheck</div>
+                            <div class="help-card-title">Static Scanning</div>
+                            <div class="help-card-desc">ThreatCheck, DefenderCheck, EMBER2024 (ML), capa (ATT&amp;CK capabilities), LitterBox</div>
                         </div>
                         <div class="help-card">
                             <div class="help-card-icon" style="color:#a855f7">&#x1F4CA;</div>
-                            <div class="help-card-title">PE Analysis</div>
-                            <div class="help-card-desc">Header parsing, entropy detection, import/export analysis, packer identification</div>
+                            <div class="help-card-title">Binary Analysis</div>
+                            <div class="help-card-desc">PE/ELF parsing, packer detection, entropy, file map, hex editor</div>
                         </div>
                     </div>
 
                     <h4>Workflow</h4>
                     <ol class="help-steps">
-                        <li><strong>Submit</strong> a sample via the Submit tab (drag &amp; drop or browse)</li>
-                        <li><strong>DetonatorAgent</strong> executes the sample in the VM</li>
-                        <li><strong>LitterBox</strong> runs static analysis (YARA, strings) + dynamic analysis (PE-Sieve, Moneta, HollowsHunter)</li>
-                        <li><strong>Fibratus + Rustinel</strong> capture ETW telemetry and fire Sigma/YARA detection rules</li>
-                        <li><strong>View results</strong> in real-time across Dashboard, Tracing, Graph, and Sysmon tabs</li>
+                        <li><strong>Submit</strong> a sample (Submit tab, <code>make submit</code> or the MCP tool <code>tdc_submit_file</code>)</li>
+                        <li><strong>DetonatorAgent</strong> runs it; exit capture is armed first</li>
+                        <li><strong>Rustinel, Fibratus, Sysmon</strong> record what it does</li>
+                        <li><strong>Live-memory scanners</strong> examine the running process (1&ndash;2 minutes); if it exits, its exit dump is analyzed instead</li>
+                        <li><strong>Read the verdict</strong> in Submit, then follow up in Tracing, Graph and Sysmon</li>
                     </ol>
+
+                    <h4>Process instances</h4>
+                    <p>Windows reuses PIDs. The UI tracks every process instance separately: <code>1234</code> is the newest process with PID 1234, <code>1234@1789372861</code> an earlier one. Alerts, events and children belong to the instance that was running at the time.</p>
                 </div>
 
                 <!-- Usage Guide -->
@@ -796,97 +800,107 @@
                     <div class="help-tab-guide">
                         <div class="help-guide-item">
                             <h4>Dashboard</h4>
-                            <p>System overview with stats strip (alerts, processes, services, rules, tools), service health cards, and recent activity feed. Auto-refreshes every 10 seconds.</p>
+                            <p>Stats strip (alerts, processes, services, rules, tools), one card per service with launch buttons, recent activity.</p>
                         </div>
                         <div class="help-guide-item">
                             <h4>Tracing</h4>
-                            <p>Real-time console showing all ETW events and detection alerts. Select a process from the sidebar to filter events. Timeline visualization shows alert distribution over time.</p>
+                            <p>Per-process console: verdict, timeline by event type, process tree and alert table. Click an alert for its full raw event and Sigma match details.</p>
                         </div>
                         <div class="help-guide-item">
                             <h4>Graph</h4>
-                            <p>Process relationship visualization with 5 layout modes (Force-directed, Hierarchical, Radial, Circular, Grid). Zoom controls, search, and time-range filtering. Nodes represent processes, edges show parent-child relationships.</p>
+                            <p>Process tree around a process. Layouts: process tree, force-directed, isometric (foldable subtrees, activity icons, remote threads as bridges). The landing page lists samples and candidate processes; click a node for its detail panel.</p>
                         </div>
                         <div class="help-guide-item">
                             <h4>Sysmon</h4>
-                            <p>Windows Sysmon event log viewer. Shows process creation, network connections, file creation, and registry events from Sysmon's ETW provider.</p>
+                            <p>Sysmon events with search, type and PID filters, and the Windows Event IDs each event corresponds to.</p>
                         </div>
                         <div class="help-guide-item">
-                            <h4>Scanner</h4>
-                            <p>Run ThreatCheck or DefenderCheck against files. Supports Defender and AMSI engines. Results show detection status, byte offset of trigger, and link to hex editor for inspection.</p>
+                            <h4>ThreatScan</h4>
+                            <p>ThreatCheck, DefenderCheck, EMBER2024 and capa on a file. The Live Process Memory panel scans a running PID with Aether, dumps it with Process Dump, captures the host baseline or sweeps every process.</p>
                         </div>
                         <div class="help-guide-item">
-                            <h4>EMBER</h4>
-                            <p>Score a file with the EMBER2024 (thrember) LightGBM classifier. Returns a machine-learning malicious probability (0&ndash;1) for PE/ELF/PDF/APK samples. Choose a benchmark model and decision threshold; results and history show the score, verdict, and SHA256.</p>
+                            <h4>ETW</h4>
+                            <p>Event Log browser across 12 channels with live threat highlighting; click an event to see all fields.</p>
                         </div>
                         <div class="help-guide-item">
-                            <h4>capa</h4>
-                            <p>Detect <em>capabilities</em> in a file with Mandiant capa (static, no execution). Answers "what can it do?" &mdash; e.g. process injection, persistence, C2 &mdash; and maps each finding to MITRE ATT&amp;CK and the Malware Behavior Catalog. Complements EMBER's malicious score with an explainable capability breakdown.</p>
+                            <h4>Hex</h4>
+                            <p>Hex editor with data inspector and structure minimap. PE/ELF Analysis parses headers, sections, imports and IOC flags; Inspect shows a section's hex dump and strings.</p>
                         </div>
                         <div class="help-guide-item">
-                            <h4>Hex Editor</h4>
-                            <p>Binary file viewer with offset navigation, data inspector (Int8/16/32, Float, ASCII, UTF-16), and drag-and-drop file upload. <strong>PE Analysis</strong> button parses headers, sections, imports, and flags IOC indicators.</p>
+                            <h4>FileMap</h4>
+                            <p>Byteplot, entropy and PE/ELF structure planes side by side with import/export trees; click to jump to an offset.</p>
+                        </div>
+                        <div class="help-guide-item">
+                            <h4>LitterBox</h4>
+                            <p>Files in the LitterBox sandbox with static, dynamic and EDR results.</p>
                         </div>
                         <div class="help-guide-item">
                             <h4>Submit</h4>
-                            <p>Detonate samples against DetonatorAgent and/or LitterBox. Triggers full analysis pipeline and polls for results. Shows stage-by-stage progress with Fibratus alerts, static analysis (YARA), and dynamic analysis (PE-Sieve, Moneta, HollowsHunter).</p>
+                            <p>Detonate a sample and follow its stages. The verdict combines EDR alerts, live memory (Aether, Process Dump, beacon scanners), the exit-time dump, network beaconing and LitterBox.</p>
                         </div>
                     </div>
                 </div>
 
                 <!-- API Reference -->
                 <div class="help-section" id="help-api">
-                    <h3>API Metamodel</h3>
-                    <p class="help-muted">All endpoints are served on port <code>9000</code>. Responses are JSON unless noted.</p>
+                    <h3>API</h3>
+                    <p class="help-muted">Served on port <code>9000</code>, JSON. No login (keep the VM on an isolated network); state-changing requests from other web sites are refused. The full reference with all endpoints is in the README; the MCP server (<code>mcp/server.py</code>, 41 tools) wraps the same API.</p>
 
-                    <h4>Core APIs</h4>
+                    <h4>Core</h4>
                     <table class="help-api-table">
                         <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
                         <tbody>
-                            <tr><td class="api-get">GET</td><td><code>/api/alerts</code></td><td>All detection alerts (Rustinel + Fibratus + LitterBox)</td></tr>
-                            <tr><td class="api-get">GET</td><td><code>/api/processes</code></td><td>Tracked processes with activity counts</td></tr>
-                            <tr><td class="api-get">GET</td><td><code>/api/status</code></td><td>Service health status (all components)</td></tr>
-                            <tr><td class="api-get">GET</td><td><code>/api/rustinel</code></td><td>Rustinel engine info (rules, version)</td></tr>
-                            <tr><td class="api-get">GET</td><td><code>/api/submissions</code></td><td>Submission history (last 200)</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/alerts</code></td><td>Detection alerts. Filters: <code>severity</code>, <code>engine</code>, <code>pid</code>, <code>since</code>, <code>detonated</code>, <code>limit</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/alerts/&lt;id&gt;</code></td><td>One alert with its complete raw event</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/processes</code></td><td>Process instances with activity counts</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/processes/&lt;key&gt;</code></td><td>One process instance (<code>&lt;pid&gt;</code> or <code>&lt;pid&gt;@&lt;start&gt;</code>)</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/sessions</code></td><td>Alerts grouped into activity bursts</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/status</code></td><td>Service health</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/submissions</code></td><td>Submission history</td></tr>
                         </tbody>
                     </table>
 
-                    <h4>Submission &amp; Detonation</h4>
+                    <h4>Detonation &amp; Graph</h4>
                     <table class="help-api-table">
                         <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
                         <tbody>
-                            <tr><td class="api-post">POST</td><td><code>/api/submit</code></td><td>Submit sample (multipart). Params: <code>file</code>, <code>target</code> (agent/litterbox/both)</td></tr>
-                            <tr><td class="api-get">GET</td><td><code>/api/detonation/results</code></td><td>Poll results. Params: <code>sha256</code>, <code>pid</code>, <code>litterbox_hash</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/submit</code></td><td>Submit a sample. Params: <code>file</code>, <code>target</code> (agent/litterbox/both)</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/detonation/results</code></td><td>Combined verdict and results. Params: <code>sha256</code>, <code>pid</code>, <code>filename</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/process-graph</code></td><td>Process tree around a process. Params: <code>pid</code>, <code>at</code>, <code>down_depth</code>, <code>max_nodes</code></td></tr>
                         </tbody>
                     </table>
 
-                    <h4>Hex Editor &amp; PE Analysis</h4>
+                    <h4>Files</h4>
                     <table class="help-api-table">
                         <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
                         <tbody>
                             <tr><td class="api-get">GET</td><td><code>/api/file/hex</code></td><td>Hex dump. Params: <code>path</code>, <code>offset</code>, <code>bytes</code></td></tr>
-                            <tr><td class="api-post">POST</td><td><code>/api/file/hex/upload</code></td><td>Upload file for hex viewing</td></tr>
-                            <tr><td class="api-get">GET</td><td><code>/api/file/pe</code></td><td>PE header analysis. Param: <code>path</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/file/pe</code></td><td>PE analysis. Param: <code>path</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/file/elf</code></td><td>ELF analysis. Param: <code>path</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/file/visualize</code></td><td>File map planes and import/export trees</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/file/signature</code></td><td>Authenticode signer and trust</td></tr>
                         </tbody>
                     </table>
 
-                    <h4>Scanner</h4>
+                    <h4>Scanners &amp; Live memory</h4>
                     <table class="help-api-table">
                         <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
                         <tbody>
-                            <tr><td class="api-post">POST</td><td><code>/api/scan/threatcheck</code></td><td>ThreatCheck scan. Params: <code>file</code>/<code>path</code>, <code>engine</code>, <code>type</code></td></tr>
-                            <tr><td class="api-post">POST</td><td><code>/api/scan/defendercheck</code></td><td>DefenderCheck scan. Params: <code>file</code>/<code>path</code></td></tr>
-                            <tr><td class="api-post">POST</td><td><code>/api/scan/ember</code></td><td>EMBER2024 ML score. Params: <code>file</code>/<code>path</code>, <code>model</code>, <code>threshold</code></td></tr>
-                            <tr><td class="api-post">POST</td><td><code>/api/scan/capa</code></td><td>capa capability detection (ATT&amp;CK/MBC). Params: <code>file</code>/<code>path</code></td></tr>
-                            <tr><td class="api-get">GET</td><td><code>/api/scan/status</code></td><td>Scanner tool availability</td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/scan/threatcheck</code></td><td>ThreatCheck (also <code>defendercheck</code>, <code>ember</code>, <code>capa</code>)</td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/scan/aether</code></td><td>Aether scan of a PID, scored. Params: <code>pid</code>, <code>samples</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/scan/processdump</code></td><td>Dump a PID's memory components</td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/scan/beacons</code></td><td>Hunt-Sleeping-Beacons (also <code>beaconeye</code>)</td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/memory/sweep</code></td><td>Scan every process (or capture the baseline)</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/memory/baseline</code></td><td>Host memory baseline status</td></tr>
                         </tbody>
                     </table>
 
-                    <h4>Proxy Endpoints</h4>
+                    <h4>Events</h4>
                     <table class="help-api-table">
                         <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
                         <tbody>
-                            <tr><td class="api-get">GET/POST</td><td><code>/api/litterbox/&lt;path&gt;</code></td><td>Proxy to LitterBox API (:1337)</td></tr>
-                            <tr><td class="api-get">GET</td><td><code>/api/fibratus/&lt;path&gt;</code></td><td>Proxy to Fibratus API (:8180)</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/sysmon</code></td><td>Sysmon events. Params: <code>max</code>, <code>event_id</code>, <code>pid</code>, <code>parent_pid</code>, <code>since</code>, <code>until</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/etw/events</code></td><td>Event Log channel. Params: <code>channel</code>, <code>max</code>, <code>filter</code></td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -895,63 +909,56 @@
                 <div class="help-section" id="help-architecture">
                     <h3>Architecture</h3>
                     <pre class="help-arch-diagram">
-&#x250C;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2510;
-&#x2502;  Windows 11 VM (Hyper-V / QEMU)                          &#x2502;
-&#x2502;                                                           &#x2502;
-&#x2502;  &#x250C;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2510;   &#x250C;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2510;   &#x250C;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2510;   &#x2502;
-&#x2502;  &#x2502;  Web UI    &#x2502;   &#x2502; DetonatorAgent &#x2502;   &#x2502; LitterBox  &#x2502;   &#x2502;
-&#x2502;  &#x2502;  :9000    &#x2502;&#x2500;&#x2500;&#x25B6;&#x2502;  :8080        &#x2502;   &#x2502;  :1337    &#x2502;   &#x2502;
-&#x2502;  &#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2518;   &#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2518;   &#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2518;   &#x2502;
-&#x2502;       &#x2502;                  &#x2502;                   &#x2502;            &#x2502;
-&#x2502;       &#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x25BC;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2518;            &#x2502;
-&#x2502;                  &#x250C;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2510;                        &#x2502;
-&#x2502;                  &#x2502;    Fibratus     &#x2502;                        &#x2502;
-&#x2502;                  &#x2502;  Kernel ETW     &#x2502;                        &#x2502;
-&#x2502;                  &#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2518;                        &#x2502;
-&#x2502;                  &#x250C;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2510;                        &#x2502;
-&#x2502;                  &#x2502;   Rustinel      &#x2502;                        &#x2502;
-&#x2502;                  &#x2502; Sigma+YARA+IOC  &#x2502;                        &#x2502;
-&#x2502;                  &#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2518;                        &#x2502;
-&#x2502;                  &#x250C;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2510;                        &#x2502;
-&#x2502;                  &#x2502;    Sysmon       &#x2502;                        &#x2502;
-&#x2502;                  &#x2502;  Event Log      &#x2502;                        &#x2502;
-&#x2502;                  &#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2518;                        &#x2502;
-&#x2514;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2500;&#x2518;</pre>
+Web UI :9000 ──submit──▶ DetonatorAgent :8080 ──runs──▶ sample
+     │    └────────────▶ LitterBox :1337 (static + dynamic)
+     │
+     ├──◀── alerts ── Rustinel (Sigma/YARA/IOC) · Fibratus (ETW) · Sysmon
+     │
+     └──── live memory ──▶ Aether · Process Dump · HSB · BeaconEye
+                          Exit Capture (dump at process exit)</pre>
 
                     <h4>Data Flow</h4>
                     <ol class="help-steps">
-                        <li>Sample submitted via Web UI &rarr; forwarded to DetonatorAgent + LitterBox</li>
-                        <li>DetonatorAgent executes the sample, returns PID</li>
-                        <li>LitterBox runs static (YARA, CheckPlz, Stringnalyzer) + dynamic (PE-Sieve, Moneta, HollowsHunter, RedEdr) analysis</li>
-                        <li>Fibratus captures kernel-level ETW events for the process</li>
-                        <li>Rustinel matches events against 20 Sigma + 717 YARA rules + IOC hashes</li>
-                        <li>Web UI aggregates alerts from all engines into unified timeline</li>
+                        <li>Sample submitted &rarr; DetonatorAgent and/or LitterBox; exit capture armed for its image name</li>
+                        <li>DetonatorAgent executes it and returns the PID</li>
+                        <li>Rustinel, Fibratus and Sysmon record its activity</li>
+                        <li>Hunt-Sleeping-Beacons, BeaconEye, Aether (3 samples) and Process Dump scan the PID</li>
+                        <li>Sysmon network events are checked for periodic connections</li>
+                        <li>All memory findings are scored together (persistence, corroboration, host baseline) and combined with EDR alerts and LitterBox into one verdict</li>
                     </ol>
 
                     <h4>File Layout</h4>
-                    <pre class="help-code">C:\DetonationChamberUI\         Web UI (Flask, this interface)
-C:\tools\rustinel\              Rustinel ETW engine + rules
-C:\tools\fibratus\              Fibratus kernel tracer
-C:\DetonatorAgent\              .NET 8 execution agent
-C:\LitterBox\                   Analysis sandbox
-C:\tools\ThreatCheck\           AV signature scanner
-C:\tools\DefenderCheck\         Defender evasion tester
-C:\tools\detection-rules\       Sigma + YARA + IOC rules
-C:\Users\vagrant\Desktop\infected\  Malware samples (Defender-excluded)</pre>
+                    <pre class="help-code">C:\DetonationChamberUI\           Web UI (this interface), memory_results\, baseline
+C:\tools\rustinel\                Rustinel ETW engine
+C:\tools\fibratus\                Fibratus kernel tracer
+C:\DetonatorAgent\                .NET execution agent
+C:\LitterBox\                     Analysis sandbox
+C:\tools\Aether\                  Memory forensics scanner + rules
+C:\tools\ProcessDump\             pd64.exe + clean-hash database
+C:\tools\Hunt-Sleeping-Beacons\   Sleeping beacon scanner
+C:\tools\BeaconEye\               Cobalt Strike config scanner
+C:\dumps\                         Memory dumps; exit\ = exit-time dumps
+C:\tools\detection-rules\         Sigma + YARA + IOC rules
+C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
                 </div>
 
                 <!-- Services -->
                 <div class="help-section" id="help-services">
-                    <h3>Services</h3>
+                    <h3>Services &amp; Tools</h3>
                     <table class="help-api-table">
-                        <thead><tr><th>Service</th><th>Port</th><th>Purpose</th><th>Technology</th></tr></thead>
+                        <thead><tr><th>Component</th><th>Port</th><th>Purpose</th><th>Technology</th></tr></thead>
                         <tbody>
-                            <tr><td><strong>Web UI</strong></td><td>9000</td><td>Unified dashboard &amp; API gateway</td><td>Python / Flask</td></tr>
-                            <tr><td><strong>DetonatorAgent</strong></td><td>8080</td><td>Executes malware samples, returns PID</td><td>.NET 8.0</td></tr>
+                            <tr><td><strong>Web UI</strong></td><td>9000</td><td>Dashboard, REST API, MCP backend</td><td>Python / Flask</td></tr>
+                            <tr><td><strong>DetonatorAgent</strong></td><td>8080</td><td>Executes samples, returns PID</td><td>.NET 8</td></tr>
                             <tr><td><strong>LitterBox</strong></td><td>1337</td><td>Static + dynamic analysis sandbox</td><td>Python / Flask</td></tr>
                             <tr><td><strong>Fibratus</strong></td><td>8180</td><td>Kernel ETW telemetry &amp; behavior rules</td><td>Go</td></tr>
                             <tr><td><strong>Rustinel</strong></td><td>&mdash;</td><td>Sigma/YARA/IOC real-time detection</td><td>Rust</td></tr>
-                            <tr><td><strong>Sysmon</strong></td><td>&mdash;</td><td>Windows event logging (process, network, file)</td><td>Sysinternals</td></tr>
+                            <tr><td><strong>Sysmon</strong></td><td>&mdash;</td><td>Process, network, file, registry, DNS events</td><td>Sysinternals</td></tr>
+                            <tr><td><strong>Aether</strong></td><td>&mdash;</td><td>Live-process memory forensics</td><td>Zig</td></tr>
+                            <tr><td><strong>Process Dump</strong></td><td>&mdash;</td><td>Dumps unpacked / hidden modules and code</td><td>C++</td></tr>
+                            <tr><td><strong>Exit Capture</strong></td><td>&mdash;</td><td>Full dump when a sample exits</td><td>Windows (WER)</td></tr>
+                            <tr><td><strong>Hunt-Sleeping-Beacons</strong></td><td>&mdash;</td><td>Call stacks of sleeping implants</td><td>C++</td></tr>
+                            <tr><td><strong>BeaconEye</strong></td><td>&mdash;</td><td>Cobalt Strike beacon configurations</td><td>.NET</td></tr>
                             <tr><td><strong>Detonator</strong></td><td>5000/8000</td><td>Orchestration UI + REST API</td><td>Python</td></tr>
                         </tbody>
                     </table>
@@ -959,28 +966,28 @@ C:\Users\vagrant\Desktop\infected\  Malware samples (Defender-excluded)</pre>
                     <h4>Detection Rules</h4>
                     <div class="help-grid">
                         <div class="help-card">
-                            <div class="help-card-title">Sigma Rules (20)</div>
-                            <div class="help-card-desc">Process injection, credential dumping, lateral movement, persistence, defense evasion patterns</div>
+                            <div class="help-card-title">Sigma</div>
+                            <div class="help-card-desc">rustinel-rules windows-advanced pack: process creation, registry persistence, tasks, services, script blocks</div>
                         </div>
                         <div class="help-card">
-                            <div class="help-card-title">YARA Rules (717)</div>
-                            <div class="help-card-desc">Compiled rule set covering malware families, packers, exploits, shellcode patterns</div>
+                            <div class="help-card-title">YARA</div>
+                            <div class="help-card-desc">rustinel-rules + Elastic protections-artifacts; loaded counts are shown on the Dashboard</div>
                         </div>
                         <div class="help-card">
-                            <div class="help-card-title">IOC Engine</div>
-                            <div class="help-card-desc">Hash-based matching. Auto-fed when samples are submitted. Supports SHA-256.</div>
+                            <div class="help-card-title">IOC</div>
+                            <div class="help-card-desc">SHA-256, IP, domain and path matching; sample hashes are added on submission</div>
+                        </div>
+                        <div class="help-card">
+                            <div class="help-card-title">In-memory signatures</div>
+                            <div class="help-card-desc">Aether's rule files (C2 strings, reflective loading, beacon fields), mapped to ATT&amp;CK</div>
                         </div>
                     </div>
 
-                    <h4>PE Analysis Capabilities</h4>
+                    <h4>On ARM64 VMs</h4>
                     <ul class="help-list">
-                        <li><strong>Headers:</strong> DOS, File, Optional (PE32/PE32+), section table</li>
-                        <li><strong>Security:</strong> ASLR, DEP/NX, SEH, CFG status</li>
-                        <li><strong>Entropy:</strong> Per-section Shannon entropy with color-coded bars (>7.0 = packed/encrypted)</li>
-                        <li><strong>Imports:</strong> Categorized suspicious API detection (injection, evasion, credential access, networking)</li>
-                        <li><strong>Packers:</strong> Section name matching (UPX, Themida, VMProtect, ASPack, MPRESS, etc.)</li>
-                        <li><strong>TLS Callbacks:</strong> Anti-debug indicator detection</li>
-                        <li><strong>RWX Sections:</strong> Read+Write+Execute flagging</li>
+                        <li>Aether, Hunt-Sleeping-Beacons and BeaconEye run as x64 builds under emulation; they see x64 processes reliably &mdash; which samples on ARM64 are</li>
+                        <li>Results for native ARM64 processes are marked as limited and count only half</li>
+                        <li>Exit dumps of emulated processes: the emulator's own executable memory is recognized and not scored</li>
                     </ul>
                 </div>
             </div>
@@ -991,6 +998,6 @@ C:\Users\vagrant\Desktop\infected\  Malware samples (Defender-excluded)</pre>
         </div>
     </div>
 
-    <script src="/static/js/app.js?v=29"></script>
+    <script src="/static/js/app.js?v=41"></script>
 </body>
 </html>

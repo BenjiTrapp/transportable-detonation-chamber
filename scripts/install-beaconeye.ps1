@@ -24,7 +24,7 @@ $installDir = "C:\tools\BeaconEye"
 $binDir = "$installDir"
 $exePath = "$binDir\BeaconEye.exe"
 
-# Check if already installed
+# Check if already installed (an empty folder from a failed run does not count)
 if (Test-Path $exePath) {
     Write-Host "[+] BeaconEye already installed at $exePath" -ForegroundColor Green
     exit 0
@@ -34,10 +34,13 @@ New-Item -ItemType Directory -Path $binDir -Force | Out-Null
 
 # --- Try downloading pre-built release from GitHub ---
 $downloaded = $false
+# Release assets are BeaconEye_x64.zip / BeaconEye_x86.zip (0.2, 0.3); the
+# names tried before do not exist, so every install fell through to a source
+# build. x64 also on ARM64: beacons there run as emulated x64 processes.
 $releaseUrls = @(
-    "https://github.com/CCob/BeaconEye/releases/latest/download/BeaconEye.zip",
-    "https://github.com/CCob/BeaconEye/releases/download/v1.0/BeaconEye.zip",
-    "https://github.com/CCob/BeaconEye/releases/latest/download/BeaconEye-net6.0-win-x64.zip"
+    "https://github.com/CCob/BeaconEye/releases/latest/download/BeaconEye_x64.zip",
+    "https://github.com/CCob/BeaconEye/releases/download/0.3/BeaconEye_x64.zip",
+    "https://github.com/CCob/BeaconEye/releases/download/0.1/BeaconEye.Release.x64.zip"
 )
 
 foreach ($url in $releaseUrls) {

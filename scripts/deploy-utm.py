@@ -86,12 +86,37 @@ def run_ps(sess, ps, label=""):
     return out
 
 
+class _QuietHandler(http.server.SimpleHTTPRequestHandler):
+    # Assigning log_message on a functools.partial never reached the handler
+    # instances, so every request was still logged.
+    def log_message(self, *args, **kwargs):
+        pass
+
+
+class _ReusableServer(socketserver.TCPServer):
+    # Re-running within the TIME_WAIT window otherwise fails to bind.
+    allow_reuse_address = True
+
+
 def serve():
-    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=REPO)
-    handler.log_message = lambda *a, **k: None
-    httpd = socketserver.TCPServer(("0.0.0.0", PORT), handler)
+    """Serve the repository to the VM for the duration of a deploy.
+
+    Bound to the UTM host-only address rather than 0.0.0.0, so the repository
+    (including .git) is not exposed on every network interface.
+    """
+    handler = functools.partial(_QuietHandler, directory=REPO)
+    try:
+        httpd = _ReusableServer((HOST_IP, PORT), handler)
+    except OSError:
+        # Host address not present (e.g. different network setup): fall back.
+        httpd = _ReusableServer(("0.0.0.0", PORT), handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
+
+
+def stop(httpd):
+    httpd.shutdown()
+    httpd.server_close()
 
 
 def do_deploy(sess, args):
@@ -111,7 +136,7 @@ def do_deploy(sess, args):
             out = run_ps(sess, ps, label=local)
             print(f"  [+] {local} -> {remote} ({out} bytes)")
     finally:
-        httpd.shutdown()
+        stop(httpd)
 
 
 def do_install(sess, args):
@@ -164,7 +189,7 @@ def do_install(sess, args):
         for line in out.splitlines():
             print(f"    {line}")
     finally:
-        httpd.shutdown()
+        stop(httpd)
 
 
 def main():

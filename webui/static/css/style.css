@@ -7121,3 +7121,6 @@ option.etw-ch-inactive { color: #94a3b8; }
     border: 1px solid rgba(234, 179, 8, 0.35);
     border-radius: var(--radius);
 }
+
+/* Isometric graph view: cross-process edges are drawn as teal bridges */
+.graph-container.graph-iso .graph-legend-line.inject { background: #2dd4bf; }

@@ -83,8 +83,12 @@ fi
 # --- Stage for the VM ---
 mkdir -p "$OUT_DIR"
 cp "$BUILT" "$OUT_DIR/Aether.exe"
-rm -rf "$OUT_DIR/rules"
-cp -R "$SRC_DIR/rules" "$OUT_DIR/rules"
+if [ ! -d "$SRC_DIR/rules" ]; then
+    echo "[!] Upstream source has no rules/ directory; keeping the existing rules" >&2
+else
+    rm -rf "$OUT_DIR/rules"
+    cp -R "$SRC_DIR/rules" "$OUT_DIR/rules"
+fi
 
 SIZE_KB=$(( $(wc -c < "$OUT_DIR/Aether.exe") / 1024 ))
 RULE_COUNT=$(find "$OUT_DIR/rules" -name '*.json' | wc -l | tr -d ' ')
@@ -95,4 +99,4 @@ echo "    Binary: $OUT_DIR/Aether.exe (${SIZE_KB} KB)"
 echo "    Rules:  $OUT_DIR/rules ($RULE_COUNT files)"
 echo
 echo "    'make up' copies prebuilt/ into the VM and install-aether.ps1 uses it."
-echo "    For a running VM:  python3 scripts/deploy-utm.py --aether"
+echo "    For a running VM:  python3 scripts/deploy-utm.py --install install-aether.ps1"

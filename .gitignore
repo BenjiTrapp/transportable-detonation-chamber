@@ -28,3 +28,4 @@ prebuilt/
 # Runtime state written by the Web UI
 webui/scan_history.json
 webui/memory_baseline.json
+webui/memory_results/

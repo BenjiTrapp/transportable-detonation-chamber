@@ -71,17 +71,26 @@ class Minidump:
         if self.data[:4] != b"MDMP":
             raise MinidumpError("not a minidump (missing MDMP signature)")
 
-        _, _, count, rva = struct.unpack_from("<4sIII", self.data, 0)
-        self.streams = {}
-        for i in range(count):
-            stype, size, srva = struct.unpack_from("<III", self.data, rva + i * 12)
-            self.streams[stype] = (size, srva)
+        # A truncated or corrupt dump surfaces as struct.error from any of the
+        # readers below; report it as a dump problem, not a code bug.
+        try:
+            _, _, count, rva = struct.unpack_from("<4sIII", self.data, 0)
+            count = min(count, max(0, (len(self.data) - rva) // 12))
+            self.streams = {}
+            for i in range(count):
+                stype, size, srva = struct.unpack_from("<III", self.data, rva + i * 12)
+                self.streams[stype] = (size, srva)
 
-        self.arch = self._read_arch()
-        self.modules = self._read_modules()
-        self.regions = self._read_memory_info()
-        self.threads = self._read_thread_info()
-        self._ranges = self._read_memory64()
+            self.arch = self._read_arch()
+            self.modules = self._read_modules()
+            self.regions = self._read_memory_info()
+            self.threads = self._read_thread_info()
+            self._ranges = self._read_memory64()
+        except struct.error as e:
+            raise MinidumpError(f"truncated or corrupt minidump: {e}") from e
+        self._range_starts = [r[0] for r in self._ranges]
+        self._regions_sorted = sorted(self.regions, key=lambda r: r["base"])
+        self._region_starts = [r["base"] for r in self._regions_sorted]
 
     # --- streams ------------------------------------------------------
 
@@ -103,6 +112,7 @@ class Minidump:
         if not s:
             return []
         count = struct.unpack_from("<I", self.data, s[1])[0]
+        count = min(count, max(0, (s[0] - 4) // 108))
         mods = []
         for i in range(count):
             off = s[1] + 4 + i * 108
@@ -121,6 +131,11 @@ class Minidump:
         if not s:
             return []
         header, entry, count = struct.unpack_from("<IIQ", self.data, s[1])
+        # Entry size and count come from the file. An entry size of 0 would
+        # re-read the same offset forever; cap both by the stream size.
+        if entry < 48:
+            raise MinidumpError(f"memory info entry size {entry} is too small")
+        count = min(count, max(0, (s[0] - header) // entry))
         regions = []
         for i in range(count):
             (base, alloc_base, alloc_protect, _, size, state, protect,
@@ -137,6 +152,9 @@ class Minidump:
         if not s:
             return []
         header, entry, count = struct.unpack_from("<III", self.data, s[1])
+        if entry < 64:
+            raise MinidumpError(f"thread info entry size {entry} is too small")
+        count = min(count, max(0, (s[0] - header) // entry))
         threads = []
         for i in range(count):
             vals = struct.unpack_from("<IIIIQQQQQQ", self.data, s[1] + header + i * entry)
@@ -148,6 +166,7 @@ class Minidump:
         if not s:
             return []
         count, base_rva = struct.unpack_from("<QQ", self.data, s[1])
+        count = min(count, max(0, (s[0] - 16) // 16))
         ranges, offset = [], base_rva
         for i in range(count):
             start, size = struct.unpack_from("<QQ", self.data, s[1] + 16 + i * 16)
@@ -166,15 +185,22 @@ class Minidump:
         An image spans several regions (one per section), which a dump stores
         as separate ranges. Gaps the dump did not capture are zero-filled so
         offsets inside the returned buffer still match virtual addresses; the
-        result stops at the first gap after the last captured byte.
+        result stops at the first gap after the last captured byte, and at the
+        end of the file if the dump was truncated.
         """
+        import bisect
         end = address + size
         out = bytearray()
         cursor = address
-        for start, length, offset in self._ranges:
+        # Start at the last range beginning at or before the address instead
+        # of walking every range for every read.
+        i = max(0, bisect.bisect_right(self._range_starts, address) - 1)
+        for start, length, offset in self._ranges[i:]:
             r_end = start + length
-            if r_end <= cursor or start >= end:
+            if r_end <= cursor:
                 continue
+            if start >= end:
+                break
             if start > cursor:
                 if not out:
                     # Leading gap: the requested start itself was not captured.
@@ -183,9 +209,11 @@ class Minidump:
                 cursor = start
             take_from = cursor - start
             take = min(r_end, end) - cursor
-            out.extend(self.data[offset + take_from:offset + take_from + take])
-            cursor += take
-            if cursor >= end:
+            chunk = self.data[offset + take_from:offset + take_from + take]
+            out.extend(chunk)
+            cursor += len(chunk)
+            if len(chunk) < take or cursor >= end:
+                # Short chunk: the file ends inside this range.
                 break
         return bytes(out)
 
@@ -194,7 +222,10 @@ class Minidump:
         return self.read(region["base"], size)
 
     def region_at(self, address):
-        for r in self.regions:
+        import bisect
+        i = bisect.bisect_right(self._region_starts, address) - 1
+        if i >= 0:
+            r = self._regions_sorted[i]
             if r["base"] <= address < r["base"] + r["size"]:
                 return r
         return None
@@ -309,18 +340,29 @@ def load_rules(rules_dir):
         try:
             with open(os.path.join(rules_dir, name), "r", encoding="utf-8") as f:
                 entries = json.load(f)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):   # ValueError covers JSON and UTF-8 errors
             continue
         for e in entries if isinstance(entries, list) else []:
-            pattern = e.get("pattern")
-            if not pattern or len(pattern) < 4:
-                # Very short patterns match almost anything in raw memory.
+            if not isinstance(e, dict):
                 continue
+            pattern = e.get("pattern")
+            if not isinstance(pattern, str):
+                continue
+            ascii_needle = pattern.encode("latin-1", errors="ignore")
+            if len(ascii_needle) < 4:
+                # Very short patterns match almost anything in raw memory.
+                # Checked on the encoded bytes: dropped non-Latin characters
+                # could otherwise leave a 0-3 byte needle.
+                continue
+            try:
+                risk = int(e.get("risk_score") or 0)
+            except (TypeError, ValueError):
+                risk = 0
             rules.append({
                 "pattern": pattern,
-                "ascii": pattern.encode("latin-1", errors="ignore"),
+                "ascii": ascii_needle,
                 "utf16": pattern.encode("utf-16le"),
-                "risk": int(e.get("risk_score") or 0),
+                "risk": risk,
                 "category": (e.get("category") or "").upper(),
                 "description": e.get("description") or "",
             })
@@ -443,6 +485,11 @@ def analyze(path, process="", rules_dir=None, extract_dir=None):
     rules = load_rules(rules_dir)
     sig_hits = {}
     scanned = 0
+    prefilter = None
+    if rules:
+        import re
+        needles = {n for rule in rules for n in (rule["ascii"], rule["utf16"]) if n}
+        prefilter = re.compile(b"|".join(re.escape(n) for n in needles))
     if rules:
         for r in committed:
             if r["type"] == MEM_IMAGE:
@@ -455,6 +502,12 @@ def analyze(path, process="", rules_dir=None, extract_dir=None):
             buf = dump.read_region(r, MAX_SIGNATURE_SCAN_BYTES - scanned)
             scanned += len(buf)
             if not buf:
+                continue
+            # One regex pass tells whether any needle occurs at all; most
+            # regions have none and skip the per-rule search entirely. The
+            # exact search below still runs where it matters, because the
+            # alternation would hide a short needle inside a longer match.
+            if prefilter is not None and prefilter.search(buf) is None:
                 continue
             for rule in rules:
                 for enc, needle in (("ascii", rule["ascii"]), ("utf16le", rule["utf16"])):

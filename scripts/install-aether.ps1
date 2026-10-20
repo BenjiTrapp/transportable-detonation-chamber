@@ -54,22 +54,25 @@ $ExePath   = "$ToolRoot\Aether.exe"
 $ZigVersion = "0.16.0"
 $ZigRoot    = "C:\tools\zig"
 
-if (Test-Path $ExePath) {
-    Write-Host "[+] Aether already installed at $ExePath" -ForegroundColor Green
-    exit 0
-}
-
 # A host-side build can be dropped here beforehand to skip the VM build
-# entirely (see scripts/build-aether.sh).
+# entirely (see scripts/build-aether.sh). Checked before the "already
+# installed" exit, so pushing a newer prebuilt actually updates the VM.
 $prebuilt = "C:\vagrant\prebuilt\Aether.exe"
 if ((-not $NoPrebuilt) -and (Test-Path $prebuilt)) {
     Write-Host "[*] Using prebuilt Aether.exe from $prebuilt" -ForegroundColor Yellow
-    New-Item -ItemType Directory -Path $ToolRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path "$ToolRoot\rules" -Force | Out-Null
     Copy-Item $prebuilt $ExePath -Force
     if (Test-Path "C:\vagrant\prebuilt\rules") {
-        Copy-Item "C:\vagrant\prebuilt\rules" "$ToolRoot\rules" -Recurse -Force
+        # Copy the contents: copying the folder into an existing rules\
+        # created rules\rules\ and left the old rules in use.
+        Copy-Item "C:\vagrant\prebuilt\rules\*" "$ToolRoot\rules\" -Recurse -Force
     }
     Write-Host "[+] Aether installed at $ExePath" -ForegroundColor Green
+    exit 0
+}
+
+if (Test-Path $ExePath) {
+    Write-Host "[+] Aether already installed at $ExePath" -ForegroundColor Green
     exit 0
 }
 
@@ -197,7 +200,8 @@ Copy-Item $built $ExePath -Force
 if (Test-Path "$SourceDir\rules") {
     New-Item -ItemType Directory -Path "$ToolRoot\rules" -Force | Out-Null
     Copy-Item "$SourceDir\rules\*.json" "$ToolRoot\rules\" -Force
-    $ruleCount = (Get-ChildItem "$ToolRoot\rules\*.json" -ErrorAction SilentlyContinue).Count
+    # @() so .Count also works for zero or one file under StrictMode.
+    $ruleCount = @(Get-ChildItem "$ToolRoot\rules\*.json" -ErrorAction SilentlyContinue).Count
     Write-Host "[+] Installed $ruleCount signature rule file(s)" -ForegroundColor Green
 }
 

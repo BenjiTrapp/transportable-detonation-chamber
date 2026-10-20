@@ -282,8 +282,11 @@ def main():
     # Add dev routes
     setup_dev_routes(flask_app)
 
-    # Start file watcher
-    observer = start_watcher()
+    # Werkzeug's reloader runs main() twice: in a watcher parent and in the
+    # serving child. Only the child serves SSE clients, so only it watches
+    # files; only the parent opens the browser (once, not on every restart).
+    is_child = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
+    observer = start_watcher() if is_child else None
 
     print()
     log(f"  Server:  http://{args.host}:{args.port}", Colors.GREEN)
@@ -295,7 +298,7 @@ def main():
     print()
 
     # Auto-open browser
-    if not args.no_open:
+    if not args.no_open and not is_child:
         open_browser(args.port)
 
     # Run Flask
@@ -304,18 +307,17 @@ def main():
             host=args.host,
             port=args.port,
             debug=True,
+            # Frontend files are not listed as extra_files: watchdog + SSE
+            # already reload them, and restarting Flask for a CSS edit dropped
+            # the SSE connections the CSS hot-swap relies on.
             use_reloader=True,
-            extra_files=[
-                str(STATIC_DIR / "js" / "app.js"),
-                str(STATIC_DIR / "css" / "style.css"),
-                str(TEMPLATES_DIR / "index.html"),
-            ]
         )
     except KeyboardInterrupt:
         pass
     finally:
-        observer.stop()
-        observer.join()
+        if observer:
+            observer.stop()
+            observer.join()
         log("Dev server stopped.", Colors.YELLOW)
 
 

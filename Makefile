@@ -85,6 +85,12 @@ help:
 	@echo "    make prerequisites   Check/install all prerequisites"
 	@echo "    make build           Mac VM build via Vagrant/QEMU (experimental)"
 	@echo ""
+	@echo "  Tests:"
+	@echo "    make unit-test       Unit tests (no VM needed); make test submits a sample to the VM"
+	@echo ""
+	@echo "  MCP:"
+	@echo "    make mcp-setup       Create mcp/.venv for the MCP server (Claude Code etc.)"
+	@echo ""
 	@echo "  Local (no VM required):"
 	@echo "    make install         Install Python venv + dependencies"
 	@echo "    make run             Run the Web UI locally (port 9000)"
@@ -359,6 +365,16 @@ status:
 	@echo "--- Web UI Health ---"
 	@curl -sf $(WEBUI_URL)/api/status | python3 -m json.tool && echo "Status: ONLINE" || echo "Status: OFFLINE"
 
+.PHONY: mcp-setup
+mcp-setup:
+	@test -d mcp/.venv || { \
+		PY=$$(for p in python3.13 python3.12 python3.11 python3.10 python3; do \
+			command -v $$p >/dev/null 2>&1 && $$p -c 'import sys; sys.exit(sys.version_info < (3, 10))' && { echo $$p; break; }; done); \
+		[ -n "$$PY" ] || { echo "[mcp] needs Python >= 3.10 (brew install python@3.12)"; exit 1; }; \
+		echo "[mcp] creating mcp/.venv with $$PY"; $$PY -m venv mcp/.venv; }
+	@mcp/.venv/bin/pip install -q -r mcp/requirements.txt
+	@echo "[mcp] ready - .mcp.json starts it as: mcp/.venv/bin/python mcp/server.py; set TDC_URL there"
+
 .PHONY: services
 services:
 	@mode=$$( $(DETECT_MODE) ); \
@@ -371,6 +387,17 @@ services:
 .PHONY: alerts
 alerts:
 	@curl -sf $(WEBUI_URL)/api/alerts | python3 -c "import json,sys;a=json.load(sys.stdin);print(f'Total: {len(a)} alerts');[print(f\"{x.get('timestamp','')} [{x.get('severity','')}] {x.get('rule_name','')}\") for x in a[-10:]]" 2>/dev/null || echo "Failed to fetch alerts (is VM running?)"
+
+.PHONY: unit-test
+unit-test: $(VENV_DIR)/bin/activate
+	@$(VENV_DIR)/bin/pip install -q -r requirements-dev.txt
+	@echo "[unit-test] web UI, frontend, docs"
+	@$(VENV_DIR)/bin/python -m pytest
+	@if [ -x mcp/.venv/bin/python ]; then \
+		mcp/.venv/bin/pip install -q -r requirements-dev.txt; \
+		echo "[unit-test] MCP server"; \
+		mcp/.venv/bin/python -m pytest tests/test_mcp.py; \
+	else echo "[unit-test] MCP tests skipped (run make mcp-setup)"; fi
 
 .PHONY: test
 test:

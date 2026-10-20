@@ -22,7 +22,7 @@ param(
         'help','prerequisites','install','run','run-debug','dev','uninstall',
         'up','halt','destroy','reload','provision','provision-webui',
         'deploy','deploy-app','restart','deploy-restart','open','logs',
-        'ssh','rdp','status','services','alerts','test','submit',
+        'ssh','rdp','status','services','alerts','test','unit-test','submit',
         'clean','clean-all'
     )]
     [string]$Target = 'help',
@@ -123,6 +123,26 @@ switch ($Target) {
             & $scriptPath
         } else {
             Write-Host "ERROR: scripts\check-prerequisites.ps1 not found" -ForegroundColor Red
+        }
+    }
+
+    'unit-test' {
+        # Unit tests: no VM needed. 'test' submits a sample to the VM instead.
+        $VenvPy = "webui\.venv\Scripts\python.exe"
+        if (-not (Test-Path $VenvPy)) {
+            Write-Host "[unit-test] webui\.venv missing - run .\make.ps1 install first" -ForegroundColor Red
+            exit 1
+        }
+        & $VenvPy -m pip install -q -r requirements-dev.txt
+        & $VenvPy -m pytest
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $McpPy = "mcp\.venv\Scripts\python.exe"
+        if (Test-Path $McpPy) {
+            & $McpPy -m pip install -q -r requirements-dev.txt
+            & $McpPy -m pytest tests\test_mcp.py
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        } else {
+            Write-Host "[unit-test] MCP tests skipped (mcp\.venv not found)" -ForegroundColor Yellow
         }
     }
 

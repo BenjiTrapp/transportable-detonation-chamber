@@ -26,8 +26,8 @@ function showToast(type, title, detail, duration) {
     toast.innerHTML = `
         <span class="toast-icon">${icons[type] || icons.info}</span>
         <div class="toast-body">
-            <div class="toast-title">${title}</div>
-            ${detail ? `<div class="toast-detail">${detail}</div>` : ''}
+            <div class="toast-title">${escapeHtml(title)}</div>
+            ${detail ? `<div class="toast-detail">${escapeHtml(detail)}</div>` : ''}
         </div>
         <button class="toast-close" onclick="this.parentElement.classList.add('removing');setTimeout(()=>this.parentElement.remove(),300)">&times;</button>`;
     container.appendChild(toast);
@@ -124,9 +124,13 @@ document.addEventListener('DOMContentLoaded', () => {
     initGraphControls();
     initRtraceTabs();
     refreshAll();
-    setInterval(refreshAlerts, 5000);
-    setInterval(refreshDashboard, 10000);
-    refreshDashboard();
+    // Polls pause while the browser tab is hidden; refreshAll() above already
+    // loaded the dashboard, so it is not fetched a second time here.
+    setInterval(() => { if (!document.hidden) refreshAlerts(); }, 5000);
+    setInterval(() => { if (!document.hidden) refreshDashboard(); }, 10000);
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) { refreshAlerts(); refreshDashboard(); }
+    });
     loadScanToolStatus();
     loadScanHistory();
 });
@@ -142,6 +146,9 @@ function initTabs() {
 }
 
 function switchTab(tabName) {
+    // Guard: an unknown name used to deactivate every tab and then throw,
+    // leaving the main area blank.
+    if (!document.getElementById(`tab-${tabName}`)) return;
     state.activeTab = tabName;
     document.querySelectorAll('.sidebar-tabs .tab').forEach(t => t.classList.remove('active'));
     document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
@@ -261,7 +268,17 @@ async function refreshDashboard() {
     }
 }
 
-async function refreshAlerts() {
+let _alertsInFlight = null;
+
+function refreshAlerts() {
+    // One request at a time: parsing tens of MB can outlast the 5 s interval,
+    // and a second request sent with the old ETag downloaded everything again.
+    if (_alertsInFlight) return _alertsInFlight;
+    _alertsInFlight = _refreshAlertsOnce().finally(() => { _alertsInFlight = null; });
+    return _alertsInFlight;
+}
+
+async function _refreshAlertsOnce() {
     try {
         // Conditional request: the server answers 304 when nothing changed,
         // which skips both the transfer and re-parsing tens of MB of JSON.
@@ -277,11 +294,19 @@ async function refreshAlerts() {
                 showToast('info', `${diff} new alert${diff > 1 ? 's' : ''}`, 'New detections received');
             }
             state.alerts = newAlerts;
-            if (state.alerts.length) {
-                const times = state.alerts.map(a => new Date(a.timestamp).getTime()).filter(t => !isNaN(t));
-                state.sessionStart = times.length ? Math.min(...times) : null;
+            indexAlerts();
+            // A loop instead of Math.min(...times): spreading >64k arguments
+            // throws a RangeError in Safari.
+            let earliest = Infinity;
+            for (const a of state.alerts) {
+                const t = new Date(a.timestamp).getTime();
+                if (t < earliest) earliest = t;
             }
+            state.sessionStart = earliest === Infinity ? null : earliest;
             renderTimeline();
+            // Processes are derived from alerts on the server; without this
+            // the sidebar and the Tracing tree kept their page-load state.
+            await refreshProcesses();
             if (state.activeTab === 'tracing') {
                 renderRtraceConsole();
             }
@@ -291,6 +316,22 @@ async function refreshAlerts() {
     } catch (e) {
         showToast('error', 'Alerts unreachable', e.message || 'Connection lost', 6000);
     }
+}
+
+// Alerts are looked up by id. Rendered rows used positions in state.alerts,
+// which changed with every refresh, or object identity, which never matches
+// because /api/processes delivers separately parsed copies.
+let _alertIndexById = new Map();
+
+function indexAlerts() {
+    _alertIndexById = new Map();
+    state.alerts.forEach((a, i) => { if (a && a.id != null) _alertIndexById.set(String(a.id), i); });
+}
+
+function alertIndexOf(alert) {
+    if (!alert) return -1;
+    const idx = _alertIndexById.get(String(alert.id));
+    return idx === undefined ? -1 : idx;
 }
 
 async function refreshProcesses() {
@@ -511,7 +552,7 @@ function renderDashboard() {
 
     // Scanner Tools Card
     cards.push(`
-        <div class="service-card scanner-card" onclick="switchTab('scanner')">
+        <div class="service-card scanner-card" onclick="switchTab('threatscan')">
             <div class="service-card-glow"></div>
             <div class="service-card-header">
                 <div class="service-card-title"><div class="service-icon scanner">T</div><h3>AV/AMSI Scanner</h3></div>
@@ -524,7 +565,7 @@ function renderDashboard() {
                 <div class="service-metric"><div class="service-metric-value">AMSI</div><div class="service-metric-label">ENGINE</div></div>
             </div>
             <div class="service-card-actions">
-                <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('scanner')">Open Scanner</button>
+                <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('threatscan')">Open Scanner</button>
             </div>
         </div>
     `);
@@ -534,7 +575,7 @@ function renderDashboard() {
     const emberOnline = emberStatus.installed !== false; // treat unknown as ready
     const emberModelCount = (emberStatus.models || []).length;
     cards.push(`
-        <div class="service-card ember-card ${emberOnline ? '' : 'offline'}" onclick="switchTab('ember')">
+        <div class="service-card ember-card ${emberOnline ? '' : 'offline'}" onclick="switchTab('threatscan')">
             <div class="service-card-glow"></div>
             <div class="service-card-header">
                 <div class="service-card-title"><div class="service-icon ember">E</div><h3>EMBER2024</h3></div>
@@ -547,7 +588,7 @@ function renderDashboard() {
                 <div class="service-metric"><div class="service-metric-value">0&ndash;1</div><div class="service-metric-label">SCORE</div></div>
             </div>
             <div class="service-card-actions">
-                <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('ember')">Open EMBER</button>
+                <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('threatscan')">Open EMBER</button>
             </div>
         </div>
     `);
@@ -556,7 +597,7 @@ function renderDashboard() {
     const capaStatus = state.capaStatus || {};
     const capaOnline = capaStatus.installed !== false; // treat unknown as ready
     cards.push(`
-        <div class="service-card capa-card ${capaOnline ? '' : 'offline'}" onclick="switchTab('capa')">
+        <div class="service-card capa-card ${capaOnline ? '' : 'offline'}" onclick="switchTab('threatscan')">
             <div class="service-card-glow"></div>
             <div class="service-card-header">
                 <div class="service-card-title"><div class="service-icon capa">C</div><h3>capa</h3></div>
@@ -569,7 +610,7 @@ function renderDashboard() {
                 <div class="service-metric"><div class="service-metric-value">Static</div><div class="service-metric-label">MODE</div></div>
             </div>
             <div class="service-card-actions">
-                <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('capa')">Open capa</button>
+                <button class="btn btn-sm" onclick="event.stopPropagation(); switchTab('threatscan')">Open capa</button>
             </div>
         </div>
     `);
@@ -593,7 +634,7 @@ function renderDashboard() {
                 html += `<span class="activity-time">${ts}</span>`;
                 html += `<span class="activity-sev">${escapeHtml((alert.severity || 'info').toUpperCase())}</span>`;
                 html += `<span class="activity-rule">${escapeHtml(ruleName)}</span>`;
-                html += proc ? `<span class="activity-proc">${escapeHtml(proc)}${pid ? ' (' + pid + ')' : ''}</span>` : '';
+                html += proc ? `<span class="activity-proc">${escapeHtml(proc)}${pid ? ' (' + escapeHtml(String(pid)) + ')' : ''}</span>` : '';
                 html += `</div>`;
             });
             activityFeed.innerHTML = html;
@@ -622,7 +663,7 @@ function initRtraceTabs() {
         dropdown.addEventListener('change', () => {
             const pid = dropdown.value;
             if (pid) {
-                selectRtraceProcess(parseInt(pid));
+                selectRtraceProcess(pid);
             }
         });
     }
@@ -667,13 +708,14 @@ function renderRtraceProcessDropdown() {
         const hasExited = !!proc.exit_time;
         const alertCount = (proc.alerts || []).length;
         const status = hasExited ? 'stopped' : 'running';
-        const selected = state.rtraceSelectedPid == proc.pid ? 'selected' : '';
-        html += `<option value="${proc.pid}" ${selected}>${escapeHtml(proc.name || 'unknown')} &mdash; ${status} (${alertCount} ev)</option>`;
+        const selected = state.rtraceSelectedPid == procKey(proc) ? 'selected' : '';
+        html += `<option value="${escapeHtml(procKey(proc))}" ${selected}>${escapeHtml(proc.name || 'unknown')} &mdash; ${status} (${alertCount} ev)</option>`;
     });
     dropdown.innerHTML = html;
 }
 
 function selectRtraceProcess(pid) {
+    pid = String(pid);          // instance key, see procKey()
     state.rtraceSelectedPid = pid;
     state.selectedProcess = pid;
 
@@ -692,7 +734,7 @@ function selectRtraceProcess(pid) {
 
     // Highlight in tree
     document.querySelectorAll('.rtrace-tree-item').forEach(el => el.classList.remove('active'));
-    const treeItem = document.querySelector(`.rtrace-tree-item[data-pid="${pid}"]`);
+    const treeItem = document.querySelector(`.rtrace-tree-item[data-pid="${CSS.escape(pid)}"]`);
     if (treeItem) treeItem.classList.add('active');
 
     // Render tabs and events
@@ -801,15 +843,21 @@ function renderRtraceTimeline() {
     ];
 
     // Parse all alert timestamps and categorize
-    const sorted = [...state.alerts].sort((a, b) => (a.timestamp || '').localeCompare(b.timestamp || ''));
+    // Plain comparison is correct for ISO timestamps and far cheaper than
+    // localeCompare on ~10k strings.
+    const sorted = [...state.alerts].sort((a, b) => {
+        const x = a.timestamp || '', y = b.timestamp || '';
+        return x < y ? -1 : x > y ? 1 : 0;
+    });
     const timestamps = sorted.map(a => new Date(a.timestamp).getTime()).filter(t => !isNaN(t));
     if (!timestamps.length) {
         container.innerHTML = '<div class="rtrace-timeline-cursor" id="rtrace-timeline-cursor"></div>';
         return;
     }
 
-    const tMin = Math.min(...timestamps);
-    const tMax = Math.max(...timestamps);
+    // Spreading the array into Math.min/max fails beyond ~64k arguments.
+    let tMin = Infinity, tMax = -Infinity;
+    for (const t of timestamps) { if (t < tMin) tMin = t; if (t > tMax) tMax = t; }
     const duration = tMax - tMin || 1; // avoid div by zero
 
     // Show time range
@@ -887,7 +935,10 @@ function renderRtraceTimeline() {
     html += `<div class="rtrace-timeline-cursor" id="rtrace-timeline-cursor"></div>`;
     container.innerHTML = html;
 
-    // Mouse tracking for cursor line
+    // The container survives re-renders, so the cursor listeners are attached
+    // once; previously each render (every alert change) added another pair.
+    if (container.dataset.cursorBound) return;
+    container.dataset.cursorBound = '1';
     container.addEventListener('mousemove', function(e) {
         const cursor = document.getElementById('rtrace-timeline-cursor');
         if (cursor) {
@@ -962,16 +1013,16 @@ function renderRtraceProcessTree() {
     let html = '';
     sorted.forEach(proc => {
         const relTime = formatRelativeTime(proc.first_seen);
-        const isActive = state.rtraceSelectedPid == proc.pid;
-        const indent = proc.parent_pid && state.processes[proc.parent_pid] ? '<span class="tree-indent"></span>' : '';
+        const isActive = state.rtraceSelectedPid == procKey(proc);
+        const indent = proc.parent_key && state.processes[proc.parent_key] ? '<span class="tree-indent"></span>' : '';
         const threats = proc.activity?.threats || 0;
         const maxSev = getMaxSeverity(proc);
-        const sevDot = threats > 0 ? `<span class="ev-sev-dot ${maxSev}" style="width:6px;height:6px;display:inline-block;"></span>` : '';
+        const sevDot = threats > 0 ? `<span class="ev-sev-dot ${cssToken(maxSev)}" style="width:6px;height:6px;display:inline-block;"></span>` : '';
 
-        html += `<div class="rtrace-tree-item ${isActive ? 'active' : ''}" data-pid="${proc.pid}" onclick="selectRtraceProcess(${proc.pid})">
+        html += `<div class="rtrace-tree-item ${isActive ? 'active' : ''}" data-pid="${escapeHtml(procKey(proc))}" onclick="selectRtraceProcess(${jsArg(procKey(proc))})">
             ${sevDot}
             <span class="tree-time">${relTime}</span>
-            ${indent}<span class="tree-pid">${proc.pid}</span>
+            ${indent}<span class="tree-pid">${escapeHtml(String(proc.pid))}</span>
             <span class="tree-name">${escapeHtml(proc.name || 'unknown')}</span>
             ${threats > 0 ? `<span class="tree-threat-count">${threats}</span>` : ''}
         </div>`;
@@ -1114,17 +1165,17 @@ function renderRtraceEventTable() {
         const details = getEventDetails(ev);
         const sevRowClass = (severity === 'critical' || severity === 'high') ? ` sev-${severity}` : '';
 
-        html += `<div class="rtrace-event-row${sevRowClass}" onclick="openAlertDetail(${state.alerts.indexOf(ev) >= 0 ? state.alerts.indexOf(ev) : 0})" title="${escapeHtml(ruleName)}\n${escapeHtml(ev.rule_description || '')}">
-            <span class="ev-sev"><span class="ev-sev-dot ${severity}"></span></span>
+        html += `<div class="rtrace-event-row${sevRowClass}" onclick="openAlertDetailById(${jsArg(ev.id)})" title="${escapeHtml(ruleName)}\n${escapeHtml(ev.rule_description || '')}">
+            <span class="ev-sev"><span class="ev-sev-dot ${cssToken(severity)}"></span></span>
             <span class="ev-time">${relTime}</span>
             <span class="ev-action">
                 <span class="rtrace-action-badge ${actionClass}">${escapeHtml(actionShort)}</span>
             </span>
-            <span class="ev-rule"><span class="ev-rule-name">${escapeHtml(ruleName)}</span>${engine ? `<span class="ev-engine-tag">${engine}</span>` : ''}</span>
+            <span class="ev-rule"><span class="ev-rule-name">${escapeHtml(ruleName)}</span>${engine ? `<span class="ev-engine-tag">${escapeHtml(engine)}</span>` : ''}</span>
             <span class="ev-pid">${pid}</span>
             <span class="ev-process">${escapeHtml(procName)}</span>
             <span class="ev-details">${escapeHtml(details)}</span>
-            ${ev.pid ? `<span class="ev-graph-btn" title="Investigate PID ${ev.pid} in process graph" onclick="event.stopPropagation(); focusProcessGraph('${ev.pid}', {reset:true})">&#9673; Graph</span>` : '<span class="ev-graph-btn-empty"></span>'}
+            ${ev.pid ? `<span class="ev-graph-btn" title="Investigate PID ${escapeHtml(String(ev.pid))} in process graph" onclick="event.stopPropagation(); focusProcessGraph(${jsArg(ev.pid)}, {reset:true, at:${jsArg(ev.timestamp || '')}})">&#9673; Graph</span>` : '<span class="ev-graph-btn-empty"></span>'}
         </div>`;
     });
     container.innerHTML = html;
@@ -1198,8 +1249,8 @@ function renderRtraceVerdictView(container, proc, events) {
         html += `<div style="margin-bottom:16px;">
             <div style="font-size:10px;font-weight:600;color:var(--text-muted);letter-spacing:1px;margin-bottom:8px;">MITRE ATT&CK</div>
             <div style="display:flex;gap:4px;flex-wrap:wrap;">`;
-        [...tactics].sort().forEach(t => { html += `<span class="tag tactic">${t}</span>`; });
-        [...techniques].sort().forEach(t => { html += `<span class="tag technique">${t}</span>`; });
+        [...tactics].sort().forEach(t => { html += `<span class="tag tactic">${escapeHtml(t)}</span>`; });
+        [...techniques].sort().forEach(t => { html += `<span class="tag technique">${escapeHtml(t)}</span>`; });
         html += `</div></div>`;
     }
 
@@ -1285,10 +1336,7 @@ function clearStoppedProcesses() {
     // Filter out stopped processes from view (client-side only)
     const procs = Object.values(state.processes);
     procs.forEach(proc => {
-        if (proc.exit_time) {
-            delete state.processes[proc.pid];
-            delete state.processes[String(proc.pid)];
-        }
+        if (proc.exit_time) delete state.processes[procKey(proc)];
     });
     renderRtraceConsole();
     renderProcessList();
@@ -1523,7 +1571,7 @@ function renderScanResult(data, container) {
     // If detected, offer to open in hex editor
     if (data.detected && data.filepath) {
         html += `<div class="scan-actions">`;
-        html += `<button class="btn btn-sm" onclick="hexOpenFile('${escapeHtml(data.filepath.replace(/\\/g, '\\\\'))}')">Open in Hex Editor</button>`;
+        html += `<button class="btn btn-sm" onclick="hexOpenFile(${jsArg(data.filepath)})">Open in Hex Editor</button>`;
         html += `</div>`;
     }
 
@@ -1551,7 +1599,12 @@ async function loadScanHistory() {
 
 function _histStatus(entry) {
     const v = (entry.verdict || '').toLowerCase();
-    const pct = (entry.score != null) ? ` ${(entry.score * 100).toFixed(1)}%` : '';
+    // EMBER reports a probability (0-1); the memory tools an evidence score
+    // on their own scale (suspicious >= 2, malicious >= 6).
+    const isProbability = /ember/i.test(entry.tool || '');
+    const pct = entry.score == null ? ''
+        : isProbability ? ` ${(entry.score * 100).toFixed(1)}%`
+        : ` score ${Number(entry.score).toFixed(2)}`;
     if (entry.status === 'timeout') return { cls: 'history-unknown', text: 'TIMEOUT' };
     if (entry.status && entry.status !== 'ok') return { cls: 'history-unknown', text: entry.status.toUpperCase() };
     if (v === 'malicious' || entry.detected === true) return { cls: 'history-detected', text: (v === 'malicious' ? 'MALICIOUS' : 'DETECTED') + pct };
@@ -2142,8 +2195,8 @@ function renderHexView(hexDump, baseOffset, bytesShown) {
         const match = line.match(/^([0-9a-f]+)\s+(.+?)\s+\|(.+)\|$/i);
         if (!match) {
             // Fallback: just display raw
-            offsetHtml += line.substring(0, 8) + '\n';
-            hexHtml += line.substring(10) + '\n';
+            offsetHtml += escapeHtml(line.substring(0, 8)) + '\n';
+            hexHtml += escapeHtml(line.substring(10)) + '\n';
             validLineIdx++;
             return;
         }
@@ -2161,7 +2214,7 @@ function renderHexView(hexDump, baseOffset, bytesShown) {
             if (byte === '') return;
             const globalIdx = (validLineIdx * 16) + byteIdx;
             const isNull = byte === '00';
-            lineHexHtml += `<span class="hex-byte${isNull ? ' null-byte' : ''}" data-idx="${globalIdx}" onclick="hexSelectByte(${globalIdx})">${byte}</span>`;
+            lineHexHtml += `<span class="hex-byte${isNull ? ' null-byte' : ''}" data-idx="${globalIdx}" onclick="hexSelectByte(${globalIdx})">${escapeHtml(byte)}</span>`;
             // Add gap between bytes 7 and 8
             if (byteIdx === 7) lineHexHtml += '<span class="hex-gap"></span>';
         });
@@ -2510,7 +2563,7 @@ function renderDetectionOverview(detection, prefix) {
                 html += `<div class="die-det-name">${escapeHtml(item.name)}</div>`;
                 if (item.version) html += `<div class="die-det-ver">${escapeHtml(item.version)}</div>`;
                 html += `</div>`;
-                html += `<div class="die-det-conf" title="Confidence: ${item.confidence}">${conf}</div>`;
+                html += `<div class="die-det-conf" title="Confidence: ${escapeHtml(item.confidence)}">${conf}</div>`;
                 html += `</div>`;
             });
         }
@@ -2616,7 +2669,7 @@ function renderPeAnalysis(pe, container) {
     }
 
     // --- File map (planes are painted asynchronously below) ---
-    html += fileMapInlineBlock(pe.path);
+    html += fileMapInlineBlock(pe.path, 'pe');
 
     // --- IOC Flags Banner ---
     if (pe.flags && pe.flags.length > 0) {
@@ -2630,11 +2683,11 @@ function renderPeAnalysis(pe, container) {
         html += '<div class="pe-flags-list">';
         pe.flags.sort((a, b) => {
             const order = {high: 0, medium: 1, low: 2};
-            return (order[a.severity] || 3) - (order[b.severity] || 3);
+            return (order[a.severity] ?? 3) - (order[b.severity] ?? 3);
         }).forEach((f, idx) => {
             const hasEvidence = f.evidence && Object.keys(f.evidence).length > 0;
-            html += `<div class="pe-flag-item sev-${f.severity}${hasEvidence ? ' expandable' : ''}" ${hasEvidence ? `onclick="toggleFlagEvidence(this)"` : ''}>`;
-            html += `<span class="pe-flag-sev">${f.severity.toUpperCase()}</span>`;
+            html += `<div class="pe-flag-item sev-${cssToken(f.severity)}${hasEvidence ? ' expandable' : ''}" ${hasEvidence ? `onclick="toggleFlagEvidence(this)"` : ''}>`;
+            html += `<span class="pe-flag-sev">${escapeHtml(f.severity.toUpperCase())}</span>`;
             html += `<span class="pe-flag-detail">${escapeHtml(f.detail)}</span>`;
             if (hasEvidence) html += `<span class="pe-flag-expand-icon">&#x25BC;</span>`;
             html += `</div>`;
@@ -2777,7 +2830,7 @@ function renderPeAnalysis(pe, container) {
     }
 
     container.innerHTML = html;
-    fileMapInlineMount(pe.path);
+    fileMapInlineMount(pe.path, 'pe');
 }
 
 async function peInspectSection(idx) {
@@ -2986,7 +3039,7 @@ function renderElfAnalysis(elf, container) {
     }
 
     // --- File map (planes are painted asynchronously below) ---
-    html += fileMapInlineBlock(elf.path);
+    html += fileMapInlineBlock(elf.path, 'elf');
 
     // --- IOC Flags Banner ---
     if (elf.flags && elf.flags.length > 0) {
@@ -3000,11 +3053,11 @@ function renderElfAnalysis(elf, container) {
         html += '<div class="elf-flags-list">';
         elf.flags.sort((a, b) => {
             const order = {high: 0, medium: 1, low: 2};
-            return (order[a.severity] || 3) - (order[b.severity] || 3);
+            return (order[a.severity] ?? 3) - (order[b.severity] ?? 3);
         }).forEach((f, idx) => {
             const hasEvidence = f.evidence && Object.keys(f.evidence).length > 0;
-            html += `<div class="elf-flag-item sev-${f.severity}${hasEvidence ? ' expandable' : ''}" ${hasEvidence ? `onclick="toggleFlagEvidence(this)"` : ''}>`;
-            html += `<span class="elf-flag-sev">${f.severity.toUpperCase()}</span>`;
+            html += `<div class="elf-flag-item sev-${cssToken(f.severity)}${hasEvidence ? ' expandable' : ''}" ${hasEvidence ? `onclick="toggleFlagEvidence(this)"` : ''}>`;
+            html += `<span class="elf-flag-sev">${escapeHtml(f.severity.toUpperCase())}</span>`;
             html += `<span class="elf-flag-detail">${escapeHtml(f.detail)}</span>`;
             if (hasEvidence) html += `<span class="elf-flag-expand-icon">&#x25BC;</span>`;
             html += `</div>`;
@@ -3153,7 +3206,7 @@ function renderElfAnalysis(elf, container) {
         html += '<div class="elf-collapse-body" style="display:none;">';
         html += '<table class="elf-table elf-sym-table"><thead><tr><th>Name</th><th>Bind</th><th>Type</th></tr></thead><tbody>';
         elf.imported_symbols.forEach(sym => {
-            html += `<tr><td class="mono">${escapeHtml(sym.name)}</td><td>${sym.bind}</td><td>${sym.type}</td></tr>`;
+            html += `<tr><td class="mono">${escapeHtml(sym.name)}</td><td>${escapeHtml(sym.bind)}</td><td>${escapeHtml(sym.type)}</td></tr>`;
         });
         if (elf.import_count > elf.imported_symbols.length) {
             html += `<tr><td colspan="3" class="muted">... and ${elf.import_count - elf.imported_symbols.length} more</td></tr>`;
@@ -3168,7 +3221,7 @@ function renderElfAnalysis(elf, container) {
         html += '<div class="elf-collapse-body" style="display:none;">';
         html += '<table class="elf-table elf-sym-table"><thead><tr><th>Name</th><th>Bind</th><th>Type</th><th>Value</th><th>Size</th></tr></thead><tbody>';
         elf.exported_symbols.forEach(sym => {
-            html += `<tr><td class="mono">${escapeHtml(sym.name)}</td><td>${sym.bind}</td><td>${sym.type}</td><td class="mono">${sym.value}</td><td>${sym.size}</td></tr>`;
+            html += `<tr><td class="mono">${escapeHtml(sym.name)}</td><td>${escapeHtml(sym.bind)}</td><td>${escapeHtml(sym.type)}</td><td class="mono">${escapeHtml(sym.value)}</td><td>${escapeHtml(sym.size)}</td></tr>`;
         });
         if (elf.export_count > elf.exported_symbols.length) {
             html += `<tr><td colspan="5" class="muted">... and ${elf.export_count - elf.exported_symbols.length} more</td></tr>`;
@@ -3177,7 +3230,7 @@ function renderElfAnalysis(elf, container) {
     }
 
     container.innerHTML = html;
-    fileMapInlineMount(elf.path);
+    fileMapInlineMount(elf.path, 'elf');
 }
 
 function elfToggleSection(el) {
@@ -3229,14 +3282,14 @@ async function openAgentDetail() {
             if (executed.length > 0) {
                 let recent = '<div class="detail-section"><div class="detail-section-title">RECENT DETONATIONS</div><div class="det-recent-list">';
                 executed.slice(0, 8).forEach(s => {
-                    const args = `'${escapeHtml(s.litterbox_hash || '')}', '${escapeHtml(s.sha256 || '')}', '${escapeHtml(s.agent_pid || '')}', '${escapeHtml((s.filename || '').replace(/'/g, ''))}'`;
+                    const args = [s.litterbox_hash, s.sha256, s.agent_pid, s.filename].map(jsArg).join(', ');
                     const ts = s.timestamp ? new Date(s.timestamp).toLocaleString('en-GB', {hour12:false}) : '';
                     const vlabel = s.verdict && s.verdict.label ? s.verdict.label : '';
                     const vcls = vlabel === 'MALICIOUS' ? 'malicious' : (vlabel === 'SUSPICIOUS' ? 'suspicious' : 'clean');
                     recent += `<div class="det-recent-item" onclick="viewDetonationResult(${args})">
                         <span class="det-recent-name">${escapeHtml(s.filename || s.sha256 || 'unknown')}</span>
                         ${s.agent_pid ? `<span class="det-recent-pid">PID ${escapeHtml(String(s.agent_pid))}</span>` : ''}
-                        ${vlabel ? `<span class="det-verdict-badge det-verdict-${vcls}" style="font-size:9px;padding:1px 6px;">${vlabel}</span>` : ''}
+                        ${vlabel ? `<span class="det-verdict-badge det-verdict-${cssToken(vcls)}" style="font-size:9px;padding:1px 6px;">${escapeHtml(vlabel)}</span>` : ''}
                         <span class="det-recent-ts muted">${ts}</span>
                     </div>`;
                 });
@@ -3278,15 +3331,15 @@ async function openLitterboxDetail() {
                         const scoreClass = score >= 7 ? 'high' : score >= 4 ? 'med' : 'low';
                         const ts = a.timestamp || a.created_at || '';
                         const timeStr = ts ? new Date(ts).toLocaleString('en-GB', {hour12:false, day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit'}) : '--';
-                        html += `<div class="lb-analysis-entry" onclick="viewLitterboxResult('${escapeHtml(hash)}')">
+                        html += `<div class="lb-analysis-entry" onclick="viewLitterboxResult(${jsArg(hash)})">
                             <div class="lb-entry-main">
                                 <span class="lb-entry-name" title="${escapeHtml(hash)}">${escapeHtml(filename)}</span>
                                 <span class="lb-entry-time">${timeStr}</span>
                             </div>
                             <div class="lb-entry-meta">
-                                <span class="lb-entry-score ${scoreClass}">${score}</span>
-                                <span class="lb-entry-hash mono">${hash.substring(0, 16)}...</span>
-                                <span class="lb-entry-status">${status}</span>
+                                <span class="lb-entry-score ${scoreClass}">${escapeHtml(String(score))}</span>
+                                <span class="lb-entry-hash mono">${escapeHtml(String(hash).substring(0, 16))}...</span>
+                                <span class="lb-entry-status">${escapeHtml(status)}</span>
                             </div>
                         </div>`;
                     });
@@ -3391,6 +3444,7 @@ async function viewDetonationResult(lbHash, sha256, pid, filename) {
     let verdict = null;
     let agentBlock = null;
     let iocFeed = null;
+    let detData = null;
     try {
         const params = new URLSearchParams();
         if (sha256) params.set('sha256', sha256);
@@ -3400,6 +3454,7 @@ async function viewDetonationResult(lbHash, sha256, pid, filename) {
         const resp = await fetch(`/api/detonation/results?${params}`);
         if (resp.ok) {
             const data = await resp.json();
+            detData = data;
             fibratusAlerts = data.fibratus_alerts || [];
             fibratusCount = data.fibratus_alert_count || fibratusAlerts.length;
             verdict = data.verdict || null;
@@ -3446,7 +3501,7 @@ async function viewDetonationResult(lbHash, sha256, pid, filename) {
     if (verdict && verdict.label) {
         const cls = verdict.label === 'MALICIOUS' ? 'malicious' : (verdict.label === 'SUSPICIOUS' ? 'suspicious' : 'clean');
         html += `<div class="det-verdict det-verdict-${cls}" style="margin:8px 0;">
-            <span class="det-verdict-badge">${verdict.label}</span>
+            <span class="det-verdict-badge">${escapeHtml(verdict.label)}</span>
             <span class="det-verdict-reasons">${verdict.reasons && verdict.reasons.length ? escapeHtml(verdict.reasons.join(' · ')) : 'No malicious indicators detected'}</span>
         </div>`;
     }
@@ -3455,6 +3510,20 @@ async function viewDetonationResult(lbHash, sha256, pid, filename) {
         const label = st === 'added' ? 'Hash added to Rustinel IOC watchlist'
             : st === 'exists' ? 'Hash already on IOC watchlist' : `IOC feed: ${st}`;
         html += `<div class="det-ioc-badge ${st === 'error' ? 'warn' : ''}">&#x1F4CC; ${escapeHtml(label)}</div>`;
+    }
+
+    // --- Live memory: scored evidence, exit-time dump, network rhythm ---
+    // Shown here as well as in the Submit tab, so a detonation opened later
+    // (history, after a reload) still explains its memory verdict.
+    if (detData && (detData.memory_evidence || detData.exit_capture_result
+            || (detData.network_beaconing && detData.network_beaconing.available))) {
+        html += '<div class="detail-section"><div class="detail-section-title">LIVE MEMORY</div><div style="padding:4px 8px;">';
+        if (detData.memory_evidence) html += renderMemoryEvidence(detData.memory_evidence, detData.aether);
+        if (detData.exit_capture_result) html += renderExitCaptureBlock(detData.exit_capture_result);
+        if (detData.network_beaconing && detData.network_beaconing.available) {
+            html += renderNetworkBeaconingBlock(detData.network_beaconing);
+        }
+        html += '</div></div>';
     }
 
     // --- DetonatorAgent execution section ---
@@ -3484,10 +3553,10 @@ async function viewDetonationResult(lbHash, sha256, pid, filename) {
             const engine = alert.engine || '';
             const alertPid = alert.pid || '';
             const ts = alert.timestamp ? new Date(alert.timestamp).toLocaleTimeString('en-GB', {hour12:false}) : '';
-            html += `<div class="det-alert-item sev-${sev}">
-                <span class="det-alert-sev">${sev.toUpperCase()}</span>
+            html += `<div class="det-alert-item sev-${cssToken(sev)}">
+                <span class="det-alert-sev">${escapeHtml(sev.toUpperCase())}</span>
                 <span class="det-alert-rule">${escapeHtml(ruleName)}</span>
-                <span class="det-alert-proc">${escapeHtml(procName)}${alertPid ? ' (PID:' + alertPid + ')' : ''}</span>
+                <span class="det-alert-proc">${escapeHtml(procName)}${alertPid ? ' (PID:' + escapeHtml(String(alertPid)) + ')' : ''}</span>
                 ${engine ? '<span class="det-alert-engine">' + escapeHtml(engine) + '</span>' : ''}
                 ${ts ? '<span class="det-alert-ts" style="color:var(--text-muted);font-size:10px;margin-left:auto;">' + ts + '</span>' : ''}
             </div>`;
@@ -3731,11 +3800,17 @@ function renderRustinelDetail(info) {
 }
 
 // --- Alert Detail ---
+function openAlertDetailById(id) {
+    const idx = _alertIndexById.get(String(id));
+    if (idx !== undefined) openAlertDetail(idx);
+}
+
 function openAlertDetail(idx) {
     const alert = state.alerts[idx];
     if (!alert) return;
 
-    pushDetailHistory('alert', idx);
+    // History keeps the id: positions shift with every alert refresh.
+    pushDetailHistory('alert', alert.id != null ? `id:${alert.id}` : idx);
     const severity = (alert.severity || 'unknown').toLowerCase();
     const severityColors = { critical: '#ef4444', high: '#f97316', medium: '#eab308', low: '#22c55e' };
 
@@ -3753,39 +3828,54 @@ function openAlertDetail(idx) {
 
     // Pivot into the process graph on this alert's PID (and its parent).
     const pivots = [];
-    if (alert.pid) pivots.push(`<button class="pivot-graph-btn" onclick="focusProcessGraph('${alert.pid}', {reset:true})">&#9673; PID ${alert.pid} in graph</button>`);
-    if (alert.parent_pid) pivots.push(`<button class="pivot-graph-btn secondary" onclick="focusProcessGraph('${alert.parent_pid}', {reset:true})">&#9673; Parent ${alert.parent_pid} in graph</button>`);
+    if (alert.pid) pivots.push(`<button class="pivot-graph-btn" onclick="focusProcessGraph(${jsArg(alert.pid)}, {reset:true, at:${jsArg(alert.timestamp || '')}})">&#9673; PID ${escapeHtml(String(alert.pid))} in graph</button>`);
+    if (alert.parent_pid) pivots.push(`<button class="pivot-graph-btn secondary" onclick="focusProcessGraph(${jsArg(alert.parent_pid)}, {reset:true, at:${jsArg(alert.timestamp || '')}})">&#9673; Parent ${escapeHtml(String(alert.parent_pid))} in graph</button>`);
     if (pivots.length) html += `<div class="pivot-graph-bar">${pivots.join('')}</div>`;
 
     const tags = (alert.tags || []).map(tag => {
-        if (tag.startsWith('attack.t')) return `<span class="tag technique">${tag.replace('attack.', '').toUpperCase()}</span>`;
-        if (tag.startsWith('attack.')) return `<span class="tag tactic">${tag.replace('attack.', '').toUpperCase()}</span>`;
+        if (tag.startsWith('attack.t')) return `<span class="tag technique">${escapeHtml(tag.replace('attack.', '').toUpperCase())}</span>`;
+        if (tag.startsWith('attack.')) return `<span class="tag tactic">${escapeHtml(tag.replace('attack.', '').toUpperCase())}</span>`;
         return `<span class="tag mitre">${escapeHtml(tag)}</span>`;
     }).join('');
 
     // --- Structured fields ---
     html += `<div class="detail-fields">
-        <div class="detail-field"><span class="field-label">Severity</span><span class="field-value"><span class="ev-sev-dot ${severity}" style="display:inline-block;width:8px;height:8px;vertical-align:middle;margin-right:4px;"></span>${severity.charAt(0).toUpperCase() + severity.slice(1)}</span></div>
+        <div class="detail-field"><span class="field-label">Severity</span><span class="field-value"><span class="ev-sev-dot ${cssToken(severity)}" style="display:inline-block;width:8px;height:8px;vertical-align:middle;margin-right:4px;"></span>${escapeHtml(severity.charAt(0).toUpperCase() + severity.slice(1))}</span></div>
         <div class="detail-field"><span class="field-label">Engine</span><span class="field-value">${escapeHtml((alert.engine || 'unknown').toUpperCase())}</span></div>
         <div class="detail-field"><span class="field-label">Rule</span><span class="field-value mono">${escapeHtml(alert.rule_name || '')}</span></div>
-        <div class="detail-field"><span class="field-label">PID</span><span class="field-value">${alert.pid || 'N/A'}</span></div>
+        <div class="detail-field"><span class="field-label">PID</span><span class="field-value">${escapeHtml(String(alert.pid || 'N/A'))}</span></div>
         <div class="detail-field"><span class="field-label">Process</span><span class="field-value">${escapeHtml(alert.process_name || '')}</span></div>
         <div class="detail-field"><span class="field-label">Image</span><span class="field-value mono">${escapeHtml(alert.process_image || '')}</span></div>
-        <div class="detail-field"><span class="field-label">Category</span><span class="field-value">${formatCategory(alert.category)}</span></div>
+        <div class="detail-field"><span class="field-label">Category</span><span class="field-value">${escapeHtml(formatCategory(alert.category))}</span></div>
         ${alert.command_line ? `<div class="detail-field"><span class="field-label">Command</span><span class="field-value mono">${escapeHtml(alert.command_line)}</span></div>` : ''}
-        ${alert.parent_name ? `<div class="detail-field"><span class="field-label">Parent</span><span class="field-value">${alert.parent_pid || '?'} (${escapeHtml(alert.parent_name)})</span></div>` : ''}
+        ${alert.parent_name ? `<div class="detail-field"><span class="field-label">Parent</span><span class="field-value">${escapeHtml(String(alert.parent_pid || '?'))} (${escapeHtml(alert.parent_name)})</span></div>` : ''}
         ${alert.parent_command_line ? `<div class="detail-field"><span class="field-label">Parent Cmd</span><span class="field-value mono">${escapeHtml(alert.parent_command_line)}</span></div>` : ''}
         ${alert.user ? `<div class="detail-field"><span class="field-label">User</span><span class="field-value">${escapeHtml(alert.user)}</span></div>` : ''}
         ${tags ? `<div class="detail-field"><span class="field-label">ATT&CK</span><span class="field-value">${tags}</span></div>` : ''}
-        <div class="detail-field"><span class="field-label">Timestamp</span><span class="field-value">${alert.timestamp || ''}</span></div>
+        <div class="detail-field"><span class="field-label">Timestamp</span><span class="field-value">${escapeHtml(alert.timestamp || '')}</span></div>
     </div>`;
 
     // --- Parsed raw event as structured sections ---
-    const raw = alert.raw || {};
-    html += renderStructuredRawEvent(raw);
+    // The alert list carries a trimmed raw event; the complete one is loaded
+    // here, and only if this alert is still the one being shown afterwards.
+    html += `<div id="alert-raw-event">${renderStructuredRawEvent(alert.raw || {})}</div>`;
 
     setDetailBody(html);
     showDetail();
+
+    if (alert.raw_trimmed && alert.id != null) {
+        const shownId = alert.id;
+        fetch(`/api/alerts/${encodeURIComponent(shownId)}`)
+            .then(r => (r.ok ? r.json() : null))
+            .then(full => {
+                const target = document.getElementById('alert-raw-event');
+                if (!full || !target || state.detailHistory.length === 0) return;
+                const top = state.detailHistory[state.detailHistory.length - 1];
+                if (top.type !== 'alert' || String(top.id) !== `id:${shownId}`) return;
+                target.innerHTML = renderStructuredRawEvent(full.raw || {});
+            })
+            .catch(() => {});
+    }
 }
 
 function renderStructuredRawEvent(raw) {
@@ -3907,6 +3997,7 @@ function syntaxHighlightJson(json) {
 
 // --- Process Detail ---
 function openProcessDetail(pid) {
+    pid = String(pid);          // instance key, see procKey()
     state.selectedProcess = pid;
     renderProcessList();
     pushDetailHistory('process', pid);
@@ -3914,7 +4005,7 @@ function openProcessDetail(pid) {
     const proc = state.processes[pid] || state.processes[String(pid)];
     if (!proc) {
         setDetailHeader(`PID ${pid}`, 'background:rgba(59,130,246,0.2);color:#3b82f6', `Process ${pid}`, '');
-        setDetailBody(`<div class="muted">No detailed information available for PID ${pid}.</div>`);
+        setDetailBody(`<div class="muted">No detailed information available for PID ${escapeHtml(String(pid))}.</div>`);
         showDetail();
         return;
     }
@@ -3923,12 +4014,12 @@ function openProcessDetail(pid) {
     const statusText = hasExited ? 'exited' : 'running';
     setDetailHeader(`PID ${proc.pid}`, 'background:rgba(59,130,246,0.2);color:#3b82f6', proc.name || 'unknown', statusText);
 
-    let html = `<div class="pivot-graph-bar"><button class="pivot-graph-btn" onclick="focusProcessGraph('${proc.pid}', {reset:true})">&#9673; View in process graph</button></div>`;
+    let html = `<div class="pivot-graph-bar"><button class="pivot-graph-btn" onclick="focusProcessGraph(${jsArg(procKey(proc))}, {reset:true, at:${jsArg(proc.first_seen || '')}})">&#9673; View in process graph</button></div>`;
     html += `<div class="detail-fields">
         <div class="detail-field"><span class="field-label">Image</span><span class="field-value mono">${escapeHtml(proc.image || '')}</span></div>
         <div class="detail-field"><span class="field-label">Command line</span><span class="field-value mono">${escapeHtml(proc.command_line || '')}</span></div>
         <div class="detail-field"><span class="field-label">User</span><span class="field-value">${escapeHtml(proc.user || '')}</span></div>
-        <div class="detail-field"><span class="field-label">Parent</span><span class="field-value">${proc.parent_pid || 'N/A'} ${proc.parent_name ? '(' + escapeHtml(proc.parent_name) + ')' : ''}</span></div>
+        <div class="detail-field"><span class="field-label">Parent</span><span class="field-value">${escapeHtml(String(proc.parent_pid || 'N/A'))} ${proc.parent_name ? '(' + escapeHtml(proc.parent_name) + ')' : ''}</span></div>
         <div class="detail-field"><span class="field-label">Started</span><span class="field-value">${formatRelativeTime(proc.first_seen)}</span></div>
         ${hasExited ? `<div class="detail-field"><span class="field-label">Exited</span><span class="field-value">${formatRelativeTime(proc.exit_time)}</span></div>` : ''}
     </div>`;
@@ -3949,10 +4040,9 @@ function openProcessDetail(pid) {
         html += `<div class="detail-section"><div class="detail-section-title">ALERTS (${procAlerts.length})</div>`;
         procAlerts.forEach(alert => {
             const sev = (alert.severity || 'unknown').toLowerCase();
-            const alertIdx = state.alerts.findIndex(a => a.id === alert.id);
-            html += `<div class="child-card" onclick="openAlertDetail(${alertIdx >= 0 ? alertIdx : 0})">
+            html += `<div class="child-card" onclick="openAlertDetailById(${jsArg(alert.id)})">
                 <div class="child-header">
-                    <span class="event-severity ${sev}">${alert.severity}</span>
+                    <span class="event-severity ${cssToken(sev)}">${escapeHtml(alert.severity)}</span>
                     <span class="child-name" style="margin-left:8px">${escapeHtml(alert.rule_name || '')}</span>
                 </div>
             </div>`;
@@ -3969,10 +4059,10 @@ function openProcessDetail(pid) {
         const pdOk = state.processDumpStatus ? state.processDumpStatus.installed !== false : true;
         html += `<div class="mem-actions">`;
         html += `<button class="btn btn-sm btn-accent" ${aetherOk ? '' : 'disabled'} `
-            + `onclick="runAetherScan(${proc.pid}, 'proc-mem-result')" `
+            + `onclick="runAetherScan(${jsInt(proc.pid)}, 'proc-mem-result')" `
             + `title="${aetherOk ? 'Scan this process for injection and implant structures' : 'Aether is not installed on this VM'}">Aether scan</button>`;
         html += `<button class="btn btn-sm btn-accent" ${pdOk ? '' : 'disabled'} `
-            + `onclick="runProcessDump(${proc.pid}, 'proc-mem-result')" `
+            + `onclick="runProcessDump(${jsInt(proc.pid)}, 'proc-mem-result')" `
             + `title="${pdOk ? 'Dump this process memory components to disk' : 'Process Dump is not installed on this VM'}">Dump memory</button>`;
         // Without a baseline every known-good module would be dumped as well.
         if (pdOk && state.processDumpStatus && state.processDumpStatus.clean_db === false) {
@@ -4000,11 +4090,11 @@ function renderProcessList() {
 
     container.innerHTML = procs.map(proc => {
         const hasThreats = (proc.activity?.threats || 0) > 0;
-        const isActive = state.selectedProcess === proc.pid;
-        return `<div class="process-item ${isActive ? 'active' : ''}" onclick="openProcessDetail(${proc.pid})">
+        const isActive = state.selectedProcess === procKey(proc);
+        return `<div class="process-item ${isActive ? 'active' : ''}" onclick="openProcessDetail(${jsArg(procKey(proc))})">
                 <div class="proc-icon ${hasThreats ? 'threat' : ''}"></div>
                 <span class="proc-name">${escapeHtml(proc.name || 'unknown')}</span>
-                <span class="proc-pid">${proc.pid}</span>
+                <span class="proc-pid">${escapeHtml(String(proc.pid))}</span>
             </div>`;
     }).join('');
 }
@@ -4021,7 +4111,7 @@ function renderTimeline() {
     container.innerHTML = alerts.map(alert => {
         const sev = (alert.severity || 'low').toLowerCase();
         const width = 30 + Math.random() * 70;
-        return `<div class="timeline-bar severity-${sev}" style="width:${width}%" title="${escapeHtml(alert.rule_name || '')}"></div>`;
+        return `<div class="timeline-bar severity-${cssToken(sev)}" style="width:${width}%" title="${escapeHtml(alert.rule_name || '')}"></div>`;
     }).join('');
 }
 
@@ -4124,7 +4214,11 @@ function goDetailBack() {
         else if (prev.type === 'rustinel') openRustinelDetail();
         else if (prev.type === 'agent') openAgentDetail();
         else if (prev.type === 'litterbox') openLitterboxDetail();
-        else if (prev.type === 'alert') openAlertDetail(prev.id);
+        else if (prev.type === 'alert') {
+            const ref = String(prev.id);
+            if (ref.startsWith('id:')) openAlertDetailById(ref.slice(3));
+            else openAlertDetail(prev.id);
+        }
     } else {
         closeDetail();
     }
@@ -4135,7 +4229,7 @@ function setDetailHeader(badgeText, badgeStyle, title, meta) {
     if (headerLeft) {
         headerLeft.innerHTML = `
             <button class="btn btn-sm" onclick="goDetailBack()">&lt; Back</button>
-            <span class="detail-badge" id="detail-badge" style="${badgeStyle}">${badgeText}</span>
+            <span class="detail-badge" id="detail-badge" style="${escapeHtml(badgeStyle)}">${escapeHtml(badgeText)}</span>
             <span class="detail-title" id="detail-title">${escapeHtml(title)}</span>`;
     }
     const metaEl = document.getElementById('detail-meta');
@@ -4238,12 +4332,12 @@ function renderDetonationResults(data, container) {
 
     let html = `<div class="det-results">`;
     // Header
-    const fullArgs = `'${lbHash || ''}', '${sha256 || ''}', '${pid || ''}', '${escapeHtml(filename).replace(/'/g, "\\'")}'`;
+    const fullArgs = [lbHash, sha256, pid, filename].map(jsArg).join(', ');
     html += `<div class="det-results-header">
         <div class="det-filename">${escapeHtml(filename)}</div>
         <div class="det-meta">
-            ${sha256 ? `<span class="det-hash mono">${sha256.substring(0, 16)}...</span>` : ''}
-            ${pid ? `<span class="det-pid">PID: ${pid}</span>` : ''}
+            ${sha256 ? `<span class="det-hash mono">${escapeHtml(sha256.substring(0, 16))}...</span>` : ''}
+            ${pid ? `<span class="det-pid">PID: ${escapeHtml(String(pid))}</span>` : ''}
             <button class="det-full-btn" onclick="viewDetonationResult(${fullArgs})">Full Results &rarr;</button>
         </div>
     </div>`;
@@ -4258,7 +4352,7 @@ function renderDetonationResults(data, container) {
             <div class="det-stage-icon">${ok ? '&#x2705;' : '&#x274C;'}</div>
             <div class="det-stage-info">
                 <div class="det-stage-title">DetonatorAgent</div>
-                <div class="det-stage-detail">${ok ? 'Executed' : 'Failed'} (HTTP ${data.agent.status})${pid ? ` — PID ${pid}` : ''}</div>
+                <div class="det-stage-detail">${ok ? 'Executed' : 'Failed'} (HTTP ${escapeHtml(String(data.agent.status))})${pid ? ` — PID ${escapeHtml(String(pid))}` : ''}</div>
             </div>
         </div>`;
     }
@@ -4297,7 +4391,7 @@ function renderDetonationResults(data, container) {
             <div class="det-stage-icon">${ok ? '&#x2705;' : '&#x274C;'}</div>
             <div class="det-stage-info">
                 <div class="det-stage-title">Dynamic Analysis</div>
-                <div class="det-stage-detail">${ok ? `Triggered (PE-Sieve, Moneta, HollowsHunter) — ${data.litterbox_dynamic.target}` : 'Not triggered' + escapeHtml(errorDetail)}</div>
+                <div class="det-stage-detail">${ok ? `Triggered (PE-Sieve, Moneta, HollowsHunter) — ${escapeHtml(data.litterbox_dynamic.target)}` : 'Not triggered' + escapeHtml(errorDetail)}</div>
             </div>
         </div>`;
     }
@@ -4324,7 +4418,7 @@ function renderDetonationResults(data, container) {
             <div class="det-stage-icon">${ok ? '&#x2705;' : '&#x23F3;'}</div>
             <div class="det-stage-info">
                 <div class="det-stage-title">Live Memory</div>
-                <div class="det-stage-detail">${ok ? `Triggered (${tools}) — scanning and dumping process memory...` : (data.beacon_scan.reason || 'Not triggered')}</div>
+                <div class="det-stage-detail">${ok ? `Triggered (${tools}) — scanning and dumping process memory...` : escapeHtml(data.beacon_scan.reason || 'Not triggered')}</div>
             </div>
         </div>`;
     }
@@ -4355,9 +4449,16 @@ function renderDetonationResults(data, container) {
 }
 
 let _detonationPollTimer = null;
+// Incremented whenever a new result view starts polling. clearTimeout cannot
+// cancel a fetch already in flight; its late response would otherwise render
+// the previous sample into the panel and restart the old poll chain.
+let _detonationPollGen = 0;
 
-function pollDetonationResults(sha256, pid, lbHash, filename, attempt) {
+function pollDetonationResults(sha256, pid, lbHash, filename, attempt, gen) {
     if (_detonationPollTimer) clearTimeout(_detonationPollTimer);
+    if (gen === undefined) gen = ++_detonationPollGen;
+    const current = () => gen === _detonationPollGen && document.getElementById('det-results-panels');
+    if (!current()) return;
     const maxAttempts = 30; // Poll for up to ~2.5 minutes
     if (attempt >= maxAttempts) {
         const panels = document.getElementById('det-results-panels');
@@ -4374,6 +4475,7 @@ function pollDetonationResults(sha256, pid, lbHash, filename, attempt) {
     fetch(`/api/detonation/results?${params}`)
         .then(r => r.json())
         .then(data => {
+            if (!current()) return;
             renderDetonationPanels(data);
             // Check service status
             const edrStatus = data.edr_status || {};
@@ -4424,7 +4526,7 @@ function pollDetonationResults(sha256, pid, lbHash, filename, attempt) {
             const allOffline = bothEdrOffline && litterboxOffline;
             const minAttempts = allOffline ? 1 : (bothEdrOffline || litterboxOffline) ? 2 : 8;
             if (!allReady || attempt < minAttempts) {
-                _detonationPollTimer = setTimeout(() => pollDetonationResults(sha256, pid, lbHash, filename, attempt + 1), 5000);
+                _detonationPollTimer = setTimeout(() => pollDetonationResults(sha256, pid, lbHash, filename, attempt + 1, gen), 5000);
             } else {
                 // Final update: show polling complete message
                 const panels = document.getElementById('det-results-panels');
@@ -4446,7 +4548,8 @@ function pollDetonationResults(sha256, pid, lbHash, filename, attempt) {
             }
         })
         .catch(() => {
-            _detonationPollTimer = setTimeout(() => pollDetonationResults(sha256, pid, lbHash, filename, attempt + 1), 5000);
+            if (!current()) return;
+            _detonationPollTimer = setTimeout(() => pollDetonationResults(sha256, pid, lbHash, filename, attempt + 1, gen), 5000);
         });
 }
 
@@ -4500,7 +4603,7 @@ function renderDetonationPanels(data) {
         const v = data.verdict;
         const cls = v.label === 'MALICIOUS' ? 'malicious' : (v.label === 'SUSPICIOUS' ? 'suspicious' : 'clean');
         html += `<div class="det-verdict det-verdict-${cls}">
-            <span class="det-verdict-badge">${v.label}</span>
+            <span class="det-verdict-badge">${escapeHtml(v.label)}</span>
             <span class="det-verdict-reasons">${v.reasons && v.reasons.length ? escapeHtml(v.reasons.join(' · ')) : 'No malicious indicators detected'}</span>
         </div>`;
     }
@@ -4530,10 +4633,10 @@ function renderDetonationPanels(data) {
             const engine = alert.engine || '';
             const apid = alert.pid || '';
             const ts = alert.timestamp ? new Date(alert.timestamp).toLocaleTimeString('en-GB', {hour12:false}) : '';
-            body += `<tr class="sev-${sev}">
-                <td><span class="det-alert-sev sev-${sev}">${sev.toUpperCase()}</span></td>
+            body += `<tr class="sev-${cssToken(sev)}">
+                <td><span class="det-alert-sev sev-${cssToken(sev)}">${escapeHtml(sev.toUpperCase())}</span></td>
                 <td>${escapeHtml(ruleName)}</td>
-                <td>${escapeHtml(procName)}${apid ? ' <span class="muted">(PID:' + apid + ')</span>' : ''}</td>
+                <td>${escapeHtml(procName)}${apid ? ' <span class="muted">(PID:' + escapeHtml(String(apid)) + ')</span>' : ''}</td>
                 <td>${escapeHtml(engine)}</td>
                 <td class="muted">${ts}</td>
                 <td>${_detRawButton('View', alert.raw || alert)}</td>
@@ -4598,6 +4701,7 @@ function renderDetonationPanels(data) {
             } else {
                 const count = hsb.suspicious_count || 0;
                 body += `<div class="det-sub-value ${count > 0 ? 'det-warn' : ''}">${count > 0 ? count + ' suspicious indicator(s) found' : 'No sleeping beacons detected'}</div>`;
+                if (hsb.limitation) body += `<div class="det-sub-value muted">Limited: ${escapeHtml(hsb.limitation)}</div>`;
                 (hsb.findings || []).forEach(f => {
                     const process = f.process || '';
                     const indicators = (f.indicators || []).join('; ');
@@ -4617,6 +4721,7 @@ function renderDetonationPanels(data) {
             } else {
                 const count = be.beacons_found || 0;
                 body += `<div class="det-sub-value ${count > 0 ? 'det-warn' : ''}">${count > 0 ? count + ' CobaltStrike beacon(s) found' : 'No CobaltStrike beacons detected'}</div>`;
+                if (be.limitation) body += `<div class="det-sub-value muted">Limited: ${escapeHtml(be.limitation)}</div>`;
                 (be.findings || []).forEach(f => {
                     body += `<div class="det-beacon-finding"><span class="det-beacon-proc">${escapeHtml(f.summary || '')}</span>`;
                     if (f.config && Object.keys(f.config).length > 0) {
@@ -4652,7 +4757,7 @@ function renderDetonationPanels(data) {
     if (tabs.length > 0) {
         html += `<div class="det-tabs"><div class="det-tab-nav">`;
         tabs.forEach((t, i) => {
-            html += `<button class="det-tab-btn ${i === 0 ? 'active' : ''}" onclick="detShowTab('${t.id}', this)">${escapeHtml(t.label)}${t.count !== undefined ? ` <span class="det-tab-count">${t.count}</span>` : ''}</button>`;
+            html += `<button class="det-tab-btn ${i === 0 ? 'active' : ''}" onclick="detShowTab(${jsArg(t.id)}, this)">${escapeHtml(t.label)}${t.count !== undefined ? ` <span class="det-tab-count">${t.count}</span>` : ''}</button>`;
         });
         html += `</div>`;
         tabs.forEach((t, i) => {
@@ -4761,15 +4866,15 @@ async function refreshSubmissions() {
             const pid = sub.agent_pid ? `<span class="badge badge-dim">PID ${sub.agent_pid}</span>` : '';
             const shortHash = sub.sha256 ? sub.sha256.substring(0, 12) + '...' : '--';
             let actions = sub.file_path
-                ? `<button class="btn btn-xs" onclick="hexOpenFile('${escapeHtml(sub.file_path.replace(/\\/g, '\\\\'))}')" title="Open in Hex Editor">Hex</button>`
+                ? `<button class="btn btn-xs" onclick="hexOpenFile(${jsArg(sub.file_path)})" title="Open in Hex Editor">Hex</button>`
                 : '';
             // Add LitterBox results button if submission went to LitterBox
             const lbHash = sub.litterbox_hash || sub.sha256;
             if (lbHash && (sub.target === 'litterbox' || sub.target === 'both' || sub.litterbox_status === 'success')) {
-                actions += ` <button class="btn btn-xs btn-lb-results" onclick="viewDetonationResult('${escapeHtml(lbHash)}', '${escapeHtml(sub.sha256 || '')}', '${escapeHtml(sub.agent_pid || '')}', '${escapeHtml(sub.filename || '')}')" title="View analysis results (LitterBox + Fibratus)">Results</button>`;
+                actions += ` <button class="btn btn-xs btn-lb-results" onclick="viewDetonationResult(${[lbHash, sub.sha256, sub.agent_pid, sub.filename].map(jsArg).join(', ')})" title="View analysis results (LitterBox + Fibratus)">Results</button>`;
             } else if (sub.sha256 || sub.agent_pid) {
                 // Even without LitterBox, show results button for Fibratus/Rustinel alerts
-                actions += ` <button class="btn btn-xs btn-lb-results" onclick="viewDetonationResult('', '${escapeHtml(sub.sha256 || '')}', '${escapeHtml(sub.agent_pid || '')}', '${escapeHtml(sub.filename || '')}')" title="View Fibratus/Rustinel alerts">Results</button>`;
+                actions += ` <button class="btn btn-xs btn-lb-results" onclick="viewDetonationResult(${['', sub.sha256, sub.agent_pid, sub.filename].map(jsArg).join(', ')})" title="View Fibratus/Rustinel alerts">Results</button>`;
             }
 
             html += `<tr>`;
@@ -4811,18 +4916,24 @@ const graphState = {
     data: null,           // last /api/process-graph payload
     emptyMessage: '',     // message shown on the canvas when there are no nodes
     isLoading: false,     // true while /api/process-graph is being fetched
+    layoutMode: 'tree',   // 'tree' | 'force' | 'iso'
+    isoCollapsed: new Set(),  // PIDs whose subtree is folded in the isometric view
 };
 
 // Programmatically focus the process graph on a PID (used by alert/process pivots).
 function focusProcessGraph(pid, opts = {}) {
-    const { push = true, reset = false } = opts;
+    // `at`: a timestamp (alert/event time); with a plain PID the server picks
+    // the process that had that PID then, not its newest holder.
+    const { push = true, reset = false, at = '' } = opts;
     pid = String(pid);
+    graphState.focusAt = at || '';
     if (reset) graphState.focusStack = [];
     else if (push && graphState.focusPid && graphState.focusPid !== pid) {
         graphState.focusStack.push(graphState.focusPid);
     }
     graphState.focusPid = pid;
     graphState.selectedNode = null;
+    graphState.isoCollapsed = new Set();
     hideGraphDetail();
     const input = document.getElementById('graph-search');
     if (input) input.value = pid;
@@ -4859,8 +4970,14 @@ async function graphRefresh() {
     showGraphLoading();
     renderBreadcrumb();
     try {
-        const resp = await fetch(`/api/process-graph?pid=${encodeURIComponent(graphState.focusPid)}&down_depth=${depth}&max_nodes=400`);
+        const atParam = graphState.focusAt ? `&at=${encodeURIComponent(graphState.focusAt)}` : '';
+        const resp = await fetch(`/api/process-graph?pid=${encodeURIComponent(graphState.focusPid)}&down_depth=${depth}&max_nodes=400${atParam}`);
         payload = await resp.json();
+        // Pin the instance the server resolved, so refreshes keep showing it.
+        if (resp.ok && payload.root_pid) {
+            graphState.focusPid = String(payload.root_pid);
+            graphState.focusAt = '';
+        }
         if (!resp.ok || payload.error) {
             graphState.nodes = [];
             graphState.edges = [];
@@ -4965,7 +5082,7 @@ async function renderGraphLanding() {
                 <div class="gsc-badges">${badges.join('')}${s.size != null ? `<span class="glc-badge">${escapeHtml(formatSize(s.size))}</span>` : ''}</div>
                 ${tools ? `<div class="gsc-tools">${tools}</div>` : ''}
                 <div class="gsc-detail" style="display:none"></div>
-                <div class="gsc-foot">${s.executed ? '&#9673; Open process tree (PID ' + escapeHtml(String(s.pid)) + ')' : '&#9656; Show scan details'}</div>
+                <div class="gsc-foot">${s.executed ? '&#9673; Open process tree (PID ' + escapeHtml(String(s.os_pid ?? s.pid)) + ')' : '&#9656; Show scan details'}</div>
             </div>`;
         });
         html += '</div>';
@@ -4978,13 +5095,13 @@ async function renderGraphLanding() {
     } else {
         html += '<div class="graph-landing-list">';
         filtered.forEach(r => {
-            const sevClass = r.severity && r.severity !== 'unknown' ? `sev-${r.severity}` : '';
+            const sevClass = r.severity && r.severity !== 'unknown' ? `sev-${cssToken(r.severity)}` : '';
             const badges = [];
             if (r.detonated) badges.push('<span class="glc-badge det">detonated</span>');
             if (r.threats > 0) badges.push(`<span class="glc-badge threat">${r.threats} threats</span>`);
             if (r.children_count > 0) badges.push(`<span class="glc-badge">${r.children_count} children</span>`);
-            html += `<div class="graph-landing-card ${sevClass}" data-pid="${escapeHtml(String(r.pid))}">
-                <div class="glc-head"><span class="glc-name">${escapeHtml(r.name || 'unknown')}</span><span class="glc-pid">PID ${escapeHtml(String(r.pid))}</span></div>
+            html += `<div class="graph-landing-card ${sevClass}" data-pid="${escapeHtml(String(r.pid))}" data-at="${escapeHtml(r.first_seen || '')}">
+                <div class="glc-head"><span class="glc-name">${escapeHtml(r.name || 'unknown')}</span><span class="glc-pid">PID ${escapeHtml(String(r.os_pid ?? r.pid))}</span></div>
                 ${r.image ? `<div class="glc-image">${escapeHtml(r.image)}</div>` : ''}
                 <div class="glc-badges">${badges.join('')}</div>
             </div>`;
@@ -4995,7 +5112,9 @@ async function renderGraphLanding() {
     landing.innerHTML = html;
 
     landing.querySelectorAll('.graph-landing-card[data-pid]').forEach(card => {
-        card.addEventListener('click', () => focusProcessGraph(card.dataset.pid, { reset: true }));
+        // Roots come from the alert tree; its keys can differ from the graph's,
+        // so the first-seen time picks the right process instance.
+        card.addEventListener('click', () => focusProcessGraph(card.dataset.pid, { reset: true, at: card.dataset.at }));
     });
 
     // Sample cards: executed samples pivot to their process tree; static-only
@@ -5096,7 +5215,10 @@ function buildGraph(payload) {
         const node = {
             id: `proc_${pid}`,
             type: 'process',
-            pid: pid,
+            key: pid,                      // instance key (dict key)
+            pid: String(proc.pid ?? pid),  // real PID for display, scans and Sysmon queries
+            started: proc.started || '',
+            supersededAt: proc.superseded_at || '',
             label: proc.name || 'unknown',
             image: proc.image || '',
             cmdline: proc.command_line || '',
@@ -5104,7 +5226,8 @@ function buildGraph(payload) {
             threats: threats,
             severity: proc.severity || 'unknown',
             children: proc.children || [],
-            parentPid: proc.parent_pid,
+            parentPid: proc.parent_key ?? proc.parent_pid,   // key of the parent instance
+            parentOsPid: proc.parent_pid,
             activity: proc.activity || {},
             firstSeen: proc.first_seen || '',
             exited: !!proc.exit_time,
@@ -5144,7 +5267,7 @@ function buildGraph(payload) {
             if (!netTargets[key]) {
                 netTargets[key] = { ip: ev.dst_ip, port: ev.dst_port, hostname: ev.dst_hostname || '', pids: new Set(), protocol: ev.protocol || 'tcp' };
             }
-            if (ev.pid) netTargets[key].pids.add(String(ev.pid));
+            if (ev.key || ev.pid) netTargets[key].pids.add(String(ev.key || ev.pid));
         });
 
         for (const [key, info] of Object.entries(netTargets)) {
@@ -5176,7 +5299,7 @@ function buildGraph(payload) {
             if (!dnsTargets[query]) {
                 dnsTargets[query] = { query, result: ev.result || '', pids: new Set() };
             }
-            if (ev.pid) dnsTargets[query].pids.add(String(ev.pid));
+            if (ev.key || ev.pid) dnsTargets[query].pids.add(String(ev.key || ev.pid));
         });
 
         for (const [query, info] of Object.entries(dnsTargets)) {
@@ -5199,8 +5322,8 @@ function buildGraph(payload) {
 
     // 5. Injection edges (Sysmon event 8: CreateRemoteThread)
     (payload.injections || []).forEach(ev => {
-        const srcPid = String(ev.source_pid);
-        const tgtPid = String(ev.target_pid);
+        const srcPid = String(ev.source_key || ev.source_pid);
+        const tgtPid = String(ev.target_key || ev.target_pid);
         if (srcPid && tgtPid && nodeMap[srcPid] && nodeMap[tgtPid]) {
             edges.push({ source: `proc_${srcPid}`, target: `proc_${tgtPid}`, type: 'inject', label: 'inject' });
         }
@@ -5213,7 +5336,7 @@ function buildGraph(payload) {
             const path = ev.target || '';
             if (!path || !ev.pid) return;
             if (!fileTargets[path]) fileTargets[path] = { path, pids: new Set() };
-            fileTargets[path].pids.add(String(ev.pid));
+            fileTargets[path].pids.add(String(ev.key || ev.pid));
         });
         for (const [path, info] of Object.entries(fileTargets)) {
             const nodeId = `file_${path}`;
@@ -5233,7 +5356,7 @@ function buildGraph(payload) {
             if (!path || !ev.pid) return;
             const shortKey = path.split('\\').slice(-2).join('\\') || path;
             if (!regTargets[shortKey]) regTargets[shortKey] = { path, pids: new Set() };
-            regTargets[shortKey].pids.add(String(ev.pid));
+            regTargets[shortKey].pids.add(String(ev.key || ev.pid));
         });
         for (const [key, info] of Object.entries(regTargets)) {
             const nodeId = `reg_${key}`;
@@ -5246,8 +5369,12 @@ function buildGraph(payload) {
 
     // Apply layout: rooted process tree (default) or force-directed
     const layout = document.getElementById('graph-layout')?.value || 'tree';
+    graphState.layoutMode = layout;
+    document.getElementById('graph-container')?.classList.toggle('graph-iso', layout === 'iso');
     if (layout === 'force') {
         applyForceLayout(nodes, edges);
+    } else if (layout === 'iso') {
+        applyIsometricLayout(nodes, edges, nodeMap);
     } else {
         applyRootedLayout(nodes, edges, nodeMap);
     }
@@ -5286,7 +5413,7 @@ function applyRootedLayout(nodes, edges, nodeMap) {
         visited.add(node.id);
         const kids = (node.children || [])
             .map(c => nodeMap[c])
-            .filter(k => k && String(k.parentPid) === String(node.pid) && !visited.has(k.id));
+            .filter(k => k && String(k.parentPid) === String(node.key) && !visited.has(k.id));
         if (!kids.length) {
             colById[node.id] = leaf++;
         } else {
@@ -5328,6 +5455,371 @@ function applyRootedLayout(nodes, edges, nodeMap) {
     }
 }
 
+// --- Isometric process-tree view -----------------------------------------
+//
+// Two isometric axes: U (down-right) is process depth, V (down-left) lines up
+// siblings. Every parent owns a "spine" running along V halfway to its
+// children; each child hangs off it by a short tick. The parent sits at the
+// head of its spine, so a single-child chain (the ancestor lineage) runs as
+// one straight line along U. Process-to-process edges (remote threads) are
+// drawn as raised bridges so they never get lost among the tree lines.
+const ISO = {
+    COS: Math.cos(Math.PI / 6),
+    SIN: Math.sin(Math.PI / 6),
+    STEP_U: 118,     // world units between depth levels
+    STEP_V: 76,      // world units between siblings
+    LIFT: 64,        // height of the bridge plane for cross-process edges
+    R: 13,           // node radius
+};
+
+function isoProject(u, v) {
+    return {
+        x: (u * ISO.STEP_U - v * ISO.STEP_V) * ISO.COS,
+        y: (u * ISO.STEP_U + v * ISO.STEP_V) * ISO.SIN,
+    };
+}
+
+function applyIsometricLayout(nodes, edges, nodeMap) {
+    const procNodes = nodes.filter(n => n.type === 'process');
+    const roots = procNodes.filter(n => !n.parentPid || !nodeMap[String(n.parentPid)]);
+    if (!roots.length && procNodes.length) roots.push(procNodes[0]);
+
+    const byTime = (a, b) => String(a.firstSeen || '').localeCompare(String(b.firstSeen || ''))
+        || (parseInt(a.pid, 10) || 0) - (parseInt(b.pid, 10) || 0);
+    const kidsOf = n => (n.children || [])
+        .map(c => nodeMap[String(c)])
+        .filter(k => k && String(k.parentPid) === String(n.key))
+        .sort(byTime);
+
+    const visited = new Set();
+    const minDepth = Math.min(0, ...procNodes.map(n => n.depth || 0));
+    let nextV = 0;
+
+    function countDescendants(n, seen = new Set()) {
+        let total = 0;
+        for (const k of kidsOf(n)) {
+            if (seen.has(k.id)) continue;
+            seen.add(k.id);
+            total += 1 + countDescendants(k, seen);
+        }
+        return total;
+    }
+    function hideSubtree(n) {
+        for (const k of kidsOf(n)) {
+            if (visited.has(k.id)) continue;
+            visited.add(k.id);
+            k.hidden = true;
+            hideSubtree(k);
+        }
+    }
+    function place(n, u) {
+        visited.add(n.id);
+        n.isoU = u;
+        n.isoKids = [];
+        const kids = kidsOf(n).filter(k => !visited.has(k.id));
+        n.isoHasKids = kids.length > 0;
+        n.isoCollapsed = graphState.isoCollapsed.has(String(n.key)) && kids.length > 0;
+        if (!kids.length || n.isoCollapsed) {
+            n.isoV = nextV++;
+            if (n.isoCollapsed) {
+                n.isoHiddenCount = countDescendants(n);
+                hideSubtree(n);
+            }
+            return;
+        }
+        n.isoV = nextV;                    // head of its own spine
+        kids.forEach(k => { place(k, u + 1); n.isoKids.push(k); });
+    }
+
+    roots.sort(byTime).forEach(r => {
+        if (visited.has(r.id)) return;
+        place(r, (r.depth || 0) - minDepth);
+        nextV += 1;                        // gap between separate trees
+    });
+    procNodes.forEach(n => {               // anything unreachable (cycles)
+        if (!visited.has(n.id)) { visited.add(n.id); n.isoU = 0; n.isoV = nextV++; n.isoKids = []; }
+    });
+
+    procNodes.forEach(n => {
+        const p = isoProject(n.isoU, n.isoV);
+        n.x = p.x;
+        n.y = p.y;
+        n.radius = n.isRoot || n.detonated || n.threats > 0 ? ISO.R + 5 : ISO.R;
+        n.isoAct = { network: 0, dns: 0, file: 0, registry: 0, inject: 0 };
+    });
+
+    // Activity is summarised as icons under each process instead of separate
+    // nodes; the nodes stay in the model so the detail panel can list them.
+    const index = {};
+    nodes.forEach(n => { index[n.id] = n; });
+    edges.forEach(e => {
+        const src = index[e.source];
+        if (!src || src.type !== 'process' || !src.isoAct) return;
+        if (e.type in src.isoAct) src.isoAct[e.type] += 1;
+    });
+    nodes.forEach(n => { if (n.type !== 'process') n.hidden = true; });
+}
+
+function isoHandleToggleClick(pos) {
+    for (const n of graphState.nodes) {
+        const t = n.isoToggle;
+        if (!t || n.hidden) continue;
+        const dx = pos.x - t.x, dy = pos.y - t.y;
+        if (dx * dx + dy * dy <= (t.r + 2) * (t.r + 2)) {
+            const key = String(n.key);
+            if (graphState.isoCollapsed.has(key)) graphState.isoCollapsed.delete(key);
+            else graphState.isoCollapsed.add(key);
+            if (graphState.data) buildGraph(graphState.data);
+            renderGraph();
+            return true;
+        }
+    }
+    return false;
+}
+
+function _isoNodeStyle(n) {
+    if (n.detonated) return { fill: '#f59e0b', stroke: '#fbbf24', glyph: '#1f1300', big: true };
+    if (n.threats > 0) {
+        if (n.severity === 'critical') return { fill: '#dc2626', stroke: '#ef4444', glyph: '#fff', big: true };
+        if (n.severity === 'high') return { fill: '#ea580c', stroke: '#f97316', glyph: '#fff', big: true };
+        return { fill: '#ca8a04', stroke: '#eab308', glyph: '#fff', big: true };
+    }
+    return { fill: '#1e293b', stroke: '#475569', glyph: '#94a3b8', big: false };
+}
+
+function _isoHexPath(ctx, x, y, r) {
+    ctx.beginPath();
+    for (let i = 0; i < 6; i++) {
+        const a = Math.PI / 6 + i * Math.PI / 3;      // pointy top
+        const px = x + r * Math.cos(a), py = y + r * Math.sin(a);
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+}
+
+// Small isometric cube - the process glyph inside the hexagon.
+function _isoCube(ctx, x, y, s, color) {
+    const c = ISO.COS * s, h = ISO.SIN * s;
+    ctx.save();
+    ctx.fillStyle = color;
+    ctx.globalAlpha *= 0.95;
+    ctx.beginPath();                                   // top face
+    ctx.moveTo(x, y - s); ctx.lineTo(x + c, y - s + h); ctx.lineTo(x, y); ctx.lineTo(x - c, y - s + h);
+    ctx.closePath(); ctx.fill();
+    ctx.globalAlpha *= 0.7;
+    ctx.beginPath();                                   // left face
+    ctx.moveTo(x - c, y - s + h); ctx.lineTo(x, y); ctx.lineTo(x, y + s); ctx.lineTo(x - c, y + h);
+    ctx.closePath(); ctx.fill();
+    ctx.globalAlpha *= 0.65;
+    ctx.beginPath();                                   // right face
+    ctx.moveTo(x + c, y - s + h); ctx.lineTo(x, y); ctx.lineTo(x, y + s); ctx.lineTo(x + c, y + h);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+}
+
+function _isoArrow(ctx, x, y, angle, size, color) {
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.lineTo(x - size * Math.cos(angle - 0.45), y - size * Math.sin(angle - 0.45));
+    ctx.lineTo(x - size * Math.cos(angle + 0.45), y - size * Math.sin(angle + 0.45));
+    ctx.closePath();
+    ctx.fillStyle = color;
+    ctx.fill();
+}
+
+// Activity icons under the label: network, DNS, files, registry.
+function _isoActivityIcons(ctx, x, y, act) {
+    const items = [
+        ['network', '#22c55e'], ['dns', '#a78bfa'], ['file', '#f97316'], ['registry', '#f472b6'],
+    ].filter(([k]) => act && act[k] > 0);
+    ctx.font = '8px monospace';
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    for (const [kind, color] of items) {
+        ctx.strokeStyle = color;
+        ctx.fillStyle = color;
+        ctx.lineWidth = 1.1;
+        if (kind === 'network') {                        // signal arcs
+            for (const rr of [2, 4.5]) {
+                ctx.beginPath(); ctx.arc(x + 4, y + 3, rr, Math.PI * 1.2, Math.PI * 1.8); ctx.stroke();
+            }
+            ctx.beginPath(); ctx.arc(x + 4, y + 3, 0.9, 0, Math.PI * 2); ctx.fill();
+        } else if (kind === 'dns') {                     // ring with dot
+            ctx.beginPath(); ctx.arc(x + 4, y, 3.6, 0, Math.PI * 2); ctx.stroke();
+            ctx.beginPath(); ctx.arc(x + 4, y, 1.2, 0, Math.PI * 2); ctx.fill();
+        } else if (kind === 'file') {                    // page
+            ctx.strokeRect(x + 1.5, y - 4, 5.5, 8);
+        } else {                                         // registry: stacked bars
+            for (let i = 0; i < 3; i++) ctx.fillRect(x + 1, y - 4 + i * 3, 7, 1.6);
+        }
+        ctx.fillText(String(act[kind]), x + 10, y + 0.5);
+        x += 12 + ctx.measureText(String(act[kind])).width + 6;
+    }
+}
+
+function renderIsometricGraph(ctx) {
+    const nodes = graphState.nodes.filter(n => n.type === 'process' && !n.hidden);
+    const byId = {};
+    graphState.nodes.forEach(n => { byId[n.id] = n; });
+    const zoom = graphState.camera.zoom;
+
+    // 1. Tree connectors: parent tick -> spine along V -> child ticks.
+    ctx.lineCap = 'round';
+    for (const n of nodes) {
+        const kids = (n.isoKids || []).filter(k => !k.hidden);
+        if (!kids.length) continue;
+        const u = n.isoU, uMid = u + 0.5;
+        const head = isoProject(uMid, n.isoV);
+        const tail = isoProject(uMid, kids[kids.length - 1].isoV);
+        ctx.strokeStyle = '#3b4a61';
+        ctx.lineWidth = 1.2;
+        ctx.globalAlpha = n.exited ? 0.6 : 0.95;
+        ctx.beginPath();
+        ctx.moveTo(n.x, n.y); ctx.lineTo(head.x, head.y);           // parent tick
+        ctx.lineTo(tail.x, tail.y);                                // spine
+        for (const k of kids) {
+            const a = isoProject(uMid, k.isoV);
+            ctx.moveTo(a.x, a.y); ctx.lineTo(k.x, k.y);            // child tick
+        }
+        ctx.stroke();
+
+        // Lineage (ancestors down to the focus root) in blue.
+        const lineage = kids.find(k => k.isAncestor || k.isRoot);
+        if (lineage && (n.isAncestor || n.isRoot)) {
+            const a = isoProject(uMid, lineage.isoV);
+            ctx.strokeStyle = '#3b82f6';
+            ctx.lineWidth = 1.6;
+            ctx.beginPath();
+            ctx.moveTo(n.x, n.y); ctx.lineTo(head.x, head.y);
+            ctx.lineTo(a.x, a.y); ctx.lineTo(lineage.x, lineage.y);
+            ctx.stroke();
+        }
+    }
+    ctx.globalAlpha = 1;
+
+    // 2. Cross-process edges (remote thread / injection) as raised bridges.
+    const teal = '#2dd4bf';
+    for (const e of graphState.edges) {
+        if (e.type !== 'inject') continue;
+        const s = byId[e.source], t = byId[e.target];
+        if (!s || !t || s.hidden || t.hidden || s === t) continue;
+        const L = ISO.LIFT;
+        const corner = isoProject(t.isoU, s.isoV);
+        const pts = [
+            { x: s.x, y: s.y - s.radius },
+            { x: s.x, y: s.y - L },
+            { x: corner.x, y: corner.y - L },
+            { x: t.x, y: t.y - L },
+            { x: t.x, y: t.y - t.radius - 3 },
+        ];
+        ctx.strokeStyle = teal;
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        pts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
+        ctx.stroke();
+        _isoArrow(ctx, pts[1].x, pts[1].y + 2, -Math.PI / 2, 7, teal);   // leaves the source
+        _isoArrow(ctx, pts[4].x, pts[4].y, Math.PI / 2, 8, teal);       // enters the target
+        const midY = (pts[3].y + pts[4].y) / 2;                           // marker on the drop
+        ctx.fillStyle = '#14b8a6';
+        ctx.beginPath();
+        if (ctx.roundRect) ctx.roundRect(t.x - 3.5, midY - 7, 7, 14, 3); else ctx.rect(t.x - 3.5, midY - 7, 7, 14);
+        ctx.fill();
+    }
+
+    // 3. Nodes, labels, badges.
+    for (const n of nodes) {
+        const st = _isoNodeStyle(n);
+        const hovered = graphState.hoveredNode === n;
+        const selected = graphState.selectedNode === n;
+        const r = n.radius * (hovered ? 1.08 : 1);
+        ctx.globalAlpha = n.exited && !st.big ? 0.6 : 1;
+
+        if (n.isRoot) {                                   // focus ring
+            _isoHexPath(ctx, n.x, n.y, r + 6);
+            ctx.strokeStyle = '#38bdf8';
+            ctx.lineWidth = 1.5;
+            ctx.setLineDash([3, 3]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+        }
+        if (st.big) {                                     // soft halo for notable nodes
+            _isoHexPath(ctx, n.x, n.y, r + 4);
+            ctx.fillStyle = st.stroke + '33';
+            ctx.fill();
+        }
+        _isoHexPath(ctx, n.x, n.y, r);
+        ctx.fillStyle = st.fill;
+        ctx.fill();
+        ctx.strokeStyle = selected ? '#ffffff' : st.stroke;
+        ctx.lineWidth = selected ? 2.2 : 1.2;
+        ctx.stroke();
+        _isoCube(ctx, n.x, n.y + 1, r * 0.48, st.glyph);
+
+        // Threat count (top right) and scan verdict (bottom left)
+        if (n.threats > 0) {
+            const bx = n.x + r * 0.85, by = n.y - r * 0.85;
+            ctx.beginPath(); ctx.arc(bx, by, 6.5, 0, Math.PI * 2);
+            ctx.fillStyle = '#ef4444'; ctx.fill();
+            ctx.font = 'bold 7px monospace';
+            ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+            ctx.fillText(n.threats > 99 ? '99+' : String(n.threats), bx, by + 0.5);
+        }
+        if (n.scans && n.scans.length) {
+            const vColors = { malicious: '#ef4444', detected: '#ef4444', clean: '#4ade80', analyzed: '#38bdf8', unknown: '#64748b' };
+            ctx.beginPath(); ctx.arc(n.x - r * 0.85, n.y + r * 0.85, 4.5, 0, Math.PI * 2);
+            ctx.fillStyle = vColors[n.scanVerdict] || '#64748b'; ctx.fill();
+            ctx.strokeStyle = '#0b1220'; ctx.lineWidth = 1.2; ctx.stroke();
+        }
+
+        // Label to the right, upper case; the focus root in cyan.
+        const label = (n.label || 'unknown').toUpperCase();
+        ctx.font = `${n.isRoot ? '600 ' : ''}11px -apple-system, "Segoe UI", sans-serif`;
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = selected || hovered ? '#ffffff' : n.isRoot ? '#22d3ee' : '#cbd5e1';
+        const text = label.length > 24 ? label.slice(0, 22) + '…' : label;
+        const lx = n.x + r + 7, ly = n.y - 5;
+        ctx.fillText(text, lx, ly);
+        if (zoom > 0.55) {
+            ctx.font = '9px monospace';
+            ctx.fillStyle = '#64748b';
+            ctx.fillText(`PID ${n.pid}`, lx, ly + 12);
+            _isoActivityIcons(ctx, lx + ctx.measureText(`PID ${n.pid}`).width + 8, ly + 12, n.isoAct);
+        }
+
+        // Fold toggle below-left of the node: labels run to the right and the
+        // next sibling's label sits below-right, so that corner stays free.
+        n.isoToggle = null;
+        if (n.isoHasKids) {
+            const tx = n.x - r - 3, ty = n.y + r + 3, tr = 5;
+            n.isoToggle = { x: tx, y: ty, r: tr };
+            ctx.beginPath(); ctx.arc(tx, ty, tr, 0, Math.PI * 2);
+            ctx.fillStyle = '#0f172a'; ctx.fill();
+            ctx.strokeStyle = n.isoCollapsed ? '#2dd4bf' : '#64748b'; ctx.lineWidth = 1; ctx.stroke();
+            ctx.strokeStyle = n.isoCollapsed ? '#2dd4bf' : '#94a3b8';
+            ctx.beginPath(); ctx.moveTo(tx - 2.6, ty); ctx.lineTo(tx + 2.6, ty);
+            if (n.isoCollapsed) { ctx.moveTo(tx, ty - 2.6); ctx.lineTo(tx, ty + 2.6); }
+            ctx.stroke();
+            if (n.isoCollapsed && n.isoHiddenCount) {
+                ctx.font = '8px monospace'; ctx.fillStyle = '#2dd4bf';
+                ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+                ctx.fillText(`+${n.isoHiddenCount}`, tx - tr - 3, ty);
+            }
+        }
+
+        if (n.isRoot) {
+            ctx.font = 'bold 8px monospace';
+            const tw = ctx.measureText('FOCUS').width;
+            ctx.fillStyle = '#38bdf8';
+            ctx.fillRect(n.x - tw / 2 - 4, n.y - r - 20, tw + 8, 11);
+            ctx.fillStyle = '#0b1220';
+            ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+            ctx.fillText('FOCUS', n.x, n.y - r - 14.5);
+        }
+        ctx.globalAlpha = 1;
+    }
+}
+
 function applyForceLayout(nodes, edges) {
     // Initial random placement
     nodes.forEach((n, i) => {
@@ -5342,19 +5834,47 @@ function applyForceLayout(nodes, edges) {
     for (let iter = 0; iter < 120; iter++) {
         const alpha = 0.3 * (1 - iter / 120);
 
-        // Repulsion between all nodes
-        for (let i = 0; i < nodes.length; i++) {
-            for (let j = i + 1; j < nodes.length; j++) {
-                const dx = nodes[j].x - nodes[i].x;
-                const dy = nodes[j].y - nodes[i].y;
-                const dist = Math.sqrt(dx * dx + dy * dy) || 1;
-                const force = 3000 / (dist * dist);
-                const fx = (dx / dist) * force * alpha;
-                const fy = (dy / dist) * force * alpha;
-                nodes[i].x -= fx;
-                nodes[i].y -= fy;
-                nodes[j].x += fx;
-                nodes[j].y += fy;
+        // Repulsion. All pairs is O(n^2) per iteration (~10M steps for 400
+        // nodes); on larger graphs only nodes in neighbouring grid cells
+        // repel - beyond REPULSE_RANGE the force is under 0.03 px anyway.
+        const repel = (a, b) => {
+            const dx = b.x - a.x;
+            const dy = b.y - a.y;
+            const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+            const force = 3000 / (dist * dist);
+            const fx = (dx / dist) * force * alpha;
+            const fy = (dy / dist) * force * alpha;
+            a.x -= fx;
+            a.y -= fy;
+            b.x += fx;
+            b.y += fy;
+        };
+        if (nodes.length <= 150) {
+            for (let i = 0; i < nodes.length; i++) {
+                for (let j = i + 1; j < nodes.length; j++) repel(nodes[i], nodes[j]);
+            }
+        } else {
+            const REPULSE_RANGE = 300;
+            const grid = new Map();
+            nodes.forEach((n, idx) => {
+                const key = `${Math.floor(n.x / REPULSE_RANGE)},${Math.floor(n.y / REPULSE_RANGE)}`;
+                let cell = grid.get(key);
+                if (!cell) grid.set(key, cell = []);
+                cell.push(idx);
+            });
+            for (const [key, cell] of grid) {
+                const [cx, cy] = key.split(',').map(Number);
+                for (let ox = -1; ox <= 1; ox++) {
+                    for (let oy = -1; oy <= 1; oy++) {
+                        const other = grid.get(`${cx + ox},${cy + oy}`);
+                        if (!other) continue;
+                        for (const i of cell) {
+                            for (const j of other) {
+                                if (j > i) repel(nodes[i], nodes[j]);
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -5384,22 +5904,36 @@ function initGraphCanvas() {
     const container = document.getElementById('graph-container');
     if (!canvas || !container) return;
 
+    // The canvas is initialised while its tab may still be hidden (0x0) and
+    // the container also changes size without a window resize (detail panel,
+    // tab switch), so follow the container itself.
     function resize() {
-        canvas.width = container.clientWidth;
-        canvas.height = container.clientHeight;
+        const w = container.clientWidth;
+        const h = container.clientHeight;
+        if (!w || !h || (canvas.width === w && canvas.height === h)) return;
+        canvas.width = w;
+        canvas.height = h;
         renderGraph();
     }
     resize();
-    window.addEventListener('resize', resize);
+    if (typeof ResizeObserver !== 'undefined') {
+        new ResizeObserver(resize).observe(container);
+    } else {
+        window.addEventListener('resize', resize);
+    }
 
     // Mouse interactions
     let lastMouse = { x: 0, y: 0 };
 
     canvas.addEventListener('mousedown', e => {
         const pos = screenToWorld(e.offsetX, e.offsetY);
+        if (graphState.layoutMode === 'iso' && isoHandleToggleClick(pos)) {
+            lastMouse = { x: e.offsetX, y: e.offsetY };
+            return;
+        }
         const node = findNodeAt(pos.x, pos.y);
         if (node) {
-            graphState.dragging = node;
+            if (graphState.layoutMode !== 'iso') graphState.dragging = node;
             graphState.selectedNode = node;
             showGraphDetail(node);
         } else {
@@ -5484,6 +6018,7 @@ function worldToScreen(wx, wy) {
 function findNodeAt(wx, wy) {
     for (let i = graphState.nodes.length - 1; i >= 0; i--) {
         const n = graphState.nodes[i];
+        if (n.hidden) continue;
         const dx = wx - n.x;
         const dy = wy - n.y;
         if (dx * dx + dy * dy < n.radius * n.radius) return n;
@@ -5499,6 +6034,7 @@ function graphFitView() {
 
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
     nodes.forEach(n => {
+        if (n.hidden) return;
         minX = Math.min(minX, n.x - n.radius);
         maxX = Math.max(maxX, n.x + n.radius);
         minY = Math.min(minY, n.y - n.radius);
@@ -5506,6 +6042,7 @@ function graphFitView() {
     });
 
     const padding = 60;
+    if (graphState.layoutMode === 'iso') maxX += 130;   // labels sit right of the node
     const w = maxX - minX + padding * 2;
     const h = maxY - minY + padding * 2;
     const zoom = Math.min(canvas.width / w, canvas.height / h, 2);
@@ -5576,6 +6113,12 @@ function renderGraph() {
     ctx.save();
     ctx.translate(camera.x, camera.y);
     ctx.scale(camera.zoom, camera.zoom);
+
+    if (graphState.layoutMode === 'iso') {
+        renderIsometricGraph(ctx);
+        ctx.restore();
+        return;
+    }
 
     const nodeColors = {
         process: '#3b82f6',
@@ -5801,16 +6344,16 @@ function showGraphTooltip(node, sx, sy) {
 
     let html = `<div class="tt-title">${escapeHtml(node.label)}</div>`;
     if (node.type === 'process') {
-        html += `<div class="tt-field"><span>PID:</span> ${node.pid}</div>`;
+        html += `<div class="tt-field"><span>PID:</span> ${escapeHtml(String(node.pid))}</div>`;
         if (node.image) html += `<div class="tt-field"><span>Image:</span> ${escapeHtml(node.image)}</div>`;
-        if (node.threats) html += `<div class="tt-field"><span>Threats:</span> ${node.threats}</div>`;
+        if (node.threats) html += `<div class="tt-field"><span>Threats:</span> ${escapeHtml(String(node.threats))}</div>`;
         if (node.scans && node.scans.length) {
             const vm = _VERDICT_META[node.scanVerdict] || _VERDICT_META.unknown;
             html += `<div class="tt-field"><span>Scan:</span> ${escapeHtml(vm.text)} (${node.scans.length})</div>`;
         }
     } else if (node.type === 'network') {
-        html += `<div class="tt-field"><span>IP:</span> ${node.ip}:${node.port}</div>`;
-        html += `<div class="tt-field"><span>Protocol:</span> ${node.protocol || 'tcp'}</div>`;
+        html += `<div class="tt-field"><span>IP:</span> ${escapeHtml(node.ip)}:${escapeHtml(String(node.port ?? ''))}</div>`;
+        html += `<div class="tt-field"><span>Protocol:</span> ${escapeHtml(node.protocol || 'tcp')}</div>`;
     } else if (node.type === 'dns') {
         html += `<div class="tt-field"><span>Query:</span> ${escapeHtml(node.label)}</div>`;
         if (node.result) html += `<div class="tt-field"><span>Result:</span> ${escapeHtml(node.result)}</div>`;
@@ -5851,6 +6394,83 @@ async function graphCheckSignature(path) {
     }
 }
 
+async function loadGraphSysmonSections(node) {
+    const pidStr = String(node.pid);
+    const keyStr = String(node.key);
+    // Only this instance's lifetime: before it started, and after another
+    // process took over the PID, the events belong to other processes.
+    const since = {};
+    const start = node.started || (node.supersededAt ? node.firstSeen : '');
+    if (start) since.since = start;
+    if (node.supersededAt) since.until = node.supersededAt;
+    const get = (params) => fetch(`/api/sysmon?${new URLSearchParams(params)}`)
+        .then(r => (r.ok ? r.json() : []))
+        .then(d => (Array.isArray(d) ? d.filter(e => e && !e.error) : []))
+        .catch(() => []);
+    const [own, children] = await Promise.all([
+        get({ pid: pidStr, max: 500, ...since }),
+        get({ parent_pid: pidStr, event_id: '1', max: 200, ...since }),
+    ]);
+    const target = document.getElementById('gd-sysmon-sections');
+    // The user may have selected another node while this was loading.
+    if (!target || target.dataset.pid !== keyStr) return;
+    target.innerHTML = renderGraphSysmonSections(pidStr, own, children);
+}
+
+function renderGraphSysmonSections(pidStr, pidSysmonEvents, childEvents) {
+    let html = '';
+    if (pidSysmonEvents.length) {
+        const eidCounts = {};
+        pidSysmonEvents.forEach(ev => {
+            const eid = ev.event_id;
+            if (!eidCounts[eid]) eidCounts[eid] = { count: 0, type: ev.type || `Event_${eid}` };
+            eidCounts[eid].count++;
+        });
+
+        html += `<div class="gd-section">Triggered Sysmon Events <span class="gd-count">${pidSysmonEvents.length}</span></div>`;
+        html += `<div class="gd-eid-grid">`;
+        for (const [eid, info] of Object.entries(eidCounts).sort((a, b) => b[1].count - a[1].count)) {
+            const typeClass = getSysmonTypeClass(eid);
+            html += `<div class="gd-eid-item"><span class="type-badge ${typeClass}">EID ${escapeHtml(String(eid))}</span><span class="gd-eid-name">${escapeHtml(info.type)}</span><span class="gd-eid-count">${info.count}x</span></div>`;
+        }
+        html += `</div>`;
+
+        const allWinEids = new Map();
+        for (const eid of Object.keys(eidCounts)) {
+            getCorrelatedWindowsEvents(parseInt(eid)).forEach(c => {
+                if (!allWinEids.has(c.id)) allWinEids.set(c.id, c);
+            });
+        }
+        if (allWinEids.size) {
+            html += `<div class="gd-section">Correlated Windows Event IDs <span class="gd-count">${allWinEids.size}</span></div>`;
+            html += `<div class="gd-eid-grid">`;
+            for (const [weid, info] of allWinEids) {
+                html += `<div class="gd-eid-item"><span class="corr-badge">${escapeHtml(String(weid))}</span><span class="gd-eid-name">${escapeHtml(info.name)}</span><span class="gd-eid-log">[${escapeHtml(info.log)}]</span></div>`;
+            }
+            html += `</div>`;
+        }
+    }
+
+    // PowerShell started by this process, or this process itself if it is PowerShell
+    const psEvents = pidSysmonEvents.concat(childEvents).filter(ev => {
+        if (Number(ev.event_id) !== 1) return false;
+        const img = (ev.image || '').toLowerCase();
+        const cmd = (ev.commandline || '').toLowerCase();
+        return (img.includes('powershell') || img.includes('pwsh') || cmd.includes('powershell')) &&
+               (String(ev.pid) === pidStr || String(ev.parent_pid) === pidStr);
+    });
+    if (psEvents.length) {
+        html += `<div class="gd-section">PowerShell Commands <span class="gd-count">${psEvents.length}</span></div>`;
+        html += `<div class="gd-ps-list">`;
+        psEvents.forEach(ev => {
+            const time = ev.timestamp ? formatSysmonTime(ev.timestamp) : '';
+            html += `<div class="gd-ps-item"><span class="gd-ps-time">${escapeHtml(time)}</span><span class="gd-ps-cmd">${escapeHtml(ev.commandline || '')}</span></div>`;
+        });
+        html += `</div>`;
+    }
+    return html;
+}
+
 function showGraphDetail(node) {
     const panel = document.getElementById('graph-detail-panel');
     const header = document.getElementById('graph-detail-header');
@@ -5864,7 +6484,7 @@ function showGraphDetail(node) {
     if (node.type === 'process') {
         headerText = `${node.label} (PID ${node.pid})`;
         if (!node.isRoot) {
-            html += `<div class="gd-actions"><button class="gd-focus-btn" data-focus-pid="${escapeHtml(String(node.pid))}">&#9673; Focus this process</button></div>`;
+            html += `<div class="gd-actions"><button class="gd-focus-btn" data-focus-pid="${escapeHtml(String(node.key))}">&#9673; Focus this process</button></div>`;
         } else {
             html += `<div class="gd-actions"><span class="gd-focus-current">&#9673; Current focus root</span></div>`;
         }
@@ -5872,13 +6492,13 @@ function showGraphDetail(node) {
         if (node.cmdline) html += `<div class="gd-field"><span class="gd-label">Cmdline</span><span class="gd-value gd-cmdline">${escapeHtml(node.cmdline)}</span></div>`;
         if (node.user) html += `<div class="gd-field"><span class="gd-label">User</span><span class="gd-value">${escapeHtml(node.user)}</span></div>`;
         html += `<div class="gd-field"><span class="gd-label">Status</span><span class="gd-value">${node.exited ? '<span style="color:#94a3b8">Exited</span>' : '<span style="color:#4ade80">Running</span>'}</span></div>`;
-        html += `<div class="gd-field"><span class="gd-label">First seen</span><span class="gd-value">${node.firstSeen || '--'}</span></div>`;
+        html += `<div class="gd-field"><span class="gd-label">First seen</span><span class="gd-value">${escapeHtml(node.firstSeen || '--')}</span></div>`;
         if (node.parentPid) {
-            const parentNode = graphState.nodes.find(n => n.type === 'process' && String(n.pid) === String(node.parentPid));
+            const parentNode = graphState.nodes.find(n => n.type === 'process' && String(n.key) === String(node.parentPid));
             if (parentNode) {
-                html += `<div class="gd-field"><span class="gd-label">Parent</span><span class="gd-value"><a class="gd-link" data-node-id="${parentNode.id}">${escapeHtml(parentNode.label)} (${parentNode.pid})</a></span></div>`;
+                html += `<div class="gd-field"><span class="gd-label">Parent</span><span class="gd-value"><a class="gd-link" data-node-id="${escapeHtml(parentNode.id)}">${escapeHtml(parentNode.label)} (${escapeHtml(parentNode.pid)})</a></span></div>`;
             } else {
-                html += `<div class="gd-field"><span class="gd-label">Parent PID</span><span class="gd-value">${node.parentPid}</span></div>`;
+                html += `<div class="gd-field"><span class="gd-label">Parent PID</span><span class="gd-value">${escapeHtml(String(node.parentOsPid ?? node.parentPid))}</span></div>`;
             }
         }
 
@@ -5923,7 +6543,7 @@ function showGraphDetail(node) {
             html += `<div class="gd-conn-list">`;
             netConns.forEach(e => {
                 const target = graphState.nodes.find(n => n.id === e.target);
-                if (target) html += `<div class="gd-conn-item"><span class="gd-conn-icon net"></span><span class="gd-conn-text">${escapeHtml(target.ip || target.label)}:${target.port || ''}</span><span class="gd-conn-proto">${target.protocol || 'tcp'}</span></div>`;
+                if (target) html += `<div class="gd-conn-item"><span class="gd-conn-icon net"></span><span class="gd-conn-text">${escapeHtml(target.ip || target.label)}:${escapeHtml(String(target.port || ''))}</span><span class="gd-conn-proto">${escapeHtml(target.protocol || 'tcp')}</span></div>`;
             });
             html += `</div>`;
         }
@@ -5938,73 +6558,22 @@ function showGraphDetail(node) {
             html += `</div>`;
         }
 
-        // Sysmon Event IDs triggered by this process + correlated Windows Event IDs
-        const pidSysmonEvents = (graphState._allSysmonEvents || []).filter(ev => String(ev.pid) === String(node.pid));
-        if (pidSysmonEvents.length) {
-            // Collect unique Sysmon Event IDs with counts
-            const eidCounts = {};
-            pidSysmonEvents.forEach(ev => {
-                const eid = ev.event_id;
-                if (!eidCounts[eid]) eidCounts[eid] = { count: 0, type: ev.type || `Event_${eid}` };
-                eidCounts[eid].count++;
-            });
-
-            html += `<div class="gd-section">Triggered Sysmon Events <span class="gd-count">${pidSysmonEvents.length}</span></div>`;
-            html += `<div class="gd-eid-grid">`;
-            for (const [eid, info] of Object.entries(eidCounts).sort((a,b) => b[1].count - a[1].count)) {
-                const typeClass = getSysmonTypeClass(eid);
-                html += `<div class="gd-eid-item"><span class="type-badge ${typeClass}">EID ${eid}</span><span class="gd-eid-name">${escapeHtml(info.type)}</span><span class="gd-eid-count">${info.count}x</span></div>`;
-            }
-            html += `</div>`;
-
-            // Correlated Windows Event IDs
-            const allWinEids = new Map();
-            for (const eid of Object.keys(eidCounts)) {
-                const corr = getCorrelatedWindowsEvents(parseInt(eid));
-                corr.forEach(c => {
-                    if (!allWinEids.has(c.id)) allWinEids.set(c.id, c);
-                });
-            }
-            if (allWinEids.size) {
-                html += `<div class="gd-section">Correlated Windows Event IDs <span class="gd-count">${allWinEids.size}</span></div>`;
-                html += `<div class="gd-eid-grid">`;
-                for (const [weid, info] of allWinEids) {
-                    html += `<div class="gd-eid-item"><span class="corr-badge">${weid}</span><span class="gd-eid-name">${escapeHtml(info.name)}</span><span class="gd-eid-log">[${escapeHtml(info.log)}]</span></div>`;
-                }
-                html += `</div>`;
-            }
-        }
-
-        // PowerShell commands associated with this process (or child powershell processes)
-        const psPid = String(node.pid);
-        const psEvents = (graphState._allSysmonEvents || []).filter(ev => {
-            if (ev.event_id !== 1) return false;
-            const img = (ev.image || '').toLowerCase();
-            const cmd = (ev.commandline || '').toLowerCase();
-            return (img.includes('powershell') || cmd.includes('powershell')) &&
-                   (String(ev.pid) === psPid || String(ev.parent_pid) === psPid);
-        });
-        if (psEvents.length) {
-            html += `<div class="gd-section">PowerShell Commands <span class="gd-count">${psEvents.length}</span></div>`;
-            html += `<div class="gd-ps-list">`;
-            psEvents.forEach(ev => {
-                const time = ev.timestamp ? formatSysmonTime(ev.timestamp) : '';
-                html += `<div class="gd-ps-item"><span class="gd-ps-time">${time}</span><span class="gd-ps-cmd">${escapeHtml(ev.commandline || '')}</span></div>`;
-            });
-            html += `</div>`;
-        }
+        // Sysmon events of this process and PowerShell children. They were
+        // read from graphState._allSysmonEvents, which nothing ever filled, so
+        // these sections never appeared; they are now loaded per process.
+        html += `<div id="gd-sysmon-sections" data-pid="${escapeHtml(String(node.key))}"><div class="gd-section">Triggered Sysmon Events <span class="gd-count">…</span></div></div>`;
 
     } else if (node.type === 'network') {
         headerText = `Network: ${node.ip}:${node.port}`;
-        html += `<div class="gd-field"><span class="gd-label">IP</span><span class="gd-value">${node.ip}</span></div>`;
-        html += `<div class="gd-field"><span class="gd-label">Port</span><span class="gd-value">${node.port}</span></div>`;
-        html += `<div class="gd-field"><span class="gd-label">Protocol</span><span class="gd-value">${node.protocol || 'tcp'}</span></div>`;
+        html += `<div class="gd-field"><span class="gd-label">IP</span><span class="gd-value">${escapeHtml(node.ip)}</span></div>`;
+        html += `<div class="gd-field"><span class="gd-label">Port</span><span class="gd-value">${escapeHtml(String(node.port ?? ''))}</span></div>`;
+        html += `<div class="gd-field"><span class="gd-label">Protocol</span><span class="gd-value">${escapeHtml(node.protocol || 'tcp')}</span></div>`;
         const conns = graphState.edges.filter(e => e.target === node.id);
         if (conns.length) {
             html += `<div class="gd-section">Connected from <span class="gd-count">${conns.length}</span></div>`;
             conns.forEach(e => {
                 const src = graphState.nodes.find(n => n.id === e.source);
-                if (src) html += `<div class="gd-conn-item"><span class="gd-conn-icon proc"></span><a class="gd-link" data-node-id="${src.id}">${escapeHtml(src.label)} (${src.pid})</a></div>`;
+                if (src) html += `<div class="gd-conn-item"><span class="gd-conn-icon proc"></span><a class="gd-link" data-node-id="${escapeHtml(src.id)}">${escapeHtml(src.label)} (${escapeHtml(String(src.pid ?? ''))})</a></div>`;
             });
         }
     } else if (node.type === 'dns') {
@@ -6016,7 +6585,7 @@ function showGraphDetail(node) {
             html += `<div class="gd-section">Queried by <span class="gd-count">${conns.length}</span></div>`;
             conns.forEach(e => {
                 const src = graphState.nodes.find(n => n.id === e.source);
-                if (src) html += `<div class="gd-conn-item"><span class="gd-conn-icon proc"></span><a class="gd-link" data-node-id="${src.id}">${escapeHtml(src.label)} (${src.pid})</a></div>`;
+                if (src) html += `<div class="gd-conn-item"><span class="gd-conn-icon proc"></span><a class="gd-link" data-node-id="${escapeHtml(src.id)}">${escapeHtml(src.label)} (${escapeHtml(String(src.pid ?? ''))})</a></div>`;
             });
         }
     } else {
@@ -6026,6 +6595,7 @@ function showGraphDetail(node) {
 
     header.textContent = headerText;
     body.innerHTML = html;
+    if (node.type === 'process' && node.pid != null) loadGraphSysmonSections(node);
 
     // Re-root the drilldown on the selected process
     const focusBtn = body.querySelector('.gd-focus-btn[data-focus-pid]');
@@ -6093,9 +6663,9 @@ function buildChildrenTree(parentNodeId, depth) {
         html += `<div class="gd-child-header">`;
         html += `<span class="gd-child-expand">${hasChildren ? '&#9654;' : '&#8226;'}</span>`;
         html += `<span class="gd-child-name">${escapeHtml(child.label)}</span>`;
-        html += `<span class="gd-child-pid">PID ${child.pid}</span>`;
+        html += `<span class="gd-child-pid">PID ${escapeHtml(String(child.pid))}</span>`;
         if (threats > 0) html += `<span class="gd-child-threats">${threats}</span>`;
-        html += `<span class="gd-child-focus" data-node-id="${child.id}" title="Focus this node">&#8599;</span>`;
+        html += `<span class="gd-child-focus" data-node-id="${escapeHtml(child.id)}" title="Focus this node">&#8599;</span>`;
         html += `</div>`;
 
         // Collapsible detail body
@@ -6103,7 +6673,7 @@ function buildChildrenTree(parentNodeId, depth) {
         if (child.image) html += `<div class="gd-child-detail"><span class="gd-child-dlabel">Image:</span> ${escapeHtml(child.image)}</div>`;
         if (child.cmdline) html += `<div class="gd-child-detail gd-cmdline"><span class="gd-child-dlabel">Cmd:</span> ${escapeHtml(child.cmdline)}</div>`;
         html += `<div class="gd-child-detail"><span class="gd-child-dlabel">Status:</span> ${child.exited ? 'Exited' : 'Running'}</div>`;
-        if (child.firstSeen) html += `<div class="gd-child-detail"><span class="gd-child-dlabel">First seen:</span> ${child.firstSeen}</div>`;
+        if (child.firstSeen) html += `<div class="gd-child-detail"><span class="gd-child-dlabel">First seen:</span> ${escapeHtml(child.firstSeen)}</div>`;
 
         // Activity mini-summary
         const actTotal = (act.network||0) + (act.dns||0) + (act.file||0) + (act.registry||0);
@@ -6278,7 +6848,7 @@ function renderSysmonStats() {
     stats.sort((a, b) => b.count - a.count);
     stats.forEach(s => {
         const typeClass = getSysmonTypeClass(s.event_id);
-        html += `<span class="stats-chip ${typeClass}" onclick="filterSysmonByType('${s.event_id}')">${s.name} <strong>${s.count}</strong></span>`;
+        html += `<span class="stats-chip ${typeClass}" onclick="filterSysmonByType(${jsArg(s.event_id)})">${escapeHtml(s.name)} <strong>${s.count}</strong></span>`;
     });
     html += `</div>`;
     container.innerHTML = html;
@@ -6360,10 +6930,13 @@ function renderSysmonTable() {
         const corrHtml = correlated.length > 0
             ? correlated.map(c => `<span class="corr-badge" title="${escapeHtml(c.name)}">${c.id}</span>`).join('')
             : '';
-        html += `<tr onclick="showSysmonDetail(${JSON.stringify(ev).replace(/"/g, '&quot;')})">
+        // Look the event up by position: embedding the event as JSON in the
+        // attribute duplicated every row's data and let an event field that
+        // contains the text &quot; break out of the handler.
+        html += `<tr onclick="showSysmonDetailAt(${sysmonEvents.indexOf(ev)})">
             <td class="col-time">${time}</td>
             <td><span class="type-badge ${typeClass}">${escapeHtml(ev.type || '')}</span></td>
-            <td class="col-pid">${ev.pid || ''}</td>
+            <td class="col-pid">${escapeHtml(String(ev.pid || ''))}</td>
             <td class="col-image">${escapeHtml(image)}</td>
             <td class="col-details">${escapeHtml(details)}</td>
             <td class="col-corr">${corrHtml}</td>
@@ -6399,12 +6972,17 @@ function truncate(str, max) {
     return str && str.length > max ? str.substring(0, max) + '...' : (str || '');
 }
 
+function showSysmonDetailAt(idx) {
+    const ev = sysmonEvents[idx];
+    if (ev) showSysmonDetail(ev);
+}
+
 function showSysmonDetail(ev) {
-    let html = `<div class="detail-section"><div class="detail-section-title">${escapeHtml(ev.type || 'Event')} - PID ${ev.pid || '?'}</div>
+    let html = `<div class="detail-section"><div class="detail-section-title">${escapeHtml(ev.type || 'Event')} - PID ${escapeHtml(String(ev.pid || '?'))}</div>
         <div class="detail-fields">
             <div class="detail-field"><span class="field-label">Timestamp</span><span class="field-value">${escapeHtml(ev.timestamp || '')}</span></div>
             <div class="detail-field"><span class="field-label">Event ID</span><span class="field-value">${ev.event_id}</span></div>
-            <div class="detail-field"><span class="field-label">PID</span><span class="field-value">${ev.pid || ''}</span></div>
+            <div class="detail-field"><span class="field-label">PID</span><span class="field-value">${escapeHtml(String(ev.pid || ''))}</span></div>
             <div class="detail-field"><span class="field-label">Image</span><span class="field-value">${escapeHtml(ev.image || '')}</span></div>
         </div></div>`;
 
@@ -6615,7 +7193,7 @@ function renderLitterboxFiles() {
 
     let html = `<table class="sysmon-events-table"><thead><tr><th>File</th><th>Type</th><th>Size</th><th>Risk</th><th>Entropy</th><th>Static</th><th>Dynamic</th><th>EDR</th><th>Actions</th></tr></thead><tbody>`;
     entries.forEach(e => {
-        const riskClass = (e.detection_risk || '').toLowerCase();
+        const riskClass = cssToken(e.detection_risk);
         const riskBadge = `<span class="lb-risk-badge lb-risk-${riskClass}">${escapeHtml(e.detection_risk || '?')}</span>`;
         const size = e.file_size ? formatSize(e.file_size) : '--';
         const entropy = e.entropy_value != null ? e.entropy_value.toFixed(2) : '--';
@@ -6626,7 +7204,7 @@ function renderLitterboxFiles() {
 
         html += `<tr>
             <td class="col-image" title="${escapeHtml(e.sha256 || '')}">${escapeHtml(e.filename || e._key)}</td>
-            <td><span class="lb-type-badge">${e._type}</span></td>
+            <td><span class="lb-type-badge">${escapeHtml(e._type)}</span></td>
             <td>${size}</td>
             <td>${riskBadge}</td>
             <td class="mono">${entropy}</td>
@@ -6634,9 +7212,9 @@ function renderLitterboxFiles() {
             <td class="center">${dynamicBadge}</td>
             <td class="center">${edrBadge}</td>
             <td class="lb-actions">
-                <button class="btn btn-xs" onclick="lbRunAnalysis('static','${md5}')" title="Run static analysis">Static</button>
-                <button class="btn btn-xs" onclick="lbRunAnalysis('dynamic','${md5}')" title="Run dynamic analysis">Dynamic</button>
-                <button class="btn btn-xs btn-outline" onclick="lbShowDetail('${md5}')" title="View results">Detail</button>
+                <button class="btn btn-xs" onclick="lbRunAnalysis('static',${jsArg(md5)})" title="Run static analysis">Static</button>
+                <button class="btn btn-xs" onclick="lbRunAnalysis('dynamic',${jsArg(md5)})" title="Run dynamic analysis">Dynamic</button>
+                <button class="btn btn-xs btn-outline" onclick="lbShowDetail(${jsArg(md5)})" title="View results">Detail</button>
             </td>
         </tr>`;
     });
@@ -6697,16 +7275,16 @@ async function lbShowDetail(md5) {
 
     try {
         const [riskResp, edrResp] = await Promise.all([
-            fetch(`/api/litterbox/api/results/risk/${md5}`),
-            fetch(`/api/litterbox/api/results/edr/${md5}`),
+            fetch(`/api/litterbox/api/results/risk/${encodeURIComponent(md5)}`),
+            fetch(`/api/litterbox/api/results/edr/${encodeURIComponent(md5)}`),
         ]);
 
-        let html = `<div class="lb-detail-header"><span>Results for ${md5}</span><button class="btn btn-xs" onclick="document.getElementById('lb-detail-panel').style.display='none'">Close</button></div>`;
+        let html = `<div class="lb-detail-header"><span>Results for ${escapeHtml(md5)}</span><button class="btn btn-xs" onclick="document.getElementById('lb-detail-panel').style.display='none'">Close</button></div>`;
 
         if (riskResp.ok) {
             const risk = await riskResp.json();
             html += `<div class="lb-detail-section"><div class="lb-detail-title">Risk Assessment</div>`;
-            html += `<div class="lb-detail-field"><span class="lb-dl">Score</span><span class="lb-dv lb-risk-badge lb-risk-${(risk.risk_level||'').toLowerCase()}">${risk.risk_score ?? '?'} / 10 (${risk.risk_level || '?'})</span></div>`;
+            html += `<div class="lb-detail-field"><span class="lb-dl">Score</span><span class="lb-dv lb-risk-badge lb-risk-${cssToken(risk.risk_level)}">${escapeHtml(String(risk.risk_score ?? '?'))} / 10 (${escapeHtml(risk.risk_level || '?')})</span></div>`;
             if (risk.risk_factors?.length) {
                 html += `<div class="lb-detail-field"><span class="lb-dl">Factors</span><ul class="lb-factors">`;
                 risk.risk_factors.forEach(f => { html += `<li>${escapeHtml(f)}</li>`; });
@@ -6725,7 +7303,7 @@ async function lbShowDetail(md5) {
         }
 
         // Link to full LitterBox UI
-        html += `<div class="lb-detail-section"><a href="http://192.168.64.4:1337/results/static/${md5}" target="_blank" class="btn btn-sm btn-outline">Open in LitterBox UI</a></div>`;
+        html += `<div class="lb-detail-section"><a href="http://192.168.64.4:1337/results/static/${encodeURIComponent(md5)}" target="_blank" class="btn btn-sm btn-outline">Open in LitterBox UI</a></div>`;
 
         panel.innerHTML = html;
     } catch (e) {
@@ -6734,8 +7312,17 @@ async function lbShowDetail(md5) {
 }
 
 // Init LitterBox on tab switch
+let _lbInitialized = false;
+
 function initLitterbox() {
-    if (_lbData) return;
+    // _lbData is only set after a successful fetch, so it could not stop
+    // repeated initialisation: every visit while LitterBox was offline added
+    // another set of drop listeners and one drop uploaded the sample N times.
+    if (_lbInitialized) {
+        if (!_lbData) refreshLitterbox();
+        return;
+    }
+    _lbInitialized = true;
     refreshLitterbox();
 
     // Setup drag-and-drop
@@ -6779,6 +7366,9 @@ async function initEtwBrowser() {
         refreshEtw();
         setupEtwAutoRefresh();
     } catch (e) {
+        // Allow a retry on the next visit; the flag was set before the fetch,
+        // so one failed load disabled the tab for the rest of the session.
+        _etwInitialized = false;
         document.getElementById('etw-event-list').innerHTML =
             `<div class="etw-error">Failed to load ETW channels: ${escapeHtml(e.message)}</div>`;
     }
@@ -6804,32 +7394,45 @@ function updateEtwChannelInfo() {
 function setupEtwAutoRefresh() {
     const cb = document.getElementById('etw-auto-refresh');
     if (!cb) return;
-    cb.addEventListener('change', () => {
+    // One interval at most, and only while the box is checked (browsers can
+    // restore an unchecked state after reload while the old code still
+    // started the timer unconditionally).
+    const sync = () => {
+        clearInterval(_etwAutoInterval);
+        _etwAutoInterval = null;
         if (cb.checked) {
             _etwAutoInterval = setInterval(() => {
-                if (state.activeTab === 'etw') refreshEtw();
+                if (state.activeTab === 'etw' && !document.hidden) refreshEtw();
             }, 5000);
-        } else {
-            clearInterval(_etwAutoInterval);
-            _etwAutoInterval = null;
         }
-    });
-    _etwAutoInterval = setInterval(() => {
-        if (state.activeTab === 'etw') refreshEtw();
-    }, 5000);
+    };
+    cb.addEventListener('change', sync);
+    sync();
+}
+
+let _etwRequestSeq = 0;
+const _etwExpanded = new Set();   // keys of rows the user expanded
+
+function etwToggleRow(el, key) {
+    el.classList.toggle('expanded');
+    if (el.classList.contains('expanded')) _etwExpanded.add(key); else _etwExpanded.delete(key);
+    if (_etwExpanded.size > 500) _etwExpanded.clear();
 }
 
 async function refreshEtw() {
-    const channel = document.getElementById('etw-channel-select')?.value || 'etw-ti';
+    const channel = document.getElementById('etw-channel-select')?.value || 'security';
     const filter = document.getElementById('etw-filter-input')?.value || '';
     const max = document.getElementById('etw-max-select')?.value || '50';
     const listEl = document.getElementById('etw-event-list');
     if (!listEl) return;
 
+    // A slow answer for a previous channel must not overwrite a newer one.
+    const seq = ++_etwRequestSeq;
     try {
         const params = new URLSearchParams({channel, max, filter});
         const resp = await fetch(`/api/etw/events?${params}`);
         const data = await resp.json();
+        if (seq !== _etwRequestSeq) return;
 
         if (data.error) {
             listEl.innerHTML = `<div class="etw-error">${escapeHtml(data.error)}</div>`;
@@ -6848,7 +7451,11 @@ async function refreshEtw() {
             const hasData = ev.data && Object.keys(ev.data).length > 0;
             const mal = classifyEtwThreat(ev);
             if (mal) malCount++;
-            html += `<div class="etw-event ${levelClass}${mal ? ' malicious' : ''}" onclick="this.classList.toggle('expanded')">`;
+            // Expanded rows stay expanded across the 5 s refresh.
+            const rowKey = `${channel}|${ev.timestamp}|${ev.event_id}`;
+            const expanded = _etwExpanded.has(rowKey) ? ' expanded' : '';
+            html += `<div class="etw-event ${levelClass}${mal ? ' malicious' : ''}${expanded}" `
+                + `onclick="etwToggleRow(this, ${jsArg(rowKey)})">`;
             html += `<div class="etw-event-header">`;
             html += `<span class="etw-event-time">${formatEtwTime(ev.timestamp)}</span>`;
             html += `<span class="etw-event-id">ID:${ev.event_id}</span>`;
@@ -7020,8 +7627,36 @@ function renderFlagEvidence(flag) {
 }
 
 function escapeHtml(str) {
-    if (!str) return '';
-    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    if (str === null || str === undefined || str === '') return '';
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// A value as a JavaScript string literal that is safe inside an HTML
+// attribute such as onclick="fn(${jsArg(x)})". File names, paths and command
+// lines come from samples; quoting them by hand ('${...}') let a crafted name
+// like a');alert(1);//.exe break out of the handler.
+function jsArg(value) {
+    return escapeHtml(JSON.stringify(value === null || value === undefined ? '' : String(value)));
+}
+
+// An integer (PID, offset) for an inline handler: onclick="fn(${jsInt(pid)})".
+// Unquoted ${proc.pid} would execute whatever a non-numeric value contains.
+function jsInt(value) {
+    const n = parseInt(value, 10);
+    return Number.isFinite(n) ? String(n) : 'null';
+}
+
+// A value used as part of a CSS class name (severity, status from events).
+// Anything but [a-z0-9_-] is dropped so it cannot leave the class attribute.
+// Processes are keyed per instance: "<pid>" is the newest process with that
+// PID, "<pid>@<start epoch>" an older one (Windows reuses PIDs).
+function procKey(proc) {
+    return String(proc.key ?? proc.pid);
+}
+
+function cssToken(value) {
+    return String(value === null || value === undefined ? '' : value).toLowerCase().replace(/[^a-z0-9_-]/g, '');
 }
 
 function formatTime(ts) {
@@ -7174,19 +7809,38 @@ const FileMapView = (() => {
         return '0x' + (n >>> 0).toString(16).padStart(8, '0').toUpperCase();
     }
 
-    async function load(path, opts = {}) {
+    const CACHE_LIMIT = 8;
+
+    function load(path, opts = {}) {
         const key = `${path}|${opts.cols || 256}|${opts.rows || 512}`;
-        if (cache.has(key) && !opts.force) return cache.get(key);
-        const params = new URLSearchParams({ path });
-        if (opts.cols) params.set('cols', opts.cols);
-        if (opts.rows) params.set('rows', opts.rows);
-        const resp = await fetch(`/api/file/visualize?${params}`);
-        const data = await resp.json();
-        if (data.error) throw new Error(data.error);
-        data.bytePlane = b64ToBytes(data.byteplot);
-        data.entropyPlane = b64ToBytes(data.entropy);
-        cache.set(key, data);
-        return data;
+        // The promise is cached, not the result, so concurrent callers (the
+        // inline map and its import tree) share one request.
+        if (cache.has(key) && !opts.force) {
+            const hit = cache.get(key);
+            cache.delete(key);
+            cache.set(key, hit);          // mark as most recently used
+            return hit;
+        }
+        const pending = (async () => {
+            const params = new URLSearchParams({ path });
+            if (opts.cols) params.set('cols', opts.cols);
+            if (opts.rows) params.set('rows', opts.rows);
+            const resp = await fetch(`/api/file/visualize?${params}`);
+            const data = await resp.json();
+            if (data.error) throw new Error(data.error);
+            data.bytePlane = b64ToBytes(data.byteplot);
+            data.entropyPlane = b64ToBytes(data.entropy);
+            // The decoded planes are all that is used; keeping the base64
+            // strings as well doubled the memory per cached file.
+            delete data.byteplot;
+            delete data.entropy;
+            return data;
+        })();
+        cache.set(key, pending);
+        // Failed loads are not cached, so a retry can succeed.
+        pending.catch(() => { if (cache.get(key) === pending) cache.delete(key); });
+        while (cache.size > CACHE_LIMIT) cache.delete(cache.keys().next().value);
+        return pending;
     }
 
     // --- Plane painters -------------------------------------------------
@@ -7413,7 +8067,7 @@ const FileMapView = (() => {
             items.forEach(it => {
                 // Structure entries carry an offset and double as jump targets.
                 const jump = it.offset != null
-                    ? ` class="fmap-legend-item fmap-legend-jump" title="jump to ${hexOff(it.offset)}" onclick="FileMapView.jumpToHex('${escapeHtml(vis.path.replace(/\\/g, '\\\\'))}', ${it.offset})"`
+                    ? ` class="fmap-legend-item fmap-legend-jump" title="jump to ${hexOff(it.offset)}" onclick="FileMapView.jumpToHex(${jsArg(vis.path)}, ${jsInt(it.offset)})"`
                     : ' class="fmap-legend-item"';
                 html += `<div${jump}><span class="fmap-legend-swatch" style="background:${it.color}"></span>${escapeHtml(it.label)}</div>`;
             });
@@ -7806,7 +8460,7 @@ async function hexRenderMinimap() {
         const info = document.getElementById('hex-minimap-info');
         if (info) {
             info.innerHTML = `${escapeHtml(vis.format)} &middot; ${(vis.regions || []).length} regions`
-                + `<button class="btn btn-sm" onclick="fileMapRender('${escapeHtml(state.hexFilePath.replace(/\\/g, '\\\\'))}');switchTab('filemap');">Full map</button>`;
+                + `<button class="btn btn-sm" onclick="fileMapRender(${jsArg(state.hexFilePath)});switchTab('filemap');">Full map</button>`;
         }
     } catch (e) {
         container.classList.remove('visible');
@@ -7823,23 +8477,27 @@ function hexUpdateMinimapViewport() {
 // --- Inline map for the PE/ELF analysis panels -----------------------
 
 // Markup placeholder; the canvases need the nodes to exist in the DOM first.
-function fileMapInlineBlock(path) {
-    const safe = escapeHtml((path || '').replace(/\\/g, '\\\\'));
+// `scope` keeps the ids unique per panel: the PE and ELF panels both stay in
+// the page, and a shared id sent the ELF map into the hidden PE panel.
+function fileMapInlineBlock(path, scope = 'pe') {
+    const safe = jsArg(path || '');
     let html = '<div class="fmap-inline">';
     html += '<div class="fmap-inline-head"><span class="die-section-title">FILE MAP</span>';
-    html += `<button class="btn btn-sm" onclick="fileMapRender('${safe}');switchTab('filemap');">Open full map</button></div>`;
-    html += '<div class="fmap-inline-body" id="fmap-inline-map"><div class="fmap-inline-wait">building planes…</div></div>';
+    html += `<button class="btn btn-sm" onclick="fileMapRender(${safe});switchTab('filemap');">Open full map</button></div>`;
+    html += `<div class="fmap-inline-body" id="fmap-inline-map-${scope}"><div class="fmap-inline-wait">building planes…</div></div>`;
     html += '<details class="fmap-inline-trees"><summary class="die-section-title die-clickable">IMPORT / EXPORT TREE</summary>';
-    html += '<div id="fmap-inline-trees"></div></details>';
+    html += `<div id="fmap-inline-trees-${scope}"></div></details>`;
     html += '</div>';
     return html;
 }
 
-function fileMapInlineMount(path) {
+function fileMapInlineMount(path, scope = 'pe') {
     if (!path) return;
-    renderInlineFileMap('fmap-inline-map', path);
+    // renderInlineFileMap and the tree share one cached load (see
+    // FileMapView.load), so this does not fetch the map twice.
+    renderInlineFileMap(`fmap-inline-map-${scope}`, path);
     FileMapView.load(path, { cols: 256, rows: 512 }).then(vis => {
-        const target = document.getElementById('fmap-inline-trees');
+        const target = document.getElementById(`fmap-inline-trees-${scope}`);
         if (target) target.innerHTML = FileMapView.treeHtml(vis);
     }).catch(() => {});
 }
@@ -8038,7 +8696,7 @@ function renderProcessDumpBlock(pd) {
         const kindCls = d.host_class ? 'sev-info'
             : d.kind === 'hiddenmodule' ? 'sev-high'
             : d.kind === 'codechunk' ? 'sev-medium' : '';
-        const esc = (d.path || '').replace(/\\/g, '\\\\');
+        const esc = jsArg(d.path || '');
         html += `<tr>`;
         html += `<td class="mem-dump-name" title="${escapeHtml(d.sha256 || '')}">${escapeHtml(d.filename)}</td>`;
         html += `<td><span class="mem-chip ${kindCls}" title="${escapeHtml(d.host_reason || '')}">`
@@ -8047,8 +8705,8 @@ function renderProcessDumpBlock(pd) {
         html += `<td>${formatSize(d.size || 0)}</td>`;
         // A dump is just a PE on disk, so hand it to the existing analyzers.
         html += `<td class="mem-dump-actions">`;
-        html += `<button class="btn btn-sm" onclick="fileMapRender('${esc}');switchTab('filemap');">Map</button>`;
-        html += `<button class="btn btn-sm" onclick="hexOpenFile('${esc}')">Hex</button>`;
+        html += `<button class="btn btn-sm" onclick="fileMapRender(${esc});switchTab('filemap');">Map</button>`;
+        html += `<button class="btn btn-sm" onclick="hexOpenFile(${esc})">Hex</button>`;
         html += `</td></tr>`;
     });
     html += `</table>`;
@@ -8145,8 +8803,8 @@ async function livememLookup() {
         let html = `<div class="mem-section-label">${data.count} match(es)</div>`;
         html += '<div class="mem-chips">';
         data.matches.forEach(m => {
-            html += `<span class="mem-chip fmap-legend-jump" onclick="livememSelect(${m.pid})" `
-                + `title="Use PID ${m.pid}"><span class="mem-chip-val">${m.pid}</span>`
+            html += `<span class="mem-chip fmap-legend-jump" onclick="livememSelect(${jsInt(m.pid)})" `
+                + `title="Use PID ${escapeHtml(String(m.pid))}"><span class="mem-chip-val">${escapeHtml(String(m.pid))}</span>`
                 + `${escapeHtml(m.name)}</span>`;
         });
         html += '</div>';
@@ -8332,6 +8990,11 @@ async function memoryBaselineStatus() {
     try {
         const resp = await fetch('/api/memory/baseline');
         const d = await resp.json();
+        if (d.stale) {
+            target.innerHTML = `<span class="mem-warn-inline">${escapeHtml(d.note || 'Baseline is outdated')} `
+                + `(${d.stale_keys} old key(s) ignored).</span>`;
+            return;
+        }
         if (!d.total) {
             target.innerHTML = '<span class="mem-warn-inline">No host baseline — '
                 + 'the box\'s own memory noise will count as evidence.</span>';
@@ -8376,11 +9039,11 @@ async function memoryBaselineCapture() {
         html += `<table class="mem-dump-table"><tr><th>process</th><th>pid</th><th>findings</th><th>new keys</th></tr>`;
         (d.scanned || []).forEach(s => {
             html += `<tr><td class="mem-dump-name">${escapeHtml(s.process || '')}</td>`
-                + `<td>${s.pid}</td><td>${s.findings}</td><td>${s.new_keys}</td></tr>`;
+                + `<td>${escapeHtml(String(s.pid))}</td><td>${escapeHtml(String(s.findings))}</td><td>${escapeHtml(String(s.new_keys))}</td></tr>`;
         });
         html += `</table>`;
         (d.failures || []).forEach(f => {
-            html += `<div class="mem-kv det-warn">PID ${f.pid} ${escapeHtml(f.process || '')}: `
+            html += `<div class="mem-kv det-warn">PID ${escapeHtml(String(f.pid))} ${escapeHtml(f.process || '')}: `
                 + `${escapeHtml(f.error)}</div>`;
         });
         target.innerHTML = html;
@@ -8437,15 +9100,15 @@ function renderExitCaptureBlock(ec) {
         html += `<div class="mem-section-label">Extracted from memory (${arts.length})</div>`;
         html += `<table class="mem-dump-table"><tr><th>file</th><th>kind</th><th>size</th><th></th></tr>`;
         arts.forEach(a => {
-            const esc = (a.path || '').replace(/\\/g, '\\\\');
+            const esc = jsArg(a.path || '');
             const cls = a.kind === 'main_image' ? '' : 'sev-high';
             html += `<tr><td class="mem-dump-name" title="${escapeHtml(a.sha256 || '')}">${escapeHtml(a.filename)}</td>`
                 + `<td><span class="mem-chip ${cls}">${escapeHtml(a.kind)}</span></td>`
                 + `<td>${formatSize(a.size || 0)}</td><td class="mem-dump-actions">`;
             if (a.is_pe) {
-                html += `<button class="btn btn-sm" onclick="fileMapRender('${esc}');switchTab('filemap');">Map</button>`;
+                html += `<button class="btn btn-sm" onclick="fileMapRender(${esc});switchTab('filemap');">Map</button>`;
             }
-            html += `<button class="btn btn-sm" onclick="hexOpenFile('${esc}')">Hex</button></td></tr>`;
+            html += `<button class="btn btn-sm" onclick="hexOpenFile(${esc})">Hex</button></td></tr>`;
         });
         html += `</table>`;
     }
@@ -8550,12 +9213,12 @@ function renderSweepResult(r) {
     flagged.forEach(p => {
         const cls = p.label === 'MALICIOUS' ? 'sev-critical' : p.label === 'SUSPICIOUS' ? 'sev-high' : 'sev-low';
         const top = (p.findings || [])[0];
-        html += `<tr><td class="mem-dump-name">${escapeHtml(p.process || '?')}</td><td>${p.pid}</td>`
+        html += `<tr><td class="mem-dump-name">${escapeHtml(p.process || '?')}</td><td>${escapeHtml(String(p.pid))}</td>`
             + `<td><span class="mem-chip ${cls}">${escapeHtml(p.label)}</span></td>`
             + `<td>${p.score}</td><td>${p.suppressed}</td>`
             + `<td class="mem-dump-name">${top ? escapeHtml(top.label) : ''}</td>`
             + `<td class="mem-dump-actions"><button class="btn btn-sm" `
-            + `onclick="document.getElementById('livemem-pid').value=${p.pid};livememAether()">Rescan</button></td></tr>`;
+            + `onclick="document.getElementById('livemem-pid').value=${jsInt(p.pid)};livememAether()">Rescan</button></td></tr>`;
     });
     return html + `</table>`;
 }

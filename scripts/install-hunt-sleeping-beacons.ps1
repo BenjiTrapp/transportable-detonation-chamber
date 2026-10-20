@@ -24,12 +24,13 @@ $ToolRoot = "C:\tools\Hunt-Sleeping-Beacons"
 $SourceDir = "C:\tools\Hunt-Sleeping-Beacons-src"
 $RepoUrl = "https://github.com/thefLink/Hunt-Sleeping-Beacons.git"
 
-# --- Detect architecture ---
-$arch = if ([System.Environment]::Is64BitOperatingSystem) {
-    $procArch = $env:PROCESSOR_ARCHITECTURE
-    if ($procArch -eq "ARM64") { "ARM64" } else { "x64" }
-} else { "x86" }
-Write-Host "[*] Detected architecture: $arch" -ForegroundColor Yellow
+# --- Target platform ---
+# Always x64, also on ARM64 Windows: the scanner reads thread contexts through
+# the AMD64 CONTEXT layout (Rip/Rsp/Rbp, Dr0-Dr7), so the solution's ARM64
+# configuration does not compile. On ARM64 the x64 build runs under emulation
+# and inspects x64 processes - which is what emulated implants are.
+$arch = "x64"
+Write-Host "[*] Building for $arch (OS: $env:PROCESSOR_ARCHITECTURE)" -ForegroundColor Yellow
 
 # --- Install Visual Studio Build Tools 2022 (C++ workload) ---
 $msbuildPaths = @(
@@ -107,7 +108,8 @@ $buildSuccess = $false
 if ($msbuildExe) {
     Write-Host "[*] Building Hunt-Sleeping-Beacons (Release|$arch)..." -ForegroundColor Yellow
 
-    $slnFile = "$SourceDir\src\Hunt-Sleeping-Beacons.sln"
+    # The scanner project only; the solution also contains a unit-test project.
+    $slnFile = "$SourceDir\src\Hunt-Sleeping-Beacons\Hunt-Sleeping-Beacons.vcxproj"
     $platform = $arch  # x64, ARM64, or x86 (matches solution config)
 
     # Run MSBuild
@@ -148,6 +150,7 @@ if (-not (Test-Path $ToolRoot)) {
 if ($buildSuccess) {
     # Find the built executable
     $outputDirs = @(
+        "$SourceDir\src\Hunt-Sleeping-Beacons\x64\Release",
         "$SourceDir\src\Hunt-Sleeping-Beacons\$platform\Release",
         "$SourceDir\src\$platform\Release",
         "$SourceDir\src\Hunt-Sleeping-Beacons\Release",

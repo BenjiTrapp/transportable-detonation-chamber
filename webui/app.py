@@ -7,6 +7,7 @@ Run: python app.py
 Access: http://localhost:9000
 """
 
+import datetime
 import json
 import os
 import glob
@@ -30,6 +31,72 @@ import minidump_analysis
 
 app = Flask(__name__)
 
+# --- Browser-side request forgery --------------------------------------
+# The UI has no login (lab tool on an isolated network), but a browser on
+# the VM or host can still be made to talk to it by any web page it opens:
+#
+#   * CSRF: a page posts a form or fetch() to http://<vm>:9000/api/submit.
+#     Browsers mark such requests with the page's Origin (or Referer), so a
+#     state-changing request naming a foreign origin is refused. Clients
+#     without these headers (curl, MCP, scripts) are not affected.
+#   * DNS rebinding: a page on evil.example re-points its own name to the VM
+#     and then counts as same-origin - it could read every response. The Host
+#     header still says evil.example, so only IP literals, localhost and the
+#     names in TDC_ALLOWED_HOSTS are served.
+from urllib.parse import urlparse as _urlparse
+import ipaddress as _ipaddress
+
+_ALLOWED_HOSTNAMES = {"localhost"} | {
+    h.strip().lower() for h in os.environ.get("TDC_ALLOWED_HOSTS", "").split(",") if h.strip()}
+_UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def _host_allowed(host):
+    host = (host or "").strip().lower()
+    if host.startswith("["):                       # [::1]:9000
+        name = host[1:host.find("]")] if "]" in host else host[1:]
+    else:
+        name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    if not name:
+        return False
+    if name in _ALLOWED_HOSTNAMES:
+        return True
+    try:
+        _ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        return False
+
+
+@app.before_request
+def _block_cross_site_requests():
+    if not _host_allowed(request.host):
+        return jsonify({"error": "Host not allowed",
+                        "hint": "use the IP address, or add the name to TDC_ALLOWED_HOSTS"}), 403
+    if request.method in _UNSAFE_METHODS:
+        source = request.headers.get("Origin") or request.headers.get("Referer")
+        # "null" is what sandboxed iframes and file:// pages send.
+        if source and (source == "null" or _urlparse(source).netloc.lower() != request.host.lower()):
+            return jsonify({"error": "Cross-site request rejected"}), 403
+    return None
+
+
+@app.after_request
+def _security_headers(resp):
+    # No framing (clickjacking), no MIME sniffing of served samples/JSON, and
+    # no URLs with sample paths leaking to other sites via Referer.
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "same-origin")
+    return resp
+
+
+@app.route("/api/health")
+def api_health():
+    """Liveness probe."""
+    return jsonify({"ok": True})
+
 # --- Configuration ---
 RUSTINEL_ALERTS_DIR = os.environ.get("RUSTINEL_ALERTS_DIR", r"C:\tools\rustinel\logs")
 RUSTINEL_INSTALL_DIR = os.environ.get("RUSTINEL_INSTALL_DIR", r"C:\tools\rustinel")
@@ -49,17 +116,95 @@ SCAN_HISTORY_MAX = 200
 MEMORY_BASELINE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory_baseline.json")
 
 
+def _decode_console(raw):
+    """Decode output of a Windows console program.
+
+    PowerShell and most built-in tools write the OEM code page (cp850 on a
+    German system) to pipes, while newer tools write UTF-8. Python's
+    text=True decodes as cp1252, where bytes such as 0x81 ("ü" in cp850) are
+    undefined: the reader thread raises and stdout silently becomes None.
+    """
+    if not raw:
+        return ""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        return raw.decode("oem", errors="replace")   # Windows only
+    except LookupError:
+        return raw.decode("latin-1")
+
+
+def _run_cmd(args, timeout=None, **kwargs):
+    """subprocess.run with captured output decoded by _decode_console.
+
+    Returns a CompletedProcess whose stdout/stderr are str, like text=True,
+    but without the cp1252 decoding failure described above.
+    """
+    kwargs.pop("text", None)
+    kwargs.pop("capture_output", None)
+    proc = subprocess.run(args, capture_output=True, timeout=timeout, **kwargs)
+    proc.stdout = _decode_console(proc.stdout)
+    proc.stderr = _decode_console(proc.stderr)
+    return proc
+
+
+def _path_within(path, roots):
+    r"""True if `path` lies inside one of `roots`.
+
+    A plain startswith() also accepts siblings (C:\TempX for C:\Temp) and
+    is fooled by junctions; this resolves the real path and compares whole
+    path components, case-insensitively as Windows does.
+    """
+    try:
+        real = os.path.normcase(os.path.realpath(path))
+    except (OSError, ValueError):
+        return False
+    for root in roots:
+        try:
+            base = os.path.normcase(os.path.realpath(root))
+            if os.path.commonpath([real, base]) == base:
+                return True
+        except (OSError, ValueError):
+            continue  # different drive, or unresolvable root
+    return False
+
+
+def _wevtutil_query(log, query=None, count=None, newest_first=True, timeout=30):
+    """Run `wevtutil qe ... /f:xml` and return the XML text.
+
+    wevtutil writes the ANSI code page by default (cp1252: "AUTORIT\xc4T"),
+    which is neither UTF-8 nor what _decode_console expects; /uni:true makes
+    it emit UTF-16 so event text from any locale survives intact.
+    Raises subprocess.TimeoutExpired / OSError like subprocess.run.
+    """
+    args = ["wevtutil", "qe", log, "/f:xml", "/uni:true"]
+    if query:
+        args.append(f"/q:{query}")
+    if count:
+        args.append(f"/c:{int(count)}")
+    if newest_first:
+        args.append("/rd:true")
+    proc = subprocess.run(args, capture_output=True, timeout=timeout,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    raw = proc.stdout or b""
+    if raw[:2] == b"\xff\xfe":
+        raw = raw[2:]
+    return raw.decode("utf-16-le", errors="replace"), proc
+
+
 def _detect_vm_ip():
     """Auto-detect Hyper-V VM IP if not configured via environment variable."""
     global VM_IP, VM_WEBUI_URL
     if VM_IP:
         return  # Already set via env var
     try:
-        result = subprocess.run(
+        result = _run_cmd(
             ["powershell", "-NoProfile", "-Command",
              "(Get-VM -Name 'DetonationChamber' -ErrorAction SilentlyContinue | "
              "Get-VMNetworkAdapter).IPAddresses | Where-Object { $_ -match '^\\d+\\.\\d+\\.\\d+\\.\\d+$' } | Select-Object -First 1"],
-            capture_output=True, text=True, timeout=5
+            timeout=5
         )
         if result.returncode == 0 and result.stdout.strip():
             VM_IP = result.stdout.strip()
@@ -220,6 +365,9 @@ def _extract_sha256(hashes):
     return ""
 
 
+_PROCESS_SCAN_TOOLS = {"aether", "process dump", "exit capture", "hunt-sleeping-beacons", "beaconeye"}
+
+
 def _summarize_scan_entry(e):
     """Compact per-tool scan summary for the graph. Carries the full ``result``
     so the detail-panel expander can reuse renderHistoryDetail()."""
@@ -332,6 +480,10 @@ def _build_samples(proc_map, by_sha, by_name):
     for e in hist:  # newest-first: keep latest per tool
         if not isinstance(e, dict):
             continue
+        # Live-memory scans target processes ("PID 1234", "all processes"),
+        # not files; they belong to the process tree, not the Samples rail.
+        if (e.get("tool") or "").lower() in _PROCESS_SCAN_TOOLS:
+            continue
         s = bucket(e.get("sha256"), e.get("filename"), e.get("filename"))
         s["sources"].add("scan")
         tool = (e.get("tool") or "?").lower()
@@ -342,7 +494,10 @@ def _build_samples(proc_map, by_sha, by_name):
 
     # Resolve each sample to a live PID via SHA256 match on process hashes.
     sha2pid = {}
-    for pid, node in proc_map.items():
+    newest_first = sorted(proc_map.items(),
+                          key=lambda kv: _to_epoch(kv[1].get("started") or kv[1].get("first_seen")) or 0,
+                          reverse=True)
+    for pid, node in newest_first:      # the latest run of a sample wins
         nsha = _extract_sha256(node.get("hashes"))
         if nsha:
             sha2pid.setdefault(nsha, pid)
@@ -359,7 +514,8 @@ def _build_samples(proc_map, by_sha, by_name):
             "target": s["target"],
             "submitted_at": s["submitted_at"],
             "agent_pid": s["agent_pid"],
-            "pid": pid,
+            "pid": pid,                      # instance key, used to focus
+            "os_pid": proc_map[pid].get("pid") if pid else None,
             "executed": pid is not None,
             "detonated": detonated,
             "verdict": _overall_verdict(scans),
@@ -452,9 +608,16 @@ def _record_submission(filename, sha256, size, target, results):
     if isinstance(fi, dict):
         entry["litterbox_hash"] = fi.get("litterbox_hash")
 
-    # If no file_path from agent, guess the common location
+    # The agent does not report where it wrote the sample. The running
+    # process knows (it may still be alive right after the submit); else the
+    # agent's drop folder. The former guess (a "vagrant" desktop folder) did
+    # not exist on any VM, so hex/PE/FileMap links to samples were dead.
     if not entry["file_path"]:
-        entry["file_path"] = f"C:\\Users\\vagrant\\Desktop\\infected\\{filename}"
+        candidates = []
+        if entry.get("agent_pid"):
+            candidates.append(_image_path_for_pid(entry["agent_pid"]))
+        candidates.append(os.path.join(r"C:\Users\Public\Downloads", os.path.basename(filename)))
+        entry["file_path"] = next((c for c in candidates if c and os.path.isfile(c)), None)
 
     with submissions_lock:
         subs = _load_submissions()
@@ -640,8 +803,11 @@ def parse_fibratus_alert(data):
         "parent_name": proc.get("parent_name", ""),
         "parent_command_line": proc.get("parent_cmdline", ""),
         "user": proc.get("username", ""),
-        "detonated": True,
-        "detonation_source": "fibratus",
+        # Fibratus watches the whole system: an alert alone does not make a
+        # process part of a detonation (it marked the web UI's own helpers,
+        # Defender and OneDrive as "detonated"). Attribution to a sample
+        # comes from the submission (PID + time window + image) instead.
+        "detonated": False,
         "raw": data,
     }
     return alert
@@ -653,15 +819,10 @@ _fibratus_cache = {"record_id": None, "alerts": []}
 def _fibratus_newest_record_id():
     """EventRecordID of the newest Fibratus event (cheap: one wevtutil call)."""
     try:
-        proc = subprocess.run(
-            ["wevtutil", "qe", "Application",
-             "/q:*[System[Provider[@Name='Fibratus']]]", "/c:1", "/rd:true", "/f:xml"],
-            capture_output=True, timeout=10,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        raw, _ = _wevtutil_query("Application", "*[System[Provider[@Name='Fibratus']]]",
+                                 count=1, timeout=10)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
-    raw = (proc.stdout or b"").decode("utf-8", errors="replace")
     start = raw.find("<EventRecordID>")
     if start < 0:
         return ""  # provider has no events
@@ -678,7 +839,17 @@ def load_fibratus_alerts():
     newest = _fibratus_newest_record_id()
     if newest is not None and newest == _fibratus_cache["record_id"]:
         return _fibratus_cache["alerts"]
-    alerts = _load_fibratus_alerts_full()
+    try:
+        alerts = _load_fibratus_alerts_full()
+    except Exception as e:
+        # A failure here used to propagate into the loader loop and skip
+        # storing *all* alerts, including Rustinel's, for that cycle.
+        print(f"[fibratus_loader] {e}")
+        return _fibratus_cache["alerts"]
+    if alerts is None:
+        # Query failed: keep serving the previous result rather than caching
+        # an empty list until the next new Fibratus event.
+        return _fibratus_cache["alerts"]
     if newest is not None:
         _fibratus_cache.update(record_id=newest, alerts=alerts)
     return alerts
@@ -692,18 +863,21 @@ def _load_fibratus_alerts_full():
     # Build PowerShell command to query Fibratus events
     # Use Get-WinEvent with FilterHashtable for efficiency
     ps_cmd = (
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; "
         "Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='Fibratus'} "
         "-MaxEvents 500 -ErrorAction SilentlyContinue | "
         "ForEach-Object { $_.Message } "
     )
 
     try:
-        result = subprocess.run(
+        result = _run_cmd(
             ["powershell", "-NoProfile", "-Command", ps_cmd],
-            capture_output=True, text=True, timeout=10,
+            timeout=10,
             creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0,
         )
-        if result.returncode != 0 or not result.stdout.strip():
+        if result.returncode != 0:
+            return None
+        if not result.stdout.strip():
             return alerts
 
         # Each event message is a JSON blob; they may be separated by newlines
@@ -745,7 +919,7 @@ def _load_fibratus_alerts_full():
 
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         print(f"[fibratus_loader] Error reading event log: {e}")
-        return alerts
+        return None
 
     return alerts
 
@@ -848,30 +1022,196 @@ def load_litterbox_results():
     return alerts
 
 
+_AGENT_PID_WINDOW = 6 * 3600   # seconds after submission a sample PID stays attributable
+
+
+def _to_epoch(ts):
+    """Epoch seconds for an ISO timestamp (naive = local time), or None."""
+    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+        return float(ts)
+    if not ts:
+        return None
+    import re
+    # Windows/Rustinel write 7 fractional digits; fromisoformat takes at most 6.
+    text = re.sub(r"(\.\d{6})\d+", r"\1", str(ts).strip().replace("Z", "+00:00"))
+    try:
+        dt = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt.timestamp()
+
+
+def _agent_detonation_index():
+    """pid -> [(window start, window end, sample basename or None)] from submissions."""
+    index = {}
+    try:
+        subs = _load_submissions()
+    except Exception:
+        return index
+    starts = []
+    for sub in subs:
+        apid = sub.get("agent_pid")
+        start = _to_epoch(sub.get("timestamp"))
+        if apid and start is not None:
+            starts.append((start, str(apid), sub))
+    starts.sort(key=lambda x: x[0])
+    for i, (start, apid, sub) in enumerate(starts):
+        end = start + _AGENT_PID_WINDOW
+        # A later submission that reuses the PID ends this one's window.
+        for later_start, later_pid, _ in starts[i + 1:]:
+            if later_pid == apid:
+                end = min(end, later_start)
+                break
+        name = os.path.basename(str(sub.get("file_path") or sub.get("filename") or "").replace("\\", "/"))
+        # Only directly executed files must match the image; DLLs/scripts run
+        # under a host process (rundll32, powershell, ...).
+        must_match = name if name.lower().endswith((".exe", ".com", ".scr")) else None
+        index.setdefault(apid, []).append((start - 60, end, must_match))
+    return index
+
+
+def _is_agent_detonation(index, pid, timestamp, image):
+    windows = index.get(str(pid))
+    if not windows:
+        return False
+    t = _to_epoch(timestamp)
+    img = os.path.basename(str(image or "").replace("\\", "/")).lower()
+    for start, end, name in windows:
+        # An alert that cannot be placed in time cannot be attributed: the
+        # PID may belong to any process that ever had it.
+        if t is None or not (start <= t <= end):
+            continue
+        if name and img and img != name.lower():
+            continue
+        return True
+    return False
+
+
+class _PidInstances:
+    """Maps (PID, time) to a process-instance key.
+
+    Windows reuses PIDs, so a PID names different processes over time. The
+    process maps key each instance separately: the newest instance of a PID
+    keeps the plain "<pid>" key (so existing links and API calls by PID keep
+    meaning "the current process"), older ones are "<pid>@<start epoch>".
+    """
+
+    SLACK = 60   # seconds: alert/event clocks and process start may differ a little
+
+    def __init__(self, procs):
+        self.by_pid = {}
+        self.image = {}
+        for key, node in procs.items():
+            t = _to_epoch(node.get("started") or node.get("first_seen"))
+            self.by_pid.setdefault(str(node.get("pid")), []).append(
+                (t if t is not None else float("-inf"), key))
+            self.image[key] = _basename(node.get("image") or "").lower() or (node.get("name") or "").lower()
+            # Sysmon ProcessCreate gives the real start; alert-derived nodes
+            # only know when they were first seen, which can be later.
+            self.exact = getattr(self, "exact", {})
+            self.exact[key] = bool(node.get("started"))
+        for lst in self.by_pid.values():
+            lst.sort(key=lambda x: x[0])
+
+    def resolve_key(self, key, at=None):
+        """Map an instance key from another process map onto this one.
+
+        "<pid>@<epoch>" resolves by its start time. A plain "<pid>" means the
+        newest process with that PID - unless `at` says when it was seen.
+        Keys differ between maps (the alert tree may not know a newer process
+        that Sysmon saw), so a key is matched by PID and time, not by name.
+        """
+        key = str(key)
+        pid, _, epoch = key.partition("@")
+        if epoch:
+            try:
+                return self.resolve(pid, float(epoch.rstrip("+")))
+            except ValueError:
+                return None
+        return self.resolve(pid, at) if at else (self.by_pid.get(pid) or [(0, None)])[-1][1]
+
+    def resolve(self, pid, ts, image=None):
+        """Key of the instance of `pid` that was alive at `ts`, or None.
+
+        `image` (e.g. Sysmon's ParentImage for a parent lookup) rules out
+        instances running a different program: with only one known holder
+        of a PID, time alone cannot tell whether it is the right one.
+        """
+        cands = self.by_pid.get(str(pid)) if pid not in (None, "") else None
+        if cands and image:
+            want = _basename(str(image)).lower()
+            if want and want != "unknown":
+                cands = [c for c in cands if self.image.get(c[1]) in ("", "unknown", want)]
+        if not cands:
+            return None
+        t = ts if isinstance(ts, (int, float)) else _to_epoch(ts)
+        if t is None:
+            return cands[-1][1]
+        started = [key for start, key in cands if start <= t + self.SLACK]
+        if started:
+            return started[-1]
+        # Every holder started after `ts`. A process with a known start cannot
+        # have been alive then; one only seen through later alerts may have.
+        fuzzy = [key for _, key in cands if not self.exact.get(key)]
+        return fuzzy[0] if fuzzy else None
+
+
+def _instance_keys(groups):
+    """{pid: [node, ...] oldest first} -> {key: node}, setting node["key"]."""
+    out = {}
+    for pid, nodes in groups.items():
+        for i, node in enumerate(nodes):
+            # When the next process took over this PID: events after that
+            # belong to it, not to this one.
+            if i + 1 < len(nodes):
+                node["superseded_at"] = nodes[i + 1].get("started") or nodes[i + 1].get("first_seen")
+            if i == len(nodes) - 1:
+                key = str(pid)
+            else:
+                t = _to_epoch(node.get("started") or node.get("first_seen"))
+                key = f"{pid}@{int(t) if t is not None else i}"
+                while key in out:
+                    key += "+"
+            node["key"] = key
+            out[key] = node
+    return out
+
+
 def build_process_tree(alerts):
     """Build process tree from alerts data.
     
     Handles PID reuse: if a PID's executable changes between alerts,
     use the most recent process info (latest alert wins).
     """
-    # Pre-load known detonated PIDs from submission history
-    _detonated_pids = set()
-    try:
-        for sub in _load_submissions():
-            apid = sub.get("agent_pid")
-            if apid:
-                _detonated_pids.add(str(apid))
-    except Exception:
-        pass
+    # Known sample PIDs from the submission history. Windows reuses PIDs, so
+    # a PID alone used to mark every later process with that number as
+    # detonated; an alert now only counts when it falls in that submission's
+    # time window and, for directly executed samples, names the same image.
+    _detonated_pids = _agent_detonation_index()
 
-    processes = {}
-    for alert in alerts:
-        raw_pid = alert.get("pid")
-        if not raw_pid:
-            continue
-        pid = str(raw_pid)
-        if pid not in processes:
-            processes[pid] = {
+    # One entry per process instance: alerts are walked in time order and a
+    # PID starts a new instance when its image changes or after it exited.
+    groups = {}          # pid -> [entry, ...] oldest first
+    ordered = sorted((a for a in alerts if a.get("pid")),
+                     key=lambda a: _to_epoch(a.get("timestamp")) or 0)
+    for alert in ordered:
+        pid = str(alert.get("pid"))
+        insts = groups.setdefault(pid, [])
+        cur = insts[-1] if insts else None
+        alert_image = (alert.get("process_image") or "").lower()
+        new_instance = cur is None
+        if cur is not None:
+            cur_image = (cur.get("image") or "").lower()
+            if alert_image and cur_image and alert_image != cur_image:
+                new_instance = True
+            elif cur.get("exit_time"):
+                ended, now = _to_epoch(cur["exit_time"]), _to_epoch(alert.get("timestamp"))
+                if ended is not None and now is not None and now > ended + 1:
+                    new_instance = True
+        if new_instance:
+            cur = {
                 "pid": pid,
                 "name": alert.get("process_name", "unknown"),
                 "image": alert.get("process_image", ""),
@@ -896,137 +1236,155 @@ def build_process_tree(alerts):
                 "detonated": False,
                 "detonation_sources": [],
             }
-        if pid:
-            # Handle PID reuse: if the executable changed, update process identity
-            # (later alerts overwrite older ones so the most recent process info wins)
-            proc_entry = processes.get(pid)
-            if proc_entry:
-                alert_image = alert.get("process_image", "")
-                alert_ts = alert.get("timestamp", "")
-                if alert_image and alert_image != proc_entry["image"]:
-                    # Different executable on same PID = PID reuse; update to latest
-                    if alert_ts >= (proc_entry.get("last_seen") or ""):
-                        proc_entry["name"] = alert.get("process_name", proc_entry["name"])
-                        proc_entry["image"] = alert_image
-                        proc_entry["command_line"] = alert.get("command_line") or proc_entry["command_line"]
-                        proc_entry["user"] = alert.get("user") or proc_entry["user"]
-                        if alert.get("parent_pid"):
-                            proc_entry["parent_pid"] = alert.get("parent_pid")
-                            proc_entry["parent_name"] = alert.get("parent_name", "")
+            insts.append(cur)
+        proc_entry = cur
+        if not proc_entry.get("image") and alert.get("process_image"):
+            proc_entry["image"] = alert["process_image"]
+            proc_entry["name"] = alert.get("process_name") or proc_entry["name"]
+        if not proc_entry.get("command_line") and alert.get("command_line"):
+            proc_entry["command_line"] = alert["command_line"]
+        if proc_entry.get("parent_pid") in (None, "") and alert.get("parent_pid"):
+            proc_entry["parent_pid"] = alert["parent_pid"]
+            proc_entry["parent_name"] = alert.get("parent_name", "")
 
-                proc_entry["alerts"].append(alert)
+        proc_entry["alerts"].append(alert)
 
-                # Count activity by category
-                cat = alert.get("category", "")
-                if isinstance(cat, list):
-                    cat = cat[0] if cat else ""
-                cat_lower = cat.lower()
+        # Count activity by category
+        cat = alert.get("category", "")
+        if isinstance(cat, list):
+            cat = cat[0] if cat else ""
+        cat_lower = cat.lower()
 
-                proc_entry["activity"]["threats"] += 1
-                if "file" in cat_lower:
-                    proc_entry["activity"]["file"] += 1
-                elif "network" in cat_lower:
-                    proc_entry["activity"]["network"] += 1
-                    # Check if HTTP specifically (ports 80/443/8080/8443)
-                    raw = alert.get("raw", {})
-                    dest_port = _get_nested(raw, "destination.port") or _get_nested(raw, "network.destination.port")
-                    if dest_port in (80, 443, 8080, 8443, "80", "443", "8080", "8443"):
-                        proc_entry["activity"]["http"] += 1
-                elif "dns" in cat_lower:
-                    proc_entry["activity"]["dns"] += 1
-                elif "registry" in cat_lower:
-                    proc_entry["activity"]["registry"] += 1
-                elif "process" in cat_lower:
-                    proc_entry["activity"]["modules"] += 1
+        proc_entry["activity"]["threats"] += 1
+        if "file" in cat_lower:
+            proc_entry["activity"]["file"] += 1
+        elif "network" in cat_lower:
+            proc_entry["activity"]["network"] += 1
+            # Check if HTTP specifically (ports 80/443/8080/8443)
+            raw = alert.get("raw", {})
+            dest_port = _get_nested(raw, "destination.port") or _get_nested(raw, "network.destination.port")
+            if dest_port in (80, 443, 8080, 8443, "80", "443", "8080", "8443"):
+                proc_entry["activity"]["http"] += 1
+        elif "dns" in cat_lower:
+            proc_entry["activity"]["dns"] += 1
+        elif "registry" in cat_lower:
+            proc_entry["activity"]["registry"] += 1
+        elif "process" in cat_lower:
+            proc_entry["activity"]["modules"] += 1
 
-                # Count artifacts (YARA/IOC matches)
-                engine = alert.get("engine", "").lower()
-                if engine in ("yara", "ioc"):
-                    proc_entry["activity"]["artifacts"] += 1
+        # Count artifacts (YARA/IOC matches)
+        engine = alert.get("engine", "").lower()
+        if engine in ("yara", "ioc"):
+            proc_entry["activity"]["artifacts"] += 1
 
-                # Track detonation enrichment (Fibratus / LitterBox / submission PIDs)
-                if alert.get("detonated") or str(pid) in _detonated_pids:
-                    proc_entry["activity"]["detonated"] += 1
-                    proc_entry["detonated"] = True
-                    det_src = alert.get("detonation_source", "")
-                    if det_src and det_src not in proc_entry["detonation_sources"]:
-                        proc_entry["detonation_sources"].append(det_src)
-                    if str(pid) in _detonated_pids and "agent" not in proc_entry["detonation_sources"]:
-                        proc_entry["detonation_sources"].append("agent")
+        # Track detonation enrichment (Fibratus / LitterBox / submission PIDs)
+        agent_match = _is_agent_detonation(_detonated_pids, pid, alert.get("timestamp"),
+                                           alert.get("process_image"))
+        if alert.get("detonated") or agent_match:
+            proc_entry["activity"]["detonated"] += 1
+            proc_entry["detonated"] = True
+            det_src = alert.get("detonation_source", "")
+            if det_src and det_src not in proc_entry["detonation_sources"]:
+                proc_entry["detonation_sources"].append(det_src)
+            if agent_match and "agent" not in proc_entry["detonation_sources"]:
+                proc_entry["detonation_sources"].append("agent")
 
-                # Track last seen timestamp
-                ts = alert.get("timestamp", "")
-                if ts and ts > (proc_entry.get("last_seen") or ""):
-                    proc_entry["last_seen"] = ts
+        # Track last seen timestamp
+        ts = alert.get("timestamp", "")
+        if ts and ts > (proc_entry.get("last_seen") or ""):
+            proc_entry["last_seen"] = ts
 
-                # Detect process exit events (ETW process terminate)
-                raw = alert.get("raw", {})
-                event_action = _get_nested(raw, "event.action", "")
-                if event_action in ("process_terminated", "exit", "ProcessExit"):
-                    proc_entry["exit_time"] = ts
-                    proc_entry["exit_code"] = _get_nested(raw, "process.exit_code")
+        # Detect process exit events (ETW process terminate)
+        raw = alert.get("raw", {})
+        event_action = _get_nested(raw, "event.action", "")
+        if event_action in ("process_terminated", "exit", "ProcessExit"):
+            proc_entry["exit_time"] = ts
+            proc_entry["exit_code"] = _get_nested(raw, "process.exit_code")
 
-    # Link children to parents
-    stub_parents = {}
-    for pid, proc in list(processes.items()):
+    # Parents that never raised an alert themselves get a stub node, one per
+    # PID and program, so the graph can still show the relationship. Stubs
+    # join the instance groups before keys are assigned, so "<pid>" stays the
+    # newest process with that PID.
+    probe = _PidInstances(_instance_keys(groups))
+    stubs = {}
+    for entry in [e for lst in groups.values() for e in lst]:
+        ppid = entry.get("parent_pid")
+        if ppid in (None, "") or str(ppid) == str(entry.get("pid")):
+            continue
+        if probe.resolve(str(ppid), entry.get("first_seen"), image=entry.get("parent_name")):
+            continue
+        sid = (str(ppid), (entry.get("parent_name") or "").lower())
+        t = _to_epoch(entry.get("first_seen"))
+        stub = stubs.get(sid)
+        if stub is None:
+            stub = stubs[sid] = {
+                "pid": str(ppid),
+                "name": entry.get("parent_name") or "unknown",
+                "image": "",
+                "command_line": entry.get("parent_command_line", ""),
+                "user": "",
+                "parent_pid": None,
+                "parent_name": "",
+                "integrity": "",
+                "working_dir": "",
+                "first_seen": entry.get("first_seen", ""),
+                "last_seen": entry.get("last_seen", ""),
+                "exit_time": None,
+                "exit_code": None,
+                "children": [],
+                "activity": {
+                    "file": 0, "network": 0, "dns": 0, "http": 0,
+                    "registry": 0, "modules": 0, "scripts": 0, "injection": 0,
+                    "wmi": 0, "services": 0, "tasks": 0, "logons": 0,
+                    "artifacts": 0, "threats": 0, "detonated": 0,
+                },
+                "alerts": [],
+                "detonated": False,
+                "detonation_sources": [],
+                "is_stub": True,
+                "_t": t,
+            }
+            groups.setdefault(str(ppid), []).append(stub)
+        elif t is not None and (stub["_t"] is None or t < stub["_t"]):
+            stub["_t"], stub["first_seen"] = t, entry.get("first_seen", "")
+    for lst in groups.values():
+        lst.sort(key=lambda e: _to_epoch(e.get("first_seen")) or 0)
+    for stub in stubs.values():
+        stub.pop("_t", None)
+    processes = _instance_keys(groups)
+
+    # Link children to the parent instance alive when the child appeared.
+    resolver = _PidInstances(processes)
+    for key, proc in processes.items():
+        proc["parent_key"] = None
         ppid = proc.get("parent_pid")
-        if ppid is not None:
-            ppid_str = str(ppid)
-            if ppid_str == str(pid):
-                continue  # self-reference
-            if ppid_str in processes:
-                if pid not in processes[ppid_str]["children"]:
-                    processes[ppid_str]["children"].append(pid)
-            elif ppid_str not in stub_parents:
-                # Create a stub parent entry so the graph can show the relationship
-                stub_parents[ppid_str] = {
-                    "pid": ppid,
-                    "name": proc.get("parent_name", "unknown"),
-                    "image": "",
-                    "command_line": proc.get("parent_command_line", ""),
-                    "user": "",
-                    "parent_pid": None,
-                    "parent_name": "",
-                    "integrity": "",
-                    "working_dir": "",
-                    "first_seen": proc.get("first_seen", ""),
-                    "last_seen": proc.get("last_seen", ""),
-                    "exit_time": None,
-                    "exit_code": None,
-                    "children": [pid],
-                    "activity": {
-                        "file": 0, "network": 0, "dns": 0, "http": 0,
-                        "registry": 0, "modules": 0, "scripts": 0, "injection": 0,
-                        "wmi": 0, "services": 0, "tasks": 0, "logons": 0,
-                        "artifacts": 0, "threats": 0, "detonated": 0,
-                    },
-                    "alerts": [],
-                    "detonated": False,
-                    "detonation_sources": [],
-                    "is_stub": True,
-                }
-            else:
-                # Stub parent already created by a sibling; just add this PID as child
-                if pid not in stub_parents[ppid_str]["children"]:
-                    stub_parents[ppid_str]["children"].append(pid)
-
-    # Merge stub parents into processes dict
-    processes.update(stub_parents)
+        if ppid in (None, "") or str(ppid) == str(proc.get("pid")):
+            continue
+        parent_key = resolver.resolve(str(ppid), proc.get("first_seen"), image=proc.get("parent_name"))
+        if parent_key and parent_key != key:
+            proc["parent_key"] = parent_key
+            if key not in processes[parent_key]["children"]:
+                processes[parent_key]["children"].append(key)
 
     # Cross-reference with submission history: mark processes whose PID matches
     # a known detonated sample (agent_pid) as detonated, including child processes
-    # (reuse the _detonated_pids set pre-loaded at the top of this function)
-    for pid in _detonated_pids:
-        if pid in processes:
-            processes[pid]["detonated"] = True
-            if "agent" not in processes[pid]["detonation_sources"]:
-                processes[pid]["detonation_sources"].append("agent")
-            # Mark direct children as detonated too (spawned by detonated sample)
-            for child_pid in processes[pid].get("children", []):
-                if child_pid in processes:
-                    processes[child_pid]["detonated"] = True
-                    if "child_of_detonated" not in processes[child_pid]["detonation_sources"]:
-                        processes[child_pid]["detonation_sources"].append("child_of_detonated")
+    # (matched per alert above, so a reused PID does not qualify)
+    for key, proc in list(processes.items()):
+        if "agent" not in proc["detonation_sources"]:
+            continue
+        # Mark direct children as detonated too (spawned by detonated sample)
+        for child_pid in proc.get("children", []):
+            if child_pid in processes:
+                processes[child_pid]["detonated"] = True
+                if "child_of_detonated" not in processes[child_pid]["detonation_sources"]:
+                    processes[child_pid]["detonation_sources"].append("child_of_detonated")
+
+    # Flag the alerts of attributed processes, so /api/alerts?detonated=true
+    # returns the sample's alerts (and only those).
+    for proc in processes.values():
+        if proc.get("detonated"):
+            for a in proc.get("alerts", []):
+                a["detonated"] = True
 
     # Infer exit for processes whose last_seen is significantly before session end
     # (heuristic: if no new events for this process after others continue, mark as exited)
@@ -1053,11 +1411,30 @@ def build_process_tree(alerts):
 _vm_fetch_failures = 0  # Track consecutive failures to avoid spamming logs
 
 
+_PROXY_HOP_HEADER = "X-TDC-Proxied"
+
+
+def _vm_get(path, **kwargs):
+    """GET from the VM's web UI (used when this instance has no local data).
+
+    Sends a hop marker: if VM_WEBUI_URL points back at this instance - the
+    fallback address is a guess - the receiving side refuses to proxy again
+    instead of recursing until every worker thread is stuck waiting on itself.
+    """
+    # The alert loader calls this from a background thread, outside any request.
+    from flask import has_request_context
+    if has_request_context() and request.headers.get(_PROXY_HOP_HEADER):
+        raise RuntimeError("refusing to proxy a proxied request")
+    headers = dict(kwargs.pop("headers", None) or {})
+    headers[_PROXY_HOP_HEADER] = "1"
+    return requests.get(f"{VM_WEBUI_URL}{path}", headers=headers, **kwargs)
+
+
 def _fetch_vm_alerts():
     """Fetch alerts from the VM's webui API as fallback when local sources are empty."""
     global _vm_fetch_failures
     try:
-        r = requests.get(f"{VM_WEBUI_URL}/api/alerts", timeout=5)
+        r = _vm_get("/api/alerts", timeout=5)
         if r.status_code == 200:
             alerts = r.json()
             if isinstance(alerts, list) and alerts:
@@ -1082,8 +1459,23 @@ def _alerts_version(alerts):
     return f"{len(alerts)}-{h.hexdigest()[:16]}"
 
 
-def _store_alerts(alerts, processes):
-    version = _alerts_version(alerts)
+def _store_alerts(alerts, processes=None):
+    """Publish an alert list; skips the rebuild when nothing changed.
+
+    The process tree also depends on submissions.json (detonation flags), so
+    its mtime is part of the version. Without this check every 5 s cycle
+    rebuilt the tree from ~10k alerts even while idle.
+    """
+    try:
+        sub_mtime = os.path.getmtime(SUBMISSIONS_FILE)
+    except OSError:
+        sub_mtime = 0
+    version = f"{_alerts_version(alerts)}-{int(sub_mtime)}"
+    with store_lock:
+        if events_store.get("alerts_version") == version:
+            return
+    if processes is None:
+        processes = build_process_tree(alerts)
     with store_lock:
         events_store["alerts"] = alerts
         events_store["processes"] = processes
@@ -1108,7 +1500,7 @@ def alert_loader_thread():
             if not has_local_data and VM_WEBUI_URL:
                 vm_alerts = _fetch_vm_alerts()
                 if vm_alerts:
-                    _store_alerts(vm_alerts, build_process_tree(vm_alerts))
+                    _store_alerts(vm_alerts)
                     time.sleep(5)
                     continue
 
@@ -1139,7 +1531,7 @@ def alert_loader_thread():
             # Sort by timestamp
             unique_alerts.sort(key=lambda a: a.get("timestamp", ""))
 
-            _store_alerts(unique_alerts, build_process_tree(unique_alerts))
+            _store_alerts(unique_alerts)
         except Exception as e:
             print(f"[alert_loader] Error: {e}")
         time.sleep(5)
@@ -1267,20 +1659,34 @@ def _find_service_launch_config():
 
 
 def _try_vm_service_start(svc_name):
-    """Try to start a service on the VM via WinRM/PSRemoting. Returns a Flask response or None."""
+    """Try to start a service on the VM via WinRM/PSRemoting. Returns a Flask response or None.
+
+    Credentials come from TDC_VM_USER / TDC_VM_PASS and reach PowerShell
+    through its environment, not its command line: command lines are visible
+    to every process on the box, including a running sample.
+    """
+    import ipaddress
+    user = os.environ.get("TDC_VM_USER", "").strip()
+    password = os.environ.get("TDC_VM_PASS", "")
+    if not user or not password:
+        return None
     try:
-        # Use PowerShell remoting to start the service on the VM
+        ipaddress.ip_address(VM_IP)
+    except ValueError:
+        return None
+    try:
         ps_cmd = (
-            f"$pass = ConvertTo-SecureString 'vagrant' -AsPlainText -Force; "
-            f"$cred = New-Object System.Management.Automation.PSCredential('vagrant', $pass); "
+            "$pass = ConvertTo-SecureString $env:TDC_VM_PASS -AsPlainText -Force; "
+            "$cred = New-Object System.Management.Automation.PSCredential($env:TDC_VM_USER, $pass); "
             f"Invoke-Command -ComputerName '{VM_IP}' -Credential $cred -ScriptBlock {{ "
             f"  Start-Service -Name '{svc_name}' -ErrorAction Stop; "
             f"  (Get-Service -Name '{svc_name}').Status "
             f"}} -ErrorAction Stop"
         )
-        result = subprocess.run(
+        child_env = dict(os.environ, TDC_VM_USER=user, TDC_VM_PASS=password)
+        result = _run_cmd(
             ["powershell", "-NoProfile", "-Command", ps_cmd],
-            capture_output=True, text=True, timeout=15
+            timeout=15, env=child_env,
         )
         if result.returncode == 0 and "Running" in result.stdout:
             return jsonify({"success": True, "message": f"Service '{svc_name}' started on VM ({VM_IP})"})
@@ -1310,30 +1716,30 @@ def api_service_launch():
         # Windows Service start
         if "service" in config:
             svc_name = config["service"]
-            result = subprocess.run(
+            result = _run_cmd(
                 ["powershell", "-NoProfile", "-Command", f"Start-Service -Name '{svc_name}' -ErrorAction Stop"],
-                capture_output=True, text=True, timeout=10
+                timeout=10
             )
             if result.returncode != 0:
                 # Service might not be registered yet — try to install it first
                 exe_path = config.get("exe")
                 if exe_path and os.path.isfile(exe_path) and "NoServiceFoundForGivenName" in result.stderr:
                     # Attempt to register the service via the executable
-                    install_result = subprocess.run(
+                    install_result = _run_cmd(
                         [exe_path, "install-service"],
-                        capture_output=True, text=True, timeout=15
+                        timeout=15
                     )
                     if install_result.returncode == 0:
                         # Set to automatic and start
-                        subprocess.run(
+                        _run_cmd(
                             ["powershell", "-NoProfile", "-Command",
                              f"Set-Service -Name '{svc_name}' -StartupType Automatic -ErrorAction SilentlyContinue"],
-                            capture_output=True, text=True, timeout=5
+                            timeout=5
                         )
-                        start_result = subprocess.run(
+                        start_result = _run_cmd(
                             ["powershell", "-NoProfile", "-Command",
                              f"Start-Service -Name '{svc_name}' -ErrorAction Stop"],
-                            capture_output=True, text=True, timeout=10
+                            timeout=10
                         )
                         if start_result.returncode == 0:
                             return jsonify({"success": True, "message": f"Service '{svc_name}' registered and started"})
@@ -1418,9 +1824,9 @@ def _is_rustinel_running():
     if now - _rustinel_proc_cache["checked_at"] < 5:
         return _rustinel_proc_cache["online"]
     try:
-        result = subprocess.run(
+        result = _run_cmd(
             ["tasklist", "/FI", "IMAGENAME eq rustinel.exe", "/NH"],
-            capture_output=True, text=True, timeout=5
+            timeout=5
         )
         online = "rustinel.exe" in result.stdout.lower()
         _rustinel_proc_cache["online"] = online
@@ -1435,11 +1841,11 @@ def _is_rustinel_running():
 def _get_rustinel_process():
     """Get detailed Rustinel process info (for detail panel only)."""
     try:
-        result = subprocess.run(
+        result = _run_cmd(
             ["powershell", "-NoProfile", "-Command",
              "Get-Process -Name rustinel -ErrorAction SilentlyContinue | "
              "Select-Object Id, StartTime, WorkingSet64 | ConvertTo-Json"],
-            capture_output=True, text=True, timeout=5
+            timeout=5
         )
         if result.stdout.strip():
             data = json.loads(result.stdout.strip())
@@ -1463,9 +1869,9 @@ def _is_sysmon_running():
         return _sysmon_proc_cache["online"]
     try:
         for svc_name in ("Sysmon64a", "Sysmon64"):
-            result = subprocess.run(
+            result = _run_cmd(
                 ["sc", "query", svc_name],
-                capture_output=True, text=True, timeout=5
+                timeout=5
             )
             if "RUNNING" in result.stdout:
                 _sysmon_proc_cache["online"] = True
@@ -1493,18 +1899,18 @@ def _is_fibratus_running():
         return _fibratus_proc_cache["online"]
     try:
         # First try service check (fast)
-        result = subprocess.run(
+        result = _run_cmd(
             ["sc", "query", "fibratus"],
-            capture_output=True, text=True, timeout=5
+            timeout=5
         )
         if "RUNNING" in result.stdout:
             _fibratus_proc_cache["online"] = True
             _fibratus_proc_cache["checked_at"] = now
             return True
         # Fallback: check if running as a process
-        result = subprocess.run(
+        result = _run_cmd(
             ["tasklist", "/FI", "IMAGENAME eq fibratus.exe", "/NH"],
-            capture_output=True, text=True, timeout=5
+            timeout=5
         )
         online = "fibratus.exe" in result.stdout.lower()
         _fibratus_proc_cache["online"] = online
@@ -1556,7 +1962,7 @@ def _get_rustinel_version():
     if not os.path.isfile(exe):
         return None
     try:
-        result = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=5)
+        result = _run_cmd([exe, "--version"], timeout=5)
         if result.stdout.strip():
             # Format: "rustinel x.y.z" or similar
             return result.stdout.strip()
@@ -1583,41 +1989,115 @@ def _get_rustinel_etw_providers():
     return providers
 
 
+_rustinel_info_cache = {"at": 0.0, "static": None}
+_RUSTINEL_STATIC_TTL = 120   # rule counts, version: change only on reinstall/update
+
+
+def _read_log_tail(path, lines=20, chunk=64 * 1024):
+    """Last `lines` non-empty lines of a text file without reading all of it."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - chunk))
+            data = f.read()
+    except OSError:
+        return []
+    text = data.decode("utf-8", errors="ignore")
+    out = [l.strip() for l in text.splitlines() if l.strip()]
+    return out[-lines:]
+
+
 @app.route("/api/rustinel")
 def api_rustinel():
-    """Get detailed Rustinel engine status, loaded rules, and configuration."""
-    proc_info = _get_rustinel_process()
-    rules = _get_rustinel_rules()
-    version = _get_rustinel_version()
-    providers = _get_rustinel_etw_providers()
+    """Get detailed Rustinel engine status, loaded rules, and configuration.
 
-    # Parse log file for recent activity
+    Polled by the dashboard every 10 s. The expensive parts - counting ~740
+    rule files, running rustinel --version, and a PowerShell process query
+    (2-5 s, and often timing out, which made Rustinel look offline) - are
+    either cached or replaced by the tasklist-based check.
+    """
+    now = time.time()
+    static = _rustinel_info_cache["static"]
+    if static is None or now - _rustinel_info_cache["at"] > _RUSTINEL_STATIC_TTL:
+        static = {
+            "version": _get_rustinel_version(),
+            "rules": _get_rustinel_rules(),
+            "etw_providers": _get_rustinel_etw_providers(),
+            # Start time and memory: detail only, refreshed with the cache.
+            "process": _get_rustinel_process(),
+        }
+        _rustinel_info_cache.update(at=now, static=static)
+
     log_files = sorted(glob.glob(os.path.join(RUSTINEL_ALERTS_DIR, "rustinel.log.*")),
                        reverse=True)
-    recent_log_lines = []
-    if log_files:
-        try:
-            with open(log_files[0], "r", encoding="utf-8", errors="ignore") as f:
-                lines = f.readlines()
-                recent_log_lines = [l.strip() for l in lines[-20:] if l.strip()]
-        except IOError:
-            pass
+    recent_log_lines = _read_log_tail(log_files[0]) if log_files else []
 
     info = {
-        "online": proc_info is not None,
-        "version": version,
-        "process": proc_info,
+        "online": _is_rustinel_running(),
+        "version": static["version"],
+        "process": static["process"],
         "install_dir": RUSTINEL_INSTALL_DIR,
         "alerts_dir": RUSTINEL_ALERTS_DIR,
-        "rules": rules,
-        "etw_providers": providers,
+        "rules": static["rules"],
+        "etw_providers": static["etw_providers"],
         "alerts_count": len(events_store.get("alerts", [])),
         "recent_log": recent_log_lines,
     }
     return jsonify(info)
 
 
-_alerts_body_cache = {"version": None, "body": b""}
+_alerts_body_cache = {"entry": None}   # (version, json body, gzip body)
+_alerts_body_lock = threading.Lock()
+
+# Raw-event keys that repeat a top-level field verbatim (Rustinel stores ECS
+# fields flat). They made up ~30 MB of the ~79 MB list.
+_RAW_DUPLICATES = {
+    "process.command_line": "command_line",
+    "process.parent.command_line": "parent_command_line",
+    "rule.description": "rule_description",
+}
+
+
+def _slim_alert(alert):
+    """List form of an alert: raw without fields the alert already carries.
+
+    The full event stays available from /api/alerts/<id>; the detail view
+    loads it on demand.
+    """
+    raw = alert.get("raw")
+    if not isinstance(raw, dict) or not raw:
+        return alert
+    slim_raw = {}
+    trimmed = False
+    for key, value in raw.items():
+        dup_of = _RAW_DUPLICATES.get(key)
+        if dup_of and alert.get(dup_of) == value:
+            trimmed = True
+            continue
+        if key == "edr.match" and isinstance(value, dict) and set(value) - {"summary"}:
+            # The full Sigma match is only shown in the detail view.
+            slim_raw[key] = {"summary": value.get("summary")}
+            trimmed = True
+            continue
+        slim_raw[key] = value
+    if not trimmed:
+        return alert
+    out = dict(alert)
+    out["raw"] = slim_raw
+    out["raw_trimmed"] = True
+    return out
+
+
+@app.route("/api/alerts/<path:alert_id>")
+def api_alert_detail(alert_id):
+    """One alert with its complete raw event."""
+    with store_lock:
+        alerts = events_store.get("alerts", [])
+    for a in alerts:
+        if str(a.get("id")) == alert_id:
+            return jsonify(a)
+    return jsonify({"error": "Alert not found"}), 404
 
 
 @app.route("/api/alerts")
@@ -1625,10 +2105,11 @@ def api_alerts():
     """Get all Rustinel/Fibratus alerts.
 
     The unfiltered list is polled every 5 s per open tab and is tens of MB,
-    so it carries an ETag: an unchanged list is answered with 304 and no
-    body, and the serialized form is reused across clients.
+    so it carries an ETag (unchanged list -> 304, no body), drops raw fields
+    that duplicate the alert's own fields, and is served gzip-compressed;
+    both bodies are built once per list version and shared by all clients.
     """
-    filtered = any(request.args.get(k) for k in ("severity", "engine", "pid", "since", "detonated"))
+    filtered = any(request.args.get(k) for k in ("severity", "engine", "pid", "since", "detonated", "limit"))
     if not filtered:
         with store_lock:
             alerts = events_store.get("alerts", [])
@@ -1637,10 +2118,21 @@ def api_alerts():
         if request.headers.get("If-None-Match") == etag:
             resp = app.response_class(status=304)
         else:
-            if _alerts_body_cache["version"] != version:
-                _alerts_body_cache["body"] = json.dumps(alerts).encode("utf-8")
-                _alerts_body_cache["version"] = version
-            resp = app.response_class(_alerts_body_cache["body"], mimetype="application/json")
+            with _alerts_body_lock:
+                # Version and bodies are swapped together, so a client can
+                # never receive one list's body under another list's ETag.
+                cached = _alerts_body_cache.get("entry")
+                if not cached or cached[0] != version:
+                    import gzip
+                    body = json.dumps([_slim_alert(a) for a in alerts]).encode("utf-8")
+                    cached = (version, body, gzip.compress(body, compresslevel=5))
+                    _alerts_body_cache["entry"] = cached
+            if "gzip" in request.headers.get("Accept-Encoding", "").lower():
+                resp = app.response_class(cached[2], mimetype="application/json")
+                resp.headers["Content-Encoding"] = "gzip"
+            else:
+                resp = app.response_class(cached[1], mimetype="application/json")
+            resp.headers["Vary"] = "Accept-Encoding"
         resp.headers["ETag"] = etag
         resp.headers["Cache-Control"] = "no-cache"
         return resp
@@ -1663,31 +2155,19 @@ def api_alerts():
     if pid:
         alerts = [a for a in alerts if a.get("pid") == pid]
     if since:
-        # Normalize 'since' for comparison: strip timezone suffix for safe string compare
-        # Both browser (UTC with Z) and Rustinel (possibly local without Z) timestamps
-        # are ISO-ish; we compare by converting both to datetime
-        from datetime import datetime, timezone
-        try:
-            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
-        except (ValueError, TypeError):
-            since_dt = None
+        # Compare as instants: alert timestamps mix "Z", "+02:00" and naive
+        # local times; comparing those as datetimes raised and fell back to a
+        # string comparison that was wrong across time zones.
+        since_t = _to_epoch(since)
+        if since_t is None:
+            return jsonify({"error": "since must be an ISO-8601 timestamp"}), 400
+        alerts = [a for a in alerts if (_to_epoch(a.get("timestamp")) or 0) >= since_t]
 
-        if since_dt:
-            filtered = []
-            for a in alerts:
-                ts = a.get("timestamp", "")
-                if not ts:
-                    continue
-                try:
-                    # If timestamp has no tz info, assume local time
-                    a_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                    if a_dt >= since_dt:
-                        filtered.append(a)
-                except (ValueError, TypeError):
-                    # Fallback: string comparison
-                    if ts >= since:
-                        filtered.append(a)
-            alerts = filtered
+    limit = request.args.get("limit", type=int)
+    if limit:
+        # Newest first, so a limit keeps the recent end of the list.
+        alerts = sorted(alerts, key=lambda a: _to_epoch(a.get("timestamp")) or 0, reverse=True)[:limit]
+        return jsonify([_slim_alert(a) for a in alerts])
 
     return jsonify(alerts)
 
@@ -1753,11 +2233,9 @@ def api_processes():
             parents_to_add = set()
             for pid in list(selected_pids):
                 proc = all_processes.get(pid, {})
-                ppid = proc.get("parent_pid")
-                if ppid is not None:
-                    ppid_str = str(ppid)
-                    if ppid_str in all_processes and ppid_str not in selected_pids:
-                        parents_to_add.add(ppid_str)
+                pkey = proc.get("parent_key")
+                if pkey and pkey in all_processes and pkey not in selected_pids:
+                    parents_to_add.add(pkey)
             selected_pids.update(parents_to_add)
 
         result = {pid: proc for pid, proc in all_processes.items() if pid in selected_pids}
@@ -1822,8 +2300,9 @@ def _build_full_process_map():
         # Events with an "error" key mean the query failed — ignore them.
         sysmon_events = [e for e in sysmon_events if isinstance(e, dict) and "error" not in e]
 
-        # Build process nodes from EID 1 (ProcessCreate). Events arrive
-        # newest-first; keep the newest identity per PID (handles PID reuse).
+        # One node per ProcessCreate (EID 1): each is a distinct process,
+        # even when Windows handed out the same PID again later.
+        groups = {}
         for ev in sysmon_events:
             if ev.get("event_id") != 1:
                 continue
@@ -1832,20 +2311,19 @@ def _build_full_process_map():
                 continue
             pid = str(pid)
             ts = ev.get("timestamp", "")
-            existing = proc_map.get(pid)
-            if existing and (existing.get("first_seen") or "") >= ts:
-                continue
             ppid = ev.get("parent_pid")
-            proc_map[pid] = {
+            groups.setdefault(pid, []).append({
                 "pid": pid,
                 "name": _basename(ev.get("image", "")) or "unknown",
                 "image": ev.get("image", ""),
                 "command_line": ev.get("commandline", ""),
                 "user": ev.get("user", ""),
                 "parent_pid": str(ppid) if ppid not in (None, "") else None,
-                "parent_name": _basename(ev.get("parent_image", "")),
+                # Sysmon writes "-" when it does not know the parent.
+                "parent_name": "" if (ev.get("parent_image") or "-") == "-" else _basename(ev["parent_image"]),
                 "integrity": ev.get("integrity", ""),
                 "hashes": ev.get("hashes", ""),
+                "started": ts,
                 "first_seen": ts,
                 "last_seen": ts,
                 "exit_time": None,
@@ -1857,15 +2335,34 @@ def _build_full_process_map():
                 "detonated": False,
                 "detonation_sources": [],
                 "source": "sysmon",
-            }
+            })
+        for lst in groups.values():
+            lst.sort(key=lambda n: _to_epoch(n["started"]) or 0)
+        proc_map = _instance_keys(groups)
+        # Process exits (EID 5) close the instance that was running.
+        exits = _PidInstances(proc_map)
+        for ev in sysmon_events:
+            if ev.get("event_id") == 5 and ev.get("pid") not in (None, ""):
+                k = exits.resolve(ev["pid"], ev.get("timestamp"))
+                if k and not proc_map[k].get("exit_time"):
+                    proc_map[k]["exit_time"] = ev.get("timestamp")
 
     # Merge alert-derived enrichment (threats, severity, detonation, activity).
     with store_lock:
         alert_procs = dict(events_store.get("processes", {}))
 
-    for pid, aproc in alert_procs.items():
-        pid = str(pid)
-        node = proc_map.get(pid)
+    sysmon_instances = _PidInstances(proc_map)
+    for akey, aproc in alert_procs.items():
+        pid = str(aproc.get("pid", akey))
+        # The Sysmon instance alive when this alert instance was first seen,
+        # if it runs the same image - otherwise it is a different process.
+        node = None
+        skey = sysmon_instances.resolve(pid, aproc.get("first_seen"))
+        if skey and proc_map[skey].get("source") == "sysmon":
+            a_img = (aproc.get("image") or "").lower()
+            s_img = (proc_map[skey].get("image") or "").lower()
+            if not a_img or not s_img or a_img == s_img:
+                node = proc_map[skey]
         if node is None:
             # Alert-only process (no Sysmon ProcessCreate seen) — include it.
             node = {
@@ -1890,7 +2387,11 @@ def _build_full_process_map():
                 "detonation_sources": [],
                 "source": "alert",
             }
-            proc_map[pid] = node
+            key = akey if akey not in proc_map else f"{pid}@{int(_to_epoch(aproc.get('first_seen')) or 0)}"
+            while key in proc_map:
+                key += "+"
+            node["key"] = key
+            proc_map[key] = node
         else:
             node["source"] = "sysmon+alert"
             # Prefer alert parent linkage if Sysmon lacked one.
@@ -1920,13 +2421,44 @@ def _build_full_process_map():
         if aproc.get("last_seen") and aproc["last_seen"] > (node.get("last_seen") or ""):
             node["last_seen"] = aproc["last_seen"]
 
-    # Rebuild children links across the merged map.
+    # Rebuild children links across the merged map, instance to instance.
+    instances = _PidInstances(proc_map)
     for node in proc_map.values():
         node["children"] = []
-    for pid, node in proc_map.items():
+        node["parent_key"] = None
+    stubs = {}
+    for key, node in list(proc_map.items()):
         ppid = node.get("parent_pid")
-        if ppid and ppid != pid and ppid in proc_map:
-            proc_map[ppid]["children"].append(pid)
+        if not ppid or str(ppid) == str(node.get("pid")):
+            continue
+        pkey = instances.resolve(ppid, node.get("started") or node.get("first_seen"),
+                                 image=node.get("parent_name"))
+        if pkey and pkey != key:
+            node["parent_key"] = pkey
+            proc_map[pkey]["children"].append(key)
+        elif node.get("parent_name"):
+            # Parent started before the event window (e.g. the agent that
+            # launched the sample): a stub with the name Sysmon reported.
+            sid = f"{ppid}~{node['parent_name'].lower()}"
+            stub_key = stubs.get(sid)
+            if stub_key is None:
+                t = _to_epoch(node.get("started") or node.get("first_seen"))
+                stub_key = str(ppid) if str(ppid) not in proc_map else f"{ppid}@{int(t) if t is not None else 0}"
+                while stub_key in proc_map:
+                    stub_key += "+"
+                stubs[sid] = stub_key
+                proc_map[stub_key] = {
+                    "pid": str(ppid), "key": stub_key, "name": node["parent_name"], "image": "",
+                    "command_line": "", "user": "", "parent_pid": None, "parent_key": None,
+                    "parent_name": "", "integrity": "", "hashes": "", "first_seen": "",
+                    "last_seen": "", "exit_time": None, "children": [],
+                    "activity": {"file": 0, "network": 0, "dns": 0, "registry": 0,
+                                 "injection": 0, "threats": 0},
+                    "alerts_count": 0, "severity": "unknown", "detonated": False,
+                    "detonation_sources": [], "source": "sysmon-parent", "is_stub": True,
+                }
+            node["parent_key"] = stub_key
+            proc_map[stub_key]["children"].append(key)
 
     return proc_map, sysmon_events
 
@@ -1955,7 +2487,7 @@ def api_process_graph():
     # If Sysmon is offline locally, proxy to the VM (same codebase there).
     if not _is_sysmon_running() and VM_WEBUI_URL:
         try:
-            r = requests.get(f"{VM_WEBUI_URL}/api/process-graph",
+            r = _vm_get("/api/process-graph",
                              params=request.args, timeout=15)
             if r.status_code == 200:
                 return jsonify(r.json())
@@ -1963,6 +2495,15 @@ def api_process_graph():
             pass
 
     proc_map, sysmon_events = _build_full_process_map()
+
+    # "pid" may be an instance key ("1234@1789...") or a plain PID. With `at`
+    # (e.g. an alert's timestamp) a plain PID resolves to the process that
+    # had it at that moment rather than its newest holder.
+    at = request.args.get("at")
+    if at or root_pid not in proc_map:
+        resolved = _PidInstances(proc_map).resolve_key(root_pid, at)
+        if resolved:
+            root_pid = resolved
 
     if root_pid not in proc_map:
         return jsonify({
@@ -1974,9 +2515,9 @@ def api_process_graph():
 
     selected = {}  # pid -> role metadata
 
-    # Ancestors: walk parent_pid up.
+    # Ancestors: walk the parent instances up.
     ancestors = []
-    cur = proc_map[root_pid].get("parent_pid")
+    cur = proc_map[root_pid].get("parent_key")
     seen_anc = {root_pid}
     level = 0
     while cur and cur in proc_map and cur not in seen_anc:
@@ -1985,7 +2526,7 @@ def api_process_graph():
         ancestors.append(cur)
         seen_anc.add(cur)
         level += 1
-        cur = proc_map[cur].get("parent_pid")
+        cur = proc_map[cur].get("parent_key")
     for i, apid in enumerate(ancestors):
         selected[apid] = {"is_root": False, "is_ancestor": True, "depth": -(i + 1)}
 
@@ -2025,35 +2566,42 @@ def api_process_graph():
     for node in processes.values():
         node["scans"] = _scans_for_node(node, scan_by_sha)
 
-    # Scope activity events to the selected process set.
+    # Scope activity events to the selected process instances. Events carry a
+    # PID and a time; the instance alive at that time owns the event, so a
+    # later process that reused the PID does not inherit them.
+    instances = _PidInstances(proc_map)
     network, dns, files, registry, injections = [], [], [], [], []
     for ev in sysmon_events:
         eid = ev.get("event_id")
+        if eid not in (3, 8, 11, 12, 13, 14, 22):
+            continue
+        ts = ev.get("timestamp", "")
+        key = instances.resolve(ev.get("pid"), ts) if ev.get("pid") is not None else None
         pid = str(ev.get("pid")) if ev.get("pid") is not None else ""
-        if eid == 3 and pid in selected_pids:
-            network.append({"pid": pid, "dst_ip": ev.get("dst_ip", ""),
+        if eid == 3 and key in selected_pids:
+            network.append({"pid": pid, "key": key, "dst_ip": ev.get("dst_ip", ""),
                             "dst_port": ev.get("dst_port", ""),
                             "dst_hostname": ev.get("dst_hostname", ""),
                             "protocol": ev.get("protocol", "tcp"),
-                            "timestamp": ev.get("timestamp", "")})
-        elif eid == 22 and pid in selected_pids:
-            dns.append({"pid": pid, "query": ev.get("query", ""),
-                        "result": ev.get("result", ""),
-                        "timestamp": ev.get("timestamp", "")})
-        elif eid == 11 and pid in selected_pids:
-            files.append({"pid": pid, "target": ev.get("target", ""),
-                          "timestamp": ev.get("timestamp", "")})
-        elif eid in (12, 13, 14) and pid in selected_pids:
-            registry.append({"pid": pid, "target": ev.get("target", ""),
-                             "details": ev.get("details", ""),
-                             "timestamp": ev.get("timestamp", "")})
+                            "timestamp": ts})
+        elif eid == 22 and key in selected_pids:
+            dns.append({"pid": pid, "key": key, "query": ev.get("query", ""),
+                        "result": ev.get("result", ""), "timestamp": ts})
+        elif eid == 11 and key in selected_pids:
+            files.append({"pid": pid, "key": key, "target": ev.get("target", ""), "timestamp": ts})
+        elif eid in (12, 13, 14) and key in selected_pids:
+            registry.append({"pid": pid, "key": key, "target": ev.get("target", ""),
+                             "details": ev.get("details", ""), "timestamp": ts})
         elif eid == 8:
             spid = str(ev.get("source_pid")) if ev.get("source_pid") is not None else pid
             tpid = str(ev.get("target_pid")) if ev.get("target_pid") is not None else ""
-            if spid in selected_pids and tpid in selected_pids:
+            skey = instances.resolve(spid, ts)
+            tkey = instances.resolve(tpid, ts)
+            if skey in selected_pids and tkey in selected_pids:
                 injections.append({"source_pid": spid, "target_pid": tpid,
+                                   "source_key": skey, "target_key": tkey,
                                    "target_image": ev.get("target_image", ""),
-                                   "timestamp": ev.get("timestamp", "")})
+                                   "timestamp": ts})
 
     return jsonify({
         "root_pid": root_pid,
@@ -2082,7 +2630,8 @@ def api_process_graph_roots():
         if threats <= 0 and not detonated:
             continue
         candidates.append({
-            "pid": str(pid),
+            "pid": str(pid),                  # instance key, used to focus
+            "os_pid": str(proc.get("pid", pid)),
             "name": proc.get("name", "unknown"),
             "image": proc.get("image", ""),
             "threats": threats,
@@ -2106,7 +2655,7 @@ def api_graph_samples():
     visible with its EMBER/capa/ThreatCheck verdicts."""
     if not _is_sysmon_running() and VM_WEBUI_URL:
         try:
-            r = requests.get(f"{VM_WEBUI_URL}/api/graph/samples", timeout=15)
+            r = _vm_get("/api/graph/samples", timeout=15)
             if r.status_code == 200:
                 return jsonify(r.json())
         except Exception:
@@ -2122,6 +2671,8 @@ def api_sysmon():
     max_events = request.args.get("max", 100, type=int)
     since = request.args.get("since")
     pid = request.args.get("pid", type=int)
+    parent_pid = request.args.get("parent_pid", type=int)
+    until = request.args.get("until")
     event_id_raw = request.args.get("event_id", "")
     # Support comma-separated event IDs (e.g. "1,3,11")
     event_ids = [int(x) for x in event_id_raw.split(",") if x.strip().isdigit()] if event_id_raw else []
@@ -2130,15 +2681,18 @@ def api_sysmon():
     # If Sysmon not available locally, proxy from VM
     if not _is_sysmon_running():
         try:
-            params = {k: v for k, v in {"max": max_events, "since": since, "pid": pid, "event_id": event_id_raw or None}.items() if v is not None}
-            r = requests.get(f"{VM_WEBUI_URL}/api/sysmon", params=params, timeout=10)
+            params = {k: v for k, v in {"max": max_events, "since": since, "pid": pid,
+                                        "parent_pid": parent_pid, "until": until,
+                                        "event_id": event_id_raw or None}.items() if v is not None}
+            r = _vm_get("/api/sysmon", params=params, timeout=10)
             if r.status_code == 200:
                 return jsonify(r.json())
         except Exception:
             pass
         return jsonify([{"error": f"Sysmon not available locally and VM ({VM_IP}) unreachable."}])
 
-    events = _read_sysmon_events(max_events=max_events, since=since, pid=pid, event_id=event_id, event_ids=event_ids)
+    events = _read_sysmon_events(max_events=max_events, since=since, pid=pid, event_id=event_id,
+                                 event_ids=event_ids, parent_pid=parent_pid, until=until)
     return jsonify(events)
 
 
@@ -2215,28 +2769,30 @@ def api_etw_channels():
     if not probe:
         return jsonify(ETW_CHANNELS)
 
-    ps_parts = []
-    for key, ch in ETW_CHANNELS.items():
-        log_name = ch["name"].replace("'", "''")
-        ps_parts.append(
-            f"try {{ $n = (Get-WinEvent -FilterHashtable @{{LogName='{log_name}'}} -MaxEvents 1 -EA Stop).Count; "
-            f"'{key}=1' }} catch {{ '{key}=0' }}"
-        )
-    ps_cmd = "; ".join(ps_parts)
+    # A channel counts as available when it exists and holds at least one
+    # record - the same meaning as the former PowerShell probe, but answered
+    # by one fast `wevtutil gli` per channel, run in parallel.
+    from concurrent.futures import ThreadPoolExecutor
 
-    try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_cmd],
-            capture_output=True, text=True, timeout=20
-        )
-        status_map = {}
-        for line in (result.stdout or "").strip().splitlines():
-            line = line.strip()
-            if "=" in line:
-                k, v = line.split("=", 1)
-                status_map[k] = v == "1"
-    except Exception:
-        status_map = {}
+    def _probe(log_name):
+        try:
+            out = _run_cmd(["wevtutil", "gli", log_name], timeout=10)
+        except Exception:
+            return None
+        if out.returncode != 0:
+            return False
+        for line in out.stdout.splitlines():
+            if line.strip().lower().startswith("numberoflogrecords:"):
+                try:
+                    return int(line.split(":", 1)[1].strip()) > 0
+                except ValueError:
+                    return None
+        # Disabled channels that never wrote a log file report no record count.
+        return False
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {key: pool.submit(_probe, ch["name"]) for key, ch in ETW_CHANNELS.items()}
+        status_map = {key: f.result() for key, f in futures.items()}
 
     enriched = {}
     for key, ch in ETW_CHANNELS.items():
@@ -2246,86 +2802,127 @@ def api_etw_channels():
 
 @app.route("/api/etw/events")
 def api_etw_events():
-    """Query events from a specific ETW channel / Windows Event Log."""
-    channel_key = request.args.get("channel", "etw-ti")
+    """Query events from a specific ETW channel / Windows Event Log.
+
+    Uses `wevtutil /f:RenderedXml`, which includes the localized message and
+    level, instead of a PowerShell pipeline (several seconds per call on the
+    VM, started every 5 s while the ETW tab was open).
+    """
+    import xml.etree.ElementTree as ET
+    from datetime import datetime as _dt, timezone as _tz
+
+    channel_key = request.args.get("channel", "security")
     max_events = request.args.get("max", 50, type=int)
     since = request.args.get("since")
     keyword_filter = request.args.get("filter", "")
+    event_id_filter = request.args.get("event_id", type=int)
 
     channel_info = ETW_CHANNELS.get(channel_key)
     if not channel_info:
         return jsonify({"error": f"Unknown channel: {channel_key}"}), 400
 
     log_name = channel_info["name"]
-    max_events = min(max_events, 500)
+    max_events = max(1, min(max_events or 50, 500))
 
-    time_filter = ""
+    # Request values only enter the query as validated integers/timestamps.
+    conditions = []
+    if event_id_filter:
+        conditions.append(f"EventID={int(event_id_filter)}")
     if since:
-        time_filter = f";StartTime='{since}'"
+        try:
+            since_dt = _dt.fromisoformat(since.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return jsonify({"error": "since must be an ISO-8601 timestamp"}), 400
+        if since_dt.tzinfo is None:
+            since_dt = since_dt.astimezone()
+        conditions.append("TimeCreated[@SystemTime>='"
+                          + since_dt.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z") + "']")
+    query = "*[System[" + " and ".join(conditions) + "]]" if conditions else None
 
-    ps_cmd = (
-        f"try {{ Get-WinEvent -FilterHashtable @{{LogName='{log_name}'{time_filter}}} "
-        f"-MaxEvents {max_events} -ErrorAction Stop | "
-        "ForEach-Object {"
-        "  $x = [xml]$_.ToXml();"
-        "  $d = @{};"
-        "  if ($x.Event.EventData) {"
-        "    $x.Event.EventData.Data | ForEach-Object {"
-        "      if ($_.Name) { $d[$_.Name] = $_.'#text' }"
-        "      else { $d['_Message'] = $_.'#text' }"
-        "    }"
-        "  };"
-        "  if ($x.Event.System) {"
-        "    $d['_Provider'] = $x.Event.System.Provider.Name;"
-        "    $d['_EventId'] = [int]$x.Event.System.EventID.'#text';"
-        "    if (-not $d['_EventId']) { $d['_EventId'] = [int]$x.Event.System.EventID }"
-        "  };"
-        "  $d['_TimeCreated'] = $_.TimeCreated.ToString('o');"
-        "  $d['_Level'] = $_.LevelDisplayName;"
-        "  $d['_Message_Short'] = ($_.Message -split \"`n\")[0];"
-        "  [PSCustomObject]$d"
-        "} | ConvertTo-Json -Depth 3 -Compress"
-        "} catch {"
-        "  @{error=$_.Exception.Message} | ConvertTo-Json -Compress"
-        "}"
-    )
-
+    args = ["wevtutil", "qe", log_name, "/f:RenderedXml", "/uni:true",
+            f"/c:{max_events}", "/rd:true"]
+    if query:
+        args.append(f"/q:{query}")
     try:
-        result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_cmd],
-            capture_output=True, text=True, timeout=15
-        )
-        output = (result.stdout or "").strip()
-        if not output:
-            return jsonify({"events": [], "channel": channel_info, "note": "No events found or channel not available"})
-
-        data = json.loads(output)
-        if isinstance(data, dict):
-            if "error" in data:
-                return jsonify({"events": [], "channel": channel_info, "error": data["error"]})
-            data = [data]
-
-        if keyword_filter:
-            kw = keyword_filter.lower()
-            data = [e for e in data if kw in json.dumps(e).lower()]
-
-        events = []
-        for item in data:
-            events.append({
-                "timestamp": item.get("_TimeCreated", ""),
-                "event_id": item.get("_EventId", 0),
-                "level": item.get("_Level", ""),
-                "provider": item.get("_Provider", ""),
-                "message": item.get("_Message_Short", ""),
-                "data": {k: v for k, v in item.items() if not k.startswith("_")},
-            })
-
-        return jsonify({"events": events, "channel": channel_info, "count": len(events)})
-
+        proc = subprocess.run(args, capture_output=True, timeout=20,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except subprocess.TimeoutExpired:
-        return jsonify({"events": [], "channel": channel_info, "error": "Query timed out (15s)"})
-    except Exception as e:
+        return jsonify({"events": [], "channel": channel_info, "error": "Query timed out (20s)"})
+    except (FileNotFoundError, OSError) as e:
         return jsonify({"events": [], "channel": channel_info, "error": str(e)})
+
+    raw = (proc.stdout or b"")
+    if raw[:2] == b"\xff\xfe":
+        raw = raw[2:]
+    xml_text = raw.decode("utf-16-le", errors="replace")
+    if proc.returncode != 0 and "<Event" not in xml_text:
+        err = _decode_console(proc.stderr).strip()
+        return jsonify({"events": [], "channel": channel_info,
+                        "error": err or f"wevtutil exited with {proc.returncode}"})
+
+    ns = "{http://schemas.microsoft.com/win/2004/08/events/event}"
+    events = []
+    for chunk in xml_text.split("</Event>"):
+        begin = chunk.find("<Event")
+        if begin < 0:
+            continue
+        try:
+            ev = ET.fromstring(chunk[begin:] + "</Event>")
+        except ET.ParseError:
+            continue
+        data = {}
+        for d in ev.iter(f"{ns}Data"):
+            name = d.get("Name")
+            if name:
+                data[name] = d.text or ""
+            elif d.text:
+                data["_Message"] = d.text      # unnamed EventData, as before
+        provider = ev.find(f"{ns}System/{ns}Provider")
+        eid = ev.find(f"{ns}System/{ns}EventID")
+        tc = ev.find(f"{ns}System/{ns}TimeCreated")
+        message = ev.findtext(f"{ns}RenderingInfo/{ns}Message") or data.get("_Message", "")
+        level = ev.findtext(f"{ns}RenderingInfo/{ns}Level") or ""
+        ts = tc.get("SystemTime", "") if tc is not None else ""
+        try:
+            base, _, frac = ts.rstrip("Z").partition(".")
+            ts = _dt.fromisoformat(base + "." + (frac + "000000")[:6] + "+00:00").astimezone().isoformat()
+        except ValueError:
+            pass
+        try:
+            event_id = int(eid.text) if eid is not None and eid.text else 0
+        except ValueError:
+            event_id = 0
+        item = {
+            "timestamp": ts,
+            "event_id": event_id,
+            "level": level,
+            "provider": provider.get("Name", "") if provider is not None else "",
+            "message": message.strip().split("\n")[0].strip(),
+            "data": {k: v for k, v in data.items() if not k.startswith("_")},
+        }
+        if keyword_filter and keyword_filter.lower() not in (
+                message + " " + json.dumps(item["data"], ensure_ascii=False)).lower():
+            continue
+        events.append(item)
+
+    if not events:
+        return jsonify({"events": [], "channel": channel_info,
+                        "note": "No events found or channel not available"})
+    return jsonify({"events": events, "channel": channel_info, "count": len(events)})
+
+
+_sysmon_stats_cache = {"at": 0.0, "data": None}
+_SYSMON_STATS_TTL = 30
+
+
+def _sysmon_recent_ids(count):
+    """Event IDs of the newest `count` Sysmon events, or None on timeout."""
+    try:
+        raw, _ = _wevtutil_query("Microsoft-Windows-Sysmon/Operational", count=count, timeout=20)
+    except subprocess.TimeoutExpired:
+        return None
+    import re as _re
+    return _re.findall(r"<EventID>(\d+)</EventID>", raw)
 
 
 @app.route("/api/sysmon/stats")
@@ -2336,7 +2933,7 @@ def api_sysmon_stats():
         if not _is_sysmon_running():
             # Try fetching from VM instead
             try:
-                r = requests.get(f"{VM_WEBUI_URL}/api/sysmon/stats", timeout=5)
+                r = _vm_get("/api/sysmon/stats", timeout=5)
                 if r.status_code == 200:
                     data = r.json()
                     if data.get("online"):
@@ -2350,71 +2947,53 @@ def api_sysmon_stats():
                 "diagnostic": f"Sysmon service is not running locally. VM ({VM_IP}) also unreachable.",
             })
 
-        # Check if the event log channel exists and get record count
-        diag_cmd = (
-            "$log = Get-WinEvent -ListLog 'Microsoft-Windows-Sysmon/Operational' -ErrorAction SilentlyContinue; "
-            "if ($log) { @{Exists=$true; RecordCount=$log.RecordCount; Enabled=$log.IsEnabled; LogMode=$log.LogMode} | ConvertTo-Json -Compress } "
-            "else { @{Exists=$false} | ConvertTo-Json -Compress }"
-        )
-        diag_result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", diag_cmd],
-            capture_output=True, text=True, timeout=15
-        )
-        diag = {}
-        if diag_result.stdout.strip():
-            diag = json.loads(diag_result.stdout.strip())
-
-        if not diag.get("Exists"):
+        # Log metadata via wevtutil (one native call instead of PowerShell).
+        gli = _run_cmd(["wevtutil", "gli", "Microsoft-Windows-Sysmon/Operational"], timeout=10)
+        if gli.returncode != 0:
             return jsonify({
                 "online": False,
                 "stats": [],
                 "diagnostic": "Event log 'Microsoft-Windows-Sysmon/Operational' does not exist. Sysmon may not be properly installed.",
             })
-
-        if not diag.get("Enabled"):
+        record_count = 0
+        for line in gli.stdout.splitlines():
+            if line.strip().lower().startswith("numberoflogrecords:"):
+                try:
+                    record_count = int(line.split(":", 1)[1].strip())
+                except ValueError:
+                    pass
+        enabled_line = _run_cmd(["wevtutil", "gl", "Microsoft-Windows-Sysmon/Operational"], timeout=10).stdout
+        if "enabled: false" in enabled_line.lower():
             return jsonify({
                 "online": False,
                 "stats": [],
                 "diagnostic": "Sysmon event log exists but is disabled.",
             })
 
-        record_count = diag.get("RecordCount", 0)
         if record_count == 0:
             return jsonify({
                 "online": True,
                 "stats": [],
                 "diagnostic": "Sysmon event log is empty (0 records). Service is running but no events have been logged yet. Check Sysmon config.",
-                "record_count": 0,
+                "record_count": record_count,
             })
 
-        # Log exists with records — query stats (retry up to 3 times on timeout)
-        stats_cmd = [
-            "powershell", "-NoProfile", "-Command",
-            "Get-WinEvent -LogName 'Microsoft-Windows-Sysmon/Operational' -MaxEvents 500 -ErrorAction SilentlyContinue | "
-            "Group-Object Id | Select-Object Name, Count | ConvertTo-Json"
-        ]
-        result = None
-        for attempt in range(3):
-            try:
-                result = subprocess.run(
-                    stats_cmd, capture_output=True, text=True, timeout=15
-                )
-                if result.stdout.strip():
-                    break
-            except subprocess.TimeoutExpired:
-                if attempt < 2:
-                    continue  # retry
-                return jsonify({
-                    "online": True,
-                    "stats": [],
-                    "diagnostic": f"Event log query timed out after 3 attempts. Log has {record_count} records.",
-                    "record_count": record_count,
-                })
+        cached = _sysmon_stats_cache.get("data")
+        if cached and time.time() - _sysmon_stats_cache["at"] < _SYSMON_STATS_TTL:
+            return jsonify(dict(cached, record_count=record_count))
 
-        if result and result.stdout.strip():
-            data = json.loads(result.stdout.strip())
-            if isinstance(data, dict):
-                data = [data]
+        # Distribution of the latest 500 events by ID.
+        events = _sysmon_recent_ids(500)
+        if events is None:
+            return jsonify({
+                "online": True,
+                "stats": [],
+                "diagnostic": f"Event log query timed out. Log has {record_count} records.",
+                "record_count": record_count,
+            })
+        if events:
+            from collections import Counter
+            data = [{"Name": k, "Count": v} for k, v in Counter(events).items()]
             # Map event IDs to names
             event_names = {
                 "1": "ProcessCreate", "2": "FileCreateTime", "3": "NetworkConnect",
@@ -2433,7 +3012,9 @@ def api_sysmon_stats():
                     "name": event_names.get(eid, f"Event {eid}"),
                     "count": item.get("Count", 0),
                 })
-            return jsonify({"online": True, "stats": stats, "record_count": record_count})
+            payload = {"online": True, "stats": stats}
+            _sysmon_stats_cache.update(at=time.time(), data=payload)
+            return jsonify(dict(payload, record_count=record_count))
 
         # Command returned empty despite records existing
         return jsonify({
@@ -2446,127 +3027,165 @@ def api_sysmon_stats():
         return jsonify({"online": False, "error": str(e), "stats": []})
 
 
-def _read_sysmon_events(max_events=100, since=None, pid=None, event_id=None, event_ids=None):
-    """Read Sysmon events from Windows Event Log with full XML field extraction."""
-    # Build PowerShell script that parses XML and returns structured JSON
-    filter_parts = "LogName='Microsoft-Windows-Sysmon/Operational'"
-    if event_id:
-        filter_parts += f";Id={event_id}"
+def _sysmon_xpath(event_ids=None, since=None, pid=None, parent_pid=None, until=None):
+    """XPath for wevtutil: lets the event log do the filtering.
 
-    ps_cmd = (
-        f"Get-WinEvent -FilterHashtable @{{{filter_parts}}} "
-        f"-MaxEvents {max_events} -ErrorAction SilentlyContinue | "
-        "ForEach-Object {"
-        "  $xml = [xml]$_.ToXml();"
-        "  $data = @{};"
-        "  $xml.Event.EventData.Data | ForEach-Object {"
-        "    $data[$_.Name] = $_.'#text'"
-        "  };"
-        "  $data['_EventId'] = $_.Id;"
-        "  $data['_TimeCreated'] = $_.TimeCreated.ToString('o');"
-        "  [PSCustomObject]$data"
-        "} | ConvertTo-Json -Depth 3 -Compress"
-    )
-
-    for attempt in range(3):
+    Filtering in the log matters for correctness, not only speed: with
+    -MaxEvents applied first and the ID/PID filter afterwards, busy event types
+    (image loads, process access) pushed the requested ones out of the window.
+    """
+    system = []
+    ids = [int(i) for i in (event_ids or []) if str(i).isdigit()]
+    if ids:
+        system.append("(" + " or ".join(f"EventID={i}" for i in ids) + ")")
+    if since:
+        from datetime import datetime as _dt, timezone as _tz
         try:
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_cmd],
-                capture_output=True, text=True, timeout=20
-            )
-            if result.stdout.strip():
-                break
-        except subprocess.TimeoutExpired:
-            if attempt < 2:
-                continue
-            return [{"error": "Sysmon event query timed out after 3 attempts"}]
-        except Exception as e:
-            return [{"error": str(e)}]
+            ts = _dt.fromisoformat(str(since).strip().replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.astimezone()          # naive input: local time
+            system.append("TimeCreated[@SystemTime>='"
+                          + ts.astimezone(_tz.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z") + "']")
+        except ValueError:
+            pass
+    if until:
+        t = _to_epoch(until)
+        if t is not None:
+            from datetime import datetime as _dt2, timezone as _tz2
+            system.append("TimeCreated[@SystemTime<'"
+                          + _dt2.fromtimestamp(t, _tz2.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z") + "']")
+    query = "*[System[" + " and ".join(system) + "]]" if system else "*"
+    for field, value in (("ProcessId", pid), ("ParentProcessId", parent_pid)):
+        if value:
+            clause = f"EventData[Data[@Name='{field}']='{int(value)}']"
+            query = (query[:-1] + f" and {clause}]") if query != "*" else f"*[{clause}]"
+    return query
 
+
+def _read_sysmon_events(max_events=100, since=None, pid=None, event_id=None, event_ids=None,
+                        parent_pid=None, until=None):
+    """Read Sysmon events from the Windows Event Log with full field extraction.
+
+    Uses wevtutil with an XPath filter and parses the XML here. The former
+    PowerShell pipeline converted every event with [xml]$_.ToXml(), which took
+    8-17 s on the ARM64 VM for a few thousand events.
+    """
+    import xml.etree.ElementTree as ET
+    max_events = max(1, min(int(max_events or 100), 5000))
+    ids = list(event_ids or ([event_id] if event_id else []))
+    query = _sysmon_xpath(ids, since=since, pid=pid, parent_pid=parent_pid, until=until)
     try:
-        if result and result.stdout.strip():
-            data = json.loads(result.stdout.strip())
-            if isinstance(data, dict):
-                data = [data]
-
-            # Filter by multiple Event IDs if requested (when more than one)
-            if event_ids and len(event_ids) > 1:
-                data = [e for e in data if e.get("_EventId", 0) in event_ids]
-
-            # Filter by PID if requested
-            if pid:
-                data = [e for e in data if str(e.get("ProcessId", "")) == str(pid)]
-
-            # Structure events with key fields promoted
-            events = []
-            for item in data:
-                eid = item.get("_EventId", 0)
-                event = {
-                    "timestamp": item.get("_TimeCreated", ""),
-                    "event_id": eid,
-                    "pid": item.get("ProcessId"),
-                    "image": item.get("Image", ""),
-                    "user": item.get("User", ""),
-                }
-                # Add type-specific fields
-                if eid == 1:  # ProcessCreate
-                    event["type"] = "ProcessCreate"
-                    event["commandline"] = item.get("CommandLine", "")
-                    event["parent_image"] = item.get("ParentImage", "")
-                    event["parent_pid"] = item.get("ParentProcessId")
-                    event["hashes"] = item.get("Hashes", "")
-                    event["integrity"] = item.get("IntegrityLevel", "")
-                elif eid == 3:  # NetworkConnect
-                    event["type"] = "NetworkConnect"
-                    event["dst_ip"] = item.get("DestinationIp", "")
-                    event["dst_port"] = item.get("DestinationPort", "")
-                    event["dst_hostname"] = item.get("DestinationHostname", "")
-                    event["protocol"] = item.get("Protocol", "")
-                elif eid == 5:  # ProcessTerminate
-                    event["type"] = "ProcessTerminate"
-                elif eid == 11:  # FileCreate
-                    event["type"] = "FileCreate"
-                    event["target"] = item.get("TargetFilename", "")
-                elif eid == 12 or eid == 13 or eid == 14:  # Registry
-                    event["type"] = "RegistryEvent"
-                    event["target"] = item.get("TargetObject", "")
-                    event["details"] = item.get("Details", "")
-                elif eid == 22:  # DNSQuery
-                    event["type"] = "DNSQuery"
-                    event["query"] = item.get("QueryName", "")
-                    event["result"] = item.get("QueryResults", "")
-                elif eid == 7:  # ImageLoad
-                    event["type"] = "ImageLoad"
-                    event["loaded_image"] = item.get("ImageLoaded", "")
-                    event["hashes"] = item.get("Hashes", "")
-                elif eid == 8:  # CreateRemoteThread
-                    event["type"] = "CreateRemoteThread"
-                    event["source_pid"] = item.get("SourceProcessId")
-                    event["target_pid"] = item.get("TargetProcessId")
-                    event["target_image"] = item.get("TargetImage", "")
-                elif eid == 10:  # ProcessAccess
-                    event["type"] = "ProcessAccess"
-                    event["source_image"] = item.get("SourceImage", "")
-                    event["target_image"] = item.get("TargetImage", "")
-                    event["access"] = item.get("GrantedAccess", "")
-                else:
-                    event["type"] = f"Event_{eid}"
-                    # Include raw data for unknown types
-                    event["raw"] = {k: v for k, v in item.items()
-                                    if not k.startswith("_")}
-                events.append(event)
-            return events
-    except Exception as e:
+        raw, proc = _wevtutil_query("Microsoft-Windows-Sysmon/Operational", query,
+                                    count=max_events, timeout=30)
+    except subprocess.TimeoutExpired:
+        return [{"error": "Sysmon event query timed out"}]
+    except (FileNotFoundError, OSError) as e:
         return [{"error": str(e)}]
-    return []
+    if proc.returncode != 0 and not proc.stdout:
+        msg = _decode_console(proc.stderr).strip()
+        return [{"error": msg}] if msg else []
+
+    ns = "{http://schemas.microsoft.com/win/2004/08/events/event}"
+    data = []
+    for chunk in raw.split("</Event>"):
+        begin = chunk.find("<Event")
+        if begin < 0:
+            continue
+        try:
+            ev = ET.fromstring(chunk[begin:] + "</Event>")
+        except ET.ParseError:
+            continue
+        item = {d.get("Name"): (d.text or "") for d in ev.iter(f"{ns}Data") if d.get("Name")}
+        eid = ev.find(f"{ns}System/{ns}EventID")
+        tc = ev.find(f"{ns}System/{ns}TimeCreated")
+        try:
+            item["_EventId"] = int(eid.text) if eid is not None else 0
+        except (TypeError, ValueError):
+            item["_EventId"] = 0
+        # SystemTime is UTC with 7 fractional digits; callers (and the
+        # previous PowerShell path) use local time with an offset.
+        st = tc.get("SystemTime", "") if tc is not None else ""
+        try:
+            from datetime import datetime as _dt
+            base, _, frac = st.rstrip("Z").partition(".")
+            t = _dt.fromisoformat(base + "." + (frac + "000000")[:6] + "+00:00")
+            item["_TimeCreated"] = t.astimezone().isoformat()
+        except ValueError:
+            item["_TimeCreated"] = st
+        data.append(item)
+
+    # Structure events with key fields promoted
+    events = []
+    for item in data:
+        eid = item.get("_EventId", 0)
+        event = {
+            "timestamp": item.get("_TimeCreated", ""),
+            "event_id": eid,
+            "pid": item.get("ProcessId"),
+            "image": item.get("Image", ""),
+            "user": item.get("User", ""),
+        }
+        # Add type-specific fields
+        if eid == 1:  # ProcessCreate
+            event["type"] = "ProcessCreate"
+            event["commandline"] = item.get("CommandLine", "")
+            event["parent_image"] = item.get("ParentImage", "")
+            event["parent_pid"] = item.get("ParentProcessId")
+            event["hashes"] = item.get("Hashes", "")
+            event["integrity"] = item.get("IntegrityLevel", "")
+        elif eid == 3:  # NetworkConnect
+            event["type"] = "NetworkConnect"
+            event["dst_ip"] = item.get("DestinationIp", "")
+            event["dst_port"] = item.get("DestinationPort", "")
+            event["dst_hostname"] = item.get("DestinationHostname", "")
+            event["protocol"] = item.get("Protocol", "")
+        elif eid == 5:  # ProcessTerminate
+            event["type"] = "ProcessTerminate"
+        elif eid == 11:  # FileCreate
+            event["type"] = "FileCreate"
+            event["target"] = item.get("TargetFilename", "")
+        elif eid == 12 or eid == 13 or eid == 14:  # Registry
+            event["type"] = "RegistryEvent"
+            event["target"] = item.get("TargetObject", "")
+            event["details"] = item.get("Details", "")
+        elif eid == 22:  # DNSQuery
+            event["type"] = "DNSQuery"
+            event["query"] = item.get("QueryName", "")
+            event["result"] = item.get("QueryResults", "")
+        elif eid == 7:  # ImageLoad
+            event["type"] = "ImageLoad"
+            event["loaded_image"] = item.get("ImageLoaded", "")
+            event["hashes"] = item.get("Hashes", "")
+        elif eid == 8:  # CreateRemoteThread
+            event["type"] = "CreateRemoteThread"
+            event["source_pid"] = item.get("SourceProcessId")
+            event["target_pid"] = item.get("TargetProcessId")
+            event["target_image"] = item.get("TargetImage", "")
+        elif eid == 10:  # ProcessAccess
+            event["type"] = "ProcessAccess"
+            event["source_image"] = item.get("SourceImage", "")
+            event["target_image"] = item.get("TargetImage", "")
+            event["access"] = item.get("GrantedAccess", "")
+        else:
+            event["type"] = f"Event_{eid}"
+            # Include raw data for unknown types
+            event["raw"] = {k: v for k, v in item.items()
+                            if not k.startswith("_")}
+        events.append(event)
+    return events
 
 
-@app.route("/api/processes/<int:pid>")
-def api_process_detail(pid):
-    """Get details for a specific process."""
+@app.route("/api/processes/<key>")
+def api_process_detail(key):
+    """One process instance: "<pid>" is the newest process with that PID,
+    "<pid>@<start epoch>" an earlier one (PIDs are reused)."""
     with store_lock:
         processes = events_store.get("processes", {})
-    proc = processes.get(pid) or processes.get(str(pid))
+    proc = processes.get(str(key))
+    if proc is None or request.args.get("at"):
+        # A key from the process graph (Sysmon-based) or a PID plus time.
+        resolved = _PidInstances(processes).resolve_key(key, request.args.get("at"))
+        proc = processes.get(resolved) if resolved else proc
     if not proc:
         return jsonify({"error": "Process not found"}), 404
     return jsonify(proc)
@@ -2574,31 +3193,85 @@ def api_process_detail(pid):
 
 @app.route("/api/sessions")
 def api_sessions():
-    """Get tracing sessions (grouped by execution)."""
+    """Alert activity grouped into sessions: bursts separated by quiet gaps.
+
+    Query: gap (seconds of silence that end a session, default 600),
+    limit (newest sessions returned, default 50). Each session is a summary
+    (time span, counts by severity, processes, top rules, alert ids); the
+    alerts themselves are at /api/alerts/<id>. The former version returned
+    every alert in one "session" - 78 MB per call.
+    """
+    gap = max(10, min(request.args.get("gap", 600, type=int) or 600, 7 * 86400))
+    limit = max(1, min(request.args.get("limit", 50, type=int) or 50, 500))
     with store_lock:
-        alerts = events_store.get("alerts", [])
-    # Group alerts into sessions by time proximity
-    sessions = []
-    if alerts:
-        sorted_alerts = sorted(alerts, key=lambda a: a.get("timestamp", ""))
-        current_session = {"alerts": [], "start": "", "end": "", "processes": set()}
-        for alert in sorted_alerts:
-            current_session["alerts"].append(alert)
-            if not current_session["start"]:
-                current_session["start"] = alert.get("timestamp", "")
-            current_session["end"] = alert.get("timestamp", "")
-            if alert.get("pid"):
-                current_session["processes"].add(alert["pid"])
+        alerts = list(events_store.get("alerts", []))
 
-        if current_session["alerts"]:
-            current_session["processes"] = list(current_session["processes"])
-            current_session["count"] = len(current_session["alerts"])
-            sessions.append(current_session)
+    timed = []
+    for a in alerts:
+        t = _to_epoch(a.get("timestamp"))
+        if t is not None:
+            timed.append((t, a))
+    timed.sort(key=lambda x: x[0])
 
-    return jsonify(sessions)
+    sessions, current, last_t = [], None, None
+    for t, a in timed:
+        if current is None or t - last_t > gap:
+            current = {"start": a.get("timestamp"), "start_epoch": t, "alerts": []}
+            sessions.append(current)
+        current["alerts"].append(a)
+        current["end"] = a.get("timestamp")
+        last_t = t
+
+    out = []
+    for sess in sessions[-limit:][::-1]:
+        group = sess.pop("alerts")
+        severity, procs, rules = {}, {}, {}
+        for a in group:
+            sev = (a.get("severity") or "unknown").lower()
+            severity[sev] = severity.get(sev, 0) + 1
+            if a.get("pid") is not None:
+                key = str(a["pid"])
+                entry = procs.setdefault(key, {"pid": a["pid"], "name": a.get("process_name") or "", "alerts": 0})
+                entry["alerts"] += 1
+            rule = a.get("rule_name") or "unknown"
+            rules[rule] = rules.get(rule, 0) + 1
+        out.append({
+            "start": sess["start"],
+            "end": sess["end"],
+            "duration_s": round(_to_epoch(sess["end"]) - sess["start_epoch"], 1),
+            "count": len(group),
+            "severity": severity,
+            "process_count": len(procs),
+            "processes": sorted(procs.values(), key=lambda p: -p["alerts"])[:20],
+            "top_rules": [{"rule": r, "count": c} for r, c in
+                          sorted(rules.items(), key=lambda x: -x[1])[:10]],
+            "alert_ids": [a.get("id") for a in group[-200:]],
+        })
+    return jsonify({"gap_s": gap, "total_sessions": len(sessions), "sessions": out})
 
 
 # --- Proxy routes to downstream services ---
+def _proxied(r):
+    """Relay a DetonatorAgent / LitterBox response without letting it run as a page.
+
+    These services render reports that contain sample-derived text (strings,
+    file names, YARA matches). Passed through as text/html on this origin, any
+    markup in them would execute with full access to this UI's API. Only data
+    types are relayed as-is; everything else is served as plain text in a
+    sandbox.
+    """
+    ctype = r.headers.get("Content-Type", "application/json")
+    base = ctype.split(";", 1)[0].strip().lower()
+    if base not in ("application/json", "text/plain", "application/octet-stream",
+                    "application/zip", "text/csv"):
+        ctype = "text/plain; charset=utf-8"
+    return (r.content, r.status_code, {
+        "Content-Type": ctype,
+        "Content-Security-Policy": "sandbox; default-src 'none'",
+        "X-Content-Type-Options": "nosniff",
+    })
+
+
 @app.route("/api/detonator/<path:path>", methods=["GET", "POST", "PUT", "DELETE"])
 def proxy_detonator(path):
     """Proxy requests to Detonator API."""
@@ -2616,7 +3289,7 @@ def proxy_detonator(path):
             r = requests.delete(url, timeout=10)
         else:
             return jsonify({"error": "Method not allowed"}), 405
-        return (r.content, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+        return _proxied(r)
     except requests.RequestException as e:
         return jsonify({"error": f"Detonator unavailable: {e}"}), 502
 
@@ -2630,7 +3303,7 @@ def proxy_agent(path):
             r = requests.get(url, params=request.args, timeout=10)
         else:
             r = requests.post(url, data=request.form, files=request.files, timeout=60)
-        return (r.content, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+        return _proxied(r)
     except requests.RequestException as e:
         return jsonify({"error": f"DetonatorAgent unavailable: {e}"}), 502
 
@@ -2650,7 +3323,7 @@ def proxy_litterbox(path):
             r = requests.post(url, data=request.form, files=request.files, timeout=120)
             if r.status_code == 404:
                 r = requests.post(f"{LITTERBOX_API}/api/{path}", data=request.form, files=request.files, timeout=120)
-        return (r.content, r.status_code, {"Content-Type": r.headers.get("Content-Type", "application/json")})
+        return _proxied(r)
     except requests.RequestException as e:
         return jsonify({"error": f"LitterBox unavailable: {e}"}), 502
 
@@ -2822,7 +3495,54 @@ def api_submissions():
     """Return submission history list."""
     with submissions_lock:
         subs = _load_submissions()
-    return jsonify(subs)
+    # Entries recorded before the path fix point at a folder that never
+    # existed; show where the sample actually is when it is still there.
+    out = []
+    for sub in subs:
+        path = sub.get("file_path")
+        if isinstance(sub, dict) and (not path or not os.path.isfile(path)) and sub.get("filename"):
+            alt = os.path.join(r"C:\Users\Public\Downloads", os.path.basename(sub["filename"]))
+            if os.path.isfile(alt):
+                sub = dict(sub, file_path=alt)
+        out.append(sub)
+    return jsonify(out)
+
+
+_lb_online_cache = {"at": 0.0, "online": False}
+_LB_ONLINE_TTL = 15
+
+
+def _litterbox_online():
+    """LitterBox reachability, cached briefly (polled every 5 s per open result)."""
+    now = time.time()
+    if now - _lb_online_cache["at"] < _LB_ONLINE_TTL:
+        return _lb_online_cache["online"]
+    try:
+        online = requests.get(LITTERBOX_API, timeout=2).status_code == 200
+    except Exception:
+        online = False
+    _lb_online_cache.update(at=now, online=online)
+    return online
+
+
+def _fetch_many(specs):
+    """GET several URLs concurrently. specs: name -> (url, timeout).
+
+    Returns name -> Response, or None where the request failed.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    if not specs:
+        return {}
+
+    def _one(url, timeout):
+        try:
+            return requests.get(url, timeout=timeout)
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=min(8, len(specs))) as pool:
+        futures = {name: pool.submit(_one, url, t) for name, (url, t) in specs.items()}
+        return {name: f.result() for name, f in futures.items()}
 
 
 @app.route("/api/detonation/results")
@@ -2836,89 +3556,65 @@ def api_detonation_results():
 
     results = {"sha256": sha256, "pid": pid, "ready": {}}
 
-    # --- Check LitterBox availability first ---
-    litterbox_online = False
-    try:
-        r = requests.get(LITTERBOX_API, timeout=2)
-        litterbox_online = r.status_code == 200
-    except Exception:
-        pass
+    # --- External services, queried concurrently ---
+    # Done one after another, the LitterBox and agent calls added their
+    # timeouts up on every 5 s poll whenever a service was down.
+    litterbox_online = _litterbox_online()
     results["litterbox_online"] = litterbox_online
+    requests_to_make = {
+        "agent_lock": (f"{DETONATOR_AGENT_API}/api/lock/status", 2),
+        "agent_exec": (f"{DETONATOR_AGENT_API}/api/logs/execution", 3),
+        "agent_log": (f"{DETONATOR_AGENT_API}/api/logs/agent", 3),
+    }
+    if litterbox_online:
+        if lb_hash:
+            requests_to_make["lb_static"] = (f"{LITTERBOX_API}/api/results/static/{lb_hash}", 5)
+            requests_to_make["lb_info"] = (f"{LITTERBOX_API}/api/results/info/{lb_hash}", 5)
+        dyn_target = pid or lb_hash
+        if dyn_target:
+            requests_to_make["lb_dynamic"] = (f"{LITTERBOX_API}/api/results/dynamic/{dyn_target}", 5)
+    fetched = _fetch_many(requests_to_make)
+
+    def _json_of(key):
+        r = fetched.get(key)
+        if r is None or r.status_code != 200:
+            return None
+        try:
+            return r.json()
+        except ValueError:
+            return None
 
     # --- LitterBox Static Results ---
     if lb_hash and litterbox_online:
-        try:
-            r = requests.get(f"{LITTERBOX_API}/api/results/static/{lb_hash}", timeout=5)
-            if r.status_code == 200:
-                results["litterbox_static"] = r.json()
-                results["ready"]["static"] = True
-            else:
-                results["ready"]["static"] = False
-        except Exception:
-            results["ready"]["static"] = False
-    elif lb_hash and not litterbox_online:
-        results["ready"]["static"] = True  # Don't block polling if LitterBox is offline
+        static = _json_of("lb_static")
+        if static is not None:
+            results["litterbox_static"] = static
+        results["ready"]["static"] = static is not None
     else:
-        results["ready"]["static"] = True  # No hash to look up
+        # Offline or nothing to look up: do not block polling on it.
+        results["ready"]["static"] = True
 
     # --- LitterBox Dynamic Results ---
-    if litterbox_online:
-        if pid:
-            try:
-                r = requests.get(f"{LITTERBOX_API}/api/results/dynamic/{pid}", timeout=5)
-                if r.status_code == 200:
-                    results["litterbox_dynamic"] = r.json()
-                    results["ready"]["dynamic"] = True
-                else:
-                    results["ready"]["dynamic"] = False
-            except Exception:
-                results["ready"]["dynamic"] = False
-        elif lb_hash:
-            try:
-                r = requests.get(f"{LITTERBOX_API}/api/results/dynamic/{lb_hash}", timeout=5)
-                if r.status_code == 200:
-                    results["litterbox_dynamic"] = r.json()
-                    results["ready"]["dynamic"] = True
-                else:
-                    results["ready"]["dynamic"] = False
-            except Exception:
-                results["ready"]["dynamic"] = False
-        else:
-            results["ready"]["dynamic"] = True  # No target to look up
+    if litterbox_online and (pid or lb_hash):
+        dynamic = _json_of("lb_dynamic")
+        if dynamic is not None:
+            results["litterbox_dynamic"] = dynamic
+        results["ready"]["dynamic"] = dynamic is not None
     else:
-        results["ready"]["dynamic"] = True  # Don't block polling if LitterBox is offline
+        results["ready"]["dynamic"] = True
 
     # --- LitterBox File Info (includes basic PE info, hashes) ---
-    if lb_hash and litterbox_online:
-        try:
-            r = requests.get(f"{LITTERBOX_API}/api/results/info/{lb_hash}", timeout=5)
-            if r.status_code == 200:
-                results["litterbox_info"] = r.json()
-        except Exception:
-            pass
+    info = _json_of("lb_info")
+    if info is not None:
+        results["litterbox_info"] = info
 
     # --- Memory scan results (from async cache) ---
-    with _beacon_cache_lock:
-        hsb_result = None
-        beaconeye_result = None
-        aether_result = None
-        processdump_result = None
-        if pid:
-            hsb_result = _beacon_results_cache.get(f"hsb_{pid}")
-            beaconeye_result = _beacon_results_cache.get(f"beaconeye_{pid}")
-            aether_result = _beacon_results_cache.get(f"aether_{pid}")
-            processdump_result = _beacon_results_cache.get(f"processdump_{pid}")
-        if not hsb_result and sha256:
-            hsb_result = _beacon_results_cache.get(f"hsb_{sha256}")
-        if not beaconeye_result and sha256:
-            beaconeye_result = _beacon_results_cache.get(f"beaconeye_{sha256}")
-        if not aether_result and sha256:
-            aether_result = _beacon_results_cache.get(f"aether_{sha256}")
-        if not processdump_result and sha256:
-            processdump_result = _beacon_results_cache.get(f"processdump_{sha256}")
-        exitcapture_result = _beacon_results_cache.get(f"exitcapture_{pid}") if pid else None
-        if not exitcapture_result and sha256:
-            exitcapture_result = _beacon_results_cache.get(f"exitcapture_{sha256}")
+    _rs = _beacon_results_cache
+    hsb_result = _rs.lookup("hsb", pid, sha256)
+    beaconeye_result = _rs.lookup("beaconeye", pid, sha256)
+    aether_result = _rs.lookup("aether", pid, sha256)
+    processdump_result = _rs.lookup("processdump", pid, sha256)
+    exitcapture_result = _rs.lookup("exitcapture", pid, sha256)
 
     if hsb_result:
         results["hunt_sleeping_beacons"] = hsb_result
@@ -2945,13 +3641,33 @@ def api_detonation_results():
 
     # --- Fibratus / Rustinel Alerts matching this detonation ---
     matching_alerts = []
-    search_terms = set()
-    if pid:
-        search_terms.add(str(pid))
-    if sha256:
-        search_terms.add(sha256[:16])  # Partial match on hash prefix
 
-    for alert in events_store.get("alerts", []):
+    # PIDs are reused: an alert only matches by PID if it was raised after
+    # this submission. Without this bound, months-old alerts of whatever
+    # process once had the same PID were attributed to the sample and drove
+    # its verdict.
+    pid_window = None
+    if pid:
+        try:
+            with submissions_lock:
+                subs = _load_submissions()
+        except Exception:
+            subs = []
+        starts = sorted(
+            t for t in (_to_epoch(sub.get("timestamp")) for sub in subs
+                        if str(sub.get("agent_pid")) == str(pid)
+                        and (not sha256 or sub.get("sha256") == sha256))
+            if t is not None)
+        if starts:
+            start = starts[-1] - 60
+            later = [t for t in (_to_epoch(sub.get("timestamp")) for sub in subs
+                                 if str(sub.get("agent_pid")) == str(pid))
+                     if t is not None and t > starts[-1]]
+            pid_window = (start, min([start + 60 + _AGENT_PID_WINDOW] + later))
+
+    with store_lock:
+        all_alerts = list(events_store.get("alerts", []))
+    for alert in all_alerts:
         # Match by PID (flat field from parse_rustinel_alert / parse_fibratus_alert)
         alert_pid = str(alert.get("pid", ""))
         alert_ppid = str(alert.get("parent_pid", ""))
@@ -2972,7 +3688,11 @@ def api_detonation_results():
         if pid:
             pid_str = str(pid)
             if alert_pid == pid_str or raw_pid == pid_str or alert_ppid == pid_str or raw_ppid == pid_str:
-                matched = True
+                t = _to_epoch(alert.get("timestamp"))
+                # Unknown submission time: keep the old behaviour. Unknown
+                # alert time: cannot be placed, so not attributed by PID.
+                matched = pid_window is None or (
+                    t is not None and pid_window[0] <= t <= pid_window[1])
         if not matched and sha256 and len(sha256) >= 16:
             sha_lower = sha256.lower()
             if (sha_lower[:16] in alert_hash.lower() or
@@ -3011,17 +3731,10 @@ def api_detonation_results():
 
     # --- DetonatorAgent block (live lock status + persisted execution result) ---
     agent_block = {"in_use": None}
-    try:
-        r = requests.get(f"{DETONATOR_AGENT_API}/api/lock/status", timeout=2)
-        if r.status_code == 200:
-            agent_block["online"] = True
-            lock = r.json()
-            if isinstance(lock, dict):
-                agent_block["in_use"] = lock.get("in_use", lock.get("locked"))
-        else:
-            agent_block["online"] = False
-    except Exception:
-        agent_block["online"] = False
+    lock = _json_of("agent_lock")
+    agent_block["online"] = lock is not None
+    if isinstance(lock, dict):
+        agent_block["in_use"] = lock.get("in_use", lock.get("locked"))
 
     # Pull the persisted IOC-feed status from submission history
     try:
@@ -3034,29 +3747,21 @@ def api_detonation_results():
     except Exception:
         pass
 
-    # Fetch live execution logs from the agent. GetExecutionLogs returns the LAST
+    # Live execution logs from the agent. GetExecutionLogs returns the LAST
     # execution's stdout/stderr/pid, so only surface it when its PID matches the
     # sample we're polling for (avoids showing an unrelated detonation's output).
-    if agent_block.get("online"):
+    if agent_block["online"]:
         execution = {}
-        try:
-            r = requests.get(f"{DETONATOR_AGENT_API}/api/logs/execution", timeout=3)
-            if r.status_code == 200:
-                log_data = r.json()
-                log_pid = str(log_data.get("pid", ""))
-                if not pid or log_pid == str(pid):
-                    execution["pid"] = log_data.get("pid")
-                    execution["stdout"] = log_data.get("stdout")
-                    execution["stderr"] = log_data.get("stderr")
-        except Exception:
-            pass
-        # Agent's own log buffer (server-side agent logs)
-        try:
-            r = requests.get(f"{DETONATOR_AGENT_API}/api/logs/agent", timeout=3)
-            if r.status_code == 200:
-                execution["agent_logs"] = r.text[:20000]
-        except Exception:
-            pass
+        log_data = _json_of("agent_exec")
+        if isinstance(log_data, dict):
+            log_pid = str(log_data.get("pid", ""))
+            if not pid or log_pid == str(pid):
+                execution["pid"] = log_data.get("pid")
+                execution["stdout"] = log_data.get("stdout")
+                execution["stderr"] = log_data.get("stderr")
+        agent_log = fetched.get("agent_log")
+        if agent_log is not None and agent_log.status_code == 200:
+            execution["agent_logs"] = agent_log.text[:20000]
         if execution:
             agent_block["execution"] = execution
     results["agent"] = agent_block
@@ -3084,13 +3789,7 @@ def _sysmon_network_events(pid):
     import xml.etree.ElementTree as ET
     query = ("*[System[(EventID=3)] and "
              f"EventData[Data[@Name='ProcessId']='{int(pid)}']]")
-    proc = subprocess.run(
-        ["wevtutil", "qe", "Microsoft-Windows-Sysmon/Operational",
-         f"/q:{query}", "/f:xml", "/c:500", "/rd:true"],
-        capture_output=True, timeout=15,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    raw = (proc.stdout or b"").decode("utf-8", errors="replace")
+    raw, _ = _wevtutil_query("Microsoft-Windows-Sysmon/Operational", query, count=500, timeout=15)
     ns = "{http://schemas.microsoft.com/win/2004/08/events/event}"
     conns, image = [], ""
     for chunk in raw.split("</Event>"):
@@ -3242,9 +3941,16 @@ def _compute_verdict(results, matching_alerts):
             score += 4
         elif evidence["score"] >= memory_evidence.VERDICT_SUSPICIOUS:
             score += 2
+        # Below VERDICT_SUSPICIOUS the evidence model itself calls the result
+        # CLEAN. Adding a point anyway turned every sample with a little
+        # uncorroborated noise into SUSPICIOUS overall.
+        if evidence["score"] >= memory_evidence.VERDICT_SUSPICIOUS:
+            reasons.extend(evidence["reasons"][:4])
         elif evidence["score"] > 0:
-            score += 1
-        reasons.extend(evidence["reasons"][:4])
+            reasons.append(
+                f"Weak memory findings only (evidence score {evidence['score']}, "
+                f"below the {memory_evidence.VERDICT_SUSPICIOUS} threshold) - not counted"
+            )
         if evidence["suppressed_count"]:
             reasons.append(
                 f"{evidence['suppressed_count']} finding(s) suppressed by the host baseline"
@@ -3313,7 +4019,7 @@ def api_file_download():
         PROCESSDUMP_DIR,
     ]
     norm_path = os.path.normpath(filepath)
-    if not any(norm_path.startswith(prefix) for prefix in allowed_prefixes):
+    if not _path_within(norm_path, allowed_prefixes):
         return jsonify({"error": "Access denied: path outside allowed directories"}), 403
 
     if not os.path.isfile(norm_path):
@@ -3321,14 +4027,19 @@ def api_file_download():
 
     directory = os.path.dirname(norm_path)
     filename = os.path.basename(norm_path)
-    return send_from_directory(directory, filename, as_attachment=True)
+    # Samples can be HTML/SVG; never let the browser render one on this origin.
+    resp = send_from_directory(directory, filename, as_attachment=True,
+                               mimetype="application/octet-stream")
+    resp.headers["Content-Security-Policy"] = "sandbox; default-src 'none'"
+    return resp
 
 
 @app.route("/api/file/hex")
 def api_file_hex():
     """Return hex dump of a file's bytes starting from a given offset."""
     filepath = request.args.get("path", "")
-    num_bytes = min(request.args.get("bytes", 8192, type=int), 65536)
+    # Negative sizes would make f.read() return the whole file as a JSON int list.
+    num_bytes = max(1, min(request.args.get("bytes", 8192, type=int) or 8192, 65536))
     start_offset = max(request.args.get("offset", 0, type=int), 0)
 
     if not filepath:
@@ -3392,7 +4103,7 @@ def api_file_hex_upload():
         f.write(file_bytes)
 
     # Generate initial hex dump
-    num_bytes = min(request.form.get("bytes", 512, type=int), 65536)
+    num_bytes = max(1, min(request.form.get("bytes", 512, type=int) or 512, 65536))
     lines = []
     for line_offset in range(0, min(len(file_bytes), num_bytes), 16):
         chunk = file_bytes[line_offset:line_offset + 16]
@@ -3430,22 +4141,41 @@ def api_file_hex_write():
 
     norm_path = os.path.normpath(filepath)
 
-    # Security: only allow writes to user-writable directories
-    allowed_write_prefixes = [
-        r"C:\Users",
+    # Writes are limited to places that hold samples and analysis copies.
+    # Previously all of C:\Users was writable - including every user's
+    # Startup folder, i.e. code execution at next logon. Executable script
+    # and shortcut types are refused even inside these folders.
+    import tempfile
+    allowed_write_dirs = [
+        os.path.join(tempfile.gettempdir(), "hex_uploads"),
         r"C:\Temp",
-        r"C:\Windows\Temp",
+        r"C:\Users\Public\Downloads",    # where the agent drops samples
+        PROCESSDUMP_DIR,
     ]
-    if not any(norm_path.startswith(prefix) for prefix in allowed_write_prefixes):
-        return jsonify({"error": "Access denied: write not allowed to this path"}), 403
+    if not _path_within(norm_path, allowed_write_dirs):
+        return jsonify({"error": "Access denied: write not allowed to this path",
+                        "allowed": allowed_write_dirs}), 403
+    if os.path.splitext(norm_path)[1].lower() in (
+            ".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".lnk", ".hta", ".py"):
+        return jsonify({"error": "Access denied: refusing to modify script/shortcut files"}), 403
 
     if not os.path.isfile(norm_path):
         return jsonify({"error": "File not found"}), 404
 
-    try:
-        # Validate byte values
-        raw_bytes = bytes([b & 0xFF for b in byte_values])
+    # Validate types before touching the file: a string offset or non-int byte
+    # used to surface as an uncaught TypeError (500).
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+        return jsonify({"error": "offset must be a non-negative integer"}), 400
+    if not isinstance(byte_values, list) or not all(
+            isinstance(b, int) and not isinstance(b, bool) and 0 <= b <= 255 for b in byte_values):
+        return jsonify({"error": "bytes must be a list of integers 0-255"}), 400
+    if len(byte_values) > 1024 * 1024:
+        return jsonify({"error": "at most 1 MiB per write"}), 400
+    if offset + len(byte_values) > os.path.getsize(norm_path):
+        return jsonify({"error": "write would extend past the end of the file"}), 400
 
+    try:
+        raw_bytes = bytes(byte_values)
         with open(norm_path, "r+b") as f:
             f.seek(offset)
             f.write(raw_bytes)
@@ -3511,8 +4241,125 @@ AETHER_RULES_DIR = r"C:\tools\Aether\rules"
 PROCESSDUMP_EXE = r"C:\tools\ProcessDump\pd64.exe"
 PROCESSDUMP_DIR = r"C:\dumps"
 
-# Cache for beacon scan results (keyed by PID or sha256)
-_beacon_results_cache = {}
+class _ResultStore:
+    """Live-memory scanner results per detonation, kept on disk.
+
+    Results used to live only in memory, so every restart of the web UI
+    (deploys, crashes, reboots) dropped them: a detonation polled afterwards
+    lost its Aether/Process Dump/exit-capture evidence and its verdict
+    changed. Each entry is its own JSON file, written atomically, so storing
+    one result never rewrites the others.
+
+    Entries are addressed by tool plus PID and/or sample SHA256. PIDs are
+    reused by Windows, so a PID match only counts when it belongs to the same
+    sample - or, when no sample is given, when it is recent.
+    """
+
+    def __init__(self, directory, limit=600):
+        self.dir = directory
+        self.limit = limit
+        self._lock = threading.Lock()
+        self._mem = {}            # key -> (meta, value)
+        self._index = {}          # key -> meta for entries only on disk
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+            for name in os.listdir(self.dir):
+                if not name.endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(self.dir, name), "r", encoding="utf-8") as f:
+                        doc = json.load(f)
+                    self._index[doc["key"]] = doc["meta"]
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue
+        except OSError as e:
+            print(f"[results] cannot use {self.dir}: {e} - results stay in memory only")
+
+    def _path(self, key):
+        return os.path.join(self.dir, hashlib.sha1(key.encode("utf-8")).hexdigest() + ".json")
+
+    def _write(self, key, meta, value):
+        path = self._path(key)
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"key": key, "meta": meta, "value": value}, f, default=str)
+            os.replace(tmp, path)
+        except (OSError, TypeError, ValueError) as e:
+            print(f"[results] could not persist {key}: {e}")
+
+    def _evict(self):
+        keys = {**self._index, **{k: m for k, (m, _) in self._mem.items()}}
+        if len(keys) <= self.limit:
+            return
+        for key, _ in sorted(keys.items(), key=lambda kv: kv[1].get("stored_at", 0))[:len(keys) - self.limit]:
+            self._mem.pop(key, None)
+            self._index.pop(key, None)
+            try:
+                os.remove(self._path(key))
+            except OSError:
+                pass
+
+    def put(self, tool, value, pid=None, sha256=None):
+        """Store a result under tool+PID and tool+SHA256 (whichever are known)."""
+        meta = {"stored_at": time.time(), "pid": str(pid) if pid else None, "sha256": sha256 or None}
+        keys = [f"{tool}_{pid}"] if pid else []
+        if sha256:
+            keys.append(f"{tool}_{sha256}")
+        with self._lock:
+            for key in keys:
+                self._mem[key] = (meta, value)
+                self._index.pop(key, None)
+            self._evict()
+        for key in keys:
+            self._write(key, meta, value)
+
+    def _entry(self, key):
+        with self._lock:
+            hit = self._mem.get(key)
+            if hit:
+                return hit
+            meta = self._index.get(key)
+        if meta is None:
+            return None
+        try:
+            with open(self._path(key), "r", encoding="utf-8") as f:
+                doc = json.load(f)
+        except (OSError, ValueError):
+            return None
+        with self._lock:
+            self._mem[key] = (doc["meta"], doc["value"])
+            self._index.pop(key, None)
+        return doc["meta"], doc["value"]
+
+    def lookup(self, tool, pid=None, sha256=None, max_pid_age=6 * 3600):
+        """Newest matching result, or None.
+
+        With a SHA256, a PID entry from a different sample is ignored. With
+        only a PID, entries older than max_pid_age are ignored (the PID has
+        probably been reused since).
+        """
+        candidates = []
+        if sha256:
+            hit = self._entry(f"{tool}_{sha256}")
+            if hit:
+                candidates.append(hit)
+        if pid:
+            hit = self._entry(f"{tool}_{pid}")
+            if hit:
+                meta = hit[0]
+                if sha256:
+                    if meta.get("sha256") in (None, sha256):
+                        candidates.append(hit)
+                elif time.time() - meta.get("stored_at", 0) <= max_pid_age:
+                    candidates.append(hit)
+        if not candidates:
+            return None
+        return max(candidates, key=lambda h: h[0].get("stored_at", 0))[1]
+
+
+_beacon_results_cache = _ResultStore(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory_results"))
 _beacon_cache_lock = threading.Lock()
 
 # Per-host baseline of benign memory findings, shared by every scanner.
@@ -3590,6 +4437,9 @@ def _exit_capture_arm(image_name):
         except OSError as e:
             return False, f"registry write failed: {e}"
         state["armed_at"] = time.time()
+        # Overlapping submissions of the same file name share the registry
+        # keys; only the last one to finish may remove them.
+        state["refs"] = state.get("refs", 0) + 1
         _exit_capture_armed[image_name.lower()] = state
     return True, None
 
@@ -3601,6 +4451,10 @@ def _exit_capture_disarm(image_name):
     import winreg
     image_name = os.path.basename(image_name or "")
     with _exit_capture_lock:
+        state = _exit_capture_armed.get(image_name.lower())
+        if state and state.get("refs", 1) > 1:
+            state["refs"] -= 1
+            return
         state = _exit_capture_armed.pop(image_name.lower(), None) or {}
         prior = state.get("prior_globalflag")
         try:
@@ -3674,9 +4528,8 @@ def _exit_capture_analyze(dump_path, process_name):
 
 def _exit_capture_watch(image_name, pid, sha256, armed_at):
     """Wait for the sample to exit (or the window to close), then analyze."""
-    def _watch():
+    def _wait_for_dump():
         deadline = armed_at + EXIT_CAPTURE_WINDOW
-        dump = None
         while time.time() < deadline:
             dump = _exit_capture_find_dump(image_name, pid=pid, since=armed_at - 1)
             if dump:
@@ -3684,14 +4537,25 @@ def _exit_capture_watch(image_name, pid, sha256, armed_at):
                 # the writer a moment to finish before reading it.
                 size = -1
                 for _ in range(20):
-                    cur = os.path.getsize(dump)
+                    try:
+                        cur = os.path.getsize(dump)
+                    except OSError:
+                        return None
                     if cur == size and cur > 0:
                         break
                     size = cur
                     time.sleep(0.5)
-                break
+                return dump
             time.sleep(2)
-        _exit_capture_disarm(image_name)
+        return None
+
+    def _watch():
+        try:
+            dump = _wait_for_dump()
+        finally:
+            # Whatever happens above, the IFEO keys must not stay behind: a
+            # left-over GlobalFlag would dump that image name forever.
+            _exit_capture_disarm(image_name)
 
         if not dump:
             entry = {
@@ -3709,13 +4573,40 @@ def _exit_capture_watch(image_name, pid, sha256, armed_at):
             except Exception as e:
                 entry = {"tool": "Exit Capture", "pid": pid, "captured": True,
                          "observed": False, "dump_path": dump, "error": str(e)}
-        with _beacon_cache_lock:
-            _beacon_results_cache[f"exitcapture_{pid}"] = entry
-            if sha256:
-                _beacon_results_cache[f"exitcapture_{sha256}"] = entry
+        _beacon_results_cache.put("exitcapture", entry, pid=pid, sha256=sha256)
         _exit_capture_prune()
 
     threading.Thread(target=_watch, daemon=True).start()
+
+
+SCAN_UPLOADS_KEEP = 40
+
+
+def _save_scan_upload(file):
+    """Store an uploaded sample in its own temp directory.
+
+    A shared fixed name broke as soon as two scans overlapped: the running
+    scanner holds the file open, so the next open(..., "wb") fails with
+    Errno 22, or one scan analyzes the other upload's bytes. Returns
+    (filepath, cleanup_dir).
+    """
+    import tempfile
+    base = os.path.join(tempfile.gettempdir(), "scan_uploads")
+    os.makedirs(base, exist_ok=True)
+    # Uploads stay around briefly (results link to them, e.g. "open in hex
+    # editor"); older ones are pruned so the folder does not grow forever.
+    try:
+        import shutil
+        dirs = sorted((os.path.join(base, d) for d in os.listdir(base)),
+                      key=os.path.getmtime, reverse=True)
+        for old in [d for d in dirs if os.path.isdir(d)][SCAN_UPLOADS_KEEP:]:
+            shutil.rmtree(old, ignore_errors=True)
+    except OSError:
+        pass
+    cleanup_dir = tempfile.mkdtemp(dir=base)
+    filepath = os.path.join(cleanup_dir, secure_filename(file.filename or "") or "scan_target")
+    file.save(filepath)
+    return filepath, cleanup_dir
 
 
 @app.route("/api/scan/threatcheck", methods=["POST"])
@@ -3728,19 +4619,10 @@ def api_scan_threatcheck():
     if not os.path.isfile(THREATCHECK_EXE):
         return jsonify({"error": "ThreatCheck not installed"}), 500
 
-    # If file uploaded, save to temp
+    # If file uploaded, save it to a private temp directory
+    cleanup_dir = None
     if "file" in request.files:
-        file = request.files["file"]
-        file_bytes = file.read()
-        import tempfile
-        temp_dir = os.path.join(tempfile.gettempdir(), "scan_uploads")
-        os.makedirs(temp_dir, exist_ok=True)
-        # Sanitize the browser-supplied name: raw names with spaces or
-        # characters illegal on Windows (e.g. "file 2.exe") make open() fail
-        # with OSError [Errno 22]. secure_filename yields a safe ASCII name.
-        filepath = os.path.join(temp_dir, secure_filename(file.filename or "") or "scan_target")
-        with open(filepath, "wb") as f:
-            f.write(file_bytes)
+        filepath, cleanup_dir = _save_scan_upload(request.files["file"])
     elif not filepath or not os.path.isfile(filepath):
         return jsonify({"error": "No file provided or path not found"}), 400
 
@@ -3748,8 +4630,8 @@ def api_scan_threatcheck():
         args = [THREATCHECK_EXE, "-f", filepath, "-e", engine]
         if file_type == "Script":
             args.extend(["-t", "Script"])
-        result = subprocess.run(
-            args, capture_output=True, text=True, timeout=120,
+        result = _run_cmd(
+            args, timeout=120,
             cwd=os.path.dirname(THREATCHECK_EXE)
         )
         output = (result.stdout or "") + (result.stderr or "")
@@ -3782,26 +4664,17 @@ def api_scan_defendercheck():
     if not os.path.isfile(DEFENDERCHECK_EXE):
         return jsonify({"error": "DefenderCheck not installed"}), 500
 
-    # If file uploaded, save to temp
+    # If file uploaded, save it to a private temp directory
+    cleanup_dir = None
     if "file" in request.files:
-        file = request.files["file"]
-        file_bytes = file.read()
-        import tempfile
-        temp_dir = os.path.join(tempfile.gettempdir(), "scan_uploads")
-        os.makedirs(temp_dir, exist_ok=True)
-        # Sanitize the browser-supplied name: raw names with spaces or
-        # characters illegal on Windows (e.g. "file 2.exe") make open() fail
-        # with OSError [Errno 22]. secure_filename yields a safe ASCII name.
-        filepath = os.path.join(temp_dir, secure_filename(file.filename or "") or "scan_target")
-        with open(filepath, "wb") as f:
-            f.write(file_bytes)
+        filepath, cleanup_dir = _save_scan_upload(request.files["file"])
     elif not filepath or not os.path.isfile(filepath):
         return jsonify({"error": "No file provided or path not found"}), 400
 
     try:
-        result = subprocess.run(
+        result = _run_cmd(
             [DEFENDERCHECK_EXE, filepath],
-            capture_output=True, text=True, timeout=120,
+            timeout=120,
             cwd=os.path.dirname(DEFENDERCHECK_EXE)
         )
         output = (result.stdout or "") + (result.stderr or "")
@@ -3845,28 +4718,19 @@ def api_scan_ember():
         return jsonify({"error": "EMBER2024 not installed"}), 500
 
     filepath = request.form.get("path", "")
+    cleanup_dir = None
     if "file" in request.files:
-        file = request.files["file"]
-        file_bytes = file.read()
-        import tempfile
-        temp_dir = os.path.join(tempfile.gettempdir(), "scan_uploads")
-        os.makedirs(temp_dir, exist_ok=True)
-        # Sanitize the browser-supplied name: raw names with spaces or
-        # characters illegal on Windows (e.g. "file 2.exe") make open() fail
-        # with OSError [Errno 22]. secure_filename yields a safe ASCII name.
-        filepath = os.path.join(temp_dir, secure_filename(file.filename or "") or "scan_target")
-        with open(filepath, "wb") as f:
-            f.write(file_bytes)
+        filepath, cleanup_dir = _save_scan_upload(request.files["file"])
     elif not filepath or not os.path.isfile(filepath):
         return jsonify({"error": "No file provided or path not found"}), 400
 
     try:
-        result = subprocess.run(
+        result = _run_cmd(
             [EMBER_PYTHON, EMBER_SCRIPT, filepath,
              "--model", model,
              "--threshold", str(threshold),
              "--models-dir", EMBER_MODELS_DIR],
-            capture_output=True, text=True, timeout=120,
+            timeout=120,
             cwd=EMBER_ROOT,
         )
         stdout = (result.stdout or "").strip()
@@ -4047,9 +4911,9 @@ def api_process_lookup():
         return jsonify({"error": "No name specified"}), 400
 
     try:
-        proc = subprocess.run(
+        proc = _run_cmd(
             ["tasklist", "/fo", "csv", "/nh"],
-            capture_output=True, text=True, timeout=30,
+            timeout=30,
         )
     except FileNotFoundError:
         return jsonify({"error": "tasklist unavailable (not running on Windows)"}), 501
@@ -4164,88 +5028,123 @@ def api_scan_history_clear():
 
 # --- Beacon Scanner Endpoints ---
 
+_ANSI_RE = None
+
+
+def _strip_ansi(text):
+    global _ANSI_RE
+    import re
+    if _ANSI_RE is None:
+        _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+    return _ANSI_RE.sub("", text or "")
+
+
+def _cross_arch_note(pid):
+    """Why a scan of `pid` may be unreliable on this host, or None.
+
+    Hunt-Sleeping-Beacons and BeaconEye are x64 tools. On ARM64 Windows they
+    run emulated and read thread contexts and heaps through x64 structures,
+    which only describe x64 (emulated) processes - such as most implants.
+    """
+    machine = _process_machine(pid)
+    if machine and machine != "x64" and platform.machine().upper() == "ARM64":
+        return f"target is a native {machine} process; this x64 scanner only sees x64 processes reliably"
+    return None
+
+
+def _run_hsb(pid=None):
+    """Run Hunt-Sleeping-Beacons. Returns (result, error)."""
+    if not os.path.isfile(HUNT_SLEEPING_BEACONS_EXE):
+        return None, "Hunt-Sleeping-Beacons not installed"
+    args = [HUNT_SLEEPING_BEACONS_EXE, "--commandline"]
+    if pid:
+        args += ["-p", str(int(pid))]
+    try:
+        proc = _run_cmd(args, timeout=120, cwd=os.path.dirname(HUNT_SLEEPING_BEACONS_EXE))
+    except subprocess.TimeoutExpired:
+        return None, "Hunt-Sleeping-Beacons timed out (120s)"
+    except Exception as e:
+        return None, str(e)
+    output = _strip_ansi((proc.stdout or "") + (proc.stderr or ""))
+    findings = _parse_hsb_output(output)
+    result = {
+        "tool": "Hunt-Sleeping-Beacons",
+        "pid": pid,
+        "output": output.strip()[-20000:],
+        "findings": findings,
+        "suspicious_count": len(findings),
+        "exit_code": proc.returncode,
+    }
+    if pid:
+        note = _cross_arch_note(pid)
+        if note:
+            result["limitation"] = note
+    return result, None
+
+
+def _run_beaconeye(pid=None):
+    """Run BeaconEye. Returns (result, error).
+
+    BeaconEye has no PID option: it scans every process (well under a
+    second) and the report is filtered to the requested PID afterwards.
+    """
+    if not os.path.isfile(BEACONEYE_EXE):
+        return None, "BeaconEye not installed"
+    try:
+        proc = _run_cmd([BEACONEYE_EXE], timeout=180, cwd=os.path.dirname(BEACONEYE_EXE))
+    except subprocess.TimeoutExpired:
+        return None, "BeaconEye timed out (180s)"
+    except Exception as e:
+        return None, str(e)
+    output = _strip_ansi((proc.stdout or "") + (proc.stderr or ""))
+    findings = _parse_beaconeye_output(output)
+    if pid:
+        findings = [f for f in findings if str(f.get("pid")) == str(pid)]
+    result = {
+        "tool": "BeaconEye",
+        "pid": pid,
+        "output": output.strip()[-20000:],
+        "findings": findings,
+        "beacons_found": len(findings),
+        "exit_code": proc.returncode,
+    }
+    if pid:
+        note = _cross_arch_note(pid)
+        if note:
+            result["limitation"] = note
+    return result, None
+
+
+def _scan_endpoint(runner, tool_key):
+    data = request.get_json(silent=True) if request.is_json else request.form
+    data = data or {}
+    pid = data.get("pid")
+    if pid not in (None, ""):
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return jsonify({"error": "pid must be an integer"}), 400
+    else:
+        pid = None
+    result, error = runner(pid)
+    if error:
+        status = 500 if "not installed" in error else 504 if "timed out" in error else 500
+        return jsonify({"error": error}), status
+    if pid:
+        _beacon_results_cache.put(tool_key, result, pid=pid)
+    return jsonify(result)
+
+
 @app.route("/api/scan/beacons", methods=["POST"])
 def api_scan_beacons():
     """Run Hunt-Sleeping-Beacons on a specific PID or all processes."""
-    data = request.get_json(force=True) if request.is_json else request.form
-    pid = data.get("pid")
-
-    if not os.path.isfile(HUNT_SLEEPING_BEACONS_EXE):
-        return jsonify({"error": "Hunt-Sleeping-Beacons not installed", "path": HUNT_SLEEPING_BEACONS_EXE}), 500
-
-    try:
-        args = [HUNT_SLEEPING_BEACONS_EXE, "--commandline"]
-        if pid:
-            args.extend(["-p", str(pid)])
-        result = subprocess.run(
-            args, capture_output=True, text=True, timeout=60,
-            cwd=os.path.dirname(HUNT_SLEEPING_BEACONS_EXE)
-        )
-        output = (result.stdout or "") + (result.stderr or "")
-        findings = _parse_hsb_output(output)
-
-        scan_result = {
-            "tool": "Hunt-Sleeping-Beacons",
-            "pid": pid,
-            "output": output.strip(),
-            "findings": findings,
-            "suspicious_count": len(findings),
-            "exit_code": result.returncode,
-        }
-
-        # Cache results for polling
-        if pid:
-            with _beacon_cache_lock:
-                key = f"hsb_{pid}"
-                _beacon_results_cache[key] = scan_result
-
-        return jsonify(scan_result)
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Hunt-Sleeping-Beacons timed out (60s)"}), 504
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    return _scan_endpoint(_run_hsb, "hsb")
 
 
 @app.route("/api/scan/beaconeye", methods=["POST"])
 def api_scan_beaconeye():
     """Run BeaconEye to scan process memory for CobaltStrike beacon configs."""
-    data = request.get_json(force=True) if request.is_json else request.form
-    pid = data.get("pid")
-
-    if not os.path.isfile(BEACONEYE_EXE):
-        return jsonify({"error": "BeaconEye not installed", "path": BEACONEYE_EXE}), 500
-
-    try:
-        args = [BEACONEYE_EXE, "scan"]
-        if pid:
-            args = [BEACONEYE_EXE, "scan", "--pid", str(pid)]
-        result = subprocess.run(
-            args, capture_output=True, text=True, timeout=90,
-            cwd=os.path.dirname(BEACONEYE_EXE)
-        )
-        output = (result.stdout or "") + (result.stderr or "")
-        findings = _parse_beaconeye_output(output)
-
-        scan_result = {
-            "tool": "BeaconEye",
-            "pid": pid,
-            "output": output.strip(),
-            "findings": findings,
-            "beacons_found": len(findings),
-            "exit_code": result.returncode,
-        }
-
-        # Cache results for polling
-        if pid:
-            with _beacon_cache_lock:
-                key = f"beaconeye_{pid}"
-                _beacon_results_cache[key] = scan_result
-
-        return jsonify(scan_result)
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "BeaconEye timed out (90s)"}), 504
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    return _scan_endpoint(_run_beaconeye, "beaconeye")
 
 
 # --- Live-memory forensics: Aether ---
@@ -4345,8 +5244,8 @@ def _run_aether_once(pid=None, scan_all=False, timeout=180):
         args += ["--rules", AETHER_RULES_DIR]
 
     try:
-        proc = subprocess.run(
-            args, capture_output=True, text=True, timeout=timeout,
+        proc = _run_cmd(
+            args, timeout=timeout,
             cwd=os.path.dirname(AETHER_EXE),
         )
     except subprocess.TimeoutExpired:
@@ -4430,8 +5329,10 @@ def _run_aether(pid=None, scan_all=False, timeout=180, samples=1, interval=3.0,
             "before the scan. This is not evidence that it was clean."
         )
 
+    # Key by full image path where it can be resolved (see _image_path_for_pid).
+    identity = (_image_path_for_pid(pid) if pid else "") or process_name
     per_sample = [
-        memory_evidence.from_aether(r.get("report") or {}, process=process_name)
+        memory_evidence.from_aether(r.get("report") or {}, process=identity)
         for r in runs
     ]
     merged = memory_evidence.merge_samples(per_sample)
@@ -4480,8 +5381,7 @@ def api_scan_aether():
 
     result["process"] = process_name
     if pid:
-        with _beacon_cache_lock:
-            _beacon_results_cache[f"aether_{pid}"] = result
+        _beacon_results_cache.put("aether", result, pid=pid)
 
     _record_scan("Aether", f"PID {pid}" if pid else "all processes", result)
 
@@ -4491,9 +5391,9 @@ def api_scan_aether():
 def _image_name_for_pid(pid):
     """Best-effort image name for a PID (used to key findings and baselines)."""
     try:
-        proc = subprocess.run(
+        proc = _run_cmd(
             ["tasklist", "/fi", f"PID eq {int(pid)}", "/fo", "csv", "/nh"],
-            capture_output=True, text=True, timeout=15,
+            timeout=15,
         )
         import csv as _csv
         for row in _csv.reader((proc.stdout or "").splitlines()):
@@ -4534,12 +5434,64 @@ def _parse_json_stream(text):
     return objs
 
 
+def _image_path_for_pid(pid):
+    """Full image path of a running process, or "" (non-Windows / no access).
+
+    Findings are keyed by path, not name, so a sample calling itself
+    svchost.exe does not inherit the real svchost's baseline entries.
+    """
+    if os.name != "nt":
+        return ""
+    import ctypes
+    from ctypes import wintypes
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    k32.QueryFullProcessImageNameW.argtypes = (
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
+    k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    try:
+        handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    if not handle:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(len(buf))
+        if k32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return buf.value
+        return ""
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _process_machine(pid):
+    """'x64', 'ARM64', 'x86', ... for a running process, or None if unknown.
+
+    Read from the image's PE header: on ARM64 Windows, IsWow64Process2
+    reports x64 processes as native, so it cannot tell them apart.
+    """
+    path = _image_path_for_pid(pid)
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4096)
+        off = struct.unpack_from("<I", head, 0x3C)[0]
+        machine = struct.unpack_from("<H", head, off + 4)[0]
+    except (OSError, struct.error):
+        return None
+    return {0x8664: "x64", 0xAA64: "ARM64", 0x14C: "x86", 0xA641: "ARM64EC", 0x1C4: "ARM"}.get(machine)
+
+
 def _running_process_names():
     """PID -> image name for every running process (tasklist)."""
     names = {}
     try:
-        proc = subprocess.run(["tasklist", "/fo", "csv", "/nh"],
-                              capture_output=True, text=True, timeout=30)
+        proc = _run_cmd(["tasklist", "/fo", "csv", "/nh"],
+                              timeout=30)
         import csv as _csv
         for row in _csv.reader((proc.stdout or "").splitlines()):
             if len(row) >= 2:
@@ -4577,6 +5529,15 @@ def _is_host_tool(pid, image):
     return (image or "").lower() in HOST_TOOL_IMAGES
 
 
+def _sweep_entry(per_pid, pid, image):
+    """Per-process accumulator; resolves the image path once per PID."""
+    entry = per_pid.get(pid)
+    if entry is None:
+        entry = per_pid[pid] = {"process": image, "findings": [],
+                                "identity": _image_path_for_pid(pid) or image}
+    return entry
+
+
 def _run_sweep(use_aether, use_processdump, capture_baseline):
     started = time.time()
     names = _running_process_names()
@@ -4587,7 +5548,7 @@ def _run_sweep(use_aether, use_processdump, capture_baseline):
         if os.path.isdir(AETHER_RULES_DIR):
             args += ["--rules", AETHER_RULES_DIR]
         try:
-            proc = subprocess.run(args, capture_output=True, text=True, timeout=1200,
+            proc = _run_cmd(args, timeout=1200,
                                   cwd=os.path.dirname(AETHER_EXE))
             reports = _parse_json_stream(proc.stdout or "")
             stats["aether_processes"] = len(reports)
@@ -4596,8 +5557,8 @@ def _run_sweep(use_aether, use_processdump, capture_baseline):
                 if pid is None:
                     continue
                 image = names.get(int(pid), "")
-                per_pid.setdefault(int(pid), {"process": image, "findings": []})
-                per_pid[int(pid)]["findings"] += memory_evidence.from_aether(rep, process=image)
+                entry = _sweep_entry(per_pid, int(pid), image)
+                entry["findings"] += memory_evidence.from_aether(rep, process=entry["identity"])
                 per_pid[int(pid)]["regions_scanned"] = rep.get("regions_scanned", 0)
         except subprocess.TimeoutExpired:
             errors.append("Aether sweep timed out (1200s)")
@@ -4617,9 +5578,9 @@ def _run_sweep(use_aether, use_processdump, capture_baseline):
                     by_pid.setdefault(d["pid"], []).append(d)
             for pid, dumps in by_pid.items():
                 image = names.get(pid, "")
-                per_pid.setdefault(pid, {"process": image, "findings": []})
-                per_pid[pid]["findings"] += memory_evidence.from_process_dump(
-                    {"dumps": dumps}, process=image)
+                entry = _sweep_entry(per_pid, pid, image)
+                entry["findings"] += memory_evidence.from_process_dump(
+                    {"dumps": dumps}, process=entry["identity"])
 
     captured = 0
     processes, excluded = [], []
@@ -4768,8 +5729,8 @@ def api_pd_baseline_build():
     def _job():
         root = os.path.dirname(PROCESSDUMP_EXE)
         try:
-            proc = subprocess.run([PROCESSDUMP_EXE, "-db", mode, "-nh"],
-                                  capture_output=True, text=True, timeout=7200, cwd=root)
+            proc = _run_cmd([PROCESSDUMP_EXE, "-db", mode, "-nh"],
+                                  timeout=7200, cwd=root)
             out = (proc.stdout or "") + (proc.stderr or "")
             # Process Dump reports the resulting total on its last summary line.
             total = None
@@ -4832,9 +5793,9 @@ def api_memory_baseline_capture():
             continue
     for name in names:
         try:
-            proc = subprocess.run(
+            proc = _run_cmd(
                 ["tasklist", "/fi", f"IMAGENAME eq {name}", "/fo", "csv", "/nh"],
-                capture_output=True, text=True, timeout=20,
+                timeout=20,
             )
             import csv as _csv
             for row in _csv.reader((proc.stdout or "").splitlines()):
@@ -4899,16 +5860,29 @@ def api_memory_evidence():
 
     with _beacon_cache_lock:
         cached = {
-            "aether": _beacon_results_cache.get(f"aether_{pid}"),
-            "process_dump": _beacon_results_cache.get(f"processdump_{pid}"),
-            "hunt_sleeping_beacons": _beacon_results_cache.get(f"hsb_{pid}"),
-            "beaconeye": _beacon_results_cache.get(f"beaconeye_{pid}"),
+            "aether": _beacon_results_cache.lookup("aether", pid),
+            "process_dump": _beacon_results_cache.lookup("processdump", pid),
+            "hunt_sleeping_beacons": _beacon_results_cache.lookup("hsb", pid),
+            "beaconeye": _beacon_results_cache.lookup("beaconeye", pid),
+            "exit_capture_result": _beacon_results_cache.lookup("exitcapture", pid),
         }
     cached = {k: v for k, v in cached.items() if v}
+    net = _network_beaconing_for_pid(pid)
+    if net.get("evidence_findings"):
+        cached["network_beaconing"] = net
     if not cached:
         return jsonify({"error": f"No cached memory results for PID {pid}"}), 404
 
-    process_name = _image_name_for_pid(pid)
+    # The process may have exited, in which case tasklist knows no name. Use
+    # the name recorded with the results so all sources agree on it -
+    # corroboration matches findings by process name.
+    process_name = ""
+    for key in ("aether", "exit_capture_result", "process_dump"):
+        entry = cached.get(key) or {}
+        if entry.get("process"):
+            process_name = entry["process"]
+            break
+    process_name = process_name or _image_name_for_pid(pid)
     findings = memory_evidence.collect(cached, process=process_name)
     return jsonify({
         "pid": pid,
@@ -5029,8 +6003,8 @@ def _run_process_dump(pid=None, dump_system=False, ignore_db=False,
         timeout = 900 if dump_system else 300
 
     try:
-        proc = subprocess.run(
-            args, capture_output=True, text=True, timeout=timeout,
+        proc = _run_cmd(
+            args, timeout=timeout,
             cwd=os.path.dirname(PROCESSDUMP_EXE),
         )
     except subprocess.TimeoutExpired:
@@ -5050,11 +6024,20 @@ def _run_process_dump(pid=None, dump_system=False, ignore_db=False,
             entry["path"] = full
             entry["size"] = os.path.getsize(full)
             try:
-                with open(full, "rb") as f:
-                    raw = f.read()
-                entry["sha256"] = hashlib.sha256(raw).hexdigest()
                 if entry["kind"] == "codechunk":
+                    # Chunks are small and their bytes are needed anyway.
+                    with open(full, "rb") as f:
+                        raw = f.read()
+                    entry["sha256"] = hashlib.sha256(raw).hexdigest()
                     _classify_codechunk(entry, raw)
+                else:
+                    # A -system dump writes thousands of modules; hash them
+                    # in chunks instead of loading each one into memory.
+                    h = hashlib.sha256()
+                    with open(full, "rb") as f:
+                        for block in iter(lambda: f.read(1024 * 1024), b""):
+                            h.update(block)
+                    entry["sha256"] = h.hexdigest()
             except OSError:
                 pass
             dumps.append(entry)
@@ -5110,8 +6093,7 @@ def api_scan_processdump():
         return jsonify({"error": error}), status
 
     if pid:
-        with _beacon_cache_lock:
-            _beacon_results_cache[f"processdump_{pid}"] = result
+        _beacon_results_cache.put("processdump", result, pid=pid)
 
     _record_scan("Process Dump", f"PID {pid}" if pid else "all processes", result)
 
@@ -5119,58 +6101,67 @@ def api_scan_processdump():
 
 
 def _parse_hsb_output(output):
-    """Parse Hunt-Sleeping-Beacons output into structured findings."""
-    findings = []
-    current = None
-    for line in output.splitlines():
-        line = line.strip()
-        if not line:
-            if current:
-                findings.append(current)
-                current = None
+    """Parse Hunt-Sleeping-Beacons output.
+
+    Format (logger.hpp):
+        * Detections for: <image> (<pid>) <cmdline>
+            ! Thread <tid> | <title> | <description> | Severity: <level>
+    One finding per process, carrying its thread detections.
+    """
+    import re
+    head = re.compile(r"^\* Detections for: (.+?) \((\d+)\)\s*(.*)$")
+    det = re.compile(r"^!\s*Thread (\d+)\s*\|\s*(.*?)\s*\|\s*(.*?)\s*\|\s*Severity:\s*(\w+)", re.I)
+    findings, current = [], None
+    for raw in _strip_ansi(output).splitlines():
+        line = raw.strip()
+        m = head.match(line)
+        if m:
+            current = {"process": m.group(1), "pid": int(m.group(2)),
+                       "cmdline": m.group(3).strip(), "detections": [], "indicators": []}
+            findings.append(current)
             continue
-        # Detect process lines (typically "PID: XXXX ..." or process name lines)
-        if "suspicious" in line.lower() or "ioc" in line.lower() or "beacon" in line.lower():
-            if current is None:
-                current = {"indicators": [], "raw": ""}
-            current["indicators"].append(line)
-            current["raw"] += line + "\n"
-        elif "pid" in line.lower() and ":" in line:
-            if current:
-                findings.append(current)
-            current = {"process": line, "indicators": [], "raw": line + "\n"}
-        elif current:
-            current["raw"] += line + "\n"
-            if any(kw in line.lower() for kw in ["unbacked", "private", "stomping", "spoofing", "apc", "timer", "proxy"]):
-                current["indicators"].append(line)
-    if current:
-        findings.append(current)
+        m = det.match(line)
+        if m and current is not None:
+            d = {"thread": int(m.group(1)), "title": m.group(2), "detail": m.group(3),
+                 "severity": m.group(4).lower()}
+            current["detections"].append(d)
+            current["indicators"].append(f"{d['title']}: {d['detail']} ({d['severity']})")
+    for f in findings:
+        sev = [d["severity"] for d in f["detections"]]
+        f["severity"] = "high" if "high" in sev else "medium" if "mid" in sev or "medium" in sev else "low"
     return findings
 
 
 def _parse_beaconeye_output(output):
-    """Parse BeaconEye output into structured beacon findings."""
-    findings = []
-    current = None
-    for line in output.splitlines():
-        line = line.strip()
-        if not line:
+    """Parse BeaconEye output.
+
+    Format (BeaconEye.cs):
+          <image> (<pid>), Keys Found:<bool>, Configuration Address: 0x<addr> [...]
+              <Name>: <Value>        (one line per config item)
+    """
+    import re
+    head = re.compile(r"^(.+?) \((\d+)\), Keys Found:(\w+), Configuration Address: (0x[0-9A-Fa-f]+)")
+    findings, current = [], None
+    for raw in _strip_ansi(output).splitlines():
+        line = raw.strip()
+        m = head.match(line)
+        if m:
+            current = {"process": m.group(1), "pid": int(m.group(2)),
+                       "keys_found": m.group(3).lower() == "true",
+                       "config_address": m.group(4), "config": {},
+                       "summary": f"Cobalt Strike beacon config in {m.group(1)} ({m.group(2)}) at {m.group(4)}"}
+            findings.append(current)
             continue
-        # BeaconEye typically outputs beacon configs when found
-        if "beacon" in line.lower() and ("found" in line.lower() or "config" in line.lower() or "pid" in line.lower()):
-            if current:
-                findings.append(current)
-            current = {"summary": line, "config": {}, "raw": line + "\n"}
-        elif current:
-            current["raw"] += line + "\n"
-            # Parse key-value config lines
-            if ":" in line or "=" in line:
-                sep = ":" if ":" in line else "="
-                parts = line.split(sep, 1)
-                if len(parts) == 2:
-                    current["config"][parts[0].strip()] = parts[1].strip()
-    if current:
-        findings.append(current)
+        if current is not None and raw.startswith("\t") and ": " in line:
+            k, v = line.split(": ", 1)
+            current["config"][k.strip()] = v.strip()
+        elif not raw.startswith("\t"):
+            current = None
+    for f in findings:
+        c2 = f["config"].get("C2Server")
+        if c2:
+            f["config"]["c2"] = c2
+            f["summary"] += f", C2 {c2}"
     return findings
 
 
@@ -5185,55 +6176,13 @@ def _run_memory_scans_async(pid, sha256):
         # Wait a few seconds for the beacon to initialize and enter sleep
         _time.sleep(5)
 
-        # Hunt-Sleeping-Beacons
-        if os.path.isfile(HUNT_SLEEPING_BEACONS_EXE):
-            try:
-                args = [HUNT_SLEEPING_BEACONS_EXE, "--commandline", "-p", str(pid)]
-                result = subprocess.run(
-                    args, capture_output=True, text=True, timeout=60,
-                    cwd=os.path.dirname(HUNT_SLEEPING_BEACONS_EXE)
-                )
-                output = (result.stdout or "") + (result.stderr or "")
-                findings = _parse_hsb_output(output)
-                with _beacon_cache_lock:
-                    _beacon_results_cache[f"hsb_{pid}"] = {
-                        "tool": "Hunt-Sleeping-Beacons",
-                        "pid": pid,
-                        "output": output.strip(),
-                        "findings": findings,
-                        "suspicious_count": len(findings),
-                        "exit_code": result.returncode,
-                    }
-                    if sha256:
-                        _beacon_results_cache[f"hsb_{sha256}"] = _beacon_results_cache[f"hsb_{pid}"]
-            except Exception as e:
-                with _beacon_cache_lock:
-                    _beacon_results_cache[f"hsb_{pid}"] = {"tool": "Hunt-Sleeping-Beacons", "error": str(e)}
-
-        # BeaconEye
-        if os.path.isfile(BEACONEYE_EXE):
-            try:
-                args = [BEACONEYE_EXE, "scan", "--pid", str(pid)]
-                result = subprocess.run(
-                    args, capture_output=True, text=True, timeout=90,
-                    cwd=os.path.dirname(BEACONEYE_EXE)
-                )
-                output = (result.stdout or "") + (result.stderr or "")
-                findings = _parse_beaconeye_output(output)
-                with _beacon_cache_lock:
-                    _beacon_results_cache[f"beaconeye_{pid}"] = {
-                        "tool": "BeaconEye",
-                        "pid": pid,
-                        "output": output.strip(),
-                        "findings": findings,
-                        "beacons_found": len(findings),
-                        "exit_code": result.returncode,
-                    }
-                    if sha256:
-                        _beacon_results_cache[f"beaconeye_{sha256}"] = _beacon_results_cache[f"beaconeye_{pid}"]
-            except Exception as e:
-                with _beacon_cache_lock:
-                    _beacon_results_cache[f"beaconeye_{pid}"] = {"tool": "BeaconEye", "error": str(e)}
+        # Beacon scanners (read-only, fast). Errors are stored too, so the
+        # result view shows why a tool produced nothing.
+        for tool, runner in (("hsb", _run_hsb), ("beaconeye", _run_beaconeye)):
+            result, error = runner(pid)
+            if result is None and error and "not installed" in error:
+                continue
+            _beacon_results_cache.put(tool, result or {"error": error}, pid=pid, sha256=sha256)
 
         # Aether: injection / implant structure scan of the live process.
         # Sampled three times so the evidence layer can tell a persistent
@@ -5246,15 +6195,11 @@ def _run_memory_scans_async(pid, sha256):
                     process_name=process_name,
                 )
                 entry = aether_result or {"tool": "Aether", "error": aether_error}
-                with _beacon_cache_lock:
-                    _beacon_results_cache[f"aether_{pid}"] = entry
-                    if sha256:
-                        _beacon_results_cache[f"aether_{sha256}"] = entry
+                _beacon_results_cache.put("aether", entry, pid=pid, sha256=sha256)
                 if aether_result:
                     _record_scan("Aether", f"PID {pid}", aether_result)
             except Exception as e:
-                with _beacon_cache_lock:
-                    _beacon_results_cache[f"aether_{pid}"] = {"tool": "Aether", "error": str(e)}
+                _beacon_results_cache.put("aether", {"tool": "Aether", "error": str(e)}, pid=pid, sha256=sha256)
 
         # Process Dump last: it writes files, and running it after the scanners
         # keeps their view of the process undisturbed. The clean-hash database
@@ -5266,16 +6211,12 @@ def _run_memory_scans_async(pid, sha256):
                     pid=pid, process_name=process_name, timeout=300
                 )
                 entry = dump_result or {"tool": "Process Dump", "error": dump_error}
-                with _beacon_cache_lock:
-                    _beacon_results_cache[f"processdump_{pid}"] = entry
-                    if sha256:
-                        _beacon_results_cache[f"processdump_{sha256}"] = entry
+                _beacon_results_cache.put("processdump", entry, pid=pid, sha256=sha256)
                 if dump_result:
                     _record_scan("Process Dump", f"PID {pid}", dump_result)
             except Exception as e:
-                with _beacon_cache_lock:
-                    _beacon_results_cache[f"processdump_{pid}"] = {
-                        "tool": "Process Dump", "error": str(e)}
+                _beacon_results_cache.put("processdump", {"tool": "Process Dump", "error": str(e)},
+                                          pid=pid, sha256=sha256)
 
     thread = threading.Thread(target=_scan, daemon=True)
     thread.start()
@@ -6000,7 +6941,9 @@ def api_file_pe():
 
     # --- Sections with entropy ---
     sections = []
-    file_data = open(norm_path, "rb").read()
+    # Reuse the bytes already read for pefile: a second open() here doubled
+    # the I/O and left the handle open (the AV-lock issue noted above).
+    file_data = pe_bytes
     total_entropy = calculate_entropy(file_data)
     result["total_entropy"] = total_entropy
 
@@ -6091,11 +7034,17 @@ def api_file_pe():
         tls = pe.DIRECTORY_ENTRY_TLS
         if tls.struct.AddressOfCallBacks:
             callback_rva = tls.struct.AddressOfCallBacks - pe.OPTIONAL_HEADER.ImageBase
+            # The callback array holds pointers: 8 bytes in PE32+. Reading
+            # DWORDs there interleaved the halves and stopped at the first
+            # zero high half.
+            is64 = pe.OPTIONAL_HEADER.Magic == 0x20B
+            stride = 8 if is64 else 4
+            read_ptr = pe.get_qword_at_rva if is64 else pe.get_dword_at_rva
             try:
                 idx = 0
                 while True:
-                    cb_addr = pe.get_dword_at_rva(callback_rva + idx * 4)
-                    if cb_addr == 0:
+                    cb_addr = read_ptr(callback_rva + idx * stride)
+                    if not cb_addr:
                         break
                     tls_callbacks.append(hex(cb_addr))
                     idx += 1
@@ -6305,7 +7254,7 @@ def api_file_pe_section():
     """Return detailed data for a specific PE section including hex dump and strings."""
     filepath = request.args.get("path", "")
     section_idx = request.args.get("index", type=int)
-    max_bytes = request.args.get("max_bytes", 4096, type=int)
+    max_bytes = max(1, min(request.args.get("max_bytes", 4096, type=int) or 4096, 16 * 1024 * 1024))
 
     if not filepath:
         return jsonify({"error": "No path specified"}), 400
@@ -7754,8 +8703,10 @@ def api_file_visualize():
 # When Flask reloader is active, only start in the child process to avoid duplicate threads
 _is_reloader_child = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
 _reloader_active = os.environ.get("FLASK_DEBUG") == "1" or os.environ.get("FLASK_ENV") == "development"
+# Tests import the module without the loader polling services in the background.
+_background_disabled = os.environ.get("TDC_NO_BACKGROUND") == "1"
 
-if _is_reloader_child or not _reloader_active:
+if not _background_disabled and (_is_reloader_child or not _reloader_active):
     loader = threading.Thread(target=alert_loader_thread, daemon=True)
     loader.start()
 
@@ -7766,4 +8717,6 @@ if __name__ == "__main__":
     print(f"    Agent API:       {DETONATOR_AGENT_API}")
     print(f"    LitterBox:       {LITTERBOX_API}")
 
-    app.run(host="0.0.0.0", port=WEBUI_PORT, debug=False)
+    # 0.0.0.0 keeps the UI reachable from the host over the VM network; set
+    # WEBUI_HOST=127.0.0.1 to restrict it to the VM itself.
+    app.run(host=os.environ.get("WEBUI_HOST", "0.0.0.0"), port=WEBUI_PORT, debug=False)
