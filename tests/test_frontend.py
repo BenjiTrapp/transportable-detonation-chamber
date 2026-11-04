@@ -151,3 +151,40 @@ def test_event_fields_are_escaped_in_html():
                 continue
             offenders.append(f"app.js:{no}: {line.strip()[:120]}")
     assert not offenders, "event-derived values inserted into HTML unescaped:\n" + "\n".join(offenders)
+
+
+def test_pipes_ui_is_wired():
+    html = open(os.path.join(ROOT, "webui", "templates", "index.html"), encoding="utf-8").read()
+    assert 'data-tab="pipes"' in html and 'id="tab-pipes"' in html
+    assert 'id="graph-show-pipes"' in html
+    assert re.search(r"^function renderNamedPipesBlock\(", SOURCE, re.M)
+    # Both detonation result views render the section.
+    assert "renderNamedPipesBlock(np)" in _function_source("renderDetonationPanels")
+    assert "renderNamedPipesBlock(detData.named_pipes)" in _function_source("viewDetonationResult")
+
+
+@needs_node
+def test_pipe_hex_edit_round_trips_binary_bytes():
+    r = _run_node(["pipesHexToBytes", "pipesHexText", "pipesBytesB64", "pipesB64Bytes"], r"""
+        const all = Uint8Array.from({ length: 256 }, (_, i) => i);
+        const text = pipesHexText(all);
+        const parsed = pipesHexToBytes(text);
+        const b64 = pipesBytesB64(parsed);
+        const back = pipesB64Bytes(b64);
+        console.log(JSON.stringify({
+          b64, expected: Buffer.from(all).toString('base64'),
+          back: Array.from(back), messy: Array.from(pipesHexToBytes(' 00ff\n0A  7f ')),
+          odd: pipesHexToBytes('abc'), bad: pipesHexToBytes('zz'), empty: Array.from(pipesHexToBytes('')),
+        }));""")
+    assert r["b64"] == r["expected"]
+    assert r["back"] == list(range(256))
+    assert r["messy"] == [0, 255, 10, 127]
+    assert r["odd"] is None and r["bad"] is None and r["empty"] == []
+
+
+@needs_node
+def test_pipe_names_are_canonicalised_like_the_backend():
+    r = _run_node(["pipesCanonical"], r"""
+        console.log(JSON.stringify([`\\\\.\\pipe\\MSSE-1-server`, 'MSSE-1-server', `\\MSSE-1-server`,
+            `\\\\HOST\\PIPE\\x`, `  \\\\x  `].map(pipesCanonical)));""")
+    assert r == ["\\MSSE-1-server", "\\MSSE-1-server", "\\MSSE-1-server", "\\x", "\\x"]

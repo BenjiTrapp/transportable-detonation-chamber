@@ -4935,6 +4935,7 @@ const graphState = {
     isLoading: false,     // true while /api/process-graph is being fetched
     layoutMode: 'tree',   // 'tree' | 'force' | 'iso'
     isoCollapsed: new Set(),  // PIDs whose subtree is folded in the isometric view
+    pipesDefaultFor: null,    // focus root the Pipes toggle default was last applied to
 };
 
 // Programmatically focus the process graph on a PID (used by alert/process pivots).
@@ -5424,8 +5425,7 @@ function buildGraph(payload) {
                 info.created.forEach(c => info.connected.forEach(k => {
                     if (c === k) return;
                     const lk = `${c}>${k}`;
-                    if (!links[lk]) links[lk] = { source: `proc_${c}`, target: `proc_${k}`, type: 'pipe-link', label: info.name, pipes: [] };
-                    links[lk].pipes.push(info.name);
+                    if (!links[lk]) links[lk] = { source: `proc_${c}`, target: `proc_${k}`, type: 'pipe-link', label: info.name };
                 }));
             }
         }
@@ -9404,6 +9404,7 @@ const pipesState = {
     capped: false,           // more messages than PIPES_MAX_MESSAGES
     editing: null,           // seq of the held message being edited
     finalFetchFor: null,     // ended session whose last messages were loaded
+    actionGen: 0,            // bumped by every message action; older polls are dropped
     busy: false,
     eventsSeq: 0,
     gone: new Set(),         // lower-case names the API reported as no longer existing
@@ -9506,10 +9507,20 @@ function pipesInterceptFrom(name) {
     showToast('info', 'Pipe prefilled', 'Choose observe or hold and press Start session.');
 }
 
+// Same as pipe_analysis.canonical_name: "\\.\pipe\x", "x" and "\x" -> "\x".
+function pipesCanonical(name) {
+    const n = String(name || '').trim().replace(/^\\\\[^\\]+\\pipe(?=\\|$)/i, '');
+    return '\\' + n.replace(/^\\+/, '');
+}
+
+function pipesIsGone(name) {
+    return pipesState.gone.has(pipesCanonical(name).toLowerCase());
+}
+
 function pipesMarkGone(name) {
-    pipesState.gone.add(String(name || '').toLowerCase());
+    pipesState.gone.add(pipesCanonical(name).toLowerCase());
     document.querySelectorAll('button[data-pipe-intercept]').forEach(b => {
-        if (pipesState.gone.has(String(b.dataset.pipeIntercept || '').toLowerCase())) {
+        if (pipesIsGone(b.dataset.pipeIntercept)) {
             b.disabled = true;
             b.title = 'The pipe no longer exists';
             if (!b.nextElementSibling || !b.nextElementSibling.classList.contains('pipes-gone-hint')) {
@@ -9635,7 +9646,7 @@ async function refreshPipeEvents() {
             <td class="pipes-proc" title="${escapeHtml(image)}">${escapeHtml(short)}</td>
             <td class="mono pipe-name-cell">${escapeHtml(ev.pipe || '')}</td>
             <td>${ev.family ? `<span class="pipe-family">${escapeHtml(ev.family)}</span>` : '<span class="muted">&mdash;</span>'}</td>
-            <td class="pipes-row-actions"><button class="btn btn-xs" onclick="pipesPrefill(${jsArg(ev.pipe || '')}, 'attach')" title="Prefill an attach session for this pipe">Intercept</button></td>
+            <td class="pipes-row-actions"><button class="btn btn-xs pipes-intercept-btn" data-pipe-intercept="${escapeHtml(ev.pipe || '')}" ${pipesIsGone(ev.pipe) ? 'disabled title="The pipe no longer exists"' : 'title="Prefill an attach session for this pipe"'} onclick="pipesPrefill(${jsArg(ev.pipe || '')}, 'attach')">Intercept</button></td>
         </tr>`;
     });
     html += '</tbody></table>';
@@ -9661,8 +9672,8 @@ async function refreshPipeSessions() {
         renderPipeSessionHeader(sel);
         const live = PIPES_LIVE.has(sel.state);
         if (live || pipesState.finalFetchFor !== sel.id) {
-            await pipesLoadMessages();
-            if (!live) pipesState.finalFetchFor = sel.id;
+            const complete = await pipesLoadMessages();
+            if (!live && complete) pipesState.finalFetchFor = sel.id;
         }
     }
 }
@@ -9710,7 +9721,9 @@ function pipesSelectSession(sid, fresh = false) {
     const sel = pipesState.sessions.find(s => s.id === sid);
     if (sel) {
         renderPipeSessionHeader(sel);
-        pipesLoadMessages().then(() => { if (!PIPES_LIVE.has(sel.state)) pipesState.finalFetchFor = sel.id; });
+        pipesLoadMessages().then(complete => {
+            if (complete && !PIPES_LIVE.has(sel.state) && pipesState.selected === sid) pipesState.finalFetchFor = sel.id;
+        });
     }
 }
 
@@ -9756,35 +9769,48 @@ function renderPipeSessionHeader(s) {
     head.innerHTML = html;
 }
 
+// Load new messages (and the current state of held ones) of the selected
+// session, page by page until a short page or the UI cap. Returns true when
+// everything the server has was seen. A response that started before the
+// last Forward/Edit/Drop/Release is dropped: it could still say "held".
+const PIPES_PAGE = 1000;   // server maximum per request
 async function pipesLoadMessages() {
     const sid = pipesState.selected;
-    if (!sid) return;
+    if (!sid) return false;
     const held = [...pipesState.messages.values()].filter(m => m.state === 'held').map(m => m.seq);
-    const after = held.length ? Math.min(...held) - 1 : pipesState.lastSeq;
-    let data;
-    try {
-        const resp = await fetch(`/api/pipes/intercept/${encodeURIComponent(sid)}/messages?after=${after}&limit=1000`);
-        data = await resp.json().catch(() => ({}));
-        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-    } catch (e) {
-        if (sid === pipesState.selected) {
-            const box = document.getElementById('pipes-msgs');
-            if (box && !pipesState.messages.size) box.innerHTML = `<div class="pipes-empty">Cannot load messages: ${escapeHtml(e.message)}</div>`;
+    let after = held.length ? Math.min(...held) - 1 : pipesState.lastSeq;
+    let complete = false;
+    while (!complete) {
+        const gen = pipesState.actionGen;
+        let data;
+        try {
+            const resp = await fetch(`/api/pipes/intercept/${encodeURIComponent(sid)}/messages?after=${jsInt(after)}&limit=${PIPES_PAGE}`);
+            data = await resp.json().catch(() => ({}));
+            if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        } catch (e) {
+            if (sid === pipesState.selected) {
+                const box = document.getElementById('pipes-msgs');
+                if (box && !pipesState.messages.size) box.innerHTML = `<div class="pipes-empty">Cannot load messages: ${escapeHtml(e.message)}</div>`;
+            }
+            break;
         }
-        return;
-    }
-    if (sid !== pipesState.selected) return;
-    for (const m of data.messages || []) {
-        const seq = Number(m && m.seq);
-        if (!Number.isInteger(seq)) continue;
-        pipesState.lastSeq = Math.max(pipesState.lastSeq, seq);
-        if (!pipesState.messages.has(seq) && pipesState.messages.size >= PIPES_MAX_MESSAGES) {
-            pipesState.capped = true;
-            continue;
+        if (sid !== pipesState.selected || gen !== pipesState.actionGen) break;
+        const page = Array.isArray(data.messages) ? data.messages : [];
+        for (const m of page) {
+            const seq = Number(m && m.seq);
+            if (!Number.isInteger(seq)) continue;
+            pipesState.lastSeq = Math.max(pipesState.lastSeq, seq);
+            after = Math.max(after, seq);
+            if (!pipesState.messages.has(seq) && pipesState.messages.size >= PIPES_MAX_MESSAGES) {
+                pipesState.capped = true;
+                continue;
+            }
+            pipesState.messages.set(seq, m);
         }
-        pipesState.messages.set(seq, m);
+        complete = page.length < PIPES_PAGE || pipesState.capped;
     }
-    renderPipeMessages();
+    if (sid === pipesState.selected) renderPipeMessages();
+    return complete;
 }
 
 function pipesB64Bytes(b64) {
@@ -9827,6 +9853,15 @@ function pipesHexDump(bytes, limit = PIPES_HEX_PREVIEW) {
     let html = lines.join('\n');
     if (bytes.length > n) html += `\n<span class="ph-more">… ${bytes.length - n} more byte(s), see the JSON export</span>`;
     return html;
+}
+
+// Hex text (whitespace ignored) -> bytes, or null if it is not whole hex pairs.
+function pipesHexToBytes(text) {
+    const hex = String(text || '').replace(/\s+/g, '');
+    if (!/^([0-9a-fA-F]{2})*$/.test(hex)) return null;
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+    return bytes;
 }
 
 function pipesHexText(bytes) {
@@ -9938,8 +9973,10 @@ async function pipesAct(seq, action, dataB64) {
     try {
         const body = { action };
         if (action === 'edit') body.data_b64 = dataB64;
+        pipesState.actionGen += 1;
         const rec = await pipesPost(`/api/pipes/intercept/${encodeURIComponent(sid)}/messages/${jsInt(seq)}`, body);
         if (sid !== pipesState.selected) return true;
+        pipesState.actionGen += 1;      // polls that overlapped the request
         pipesApplyRecord(rec);
         if (pipesState.editing === seq) pipesState.editing = null;
         renderPipeMessages();
@@ -9967,19 +10004,19 @@ async function pipesEditApply(seq) {
     const ta = document.getElementById(`pipe-edit-${seq}`);
     const err = document.getElementById(`pipe-edit-error-${seq}`);
     if (!ta) return;
-    const hex = ta.value.replace(/\s+/g, '');
-    if (!/^([0-9a-fA-F]{2})*$/.test(hex)) {
+    const bytes = pipesHexToBytes(ta.value);
+    if (!bytes) {
         if (err) err.textContent = 'Not valid hex: use pairs of 0-9 / a-f.';
         return;
     }
-    const bytes = new Uint8Array(hex.length / 2);
-    for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
     await pipesAct(seq, 'edit', pipesBytesB64(bytes));
 }
 
 async function pipesReleaseAll(sid) {
     try {
+        pipesState.actionGen += 1;
         const d = await pipesPost(`/api/pipes/intercept/${encodeURIComponent(sid)}/release`);
+        pipesState.actionGen += 1;
         showToast('success', 'Held messages released', `${Number(d.released) || 0} forwarded`);
     } catch (e) {
         showToast('error', 'Release failed', e.message);
@@ -9990,7 +10027,9 @@ async function pipesReleaseAll(sid) {
 
 async function pipesStopSession(sid) {
     try {
+        pipesState.actionGen += 1;
         const resp = await fetch(`/api/pipes/intercept/${encodeURIComponent(sid)}`, { method: 'DELETE' });
+        pipesState.actionGen += 1;
         const d = await resp.json().catch(() => ({}));
         if (!resp.ok) throw new Error(d.error || `HTTP ${resp.status}`);
         showToast('info', 'Session stopped', String(d.pattern || sid));
@@ -10036,7 +10075,7 @@ function renderNamedPipesBlock(np) {
         ];
         if (!rows.length) rows.push(['', '']);
         const span = rows.length;
-        const gone = pipesState.gone.has(name.toLowerCase());
+        const gone = pipesIsGone(name);
         const flags = (p.flags || []).map(f =>
             `<span class="pipe-flag pipe-flag-${cssToken(f)}">${escapeHtml(PIPE_FLAG_LABELS[f] || f)}</span>`).join('');
         rows.forEach(([action, key], i) => {
