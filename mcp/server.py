@@ -544,6 +544,29 @@ def tdc_submissions() -> str:
     return f"{len(entries)} submissions:\n" + "\n".join(lines)
 
 
+def _pipe_user_label(pipes: list):
+    """Formatter for the process keys in named_pipes created_by/connected_by.
+
+    "<pid>?" (the sample, whose ProcessCreate Sysmon missed) reads "<pid> (sample)".
+    "<pid>@<epoch>" instance keys shrink to the plain PID, unless two instances
+    of that PID appear among these pipes - then the full key tells them apart.
+    """
+    instances: dict = {}
+    for p in pipes:
+        for k in (p.get("created_by") or []) + (p.get("connected_by") or []):
+            pid, at, _ = str(k).partition("@")
+            if at:
+                instances.setdefault(pid, set()).add(str(k))
+
+    def show(key) -> str:
+        key = str(key)
+        if key.endswith("?"):
+            return f"{key[:-1]} (sample)"
+        pid = key.partition("@")[0]
+        return key if len(instances.get(pid, ())) > 1 else pid
+    return show
+
+
 @mcp.tool()
 def tdc_detonation_results(sha256: Optional[str] = None, pid: Optional[int] = None,
                            filename: Optional[str] = None) -> str:
@@ -573,16 +596,22 @@ def tdc_detonation_results(sha256: Optional[str] = None, pid: Optional[int] = No
     if isinstance(nb, dict) and nb.get("evidence_findings"):
         lines.append(f"Network beaconing: {len(nb['evidence_findings'])} periodic destination(s)")
     np_ = d.get("named_pipes")
-    if isinstance(np_, dict) and np_.get("available"):
+    if isinstance(np_, dict) and np_.get("available") is False:
+        lines.append(f"Named pipes: unavailable ({np_.get('reason') or 'unknown reason'})")
+    elif isinstance(np_, dict) and np_.get("available"):
         pipes = np_.get("pipes") or []
         families = list(dict.fromkeys(p["family"] for p in pipes if p.get("family")))
         lines.append(f"Named pipes: {len(pipes)}"
                      + (f" (families {', '.join(families)})" if families else "")
                      + (" [truncated]" if np_.get("truncated") else ""))
-        for p in pipes[:10]:
-            if p.get("family") or p.get("flags"):
-                lines.append(f"  {p.get('pipe')}" + (f" [{p['family']}]" if p.get("family") else "")
-                             + (f" {', '.join(p['flags'])}" if p.get("flags") else ""))
+        show = _pipe_user_label(pipes)
+        for p in [p for p in pipes if p.get("family") or p.get("flags")][:10]:
+            users = [f"{role} by {', '.join(show(k) for k in p.get(field) or [])}"
+                     for field, role in (("created_by", "created"), ("connected_by", "connected"))
+                     if p.get(field)]
+            lines.append(f"  {p.get('pipe')}" + (f" [{p['family']}]" if p.get("family") else "")
+                         + (f" {', '.join(p['flags'])}" if p.get("flags") else "")
+                         + (f" - {', '.join(users)}" if users else ""))
     ec = d.get("exit_capture_result")
     if isinstance(ec, dict):
         lines.append(f"Exit capture: {'observed' if ec.get('observed') else ec.get('status') or 'no dump'}")
@@ -1410,7 +1439,7 @@ def tdc_pipes(pid: Optional[str] = None, name: Optional[str] = None, since: Opti
              + (" (truncated, raise max_events or narrow the filter)" if d.get("truncated") else "")]
     for ev in events:
         image = (ev.get("image") or "").split("\\")[-1]
-        lines.append(f"[{(ev.get('timestamp') or '')[:23]}] {ev.get('type', '?'):<13} {ev.get('pipe')}"
+        lines.append(f"[{(ev.get('timestamp') or '')[:23]}] {(ev.get('type') or '?'):<13} {ev.get('pipe')}"
                      + (f" [{ev['family']}]" if ev.get("family") else "")
                      + f"  PID {ev.get('pid')} {image}"
                      + (f" ({ev['user']})" if ev.get("user") else ""))
@@ -1421,14 +1450,17 @@ def tdc_pipes(pid: Optional[str] = None, name: Optional[str] = None, since: Opti
 
 
 @mcp.tool()
-def tdc_pipe_sessions(session_id: Optional[str] = None, max_messages: int = 20) -> str:
+def tdc_pipe_sessions(session_id: Optional[str] = None, max_messages: int = 20, after: int = 0) -> str:
     """Named pipe interception sessions (read-only; start, stop and forward in
     the web UI's Pipes tab). Without an ID: list all sessions. With an ID: the
-    session and its first recorded messages as hex previews (64 bytes each).
+    session and its recorded messages as hex previews (64 bytes each), page by
+    page via after.
 
     Args:
         session_id: Interception session ID (omit to list sessions)
         max_messages: Messages to show for a session (default 20)
+        after: Show messages with a sequence number above this (default 0 =
+               from the start; the output names the value for the next page)
     """
     if not session_id:
         d = _call("GET", "/api/pipes/intercept")
@@ -1438,7 +1470,7 @@ def tdc_pipe_sessions(session_id: Optional[str] = None, max_messages: int = 20) 
         if not sessions:
             return "No interception sessions."
         return f"{len(sessions)} session(s):\n" + "\n".join(
-            f"  {s.get('id')}  {s.get('state'):<8} {s.get('pattern')} ({s.get('match')}, {s.get('how')}, "
+            f"  {s.get('id')}  {(s.get('state') or '?'):<8} {s.get('pattern')} ({s.get('match')}, {s.get('how')}, "
             f"{s.get('mode')}{', squat' if s.get('squat') else ''})  "
             f"{s.get('message_count', 0)} msg(s), {s.get('connections', 0)} conn(s)"
             + (f"  error: {s['last_error']}" if s.get("last_error") else "")
@@ -1446,7 +1478,7 @@ def tdc_pipe_sessions(session_id: Optional[str] = None, max_messages: int = 20) 
     s = _call("GET", f"/api/pipes/intercept/{session_id}")
     if s.get("error"):
         return f"Error: {s['error']}"
-    lines = [f"Session {s.get('id')}: {s.get('state')} - {s.get('pattern')} ({s.get('match')}, "
+    lines = [f"Session {s.get('id')}: {s.get('state') or '?'} - {s.get('pattern')} ({s.get('match')}, "
              f"{s.get('how')}, {s.get('mode')}{', squat' if s.get('squat') else ''})",
              f"  {s.get('connections', 0)} connection(s), {s.get('message_count', 0)} message(s), "
              f"{s.get('held_count', 0)} held, {s.get('self_connect_retries', 0)} self-connect retries"]
@@ -1457,13 +1489,17 @@ def tdc_pipe_sessions(session_id: Optional[str] = None, max_messages: int = 20) 
     if s.get("end_reason"):
         lines.append(f"  Ended: {s['end_reason']}")
     m = _call("GET", f"/api/pipes/intercept/{session_id}/messages",
-              params={"after": 0, "limit": max_messages})
+              params={"after": after, "limit": max_messages})
     if m.get("error"):
         return "\n".join(lines + [f"Messages: error: {m['error']}"])
     msgs = m.get("messages") or []
     total = s.get("message_count") or 0
-    lines.append(f"\nFirst {len(msgs)} of {total} message(s):" if total > len(msgs)
-                 else f"\n{len(msgs)} message(s):")
+    where = f" after #{after}" if after else ""
+    if total > len(msgs):
+        more = f"; next page: after={msgs[-1].get('seq')}" if msgs and len(msgs) >= max_messages else ""
+        lines.append(f"\n{'First ' if not after else ''}{len(msgs)} of {total} message(s){where}{more}:")
+    else:
+        lines.append(f"\n{len(msgs)} message(s){where}:")
     for msg in msgs:
         lines.append(f"  #{msg.get('seq')} [{_clock(msg.get('ts'))}] conn {msg.get('conn')} {msg.get('dir')} "
                      f"{msg.get('size')} B {msg.get('state')}"

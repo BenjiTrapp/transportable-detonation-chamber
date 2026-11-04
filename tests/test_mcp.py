@@ -138,28 +138,61 @@ def test_pipe_sessions_tool_reads_messages(api):
 
     out = server.tdc_pipe_sessions("s1", max_messages=5)
     assert ("/api/pipes/intercept/s1/messages", {"after": 0, "limit": 5}) in fake.calls
+    assert "\n2 message(s):" in out
     assert "4d 5a 90 00 68 65 6c 6c 6f" in out and "MZ..hello" in out
     assert out.count("00 01 02") == 1 and "..." in out          # first 64 bytes only
     assert "edited" in out and "78 79 7a" in out                # original shown
     assert server.tdc_pipe_sessions("nope") == "Error: Interception session nope not found"
 
+    fake.routes["/api/pipes/intercept/s1"] = dict(session, message_count=7, state=None)
+    out = server.tdc_pipe_sessions("s1", max_messages=2)
+    assert "Session s1: ? -" in out
+    assert "First 2 of 7 message(s); next page: after=2:" in out
+    out = server.tdc_pipe_sessions("s1", max_messages=2, after=2)
+    assert ("/api/pipes/intercept/s1/messages", {"after": 2, "limit": 2}) in fake.calls
+    assert "2 of 7 message(s) after #2; next page: after=2:" in out
+
+    fake.routes["/api/pipes/intercept"] = {"sessions": [dict(session, state=None)]}
+    assert "s1  ?" in server.tdc_pipe_sessions()
+
 
 def test_detonation_results_mentions_pipes(api):
     base = {"verdict": {"label": "SUSPICIOUS", "score": 2, "reasons": []}, "ready": {}}
     api({"/api/detonation/results": dict(base, named_pipes={"available": True, "pipes": [
-        {"pipe": "\\MSSE-1-server", "family": "Cobalt Strike", "created_by": ["4072?"], "connected_by": [],
-         "flags": ["c2_default"]},
+        {"pipe": "\\MSSE-1-server", "family": "Cobalt Strike", "created_by": ["4072?"],
+         "connected_by": ["812@1700000000.0"], "flags": ["c2_default", "cross_process"]},
         {"pipe": "\\MSSE-2-server", "family": "Cobalt Strike", "created_by": ["4072?"], "connected_by": [],
          "flags": ["c2_default"]},
         {"pipe": "\\abc", "family": None, "created_by": ["4072@1"], "connected_by": [], "flags": []},
+        {"pipe": "\\spoolss", "family": None, "created_by": ["700@5.0"],
+         "connected_by": ["4072@1", "4072@2"], "flags": ["sensitive_system"]},
     ], "evidence_findings": []})})
     out = server.tdc_detonation_results(pid=4072)
-    assert "Named pipes: 3 (families Cobalt Strike)" in out
+    assert "Named pipes: 4 (families Cobalt Strike)" in out and "[truncated]" not in out
+    lines = out.splitlines()
+    assert ("  \\MSSE-1-server [Cobalt Strike] c2_default, cross_process"
+            " - created by 4072 (sample), connected by 812") in lines
+    assert "  \\MSSE-2-server [Cobalt Strike] c2_default - created by 4072 (sample)" in lines
+    # two instances of PID 4072 among the pipes: keep the keys apart
+    assert "  \\spoolss sensitive_system - created by 700, connected by 4072@1, 4072@2" in lines
+    assert not any(l.startswith("  \\abc") for l in lines)       # unflagged: count only
+
+    # flagged pipes are picked before the 10-line cap
+    plain = [{"pipe": f"\\p{i}", "family": None, "flags": []} for i in range(12)]
+    api({"/api/detonation/results": dict(base, named_pipes={"available": True, "truncated": True,
+        "pipes": plain + [{"pipe": "\\late", "family": None, "flags": ["random_name"]}],
+        "evidence_findings": []})})
+    out = server.tdc_detonation_results(pid=4072)
+    assert "Named pipes: 13 [truncated]" in out and "  \\late random_name" in out
 
     api({"/api/detonation/results": dict(base, named_pipes={"available": True, "pipes": [
         {"pipe": "\\abc", "family": None, "flags": []}], "evidence_findings": []})})
     out = server.tdc_detonation_results(pid=4072)
     assert "Named pipes: 1" in out and "families" not in out
+
+    api({"/api/detonation/results": dict(base, named_pipes={
+        "available": False, "reason": "Sysmon not running", "pipes": [], "evidence_findings": []})})
+    assert "Named pipes: unavailable (Sysmon not running)" in server.tdc_detonation_results(pid=4072)
 
 
 def test_every_tool_has_a_docstring_with_its_arguments():
