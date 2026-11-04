@@ -3635,6 +3635,8 @@ def api_detonation_results():
     # --- Network beaconing from Sysmon EID 3 (survives process exit) ---
     if pid:
         results["network_beaconing"] = _network_beaconing_for_pid(pid)
+        # --- Named pipes from Sysmon EID 17/18 (also survive process exit) ---
+        results["named_pipes"] = _pipe_activity_for(pid, sha256 or None)
 
     # Memory tool status
     results["beacon_tools"] = {
@@ -4028,6 +4030,8 @@ def _compute_verdict(results, matching_alerts):
                                "beaconeye", "exit_capture_result") if results.get(k)]
     if (results.get("network_beaconing") or {}).get("evidence_findings"):
         mem_sources.append("network_beaconing")
+    if (results.get("named_pipes") or {}).get("evidence_findings"):
+        mem_sources.append("named_pipes")
     if mem_sources:
         evidence = memory_evidence.score(mem_findings, baseline=_memory_baseline)
 
@@ -5703,6 +5707,21 @@ def _run_sweep(use_aether, use_processdump, capture_baseline):
                     {"dumps": dumps}, process=entry["identity"])
 
     captured = 0
+    pipe_captured = None
+    if capture_baseline:
+        pipe_captured = 0
+        if _is_sysmon_running():
+            since = datetime.datetime.fromtimestamp(time.time() - 1800).astimezone().isoformat()
+            try:
+                raw = _read_sysmon_events(event_ids=[17, 18], since=since, max_events=5000)
+            except Exception as e:
+                raw = [{"error": str(e)}]
+            pipe_errors = [e for e in raw if isinstance(e, dict) and "error" in e]
+            pipe_events = [e for e in raw if isinstance(e, dict) and "error" not in e]
+            if pipe_errors and not pipe_events:
+                errors.append(f"Pipe baseline failed: {pipe_errors[0]['error']}")
+            pipe_captured = _memory_baseline.add(
+                pipe_analysis.baseline_findings(pipe_events, self_pid=os.getpid()))
     processes, excluded = [], []
     for pid, entry in per_pid.items():
         if _is_host_tool(pid, entry["process"]):
@@ -5741,6 +5760,7 @@ def _run_sweep(use_aether, use_processdump, capture_baseline):
         # Security tools match their own detection rules; listed, not scored.
         "excluded_host_tools": sorted(excluded, key=lambda e: e["process"].lower()),
         "baseline_keys_added": captured if capture_baseline else None,
+        "pipe_keys_added": pipe_captured,
         "baseline": _memory_baseline.stats(),
         "stats": stats,
         "errors": errors,

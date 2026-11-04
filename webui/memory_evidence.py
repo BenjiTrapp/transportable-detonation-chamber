@@ -126,6 +126,29 @@ KINDS = {
         "weight": 4.5, "evidence": EVIDENCE_STRUCTURAL, "corroborate": False,
         "label": "Decoded C2 beacon configuration",
     },
+    # Named pipes from Sysmon EID 17/18. A catalogued implant/tool default
+    # name is graded by its catalog weight and is never baselined away: a
+    # Cobalt Strike pipe on the clean host is a finding, not noise.
+    "pipe_c2_default": {
+        "weight": 4.0, "evidence": EVIDENCE_STRUCTURAL, "corroborate": False,
+        "baseline_exempt": True,
+        "label": "Named pipe matches a known C2 / tool default",
+    },
+    "pipe_cross_process": {
+        "weight": 1.5, "evidence": EVIDENCE_BEHAVIORAL, "corroborate": True,
+        "label": "Named pipe shared with another process",
+    },
+    "pipe_sensitive_system": {
+        "weight": 1.0, "evidence": EVIDENCE_BEHAVIORAL, "corroborate": True,
+        "label": "Connected to a sensitive system pipe (SCM/LSA/SAM)",
+    },
+    # Random names are exempt because their normalized keys collapse to
+    # wildcards: one GUID pipe in the baseline would hide every other.
+    "pipe_random_name": {
+        "weight": 0.8, "evidence": EVIDENCE_STRING, "corroborate": True,
+        "baseline_exempt": True,
+        "label": "Randomly named pipe",
+    },
     # Extracted artifacts
     "dumped_hidden_module": {
         "weight": 3.0, "evidence": EVIDENCE_ARTIFACT, "corroborate": False,
@@ -722,6 +745,11 @@ def score(findings, baseline=None):
     def proc_key(f):
         return (f.get("process") or "").lower()
 
+    def known(f):
+        if baseline is None or KINDS.get(f.get("kind"), {}).get("baseline_exempt"):
+            return False
+        return baseline.knows(f["key"])
+
     # Only substantial findings may corroborate another source. Otherwise a
     # trivial string hit ("kernel32.dll", weight 0.2) would vouch for anything
     # that happens to share the process.
@@ -729,7 +757,7 @@ def score(findings, baseline=None):
     for f in findings:
         if f.get("base_weight", 0) < CORROBORATION_MIN_WEIGHT:
             continue
-        if baseline is not None and baseline.knows(f["key"]):
+        if known(f):
             continue
         sources_by_process.setdefault(proc_key(f), set()).add(f["source"])
 
@@ -738,7 +766,7 @@ def score(findings, baseline=None):
         item = dict(f)
         factors = {}
 
-        if baseline is not None and baseline.knows(f["key"]):
+        if known(f):
             item["baseline"] = "known"
             item["confidence"] = 0.0
             item["score"] = 0.0
@@ -866,6 +894,11 @@ def collect(results, process=""):
     net = results.get("network_beaconing") or {}
     if isinstance(net, dict) and net.get("evidence_findings"):
         findings += net["evidence_findings"]
+
+    # Named pipes from Sysmon EID 17/18.
+    pipes = results.get("named_pipes") or {}
+    if isinstance(pipes, dict) and pipes.get("evidence_findings"):
+        findings += pipes["evidence_findings"]
 
     dyn = results.get("litterbox_dynamic") or {}
     if isinstance(dyn, dict):

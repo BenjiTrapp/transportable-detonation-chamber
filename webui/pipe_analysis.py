@@ -12,6 +12,8 @@ import os
 import re
 from collections import Counter
 
+from memory_evidence import KINDS, MemoryFinding
+
 DEFAULT_SIGNATURES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                        "pipe_signatures.json")
 
@@ -186,16 +188,19 @@ def analyze(events, sample_keys, resolve, self_pid, signatures=None) -> dict:
         g = groups.setdefault(name.lower(), {"pipe": name, "created": [], "connected": [],
                                              "times": [], "sample_created": False,
                                              "other_created": False, "sample_connected": False,
-                                             "other_connected": False})
+                                             "other_connected": False, "images": []})
         in_sample = key is not None and key in sample_keys
         shown = key if key is not None else str(pid)
         role = "created" if ev["type"] == "PipeCreated" else "connected"
         if shown not in g[role]:
             g[role].append(shown)
+        image = ev.get("image") or ""
+        if in_sample and image not in g["images"]:
+            g["images"].append(image)
         g[("sample_" if in_sample else "other_") + role] = True
         g["times"].append((_epoch(ts), ts))
 
-    pipes = []
+    pipes, findings = [], []
     for g in groups.values():
         if not (g["sample_created"] or g["sample_connected"]):
             continue
@@ -221,6 +226,75 @@ def analyze(events, sample_keys, resolve, self_pid, signatures=None) -> dict:
             "last_seen": timed[-1][1] if timed else (g["times"][-1][1] if g["times"] else ""),
             "flags": flags,
         })
+        findings += _flag_findings(name, flags, hit, g["images"])
     pipes.sort(key=lambda p: (_epoch(p["first_seen"]) or 0.0, p["pipe"].lower()))
-    # Task 4 turns flags into MemoryFinding evidence.
-    return {"pipes": pipes, "evidence_findings": []}
+    return {"pipes": pipes, "evidence_findings": findings}
+
+
+SOURCE = "sysmon-pipes"
+_FLAG_KINDS = {
+    "c2_default": "pipe_c2_default",
+    "cross_process": "pipe_cross_process",
+    "sensitive_system": "pipe_sensitive_system",
+    "random_name": "pipe_random_name",
+}
+
+
+def _finding(kind, name, image, detail, weight=None, family=None):
+    return MemoryFinding(
+        source=SOURCE, kind=kind, process=image, detail=detail,
+        identity=(normalize_for_key(name),), weight=weight,
+        extra={"pipe": name, "family": family},
+    )
+
+
+def _flag_findings(name, flags, hit, images) -> list:
+    """One finding per flag and sample image that touched the pipe."""
+    out = []
+    for flag in flags:
+        kind = _FLAG_KINDS.get(flag)
+        if not kind:
+            continue
+        weight, family, detail = None, None, name
+        if kind == "pipe_c2_default" and hit:
+            weight = hit.get("weight") or KINDS[kind]["weight"]
+            family = hit.get("family")
+            detail = f"{name} ({family})" + (f" - {hit['note']}" if hit.get("note") else "")
+        for image in images or [""]:
+            out.append(_finding(kind, name, image, detail, weight=weight, family=family))
+    return out
+
+
+def _never_baselined(name: str) -> bool:
+    """Names whose key is all wildcards or random: baselining them would
+    suppress every other random-named pipe."""
+    return normalize_for_key(name).strip("\\*") == "" or looks_random(name)
+
+
+def baseline_findings(events, self_pid) -> list:
+    """Baseline-able (non-C2) findings for every pipe event on a clean host.
+
+    Each event yields the kinds a later detonation could report for the same
+    process and normalized pipe name, so they share its finding key.
+    """
+    self_pid = str(self_pid) if self_pid is not None else None
+    out, seen = [], set()
+    for ev in events or []:
+        if not isinstance(ev, dict) or ev.get("type") not in ("PipeCreated", "PipeConnected"):
+            continue
+        pid = ev.get("pid")
+        if pid in (None, "") or str(pid) == self_pid:
+            continue
+        name = canonical_name(ev.get("pipe") or "")
+        if name == "\\" or name.lower().startswith(_IGNORED_PREFIXES) or _never_baselined(name):
+            continue
+        image = ev.get("image") or ""
+        kinds = ["pipe_cross_process"]
+        if ev["type"] == "PipeConnected" and name.lower() in SENSITIVE_SYSTEM_PIPES:
+            kinds.append("pipe_sensitive_system")
+        for kind in kinds:
+            f = _finding(kind, name, image, name)
+            if f["key"] not in seen:
+                seen.add(f["key"])
+                out.append(f)
+    return out
