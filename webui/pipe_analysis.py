@@ -19,7 +19,7 @@ _MATCH_TYPES = ("prefix", "exact", "contains", "regex")
 _PIPE_PREFIX_RE = re.compile(r"^\\\\[^\\]+\\pipe(?=\\|$)", re.IGNORECASE)
 _GUID_RE = re.compile(r"\{?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}?",
                       re.IGNORECASE)
-_HEX_RUN_RE = re.compile(r"[0-9a-f]{4,}")
+_HEX_RUN_RE = re.compile(r"(?=[0-9a-f]*\d)[0-9a-f]{4,}")
 _DIGITS_RE = re.compile(r"[0-9]+")
 _REGEX_CACHE: dict = {}
 
@@ -55,17 +55,23 @@ def load_signatures(path: str | None = None) -> list[dict]:
     sigs = []
     for i, entry in enumerate(raw):
         if not isinstance(entry, dict):
+            print(f"[pipe_analysis] skipping non-object signature #{i}: {entry!r}")
             continue
         pattern = entry.get("pattern")
         kind = entry.get("match")
         if not isinstance(pattern, str) or not pattern or kind not in _MATCH_TYPES:
             print(f"[pipe_analysis] skipping malformed signature #{i}: {entry!r}")
             continue
+        try:
+            weight = float(entry.get("weight") or 0.0)
+        except (TypeError, ValueError):
+            print(f"[pipe_analysis] skipping signature #{i} with invalid weight {entry.get('weight')!r}")
+            continue
         sig = {
             "family": str(entry.get("family") or "unknown"),
             "pattern": pattern,
             "match": kind,
-            "weight": float(entry.get("weight") or 0.0),
+            "weight": weight,
             "note": str(entry.get("note") or ""),
         }
         if kind == "regex":
@@ -93,7 +99,7 @@ def _matches(name: str, sig: dict) -> bool:
     if kind == "exact":
         return lname == canonical_name(pat).lower()
     if kind == "prefix":
-        return lname.startswith(pat)
+        return lname.startswith(canonical_name(pat).lower())
     if kind == "contains":
         return pat in lname
     return False

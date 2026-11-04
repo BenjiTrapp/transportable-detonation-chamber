@@ -71,3 +71,35 @@ def test_signatures_are_json_serializable():
     sigs = load_signatures(None)
     json.dumps(sigs)
     json.dumps(match_signature(r"\MSSE-1-server", sigs))
+
+
+def test_prefix_pattern_without_backslash_is_canonicalized(tmp_path):
+    path = tmp_path / "sigs.json"
+    path.write_text(json.dumps([
+        {"family": "CS", "pattern": "postex_", "match": "prefix", "weight": 4.0, "note": "n"},
+    ]))
+    sigs = load_signatures(str(path))
+    assert _family(r"\postex_1", sigs) == "CS"
+    assert _family(r"\\.\pipe\POSTEX_1", sigs) == "CS"
+
+
+def test_bad_weight_and_non_dict_entries_are_skipped(tmp_path, capsys):
+    path = tmp_path / "sigs.json"
+    path.write_text(json.dumps([
+        "not a dict",
+        {"family": "Bad", "pattern": r"\bad", "match": "exact", "weight": "high", "note": "n"},
+        {"family": "Good", "pattern": r"\good", "match": "exact", "weight": "2.5", "note": "n"},
+    ]))
+    sigs = load_signatures(str(path))
+    assert [s["family"] for s in sigs] == ["Good"]
+    assert sigs[0]["weight"] == 2.5
+    out = capsys.readouterr().out
+    assert out.count("[pipe_analysis]") >= 2
+
+
+def test_normalize_keeps_english_hex_words():
+    for word in (r"\feedback", r"\dbaccess", r"\cafe"):
+        assert normalize_for_key(word) == word
+    assert normalize_for_key("status_4a3f9c") == r"\status_*"
+    assert normalize_for_key("MSSE-1234-server") == r"\msse-*-server"
+    assert normalize_for_key("{3F2504E0-4F89-11D3-9A0C-0305E82C3301}") == r"\*"
