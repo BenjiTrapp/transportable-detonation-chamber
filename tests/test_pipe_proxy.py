@@ -56,6 +56,15 @@ def make_manager(backend, clock, tmp_path):
         kw.setdefault("settle", 0.01)
         m = InterceptManager(backend, str(tmp_path / "sessions"), **kw)
         managers.append(m)
+        real_start = m.start
+
+        def start(*a, **k):
+            # The engine returns "starting" until the first upstream is open.
+            sid = real_start(*a, **k)["id"]
+            assert wait_for(lambda: m.get(sid)["state"] != "starting")
+            return m.get(sid)
+
+        m.start = start
         return m
 
     yield make
@@ -751,6 +760,8 @@ def test_durations_must_be_finite_and_bounded(backend, mgr):
     assert backend.created == []
     s = mgr.start("svc", "hold", "attach", "exact", max_duration=3600, hold_timeout=3600)
     assert s["max_duration"] == 3600 and s["hold_timeout"] == 3600
+    mgr.stop(s["id"])
+    backend.fake_server("svc")                    # the server's next instance
     assert mgr.start("svc", "hold", "attach", "exact", max_duration=10)["hold_timeout"] == 10
     json.dumps(mgr.list(), allow_nan=False)
 
@@ -793,7 +804,7 @@ def test_proxy_instance_stays_ahead_of_a_server_with_spare_instances(backend, mg
         recorded = [base64.b64decode(m["data_b64"]) for m in mgr.messages(sid)]
         assert recorded == [f"m{i}".encode() for i in range(6)]
         assert all(m["conn"] == i + 1 for i, m in enumerate(mgr.messages(sid)))
-        got = sorted(ep.recv() for ep in server.conns[:6])
+        got = sorted(d for d in (ep.recv(timeout=0.05) for ep in server.conns[:7]) if d)
         assert got == sorted(f"m{i}".encode() for i in range(6))
         assert mgr.get(sid)["self_connect_retries"] == 0
         for c in clients:
@@ -802,21 +813,28 @@ def test_proxy_instance_stays_ahead_of_a_server_with_spare_instances(backend, mg
         server.close()
 
 
-def test_upstream_connect_on_own_instance_is_retried(backend, make_manager):
+def test_upstream_connect_on_own_instance_is_retried(backend, make_manager, monkeypatch):
+    monkeypatch.setattr(pipe_proxy, "FLUSH_TIMEOUT", 0.1)
     m = make_manager(connect_timeout=5.0)
     first = backend.fake_server("solo")           # one instance, no spare
     sid = m.start("solo", "observe", "attach", "exact")["id"]
     c1 = backend.fake_client("solo")              # gets the proxy; upstream is `first`
     c1.send(b"one")
     assert first.recv() == b"one"
-    # The upstream for the next client finds only our own new instance free.
-    assert wait_for(lambda: m.get(sid)["self_connect_retries"] >= 1)
-    second = backend.fake_server("solo")          # the server offers another instance
-    assert wait_for(lambda: second.connected)     # ... and the proxy's retry takes it
-    c2 = backend.fake_client("solo")
+    # The spare flush after the first client finds only our own instance free.
+    assert wait_for(lambda: m.get(sid)["self_connect_retries"] == 1)
+    time.sleep(0.2)                               # flush gave up; many attempts, one episode
+    assert m.get(sid)["self_connect_retries"] == 1
+    c2 = backend.fake_client("solo")              # the proxy's next instance
     c2.send(b"two")
-    assert second.recv() == b"two"
+    # The upstream for c2 again finds only the proxy's own new instance free.
+    assert wait_for(lambda: m.get(sid)["self_connect_retries"] == 2)
+    time.sleep(0.1)
+    assert m.get(sid)["self_connect_retries"] == 2
+    second = backend.fake_server("solo")          # the server offers another instance
+    assert second.recv() == b"two"                # ... and the proxy's retry takes it
     assert [base64.b64decode(x["data_b64"]) for x in m.messages(sid)] == [b"one", b"two"]
+    assert m.get(sid)["last_error"] is None
 
 
 def test_export_reads_persisted_file_once_and_reports_errors(api, tdc, backend):
@@ -834,3 +852,78 @@ def test_export_reads_persisted_file_once_and_reports_errors(api, tdc, backend):
         f.write("{broken")
     r = api.get(f"/api/pipes/intercept/{sid}/export")
     assert r.status_code == 500 and "export failed" in r.get_json()["error"]
+
+
+def _idle_server_conns(backend, name):
+    """Real server instances held by a proxy upstream that has no client."""
+    return [i for i in backend._instances
+            if i.kind == "real" and i.name == name and i.connected
+            and not i.closed["server"] and not i.closed["client"]]
+
+
+def test_server_holds_no_idle_proxy_connection_after_first_client(backend, mgr):
+    server = SpareServer(backend, "idle")
+    try:
+        sid = mgr.start("idle", "observe", "attach", "exact")["id"]
+        assert len(_idle_server_conns(backend, r"\idle")) == 1     # for the first client
+        for i in range(4):
+            c = backend.fake_client("idle")
+            c.send(f"m{i}".encode())
+            assert wait_for(lambda: len(mgr.messages(sid)) == i + 1), f"client {i} bypassed"
+            assert len(_idle_server_conns(backend, r"\idle")) == 1  # only this client's
+            c.close()
+            assert wait_for(lambda: not _idle_server_conns(backend, r"\idle"))
+            time.sleep(0.05)
+            assert not _idle_server_conns(backend, r"\idle"), "idle proxy connection"
+    finally:
+        server.close()
+
+
+def test_one_session_per_pipe(backend, mgr):
+    backend.fake_server("svc")
+    first = mgr.start("svc", "observe", "attach", "exact")
+    for args, kw in ((("SVC", "hold", "attach", "exact"), {}),
+                     ((r"\\.\pipe\svc", "observe", "arm", "exact"), {})):
+        with pytest.raises(ValueError, match=first["id"]):
+            mgr.start(*args, **kw)
+    sq = mgr.start("sq", "observe", "arm", "exact", squat=True)
+    with pytest.raises(ValueError, match=sq["id"]):
+        mgr.start("sq", "observe", "arm", "exact")
+    waiting = mgr.start("later", "observe", "arm", "exact")      # claims before it exists
+    with pytest.raises(ValueError, match=waiting["id"]):
+        mgr.start("later", "observe", "arm", "exact", squat=True)
+    assert len(mgr.list()) == 3
+    mgr.stop(first["id"])
+    backend.fake_server("svc")                    # the server's next instance
+    assert mgr.start("svc", "observe", "attach", "exact")["state"] == "active"
+
+
+def test_arm_watcher_skips_pipes_owned_by_another_session(backend, mgr):
+    taken = mgr.start(r"\postex_1", "observe", "arm", "exact")
+    prefix = mgr.start(r"\postex_", "observe", "arm", "prefix")
+    backend.fake_server("postex_1")
+    assert wait_for(lambda: mgr.get(taken["id"])["state"] == "active")
+    watcher_polls(mgr, prefix["id"], 3)
+    assert mgr.get(prefix["id"])["state"] == "armed"
+    backend.fake_server("postex_2")
+    assert wait_for(lambda: mgr.get(prefix["id"])["target"] == r"\postex_2")
+    with pytest.raises(ValueError, match=prefix["id"]):
+        mgr.start(r"\postex_2", "observe", "attach", "exact")
+
+
+def test_start_returns_starting_before_the_first_upstream(backend, make_manager, monkeypatch):
+    m = make_manager()
+    backend.fake_server("slow")
+    gate = threading.Event()
+    real_connect = backend.connect
+
+    def slow_connect(name, timeout):
+        gate.wait(2.0)
+        return real_connect(name, timeout)
+
+    monkeypatch.setattr(backend, "connect", slow_connect)
+    t0 = time.monotonic()
+    s = InterceptManager.start(m, "slow", "observe", "attach", "exact")
+    assert time.monotonic() - t0 < 0.5 and s["state"] == "starting"
+    gate.set()
+    assert wait_for(lambda: m.get(s["id"])["state"] == "active")

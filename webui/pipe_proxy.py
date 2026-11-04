@@ -42,6 +42,8 @@ MAX_MESSAGE_LOG = 1024 * 1024
 MAX_SESSION_RECORD = 50 * 1024 * 1024
 MAX_DURATION_LIMIT = 3600
 DEFAULT_HOLD_TIMEOUT = 30
+MAX_SETTLE = 1.0
+FLUSH_TIMEOUT = 1.0
 SESSION_MODES = ("observe", "hold")
 HOWS = ("attach", "arm")
 MATCHES = ("exact", "prefix", "regex")
@@ -122,6 +124,7 @@ class _Session:
         self.last_error = None
         self.watch_polls = 0
         self.self_connect_retries = 0
+        self.claim = None           # canonical lower-case pipe name this session owns
         self.regex = re.compile(pattern, re.IGNORECASE) if match == "regex" else None
 
     def matches(self, name):
@@ -203,7 +206,41 @@ class InterceptManager:
 
         s = _Session(secrets.token_hex(6), pattern, mode, how, match, bool(squat),
                      max_duration, hold_timeout, pipe_mode, self.clock())
-        first = None
+        # One session per pipe: a session's upstream connect could otherwise
+        # land on another session's listening instance (Windows routes to the
+        # oldest free instance, whoever owns it).
+        with self._lock:
+            if match == "exact":
+                other = self._claimed_by(_key(pattern))
+                if other is not None:
+                    raise ValueError(f"pipe {pattern} is already intercepted by session {other}")
+                s.claim = _key(pattern)
+            self._sessions[s.id] = s
+        try:
+            first, known = self._open_first(s, pattern, how, squat, pipe_mode)
+        except BaseException:
+            with self._lock:
+                self._sessions.pop(s.id, None)
+            raise
+        if first is not None:
+            self._activate(s, pattern, s.pipe_mode, first)
+        else:
+            with s.lock:
+                self._spawn(s, self._watch, (s, known), "watch")
+        self._ensure_ticker()
+        print(f"[pipe_proxy] session {s.id} started: {how}/{match} {pattern!r} mode={mode}"
+              f"{' squat' if squat else ''}")
+        return self.get(s.id)
+
+    def _claimed_by(self, key, exclude=None):
+        """Id of the live session that owns pipe `key`; caller holds `_lock`."""
+        for other in self._sessions.values():
+            if other.id != exclude and not other.ended and other.claim == key:
+                return other.id
+        return None
+
+    def _open_first(self, s, pattern, how, squat, pipe_mode):
+        first = known = None
         if how == "attach":
             if not self.backend.exists(pattern):
                 raise ValueError(f"pipe {pattern} does not exist")
@@ -223,18 +260,7 @@ class InterceptManager:
                 known = {_key(n) for n in self.backend.list_pipes()}
             except OSError as e:
                 raise ValueError(f"cannot list pipes: {e}") from None
-
-        with self._lock:
-            self._sessions[s.id] = s
-        if first is not None:
-            self._activate(s, pattern, s.pipe_mode, first)
-        else:
-            with s.lock:
-                self._spawn(s, self._watch, (s, known), "watch")
-        self._ensure_ticker()
-        print(f"[pipe_proxy] session {s.id} started: {how}/{match} {pattern!r} mode={mode}"
-              f"{' squat' if squat else ''}")
-        return self.get(s.id)
+        return first, known
 
     def stop(self, sid: str, reason: str = "stopped") -> dict:
         """End a session: still-held messages are forwarded (`auto_passed`) and
@@ -521,10 +547,9 @@ class InterceptManager:
     def _activate(self, s, target, mode, h):
         """Make `h` the session's listening proxy instance and start accepting.
 
-        Unless squatting (no real server yet), an upstream connection for the
-        first client is opened right here, after `h` exists: it takes the real
-        server's oldest free instance, so any spare the server creates next is
-        younger than `h` and the next client lands on the proxy.
+        The session is "starting" until the accept thread has opened the
+        upstream for the first client (see `_accept_loop`); squat sessions
+        have no real server yet and are active at once.
         """
         with s.lock:
             ok = not s.ended
@@ -532,21 +557,10 @@ class InterceptManager:
                 s.target = canonical_name(target)
                 s.pipe_mode = mode
                 s.handles.add(h)
+                s.state = "active" if s.squat else "starting"
+                self._spawn(s, self._accept_loop, (s, h), "accept")
         if not ok:
             self._close_quiet(h)
-            return False
-        ready = None
-        if not s.squat:
-            ready, h = self._connect_upstream(s, h, self.connect_timeout, "first client")
-        with s.lock:
-            ok = not s.ended
-            if ok:
-                s.state = "active"
-                self._spawn(s, self._accept_loop, (s, h, ready), "accept")
-        if not ok:
-            for x in (h, ready):
-                if x is not None:
-                    self._close_quiet(x)
         return ok
 
     def _note_error(self, s, msg):
@@ -577,10 +591,19 @@ class InterceptManager:
                 if k in BLOCKLIST or not s.matches(name):
                     known.add(k)
                     continue
+                with self._lock:
+                    other = self._claimed_by(k, exclude=s.id)
+                    if other is None:
+                        s.claim = k
+                if other is not None:
+                    continue            # another live session owns this pipe
                 try:
                     mode = s.pipe_mode_hint or self.backend.pipe_mode(name)
                     h = self.backend.create_server(name, mode, False)
                 except OSError as e:
+                    if s.match != "exact":
+                        with self._lock:
+                            s.claim = None
                     failures[k] = failures.get(k, 0) + 1
                     if failures[k] >= WATCH_RETRIES:
                         known.add(k)
@@ -606,17 +629,35 @@ class InterceptManager:
             return None
         return h if self._track(s, h) else None
 
-    def _accept_loop(self, s, h, ready):
+    def _accept_loop(self, s, h):
         """Accept clients on proxy instance `h`, pairing each with an upstream.
 
-        Windows hands a client the oldest free instance. To keep that a proxy
-        instance, the next proxy instance is always created *before* the next
-        upstream connection is opened: the upstream takes the server's current
-        spare, and the server's next spare is younger than our instance.
-        `ready` is the upstream prepared for the next client. A connection on
-        `h` whose client is this process is one of our own upstream connects
-        (another session on the same pipe) and is dropped.
+        Windows hands a client the oldest free instance, whoever owns it. The
+        proxy keeps that one of its own instances:
+
+        * Before the first client (not for squat), after `h` exists, one
+          upstream is opened and held for that client. It takes the server's
+          free instance that predates the session, so the server's next one
+          is younger than `h`.
+        * When a client arrives, the next proxy instance is created first and
+          only then the upstream for *this* client: it takes the server's
+          current spare (older than our new instance), and the server's next
+          spare is younger again.
+        * The first client uses the held upstream, so nothing consumes the
+          spare the server created for it - which is older than the proxy
+          instance created on that client's arrival. One upstream is
+          therefore opened and closed at once right after it. From then on
+          the server never holds an idle proxy connection.
+
+        A connection on `h` whose client is this process is one of our own
+        upstream connects and is dropped.
         """
+        ready = None
+        if not s.squat:
+            ready, h = self._connect_upstream(s, h, self.connect_timeout, "first client")
+            with s.lock:
+                if not s.ended:
+                    s.state = "active"
         try:
             while not s.ended:
                 if h is None:
@@ -634,64 +675,71 @@ class InterceptManager:
                 if not connected:
                     continue
                 if self.backend.client_pid(h) == self.own_pid:
-                    # One of our own upstream connects (e.g. another session's).
                     with s.lock:
                         s.self_connect_retries += 1
                     self._close(s, h)
                     h = None
                     continue
-                client, h = h, None
-                upstream, ready = ready, None
+                client = h
+                h = self._new_instance(s)
+                if ready is not None:
+                    upstream, ready = ready, None
+                    self._start_conn(s, client, upstream)
+                    flush, h = self._connect_upstream(s, h, FLUSH_TIMEOUT, "spare flush",
+                                                      quiet=True)
+                    if flush is not None:
+                        self._close(s, flush)
+                    continue
+                upstream, h = self._connect_upstream(
+                    s, h, None if s.squat else self.connect_timeout, "client")
                 if upstream is None:
-                    # No spare first: this connect must not land on ourselves.
-                    upstream, _ = self._connect_upstream(
-                        s, None, None if s.squat else self.connect_timeout, "client")
-                    if upstream is None:
-                        self._close(s, client)
-                        continue
+                    self._close(s, client)
+                    continue
                 self._start_conn(s, client, upstream)
-                if h is None:
-                    h = self._new_instance(s)
-                if h is not None:
-                    ready, h = self._connect_upstream(s, h, self.connect_timeout, "next client")
         finally:
             if ready is not None:
                 self._close(s, ready)
 
-    def _connect_upstream(self, s, spare, timeout, purpose):
+    def _connect_upstream(self, s, spare, timeout, purpose, quiet=False):
         """Connect to the real server; returns (upstream or None, spare).
 
-        `spare` is our own listening instance, if any. Windows hands the
-        connect the oldest free instance; if that was `spare` (its client is
-        this process), no older real instance was free: the self-connection
-        and the now broken spare are closed, the server gets `settle` seconds
-        to create its next instance, and a new spare - younger than that one -
-        is created before the retry. Gives up after `timeout` seconds (None:
-        until the session ends), or at once when a real client takes `spare`.
+        `spare` is our own listening instance, if any. If the connect landed
+        on it (its client is this process), no older real instance was free:
+        the self-connection and the broken spare are closed, the server gets
+        some time to create its next instance (backing off from `settle` to
+        `MAX_SETTLE`), and a new spare - younger than that instance - is
+        created before the retry. One such episode counts once in
+        `self_connect_retries`. Gives up after `timeout` seconds (None: until
+        the session ends, as for squat).
         """
         deadline = None if timeout is None else time.monotonic() + timeout
+        settle = self.settle
+        counted = False
         while not s.ended:
             try:
                 up = self.backend.connect(s.target, self.io_timeout)
             except OSError as e:
                 if deadline is not None and time.monotonic() >= deadline:
-                    self._note_error(s, f"no upstream for {s.target} ({purpose}): {e}")
+                    if not quiet:
+                        self._note_error(s, f"no upstream for {s.target} ({purpose}): {e}")
                     return None, spare
-                if spare is not None and self.backend.client_pid(spare) is not None:
-                    return None, spare          # a client is waiting on our spare
                 if isinstance(e, FileNotFoundError):
                     s.stop_evt.wait(self.io_timeout)
                 continue
             if spare is not None and self.backend.client_pid(spare) == self.own_pid:
-                with s.lock:
-                    s.self_connect_retries += 1
+                if not counted:
+                    counted = True
+                    with s.lock:
+                        s.self_connect_retries += 1
                 self._close_quiet(up)
                 self._close(s, spare)
-                s.stop_evt.wait(self.settle)
+                s.stop_evt.wait(settle)
+                settle = min(settle * 2, MAX_SETTLE)
                 spare = self._new_instance(s)
                 if deadline is not None and time.monotonic() >= deadline:
-                    self._note_error(s, f"no upstream for {s.target} ({purpose}): "
-                                        "only our own instance was free")
+                    if not quiet:
+                        self._note_error(s, f"no upstream for {s.target} ({purpose}): "
+                                            "only our own instance was free")
                     return None, spare
                 continue
             return (up if self._track(s, up) else None), spare

@@ -116,6 +116,11 @@ def recorded(sid, data):
                for m in messages(sid))
 
 
+def active(sid):
+    """The session is "starting" until its first upstream is open."""
+    return wait_for(lambda: call("GET", f"/{sid}")[1].get("state") == "active", 10.0)
+
+
 def test_observe():
     server = EchoServer(r"\tdc_test")
     try:
@@ -126,6 +131,7 @@ def test_observe():
             print("FAIL 0/3")
             return
         sid = s["id"]
+        print("active:", bool(active(sid)))
         c = b.connect(r"\tdc_test", 5.0)
         ok = 0
         for i in range(1, 4):
@@ -171,6 +177,7 @@ def test_edit():
             print("FAIL edit")
             return
         sid = s["id"]
+        print("active:", bool(active(sid)))
         c = b.connect(r"\tdc_test", 5.0)
         b.write(c, b"original")
         item = wait_for(lambda: held(sid, "c2s"), 3.0)
