@@ -3894,40 +3894,60 @@ def _pipe_activity_for(pid, sha256=None, at=None):
     except (TypeError, ValueError):
         return {"available": False, "reason": "invalid pid", "pipes": [], "evidence_findings": []}
 
-    cache_key = (pid, (sha256 or "").lower() or None, at or None)
-    cached = _pipe_cache.get(cache_key)
-    if cached and time.time() - cached[0] < _NET_BEACON_TTL:
-        return cached[1]
-
     if not _is_sysmon_running():
         return {"available": False, "reason": "Sysmon not running", "pipes": [], "evidence_findings": []}
 
     start = _pipe_submission_start(pid, sha256, at)
+    # The resolved submission is part of the key: a new detonation that got
+    # the same PID within the TTL must not see the previous one's result.
+    cache_key = (pid, (sha256 or "").lower() or None, at or None, start)
+    cached = _pipe_cache.get(cache_key)
+    if cached and time.time() - cached[0] < _NET_BEACON_TTL:
+        return cached[1]
+
     anchor = start if start is not None else (_to_epoch(at) if at else None)
     since = until = None
     if anchor is not None:
+        # 60 s slack before the anchor, as in _agent_detonation_index: the
+        # submission timestamp and Sysmon's clock can differ slightly.
         since = datetime.datetime.fromtimestamp(anchor - 60).astimezone().isoformat()
         until = datetime.datetime.fromtimestamp(anchor + _AGENT_PID_WINDOW).astimezone().isoformat()
 
     try:
         proc_map, _ = _build_full_process_map()
-        events = _read_sysmon_events(event_ids=[17, 18], since=since, until=until, max_events=2000)
+        raw_events = _read_sysmon_events(event_ids=[17, 18], since=since, until=until, max_events=2000)
     except Exception as e:
         return {"available": False, "reason": str(e), "pipes": [], "evidence_findings": []}
-    errors = [e for e in events if isinstance(e, dict) and "error" in e]
-    events = [e for e in events if isinstance(e, dict) and "error" not in e]
+    errors = [e for e in raw_events if isinstance(e, dict) and "error" in e]
+    events = [e for e in raw_events if isinstance(e, dict) and "error" not in e]
     if errors and not events:
         return {"available": False, "reason": errors[0]["error"], "pipes": [], "evidence_findings": []}
 
     instances = _PidInstances(proc_map)
     sample_key = instances.resolve(pid, anchor) if anchor is not None else instances.resolve_key(str(pid))
+    rejected = None
+    if sample_key is not None and anchor is not None:
+        node = proc_map.get(sample_key) or {}
+        began = _to_epoch(node.get("started") or node.get("first_seen"))
+        ended = _to_epoch(node.get("superseded_at"))
+        # An instance that was replaced before the detonation, or (with a
+        # known submission start) began well before it, is an earlier holder
+        # of the PID, not the sample. Same 60 s slack as the window.
+        if (ended is not None and ended < anchor - 60) or \
+                (start is not None and began is not None and began < start - 60):
+            rejected, sample_key = sample_key, None
     if sample_key is None:
-        # The sample's ProcessCreate fell out of the event window: fall back
-        # to its PID alone (descendants cannot be found without it).
-        sample_keys = {str(pid)}
+        # The sample's ProcessCreate is not in the map: attribute events of
+        # its PID that no other known instance explains to a sentinel key.
+        # Descendants cannot be found without the ProcessCreate.
+        sentinel = f"{pid}?"
+        sample_keys = {sentinel}
 
         def resolve(p, ts):
-            return instances.resolve(p, ts) or str(p)
+            key = instances.resolve(p, ts)
+            if str(p) == str(pid) and (key is None or key == rejected):
+                return sentinel
+            return key or str(p)
     else:
         sample_keys, todo = set(), [sample_key]
         while todo:
@@ -3942,6 +3962,7 @@ def _pipe_activity_for(pid, sha256=None, at=None):
 
     result = pipe_analysis.analyze(events, sample_keys, resolve, self_pid=os.getpid())
     result["available"] = True
+    result["truncated"] = len(raw_events) >= 2000
     _pipe_cache[cache_key] = (time.time(), result)
     if len(_pipe_cache) > 200:
         oldest = min(_pipe_cache, key=lambda k: _pipe_cache[k][0])

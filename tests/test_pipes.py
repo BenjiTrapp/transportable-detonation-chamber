@@ -353,3 +353,83 @@ def test_pipe_activity_unavailable_without_sysmon(tdc):
     res = tdc._pipe_activity_for(4072)
     assert res["available"] is False
     assert res["pipes"] == [] and res["evidence_findings"] == []
+
+
+def _pipe_activity_setup(tdc, monkeypatch, procs, pipes, sub_ts="2026-11-04T09:59:59"):
+    calls = []
+
+    def fake_read(**kw):
+        calls.append(kw)
+        return list(pipes) if kw.get("event_ids") == [17, 18] else list(procs)
+
+    monkeypatch.setattr(tdc, "_is_sysmon_running", lambda: True)
+    monkeypatch.setattr(tdc, "_read_sysmon_events", fake_read)
+    monkeypatch.setattr(tdc, "_load_submissions", lambda: [
+        {"agent_pid": 4072, "timestamp": sub_ts, "sha256": "ab" * 32, "filename": "sample.exe"}])
+    tdc._pipe_cache.clear()
+    return calls
+
+
+def test_pid_reuse_main_path_excludes_later_holder(tdc, monkeypatch):
+    from test_process_instances import _sysmon_create
+
+    procs = [
+        _sysmon_create(4072, _local(10, 0, 0), r"C:\Users\Public\sample.exe", 2964),
+        _sysmon_create(4072, _local(11, 0, 0), r"C:\Windows\System32\notepad.exe", 700),
+    ]
+    pipes = [
+        _pipe_ev("create", 4072, r"\msagent_aa", _local(10, 0, 5)),
+        _pipe_ev("create", 4072, r"\msagent_bb", _local(11, 0, 5)),
+    ]
+    _pipe_activity_setup(tdc, monkeypatch, procs, pipes)
+    res = tdc._pipe_activity_for(4072)
+    assert [p["pipe"] for p in res["pipes"]] == [r"\msagent_aa"]
+    assert res["pipes"][0]["created_by"][0].startswith("4072@")
+
+
+def test_pid_reuse_fallback_excludes_later_holder(tdc, monkeypatch):
+    from test_process_instances import _sysmon_create
+
+    # The sample's ProcessCreate fell out of the map; a later holder of the PID is in it.
+    procs = [_sysmon_create(4072, _local(11, 0, 0), r"C:\Windows\System32\notepad.exe", 700)]
+    pipes = [
+        _pipe_ev("create", 4072, r"\msagent_aa", _local(10, 0, 5)),
+        _pipe_ev("create", 4072, r"\msagent_bb", _local(11, 0, 5)),
+    ]
+    _pipe_activity_setup(tdc, monkeypatch, procs, pipes)
+    res = tdc._pipe_activity_for(4072)
+    assert [p["pipe"] for p in res["pipes"]] == [r"\msagent_aa"]
+
+
+def test_fallback_rejects_older_holder_and_its_subtree(tdc, monkeypatch):
+    from test_process_instances import _sysmon_create
+
+    # Only an older holder of the PID (and its child) is in the map.
+    procs = [
+        _sysmon_create(4072, _local(8, 0, 0), r"C:\Windows\System32\svchost.exe", 600),
+        _sysmon_create(4500, _local(8, 0, 1), r"C:\Windows\System32\conhost.exe", 4072),
+    ]
+    pipes = [
+        _pipe_ev("create", 4500, r"\msagent_old", _local(10, 0, 2)),
+        _pipe_ev("create", 4072, r"\msagent_aa", _local(10, 0, 5)),
+    ]
+    _pipe_activity_setup(tdc, monkeypatch, procs, pipes)
+    res = tdc._pipe_activity_for(4072)
+    assert [p["pipe"] for p in res["pipes"]] == [r"\msagent_aa"]
+
+
+def test_cache_distinguishes_submissions_and_reports_truncation(tdc, monkeypatch):
+    from test_process_instances import _sysmon_create
+
+    procs = [_sysmon_create(4072, _local(10, 0, 0), r"C:\Users\Public\sample.exe", 2964),
+             _sysmon_create(4072, _local(12, 0, 0), r"C:\Users\Public\other.exe", 2964)]
+    pipes = [_pipe_ev("create", 4072, r"\msagent_aa", _local(10, 0, 5))] + \
+        [_pipe_ev("create", 4072, r"\msagent_bb", _local(12, 0, 5))] * 1999
+    _pipe_activity_setup(tdc, monkeypatch, procs, pipes)
+    first = tdc._pipe_activity_for(4072)
+    assert first["truncated"] is True
+    assert [p["pipe"] for p in first["pipes"]] == [r"\msagent_aa"]
+    monkeypatch.setattr(tdc, "_load_submissions", lambda: [
+        {"agent_pid": 4072, "timestamp": "2026-11-04T11:59:59", "sha256": "ab" * 32}])
+    second = tdc._pipe_activity_for(4072)
+    assert [p["pipe"] for p in second["pipes"]] == [r"\msagent_bb"]
