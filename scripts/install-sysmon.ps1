@@ -35,6 +35,52 @@ if ($isArm64) {
 }
 $configPath = "$sysmonDir\sysmonconfig.xml"
 
+# The upstream config only logs a short list of pipe names (include mode), so
+# almost no EID 17/18 events are written. Replace every PipeEvent filter with
+# one exclude-mode group that drops known benign noise. Every rule combines
+# Image AND PipeName so a sample cannot hide by reusing a benign pipe name.
+function Set-PipeEventExclude {
+    param([string]$Path)
+    $pipeGroup = @'
+<RuleGroup name="" groupRelation="or">
+  <PipeEvent onmatch="exclude">
+    <Rule groupRelation="and"><Image condition="end with">chrome.exe</Image><PipeName condition="begin with">\mojo.</PipeName></Rule>
+    <Rule groupRelation="and"><Image condition="end with">chrome.exe</Image><PipeName condition="begin with">\crashpad_</PipeName></Rule>
+    <Rule groupRelation="and"><Image condition="end with">msedge.exe</Image><PipeName condition="begin with">\mojo.</PipeName></Rule>
+    <Rule groupRelation="and"><Image condition="end with">msedge.exe</Image><PipeName condition="begin with">\crashpad_</PipeName></Rule>
+    <Rule groupRelation="and"><Image condition="end with">svchost.exe</Image><PipeName condition="begin with">\lsass</PipeName></Rule>
+    <Rule groupRelation="and"><Image condition="end with">svchost.exe</Image><PipeName condition="begin with">\ntsvcs</PipeName></Rule>
+    <Rule groupRelation="and"><Image condition="end with">svchost.exe</Image><PipeName condition="begin with">\srvsvc</PipeName></Rule>
+    <Rule groupRelation="and"><Image condition="end with">svchost.exe</Image><PipeName condition="begin with">\wkssvc</PipeName></Rule>
+    <Rule groupRelation="and"><Image condition="end with">MsMpEng.exe</Image><PipeName condition="begin with">\</PipeName></Rule>
+  </PipeEvent>
+</RuleGroup>
+'@
+    try {
+        [xml]$cfg = Get-Content -Path $Path -Raw
+        foreach ($node in @($cfg.SelectNodes("//PipeEvent"))) {
+            $parent = $node.ParentNode
+            [void]$parent.RemoveChild($node)
+            if ($parent.LocalName -eq "RuleGroup" -and -not $parent.HasChildNodes) {
+                [void]$parent.ParentNode.RemoveChild($parent)
+            }
+        }
+        $fragment = New-Object System.Xml.XmlDocument
+        $fragment.LoadXml($pipeGroup)
+        $filtering = $cfg.SelectSingleNode("/Sysmon/EventFiltering")
+        [void]$filtering.AppendChild($cfg.ImportNode($fragment.DocumentElement, $true))
+        $cfg.Save($Path)
+        Write-Host "[+] PipeEvent switched to exclude mode" -ForegroundColor Green
+    } catch {
+        Write-Host "[!] PipeEvent post-processing failed: $_" -ForegroundColor Yellow
+    }
+}
+
+function Set-SysmonLogSize {
+    # 512 MB so pipe events do not rotate out short detonations
+    wevtutil sl Microsoft-Windows-Sysmon/Operational /ms:536870912
+}
+
 # Check if already installed and running
 $sysmonSvc = Get-Service -Name $sysmonServiceName -ErrorAction SilentlyContinue
 if (-not $sysmonSvc) {
@@ -48,7 +94,9 @@ if ($sysmonSvc -and $sysmonSvc.Status -eq "Running") {
     $configUrl = "https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml"
     try {
         Invoke-WebRequest -Uri $configUrl -OutFile $configPath -UseBasicParsing
+        Set-PipeEventExclude -Path $configPath
         & $sysmonExe -c $configPath 2>$null
+        Set-SysmonLogSize
         Write-Host "[+] Sysmon config updated" -ForegroundColor Green
     } catch {
         Write-Host "[!] Config update failed: $_" -ForegroundColor Yellow
@@ -142,10 +190,12 @@ try {
 "@
     Set-Content -Path $configPath -Value $minimalConfig
 }
+Set-PipeEventExclude -Path $configPath
 
 # Install Sysmon as a service
 Write-Host "[*] Installing Sysmon service..." -ForegroundColor Yellow
 & $sysmonExe -accepteula -i $configPath 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
+Set-SysmonLogSize
 
 # Verify installation
 Start-Sleep -Seconds 3

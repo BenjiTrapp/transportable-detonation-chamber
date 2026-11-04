@@ -103,3 +103,44 @@ def test_normalize_keeps_english_hex_words():
     assert normalize_for_key("status_4a3f9c") == r"\status_*"
     assert normalize_for_key("MSSE-1234-server") == r"\msse-*-server"
     assert normalize_for_key("{3F2504E0-4F89-11D3-9A0C-0305E82C3301}") == r"\*"
+
+
+def test_sysmon_installer_switches_pipeevent_to_exclude():
+    import os
+    import re
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "scripts", "install-sysmon.ps1"), encoding="utf-8") as fh:
+        script = fh.read()
+
+    # Existing PipeEvent elements (the include-mode block) are removed.
+    assert re.search(r"SelectNodes\([^)]*PipeEvent", script)
+    assert "RemoveChild" in script
+    assert 'onmatch="exclude"' in script and "<PipeEvent" in script
+    assert 'onmatch="include"' not in script.split("<PipeEvent", 1)[1].split("</PipeEvent>", 1)[0]
+
+    block = script.split('<PipeEvent onmatch="exclude">', 1)[1].split("</PipeEvent>", 1)[0]
+    rules = re.findall(r'<Rule groupRelation="and">(.*?)</Rule>', block, re.S)
+    assert rules
+    for rule in rules:
+        assert '<Image condition="end with">' in rule
+        assert "<PipeName" in rule
+    pairs = {(re.search(r"<Image[^>]*>([^<]+)</Image>", r).group(1),
+              re.search(r"<PipeName[^>]*>([^<]+)</PipeName>", r).group(1)) for r in rules}
+    for image in ("chrome.exe", "msedge.exe"):
+        assert (image, r"\mojo.") in pairs
+        assert (image, r"\crashpad_") in pairs
+    for pipe in (r"\lsass", r"\ntsvcs", r"\srvsvc", r"\wkssvc"):
+        assert ("svchost.exe", pipe) in pairs
+    assert any(img == "MsMpEng.exe" for img, _ in pairs)
+    # No rule may exclude by pipe name alone.
+    assert not re.search(r"<PipeEvent onmatch=\"exclude\">\s*<PipeName", script)
+
+    # Post-processing applies to both install paths: before -c and before -i.
+    calls = [m.start() for m in re.finditer(r"Set-PipeEventExclude\b", script)]
+    assert len(calls) >= 3  # definition + two call sites
+    assert script.index("-c $configPath") > calls[1]
+    assert script.rindex("-i $configPath") > calls[-1]
+
+    m = re.search(r"wevtutil sl Microsoft-Windows-Sysmon/Operational /ms:(\d+)", script)
+    assert m and int(m.group(1)) >= 536870912
