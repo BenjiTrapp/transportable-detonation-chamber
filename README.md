@@ -118,6 +118,7 @@ make open       # Opens http://<vm-ip>:9000 in browser
 | **Dashboard** | Stats strip (alerts, processes, services, rules, tools), service health cards, recent activity feed |
 | **Tracing** | Per-process console: verdict, timeline by event type, process tree, alerts with full raw events (Sigma match details) |
 | **Graph** | Process tree around a process: tree, force-directed and isometric layouts, landing page with samples and candidate processes, detail panel with Sysmon events and children |
+| **Pipes** | Named pipes: Sysmon pipe events (EID 17/18) with name/PID filters and C2-family hits, and interception sessions (attach to an existing pipe or arm for a name/prefix/regex; observe or hold messages to forward, edit or drop them; JSON export) |
 | **Sysmon** | Sysmon event viewer with search, type/PID filters and Sysmon → Windows Event ID correlation |
 | **ThreatScan** | ThreatCheck, DefenderCheck, EMBER2024 and capa on a file, plus the **Live Process Memory** panel (Aether scan, memory dump, host baseline, system sweep) and the scan history |
 | **ETW** | Multi-channel Event Log browser with live threat highlighting (see below) |

@@ -163,6 +163,9 @@ function switchTab(tabName) {
     if (tabName === 'graph') {
         graphRefresh();
     }
+    if (tabName === 'pipes') {
+        openPipesTab();
+    }
     if (tabName === 'submit') {
         refreshSubmissions();
     }
@@ -3526,6 +3529,13 @@ async function viewDetonationResult(lbHash, sha256, pid, filename) {
         html += '</div></div>';
     }
 
+    // --- Named pipes (Sysmon 17/18) of the sample subtree ---
+    if (detData && detData.named_pipes) {
+        html += '<div class="detail-section"><div class="detail-section-title">NAMED PIPES</div><div style="padding:4px 8px;">';
+        html += renderNamedPipesBlock(detData.named_pipes);
+        html += '</div></div>';
+    }
+
     // --- DetonatorAgent execution section ---
     const exec = agentBlock && agentBlock.execution;
     if (agentBlock) {
@@ -4750,6 +4760,13 @@ function renderDetonationPanels(data) {
         tabs.push({ id: 'det-tab-beacons', label: 'Memory', body });
     }
 
+    // Named pipes the sample subtree created or connected to (Sysmon 17/18)
+    if (data.named_pipes) {
+        const np = data.named_pipes;
+        const body = `<div class="det-sub-title">NAMED PIPES</div>` + renderNamedPipesBlock(np);
+        tabs.push({ id: 'det-tab-pipes', label: 'Named Pipes', count: np.available ? (np.pipes || []).length : undefined, body });
+    }
+
     // Raw JSON tab (full response)
     tabs.push({ id: 'det-tab-raw', label: 'Raw JSON', body: `<pre class="det-raw det-raw-tall">${escapeHtml(JSON.stringify(data, null, 2))}</pre>` });
 
@@ -4979,6 +4996,7 @@ async function graphRefresh() {
             graphState.focusAt = '';
         }
         if (!resp.ok || payload.error) {
+            graphState.data = null;
             graphState.nodes = [];
             graphState.edges = [];
             graphState.emptyMessage = payload.error || `Process ${graphState.focusPid} not found.`;
@@ -5000,6 +5018,13 @@ async function graphRefresh() {
     }
 
     graphState.data = payload;
+    // Pipes are on by default when the focus is a detonated sample; a manual
+    // change sticks until the focus moves to another process.
+    const pipesToggle = document.getElementById('graph-show-pipes');
+    if (pipesToggle && graphState.pipesDefaultFor !== graphState.focusPid) {
+        graphState.pipesDefaultFor = graphState.focusPid;
+        pipesToggle.checked = !!(payload.processes?.[payload.root_pid]?.detonated);
+    }
     buildGraph(payload);
     graphFitView();
     renderGraph();
@@ -5178,6 +5203,10 @@ function renderBreadcrumb() {
     });
     html += `<span class="gbc-sep">&rsaquo;</span><span class="gbc-current">${escapeHtml(rootLabel(graphState.focusPid))}</span>`;
     if (graphState.data?.truncated) html += '<span class="gbc-trunc" title="Tree truncated at the node cap">&#9888; truncated</span>';
+    if (document.getElementById('graph-show-pipes')?.checked) {
+        if (graphState.data?.pipes_truncated) html += '<span class="gbc-trunc" title="Pipe events were capped; some pipes may be missing">&#9888; pipe events truncated</span>';
+        if (graphState.data?.pipes_error) html += `<span class="gbc-trunc" title="${escapeHtml(graphState.data.pipes_error)}">&#9888; pipes unavailable</span>`;
+    }
     bc.innerHTML = html;
 
     bc.querySelector('.gbc-home')?.addEventListener('click', () => {
@@ -5206,6 +5235,8 @@ function buildGraph(payload) {
     const showDns = document.getElementById('graph-show-dns')?.checked;
     const showFiles = document.getElementById('graph-show-files')?.checked;
     const showRegistry = document.getElementById('graph-show-registry')?.checked;
+    const showPipes = document.getElementById('graph-show-pipes')?.checked;
+    const layout = document.getElementById('graph-layout')?.value || 'tree';
 
     const procs = payload.processes || {};
 
@@ -5367,8 +5398,41 @@ function buildGraph(payload) {
         }
     }
 
+    // 8. Named pipe nodes (Sysmon events 17/18): one node per pipe, edges from
+    // every process that created or connected to it. The isometric view hides
+    // activity nodes, so there two processes on the same pipe get a bridge.
+    if (showPipes) {
+        const pipeTargets = {};
+        (payload.pipes || []).forEach(ev => {
+            const name = String(ev.pipe || '');
+            const key = String(ev.key || ev.pid || '');
+            if (!name || !nodeMap[key]) return;
+            const id = name.toLowerCase();
+            const t = pipeTargets[id] || (pipeTargets[id] = { name, family: null, created: new Set(), connected: new Set() });
+            if (ev.family) t.family = ev.family;
+            (ev.action === 'created' ? t.created : t.connected).add(key);
+        });
+        const links = {};
+        for (const [id, info] of Object.entries(pipeTargets)) {
+            const nodeId = `pipe_${id}`;
+            nodes.push({ id: nodeId, type: 'pipe', label: info.name, family: info.family,
+                createdBy: [...info.created], connectedBy: [...info.connected],
+                x: 0, y: 0, vx: 0, vy: 0, radius: 9 });
+            info.created.forEach(k => edges.push({ source: `proc_${k}`, target: nodeId, type: 'pipe-create', label: 'create' }));
+            info.connected.forEach(k => edges.push({ source: `proc_${k}`, target: nodeId, type: 'pipe-connect', label: 'connect' }));
+            if (layout === 'iso') {
+                info.created.forEach(c => info.connected.forEach(k => {
+                    if (c === k) return;
+                    const lk = `${c}>${k}`;
+                    if (!links[lk]) links[lk] = { source: `proc_${c}`, target: `proc_${k}`, type: 'pipe-link', label: info.name, pipes: [] };
+                    links[lk].pipes.push(info.name);
+                }));
+            }
+        }
+        Object.values(links).forEach(l => edges.push(l));
+    }
+
     // Apply layout: rooted process tree (default) or force-directed
-    const layout = document.getElementById('graph-layout')?.value || 'tree';
     graphState.layoutMode = layout;
     document.getElementById('graph-container')?.classList.toggle('graph-iso', layout === 'iso');
     if (layout === 'force') {
@@ -5388,6 +5452,7 @@ function buildGraph(payload) {
         const procCount = nodes.filter(n => n.type === 'process').length;
         let label = `${procCount} processes, ${nodes.length} nodes`;
         if (payload.truncated) label += ' (truncated at cap)';
+        if (showPipes) label += `, ${nodes.filter(n => n.type === 'pipe').length} pipes`;
         countEl.textContent = label;
     }
 }
@@ -5545,16 +5610,22 @@ function applyIsometricLayout(nodes, edges, nodeMap) {
         n.x = p.x;
         n.y = p.y;
         n.radius = n.isRoot || n.detonated || n.threats > 0 ? ISO.R + 5 : ISO.R;
-        n.isoAct = { network: 0, dns: 0, file: 0, registry: 0, inject: 0 };
+        n.isoAct = { network: 0, dns: 0, file: 0, registry: 0, inject: 0, pipe: 0 };
     });
 
     // Activity is summarised as icons under each process instead of separate
     // nodes; the nodes stay in the model so the detail panel can list them.
     const index = {};
     nodes.forEach(n => { index[n.id] = n; });
+    const pipeSeen = new Set();       // a pipe counts once per process (create + connect)
     edges.forEach(e => {
         const src = index[e.source];
         if (!src || src.type !== 'process' || !src.isoAct) return;
+        if (e.type === 'pipe-create' || e.type === 'pipe-connect') {
+            const k = `${e.source}|${e.target}`;
+            if (!pipeSeen.has(k)) { pipeSeen.add(k); src.isoAct.pipe += 1; }
+            return;
+        }
         if (e.type in src.isoAct) src.isoAct[e.type] += 1;
     });
     nodes.forEach(n => { if (n.type !== 'process') n.hidden = true; });
@@ -5627,10 +5698,11 @@ function _isoArrow(ctx, x, y, angle, size, color) {
     ctx.fill();
 }
 
-// Activity icons under the label: network, DNS, files, registry.
+// Activity icons under the label: network, DNS, files, registry, pipes.
 function _isoActivityIcons(ctx, x, y, act) {
     const items = [
         ['network', '#22c55e'], ['dns', '#a78bfa'], ['file', '#f97316'], ['registry', '#f472b6'],
+        ['pipe', '#38bdf8'],
     ].filter(([k]) => act && act[k] > 0);
     ctx.font = '8px monospace';
     ctx.textBaseline = 'middle';
@@ -5649,6 +5721,10 @@ function _isoActivityIcons(ctx, x, y, act) {
             ctx.beginPath(); ctx.arc(x + 4, y, 1.2, 0, Math.PI * 2); ctx.fill();
         } else if (kind === 'file') {                    // page
             ctx.strokeRect(x + 1.5, y - 4, 5.5, 8);
+        } else if (kind === 'pipe') {                    // diamond
+            ctx.beginPath();
+            ctx.moveTo(x + 4, y - 4); ctx.lineTo(x + 8, y); ctx.lineTo(x + 4, y + 4); ctx.lineTo(x, y);
+            ctx.closePath(); ctx.stroke();
         } else {                                         // registry: stacked bars
             for (let i = 0; i < 3; i++) ctx.fillRect(x + 1, y - 4 + i * 3, 7, 1.6);
         }
@@ -5697,13 +5773,15 @@ function renderIsometricGraph(ctx) {
     }
     ctx.globalAlpha = 1;
 
-    // 2. Cross-process edges (remote thread / injection) as raised bridges.
+    // 2. Cross-process edges as raised bridges: remote threads (solid) and
+    // named pipes shared by two processes (dashed, lower, creator -> client).
     const teal = '#2dd4bf';
     for (const e of graphState.edges) {
-        if (e.type !== 'inject') continue;
+        if (e.type !== 'inject' && e.type !== 'pipe-link') continue;
         const s = byId[e.source], t = byId[e.target];
         if (!s || !t || s.hidden || t.hidden || s === t) continue;
-        const L = ISO.LIFT;
+        const isPipe = e.type === 'pipe-link';
+        const L = isPipe ? ISO.LIFT * 0.7 : ISO.LIFT;
         const corner = isoProject(t.isoU, s.isoV);
         const pts = [
             { x: s.x, y: s.y - s.radius },
@@ -5714,15 +5792,20 @@ function renderIsometricGraph(ctx) {
         ];
         ctx.strokeStyle = teal;
         ctx.lineWidth = 1.4;
+        if (isPipe) ctx.setLineDash([5, 3]);
         ctx.beginPath();
         pts.forEach((p, i) => (i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)));
         ctx.stroke();
+        ctx.setLineDash([]);
         _isoArrow(ctx, pts[1].x, pts[1].y + 2, -Math.PI / 2, 7, teal);   // leaves the source
         _isoArrow(ctx, pts[4].x, pts[4].y, Math.PI / 2, 8, teal);       // enters the target
         const midY = (pts[3].y + pts[4].y) / 2;                           // marker on the drop
         ctx.fillStyle = '#14b8a6';
         ctx.beginPath();
-        if (ctx.roundRect) ctx.roundRect(t.x - 3.5, midY - 7, 7, 14, 3); else ctx.rect(t.x - 3.5, midY - 7, 7, 14);
+        if (isPipe) {                                                     // diamond: pipe
+            ctx.moveTo(t.x, midY - 6); ctx.lineTo(t.x + 5, midY); ctx.lineTo(t.x, midY + 6); ctx.lineTo(t.x - 5, midY);
+            ctx.closePath();
+        } else if (ctx.roundRect) ctx.roundRect(t.x - 3.5, midY - 7, 7, 14, 3); else ctx.rect(t.x - 3.5, midY - 7, 7, 14);
         ctx.fill();
     }
 
@@ -6126,6 +6209,7 @@ function renderGraph() {
         dns: '#a78bfa',
         file: '#f97316',
         registry: '#f472b6',
+        pipe: '#38bdf8',
     };
 
     const edgeColors = {
@@ -6135,6 +6219,8 @@ function renderGraph() {
         inject: '#ef4444',
         file: '#f97316',
         registry: '#f472b6',
+        'pipe-create': '#38bdf8',
+        'pipe-connect': '#38bdf8',
     };
 
     // Build node index for edge lookup
@@ -6154,6 +6240,8 @@ function renderGraph() {
         ctx.lineWidth = edge.type === 'inject' ? 2 : 1;
         if (edge.type === 'inject') {
             ctx.setLineDash([4, 3]);
+        } else if (edge.type === 'pipe-create') {
+            ctx.setLineDash([6, 2]);
         } else if (edge.type !== 'spawn') {
             ctx.setLineDash([2, 2]);
         } else {
@@ -6232,11 +6320,20 @@ function renderGraph() {
             ctx.fill();
         }
 
-        // Node circle
+        // Node outline: a diamond for pipes, a circle otherwise
         ctx.beginPath();
-        ctx.arc(node.x, node.y, r, 0, Math.PI * 2);
+        if (node.type === 'pipe') {
+            ctx.moveTo(node.x, node.y - r * 1.25);
+            ctx.lineTo(node.x + r * 1.25, node.y);
+            ctx.lineTo(node.x, node.y + r * 1.25);
+            ctx.lineTo(node.x - r * 1.25, node.y);
+            ctx.closePath();
+        } else {
+            ctx.arc(node.x, node.y, r, 0, Math.PI * 2);
+        }
         ctx.fillStyle = color + '30';
         ctx.fill();
+        if (node.type === 'pipe' && node.family) color = '#ef4444';   // known C2 pipe name
         ctx.strokeStyle = isSelected ? '#fff' : color;
         ctx.lineWidth = isSelected ? 2.5 : 1.5;
         ctx.stroke();
@@ -6262,6 +6359,9 @@ function renderGraph() {
             ctx.beginPath();
             ctx.arc(node.x, node.y, r * 0.35, 0, Math.PI * 2);
             ctx.fill();
+        } else if (node.type === 'pipe') {
+            // Pipe: a short horizontal bar
+            ctx.fillRect(node.x - r * 0.5, node.y - r * 0.15, r, r * 0.3);
         } else {
             // Small triangle for file/registry
             ctx.beginPath();
@@ -6361,6 +6461,9 @@ function showGraphTooltip(node, sx, sy) {
         html += `<div class="tt-field"><span>Path:</span> ${escapeHtml(node.fullPath || node.label)}</div>`;
     } else if (node.type === 'registry') {
         html += `<div class="tt-field"><span>Key:</span> ${escapeHtml(node.fullPath || node.label)}</div>`;
+    } else if (node.type === 'pipe') {
+        if (node.family) html += `<div class="tt-field"><span>Family:</span> ${escapeHtml(node.family)}</div>`;
+        html += `<div class="tt-field"><span>Created by:</span> ${escapeHtml(String((node.createdBy || []).length))} · <span>connected:</span> ${escapeHtml(String((node.connectedBy || []).length))}</div>`;
     }
 
     tooltip.innerHTML = html;
@@ -6548,6 +6651,17 @@ function showGraphDetail(node) {
             html += `</div>`;
         }
 
+        const pipeConns = connections.filter(e => (e.type === 'pipe-create' || e.type === 'pipe-connect') && e.source === node.id);
+        if (pipeConns.length) {
+            html += `<div class="gd-section">Named Pipes <span class="gd-count">${pipeConns.length}</span></div>`;
+            html += `<div class="gd-conn-list">`;
+            pipeConns.forEach(e => {
+                const target = graphState.nodes.find(n => n.id === e.target);
+                if (target) html += `<div class="gd-conn-item"><span class="gd-conn-icon pipe"></span><a class="gd-link gd-conn-text" data-node-id="${escapeHtml(target.id)}">${escapeHtml(target.label)}</a><span class="gd-conn-proto">${e.type === 'pipe-create' ? 'created' : 'connected'}${target.family ? ' · ' + escapeHtml(target.family) : ''}</span></div>`;
+            });
+            html += `</div>`;
+        }
+
         if (dnsConns.length) {
             html += `<div class="gd-section">DNS Queries <span class="gd-count">${dnsConns.length}</span></div>`;
             html += `<div class="gd-conn-list">`;
@@ -6588,6 +6702,23 @@ function showGraphDetail(node) {
                 if (src) html += `<div class="gd-conn-item"><span class="gd-conn-icon proc"></span><a class="gd-link" data-node-id="${escapeHtml(src.id)}">${escapeHtml(src.label)} (${escapeHtml(String(src.pid ?? ''))})</a></div>`;
             });
         }
+    } else if (node.type === 'pipe') {
+        headerText = `Pipe: ${node.label}`;
+        html += `<div class="gd-field"><span class="gd-label">Name</span><span class="gd-value">${escapeHtml(node.label)}</span></div>`;
+        if (node.family) html += `<div class="gd-field"><span class="gd-label">Family</span><span class="gd-value"><span class="pipe-family">${escapeHtml(node.family)}</span></span></div>`;
+        const procLink = key => {
+            const src = graphState.nodes.find(n => n.id === `proc_${key}`);
+            return src ? `<div class="gd-conn-item"><span class="gd-conn-icon proc"></span><a class="gd-link" data-node-id="${escapeHtml(src.id)}">${escapeHtml(src.label)} (${escapeHtml(String(src.pid ?? ''))})</a></div>` : '';
+        };
+        if ((node.createdBy || []).length) {
+            html += `<div class="gd-section">Created by <span class="gd-count">${node.createdBy.length}</span></div>`;
+            html += node.createdBy.map(procLink).join('');
+        }
+        if ((node.connectedBy || []).length) {
+            html += `<div class="gd-section">Connected by <span class="gd-count">${node.connectedBy.length}</span></div>`;
+            html += node.connectedBy.map(procLink).join('');
+        }
+        html += `<div class="gd-actions"><button class="gd-focus-btn" data-pipe-name="${escapeHtml(node.label)}">Intercept in Pipes tab</button></div>`;
     } else {
         headerText = `${node.type}: ${node.label}`;
         if (node.fullPath) html += `<div class="gd-field"><span class="gd-label">Path</span><span class="gd-value">${escapeHtml(node.fullPath)}</span></div>`;
@@ -6596,6 +6727,9 @@ function showGraphDetail(node) {
     header.textContent = headerText;
     body.innerHTML = html;
     if (node.type === 'process' && node.pid != null) loadGraphSysmonSections(node);
+
+    const pipeBtn = body.querySelector('.gd-focus-btn[data-pipe-name]');
+    if (pipeBtn) pipeBtn.addEventListener('click', () => pipesInterceptFrom(pipeBtn.dataset.pipeName));
 
     // Re-root the drilldown on the selected process
     const focusBtn = body.querySelector('.gd-focus-btn[data-focus-pid]');
@@ -6705,7 +6839,7 @@ function hideGraphDetail() {
 
 function initGraphControls() {
     // Activity toggles re-render the current focus subtree
-    ['graph-show-network', 'graph-show-dns', 'graph-show-files', 'graph-show-registry'].forEach(id => {
+    ['graph-show-network', 'graph-show-dns', 'graph-show-files', 'graph-show-registry', 'graph-show-pipes'].forEach(id => {
         const el = document.getElementById(id);
         if (el) el.addEventListener('change', () => { if (state.activeTab === 'graph' && graphState.focusPid) graphRefresh(); });
     });
@@ -9252,4 +9386,673 @@ async function pdBaselinePoll() {
             loadScanToolStatus();
         }
     } catch (e) { /* best-effort */ }
+}
+
+// =============================================
+// Named Pipes tab: Sysmon pipe events + interception sessions
+// =============================================
+// Pipe names, images, families and message bytes come from the sample: every
+// value goes through escapeHtml()/jsArg()/jsInt()/cssToken().
+
+const pipesState = {
+    initialized: false,
+    sessions: [],
+    selected: null,          // id of the session shown in the message view
+    messages: new Map(),     // seq -> message of the selected session
+    rows: new Map(),         // seq -> { el, sig } rendered rows
+    lastSeq: 0,
+    capped: false,           // more messages than PIPES_MAX_MESSAGES
+    editing: null,           // seq of the held message being edited
+    finalFetchFor: null,     // ended session whose last messages were loaded
+    busy: false,
+    eventsSeq: 0,
+    gone: new Set(),         // lower-case names the API reported as no longer existing
+};
+const PIPES_MAX_MESSAGES = 2000;
+const PIPES_HEX_PREVIEW = 512;
+const PIPES_LIVE = new Set(['starting', 'armed', 'active']);
+const PIPE_FLAG_LABELS = {
+    c2_default: 'C2 default name',
+    cross_process: 'cross-process',
+    sensitive_system: 'sensitive system pipe',
+    random_name: 'random name',
+};
+
+function initPipesTab() {
+    if (pipesState.initialized) return;
+    pipesState.initialized = true;
+    ['pipes-f-how', 'pipes-f-match', 'pipes-f-mode'].forEach(id => {
+        document.getElementById(id)?.addEventListener('change', pipesSyncForm);
+    });
+    ['pipes-filter-name', 'pipes-filter-pid'].forEach(id => {
+        document.getElementById(id)?.addEventListener('keydown', e => {
+            if (e.key === 'Enter') { e.preventDefault(); refreshPipeEvents(); }
+        });
+    });
+    document.getElementById('pipes-filter-window')?.addEventListener('change', refreshPipeEvents);
+    pipesSyncForm();
+    // 1 s while the tab is visible and a session can still record something.
+    setInterval(() => {
+        if (state.activeTab !== 'pipes' || document.hidden || pipesState.busy) return;
+        const sel = pipesState.sessions.find(s => s.id === pipesState.selected);
+        const needFinal = sel && !PIPES_LIVE.has(sel.state) && pipesState.finalFetchFor !== sel.id;
+        if (pipesState.sessions.some(s => PIPES_LIVE.has(s.state)) || needFinal) pipesPoll();
+    }, 1000);
+}
+
+function openPipesTab() {
+    initPipesTab();
+    refreshPipeEvents();
+    refreshPipeSessions();
+}
+
+async function pipesPoll() {
+    pipesState.busy = true;
+    try {
+        await refreshPipeSessions();
+    } finally {
+        pipesState.busy = false;
+    }
+}
+
+// --- Form ---
+function pipesSyncForm() {
+    const how = document.getElementById('pipes-f-how');
+    const match = document.getElementById('pipes-f-match');
+    const mode = document.getElementById('pipes-f-mode');
+    const squat = document.getElementById('pipes-f-squat');
+    const squatWrap = document.getElementById('pipes-f-squat-wrap');
+    const holdWrap = document.getElementById('pipes-f-hold-wrap');
+    if (!how || !match) return;
+    // attach opens one known pipe, so only exact names are accepted.
+    if (how.value === 'attach') match.value = 'exact';
+    match.disabled = how.value === 'attach';
+    match.title = match.disabled ? 'attach needs the exact pipe name' : '';
+    const squatOk = how.value === 'arm' && match.value === 'exact';
+    if (squat) {
+        squat.disabled = !squatOk;
+        if (!squatOk) squat.checked = false;
+    }
+    if (squatWrap) squatWrap.classList.toggle('disabled', !squatOk);
+    if (holdWrap) holdWrap.hidden = mode?.value !== 'hold';
+}
+
+function pipesFormError(msg) {
+    const el = document.getElementById('pipes-form-error');
+    if (!el) return;
+    el.hidden = !msg;
+    el.textContent = msg || '';
+}
+
+function pipesPrefill(name, how = 'attach') {
+    const pattern = document.getElementById('pipes-f-pattern');
+    const howEl = document.getElementById('pipes-f-how');
+    const match = document.getElementById('pipes-f-match');
+    if (pattern) pattern.value = String(name || '');
+    if (howEl) howEl.value = how === 'arm' ? 'arm' : 'attach';
+    if (match) match.value = 'exact';
+    pipesSyncForm();
+    pipesFormError('');
+    document.getElementById('pipes-form')?.scrollIntoView({ block: 'nearest' });
+    document.getElementById('pipes-start-btn')?.focus();
+}
+
+// "Intercept" in a detonation result: open the tab with an attach form.
+function pipesInterceptFrom(name) {
+    // The result may be open in the detail panel, which would cover the form.
+    if (state.detailOpen) closeDetail();
+    switchTab('pipes');
+    pipesPrefill(name, 'attach');
+    showToast('info', 'Pipe prefilled', 'Choose observe or hold and press Start session.');
+}
+
+function pipesMarkGone(name) {
+    pipesState.gone.add(String(name || '').toLowerCase());
+    document.querySelectorAll('button[data-pipe-intercept]').forEach(b => {
+        if (pipesState.gone.has(String(b.dataset.pipeIntercept || '').toLowerCase())) {
+            b.disabled = true;
+            b.title = 'The pipe no longer exists';
+            if (!b.nextElementSibling || !b.nextElementSibling.classList.contains('pipes-gone-hint')) {
+                b.insertAdjacentHTML('afterend', '<div class="pipes-gone-hint">pipe no longer exists</div>');
+            }
+        }
+    });
+}
+
+async function pipesStartSession() {
+    const val = id => (document.getElementById(id)?.value || '').trim();
+    const pattern = val('pipes-f-pattern');
+    const how = val('pipes-f-how') || 'attach';
+    const match = how === 'attach' ? 'exact' : (val('pipes-f-match') || 'exact');
+    const mode = val('pipes-f-mode') || 'observe';
+    const duration = Number(val('pipes-f-duration'));
+    if (!pattern) { pipesFormError('Enter a pipe name or pattern.'); return; }
+    if (!Number.isInteger(duration) || duration < 1 || duration > 3600) {
+        pipesFormError('Max duration must be a whole number of seconds between 1 and 3600.');
+        return;
+    }
+    const body = { pattern, how, match, mode, max_duration: duration };
+    if (mode === 'hold') {
+        const hold = Number(val('pipes-f-hold'));
+        if (!Number.isInteger(hold) || hold < 1 || hold > duration) {
+            pipesFormError('Hold timeout must be a whole number of seconds, at most the max duration.');
+            return;
+        }
+        body.hold_timeout = hold;
+    }
+    const squat = document.getElementById('pipes-f-squat');
+    if (squat && !squat.disabled && squat.checked) body.squat = true;
+    const pipeMode = val('pipes-f-pipemode');
+    if (pipeMode) body.pipe_mode = pipeMode;
+
+    const btn = document.getElementById('pipes-start-btn');
+    if (btn) btn.disabled = true;
+    pipesFormError('');
+    try {
+        const resp = await fetch('/api/pipes/intercept', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            const msg = data.error || `HTTP ${resp.status}`;
+            pipesFormError(msg);
+            if (resp.status === 400 && /does not exist/i.test(msg)) pipesMarkGone(pattern);
+            return;
+        }
+        showToast('success', 'Interception started', `${data.how || how} ${data.pattern || pattern}`);
+        pipesSelectSession(data.id, true);
+        await refreshPipeSessions();
+    } catch (e) {
+        pipesFormError('Request failed: ' + e.message);
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+// --- Events ---
+function pipesFilterPid(pid) {
+    const el = document.getElementById('pipes-filter-pid');
+    if (el) el.value = pid == null ? '' : String(pid);
+    refreshPipeEvents();
+}
+
+async function refreshPipeEvents() {
+    const seq = ++pipesState.eventsSeq;
+    const box = document.getElementById('pipes-events');
+    const note = document.getElementById('pipes-events-note');
+    const summary = document.getElementById('pipes-hit-summary');
+    if (!box) return;
+    const name = (document.getElementById('pipes-filter-name')?.value || '').trim();
+    const pid = (document.getElementById('pipes-filter-pid')?.value || '').trim();
+    const minutes = parseInt(document.getElementById('pipes-filter-window')?.value, 10) || 60;
+    const setNote = (text) => { if (note) { note.hidden = !text; note.textContent = text || ''; } };
+    if (pid && !/^\d+$/.test(pid)) { setNote('PID must be a number.'); return; }
+    const params = new URLSearchParams({ since: new Date(Date.now() - minutes * 60000).toISOString(), max: '1000' });
+    if (name) params.set('name', name);
+    if (pid) params.set('pid', pid);
+    box.innerHTML = '<div class="pipes-empty"><div class="loading-spinner"></div> Loading pipe events...</div>';
+    let data;
+    try {
+        const resp = await fetch(`/api/pipes?${params}`);
+        data = await resp.json().catch(() => ({}));
+        if (!resp.ok && !data.error) data.error = `HTTP ${resp.status}`;
+    } catch (e) {
+        data = { error: e.message };
+    }
+    if (seq !== pipesState.eventsSeq) return;
+    const events = Array.isArray(data.events) ? data.events.slice() : [];
+    events.sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')));
+
+    const notes = [];
+    if (data.error) notes.push(data.error);
+    if (data.available === false) notes.push(data.reason || 'Sysmon is not available.');
+    if (data.truncated) notes.push('Event limit reached: only the newest 1000 events of the window are shown. Narrow the filter or the time window.');
+    setNote(notes.join(' · '));
+
+    const pipeNames = new Set(events.map(e => String(e.pipe || '').toLowerCase()));
+    const hits = events.filter(e => e.family);
+    const families = [...new Set(hits.map(e => e.family))];
+    if (summary) {
+        summary.innerHTML = `<span class="badge badge-dim">${events.length} events</span>`
+            + `<span class="badge badge-dim">${pipeNames.size} pipes</span>`
+            + (hits.length ? `<span class="badge badge-red" title="${escapeHtml(families.join(', '))}">${hits.length} known C2 pipe name hit(s)</span>` : '');
+    }
+    if (!events.length) {
+        box.innerHTML = `<div class="pipes-empty">No named pipe events${name || pid ? ' match the filter' : ''} in the last ${minutes >= 60 ? minutes / 60 + ' h' : minutes + ' min'}.</div>`;
+        return;
+    }
+    let html = `<table class="pipes-table"><thead><tr>
+        <th>Time</th><th>Event</th><th>PID</th><th>Process</th><th>Pipe</th><th>Family</th><th></th>
+        </tr></thead><tbody>`;
+    events.forEach(ev => {
+        const created = ev.type === 'PipeCreated';
+        const image = String(ev.image || '');
+        const short = image.split('\\').pop() || image;
+        html += `<tr class="${ev.family ? 'pipes-row-hit' : ''}">
+            <td class="muted">${escapeHtml(formatTime(ev.timestamp))}</td>
+            <td><span class="pipe-action pipe-action-${created ? 'created' : 'connected'}">${created ? 'created' : 'connected'}</span></td>
+            <td><a class="pipes-link" onclick="pipesFilterPid(${jsInt(ev.pid)})" title="Filter by this PID">${escapeHtml(String(ev.pid ?? ''))}</a></td>
+            <td class="pipes-proc" title="${escapeHtml(image)}">${escapeHtml(short)}</td>
+            <td class="mono pipe-name-cell">${escapeHtml(ev.pipe || '')}</td>
+            <td>${ev.family ? `<span class="pipe-family">${escapeHtml(ev.family)}</span>` : '<span class="muted">&mdash;</span>'}</td>
+            <td class="pipes-row-actions"><button class="btn btn-xs" onclick="pipesPrefill(${jsArg(ev.pipe || '')}, 'attach')" title="Prefill an attach session for this pipe">Intercept</button></td>
+        </tr>`;
+    });
+    html += '</tbody></table>';
+    box.innerHTML = html;
+}
+
+// --- Sessions ---
+async function refreshPipeSessions() {
+    let data;
+    try {
+        const resp = await fetch('/api/pipes/intercept');
+        data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+    } catch (e) {
+        const box = document.getElementById('pipes-sessions');
+        if (box) box.innerHTML = `<div class="pipes-empty">Cannot load sessions: ${escapeHtml(e.message)}</div>`;
+        return;
+    }
+    pipesState.sessions = Array.isArray(data.sessions) ? data.sessions : [];
+    renderPipeSessions();
+    const sel = pipesState.sessions.find(s => s.id === pipesState.selected);
+    if (sel) {
+        renderPipeSessionHeader(sel);
+        const live = PIPES_LIVE.has(sel.state);
+        if (live || pipesState.finalFetchFor !== sel.id) {
+            await pipesLoadMessages();
+            if (!live) pipesState.finalFetchFor = sel.id;
+        }
+    }
+}
+
+function pipesFmtEpoch(t) {
+    if (t === null || t === undefined || t === '') return '';
+    const d = new Date(Number(t) * 1000);
+    return isNaN(d.getTime()) ? '' : d.toLocaleTimeString('en-GB', { hour12: false });
+}
+
+function renderPipeSessions() {
+    const box = document.getElementById('pipes-sessions');
+    if (!box) return;
+    if (!pipesState.sessions.length) {
+        box.innerHTML = '<div class="pipes-empty">No interception sessions yet.</div>';
+        return;
+    }
+    box.innerHTML = pipesState.sessions.map(s => {
+        const active = s.id === pipesState.selected;
+        const held = Number(s.held_count) || 0;
+        return `<div class="pipes-session-item ${active ? 'active' : ''}" onclick="pipesSelectSession(${jsArg(s.id)})">
+            <div class="pss-head">
+                <span class="pipes-state pipes-state-${cssToken(s.state)}">${escapeHtml(s.state)}</span>
+                <span class="pss-pattern" title="${escapeHtml(s.target || s.pattern || '')}">${escapeHtml(s.target || s.pattern || '')}</span>
+                ${held ? `<span class="pss-held">${held} held</span>` : ''}
+            </div>
+            <div class="pss-meta">${escapeHtml(s.how)}/${escapeHtml(s.match)} · ${escapeHtml(s.mode)}${s.squat ? ' · squat' : ''} · ${Number(s.message_count) || 0} msg · ${Number(s.connections) || 0} conn · ${escapeHtml(pipesFmtEpoch(s.started))}</div>
+        </div>`;
+    }).join('');
+}
+
+function pipesSelectSession(sid, fresh = false) {
+    sid = String(sid || '');
+    if (!fresh && sid === pipesState.selected) return;
+    pipesState.selected = sid;
+    pipesState.messages = new Map();
+    pipesState.rows = new Map();
+    pipesState.lastSeq = 0;
+    pipesState.capped = false;
+    pipesState.editing = null;
+    pipesState.finalFetchFor = null;
+    const view = document.getElementById('pipes-session-view');
+    if (view) view.innerHTML = '<div class="pipes-session-head" id="pipes-session-head"></div><div class="pipes-msgs" id="pipes-msgs"><div class="pipes-empty">Loading messages...</div></div>';
+    renderPipeSessions();
+    const sel = pipesState.sessions.find(s => s.id === sid);
+    if (sel) {
+        renderPipeSessionHeader(sel);
+        pipesLoadMessages().then(() => { if (!PIPES_LIVE.has(sel.state)) pipesState.finalFetchFor = sel.id; });
+    }
+}
+
+function renderPipeSessionHeader(s) {
+    const head = document.getElementById('pipes-session-head');
+    if (!head) return;
+    const live = PIPES_LIVE.has(s.state);
+    const held = Number(s.held_count) || 0;
+    const sid = String(s.id || '');
+    const field = (label, value) => `<div class="pipes-kv"><span>${label}</span><b>${value}</b></div>`;
+    let remaining = '';
+    if (live && s.started && s.max_duration) {
+        const left = Math.max(0, Math.round(Number(s.started) + Number(s.max_duration) - Date.now() / 1000));
+        remaining = ` (${left} s left)`;
+    }
+    let html = `<div class="pipes-sh-top">
+        <span class="pipes-state pipes-state-${cssToken(s.state)}">${escapeHtml(s.state)}</span>
+        <span class="pipes-sh-name mono">${escapeHtml(s.target || s.pattern || '')}</span>
+        <div class="pipes-sh-actions">
+            ${live && held ? `<button class="btn btn-sm btn-accent" onclick="pipesReleaseAll(${jsArg(sid)})">Release all (${held})</button>` : ''}
+            ${live ? `<button class="btn btn-sm pipes-stop-btn" onclick="pipesStopSession(${jsArg(sid)})">Stop</button>` : ''}
+            <a class="btn btn-sm" href="/api/pipes/intercept/${escapeHtml(encodeURIComponent(sid))}/export" download>Export JSON</a>
+        </div>
+    </div>`;
+    html += '<div class="pipes-kv-grid">';
+    html += field('Session', escapeHtml(sid));
+    if (s.target && s.target !== s.pattern) html += field('Pattern', escapeHtml(s.pattern));
+    html += field('How / match', `${escapeHtml(s.how)} / ${escapeHtml(s.match)}${s.squat ? ' · squat' : ''}`);
+    html += field('Mode', escapeHtml(s.mode) + (s.mode === 'hold' ? ` · auto-forward after ${escapeHtml(String(s.hold_timeout ?? ''))} s` : ''));
+    html += field('Pipe mode', escapeHtml(s.pipe_mode || '—'));
+    html += field('Started', escapeHtml(pipesFmtEpoch(s.started)) + escapeHtml(remaining));
+    if (s.ended) html += field('Ended', `${escapeHtml(pipesFmtEpoch(s.ended))}${s.end_reason ? ' · ' + escapeHtml(s.end_reason) : ''}`);
+    html += field('Connections', `${Number(s.connections) || 0} (${Number(s.active_connections) || 0} open)`);
+    html += field('Messages', `${Number(s.message_count) || 0} · ${escapeHtml(formatSize(Number(s.recorded_bytes) || 0))} recorded`);
+    html += '</div>';
+    const notes = [];
+    if (s.state === 'armed') notes.push('Waiting for a pipe that matches the pattern to appear.');
+    if (s.state === 'starting') notes.push('Starting: connecting to the real server. Clients connecting in this phase are not intercepted.');
+    if (s.recording_truncated) notes.push('Recording limit reached: further messages are relayed but not recorded.');
+    if (Number(s.self_connect_retries) > 0) notes.push(`Upstream connect landed on the proxy's own instance ${Number(s.self_connect_retries)} time(s) and was retried.`);
+    if (s.last_error) notes.push('Last error: ' + s.last_error);
+    if (notes.length) html += `<div class="pipes-note">${notes.map(escapeHtml).join('<br>')}</div>`;
+    head.innerHTML = html;
+}
+
+async function pipesLoadMessages() {
+    const sid = pipesState.selected;
+    if (!sid) return;
+    const held = [...pipesState.messages.values()].filter(m => m.state === 'held').map(m => m.seq);
+    const after = held.length ? Math.min(...held) - 1 : pipesState.lastSeq;
+    let data;
+    try {
+        const resp = await fetch(`/api/pipes/intercept/${encodeURIComponent(sid)}/messages?after=${after}&limit=1000`);
+        data = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+    } catch (e) {
+        if (sid === pipesState.selected) {
+            const box = document.getElementById('pipes-msgs');
+            if (box && !pipesState.messages.size) box.innerHTML = `<div class="pipes-empty">Cannot load messages: ${escapeHtml(e.message)}</div>`;
+        }
+        return;
+    }
+    if (sid !== pipesState.selected) return;
+    for (const m of data.messages || []) {
+        const seq = Number(m && m.seq);
+        if (!Number.isInteger(seq)) continue;
+        pipesState.lastSeq = Math.max(pipesState.lastSeq, seq);
+        if (!pipesState.messages.has(seq) && pipesState.messages.size >= PIPES_MAX_MESSAGES) {
+            pipesState.capped = true;
+            continue;
+        }
+        pipesState.messages.set(seq, m);
+    }
+    renderPipeMessages();
+}
+
+function pipesB64Bytes(b64) {
+    try {
+        const bin = atob(String(b64 || ''));
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+        return out;
+    } catch (e) {
+        return new Uint8Array(0);
+    }
+}
+
+function pipesBytesB64(bytes) {
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+        bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(bin);
+}
+
+// Hex + ASCII dump, 16 bytes per line, as escaped HTML.
+function pipesHexDump(bytes, limit = PIPES_HEX_PREVIEW) {
+    const n = Math.min(bytes.length, limit);
+    const lines = [];
+    for (let off = 0; off < n; off += 16) {
+        const row = bytes.subarray(off, Math.min(off + 16, n));
+        let hex = '', ascii = '';
+        for (let i = 0; i < 16; i++) {
+            if (i < row.length) {
+                hex += row[i].toString(16).padStart(2, '0') + ' ';
+                ascii += row[i] >= 0x20 && row[i] < 0x7f ? String.fromCharCode(row[i]) : '.';
+            } else {
+                hex += '   ';
+            }
+            if (i === 7) hex += ' ';
+        }
+        lines.push(`<span class="ph-off">${off.toString(16).padStart(6, '0')}</span>  ${hex} <span class="ph-ascii">${escapeHtml(ascii)}</span>`);
+    }
+    let html = lines.join('\n');
+    if (bytes.length > n) html += `\n<span class="ph-more">… ${bytes.length - n} more byte(s), see the JSON export</span>`;
+    return html;
+}
+
+function pipesHexText(bytes) {
+    const parts = [];
+    for (let off = 0; off < bytes.length; off += 16) {
+        parts.push(Array.from(bytes.subarray(off, off + 16), b => b.toString(16).padStart(2, '0')).join(' '));
+    }
+    return parts.join('\n');
+}
+
+function pipesMessageRow(m, live) {
+    const seq = Number(m.seq);
+    const st = String(m.state || '');
+    const bytes = pipesB64Bytes(m.data_b64);
+    const c2s = m.dir === 'c2s';
+    const editing = pipesState.editing === seq && st === 'held' && live;
+    let html = `<div class="pipe-msg pipe-msg-${cssToken(st)} ${c2s ? 'pipe-msg-c2s' : 'pipe-msg-s2c'}">
+        <div class="pipe-msg-head">
+            <span class="pipe-msg-seq">#${seq}</span>
+            <span class="pipe-msg-dir">${c2s ? 'client &rarr; server' : 'server &rarr; client'}</span>
+            <span class="pipe-msg-conn">conn ${escapeHtml(String(m.conn ?? ''))}</span>
+            <span class="pipe-msg-size">${Number(m.size) || 0} B${m.truncated ? ' · log truncated' : ''}</span>
+            <span class="pipe-msg-ts">${escapeHtml(pipesFmtEpoch(m.ts))}</span>
+            <span class="pipe-msg-state pipes-mstate-${cssToken(st)}">${escapeHtml(st.replace('_', ' '))}</span>`;
+    if (st === 'held' && live && !editing) {
+        html += `<span class="pipe-msg-actions">
+            <button class="btn btn-xs pipe-btn-forward" onclick="pipesAct(${jsInt(seq)}, 'forward')">Forward</button>
+            <button class="btn btn-xs" onclick="pipesEditStart(${jsInt(seq)})">Edit</button>
+            <button class="btn btn-xs pipe-btn-drop" onclick="pipesAct(${jsInt(seq)}, 'drop')">Drop</button>
+        </span>`;
+    }
+    html += '</div>';
+    if (editing) {
+        html += `<div class="pipe-edit">
+            ${m.truncated ? '<div class="pipes-note">Only the first part of this message was recorded; the edited bytes replace the whole message.</div>' : ''}
+            <textarea class="pipe-edit-hex" id="pipe-edit-${seq}" spellcheck="false">${escapeHtml(pipesHexText(bytes))}</textarea>
+            <div class="pipe-edit-actions">
+                <span class="muted">Hex bytes, whitespace is ignored.</span>
+                <span class="pipe-edit-error" id="pipe-edit-error-${seq}"></span>
+                <button class="btn btn-xs" onclick="pipesEditCancel()">Cancel</button>
+                <button class="btn btn-xs btn-accent" onclick="pipesEditApply(${jsInt(seq)})">Send edited</button>
+            </div>
+        </div>`;
+    } else if (!bytes.length && (Number(m.size) || 0) > 0) {
+        html += '<div class="pipe-hex muted">(not recorded: session recording limit reached)</div>';
+    } else if (bytes.length) {
+        html += `<pre class="pipe-hex">${pipesHexDump(bytes)}</pre>`;
+    }
+    if (m.original_b64) {
+        html += `<details class="pipe-orig"><summary>original (before edit)</summary><pre class="pipe-hex">${pipesHexDump(pipesB64Bytes(m.original_b64))}</pre></details>`;
+    }
+    html += '</div>';
+    return html;
+}
+
+function renderPipeMessages() {
+    const box = document.getElementById('pipes-msgs');
+    if (!box) return;
+    const sel = pipesState.sessions.find(s => s.id === pipesState.selected);
+    const live = !!sel && PIPES_LIVE.has(sel.state);
+    if (!pipesState.messages.size) {
+        box.innerHTML = `<div class="pipes-empty">${live ? 'No messages yet. Waiting for a client to connect...' : 'This session recorded no messages.'}</div>`;
+        pipesState.rows = new Map();
+        return;
+    }
+    if (!pipesState.rows.size) box.innerHTML = '';
+    const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+    const seqs = [...pipesState.messages.keys()].sort((a, b) => a - b);
+    for (const seq of seqs) {
+        const m = pipesState.messages.get(seq);
+        const sig = `${m.state}|${m.original_b64 ? 1 : 0}|${live ? 1 : 0}|${pipesState.editing === seq ? 1 : 0}`;
+        const row = pipesState.rows.get(seq);
+        if (row && row.sig === sig) continue;
+        const tpl = document.createElement('template');
+        tpl.innerHTML = pipesMessageRow(m, live).trim();
+        const el = tpl.content.firstElementChild;
+        if (row) {
+            row.el.replaceWith(el);
+        } else {
+            box.appendChild(el);
+        }
+        pipesState.rows.set(seq, { el, sig });
+    }
+    let capNote = box.querySelector('.pipes-cap-note');
+    if (pipesState.capped && !capNote) {
+        box.insertAdjacentHTML('beforeend', `<div class="pipes-note pipes-cap-note">Showing the first ${PIPES_MAX_MESSAGES} messages; the JSON export has all of them.</div>`);
+    }
+    if (nearBottom) box.scrollTop = box.scrollHeight;
+}
+
+async function pipesPost(url, body) {
+    const resp = await fetch(url, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+    return data;
+}
+
+function pipesApplyRecord(rec) {
+    if (rec && Number.isInteger(Number(rec.seq)) && pipesState.messages.has(Number(rec.seq))) {
+        pipesState.messages.set(Number(rec.seq), rec);
+    }
+}
+
+async function pipesAct(seq, action, dataB64) {
+    const sid = pipesState.selected;
+    if (!sid) return false;
+    try {
+        const body = { action };
+        if (action === 'edit') body.data_b64 = dataB64;
+        const rec = await pipesPost(`/api/pipes/intercept/${encodeURIComponent(sid)}/messages/${jsInt(seq)}`, body);
+        if (sid !== pipesState.selected) return true;
+        pipesApplyRecord(rec);
+        if (pipesState.editing === seq) pipesState.editing = null;
+        renderPipeMessages();
+        refreshPipeSessions();
+        return true;
+    } catch (e) {
+        showToast('error', `Cannot ${action} message #${seq}`, e.message);
+        refreshPipeSessions();
+        return false;
+    }
+}
+
+function pipesEditStart(seq) {
+    pipesState.editing = seq;
+    renderPipeMessages();
+    document.getElementById(`pipe-edit-${seq}`)?.focus();
+}
+
+function pipesEditCancel() {
+    pipesState.editing = null;
+    renderPipeMessages();
+}
+
+async function pipesEditApply(seq) {
+    const ta = document.getElementById(`pipe-edit-${seq}`);
+    const err = document.getElementById(`pipe-edit-error-${seq}`);
+    if (!ta) return;
+    const hex = ta.value.replace(/\s+/g, '');
+    if (!/^([0-9a-fA-F]{2})*$/.test(hex)) {
+        if (err) err.textContent = 'Not valid hex: use pairs of 0-9 / a-f.';
+        return;
+    }
+    const bytes = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+    await pipesAct(seq, 'edit', pipesBytesB64(bytes));
+}
+
+async function pipesReleaseAll(sid) {
+    try {
+        const d = await pipesPost(`/api/pipes/intercept/${encodeURIComponent(sid)}/release`);
+        showToast('success', 'Held messages released', `${Number(d.released) || 0} forwarded`);
+    } catch (e) {
+        showToast('error', 'Release failed', e.message);
+    }
+    pipesState.editing = null;
+    refreshPipeSessions();
+}
+
+async function pipesStopSession(sid) {
+    try {
+        const resp = await fetch(`/api/pipes/intercept/${encodeURIComponent(sid)}`, { method: 'DELETE' });
+        const d = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(d.error || `HTTP ${resp.status}`);
+        showToast('info', 'Session stopped', String(d.pattern || sid));
+    } catch (e) {
+        showToast('error', 'Stop failed', e.message);
+    }
+    pipesState.editing = null;
+    pipesState.finalFetchFor = null;
+    refreshPipeSessions();
+}
+
+// --- Detonation results: NAMED PIPES ---
+// Instance keys are "<pid>", "<pid>@<start>" or the sentinel "<pid>?" (the
+// sample, whose ProcessCreate was not in the log).
+function pipeProcLabel(key) {
+    const k = String(key ?? '');
+    if (!k) return '';
+    if (k.endsWith('?')) return `sample (PID ${k.slice(0, -1)})`;
+    const proc = state.processes[k];
+    const pid = k.split('@')[0];
+    return proc && proc.name ? `${proc.name} (PID ${proc.pid ?? pid})` : `PID ${pid}`;
+}
+
+function renderNamedPipesBlock(np) {
+    if (!np) return '';
+    if (!np.available) {
+        return `<div class="det-sub-value muted">Named pipe activity unavailable${np.reason ? ': ' + escapeHtml(np.reason) : ''}.</div>`;
+    }
+    const pipes = Array.isArray(np.pipes) ? np.pipes : [];
+    let html = '';
+    if (np.truncated) html += '<div class="pipes-note">Event limit reached: the pipe list may be incomplete.</div>';
+    if (!pipes.length) return html + '<div class="det-sub-value muted">The sample created or connected to no named pipes.</div>';
+    const findings = Array.isArray(np.evidence_findings) ? np.evidence_findings.length : 0;
+    html += `<div class="det-sub-value">${pipes.length} pipe(s)${findings ? ` · ${findings} finding(s) scored in the memory evidence` : ''}</div>`;
+    html += `<table class="pipes-table pipes-result-table"><thead><tr>
+        <th>Time</th><th>Process</th><th>Action</th><th>Pipe</th><th>Family</th><th>Flags</th><th></th>
+        </tr></thead><tbody>`;
+    pipes.forEach(p => {
+        const name = String(p.pipe || '');
+        const rows = [
+            ...(p.created_by || []).map(k => ['created', k]),
+            ...(p.connected_by || []).map(k => ['connected', k]),
+        ];
+        if (!rows.length) rows.push(['', '']);
+        const span = rows.length;
+        const gone = pipesState.gone.has(name.toLowerCase());
+        const flags = (p.flags || []).map(f =>
+            `<span class="pipe-flag pipe-flag-${cssToken(f)}">${escapeHtml(PIPE_FLAG_LABELS[f] || f)}</span>`).join('');
+        rows.forEach(([action, key], i) => {
+            html += `<tr class="${i === 0 ? 'pipes-group-start' : ''} ${p.family ? 'pipes-row-hit' : ''}">`;
+            if (i === 0) html += `<td rowspan="${span}" class="muted">${escapeHtml(formatTime(p.first_seen))}</td>`;
+            html += `<td>${escapeHtml(pipeProcLabel(key))}</td>`;
+            html += `<td>${action ? `<span class="pipe-action pipe-action-${cssToken(action)}">${escapeHtml(action)}</span>` : ''}</td>`;
+            if (i === 0) {
+                html += `<td rowspan="${span}" class="mono pipe-name-cell">${escapeHtml(name)}</td>`;
+                html += `<td rowspan="${span}">${p.family ? `<span class="pipe-family" title="${escapeHtml(p.note || '')}">${escapeHtml(p.family)}</span>` : '<span class="muted">&mdash;</span>'}</td>`;
+                html += `<td rowspan="${span}" class="pipe-flags">${flags || '<span class="muted">&mdash;</span>'}</td>`;
+                html += `<td rowspan="${span}" class="pipes-row-actions"><button class="btn btn-xs pipes-intercept-btn" data-pipe-intercept="${escapeHtml(name)}" ${gone ? 'disabled title="The pipe no longer exists"' : 'title="Open the Pipes tab with an attach session for this pipe"'} onclick="pipesInterceptFrom(${jsArg(name)})">Intercept</button>${gone ? '<div class="pipes-gone-hint">pipe no longer exists</div>' : ''}</td>`;
+            }
+            html += '</tr>';
+        });
+    });
+    html += '</tbody></table>';
+    return html;
 }

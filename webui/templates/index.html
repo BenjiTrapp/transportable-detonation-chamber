@@ -8,7 +8,7 @@
     <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
     <link rel="icon" type="image/png" sizes="192x192" href="/static/favicon-192.png">
     <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
-    <link rel="stylesheet" href="/static/css/style.css?v=27">
+    <link rel="stylesheet" href="/static/css/style.css?v=28">
 </head>
 <body>
     <!-- Global loading overlay (shown on slow fetches) -->
@@ -31,6 +31,7 @@
                     <button class="tab active" data-tab="dashboard">Dashboard</button>
                     <button class="tab" data-tab="tracing">Tracing</button>
                     <button class="tab" data-tab="graph">Graph</button>
+                    <button class="tab" data-tab="pipes">Pipes</button>
                     <button class="tab" data-tab="sysmon">Sysmon</button>
                     <button class="tab" data-tab="threatscan">ThreatScan</button>
                     <button class="tab" data-tab="etw">ETW</button>
@@ -232,6 +233,7 @@
                         <label class="graph-toggle"><input type="checkbox" id="graph-show-dns" checked> DNS</label>
                         <label class="graph-toggle"><input type="checkbox" id="graph-show-files"> Files</label>
                         <label class="graph-toggle"><input type="checkbox" id="graph-show-registry"> Registry</label>
+                        <label class="graph-toggle" title="Named pipes (Sysmon EID 17/18); on by default for detonated samples"><input type="checkbox" id="graph-show-pipes"> Pipes</label>
                         <select id="graph-depth" class="filter-select" title="Descendant depth">
                             <option value="0" selected>All subtasks</option>
                             <option value="1">1 level</option>
@@ -270,6 +272,7 @@
                         <span class="graph-legend-item"><span class="graph-legend-dot" style="background:#a78bfa"></span>DNS</span>
                         <span class="graph-legend-item"><span class="graph-legend-dot" style="background:#f97316"></span>File</span>
                         <span class="graph-legend-item"><span class="graph-legend-dot" style="background:#f472b6"></span>Registry</span>
+                        <span class="graph-legend-item"><span class="graph-legend-dot graph-legend-diamond" style="background:#38bdf8"></span>Pipe</span>
                         <span class="graph-legend-item line"><span class="graph-legend-line spawn"></span>Spawned</span>
                         <span class="graph-legend-item line"><span class="graph-legend-line network"></span>Connection</span>
                         <span class="graph-legend-item line"><span class="graph-legend-line inject"></span>Injection</span>
@@ -278,6 +281,82 @@
                 <div class="graph-detail-panel" id="graph-detail-panel">
                     <div class="graph-detail-header" id="graph-detail-header">Select a node</div>
                     <div class="graph-detail-body" id="graph-detail-body"></div>
+                </div>
+            </div>
+
+            <!-- Pipes Tab -->
+            <div class="tab-content" id="tab-pipes">
+                <div class="content-header">
+                    <h2>Named Pipes</h2>
+                    <span class="content-subtitle">Sysmon pipe events (EID 17/18) and pipe interception</span>
+                </div>
+                <div class="pipes-body">
+                    <section class="pipes-panel pipes-events-panel">
+                        <div class="pipes-panel-head">
+                            <span class="pipes-panel-title">PIPE EVENTS</span>
+                            <span class="pipes-hit-summary" id="pipes-hit-summary"></span>
+                            <div class="pipes-panel-actions">
+                                <input type="text" id="pipes-filter-name" class="etw-filter pipes-filter-name" placeholder="Pipe name (\prefix anchors at the start)" autocomplete="off" spellcheck="false">
+                                <input type="text" id="pipes-filter-pid" class="etw-filter pipes-filter-pid" placeholder="PID" autocomplete="off" inputmode="numeric">
+                                <select id="pipes-filter-window" class="etw-select" title="Time window">
+                                    <option value="15">Last 15 min</option>
+                                    <option value="60" selected>Last hour</option>
+                                    <option value="360">Last 6 h</option>
+                                    <option value="1440">Last 24 h</option>
+                                </select>
+                                <button class="etw-btn" onclick="refreshPipeEvents()">Refresh</button>
+                            </div>
+                        </div>
+                        <div class="pipes-note" id="pipes-events-note" hidden></div>
+                        <div class="pipes-events" id="pipes-events"><div class="pipes-empty">Loading pipe events...</div></div>
+                    </section>
+                    <section class="pipes-panel pipes-intercept-panel">
+                        <div class="pipes-panel-head">
+                            <span class="pipes-panel-title">INTERCEPTION</span>
+                            <div class="pipes-panel-actions">
+                                <button class="btn btn-sm" onclick="refreshPipeSessions()">Refresh</button>
+                            </div>
+                        </div>
+                        <form class="pipes-form" id="pipes-form" onsubmit="event.preventDefault(); pipesStartSession();">
+                            <label class="pipes-field pipes-field-wide"><span>Pipe name / pattern</span>
+                                <input type="text" id="pipes-f-pattern" class="etw-filter" placeholder="\name, e.g. \MSSE-1234-server" autocomplete="off" spellcheck="false" required></label>
+                            <label class="pipes-field"><span>How</span>
+                                <select id="pipes-f-how" class="etw-select">
+                                    <option value="attach" selected>attach (pipe exists)</option>
+                                    <option value="arm">arm (wait for it)</option>
+                                </select></label>
+                            <label class="pipes-field"><span>Match</span>
+                                <select id="pipes-f-match" class="etw-select">
+                                    <option value="exact" selected>exact</option>
+                                    <option value="prefix">prefix</option>
+                                    <option value="regex">regex</option>
+                                </select></label>
+                            <label class="pipes-field"><span>Mode</span>
+                                <select id="pipes-f-mode" class="etw-select">
+                                    <option value="observe" selected>observe</option>
+                                    <option value="hold">hold (decide each message)</option>
+                                </select></label>
+                            <label class="pipes-field"><span>Pipe mode</span>
+                                <select id="pipes-f-pipemode" class="etw-select" title="auto: probe the real server">
+                                    <option value="" selected>auto</option>
+                                    <option value="byte">byte</option>
+                                    <option value="message">message</option>
+                                </select></label>
+                            <label class="pipes-field pipes-field-num"><span>Max duration (s)</span>
+                                <input type="number" id="pipes-f-duration" class="etw-filter" min="1" max="3600" value="600"></label>
+                            <label class="pipes-field pipes-field-num" id="pipes-f-hold-wrap"><span>Hold timeout (s)</span>
+                                <input type="number" id="pipes-f-hold" class="etw-filter" min="1" max="3600" value="30"></label>
+                            <label class="pipes-field pipes-field-check" id="pipes-f-squat-wrap" title="Only with match=exact and how=arm: create the pipe before the real server does">
+                                <input type="checkbox" id="pipes-f-squat" disabled> squat</label>
+                            <button type="submit" class="etw-btn pipes-start-btn" id="pipes-start-btn">Start session</button>
+                        </form>
+                        <div class="pipes-form-error" id="pipes-form-error" hidden></div>
+                        <div class="pipes-limits">The pipe name must be known in advance. Clients that connect while a session is still <em>starting</em>, or that were already connected before it started, are not intercepted. Held messages are forwarded automatically after the hold timeout and when the session ends.</div>
+                        <div class="pipes-sessions-wrap">
+                            <div class="pipes-sessions" id="pipes-sessions"><div class="pipes-empty">No interception sessions yet.</div></div>
+                            <div class="pipes-session-view" id="pipes-session-view"><div class="pipes-empty">Select a session to see its messages.</div></div>
+                        </div>
+                    </section>
                 </div>
             </div>
 
@@ -811,6 +890,10 @@
                             <p>Process tree around a process. Layouts: process tree, force-directed, isometric (foldable subtrees, activity icons, remote threads as bridges). The landing page lists samples and candidate processes; click a node for its detail panel.</p>
                         </div>
                         <div class="help-guide-item">
+                            <h4>Pipes</h4>
+                            <p>Named pipe events from Sysmon (EID 17/18) with name and PID filters; known C2 pipe names are marked. Interception: attach to an existing pipe or arm for a pipe that does not exist yet, observe or hold messages (forward, edit as hex, drop), export a session as JSON. The pipe name must be known; clients that connect while a session is starting, or that were already connected, are not intercepted.</p>
+                        </div>
+                        <div class="help-guide-item">
                             <h4>Sysmon</h4>
                             <p>Sysmon events with search, type and PID filters, and the Windows Event IDs each event corresponds to.</p>
                         </div>
@@ -998,6 +1081,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         </div>
     </div>
 
-    <script src="/static/js/app.js?v=41"></script>
+    <script src="/static/js/app.js?v=42"></script>
 </body>
 </html>
