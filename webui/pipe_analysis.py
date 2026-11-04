@@ -172,6 +172,16 @@ def _epoch(ts) -> float | None:
     return dt.timestamp()
 
 
+def is_ignored(ev, self_pid) -> bool:
+    """Pipe events that are noise: no PID, the web UI's own pipe proxy
+    (`self_pid`), empty names and PowerShell host pipes."""
+    pid = ev.get("pid")
+    if pid in (None, "") or (self_pid is not None and str(pid) == str(self_pid)):
+        return True
+    name = canonical_name(ev.get("pipe") or "")
+    return name == "\\" or name.lower().startswith(_IGNORED_PREFIXES)
+
+
 def analyze(events, sample_keys, resolve, self_pid, signatures=None) -> dict:
     """Pipes the sample subtree created or connected to, with flags.
 
@@ -183,17 +193,14 @@ def analyze(events, sample_keys, resolve, self_pid, signatures=None) -> dict:
     """
     sigs = _default_signatures() if signatures is None else signatures
     sample_keys = set(sample_keys or ())
-    self_pid = str(self_pid) if self_pid is not None else None
     groups: dict = {}
     for ev in events or []:
         if not isinstance(ev, dict) or ev.get("type") not in ("PipeCreated", "PipeConnected"):
             continue
+        if is_ignored(ev, self_pid):
+            continue
         pid = ev.get("pid")
-        if pid in (None, "") or str(pid) == self_pid:
-            continue
         name = canonical_name(ev.get("pipe") or "")
-        if name == "\\" or name.lower().startswith(_IGNORED_PREFIXES):
-            continue
         ts = ev.get("timestamp") or ""
         key = resolve(str(pid), ts)
         g = groups.setdefault(name.lower(), {"pipe": name, "created": [], "connected": [],
@@ -313,16 +320,14 @@ def baseline_findings(events, self_pid, signatures=None) -> list:
     non-C2 kinds: a known implant pipe on the "clean" host is not benign.
     """
     sigs = _default_signatures() if signatures is None else signatures
-    self_pid = str(self_pid) if self_pid is not None else None
     out, seen = [], set()
     for ev in events or []:
         if not isinstance(ev, dict) or ev.get("type") not in ("PipeCreated", "PipeConnected"):
             continue
-        pid = ev.get("pid")
-        if pid in (None, "") or str(pid) == self_pid:
+        if is_ignored(ev, self_pid):
             continue
         name = canonical_name(ev.get("pipe") or "")
-        if name == "\\" or name.lower().startswith(_IGNORED_PREFIXES) or _never_baselined(name):
+        if _never_baselined(name):
             continue
         if match_signature(name, sigs):
             continue

@@ -842,9 +842,10 @@ All endpoints served on port `9000`. Responses are JSON.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/process-graph` | Ancestors + descendants of a process with network, DNS, file, registry and injection events. Params: `pid` (PID or instance key), `at` (ISO time: the process that had the PID then), `down_depth` (0 = all), `up_depth`, `max_nodes` |
+| GET | `/api/process-graph` | Ancestors + descendants of a process with network, DNS, file, registry, injection and named pipe (`pipes`) events. Params: `pid` (PID or instance key), `at` (ISO time: the process that had the PID then), `down_depth` (0 = all), `up_depth`, `max_nodes` |
 | GET | `/api/process-graph/roots` | Candidate focus processes (detonated / most alerts) |
 | GET | `/api/graph/samples` | Submitted and scanned files with their scan verdicts |
+| GET | `/api/pipes` | Sysmon named pipe events (EID 17/18) with catalog family. Params: `pid`, `key` (process instance key), `since` (default: one hour ago), `until`, `name` (case-insensitive substring), `max` |
 
 ### Hex Editor & Binary Analysis
 

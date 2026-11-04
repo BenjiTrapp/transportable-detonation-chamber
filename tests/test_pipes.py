@@ -626,3 +626,110 @@ def test_catalog_weights_are_honoured_and_clamped(tmp_path, capsys):
     assert c2_weight(r"\zero") == 0.0
     assert c2_weight(r"\none") == 4.0
     assert c2_weight(r"\huge") == pipe_analysis.MAX_SIGNATURE_WEIGHT
+
+
+def _pipes_api_setup(tdc, monkeypatch, procs, pipes):
+    calls = []
+
+    def fake_read(**kw):
+        calls.append(kw)
+        return list(pipes) if kw.get("event_ids") == [17, 18] else list(procs)
+
+    monkeypatch.setattr(tdc, "_is_sysmon_running", lambda: True)
+    monkeypatch.setattr(tdc, "_read_sysmon_events", fake_read)
+    return calls
+
+
+def test_api_pipes_default_window(tdc, client, monkeypatch):
+    import time
+    calls = _pipes_api_setup(tdc, monkeypatch, [], [
+        _pipe_ev("create", 4072, r"\msagent_5b", _local(10, 0, 1)),
+        _pipe_ev("create", tdc.os.getpid(), r"\proxy_pipe", _local(10, 0, 2)),
+        _pipe_ev("connect", 4072, r"\PSHost.1.2.powershell", _local(10, 0, 3)),
+    ])
+    body = client.get("/api/pipes").get_json()
+    assert abs(tdc._to_epoch(body["since"]) - (time.time() - 3600)) < 30
+    q = [c for c in calls if c.get("event_ids") == [17, 18]][0]
+    assert q["since"] == body["since"]
+    assert [e["pipe"] for e in body["events"]] == [r"\msagent_5b"]
+    assert body["events"][0]["family"] == "Cobalt Strike"
+
+    since = _local(9, 0, 0)
+    body = client.get("/api/pipes", query_string={"since": since, "pid": "4072", "max": "7"}).get_json()
+    assert body["since"] == since
+    q = [c for c in calls if c.get("event_ids") == [17, 18]][-1]
+    assert q["pid"] == 4072 and q["max_events"] == 7
+
+
+def test_api_pipes_name_filter(tdc, client, monkeypatch):
+    _pipes_api_setup(tdc, monkeypatch, [], [
+        _pipe_ev("create", 4072, r"\msagent_5b", _local(10, 0, 1)),
+        _pipe_ev("create", 4072, r"\MSSE-1-server", _local(10, 0, 2)),
+        _pipe_ev("connect", 4072, r"\lsarpc", _local(10, 0, 3)),
+    ])
+    names = lambda q: [e["pipe"] for e in client.get("/api/pipes", query_string={"name": q}).get_json()["events"]]
+    assert names("AGENT") == [r"\msagent_5b"]
+    assert names("msse") == [r"\MSSE-1-server"]
+    assert names(r"\\.\pipe\lsa") == [r"\lsarpc"]
+    assert names(r"\agent") == []
+
+
+def test_api_pipes_key_scopes_to_instance(tdc, client, monkeypatch):
+    from test_process_instances import _sysmon_create
+
+    procs = [
+        _sysmon_create(4072, _local(10, 0, 0), r"C:\Users\Public\sample.exe", 2964),
+        _sysmon_create(4072, _local(11, 0, 0), r"C:\Windows\System32\notepad.exe", 700),
+    ]
+    _pipes_api_setup(tdc, monkeypatch, procs, [
+        _pipe_ev("create", 4072, r"\msagent_aa", _local(10, 0, 5)),
+        _pipe_ev("create", 4072, r"\msagent_bb", _local(11, 0, 5)),
+    ])
+    old = next(k for k in tdc._build_full_process_map()[0] if k.startswith("4072@"))
+    body = client.get("/api/pipes", query_string={"key": old, "since": _local(9)}).get_json()
+    assert [(e["pipe"], e["key"]) for e in body["events"]] == [(r"\msagent_aa", old)]
+    assert client.get("/api/pipes?key=999").status_code == 404
+
+
+def test_graph_includes_pipes_of_subtree_only(tdc, client, monkeypatch):
+    from test_process_instances import _sysmon_create
+
+    procs = [
+        _sysmon_create(4072, _local(10, 0, 0), r"C:\Users\Public\sample.exe", 2964),
+        _sysmon_create(4100, _local(10, 0, 3), r"C:\Windows\System32\rundll32.exe", 4072),
+        _sysmon_create(6000, _local(9, 0, 0), r"C:\Windows\System32\svchost.exe", 1),
+        # An earlier holder of the sample's PID.
+        _sysmon_create(4072, _local(8, 0, 0), r"C:\Windows\System32\conhost.exe", 1),
+    ]
+    pipes = [
+        _pipe_ev("create", 4100, r"\msagent_5b", _local(10, 0, 4)),
+        _pipe_ev("connect", 4072, r"\msagent_5b", _local(10, 0, 5)),
+        _pipe_ev("connect", 6000, r"\msagent_5b", _local(10, 0, 6)),
+        _pipe_ev("create", 4072, r"\old_holder", _local(8, 0, 5)),
+        _pipe_ev("create", tdc.os.getpid(), r"\proxy_pipe", _local(10, 0, 8)),
+    ]
+    calls = _pipes_api_setup(tdc, monkeypatch, procs, pipes)
+    body = client.get("/api/process-graph?pid=4072").get_json()
+    assert body["root_pid"] == "4072"
+    got = sorted((p["key"], p["pid"], p["pipe"], p["action"], p["family"]) for p in body["pipes"])
+    assert got == [("4072", "4072", r"\msagent_5b", "connected", "Cobalt Strike"),
+                   ("4100", "4100", r"\msagent_5b", "created", "Cobalt Strike")]
+    assert all(p["timestamp"] for p in body["pipes"])
+    pq = [c for c in calls if c.get("event_ids") == [17, 18]]
+    assert pq and all(set(c["pid"]) <= {"4072", "4100"} for c in pq)
+    assert tdc._to_epoch(pq[0]["since"]) == tdc._to_epoch(_local(10, 0, 0)) - 60
+
+
+def test_graph_pipes_empty_without_sysmon(tdc, client):
+    tdc.events_store["processes"] = {}
+    from conftest import make_alert
+    with tdc.store_lock:
+        tdc.events_store["alerts"] = [make_alert(1, 4072, "2026-11-04T10:00:00Z", r"C:\x\a.exe")]
+    body = client.get("/api/process-graph?pid=4072").get_json()
+    assert body.get("pipes") == []
+
+
+def test_sysmon_xpath_accepts_pid_list(tdc):
+    q = tdc._sysmon_xpath([17, 18], pid=["4072", 4100])
+    assert "Data[@Name='ProcessId']='4072' or Data[@Name='ProcessId']='4100'" in q
+    assert tdc._sysmon_xpath([17], pid=4072).endswith("EventData[Data[@Name='ProcessId']='4072']]")
