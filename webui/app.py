@@ -2605,6 +2605,7 @@ def api_process_graph():
                                    "target_image": ev.get("target_image", ""),
                                    "timestamp": ts})
 
+    pipes, pipes_truncated, pipes_error = _graph_pipes(proc_map, selected, instances)
     return jsonify({
         "root_pid": root_pid,
         "truncated": truncated,
@@ -2615,35 +2616,22 @@ def api_process_graph():
         "files": files,
         "registry": registry,
         "injections": injections,
-        "pipes": _graph_pipes(proc_map, selected, instances),
+        "pipes": pipes,
+        "pipes_truncated": pipes_truncated,
+        **({"pipes_error": pipes_error} if pipes_error else {}),
     })
 
 
 _GRAPH_PIPE_MAX_PIDS = 50
 _PIPE_XPATH_PIDS = 20           # PIDs per XPath query, keeps the query simple
+_GRAPH_PIPE_MAX_EVENTS = 2000
 
 
-def _graph_pipes(proc_map, selected, instances):
-    """Sysmon EID 17/18 of the selected process instances.
-
-    One targeted query over their PIDs (root and descendants first, at most
-    _GRAPH_PIPE_MAX_PIDS) and their lifetime; events are then attributed with
-    `instances.resolve`, so other holders of a PID are dropped.
-    """
-    if not _is_sysmon_running():
-        return []
-    order = sorted(selected, key=lambda k: (selected[k].get("depth", 0) < 0,
-                                            abs(selected[k].get("depth", 0))))
-    pids, starts, ends, open_ended = [], [], [], False
-    for key in order:
-        node = proc_map.get(key) or {}
-        pid = str(node.get("pid") or "")
-        if not pid.isdigit():
-            continue
-        if pid not in pids:
-            if len(pids) >= _GRAPH_PIPE_MAX_PIDS:
-                continue
-            pids.append(pid)
+def _instance_window(nodes):
+    """(since, until) ISO strings spanning the lifetimes of `nodes` with 60 s
+    slack; None for an open end (no known start, or one is still running)."""
+    starts, ends, open_ended = [], [], False
+    for node in nodes:
         t = _to_epoch(node.get("started") or node.get("first_seen"))
         if t is not None:
             starts.append(t)
@@ -2652,21 +2640,61 @@ def _graph_pipes(proc_map, selected, instances):
             open_ended = True
         else:
             ends.append(max(end, _to_epoch(node.get("last_seen")) or end))
-    if not pids:
-        return []
     since = (datetime.datetime.fromtimestamp(min(starts) - 60).astimezone().isoformat()
              if starts else None)
     until = (datetime.datetime.fromtimestamp(max(ends) + 60).astimezone().isoformat()
              if ends and not open_ended else None)
+    return since, until
 
-    sigs = pipe_analysis._default_signatures()
+
+def _graph_pipes(proc_map, selected, instances):
+    """Sysmon EID 17/18 of the selected process instances.
+
+    Returns (pipes, truncated, error). Root and descendants are queried apart
+    from ancestors, each chunk over only its own instances' lifetimes: a
+    long-running ancestor (explorer, the agent) must neither widen the
+    sample's window nor fill its event cap. The web UI's own PID is skipped.
+    Events are attributed with `instances.resolve`, so other holders of a
+    PID are dropped.
+    """
+    if not _is_sysmon_running():
+        return [], False, None
     self_pid = os.getpid()
-    out = []
-    for i in range(0, len(pids), _PIPE_XPATH_PIDS):
+    order = sorted(selected, key=lambda k: (selected[k].get("depth", 0) < 0,
+                                            abs(selected[k].get("depth", 0))))
+    by_pid, own, ancestor = {}, [], []
+    truncated = False
+    for key in order:
+        node = proc_map.get(key) or {}
+        pid = str(node.get("pid") or "")
+        if not pid.isdigit() or pid == str(self_pid):
+            continue
+        if pid not in by_pid:
+            if len(by_pid) >= _GRAPH_PIPE_MAX_PIDS:
+                truncated = True
+                continue
+            by_pid[pid] = []
+            (ancestor if selected[key].get("depth", 0) < 0 else own).append(pid)
+        by_pid[pid].append(node)
+    if not by_pid:
+        return [], truncated, None
+
+    chunks = [group[i:i + _PIPE_XPATH_PIDS] for group in (own, ancestor)
+              for i in range(0, len(group), _PIPE_XPATH_PIDS)]
+    sigs = pipe_analysis.default_signatures()
+    out, errors, seen = [], [], set()
+    for chunk in chunks:
+        since, until = _instance_window([n for p in chunk for n in by_pid[p]])
         raw = _read_sysmon_events(event_ids=[17, 18], since=since, until=until,
-                                  pid=pids[i:i + _PIPE_XPATH_PIDS], max_events=2000)
-        for ev in raw if isinstance(raw, list) else []:
-            if not isinstance(ev, dict) or "error" in ev or \
+                                  pid=chunk, max_events=_GRAPH_PIPE_MAX_EVENTS)
+        raw = raw if isinstance(raw, list) else []
+        if len(raw) >= _GRAPH_PIPE_MAX_EVENTS:
+            truncated = True
+        for ev in raw:
+            if isinstance(ev, dict) and "error" in ev:
+                errors.append(str(ev["error"]))
+                continue
+            if not isinstance(ev, dict) or \
                     ev.get("type") not in ("PipeCreated", "PipeConnected") or \
                     pipe_analysis.is_ignored(ev, self_pid):
                 continue
@@ -2675,12 +2703,16 @@ def _graph_pipes(proc_map, selected, instances):
             if key not in selected:
                 continue
             name = pipe_analysis.canonical_name(ev.get("pipe") or "")
+            action = "created" if ev["type"] == "PipeCreated" else "connected"
+            if (key, name, action, ts) in seen:
+                continue
+            seen.add((key, name, action, ts))
             hit = pipe_analysis.match_signature(name, sigs)
             out.append({"key": key, "pid": str(ev.get("pid")), "pipe": name,
-                        "action": "created" if ev["type"] == "PipeCreated" else "connected",
-                        "family": hit["family"] if hit else None, "timestamp": ts})
+                        "action": action, "family": hit["family"] if hit else None,
+                        "timestamp": ts})
     out.sort(key=lambda p: _to_epoch(p["timestamp"]) or 0.0)
-    return out
+    return out, truncated, (errors[0] if errors and not out else None)
 
 
 @app.route("/api/pipes")
@@ -2688,14 +2720,20 @@ def api_pipes():
     """Sysmon named pipe events (EID 17/18).
 
     Query params: pid, key (process instance key; only that instance's
-    events), since (default: one hour ago), until, name (case-insensitive
-    substring of the pipe name), max (default 500).
+    events, window defaults to its lifetime), since (default: one hour ago),
+    until, name (case-insensitive substring of the pipe name; a leading
+    backslash anchors it at the start), max (default 500).
     """
-    since = request.args.get("since") or \
-        (datetime.datetime.now().astimezone() - datetime.timedelta(hours=1)).isoformat()
+    since = request.args.get("since") or None
     until = request.args.get("until") or None
+    for label, value in (("since", since), ("until", until)):
+        if value and _to_epoch(value) is None:
+            return jsonify({"error": f"invalid {label}: {value}"}), 400
+    raw_pid = (request.args.get("pid") or "").strip()
+    if raw_pid and not raw_pid.isdigit():
+        return jsonify({"error": f"invalid pid: {raw_pid}"}), 400
+    pid = int(raw_pid) if raw_pid else None
     key = request.args.get("key")
-    pid = request.args.get("pid", type=int)
     max_events = max(1, min(request.args.get("max", 500, type=int) or 500, 5000))
     raw_name = request.args.get("name") or ""
 
@@ -2716,7 +2754,13 @@ def api_pipes():
         instance_key = instances.resolve_key(key)
         if not instance_key or instance_key not in proc_map:
             return jsonify({"error": f"Process {key} not found", "events": [], "since": since}), 404
-        pid = int(proc_map[instance_key]["pid"])
+        node = proc_map[instance_key]
+        pid = int(node["pid"])
+        if not since:
+            since, life_until = _instance_window([node])
+            until = until or life_until
+    if not since:
+        since = (datetime.datetime.now().astimezone() - datetime.timedelta(hours=1)).isoformat()
 
     needle = pipe_analysis.canonical_name(raw_name).lower() if raw_name else ""
     if raw_name and not raw_name.startswith("\\"):
@@ -2724,8 +2768,9 @@ def api_pipes():
 
     raw = _read_sysmon_events(event_ids=[17, 18], since=since, until=until, pid=pid,
                               max_events=max_events)
+    raw = raw if isinstance(raw, list) else []
     errors = [e for e in raw if isinstance(e, dict) and "error" in e]
-    sigs = pipe_analysis._default_signatures()
+    sigs = pipe_analysis.default_signatures()
     self_pid = os.getpid()
     events = []
     for ev in raw:

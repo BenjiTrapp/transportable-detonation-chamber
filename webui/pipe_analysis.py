@@ -151,7 +151,8 @@ _DEFAULT_SIGNATURES: list | None = None
 _FRACTION_RE = re.compile(r"(\.\d{6})\d+")
 
 
-def _default_signatures() -> list[dict]:
+def default_signatures() -> list[dict]:
+    """The bundled catalog, loaded once."""
     global _DEFAULT_SIGNATURES
     if _DEFAULT_SIGNATURES is None:
         _DEFAULT_SIGNATURES = load_signatures(None)
@@ -191,7 +192,7 @@ def analyze(events, sample_keys, resolve, self_pid, signatures=None) -> dict:
     is listed so cross-process use is visible. Events of the web UI itself
     (`self_pid`) and PowerShell host pipes are ignored.
     """
-    sigs = _default_signatures() if signatures is None else signatures
+    sigs = default_signatures() if signatures is None else signatures
     sample_keys = set(sample_keys or ())
     groups: dict = {}
     for ev in events or []:
@@ -319,7 +320,7 @@ def baseline_findings(events, self_pid, signatures=None) -> list:
     Catalogued (C2/tool) pipes are never baselined, not even their
     non-C2 kinds: a known implant pipe on the "clean" host is not benign.
     """
-    sigs = _default_signatures() if signatures is None else signatures
+    sigs = default_signatures() if signatures is None else signatures
     out, seen = [], set()
     for ev in events or []:
         if not isinstance(ev, dict) or ev.get("type") not in ("PipeCreated", "PipeConnected"):

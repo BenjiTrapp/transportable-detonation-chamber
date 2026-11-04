@@ -733,3 +733,75 @@ def test_sysmon_xpath_accepts_pid_list(tdc):
     q = tdc._sysmon_xpath([17, 18], pid=["4072", 4100])
     assert "Data[@Name='ProcessId']='4072' or Data[@Name='ProcessId']='4100'" in q
     assert tdc._sysmon_xpath([17], pid=4072).endswith("EventData[Data[@Name='ProcessId']='4072']]")
+
+
+def test_graph_queries_ancestors_apart_with_their_own_window(tdc, client, monkeypatch):
+    from test_process_instances import _sysmon_create
+
+    me = tdc.os.getpid()
+    procs = [
+        _sysmon_create(me, _local(5, 0, 0), r"C:\Python\python.exe", 1),
+        _sysmon_create(3000, _local(6, 0, 0), r"C:\Windows\explorer.exe", me),
+        _sysmon_create(4072, _local(10, 0, 0), r"C:\Users\Public\sample.exe", 3000,
+                       r"C:\Windows\explorer.exe"),
+        _sysmon_create(4100, _local(10, 0, 3), r"C:\Windows\System32\rundll32.exe", 4072),
+    ]
+    pipes = [
+        _pipe_ev("create", 3000, r"\explorer_pipe", _local(9, 0, 0)),
+        _pipe_ev("create", 4100, r"\msagent_5b", _local(10, 0, 4)),
+    ]
+    calls = _pipes_api_setup(tdc, monkeypatch, procs, pipes)
+    body = client.get("/api/process-graph?pid=4072").get_json()
+    pq = [c for c in calls if c.get("event_ids") == [17, 18]]
+    assert [sorted(c["pid"]) for c in pq] == [["4072", "4100"], ["3000"]]
+    assert tdc._to_epoch(pq[0]["since"]) == tdc._to_epoch(_local(10, 0, 0)) - 60
+    assert tdc._to_epoch(pq[1]["since"]) == tdc._to_epoch(_local(6, 0, 0)) - 60
+    assert sorted(p["pipe"] for p in body["pipes"]) == [r"\explorer_pipe", r"\msagent_5b"]
+    assert body["pipes_truncated"] is False and "pipes_error" not in body
+
+
+def test_graph_pipes_truncated_and_error(tdc, client, monkeypatch):
+    from test_process_instances import _sysmon_create
+
+    procs = [
+        _sysmon_create(4072, _local(10, 0, 0), r"C:\Users\Public\sample.exe", 2964),
+        _sysmon_create(4100, _local(10, 0, 3), r"C:\Windows\System32\rundll32.exe", 4072),
+    ]
+    _pipes_api_setup(tdc, monkeypatch, procs, [{"error": "query failed"}])
+    body = client.get("/api/process-graph?pid=4072").get_json()
+    assert body["pipes"] == [] and body["pipes_error"] == "query failed"
+
+    monkeypatch.setattr(tdc, "_GRAPH_PIPE_MAX_PIDS", 1)
+    _pipes_api_setup(tdc, monkeypatch, procs, [])
+    assert client.get("/api/process-graph?pid=4072").get_json()["pipes_truncated"] is True
+
+    monkeypatch.setattr(tdc, "_GRAPH_PIPE_MAX_PIDS", 50)
+    many = [_pipe_ev("create", 4072, rf"\p{i}", _local(10, 0, 5)) for i in range(2000)]
+    _pipes_api_setup(tdc, monkeypatch, procs, many)
+    assert client.get("/api/process-graph?pid=4072").get_json()["pipes_truncated"] is True
+
+
+def test_api_pipes_rejects_invalid_input(tdc, client, monkeypatch):
+    _pipes_api_setup(tdc, monkeypatch, [], [])
+    assert client.get("/api/pipes?pid=abc").status_code == 400
+    assert client.get("/api/pipes?since=yesterday").status_code == 400
+    assert client.get("/api/pipes?until=nope").status_code == 400
+    assert client.get("/api/pipes?pid=4072").status_code == 200
+
+
+def test_api_pipes_key_defaults_to_instance_lifetime(tdc, client, monkeypatch):
+    from test_process_instances import _sysmon_create
+
+    procs = [
+        _sysmon_create(4072, _local(10, 0, 0), r"C:\Users\Public\sample.exe", 2964),
+        _sysmon_create(4072, _local(11, 0, 0), r"C:\Windows\System32\notepad.exe", 700),
+    ]
+    calls = _pipes_api_setup(tdc, monkeypatch, procs, [])
+    old = next(k for k in tdc._build_full_process_map()[0] if k.startswith("4072@"))
+    body = client.get("/api/pipes", query_string={"key": old}).get_json()
+    q = [c for c in calls if c.get("event_ids") == [17, 18]][-1]
+    assert tdc._to_epoch(body["since"]) == tdc._to_epoch(q["since"]) == tdc._to_epoch(_local(10)) - 60
+    assert tdc._to_epoch(q["until"]) == tdc._to_epoch(_local(11)) + 60
+    client.get("/api/pipes", query_string={"key": "4072"})
+    q = [c for c in calls if c.get("event_ids") == [17, 18]][-1]
+    assert tdc._to_epoch(q["since"]) == tdc._to_epoch(_local(11)) - 60 and q["until"] is None
