@@ -951,10 +951,12 @@ there if the VM is not at `http://192.168.64.4:9000`.
 | Events | `tdc_sysmon_events`, `tdc_sysmon_stats`, `tdc_etw_events`, `tdc_etw_channels` |
 | Static analysis | `tdc_scan_ember`, `tdc_scan_capa`, `tdc_scan_threatcheck`, `tdc_scan_defendercheck`, `tdc_scan_history` |
 | Files (paths in the VM) | `tdc_pe_analyze`, `tdc_pe_section`, `tdc_elf_analyze`, `tdc_file_signature`, `tdc_file_hex`, `tdc_file_map` |
+| Named pipes (read-only) | `tdc_pipes`, `tdc_pipe_sessions` |
 | Live memory | `tdc_memory_scan`, `tdc_memory_dump`, `tdc_memory_evidence`, `tdc_memory_baseline`, `tdc_memory_sweep`, `tdc_memory_sweep_status`, `tdc_processdump_baseline`, `tdc_scan_beacons`, `tdc_scan_beaconeye` |
 
 Not exposed on purpose: byte patching (`/api/file/hex/write`), clearing the
-scan history and the raw service proxies.
+scan history, starting, stopping or steering pipe interception (forward, drop,
+edit) and the raw service proxies.
 
 ---
 
@@ -1031,7 +1033,7 @@ transportable-detonation-chamber/
 ├── static/                         # Screenshots for this README
 │
 ├── mcp/
-│   ├── server.py                  # MCP server (41 tools, talks to the web UI API)
+│   ├── server.py                  # MCP server (43 tools, talks to the web UI API)
 │   └── requirements.txt           # mcp, httpx  (make mcp-setup)
 ├── .mcp.json                      # Registers the MCP server for Claude Code
 │

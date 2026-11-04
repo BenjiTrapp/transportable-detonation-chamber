@@ -6,6 +6,8 @@ Exposes TDC functionality as MCP tools for use with Claude Code and other MCP cl
 Connects to the TDC Web UI API running on the analysis VM.
 """
 
+import base64
+import datetime
 import json
 import os
 import sys
@@ -570,6 +572,17 @@ def tdc_detonation_results(sha256: Optional[str] = None, pid: Optional[int] = No
     nb = d.get("network_beaconing")
     if isinstance(nb, dict) and nb.get("evidence_findings"):
         lines.append(f"Network beaconing: {len(nb['evidence_findings'])} periodic destination(s)")
+    np_ = d.get("named_pipes")
+    if isinstance(np_, dict) and np_.get("available"):
+        pipes = np_.get("pipes") or []
+        families = list(dict.fromkeys(p["family"] for p in pipes if p.get("family")))
+        lines.append(f"Named pipes: {len(pipes)}"
+                     + (f" (families {', '.join(families)})" if families else "")
+                     + (" [truncated]" if np_.get("truncated") else ""))
+        for p in pipes[:10]:
+            if p.get("family") or p.get("flags"):
+                lines.append(f"  {p.get('pipe')}" + (f" [{p['family']}]" if p.get("family") else "")
+                             + (f" {', '.join(p['flags'])}" if p.get("flags") else ""))
     ec = d.get("exit_capture_result")
     if isinstance(ec, dict):
         lines.append(f"Exit capture: {'observed' if ec.get('observed') else ec.get('status') or 'no dump'}")
@@ -1337,6 +1350,127 @@ def tdc_rustinel_info() -> str:
     lines = [f"Rustinel {d.get('version') or ''} - {d.get('alerts_count')} alerts in {d.get('alerts_dir')}",
              "Rules: " + ", ".join(f"{k} {v}" for k, v in rules.items() if not isinstance(v, dict)),
              "ETW providers: " + ", ".join(p.get("name", "?") for p in d.get("etw_providers") or [])]
+    return "\n".join(lines)
+
+
+# --- Named pipes (read-only: interception is driven from the web UI) ---
+
+
+def _clock(value) -> str:
+    """Epoch seconds or ISO text as HH:MM:SS.mmm (UTC for epochs)."""
+    if isinstance(value, (int, float)):
+        return datetime.datetime.fromtimestamp(value, datetime.timezone.utc).strftime("%H:%M:%S.%f")[:-3] + "Z"
+    return str(value or "")[11:23] or "?"
+
+
+def _hex_preview(b64: str, limit: int = 64) -> str:
+    """First `limit` bytes as hex plus printable ASCII."""
+    try:
+        data = base64.b64decode(b64 or "")
+    except (ValueError, TypeError):
+        return "(undecodable)"
+    if not data:
+        return "(empty)"
+    head = data[:limit]
+    text = "".join(chr(c) if 32 <= c < 127 else "." for c in head)
+    return f"{head.hex(' ')}{' ...' if len(data) > limit else ''}  |{text}|"
+
+
+@mcp.tool()
+def tdc_pipes(pid: Optional[str] = None, name: Optional[str] = None, since: Optional[str] = None,
+              max_events: int = 100) -> str:
+    """Sysmon named pipe events (EID 17 PipeCreated / 18 PipeConnected) with the
+    C2 family when the pipe name matches a known default (Cobalt Strike, ...).
+
+    Args:
+        pid: Process ID, or a process instance key "<pid>@<epoch>" (only that
+             instance's events, over its lifetime)
+        name: Case-insensitive substring of the pipe name; a leading backslash
+              anchors it at the start (e.g. "\\MSSE-")
+        since: ISO timestamp to start from (default: one hour ago, or the
+               instance's start when a key is given)
+        max_events: Maximum number of events to return (default 100)
+    """
+    params: dict = {"max": max_events}
+    if pid:
+        params["pid" if str(pid).isdigit() else "key"] = str(pid)
+    if name:
+        params["name"] = name
+    if since:
+        params["since"] = since
+    d = _call("GET", "/api/pipes", params=params)
+    if d.get("error"):
+        return f"Error: {d['error']}"
+    if d.get("available") is False:
+        return f"Named pipe events unavailable: {d.get('reason') or 'unknown reason'}"
+    events = d.get("events") or []
+    if not events:
+        return f"No named pipe events since {d.get('since')}."
+    lines = [f"{len(events)} pipe event(s) since {d.get('since')}"
+             + (" (truncated, raise max_events or narrow the filter)" if d.get("truncated") else "")]
+    for ev in events:
+        image = (ev.get("image") or "").split("\\")[-1]
+        lines.append(f"[{(ev.get('timestamp') or '')[:23]}] {ev.get('type', '?'):<13} {ev.get('pipe')}"
+                     + (f" [{ev['family']}]" if ev.get("family") else "")
+                     + f"  PID {ev.get('pid')} {image}"
+                     + (f" ({ev['user']})" if ev.get("user") else ""))
+    families = list(dict.fromkeys(ev["family"] for ev in events if ev.get("family")))
+    if families:
+        lines.append(f"Families: {', '.join(families)}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def tdc_pipe_sessions(session_id: Optional[str] = None, max_messages: int = 20) -> str:
+    """Named pipe interception sessions (read-only; start, stop and forward in
+    the web UI's Pipes tab). Without an ID: list all sessions. With an ID: the
+    session and its first recorded messages as hex previews (64 bytes each).
+
+    Args:
+        session_id: Interception session ID (omit to list sessions)
+        max_messages: Messages to show for a session (default 20)
+    """
+    if not session_id:
+        d = _call("GET", "/api/pipes/intercept")
+        if d.get("error"):
+            return f"Error: {d['error']}"
+        sessions = d.get("sessions") or []
+        if not sessions:
+            return "No interception sessions."
+        return f"{len(sessions)} session(s):\n" + "\n".join(
+            f"  {s.get('id')}  {s.get('state'):<8} {s.get('pattern')} ({s.get('match')}, {s.get('how')}, "
+            f"{s.get('mode')}{', squat' if s.get('squat') else ''})  "
+            f"{s.get('message_count', 0)} msg(s), {s.get('connections', 0)} conn(s)"
+            + (f"  error: {s['last_error']}" if s.get("last_error") else "")
+            for s in sessions)
+    s = _call("GET", f"/api/pipes/intercept/{session_id}")
+    if s.get("error"):
+        return f"Error: {s['error']}"
+    lines = [f"Session {s.get('id')}: {s.get('state')} - {s.get('pattern')} ({s.get('match')}, "
+             f"{s.get('how')}, {s.get('mode')}{', squat' if s.get('squat') else ''})",
+             f"  {s.get('connections', 0)} connection(s), {s.get('message_count', 0)} message(s), "
+             f"{s.get('held_count', 0)} held, {s.get('self_connect_retries', 0)} self-connect retries"]
+    if s.get("recording_truncated"):
+        lines.append("  Recording limit reached: later messages were relayed but not recorded")
+    if s.get("last_error"):
+        lines.append(f"  Last error: {s['last_error']}")
+    if s.get("end_reason"):
+        lines.append(f"  Ended: {s['end_reason']}")
+    m = _call("GET", f"/api/pipes/intercept/{session_id}/messages",
+              params={"after": 0, "limit": max_messages})
+    if m.get("error"):
+        return "\n".join(lines + [f"Messages: error: {m['error']}"])
+    msgs = m.get("messages") or []
+    total = s.get("message_count") or 0
+    lines.append(f"\nFirst {len(msgs)} of {total} message(s):" if total > len(msgs)
+                 else f"\n{len(msgs)} message(s):")
+    for msg in msgs:
+        lines.append(f"  #{msg.get('seq')} [{_clock(msg.get('ts'))}] conn {msg.get('conn')} {msg.get('dir')} "
+                     f"{msg.get('size')} B {msg.get('state')}"
+                     + (" (recording cut)" if msg.get("truncated") else ""))
+        lines.append(f"    {_hex_preview(msg.get('data_b64'))}")
+        if msg.get("original_b64") is not None:
+            lines.append(f"    original: {_hex_preview(msg['original_b64'])}")
     return "\n".join(lines)
 
 
