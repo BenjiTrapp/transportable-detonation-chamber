@@ -847,6 +847,19 @@ All endpoints served on port `9000`. Responses are JSON.
 | GET | `/api/graph/samples` | Submitted and scanned files with their scan verdicts |
 | GET | `/api/pipes` | Sysmon named pipe events (EID 17/18) with catalog family. Params: `pid`, `key` (process instance key; window defaults to its lifetime), `since` (default: one hour ago), `until`, `name` (case-insensitive substring; a leading `\` anchors it at the start of the pipe name), `max` |
 
+### Named Pipe Interception
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/pipes/intercept` | Interception sessions (live and ended), newest first |
+| POST | `/api/pipes/intercept` | Start a session → 201 session / 400 error. JSON: `pattern` (required), `mode` (`observe`/`hold`), `how` (`attach`/`arm`), `match` (`exact`/`prefix`/`regex`), `squat` (arm + exact only), `max_duration` (default 600 s), `hold_timeout` (default 30 s), `pipe_mode` (`byte`/`message`; skips probing the real server). `\lsass`, `\ntsvcs`, `\protected_storage` are refused |
+| GET | `/api/pipes/intercept/<sid>` | One session (state, target, connection and message counts) |
+| DELETE | `/api/pipes/intercept/<sid>` | End a session; held messages are forwarded, both ends are closed |
+| GET | `/api/pipes/intercept/<sid>/messages` | Recorded messages (`seq`, `conn`, `dir` `c2s`/`s2c`, `data_b64`, `state`). Params: `after` (seq), `limit` (default 200, max 1000) |
+| POST | `/api/pipes/intercept/<sid>/messages/<seq>` | Decide a held message. JSON: `action` (`forward`/`drop`/`edit`), `data_b64` (for `edit`) |
+| POST | `/api/pipes/intercept/<sid>/release` | Forward every held message → `{"released": n}` |
+| GET | `/api/pipes/intercept/<sid>/export` | Session and all messages as a JSON attachment |
+
 ### Hex Editor & Binary Analysis
 
 | Method | Endpoint | Description |

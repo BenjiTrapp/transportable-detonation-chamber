@@ -8,6 +8,7 @@ Access: http://localhost:9000
 """
 
 import datetime
+import atexit
 import json
 import os
 import glob
@@ -27,6 +28,7 @@ import requests
 # as normalizers there, so the verdict logic does not depend on any one tool.
 import memory_evidence
 import pipe_analysis
+import pipe_proxy
 # Offline analysis of exit-time minidumps (no scanner binary involved).
 import minidump_analysis
 
@@ -2789,6 +2791,143 @@ def api_pipes():
     if errors and not events:
         body["error"] = errors[0]["error"]
     return jsonify(body)
+
+
+# --- Named pipe interception ---
+PIPE_SESSIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pipe_sessions")
+_INTERCEPT_FIELDS = {"pattern", "mode", "how", "match", "squat", "max_duration",
+                     "hold_timeout", "pipe_mode"}
+_intercept = None
+_intercept_lock = threading.Lock()
+
+
+def _get_intercept():
+    """The interception manager, created on first use (no threads at import)."""
+    global _intercept
+    with _intercept_lock:
+        if _intercept is None:
+            backend = pipe_proxy.Win32PipeBackend() if os.name == "nt" \
+                else pipe_proxy.FakePipeBackend()
+            _intercept = pipe_proxy.InterceptManager(backend, store_dir=PIPE_SESSIONS_DIR)
+            atexit.register(_intercept.shutdown)
+        return _intercept
+
+
+def _unknown_session(sid):
+    return jsonify({"error": f"Interception session {sid} not found"}), 404
+
+
+def _int_arg(name, default):
+    raw = request.args.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"invalid {name}: {raw}") from None
+
+
+@app.route("/api/pipes/intercept", methods=["GET", "POST"])
+def api_pipes_intercept():
+    """List interception sessions, or start one.
+
+    POST body (JSON): pattern (required), mode (observe|hold, default observe),
+    how (attach|arm, default attach), match (exact|prefix|regex, default
+    exact), squat (bool), max_duration, hold_timeout (seconds), pipe_mode
+    (byte|message; skips probing the real server for its mode).
+    """
+    if request.method == "GET":
+        return jsonify({"sessions": _get_intercept().list()})
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "JSON object body required"}), 400
+    unknown = sorted(set(body) - _INTERCEPT_FIELDS)
+    if unknown:
+        return jsonify({"error": f"unknown field(s): {', '.join(unknown)}"}), 400
+    squat = body.get("squat", False)
+    if not isinstance(squat, bool):
+        return jsonify({"error": "squat must be true or false"}), 400
+    kwargs = {k: body[k] for k in ("max_duration", "hold_timeout", "pipe_mode") if k in body}
+    try:
+        session = _get_intercept().start(
+            body.get("pattern"), body.get("mode", "observe"), body.get("how", "attach"),
+            body.get("match", "exact"), squat=squat, **kwargs)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(session), 201
+
+
+@app.route("/api/pipes/intercept/<sid>", methods=["GET", "DELETE"])
+def api_pipes_intercept_session(sid):
+    """One interception session; DELETE ends it (held messages are forwarded)."""
+    m = _get_intercept()
+    try:
+        return jsonify(m.stop(sid) if request.method == "DELETE" else m.get(sid))
+    except KeyError:
+        return _unknown_session(sid)
+
+
+@app.route("/api/pipes/intercept/<sid>/messages")
+def api_pipes_intercept_messages(sid):
+    """Recorded messages with seq > after (default 0), at most limit (default 200, max 1000)."""
+    try:
+        after, limit = _int_arg("after", 0), _int_arg("limit", 200)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    try:
+        return jsonify({"messages": _get_intercept().messages(sid, after=after, limit=limit)})
+    except KeyError:
+        return _unknown_session(sid)
+
+
+@app.route("/api/pipes/intercept/<sid>/messages/<int:seq>", methods=["POST"])
+def api_pipes_intercept_act(sid, seq):
+    """Decide a held message. Body: {"action": "forward"|"drop"|"edit", "data_b64"}."""
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "JSON object body required"}), 400
+    try:
+        return jsonify(_get_intercept().act(sid, seq, body.get("action"), body.get("data_b64")))
+    except KeyError:
+        return _unknown_session(sid)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/pipes/intercept/<sid>/release", methods=["POST"])
+def api_pipes_intercept_release(sid):
+    """Forward every held message of the session."""
+    m = _get_intercept()
+    try:
+        m.get(sid)
+        return jsonify({"released": m.release_all(sid)})
+    except KeyError:
+        return _unknown_session(sid)
+
+
+@app.route("/api/pipes/intercept/<sid>/export")
+def api_pipes_intercept_export(sid):
+    """Session metadata and every recorded message as a JSON download."""
+    m = _get_intercept()
+    try:
+        session = m.get(sid)
+        messages, after = [], 0
+        while True:
+            page = m.messages(sid, after=after, limit=1000)
+            messages.extend(page)
+            if len(page) < 1000:
+                break
+            after = page[-1]["seq"]
+    except KeyError:
+        return _unknown_session(sid)
+    data = json.dumps({"session": session, "messages": messages}, indent=1)
+    # Recorded bytes come from the sample; never let a browser render them here.
+    return (data, 200, {
+        "Content-Type": "application/octet-stream",
+        "Content-Disposition": f'attachment; filename="pipe-session-{sid}.json"',
+        "Content-Security-Policy": "sandbox; default-src 'none'",
+        "X-Content-Type-Options": "nosniff",
+    })
 
 
 @app.route("/api/process-graph/roots")

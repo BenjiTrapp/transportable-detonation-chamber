@@ -40,6 +40,8 @@ FILES = {
     "webui/minidump_analysis.py": r"C:\DetonationChamberUI\minidump_analysis.py",
     "webui/pipe_analysis.py": r"C:\DetonationChamberUI\pipe_analysis.py",
     "webui/pipe_signatures.json": r"C:\DetonationChamberUI\pipe_signatures.json",
+    "webui/pipe_backends.py": r"C:\DetonationChamberUI\pipe_backends.py",
+    "webui/pipe_proxy.py": r"C:\DetonationChamberUI\pipe_proxy.py",
     "webui/static/js/app.js": r"C:\DetonationChamberUI\static\js\app.js",
     "webui/static/css/style.css": r"C:\DetonationChamberUI\static\css\style.css",
     "webui/templates/index.html": r"C:\DetonationChamberUI\templates\index.html",

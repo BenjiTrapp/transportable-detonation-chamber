@@ -304,10 +304,12 @@ ERROR_PIPE_NOT_CONNECTED = 233
 ERROR_MORE_DATA = 234
 ERROR_PIPE_CONNECTED = 535
 ERROR_OPERATION_ABORTED = 995
+ERROR_IO_INCOMPLETE = 996
 ERROR_IO_PENDING = 997
 _CLOSED_ERRORS = (ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
                   ERROR_OPERATION_ABORTED, ERROR_INVALID_HANDLE)
 WRITE_TIMEOUT = 30.0
+CLOSE_POLL = 0.05               # how often a pending I/O checks for close()
 BUSY_BACKOFF = 0.02
 _INVALID_HANDLE = ctypes.c_void_p(-1).value
 
@@ -463,13 +465,18 @@ class Win32PipeBackend(PipeBackend):
             raise _winerr(ctypes.get_last_error(), "CreateNamedPipeW")
         return _WinHandle(h, mode)
 
-    def _overlapped(self, hv, start, timeout):
-        """Run one overlapped call on raw handle `hv`; returns (ok, transferred, error).
+    def _overlapped(self, h, start, timeout):
+        """Run one overlapped call on handle `h`; returns (ok, transferred, error).
 
-        `start(ov)` issues the call. On timeout the I/O is cancelled and waited
-        for, so the kernel never touches `ov` or the buffer after we return.
-        The caller holds a reference on the handle, so `hv` stays valid.
+        `start(ov)` issues the call. On timeout or `h.close()` the I/O is
+        cancelled and waited for, so the kernel never touches `ov` or the
+        buffer after we return. The caller holds a reference on the handle, so
+        `h.value` stays valid. The wait runs in short slices because a close()
+        that lands before the call is issued cannot cancel it.
         """
+        if h.closed:
+            return False, 0, ERROR_OPERATION_ABORTED
+        hv = h.value
         ev = _k32.CreateEventW(None, True, False, None)
         if not ev:
             raise _winerr(ctypes.get_last_error(), "CreateEventW")
@@ -486,16 +493,25 @@ class Win32PipeBackend(PipeBackend):
                 return False, n.value, err
             if err != ERROR_IO_PENDING:
                 return False, 0, err
-            ms = INFINITE if timeout is None else max(0, int(timeout * 1000))
-            if _k32.WaitForSingleObject(ev, ms) == WAIT_TIMEOUT:
-                _k32.CancelIoEx(hv, ctypes.byref(ov))
-                ok = _k32.GetOverlappedResult(hv, ctypes.byref(ov), ctypes.byref(n), True)
-                if ok:
-                    return True, n.value, 0
-                err = ctypes.get_last_error()
-                return False, n.value, (WAIT_TIMEOUT if err == ERROR_OPERATION_ABORTED else err)
-            ok = _k32.GetOverlappedResult(hv, ctypes.byref(ov), ctypes.byref(n), False)
-            return bool(ok), n.value, (0 if ok else ctypes.get_last_error())
+            deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+            while True:
+                if h.closed:
+                    break
+                left = CLOSE_POLL if deadline is None else \
+                    min(CLOSE_POLL, max(0.0, deadline - time.monotonic()))
+                if _k32.WaitForSingleObject(ev, int(left * 1000)) != WAIT_TIMEOUT:
+                    ok = _k32.GetOverlappedResult(hv, ctypes.byref(ov), ctypes.byref(n), False)
+                    return bool(ok), n.value, (0 if ok else ctypes.get_last_error())
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
+            _k32.CancelIoEx(hv, ctypes.byref(ov))
+            ok = _k32.GetOverlappedResult(hv, ctypes.byref(ov), ctypes.byref(n), True)
+            if ok:
+                return True, n.value, 0
+            err = ctypes.get_last_error()
+            if err == ERROR_OPERATION_ABORTED and not h.closed:
+                err = WAIT_TIMEOUT
+            return False, n.value, err
         finally:
             _k32.CloseHandle(ev)
 
@@ -504,7 +520,7 @@ class Win32PipeBackend(PipeBackend):
             return False
         try:
             ok, _, err = self._overlapped(
-                h.value, lambda ov: _k32.ConnectNamedPipe(h.value, ctypes.byref(ov)), timeout)
+                h, lambda ov: _k32.ConnectNamedPipe(h.value, ctypes.byref(ov)), timeout)
         finally:
             h.release()
         if ok or err == ERROR_PIPE_CONNECTED or err == ERROR_NO_DATA:
@@ -560,7 +576,7 @@ class Win32PipeBackend(PipeBackend):
         while True:
             buf = ctypes.create_string_buffer(BUFFER_SIZE)
             ok, n, err = self._overlapped(
-                h.value,
+                h,
                 lambda ov: _k32.ReadFile(h.value, buf, BUFFER_SIZE, None, ctypes.byref(ov)),
                 wait)
             if ok:
@@ -594,7 +610,7 @@ class Win32PipeBackend(PipeBackend):
             buf = ctypes.create_string_buffer(view.tobytes(), len(view))
             size = len(view)
             ok, n, err = self._overlapped(
-                h.value,
+                h,
                 lambda ov: _k32.WriteFile(h.value, buf, size, None, ctypes.byref(ov)),
                 WRITE_TIMEOUT)
             if not ok:

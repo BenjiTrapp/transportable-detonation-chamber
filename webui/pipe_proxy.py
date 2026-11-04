@@ -355,16 +355,18 @@ class InterceptManager:
 
     def shutdown(self) -> None:
         self._shutdown.set()
+        me = threading.current_thread()
+        with self._lock:
+            ticker = self._ticker
+        # A tick still in progress may start finishers; wait for it first.
+        if ticker is not None and ticker is not me:
+            ticker.join(_JOIN_TIMEOUT)
         with self._lock:
             sids = list(self._sessions)
         for sid in sids:
             self.stop(sid, "shutdown")
         with self._lock:
             waiters = list(self._finishers)
-            t = self._ticker
-            if t is not None:
-                waiters.append(t)
-        me = threading.current_thread()
         for t in waiters:
             if t is not me:
                 t.join(_JOIN_TIMEOUT)

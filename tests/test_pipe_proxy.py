@@ -491,3 +491,224 @@ def test_win_handle_close_waits_for_in_flight_io():
     idle.close()
     assert events[-1] == ("close", 8) and events.count(("close", 8)) == 1
     assert ("cancel", 8) not in events
+
+
+def test_shutdown_joins_ticker_before_collecting_finishers(make_manager, monkeypatch):
+    m = make_manager(tick_interval=0.01)
+    late = []
+
+    def slow_tick():
+        # A tick that is still running when shutdown() starts and only then
+        # spawns a session finisher.
+        if not m._shutdown.wait(1.0):
+            return
+        time.sleep(0.05)
+        t = threading.Thread(target=time.sleep, args=(0.3,), name="pipe_proxy-late-finisher")
+        with m._lock:
+            m._finishers.append(t)
+        t.start()
+        late.append(t)
+
+    monkeypatch.setattr(m, "check_timers", slow_tick)
+    m._ensure_ticker()
+    time.sleep(0.03)
+    m.shutdown()
+    assert late and not late[0].is_alive()
+
+
+class _PendingK32:
+    """kernel32 stand-in whose overlapped WriteFile/ReadFile never completes
+    on its own; only CancelIoEx ends it (ERROR_OPERATION_ABORTED)."""
+
+    def __init__(self, pb):
+        self.pb = pb
+        self.calls = []
+        self.cancelled = False
+        self.err = 0
+
+    def CreateEventW(self, *a):
+        return 99
+
+    def CloseHandle(self, h):
+        return 1
+
+    def _pending(self, name):
+        self.calls.append(name)
+        self.err = self.pb.ERROR_IO_PENDING
+        return 0
+
+    def WriteFile(self, *a):
+        return self._pending("WriteFile")
+
+    def ReadFile(self, *a):
+        return self._pending("ReadFile")
+
+    def WaitForSingleObject(self, ev, ms):
+        end = time.monotonic() + min(ms, 2000) / 1000
+        while time.monotonic() < end and not self.cancelled:
+            time.sleep(0.005)
+        return self.pb.WAIT_OBJECT_0 if self.cancelled else self.pb.WAIT_TIMEOUT
+
+    def CancelIoEx(self, h, ov):
+        self.calls.append("CancelIoEx")
+        self.cancelled = True
+        return 1
+
+    def GetOverlappedResult(self, h, ov, n, wait):
+        if self.cancelled:
+            self.err = self.pb.ERROR_OPERATION_ABORTED
+            return 0
+        self.err = self.pb.ERROR_IO_INCOMPLETE
+        return 0
+
+
+@pytest.fixture
+def pending_k32(monkeypatch):
+    import ctypes
+    import pipe_backends
+    if pipe_backends.wt is None:
+        pytest.skip("ctypes.wintypes unavailable")
+    k32 = _PendingK32(pipe_backends)
+    monkeypatch.setattr(pipe_backends, "_k32", k32)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: k32.err, raising=False)
+    return k32
+
+
+def test_win32_io_on_closed_handle_is_not_issued(pending_k32):
+    import pipe_backends
+    b = pipe_backends.Win32PipeBackend()
+    h = pipe_backends._WinHandle(5, "byte", cancel=lambda v: None, closer=lambda v: None)
+    assert h.acquire()
+    h.close()                                  # close() between acquire() and WriteFile
+    t0 = time.monotonic()
+    with pytest.raises(BrokenPipeError):
+        b._write(h, b"data")
+    assert b._read(h, 5.0) is None
+    assert time.monotonic() - t0 < 0.5
+    assert "WriteFile" not in pending_k32.calls and "ReadFile" not in pending_k32.calls
+
+
+def test_win32_close_during_pending_io_cancels_it(pending_k32):
+    import pipe_backends
+    b = pipe_backends.Win32PipeBackend()
+    # The cancel in close() runs before the I/O exists, so it misses it.
+    h = pipe_backends._WinHandle(5, "byte", cancel=lambda v: None, closer=lambda v: None)
+    assert h.acquire()
+    threading.Timer(0.05, h.close).start()
+    t0 = time.monotonic()
+    with pytest.raises(BrokenPipeError):
+        b._write(h, b"data")
+    assert time.monotonic() - t0 < 0.5
+    assert pending_k32.calls == ["WriteFile", "CancelIoEx"]
+
+
+# ------------------------------------------------------------------ API routes
+
+@pytest.fixture
+def api(tdc, client, make_manager, monkeypatch):
+    m = make_manager()
+    monkeypatch.setattr(tdc, "_intercept", m)
+    return client
+
+
+def test_intercept_manager_is_created_lazily(app_module):
+    assert app_module._intercept is None
+    assert not [t for t in threading.enumerate() if t.name.startswith("pipe_proxy")]
+
+
+def test_intercept_routes_roundtrip(api, backend):
+    server = backend.fake_server("svc")
+    r = api.post("/api/pipes/intercept", json={"pattern": "svc", "mode": "hold",
+                                                 "how": "attach", "match": "exact"})
+    assert r.status_code == 201, r.get_json()
+    sid = r.get_json()["id"]
+    assert r.get_json()["state"] == "active"
+    assert [s["id"] for s in api.get("/api/pipes/intercept").get_json()["sessions"]] == [sid]
+    assert api.get(f"/api/pipes/intercept/{sid}").get_json()["target"] == r"\svc"
+
+    client = backend.fake_client("svc")
+    client.send(b"pinx")
+    assert wait_for(lambda: len(api.get(f"/api/pipes/intercept/{sid}/messages")
+                                .get_json()["messages"]) == 1)
+    msg = api.get(f"/api/pipes/intercept/{sid}/messages?after=0&limit=10").get_json()["messages"][0]
+    assert msg["state"] == "held" and base64.b64decode(msg["data_b64"]) == b"pinx"
+    r = api.post(f"/api/pipes/intercept/{sid}/messages/{msg['seq']}",
+                 json={"action": "edit", "data_b64": "cGluZw=="})
+    assert r.status_code == 200 and r.get_json()["state"] == "edited"
+    assert server.recv() == b"ping"
+
+    client.send(b"two")
+    assert wait_for(lambda: api.get(f"/api/pipes/intercept/{sid}").get_json()["held_count"] == 1)
+    assert api.post(f"/api/pipes/intercept/{sid}/release").get_json() == {"released": 1}
+    assert server.recv() == b"two"
+    assert api.get(f"/api/pipes/intercept/{sid}/messages?after=1").get_json()["messages"][0]["seq"] == 2
+
+    r = api.post(f"/api/pipes/intercept/{sid}/messages/1", json={"action": "forward"})
+    assert r.status_code == 400 and "not held" in r.get_json()["error"]
+
+    r = api.delete(f"/api/pipes/intercept/{sid}")
+    assert r.status_code == 200 and r.get_json()["state"] == "ended"
+    assert client.recv() is None
+
+    r = api.get(f"/api/pipes/intercept/{sid}/export")
+    assert r.status_code == 200
+    assert "attachment" in r.headers["Content-Disposition"] and sid in r.headers["Content-Disposition"]
+    assert r.headers["Content-Security-Policy"].startswith("sandbox")
+    assert r.headers["Content-Type"] == "application/octet-stream"
+    doc = json.loads(r.data)
+    assert doc["session"]["id"] == sid and [x["seq"] for x in doc["messages"]] == [1, 2]
+    assert base64.b64decode(doc["messages"][0]["original_b64"]) == b"pinx"
+
+
+def test_intercept_rejects_cross_site_post(api, backend):
+    backend.fake_server("svc")
+    r = api.post("/api/pipes/intercept", json={"pattern": "svc"},
+                 headers={"Origin": "http://evil.example"})
+    assert r.status_code == 403
+    assert backend.created == []
+    r = api.delete("/api/pipes/intercept/abc", headers={"Origin": "http://evil.example"})
+    assert r.status_code == 403
+
+
+def test_intercept_rejects_blocked_pipe(api, backend):
+    backend.fake_server("lsass")
+    r = api.post("/api/pipes/intercept", json={"pattern": r"\lsass", "how": "attach"})
+    assert r.status_code == 400 and "blocklist" in r.get_json()["error"]
+    assert backend.created == []
+
+
+@pytest.mark.parametrize("body", [
+    None, [], {"pattern": "svc", "bogus": 1}, {"pattern": "svc", "squat": "yes"},
+    {"pattern": "svc", "max_duration": "10"}, {"pattern": "svc", "pipe_mode": "duplex"},
+    {"how": "attach"},
+])
+def test_intercept_start_validates_body(api, backend, body):
+    backend.fake_server("svc")
+    r = api.post("/api/pipes/intercept", json=body) if body is not None else \
+        api.post("/api/pipes/intercept", data="x", content_type="text/plain")
+    assert r.status_code == 400 and r.get_json()["error"]
+    assert backend.created == []
+
+
+def test_intercept_start_passes_pipe_mode(api, backend, monkeypatch):
+    backend.fake_server("svc")
+    monkeypatch.setattr(backend, "pipe_mode", lambda name: pytest.fail("probed the server"))
+    r = api.post("/api/pipes/intercept", json={"pattern": "svc", "pipe_mode": "message"})
+    assert r.status_code == 201 and r.get_json()["pipe_mode"] == "message"
+
+
+def test_intercept_unknown_session_and_bad_params(api, backend):
+    for method, path in (("get", "/api/pipes/intercept/nope"),
+                         ("delete", "/api/pipes/intercept/nope"),
+                         ("get", "/api/pipes/intercept/nope/messages"),
+                         ("post", "/api/pipes/intercept/nope/release"),
+                         ("get", "/api/pipes/intercept/nope/export")):
+        assert getattr(api, method)(path).status_code == 404, path
+    r = api.post("/api/pipes/intercept/nope/messages/1", json={"action": "forward"})
+    assert r.status_code == 404
+    backend.fake_server("svc")
+    sid = api.post("/api/pipes/intercept", json={"pattern": "svc"}).get_json()["id"]
+    assert api.get(f"/api/pipes/intercept/{sid}/messages?after=x").status_code == 400
+    assert api.post(f"/api/pipes/intercept/{sid}/messages/1", json=["x"]).status_code == 400
+    r = api.post(f"/api/pipes/intercept/{sid}/messages/1", json={"action": "edit", "data_b64": "%%"})
+    assert r.status_code == 400
