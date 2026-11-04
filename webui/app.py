@@ -26,6 +26,7 @@ import requests
 # Tool-agnostic scoring layer for live-memory findings. Scanners are plugged in
 # as normalizers there, so the verdict logic does not depend on any one tool.
 import memory_evidence
+import pipe_analysis
 # Offline analysis of exit-time minidumps (no scanner binary involved).
 import minidump_analysis
 
@@ -3166,6 +3167,10 @@ def _read_sysmon_events(max_events=100, since=None, pid=None, event_id=None, eve
             event["source_image"] = item.get("SourceImage", "")
             event["target_image"] = item.get("TargetImage", "")
             event["access"] = item.get("GrantedAccess", "")
+        elif eid == 17 or eid == 18:  # PipeEvent
+            event["type"] = "PipeCreated" if eid == 17 else "PipeConnected"
+            event["pipe"] = pipe_analysis.canonical_name(item.get("PipeName", ""))
+            event["event_type"] = item.get("EventType", "")
         else:
             event["type"] = f"Event_{eid}"
             # Include raw data for unknown types
@@ -3847,6 +3852,100 @@ def _network_beaconing_for_pid(pid):
     if len(_net_beacon_cache) > 200:
         oldest = min(_net_beacon_cache, key=lambda k: _net_beacon_cache[k][0])
         _net_beacon_cache.pop(oldest, None)
+    return result
+
+
+_pipe_cache = {}                # (pid, sha256, at) -> (fetched_at, result)
+
+
+def _pipe_submission_start(pid, sha256=None, at=None):
+    """Start epoch of the submission that ran `pid` (the one at `at`, else the newest)."""
+    try:
+        subs = _load_submissions()
+    except Exception:
+        return None
+    at_t = _to_epoch(at) if at else None
+    starts = []
+    for sub in subs or []:
+        if str(sub.get("agent_pid") or "") != str(pid):
+            continue
+        if sha256 and str(sub.get("sha256") or "").lower() != str(sha256).lower():
+            continue
+        t = _to_epoch(sub.get("timestamp"))
+        if t is not None:
+            starts.append(t)
+    if not starts:
+        return None
+    if at_t is not None:
+        before = [t for t in starts if t - 60 <= at_t]
+        return max(before) if before else min(starts)
+    return max(starts)
+
+
+def _pipe_activity_for(pid, sha256=None, at=None):
+    """Named pipes a detonated sample and its descendants created or connected to.
+
+    Sysmon EID 17/18 in the submission's attribution window, scoped to the
+    sample's process subtree. Events of this web UI process (the pipe proxy)
+    are ignored. Cached briefly like _network_beaconing_for_pid.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return {"available": False, "reason": "invalid pid", "pipes": [], "evidence_findings": []}
+
+    cache_key = (pid, (sha256 or "").lower() or None, at or None)
+    cached = _pipe_cache.get(cache_key)
+    if cached and time.time() - cached[0] < _NET_BEACON_TTL:
+        return cached[1]
+
+    if not _is_sysmon_running():
+        return {"available": False, "reason": "Sysmon not running", "pipes": [], "evidence_findings": []}
+
+    start = _pipe_submission_start(pid, sha256, at)
+    anchor = start if start is not None else (_to_epoch(at) if at else None)
+    since = until = None
+    if anchor is not None:
+        since = datetime.datetime.fromtimestamp(anchor - 60).astimezone().isoformat()
+        until = datetime.datetime.fromtimestamp(anchor + _AGENT_PID_WINDOW).astimezone().isoformat()
+
+    try:
+        proc_map, _ = _build_full_process_map()
+        events = _read_sysmon_events(event_ids=[17, 18], since=since, until=until, max_events=2000)
+    except Exception as e:
+        return {"available": False, "reason": str(e), "pipes": [], "evidence_findings": []}
+    errors = [e for e in events if isinstance(e, dict) and "error" in e]
+    events = [e for e in events if isinstance(e, dict) and "error" not in e]
+    if errors and not events:
+        return {"available": False, "reason": errors[0]["error"], "pipes": [], "evidence_findings": []}
+
+    instances = _PidInstances(proc_map)
+    sample_key = instances.resolve(pid, anchor) if anchor is not None else instances.resolve_key(str(pid))
+    if sample_key is None:
+        # The sample's ProcessCreate fell out of the event window: fall back
+        # to its PID alone (descendants cannot be found without it).
+        sample_keys = {str(pid)}
+
+        def resolve(p, ts):
+            return instances.resolve(p, ts) or str(p)
+    else:
+        sample_keys, todo = set(), [sample_key]
+        while todo:
+            key = todo.pop()
+            if key in sample_keys:
+                continue
+            sample_keys.add(key)
+            todo.extend((proc_map.get(key) or {}).get("children") or [])
+
+        def resolve(p, ts):
+            return instances.resolve(p, ts)
+
+    result = pipe_analysis.analyze(events, sample_keys, resolve, self_pid=os.getpid())
+    result["available"] = True
+    _pipe_cache[cache_key] = (time.time(), result)
+    if len(_pipe_cache) > 200:
+        oldest = min(_pipe_cache, key=lambda k: _pipe_cache[k][0])
+        _pipe_cache.pop(oldest, None)
     return result
 
 

@@ -130,3 +130,97 @@ def looks_random(name: str) -> bool:
     if _GUID_RE.fullmatch(last):
         return True
     return len(last) >= 12 and _entropy(last) >= 3.5
+
+
+SENSITIVE_SYSTEM_PIPES = frozenset({r"\svcctl", r"\lsarpc", r"\samr", r"\netlogon", r"\atsvc"})
+_IGNORED_PREFIXES = (r"\pshost.",)
+_DEFAULT_SIGNATURES: list | None = None
+_FRACTION_RE = re.compile(r"(\.\d{6})\d+")
+
+
+def _default_signatures() -> list[dict]:
+    global _DEFAULT_SIGNATURES
+    if _DEFAULT_SIGNATURES is None:
+        _DEFAULT_SIGNATURES = load_signatures(None)
+    return _DEFAULT_SIGNATURES
+
+
+def _epoch(ts) -> float | None:
+    import datetime
+    if not ts:
+        return None
+    text = _FRACTION_RE.sub(r"\1", str(ts).strip().replace("Z", "+00:00"))
+    try:
+        dt = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt.timestamp()
+
+
+def analyze(events, sample_keys, resolve, self_pid, signatures=None) -> dict:
+    """Pipes the sample subtree created or connected to, with flags.
+
+    `events` are Sysmon EID 17/18 dicts (type, pipe, pid, timestamp, ...);
+    `resolve(pid, ts)` maps them to process-instance keys. Only pipes that a
+    sample instance touched are reported, but every process on such a pipe
+    is listed so cross-process use is visible. Events of the web UI itself
+    (`self_pid`) and PowerShell host pipes are ignored.
+    """
+    sigs = _default_signatures() if signatures is None else signatures
+    sample_keys = set(sample_keys or ())
+    self_pid = str(self_pid) if self_pid is not None else None
+    groups: dict = {}
+    for ev in events or []:
+        if not isinstance(ev, dict) or ev.get("type") not in ("PipeCreated", "PipeConnected"):
+            continue
+        pid = ev.get("pid")
+        if pid in (None, "") or str(pid) == self_pid:
+            continue
+        name = canonical_name(ev.get("pipe") or "")
+        if name == "\\" or name.lower().startswith(_IGNORED_PREFIXES):
+            continue
+        ts = ev.get("timestamp") or ""
+        key = resolve(str(pid), ts)
+        g = groups.setdefault(name.lower(), {"pipe": name, "created": [], "connected": [],
+                                             "times": [], "sample_created": False,
+                                             "other_created": False, "sample_connected": False,
+                                             "other_connected": False})
+        in_sample = key is not None and key in sample_keys
+        shown = key if key is not None else str(pid)
+        role = "created" if ev["type"] == "PipeCreated" else "connected"
+        if shown not in g[role]:
+            g[role].append(shown)
+        g[("sample_" if in_sample else "other_") + role] = True
+        g["times"].append((_epoch(ts), ts))
+
+    pipes = []
+    for g in groups.values():
+        if not (g["sample_created"] or g["sample_connected"]):
+            continue
+        name = g["pipe"]
+        hit = match_signature(name, sigs)
+        flags = []
+        if hit:
+            flags.append("c2_default")
+        if (g["sample_created"] and g["other_connected"]) or (g["other_created"] and g["sample_connected"]):
+            flags.append("cross_process")
+        if g["sample_connected"] and name.lower() in SENSITIVE_SYSTEM_PIPES:
+            flags.append("sensitive_system")
+        if looks_random(name):
+            flags.append("random_name")
+        timed = sorted((t for t in g["times"] if t[0] is not None), key=lambda t: t[0])
+        pipes.append({
+            "pipe": name,
+            "family": hit["family"] if hit else None,
+            "note": hit["note"] if hit else "",
+            "created_by": g["created"],
+            "connected_by": g["connected"],
+            "first_seen": timed[0][1] if timed else (g["times"][0][1] if g["times"] else ""),
+            "last_seen": timed[-1][1] if timed else (g["times"][-1][1] if g["times"] else ""),
+            "flags": flags,
+        })
+    pipes.sort(key=lambda p: (_epoch(p["first_seen"]) or 0.0, p["pipe"].lower()))
+    # Task 4 turns flags into MemoryFinding evidence.
+    return {"pipes": pipes, "evidence_findings": []}

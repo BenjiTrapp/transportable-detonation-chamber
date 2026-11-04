@@ -186,3 +186,170 @@ def test_sysmon_pipe_rules_are_anchored_to_image_paths():
     assert msmpeng
     for rule in msmpeng:
         assert ("begin with", DEFENDER_PLATFORM) in images_of(rule)
+
+
+# --- Sysmon EID 17/18 parsing and attribution --------------------------------
+
+PIPE_XML = """<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>
+<System><Provider Name='Microsoft-Windows-Sysmon'/><EventID>17</EventID>
+<TimeCreated SystemTime='2026-11-04T10:00:01.1234567Z'/></System>
+<EventData><Data Name='RuleName'>-</Data><Data Name='EventType'>CreatePipe</Data>
+<Data Name='UtcTime'>2026-11-04 10:00:01.123</Data>
+<Data Name='ProcessGuid'>{11111111-2222-3333-4444-555555555555}</Data>
+<Data Name='ProcessId'>4072</Data><Data Name='PipeName'>\\msagent_5b</Data>
+<Data Name='Image'>C:\\Users\\Public\\beacon.exe</Data><Data Name='User'>LAB\\analyst</Data>
+</EventData></Event>"""
+
+
+class _Proc:
+    stdout, stderr, returncode = b"x", b"", 0
+
+
+def test_parse_pipe_events(tdc, monkeypatch):
+    seen = {}
+
+    def fake_query(log, query=None, count=None, newest_first=True, timeout=30):
+        seen["query"] = query
+        return PIPE_XML, _Proc()
+
+    monkeypatch.setattr(tdc, "_wevtutil_query", fake_query)
+    events = tdc._read_sysmon_events(event_ids=[17, 18], max_events=10)
+    assert "EventID=17" in seen["query"] and "EventID=18" in seen["query"]
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["type"] == "PipeCreated"
+    assert ev["pipe"] == r"\msagent_5b"
+    assert ev["event_type"] == "CreatePipe"
+    assert ev["pid"] == "4072"
+    assert ev["image"] == r"C:\Users\Public\beacon.exe"
+    assert ev["user"] == r"LAB\analyst"
+    assert ev["timestamp"]
+
+
+def _pipe_ev(kind, pid, pipe, ts="2026-11-04T10:00:00+00:00", image="x.exe"):
+    return {"type": "PipeCreated" if kind == "create" else "PipeConnected",
+            "event_type": "CreatePipe" if kind == "create" else "ConnectPipe",
+            "pid": str(pid), "pipe": pipe, "timestamp": ts, "image": image, "user": ""}
+
+
+def _resolve(pid, ts):
+    return str(pid)
+
+
+def test_analyze_flags():
+    events = [
+        _pipe_ev("create", 4072, r"\msagent_5b", "2026-11-04T10:00:00+00:00", "beacon.exe"),
+        _pipe_ev("connect", 5000, r"\msagent_5b", "2026-11-04T10:00:05+00:00", "rundll32.exe"),
+    ]
+    res = pipe_analysis.analyze(events, {"4072"}, _resolve, self_pid=1)
+    assert res["evidence_findings"] == []
+    assert len(res["pipes"]) == 1
+    p = res["pipes"][0]
+    assert p["pipe"] == r"\msagent_5b"
+    assert p["family"] == "Cobalt Strike"
+    assert p["note"]
+    assert {"c2_default", "cross_process"} <= set(p["flags"])
+    assert p["created_by"] == ["4072"]
+    assert p["connected_by"] == ["5000"]
+    assert p["first_seen"] == "2026-11-04T10:00:00+00:00"
+    assert p["last_seen"] == "2026-11-04T10:00:05+00:00"
+
+
+def test_analyze_sensitive_system_pipe():
+    events = [_pipe_ev("connect", 4072, r"\svcctl")]
+    res = pipe_analysis.analyze(events, {"4072"}, _resolve, self_pid=1)
+    p = res["pipes"][0]
+    assert "sensitive_system" in p["flags"]
+    assert "c2_default" not in p["flags"]
+    assert p["family"] is None
+
+
+def test_analyze_ignores_own_proxy_and_pshost():
+    events = [
+        _pipe_ev("create", 4072, r"\PSHost.1.2.powershell"),
+        _pipe_ev("create", 999, r"\msagent_aa"),
+        _pipe_ev("connect", 999, r"\svcctl"),
+        _pipe_ev("connect", 4072, r"\msagent_bb"),
+        _pipe_ev("create", 999, r"\msagent_bb"),
+    ]
+    res = pipe_analysis.analyze(events, {"4072"}, _resolve, self_pid=999)
+    names = [p["pipe"] for p in res["pipes"]]
+    assert names == [r"\msagent_bb"]
+    p = res["pipes"][0]
+    assert p["created_by"] == [] and p["connected_by"] == ["4072"]
+    assert "cross_process" not in p["flags"]
+
+
+def test_unrelated_processes_are_not_attributed():
+    events = [
+        _pipe_ev("create", 4072, r"\status_12"),
+        _pipe_ev("create", 6000, r"\msagent_99"),
+        _pipe_ev("connect", 6001, r"\msagent_99"),
+        _pipe_ev("connect", 6001, r"\svcctl"),
+    ]
+    res = pipe_analysis.analyze(events, {"4072"}, _resolve, self_pid=1)
+    assert [p["pipe"] for p in res["pipes"]] == [r"\status_12"]
+    p = res["pipes"][0]
+    assert p["created_by"] == ["4072"] and "cross_process" not in p["flags"]
+
+
+def test_analyze_random_name_and_case_insensitive_grouping():
+    events = [
+        _pipe_ev("create", 4072, r"\Xk9qZ2mVb7Lw4Tn"),
+        _pipe_ev("connect", 4072, r"\xk9qz2mvb7lw4tn"),
+    ]
+    res = pipe_analysis.analyze(events, {"4072"}, _resolve, self_pid=1)
+    assert len(res["pipes"]) == 1
+    assert "random_name" in res["pipes"][0]["flags"]
+
+
+def _local(h, m=0, s=0):
+    import datetime
+    return datetime.datetime(2026, 11, 4, h, m, s).astimezone().isoformat()
+
+
+def test_pipe_activity_for_scopes_to_sample_subtree(tdc, monkeypatch):
+    from test_process_instances import _sysmon_create
+
+    procs = [
+        _sysmon_create(4072, _local(10, 0, 0), r"C:\Users\Public\sample.exe", 2964,
+                       r"C:\DetonatorAgent\DetonatorAgent.exe"),
+        _sysmon_create(4100, _local(10, 0, 3), r"C:\Windows\System32\rundll32.exe", 4072),
+        _sysmon_create(6000, _local(9, 0, 0), r"C:\Windows\System32\svchost.exe", 1),
+    ]
+    pipes = [
+        _pipe_ev("create", 4100, r"\msagent_5b", _local(10, 0, 4)),
+        _pipe_ev("connect", 6000, r"\msagent_5b", _local(10, 0, 6)),
+        _pipe_ev("create", 6000, r"\other", _local(10, 0, 7)),
+        _pipe_ev("create", tdc.os.getpid(), r"\proxy_pipe", _local(10, 0, 8)),
+    ]
+    calls = []
+
+    def fake_read(**kw):
+        calls.append(kw)
+        return list(pipes) if kw.get("event_ids") == [17, 18] else list(procs)
+
+    monkeypatch.setattr(tdc, "_is_sysmon_running", lambda: True)
+    monkeypatch.setattr(tdc, "_read_sysmon_events", fake_read)
+    monkeypatch.setattr(tdc, "_load_submissions", lambda: [
+        {"agent_pid": 4072, "timestamp": "2026-11-04T09:59:59", "sha256": "ab" * 32,
+         "filename": "sample.exe"}])
+    tdc._pipe_cache.clear()
+
+    res = tdc._pipe_activity_for(4072, sha256="ab" * 32)
+    assert res["available"] is True
+    assert res["evidence_findings"] == []
+    assert [p["pipe"] for p in res["pipes"]] == [r"\msagent_5b"]
+    p = res["pipes"][0]
+    assert p["created_by"] == ["4100"] and p["connected_by"] == ["6000"]
+    assert "cross_process" in p["flags"]
+    q = [c for c in calls if c.get("event_ids") == [17, 18]][0]
+    assert q["max_events"] == 2000
+    assert tdc._to_epoch(q["until"]) - tdc._to_epoch(q["since"]) == 60 + tdc._AGENT_PID_WINDOW
+
+
+def test_pipe_activity_unavailable_without_sysmon(tdc):
+    tdc._pipe_cache.clear()
+    res = tdc._pipe_activity_for(4072)
+    assert res["available"] is False
+    assert res["pipes"] == [] and res["evidence_findings"] == []
