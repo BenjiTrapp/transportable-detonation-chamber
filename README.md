@@ -852,13 +852,15 @@ All endpoints served on port `9000`. Responses are JSON.
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/pipes/intercept` | Interception sessions (live and ended), newest first |
-| POST | `/api/pipes/intercept` | Start a session → 201 session / 400 error. JSON: `pattern` (required), `mode` (`observe`/`hold`), `how` (`attach`/`arm`), `match` (`exact`/`prefix`/`regex`), `squat` (arm + exact only), `max_duration` (default 600 s), `hold_timeout` (default 30 s), `pipe_mode` (`byte`/`message`; skips probing the real server). `\lsass`, `\ntsvcs`, `\protected_storage` are refused |
-| GET | `/api/pipes/intercept/<sid>` | One session (state, target, connection and message counts) |
+| POST | `/api/pipes/intercept` | Start a session → 201 session / 400 error. JSON: `pattern` (required), `mode` (`observe`/`hold`), `how` (`attach`/`arm`), `match` (`exact`/`prefix`/`regex`), `squat` (arm + exact only), `max_duration` (default 600 s, at most 3600), `hold_timeout` (default 30 s, at most `max_duration`; both finite), `pipe_mode` (`byte`/`message`; skips probing the real server). `\lsass`, `\ntsvcs`, `\protected_storage` are refused |
+| GET | `/api/pipes/intercept/<sid>` | One session (state, target, connection and message counts, `self_connect_retries`: upstream connects that landed on the proxy's own instance and were retried) |
 | DELETE | `/api/pipes/intercept/<sid>` | End a session; held messages are forwarded, both ends are closed |
 | GET | `/api/pipes/intercept/<sid>/messages` | Recorded messages (`seq`, `conn`, `dir` `c2s`/`s2c`, `data_b64`, `state`). Params: `after` (seq), `limit` (default 200, max 1000) |
 | POST | `/api/pipes/intercept/<sid>/messages/<seq>` | Decide a held message. JSON: `action` (`forward`/`drop`/`edit`), `data_b64` (for `edit`) |
 | POST | `/api/pipes/intercept/<sid>/release` | Forward every held message → `{"released": n}` |
 | GET | `/api/pipes/intercept/<sid>/export` | Session and all messages as a JSON attachment |
+
+Windows hands a connecting client the oldest free instance of a pipe. Once a session is active the proxy keeps that a proxy instance: it opens the upstream connection for the next client right after creating its next listening instance, so the real server's next spare instance is always younger. The real server therefore sees one idle connection from the proxy opened ahead of each client. If that upstream connect lands on the proxy's own instance instead (the client process id of the instance is the web UI's; counted in `self_connect_retries`), the proxy closes it, gives the server a moment to create its next instance and retries with a fresh instance. Not intercepted are connections that existed before the session started, and a client that connects in the instant in which no proxy instance is listening (during such a retry, or while the real server had no free instance).
 
 ### Hex Editor & Binary Analysis
 

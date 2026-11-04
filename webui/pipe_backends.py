@@ -45,6 +45,10 @@ class PipeBackend:
     def connect(self, name, timeout):
         raise NotImplementedError
 
+    def client_pid(self, h):
+        """Process id of the client connected to server instance `h` (None if none)."""
+        raise NotImplementedError
+
     def read(self, h, timeout):
         raise NotImplementedError
 
@@ -59,11 +63,15 @@ class PipeBackend:
 # In-memory fake
 # --------------------------------------------------------------------------
 
+FAKE_CLIENT_PID = 4             # process id of fake_client connections
+
+
 class _FakeInstance:
     def __init__(self, name, mode, kind):
         self.name = canonical_name(name)
         self.mode = mode
         self.kind = kind            # "proxy" (create_server) or "real" (fake_server)
+        self.client_pid = None
         self.connected = False
         self.closed = {"server": False, "client": False}
         self.inbox = {"server": deque(), "client": deque()}
@@ -112,13 +120,15 @@ class FakeEndpoint:
 class FakePipeBackend(PipeBackend):
     """In-memory named pipes.
 
-    Routing model: a real client (`fake_client`) prefers free proxy instances,
-    i.e. the proxy wins the race; the engine's upstream `connect` prefers free
-    real-server instances. Within a kind the newest free instance is taken. A
-    pipe exists while at least one server end is open.
+    Routing model (as observed on Windows): every client, `fake_client` and
+    the engine's `connect` alike, gets the oldest free instance, whoever owns
+    it. The engine's `connect` counts as process `own_pid` (default: this
+    process), `fake_client` as `FAKE_CLIENT_PID`; `client_pid` reports it per
+    instance. A pipe exists while at least one server end is open.
     """
 
-    def __init__(self):
+    def __init__(self, own_pid=None):
+        self.own_pid = os.getpid() if own_pid is None else own_pid
         self._cv = threading.Condition()
         self._instances = []
         self.created = []           # (canonical name, mode, first_instance) per create_server
@@ -147,7 +157,7 @@ class FakePipeBackend(PipeBackend):
         return FakeEndpoint(self, _FakeHandle(inst, "server"))
 
     def fake_client(self, name, timeout=1.0):
-        return FakeEndpoint(self, self._connect(name, "proxy", timeout))
+        return FakeEndpoint(self, self._connect(name, timeout, FAKE_CLIENT_PID))
 
     # -- protocol --
 
@@ -199,7 +209,7 @@ class FakePipeBackend(PipeBackend):
                     return False
                 self._cv.wait(left)
 
-    def _connect(self, name, prefer, timeout):
+    def _connect(self, name, timeout, pid):
         deadline = time.monotonic() + timeout
         with self._cv:
             while True:
@@ -208,9 +218,9 @@ class FakePipeBackend(PipeBackend):
                     raise FileNotFoundError(f"pipe {canonical_name(name)} not found")
                 free = [i for i in insts if not i.connected]
                 if free:
-                    free.sort(key=lambda i: i.kind == prefer)
-                    inst = free[-1]
+                    inst = free[0]          # oldest free instance
                     inst.connected = True
+                    inst.client_pid = pid
                     self._cv.notify_all()
                     return _FakeHandle(inst, "client")
                 left = deadline - time.monotonic()
@@ -221,7 +231,11 @@ class FakePipeBackend(PipeBackend):
     def connect(self, name, timeout):
         with self._cv:
             self.connect_attempts += 1
-        return self._connect(name, "real", timeout)
+        return self._connect(name, timeout, self.own_pid)
+
+    def client_pid(self, h):
+        with self._cv:
+            return h.inst.client_pid if h.inst.connected else None
 
     def _is_closed(self, h):
         with self._cv:
@@ -337,6 +351,7 @@ if os.name == "nt":
         ("WaitNamedPipeW", wt.BOOL, [wt.LPCWSTR, wt.DWORD]),
         ("SetNamedPipeHandleState", wt.BOOL, [wt.HANDLE, _LPDW, _LPDW, _LPDW]),
         ("GetNamedPipeInfo", wt.BOOL, [wt.HANDLE, _LPDW, _LPDW, _LPDW, _LPDW]),
+        ("GetNamedPipeClientProcessId", wt.BOOL, [wt.HANDLE, ctypes.POINTER(wt.ULONG)]),
         ("ReadFile", wt.BOOL, [wt.HANDLE, ctypes.c_void_p, wt.DWORD, _LPDW, _LPOV]),
         ("WriteFile", wt.BOOL, [wt.HANDLE, ctypes.c_void_p, wt.DWORD, _LPDW, _LPOV]),
         ("GetOverlappedResult", wt.BOOL, [wt.HANDLE, _LPOV, _LPDW, wt.BOOL]),
@@ -561,6 +576,19 @@ class Win32PipeBackend(PipeBackend):
                 _k32.CloseHandle(h)
                 raise _winerr(err, "SetNamedPipeHandleState")
         return _WinHandle(h, mode)
+
+    def client_pid(self, h):
+        # Per instance. (GetNamedPipeServerProcessId is not: it reports the
+        # creator of the pipe's first instance for every instance.)
+        if not h.acquire():
+            return None
+        try:
+            pid = wt.ULONG(0)
+            if not _k32.GetNamedPipeClientProcessId(h.value, ctypes.byref(pid)):
+                return None
+            return pid.value or None
+        finally:
+            h.release()
 
     def read(self, h, timeout):
         if not h.acquire():

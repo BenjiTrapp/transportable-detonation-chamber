@@ -2,6 +2,9 @@
 
 import base64
 import json
+import os
+import subprocess
+import sys
 import threading
 import time
 
@@ -50,6 +53,7 @@ def make_manager(backend, clock, tmp_path):
         kw.setdefault("tick_interval", None)
         kw.setdefault("io_timeout", 0.02)
         kw.setdefault("poll_interval", 0.01)
+        kw.setdefault("settle", 0.01)
         m = InterceptManager(backend, str(tmp_path / "sessions"), **kw)
         managers.append(m)
         return m
@@ -611,9 +615,25 @@ def api(tdc, client, make_manager, monkeypatch):
     return client
 
 
-def test_intercept_manager_is_created_lazily(app_module):
-    assert app_module._intercept is None
-    assert not [t for t in threading.enumerate() if t.name.startswith("pipe_proxy")]
+def test_intercept_manager_is_created_lazily(app_module, monkeypatch, tmp_path):
+    # A fresh interpreter: importing app.py must not create the manager or threads.
+    code = ("import threading, app; "
+            "print(app._intercept is None, "
+            "[t.name for t in threading.enumerate() if t.name.startswith('pipe_proxy')])")
+    env = dict(os.environ, TDC_NO_BACKGROUND="1",
+               PYTHONPATH=os.path.join(os.path.dirname(os.path.dirname(__file__)), "webui"))
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                         text=True, timeout=60)
+    assert out.stdout.strip().splitlines()[-1] == "True []", out.stderr
+
+    registered = []
+    monkeypatch.setattr(app_module, "_intercept", None)
+    monkeypatch.setattr(app_module, "PIPE_SESSIONS_DIR", str(tmp_path / "ps"))
+    monkeypatch.setattr(app_module.atexit, "register", registered.append)
+    m = app_module._get_intercept()
+    assert app_module._get_intercept() is m and registered == [m.shutdown]
+    assert isinstance(m.backend, FakePipeBackend if os.name != "nt" else pipe_proxy.Win32PipeBackend)
+    m.shutdown()
 
 
 def test_intercept_routes_roundtrip(api, backend):
@@ -680,12 +700,19 @@ def test_intercept_rejects_blocked_pipe(api, backend):
 @pytest.mark.parametrize("body", [
     None, [], {"pattern": "svc", "bogus": 1}, {"pattern": "svc", "squat": "yes"},
     {"pattern": "svc", "max_duration": "10"}, {"pattern": "svc", "pipe_mode": "duplex"},
-    {"how": "attach"},
+    {"how": "attach"}, {"pattern": "svc", "max_duration": 3601},
+    {"pattern": "svc", "max_duration": 60, "hold_timeout": 61},
+    '{"pattern": "svc", "max_duration": NaN}', '{"pattern": "svc", "hold_timeout": Infinity}',
+    '{"pattern": "svc", "max_duration": -Infinity}',
 ])
 def test_intercept_start_validates_body(api, backend, body):
     backend.fake_server("svc")
-    r = api.post("/api/pipes/intercept", json=body) if body is not None else \
-        api.post("/api/pipes/intercept", data="x", content_type="text/plain")
+    if body is None:
+        r = api.post("/api/pipes/intercept", data="x", content_type="text/plain")
+    elif isinstance(body, str):            # raw JSON with NaN/Infinity literals
+        r = api.post("/api/pipes/intercept", data=body, content_type="application/json")
+    else:
+        r = api.post("/api/pipes/intercept", json=body)
     assert r.status_code == 400 and r.get_json()["error"]
     assert backend.created == []
 
@@ -712,3 +739,98 @@ def test_intercept_unknown_session_and_bad_params(api, backend):
     assert api.post(f"/api/pipes/intercept/{sid}/messages/1", json=["x"]).status_code == 400
     r = api.post(f"/api/pipes/intercept/{sid}/messages/1", json={"action": "edit", "data_b64": "%%"})
     assert r.status_code == 400
+
+
+def test_durations_must_be_finite_and_bounded(backend, mgr):
+    backend.fake_server("svc")
+    for kw in ({"max_duration": float("nan")}, {"max_duration": float("inf")},
+               {"hold_timeout": float("nan")}, {"hold_timeout": float("inf")},
+               {"max_duration": 3601}, {"max_duration": 60, "hold_timeout": 61}):
+        with pytest.raises(ValueError):
+            mgr.start("svc", "hold", "attach", "exact", **kw)
+    assert backend.created == []
+    s = mgr.start("svc", "hold", "attach", "exact", max_duration=3600, hold_timeout=3600)
+    assert s["max_duration"] == 3600 and s["hold_timeout"] == 3600
+    assert mgr.start("svc", "hold", "attach", "exact", max_duration=10)["hold_timeout"] == 10
+    json.dumps(mgr.list(), allow_nan=False)
+
+
+class SpareServer:
+    """A real server that always keeps one free instance: when a client takes
+    it, the server creates the next one (as many real servers do)."""
+
+    def __init__(self, backend, name, mode="byte"):
+        self.backend, self.name, self.mode = backend, name, mode
+        self.conns = []
+        self.stop = threading.Event()
+        self.spare = backend.fake_server(name, mode)
+        self.thread = threading.Thread(target=self._loop, name="spare-server", daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        while not self.stop.is_set():
+            if self.spare.wait_connected(0.01):
+                self.conns.append(self.spare)
+                self.spare = self.backend.fake_server(self.name, self.mode)
+
+    def close(self):
+        self.stop.set()
+        self.thread.join()
+        for ep in self.conns + [self.spare]:
+            ep.close()
+
+
+def test_proxy_instance_stays_ahead_of_a_server_with_spare_instances(backend, mgr):
+    server = SpareServer(backend, "spare")
+    try:
+        sid = mgr.start("spare", "observe", "attach", "exact")["id"]
+        clients = []
+        for i in range(6):
+            c = backend.fake_client("spare")
+            clients.append(c)              # kept open: every connection holds an instance
+            c.send(f"m{i}".encode())
+            assert wait_for(lambda: len(mgr.messages(sid)) == i + 1), f"client {i} bypassed"
+        recorded = [base64.b64decode(m["data_b64"]) for m in mgr.messages(sid)]
+        assert recorded == [f"m{i}".encode() for i in range(6)]
+        assert all(m["conn"] == i + 1 for i, m in enumerate(mgr.messages(sid)))
+        got = sorted(ep.recv() for ep in server.conns[:6])
+        assert got == sorted(f"m{i}".encode() for i in range(6))
+        assert mgr.get(sid)["self_connect_retries"] == 0
+        for c in clients:
+            c.close()
+    finally:
+        server.close()
+
+
+def test_upstream_connect_on_own_instance_is_retried(backend, make_manager):
+    m = make_manager(connect_timeout=5.0)
+    first = backend.fake_server("solo")           # one instance, no spare
+    sid = m.start("solo", "observe", "attach", "exact")["id"]
+    c1 = backend.fake_client("solo")              # gets the proxy; upstream is `first`
+    c1.send(b"one")
+    assert first.recv() == b"one"
+    # The upstream for the next client finds only our own new instance free.
+    assert wait_for(lambda: m.get(sid)["self_connect_retries"] >= 1)
+    second = backend.fake_server("solo")          # the server offers another instance
+    assert wait_for(lambda: second.connected)     # ... and the proxy's retry takes it
+    c2 = backend.fake_client("solo")
+    c2.send(b"two")
+    assert second.recv() == b"two"
+    assert [base64.b64decode(x["data_b64"]) for x in m.messages(sid)] == [b"one", b"two"]
+
+
+def test_export_reads_persisted_file_once_and_reports_errors(api, tdc, backend):
+    backend.fake_server("svc")
+    sid = api.post("/api/pipes/intercept", json={"pattern": "svc"}).get_json()["id"]
+    c = backend.fake_client("svc")
+    c.send(b"x")
+    m = tdc._intercept
+    assert wait_for(lambda: len(m.messages(sid)) == 1)
+    api.delete(f"/api/pipes/intercept/{sid}")
+    path = m._persisted[sid]["path"]
+    doc = json.loads(api.get(f"/api/pipes/intercept/{sid}/export").data)
+    assert [x["seq"] for x in doc["messages"]] == [1]
+    with open(path, "w") as f:
+        f.write("{broken")
+    r = api.get(f"/api/pipes/intercept/{sid}/export")
+    assert r.status_code == 500 and "export failed" in r.get_json()["error"]

@@ -2908,19 +2908,13 @@ def api_pipes_intercept_release(sid):
 @app.route("/api/pipes/intercept/<sid>/export")
 def api_pipes_intercept_export(sid):
     """Session metadata and every recorded message as a JSON download."""
-    m = _get_intercept()
     try:
-        session = m.get(sid)
-        messages, after = [], 0
-        while True:
-            page = m.messages(sid, after=after, limit=1000)
-            messages.extend(page)
-            if len(page) < 1000:
-                break
-            after = page[-1]["seq"]
+        doc = _get_intercept().export(sid)
     except KeyError:
         return _unknown_session(sid)
-    data = json.dumps({"session": session, "messages": messages}, indent=1)
+    except (OSError, ValueError) as e:
+        return jsonify({"error": f"export failed: {e}"}), 500
+    data = json.dumps(doc, indent=1)
     # Recorded bytes come from the sample; never let a browser render them here.
     return (data, 200, {
         "Content-Type": "application/octet-stream",

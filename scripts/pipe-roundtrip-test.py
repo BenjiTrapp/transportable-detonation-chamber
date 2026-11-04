@@ -4,16 +4,18 @@ Run ON the VM with the web UI's venv python (the UI must be running):
 
     C:\\DetonationChamberUI\\venv\\Scripts\\python.exe pipe-roundtrip-test.py
 
-It creates its own echo server and client through `Win32PipeBackend` and
+It creates its own echo server and clients through `Win32PipeBackend` and
 drives the live API at http://127.0.0.1:9000:
 
-  1. observe/attach on \\tdc_test, client sends 3 messages -> "OK 3/3"
+  1. observe/attach on \\tdc_test, one client sends 3 messages -> "OK 3/3",
+     then CONNECTIONS more clients connect one after another; every one must
+     go through the proxy -> "OK bypass 0/N"
   2. hold/attach, client message edited via the API, server sees the edit -> "OK edit"
   3. arm/exact/squat on \\tdc_squat, then the real server starts -> "OK squat"
 
-The echo server keeps a spare instance like many real servers do. Windows
-gives a client the oldest free instance, so a connection can bypass the
-proxy; the script then reconnects and reports how many attempts it took.
+The echo server keeps a spare instance like many real servers do, and Windows
+gives a client the oldest free instance. A connection made after the session
+became active that reaches the real server directly is a bypass and FAILS.
 """
 
 import base64
@@ -28,6 +30,7 @@ sys.path.insert(0, r"C:\DetonationChamberUI")
 from pipe_backends import Win32PipeBackend  # noqa: E402
 
 API = "http://127.0.0.1:9000/api/pipes/intercept"
+CONNECTIONS = 10
 b = Win32PipeBackend()
 
 
@@ -53,7 +56,7 @@ def wait_for(cond, timeout=5.0):
 
 
 class EchoServer:
-    """A real pipe server: always one listening instance, echoes every read."""
+    """A real pipe server: always one spare listening instance, echoes every read."""
 
     def __init__(self, name, first=True):
         self.name = name
@@ -113,29 +116,6 @@ def recorded(sid, data):
                for m in messages(sid))
 
 
-ATTEMPTS = 5
-
-
-def connect_through_proxy(sid, name, first, check):
-    """Connect and send `first` until the connection lands on the proxy.
-
-    Windows hands a client the oldest free server instance, so whether the
-    proxy's instance or the real server's spare one is taken depends on which
-    was created first. A connection that bypassed the proxy is closed and retried.
-    """
-    for attempt in range(1, ATTEMPTS + 1):
-        c = b.connect(name, 5.0)
-        b.write(c, first)
-        if wait_for(lambda: check(sid, first), 1.5):
-            print(f"  connection {attempt} went through the proxy")
-            return c, attempt
-        print(f"  connection {attempt} bypassed the proxy (went to the real server)")
-        recv(c, 1.0)
-        b.close(c)
-        time.sleep(0.3)
-    return None, ATTEMPTS
-
-
 def test_observe():
     server = EchoServer(r"\tdc_test")
     try:
@@ -143,14 +123,12 @@ def test_observe():
                                    "how": "attach", "match": "exact"})
         print("start observe:", st, s.get("state"), s.get("pipe_mode"), s.get("error", ""))
         if st != 201:
+            print("FAIL 0/3")
             return
         sid = s["id"]
-        c, _ = connect_through_proxy(sid, r"\tdc_test", b"msg1", recorded)
-        if c is None:
-            print("FAIL 0/3: no connection went through the proxy")
-            return
-        ok = 1 if recv(c) == b"msg1" else 0
-        for i in range(2, 4):
+        c = b.connect(r"\tdc_test", 5.0)
+        ok = 0
+        for i in range(1, 4):
             msg = f"msg{i}".encode()
             b.write(c, msg)
             if recv(c) == msg:
@@ -163,6 +141,20 @@ def test_observe():
         print(f"echo ok {ok}/3, api c2s={seen}, s2c={echoed}, server got {server.received}")
         n = sum(1 for i in range(1, 4) if f"msg{i}".encode() in seen and f"msg{i}".encode() in echoed)
         print(f"{'OK' if n == 3 and ok == 3 else 'FAIL'} {n}/3")
+
+        bypassed = []
+        for i in range(CONNECTIONS):
+            msg = f"conn{i}".encode()
+            c = b.connect(r"\tdc_test", 5.0)
+            b.write(c, msg)
+            echo = recv(c)
+            b.close(c)
+            if echo != msg or not wait_for(lambda: recorded(sid, msg), 2.0):
+                bypassed.append(i)
+        meta = call("GET", f"/{sid}")[1]
+        print(f"connections: {CONNECTIONS}, bypassed: {bypassed}, "
+              f"self_connect_retries: {meta.get('self_connect_retries')}")
+        print(f"{'OK' if not bypassed else 'FAIL'} bypass {len(bypassed)}/{CONNECTIONS}")
         call("DELETE", f"/{sid}")
     finally:
         server.close()
@@ -170,21 +162,21 @@ def test_observe():
 
 def test_edit():
     server = EchoServer(r"\tdc_test")
+    c = None
     try:
         st, s = call("POST", body={"pattern": r"\tdc_test", "mode": "hold",
                                    "how": "attach", "match": "exact", "hold_timeout": 60})
         print("start hold:", st, s.get("state"), s.get("error", ""))
         if st != 201:
+            print("FAIL edit")
             return
         sid = s["id"]
-        c, _ = connect_through_proxy(sid, r"\tdc_test", b"original",
-                                     lambda sid, data: held(sid, "c2s"))
-        item = held(sid, "c2s") if c is not None else None
+        c = b.connect(r"\tdc_test", 5.0)
+        b.write(c, b"original")
+        item = wait_for(lambda: held(sid, "c2s"), 3.0)
         if not item:
-            print("FAIL edit: no held c2s message; messages:", messages(sid),
-                  "server got", server.received)
+            print("FAIL edit: bypass, no held c2s message; server got", server.received)
         else:
-            server.received.clear()
             seq = item[0]["seq"]
             st, rec = call("POST", f"/{sid}/messages/{seq}",
                            {"action": "edit", "data_b64": base64.b64encode(b"EDITED!").decode()})
@@ -196,10 +188,10 @@ def test_edit():
             echo = recv(c)
             print(f"server got {got}, client echo {echo!r}")
             print("OK edit" if got == [b"EDITED!"] and echo == b"EDITED!" else "FAIL edit")
-        if c is not None:
-            b.close(c)
         call("DELETE", f"/{sid}")
     finally:
+        if c is not None:
+            b.close(c)
         server.close()
 
 

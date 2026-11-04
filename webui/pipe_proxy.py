@@ -24,6 +24,7 @@ taking a session lock; no I/O happens under either lock.
 
 import base64
 import json
+import math
 import os
 import re
 import secrets
@@ -39,6 +40,8 @@ from pipe_backends import (MODES, FakeEndpoint, FakePipeBackend, PipeBackend,  #
 BLOCKLIST = frozenset({"\\lsass", "\\ntsvcs", "\\protected_storage"})
 MAX_MESSAGE_LOG = 1024 * 1024
 MAX_SESSION_RECORD = 50 * 1024 * 1024
+MAX_DURATION_LIMIT = 3600
+DEFAULT_HOLD_TIMEOUT = 30
 SESSION_MODES = ("observe", "hold")
 HOWS = ("attach", "arm")
 MATCHES = ("exact", "prefix", "regex")
@@ -50,6 +53,11 @@ WATCH_RETRIES = 3
 
 def _key(name):
     return canonical_name(name).lower()
+
+
+def _positive(value):
+    return not isinstance(value, bool) and isinstance(value, (int, float)) \
+        and math.isfinite(value) and value > 0
 
 
 class _Item:
@@ -113,6 +121,7 @@ class _Session:
         self.recording_truncated = False
         self.last_error = None
         self.watch_polls = 0
+        self.self_connect_retries = 0
         self.regex = re.compile(pattern, re.IGNORECASE) if match == "regex" else None
 
     def matches(self, name):
@@ -128,8 +137,11 @@ class InterceptManager:
     def __init__(self, backend, store_dir, clock=time.time, tick_interval: Optional[float] = 1.0,
                  io_timeout: float = 0.25, poll_interval: float = 0.5,
                  connect_timeout: float = 5.0, max_message_log: int = MAX_MESSAGE_LOG,
-                 max_session_record: int = MAX_SESSION_RECORD, drain_timeout: float = 2.0):
+                 max_session_record: int = MAX_SESSION_RECORD, drain_timeout: float = 2.0,
+                 own_pid: Optional[int] = None, settle: float = 0.1):
         self.backend = backend
+        self.own_pid = os.getpid() if own_pid is None else own_pid
+        self.settle = settle
         self.store_dir = store_dir
         self.clock = clock
         self.tick_interval = tick_interval
@@ -151,8 +163,9 @@ class InterceptManager:
     # ---------------------------------------------------------------- public
 
     def start(self, pattern: str, mode: str, how: str, match: str, squat: bool = False,
-              max_duration: int = 600, hold_timeout: int = 30,
+              max_duration: int = 600, hold_timeout: Optional[int] = None,
               pipe_mode: Optional[str] = None) -> dict:
+        """Start a session. `hold_timeout` defaults to min(30, max_duration)."""
         if mode not in SESSION_MODES:
             raise ValueError(f"mode must be one of {SESSION_MODES}")
         if how not in HOWS:
@@ -161,9 +174,15 @@ class InterceptManager:
             raise ValueError(f"match must be one of {MATCHES}")
         if pipe_mode is not None and pipe_mode not in MODES:
             raise ValueError(f"pipe_mode must be one of {MODES}")
+        if hold_timeout is None and _positive(max_duration):
+            hold_timeout = min(DEFAULT_HOLD_TIMEOUT, max_duration)
         for label, value in (("max_duration", max_duration), ("hold_timeout", hold_timeout)):
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-                raise ValueError(f"{label} must be a positive number")
+            if not _positive(value):
+                raise ValueError(f"{label} must be a positive finite number")
+        if max_duration > MAX_DURATION_LIMIT:
+            raise ValueError(f"max_duration must be at most {MAX_DURATION_LIMIT} seconds")
+        if hold_timeout > max_duration:
+            raise ValueError("hold_timeout must not exceed max_duration")
         if not isinstance(pattern, str) or not pattern.strip():
             raise ValueError("pattern is required")
         if match == "regex":
@@ -268,6 +287,24 @@ class InterceptManager:
             print(f"[pipe_proxy] cannot read {entry['path']}: {e}")
             return []
         return [m for m in msgs if m.get("seq", 0) > after][:limit]
+
+    def export(self, sid: str) -> dict:
+        """Session metadata and every message; the file of an ended session is
+        read once and read errors raise (OSError/ValueError)."""
+        s = self._live(sid)
+        if s is not None:
+            with s.lock:
+                return {"session": self._meta(s), "messages": [dict(r) for r in s.messages]}
+        with self._lock:
+            entry = self._persisted.get(sid)
+        if entry is None:
+            raise KeyError(sid)
+        with open(entry["path"], encoding="utf-8") as f:
+            doc = json.load(f)
+        msgs = doc.get("messages", []) if isinstance(doc, dict) else None
+        if not isinstance(msgs, list):
+            raise ValueError(f"{entry['path']}: messages is not a list")
+        return {"session": dict(entry["session"]), "messages": msgs}
 
     def act(self, sid: str, seq: int, action: str, data_b64: Optional[str] = None) -> dict:
         if action not in ACTIONS:
@@ -429,6 +466,7 @@ class InterceptManager:
             "message_count": len(s.messages), "held_count": held,
             "recorded_bytes": s.recorded_bytes, "recording_truncated": s.recording_truncated,
             "end_reason": s.end_reason, "last_error": s.last_error,
+            "self_connect_retries": s.self_connect_retries,
         }
 
     @staticmethod
@@ -481,18 +519,34 @@ class InterceptManager:
             print(f"[pipe_proxy] close failed: {e}")
 
     def _activate(self, s, target, mode, h):
+        """Make `h` the session's listening proxy instance and start accepting.
+
+        Unless squatting (no real server yet), an upstream connection for the
+        first client is opened right here, after `h` exists: it takes the real
+        server's oldest free instance, so any spare the server creates next is
+        younger than `h` and the next client lands on the proxy.
+        """
         with s.lock:
-            if s.ended:
-                ok = False
-            else:
-                ok = True
+            ok = not s.ended
+            if ok:
                 s.target = canonical_name(target)
                 s.pipe_mode = mode
-                s.state = "active"
                 s.handles.add(h)
-                self._spawn(s, self._accept_loop, (s, h), "accept")
         if not ok:
             self._close_quiet(h)
+            return False
+        ready = None
+        if not s.squat:
+            ready, h = self._connect_upstream(s, h, self.connect_timeout, "first client")
+        with s.lock:
+            ok = not s.ended
+            if ok:
+                s.state = "active"
+                self._spawn(s, self._accept_loop, (s, h, ready), "accept")
+        if not ok:
+            for x in (h, ready):
+                if x is not None:
+                    self._close_quiet(x)
         return ok
 
     def _note_error(self, s, msg):
@@ -542,49 +596,106 @@ class InterceptManager:
             if taken:
                 return
 
-    def _accept_loop(self, s, h):
-        while not s.ended:
-            if h is None:
+    def _new_instance(self, s):
+        """Create and track one more listening proxy instance (None on failure)."""
+        try:
+            h = self.backend.create_server(s.target, s.pipe_mode, False)
+        except OSError as e:
+            self._note_error(s, f"create_server failed: {e}")
+            s.stop_evt.wait(self.poll_interval)
+            return None
+        return h if self._track(s, h) else None
+
+    def _accept_loop(self, s, h, ready):
+        """Accept clients on proxy instance `h`, pairing each with an upstream.
+
+        Windows hands a client the oldest free instance. To keep that a proxy
+        instance, the next proxy instance is always created *before* the next
+        upstream connection is opened: the upstream takes the server's current
+        spare, and the server's next spare is younger than our instance.
+        `ready` is the upstream prepared for the next client. A connection on
+        `h` whose client is this process is one of our own upstream connects
+        (another session on the same pipe) and is dropped.
+        """
+        try:
+            while not s.ended:
+                if h is None:
+                    h = self._new_instance(s)
+                    if h is None:
+                        continue
                 try:
-                    h = self.backend.create_server(s.target, s.pipe_mode, False)
+                    connected = self.backend.accept(h, self.io_timeout)
                 except OSError as e:
-                    self._note_error(s, f"create_server failed: {e}")
+                    self._note_error(s, f"accept failed: {e}")
+                    self._close(s, h)
+                    h = None
                     s.stop_evt.wait(self.poll_interval)
                     continue
-                if not self._track(s, h):
-                    return
-            try:
-                connected = self.backend.accept(h, self.io_timeout)
-            except OSError as e:
-                self._note_error(s, f"accept failed: {e}")
-                self._close(s, h)
-                h = None
-                s.stop_evt.wait(self.poll_interval)
-                continue
-            if not connected:
-                continue
-            client, h = h, None
-            upstream = self._connect_upstream(s)
-            if upstream is None:
-                self._close(s, client)
-                continue
-            self._start_conn(s, client, upstream)
+                if not connected:
+                    continue
+                if self.backend.client_pid(h) == self.own_pid:
+                    # One of our own upstream connects (e.g. another session's).
+                    with s.lock:
+                        s.self_connect_retries += 1
+                    self._close(s, h)
+                    h = None
+                    continue
+                client, h = h, None
+                upstream, ready = ready, None
+                if upstream is None:
+                    # No spare first: this connect must not land on ourselves.
+                    upstream, _ = self._connect_upstream(
+                        s, None, None if s.squat else self.connect_timeout, "client")
+                    if upstream is None:
+                        self._close(s, client)
+                        continue
+                self._start_conn(s, client, upstream)
+                if h is None:
+                    h = self._new_instance(s)
+                if h is not None:
+                    ready, h = self._connect_upstream(s, h, self.connect_timeout, "next client")
+        finally:
+            if ready is not None:
+                self._close(s, ready)
 
-    def _connect_upstream(self, s):
-        # No proxy instance is listening here, so this cannot reach ourselves.
-        deadline = time.monotonic() + self.connect_timeout
+    def _connect_upstream(self, s, spare, timeout, purpose):
+        """Connect to the real server; returns (upstream or None, spare).
+
+        `spare` is our own listening instance, if any. Windows hands the
+        connect the oldest free instance; if that was `spare` (its client is
+        this process), no older real instance was free: the self-connection
+        and the now broken spare are closed, the server gets `settle` seconds
+        to create its next instance, and a new spare - younger than that one -
+        is created before the retry. Gives up after `timeout` seconds (None:
+        until the session ends), or at once when a real client takes `spare`.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
         while not s.ended:
             try:
                 up = self.backend.connect(s.target, self.io_timeout)
             except OSError as e:
-                if not s.squat and time.monotonic() >= deadline:
-                    self._note_error(s, f"no upstream for {s.target}: {e}")
-                    return None
+                if deadline is not None and time.monotonic() >= deadline:
+                    self._note_error(s, f"no upstream for {s.target} ({purpose}): {e}")
+                    return None, spare
+                if spare is not None and self.backend.client_pid(spare) is not None:
+                    return None, spare          # a client is waiting on our spare
                 if isinstance(e, FileNotFoundError):
                     s.stop_evt.wait(self.io_timeout)
                 continue
-            return up if self._track(s, up) else None
-        return None
+            if spare is not None and self.backend.client_pid(spare) == self.own_pid:
+                with s.lock:
+                    s.self_connect_retries += 1
+                self._close_quiet(up)
+                self._close(s, spare)
+                s.stop_evt.wait(self.settle)
+                spare = self._new_instance(s)
+                if deadline is not None and time.monotonic() >= deadline:
+                    self._note_error(s, f"no upstream for {s.target} ({purpose}): "
+                                        "only our own instance was free")
+                    return None, spare
+                continue
+            return (up if self._track(s, up) else None), spare
+        return None, spare
 
     def _start_conn(self, s, client, upstream):
         with s.lock:
