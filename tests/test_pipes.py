@@ -123,9 +123,9 @@ def test_sysmon_installer_switches_pipeevent_to_exclude():
     rules = re.findall(r'<Rule groupRelation="and">(.*?)</Rule>', block, re.S)
     assert rules
     for rule in rules:
-        assert '<Image condition="end with">' in rule
+        assert "<Image" in rule
         assert "<PipeName" in rule
-    pairs = {(re.search(r"<Image[^>]*>([^<]+)</Image>", r).group(1),
+    pairs = {(re.findall(r"<Image[^>]*>([^<]+)</Image>", r)[-1].rsplit("\\", 1)[-1],
               re.search(r"<PipeName[^>]*>([^<]+)</PipeName>", r).group(1)) for r in rules}
     for image in ("chrome.exe", "msedge.exe"):
         assert (image, r"\mojo.") in pairs
@@ -144,3 +144,45 @@ def test_sysmon_installer_switches_pipeevent_to_exclude():
 
     m = re.search(r"wevtutil sl Microsoft-Windows-Sysmon/Operational /ms:(\d+)", script)
     assert m and int(m.group(1)) >= 536870912
+
+
+DEFENDER_PLATFORM = "C:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\"
+
+
+def _sysmon_pipe_rules():
+    import os
+    import re
+    import xml.etree.ElementTree as ET
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "scripts", "install-sysmon.ps1"), encoding="utf-8") as fh:
+        script = fh.read()
+    m = re.search(r"\$pipeGroup = @'\r?\n(.*?)\r?\n'@", script, re.S)
+    assert m, "pipe rule here-string not found"
+    group = ET.fromstring(m.group(1))
+    pipe_event = group.find("PipeEvent")
+    assert pipe_event is not None and pipe_event.get("onmatch") == "exclude"
+    return pipe_event.findall("Rule")
+
+
+def test_sysmon_pipe_rules_are_anchored_to_image_paths():
+    rules = _sysmon_pipe_rules()
+    assert rules
+    for rule in rules:
+        assert rule.get("groupRelation") == "and"
+        assert len(rule.findall("PipeName")) == 1
+        images = rule.findall("Image")
+        assert images
+        for image in images:
+            assert image.text.startswith("\\") or image.text[1:3] == ":\\", image.text
+            if image.get("condition") == "end with":
+                assert image.text.startswith("\\"), image.text
+
+    def images_of(rule):
+        return [(i.get("condition"), i.text) for i in rule.findall("Image")]
+
+    msmpeng = [r for r in rules
+               if any(t.lower().endswith("\\msmpeng.exe") for _, t in images_of(r))]
+    assert msmpeng
+    for rule in msmpeng:
+        assert ("begin with", DEFENDER_PLATFORM) in images_of(rule)

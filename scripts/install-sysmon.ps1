@@ -44,15 +44,15 @@ function Set-PipeEventExclude {
     $pipeGroup = @'
 <RuleGroup name="" groupRelation="or">
   <PipeEvent onmatch="exclude">
-    <Rule groupRelation="and"><Image condition="end with">chrome.exe</Image><PipeName condition="begin with">\mojo.</PipeName></Rule>
-    <Rule groupRelation="and"><Image condition="end with">chrome.exe</Image><PipeName condition="begin with">\crashpad_</PipeName></Rule>
-    <Rule groupRelation="and"><Image condition="end with">msedge.exe</Image><PipeName condition="begin with">\mojo.</PipeName></Rule>
-    <Rule groupRelation="and"><Image condition="end with">msedge.exe</Image><PipeName condition="begin with">\crashpad_</PipeName></Rule>
-    <Rule groupRelation="and"><Image condition="end with">svchost.exe</Image><PipeName condition="begin with">\lsass</PipeName></Rule>
-    <Rule groupRelation="and"><Image condition="end with">svchost.exe</Image><PipeName condition="begin with">\ntsvcs</PipeName></Rule>
-    <Rule groupRelation="and"><Image condition="end with">svchost.exe</Image><PipeName condition="begin with">\srvsvc</PipeName></Rule>
-    <Rule groupRelation="and"><Image condition="end with">svchost.exe</Image><PipeName condition="begin with">\wkssvc</PipeName></Rule>
-    <Rule groupRelation="and"><Image condition="end with">MsMpEng.exe</Image><PipeName condition="begin with">\</PipeName></Rule>
+    <Rule groupRelation="and"><Image condition="end with">\chrome.exe</Image><PipeName condition="begin with">\mojo.</PipeName></Rule>
+    <Rule groupRelation="and"><Image condition="end with">\chrome.exe</Image><PipeName condition="begin with">\crashpad_</PipeName></Rule>
+    <Rule groupRelation="and"><Image condition="end with">\msedge.exe</Image><PipeName condition="begin with">\mojo.</PipeName></Rule>
+    <Rule groupRelation="and"><Image condition="end with">\msedge.exe</Image><PipeName condition="begin with">\crashpad_</PipeName></Rule>
+    <Rule groupRelation="and"><Image condition="is">C:\Windows\System32\svchost.exe</Image><PipeName condition="begin with">\lsass</PipeName></Rule>
+    <Rule groupRelation="and"><Image condition="is">C:\Windows\System32\svchost.exe</Image><PipeName condition="begin with">\ntsvcs</PipeName></Rule>
+    <Rule groupRelation="and"><Image condition="is">C:\Windows\System32\svchost.exe</Image><PipeName condition="begin with">\srvsvc</PipeName></Rule>
+    <Rule groupRelation="and"><Image condition="is">C:\Windows\System32\svchost.exe</Image><PipeName condition="begin with">\wkssvc</PipeName></Rule>
+    <Rule groupRelation="and"><Image condition="begin with">C:\ProgramData\Microsoft\Windows Defender\Platform\</Image><Image condition="end with">\MsMpEng.exe</Image><PipeName condition="begin with">\</PipeName></Rule>
   </PipeEvent>
 </RuleGroup>
 '@
@@ -72,13 +72,18 @@ function Set-PipeEventExclude {
         $cfg.Save($Path)
         Write-Host "[+] PipeEvent switched to exclude mode" -ForegroundColor Green
     } catch {
-        Write-Host "[!] PipeEvent post-processing failed: $_" -ForegroundColor Yellow
+        Write-Host "[!] PipeEvent post-processing failed - pipe events will not be logged: $_" -ForegroundColor Red
     }
 }
 
 function Set-SysmonLogSize {
     # 512 MB so pipe events do not rotate out short detonations
     wevtutil sl Microsoft-Windows-Sysmon/Operational /ms:536870912
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "[!] Could not set Sysmon log size to 512 MB (wevtutil exit $LASTEXITCODE)" -ForegroundColor Red
+    } else {
+        Write-Host "[+] Sysmon log size set to 512 MB" -ForegroundColor Green
+    }
 }
 
 # Check if already installed and running
