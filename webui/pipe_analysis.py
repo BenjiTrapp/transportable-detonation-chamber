@@ -12,7 +12,10 @@ import os
 import re
 from collections import Counter
 
-from memory_evidence import KINDS, MemoryFinding
+from memory_evidence import KINDS, VERDICT_MALICIOUS, MemoryFinding
+
+# A single catalogued pipe is strong evidence, but never a verdict by itself.
+MAX_SIGNATURE_WEIGHT = VERDICT_MALICIOUS - 1.0
 
 DEFAULT_SIGNATURES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                        "pipe_signatures.json")
@@ -64,11 +67,19 @@ def load_signatures(path: str | None = None) -> list[dict]:
         if not isinstance(pattern, str) or not pattern or kind not in _MATCH_TYPES:
             print(f"[pipe_analysis] skipping malformed signature #{i}: {entry!r}")
             continue
+        raw_weight = entry.get("weight")
         try:
-            weight = float(entry.get("weight") or 0.0)
+            weight = None if raw_weight is None else float(raw_weight)
         except (TypeError, ValueError):
-            print(f"[pipe_analysis] skipping signature #{i} with invalid weight {entry.get('weight')!r}")
+            weight = float("nan")
+        if weight is not None and math.isnan(weight):
+            print(f"[pipe_analysis] skipping signature #{i} with invalid weight {raw_weight!r}")
             continue
+        if weight is not None and not 0.0 <= weight <= MAX_SIGNATURE_WEIGHT:
+            clamped = min(max(weight, 0.0), MAX_SIGNATURE_WEIGHT)
+            print(f"[pipe_analysis] signature #{i} weight {weight} clamped to {clamped} "
+                  f"(one pipe must not reach MALICIOUS on its own)")
+            weight = clamped
         sig = {
             "family": str(entry.get("family") or "unknown"),
             "pattern": pattern,
@@ -188,15 +199,19 @@ def analyze(events, sample_keys, resolve, self_pid, signatures=None) -> dict:
         g = groups.setdefault(name.lower(), {"pipe": name, "created": [], "connected": [],
                                              "times": [], "sample_created": False,
                                              "other_created": False, "sample_connected": False,
-                                             "other_connected": False, "images": []})
+                                             "other_connected": False, "images": [],
+                                             "sample_created_images": [],
+                                             "sample_connected_images": []})
         in_sample = key is not None and key in sample_keys
         shown = key if key is not None else str(pid)
         role = "created" if ev["type"] == "PipeCreated" else "connected"
         if shown not in g[role]:
             g[role].append(shown)
         image = ev.get("image") or ""
-        if in_sample and image not in g["images"]:
-            g["images"].append(image)
+        if in_sample:
+            if image not in g["images"]:
+                g["images"].append(image)
+            g["sample_" + role + "_images"].append((_epoch(ts), image))
         g[("sample_" if in_sample else "other_") + role] = True
         g["times"].append((_epoch(ts), ts))
 
@@ -226,9 +241,17 @@ def analyze(events, sample_keys, resolve, self_pid, signatures=None) -> dict:
             "last_seen": timed[-1][1] if timed else (g["times"][-1][1] if g["times"] else ""),
             "flags": flags,
         })
-        findings += _flag_findings(name, flags, hit, g["images"])
+        findings += _flag_findings(name, flags, hit, g["images"], _primary_image(g))
     pipes.sort(key=lambda p: (_epoch(p["first_seen"]) or 0.0, p["pipe"].lower()))
     return {"pipes": pipes, "evidence_findings": findings}
+
+
+def _primary_image(g) -> str:
+    """Earliest sample image that created the pipe, else the earliest that connected."""
+    for seen in (g["sample_created_images"], g["sample_connected_images"]):
+        if seen:
+            return min(seen, key=lambda t: (t[0] is None, t[0] or 0.0))[1]
+    return g["images"][0] if g["images"] else ""
 
 
 SOURCE = "sysmon-pipes"
@@ -248,19 +271,29 @@ def _finding(kind, name, image, detail, weight=None, family=None):
     )
 
 
-def _flag_findings(name, flags, hit, images) -> list:
-    """One finding per flag and sample image that touched the pipe."""
+def _flag_findings(name, flags, hit, images, primary) -> list:
+    """Findings for a pipe's flags.
+
+    The C2 kind is one fact about the pipe and counts once (for `primary`):
+    per-image copies would escape saturation and add up. The other kinds are
+    emitted per sample image, because their baseline keys are per process.
+    """
     out = []
     for flag in flags:
         kind = _FLAG_KINDS.get(flag)
         if not kind:
             continue
         weight, family, detail = None, None, name
-        if kind == "pipe_c2_default" and hit:
-            weight = hit.get("weight") or KINDS[kind]["weight"]
-            family = hit.get("family")
-            detail = f"{name} ({family})" + (f" - {hit['note']}" if hit.get("note") else "")
-        for image in images or [""]:
+        targets = images or [""]
+        if kind == "pipe_c2_default":
+            targets = [primary]
+            if hit:
+                weight = hit.get("weight")
+                if weight is None:
+                    weight = KINDS[kind]["weight"]
+                family = hit.get("family")
+                detail = f"{name} ({family})" + (f" - {hit['note']}" if hit.get("note") else "")
+        for image in targets:
             out.append(_finding(kind, name, image, detail, weight=weight, family=family))
     return out
 
@@ -271,12 +304,15 @@ def _never_baselined(name: str) -> bool:
     return normalize_for_key(name).strip("\\*") == "" or looks_random(name)
 
 
-def baseline_findings(events, self_pid) -> list:
+def baseline_findings(events, self_pid, signatures=None) -> list:
     """Baseline-able (non-C2) findings for every pipe event on a clean host.
 
     Each event yields the kinds a later detonation could report for the same
     process and normalized pipe name, so they share its finding key.
+    Catalogued (C2/tool) pipes are never baselined, not even their
+    non-C2 kinds: a known implant pipe on the "clean" host is not benign.
     """
+    sigs = _default_signatures() if signatures is None else signatures
     self_pid = str(self_pid) if self_pid is not None else None
     out, seen = [], set()
     for ev in events or []:
@@ -287,6 +323,8 @@ def baseline_findings(events, self_pid) -> list:
             continue
         name = canonical_name(ev.get("pipe") or "")
         if name == "\\" or name.lower().startswith(_IGNORED_PREFIXES) or _never_baselined(name):
+            continue
+        if match_signature(name, sigs):
             continue
         image = ev.get("image") or ""
         kinds = ["pipe_cross_process"]

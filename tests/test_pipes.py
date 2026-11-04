@@ -478,11 +478,11 @@ def test_c2_pipe_not_suppressed_by_baseline(tdc):
 
 def test_baseline_suppresses_known_cross_process_pipe(tdc):
     base = pipe_analysis.baseline_findings(
-        [_pipe_ev("create", 700, r"\status_4a3f", image=SAMPLE_IMG)], self_pid=1)
+        [_pipe_ev("create", 700, r"\appsvc_4a3f", image=SAMPLE_IMG)], self_pid=1)
     assert any(f["kind"] == "pipe_cross_process" for f in base)
     assert not any(f["kind"] == "pipe_c2_default" for f in base)
     tdc._memory_baseline.add(base)
-    f = _pipe_finding("pipe_cross_process", r"\status_9c21")
+    f = _pipe_finding("pipe_cross_process", r"\appsvc_9c21")
     ev = tdc.memory_evidence.score([f], baseline=tdc._memory_baseline)
     assert ev["suppressed_count"] == 1
 
@@ -492,7 +492,7 @@ def test_random_or_wildcard_baseline_pipes_never_suppress(tdc):
         _pipe_ev("create", 700, r"\{1b2c3d4e-0000-1111-2222-333344445555}", image=SAMPLE_IMG),
         _pipe_ev("create", 700, r"\Xk9qZ2mVb7Lw4Tn", image=SAMPLE_IMG),
         _pipe_ev("create", 700, r"\1234", image=SAMPLE_IMG),
-        _pipe_ev("create", 1, r"\status_4a3f", image=SAMPLE_IMG),       # own process
+        _pipe_ev("create", 1, r"\appsvc_4a3f", image=SAMPLE_IMG),       # own process
         _pipe_ev("create", 700, r"\PSHost.1.2.powershell", image=SAMPLE_IMG),
     ], self_pid=1)
     assert base == []
@@ -507,7 +507,7 @@ def test_pipe_corroborates_memory(tdc):
     from memory_evidence import MemoryFinding
     mem = MemoryFinding(source="aether", kind="memory_signature", process="sample.exe",
                         detail="x", identity=("c", "p"), weight=1.0)
-    ev = tdc.memory_evidence.score([_pipe_finding("pipe_cross_process", r"\status_4a3f"), mem])
+    ev = tdc.memory_evidence.score([_pipe_finding("pipe_cross_process", r"\appsvc_4a3f"), mem])
     sig = [f for f in ev["findings"] if f["kind"] == "memory_signature"][0]
     assert "sysmon-pipes" in sig["corroborated_by"]
 
@@ -549,7 +549,7 @@ def test_sweep_baseline_adds_pipe_keys(tdc, monkeypatch):
 
     def fake_read(**kw):
         calls.append(kw)
-        return [_pipe_ev("create", 700, r"\status_4a3f", image=SAMPLE_IMG),
+        return [_pipe_ev("create", 700, r"\appsvc_4a3f", image=SAMPLE_IMG),
                 _pipe_ev("connect", 701, r"\svcctl", image=r"C:\Windows\System32\services.exe"),
                 _pipe_ev("create", 702, r"\msagent_5b", image=SAMPLE_IMG)]
 
@@ -557,12 +557,72 @@ def test_sweep_baseline_adds_pipe_keys(tdc, monkeypatch):
     monkeypatch.setattr(tdc, "_is_sysmon_running", lambda: True)
     monkeypatch.setattr(tdc, "_running_process_names", lambda: {})
     res = tdc._run_sweep(use_aether=False, use_processdump=False, capture_baseline=True)
-    assert res["pipe_keys_added"] >= 2
+    assert res["pipe_keys_added"] == 3      # appsvc_*, svcctl x2 kinds; msagent_5b none
     q = calls[0]
     assert q["event_ids"] == [17, 18]
     assert abs(tdc._to_epoch(q["since"]) - (tdc.time.time() - 1800)) < 60
-    f = _pipe_finding("pipe_cross_process", r"\status_9c21")
+    f = _pipe_finding("pipe_cross_process", r"\appsvc_9c21")
     assert tdc._memory_baseline.knows(f["key"])
-    assert not tdc._memory_baseline.knows(_pipe_finding("pipe_c2_default", r"\msagent_5b")["key"])
+    # The C2 pipe left no key, so a later detonation on it is fully scored.
+    assert not tdc._memory_baseline.knows(_pipe_finding("pipe_cross_process", r"\msagent_5b")["key"])
+    det = pipe_analysis.analyze([
+        _pipe_ev("create", 4072, r"\msagent_5b", "2026-11-04T10:00:00+00:00", SAMPLE_IMG),
+        _pipe_ev("connect", 5000, r"\msagent_5b", "2026-11-04T10:00:05+00:00", "rundll32.exe"),
+    ], {"4072"}, _resolve, self_pid=1)
+    ev = tdc.memory_evidence.score(det["evidence_findings"], baseline=tdc._memory_baseline)
+    assert ev["suppressed_count"] == 0
+    assert {f["kind"] for f in ev["findings"]} == {"pipe_c2_default", "pipe_cross_process"}
     scan = tdc._run_sweep(use_aether=False, use_processdump=False, capture_baseline=False)
     assert scan["pipe_keys_added"] is None
+
+
+def test_c2_pipe_counts_once_across_sample_images(tdc):
+    child = r"C:\Windows\System32\rundll32.exe"
+    events = [
+        _pipe_ev("connect", 4100, r"\msagent_5b", "2026-11-04T10:00:05+00:00", child),
+        _pipe_ev("create", 4072, r"\msagent_5b", "2026-11-04T10:00:00+00:00", SAMPLE_IMG),
+        _pipe_ev("connect", 6000, r"\msagent_5b", "2026-11-04T10:00:06+00:00", "svchost.exe"),
+    ]
+    res = pipe_analysis.analyze(events, {"4072", "4100"}, _resolve, self_pid=1)
+    c2 = [f for f in res["evidence_findings"] if f["kind"] == "pipe_c2_default"]
+    assert len(c2) == 1 and c2[0]["image_path"] == SAMPLE_IMG    # the creator
+    cross = [f for f in res["evidence_findings"] if f["kind"] == "pipe_cross_process"]
+    assert {f["process"] for f in cross} == {"sample.exe", "rundll32.exe"}
+    ev = tdc.memory_evidence.score(res["evidence_findings"])
+    assert ev["label"] == "SUSPICIOUS"
+
+
+def test_c2_finding_falls_back_to_first_connecting_image():
+    events = [
+        _pipe_ev("connect", 4100, r"\msagent_5b", "2026-11-04T10:00:09+00:00", "late.exe"),
+        _pipe_ev("connect", 4072, r"\msagent_5b", "2026-11-04T10:00:01+00:00", "early.exe"),
+        _pipe_ev("create", 6000, r"\msagent_5b", "2026-11-04T10:00:00+00:00", "outside.exe"),
+    ]
+    res = pipe_analysis.analyze(events, {"4072", "4100"}, _resolve, self_pid=1)
+    c2 = [f for f in res["evidence_findings"] if f["kind"] == "pipe_c2_default"]
+    assert [f["process"] for f in c2] == ["early.exe"]
+
+
+def test_catalog_weights_are_honoured_and_clamped(tmp_path, capsys):
+    path = tmp_path / "sigs.json"
+    path.write_text(json.dumps([
+        {"family": "Zero", "pattern": r"\zero", "match": "exact", "weight": 0, "note": "n"},
+        {"family": "None", "pattern": r"\none", "match": "exact", "note": "n"},
+        {"family": "Huge", "pattern": r"\huge", "match": "exact", "weight": 9.0, "note": "n"},
+        {"family": "Neg", "pattern": r"\neg", "match": "exact", "weight": -1, "note": "n"},
+    ]))
+    sigs = load_signatures(str(path))
+    by = {s["family"]: s["weight"] for s in sigs}
+    assert by["Zero"] == 0.0 and by["None"] is None and by["Neg"] == 0.0
+    assert by["Huge"] == pipe_analysis.MAX_SIGNATURE_WEIGHT < pipe_analysis.VERDICT_MALICIOUS
+    assert capsys.readouterr().out.count("clamped") == 2
+
+    def c2_weight(pipe):
+        res = pipe_analysis.analyze([_pipe_ev("create", 1, pipe)], {"1"}, _resolve,
+                                    self_pid=0, signatures=sigs)
+        return [f["base_weight"] for f in res["evidence_findings"]
+                if f["kind"] == "pipe_c2_default"][0]
+
+    assert c2_weight(r"\zero") == 0.0
+    assert c2_weight(r"\none") == 4.0
+    assert c2_weight(r"\huge") == pipe_analysis.MAX_SIGNATURE_WEIGHT
