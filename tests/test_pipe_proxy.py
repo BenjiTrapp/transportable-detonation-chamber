@@ -66,6 +66,13 @@ def mgr(make_manager):
     return make_manager()
 
 
+def watcher_polls(m, sid, n=2):
+    """Wait until the session's watcher has completed `n` more polls."""
+    s = m._live(sid)
+    target = s.watch_polls + n
+    assert wait_for(lambda: s.watch_polls >= target)
+
+
 def _states(m, sid):
     return [(x["dir"], x["state"]) for x in m.messages(sid)]
 
@@ -158,8 +165,8 @@ def test_session_expires_and_closes_both_ends(backend, mgr, clock):
     assert s["state"] == "ended" and s["end_reason"] == "expired"
     assert client.recv() is None
     assert server.recv() is None
-    assert not backend.exists("svc") or all(
-        i.kind == "real" for i in backend._instances if not i.closed["server"])
+    assert wait_for(lambda: all(
+        i.kind == "real" for i in backend._instances if not i.closed["server"]))
 
 
 def test_server_disappears_closes_client(backend, mgr):
@@ -189,7 +196,7 @@ def test_arm_prefix_takes_first_new_matching_pipe(backend, mgr):
     s = mgr.start(r"\postex_", "observe", "arm", "prefix")
     assert s["state"] == "armed"
     backend.fake_server("unrelated")
-    time.sleep(0.03)
+    watcher_polls(mgr, s["id"])
     assert mgr.get(s["id"])["state"] == "armed"
     server = backend.fake_server("postex_ab12")
     assert wait_for(lambda: mgr.get(s["id"])["state"] == "active")
@@ -203,7 +210,7 @@ def test_arm_prefix_takes_first_new_matching_pipe(backend, mgr):
 def test_arm_regex_and_blocklist_never_taken(backend, mgr):
     s = mgr.start(r"^\\(lsass|msagent_\d+)$", "observe", "arm", "regex")
     backend.fake_server("lsass")
-    time.sleep(0.03)
+    watcher_polls(mgr, s["id"])
     assert mgr.get(s["id"])["state"] == "armed"
     backend.fake_server("MSAGENT_42")
     assert wait_for(lambda: mgr.get(s["id"])["target"] == r"\MSAGENT_42")
@@ -215,7 +222,9 @@ def test_squat_creates_first_instance_and_waits_for_real_server(backend, mgr):
     assert backend.created == [(r"\sq", "byte", True)]
     client = backend.fake_client("sq")
     client.send(b"early")
-    time.sleep(0.03)
+    attempts = backend.connect_attempts
+    assert wait_for(lambda: backend.connect_attempts >= attempts + 2)   # upstream retries
+    assert mgr.get(s["id"])["state"] == "active"
     server = backend.fake_server("sq")
     assert server.recv() == b"early"
     server.send(b"late")
@@ -303,8 +312,9 @@ def test_stop_persists_and_new_manager_lists_ended(backend, make_manager, tmp_pa
     s = m.stop(sid)
     assert s["state"] == "ended" and s["end_reason"] == "stopped"
     assert m.stop(sid)["state"] == "ended"
-    assert server.recv(timeout=0.05) is None
-    assert m.messages(sid)[0]["state"] == "dropped"
+    assert server.recv() == b"ping"            # held messages are forwarded on stop
+    assert server.recv() is None
+    assert m.messages(sid)[0]["state"] == "auto_passed"
     path = tmp_path / "sessions" / f"{sid}.json"
     doc = json.loads(path.read_text())
     assert doc["session"]["id"] == sid
@@ -341,3 +351,143 @@ def test_win32_backend_imports_and_guards_constructor():
     if pipe_backends.os.name != "nt":
         with pytest.raises(RuntimeError):
             pipe_proxy.Win32PipeBackend()
+
+
+def test_watcher_retries_failed_attach_and_reports_error(backend, mgr, monkeypatch):
+    real_create = backend.create_server
+    calls = []
+
+    def flaky(name, mode, first_instance):
+        calls.append(name)
+        if len(calls) < 3:
+            raise OSError("instance limit")
+        return real_create(name, mode, first_instance)
+
+    monkeypatch.setattr(backend, "create_server", flaky)
+    sid = mgr.start("postex_", "observe", "arm", "prefix")["id"]
+    backend.fake_server("postex_1")
+    assert wait_for(lambda: mgr.get(sid)["state"] == "active")
+    assert len(calls) == 3 and "instance limit" in mgr.get(sid)["last_error"]
+
+
+def test_watcher_gives_up_after_bounded_retries(backend, mgr, monkeypatch):
+    calls = []
+
+    def broken(name, mode, first_instance):
+        calls.append(name)
+        raise OSError("nope")
+
+    monkeypatch.setattr(backend, "create_server", broken)
+    sid = mgr.start("postex_", "observe", "arm", "prefix")["id"]
+    backend.fake_server("postex_1")
+    assert wait_for(lambda: len(calls) == pipe_proxy.WATCH_RETRIES)
+    watcher_polls(mgr, sid, 3)
+    assert len(calls) == pipe_proxy.WATCH_RETRIES
+    assert mgr.get(sid)["state"] == "armed"
+
+
+def test_blocked_write_does_not_stall_timers_or_act(backend, make_manager, clock):
+    m = make_manager(drain_timeout=0.1)
+    stuck_server = backend.fake_server("stuck", mode="message")
+    slow_server = backend.fake_server("slow")
+    backend.fake_server("short")
+    stuck = m.start("stuck", "hold", "attach", "exact")["id"]
+    slow = m.start("slow", "hold", "attach", "exact", hold_timeout=30)["id"]
+    short = m.start("short", "observe", "attach", "exact", max_duration=5)["id"]
+    short_client = backend.fake_client("short")
+
+    backend.block_writes("stuck")
+    stuck_client = backend.fake_client("stuck")
+    stuck_client.send(b"m1")
+    stuck_client.send(b"m2")
+    assert wait_for(lambda: len(m.messages(stuck)) == 2)
+    first, second = [x["seq"] for x in m.messages(stuck)]
+    m.act(stuck, first, "forward")             # the pump now blocks writing m1
+    assert wait_for(lambda: m._live(stuck).conns[0].dirs["c2s"].writing)
+
+    t0 = time.monotonic()
+    m.act(stuck, second, "forward")
+    assert m.release_all(stuck) == 0
+    assert time.monotonic() - t0 < 0.2
+
+    slow_client = backend.fake_client("slow")
+    slow_client.send(b"later")
+    assert wait_for(lambda: len(m.messages(slow)) == 1)
+    clock.advance(31)
+    t0 = time.monotonic()
+    m.check_timers()
+    assert time.monotonic() - t0 < 0.2
+    assert slow_server.recv() == b"later"
+    assert m.messages(slow)[0]["state"] == "auto_passed"
+    assert m.get(short)["state"] == "ended"
+    assert short_client.recv() is None
+
+    t0 = time.monotonic()
+    m.stop(stuck)                               # drains briefly, then closes the stuck write
+    assert time.monotonic() - t0 < 1.5
+    assert stuck_client.recv() is None
+    assert stuck_server.recv(timeout=0.05) is None
+
+
+def test_win32_client_opens_are_identification_only(monkeypatch):
+    import pipe_backends
+    if pipe_backends.wt is None:
+        pytest.skip("ctypes.wintypes unavailable")
+    assert pipe_backends.CLIENT_OPEN_FLAGS & 0x00100000      # SECURITY_SQOS_PRESENT
+    assert pipe_backends.CLIENT_OPEN_FLAGS & 0x00010000      # SECURITY_IDENTIFICATION
+    assert pipe_backends.CLIENT_OPEN_FLAGS & pipe_backends.FILE_FLAG_OVERLAPPED
+
+    class K32:
+        def __init__(self):
+            self.calls = []
+
+        def CreateFileW(self, path, access, share, sa, disposition, flags, template):
+            self.calls.append(("CreateFileW", path, flags))
+            return 4242
+
+        def GetNamedPipeInfo(self, h, flags, *rest):
+            return 0
+
+        def CancelIoEx(self, h, ov):
+            self.calls.append(("CancelIoEx", h))
+            return 1
+
+        def CloseHandle(self, h):
+            self.calls.append(("CloseHandle", h))
+            return 1
+
+    k32 = K32()
+    monkeypatch.setattr(pipe_backends, "_k32", k32)
+    b = pipe_backends.Win32PipeBackend()
+    h = b.connect("svc", 1.0)
+    assert h.mode == "byte"
+    b.close(h)
+    assert b.pipe_mode(r"\\.\pipe\svc") == "byte"
+    opens = [c for c in k32.calls if c[0] == "CreateFileW"]
+    assert [c[1] for c in opens] == [r"\\.\pipe\svc"] * 2
+    assert all(c[2] == pipe_backends.CLIENT_OPEN_FLAGS for c in opens)
+    assert k32.calls.count(("CloseHandle", 4242)) == 2
+
+
+def test_win_handle_close_waits_for_in_flight_io():
+    import pipe_backends
+    events = []
+    h = pipe_backends._WinHandle(7, "byte", cancel=lambda v: events.append(("cancel", v)),
+                                 closer=lambda v: events.append(("close", v)))
+    assert h.acquire() and h.acquire()
+    h.close()
+    assert events == [("cancel", 7)]           # pending I/O cancelled, value not freed
+    assert not h.acquire()                     # no new I/O after close
+    h.release()
+    assert events == [("cancel", 7)]
+    h.release()
+    assert events == [("cancel", 7), ("close", 7)]
+    h.close()
+    assert events == [("cancel", 7), ("close", 7)]
+
+    idle = pipe_backends._WinHandle(8, "byte", cancel=lambda v: events.append(("cancel", v)),
+                                    closer=lambda v: events.append(("close", v)))
+    idle.close()
+    idle.close()
+    assert events[-1] == ("close", 8) and events.count(("close", 8)) == 1
+    assert ("cancel", 8) not in events

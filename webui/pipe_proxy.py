@@ -12,8 +12,14 @@ evaluated by `check_timers()`, which a daemon ticker thread calls every
 `tick_interval` seconds (None disables the ticker, as in the tests). I/O waits
 use real time with short `io_timeout` slices so every thread notices `stop()`.
 
-Lock order: direction write lock -> session lock. The manager lock only guards
-the session dict and is never held while taking another lock.
+Each direction's pump thread is its only writer: `act`, `release_all` and
+`check_timers` only change message states and wake the pump, so HTTP handlers
+and the ticker never wait behind a stalled pipe write. `stop()` forwards
+still-held messages (state `auto_passed`), gives the pumps up to
+`drain_timeout` seconds to write them, then closes every handle.
+
+Locks: the manager lock only guards the session dict and is never held while
+taking a session lock; no I/O happens under either lock.
 """
 
 import base64
@@ -39,6 +45,7 @@ MATCHES = ("exact", "prefix", "regex")
 ACTIONS = ("forward", "drop", "edit")
 _SID_FILE_RE = re.compile(r"^[0-9a-f]{12}\.json$")
 _JOIN_TIMEOUT = 2.0
+WATCH_RETRIES = 3
 
 
 def _key(name):
@@ -63,7 +70,8 @@ class _Direction:
         self.dst = dst
         self.queue = deque()
         self.eof = False
-        self.wlock = threading.Lock()
+        self.writing = False
+        self.wake = threading.Event()
 
 
 class _Conn:
@@ -103,6 +111,8 @@ class _Session:
         self.next_seq = 1
         self.recorded_bytes = 0
         self.recording_truncated = False
+        self.last_error = None
+        self.watch_polls = 0
         self.regex = re.compile(pattern, re.IGNORECASE) if match == "regex" else None
 
     def matches(self, name):
@@ -118,7 +128,7 @@ class InterceptManager:
     def __init__(self, backend, store_dir, clock=time.time, tick_interval: Optional[float] = 1.0,
                  io_timeout: float = 0.25, poll_interval: float = 0.5,
                  connect_timeout: float = 5.0, max_message_log: int = MAX_MESSAGE_LOG,
-                 max_session_record: int = MAX_SESSION_RECORD):
+                 max_session_record: int = MAX_SESSION_RECORD, drain_timeout: float = 2.0):
         self.backend = backend
         self.store_dir = store_dir
         self.clock = clock
@@ -128,6 +138,8 @@ class InterceptManager:
         self.connect_timeout = connect_timeout
         self.max_message_log = max_message_log
         self.max_session_record = max_session_record
+        self.drain_timeout = drain_timeout
+        self._finishers = []
         self._lock = threading.Lock()
         self._sessions = {}
         self._persisted = {}
@@ -206,33 +218,13 @@ class InterceptManager:
         return self.get(s.id)
 
     def stop(self, sid: str, reason: str = "stopped") -> dict:
+        """End a session: still-held messages are forwarded (`auto_passed`) and
+        written within `drain_timeout`, then both ends of every connection close."""
         s = self._live(sid)
         if s is None:
             return self.get(sid)
-        with s.lock:
-            if s.ended:
-                return self._meta(s)
-            s.ended = True
-            s.state = "ended"
-            s.end_reason = reason
-            s.ended_at = self.clock()
-            for item in s.pending.values():
-                if item.state == "held":
-                    self._set_state(item, "dropped")
-            handles = list(s.handles)
-            s.handles.clear()
-            threads = list(s.threads)
-        s.stop_evt.set()
-        for h in handles:
-            self._close_quiet(h)
-        me = threading.current_thread()
-        for t in threads:
-            if t is not me:
-                t.join(_JOIN_TIMEOUT)
-                if t.is_alive():
-                    print(f"[pipe_proxy] session {sid}: thread {t.name} did not stop")
-        self._persist(s)
-        print(f"[pipe_proxy] session {sid} ended ({reason})")
+        if self._begin_stop(s, reason):
+            self._finish_stop(s)
         return self.get(sid)
 
     def get(self, sid: str) -> dict:
@@ -312,8 +304,7 @@ class InterceptManager:
                 item.data = new
                 self._set_state(item, "edited")
             rec = dict(item.rec)
-            direction = item.direction
-        self._flush(s, direction)
+            item.direction.wake.set()
         return rec
 
     def release_all(self, sid: str) -> int:
@@ -321,38 +312,46 @@ class InterceptManager:
         if s is None:
             self.get(sid)
             return 0
-        dirs = set()
         released = 0
         with s.lock:
             for item in s.pending.values():
                 if item.state == "held":
                     self._set_state(item, "passed")
-                    dirs.add(item.direction)
+                    item.direction.wake.set()
                     released += 1
-        for d in dirs:
-            self._flush(s, d)
         return released
 
     def check_timers(self) -> None:
+        """Expire sessions and auto-forward overdue held messages.
+
+        Never does pipe I/O and never waits for a pump: expired sessions are
+        torn down on their own thread.
+        """
         now = self.clock()
         with self._lock:
             sessions = list(self._sessions.values())
+        expired = []
         for s in sessions:
             with s.lock:
                 if s.ended:
                     continue
-                expired = now - s.started >= s.max_duration
-                dirs = set()
-                if not expired and s.mode == "hold":
-                    for item in s.pending.values():
-                        if item.state == "held" and now - item.held_at >= s.hold_timeout:
-                            self._set_state(item, "auto_passed")
-                            dirs.add(item.direction)
-            if expired:
-                self.stop(s.id, "expired")
-                continue
-            for d in dirs:
-                self._flush(s, d)
+                if now - s.started >= s.max_duration:
+                    expired.append(s)
+                    continue
+                if s.mode != "hold":
+                    continue
+                for item in s.pending.values():
+                    if item.state == "held" and now - item.held_at >= s.hold_timeout:
+                        self._set_state(item, "auto_passed")
+                        item.direction.wake.set()
+        for s in expired:
+            if self._begin_stop(s, "expired"):
+                t = threading.Thread(target=self._finish_stop, args=(s,), daemon=True,
+                                     name=f"pipe_proxy-{s.id}-stop")
+                with self._lock:
+                    self._finishers = [f for f in self._finishers if f.is_alive()]
+                    self._finishers.append(t)
+                    t.start()
 
     def shutdown(self) -> None:
         self._shutdown.set()
@@ -360,11 +359,58 @@ class InterceptManager:
             sids = list(self._sessions)
         for sid in sids:
             self.stop(sid, "shutdown")
-        t = self._ticker
-        if t is not None and t is not threading.current_thread():
-            t.join(_JOIN_TIMEOUT)
+        with self._lock:
+            waiters = list(self._finishers)
+            t = self._ticker
+            if t is not None:
+                waiters.append(t)
+        me = threading.current_thread()
+        for t in waiters:
+            if t is not me:
+                t.join(_JOIN_TIMEOUT)
 
     # ------------------------------------------------------------- internals
+
+    def _begin_stop(self, s, reason):
+        """Mark `s` ended (synchronously); returns False if it already was."""
+        with s.lock:
+            if s.ended:
+                return False
+            s.ended = True
+            s.state = "ended"
+            s.end_reason = reason
+            s.ended_at = self.clock()
+            for item in s.pending.values():
+                if item.state == "held":
+                    self._set_state(item, "auto_passed")
+            for c in s.conns:
+                for d in c.dirs.values():
+                    d.wake.set()
+        return True
+
+    def _finish_stop(self, s):
+        deadline = time.monotonic() + self.drain_timeout
+        while time.monotonic() < deadline:
+            with s.lock:
+                busy = any(d.queue or d.writing for c in s.conns for d in c.dirs.values())
+            if not busy:
+                break
+            time.sleep(0.005)
+        with s.lock:
+            handles = list(s.handles)
+            s.handles.clear()
+            threads = list(s.threads)
+        s.stop_evt.set()
+        for h in handles:
+            self._close_quiet(h)
+        me = threading.current_thread()
+        for t in threads:
+            if t is not me:
+                t.join(_JOIN_TIMEOUT)
+                if t.is_alive():
+                    print(f"[pipe_proxy] session {s.id}: thread {t.name} did not stop")
+        self._persist(s)
+        print(f"[pipe_proxy] session {s.id} ended ({s.end_reason})")
 
     def _live(self, sid):
         with self._lock:
@@ -380,7 +426,7 @@ class InterceptManager:
             "active_connections": sum(1 for c in s.conns if c.open_dirs > 0),
             "message_count": len(s.messages), "held_count": held,
             "recorded_bytes": s.recorded_bytes, "recording_truncated": s.recording_truncated,
-            "end_reason": s.end_reason,
+            "end_reason": s.end_reason, "last_error": s.last_error,
         }
 
     @staticmethod
@@ -447,41 +493,60 @@ class InterceptManager:
             self._close_quiet(h)
         return ok
 
+    def _note_error(self, s, msg):
+        print(f"[pipe_proxy] session {s.id}: {msg}")
+        with s.lock:
+            s.last_error = msg
+
     def _watch(self, s, known):
-        while not s.stop_evt.wait(self.poll_interval):
+        failures = {}
+        while not s.ended and not s.stop_evt.wait(self.poll_interval):
             try:
                 names = self.backend.list_pipes()
             except OSError as e:
-                print(f"[pipe_proxy] session {s.id}: list_pipes failed: {e}")
+                self._note_error(s, f"list_pipes failed: {e}")
                 continue
             current = {}
             for n in names:
                 current.setdefault(_key(n), canonical_name(n))
             known &= set(current)
+            for k in list(failures):
+                if k not in current:
+                    del failures[k]
+            taken = False
             for k in sorted(current):
                 if k in known:
                     continue
-                known.add(k)
                 name = current[k]
                 if k in BLOCKLIST or not s.matches(name):
+                    known.add(k)
                     continue
                 try:
                     mode = s.pipe_mode_hint or self.backend.pipe_mode(name)
                     h = self.backend.create_server(name, mode, False)
                 except OSError as e:
-                    print(f"[pipe_proxy] session {s.id}: cannot attach to {name}: {e}")
+                    failures[k] = failures.get(k, 0) + 1
+                    if failures[k] >= WATCH_RETRIES:
+                        known.add(k)
+                    self._note_error(s, f"cannot attach to {name} "
+                                        f"(try {failures[k]}/{WATCH_RETRIES}): {e}")
                     continue
                 print(f"[pipe_proxy] session {s.id}: armed watcher took {name} ({mode})")
                 self._activate(s, name, mode, h)
+                taken = True
+                break
+            with s.lock:
+                s.watch_polls += 1
+            if taken:
                 return
 
     def _accept_loop(self, s, h):
-        while not s.stop_evt.is_set():
+        while not s.ended:
             if h is None:
                 try:
                     h = self.backend.create_server(s.target, s.pipe_mode, False)
                 except OSError as e:
-                    print(f"[pipe_proxy] session {s.id}: create_server failed: {e}")
+                    self._note_error(s, f"create_server failed: {e}")
                     s.stop_evt.wait(self.poll_interval)
                     continue
                 if not self._track(s, h):
@@ -489,7 +554,7 @@ class InterceptManager:
             try:
                 connected = self.backend.accept(h, self.io_timeout)
             except OSError as e:
-                print(f"[pipe_proxy] session {s.id}: accept failed: {e}")
+                self._note_error(s, f"accept failed: {e}")
                 self._close(s, h)
                 h = None
                 s.stop_evt.wait(self.poll_interval)
@@ -506,12 +571,12 @@ class InterceptManager:
     def _connect_upstream(self, s):
         # No proxy instance is listening here, so this cannot reach ourselves.
         deadline = time.monotonic() + self.connect_timeout
-        while not s.stop_evt.is_set():
+        while not s.ended:
             try:
                 up = self.backend.connect(s.target, self.io_timeout)
             except OSError as e:
                 if not s.squat and time.monotonic() >= deadline:
-                    print(f"[pipe_proxy] session {s.id}: no upstream for {s.target}: {e}")
+                    self._note_error(s, f"no upstream for {s.target}: {e}")
                     return None
                 if isinstance(e, FileNotFoundError):
                     s.stop_evt.wait(self.io_timeout)
@@ -536,22 +601,38 @@ class InterceptManager:
             print(f"[pipe_proxy] session {s.id}: connection {conn.id} on {s.target}")
 
     def _pump(self, s, d):
+        """Read `d.src`, record, and write decided messages to `d.dst`.
+
+        This thread is the only writer of its direction. After EOF or session
+        end it stops reading and only drains the queue.
+        """
         while not s.stop_evt.is_set():
+            self._flush(s, d)
+            with s.lock:
+                reading = not d.eof and not s.ended
+                if not reading and not d.queue:
+                    break
+            if not reading:
+                d.wake.wait(self.io_timeout)
+                d.wake.clear()
+                continue
             try:
                 data = self.backend.read(d.src, self.io_timeout)
             except OSError as e:
                 print(f"[pipe_proxy] session {s.id}: read {d.name} failed: {e}")
                 data = None
             if data is None:
-                break
-            if data:
+                with s.lock:
+                    d.eof = True
+            elif data:
                 self._record(s, d, data)
-                self._flush(s, d)
         with s.lock:
-            d.eof = True
             d.conn.open_dirs -= 1
-        self._flush(s, d)
-        self._close(s, d.src)
+            eof = d.eof
+        if eof:
+            # The source went away: propagate the close to the other side.
+            self._close(s, d.src)
+            self._close(s, d.dst)
 
     def _record(self, s, d, data):
         now = self.clock()
@@ -578,23 +659,26 @@ class InterceptManager:
             s.pending[seq] = item
 
     def _flush(self, s, d):
-        """Write every decided message at the head of `d`'s queue, in order."""
-        with d.wlock:
-            while True:
-                with s.lock:
-                    if not d.queue or d.queue[0].state == "held" or s.ended:
-                        close_dst = d.eof and not d.queue
-                        break
-                    item = d.queue.popleft()
-                    s.pending.pop(item.seq, None)
+        """Write every decided message at the head of `d`'s queue, in order.
+
+        Only called from `d`'s pump thread, so writes need no lock.
+        """
+        while True:
+            with s.lock:
+                if not d.queue or d.queue[0].state == "held":
+                    return
+                item = d.queue.popleft()
+                s.pending.pop(item.seq, None)
                 if item.state == "dropped":
                     continue
-                try:
-                    self.backend.write(d.dst, item.data)
-                except OSError as e:
-                    print(f"[pipe_proxy] session {s.id}: write {d.name} #{item.seq} failed: {e}")
-        if close_dst:
-            self._close(s, d.dst)
+                d.writing = True
+            try:
+                self.backend.write(d.dst, item.data)
+            except OSError as e:
+                print(f"[pipe_proxy] session {s.id}: write {d.name} #{item.seq} failed: {e}")
+            finally:
+                with s.lock:
+                    d.writing = False
 
     def _persist(self, s):
         with s.lock:
