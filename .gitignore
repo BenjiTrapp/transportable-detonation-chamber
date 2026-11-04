@@ -29,3 +29,8 @@ prebuilt/
 webui/scan_history.json
 webui/memory_baseline.json
 webui/memory_results/
+
+# Subagent-driven development scratch (ledger, briefs, review packages)
+.superpowers/
+# Pipe interception recordings
+webui/pipe_sessions/
