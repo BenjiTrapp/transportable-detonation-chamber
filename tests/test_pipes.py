@@ -362,6 +362,118 @@ def test_pipe_activity_for_scopes_to_sample_subtree(tdc, monkeypatch):
     assert tdc._to_epoch(q["until"]) - tdc._to_epoch(q["since"]) == 60 + tdc._AGENT_PID_WINDOW
 
 
+def _filtering_read(tdc, procs, pipes, calls):
+    """A `_read_sysmon_events` stand-in that honours the pid, pipe_names,
+    since/until and max_events filters (newest first, like wevtutil /rd:true)."""
+
+    def fake_read(**kw):
+        calls.append(kw)
+        if kw.get("event_ids") != [17, 18]:
+            return list(procs)
+        out = list(pipes)
+        pids = kw.get("pid")
+        if pids is not None:
+            pids = {str(p) for p in (pids if isinstance(pids, (list, tuple, set)) else [pids])}
+            out = [e for e in out if str(e["pid"]) in pids]
+        if kw.get("pipe_names") is not None:
+            out = [e for e in out if e["pipe"] in kw["pipe_names"]]
+        lo, hi = tdc._to_epoch(kw.get("since")), tdc._to_epoch(kw.get("until"))
+        out = [e for e in out if (lo is None or tdc._to_epoch(e["timestamp"]) >= lo)
+               and (hi is None or tdc._to_epoch(e["timestamp"]) < hi)]
+        out.sort(key=lambda e: tdc._to_epoch(e["timestamp"]), reverse=True)
+        return out[:kw.get("max_events", 100)]
+    return fake_read
+
+
+def _scoped_setup(tdc, monkeypatch, procs, pipes):
+    calls = []
+    monkeypatch.setattr(tdc, "_is_sysmon_running", lambda: True)
+    monkeypatch.setattr(tdc, "_read_sysmon_events", _filtering_read(tdc, procs, pipes, calls))
+    monkeypatch.setattr(tdc, "_load_submissions", lambda: [
+        {"agent_pid": 4072, "timestamp": "2026-11-04T09:59:59", "sha256": "ab" * 32,
+         "filename": "sample.exe"}])
+    tdc._pipe_cache.clear()
+    return calls
+
+
+def test_pipe_activity_queries_subtree_first_despite_unrelated_noise(tdc, monkeypatch):
+    from test_process_instances import _sysmon_create
+
+    procs = [
+        _sysmon_create(4072, _local(10, 0, 0), r"C:\Users\Public\sample.exe", 2964),
+        _sysmon_create(4100, _local(10, 0, 3), r"C:\Windows\System32\rundll32.exe", 4072),
+        _sysmon_create(6000, _local(9, 0, 0), r"C:\Windows\System32\svchost.exe", 1),
+    ]
+    noise = [_pipe_ev("create", 7000 + i % 50, rf"\noise{i}", _local(10, 1 + i // 100, i % 60))
+             for i in range(2500)]
+    pipes = [
+        _pipe_ev("create", 4100, r"\msagent_5b", _local(10, 0, 4)),     # the oldest event
+        _pipe_ev("connect", 6000, r"\msagent_5b", _local(10, 0, 6)),
+        _pipe_ev("create", 4072, "\\it's", _local(10, 0, 7)),
+    ] + noise
+    calls = _scoped_setup(tdc, monkeypatch, procs, pipes)
+    res = tdc._pipe_activity_for(4072, sha256="ab" * 32)
+    assert res["available"] is True
+    by = {p["pipe"]: p for p in res["pipes"]}
+    assert set(by) == {r"\msagent_5b", "\\it's"}
+    assert by[r"\msagent_5b"]["created_by"] == ["4100"]
+    assert by[r"\msagent_5b"]["connected_by"] == ["6000"]           # found by name
+    assert "cross_process" in by[r"\msagent_5b"]["flags"]
+    pq = [c for c in calls if c.get("event_ids") == [17, 18]]
+    by_pid = [c for c in pq if c.get("pid") is not None]
+    by_name = [c for c in pq if c.get("pipe_names") is not None]
+    assert by_pid and all(set(map(str, c["pid"])) <= {"4072", "4100"} for c in by_pid)
+    # Quotes would break the XPath literal: such names are never queried.
+    assert by_name and [n for c in by_name for n in c["pipe_names"]] == [r"\msagent_5b"]
+    assert all(c.get("pid") is not None or c.get("pipe_names") is not None for c in pq)
+    assert res["truncated"] is True                  # \it's peers could not be looked up
+
+
+def test_pipe_activity_name_query_is_capped(tdc, monkeypatch):
+    from test_process_instances import _sysmon_create
+
+    procs = [_sysmon_create(4072, _local(10, 0, 0), r"C:\Users\Public\sample.exe", 2964)]
+    pipes = [_pipe_ev("create", 4072, rf"\p{i:02d}", _local(10, 0, i)) for i in range(30)]
+    calls = _scoped_setup(tdc, monkeypatch, procs, pipes)
+    res = tdc._pipe_activity_for(4072)
+    assert len(res["pipes"]) == 30 and res["truncated"] is True
+    names = [n for c in calls if c.get("pipe_names") for n in c["pipe_names"]]
+    assert len(names) == tdc._PIPE_NAME_QUERY_MAX == 20
+    assert names == [rf"\p{i:02d}" for i in range(20)]              # oldest first
+
+
+def test_pipe_activity_until_is_bounded_by_subtree_exit(tdc, monkeypatch):
+    from test_process_instances import _sysmon_create
+
+    procs = [
+        _sysmon_create(4072, _local(10, 0, 0), r"C:\Users\Public\sample.exe", 2964),
+        _sysmon_create(4100, _local(10, 0, 3), r"C:\Windows\System32\rundll32.exe", 4072),
+        {"event_id": 5, "pid": "4072", "timestamp": _local(10, 2, 0)},
+        {"event_id": 5, "pid": "4100", "timestamp": _local(10, 5, 0)},
+    ]
+    pipes = [_pipe_ev("create", 4100, r"\msagent_5b", _local(10, 0, 4))]
+    calls = _scoped_setup(tdc, monkeypatch, procs, pipes)
+    res = tdc._pipe_activity_for(4072)
+    assert [p["pipe"] for p in res["pipes"]] == [r"\msagent_5b"]
+    pq = [c for c in calls if c.get("event_ids") == [17, 18]]
+    assert pq and all(tdc._to_epoch(c["until"]) == tdc._to_epoch(_local(10, 5, 0)) + 60
+                      for c in pq)
+
+    # A process still running keeps the submission window.
+    calls = _scoped_setup(tdc, monkeypatch, procs[:3], pipes)
+    tdc._pipe_activity_for(4072)
+    q = [c for c in calls if c.get("event_ids") == [17, 18]][0]
+    assert tdc._to_epoch(q["until"]) - tdc._to_epoch(q["since"]) == 60 + tdc._AGENT_PID_WINDOW
+
+
+def test_sysmon_xpath_pipe_names(tdc):
+    q = tdc._sysmon_xpath([17, 18], pipe_names=[r"\a", r"\b c"])
+    assert "EventData[Data[@Name='PipeName']='\\a' or Data[@Name='PipeName']='\\b c']" in q
+    import pytest
+    with pytest.raises(ValueError):
+        tdc._sysmon_xpath([17], pipe_names=["\\x' or '1'='1"])
+
+
 def test_pipe_activity_unavailable_without_sysmon(tdc):
     tdc._pipe_cache.clear()
     res = tdc._pipe_activity_for(4072)

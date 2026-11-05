@@ -3335,13 +3335,24 @@ def api_sysmon_stats():
         return jsonify({"online": False, "error": str(e), "stats": []})
 
 
-def _sysmon_xpath(event_ids=None, since=None, pid=None, parent_pid=None, until=None):
+def _xpath_safe_name(name):
+    """True if `name` can sit inside a quoted XPath literal on wevtutil's
+    command line. Pipe names come from samples: no quotes, no control
+    characters, bounded length."""
+    return isinstance(name, str) and 0 < len(name) <= 256 and \
+        not any(c in name for c in "'\"") and name.isprintable()
+
+
+def _sysmon_xpath(event_ids=None, since=None, pid=None, parent_pid=None, until=None,
+                  pipe_names=None):
     """XPath for wevtutil: lets the event log do the filtering.
 
     Filtering in the log matters for correctness, not only speed: with
     -MaxEvents applied first and the ID/PID filter afterwards, busy event types
     (image loads, process access) pushed the requested ones out of the window.
-    `pid` may be a list: events of any of these PIDs.
+    `pid` may be a list: events of any of these PIDs. `pipe_names`: events
+    whose PipeName equals one of them (ValueError for names that fail
+    `_xpath_safe_name`).
     """
     system = []
     ids = [int(i) for i in (event_ids or []) if str(i).isdigit()]
@@ -3370,11 +3381,18 @@ def _sysmon_xpath(event_ids=None, since=None, pid=None, parent_pid=None, until=N
             clause = "EventData[" + " or ".join(
                 f"Data[@Name='{field}']='{int(v)}'" for v in values) + "]"
             query = (query[:-1] + f" and {clause}]") if query != "*" else f"*[{clause}]"
+    if pipe_names:
+        bad = [n for n in pipe_names if not _xpath_safe_name(n)]
+        if bad:
+            raise ValueError(f"pipe name not usable in an XPath query: {bad[0]!r}")
+        clause = "EventData[" + " or ".join(
+            f"Data[@Name='PipeName']='{n}'" for n in pipe_names) + "]"
+        query = (query[:-1] + f" and {clause}]") if query != "*" else f"*[{clause}]"
     return query
 
 
 def _read_sysmon_events(max_events=100, since=None, pid=None, event_id=None, event_ids=None,
-                        parent_pid=None, until=None):
+                        parent_pid=None, until=None, pipe_names=None):
     """Read Sysmon events from the Windows Event Log with full field extraction.
 
     Uses wevtutil with an XPath filter and parses the XML here. The former
@@ -3384,7 +3402,8 @@ def _read_sysmon_events(max_events=100, since=None, pid=None, event_id=None, eve
     import xml.etree.ElementTree as ET
     max_events = max(1, min(int(max_events or 100), 5000))
     ids = list(event_ids or ([event_id] if event_id else []))
-    query = _sysmon_xpath(ids, since=since, pid=pid, parent_pid=parent_pid, until=until)
+    query = _sysmon_xpath(ids, since=since, pid=pid, parent_pid=parent_pid, until=until,
+                          pipe_names=pipe_names)
     try:
         raw, proc = _wevtutil_query("Microsoft-Windows-Sysmon/Operational", query,
                                     count=max_events, timeout=30)
@@ -4227,13 +4246,8 @@ def _pipe_activity_for(pid, sha256=None, at=None):
 
     try:
         proc_map, _ = _build_full_process_map()
-        raw_events = _read_sysmon_events(event_ids=[17, 18], since=since, until=until, max_events=2000)
     except Exception as e:
         return {"available": False, "reason": str(e), "pipes": [], "evidence_findings": []}
-    errors = [e for e in raw_events if isinstance(e, dict) and "error" in e]
-    events = [e for e in raw_events if isinstance(e, dict) and "error" not in e]
-    if errors and not events:
-        return {"available": False, "reason": errors[0]["error"], "pipes": [], "evidence_findings": []}
 
     instances = _PidInstances(proc_map)
     sample_key = instances.resolve(pid, anchor) if anchor is not None else instances.resolve_key(str(pid))
@@ -4254,6 +4268,7 @@ def _pipe_activity_for(pid, sha256=None, at=None):
         # Descendants cannot be found without the ProcessCreate.
         sentinel = f"{pid}?"
         sample_keys = {sentinel}
+        pids = [str(pid)]
 
         def resolve(p, ts):
             key = instances.resolve(p, ts)
@@ -4268,18 +4283,92 @@ def _pipe_activity_for(pid, sha256=None, at=None):
                 continue
             sample_keys.add(key)
             todo.extend((proc_map.get(key) or {}).get("children") or [])
+        nodes = [proc_map[k] for k in sample_keys if k in proc_map]
+        # Once the whole subtree has exited, nothing later belongs to it.
+        _, life_until = _instance_window(nodes)
+        if life_until and (until is None or _to_epoch(life_until) < _to_epoch(until)):
+            until = life_until
+        pids = sorted({str(n.get("pid")) for n in nodes if str(n.get("pid") or "").isdigit()},
+                      key=int)
 
         def resolve(p, ts):
             return instances.resolve(p, ts)
 
+    raw_events, truncated = _pipe_events_for(pids, sample_keys, resolve, since, until)
+    errors = [e for e in raw_events if isinstance(e, dict) and "error" in e]
+    events = [e for e in raw_events if isinstance(e, dict) and "error" not in e]
+    if errors and not events:
+        return {"available": False, "reason": errors[0]["error"], "pipes": [], "evidence_findings": []}
+
     result = pipe_analysis.analyze(events, sample_keys, resolve, self_pid=os.getpid())
     result["available"] = True
-    result["truncated"] = len(raw_events) >= 2000
+    result["truncated"] = truncated
     _pipe_cache[cache_key] = (time.time(), result)
     if len(_pipe_cache) > 200:
         oldest = min(_pipe_cache, key=lambda k: _pipe_cache[k][0])
         _pipe_cache.pop(oldest, None)
     return result
+
+
+_PIPE_ACTIVITY_MAX_EVENTS = 2000
+_PIPE_NAME_QUERY_MAX = 20       # pipe names whose other parties are looked up
+_PIPE_XPATH_NAMES = 5           # pipe names per XPath query
+
+
+def _pipe_events_for(pids, sample_keys, resolve, since, until):
+    """Sysmon EID 17/18 for a detonation, queried pipe-first.
+
+    First the subtree's own events (PID-list queries), so the busy rest of
+    the host cannot push the sample's events out of the event cap; then the
+    events of every process on the pipes the sample touched (name equality
+    queries), so other parties are still seen for cross_process. Returns
+    (events, truncated); `truncated` is also set when pipe names were not
+    looked up (over `_PIPE_NAME_QUERY_MAX`, or not safe in an XPath literal).
+    """
+    self_pid = os.getpid()
+    truncated = len(pids) > _GRAPH_PIPE_MAX_PIDS
+    pids = [p for p in pids if p != str(self_pid)][:_GRAPH_PIPE_MAX_PIDS]
+    events, seen = [], set()
+
+    def add(raw):
+        nonlocal truncated
+        raw = raw if isinstance(raw, list) else []
+        if len(raw) >= _PIPE_ACTIVITY_MAX_EVENTS:
+            truncated = True
+        for ev in raw:
+            if not isinstance(ev, dict):
+                continue
+            ident = None if "error" in ev else \
+                (ev.get("type"), str(ev.get("pid")), ev.get("pipe"), ev.get("timestamp"))
+            if ident is not None and ident in seen:
+                continue
+            seen.add(ident)
+            events.append(ev)
+
+    for i in range(0, len(pids), _PIPE_XPATH_PIDS):
+        add(_read_sysmon_events(event_ids=[17, 18], since=since, until=until,
+                                pid=pids[i:i + _PIPE_XPATH_PIDS],
+                                max_events=_PIPE_ACTIVITY_MAX_EVENTS))
+
+    names, wanted = [], set()
+    own = sorted((ev for ev in events if "error" not in ev and ev.get("type")
+                  and not pipe_analysis.is_ignored(ev, self_pid)
+                  and resolve(str(ev.get("pid")), ev.get("timestamp") or "") in sample_keys),
+                 key=lambda ev: _to_epoch(ev.get("timestamp")) or 0.0)
+    for ev in own:
+        name = ev.get("pipe") or ""
+        if name in wanted:
+            continue
+        wanted.add(name)
+        if not _xpath_safe_name(name) or len(names) >= _PIPE_NAME_QUERY_MAX:
+            truncated = True
+            continue
+        names.append(name)
+    for i in range(0, len(names), _PIPE_XPATH_NAMES):
+        add(_read_sysmon_events(event_ids=[17, 18], since=since, until=until,
+                                pipe_names=names[i:i + _PIPE_XPATH_NAMES],
+                                max_events=_PIPE_ACTIVITY_MAX_EVENTS))
+    return events, truncated
 
 
 def _compute_verdict(results, matching_alerts):

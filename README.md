@@ -604,7 +604,12 @@ Sysmon log is enlarged to 512 MB.
 
 After a detonation, the pipe events of the sample's process subtree are
 attributed to process instances and listed in the **NAMED PIPES** section of
-the results:
+the results. The query is pipe-first: the subtree's own PIDs are queried
+first (window: submission to the subtree's last exit + 60 s, at most 6 h),
+then every party on the pipes the sample touched by exact pipe name (up to 20
+names; names with quotes are not queried), so unrelated host activity cannot
+push the sample's events out of the 2000-event cap. `truncated` reports a cap
+hit or names that were not looked up.
 
 | Flag | Meaning | Evidence (weight) |
 |------|---------|-------------------|
