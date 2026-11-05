@@ -598,8 +598,11 @@ ways.
 Sysmon logs every pipe creation (EID 17) and connection (EID 18). The
 provisioning switches the SwiftOnSecurity `PipeEvent` filter from its short
 include list to **exclude** mode, so every pipe is logged except a few noisy
-pairs of image *and* pipe name (Chrome/Edge Mojo and Crashpad pipes, svchost from
-`System32`, Defender from its platform folder) - never by name alone. The
+pairs of image *and* pipe name (Chrome/Edge Mojo and Crashpad pipes; `\lsass`
+from `lsass.exe`, `\ntsvcs` from `services.exe`, `\srvsvc`/`\wkssvc` from
+`svchost.exe`, all in `System32`; Defender from its platform folder) - never by
+name alone. Anonymous pipes are logged too (Sysmon writes `<Anonymous Pipe>`)
+and dropped when the events are read. The
 Sysmon log is enlarged to 512 MB.
 
 After a detonation, the pipe events of the sample's process subtree are
@@ -622,7 +625,9 @@ Pipe findings enter the same evidence model as live memory (source
 `sysmon-pipes`), so a default C2 pipe alone makes a sample SUSPICIOUS, and
 together with a memory finding on the same process it corroborates it. The
 catalog is plain JSON: add an entry (`pattern`, `match` exact/prefix/contains/regex,
-`family`, `weight`, `note`) without touching code.
+`family`, `weight`, `note`) without touching code. It includes Metasploit's
+`\msf-pipe` (the default `PIPENAME` of `reverse_named_pipe`); Sliver has no
+default pipe name (the operator always chooses it), so it has no entry.
 
 "Sweep as baseline" (Live Process Memory) also records the pipes of the last
 30 minutes as known for this host, keyed by image path and a normalised name
@@ -640,10 +645,10 @@ The **Pipes** tab starts interception sessions in the web UI process:
 
 | Option | Values |
 |--------|--------|
-| How | **attach** to an existing pipe (exact name), or **arm** before a detonation: a watcher takes the first *new* pipe matching an exact name, prefix (e.g. `postex_`) or regex |
+| How | **attach** to an existing pipe (exact name), or **arm** before a detonation: a watcher takes the first *new* pipe matching an exact name, prefix (e.g. `postex_`) or regex. Arm with an exact name that already exists is refused ("use attach") |
 | Mode | **observe** (relay and record) or **hold** (each message waits until you forward, edit or drop it; auto-forwarded after the hold timeout) |
 | Squat | opt-in, arm + exact only: the proxy creates the pipe before the real server does |
-| Limits | 10 min default session (≤ 1 h), 1 MiB logged per message, 50 MiB per session; `\lsass`, `\ntsvcs`, `\protected_storage` are refused |
+| Limits | 10 min default session (≤ 1 h), at most 16 live sessions, 1 MiB logged per message, 50 MiB per session. In hold mode a direction stops reading while its first message is held and the session already queues 16 MiB or 1000 messages (the pipe buffer fills and the sender blocks); a message-mode message over 16 MiB closes the connection. `\lsass`, `\ntsvcs`, `\protected_storage` and their NPFS aliases `\lsarpc`, `\samr`, `\netlogon`, `\svcctl`, `\epmapper`, `\InitShutdown` are refused (observation still sees them, e.g. `sensitive_system`) |
 
 The proxy adds its own server instances of the pipe. Each client that lands
 on one gets its own upstream connection to the real server, opened with
@@ -975,10 +980,10 @@ All endpoints served on port `9000`. Responses are JSON.
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/pipes/intercept` | Interception sessions (live and ended), newest first |
-| POST | `/api/pipes/intercept` | Start a session → 201 session (state `starting` until the first upstream is open, then `active`; `armed` while an arm session waits) / 400 error. JSON: `pattern` (required), `mode` (`observe`/`hold`), `how` (`attach`/`arm`), `match` (`exact`/`prefix`/`regex`), `squat` (arm + exact only), `max_duration` (default 600 s, at most 3600), `hold_timeout` (default 30 s, at most `max_duration`; both finite), `pipe_mode` (`byte`/`message`; skips probing the real server). `\lsass`, `\ntsvcs`, `\protected_storage` are refused |
+| POST | `/api/pipes/intercept` | Start a session → 201 session (state `starting` until the first upstream is open, then `active`; `armed` while an arm session waits) / 400 error. JSON: `pattern` (required), `mode` (`observe`/`hold`), `how` (`attach`/`arm`), `match` (`exact`/`prefix`/`regex`), `squat` (arm + exact only), `max_duration` (default 600 s, at most 3600), `hold_timeout` (default 30 s, at most `max_duration`; both finite), `pipe_mode` (`byte`/`message`; skips probing the real server). Refused (400): `\lsass`, `\ntsvcs`, `\protected_storage`, `\lsarpc`, `\samr`, `\netlogon`, `\svcctl`, `\epmapper`, `\InitShutdown`; arm + exact for a pipe that already exists. 429 with 16 live sessions; 413 for a body over 2 MiB |
 | GET | `/api/pipes/intercept/<sid>` | One session (state, target, connection and message counts, `self_connect_retries`: upstream connects that landed on the proxy's own instance and were retried) |
 | DELETE | `/api/pipes/intercept/<sid>` | End a session; held messages are forwarded, both ends are closed |
-| GET | `/api/pipes/intercept/<sid>/messages` | Recorded messages (`seq`, `conn`, `dir` `c2s`/`s2c`, `data_b64`, `state`). Params: `after` (seq), `limit` (default 200, max 1000) |
+| GET | `/api/pipes/intercept/<sid>/messages` | Recorded messages (`seq`, `conn`, `dir` `c2s`/`s2c`, `data_b64`, `state`: `held`, `passed`, `auto_passed`, `edited`, `dropped`, or `write_failed` when relaying a decided message failed). Params: `after` (seq), `limit` (default 200, max 1000) |
 | POST | `/api/pipes/intercept/<sid>/messages/<seq>` | Decide a held message. JSON: `action` (`forward`/`drop`/`edit`), `data_b64` (for `edit`) |
 | POST | `/api/pipes/intercept/<sid>/release` | Forward every held message → `{"released": n}` |
 | GET | `/api/pipes/intercept/<sid>/export` | Session and all messages as a JSON attachment |

@@ -77,3 +77,15 @@ def test_every_deploy_path_uploads_the_web_ui_modules():
     for name in sorted(modules):
         assert f"webui/{name} C:\\\\DetonationChamberUI\\\\{name}" in vagrant, name
         assert f"'webui\\{name}' -Destination 'C:\\DetonationChamberUI\\{name}'" in hyperv, name
+
+
+def test_help_lists_every_pipe_interception_route():
+    routes = set()
+    for m in re.finditer(r'@app\.route\("(/api/pipes/intercept[^"]*)"(?:, methods=\[([^\]]*)\])?', APP):
+        for method in re.findall(r'"(\w+)"', m.group(2) or '"GET"'):
+            routes.add((method, _norm(m.group(1))))
+    assert len(routes) == 8
+    rows = {(m, _norm(p.replace("&lt;", "<").replace("&gt;", ">"))) for m, p in re.findall(
+        r'<td class="api-\w+">(\w+)</td><td><code>(/api/pipes/intercept[^<]*)</code>', HELP)}
+    assert routes <= rows, routes - rows
+    assert '<td class="api-delete">DELETE</td>' in HELP

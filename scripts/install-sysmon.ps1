@@ -48,8 +48,8 @@ function Set-PipeEventExclude {
     <Rule groupRelation="and"><Image condition="end with">\chrome.exe</Image><PipeName condition="begin with">\crashpad_</PipeName></Rule>
     <Rule groupRelation="and"><Image condition="end with">\msedge.exe</Image><PipeName condition="begin with">\mojo.</PipeName></Rule>
     <Rule groupRelation="and"><Image condition="end with">\msedge.exe</Image><PipeName condition="begin with">\crashpad_</PipeName></Rule>
-    <Rule groupRelation="and"><Image condition="is">C:\Windows\System32\svchost.exe</Image><PipeName condition="begin with">\lsass</PipeName></Rule>
-    <Rule groupRelation="and"><Image condition="is">C:\Windows\System32\svchost.exe</Image><PipeName condition="begin with">\ntsvcs</PipeName></Rule>
+    <Rule groupRelation="and"><Image condition="is">C:\Windows\System32\lsass.exe</Image><PipeName condition="begin with">\lsass</PipeName></Rule>
+    <Rule groupRelation="and"><Image condition="is">C:\Windows\System32\services.exe</Image><PipeName condition="begin with">\ntsvcs</PipeName></Rule>
     <Rule groupRelation="and"><Image condition="is">C:\Windows\System32\svchost.exe</Image><PipeName condition="begin with">\srvsvc</PipeName></Rule>
     <Rule groupRelation="and"><Image condition="is">C:\Windows\System32\svchost.exe</Image><PipeName condition="begin with">\wkssvc</PipeName></Rule>
     <Rule groupRelation="and"><Image condition="begin with">C:\ProgramData\Microsoft\Windows Defender\Platform\</Image><Image condition="end with">\MsMpEng.exe</Image><PipeName condition="begin with">\</PipeName></Rule>

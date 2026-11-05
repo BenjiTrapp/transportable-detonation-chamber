@@ -2799,6 +2799,15 @@ _INTERCEPT_FIELDS = {"pattern", "mode", "how", "match", "squat", "max_duration",
                      "hold_timeout", "pipe_mode"}
 _intercept = None
 _intercept_lock = threading.Lock()
+# JSON bodies of the interception routes; an edit carries at most 1 MiB as
+# base64. Not a global MAX_CONTENT_LENGTH: sample and dump uploads are larger.
+_INTERCEPT_MAX_BODY = 2 * 1024 * 1024
+
+
+def _intercept_body_too_large():
+    if (request.content_length or 0) > _INTERCEPT_MAX_BODY:
+        return jsonify({"error": f"request body exceeds {_INTERCEPT_MAX_BODY} bytes"}), 413
+    return None
 
 
 def _get_intercept():
@@ -2838,6 +2847,9 @@ def api_pipes_intercept():
     """
     if request.method == "GET":
         return jsonify({"sessions": _get_intercept().list()})
+    too_large = _intercept_body_too_large()
+    if too_large:
+        return too_large
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         return jsonify({"error": "JSON object body required"}), 400
@@ -2852,6 +2864,8 @@ def api_pipes_intercept():
         session = _get_intercept().start(
             body.get("pattern"), body.get("mode", "observe"), body.get("how", "attach"),
             body.get("match", "exact"), squat=squat, **kwargs)
+    except pipe_proxy.SessionLimitError as e:
+        return jsonify({"error": str(e)}), 429
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify(session), 201
@@ -2883,6 +2897,9 @@ def api_pipes_intercept_messages(sid):
 @app.route("/api/pipes/intercept/<sid>/messages/<int:seq>", methods=["POST"])
 def api_pipes_intercept_act(sid, seq):
     """Decide a held message. Body: {"action": "forward"|"drop"|"edit", "data_b64"}."""
+    too_large = _intercept_body_too_large()
+    if too_large:
+        return too_large
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         return jsonify({"error": "JSON object body required"}), 400

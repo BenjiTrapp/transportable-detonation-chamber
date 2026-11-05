@@ -7,6 +7,7 @@
   {"family": "Covenant", "pattern": "\\gruntsvc", "match": "exact", "weight": 4.0, "note": "Default SMB Grunt pipe"},
   {"family": "PoshC2", "pattern": "\\jaccdpqnvbrrxlaf", "match": "exact", "weight": 4.0, "note": "Default PoshC2 SMB implant pipe"},
   {"family": "PoshC2", "pattern": "\\Posh", "match": "exact", "weight": 4.0, "note": "PoshC2 named pipe"},
+  {"family": "Metasploit", "pattern": "\\msf-pipe", "match": "exact", "weight": 3.0, "note": "default PIPENAME of reverse_named_pipe"},
   {"family": "PsExec", "pattern": "\\PSEXESVC", "match": "prefix", "weight": 3.0, "note": "Sysinternals PsExec service pipes (PSEXESVC, PSEXESVC-<host>-<pid>-stdin ...)"},
   {"family": "PAExec/RemCom/CSExec", "pattern": "paexec", "match": "contains", "weight": 3.0, "note": "PAExec remote execution (PsExec alternative)"},
   {"family": "PAExec/RemCom/CSExec", "pattern": "remcom", "match": "contains", "weight": 3.0, "note": "RemCom remote execution (PsExec alternative, used by Impacket smbexec-style tooling)"},

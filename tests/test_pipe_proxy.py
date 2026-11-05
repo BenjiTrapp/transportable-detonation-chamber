@@ -1056,3 +1056,121 @@ def test_start_returns_starting_before_the_first_upstream(backend, make_manager,
     assert time.monotonic() - t0 < 0.5 and s["state"] == "starting"
     gate.set()
     assert wait_for(lambda: m.get(s["id"])["state"] == "active")
+
+
+# ------------------------------------------------------------- review minors
+
+def test_arm_exact_on_existing_pipe_is_refused(backend, mgr):
+    backend.fake_server("there")
+    with pytest.raises(ValueError, match="use attach"):
+        mgr.start("there", "observe", "arm", "exact")
+    assert mgr.list() == [] and backend.created == []
+    mgr.start("there", "observe", "arm", "prefix")         # prefix/regex wait for new pipes
+
+
+def test_attach_refuses_a_pipe_that_vanished(backend, mgr, monkeypatch):
+    monkeypatch.setattr(backend, "exists", lambda name: True)     # gone right after the check
+    monkeypatch.setattr(backend, "pipe_mode", lambda name: "byte")
+    with pytest.raises(ValueError, match="cannot attach"):
+        mgr.start("gone", "observe", "attach", "exact")
+    assert backend.created == [] and backend.list_pipes() == []
+
+
+def test_live_session_cap(backend, make_manager):
+    m = make_manager(max_sessions=2)
+    a = m.start("a", "observe", "arm", "exact")
+    m.start("b", "observe", "arm", "exact")
+    with pytest.raises(pipe_proxy.SessionLimitError, match="2 live"):
+        m.start("c", "observe", "arm", "exact")
+    m.stop(a["id"])
+    m.start("c", "observe", "arm", "exact")
+    assert pipe_proxy.MAX_LIVE_SESSIONS == 16
+    assert issubclass(pipe_proxy.SessionLimitError, ValueError)
+
+
+def test_edit_payload_size_is_checked_before_decoding(backend, mgr, monkeypatch):
+    backend.fake_server("svc")
+    sid = mgr.start("svc", "hold", "attach", "exact")["id"]
+    client = backend.fake_client("svc")
+    client.send(b"x")
+    assert wait_for(lambda: len(mgr.messages(sid)) == 1)
+    big = "A" * (4 * ((pipe_proxy.MAX_MESSAGE_LOG + 2) // 3) + 4)
+    monkeypatch.setattr(pipe_proxy.base64, "b64decode",
+                        lambda *a, **k: pytest.fail("decoded an oversized payload"))
+    with pytest.raises(ValueError, match="too large"):
+        mgr.act(sid, 1, "edit", big)
+
+
+def test_failed_write_marks_message_write_failed(backend, mgr):
+    server = backend.fake_server("wf")
+    sid = mgr.start("wf", "hold", "attach", "exact")["id"]
+    client = backend.fake_client("wf")
+    client.send(b"x")
+    assert wait_for(lambda: len(mgr.messages(sid)) == 1)
+    server.close()                       # the upstream goes away while the message is held
+    assert client.recv() is None
+    mgr.act(sid, 1, "forward")
+    assert wait_for(lambda: mgr.messages(sid)[0]["state"] == "write_failed")
+
+
+def test_npfs_aliases_are_blocked(backend, mgr):
+    for name in (r"\lsarpc", "SAMR", r"\\.\pipe\netlogon", r"\svcctl", r"\epmapper",
+                 r"\InitShutdown"):
+        backend.fake_server(name)
+        with pytest.raises(ValueError, match="blocklist"):
+            mgr.start(name, "observe", "attach", "exact")
+    assert backend.created == []
+
+
+def test_api_session_cap_and_body_size(api, tdc, backend, monkeypatch):
+    monkeypatch.setattr(tdc._intercept, "max_sessions", 1)
+    assert api.post("/api/pipes/intercept", json={"pattern": "a", "how": "arm"}).status_code == 201
+    r = api.post("/api/pipes/intercept", json={"pattern": "b", "how": "arm"})
+    assert r.status_code == 429 and "live" in r.get_json()["error"]
+    r = api.post("/api/pipes/intercept/abc/messages/1", data="x" * (3 * 1024 * 1024),
+                 content_type="application/json")
+    assert r.status_code == 413
+
+
+def test_win32_attach_instance_check(monkeypatch):
+    import ctypes
+    import pipe_backends
+    if pipe_backends.wt is None:
+        pytest.skip("ctypes.wintypes unavailable")
+
+    class K32:
+        instances, state_ok = 2, True
+        closed = []
+
+        def CreateNamedPipeW(self, *a):
+            return 6161
+
+        def GetNamedPipeHandleStateW(self, h, state, cur, *rest):
+            if not self.state_ok:
+                return 0
+            cur._obj.value = self.instances
+            return 1
+
+        def GetNamedPipeInfo(self, h, flags, *rest):
+            return 1
+
+        def CloseHandle(self, h):
+            self.closed.append(h)
+            return 1
+
+    k32 = K32()
+    monkeypatch.setattr(pipe_backends, "_k32", k32)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
+    b = pipe_backends.Win32PipeBackend()
+    h = b.create_server("svc", "byte", False, existing=True)
+    assert h.value == 6161 and k32.closed == []
+    k32.instances = 1                    # ours is the only instance: the pipe vanished
+    with pytest.raises(FileNotFoundError):
+        b.create_server("svc", "byte", False, existing=True)
+    assert k32.closed == [6161]
+    k32.instances, k32.state_ok = 2, False
+    with pytest.raises(OSError):
+        b.create_server("svc", "byte", False, existing=True)
+    with pytest.raises(OSError):
+        b.pipe_mode("svc")               # the probe no longer ignores a failed state query
+    assert k32.closed == [6161] * 3

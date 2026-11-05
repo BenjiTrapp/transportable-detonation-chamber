@@ -30,6 +30,10 @@ def test_signature_catalog_matches_defaults():
                  r"\MSSE-4242-server", r"\postex_ssh_1a"):
         assert _family(name, sigs) == "Cobalt Strike", name
     assert _family(r"\PSEXESVC", sigs) == "PsExec"
+    msf = match_signature(r"\msf-pipe", sigs)
+    assert msf["family"] == "Metasploit" and msf["match"] == "exact" and msf["weight"] == 3.0
+    assert "reverse_named_pipe" in msf["note"]
+    assert match_signature(r"\msf-pipe2", sigs) is None
     for name in (r"\paexec_x", r"\RemCom_communicaton", r"\csexecsvc"):
         assert _family(name, sigs) == "PAExec/RemCom/CSExec", name
     assert match_signature(r"\lsass", sigs) is None
@@ -161,8 +165,14 @@ def test_sysmon_installer_switches_pipeevent_to_exclude():
     for image in ("chrome.exe", "msedge.exe"):
         assert (image, r"\mojo.") in pairs
         assert (image, r"\crashpad_") in pairs
-    for pipe in (r"\lsass", r"\ntsvcs", r"\srvsvc", r"\wkssvc"):
+    for pipe in (r"\srvsvc", r"\wkssvc"):
         assert ("svchost.exe", pipe) in pairs
+    # Each pipe is anchored to the image that really creates it.
+    assert ("lsass.exe", r"\lsass") in pairs and ("svchost.exe", r"\lsass") not in pairs
+    assert ("services.exe", r"\ntsvcs") in pairs and ("svchost.exe", r"\ntsvcs") not in pairs
+    for image, pipe in (("lsass.exe", r"\lsass"), ("services.exe", r"\ntsvcs")):
+        assert f'<Image condition="is">C:\\Windows\\System32\\{image}</Image>' \
+            f'<PipeName condition="begin with">{pipe}</PipeName>' in block
     assert any(img == "MsMpEng.exe" for img, _ in pairs)
     # No rule may exclude by pipe name alone.
     assert not re.search(r"<PipeEvent onmatch=\"exclude\">\s*<PipeName", script)

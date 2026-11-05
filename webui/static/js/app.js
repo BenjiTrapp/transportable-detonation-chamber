@@ -9885,7 +9885,7 @@ function pipesMessageRow(m, live) {
             <span class="pipe-msg-conn">conn ${escapeHtml(String(m.conn ?? ''))}</span>
             <span class="pipe-msg-size">${Number(m.size) || 0} B${m.truncated ? ' · log truncated' : ''}</span>
             <span class="pipe-msg-ts">${escapeHtml(pipesFmtEpoch(m.ts))}</span>
-            <span class="pipe-msg-state pipes-mstate-${cssToken(st)}">${escapeHtml(st.replace('_', ' '))}</span>`;
+            <span class="pipe-msg-state pipes-mstate-${cssToken(st)}"${st === 'write_failed' ? ' title="Decided, but writing it to the other side failed (that end has closed)"' : ''}>${escapeHtml(st.replace('_', ' '))}</span>`;
     if (st === 'held' && live && !editing) {
         html += `<span class="pipe-msg-actions">
             <button class="btn btn-xs pipe-btn-forward" onclick="pipesAct(${jsInt(seq)}, 'forward')">Forward</button>

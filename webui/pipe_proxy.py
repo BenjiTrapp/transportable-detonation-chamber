@@ -37,10 +37,15 @@ from pipe_analysis import canonical_name
 from pipe_backends import (MODES, FakeEndpoint, FakePipeBackend, PipeBackend,  # noqa: F401
                            Win32PipeBackend)
 
-BLOCKLIST = frozenset({"\\lsass", "\\ntsvcs", "\\protected_storage"})
+# Never intercepted: LSA/SCM pipes and their NPFS aliases (\\lsarpc, \\samr,
+# \\netlogon are served by lsass; \\svcctl by services; \\epmapper by RPCSS;
+# \\InitShutdown by wininit). They stay visible to observation.
+BLOCKLIST = frozenset({"\\lsass", "\\ntsvcs", "\\protected_storage", "\\lsarpc", "\\samr",
+                       "\\netlogon", "\\svcctl", "\\epmapper", "\\initshutdown"})
 MAX_MESSAGE_LOG = 1024 * 1024
 MAX_SESSION_RECORD = 50 * 1024 * 1024
 MAX_DURATION_LIMIT = 3600
+MAX_LIVE_SESSIONS = 16
 # Hold mode: while a direction's head message is held, it stops reading once
 # the session holds this much (the pipe buffer then fills and the peer blocks).
 MAX_QUEUED_BYTES = 16 * 1024 * 1024
@@ -55,6 +60,10 @@ ACTIONS = ("forward", "drop", "edit")
 _SID_FILE_RE = re.compile(r"^[0-9a-f]{12}\.json$")
 _JOIN_TIMEOUT = 2.0
 WATCH_RETRIES = 3
+
+
+class SessionLimitError(ValueError):
+    """Too many live sessions."""
 
 
 def _key(name):
@@ -150,8 +159,10 @@ class InterceptManager:
                  max_session_record: int = MAX_SESSION_RECORD, drain_timeout: float = 2.0,
                  own_pid: Optional[int] = None, settle: float = 0.1,
                  max_queued_bytes: int = MAX_QUEUED_BYTES,
-                 max_queued_messages: int = MAX_QUEUED_MESSAGES):
+                 max_queued_messages: int = MAX_QUEUED_MESSAGES,
+                 max_sessions: int = MAX_LIVE_SESSIONS):
         self.backend = backend
+        self.max_sessions = max_sessions
         self.max_queued_bytes = max_queued_bytes
         self.max_queued_messages = max_queued_messages
         self.own_pid = os.getpid() if own_pid is None else own_pid
@@ -221,6 +232,10 @@ class InterceptManager:
         # land on another session's listening instance (Windows routes to the
         # oldest free instance, whoever owns it).
         with self._lock:
+            live = sum(1 for x in self._sessions.values() if not x.ended)
+            if live >= self.max_sessions:
+                raise SessionLimitError(f"{live} live sessions (limit {self.max_sessions}); "
+                                        "stop one first")
             if match == "exact":
                 other = self._claimed_by(_key(pattern))
                 if other is not None:
@@ -257,7 +272,7 @@ class InterceptManager:
                 raise ValueError(f"pipe {pattern} does not exist")
             try:
                 s.pipe_mode = pipe_mode or self.backend.pipe_mode(pattern)
-                first = self.backend.create_server(pattern, s.pipe_mode, False)
+                first = self.backend.create_server(pattern, s.pipe_mode, False, existing=True)
             except OSError as e:
                 raise ValueError(f"cannot attach to {pattern}: {e}") from None
         elif squat:
@@ -267,6 +282,9 @@ class InterceptManager:
             except OSError as e:
                 raise ValueError(f"cannot squat {pattern} (already exists?): {e}") from None
         else:
+            if s.match == "exact" and self.backend.exists(pattern):
+                # The watcher only takes *new* pipes and would wait forever.
+                raise ValueError(f"pipe {pattern} already exists - use attach")
             try:
                 known = {_key(n) for n in self.backend.list_pipes()}
             except OSError as e:
@@ -350,6 +368,8 @@ class InterceptManager:
         if action == "edit":
             if not isinstance(data_b64, str):
                 raise ValueError("edit requires data_b64")
+            if len(data_b64) > 4 * ((self.max_message_log + 2) // 3):
+                raise ValueError("edited message is too large")
             try:
                 new = base64.b64decode(data_b64, validate=True)
             except (ValueError, TypeError):
@@ -861,6 +881,8 @@ class InterceptManager:
                 self.backend.write(d.dst, item.data)
             except OSError as e:
                 print(f"[pipe_proxy] session {s.id}: write {d.name} #{item.seq} failed: {e}")
+                with s.lock:
+                    self._set_state(item, "write_failed")
             finally:
                 with s.lock:
                     d.writing = False

@@ -36,7 +36,9 @@ class PipeBackend:
     def pipe_mode(self, name):
         raise NotImplementedError
 
-    def create_server(self, name, mode, first_instance):
+    def create_server(self, name, mode, first_instance, existing=False):
+        """New server instance. `existing`: the pipe must already have another
+        instance (FileNotFoundError otherwise, and no instance is left)."""
         raise NotImplementedError
 
     def accept(self, h, timeout):
@@ -185,10 +187,12 @@ class FakePipeBackend(PipeBackend):
                 raise FileNotFoundError(f"pipe {canonical_name(name)} not found")
             return insts[0].mode
 
-    def create_server(self, name, mode, first_instance):
+    def create_server(self, name, mode, first_instance, existing=False):
         if mode not in MODES:
             raise ValueError(f"bad mode {mode!r}")
         with self._cv:
+            if existing and not self._open(name):
+                raise FileNotFoundError(f"pipe {canonical_name(name)} not found")
             if first_instance and self._open(name):
                 raise PermissionError(f"pipe {canonical_name(name)} already exists")
             inst = _FakeInstance(name, mode, "proxy")
@@ -475,14 +479,8 @@ class Win32PipeBackend(PipeBackend):
         # instance of our own; unlike a client probe this never occupies one
         # of the server's instances (single-instance servers such as SMB
         # beacons would lose their only one).
-        h = self.create_server(name, "byte", False)
+        h = self.create_server(name, "byte", False, existing=True)
         try:
-            count = wt.DWORD(0)
-            if _k32.GetNamedPipeHandleStateW(h.value, None, ctypes.byref(count), None, None,
-                                             None, 0) and count.value <= 1:
-                # Ours is the only instance: the server's pipe vanished and we
-                # just created a new pipe instead of probing it.
-                raise FileNotFoundError(f"pipe {canonical_name(name)} not found")
             flags = wt.DWORD(0)
             if not _k32.GetNamedPipeInfo(h.value, ctypes.byref(flags), None, None, None):
                 raise _winerr(ctypes.get_last_error(), "GetNamedPipeInfo")
@@ -490,7 +488,28 @@ class Win32PipeBackend(PipeBackend):
         finally:
             self.close(h)
 
-    def create_server(self, name, mode, first_instance):
+    def _instances(self, h):
+        """Current number of instances of the pipe of server handle `h`."""
+        count = wt.DWORD(0)
+        if not _k32.GetNamedPipeHandleStateW(h.value, None, ctypes.byref(count), None, None,
+                                             None, 0):
+            raise _winerr(ctypes.get_last_error(), "GetNamedPipeHandleStateW")
+        return count.value
+
+    def create_server(self, name, mode, first_instance, existing=False):
+        h = self._create_server(name, mode, first_instance)
+        if existing:
+            try:
+                if self._instances(h) <= 1:
+                    # Ours is the only instance: the server's pipe vanished
+                    # and we just created a new pipe instead of joining it.
+                    raise FileNotFoundError(f"pipe {canonical_name(name)} not found")
+            except BaseException:
+                self.close(h)
+                raise
+        return h
+
+    def _create_server(self, name, mode, first_instance):
         open_mode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED
         if first_instance:
             open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE
