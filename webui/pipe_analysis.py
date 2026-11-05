@@ -146,11 +146,60 @@ def _entropy(s: str) -> float:
 
 
 def looks_random(name: str) -> bool:
-    """Last name component is GUID-shaped, or long (>=12) with entropy >= 3.5."""
-    last = canonical_name(name).rstrip("\\").split("\\")[-1]
-    if _GUID_RE.fullmatch(last):
+    """A name token looks generated: a GUID, a hex run (>= 6, digits and
+    letters), or a long (>= 12) high-entropy token that mixes digits and
+    letters or is a vowel-less letter soup.
+
+    Tokens are split at `\\`, `-`, `_`, `.` and spaces, so counters and PIDs
+    (`CatalogChangeListener-3e0-0`, `dotnet-diagnostic-1234-...`) and
+    CamelCase words are not random. Names in `BENIGN_PIPE_PREFIXES` never are.
+    """
+    cname = canonical_name(name)
+    if is_benign_name(cname):
+        return False
+    if _GUID_RE.search(cname):
         return True
-    return len(last) >= 12 and _entropy(last) >= 3.5
+    return any(_random_token(t) for t in _TOKEN_SPLIT_RE.split(cname) if t)
+
+
+def _random_token(tok: str) -> bool:
+    digits = sum(c.isdigit() for c in tok)
+    letters = sum(c.isalpha() for c in tok)
+    if _HEX_TOKEN_RE.fullmatch(tok) and digits and letters:
+        return True
+    if len(tok) < 12 or _entropy(tok) < 3.5:
+        return False
+    if digits >= 2 and letters >= 2:
+        return True
+    if letters == len(tok):
+        vowels = sum(c in "aeiouy" for c in tok.lower())
+        return vowels / len(tok) < 0.2
+    return False
+
+
+# Well-known Windows/runtime/browser pipes whose names carry PIDs, counters or
+# random ids. Only the random_name flag is affected: they still get every
+# other flag, and they are no catalog entries (never c2_default or a family).
+BENIGN_PIPE_PREFIXES = (
+    r"\winsock2\catalogchangelistener-",
+    r"\dotnet-diagnostic-",
+    r"\pipe_eventroot\cimv2scm event provider",
+    r"\chrome.",
+    r"\local\chrome.",
+    r"\mojo.",
+    r"\local\mojo.",
+    r"\crashpad_",
+    r"\local\crashpad_",
+    r"\tsvcpipe-",
+    r"\gecko-crash-server-pipe.",
+)
+_TOKEN_SPLIT_RE = re.compile(r"[\\\-_. ]+")
+_HEX_TOKEN_RE = re.compile(r"[0-9a-f]{6,}", re.IGNORECASE)
+
+
+def is_benign_name(name: str) -> bool:
+    """The name starts with one of `BENIGN_PIPE_PREFIXES` (case-insensitive)."""
+    return canonical_name(name).lower().startswith(BENIGN_PIPE_PREFIXES)
 
 
 SENSITIVE_SYSTEM_PIPES = frozenset({r"\svcctl", r"\lsarpc", r"\samr", r"\netlogon", r"\atsvc"})

@@ -616,7 +616,7 @@ hit or names that were not looked up.
 | `c2_default` | name matches the catalog `webui/pipe_signatures.json` (C2 defaults, credential dumpers, remote-exec tools, APT pipes) | structural, weight from the catalog (C2 4.0, remote exec 3.0); never baseline-suppressed, counted once per pipe |
 | `cross_process` | created by the sample tree and connected by a process outside it (or the other way round) | behavioural 1.5, needs corroboration |
 | `sensitive_system` | the sample connects to `\svcctl`, `\lsarpc`, `\samr`, `\netlogon` or `\atsvc` | behavioural 1.0, needs corroboration |
-| `random_name` | the name looks random (last part GUID-shaped, or ≥ 12 characters with high entropy) | string 0.8, needs corroboration |
+| `random_name` | a name token looks generated: GUID, hex run (≥ 6, digits and letters), or ≥ 12 characters with high entropy that mix digits and letters or have almost no vowels; tokens are split at `\ - _ . ` and spaces, so PIDs and counters do not count. Common Windows/runtime/browser pipes (`\Winsock2\CatalogChangeListener-*`, `\dotnet-diagnostic-*`, `\PIPE_EVENTROOT\*`, Chrome/Mojo/Crashpad, ...; `BENIGN_PIPE_PREFIXES` in `pipe_analysis.py`) are never flagged - only this flag is affected | string 0.8, needs corroboration |
 
 Pipe findings enter the same evidence model as live memory (source
 `sysmon-pipes`), so a default C2 pipe alone makes a sample SUSPICIOUS, and

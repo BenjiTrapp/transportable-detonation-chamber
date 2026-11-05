@@ -63,6 +63,37 @@ def test_looks_random():
     assert looks_random(r"\{3F2504E0-4F89-11D3-9A0C-0305E82C3301}") is True
 
 
+BENIGN_PIPES = (
+    r"\Winsock2\CatalogChangeListener-3e0-0",
+    r"\dotnet-diagnostic-1234-5678-socket",
+    r"\PIPE_EVENTROOT\CIMV2SCM EVENT PROVIDER",
+    r"\chrome.sync.1234.5678.9a8b7c6d5e4f3a2b",
+    r"\LOCAL\mojo.6084.10168.2399218213542766592",
+)
+
+
+def test_common_benign_pipes_are_not_random():
+    for name in BENIGN_PIPES:
+        assert looks_random(name) is False, name
+    for name in (r"\5f2a9c1e7b3d48a6", r"\msagent_3fcef7", r"\Xk9qZ2mVb7Lw4Tn",
+                 r"\jaccdpqnvbrrxlaf", r"\pipe-{3F2504E0-4F89-11D3-9A0C-0305E82C3301}",
+                 r"\3F2504E0-4F89-11D3-9A0C-0305E82C3301"):
+        assert looks_random(name) is True, name
+    # Tokens, not the whole component: short hex and digit runs are counters/PIDs.
+    for name in (r"\appsvc_4a3f", r"\InitShutdown", r"\AppContainerNamedObjects",
+                 r"\svc-1234-567890123"):
+        assert looks_random(name) is False, name
+
+
+def test_benign_pipes_carry_no_family_and_can_be_baselined():
+    for name in BENIGN_PIPES:
+        assert pipe_analysis.is_benign_name(name), name
+        res = pipe_analysis.analyze([_pipe_ev("create", 4072, name)], {"4072"}, _resolve, self_pid=1)
+        assert res["pipes"][0]["flags"] == [] and res["pipes"][0]["family"] is None, name
+        assert pipe_analysis.baseline_findings([_pipe_ev("create", 700, name)], self_pid=1), name
+    assert not pipe_analysis.is_benign_name(r"\msagent_3fcef7")
+
+
 def test_module_has_default_catalog_path():
     assert pipe_analysis.DEFAULT_SIGNATURES_PATH.endswith("pipe_signatures.json")
 
