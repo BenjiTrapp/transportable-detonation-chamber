@@ -147,6 +147,8 @@ def looks_random(name: str) -> bool:
 
 SENSITIVE_SYSTEM_PIPES = frozenset({r"\svcctl", r"\lsarpc", r"\samr", r"\netlogon", r"\atsvc"})
 _IGNORED_PREFIXES = (r"\pshost.",)
+# Sysmon's placeholder for unnamed (anonymous) pipes, e.g. stdout redirection.
+_ANONYMOUS = r"\<anonymous pipe>"
 _DEFAULT_SIGNATURES: list | None = None
 _FRACTION_RE = re.compile(r"(\.\d{6})\d+")
 
@@ -175,12 +177,12 @@ def _epoch(ts) -> float | None:
 
 def is_ignored(ev, self_pid) -> bool:
     """Pipe events that are noise: no PID, the web UI's own pipe proxy
-    (`self_pid`), empty names and PowerShell host pipes."""
+    (`self_pid`), empty names, anonymous pipes and PowerShell host pipes."""
     pid = ev.get("pid")
     if pid in (None, "") or (self_pid is not None and str(pid) == str(self_pid)):
         return True
-    name = canonical_name(ev.get("pipe") or "")
-    return name == "\\" or name.lower().startswith(_IGNORED_PREFIXES)
+    name = canonical_name(ev.get("pipe") or "").lower()
+    return name in ("\\", _ANONYMOUS) or name.startswith(_IGNORED_PREFIXES)
 
 
 def analyze(events, sample_keys, resolve, self_pid, signatures=None) -> dict:

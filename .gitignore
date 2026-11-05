@@ -34,3 +34,6 @@ webui/memory_results/
 .superpowers/
 # Pipe interception recordings
 webui/pipe_sessions/
+# Locally built test samples (source only is committed)
+tests/samples/*.exe
+tests/samples/*.pdb

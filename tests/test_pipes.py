@@ -280,6 +280,14 @@ def test_analyze_ignores_own_proxy_and_pshost():
     assert "cross_process" not in p["flags"]
 
 
+def test_anonymous_pipes_are_ignored():
+    ev = _pipe_ev("create", 4072, "<Anonymous Pipe>")
+    assert pipe_analysis.is_ignored(ev, self_pid=None)
+    assert not pipe_analysis.is_ignored(_pipe_ev("create", 4072, r"\anonymous"), None)
+    res = pipe_analysis.analyze([ev], {"4072"}, _resolve, self_pid=None)
+    assert res["pipes"] == []
+
+
 def test_unrelated_processes_are_not_attributed():
     events = [
         _pipe_ev("create", 4072, r"\status_12"),
