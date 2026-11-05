@@ -62,3 +62,18 @@ def test_help_tab_guide_covers_every_tab():
     ui_tabs = re.findall(r'data-tab="[^"]+">([^<]+)</button>', HELP)
     guide = HELP[HELP.index('id="help-usage"'):HELP.index('id="help-api"')]
     assert re.findall(r"<h4>([^<]+)</h4>", guide) == ui_tabs
+
+
+def test_every_deploy_path_uploads_the_web_ui_modules():
+    """deploy-utm.py, the Makefile (Vagrant) and make.ps1 (Hyper-V) must ship
+    the same backend files: a missing module is an ImportError on the VM."""
+    utm = open(os.path.join(ROOT, "scripts", "deploy-utm.py"), encoding="utf-8").read()
+    modules = set(re.findall(r'"webui/([\w.]+\.(?:py|json))"', utm))
+    assert {"app.py", "pipe_proxy.py", "pipe_backends.py", "pipe_signatures.json"} <= modules
+    make = open(os.path.join(ROOT, "Makefile"), encoding="utf-8").read()
+    ps1 = open(os.path.join(ROOT, "make.ps1"), encoding="utf-8").read()
+    vagrant = make[make.index("\ndeploy:"):make.index("\n.PHONY: deploy-app")]
+    hyperv = ps1[ps1.index("'deploy' {"):ps1.index("'deploy-app' {")]
+    for name in sorted(modules):
+        assert f"webui/{name} C:\\\\DetonationChamberUI\\\\{name}" in vagrant, name
+        assert f"'webui\\{name}' -Destination 'C:\\DetonationChamberUI\\{name}'" in hyperv, name

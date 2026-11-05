@@ -317,6 +317,13 @@ switch ($Target) {
         Write-Host "[deploy] Uploading webui files to VM at $VMIp..." -ForegroundColor Cyan
         $s = Get-VMSession
         try {
+            Copy-Item 'webui\app.py' -Destination 'C:\DetonationChamberUI\app.py' -ToSession $s -Force
+            Copy-Item 'webui\memory_evidence.py' -Destination 'C:\DetonationChamberUI\memory_evidence.py' -ToSession $s -Force
+            Copy-Item 'webui\minidump_analysis.py' -Destination 'C:\DetonationChamberUI\minidump_analysis.py' -ToSession $s -Force
+            Copy-Item 'webui\pipe_analysis.py' -Destination 'C:\DetonationChamberUI\pipe_analysis.py' -ToSession $s -Force
+            Copy-Item 'webui\pipe_signatures.json' -Destination 'C:\DetonationChamberUI\pipe_signatures.json' -ToSession $s -Force
+            Copy-Item 'webui\pipe_backends.py' -Destination 'C:\DetonationChamberUI\pipe_backends.py' -ToSession $s -Force
+            Copy-Item 'webui\pipe_proxy.py' -Destination 'C:\DetonationChamberUI\pipe_proxy.py' -ToSession $s -Force
             Copy-Item 'webui\templates\index.html' -Destination 'C:\DetonationChamberUI\templates\index.html' -ToSession $s -Force
             Copy-Item 'webui\static\css\style.css' -Destination 'C:\DetonationChamberUI\static\css\style.css' -ToSession $s -Force
             Copy-Item 'webui\static\js\app.js' -Destination 'C:\DetonationChamberUI\static\js\app.js' -ToSession $s -Force
@@ -332,7 +339,13 @@ switch ($Target) {
         $s = Get-VMSession
         try {
             Copy-Item 'webui\app.py' -Destination 'C:\DetonationChamberUI\app.py' -ToSession $s -Force
-            Write-Host "[deploy-app] app.py synced." -ForegroundColor Green
+            Copy-Item 'webui\memory_evidence.py' -Destination 'C:\DetonationChamberUI\memory_evidence.py' -ToSession $s -Force
+            Copy-Item 'webui\minidump_analysis.py' -Destination 'C:\DetonationChamberUI\minidump_analysis.py' -ToSession $s -Force
+            Copy-Item 'webui\pipe_analysis.py' -Destination 'C:\DetonationChamberUI\pipe_analysis.py' -ToSession $s -Force
+            Copy-Item 'webui\pipe_signatures.json' -Destination 'C:\DetonationChamberUI\pipe_signatures.json' -ToSession $s -Force
+            Copy-Item 'webui\pipe_backends.py' -Destination 'C:\DetonationChamberUI\pipe_backends.py' -ToSession $s -Force
+            Copy-Item 'webui\pipe_proxy.py' -Destination 'C:\DetonationChamberUI\pipe_proxy.py' -ToSession $s -Force
+            Write-Host "[deploy-app] app.py and modules synced." -ForegroundColor Green
         } finally {
             Remove-PSSession $s
         }

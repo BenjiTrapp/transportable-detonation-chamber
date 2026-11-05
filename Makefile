@@ -303,6 +303,12 @@ deploy:
 		vagrant upload webui/static/css/style.css C:\\DetonationChamberUI\\static\\css\\style.css; \
 		vagrant upload webui/static/js/app.js C:\\DetonationChamberUI\\static\\js\\app.js; \
 		vagrant upload webui/app.py C:\\DetonationChamberUI\\app.py; \
+		vagrant upload webui/memory_evidence.py C:\\DetonationChamberUI\\memory_evidence.py; \
+		vagrant upload webui/minidump_analysis.py C:\\DetonationChamberUI\\minidump_analysis.py; \
+		vagrant upload webui/pipe_analysis.py C:\\DetonationChamberUI\\pipe_analysis.py; \
+		vagrant upload webui/pipe_signatures.json C:\\DetonationChamberUI\\pipe_signatures.json; \
+		vagrant upload webui/pipe_backends.py C:\\DetonationChamberUI\\pipe_backends.py; \
+		vagrant upload webui/pipe_proxy.py C:\\DetonationChamberUI\\pipe_proxy.py; \
 		vagrant upload webui/static/icon.png C:\\DetonationChamberUI\\static\\icon.png || true; \
 		echo "[deploy] Done."; \
 	fi
@@ -315,7 +321,13 @@ deploy-app:
 		$(UTM_DEPLOY) --action deploy; \
 	else \
 		vagrant upload webui/app.py C:\\DetonationChamberUI\\app.py; \
-		echo "[deploy-app] app.py synced."; \
+		vagrant upload webui/memory_evidence.py C:\\DetonationChamberUI\\memory_evidence.py; \
+		vagrant upload webui/minidump_analysis.py C:\\DetonationChamberUI\\minidump_analysis.py; \
+		vagrant upload webui/pipe_analysis.py C:\\DetonationChamberUI\\pipe_analysis.py; \
+		vagrant upload webui/pipe_signatures.json C:\\DetonationChamberUI\\pipe_signatures.json; \
+		vagrant upload webui/pipe_backends.py C:\\DetonationChamberUI\\pipe_backends.py; \
+		vagrant upload webui/pipe_proxy.py C:\\DetonationChamberUI\\pipe_proxy.py; \
+		echo "[deploy-app] app.py and modules synced."; \
 	fi
 
 .PHONY: restart
