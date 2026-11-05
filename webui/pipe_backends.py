@@ -458,11 +458,18 @@ class Win32PipeBackend(PipeBackend):
         return any(n.lower() == k for n in self.list_pipes())
 
     def pipe_mode(self, name):
-        # GetNamedPipeInfo needs a handle, so this briefly connects as a client
-        # (identification-only, like every client open).
-        h = self.connect(name, 1.0)
+        # A new instance always takes the pipe type of the pipe's first
+        # instance, whatever type it asks for (checked on Windows 11). So the
+        # real server's mode is read from a throw-away instance of our own;
+        # unlike a client probe this never occupies one of the server's
+        # instances (single-instance servers such as SMB beacons would lose
+        # their only one).
+        h = self.create_server(name, "byte", False)
         try:
-            return h.mode
+            flags = wt.DWORD(0)
+            if not _k32.GetNamedPipeInfo(h.value, ctypes.byref(flags), None, None, None):
+                raise _winerr(ctypes.get_last_error(), "GetNamedPipeInfo")
+            return "message" if flags.value & PIPE_TYPE_MESSAGE else "byte"
         finally:
             self.close(h)
 

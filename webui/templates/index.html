@@ -986,6 +986,18 @@
                             <tr><td class="api-get">GET</td><td><code>/api/etw/events</code></td><td>Event Log channel. Params: <code>channel</code>, <code>max</code>, <code>filter</code></td></tr>
                         </tbody>
                     </table>
+
+                    <h4>Named Pipes</h4>
+                    <table class="help-api-table">
+                        <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td class="api-get">GET</td><td><code>/api/pipes</code></td><td>Sysmon pipe events (EID 17/18) with catalog family. Params: <code>pid</code>, <code>key</code>, <code>since</code>, <code>until</code>, <code>name</code>, <code>max</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/pipes/intercept</code></td><td>Interception sessions; <code>POST</code> starts one (<code>pattern</code>, <code>match</code>, <code>how</code>, <code>mode</code>, <code>squat</code>, <code>max_duration</code>)</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/pipes/intercept/&lt;sid&gt;/messages</code></td><td>Recorded messages. Params: <code>after</code>, <code>limit</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/pipes/intercept/&lt;sid&gt;/messages/&lt;seq&gt;</code></td><td>Forward, edit or drop a held message</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/pipes/intercept/&lt;sid&gt;/export</code></td><td>Session and all messages as a JSON download</td></tr>
+                        </tbody>
+                    </table>
                 </div>
 
                 <!-- Architecture -->
@@ -997,8 +1009,10 @@ Web UI :9000 ──submit──▶ DetonatorAgent :8080 ──runs──▶ samp
      │
      ├──◀── alerts ── Rustinel (Sigma/YARA/IOC) · Fibratus (ETW) · Sysmon
      │
-     └──── live memory ──▶ Aether · Process Dump · HSB · BeaconEye
-                          Exit Capture (dump at process exit)</pre>
+     ├──── live memory ──▶ Aether · Process Dump · HSB · BeaconEye
+     │                    Exit Capture (dump at process exit)
+     │
+     └──── named pipes ──▶ Sysmon EID 17/18 (observe) · pipe proxy (intercept)</pre>
 
                     <h4>Data Flow</h4>
                     <ol class="help-steps">
@@ -1007,11 +1021,12 @@ Web UI :9000 ──submit──▶ DetonatorAgent :8080 ──runs──▶ samp
                         <li>Rustinel, Fibratus and Sysmon record its activity</li>
                         <li>Hunt-Sleeping-Beacons, BeaconEye, Aether (3 samples) and Process Dump scan the PID</li>
                         <li>Sysmon network events are checked for periodic connections</li>
+                        <li>Sysmon pipe events of the sample's process tree are matched against the pipe catalog (C2 defaults, cross-process and system pipes, random names)</li>
                         <li>All memory findings are scored together (persistence, corroboration, host baseline) and combined with EDR alerts and LitterBox into one verdict</li>
                     </ol>
 
                     <h4>File Layout</h4>
-                    <pre class="help-code">C:\DetonationChamberUI\           Web UI (this interface), memory_results\, baseline
+                    <pre class="help-code">C:\DetonationChamberUI\           Web UI (this interface), memory_results\, pipe_sessions\, baseline
 C:\tools\rustinel\                Rustinel ETW engine
 C:\tools\fibratus\                Fibratus kernel tracer
 C:\DetonatorAgent\                .NET execution agent
@@ -1036,7 +1051,8 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
                             <tr><td><strong>LitterBox</strong></td><td>1337</td><td>Static + dynamic analysis sandbox</td><td>Python / Flask</td></tr>
                             <tr><td><strong>Fibratus</strong></td><td>8180</td><td>Kernel ETW telemetry &amp; behavior rules</td><td>Go</td></tr>
                             <tr><td><strong>Rustinel</strong></td><td>&mdash;</td><td>Sigma/YARA/IOC real-time detection</td><td>Rust</td></tr>
-                            <tr><td><strong>Sysmon</strong></td><td>&mdash;</td><td>Process, network, file, registry, DNS events</td><td>Sysinternals</td></tr>
+                            <tr><td><strong>Sysmon</strong></td><td>&mdash;</td><td>Process, network, file, registry, DNS and named-pipe events</td><td>Sysinternals</td></tr>
+                            <tr><td><strong>Pipe proxy</strong></td><td>&mdash;</td><td>Named-pipe interception inside the web UI (observe / hold, edit, drop)</td><td>Python / ctypes</td></tr>
                             <tr><td><strong>Aether</strong></td><td>&mdash;</td><td>Live-process memory forensics</td><td>Zig</td></tr>
                             <tr><td><strong>Process Dump</strong></td><td>&mdash;</td><td>Dumps unpacked / hidden modules and code</td><td>C++</td></tr>
                             <tr><td><strong>Exit Capture</strong></td><td>&mdash;</td><td>Full dump when a sample exits</td><td>Windows (WER)</td></tr>

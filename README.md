@@ -48,6 +48,7 @@
 - [Installation](#installation)
 - [Usage](#usage)
 - [Live Memory Analysis](#live-memory-analysis)
+- [Named Pipes](#named-pipes)
 - [Demo](#demo)
 - [API Reference](#api-reference)
 - [MCP Server](#mcp-server)
@@ -585,11 +586,100 @@ with x64 instructions in every process and decides the architecture from
   baseline from an older key scheme is reported as outdated and ignored -
   capture it again ("Sweep as baseline").
 
+## Named Pipes
+
+Beacons talk to their child processes and to each other over named pipes
+(Cobalt Strike's `\msagent_##`, `\postex_*`, `\status_*`; PsExec-style
+`\PSEXESVC`, Covenant's `\gruntsvc`, ...). The chamber watches pipes in two
+ways.
+
+### A: Observation (passive, from Sysmon)
+
+Sysmon logs every pipe creation (EID 17) and connection (EID 18). The
+provisioning switches the SwiftOnSecurity `PipeEvent` filter from its short
+include list to **exclude** mode, so every pipe is logged except a few noisy
+pairs of image *and* pipe name (Chrome/Edge Mojo pipes, svchost from
+`System32`, Defender from its platform folder) - never by name alone. The
+Sysmon log is enlarged to 512 MB.
+
+After a detonation, the pipe events of the sample's process subtree are
+attributed to process instances and listed in the **NAMED PIPES** section of
+the results:
+
+| Flag | Meaning | Evidence (weight) |
+|------|---------|-------------------|
+| `c2_default` | name matches the catalog `webui/pipe_signatures.json` (C2 defaults, credential dumpers, remote-exec tools, APT pipes) | structural, weight from the catalog (C2 4.0, remote exec 3.0); never baseline-suppressed, counted once per pipe |
+| `cross_process` | created by the sample tree and connected by a process outside it (or the other way round) | behavioural 1.5, needs corroboration |
+| `sensitive_system` | the sample connects to `\svcctl`, `\lsarpc`, `\samr`, `\netlogon` or `\atsvc` | behavioural 1.0, needs corroboration |
+| `random_name` | the name looks random (hex/GUID runs) | string 0.8, needs corroboration |
+
+Pipe findings enter the same evidence model as live memory (source
+`sysmon-pipes`), so a default C2 pipe alone makes a sample SUSPICIOUS, and
+together with a memory finding on the same process it corroborates it. The
+catalog is plain JSON: add an entry (`pattern`, `match` exact/prefix/contains/regex,
+`family`, `weight`, `note`) without touching code.
+
+"Sweep as baseline" (Live Process Memory) also records the pipes of the last
+30 minutes as known for this host, keyed by image path and a normalised name
+(`\status_4a3f` → `\status_*`). Catalog pipes, random names and all-wildcard
+names are never baselined.
+
+In the **Graph** tab the **Pipes** toggle (on for detonated roots, off
+otherwise) adds pipe nodes for the processes shown; in the isometric view two
+processes on the same pipe are joined by a bridge. The **Pipes** tab lists raw
+pipe events with name, PID and time filters.
+
+### B: Interception (active, pipe-intercept style)
+
+The **Pipes** tab starts interception sessions in the web UI process:
+
+| Option | Values |
+|--------|--------|
+| How | **attach** to an existing pipe (exact name), or **arm** before a detonation: a watcher takes the first *new* pipe matching an exact name, prefix (e.g. `postex_`) or regex |
+| Mode | **observe** (relay and record) or **hold** (each message waits until you forward, edit or drop it; auto-forwarded after the hold timeout) |
+| Squat | opt-in, arm + exact only: the proxy creates the pipe before the real server does |
+| Limits | 10 min default session (≤ 1 h), 1 MiB logged per message, 50 MiB per session; `\lsass`, `\ntsvcs`, `\protected_storage` are refused |
+
+The proxy adds its own server instances of the pipe. Each client that lands
+on one gets its own upstream connection to the real server, opened with
+identification-only impersonation so a malicious server cannot borrow the web
+UI's SYSTEM token. Recordings are written to `webui/pipe_sessions/` when a
+session ends and can be exported as JSON; sessions do not resume after a
+restart. The MCP tools can read sessions and recordings but cannot start or
+steer them.
+
+```
+Pipes tab → pattern "msagent_", match prefix, how arm, mode observe → Start
+Submit tab → detonate the sample → the session attaches to \msagent_<hex>
+```
+
+### Limitations
+
+- Interception needs the pipe name (or a prefix/regex) in advance. A client
+  that was already connected before the session, or connects while the
+  session is `starting`, is not intercepted.
+- Servers that check their peer (client PID, token) or that create their pipe
+  with `FILE_FLAG_FIRST_PIPE_INSTANCE` and refuse extra instances can notice
+  or defeat the proxy.
+- Squat creates the pipe first; a server that insists on owning the first
+  instance fails to start. Use it only on purpose.
+- Without an explicit `pipe_mode` the proxy reads the server's byte/message
+  mode from a throw-away instance of its own; it never connects to the server
+  for that.
+- The 30-minute pipe window of "Sweep as baseline" includes a recent
+  detonation's pipes - run it on a clean box only.
+- Observation depends on Sysmon; with `available: false` the results say so
+  instead of showing an empty list.
+- The proxy's own pipe events are hidden by the web UI's current PID. After a
+  restart, events of the previous web UI process show up in the Pipes tab's
+  event list as `python.exe`; they are never attributed to a sample (the web
+  UI is not in a sample's process tree).
+
 ## Demo
 
 Screenshots from the ARM64 UTM VM with the test samples used during development
-(`shortlived.exe`, `injectsim.exe`, `beaconsim.exe` — harmless programs that
-mimic implant behaviour).
+(`shortlived.exe`, `injectsim.exe`, `beaconsim.exe`, `pipesim.exe` — harmless
+programs that mimic implant behaviour).
 
 ### Service Dashboard
 
@@ -783,6 +873,31 @@ mimic implant behaviour).
 
 ---
 
+### Named Pipes
+
+<p align="center">
+  <img src="static/pipes_tab.png" alt="Pipes tab: events and an interception session" width="100%">
+</p>
+
+> **Pipes tab:** the Sysmon pipe events filtered to `\msagent_5e62b5` - the
+> harmless test sample `pipesim.exe` creates it and its child connects; both
+> rows are tagged **Cobalt Strike**. Below: an interception session armed for
+> the prefix `msagent_` before the detonation. It took the new pipe, relayed
+> the whole 60 s run (58 messages, `beacon n` client → server and `task n`
+> server → client, hex and ASCII) and the sample exited normally.
+
+<p align="center">
+  <img src="static/detonation_pipes.png" alt="Detonation results: NAMED PIPES section" width="100%">
+</p>
+
+> **NAMED PIPES** in the detonation results of `pipesim.exe`: one pipe, created
+> by PID 4268 and connected by its child 14484, flags *C2 default name* and
+> *random name*. Both findings enter the memory evidence (source
+> `sysmon-pipes`, verdict **MALICIOUS** together with the memory findings), and
+> **Intercept** opens the Pipes tab with an attach form for this pipe.
+
+---
+
 ### Sysmon & ETW
 
 <table>
@@ -861,7 +976,7 @@ All endpoints served on port `9000`. Responses are JSON.
 | POST | `/api/pipes/intercept/<sid>/release` | Forward every held message → `{"released": n}` |
 | GET | `/api/pipes/intercept/<sid>/export` | Session and all messages as a JSON attachment |
 
-Windows hands a connecting client the oldest free instance of a pipe, whoever owns it. Once a session is `active` the proxy keeps that a proxy instance: when a client arrives it first creates its next listening instance and only then connects upstream for this client, so the connect takes the real server's current spare and the server's next spare is younger than the proxy's. Only before the first client is an upstream opened in advance (that is what the `starting` state waits for); it consumes the server instance that predates the session, and right after the first client one more upstream is opened and closed at once to consume the spare the server created for it. After that the server never holds an idle proxy connection. If an upstream connect lands on the proxy's own instance instead (the instance's client process id is the web UI's), the proxy closes it, gives the server a moment to create its next instance (backing off up to 1 s) and retries with a fresh instance; each such episode counts once in `self_connect_retries`. Without `pipe_mode`, starting an `attach` (or an armed watcher taking a pipe) also opens and closes one connection to the real server to probe its pipe mode; passing `pipe_mode` avoids it. Only one live session may own a pipe: a second session for the same exact name is refused (400), and armed prefix/regex watchers skip pipes another session owns, because one session's upstream connect could otherwise land on the other's listening instance. Not intercepted are connections that existed before the session started or were made while it was `starting`, and a client that connects in the instant in which no proxy instance is listening (during a self-connect retry, or while the real server had no free instance).
+Windows hands a connecting client the oldest free instance of a pipe, whoever owns it. Once a session is `active` the proxy keeps that a proxy instance: when a client arrives it first creates its next listening instance and only then connects upstream for this client, so the connect takes the real server's current spare and the server's next spare is younger than the proxy's. Only before the first client is an upstream opened in advance (that is what the `starting` state waits for); it consumes the server instance that predates the session, and right after the first client one more upstream is opened and closed at once to consume the spare the server created for it. After that the server never holds an idle proxy connection. If an upstream connect lands on the proxy's own instance instead (the instance's client process id is the web UI's), the proxy closes it, gives the server a moment to create its next instance (backing off up to 1 s) and retries with a fresh instance; each such episode counts once in `self_connect_retries`. Without `pipe_mode`, the proxy reads the real server's pipe mode from a throw-away instance of its own (Windows gives every instance the type of the first one), so the probe never takes one of the server's instances; passing `pipe_mode` skips it. Only one live session may own a pipe: a second session for the same exact name is refused (400), and armed prefix/regex watchers skip pipes another session owns, because one session's upstream connect could otherwise land on the other's listening instance. Not intercepted are connections that existed before the session started or were made while it was `starting`, and a client that connects in the instant in which no proxy instance is listening (during a self-connect retry, or while the real server had no free instance).
 
 ### Hex Editor & Binary Analysis
 
@@ -994,6 +1109,21 @@ C:\tools\detection-rules\yara-combined\
 C:\tools\detection-rules\rustinel-rules\dist\windows-advanced\rules\ioc\
 ```
 
+### Sysmon Pipe Events
+
+`scripts/install-sysmon.ps1` rewrites the downloaded SwiftOnSecurity config:
+all `PipeEvent` include rules are replaced by one exclude group (image + pipe
+name pairs only) and the Sysmon log is set to 512 MB
+(`wevtutil sl Microsoft-Windows-Sysmon/Operational /ms:536870912`). Re-run it
+after updating the config:
+
+```bash
+python3 scripts/deploy-utm.py --vm-ip <vm> --vm-user tdc --vm-pass tdc --install install-sysmon.ps1
+```
+
+The pipe catalog `webui/pipe_signatures.json` is loaded once per web UI process; restart the
+web UI after editing it.
+
 ### Defender Exclusions
 
 Provisioning adds exclusions for detonation paths. To fully disable for testing:
@@ -1038,12 +1168,18 @@ transportable-detonation-chamber/
 ├── .mcp.json                      # Registers the MCP server for Claude Code
 │
 ├── tests/                          # Unit tests (make unit-test), run by GitHub Actions
+│   └── samples/pipesim.c          # Harmless named-pipe test sample (build with zig cc)
 │
 ├── webui/                          # Unified Web UI
 │   ├── app.py                     # Flask backend (APIs, proxying, PE/ELF analysis)
 │   ├── memory_evidence.py         # Tool-independent scoring of memory findings
 │   ├── minidump_analysis.py       # Offline analysis of exit-time minidumps
 │   ├── memory_results/            # Persisted live-memory results (git-ignored)
+│   ├── pipe_analysis.py           # Pipe attribution, flags, evidence and baseline keys
+│   ├── pipe_signatures.json       # Named-pipe catalog (C2 defaults, tools, APT pipes)
+│   ├── pipe_proxy.py              # Interception engine (sessions, hold queue, recording)
+│   ├── pipe_backends.py           # Win32 (ctypes) and in-memory fake pipe backends
+│   ├── pipe_sessions/             # Ended interception recordings (git-ignored)
 │   ├── memory_baseline.json       # Host memory baseline (git-ignored)
 │   ├── dev_server.py              # Dev server with live-reload
 │   ├── requirements.txt           # Python deps (flask, requests, watchdog, pefile)
@@ -1063,7 +1199,7 @@ transportable-detonation-chamber/
 │
 ├── scripts/                        # Provisioning scripts
 │   ├── install-prerequisites.ps1  # .NET 8, Python 3.12, Git, 7-Zip
-│   ├── install-sysmon.ps1         # Sysmon (ARM64-aware)
+│   ├── install-sysmon.ps1         # Sysmon (ARM64-aware; PipeEvent in exclude mode, 512 MB log)
 │   ├── install-fibratus.ps1       # Fibratus v3.0.0
 │   ├── install-rustinel.ps1       # Rustinel v1.1.1
 │   ├── install-detection-rules.ps1 # Sigma + YARA rules
@@ -1078,6 +1214,7 @@ transportable-detonation-chamber/
 │   ├── install-re-tools.ps1      # Detect It Easy, WinDbg, Ghidra
 │   ├── install-webui.ps1          # Web UI deployment
 │   ├── deploy-utm.py             # Push code to a UTM VM over WinRM, restart, run installers
+│   ├── pipe-roundtrip-test.py    # Interception round trip on the VM (observe, edit, squat)
 │   └── configure-services.ps1    # Service registration (runs on every boot)
 │
 └── prebuilt/                       # Host-built binaries uploaded by provisioning (git-ignored)

@@ -459,7 +459,15 @@ def test_win32_client_opens_are_identification_only(monkeypatch):
             return 4242
 
         def GetNamedPipeInfo(self, h, flags, *rest):
+            self.calls.append(("GetNamedPipeInfo", h))
+            if h == 5151:
+                flags._obj.value = pipe_backends.PIPE_TYPE_MESSAGE
+                return 1
             return 0
+
+        def CreateNamedPipeW(self, path, open_mode, pipe_mode, *rest):
+            self.calls.append(("CreateNamedPipeW", path))
+            return 5151
 
         def CancelIoEx(self, h, ov):
             self.calls.append(("CancelIoEx", h))
@@ -475,11 +483,15 @@ def test_win32_client_opens_are_identification_only(monkeypatch):
     h = b.connect("svc", 1.0)
     assert h.mode == "byte"
     b.close(h)
-    assert b.pipe_mode(r"\\.\pipe\svc") == "byte"
+    # The mode probe uses a throw-away server instance, never a client open,
+    # so it cannot take a single-instance server's only instance.
+    assert b.pipe_mode(r"\\.\pipe\svc") == "message"
     opens = [c for c in k32.calls if c[0] == "CreateFileW"]
-    assert [c[1] for c in opens] == [r"\\.\pipe\svc"] * 2
+    assert [c[1] for c in opens] == [r"\\.\pipe\svc"]
     assert all(c[2] == pipe_backends.CLIENT_OPEN_FLAGS for c in opens)
-    assert k32.calls.count(("CloseHandle", 4242)) == 2
+    assert ("CreateNamedPipeW", r"\\.\pipe\svc") in k32.calls
+    assert k32.calls.count(("CloseHandle", 4242)) == 1
+    assert k32.calls.count(("CloseHandle", 5151)) == 1
 
 
 def test_win_handle_close_waits_for_in_flight_io():
