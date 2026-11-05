@@ -598,7 +598,7 @@ ways.
 Sysmon logs every pipe creation (EID 17) and connection (EID 18). The
 provisioning switches the SwiftOnSecurity `PipeEvent` filter from its short
 include list to **exclude** mode, so every pipe is logged except a few noisy
-pairs of image *and* pipe name (Chrome/Edge Mojo pipes, svchost from
+pairs of image *and* pipe name (Chrome/Edge Mojo and Crashpad pipes, svchost from
 `System32`, Defender from its platform folder) - never by name alone. The
 Sysmon log is enlarged to 512 MB.
 
@@ -611,7 +611,7 @@ the results:
 | `c2_default` | name matches the catalog `webui/pipe_signatures.json` (C2 defaults, credential dumpers, remote-exec tools, APT pipes) | structural, weight from the catalog (C2 4.0, remote exec 3.0); never baseline-suppressed, counted once per pipe |
 | `cross_process` | created by the sample tree and connected by a process outside it (or the other way round) | behavioural 1.5, needs corroboration |
 | `sensitive_system` | the sample connects to `\svcctl`, `\lsarpc`, `\samr`, `\netlogon` or `\atsvc` | behavioural 1.0, needs corroboration |
-| `random_name` | the name looks random (hex/GUID runs) | string 0.8, needs corroboration |
+| `random_name` | the name looks random (last part GUID-shaped, or ≥ 12 characters with high entropy) | string 0.8, needs corroboration |
 
 Pipe findings enter the same evidence model as live memory (source
 `sysmon-pipes`), so a default C2 pipe alone makes a sample SUSPICIOUS, and
@@ -665,7 +665,9 @@ Submit tab → detonate the sample → the session attaches to \msagent_<hex>
   instance fails to start. Use it only on purpose.
 - Without an explicit `pipe_mode` the proxy reads the server's byte/message
   mode from a throw-away instance of its own; it never connects to the server
-  for that.
+  for that. A client that connects in the instant this instance exists (only
+  possible while the server has no free instance) loses its connection when
+  it is closed; passing `pipe_mode` avoids even that.
 - The 30-minute pipe window of "Sweep as baseline" includes a recent
   detonation's pipes - run it on a clean box only.
 - Observation depends on Sysmon; with `available: false` the results say so

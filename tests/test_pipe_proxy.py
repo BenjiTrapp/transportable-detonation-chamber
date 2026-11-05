@@ -469,6 +469,10 @@ def test_win32_client_opens_are_identification_only(monkeypatch):
             self.calls.append(("CreateNamedPipeW", path))
             return 5151
 
+        def GetNamedPipeHandleStateW(self, h, state, cur, *rest):
+            cur._obj.value = self.instances
+            return 1
+
         def CancelIoEx(self, h, ov):
             self.calls.append(("CancelIoEx", h))
             return 1
@@ -478,6 +482,7 @@ def test_win32_client_opens_are_identification_only(monkeypatch):
             return 1
 
     k32 = K32()
+    k32.instances = 2
     monkeypatch.setattr(pipe_backends, "_k32", k32)
     b = pipe_backends.Win32PipeBackend()
     h = b.connect("svc", 1.0)
@@ -492,6 +497,12 @@ def test_win32_client_opens_are_identification_only(monkeypatch):
     assert ("CreateNamedPipeW", r"\\.\pipe\svc") in k32.calls
     assert k32.calls.count(("CloseHandle", 4242)) == 1
     assert k32.calls.count(("CloseHandle", 5151)) == 1
+    # If the probe instance is the only one, the server's pipe is gone: the
+    # probe must not leave a pipe of its own behind or guess a mode.
+    k32.instances = 1
+    with pytest.raises(FileNotFoundError):
+        b.pipe_mode("svc")
+    assert k32.calls.count(("CloseHandle", 5151)) == 2
 
 
 def test_win_handle_close_waits_for_in_flight_io():

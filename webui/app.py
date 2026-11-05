@@ -3479,7 +3479,7 @@ def _read_sysmon_events(max_events=100, since=None, pid=None, event_id=None, eve
             event["access"] = item.get("GrantedAccess", "")
         elif eid == 17 or eid == 18:  # PipeEvent
             event["type"] = "PipeCreated" if eid == 17 else "PipeConnected"
-            event["pipe"] = pipe_analysis.canonical_name(item.get("PipeName", ""))
+            event["pipe"] = pipe_analysis.sysmon_pipe_name(item.get("PipeName", ""))
             event["event_type"] = item.get("EventType", "")
         else:
             event["type"] = f"Event_{eid}"

@@ -284,6 +284,11 @@ def test_anonymous_pipes_are_ignored():
     ev = _pipe_ev("create", 4072, "<Anonymous Pipe>")
     assert pipe_analysis.is_ignored(ev, self_pid=None)
     assert not pipe_analysis.is_ignored(_pipe_ev("create", 4072, r"\anonymous"), None)
+    # A real pipe named like the placeholder arrives with a backslash and stays visible.
+    assert not pipe_analysis.is_ignored(_pipe_ev("create", 4072, r"\<Anonymous Pipe>"), None)
+    assert pipe_analysis.sysmon_pipe_name("<Anonymous Pipe>") == "<Anonymous Pipe>"
+    assert pipe_analysis.sysmon_pipe_name(r"\<Anonymous Pipe>") == r"\<Anonymous Pipe>"
+    assert pipe_analysis.sysmon_pipe_name(r"\\.\pipe\x") == r"\x"
     res = pipe_analysis.analyze([ev], {"4072"}, _resolve, self_pid=None)
     assert res["pipes"] == []
 

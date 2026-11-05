@@ -36,6 +36,14 @@ def canonical_name(name: str) -> str:
     return "\\" + n.lstrip("\\")
 
 
+def sysmon_pipe_name(raw: str) -> str:
+    """Canonical name of a Sysmon `PipeName`, except Sysmon's own placeholder
+    `<Anonymous Pipe>`, which is kept as is so it stays distinguishable from a
+    real pipe of that name (always logged with a leading backslash)."""
+    n = (raw or "").strip()
+    return n if n.lower() == _ANONYMOUS else canonical_name(n)
+
+
 def normalize_for_key(name: str) -> str:
     """Lowercased canonical name with GUIDs, hex runs and digit runs as `*`."""
     n = canonical_name(name).lower()
@@ -148,7 +156,9 @@ def looks_random(name: str) -> bool:
 SENSITIVE_SYSTEM_PIPES = frozenset({r"\svcctl", r"\lsarpc", r"\samr", r"\netlogon", r"\atsvc"})
 _IGNORED_PREFIXES = (r"\pshost.",)
 # Sysmon's placeholder for unnamed (anonymous) pipes, e.g. stdout redirection.
-_ANONYMOUS = r"\<anonymous pipe>"
+# Compared raw: a real named pipe always arrives with a leading backslash, so
+# `\<Anonymous Pipe>` (a legal pipe name) is not hidden.
+_ANONYMOUS = "<anonymous pipe>"
 _DEFAULT_SIGNATURES: list | None = None
 _FRACTION_RE = re.compile(r"(\.\d{6})\d+")
 
@@ -181,8 +191,11 @@ def is_ignored(ev, self_pid) -> bool:
     pid = ev.get("pid")
     if pid in (None, "") or (self_pid is not None and str(pid) == str(self_pid)):
         return True
-    name = canonical_name(ev.get("pipe") or "").lower()
-    return name in ("\\", _ANONYMOUS) or name.startswith(_IGNORED_PREFIXES)
+    raw = (ev.get("pipe") or "").strip()
+    if raw.lower() == _ANONYMOUS:
+        return True
+    name = canonical_name(raw).lower()
+    return name == "\\" or name.startswith(_IGNORED_PREFIXES)
 
 
 def analyze(events, sample_keys, resolve, self_pid, signatures=None) -> dict:

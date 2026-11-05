@@ -351,6 +351,8 @@ if os.name == "nt":
         ("WaitNamedPipeW", wt.BOOL, [wt.LPCWSTR, wt.DWORD]),
         ("SetNamedPipeHandleState", wt.BOOL, [wt.HANDLE, _LPDW, _LPDW, _LPDW]),
         ("GetNamedPipeInfo", wt.BOOL, [wt.HANDLE, _LPDW, _LPDW, _LPDW, _LPDW]),
+        ("GetNamedPipeHandleStateW", wt.BOOL, [wt.HANDLE, _LPDW, _LPDW, _LPDW, _LPDW,
+                                               ctypes.c_void_p, wt.DWORD]),
         ("GetNamedPipeClientProcessId", wt.BOOL, [wt.HANDLE, ctypes.POINTER(wt.ULONG)]),
         ("ReadFile", wt.BOOL, [wt.HANDLE, ctypes.c_void_p, wt.DWORD, _LPDW, _LPOV]),
         ("WriteFile", wt.BOOL, [wt.HANDLE, ctypes.c_void_p, wt.DWORD, _LPDW, _LPOV]),
@@ -459,13 +461,19 @@ class Win32PipeBackend(PipeBackend):
 
     def pipe_mode(self, name):
         # A new instance always takes the pipe type of the pipe's first
-        # instance, whatever type it asks for (checked on Windows 11). So the
-        # real server's mode is read from a throw-away instance of our own;
-        # unlike a client probe this never occupies one of the server's
-        # instances (single-instance servers such as SMB beacons would lose
-        # their only one).
+        # instance, whatever type it asks for (checked on Windows 11 ARM64,
+        # build 26200). So the real server's mode is read from a throw-away
+        # instance of our own; unlike a client probe this never occupies one
+        # of the server's instances (single-instance servers such as SMB
+        # beacons would lose their only one).
         h = self.create_server(name, "byte", False)
         try:
+            count = wt.DWORD(0)
+            if _k32.GetNamedPipeHandleStateW(h.value, None, ctypes.byref(count), None, None,
+                                             None, 0) and count.value <= 1:
+                # Ours is the only instance: the server's pipe vanished and we
+                # just created a new pipe instead of probing it.
+                raise FileNotFoundError(f"pipe {canonical_name(name)} not found")
             flags = wt.DWORD(0)
             if not _k32.GetNamedPipeInfo(h.value, ctypes.byref(flags), None, None, None):
                 raise _winerr(ctypes.get_last_error(), "GetNamedPipeInfo")
