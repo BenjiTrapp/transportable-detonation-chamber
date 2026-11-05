@@ -934,6 +934,112 @@ def test_arm_watcher_skips_pipes_owned_by_another_session(backend, mgr):
         mgr.start(r"\postex_2", "observe", "attach", "exact")
 
 
+def _forward_all(m, sid, server, n, timeout=3.0):
+    got, deadline = [], time.monotonic() + timeout
+    while len(got) < n and time.monotonic() < deadline:
+        m.release_all(sid)
+        d = server.recv(timeout=0.02)
+        if d:
+            got.append(d)
+    return got
+
+
+@pytest.mark.parametrize("caps", [{"max_queued_messages": 3}, {"max_queued_bytes": 10}])
+def test_hold_backpressure_stops_reading_while_head_is_held(backend, make_manager, caps):
+    m = make_manager(**caps)
+    server = backend.fake_server("bp", mode="message")
+    sid = m.start("bp", "hold", "attach", "exact")["id"]
+    client = backend.fake_client("bp")
+    sent = [f"m{i:03d}".encode() for i in range(10)]          # 4 bytes each
+    for data in sent:
+        client.send(data)
+    assert wait_for(lambda: len(m.messages(sid)) == 3)
+    time.sleep(0.1)
+    # The engine stopped pulling: the rest is still in the pipe, so the
+    # sender blocks once the pipe buffer is full instead of filling our memory.
+    assert len(m.messages(sid)) == 3
+    assert backend.data_reads == 3
+    assert _forward_all(m, sid, server, 10) == sent
+    assert [x["seq"] for x in m.messages(sid)] == list(range(1, 11))
+
+
+def test_observe_mode_is_not_throttled(backend, make_manager):
+    m = make_manager(max_queued_messages=1)
+    server = backend.fake_server("obs", mode="message")
+    m.start("obs", "observe", "attach", "exact")
+    client = backend.fake_client("obs")
+    for i in range(5):
+        client.send(bytes([i]))
+    assert [server.recv() for _ in range(5)] == [bytes([i]) for i in range(5)]
+
+
+def test_read_error_closes_connection_and_sets_last_error(backend, mgr, monkeypatch):
+    server = backend.fake_server("big", mode="message")
+    sid = mgr.start("big", "observe", "attach", "exact")["id"]
+    real_read = backend.read
+
+    def read(h, timeout):
+        data = real_read(h, timeout)
+        if data == b"HUGE":
+            raise OSError(None, "message exceeds the relay limit")
+        return data
+
+    monkeypatch.setattr(backend, "read", read)
+    client = backend.fake_client("big")
+    client.send(b"HUGE")
+    assert client.recv() is None
+    assert server.recv() is None
+    assert "relay limit" in (mgr.get(sid)["last_error"] or "")
+
+
+class _MoreDataK32:
+    """kernel32 stand-in whose ReadFile always reports ERROR_MORE_DATA: a
+    message-mode peer sending one endless message."""
+
+    def __init__(self, pb):
+        self.pb = pb
+        self.err = 0
+        self.reads = 0
+
+    def CreateEventW(self, *a):
+        return 99
+
+    def CloseHandle(self, h):
+        return 1
+
+    def ReadFile(self, *a):
+        self.reads += 1
+        self.err = self.pb.ERROR_MORE_DATA
+        return 0
+
+    def GetOverlappedResult(self, h, ov, n, wait):
+        n._obj.value = self.pb.BUFFER_SIZE
+        return 1
+
+
+def test_win32_message_reassembly_is_capped(monkeypatch):
+    import ctypes
+    import pipe_backends
+    if pipe_backends.wt is None:
+        pytest.skip("ctypes.wintypes unavailable")
+    k32 = _MoreDataK32(pipe_backends)
+    monkeypatch.setattr(pipe_backends, "_k32", k32)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: k32.err, raising=False)
+    monkeypatch.setattr(pipe_backends, "MAX_RELAY_MESSAGE", 4 * pipe_backends.BUFFER_SIZE)
+    b = pipe_backends.Win32PipeBackend()
+    h = pipe_backends._WinHandle(5, "message", cancel=lambda v: None, closer=lambda v: None)
+    assert h.acquire()
+    with pytest.raises(pipe_backends.MessageTooLarge):
+        b._read(h, 1.0)
+    assert k32.reads == 5                      # stopped right after crossing the cap
+
+
+def test_win32_relay_message_limit_is_16_mib():
+    import pipe_backends
+    assert pipe_backends.MAX_RELAY_MESSAGE == 16 * 1024 * 1024
+    assert issubclass(pipe_backends.MessageTooLarge, OSError)
+
+
 def test_start_returns_starting_before_the_first_upstream(backend, make_manager, monkeypatch):
     m = make_manager()
     backend.fake_server("slow")

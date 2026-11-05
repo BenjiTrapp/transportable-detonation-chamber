@@ -41,6 +41,10 @@ BLOCKLIST = frozenset({"\\lsass", "\\ntsvcs", "\\protected_storage"})
 MAX_MESSAGE_LOG = 1024 * 1024
 MAX_SESSION_RECORD = 50 * 1024 * 1024
 MAX_DURATION_LIMIT = 3600
+# Hold mode: while a direction's head message is held, it stops reading once
+# the session holds this much (the pipe buffer then fills and the peer blocks).
+MAX_QUEUED_BYTES = 16 * 1024 * 1024
+MAX_QUEUED_MESSAGES = 1000
 DEFAULT_HOLD_TIMEOUT = 30
 MAX_SETTLE = 1.0
 FLUSH_TIMEOUT = 1.0
@@ -66,6 +70,7 @@ class _Item:
     def __init__(self, seq, data, state, held_at, rec, direction):
         self.seq = seq
         self.data = data
+        self.queued_size = len(data)
         self.state = state
         self.held_at = held_at
         self.rec = rec
@@ -120,6 +125,8 @@ class _Session:
         self.pending = {}
         self.next_seq = 1
         self.recorded_bytes = 0
+        self.queued_bytes = 0
+        self.queued_count = 0
         self.recording_truncated = False
         self.last_error = None
         self.watch_polls = 0
@@ -141,8 +148,12 @@ class InterceptManager:
                  io_timeout: float = 0.25, poll_interval: float = 0.5,
                  connect_timeout: float = 5.0, max_message_log: int = MAX_MESSAGE_LOG,
                  max_session_record: int = MAX_SESSION_RECORD, drain_timeout: float = 2.0,
-                 own_pid: Optional[int] = None, settle: float = 0.1):
+                 own_pid: Optional[int] = None, settle: float = 0.1,
+                 max_queued_bytes: int = MAX_QUEUED_BYTES,
+                 max_queued_messages: int = MAX_QUEUED_MESSAGES):
         self.backend = backend
+        self.max_queued_bytes = max_queued_bytes
+        self.max_queued_messages = max_queued_messages
         self.own_pid = os.getpid() if own_pid is None else own_pid
         self.settle = settle
         self.store_dir = store_dir
@@ -765,14 +776,17 @@ class InterceptManager:
         """Read `d.src`, record, and write decided messages to `d.dst`.
 
         This thread is the only writer of its direction. After EOF or session
-        end it stops reading and only drains the queue.
+        end it stops reading and only drains the queue. While its head message
+        is held and the session's queue is over its limits it does not read
+        either (backpressure), until a decision lets the queue drain.
         """
         while not s.stop_evt.is_set():
             self._flush(s, d)
             with s.lock:
-                reading = not d.eof and not s.ended
-                if not reading and not d.queue:
+                done = d.eof or s.ended
+                if done and not d.queue:
                     break
+                reading = not done and not self._throttled(s, d)
             if not reading:
                 d.wake.wait(self.io_timeout)
                 d.wake.clear()
@@ -780,7 +794,7 @@ class InterceptManager:
             try:
                 data = self.backend.read(d.src, self.io_timeout)
             except OSError as e:
-                print(f"[pipe_proxy] session {s.id}: read {d.name} failed: {e}")
+                self._note_error(s, f"read {d.name} failed: {e}")
                 data = None
             if data is None:
                 with s.lock:
@@ -794,6 +808,12 @@ class InterceptManager:
             # The source went away: propagate the close to the other side.
             self._close(s, d.src)
             self._close(s, d.dst)
+
+    def _throttled(self, s, d):
+        """True while `d` must not read; caller holds `s.lock`. After a flush
+        a non-empty queue means its head is held."""
+        return bool(d.queue) and (s.queued_bytes >= self.max_queued_bytes
+                                  or s.queued_count >= self.max_queued_messages)
 
     def _record(self, s, d, data):
         now = self.clock()
@@ -817,6 +837,8 @@ class InterceptManager:
             s.messages.append(rec)
             item = _Item(seq, data, state, now, rec, d)
             d.queue.append(item)
+            s.queued_bytes += item.queued_size
+            s.queued_count += 1
             s.pending[seq] = item
 
     def _flush(self, s, d):
@@ -829,6 +851,8 @@ class InterceptManager:
                 if not d.queue or d.queue[0].state == "held":
                     return
                 item = d.queue.popleft()
+                s.queued_bytes -= item.queued_size
+                s.queued_count -= 1
                 s.pending.pop(item.seq, None)
                 if item.state == "dropped":
                     continue

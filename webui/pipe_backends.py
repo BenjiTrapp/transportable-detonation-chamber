@@ -133,6 +133,7 @@ class FakePipeBackend(PipeBackend):
         self._instances = []
         self.created = []           # (canonical name, mode, first_instance) per create_server
         self.connect_attempts = 0   # backend.connect calls (the engine's upstream side)
+        self.data_reads = 0         # read calls that returned data
         self._blocked = set()       # pipe keys whose writes block (simulates a stalled reader)
 
     def block_writes(self, name, blocked=True):
@@ -250,6 +251,7 @@ class FakePipeBackend(PipeBackend):
                     return None
                 box = inst.inbox[h.side]
                 if box:
+                    self.data_reads += 1
                     if inst.mode == "message":
                         return box.popleft()
                     data = b"".join(box)
@@ -301,6 +303,9 @@ PIPE_READMODE_MESSAGE = 0x2
 PIPE_WAIT = 0x0
 PIPE_UNLIMITED_INSTANCES = 255
 BUFFER_SIZE = 64 * 1024
+# Largest message-mode message reassembled for relaying; a larger one closes
+# the connection (the sample must not exhaust the web UI's memory).
+MAX_RELAY_MESSAGE = 16 * 1024 * 1024
 GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
 OPEN_EXISTING = 3
@@ -368,6 +373,10 @@ if os.name == "nt":
         _fn = getattr(_k32, _name)
         _fn.restype = _res
         _fn.argtypes = _args
+
+
+class MessageTooLarge(OSError):
+    """A message-mode message exceeded MAX_RELAY_MESSAGE."""
 
 
 def _winerr(code, what):
@@ -615,6 +624,7 @@ class Win32PipeBackend(PipeBackend):
 
     def _read(self, h, timeout):
         chunks = []
+        total = 0
         wait = timeout
         while True:
             buf = ctypes.create_string_buffer(BUFFER_SIZE)
@@ -628,6 +638,10 @@ class Win32PipeBackend(PipeBackend):
             if err == ERROR_MORE_DATA:
                 # Message mode: the rest of this message is already buffered.
                 chunks.append(buf.raw[:n])
+                total += n
+                if total > MAX_RELAY_MESSAGE:
+                    raise MessageTooLarge(None, f"ReadFile: message exceeds the relay limit "
+                                                f"of {MAX_RELAY_MESSAGE} bytes")
                 wait = WRITE_TIMEOUT
                 continue
             if err in _CLOSED_ERRORS or h.closed:
