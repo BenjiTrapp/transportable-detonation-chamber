@@ -1,0 +1,1972 @@
+/* Detonation Chamber - Cyberpunk theme
+   Active while <html data-theme="cyberpunk">, which the theme switch sets.
+   Every selector here starts with [data-theme="cyberpunk"] (or
+   :root[data-theme="cyberpunk"]), so nothing in this file can change Classic
+   (tests/test_theme.py::test_cyberpunk_css_is_scoped).
+   The page keeps Classic's markup: the colours of style.css :root are set
+   again below, so every rule there paints in this palette, and the rules
+   after them give the parts their Cyberpunk shape. */
+
+/* --- Palette: the values of the design spec ---
+   Each *-rgb variable is the same colour as "r, g, b", for
+   rgba(var(--name-rgb), alpha). */
+:root[data-theme="cyberpunk"] {
+    --cp-bg: #0b0716;
+    --cp-bg-rgb: 11, 7, 22;
+    --cp-bar-top: #170e2c;
+    --cp-bar-bottom: #120a22;
+    --cp-card: #140d24;
+    --cp-card-rgb: 20, 13, 36;
+    --cp-raised: #1b1232;
+    --cp-raised-rgb: 27, 18, 50;
+    --cp-line: #251a3d;
+    --cp-line-rgb: 37, 26, 61;
+    --cp-text: #f3eefc;
+    --cp-text-muted: #c9bfe3;
+    --cp-text-muted-rgb: 201, 191, 227;
+    --cp-text-dim: #8a7fb0;
+    --cp-text-dim-rgb: 138, 127, 176;
+    --cp-magenta: #ff4fd8;
+    --cp-magenta-rgb: 255, 79, 216;
+    --cp-on-magenta: #12081f;
+    --cp-cyan: #37e0ff;
+    --cp-cyan-rgb: 55, 224, 255;
+    --cp-green: #39d98a;
+    --cp-green-rgb: 57, 217, 138;
+    --cp-gold: #ffd060;
+    --cp-gold-rgb: 255, 208, 96;
+    --cp-amber: #ffb000;
+    --cp-amber-rgb: 255, 176, 0;
+    --cp-orange: #ff7a1a;
+    --cp-orange-rgb: 255, 122, 26;
+    --cp-red: #ff3b3b;
+    --cp-red-rgb: 255, 59, 59;
+    --cp-tile-critical: #d03b3b;
+    --cp-black-rgb: 0, 0, 0;
+    /* Data colours outside the spec, in its neon: one hue per kind of thing */
+    --cp-blue: #5b7cff;
+    --cp-blue-rgb: 91, 124, 255;
+    --cp-violet: #b18cff;
+    --cp-violet-rgb: 177, 140, 255;
+    --cp-purple: #b45cff;
+    --cp-purple-rgb: 180, 92, 255;
+    --cp-teal: #2de2c6;
+    --cp-teal-rgb: 45, 226, 198;
+    --cp-amber-light: #ffc23d;
+    --cp-amber-light-rgb: 255, 194, 61;
+    --cp-protector: #ffa31a;
+    --cp-heading: linear-gradient(90deg, var(--cp-gold), var(--cp-amber) 45%, var(--cp-red));
+    --cp-glow: 0 0 14px rgba(var(--cp-magenta-rgb), .35);
+    --cp-card-border: 1px solid rgba(var(--cp-magenta-rgb), .22);
+    --cp-card-shadow: 0 0 0 1px rgba(var(--cp-black-rgb), .35), 0 8px 24px -16px rgba(var(--cp-magenta-rgb), .35);
+    --cp-font-label: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --cp-font-text: system-ui, -apple-system, "Segoe UI", sans-serif;
+    --topbar-height: 56px;
+    --drawer-width: 320px;
+}
+
+/* --- Classic's colours and fonts in Cyberpunk ---
+   The same names as in style.css :root, so its rules and the canvas
+   drawings (themeColor in app.js) take these values. */
+:root[data-theme="cyberpunk"] {
+    /* Surfaces: page, cards, raised parts (buttons, table heads), lines */
+    --bg-primary: var(--cp-bg);
+    --bg-primary-rgb: var(--cp-bg-rgb);
+    --bg-secondary: var(--cp-card);
+    --bg-tertiary: var(--cp-raised);
+    --bg-card: var(--cp-card);
+    --bg-card-hover: var(--cp-raised);
+    --bg-counter: var(--cp-bg);
+    --border-primary: var(--cp-line);
+    --border-primary-rgb: var(--cp-line-rgb);
+    --border-accent: #7c2c7a;
+    --border-dashed: #4a2a5e;
+    --text-primary: var(--cp-text);
+    --text-secondary: var(--cp-text-muted);
+    --text-secondary-rgb: var(--cp-text-muted-rgb);
+    --text-muted: var(--cp-text-dim);
+    --text-muted-rgb: var(--cp-text-dim-rgb);
+    --text-dim: #665c8c;
+    /* Accents; the severities take the spec's colours */
+    --accent-cyan: var(--cp-cyan);
+    --accent-cyan-rgb: var(--cp-cyan-rgb);
+    --accent-blue: var(--cp-blue);
+    --accent-blue-rgb: var(--cp-blue-rgb);
+    --accent-purple: var(--cp-violet);
+    --accent-purple-rgb: var(--cp-violet-rgb);
+    --accent-pink: var(--cp-magenta);
+    --accent-pink-rgb: var(--cp-magenta-rgb);
+    --accent-red: var(--cp-red);
+    --accent-red-rgb: var(--cp-red-rgb);
+    --accent-orange: var(--cp-orange);
+    --accent-orange-rgb: var(--cp-orange-rgb);
+    --accent-yellow: var(--cp-amber);
+    --accent-yellow-rgb: var(--cp-amber-rgb);
+    --accent-green: var(--cp-green);
+    --accent-green-rgb: var(--cp-green-rgb);
+    --severity-critical: var(--cp-red);
+    --severity-critical-rgb: var(--cp-red-rgb);
+    --severity-high: var(--cp-orange);
+    --severity-high-rgb: var(--cp-orange-rgb);
+    --severity-medium: var(--cp-amber);
+    --severity-medium-rgb: var(--cp-amber-rgb);
+    --severity-low: var(--cp-green);
+    --severity-low-rgb: var(--cp-green-rgb);
+    /* info: cyan (Classic writes it in its secondary text colour) */
+    --severity-info: var(--cp-cyan);
+    --severity-info-rgb: var(--cp-cyan-rgb);
+    /* The Tailwind-named colours: each keeps its role (lighter or darker
+       step of a hue) in the neon palette. White and black stay. */
+    --c-white: #fff;
+    --c-white-rgb: 255, 255, 255;
+    --c-black: #000;
+    --c-black-rgb: 0, 0, 0;
+    --c-red-300: #ff9a9a;
+    --c-red-400: #ff6b6b;
+    --c-red-600: var(--cp-tile-critical);
+    --c-orange-400: #ff9a4d;
+    --c-orange-600: #e0620c;
+    --c-amber-200: #ffe7a3;
+    --c-amber-300: var(--cp-gold);
+    --c-amber-400: var(--cp-amber-light);
+    --c-amber-400-rgb: var(--cp-amber-light-rgb);
+    --c-amber-500: var(--cp-protector);
+    --c-yellow-400: #ffd84a;
+    --c-yellow-600: #c98a00;
+    --c-green-400: #5ef0a5;
+    --c-green-400-rgb: 94, 240, 165;
+    --c-teal-400: var(--cp-teal);
+    --c-teal-400-rgb: var(--cp-teal-rgb);
+    --c-teal-500: #1cc4ad;
+    --c-cyan-300: #8cecff;
+    --c-sky-400: #4cc3ff;
+    --c-sky-400-rgb: 76, 195, 255;
+    --c-sky-500: #2aa5ff;
+    --c-blue-400: #7d9bff;
+    --c-blue-400-rgb: 125, 155, 255;
+    --c-violet-300: #d2bdff;
+    --c-purple-400: #d68cff;
+    --c-purple-500: var(--cp-purple);
+    --c-purple-500-rgb: var(--cp-purple-rgb);
+    --c-slate-300: #d6cdee;
+    --c-slate-800: #241a42;
+    --c-slate-900: var(--cp-card);
+    --c-slate-900-rgb: var(--cp-card-rgb);
+    --c-slate-650: #4a3d70;
+    --c-amber-990: #2a1700;
+    /* The dark blues (roles in style.css :root) become dark violets */
+    --c-navy-800: #4a1d58;
+    --c-navy-900: #120b22;
+    --c-navy-950: var(--cp-on-magenta);
+    --c-navy-960: #0e0920;
+    --c-navy-970-rgb: var(--cp-bg-rgb);
+    --c-navy-980-rgb: 6, 3, 14;
+    --c-navy-990: #07040f;
+    /* Raw and JSON views */
+    --c-gh-blue-1: #a7e9ff;
+    --c-gh-blue-2: #7fb2ff;
+    --c-gh-green-1: #6cf2a8;
+    --c-gh-orange-2: #ffb84d;
+    --c-gh-red-3: #ff6fa8;
+    --c-gh-gray-4: #7d7399;
+    /* Data colours: the kinds keep their hues (process blue, network green,
+       DNS violet, file orange, registry pink, pipe cyan, detonated gold) */
+    --graph-process: var(--cp-blue);
+    --graph-process-rgb: var(--cp-blue-rgb);
+    --graph-network: var(--cp-green);
+    --graph-network-rgb: var(--cp-green-rgb);
+    --graph-dns: var(--cp-violet);
+    --graph-dns-rgb: var(--cp-violet-rgb);
+    --graph-file: var(--cp-orange);
+    --graph-file-rgb: var(--cp-orange-rgb);
+    --graph-registry: var(--cp-magenta);
+    --graph-registry-rgb: var(--cp-magenta-rgb);
+    --graph-pipe: var(--cp-cyan);
+    --graph-pipe-rgb: var(--cp-cyan-rgb);
+    --graph-detonated: var(--cp-gold);
+    --graph-detonated-rgb: var(--cp-gold-rgb);
+    --pe-code: var(--cp-blue);
+    --pe-data: var(--cp-green);
+    --pe-readonly: var(--cp-text-dim);
+    --pe-packer: var(--cp-purple);
+    --pe-overlay: #6f6690;
+    --pe-entropy-high: var(--cp-red);
+    --pe-entropy-warn: var(--cp-amber);
+    --pe-entropy-normal: var(--cp-green);
+    --pe-compiler: #7d9bff;
+    --pe-linker: #9d8cff;
+    --pe-protector: var(--cp-protector);
+    --pe-language: var(--cp-cyan);
+    --pe-runtime: var(--cp-teal);
+    --assess-clean: var(--cp-green);
+    --assess-clean-rgb: var(--cp-green-rgb);
+    --assess-packed: var(--cp-purple);
+    --assess-packed-rgb: var(--cp-purple-rgb);
+    --assess-encrypted: var(--cp-red);
+    --assess-encrypted-rgb: var(--cp-red-rgb);
+    --assess-protected: var(--cp-protector);
+    --assess-protected-tint-rgb: var(--cp-amber-light-rgb);
+    --assess-suspicious: var(--cp-amber-light);
+    --assess-suspicious-rgb: var(--cp-amber-light-rgb);
+    --font-mono: var(--cp-font-label);
+    --font-sans: var(--cp-font-text);
+    --radius-lg: 6px;
+}
+
+/* --- Page: deep violet with a fine magenta grid and two glows at the top;
+   running text in the sans-serif, labels and data in the monospace --- */
+[data-theme="cyberpunk"] body {
+    font-family: var(--font-sans);
+    font-size: 14px;
+    background-color: var(--cp-bg);
+    background-image:
+        radial-gradient(1100px 520px at 14% -14%, rgba(var(--cp-magenta-rgb), .22), transparent 65%),
+        radial-gradient(900px 480px at 86% -16%, rgba(var(--cp-amber-rgb), .10), transparent 62%),
+        linear-gradient(rgba(var(--cp-magenta-rgb), .045) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(var(--cp-magenta-rgb), .045) 1px, transparent 1px);
+    background-size: auto, auto, 28px 28px, 28px 28px;
+}
+[data-theme="cyberpunk"] ::selection {
+    color: var(--cp-on-magenta);
+    background: var(--cp-magenta);
+}
+
+/* --- Layout: the top bar is fixed above, the content gets the full width
+   below it, and the sidebar becomes a drawer over the content --- */
+[data-theme="cyberpunk"] #app {
+    padding-top: var(--topbar-height);
+}
+
+/* The detail view slides in below the top bar, not under it */
+[data-theme="cyberpunk"] .detail-panel {
+    top: var(--topbar-height);
+    bottom: 0;
+    height: auto;
+}
+
+[data-theme="cyberpunk"] .toast-container {
+    top: calc(var(--topbar-height) + 12px);
+}
+
+/* --- Top bar: one row; only the tab area shrinks, and tabs that do not fit
+   go into the "…" menu (updateTabOverflow in app.js) --- */
+[data-theme="cyberpunk"] #topbar {
+    position: fixed;
+    top: 0;
+    right: 0;
+    left: 0;
+    z-index: 300;
+    height: var(--topbar-height);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 0 16px;
+    white-space: nowrap;
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-muted);
+    background: linear-gradient(180deg, var(--cp-bar-top), var(--cp-bar-bottom));
+    border-bottom: 1px solid rgba(var(--cp-magenta-rgb), .5);
+    box-shadow: 0 1px 0 rgba(var(--cp-magenta-rgb), .25), 0 8px 28px rgba(var(--cp-magenta-rgb), .12);
+}
+[data-theme="cyberpunk"] #topbar > * {
+    flex-shrink: 0;
+}
+
+/* Buttons of the top bar */
+[data-theme="cyberpunk"] #drawer-toggle,
+[data-theme="cyberpunk"] #topbar-services,
+[data-theme="cyberpunk"] #topbar-more-toggle,
+[data-theme="cyberpunk"] #topbar .btn-help,
+[data-theme="cyberpunk"] #topbar .btn-theme {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    height: 32px;
+    margin: 0;
+    padding: 0 12px;
+    font-family: var(--cp-font-label);
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-text-muted);
+    background: var(--cp-raised);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: color .15s, border-color .15s, box-shadow .15s;
+}
+[data-theme="cyberpunk"] #drawer-toggle:hover:not(:disabled),
+[data-theme="cyberpunk"] #drawer-toggle[aria-expanded="true"],
+[data-theme="cyberpunk"] #topbar-services:hover:not(:disabled),
+[data-theme="cyberpunk"] #topbar-services[aria-expanded="true"],
+[data-theme="cyberpunk"] #topbar-more-toggle:hover:not(:disabled),
+[data-theme="cyberpunk"] #topbar-more-toggle[aria-expanded="true"],
+[data-theme="cyberpunk"] #topbar .btn-help:hover:not(:disabled),
+[data-theme="cyberpunk"] #topbar .btn-theme:hover:not(:disabled) {
+    color: var(--cp-text);
+    border-color: var(--cp-magenta);
+    box-shadow: var(--cp-glow);
+}
+[data-theme="cyberpunk"] #topbar button:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: 2px;
+}
+[data-theme="cyberpunk"] #drawer-toggle {
+    color: var(--cp-text);
+}
+[data-theme="cyberpunk"] #drawer-count {
+    min-width: 22px;
+    padding: 2px 6px;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .05em;
+    text-align: center;
+    color: var(--cp-on-magenta);
+    background: var(--cp-magenta);
+    border-radius: 9px;
+}
+[data-theme="cyberpunk"] #topbar .btn-theme {
+    padding: 0 11px;
+    font-size: 14px;
+    letter-spacing: 0;
+}
+
+/* Logo (the original icon.png, only scaled) and name */
+[data-theme="cyberpunk"] .topbar-brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+[data-theme="cyberpunk"] .topbar-logo {
+    width: 32px;
+    height: 32px;
+    object-fit: contain;
+    border-radius: 6px;
+}
+[data-theme="cyberpunk"] .topbar-title {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .12em;
+    color: transparent;
+    background: var(--cp-heading);
+    -webkit-background-clip: text;
+    background-clip: text;
+}
+
+/* The tabs as one switch strip; the active tab is magenta with a glow */
+[data-theme="cyberpunk"] #topbar-nav {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+[data-theme="cyberpunk"] #topbar-nav .sidebar-tabs {
+    flex: none;
+    flex-wrap: nowrap;
+    gap: 2px;
+    padding: 2px;
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+}
+[data-theme="cyberpunk"] #topbar-nav .tab {
+    flex: none;
+    height: 26px;
+    padding: 0 10px;
+    font-family: var(--cp-font-label);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-text-muted);
+    background: transparent;
+    border: 0;
+    border-radius: 4px;
+    transition: color .15s, background .15s, box-shadow .15s;
+}
+[data-theme="cyberpunk"] #topbar-nav .tab:hover {
+    color: var(--cp-text);
+    background: var(--cp-raised);
+}
+[data-theme="cyberpunk"] #topbar-nav .tab.active {
+    color: var(--cp-on-magenta);
+    background: var(--cp-magenta);
+    box-shadow: var(--cp-glow);
+}
+[data-theme="cyberpunk"] #topbar-nav .tab.tab-overflow {
+    display: none;
+}
+
+/* "…": the tabs that do not fit */
+[data-theme="cyberpunk"] .topbar-more-wrap {
+    position: relative;
+    flex: none;
+}
+[data-theme="cyberpunk"] .topbar-more-wrap[hidden] {
+    display: none;
+}
+[data-theme="cyberpunk"] #topbar-more-toggle {
+    padding: 0 10px 7px;            /* "…" sits on the baseline: lift it to the middle */
+    font-size: 17px;
+    letter-spacing: 0;
+}
+
+/* Drop-downs below their button, open while it has aria-expanded="true" */
+[data-theme="cyberpunk"] #topbar-more,
+[data-theme="cyberpunk"] #topbar-services-panel {
+    display: none;
+    position: absolute;
+    top: calc(100% + 10px);
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: 0 0 0 1px rgba(var(--cp-black-rgb), .35), 0 14px 32px -12px rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme="cyberpunk"] #topbar-more {
+    left: 0;
+    min-width: 180px;
+    flex-direction: column;
+    gap: 2px;
+    padding: 6px;
+}
+[data-theme="cyberpunk"] #topbar-more-toggle[aria-expanded="true"] + #topbar-more {
+    display: flex;
+}
+[data-theme="cyberpunk"] .topbar-more-item {
+    padding: 8px 10px;
+    font-family: var(--cp-font-label);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .08em;
+    text-align: left;
+    text-transform: uppercase;
+    color: var(--cp-text-muted);
+    background: transparent;
+    border: 0;
+    border-radius: 4px;
+    cursor: pointer;
+}
+[data-theme="cyberpunk"] .topbar-more-item:hover,
+[data-theme="cyberpunk"] .topbar-more-item:focus-visible {
+    color: var(--cp-text);
+    background: var(--cp-raised);
+}
+/* The cyan focus ring of the top bar, inside the item */
+[data-theme="cyberpunk"] #topbar .topbar-more-item:focus-visible {
+    outline-offset: -2px;
+}
+
+/* Services: a dot and "n/m ONLINE"; the drop-down holds the status row */
+[data-theme="cyberpunk"] .topbar-services-wrap {
+    position: relative;
+}
+[data-theme="cyberpunk"] #topbar-services::after {
+    /* Not part of the button's name (aria-expanded says it opens) */
+    content: "\25BE";
+    content: "\25BE" / "";
+    font-size: 10px;
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .topbar-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .topbar-dot.ok {
+    background: var(--cp-green);
+    box-shadow: 0 0 8px rgba(var(--cp-green-rgb), .7);
+}
+[data-theme="cyberpunk"] .topbar-dot.partial {
+    background: var(--cp-amber);
+    box-shadow: 0 0 8px rgba(var(--cp-amber-rgb), .7);
+}
+[data-theme="cyberpunk"] .topbar-dot.down {
+    background: var(--cp-red);
+    box-shadow: 0 0 8px rgba(var(--cp-red-rgb), .7);
+}
+[data-theme="cyberpunk"] #topbar-services-panel {
+    right: 0;
+    min-width: 230px;
+    padding: 12px 14px;
+}
+[data-theme="cyberpunk"] #topbar-services[aria-expanded="true"] + #topbar-services-panel {
+    display: block;
+}
+[data-theme="cyberpunk"] #topbar-services-panel::before {
+    content: "SERVICE STATUS";
+    display: block;
+    margin-bottom: 10px;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .12em;
+    color: var(--cp-cyan);
+}
+[data-theme="cyberpunk"] #topbar-services-panel .sidebar-footer {
+    padding: 0;
+    border-top: 0;
+    gap: 8px;
+}
+[data-theme="cyberpunk"] #topbar-services-panel .status-item {
+    gap: 8px;
+    font-family: var(--cp-font-label);
+    font-size: 11px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--cp-text-muted);
+}
+[data-theme="cyberpunk"] #topbar-services-panel .status-item .dot {
+    width: 8px;
+    height: 8px;
+    background: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] #topbar-services-panel .status-item.online .dot {
+    background: var(--cp-green);
+    box-shadow: 0 0 8px rgba(var(--cp-green-rgb), .7);
+}
+[data-theme="cyberpunk"] #topbar-services-panel .status-item.offline .dot {
+    background: var(--cp-red);
+    box-shadow: 0 0 8px rgba(var(--cp-red-rgb), .7);
+}
+[data-theme="cyberpunk"] #topbar-services-panel .status-item::after {
+    margin-left: auto;
+    padding-left: 16px;
+    font-size: 10.5px;
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] #topbar-services-panel .status-item.online::after {
+    content: "online";
+    color: var(--cp-green);
+}
+[data-theme="cyberpunk"] #topbar-services-panel .status-item.offline::after {
+    content: "offline";
+    color: var(--cp-red);
+}
+
+/* Time of the last status update */
+[data-theme="cyberpunk"] #topbar-time {
+    min-width: 9ch;
+    font-size: 11px;
+    letter-spacing: .05em;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    color: var(--cp-text-dim);
+}
+
+/* --- Drawer: process list and timeline, slid out of view until
+   ☰ PROCESSES opens it (#app.drawer-open) --- */
+[data-theme="cyberpunk"] #sidebar {
+    position: fixed;
+    top: var(--topbar-height);
+    bottom: 0;
+    left: 0;
+    z-index: 250;
+    width: var(--drawer-width);
+    min-width: 0;
+    background: var(--cp-card);
+    border-right: 1px solid rgba(var(--cp-magenta-rgb), .35);
+    box-shadow: 12px 0 36px -12px rgba(var(--cp-magenta-rgb), .35);
+    transform: translateX(-100%);
+    visibility: hidden;
+    transition: transform .22s ease, visibility 0s linear .22s;
+}
+[data-theme="cyberpunk"] #app.drawer-open #sidebar {
+    transform: none;
+    visibility: visible;
+    transition: transform .22s ease;
+}
+/* Logo, Help and ✶ are in the top bar */
+[data-theme="cyberpunk"] #sidebar .sidebar-header {
+    display: none;
+}
+[data-theme="cyberpunk"] #sidebar .sidebar-section {
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--cp-line);
+}
+[data-theme="cyberpunk"] #sidebar .section-header {
+    margin-bottom: 10px;
+}
+[data-theme="cyberpunk"] #sidebar .section-title {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .12em;
+    color: var(--cp-cyan);
+}
+[data-theme="cyberpunk"] #sidebar .badge {
+    padding: 1px 7px;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: .05em;
+    color: var(--cp-magenta);
+    background: rgba(var(--cp-magenta-rgb), .14);
+    border: 1px solid rgba(var(--cp-magenta-rgb), .35);
+    border-radius: 9px;
+}
+[data-theme="cyberpunk"] #sidebar .process-item:hover {
+    background: var(--cp-raised);
+}
+[data-theme="cyberpunk"] #sidebar .process-item.active {
+    background: rgba(var(--cp-magenta-rgb), .14);
+    box-shadow: inset 2px 0 0 var(--cp-magenta);
+}
+[data-theme="cyberpunk"] #sidebar .process-item .proc-icon {
+    background: var(--cp-cyan);
+}
+[data-theme="cyberpunk"] #sidebar .process-item .proc-icon.threat {
+    background: var(--cp-red);
+    box-shadow: 0 0 6px rgba(var(--cp-red-rgb), .6);
+}
+[data-theme="cyberpunk"] #sidebar .process-item .proc-name {
+    color: var(--cp-text);
+}
+[data-theme="cyberpunk"] #sidebar .process-item .proc-pid {
+    color: var(--cp-text-dim);
+}
+
+/* Darkens the content (not the top bar) while the drawer is open. Closed,
+   it lets every click through at once, not only after its fade. */
+[data-theme="cyberpunk"] #drawer-scrim {
+    display: block;
+    position: fixed;
+    top: var(--topbar-height);
+    right: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 200;
+    background: rgba(var(--cp-bg-rgb), .66);
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition: opacity .22s ease, visibility 0s linear .22s;
+}
+[data-theme="cyberpunk"] #app.drawer-open #drawer-scrim {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transition: opacity .22s ease;
+}
+
+/* --- Tab heads: the .content-header of each tab is a head area with a
+   green kicker line, the title in the heading gradient and the subtitle
+   below it; the controls stay on the right --- */
+[data-theme="cyberpunk"] .content-header {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "kicker actions" "title actions" "sub actions";
+    align-items: center;
+    column-gap: 24px;
+    padding: 16px 24px 14px;
+    background: linear-gradient(180deg, rgba(var(--cp-magenta-rgb), .06), rgba(var(--cp-magenta-rgb), 0));
+    border-bottom: 1px solid var(--cp-line);
+}
+[data-theme="cyberpunk"] .content-header::before {
+    /* Decoration: the empty alternative text keeps screen readers from reading
+       it before every title (the first line is for browsers without it) */
+    content: "TDC // DETONATION CHAMBER";
+    content: "TDC // DETONATION CHAMBER" / "";
+    grid-area: kicker;
+    margin-bottom: 4px;
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: .12em;
+    color: var(--cp-green);
+}
+[data-theme="cyberpunk"] .content-header h2 {
+    grid-area: title;
+    justify-self: start;
+    font-family: var(--cp-font-label);
+    font-size: 22px;
+    font-weight: 700;
+    line-height: 1.15;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: transparent;
+    background: var(--cp-heading);
+    -webkit-background-clip: text;
+    background-clip: text;
+}
+[data-theme="cyberpunk"] .content-subtitle {
+    grid-area: sub;
+    margin-top: 4px;
+    font-family: var(--cp-font-text);
+    font-size: 14px;
+    color: var(--cp-text-muted);
+}
+[data-theme="cyberpunk"] .content-header .header-actions {
+    grid-area: actions;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+[data-theme="cyberpunk"] .header-meta,
+[data-theme="cyberpunk"] .scanner-status {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    letter-spacing: .06em;
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .scanner-status.online {
+    color: var(--cp-green);
+}
+
+/* Tracing and Graph have their own head rows: the same look, no kicker */
+[data-theme="cyberpunk"] .rtrace-header,
+[data-theme="cyberpunk"] .graph-toolbar {
+    padding: 12px 20px;
+    background: linear-gradient(180deg, rgba(var(--cp-magenta-rgb), .06), rgba(var(--cp-magenta-rgb), 0));
+    border-bottom: 1px solid var(--cp-line);
+}
+[data-theme="cyberpunk"] .rtrace-brand,
+[data-theme="cyberpunk"] .graph-title {
+    font-family: var(--cp-font-label);
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-text-muted);
+}
+[data-theme="cyberpunk"] .rtrace-brand-highlight,
+[data-theme="cyberpunk"] .graph-title {
+    font-style: normal;
+    color: transparent;
+    background: var(--cp-heading);
+    -webkit-background-clip: text;
+    background-clip: text;
+}
+[data-theme="cyberpunk"] .graph-subtitle {
+    font-family: var(--cp-font-text);
+    font-size: 13px;
+    color: var(--cp-text-muted);
+}
+
+/* --- Cards: card surface, a faint magenta edge, 6 px corners --- */
+[data-theme="cyberpunk"] .stat-card,
+[data-theme="cyberpunk"] .service-card,
+[data-theme="cyberpunk"] .activity-feed,
+[data-theme="cyberpunk"] .pipes-panel,
+[data-theme="cyberpunk"] .scanner-livemem,
+[data-theme="cyberpunk"] .scanner-placeholder,
+[data-theme="cyberpunk"] .ts-tools,
+[data-theme="cyberpunk"] .ts-tool-card,
+[data-theme="cyberpunk"] .die-overview,
+[data-theme="cyberpunk"] .pe-card,
+[data-theme="cyberpunk"] .elf-card,
+[data-theme="cyberpunk"] .det-panel,
+[data-theme="cyberpunk"] .detonation-section,
+[data-theme="cyberpunk"] .graph-sample-card,
+[data-theme="cyberpunk"] .help-card,
+[data-theme="cyberpunk"] .help-guide-item,
+[data-theme="cyberpunk"] .child-card,
+[data-theme="cyberpunk"] .fmap-tree,
+[data-theme="cyberpunk"] .fmap-inline,
+[data-theme="cyberpunk"] .hex-minimap-wrap,
+[data-theme="cyberpunk"] .sysmon-correlation,
+[data-theme="cyberpunk"] .lb-detail-panel {
+    background-color: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow);
+}
+/* Cards whose left edge shows a state or a severity keep it */
+[data-theme="cyberpunk"] .det-stage,
+[data-theme="cyberpunk"] .graph-landing-card {
+    background-color: var(--cp-card);
+    border-top-color: rgba(var(--cp-magenta-rgb), .22);
+    border-right-color: rgba(var(--cp-magenta-rgb), .22);
+    border-bottom-color: rgba(var(--cp-magenta-rgb), .22);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow);
+}
+[data-theme="cyberpunk"] .service-card:hover,
+[data-theme="cyberpunk"] .graph-landing-card:hover,
+[data-theme="cyberpunk"] .graph-sample-card:hover,
+[data-theme="cyberpunk"] .child-card:hover,
+[data-theme="cyberpunk"] .help-card:hover {
+    background-color: var(--cp-raised);
+    border-color: rgba(var(--cp-magenta-rgb), .6);
+    box-shadow: var(--cp-card-shadow), var(--cp-glow);
+}
+[data-theme="cyberpunk"] .service-card {
+    padding: 16px;
+}
+[data-theme="cyberpunk"] .service-card-glow {
+    opacity: .07;
+}
+[data-theme="cyberpunk"] .service-card-title h3 {
+    font-family: var(--cp-font-label);
+    font-size: 12px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+}
+[data-theme="cyberpunk"] .service-card-desc,
+[data-theme="cyberpunk"] .help-card-desc,
+[data-theme="cyberpunk"] .help-guide-item p {
+    font-family: var(--cp-font-text);
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--cp-text-muted);
+}
+[data-theme="cyberpunk"] .service-metric,
+[data-theme="cyberpunk"] .activity-counter {
+    background: rgba(var(--cp-bg-rgb), .7);
+    border-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .service-metric-value {
+    font-family: var(--cp-font-label);
+}
+[data-theme="cyberpunk"] .service-metric-label,
+[data-theme="cyberpunk"] .counter-label {
+    font-family: var(--cp-font-label);
+    font-size: 10px;
+    letter-spacing: .1em;
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .service-status-badge {
+    font-family: var(--cp-font-label);
+    letter-spacing: .1em;
+    border: 1px solid currentColor;
+}
+/* Activity list and the rows inside cards keep the card surface */
+[data-theme="cyberpunk"] .dashboard-stats,
+[data-theme="cyberpunk"] .dashboard-activity {
+    border-color: var(--cp-line);
+}
+
+/* --- Tiles: a 3 px edge on the left in the colour of their severity
+   (alerts critical, processes info, services low, rules medium, tools
+   high), the figure in 28 px --- */
+[data-theme="cyberpunk"] .stat-card {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    padding: 16px 16px 14px 19px;
+    text-align: left;
+}
+[data-theme="cyberpunk"] .stat-card::before {
+    top: 0;
+    right: auto;
+    bottom: 0;
+    left: 0;
+    width: 3px;
+    height: auto;
+}
+[data-theme="cyberpunk"] .stat-card.stat-alerts::before {
+    background: var(--cp-tile-critical);
+}
+[data-theme="cyberpunk"] .stat-card.stat-processes::before {
+    background: var(--cp-cyan);
+}
+[data-theme="cyberpunk"] .stat-card.stat-services::before {
+    background: var(--cp-green);
+}
+[data-theme="cyberpunk"] .stat-card.stat-rules::before {
+    background: var(--cp-amber);
+}
+[data-theme="cyberpunk"] .stat-card.stat-tools::before {
+    background: var(--cp-orange);
+}
+[data-theme="cyberpunk"] .stat-value {
+    font-family: var(--cp-font-label);
+    font-size: 28px;
+    font-weight: 600;
+    margin-bottom: 8px;
+}
+[data-theme="cyberpunk"] .stat-label {
+    order: -1;
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    letter-spacing: .12em;
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .stat-breakdown {
+    justify-content: flex-start;
+}
+[data-theme="cyberpunk"] .stat-tag {
+    font-family: var(--cp-font-label);
+    font-size: 10px;
+    letter-spacing: .04em;
+}
+
+/* --- Section titles: cyan, monospace, upper case --- */
+[data-theme="cyberpunk"] .activity-header h3,
+[data-theme="cyberpunk"] .scanner-history-header h3,
+[data-theme="cyberpunk"] .submissions-header h3,
+[data-theme="cyberpunk"] .pe-panel-header h3,
+[data-theme="cyberpunk"] .elf-panel-header h3,
+[data-theme="cyberpunk"] .detail-section-title,
+[data-theme="cyberpunk"] .det-sub-title,
+[data-theme="cyberpunk"] .det-panel-title,
+[data-theme="cyberpunk"] .detonation-section-title,
+[data-theme="cyberpunk"] .die-title,
+[data-theme="cyberpunk"] .die-section-title,
+[data-theme="cyberpunk"] .pe-card-title,
+[data-theme="cyberpunk"] .elf-card-title,
+[data-theme="cyberpunk"] .hex-minimap-title,
+[data-theme="cyberpunk"] .hex-inspector-title,
+[data-theme="cyberpunk"] .pipes-panel-title,
+[data-theme="cyberpunk"] .lb-scanners-title,
+[data-theme="cyberpunk"] .lb-sub-title,
+[data-theme="cyberpunk"] .lb-detail-title,
+[data-theme="cyberpunk"] .corr-panel-title,
+[data-theme="cyberpunk"] .fmap-legend-title,
+[data-theme="cyberpunk"] .fmap-tree-head,
+[data-theme="cyberpunk"] .capa-group-title,
+[data-theme="cyberpunk"] .rtrace-tree-header,
+[data-theme="cyberpunk"] .rtrace-timeline-label,
+[data-theme="cyberpunk"] .graph-landing-title,
+[data-theme="cyberpunk"] .help-section h4 {
+    font-family: var(--cp-font-label);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--cp-cyan);
+}
+[data-theme="cyberpunk"] .graph-landing-title {
+    font-size: 12px;
+}
+[data-theme="cyberpunk"] .det-panel-title {
+    background: rgba(var(--cp-cyan-rgb), .04);
+}
+
+/* --- Tables: head in cyan on the raised surface, rows divided by the line
+   colour, hover raised --- */
+[data-theme="cyberpunk"] .sysmon-events-table thead th,
+[data-theme="cyberpunk"] .alerts-table thead th,
+[data-theme="cyberpunk"] .pe-table th,
+[data-theme="cyberpunk"] .elf-table th,
+[data-theme="cyberpunk"] .corr-ref-table th,
+[data-theme="cyberpunk"] .submissions-table th,
+[data-theme="cyberpunk"] .help-api-table th,
+[data-theme="cyberpunk"] .det-alert-table th,
+[data-theme="cyberpunk"] .ember-more-table th,
+[data-theme="cyberpunk"] .mem-dump-table th,
+[data-theme="cyberpunk"] .pipes-table th,
+[data-theme="cyberpunk"] .rtrace-event-table-header {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-cyan);
+    background: var(--cp-raised);
+    border-bottom: 1px solid var(--cp-line);
+}
+[data-theme="cyberpunk"] .submissions-table thead,
+[data-theme="cyberpunk"] .help-api-table thead {
+    background: var(--cp-raised);
+}
+[data-theme="cyberpunk"] .sysmon-events-table td,
+[data-theme="cyberpunk"] .submissions-table td,
+[data-theme="cyberpunk"] .help-api-table td,
+[data-theme="cyberpunk"] .det-alert-table td,
+[data-theme="cyberpunk"] .mem-dump-table td,
+[data-theme="cyberpunk"] .pipes-table td,
+[data-theme="cyberpunk"] .pe-table td,
+[data-theme="cyberpunk"] .elf-table td {
+    border-bottom-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .sysmon-events-table tbody tr,
+[data-theme="cyberpunk"] .rtrace-event-row {
+    border-bottom-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .sysmon-events-table tbody tr:hover,
+[data-theme="cyberpunk"] .submissions-table tr:hover td,
+[data-theme="cyberpunk"] .help-api-table tr:hover td,
+[data-theme="cyberpunk"] .pipes-table tr:hover td,
+[data-theme="cyberpunk"] .rtrace-event-row:hover {
+    background: var(--cp-raised);
+}
+[data-theme="cyberpunk"] .help-api-table {
+    border-color: var(--cp-line);
+}
+
+/* --- Alerts tab: the filter bar on the page, the severity chips as switches
+   (a pressed one in its severity's colour with its glow), the count as a
+   label; the table takes the table look above --- */
+[data-theme="cyberpunk"] .alerts-filters {
+    padding: 12px 24px;
+    background: transparent;
+}
+[data-theme="cyberpunk"] .alerts-sev-chip {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    letter-spacing: .08em;
+    color: var(--cp-text-dim);
+    background: var(--cp-raised);
+    border-color: rgba(var(--cp-magenta-rgb), .22);
+    border-radius: 4px;
+}
+[data-theme="cyberpunk"] .alerts-sev-chip[aria-pressed="false"]:hover:not(:disabled) {
+    color: var(--cp-text);
+    background: var(--cp-raised);
+    border-color: var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .alerts-sev-chip.critical[aria-pressed="true"] {
+    box-shadow: 0 0 12px rgba(var(--severity-critical-rgb), .35);
+}
+[data-theme="cyberpunk"] .alerts-sev-chip.high[aria-pressed="true"] {
+    box-shadow: 0 0 12px rgba(var(--severity-high-rgb), .35);
+}
+[data-theme="cyberpunk"] .alerts-sev-chip.medium[aria-pressed="true"] {
+    box-shadow: 0 0 12px rgba(var(--severity-medium-rgb), .35);
+}
+[data-theme="cyberpunk"] .alerts-sev-chip.low[aria-pressed="true"] {
+    box-shadow: 0 0 12px rgba(var(--severity-low-rgb), .35);
+}
+[data-theme="cyberpunk"] .alerts-sev-chip.info[aria-pressed="true"] {
+    box-shadow: 0 0 12px rgba(var(--severity-info-rgb), .35);
+}
+[data-theme="cyberpunk"] .alerts-sev-chip:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: 2px;
+}
+[data-theme="cyberpunk"] .alerts-count {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .alerts-table-wrap {
+    padding: 0 24px 16px;
+}
+[data-theme="cyberpunk"] .alerts-table .alerts-limit-row td {
+    font-family: var(--cp-font-label);
+    letter-spacing: .06em;
+}
+
+/* --- Buttons: raised, faint magenta edge; magenta with a glow on hover.
+   Primary actions are magenta with dark text. --- */
+[data-theme="cyberpunk"] .btn,
+[data-theme="cyberpunk"] .btn-xs,
+[data-theme="cyberpunk"] .btn-help,
+[data-theme="cyberpunk"] .btn-theme {
+    font-family: var(--cp-font-label);
+    font-weight: 600;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--cp-text-muted);
+    background: var(--cp-raised);
+    border: 1px solid rgba(var(--cp-magenta-rgb), .22);
+    border-radius: 4px;
+    transition: color .15s, border-color .15s, box-shadow .15s, background-color .15s;
+}
+[data-theme="cyberpunk"] .btn:hover:not(:disabled),
+[data-theme="cyberpunk"] .btn-xs:hover:not(:disabled),
+[data-theme="cyberpunk"] .btn-help:hover:not(:disabled),
+[data-theme="cyberpunk"] .btn-theme:hover:not(:disabled) {
+    color: var(--cp-text);
+    background: var(--cp-raised);
+    border-color: var(--cp-magenta);
+    box-shadow: var(--cp-glow);
+}
+[data-theme="cyberpunk"] .btn-primary,
+[data-theme="cyberpunk"] .etw-btn,
+[data-theme="cyberpunk"] .gd-focus-btn,
+[data-theme="cyberpunk"] .pivot-graph-btn {
+    font-family: var(--cp-font-label);
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-on-magenta);
+    background: var(--cp-magenta);
+    border: 1px solid var(--cp-magenta);
+    border-radius: 4px;
+    box-shadow: var(--cp-glow);
+}
+[data-theme="cyberpunk"] .btn-primary:hover:not(:disabled),
+[data-theme="cyberpunk"] .etw-btn:hover:not(:disabled),
+[data-theme="cyberpunk"] .gd-focus-btn:hover:not(:disabled),
+[data-theme="cyberpunk"] .pivot-graph-btn:hover:not(:disabled) {
+    color: var(--cp-on-magenta);
+    background: var(--cp-magenta);
+    border-color: var(--cp-magenta);
+    box-shadow: 0 0 20px rgba(var(--cp-magenta-rgb), .6);
+    opacity: 1;
+}
+[data-theme="cyberpunk"] .btn-primary:disabled,
+[data-theme="cyberpunk"] .etw-btn:disabled {
+    box-shadow: none;
+}
+[data-theme="cyberpunk"] .pivot-graph-btn.secondary {
+    color: var(--cp-magenta);
+    background: transparent;
+    box-shadow: none;
+}
+[data-theme="cyberpunk"] .btn-accent,
+[data-theme="cyberpunk"] .btn-lb-results {
+    color: var(--cp-cyan);
+    background: rgba(var(--cp-cyan-rgb), .08);
+    border-color: rgba(var(--cp-cyan-rgb), .35);
+}
+[data-theme="cyberpunk"] .btn-accent:hover:not(:disabled),
+[data-theme="cyberpunk"] .btn-lb-results:hover:not(:disabled) {
+    color: var(--cp-text);
+    background: rgba(var(--cp-cyan-rgb), .16);
+    border-color: var(--cp-cyan);
+    box-shadow: 0 0 14px rgba(var(--cp-cyan-rgb), .3);
+}
+/* Buttons that keep Classic's meaning: the outline variant, and stopping a
+   session or forwarding / dropping a held message in red and green */
+[data-theme="cyberpunk"] .btn-outline {
+    background: transparent;
+}
+[data-theme="cyberpunk"] .pipes-stop-btn {
+    color: var(--c-red-300);
+    border-color: rgba(var(--accent-red-rgb), .35);
+}
+[data-theme="cyberpunk"] .pipe-btn-forward {
+    color: var(--c-green-400);
+    border-color: rgba(var(--accent-green-rgb), .4);
+}
+[data-theme="cyberpunk"] .pipe-btn-drop {
+    color: var(--c-red-400);
+    border-color: rgba(var(--accent-red-rgb), .4);
+}
+/* Close buttons: wide enough for "✕ close" */
+[data-theme="cyberpunk"] .btn-close {
+    width: auto;
+    min-width: 28px;
+    padding: 0 8px;
+    font-size: 12px;
+    letter-spacing: .06em;
+    white-space: nowrap;
+}
+[data-theme="cyberpunk"] .btn:focus-visible,
+[data-theme="cyberpunk"] .btn-xs:focus-visible,
+[data-theme="cyberpunk"] .etw-btn:focus-visible,
+[data-theme="cyberpunk"] .tab:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: 2px;
+}
+
+/* --- Inputs: a dark field with a line edge; magenta edge when focused --- */
+[data-theme="cyberpunk"] .filter-input,
+[data-theme="cyberpunk"] .filter-select,
+[data-theme="cyberpunk"] .etw-filter,
+[data-theme="cyberpunk"] .etw-select,
+[data-theme="cyberpunk"] .graph-search-input,
+[data-theme="cyberpunk"] .rtrace-process-dropdown,
+[data-theme="cyberpunk"] .pipe-edit-hex {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text);
+    background-color: rgba(var(--cp-bg-rgb), .8);
+    border: 1px solid var(--cp-line);
+    border-radius: 4px;
+}
+[data-theme="cyberpunk"] .filter-input:focus,
+[data-theme="cyberpunk"] .filter-select:focus,
+[data-theme="cyberpunk"] .etw-filter:focus,
+[data-theme="cyberpunk"] .etw-select:focus,
+[data-theme="cyberpunk"] .graph-search-input:focus,
+[data-theme="cyberpunk"] .rtrace-process-dropdown:focus,
+[data-theme="cyberpunk"] .pipe-edit-hex:focus {
+    outline: none;
+    border-color: var(--cp-magenta);
+    box-shadow: 0 0 0 1px rgba(var(--cp-magenta-rgb), .35), var(--cp-glow);
+}
+[data-theme="cyberpunk"] .filter-input::placeholder,
+[data-theme="cyberpunk"] .etw-filter::placeholder,
+[data-theme="cyberpunk"] .graph-search-input::placeholder {
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] input[type="checkbox"],
+[data-theme="cyberpunk"] input[type="radio"] {
+    accent-color: var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .option-label,
+[data-theme="cyberpunk"] .ts-opts-label,
+[data-theme="cyberpunk"] .pipes-field,
+[data-theme="cyberpunk"] .filemap-ctl,
+[data-theme="cyberpunk"] .hex-path-or {
+    font-family: var(--cp-font-label);
+    letter-spacing: .06em;
+    color: var(--cp-text-dim);
+}
+
+/* Drop zones: dashed magenta edge on the card surface */
+[data-theme="cyberpunk"] .hex-drop-zone,
+[data-theme="cyberpunk"] .scanner-drop-zone,
+[data-theme="cyberpunk"] .upload-zone,
+[data-theme="cyberpunk"] .lb-drop-zone {
+    background: rgba(var(--cp-card-rgb), .75);
+    border-color: rgba(var(--cp-magenta-rgb), .3);
+    border-radius: 6px;
+}
+[data-theme="cyberpunk"] .hex-drop-zone:hover,
+[data-theme="cyberpunk"] .hex-drop-zone.dragover,
+[data-theme="cyberpunk"] .scanner-drop-zone:hover,
+[data-theme="cyberpunk"] .scanner-drop-zone.dragover,
+[data-theme="cyberpunk"] .upload-zone:hover,
+[data-theme="cyberpunk"] .upload-zone.dragover,
+[data-theme="cyberpunk"] .lb-drop-zone:hover,
+[data-theme="cyberpunk"] .lb-drop-zone.dragover {
+    background: rgba(var(--cp-magenta-rgb), .06);
+    border-color: var(--cp-magenta);
+    box-shadow: var(--cp-glow);
+}
+[data-theme="cyberpunk"] .hex-drop-zone.has-file {
+    border-color: rgba(var(--cp-magenta-rgb), .35);
+}
+[data-theme="cyberpunk"] .hex-browse-link,
+[data-theme="cyberpunk"] .hex-change-file {
+    color: var(--cp-magenta);
+}
+
+/* --- Badges and chips: monospace, with an edge in their own colour --- */
+[data-theme="cyberpunk"] .badge,
+[data-theme="cyberpunk"] .stat-tag,
+[data-theme="cyberpunk"] .sev-badge,
+[data-theme="cyberpunk"] .event-severity,
+[data-theme="cyberpunk"] .detail-badge,
+[data-theme="cyberpunk"] .rtrace-sev-pill,
+[data-theme="cyberpunk"] .rtrace-engine-chip,
+[data-theme="cyberpunk"] .rtrace-rule-chip,
+[data-theme="cyberpunk"] .rtrace-tag,
+[data-theme="cyberpunk"] .rtrace-action-badge,
+[data-theme="cyberpunk"] .glc-badge,
+[data-theme="cyberpunk"] .pipe-action,
+[data-theme="cyberpunk"] .pipe-family,
+[data-theme="cyberpunk"] .pipe-flag,
+[data-theme="cyberpunk"] .pipes-state,
+[data-theme="cyberpunk"] .pipe-msg-state,
+[data-theme="cyberpunk"] .category-badge,
+[data-theme="cyberpunk"] .tag {
+    font-family: var(--cp-font-label);
+    letter-spacing: .05em;
+}
+[data-theme="cyberpunk"] .badge {
+    color: var(--cp-magenta);
+    background: rgba(var(--cp-magenta-rgb), .14);
+}
+[data-theme="cyberpunk"] .badge-green {
+    color: var(--cp-green);
+    background: rgba(var(--cp-green-rgb), .14);
+}
+[data-theme="cyberpunk"] .badge-red {
+    color: var(--cp-red);
+    background: rgba(var(--cp-red-rgb), .14);
+}
+[data-theme="cyberpunk"] .badge-dim {
+    color: var(--cp-text-dim);
+    background: rgba(var(--cp-text-muted-rgb), .08);
+}
+[data-theme="cyberpunk"] .rtrace-verdict-badge {
+    font-family: var(--cp-font-label);
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    box-shadow: 0 0 12px rgba(var(--cp-red-rgb), .45);
+}
+[data-theme="cyberpunk"] .rtrace-verdict-badge.clean,
+[data-theme="cyberpunk"] .rtrace-verdict-badge.unknown {
+    box-shadow: none;
+}
+/* --- Severity indicators: the spec's five colours, tints of the same
+   colour. Classic marks "high" partly in the red of critical, "medium" in
+   amber-400, "low" in blue and "info" in grey; here each severity has one
+   colour (tests/test_theme.py::test_cyberpunk_severity_indicators_use_the_spec_colours) --- */
+/* critical */
+[data-theme="cyberpunk"] .rtrace-sev-pill.critical,
+[data-theme="cyberpunk"] .rtrace-rule-chip.critical,
+[data-theme="cyberpunk"] .graph-detail-body .gd-badge.critical,
+[data-theme="cyberpunk"] .gd-activity-cell.critical .gd-act-num,
+[data-theme="cyberpunk"] .lb-risk-critical,
+[data-theme="cyberpunk"] .activity-entry.sev-high[data-sev="critical"] .activity-sev {
+    color: var(--severity-critical);
+}
+[data-theme="cyberpunk"] .rtrace-sev-pill.critical .sev-dot {
+    background: var(--severity-critical);
+}
+/* The feed's class sev-high covers critical and high; data-sev tells them
+   apart. The shared .sev-high colours every border !important (style.css),
+   so the edge of a critical entry has to be !important as well. */
+[data-theme="cyberpunk"] .activity-entry.sev-high[data-sev="critical"] {
+    border-left-color: rgba(var(--severity-critical-rgb), .55) !important;
+    background: rgba(var(--severity-critical-rgb), .03);
+}
+/* high */
+[data-theme="cyberpunk"] .rtrace-sev-pill.high,
+[data-theme="cyberpunk"] .rtrace-rule-chip.high,
+[data-theme="cyberpunk"] .graph-detail-body .gd-badge.high,
+[data-theme="cyberpunk"] .lb-risk-high,
+[data-theme="cyberpunk"] .pe-flag-item.sev-high .pe-flag-sev,
+[data-theme="cyberpunk"] .elf-flag-item.sev-high .elf-flag-sev,
+[data-theme="cyberpunk"] .sev-high .activity-sev,
+[data-theme="cyberpunk"] .det-alert-item.sev-high .det-alert-sev {
+    color: var(--severity-high);
+}
+[data-theme="cyberpunk"] .rtrace-sev-pill.high .sev-dot {
+    background: var(--severity-high);
+}
+[data-theme="cyberpunk"] .pe-flag-badge.high,
+[data-theme="cyberpunk"] .elf-flag-badge.high,
+[data-theme="cyberpunk"] .pe-status-tag.high,
+[data-theme="cyberpunk"] .elf-status-badge.high,
+[data-theme="cyberpunk"] .stat-tag.high,
+[data-theme="cyberpunk"] .lb-entry-score.high {
+    color: var(--severity-high);
+    background: rgba(var(--severity-high-rgb), .15);
+}
+[data-theme="cyberpunk"] .pe-flag-item.sev-high,
+[data-theme="cyberpunk"] .elf-flag-item.sev-high,
+[data-theme="cyberpunk"] .activity-entry.sev-high,
+[data-theme="cyberpunk"] .det-alert-item.sev-high {
+    border-left-color: var(--severity-high);
+    background: rgba(var(--severity-high-rgb), .03);
+}
+/* medium; the entropy status "warn" and the log level "warning" with it */
+[data-theme="cyberpunk"] .rtrace-sev-pill.medium,
+[data-theme="cyberpunk"] .lb-risk-medium,
+[data-theme="cyberpunk"] .pe-flag-item.sev-medium .pe-flag-sev,
+[data-theme="cyberpunk"] .elf-flag-item.sev-medium .elf-flag-sev,
+[data-theme="cyberpunk"] .sev-med .activity-sev,
+[data-theme="cyberpunk"] .det-alert-item.sev-medium .det-alert-sev {
+    color: var(--severity-medium);
+}
+[data-theme="cyberpunk"] .rtrace-sev-pill.medium .sev-dot {
+    background: var(--severity-medium);
+}
+[data-theme="cyberpunk"] .pe-flag-badge.med,
+[data-theme="cyberpunk"] .elf-flag-badge.med,
+[data-theme="cyberpunk"] .pe-status-tag.warn,
+[data-theme="cyberpunk"] .elf-status-badge.warn,
+[data-theme="cyberpunk"] .stat-tag.med,
+[data-theme="cyberpunk"] .lb-entry-score.med,
+[data-theme="cyberpunk"] .det-alert-sev.sev-medium,
+[data-theme="cyberpunk"] .etw-event-level.warning {
+    color: var(--severity-medium);
+    background: rgba(var(--severity-medium-rgb), .15);
+}
+[data-theme="cyberpunk"] .pe-flag-item.sev-medium,
+[data-theme="cyberpunk"] .elf-flag-item.sev-medium {
+    border-left-color: var(--severity-medium);
+    background: rgba(var(--severity-medium-rgb), .03);
+}
+[data-theme="cyberpunk"] .activity-entry.sev-med,
+[data-theme="cyberpunk"] .det-alert-item.sev-medium {
+    border-left-color: var(--severity-medium);
+}
+/* Detonation alert items of severity info: the info colour (Classic
+   leaves them unmarked) */
+[data-theme="cyberpunk"] .det-alert-item.sev-info {
+    border-left-color: var(--severity-info);
+}
+[data-theme="cyberpunk"] .det-alert-item.sev-info .det-alert-sev {
+    color: var(--severity-info);
+}
+[data-theme="cyberpunk"] .det-alert-sev.sev-info {
+    color: var(--severity-info);
+    background: rgba(var(--severity-info-rgb), .15);
+}
+[data-theme="cyberpunk"] .ev-sev-dot.info {
+    background: var(--severity-info);
+}
+/* low */
+[data-theme="cyberpunk"] .rtrace-sev-pill.low,
+[data-theme="cyberpunk"] .lb-risk-low,
+[data-theme="cyberpunk"] .pe-flag-item.sev-low .pe-flag-sev,
+[data-theme="cyberpunk"] .elf-flag-item.sev-low .elf-flag-sev,
+[data-theme="cyberpunk"] .sev-low .activity-sev,
+[data-theme="cyberpunk"] .det-alert-item.sev-low .det-alert-sev {
+    color: var(--severity-low);
+}
+[data-theme="cyberpunk"] .rtrace-sev-pill.low .sev-dot,
+[data-theme="cyberpunk"] .ev-sev-dot.low {
+    background: var(--severity-low);
+}
+[data-theme="cyberpunk"] .stat-tag.low,
+[data-theme="cyberpunk"] .pe-flag-badge.low,
+[data-theme="cyberpunk"] .elf-flag-badge.low,
+[data-theme="cyberpunk"] .det-alert-sev.sev-low {
+    color: var(--severity-low);
+    background: rgba(var(--severity-low-rgb), .15);
+}
+[data-theme="cyberpunk"] .activity-entry.sev-low,
+[data-theme="cyberpunk"] .pe-flag-item.sev-low,
+[data-theme="cyberpunk"] .elf-flag-item.sev-low,
+[data-theme="cyberpunk"] .det-alert-item.sev-low {
+    border-left-color: var(--severity-low);
+}
+/* info; Classic's border of .sev-info is !important */
+[data-theme="cyberpunk"] .sev-info {
+    color: var(--severity-info);
+    border-color: rgba(var(--severity-info-rgb), .55) !important;
+}
+[data-theme="cyberpunk"] .mem-finding.sev-info {
+    border-left-color: var(--severity-info);
+}
+[data-theme="cyberpunk"] .etw-event-level.information,
+[data-theme="cyberpunk"] .etw-event-level.info,
+[data-theme="cyberpunk"] .etw-event-level.verbose {
+    color: var(--severity-info);
+    background: rgba(var(--severity-info-rgb), .08);
+}
+
+/* --- Tracing console: bands on the page, the split view in cards --- */
+[data-theme="cyberpunk"] .rtrace-info-bar,
+[data-theme="cyberpunk"] .rtrace-severity-bar,
+[data-theme="cyberpunk"] .rtrace-timeline-section {
+    background: transparent;
+    border-bottom-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .rtrace-proc-name {
+    font-family: var(--cp-font-label);
+    font-size: 15px;
+    letter-spacing: .04em;
+}
+[data-theme="cyberpunk"] .rtrace-timeline-bar {
+    background: rgba(var(--cp-card-rgb), .85);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+}
+[data-theme="cyberpunk"] .rtrace-timeline-cursor {
+    background: var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .rtrace-split {
+    border-top: 0;
+    gap: 12px;
+    padding: 12px 16px 16px;
+}
+[data-theme="cyberpunk"] .rtrace-tree-panel,
+[data-theme="cyberpunk"] .rtrace-detail-panel {
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow);
+}
+[data-theme="cyberpunk"] .rtrace-tree-header,
+[data-theme="cyberpunk"] .rtrace-detail-tabs {
+    background: var(--cp-raised);
+    border-bottom-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .rtrace-tab {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .rtrace-tab:hover {
+    color: var(--cp-text);
+}
+[data-theme="cyberpunk"] .rtrace-tab.active {
+    color: var(--cp-text);
+    border-bottom-color: var(--cp-magenta);
+    box-shadow: inset 0 -12px 16px -14px rgba(var(--cp-magenta-rgb), .6);
+}
+[data-theme="cyberpunk"] .rtrace-tab.active .rtrace-tab-count {
+    color: var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .rtrace-tree-item.active {
+    background: rgba(var(--cp-magenta-rgb), .1);
+    border-left-color: var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .rtrace-event-row.selected {
+    background: rgba(var(--cp-magenta-rgb), .1);
+}
+
+/* --- Graph: the canvas on the page grid; legend, tooltip and detail view
+   as cards --- */
+[data-theme="cyberpunk"] .graph-container {
+    background-color: transparent;
+    background-image: radial-gradient(circle, rgba(var(--cp-magenta-rgb), .16) 1px, transparent 1px);
+}
+[data-theme="cyberpunk"] .graph-landing {
+    background-color: var(--cp-bg);
+    background-image:
+        linear-gradient(rgba(var(--cp-magenta-rgb), .045) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(var(--cp-magenta-rgb), .045) 1px, transparent 1px);
+    background-size: 28px 28px;
+    background-attachment: fixed;           /* on the grid of the page */
+}
+[data-theme="cyberpunk"] .graph-loading {
+    background: rgba(var(--cp-bg-rgb), .6);
+}
+[data-theme="cyberpunk"] .graph-zoom-controls,
+[data-theme="cyberpunk"] .graph-time-filter {
+    background: rgba(var(--cp-bg-rgb), .8);
+    border-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .graph-zoom-btn {
+    color: var(--cp-text-muted);
+    background: transparent;
+    border: 0;
+    box-shadow: none;
+}
+[data-theme="cyberpunk"] .graph-zoom-btn:hover:not(:disabled) {
+    color: var(--cp-text);
+    background: var(--cp-raised);
+    box-shadow: none;
+}
+[data-theme="cyberpunk"] .graph-time-btn.active {
+    color: var(--cp-on-magenta);
+    background: var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .graph-toggle {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    letter-spacing: .04em;
+    color: var(--cp-text-muted);
+}
+[data-theme="cyberpunk"] .graph-legend {
+    font-family: var(--cp-font-label);
+    background: rgba(var(--cp-card-rgb), .92);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow);
+}
+[data-theme="cyberpunk"] .graph-tooltip,
+[data-theme="cyberpunk"] .fmap-tooltip {
+    background: rgba(var(--cp-card-rgb), .97);
+    border: 1px solid rgba(var(--cp-magenta-rgb), .45);
+    border-radius: 6px;
+    box-shadow: 0 0 0 1px rgba(var(--cp-black-rgb), .35), 0 10px 28px -10px rgba(var(--cp-magenta-rgb), .5);
+}
+[data-theme="cyberpunk"] .graph-breadcrumb {
+    font-family: var(--cp-font-label);
+    background: transparent;
+    border-bottom-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .graph-detail-panel {
+    background: rgba(var(--cp-card-rgb), .96);
+    border: 1px solid rgba(var(--cp-magenta-rgb), .35);
+    border-radius: 6px;
+    box-shadow: 0 0 0 1px rgba(var(--cp-black-rgb), .35), 0 12px 32px -12px rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme="cyberpunk"] .graph-detail-header {
+    font-family: var(--cp-font-label);
+    letter-spacing: .06em;
+    background: var(--cp-raised);
+    border-bottom-color: var(--cp-line);
+    border-radius: 6px 6px 0 0;
+}
+
+/* --- Hex editor and file map --- */
+/* With the PE/ELF panel open (up to 65 % of the window, and it scrolls)
+   the card keeps at least the room Classic leaves it at 1920 x 960: the
+   structure map, the file row, the status row and the top of the
+   inspector; the panel gives way. */
+[data-theme="cyberpunk"] .hex-editor-container {
+    min-height: 244px;
+    margin: 0 16px 12px;
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow);
+}
+[data-theme="cyberpunk"] .hex-minimap-wrap {
+    margin: 8px 8px 0;
+}
+[data-theme="cyberpunk"] .hex-file-info,
+[data-theme="cyberpunk"] .hex-status-bar {
+    font-family: var(--cp-font-label);
+    background: var(--cp-raised);
+    border-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .hex-editor-body {
+    background: rgba(var(--cp-bg-rgb), .85);
+}
+[data-theme="cyberpunk"] .hex-offset-col {
+    color: var(--cp-text-dim);
+    background: var(--cp-card);
+    border-right-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .hex-view .hex-byte.selected,
+[data-theme="cyberpunk"] .hex-ascii-col .ascii-char.selected {
+    color: var(--cp-on-magenta);
+    background: var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .hex-view .hex-byte:hover,
+[data-theme="cyberpunk"] .hex-ascii-col .ascii-char:hover {
+    background: rgba(var(--cp-magenta-rgb), .2);
+}
+[data-theme="cyberpunk"] .hex-resize-handle {
+    background: var(--cp-line);
+}
+[data-theme="cyberpunk"] .hex-resize-handle:hover,
+[data-theme="cyberpunk"] .hex-resize-handle.active {
+    background: var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .hex-inspector {
+    background: var(--cp-card);
+    border-left-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .pe-panel,
+[data-theme="cyberpunk"] .elf-panel {
+    margin: 0 16px 12px;
+    background: rgba(var(--cp-card-rgb), .6);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+}
+/* The ELF panel scrolls like the PE panel: the card above keeps its minimum
+   height, and a panel that does not scroll (Classic) would lose its end */
+[data-theme="cyberpunk"] .elf-panel {
+    max-height: 65vh;
+    overflow-y: auto;
+}
+[data-theme="cyberpunk"] .pe-panel-header,
+[data-theme="cyberpunk"] .elf-panel-header {
+    background: var(--cp-raised);
+    border-bottom-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .fmap-view {
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow);
+}
+[data-theme="cyberpunk"] .fmap-canvas {
+    border-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .fmap-strip-viewport {
+    border-color: var(--cp-magenta);
+    box-shadow: 0 0 10px rgba(var(--cp-magenta-rgb), .5);
+}
+
+/* --- Pipes tab --- */
+[data-theme="cyberpunk"] .pipes-body {
+    gap: 14px;
+    padding: 14px 16px 16px;
+}
+[data-theme="cyberpunk"] .pipes-panel-head {
+    background: var(--cp-raised);
+    border-bottom-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .pipes-session-item.active {
+    background: rgba(var(--cp-magenta-rgb), .1);
+    box-shadow: inset 2px 0 0 var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .pipes-session-item:hover {
+    background: var(--cp-raised);
+}
+[data-theme="cyberpunk"] .pss-pattern,
+[data-theme="cyberpunk"] .pipes-sh-name {
+    font-family: var(--cp-font-label);
+}
+[data-theme="cyberpunk"] .pipe-msg {
+    background: rgba(var(--cp-bg-rgb), .55);
+    border-color: var(--cp-line);
+    border-radius: 4px;
+}
+[data-theme="cyberpunk"] .pipe-msg-c2s {
+    border-left-color: var(--c-sky-400);
+}
+[data-theme="cyberpunk"] .pipe-msg-s2c {
+    border-left-color: var(--accent-purple);
+}
+[data-theme="cyberpunk"] .pipe-msg-held {
+    border-color: rgba(var(--c-amber-400-rgb), .55);
+}
+[data-theme="cyberpunk"] .pipe-msg-head {
+    font-family: var(--cp-font-label);
+}
+[data-theme="cyberpunk"] .pipes-limits {
+    font-family: var(--cp-font-text);
+    font-size: 12px;
+    border-bottom-color: var(--cp-line);
+}
+
+/* --- Detail view: the same structure, as a card that slides over the
+   content with a magenta edge --- */
+[data-theme="cyberpunk"] .detail-panel {
+    background: var(--cp-card);
+    border-left: 1px solid rgba(var(--cp-magenta-rgb), .45);
+    box-shadow: -14px 0 40px -12px rgba(var(--cp-magenta-rgb), .35), -4px 0 20px rgba(var(--cp-black-rgb), .5);
+}
+[data-theme="cyberpunk"] .detail-header {
+    background: linear-gradient(180deg, var(--cp-bar-top), var(--cp-raised));
+    border-bottom-color: rgba(var(--cp-magenta-rgb), .25);
+}
+[data-theme="cyberpunk"] .detail-title {
+    font-family: var(--cp-font-label);
+    font-size: 14px;
+    letter-spacing: .04em;
+}
+[data-theme="cyberpunk"] .detail-meta {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .detail-section-title {
+    border-bottom-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .field-label {
+    font-family: var(--cp-font-label);
+    font-size: 11px;
+    letter-spacing: .04em;
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .activity-counter.active {
+    border-color: var(--cp-magenta);
+    box-shadow: var(--cp-glow);
+}
+[data-theme="cyberpunk"] .raw-structured {
+    background: var(--cp-line);
+    border-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .raw-field,
+[data-theme="cyberpunk"] .raw-json,
+[data-theme="cyberpunk"] .raw-json-pretty,
+[data-theme="cyberpunk"] .hex-preview {
+    background: rgba(var(--cp-bg-rgb), .92);
+}
+[data-theme="cyberpunk"] .raw-field:hover {
+    background: var(--cp-raised);
+}
+[data-theme="cyberpunk"] .related-card {
+    background: var(--cp-raised);
+    border-color: rgba(var(--cp-magenta-rgb), .3);
+    border-radius: 6px;
+}
+
+/* --- Help --- */
+[data-theme="cyberpunk"] .help-modal-backdrop {
+    background: rgba(var(--cp-bg-rgb), .78);
+}
+[data-theme="cyberpunk"] .help-modal-content {
+    background: var(--cp-card);
+    border: 1px solid rgba(var(--cp-magenta-rgb), .45);
+    border-radius: 6px;
+    box-shadow: 0 0 0 1px rgba(var(--cp-black-rgb), .35), 0 24px 70px -20px rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme="cyberpunk"] .help-header {
+    background: linear-gradient(180deg, var(--cp-bar-top), var(--cp-bar-bottom));
+    border-bottom-color: rgba(var(--cp-magenta-rgb), .35);
+}
+[data-theme="cyberpunk"] .help-title {
+    font-family: var(--cp-font-label);
+    font-size: 16px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: transparent;
+    background: var(--cp-heading);
+    -webkit-background-clip: text;
+    background-clip: text;
+}
+[data-theme="cyberpunk"] .help-version {
+    font-family: var(--cp-font-label);
+    letter-spacing: .06em;
+    color: var(--cp-green);
+}
+[data-theme="cyberpunk"] .help-tabs {
+    background: var(--cp-raised);
+    border-bottom-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .help-tab {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .help-tab:hover {
+    color: var(--cp-text);
+    background: rgba(var(--cp-magenta-rgb), .06);
+}
+[data-theme="cyberpunk"] .help-tab.active {
+    color: var(--cp-text);
+    border-bottom-color: var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .help-section h3 {
+    font-family: var(--cp-font-label);
+    font-size: 15px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+}
+[data-theme="cyberpunk"] .help-section p,
+[data-theme="cyberpunk"] .help-steps li,
+[data-theme="cyberpunk"] .help-list li {
+    font-family: var(--cp-font-text);
+    font-size: 14px;
+    line-height: 1.6;
+}
+[data-theme="cyberpunk"] .help-card-title,
+[data-theme="cyberpunk"] .help-guide-item h4 {
+    font-family: var(--cp-font-label);
+    font-size: 11px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+}
+[data-theme="cyberpunk"] .help-guide-item h4 {
+    color: var(--cp-cyan);
+}
+[data-theme="cyberpunk"] .help-arch-diagram,
+[data-theme="cyberpunk"] .help-code {
+    background: rgba(var(--cp-bg-rgb), .9);
+    border-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .help-footer {
+    font-family: var(--cp-font-label);
+    background: var(--cp-bar-bottom);
+    border-top-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .help-footer a {
+    color: var(--cp-magenta);
+}
+
+/* --- Toasts: cards with a coloured edge --- */
+[data-theme="cyberpunk"] .toast {
+    font-family: var(--cp-font-text);
+    font-size: 13px;
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-left-width: 3px;
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow), 0 10px 28px -12px rgba(var(--cp-black-rgb), .6);
+}
+[data-theme="cyberpunk"] .toast-title {
+    font-family: var(--cp-font-label);
+    font-size: 11px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+}
+[data-theme="cyberpunk"] .toast.toast-success {
+    border-left-color: var(--cp-green);
+}
+[data-theme="cyberpunk"] .toast.toast-error {
+    border-left-color: var(--cp-red);
+}
+[data-theme="cyberpunk"] .toast.toast-warning {
+    border-left-color: var(--cp-amber);
+}
+[data-theme="cyberpunk"] .toast.toast-info {
+    border-left-color: var(--cp-cyan);
+}
+
+/* --- Loading overlay and scroll bars --- */
+[data-theme="cyberpunk"] .loading-spinner {
+    border-color: rgba(var(--cp-magenta-rgb), .2);
+    border-top-color: var(--cp-magenta);
+    box-shadow: 0 0 12px rgba(var(--cp-magenta-rgb), .3);
+}
+[data-theme="cyberpunk"] .loading-text {
+    font-family: var(--cp-font-label);
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--cp-text-muted);
+}
+[data-theme="cyberpunk"] ::-webkit-scrollbar-track {
+    background: transparent;
+}
+[data-theme="cyberpunk"] ::-webkit-scrollbar-thumb {
+    background: var(--cp-line);
+}
+[data-theme="cyberpunk"] ::-webkit-scrollbar-thumb:hover {
+    background: rgba(var(--cp-magenta-rgb), .55);
+}
+
+/* --- (i) explanations and sortable tables: the (i) as a small cyan switch
+   that lights up while its text is open, the popover as a card with a
+   magenta edge; the sorted column's arrow in magenta with a glow --- */
+[data-theme="cyberpunk"] .info-btn {
+    width: 16px;
+    height: 16px;
+    font-family: var(--cp-font-label);
+    font-size: 10px;
+    color: var(--cp-cyan);
+    background: var(--cp-raised);
+    border: 1px solid rgba(var(--cp-cyan-rgb), .45);
+}
+[data-theme="cyberpunk"] .info-btn:hover:not(:disabled),
+[data-theme="cyberpunk"] .info-btn[aria-expanded="true"] {
+    color: var(--cp-on-magenta);
+    background: var(--cp-cyan);
+    border-color: var(--cp-cyan);
+    box-shadow: 0 0 10px rgba(var(--cp-cyan-rgb), .45);
+}
+[data-theme="cyberpunk"] .info-btn:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: 2px;
+}
+[data-theme="cyberpunk"] .info-popover {
+    padding: 10px 12px;
+    font-family: var(--cp-font-text);
+    font-size: 13px;
+    color: var(--cp-text);
+    background: rgba(var(--cp-card-rgb), .98);
+    border: 1px solid rgba(var(--cp-magenta-rgb), .45);
+    border-radius: 6px;
+    box-shadow: 0 0 0 1px rgba(var(--cp-black-rgb), .35), 0 10px 28px -10px rgba(var(--cp-magenta-rgb), .5);
+}
+[data-theme="cyberpunk"] table[data-sortable] > thead > tr > th:not([data-no-sort]):not(:empty):hover {
+    color: var(--cp-text);
+}
+[data-theme="cyberpunk"] table[data-sortable] > thead > tr > th:not([data-no-sort]):not(:empty)[aria-sort]::after {
+    color: var(--cp-magenta);
+    text-shadow: 0 0 8px rgba(var(--cp-magenta-rgb), .6);
+}
+[data-theme="cyberpunk"] table[data-sortable] > thead > tr > th:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: -2px;
+}
+
+/* --- CHART / TABLE, the tiles and the Tracing grid heads: the switch as a
+   small cyan control that turns magenta under the pointer, the table views in
+   the table look above, tiles lit like the cards under the pointer, the
+   sorted grid head's arrow in magenta with a glow --- */
+[data-theme="cyberpunk"] .view-toggle {
+    height: 16px;
+    padding: 0 8px;
+    font-family: var(--cp-font-label);
+    font-size: 10px;
+    letter-spacing: .1em;
+    color: var(--cp-cyan);
+    background: var(--cp-raised);
+    border: 1px solid rgba(var(--cp-cyan-rgb), .45);
+    border-radius: 4px;
+    transition: color .15s, border-color .15s, box-shadow .15s, background-color .15s;
+}
+[data-theme="cyberpunk"] .view-toggle:hover:not(:disabled) {
+    color: var(--cp-on-magenta);
+    background: var(--cp-magenta);
+    border-color: var(--cp-magenta);
+    box-shadow: var(--cp-glow);
+}
+[data-theme="cyberpunk"] .view-toggle:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: 2px;
+}
+[data-theme="cyberpunk"] .view-table th {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-cyan);
+    background: var(--cp-raised);
+    border-bottom: 1px solid var(--cp-line);
+}
+[data-theme="cyberpunk"] .view-table td {
+    border-bottom-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .view-table tbody tr:hover td {
+    background: var(--cp-raised);
+}
+[data-theme="cyberpunk"] .stat-card[role="button"] {
+    transition: border-color .15s, background-color .15s, box-shadow .15s;
+}
+[data-theme="cyberpunk"] .stat-card[role="button"]:hover {
+    background-color: var(--cp-raised);
+    border-color: rgba(var(--cp-magenta-rgb), .6);
+    box-shadow: var(--cp-card-shadow), var(--cp-glow);
+}
+[data-theme="cyberpunk"] .stat-card[role="button"]:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: 2px;
+}
+[data-theme="cyberpunk"] .rtrace-event-table-header > .rtrace-col:hover {
+    color: var(--cp-text);
+}
+[data-theme="cyberpunk"] .rtrace-event-table-header > .rtrace-col[aria-sort="ascending"]::after,
+[data-theme="cyberpunk"] .rtrace-event-table-header > .rtrace-col[aria-sort="descending"]::after {
+    color: var(--cp-magenta);
+    text-shadow: 0 0 8px rgba(var(--cp-magenta-rgb), .6);
+}
+[data-theme="cyberpunk"] .rtrace-event-table-header > .rtrace-col:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: -2px;
+}

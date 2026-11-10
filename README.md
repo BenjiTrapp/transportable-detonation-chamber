@@ -32,8 +32,8 @@
 </p>
 
 <p align="center">
-  <img src="static/dashboard.png" alt="Dashboard" width="90%">
-  <br><sub>Service Dashboard &mdash; real-time health monitoring, alert feed, and detection metrics</sub>
+  <img src="static/theme_cyberpunk.png" alt="Dashboard in the Cyberpunk theme" width="90%">
+  <br><sub>Service Dashboard &mdash; real-time health monitoring, alert feed, and detection metrics (Cyberpunk theme, the default; ✶ switches to Classic)</sub>
 </p>
 
 ---
@@ -116,7 +116,8 @@ make open       # Opens http://<vm-ip>:9000 in browser
 
 | Tab | Description |
 |-----|-------------|
-| **Dashboard** | Stats strip (alerts, processes, services, rules, tools), service health cards, recent activity feed |
+| **Dashboard** | Stats strip (alerts, processes, services, rules, tools), service health cards, recent activity feed; each tile opens what it counts |
+| **Alerts** | Every alert in one table, newest first, with severity (multi-select), engine and text filters and an "n of m" count; a row opens the alert detail, the process name its process (only processes in the process list are links); the newest 2000 matches are listed |
 | **Tracing** | Per-process console: verdict, timeline by event type, process tree, alerts with full raw events (Sigma match details) |
 | **Graph** | Process tree around a process: tree, force-directed and isometric layouts, landing page with samples and candidate processes, detail panel with Sysmon events and children |
 | **Pipes** | Named pipes: Sysmon pipe events (EID 17/18) with name/PID filters and C2-family hits, and interception sessions (attach to an existing pipe or arm for a name/prefix/regex; observe or hold messages to forward, edit or drop them; JSON export) |
@@ -132,6 +133,54 @@ Every process in the UI is a process *instance*: Windows reuses PIDs, so the
 newest process with a PID is addressed by the plain PID and earlier ones as
 `<pid>@<start epoch>`. Alerts, events and children belong to the instance
 that was running at the time.
+
+### Themes
+
+The Web UI has two themes: **Cyberpunk** (the default: neon on deep violet)
+and **Classic** (the original look, shown in most screenshots). **✶** switches
+between them at once, without reloading the page; the open tab, an open detail
+view, filters, sort orders, the graph and running pipe interception sessions
+stay as they are. The choice is stored in the browser (`localStorage`), so a
+browser without a stored choice starts in Cyberpunk. In Classic ✶ sits below "? Help" in
+the sidebar header, in Cyberpunk at the right end of the top bar.
+
+Cyberpunk replaces the sidebar with a top bar and gives the content the full
+width:
+
+- **☰ PROCESSES** (with the number of tracked processes) opens the process
+  list and the timeline in a drawer over the content. Esc, a click beside it or
+  picking a process closes it.
+- The tabs sit in the top bar. Tabs that do not fit into a narrow window move
+  into a **"…"** menu; the active tab always stays in the bar.
+- **n/m ONLINE** counts the five services of the status row (Rustinel,
+  Sysmon, Fibratus, Agent, LitterBox) and opens a drop-down with the status of
+  each. The SERVICES ONLINE tile on the dashboard counts six: it adds the
+  Detonator.
+- Tab heads get a large title in a head area of their own, and cards and
+  tiles get neon borders.
+
+Both themes share the card controls:
+
+- **(i)** beside a card or section title explains it in a sentence or two;
+  Esc or a click elsewhere closes the explanation.
+- **CHART / TABLE** shows the numbers of a chart as a table: the sidebar
+  timeline, the Tracing timeline and severity bar, the file structure of the
+  PE/ELF binary analysis and the file map strip of the PE analysis. The choice
+  holds per card until the page is reloaded.
+- **Sortable tables:** a click on a column head sorts ascending, a second
+  click descending (↕ / ▲ / ▼). Numbers sort numerically, times
+  chronologically, empty cells last. The order survives the table being
+  rendered again: the Alerts tab when the alerts refresh (every 5 s) brings
+  new ones, Sysmon and the pipe events after Refresh or a filter change. The
+  Tracing event list sorts the same way.
+- **Dashboard tiles** open what they count: TOTAL ALERTS the Alerts tab, its
+  high / med / low counts the Alerts tab filtered by that severity (high
+  includes critical, low includes info), PROCESSES TRACKED the process list,
+  SERVICES ONLINE the service cards, DETECTION RULES the help on the detection
+  rules and SCANNER TOOLS the ThreatScan tab.
+
+Tiles and column heads also take Enter and Space. The **Alerts** tab (see the
+table above) exists in both themes.
 
 ### ETW Browser
 
@@ -693,17 +742,53 @@ Screenshots from the ARM64 UTM VM with the test samples used during development
 (`shortlived.exe`, `injectsim.exe`, `beaconsim.exe`, `pipesim.exe` — harmless
 programs that mimic implant behaviour).
 
-### Service Dashboard
+### Service Dashboard (Classic)
 
 <p align="center">
-  <img src="static/dashboard.png" alt="Dashboard" width="100%">
+  <img src="static/dashboard.png" alt="Dashboard in the Classic theme" width="100%">
 </p>
 
-> Stats strip (alerts, tracked processes, services online, loaded Sigma/YARA
-> rules, scanner tools) and one card per service: Rustinel, DetonatorAgent,
-> LitterBox, Sysmon, Fibratus, AV/AMSI scanner, EMBER2024 and capa. Offline
-> services are struck through and can be launched from their card. The left
-> sidebar lists tracked processes and a per-engine alert timeline.
+> Stats strip (alerts by severity, tracked processes, services online, loaded
+> Sigma/YARA rules, scanner tools), where each tile opens what it counts, and
+> one card per service: Rustinel, DetonatorAgent, LitterBox, Sysmon, Fibratus,
+> AV/AMSI scanner, EMBER2024 and capa. Offline services are struck through and
+> can be launched from their card. The left sidebar holds the tabs (Alerts,
+> the second, lists every alert), ✶ below "? Help" (switches to the default
+> Cyberpunk theme), the tracked processes and the alert timeline: the 60 newest alerts
+> coloured by severity, which TABLE lists as a table.
+
+---
+
+### Cyberpunk Theme (default)
+
+<p align="center">
+  <img src="static/theme_cyberpunk.png" alt="Dashboard in the Cyberpunk theme" width="100%">
+</p>
+
+> The same dashboard in the **Cyberpunk** theme, which a browser without a
+> stored choice starts in. The top bar holds ☰ PROCESSES
+> (363 tracked processes, opens the process list and the timeline in a
+> drawer), the logo, the tabs with the active one in magenta, the service
+> summary, the time of the last update, Help and ✶, which switches back to
+> Classic. The summary *4/5 ONLINE* counts the five services of the status row
+> (LitterBox is offline; a click lists them); the SERVICES ONLINE tile shows
+> *4/6* because it also counts the Detonator, which is offline as well. Below
+> the head area the stats tiles carry a coloured edge; a click on a tile opens
+> what it counts, a click on *2896 high* the critical and high alerts.
+
+---
+
+### Alerts
+
+<p align="center">
+  <img src="static/alerts_tab.png" alt="Alerts tab filtered by severity and engine" width="100%">
+</p>
+
+> The **Alerts** tab filtered to the critical and high alerts of the fibratus
+> engine: *6 of 9620*, newest first, each with its time, severity, engine,
+> rule, process and PID, and the rule's description. A click on a row opens
+> the alert detail; process names that are in the process list (here
+> `services.exe`) are links to the process. Column heads sort the table.
 
 ---
 
@@ -1198,7 +1283,8 @@ transportable-detonation-chamber/
 │   ├── templates/
 │   │   └── index.html             # SPA with all tabs + Help modal
 │   └── static/
-│       ├── css/style.css          # Dark theme
+│       ├── css/style.css          # Classic theme (every colour a variable in :root)
+│       ├── css/theme-cyberpunk.css # Cyberpunk theme, scoped to [data-theme="cyberpunk"]
 │       ├── js/app.js              # Frontend logic (single file, no build step)
 │       └── icon.png               # Logo
 │

@@ -113,9 +113,269 @@ const LoadingSpinner = (() => {
     };
 })();
 
+// --- Theme colours ---
+// A canvas cannot use var(--x), so drawings read the colours of the active
+// theme from the CSS variables (style.css :root). Cached until the theme changes.
+const _themeColorCache = new Map();
+
+function themeColor(name, alpha) {
+    const key = alpha === undefined ? name : `${name}/${alpha}`;
+    let color = _themeColorCache.get(key);
+    if (color === undefined) {
+        const style = getComputedStyle(document.documentElement);
+        color = alpha === undefined
+            ? style.getPropertyValue(name).trim()
+            : `rgba(${style.getPropertyValue(name + '-rgb').trim()}, ${alpha})`;
+        _themeColorCache.set(key, color);
+    }
+    return color;
+}
+
+// After a theme switch the colours are read again and the views drawn from
+// them are rebuilt (graph and Tracing timeline only while their tab is open;
+// the file maps all, from the data they show). The sidebar timeline is left
+// alone: its bars take their colours from CSS classes, and a redraw would
+// give them new random widths.
+function onThemeChange() {
+    _themeColorCache.clear();
+    if (state.activeTab === 'graph') renderGraph();
+    if (state.activeTab === 'tracing') renderRtraceTimeline();
+    renderDashboard();
+    FileMapView.repaint();
+}
+document.addEventListener('tdc:themechange', onThemeChange);
+
+// --- Theme switch (✶) ---
+// <html data-theme> selects the theme; the inline script in index.html sets it
+// from localStorage before the first paint. A switch never reloads the page:
+// the tab bar and the service status move between the sidebar (Classic) and
+// the top bar (Cyberpunk) as the same nodes, so handlers and state stay.
+const THEMES = ['classic', 'cyberpunk'];
+const THEME_LABELS = { classic: 'Classic', cyberpunk: 'Cyberpunk' };
+
+function normalizeTheme(value) {
+    // Cyberpunk is the default theme (same rule as the boot script in index.html).
+    return THEMES.includes(value) ? value : 'cyberpunk';
+}
+
+function nextTheme(theme) {
+    return THEMES[(THEMES.indexOf(normalizeTheme(theme)) + 1) % THEMES.length];
+}
+
+function currentTheme() {
+    return normalizeTheme(document.documentElement.dataset.theme);
+}
+
+function applyThemeLayout(theme) {
+    // Every part is checked: this runs first at start-up, and a missing element
+    // must not stop the rest of the page from being set up.
+    const nav = document.querySelector('nav.sidebar-tabs');
+    const status = document.getElementById('service-status');
+    if (theme === 'cyberpunk') {
+        const navHome = document.getElementById('topbar-nav');
+        const statusHome = document.getElementById('topbar-services-panel');
+        if (nav && navHome) navHome.prepend(nav);               // in front of the "…" menu
+        if (status && statusHome) statusHome.appendChild(status);
+    } else {
+        const logo = document.querySelector('.logo-container');
+        const sidebar = document.getElementById('sidebar');
+        if (nav && logo) logo.after(nav);
+        if (status && sidebar) sidebar.appendChild(status);
+    }
+    // The drawer and the drop-downs start closed in either theme (their state
+    // is not kept), and the tabs are fitted to the bar they are now in.
+    closeDrawer();
+    closeTopbarMenus();
+    updateTabOverflow();
+    // Set here rather than in setTheme(), so a page loaded in Cyberpunk names
+    // the right target as well.
+    const label = `Switch to ${THEME_LABELS[nextTheme(theme)]} theme`;
+    for (const id of ['theme-toggle', 'theme-toggle-top']) {
+        const button = document.getElementById(id);
+        if (!button) continue;
+        button.title = label;
+        button.setAttribute('aria-label', label);
+    }
+}
+
+function setTheme(name) {
+    const theme = normalizeTheme(name);
+    const root = document.documentElement;
+    const toggleHadFocus = ['theme-toggle', 'theme-toggle-top'].includes(document.activeElement?.id);
+    // Both layouts swap at once: no transition may run between them (the
+    // drawer slid out of view, the tabs faded). They are off until the next
+    // frame; the layout is computed once while they are off.
+    root.classList.add('theme-switching');
+    try {
+        root.dataset.theme = theme;
+        try {
+            localStorage.setItem('tdc-theme', theme);
+        } catch (e) {
+            // Storage blocked or full: the choice lasts until the page is reloaded.
+        }
+        applyThemeLayout(theme);
+        // The ✶ just used is hidden in the new theme: keyboard focus moves to the visible one.
+        if (toggleHadFocus) document.getElementById(theme === 'cyberpunk' ? 'theme-toggle-top' : 'theme-toggle')?.focus();
+        document.dispatchEvent(new CustomEvent('tdc:themechange', { detail: { theme } }));
+    } finally {
+        // Even after an error transitions come back on, a frame later.
+        void document.body?.offsetWidth;    // the new styles, computed while transitions are off
+        const transitionsOn = () => root.classList.remove('theme-switching');
+        if (typeof requestAnimationFrame === 'function') requestAnimationFrame(transitionsOn);
+        else transitionsOn();
+    }
+}
+
+function toggleTheme() {
+    setTheme(nextTheme(currentTheme()));
+}
+
+// --- Cyberpunk top bar: drawer, drop-downs, tab overflow ---
+// In Cyberpunk the sidebar is a drawer that slides in over the content while
+// #app has .drawer-open (theme-cyberpunk.css). Its open state is not kept.
+function isDrawerOpen() {
+    return !!document.getElementById('app')?.classList.contains('drawer-open');
+}
+
+function setDrawerOpen(open) {
+    document.getElementById('app')?.classList.toggle('drawer-open', open);
+    document.getElementById('drawer-toggle')?.setAttribute('aria-expanded', String(open));
+}
+
+function openDrawer() {
+    if (currentTheme() === 'cyberpunk') setDrawerOpen(true);     // Classic shows the sidebar anyway
+}
+
+function closeDrawer() {
+    setDrawerOpen(false);
+}
+
+function toggleDrawer() {
+    if (isDrawerOpen()) closeDrawer();
+    else openDrawer();
+}
+
+// The drop-downs of the top bar, button -> panel. A button's aria-expanded
+// shows or hides the panel right after it (theme-cyberpunk.css).
+const TOPBAR_MENUS = { 'topbar-services': 'topbar-services-panel', 'topbar-more-toggle': 'topbar-more' };
+
+function isTopbarMenuOpen(buttonId) {
+    return document.getElementById(buttonId)?.getAttribute('aria-expanded') === 'true';
+}
+
+function setTopbarMenu(buttonId, open) {
+    document.getElementById(buttonId)?.setAttribute('aria-expanded', String(open));
+}
+
+function toggleTopbarMenu(buttonId) {
+    const open = !isTopbarMenuOpen(buttonId);
+    closeTopbarMenus();
+    if (open) setTopbarMenu(buttonId, true);
+}
+
+function closeTopbarMenus() {
+    Object.keys(TOPBAR_MENUS).forEach(id => setTopbarMenu(id, false));
+}
+
+// A click outside an open drop-down closes it, and a click beside the open
+// drawer (on the scrim or in the top bar) closes the drawer. A click in the
+// (i) popover is not beside it: the popover of a drawer title lies over the
+// page, outside the drawer, and a click in it (to select its text) must not
+// hide the title it explains. Registered for the capture phase: it sees the
+// click before a handler re-renders the target (a process in the drawer),
+// which would then no longer be inside anything.
+function onTopbarOutsideClick(e) {
+    const inside = id => !!document.getElementById(id)?.contains(e.target);
+    for (const [button, panel] of Object.entries(TOPBAR_MENUS)) {
+        if (isTopbarMenuOpen(button) && !inside(button) && !inside(panel)) setTopbarMenu(button, false);
+    }
+    if (isDrawerOpen() && !inside('sidebar') && !inside('drawer-toggle') && !inside('info-popover')) closeDrawer();
+}
+document.addEventListener('click', onTopbarOutsideClick, true);
+
+// Which tabs fit into the top bar: all of them if they do; otherwise the
+// active tab and, in their order, as many of the others as fit beside the "…"
+// button. Widths in px; returns the indices of the tabs to show, ascending.
+function computeVisibleTabs(widths, available, moreWidth, activeIndex) {
+    const all = widths.map((_, i) => i);
+    if (widths.reduce((sum, w) => sum + w, 0) <= available) return all;
+    const active = all.includes(activeIndex) ? activeIndex : -1;
+    const visible = active >= 0 ? [active] : [];
+    let room = available - moreWidth - (active >= 0 ? widths[active] : 0);
+    for (const i of all) {
+        if (i === active) continue;
+        if (widths[i] > room) break;        // the menu keeps the rest in their order
+        room -= widths[i];
+        visible.push(i);
+    }
+    return visible.sort((a, b) => a - b);
+}
+
+// Tabs that do not fit into the Cyberpunk top bar get .tab-overflow (hidden)
+// and an entry in the "…" menu. Runs when the room changes, after every tab
+// switch and on a theme switch; in Classic it only clears what it set.
+function updateTabOverflow() {
+    const area = document.getElementById('topbar-nav');
+    const wrap = document.getElementById('topbar-more-wrap');
+    const menu = document.getElementById('topbar-more');
+    const nav = document.querySelector('nav.sidebar-tabs');
+    if (!area || !wrap || !menu || !nav) return;
+    const tabs = [...nav.querySelectorAll('.tab')];
+    // Everything is shown first, so that each tab and the "…" button can be measured.
+    tabs.forEach(tab => tab.classList.remove('tab-overflow'));
+    menu.replaceChildren();
+    wrap.hidden = false;
+    if (currentTheme() !== 'cyberpunk' || !area.contains(nav)) {
+        wrap.hidden = true;
+        setTopbarMenu('topbar-more-toggle', false);
+        return;
+    }
+    const px = (el, property) => parseFloat(getComputedStyle(el)[property]) || 0;
+    const gap = px(nav, 'columnGap');
+    const frame = px(nav, 'paddingLeft') + px(nav, 'paddingRight') + px(nav, 'borderLeftWidth')
+        + px(nav, 'borderRightWidth');
+    // Each tab counts with the gap after it; the last one has none, hence + gap.
+    const widths = tabs.map(tab => tab.getBoundingClientRect().width + gap);
+    const available = area.getBoundingClientRect().width - frame + gap;
+    const moreWidth = wrap.getBoundingClientRect().width + px(area, 'columnGap');
+    const active = tabs.findIndex(tab => tab.classList.contains('active'));
+    const visible = new Set(computeVisibleTabs(widths, available, moreWidth, active));
+    const hidden = tabs.filter((_, i) => !visible.has(i));
+    for (const tab of hidden) {
+        tab.classList.add('tab-overflow');
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'topbar-more-item';
+        item.textContent = tab.textContent.trim();
+        item.addEventListener('click', () => {
+            setTopbarMenu('topbar-more-toggle', false);
+            switchTab(tab.dataset.tab);
+            tab.focus();                    // the item is gone: the tab now in the bar takes the focus
+        });
+        menu.appendChild(item);
+    }
+    wrap.hidden = !hidden.length;
+    if (!hidden.length) setTopbarMenu('topbar-more-toggle', false);
+}
+
+// The tabs are fitted again whenever the room for them changes (window size,
+// a longer service summary).
+function initTopbar() {
+    const area = document.getElementById('topbar-nav');
+    if (!area) return;
+    if (typeof ResizeObserver !== 'undefined') {
+        new ResizeObserver(() => updateTabOverflow()).observe(area);
+    } else {
+        window.addEventListener('resize', updateTabOverflow);
+    }
+}
+
 // --- Initialization ---
 document.addEventListener('DOMContentLoaded', () => {
+    applyThemeLayout(currentTheme());
     initTabs();
+    initTopbar();
+    initCardControls();
     initUpload();
     initHexDropZone();
     initHexResizeHandle();
@@ -154,6 +414,11 @@ function switchTab(tabName) {
     document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
     document.querySelector(`.tab[data-tab="${tabName}"]`).classList.add('active');
     document.getElementById(`tab-${tabName}`).classList.add('active');
+    // Cyberpunk: a tab picked from the "…" menu takes a place in the top bar.
+    updateTabOverflow();
+    if (tabName === 'alerts') {
+        renderAlertsTab();
+    }
     if (tabName === 'sysmon' && sysmonEvents.length === 0) {
         refreshSysmon();
     }
@@ -264,8 +529,11 @@ async function refreshDashboard() {
             state.rustinelInfo = await rustinelResp.json();
         }
         renderDashboard();
+        const updated = new Date().toLocaleTimeString('en-GB');
         const timeEl = document.getElementById('dashboard-time');
-        if (timeEl) timeEl.textContent = 'Updated ' + new Date().toLocaleTimeString('en-GB');
+        if (timeEl) timeEl.textContent = 'Updated ' + updated;
+        const topbarTime = document.getElementById('topbar-time');      // the same clock in the Cyberpunk top bar
+        if (topbarTime) topbarTime.textContent = updated;
     } catch (e) {
         showToast('error', 'Dashboard unreachable', e.message || 'Connection to server lost', 6000);
     }
@@ -312,6 +580,14 @@ async function _refreshAlertsOnce() {
             await refreshProcesses();
             if (state.activeTab === 'tracing') {
                 renderRtraceConsole();
+            }
+            // After the process list: it maps the alerts to their process instances.
+            if (state.activeTab === 'alerts') {
+                renderAlertsTab();
+            } else if (_alertsTabShown) {
+                // The table is not on screen: it lets go of the lists it was built
+                // from (tens of MB) and keeps its filters, so the place in it stays.
+                _alertsTabShown = { filterKey: _alertsTabShown.filterKey };
             }
         } else if (resp.status >= 500) {
             showToast('error', 'Alert fetch failed', `Server error ${resp.status}`, 5000);
@@ -387,34 +663,45 @@ function renderDashboard() {
         ];
         const servicesOnline = servicesList.filter(s => s.online).length;
         const servicesTotal = servicesList.length;
-        const highSev = alerts.filter(a => a.severity === 'high' || a.severity === 'critical').length;
-        const medSev = alerts.filter(a => a.severity === 'medium').length;
-        const lowSev = alerts.filter(a => a.severity === 'low' || a.severity === 'info').length;
+        // In any case ("High" and "high" both occur); no severity and "unknown"
+        // count as low, as the Alerts tab counts them as info (alertSeverity)
+        let highSev = 0, medSev = 0, lowSev = 0;
+        for (const alert of alerts) {
+            const severity = alertSeverity(alert);
+            if (severity === 'critical' || severity === 'high') highSev++;
+            else if (severity === 'medium') medSev++;
+            else if (severity === 'low' || severity === 'info') lowSev++;
+        }
         const rulesLoaded = (rustinel.rules?.sigma || 0) + (rustinel.rules?.yara || 0);
 
+        // Each tile opens what it counts; a severity count opens the Alerts tab
+        // filtered by it (and not the tile's whole list as well). A refresh
+        // renders the tiles again: the one with the keyboard focus keeps it.
+        const active = document.activeElement;
+        const focusedTile = active && active.closest ? active.closest('#dashboard-stats .stat-card')?.dataset.tile : null;
         statsContainer.innerHTML = `
-            <div class="stat-card stat-alerts">
+            <div class="stat-card stat-alerts" data-tile="alerts" role="button" tabindex="0" onclick="openAlertsTab({})" onkeydown="onTileKey(event, this)">
                 <div class="stat-value">${totalAlerts}</div>
                 <div class="stat-label">TOTAL ALERTS</div>
                 <div class="stat-breakdown">
-                    ${highSev ? `<span class="stat-tag high">${highSev} high</span>` : ''}
-                    ${medSev ? `<span class="stat-tag med">${medSev} med</span>` : ''}
-                    ${lowSev ? `<span class="stat-tag low">${lowSev} low</span>` : ''}
+                    ${highSev ? `<span class="stat-tag high stat-tag-link" title="Show the critical and high alerts" onclick="event.stopPropagation(); openAlertsTab({severities: ['critical', 'high']})">${highSev} high</span>` : ''}
+                    ${medSev ? `<span class="stat-tag med stat-tag-link" title="Show the medium alerts" onclick="event.stopPropagation(); openAlertsTab({severities: ['medium']})">${medSev} med</span>` : ''}
+                    ${lowSev ? `<span class="stat-tag low stat-tag-link" title="Show the low and info alerts" onclick="event.stopPropagation(); openAlertsTab({severities: ['low', 'info']})">${lowSev} low</span>` : ''}
                 </div>
             </div>
-            <div class="stat-card stat-processes">
+            <div class="stat-card stat-processes" data-tile="processes" role="button" tabindex="0" onclick="revealProcessList()" onkeydown="onTileKey(event, this)">
                 <div class="stat-value">${processCount}</div>
                 <div class="stat-label">PROCESSES TRACKED</div>
                 <div class="stat-breakdown"><span class="stat-tag dim">via ETW telemetry</span></div>
             </div>
-            <div class="stat-card stat-services">
+            <div class="stat-card stat-services" data-tile="services" role="button" tabindex="0" onclick="revealSection('dashboard-grid')" onkeydown="onTileKey(event, this)">
                 <div class="stat-value">${servicesOnline}<span class="stat-value-sub">/${servicesTotal}</span></div>
                 <div class="stat-label">SERVICES ONLINE</div>
                 <div class="stat-breakdown">
                     ${servicesList.map(s => `<span class="stat-tag ${s.online ? 'svc-on' : 'svc-off'}">${s.name}</span>`).join('')}
                 </div>
             </div>
-            <div class="stat-card stat-rules">
+            <div class="stat-card stat-rules" data-tile="rules" role="button" tabindex="0" onclick="openHelp('services', 'help-detection-rules')" onkeydown="onTileKey(event, this)">
                 <div class="stat-value">${rulesLoaded}</div>
                 <div class="stat-label">DETECTION RULES</div>
                 <div class="stat-breakdown">
@@ -422,7 +709,7 @@ function renderDashboard() {
                     <span class="stat-tag dim">${rustinel.rules?.yara || 0} yara</span>
                 </div>
             </div>
-            <div class="stat-card stat-tools">
+            <div class="stat-card stat-tools" data-tile="tools" role="button" tabindex="0" onclick="switchTab('threatscan')" onkeydown="onTileKey(event, this)">
                 <div class="stat-value">4</div>
                 <div class="stat-label">SCANNER TOOLS</div>
                 <div class="stat-breakdown">
@@ -433,6 +720,7 @@ function renderDashboard() {
                 </div>
             </div>
         `;
+        if (focusedTile) statsContainer.querySelector(`.stat-card[data-tile="${focusedTile}"]`)?.focus({ preventScroll: true });
     }
 
     // --- Service Cards ---
@@ -625,15 +913,18 @@ function renderDashboard() {
         if (alerts.length === 0) {
             activityFeed.innerHTML = '<div class="activity-empty">No recent activity. Submit a sample to begin.</div>';
         } else {
-            const recent = alerts.slice(0, 8);
+            const recent = newestAlerts(alerts, 8);
             let html = '';
             recent.forEach(alert => {
                 const ts = alert.timestamp ? new Date(alert.timestamp).toLocaleTimeString('en-GB', {hour12:false}) : '--';
-                const sevClass = (alert.severity === 'high' || alert.severity === 'critical') ? 'sev-high' : alert.severity === 'medium' ? 'sev-med' : 'sev-low';
+                const severity = alertSeverity(alert);      // lower case: the engines write "High" as well
+                const sevClass = (severity === 'high' || severity === 'critical') ? 'sev-high' : severity === 'medium' ? 'sev-med' : 'sev-low';
+                // sev-high covers critical as well; data-sev keeps them apart (Cyberpunk colours critical on its own)
+                const sevKey = ['critical', 'high', 'medium'].includes(severity) ? severity : 'low';
                 const ruleName = alert.rule_name || alert.name || 'Unknown Rule';
                 const proc = alert.process_name || '';
                 const pid = alert.pid || '';
-                html += `<div class="activity-entry ${sevClass}">`;
+                html += `<div class="activity-entry ${sevClass}" data-sev="${sevKey}">`;
                 html += `<span class="activity-time">${ts}</span>`;
                 html += `<span class="activity-sev">${escapeHtml((alert.severity || 'info').toUpperCase())}</span>`;
                 html += `<span class="activity-rule">${escapeHtml(ruleName)}</span>`;
@@ -643,6 +934,613 @@ function renderDashboard() {
             activityFeed.innerHTML = html;
         }
     }
+}
+
+// =============================================
+// ALERTS TAB
+// =============================================
+// Every alert of state.alerts in one table, newest first, filtered by
+// severity, engine and text. The filters are the tab's controls themselves,
+// so they outlast a re-render and a theme switch (same nodes). A refresh
+// re-renders the table only while the tab is open and only if what it shows
+// changed; the place in the list stays unless the filters changed.
+const ALERTS_TAB_LIMIT = 2000;
+const ALERT_SEVERITIES = ['critical', 'high', 'medium', 'low', 'info'];
+let _alertsTabShown = null;     // {alerts, processes, filterKey} of the rendered table
+
+// Lower case, as the engines write "High" as well as "high"; an alert
+// without a severity, or with the server's default "unknown" (engines that
+// have none), counts as info.
+function alertSeverity(alert) {
+    const severity = String(alert?.severity || '').toLowerCase();
+    return !severity || severity === 'unknown' ? 'info' : severity;
+}
+
+function alertRuleName(alert) {
+    return String(alert?.rule_name || alert?.name || '');
+}
+
+// The process by name, else by the file name of its image ('' if neither is known)
+function alertProcessName(alert) {
+    const name = String(alert?.process_name || '').trim();
+    return name || String(alert?.process_image || '').split(/[\\/]/).pop();
+}
+
+// filter = {severities: [...], engine, text}; an empty list or text does not
+// filter. Severity and engine are compared in any case; the text is searched
+// in the rule, the process (name, PID) and the description.
+function filterAlerts(alerts, filter) {
+    filter = filter || {};
+    const severities = new Set((filter.severities || []).map(s => String(s || '').toLowerCase()).filter(Boolean));
+    const engine = String(filter.engine || '').toLowerCase();
+    const text = String(filter.text || '').trim().toLowerCase();
+    const matches = [];
+    (alerts || []).forEach((alert, i) => {
+        if (!alert) return;
+        if (severities.size && !severities.has(alertSeverity(alert))) return;
+        if (engine && String(alert.engine || '').toLowerCase() !== engine) return;
+        if (text && ![alertRuleName(alert), alertProcessName(alert), alert.pid, alert.rule_description]
+            .some(value => String(value ?? '').toLowerCase().includes(text))) return;
+        const time = Date.parse(alert.timestamp);
+        matches.push({ alert, time: Number.isNaN(time) ? -Infinity : time, i });
+    });
+    // Newest first by time, not by string (time zones differ); alerts without
+    // a time last; the same time in reverse list order.
+    matches.sort((a, b) => (b.time - a.time) || (b.i - a.i));
+    return matches.map(m => m.alert);
+}
+
+// The `count` newest alerts, newest first, in the order of the Alerts tab.
+// /api/alerts lists them oldest first, sorted by their text, which is not
+// their order in time across time zones: neither end of it will do.
+function newestAlerts(alerts, count) {
+    return filterAlerts(alerts).slice(0, count);
+}
+
+// The engines for the engine choice: each once, whatever its case, in the
+// spelling it first appears in.
+function alertEngines(alerts) {
+    const engines = new Map();
+    for (const alert of alerts || []) {
+        const engine = String(alert?.engine || '');
+        if (engine && !engines.has(engine.toLowerCase())) engines.set(engine.toLowerCase(), engine);
+    }
+    return [...engines.values()].sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+}
+
+// Windows reuses PIDs, and an alert carries no instance key. The process list
+// names the alerts of each instance by time and rule, which maps an alert to
+// the instance it belongs to; alerts of processes not in the list have none.
+function alertInstanceIndex(processes = state.processes) {
+    const index = new Map();
+    for (const [key, proc] of Object.entries(processes || {})) {
+        for (const alert of proc?.alerts || []) index.set(_alertInstanceId(proc.pid ?? key, alert), key);
+    }
+    return index;
+}
+
+function _alertInstanceId(pid, alert) {
+    return [pid, alert.timestamp ?? '', alert.rule_name ?? ''].join('|');
+}
+
+// Date and time: the list spans days
+function formatAlertTime(ts) {
+    const d = new Date(ts);
+    if (ts === null || ts === undefined || ts === '' || Number.isNaN(d.getTime())) return String(ts ?? '');
+    const p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+// Table rows for alerts already filtered and sorted: the first ALERTS_TAB_LIMIT
+// of them, under a note when there are more. A row opens the alert, the
+// process its instance. Long texts are cut by CSS; the title has them in full.
+function alertRowsHtml(alerts) {
+    const index = alertInstanceIndex();
+    const rows = alerts.slice(0, ALERTS_TAB_LIMIT).map(alert => {
+        // Class and badge text alike: only [a-z0-9_-] (a severity can be anything)
+        const sevClass = cssToken(alertSeverity(alert));
+        const rule = alertRuleName(alert) || 'Unknown Rule';
+        const desc = String(alert.rule_description || '');
+        const name = alertProcessName(alert);
+        const pid = alert.pid === null || alert.pid === undefined ? '' : String(alert.pid);
+        const key = alert.key != null ? procKey(alert) : (pid ? index.get(_alertInstanceId(pid, alert)) : undefined);
+        const label = name ? `${escapeHtml(name)}${pid ? ` <span class="alerts-proc-pid">${escapeHtml(pid)}</span>` : ''}`
+            : pid ? `PID ${escapeHtml(pid)}` : '';
+        const procTitle = [alert.process_image || name, pid ? `PID ${pid}` : '', key && key !== pid ? `instance ${key}` : '']
+            .filter(Boolean).join(' · ');
+        const proc = !label ? '<span class="muted">&mdash;</span>'
+            : key ? `<a class="alerts-proc-link" onclick="event.stopPropagation(); openProcessDetail(${jsArg(key)})" title="${escapeHtml(procTitle)}">${label}</a>`
+            : `<span title="${escapeHtml(procTitle ? procTitle + ' (not in the process list)' : 'Not in the process list')}">${label}</span>`;
+        return `<tr class="alerts-row" onclick="openAlertDetailById(${jsArg(alert.id)})">`
+            + `<td class="alerts-time" data-sort-value="${sortTimeValue(alert.timestamp)}" title="${escapeHtml(alert.timestamp || '')}">${escapeHtml(formatAlertTime(alert.timestamp))}</td>`
+            + `<td class="alerts-sev" data-sort-value="${severitySortValue(sevClass)}"><span class="event-severity ${sevClass}">${sevClass || 'unknown'}</span></td>`
+            + `<td class="alerts-engine">${escapeHtml(alert.engine || '')}</td>`
+            + `<td class="alerts-rule" title="${escapeHtml(rule)}">${escapeHtml(rule)}</td>`
+            + `<td class="alerts-proc">${proc}</td>`
+            + `<td class="alerts-desc" title="${escapeHtml(desc)}">${escapeHtml(desc)}</td>`
+            + '</tr>';
+    });
+    // The note keeps its place on top when the table is sorted (data-sort-skip)
+    if (alerts.length > ALERTS_TAB_LIMIT) {
+        rows.unshift(`<tr class="alerts-limit-row" data-sort-skip><td colspan="6">Showing newest ${ALERTS_TAB_LIMIT} of ${alerts.length}. Narrow the filters to reach older alerts.</td></tr>`);
+    }
+    return rows.join('');
+}
+
+// "All engines" and the engines of the alerts. A chosen engine that no alert
+// has (yet) stays a choice, so the filter in effect is the one on screen.
+function setAlertsEngineOptions(select, engines, chosen) {
+    const wanted = String(chosen || '');
+    const match = engines.find(e => e.toLowerCase() === wanted.toLowerCase());
+    const names = wanted && !match ? [...engines, wanted] : engines;
+    select.replaceChildren(...['', ...names].map(name => {
+        const option = document.createElement('option');
+        option.value = name;
+        option.textContent = name || 'All engines';
+        return option;
+    }));
+    select.value = match || wanted;
+}
+
+function alertsFilterFromControls() {
+    return {
+        severities: [...document.querySelectorAll('#tab-alerts .alerts-sev-chip')]
+            .filter(chip => chip.getAttribute('aria-pressed') === 'true').map(chip => chip.dataset.severity),
+        engine: document.getElementById('alerts-filter-engine')?.value || '',
+        text: document.getElementById('alerts-filter-text')?.value || '',
+    };
+}
+
+function renderAlertsTab() {
+    const rows = document.getElementById('alerts-rows');
+    if (!rows) return;
+    const alerts = state.alerts || [];
+    const engine = document.getElementById('alerts-filter-engine');
+    const shown = _alertsTabShown;
+    if (engine && (!shown || shown.alerts !== alerts)) setAlertsEngineOptions(engine, alertEngines(alerts), engine.value);
+    const filter = alertsFilterFromControls();
+    const filterKey = JSON.stringify([filter.severities, filter.engine.toLowerCase(), filter.text.trim().toLowerCase()]);
+    if (shown && shown.alerts === alerts && shown.processes === state.processes && shown.filterKey === filterKey) return;
+    const matches = filterAlerts(alerts, filter);
+    const wrap = document.getElementById('alerts-table-wrap');
+    const scrollTop = wrap ? wrap.scrollTop : 0;
+    rows.innerHTML = matches.length ? alertRowsHtml(matches)
+        : `<tr class="alerts-empty-row" data-sort-skip><td colspan="6">${alerts.length ? 'No alerts match the filters.' : 'No alerts yet.'}</td></tr>`;
+    // The same filters keep the place in the list; other filters start at the top.
+    if (wrap) wrap.scrollTop = shown && shown.filterKey === filterKey ? scrollTop : 0;
+    const count = document.getElementById('alerts-count');
+    if (count) count.textContent = `${matches.length} of ${alerts.length}`;
+    _alertsTabShown = { alerts, processes: state.processes, filterKey };
+}
+
+function toggleAlertsSeverity(severity) {
+    const chip = document.querySelector(`#tab-alerts .alerts-sev-chip[data-severity="${cssToken(severity)}"]`);
+    if (!chip) return;
+    chip.setAttribute('aria-pressed', String(chip.getAttribute('aria-pressed') !== 'true'));
+    renderAlertsTab();
+}
+
+// The search renders once typing pauses: a full table takes about 0.1 s to
+// lay out, which made every keystroke lag.
+let _alertsRenderTimer = null;
+
+function scheduleAlertsRender() {
+    clearTimeout(_alertsRenderTimer);
+    _alertsRenderTimer = setTimeout(renderAlertsTab, 200);
+}
+
+// Opens the Alerts tab with exactly these filters (others cleared), e.g.
+// openAlertsTab({severities: ['critical', 'high']}); no filter shows every alert.
+function openAlertsTab(filter) {
+    filter = filter || {};
+    const severities = new Set((filter.severities || []).map(s => String(s || '').toLowerCase()));
+    document.querySelectorAll('#tab-alerts .alerts-sev-chip').forEach(chip =>
+        chip.setAttribute('aria-pressed', String(severities.has(chip.dataset.severity))));
+    const engine = document.getElementById('alerts-filter-engine');
+    if (engine) setAlertsEngineOptions(engine, alertEngines(state.alerts), filter.engine);
+    const text = document.getElementById('alerts-filter-text');
+    if (text) text.value = String(filter.text || '');
+    switchTab('alerts');
+}
+
+// =============================================
+// CARD CONTROLS: (i) EXPLANATIONS, SORTABLE TABLES (both themes)
+// =============================================
+// A heading with data-info="..." gets a small (i) button after its text; the
+// button shows the text in the shared #info-popover, as text (never markup).
+// A table with data-sortable and data-sort-id="..." sorts by a click on a column
+// head: ascending, then descending. tableSortState keeps the order per sort id
+// until the page is reloaded. Render functions rebuild their tables (the
+// Alerts tab, Sysmon and the pipe events on every refresh): one
+// MutationObserver for the page sorts each rebuilt table again and gives the
+// headings rendered by JavaScript their (i), before the browser paints.
+// sort id -> {col, dir: 'asc' | 'desc'}
+const tableSortState = {};
+const SORT_COLLATOR = new Intl.Collator(undefined, { numeric: true, sensitivity: 'accent' });
+let _cardControlsObserver = null;
+// The (i) whose text the popover shows
+let _infoPopoverAnchor = null;
+
+// --- (i) explanations ---
+function initInfoButtons(root = document) {
+    const holders = [...root.querySelectorAll('[data-info]')];
+    if (root.nodeType === 1 && root.hasAttribute('data-info')) holders.unshift(root);
+    for (const holder of holders) {
+        if ([...holder.children].some(child => child.classList.contains('info-btn'))) continue;
+        const button = document.createElement('button');
+        button.className = 'info-btn';
+        button.type = 'button';
+        button.setAttribute('aria-label', 'Explain');
+        button.textContent = 'i';
+        holder.appendChild(button);
+    }
+}
+
+// Where the popover goes (px, for position: fixed): below the button with
+// the left edges aligned, moved left to stay in the window, and above the
+// button when there is no room below.
+function infoPopoverPosition(anchor, size, viewport, margin = 8) {
+    const gap = 6;
+    const left = Math.max(margin, Math.min(anchor.left, viewport.width - size.width - margin));
+    let top = anchor.bottom + gap;
+    if (top + size.height > viewport.height - margin && anchor.top - gap - size.height >= margin) {
+        top = anchor.top - gap - size.height;
+    }
+    top = Math.max(margin, Math.min(top, viewport.height - size.height - margin));
+    return { left: Math.round(left), top: Math.round(top) };
+}
+
+function isInfoPopoverOpen() {
+    const popover = document.getElementById('info-popover');
+    return !!popover && !popover.hidden;
+}
+
+function openInfoPopover(button) {
+    const popover = document.getElementById('info-popover');
+    const holder = button.closest('[data-info]');
+    if (!popover || !holder) return;
+    if (_infoPopoverAnchor && _infoPopoverAnchor !== button) _infoPopoverAnchor.setAttribute('aria-expanded', 'false');
+    popover.textContent = holder.getAttribute('data-info');
+    popover.hidden = false;
+    // Measured where it cannot overflow, then placed (no paint in between)
+    popover.style.left = '0px';
+    popover.style.top = '0px';
+    const size = popover.getBoundingClientRect();
+    const at = infoPopoverPosition(button.getBoundingClientRect(), { width: size.width, height: size.height },
+                                   { width: window.innerWidth, height: window.innerHeight });
+    popover.style.left = `${at.left}px`;
+    popover.style.top = `${at.top}px`;
+    button.setAttribute('aria-expanded', 'true');
+    button.setAttribute('aria-controls', 'info-popover');
+    _infoPopoverAnchor = button;
+}
+
+// Returns the (i) the popover belonged to, for the focus to go back to
+function closeInfoPopover() {
+    const popover = document.getElementById('info-popover');
+    const anchor = _infoPopoverAnchor;
+    if (popover) popover.hidden = true;
+    if (anchor) anchor.setAttribute('aria-expanded', 'false');
+    _infoPopoverAnchor = null;
+    return anchor;
+}
+
+// Capture phase: a click on (i) inside a clickable card or a collapsible
+// title does not also click that; any other click outside the popover closes it.
+function onInfoClick(e) {
+    const button = e.target && e.target.closest ? e.target.closest('.info-btn') : null;
+    if (button) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (button === _infoPopoverAnchor && isInfoPopoverOpen()) closeInfoPopover();
+        else openInfoPopover(button);
+        return;
+    }
+    const popover = document.getElementById('info-popover');
+    if (isInfoPopoverOpen() && !popover.contains(e.target)) closeInfoPopover();
+}
+
+// The popover is placed for the button where it was: it closes when the page
+// or a container around the button scrolls (a container elsewhere may scroll).
+function onInfoAnchorScroll(e) {
+    const anchor = _infoPopoverAnchor;
+    if (!anchor) return;
+    const target = e.target;
+    if (target === document || target === window || (target && target.contains && target.contains(anchor))) {
+        closeInfoPopover();
+    }
+}
+
+// --- Sortable tables ---
+// A value as it is compared: a number (also 0x hex, a sign, a % sign), a
+// date and time (ISO), a clock time (HH:MM[:SS]) or text. A placeholder
+// (-, --, —, ?, n/a) counts as empty.
+function sortKey(value) {
+    const text = String(value === null || value === undefined ? '' : value).trim();
+    const key = { text, empty: ['', '-', '--', '?', '\u2014', '\u2013', 'n/a'].includes(text.toLowerCase()),
+                  num: null, date: null, clock: null };
+    if (key.empty) return key;
+    if (/^[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?%?$/i.test(text)) {
+        key.num = parseFloat(text);
+    } else if (/^0x[0-9a-f]+$/i.test(text)) {
+        key.num = parseInt(text, 16);
+    } else if (/^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:[.,]\d+)?)?)?(?:Z|[+-]\d{2}:?\d{2})?$/i.test(text)) {
+        const t = Date.parse(text.replace(' ', 'T').replace(',', '.'));
+        if (!Number.isNaN(t)) key.date = t;
+    } else {
+        const m = /^(\d{1,2}):(\d{2})(?::(\d{2}(?:\.\d+)?))?$/.exec(text);
+        if (m) key.clock = Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3] || 0);
+    }
+    return key;
+}
+
+// Two numbers numerically, two times chronologically, anything else as text
+// in any case ("Alpha" before "beta", "chunk_9" before "chunk_10"); an empty
+// value after every other one.
+function compareSortKeys(a, b) {
+    if (a.empty || b.empty) return Number(a.empty) - Number(b.empty);
+    const order = (x, y) => (x > y) - (x < y);
+    if (a.num !== null && b.num !== null) return order(a.num, b.num);
+    if (a.date !== null && b.date !== null) return order(a.date, b.date);
+    if (a.clock !== null && b.clock !== null) return order(a.clock, b.clock);
+    return SORT_COLLATOR.compare(a.text, b.text);
+}
+
+function compareSortValues(a, b) {
+    return compareSortKeys(sortKey(a), sortKey(b));
+}
+
+// The cell of a row in column col (columns counted with their colspan)
+function sortCellAt(row, col) {
+    let x = 0;
+    for (const cell of row.cells) {
+        x += cell.colSpan || 1;
+        if (col < x) return cell;
+    }
+    return null;
+}
+
+// What a cell sorts by: its data-sort-value, else its text
+function sortCellValue(row, col) {
+    const cell = sortCellAt(row, col);
+    if (!cell) return '';
+    const value = cell.getAttribute('data-sort-value');
+    return value !== null ? value : cell.textContent;
+}
+
+// A note or an empty state: marked data-sort-skip, or one cell across the table
+function isSortPinnedRow(row) {
+    if (row.hasAttribute('data-sort-skip')) return true;
+    const cells = row.cells;
+    return cells.length === 1 && (cells[0].colSpan || 1) > 1;
+}
+
+// The rows of one table body in their new order, by column col, dir 'asc' or
+// 'desc'. Rows that belong together move together: a row, the rows its
+// rowspan covers and its detail rows (data-sort-detail). A pinned row keeps
+// its place. Stable: equal values keep their order in either direction, and
+// empty values come last in either direction.
+function sortRows(rows, col, dir) {
+    const units = [];
+    let covered = 0;
+    for (const row of rows) {
+        const span = Math.max(1, ...[...row.cells].map(cell => cell.rowSpan || 1));
+        const detail = row.hasAttribute('data-sort-detail');
+        const last = units[units.length - 1];
+        if (last && !last.pinned && (covered > 0 || detail)) {
+            last.rows.push(row);
+            covered = Math.max(covered - 1, span - 1);
+            continue;
+        }
+        const pinned = detail || isSortPinnedRow(row);
+        units.push({ rows: [row], pinned, key: pinned ? null : sortKey(sortCellValue(row, col)), index: units.length });
+        covered = pinned ? 0 : span - 1;
+    }
+    const sign = dir === 'desc' ? -1 : 1;
+    const sorted = units.filter(unit => !unit.pinned).sort((a, b) => {
+        const order = a.key.empty || b.key.empty ? compareSortKeys(a.key, b.key) : sign * compareSortKeys(a.key, b.key);
+        return order || a.index - b.index;
+    });
+    let next = 0;
+    return units.flatMap(unit => (unit.pinned ? unit : sorted[next++]).rows);
+}
+
+// The row of column heads: the last row of <thead>, else a first row of <th>s
+function sortHeaderRow(table) {
+    const head = table.tHead;
+    if (head && head.rows.length) return head.rows[head.rows.length - 1];
+    const first = table.rows[0];
+    return first && first.cells.length && [...first.cells].every(cell => cell.tagName === 'TH') ? first : null;
+}
+
+// A head without text (a column of buttons) or with data-no-sort does not sort
+function isSortHeader(th) {
+    return th.tagName === 'TH' && !th.hasAttribute('data-no-sort') && th.textContent.trim() !== '';
+}
+
+function sortColumnOf(cell) {
+    let col = 0;
+    for (const other of cell.parentElement.cells) {
+        if (other === cell) return col;
+        col += other.colSpan || 1;
+    }
+    return col;
+}
+
+// Applies the stored order to one table: its rows and the state of its heads
+// (aria-sort, which style.css shows as ↕ ▲ ▼; tabindex for the keyboard)
+function applyTableSort(table) {
+    const head = sortHeaderRow(table);
+    if (!head) return;
+    const sort = tableSortState[table.dataset.sortId];
+    for (const th of head.cells) {
+        if (!isSortHeader(th)) continue;
+        if (!th.hasAttribute('tabindex')) th.setAttribute('tabindex', '0');
+        if (sort && sortColumnOf(th) === sort.col) th.setAttribute('aria-sort', sort.dir === 'desc' ? 'descending' : 'ascending');
+        else th.removeAttribute('aria-sort');
+    }
+    if (!sort) return;
+    for (const body of table.tBodies) {
+        const rows = [...body.rows].filter(row => row !== head);
+        const sorted = sortRows(rows, sort.col, sort.dir);
+        if (sorted.every((row, i) => row === rows[i])) continue;
+        const fragment = document.createDocumentFragment();
+        sorted.forEach(row => fragment.appendChild(row));
+        body.appendChild(fragment);
+    }
+}
+
+// Sorts every sortable table in root (or root itself) again by its stored order
+function reapplyTableSorts(root = document) {
+    const tables = [...root.querySelectorAll('table[data-sortable]')];
+    if (root.nodeType === 1 && root.matches('table[data-sortable]')) tables.unshift(root);
+    tables.forEach(applyTableSort);
+}
+
+// A click on the sorted column turns the order; another column starts ascending.
+// Every table of the same sort id on the page takes the new order.
+function sortTableBy(table, col) {
+    const id = table.dataset.sortId;
+    if (!id) return;
+    const current = tableSortState[id];
+    tableSortState[id] = { col, dir: current && current.col === col && current.dir === 'asc' ? 'desc' : 'asc' };
+    document.querySelectorAll('table[data-sortable]').forEach(other => {
+        if (other.dataset.sortId === id) applyTableSort(other);
+    });
+}
+
+function sortHeaderFrom(target) {
+    const th = target && target.closest ? target.closest('th') : null;
+    const table = th && th.closest('table');
+    return table && table.hasAttribute('data-sortable') && th.parentElement === sortHeaderRow(table) && isSortHeader(th)
+        ? th : null;
+}
+
+function onSortHeaderClick(e) {
+    const th = sortHeaderFrom(e.target);
+    if (th) sortTableBy(th.closest('table'), sortColumnOf(th));
+}
+
+function onSortHeaderKey(e) {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const th = sortHeaderFrom(e.target);
+    if (!th || th !== e.target) return;
+    e.preventDefault();
+    sortTableBy(th.closest('table'), sortColumnOf(th));
+}
+
+// The observer's callback: tables a render function rebuilt or changed are
+// sorted again, headings it added get their (i). Its own changes (moved rows,
+// new buttons) are taken off the queue, so it never triggers itself.
+function onCardControlsMutated(records) {
+    const tables = new Set();
+    const roots = [];
+    for (const record of records) {
+        const table = record.target && record.target.closest ? record.target.closest('table[data-sortable]') : null;
+        if (table) tables.add(table);
+        for (const node of record.addedNodes) {
+            if (node.nodeType !== 1) continue;
+            // Cheap checks first: a hex page adds thousands of plain spans
+            const itself = node.hasAttribute('data-info') || (node.tagName === 'TABLE' && node.hasAttribute('data-sortable'));
+            if (itself || (node.firstElementChild && node.querySelector('table[data-sortable], [data-info]'))) roots.push(node);
+        }
+    }
+    for (const root of roots) {
+        initInfoButtons(root);
+        if (root.matches('table[data-sortable]')) tables.add(root);
+        root.querySelectorAll('table[data-sortable]').forEach(table => tables.add(table));
+    }
+    tables.forEach(table => { if (table.isConnected) applyTableSort(table); });
+    // A render removed the (i) the popover was showing
+    if (_infoPopoverAnchor && !_infoPopoverAnchor.isConnected) closeInfoPopover();
+    if (_cardControlsObserver) _cardControlsObserver.takeRecords();
+}
+
+function initCardControls() {
+    document.addEventListener('click', onInfoClick, true);
+    document.addEventListener('click', onSortHeaderClick);
+    document.addEventListener('keydown', onSortHeaderKey);
+    document.addEventListener('scroll', onInfoAnchorScroll, true);
+    window.addEventListener('resize', () => closeInfoPopover());
+    initInfoButtons(document);
+    reapplyTableSorts(document);
+    if (typeof MutationObserver === 'function' && document.body) {
+        _cardControlsObserver = new MutationObserver(onCardControlsMutated);
+        _cardControlsObserver.observe(document.body, { childList: true, subtree: true });
+    }
+}
+
+// --- CHART / TABLE ---
+// A card that draws numbers (the timelines, the severity bar, the file
+// structure of the binary analysis, the file map strip of the PE analysis)
+// shows the same numbers as a sortable table on request. Its render function
+// writes both views, marked data-view-of="<card id>" data-view="chart|table"
+// (cardViewAttrs, or in the markup of index.html), and the switch from
+// viewToggleHtml(id). The view not chosen is hidden, so a switch needs no new
+// render; a refresh renders both views again, so the table is as current as
+// the chart. The choice lasts per card until the page is reloaded.
+// card id -> 'table'; a card not in it shows its chart
+const cardViewState = {};
+
+function isTableView(id) {
+    return cardViewState[id] === 'table';
+}
+
+// The switch reads "TABLE" while the chart shows and "CHART" while the table shows
+function viewToggleHtml(id) {
+    const table = isTableView(id);
+    return `<button type="button" class="view-toggle" data-view-toggle="${escapeHtml(id)}" title="${table ? 'Show the chart' : 'Show the numbers as a table'}" onclick="toggleCardView(${jsArg(id)})">${table ? 'CHART' : 'TABLE'}</button>`;
+}
+
+// The attributes of one view of a card: hidden unless it is the one chosen
+function cardViewAttrs(id, view) {
+    const shown = (view === 'table') === isTableView(id);
+    return ` data-view-of="${escapeHtml(id)}" data-view="${view === 'table' ? 'table' : 'chart'}"${shown ? '' : ' hidden'}`;
+}
+
+// Shows the other view of every card with this id. The switches keep their
+// node (and so the keyboard focus); only their text changes.
+function toggleCardView(id) {
+    if (isTableView(id)) delete cardViewState[id];
+    else cardViewState[id] = 'table';
+    const table = isTableView(id);
+    document.querySelectorAll('[data-view-of]').forEach(el => {
+        if (el.getAttribute('data-view-of') === id) el.hidden = (el.getAttribute('data-view') === 'table') !== table;
+    });
+    document.querySelectorAll('.view-toggle').forEach(button => {
+        if (button.getAttribute('data-view-toggle') !== id) return;
+        button.textContent = table ? 'CHART' : 'TABLE';
+        button.title = table ? 'Show the chart' : 'Show the numbers as a table';
+    });
+}
+
+// --- Dashboard tiles ---
+// The tiles are <div role="button">s: Enter and Space click them as a button
+// would. The severity counts inside the alerts tile are mouse targets of their
+// own (no nested buttons); the keyboard reaches their filters in the Alerts tab.
+function onTileKey(event, tile) {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    if (event.target !== tile) return;
+    event.preventDefault();
+    tile.click();
+}
+
+// Scrolls an element into view and marks it for a second (.reveal-flash)
+function revealSection(id) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    el.classList.remove('reveal-flash');
+    void el.offsetWidth;            // the animation starts again on a second click
+    el.classList.add('reveal-flash');
+    clearTimeout(el._revealTimer);
+    el._revealTimer = setTimeout(() => el.classList.remove('reveal-flash'), 1000);
+}
+
+// PROCESSES TRACKED: the process list, in the sidebar (Classic) or in the drawer (Cyberpunk)
+function revealProcessList() {
+    if (currentTheme() === 'cyberpunk') openDrawer();
+    else revealSection('process-list-section');
 }
 
 // =============================================
@@ -670,6 +1568,7 @@ function initRtraceTabs() {
             }
         });
     }
+    initRtraceEventSort();
 }
 
 function renderRtraceConsole() {
@@ -782,6 +1681,9 @@ function updateRtraceSeverityBar(proc) {
     const enginesEl = document.getElementById('rtrace-engines');
     const rulesEl = document.getElementById('rtrace-top-rules');
     if (!sevCountsEl) return;
+    // The counts as pills (CHART) or as a table (TABLE); the switch is written once
+    const toggle = document.getElementById('rtrace-sev-view-toggle');
+    if (toggle && !toggle.firstElementChild) toggle.innerHTML = viewToggleHtml('rtrace-severity');
 
     const alerts = proc.alerts || [];
 
@@ -808,6 +1710,8 @@ function updateRtraceSeverityBar(proc) {
     if (sevCounts.low > 0) sevHtml += `<span class="rtrace-sev-pill low"><span class="sev-dot"></span>${sevCounts.low} Low</span>`;
     if (!sevHtml) sevHtml = '<span style="font-size:10px;color:var(--text-muted);">No detections</span>';
     sevCountsEl.innerHTML = sevHtml;
+    const sevTable = document.getElementById('rtrace-sev-table');
+    if (sevTable) sevTable.innerHTML = rtraceSeverityTableHtml(sevCounts);
 
     // Render engine chips
     let engHtml = '';
@@ -826,23 +1730,47 @@ function updateRtraceSeverityBar(proc) {
     rulesEl.innerHTML = ruleHtml;
 }
 
+// The table view of the severity bar: the alerts per severity, zeros included
+function rtraceSeverityTableHtml(sevCounts) {
+    const rows = ['critical', 'high', 'medium', 'low'].map(sev =>
+        `<tr><td data-sort-value="${severitySortValue(sev)}"><span class="event-severity ${cssToken(sev)}">${sev}</span></td>`
+        + `<td class="view-table-num">${sevCounts[sev] || 0}</td></tr>`);
+    return '<table class="view-table view-table-compact" data-sortable data-sort-id="rtrace-severity-counts"><thead><tr>'
+        + `<th>Severity</th><th class="view-table-num">Count</th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
+}
+
+// The table view of the Tracing timeline: the alerts of each lane, in lane order
+function rtraceTimelineTableHtml(lanes) {
+    const rows = lanes.map(lane =>
+        `<tr><td><span class="view-table-dot" style="background:${lane.color}"></span>${lane.name}</td>`
+        + `<td class="view-table-num">${lane.count}</td></tr>`);
+    if (!rows.length) rows.push('<tr data-sort-skip><td colspan="2" class="view-table-empty">No alerts yet.</td></tr>');
+    return '<table class="view-table view-table-compact" data-sortable data-sort-id="rtrace-timeline-types"><thead><tr>'
+        + `<th>Event type</th><th class="view-table-num">Count</th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
+}
+
 function renderRtraceTimeline() {
     const container = document.getElementById('rtrace-timeline-bar');
     const rangeEl = document.getElementById('rtrace-timeline-range');
+    // The lanes (CHART) or the alerts per lane (TABLE); the switch is written once
+    const toggle = document.getElementById('rtrace-timeline-view-toggle');
+    if (toggle && !toggle.firstElementChild) toggle.innerHTML = viewToggleHtml('rtrace-timeline');
+    const table = document.getElementById('rtrace-timeline-table');
     if (!container || !state.alerts.length) {
         if (container) container.innerHTML = '<div class="rtrace-timeline-cursor" id="rtrace-timeline-cursor"></div>';
         if (rangeEl) rangeEl.textContent = '';
+        if (table) table.innerHTML = rtraceTimelineTableHtml([]);
         return;
     }
 
-    // Category config: lane order and colors
+    // Category config: lane order and colors (name: in the legend and the table)
     const lanes = [
-        { key: 'critical', label: 'CRIT', color: '#ef4444' },
-        { key: 'process', label: 'PROC', color: '#3b82f6' },
-        { key: 'network', label: 'NET', color: '#22c55e' },
-        { key: 'dns', label: 'DNS', color: '#a78bfa' },
-        { key: 'file', label: 'FILE', color: '#f97316' },
-        { key: 'registry', label: 'REG', color: '#f472b6' },
+        { key: 'critical', label: 'CRIT', name: 'Critical/High', color: 'var(--severity-critical)' },
+        { key: 'process', label: 'PROC', name: 'Process', color: 'var(--graph-process)' },
+        { key: 'network', label: 'NET', name: 'Network', color: 'var(--graph-network)' },
+        { key: 'dns', label: 'DNS', name: 'DNS', color: 'var(--graph-dns)' },
+        { key: 'file', label: 'FILE', name: 'File', color: 'var(--graph-file)' },
+        { key: 'registry', label: 'REG', name: 'Registry', color: 'var(--graph-registry)' },
     ];
 
     // Parse all alert timestamps and categorize
@@ -855,6 +1783,7 @@ function renderRtraceTimeline() {
     const timestamps = sorted.map(a => new Date(a.timestamp).getTime()).filter(t => !isNaN(t));
     if (!timestamps.length) {
         container.innerHTML = '<div class="rtrace-timeline-cursor" id="rtrace-timeline-cursor"></div>';
+        if (table) table.innerHTML = rtraceTimelineTableHtml(lanes.map(lane => ({ ...lane, count: 0 })));
         return;
     }
 
@@ -897,6 +1826,8 @@ function renderRtraceTimeline() {
             laneEvents[key].push({ t, alert });
         }
     });
+    // The same alerts the lanes draw (an alert without a valid time has no place on either)
+    if (table) table.innerHTML = rtraceTimelineTableHtml(lanes.map(lane => ({ ...lane, count: laneEvents[lane.key].length })));
 
     // Render lanes
     const containerWidth = container.clientWidth || 600;
@@ -1145,8 +2076,11 @@ function renderRtraceEventTable() {
     }
     // 'live' tab: no filter (shows all events)
 
-    // Sort by timestamp
+    // Sort by timestamp, then by the column chosen in the heads (equal values
+    // keep their time order); every alerts poll renders the grid in that order
     events.sort((a, b) => (a.timestamp || '').localeCompare(b.timestamp || ''));
+    const sort = tableSortState[RTRACE_EVENT_SORT_ID];
+    if (sort) events = sortItemsBy(events, ev => rtraceEventSortValue(ev, sort.col), sort.dir);
 
     if (!events.length) {
         container.innerHTML = '<div style="padding:20px;color:var(--text-muted);font-size:11px;">No events for this filter.</div>';
@@ -1156,9 +2090,7 @@ function renderRtraceEventTable() {
     let html = '';
     events.forEach((ev, idx) => {
         const relTime = formatRelativeTime(ev.timestamp);
-        const raw = ev.raw || {};
-        const action = raw.event?.action || ev.engine || 'event';
-        const actionShort = action.replace('_', ' ').split(' ')[0];
+        const actionShort = rtraceEventAction(ev);
         const actionClass = getActionBadgeClass(actionShort);
         const severity = (ev.severity || 'unknown').toLowerCase();
         const ruleName = ev.rule_name || '';
@@ -1170,18 +2102,97 @@ function renderRtraceEventTable() {
 
         html += `<div class="rtrace-event-row${sevRowClass}" onclick="openAlertDetailById(${jsArg(ev.id)})" title="${escapeHtml(ruleName)}\n${escapeHtml(ev.rule_description || '')}">
             <span class="ev-sev"><span class="ev-sev-dot ${cssToken(severity)}"></span></span>
-            <span class="ev-time">${relTime}</span>
+            <span class="ev-time">${escapeHtml(relTime)}</span>
             <span class="ev-action">
                 <span class="rtrace-action-badge ${actionClass}">${escapeHtml(actionShort)}</span>
             </span>
             <span class="ev-rule"><span class="ev-rule-name">${escapeHtml(ruleName)}</span>${engine ? `<span class="ev-engine-tag">${escapeHtml(engine)}</span>` : ''}</span>
-            <span class="ev-pid">${pid}</span>
+            <span class="ev-pid">${escapeHtml(String(pid))}</span>
             <span class="ev-process">${escapeHtml(procName)}</span>
             <span class="ev-details">${escapeHtml(details)}</span>
             ${ev.pid ? `<span class="ev-graph-btn" title="Investigate PID ${escapeHtml(String(ev.pid))} in process graph" onclick="event.stopPropagation(); focusProcessGraph(${jsArg(ev.pid)}, {reset:true, at:${jsArg(ev.timestamp || '')}})">&#9673; Graph</span>` : '<span class="ev-graph-btn-empty"></span>'}
         </div>`;
     });
     container.innerHTML = html;
+}
+
+// --- Sorting the event grid ---
+// The grid is a CSS grid of <div> rows, not a <table> (its layout would not
+// survive the change): its heads sort the events before they are rendered,
+// with the order kept in tableSortState and compared like a table's cells
+// (sortKey, compareSortKeys).
+const RTRACE_EVENT_SORT_ID = 'rtrace-events';
+
+// The action word a row shows ("registry_set" -> "registry")
+function rtraceEventAction(ev) {
+    const action = ev.raw?.event?.action || ev.engine || 'event';
+    return action.replace('_', ' ').split(' ')[0];
+}
+
+// What an event sorts by in column col: Sev, Time, Action, Rule / Engine,
+// PID, Process, Details. The severity by rank, the time by when.
+function rtraceEventSortValue(ev, col) {
+    switch (col) {
+        case 0: return severitySortValue(alertSeverity(ev));
+        case 1: return sortTimeValue(ev.timestamp);
+        case 2: return rtraceEventAction(ev);
+        case 3: return ev.rule_name || '';
+        case 4: return ev.pid || '';
+        case 5: return ev.process_name || '';
+        default: return getEventDetails(ev);
+    }
+}
+
+// The items in the order of one value, as sortRows orders rows: stable in
+// either direction, empty values last in either direction
+function sortItemsBy(items, valueOf, dir) {
+    const sign = dir === 'desc' ? -1 : 1;
+    return items.map((item, index) => ({ item, index, key: sortKey(valueOf(item)) }))
+        .sort((a, b) => (a.key.empty || b.key.empty ? compareSortKeys(a.key, b.key) : sign * compareSortKeys(a.key, b.key))
+            || a.index - b.index)
+        .map(entry => entry.item);
+}
+
+// A click on the sorted column turns the order; another column starts ascending
+function sortRtraceEvents(col) {
+    const current = tableSortState[RTRACE_EVENT_SORT_ID];
+    tableSortState[RTRACE_EVENT_SORT_ID] = { col, dir: current && current.col === col && current.dir === 'asc' ? 'desc' : 'asc' };
+    updateRtraceEventSortHeads();
+    renderRtraceEventTable();
+}
+
+// aria-sort on the sorted head, which style.css shows as ▲ / ▼ (↕ on the others)
+function updateRtraceEventSortHeads() {
+    const sort = tableSortState[RTRACE_EVENT_SORT_ID];
+    document.querySelectorAll('.rtrace-event-table-header .rtrace-col').forEach((head, col) => {
+        if (sort && sort.col === col) head.setAttribute('aria-sort', sort.dir === 'desc' ? 'descending' : 'ascending');
+        else head.removeAttribute('aria-sort');
+    });
+}
+
+// The heads take a click, Enter and Space. They are static markup: set up once.
+function initRtraceEventSort() {
+    const header = document.querySelector('.rtrace-event-table-header');
+    if (!header) return;
+    const heads = [...header.querySelectorAll('.rtrace-col')];
+    header.setAttribute('role', 'row');
+    heads.forEach(head => {
+        head.setAttribute('role', 'columnheader');
+        head.setAttribute('tabindex', '0');
+    });
+    const columnOf = target => heads.indexOf(target && target.closest ? target.closest('.rtrace-col') : null);
+    header.addEventListener('click', e => {
+        const col = columnOf(e.target);
+        if (col >= 0) sortRtraceEvents(col);
+    });
+    header.addEventListener('keydown', e => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        const col = columnOf(e.target);
+        if (col < 0) return;
+        e.preventDefault();
+        sortRtraceEvents(col);
+    });
+    updateRtraceEventSortHeads();
 }
 
 // --- Verdict Summary View ---
@@ -1862,30 +2873,32 @@ function renderEmberExplanation(ex) {
     // All feature-group contributions
     if (ex.contributions && ex.contributions.length) {
         html += `<div class="ember-more-sub">All feature-group contributions (base ${ex.base_value != null ? ex.base_value : '?'})</div>`;
-        html += `<table class="ember-more-table"><tr><th>group</th><th>contribution</th></tr>`;
+        html += `<table class="ember-more-table" data-sortable data-sort-id="ember-contributions"><thead><tr><th>group</th><th>contribution</th></tr></thead><tbody>`;
         ex.contributions.forEach(c => {
             html += `<tr><td>${escapeHtml(c.group)}</td><td class="${c.value >= 0 ? 'why-mal-t' : 'why-ben-t'}">${c.value >= 0 ? '+' : ''}${c.value}</td></tr>`;
         });
-        html += `</table>`;
+        html += `</tbody></table>`;
     }
 
     // All sections (entropy-sorted)
     if (det.sections && det.sections.length) {
         html += `<div class="ember-more-sub">Sections (entry: ${escapeHtml(det.entry_section || '?')})</div>`;
-        html += `<table class="ember-more-table"><tr><th>name</th><th>entropy</th><th>size</th><th>vsize</th></tr>`;
+        html += `<table class="ember-more-table" data-sortable data-sort-id="ember-sections"><thead><tr><th>name</th><th>entropy</th><th>size</th><th>vsize</th></tr></thead><tbody>`;
         det.sections.forEach(s => {
             const hot = s.entropy >= 7 ? ' class="chip-warn"' : '';
-            html += `<tr><td>${escapeHtml(s.name)}</td><td${hot}>${s.entropy}</td><td>${formatSize(s.size)}</td><td>${formatSize(s.vsize)}</td></tr>`;
+            html += `<tr><td>${escapeHtml(s.name)}</td><td${hot}>${s.entropy}</td>`
+                + `<td data-sort-value="${sortNumberValue(s.size)}">${formatSize(s.size)}</td>`
+                + `<td data-sort-value="${sortNumberValue(s.vsize)}">${formatSize(s.vsize)}</td></tr>`;
         });
-        html += `</table>`;
+        html += `</tbody></table>`;
     }
 
     // Top DLLs
     if (det.top_dlls && det.top_dlls.length) {
         html += `<div class="ember-more-sub">Top imported DLLs</div>`;
-        html += `<table class="ember-more-table"><tr><th>dll</th><th>imports</th></tr>`;
+        html += `<table class="ember-more-table" data-sortable data-sort-id="ember-dlls"><thead><tr><th>dll</th><th>imports</th></tr></thead><tbody>`;
         det.top_dlls.forEach(d => html += `<tr><td>${escapeHtml(d.dll)}</td><td>${d.count}</td></tr>`);
-        html += `</table>`;
+        html += `</tbody></table>`;
     }
 
     // All notable APIs
@@ -2512,20 +3525,27 @@ function renderSignature(data) {
  */
 function renderDetectionOverview(detection, prefix) {
     let html = `<div class="die-overview ${prefix}-die-overview">`;
+    // The file structure (CHART) or its sections as a table (TABLE); the
+    // entropy map shows in both views. Without sections there is nothing to switch.
+    const view = `${prefix}-die`;
+    const hasSections = (detection.section_layout || []).length > 0;
 
     // --- Assessment Badge ---
     const assessmentColors = {
-        clean: {bg: 'rgba(34,197,94,0.08)', border: '#22c55e', text: '#22c55e', label: 'CLEAN'},
-        packed: {bg: 'rgba(168,85,247,0.08)', border: '#a855f7', text: '#a855f7', label: 'PACKED'},
-        encrypted: {bg: 'rgba(239,68,68,0.08)', border: '#ef4444', text: '#ef4444', label: 'ENCRYPTED'},
-        protected: {bg: 'rgba(251,191,36,0.08)', border: '#f59e0b', text: '#f59e0b', label: 'PROTECTED'},
-        suspicious: {bg: 'rgba(251,191,36,0.06)', border: '#fbbf24', text: '#fbbf24', label: 'SUSPICIOUS'},
+        clean: {bg: 'rgba(var(--assess-clean-rgb), 0.08)', border: 'var(--assess-clean)', text: 'var(--assess-clean)', label: 'CLEAN'},
+        packed: {bg: 'rgba(var(--assess-packed-rgb), 0.08)', border: 'var(--assess-packed)', text: 'var(--assess-packed)', label: 'PACKED'},
+        encrypted: {bg: 'rgba(var(--assess-encrypted-rgb), 0.08)', border: 'var(--assess-encrypted)', text: 'var(--assess-encrypted)', label: 'ENCRYPTED'},
+        protected: {bg: 'rgba(var(--assess-protected-tint-rgb), 0.08)', border: 'var(--assess-protected)', text: 'var(--assess-protected)', label: 'PROTECTED'},
+        suspicious: {bg: 'rgba(var(--assess-suspicious-rgb), 0.06)', border: 'var(--assess-suspicious)', text: 'var(--assess-suspicious)', label: 'SUSPICIOUS'},
     };
     const assess = assessmentColors[detection.assessment] || assessmentColors.clean;
 
     html += `<div class="die-header">`;
-    html += `<div class="die-title">BINARY ANALYSIS</div>`;
+    html += `<div class="die-title" data-info="Compiler, linker, packer and protector signatures in the style of Detect It Easy, with an overall assessment. The entropy map and the file structure show where packed or encrypted data lies.">BINARY ANALYSIS</div>`;
+    html += `<div class="die-header-tools">`;
     html += `<div class="die-assessment" style="background:${assess.bg};border-color:${assess.border};color:${assess.text}">${assess.label}</div>`;
+    if (hasSections) html += viewToggleHtml(view);
+    html += `</div>`;
     html += `</div>`;
 
     // --- Detection Results (cards like DiE) ---
@@ -2548,14 +3568,15 @@ function renderDetectionOverview(detection, prefix) {
             protector: 'Protector', overlay: 'Overlay', language: 'Language', runtime: 'Runtime'
         };
         const typeColors = {
-            compiler: '#60a5fa', linker: '#818cf8', packer: '#a855f7',
-            protector: '#f59e0b', overlay: '#6b7280', language: '#22d3ee', runtime: '#34d399'
+            compiler: 'var(--pe-compiler)', linker: 'var(--pe-linker)', packer: 'var(--pe-packer)',
+            protector: 'var(--pe-protector)', overlay: 'var(--pe-overlay)', language: 'var(--pe-language)',
+            runtime: 'var(--pe-runtime)'
         };
 
         for (const [type, items] of Object.entries(groups)) {
             const icon = typeIcons[type] || '\u2022';
             const label = typeLabels[type] || type;
-            const color = typeColors[type] || '#94a3b8';
+            const color = typeColors[type] || 'var(--text-secondary)';
 
             items.forEach(item => {
                 const conf = item.confidence === 'high' ? 'H' : item.confidence === 'medium' ? 'M' : 'L';
@@ -2604,19 +3625,13 @@ function renderDetectionOverview(detection, prefix) {
 
     // --- Section Layout Diagram ---
     if (detection.section_layout && detection.section_layout.length > 0) {
-        html += `<div class="die-layout-section">`;
+        html += `<div class="die-layout-section"${cardViewAttrs(view, 'chart')}>`;
         html += `<div class="die-section-title">FILE STRUCTURE</div>`;
         html += `<div class="die-layout-bar">`;
 
         detection.section_layout.forEach(sec => {
             if (sec.pct_size < 0.3) return; // Skip tiny sections
-            let secColor;
-            if (sec.packer) secColor = '#a855f7'; // purple for packer sections
-            else if (sec.entropy_status === 'high') secColor = '#ef4444'; // red for high entropy
-            else if (sec.entropy_status === 'warn') secColor = '#fbbf24'; // yellow for warning
-            else if (sec.executable) secColor = '#3b82f6'; // blue for code
-            else if (sec.writable) secColor = '#22c55e'; // green for data
-            else secColor = '#64748b'; // gray for read-only
+            const secColor = dieSectionKind(sec).color;
 
             const tooltip = `${sec.name}: ${formatSize(sec.size)} | Entropy: ${sec.entropy.toFixed(2)}${sec.packer ? ' | ' + sec.packer : ''}`;
             html += `<div class="die-layout-seg" style="left:${sec.pct_start}%;width:${Math.max(sec.pct_size, 0.5)}%;background:${secColor}" title="${escapeHtml(tooltip)}">`;
@@ -2628,7 +3643,7 @@ function renderDetectionOverview(detection, prefix) {
         if (detection.overlay && detection.overlay.size > 0 && detection.file_size > 0) {
             const overlayPct = (detection.overlay.size / detection.file_size * 100).toFixed(2);
             const overlayStart = (detection.overlay.offset / detection.file_size * 100).toFixed(2);
-            html += `<div class="die-layout-seg die-overlay-seg" style="left:${overlayStart}%;width:${overlayPct}%;background:#6b7280" title="Overlay: ${formatSize(detection.overlay.size)}">`;
+            html += `<div class="die-layout-seg die-overlay-seg" style="left:${overlayStart}%;width:${overlayPct}%;background:var(--pe-overlay)" title="Overlay: ${formatSize(detection.overlay.size)}">`;
             if (parseFloat(overlayPct) > 5) html += `<span class="die-layout-label">overlay</span>`;
             html += `</div>`;
         }
@@ -2637,15 +3652,20 @@ function renderDetectionOverview(detection, prefix) {
 
         // Legend
         html += `<div class="die-layout-legend">`;
-        html += `<span class="die-legend-item"><span class="die-legend-dot" style="background:#3b82f6"></span>Code</span>`;
-        html += `<span class="die-legend-item"><span class="die-legend-dot" style="background:#22c55e"></span>Data</span>`;
-        html += `<span class="die-legend-item"><span class="die-legend-dot" style="background:#64748b"></span>Read-only</span>`;
-        html += `<span class="die-legend-item"><span class="die-legend-dot" style="background:#ef4444"></span>High Entropy</span>`;
-        html += `<span class="die-legend-item"><span class="die-legend-dot" style="background:#a855f7"></span>Packer</span>`;
-        if (detection.overlay) html += `<span class="die-legend-item"><span class="die-legend-dot" style="background:#6b7280"></span>Overlay</span>`;
+        html += `<span class="die-legend-item"><span class="die-legend-dot" style="background:var(--pe-code)"></span>Code</span>`;
+        html += `<span class="die-legend-item"><span class="die-legend-dot" style="background:var(--pe-data)"></span>Data</span>`;
+        html += `<span class="die-legend-item"><span class="die-legend-dot" style="background:var(--pe-readonly)"></span>Read-only</span>`;
+        html += `<span class="die-legend-item"><span class="die-legend-dot" style="background:var(--pe-entropy-high)"></span>High Entropy</span>`;
+        html += `<span class="die-legend-item"><span class="die-legend-dot" style="background:var(--pe-packer)"></span>Packer</span>`;
+        if (detection.overlay) html += `<span class="die-legend-item"><span class="die-legend-dot" style="background:var(--pe-overlay)"></span>Overlay</span>`;
         html += `</div>`;
 
         html += `</div>`;
+    }
+
+    // --- The same sections as a table (TABLE) ---
+    if (hasSections) {
+        html += `<div class="die-table-section view-table-wrap"${cardViewAttrs(view, 'table')}>${dieSectionsTableHtml(detection)}</div>`;
     }
 
     // --- Rich Header (PE only, collapsible) ---
@@ -2663,6 +3683,39 @@ function renderDetectionOverview(detection, prefix) {
     return html;
 }
 
+// What the file structure colours a section by, first match: a packer, high
+// or suspicious entropy, code, data, read-only
+function dieSectionKind(sec) {
+    if (sec.packer) return { label: `Packer (${sec.packer})`, color: 'var(--pe-packer)' };
+    if (sec.entropy_status === 'high') return { label: 'High Entropy', color: 'var(--pe-entropy-high)' };
+    if (sec.entropy_status === 'warn') return { label: 'Suspicious Entropy', color: 'var(--pe-entropy-warn)' };
+    if (sec.executable) return { label: 'Code', color: 'var(--pe-code)' };
+    if (sec.writable) return { label: 'Data', color: 'var(--pe-data)' };
+    return { label: 'Read-only', color: 'var(--pe-readonly)' };
+}
+
+// The table view of the file structure: its sections (also those too small to
+// draw) and the overlay, in file order, with their offsets
+function dieSectionsTableHtml(detection) {
+    const parts = (detection.section_layout || []).map(sec => ({ ...sec, kind: dieSectionKind(sec) }));
+    if (detection.overlay && detection.overlay.size > 0) {
+        parts.push({ name: 'overlay', offset: detection.overlay.offset, size: detection.overlay.size, entropy: null,
+                     kind: { label: 'Overlay', color: 'var(--pe-overlay)' } });
+    }
+    // The section headers need not be in file order; equal offsets keep theirs
+    parts.sort((a, b) => (Number(a.offset) || 0) - (Number(b.offset) || 0));
+    const rows = parts.map(sec => {
+        const entropy = sec.entropy === null || sec.entropy === undefined ? NaN : Number(sec.entropy);
+        return `<tr><td class="mono" title="${escapeHtml(sec.name)}"><span class="view-table-clip">${escapeHtml(sec.name)}</span></td>`
+            + `<td class="mono" data-sort-value="${sortNumberValue(sec.offset)}">${FileMapView.hexOff(Number(sec.offset) || 0)}</td>`
+            + `<td data-sort-value="${sortNumberValue(sec.size)}">${formatSize(sec.size)}</td>`
+            + `<td data-sort-value="${Number.isFinite(entropy) ? sortNumberValue(entropy) : ''}">${Number.isFinite(entropy) ? entropy.toFixed(2) : '&mdash;'}</td>`
+            + `<td><span class="view-table-dot" style="background:${sec.kind.color}"></span>${escapeHtml(sec.kind.label)}</td></tr>`;
+    });
+    return '<table class="view-table" data-sortable data-sort-id="die-sections"><thead><tr><th>Section</th><th>Offset</th>'
+        + `<th>Size</th><th>Entropy</th><th>Assessment</th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
+}
+
 function renderPeAnalysis(pe, container) {
     let html = '';
 
@@ -2671,8 +3724,9 @@ function renderPeAnalysis(pe, container) {
         html += renderDetectionOverview(pe.detection, 'pe');
     }
 
-    // --- File map (planes are painted asynchronously below) ---
-    html += fileMapInlineBlock(pe.path, 'pe');
+    // --- File map (planes are painted asynchronously below): the strip (CHART)
+    // or its regions as a table (TABLE) ---
+    html += fileMapInlineBlock(pe.path, 'pe', 'pe-filemap', viewToggleHtml('pe-filemap'));
 
     // --- IOC Flags Banner ---
     if (pe.flags && pe.flags.length > 0) {
@@ -2733,7 +3787,7 @@ function renderPeAnalysis(pe, container) {
 
     // Security features card
     html += `<div class="pe-card">
-        <div class="pe-card-title">SECURITY FEATURES</div>
+        <div class="pe-card-title" data-info="Exploit mitigations from the optional header (ASLR, DEP, SEH and CFG) and the entropy of the whole file.">SECURITY FEATURES</div>
         <div class="pe-field"><span class="pe-label">ASLR</span><span class="pe-value ${oh.aslr ? 'pe-ok' : 'pe-bad'}">${oh.aslr ? 'Enabled' : 'Disabled'}</span></div>
         <div class="pe-field"><span class="pe-label">DEP/NX</span><span class="pe-value ${oh.dep_nx ? 'pe-ok' : 'pe-bad'}">${oh.dep_nx ? 'Enabled' : 'Disabled'}</span></div>
         <div class="pe-field"><span class="pe-label">SEH</span><span class="pe-value ${oh.no_seh ? 'pe-bad' : 'pe-ok'}">${oh.no_seh ? 'No SEH' : 'Enabled'}</span></div>
@@ -2753,22 +3807,23 @@ function renderPeAnalysis(pe, container) {
 
     // --- Sections Table with entropy bars ---
     html += '<div class="pe-section-table">';
-    html += '<div class="pe-card-title">SECTIONS</div>';
-    html += '<table class="pe-table"><thead><tr><th>Name</th><th>V.Addr</th><th>V.Size</th><th>Raw Size</th><th>Flags</th><th>Entropy</th><th>Status</th><th></th></tr></thead><tbody>';
+    html += '<div class="pe-card-title" data-info="Section headers with addresses, sizes, permissions and entropy. Entropy close to 8 means compressed or encrypted data, and Inspect shows the bytes and strings of a section.">SECTIONS</div>';
+    html += '<table class="pe-table" data-sortable data-sort-id="pe-sections"><thead><tr><th>Name</th><th>V.Addr</th><th>V.Size</th><th>Raw Size</th><th>Flags</th><th>Entropy</th><th>Status</th><th></th></tr></thead><tbody>';
     pe.sections.forEach((sec, idx) => {
         const rowClass = sec.entropy_status === 'high' ? 'pe-row-high' : sec.entropy_status === 'warn' ? 'pe-row-warn' : '';
         const rwx = sec.rwx_warning ? ' <span class="pe-rwx-badge">RWX</span>' : '';
         const packer = sec.packer_indicator ? ` <span class="pe-packer-badge">${escapeHtml(sec.packer_indicator)}</span>` : '';
         const flags = (sec.readable ? 'R' : '-') + (sec.writable ? 'W' : '-') + (sec.executable ? 'X' : '-');
         const entropyPct = Math.min(100, (sec.entropy / 8) * 100);
-        const barColor = sec.entropy_status === 'high' ? '#ef4444' : sec.entropy_status === 'warn' ? '#fbbf24' : '#22c55e';
+        const barColor = sec.entropy_status === 'high' ? 'var(--pe-entropy-high)' : sec.entropy_status === 'warn' ? 'var(--pe-entropy-warn)' : 'var(--pe-entropy-normal)';
 
         const secOffsetDec = sec.raw_offset_dec != null ? sec.raw_offset_dec : parseInt(sec.raw_offset, 16);
+        // The detail row (Inspect) moves with its section when the table is sorted
         html += `<tr class="${rowClass}" id="pe-sec-row-${idx}">
-            <td class="mono"><a class="section-link" href="#" onclick="peJumpToSection(${secOffsetDec}); return false;" title="View in Hex Editor">${escapeHtml(sec.name)}</a>${packer}${rwx}</td>
+            <td class="mono" data-sort-value="${escapeHtml(sec.name)}"><a class="section-link" href="#" onclick="peJumpToSection(${secOffsetDec}); return false;" title="View in Hex Editor">${escapeHtml(sec.name)}</a>${packer}${rwx}</td>
             <td class="mono">${sec.virtual_address}</td>
-            <td>${formatSize(sec.virtual_size)}</td>
-            <td>${formatSize(sec.raw_size)}</td>
+            <td data-sort-value="${sortNumberValue(sec.virtual_size)}">${formatSize(sec.virtual_size)}</td>
+            <td data-sort-value="${sortNumberValue(sec.raw_size)}">${formatSize(sec.raw_size)}</td>
             <td class="mono">${flags}</td>
             <td>
                 <div class="pe-entropy-cell">
@@ -2779,7 +3834,7 @@ function renderPeAnalysis(pe, container) {
             <td><span class="pe-status-tag ${sec.entropy_status}">${sec.entropy_status === 'high' ? 'ENCRYPTED/PACKED' : sec.entropy_status === 'warn' ? 'SUSPICIOUS' : 'Normal'}</span></td>
             <td><button class="btn btn-sm pe-inspect-btn" onclick="peInspectSection(${idx})">Inspect</button></td>
         </tr>
-        <tr class="pe-sec-detail-row" id="pe-sec-detail-${idx}" style="display:none;">
+        <tr class="pe-sec-detail-row" id="pe-sec-detail-${idx}" style="display:none;" data-sort-detail>
             <td colspan="8"><div class="pe-sec-detail-container" id="pe-sec-detail-body-${idx}"></div></td>
         </tr>`;
     });
@@ -3104,7 +4159,7 @@ function renderElfAnalysis(elf, container) {
     // Security Features card
     const sec = elf.security;
     html += `<div class="elf-card">
-        <div class="elf-card-title">SECURITY FEATURES</div>
+        <div class="elf-card-title" data-info="Hardening of the binary: PIE for ASLR, a non-executable stack, RELRO, a stack canary and Fortify, and whether its symbols are stripped.">SECURITY FEATURES</div>
         <div class="elf-field"><span class="elf-label">PIE (ASLR)</span><span class="elf-value ${sec.pie ? 'elf-ok' : 'elf-bad'}">${sec.pie ? 'Yes' : 'No'}</span></div>
         <div class="elf-field"><span class="elf-label">NX (Stack)</span><span class="elf-value ${sec.nx ? 'elf-ok' : 'elf-bad'}">${sec.nx ? 'Enabled' : 'Disabled'}</span></div>
         <div class="elf-field"><span class="elf-label">RELRO</span><span class="elf-value ${sec.relro === 'Full' ? 'elf-ok' : sec.relro === 'Partial' ? 'elf-warn' : 'elf-bad'}">${sec.relro}</span></div>
@@ -3140,8 +4195,8 @@ function renderElfAnalysis(elf, container) {
     // --- Sections Table ---
     if (elf.sections && elf.sections.length > 0) {
         html += '<div class="elf-section-block">';
-        html += '<div class="elf-card-title">SECTIONS</div>';
-        html += '<table class="elf-table"><thead><tr><th>#</th><th>Name</th><th>Type</th><th>Address</th><th>Offset</th><th>Size</th><th>Flags</th><th>Entropy</th><th>Status</th></tr></thead><tbody>';
+        html += '<div class="elf-card-title" data-info="Section headers with type, address, offset, size, flags and entropy. Entropy close to 8 means compressed or encrypted data.">SECTIONS</div>';
+        html += '<table class="elf-table" data-sortable data-sort-id="elf-sections"><thead><tr><th>#</th><th>Name</th><th>Type</th><th>Address</th><th>Offset</th><th>Size</th><th>Flags</th><th>Entropy</th><th>Status</th></tr></thead><tbody>';
         elf.sections.forEach(s => {
             const rowClass = s.entropy_status === 'high' ? 'elf-row-high' : s.entropy_status === 'warn' ? 'elf-row-warn' : '';
             const wxBadge = s.wx_warning ? ' <span class="elf-wx-badge">W+X</span>' : '';
@@ -3152,11 +4207,11 @@ function renderElfAnalysis(elf, container) {
                 : (escapeHtml(s.name) || '<em>null</em>');
             html += `<tr class="${rowClass}">
                 <td>${s.index}</td>
-                <td class="mono">${nameHtml}${wxBadge}${packerBadge}</td>
+                <td class="mono" data-sort-value="${escapeHtml(s.name || '')}">${nameHtml}${wxBadge}${packerBadge}</td>
                 <td>${escapeHtml(s.type)}</td>
                 <td class="mono">${s.address}</td>
                 <td class="mono">${s.offset}</td>
-                <td>${formatSize(s.size)}</td>
+                <td data-sort-value="${sortNumberValue(s.size)}">${formatSize(s.size)}</td>
                 <td class="mono">${s.flags_str}</td>
                 <td><div class="elf-entropy-bar"><div class="elf-entropy-fill ${s.entropy_status}" style="width:${(s.entropy / 8 * 100).toFixed(1)}%"></div><span class="elf-entropy-val">${s.entropy.toFixed(2)}</span></div></td>
                 <td><span class="elf-status-badge ${s.entropy_status}">${s.entropy_status}</span></td>
@@ -3168,8 +4223,8 @@ function renderElfAnalysis(elf, container) {
     // --- Segments Table ---
     if (elf.segments && elf.segments.length > 0) {
         html += '<div class="elf-section-block">';
-        html += '<div class="elf-card-title">PROGRAM HEADERS (SEGMENTS)</div>';
-        html += '<table class="elf-table"><thead><tr><th>#</th><th>Type</th><th>Offset</th><th>VAddr</th><th>FileSz</th><th>MemSz</th><th>Flags</th><th>Note</th></tr></thead><tbody>';
+        html += '<div class="elf-card-title" data-info="The segments the loader maps into memory, with offsets, addresses, sizes and permissions; the note marks segments that matter for security.">PROGRAM HEADERS (SEGMENTS)</div>';
+        html += '<table class="elf-table" data-sortable data-sort-id="elf-segments"><thead><tr><th>#</th><th>Type</th><th>Offset</th><th>VAddr</th><th>FileSz</th><th>MemSz</th><th>Flags</th><th>Note</th></tr></thead><tbody>';
         elf.segments.forEach(seg => {
             const noteHtml = seg.security_note ? `<span class="elf-seg-note">${escapeHtml(seg.security_note)}</span>` :
                              seg.interpreter ? `<span class="elf-seg-note mono">${escapeHtml(seg.interpreter)}</span>` : '';
@@ -3178,8 +4233,8 @@ function renderElfAnalysis(elf, container) {
                 <td class="mono">${escapeHtml(seg.type)}</td>
                 <td class="mono">${seg.offset}</td>
                 <td class="mono">${seg.vaddr}</td>
-                <td>${formatSize(seg.filesz)}</td>
-                <td>${formatSize(seg.memsz)}</td>
+                <td data-sort-value="${sortNumberValue(seg.filesz)}">${formatSize(seg.filesz)}</td>
+                <td data-sort-value="${sortNumberValue(seg.memsz)}">${formatSize(seg.memsz)}</td>
                 <td class="mono">${seg.flags_str}</td>
                 <td>${noteHtml}</td>
             </tr>`;
@@ -3207,12 +4262,12 @@ function renderElfAnalysis(elf, container) {
         html += '<div class="elf-section-block">';
         html += `<div class="elf-card-title elf-collapsible" onclick="elfToggleSection(this)">IMPORTED SYMBOLS (${elf.import_count}) &#x25B6;</div>`;
         html += '<div class="elf-collapse-body" style="display:none;">';
-        html += '<table class="elf-table elf-sym-table"><thead><tr><th>Name</th><th>Bind</th><th>Type</th></tr></thead><tbody>';
+        html += '<table class="elf-table elf-sym-table" data-sortable data-sort-id="elf-imports"><thead><tr><th>Name</th><th>Bind</th><th>Type</th></tr></thead><tbody>';
         elf.imported_symbols.forEach(sym => {
             html += `<tr><td class="mono">${escapeHtml(sym.name)}</td><td>${escapeHtml(sym.bind)}</td><td>${escapeHtml(sym.type)}</td></tr>`;
         });
         if (elf.import_count > elf.imported_symbols.length) {
-            html += `<tr><td colspan="3" class="muted">... and ${elf.import_count - elf.imported_symbols.length} more</td></tr>`;
+            html += `<tr data-sort-skip><td colspan="3" class="muted">... and ${elf.import_count - elf.imported_symbols.length} more</td></tr>`;
         }
         html += '</tbody></table></div></div>';
     }
@@ -3222,12 +4277,12 @@ function renderElfAnalysis(elf, container) {
         html += '<div class="elf-section-block">';
         html += `<div class="elf-card-title elf-collapsible" onclick="elfToggleSection(this)">EXPORTED SYMBOLS (${elf.export_count}) &#x25B6;</div>`;
         html += '<div class="elf-collapse-body" style="display:none;">';
-        html += '<table class="elf-table elf-sym-table"><thead><tr><th>Name</th><th>Bind</th><th>Type</th><th>Value</th><th>Size</th></tr></thead><tbody>';
+        html += '<table class="elf-table elf-sym-table" data-sortable data-sort-id="elf-exports"><thead><tr><th>Name</th><th>Bind</th><th>Type</th><th>Value</th><th>Size</th></tr></thead><tbody>';
         elf.exported_symbols.forEach(sym => {
             html += `<tr><td class="mono">${escapeHtml(sym.name)}</td><td>${escapeHtml(sym.bind)}</td><td>${escapeHtml(sym.type)}</td><td class="mono">${escapeHtml(sym.value)}</td><td>${escapeHtml(sym.size)}</td></tr>`;
         });
         if (elf.export_count > elf.exported_symbols.length) {
-            html += `<tr><td colspan="5" class="muted">... and ${elf.export_count - elf.exported_symbols.length} more</td></tr>`;
+            html += `<tr data-sort-skip><td colspan="5" class="muted">... and ${elf.export_count - elf.exported_symbols.length} more</td></tr>`;
         }
         html += '</tbody></table></div></div>';
     }
@@ -3260,7 +4315,7 @@ function elfJumpToSection(rawOffset) {
 // --- Detail Panels for Dashboard Services ---
 async function openAgentDetail() {
     pushDetailHistory('agent', 0);
-    setDetailHeader('Service', 'background:rgba(249,115,22,0.15);color:var(--accent-orange)', 'DetonatorAgent', '');
+    setDetailHeader('Service', 'background:rgba(var(--accent-orange-rgb), 0.15);color:var(--accent-orange)', 'DetonatorAgent', '');
     setDetailBody('<div class="muted">Loading...</div>');
     showDetail();
 
@@ -3305,7 +4360,7 @@ async function openAgentDetail() {
 
 async function openLitterboxDetail() {
     pushDetailHistory('litterbox', 0);
-    setDetailHeader('Service', 'background:rgba(167,139,250,0.15);color:var(--accent-purple)', 'LitterBox', '');
+    setDetailHeader('Service', 'background:rgba(var(--accent-purple-rgb), 0.15);color:var(--accent-purple)', 'LitterBox', '');
     setDetailBody('<div class="muted">Loading...</div>');
     showDetail();
 
@@ -3363,7 +4418,7 @@ async function openLitterboxDetail() {
 
 async function viewLitterboxResult(hash) {
     pushDetailHistory('litterbox-result', hash);
-    setDetailHeader('Analysis', 'background:rgba(167,139,250,0.15);color:var(--accent-purple)', 'LitterBox Result', hash.substring(0, 12) + '...');
+    setDetailHeader('Analysis', 'background:rgba(var(--accent-purple-rgb), 0.15);color:var(--accent-purple)', 'LitterBox Result', hash.substring(0, 12) + '...');
     setDetailBody('<div class="muted">Fetching analysis results...</div>');
     showDetail();
 
@@ -3398,7 +4453,7 @@ async function viewLitterboxResult(hash) {
         if (fileInfo.md5) html += `<div class="detail-field"><span class="field-label">MD5</span><span class="field-value mono" style="font-size:10px">${escapeHtml(fileInfo.md5)}</span></div>`;
         if (fileInfo.size !== undefined) html += `<div class="detail-field"><span class="field-label">Size</span><span class="field-value">${formatSize(fileInfo.size)}</span></div>`;
         if (fileInfo.file_type || fileInfo.type) html += `<div class="detail-field"><span class="field-label">Type</span><span class="field-value">${escapeHtml(fileInfo.file_type || fileInfo.type)}</span></div>`;
-        if (fileInfo.score !== undefined) html += `<div class="detail-field"><span class="field-label">Score</span><span class="field-value" style="color:${fileInfo.score >= 7 ? 'var(--accent-red)' : fileInfo.score >= 4 ? '#fbbf24' : 'var(--accent-green)'};font-weight:700">${fileInfo.score}/10</span></div>`;
+        if (fileInfo.score !== undefined) html += `<div class="detail-field"><span class="field-label">Score</span><span class="field-value" style="color:${fileInfo.score >= 7 ? 'var(--accent-red)' : fileInfo.score >= 4 ? 'var(--c-amber-400)' : 'var(--accent-green)'};font-weight:700">${fileInfo.score}/10</span></div>`;
         html += `</div>`;
     } else {
         html += `<div class="detail-fields"><div class="detail-field"><span class="field-label">Hash</span><span class="field-value mono" style="font-size:10px;word-break:break-all">${escapeHtml(hash)}</span></div></div>`;
@@ -3427,7 +4482,7 @@ async function viewLitterboxResult(hash) {
     html += '</div>';
 
     // Link to LitterBox UI
-    html += `<div style="margin-top:12px;"><a href="http://localhost:1337" target="_blank" class="btn btn-sm" style="color:var(--accent-purple);border-color:rgba(167,139,250,0.3);">Open in LitterBox UI</a></div>`;
+    html += `<div style="margin-top:12px;"><a href="http://localhost:1337" target="_blank" class="btn btn-sm" style="color:var(--accent-purple);border-color:rgba(var(--accent-purple-rgb), 0.3);">Open in LitterBox UI</a></div>`;
 
     setDetailBody(html);
 }
@@ -3435,7 +4490,7 @@ async function viewLitterboxResult(hash) {
 async function viewDetonationResult(lbHash, sha256, pid, filename) {
     const displayHash = sha256 || lbHash || 'unknown';
     pushDetailHistory('detonation-result', displayHash);
-    setDetailHeader('Analysis', 'background:rgba(167,139,250,0.15);color:var(--accent-purple)', 'Detonation Results', (filename || displayHash.substring(0, 12) + '...'));
+    setDetailHeader('Analysis', 'background:rgba(var(--accent-purple-rgb), 0.15);color:var(--accent-purple)', 'Detonation Results', (filename || displayHash.substring(0, 12) + '...'));
     setDetailBody('<div class="muted">Fetching analysis results...</div>');
     showDetail();
 
@@ -3492,7 +4547,7 @@ async function viewDetonationResult(lbHash, sha256, pid, filename) {
         if (fileInfo.size !== undefined) html += `<div class="detail-field"><span class="field-label">Size</span><span class="field-value">${formatSize(fileInfo.size)}</span></div>`;
         if (fileInfo.file_type || fileInfo.type) html += `<div class="detail-field"><span class="field-label">Type</span><span class="field-value">${escapeHtml(fileInfo.file_type || fileInfo.type)}</span></div>`;
         if (pid) html += `<div class="detail-field"><span class="field-label">PID</span><span class="field-value">${escapeHtml(pid)}</span></div>`;
-        if (fileInfo.score !== undefined) html += `<div class="detail-field"><span class="field-label">Score</span><span class="field-value" style="color:${fileInfo.score >= 7 ? 'var(--accent-red)' : fileInfo.score >= 4 ? '#fbbf24' : 'var(--accent-green)'};font-weight:700">${fileInfo.score}/10</span></div>`;
+        if (fileInfo.score !== undefined) html += `<div class="detail-field"><span class="field-label">Score</span><span class="field-value" style="color:${fileInfo.score >= 7 ? 'var(--accent-red)' : fileInfo.score >= 4 ? 'var(--c-amber-400)' : 'var(--accent-green)'};font-weight:700">${fileInfo.score}/10</span></div>`;
     } else {
         if (filename) html += `<div class="detail-field"><span class="field-label">Filename</span><span class="field-value">${escapeHtml(filename)}</span></div>`;
         if (sha256) html += `<div class="detail-field"><span class="field-label">SHA-256</span><span class="field-value mono" style="font-size:10px;word-break:break-all">${escapeHtml(sha256)}</span></div>`;
@@ -3520,7 +4575,7 @@ async function viewDetonationResult(lbHash, sha256, pid, filename) {
     // (history, after a reload) still explains its memory verdict.
     if (detData && (detData.memory_evidence || detData.exit_capture_result
             || (detData.network_beaconing && detData.network_beaconing.available))) {
-        html += '<div class="detail-section"><div class="detail-section-title">LIVE MEMORY</div><div style="padding:4px 8px;">';
+        html += '<div class="detail-section"><div class="detail-section-title" data-info="The memory evidence of the detonation, scored by one model, with the dump written when the sample exited and the rhythm of its network connections. A score of 2.0 or more is SUSPICIOUS, 6.0 or more MALICIOUS.">LIVE MEMORY</div><div style="padding:4px 8px;">';
         if (detData.memory_evidence) html += renderMemoryEvidence(detData.memory_evidence, detData.aether);
         if (detData.exit_capture_result) html += renderExitCaptureBlock(detData.exit_capture_result);
         if (detData.network_beaconing && detData.network_beaconing.available) {
@@ -3531,7 +4586,7 @@ async function viewDetonationResult(lbHash, sha256, pid, filename) {
 
     // --- Named pipes (Sysmon 17/18) of the sample subtree ---
     if (detData && detData.named_pipes) {
-        html += '<div class="detail-section"><div class="detail-section-title">NAMED PIPES</div><div style="padding:4px 8px;">';
+        html += '<div class="detail-section"><div class="detail-section-title" data-info="Pipes that the process tree of the sample created or connected to, from Sysmon EID 17 and 18. C2 catalog names, cross-process use, sensitive system pipes and random names are flagged and scored with the memory evidence.">NAMED PIPES</div><div style="padding:4px 8px;">';
         html += renderNamedPipesBlock(detData.named_pipes);
         html += '</div></div>';
     }
@@ -3606,7 +4661,7 @@ async function viewDetonationResult(lbHash, sha256, pid, filename) {
 
     // Link to LitterBox UI
     if (lbHash) {
-        html += `<div style="margin-top:12px;"><a href="http://localhost:1337" target="_blank" class="btn btn-sm" style="color:var(--accent-purple);border-color:rgba(167,139,250,0.3);">Open in LitterBox UI</a></div>`;
+        html += `<div style="margin-top:12px;"><a href="http://localhost:1337" target="_blank" class="btn btn-sm" style="color:var(--accent-purple);border-color:rgba(var(--accent-purple-rgb), 0.3);">Open in LitterBox UI</a></div>`;
     }
 
     setDetailBody(html);
@@ -3760,7 +4815,7 @@ function renderLbDynamicResults(data) {
 
 async function openRustinelDetail() {
     pushDetailHistory('rustinel', 0);
-    setDetailHeader('Engine', 'background:rgba(34,211,238,0.15);color:var(--accent-cyan)', 'Rustinel', 'loading...');
+    setDetailHeader('Engine', 'background:rgba(var(--accent-cyan-rgb), 0.15);color:var(--accent-cyan)', 'Rustinel', 'loading...');
     setDetailBody('<div class="muted">Fetching Rustinel status...</div>');
     showDetail();
 
@@ -3777,7 +4832,7 @@ async function openRustinelDetail() {
 function renderRustinelDetail(info) {
     const online = info.online;
     const statusColor = online ? 'var(--accent-green)' : 'var(--accent-red)';
-    setDetailHeader('Engine', 'background:rgba(34,211,238,0.15);color:var(--accent-cyan)', 'Rustinel', '');
+    setDetailHeader('Engine', 'background:rgba(var(--accent-cyan-rgb), 0.15);color:var(--accent-cyan)', 'Rustinel', '');
 
     let html = `<div class="detail-fields">
         <div class="detail-field"><span class="field-label">Version</span><span class="field-value">${escapeHtml(info.version || 'unknown')}</span></div>
@@ -3822,11 +4877,17 @@ function openAlertDetail(idx) {
     // History keeps the id: positions shift with every alert refresh.
     pushDetailHistory('alert', alert.id != null ? `id:${alert.id}` : idx);
     const severity = (alert.severity || 'unknown').toLowerCase();
-    const severityColors = { critical: '#ef4444', high: '#f97316', medium: '#eab308', low: '#22c55e' };
+    const tint = 0x20 / 255;
+    const badgeStyles = {
+        critical: `background:rgba(var(--severity-critical-rgb), ${tint});color:var(--severity-critical)`,
+        high: `background:rgba(var(--severity-high-rgb), ${tint});color:var(--severity-high)`,
+        medium: `background:rgba(var(--severity-medium-rgb), ${tint});color:var(--severity-medium)`,
+        low: `background:rgba(var(--severity-low-rgb), ${tint});color:var(--severity-low)`,
+    };
 
     setDetailHeader(
         severity.charAt(0).toUpperCase() + severity.slice(1),
-        `background:${severityColors[severity] || '#64748b'}20;color:${severityColors[severity] || '#94a3b8'}`,
+        badgeStyles[severity] || `background:rgba(var(--text-muted-rgb), ${tint});color:var(--text-secondary)`,
         alert.rule_name || 'Unknown Rule',
         formatRelativeTime(alert.timestamp)
     );
@@ -4011,10 +5072,12 @@ function openProcessDetail(pid) {
     state.selectedProcess = pid;
     renderProcessList();
     pushDetailHistory('process', pid);
+    // Cyberpunk: picking a process in the drawer closes it, so the detail view is in sight.
+    if (currentTheme() === 'cyberpunk') closeDrawer();
 
     const proc = state.processes[pid] || state.processes[String(pid)];
     if (!proc) {
-        setDetailHeader(`PID ${pid}`, 'background:rgba(59,130,246,0.2);color:#3b82f6', `Process ${pid}`, '');
+        setDetailHeader(`PID ${pid}`, 'background:rgba(var(--accent-blue-rgb), 0.2);color:var(--accent-blue)', `Process ${pid}`, '');
         setDetailBody(`<div class="muted">No detailed information available for PID ${escapeHtml(String(pid))}.</div>`);
         showDetail();
         return;
@@ -4022,7 +5085,7 @@ function openProcessDetail(pid) {
 
     const hasExited = !!proc.exit_time;
     const statusText = hasExited ? 'exited' : 'running';
-    setDetailHeader(`PID ${proc.pid}`, 'background:rgba(59,130,246,0.2);color:#3b82f6', proc.name || 'unknown', statusText);
+    setDetailHeader(`PID ${proc.pid}`, 'background:rgba(var(--accent-blue-rgb), 0.2);color:var(--accent-blue)', proc.name || 'unknown', statusText);
 
     let html = `<div class="pivot-graph-bar"><button class="pivot-graph-btn" onclick="focusProcessGraph(${jsArg(procKey(proc))}, {reset:true, at:${jsArg(proc.first_seen || '')}})">&#9673; View in process graph</button></div>`;
     html += `<div class="detail-fields">
@@ -4090,8 +5153,10 @@ function openProcessDetail(pid) {
 function renderProcessList() {
     const container = document.getElementById('process-list');
     const count = document.getElementById('process-count');
+    const drawerCount = document.getElementById('drawer-count');    // ☰ PROCESSES in the Cyberpunk top bar
     const procs = Object.values(state.processes);
     count.textContent = procs.length;
+    if (drawerCount) drawerCount.textContent = procs.length;
 
     if (!procs.length) {
         container.innerHTML = '<div class="muted" style="padding:8px;font-size:10px;">No processes tracked</div>';
@@ -4110,14 +5175,21 @@ function renderProcessList() {
 }
 
 // --- Render: Timeline (sidebar) ---
+// The 60 newest alerts, newest first, as bars (CHART) or as a table of time,
+// severity and rule (TABLE)
 function renderTimeline() {
     const container = document.getElementById('timeline');
-    if (!state.alerts.length) {
+    const toggle = document.getElementById('timeline-view-toggle');
+    // Written once: a refresh keeps the switch (and the keyboard focus on it)
+    if (toggle && !toggle.firstElementChild) toggle.innerHTML = viewToggleHtml('timeline');
+    const maxBars = 60;
+    const alerts = newestAlerts(state.alerts, maxBars);
+    const table = document.getElementById('timeline-table');
+    if (table) table.innerHTML = timelineTableHtml(alerts);
+    if (!alerts.length) {
         container.innerHTML = '';
         return;
     }
-    const maxBars = 60;
-    const alerts = state.alerts.slice(0, maxBars);
     container.innerHTML = alerts.map(alert => {
         const sev = (alert.severity || 'low').toLowerCase();
         const width = 30 + Math.random() * 70;
@@ -4125,17 +5197,33 @@ function renderTimeline() {
     }).join('');
 }
 
+// The table view of the sidebar timeline: its alerts, newest first
+function timelineTableHtml(alerts) {
+    const rows = alerts.map(alert => {
+        const sevClass = cssToken(alertSeverity(alert));
+        const rule = alertRuleName(alert);
+        return `<tr><td data-sort-value="${sortTimeValue(alert.timestamp)}">${escapeHtml(formatTime(alert.timestamp))}</td>`
+            + `<td data-sort-value="${severitySortValue(sevClass)}"><span class="event-severity ${sevClass}">${sevClass || 'unknown'}</span></td>`
+            + `<td class="view-table-text" title="${escapeHtml(rule)}">${escapeHtml(rule)}</td></tr>`;
+    });
+    if (!rows.length) rows.push('<tr data-sort-skip><td colspan="3" class="view-table-empty">No alerts yet.</td></tr>');
+    return '<table class="view-table" data-sortable data-sort-id="timeline-alerts"><thead><tr><th>Time</th><th>Severity</th>'
+        + `<th>Rule</th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
+}
+
 // --- Render: Service status ---
+// The services of the status row (sidebar; the drop-down of the Cyberpunk top bar)
+const STATUS_SERVICES = [
+    {key: 'rustinel', id: 'status-rustinel', name: 'Rustinel'},
+    {key: 'sysmon', id: 'status-sysmon', name: 'Sysmon'},
+    {key: 'detonator_agent', id: 'status-agent', name: 'Agent'},
+    {key: 'litterbox', id: 'status-litterbox', name: 'Litterbox'},
+    {key: 'fibratus', id: 'status-fibratus', name: 'Fibratus'},
+];
+
 function updateServiceStatus(status) {
     // Detect transitions and show toasts
-    const services = [
-        {key: 'rustinel', id: 'status-rustinel', name: 'Rustinel'},
-        {key: 'sysmon', id: 'status-sysmon', name: 'Sysmon'},
-        {key: 'detonator_agent', id: 'status-agent', name: 'Agent'},
-        {key: 'litterbox', id: 'status-litterbox', name: 'Litterbox'},
-        {key: 'fibratus', id: 'status-fibratus', name: 'Fibratus'},
-    ];
-    services.forEach(svc => {
+    STATUS_SERVICES.forEach(svc => {
         const nowOnline = !!status[svc.key]?.online;
         const prev = state._prevServiceStatus?.[svc.key]?.online;
         // Only toast on actual transitions (not initial load)
@@ -4149,6 +5237,19 @@ function updateServiceStatus(status) {
         setStatus(svc.id, nowOnline);
     });
     state._prevServiceStatus = JSON.parse(JSON.stringify(status));
+    updateTopbarServices(status);
+}
+
+// Summary on the services button of the Cyberpunk top bar: a dot and "n/m ONLINE"
+function updateTopbarServices(status = state.serviceStatus) {
+    const button = document.getElementById('topbar-services');
+    if (!button) return;
+    const online = STATUS_SERVICES.filter(svc => status?.[svc.key]?.online).length;
+    const total = STATUS_SERVICES.length;
+    const dot = document.createElement('span');
+    dot.className = 'topbar-dot ' + (online === total ? 'ok' : online ? 'partial' : 'down');
+    button.replaceChildren(dot, `${online}/${total} ONLINE`);
+    button.title = `${online} of ${total} services online`;
 }
 
 function setStatus(elementId, online) {
@@ -4633,8 +5734,8 @@ function renderDetonationPanels(data) {
     // Alerts tab
     const alerts = data.fibratus_alerts || [];
     if (alerts.length > 0) {
-        let body = `<table class="det-alert-table"><thead><tr>
-            <th>Severity</th><th>Rule / Threat</th><th>Process</th><th>Engine</th><th>Time</th><th>Raw</th>
+        let body = `<table class="det-alert-table" data-sortable data-sort-id="detonation-alerts"><thead><tr>
+            <th>Severity</th><th>Rule / Threat</th><th>Process</th><th>Engine</th><th>Time</th><th data-no-sort>Raw</th>
             </tr></thead><tbody>`;
         alerts.forEach(alert => {
             const sev = (alert.severity || 'unknown').toLowerCase();
@@ -4644,11 +5745,11 @@ function renderDetonationPanels(data) {
             const apid = alert.pid || '';
             const ts = alert.timestamp ? new Date(alert.timestamp).toLocaleTimeString('en-GB', {hour12:false}) : '';
             body += `<tr class="sev-${cssToken(sev)}">
-                <td><span class="det-alert-sev sev-${cssToken(sev)}">${escapeHtml(sev.toUpperCase())}</span></td>
+                <td data-sort-value="${severitySortValue(sev)}"><span class="det-alert-sev sev-${cssToken(sev)}">${escapeHtml(sev.toUpperCase())}</span></td>
                 <td>${escapeHtml(ruleName)}</td>
                 <td>${escapeHtml(procName)}${apid ? ' <span class="muted">(PID:' + escapeHtml(String(apid)) + ')</span>' : ''}</td>
                 <td>${escapeHtml(engine)}</td>
-                <td class="muted">${ts}</td>
+                <td class="muted" data-sort-value="${sortTimeValue(alert.timestamp)}">${ts}</td>
                 <td>${_detRawButton('View', alert.raw || alert)}</td>
             </tr>`;
         });
@@ -4700,7 +5801,7 @@ function renderDetonationPanels(data) {
         // overall assessment uses, and it is the only place where one tool
         // corroborating another becomes visible.
         if (data.memory_evidence) {
-            body += `<div class="det-sub-title">Memory evidence &mdash; all sources</div>`;
+            body += `<div class="det-sub-title" data-info="All memory findings scored together: persistence across samples, corroboration by another tool and the host baseline decide the weight of each. A score of 2.0 or more is SUSPICIOUS, 6.0 or more MALICIOUS.">Memory evidence &mdash; all sources</div>`;
             body += renderMemoryEvidence(data.memory_evidence, data.aether);
         }
         if (data.hunt_sleeping_beacons) {
@@ -4763,7 +5864,7 @@ function renderDetonationPanels(data) {
     // Named pipes the sample subtree created or connected to (Sysmon 17/18)
     if (data.named_pipes) {
         const np = data.named_pipes;
-        const body = `<div class="det-sub-title">NAMED PIPES</div>` + renderNamedPipesBlock(np);
+        const body = `<div class="det-sub-title" data-info="Pipes that the process tree of the sample created or connected to, from Sysmon EID 17 and 18. C2 catalog names, cross-process use, sensitive system pipes and random names are flagged and scored with the memory evidence.">NAMED PIPES</div>` + renderNamedPipesBlock(np);
         tabs.push({ id: 'det-tab-pipes', label: 'Named Pipes', count: np.available ? (np.pipes || []).length : undefined, body });
     }
 
@@ -4864,8 +5965,8 @@ async function refreshSubmissions() {
             return;
         }
 
-        let html = '<table class="submissions-table"><thead><tr>';
-        html += '<th>Time</th><th>Filename</th><th>SHA-256</th><th>Size</th><th>Target</th><th>Status</th><th>Actions</th>';
+        let html = '<table class="submissions-table" data-sortable data-sort-id="submissions"><thead><tr>';
+        html += '<th>Time</th><th>Filename</th><th>SHA-256</th><th>Size</th><th>Target</th><th>Status</th><th data-no-sort>Actions</th>';
         html += '</tr></thead><tbody>';
 
         submissions.forEach(sub => {
@@ -4895,10 +5996,10 @@ async function refreshSubmissions() {
             }
 
             html += `<tr>`;
-            html += `<td class="td-time">${ts}</td>`;
+            html += `<td class="td-time" data-sort-value="${sortTimeValue(sub.timestamp)}">${ts}</td>`;
             html += `<td class="td-filename" title="${escapeHtml(sub.filename || '')}">${escapeHtml(sub.filename || '--')}</td>`;
             html += `<td class="td-hash mono" title="${escapeHtml(sub.sha256 || '')}">${shortHash}</td>`;
-            html += `<td class="td-size">${sub.size ? formatSize(sub.size) : '--'}</td>`;
+            html += `<td class="td-size" data-sort-value="${sortNumberValue(sub.size)}">${sub.size ? formatSize(sub.size) : '--'}</td>`;
             html += `<td class="td-target">${escapeHtml(sub.target || '--')}</td>`;
             html += `<td class="td-status">${agentBadge} ${lbBadge} ${pid}</td>`;
             html += `<td class="td-actions">${actions}</td>`;
@@ -5649,13 +6750,17 @@ function isoHandleToggleClick(pos) {
 }
 
 function _isoNodeStyle(n) {
-    if (n.detonated) return { fill: '#f59e0b', stroke: '#fbbf24', glyph: '#1f1300', big: true };
+    const style = (fill, stroke, glyph, big) => ({
+        fill: themeColor(fill), stroke: themeColor(stroke), glyph: themeColor(glyph),
+        halo: big ? themeColor(stroke, 0x33 / 255) : null, big,
+    });
+    if (n.detonated) return style('--c-amber-500', '--graph-detonated', '--c-amber-990', true);
     if (n.threats > 0) {
-        if (n.severity === 'critical') return { fill: '#dc2626', stroke: '#ef4444', glyph: '#fff', big: true };
-        if (n.severity === 'high') return { fill: '#ea580c', stroke: '#f97316', glyph: '#fff', big: true };
-        return { fill: '#ca8a04', stroke: '#eab308', glyph: '#fff', big: true };
+        if (n.severity === 'critical') return style('--c-red-600', '--severity-critical', '--c-white', true);
+        if (n.severity === 'high') return style('--c-orange-600', '--severity-high', '--c-white', true);
+        return style('--c-yellow-600', '--severity-medium', '--c-white', true);
     }
-    return { fill: '#1e293b', stroke: '#475569', glyph: '#94a3b8', big: false };
+    return style('--c-slate-800', '--text-dim', '--text-secondary', false);
 }
 
 function _isoHexPath(ctx, x, y, r) {
@@ -5701,13 +6806,14 @@ function _isoArrow(ctx, x, y, angle, size, color) {
 // Activity icons under the label: network, DNS, files, registry, pipes.
 function _isoActivityIcons(ctx, x, y, act) {
     const items = [
-        ['network', '#22c55e'], ['dns', '#a78bfa'], ['file', '#f97316'], ['registry', '#f472b6'],
-        ['pipe', '#38bdf8'],
+        ['network', '--graph-network'], ['dns', '--graph-dns'], ['file', '--graph-file'],
+        ['registry', '--graph-registry'], ['pipe', '--graph-pipe'],
     ].filter(([k]) => act && act[k] > 0);
     ctx.font = '8px monospace';
     ctx.textBaseline = 'middle';
     ctx.textAlign = 'left';
-    for (const [kind, color] of items) {
+    for (const [kind, colorVar] of items) {
+        const color = themeColor(colorVar);
         ctx.strokeStyle = color;
         ctx.fillStyle = color;
         ctx.lineWidth = 1.1;
@@ -5747,7 +6853,7 @@ function renderIsometricGraph(ctx) {
         const u = n.isoU, uMid = u + 0.5;
         const head = isoProject(uMid, n.isoV);
         const tail = isoProject(uMid, kids[kids.length - 1].isoV);
-        ctx.strokeStyle = '#3b4a61';
+        ctx.strokeStyle = themeColor('--c-slate-650');
         ctx.lineWidth = 1.2;
         ctx.globalAlpha = n.exited ? 0.6 : 0.95;
         ctx.beginPath();
@@ -5763,7 +6869,7 @@ function renderIsometricGraph(ctx) {
         const lineage = kids.find(k => k.isAncestor || k.isRoot);
         if (lineage && (n.isAncestor || n.isRoot)) {
             const a = isoProject(uMid, lineage.isoV);
-            ctx.strokeStyle = '#3b82f6';
+            ctx.strokeStyle = themeColor('--accent-blue');
             ctx.lineWidth = 1.6;
             ctx.beginPath();
             ctx.moveTo(n.x, n.y); ctx.lineTo(head.x, head.y);
@@ -5775,7 +6881,7 @@ function renderIsometricGraph(ctx) {
 
     // 2. Cross-process edges as raised bridges: remote threads (solid) and
     // named pipes shared by two processes (dashed, lower, creator -> client).
-    const teal = '#2dd4bf';
+    const teal = themeColor('--c-teal-400');
     for (const e of graphState.edges) {
         if (e.type !== 'inject' && e.type !== 'pipe-link') continue;
         const s = byId[e.source], t = byId[e.target];
@@ -5800,7 +6906,7 @@ function renderIsometricGraph(ctx) {
         _isoArrow(ctx, pts[1].x, pts[1].y + 2, -Math.PI / 2, 7, teal);   // leaves the source
         _isoArrow(ctx, pts[4].x, pts[4].y, Math.PI / 2, 8, teal);       // enters the target
         const midY = (pts[3].y + pts[4].y) / 2;                           // marker on the drop
-        ctx.fillStyle = '#14b8a6';
+        ctx.fillStyle = themeColor('--c-teal-500');
         ctx.beginPath();
         if (isPipe) {                                                     // diamond: pipe
             ctx.moveTo(t.x, midY - 6); ctx.lineTo(t.x + 5, midY); ctx.lineTo(t.x, midY + 6); ctx.lineTo(t.x - 5, midY);
@@ -5819,7 +6925,7 @@ function renderIsometricGraph(ctx) {
 
         if (n.isRoot) {                                   // focus ring
             _isoHexPath(ctx, n.x, n.y, r + 6);
-            ctx.strokeStyle = '#38bdf8';
+            ctx.strokeStyle = themeColor('--c-sky-400');
             ctx.lineWidth = 1.5;
             ctx.setLineDash([3, 3]);
             ctx.stroke();
@@ -5827,13 +6933,13 @@ function renderIsometricGraph(ctx) {
         }
         if (st.big) {                                     // soft halo for notable nodes
             _isoHexPath(ctx, n.x, n.y, r + 4);
-            ctx.fillStyle = st.stroke + '33';
+            ctx.fillStyle = st.halo;
             ctx.fill();
         }
         _isoHexPath(ctx, n.x, n.y, r);
         ctx.fillStyle = st.fill;
         ctx.fill();
-        ctx.strokeStyle = selected ? '#ffffff' : st.stroke;
+        ctx.strokeStyle = selected ? themeColor('--c-white') : st.stroke;
         ctx.lineWidth = selected ? 2.2 : 1.2;
         ctx.stroke();
         _isoCube(ctx, n.x, n.y + 1, r * 0.48, st.glyph);
@@ -5842,16 +6948,16 @@ function renderIsometricGraph(ctx) {
         if (n.threats > 0) {
             const bx = n.x + r * 0.85, by = n.y - r * 0.85;
             ctx.beginPath(); ctx.arc(bx, by, 6.5, 0, Math.PI * 2);
-            ctx.fillStyle = '#ef4444'; ctx.fill();
+            ctx.fillStyle = themeColor('--accent-red'); ctx.fill();
             ctx.font = 'bold 7px monospace';
-            ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+            ctx.fillStyle = themeColor('--c-white'); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
             ctx.fillText(n.threats > 99 ? '99+' : String(n.threats), bx, by + 0.5);
         }
         if (n.scans && n.scans.length) {
-            const vColors = { malicious: '#ef4444', detected: '#ef4444', clean: '#4ade80', analyzed: '#38bdf8', unknown: '#64748b' };
+            const vColors = { malicious: '--accent-red', detected: '--accent-red', clean: '--c-green-400', analyzed: '--c-sky-400', unknown: '--text-muted' };
             ctx.beginPath(); ctx.arc(n.x - r * 0.85, n.y + r * 0.85, 4.5, 0, Math.PI * 2);
-            ctx.fillStyle = vColors[n.scanVerdict] || '#64748b'; ctx.fill();
-            ctx.strokeStyle = '#0b1220'; ctx.lineWidth = 1.2; ctx.stroke();
+            ctx.fillStyle = themeColor(vColors[n.scanVerdict] || '--text-muted'); ctx.fill();
+            ctx.strokeStyle = themeColor('--c-navy-950'); ctx.lineWidth = 1.2; ctx.stroke();
         }
 
         // Label to the right, upper case; the focus root in cyan.
@@ -5859,13 +6965,13 @@ function renderIsometricGraph(ctx) {
         ctx.font = `${n.isRoot ? '600 ' : ''}11px -apple-system, "Segoe UI", sans-serif`;
         ctx.textAlign = 'left';
         ctx.textBaseline = 'middle';
-        ctx.fillStyle = selected || hovered ? '#ffffff' : n.isRoot ? '#22d3ee' : '#cbd5e1';
+        ctx.fillStyle = themeColor(selected || hovered ? '--c-white' : n.isRoot ? '--accent-cyan' : '--c-slate-300');
         const text = label.length > 24 ? label.slice(0, 22) + '…' : label;
         const lx = n.x + r + 7, ly = n.y - 5;
         ctx.fillText(text, lx, ly);
         if (zoom > 0.55) {
             ctx.font = '9px monospace';
-            ctx.fillStyle = '#64748b';
+            ctx.fillStyle = themeColor('--text-muted');
             ctx.fillText(`PID ${n.pid}`, lx, ly + 12);
             _isoActivityIcons(ctx, lx + ctx.measureText(`PID ${n.pid}`).width + 8, ly + 12, n.isoAct);
         }
@@ -5877,14 +6983,14 @@ function renderIsometricGraph(ctx) {
             const tx = n.x - r - 3, ty = n.y + r + 3, tr = 5;
             n.isoToggle = { x: tx, y: ty, r: tr };
             ctx.beginPath(); ctx.arc(tx, ty, tr, 0, Math.PI * 2);
-            ctx.fillStyle = '#0f172a'; ctx.fill();
-            ctx.strokeStyle = n.isoCollapsed ? '#2dd4bf' : '#64748b'; ctx.lineWidth = 1; ctx.stroke();
-            ctx.strokeStyle = n.isoCollapsed ? '#2dd4bf' : '#94a3b8';
+            ctx.fillStyle = themeColor('--c-slate-900'); ctx.fill();
+            ctx.strokeStyle = themeColor(n.isoCollapsed ? '--c-teal-400' : '--text-muted'); ctx.lineWidth = 1; ctx.stroke();
+            ctx.strokeStyle = themeColor(n.isoCollapsed ? '--c-teal-400' : '--text-secondary');
             ctx.beginPath(); ctx.moveTo(tx - 2.6, ty); ctx.lineTo(tx + 2.6, ty);
             if (n.isoCollapsed) { ctx.moveTo(tx, ty - 2.6); ctx.lineTo(tx, ty + 2.6); }
             ctx.stroke();
             if (n.isoCollapsed && n.isoHiddenCount) {
-                ctx.font = '8px monospace'; ctx.fillStyle = '#2dd4bf';
+                ctx.font = '8px monospace'; ctx.fillStyle = themeColor('--c-teal-400');
                 ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
                 ctx.fillText(`+${n.isoHiddenCount}`, tx - tr - 3, ty);
             }
@@ -5893,9 +6999,9 @@ function renderIsometricGraph(ctx) {
         if (n.isRoot) {
             ctx.font = 'bold 8px monospace';
             const tw = ctx.measureText('FOCUS').width;
-            ctx.fillStyle = '#38bdf8';
+            ctx.fillStyle = themeColor('--c-sky-400');
             ctx.fillRect(n.x - tw / 2 - 4, n.y - r - 20, tw + 8, 11);
-            ctx.fillStyle = '#0b1220';
+            ctx.fillStyle = themeColor('--c-navy-950');
             ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
             ctx.fillText('FOCUS', n.x, n.y - r - 14.5);
         }
@@ -6182,7 +7288,7 @@ function renderGraph() {
     if (nodes.length === 0) {
         if (graphState.isLoading) return;
         ctx.save();
-        ctx.fillStyle = '#64748b';
+        ctx.fillStyle = themeColor('--text-muted');
         ctx.font = '14px monospace';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
@@ -6203,24 +7309,25 @@ function renderGraph() {
         return;
     }
 
+    // Colours by variable name: some are also painted with an alpha
     const nodeColors = {
-        process: '#3b82f6',
-        network: '#22c55e',
-        dns: '#a78bfa',
-        file: '#f97316',
-        registry: '#f472b6',
-        pipe: '#38bdf8',
+        process: '--graph-process',
+        network: '--graph-network',
+        dns: '--graph-dns',
+        file: '--graph-file',
+        registry: '--graph-registry',
+        pipe: '--graph-pipe',
     };
 
     const edgeColors = {
-        spawn: '#475569',
-        network: '#22c55e',
-        dns: '#a78bfa',
-        inject: '#ef4444',
-        file: '#f97316',
-        registry: '#f472b6',
-        'pipe-create': '#38bdf8',
-        'pipe-connect': '#38bdf8',
+        spawn: '--text-dim',
+        network: '--graph-network',
+        dns: '--graph-dns',
+        inject: '--accent-red',
+        file: '--graph-file',
+        registry: '--graph-registry',
+        'pipe-create': '--graph-pipe',
+        'pipe-connect': '--graph-pipe',
     };
 
     // Build node index for edge lookup
@@ -6236,7 +7343,7 @@ function renderGraph() {
         ctx.beginPath();
         ctx.moveTo(src.x, src.y);
         ctx.lineTo(tgt.x, tgt.y);
-        ctx.strokeStyle = edgeColors[edge.type] || '#475569';
+        ctx.strokeStyle = themeColor(edgeColors[edge.type] || '--text-dim');
         ctx.lineWidth = edge.type === 'inject' ? 2 : 1;
         if (edge.type === 'inject') {
             ctx.setLineDash([4, 3]);
@@ -6263,7 +7370,7 @@ function renderGraph() {
             ctx.lineTo(arrX - headLen * Math.cos(angle - 0.4), arrY - headLen * Math.sin(angle - 0.4));
             ctx.lineTo(arrX - headLen * Math.cos(angle + 0.4), arrY - headLen * Math.sin(angle + 0.4));
             ctx.closePath();
-            ctx.fillStyle = edgeColors[edge.type];
+            ctx.fillStyle = themeColor(edgeColors[edge.type]);
             ctx.globalAlpha = 0.7;
             ctx.fill();
             ctx.globalAlpha = 1;
@@ -6274,18 +7381,18 @@ function renderGraph() {
     nodes.forEach(node => {
         const isHovered = graphState.hoveredNode === node;
         const isSelected = graphState.selectedNode === node;
-        let color = nodeColors[node.type] || '#64748b';
+        let colorVar = nodeColors[node.type] || '--text-muted';
 
         // Override color for malicious processes
         if (node.type === 'process' && node.threats > 0) {
-            if (node.severity === 'critical') color = '#ef4444';
-            else if (node.severity === 'high') color = '#f97316';
-            else if (node.severity === 'medium') color = '#eab308';
+            if (node.severity === 'critical') colorVar = '--severity-critical';
+            else if (node.severity === 'high') colorVar = '--severity-high';
+            else if (node.severity === 'medium') colorVar = '--severity-medium';
         }
 
         // Override color for detonated processes (gold)
         if (node.detonated) {
-            color = '#fbbf24';
+            colorVar = '--graph-detonated';
         }
 
         const r = node.radius * (isHovered ? 1.2 : 1);
@@ -6297,7 +7404,7 @@ function renderGraph() {
         if (node.isRoot) {
             ctx.beginPath();
             ctx.arc(node.x, node.y, r + 8, 0, Math.PI * 2);
-            ctx.strokeStyle = '#38bdf8';
+            ctx.strokeStyle = themeColor('--c-sky-400');
             ctx.lineWidth = 2;
             ctx.setLineDash([3, 3]);
             ctx.stroke();
@@ -6308,7 +7415,7 @@ function renderGraph() {
         if (node.type === 'process' && node.threats > 0) {
             ctx.beginPath();
             ctx.arc(node.x, node.y, r + 4, 0, Math.PI * 2);
-            ctx.fillStyle = color + '20';
+            ctx.fillStyle = themeColor(colorVar, 0x20 / 255);
             ctx.fill();
         }
 
@@ -6316,7 +7423,7 @@ function renderGraph() {
         if (node.detonated) {
             ctx.beginPath();
             ctx.arc(node.x, node.y, r + 5, 0, Math.PI * 2);
-            ctx.fillStyle = '#fbbf2425';
+            ctx.fillStyle = themeColor('--graph-detonated', 0x25 / 255);
             ctx.fill();
         }
 
@@ -6331,10 +7438,11 @@ function renderGraph() {
         } else {
             ctx.arc(node.x, node.y, r, 0, Math.PI * 2);
         }
-        ctx.fillStyle = color + '30';
+        ctx.fillStyle = themeColor(colorVar, 0x30 / 255);
         ctx.fill();
-        if (node.type === 'pipe' && node.family) color = '#ef4444';   // known C2 pipe name
-        ctx.strokeStyle = isSelected ? '#fff' : color;
+        if (node.type === 'pipe' && node.family) colorVar = '--severity-critical';   // known C2 pipe name
+        const color = themeColor(colorVar);
+        ctx.strokeStyle = isSelected ? themeColor('--c-white') : color;
         ctx.lineWidth = isSelected ? 2.5 : 1.5;
         ctx.stroke();
 
@@ -6375,7 +7483,7 @@ function renderGraph() {
 
         // Label
         ctx.font = `${node.type === 'process' ? '10' : '8'}px monospace`;
-        ctx.fillStyle = isHovered ? '#fff' : '#94a3b8';
+        ctx.fillStyle = themeColor(isHovered ? '--c-white' : '--text-secondary');
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
         const labelY = node.y + r + 4;
@@ -6387,10 +7495,10 @@ function renderGraph() {
             const by = node.y - r * 0.7;
             ctx.beginPath();
             ctx.arc(bx, by, 7, 0, Math.PI * 2);
-            ctx.fillStyle = '#ef4444';
+            ctx.fillStyle = themeColor('--accent-red');
             ctx.fill();
             ctx.font = 'bold 7px monospace';
-            ctx.fillStyle = '#fff';
+            ctx.fillStyle = themeColor('--c-white');
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
             ctx.fillText(String(node.threats), bx, by);
@@ -6398,20 +7506,20 @@ function renderGraph() {
 
         // Scan verdict indicator (bottom-left): matched EMBER/capa/TC/DC result
         if (node.type === 'process' && node.scans && node.scans.length) {
-            const vColors = { malicious: '#ef4444', detected: '#ef4444',
-                              clean: '#4ade80', analyzed: '#38bdf8', unknown: '#64748b' };
-            const vc = vColors[node.scanVerdict] || '#64748b';
+            const vColors = { malicious: '--accent-red', detected: '--accent-red',
+                              clean: '--c-green-400', analyzed: '--c-sky-400', unknown: '--text-muted' };
+            const vc = themeColor(vColors[node.scanVerdict] || '--text-muted');
             const sbx = node.x - r * 0.7;
             const sby = node.y + r * 0.7;
             ctx.beginPath();
             ctx.arc(sbx, sby, 6, 0, Math.PI * 2);
             ctx.fillStyle = vc;
             ctx.fill();
-            ctx.strokeStyle = '#0b1220';
+            ctx.strokeStyle = themeColor('--c-navy-950');
             ctx.lineWidth = 1.5;
             ctx.stroke();
             ctx.font = 'bold 7px monospace';
-            ctx.fillStyle = '#0b1220';
+            ctx.fillStyle = themeColor('--c-navy-950');
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
             ctx.fillText('S', sbx, sby);
@@ -6425,9 +7533,9 @@ function renderGraph() {
             const badgeY = node.y - r - 8;
             const text = 'FOCUS';
             const tw = ctx.measureText(text).width;
-            ctx.fillStyle = '#38bdf8';
+            ctx.fillStyle = themeColor('--c-sky-400');
             ctx.fillRect(node.x - tw / 2 - 4, badgeY - 11, tw + 8, 12);
-            ctx.fillStyle = '#0b1220';
+            ctx.fillStyle = themeColor('--c-navy-950');
             ctx.fillText(text, node.x, badgeY);
         }
 
@@ -6594,7 +7702,7 @@ function showGraphDetail(node) {
         html += `<div class="gd-field"><span class="gd-label">Image</span><span class="gd-value">${escapeHtml(node.image)}</span></div>`;
         if (node.cmdline) html += `<div class="gd-field"><span class="gd-label">Cmdline</span><span class="gd-value gd-cmdline">${escapeHtml(node.cmdline)}</span></div>`;
         if (node.user) html += `<div class="gd-field"><span class="gd-label">User</span><span class="gd-value">${escapeHtml(node.user)}</span></div>`;
-        html += `<div class="gd-field"><span class="gd-label">Status</span><span class="gd-value">${node.exited ? '<span style="color:#94a3b8">Exited</span>' : '<span style="color:#4ade80">Running</span>'}</span></div>`;
+        html += `<div class="gd-field"><span class="gd-label">Status</span><span class="gd-value">${node.exited ? '<span style="color:var(--text-secondary)">Exited</span>' : '<span style="color:var(--c-green-400)">Running</span>'}</span></div>`;
         html += `<div class="gd-field"><span class="gd-label">First seen</span><span class="gd-value">${escapeHtml(node.firstSeen || '--')}</span></div>`;
         if (node.parentPid) {
             const parentNode = graphState.nodes.find(n => n.type === 'process' && String(n.key) === String(node.parentPid));
@@ -7054,7 +8162,7 @@ function renderSysmonTable() {
     }
 
     const countInfo = hasAnyFilter ? ` <span class="sysmon-filter-count">(${filtered.length}/${sysmonEvents.length})</span>` : '';
-    let html = `<table class="sysmon-events-table"><thead><tr><th>Time</th><th>Type</th><th>PID</th><th>Image</th><th>Details</th><th class="col-corr">Win. EID</th></tr></thead><tbody>`;
+    let html = `<table class="sysmon-events-table" data-sortable data-sort-id="sysmon-events"><thead><tr><th>Time</th><th>Type</th><th>PID</th><th>Image</th><th>Details</th><th class="col-corr">Win. EID</th></tr></thead><tbody>`;
     filtered.forEach(ev => {
         const typeClass = getSysmonTypeClass(String(ev.event_id));
         const time = ev.timestamp ? formatSysmonTime(ev.timestamp) : '';
@@ -7066,14 +8174,15 @@ function renderSysmonTable() {
             : '';
         // Look the event up by position: embedding the event as JSON in the
         // attribute duplicated every row's data and let an event field that
-        // contains the text &quot; break out of the handler.
+        // contains the text &quot; break out of the handler. The time shows the
+        // clock only, so it sorts by its value (several days in one list).
         html += `<tr onclick="showSysmonDetailAt(${sysmonEvents.indexOf(ev)})">
-            <td class="col-time">${time}</td>
+            <td class="col-time" data-sort-value="${sortTimeValue(ev.timestamp)}">${time}</td>
             <td><span class="type-badge ${typeClass}">${escapeHtml(ev.type || '')}</span></td>
             <td class="col-pid">${escapeHtml(String(ev.pid || ''))}</td>
             <td class="col-image">${escapeHtml(image)}</td>
             <td class="col-details">${escapeHtml(details)}</td>
-            <td class="col-corr">${corrHtml}</td>
+            <td class="col-corr" data-sort-value="${correlated.map(c => c.id).join(' ')}">${corrHtml}</td>
         </tr>`;
     });
     html += '</tbody></table>';
@@ -7130,7 +8239,7 @@ function showSysmonDetail(ev) {
         html += `</div></div>`;
     }
 
-    setDetailHeader('Sysmon', 'background:rgba(34,197,94,0.15);color:var(--accent-green)', ev.type || 'Event', '');
+    setDetailHeader('Sysmon', 'background:rgba(var(--accent-green-rgb), 0.15);color:var(--accent-green)', ev.type || 'Event', '');
     setDetailBody(html);
     showDetail();
 }
@@ -7220,8 +8329,8 @@ function toggleSysmonCorrelation() {
         return;
     }
 
-    let html = '<div class="corr-panel-header"><span class="corr-panel-title">Sysmon / Windows Event ID Correlation</span><button class="btn btn-sm" onclick="toggleSysmonCorrelation()">Close</button></div>';
-    html += '<div class="corr-panel-body"><table class="corr-ref-table"><thead><tr><th>Sysmon ID</th><th>Sysmon Event</th><th>Related Windows Events</th></tr></thead><tbody>';
+    let html = '<div class="corr-panel-header"><span class="corr-panel-title" data-info="For each Sysmon event, the Windows events that record the same activity and the log they are written to.">Sysmon / Windows Event ID Correlation</span><button class="btn btn-sm" onclick="toggleSysmonCorrelation()">Close</button></div>';
+    html += '<div class="corr-panel-body"><table class="corr-ref-table" data-sortable data-sort-id="sysmon-correlation"><thead><tr><th>Sysmon ID</th><th>Sysmon Event</th><th>Related Windows Events</th></tr></thead><tbody>';
 
     const sysmonNames = {
         1: 'ProcessCreate', 3: 'NetworkConnect', 5: 'ProcessTerminate',
@@ -7325,7 +8434,7 @@ function renderLitterboxFiles() {
         return;
     }
 
-    let html = `<table class="sysmon-events-table"><thead><tr><th>File</th><th>Type</th><th>Size</th><th>Risk</th><th>Entropy</th><th>Static</th><th>Dynamic</th><th>EDR</th><th>Actions</th></tr></thead><tbody>`;
+    let html = `<table class="sysmon-events-table" data-sortable data-sort-id="litterbox-files"><thead><tr><th>File</th><th>Type</th><th>Size</th><th>Risk</th><th>Entropy</th><th>Static</th><th>Dynamic</th><th>EDR</th><th data-no-sort>Actions</th></tr></thead><tbody>`;
     entries.forEach(e => {
         const riskClass = cssToken(e.detection_risk);
         const riskBadge = `<span class="lb-risk-badge lb-risk-${riskClass}">${escapeHtml(e.detection_risk || '?')}</span>`;
@@ -7339,8 +8448,8 @@ function renderLitterboxFiles() {
         html += `<tr>
             <td class="col-image" title="${escapeHtml(e.sha256 || '')}">${escapeHtml(e.filename || e._key)}</td>
             <td><span class="lb-type-badge">${escapeHtml(e._type)}</span></td>
-            <td>${size}</td>
-            <td>${riskBadge}</td>
+            <td data-sort-value="${sortNumberValue(e.file_size)}">${size}</td>
+            <td data-sort-value="${severitySortValue(e.detection_risk)}">${riskBadge}</td>
             <td class="mono">${entropy}</td>
             <td class="center">${staticBadge}</td>
             <td class="center">${dynamicBadge}</td>
@@ -7833,6 +8942,28 @@ function formatSize(bytes) {
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
+// data-sort-value of a cell that shows a time as text ("23:59:58", "09 Nov,
+// 10:00"): epoch ms, so a sortable table orders by when, across days and time
+// zones; '' (sorted last) when there is none. Only digits reach the markup.
+function sortTimeValue(ts) {
+    const t = ts === null || ts === undefined || ts === '' ? NaN : Date.parse(ts);
+    return Number.isNaN(t) ? '' : String(t);
+}
+
+// data-sort-value of a cell that shows a number formatted ("1.2 KB")
+function sortNumberValue(value) {
+    const n = value === null || value === undefined || value === '' ? NaN : Number(value);
+    return Number.isFinite(n) ? String(n) : '';
+}
+
+// data-sort-value of a severity: critical 5 ... info 1 (the server's
+// "unknown" counts as info), '' for anything else
+function severitySortValue(severity) {
+    const s = String(severity || '').toLowerCase();
+    const rank = ALERT_SEVERITIES.indexOf(s === 'unknown' ? 'info' : s);
+    return rank < 0 ? '' : String(ALERT_SEVERITIES.length - rank);
+}
+
 function formatCategory(cat) {
     if (Array.isArray(cat)) return cat.map(c => c.charAt(0).toUpperCase() + c.slice(1)).join(', ');
     if (typeof cat === 'string') return cat.charAt(0).toUpperCase() + cat.slice(1);
@@ -7846,11 +8977,33 @@ function activityCounter(label, value) {
 }
 
 // --- Keyboard shortcuts ---
-document.addEventListener('keydown', e => {
+// Esc closes one layer per press, the top-most first: the (i) popover (the
+// focus goes back to its button), help, a drop-down of the top bar and the
+// drawer (the focus goes back to their button), the detail view.
+function handleGlobalKeydown(e) {
     if (e.key === 'Escape') {
+        const infoPopover = document.getElementById('info-popover');
+        if (infoPopover && !infoPopover.hidden) {
+            closeInfoPopover()?.focus();
+            return;
+        }
         const helpModal = document.getElementById('help-modal');
         if (helpModal && !helpModal.classList.contains('hidden')) {
             closeHelp();
+            return;
+        }
+        // An open drop-down closes and gives the focus back to its button.
+        const menuButton = Object.keys(TOPBAR_MENUS).find(isTopbarMenuOpen);
+        if (menuButton) {
+            closeTopbarMenus();
+            document.getElementById(menuButton)?.focus();
+            return;
+        }
+        // The drawer gives a focus that is in it to ☰ PROCESSES (it would stay on a hidden element).
+        if (isDrawerOpen()) {
+            const focusInDrawer = !!document.getElementById('sidebar')?.contains(document.activeElement);
+            closeDrawer();
+            if (focusInDrawer) document.getElementById('drawer-toggle')?.focus();
             return;
         }
         if (state.detailOpen) closeDetail();
@@ -7859,12 +9012,19 @@ document.addEventListener('keydown', e => {
         e.preventDefault();
         goDetailBack();
     }
-});
+}
+document.addEventListener('keydown', handleGlobalKeydown);
 
 // --- Help Modal ---
-function openHelp() {
+// Opens the help where it was left, or at a section (overview, usage, api,
+// architecture, services) with an element of it scrolled into view.
+function openHelp(section, anchorId) {
     const modal = document.getElementById('help-modal');
-    if (modal) modal.classList.remove('hidden');
+    if (!modal) return;
+    modal.classList.remove('hidden');
+    if (section) showHelpSection(section);
+    const anchor = anchorId ? document.getElementById(anchorId) : null;
+    if (anchor) anchor.scrollIntoView({ block: 'start' });
 }
 
 function closeHelp() {
@@ -7872,18 +9032,18 @@ function closeHelp() {
     if (modal) modal.classList.add('hidden');
 }
 
+// Shows one section of the help and marks its tab; an unknown name changes nothing
+function showHelpSection(name) {
+    const section = document.getElementById('help-' + name);
+    if (!section || !section.classList.contains('help-section')) return;
+    document.querySelectorAll('.help-tab').forEach(tab => tab.classList.toggle('active', tab.dataset.help === name));
+    document.querySelectorAll('.help-section').forEach(s => s.classList.toggle('active', s === section));
+}
+
 // Help tab switching
 document.addEventListener('DOMContentLoaded', () => {
-    const helpTabs = document.querySelectorAll('.help-tab');
-    helpTabs.forEach(tab => {
-        tab.addEventListener('click', () => {
-            const target = tab.dataset.help;
-            helpTabs.forEach(t => t.classList.remove('active'));
-            tab.classList.add('active');
-            document.querySelectorAll('.help-section').forEach(s => s.classList.remove('active'));
-            const section = document.getElementById('help-' + target);
-            if (section) section.classList.add('active');
-        });
+    document.querySelectorAll('.help-tab').forEach(tab => {
+        tab.addEventListener('click', () => showHelpSection(tab.dataset.help));
     });
 });
 
@@ -8067,7 +9227,7 @@ const FileMapView = (() => {
         const h = canvas.height;
         const size = vis.file_size || 1;
 
-        ctx.fillStyle = '#10182b';
+        ctx.fillStyle = themeColor('--c-navy-900');
         ctx.fillRect(0, 0, width, h);
 
         (vis.regions || []).forEach(r => {
@@ -8265,6 +9425,31 @@ const FileMapView = (() => {
         const legend = document.createElement('div');
         legend.innerHTML = legendHtml(vis);
         container.appendChild(legend.firstChild);
+        keepForRepaint(container, () => renderVertical(container, vis, opts));
+    }
+
+    // A theme switch paints every map on the page again (repaint), from the
+    // data it was drawn from. Skipped once other content replaced the map.
+    function keepForRepaint(container, render) {
+        container._fmapRepaint = render;
+        container._fmapShown = container.firstChild;
+    }
+
+    // Hidden maps are painted as well; a strip keeps its labels where they
+    // were and the hex editor's mark of the visible page.
+    function repaint() {
+        document.querySelectorAll('.fmap-view, .fmap-strip').forEach(container => {
+            if (!container._fmapRepaint || container.firstChild !== container._fmapShown) return;
+            const old = container._viewportMarker;
+            const mark = old && { left: old.style.left, width: old.style.width, visible: old.classList.contains('visible') };
+            container._fmapRepaint();
+            const marker = container._viewportMarker;
+            if (mark && marker) {
+                marker.style.left = mark.left;
+                marker.style.width = mark.width;
+                if (mark.visible) marker.classList.add('visible');
+            }
+        });
     }
 
     // --- Horizontal strip (hex minimap + inline analyzer map) ----------
@@ -8340,7 +9525,7 @@ const FileMapView = (() => {
             canvas.height = 1;
             const ctx = canvas.getContext('2d');
             const size = vis.file_size || 1;
-            ctx.fillStyle = '#10182b';
+            ctx.fillStyle = themeColor('--c-navy-900');
             ctx.fillRect(0, 0, canvas.width, 1);
             (vis.regions || []).forEach(r => {
                 ctx.fillStyle = r.color;
@@ -8360,7 +9545,7 @@ const FileMapView = (() => {
         labels.className = 'fmap-strip-names';
         container.appendChild(labels);
 
-        const trackWidth = labels.clientWidth || 900;
+        const trackWidth = opts.labelWidth || labels.clientWidth || 900;
         const placed = [];   // [left, right] in px, kept sorted-free for simple checks
         const CHAR_PX = 5.3; // approx. width of one 9px monospace glyph
         const DOT_PX = 12;   // color dot + gap
@@ -8397,6 +9582,7 @@ const FileMapView = (() => {
             container._viewportMarker = marker;
         }
         container._structCanvas = structCanvas;
+        keepForRepaint(container, () => renderStrip(container, vis, { ...opts, labelWidth: trackWidth }));
         return container;
     }
 
@@ -8477,7 +9663,7 @@ const FileMapView = (() => {
     }
 
     return {
-        load, renderVertical, renderStrip, updateViewport,
+        load, renderVertical, renderStrip, updateViewport, repaint,
         treeHtml, legendHtml, hexOff, jumpToHex,
         clearCache: () => cache.clear(),
     };
@@ -8612,13 +9798,19 @@ function hexUpdateMinimapViewport() {
 
 // Markup placeholder; the canvases need the nodes to exist in the DOM first.
 // `scope` keeps the ids unique per panel: the PE and ELF panels both stay in
-// the page, and a shared id sent the ELF map into the hidden PE panel.
-function fileMapInlineBlock(path, scope = 'pe') {
+// the page, and a shared id sent the ELF map into the hidden PE panel. Given
+// a card id (`view`) and its switch (`toggle`, viewToggleHtml), the block shows
+// the regions of the strip's structure track as a table as well (TABLE).
+function fileMapInlineBlock(path, scope = 'pe', view = '', toggle = '') {
     const safe = jsArg(path || '');
     let html = '<div class="fmap-inline">';
     html += '<div class="fmap-inline-head"><span class="die-section-title">FILE MAP</span>';
-    html += `<button class="btn btn-sm" onclick="fileMapRender(${safe});switchTab('filemap');">Open full map</button></div>`;
-    html += `<div class="fmap-inline-body" id="fmap-inline-map-${scope}"><div class="fmap-inline-wait">building planes…</div></div>`;
+    html += `<span class="fmap-inline-tools">${toggle}<button class="btn btn-sm" onclick="fileMapRender(${safe});switchTab('filemap');">Open full map</button></span></div>`;
+    html += `<div class="fmap-inline-body" id="fmap-inline-map-${scope}"${view ? cardViewAttrs(view, 'chart') : ''}><div class="fmap-inline-wait">building planes…</div></div>`;
+    if (view) {
+        html += `<div class="fmap-inline-table view-table-wrap" id="fmap-inline-table-${scope}"${cardViewAttrs(view, 'table')}>`
+            + '<div class="fmap-inline-wait">building the table…</div></div>';
+    }
     html += '<details class="fmap-inline-trees"><summary class="die-section-title die-clickable">IMPORT / EXPORT TREE</summary>';
     html += `<div id="fmap-inline-trees-${scope}"></div></details>`;
     html += '</div>';
@@ -8627,13 +9819,43 @@ function fileMapInlineBlock(path, scope = 'pe') {
 
 function fileMapInlineMount(path, scope = 'pe') {
     if (!path) return;
-    // renderInlineFileMap and the tree share one cached load (see
-    // FileMapView.load), so this does not fetch the map twice.
+    // renderInlineFileMap, the tree and the table share one cached load (see
+    // FileMapView.load), so this does not fetch the map twice. Like the strip,
+    // the tree and the table are taken before the load: when the analysis of
+    // the next file has replaced the panel by then, this file's map goes into
+    // its own (detached) nodes and not into the next file's panel.
+    const trees = document.getElementById(`fmap-inline-trees-${scope}`);
+    const table = document.getElementById(`fmap-inline-table-${scope}`);
     renderInlineFileMap(`fmap-inline-map-${scope}`, path);
     FileMapView.load(path, { cols: 256, rows: 512 }).then(vis => {
-        const target = document.getElementById(`fmap-inline-trees-${scope}`);
-        if (target) target.innerHTML = FileMapView.treeHtml(vis);
-    }).catch(() => {});
+        if (trees) trees.innerHTML = FileMapView.treeHtml(vis);
+        if (table) table.innerHTML = fileMapRegionsTableHtml(vis);
+    }).catch(e => {
+        if (table) table.innerHTML = `<div class="pe-error">File map failed: ${escapeHtml(e.message)}</div>`;
+    });
+}
+
+// The table view of the inline file map: the regions of its structure track
+// (headers, sections, data directories, overlay) in file order, with the
+// permissions and the entropy the sections (and the overlay) carry
+function fileMapRegionsTableHtml(vis) {
+    const regions = (vis.regions || []).slice()
+        .sort((a, b) => ((Number(a.offset) || 0) - (Number(b.offset) || 0)) || ((a.priority || 0) - (b.priority || 0)));
+    const rows = regions.map(region => {
+        const detail = region.detail || {};
+        const entropy = detail.entropy === null || detail.entropy === undefined ? NaN : Number(detail.entropy);
+        // The strip's colour of the region (only a colour reaches the style)
+        const color = /^#[0-9a-f]{3,8}$/i.test(String(region.color || '')) ? region.color : '';
+        return `<tr><td title="${escapeHtml(region.name)}">${color ? `<span class="view-table-dot" style="background:${color}"></span>` : ''}`
+            + `<span class="view-table-clip">${escapeHtml(region.name)}</span></td>`
+            + `<td class="mono" data-sort-value="${sortNumberValue(region.offset)}">${FileMapView.hexOff(Number(region.offset) || 0)}</td>`
+            + `<td data-sort-value="${sortNumberValue(region.size)}">${formatSize(region.size)}</td>`
+            + `<td class="mono">${detail.permissions ? escapeHtml(detail.permissions) : '&mdash;'}</td>`
+            + `<td data-sort-value="${Number.isFinite(entropy) ? sortNumberValue(entropy) : ''}">${Number.isFinite(entropy) ? entropy.toFixed(2) : '&mdash;'}</td></tr>`;
+    });
+    if (!rows.length) rows.push('<tr data-sort-skip><td colspan="5" class="view-table-empty">No structure found in this file.</td></tr>');
+    return '<table class="view-table" data-sortable data-sort-id="file-map-regions"><thead><tr><th>Name</th><th>Offset</th>'
+        + `<th>Raw Size</th><th>Permissions</th><th>Entropy</th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
 }
 
 async function renderInlineFileMap(containerId, path) {
@@ -8674,7 +9896,7 @@ function aetherSeverityClass(sev) {
 }
 
 function renderAetherBlock(aether, opts = {}) {
-    let html = `<div class="det-sub-title">Aether &mdash; live-memory forensics</div>`;
+    let html = `<div class="det-sub-title" data-info="Aether scans the running process for thread start addresses, PE images and .NET assemblies in private memory, heap API tables and in-memory signatures. Its findings feed the memory evidence score.">Aether &mdash; live-memory forensics</div>`;
 
     if (aether.error) {
         return html + `<div class="det-sub-value det-warn">${escapeHtml(aether.error)}</div>`;
@@ -8805,7 +10027,7 @@ function renderAetherBlock(aether, opts = {}) {
 }
 
 function renderProcessDumpBlock(pd) {
-    let html = `<div class="det-sub-title">Process Dump &mdash; memory extraction</div>`;
+    let html = `<div class="det-sub-title" data-info="Process Dump writes unpacked modules, hidden modules and loose code from memory to disk and skips the modules in its clean-hash database. Map and Hex open a dump in the file map or the hex editor.">Process Dump &mdash; memory extraction</div>`;
     if (pd.error) {
         return html + `<div class="det-sub-value det-warn">${escapeHtml(pd.error)}</div>`;
     }
@@ -8825,7 +10047,7 @@ function renderProcessDumpBlock(pd) {
     }
 
     html += `<div class="mem-section-label">Dumped files <span class="mem-foot-inline">${escapeHtml(pd.output_dir || '')}</span></div>`;
-    html += `<table class="mem-dump-table"><tr><th>file</th><th>kind</th><th>arch</th><th>size</th><th></th></tr>`;
+    html += `<table class="mem-dump-table" data-sortable data-sort-id="processdump-files"><thead><tr><th>file</th><th>kind</th><th>arch</th><th>size</th><th></th></tr></thead><tbody>`;
     (pd.dumps || []).forEach(d => {
         const kindCls = d.host_class ? 'sev-info'
             : d.kind === 'hiddenmodule' ? 'sev-high'
@@ -8836,14 +10058,14 @@ function renderProcessDumpBlock(pd) {
         html += `<td><span class="mem-chip ${kindCls}" title="${escapeHtml(d.host_reason || '')}">`
             + `${escapeHtml(d.host_class ? `${d.kind} (host: ${d.host_class})` : (d.kind || ''))}</span></td>`;
         html += `<td>${escapeHtml(d.arch || '')}</td>`;
-        html += `<td>${formatSize(d.size || 0)}</td>`;
+        html += `<td data-sort-value="${sortNumberValue(d.size || 0)}">${formatSize(d.size || 0)}</td>`;
         // A dump is just a PE on disk, so hand it to the existing analyzers.
         html += `<td class="mem-dump-actions">`;
         html += `<button class="btn btn-sm" onclick="fileMapRender(${esc});switchTab('filemap');">Map</button>`;
         html += `<button class="btn btn-sm" onclick="hexOpenFile(${esc})">Hex</button>`;
         html += `</td></tr>`;
     });
-    html += `</table>`;
+    html += `</tbody></table>`;
     return html + _detRawButton('View Process Dump raw', pd);
 }
 
@@ -9170,12 +10392,12 @@ async function memoryBaselineCapture() {
         html += `<div class="mem-chips"><span class="mem-chip"><span class="mem-chip-val">`
             + `${d.captured}</span>new key(s)</span>`
             + `<span class="mem-chip"><span class="mem-chip-val">${d.baseline.total}</span>total</span></div>`;
-        html += `<table class="mem-dump-table"><tr><th>process</th><th>pid</th><th>findings</th><th>new keys</th></tr>`;
+        html += `<table class="mem-dump-table" data-sortable data-sort-id="memory-baseline-capture"><thead><tr><th>process</th><th>pid</th><th>findings</th><th>new keys</th></tr></thead><tbody>`;
         (d.scanned || []).forEach(s => {
             html += `<tr><td class="mem-dump-name">${escapeHtml(s.process || '')}</td>`
                 + `<td>${escapeHtml(String(s.pid))}</td><td>${escapeHtml(String(s.findings))}</td><td>${escapeHtml(String(s.new_keys))}</td></tr>`;
         });
-        html += `</table>`;
+        html += `</tbody></table>`;
         (d.failures || []).forEach(f => {
             html += `<div class="mem-kv det-warn">PID ${escapeHtml(String(f.pid))} ${escapeHtml(f.process || '')}: `
                 + `${escapeHtml(f.error)}</div>`;
@@ -9199,7 +10421,7 @@ async function memoryBaselineClear() {
 // --- Exit capture (post-mortem analysis of the exit-time memory dump) ----
 
 function renderExitCaptureBlock(ec) {
-    let html = `<div class="det-sub-title">Exit Capture &mdash; memory at process exit</div>`;
+    let html = `<div class="det-sub-title" data-info="Windows writes a full-memory dump the moment the sample exits, and the dump is analyzed offline. It covers samples that exit before the live scanners can run.">Exit Capture &mdash; memory at process exit</div>`;
     if (ec.error) {
         return html + `<div class="det-sub-value det-warn">${escapeHtml(ec.error)}</div>`;
     }
@@ -9232,19 +10454,19 @@ function renderExitCaptureBlock(ec) {
     const arts = ec.artifacts || [];
     if (arts.length) {
         html += `<div class="mem-section-label">Extracted from memory (${arts.length})</div>`;
-        html += `<table class="mem-dump-table"><tr><th>file</th><th>kind</th><th>size</th><th></th></tr>`;
+        html += `<table class="mem-dump-table" data-sortable data-sort-id="exit-capture-artifacts"><thead><tr><th>file</th><th>kind</th><th>size</th><th></th></tr></thead><tbody>`;
         arts.forEach(a => {
             const esc = jsArg(a.path || '');
             const cls = a.kind === 'main_image' ? '' : 'sev-high';
             html += `<tr><td class="mem-dump-name" title="${escapeHtml(a.sha256 || '')}">${escapeHtml(a.filename)}</td>`
                 + `<td><span class="mem-chip ${cls}">${escapeHtml(a.kind)}</span></td>`
-                + `<td>${formatSize(a.size || 0)}</td><td class="mem-dump-actions">`;
+                + `<td data-sort-value="${sortNumberValue(a.size || 0)}">${formatSize(a.size || 0)}</td><td class="mem-dump-actions">`;
             if (a.is_pe) {
                 html += `<button class="btn btn-sm" onclick="fileMapRender(${esc});switchTab('filemap');">Map</button>`;
             }
             html += `<button class="btn btn-sm" onclick="hexOpenFile(${esc})">Hex</button></td></tr>`;
         });
-        html += `</table>`;
+        html += `</tbody></table>`;
     }
     if (ec.dump_path) {
         html += `<div class="mem-foot">Dump: ${escapeHtml(ec.dump_path)} (${formatSize(ec.dump_size || 0)}) `
@@ -9257,7 +10479,7 @@ function renderExitCaptureBlock(ec) {
 // --- Network beaconing (periodicity of outbound connections, from Sysmon) ---
 
 function renderNetworkBeaconingBlock(net) {
-    let html = `<div class="det-sub-title">Network &mdash; connection periodicity</div>`;
+    let html = `<div class="det-sub-title" data-info="Outbound connections of the sample from Sysmon EID 3, checked for the regular check-in interval of a beacon. A low coefficient of variation (CoV) means a regular interval.">Network &mdash; connection periodicity</div>`;
     const hits = net.evidence_findings || [];
     html += `<div class="det-sub-value">${net.connections} outbound connection(s) to `
         + `${(net.endpoints || []).length} endpoint(s)`
@@ -9342,19 +10564,20 @@ function renderSweepResult(r) {
         return html + `<div class="det-sub-value">No process carries findings beyond the host baseline `
             + `(${r.processes.length} with baseline-known findings only).</div>`;
     }
-    html += `<table class="mem-dump-table"><tr><th>process</th><th>pid</th><th>verdict</th>`
-        + `<th>score</th><th>suppressed</th><th>top evidence</th><th></th></tr>`;
+    html += `<table class="mem-dump-table" data-sortable data-sort-id="memory-sweep"><thead><tr><th>process</th><th>pid</th><th>verdict</th>`
+        + `<th>score</th><th>suppressed</th><th>top evidence</th><th></th></tr></thead><tbody>`;
     flagged.forEach(p => {
         const cls = p.label === 'MALICIOUS' ? 'sev-critical' : p.label === 'SUSPICIOUS' ? 'sev-high' : 'sev-low';
+        const rank = p.label === 'MALICIOUS' ? 3 : p.label === 'SUSPICIOUS' ? 2 : 1;
         const top = (p.findings || [])[0];
         html += `<tr><td class="mem-dump-name">${escapeHtml(p.process || '?')}</td><td>${escapeHtml(String(p.pid))}</td>`
-            + `<td><span class="mem-chip ${cls}">${escapeHtml(p.label)}</span></td>`
+            + `<td data-sort-value="${rank}"><span class="mem-chip ${cls}">${escapeHtml(p.label)}</span></td>`
             + `<td>${p.score}</td><td>${p.suppressed}</td>`
             + `<td class="mem-dump-name">${top ? escapeHtml(top.label) : ''}</td>`
             + `<td class="mem-dump-actions"><button class="btn btn-sm" `
             + `onclick="document.getElementById('livemem-pid').value=${jsInt(p.pid)};livememAether()">Rescan</button></td></tr>`;
     });
-    return html + `</table>`;
+    return html + `</tbody></table>`;
 }
 
 async function pdBaselineBuild() {
@@ -9632,7 +10855,7 @@ async function refreshPipeEvents() {
         box.innerHTML = `<div class="pipes-empty">No named pipe events${name || pid ? ' match the filter' : ''} in the last ${minutes >= 60 ? minutes / 60 + ' h' : minutes + ' min'}.</div>`;
         return;
     }
-    let html = `<table class="pipes-table"><thead><tr>
+    let html = `<table class="pipes-table" data-sortable data-sort-id="pipe-events"><thead><tr>
         <th>Time</th><th>Event</th><th>PID</th><th>Process</th><th>Pipe</th><th>Family</th><th></th>
         </tr></thead><tbody>`;
     events.forEach(ev => {
@@ -9640,7 +10863,7 @@ async function refreshPipeEvents() {
         const image = String(ev.image || '');
         const short = image.split('\\').pop() || image;
         html += `<tr class="${ev.family ? 'pipes-row-hit' : ''}">
-            <td class="muted">${escapeHtml(formatTime(ev.timestamp))}</td>
+            <td class="muted" data-sort-value="${sortTimeValue(ev.timestamp)}">${escapeHtml(formatTime(ev.timestamp))}</td>
             <td><span class="pipe-action pipe-action-${created ? 'created' : 'connected'}">${created ? 'created' : 'connected'}</span></td>
             <td><a class="pipes-link" onclick="pipesFilterPid(${jsInt(ev.pid)})" title="Filter by this PID">${escapeHtml(String(ev.pid ?? ''))}</a></td>
             <td class="pipes-proc" title="${escapeHtml(image)}">${escapeHtml(short)}</td>
@@ -10064,7 +11287,8 @@ function renderNamedPipesBlock(np) {
     if (!pipes.length) return html + '<div class="det-sub-value muted">The sample created or connected to no named pipes.</div>';
     const findings = Array.isArray(np.evidence_findings) ? np.evidence_findings.length : 0;
     html += `<div class="det-sub-value">${pipes.length} pipe(s)${findings ? ` · ${findings} finding(s) scored in the memory evidence` : ''}</div>`;
-    html += `<table class="pipes-table pipes-result-table"><thead><tr>
+    // A pipe's rows (one per process) are one group: sorting moves them together
+    html += `<table class="pipes-table pipes-result-table" data-sortable data-sort-id="named-pipes"><thead><tr>
         <th>Time</th><th>Process</th><th>Action</th><th>Pipe</th><th>Family</th><th>Flags</th><th></th>
         </tr></thead><tbody>`;
     pipes.forEach(p => {
@@ -10080,7 +11304,7 @@ function renderNamedPipesBlock(np) {
             `<span class="pipe-flag pipe-flag-${cssToken(f)}">${escapeHtml(PIPE_FLAG_LABELS[f] || f)}</span>`).join('');
         rows.forEach(([action, key], i) => {
             html += `<tr class="${i === 0 ? 'pipes-group-start' : ''} ${p.family ? 'pipes-row-hit' : ''}">`;
-            if (i === 0) html += `<td rowspan="${span}" class="muted">${escapeHtml(formatTime(p.first_seen))}</td>`;
+            if (i === 0) html += `<td rowspan="${span}" class="muted" data-sort-value="${sortTimeValue(p.first_seen)}">${escapeHtml(formatTime(p.first_seen))}</td>`;
             html += `<td>${escapeHtml(pipeProcLabel(key))}</td>`;
             html += `<td>${action ? `<span class="pipe-action pipe-action-${cssToken(action)}">${escapeHtml(action)}</span>` : ''}</td>`;
             if (i === 0) {

@@ -44,6 +44,7 @@ FILES = {
     "webui/pipe_proxy.py": r"C:\DetonationChamberUI\pipe_proxy.py",
     "webui/static/js/app.js": r"C:\DetonationChamberUI\static\js\app.js",
     "webui/static/css/style.css": r"C:\DetonationChamberUI\static\css\style.css",
+    "webui/static/css/theme-cyberpunk.css": r"C:\DetonationChamberUI\static\css\theme-cyberpunk.css",
     "webui/templates/index.html": r"C:\DetonationChamberUI\templates\index.html",
     "webui/static/icon.png": r"C:\DetonationChamberUI\static\icon.png",
 }

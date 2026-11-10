@@ -301,6 +301,7 @@ deploy:
 		echo "[deploy] Uploading webui files to Vagrant VM..."; \
 		vagrant upload webui/templates/index.html C:\\DetonationChamberUI\\templates\\index.html; \
 		vagrant upload webui/static/css/style.css C:\\DetonationChamberUI\\static\\css\\style.css; \
+		vagrant upload webui/static/css/theme-cyberpunk.css C:\\DetonationChamberUI\\static\\css\\theme-cyberpunk.css; \
 		vagrant upload webui/static/js/app.js C:\\DetonationChamberUI\\static\\js\\app.js; \
 		vagrant upload webui/app.py C:\\DetonationChamberUI\\app.py; \
 		vagrant upload webui/memory_evidence.py C:\\DetonationChamberUI\\memory_evidence.py; \

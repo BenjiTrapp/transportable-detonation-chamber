@@ -326,6 +326,7 @@ switch ($Target) {
             Copy-Item 'webui\pipe_proxy.py' -Destination 'C:\DetonationChamberUI\pipe_proxy.py' -ToSession $s -Force
             Copy-Item 'webui\templates\index.html' -Destination 'C:\DetonationChamberUI\templates\index.html' -ToSession $s -Force
             Copy-Item 'webui\static\css\style.css' -Destination 'C:\DetonationChamberUI\static\css\style.css' -ToSession $s -Force
+            Copy-Item 'webui\static\css\theme-cyberpunk.css' -Destination 'C:\DetonationChamberUI\static\css\theme-cyberpunk.css' -ToSession $s -Force
             Copy-Item 'webui\static\js\app.js' -Destination 'C:\DetonationChamberUI\static\js\app.js' -ToSession $s -Force
             Copy-Item 'webui\static\icon.png' -Destination 'C:\DetonationChamberUI\static\icon.png' -ToSession $s -Force -ErrorAction SilentlyContinue
             Write-Host "[deploy] Files synced successfully." -ForegroundColor Green

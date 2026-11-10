@@ -53,7 +53,8 @@ def test_readme_images_exist_and_none_are_orphaned():
 
 def test_readme_tabs_match_the_ui():
     ui_tabs = re.findall(r'data-tab="[^"]+">([^<]+)</button>', HELP)
-    section = README[README.index("### Web UI Tabs"):README.index("### ETW Browser")]
+    start = README.index("### Web UI Tabs")
+    section = README[start:README.index("\n### ", start)]
     readme_tabs = re.findall(r"^\| \*\*([^*]+)\*\* \|", section, re.M)
     assert ui_tabs == readme_tabs
 
@@ -64,9 +65,13 @@ def test_help_tab_guide_covers_every_tab():
     assert re.findall(r"<h4>([^<]+)</h4>", guide) == ui_tabs
 
 
+WEB_UI_ASSETS = ["static/js/app.js", "static/css/style.css", "static/css/theme-cyberpunk.css"]
+
+
 def test_every_deploy_path_uploads_the_web_ui_modules():
     """deploy-utm.py, the Makefile (Vagrant) and make.ps1 (Hyper-V) must ship
-    the same backend files: a missing module is an ImportError on the VM."""
+    the same files: a missing module is an ImportError on the VM, a missing
+    script or style sheet a page without its behaviour or its theme."""
     utm = open(os.path.join(ROOT, "scripts", "deploy-utm.py"), encoding="utf-8").read()
     modules = set(re.findall(r'"webui/([\w.]+\.(?:py|json))"', utm))
     assert {"app.py", "pipe_proxy.py", "pipe_backends.py", "pipe_signatures.json"} <= modules
@@ -74,9 +79,11 @@ def test_every_deploy_path_uploads_the_web_ui_modules():
     ps1 = open(os.path.join(ROOT, "make.ps1"), encoding="utf-8").read()
     vagrant = make[make.index("\ndeploy:"):make.index("\n.PHONY: deploy-app")]
     hyperv = ps1[ps1.index("'deploy' {"):ps1.index("'deploy-app' {")]
-    for name in sorted(modules):
-        assert f"webui/{name} C:\\\\DetonationChamberUI\\\\{name}" in vagrant, name
-        assert f"'webui\\{name}' -Destination 'C:\\DetonationChamberUI\\{name}'" in hyperv, name
+    for name in sorted(modules) + WEB_UI_ASSETS:
+        win = name.replace("/", "\\")
+        assert f'"webui/{name}": r"C:\\DetonationChamberUI\\{win}"' in utm, name
+        assert f"webui/{name} C:\\\\DetonationChamberUI\\\\" + win.replace("\\", "\\\\") in vagrant, name
+        assert f"'webui\\{win}' -Destination 'C:\\DetonationChamberUI\\{win}'" in hyperv, name
 
 
 def test_help_lists_every_pipe_interception_route():

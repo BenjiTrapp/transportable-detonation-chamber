@@ -8,7 +8,19 @@
     <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
     <link rel="icon" type="image/png" sizes="192x192" href="/static/favicon-192.png">
     <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
-    <link rel="stylesheet" href="/static/css/style.css?v=29">
+    <!-- The stored theme is applied before the styles and the first paint, so a
+         page loaded in Cyberpunk never shows Classic first (setTheme in app.js) -->
+    <script>
+        // Cyberpunk is the default; only a stored "classic" keeps Classic.
+        try {
+            document.documentElement.dataset.theme =
+                localStorage.getItem('tdc-theme') === 'classic' ? 'classic' : 'cyberpunk';
+        } catch (e) {
+            document.documentElement.dataset.theme = 'cyberpunk';
+        }
+    </script>
+    <link rel="stylesheet" href="/static/css/style.css?v=41">
+    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=13">
 </head>
 <body>
     <!-- Global loading overlay (shown on slow fetches) -->
@@ -19,16 +31,49 @@
         </div>
     </div>
     <div id="app">
+        <!-- Top bar of the Cyberpunk theme (hidden in Classic). The tab bar and
+             the service status move in here when Cyberpunk is on (applyThemeLayout);
+             the sidebar becomes a drawer that ☰ PROCESSES slides in. Tabs that do
+             not fit go into the "…" menu (updateTabOverflow). -->
+        <header id="topbar">
+            <button id="drawer-toggle" aria-controls="sidebar" aria-expanded="false" onclick="toggleDrawer()">☰ PROCESSES <span class="badge" id="drawer-count">0</span></button>
+            <div class="topbar-brand">
+                <img src="/static/icon.png" alt="TDC Logo" class="topbar-logo">
+                <span class="topbar-title">DETONATION CHAMBER</span>
+            </div>
+            <div id="topbar-nav">
+                <div class="topbar-more-wrap" id="topbar-more-wrap" hidden>
+                    <button id="topbar-more-toggle" aria-controls="topbar-more" aria-expanded="false" onclick="toggleTopbarMenu('topbar-more-toggle')" title="More tabs" aria-label="More tabs">…</button>
+                    <div id="topbar-more"></div>
+                </div>
+            </div>
+            <div class="topbar-services-wrap">
+                <button id="topbar-services" aria-controls="topbar-services-panel" aria-expanded="false" onclick="toggleTopbarMenu('topbar-services')">SERVICES</button>
+                <div id="topbar-services-panel"></div>
+            </div>
+            <span id="topbar-time" title="Last status update"></span>
+            <button class="btn-help" onclick="openHelp()" title="Help &amp; Documentation">? Help</button>
+            <button class="btn-theme" id="theme-toggle-top" onclick="toggleTheme()" title="Switch to Classic theme" aria-label="Switch to Classic theme">✶</button>
+        </header>
+
+        <!-- Darkens the content while the Cyberpunk drawer is open; a click on it
+             closes the drawer like any click beside it (onTopbarOutsideClick) -->
+        <div id="drawer-scrim" aria-hidden="true"></div>
+
         <!-- Left Sidebar -->
         <aside id="sidebar">
             <div class="sidebar-header">
                 <div class="logo-container">
                     <img src="/static/icon.png" alt="TDC Logo" class="logo-img">
                     <h1 class="logo">DETONATION<br><span class="logo-sub">CHAMBER</span></h1>
-                    <button class="btn-help" onclick="openHelp()" title="Help &amp; Documentation">? Help</button>
+                    <div class="header-buttons">
+                        <button class="btn-help" onclick="openHelp()" title="Help &amp; Documentation">? Help</button>
+                        <button class="btn-theme" id="theme-toggle" onclick="toggleTheme()" title="Switch to Cyberpunk theme" aria-label="Switch to Cyberpunk theme">✶</button>
+                    </div>
                 </div>
                 <nav class="sidebar-tabs">
                     <button class="tab active" data-tab="dashboard">Dashboard</button>
+                    <button class="tab" data-tab="alerts">Alerts</button>
                     <button class="tab" data-tab="tracing">Tracing</button>
                     <button class="tab" data-tab="graph">Graph</button>
                     <button class="tab" data-tab="pipes">Pipes</button>
@@ -45,18 +90,21 @@
             <!-- Process List -->
             <div class="sidebar-section" id="process-list-section">
                 <div class="section-header">
-                    <span class="section-title">PROCESSES</span>
+                    <span class="section-title" data-info="Processes seen in the telemetry, one entry per process instance, since Windows reuses PIDs. Click a process for its details, alerts and children.">PROCESSES</span>
                     <span class="badge" id="process-count">0</span>
                 </div>
                 <div id="process-list" class="process-list"></div>
             </div>
 
-            <!-- Timeline -->
+            <!-- Timeline: the bars (CHART) or the same alerts as a table (TABLE),
+                 both from renderTimeline() in app.js -->
             <div class="sidebar-section" id="timeline-section">
                 <div class="section-header">
-                    <span class="section-title">TIMELINE</span>
+                    <span class="section-title" data-info="The 60 newest alerts as bars coloured by severity. Hover a bar for its rule, or switch to TABLE for their times, severities and rules.">TIMELINE</span>
+                    <span class="view-toggle-slot" id="timeline-view-toggle"></span>
                 </div>
-                <div id="timeline" class="timeline"></div>
+                <div id="timeline" class="timeline" data-view-of="timeline" data-view="chart"></div>
+                <div class="view-table-wrap" id="timeline-table" data-view-of="timeline" data-view="table" hidden></div>
             </div>
 
             <!-- Compact status row -->
@@ -74,7 +122,7 @@
             <!-- Dashboard Tab -->
             <div class="tab-content active" id="tab-dashboard">
                 <div class="content-header">
-                    <h2>Service Dashboard</h2>
+                    <h2 data-info="Health of every service in the chamber, the loaded detection rules and the newest alerts. Click a tile to open what it counts, a service card for its details, or Launch to start a service that is offline.">Service Dashboard</h2>
                     <div class="header-actions">
                         <span class="header-meta" id="dashboard-time"></span>
                         <button class="btn btn-sm" onclick="refreshDashboard()">Refresh</button>
@@ -92,7 +140,7 @@
                     <!-- Recent Activity -->
                     <div class="dashboard-activity">
                         <div class="activity-header">
-                            <h3>Recent Activity</h3>
+                            <h3 data-info="The eight newest alerts of all engines with severity, rule and process. View All opens the Tracing console.">Recent Activity</h3>
                             <button class="btn btn-sm" onclick="switchTab('tracing')">View All</button>
                         </div>
                         <div class="activity-feed" id="dashboard-activity-feed">
@@ -102,12 +150,45 @@
                 </div>
             </div>
 
+            <!-- Alerts Tab: every alert, newest first; filters, rows and the count
+                 come from renderAlertsTab() in app.js -->
+            <div class="tab-content" id="tab-alerts">
+                <div class="content-header">
+                    <h2 data-info="Every alert of Rustinel, Fibratus and LitterBox in one table, newest first, filtered by severity, engine and text. Click a column head to sort, a row for the alert details and a process name for its process (only processes in the process list are links).">Alerts</h2>
+                    <span class="content-subtitle">Every detection of Rustinel, Fibratus and LitterBox, newest first</span>
+                </div>
+                <div class="alerts-filters">
+                    <div class="alerts-sev-filter" role="group" aria-label="Severity">
+                        <button type="button" class="alerts-sev-chip critical" data-severity="critical" aria-pressed="false" onclick="toggleAlertsSeverity('critical')"><span class="alerts-sev-dot"></span>critical</button>
+                        <button type="button" class="alerts-sev-chip high" data-severity="high" aria-pressed="false" onclick="toggleAlertsSeverity('high')"><span class="alerts-sev-dot"></span>high</button>
+                        <button type="button" class="alerts-sev-chip medium" data-severity="medium" aria-pressed="false" onclick="toggleAlertsSeverity('medium')"><span class="alerts-sev-dot"></span>medium</button>
+                        <button type="button" class="alerts-sev-chip low" data-severity="low" aria-pressed="false" onclick="toggleAlertsSeverity('low')"><span class="alerts-sev-dot"></span>low</button>
+                        <button type="button" class="alerts-sev-chip info" data-severity="info" aria-pressed="false" onclick="toggleAlertsSeverity('info')"><span class="alerts-sev-dot"></span>info</button>
+                    </div>
+                    <select id="alerts-filter-engine" class="filter-select" title="Engine" aria-label="Engine" onchange="renderAlertsTab()">
+                        <option value="">All engines</option>
+                    </select>
+                    <input type="text" id="alerts-filter-text" class="filter-input alerts-filter-text" placeholder="Search rule, process, description..." aria-label="Search rule, process, description" autocomplete="off" spellcheck="false" oninput="scheduleAlertsRender()">
+                    <span class="alerts-count" id="alerts-count"></span>
+                </div>
+                <div class="alerts-table-wrap" id="alerts-table-wrap">
+                    <table class="alerts-table" id="alerts-table" data-sortable data-sort-id="alerts">
+                        <colgroup>
+                            <col class="alerts-col-time"><col class="alerts-col-sev"><col class="alerts-col-engine">
+                            <col class="alerts-col-rule"><col class="alerts-col-proc"><col class="alerts-col-desc">
+                        </colgroup>
+                        <thead><tr><th>Time</th><th>Severity</th><th>Engine</th><th>Rule</th><th>Process</th><th>Description</th></tr></thead>
+                        <tbody id="alerts-rows"></tbody>
+                    </table>
+                </div>
+            </div>
+
             <!-- Tracing Tab - RUSTINEL TRACE Analysis Console -->
             <div class="tab-content" id="tab-tracing">
                 <!-- Console Header Bar -->
                 <div class="rtrace-header">
                     <div class="rtrace-title">
-                        <span class="rtrace-brand"><span class="rtrace-brand-highlight">RUSTINEL TRACE</span> Analysis Console</span>
+                        <span class="rtrace-brand" data-info="Per-process console for the alerts: pick a process for its verdict, its timeline by event type, its process tree and its alert table. Click an alert for its full raw event and the Sigma match details."><span class="rtrace-brand-highlight">RUSTINEL TRACE</span> Analysis Console</span>
                     </div>
                     <div class="rtrace-header-actions">
                         <input type="text" id="rtrace-search" class="filter-input" placeholder="Search process, file, path..." title="Filter by process name, image path, or file activity" oninput="filterRtraceTree()">
@@ -132,10 +213,12 @@
                     <span class="rtrace-path" id="rtrace-path">--</span>
                 </div>
 
-                <!-- Severity Summary Bar -->
+                <!-- Severity Summary Bar: the counts as pills (CHART) or as a table
+                     (TABLE), both from updateRtraceSeverityBar() in app.js -->
                 <div class="rtrace-severity-bar" id="rtrace-severity-bar">
                     <div class="rtrace-sev-section">
-                        <div class="rtrace-sev-counts" id="rtrace-sev-counts"></div>
+                        <div class="rtrace-sev-counts" id="rtrace-sev-counts" data-view-of="rtrace-severity" data-view="chart"></div>
+                        <div class="view-table-wrap rtrace-sev-table" id="rtrace-sev-table" data-view-of="rtrace-severity" data-view="table" hidden></div>
                     </div>
                     <div class="rtrace-sev-section">
                         <div class="rtrace-engines" id="rtrace-engines"></div>
@@ -143,25 +226,31 @@
                     <div class="rtrace-sev-section">
                         <div class="rtrace-top-rules" id="rtrace-top-rules"></div>
                     </div>
+                    <span class="view-toggle-slot rtrace-sev-toggle" id="rtrace-sev-view-toggle"></span>
                 </div>
 
-                <!-- Timeline -->
+                <!-- Timeline: lanes by event type (CHART) or the alerts per type
+                     (TABLE), both from renderRtraceTimeline() in app.js -->
                 <div class="rtrace-timeline-section">
                     <div class="rtrace-timeline-label">
-                        <span>TIMELINE</span>
-                        <span class="rtrace-timeline-time-range" id="rtrace-timeline-range"></span>
+                        <span data-info="All alerts over time in lanes by event type; high and critical alerts go to the CRIT lane. Hover a mark for its time and the number of events, or switch to TABLE for the alerts per type.">TIMELINE</span>
+                        <span class="rtrace-timeline-tools">
+                            <span class="rtrace-timeline-time-range" id="rtrace-timeline-range"></span>
+                            <span class="view-toggle-slot" id="rtrace-timeline-view-toggle"></span>
+                        </span>
                     </div>
-                    <div class="rtrace-timeline-bar" id="rtrace-timeline-bar">
+                    <div class="rtrace-timeline-bar" id="rtrace-timeline-bar" data-view-of="rtrace-timeline" data-view="chart">
                         <div class="rtrace-timeline-cursor" id="rtrace-timeline-cursor"></div>
                     </div>
-                    <div class="rtrace-timeline-legend">
-                        <span class="rtrace-legend-item"><span class="rtrace-legend-dot" style="background:#ef4444"></span>Critical/High</span>
-                        <span class="rtrace-legend-item"><span class="rtrace-legend-dot" style="background:#3b82f6"></span>Process</span>
-                        <span class="rtrace-legend-item"><span class="rtrace-legend-dot" style="background:#22c55e"></span>Network</span>
-                        <span class="rtrace-legend-item"><span class="rtrace-legend-dot" style="background:#a78bfa"></span>DNS</span>
-                        <span class="rtrace-legend-item"><span class="rtrace-legend-dot" style="background:#f97316"></span>File</span>
-                        <span class="rtrace-legend-item"><span class="rtrace-legend-dot" style="background:#f472b6"></span>Registry</span>
+                    <div class="rtrace-timeline-legend" data-view-of="rtrace-timeline" data-view="chart">
+                        <span class="rtrace-legend-item"><span class="rtrace-legend-dot" style="background:var(--severity-critical)"></span>Critical/High</span>
+                        <span class="rtrace-legend-item"><span class="rtrace-legend-dot" style="background:var(--graph-process)"></span>Process</span>
+                        <span class="rtrace-legend-item"><span class="rtrace-legend-dot" style="background:var(--graph-network)"></span>Network</span>
+                        <span class="rtrace-legend-item"><span class="rtrace-legend-dot" style="background:var(--graph-dns)"></span>DNS</span>
+                        <span class="rtrace-legend-item"><span class="rtrace-legend-dot" style="background:var(--graph-file)"></span>File</span>
+                        <span class="rtrace-legend-item"><span class="rtrace-legend-dot" style="background:var(--graph-registry)"></span>Registry</span>
                     </div>
+                    <div class="view-table-wrap rtrace-timeline-table" id="rtrace-timeline-table" data-view-of="rtrace-timeline" data-view="table" hidden></div>
                 </div>
 
                 <!-- Split View: Process Tree + Detail -->
@@ -169,7 +258,7 @@
                     <!-- Left: Process Tree -->
                     <div class="rtrace-tree-panel">
                         <div class="rtrace-tree-header">
-                            <span>PROCESS TREE (<span id="rtrace-tree-count">0</span>) &mdash; TIME FROM START</span>
+                            <span data-info="Every tracked process with its first appearance relative to the earliest alert, its PID and its alert count. Select one for its events on the right.">PROCESS TREE (<span id="rtrace-tree-count">0</span>) &mdash; TIME FROM START</span>
                         </div>
                         <div class="rtrace-tree-list" id="rtrace-tree-list">
                             <!-- Rendered by JS -->
@@ -194,7 +283,8 @@
                                 <button class="rtrace-tab" data-rtab="artifacts">Artifacts <span class="rtrace-tab-count">0</span></button>
                                 <button class="rtrace-tab" data-rtab="modules">Modules <span class="rtrace-tab-count">0</span></button>
                             </div>
-                            <!-- Event Table -->
+                            <!-- Event Table: a grid of <div>s whose heads sort the rows
+                                 (initRtraceEventSort in app.js) -->
                             <div class="rtrace-event-table-wrapper" id="rtrace-event-table-wrapper">
                                 <!-- Column headers -->
                                 <div class="rtrace-event-table-header">
@@ -219,7 +309,7 @@
             <div class="tab-content" id="tab-graph">
                 <div class="graph-toolbar">
                     <div class="graph-toolbar-left">
-                        <span class="graph-title">PROCESS GRAPH</span>
+                        <span class="graph-title" data-info="The process tree around one process with its network, DNS, file, registry and pipe activity. Pick a sample or a process on the landing page or type a PID, then click a node for its details.">PROCESS GRAPH</span>
                         <span class="graph-subtitle" id="graph-node-count">Select a process to investigate</span>
                     </div>
                     <div class="graph-toolbar-right">
@@ -265,14 +355,14 @@
                     </div>
                     <div class="graph-tooltip" id="graph-tooltip"></div>
                     <div class="graph-legend">
-                        <span class="graph-legend-item"><span class="graph-legend-dot" style="background:#3b82f6"></span>Process</span>
-                        <span class="graph-legend-item"><span class="graph-legend-dot" style="background:#ef4444"></span>Malicious</span>
-                        <span class="graph-legend-item"><span class="graph-legend-dot detonated-dot" style="background:#fbbf24"></span>Detonated</span>
-                        <span class="graph-legend-item"><span class="graph-legend-dot" style="background:#22c55e"></span>Network</span>
-                        <span class="graph-legend-item"><span class="graph-legend-dot" style="background:#a78bfa"></span>DNS</span>
-                        <span class="graph-legend-item"><span class="graph-legend-dot" style="background:#f97316"></span>File</span>
-                        <span class="graph-legend-item"><span class="graph-legend-dot" style="background:#f472b6"></span>Registry</span>
-                        <span class="graph-legend-item"><span class="graph-legend-dot graph-legend-diamond" style="background:#38bdf8"></span>Pipe</span>
+                        <span class="graph-legend-item"><span class="graph-legend-dot" style="background:var(--graph-process)"></span>Process</span>
+                        <span class="graph-legend-item"><span class="graph-legend-dot" style="background:var(--severity-critical)"></span>Malicious</span>
+                        <span class="graph-legend-item"><span class="graph-legend-dot detonated-dot" style="background:var(--graph-detonated)"></span>Detonated</span>
+                        <span class="graph-legend-item"><span class="graph-legend-dot" style="background:var(--graph-network)"></span>Network</span>
+                        <span class="graph-legend-item"><span class="graph-legend-dot" style="background:var(--graph-dns)"></span>DNS</span>
+                        <span class="graph-legend-item"><span class="graph-legend-dot" style="background:var(--graph-file)"></span>File</span>
+                        <span class="graph-legend-item"><span class="graph-legend-dot" style="background:var(--graph-registry)"></span>Registry</span>
+                        <span class="graph-legend-item"><span class="graph-legend-dot graph-legend-diamond" style="background:var(--graph-pipe)"></span>Pipe</span>
                         <span class="graph-legend-item line"><span class="graph-legend-line spawn"></span>Spawned</span>
                         <span class="graph-legend-item line"><span class="graph-legend-line network"></span>Connection</span>
                         <span class="graph-legend-item line"><span class="graph-legend-line inject"></span>Injection</span>
@@ -287,13 +377,13 @@
             <!-- Pipes Tab -->
             <div class="tab-content" id="tab-pipes">
                 <div class="content-header">
-                    <h2>Named Pipes</h2>
+                    <h2 data-info="Sysmon pipe events (EID 17 created, EID 18 connected) and interception sessions. Beacons talk to their child processes and to each other over named pipes.">Named Pipes</h2>
                     <span class="content-subtitle">Sysmon pipe events (EID 17/18) and pipe interception</span>
                 </div>
                 <div class="pipes-body">
                     <section class="pipes-panel pipes-events-panel">
                         <div class="pipes-panel-head">
-                            <span class="pipes-panel-title">PIPE EVENTS</span>
+                            <span class="pipes-panel-title" data-info="Sysmon pipe events of the chosen time window, newest first, filtered by pipe name or PID. A family marks a name from the C2 pipe catalog, and Intercept prefills an attach session for the pipe.">PIPE EVENTS</span>
                             <span class="pipes-hit-summary" id="pipes-hit-summary"></span>
                             <div class="pipes-panel-actions">
                                 <input type="text" id="pipes-filter-name" class="etw-filter pipes-filter-name" placeholder="Pipe name (\prefix anchors at the start)" autocomplete="off" spellcheck="false">
@@ -312,7 +402,7 @@
                     </section>
                     <section class="pipes-panel pipes-intercept-panel">
                         <div class="pipes-panel-head">
-                            <span class="pipes-panel-title">INTERCEPTION</span>
+                            <span class="pipes-panel-title" data-info="Attach to an existing pipe or arm for one that does not exist yet, then observe the messages or hold each one to forward, edit or drop it. The pipe name must be known in advance.">INTERCEPTION</span>
                             <div class="pipes-panel-actions">
                                 <button class="btn btn-sm" onclick="refreshPipeSessions()">Refresh</button>
                             </div>
@@ -363,7 +453,7 @@
             <!-- Sysmon Tab -->
             <div class="tab-content" id="tab-sysmon">
                 <div class="content-header">
-                    <h2>Sysmon Events</h2>
+                    <h2 data-info="Sysmon events from the event log with search, type, EID and PID filters. The Windows EID column lists the Windows events that record the same activity, and Correlate shows the whole mapping.">Sysmon Events</h2>
                     <div class="header-actions">
                         <input type="text" id="sysmon-search" class="filter-input filter-input-wide" placeholder="Search process, file, IP, domain..." oninput="filterSysmonLocal()">
                         <select id="sysmon-filter-type" class="filter-select" onchange="refreshSysmon()">
@@ -399,7 +489,7 @@
             <!-- ThreatScan Tab (unified static analysis: ThreatCheck / DefenderCheck / EMBER2024 / capa) -->
             <div class="tab-content" id="tab-threatscan">
                 <div class="content-header">
-                    <h2>ThreatScan</h2>
+                    <h2 data-info="Static analysis of one file without running it: ThreatCheck and DefenderCheck find the bytes that Defender or AMSI flag, EMBER2024 scores the file with a machine-learning model and capa lists its capabilities.">ThreatScan</h2>
                     <div class="header-actions">
                         <span class="scanner-status" id="threatscan-status"></span>
                     </div>
@@ -485,7 +575,7 @@
                          telemetry-driven process list in the sidebar) -->
                     <div class="scanner-livemem">
                         <div class="scanner-history-header">
-                            <h3>Live Process Memory</h3>
+                            <h3 data-info="Scans or dumps a running process by PID: Aether reports injection and implant structures, Process Dump writes memory components to disk for the file map and the static analyzers. Capture the host baseline on a clean box only.">Live Process Memory</h3>
                             <span class="scanner-status" id="livemem-status"></span>
                         </div>
                         <div class="scanner-options">
@@ -545,7 +635,7 @@
                     <!-- Shared Scan History -->
                     <div class="scanner-history">
                         <div class="scanner-history-header">
-                            <h3>Scan History</h3>
+                            <h3 data-info="The newest 100 scans of every tool, most recent first. Click an entry for its full result.">Scan History</h3>
                             <button class="btn btn-sm" onclick="clearScanHistory()">Clear</button>
                         </div>
                         <div class="scanner-history-list" id="threatscan-history-list"></div>
@@ -556,7 +646,7 @@
             <!-- Hex Editor Tab -->
             <div class="tab-content" id="tab-hexeditor">
                 <div class="content-header">
-                    <h2>Hex Editor</h2>
+                    <h2 data-info="Hex and ASCII view of a file on the VM, a page at a time, with a data inspector for the selected byte. PE Analysis and ELF Analysis parse the headers, sections and imports of the loaded file.">Hex Editor</h2>
                     <div class="header-actions">
                         <button class="btn btn-sm btn-accent" id="pe-analyze-btn" onclick="peAnalyze()" title="Parse PE header">PE Analysis</button>
                         <button class="btn btn-sm btn-accent" id="elf-analyze-btn" onclick="elfAnalyze()" title="Parse ELF header">ELF Analysis</button>
@@ -587,7 +677,7 @@
                     <!-- Structure Minimap -->
                     <div class="hex-minimap-wrap">
                         <div class="hex-minimap-head">
-                            <span class="hex-minimap-title">STRUCTURE MAP</span>
+                            <span class="hex-minimap-title" data-info="The whole loaded file as strips of byte classes, entropy and structure; the frame marks the page shown below. Click a strip to jump to that offset.">STRUCTURE MAP</span>
                             <span class="hex-minimap-info" id="hex-minimap-info"></span>
                         </div>
                         <div class="hex-minimap" id="hex-minimap"></div>
@@ -616,7 +706,7 @@
                     </div>
                     <!-- Hex Inspector -->
                     <div class="hex-inspector" id="hex-inspector">
-                        <div class="hex-inspector-title">DATA INSPECTOR</div>
+                        <div class="hex-inspector-title" data-info="The selected byte and the bytes after it read as signed and unsigned integers, as floats and as text, little-endian.">DATA INSPECTOR</div>
                         <div class="hex-inspector-fields" id="hex-inspector-fields">
                             <div class="hex-insp-row"><span class="hex-insp-label">Int8</span><span class="hex-insp-value" id="hex-insp-int8">--</span></div>
                             <div class="hex-insp-row"><span class="hex-insp-label">UInt8</span><span class="hex-insp-value" id="hex-insp-uint8">--</span></div>
@@ -634,7 +724,7 @@
                 <!-- PE Analysis Panel -->
                 <div class="pe-panel" id="pe-panel" style="display:none;">
                     <div class="pe-panel-header">
-                        <h3>PE Header Analysis</h3>
+                        <h3 data-info="Headers, sections, imports, exports and IOC flags of the PE file in the hex editor, with packer and compiler detection. Click an IOC flag for its evidence.">PE Header Analysis</h3>
                         <button class="btn btn-sm btn-close" onclick="document.getElementById('pe-panel').style.display='none'">&#x2715;</button>
                     </div>
                     <div class="pe-panel-body" id="pe-panel-body">
@@ -644,7 +734,7 @@
                 <!-- ELF Analysis Panel -->
                 <div class="elf-panel" id="elf-panel" style="display:none;">
                     <div class="elf-panel-header">
-                        <h3>ELF Binary Analysis</h3>
+                        <h3 data-info="Headers, segments, sections, symbols and security features of the ELF file in the hex editor, with packer detection and IOC flags.">ELF Binary Analysis</h3>
                         <button class="btn btn-sm btn-close" onclick="document.getElementById('elf-panel').style.display='none'">&#x2715;</button>
                     </div>
                     <div class="elf-panel-body" id="elf-panel-body">
@@ -656,7 +746,7 @@
             <!-- FileMap Tab -->
             <div class="tab-content" id="tab-filemap">
                 <div class="content-header">
-                    <h2>File Map</h2>
+                    <h2 data-info="Byteplot, entropy and structure planes of a PE or ELF file side by side, with its import and export trees. Click a plane to open that offset in the hex editor.">File Map</h2>
                     <span class="content-subtitle">Byteplot, entropy and PE/ELF structure planes</span>
                     <div class="header-actions">
                         <label class="filemap-ctl">cols
@@ -699,7 +789,7 @@
             <!-- ETW Browser Tab -->
             <div class="tab-content" id="tab-etw">
                 <div class="content-header">
-                    <h2>ETW Browser</h2>
+                    <h2 data-info="Live viewer for 12 Windows Event Log channels; events that match the threat rules are highlighted. Click an event to see all of its fields.">ETW Browser</h2>
                     <span class="content-subtitle">Windows Event Tracing — live event stream viewer</span>
                 </div>
                 <div class="etw-controls">
@@ -723,7 +813,7 @@
             <!-- LitterBox Tab -->
             <div class="tab-content" id="tab-litterbox">
                 <div class="content-header">
-                    <h2>LitterBox</h2>
+                    <h2 data-info="Files uploaded to the LitterBox sandbox with their static, dynamic and EDR results. Upload a file here, start an analysis from its row or open its details.">LitterBox</h2>
                     <div class="header-actions">
                         <input type="text" id="lb-search" class="filter-input filter-input-wide" placeholder="Search filename, hash..." oninput="filterLitterboxFiles()">
                         <button class="btn btn-sm" onclick="refreshLitterbox()">Refresh</button>
@@ -750,7 +840,7 @@
             <!-- Submit Tab -->
             <div class="tab-content" id="tab-submit">
                 <div class="content-header">
-                    <h2>Submit Sample</h2>
+                    <h2 data-info="Detonate a sample through DetonatorAgent, LitterBox or both and follow its stages. The verdict combines EDR alerts, live memory, the exit-time dump, network beaconing and LitterBox.">Submit Sample</h2>
                 </div>
                 <div class="submit-form">
                     <div class="upload-zone" id="upload-zone">
@@ -781,7 +871,7 @@
                 <!-- Submissions History -->
                 <div class="submissions-history">
                     <div class="submissions-header">
-                        <h3>Submission History</h3>
+                        <h3 data-info="Every sample submitted so far. Results opens its combined detonation results, and Hex opens the file in the hex editor.">Submission History</h3>
                         <button class="btn btn-sm" onclick="refreshSubmissions()">Refresh</button>
                     </div>
                     <div class="submissions-list" id="submissions-list">
@@ -838,22 +928,22 @@
                     <h4>Key Capabilities</h4>
                     <div class="help-grid">
                         <div class="help-card">
-                            <div class="help-card-icon" style="color:#22d3ee">&#x1F50D;</div>
+                            <div class="help-card-icon" style="color:var(--accent-cyan)">&#x1F50D;</div>
                             <div class="help-card-title">Real-time Detection</div>
                             <div class="help-card-desc">Sigma, YARA and IOC matching via Rustinel; kernel ETW behavior rules via Fibratus; Sysmon events</div>
                         </div>
                         <div class="help-card">
-                            <div class="help-card-icon" style="color:#f472b6">&#x1F9E0;</div>
+                            <div class="help-card-icon" style="color:var(--accent-pink)">&#x1F9E0;</div>
                             <div class="help-card-title">Live Memory</div>
                             <div class="help-card-desc">Aether, Process Dump, Hunt-Sleeping-Beacons, BeaconEye and an exit-time dump, scored by one evidence model with a host baseline</div>
                         </div>
                         <div class="help-card">
-                            <div class="help-card-icon" style="color:#fbbf24">&#x1F6E1;</div>
+                            <div class="help-card-icon" style="color:var(--c-amber-400)">&#x1F6E1;</div>
                             <div class="help-card-title">Static Scanning</div>
                             <div class="help-card-desc">ThreatCheck, DefenderCheck, EMBER2024 (ML), capa (ATT&amp;CK capabilities), LitterBox</div>
                         </div>
                         <div class="help-card">
-                            <div class="help-card-icon" style="color:#a855f7">&#x1F4CA;</div>
+                            <div class="help-card-icon" style="color:var(--c-purple-500)">&#x1F4CA;</div>
                             <div class="help-card-title">Binary Analysis</div>
                             <div class="help-card-desc">PE/ELF parsing, packer detection, entropy, file map, hex editor</div>
                         </div>
@@ -870,6 +960,10 @@
 
                     <h4>Process instances</h4>
                     <p>Windows reuses PIDs. The UI tracks every process instance separately: <code>1234</code> is the newest process with PID 1234, <code>1234@1789372861</code> an earlier one. Alerts, events and children belong to the instance that was running at the time.</p>
+
+                    <h4>Themes and card controls</h4>
+                    <p><strong>✶</strong> switches between the Classic and the Cyberpunk theme at once, without reloading the page: the open tab, an open detail view, filters, the graph and running interception sessions stay as they are. This browser remembers the choice; without one the UI starts in Cyberpunk, the default. In Classic ✶ sits below "? Help". In Cyberpunk it is at the right end of the top bar, where ☰ PROCESSES opens the process list and the timeline, "…" holds the tabs that do not fit and "n/m ONLINE" lists the five services of the status row (Rustinel, Sysmon, Fibratus, Agent, LitterBox); the SERVICES ONLINE tile also counts the Detonator.</p>
+                    <p>In both themes <strong>(i)</strong> beside a title explains its card, <strong>CHART / TABLE</strong> shows the numbers of a chart as a table, a click on a column head sorts the table (a second click reverses the order), and a dashboard tile opens what it counts.</p>
                 </div>
 
                 <!-- Usage Guide -->
@@ -879,7 +973,11 @@
                     <div class="help-tab-guide">
                         <div class="help-guide-item">
                             <h4>Dashboard</h4>
-                            <p>Stats strip (alerts, processes, services, rules, tools), one card per service with launch buttons, recent activity.</p>
+                            <p>Stats strip (alerts, processes, services, rules, tools), one card per service with launch buttons, recent activity. A tile opens what it counts; the high / med / low counts of the TOTAL ALERTS tile open the Alerts tab filtered by severity.</p>
+                        </div>
+                        <div class="help-guide-item">
+                            <h4>Alerts</h4>
+                            <p>Every alert in one table, newest first. Filter by severity (several at once), engine and text (rule, process, description); "n of m" counts the matches, and the newest 2000 of them are listed. Click a row for the alert's details, a process name for its process (only processes in the process list are links).</p>
                         </div>
                         <div class="help-guide-item">
                             <h4>Tracing</h4>
@@ -1066,7 +1164,7 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
                         </tbody>
                     </table>
 
-                    <h4>Detection Rules</h4>
+                    <h4 id="help-detection-rules">Detection Rules</h4>
                     <div class="help-grid">
                         <div class="help-card">
                             <div class="help-card-title">Sigma</div>
@@ -1101,6 +1199,10 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         </div>
     </div>
 
-    <script src="/static/js/app.js?v=44"></script>
+    <!-- The text of an (i) explanation, placed next to its button (openInfoPopover
+         in app.js); set as text, never as markup -->
+    <div id="info-popover" class="info-popover" role="status" hidden></div>
+
+    <script src="/static/js/app.js?v=60"></script>
 </body>
 </html>
