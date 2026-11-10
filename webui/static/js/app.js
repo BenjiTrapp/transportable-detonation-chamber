@@ -8208,7 +8208,8 @@ function getSysmonTypeClass(eventId) {
 }
 
 function formatSysmonTime(isoStr) {
-    try { const d = new Date(isoStr); return d.toLocaleTimeString('en-US', { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0'); } catch { return isoStr; }
+    // hourCycle h23: with `hour12: false`, older ICU builds print midnight as "24:00:02".
+    try { const d = new Date(isoStr); return d.toLocaleTimeString('en-US', { hourCycle: 'h23' }) + '.' + String(d.getMilliseconds()).padStart(3, '0'); } catch { return isoStr; }
 }
 
 function truncate(str, max) {
