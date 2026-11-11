@@ -43,9 +43,38 @@ def _function_source(name):
 
 def _run_node(functions, script, prelude=""):
     code = prelude + "\n" + "\n".join(_function_source(f) for f in functions) + "\n" + script
-    out = subprocess.run([NODE, "-e", code], capture_output=True, text=True, timeout=30)
+    # The code goes in on stdin: Linux takes no argument over 128 KiB, and the
+    # chart tests run more than that. It runs as `node -e` would run it (a
+    # script in the global scope), so a test can still replace a function.
+    out = subprocess.run([NODE, "-e", _NODE_STDIN_SCRIPT], input=code, capture_output=True, text=True, timeout=30)
     assert out.returncode == 0, out.stderr
     return json.loads(out.stdout)
+
+
+_NODE_STDIN_SCRIPT = ("require('vm').runInThisContext(require('fs').readFileSync(0, 'utf8'), "
+                      "{ filename: '[eval]' });")
+
+
+@needs_node
+def test_run_node_takes_code_longer_than_one_argument_may_be():
+    """Linux caps a single command-line argument at 128 KiB (MAX_ARG_STRLEN),
+    and the chart tests hand node scripts of more than that: the code goes to
+    node another way than as an argument."""
+    seen = []
+    real_run = subprocess.run
+
+    def spy(args, *a, **k):
+        seen.append(max(len(str(arg)) for arg in args))
+        return real_run(args, *a, **k)
+
+    padding = "// " + "x" * 200_000 + "\n"
+    subprocess.run = spy
+    try:
+        r = _run_node([], padding + "console.log(JSON.stringify({ ok: 1 }));")
+    finally:
+        subprocess.run = real_run
+    assert r == {"ok": 1}
+    assert seen and max(seen) < 131072, "the code went to node as one argument longer than Linux allows"
 
 
 @needs_node
