@@ -1078,6 +1078,64 @@
     letter-spacing: .06em;
 }
 
+/* --- Alerts tab: the drilldown bar of the design of the drilldown, a raised
+   card with a magenta edge and a faint glow; BACK filled in magenta with its
+   glow, as the main buttons; the steps a click goes back to in cyan and
+   underlined, the current one white; DRILLDOWN, the separators and the count
+   dim. It stands at the top of the tab as in Classic (style.css). The chips
+   of the chart filters in the tab: larger, cyan with a cyan edge, their × in
+   magenta --- */
+[data-theme="cyberpunk"] .alerts-drill {
+    margin: 14px 24px 0;
+    font-family: var(--cp-font-label);
+    letter-spacing: .04em;
+    background: var(--cp-raised);
+    border: 1px solid var(--cp-magenta);
+    border-radius: 6px;
+    box-shadow: 0 0 18px rgba(var(--cp-magenta-rgb), .25);
+}
+[data-theme="cyberpunk"] .alerts-drill-back {
+    background: var(--cp-magenta);
+    color: var(--cp-on-magenta);
+    border-color: var(--cp-magenta);
+    border-radius: 4px;
+    box-shadow: 0 0 12px rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme="cyberpunk"] .alerts-drill-back:hover {
+    background: var(--cp-magenta);
+    box-shadow: 0 0 20px rgba(var(--cp-magenta-rgb), .6);
+}
+[data-theme="cyberpunk"] .alerts-drill-back:focus-visible,
+[data-theme="cyberpunk"] .alerts-drill-step:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: 2px;
+}
+[data-theme="cyberpunk"] .alerts-drill-label {
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .alerts-drill-step {
+    color: var(--cp-cyan);
+    text-decoration-color: rgba(var(--cp-cyan-rgb), .35);
+}
+[data-theme="cyberpunk"] .alerts-drill-step:hover {
+    text-decoration-color: var(--cp-cyan);
+    text-shadow: 0 0 8px rgba(var(--cp-cyan-rgb), .5);
+}
+[data-theme="cyberpunk"] .alerts-drill-step.is-current {
+    color: var(--cp-text);
+    text-shadow: none;
+}
+[data-theme="cyberpunk"] .alerts-drill-more,
+[data-theme="cyberpunk"] .alerts-drill-sep,
+[data-theme="cyberpunk"] .alerts-drill-count {
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] #tab-alerts .alerts-filter-chip {
+    font-size: 12px;
+    color: var(--cp-cyan);
+    border-color: var(--cp-cyan);
+}
+
 /* --- Buttons: raised, faint magenta edge; magenta with a glow on hover.
    Primary actions are magenta with dark text. --- */
 [data-theme="cyberpunk"] .btn,

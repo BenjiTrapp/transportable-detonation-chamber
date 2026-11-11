@@ -1716,6 +1716,13 @@ CHART_FUNCTIONS = ["alertCategory", "countBy", "binByTime", "stackedBarsSvg", "d
                    "_chartNumber", "_chartShare", "_chartCoord", "_chartSegments", "_chartPeriodStart", "_chartPeriodNext",
                    "_chartDate", "_chartClock", "_chartPeriodLabel", "_chartTicks", "_chartFineStep",
                    "topWithOther", "alertFlow", "_chartFlow", "layoutSankey", "sankeySvg", "_sankeyFit", "_chartEllipsis"]
+# A range drawn across bars (initBarsBrush), which OVER TIME of the Alerts tab shares with ALERT ACTIVITY of the
+# dashboard, and its state: the Alerts tab's prelude declares it, the dashboard's has it from there (once)
+BARS_BRUSH_FUNCTIONS = ["initBarsBrush", "barsBrushActive", "barsClickPeriod", "_binPeriod", "onBarsBrushStart",
+                        "onBarsBrushMove", "onBarsBrushEnd", "onBarsBrushCancel", "_barsBrushStop", "_barsBrushMark",
+                        "_barsBinAt"]
+BARS_BRUSH_CONSTS = ["_barsBrushHosts"]
+BARS_BRUSH_LETS = "\nlet _barsBrush = null;\nlet _barsReleased = null;"
 # The charts of the Alerts tab above its filter bar, the parts the dashboard and the Sysmon tab share with them, and
 # the CHART / TABLE switch of their cards
 ALERTS_CHART_FUNCTIONS = ["renderAlertsCharts", "alertsSeverityItems", "_alertsSeverityColor", "alertsEngineItems",
@@ -1726,28 +1733,34 @@ ALERTS_CHART_FUNCTIONS = ["renderAlertsCharts", "alertsSeverityItems", "_alertsS
                           "_flowClickFilter", "_alertsChartWidths",
                           "_alertsChartInert", "onAlertsChartClick", "_applyAlertsChartFilter", "toggleAlertsFlowScale",
                           "_pressFlowScale", "redrawAlertsChartsOnResize", "isTableView", "viewToggleHtml",
-                          "cardViewAttrs", "toggleCardView"]
-# The tab with the chips of the chart filters, which name a time range as the charts do (block CHARTS), and its charts
+                          "cardViewAttrs", "toggleCardView", "_drillAlertsBars", "_drawAlertsTimeHeld"] + BARS_BRUSH_FUNCTIONS
+# The tab with the chips of the chart filters, which name a time range as the charts do (block CHARTS), the steps of
+# its drilldown with the bar above the charts that shows them, and its charts
 ALERTS_TAB_FUNCTIONS = list(dict.fromkeys(ALERT_ROW_FUNCTIONS + [
     "alertEngines", "setAlertsEngineOptions", "alertsFilterFromControls", "renderAlertsTab", "toggleAlertsSeverity",
     "selectAlertsSeverity", "openAlertsTab", "setAlertsFilters", "removeAlertsFilter", "renderAlertsActiveFilters",
-    "filterChipHtml", "_alertsExtraOf", "_alertsListTop", "_tabListTop", "chartRangeLabel"] + CHART_FUNCTIONS
+    "filterChipHtml", "_alertsExtraOf", "_alertsListTop", "_tabListTop", "chartRangeLabel", "initAlertsTab",
+    "_followBarHeight",
+    "alertsDrillValues", "drillAlerts", "alertsDrillBack", "alertsDrillTo", "forgetAlertsDrill", "alertsStepLabel",
+    "onAlertsEngineChange", "_alertsDrillNone", "_alertsDrillSame", "_alertsDrillOf", "_setAlertsDrillValues",
+    "_alertsDrillStep", "renderAlertsDrillBar", "_focusFromKeyboard", "_alertsDrillPathHtml", "onAlertsDrillClick"]
+    + CHART_FUNCTIONS
     + ALERTS_CHART_FUNCTIONS))
-# The state of the Alerts tab and its charts (app.js top level) for the functions under test
-ALERTS_TAB_CONSTS = ["ALERT_SEVERITIES", "ALERT_TIME_MIN", "alertsExtraFilter", "cardViewState",
-                     "alertsFlowView"] + CHART_CONSTS
-ALERTS_TAB_LETS = "\nlet _alertsTabShown = null;\nlet _alertsChartsDrawn = null;"
-# The charts of the dashboard between its tiles and its service cards, and their state
+# The state of the Alerts tab, its drilldown and its charts (app.js top level) for the functions under test
+ALERTS_TAB_CONSTS = (["ALERT_SEVERITIES", "ALERT_TIME_MIN", "alertsExtraFilter", "ALERTS_DRILL_KINDS", "alertsDrilldown",
+                      "ALERTS_DRILL_VISIBLE", "cardViewState", "alertsFlowView", "ALERTS_BARS_BRUSH"]
+                     + BARS_BRUSH_CONSTS + CHART_CONSTS)
+ALERTS_TAB_LETS = ("\nlet _alertsTabShown = null;\nlet _alertsChartsDrawn = null;\nlet alertsDrillVersion = 0;"
+                   "\nlet _alertsDrillDrawn = null;" + BARS_BRUSH_LETS)
+# The charts of the dashboard between its tiles and its service cards, and their state; the range drawn across bars,
+# which ALERT ACTIVITY shares with OVER TIME, comes with the Alerts tab (BARS_BRUSH_*)
 DASHBOARD_CHART_FUNCTIONS = ["renderDashboardCharts", "setDashboardRange", "_dashboardCount",
                              "_dashboardFollowTheClock", "_dashboardSparkCounts", "dashboardCategoryItems",
                              "releaseDashboardCounts", "_drawDashboardSparks", "_drawDashboardBars",
                              "_drawDashboardDonuts", "_drawDashboardRange", "_dashboardBarsSize",
-                             "onDashboardChartClick", "_dashboardBinPeriod", "initDashboardCharts", "onDashboardBrushStart",
-                             "onDashboardBrushMove", "onDashboardBrushEnd", "onDashboardBrushCancel", "_dashboardBrushStop",
-                             "_dashboardBrushMark", "_dashboardBinAt", "redrawDashboardChartsOnResize"]
+                             "onDashboardChartClick", "initDashboardCharts", "redrawDashboardChartsOnResize"]
 DASHBOARD_CHART_CONSTS = ["DASHBOARD_RANGES", "DASHBOARD_SPARK_DAYS", "dashboardRange", "dashboardBarsRange",
-                          "_dashboardMemo", "_dashboardDrawn"]
-DASHBOARD_CHART_LETS = "\nlet _dashboardBrush = null;\nlet _dashboardReleased = null;"
+                          "_dashboardMemo", "_dashboardDrawn", "DASHBOARD_BARS_BRUSH"]
 
 # Four alerts as the engines write them: severity and engine in either case,
 # the process by name, by image only or by PID only, time zones mixed (as a
@@ -1887,8 +1900,8 @@ def test_alerts_tab_is_wired():
     assert chips and "hidden" in chips[0]["attrs"] and chips[0]["attrs"].get("role") == "group" \
         and chips[0]["attrs"].get("aria-label"), "the chips of the chart filters are not in the filter bar"
     engine = find(tab, lambda e: e["attrs"].get("id") == "alerts-filter-engine")[0]
-    assert engine["tag"] == "select" and engine["attrs"].get("onchange") == "renderAlertsTab()", \
-        "choosing an engine does not filter"
+    assert engine["tag"] == "select" and engine["attrs"].get("onchange") == "onAlertsEngineChange()", \
+        "choosing an engine does not filter, or leaves a step of the drilldown that set the engine in its path"
     search = find(tab, lambda e: e["attrs"].get("id") == "alerts-filter-text")[0]
     assert search["attrs"].get("oninput") == "scheduleAlertsRender()", "every keystroke lays out 2000 rows"
     assert re.search(r"tabName === 'alerts'\)\s*\{\s*renderAlertsTab\(\)", _function_source("switchTab"))

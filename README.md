@@ -117,7 +117,7 @@ make open       # Opens http://<vm-ip>:9000 in browser
 | Tab | Description |
 |-----|-------------|
 | **Dashboard** | Stats strip (alerts, processes, services, rules, tools; TOTAL ALERTS and PROCESSES TRACKED with 45-day sparklines), ALERT ACTIVITY with the SEVERITY and CATEGORY donuts of its range (see [Charts](#charts)), service health cards, recent activity feed; each tile opens what it counts |
-| **Alerts** | Every alert in one table, newest first, under charts of the current filter (severity and engine pies, bars over time, an engine → rule → process Sankey), with severity (multi-select), engine and text filters, the time range, category, rule and process filters a chart click sets (each a chip with ×) and an "n of m" count; a row opens the alert detail, the process name its process (only processes in the process list are links); the newest 2000 matches are listed |
+| **Alerts** | Every alert in one table, newest first, under charts of the current filter (severity and engine pies, bars over time, an engine → rule → process Sankey), with severity (multi-select), engine and text filters, the time range, category, rule and process filters a chart click or a range drawn across the bars sets (each a chip with ×), a drilldown bar with BACK and the path of those steps (see [Charts](#charts)) and an "n of m" count; a row opens the alert detail, the process name its process (only processes in the process list are links); the newest 2000 matches are listed |
 | **Tracing** | Per-process console: verdict, timeline by event type, process tree, alerts with full raw events (Sigma match details) |
 | **Graph** | Process tree around a process: tree, force-directed and isometric layouts, landing page with samples and candidate processes, detail panel with Sysmon events, ACTIVITY MIX and children |
 | **Pipes** | Named pipes: Sysmon pipe events (EID 17/18) with name/PID filters and C2-family hits, and interception sessions (attach to an existing pipe or arm for a name/prefix/regex; observe or hold messages to forward, edit or drop them; JSON export) |
@@ -139,10 +139,11 @@ that was running at the time.
 The Web UI has two themes: **Cyberpunk** (the default: neon on deep violet)
 and **Classic** (the original look, shown in most screenshots). **✶** switches
 between them at once, without reloading the page; the open tab, an open detail
-view, filters, sort orders, the graph and running pipe interception sessions
-stay as they are. The choice is stored in the browser (`localStorage`), so a
-browser without a stored choice starts in Cyberpunk. In Classic ✶ sits below "? Help" in
-the sidebar header, in Cyberpunk at the right end of the top bar.
+view, filters and drilldown steps, sort orders, the graph and running pipe
+interception sessions stay as they are. The choice is stored in the browser
+(`localStorage`), so a browser without a stored choice starts in Cyberpunk. In
+Classic ✶ sits below "? Help" in the sidebar header, in Cyberpunk at the right
+end of the top bar.
 
 Cyberpunk replaces the sidebar with a top bar and gives the content the full
 width:
@@ -197,7 +198,8 @@ the other tables. Screenshots:
 | Dashboard | Sparklines in TOTAL ALERTS and PROCESSES TRACKED | Alerts and newly seen processes per day over the last 45 days | — |
 | Dashboard | **ALERT ACTIVITY** | Alerts per hour, day or week, stacked by severity, for **24H / 7D / 30D / ALL** (default ALL) | A drag across the bars narrows the donuts to that range (a chip; its × goes back to the preset); a bar opens the Alerts tab filtered to its period |
 | Dashboard | **SEVERITY**, **CATEGORY** | Donuts of the range with name, count and share; the six most frequent categories, the rest as *other categories* | A segment or a legend row opens the Alerts tab with that severity or category, within the range |
-| Alerts | **SEVERITY**, **OVER TIME**, **ENGINE** | Pies and bars of the alerts the filters let through | A slice or a legend row shows only its severity (the chips in the filter bar switch severities on or off) or chooses its engine; a bar sets its period |
+| Alerts | **SEVERITY**, **ENGINE** | Pies of the alerts the filters let through | A slice or a legend row shows only its severity (the chips in the filter bar switch severities on or off) or chooses its engine |
+| Alerts | **OVER TIME** | The same alerts per hour, day or week, stacked by severity; a span of up to about 20 hours in steps of 1 s to 30 min (at most 40 bars) | A drag across the bars narrows the tab to the bars it covers, a click on a bar to its period |
 | Alerts | **FLOW: ENGINE → RULE → PROCESS** | Sankey of the same alerts: the six most frequent rules and processes, the rest as *other rules* / *other processes* | A node sets its engine, rule or process, a band both of its ends |
 | Sysmon | **EVENTS OVER TIME** | The loaded events per period (seconds, minutes or longer, by their span), stacked by event type | A bar sets a time window (Shift+click widens it to another bar), a legend row the event type |
 | Sysmon | **PROCESS → EVENT TYPE** | Sankey image → event type: the six most frequent images, the rest as *other images* | A node sets its image or event type, a band both of its ends |
@@ -207,23 +209,58 @@ the other tables. Screenshots:
 | Graph | **ACTIVITY MIX** | Donut in a process node's detail: the Sysmon activity of that process instance (network, DNS, file, registry, named pipes, the injections it made); its alerts as a number beside it, not part of the ring | — |
 
 - **Click filters:** a time range, category, rule or process (Alerts) and a
-  time window, image or event type (Sysmon) set by a click show as chips in
-  the filter bar; the × of a chip takes that filter off. A severity or an
-  engine sets the filter bar's own controls. The count of the table ("n of
+  time window, image or event type (Sysmon) set by a click (in the Alerts
+  tab also by a range drawn across OVER TIME) show as chips in the filter
+  bar; the × of a chip takes that filter off, and in the Alerts tab BACK
+  takes the last step back (see *Drilldown*). A severity or an engine sets
+  the filter bar's own controls. The count of the table ("n of
   m" in the Alerts tab, "Showing n of m events" in Sysmon) is then exactly
   what the part counted. Some parts set no filter: a bucket (*other rules*,
   *other processes*, *other images*, *other categories*) and every band into
   or out of one (*other rules* → a process, *other images* → an event type),
   which stand for several names and would list more than they show; the
   alerts without an engine and a severity no chip names, which no control
-  of the filter bar selects; and a bar without alerts or events, which
-  would list nothing.
+  of the filter bar selects; and a bar without alerts or events, or a range
+  drawn across such bars only, which would list nothing.
+- **Drawing a range across OVER TIME:** press on the bars and drag by at
+  least 5 px: a dashed box over their whole height snaps to whole bars, as
+  on ALERT ACTIVITY. Letting go narrows the tab from the start of the first
+  to the end of the last bar it covers, so the table lists exactly what
+  those bars counted. The bars then divide the range anew: a day in 24 bars
+  of an hour, 10:00–12:00 in 24 bars of 5 minutes. A range that does not
+  begin and end on a full minute is named with seconds. New alerts (every
+  5 s) do not redraw the bars while a range is being drawn; they are drawn
+  once the button is up.
+- **Drilldown (Alerts tab):** a click on SEVERITY, ENGINE, FLOW or a bar of
+  OVER TIME, or a range drawn across OVER TIME, is a step when it changes a
+  filter (the same slice clicked again is none); so is every jump from the
+  dashboard with a filter. While there is a step, a bar between the head of
+  the tab and the charts shows **‹ BACK** (its tooltip names where it
+  goes), DRILLDOWN, the path and the count ("n of m alerts"). The path
+  reads like
+  `ALL ALERTS › 27 Jul › 27 Jul 10:00–12:00`, the current step last; of
+  more than three steps the oldest fold into "…", whose tooltip names them,
+  and a long name is cut (its tooltip has it in full). BACK takes the last
+  step back: the filters it changed get the values they had before it. A
+  step in the path jumps back to the state after it, ALL ALERTS takes every
+  step back, and the bar disappears. What you set in the filter bar
+  yourself (the severity chips, the engine choice, the search, the × of a
+  chip) is no step, and BACK never undoes it: the steps forget a filter you
+  change that way, and a step leaves the path only once it sets no filter,
+  so the path names only what is still in effect (the step of a band,
+  `Sigma · rule: Run Key`, stays as `rule: Run Key` when you choose the
+  engine yourself). A jump from the dashboard (a high / med / low count of
+  TOTAL ALERTS, a bar, a donut segment or legend row) starts a new path
+  with one step, named `Dashboard: …` (for example
+  `Dashboard: CRITICAL + HIGH`); BACK then shows all alerts and stays in
+  the tab. TOTAL ALERTS itself sets no filter and makes no step. The steps
+  last until the page is reloaded, as the filters do.
 - **Charts and filters:** the charts of the Alerts and Sysmon tabs count
   everything the current filters let through (the Alerts table lists the
   newest 2000 of it, the charts all; Sysmon: all but its time window, which
   the bars mark; the window narrows the table). Both tabs scroll as a whole
-  while the filter bar stays at the top; a click on the dashboard opens the
-  Alerts tab at its top.
+  while the filter bar stays at the top (in the Alerts tab right under the
+  drilldown bar); a click on the dashboard opens the Alerts tab at its top.
 - **Times:** bars follow local hours and days. An alert or event without a
   readable time, or with one before 2000 or more than a day ahead (a sample
   can set the clock), is in no bar: a note under the bars counts those, and
@@ -870,15 +907,17 @@ programs that mimic implant behaviour).
 </p>
 
 > The **Alerts** tab (Classic) filtered to the critical and high alerts of
-> the fibratus engine: *6 of 9620*. The charts above the filter bar count
+> the fibratus engine: *6 of 9641*. The charts above the filter bar count
 > the same six: SEVERITY 1 critical and 5 high, OVER TIME one alert on each
-> of six days between 28 Oct and 10 Nov, ENGINE fibratus alone, and FLOW
-> from fibratus through six rules to six processes (a click on a part would
-> narrow the list further). Below the bar the six rows, newest first, each
-> with its time, severity, engine, rule, process and PID, and the rule's
-> description. A click on a row opens the alert detail; process names that
-> are in the process list (here `services.exe`) are links to the process.
-> Column heads sort the table.
+> of six days between 28 Oct and 10 Nov (under the bars the hint how to use
+> them), ENGINE fibratus alone, and FLOW from fibratus through six rules to
+> six processes (a click on a part would narrow the list further). The
+> severity chips and the engine are set in the filter bar itself, which is
+> no drilldown step, so no drilldown bar shows. Below the bar the six rows,
+> newest first, each with its time, severity, engine, rule, process and
+> PID, and the rule's description. A click on a row opens the alert detail;
+> process names that are in the process list (here `services.exe`) are
+> links to the process. Column heads sort the table.
 
 ---
 
@@ -902,16 +941,35 @@ programs that mimic implant behaviour).
   <img src="static/alerts_charts.png" alt="Alerts tab with its chart strip and the engine, rule and process Sankey" width="100%">
 </p>
 
-> The **Alerts** tab with all 9,620 alerts: **SEVERITY** and **ENGINE** as
-> pies beside their legends (Sigma 9,415, Yara 195, fibratus 10), **OVER
-> TIME** per day stacked by severity, and **FLOW: ENGINE → RULE → PROCESS**
-> drawn by square roots. It shows the noise at a glance: the Run-key rule
-> alone has 6,150 of the alerts, 5,757 of them on `MsMpEng.exe` (6,190
-> alerts in all). The
-> six most frequent rules and processes stand on their own, the rest as
-> *other rules* (72) and *other processes* (483). A click on a slice, a
-> bar, a node or a band sets its filter; no filter is set here (*9620 of
-> 9620* in the filter bar).
+> The **Alerts** tab with all 9,641 alerts: **SEVERITY** and **ENGINE** as
+> pies beside their legends (Sigma 9,415, Yara 216, fibratus 10), **OVER
+> TIME** per week stacked by severity (the week of 27 Jul has 3,372 alerts)
+> with the hint how to draw a range below it, and **FLOW: ENGINE → RULE →
+> PROCESS** drawn by square roots. It shows the noise at a glance: the
+> Run-key rule alone has 6,150 of the alerts, 5,757 of them on `MsMpEng.exe`
+> (6,190 alerts in all). The six most frequent rules and processes stand on
+> their own, the rest as *other rules* (79) and *other processes* (504). A
+> click on a slice, a bar, a node or a band, or a range drawn across the
+> bars, narrows the tab by a step; no filter is set here (*9641 of 9641* in
+> the filter bar), so no drilldown bar shows.
+
+<p align="center">
+  <img src="static/alerts_drilldown.png" alt="Alerts tab narrowed in three drilldown steps, with BACK and the path above the charts" width="100%">
+</p>
+
+> The **Alerts** tab (Cyberpunk) after three steps: a click on the week
+> 27 Jul – 02 Aug in OVER TIME, a click on its day 27 Jul, then a range
+> drawn across the hours 10:00 and 11:00. The drilldown bar above the charts
+> shows **‹ BACK**, the path
+> `ALL ALERTS › 27 Jul – 02 Aug › 27 Jul › 27 Jul 10:00–12:00` (a click on a
+> step goes back to it) and *1,345 of 9,641 alerts*. OVER TIME divides the
+> two hours into 24 bars of 5 minutes; the busiest, 10:30–10:35, has 373
+> alerts. SEVERITY counts 6 critical, 784 high and 555 medium, ENGINE Sigma
+> 1,339 and Yara 6, and FLOW leads Suspicious Encoded PowerShell Command
+> Line (766) to `powershell.exe` (767 in all) and Registry Run Key
+> Persistence (506) mostly to `MsMpEng.exe` (539 in all). The range stands
+> as a chip under the filter bar (*1345 of 9641*), and the table lists those
+> alerts, newest first.
 
 ---
 

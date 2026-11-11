@@ -981,13 +981,13 @@ const _dashboardMemo = { bars: null, donuts: null, sparks: null };
 // What is on screen: the counts each part was drawn from, the range of the
 // switch and the chip, the range the bars mark ('' for none) and their size
 const _dashboardDrawn = { bars: null, donuts: null, sparks: null, range: '', marked: '', size: null };
-// The press on the bars while it lasts ({pointerId, x, first, last, moved,
-// svg, bins, pressed}: where it began, the bars it spans, whether it draws a
-// range, the bars on screen then and the bar pressed); after its release,
-// until the click of that release (it comes in the same task, if at all),
-// what that click does: {drew, pressed}
-let _dashboardBrush = null;
-let _dashboardReleased = null;
+// ALERT ACTIVITY takes a range drawn across its bars (initBarsBrush): it is
+// the range of the donuts, from the start of its first bar to the end of its last
+const DASHBOARD_BARS_BRUSH = {
+    view: 'dashboard-alerts-chart',
+    bins: () => (_dashboardDrawn.bars ? _dashboardDrawn.bars.bins : []),
+    onRange: (first, last, bins) => setDashboardRange('custom', bins[first].start, bins[last].end),
+};
 
 // The switch: a preset from now on ('all', and a name it does not know:
 // every alert), or a range drawn across the bars, setDashboardRange('custom',
@@ -1023,8 +1023,8 @@ function renderDashboardCharts() {
         drawn.donuts = counted.donuts;
         _drawDashboardDonuts(counted.donuts);
     }
-    // While a range is drawn across the bars, they stay as they are
-    if (_dashboardBrush) return;
+    // While a press on the bars lasts (a range may be drawn across them), they stay as they are
+    if (barsBrushActive(DASHBOARD_BARS_BRUSH)) return;
     const size = _dashboardBarsSize();
     const marked = dashboardRange.preset === 'custom' ? `${dashboardRange.from}-${dashboardRange.to}` : '';
     if (drawn.bars === counted.bars && drawn.marked === marked
@@ -1208,16 +1208,12 @@ function _dashboardBarsSize() {
 // alerts, a severity no chip names and "other categories" open nothing (each
 // would list other alerts than it shows), nor does the release of a press
 // that drew a range across the bars. The click of a press on the bars opens
-// the bar pressed, wherever the browser sends it (to their common parent when
-// the press ended on the next bar).
+// the bar pressed, wherever the browser sends it (barsClickPeriod).
 function onDashboardChartClick(event, chart) {
     const target = event && event.target;
     if (!target || typeof target.closest !== 'function') return;
     if (chart === 'alerts') {
-        const released = _dashboardReleased;
-        _dashboardReleased = null;
-        const bin = released ? null : target.closest('[data-bin-start]');
-        const period = released ? (released.drew ? null : released.pressed) : _dashboardBinPeriod(bin);
+        const period = barsClickPeriod(event, DASHBOARD_BARS_BRUSH);
         if (period) openAlertsTab(period);
         return;
     }
@@ -1228,120 +1224,190 @@ function onDashboardChartClick(event, chart) {
     else if (chart === 'category' && key) openAlertsTab({ category: key, ...range });
 }
 
-// The period {from, to} of a bar (a [data-bin-start] group) with alerts, else null
-function _dashboardBinPeriod(bin) {
-    return bin && Number(bin.getAttribute('data-total')) > 0
-        ? { from: Number(bin.getAttribute('data-bin-start')), to: Number(bin.getAttribute('data-bin-end')) } : null;
-}
-
-// The bars take a range drawn across them (mouse, pen or finger): a press on
-// them begins it, its moves and its end are followed wherever the pointer
-// goes (out of the bars, out of the window). The context menu drops a press
-// (macOS opens it on Ctrl+click, the release then goes to the menu). They
-// are drawn again in the next frame when the size of their card changes
-// (the window, the theme, the donut cards beside them).
+// The bars take a range drawn across them (initBarsBrush). They are drawn
+// again in the next frame when the size of their card changes (the window,
+// the theme, the donut cards beside them).
 function initDashboardCharts() {
-    const view = document.getElementById('dashboard-alerts-chart');
-    if (view) {
-        view.addEventListener('pointerdown', onDashboardBrushStart);
-        document.addEventListener('pointermove', onDashboardBrushMove, true);
-        document.addEventListener('pointerup', onDashboardBrushEnd, true);
-        document.addEventListener('pointercancel', onDashboardBrushEnd, true);
-        document.addEventListener('contextmenu', onDashboardBrushCancel, true);
-    }
+    initBarsBrush(DASHBOARD_BARS_BRUSH);
     const area = document.querySelector('#dashboard-alerts-card .dashboard-bars-area');
     if (area && typeof ResizeObserver !== 'undefined') {
         new ResizeObserver(() => requestAnimationFrame(redrawDashboardChartsOnResize)).observe(area);
     }
 }
 
-// A press on the bars (the main button) may begin a range: at the bar under
-// the pointer. It takes no pointer capture yet: a press that does not move is
-// a click, which the browser sends to the bar under the pointer.
-function onDashboardBrushStart(event) {
-    _dashboardReleased = null;
+// The bars for the new size of their card; nothing while the dashboard is
+// hidden, for the size they have or while a press on them lasts
+function redrawDashboardChartsOnResize() {
+    const drawn = _dashboardDrawn, size = _dashboardBarsSize();
+    if (!drawn.bars || barsBrushActive(DASHBOARD_BARS_BRUSH) || !size.width || !size.height
+        || (drawn.size && size.width === drawn.size.width && size.height === drawn.size.height)) return;
+    drawn.size = size;
+    _drawDashboardBars(drawn);
+}
+
+// --- A range drawn across bars ---
+// ALERT ACTIVITY of the dashboard and OVER TIME of the Alerts tab take a
+// range drawn across their bars (mouse, pen or finger) by the same code.
+// Each is a host: {view: the id of the element with the bars; bins(): the
+// bins of the bars drawn, [{start, end, total}], read when a press begins
+// and kept until it ends; onRange(first, last, bins): a range was drawn
+// across them, from the bar numbered first to the bar numbered last of
+// those bins; onStop(), optional: a press on them is over, whether it drew
+// a range or not, also when it was cancelled; no press holds the bars then
+// (it comes before onRange)}.
+// The press on the bars of a host while it lasts ({host, view, pointerId, x,
+// first, last, moved, svg, bins, pressed}: whose bars and where it began,
+// the bars it spans, whether it draws a range, the bars on screen then and
+// the bar pressed); after its release, until the click of that release (it
+// comes in the same task, if at all), what that click stands for: {host,
+// drew, pressed}
+let _barsBrush = null;
+let _barsReleased = null;
+// The hosts whose bars take a range (initBarsBrush)
+const _barsBrushHosts = new Set();
+
+// The bars of a host take a range drawn across them: a press on them begins
+// it, its moves and its end are followed wherever the pointer goes (out of
+// the bars, out of the window). The context menu drops a press (macOS opens
+// it on Ctrl+click, the release then goes to the menu). The page listens for
+// these once for all hosts, the bars of a host for a press once, however
+// often it is set up.
+function initBarsBrush(host) {
+    const view = document.getElementById(host.view);
+    if (!view || _barsBrushHosts.has(host)) return;
+    if (!_barsBrushHosts.size) {
+        document.addEventListener('pointermove', onBarsBrushMove, true);
+        document.addEventListener('pointerup', onBarsBrushEnd, true);
+        document.addEventListener('pointercancel', onBarsBrushEnd, true);
+        document.addEventListener('contextmenu', onBarsBrushCancel, true);
+    }
+    _barsBrushHosts.add(host);
+    view.addEventListener('pointerdown', event => onBarsBrushStart(event, host));
+}
+
+// Whether a press on the bars of the host lasts: while it does, they are not
+// drawn again (a range drawn is marked on them, its click is to reach them)
+function barsBrushActive(host) {
+    return !!_barsBrush && _barsBrush.host === host;
+}
+
+// What a click on the bars of a host stands for, the period {from, to} of a
+// bar or null: after a press on them that drew a range, nothing (that click
+// only); after one that did not move, the bar it pressed, wherever the
+// browser sends the click (to the bars' common parent when the press ended
+// on the next bar); without a press, the bar clicked. A bar without alerts
+// stands for nothing, and so does the click of a press on another host's bars.
+function barsClickPeriod(event, host) {
+    const released = _barsReleased;
+    if (released) {
+        if (released.host !== host) return null;
+        _barsReleased = null;
+        return released.drew ? null : released.pressed;
+    }
+    const target = event && event.target, view = document.getElementById(host.view);
+    if (!target || typeof target.closest !== 'function' || !view || !view.contains(target)) return null;
+    return _binPeriod(target.closest('[data-bin-start]'));
+}
+
+// The period {from, to} of a bar (a [data-bin-start] group) with alerts, else null
+function _binPeriod(bin) {
+    return bin && Number(bin.getAttribute('data-total')) > 0
+        ? { from: Number(bin.getAttribute('data-bin-start')), to: Number(bin.getAttribute('data-bin-end')) } : null;
+}
+
+// A press on the bars of a host (the main button) may begin a range: at the
+// bar under the pointer, over the bars drawn then. It takes no pointer
+// capture yet: a press that does not move is a click, which the browser
+// sends to the bar under the pointer. A press still under way (its release
+// never came, another finger's) ends first, as a cancelled one; should its
+// host draw the bars again then, this press is on bars no longer shown and
+// begins nothing.
+function onBarsBrushStart(event, host) {
+    _barsReleased = null;
     const target = event.target && typeof event.target.closest === 'function' ? event.target : null;
     const svg = target ? target.closest('svg') : null;
-    const bins = _dashboardDrawn.bars ? _dashboardDrawn.bars.bins : [];
-    if (event.button !== 0 || !svg || !bins.length) return;
-    const bin = _dashboardBinAt(svg, event.clientX, bins.length);
-    _dashboardBrush = { pointerId: event.pointerId, x: event.clientX, first: bin, last: bin, moved: false, svg, bins,
-                        pressed: _dashboardBinPeriod(target.closest('[data-bin-start]')) };
+    if (event.button !== 0 || !svg) return;
+    if (_barsBrush) _barsBrushStop(true);
+    const bins = svg.isConnected ? host.bins() : null;
+    if (!bins || !bins.length) return;
+    const bin = _barsBinAt(svg, event.clientX, bins.length);
+    _barsBrush = { host, view: document.getElementById(host.view), pointerId: event.pointerId, x: event.clientX,
+                   first: bin, last: bin, moved: false, svg, bins, pressed: _binPeriod(target.closest('[data-bin-start]')) };
 }
 
 // Moved by 5 px or more, the press draws a range: from its bar to the bar
-// under the pointer, marked as it grows. From then on the bars hold the
+// under the pointer, marked as it grows. From then on its bars hold the
 // pointer's capture, so its moves and its release reach them wherever it is.
 // A move without the main button (its release went elsewhere) ends the press
 // as a cancelled one.
-function onDashboardBrushMove(event) {
-    const brush = _dashboardBrush;
+function onBarsBrushMove(event) {
+    const brush = _barsBrush;
     if (!brush || event.pointerId !== brush.pointerId) return;
     if (typeof event.buttons === 'number' && !(event.buttons & 1)) {
-        _dashboardBrushStop(true);
+        _barsBrushStop(true);
         return;
     }
     if (!brush.moved) {
         if (Math.abs(event.clientX - brush.x) < 5) return;
         brush.moved = true;
-        const view = document.getElementById('dashboard-alerts-chart');
-        if (view) {
-            view.classList.add('is-brushing');
+        if (brush.view) {
+            brush.view.classList.add('is-brushing');
             try {
-                view.setPointerCapture(event.pointerId);
+                brush.view.setPointerCapture(event.pointerId);
             } catch (e) {
                 // not a live pointer: the moves still come while it is over the page
             }
         }
     }
-    brush.last = _dashboardBinAt(brush.svg, event.clientX, brush.bins.length);
-    _dashboardBrushMark(brush);
+    brush.last = _barsBinAt(brush.svg, event.clientX, brush.bins.length);
+    _barsBrushMark(brush);
 }
 
-// Released, a range drawn is the range of the donuts (its bars' start and
-// end), and the click of this release opens nothing; a press that did not
-// move leaves its click the bar it pressed. Cancelled, nothing. What the
-// click does lasts until the task is over: a later click (no press) opens
-// the bar it is on.
-function onDashboardBrushEnd(event) {
-    const brush = _dashboardBrush;
+// Released, a range drawn is the host's (onRange with the numbers of its
+// first and its last bar), and the click of this release stands for
+// nothing; a press that did not move leaves its click the bar it pressed.
+// Cancelled, nothing. What the click stands for lasts until the task is
+// over: a later click (no press) stands for the bar it is on.
+function onBarsBrushEnd(event) {
+    const brush = _barsBrush;
     if (!brush || event.pointerId !== brush.pointerId) return;
-    _dashboardBrushStop(false);
+    _barsBrushStop(false);
     if (event.type !== 'pointerup') return;
-    _dashboardReleased = { drew: brush.moved, pressed: brush.pressed };
-    setTimeout(() => { _dashboardReleased = null; }, 0);
-    if (!brush.moved) return;
-    const { bins } = brush;
-    setDashboardRange('custom', bins[Math.min(brush.first, brush.last)].start, bins[Math.max(brush.first, brush.last)].end);
+    _barsReleased = { host: brush.host, drew: brush.moved, pressed: brush.pressed };
+    setTimeout(() => { _barsReleased = null; }, 0);
+    if (brush.moved) brush.host.onRange(Math.min(brush.first, brush.last), Math.max(brush.first, brush.last), brush.bins);
 }
 
 // The context menu during a press: it ends as a cancelled one
-function onDashboardBrushCancel() {
-    if (_dashboardBrush) _dashboardBrushStop(true);
+function onBarsBrushCancel() {
+    if (_barsBrush) _barsBrushStop(true);
 }
 
-// The press is over: no mark; the bars may be drawn again. `release` lets go
-// of the pointer's capture of a press whose release the bars never got (on
-// a release or a cancel the browser lets go of it, and the click of the
-// release still goes to the bars)
-function _dashboardBrushStop(release) {
-    const brush = _dashboardBrush;
-    _dashboardBrush = null;
+// The press is over: no mark; its bars may be drawn again, and its host
+// hears of it. `release` lets go of the pointer's capture of a press whose
+// release the bars never got (on a release or a cancel the browser lets go
+// of it, and the click of the release still goes to the bars)
+function _barsBrushStop(release) {
+    const brush = _barsBrush;
+    _barsBrush = null;
     if (!brush) return;
     brush.svg.querySelector('.chart-brush')?.remove();
-    const view = document.getElementById('dashboard-alerts-chart');
-    if (!view) return;
-    view.classList.remove('is-brushing');
-    if (!release || !brush.moved) return;
-    try {
-        view.releasePointerCapture(brush.pointerId);
-    } catch (e) {
-        // the browser let go of it already
+    const view = brush.view;
+    if (view) {
+        view.classList.remove('is-brushing');
+        if (release && brush.moved) {
+            try {
+                view.releasePointerCapture(brush.pointerId);
+            } catch (e) {
+                // the browser let go of it already
+            }
+        }
     }
+    if (typeof brush.host.onStop === 'function') brush.host.onStop();
 }
 
 // The mark of the range being drawn: over its bars, as high as the plot
-function _dashboardBrushMark(brush) {
+function _barsBrushMark(brush) {
     const svg = brush.svg, slot = Number(svg.getAttribute('width')) / brush.bins.length;
     let mark = svg.querySelector('.chart-brush');
     if (!mark) {
@@ -1358,21 +1424,11 @@ function _dashboardBrushMark(brush) {
 }
 
 // The bar under the pointer at clientX: the first or the last beyond the ends
-function _dashboardBinAt(svg, clientX, n) {
+function _barsBinAt(svg, clientX, n) {
     const rect = svg.getBoundingClientRect(), width = Number(svg.getAttribute('width')) || rect.width;
     if (!(width > 0) || !(n > 0)) return 0;
     const x = (clientX - rect.left) * (rect.width > 0 ? width / rect.width : 1);
     return Math.min(n - 1, Math.max(0, Math.floor(x / (width / n))));
-}
-
-// The bars for the new size of their card; nothing while the dashboard is
-// hidden, for the size they have or while a range is drawn across them
-function redrawDashboardChartsOnResize() {
-    const drawn = _dashboardDrawn, size = _dashboardBarsSize();
-    if (!drawn.bars || _dashboardBrush || !size.width || !size.height
-        || (drawn.size && size.width === drawn.size.width && size.height === drawn.size.height)) return;
-    drawn.size = size;
-    _drawDashboardBars(drawn);
 }
 
 // =============================================
@@ -1383,13 +1439,16 @@ function redrawDashboardChartsOnResize() {
 // so they outlast a re-render and a theme switch (same nodes). The charts
 // filter further, by a time range, a category, a rule and a process
 // (alertsExtraFilter); each of these shows as a chip in the filter bar,
-// whose × takes it off. A refresh re-renders the table only while the tab is
-// open and only if what it shows changed; the place in the list stays unless
-// the filters changed. The tab scrolls as a whole, the filter bar stands at
-// its top.
+// whose × takes it off. A click on a chart, and a range drawn across the
+// bars of OVER TIME, is a step of a drilldown, which can be taken back
+// (alertsDrilldown): the drilldown bar above the charts shows the steps,
+// with BACK. A refresh re-renders the table only while the tab is open and
+// only if what it shows changed; the place in the list stays unless the
+// filters changed. The tab scrolls as a whole, the drilldown bar and the
+// filter bar stand at its top.
 const ALERTS_TAB_LIMIT = 2000;
 const ALERT_SEVERITIES = ['critical', 'high', 'medium', 'low', 'info'];
-let _alertsTabShown = null;     // {alerts, processes, filterKey, chips} of the rendered table
+let _alertsTabShown = null;     // {alerts, processes, filterKey, chips, count} of the rendered table
 // The filters of the charts: a time range in epoch ms (from included, to
 // not), a category, a rule and a process; null = none
 const alertsExtraFilter = { from: null, to: null, category: null, rule: null, process: null };
@@ -1584,8 +1643,12 @@ function renderAlertsTab() {
     const filterKey = JSON.stringify([filter.severities, filter.engine.toLowerCase(), filter.text.trim().toLowerCase(),
         filter.from, filter.to, ...[filter.category, filter.rule, filter.process].map(_alertsNameKey)]);
     const chips = JSON.stringify(_alertsExtraOf(alertsExtraFilter));     // the chart filters as the chips show them
+    // Nothing else to draw, but the path of the drilldown may be another all the same (the same jump twice)
     if (shown && shown.alerts === alerts && shown.processes === state.processes && shown.filterKey === filterKey
-        && shown.chips === chips) return;
+        && shown.chips === chips) {
+        renderAlertsDrillBar(shown.count, alerts.length);
+        return;
+    }
     const matches = filterAlerts(alerts, filter);
     const tab = document.getElementById('tab-alerts');
     const scrollTop = tab ? tab.scrollTop : 0;
@@ -1596,19 +1659,25 @@ function renderAlertsTab() {
         : `<tr class="alerts-empty-row" data-sort-skip><td colspan="6">${alerts.length ? 'No alerts match the filters.' : 'No alerts yet.'}</td></tr>`;
     // Re-rendered only when they changed: a chip in focus keeps it when new alerts arrive
     if (!shown || shown.chips !== chips) renderAlertsActiveFilters();
+    // Before the place in the list is set: the list starts under the drilldown bar as it is now
+    renderAlertsDrillBar(matches.length, alerts.length);
     // The same filters keep the place in the list. Other filters start at its
-    // top: with the filter bar standing at the top of the tab, the first row
-    // right under it, so the bar stays under the pointer; above that, nothing moves.
+    // top: with the drilldown bar and the filter bar standing at the top of
+    // the tab, the first row right under them, so the bars stay under the
+    // pointer; above that, nothing moves.
     if (tab) tab.scrollTop = shown && shown.filterKey === filterKey ? scrollTop : Math.min(scrollTop, _alertsListTop(tab));
     const count = document.getElementById('alerts-count');
     if (count) count.textContent = `${matches.length} of ${alerts.length}`;
-    _alertsTabShown = { alerts, processes: state.processes, filterKey, chips };
+    _alertsTabShown = { alerts, processes: state.processes, filterKey, chips, count: matches.length };
 }
 
 // How far the tab is scrolled when its list starts at the top: the first row
-// right under the filter bar, which then stands at the top of the tab
+// right under the filter bar and, while a step shows it, the drilldown bar,
+// which then stand at the top of the tab
 function _alertsListTop(tab) {
-    return _tabListTop(tab, tab.querySelector('.alerts-filters'), document.getElementById('alerts-table-wrap'));
+    const top = _tabListTop(tab, tab.querySelector('.alerts-filters'), document.getElementById('alerts-table-wrap'));
+    const drillBar = document.getElementById('alerts-drill');
+    return drillBar && !drillBar.hidden ? Math.max(0, top - drillBar.getBoundingClientRect().height) : top;
 }
 
 // How far a tab that scrolls as a whole is scrolled when `list` starts at
@@ -1659,33 +1728,45 @@ function _alertsExtraOf(filter) {
              rule: name(filter.rule), process: name(filter.process) };
 }
 
-// Sets some of the chart filters and keeps the others, e.g. the range of a
-// bar: setAlertsFilters({from, to}); null takes a filter off.
+// Sets some of the chart filters and keeps the others, e.g.
+// setAlertsFilters({rule: null}); null takes a filter off. This is no step
+// of the drilldown, and the steps do not forget the filter: a click on a
+// chart sets its filter with drillAlerts, the × of a chip with
+// removeAlertsFilter.
 function setAlertsFilters(changes) {
     Object.assign(alertsExtraFilter, _alertsExtraOf({ ...alertsExtraFilter, ...changes }));
     renderAlertsTab();
 }
 
-// The × of a chip ('range', 'category', 'rule' or 'process'). A chip in focus
-// hands it on to the chip that takes its place, the search box after the last.
+// The × of a chip ('range', 'category', 'rule' or 'process') takes off its
+// filter by hand: the steps of the drilldown forget it before the tab is
+// drawn. A chip in focus hands the focus on to the chip that takes its
+// place, the search box after the last.
 function removeAlertsFilter(kind) {
     const holder = document.getElementById('alerts-active-filters');
     const chips = () => (holder ? [...holder.querySelectorAll('.alerts-filter-chip')] : []);
     const focused = chips().indexOf(document.activeElement);
+    forgetAlertsDrill([kind]);
     setAlertsFilters(kind === 'range' ? { from: null, to: null } : { [kind]: null });
     if (focused < 0) return;
     const left = chips();
     (left[Math.min(focused, left.length - 1)] || document.getElementById('alerts-filter-text'))?.focus();
 }
 
-// The table head stands right under the filter bar, which grows with its
-// chips and when it wraps: --alerts-bar-height on the head (six cells, never
-// rebuilt) follows the bar's height, border included. The bars and the
-// Sankey above it are drawn for the width of their cards: again, in the next
-// frame, when the width of the charts changes (the window, the theme, the
-// tab shown again).
+// The drilldown bar stands at the top of the tab, the filter bar right under
+// it, the table head under both; each bar grows with what it holds (the
+// path, the chips) and when it wraps: --alerts-path-height on the tab (0 px
+// while the bar is hidden) and --alerts-bar-height on the head (six cells,
+// never rebuilt) follow their heights, border included. The bars and the
+// Sankey above the filter bar are drawn for the width of their cards: again,
+// in the next frame, when the width of the charts changes (the window, the
+// theme, the tab shown again). OVER TIME takes a range drawn across its bars
+// (ALERTS_BARS_BRUSH), with ResizeObserver or without.
 function initAlertsTab() {
+    initBarsBrush(ALERTS_BARS_BRUSH);
     if (typeof ResizeObserver === 'undefined') return;
+    const tab = document.getElementById('tab-alerts'), drillBar = document.getElementById('alerts-drill');
+    if (tab && drillBar) _followBarHeight(drillBar, tab, '--alerts-path-height');
     const bar = document.querySelector('#tab-alerts .alerts-filters');
     const head = document.querySelector('#alerts-table thead');
     if (bar && head) _followBarHeight(bar, head, '--alerts-bar-height');
@@ -1693,33 +1774,32 @@ function initAlertsTab() {
     if (charts) new ResizeObserver(() => requestAnimationFrame(redrawAlertsChartsOnResize)).observe(charts);
 }
 
-// The height of a filter bar standing at the top of its tab, border
-// included, as the variable `name` on `holder`, for the table head under the
-// bar to stand right below it, whatever the bar's height (chips, wrapping)
+// The height of a bar standing at the top of its tab (a filter bar, the
+// drilldown bar of the Alerts tab), border included, as the variable `name`
+// on `holder`, for what stands under the bar to stand right below it,
+// whatever the bar's height (chips, wrapping; 0 while it is hidden)
 function _followBarHeight(bar, holder, name) {
     new ResizeObserver(() => holder.style.setProperty(name, `${bar.getBoundingClientRect().height}px`))
         .observe(bar, { box: 'border-box' });
 }
 
-// A chip of the filter bar switches its severity on or off
+// A chip of the filter bar switches its severity on or off, by hand: the
+// steps of the drilldown forget the severities before the tab is drawn
 function toggleAlertsSeverity(severity) {
     const chip = document.querySelector(`#tab-alerts .alerts-sev-chip[data-severity="${cssToken(severity)}"]`);
     if (!chip) return;
     chip.setAttribute('aria-pressed', String(chip.getAttribute('aria-pressed') !== 'true'));
+    forgetAlertsDrill(['severities']);
     renderAlertsTab();
 }
 
-// A slice or a legend row of SEVERITY shows the alerts of its severity alone:
-// its chip pressed, the others not; nothing changes when it is the only one
-// pressed already (a click that let go of it would show every severity)
+// A slice or a legend row of SEVERITY shows the alerts of its severity alone,
+// a step of the drilldown: its chip pressed, the others not; no step when it
+// is the only one pressed already (a click that let go of it would show
+// every severity)
 function selectAlertsSeverity(severity) {
-    const chips = [...document.querySelectorAll('#tab-alerts .alerts-sev-chip')];
-    const chip = chips.find(c => c.dataset.severity === severity);
-    if (!chip) return;
-    const pressed = chips.filter(c => c.getAttribute('aria-pressed') === 'true');
-    if (pressed.length === 1 && pressed[0] === chip) return;
-    chips.forEach(c => c.setAttribute('aria-pressed', String(c === chip)));
-    renderAlertsTab();
+    const chip = [...document.querySelectorAll('#tab-alerts .alerts-sev-chip')].find(c => c.dataset.severity === severity);
+    if (chip) drillAlerts({ severities: [severity] });
 }
 
 // The search renders once typing pauses: a full table takes about 0.1 s to
@@ -1731,40 +1811,305 @@ function scheduleAlertsRender() {
     _alertsRenderTimer = setTimeout(renderAlertsTab, 200);
 }
 
-// Opens the Alerts tab with exactly these filters (others cleared), e.g.
-// openAlertsTab({severities: ['critical', 'high']}), or from a chart
-// openAlertsTab({category: 'registry', from, to}); no filter shows every alert.
-// The tab opens at its top, the charts and the filters in view.
+// Opens the Alerts tab with exactly these filters (others cleared, the search
+// too unless `text` is given), e.g. openAlertsTab({severities: ['critical',
+// 'high']}), or from a chart openAlertsTab({category: 'registry', from, to});
+// no filter shows every alert. The jump starts a new drilldown: one step of
+// the filters it set, from none (BACK then shows every alert), also when it
+// changes nothing; no step without a filter. The tab opens at its top, the
+// charts and the filters in view.
 function openAlertsTab(filter) {
     filter = filter || {};
-    const severities = new Set((filter.severities || []).map(s => String(s || '').toLowerCase()));
-    document.querySelectorAll('#tab-alerts .alerts-sev-chip').forEach(chip =>
-        chip.setAttribute('aria-pressed', String(severities.has(chip.dataset.severity))));
-    const engine = document.getElementById('alerts-filter-engine');
-    if (engine) setAlertsEngineOptions(engine, alertEngines(state.alerts), filter.engine);
+    const none = Object.fromEntries(ALERTS_DRILL_KINDS.map(kind => [kind, _alertsDrillNone(kind)]));
+    _setAlertsDrillValues({ ...none, ..._alertsDrillOf(filter, none) });
     const text = document.getElementById('alerts-filter-text');
     if (text) text.value = String(filter.text || '');
-    Object.assign(alertsExtraFilter, _alertsExtraOf(filter));
+    const after = alertsDrillValues();
+    const kinds = ALERTS_DRILL_KINDS.filter(kind => !_alertsDrillSame(kind, none[kind], after[kind]));
+    alertsDrilldown.length = 0;
+    if (kinds.length) alertsDrilldown.push(_alertsDrillStep(true, none, after, kinds));
+    alertsDrillVersion++;
     switchTab('alerts');
     const tab = document.getElementById('tab-alerts');
     if (tab) tab.scrollTop = 0;
 }
 
+// --- The drilldown: the steps that narrowed the tab ---
+// A click on a chart that changes the filters, a range drawn across OVER
+// TIME and a jump from the dashboard that sets a filter are steps:
+// {dashboard, before, after}, the kinds of filter the step changed (of
+// ALERTS_DRILL_KINDS) with their values before and after it, as
+// alertsDrillValues gives them. BACK and a jump to a step set the values
+// before the later steps again, the newest first, and nothing else: not the
+// search, nor a filter of another kind. What is set by hand in the filter
+// bar (a severity chip, the engine choice, the × of a chip) is no step; the
+// steps forget its kind, a step left without one drops out, so the path
+// names only what is in effect and BACK never undoes a setting of one's
+// own. The steps last until the page is reloaded, as the filters do.
+const ALERTS_DRILL_KINDS = ['range', 'severities', 'engine', 'category', 'rule', 'process'];
+// The steps, the oldest first
+const alertsDrilldown = [];
+// Counts the changes of the steps: what shows the path draws it again when
+// this changed, also when the filters did not (the same jump twice)
+let alertsDrillVersion = 0;
+// The drilldown bar shows ALL ALERTS, the last ALERTS_DRILL_VISIBLE steps
+// and, before them, the older ones together as "…"
+const ALERTS_DRILL_VISIBLE = 3;
+// The version of the steps the path of the bar was drawn for (null: none)
+let _alertsDrillDrawn = null;
+
+// The filters as the steps hold them: the time range {from, to}, the
+// severities pressed (in the order of ALERT_SEVERITIES), the engine chosen
+// ('' for all) and the category, rule and process (null for none)
+function alertsDrillValues() {
+    const f = alertsFilterFromControls();
+    return { range: { from: f.from, to: f.to }, severities: ALERT_SEVERITIES.filter(s => f.severities.includes(s)),
+             engine: f.engine, category: f.category, rule: f.rule, process: f.process };
+}
+
+// A step: sets the filters of `change` (filterAlerts' fields {from, to},
+// {severities}, {engine}, {category}, {rule}, {process}, or several; a field
+// left out keeps its filter) and draws the tab. The step holds the kinds the
+// change changed, compared as the filters compare them: a range by both
+// bounds, the severities as a set, the engine and the names in any case and
+// without blanks around them. A change that changes none is no step and
+// sets nothing: false.
+function drillAlerts(change) {
+    const before = alertsDrillValues(), wanted = _alertsDrillOf(change || {}, before);
+    const kinds = ALERTS_DRILL_KINDS.filter(kind => kind in wanted && !_alertsDrillSame(kind, before[kind], wanted[kind]));
+    if (!kinds.length) return false;
+    _setAlertsDrillValues(Object.fromEntries(kinds.map(kind => [kind, wanted[kind]])));
+    alertsDrilldown.push(_alertsDrillStep(false, before, alertsDrillValues(), kinds));
+    alertsDrillVersion++;
+    renderAlertsTab();
+    return true;
+}
+
+// BACK: the last step taken back
+function alertsDrillBack() {
+    alertsDrillTo(alertsDrilldown.length - 2);
+}
+
+// A jump to the step numbered `index` (-1: to before the first): the steps
+// after it are taken back, the newest first, each setting the values before
+// it again; then the tab is drawn. Nothing to take back, nothing happens.
+function alertsDrillTo(index) {
+    const keep = Math.max(0, Math.floor(index) + 1);
+    if (!(alertsDrilldown.length > keep)) return;
+    while (alertsDrilldown.length > keep) _setAlertsDrillValues(alertsDrilldown.pop().before);
+    alertsDrillVersion++;
+    renderAlertsTab();
+}
+
+// Filters set by hand: the steps forget these kinds (names of
+// ALERTS_DRILL_KINDS), a step left without a kind drops out
+function forgetAlertsDrill(kinds) {
+    const forget = new Set([].concat(kinds));
+    if (!alertsDrilldown.some(step => Object.keys(step.after).some(kind => forget.has(kind)))) return;
+    const left = alertsDrilldown.map(step => _alertsDrillStep(step.dashboard, step.before, step.after,
+                                                              Object.keys(step.after).filter(kind => !forget.has(kind))));
+    alertsDrilldown.splice(0, alertsDrilldown.length, ...left.filter(step => Object.keys(step.after).length));
+    alertsDrillVersion++;
+}
+
+// The name of a step, as text: its kinds in the order of ALERTS_DRILL_KINDS
+// joined by " · ", a range as its chip names it, the severities in capitals
+// joined by " + ", the engine by its name, the others as "category: …",
+// "rule: …", "process: …"; a jump from the dashboard begins "Dashboard: "
+function alertsStepLabel(step) {
+    const after = step?.after || {};
+    const names = ALERTS_DRILL_KINDS.filter(kind => kind in after).map(kind => {
+        const value = after[kind];
+        if (kind === 'range') return chartRangeLabel(value.from, value.to);
+        if (kind === 'severities') return value.map(s => s.toUpperCase()).join(' + ');
+        return kind === 'engine' ? value : `${kind}: ${value ?? ''}`;
+    });
+    return (step?.dashboard ? 'Dashboard: ' : '') + names.join(' · ');
+}
+
+// The engine chosen by hand in the filter bar: the steps forget the engine
+// before the tab is drawn
+function onAlertsEngineChange() {
+    forgetAlertsDrill(['engine']);
+    renderAlertsTab();
+}
+
+// The value of a kind of filter that filters nothing
+function _alertsDrillNone(kind) {
+    return kind === 'range' ? { from: null, to: null } : kind === 'severities' ? [] : kind === 'engine' ? '' : null;
+}
+
+// Whether two values of a kind of filter filter alike: a range by both
+// bounds, severities as a set, the engine and the names as the filters
+// compare them (_alertsNameKey)
+function _alertsDrillSame(kind, a, b) {
+    if (kind === 'range') return a.from === b.from && a.to === b.to;
+    if (kind === 'severities') {
+        const x = new Set(a), y = new Set(b);
+        return x.size === y.size && [...x].every(s => y.has(s));
+    }
+    return _alertsNameKey(a) === _alertsNameKey(b);
+}
+
+// The values of the kinds of filter `change` sets (drillAlerts' fields; one
+// left out or undefined sets nothing), as alertsDrillValues gives them: the
+// severities only those of a chip, the engine without the blanks around it
+// (as the names), a range with a bound it is not given from `current`
+function _alertsDrillOf(change, current) {
+    const given = field => change[field] !== undefined;
+    const extra = _alertsExtraOf(change), values = {};
+    if (given('from') || given('to')) {
+        values.range = { from: given('from') ? extra.from : current.range.from, to: given('to') ? extra.to : current.range.to };
+    }
+    if (given('severities')) {
+        const wanted = new Set((change.severities || []).map(s => String(s || '').toLowerCase()));
+        values.severities = ALERT_SEVERITIES.filter(s => wanted.has(s));
+    }
+    if (given('engine')) values.engine = String(change.engine ?? '').trim();
+    for (const kind of ['category', 'rule', 'process']) if (given(kind)) values[kind] = extra[kind];
+    return values;
+}
+
+// Sets the filters of the kinds in `values` (alertsDrillValues' form) and
+// leaves the others and the search as they are; draws nothing. Not through
+// the handlers of the filter bar, which would make the steps forget them.
+// The engine takes the spelling the engine choice offers.
+function _setAlertsDrillValues(values) {
+    if ('severities' in values) {
+        const pressed = new Set(values.severities);
+        document.querySelectorAll('#tab-alerts .alerts-sev-chip').forEach(chip =>
+            chip.setAttribute('aria-pressed', String(pressed.has(chip.dataset.severity))));
+    }
+    const select = document.getElementById('alerts-filter-engine');
+    if ('engine' in values && select) setAlertsEngineOptions(select, alertEngines(state.alerts), values.engine);
+    const extra = { ...alertsExtraFilter, ...('range' in values ? values.range : {}) };
+    for (const kind of ['category', 'rule', 'process']) if (kind in values) extra[kind] = values[kind];
+    Object.assign(alertsExtraFilter, _alertsExtraOf(extra));
+}
+
+// A step of these kinds of filter, with their values before and after it
+function _alertsDrillStep(dashboard, before, after, kinds) {
+    const pick = values => Object.fromEntries(kinds.map(kind => [kind, values[kind]]));
+    return { dashboard, before: pick(before), after: pick(after) };
+}
+
+// --- The drilldown bar: BACK and the path above the charts ---
+// The bar (#alerts-drill) while a step narrows the tab, hidden without one:
+// ‹ BACK, DRILLDOWN, the path of the steps and the count of the table,
+// `shown` of `total` alerts (renderAlertsTab, after each drawing). The path
+// is drawn again only when the steps changed (alertsDrillVersion), so new
+// alerts leave a step in focus as it is; a step in focus drawn anew hands
+// the focus to BACK. With the path, BACK's title and its name for screen
+// readers say where it goes, as text: "Back to" the step before the last,
+// "Back to all alerts" from the only one. A bar that goes with the focus in
+// it hands a focus of the keyboard on to the search box; after a click of
+// the mouse the focus stays where the browser leaves it (the search box
+// would light up, a touch screen open its keyboard).
+function renderAlertsDrillBar(shown, total) {
+    const bar = document.getElementById('alerts-drill');
+    if (!bar) return;
+    const path = document.getElementById('alerts-drill-path'), count = document.getElementById('alerts-drill-count');
+    const back = bar.querySelector('[data-drill="back"]');
+    const focus = document.activeElement;
+    const inBar = !!focus && bar.contains(focus);
+    // Asked before the path is drawn anew: a step taken out of the page is no longer focused
+    const byKeyboard = inBar && _focusFromKeyboard(focus);
+    let lost = false;
+    if (path && _alertsDrillDrawn !== alertsDrillVersion) {
+        lost = inBar && path.contains(focus);
+        path.innerHTML = alertsDrilldown.length ? _alertsDrillPathHtml(alertsDrilldown) : '';
+        const before = alertsDrilldown[alertsDrilldown.length - 2];
+        const where = `Back to ${before ? alertsStepLabel(before) : 'all alerts'}`;
+        back?.setAttribute('title', where);
+        back?.setAttribute('aria-label', where);
+        _alertsDrillDrawn = alertsDrillVersion;
+    }
+    const text = `${_chartNumber(shown)} of ${_chartNumber(total)} alerts`;
+    if (count && count.textContent !== text) count.textContent = text;
+    bar.hidden = !alertsDrilldown.length;
+    if (inBar && bar.hidden) {
+        if (byKeyboard) document.getElementById('alerts-filter-text')?.focus();
+    } else if (lost) back?.focus();
+}
+
+// Whether the focus on `el` came from the keyboard (it matches
+// :focus-visible). A browser that does not know the selector counts as the
+// keyboard, so a keyboard user is not left without the focus.
+function _focusFromKeyboard(el) {
+    try {
+        return el.matches(':focus-visible');
+    } catch (e) {
+        return true;
+    }
+}
+
+// The path of the drilldown bar: ALL ALERTS, the steps before the last
+// ALERTS_DRILL_VISIBLE together as "…" (its title names them, and so does a
+// text for screen readers only in it), then those; each a button that jumps
+// back to it (data-drill-step: its number, -1 for ALL ALERTS) but the last,
+// the current step; › between them. The names as text, each in full in its
+// title (a long one is cut by CSS).
+function _alertsDrillPathHtml(steps) {
+    const labels = steps.map(alertsStepLabel);
+    const first = Math.max(0, labels.length - ALERTS_DRILL_VISIBLE);
+    const parts = ['<button type="button" class="alerts-drill-step" data-drill-step="-1">ALL ALERTS</button>'];
+    if (first > 0) {
+        const folded = escapeHtml(labels.slice(0, first).join(' › '));
+        parts.push(`<span class="alerts-drill-more" title="${folded}">…<span class="visually-hidden">${folded}</span></span>`);
+    }
+    for (let i = first; i < labels.length; i++) {
+        const name = escapeHtml(labels[i]);
+        parts.push(i === labels.length - 1
+            ? `<span class="alerts-drill-step is-current" aria-current="step" title="${name}">${name}</span>`
+            : `<button type="button" class="alerts-drill-step" data-drill-step="${i}" title="${name}">${name}</button>`);
+    }
+    return parts.join('<span class="alerts-drill-sep" aria-hidden="true">›</span>');
+}
+
+// A click in the drilldown bar, its one handler: BACK takes the last step
+// back, a step of the path jumps back to it (its number from data-drill-step,
+// -1 for ALL ALERTS); anything else (›, DRILLDOWN, "…", the current step,
+// the count) does nothing
+function onAlertsDrillClick(event) {
+    const target = event && event.target;
+    if (!target || typeof target.closest !== 'function') return;
+    if (target.closest('[data-drill="back"]')) {
+        alertsDrillBack();
+        return;
+    }
+    const step = target.closest('[data-drill-step]');
+    if (step) alertsDrillTo(Number(step.getAttribute('data-drill-step')));
+}
+
 // --- The charts of the Alerts tab ---
 // Above the filter bar: SEVERITY and ENGINE as pies beside their legends,
-// OVER TIME (twice as wide) as bars per hour, day or week stacked by
-// severity, below them FLOW, a Sankey engine → rule → process. They count
-// the alerts the filters let through, every one (the table shows the newest
-// 2000); an alert without a time is in no bar, a note under the bars counts
-// those. A click sets the filter of the part clicked (onAlertsChartClick),
-// so the table then lists what the part counted. Each card shows its numbers
-// as a table on request (CHART / TABLE).
+// OVER TIME (twice as wide) as bars per hour, day or week (seconds or
+// minutes for a span of up to 20 hours) stacked by severity, below them
+// FLOW, a Sankey engine → rule → process. They count the alerts the filters
+// let through, every one (the table shows the newest 2000); an alert without
+// a time is in no bar, a note under the bars counts those. A click sets the
+// filter of the part clicked (onAlertsChartClick), and a range drawn across
+// the bars of OVER TIME their period (ALERTS_BARS_BRUSH), so the table then
+// lists what the parts counted. Each card shows its numbers as a table on
+// request (CHART / TABLE).
 // The Sankey by square roots (small flows stay visible) or, with LINEAR, in
 // true proportions, until the page is reloaded
 const alertsFlowView = { linear: false };
 // What the bars and the Sankey on screen were drawn from, and for which widths:
-// a resize or LINEAR draws them again without counting again
+// a resize or LINEAR draws them again without counting again; timeHeld: the
+// bars of OVER TIME are still to be drawn from it (a press on them held them)
 let _alertsChartsDrawn = null;
+// OVER TIME takes a range drawn across its bars (initBarsBrush), a step of
+// the drilldown (_drillAlertsBars). While a press on the bars lasts they are
+// not drawn; once it is over they are, if that was put off (_drawAlertsTimeHeld).
+// While they are held back so, the bars on screen are not those counted: a
+// press on them then begins nothing (no bins).
+const ALERTS_BARS_BRUSH = {
+    view: 'alerts-time-chart',
+    bins: () => (_alertsChartsDrawn && !_alertsChartsDrawn.timeHeld ? _alertsChartsDrawn.time.bins : []),
+    onRange: (first, last, bins) => _drillAlertsBars(bins.slice(first, last + 1)),
+    onStop: () => setTimeout(_drawAlertsTimeHeld, 0),
+};
 // The first time an alert or a Sysmon event can plausibly have: one of a
 // clock set to 1970 (or a FILETIME of 0, 1601) would squeeze every other bar
 // into one
@@ -1786,9 +2131,10 @@ function renderAlertsCharts(matches) {
     const engines = alertsEngineItems(list);
     _drawAlertsPie('severity', alertsSeverityItems(list), empty);
     _drawAlertsPie('engine', engines, empty);
-    // The bars span the time range of the filters, when one is set
+    // The bars span the time range of the filters, when one is set; a span of
+    // up to 20 hours takes seconds or minutes, so a narrowed range shows detail
     const range = _alertsExtraOf(alertsExtraFilter);
-    const time = alertSeverityBins(list, { from: range.from, to: range.to });
+    const time = alertSeverityBins(list, { from: range.from, to: range.to, fine: true });
     const flow = alertFlow(list, { top: 6, names: state.alerts });
     flow.colors = _alertsFlowColors(flow, engines);
     _alertsChartsDrawn = { widths, empty, time, flow };
@@ -1908,7 +2254,8 @@ function chartTimeBins(items, opts) {
 
 // The alerts per hour, day or week stacked by severity, for OVER TIME and
 // ALERT ACTIVITY: chartTimeBins' {unit, bins, untimed, implausible} (opts:
-// from, to, until, now)
+// from, to, until, now; fine for OVER TIME: a short span in seconds or
+// minutes, with their step)
 function alertSeverityBins(alerts, opts) {
     return chartTimeBins(alerts, { ...opts, key: alertSeverity, keys: SEVERITY_ORDER });
 }
@@ -1920,27 +2267,45 @@ function _alertsTimeNote(time) {
 }
 
 // Bars of alertSeverityBins (opts: width, height, selection), each severity
-// in its colour of SEVERITY, one no chip names muted as there
+// in its colour of SEVERITY, one no chip names muted as there; labelled by
+// the unit and step they were counted in
 function _alertsTimeBarsSvg(time, opts) {
     const colors = Object.create(null);         // keys from the data: none may be special (__proto__)
     for (const bin of time.bins) Object.keys(bin.counts).forEach(key => { colors[key] = _alertsSeverityColor(key); });
-    return stackedBarsSvg(time.bins, { ...opts, keys: SEVERITY_ORDER, colors, unit: time.unit });
+    return stackedBarsSvg(time.bins, { ...opts, keys: SEVERITY_ORDER, colors, unit: time.unit, step: time.step });
 }
 
 // OVER TIME from what renderAlertsCharts counted: the bars for the width of
-// their card, under them the note of the alerts in no bar; a bar without
-// alerts sets no range. The table view.
+// their card, a bar without alerts marked (it sets no range); on the line
+// under them how to use them (as under ALERT ACTIVITY), then the note of the
+// alerts in no bar. The bars leave room for that line, so the card keeps the
+// height of the pies beside it. The table view. Nothing while a press on the
+// bars lasts (a range may be drawn across them): drawn.timeHeld, and they are
+// drawn after its end (_drawAlertsTimeHeld).
 function _drawAlertsTime(drawn) {
+    drawn.timeHeld = barsBrushActive(ALERTS_BARS_BRUSH);
+    if (drawn.timeHeld) return;
     const view = document.getElementById('alerts-time-chart'), table = document.getElementById('alerts-time-table');
+    const svg = drawn.empty ? '' : _alertsTimeBarsSvg(drawn.time, { width: drawn.widths.time || 560, height: 104 });
     const missed = _alertsTimeNote(drawn.time);
-    const note = missed ? '<div class="alerts-chart-note" title="Alerts without a readable time or with one no clock can have had (before 2000, more than a day ahead) are in no bar; SEVERITY, ENGINE and FLOW count them">'
-        + `${escapeHtml(missed)}</div>` : '';
-    const svg = drawn.empty ? '' : _alertsTimeBarsSvg(drawn.time, { width: drawn.widths.time || 560, height: note ? 104 : 120 });
+    // The hint breaks after its "·" on a narrow card, not inside a phrase
+    const line = (svg ? '<span class="alerts-time-hint"><span>Drag across the bars to narrow the range ·</span> <span>click a bar to show only its period</span></span>' : '')
+        + (missed ? '<span class="alerts-time-missed" title="Alerts without a readable time or with one no clock can have had (before 2000, more than a day ahead) are in no bar; SEVERITY, ENGINE and FLOW count them">'
+                    + `${escapeHtml(missed)}</span>` : '');
     if (view) {
-        view.innerHTML = (svg || chartEmptyHtml(drawn.empty || 'No alerts with a time')) + note;
+        view.innerHTML = (svg || chartEmptyHtml(drawn.empty || 'No alerts with a time')) + (line ? `<div class="alerts-chart-note">${line}</div>` : '');
         _alertsChartInert(view, '[data-bin-start]', el => !(Number(el.getAttribute('data-total')) > 0));
     }
     if (table) table.innerHTML = _alertsTimeTableHtml(drawn.time, drawn.empty, '<table class="view-table" data-sortable data-sort-id="alerts-time">');
+}
+
+// After a press on the bars of OVER TIME (ALERTS_BARS_BRUSH), once the task
+// of its end is over: the bars as renderAlertsCharts counted them last, if
+// they were not drawn while it lasted (new alerts, another width). Not within
+// that task: Chrome sends the click of the release only to a bar still on
+// the page, and the step of that click draws them anyway.
+function _drawAlertsTimeHeld() {
+    if (_alertsChartsDrawn && _alertsChartsDrawn.timeHeld) _drawAlertsTime(_alertsChartsDrawn);
 }
 
 // The table view of bars of alertSeverityBins, `table` its <table> tag: each
@@ -2068,10 +2433,13 @@ function _alertsChartInert(view, selector, inert) {
     view.querySelectorAll(selector).forEach(el => { if (inert(el)) el.classList.add('chart-inert'); });
 }
 
-// A click on a chart of the Alerts tab sets the filter of the part clicked:
-// the slice or legend row of a severity shows that severity alone
-// (selectAlertsSeverity), of an engine chooses the engine; a bar sets its
-// period; a node of FLOW its engine, rule or process, a band both of its
+// A click on a chart of the Alerts tab sets the filter of the part clicked,
+// as a step of the drilldown (drillAlerts): the slice or legend row of a
+// severity shows that severity alone (selectAlertsSeverity), of an engine
+// chooses the engine; a bar sets its period, that of the bar pressed
+// wherever the browser sends the click (barsClickPeriod), and the click of
+// a press that drew a range across the bars nothing (the range was the
+// step); a node of FLOW its engine, rule or process, a band both of its
 // ends. "other rules", "other processes", alerts without an engine, a
 // severity without a chip, a band with such an end and a bar without alerts
 // set nothing: each would list other alerts than it shows (more, or none).
@@ -2079,10 +2447,8 @@ function onAlertsChartClick(event, chart) {
     const target = event && event.target;
     if (!target || typeof target.closest !== 'function') return;
     if (chart === 'time') {
-        const bin = target.closest('[data-bin-start]');
-        if (bin && Number(bin.getAttribute('data-total')) > 0) {
-            setAlertsFilters({ from: bin.getAttribute('data-bin-start'), to: bin.getAttribute('data-bin-end') });
-        }
+        const period = barsClickPeriod(event, ALERTS_BARS_BRUSH);
+        if (period) drillAlerts(period);
     } else if (chart === 'flow') {
         const change = _flowClickFilter(target, _alertsFlowFilter);
         if (change) _applyAlertsChartFilter(change);
@@ -2090,18 +2456,24 @@ function onAlertsChartClick(event, chart) {
         const part = target.closest('[data-key]');
         const key = part ? part.getAttribute('data-key') : '';
         if (chart === 'severity' && ALERT_SEVERITIES.includes(key)) selectAlertsSeverity(key);
-        else if (chart === 'engine' && key) _applyAlertsChartFilter({ engine: key });
+        else if (chart === 'engine' && key) drillAlerts({ engine: key });
     }
 }
 
-// The engine choice and the rule and process filters of a click, in one
-// render; nothing when the click stands for no filter
+// The engine choice and the rule and process filters of a click on FLOW, in
+// one step (drillAlerts); none when the click stands for no filter or
+// changes none (false)
 function _applyAlertsChartFilter(change) {
-    const { engine, ...names } = change || {};
-    if (engine === undefined && !Object.keys(names).length) return;
-    const select = document.getElementById('alerts-filter-engine');
-    if (engine !== undefined && select) setAlertsEngineOptions(select, alertEngines(state.alerts), engine);
-    setAlertsFilters(names);
+    return drillAlerts(change || {});
+}
+
+// A range drawn across bars of OVER TIME (ALERTS_BARS_BRUSH; these bins, the
+// first to the last): a step from the start of the first to the end of the
+// last, so the table lists what they counted. None when no bar of them has
+// alerts (it would empty every card, as a click on such a bar would) or when
+// it changes nothing (false).
+function _drillAlertsBars(bins) {
+    return bins.some(bin => bin.total > 0) && drillAlerts({ from: bins[0].start, to: bins[bins.length - 1].end });
 }
 
 // LINEAR: the Sankey in true proportions, or by square roots again
@@ -2704,8 +3076,9 @@ function _chartClock(t, seconds) {
 }
 
 // A bin's period for its tooltip: "14 Jul 2026, 22:00–23:00", "14 Jul 2026",
-// "13 Jul – 19 Jul 2026", "10 Nov 2026, 19:30:30–19:31:00" for seconds; a
-// day cut short by the range names its hours
+// "13 Jul – 19 Jul 2026", "10 Nov 2026, 19:30:30–19:31:00" for seconds, and
+// so for a bin a range cuts off the full minute ("15:30:17–15:31:00", as the
+// chip of its period names it); a day cut short by the range names its hours
 function _chartPeriodLabel(start, end, unit) {
     if (unit === 'week') {
         const lastDay = end - 1;
@@ -2713,7 +3086,8 @@ function _chartPeriodLabel(start, end, unit) {
         return `${_chartDate(start, !sameYear)} – ${_chartDate(lastDay, true)}`;
     }
     const wholeDay = start === _chartPeriodStart(start, 'day') && end === _chartPeriodNext(start, 'day');
-    const seconds = unit === 'second';
+    const offMinute = t => new Date(t).getSeconds() !== 0 || new Date(t).getMilliseconds() !== 0;
+    const seconds = unit === 'second' || offMinute(start) || offMinute(end);
     return unit === 'day' && wholeDay ? _chartDate(start, true)
         : `${_chartDate(start, true)}, ${_chartClock(start, seconds)}–${_chartClock(end, seconds)}`;
 }
@@ -2721,8 +3095,9 @@ function _chartPeriodLabel(start, end, unit) {
 // A time range (epoch ms, `to` not included) as the chip of a filter names
 // it, in local time: "14 Jul – 20 Jul" when both ends are midnights (the last
 // day included, as a week's tooltip), else with the times, "14 Jul
-// 22:00–23:00" or "14 Jul 23:00 – 15 Jul 00:00"; "from …" or "before …" with
-// one end. The years show when the ends lie in two.
+// 22:00–23:00" or "14 Jul 23:00 – 15 Jul 00:00", to the second when an end
+// is not on a full minute ("27 Jul 11:45:10–11:45:40"); "from …" or
+// "before …" with one end. The years show when the ends lie in two.
 function chartRangeLabel(from, to) {
     const hasFrom = Number.isFinite(from), hasTo = Number.isFinite(to);
     if (!hasFrom && !hasTo) return '';
@@ -2730,12 +3105,15 @@ function chartRangeLabel(from, to) {
     const days = (!hasFrom || midnight(from)) && (!hasTo || midnight(to)) && !(hasFrom && hasTo && to <= from);
     const last = days && hasTo ? to - 1 : to;
     const years = hasFrom && hasTo && new Date(from).getFullYear() !== new Date(last).getFullYear();
-    const at = (t, clock) => `${_chartDate(t, years)}${clock ? ' ' + _chartClock(t) : ''}`;
+    // Both ends with their seconds when one is not on a full minute (a range of bars of seconds)
+    const offMinute = t => new Date(t).getSeconds() !== 0 || new Date(t).getMilliseconds() !== 0;
+    const seconds = (hasFrom && offMinute(from)) || (hasTo && offMinute(to));
+    const at = (t, clock) => `${_chartDate(t, years)}${clock ? ' ' + _chartClock(t, seconds) : ''}`;
     if (!hasTo) return `from ${at(from, !days)}`;
     if (!hasFrom) return `before ${at(to, !days)}`;
     if (days) return _chartPeriodStart(last, 'day') === from ? at(from) : `${at(from)} – ${at(last)}`;
     return to > from && _chartPeriodStart(to, 'day') === _chartPeriodStart(from, 'day')
-        ? `${at(from, true)}–${_chartClock(to)}` : `${at(from, true)} – ${at(to, true)}`;
+        ? `${at(from, true)}–${_chartClock(to, seconds)}` : `${at(from, true)} – ${at(to, true)}`;
 }
 
 // The bins labelled under a bar chart, with their text: the finest of whole

@@ -52,6 +52,55 @@ Regressions covered:
     every other bar into one, or lost between the slices and the bars
   * Sigma's "informational" outside the severity info (grey, no chip)
   * a sorted column of OVER TIME moving when its "Other" column comes and goes
+  * OVER TIME of a range narrowed to a few hours in a bar or two of an hour,
+    or ALERT ACTIVITY in bars of minutes; bars of minutes that leave a gap or
+    change their length in the night the clocks go back
+  * the chip of a range of bars of seconds named without its seconds, so
+    ranges a few seconds apart go by the same name
+  * a drilldown step that BACK does not take back exactly (other counts or
+    rows than before it), a click that changes nothing (the same slice, an
+    engine in other capitals) taken as a step, a step that holds filters it
+    did not change or names them otherwise than the charts and chips do
+  * BACK or a jump in the path undoing a setting of one's own (the search,
+    a severity chip, the engine choice, the × of a chip), or a path that
+    still names a step such a setting replaced; a path drawn before the
+    steps forgot what was set by hand
+  * a jump from the dashboard that adds to the old path instead of starting
+    a new one, that is no step when it changes nothing, whose BACK leaves the
+    tab or brings back what the jump cleared
+  * a range drawn across OVER TIME that is no step, a step of other bars
+    than those marked, or two (its click as well); a press that did not move
+    setting nothing when Chrome sends its click to the <svg>; a range of bars
+    without alerts emptying every card
+  * new alerts drawing OVER TIME again while a range is drawn across it (the
+    mark lost), or not once the press is over; a range drawn across the
+    dashboard's bars taken as a step of the Alerts tab
+  * a bar a range cuts off the full minute named without its seconds, unlike
+    the chip of its period; OVER TIME without the hint how to use its bars,
+    or with one where it shows none; a half of the hint running into the
+    next card
+  * a press on bars of OVER TIME held back for new alerts (they came during
+    the press before it) that marks or narrows by bars not on screen
+  * a drilldown bar shown without a step or hidden with one; a path drawn
+    again only when the filters changed (the same jump twice kept the old
+    path), that names a step no longer in effect or a name from the data as
+    markup; new alerts taking a step in focus off it, the focus lost with the
+    bar or with a step drawn anew
+  * the first row of the list under the drilldown bar or the filter bar
+    after a filter change, the filter bar or the table head over the
+    drilldown bar, the drilldown bar shrunk into the tab
+  * the underline of a step of the path cut off by the step's own box (it
+    cuts a long name); the current step cut at the path's edge without an
+    ellipsis, or losing a letter while a step before it could still give way
+  * a click of the mouse that takes the drilldown bar away lighting up the
+    search box (on a touch screen: opening the keyboard); the bar taking the
+    focus off a control outside it as it goes
+  * a screen reader reading the ‹ of BACK, BACK without a word of where it
+    goes (or of a step no longer there), the folded steps of "…" named only
+    in its tooltip, which screen readers do not read; that text shown in the
+    bar
+  * an engine given with blanks around it a choice of its own that lists
+    nothing; BACK of a step of an engine and a rule leaving one of them set
   * the dashboard counting all alerts again on every poll, for a list or a
     range that did not change, or while it is hidden; a preset that stays at
     the time it was chosen while the clock runs on
@@ -63,6 +112,11 @@ Regressions covered:
     still counting the stopped processes "Clear stopped" took out of the list
   * a drag across the bars that goes on drawing after its button went up
     elsewhere (macOS opens the context menu on Ctrl+click)
+  * two charts of bars that take a range drawn across them reaching into
+    each other: a drag on one setting the range of the other, marking its
+    bars or holding them still; the click of a press on one standing for a
+    bar of the other; a chart not told that a press on it is over; the page
+    listening twice for each press
   * a Sysmon capture of minutes in a single hourly bar; bins of seconds or
     minutes that begin at UTC instead of local multiples of their step
   * Sysmon charts that count other events than the table lists, or the
@@ -132,8 +186,8 @@ import pytest
 
 from conftest import make_alert
 from test_frontend import _function_source, _run_node, needs_node
-from test_theme import (ALERTS_CHART_FUNCTIONS, ALERTS_TAB_FUNCTIONS, APP_JS, CHART_CONSTS, CHART_FUNCTIONS,
-                        DASHBOARD_CHART_CONSTS, DASHBOARD_CHART_FUNCTIONS, DASHBOARD_CHART_LETS, INDEX_HTML,
+from test_theme import (ALERTS_CHART_FUNCTIONS, ALERTS_TAB_FUNCTIONS, APP_JS, BARS_BRUSH_FUNCTIONS, CHART_CONSTS,
+                        CHART_FUNCTIONS, DASHBOARD_CHART_CONSTS, DASHBOARD_CHART_FUNCTIONS, INDEX_HTML,
                         LITERAL_COLOR, NEWEST_ALERTS_FUNCTIONS, SORT_DOM, STYLE_CSS, SYSMON_TAB_FUNCTIONS, THEME_CSS,
                         _alerts_prelude, _const_source, _cyberpunk_palette, _element_markup, _Elements, _hex_rgb,
                         _read, _resolve, _root_values, _rules, _strip_js_comments, _sysmon_prelude, _tab_markup)
@@ -461,7 +515,7 @@ def test_bin_by_time_takes_seconds_and_minutes_for_short_spans(zone):
     each beginning at a multiple of its step in local time (Kathmandu is 5:45
     ahead of UTC: its half hours are no UTC half hours), gapless and of one
     length also through the night the clocks go back. A longer span, and
-    every call without `fine` (the Alerts tab, the dashboard), keeps hours,
+    every call without `fine` (ALERT ACTIVITY of the dashboard), keeps hours,
     days and weeks."""
     r = _run_node(CHART_JS, BINS_LOOK + r"""
         const S = 1000, M = 60000, H = 3600000;
@@ -519,23 +573,31 @@ def test_stacked_bars_label_seconds_and_minutes(zone):
     19:30:30–19:31:00") and their ticks round times with their seconds, which
     take 56 px between them (not the 48 px of shorter labels: at 900 px, a
     tick a minute would stand 51 px apart); bars of minutes without them;
-    midnight is the date, never 24:00."""
-    r = _run_node(CHART_JS, r"""
+    midnight is the date, never 24:00. A bar a range cuts off the full minute
+    is named to the second, as the chip of its period ("10 Nov 2026,
+    15:30:17–15:31:00"), among bars of minutes and of hours alike; the bars
+    it does not cut keep their names."""
+    r = _run_node(CHART_JS + ["chartRangeLabel"], r"""
         const at = (...a) => new Date(...a).getTime();
-        const S = 1000, M = 60000;
+        const S = 1000, M = 60000, H = 3600000;
         const items = (t, n, gap) => Array.from({ length: n }, (_, i) => ({ t: t + i * gap, k: i % 3 ? 'PipeCreated' : 'ProcessCreate' }));
-        const draw = (list, width = 700) => {
-            const { unit, step, bins } = binByTime(list, { time: x => x.t, key: x => x.k, fine: true });
+        const draw = (list, width = 700, range = {}) => {
+            const { unit, step, bins } = binByTime(list, { time: x => x.t, key: x => x.k, fine: true, ...range });
             const svg = stackedBarsSvg(bins, { width, height: 140, keys: ['ProcessCreate', 'PipeCreated'], unit, step });
             return { unit, step, n: bins.length, svg,
                      titles: [...svg.matchAll(/<title>([^<]*)<\/title>/g)].map(m => m[1].split('\n')[0]),
-                     ticks: [...svg.matchAll(/<text class="chart-tick"[^>]*>([^<]*)<\/text>/g)].map(m => m[1]) };
+                     ticks: [...svg.matchAll(/<text class="chart-tick"[^>]*>([^<]*)<\/text>/g)].map(m => m[1]),
+                     chips: bins.map(bin => chartRangeLabel(bin.start, bin.end)) };
         };
+        const cut = at(2026, 10, 10, 15, 30, 17);
         console.log(JSON.stringify({
             halfMinutes: draw(items(at(2026, 10, 10, 19, 30, 45), 35, 30 * S)),      // 17 minutes
             wide: draw(items(at(2026, 10, 10, 19, 30, 45), 35, 30 * S), 900),
             minutes: draw(items(at(2026, 10, 10, 23, 40), 40, 3 * M)),               // two hours over midnight
             seconds: draw(items(at(2026, 10, 10, 9, 0, 7), 12, 3 * S)),              // 33 seconds
+            // A range from 15:30:17: 39 minutes to 16:09:40, a day to 15:30:17 the next day
+            cutMinutes: draw(items(at(2026, 10, 10, 15, 31), 38, M), 700, { from: cut, to: at(2026, 10, 10, 16, 9, 40) }),
+            cutHours: draw(items(at(2026, 10, 10, 16), 23, H), 700, { from: cut, to: at(2026, 10, 11, 15, 30, 17) }),
         }));
     """, _prelude(zone))
     half = r["halfMinutes"]
@@ -556,6 +618,17 @@ def test_stacked_bars_label_seconds_and_minutes(zone):
         seconds["ticks"]
     for view in (half, minutes, seconds):
         assert "24:" not in view["svg"]
+    # Cut off the full minute by the range: its first and last bar to the second, as their chips; the others not
+    cut = r["cutMinutes"]
+    assert (cut["unit"], cut["step"], cut["n"]) == ("minute", 60000, 40)
+    assert [cut["titles"][i] for i in (0, 1, -1)] == ["10 Nov 2026, 15:30:17\u201315:31:00", "10 Nov 2026, 15:31\u201315:32",
+                                                     "10 Nov 2026, 16:09:00\u201316:09:40"], cut["titles"][:2]
+    assert [cut["chips"][i] for i in (0, 1, -1)] == ["10 Nov 15:30:17\u201315:31:00", "10 Nov 15:31\u201315:32",
+                                                    "10 Nov 16:09:00\u201316:09:40"]
+    hours = r["cutHours"]
+    assert (hours["unit"], hours["n"]) == ("hour", 25)
+    assert [hours["titles"][i] for i in (0, 1, -1)] == ["10 Nov 2026, 15:30:17\u201316:00:00", "10 Nov 2026, 16:00\u201317:00",
+                                                       "11 Nov 2026, 15:00:00\u201315:30:17"], hours["titles"][:2]
 
 
 # --- Donut, pie, legend ---------------------------------------------------------
@@ -1425,7 +1498,8 @@ def test_filter_alerts_range_category_rule_process(zone):
 def test_chart_range_label_names_local_days_and_times(zone):
     """The chip of a time range in local time: whole days by their dates (the
     last one included, as the tooltip of a week's bar), other ranges with
-    their times (hours 00-23, the end not included)."""
+    their times (hours 00-23, the end not included; with seconds where an end
+    is not on a full minute)."""
     r = _run_node(["chartRangeLabel", "_chartDate", "_chartClock", "_chartPeriodStart"], r"""
         const at = (...a) => new Date(...a).getTime();          // local time of the zone
         console.log(JSON.stringify([
@@ -1445,8 +1519,34 @@ def test_chart_range_label_names_local_days_and_times(zone):
         ]));
     """, _prelude(zone))
     assert r == ["14 Jul \u2013 20 Jul", "14 Jul", "29 Mar", "25 Oct", "14 Jul 22:00\u201323:00",
-                 "14 Jul 23:00 \u2013 15 Jul 00:00", "03 Nov 14:23 \u2013 10 Nov 14:23", "from 14 Jul", "before 21 Jul",
-                 "from 03 Nov 14:23", "29 Dec 2025 \u2013 04 Jan 2026", "31 Dec", "14 Jul 00:00 \u2013 14 Jul 00:00", ""]
+                 "14 Jul 23:00 \u2013 15 Jul 00:00", "03 Nov 14:23:05 \u2013 10 Nov 14:23:05", "from 14 Jul",
+                 "before 21 Jul", "from 03 Nov 14:23", "29 Dec 2025 \u2013 04 Jan 2026", "31 Dec",
+                 "14 Jul 00:00 \u2013 14 Jul 00:00", ""]
+
+
+@needs_node
+@pytest.mark.parametrize("zone", ZONES)
+def test_chart_range_label_names_seconds_when_needed(zone):
+    """A range of bars of seconds is named to the second: as soon as one of
+    its ends is not on a full minute of local time (by its seconds or its
+    milliseconds), both ends show their seconds. A range on full minutes is
+    named as before."""
+    r = _run_node(["chartRangeLabel", "_chartDate", "_chartClock", "_chartPeriodStart"], r"""
+        const at = (...a) => new Date(...a).getTime();          // local time of the zone
+        console.log(JSON.stringify([
+            chartRangeLabel(at(2026, 6, 27, 11, 45, 10), at(2026, 6, 27, 11, 45, 40)),
+            chartRangeLabel(at(2026, 6, 27, 11, 45), at(2026, 6, 27, 12)),
+            chartRangeLabel(at(2026, 6, 27), at(2026, 6, 28)),
+            chartRangeLabel(at(2026, 6, 27, 23, 59, 30), at(2026, 6, 28, 0, 0, 30)),
+            // One end off the minute (by a second or a millisecond), or the only end
+            chartRangeLabel(at(2026, 6, 27, 11, 45), at(2026, 6, 27, 11, 45, 30)),
+            chartRangeLabel(at(2026, 6, 27, 11, 45, 0, 500), at(2026, 6, 27, 12)),
+            chartRangeLabel(at(2026, 6, 27, 11, 45, 10), null), chartRangeLabel(null, at(2026, 6, 27, 11, 45, 10)),
+        ]));
+    """, _prelude(zone))
+    assert r == ["27 Jul 11:45:10\u201311:45:40", "27 Jul 11:45\u201312:00", "27 Jul",
+                 "27 Jul 23:59:30 \u2013 28 Jul 00:00:30", "27 Jul 11:45:00\u201311:45:30",
+                 "27 Jul 11:45:00\u201312:00:00", "from 27 Jul 11:45:10", "before 27 Jul 11:45:10"]
 
 
 # The Alerts tab of index.html in the test DOM (SORT_DOM: markup is parsed,
@@ -1566,12 +1666,20 @@ def test_active_filter_chips_are_removable():
 
 @needs_node
 def test_the_alerts_table_head_stands_under_the_filter_bar():
-    """The tab scrolls as a whole: the table head stands right under the
-    filter bar, which grows with its chips and when it wraps (its border box,
-    the height the head has to clear). The charts above the bar are drawn
-    again when their width changes, in the next frame. A page without the tab
-    or without ResizeObserver starts all the same."""
-    r = _run_node(["initAlertsTab", "_followBarHeight"], r"""
+    """The tab scrolls as a whole: the filter bar stands right under the
+    drilldown bar, the table head right under both; each bar grows with its
+    contents (the chips, the path) and when it wraps, so each one's border
+    box, the height the bars below have to clear, is followed: the drilldown
+    bar's on the tab (--alerts-path-height, 0 px while it is hidden), the
+    filter bar's on the head (--alerts-bar-height). The charts above the
+    filter bar are drawn again when their width changes, in the next frame.
+    OVER TIME takes a range drawn across its bars, once however often it is
+    set up, and also without ResizeObserver. A page without the tab or
+    without ResizeObserver starts all the same."""
+    functions = ["initAlertsTab", "_followBarHeight"] + BARS_BRUSH_FUNCTIONS
+    presses = "$('alerts-time-chart').listeners.filter(l => l.type === 'pointerdown').length"
+    r = _run_node(functions, r"""
+        const $ = id => document.getElementById(id);
         const resizers = [], frames = [];
         let redraws = 0;
         globalThis.ResizeObserver = class {
@@ -1581,15 +1689,22 @@ def test_the_alerts_table_head_stands_under_the_filter_bar():
         globalThis.requestAnimationFrame = fn => frames.push(fn);
         globalThis.redrawAlertsChartsOnResize = () => redraws++;
         document.body.innerHTML = MARKUP;
+        const tab = $('tab-alerts'), drillBar = $('alerts-drill');
         const bar = document.querySelector('#tab-alerts .alerts-filters'), head = document.querySelector('#alerts-table thead');
-        head.style.setProperty = (name, value) => { head.style[name] = value; };
+        for (const el of [tab, head]) el.style.setProperty = (name, value) => { el.style[name] = value; };
+        drillBar.rect = { top: 0, height: 38.5 };
         bar.rect = { top: 0, height: 45.5 };
         initAlertsTab();
-        const r = { observed: resizers.map(o => [o.el === bar, o.el === document.getElementById('alerts-charts'), o.options]) };
-        resizers[0].callback([]); r.first = head.style['--alerts-bar-height'];
-        bar.rect = { top: 0, height: 79 };
-        resizers[0].callback([]); r.chips = head.style['--alerts-bar-height'];
-        resizers[1].callback([]); r.resized = [redraws, frames.length];
+        const r = { observed: resizers.map(o => [o.el.id || o.el.className, o.options || null]), presses: PRESSES };
+        const observer = el => resizers.find(o => o.el === el);
+        observer(drillBar).callback([]); observer(bar).callback([]);
+        r.first = [tab.style['--alerts-path-height'], head.style['--alerts-bar-height']];
+        drillBar.rect = { top: 0, height: 0 };      // hidden: no step
+        bar.rect = { top: 0, height: 79 };          // a row of chips
+        observer(drillBar).callback([]); observer(bar).callback([]);
+        r.chips = [tab.style['--alerts-path-height'], head.style['--alerts-bar-height']];
+        r.onHead = '--alerts-path-height' in head.style || '--alerts-bar-height' in tab.style;
+        observer($('alerts-charts')).callback([]); r.resized = [redraws, frames.length];
         frames.splice(0).forEach(fn => fn()); r.drawn = redraws;
         document.body.innerHTML = '';
         try { initAlertsTab(); r.noTab = 'ok'; } catch (e) { r.noTab = e.message; }
@@ -1597,12 +1712,26 @@ def test_the_alerts_table_head_stands_under_the_filter_bar():
         delete globalThis.ResizeObserver;
         try { initAlertsTab(); r.noObserver = 'ok'; } catch (e) { r.noObserver = e.message; }
         console.log(JSON.stringify(r));
-    """.replace("MARKUP", json.dumps(_tab_markup("alerts"))), SORT_DOM)
-    assert r["observed"] == [[True, False, {"box": "border-box"}], [False, True, None]], \
-        "the bar's height without its border, or the charts not watched"
-    assert (r["first"], r["chips"]) == ("45.5px", "79px")
+    """.replace("MARKUP", json.dumps(_tab_markup("alerts"))).replace("PRESSES", presses), SORT_DOM + _alerts_prelude())
+    assert sorted(r["observed"], key=json.dumps) == sorted([["alerts-drill", {"box": "border-box"}],
+                                                           ["alerts-filters", {"box": "border-box"}],
+                                                           ["alerts-charts", None]], key=json.dumps), \
+        f"a bar's height without its border, or the bars or the charts not watched: {r['observed']}"
+    assert (r["first"], r["chips"]) == (["38.5px", "45.5px"], ["0px", "79px"])
+    assert r["onHead"] is False, "a bar's height is kept on the wrong element"
     assert r["resized"] == [0, 1] and r["drawn"] == 1, "the charts are drawn again inside the observer, or not at all"
     assert r["noTab"] == "ok" and r["noObserver"] == "ok"
+    assert r["presses"] == 1, "OVER TIME takes no range drawn across its bars"
+    # A page without ResizeObserver, set up twice: its bars take each press once, the page its moves and ends
+    bare = _run_node(functions, r"""
+        const $ = id => document.getElementById(id);
+        document.body.innerHTML = MARKUP;
+        initAlertsTab();
+        initAlertsTab();
+        console.log(JSON.stringify({ presses: PRESSES, page: document.listeners.map(l => l.type) }));
+    """.replace("MARKUP", json.dumps(_tab_markup("alerts"))).replace("PRESSES", presses), SORT_DOM + _alerts_prelude())
+    assert bare == {"presses": 1, "page": ["pointermove", "pointerup", "pointercancel", "contextmenu"]}, \
+        f"without ResizeObserver OVER TIME takes no range drawn across its bars, or takes each press twice: {bare}"
     js = _strip_js_comments(_read(APP_JS))
     start = js.index("document.addEventListener('DOMContentLoaded', () => {")
     assert re.search(r"^\s*initAlertsTab\(\);", js[start:js.index("\n});", start)], re.M), "not set up at start-up"
@@ -1613,28 +1742,37 @@ def _background(body):
     return m.group(1).strip() if m else None
 
 
+def _declared(body, prop):
+    """The value a rule body gives `prop`: its last declaration (None for none)."""
+    values = re.findall(r"(?:^|;)\s*%s\s*:\s*([^;]+)" % re.escape(prop), body or "")
+    return re.sub(r"\s+", " ", values[-1]).strip() if values else None
+
+
 def test_the_alerts_tab_scrolls_as_a_whole_under_a_standing_filter_bar():
     """The tab scrolls as a whole and the table has no scrolling of its own;
     the filter bar stands at the top of the tab (in Cyberpunk under the fixed
-    top bar: the tab begins below it), opaque in both themes, so the rows pass
-    under it unseen; the table head stands right under the bar. The chip row
-    takes no room while there is no chip, and a long name is cut."""
+    top bar: the tab begins below it), right under the drilldown bar while a
+    step shows it (--alerts-path-height, 0 px without), opaque in both
+    themes, so the rows pass under it unseen; the table head stands right
+    under both bars. The chip row takes no room while there is no chip, and a
+    long name is cut."""
     rules, theme = _rules(STYLE_CSS), _rules(THEME_CSS)
     assert re.search(r"(?:^|;)\s*overflow-y:\s*auto", rules.get("#tab-alerts", "")), "the tab does not scroll"
     wrap = rules.get(".alerts-table-wrap", "")
     assert not re.search(r"overflow(?:-y)?:\s*(?:auto|scroll)|min-height:\s*0", wrap), "the table scrolls on its own"
     assert re.search(r"(?:^|;)\s*flex:\s*1 0 auto", wrap), "the table shrinks into the tab instead of making it scroll"
     bar = rules.get(".alerts-filters", "")
-    assert re.search(r"position:\s*sticky", bar) and re.search(r"(?:^|;)\s*top:\s*0\s*(?:;|$)", bar), \
-        "the filter bar scrolls away"
+    assert re.search(r"position:\s*sticky", bar) and _declared(bar, "top") == "var(--alerts-path-height)", \
+        "the filter bar scrolls away, or does not stand right under the drilldown bar"
     head = rules.get(".alerts-table thead th", "")
-    assert re.search(r"position:\s*sticky", head) and re.search(r"top:\s*var\(--alerts-bar-height\)", head), \
-        "the table head stands under the filter bar instead of right below it"
+    assert re.search(r"position:\s*sticky", head) \
+        and _declared(head, "top") == "calc(var(--alerts-path-height) + var(--alerts-bar-height))", \
+        "the table head stands under the bars instead of right below them"
     def layer(body):
         return int(re.search(r"z-index:\s*(\d+)", body).group(1))
 
     assert layer(bar) > layer(head), "the table head passes over the filter bar"
-    assert "--alerts-bar-height" in _root_values()
+    assert "--alerts-bar-height" in _root_values() and _root_values().get("--alerts-path-height") == "0px"
     cyberpunk_bar = theme.get('[data-theme="cyberpunk"] .alerts-filters', "")
     for name, palette, value in (("Classic", _resolve(_root_values()), _background(bar)),
                                  ("Cyberpunk", _cyberpunk_palette(), _background(cyberpunk_bar) or _background(bar))):
@@ -1714,7 +1852,7 @@ ALERT_CHARTS_LOOK = r"""
         empty: hint($(id)),
     });
     const charts = () => {
-        const time = $('alerts-time-chart'), flow = $('alerts-flow-chart'), note = time.querySelector('.alerts-chart-note');
+        const time = $('alerts-time-chart'), flow = $('alerts-flow-chart'), note = time.querySelector('.alerts-time-missed');
         return {
             severity: pie('alerts-severity-chart'), engine: pie('alerts-engine-chart'),
             bins: time.querySelectorAll('.chart-bin').map(g => [Number(g.getAttribute('data-bin-start')),
@@ -2096,8 +2234,8 @@ def test_alerts_charts_have_info_and_table():
         return node.get("text", "") + "".join(text(c) for c in node["children"])
 
     parts = [c["attrs"].get("id") or c["attrs"].get("class") for c in tab["children"]]
-    assert parts == ["content-header", "alerts-charts", "alerts-filters", "alerts-table-wrap"], \
-        "the charts are not above the filter bar"
+    assert parts == ["content-header", "alerts-drill", "alerts-charts", "alerts-filters", "alerts-table-wrap"], \
+        "the charts are not above the filter bar, under the drilldown bar"
     charts = by_id(tab, "alerts-charts")
     assert "hidden" not in charts["attrs"]
     cards = find(charts, lambda e: "chart-card" in e["attrs"].get("class", "").split())
@@ -2295,7 +2433,7 @@ def test_alerts_over_time_leaves_out_implausible_times():
         const table = $('alerts-time-table').querySelector('table');
         console.log(JSON.stringify({
             bins, listed: bins.map(([start, end]) => filterAlerts(alerts, { from: start, to: end }).length),
-            note: time.querySelector('.alerts-chart-note').textContent.trim(),
+            note: time.querySelector('.alerts-time-missed').textContent.trim(),
             notes: table.tBodies[0].rows.filter(row => row.hasAttribute('data-sort-skip')).map(row => row.textContent.trim()),
             slices: $('alerts-severity-chart').querySelectorAll('.chart-seg').reduce((sum, s) => sum + Number(s.getAttribute('data-value')), 0),
             count: $('alerts-count').textContent, now, latest: now + 24 * HOUR,
@@ -2313,6 +2451,1545 @@ def test_alerts_over_time_leaves_out_implausible_times():
     assert r["listed"] == [total for *_, total in bins], "a bar's period lists other alerts than it counted"
 
 
+# Alerts of 27 Jul 2026 in the local time of the zone: one every 2:59 for two
+# hours from 10:00 on, two in its first second, one a millisecond before
+# 10:00, one before 12:00 and one at 12:00 (the end of 10:00-12:00, not in it),
+# and three more that day (08:15 the first, 23:59:59 the last); then one
+# every 20 minutes from 22:05 on 24 Oct, through the night the clocks go back
+# in Europe (25 Oct: 03:00 summer time is 02:00 winter time).
+SHORT_SPAN_FIXTURE = r"""
+    const at = (...a) => new Date(...a).getTime();          // local time of the zone
+    const S = 1000, M = 60000;
+    const from = at(2026, 6, 27, 10), to = at(2026, 6, 27, 12);
+    const july = [...Array.from({ length: 40 }, (_, i) => from + i * 179 * S), from + 800, from + 1100, from - 1, to - 1, to,
+                  at(2026, 6, 27, 8, 15), at(2026, 6, 27, 13, 40), at(2026, 6, 27, 23, 59, 59)];
+    const night = { from: at(2026, 9, 24, 22), to: at(2026, 9, 25, 6) };
+    const october = Array.from({ length: 27 }, (_, i) => night.from + 5 * M + i * 20 * M);
+    const SHORT_SEVERITIES = ['high', 'medium', 'critical', 'low', 'info'];
+    const alertsAt = times => times.map((t, i) => ({ id: 's' + i, timestamp: new Date(t).toISOString(),
+        severity: SHORT_SEVERITIES[i % 5], engine: 'Sigma', rule_name: 'Run Key', process_name: 'p.exe' }));
+"""
+
+
+@needs_node
+@pytest.mark.parametrize("zone", ["UTC", "Europe/Berlin"])
+def test_alerts_over_time_gets_finer_for_short_spans(zone):
+    """Narrowed to a short range, OVER TIME shows its detail: a span of up to
+    20 hours takes bars of seconds or minutes (at most 40), whether a filter
+    or the alerts themselves set it. 27 Jul 10:00-12:00 are 24 bars of 5
+    minutes, the first from the start of the range, the last up to its end,
+    together counting what the table lists, their periods named in the table
+    view as in their tooltips. A whole day keeps its 24 hours, and ALERT
+    ACTIVITY of the dashboard its hours, also over alerts of 16 hours.
+    Through the night the clocks go back (Europe, 25 Oct) the bars of 15
+    minutes follow each other without a gap, named in local time. Bars a
+    range cuts short at both ends are labelled by their step."""
+    script = _alert_charts_script(SHORT_SPAN_FIXTURE + r"""
+        Date.now = () => Date.UTC(2026, 10, 10, 12);                // after all of them: no time is implausible
+        globalThis.state = { alerts: alertsAt([...july, ...october]), processes: {}, activeTab: 'alerts' };
+        const look = () => {
+            const view = charts(), time = $('alerts-time-chart'), counted = _alertsChartsDrawn.time;
+            return {
+                unit: counted.unit, step: counted.step ?? null, count: view.count,
+                bins: view.bins.map(([start, end, total]) => [start, end, total]),
+                titles: time.querySelectorAll('.chart-bin').map(g => g.querySelector('title').textContent.split('\n')[0]),
+                periods: view.tables.time.rows.map(row => row[0][0]),
+                chips: $('alerts-active-filters').querySelectorAll('.alerts-filter-chip')
+                    .map(c => c.textContent.replace(/\s+/g, ' ').trim()),
+            };
+        };
+        renderAlertsTab();
+        const r = { from, to, night, day: { from: at(2026, 6, 27), to: at(2026, 6, 28) },
+                    ownSpan: { from: at(2026, 6, 27, 8), to: at(2026, 6, 28) } };
+        setAlertsFilters({ from, to }); r.twoHours = look();
+        setAlertsFilters(r.day); r.wholeDay = look();
+        setAlertsFilters(night); r.overNight = look();
+        // No range: the span of the alerts themselves, 27 Jul from 08:15 to 23:59:59
+        setAlertsFilters({ from: null, to: null });
+        state.alerts = alertsAt(july); renderAlertsTab(); r.own = look();
+        // Bars a range cuts short at both ends (it lasts half a second here): labelled by their step
+        const cut = alertSeverityBins(state.alerts, { from: from + 700, to: from + 1200, fine: true });
+        r.cut = { unit: cut.unit, step: cut.step, ticks: [..._alertsTimeBarsSvg(cut, { width: 560, height: 120 })
+            .matchAll(/<text class="chart-tick"[^>]*>([^<]*)<\/text>/g)].map(m => m[1]) };
+        console.log(JSON.stringify(r));
+    """)
+    r = _run_node(ALERTS_TAB_FUNCTIONS, script, SORT_DOM + "process.env.TZ = %s;\n" % json.dumps(zone) + _alerts_prelude())
+    MINUTES_5, QUARTER, HALF, HOUR = 300000, 900000, 1800000, 3600000
+
+    def gapless(view, length, span):
+        bins = view["bins"]
+        return (bins and all(end - start == length for start, end, _ in bins)
+                and all(b[0] == a[1] for a, b in zip(bins, bins[1:]))
+                and (bins[0][0], bins[-1][1]) == (span["from"], span["to"]))
+
+    def listed(view):
+        return int(view["count"].split(" of ")[0])
+
+    two = r["twoHours"]
+    assert (two["unit"], two["step"], len(two["bins"])) == ("minute", MINUTES_5, 24), \
+        f"10:00-12:00 in {len(two['bins'])} bars of {two['unit']}"
+    assert gapless(two, MINUTES_5, r), "the bars of 5 minutes do not span the range, or leave a gap"
+    assert sum(total for *_, total in two["bins"]) == listed(two) and two["count"] == "43 of 75", \
+        "the bars count other alerts than the table lists"
+    assert "27 Jul 2026, 10:10\u201310:15" in two["periods"] and two["titles"][2] == "27 Jul 2026, 10:10\u201310:15", \
+        (two["periods"], two["titles"][:3])
+    assert two["periods"] == [title for title, (*_, total) in zip(two["titles"], two["bins"]) if total], \
+        "the table view follows other periods than the bars"
+    assert two["chips"] == ["\u00d7 27 Jul 10:00\u201312:00"]
+    day = r["wholeDay"]
+    assert (day["unit"], day["step"], len(day["bins"])) == ("hour", None, 24) and gapless(day, HOUR, r["day"]), \
+        "a whole day is no longer 24 bars of an hour"
+    assert sum(total for *_, total in day["bins"]) == listed(day) and day["count"] == "48 of 75"
+    assert "27 Jul 2026, 10:00\u201311:00" in day["periods"] and day["chips"] == ["\u00d7 27 Jul"]
+    # The night of 24 Oct, 22:00 to 06:00: 9 hours in Berlin (the hour from 02:00 twice), 8 in UTC
+    night = r["overNight"]
+    quarters = {"UTC": 32, "Europe/Berlin": 36}[zone]
+    assert (night["unit"], night["step"], len(night["bins"])) == ("minute", QUARTER, quarters), \
+        f"{len(night['bins'])} bars of {night['unit']} ({night['step']})"
+    assert gapless(night, QUARTER, r["night"]), "the bars of 15 minutes leave a gap or change length in the night"
+    assert sum(total for *_, total in night["bins"]) == listed(night) == {"UTC": 24, "Europe/Berlin": 27}[zone]
+    assert (night["titles"][0], night["titles"][-1]) == ("24 Oct 2026, 22:00\u201322:15", "25 Oct 2026, 05:45\u201306:00")
+    assert night["titles"][8] == "25 Oct 2026, 00:00\u201300:15"
+    if zone == "Europe/Berlin":
+        # The last quarter of summer time ends at 03:00, which is 02:00 winter time; that hour comes again
+        assert night["titles"][19:21] == ["25 Oct 2026, 02:45\u201302:00", "25 Oct 2026, 02:00\u201302:15"], \
+            night["titles"][17:23]
+        assert night["titles"].count("25 Oct 2026, 02:00\u201302:15") == 2
+    assert night["chips"] == ["\u00d7 24 Oct 22:00 \u2013 25 Oct 06:00"]
+    own = r["own"]
+    assert (own["unit"], own["step"], len(own["bins"])) == ("minute", HALF, 32) and gapless(own, HALF, r["ownSpan"]), \
+        "the alerts of 16 hours, without a range, are not in bars of half an hour"
+    assert sum(total for *_, total in own["bins"]) == listed(own) == 48 and own["chips"] == []
+    assert r["cut"] == {"unit": "second", "step": 1000, "ticks": ["10:00:00", "10:00:01"]}, \
+        "bars cut short by the range are labelled by their length instead of their step"
+
+    # ALERT ACTIVITY of the dashboard keeps hours: for 24H, and for ALL over the alerts of 27 Jul alone
+    script = _dashboard_script(SHORT_SPAN_FIXTURE + r"""
+        globalThis.state = { alerts, processes, serviceStatus: {}, rustinelInfo: {}, activeTab: 'dashboard' };
+        const bars = () => ({ unit: _dashboardDrawn.bars.unit, step: 'step' in _dashboardDrawn.bars,
+                              bins: look().bins.map(([start, end]) => [start, end]) });
+        renderDashboard();
+        setDashboardRange('24h');
+        const r = { day: bars() };
+        state.alerts = alertsAt(july);
+        setDashboardRange('all');
+        r.all = { ...bars(), from: at(2026, 6, 27, 8), to: at(2026, 6, 28) };
+        console.log(JSON.stringify(r));
+    """)
+    d = _run_node(DASHBOARD_JS, script, _dashboard_prelude(zone))
+    assert (d["day"]["unit"], d["day"]["step"]) == ("hour", False), d["day"]["unit"]
+    assert len(d["day"]["bins"]) >= 24 and all(end - start <= HOUR for start, end in d["day"]["bins"])
+    assert (d["all"]["unit"], d["all"]["step"]) == ("hour", False), \
+        "ALERT ACTIVITY takes bars of minutes for alerts of 16 hours"
+    assert d["all"]["bins"] == [[t, t + HOUR] for t in range(d["all"]["from"], d["all"]["to"], HOUR)]
+
+
+# --- The drilldown of the Alerts tab ------------------------------------------------
+
+# What the drilldown tests look at: the steps (as data and by name), the
+# version of the path, the filters of the tab and what the table lists (the
+# ids of its rows, up to 100 of them); and the parts of the charts they click
+DRILL_LOOK = r"""
+    const at = (day, hour = 0) => new Date(2026, 6, day, hour).getTime();     // July, local time of the zone
+    const holder = $('alerts-active-filters');
+    const drill = () => {
+        const ids = $('alerts-rows').querySelectorAll('tr.alerts-row')
+            .map(row => /openAlertDetailById\("(\w+)"\)/.exec(row.getAttribute('onclick'))[1]);
+        return {
+            labels: alertsDrilldown.map(alertsStepLabel), steps: JSON.parse(JSON.stringify(alertsDrilldown)),
+            version: alertsDrillVersion,
+            pressed: document.querySelectorAll('#tab-alerts .alerts-sev-chip')
+                .filter(c => c.getAttribute('aria-pressed') === 'true').map(c => c.dataset.severity),
+            engine: $('alerts-filter-engine').value, text: $('alerts-filter-text').value, filter: { ...alertsExtraFilter },
+            chips: holder.querySelectorAll('.alerts-filter-chip').map(c => c.getAttribute('data-filter')),
+            count: $('alerts-count').textContent, rows: ids.length, ids: ids.length > 100 ? null : ids,
+        };
+    };
+    const seg = (id, key) => $(id).querySelectorAll('.chart-seg').find(s => s.getAttribute('data-key') === key);
+    const legendName = (id, key) => $(id).querySelectorAll('.chart-legend-row')
+        .find(row => row.getAttribute('data-key') === key).querySelector('.chart-legend-name');
+    const dayBar = day => $('alerts-time-chart').querySelectorAll('.chart-bin')
+        .find(g => Number(g.getAttribute('data-bin-start')) === at(day)).querySelector('.chart-bar');
+    const node = id => $('alerts-flow-chart').querySelectorAll('.sankey-node').find(g => g.getAttribute('data-sankey-node') === id);
+    const band = (source, target) => $('alerts-flow-chart').querySelectorAll('.sankey-link')
+        .find(p => p.getAttribute('data-source') === source && p.getAttribute('data-target') === target);
+"""
+
+NO_EXTRA = {"from": None, "to": None, "category": None, "rule": None, "process": None}
+
+
+def _drill_script(script):
+    return _alert_charts_script(DRILL_LOOK + script)
+
+
+def _listed(view):
+    return int(view["count"].split(" of ")[0])
+
+
+@needs_node
+@pytest.mark.parametrize("zone", ["UTC", "Europe/Berlin", "Asia/Kolkata"])
+def test_drilldown_steps_back_and_jump(zone):
+    """Each click on a chart that changes the filters is a step of the
+    drilldown, which holds the kinds of filter it changed with their values
+    before and after it: the bar of 27 Jul, then 10:00-12:00 of that day,
+    then the rule Run Key are named "27 Jul", "27 Jul 10:00–12:00" and
+    "rule: Run Key". BACK takes the last one back, to exactly the count and
+    rows before it; a jump to a step takes back the later ones, the newest
+    first; -1 takes back every one. A click that changes nothing (the same
+    slice again, its legend row, an engine or a range in another form) is no
+    step; a band whose engine is chosen already is a step of its rule, one
+    from an engine not chosen yet a step of both, which BACK takes back
+    together. An engine given with blanks around it is the engine of that
+    name. The severities of a step stand in the order of the chips. Each
+    change of the steps, and only that, counts up the version of the path."""
+    script = _drill_script(r"""
+        globalThis.state = { alerts, processes: {}, activeTab: 'alerts' };
+        renderAlertsTab();
+        const r = { start: drill(), values: alertsDrillValues() };
+        // OVER TIME: the bar of 27 Jul, then 10:00-12:00 of that day, then the rule node Run Key
+        click(dayBar(27)); r.day = drill();
+        r.ten = drillAlerts({ from: at(27, 10), to: at(27, 12) }); r.window = drill();
+        // The same range as text and as a Date, or one of its bounds alone: no step
+        r.same = [drillAlerts({ from: String(at(27, 10)), to: new Date(at(27, 12)) }), drillAlerts({ from: at(27, 10) }), drill()];
+        // A bound alone sets that bound, the other stays
+        r.partial = [drillAlerts({ to: at(27, 11) }), drill()];
+        alertsDrillBack();
+        _applyAlertsChartFilter({ rule: 'Run Key' }); r.rule = drill();
+        r.sameRule = [drillAlerts({ rule: ' run key ' }), drill()];
+        alertsDrillBack(); r.back = drill();
+        alertsDrillTo(0); r.toDay = drill();
+        alertsDrillTo(-1); r.all = drill();
+        r.nothingBack = (alertsDrillBack(), alertsDrillTo(-1), drill());
+        // Severities no chip names press nothing: no step
+        r.noChip = [drillAlerts({ severities: ['warning', 'High!'] }), drill()];
+        // SEVERITY: the slice of high is a step HIGH; the slice again, its legend row, high in capitals: none
+        click(seg('alerts-severity-chart', 'high')); r.high = drill();
+        click(seg('alerts-severity-chart', 'high'));
+        click(legendName('alerts-severity-chart', 'high'));
+        r.highAgain = [drillAlerts({ severities: ['HIGH', 'high'] }), drill()];
+        // ENGINE: the slice of sigma is a step Sigma, in its first spelling; again, or in capitals: none
+        click(seg('alerts-engine-chart', 'sigma')); r.sigma = drill();
+        click(seg('alerts-engine-chart', 'sigma'));
+        click(legendName('alerts-engine-chart', 'sigma'));
+        r.sigmaAgain = [drillAlerts({ engine: ' SIGMA ' }), drill()];
+        // FLOW: a band from Sigma, the engine chosen already, to Run Key is a step of the rule alone
+        click(band('engine:Sigma', 'rule:Run Key')); r.band = drill();
+        // Severities in another order and case, in the order of the chips; BACK sets those before, HIGH stays
+        r.reordered = [drillAlerts({ severities: ['low', 'CRITICAL'] }), drill()];
+        alertsDrillBack(); r.reorderedBack = drill();
+        // A jump to a step takes back the later ones, the newest first: MEDIUM (from HIGH) before HIGH (from none)
+        drillAlerts({ severities: ['medium'] });
+        alertsDrillTo(0); r.toHigh = drill();
+        drillAlerts({ severities: ['medium'] });
+        alertsDrillTo(-1); r.none = drill();
+        // FLOW: a band from Sigma to Run Key with no engine chosen is one step of both; BACK takes both back
+        const engines = () => $('alerts-filter-engine').children.map(o => o.value);
+        click(dayBar(27)); r.dayAgain = { ...drill(), offered: engines() };
+        click(band('engine:Sigma', 'rule:Run Key')); r.bandBoth = drill();
+        alertsDrillBack(); r.bandBothBack = drill();
+        // An engine with blanks around it: the engine of that name in the spelling the choice offers, no choice of
+        // its own (it would filter by the blanks too, and list nothing)
+        alertsDrillTo(-1);
+        r.blanks = [drillAlerts({ engine: ' Sigma ' }), { ...drill(), offered: engines(),
+                    listed: filterAlerts(alerts, { engine: 'sigma' }).length }];
+        console.log(JSON.stringify(r));
+    """)
+    r = _run_node(ALERTS_TAB_FUNCTIONS, script, SORT_DOM + "process.env.TZ = %s;\n" % json.dumps(zone) + _alerts_prelude())
+    none = {"range": {"from": None, "to": None}}
+    start, day, window, rule = r["start"], r["day"], r["window"], r["rule"]
+    assert (start["labels"], start["count"]) == ([], "2345 of 2345")
+    assert r["values"] == {"range": {"from": None, "to": None}, "severities": [], "engine": "", "category": None,
+                           "rule": None, "process": None}
+    # The values of each step, of the kinds it changed only
+    first = {"from": day["filter"]["from"], "to": day["filter"]["to"]}
+    ten = {"from": window["filter"]["from"], "to": window["filter"]["to"]}
+    assert day["labels"] == ["27 Jul"] and day["chips"] == ["range"]
+    assert day["steps"] == [{"dashboard": False, "before": none, "after": {"range": first}}]
+    assert r["ten"] is True and window["labels"] == ["27 Jul", "27 Jul 10:00\u201312:00"]
+    assert window["steps"][1] == {"dashboard": False, "before": {"range": first}, "after": {"range": ten}}
+    assert ten["to"] - ten["from"] == 2 * 3600000 and first["from"] <= ten["from"] < ten["to"] <= first["to"]
+    assert r["same"] == [False, False, window], "a range in another form, or one bound alone, made a step"
+    partial = r["partial"]
+    assert partial[0] is True and partial[1]["labels"][-1] == "27 Jul 10:00\u201311:00"
+    assert partial[1]["steps"][-1]["after"] == {"range": {"from": ten["from"], "to": ten["from"] + 3600000}}
+    assert rule["labels"] == ["27 Jul", "27 Jul 10:00\u201312:00", "rule: Run Key"]
+    assert rule["steps"][2] == {"dashboard": False, "before": {"rule": None}, "after": {"rule": "Run Key"}}
+    assert _listed(day) > _listed(window) > _listed(rule) > 0, (day["count"], window["count"], rule["count"])
+    assert r["sameRule"] == [False, rule], "a rule in other capitals and blanks made a step"
+    # BACK: exactly the count and rows of the step before
+    back = r["back"]
+    assert back["labels"] == ["27 Jul", "27 Jul 10:00\u201312:00"] and back["filter"]["rule"] is None
+    assert (back["count"], back["ids"], back["filter"], back["chips"]) == \
+        (window["count"], window["ids"], window["filter"], window["chips"]), "BACK does not show what the step before did"
+    to_day = r["toDay"]
+    assert to_day["labels"] == ["27 Jul"]
+    assert (to_day["count"], to_day["rows"], to_day["ids"], to_day["filter"]) == \
+        (day["count"], day["rows"], day["ids"], day["filter"])
+    everything = r["all"]
+    assert (everything["labels"], everything["steps"], everything["filter"], everything["chips"], everything["count"]) == \
+        ([], [], NO_EXTRA, [], "2345 of 2345")
+    assert r["nothingBack"] == everything, "BACK without a step changed something"
+    assert r["noChip"] == [False, everything], "severities no chip names made a step that changes nothing"
+    # SEVERITY and ENGINE: named HIGH and Sigma (the first spelling of the engine), each once
+    high, sigma, band = r["high"], r["sigma"], r["band"]
+    assert (high["labels"], high["pressed"]) == (["HIGH"], ["high"])
+    assert high["steps"] == [{"dashboard": False, "before": {"severities": []}, "after": {"severities": ["high"]}}]
+    assert r["highAgain"] == [False, high], "the same severity again made a step"
+    assert (sigma["labels"], sigma["engine"]) == (["HIGH", "Sigma"], "Sigma")
+    assert sigma["steps"][1] == {"dashboard": False, "before": {"engine": ""}, "after": {"engine": "Sigma"}}
+    assert r["sigmaAgain"] == [False, sigma], "the same engine again made a step"
+    assert band["labels"] == ["HIGH", "Sigma", "rule: Run Key"] and band["engine"] == "Sigma"
+    assert band["steps"][2] == {"dashboard": False, "before": {"rule": None}, "after": {"rule": "Run Key"}}, \
+        "the step of a band holds the engine it did not change"
+    made, reordered = r["reordered"]
+    assert made is True and reordered["labels"][-1] == "CRITICAL + LOW"
+    assert reordered["steps"][-1] == {"dashboard": False, "before": {"severities": ["high"]},
+                                      "after": {"severities": ["critical", "low"]}}
+    after_back = r["reorderedBack"]
+    assert (after_back["labels"], after_back["pressed"]) == (band["labels"], ["high"]), \
+        "BACK set the severities by the handler of the chips, which forgot the step HIGH"
+    to_high = r["toHigh"]
+    assert (to_high["labels"], to_high["pressed"], to_high["engine"], to_high["filter"]) == (["HIGH"], ["high"], "", NO_EXTRA)
+    assert (to_high["count"], to_high["rows"]) == (high["count"], high["rows"])
+    assert (r["none"]["labels"], r["none"]["pressed"], r["none"]["engine"], r["none"]["filter"], r["none"]["count"]) == \
+        ([], [], "", NO_EXTRA, "2345 of 2345"), "the steps were taken back the oldest first"
+    # A step of two kinds (a band from an engine not chosen yet): BACK sets both as they were
+    day_again, both, both_back = r["dayAgain"], r["bandBoth"], r["bandBothBack"]
+    assert both["labels"] == ["27 Jul", "Sigma \u00b7 rule: Run Key"]
+    assert (both["engine"], both["filter"]["rule"]) == ("Sigma", "Run Key")
+    assert both["steps"][1] == {"dashboard": False, "before": {"engine": "", "rule": None},
+                                "after": {"engine": "Sigma", "rule": "Run Key"}}
+    assert 0 < _listed(both) < _listed(day_again) <= 100
+    assert (both_back["labels"], both_back["engine"], both_back["filter"]["rule"]) == (["27 Jul"], "", None), \
+        "BACK of a step of an engine and a rule left one of them set"
+    assert (both_back["count"], both_back["ids"], both_back["filter"], both_back["chips"]) == \
+        (day_again["count"], day_again["ids"], day_again["filter"], day_again["chips"])
+    made, blanks = r["blanks"]
+    assert made is True and (blanks["labels"], blanks["engine"]) == (["Sigma"], "Sigma")
+    assert blanks["steps"][-1]["after"] == {"engine": "Sigma"}
+    assert blanks["offered"] == day_again["offered"], \
+        f"an engine with blanks around it became a choice of its own: {blanks['offered']}"
+    assert blanks["count"] == f"{blanks['listed']} of 2345" and blanks["listed"] > 0
+    # The version counts every change of the steps, and nothing else
+    changes = [start, day, window, rule, back, to_day, everything]
+    assert all(a["version"] < b["version"] for a, b in zip(changes, changes[1:])), [v["version"] for v in changes]
+    assert partial[1]["version"] > window["version"] and rule["version"] > partial[1]["version"] + 1
+    assert r["nothingBack"]["version"] == everything["version"]
+    assert everything["version"] < high["version"] < sigma["version"] < band["version"] < reordered["version"] \
+        < after_back["version"] < to_high["version"] < r["none"]["version"]
+
+
+@needs_node
+def test_drilldown_leaves_own_settings_alone():
+    """What is set by hand in the filter bar is no step, and BACK never takes
+    it back: a search typed after a step stays after BACK; a severity chip
+    switched after a step of SEVERITY, the engine chosen after a step of
+    ENGINE and the × of the range chip after two steps of OVER TIME make the
+    steps forget that kind of filter, and a step left without one drops out
+    of the path; BACK then skips it. A step of two kinds stays with the one
+    left: the band Sigma → Run Key, then the engine chosen by hand, leaves
+    "rule: Run Key" (as the README says), and BACK takes the rule back, not
+    the engine. The render of the click by hand already finds the path that
+    is left, and its version is another (what shows the path draws it
+    again)."""
+    script = _drill_script(r"""
+        globalThis.state = { alerts, processes: {}, activeTab: 'alerts' };
+        // The path each render of the tab finds
+        const seen = [], render = renderAlertsTab;
+        globalThis.renderAlertsTab = () => { seen.push(alertsDrilldown.map(alertsStepLabel)); render(); };
+        const drawn = () => seen[seen.length - 1];
+        renderAlertsTab();
+        const r = {};
+        // The search typed after a step stays when BACK takes the step back
+        click(dayBar(27));
+        $('alerts-filter-text').value = 'run key'; renderAlertsTab();
+        r.search = drill();
+        alertsDrillBack(); r.searchBack = { ...drill(), listed: filterAlerts(alerts, { text: 'run key' }).length };
+        // A severity chip switched after a step of SEVERITY: that step drops out, BACK skips it
+        openAlertsTab({});
+        click(dayBar(27)); click(seg('alerts-severity-chart', 'high')); r.severityStep = drill();
+        click(document.querySelector('#tab-alerts .alerts-sev-chip[data-severity="medium"]'));
+        r.chip = { ...drill(), drawn: drawn() };
+        alertsDrillBack(); r.chipBack = drill();
+        // The engine chosen after a step of ENGINE: the step drops out
+        openAlertsTab({});
+        click(seg('alerts-engine-chart', 'sigma')); r.engineStep = drill();
+        const select = $('alerts-filter-engine');
+        select.value = 'Yara'; dispatch('change', select);
+        r.engineByHand = { ...drill(), drawn: drawn(), listed: filterAlerts(alerts, { engine: 'Yara' }).length };
+        alertsDrillBack(); r.engineBack = drill();
+        // Two ranges and a rule, then the × of the range chip: the rule is left; BACK takes it off, no range comes back
+        openAlertsTab({});
+        click(dayBar(27)); drillAlerts({ from: at(27, 10), to: at(27, 12) });
+        click(node('rule:Run Key').querySelector('text'));
+        r.three = drill();
+        click(holder.querySelector('.alerts-filter-chip[data-filter="range"]'));
+        r.cut = { ...drill(), drawn: drawn(), listed: filterAlerts(alerts, { rule: 'Run Key' }).length };
+        alertsDrillBack(); r.cutBack = drill();
+        // The band Sigma → Run Key with no engine chosen, one step of both; then the engine chosen by hand: the step
+        // forgets the engine and stays as the rule's; BACK takes the rule back, the engine chosen by hand stays
+        openAlertsTab({});
+        click(band('engine:Sigma', 'rule:Run Key')); r.band = drill();
+        select.value = 'Yara'; dispatch('change', select);
+        r.bandByHand = { ...drill(), drawn: drawn() };
+        alertsDrillBack(); r.bandBack = drill();
+        console.log(JSON.stringify(r));
+    """)
+    r = _run_node(ALERTS_TAB_FUNCTIONS, script, SORT_DOM + _alerts_prelude())
+    assert (r["search"]["labels"], r["search"]["text"]) == (["27 Jul"], "run key")
+    back = r["searchBack"]
+    assert (back["labels"], back["text"], back["filter"]) == ([], "run key", NO_EXTRA), "BACK took the search back"
+    assert back["count"] == f"{back['listed']} of 2345" and back["listed"] > 0
+    # The severity chip: the step HIGH drops out, before the tab is drawn; BACK skips it
+    assert r["severityStep"]["labels"] == ["27 Jul", "HIGH"]
+    chip = r["chip"]
+    assert (chip["labels"], chip["pressed"]) == (["27 Jul"], ["high", "medium"]), "the path names a step no longer in effect"
+    assert chip["drawn"] == ["27 Jul"], "the tab was drawn before the steps forgot the severities"
+    assert chip["version"] > r["severityStep"]["version"], "a step dropped by a chip set by hand left the version as it was"
+    chip_back = r["chipBack"]
+    assert (chip_back["labels"], chip_back["filter"], chip_back["pressed"]) == ([], NO_EXTRA, ["high", "medium"]), \
+        "BACK undid the severities set by hand"
+    # The engine choice: the step Sigma drops out
+    assert (r["engineStep"]["labels"], r["engineStep"]["engine"]) == (["Sigma"], "Sigma")
+    by_hand = r["engineByHand"]
+    assert (by_hand["labels"], by_hand["engine"], by_hand["drawn"]) == ([], "Yara", []), \
+        "the engine chosen by hand left the step of the engine in the path"
+    assert by_hand["count"] == f"{by_hand['listed']} of 2345" and by_hand["listed"] > 0
+    assert by_hand["version"] > r["engineStep"]["version"], "a step dropped by the engine chosen by hand left the version"
+    assert r["engineBack"] == {k: v for k, v in by_hand.items() if k not in ("drawn", "listed")}, \
+        "BACK without a step changed something"
+    # The × of the range: both range steps drop out, the rule's is left; BACK takes the rule off, no range returns
+    assert r["three"]["labels"] == ["27 Jul", "27 Jul 10:00\u201312:00", "rule: Run Key"]
+    cut = r["cut"]
+    assert cut["labels"] == ["rule: Run Key"] and cut["drawn"] == ["rule: Run Key"]
+    assert cut["version"] > r["three"]["version"], "steps dropped by the × of a chip left the version as it was"
+    assert cut["steps"] == [{"dashboard": False, "before": {"rule": None}, "after": {"rule": "Run Key"}}]
+    assert (cut["filter"], cut["chips"]) == ({**NO_EXTRA, "rule": "Run Key"}, ["rule"])
+    assert cut["count"] == f"{cut['listed']} of 2345"
+    cut_back = r["cutBack"]
+    assert (cut_back["labels"], cut_back["filter"], cut_back["chips"], cut_back["count"]) == \
+        ([], NO_EXTRA, [], "2345 of 2345"), "BACK brought back the range taken off by hand"
+    # The band of an engine and a rule: the engine chosen by hand leaves the step the rule's
+    band, band_by_hand, band_back = r["band"], r["bandByHand"], r["bandBack"]
+    assert (band["labels"], band["engine"], band["filter"]["rule"]) == (["Sigma \u00b7 rule: Run Key"], "Sigma", "Run Key")
+    assert (band_by_hand["labels"], band_by_hand["drawn"], band_by_hand["engine"]) == \
+        (["rule: Run Key"], ["rule: Run Key"], "Yara"), \
+        "the engine chosen by hand took the band's step out of the path, or left the engine in it"
+    assert band_by_hand["steps"] == [{"dashboard": False, "before": {"rule": None}, "after": {"rule": "Run Key"}}]
+    assert (band_back["labels"], band_back["engine"], band_back["filter"]) == ([], "Yara", NO_EXTRA), \
+        "BACK of the band's step undid the engine chosen by hand, or kept the rule"
+
+
+@needs_node
+def test_dashboard_jump_starts_a_new_path():
+    """A jump from the dashboard with a filter replaces the path by one step
+    named after what it set, from no filter: "Dashboard: CRITICAL + HIGH",
+    "Dashboard: 14 Jul – 20 Jul · category: registry". BACK then shows every
+    alert and stays in the Alerts tab; what the jump cleared (the search, a
+    severity chip, the engine) stays cleared. The same jump twice is one
+    step, and a path drawn anew; a jump without a filter (TOTAL ALERTS)
+    leaves no step."""
+    script = _drill_script(r"""
+        globalThis.state = { alerts, processes: {}, activeTab: 'alerts' };
+        renderAlertsTab();
+        const r = {};
+        // Two steps, a search, a severity chip and an engine of one's own; then the dashboard's tag "high"
+        // (critical and high)
+        click(dayBar(27)); _applyAlertsChartFilter({ rule: 'Run Key' });
+        $('alerts-filter-text').value = 'run'; renderAlertsTab();
+        click(document.querySelector('#tab-alerts .alerts-sev-chip[data-severity="medium"]'));
+        const select = $('alerts-filter-engine');
+        select.value = 'Yara'; dispatch('change', select);
+        r.before = drill();
+        state.activeTab = 'dashboard';
+        openAlertsTab({ severities: ['critical', 'high'] });
+        r.jump = { ...drill(), tab: state.activeTab, listed: filterAlerts(alerts, { severities: ['critical', 'high'] }).length };
+        alertsDrillBack(); r.back = { ...drill(), tab: state.activeTab };
+        // A range and a category of the dashboard, twice
+        state.activeTab = 'dashboard';
+        openAlertsTab({ category: 'registry', from: at(14), to: at(21) }); r.category = drill();
+        openAlertsTab({ category: 'registry', from: at(14), to: at(21) }); r.twice = drill();
+        r.range = { from: at(14), to: at(21) };
+        // ALL (no range), an engine in its first spelling, a severity no chip names, TOTAL ALERTS
+        openAlertsTab({ category: 'registry', from: null, to: null }); r.noRange = drill();
+        openAlertsTab({ engine: 'yara', severities: ['High'] }); r.engine = drill();
+        openAlertsTab({ severities: ['warning'] }); r.noChip = drill();
+        openAlertsTab({ severities: ['high'] }); openAlertsTab({}); r.total = drill();
+        console.log(JSON.stringify(r));
+    """)
+    r = _run_node(ALERTS_TAB_FUNCTIONS, script, SORT_DOM + _alerts_prelude())
+    before, jump, back = r["before"], r["jump"], r["back"]
+    assert (before["labels"], before["text"], before["pressed"], before["engine"]) == \
+        (["27 Jul", "rule: Run Key"], "run", ["medium"], "Yara")
+    assert jump["labels"] == ["Dashboard: CRITICAL + HIGH"], "the jump added to the old path"
+    assert jump["steps"] == [{"dashboard": True, "before": {"severities": []}, "after": {"severities": ["critical", "high"]}}], \
+        "the step of a jump holds the filters before it, not none"
+    assert (jump["pressed"], jump["text"], jump["engine"], jump["filter"], jump["tab"]) == \
+        (["critical", "high"], "", "", NO_EXTRA, "alerts")
+    assert jump["count"] == f"{jump['listed']} of 2345" and jump["version"] > before["version"]
+    assert (back["labels"], back["pressed"], back["tab"], back["text"], back["engine"], back["filter"], back["count"]) == \
+        ([], [], "alerts", "", "", NO_EXTRA, "2345 of 2345"), "BACK after a jump does not show every alert in the tab"
+    rng = r["range"]
+    category, twice = r["category"], r["twice"]
+    assert category["labels"] == ["Dashboard: 14 Jul \u2013 20 Jul \u00b7 category: registry"]
+    assert category["steps"] == [{"dashboard": True, "before": {"range": {"from": None, "to": None}, "category": None},
+                                  "after": {"range": rng, "category": "registry"}}]
+    assert (twice["labels"], twice["steps"]) == (category["labels"], category["steps"]), "the same jump twice is no one step"
+    assert twice["version"] > category["version"], "the same jump again does not draw the path anew"
+    assert r["noRange"]["labels"] == ["Dashboard: category: registry"]
+    assert r["noRange"]["steps"][0]["after"] == {"category": "registry"}, "ALL, no range, is a range of the step"
+    assert r["engine"]["labels"] == ["Dashboard: HIGH \u00b7 Yara"]
+    assert r["engine"]["steps"][0]["after"] == {"severities": ["high"], "engine": "Yara"}
+    assert (r["noChip"]["labels"], r["noChip"]["pressed"]) == ([], [])
+    total = r["total"]
+    assert (total["labels"], total["steps"], total["count"]) == ([], [], "2345 of 2345")
+    assert total["version"] > r["noChip"]["version"]
+
+
+@needs_node
+def test_alerts_bars_take_a_range_drawn_across_them():
+    """A range drawn across the bars of OVER TIME is a step of the drilldown,
+    the events as Chrome sends them (see
+    test_dashboard_bars_take_a_range_drawn_across_them). Drawn from bar 2 to
+    bar 5 (marked once moved by 5 px), it is one step from the start of bar 2
+    to the end of bar 5: the table lists what those four bars counted, the
+    bars divide that range anew, and the click of the release is no second
+    step. A press that does not move is a step to the bar it pressed, also
+    when it ends on the next bar and Chrome sends its click to the <svg>. A
+    range of bars without alerts sets nothing; with a bar of alerts among
+    them it is a step. New alerts while a range is drawn leave the bars and
+    the mark as they are (the table counts them); once the press is over,
+    OVER TIME shows them, also after a cancelled one, and a range released
+    then is that of the bars it was drawn across. The bars held for a press
+    are drawn after the task of its end, not within it: a still press during
+    new alerts keeps the bar it pressed on the page, so Chrome sends it the
+    click (to a bar drawn anew under the pointer it sends none). A range
+    drawn across the dashboard's bars is no step of the Alerts tab, nor does
+    it hold OVER TIME still."""
+    script = _drill_script(r"""
+        globalThis.state = { alerts, processes: {}, activeTab: 'alerts' };
+        globalThis.ResizeObserver = class { observe() {} };
+        globalThis.requestAnimationFrame = fn => fn();
+        document.createElementNS = (ns, tag) => Object.assign(document.createElement(tag), { ns });
+        document.querySelector('#alerts-time-card .chart-card-head').rect = { width: 700 };
+        initAlertsTab();
+        renderAlertsTab();
+        const view = $('alerts-time-chart');
+        const svg = () => view.querySelector('svg');
+        // The bars on screen, [start, end, total] each, placed at x 100 to 800
+        const shown = () => view.querySelectorAll('.chart-bin').map(g => ['data-bin-start', 'data-bin-end', 'data-total']
+            .map(a => Number(g.getAttribute(a))));
+        let n = 0, slot = 0;
+        const place = () => {
+            svg().rect = { left: 100, top: 50, width: 700, height: 104, right: 800, bottom: 154 };
+            n = shown().length;
+            slot = 700 / n;
+            return shown();
+        };
+        const xOf = i => 100 + (i + 0.5) * slot;
+        const hit = i => view.querySelectorAll('.chart-hit')[i];
+        const mark = () => { const m = view.querySelector('.chart-brush'); return m && [Number(m.getAttribute('x')), Number(m.getAttribute('width'))]; };
+        const brushing = () => view.classList.contains('is-brushing');
+        // Chrome's pointer capture: the pointer's events and the click after its release go to the element holding it
+        let captured = null;
+        Element.prototype.setPointerCapture = function () { captured = this; };
+        Element.prototype.releasePointerCapture = function () { if (captured === this) captured = null; };
+        const chain = el => { const list = []; for (let e = el; e; e = e.parentNode) list.push(e); return list; };
+        const common = (a, b) => chain(a).find(e => chain(b).includes(e)) || null;
+        // What is under the pointer at clientX: the hit area of a bar, or the card beside the bars
+        const under = x => { const i = Math.floor((x - 100) / slot); return i >= 0 && i < n ? hit(i) : $('alerts-time-card'); };
+        const send = (type, x) => dispatch(type, captured || under(x),
+            { clientX: x, clientY: 100, button: 0, buttons: /up|cancel/.test(type) ? 0 : 1, pointerId: 7 });
+        // The release at x and the click Chrome sends after it: to the element holding the capture, else to the
+        // nearest common ancestor of the press's target (`down`) and the release's; none when the press's target
+        // is gone, drawn anew during the release (Chrome 157 on the VM then sends no click to the page). That
+        // element is returned.
+        const lift = (x, down) => {
+            const up = captured || under(x);
+            send('pointerup', x);
+            const target = captured || (down.isConnected ? common(down, up) : null);
+            captured = null;
+            if (target) dispatch('click', target, { clientX: x, clientY: 100, button: 0 });
+            return target;
+        };
+        // A press at x0, moves to each x of xs, the release at the last one
+        const gesture = (x0, xs = []) => {
+            const down = under(x0);
+            send('pointerdown', x0);
+            xs.forEach(x => send('pointermove', x));
+            return lift(xs.length ? xs[xs.length - 1] : x0, down);
+        };
+        let bins = place();
+        const r = { n, start: drill() };
+        // From bar 2 to bar 5; moved by 3 px it draws nothing yet
+        const down = under(xOf(2));
+        send('pointerdown', xOf(2)); send('pointermove', xOf(2) + 3);
+        r.small = [mark(), captured === null];
+        send('pointermove', xOf(4)); send('pointermove', xOf(5));
+        r.marked = { mark: mark(), slot, capture: captured && captured.id, brushing: brushing() };
+        const target = lift(xOf(5), down);
+        r.drag = { ...drill(), want: [bins[2][0], bins[5][1]], label: chartRangeLabel(bins[2][0], bins[5][1]),
+                   sum: bins.slice(2, 6).reduce((sum, bin) => sum + bin[2], 0), bars: shown(), mark: mark(),
+                   brushing: brushing(), clickTarget: target && target.id };
+        // A press on a bar that moves but by 4 px, onto the next bar: Chrome sends its click to the parent the two bars
+        // share, the <svg> (in the test DOM, which nests what follows a self-closing tag, it would be a grid line)
+        alertsDrillTo(-1);
+        bins = place();
+        const full = bins.findIndex((bin, i) => bin[2] > 0 && i + 1 < bins.length);
+        const edge = 100 + (full + 1) * slot;
+        send('pointerdown', edge - 2); send('pointermove', edge + 2);
+        r.slipped = under(edge + 2) !== under(edge - 2);
+        send('pointerup', edge + 2);
+        captured = null;
+        const chart = svg();
+        dispatch('click', chart, { clientX: edge + 2, clientY: 100, button: 0 });
+        r.still = { ...drill(), inBar: !!chart.closest('[data-bin-start]'), want: [bins[full][0], bins[full][1]],
+                    total: bins[full][2] };
+        // A range of bars without alerts (before the first alert) sets nothing; with a bar of alerts it is a step
+        alertsDrillTo(-1);
+        r.wide = { from: t0 - 3 * DAY, to: t0 + DAY };
+        setAlertsFilters(r.wide);
+        bins = place();
+        const before = drill();
+        gesture(xOf(0), [xOf(2)]);
+        r.empty = { totals: bins.map(bin => bin[2]), before, after: drill() };
+        gesture(xOf(1), [xOf(3)]);
+        r.oneFull = { ...drill(), want: [bins[1][0], bins[3][1]], total: bins[3][2] };
+        // New alerts while a range is drawn: the bars and the mark stay, the table counts them; a cancelled press
+        // leaves OVER TIME showing them once the task of its end is over (a click of it would still reach the bars)
+        alertsDrillTo(-1);
+        setAlertsFilters({ from: null, to: null });
+        bins = place();
+        const drawn = svg();
+        const late = { id: 'late', timestamp: new Date(bins[3][0] + HOUR).toISOString(), severity: 'high', engine: 'Sigma',
+                       rule_name: 'Run Key', process_name: 'p.exe' };
+        send('pointerdown', xOf(1)); send('pointermove', xOf(4));
+        state.alerts = [...alerts, late];
+        renderAlertsTab();
+        r.polled = { kept: svg() === drawn, mark: mark(), slot, count: $('alerts-count').textContent };
+        send('pointercancel', xOf(4));
+        captured = null;
+        r.polled.sameTask = svg() === drawn;
+        settle().then(() => {
+            r.cancelled = { ...drill(), redrawn: svg() !== drawn, mark: mark(), brushing: brushing(),
+                            totals: shown().map(bin => bin[2]), before: bins.map(bin => bin[2]) };
+            // ... and a range released after new alerts came is that of the bars it was drawn across
+            bins = place();
+            const later = { ...late, id: 'later', timestamp: new Date(bins[2][0] + 2 * HOUR).toISOString() };
+            const pressed = under(xOf(2));
+            send('pointerdown', xOf(2)); send('pointermove', xOf(3));
+            state.alerts = [...alerts, late, later];
+            renderAlertsTab();
+            lift(xOf(3), pressed);
+            r.released = { ...drill(), want: [bins[2][0], bins[3][1]], sum: bins[2][2] + bins[3][2] + 1,
+                           bars: shown().reduce((sum, bin) => sum + bin[2], 0) };
+            return settle();
+        }).then(() => {
+            // A press on a bar that does not move while new alerts come: its click reaches the bars it pressed (they
+            // are drawn anew after it), a step to that bar
+            alertsDrillTo(-1);
+            bins = place();
+            const one = bins.findIndex(bin => bin[2] > 0);
+            const pressed = under(xOf(one));
+            send('pointerdown', xOf(one));
+            state.alerts = [...alerts, late, { ...late, id: 'polled' }];
+            renderAlertsTab();
+            const clicked = lift(xOf(one), pressed);
+            r.stillPolled = { ...drill(), clicked: clicked && clicked.tagName.toLowerCase(), want: [bins[one][0], bins[one][1]],
+                              total: bins[one][2] };
+            return settle();
+        }).then(() => {
+            r.stillPolledLater = { steps: drill().steps, held: _alertsChartsDrawn.timeHeld };
+            console.log(JSON.stringify(r));
+        });
+    """)
+    r = _run_node(ALERTS_TAB_FUNCTIONS, script, SORT_DOM + _alerts_prelude())
+    none = {"range": {"from": None, "to": None}}
+
+    def step(before, view):
+        return [{"dashboard": False, "before": before, "after": {"range": {"from": view["want"][0], "to": view["want"][1]}}}]
+    start = r["start"]
+    assert r["n"] >= 20 and (start["labels"], start["count"]) == ([], "2345 of 2345")
+    assert r["small"] == [None, True], "a press moved by 3 px drew a range or took the capture"
+    marked = r["marked"]
+    assert marked["mark"] and abs(marked["mark"][0] - 2 * marked["slot"]) < 0.02 \
+        and abs(marked["mark"][1] - 4 * marked["slot"]) < 0.02, f"the mark is not over bars 2 to 5: {marked}"
+    assert (marked["capture"], marked["brushing"]) == ("alerts-time-chart", True), marked
+    drag = r["drag"]
+    assert drag["steps"] == step(none, drag), f"a range drawn from bar 2 to bar 5 made the steps {drag['steps']}"
+    assert (drag["labels"], drag["chips"]) == ([drag["label"]], ["range"])
+    assert drag["count"] == f"{drag['sum']} of 2345" and drag["sum"] > 0, "the table lists other alerts than the bars counted"
+    bars = drag["bars"]
+    assert (bars[0][0], bars[-1][1], sum(total for *_, total in bars)) == (*drag["want"], drag["sum"]), \
+        "the bars do not divide the range drawn anew"
+    assert drag["version"] == start["version"] + 1, "the click of the release made a step of its own"
+    assert (drag["mark"], drag["brushing"], drag["clickTarget"]) == (None, False, "alerts-time-chart")
+    still = r["still"]
+    assert r["slipped"] and still["inBar"] is False
+    assert still["steps"] == step(none, still), \
+        f"a press that did not move and ended on the next bar (its click on the <svg>) made the steps {still['steps']}"
+    assert still["count"] == f"{still['total']} of 2345" and still["total"] > 0
+    empty = r["empty"]
+    assert empty["totals"][:3] == [0, 0, 0] and empty["totals"][3] > 0, empty["totals"]
+    assert empty["after"] == empty["before"], "a range of bars without alerts set something"
+    one = r["oneFull"]
+    assert one["steps"] == step({"range": r["wide"]}, one) and one["count"] == f"{one['total']} of 2345", one["steps"]
+    polled, cancelled = r["polled"], r["cancelled"]
+    assert polled["kept"] and polled["mark"] and abs(polled["mark"][1] - 4 * polled["slot"]) < 0.02, \
+        "new alerts drew OVER TIME again while a range was drawn across it"
+    assert polled["count"] == "2346 of 2346", "the table did not count the new alerts meanwhile"
+    assert polled["sameTask"], "OVER TIME was drawn anew within the task of the press's end, before its click"
+    assert cancelled["redrawn"] and (cancelled["mark"], cancelled["brushing"], cancelled["steps"]) == (None, False, []), \
+        "OVER TIME does not show the new alerts after a cancelled range"
+    assert cancelled["totals"] == [total + (i == 3) for i, total in enumerate(cancelled["before"])]
+    released = r["released"]
+    assert released["steps"] == step(none, released), released["steps"]
+    assert released["count"] == f"{released['sum']} of 2347" == f"{released['bars']} of 2347", \
+        "after a range released past new alerts the bars count other alerts than the table"
+    polled_still = r["stillPolled"]
+    assert polled_still["clicked"] is not None, \
+        "a press that did not move while new alerts came lost its click (the bars drawn anew under it)"
+    assert polled_still["steps"] == step(none, polled_still) and polled_still["count"] == f"{polled_still['total']} of 2347", \
+        polled_still["steps"]
+    assert r["stillPolledLater"] == {"steps": polled_still["steps"], "held": False}, \
+        "the bars held for the press were not drawn after it, or its step was lost"
+
+    # A range drawn across ALERT ACTIVITY: OVER TIME is drawn meanwhile (a poll), and the Alerts tab takes no step
+    script = _dashboard_script(r"""
+        globalThis.state = { alerts, processes, serviceStatus: {}, rustinelInfo: {}, activeTab: 'dashboard' };
+        globalThis.ResizeObserver = class { observe() {} };
+        globalThis.requestAnimationFrame = fn => fn();
+        document.createElementNS = (ns, tag) => Object.assign(document.createElement(tag), { ns });
+        document.querySelector('#dashboard-alerts-card .dashboard-bars-area').rect = { left: 0, top: 0, width: 700, height: 220 };
+        initAlertsTab();
+        initDashboardCharts();
+        renderAlertsTab();
+        setDashboardRange('7d');
+        const dash = $('dashboard-alerts-chart');
+        dash.querySelector('svg').rect = { left: 100, top: 50, width: 700, height: 220, right: 800, bottom: 270 };
+        const bins = look().bins, slot = 700 / bins.length, xOf = i => 100 + (i + 0.5) * slot;
+        let captured = null;
+        Element.prototype.setPointerCapture = function () { captured = this; };
+        Element.prototype.releasePointerCapture = function () { if (captured === this) captured = null; };
+        const send = (type, x) => dispatch(type, captured || dash.querySelectorAll('.chart-hit')[Math.floor((x - 100) / slot)],
+            { clientX: x, clientY: 120, button: 0, buttons: /up|cancel/.test(type) ? 0 : 1, pointerId: 7 });
+        const tab = () => ({ steps: JSON.parse(JSON.stringify(alertsDrilldown)), version: alertsDrillVersion,
+                             filter: { ...alertsExtraFilter }, count: $('alerts-count').textContent });
+        const r = { before: tab() };
+        send('pointerdown', xOf(2)); send('pointermove', xOf(5));
+        const over = $('alerts-time-chart').querySelector('svg');
+        state.alerts = [...alerts];
+        renderAlertsTab();
+        r.during = [barsBrushActive(DASHBOARD_BARS_BRUSH), $('alerts-time-chart').querySelector('svg') !== over];
+        const up = captured;
+        send('pointerup', xOf(5));
+        captured = null;
+        dispatch('click', up || dash, { clientX: xOf(5), clientY: 120, button: 0 });
+        r.after = { ...tab(), range: { ...dashboardRange }, want: [bins[2][0], bins[5][1]] };
+        console.log(JSON.stringify(r));
+    """)
+    d = _run_node(DASHBOARD_JS, script, _dashboard_prelude())
+    assert d["during"] == [True, True], "a range drawn across the dashboard's bars held OVER TIME still, or none was drawn"
+    after = d["after"]
+    assert {key: after[key] for key in d["before"]} == d["before"], "a range drawn across ALERT ACTIVITY was a step"
+    assert (after["range"]["preset"], after["range"]["from"], after["range"]["to"]) == ("custom", *after["want"])
+
+
+@needs_node
+def test_a_press_on_bars_held_back_begins_nothing():
+    """New alerts during a press on OVER TIME are counted, but the bars are
+    drawn only after the task that ends the press: until then the bars on
+    screen are not those counted. A second press within that task (another
+    finger, a pen) begins nothing, so it neither marks nor narrows by bars
+    that are not on screen; once the task is over, the new bars are drawn
+    and take a press again. A second press that began before the new alerts
+    came keeps its bars and its mark through them, and through the redraw
+    put off by the press before it; released, it narrows by the bars it was
+    drawn across, and OVER TIME shows the new alerts."""
+    script = _drill_script(r"""
+        globalThis.state = { alerts, processes: {}, activeTab: 'alerts' };
+        globalThis.ResizeObserver = class { observe() {} };
+        globalThis.requestAnimationFrame = fn => fn();
+        document.createElementNS = (ns, tag) => Object.assign(document.createElement(tag), { ns });
+        document.querySelector('#alerts-time-card .chart-card-head').rect = { width: 700 };
+        initAlertsTab();
+        renderAlertsTab();
+        const view = $('alerts-time-chart');
+        const svg = () => view.querySelector('svg');
+        const shown = () => view.querySelectorAll('.chart-bin').map(g => ['data-bin-start', 'data-bin-end', 'data-total']
+            .map(a => Number(g.getAttribute(a))));
+        // The bars on screen, placed at x 100 to 800
+        let n = 0, slot = 0;
+        const place = () => {
+            svg().rect = { left: 100, top: 50, width: 700, height: 104, right: 800, bottom: 154 };
+            n = shown().length;
+            slot = 700 / n;
+            return shown();
+        };
+        const xOf = i => 100 + (i + 0.5) * slot;
+        const mark = () => { const m = view.querySelector('.chart-brush'); return m && [Number(m.getAttribute('x')), Number(m.getAttribute('width'))]; };
+        // Chrome's pointer capture (see test_alerts_bars_take_a_range_drawn_across_them); the click of a release
+        // without it goes to the bars' <svg>, the parent of the bars it began and ended on
+        let captured = null;
+        Element.prototype.setPointerCapture = function () { captured = this; };
+        Element.prototype.releasePointerCapture = function () { if (captured === this) captured = null; };
+        const under = x => { const i = Math.floor((x - 100) / slot); return i >= 0 && i < n ? view.querySelectorAll('.chart-hit')[i] : $('alerts-time-card'); };
+        const send = (type, x) => dispatch(type, captured || under(x),
+            { clientX: x, clientY: 100, button: 0, buttons: /up|cancel/.test(type) ? 0 : 1, pointerId: 7 });
+        const lift = x => {
+            const target = captured || svg();
+            send('pointerup', x);
+            captured = null;
+            dispatch('click', target, { clientX: x, clientY: 100, button: 0 });
+        };
+        const cancel = x => { send('pointercancel', x); captured = null; };
+        // New alerts ten days after the last one: other bars than those on screen
+        const last = Math.max(...alerts.map(a => Date.parse(a.timestamp)).filter(Number.isFinite));
+        const late = id => ({ id, timestamp: new Date(last + 10 * DAY).toISOString(), severity: 'high', engine: 'Sigma',
+                              rule_name: 'Run Key', process_name: 'p.exe' });
+        let bins = place(), drawn = svg();
+        const r = { n };
+        // A press drawing across bars 1 to 4 while new alerts come: they are counted, the bars on screen stay
+        send('pointerdown', xOf(1)); send('pointermove', xOf(4));
+        state.alerts = [...alerts, late('late')];
+        renderAlertsTab();
+        r.held = { kept: svg() === drawn, held: _alertsChartsDrawn.timeHeld, counted: _alertsChartsDrawn.time.bins.length,
+                   bins: ALERTS_BARS_BRUSH.bins().length, count: $('alerts-count').textContent };
+        // It is cancelled; in the same task a second press draws across bars 2 to 5 and is released
+        cancel(xOf(4));
+        send('pointerdown', xOf(2)); send('pointermove', xOf(5));
+        r.second = { kept: svg() === drawn, mark: mark(), active: barsBrushActive(ALERTS_BARS_BRUSH),
+                     brushing: view.classList.contains('is-brushing'), captured: captured !== null };
+        lift(xOf(5));
+        r.secondUp = drill();
+        settle().then(() => {
+            r.after = { redrawn: svg() !== drawn, n: shown().length, held: _alertsChartsDrawn.timeHeld };
+            alertsDrillTo(-1);          // (no step to take back, unless the second press made one)
+            // The new bars take a press again
+            bins = place();
+            send('pointerdown', xOf(2)); send('pointermove', xOf(5));
+            r.again = { mark: mark(), slot };
+            lift(xOf(5));
+            r.againStep = { ...drill(), want: [bins[2][0], bins[5][1]] };
+            // A press, its end, and in the same task a second press, during which new alerts come: that press
+            // keeps its bars and its mark through the redraw the first one put off
+            alertsDrillTo(-1);
+            bins = place();
+            drawn = svg();
+            send('pointerdown', xOf(1)); send('pointermove', xOf(3));
+            cancel(xOf(3));
+            send('pointerdown', xOf(2)); send('pointermove', xOf(5));
+            state.alerts = [...alerts, late('late'), late('later')];
+            renderAlertsTab();
+            return settle();
+        }).then(() => {
+            r.through = { kept: svg() === drawn, mark: mark(), slot, held: _alertsChartsDrawn.timeHeld,
+                          active: barsBrushActive(ALERTS_BARS_BRUSH) };
+            lift(xOf(5));
+            r.released = { ...drill(), want: [bins[2][0], bins[5][1]], redrawn: svg() !== drawn,
+                           bars: shown().reduce((sum, bin) => sum + bin[2], 0) };
+            console.log(JSON.stringify(r));
+        });
+    """)
+    r = _run_node(ALERTS_TAB_FUNCTIONS, script, SORT_DOM + _alerts_prelude())
+    held = r["held"]
+    assert held["kept"] and held["held"] and held["counted"] != r["n"], held
+    assert held["count"] == "2346 of 2346", "the table did not count the new alerts"
+    assert held["bins"] == 0, "the bars held back are offered to a press, though others are on screen"
+    second = r["second"]
+    assert second["kept"] and (second["mark"], second["active"], second["brushing"], second["captured"]) == \
+        (None, False, False, False), f"a press on bars held back marked bars that are not on screen: {second}"
+    assert r["secondUp"]["steps"] == [], "a press on bars held back narrowed by bars that are not on screen"
+    assert r["after"] == {"redrawn": True, "n": r["held"]["counted"], "held": False}, \
+        "the bars held back were not drawn once the task of the press's end was over"
+    again = r["again"]
+    assert again["mark"] and abs(again["mark"][0] - 2 * again["slot"]) < 0.02 and abs(again["mark"][1] - 4 * again["slot"]) < 0.02
+    step = r["againStep"]
+    assert step["steps"] == [{"dashboard": False, "before": {"range": {"from": None, "to": None}},
+                              "after": {"range": {"from": step["want"][0], "to": step["want"][1]}}}]
+    through = r["through"]
+    assert through["kept"] and through["held"] and through["active"], \
+        "the redraw a press put off was done during the press after it"
+    assert through["mark"] and abs(through["mark"][0] - 2 * through["slot"]) < 0.02 \
+        and abs(through["mark"][1] - 4 * through["slot"]) < 0.02, f"the mark of the second press is gone: {through}"
+    released = r["released"]
+    assert released["redrawn"], "OVER TIME does not show the new alerts after the release"
+    assert released["steps"] == [{"dashboard": False, "before": {"range": {"from": None, "to": None}},
+                                  "after": {"range": {"from": released["want"][0], "to": released["want"][1]}}}]
+    assert released["count"] == f"{released['bars']} of 2347", "the bars count other alerts than the table"
+
+
+@needs_node
+def test_alerts_over_time_hint_and_info():
+    """Under the bars of OVER TIME stands how to use them, as under ALERT
+    ACTIVITY of the dashboard: "Drag across the bars to narrow the range ·
+    click a bar to show only its period", on the line of the note of the
+    alerts in no bar (before it). Without bars there is no hint: no alert
+    matches, none has a time, there are none. The (i) of OVER TIME tells of
+    drawing a range and of BACK. The bars select no text while a range is
+    drawn across them and let a finger scroll the page; both themes style
+    the line under them."""
+    script = _alert_charts_script(r"""
+        globalThis.state = { alerts, processes: {}, activeTab: 'alerts' };
+        const time = $('alerts-time-chart');
+        const look = () => ({
+            parts: time.children.map(c => [c.tagName.toLowerCase(), c.getAttribute('class')]),
+            line: (time.querySelector('.alerts-chart-note') || { children: [] }).children
+                .map(c => [c.getAttribute('class'), c.textContent, c.getAttribute('title')]),
+            hintParts: (time.querySelector('.alerts-time-hint') || { children: [] }).children.map(c => c.textContent),
+        });
+        const untimed = alerts.filter(a => Number.isNaN(Date.parse(a.timestamp)));
+        renderAlertsTab();
+        const r = { all: { ...look(), untimed: untimed.length } };
+        openAlertsTab({ process: 'nothing like it' });
+        r.none = look();
+        state.alerts = untimed;
+        openAlertsTab({});
+        r.untimed = { ...look(), untimed: untimed.length };
+        state.alerts = [];
+        renderAlertsTab();
+        r.noAlerts = look();
+        console.log(JSON.stringify(r));
+    """)
+    r = _run_node(ALERTS_TAB_FUNCTIONS, script, SORT_DOM + _alerts_prelude())
+    hint = "Drag across the bars to narrow the range \u00b7 click a bar to show only its period"
+    missed = ["alerts-time-missed", f"{r['all']['untimed']} without time",
+              "Alerts without a readable time or with one no clock can have had (before 2000, more than a day ahead) "
+              "are in no bar; SEVERITY, ENGINE and FLOW count them"]
+    every = r["all"]
+    assert every["parts"] == [["svg", "chart-svg chart-bars"], ["div", "alerts-chart-note"]], \
+        f"no line under the bars: {every['parts']}"
+    assert every["line"] == [["alerts-time-hint", hint, None], missed], \
+        f"the line under the bars does not say how to use them, then what is in no bar: {every['line']}"
+    assert (r["none"]["parts"], r["none"]["line"]) == ([["div", "chart-empty"]], []), "a hint without bars"
+    assert r["untimed"]["parts"] == [["div", "chart-empty"], ["div", "alerts-chart-note"]] and r["untimed"]["line"] == [missed], \
+        "alerts without a time alone: a hint without bars, or no note of them"
+    assert r["noAlerts"]["parts"] == [["div", "chart-empty"]]
+    html = _read(INDEX_HTML)
+    card = _element_markup(html, html.index('<div class="chart-card" id="alerts-time-card">'))
+    info = re.search(r'<h3 class="chart-card-title" data-info="([^"]*)">OVER TIME</h3>', card)
+    assert info and "Drag across the bars" in info.group(1), "the (i) of OVER TIME does not tell of drawing a range"
+    assert info.group(1) == ("The alerts of the current filters per period, stacked by severity; alerts without a time "
+                             "are noted below the bars. Drag across the bars or click a bar to narrow the tab to that "
+                             "period, BACK above the charts goes back a step."), info.group(1)
+    rules, theme = _rules(STYLE_CSS), _rules(THEME_CSS)
+    bars = rules.get("#alerts-time-chart", "")
+    assert re.search(r"(?:^|;)\s*user-select:\s*none", bars) and re.search(r"(?:^|;)\s*touch-action:\s*pan-y", bars), \
+        "a range drawn across OVER TIME selects text, or a finger cannot draw one"
+    line = rules.get(".alerts-chart-note", "")
+    assert all(re.search(r"(?:^|;)\s*%s" % decl, line) for decl in (r"display:\s*flex", r"flex-wrap:\s*wrap",
+                                                                    r"justify-content:\s*space-between")), \
+        "the hint and the note of the alerts in no bar do not share the line under the bars"
+    # On a narrow card (Classic at 1280 px) the hint breaks after its "·", not inside a phrase ("click a / bar"); on
+    # one narrower than a half (below about 1220 px), that half wraps inside the card instead of running into ENGINE
+    assert every["hintParts"] == ["Drag across the bars to narrow the range \u00b7", "click a bar to show only its period"], \
+        every["hintParts"]
+    half = rules.get(".alerts-time-hint span", "")
+    assert re.search(r"(?:^|;)\s*display:\s*inline-block", half), "the hint breaks inside a phrase on a narrow card"
+    assert not re.search(r"white-space:\s*nowrap", half), "a half of the hint wider than the card runs into the next card"
+    assert _painted(rules, _cls("alerts-chart-note"), "color") and '[data-theme="cyberpunk"] .alerts-chart-note' in theme
+
+
+# --- The drilldown bar of the Alerts tab ------------------------------------------
+
+# What the drilldown bar shows: hidden or not, the texts of its path as seen
+# (without the separators, and without the text for screen readers only,
+# .visually-hidden), the parts of its path (tag, attributes, text as seen)
+# and its count; the parts a click may hit, and where the keyboard focus is.
+# How the focus came to an element: keyFocus from the keyboard (it then
+# matches :focus-visible, as long as it is focused and in the page),
+# mouseFocus by a click of the mouse (it does not); noFocusVisible() makes a
+# browser that does not know the selector (matches throws).
+DRILL_BAR_LOOK = r"""
+    const drillBar = $('alerts-drill'), pathOf = () => $('alerts-drill-path');
+    const back = drillBar.querySelector('[data-drill="back"]');
+    const seen = node => node.nodeType === 3 ? node.textContent
+        : node.classList.contains('visually-hidden') ? '' : node.childNodes.map(seen).join('');
+    const bar = () => ({
+        hidden: drillBar.hidden,
+        path: pathOf().children.filter(el => !el.classList.contains('alerts-drill-sep')).map(seen),
+        parts: pathOf().children.map(el => [el.tagName.toLowerCase(), { ...el.attrs }, seen(el)]),
+        count: $('alerts-drill-count').textContent,
+    });
+    const stepAt = i => pathOf().querySelector(`[data-drill-step="${i}"]`);
+    const focused = () => {
+        const el = document.activeElement;
+        return !el ? null : el === back ? 'back' : el.id || el.getAttribute('data-drill-step') || el.tagName.toLowerCase();
+    };
+    const look = () => ({ bar: bar(), labels: alertsDrilldown.map(alertsStepLabel), version: alertsDrillVersion,
+                          table: $('alerts-count').textContent, filter: { ...alertsExtraFilter }, focus: focused() });
+    const fromKeys = new Set(), plainMatches = Element.prototype.matches;
+    let knowsFocusVisible = true;
+    Element.prototype.matches = function (selector) {
+        if (selector !== ':focus-visible') return plainMatches.call(this, selector);
+        if (!knowsFocusVisible) throw new SyntaxError(`'${selector}' is not a valid selector`);
+        return document.activeElement === this && this.isConnected && fromKeys.has(this);
+    };
+    const keyFocus = el => { fromKeys.add(el); el.focus(); };
+    const mouseFocus = el => { fromKeys.delete(el); el.focus(); };
+    const noFocusVisible = () => { knowsFocusVisible = false; };
+"""
+
+DRILL_INFO = ("Each click on a chart and each range drawn across OVER TIME that changes a filter is a step here. BACK goes "
+              "back one step, a step goes back to it, ALL ALERTS takes every step off.")
+SEP = ["span", {"class": "alerts-drill-sep", "aria-hidden": "true"}, "\u203a"]
+
+
+def _drill_bar_script(script):
+    return _drill_script(DRILL_BAR_LOOK + script)
+
+
+def _drill_step(i, label, current=False):
+    """A step of the path as DRILL_BAR_LOOK gives it: a button that jumps back
+    to it, or the current step (no button)."""
+    if current:
+        return ["span", {"class": "alerts-drill-step is-current", "aria-current": "step", "title": label}, label]
+    return ["button", {"type": "button", "class": "alerts-drill-step", "data-drill-step": str(i), "title": label}, label]
+
+
+ALL_ALERTS = ["button", {"type": "button", "class": "alerts-drill-step", "data-drill-step": "-1"}, "ALL ALERTS"]
+
+
+def _joined(*parts):
+    """The parts of a path with › between them."""
+    return [part for i, p in enumerate(parts) for part in ([SEP, p] if i else [p])]
+
+
+@needs_node
+def test_drilldown_bar_shows_the_path():
+    """Between the head of the tab and its charts stands the drilldown bar,
+    hidden while there is no step: ‹ BACK, DRILLDOWN with its (i), the path
+    and the count. The path begins with ALL ALERTS and ends with the current
+    step, which is no button; the steps between are buttons that jump back
+    to them, › between them; each step's title has its name in full. Of more
+    steps than three, the older ones fall together into "…", whose title
+    names them. The count is that of the table, with separators. A name from
+    the data (markup, a quote, 300 characters) stays text. New alerts change
+    the count and keep the path, its very buttons (one in focus keeps it).
+    The path is drawn again whenever the steps changed, also when the
+    filters did not: a jump from the dashboard to the range a bar set makes
+    the step "14 Jul" "Dashboard: 14 Jul"; a severity chip switched by hand
+    takes the step of SEVERITY out of it at once. The (i) of the tab tells
+    of the steps and BACK."""
+    html = _read(INDEX_HTML)
+    tab = _Elements(html).by_id("tab-alerts")
+    nav = tab["children"][1]
+    assert (nav["tag"], nav["attrs"]) == ("nav", {"class": "alerts-drill", "id": "alerts-drill", "aria-label": "Drilldown",
+                                                  "hidden": "", "onclick": "onAlertsDrillClick(event)"}), \
+        "no drilldown bar between the head of the tab and its charts"
+    # BACK's ‹ stands in a span of its own, hidden from screen readers:
+    # test_drilldown_bar_names_where_back_goes_and_the_folded_steps
+    assert [(c["tag"], c["attrs"], c.get("text", "")) for c in nav["children"]] == [
+        ("button", {"type": "button", "class": "alerts-drill-back", "data-drill": "back"}, " BACK"),
+        ("span", {"class": "alerts-drill-label", "data-info": DRILL_INFO}, "DRILLDOWN"),
+        ("span", {"class": "alerts-drill-path", "id": "alerts-drill-path"}, ""),
+        ("span", {"class": "alerts-drill-count", "id": "alerts-drill-count"}, ""),
+    ]
+    head = tab["children"][0]
+    heading = next(c for c in head["children"] if c["tag"] == "h2")["attrs"]["data-info"]
+    assert len(heading) <= 300 and "BACK" in heading and "OVER TIME" in heading and "as a chip" not in heading, \
+        f"the (i) of the tab does not tell of the steps of the drilldown and BACK: {heading}"
+
+    script = _drill_bar_script(r"""
+        globalThis.state = { alerts, processes: {}, activeTab: 'alerts' };
+        renderAlertsTab();
+        const r = { start: bar() };
+        // Two steps: the bar of 14 Jul, then 10:00-12:00 of that day
+        click(dayBar(14)); drillAlerts({ from: at(14, 10), to: at(14, 12) });
+        r.two = look();
+        // Five: then HIGH, Sigma and the rule Run Key; the two oldest fall together into "…"
+        drillAlerts({ severities: ['high'] }); drillAlerts({ engine: 'sigma' }); drillAlerts({ rule: 'Run Key' });
+        r.five = look();
+        // New alerts: the count follows them, the path stays as it is, its very nodes
+        const nodes = pathOf().children;
+        state.alerts = [...alerts, { id: 'new', timestamp: new Date(at(14, 11)).toISOString(), severity: 'high',
+                                     engine: 'Sigma', rule_name: 'Run Key', process_name: 'x.exe' }];
+        renderAlertsTab();
+        r.polled = { ...look(), same: pathOf().children.length === nodes.length
+                                      && pathOf().children.every((el, i) => el === nodes[i]) };
+        state.alerts = alerts;
+        renderAlertsTab();
+        // Names from the data stay text, in full in their titles (one of 300 characters too)
+        alertsDrillTo(-1);
+        const LONG = ('A' + QUOTE + EVIL).repeat(20).slice(0, 299) + 'Z';
+        drillAlerts({ rule: EVIL }); drillAlerts({ process: QUOTE }); drillAlerts({ category: LONG });
+        r.hostile = { ...look(), markup: ['img', 'b', 'script'].map(tag => drillBar.querySelectorAll(tag).length) };
+        // ... also where they fall together into "…"
+        drillAlerts({ severities: ['high'] }); drillAlerts({ engine: 'sigma' });
+        r.hostileMore = { ...look(), markup: ['img', 'b', 'script'].map(tag => drillBar.querySelectorAll(tag).length) };
+        // The steps change, the filters do not: a jump from the dashboard to the range the bar of 14 Jul set
+        alertsDrillTo(-1);
+        click(dayBar(14));
+        r.day = look();
+        const row = $('alerts-rows').firstElementChild, range = { ...alertsExtraFilter };
+        state.activeTab = 'dashboard';
+        openAlertsTab({ from: range.from, to: range.to });
+        r.jump = { ...look(), sameRows: $('alerts-rows').firstElementChild === row };
+        // A severity chip switched by hand: the step of SEVERITY leaves the path at once
+        click(seg('alerts-severity-chart', 'high')); r.high = look();
+        click(document.querySelector('#tab-alerts .alerts-sev-chip[data-severity="medium"]')); r.chip = look();
+        alertsDrillTo(-1); r.end = look();
+        console.log(JSON.stringify(r));
+    """)
+    r = _run_node(ALERTS_TAB_FUNCTIONS, script, SORT_DOM + _alerts_prelude())
+    assert r["start"] == {"hidden": True, "path": [], "parts": [], "count": "2,345 of 2,345 alerts"}, \
+        "the bar shows without a step"
+
+    def count(look):
+        shown, total = look["table"].split(" of ")
+        return f"{int(shown):,} of {int(total):,} alerts"
+    two = r["two"]
+    assert two["labels"] == ["14 Jul", "14 Jul 10:00\u201312:00"]
+    assert (two["bar"]["hidden"], two["bar"]["path"]) == (False, ["ALL ALERTS", "14 Jul", "14 Jul 10:00\u201312:00"])
+    assert two["bar"]["parts"] == _joined(ALL_ALERTS, _drill_step(0, "14 Jul"), _drill_step(1, "14 Jul 10:00\u201312:00", True)), \
+        two["bar"]["parts"]
+    assert two["bar"]["count"] == count(two) and 0 < int(two["table"].split(" of ")[0]) < 2345
+    five = r["five"]
+    s = five["labels"]
+    assert s == ["14 Jul", "14 Jul 10:00\u201312:00", "HIGH", "Sigma", "rule: Run Key"]
+    assert five["bar"]["path"] == ["ALL ALERTS", "\u2026", s[2], s[3], s[4]]
+    more = ["span", {"class": "alerts-drill-more", "title": f"{s[0]} \u203a {s[1]}"}, "\u2026"]
+    assert five["bar"]["parts"] == _joined(ALL_ALERTS, more, _drill_step(2, s[2]), _drill_step(3, s[3]),
+                                           _drill_step(4, s[4], True)), five["bar"]["parts"]
+    assert five["bar"]["count"] == count(five)
+    polled = r["polled"]
+    assert polled["same"] and (polled["labels"], polled["bar"]["parts"]) == (five["labels"], five["bar"]["parts"]), \
+        "new alerts drew the path anew (a step in focus loses it) or changed it"
+    assert polled["table"] == f"{int(five['table'].split(' of ')[0]) + 1} of 2346" and polled["bar"]["count"] == count(polled)
+    hostile = r["hostile"]
+    long = ("A" + QUOTE + EVIL) * 20
+    long = long[:299] + "Z"
+    names = [f"rule: {EVIL}", f"process: {QUOTE}", f"category: {long}"]
+    assert hostile["labels"] == names and len(long) == 300
+    assert hostile["markup"] == [0, 0, 0], "a name from the data became markup in the path"
+    assert hostile["bar"]["path"] == ["ALL ALERTS", *names]
+    assert hostile["bar"]["parts"] == _joined(ALL_ALERTS, _drill_step(0, names[0]), _drill_step(1, names[1]),
+                                              _drill_step(2, names[2], True)), "a name left its text or its title"
+    more_hostile = r["hostileMore"]
+    folded = ["span", {"class": "alerts-drill-more", "title": f"{names[0]} \u203a {names[1]}"}, "\u2026"]
+    assert more_hostile["markup"] == [0, 0, 0] and more_hostile["bar"]["parts"] == _joined(
+        ALL_ALERTS, folded, _drill_step(2, names[2]), _drill_step(3, "HIGH"), _drill_step(4, "Sigma", True)), \
+        "a name left the title of \u2026"
+    # The same filters, other steps: the path drawn again though the table was not
+    jump = r["jump"]
+    assert r["day"]["bar"]["path"] == ["ALL ALERTS", "14 Jul"]
+    assert jump["sameRows"] and jump["filter"] == r["day"]["filter"], "the jump changed the filters or drew the table again"
+    assert jump["labels"] == ["Dashboard: 14 Jul"] and jump["bar"]["path"] == ["ALL ALERTS", "Dashboard: 14 Jul"], \
+        "the path still names the step the jump replaced"
+    assert jump["bar"]["count"] == r["day"]["bar"]["count"]
+    assert r["high"]["bar"]["path"] == ["ALL ALERTS", "Dashboard: 14 Jul", "HIGH"]
+    assert r["chip"]["bar"]["path"] == ["ALL ALERTS", "Dashboard: 14 Jul"] and r["chip"]["bar"]["count"] == count(r["chip"]), \
+        "the path still names the step a chip switched by hand replaced"
+    assert (r["end"]["bar"]["hidden"], r["end"]["bar"]["path"]) == (True, [])
+
+
+@needs_node
+def test_drilldown_bar_names_where_back_goes_and_the_folded_steps():
+    """For screen readers: the ‹ of BACK is hidden from them, so BACK reads
+    as "BACK"; its title and its name say where it goes, "Back to" the step
+    before the last ("Back to all alerts" from the only step), and follow
+    the steps (BACK, a step a filter set by hand drops; new alerts leave
+    them as they are). The "…" of the folded steps names them in a text for
+    screen readers only (.visually-hidden: out of sight and of the layout,
+    with no colour of its own) beside its title, while the bar shows "…"
+    alone. A click on the ‹ is a click on BACK. Names from the data
+    (markup, a quote, 300 characters) stay text."""
+    back = next(c for c in _Elements(_read(INDEX_HTML)).by_id("alerts-drill")["children"]
+                if c["attrs"].get("data-drill") == "back")
+    assert (back.get("text", ""), [(c["tag"], c["attrs"], c.get("text", "")) for c in back["children"]]) == \
+        (" BACK", [("span", {"aria-hidden": "true"}, "\u2039")]), "a screen reader reads the \u2039 of BACK"
+    hidden = _rules(STYLE_CSS).get(".visually-hidden", "")
+    props = ("position", "width", "height", "margin", "padding", "overflow", "clip", "clip-path", "white-space", "border")
+    assert [_declared(hidden, p) for p in props] == \
+        ["absolute", "1px", "1px", "-1px", "0", "hidden", "rect(0, 0, 0, 0)", "inset(50%)", "nowrap", "0"], \
+        f"the text for screen readers only takes room or shows: {hidden}"
+    assert not re.search(r"(?:^|;)\s*(?:color|background|fill|stroke|box-shadow|text-shadow)", hidden), hidden
+
+    script = _drill_bar_script(r"""
+        globalThis.state = { alerts, processes: {}, activeTab: 'alerts' };
+        renderAlertsTab();
+        // BACK's title and name; the text for screen readers only in the path, by the element that holds it; the
+        // parts of "…" (text, or tag, attributes and text)
+        const backOf = () => ({ title: back.getAttribute('title'), label: back.getAttribute('aria-label') });
+        const unseen = () => pathOf().querySelectorAll('.visually-hidden').map(el => [el.parentElement.className, el.textContent]);
+        const more = () => {
+            const el = pathOf().querySelector('.alerts-drill-more');
+            return el && el.childNodes.map(n => n.nodeType === 3 ? n.textContent : [n.tagName.toLowerCase(), { ...n.attrs }, n.textContent]);
+        };
+        const read = () => ({ ...look(), back: backOf(), unseen: unseen(), more: more(),
+                              markup: ['img', 'b', 'script'].map(tag => drillBar.querySelectorAll(tag).length) });
+        const r = {};
+        // One step: BACK goes back to all alerts
+        click(dayBar(14)); r.one = read();
+        // Three: BACK goes back to the second; nothing folds
+        drillAlerts({ from: at(14, 10), to: at(14, 12) }); drillAlerts({ severities: ['high'] }); r.three = read();
+        // A click on the ‹ of BACK: two steps left, BACK goes back to the first; new alerts leave that as it is
+        click(back.querySelector('[aria-hidden="true"]') || back); r.two = read();
+        state.alerts = [...alerts, { id: 'new', timestamp: new Date(at(14, 11)).toISOString(), severity: 'high',
+                                     engine: 'Sigma', rule_name: 'Run Key', process_name: 'x.exe' }];
+        renderAlertsTab(); r.polled = read();
+        state.alerts = alerts; renderAlertsTab();
+        // Names from the data: three steps of them, then five, the two oldest folded into "…"
+        alertsDrillTo(-1);
+        const LONG = ('A' + QUOTE + EVIL).repeat(20).slice(0, 299) + 'Z';
+        drillAlerts({ rule: EVIL }); drillAlerts({ process: QUOTE }); drillAlerts({ category: LONG }); r.hostile = read();
+        drillAlerts({ severities: ['high'] }); drillAlerts({ engine: 'sigma' }); r.five = read();
+        // The engine chosen by hand: the step Sigma drops out; BACK and "…" follow
+        const select = $('alerts-filter-engine');
+        select.value = 'Yara'; dispatch('change', select); r.byHand = read();
+        console.log(JSON.stringify(r));
+    """)
+    r = _run_node(ALERTS_TAB_FUNCTIONS, script, SORT_DOM + _alerts_prelude())
+
+    def to(name):
+        return {"title": f"Back to {name}", "label": f"Back to {name}"}
+    one, three, two = r["one"], r["three"], r["two"]
+    assert (one["labels"], one["back"]) == (["14 Jul"], to("all alerts")), f"BACK of the only step: {one['back']}"
+    assert three["labels"] == ["14 Jul", "14 Jul 10:00\u201312:00", "HIGH"]
+    assert three["back"] == to("14 Jul 10:00\u201312:00"), f"BACK does not name the step it goes back to: {three['back']}"
+    assert (two["labels"], two["back"]) == (["14 Jul", "14 Jul 10:00\u201312:00"], to("14 Jul")), \
+        f"a click on the \u2039 is no BACK, or BACK's title stays as it was: {two['labels']}, {two['back']}"
+    assert (r["polled"]["back"], r["polled"]["version"]) == (two["back"], two["version"])
+    assert (one["unseen"], three["unseen"], two["unseen"], three["more"]) == ([], [], [], None), \
+        "text for screen readers only without a step folded"
+    long = (("A" + QUOTE + EVIL) * 20)[:299] + "Z"
+    names = [f"rule: {EVIL}", f"process: {QUOTE}", f"category: {long}"]
+    hostile = r["hostile"]
+    assert hostile["labels"] == names and hostile["back"] == to(names[1]) and hostile["markup"] == [0, 0, 0], \
+        f"a name from the data left BACK's title or became markup: {hostile['back']}"
+    five, folded = r["five"], f"{names[0]} \u203a {names[1]}"
+    assert five["back"] == to("HIGH") and five["markup"] == [0, 0, 0]
+    assert five["more"] == ["\u2026", ["span", {"class": "visually-hidden"}, folded]], \
+        f"the \u2026 does not name the folded steps for screen readers: {five['more']}"
+    assert five["unseen"] == [["alerts-drill-more", folded]], five["unseen"]
+    assert five["bar"]["path"] == ["ALL ALERTS", "\u2026", names[2], "HIGH", "Sigma"]
+    assert five["bar"]["parts"][2] == ["span", {"class": "alerts-drill-more", "title": folded}, "\u2026"], \
+        "the \u2026 lost its title"
+    by_hand = r["byHand"]
+    assert (by_hand["labels"], by_hand["back"]) == ([*names, "HIGH"], to(names[2])), \
+        f"BACK still names a step a filter set by hand dropped: {by_hand['back']}"
+    assert by_hand["unseen"] == [["alerts-drill-more", names[0]]], by_hand["unseen"]
+
+
+@needs_node
+def test_drilldown_bar_clicks():
+    """A click in the drilldown bar, one handler for the bar reading the
+    number of the step from its data- attribute: BACK takes the last step
+    back, a step jumps back to the state after it (the later ones taken
+    back), ALL ALERTS takes every step back; ›, DRILLDOWN, "…", the current
+    step, the count and the bar itself do nothing. The keyboard focus stays
+    where it was if it can: on BACK while steps are left; a step in focus
+    drawn anew hands it to BACK; when the bar goes, the focus moves on to the
+    search box (after a click of the mouse it does not:
+    test_drilldown_bar_moves_on_keyboard_focus_only). New alerts leave a step
+    in focus as it is."""
+    script = _drill_bar_script(r"""
+        globalThis.state = { alerts, processes: {}, activeTab: 'alerts' };
+        renderAlertsTab();
+        click(dayBar(14)); drillAlerts({ from: at(14, 10), to: at(14, 12) });
+        const r = { two: look() };
+        drillAlerts({ severities: ['high'] }); r.three = look();
+        // BACK from the keyboard: a step less, the focus stays on it
+        keyFocus(back); click(back); r.back = look();
+        // A step: the state after it; the step in focus is drawn anew, the focus goes to BACK
+        drillAlerts({ severities: ['high'] });
+        keyFocus(stepAt(0)); click(stepAt(0)); r.toFirst = look();
+        // New alerts while a step is in focus: the path stays, the focus with it
+        drillAlerts({ from: at(14, 10), to: at(14, 12) });
+        const kept = stepAt(0);
+        keyFocus(kept);
+        state.alerts = [...alerts, { id: 'new', timestamp: new Date(at(14, 11)).toISOString(), severity: 'high',
+                                     engine: 'Sigma', rule_name: 'Run Key', process_name: 'x.exe' }];
+        renderAlertsTab();
+        r.polled = { ...look(), kept: document.activeElement === kept && kept.isConnected };
+        state.alerts = alerts;
+        renderAlertsTab();
+        // ›, DRILLDOWN, the current step, the count, the path and the bar itself: nothing
+        const before = look();
+        const parts = [pathOf().querySelector('.alerts-drill-sep'), drillBar.querySelector('.alerts-drill-label'),
+                       pathOf().querySelector('[aria-current="step"]'), $('alerts-drill-count'), pathOf(), drillBar];
+        parts.forEach(el => click(el));
+        r.nothing = { before, after: look(), hit: parts.map(el => !!el) };
+        // "…" (five steps): nothing either
+        drillAlerts({ severities: ['high'] }); drillAlerts({ engine: 'sigma' }); drillAlerts({ rule: 'Run Key' });
+        const five = look();
+        click(pathOf().querySelector('.alerts-drill-more'));
+        r.more = { before: five, after: look() };
+        // ALL ALERTS from the keyboard: no step left, the bar hidden, the focus on the search box
+        keyFocus(stepAt(-1)); click(stepAt(-1)); r.all = look();
+        // BACK of the only step, from the keyboard: the same
+        click(dayBar(14)); keyFocus(back); click(back); r.lastBack = look();
+        console.log(JSON.stringify(r));
+    """)
+    r = _run_node(ALERTS_TAB_FUNCTIONS, script, SORT_DOM + _alerts_prelude())
+    two, three, back = r["two"], r["three"], r["back"]
+    assert three["labels"] == ["14 Jul", "14 Jul 10:00\u201312:00", "HIGH"]
+    assert (back["labels"], back["table"], back["filter"], back["bar"]["path"]) == \
+        (two["labels"], two["table"], two["filter"], ["ALL ALERTS", "14 Jul", "14 Jul 10:00\u201312:00"]), \
+        "BACK does not take the last step back"
+    assert back["focus"] == "back" and not back["bar"]["hidden"], "BACK lost the focus while steps are left"
+    to_first = r["toFirst"]
+    assert (to_first["labels"], to_first["bar"]["path"]) == (["14 Jul"], ["ALL ALERTS", "14 Jul"]), \
+        "a click on the first step does not leave that step alone"
+    assert to_first["focus"] == "back", f"the focus on a step drawn anew got lost: {to_first['focus']}"
+    polled = r["polled"]
+    assert polled["kept"] and polled["labels"] == ["14 Jul", "14 Jul 10:00\u201312:00"], \
+        "new alerts took the focus off a step"
+    nothing = r["nothing"]
+    assert all(nothing["hit"]) and nothing["after"] == nothing["before"], \
+        f"a click on a separator, DRILLDOWN, the current step or the count changed something: {nothing}"
+    assert r["more"]["after"] == r["more"]["before"] and "\u2026" in r["more"]["before"]["bar"]["path"]
+    for name in ("all", "lastBack"):
+        gone = r[name]
+        assert (gone["labels"], gone["filter"], gone["table"], gone["bar"]["hidden"]) == ([], NO_EXTRA, "2345 of 2345", True), \
+            f"{name}: steps left, or the bar still shows"
+        assert gone["focus"] == "alerts-filter-text", f"{name}: the focus left with the bar ({gone['focus']})"
+    assert r["all"]["version"] > r["more"]["after"]["version"]
+
+
+@needs_node
+def test_drilldown_bar_moves_on_keyboard_focus_only():
+    """The bar goes with the focus in it (ALL ALERTS, BACK of the only step):
+    a focus that came from the keyboard (:focus-visible) moves on to the
+    search box; after a click of the mouse the focus stays where the browser
+    leaves it, so the search box neither lights up nor opens a touch
+    keyboard. A browser that does not know :focus-visible counts as the
+    keyboard. A focus outside the bar stays where it is when the bar goes:
+    the chip MEDIUM switched from the keyboard takes the only step (MEDIUM)
+    off."""
+    script = _drill_bar_script(r"""
+        globalThis.state = { alerts, processes: {}, activeTab: 'alerts' };
+        renderAlertsTab();
+        const r = {};
+        const twoSteps = () => { click(dayBar(14)); drillAlerts({ from: at(14, 10), to: at(14, 12) }); };
+        // ALL ALERTS from the keyboard, then by the mouse
+        twoSteps();
+        let all = stepAt(-1);
+        keyFocus(all); click(all); r.allKeys = look();
+        twoSteps();
+        all = stepAt(-1);
+        mouseFocus(all); click(all); r.allMouse = { ...look(), left: document.activeElement === all };
+        // BACK of the only step from the keyboard, then by the mouse
+        click(dayBar(14)); keyFocus(back); click(back); r.backKeys = look();
+        click(dayBar(14)); mouseFocus(back); click(back); r.backMouse = { ...look(), left: document.activeElement === back };
+        // The focus outside the bar: on the chip MEDIUM, which takes the only step (MEDIUM) off
+        click(seg('alerts-severity-chart', 'medium')); r.medium = look();
+        const chip = document.querySelector('#tab-alerts .alerts-sev-chip[data-severity="medium"]');
+        keyFocus(chip); click(chip);
+        r.chip = { ...look(), left: document.activeElement === chip, pressed: chip.getAttribute('aria-pressed') };
+        // A browser without :focus-visible (the selector throws): ALL ALERTS as from the keyboard
+        noFocusVisible();
+        twoSteps();
+        all = stepAt(-1);
+        all.focus(); click(all); r.unknown = look();
+        console.log(JSON.stringify(r));
+    """)
+    r = _run_node(ALERTS_TAB_FUNCTIONS, script, SORT_DOM + _alerts_prelude())
+    for name in ("allKeys", "allMouse", "backKeys", "backMouse", "unknown"):
+        gone = r[name]
+        assert (gone["labels"], gone["filter"], gone["table"], gone["bar"]["hidden"]) == ([], NO_EXTRA, "2345 of 2345", True), \
+            f"{name}: steps left, or the bar still shows"
+    for name in ("allKeys", "backKeys", "unknown"):
+        assert r[name]["focus"] == "alerts-filter-text", f"{name}: the keyboard focus left with the bar ({r[name]['focus']})"
+    assert (r["allMouse"]["focus"], r["allMouse"]["left"]) == ("-1", True), \
+        f"a click of the mouse on ALL ALERTS moved the focus on to {r['allMouse']['focus']}"
+    assert (r["backMouse"]["focus"], r["backMouse"]["left"]) == ("back", True), \
+        f"a click of the mouse on BACK moved the focus on to {r['backMouse']['focus']}"
+    assert r["medium"]["labels"] == ["MEDIUM"] and not r["medium"]["bar"]["hidden"]
+    chip = r["chip"]
+    assert (chip["labels"], chip["bar"]["hidden"], chip["pressed"]) == ([], True, "false")
+    assert chip["left"], f"the bar took the focus off the chip MEDIUM ({chip['focus']})"
+
+
+@needs_node
+def test_drilldown_bar_stands_at_the_top():
+    """While the tab scrolls, the drilldown bar stands at its top, opaque in
+    both themes and over the layer of the filter bar, which stands right
+    under it, the table head under both (--alerts-path-height: the bar's
+    border box, which initAlertsTab keeps on the tab, 0 px while it is
+    hidden). The bar keeps one line, a step at most 28 characters with an
+    ellipsis; it takes no room while hidden and does not shrink into the
+    tab. BACK is filled like the main buttons of the theme. The Sysmon tab's
+    filter bar stays at the top of its tab. The list starts right under both
+    bars: scrolled down, a filter change starts it there, whether the change
+    shows the bar, keeps it or hides it; scrolled above it, nothing moves."""
+    rules, theme = _rules(STYLE_CSS), _rules(THEME_CSS)
+    drill = rules.get(".alerts-drill", "")
+    assert re.search(r"position:\s*sticky", drill) and _declared(drill, "top") == "0", "the drilldown bar scrolls away"
+
+    def layer(body):
+        return int(re.search(r"z-index:\s*(\d+)", body).group(1))
+    assert layer(drill) > layer(rules.get(".alerts-filters", "")) > layer(rules.get(".alerts-table thead th", "")), \
+        "the filter bar or the table head passes over the drilldown bar"
+    assert _declared(drill, "flex") in ("none", "0 0 auto"), "the bar shrinks into the tab"
+    assert (_declared(drill, "white-space"), _declared(drill, "overflow")) == ("nowrap", "hidden"), "the bar takes a second line"
+    step = rules.get(".alerts-drill-step", "")
+    assert (_declared(step, "max-width"), _declared(step, "overflow"), _declared(step, "text-overflow"),
+            _declared(step, "white-space")) == ("28ch", "hidden", "ellipsis", "nowrap"), "a long name widens the path"
+    assert _declared(rules.get(".alerts-drill[hidden]", ""), "display") == "none", "the bar takes room without a step"
+    cyberpunk = theme.get('[data-theme="cyberpunk"] .alerts-drill', "")
+    for name, palette, value in (("Classic", _resolve(_root_values()), _background(drill)),
+                                 ("Cyberpunk", _cyberpunk_palette(), _background(cyberpunk) or _background(drill))):
+        colour = re.sub(r"var\(\s*(--[\w-]+)\s*\)", lambda m: palette[m.group(1)], value or "")
+        assert re.fullmatch(r"#[0-9a-fA-F]{3}|#[0-9a-fA-F]{6}", colour), f"{name}: the rows show through the bar ({value})"
+    for selector, body in theme.items():
+        if re.search(r"\.alerts-drill$", selector):
+            assert not re.search(r"(?:^|;)\s*(?:position|top|z-index|overflow(?:-[xy])?|white-space|flex)\s*:", body), selector
+    # BACK: filled, as a main button of the theme (Classic's in its accent blue, Cyberpunk's in magenta)
+    back, primary = rules.get(".alerts-drill-back", ""), rules.get(".btn-primary", "")
+    assert [_declared(back, p) for p in ("background", "color")] == [_declared(primary, p) for p in ("background", "color")] \
+        and _declared(primary, "border-color") in (_declared(back, "border") or ""), "BACK does not look like a main button"
+    cp_back, cp_primary = theme.get('[data-theme="cyberpunk"] .alerts-drill-back', ""), \
+        theme.get('[data-theme="cyberpunk"] .btn-primary', "")
+    assert [_declared(cp_back, p) for p in ("background", "color")] == [_declared(cp_primary, p) for p in ("background", "color")] \
+        == ["var(--cp-magenta)", "var(--cp-on-magenta)"], "BACK is not filled in magenta in Cyberpunk"
+    assert _declared(rules.get(".sysmon-filters", ""), "top") == "0", "the Sysmon tab's filter bar moved"
+
+    script = _drill_bar_script(r"""
+        globalThis.state = { alerts, processes: {}, activeTab: 'alerts' };
+        const tab = $('tab-alerts'), filters = document.querySelector('#tab-alerts .alerts-filters');
+        // initAlertsTab keeps the bar's border box on the tab
+        const resizers = [];
+        globalThis.ResizeObserver = class {
+            constructor(callback) { this.callback = callback; resizers.push(this); }
+            observe(el, options) { this.el = el; this.options = options; }
+        };
+        globalThis.requestAnimationFrame = fn => fn();
+        globalThis.redrawAlertsChartsOnResize = () => {};
+        tab.style.setProperty = (name, value) => { tab.style[name] = value; };
+        $('alerts-table').tHead.style.setProperty = () => {};
+        initAlertsTab();
+        const watch = resizers.find(o => o.el === drillBar);
+        const r = { observed: watch ? [watch.options || null] : null };
+        drillBar.rect = { top: 0, height: 41.5 };
+        if (watch) watch.callback([]);
+        r.height = tab.style['--alerts-path-height'];
+        // The layout: the tab 56 px below the top of the window; its head 90 px high, the drilldown bar 14 px below
+        // it (40 px high; no room while hidden), the charts (500 px), the filter bar (60 px), then the table. The bars
+        // stand at the top of the tab once what is above them has scrolled away.
+        const HEAD = 90, GAP = 14, PATH = 40, CHARTS = 500, BAR = 60;
+        const pathHeight = () => (drillBar.hidden ? 0 : PATH);
+        const above = () => HEAD + (drillBar.hidden ? 0 : GAP + PATH);
+        tab.getBoundingClientRect = () => ({ top: 56, height: 800, width: 0 });
+        drillBar.getBoundingClientRect = () => (drillBar.hidden ? { top: 0, height: 0, width: 0 }
+            : { top: 56 + Math.max(0, HEAD + GAP - tab.scrollTop), height: PATH, width: 0 });
+        filters.getBoundingClientRect = () => ({ top: 56 + Math.max(pathHeight(), above() + CHARTS - tab.scrollTop), height: BAR,
+                                                 width: 0 });
+        $('alerts-table-wrap').getBoundingClientRect = () => ({ top: 56 + above() + CHARTS + BAR - tab.scrollTop, width: 0 });
+        // Where the list begins, from the top of the tab, and how high the bars standing over it are
+        const where = () => ({ scroll: tab.scrollTop, list: $('alerts-table-wrap').getBoundingClientRect().top - 56,
+                               bars: pathHeight() + BAR, hidden: drillBar.hidden });
+        renderAlertsTab();
+        r.hiddenTop = _alertsListTop(tab);
+        // Scrolled down the list, the first step: the bar shows, the list starts right under both bars
+        tab.scrollTop = 3000;
+        click(dayBar(14));
+        r.shown = where();
+        r.shownTop = _alertsListTop(tab);
+        // ... a step more (the bar stays), then ALL ALERTS (the bar goes): right under the bars there are
+        tab.scrollTop = 3000;
+        click(seg('alerts-severity-chart', 'high'));
+        r.kept = where();
+        tab.scrollTop = 3000;
+        click(stepAt(-1));
+        r.gone = where();
+        // Scrolled above the list: nothing moves
+        tab.scrollTop = 30;
+        click(dayBar(14));
+        r.above = where();
+        console.log(JSON.stringify(r));
+    """)
+    r = _run_node(ALERTS_TAB_FUNCTIONS, script, SORT_DOM + _alerts_prelude())
+    assert r["observed"] == [{"box": "border-box"}] and r["height"] == "41.5px", \
+        f"the tab does not keep the drilldown bar's height, border included: {r}"
+    assert (r["hiddenTop"], r["shownTop"]) == (90 + 500 + 60 - 60, 90 + 14 + 40 + 500 + 60 - 100), \
+        "the list does not start right under both bars (40 px and 60 px)"
+    for name in ("shown", "kept", "gone"):
+        assert r[name]["scroll"] < 3000 and r[name]["list"] == r[name]["bars"], \
+            f"{name}: after a filter change the first row is not right under the bars: {r[name]}"
+    assert (r["shown"]["hidden"], r["kept"]["hidden"], r["gone"]["hidden"]) == (False, False, True)
+    assert r["above"]["scroll"] == 30, "a filter change moved a tab scrolled above its list"
+
+
+def _px(value):
+    """A length in px (0 for 0), None for anything else."""
+    m = re.fullmatch(r"(-?\d+(?:\.\d+)?)px|-?0", (value or "").strip())
+    return float(m.group(1) or 0) if m else None
+
+
+def _side(body, prop, side):
+    """The value a rule body gives one side (top, right, bottom, left) of a
+    box property (padding, margin): its last declaration, the longhand or
+    the shorthand of one to four values."""
+    sides, value = ["top", "right", "bottom", "left"], None
+    for name, given in re.findall(r"(?:^|;)\s*(%s(?:-(?:top|right|bottom|left))?)\s*:\s*([^;]+)" % re.escape(prop), body or ""):
+        if name == prop:
+            v = given.split()
+            value = {1: v * 4, 2: v * 2, 3: v + v[1:2], 4: v}[len(v)][sides.index(side)]
+        elif name == f"{prop}-{side}":
+            value = given.strip()
+    return value
+
+
+def _shrink(body):
+    """The flex-shrink a rule body gives: its own declaration or the second
+    number of flex (None for none)."""
+    found = re.findall(r"(?:^|;)\s*(flex-shrink|flex)\s*:\s*([^;]+)", body or "")
+    if not found:
+        return None
+    name, value = found[-1]
+    return float(value.split()[1] if name == "flex" else value)
+
+
+def test_drilldown_bar_steps_keep_their_underline_and_give_way_in_turn():
+    """A step a click goes back to is underlined. Its box cuts a long name
+    with an ellipsis and with it all that passes its edge, so it leaves the
+    underline room below the text (padding, taken back by a negative margin:
+    the bar keeps its height); the path, which cuts what passes its own edge,
+    leaves that room and the focus ring around it room below the steps (in
+    both themes). Where the path does not fit, the steps between ALL ALERTS
+    and the current one give way first, so far ahead that the current one
+    keeps every pixel while they can (its share of the shrinking, its width
+    of at most 28ch, some 200 px, by the ratio of the two, stays below
+    1/128 px, the precision of the layout: below that the current step
+    would lose its last letter to an ellipsis); then the current one, down
+    to 8 characters, cut with an ellipsis instead of at the path's edge.
+    ALL ALERTS stays whole."""
+    rules, theme = _rules(STYLE_CSS), _rules(THEME_CSS)
+    step = rules.get(".alerts-drill-step", "")
+    assert "underline" in (_declared(step, "text-decoration") or "") and _declared(step, "overflow") == "hidden"
+    offset, room = _px(_declared(step, "text-underline-offset")), _px(_side(step, "padding", "bottom"))
+    assert room is not None and room >= offset + 1, \
+        f"the underline ({offset} px below the text) lies outside the box of a step, which cuts it off (room: {room})"
+    assert _px(_side(step, "margin", "bottom")) == -room, "the room for the underline makes the drilldown bar higher"
+    assert _px(_side(step, "padding", "top")) == 0, "the text of a step moved down"
+
+    def ring(body):
+        width = re.match(r"(\d+(?:\.\d+)?px)", _declared(body, "outline") or "")
+        return _px(width.group(1)) + _px(_declared(body, "outline-offset"))
+    reach = max(ring(rules.get(".alerts-drill-step:focus-visible", "")),
+                ring(theme.get('[data-theme="cyberpunk"] .alerts-drill-step:focus-visible', "")))
+    path = rules.get(".alerts-drill-path", "")
+    below = _px(_side(path, "padding", "bottom"))
+    assert _declared(path, "overflow") == "hidden" and below is not None and below >= room + reach, \
+        f"the focus ring of a step is cut off below it ({room} + {reach} px, room: {below})"
+    assert _px(_side(path, "margin", "bottom")) == -below and _px(_side(path, "padding", "top")) >= reach \
+        and _px(_side(path, "margin", "top")) == -_px(_side(path, "padding", "top")), \
+        "the path makes the drilldown bar higher, or cuts the focus ring above the steps"
+    for selector, body in theme.items():
+        if re.search(r"\.alerts-drill-(?:step|path)$", selector):
+            assert not re.search(r"(?:^|;)\s*(?:padding|margin|overflow|flex|text-underline-offset)(?:-[a-z]+)?\s*:", body), \
+                selector
+    first = rules.get('.alerts-drill-step[data-drill-step="-1"]', "")
+    current = rules.get(".alerts-drill-step.is-current", "")
+    between, last = _shrink(step), _shrink(current)
+    assert _shrink(first) == 0, "ALL ALERTS gives way"
+    assert last and last > 0 and _declared(current, "min-width") == "8ch", \
+        "the current step is cut at the path's edge without an ellipsis, or shrinks to nothing"
+    assert between / last >= 128 * 200, \
+        f"the current step gives way while a step between it and ALL ALERTS still can ({between} : {last})"
+
+
 # --- The charts of the dashboard ------------------------------------------------
 
 DASHBOARD_JS = list(dict.fromkeys(["renderDashboard", "onTileKey"] + NEWEST_ALERTS_FUNCTIONS + ALERTS_TAB_FUNCTIONS
@@ -2320,8 +3997,9 @@ DASHBOARD_JS = list(dict.fromkeys(["renderDashboard", "onTileKey"] + NEWEST_ALER
 
 
 def _dashboard_prelude(zone="UTC"):
+    # The range drawn across bars comes with the Alerts tab's prelude (BARS_BRUSH_*), declared once
     return (SORT_DOM + "process.env.TZ = %s;\n" % json.dumps(zone) + _alerts_prelude() + "\n"
-            + "\n".join(_const_source(name) for name in DASHBOARD_CHART_CONSTS) + DASHBOARD_CHART_LETS)
+            + "\n".join(_const_source(name) for name in DASHBOARD_CHART_CONSTS))
 
 
 # 640 alerts over 95 days up to 10 Nov 2026 15:30 UTC ("now"), times in UTC and
@@ -3021,8 +4699,8 @@ def test_a_range_being_drawn_ends_when_its_button_is_gone():
         dispatch('click', captured || view, { clientX: at(3), clientY: 120, button: 0 });
         captured = null;
         r.next = [{ ...dashboardRange }, look().bins[1][0], look().bins[3][1], opened.splice(0)];
-        const js = initDashboardCharts.toString();
-        r.listens = /addEventListener\('contextmenu', onDashboardBrushCancel, true\)/.test(js);
+        const js = initBarsBrush.toString();
+        r.listens = /addEventListener\('contextmenu', onBarsBrushCancel, true\)/.test(js);
         console.log(JSON.stringify(r));
     """)
     r = _run_node(DASHBOARD_JS, script, _dashboard_prelude())
@@ -3036,6 +4714,262 @@ def test_a_range_being_drawn_ends_when_its_button_is_gone():
     rng, start, end, opened = r["next"]
     assert (rng["preset"], rng["from"], rng["to"], opened) == ("custom", start, end, []), r["next"]
     assert r["listens"], "the context menu is not listened for"
+
+
+@needs_node
+def test_bars_brush_serves_two_charts_apart():
+    """Two charts of bars take a range drawn across them through the same
+    code (initBarsBrush), each apart from the other; the events as Chrome
+    sends them (see test_dashboard_bars_take_a_range_drawn_across_them). A
+    drag on one is a range of that one only, over the bars it showed when
+    pressed: its mark and the pointer's capture on its own bars, only its
+    bars held still while it lasts (barsBrushActive), also when it runs on
+    over the other's; its click stands for nothing on either chart, and it
+    is the only click that does. A press that does not move stands for the
+    bar it pressed on its own chart, wherever the click goes, and for nothing
+    on the other; a bar without alerts for nothing. However a press ends
+    (released, cancelled, the context menu, a move without the main button,
+    released elsewhere on the page, after another pointer's release, a
+    second finger's press), its chart is told once, when no press holds the
+    bars, and before it hears of a range drawn; a second finger's press on
+    bars its chart draws again then begins
+    nothing. The page listens once for the moves and the end of a press,
+    each chart once for a press, however often they were set up (the
+    dashboard's ALERT ACTIVITY as well)."""
+    script = _dashboard_script(r"""
+        document.createElementNS = (ns, tag) => Object.assign(document.createElement(tag), { ns });
+        // Two charts of bars side by side: A with 8 bars at x 100 to 800, B with 10 at x 900 to 1600
+        const holder = document.createElement('div');
+        holder.innerHTML = '<div id="bars-page"><div id="bars-a"></div><div id="bars-b"></div></div>';
+        document.body.appendChild(holder.firstElementChild);
+        const binsOf = totals => totals.map((total, i) => ({ start: T + i * HOUR, end: T + (i + 1) * HOUR, total,
+                                                             counts: { high: total } }));
+        const drawn = { A: binsOf([1, 2, 3, 4, 5, 6, 7, 8]), B: binsOf([2, 0, 3, 0, 1, 1, 1, 1, 1, 1]) };
+        const left = { A: 100, B: 900 }, slot = { A: 700 / 8, B: 700 / 10 };
+        const view = name => $(`bars-${name.toLowerCase()}`);
+        for (const name of ['A', 'B']) view(name).innerHTML = stackedBarsSvg(drawn[name], { width: 700, height: 220 });
+        const place = () => ['A', 'B'].forEach(name => {
+            view(name).querySelector('svg').rect = { left: left[name], top: 50, width: 700, height: 220,
+                                                     right: left[name] + 700, bottom: 270 };
+        });
+        const at = (name, i) => left[name] + (i + 0.5) * slot[name];
+        const hit = (name, i) => view(name).querySelectorAll('.chart-hit')[i];
+        // What is under the pointer at clientX: the hit area of a bar of either chart, or the page around them
+        const under = x => {
+            const name = ['A', 'B'].find(k => x >= left[k] && x < left[k] + 700);
+            return name ? hit(name, Math.floor((x - left[name]) / slot[name])) : $('bars-page');
+        };
+        const period = (name, i) => ({ from: drawn[name][i].start, to: drawn[name][i].end });
+        // The hosts and what they are told: [chart, 'range', first, last, the totals of its bins] or [chart, 'stop'],
+        // each with whether a press holds the bars of A and of B then
+        const told = [], calls = { A: 0, B: 0 };
+        const active = () => [barsBrushActive(A), barsBrushActive(B)];
+        const host = name => ({
+            view: `bars-${name.toLowerCase()}`,
+            bins: () => { calls[name]++; return drawn[name]; },
+            onRange: (first, last, bins) => told.push([name, 'range', first, last, bins.map(bin => bin.total), active()]),
+            onStop: () => told.push([name, 'stop', active()]),
+        });
+        const A = host('A'), B = host('B');
+        const take = () => told.splice(0);
+        // Each chart's click as its onclick takes it
+        const clicks = [];
+        view('A').addEventListener('click', event => clicks.push(['A', barsClickPeriod(event, A)]));
+        view('B').addEventListener('click', event => clicks.push(['B', barsClickPeriod(event, B)]));
+        // Chrome's pointer capture: the pointer's events and the click after its release go to the element holding
+        // it; the release ends it
+        let captured = null;
+        const released = [];
+        Element.prototype.setPointerCapture = function () { captured = this; };
+        Element.prototype.releasePointerCapture = function (id) { released.push([this.id, id]); if (captured === this) captured = null; };
+        const capture = () => captured && captured.id;
+        const chain = el => { const list = []; for (let e = el; e; e = e.parentNode) list.push(e); return list; };
+        const common = (a, b) => chain(a).find(e => chain(b).includes(e)) || null;
+        const send = (type, x, extra = {}) => dispatch(type, captured || under(x),
+            { clientX: x, clientY: 120, button: 0, buttons: /up|cancel/.test(type) ? 0 : 1, pointerId: 7, ...extra });
+        // A press at x; its release at x, which gives the element Chrome sends the click after it to: the one
+        // holding the capture, else the nearest common ancestor of the press's and the release's targets
+        let down = null;
+        const press = (x, extra = {}) => { place(); down = under(x); send('pointerdown', x, extra); };
+        const lift = (x, extra = {}) => {
+            const up = captured || under(x);
+            send('pointerup', x, extra);
+            const target = captured || common(down, up);
+            captured = null;
+            return target;
+        };
+        const clickAt = (target, x) => dispatch('click', target, { clientX: x, clientY: 120, button: 0 });
+        const mark = name => {
+            const m = view(name).querySelector('.chart-brush');
+            return m && [Number(m.getAttribute('x')), Number(m.getAttribute('width'))];
+        };
+        const brushing = () => ['A', 'B'].map(name => view(name).classList.contains('is-brushing'));
+        // Both set up twice, beside the dashboard's ALERT ACTIVITY
+        initDashboardCharts();
+        for (const h of [A, B, A, B]) initBarsBrush(h);
+        const r = {
+            page: document.listeners.map(l => [l.type, l.fn.name, l.capture]),
+            presses: ['dashboard-alerts-chart', 'bars-a', 'bars-b'].map(id => $(id).listeners.filter(l => l.type === 'pointerdown').length),
+        };
+        // A drag on A from bar 2 to bar 5; its host counts its bars again meanwhile (bins() gives other ones)
+        r.idle = active();
+        press(at('A', 2));
+        r.pressed = active();
+        const shown = drawn.A;
+        drawn.A = binsOf([8, 7, 6, 5, 4, 3, 2, 1]);
+        send('pointermove', at('A', 2) + 3);
+        r.small = [active(), capture(), mark('A')];
+        send('pointermove', at('A', 4));
+        send('pointermove', at('A', 5));
+        r.drawing = [active(), capture(), mark('A'), mark('B'), brushing()];
+        const dragClick = clickAt(lift(at('A', 5)), at('A', 5));
+        r.drag = { told: take(), clicks: clicks.splice(0), target: dragClick.target.id, forB: barsClickPeriod(dragClick, B),
+                   calls: { ...calls }, after: [active(), mark('A'), brushing()] };
+        drawn.A = shown;
+        // That click was the only one the drag took: a click on a bar of A (a script's) stands for that bar
+        click(hit('A', 6));
+        r.clickAfter = [clicks.splice(0), [['A', period('A', 6)]]];
+        // A press on bar 2 of B that does not move but by 4 px, onto bar 3 (no alerts): Chrome sends its click to
+        // the parent the two bars share. It stands for bar 2 of B, on A for nothing (before B took it and after).
+        const edge = left.B + 3 * slot.B;
+        press(edge - 2);
+        send('pointermove', edge + 2);
+        r.stillActive = active();
+        const target = lift(edge + 2);
+        const early = barsClickPeriod({ type: 'click', target }, A);
+        const stillClick = clickAt(target, edge + 2);
+        r.still = { told: take(), clicks: clicks.splice(0), want: [['B', period('B', 2)]],
+                    inBar: !!target.closest('[data-bin-start]'), forA: [early, barsClickPeriod(stillClick, A)] };
+        // A click without a press on a bar of B (a script's): that bar on B, nothing on A
+        const scripted = click(hit('B', 2));
+        r.scripted = [clicks.splice(0), [['B', period('B', 2)]], barsClickPeriod(scripted, A)];
+        // A drag on B from bar 6 leftwards, on over the bars of A: a range of B from its first bar
+        press(at('B', 6));
+        send('pointermove', at('B', 6) - 10);
+        send('pointermove', 300);
+        r.overA = [capture(), mark('A'), !!mark('B'), active()];
+        clickAt(lift(300), 300);
+        r.leftwards = { told: take(), clicks: clicks.splice(0) };
+        // A press on a bar without alerts, and a click on one: nothing
+        press(at('B', 3));
+        clickAt(lift(at('B', 3)), at('B', 3));
+        click(hit('B', 1));
+        r.empty = { told: take(), clicks: clicks.splice(0) };
+        // However a press ends, its chart is told once
+        const ends = r.ends = {};
+        press(at('A', 1)); send('pointermove', at('A', 4)); send('pointercancel', at('A', 4));
+        captured = null;
+        ends.cancelled = [take(), mark('A'), brushing()];
+        press(at('B', 2)); send('pointercancel', at('B', 2));
+        ends.cancelledStill = [take()];
+        press(at('B', 2)); send('pointermove', at('B', 5));
+        dispatch('contextmenu', captured || under(at('B', 5)), { clientX: at('B', 5), clientY: 120, button: 0, buttons: 1 });
+        ends.menu = [take(), mark('B'), capture(), released.splice(0)];
+        press(at('A', 1)); send('pointermove', at('A', 4)); send('pointermove', at('A', 6), { buttons: 0 });
+        ends.buttonGone = [take(), mark('A'), capture(), released.splice(0)];
+        press(at('A', 3));
+        const outside = lift(850);
+        clickAt(outside, 850);
+        ends.elsewhere = [take(), outside.id, clicks.splice(0)];
+        press(at('B', 0)); send('pointerup', at('B', 0), { pointerId: 8 });
+        ends.otherPointer = [take(), active()];
+        clickAt(lift(at('B', 0)), at('B', 0));
+        ends.ownPointer = [take(), clicks.splice(0), [['B', period('B', 0)]]];
+        press(at('A', 2), { button: 2 }); send('pointerup', at('A', 2), { button: 2 });
+        ends.otherButton = [take(), active()];
+        // A second finger's press on B while the first draws on A: the first press ends, its moves and its
+        // release are not heard any more; the second is a press on B of its own
+        press(at('A', 1)); send('pointermove', at('A', 4));
+        place();
+        down = under(at('B', 0));
+        dispatch('pointerdown', down, { clientX: at('B', 0), clientY: 120, button: 0, buttons: 1, pointerId: 8 });
+        ends.secondFinger = [take(), mark('A'), brushing(), capture(), released.splice(0), active()];
+        send('pointermove', at('A', 6)); send('pointerup', at('A', 6));
+        ends.firstLifted = [take(), active()];
+        clickAt(lift(at('B', 0), { pointerId: 8 }), at('B', 0));
+        ends.secondLifted = [take(), clicks.splice(0), [['B', period('B', 0)]]];
+        // ... on the same chart, whose host draws its bars again when told: the second finger's press is on bars no
+        // longer shown, it begins nothing
+        const onStop = B.onStop;
+        B.onStop = () => { onStop(); view('B').innerHTML = stackedBarsSvg(drawn.B, { width: 700, height: 220 }); };
+        press(at('B', 4)); send('pointermove', at('B', 7));
+        const stale = under(at('B', 2));
+        dispatch('pointerdown', stale, { clientX: at('B', 2), clientY: 120, button: 0, buttons: 1, pointerId: 8 });
+        B.onStop = onStop;
+        ends.redrawn = [take(), stale.isConnected, active(), released.splice(0)];
+        place();
+        send('pointermove', at('B', 6), { pointerId: 8 }); send('pointerup', at('B', 6), { pointerId: 8 });
+        ends.redrawnLifted = [take(), active()];
+        console.log(JSON.stringify(r));
+    """)
+    r = _run_node(DASHBOARD_JS, script, _dashboard_prelude())
+
+    def told(calls):
+        """The ranges [chart, first, last, totals of its bins] and the charts
+        told that a press is over, of the hosts' calls; each call made while
+        no press held the bars of either chart."""
+        assert all(call[-1] == [False, False] for call in calls), f"a chart was told while a press held the bars: {calls}"
+        return ([[call[0], *call[2:-1]] for call in calls if call[1] == "range"],
+                [call[0] for call in calls if call[1] == "stop"])
+
+    assert sorted(r["page"]) == [["contextmenu", "onBarsBrushCancel", True], ["pointercancel", "onBarsBrushEnd", True],
+                                 ["pointermove", "onBarsBrushMove", True], ["pointerup", "onBarsBrushEnd", True]], \
+        f"the page does not listen once for the moves and the end of a press: {r['page']}"
+    assert r["presses"] == [1, 1, 1], "a chart set up twice takes each press twice"
+    # A drag on A from bar 2 to bar 5
+    assert r["idle"] == [False, False] and r["pressed"] == [True, False]
+    assert r["small"] == [[True, False], None, None], "a move by 3 px drew a range or took the capture"
+    held, capture, mark_a, mark_b, brushing = r["drawing"]
+    assert held == [True, False], "a drag on A held the bars of B, or not those of A"
+    assert capture == "bars-a" and mark_b is None and brushing == [True, False], r["drawing"]
+    assert abs(mark_a[0] - 2 * 87.5) < 0.02 and abs(mark_a[1] - 4 * 87.5) < 0.02, f"the mark is not over bars 2 to 5 of A: {mark_a}"
+    drag = r["drag"]
+    assert told(drag["told"]) == ([["A", 2, 5, [1, 2, 3, 4, 5, 6, 7, 8]]], ["A"]), \
+        f"a drag on A from bar 2 to bar 5 told {drag['told']}"
+    assert [call[1] for call in drag["told"]] == ["stop", "range"], \
+        f"released, A heard of the range before it was told that the press is over: {drag['told']}"
+    assert drag["calls"] == {"A": 1, "B": 0}, "the bars were read again while the range was drawn"
+    assert drag["clicks"] == [["A", None]] and drag["target"] == "bars-a" and drag["forB"] is None, \
+        "the click of the drag stood for a bar"
+    assert drag["after"] == [[False, False], None, [False, False]]
+    assert r["clickAfter"][0] == r["clickAfter"][1], "the drag took a later click as well"
+    # A press on B that did not move
+    still = r["still"]
+    assert r["stillActive"] == [False, True]
+    assert still["inBar"] is False and still["clicks"] == still["want"], \
+        f"a press on bar 2 of B that slipped onto bar 3 stood for {still['clicks']}"
+    assert still["forA"] == [None, None], "the click of a press on B stood for a bar of A"
+    assert told(still["told"]) == ([], ["B"])
+    assert r["scripted"][0] == r["scripted"][1] and r["scripted"][2] is None, \
+        f"a click on a bar of B stood for {r['scripted'][2]} on A"
+    # A drag on B that ran on over A
+    assert r["overA"] == ["bars-b", None, True, [False, True]], "a drag on B marked or held the bars of A"
+    assert told(r["leftwards"]["told"]) == ([["B", 0, 6, [2, 0, 3, 0, 1, 1, 1, 1, 1, 1]]], ["B"]), r["leftwards"]
+    assert [call[1] for call in r["leftwards"]["told"]] == ["stop", "range"], r["leftwards"]
+    assert r["leftwards"]["clicks"] == [["B", None]]
+    assert told(r["empty"]["told"]) == ([], ["B"]) and r["empty"]["clicks"] == [["B", None], ["B", None]], \
+        "a bar without alerts stood for its period"
+    # However a press ended, its chart was told once
+    ends = r["ends"]
+    for name, chart in (("cancelled", "A"), ("cancelledStill", "B"), ("menu", "B"), ("buttonGone", "A"),
+                        ("elsewhere", "A"), ("ownPointer", "B"), ("secondFinger", "A"), ("secondLifted", "B"),
+                        ("redrawn", "B")):
+        assert told(ends[name][0]) == ([], [chart]), f"{name}: {ends[name][0]}"
+    for name in ("otherPointer", "otherButton", "firstLifted", "redrawnLifted"):
+        assert told(ends[name][0]) == ([], []), f"{name}: {ends[name][0]}"
+    assert ends["cancelled"][1:] == [None, [False, False]]
+    assert ends["menu"][1:] == [None, None, [["bars-b", 7]]], "the context menu left the range being drawn on B"
+    assert ends["buttonGone"][1:] == [None, None, [["bars-a", 7]]], "a move without the main button kept drawing on A"
+    assert ends["elsewhere"][1:] == ["bars-page", []]
+    assert ends["otherPointer"][1] == [False, True] and ends["otherButton"][1] == [False, False]
+    assert ends["ownPointer"][1] == ends["ownPointer"][2]
+    assert ends["secondFinger"][1:] == [None, [False, False], None, [["bars-a", 7]], [False, True]], \
+        f"a second finger's press on B left the press on A: {ends['secondFinger']}"
+    assert ends["firstLifted"][1] == [False, True], "the first finger's release ended the second finger's press"
+    assert ends["secondLifted"][1] == ends["secondLifted"][2]
+    assert ends["redrawn"][1:] == [False, [False, False], [["bars-b", 7]]], \
+        f"a press on bars drawn again under it began a range: {ends['redrawn']}"
+    assert ends["redrawnLifted"][1] == [False, False]
 
 
 @needs_node

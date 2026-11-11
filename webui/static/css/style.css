@@ -163,6 +163,10 @@
     /* Not a colour: the height of the Alerts tab's filter bar, which its
        table head stands under; app.js (initAlertsTab) sets it on the head */
     --alerts-bar-height: 0px;
+    /* Nor this: the height of the Alerts tab's drilldown bar (0 while it is
+       hidden), which its filter bar and table head stand under;
+       initAlertsTab sets it on #tab-alerts */
+    --alerts-path-height: 0px;
     /* The same for the Sysmon tab (initSysmonTab sets it on #sysmon-table) */
     --sysmon-bar-height: 0px;
 }
@@ -6746,7 +6750,7 @@ option.etw-ch-inactive { color: var(--text-secondary); }
 .capa-cap-mbc { color: var(--accent-yellow); }
 
 /* =============================================
-   PORTEX-STYLE FILE MAP
+   FILE MAP
    Byteplot / entropy / structure planes, legend,
    hex editor minimap and import/export trees.
    ============================================= */
@@ -7481,9 +7485,10 @@ option.etw-ch-inactive { color: var(--text-secondary); }
    colour) and one table of every alert. The layout is fixed and every cell
    stays on one line with an ellipsis, so a long rule or process name cannot
    widen the table (the full text is in the cell's title). The tab scrolls as
-   a whole; the filter bar, with a row of chips for the filters the charts
-   set, stands at its top, the table head right under it
-   (--alerts-bar-height: initAlertsTab keeps it at the bar's height). The
+   a whole; the drilldown bar (while a step shows it) stands at its top, the
+   filter bar, with a row of chips for the filters the charts set, right
+   under it (--alerts-path-height), the table head right under both
+   (--alerts-bar-height: initAlertsTab keeps both at the bars' heights). The
    Sysmon tab's filter bar stands at the top of its tab the same way. --- */
 #tab-alerts { overflow-x: hidden; overflow-y: auto; }
 .alerts-filters,
@@ -7498,6 +7503,146 @@ option.etw-ch-inactive { color: var(--text-secondary); }
     padding: 10px 20px;
     background: var(--bg-card);
     border-bottom: 1px solid var(--border-primary);
+}
+.alerts-filters {
+    top: var(--alerts-path-height);
+}
+/* The drilldown bar (renderAlertsDrillBar in app.js) between the head of the
+   tab and the charts, while a step narrows the tab: ‹ BACK, filled as a main
+   button; the muted label DRILLDOWN; the path, ALL ALERTS › the steps a
+   click goes back to (underlined) › the current step; the count on the
+   right. One line: a step is cut at 28 characters (its title has it in
+   full), and where the path does not fit, the steps between ALL ALERTS and
+   the current one give way first, then the current one, down to 8
+   characters with an ellipsis. It stands at the top of the tab while it
+   scrolls, opaque, over the filter bar's layer; it takes no room while
+   hidden. A step's box, which cuts a long name, leaves its underline room
+   below the text, the path the focus rings of its steps. */
+.alerts-drill {
+    position: sticky;
+    top: 0;
+    z-index: 3;
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 10px;
+    margin: 12px 20px 0;
+    padding: 7px 10px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    background: var(--bg-card);
+    border: 1px solid var(--accent-cyan);
+    border-radius: var(--radius-lg);
+}
+.alerts-drill[hidden] {
+    display: none;
+}
+.alerts-drill-back {
+    flex: none;
+    padding: 4px 12px;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    background: var(--border-accent);
+    color: var(--accent-cyan);
+    border: 1px solid var(--accent-cyan);
+    border-radius: var(--radius);
+    cursor: pointer;
+    transition: background 0.15s;
+}
+.alerts-drill-back:hover {
+    background: var(--c-navy-800);
+}
+.alerts-drill-back:focus-visible,
+.alerts-drill-step:focus-visible {
+    outline: 1px solid var(--accent-cyan);
+    outline-offset: 2px;
+}
+.alerts-drill-label {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    color: var(--text-muted);
+}
+.alerts-drill-path {
+    display: flex;
+    flex: 0 1 auto;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    margin: -4px 0 -8px;
+    padding: 4px 4px 8px;
+    overflow: hidden;
+}
+.alerts-drill-step {
+    flex: 0 100000 auto;
+    min-width: 4ch;
+    max-width: 28ch;
+    padding: 0 0 4px;
+    margin-bottom: -4px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font: inherit;
+    letter-spacing: inherit;
+    color: var(--accent-cyan);
+    background: none;
+    border: none;
+    text-decoration: underline;
+    text-decoration-color: rgba(var(--accent-cyan-rgb), 0.35);
+    text-underline-offset: 3px;
+    cursor: pointer;
+}
+.alerts-drill-step:hover {
+    text-decoration-color: var(--accent-cyan);
+}
+.alerts-drill-step[data-drill-step="-1"] {
+    flex-shrink: 0;
+}
+/* The current step gives way only once the steps before it cannot: their
+   shrink factor is so far ahead of its 1 that its share of the shrinking
+   stays below what the layout can draw (a share it could draw would cost
+   it its last letter to the ellipsis) */
+.alerts-drill-step.is-current {
+    flex-shrink: 1;
+    min-width: 8ch;
+    color: var(--text-primary);
+    text-decoration: none;
+    cursor: default;
+}
+.alerts-drill-more,
+.alerts-drill-sep {
+    flex: none;
+    color: var(--text-muted);
+}
+.alerts-drill-more {
+    cursor: help;
+}
+/* Text for screen readers only (the names of the steps folded into "…"):
+   out of sight and out of the layout, still read out */
+.visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+}
+.alerts-drill-count {
+    flex: none;
+    margin-left: auto;
+    font-weight: 400;
+    color: var(--text-muted);
 }
 .alerts-sev-filter { display: flex; gap: 6px; flex-wrap: wrap; }
 .alerts-sev-chip {
@@ -7554,6 +7699,16 @@ option.etw-ch-inactive { color: var(--text-secondary); }
 .alerts-filter-chip:hover .alerts-filter-chip-x { color: var(--accent-red); }
 .alerts-filter-chip-kind { color: var(--text-muted); white-space: nowrap; }
 .alerts-filter-chip-value { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* In the Alerts tab the chips of the chart filters stand out (they say what
+   narrows the list): larger, with an edge in the accent colour */
+#tab-alerts .alerts-filter-chip {
+    padding: 4px 11px;
+    font-size: 11.5px;
+    border-color: var(--accent-cyan);
+}
+#tab-alerts .alerts-filter-chip-x {
+    font-size: 14px;
+}
 .alerts-table-wrap { flex: 1 0 auto; padding: 0 20px 12px; }
 .alerts-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
 .alerts-col-time { width: 150px; }
@@ -7561,7 +7716,7 @@ option.etw-ch-inactive { color: var(--text-secondary); }
 .alerts-col-engine { width: 84px; }
 .alerts-col-rule { width: 27%; }
 .alerts-col-proc { width: 17%; }
-.alerts-table thead th { position: sticky; top: var(--alerts-bar-height); z-index: 1; padding: 8px 10px; text-align: left; font-size: 10px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); background: var(--bg-primary); border-bottom: 1px solid var(--border-primary); }
+.alerts-table thead th { position: sticky; top: calc(var(--alerts-path-height) + var(--alerts-bar-height)); z-index: 1; padding: 8px 10px; text-align: left; font-size: 10px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); background: var(--bg-primary); border-bottom: 1px solid var(--border-primary); }
 .alerts-table td { padding: 6px 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-secondary); border-bottom: 1px solid var(--border-primary); }
 .alerts-table .alerts-row { cursor: pointer; transition: background 0.1s; }
 .alerts-table .alerts-row:hover { background: var(--bg-card-hover); }
@@ -7578,7 +7733,8 @@ option.etw-ch-inactive { color: var(--text-secondary); }
 /* The charts above the filter bar (renderAlertsCharts in app.js): SEVERITY,
    OVER TIME (twice as wide) and ENGINE in a row, FLOW below; a pie's card
    keeps the room for its pie and legend. A chart keeps its height when it
-   shows a hint instead. They scroll away under the filter bar. */
+   shows a hint instead. They scroll away under the bars standing at the top
+   of the tab. */
 .alerts-charts {
     display: flex;
     flex: 0 0 auto;
@@ -7598,11 +7754,30 @@ option.etw-ch-inactive { color: var(--text-secondary); }
     min-width: 0;
     min-height: 120px;
 }
+/* The line under the bars of OVER TIME, as under ALERT ACTIVITY of the
+   dashboard: how to use the bars (when there are some), then the alerts in
+   no bar, side by side while both fit; on a narrow card the hint breaks
+   after its "·", not inside a phrase, and a half wider than the card wraps
+   within it instead of running into the next card */
 .alerts-chart-note {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 2px 12px;
     margin-top: 4px;
     font-family: var(--font-mono);
     font-size: 10px;
     color: var(--text-muted);
+}
+.alerts-time-hint span {
+    display: inline-block;
+}
+/* OVER TIME takes a range drawn across its bars (ALERTS_BARS_BRUSH in
+   app.js): no text is selected meanwhile, and a finger draws it sideways and
+   still scrolls the page */
+#alerts-time-chart {
+    user-select: none;
+    touch-action: pan-y;
 }
 /* The table of FLOW: rules and processes both have long names, so its two
    name columns share the width (else the targets kept a few letters) */
