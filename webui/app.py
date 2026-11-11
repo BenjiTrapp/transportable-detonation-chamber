@@ -439,7 +439,8 @@ def _build_samples(proc_map, by_sha, by_name):
     filename), each carrying its per-tool scans and — if it actually ran — its
     live PID. Files that were only statically scanned (never executed, e.g. a
     ransomware sample that must not be detonated) still appear here."""
-    subs = _load_submissions()
+    with submissions_lock:
+        subs = _load_submissions()
     hist = _load_scan_history()
 
     # filename(lower) -> sha, so name-only scans merge into the sha'd group.
@@ -537,7 +538,14 @@ def _build_samples(proc_map, by_sha, by_name):
 
 
 # --- Submissions History ---
+# Held by every write of submissions.json, from reading the list to putting the
+# new file in its place, and by every read; not re-entrant
 submissions_lock = threading.Lock()
+# On Windows another program holding submissions.json for a moment (the virus
+# scanner, an indexer) fails putting a new file in its place with
+# PermissionError: tried this often, this many seconds apart
+_REPLACE_ATTEMPTS = 10
+_REPLACE_PAUSE = 0.05
 
 
 def _load_submissions():
@@ -552,12 +560,30 @@ def _load_submissions():
 
 
 def _save_submissions(submissions):
-    """Persist submission history to JSON file."""
+    """Persist submission history to JSON file. It is written beside it,
+    flushed to the disk and only then put in its place, so a write that
+    fails halfway (a full disk, a crash) leaves the history as it was. What
+    failed is raised: the callers log it."""
+    tmp = SUBMISSIONS_FILE + ".tmp"
     try:
-        with open(SUBMISSIONS_FILE, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(submissions, f, indent=2)
-    except IOError:
-        pass
+            f.flush()
+            os.fsync(f.fileno())
+        for attempt in range(1, _REPLACE_ATTEMPTS + 1):
+            try:
+                os.replace(tmp, SUBMISSIONS_FILE)
+                break
+            except PermissionError:
+                if attempt == _REPLACE_ATTEMPTS:
+                    raise
+                time.sleep(_REPLACE_PAUSE)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _record_submission(filename, sha256, size, target, results):
@@ -627,9 +653,42 @@ def _record_submission(filename, sha256, size, target, results):
         subs.insert(0, entry)  # newest first
         # Keep max 200 entries
         subs = subs[:200]
-        _save_submissions(subs)
+        try:
+            _save_submissions(subs)
+        except Exception as e:
+            # The sample went out: the submit answers, the history misses it
+            print(f"[submissions] could not record the submission of {str(sha256 or '')[:12] or filename or '?'}: {e}")
 
     return entry
+
+
+def _store_submission_verdict(sha256, pid, verdict):
+    """Keep a detonation's verdict (label and score) on its submission, for
+    the verdict history of the Submit tab: on the submission of the run it
+    was computed for, the sample run as this PID or, without a PID, one of
+    the sample that ran without (LitterBox only); the newest of them. A PID
+    none of the sample's submissions ran as, or no PID for a sample that
+    always ran with one, is no run of the history: the verdict is kept
+    nowhere. A PID alone names no submission (PIDs are reused). Written only
+    when it changed, so polling the results does not rewrite the file."""
+    sha = str(sha256 or "").strip().lower()
+    if not sha or not isinstance(verdict, dict):
+        return False
+    kept = {"label": verdict.get("label"), "score": verdict.get("score")}
+    run = str(pid or "").strip()
+    with submissions_lock:
+        subs = _load_submissions()
+        runs = [i for i, sub in enumerate(subs)
+                if isinstance(sub, dict) and str(sub.get("sha256") or "").lower() == sha
+                and str(sub.get("agent_pid") or "") == run]
+        if not runs:
+            return False
+        i = runs[0]                     # the list is newest first
+        if subs[i].get("verdict") == kept:
+            return False
+        subs[i] = dict(subs[i], verdict=kept)
+        _save_submissions(subs)
+    return True
 
 
 # --- Rustinel NDJSON Parser ---
@@ -1050,7 +1109,8 @@ def _agent_detonation_index():
     """pid -> [(window start, window end, sample basename or None)] from submissions."""
     index = {}
     try:
-        subs = _load_submissions()
+        with submissions_lock:
+            subs = _load_submissions()
     except Exception:
         return index
     starts = []
@@ -1462,18 +1522,39 @@ def _alerts_version(alerts):
     return f"{len(alerts)}-{h.hexdigest()[:16]}"
 
 
+_submissions_tree_cache = {"stat": None, "key": "0"}
+
+
+def _submissions_tree_key():
+    """What the process tree takes from submissions.json - when, as which PID
+    and from which file each sample ran - as a token. The file is read again
+    only when it changed, and a verdict kept on a submission leaves the token
+    as it was: a rebuilt tree would also give the alert list a new ETag, and
+    every open page would load the whole list again."""
+    try:
+        st = os.stat(SUBMISSIONS_FILE)
+    except OSError:
+        return "0"
+    stat = (SUBMISSIONS_FILE, st.st_mtime_ns, st.st_size)
+    cache = _submissions_tree_cache
+    if cache["stat"] != stat:
+        with submissions_lock:
+            subs = _load_submissions()
+        runs = [[sub.get(k) for k in ("agent_pid", "timestamp", "file_path", "filename")]
+                for sub in (subs if isinstance(subs, list) else []) if isinstance(sub, dict)]
+        cache["key"] = hashlib.md5(json.dumps(runs, default=str).encode("utf-8")).hexdigest()[:12]
+        cache["stat"] = stat
+    return cache["key"]
+
+
 def _store_alerts(alerts, processes=None):
     """Publish an alert list; skips the rebuild when nothing changed.
 
-    The process tree also depends on submissions.json (detonation flags), so
-    its mtime is part of the version. Without this check every 5 s cycle
-    rebuilt the tree from ~10k alerts even while idle.
+    The process tree also depends on submissions.json (detonation windows),
+    so what it takes from there is part of the version. Without this check
+    every 5 s cycle rebuilt the tree from ~10k alerts even while idle.
     """
-    try:
-        sub_mtime = os.path.getmtime(SUBMISSIONS_FILE)
-    except OSError:
-        sub_mtime = 0
-    version = f"{_alerts_version(alerts)}-{int(sub_mtime)}"
+    version = f"{_alerts_version(alerts)}-{_submissions_tree_key()}"
     with store_lock:
         if events_store.get("alerts_version") == version:
             return
@@ -4123,6 +4204,12 @@ def api_detonation_results():
 
     # --- Aggregated verdict (CLEAN / SUSPICIOUS / MALICIOUS) ---
     results["verdict"] = _compute_verdict(results, matching_alerts)
+    # Kept on the submission for the verdict history; the results do not
+    # depend on it, so a file that cannot be written is only logged.
+    try:
+        _store_submission_verdict(sha256, pid, results["verdict"])
+    except Exception as e:
+        print(f"[submissions] could not keep the verdict of {sha256[:12] or pid or '?'}: {e}")
 
     return jsonify(results)
 
@@ -4209,7 +4296,8 @@ _pipe_cache = {}                # (pid, sha256, at) -> (fetched_at, result)
 def _pipe_submission_start(pid, sha256=None, at=None):
     """Start epoch of the submission that ran `pid` (the one at `at`, else the newest)."""
     try:
-        subs = _load_submissions()
+        with submissions_lock:
+            subs = _load_submissions()
     except Exception:
         return None
     at_t = _to_epoch(at) if at else None

@@ -19,8 +19,8 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=41">
-    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=13">
+    <link rel="stylesheet" href="/static/css/style.css?v=55">
+    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=19">
 </head>
 <body>
     <!-- Global loading overlay (shown on slow fetches) -->
@@ -133,6 +133,49 @@
                     <div class="dashboard-stats" id="dashboard-stats">
                         <!-- Rendered by JS -->
                     </div>
+                    <!-- Alert activity and the donuts of its range, from renderDashboardCharts() in
+                         app.js: the switch sets the range, a range drawn across the bars narrows the
+                         donuts to it, a bar or a segment opens the Alerts tab with its filter -->
+                    <div class="dashboard-charts" id="dashboard-charts">
+                        <div class="chart-card dashboard-bars-card" id="dashboard-alerts-card">
+                            <div class="chart-card-head">
+                                <h3 class="chart-card-title" data-info="The alerts per hour, day or week of the last 24 hours, 7 days, 30 days or of all of them, stacked by severity. Drag across the bars to narrow the donuts to that range, or click a bar to open its alerts in the Alerts tab.">ALERT ACTIVITY</h3>
+                                <span class="chart-card-tools">
+                                    <span class="dashboard-range-chip" id="dashboard-range-chip" hidden></span>
+                                    <span class="chart-range" role="group" aria-label="Range of the dashboard charts">
+                                        <button type="button" class="chart-range-btn" data-range="24h" aria-pressed="false" onclick="setDashboardRange('24h')">24H</button>
+                                        <button type="button" class="chart-range-btn" data-range="7d" aria-pressed="false" onclick="setDashboardRange('7d')">7D</button>
+                                        <button type="button" class="chart-range-btn" data-range="30d" aria-pressed="false" onclick="setDashboardRange('30d')">30D</button>
+                                        <button type="button" class="chart-range-btn" data-range="all" aria-pressed="true" onclick="setDashboardRange('all')">ALL</button>
+                                    </span>
+                                    <span class="view-toggle-slot" id="dashboard-alerts-toggle"></span>
+                                </span>
+                            </div>
+                            <div class="dashboard-bars-area">
+                                <div class="dashboard-bars-view chart-clickable" id="dashboard-alerts-chart" data-view-of="dashboard-alerts" data-view="chart" onclick="onDashboardChartClick(event, 'alerts')"></div>
+                                <div class="view-table-wrap dashboard-bars-table" id="dashboard-alerts-table" data-view-of="dashboard-alerts" data-view="table" hidden></div>
+                            </div>
+                            <div class="dashboard-bars-note" id="dashboard-alerts-note" data-view-of="dashboard-alerts" data-view="chart"></div>
+                        </div>
+                        <div class="dashboard-donuts">
+                            <div class="chart-card" id="dashboard-severity-card">
+                                <div class="chart-card-head">
+                                    <h3 class="chart-card-title" data-info="The alerts of the range of ALERT ACTIVITY by severity, of the range drawn across its bars when there is one. Click a segment or a legend row to open those alerts in the Alerts tab.">SEVERITY</h3>
+                                    <span class="chart-card-tools view-toggle-slot" id="dashboard-severity-toggle"></span>
+                                </div>
+                                <div class="dashboard-donut-view chart-clickable" id="dashboard-severity-chart" data-view-of="dashboard-severity" data-view="chart" onclick="onDashboardChartClick(event, 'severity')"></div>
+                                <div class="view-table-wrap" id="dashboard-severity-table" data-view-of="dashboard-severity" data-view="table" hidden></div>
+                            </div>
+                            <div class="chart-card" id="dashboard-category-card">
+                                <div class="chart-card-head">
+                                    <h3 class="chart-card-title" data-info="The alerts of the same range by category; the six most frequent stand on their own, the rest is other categories. Click a segment or a legend row to open those alerts in the Alerts tab.">CATEGORY</h3>
+                                    <span class="chart-card-tools view-toggle-slot" id="dashboard-category-toggle"></span>
+                                </div>
+                                <div class="dashboard-donut-view chart-clickable" id="dashboard-category-chart" data-view-of="dashboard-category" data-view="chart" onclick="onDashboardChartClick(event, 'category')"></div>
+                                <div class="view-table-wrap" id="dashboard-category-table" data-view-of="dashboard-category" data-view="table" hidden></div>
+                            </div>
+                        </div>
+                    </div>
                     <!-- Service Cards -->
                     <div class="dashboard-grid" id="dashboard-grid">
                         <!-- Service cards rendered by JS -->
@@ -154,8 +197,49 @@
                  come from renderAlertsTab() in app.js -->
             <div class="tab-content" id="tab-alerts">
                 <div class="content-header">
-                    <h2 data-info="Every alert of Rustinel, Fibratus and LitterBox in one table, newest first, filtered by severity, engine and text. Click a column head to sort, a row for the alert details and a process name for its process (only processes in the process list are links).">Alerts</h2>
+                    <h2 data-info="Every alert of Rustinel, Fibratus and LitterBox, newest first, under charts of those the filters let through: severity, engine, text, and the time range, category, rule or process a click on a chart sets as a chip, which × takes off. Click a row for its details, a process name for its process.">Alerts</h2>
                     <span class="content-subtitle">Every detection of Rustinel, Fibratus and LitterBox, newest first</span>
+                </div>
+                <!-- The charts of the alerts the filters let through, from renderAlertsCharts() in
+                     app.js: a click on a slice, a bar, a node or a band sets the filter it stands for -->
+                <div class="alerts-charts" id="alerts-charts">
+                    <div class="alerts-chart-strip">
+                        <div class="chart-card" id="alerts-severity-card">
+                            <div class="chart-card-head">
+                                <h3 class="chart-card-title" data-info="The alerts of the current filters by severity. Click a slice or a legend row to show only that severity; the chips in the filter bar switch severities on or off.">SEVERITY</h3>
+                                <span class="chart-card-tools view-toggle-slot" id="alerts-severity-toggle"></span>
+                            </div>
+                            <div class="alerts-chart-view chart-clickable" id="alerts-severity-chart" data-view-of="alerts-severity" data-view="chart" onclick="onAlertsChartClick(event, 'severity')"></div>
+                            <div class="view-table-wrap" id="alerts-severity-table" data-view-of="alerts-severity" data-view="table" hidden></div>
+                        </div>
+                        <div class="chart-card" id="alerts-time-card">
+                            <div class="chart-card-head">
+                                <h3 class="chart-card-title" data-info="The alerts of the current filters per hour, day or week, stacked by severity; alerts without a time are noted below the bars. Click a bar to show only its period, the × of its chip in the filter bar takes it off again.">OVER TIME</h3>
+                                <span class="chart-card-tools view-toggle-slot" id="alerts-time-toggle"></span>
+                            </div>
+                            <div class="alerts-chart-view chart-clickable" id="alerts-time-chart" data-view-of="alerts-time" data-view="chart" onclick="onAlertsChartClick(event, 'time')"></div>
+                            <div class="view-table-wrap" id="alerts-time-table" data-view-of="alerts-time" data-view="table" hidden></div>
+                        </div>
+                        <div class="chart-card" id="alerts-engine-card">
+                            <div class="chart-card-head">
+                                <h3 class="chart-card-title" data-info="The alerts of the current filters by the engine that raised them. Click a slice or a legend row to choose that engine.">ENGINE</h3>
+                                <span class="chart-card-tools view-toggle-slot" id="alerts-engine-toggle"></span>
+                            </div>
+                            <div class="alerts-chart-view chart-clickable" id="alerts-engine-chart" data-view-of="alerts-engine" data-view="chart" onclick="onAlertsChartClick(event, 'engine')"></div>
+                            <div class="view-table-wrap" id="alerts-engine-table" data-view-of="alerts-engine" data-view="table" hidden></div>
+                        </div>
+                    </div>
+                    <div class="chart-card" id="alerts-flow-card">
+                        <div class="chart-card-head">
+                            <h3 class="chart-card-title" data-info="Which engine reported which rule on which process, for the current filters; the six most frequent rules and processes stand on their own, the rest is other rules and other processes. Click a node or a band to filter by it; LINEAR draws true proportions instead of square roots.">FLOW: ENGINE → RULE → PROCESS</h3>
+                            <span class="chart-card-tools">
+                                <button type="button" class="view-toggle chart-scale-toggle" id="alerts-flow-linear" aria-pressed="false" title="Draw the flows in true proportions" onclick="toggleAlertsFlowScale()" data-view-of="alerts-flow" data-view="chart">LINEAR</button>
+                                <span class="view-toggle-slot" id="alerts-flow-toggle"></span>
+                            </span>
+                        </div>
+                        <div class="alerts-chart-view chart-clickable" id="alerts-flow-chart" data-view-of="alerts-flow" data-view="chart" onclick="onAlertsChartClick(event, 'flow')"></div>
+                        <div class="view-table-wrap" id="alerts-flow-table" data-view-of="alerts-flow" data-view="table" hidden></div>
+                    </div>
                 </div>
                 <div class="alerts-filters">
                     <div class="alerts-sev-filter" role="group" aria-label="Severity">
@@ -170,6 +254,8 @@
                     </select>
                     <input type="text" id="alerts-filter-text" class="filter-input alerts-filter-text" placeholder="Search rule, process, description..." aria-label="Search rule, process, description" autocomplete="off" spellcheck="false" oninput="scheduleAlertsRender()">
                     <span class="alerts-count" id="alerts-count"></span>
+                    <!-- The filters a chart sets (time range, category, rule, process), a chip each: renderAlertsActiveFilters() -->
+                    <div class="alerts-active-filters" id="alerts-active-filters" role="group" aria-label="Chart filters" hidden></div>
                 </div>
                 <div class="alerts-table-wrap" id="alerts-table-wrap">
                     <table class="alerts-table" id="alerts-table" data-sortable data-sort-id="alerts">
@@ -450,36 +536,68 @@
                 </div>
             </div>
 
-            <!-- Sysmon Tab -->
+            <!-- Sysmon Tab: the charts of the events the filters let through
+                 (renderSysmonCharts in app.js), the filter bar, the table -->
             <div class="tab-content" id="tab-sysmon">
                 <div class="content-header">
-                    <h2 data-info="Sysmon events from the event log with search, type, EID and PID filters. The Windows EID column lists the Windows events that record the same activity, and Correlate shows the whole mapping.">Sysmon Events</h2>
-                    <div class="header-actions">
-                        <input type="text" id="sysmon-search" class="filter-input filter-input-wide" placeholder="Search process, file, IP, domain..." oninput="filterSysmonLocal()">
-                        <select id="sysmon-filter-type" class="filter-select" onchange="refreshSysmon()">
-                            <option value="">All Types</option>
-                            <option value="1">ProcessCreate</option>
-                            <option value="3">NetworkConnect</option>
-                            <option value="5">ProcessTerminate</option>
-                            <option value="7">ImageLoad</option>
-                            <option value="8">CreateRemoteThread</option>
-                            <option value="10">ProcessAccess</option>
-                            <option value="11">FileCreate</option>
-                            <option value="13">RegistryValueSet</option>
-                            <option value="22">DNSQuery</option>
-                        </select>
-                        <input type="text" id="sysmon-filter-eid" class="filter-input" placeholder="Sysmon EID (1,3,11...)" title="Filter by Sysmon Event IDs (comma-separated)" oninput="filterSysmonLocal()" onchange="refreshSysmon()">
-                        <input type="text" id="sysmon-filter-wineid" class="filter-input" placeholder="Win EID (4688,4663...)" title="Filter by correlated Windows Event IDs (comma-separated)" oninput="filterSysmonLocal()">
-                        <input type="text" id="sysmon-filter-pid" class="filter-input" placeholder="PID...">
-                        <select id="sysmon-max-events" class="filter-select">
-                            <option value="50">50 events</option>
-                            <option value="100" selected>100 events</option>
-                            <option value="200">200 events</option>
-                            <option value="500">500 events</option>
-                        </select>
-                        <button class="btn btn-sm" onclick="refreshSysmon()">Refresh</button>
-                        <button class="btn btn-sm btn-outline" onclick="toggleSysmonCorrelation()" title="Event ID Correlation Reference">Correlate</button>
+                    <h2 data-info="Sysmon events from the event log with search, type, EID and PID filters, and the time window, image or event type a click on a chart sets as a chip. The Windows EID column lists the Windows events that record the same activity, and Correlate shows the whole mapping.">Sysmon Events</h2>
+                </div>
+                <!-- A click on a bar sets a time window, on a node or band an image or event type; each is a chip in the filter bar -->
+                <div class="sysmon-charts" id="sysmon-charts">
+                    <div class="chart-card" id="sysmon-time-card">
+                        <div class="chart-card-head">
+                            <h3 class="chart-card-title" data-info="The events of the current filters per period, stacked by event type. Click a bar to show only its period in the table (Shift+click widens it to another bar), a legend row for its type.">EVENTS OVER TIME</h3>
+                            <span class="chart-card-tools view-toggle-slot" id="sysmon-time-toggle"></span>
+                        </div>
+                        <div class="sysmon-chart-area">
+                            <div class="sysmon-chart-view sysmon-time-view chart-clickable" id="sysmon-time-chart" data-view-of="sysmon-time" data-view="chart" onclick="onSysmonChartClick(event, 'time')">
+                                <div class="sysmon-time-plot" id="sysmon-time-plot"></div>
+                                <div class="sysmon-time-legend" id="sysmon-time-legend"></div>
+                            </div>
+                            <div class="view-table-wrap sysmon-chart-table" id="sysmon-time-table" data-view-of="sysmon-time" data-view="table" hidden></div>
+                        </div>
                     </div>
+                    <div class="chart-card" id="sysmon-flow-card">
+                        <div class="chart-card-head">
+                            <h3 class="chart-card-title" data-info="Which image raised which kind of event, for the current filters; the six most frequent images stand on their own, the rest is other images. Click a node or a band to filter by it; LINEAR draws true proportions instead of square roots.">PROCESS → EVENT TYPE</h3>
+                            <span class="chart-card-tools">
+                                <button type="button" class="view-toggle chart-scale-toggle" id="sysmon-flow-linear" aria-pressed="false" title="Draw the flows in true proportions" onclick="toggleSysmonFlowScale()" data-view-of="sysmon-flow" data-view="chart">LINEAR</button>
+                                <span class="view-toggle-slot" id="sysmon-flow-toggle"></span>
+                            </span>
+                        </div>
+                        <div class="sysmon-chart-area">
+                            <div class="sysmon-chart-view chart-clickable" id="sysmon-flow-chart" data-view-of="sysmon-flow" data-view="chart" onclick="onSysmonChartClick(event, 'flow')"></div>
+                            <div class="view-table-wrap sysmon-chart-table" id="sysmon-flow-table" data-view-of="sysmon-flow" data-view="table" hidden></div>
+                        </div>
+                    </div>
+                </div>
+                <div class="sysmon-filters">
+                    <input type="text" id="sysmon-search" class="filter-input filter-input-wide" placeholder="Search process, file, IP, domain..." oninput="filterSysmonLocal()">
+                    <select id="sysmon-filter-type" class="filter-select" onchange="refreshSysmon()">
+                        <option value="">All Types</option>
+                        <option value="1">ProcessCreate</option>
+                        <option value="3">NetworkConnect</option>
+                        <option value="5">ProcessTerminate</option>
+                        <option value="7">ImageLoad</option>
+                        <option value="8">CreateRemoteThread</option>
+                        <option value="10">ProcessAccess</option>
+                        <option value="11">FileCreate</option>
+                        <option value="13">RegistryValueSet</option>
+                        <option value="22">DNSQuery</option>
+                    </select>
+                    <input type="text" id="sysmon-filter-eid" class="filter-input" placeholder="Sysmon EID (1,3,11...)" title="Filter by Sysmon Event IDs (comma-separated)" oninput="filterSysmonLocal()" onchange="refreshSysmon()">
+                    <input type="text" id="sysmon-filter-wineid" class="filter-input" placeholder="Win EID (4688,4663...)" title="Filter by correlated Windows Event IDs (comma-separated)" oninput="filterSysmonLocal()">
+                    <input type="text" id="sysmon-filter-pid" class="filter-input" placeholder="PID...">
+                    <select id="sysmon-max-events" class="filter-select">
+                        <option value="50">50 events</option>
+                        <option value="100" selected>100 events</option>
+                        <option value="200">200 events</option>
+                        <option value="500">500 events</option>
+                    </select>
+                    <button class="btn btn-sm" onclick="refreshSysmon()">Refresh</button>
+                    <button class="btn btn-sm btn-outline" onclick="toggleSysmonCorrelation()" title="Event ID Correlation Reference">Correlate</button>
+                    <!-- The filters a chart sets (time window, image, event type), a chip each: renderSysmonActiveFilters() -->
+                    <div class="alerts-active-filters" id="sysmon-active-filters" role="group" aria-label="Chart filters" hidden></div>
                 </div>
                 <div id="sysmon-correlation-panel" class="sysmon-correlation" style="display:none;"></div>
                 <div class="sysmon-stats" id="sysmon-stats"></div>
@@ -637,6 +755,20 @@
                         <div class="scanner-history-header">
                             <h3 data-info="The newest 100 scans of every tool, most recent first. Click an entry for its full result.">Scan History</h3>
                             <button class="btn btn-sm" onclick="clearScanHistory()">Clear</button>
+                        </div>
+                        <!-- SCORE HISTORY of the scans below (renderScoreHistory in app.js): a click on a point opens its entry in the list -->
+                        <div class="chart-card score-history-card" id="score-history-card">
+                            <div class="chart-card-head">
+                                <h3 class="chart-card-title" data-info="A point per scan, oldest left: Aether and Exit Capture at their evidence score, the others in the lane “no score” (EMBER2024’s probability shows in the tooltip), each in its verdict’s colour; dashed lines mark SUSPICIOUS 2 and MALICIOUS 6. Click a point to open its scan in the list below.">SCORE HISTORY</h3>
+                                <span class="chart-card-tools view-toggle-slot" id="score-history-toggle"></span>
+                            </div>
+                            <div class="score-history-area" id="score-history-area">
+                                <div class="score-history-view" id="score-history-chart" data-view-of="score-history" data-view="chart">
+                                    <div class="score-history-plot chart-clickable" id="score-history-plot" onclick="onScoreHistoryClick(event)"></div>
+                                    <div class="score-history-legend" id="score-history-legend"></div>
+                                </div>
+                                <div class="view-table-wrap score-history-table" id="score-history-table" data-view-of="score-history" data-view="table" hidden></div>
+                            </div>
                         </div>
                         <div class="scanner-history-list" id="threatscan-history-list"></div>
                     </div>
@@ -874,6 +1006,20 @@
                         <h3 data-info="Every sample submitted so far. Results opens its combined detonation results, and Hex opens the file in the hex editor.">Submission History</h3>
                         <button class="btn btn-sm" onclick="refreshSubmissions()">Refresh</button>
                     </div>
+                    <!-- VERDICT HISTORY of the submissions below (renderSubmissionVerdicts in app.js): a click on a bar opens its results -->
+                    <div class="chart-card submission-verdicts-card" id="submission-verdicts-card">
+                        <div class="chart-card-head">
+                            <h3 class="chart-card-title" data-info="A bar per submission, oldest left, as high as its verdict’s score (at most 10) and in its colour; dashed lines mark where SUSPICIOUS (1) and MALICIOUS (3) begin, and grey bars are “not evaluated”. Click a bar to open its results, which evaluates a grey one.">VERDICT HISTORY</h3>
+                            <span class="chart-card-tools view-toggle-slot" id="submission-verdicts-toggle"></span>
+                        </div>
+                        <div class="submission-verdicts-area" id="submission-verdicts-area">
+                            <div class="submission-verdicts-view" id="submission-verdicts-chart" data-view-of="submission-verdicts" data-view="chart">
+                                <div class="submission-verdicts-plot chart-clickable" id="submission-verdicts-plot" onclick="onSubmissionVerdictsClick(event)"></div>
+                                <div class="submission-verdicts-legend" id="submission-verdicts-legend"></div>
+                            </div>
+                            <div class="view-table-wrap submission-verdicts-table" id="submission-verdicts-table" data-view-of="submission-verdicts" data-view="table" hidden></div>
+                        </div>
+                    </div>
                     <div class="submissions-list" id="submissions-list">
                         <div style="padding:12px;color:var(--text-muted);font-size:11px;">Loading submissions...</div>
                     </div>
@@ -964,6 +1110,9 @@
                     <h4>Themes and card controls</h4>
                     <p><strong>✶</strong> switches between the Classic and the Cyberpunk theme at once, without reloading the page: the open tab, an open detail view, filters, the graph and running interception sessions stay as they are. This browser remembers the choice; without one the UI starts in Cyberpunk, the default. In Classic ✶ sits below "? Help". In Cyberpunk it is at the right end of the top bar, where ☰ PROCESSES opens the process list and the timeline, "…" holds the tabs that do not fit and "n/m ONLINE" lists the five services of the status row (Rustinel, Sysmon, Fibratus, Agent, LitterBox); the SERVICES ONLINE tile also counts the Detonator.</p>
                     <p>In both themes <strong>(i)</strong> beside a title explains its card, <strong>CHART / TABLE</strong> shows the numbers of a chart as a table, a click on a column head sorts the table (a second click reverses the order), and a dashboard tile opens what it counts.</p>
+
+                    <h4>Charts</h4>
+                    <p>The charts of the Dashboard, Alerts, Sysmon, ThreatScan and Submit tabs, of a graph node's detail and of the detonation results take the colours of the theme, and CHART / TABLE lists their numbers. A click on a bar, a slice, a legend row or a Sankey node of the Dashboard, Alerts and Sysmon charts filters by it (the dashboard opens the Alerts tab with that filter): a time range, category, rule, process, image or event type set this way shows as a chip in the filter bar, and its &times; takes it off. On the dashboard, 24H / 7D / 30D / ALL choose the range (ALL by default) and a drag across the bars narrows the donuts to the range drawn. Sankeys are drawn by square roots so small flows stay visible; LINEAR shows true proportions.</p>
                 </div>
 
                 <!-- Usage Guide -->
@@ -973,11 +1122,11 @@
                     <div class="help-tab-guide">
                         <div class="help-guide-item">
                             <h4>Dashboard</h4>
-                            <p>Stats strip (alerts, processes, services, rules, tools), one card per service with launch buttons, recent activity. A tile opens what it counts; the high / med / low counts of the TOTAL ALERTS tile open the Alerts tab filtered by severity.</p>
+                            <p>Stats strip (alerts, processes, services, rules, tools; TOTAL ALERTS and PROCESSES TRACKED with 45-day sparklines), ALERT ACTIVITY (alerts stacked by severity) with the SEVERITY and CATEGORY donuts of its range, one card per service with launch buttons, recent activity. A tile opens what it counts (the high / med / low counts of TOTAL ALERTS open the Alerts tab filtered by severity); a bar or a segment opens the Alerts tab filtered to it, and a drag across the bars narrows the donuts to the range drawn.</p>
                         </div>
                         <div class="help-guide-item">
                             <h4>Alerts</h4>
-                            <p>Every alert in one table, newest first. Filter by severity (several at once), engine and text (rule, process, description); "n of m" counts the matches, and the newest 2000 of them are listed. Click a row for the alert's details, a process name for its process (only processes in the process list are links).</p>
+                            <p>Every alert in one table, newest first, under charts of the alerts the filters let through: SEVERITY, OVER TIME, ENGINE and the Sankey FLOW: ENGINE &rarr; RULE &rarr; PROCESS. Filter by severity (several at once), engine and text (rule, process, description), or click a chart (here or on the dashboard): a time range, category, rule or process becomes a chip in the filter bar whose &times; takes it off. "n of m" counts the matches, and the newest 2000 of them are listed; the tab scrolls as a whole, the filter bar stays at its top. Click a row for the alert's details, a process name for its process (only processes in the process list are links).</p>
                         </div>
                         <div class="help-guide-item">
                             <h4>Tracing</h4>
@@ -985,7 +1134,7 @@
                         </div>
                         <div class="help-guide-item">
                             <h4>Graph</h4>
-                            <p>Process tree around a process. Layouts: process tree, force-directed, isometric (foldable subtrees, activity icons, remote threads as bridges). The landing page lists samples and candidate processes; click a node for its detail panel.</p>
+                            <p>Process tree around a process. Layouts: process tree, force-directed, isometric (foldable subtrees, activity icons, remote threads as bridges). The landing page lists samples and candidate processes; click a node for its detail panel, where ACTIVITY MIX shows its Sysmon activity by kind.</p>
                         </div>
                         <div class="help-guide-item">
                             <h4>Pipes</h4>
@@ -993,11 +1142,11 @@
                         </div>
                         <div class="help-guide-item">
                             <h4>Sysmon</h4>
-                            <p>Sysmon events with search, type and PID filters, and the Windows Event IDs each event corresponds to.</p>
+                            <p>Sysmon events with search, type and PID filters, and the Windows Event IDs each event corresponds to. EVENTS OVER TIME and the Sankey PROCESS &rarr; EVENT TYPE count the events of the filters, all but the time window, which the bars mark (it narrows the table): a click on a bar sets a time window (Shift+click widens it to another bar), on a legend row or a node an event type or image, each a chip in the filter bar.</p>
                         </div>
                         <div class="help-guide-item">
                             <h4>ThreatScan</h4>
-                            <p>ThreatCheck, DefenderCheck, EMBER2024 and capa on a file. The Live Process Memory panel scans a running PID with Aether, dumps it with Process Dump, captures the host baseline or sweeps every process.</p>
+                            <p>ThreatCheck, DefenderCheck, EMBER2024 and capa on a file. The Live Process Memory panel scans a running PID with Aether, dumps it with Process Dump, captures the host baseline or sweeps every process. SCORE HISTORY plots the scan history: Aether and Exit Capture at their evidence score against SUSPICIOUS 2 and MALICIOUS 6, the other tools in the lane "no score"; a point opens its scan in the list.</p>
                         </div>
                         <div class="help-guide-item">
                             <h4>ETW</h4>
@@ -1017,7 +1166,7 @@
                         </div>
                         <div class="help-guide-item">
                             <h4>Submit</h4>
-                            <p>Detonate a sample and follow its stages. The verdict combines EDR alerts, live memory (Aether, Process Dump, beacon scanners), the exit-time dump, network beaconing and LitterBox.</p>
+                            <p>Detonate a sample and follow its stages. The verdict combines EDR alerts, live memory (Aether, Process Dump, beacon scanners), the exit-time dump, network beaconing and LitterBox; VERDICT FLOW shows which findings it counted. VERDICT HISTORY above the submission history has a bar per submission in its stored verdict's colour (grey: not evaluated yet); a bar opens its results.</p>
                         </div>
                     </div>
                 </div>
@@ -1203,6 +1352,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
          in app.js); set as text, never as markup -->
     <div id="info-popover" class="info-popover" role="status" hidden></div>
 
-    <script src="/static/js/app.js?v=61"></script>
+    <script src="/static/js/app.js?v=77"></script>
 </body>
 </html>

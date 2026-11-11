@@ -29,6 +29,8 @@ prebuilt/
 webui/scan_history.json
 webui/memory_baseline.json
 webui/memory_results/
+# A write of submissions.json that did not finish (the file itself is in the repository)
+webui/submissions.json.tmp
 
 # Subagent-driven development scratch (ledger, briefs, review packages)
 .superpowers/

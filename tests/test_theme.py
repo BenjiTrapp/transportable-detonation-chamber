@@ -443,7 +443,8 @@ def test_cyberpunk_severity_indicators_use_the_spec_colours():
 
 
 # The newest alerts first, as the sidebar timeline and Recent Activity take them
-NEWEST_ALERTS_FUNCTIONS = ["newestAlerts", "filterAlerts", "alertSeverity", "alertRuleName", "alertProcessName"]
+NEWEST_ALERTS_FUNCTIONS = ["newestAlerts", "filterAlerts", "alertSeverity", "alertRuleName", "alertProcessName",
+                           "alertCategory", "_alertsTimeBound", "_alertsNameKey", "_alertNameIs"]
 
 
 @needs_node
@@ -454,6 +455,7 @@ def test_dashboard_activity_tells_critical_from_high():
     r = _run_node(["renderDashboard", "escapeHtml"] + NEWEST_ALERTS_FUNCTIONS, r"""
         const els = {};
         globalThis.document = { getElementById: id => (els[id] = els[id] || { innerHTML: '' }) };
+        globalThis.renderDashboardCharts = () => {};          // the charts have tests of their own
         const alert = (severity, i) => ({ severity, rule_name: 'r', process_name: 'p', pid: 1,
                                           timestamp: new Date(Date.UTC(2026, 10, 9, 10, 0, 0) - i * 1000).toISOString() });
         const feed = severities => {
@@ -481,6 +483,7 @@ def test_recent_activity_shows_the_eight_newest_alerts():
     r = _run_node(["renderDashboard", "escapeHtml"] + NEWEST_ALERTS_FUNCTIONS, r"""
         const els = {};
         globalThis.document = { getElementById: id => (els[id] = els[id] || { innerHTML: '' }) };
+        globalThis.renderDashboardCharts = () => {};          // the charts have tests of their own
         const alert = (rule, timestamp) => ({ severity: 'low', rule_name: rule, process_name: 'p', pid: 1, timestamp });
         const alerts = [];
         for (let i = 0; i < 12; i++) alerts.push(alert('rule ' + i, new Date(Date.UTC(2026, 10, 9, 10, i)).toISOString()));
@@ -1701,12 +1704,50 @@ def test_reference_site_check_finds_glued_and_separated_forms():
 
 # --- Alerts tab ----------------------------------------------------------------
 
-ALERT_FUNCTIONS = ["alertSeverity", "alertRuleName", "alertProcessName", "filterAlerts"]
+ALERT_FUNCTIONS = ["alertSeverity", "alertRuleName", "alertProcessName", "alertCategory", "filterAlerts",
+                   "_alertsTimeBound", "_alertsNameKey", "_alertNameIs"]
 ALERT_ROW_FUNCTIONS = ALERT_FUNCTIONS + ["alertRowsHtml", "alertInstanceIndex", "_alertInstanceId", "formatAlertTime",
                                          "escapeHtml", "jsArg", "cssToken", "procKey", "sortTimeValue",
                                          "severitySortValue"]
-ALERTS_TAB_FUNCTIONS = ALERT_ROW_FUNCTIONS + ["alertEngines", "setAlertsEngineOptions", "alertsFilterFromControls",
-                                              "renderAlertsTab", "toggleAlertsSeverity", "openAlertsTab"]
+# The building blocks of the charts (block CHARTS of app.js) and their constants
+CHART_CONSTS = ["SEVERITY_ORDER", "SEVERITY_COLORS", "CHART_PALETTE", "CHART_MONTHS", "CHART_MAX_BINS"]
+CHART_FUNCTIONS = ["alertCategory", "countBy", "binByTime", "stackedBarsSvg", "donutSvg", "pieSvg", "chartLegendHtml",
+                   "sparklineSvg", "scatterSvg", "verdictBarsSvg", "chartEmptyHtml", "_chartSentence", "_chartColor",
+                   "_chartNumber", "_chartShare", "_chartCoord", "_chartSegments", "_chartPeriodStart", "_chartPeriodNext",
+                   "_chartDate", "_chartClock", "_chartPeriodLabel", "_chartTicks", "_chartFineStep",
+                   "topWithOther", "alertFlow", "_chartFlow", "layoutSankey", "sankeySvg", "_sankeyFit", "_chartEllipsis"]
+# The charts of the Alerts tab above its filter bar, the parts the dashboard and the Sysmon tab share with them, and
+# the CHART / TABLE switch of their cards
+ALERTS_CHART_FUNCTIONS = ["renderAlertsCharts", "alertsSeverityItems", "_alertsSeverityColor", "alertsEngineItems",
+                          "_drawAlertsPie", "_drawShareChart", "_alertsShareTableHtml", "chartTimeBins",
+                          "alertSeverityBins", "_alertsTimeNote", "_alertsTimeBarsSvg", "_drawAlertsTime",
+                          "_timeBinsTableHtml", "_alertsTimeTableHtml", "_drawAlertsFlow", "_flowTableHtml",
+                          "_alertsFlowTableHtml", "_alertsFlowColors", "_alertsFlowFilter", "_flowInert",
+                          "_flowClickFilter", "_alertsChartWidths",
+                          "_alertsChartInert", "onAlertsChartClick", "_applyAlertsChartFilter", "toggleAlertsFlowScale",
+                          "_pressFlowScale", "redrawAlertsChartsOnResize", "isTableView", "viewToggleHtml",
+                          "cardViewAttrs", "toggleCardView"]
+# The tab with the chips of the chart filters, which name a time range as the charts do (block CHARTS), and its charts
+ALERTS_TAB_FUNCTIONS = list(dict.fromkeys(ALERT_ROW_FUNCTIONS + [
+    "alertEngines", "setAlertsEngineOptions", "alertsFilterFromControls", "renderAlertsTab", "toggleAlertsSeverity",
+    "selectAlertsSeverity", "openAlertsTab", "setAlertsFilters", "removeAlertsFilter", "renderAlertsActiveFilters",
+    "filterChipHtml", "_alertsExtraOf", "_alertsListTop", "_tabListTop", "chartRangeLabel"] + CHART_FUNCTIONS
+    + ALERTS_CHART_FUNCTIONS))
+# The state of the Alerts tab and its charts (app.js top level) for the functions under test
+ALERTS_TAB_CONSTS = ["ALERT_SEVERITIES", "ALERT_TIME_MIN", "alertsExtraFilter", "cardViewState",
+                     "alertsFlowView"] + CHART_CONSTS
+ALERTS_TAB_LETS = "\nlet _alertsTabShown = null;\nlet _alertsChartsDrawn = null;"
+# The charts of the dashboard between its tiles and its service cards, and their state
+DASHBOARD_CHART_FUNCTIONS = ["renderDashboardCharts", "setDashboardRange", "_dashboardCount",
+                             "_dashboardFollowTheClock", "_dashboardSparkCounts", "dashboardCategoryItems",
+                             "releaseDashboardCounts", "_drawDashboardSparks", "_drawDashboardBars",
+                             "_drawDashboardDonuts", "_drawDashboardRange", "_dashboardBarsSize",
+                             "onDashboardChartClick", "_dashboardBinPeriod", "initDashboardCharts", "onDashboardBrushStart",
+                             "onDashboardBrushMove", "onDashboardBrushEnd", "onDashboardBrushCancel", "_dashboardBrushStop",
+                             "_dashboardBrushMark", "_dashboardBinAt", "redrawDashboardChartsOnResize"]
+DASHBOARD_CHART_CONSTS = ["DASHBOARD_RANGES", "DASHBOARD_SPARK_DAYS", "dashboardRange", "dashboardBarsRange",
+                          "_dashboardMemo", "_dashboardDrawn"]
+DASHBOARD_CHART_LETS = "\nlet _dashboardBrush = null;\nlet _dashboardReleased = null;"
 
 # Four alerts as the engines write them: severity and engine in either case,
 # the process by name, by image only or by PID only, time zones mixed (as a
@@ -1727,7 +1768,7 @@ ALERT_FIXTURE = r"""
 
 
 def _alerts_prelude():
-    return "\n".join(_const_source(c) for c in ("ALERTS_TAB_LIMIT", "ALERT_SEVERITIES")) + "\nlet _alertsTabShown = null;"
+    return "\n".join(_const_source(c) for c in ["ALERTS_TAB_LIMIT"] + ALERTS_TAB_CONSTS) + ALERTS_TAB_LETS
 
 
 @needs_node
@@ -1840,6 +1881,11 @@ def test_alerts_tab_is_wired():
     assert all(c["tag"] == "button" and c["attrs"].get("aria-pressed") == "false" for c in chips)
     for part in ("alerts-filter-engine", "alerts-filter-text", "alerts-count", "alerts-rows", "alerts-table-wrap"):
         assert find(tab, lambda e, part=part: e["attrs"].get("id") == part), part
+    # The chips of the chart filters: in the filter bar, which stands at the top, hidden while there are none
+    bar = find(tab, lambda e: "alerts-filters" in e["attrs"].get("class", "").split())
+    chips = find(bar[0], lambda e: e["attrs"].get("id") == "alerts-active-filters") if bar else []
+    assert chips and "hidden" in chips[0]["attrs"] and chips[0]["attrs"].get("role") == "group" \
+        and chips[0]["attrs"].get("aria-label"), "the chips of the chart filters are not in the filter bar"
     engine = find(tab, lambda e: e["attrs"].get("id") == "alerts-filter-engine")[0]
     assert engine["tag"] == "select" and engine["attrs"].get("onchange") == "renderAlertsTab()", \
         "choosing an engine does not filter"
@@ -1936,10 +1982,22 @@ def _alerts_tab_prelude():
 
 @needs_node
 def test_open_alerts_tab_sets_its_filters_and_a_refresh_keeps_them():
+    """The tab scrolls as a whole. A refresh with the same filters keeps the
+    place in the list; other filters start at the top of the list: its first
+    row right under the filter bar standing at the top of the tab, so the bar
+    does not move away under the pointer (above that, nothing moves)."""
     r = _run_node(ALERTS_TAB_FUNCTIONS, ALERT_FIXTURE + r"""
         globalThis.state = { alerts, processes: {}, activeTab: 'dashboard' };
         globalThis.switchTab = name => { state.activeTab = name; if (name === 'alerts') renderAlertsTab(); };
         const $ = id => document.getElementById(id);
+        // The layout: the tab 56 px below the top of the window, its head 50 px
+        // high, then the filter bar (40 px; it stands at the top of the tab once
+        // the head has scrolled away), then the table
+        const tab = $('tab-alerts'), bar = document.querySelector('#tab-alerts .alerts-filters');
+        tab.scrollTop = 0;
+        tab.getBoundingClientRect = () => ({ top: 56, width: 0 });
+        bar.getBoundingClientRect = () => ({ top: 56 + Math.max(0, 50 - tab.scrollTop), height: 40, width: 0 });
+        $('alerts-table-wrap').getBoundingClientRect = () => ({ top: 56 + 90 - tab.scrollTop, width: 0 });
         let builds = 0;
         const rows = $('alerts-rows');
         const html = Object.getOwnPropertyDescriptor(El.prototype, 'innerHTML');
@@ -1950,35 +2008,42 @@ def test_open_alerts_tab_sets_its_filters_and_a_refresh_keeps_them():
             engine: $('alerts-filter-engine').value, engines: $('alerts-filter-engine').children.map(o => o.value),
             text: $('alerts-filter-text').value || '',
             ids: [...rows.html.matchAll(/openAlertDetailById\(&quot;(\w+)&quot;\)/g)].map(m => m[1]),
-            count: $('alerts-count').textContent, tab: state.activeTab, scroll: $('alerts-table-wrap').scrollTop || 0,
+            count: $('alerts-count').textContent, tab: state.activeTab, scroll: tab.scrollTop,
+            // Where the list begins, from the top of the tab
+            list: $('alerts-table-wrap').getBoundingClientRect().top - tab.getBoundingClientRect().top,
         });
         const r = {};
         openAlertsTab({ severities: ['critical', 'High'], engine: 'yara', text: '' }); r.preset = view();
         openAlertsTab({}); r.all = view();
         builds = 0; renderAlertsTab(); renderAlertsTab(); r.unchangedBuilds = builds;
-        $('alerts-table-wrap').scrollTop = 480;
+        tab.scrollTop = 480;
         state.alerts = [{ id: 'a5', timestamp: '2026-11-09T13:00:00Z', severity: 'High', engine: 'IOC', rule_name: 'New' },
                         ...alerts];
         renderAlertsTab(); r.refreshed = view();
         click(document.querySelector('.alerts-sev-chip[data-severity="medium"]')); r.medium = view();
+        tab.scrollTop = 30;
         $('alerts-filter-text').value = 'mimi'; renderAlertsTab(); r.text = view();
         click(document.querySelector('.alerts-sev-chip[data-severity="medium"]')); r.unpressed = view();
+        // A chart filter is another filter as well
+        tab.scrollTop = 480; setAlertsFilters({ rule: 'mimikatz' }); r.chart = view();
         openAlertsTab({ engine: 'etw' }); r.unknownEngine = { ...view(), empty: /No alerts match/.test(rows.html) };
         state.alerts = []; renderAlertsTab(); r.noAlerts = { ...view(), empty: /No alerts yet/.test(rows.html) };
         console.log(JSON.stringify(r));
     """, _alerts_tab_prelude())
     assert r["preset"] == {"pressed": ["critical", "high"], "engine": "Yara", "engines": ["", "fibratus", "Sigma", "Yara"],
-                           "text": "", "ids": ["a2"], "count": "1 of 4", "tab": "alerts", "scroll": 0}
+                           "text": "", "ids": ["a2"], "count": "1 of 4", "tab": "alerts", "scroll": 0, "list": 90}
     assert r["all"] == {**r["preset"], "pressed": [], "engine": "", "ids": ["a4", "a2", "a1", "a3"], "count": "4 of 4"}
     assert r["unchangedBuilds"] == 0, "the list is rebuilt although nothing changed"
     # New data with the same filters: the place in the list stays, the new engine is offered
     assert r["refreshed"]["ids"] == ["a5", "a4", "a2", "a1", "a3"] and r["refreshed"]["count"] == "5 of 5"
     assert r["refreshed"]["scroll"] == 480 and r["refreshed"]["engines"] == ["", "fibratus", "IOC", "Sigma", "Yara"]
-    # Other filters start at the top of the list
-    assert (r["medium"]["pressed"], r["medium"]["ids"], r["medium"]["count"], r["medium"]["scroll"]) == \
-        (["medium"], ["a4"], "1 of 5", 0)
-    assert (r["text"]["ids"], r["text"]["text"]) == (["a4"], "mimi")
+    # Other filters start at the top of the list: the head scrolled away, the first row right under the bar
+    assert (r["medium"]["pressed"], r["medium"]["ids"], r["medium"]["count"]) == (["medium"], ["a4"], "1 of 5")
+    assert (r["medium"]["scroll"], r["medium"]["list"]) == (50, 40), "other filters do not start at the top of the list"
+    # ... and where the list starts below the bar anyway, nothing moves
+    assert (r["text"]["ids"], r["text"]["text"], r["text"]["scroll"]) == (["a4"], "mimi", 30)
     assert (r["unpressed"]["pressed"], r["unpressed"]["ids"]) == ([], ["a4"])
+    assert (r["chart"]["ids"], r["chart"]["scroll"]) == (["a4"], 50), "a chart's filter does not start the list at the top"
     # An engine without alerts stays chosen (a tile may ask for it before alerts arrive)
     assert r["unknownEngine"]["engine"] == "etw" and "etw" in r["unknownEngine"]["engines"]
     assert (r["unknownEngine"]["ids"], r["unknownEngine"]["count"], r["unknownEngine"]["empty"]) == ([], "0 of 5", True)
@@ -1991,12 +2056,16 @@ def test_a_refresh_re_renders_the_alerts_tab_only_while_it_is_open():
     """After new alerts (not a 304) and after the process list that resolves
     their process instances; never while another tab is open. A refresh while
     the tab is closed lets go of the lists the table was built from (tens of
-    MB) and keeps only its filters."""
+    MB) and keeps only its filters. The dashboard, while it is open, renders
+    the new alerts (its tiles and charts) as well; while it is hidden, it
+    lets go of the lists it counted, as the table does."""
     r = _run_node(["_refreshAlertsOnce"], r"""
         const log = [];
         for (const f of ['showToast', 'indexAlerts', 'renderTimeline', 'renderRtraceConsole']) globalThis[f] = () => {};
         globalThis.refreshProcesses = async () => { log.push('processes'); };
         globalThis.renderAlertsTab = () => log.push('render');
+        globalThis.renderDashboard = () => log.push('dashboard');
+        globalThis.releaseDashboardCounts = () => log.push('release');
         const reply = status => async () => ({ status, ok: status === 200, headers: { get: () => '"v2"' },
                                                json: async () => [{ id: 'a', timestamp: '2026-11-09T10:00:00Z' }] });
         (async () => {
@@ -2014,7 +2083,8 @@ def test_a_refresh_re_renders_the_alerts_tab_only_while_it_is_open():
             console.log(JSON.stringify({ r, shown }));
         })();
     """, "let _alertsTabShown = null;")
-    assert r["r"] == ["processes render", "", "processes", "", ""]
+    assert r["r"] == ["processes render release", "", "processes dashboard", "", ""], \
+        "the hidden dashboard keeps the old lists, or the open one does not render the new alerts"
     kept, filters = ["alerts", "filterKey", "processes", '[["high"],"",""]'], ["filterKey", '[["high"],"",""]']
     assert r["shown"] == [kept, kept, filters, kept, kept], "a refresh with the tab closed keeps the old alert list alive"
 
@@ -2072,6 +2142,10 @@ class Node {
     get children() { return this.childNodes.filter(n => n.nodeType === 1); }
     get firstElementChild() { return this.children[0] || null; }
     get lastElementChild() { const c = this.children; return c[c.length - 1] || null; }
+    get nextElementSibling() {
+        const siblings = this.parentNode ? this.parentNode.childNodes : [];
+        return siblings.slice(siblings.indexOf(this) + 1).find(n => n.nodeType === 1) || null;
+    }
     get textContent() { return this.childNodes.map(n => n.textContent).join(''); }
     set textContent(v) { this.replaceChildren(...(String(v) ? [new Text(String(v))] : [])); }
     contains(n) { for (let e = n; e; e = e.parentNode) if (e === this) return true; return false; }
@@ -2428,6 +2502,31 @@ def test_formatted_times_and_sizes_sort_by_their_value():
 
 SYSMON_FUNCTIONS = ["renderSysmonTable", "getSysmonDetails", "getSysmonTypeClass", "formatSysmonTime", "truncate",
                     "getCorrelatedWindowsEvents", "escapeHtml", "sortTimeValue"]
+# The Sysmon tab with its charts above its filter bar, the chips of the filters the charts set, and the parts it
+# shares with the Alerts tab and the building blocks of the charts
+SYSMON_TAB_FUNCTIONS = list(dict.fromkeys(SYSMON_FUNCTIONS + [
+    "refreshSysmon", "renderSysmonStats", "filterSysmonLocal", "_sysmonTableHtml", "sysmonFilterFromControls",
+    "filterSysmonEvents",
+    "sysmonImageName", "sysmonEventType", "renderSysmonCharts", "sysmonFlow", "sysmonTypeColor", "sysmonTypeItems",
+    "_sysmonTypeNames", "_sysmonEmptyText", "_drawSysmonTime", "_drawSysmonFlow", "_sysmonFlowColors",
+    "_sysmonChartWidths", "onSysmonChartClick", "_sysmonFlowFilter", "setSysmonFilters", "removeSysmonFilter",
+    "renderSysmonActiveFilters", "_sysmonWindowLabel", "_sysmonKeepWindow", "toggleSysmonFlowScale",
+    "redrawSysmonChartsOnResize", "initSysmonTab",
+    "chartTimeBins", "_timeBinsTableHtml", "_flowTableHtml", "filterChipHtml", "_alertsTimeNote",
+    "_alertsChartInert", "_flowInert", "_flowClickFilter",
+    "_alertsNameKey", "_alertNameIs", "_alertsTimeBound", "_pressFlowScale", "formatAlertTime", "jsArg", "_tabListTop",
+    "_followBarHeight", "isTableView", "viewToggleHtml", "cardViewAttrs", "toggleCardView"] + CHART_FUNCTIONS))
+# Their state (app.js top level)
+SYSMON_TAB_CONSTS = ["SYSMON_WINDOWS_CORRELATION", "sysmonTimeWindow", "sysmonFlowFilter", "sysmonFlowView",
+                     "SYSMON_TYPE_COLORS", "SYSMON_OTHER_COLORS", "ALERT_TIME_MIN", "cardViewState"] + CHART_CONSTS
+SYSMON_TAB_LETS = ("\nlet sysmonEvents = [];\nlet sysmonStats = null;\nlet sysmonLoadError = '';"
+                   "\nlet _sysmonChartsDrawn = null;\nlet _sysmonTableShown = null;\n")
+
+
+def _sysmon_prelude():
+    return "\n".join(_const_source(c) for c in SYSMON_TAB_CONSTS) + SYSMON_TAB_LETS
+
+
 PIPE_EVENT_FUNCTIONS = ["refreshPipeEvents", "pipesIsGone", "pipesCanonical", "formatTime", "jsArg", "jsInt",
                         "renderNamedPipesBlock", "pipeProcLabel", "cssToken"]
 
@@ -2520,11 +2619,12 @@ def test_a_sorted_table_stays_sorted_when_polling_renders_it_again():
         })();
     """
     markup = _tab_markup("sysmon") + _tab_markup("pipes") + _tab_markup("alerts") + '<div id="submit-result"></div>'
-    prelude = (SORT_DOM + _controls_prelude() + "\nlet sysmonEvents = [];\n"
-               + "\n".join(_const_source(c) for c in ("SYSMON_WINDOWS_CORRELATION", "pipesState", "PIPE_FLAG_LABELS"))
-               + "\nconst ALERTS_TAB_LIMIT = 3;\n" + _const_source("ALERT_SEVERITIES") + "\nlet _alertsTabShown = null;\n"
+    consts = list(dict.fromkeys(SYSMON_TAB_CONSTS + ["pipesState", "PIPE_FLAG_LABELS"] + ALERTS_TAB_CONSTS))
+    prelude = (SORT_DOM + _controls_prelude() + SYSMON_TAB_LETS
+               + "\n".join(_const_source(c) for c in consts)
+               + "\nconst ALERTS_TAB_LIMIT = 3;\n" + ALERTS_TAB_LETS + "\n"
                + ALERT_FIXTURE.replace("const alerts", "const ALERTS"))
-    functions = sorted(set(CONTROL_FUNCTIONS + SYSMON_FUNCTIONS + PIPE_EVENT_FUNCTIONS + ALERTS_TAB_FUNCTIONS))
+    functions = sorted(set(CONTROL_FUNCTIONS + SYSMON_TAB_FUNCTIONS + PIPE_EVENT_FUNCTIONS + ALERTS_TAB_FUNCTIONS))
     r = _run_node(functions, script.replace("MARKUP", json.dumps(markup)), prelude)
     # The time column shows clock times: as text the next day would come first
     assert r["sysmonClock"] == ["12:00:00.000", "23:59:58.000", "00:00:02.000"]
@@ -2819,7 +2919,8 @@ def test_card_controls_are_set_up_once():
 
 CARD_VIEW_FUNCTIONS = ["isTableView", "viewToggleHtml", "cardViewAttrs", "toggleCardView", "escapeHtml", "jsArg"]
 CHART_CARDS = ["renderTimeline", "renderRtraceTimeline", "updateRtraceSeverityBar", "renderDetectionOverview",
-               "renderPeAnalysis"]
+               "renderPeAnalysis", "renderAlertsCharts", "renderDashboardCharts", "renderSysmonCharts",
+               "renderScoreHistory", "renderSubmissionVerdicts", "graphActivityMixHtml", "verdictFlowHtml"]
 
 
 def _rules(path):
@@ -2895,6 +2996,7 @@ def test_dashboard_tiles_count_and_open_their_lists():
         document.body.innerHTML = MARKUP;
         Element.prototype.click = function () { return click(this); };
         const calls = [];
+        globalThis.renderDashboardCharts = () => {};          // the charts have tests of their own
         globalThis.openAlertsTab = filter => calls.push(['alerts', filter]);
         globalThis.revealProcessList = () => calls.push(['processes']);
         globalThis.revealSection = id => calls.push(['reveal', id]);
@@ -2940,8 +3042,8 @@ def test_dashboard_tiles_count_and_open_their_lists():
 def test_processes_tile_reveals_the_process_list():
     """Classic: the process list of the sidebar scrolls into view and is
     marked for about a second; Cyberpunk: the drawer with the list opens."""
-    r = _run_node(["revealProcessList", "revealSection", "currentTheme", "normalizeTheme", "openDrawer", "setDrawerOpen",
-                   "isDrawerOpen"], r"""
+    r = _run_node(["revealProcessList", "revealSection", "revealElement", "currentTheme", "normalizeTheme", "openDrawer",
+                   "setDrawerOpen", "isDrawerOpen"], r"""
         const timers = [];
         globalThis.setTimeout = (fn, ms) => { timers.push([fn, ms]); return timers.length; };
         globalThis.clearTimeout = () => {};

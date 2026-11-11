@@ -133,6 +133,10 @@
     --c-amber-500: var(--cp-protector);
     --c-yellow-400: #ffd84a;
     --c-yellow-600: #c98a00;
+    --c-lime-400: #b0f02f;
+    --c-lime-400-rgb: 176, 240, 47;
+    --c-lime-600: #81b521;
+    --c-lime-600-rgb: 129, 181, 33;
     --c-green-400: #5ef0a5;
     --c-green-400-rgb: 94, 240, 165;
     --c-teal-400: var(--cp-teal);
@@ -154,6 +158,8 @@
     --c-slate-900-rgb: var(--cp-card-rgb);
     --c-slate-650: #4a3d70;
     --c-amber-990: #2a1700;
+    --c-sky-550: #2095c8;
+    --c-sky-550-rgb: 32, 149, 200;
     /* The dark blues (roles in style.css :root) become dark violets */
     --c-navy-800: #4a1d58;
     --c-navy-900: #120b22;
@@ -987,10 +993,14 @@
 
 /* --- Alerts tab: the filter bar on the page, the severity chips as switches
    (a pressed one in its severity's colour with its glow), the count as a
-   label; the table takes the table look above --- */
-[data-theme="cyberpunk"] .alerts-filters {
+   label; the table takes the table look above. The bar stands at the top of
+   the tab while it scrolls (below the top bar): it is opaque, in the colour
+   of the page, so the rows pass under it unseen; so does the Sysmon tab's.
+   The chips of the chart filters: cyan, their × in magenta --- */
+[data-theme="cyberpunk"] .alerts-filters,
+[data-theme="cyberpunk"] .sysmon-filters {
     padding: 12px 24px;
-    background: transparent;
+    background: var(--cp-bg);
 }
 [data-theme="cyberpunk"] .alerts-sev-chip {
     font-family: var(--cp-font-label);
@@ -1030,6 +1040,34 @@
     font-size: 10.5px;
     letter-spacing: .08em;
     text-transform: uppercase;
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .alerts-filter-chip {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    letter-spacing: .04em;
+    color: var(--cp-text);
+    background: rgba(var(--cp-cyan-rgb), .08);
+    border-color: rgba(var(--cp-cyan-rgb), .45);
+    border-radius: 4px;
+}
+[data-theme="cyberpunk"] .alerts-filter-chip:hover {
+    background: rgba(var(--cp-cyan-rgb), .14);
+    border-color: var(--cp-cyan);
+    box-shadow: 0 0 12px rgba(var(--cp-cyan-rgb), .3);
+}
+[data-theme="cyberpunk"] .alerts-filter-chip:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: 2px;
+}
+[data-theme="cyberpunk"] .alerts-filter-chip-x {
+    color: var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .alerts-filter-chip:hover .alerts-filter-chip-x {
+    color: var(--cp-magenta);
+    text-shadow: var(--cp-glow);
+}
+[data-theme="cyberpunk"] .alerts-filter-chip-kind {
     color: var(--cp-text-dim);
 }
 [data-theme="cyberpunk"] .alerts-table-wrap {
@@ -1969,4 +2007,97 @@
 [data-theme="cyberpunk"] .rtrace-event-table-header > .rtrace-col:focus-visible {
     outline: 2px solid var(--cp-cyan);
     outline-offset: -2px;
+}
+
+/* --- Charts: the cards in the card look, their titles like the section
+   titles (cyan, monospace, upper case); the parts of the charts take the
+   palette through the variables of style.css --- */
+[data-theme="cyberpunk"] .chart-card {
+    background-color: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow);
+}
+[data-theme="cyberpunk"] .chart-card-title {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--cp-cyan);
+}
+
+/* --- Alerts tab charts: the cards above the filter bar spaced like the
+   bar, the note in the label font, LINEAR pressed in cyan --- */
+[data-theme="cyberpunk"] .alerts-charts {
+    gap: 12px;
+    padding: 14px 24px 12px;
+}
+[data-theme="cyberpunk"] .alerts-chart-strip {
+    gap: 12px;
+}
+[data-theme="cyberpunk"] .alerts-chart-note {
+    font-family: var(--cp-font-label);
+    letter-spacing: .04em;
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .chart-scale-toggle[aria-pressed="true"] {
+    color: var(--cp-cyan);
+    background: rgba(var(--cp-cyan-rgb), .16);
+    border-color: var(--cp-cyan);
+    box-shadow: 0 0 10px rgba(var(--cp-cyan-rgb), .35);
+}
+
+/* --- Sysmon tab charts: the cards above the filter bar spaced like the
+   bar, the note in the label font --- */
+[data-theme="cyberpunk"] .sysmon-charts {
+    gap: 12px;
+    padding: 14px 24px 12px;
+}
+[data-theme="cyberpunk"] .sysmon-chart-note {
+    font-family: var(--cp-font-label);
+    letter-spacing: .04em;
+    color: var(--cp-text-dim);
+}
+
+/* --- Dashboard charts: the row spaced like the tiles, the switch of the
+   range as small labels with the preset in effect in magenta (as the tab in
+   the top bar), the sparkline of a tile under its tags on the left, the
+   notes in the label font --- */
+[data-theme="cyberpunk"] .chart-range {
+    border-color: rgba(var(--cp-magenta-rgb), .35);
+    border-radius: 4px;
+}
+[data-theme="cyberpunk"] .chart-range-btn {
+    height: 16px;
+    padding: 0 7px;
+    font-family: var(--cp-font-label);
+    font-size: 10px;
+    letter-spacing: .1em;
+    color: var(--cp-text-muted);
+    border-left-color: rgba(var(--cp-magenta-rgb), .22);
+    transition: color .15s, background-color .15s, box-shadow .15s;
+}
+[data-theme="cyberpunk"] .chart-range-btn:hover:not(:disabled) {
+    color: var(--cp-text);
+    background: var(--cp-raised);
+}
+[data-theme="cyberpunk"] .chart-range-btn[aria-pressed="true"] {
+    color: var(--cp-on-magenta);
+    background: var(--cp-magenta);
+    box-shadow: var(--cp-glow);
+}
+[data-theme="cyberpunk"] .chart-range-btn:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: -2px;
+}
+[data-theme="cyberpunk"] .stat-spark {
+    justify-content: flex-start;
+    margin-top: 10px;
+}
+[data-theme="cyberpunk"] .stat-spark-label,
+[data-theme="cyberpunk"] .dashboard-bars-note {
+    font-family: var(--cp-font-label);
+    letter-spacing: .04em;
+    color: var(--cp-text-dim);
 }

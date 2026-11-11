@@ -7,10 +7,27 @@ Regressions covered:
   * the graph landing page listed memory scans ("PID 4072") as samples
   * Sysmon XPath without time bounds / parent filter
   * ETW events parsed from wevtutil RenderedXml
+  * the verdict of a detonation computed on every view and never kept, so
+    the history of the Submit tab could not show it; kept on another sample's
+    or another run's submission, or written again on every poll; kept on the
+    newest run of the sample when it was computed for none of its runs (a
+    PID none of them had, no PID for a sample that always ran with one)
+  * a kept verdict rebuilding the process tree and changing the ETag of the
+    alert list (every open page loading tens of MB again)
+  * the tests writing the submissions.json of the repository
+  * a write of submissions.json that failed halfway (a full disk) leaving
+    the history empty, without a word in the log; a file another program
+    held for a moment failing the write; readers of the file that did not
+    wait for a write to end
 """
 
+import ast
 import gzip
 import json
+import os
+import threading
+
+import pytest
 
 from conftest import make_alert
 
@@ -124,3 +141,311 @@ def test_etw_events_from_rendered_xml(tdc, client, monkeypatch):
     assert ev["message"] == "Ein Konto wurde erfolgreich angemeldet."
     assert ev["data"] == {"TargetUserName": "TDC", "LogonType": "3"}
     assert client.get("/api/etw/events?channel=security&since=nope").status_code == 400
+
+
+# --- The verdict kept on the submission (VERDICT HISTORY of the Submit tab) ------
+
+SHA_A, SHA_B = "a1" * 32, "b2" * 32
+
+
+def _submissions_on_disk(tdc, monkeypatch, subs):
+    """submissions.json with these entries (newest first, as the server keeps
+    them), read back as the server reads it: a fresh copy on every load."""
+    with open(tdc.SUBMISSIONS_FILE, "w") as f:
+        json.dump(subs, f)
+
+    def load():
+        with open(tdc.SUBMISSIONS_FILE) as f:
+            return json.load(f)
+
+    monkeypatch.setattr(tdc, "_load_submissions", load)
+    return load
+
+
+def _results_without_the_vm(tdc, monkeypatch):
+    """/api/detonation/results with LitterBox, the agent, the EDRs and Sysmon away."""
+    monkeypatch.setattr(tdc, "_fetch_many", lambda specs: {})
+    monkeypatch.setattr(tdc, "_litterbox_online", lambda: False)
+    monkeypatch.setattr(tdc, "_is_fibratus_running", lambda: False)
+    monkeypatch.setattr(tdc, "_is_rustinel_running", lambda: False)
+    monkeypatch.setattr(tdc, "_network_beaconing_for_pid", lambda pid: {"available": False})
+    monkeypatch.setattr(tdc, "_pipe_activity_for", lambda pid, sha256=None, at=None: {"available": False})
+
+
+def test_the_tests_keep_away_from_the_submissions_of_the_repository(tdc, tmp_path):
+    """webui/submissions.json is in the repository: a test that stores a
+    verdict must write a file of its own."""
+    assert os.path.dirname(tdc.SUBMISSIONS_FILE) == str(tmp_path)
+
+
+def test_detonation_results_store_the_verdict_on_the_submission(tdc, client, monkeypatch):
+    """The verdict /api/detonation/results computes is kept, as its label and
+    score, on the submission of the run it was computed for: the one of the
+    sample with this PID; without a PID the one of the sample that ran
+    without (LitterBox only). It is written under the submissions lock and
+    only when it changed. A PID none of the sample's submissions ran as, no
+    PID for a sample that always ran with one (tdc_detonation_results with a
+    hash only), a sample without a submission, or a PID alone (PIDs are
+    reused) keep it nowhere: it was computed for no run of the history."""
+    load = _submissions_on_disk(tdc, monkeypatch, [
+        {"id": "new", "sha256": SHA_A, "agent_pid": 5000, "timestamp": "2026-11-05T11:37:11", "filename": "evil.exe",
+         "verdict": None},
+        {"id": "old", "sha256": SHA_A, "agent_pid": 4242, "timestamp": "2026-11-05T10:00:00", "filename": "evil.exe",
+         "verdict": None},
+        {"id": "other", "sha256": SHA_B, "agent_pid": 4242, "timestamp": "2026-11-04T10:00:00", "filename": "b.exe",
+         "verdict": None},
+        {"id": "lb", "sha256": SHA_A, "agent_pid": None, "timestamp": "2026-11-03T10:00:00", "filename": "evil.exe",
+         "verdict": None},
+        {"id": "nosha", "agent_pid": 4242, "timestamp": "2026-11-02T10:00:00", "filename": "old.exe", "verdict": None},
+    ])
+    real_save, saves = tdc._save_submissions, []
+
+    def save(subs):
+        saves.append(tdc.submissions_lock.locked())
+        real_save(subs)
+
+    monkeypatch.setattr(tdc, "_save_submissions", save)
+    _results_without_the_vm(tdc, monkeypatch)
+    computed = {"label": "MALICIOUS", "score": 4, "reasons": ["1 critical EDR alert(s)", "LitterBox score 8/10"]}
+    monkeypatch.setattr(tdc, "_compute_verdict", lambda results, alerts: dict(computed))
+
+    def verdict_of(query):
+        r = client.get("/api/detonation/results?" + query)
+        assert r.status_code == 200
+        return r.get_json()["verdict"]
+
+    def kept():
+        return {sub["id"]: sub["verdict"] for sub in load()}
+
+    malicious, suspicious, clean = ({"label": "MALICIOUS", "score": 4}, {"label": "SUSPICIOUS", "score": 2},
+                                    {"label": "CLEAN", "score": 0})
+    assert verdict_of(f"sha256={SHA_A}&pid=4242&filename=evil.exe") == computed
+    assert kept() == {"new": None, "old": malicious, "other": None, "lb": None, "nosha": None}, "kept on another submission"
+    assert saves == [True], "not written once, under the submissions lock"
+    verdict_of(f"sha256={SHA_A}&pid=4242&filename=evil.exe")
+    assert len(saves) == 1, "an unchanged verdict was written again"
+    computed.update(label="SUSPICIOUS", score=2, reasons=[])
+    verdict_of(f"sha256={SHA_A}&pid=4242")
+    assert kept()["old"] == suspicious and len(saves) == 2, "a new verdict did not replace the kept one"
+    # The newest run of the sample, the hash in any case
+    verdict_of(f"sha256={SHA_A.upper()}&pid=5000")
+    assert kept() == {"new": suspicious, "old": suspicious, "other": None, "lb": None, "nosha": None} and len(saves) == 3
+    # A PID no submission of the sample ran as: no run of the history, kept nowhere (not on the newest run)
+    computed.update(label="MALICIOUS", score=4)
+    verdict_of(f"sha256={SHA_A}&pid=9999")
+    assert kept() == {"new": suspicious, "old": suspicious, "other": None, "lb": None, "nosha": None} and len(saves) == 3, \
+        "a verdict computed for a PID no run had was kept on a run of the sample"
+    # Without a PID: the submission of the sample that ran without one (LitterBox only)
+    computed.update(label="CLEAN", score=0)
+    verdict_of(f"sha256={SHA_A}")
+    assert kept() == {"new": suspicious, "old": suspicious, "other": None, "lb": clean, "nosha": None} and len(saves) == 4
+    # Without a PID for a sample that only ran with one (tdc_detonation_results with a hash only): kept nowhere
+    verdict_of(f"sha256={SHA_B}")
+    assert kept()["other"] is None and len(saves) == 4, "a verdict computed without a PID was kept on a run with one"
+    # Nothing to keep it on: an unknown sample, or a PID without a sample (not even a submission without a hash)
+    verdict_of(f"sha256={'c3' * 32}&pid=4242")
+    verdict_of("pid=4242")
+    assert len(saves) == 4 and kept()["other"] is None and kept()["nosha"] is None, \
+        "a verdict was kept on a submission of another sample"
+
+
+def _disk_full_while_writing(tdc, monkeypatch):
+    """A write of submissions.json fails halfway, as on a full disk: part of
+    the list is written, then json.dump fails."""
+    def dump(obj, f, **kw):
+        f.write('[\n  {\n    "id": "')
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(tdc.json, "dump", dump)
+
+
+def _left_beside(tdc):
+    """What a write of submissions.json left next to it."""
+    folder = os.path.dirname(tdc.SUBMISSIONS_FILE)
+    return sorted(name for name in os.listdir(folder) if name.startswith("submissions") and name != "submissions.json")
+
+
+def test_detonation_results_survive_a_verdict_that_cannot_be_kept(tdc, client, monkeypatch, capsys):
+    """Keeping the verdict is a side effect: a submissions file that cannot be
+    written (the disk full halfway through the write) or read leaves the
+    results as they are and the file as it was, and says so in the log."""
+    _results_without_the_vm(tdc, monkeypatch)
+    load = _submissions_on_disk(tdc, monkeypatch, [
+        {"id": "s", "sha256": SHA_A, "agent_pid": 4242, "timestamp": "2026-11-05T10:00:00", "verdict": None}])
+    with open(tdc.SUBMISSIONS_FILE, "rb") as f:
+        before = f.read()
+    _disk_full_while_writing(tdc, monkeypatch)
+    r = client.get(f"/api/detonation/results?sha256={SHA_A}&pid=4242")
+    assert r.status_code == 200 and r.get_json()["verdict"]["label"] == "CLEAN"
+    out = capsys.readouterr().out
+    assert "[submissions]" in out and "No space left on device" in out, out
+    assert "No space left on device" not in r.get_data(as_text=True)
+    with open(tdc.SUBMISSIONS_FILE, "rb") as f:
+        assert f.read() == before, "a verdict that could not be kept emptied the submissions"
+    assert [sub["id"] for sub in load()] == ["s"] and _left_beside(tdc) == []
+
+    def unreadable():
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    monkeypatch.setattr(tdc, "_load_submissions", unreadable)
+    r = client.get(f"/api/detonation/results?sha256={SHA_A}&pid=4242")
+    assert r.status_code == 200 and r.get_json()["verdict"]["label"] == "CLEAN"
+    assert "[submissions]" in capsys.readouterr().out
+
+
+def test_a_submission_that_cannot_be_recorded_keeps_the_others(tdc, monkeypatch, capsys):
+    """A new submission whose write fails halfway (a full disk) keeps the
+    history as it was: the file is written beside it and put in its place
+    only once it is complete. The submit still answers with its entry; the
+    log says what failed."""
+    load = _submissions_on_disk(tdc, monkeypatch, [
+        {"id": "s", "sha256": SHA_A, "agent_pid": 4242, "timestamp": "2026-11-05T10:00:00", "verdict": None},
+        {"id": "t", "sha256": SHA_B, "agent_pid": 5000, "timestamp": "2026-11-04T10:00:00", "verdict": None}])
+    with open(tdc.SUBMISSIONS_FILE, "rb") as f:
+        before = f.read()
+    real_dump = tdc.json.dump
+    _disk_full_while_writing(tdc, monkeypatch)
+    entry = tdc._record_submission("new.exe", "c3" * 32, 10, "agent", {})
+    assert entry["sha256"] == "c3" * 32 and entry["filename"] == "new.exe"
+    out = capsys.readouterr().out
+    assert "[submissions]" in out and "No space left on device" in out, out
+    with open(tdc.SUBMISSIONS_FILE, "rb") as f:
+        assert f.read() == before, "a submission that could not be recorded took the others with it"
+    assert [sub["id"] for sub in load()] == ["s", "t"] and _left_beside(tdc) == []
+    # The disk has room again: the next submission joins the others
+    monkeypatch.setattr(tdc.json, "dump", real_dump)
+    tdc._record_submission("next.exe", "d4" * 32, 10, "agent", {})
+    assert [sub.get("filename") for sub in load()] == ["next.exe", None, None] and _left_beside(tdc) == []
+
+
+def test_a_submissions_file_another_program_holds_is_replaced_after_a_moment(tdc, monkeypatch):
+    """On Windows another program (the virus scanner, an indexer) holding
+    submissions.json for a moment fails putting the new file in its place
+    with PermissionError: the write tries again shortly. When the file stays
+    held it gives up: the error goes to its caller, the file stays as it
+    was, and nothing is left beside it."""
+    load = _submissions_on_disk(tdc, monkeypatch, [{"id": "s", "sha256": SHA_A, "verdict": None}])
+    real_replace, attempts, pauses = os.replace, [], []
+
+    def held(times):
+        def replace(src, dst):
+            attempts.append((os.path.basename(src), os.path.basename(dst)))
+            if len(attempts) <= times:
+                raise PermissionError(13, "The process cannot access the file because it is being used by another process")
+            real_replace(src, dst)
+        return replace
+
+    monkeypatch.setattr(tdc.time, "sleep", pauses.append)
+    monkeypatch.setattr(tdc.os, "replace", held(2))
+    tdc._save_submissions([{"id": "n"}])
+    assert [sub["id"] for sub in load()] == ["n"] and len(attempts) == 3 and len(pauses) == 2, (attempts, pauses)
+    assert set(attempts) == {("submissions.json.tmp", "submissions.json")} and _left_beside(tdc) == []
+    attempts.clear()
+    pauses.clear()
+    monkeypatch.setattr(tdc.os, "replace", held(10 ** 6))
+    with pytest.raises(PermissionError):
+        tdc._save_submissions([{"id": "m"}])
+    assert [sub["id"] for sub in load()] == ["n"] and _left_beside(tdc) == []
+    assert 3 <= len(attempts) <= 20 and 0 < sum(pauses) <= 2, (len(attempts), pauses)
+
+
+def test_the_readers_of_the_submissions_wait_for_a_write(tdc, monkeypatch):
+    """A write of submissions.json holds the submissions lock from reading the
+    list to putting the new file in its place; every reader takes it as
+    well: the samples of the graph, the detonation windows of the process
+    tree (which stays cached), the start of a submission for its pipes."""
+    seen = []
+
+    def load():
+        seen.append(tdc.submissions_lock.locked())
+        return [{"id": "s", "sha256": SHA_A, "agent_pid": 4242, "timestamp": "2026-11-05T10:00:00", "filename": "evil.exe"}]
+
+    monkeypatch.setattr(tdc, "_load_submissions", load)
+    tdc._build_samples({}, {}, {})
+    tdc.build_process_tree([])
+    tdc._pipe_submission_start("4242", SHA_A)
+    assert seen == [True, True, True], "a reader of the submissions does not wait for a write to end"
+    # The lock is not re-entrant: building the tree (which reads the file twice) does not wait for itself
+    with open(tdc.SUBMISSIONS_FILE, "w") as f:
+        json.dump(load(), f)
+    done = threading.Event()
+
+    def build():
+        tdc._store_alerts([make_alert(1, 4242, "2026-11-05T09:00:05Z", r"C:\x\evil.exe")])
+        done.set()
+
+    threading.Thread(target=build, daemon=True).start()
+    if not done.wait(10):
+        tdc.submissions_lock.release()
+        pytest.fail("building the process tree waits for the submissions lock it holds itself")
+
+
+def test_nothing_takes_the_submissions_lock_while_holding_it(app_module):
+    """submissions_lock is not re-entrant: nothing app.py calls while it holds
+    the lock takes it again (itself or through the functions it calls)."""
+    with open(app_module.__file__, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+
+    def locked(node):
+        return isinstance(node, ast.With) and any(
+            isinstance(item.context_expr, ast.Name) and item.context_expr.id == "submissions_lock" for item in node.items)
+
+    def calls(nodes):
+        return {n.func.id for node in nodes for n in ast.walk(node)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+
+    takers = {name for name, fn in functions.items() if any(locked(n) for n in ast.walk(fn))}
+    while True:
+        more = {name for name, fn in functions.items() if name not in takers and calls([fn]) & takers}
+        if not more:
+            break
+        takers |= more
+    assert {"_build_samples", "_agent_detonation_index", "_pipe_submission_start", "build_process_tree",
+            "_record_submission", "_store_submission_verdict"} <= takers
+    nested = {name: sorted(calls(block.body) & takers) for name, fn in functions.items()
+              for block in ast.walk(fn) if locked(block) and calls(block.body) & takers}
+    assert not nested, f"called while holding the submissions lock, and taking it: {nested}"
+
+
+def test_a_kept_verdict_leaves_the_process_tree_and_the_alert_list_as_they_were(tdc, client, monkeypatch):
+    """The process tree takes only when and as which PID and file each sample
+    ran from submissions.json: a verdict kept there neither builds the tree
+    again nor changes the ETag of the alert list (every open page would load
+    the whole list again). A new submission does both."""
+    load = _submissions_on_disk(tdc, monkeypatch, [
+        {"id": "s", "sha256": SHA_A, "agent_pid": 4242, "timestamp": "2026-10-20T10:00:00", "filename": "evil.exe",
+         "file_path": r"C:\Users\Public\Downloads\evil.exe", "verdict": None}])
+    builds = []
+    real_build = tdc.build_process_tree
+    monkeypatch.setattr(tdc, "build_process_tree", lambda alerts: builds.append(len(alerts)) or real_build(alerts))
+    alerts = [make_alert(1, 4242, "2026-10-20T08:00:05Z", r"C:\Users\Public\Downloads\evil.exe")]
+    stamp = [os.path.getmtime(tdc.SUBMISSIONS_FILE)]
+
+    def touched():
+        # A new modification time, as a write a second later gives it on any file system
+        stamp[0] += 10
+        os.utime(tdc.SUBMISSIONS_FILE, (stamp[0], stamp[0]))
+
+    def etag():
+        return client.get("/api/alerts").headers["ETag"]
+
+    tdc._store_alerts(alerts)
+    first = etag()
+    assert builds == [1]
+    tdc._store_submission_verdict(SHA_A, "4242", {"label": "MALICIOUS", "score": 4, "reasons": ["x"]})
+    assert load()[0]["verdict"] == {"label": "MALICIOUS", "score": 4}
+    touched()
+    tdc._store_alerts(alerts)
+    assert builds == [1] and etag() == first, "a kept verdict built the process tree again or changed the alert list's ETag"
+    # Another detonation: its window changes the tree
+    subs = load()
+    subs.insert(0, {"id": "t", "sha256": SHA_B, "agent_pid": 5000, "timestamp": "2026-10-21T10:00:00",
+                    "filename": "b.exe", "verdict": None})
+    with open(tdc.SUBMISSIONS_FILE, "w") as f:
+        json.dump(subs, f)
+    touched()
+    tdc._store_alerts(alerts)
+    assert builds == [1, 1] and etag() != first, "a new submission did not build the process tree again"
+    tdc._store_alerts(alerts)
+    assert builds == [1, 1], "an unchanged file built the tree again"

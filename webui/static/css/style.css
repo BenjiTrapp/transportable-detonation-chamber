@@ -66,6 +66,10 @@
     --c-amber-500: #f59e0b;
     --c-yellow-400: #facc15;
     --c-yellow-600: #ca8a04;
+    --c-lime-400: #a3e635;
+    --c-lime-400-rgb: 163, 230, 53;
+    --c-lime-600: #65a30d;
+    --c-lime-600-rgb: 101, 163, 13;
     --c-green-400: #4ade80;
     --c-green-400-rgb: 74, 222, 128;
     --c-teal-400: #2dd4bf;
@@ -85,9 +89,12 @@
     --c-slate-800: #1e293b;
     --c-slate-900: #0f172a;
     --c-slate-900-rgb: 15, 23, 42;
-    /* Steps between or below the Tailwind ones */
+    /* Steps between or below the Tailwind ones (sky-550: between sky-500
+       and sky-600, at the hue of sky-400) */
     --c-slate-650: #3b4a61;
     --c-amber-990: #1f1300;
+    --c-sky-550: #1d8ab7;
+    --c-sky-550-rgb: 29, 138, 183;
     /* Dark blues outside the Tailwind palette; a higher step is darker.
        800: primary buttons on hover; 900: file map canvases behind the
        structure regions; 950: text on sky buttons and graph badges;
@@ -153,6 +160,11 @@
     --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     --radius: 4px;
     --radius-lg: 8px;
+    /* Not a colour: the height of the Alerts tab's filter bar, which its
+       table head stands under; app.js (initAlertsTab) sets it on the head */
+    --alerts-bar-height: 0px;
+    /* The same for the Sysmon tab (initSysmonTab sets it on #sysmon-table) */
+    --sysmon-bar-height: 0px;
 }
 
 * {
@@ -5589,6 +5601,8 @@ body.hex-resizing {
 .scan-history-entry.history-clean { border-left-color: var(--accent-green); }
 .scan-history-entry.history-detected { border-left-color: var(--accent-red); background: rgba(var(--accent-red-rgb), 0.03); }
 .scan-history-entry.history-unknown { border-left-color: var(--c-amber-400); }
+/* A suspicious memory scan in the colour SCORE HISTORY gives it */
+.scan-history-entry.history-suspicious { border-left-color: var(--severity-medium); }
 .scan-history-time { color: var(--text-muted); font-size: 10px; min-width: 60px; }
 .scan-history-file { flex: 1; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .scan-history-tool { color: var(--text-muted); font-size: 10px; }
@@ -5596,6 +5610,7 @@ body.hex-resizing {
 .history-clean .scan-history-status { color: var(--accent-green); }
 .history-detected .scan-history-status { color: var(--accent-red); }
 .history-unknown .scan-history-status { color: var(--c-amber-400); }
+.history-suspicious .scan-history-status { color: var(--severity-medium); }
 
 .scan-history-empty { color: var(--text-muted); font-size: 11px; padding: 8px 10px; font-style: italic; }
 
@@ -7465,8 +7480,17 @@ option.etw-ch-inactive { color: var(--text-secondary); }
 /* --- Alerts tab: filter bar, severity chips (pressed: in the severity's
    colour) and one table of every alert. The layout is fixed and every cell
    stays on one line with an ellipsis, so a long rule or process name cannot
-   widen the table (the full text is in the cell's title). --- */
-.alerts-filters {
+   widen the table (the full text is in the cell's title). The tab scrolls as
+   a whole; the filter bar, with a row of chips for the filters the charts
+   set, stands at its top, the table head right under it
+   (--alerts-bar-height: initAlertsTab keeps it at the bar's height). The
+   Sysmon tab's filter bar stands at the top of its tab the same way. --- */
+#tab-alerts { overflow-x: hidden; overflow-y: auto; }
+.alerts-filters,
+.sysmon-filters {
+    position: sticky;
+    top: 0;
+    z-index: 2;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -7507,14 +7531,37 @@ option.etw-ch-inactive { color: var(--text-secondary); }
 .alerts-sev-chip.info[aria-pressed="true"] { color: var(--severity-info); background: rgba(var(--severity-info-rgb), 0.15); border-color: rgba(var(--severity-info-rgb), 0.5); }
 .filter-input.alerts-filter-text { flex: 1 1 240px; width: auto; max-width: 420px; }
 .alerts-count { margin-left: auto; font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); white-space: nowrap; }
-.alerts-table-wrap { flex: 1; min-height: 0; overflow: auto; padding: 0 20px 12px; }
+.alerts-active-filters { display: flex; flex: 1 0 100%; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.alerts-active-filters[hidden] { display: none; }
+.alerts-filter-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    max-width: 100%;
+    padding: 3px 9px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.2px;
+    color: var(--text-primary);
+    background: rgba(var(--accent-cyan-rgb), 0.08);
+    border: 1px solid rgba(var(--accent-cyan-rgb), 0.35);
+    border-radius: 10px;
+    cursor: pointer;
+    transition: all 0.15s;
+}
+.alerts-filter-chip:hover { background: var(--bg-card-hover); border-color: var(--accent-cyan); }
+.alerts-filter-chip-x { font-size: 12px; font-weight: 700; line-height: 1; color: var(--accent-cyan); }
+.alerts-filter-chip:hover .alerts-filter-chip-x { color: var(--accent-red); }
+.alerts-filter-chip-kind { color: var(--text-muted); white-space: nowrap; }
+.alerts-filter-chip-value { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.alerts-table-wrap { flex: 1 0 auto; padding: 0 20px 12px; }
 .alerts-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 12px; }
 .alerts-col-time { width: 150px; }
 .alerts-col-sev { width: 92px; }
 .alerts-col-engine { width: 84px; }
 .alerts-col-rule { width: 27%; }
 .alerts-col-proc { width: 17%; }
-.alerts-table thead th { position: sticky; top: 0; z-index: 1; padding: 8px 10px; text-align: left; font-size: 10px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); background: var(--bg-primary); border-bottom: 1px solid var(--border-primary); }
+.alerts-table thead th { position: sticky; top: var(--alerts-bar-height); z-index: 1; padding: 8px 10px; text-align: left; font-size: 10px; font-weight: 600; text-transform: uppercase; color: var(--text-muted); background: var(--bg-primary); border-bottom: 1px solid var(--border-primary); }
 .alerts-table td { padding: 6px 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-secondary); border-bottom: 1px solid var(--border-primary); }
 .alerts-table .alerts-row { cursor: pointer; transition: background 0.1s; }
 .alerts-table .alerts-row:hover { background: var(--bg-card-hover); }
@@ -7528,6 +7575,121 @@ option.etw-ch-inactive { color: var(--text-secondary); }
 .alerts-proc-pid { margin-left: 4px; font-family: var(--font-mono); font-size: 10px; color: var(--text-muted); }
 .alerts-table .alerts-limit-row td { white-space: normal; text-align: center; font-size: 11px; color: var(--c-amber-400); background: rgba(var(--c-amber-400-rgb), 0.08); }
 .alerts-table .alerts-empty-row td { white-space: normal; text-align: center; padding: 28px 10px; color: var(--text-muted); }
+/* The charts above the filter bar (renderAlertsCharts in app.js): SEVERITY,
+   OVER TIME (twice as wide) and ENGINE in a row, FLOW below; a pie's card
+   keeps the room for its pie and legend. A chart keeps its height when it
+   shows a hint instead. They scroll away under the filter bar. */
+.alerts-charts {
+    display: flex;
+    flex: 0 0 auto;
+    flex-direction: column;
+    gap: 10px;
+    padding: 12px 20px;
+}
+.alerts-chart-strip {
+    display: grid;
+    grid-template-columns: minmax(310px, 1fr) minmax(0, 2fr) minmax(310px, 1fr);
+    gap: 10px;
+}
+.alerts-chart-view {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    min-width: 0;
+    min-height: 120px;
+}
+.alerts-chart-note {
+    margin-top: 4px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-muted);
+}
+/* The table of FLOW: rules and processes both have long names, so its two
+   name columns share the width (else the targets kept a few letters) */
+#alerts-flow-table .view-table .view-table-text {
+    width: 50%;
+}
+
+/* --- Sysmon tab: as the Alerts tab, it scrolls as a whole, the table has
+   no scrolling of its own and its head stands right under the filter bar
+   (--sysmon-bar-height: initSysmonTab keeps it at the bar's height; the
+   LitterBox files, the same table class, keep their own head). A table
+   wider than the tab scrolls sideways with it, so no column is cut off.
+   Above the bar, EVENTS OVER TIME beside PROCESS → EVENT TYPE
+   (renderSysmonCharts in app.js), both as high as the Sankey needs (app.js
+   sets the height of their areas): a chart and its table view lie over the
+   same area, the table scrolls in it. The bars sit beside the legend of the
+   event types and do not select their text (Shift+click). --- */
+#tab-sysmon { overflow-x: auto; overflow-y: auto; }
+#sysmon-table { flex: 1 0 auto; overflow: visible; }
+#sysmon-table .sysmon-events-table thead th { top: var(--sysmon-bar-height); z-index: 1; }
+.sysmon-charts {
+    display: grid;
+    flex: 0 0 auto;
+    grid-template-columns: minmax(0, 3fr) minmax(320px, 2fr);
+    gap: 10px;
+    padding: 12px 20px;
+}
+.sysmon-chart-area {
+    position: relative;
+    height: 120px;
+}
+.sysmon-chart-view,
+.sysmon-chart-table {
+    position: absolute;
+    inset: 0;
+}
+.sysmon-chart-view {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    min-width: 0;
+}
+.sysmon-chart-table {
+    overflow: auto;
+}
+/* Where its two scroll bars meet, the card shows through (not the browser's white corner) */
+.sysmon-chart-table::-webkit-scrollbar-corner {
+    background: transparent;
+}
+.sysmon-chart-table .view-table th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+/* The event types of the Sankey's table keep their (short) names whole: the images give way */
+#sysmon-flow-table .view-table td:nth-child(2) {
+    width: auto;
+    max-width: none;
+}
+.sysmon-time-view {
+    flex-direction: row;
+    align-items: center;
+    gap: 12px;
+    user-select: none;
+}
+.sysmon-time-plot {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    justify-content: center;
+    align-self: stretch;
+    min-width: 0;
+}
+.sysmon-time-legend {
+    flex: 0 0 200px;
+    max-height: 100%;
+    overflow-y: auto;
+}
+.sysmon-time-legend:empty {
+    display: none;
+}
+.sysmon-chart-note {
+    margin-top: 4px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-muted);
+}
 
 /* --- (i) explanations and sortable tables (both themes) ---
    A heading with data-info gets a small round (i) after its text; its text
@@ -7819,4 +7981,564 @@ table[data-sortable] > thead > tr > th:focus-visible {
 .rtrace-event-table-header > .rtrace-col:focus-visible {
     outline: 1px solid var(--accent-cyan);
     outline-offset: -1px;
+}
+
+/* --- Charts (both themes) ---
+   The SVG of the chart building blocks (CHARTS in app.js): the data colours
+   come inline as var(--...), the other parts are styled here. A card has a
+   head (title with (i), tools such as CHART / TABLE on the right) and its
+   chart; a donut or pie sits beside its legend in .chart-split. A view that
+   filters by a click on its chart marks it .chart-clickable. */
+.chart-card {
+    min-width: 0;
+    padding: 10px 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius-lg);
+}
+.chart-card-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 16px;
+    margin-bottom: 8px;
+}
+.chart-card-title {
+    margin: 0;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1.5px;
+    color: var(--text-muted);
+}
+.chart-card-tools {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: auto;
+}
+.chart-split {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+}
+.chart-split > .chart-svg {
+    flex-shrink: 0;
+}
+.chart-svg {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    overflow: visible;
+}
+.chart-svg text {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    fill: var(--text-muted);
+}
+.chart-grid {
+    stroke: var(--border-primary);
+    stroke-width: 1;
+    shape-rendering: crispEdges;
+}
+.chart-axis {
+    stroke: var(--border-accent);
+    stroke-width: 1;
+    shape-rendering: crispEdges;
+}
+.chart-bar {
+    shape-rendering: crispEdges;
+}
+.chart-bin:hover .chart-hit,
+.chart-slot:hover .chart-hit {
+    fill: rgba(var(--text-secondary-rgb), 0.08);
+}
+.chart-selection {
+    fill: rgba(var(--accent-cyan-rgb), 0.08);
+    stroke: var(--accent-cyan);
+    stroke-dasharray: 3 3;
+    pointer-events: none;
+}
+.chart-seg,
+.chart-point {
+    transition: opacity 0.15s;
+}
+.chart-seg:hover,
+.chart-point:hover {
+    opacity: 0.8;
+}
+/* Slices apart by a thin line in the colour of the card */
+.chart-slice {
+    stroke: var(--bg-card);
+    stroke-width: 1.5;
+}
+.chart-svg .chart-center-label {
+    font-family: var(--font-sans);
+    font-size: 18px;
+    font-weight: 600;
+    fill: var(--text-primary);
+}
+.chart-svg .chart-center-sub {
+    letter-spacing: 1px;
+}
+.chart-spark-area {
+    fill-opacity: 0.15;
+}
+.chart-spark-line {
+    fill: none;
+    stroke-width: 1.6;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+}
+.chart-threshold {
+    stroke: var(--border-dashed);
+    stroke-width: 1;
+}
+/* The lane "no score" under the axis of the score chart */
+.chart-lane {
+    fill: rgba(var(--text-secondary-rgb), 0.05);
+}
+.chart-point {
+    stroke: var(--bg-card);
+    stroke-width: 1;
+}
+/* Sankey: translucent bands in the colour of their source, nodes with their
+   name (bright) and value (muted); a name over a band keeps a rim in the
+   colour of the card */
+.sankey-link {
+    fill-opacity: 0.32;
+    transition: fill-opacity 0.15s;
+}
+.sankey-link:hover {
+    fill-opacity: 0.6;
+}
+.sankey-bar {
+    transition: opacity 0.15s;
+}
+.sankey-node:hover .sankey-bar {
+    opacity: 0.8;
+}
+.chart-svg .sankey-label {
+    font-size: 10px;
+    fill: var(--text-primary);
+    paint-order: stroke;
+    stroke: var(--bg-card);
+    stroke-width: 3px;
+    stroke-linejoin: round;
+}
+.chart-svg .sankey-value {
+    fill: var(--text-muted);
+}
+.chart-clickable .chart-seg,
+.chart-clickable .chart-bin,
+.chart-clickable .chart-slot,
+.chart-clickable .chart-point,
+.chart-clickable .chart-legend-row,
+.chart-clickable .sankey-link,
+.chart-clickable .sankey-node {
+    cursor: pointer;
+}
+.chart-clickable .chart-legend-row:hover {
+    background: var(--bg-card-hover);
+}
+/* A part a click sets no filter for ("other rules", ...) keeps the arrow */
+.chart-clickable .chart-inert {
+    cursor: default;
+}
+.chart-clickable .chart-legend-row.chart-inert:hover {
+    background: transparent;
+}
+.chart-clickable .chart-bin.chart-inert:hover .chart-hit {
+    fill: transparent;
+}
+/* LINEAR of a Sankey (a .view-toggle), pressed: in the accent colour */
+.chart-scale-toggle[aria-pressed="true"] {
+    color: var(--accent-cyan);
+    background: rgba(var(--accent-cyan-rgb), 0.12);
+    border-color: var(--accent-cyan);
+}
+/* Legend: colour, name (cut with an ellipsis; the row's title has it in full), count, share */
+.chart-legend {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+    font-family: var(--font-mono);
+    font-size: 10px;
+}
+.chart-legend-row {
+    display: grid;
+    grid-template-columns: 9px minmax(48px, 1fr) auto 44px;
+    align-items: center;
+    gap: 6px;
+    padding: 1px 2px;
+    border-radius: 3px;
+}
+.chart-legend-swatch {
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
+}
+.chart-legend-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-secondary);
+}
+.chart-legend-count {
+    font-weight: 600;
+    text-align: right;
+    color: var(--text-primary);
+}
+.chart-legend-pct {
+    text-align: right;
+    color: var(--text-muted);
+}
+/* Instead of a chart without data */
+.chart-empty {
+    padding: 24px 12px;
+    font-size: 11px;
+    text-align: center;
+    color: var(--text-muted);
+}
+
+/* --- Dashboard charts (renderDashboardCharts in app.js) ---
+   Between the tiles and the service cards: ALERT ACTIVITY (twice as wide)
+   and beside it SEVERITY above CATEGORY, whose cards give the row its
+   height. The bars fill the room between the head of their card and its
+   note: the chart and its table view lie over that room (the table scrolls
+   in it), so neither stretches the row. The switch of the range is a row of
+   buttons, the preset in effect pressed; a range drawn across the bars is
+   marked like a selection (pointer-events: none) and named by a chip. TOTAL
+   ALERTS and PROCESSES TRACKED show their sparkline under their tags. */
+.dashboard-charts {
+    display: grid;
+    grid-template-columns: minmax(0, 2fr) minmax(300px, 1fr);
+    gap: 12px;
+    padding: 16px 20px 0;
+}
+.dashboard-bars-card {
+    display: flex;
+    flex-direction: column;
+}
+.dashboard-bars-area {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 180px;
+}
+.dashboard-bars-view,
+.dashboard-bars-table {
+    position: absolute;
+    inset: 0;
+}
+.dashboard-bars-view {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    user-select: none;
+    touch-action: pan-y;            /* a finger draws a range across, and still scrolls the page */
+}
+.dashboard-bars-table {
+    overflow: auto;
+}
+.dashboard-bars-table .view-table th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+/* While a new range is drawn, the one it replaces is not marked */
+.dashboard-bars-view.is-brushing .chart-selection:not(.chart-brush) {
+    display: none;
+}
+.dashboard-bars-note {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 2px 12px;
+    min-height: 14px;
+    margin-top: 6px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-muted);
+}
+.dashboard-donuts {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-width: 0;
+}
+.dashboard-donuts > .chart-card {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+}
+.dashboard-donut-view {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    justify-content: center;
+}
+/* A count stays near its name when the card is wide */
+.dashboard-donut-view .chart-legend {
+    max-width: 300px;
+}
+.chart-range {
+    display: inline-flex;
+    flex-shrink: 0;
+    overflow: hidden;
+    border: 1px solid var(--border-accent);
+    border-radius: 3px;
+}
+.chart-range-btn {
+    height: 14px;
+    padding: 0 6px;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    line-height: 1;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    background: transparent;
+    border: 0;
+    border-left: 1px solid var(--border-accent);
+    cursor: pointer;
+    transition: color 0.15s, background-color 0.15s;
+}
+.chart-range-btn:first-child {
+    border-left: 0;
+}
+.chart-range-btn:hover {
+    color: var(--accent-cyan);
+}
+.chart-range-btn[aria-pressed="true"] {
+    color: var(--accent-cyan);
+    background: rgba(var(--accent-cyan-rgb), 0.15);
+}
+.chart-range-btn:focus-visible {
+    outline: 1px solid var(--accent-cyan);
+    outline-offset: -1px;
+}
+.dashboard-range-chip {
+    display: inline-flex;
+    min-width: 0;
+}
+.dashboard-range-chip[hidden] {
+    display: none;
+}
+.dashboard-range-chip .alerts-filter-chip {
+    padding: 1px 8px;
+}
+.stat-spark {
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    gap: 6px;
+    margin-top: 8px;
+}
+.stat-spark:empty {
+    display: none;
+}
+/* In a narrow tile the line gets shorter, its label stays on one line */
+.stat-spark > .chart-svg {
+    flex: 0 1 auto;
+    min-width: 0;
+}
+.stat-spark-label {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    white-space: nowrap;
+    color: var(--text-muted);
+}
+
+/* --- SCORE HISTORY of the ThreatScan tab (renderScoreHistory in app.js) ---
+   Above the list of the scan history: the points beside the legend of their
+   verdicts. The chart and its table view lie over the same area (the table
+   scrolls in it), so the list does not move when the view changes; without
+   scans the area is low. The entry of the list a point leads to is marked
+   for 1.5 s (revealHistoryEntry). */
+.score-history-card {
+    margin-bottom: 10px;
+}
+.score-history-area {
+    position: relative;
+    height: 172px;
+}
+.score-history-area.is-empty {
+    height: 72px;
+}
+.score-history-view,
+.score-history-table {
+    position: absolute;
+    inset: 0;
+}
+.score-history-view {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+.score-history-plot {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    justify-content: center;
+    align-self: stretch;
+    min-width: 0;
+}
+.score-history-legend {
+    flex: 0 0 220px;
+    max-height: 100%;
+    overflow-y: auto;
+}
+.score-history-legend:empty {
+    display: none;
+}
+.score-history-table {
+    overflow: auto;
+}
+/* Where its two scroll bars meet, the card shows through (not the browser's white corner) */
+.score-history-table::-webkit-scrollbar-corner {
+    background: transparent;
+}
+.score-history-table .view-table th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+.scan-history-entry.reveal-flash {
+    animation-duration: 1.5s;
+}
+
+/* --- VERDICT HISTORY of the Submit tab (renderSubmissionVerdicts in app.js) ---
+   Between the head of the submission history and its list, set in as the
+   head is: a bar per submission beside the legend of their verdicts. The
+   chart and its table view lie over the same area (the table scrolls in it),
+   so the list does not move when the view changes; without submissions the
+   area is low. */
+.submission-verdicts-card {
+    margin: 0 16px 12px;
+}
+.submission-verdicts-area {
+    position: relative;
+    height: 172px;
+}
+.submission-verdicts-area.is-empty {
+    height: 72px;
+}
+.submission-verdicts-view,
+.submission-verdicts-table {
+    position: absolute;
+    inset: 0;
+}
+.submission-verdicts-view {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+.submission-verdicts-plot {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    justify-content: center;
+    align-self: stretch;
+    min-width: 0;
+}
+.submission-verdicts-legend {
+    flex: 0 0 220px;
+    max-height: 100%;
+    overflow-y: auto;
+}
+.submission-verdicts-legend:empty {
+    display: none;
+}
+.submission-verdicts-table {
+    overflow: auto;
+}
+/* Where its two scroll bars meet, the card shows through (not the browser's white corner) */
+.submission-verdicts-table::-webkit-scrollbar-corner {
+    background: transparent;
+}
+.submission-verdicts-table .view-table th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+
+/* --- ACTIVITY MIX of a process in the graph detail (graphActivityMixHtml in app.js) ---
+   Under the Activity grid: a head like the panel's other sections, with the
+   (i) after the title and CHART / TABLE on the right; the donut beside its
+   legend, or the table (it scrolls in a bounded height); then the process's
+   alerts as a number of their own, in the colour of critical when it has
+   any. */
+.gd-mix-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.gd-mix-head .view-toggle {
+    margin-left: auto;
+}
+.gd-mix-view .chart-split {
+    gap: 10px;
+}
+.gd-mix-view .chart-empty {
+    padding: 10px 6px;
+}
+.gd-mix-table {
+    max-height: 180px;
+    overflow: auto;
+}
+.gd-mix-table::-webkit-scrollbar-corner {
+    background: transparent;
+}
+.gd-mix-threats {
+    margin-top: 6px;
+    font-size: 9px;
+    letter-spacing: 0.3px;
+    color: var(--text-muted);
+}
+.gd-mix-threats-label {
+    font-weight: 700;
+    text-transform: uppercase;
+}
+.gd-mix-threats-num {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+.gd-mix-threats.has-threats .gd-mix-threats-num {
+    color: var(--severity-critical);
+}
+
+/* --- VERDICT FLOW of the detonation results (verdictFlowHtml in app.js) ---
+   Under the verdict, in the Submit tab and in the detail panel: the Sankey
+   for the width of its card, or its table view, which scrolls in a bounded
+   height with its head standing. */
+.verdict-flow-card {
+    margin: 8px 0;
+}
+.verdict-flow-view {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    min-width: 0;
+}
+.verdict-flow-table {
+    max-height: 300px;
+    overflow: auto;
+}
+/* Where its two scroll bars meet, the card shows through (not the browser's white corner) */
+.verdict-flow-table::-webkit-scrollbar-corner {
+    background: transparent;
+}
+.verdict-flow-table .view-table th {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+}
+/* The targets (kinds, counted or not) keep their short names whole: the process names give way */
+.verdict-flow-table .view-table td:nth-child(2) {
+    width: auto;
+    max-width: none;
 }

@@ -376,11 +376,16 @@ document.addEventListener('DOMContentLoaded', () => {
     initTabs();
     initTopbar();
     initCardControls();
+    initAlertsTab();
+    initSysmonTab();
+    initDashboardCharts();
     initUpload();
     initHexDropZone();
     initHexResizeHandle();
     initFileMapDropZone();
     initThreatScan();
+    initScoreHistory();
+    initSubmissionVerdicts();
     initGraphControls();
     initRtraceTabs();
     refreshAll();
@@ -416,6 +421,9 @@ function switchTab(tabName) {
     document.getElementById(`tab-${tabName}`).classList.add('active');
     // Cyberpunk: a tab picked from the "…" menu takes a place in the top bar.
     updateTabOverflow();
+    if (tabName === 'dashboard') {
+        renderDashboardCharts();
+    }
     if (tabName === 'alerts') {
         renderAlertsTab();
     }
@@ -589,6 +597,10 @@ async function _refreshAlertsOnce() {
                 // from (tens of MB) and keeps its filters, so the place in it stays.
                 _alertsTabShown = { filterKey: _alertsTabShown.filterKey };
             }
+            // An open dashboard counts the new alerts in its tiles and charts now, not at its next
+            // refresh; a hidden one lets go of the lists it counted, as the table above does
+            if (state.activeTab === 'dashboard') renderDashboard();
+            else releaseDashboardCounts();
         } else if (resp.status >= 500) {
             showToast('error', 'Alert fetch failed', `Server error ${resp.status}`, 5000);
         }
@@ -677,6 +689,8 @@ function renderDashboard() {
         // Each tile opens what it counts; a severity count opens the Alerts tab
         // filtered by it (and not the tile's whole list as well). A refresh
         // renders the tiles again: the one with the keyboard focus keeps it.
+        // TOTAL ALERTS and PROCESSES TRACKED have a slot for their sparkline
+        // (renderDashboardCharts), the other tiles have no history to show.
         const active = document.activeElement;
         const focusedTile = active && active.closest ? active.closest('#dashboard-stats .stat-card')?.dataset.tile : null;
         statsContainer.innerHTML = `
@@ -688,11 +702,13 @@ function renderDashboard() {
                     ${medSev ? `<span class="stat-tag med stat-tag-link" title="Show the medium alerts" onclick="event.stopPropagation(); openAlertsTab({severities: ['medium']})">${medSev} med</span>` : ''}
                     ${lowSev ? `<span class="stat-tag low stat-tag-link" title="Show the low and info alerts" onclick="event.stopPropagation(); openAlertsTab({severities: ['low', 'info']})">${lowSev} low</span>` : ''}
                 </div>
+                <div class="stat-spark" id="dashboard-alerts-spark" aria-hidden="true"></div>
             </div>
             <div class="stat-card stat-processes" data-tile="processes" role="button" tabindex="0" onclick="revealProcessList()" onkeydown="onTileKey(event, this)">
                 <div class="stat-value">${processCount}</div>
                 <div class="stat-label">PROCESSES TRACKED</div>
                 <div class="stat-breakdown"><span class="stat-tag dim">via ETW telemetry</span></div>
+                <div class="stat-spark" id="dashboard-processes-spark" aria-hidden="true"></div>
             </div>
             <div class="stat-card stat-services" data-tile="services" role="button" tabindex="0" onclick="revealSection('dashboard-grid')" onkeydown="onTileKey(event, this)">
                 <div class="stat-value">${servicesOnline}<span class="stat-value-sub">/${servicesTotal}</span></div>
@@ -934,6 +950,429 @@ function renderDashboard() {
             activityFeed.innerHTML = html;
         }
     }
+
+    // --- Alert activity, the donuts and the sparklines of the tiles ---
+    renderDashboardCharts();
+}
+
+// --- The charts of the dashboard ---
+// Between the tiles and the service cards: ALERT ACTIVITY, the alerts per
+// hour, day or week stacked by severity over the range of its switch (24H,
+// 7D, 30D or ALL), and beside it the donuts SEVERITY and CATEGORY of that
+// range. A range drawn across the bars narrows the donuts to it (a chip
+// names it, its × takes it off); a bar opens the Alerts tab at its period, a
+// segment at its severity or category within the range, so the table there
+// lists what the part counted. TOTAL ALERTS and PROCESSES TRACKED show their
+// last 45 days as sparklines. Each part counts again only when what it is
+// counted from changed (the alerts, the process list, the range), and
+// nothing is counted while the dashboard is hidden; alerts without a time or
+// with one no clock can have had are in no bar, a note counts them.
+const DASHBOARD_RANGES = new Map([['24h', 86400000], ['7d', 7 * 86400000], ['30d', 30 * 86400000]]);
+const DASHBOARD_SPARK_DAYS = 45;
+// What the donuts count: a preset of the switch ('24h', '7d', '30d' or
+// 'all', the default) or a range drawn across the bars ('custom'); from / to
+// in epoch ms, from included and to not, null for an open end. A preset runs
+// from its start on (to null), so the newest alerts are in it.
+const dashboardRange = { preset: 'all', from: null, to: null };
+// What the bars span: the preset last chosen (a range drawn across them leaves it)
+const dashboardBarsRange = { preset: 'all', from: null };
+// Each part's counts with the inputs they were counted from: {inputs, value}
+const _dashboardMemo = { bars: null, donuts: null, sparks: null };
+// What is on screen: the counts each part was drawn from, the range of the
+// switch and the chip, the range the bars mark ('' for none) and their size
+const _dashboardDrawn = { bars: null, donuts: null, sparks: null, range: '', marked: '', size: null };
+// The press on the bars while it lasts ({pointerId, x, first, last, moved,
+// svg, bins, pressed}: where it began, the bars it spans, whether it draws a
+// range, the bars on screen then and the bar pressed); after its release,
+// until the click of that release (it comes in the same task, if at all),
+// what that click does: {drew, pressed}
+let _dashboardBrush = null;
+let _dashboardReleased = null;
+
+// The switch: a preset from now on ('all', and a name it does not know:
+// every alert), or a range drawn across the bars, setDashboardRange('custom',
+// from, to) in epoch ms, `to` after `from`; anything else changes nothing
+function setDashboardRange(preset, from, to) {
+    if (preset === 'custom') {
+        const start = _alertsTimeBound(from), end = _alertsTimeBound(to);
+        if (start === null || end === null || !(end > start)) return;
+        Object.assign(dashboardRange, { preset: 'custom', from: start, to: end });
+    } else {
+        const name = DASHBOARD_RANGES.has(preset) ? preset : 'all';
+        const start = name === 'all' ? null : Date.now() - DASHBOARD_RANGES.get(name);
+        Object.assign(dashboardRange, { preset: name, from: start, to: null });
+        Object.assign(dashboardBarsRange, { preset: name, from: start });
+    }
+    renderDashboardCharts();
+}
+
+// Draws what changed: renderDashboard calls it after writing the tiles (every
+// refresh, and with new alerts), switchTab when the dashboard is shown again
+function renderDashboardCharts() {
+    if (state.activeTab !== 'dashboard' || !document.getElementById('dashboard-charts')) return;
+    for (const id of ['dashboard-alerts', 'dashboard-severity', 'dashboard-category']) {
+        // Written once: a refresh keeps the switch (and the keyboard focus on it)
+        const slot = document.getElementById(`${id}-toggle`);
+        if (slot && !slot.firstElementChild) slot.innerHTML = viewToggleHtml(id);
+    }
+    const counted = _dashboardCount(Date.now());
+    const drawn = _dashboardDrawn;
+    _drawDashboardSparks(counted.sparks);
+    _drawDashboardRange();
+    if (drawn.donuts !== counted.donuts) {
+        drawn.donuts = counted.donuts;
+        _drawDashboardDonuts(counted.donuts);
+    }
+    // While a range is drawn across the bars, they stay as they are
+    if (_dashboardBrush) return;
+    const size = _dashboardBarsSize();
+    const marked = dashboardRange.preset === 'custom' ? `${dashboardRange.from}-${dashboardRange.to}` : '';
+    if (drawn.bars === counted.bars && drawn.marked === marked
+        && (!size.width || (drawn.size && size.width === drawn.size.width && size.height === drawn.size.height))) return;
+    Object.assign(drawn, { bars: counted.bars, marked }, size.width && size.height ? { size } : {});
+    _drawDashboardBars(drawn);
+}
+
+// The counts of the charts, each part's again only when its inputs changed:
+// the bars from the alerts and the span of the bars, the donuts from the
+// alerts and the range, the sparklines from the alerts, the process list and
+// the day it is. A range drawn across the bars that they no longer reach (the
+// alerts under it are gone) is taken off: the chip, the mark and the donuts
+// name no range the bars do not show.
+function _dashboardCount(now) {
+    _dashboardFollowTheClock(now);
+    const alerts = state.alerts || [];
+    const memo = (name, inputs, count) => {
+        const last = _dashboardMemo[name];
+        if (!last || last.inputs.some((input, i) => input !== inputs[i])) _dashboardMemo[name] = { inputs, value: count() };
+        return _dashboardMemo[name].value;
+    };
+    const { preset, from } = dashboardBarsRange;
+    const span = DASHBOARD_RANGES.get(preset);
+    // A preset's bars reach up to now: its hours or days without alerts are bars too
+    const bars = memo('bars', [alerts, preset, from], () => alertSeverityBins(from === null ? alerts : filterAlerts(alerts, { from }),
+                                                                               { from, until: span ? from + span : null, now }));
+    const { bins } = bars;
+    if (dashboardRange.preset === 'custom' && (!bins.length || dashboardRange.to <= bins[0].start
+                                               || dashboardRange.from >= bins[bins.length - 1].end)) {
+        Object.assign(dashboardRange, { preset, from, to: null });
+    }
+    return {
+        bars,
+        donuts: memo('donuts', [alerts, dashboardRange.preset, dashboardRange.from, dashboardRange.to], () => {
+            const matches = filterAlerts(alerts, { from: dashboardRange.from, to: dashboardRange.to });
+            return { total: matches.length, severity: alertsSeverityItems(matches), category: dashboardCategoryItems(matches) };
+        }),
+        sparks: memo('sparks', [alerts, state.processes, _chartPeriodStart(now, 'day')],
+                     () => _dashboardSparkCounts(alerts, state.processes, now)),
+    };
+}
+
+// A preset runs up to now: its start follows the clock by the minute. A
+// range drawn across its bars holds them where they are, so the range stays
+// on them (the preset starts from now again when the range is taken off).
+function _dashboardFollowTheClock(now) {
+    const span = DASHBOARD_RANGES.get(dashboardBarsRange.preset);
+    if (!span || dashboardRange.preset === 'custom' || Math.abs(now - span - dashboardBarsRange.from) < 60000) return;
+    dashboardRange.from = dashboardBarsRange.from = now - span;
+}
+
+// While the dashboard is hidden: it lets go of the lists it counted (tens of
+// MB of alerts), as the Alerts tab does; shown again, it counts those of then
+function releaseDashboardCounts() {
+    for (const name of Object.keys(_dashboardMemo)) _dashboardMemo[name] = null;
+}
+
+// TOTAL ALERTS and PROCESSES TRACKED: the alerts, and the processes first
+// seen, per local day of the last 45 days (today the last), oldest first
+function _dashboardSparkCounts(alerts, processes, now) {
+    const today = _chartPeriodStart(now, 'day');
+    const first = new Date(today);
+    first.setDate(first.getDate() - (DASHBOARD_SPARK_DAYS - 1));
+    const days = { from: _chartPeriodStart(first.getTime(), 'day'), to: _chartPeriodNext(today, 'day') };
+    const perDay = (items, time) => binByTime(items, { ...days, time }).bins.map(bin => bin.total);
+    return {
+        alerts: perDay(alerts, alert => Date.parse(alert?.timestamp)),
+        processes: perDay(Object.values(processes || {}), proc => Date.parse(proc?.first_seen)),
+    };
+}
+
+// The segments of CATEGORY: the alerts per category (alertCategory, "other"
+// for alerts without one), the six most frequent on their own, the rest
+// summed up as "other categories": key '', no filter (it stands for several),
+// `kinds` the number it sums up. A category keeps its colour whatever the
+// range, that of its rank among all alerts; the muted one is the rest's.
+function dashboardCategoryItems(matches) {
+    const counts = countBy(matches, alertCategory);
+    const { keep } = topWithOther(counts, 6, '');
+    const rank = new Map(countBy((state.alerts || []).filter(Boolean), alertCategory).map(({ key }, i) => [key, i]));
+    const items = counts.filter(({ key }) => keep.has(key)).map(({ key, count }) => ({
+        key, label: key, value: count, color: CHART_PALETTE[(rank.has(key) ? rank.get(key) : rank.size) % (CHART_PALETTE.length - 1)],
+    }));
+    const rest = counts.filter(({ key }) => !keep.has(key));
+    if (rest.length) {
+        items.push({ key: '', label: 'other categories', value: rest.reduce((sum, c) => sum + c.count, 0),
+                     color: 'var(--text-muted)', kinds: rest.length });
+    }
+    return items;
+}
+
+// The sparklines into the slots of their tiles, which renderDashboard writes
+// again on every refresh (empty); a slot that shows the counts already is left
+function _drawDashboardSparks(sparks) {
+    const tiles = [['alerts', 'var(--accent-pink)', 'Alerts'], ['processes', 'var(--accent-cyan)', 'Processes first seen']];
+    for (const [kind, color, what] of tiles) {
+        const slot = document.getElementById(`dashboard-${kind}-spark`);
+        if (!slot || (slot.firstElementChild && _dashboardDrawn.sparks === sparks)) continue;
+        const values = sparks[kind];
+        slot.setAttribute('title', `${what} per day over the last ${DASHBOARD_SPARK_DAYS} days: `
+            + `${_chartNumber(values.reduce((sum, n) => sum + n, 0))} in all`);
+        slot.innerHTML = sparklineSvg(values, { width: 120, height: 26, color })
+            + `<span class="stat-spark-label">${DASHBOARD_SPARK_DAYS} days</span>`;
+    }
+    _dashboardDrawn.sparks = sparks;
+}
+
+// ALERT ACTIVITY from what renderDashboardCharts counted: the bars for the
+// size of their card, a range drawn across them marked, a bar without alerts
+// inert; under them how to use them and the alerts in no bar; the table view
+function _drawDashboardBars(drawn) {
+    const view = document.getElementById('dashboard-alerts-chart'), table = document.getElementById('dashboard-alerts-table');
+    const note = document.getElementById('dashboard-alerts-note');
+    const time = drawn.bars;
+    const empty = time.untimed + time.implausible ? 'No alerts with a time'
+        : (state.alerts || []).length ? 'No alerts in this range' : 'No alerts yet';
+    const selection = dashboardRange.preset === 'custom' ? { from: dashboardRange.from, to: dashboardRange.to } : null;
+    const svg = _alertsTimeBarsSvg(time, { width: drawn.size ? drawn.size.width : 720,
+                                           height: drawn.size ? drawn.size.height : 200, selection });
+    if (view) {
+        view.innerHTML = svg || chartEmptyHtml(empty);
+        _alertsChartInert(view, '[data-bin-start]', el => !(Number(el.getAttribute('data-total')) > 0));
+    }
+    if (note) {
+        const missed = _alertsTimeNote(time);
+        note.innerHTML = (svg ? '<span class="dashboard-bars-hint">Drag across the bars to narrow the range · click a bar to open its alerts</span>' : '')
+            + (missed ? `<span class="dashboard-bars-missed" title="Alerts without a readable time or with one no clock can have had (before 2000, more than a day ahead) are in no bar; the donuts count them">${escapeHtml(missed)}</span>` : '');
+    }
+    if (table) table.innerHTML = _alertsTimeTableHtml(time, empty, '<table class="view-table" data-sortable data-sort-id="dashboard-alerts">');
+}
+
+// SEVERITY and CATEGORY of the range: each donut beside its legend, in its
+// middle the alerts or the kinds of category; their table views
+function _drawDashboardDonuts(donuts) {
+    const empty = donuts.total ? '' : (state.alerts || []).length ? 'No alerts in this range' : 'No alerts yet';
+    const kinds = donuts.category.reduce((sum, item) => sum + (item.kinds || 1), 0);
+    _drawShareChart('dashboard-severity', 'severity', donuts.severity, empty,
+        donutSvg(donuts.severity, { size: 110, thickness: 16, centerSub: 'ALERTS' }),
+        '<table class="view-table" data-sortable data-sort-id="dashboard-severity">');
+    _drawShareChart('dashboard-category', 'category', donuts.category, empty,
+        donutSvg(donuts.category, { size: 110, thickness: 16, centerLabel: kinds, centerSub: kinds === 1 ? 'KIND' : 'KINDS' }),
+        '<table class="view-table" data-sortable data-sort-id="dashboard-category">');
+}
+
+// The switch shows the preset the donuts count, none while they count a range
+// drawn across the bars: that range is a chip before the switch, whose ×
+// goes back to the preset of the bars (its keyboard focus moves on to that
+// preset). Both are written again only for another range: new alerts leave
+// a chip in focus as it is.
+function _drawDashboardRange() {
+    const { preset, from, to } = dashboardRange, base = dashboardBarsRange.preset;
+    const key = preset === 'custom' ? `custom|${from}|${to}|${base}` : preset;
+    if (_dashboardDrawn.range === key) return;
+    _dashboardDrawn.range = key;
+    document.querySelectorAll('#dashboard-alerts-card .chart-range-btn').forEach(button =>
+        button.setAttribute('aria-pressed', String(button.getAttribute('data-range') === preset)));
+    const holder = document.getElementById('dashboard-range-chip');
+    if (!holder) return;
+    const focused = holder.contains(document.activeElement);
+    if (preset === 'custom') {
+        const title = `Remove the range ${formatAlertTime(from)} – ${formatAlertTime(to)} (end not included): back to ${base.toUpperCase()}`;
+        holder.innerHTML = filterChipHtml({ value: chartRangeLabel(from, to), title }, `setDashboardRange(${jsArg(base)})`);
+    } else {
+        holder.innerHTML = '';
+    }
+    holder.hidden = preset !== 'custom';
+    if (focused && preset !== 'custom') document.querySelector('#dashboard-alerts-card .chart-range-btn[aria-pressed="true"]')?.focus();
+}
+
+// The size the bars are drawn for: the room between the head of their card
+// and its note (0 while the dashboard is hidden)
+function _dashboardBarsSize() {
+    const rect = document.querySelector('#dashboard-alerts-card .dashboard-bars-area')?.getBoundingClientRect();
+    return { width: Math.floor(rect ? rect.width : 0), height: Math.floor(rect ? rect.height : 0) };
+}
+
+// A click on a chart of the dashboard opens the Alerts tab filtered by the
+// part clicked: a bar at its period, the segment or legend row of a severity
+// or a category at it within the range of the dashboard. A bar without
+// alerts, a severity no chip names and "other categories" open nothing (each
+// would list other alerts than it shows), nor does the release of a press
+// that drew a range across the bars. The click of a press on the bars opens
+// the bar pressed, wherever the browser sends it (to their common parent when
+// the press ended on the next bar).
+function onDashboardChartClick(event, chart) {
+    const target = event && event.target;
+    if (!target || typeof target.closest !== 'function') return;
+    if (chart === 'alerts') {
+        const released = _dashboardReleased;
+        _dashboardReleased = null;
+        const bin = released ? null : target.closest('[data-bin-start]');
+        const period = released ? (released.drew ? null : released.pressed) : _dashboardBinPeriod(bin);
+        if (period) openAlertsTab(period);
+        return;
+    }
+    const part = target.closest('[data-key]');
+    const key = part ? part.getAttribute('data-key') : '';
+    const range = { from: dashboardRange.from, to: dashboardRange.to };
+    if (chart === 'severity' && ALERT_SEVERITIES.includes(key)) openAlertsTab({ severities: [key], ...range });
+    else if (chart === 'category' && key) openAlertsTab({ category: key, ...range });
+}
+
+// The period {from, to} of a bar (a [data-bin-start] group) with alerts, else null
+function _dashboardBinPeriod(bin) {
+    return bin && Number(bin.getAttribute('data-total')) > 0
+        ? { from: Number(bin.getAttribute('data-bin-start')), to: Number(bin.getAttribute('data-bin-end')) } : null;
+}
+
+// The bars take a range drawn across them (mouse, pen or finger): a press on
+// them begins it, its moves and its end are followed wherever the pointer
+// goes (out of the bars, out of the window). The context menu drops a press
+// (macOS opens it on Ctrl+click, the release then goes to the menu). They
+// are drawn again in the next frame when the size of their card changes
+// (the window, the theme, the donut cards beside them).
+function initDashboardCharts() {
+    const view = document.getElementById('dashboard-alerts-chart');
+    if (view) {
+        view.addEventListener('pointerdown', onDashboardBrushStart);
+        document.addEventListener('pointermove', onDashboardBrushMove, true);
+        document.addEventListener('pointerup', onDashboardBrushEnd, true);
+        document.addEventListener('pointercancel', onDashboardBrushEnd, true);
+        document.addEventListener('contextmenu', onDashboardBrushCancel, true);
+    }
+    const area = document.querySelector('#dashboard-alerts-card .dashboard-bars-area');
+    if (area && typeof ResizeObserver !== 'undefined') {
+        new ResizeObserver(() => requestAnimationFrame(redrawDashboardChartsOnResize)).observe(area);
+    }
+}
+
+// A press on the bars (the main button) may begin a range: at the bar under
+// the pointer. It takes no pointer capture yet: a press that does not move is
+// a click, which the browser sends to the bar under the pointer.
+function onDashboardBrushStart(event) {
+    _dashboardReleased = null;
+    const target = event.target && typeof event.target.closest === 'function' ? event.target : null;
+    const svg = target ? target.closest('svg') : null;
+    const bins = _dashboardDrawn.bars ? _dashboardDrawn.bars.bins : [];
+    if (event.button !== 0 || !svg || !bins.length) return;
+    const bin = _dashboardBinAt(svg, event.clientX, bins.length);
+    _dashboardBrush = { pointerId: event.pointerId, x: event.clientX, first: bin, last: bin, moved: false, svg, bins,
+                        pressed: _dashboardBinPeriod(target.closest('[data-bin-start]')) };
+}
+
+// Moved by 5 px or more, the press draws a range: from its bar to the bar
+// under the pointer, marked as it grows. From then on the bars hold the
+// pointer's capture, so its moves and its release reach them wherever it is.
+// A move without the main button (its release went elsewhere) ends the press
+// as a cancelled one.
+function onDashboardBrushMove(event) {
+    const brush = _dashboardBrush;
+    if (!brush || event.pointerId !== brush.pointerId) return;
+    if (typeof event.buttons === 'number' && !(event.buttons & 1)) {
+        _dashboardBrushStop(true);
+        return;
+    }
+    if (!brush.moved) {
+        if (Math.abs(event.clientX - brush.x) < 5) return;
+        brush.moved = true;
+        const view = document.getElementById('dashboard-alerts-chart');
+        if (view) {
+            view.classList.add('is-brushing');
+            try {
+                view.setPointerCapture(event.pointerId);
+            } catch (e) {
+                // not a live pointer: the moves still come while it is over the page
+            }
+        }
+    }
+    brush.last = _dashboardBinAt(brush.svg, event.clientX, brush.bins.length);
+    _dashboardBrushMark(brush);
+}
+
+// Released, a range drawn is the range of the donuts (its bars' start and
+// end), and the click of this release opens nothing; a press that did not
+// move leaves its click the bar it pressed. Cancelled, nothing. What the
+// click does lasts until the task is over: a later click (no press) opens
+// the bar it is on.
+function onDashboardBrushEnd(event) {
+    const brush = _dashboardBrush;
+    if (!brush || event.pointerId !== brush.pointerId) return;
+    _dashboardBrushStop(false);
+    if (event.type !== 'pointerup') return;
+    _dashboardReleased = { drew: brush.moved, pressed: brush.pressed };
+    setTimeout(() => { _dashboardReleased = null; }, 0);
+    if (!brush.moved) return;
+    const { bins } = brush;
+    setDashboardRange('custom', bins[Math.min(brush.first, brush.last)].start, bins[Math.max(brush.first, brush.last)].end);
+}
+
+// The context menu during a press: it ends as a cancelled one
+function onDashboardBrushCancel() {
+    if (_dashboardBrush) _dashboardBrushStop(true);
+}
+
+// The press is over: no mark; the bars may be drawn again. `release` lets go
+// of the pointer's capture of a press whose release the bars never got (on
+// a release or a cancel the browser lets go of it, and the click of the
+// release still goes to the bars)
+function _dashboardBrushStop(release) {
+    const brush = _dashboardBrush;
+    _dashboardBrush = null;
+    if (!brush) return;
+    brush.svg.querySelector('.chart-brush')?.remove();
+    const view = document.getElementById('dashboard-alerts-chart');
+    if (!view) return;
+    view.classList.remove('is-brushing');
+    if (!release || !brush.moved) return;
+    try {
+        view.releasePointerCapture(brush.pointerId);
+    } catch (e) {
+        // the browser let go of it already
+    }
+}
+
+// The mark of the range being drawn: over its bars, as high as the plot
+function _dashboardBrushMark(brush) {
+    const svg = brush.svg, slot = Number(svg.getAttribute('width')) / brush.bins.length;
+    let mark = svg.querySelector('.chart-brush');
+    if (!mark) {
+        const plot = svg.querySelector('.chart-hit');
+        mark = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        mark.setAttribute('class', 'chart-selection chart-brush');
+        mark.setAttribute('y', plot ? plot.getAttribute('y') : '0');
+        mark.setAttribute('height', plot ? plot.getAttribute('height') : svg.getAttribute('height'));
+        svg.appendChild(mark);
+    }
+    const first = Math.min(brush.first, brush.last), last = Math.max(brush.first, brush.last);
+    mark.setAttribute('x', _chartCoord(first * slot));
+    mark.setAttribute('width', _chartCoord((last - first + 1) * slot));
+}
+
+// The bar under the pointer at clientX: the first or the last beyond the ends
+function _dashboardBinAt(svg, clientX, n) {
+    const rect = svg.getBoundingClientRect(), width = Number(svg.getAttribute('width')) || rect.width;
+    if (!(width > 0) || !(n > 0)) return 0;
+    const x = (clientX - rect.left) * (rect.width > 0 ? width / rect.width : 1);
+    return Math.min(n - 1, Math.max(0, Math.floor(x / (width / n))));
+}
+
+// The bars for the new size of their card; nothing while the dashboard is
+// hidden, for the size they have or while a range is drawn across them
+function redrawDashboardChartsOnResize() {
+    const drawn = _dashboardDrawn, size = _dashboardBarsSize();
+    if (!drawn.bars || _dashboardBrush || !size.width || !size.height
+        || (drawn.size && size.width === drawn.size.width && size.height === drawn.size.height)) return;
+    drawn.size = size;
+    _drawDashboardBars(drawn);
 }
 
 // =============================================
@@ -941,19 +1380,26 @@ function renderDashboard() {
 // =============================================
 // Every alert of state.alerts in one table, newest first, filtered by
 // severity, engine and text. The filters are the tab's controls themselves,
-// so they outlast a re-render and a theme switch (same nodes). A refresh
-// re-renders the table only while the tab is open and only if what it shows
-// changed; the place in the list stays unless the filters changed.
+// so they outlast a re-render and a theme switch (same nodes). The charts
+// filter further, by a time range, a category, a rule and a process
+// (alertsExtraFilter); each of these shows as a chip in the filter bar,
+// whose × takes it off. A refresh re-renders the table only while the tab is
+// open and only if what it shows changed; the place in the list stays unless
+// the filters changed. The tab scrolls as a whole, the filter bar stands at
+// its top.
 const ALERTS_TAB_LIMIT = 2000;
 const ALERT_SEVERITIES = ['critical', 'high', 'medium', 'low', 'info'];
-let _alertsTabShown = null;     // {alerts, processes, filterKey} of the rendered table
+let _alertsTabShown = null;     // {alerts, processes, filterKey, chips} of the rendered table
+// The filters of the charts: a time range in epoch ms (from included, to
+// not), a category, a rule and a process; null = none
+const alertsExtraFilter = { from: null, to: null, category: null, rule: null, process: null };
 
 // Lower case, as the engines write "High" as well as "high"; an alert
-// without a severity, or with the server's default "unknown" (engines that
-// have none), counts as info.
+// without a severity, with the server's default "unknown" (engines that
+// have none) or with Sigma's level "informational" counts as info.
 function alertSeverity(alert) {
     const severity = String(alert?.severity || '').toLowerCase();
-    return !severity || severity === 'unknown' ? 'info' : severity;
+    return !severity || severity === 'unknown' || severity === 'informational' ? 'info' : severity;
 }
 
 function alertRuleName(alert) {
@@ -966,28 +1412,63 @@ function alertProcessName(alert) {
     return name || String(alert?.process_image || '').split(/[\\/]/).pop();
 }
 
-// filter = {severities: [...], engine, text}; an empty list or text does not
-// filter. Severity and engine are compared in any case; the text is searched
-// in the rule, the process (name, PID) and the description.
+// filter = {severities: [...], engine, text, from, to, category, rule,
+// process}; an empty list, text or name and a missing bound do not filter.
+// Severity and engine are compared in any case; the text is searched in the
+// rule, the process (name, PID) and the description. from / to are epoch ms,
+// `from` included and `to` not, as the bins of a chart (binByTime), so a bar
+// lists here exactly what it counted; an alert without a time is in no
+// range. category is alertCategory's; rule and process are whole names in
+// any case, the process as the table names it (alertProcessName), and
+// "(unknown)", the charts' name for none, takes the alerts without one too.
 function filterAlerts(alerts, filter) {
     filter = filter || {};
     const severities = new Set((filter.severities || []).map(s => String(s || '').toLowerCase()).filter(Boolean));
     const engine = String(filter.engine || '').toLowerCase();
     const text = String(filter.text || '').trim().toLowerCase();
+    const from = _alertsTimeBound(filter.from), to = _alertsTimeBound(filter.to);
+    const category = _alertsNameKey(filter.category);
+    const rule = _alertsNameKey(filter.rule), proc = _alertsNameKey(filter.process);
     const matches = [];
     (alerts || []).forEach((alert, i) => {
         if (!alert) return;
         if (severities.size && !severities.has(alertSeverity(alert))) return;
         if (engine && String(alert.engine || '').toLowerCase() !== engine) return;
+        if (category && alertCategory(alert) !== category) return;
+        if (rule && !_alertNameIs(alertRuleName(alert), rule)) return;
+        if (proc && !_alertNameIs(alertProcessName(alert), proc)) return;
         if (text && ![alertRuleName(alert), alertProcessName(alert), alert.pid, alert.rule_description]
             .some(value => String(value ?? '').toLowerCase().includes(text))) return;
         const time = Date.parse(alert.timestamp);
+        // An alert without a time (NaN) fails both comparisons: it is in no range
+        if ((from !== null || to !== null) && !(time >= (from ?? -Infinity) && time < (to ?? Infinity))) return;
         matches.push({ alert, time: Number.isNaN(time) ? -Infinity : time, i });
     });
     // Newest first by time, not by string (time zones differ); alerts without
     // a time last; the same time in reverse list order.
     matches.sort((a, b) => (b.time - a.time) || (b.i - a.i));
     return matches.map(m => m.alert);
+}
+
+// A bound of the time range in epoch ms, or null (none): a number, a Date or
+// a number as text (a data-* attribute of a chart)
+function _alertsTimeBound(value) {
+    if (value instanceof Date) value = value.getTime();
+    else if (typeof value === 'string' && value.trim()) value = Number(value);
+    return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+// A category, rule or process name as the filters compare it: in lower case,
+// without the blanks around it ('' = no filter)
+function _alertsNameKey(name) {
+    return String(name ?? '').trim().toLowerCase();
+}
+
+// Whether an alert's rule or process name is the one asked for (a name key);
+// "(unknown)", the name the charts give alerts without one, also takes those
+function _alertNameIs(name, wanted) {
+    const key = _alertsNameKey(name);
+    return key === wanted || (!key && wanted === '(unknown)');
 }
 
 // The `count` newest alerts, newest first, in the order of the Alerts tab.
@@ -1088,6 +1569,7 @@ function alertsFilterFromControls() {
             .filter(chip => chip.getAttribute('aria-pressed') === 'true').map(chip => chip.dataset.severity),
         engine: document.getElementById('alerts-filter-engine')?.value || '',
         text: document.getElementById('alerts-filter-text')?.value || '',
+        ..._alertsExtraOf(alertsExtraFilter),
     };
 }
 
@@ -1099,24 +1581,144 @@ function renderAlertsTab() {
     const shown = _alertsTabShown;
     if (engine && (!shown || shown.alerts !== alerts)) setAlertsEngineOptions(engine, alertEngines(alerts), engine.value);
     const filter = alertsFilterFromControls();
-    const filterKey = JSON.stringify([filter.severities, filter.engine.toLowerCase(), filter.text.trim().toLowerCase()]);
-    if (shown && shown.alerts === alerts && shown.processes === state.processes && shown.filterKey === filterKey) return;
+    const filterKey = JSON.stringify([filter.severities, filter.engine.toLowerCase(), filter.text.trim().toLowerCase(),
+        filter.from, filter.to, ...[filter.category, filter.rule, filter.process].map(_alertsNameKey)]);
+    const chips = JSON.stringify(_alertsExtraOf(alertsExtraFilter));     // the chart filters as the chips show them
+    if (shown && shown.alerts === alerts && shown.processes === state.processes && shown.filterKey === filterKey
+        && shown.chips === chips) return;
     const matches = filterAlerts(alerts, filter);
-    const wrap = document.getElementById('alerts-table-wrap');
-    const scrollTop = wrap ? wrap.scrollTop : 0;
+    const tab = document.getElementById('tab-alerts');
+    const scrollTop = tab ? tab.scrollTop : 0;
+    // The charts count the same matches, drawn again only for other alerts or filters (not
+    // for a new process list), and first: the layout they measure is still clean
+    if (!shown || shown.alerts !== alerts || shown.filterKey !== filterKey) renderAlertsCharts(matches);
     rows.innerHTML = matches.length ? alertRowsHtml(matches)
         : `<tr class="alerts-empty-row" data-sort-skip><td colspan="6">${alerts.length ? 'No alerts match the filters.' : 'No alerts yet.'}</td></tr>`;
-    // The same filters keep the place in the list; other filters start at the top.
-    if (wrap) wrap.scrollTop = shown && shown.filterKey === filterKey ? scrollTop : 0;
+    // Re-rendered only when they changed: a chip in focus keeps it when new alerts arrive
+    if (!shown || shown.chips !== chips) renderAlertsActiveFilters();
+    // The same filters keep the place in the list. Other filters start at its
+    // top: with the filter bar standing at the top of the tab, the first row
+    // right under it, so the bar stays under the pointer; above that, nothing moves.
+    if (tab) tab.scrollTop = shown && shown.filterKey === filterKey ? scrollTop : Math.min(scrollTop, _alertsListTop(tab));
     const count = document.getElementById('alerts-count');
     if (count) count.textContent = `${matches.length} of ${alerts.length}`;
-    _alertsTabShown = { alerts, processes: state.processes, filterKey };
+    _alertsTabShown = { alerts, processes: state.processes, filterKey, chips };
 }
 
+// How far the tab is scrolled when its list starts at the top: the first row
+// right under the filter bar, which then stands at the top of the tab
+function _alertsListTop(tab) {
+    return _tabListTop(tab, tab.querySelector('.alerts-filters'), document.getElementById('alerts-table-wrap'));
+}
+
+// How far a tab that scrolls as a whole is scrolled when `list` starts at
+// its top: right under `bar`, the filter bar standing at the top of the tab
+// (the Alerts and the Sysmon tab); 0 without them
+function _tabListTop(tab, bar, list) {
+    if (!bar || !list) return 0;
+    const top = list.getBoundingClientRect().top - tab.getBoundingClientRect().top + tab.scrollTop;
+    return Math.max(0, top - bar.getBoundingClientRect().height);
+}
+
+// The chart filters as chips in the filter bar, one each: "× 14 Jul – 20 Jul",
+// "× category: registry", "× rule: …", "× process: …"; a click takes off that
+// filter only. The row is hidden while there is none.
+function renderAlertsActiveFilters() {
+    const holder = document.getElementById('alerts-active-filters');
+    if (!holder) return;
+    const f = _alertsExtraOf(alertsExtraFilter);
+    const chips = [];
+    if (f.from !== null || f.to !== null) {
+        const range = f.from === null ? `before ${formatAlertTime(f.to)}` : f.to === null ? `from ${formatAlertTime(f.from)}`
+            : `${formatAlertTime(f.from)} – ${formatAlertTime(f.to)} (end not included)`;
+        chips.push({ kind: 'range', value: chartRangeLabel(f.from, f.to), title: `Remove the time range ${range}` });
+    }
+    for (const kind of ['category', 'rule', 'process']) {
+        if (f[kind] !== null) chips.push({ kind, name: kind, value: f[kind], title: `Remove the ${kind} filter: ${f[kind]}` });
+    }
+    holder.innerHTML = chips.map(chip => filterChipHtml(chip, `removeAlertsFilter(${jsArg(chip.kind)})`)).join('');
+    holder.hidden = chips.length === 0;
+}
+
+// A chip of a filter that a chart set (the Alerts tab, the dashboard, the
+// Sysmon tab): ×, its kind and its value as text; a click on it takes the
+// filter off. `safe` is its click handler, the values in it through jsArg.
+function filterChipHtml(chip, safe) {
+    return `<button type="button" class="alerts-filter-chip"${chip.kind ? ` data-filter="${escapeHtml(chip.kind)}"` : ''} title="${escapeHtml(chip.title)}" aria-label="${escapeHtml(chip.title)}" onclick="${safe}">`
+        + '<span class="alerts-filter-chip-x" aria-hidden="true">&times;</span> '
+        + (chip.name ? `<span class="alerts-filter-chip-kind">${escapeHtml(chip.name)}:</span> ` : '')
+        + `<span class="alerts-filter-chip-value">${escapeHtml(chip.value)}</span></button>`;
+}
+
+// The chart filters of `filter` as alertsExtraFilter keeps them: the bounds
+// in epoch ms, the names without the blanks around them, null for none
+function _alertsExtraOf(filter) {
+    filter = filter || {};
+    const name = value => String(value ?? '').trim() || null;
+    return { from: _alertsTimeBound(filter.from), to: _alertsTimeBound(filter.to), category: name(filter.category),
+             rule: name(filter.rule), process: name(filter.process) };
+}
+
+// Sets some of the chart filters and keeps the others, e.g. the range of a
+// bar: setAlertsFilters({from, to}); null takes a filter off.
+function setAlertsFilters(changes) {
+    Object.assign(alertsExtraFilter, _alertsExtraOf({ ...alertsExtraFilter, ...changes }));
+    renderAlertsTab();
+}
+
+// The × of a chip ('range', 'category', 'rule' or 'process'). A chip in focus
+// hands it on to the chip that takes its place, the search box after the last.
+function removeAlertsFilter(kind) {
+    const holder = document.getElementById('alerts-active-filters');
+    const chips = () => (holder ? [...holder.querySelectorAll('.alerts-filter-chip')] : []);
+    const focused = chips().indexOf(document.activeElement);
+    setAlertsFilters(kind === 'range' ? { from: null, to: null } : { [kind]: null });
+    if (focused < 0) return;
+    const left = chips();
+    (left[Math.min(focused, left.length - 1)] || document.getElementById('alerts-filter-text'))?.focus();
+}
+
+// The table head stands right under the filter bar, which grows with its
+// chips and when it wraps: --alerts-bar-height on the head (six cells, never
+// rebuilt) follows the bar's height, border included. The bars and the
+// Sankey above it are drawn for the width of their cards: again, in the next
+// frame, when the width of the charts changes (the window, the theme, the
+// tab shown again).
+function initAlertsTab() {
+    if (typeof ResizeObserver === 'undefined') return;
+    const bar = document.querySelector('#tab-alerts .alerts-filters');
+    const head = document.querySelector('#alerts-table thead');
+    if (bar && head) _followBarHeight(bar, head, '--alerts-bar-height');
+    const charts = document.getElementById('alerts-charts');
+    if (charts) new ResizeObserver(() => requestAnimationFrame(redrawAlertsChartsOnResize)).observe(charts);
+}
+
+// The height of a filter bar standing at the top of its tab, border
+// included, as the variable `name` on `holder`, for the table head under the
+// bar to stand right below it, whatever the bar's height (chips, wrapping)
+function _followBarHeight(bar, holder, name) {
+    new ResizeObserver(() => holder.style.setProperty(name, `${bar.getBoundingClientRect().height}px`))
+        .observe(bar, { box: 'border-box' });
+}
+
+// A chip of the filter bar switches its severity on or off
 function toggleAlertsSeverity(severity) {
     const chip = document.querySelector(`#tab-alerts .alerts-sev-chip[data-severity="${cssToken(severity)}"]`);
     if (!chip) return;
     chip.setAttribute('aria-pressed', String(chip.getAttribute('aria-pressed') !== 'true'));
+    renderAlertsTab();
+}
+
+// A slice or a legend row of SEVERITY shows the alerts of its severity alone:
+// its chip pressed, the others not; nothing changes when it is the only one
+// pressed already (a click that let go of it would show every severity)
+function selectAlertsSeverity(severity) {
+    const chips = [...document.querySelectorAll('#tab-alerts .alerts-sev-chip')];
+    const chip = chips.find(c => c.dataset.severity === severity);
+    if (!chip) return;
+    const pressed = chips.filter(c => c.getAttribute('aria-pressed') === 'true');
+    if (pressed.length === 1 && pressed[0] === chip) return;
+    chips.forEach(c => c.setAttribute('aria-pressed', String(c === chip)));
     renderAlertsTab();
 }
 
@@ -1130,7 +1732,9 @@ function scheduleAlertsRender() {
 }
 
 // Opens the Alerts tab with exactly these filters (others cleared), e.g.
-// openAlertsTab({severities: ['critical', 'high']}); no filter shows every alert.
+// openAlertsTab({severities: ['critical', 'high']}), or from a chart
+// openAlertsTab({category: 'registry', from, to}); no filter shows every alert.
+// The tab opens at its top, the charts and the filters in view.
 function openAlertsTab(filter) {
     filter = filter || {};
     const severities = new Set((filter.severities || []).map(s => String(s || '').toLowerCase()));
@@ -1140,7 +1744,390 @@ function openAlertsTab(filter) {
     if (engine) setAlertsEngineOptions(engine, alertEngines(state.alerts), filter.engine);
     const text = document.getElementById('alerts-filter-text');
     if (text) text.value = String(filter.text || '');
+    Object.assign(alertsExtraFilter, _alertsExtraOf(filter));
     switchTab('alerts');
+    const tab = document.getElementById('tab-alerts');
+    if (tab) tab.scrollTop = 0;
+}
+
+// --- The charts of the Alerts tab ---
+// Above the filter bar: SEVERITY and ENGINE as pies beside their legends,
+// OVER TIME (twice as wide) as bars per hour, day or week stacked by
+// severity, below them FLOW, a Sankey engine → rule → process. They count
+// the alerts the filters let through, every one (the table shows the newest
+// 2000); an alert without a time is in no bar, a note under the bars counts
+// those. A click sets the filter of the part clicked (onAlertsChartClick),
+// so the table then lists what the part counted. Each card shows its numbers
+// as a table on request (CHART / TABLE).
+// The Sankey by square roots (small flows stay visible) or, with LINEAR, in
+// true proportions, until the page is reloaded
+const alertsFlowView = { linear: false };
+// What the bars and the Sankey on screen were drawn from, and for which widths:
+// a resize or LINEAR draws them again without counting again
+let _alertsChartsDrawn = null;
+// The first time an alert or a Sysmon event can plausibly have: one of a
+// clock set to 1970 (or a FILETIME of 0, 1601) would squeeze every other bar
+// into one
+const ALERT_TIME_MIN = Date.UTC(2000, 0, 1);
+
+// Draws the four charts of the alerts of the filters (filterAlerts' list);
+// renderAlertsTab calls it when the alerts or the filters changed
+function renderAlertsCharts(matches) {
+    if (!document.getElementById('alerts-charts')) return;
+    for (const id of ['alerts-severity', 'alerts-time', 'alerts-engine', 'alerts-flow']) {
+        // Written once: a refresh keeps the switch (and the keyboard focus on it)
+        const slot = document.getElementById(`${id}-toggle`);
+        if (slot && !slot.firstElementChild) slot.innerHTML = viewToggleHtml(id);
+    }
+    const list = (matches || []).filter(Boolean);
+    // Measured before anything is written, while the layout is still clean
+    const widths = _alertsChartWidths();
+    const empty = list.length ? '' : (state.alerts || []).length ? 'No alerts match the filters' : 'No alerts yet';
+    const engines = alertsEngineItems(list);
+    _drawAlertsPie('severity', alertsSeverityItems(list), empty);
+    _drawAlertsPie('engine', engines, empty);
+    // The bars span the time range of the filters, when one is set
+    const range = _alertsExtraOf(alertsExtraFilter);
+    const time = alertSeverityBins(list, { from: range.from, to: range.to });
+    const flow = alertFlow(list, { top: 6, names: state.alerts });
+    flow.colors = _alertsFlowColors(flow, engines);
+    _alertsChartsDrawn = { widths, empty, time, flow };
+    _drawAlertsTime(_alertsChartsDrawn);
+    _drawAlertsFlow(_alertsChartsDrawn);
+}
+
+// The slices of SEVERITY: the alerts per severity as the table reads it (in
+// any case; none, "unknown" and "informational" are info), critical first. A
+// severity of another name ("warning", say) comes after them, muted: no chip
+// filters by it.
+function alertsSeverityItems(matches) {
+    const rank = key => (SEVERITY_ORDER.includes(key) ? SEVERITY_ORDER.indexOf(key) : SEVERITY_ORDER.length);
+    return countBy(matches, alertSeverity).sort((a, b) => rank(a.key) - rank(b.key)).map(({ key, count }) => ({
+        key, label: key.toUpperCase(), value: count, color: _alertsSeverityColor(key),
+    }));
+}
+
+// A severity's colour in SEVERITY and OVER TIME alike: its own for the five of
+// the chips, muted for any other
+function _alertsSeverityColor(key) {
+    return SEVERITY_ORDER.includes(key) ? SEVERITY_COLORS[key] : 'var(--text-muted)';
+}
+
+// The slices of ENGINE: the alerts per engine in any case, as the engine
+// choice compares them. Name and colour come from every alert, not only those
+// of the filters (the first spelling, the colour of its rank), so neither
+// changes with a filter. Alerts without an engine are "(unknown)", which the
+// engine choice cannot name.
+function alertsEngineItems(matches) {
+    const keyOf = alert => String(alert?.engine || '').toLowerCase();
+    const all = (state.alerts || []).filter(Boolean);
+    const spelling = new Map();
+    for (const alert of all) {
+        if (!spelling.has(keyOf(alert))) spelling.set(keyOf(alert), String(alert.engine || ''));
+    }
+    const rank = new Map(countBy(all, keyOf).map(({ key }, i) => [key, i]));
+    return countBy(matches, keyOf).map(({ key, count }) => ({
+        key, label: spelling.get(key) || key || '(unknown)', value: count,
+        color: CHART_PALETTE[(rank.has(key) ? rank.get(key) : rank.size) % CHART_PALETTE.length],
+    }));
+}
+
+// SEVERITY or ENGINE: the pie beside its legend (or the hint) and the table view
+function _drawAlertsPie(kind, items, empty) {
+    _drawShareChart(`alerts-${kind}`, kind, items, empty, empty ? '' : pieSvg(items, { size: 120 }),
+        kind === 'severity' ? '<table class="view-table" data-sortable data-sort-id="alerts-severity">'
+            : '<table class="view-table" data-sortable data-sort-id="alerts-engine">');
+}
+
+// A pie or a donut (`chart`, its markup) beside its legend in #<id>-chart,
+// or the hint; the parts a click sets no filter for marked: a severity no
+// chip names, the slice without a key (alerts without an engine, "other
+// categories"). The table view in #<id>-table, `table` its <table> tag.
+function _drawShareChart(id, kind, items, empty, chart, table) {
+    const view = document.getElementById(`${id}-chart`), tableView = document.getElementById(`${id}-table`);
+    if (view) {
+        view.innerHTML = chart ? `<div class="chart-split">${chart}${chartLegendHtml(items)}</div>` : chartEmptyHtml(empty || 'No alerts');
+        _alertsChartInert(view, '[data-key]', el => {
+            const key = el.getAttribute('data-key');
+            return kind === 'severity' ? !ALERT_SEVERITIES.includes(key) : !key;
+        });
+    }
+    if (tableView) tableView.innerHTML = _alertsShareTableHtml(kind, items, empty, table);
+}
+
+// The table view of a pie or a donut of `kind` (severity, engine, category,
+// activity: ACTIVITY MIX of the graph detail), `table` its <table> tag: the
+// count and share of each slice
+function _alertsShareTableHtml(kind, items, empty, table) {
+    const total = items.reduce((sum, item) => sum + item.value, 0);
+    const rows = empty ? [] : items.map((item, i) => {
+        // A severity without a chip in neutral grey: cssToken("High!") would give it the colour of high
+        const name = kind === 'severity'
+            ? `<td data-sort-value="${severitySortValue(item.key)}"><span class="event-severity ${ALERT_SEVERITIES.includes(item.key) ? cssToken(item.key) : ''}">${escapeHtml(item.key)}</span></td>`
+            : `<td class="view-table-text" title="${escapeHtml(item.label)}"><span class="view-table-dot" style="background:${_chartColor(item.color, i)}"></span>${escapeHtml(item.label)}</td>`;
+        return `<tr>${name}<td class="view-table-num" data-sort-value="${item.value}">${_chartNumber(item.value)}</td>`
+            + `<td class="view-table-num" data-sort-value="${total ? item.value / total : 0}">${escapeHtml(_chartShare(item.value, total))}</td></tr>`;
+    });
+    if (!rows.length) rows.push(`<tr data-sort-skip><td colspan="3" class="view-table-empty">${escapeHtml(empty || 'No alerts')}.</td></tr>`);
+    const head = { severity: 'Severity', engine: 'Engine', category: 'Category', activity: 'Kind' }[kind] || 'Name';
+    return `${table}<thead><tr><th>${head}</th><th class="view-table-num">Count</th><th class="view-table-num">Share</th></tr></thead>`
+        + `<tbody>${rows.join('')}</tbody></table>`;
+}
+
+// The items per period of binByTime, and those in no bar: untimed (without a
+// readable timestamp) and implausible (with a time no clock can have had:
+// before 2000, a day or more from now). opts as binByTime's (key(item),
+// keys, from, to, fine); without `to` the bins reach at least to `until`
+// (the end of a range that runs up to now). The bins never reach past the
+// plausible times, so a bin's start and end select exactly the items it
+// counts. The Alerts tab, the dashboard and the Sysmon tab count with it.
+function chartTimeBins(items, opts) {
+    opts = opts || {};
+    const latest = (Number.isFinite(opts.now) ? opts.now : Date.now()) + 86400000;
+    const timed = [];
+    let untimed = 0, implausible = 0, last = -Infinity;
+    for (const item of items || []) {
+        if (!item) continue;
+        const t = Date.parse(item.timestamp);
+        if (Number.isNaN(t)) untimed++;
+        else if (t < ALERT_TIME_MIN || t >= latest) implausible++;
+        else {
+            timed.push([t, item]);
+            last = Math.max(last, t);
+        }
+    }
+    const key = typeof opts.key === 'function' ? opts.key : null;
+    const to = Number.isFinite(opts.to) ? opts.to : Number.isFinite(opts.until) ? Math.max(opts.until, last + 1) : undefined;
+    const time = binByTime(timed, { time: pair => pair[0], key: key && (pair => key(pair[1])), keys: opts.keys,
+                                    from: opts.from, to, fine: opts.fine });
+    const head = time.bins[0], tail = time.bins[time.bins.length - 1];
+    if (head && head.start < ALERT_TIME_MIN && head.end > ALERT_TIME_MIN) head.start = ALERT_TIME_MIN;
+    if (tail && tail.end > latest && tail.start < latest) tail.end = latest;
+    return { ...time, untimed, implausible };
+}
+
+// The alerts per hour, day or week stacked by severity, for OVER TIME and
+// ALERT ACTIVITY: chartTimeBins' {unit, bins, untimed, implausible} (opts:
+// from, to, until, now)
+function alertSeverityBins(alerts, opts) {
+    return chartTimeBins(alerts, { ...opts, key: alertSeverity, keys: SEVERITY_ORDER });
+}
+
+// The note of the alerts in no bar: "12 without time · 1 with implausible time" ('' for none)
+function _alertsTimeNote(time) {
+    return [time.untimed > 0 ? `${_chartNumber(time.untimed)} without time` : '',
+            time.implausible > 0 ? `${_chartNumber(time.implausible)} with implausible time` : ''].filter(Boolean).join(' · ');
+}
+
+// Bars of alertSeverityBins (opts: width, height, selection), each severity
+// in its colour of SEVERITY, one no chip names muted as there
+function _alertsTimeBarsSvg(time, opts) {
+    const colors = Object.create(null);         // keys from the data: none may be special (__proto__)
+    for (const bin of time.bins) Object.keys(bin.counts).forEach(key => { colors[key] = _alertsSeverityColor(key); });
+    return stackedBarsSvg(time.bins, { ...opts, keys: SEVERITY_ORDER, colors, unit: time.unit });
+}
+
+// OVER TIME from what renderAlertsCharts counted: the bars for the width of
+// their card, under them the note of the alerts in no bar; a bar without
+// alerts sets no range. The table view.
+function _drawAlertsTime(drawn) {
+    const view = document.getElementById('alerts-time-chart'), table = document.getElementById('alerts-time-table');
+    const missed = _alertsTimeNote(drawn.time);
+    const note = missed ? '<div class="alerts-chart-note" title="Alerts without a readable time or with one no clock can have had (before 2000, more than a day ahead) are in no bar; SEVERITY, ENGINE and FLOW count them">'
+        + `${escapeHtml(missed)}</div>` : '';
+    const svg = drawn.empty ? '' : _alertsTimeBarsSvg(drawn.time, { width: drawn.widths.time || 560, height: note ? 104 : 120 });
+    if (view) {
+        view.innerHTML = (svg || chartEmptyHtml(drawn.empty || 'No alerts with a time')) + note;
+        _alertsChartInert(view, '[data-bin-start]', el => !(Number(el.getAttribute('data-total')) > 0));
+    }
+    if (table) table.innerHTML = _alertsTimeTableHtml(drawn.time, drawn.empty, '<table class="view-table" data-sortable data-sort-id="alerts-time">');
+}
+
+// The table view of bars of alertSeverityBins, `table` its <table> tag: each
+// period with alerts by severity and its total, then the severities no chip
+// names together as "Other" (a column only when there are some, after the
+// total, so a sorted column keeps its place), so a row adds up to its total;
+// the alerts in no bar in rows at the end
+function _alertsTimeTableHtml(time, empty, table) {
+    const others = bin => Object.keys(bin.counts).filter(key => !SEVERITY_ORDER.includes(key) && bin.counts[key] > 0);
+    const other = time.bins.some(bin => bin.total > 0 && others(bin).length);
+    return _timeBinsTableHtml(time, [
+        ...SEVERITY_ORDER.map(s => ({ head: `${s[0].toUpperCase()}${s.slice(1)}`, count: bin => bin.counts[s] || 0 })),
+        { head: 'Total', count: bin => bin.total },
+        ...(other ? [{ head: 'Other', title: 'Severities no filter chip names',
+                       count: bin => others(bin).reduce((sum, key) => sum + bin.counts[key], 0),
+                       cellTitle: bin => others(bin).map(key => `${key}: ${_chartNumber(bin.counts[key])}`).join(', ') }] : []),
+    ], empty || 'No alerts with a time', table);
+}
+
+// The table view of bars of chartTimeBins, `table` its <table> tag: a row
+// per period with items, a cell per column [{head, title, count(bin),
+// cellTitle(bin)}] after the period, the items in no bar in rows at the end;
+// `empty` the only row without any
+function _timeBinsTableHtml(time, columns, empty, table) {
+    const cell = (n, title) => `<td class="view-table-num" data-sort-value="${n}"${title ? ` title="${escapeHtml(title)}"` : ''}>${_chartNumber(n)}</td>`;
+    const cols = columns.length + 1;
+    const rows = time.bins.filter(bin => bin.total > 0).map(bin =>
+        `<tr><td data-sort-value="${bin.start}">${escapeHtml(_chartPeriodLabel(bin.start, bin.end, time.unit))}</td>`
+        + columns.map(column => cell(column.count(bin), column.cellTitle ? column.cellTitle(bin) : '')).join('') + '</tr>');
+    for (const [n, what] of [[time.untimed, 'without time'], [time.implausible, 'with implausible time']]) {
+        if (n > 0) rows.push(`<tr data-sort-skip><td colspan="${cols}" class="view-table-empty">${_chartNumber(n)} ${what}</td></tr>`);
+    }
+    if (!rows.length) rows.push(`<tr data-sort-skip><td colspan="${cols}" class="view-table-empty">${escapeHtml(_chartSentence(empty))}</td></tr>`);
+    return `${table}<thead><tr><th>Period</th>`
+        + columns.map(column => `<th class="view-table-num"${column.title ? ` title="${escapeHtml(column.title)}"` : ''}>${escapeHtml(column.head)}</th>`).join('')
+        + `</tr></thead><tbody>${rows.join('')}</tbody></table>`;
+}
+
+// FLOW from what renderAlertsCharts counted: the Sankey for the width of its
+// card, as high as its fullest column needs, by square roots or in true
+// proportions (LINEAR); the parts a click sets nothing for marked; the table view
+function _drawAlertsFlow(drawn) {
+    const view = document.getElementById('alerts-flow-chart'), table = document.getElementById('alerts-flow-table');
+    const { flow } = drawn;
+    const nodes = Math.max(0, ...flow.columns.map(column => column.length));
+    const layout = layoutSankey(flow.columns, flow.links, { width: drawn.widths.flow || 720,
+        height: Math.min(340, Math.max(120, 40 * nodes + 20)), scale: alertsFlowView.linear ? 'linear' : 'sqrt' });
+    if (view) {
+        view.innerHTML = sankeySvg(layout, { labels: flow.labels, colors: flow.colors }) || chartEmptyHtml(drawn.empty || 'No alerts');
+        _flowInert(view, _alertsFlowFilter);
+    }
+    if (table) table.innerHTML = _alertsFlowTableHtml(flow, drawn.empty);
+}
+
+// Marks the parts of a Sankey a click sets no filter for (filterOf(id) gives
+// {} for its node): such a node, and a band with such an end, which would
+// list more items than it carries
+function _flowInert(view, filterOf) {
+    const sets = id => Object.keys(filterOf(id)).length > 0;
+    _alertsChartInert(view, '[data-sankey-node]', el => !sets(el.getAttribute('data-sankey-node')));
+    _alertsChartInert(view, '[data-sankey-link]', el => !sets(el.getAttribute('data-source')) || !sets(el.getAttribute('data-target')));
+}
+
+// The filter a click on a Sankey sets: that of its node, or of both ends of
+// its band (filterOf as _flowInert's); null where the click stands for none
+function _flowClickFilter(target, filterOf) {
+    const band = target.closest('[data-sankey-link]'), node = target.closest('[data-sankey-node]');
+    const ends = (band ? [band.getAttribute('data-source'), band.getAttribute('data-target')]
+        : node ? [node.getAttribute('data-sankey-node')] : []).map(filterOf);
+    return ends.length && ends.every(end => Object.keys(end).length) ? Object.assign({}, ...ends) : null;
+}
+
+// The table view of FLOW: each band with its two ends and its alerts, the
+// bands from the engines first, the largest first
+function _alertsFlowTableHtml(flow, empty) {
+    return _flowTableHtml(flow, empty || 'No alerts', '<table class="view-table" data-sortable data-sort-id="alerts-flow">',
+                          ['Source', 'Target']);
+}
+
+// The table view of a Sankey of _chartFlow, `table` its <table> tag, `heads`
+// those of the two ends: each band with its ends and its count, the bands of
+// the first column first, the largest first; `empty` the only row without any
+function _flowTableHtml(flow, empty, table, heads) {
+    const label = id => escapeHtml(flow.labels[id] ?? id);
+    const step = new Map(flow.columns.flatMap((column, c) => column.map(id => [id, c])));
+    const rows = [...flow.links].sort((a, b) => (step.get(a.source) - step.get(b.source)) || (b.value - a.value)).map(link =>
+        `<tr><td class="view-table-text" title="${label(link.source)}">${label(link.source)}</td>`
+        + `<td class="view-table-text" title="${label(link.target)}">${label(link.target)}</td>`
+        + `<td class="view-table-num" data-sort-value="${link.value}">${_chartNumber(link.value)}</td></tr>`);
+    if (!rows.length) rows.push(`<tr data-sort-skip><td colspan="3" class="view-table-empty">${escapeHtml(_chartSentence(empty))}</td></tr>`);
+    return `${table}<thead><tr><th>${escapeHtml(heads[0])}</th><th>${escapeHtml(heads[1])}</th>`
+        + `<th class="view-table-num">Count</th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
+}
+
+// The colours of the nodes of FLOW: an engine in its colour of ENGINE (it
+// stays when a filter is set), "other rules" / "other processes" muted, the
+// others from the palette by their place, without its muted last colour
+function _alertsFlowColors(flow, engines) {
+    const engineColor = new Map(engines.map(item => [item.key, item.color]));
+    const colors = Object.create(null);
+    flow.columns.forEach((column, c) => column.forEach((id, i) => {
+        colors[id] = c === 0 ? engineColor.get(id.slice('engine:'.length).toLowerCase())
+            : id === 'other rules' || id === 'other processes' ? 'var(--text-muted)'
+            : CHART_PALETTE[(c + i) % (CHART_PALETTE.length - 1)];
+    }));
+    return colors;
+}
+
+// The filter a node of FLOW stands for: {engine}, {rule} or {process} with
+// its name; none ({}) for "other rules", "other processes" and the engine of
+// alerts without one
+function _alertsFlowFilter(id) {
+    const m = /^(engine|rule|process):([\s\S]*)$/.exec(String(id ?? ''));
+    return m && m[2] ? { [m[1]]: m[2] } : {};
+}
+
+// The widths the bars and the Sankey are drawn for: those of their cards (0 while hidden)
+function _alertsChartWidths() {
+    const width = kind => Math.floor(document.querySelector(`#alerts-${kind}-card .chart-card-head`)?.getBoundingClientRect().width || 0);
+    return { time: width('time'), flow: width('flow') };
+}
+
+// Marks the parts of a chart a click sets no filter for: no pointer (.chart-inert)
+function _alertsChartInert(view, selector, inert) {
+    view.querySelectorAll(selector).forEach(el => { if (inert(el)) el.classList.add('chart-inert'); });
+}
+
+// A click on a chart of the Alerts tab sets the filter of the part clicked:
+// the slice or legend row of a severity shows that severity alone
+// (selectAlertsSeverity), of an engine chooses the engine; a bar sets its
+// period; a node of FLOW its engine, rule or process, a band both of its
+// ends. "other rules", "other processes", alerts without an engine, a
+// severity without a chip, a band with such an end and a bar without alerts
+// set nothing: each would list other alerts than it shows (more, or none).
+function onAlertsChartClick(event, chart) {
+    const target = event && event.target;
+    if (!target || typeof target.closest !== 'function') return;
+    if (chart === 'time') {
+        const bin = target.closest('[data-bin-start]');
+        if (bin && Number(bin.getAttribute('data-total')) > 0) {
+            setAlertsFilters({ from: bin.getAttribute('data-bin-start'), to: bin.getAttribute('data-bin-end') });
+        }
+    } else if (chart === 'flow') {
+        const change = _flowClickFilter(target, _alertsFlowFilter);
+        if (change) _applyAlertsChartFilter(change);
+    } else {
+        const part = target.closest('[data-key]');
+        const key = part ? part.getAttribute('data-key') : '';
+        if (chart === 'severity' && ALERT_SEVERITIES.includes(key)) selectAlertsSeverity(key);
+        else if (chart === 'engine' && key) _applyAlertsChartFilter({ engine: key });
+    }
+}
+
+// The engine choice and the rule and process filters of a click, in one
+// render; nothing when the click stands for no filter
+function _applyAlertsChartFilter(change) {
+    const { engine, ...names } = change || {};
+    if (engine === undefined && !Object.keys(names).length) return;
+    const select = document.getElementById('alerts-filter-engine');
+    if (engine !== undefined && select) setAlertsEngineOptions(select, alertEngines(state.alerts), engine);
+    setAlertsFilters(names);
+}
+
+// LINEAR: the Sankey in true proportions, or by square roots again
+function toggleAlertsFlowScale() {
+    alertsFlowView.linear = !alertsFlowView.linear;
+    _pressFlowScale(document.getElementById('alerts-flow-linear'), alertsFlowView.linear);
+    if (_alertsChartsDrawn) _drawAlertsFlow(_alertsChartsDrawn);
+}
+
+// The LINEAR switch of a Sankey pressed or not, its title saying what a click does
+function _pressFlowScale(button, linear) {
+    if (!button) return;
+    button.setAttribute('aria-pressed', String(linear));
+    button.title = linear ? 'Draw the flows by their square roots, so small flows stay visible' : 'Draw the flows in true proportions';
+}
+
+// The bars and the Sankey for the new width of their cards; nothing while the
+// tab is hidden or for the widths they were drawn for
+function redrawAlertsChartsOnResize() {
+    const drawn = _alertsChartsDrawn;
+    if (!drawn) return;
+    const widths = _alertsChartWidths();
+    if (!widths.time || !widths.flow || (widths.time === drawn.widths.time && widths.flow === drawn.widths.flow)) return;
+    drawn.widths = widths;
+    _drawAlertsTime(drawn);
+    _drawAlertsFlow(drawn);
 }
 
 // =============================================
@@ -1527,20 +2514,801 @@ function onTileKey(event, tile) {
 
 // Scrolls an element into view and marks it for a second (.reveal-flash)
 function revealSection(id) {
-    const el = document.getElementById(id);
+    revealElement(document.getElementById(id), 'nearest', 1000);
+}
+
+// Scrolls `el` into view (`block` as scrollIntoView takes it) and marks it
+// with .reveal-flash for `ms`, as long as its animation lasts
+function revealElement(el, block, ms) {
     if (!el) return;
-    el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    el.scrollIntoView({ behavior: 'smooth', block });
     el.classList.remove('reveal-flash');
     void el.offsetWidth;            // the animation starts again on a second click
     el.classList.add('reveal-flash');
     clearTimeout(el._revealTimer);
-    el._revealTimer = setTimeout(() => el.classList.remove('reveal-flash'), 1000);
+    el._revealTimer = setTimeout(() => el.classList.remove('reveal-flash'), ms);
 }
 
 // PROCESSES TRACKED: the process list, in the sidebar (Classic) or in the drawer (Cyberpunk)
 function revealProcessList() {
     if (currentTheme() === 'cyberpunk') openDrawer();
     else revealSection('process-list-section');
+}
+
+// =============================================
+// CHARTS
+// =============================================
+// The building blocks of the charts of the Dashboard, the Alerts tab, Sysmon,
+// ThreatScan, Submit, the graph detail and the detonation results: counting,
+// bins in time, Sankey flows and their layout, then SVG markup. Colours are
+// theme variables, var(--...), so a theme switch recolours a chart without
+// drawing it again; a colour that is no variable gives way to the palette.
+// Every text from the data goes through escapeHtml. A chart with nothing to
+// draw is '', so its card can show chartEmptyHtml(...) instead. The views
+// handle the clicks: segments, bars, legend rows and points carry data-key,
+// the bins of a bar chart data-bin-start / data-bin-end (epoch ms), the nodes
+// of a Sankey data-sankey-node, its bands data-sankey-link.
+const SEVERITY_ORDER = ['critical', 'high', 'medium', 'low', 'info'];
+const SEVERITY_COLORS = {
+    critical: 'var(--severity-critical)', high: 'var(--severity-high)', medium: 'var(--severity-medium)',
+    low: 'var(--severity-low)', info: 'var(--severity-info)',
+};
+// Colours for kinds without a colour of their own (categories, engines, event types), in this order
+const CHART_PALETTE = ['var(--accent-pink)', 'var(--accent-cyan)', 'var(--accent-yellow)', 'var(--accent-green)',
+    'var(--accent-purple)', 'var(--accent-orange)', 'var(--accent-blue)', 'var(--text-muted)'];
+const CHART_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+// A clock set to the year 9999 must not give a chart millions of bins
+const CHART_MAX_BINS = 1000;
+
+// --- Counting ---
+// An alert's category in lower case: the first of a list (["registry"]) or
+// the text ("process"); "other" when it has none.
+function alertCategory(alert) {
+    const category = alert?.category;
+    const first = Array.isArray(category) ? category[0] : category;
+    return String(first ?? '').trim().toLowerCase() || 'other';
+}
+
+// [{key, count}] of the items by keyFn(item): the most frequent first, ties in
+// the order of their keys, so a ranking keeps its order from render to render.
+function countBy(items, keyFn) {
+    const counts = new Map();
+    for (const item of items || []) {
+        const key = keyFn ? keyFn(item) : item;
+        counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    return [...counts].map(([key, count]) => ({ key, count })).sort((a, b) => {
+        const x = String(a.key), y = String(b.key);
+        return (b.count - a.count) || (x < y ? -1 : x > y ? 1 : 0);
+    });
+}
+
+// --- Bins in time ---
+// Items counted per hour, day or week: {unit, bins: [{start, end, counts,
+// total}]}, times in epoch ms. time(item) gives an item's time (default: its
+// timestamp); items without one are left out. The unit follows the span:
+// hours up to 2 days, days up to 120 days, weeks beyond; with `fine` (a
+// Sysmon capture of minutes) a span of up to 20 hours takes steps of seconds
+// or minutes instead ({unit: 'second' | 'minute', step: ms, bins}, see
+// _chartFineStep). Bins begin at a local full hour, a local midnight, a
+// Monday or a local multiple of their step, and follow each other without a
+// gap, empty ones too, from the first item (or `from`) to the last (or `to`,
+// which is not included). With `from` / `to` only the items between count,
+// and the first and last bin begin and end there: a bin's start and end
+// select exactly the items it counts. counts has every key of `keys` (0 when
+// none) and key(item) of each item counted.
+function binByTime(items, opts) {
+    opts = opts || {};
+    const time = typeof opts.time === 'function' ? opts.time : item => Date.parse(item?.timestamp);
+    const key = typeof opts.key === 'function' ? opts.key : null;
+    const hasFrom = Number.isFinite(opts.from), hasTo = Number.isFinite(opts.to);
+    const timed = [];
+    let first = Infinity, last = -Infinity;
+    for (const item of items || []) {
+        let t = time(item);
+        if (t instanceof Date) t = t.getTime();
+        if (typeof t !== 'number' || !Number.isFinite(t)) continue;
+        if ((hasFrom && t < opts.from) || (hasTo && t >= opts.to)) continue;
+        timed.push([t, item]);
+        first = Math.min(first, t);
+        last = Math.max(last, t);
+    }
+    const from = hasFrom ? opts.from : first, to = hasTo ? opts.to : last;
+    const span = to - from;
+    const step = opts.fine ? _chartFineStep(span) : 0;
+    const unit = step ? (step < 60000 ? 'second' : 'minute')
+        : span <= 2 * 86400000 ? 'hour' : span <= 120 * 86400000 ? 'day' : 'week';
+    if (!Number.isFinite(span) || span < 0 || (hasTo && span === 0)) return { unit, bins: [] };
+    const keys = (opts.keys || []).map(String);
+    const bins = [];
+    for (let start = _chartPeriodStart(from, unit, step); bins.length < CHART_MAX_BINS;) {
+        const next = _chartPeriodNext(start, unit, step);
+        const counts = Object.create(null);         // the keys come from the data: none may be special (__proto__)
+        keys.forEach(k => { counts[k] = 0; });
+        bins.push({ start: hasFrom ? Math.max(start, from) : start, end: hasTo ? Math.min(next, to) : next, counts, total: 0 });
+        if (hasTo ? next >= to : next > to) break;
+        start = next;
+    }
+    // Capped at CHART_MAX_BINS: the last bin reaches to the end, so no item is lost
+    const tail = bins[bins.length - 1];
+    if (hasTo ? tail.end < to : tail.end <= to) tail.end = hasTo ? to : _chartPeriodNext(_chartPeriodStart(to, unit, step), unit, step);
+    for (const [t, item] of timed) {
+        let lo = 0, hi = bins.length - 1;           // the last bin that starts at or before t
+        while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1;
+            if (bins[mid].start <= t) lo = mid;
+            else hi = mid - 1;
+        }
+        const bin = bins[lo];
+        bin.total++;
+        if (key) {
+            const k = String(key(item) ?? '');
+            bin.counts[k] = (bin.counts[k] || 0) + 1;
+        }
+    }
+    return step ? { unit, step, bins } : { unit, bins };
+}
+
+// The step of bins of seconds or minutes for a span of `span` ms: the
+// shortest of 1, 2, 5, 10, 15 and 30 seconds or minutes that takes at most
+// 40 of them; 0 when even half hours would take more (the span gets hours)
+function _chartFineStep(span) {
+    const steps = [1, 2, 5, 10, 15, 30].map(n => n * 1000).concat([1, 2, 5, 10, 15, 30].map(n => n * 60000));
+    return steps.find(step => span / step <= 40) || 0;
+}
+
+// The start of the local hour, day or week (Monday) that t lies in, or of
+// the step of seconds or minutes ('second' / 'minute', `step` ms)
+function _chartPeriodStart(t, unit, step) {
+    if (unit === 'hour' || unit === 'second' || unit === 'minute') {
+        // By the offset in effect at t: when the clocks go back, the hour that
+        // comes twice begins where t's own one does
+        const size = unit === 'hour' ? 3600000 : step > 0 ? step : unit === 'second' ? 1000 : 60000;
+        const offset = -new Date(t).getTimezoneOffset() * 60000;
+        return t - ((((t + offset) % size) + size) % size);
+    }
+    const d = new Date(t);
+    d.setHours(0, 0, 0, 0);
+    if (unit === 'week') d.setDate(d.getDate() - (d.getDay() + 6) % 7);
+    return d.getTime();
+}
+
+// The start of the period after the one that starts at t: an hour or a step
+// later, or the next local midnight (a day has 23 or 25 hours when the
+// clocks change)
+function _chartPeriodNext(t, unit, step) {
+    let next = t + 3600000;
+    if (unit === 'second' || unit === 'minute') {
+        next = t + (step > 0 ? step : unit === 'second' ? 1000 : 60000);
+    } else if (unit !== 'hour') {
+        const d = new Date(t);
+        d.setDate(d.getDate() + (unit === 'week' ? 7 : 1));
+        d.setHours(0, 0, 0, 0);
+        next = d.getTime();
+    }
+    return next > t ? next : t + 3600000;
+}
+
+// "14 Jul" or "14 Jul 2026", in local time
+function _chartDate(t, withYear) {
+    const d = new Date(t);
+    return `${String(d.getDate()).padStart(2, '0')} ${CHART_MONTHS[d.getMonth()]}${withYear ? ' ' + d.getFullYear() : ''}`;
+}
+
+// "22:00" (or with `seconds` "22:00:15") in local time, hours 00-23
+// (midnight is never 24:00)
+function _chartClock(t, seconds) {
+    const d = new Date(t);
+    const p = n => String(n).padStart(2, '0');
+    return `${p(d.getHours())}:${p(d.getMinutes())}${seconds ? ':' + p(d.getSeconds()) : ''}`;
+}
+
+// A bin's period for its tooltip: "14 Jul 2026, 22:00–23:00", "14 Jul 2026",
+// "13 Jul – 19 Jul 2026", "10 Nov 2026, 19:30:30–19:31:00" for seconds; a
+// day cut short by the range names its hours
+function _chartPeriodLabel(start, end, unit) {
+    if (unit === 'week') {
+        const lastDay = end - 1;
+        const sameYear = new Date(start).getFullYear() === new Date(lastDay).getFullYear();
+        return `${_chartDate(start, !sameYear)} – ${_chartDate(lastDay, true)}`;
+    }
+    const wholeDay = start === _chartPeriodStart(start, 'day') && end === _chartPeriodNext(start, 'day');
+    const seconds = unit === 'second';
+    return unit === 'day' && wholeDay ? _chartDate(start, true)
+        : `${_chartDate(start, true)}, ${_chartClock(start, seconds)}–${_chartClock(end, seconds)}`;
+}
+
+// A time range (epoch ms, `to` not included) as the chip of a filter names
+// it, in local time: "14 Jul – 20 Jul" when both ends are midnights (the last
+// day included, as a week's tooltip), else with the times, "14 Jul
+// 22:00–23:00" or "14 Jul 23:00 – 15 Jul 00:00"; "from …" or "before …" with
+// one end. The years show when the ends lie in two.
+function chartRangeLabel(from, to) {
+    const hasFrom = Number.isFinite(from), hasTo = Number.isFinite(to);
+    if (!hasFrom && !hasTo) return '';
+    const midnight = t => t === _chartPeriodStart(t, 'day');
+    const days = (!hasFrom || midnight(from)) && (!hasTo || midnight(to)) && !(hasFrom && hasTo && to <= from);
+    const last = days && hasTo ? to - 1 : to;
+    const years = hasFrom && hasTo && new Date(from).getFullYear() !== new Date(last).getFullYear();
+    const at = (t, clock) => `${_chartDate(t, years)}${clock ? ' ' + _chartClock(t) : ''}`;
+    if (!hasTo) return `from ${at(from, !days)}`;
+    if (!hasFrom) return `before ${at(to, !days)}`;
+    if (days) return _chartPeriodStart(last, 'day') === from ? at(from) : `${at(from)} – ${at(last)}`;
+    return to > from && _chartPeriodStart(to, 'day') === _chartPeriodStart(from, 'day')
+        ? `${at(from, true)}–${_chartClock(to)}` : `${at(from, true)} – ${at(to, true)}`;
+}
+
+// The bins labelled under a bar chart, with their text: the finest of whole
+// hours, days, Mondays, the 1st of a month, of a quarter, of a year that
+// leaves 48 px between labels (bars of seconds or minutes: of the round
+// times that are multiples of their step, 56 px for labels with seconds);
+// the first bin too when there is room.
+function _chartTicks(bins, unit, slot, step) {
+    const dates = bins.map(bin => new Date(bin.start));
+    const fine = unit === 'second' || unit === 'minute';
+    // The local time of day in ms, for the round times of bars of seconds or minutes
+    const local = d => (((d.getHours() * 60 + d.getMinutes()) * 60 + d.getSeconds()) * 1000) + d.getMilliseconds();
+    const rounds = [1, 2, 5, 10, 15, 30].map(n => n * 1000).concat([1, 2, 5, 10, 15, 30].map(n => n * 60000),
+                                                                      [1, 2, 3, 6, 12, 24].map(n => n * 3600000));
+    const rules = fine ? rounds.filter(ms => ms >= step && ms % step === 0).map(ms => d => local(d) % ms === 0)
+        : unit === 'hour' ? [1, 2, 3, 6, 12, 24].map(n => d => d.getHours() % n === 0)
+        : unit === 'day' ? [() => true, d => d.getDay() === 1, d => d.getDate() === 1,
+            d => d.getDate() === 1 && d.getMonth() % 3 === 0, d => d.getDate() === 1 && d.getMonth() === 0]
+        : [() => true, d => d.getDate() <= 7, d => d.getDate() <= 7 && d.getMonth() % 3 === 0,
+            d => d.getDate() <= 7 && d.getMonth() === 0];
+    const room = unit === 'second' ? 56 : 48;
+    const roomy = ticks => ticks.every((i, k) => k === 0 || (i - ticks[k - 1]) * slot >= room);
+    let ticks = null;
+    for (const rule of rules) {
+        const found = dates.flatMap((d, i) => (rule(d) ? [i] : []));
+        if (roomy(found)) { ticks = found; break; }
+    }
+    if (!ticks) {
+        const every = Math.ceil(room / slot);
+        ticks = dates.flatMap((d, i) => (i % every === 0 ? [i] : []));
+    }
+    if (ticks[0] !== 0 && (!ticks.length || ticks[0] * slot >= room)) ticks.unshift(0);
+    if (fine) {
+        // With seconds where one of them is not on a full minute; midnight is its date
+        const seconds = unit === 'second' && ticks.some(i => dates[i].getSeconds() !== 0);
+        return ticks.map(i => ({ i, text: local(dates[i]) === 0 ? _chartDate(bins[i].start) : _chartClock(bins[i].start, seconds) }));
+    }
+    return ticks.map(i => ({
+        i, text: unit === 'hour' && dates[i].getHours() + dates[i].getMinutes() > 0 ? _chartClock(bins[i].start) : _chartDate(bins[i].start),
+    }));
+}
+
+// --- SVG ---
+// The colour if it is a theme variable, var(--name), else the i-th of the
+// palette: a literal would stay the same in every theme, and a colour from
+// the data could leave its style attribute.
+function _chartColor(color, i) {
+    const n = Number.isInteger(i) && i > 0 ? i : 0;
+    return typeof color === 'string' && /^var\(--[\w-]+\)$/.test(color) ? color : CHART_PALETTE[n % CHART_PALETTE.length];
+}
+
+// A count with thousands separators (9,620)
+function _chartNumber(n) {
+    const value = Number(n);
+    return Number.isFinite(value) ? value.toLocaleString('en-US', { maximumFractionDigits: 2 }) : '0';
+}
+
+// A share in per cent with one decimal; "<0.1%" for one too small to show
+function _chartShare(value, total) {
+    const pct = total > 0 && value > 0 ? value / total * 100 : 0;
+    return pct > 0 && pct < 0.05 ? '<0.1%' : `${pct.toFixed(1)}%`;
+}
+
+// A coordinate with at most two decimals
+function _chartCoord(n) {
+    return String(Math.round(n * 100) / 100);
+}
+
+// The text cut to at most `max` characters, the last of them "…" where it is cut
+function _chartEllipsis(text, max) {
+    const chars = Array.from(String(text ?? ''));           // by code point: an emoji is not cut in half
+    return chars.length <= max ? chars.join('') : `${chars.slice(0, Math.max(max - 1, 0)).join('')}…`;
+}
+
+// The items of a donut or a pie with a value above 0: each with its colour
+// (its own, or the palette's by its place in the list, as in its legend), its
+// tooltip and its part of the circle; a part too small to see gets a sliver.
+function _chartSegments(items) {
+    const segments = [];
+    (items || []).forEach((item, i) => {
+        const value = Number(item?.value);
+        if (!(value > 0) || !Number.isFinite(value)) return;
+        segments.push({ key: item.key, label: String(item.label ?? item.key ?? ''), value, color: _chartColor(item.color, i) });
+    });
+    const total = segments.reduce((sum, s) => sum + s.value, 0);
+    const shown = segments.map(s => Math.max(s.value / total, 0.004));
+    const sum = shown.reduce((a, b) => a + b, 0);
+    segments.forEach((s, i) => {
+        s.part = shown[i] / sum;
+        s.title = `${s.label}: ${_chartNumber(s.value)} (${_chartShare(s.value, total)})`;
+    });
+    return { total, segments };
+}
+
+// A ring of items [{key, label, value, color}], clockwise from 12 o'clock,
+// with the total (or centerLabel; '' for none) and centerSub in its middle.
+// One item of 100 % is a circle: an arc from a point back to itself draws nothing.
+function donutSvg(items, opts) {
+    opts = opts || {};
+    const { total, segments } = _chartSegments(items);
+    if (!segments.length) return '';
+    const size = opts.size > 0 ? Number(opts.size) : 120;
+    const thickness = opts.thickness > 0 ? Math.min(Number(opts.thickness), size / 2) : 18;
+    const c = size / 2, r = (size - thickness) / 2;
+    const at = angle => `${_chartCoord(c + r * Math.cos(angle))} ${_chartCoord(c + r * Math.sin(angle))}`;
+    let angle = -Math.PI / 2;
+    const ring = segments.map(s => {
+        const attrs = `class="chart-seg" data-key="${escapeHtml(s.key)}" data-value="${s.value}" fill="none" stroke-width="${_chartCoord(thickness)}" style="stroke:${s.color}"`;
+        const title = `<title>${escapeHtml(s.title)}</title>`;
+        if (s.part > 0.9999) return `<circle ${attrs} cx="${c}" cy="${c}" r="${_chartCoord(r)}">${title}</circle>`;
+        const from = angle;
+        angle += s.part * 2 * Math.PI;
+        return `<path ${attrs} d="M${at(from)} A${_chartCoord(r)} ${_chartCoord(r)} 0 ${s.part > 0.5 ? 1 : 0} 1 ${at(angle)}">${title}</path>`;
+    });
+    const label = opts.centerLabel === undefined ? _chartNumber(total)
+        : typeof opts.centerLabel === 'number' ? _chartNumber(opts.centerLabel) : String(opts.centerLabel ?? '');
+    const sub = String(opts.centerSub ?? '');
+    const center = (label ? `<text class="chart-center-label" x="${c}" y="${_chartCoord(sub ? c + 2 : c + 6)}" text-anchor="middle">${escapeHtml(label)}</text>` : '')
+        + (sub ? `<text class="chart-center-sub" x="${c}" y="${_chartCoord(label ? c + 16 : c + 3)}" text-anchor="middle">${escapeHtml(sub)}</text>` : '');
+    return `<svg class="chart-svg chart-donut" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">${ring.join('')}${center}</svg>`;
+}
+
+// The items as slices of a disc, clockwise from 12 o'clock, apart by a thin
+// line in the colour of the card; one item of 100 % is the whole disc.
+function pieSvg(items, opts) {
+    opts = opts || {};
+    const { segments } = _chartSegments(items);
+    if (!segments.length) return '';
+    const size = opts.size > 0 ? Number(opts.size) : 120;
+    const c = size / 2, r = Math.max(size / 2 - 2, 1);
+    const at = angle => `${_chartCoord(c + r * Math.cos(angle))} ${_chartCoord(c + r * Math.sin(angle))}`;
+    let angle = -Math.PI / 2;
+    const slices = segments.map(s => {
+        const attrs = `class="chart-seg chart-slice" data-key="${escapeHtml(s.key)}" data-value="${s.value}" style="fill:${s.color}"`;
+        const title = `<title>${escapeHtml(s.title)}</title>`;
+        if (s.part > 0.9999) return `<circle ${attrs} cx="${c}" cy="${c}" r="${_chartCoord(r)}">${title}</circle>`;
+        const from = angle;
+        angle += s.part * 2 * Math.PI;
+        return `<path ${attrs} d="M${c} ${c} L${at(from)} A${_chartCoord(r)} ${_chartCoord(r)} 0 ${s.part > 0.5 ? 1 : 0} 1 ${at(angle)} Z">${title}</path>`;
+    });
+    return `<svg class="chart-svg chart-pie" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}">${slices.join('')}</svg>`;
+}
+
+// The legend of a donut or a pie: per item its colour, name, count and share
+// of `total` (default: the sum of the values), one row with data-key each.
+// A long name is cut by CSS; the row's title has it in full.
+function chartLegendHtml(items, opts) {
+    opts = opts || {};
+    const list = items || [];
+    const values = list.map(item => {
+        const value = Number(item?.value);
+        return Number.isFinite(value) && value > 0 ? value : 0;
+    });
+    const total = Number(opts.total) > 0 ? Number(opts.total) : values.reduce((sum, v) => sum + v, 0);
+    const rows = list.map((item, i) => {
+        if (!item) return '';
+        const label = String(item.label ?? item.key ?? '');
+        return `<div class="chart-legend-row" data-key="${escapeHtml(item.key)}" title="${escapeHtml(label)}">`
+            + `<span class="chart-legend-swatch" style="background:${_chartColor(item.color, i)}"></span>`
+            + `<span class="chart-legend-name">${escapeHtml(label)}</span>`
+            + `<span class="chart-legend-count">${_chartNumber(values[i])}</span>`
+            + `<span class="chart-legend-pct">${escapeHtml(_chartShare(values[i], total))}</span></div>`;
+    }).join('');
+    return rows ? `<div class="chart-legend">${rows}</div>` : '';
+}
+
+// Bars of bins (binByTime), each a stack of its counts: the first key of
+// `keys` on top, keys that are not in `keys` below them; colours from
+// `colors` ({key: 'var(--x)'} or a list in the order of `keys`), else the
+// palette. Each bin is a <g data-bin-start data-bin-end> whose <title> names
+// its period and numbers; labels of times or dates under the plot (`unit`
+// and `step` of binByTime, else hours, days or weeks by the length of the
+// bins); the highest bin's count at the top left. selection {from, to} marks
+// a range.
+function stackedBarsSvg(bins, opts) {
+    opts = opts || {};
+    const list = (bins || []).filter(bin => bin && Number.isFinite(bin.start) && Number.isFinite(bin.end));
+    const keys = [...new Set((opts.keys || []).map(String))];
+    for (const bin of list) Object.keys(bin.counts || {}).forEach(k => { if (!keys.includes(k)) keys.push(k); });
+    // Without keys a bar is its bin's total
+    const stacks = list.map(bin => (keys.length ? keys.map(k => [k, Number(bin.counts?.[k]) || 0]).filter(([, n]) => n > 0)
+        : Number(bin.total) > 0 ? [['total', Number(bin.total)]] : []));
+    const max = Math.max(0, ...stacks.map(stack => stack.reduce((sum, [, n]) => sum + n, 0)));
+    if (!(max > 0)) return '';
+    const width = opts.width > 0 ? Number(opts.width) : 560, height = opts.height > 0 ? Number(opts.height) : 140;
+    const top = 12, plotH = Math.max(height - top - 16, 10), bottom = top + plotH;
+    const slot = width / list.length;
+    // A bar fills its slot but a 1 px gap, up to 40 px: a single bin is no block across the chart
+    const barW = Math.min(Math.max(slot - (slot > 2 ? 1 : 0), 0.5), 40), inset = (slot - barW) / 2;
+    const longest = Math.max(...list.map(bin => bin.end - bin.start));
+    const unit = ['second', 'minute', 'hour', 'day', 'week'].includes(opts.unit) ? opts.unit
+        : longest <= 2 * 3600000 ? 'hour' : longest <= 2 * 86400000 ? 'day' : 'week';
+    const step = opts.step > 0 ? Number(opts.step) : longest;
+    const color = k => _chartColor(Array.isArray(opts.colors) ? opts.colors[keys.indexOf(k)] : opts.colors?.[k], keys.indexOf(k));
+    let svg = [0.25, 0.5, 0.75, 1].map(f => {
+        const y = _chartCoord(bottom - plotH * f);
+        return `<line class="chart-grid" x1="0" x2="${width}" y1="${y}" y2="${y}"/>`;
+    }).join('') + `<text class="chart-ymax" x="0" y="${top - 3}">${_chartNumber(max)}</text>`;
+    list.forEach((bin, i) => {
+        const x = i * slot;
+        let y = bottom, bars = '';
+        for (const [k, n] of [...stacks[i]].reverse()) {
+            const h = plotH * n / max;
+            y -= h;
+            bars += `<rect class="chart-bar" data-key="${escapeHtml(k)}" data-count="${n}" x="${_chartCoord(x + inset)}" y="${_chartCoord(y)}" width="${_chartCoord(barW)}" height="${_chartCoord(h)}" style="fill:${color(k)}"/>`;
+        }
+        const title = [_chartPeriodLabel(bin.start, bin.end, unit), `total: ${_chartNumber(bin.total)}`,
+            ...(keys.length ? stacks[i].map(([k, n]) => `${k}: ${_chartNumber(n)}`) : [])].join('\n');
+        svg += `<g class="chart-bin" data-bin-start="${bin.start}" data-bin-end="${bin.end}" data-total="${Number(bin.total) || 0}"><title>${escapeHtml(title)}</title>`
+            + `<rect class="chart-hit" x="${_chartCoord(x)}" y="${top}" width="${_chartCoord(slot)}" height="${_chartCoord(plotH)}" fill="transparent"/>${bars}</g>`;
+    });
+    svg += `<line class="chart-axis" x1="0" x2="${width}" y1="${bottom}" y2="${bottom}"/>`;
+    if (opts.selection) {
+        const xOf = t => {
+            if (t <= list[0].start) return 0;
+            if (t >= list[list.length - 1].end) return width;
+            const i = list.findIndex(bin => t < bin.end);
+            return (i + Math.max(0, (t - list[i].start) / (list[i].end - list[i].start))) * slot;
+        };
+        const x0 = xOf(Number.isFinite(opts.selection.from) ? opts.selection.from : -Infinity);
+        const x1 = xOf(Number.isFinite(opts.selection.to) ? opts.selection.to : Infinity);
+        if (x1 > x0) svg += `<rect class="chart-selection" x="${_chartCoord(x0)}" y="${top}" width="${_chartCoord(x1 - x0)}" height="${_chartCoord(plotH)}" fill="none"/>`;
+    }
+    for (const { i, text } of _chartTicks(list, unit, slot, step)) {
+        const x = i * slot + inset;
+        if (x + text.length * 5.6 > width) continue;     // it would run past the right edge
+        svg += `<text class="chart-tick" x="${_chartCoord(x)}" y="${height - 3}">${escapeHtml(text)}</text>`;
+    }
+    return `<svg class="chart-svg chart-bars" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${svg}</svg>`;
+}
+
+// A small line of values (alerts per day of a tile), its area faintly
+// filled: the highest value at the top, 0 on the ground.
+function sparklineSvg(values, opts) {
+    opts = opts || {};
+    const list = (values || []).map(v => (Number.isFinite(Number(v)) ? Math.max(Number(v), 0) : 0));
+    if (!list.length) return '';
+    const width = opts.width > 0 ? Number(opts.width) : 120, height = opts.height > 0 ? Number(opts.height) : 26;
+    const color = _chartColor(opts.color, 0);
+    const max = Math.max(...list) || 1;
+    const line = list.length === 1 ? [list[0], list[0]] : list;
+    const points = line.map((v, i) => `${_chartCoord(i * width / (line.length - 1))},${_chartCoord(height - 3 - (height - 6) * v / max)}`).join(' ');
+    return `<svg class="chart-svg chart-spark" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`
+        + `<polygon class="chart-spark-area" points="0,${height} ${points} ${width},${height}" style="fill:${color}"/>`
+        + `<polyline class="chart-spark-line" points="${points}" fill="none" style="stroke:${color}"/></svg>`;
+}
+
+// Points [{x, y, color, title, key}] along x (a time or a rank) at height y
+// (a score; above yMax at the top edge). A point without a score (y null) sits
+// in a lane "no score" under the axis. thresholds [{y, label}] are dashed
+// lines, labelled "<label> <y>" on the left.
+function scatterSvg(points, opts) {
+    opts = opts || {};
+    const list = (points || []).filter(Boolean);
+    if (!list.length) return '';
+    const width = opts.width > 0 ? Number(opts.width) : 520, height = opts.height > 0 ? Number(opts.height) : 120;
+    const score = point => (point.y === null || point.y === undefined || point.y === '' ? NaN : Number(point.y));
+    const scores = list.map(score).filter(Number.isFinite);
+    const thresholds = (opts.thresholds || []).filter(th => th && Number.isFinite(Number(th.y)))
+        .map(th => ({ y: Number(th.y), label: `${th.label ?? ''} ${_chartNumber(th.y)}`.trim() }));
+    const yMax = opts.yMax > 0 ? Number(opts.yMax) : Math.max(1, ...scores, ...thresholds.map(th => th.y)) * 1.1;
+    const lane = scores.length < list.length;
+    const longest = Math.max(lane ? 'no score'.length : 0, ...thresholds.map(th => th.label.length));
+    const left = Math.max(40, Math.ceil(longest * 5.6) + 10), radius = 4, laneH = 16;
+    const top = 8, axisY = height - (lane ? laneH + 10 : 6), laneY = axisY + 6;
+    const yOf = y => axisY - (axisY - top) * Math.min(Math.max(y, 0), yMax) / yMax;
+    const xs = list.map((point, i) => (typeof point.x === 'number' && Number.isFinite(point.x) ? point.x : i));
+    const xMin = Math.min(...xs), xMax = Math.max(...xs), inset = radius + 2;
+    const xOf = x => (xMax > xMin ? left + inset + (width - left - 2 * inset) * (x - xMin) / (xMax - xMin) : (left + width) / 2);
+    let svg = `<line class="chart-axis" x1="${left}" x2="${width}" y1="${axisY}" y2="${axisY}"/>`;
+    for (const th of thresholds) {
+        if (th.y < 0 || th.y > yMax) continue;
+        const y = yOf(th.y);
+        svg += `<line class="chart-threshold" x1="${left}" x2="${width}" y1="${_chartCoord(y)}" y2="${_chartCoord(y)}" stroke-dasharray="4 3"/>`
+            + `<text class="chart-threshold-label" x="0" y="${_chartCoord(y + 3)}">${escapeHtml(th.label)}</text>`;
+    }
+    if (lane) {
+        svg += `<rect class="chart-lane" x="${left}" y="${laneY}" width="${width - left}" height="${laneH}" fill="none"/>`
+            + `<text class="chart-lane-label" x="0" y="${laneY + laneH / 2 + 3}">no score</text>`;
+    }
+    list.forEach((point, i) => {
+        const y = score(point), scored = Number.isFinite(y);
+        const title = point.title ?? (scored ? _chartNumber(y) : 'no score');
+        svg += `<circle class="chart-point" cx="${_chartCoord(xOf(xs[i]))}" cy="${_chartCoord(scored ? yOf(y) : laneY + laneH / 2)}" r="${radius}" data-key="${escapeHtml(point.key)}" style="fill:${_chartColor(point.color, i)}"><title>${escapeHtml(title)}</title></circle>`;
+    });
+    return `<svg class="chart-svg chart-scatter" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${svg}</svg>`;
+}
+
+// Bars [{key, y, color, title}] side by side in their order (a submission
+// each, the oldest first), each as high as its y (a score; above yMax at the
+// top edge). A bar of 0 or without a score (y null) is a stub on the axis, so
+// that it shows and takes a click. thresholds [{y, label}] are dashed lines,
+// labelled "<label> <y>" on the left. Each bar is a <g class="chart-slot"
+// data-key> with its tooltip, over the whole height of its slot.
+function verdictBarsSvg(items, opts) {
+    opts = opts || {};
+    const list = (items || []).filter(Boolean);
+    if (!list.length) return '';
+    const width = opts.width > 0 ? Number(opts.width) : 520, height = opts.height > 0 ? Number(opts.height) : 120;
+    const score = item => (item.y === null || item.y === undefined || item.y === '' ? NaN : Number(item.y));
+    const scores = list.map(score).filter(Number.isFinite);
+    const thresholds = (opts.thresholds || []).filter(th => th && Number.isFinite(Number(th.y)))
+        .map(th => ({ y: Number(th.y), label: `${th.label ?? ''} ${_chartNumber(th.y)}`.trim() }));
+    const yMax = opts.yMax > 0 ? Number(opts.yMax) : Math.max(1, ...scores, ...thresholds.map(th => th.y)) * 1.1;
+    const longest = Math.max(0, ...thresholds.map(th => th.label.length));
+    const left = Math.max(40, Math.ceil(longest * 5.6) + 10), top = 8, axisY = height - 6, stub = 3;
+    const plotH = Math.max(axisY - top, 10);
+    const yOf = y => axisY - plotH * Math.min(Math.max(y, 0), yMax) / yMax;
+    const slot = Math.max(width - left, 1) / list.length;
+    // A bar fills its slot but a 1 px gap, up to 24 px
+    const barW = Math.min(Math.max(slot - (slot > 2 ? 1 : 0), 0.5), 24), inset = (slot - barW) / 2;
+    let svg = '';
+    for (const th of thresholds) {
+        if (th.y < 0 || th.y > yMax) continue;
+        const y = yOf(th.y);
+        svg += `<line class="chart-threshold" x1="${left}" x2="${width}" y1="${_chartCoord(y)}" y2="${_chartCoord(y)}" stroke-dasharray="4 3"/>`
+            + `<text class="chart-threshold-label" x="0" y="${_chartCoord(y + 3)}">${escapeHtml(th.label)}</text>`;
+    }
+    list.forEach((item, i) => {
+        const y = score(item), x = left + i * slot;
+        const h = Math.max(axisY - yOf(Number.isFinite(y) ? y : 0), stub);
+        const title = item.title ?? (Number.isFinite(y) ? _chartNumber(y) : 'no score');
+        svg += `<g class="chart-slot" data-key="${escapeHtml(item.key)}"><title>${escapeHtml(title)}</title>`
+            + `<rect class="chart-hit" x="${_chartCoord(x)}" y="${top}" width="${_chartCoord(slot)}" height="${_chartCoord(plotH)}" fill="transparent"/>`
+            + `<rect class="chart-bar" x="${_chartCoord(x + inset)}" y="${_chartCoord(axisY - h)}" width="${_chartCoord(barW)}" height="${_chartCoord(h)}" style="fill:${_chartColor(item.color, i)}"/></g>`;
+    });
+    svg += `<line class="chart-axis" x1="${left}" x2="${width}" y1="${axisY}" y2="${axisY}"/>`;
+    return `<svg class="chart-svg chart-bars" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${svg}</svg>`;
+}
+
+// The hint a card shows instead of a chart without data ("No alerts in this range")
+function chartEmptyHtml(text) {
+    return `<div class="chart-empty">${escapeHtml(text)}</div>`;
+}
+
+// Such a hint as the only row of a table view: with its full stop ("No alerts yet.")
+function _chartSentence(text) {
+    const words = String(text ?? '');
+    return /[.!?…]$/.test(words) ? words : `${words}.`;
+}
+
+// --- Sankey ---
+// The keys of counts [{key, count}] (countBy) that stand on their own: the
+// `top` most frequent, ties in the order of counts. label(key) is the key if
+// kept, else otherLabel. An "other" never stands for a single key: when only
+// one would be left over, it is kept too.
+function topWithOther(counts, top, otherLabel) {
+    const n = typeof top === 'number' && top >= 0 ? Math.floor(top) : 6;
+    const ranked = (Array.isArray(counts) ? counts : []).filter(Boolean)
+        .sort((a, b) => (Number(b.count) || 0) - (Number(a.count) || 0));
+    const keep = new Set((ranked.length > n + 1 ? ranked.slice(0, n) : ranked).map(c => c.key));
+    return { keep, label: key => (keep.has(key) ? key : otherLabel) };
+}
+
+// The alerts as a flow engine → rule → process (the Alerts tab), for
+// layoutSankey and sankeySvg: {columns, links, labels}. A column groups its
+// names as the filters of the Alerts tab compare them, so a node counts what
+// its filter lists: an engine in any case; a rule or a process in any case and
+// without the blanks around it, none (or one named so) as "(unknown)", which
+// the filters of the rule and the process take for both. A node takes the
+// first spelling of its name in opts.names (default: the alerts), e.g. all
+// alerts while the flow shows those of the filters, so a name keeps its
+// spelling whatever the filters. Every engine stands on its own, so do the
+// `top` (default 6) most frequent rules and processes; the rest is "other
+// rules" / "other processes", last in its column. A node's id is its kind and
+// name: "engine:Sigma", "rule:<name>", "process:<name>" ("engine:" for alerts
+// without an engine, labelled "(unknown)"), so a process named like a rule or
+// "other processes" stays a node of its own. labels has each id's text.
+function alertFlow(alerts, opts) {
+    return _chartFlow(alerts, [
+        // [kind, an alert's name in the flow, the key it is grouped by, the rest]: an engine in
+        // any case, as the engine choice compares it; a rule or a process as its filter does
+        ['engine', alert => String(alert.engine || ''), name => name.toLowerCase(), null],
+        ['rule', alert => alertRuleName(alert).trim() || '(unknown)', _alertsNameKey, 'other rules'],
+        ['process', alert => alertProcessName(alert).trim() || '(unknown)', _alertsNameKey, 'other processes'],
+    ], opts);
+}
+
+// Items as a flow from column to column (alertFlow, sysmonFlow): steps
+// [[kind, name(item), key(name), other], ...], one per column. An item's node
+// in a column is its name there, grouped by its key, in the first spelling
+// of opts.names (default: the items); with `other`, only the `top` (default
+// 6) most frequent names stand on their own, the rest is `other`, last in its
+// column. Ids are "<kind>:<name>" ("<kind>:" for an empty name, labelled
+// "(unknown)"); each item flows once from each column to the next.
+function _chartFlow(items, steps, opts) {
+    opts = opts || {};
+    const list = (items || []).filter(Boolean);
+    const names = Array.isArray(opts.names) ? opts.names.filter(Boolean) : list;
+    // Per step, per item: the id of its node
+    const ids = steps.map(([kind, name, keyOf, other]) => {
+        const first = new Map();                    // the key -> the id of its first spelling
+        const spell = item => {
+            const text = name(item), key = keyOf(text);
+            if (!first.has(key)) first.set(key, `${kind}:${text}`);
+            return first.get(key);
+        };
+        if (names !== list) names.forEach(spell);
+        const own = list.map(spell);
+        return other ? own.map(topWithOther(countBy(own), opts.top ?? 6, other).label) : own;
+    });
+    const labels = Object.create(null);
+    const columns = steps.map(([kind, , , other], c) => {
+        const ranked = countBy(ids[c]).map(x => x.key);
+        const column = [...ranked.filter(id => id !== other), ...ranked.filter(id => id === other)];
+        column.forEach(id => { labels[id] = id === other ? other : id.slice(kind.length + 1) || '(unknown)'; });
+        return column;
+    });
+    const links = [];
+    for (let c = 0; c + 1 < steps.length; c++) {
+        const pairs = new Map();                    // source id -> Map(target id -> items)
+        for (let i = 0; i < list.length; i++) {
+            const source = ids[c][i], target = ids[c + 1][i];
+            if (!pairs.has(source)) pairs.set(source, new Map());
+            pairs.get(source).set(target, (pairs.get(source).get(target) || 0) + 1);
+        }
+        pairs.forEach((targets, source) => targets.forEach((value, target) => links.push({ source, target, value })));
+    }
+    return { columns, links, labels };
+}
+
+// Where the nodes and bands of a Sankey go: {nodes: [{id, col, x, y, h,
+// value}], links: [{source, target, value, sy, ty, thickness_s,
+// thickness_t}], width, height, nodeWidth}. columns [[id, ...], ...] run from
+// left to right, links [{source, target, value}] from a column to the next;
+// other links, values not above 0, an id listed a second time and nodes
+// without flow are left out, the same pair twice adds up. A node's value is
+// max(in, out), its height that value or its square root (scale 'sqrt', the
+// default, so small flows stay visible; 'linear' for true proportions) times
+// one factor for all columns: the largest at which every column fits. The
+// nodes of a column keep their order, centred, `gap` apart (less where the
+// gaps would take more than a quarter of the height), at least 2 px high
+// (less where a crowded column would not fit). A band leaves its source at
+// sy and enters its target at ty, as thick as its share of each node; the
+// bands of a node lie side by side from its top in the order of their other
+// ends, so they do not cross there. The last column keeps labelWidth (a
+// quarter of the width) on its right for its labels.
+function layoutSankey(columns, links, opts) {
+    opts = opts || {};
+    const width = opts.width > 0 ? Number(opts.width) : 720, height = opts.height > 0 ? Number(opts.height) : 240;
+    const nodeWidth = opts.nodeWidth > 0 ? Number(opts.nodeWidth) : 12;
+    const gap = opts.gap >= 0 ? Number(opts.gap) : 10;
+    const labelWidth = opts.labelWidth >= 0 ? Number(opts.labelWidth) : width / 4;
+    const size = opts.scale === 'linear' ? v => v : Math.sqrt;
+    const layout = { nodes: [], links: [], width, height, nodeWidth };
+    const colOf = new Map();                        // each id in the first column that lists it
+    (columns || []).forEach((column, c) => (column || []).forEach(id => { if (!colOf.has(id)) colOf.set(id, c); }));
+    const flows = new Map();                        // source -> Map(target -> value)
+    const flowIn = new Map(), flowOut = new Map();
+    for (const link of links || []) {
+        const value = Number(link?.value), from = colOf.get(link?.source);
+        if (!(value > 0) || !Number.isFinite(value) || from === undefined || colOf.get(link.target) !== from + 1) continue;
+        if (!flows.has(link.source)) flows.set(link.source, new Map());
+        flows.get(link.source).set(link.target, (flows.get(link.source).get(link.target) || 0) + value);
+        flowOut.set(link.source, (flowOut.get(link.source) || 0) + value);
+        flowIn.set(link.target, (flowIn.get(link.target) || 0) + value);
+    }
+    const stacks = [];                              // the columns with nodes: {c, nodes, space, least, k}
+    colOf.forEach((c, id) => {
+        const value = Math.max(flowIn.get(id) || 0, flowOut.get(id) || 0);
+        if (!(value > 0)) return;
+        if (stacks[stacks.length - 1]?.c !== c) stacks.push({ c, nodes: [] });
+        stacks[stacks.length - 1].nodes.push({ id, col: c, x: 0, y: 0, h: 0, value });
+    });
+    if (stacks.length < 2) return layout;
+    for (const stack of stacks) {
+        const n = stack.nodes.length;
+        stack.space = n > 1 ? Math.min(gap, height / 4 / (n - 1)) : 0;
+        stack.least = Math.min(2, height / 2 / n);
+        stack.k = _sankeyFit(stack.nodes.map(node => size(node.value)), height - stack.space * (n - 1), stack.least);
+    }
+    const k = Math.min(...stacks.map(stack => stack.k));
+    const first = stacks[0].c, step = Math.max(width - labelWidth - nodeWidth, 0) / (stacks[stacks.length - 1].c - first);
+    for (const { c, nodes, space, least } of stacks) {
+        nodes.forEach(node => { node.h = Math.max(size(node.value) * k, least); });
+        let y = (height - nodes.reduce((sum, node) => sum + node.h, 0) - space * (nodes.length - 1)) / 2;
+        for (const node of nodes) {
+            node.x = (c - first) * step;
+            node.y = y;
+            y += node.h + space;
+        }
+        layout.nodes.push(...nodes);
+    }
+    const byId = new Map(layout.nodes.map(node => [node.id, node]));
+    flows.forEach((targets, source) => targets.forEach((value, target) => {
+        const src = byId.get(source), dst = byId.get(target);
+        layout.links.push({ source, target, value, sy: 0, ty: 0, thickness_s: src.h * value / src.value, thickness_t: dst.h * value / dst.value });
+    }));
+    const stackBands = (end, other, at, thick) => {
+        const ends = new Map();                     // node id -> its bands at this end
+        for (const band of layout.links) {
+            if (!ends.has(band[end])) ends.set(band[end], []);
+            ends.get(band[end]).push(band);
+        }
+        ends.forEach((bands, id) => {
+            let y = byId.get(id).y;
+            bands.sort((a, b) => byId.get(a[other]).y - byId.get(b[other]).y)
+                .forEach(band => { band[at] = y; y += band[thick]; });
+        });
+    };
+    stackBands('source', 'target', 'sy', 'thickness_s');
+    stackBands('target', 'source', 'ty', 'thickness_t');
+    return layout;
+}
+
+// The largest factor k at which nodes of these sizes, each max(size * k,
+// least) high, take no more than `room` (at least `least` per node): the
+// smallest go to `least` one by one until the others fit at k.
+function _sankeyFit(sizes, room, least) {
+    const sorted = [...sizes].sort((a, b) => a - b);
+    let rest = sorted.reduce((sum, s) => sum + s, 0);
+    for (let i = 0; i < sorted.length; i++) {
+        const k = (room - i * least) / rest;
+        if (sorted[i] * k >= least - 1e-9) return k;
+        rest -= sorted[i];
+    }
+    return 0;
+}
+
+// A Sankey of layoutSankey as SVG: the bands in the colour of their source,
+// translucent, the thinnest on top (at least 1 px, so a flow of 1 among
+// thousands stays visible), then the nodes, each with its name and value on
+// its right. colors: {id: 'var(--x)'} or a function of the node; else the
+// palette by the node's place in its column, one colour further per column
+// (the first column takes the colours of a pie of the same list). labels:
+// {id: text} or a function of the id; else the id. A name is cut with "…" to
+// the room up to the next column; the <title> has it in full. A node is a
+// <g data-sankey-node="<id>">, a band a <path data-sankey-link=
+// '["<source>","<target>"]' data-source data-target>: the pair as JSON, so a
+// click gets both ends back whatever their names.
+function sankeySvg(layout, opts) {
+    opts = opts || {};
+    const nodes = (layout?.nodes || []).filter(n => n && [n.x, n.y, n.h].every(Number.isFinite));
+    if (!nodes.length) return '';
+    const width = layout.width > 0 ? Number(layout.width) : 720, height = layout.height > 0 ? Number(layout.height) : 240;
+    const nodeWidth = layout.nodeWidth > 0 ? Number(layout.nodeWidth) : 12;
+    const own = (map, id) => (map && typeof map === 'object' && Object.prototype.hasOwnProperty.call(map, id) ? map[id] : undefined);
+    const labelOf = id => String((typeof opts.labels === 'function' ? opts.labels(id) : own(opts.labels, id)) ?? id ?? '');
+    const colorOf = n => (typeof opts.colors === 'function' ? opts.colors(n) : own(opts.colors, n.id));
+    const drawn = new Map(), places = new Map();    // id -> the node to draw; column -> nodes so far
+    for (const n of nodes) {
+        const i = places.get(n.col) || 0;
+        places.set(n.col, i + 1);
+        drawn.set(n.id, { ...n, label: labelOf(n.id), color: _chartColor(colorOf(n), (Number(n.col) || 0) + i) });
+    }
+    const c = _chartCoord;
+    const span = (y, t) => (t >= 1 ? [y, t] : [y + t / 2 - 0.5, 1]);
+    const bands = (layout.links || []).filter(b => b && drawn.has(b.source) && drawn.has(b.target)
+        && [b.sy, b.ty, b.thickness_s, b.thickness_t].every(Number.isFinite)).sort((a, b) => b.value - a.value);
+    let svg = '';
+    for (const band of bands) {
+        const src = drawn.get(band.source), dst = drawn.get(band.target);
+        const x0 = src.x + nodeWidth, x1 = dst.x, mx = (x0 + x1) / 2;
+        const [y0, t0] = span(band.sy, band.thickness_s), [y1, t1] = span(band.ty, band.thickness_t);
+        const value = Number(band.value) || 0;
+        const title = `${src.label} → ${dst.label}: ${_chartNumber(value)}`;
+        svg += `<path class="sankey-link" data-sankey-link="${escapeHtml(JSON.stringify([String(band.source), String(band.target)]))}"`
+            + ` data-source="${escapeHtml(band.source)}" data-target="${escapeHtml(band.target)}" data-value="${value}"`
+            + ` d="M${c(x0)} ${c(y0)} C${c(mx)} ${c(y0)} ${c(mx)} ${c(y1)} ${c(x1)} ${c(y1)} L${c(x1)} ${c(y1 + t1)}`
+            + ` C${c(mx)} ${c(y1 + t1)} ${c(mx)} ${c(y0 + t0)} ${c(x0)} ${c(y0 + t0)} Z" style="fill:${src.color}"><title>${escapeHtml(title)}</title></path>`;
+    }
+    // A label has the room from its node to the next column (or the right edge), at about 6 px per character
+    const xs = [...new Set(nodes.map(n => n.x))].sort((a, b) => a - b);
+    for (const n of drawn.values()) {
+        const value = Number(n.value) || 0, count = _chartNumber(value);
+        const room = (xs.find(x => x > n.x) ?? width) - n.x - nodeWidth - 12;
+        const name = _chartEllipsis(n.label, Math.max(Math.floor(room / 6) - count.length - 1, 4));
+        svg += `<g class="sankey-node" data-sankey-node="${escapeHtml(n.id)}" data-value="${value}"><title>${escapeHtml(`${n.label}: ${count}`)}</title>`
+            + `<rect class="sankey-bar" x="${c(n.x)}" y="${c(n.y)}" width="${c(nodeWidth)}" height="${c(n.h)}" rx="2" style="fill:${n.color}"/>`
+            + `<text class="sankey-label" x="${c(n.x + nodeWidth + 6)}" y="${c(n.y + n.h / 2 + 3.5)}">${escapeHtml(name)} <tspan class="sankey-value">${count}</tspan></text></g>`;
+    }
+    // 6 px above and below: the label of a node at the edge is not cut off
+    return `<svg class="chart-svg chart-sankey" width="${width}" height="${height + 12}" viewBox="0 -6 ${width} ${height + 12}">${svg}</svg>`;
 }
 
 // =============================================
@@ -2352,6 +4120,7 @@ function clearStoppedProcesses() {
     procs.forEach(proc => {
         if (proc.exit_time) delete state.processes[procKey(proc)];
     });
+    releaseDashboardCounts();               // the list changed in place: the dashboard counts it again
     renderRtraceConsole();
     renderProcessList();
 }
@@ -2359,6 +4128,7 @@ function clearStoppedProcesses() {
 function clearAllTracing() {
     state.alerts = [];
     state.processes = {};
+    releaseDashboardCounts();               // the dashboard (hidden here) holds no counts of the lists cleared
     state.rtraceSelectedPid = null;
     const placeholder = document.getElementById('rtrace-detail-placeholder');
     const content = document.getElementById('rtrace-detail-content');
@@ -2607,20 +4377,45 @@ async function loadScanHistory() {
         const data = await resp.json();
         renderUnifiedHistory(data.history || []);
     } catch (e) {
-        // history must never break the page
+        // history must never break the page; a chart that has nothing yet says why
+        if (!_scoreHistoryDrawn) renderScoreHistory(null, 'Scan history not available');
     }
 }
 
+// A scan's time in epoch ms (NaN without one) and as the list shows it ("05/11/2026, 11:37:31")
+function _histTime(entry) {
+    const date = new Date(entry?.timestamp ?? NaN), t = date.getTime();
+    return { t, text: Number.isNaN(t) ? '\u2014' : date.toLocaleString('en-GB', { hour12: false }) };
+}
+
+// The tools whose score is the evidence score of the memory scans (its own
+// scale: suspicious >= 2, malicious >= 6), as app.py's _normalize_scan sets it
+const EVIDENCE_SCORE_TOOLS = ['aether', 'exit capture'];
+
+// What a scan's score is: 'evidence' (Aether, Exit Capture), 'probability'
+// (EMBER2024 reports the model's malicious probability, 0-1) or '' (any other tool)
+function _histScoreKind(entry) {
+    const tool = String(entry?.tool ?? '').trim().toLowerCase();
+    if (EVIDENCE_SCORE_TOOLS.includes(tool)) return 'evidence';
+    return /ember/.test(tool) ? 'probability' : '';
+}
+
+// A probability (0-1) in per cent: "33.9%"
+function _histPercent(score) {
+    return `${(Number(score) * 100).toFixed(1)}%`;
+}
+
+// A scan's label in the list: its verdict with its score. A suspicious
+// memory scan (the server sets detected for it as well) is SUSPICIOUS, in
+// the colour SCORE HISTORY gives it, not DETECTED.
 function _histStatus(entry) {
     const v = (entry.verdict || '').toLowerCase();
-    // EMBER reports a probability (0-1); the memory tools an evidence score
-    // on their own scale (suspicious >= 2, malicious >= 6).
-    const isProbability = /ember/i.test(entry.tool || '');
     const pct = entry.score == null ? ''
-        : isProbability ? ` ${(entry.score * 100).toFixed(1)}%`
+        : _histScoreKind(entry) === 'probability' ? ` ${_histPercent(entry.score)}`
         : ` score ${Number(entry.score).toFixed(2)}`;
     if (entry.status === 'timeout') return { cls: 'history-unknown', text: 'TIMEOUT' };
     if (entry.status && entry.status !== 'ok') return { cls: 'history-unknown', text: entry.status.toUpperCase() };
+    if (v === 'suspicious') return { cls: 'history-suspicious', text: 'SUSPICIOUS' + pct };
     if (v === 'malicious' || entry.detected === true) return { cls: 'history-detected', text: (v === 'malicious' ? 'MALICIOUS' : 'DETECTED') + pct };
     if (v === 'benign' || v === 'clean' || entry.clean === true) return { cls: 'history-clean', text: (v === 'benign' ? 'BENIGN' : 'CLEAN') + pct };
     if (v === 'analyzed' || v) return { cls: 'history-unknown', text: (v || '?').toUpperCase() };
@@ -2634,14 +4429,16 @@ function renderUnifiedHistory(history) {
 
     if (!history.length) {
         containers.forEach(c => { c.innerHTML = '<div class="scan-history-empty">No scans yet.</div>'; });
+        renderScoreHistory(history);
         return;
     }
 
     let html = '';
-    history.forEach(entry => {
-        const ts = new Date(entry.timestamp).toLocaleString('en-GB', { hour12: false });
+    history.forEach((entry, i) => {
+        const ts = _histTime(entry).text;
         const st = _histStatus(entry);
-        html += `<div class="scan-history-entry ${st.cls}" onclick="toggleHistoryDetail(this)">`;
+        // data-history-index: the point of SCORE HISTORY that leads here
+        html += `<div class="scan-history-entry ${st.cls}" data-history-index="${i}" onclick="toggleHistoryDetail(this)">`;
         html += `<span class="scan-history-more">&#9656;</span>`;
         html += `<span class="scan-history-time">${escapeHtml(ts)}</span>`;
         html += `<span class="scan-history-tool">${escapeHtml(entry.tool || '?')}</span>`;
@@ -2651,6 +4448,7 @@ function renderUnifiedHistory(history) {
         html += `<div class="scan-history-detail" style="display:none">${renderHistoryDetail(entry)}</div>`;
     });
     containers.forEach(c => { c.innerHTML = html; });
+    renderScoreHistory(history);
 }
 
 function toggleHistoryDetail(el) {
@@ -2716,6 +4514,175 @@ async function clearScanHistory() {
         await fetch('/api/scan/history/clear', { method: 'POST' });
     } catch (e) { /* ignore */ }
     loadScanHistory();
+}
+
+// --- SCORE HISTORY of the ThreatScan tab ---
+// Above the list of the scan history: a point per scan, the oldest on the
+// left, by its place in the history (scans come in bursts, which a time axis
+// would pile up), in the colour of its verdict. A memory scan (Aether, Exit
+// Capture) stands at the height of its evidence score, which the dashed
+// thresholds are of; every other scan, and a memory scan without a score,
+// lies in the lane "no score" under the axis (EMBER2024's probability is no
+// evidence score: its tooltip and the table show it). A click on a point
+// opens its entry of the list, scrolls it into view and marks it; the table
+// view lists every scan.
+const SCORE_HISTORY_THRESHOLDS = [{ y: 2, label: 'SUSPICIOUS' }, { y: 6, label: 'MALICIOUS' }];
+// The verdicts by colour, in the order of the legend; any other verdict (unknown, dumped, analyzed, none) is the last
+const SCORE_HISTORY_GROUPS = [
+    { key: 'clean', label: 'clean / benign', verdicts: ['clean', 'benign'], color: 'var(--severity-low)' },
+    { key: 'suspicious', label: 'suspicious', verdicts: ['suspicious'], color: 'var(--severity-medium)' },
+    { key: 'detected', label: 'detected / malicious', verdicts: ['detected', 'malicious'], color: 'var(--severity-critical)' },
+    { key: 'other', label: 'no verdict', verdicts: [], color: 'var(--text-muted)' },
+];
+// The scale reaches a tenth above the highest score or the MALICIOUS line,
+// at most this far: a score of 50 sits at the top edge (its tooltip has it)
+// instead of pressing the others under the lines
+const SCORE_HISTORY_MAX = 10;
+// What the chart on screen was drawn from, and for which width: a resize draws it again
+let _scoreHistoryDrawn = null;
+
+// Draws SCORE HISTORY of the scan history (the newest scan first, as the
+// server lists it): the chart, its legend, its table view; renderUnifiedHistory
+// calls it. Without scans it says so, or `hint`.
+function renderScoreHistory(history, hint) {
+    if (!document.getElementById('score-history-plot')) return;
+    // Written once: a render keeps the switch (and the keyboard focus on it)
+    const slot = document.getElementById('score-history-toggle');
+    if (slot && !slot.firstElementChild) slot.innerHTML = viewToggleHtml('score-history');
+    const scans = scoreHistoryScans(history), empty = hint || 'No scans yet';
+    const legend = document.getElementById('score-history-legend'), table = document.getElementById('score-history-table');
+    // The legend first: it takes its room beside the plot (none without
+    // scans), so the plot is measured at the width the points get
+    if (legend) legend.innerHTML = scans.length ? chartLegendHtml(_scoreHistoryLegend(scans)) : '';
+    _scoreHistoryDrawn = { scans, empty, width: _scoreHistoryWidth() };
+    _drawScoreHistory(_scoreHistoryDrawn);
+    if (table) table.innerHTML = _scoreHistoryTableHtml(scans, empty);
+}
+
+// The scans of the history in the order of the chart, the oldest first: each
+// with its place in the history (`index`: the key of its point and of its
+// entry in the list), its evidence score (null for any other scan or one
+// without), EMBER2024's probability (null for any other scan) and the group
+// of its verdict
+function scoreHistoryScans(history) {
+    const list = Array.isArray(history) ? history : [];
+    const scans = [];
+    for (let index = list.length - 1; index >= 0; index--) {
+        const entry = list[index];
+        if (!entry || typeof entry !== 'object') continue;
+        const kind = _histScoreKind(entry), value = _scanScore(entry);
+        scans.push({ index, entry, score: kind === 'evidence' ? value : null, probability: kind === 'probability' ? value : null,
+                     group: scoreHistoryGroup(entry.verdict) });
+    }
+    return scans;
+}
+
+// A scan's score as a number (also one written as text); null for none
+function _scanScore(entry) {
+    const score = entry?.score;
+    const n = typeof score === 'number' ? score : typeof score === 'string' && score.trim() ? Number(score) : NaN;
+    return Number.isFinite(n) ? n : null;
+}
+
+// The group of SCORE_HISTORY_GROUPS a verdict belongs to, in any case
+function scoreHistoryGroup(verdict) {
+    const name = String(verdict ?? '').trim().toLowerCase();
+    return SCORE_HISTORY_GROUPS.find(group => group.verdicts.includes(name)) || SCORE_HISTORY_GROUPS[SCORE_HISTORY_GROUPS.length - 1];
+}
+
+// A scan's verdict as the server wrote it, "unknown" for none
+function _scanVerdict(entry) {
+    return String(entry?.verdict ?? '').trim() || 'unknown';
+}
+
+// The points for the width of the plot (a guess while it is hidden: the
+// ResizeObserver draws them again when it shows), or the hint without scans
+function _drawScoreHistory(drawn) {
+    const plot = document.getElementById('score-history-plot'), area = document.getElementById('score-history-area');
+    const { scans } = drawn;
+    const highest = Math.max(...SCORE_HISTORY_THRESHOLDS.map(th => th.y), ...scans.map(scan => scan.score ?? 0));
+    const points = scans.map((scan, x) => ({ x, y: scan.score, color: scan.group.color, key: String(scan.index),
+                                             title: _scoreHistoryTitle(scan) }));
+    const svg = scatterSvg(points, { width: drawn.width || 640, height: 160, thresholds: SCORE_HISTORY_THRESHOLDS,
+                                     yMax: Math.min(SCORE_HISTORY_MAX, highest * 1.1) });
+    if (area) area.classList.toggle('is-empty', !svg);
+    if (plot) plot.innerHTML = svg || chartEmptyHtml(drawn.empty);
+}
+
+// A point's tooltip: tool and file, evidence score (or EMBER2024's
+// probability) and verdict, time
+function _scoreHistoryTitle(scan) {
+    const { entry, score, probability } = scan;
+    const value = score !== null ? `score ${_chartNumber(score)}`
+        : probability !== null ? `probability ${_histPercent(probability)}` : 'no score';
+    return [`${entry.tool || '?'} \u00b7 ${entry.filename || '--'}`, `${value} \u00b7 ${_scanVerdict(entry)}`,
+            _histTime(entry).text].join('\n');
+}
+
+// The legend: the scans per group of verdicts, the groups with scans only
+function _scoreHistoryLegend(scans) {
+    return SCORE_HISTORY_GROUPS.map(group => ({ key: group.key, label: group.label, color: group.color,
+        value: scans.filter(scan => scan.group === group).length })).filter(item => item.value > 0);
+}
+
+// The table view: every scan in the order of the chart with its time, tool,
+// file, score and verdict; `empty` the only row without any. The Score
+// column sorts by the evidence scores only: EMBER2024's probability ("33.9%")
+// and "—" (none) come after them.
+function _scoreHistoryTableHtml(scans, empty) {
+    const rows = scans.map(({ entry, score, probability, group }) => {
+        const time = _histTime(entry), file = entry.filename || '--';
+        const value = score !== null ? _chartNumber(score) : probability !== null ? _histPercent(probability) : '&mdash;';
+        return `<tr><td data-sort-value="${Number.isNaN(time.t) ? '' : time.t}">${escapeHtml(time.text)}</td>`
+            + `<td>${escapeHtml(entry.tool || '?')}</td>`
+            + `<td class="view-table-text" title="${escapeHtml(file)}">${escapeHtml(file)}</td>`
+            + `<td class="view-table-num" data-sort-value="${score === null ? '' : score}">${value}</td>`
+            + `<td><span class="view-table-dot" style="background:${group.color}"></span>${escapeHtml(_scanVerdict(entry))}</td></tr>`;
+    });
+    if (!rows.length) rows.push(`<tr data-sort-skip><td colspan="5" class="view-table-empty">${escapeHtml(_chartSentence(empty))}</td></tr>`);
+    return '<table class="view-table" data-sortable data-sort-id="score-history"><thead><tr><th>Time</th><th>Tool</th>'
+        + `<th>File</th><th class="view-table-num">Score</th><th>Verdict</th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
+}
+
+// The width SCORE HISTORY is drawn for: that of its plot (0 while hidden)
+function _scoreHistoryWidth() {
+    return Math.floor(document.getElementById('score-history-plot')?.getBoundingClientRect().width || 0);
+}
+
+// The points for the new width of their plot; not while it is hidden (0) or
+// for the width they were drawn for. The legend and the table stay.
+function redrawScoreHistoryOnResize() {
+    const drawn = _scoreHistoryDrawn;
+    const width = _scoreHistoryWidth();
+    if (!drawn || !width || width === drawn.width) return;
+    drawn.width = width;
+    _drawScoreHistory(drawn);
+}
+
+// SCORE HISTORY is drawn again, in the next frame, when its plot changes its
+// width (the window, the theme, the tab or the chart view shown again)
+function initScoreHistory() {
+    const plot = document.getElementById('score-history-plot');
+    if (plot && typeof ResizeObserver !== 'undefined') {
+        new ResizeObserver(() => requestAnimationFrame(redrawScoreHistoryOnResize)).observe(plot);
+    }
+}
+
+// A click on a point of SCORE HISTORY shows its scan in the list below
+function onScoreHistoryClick(event) {
+    const point = event?.target?.closest?.('.chart-point');
+    if (point) revealHistoryEntry(point.getAttribute('data-key'));
+}
+
+// Opens the entry of the scan history at `index` (its place in the history)
+// as a click on it does, one already open staying so, scrolls it into the
+// middle of the view and marks it for 1.5 s
+function revealHistoryEntry(index) {
+    const list = document.getElementById('threatscan-history-list');
+    const entry = [...(list ? list.querySelectorAll('.scan-history-entry') : [])]
+        .find(el => el.getAttribute('data-history-index') === String(index));
+    if (entry && entry.nextElementSibling?.style.display === 'none') toggleHistoryDetail(entry);
+    revealElement(entry, 'center', 1500);
 }
 
 // Roll up per-tool scan summaries into one verdict label (mirrors the backend
@@ -4518,6 +6485,7 @@ async function viewDetonationResult(lbHash, sha256, pid, filename) {
             verdict = data.verdict || null;
             agentBlock = data.agent || null;
             iocFeed = data.ioc_feed || null;
+            noteDetonationVerdict(sha256, pid, verdict);
         }
     } catch (e) {}
 
@@ -4569,6 +6537,9 @@ async function viewDetonationResult(lbHash, sha256, pid, filename) {
             : st === 'exists' ? 'Hash already on IOC watchlist' : `IOC feed: ${st}`;
         html += `<div class="det-ioc-badge ${st === 'error' ? 'warn' : ''}">&#x1F4CC; ${escapeHtml(label)}</div>`;
     }
+
+    // --- VERDICT FLOW: what the verdict came from (its Sankey drawn once the body is in the page) ---
+    if (detData && detData.verdict) html += verdictFlowHtml(detData, 'detail');
 
     // --- Live memory: scored evidence, exit-time dump, network rhythm ---
     // Shown here as well as in the Submit tab, so a detonation opened later
@@ -4665,6 +6636,7 @@ async function viewDetonationResult(lbHash, sha256, pid, filename) {
     }
 
     setDetailBody(html);
+    drawVerdictFlow('detail');
 }
 
 function renderLbStaticResults(data) {
@@ -5572,8 +7544,9 @@ function pollDetonationResults(sha256, pid, lbHash, filename, attempt, gen) {
     if (!current()) return;
     const maxAttempts = 30; // Poll for up to ~2.5 minutes
     if (attempt >= maxAttempts) {
-        const panels = document.getElementById('det-results-panels');
-        if (panels) panels.innerHTML = '<div class="det-poll-done">Polling complete. Results shown above reflect final state.</div>';
+        // The last results (verdict, VERDICT FLOW, tabs) stay, as when everything is ready
+        endDetonationPolling(document.getElementById('det-results-panels'),
+            'Polling complete. Results shown above reflect final state.', 'Polling complete. No results were received.');
         return;
     }
 
@@ -5588,6 +7561,7 @@ function pollDetonationResults(sha256, pid, lbHash, filename, attempt, gen) {
         .then(data => {
             if (!current()) return;
             renderDetonationPanels(data);
+            noteDetonationVerdict(sha256, pid, data.verdict);
             // Check service status
             const edrStatus = data.edr_status || {};
             const fibratusOffline = edrStatus.fibratus_online === false;
@@ -5640,28 +7614,35 @@ function pollDetonationResults(sha256, pid, lbHash, filename, attempt, gen) {
                 _detonationPollTimer = setTimeout(() => pollDetonationResults(sha256, pid, lbHash, filename, attempt + 1, gen), 5000);
             } else {
                 // Final update: show polling complete message
-                const panels = document.getElementById('det-results-panels');
-                if (panels && !panels.querySelector('.det-poll-done')) {
-                    let msg;
-                    if (allOffline) {
-                        msg = '<div class="det-poll-done">Polling complete. All analysis services offline — no results available.</div>';
-                    } else if (litterboxOffline && bothEdrOffline) {
-                        msg = '<div class="det-poll-done">Polling complete. LitterBox and EDR services offline.</div>';
-                    } else if (litterboxOffline) {
-                        msg = '<div class="det-poll-done">Polling complete. LitterBox offline — static/dynamic analysis unavailable.</div>';
-                    } else if (bothEdrOffline) {
-                        msg = '<div class="det-poll-done">Polling complete. EDR services offline — no detection alerts available.</div>';
-                    } else {
-                        msg = '<div class="det-poll-done">Polling complete. All results collected.</div>';
-                    }
-                    panels.insertAdjacentHTML('beforeend', msg);
+                let note;
+                if (allOffline) {
+                    note = 'Polling complete. All analysis services offline — no results available.';
+                } else if (litterboxOffline && bothEdrOffline) {
+                    note = 'Polling complete. LitterBox and EDR services offline.';
+                } else if (litterboxOffline) {
+                    note = 'Polling complete. LitterBox offline — static/dynamic analysis unavailable.';
+                } else if (bothEdrOffline) {
+                    note = 'Polling complete. EDR services offline — no detection alerts available.';
+                } else {
+                    note = 'Polling complete. All results collected.';
                 }
+                endDetonationPolling(document.getElementById('det-results-panels'), note);
             }
         })
         .catch(() => {
             if (!current()) return;
             _detonationPollTimer = setTimeout(() => pollDetonationResults(sha256, pid, lbHash, filename, attempt + 1, gen), 5000);
         });
+}
+
+// Polling has ended: its note under the results, once. A spinner still in
+// the panel (no poll was answered, or none brought results) goes with it;
+// `none`, when given, is the note for a panel that then shows nothing else.
+function endDetonationPolling(panels, note, none) {
+    if (!panels || panels.querySelector('.det-poll-done')) return;
+    panels.querySelectorAll('.det-panel-loading').forEach(spinner => spinner.remove());
+    const text = none && !panels.children.length ? none : note;
+    panels.insertAdjacentHTML('beforeend', `<div class="det-poll-done">${escapeHtml(text)}</div>`);
 }
 
 // Raw-JSON modal support: payloads are rebuilt on every render, opened by index.
@@ -5727,6 +7708,9 @@ function renderDetonationPanels(data) {
             : `IOC feed: ${st}`;
         html += `<div class="det-ioc-badge ${st === 'error' ? 'warn' : ''}">&#x1F4CC; ${escapeHtml(label)}</div>`;
     }
+
+    // --- VERDICT FLOW: what the verdict came from (its Sankey drawn once the panels are in the page) ---
+    if (data.verdict) html += verdictFlowHtml(data, 'det');
 
     // --- Build tabs (only those with data) ---
     const tabs = [];
@@ -5945,6 +7929,254 @@ function renderDetonationPanels(data) {
     }
 
     panels.innerHTML = html;
+    drawVerdictFlow('det');
+}
+
+// =============================================
+// VERDICT FLOW of the detonation results
+// =============================================
+// What the verdict of a detonation came from, as a Sankey: the processes of
+// the findings (left), the kind of each finding (middle), whether the
+// verdict counted it (right). Each finding flows once: an EDR alert, the
+// LitterBox score of the sample file, or a finding of the memory evidence
+// by its source, which is the exit capture, network beaconing, named pipes
+// or (Aether, Process Dump, Hunt-Sleeping-Beacons, BeaconEye, PE-Sieve,
+// Moneta) live memory. As app.py's _compute_verdict counts them: every EDR
+// alert (each severity adds its points); the LitterBox score when it adds
+// points (shown only then); a memory finding that keeps a weight once the
+// memory evidence reaches SUSPICIOUS, so the counted ones make up the
+// evidence score; not one the host baseline suppressed, one capped as a
+// repeat of its kind (weight 0), or any of an evidence below SUSPICIOUS
+// ("weak memory findings only").
+// The Submit tab (scope 'det') and the detail panel ('detail') draw it with
+// the same functions, each under ids of its own: both can be open at once.
+// The kinds in the order of the middle column, with their colours; the
+// LitterBox score first, as the sample file it flows from heads the left
+// column: its band crosses none
+const VERDICT_FLOW_KINDS = [
+    { key: 'litterbox', label: 'LitterBox score', color: 'var(--accent-pink)' },
+    { key: 'edr', label: 'EDR alerts', color: 'var(--accent-orange)' },
+    { key: 'memory', label: 'live memory', color: 'var(--accent-purple)' },
+    { key: 'exit', label: 'exit capture', color: 'var(--accent-blue)' },
+    { key: 'network', label: 'network beaconing', color: 'var(--graph-network)' },
+    { key: 'pipes', label: 'named pipes', color: 'var(--graph-pipe)' },
+];
+// The LitterBox score (of 10) from which _compute_verdict adds points to the verdict
+const VERDICT_FLOW_LITTERBOX_MIN = 4;
+// The sources of the memory evidence that are a kind of their own; any other is live memory
+const VERDICT_FLOW_SOURCES = { 'exit-capture': 'exit', 'sysmon-network': 'network', 'sysmon-pipes': 'pipes' };
+// LINEAR of each view's flow, until the page is reloaded
+const verdictFlowView = { det: { linear: false }, detail: { linear: false } };
+// What the flow of each view was drawn from, for which width, and the card head that is watched for its width
+const _verdictFlowDrawn = { det: null, detail: null };
+let _verdictFlowObserver = null;
+
+// The findings of a detonation's results, each once: [{process, kind,
+// counted, count, file}], kind a key of VERDICT_FLOW_KINDS, count 1 but for
+// the alerts the server matched beyond those it lists (fibratus_alert_count):
+// they are one entry, their process "(not listed)". An alert's process is
+// its name as the Alerts tab gives it, a memory finding's its own; the
+// LitterBox score, there when it added points, is the sample file's (file).
+function detonationFindings(results) {
+    const r = results && typeof results === 'object' ? results : {};
+    const found = [];
+    const lb = r.litterbox_info && typeof r.litterbox_info === 'object' ? r.litterbox_info.score : null;
+    if (typeof lb === 'number' && lb >= VERDICT_FLOW_LITTERBOX_MIN) {
+        found.push({ process: '(sample file)', kind: 'litterbox', counted: true, count: 1, file: true });
+    }
+    const alerts = (Array.isArray(r.fibratus_alerts) ? r.fibratus_alerts : []).filter(alert => alert && typeof alert === 'object');
+    alerts.forEach(alert => found.push({ process: alertProcessName(alert), kind: 'edr', counted: true, count: 1 }));
+    const unlisted = Math.floor(Number(r.fibratus_alert_count)) - alerts.length;
+    if (Number.isFinite(unlisted) && unlisted > 0) found.push({ process: '(not listed)', kind: 'edr', counted: true, count: unlisted });
+    const ev = r.memory_evidence && typeof r.memory_evidence === 'object' ? r.memory_evidence : null;
+    if (!ev) return found;
+    const line = Number(ev.thresholds?.suspicious);
+    const reached = Number(ev.score) >= (Number.isFinite(line) ? line : 2);
+    const add = (list, counts) => (Array.isArray(list) ? list : []).forEach(f => {
+        if (!f || typeof f !== 'object') return;
+        found.push({ process: String(f.process ?? ''), kind: _verdictFlowKind(f.source), counted: counts(f), count: 1 });
+    });
+    add(ev.findings, f => reached && Number(f.score) > 0);
+    add(ev.suppressed, () => false);
+    return found;
+}
+
+// The kind of a finding of the memory evidence by its source
+function _verdictFlowKind(source) {
+    const name = String(source ?? '');
+    return Object.prototype.hasOwnProperty.call(VERDICT_FLOW_SOURCES, name) ? VERDICT_FLOW_SOURCES[name] : 'memory';
+}
+
+// The findings as a flow process → kind → counted or not, for layoutSankey
+// and sankeySvg: {columns, links, labels}. A process in any case and without
+// the blanks around it, in its first spelling, none as "(unknown)"; the six
+// with the most findings stand on their own, the rest is "other processes",
+// last; the sample file of the LitterBox score first, on its own whatever
+// the processes. The kinds in the order of VERDICT_FLOW_KINDS, "counted
+// (<verdict>)" above "not counted"; a column lists only what has findings.
+// Ids "sample file", "process:<name>", "kind:<key>", "verdict:counted",
+// "verdict:not counted".
+function detonationFlow(results) {
+    const found = detonationFindings(results);
+    const nameOf = f => f.process.trim() || '(unknown)';
+    const spelling = new Map(), totals = new Map();
+    for (const f of found) {
+        if (f.file) continue;
+        const key = _alertsNameKey(nameOf(f));
+        if (!spelling.has(key)) spelling.set(key, nameOf(f));
+        totals.set(key, (totals.get(key) || 0) + f.count);
+    }
+    const ranked = [...totals].map(([key, count]) => ({ key, count }))
+        .sort((a, b) => (b.count - a.count) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    const top = topWithOther(ranked, 6, 'other processes');
+    const processId = f => {
+        if (f.file) return 'sample file';
+        const key = _alertsNameKey(nameOf(f));
+        return top.keep.has(key) ? `process:${spelling.get(key)}` : 'other processes';
+    };
+    const pairs = new Map();                        // source id -> Map(target id -> findings)
+    const flow = (source, target, n) => {
+        if (!pairs.has(source)) pairs.set(source, new Map());
+        pairs.get(source).set(target, (pairs.get(source).get(target) || 0) + n);
+    };
+    for (const f of found) {
+        flow(processId(f), `kind:${f.kind}`, f.count);
+        flow(`kind:${f.kind}`, f.counted ? 'verdict:counted' : 'verdict:not counted', f.count);
+    }
+    const label = String(results?.verdict?.label ?? '').trim();
+    const labels = Object.create(null);             // names from the data: none may be special (__proto__)
+    const processes = ranked.filter(({ key }) => top.keep.has(key)).map(({ key }) => `process:${spelling.get(key)}`);
+    processes.forEach(id => { labels[id] = id.slice('process:'.length); });
+    if (ranked.some(({ key }) => !top.keep.has(key))) {
+        processes.push('other processes');
+        labels['other processes'] = 'other processes';
+    }
+    if (pairs.has('sample file')) {
+        processes.unshift('sample file');
+        labels['sample file'] = '(sample file)';
+    }
+    const kinds = VERDICT_FLOW_KINDS.filter(kind => pairs.has(`kind:${kind.key}`)).map(kind => {
+        labels[`kind:${kind.key}`] = kind.label;
+        return `kind:${kind.key}`;
+    });
+    const used = new Set(kinds.flatMap(id => [...pairs.get(id).keys()]));
+    labels['verdict:counted'] = label ? `counted (${label})` : 'counted';
+    labels['verdict:not counted'] = 'not counted';
+    const verdicts = ['verdict:counted', 'verdict:not counted'].filter(id => used.has(id));
+    const links = [];
+    pairs.forEach((targets, source) => targets.forEach((value, target) => links.push({ source, target, value })));
+    return { columns: [processes, kinds, verdicts], links, labels };
+}
+
+// The colours of the nodes of a flow: a process from the palette by its
+// place among the processes (without its muted last colour), "other
+// processes" and "(not listed)" muted, the sample file grey (no process
+// loses its colour to it); a kind its own; "counted" the colour of the
+// verdict (as in VERDICT HISTORY), "not counted" muted
+function _verdictFlowColors(flow, label) {
+    const colors = Object.create(null);
+    const [processes = [], kinds = [], verdicts = []] = flow.columns;
+    let place = 0;
+    processes.forEach(id => {
+        colors[id] = id === 'sample file' ? 'var(--text-secondary)'
+            : id === 'other processes' || id === 'process:(not listed)' ? 'var(--text-muted)'
+            : CHART_PALETTE[place++ % (CHART_PALETTE.length - 1)];
+    });
+    kinds.forEach(id => { colors[id] = VERDICT_FLOW_KINDS.find(kind => `kind:${kind.key}` === id)?.color; });
+    verdicts.forEach(id => { colors[id] = id === 'verdict:counted' ? submissionVerdictGroup(label).color : 'var(--text-muted)'; });
+    return colors;
+}
+
+// The card VERDICT FLOW of a detonation's results for one of the two views
+// (scope 'det': the Submit tab, 'detail': the detail panel; '' for another):
+// its head with the (i), LINEAR and CHART / TABLE, the room for the Sankey and
+// the table view of its bands. Both views render it with this function and,
+// once it is in the page, draw its Sankey with drawVerdictFlow(scope).
+function verdictFlowHtml(results, scope) {
+    if (!Object.prototype.hasOwnProperty.call(verdictFlowView, scope)) return '';
+    const flow = detonationFlow(results);
+    flow.colors = _verdictFlowColors(flow, results?.verdict?.label);
+    // The head watched so far stays known: the next draw lets go of it
+    _verdictFlowDrawn[scope] = { flow, width: 0, head: _verdictFlowDrawn[scope]?.head || null };
+    const id = `${scope}-verdict-flow`, linear = verdictFlowView[scope].linear;
+    const table = scope === 'detail' ? '<table class="view-table" data-sortable data-sort-id="detail-verdict-flow">'
+        : '<table class="view-table" data-sortable data-sort-id="det-verdict-flow">';
+    return `<div class="chart-card verdict-flow-card" id="${id}-card"><div class="chart-card-head">`
+        + `<h3 class="chart-card-title" data-info="Findings flow process → kind → counted or not: every EDR alert (past 50: (not listed)), the (sample file)'s LitterBox score from 4/10, a weighted memory finding once evidence is SUSPICIOUS, none the baseline suppressed or capped. Named pipes counts pipe findings, not pipes; LINEAR: true proportions.">VERDICT FLOW</h3><span class="chart-card-tools">`
+        + `<button type="button" class="view-toggle chart-scale-toggle" id="${id}-linear" aria-pressed="${linear}" `
+        + `title="${linear ? 'Draw the flows by their square roots, so small flows stay visible' : 'Draw the flows in true proportions'}" `
+        + `onclick="toggleVerdictFlowScale(${jsArg(scope)})"${cardViewAttrs(id, 'chart')}>LINEAR</button>${viewToggleHtml(id)}</span></div>`
+        + `<div class="verdict-flow-view" id="${id}-chart"${cardViewAttrs(id, 'chart')}></div>`
+        + `<div class="view-table-wrap verdict-flow-table" id="${id}-table"${cardViewAttrs(id, 'table')}>`
+        + `${_flowTableHtml(flow, 'No findings', table, ['Source', 'Target'])}</div></div>`;
+}
+
+// Draws the Sankey of the VERDICT FLOW of `scope` that verdictFlowHtml
+// rendered, for the width of its card, and watches that width (the card of
+// an earlier render no more); forgets the flow when the view rendered none
+function drawVerdictFlow(scope) {
+    if (!Object.prototype.hasOwnProperty.call(_verdictFlowDrawn, scope)) return;
+    const drawn = _verdictFlowDrawn[scope];
+    if (!drawn) return;
+    const head = document.querySelector(`#${scope}-verdict-flow-card .chart-card-head`);
+    if (drawn.head && drawn.head !== head) _verdictFlowObserver?.unobserve(drawn.head);
+    if (!head) {
+        _verdictFlowDrawn[scope] = null;
+        return;
+    }
+    if (!_verdictFlowObserver && typeof ResizeObserver !== 'undefined') {
+        _verdictFlowObserver = new ResizeObserver(() => requestAnimationFrame(redrawVerdictFlowsOnResize));
+    }
+    if (drawn.head !== head) _verdictFlowObserver?.observe(head);
+    drawn.head = head;
+    drawn.width = _verdictFlowWidth(head);
+    _drawVerdictFlowSvg(scope);
+}
+
+// The Sankey for the width it was measured at (a guess while the card is
+// hidden: the observer draws it again when it shows), as high as its fullest
+// column needs, the right column with the room for its names, by square
+// roots or in true proportions (LINEAR); "No findings" without any
+function _drawVerdictFlowSvg(scope) {
+    const drawn = _verdictFlowDrawn[scope], view = document.getElementById(`${scope}-verdict-flow-chart`);
+    if (!drawn || !view) return;
+    const { flow } = drawn;
+    const width = drawn.width || 640;
+    const nodes = Math.max(0, ...flow.columns.map(column => column.length));
+    const into = new Map();
+    flow.links.forEach(link => into.set(link.target, (into.get(link.target) || 0) + link.value));
+    const last = flow.columns[flow.columns.length - 1] || [];
+    const longest = Math.max(0, ...last.map(id => String(flow.labels[id] ?? id).length + _chartNumber(into.get(id)).length + 1));
+    const layout = layoutSankey(flow.columns, flow.links, { width, height: Math.min(300, Math.max(110, 28 * nodes + 24)),
+        scale: verdictFlowView[scope].linear ? 'linear' : 'sqrt', labelWidth: Math.max(width / 4, Math.min(width / 2, 6 * longest + 24)) });
+    view.innerHTML = sankeySvg(layout, { labels: flow.labels, colors: flow.colors }) || chartEmptyHtml('No findings');
+}
+
+// The width a card's Sankey is drawn for: that of its head (0 while hidden)
+function _verdictFlowWidth(head) {
+    return Math.floor(head?.getBoundingClientRect().width || 0);
+}
+
+// LINEAR of one view: its flow in true proportions, or by square roots again
+function toggleVerdictFlowScale(scope) {
+    if (!Object.prototype.hasOwnProperty.call(verdictFlowView, scope)) return;
+    const view = verdictFlowView[scope];
+    view.linear = !view.linear;
+    _pressFlowScale(document.getElementById(`${scope}-verdict-flow-linear`), view.linear);
+    _drawVerdictFlowSvg(scope);
+}
+
+// Each flow on screen for the new width of its card; not while it is hidden
+// (0), for the width it was drawn for, or once its view showed something else
+function redrawVerdictFlowsOnResize() {
+    for (const scope of Object.keys(_verdictFlowDrawn)) {
+        const drawn = _verdictFlowDrawn[scope];
+        if (!drawn || !drawn.head || !drawn.head.isConnected) continue;
+        const width = _verdictFlowWidth(drawn.head);
+        if (!width || width === drawn.width) continue;
+        drawn.width = width;
+        _drawVerdictFlowSvg(scope);
+    }
 }
 
 // --- Submissions History ---
@@ -5956,12 +8188,14 @@ async function refreshSubmissions() {
         const resp = await fetch('/api/submissions');
         if (!resp.ok) {
             container.innerHTML = '<div style="padding:12px;color:var(--text-muted);font-size:11px;">Failed to load submissions.</div>';
+            renderSubmissionVerdicts(null, 'Submissions not available');
             return;
         }
         const submissions = await resp.json();
 
         if (!submissions.length) {
             container.innerHTML = '<div style="padding:12px;color:var(--text-muted);font-size:11px;">No samples submitted yet. Use the form above to detonate a sample.</div>';
+            renderSubmissionVerdicts(submissions);
             return;
         }
 
@@ -5970,7 +8204,7 @@ async function refreshSubmissions() {
         html += '</tr></thead><tbody>';
 
         submissions.forEach(sub => {
-            const ts = sub.timestamp ? new Date(sub.timestamp).toLocaleString('en-GB', {hour12: false, day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit', second:'2-digit'}) : '--';
+            const ts = _submissionTime(sub).text;
             const agentBadge = sub.agent_status === 'success'
                 ? '<span class="badge badge-green">Agent OK</span>'
                 : sub.agent_status === 'failed'
@@ -5986,13 +8220,12 @@ async function refreshSubmissions() {
             let actions = sub.file_path
                 ? `<button class="btn btn-xs" onclick="hexOpenFile(${jsArg(sub.file_path)})" title="Open in Hex Editor">Hex</button>`
                 : '';
-            // Add LitterBox results button if submission went to LitterBox
-            const lbHash = sub.litterbox_hash || sub.sha256;
-            if (lbHash && (sub.target === 'litterbox' || sub.target === 'both' || sub.litterbox_status === 'success')) {
-                actions += ` <button class="btn btn-xs btn-lb-results" onclick="viewDetonationResult(${[lbHash, sub.sha256, sub.agent_pid, sub.filename].map(jsArg).join(', ')})" title="View analysis results (LitterBox + Fibratus)">Results</button>`;
-            } else if (sub.sha256 || sub.agent_pid) {
-                // Even without LitterBox, show results button for Fibratus/Rustinel alerts
-                actions += ` <button class="btn btn-xs btn-lb-results" onclick="viewDetonationResult(${['', sub.sha256, sub.agent_pid, sub.filename].map(jsArg).join(', ')})" title="View Fibratus/Rustinel alerts">Results</button>`;
+            // Results: LitterBox's and the EDRs' results if the submission went to LitterBox, else the EDRs'
+            const args = submissionResultArgs(sub);
+            if (args && args[0]) {
+                actions += ` <button class="btn btn-xs btn-lb-results" onclick="viewDetonationResult(${args.map(jsArg).join(', ')})" title="View analysis results (LitterBox + Fibratus)">Results</button>`;
+            } else if (args) {
+                actions += ` <button class="btn btn-xs btn-lb-results" onclick="viewDetonationResult(${args.map(jsArg).join(', ')})" title="View Fibratus/Rustinel alerts">Results</button>`;
             }
 
             html += `<tr>`;
@@ -6008,9 +8241,207 @@ async function refreshSubmissions() {
 
         html += '</tbody></table>';
         container.innerHTML = html;
+        renderSubmissionVerdicts(submissions);
     } catch (e) {
         container.innerHTML = `<div style="padding:12px;color:var(--accent-red);font-size:11px;">Error: ${escapeHtml(e.message)}</div>`;
+        renderSubmissionVerdicts(null, 'Submissions not available');
     }
+}
+
+// A submission's time in epoch ms (NaN without one) and as the list shows it ("05 Nov, 11:37:11")
+function _submissionTime(sub) {
+    const date = new Date(sub?.timestamp || NaN), t = date.getTime();
+    return { t, text: Number.isNaN(t) ? '--' : date.toLocaleString('en-GB', { hour12: false, day: '2-digit', month: 'short',
+                                                                             hour: '2-digit', minute: '2-digit', second: '2-digit' }) };
+}
+
+// What viewDetonationResult takes to open a submission's results (its
+// Results button and its bar in VERDICT HISTORY), as text: LitterBox's hash
+// (else the sample's) when it went to LitterBox, '' when not; null without a
+// hash and a PID, which have no results
+function submissionResultArgs(sub) {
+    if (!sub || typeof sub !== 'object') return null;
+    const text = value => (value === null || value === undefined ? '' : String(value));
+    const lbHash = sub.litterbox_hash || sub.sha256;
+    if (lbHash && (sub.target === 'litterbox' || sub.target === 'both' || sub.litterbox_status === 'success')) {
+        return [lbHash, sub.sha256, sub.agent_pid, sub.filename].map(text);
+    }
+    return sub.sha256 || sub.agent_pid ? ['', sub.sha256, sub.agent_pid, sub.filename].map(text) : null;
+}
+
+// --- VERDICT HISTORY of the Submit tab ---
+// Above the list of the submissions: a bar per submission, the oldest on the
+// left, by its place in the list (samples are sent in bursts, which a time
+// axis would pile up), as high as the score of the verdict the server keeps
+// on it and in that verdict's colour. The score is the verdict's own (points
+// for EDR alerts, LitterBox and the memory evidence), which turns SUSPICIOUS
+// at 1 and MALICIOUS at 3 (app.py's _compute_verdict), where the dashed
+// lines are. A submission with no verdict kept (sent before verdicts were
+// kept, or its results never opened) is a grey stub, "not evaluated". A
+// click on a bar opens its results, as its Results button does; the table
+// view lists every submission.
+const SUBMISSION_VERDICT_THRESHOLDS = [{ y: 1, label: 'SUSPICIOUS' }, { y: 3, label: 'MALICIOUS' }];
+// The verdicts by colour, in the order of the legend: any other label is "other verdict", none "not evaluated"
+const SUBMISSION_VERDICT_GROUPS = [
+    { key: 'clean', label: 'clean', labels: ['CLEAN'], color: 'var(--severity-low)' },
+    { key: 'suspicious', label: 'suspicious', labels: ['SUSPICIOUS'], color: 'var(--severity-medium)' },
+    { key: 'malicious', label: 'malicious', labels: ['MALICIOUS'], color: 'var(--severity-critical)' },
+    { key: 'other', label: 'other verdict', labels: [], color: 'var(--text-muted)' },
+    { key: 'none', label: 'not evaluated', labels: [], color: 'var(--text-dim)' },
+];
+// The scale reaches a tenth above the highest score or the MALICIOUS line, at most this far
+const SUBMISSION_VERDICT_MAX = 10;
+// What the chart on screen was drawn from (the submissions as listed), and for which width
+let _submissionVerdictsDrawn = null;
+// The verdict the history was last loaded for, of each run (sample and PID)
+const _verdictHistoryAsked = new Map();
+
+// Draws VERDICT HISTORY of the submissions (the newest first, as the server
+// lists them): the chart, its legend, its table view; refreshSubmissions
+// calls it whenever it renders the list. Without submissions it says so, or `hint`.
+function renderSubmissionVerdicts(submissions, hint) {
+    if (!document.getElementById('submission-verdicts-plot')) return;
+    // Written once: a render keeps the switch (and the keyboard focus on it)
+    const slot = document.getElementById('submission-verdicts-toggle');
+    if (slot && !slot.firstElementChild) slot.innerHTML = viewToggleHtml('submission-verdicts');
+    const subs = Array.isArray(submissions) ? submissions : [];
+    const items = submissionVerdictItems(subs), empty = hint || 'No submissions yet';
+    const legend = document.getElementById('submission-verdicts-legend'), table = document.getElementById('submission-verdicts-table');
+    // The legend first: it takes its room beside the plot, so the plot is measured at the width the bars get
+    if (legend) legend.innerHTML = items.length ? chartLegendHtml(_submissionVerdictLegend(items)) : '';
+    _submissionVerdictsDrawn = { subs, items, empty, width: _submissionVerdictsWidth() };
+    _drawSubmissionVerdicts(_submissionVerdictsDrawn);
+    if (table) table.innerHTML = _submissionVerdictsTableHtml(items, empty);
+}
+
+// The submissions in the order of the chart, the oldest first: each with its
+// place in the list (`index`: the key of its bar), the label and score of
+// its kept verdict (null for none) and the group of its colour
+function submissionVerdictItems(submissions) {
+    const list = Array.isArray(submissions) ? submissions : [];
+    const items = [];
+    for (let index = list.length - 1; index >= 0; index--) {
+        const sub = list[index];
+        if (!sub || typeof sub !== 'object') continue;
+        const { label, score } = _submissionVerdict(sub);
+        items.push({ index, sub, label, score, group: submissionVerdictGroup(label) });
+    }
+    return items;
+}
+
+// The verdict kept on a submission as {label, score}: a label of a verdict
+// written as text has no score; without a label it is none (null, null)
+function _submissionVerdict(sub) {
+    const verdict = typeof sub?.verdict === 'string' ? { label: sub.verdict } : sub?.verdict;
+    const label = verdict && typeof verdict === 'object' ? String(verdict.label ?? '').trim() : '';
+    return { label: label || null, score: label ? _scanScore(verdict) : null };
+}
+
+// The group of SUBMISSION_VERDICT_GROUPS a verdict's label belongs to, in any case
+function submissionVerdictGroup(label) {
+    const name = String(label ?? '').trim().toUpperCase();
+    const group = key => SUBMISSION_VERDICT_GROUPS.find(g => g.key === key);
+    if (!name) return group('none');
+    return SUBMISSION_VERDICT_GROUPS.find(g => g.labels.includes(name)) || group('other');
+}
+
+// The bars for the width of the plot (a guess while it is hidden: the
+// ResizeObserver draws them again when it shows), or the hint without submissions
+function _drawSubmissionVerdicts(drawn) {
+    const plot = document.getElementById('submission-verdicts-plot'), area = document.getElementById('submission-verdicts-area');
+    const { items } = drawn;
+    const highest = Math.max(...SUBMISSION_VERDICT_THRESHOLDS.map(th => th.y), ...items.map(item => item.score ?? 0));
+    const bars = items.map(item => ({ key: String(item.index), y: item.score, color: item.group.color,
+                                      title: _submissionVerdictTitle(item) }));
+    const svg = verdictBarsSvg(bars, { width: drawn.width || 640, height: 160, thresholds: SUBMISSION_VERDICT_THRESHOLDS,
+                                       yMax: Math.min(SUBMISSION_VERDICT_MAX, highest * 1.1) });
+    if (area) area.classList.toggle('is-empty', !svg);
+    if (plot) plot.innerHTML = svg || chartEmptyHtml(drawn.empty);
+}
+
+// A bar's tooltip: file, verdict and its score (or "no score"), time
+function _submissionVerdictTitle(item) {
+    const { sub, label, score } = item;
+    const parts = [sub.filename || '--', label || 'not evaluated'];
+    if (label) parts.push(score !== null ? `score ${_chartNumber(score)}` : 'no score');
+    parts.push(_submissionTime(sub).text);
+    return parts.join(' \u00b7 ');
+}
+
+// The legend: the submissions per group of verdicts, the groups with submissions only
+function _submissionVerdictLegend(items) {
+    return SUBMISSION_VERDICT_GROUPS.map(group => ({ key: group.key, label: group.label, color: group.color,
+        value: items.filter(item => item.group === group).length })).filter(item => item.value > 0);
+}
+
+// The table view: every submission in the order of the chart with its time,
+// file, verdict and score ("—" without, sorted last); `empty` the only row without any
+function _submissionVerdictsTableHtml(items, empty) {
+    const rows = items.map(({ sub, label, score, group }) => {
+        const time = _submissionTime(sub), file = sub.filename || '--';
+        return `<tr><td data-sort-value="${Number.isNaN(time.t) ? '' : time.t}">${escapeHtml(time.text)}</td>`
+            + `<td class="view-table-text" title="${escapeHtml(file)}">${escapeHtml(file)}</td>`
+            + `<td><span class="view-table-dot" style="background:${group.color}"></span>${escapeHtml(label || 'not evaluated')}</td>`
+            + `<td class="view-table-num" data-sort-value="${score === null ? '' : score}">${score === null ? '&mdash;' : _chartNumber(score)}</td></tr>`;
+    });
+    if (!rows.length) rows.push(`<tr data-sort-skip><td colspan="4" class="view-table-empty">${escapeHtml(_chartSentence(empty))}</td></tr>`);
+    return '<table class="view-table" data-sortable data-sort-id="submission-verdicts"><thead><tr><th>Time</th><th>File</th>'
+        + `<th>Verdict</th><th class="view-table-num">Score</th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
+}
+
+// The width VERDICT HISTORY is drawn for: that of its plot (0 while hidden)
+function _submissionVerdictsWidth() {
+    return Math.floor(document.getElementById('submission-verdicts-plot')?.getBoundingClientRect().width || 0);
+}
+
+// The bars for the new width of their plot; not while it is hidden (0) or
+// for the width they were drawn for. The legend and the table stay.
+function redrawSubmissionVerdictsOnResize() {
+    const drawn = _submissionVerdictsDrawn;
+    const width = _submissionVerdictsWidth();
+    if (!drawn || !width || width === drawn.width) return;
+    drawn.width = width;
+    _drawSubmissionVerdicts(drawn);
+}
+
+// VERDICT HISTORY is drawn again, in the next frame, when its plot changes
+// its width (the window, the theme, the tab or the chart view shown again)
+function initSubmissionVerdicts() {
+    const plot = document.getElementById('submission-verdicts-plot');
+    if (plot && typeof ResizeObserver !== 'undefined') {
+        new ResizeObserver(() => requestAnimationFrame(redrawSubmissionVerdictsOnResize)).observe(plot);
+    }
+}
+
+// A click on a bar of VERDICT HISTORY opens its submission's results
+function onSubmissionVerdictsClick(event) {
+    const key = event?.target?.closest?.('.chart-slot')?.getAttribute('data-key');
+    const sub = _submissionVerdictsDrawn && /^\d+$/.test(key || '') ? _submissionVerdictsDrawn.subs[Number(key)] : null;
+    const args = submissionResultArgs(sub);
+    if (args) viewDetonationResult(...args);
+}
+
+// A view of a detonation's results computed its verdict, which the server
+// keeps on the submission of its run (app.py's _store_submission_verdict:
+// the sample run as this PID, without a PID one that ran without; none for
+// a PID none of its submissions ran as). While the Submit tab is open, its
+// list and VERDICT HISTORY load again when they show another verdict there,
+// once for each verdict: a server that could not keep it (a file it cannot
+// write) lists the old one after every poll. The tab loads them anyway when
+// it opens.
+function noteDetonationVerdict(sha256, pid, verdict) {
+    const drawn = _submissionVerdictsDrawn;
+    const sha = String(sha256 || '').trim().toLowerCase(), run = String(pid || '').trim();
+    if (state.activeTab !== 'submit' || !drawn || !sha || !verdict || typeof verdict !== 'object' || !verdict.label) return;
+    const sub = drawn.subs.find(s => s && typeof s === 'object' && String(s.sha256 || '').toLowerCase() === sha
+                                     && String(s.agent_pid || '') === run);
+    if (!sub) return;
+    const kept = _submissionVerdict(sub), label = String(verdict.label).trim(), score = _scanScore(verdict);
+    if (kept.label === label && kept.score === score) return;
+    const key = JSON.stringify([sha, run]), asked = JSON.stringify([label, score]);
+    if (_verdictHistoryAsked.get(key) === asked) return;
+    _verdictHistoryAsked.set(key, asked);
+    refreshSubmissions();
 }
 
 // =============================================
@@ -7682,6 +10113,61 @@ function renderGraphSysmonSections(pidStr, pidSysmonEvents, childEvents) {
     return html;
 }
 
+// --- ACTIVITY MIX of a process node ---
+// The detail of a process node shows, under its Activity grid (its alerts by
+// category), what the process did by Sysmon in the graph data of
+// /api/process-graph: a donut of its network connections, DNS queries,
+// files created, registry changes, named pipe events and the injections it
+// made, beside its legend; its alerts (Threats) are a number of their own
+// under it, no part of the ring, which would count them a second time. The
+// table view lists the same numbers. The kinds in the order of the ring, each
+// with the list of the payload that holds its entries and the colour of its
+// nodes (or, for an injection, its edge) in the graph.
+const ACTIVITY_MIX_KINDS = [
+    { key: 'network', label: 'Network', list: 'network', color: 'var(--graph-network)' },
+    { key: 'dns', label: 'DNS', list: 'dns', color: 'var(--graph-dns)' },
+    { key: 'file', label: 'File', list: 'files', color: 'var(--graph-file)' },
+    { key: 'registry', label: 'Registry', list: 'registry', color: 'var(--graph-registry)' },
+    { key: 'pipe', label: 'Named pipes', list: 'pipes', color: 'var(--graph-pipe)' },
+    { key: 'injection', label: 'Injection', list: 'injections', color: 'var(--accent-red)' },
+];
+
+// The Sysmon activity of one process instance (its key, "1112" or
+// "1112@1789000000") in a /api/process-graph payload: [{key, label, value,
+// color}] for each kind it has entries of, in the order of ACTIVITY_MIX_KINDS.
+// An entry belongs to the instance of its key (to its PID where it has none),
+// as the graph draws its edge; an injection to the instance that made it.
+// Another process that had the same PID counts apart.
+function activityMix(payload, key) {
+    const own = String(key ?? '');
+    if (!own || !payload || typeof payload !== 'object') return [];
+    const ownerOf = (kind, ev) => String((kind === 'injection' ? ev.source_key || ev.source_pid : ev.key || ev.pid) ?? '');
+    return ACTIVITY_MIX_KINDS.map(({ key: kind, label, list, color }) => ({
+        key: kind, label, color,
+        value: (Array.isArray(payload[list]) ? payload[list] : []).filter(ev => ev && typeof ev === 'object' && ownerOf(kind, ev) === own).length,
+    })).filter(item => item.value > 0);
+}
+
+// ACTIVITY MIX of a process node, for its detail (showGraphDetail): the head
+// with its (i) and CHART / TABLE, the donut beside its legend (or why there
+// is none) and the table view, then the node's alerts as a number
+function graphActivityMixHtml(node) {
+    const id = 'graph-activity-mix';
+    const items = activityMix(graphState.data, node?.key);
+    const empty = items.length ? '' : 'No Sysmon activity for this process';
+    const threats = Number(node?.activity?.threats) || 0;
+    const chart = empty ? chartEmptyHtml(empty)
+        : `<div class="chart-split">${donutSvg(items, { size: 92, thickness: 14, centerSub: 'EVENTS' })}${chartLegendHtml(items)}</div>`;
+    return `<div class="gd-mix" id="${id}">`
+        + `<div class="gd-section gd-mix-head"><span class="gd-mix-title" data-info="What this process did by Sysmon in the data of the graph (network, DNS, files, registry, named pipes, the injections it made), apart from other processes that had its PID. Threats are its alerts, which the grid above counts by category; they are not part of the ring.">ACTIVITY MIX</span>${viewToggleHtml(id)}</div>`
+        + `<div class="gd-mix-view"${cardViewAttrs(id, 'chart')}>${chart}</div>`
+        + `<div class="view-table-wrap gd-mix-table"${cardViewAttrs(id, 'table')}>`
+        + `${_alertsShareTableHtml('activity', items, empty, '<table class="view-table" data-sortable data-sort-id="graph-activity-mix">')}</div>`
+        + `<div class="gd-mix-threats${threats > 0 ? ' has-threats' : ''}" title="The alerts of this process; the Activity grid counts them by category">`
+        + `<span class="gd-mix-threats-label">Threats</span> <span class="gd-mix-threats-num">${_chartNumber(threats)}</span> `
+        + '<span class="gd-mix-threats-note">&middot; alerts, not part of the ring</span></div></div>';
+}
+
 function showGraphDetail(node) {
     const panel = document.getElementById('graph-detail-panel');
     const header = document.getElementById('graph-detail-header');
@@ -7725,6 +10211,8 @@ function showGraphDetail(node) {
         html += `<div class="gd-activity-cell"><span class="gd-act-num">${act.registry || 0}</span><span class="gd-act-label">Registry</span></div>`;
         html += `<div class="gd-activity-cell"><span class="gd-act-num">${act.injection || 0}</span><span class="gd-act-label">Injection</span></div>`;
         html += `</div>`;
+        // What the process did by Sysmon, its alerts beside it
+        html += graphActivityMixHtml(node);
 
         // Digital signature (on-demand: signer verification runs Get-AuthenticodeSignature)
         if (node.image) {
@@ -7997,8 +10485,26 @@ function initGraphControls() {
 }
 
 // --- Sysmon Events Tab ---
+// The newest Sysmon events (/api/sysmon, as many as chosen; the type, EID
+// and PID filters ask the server) in one table, newest first, filtered
+// further in the page by the search and the EID filters. Above the filter
+// bar, EVENTS OVER TIME and PROCESS → EVENT TYPE count the events the table
+// lists (renderSysmonCharts): a bar sets a time window, a node or band an
+// image or an event type, each a chip in the filter bar whose × takes it
+// off. The tab scrolls as a whole, the filter bar stands at its top.
 let sysmonEvents = [];
 let sysmonStats = null;
+// Why the last query brought no events (the server failed or was not
+// reached), shown in place of the table; '' when it brought some
+let sysmonLoadError = '';
+// The time window of a bar: epoch ms, from included and to not, null for
+// none. Only the table takes it: the charts count every event of the other
+// filters, so they still show where else to look.
+const sysmonTimeWindow = { from: null, to: null };
+// The image and the event type a node, a band or a legend row set; null = none
+const sysmonFlowFilter = { image: null, type: null };
+// {key, chips} of the rendered table: the filters it lists, the chart filters its chips show
+let _sysmonTableShown = null;
 
 async function refreshSysmon() {
     const eventType = document.getElementById('sysmon-filter-type')?.value || '';
@@ -8024,23 +10530,34 @@ async function refreshSysmon() {
     }
     if (tableContainer && !sysmonEvents.length) {
         tableContainer.innerHTML = '<div class="sysmon-loading"><div class="loading-spinner"></div><span>Querying Sysmon event log...</span></div>';
+        renderSysmonCharts([], 'Loading Sysmon events…');
     }
 
+    // Set once the events are in (or known to have failed): an error after that, of the statistics, keeps them
+    let eventsDone = false;
     try {
         const [eventsResp, statsResp] = await Promise.all([
             fetch(url),
             fetch('/api/sysmon/stats'),
         ]);
         if (eventsResp.ok) {
-            sysmonEvents = await eventsResp.json();
+            const events = await eventsResp.json();
+            sysmonEvents = Array.isArray(events) ? events : [];
+            sysmonLoadError = '';
+            eventsDone = true;
             // Check if the response contains an error from backend retries
             if (sysmonEvents.length === 1 && sysmonEvents[0]?.error) {
                 showToast('warning', 'Sysmon query issue', sysmonEvents[0].error, 6000);
             }
+            _sysmonKeepWindow(sysmonEvents);
             renderSysmonTable();
-        } else if (tableContainer) {
-            showToast('error', 'Sysmon events failed', `Server returned ${eventsResp.status}`, 5000);
-            tableContainer.innerHTML = '<div class="empty-state">Failed to load Sysmon events.</div>';
+        } else {
+            // No events held: the tab asks again when it is opened
+            sysmonEvents = [];
+            sysmonLoadError = 'Failed to load Sysmon events.';
+            eventsDone = true;
+            if (tableContainer) showToast('error', 'Sysmon events failed', `Server returned ${eventsResp.status}`, 5000);
+            renderSysmonTable();
         }
         if (statsResp.ok) {
             sysmonStats = await statsResp.json();
@@ -8058,8 +10575,10 @@ async function refreshSysmon() {
         if (statsContainer) {
             statsContainer.innerHTML = `<div class="sysmon-diagnostic warning">Connection error: ${escapeHtml(e.message)}</div>`;
         }
-        if (tableContainer) {
-            tableContainer.innerHTML = `<div class="empty-state">Connection error: ${escapeHtml(e.message)}</div>`;
+        if (!eventsDone) {
+            sysmonEvents = [];
+            sysmonLoadError = `Connection error: ${e?.message ?? ''}`;
+            renderSysmonTable();
         }
     }
 }
@@ -8101,48 +10620,39 @@ function filterSysmonByType(eventId) {
     if (select) { select.value = eventId; refreshSysmon(); }
 }
 
-function renderSysmonTable() {
-    const container = document.getElementById('sysmon-table');
-    if (!container) return;
+// The filters of the table: the search and the EID filters as typed, the
+// image, the event type and the time window the charts set
+function sysmonFilterFromControls() {
+    return {
+        text: document.getElementById('sysmon-search')?.value || '',
+        eids: document.getElementById('sysmon-filter-eid')?.value || '',
+        winEids: document.getElementById('sysmon-filter-wineid')?.value || '',
+        ...sysmonFlowFilter, ...sysmonTimeWindow,
+    };
+}
 
-    if (!sysmonEvents || !sysmonEvents.length) {
-        container.innerHTML = '<div class="empty-state">No Sysmon events found</div>';
-        return;
-    }
-
-    if (sysmonEvents[0]?.error) {
-        container.innerHTML = `<div class="empty-state">Error: ${escapeHtml(sysmonEvents[0].error)}</div>`;
-        return;
-    }
-
-    // Apply local filters
-    const searchTerm = (document.getElementById('sysmon-search')?.value || '').toLowerCase().trim();
-    const eidFilter = (document.getElementById('sysmon-filter-eid')?.value || '').trim();
-    const winEidFilter = (document.getElementById('sysmon-filter-wineid')?.value || '').trim();
-    let filtered = sysmonEvents;
-
-    // Filter by Sysmon Event IDs (comma-separated)
-    if (eidFilter) {
-        const eids = eidFilter.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
-        if (eids.length) {
-            filtered = filtered.filter(ev => eids.includes(ev.event_id));
-        }
-    }
-
-    // Filter by correlated Windows Event IDs (comma-separated)
-    if (winEidFilter) {
-        const winEids = winEidFilter.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
-        if (winEids.length) {
-            filtered = filtered.filter(ev => {
-                const correlated = getCorrelatedWindowsEvents(ev.event_id);
-                return correlated.some(c => winEids.includes(c.id));
-            });
-        }
-    }
-
-    // Text search filter
-    if (searchTerm) {
-        filtered = filtered.filter(ev => {
+// The events the filter lets through, in their order. filter = {text, eids,
+// winEids, image, type, from, to}: the search in the event's fields in any
+// case; Sysmon and correlated Windows event IDs as the EID filters take them
+// ("1, 3, 11"); the image by its file name, as the table names it, and the
+// event type, both in any case and without the blanks around them,
+// "(unknown)" taking the events without one; the time window, `from`
+// included and `to` not, as a bar of EVENTS OVER TIME counts (an event
+// without a time is in none). A filter left empty does not filter.
+function filterSysmonEvents(events, filter) {
+    filter = filter || {};
+    const text = String(filter.text || '').toLowerCase().trim();
+    const ids = value => String(value || '').split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
+    const eids = ids(filter.eids), winEids = ids(filter.winEids);
+    const image = _alertsNameKey(filter.image), type = _alertsNameKey(filter.type);
+    const from = _alertsTimeBound(filter.from), to = _alertsTimeBound(filter.to);
+    return (events || []).filter(ev => {
+        if (!ev) return false;
+        if (eids.length && !eids.includes(ev.event_id)) return false;
+        if (winEids.length && !getCorrelatedWindowsEvents(ev.event_id).some(c => winEids.includes(c.id))) return false;
+        if (image && !_alertNameIs(sysmonImageName(ev), image)) return false;
+        if (type && !_alertNameIs(String(ev.type ?? ''), type)) return false;
+        if (text) {
             const haystack = [
                 ev.image, ev.commandline, ev.type, ev.target, ev.query,
                 ev.dst_ip, ev.dst_hostname, ev.loaded_image, ev.source_image,
@@ -8150,15 +10660,75 @@ function renderSysmonTable() {
                 String(ev.pid || ''), String(ev.event_id || ''),
                 ev.details, ev.result
             ].filter(Boolean).join(' ').toLowerCase();
-            return haystack.includes(searchTerm);
-        });
+            if (!haystack.includes(text)) return false;
+        }
+        if (from === null && to === null) return true;
+        // An event without a time (NaN) fails both comparisons: it is in no window
+        const t = Date.parse(ev.timestamp);
+        return t >= (from ?? -Infinity) && t < (to ?? Infinity);
+    });
+}
+
+// An event's image by its file name, as the table shows it ('' if none)
+function sysmonImageName(ev) {
+    return String(ev?.image || '').split('\\').pop();
+}
+
+// An event's type without the blanks around it, "(unknown)" if it has none
+function sysmonEventType(ev) {
+    return String(ev?.type ?? '').trim() || '(unknown)';
+}
+
+function renderSysmonTable() {
+    const container = document.getElementById('sysmon-table');
+    if (!container) return;
+    const filter = sysmonFilterFromControls();
+    // The charts count the events of the filters but the time window
+    const loaded = !!sysmonEvents?.length && !sysmonEvents[0]?.error;
+    const shown = loaded ? filterSysmonEvents(sysmonEvents, { ...filter, from: null, to: null }) : [];
+    renderSysmonCharts(shown);
+    // The chips are written again only when the chart filters changed: a chip in focus keeps it
+    const chips = JSON.stringify([sysmonTimeWindow, sysmonFlowFilter]);
+    if (!_sysmonTableShown || _sysmonTableShown.chips !== chips) renderSysmonActiveFilters();
+    // The same filters keep the place in the list. Other filters start at its top: with the filter bar
+    // standing at the top of the tab, the first row right under it, so the bar stays under the pointer;
+    // above that, nothing moves.
+    const key = JSON.stringify([filter.text.toLowerCase().trim(), filter.eids.trim(), filter.winEids.trim(), chips]);
+    const tab = document.getElementById('tab-sysmon');
+    const scrollTop = tab ? tab.scrollTop : 0;
+    container.innerHTML = _sysmonTableHtml(shown, filter);
+    if (tab) {
+        tab.scrollTop = _sysmonTableShown && _sysmonTableShown.key === key ? scrollTop
+            : Math.min(scrollTop, _tabListTop(tab, tab.querySelector('.sysmon-filters'), container));
+    }
+    _sysmonTableShown = { key, chips };
+}
+
+// The table of the events of the filters (`shown`) in their time window, or
+// why there is none
+function _sysmonTableHtml(shown, filter) {
+    if (!sysmonEvents || !sysmonEvents.length) {
+        return `<div class="empty-state">${escapeHtml(sysmonLoadError || 'No Sysmon events found')}</div>`;
     }
 
-    const hasAnyFilter = searchTerm || eidFilter || winEidFilter;
+    if (sysmonEvents[0]?.error) {
+        return `<div class="empty-state">Error: ${escapeHtml(sysmonEvents[0].error)}</div>`;
+    }
+
+    const searchTerm = filter.text.toLowerCase().trim();
+    const eidFilter = filter.eids.trim();
+    const winEidFilter = filter.winEids.trim();
+    const filtered = filterSysmonEvents(shown, { from: filter.from, to: filter.to });
+    const chartFilters = [
+        filter.from !== null && filter.to !== null && `time window ${_sysmonWindowLabel(filter.from, filter.to)}`,
+        filter.image !== null && `image: ${filter.image}`, filter.type !== null && `type: ${filter.type}`,
+    ].filter(Boolean);
+
+    const hasAnyFilter = searchTerm || eidFilter || winEidFilter || chartFilters.length;
     if (!filtered.length) {
-        const filterDesc = [searchTerm && `"${searchTerm}"`, eidFilter && `Sysmon EID: ${eidFilter}`, winEidFilter && `Win EID: ${winEidFilter}`].filter(Boolean).join(', ');
-        container.innerHTML = `<div class="empty-state">No events matching ${escapeHtml(filterDesc)} (${sysmonEvents.length} total)</div>`;
-        return;
+        const filterDesc = [searchTerm && `"${searchTerm}"`, eidFilter && `Sysmon EID: ${eidFilter}`, winEidFilter && `Win EID: ${winEidFilter}`,
+                            ...chartFilters].filter(Boolean).join(', ');
+        return `<div class="empty-state">No events matching ${escapeHtml(filterDesc)} (${sysmonEvents.length} total)</div>`;
     }
 
     const countInfo = hasAnyFilter ? ` <span class="sysmon-filter-count">(${filtered.length}/${sysmonEvents.length})</span>` : '';
@@ -8187,7 +10757,7 @@ function renderSysmonTable() {
     });
     html += '</tbody></table>';
     if (hasAnyFilter) html = `<div class="sysmon-search-info">Showing ${filtered.length} of ${sysmonEvents.length} events${countInfo}</div>` + html;
-    container.innerHTML = html;
+    return html;
 }
 
 function getSysmonDetails(ev) {
@@ -8352,6 +10922,328 @@ function toggleSysmonCorrelation() {
     html += '</tbody></table></div>';
     panel.innerHTML = html;
     panel.style.display = 'block';
+}
+
+// --- The charts of the Sysmon tab ---
+// Above the filter bar, side by side: EVENTS OVER TIME, the events per step
+// of seconds or minutes (hours, days for longer spans) stacked by event
+// type, with the types' legend; PROCESS → EVENT TYPE, a Sankey image → event
+// type. They count the events of the filters but the time window (the table
+// takes that, the bars mark it); an event without a time is in no bar, a
+// note counts those. A bar sets the time window of its period (Shift: widens
+// the window to it), a node, a band or a legend row its image and / or event
+// type. Each card shows its numbers as a table on request (CHART / TABLE).
+// The colour of an event type, by its name: that of its badge in the table
+// (process cyan, network purple, file green, ...), the pipes pink and teal;
+// ProcessTerminate a light grey: its badge shares the red of
+// CreateRemoteThread, and a process that ends is no alarm
+const SYSMON_TYPE_COLORS = {
+    processcreate: 'var(--accent-cyan)', networkconnect: 'var(--c-purple-500)', processterminate: 'var(--text-primary)',
+    imageload: 'var(--text-secondary)', createremotethread: 'var(--c-red-400)', processaccess: 'var(--c-amber-400)',
+    filecreate: 'var(--accent-green)', registryevent: 'var(--accent-orange)', dnsquery: 'var(--c-blue-400)',
+    pipecreated: 'var(--accent-pink)', pipeconnected: 'var(--c-teal-400)',
+};
+// The colours of the other types (Event_23, ...): one each by its name, on
+// the hues none of the types above has, in either theme (lime and azure, a
+// light and a dark step each)
+const SYSMON_OTHER_COLORS = ['var(--c-lime-400)', 'var(--c-sky-400)', 'var(--c-lime-600)', 'var(--c-sky-550)'];
+// PROCESS → EVENT TYPE by square roots (small flows stay visible) or, with
+// LINEAR, in true proportions, until the page is reloaded
+const sysmonFlowView = { linear: false };
+// What the charts on screen were drawn from, for which widths and height: a
+// resize or LINEAR draws them again without counting again
+let _sysmonChartsDrawn = null;
+
+// Draws both charts of the events of the filters (the time window aside);
+// renderSysmonTable calls it. Without events they say why ("Sysmon not
+// available", "No Sysmon events", "No events match the filters"), or `hint`.
+function renderSysmonCharts(events, hint) {
+    if (!document.getElementById('sysmon-charts')) return;
+    for (const id of ['sysmon-time', 'sysmon-flow']) {
+        // Written once: a render keeps the switch (and the keyboard focus on it)
+        const slot = document.getElementById(`${id}-toggle`);
+        if (slot && !slot.firstElementChild) slot.innerHTML = viewToggleHtml(id);
+    }
+    const list = (events || []).filter(Boolean);
+    const empty = list.length ? '' : hint || _sysmonEmptyText();
+    // A type is named as it first appears among the events loaded, in the bars as in the Sankey
+    const names = _sysmonTypeNames(sysmonEvents);
+    const typeOf = ev => names.get(_alertsNameKey(sysmonEventType(ev))) || sysmonEventType(ev);
+    const types = sysmonTypeItems(list, typeOf);
+    // The most frequent type at the foot of a bar
+    const time = chartTimeBins(list, { key: typeOf, keys: types.map(item => item.key).reverse(), fine: true });
+    const flow = sysmonFlow(list, { top: 6, names: sysmonEvents });
+    // As high as the fuller column of the Sankey needs: its names stay apart
+    const nodes = Math.max(0, ...flow.columns.map(column => column.length));
+    const height = empty ? 120 : Math.min(420, Math.max(180, 32 * nodes + 24));
+    // The legend first: it takes its room beside the plot of the bars, so the plot is measured at the width they get
+    const legend = document.getElementById('sysmon-time-legend');
+    if (legend) legend.innerHTML = empty ? '' : chartLegendHtml(types);
+    document.querySelectorAll('#sysmon-charts .sysmon-chart-area').forEach(area => { area.style.height = `${height}px`; });
+    _sysmonChartsDrawn = { widths: _sysmonChartWidths(), height, empty, time, types, flow };
+    _drawSysmonTime(_sysmonChartsDrawn);
+    _drawSysmonFlow(_sysmonChartsDrawn);
+}
+
+// Why the charts have no events to count
+function _sysmonEmptyText() {
+    if (sysmonLoadError || sysmonEvents?.[0]?.error) return 'Sysmon not available';
+    return sysmonEvents?.length ? 'No events match the filters' : 'No Sysmon events';
+}
+
+// Each event type (in lower case, without blanks) with its first spelling among the events
+function _sysmonTypeNames(events) {
+    const names = new Map();
+    for (const ev of events || []) {
+        const type = sysmonEventType(ev), key = _alertsNameKey(type);
+        if (!names.has(key)) names.set(key, type);
+    }
+    return names;
+}
+
+// The legend of EVENTS OVER TIME: the events per type (typeOf(event)), also
+// those in no bar, the most frequent first, each type in its colour
+function sysmonTypeItems(events, typeOf) {
+    return countBy(events, typeOf).map(({ key, count }) => ({ key, label: key, value: count, color: sysmonTypeColor(key) }));
+}
+
+// An event type's colour (SYSMON_TYPE_COLORS), in any case; another type one
+// of SYSMON_OTHER_COLORS by its name, so it keeps it whatever else is loaded
+function sysmonTypeColor(type) {
+    const name = _alertsNameKey(type);
+    if (Object.prototype.hasOwnProperty.call(SYSMON_TYPE_COLORS, name)) return SYSMON_TYPE_COLORS[name];
+    let hash = 0;
+    for (const ch of name) hash = (hash * 31 + ch.codePointAt(0)) % 9973;
+    return SYSMON_OTHER_COLORS[hash % SYSMON_OTHER_COLORS.length];
+}
+
+// The events as a flow image → event type (PROCESS → EVENT TYPE), _chartFlow's
+// {columns, links, labels}: an image by its file name as the table names it,
+// in any case and without the blanks around it (as its filter compares it),
+// none as "(unknown)"; the `top` (default 6) most frequent on their own, the
+// rest "other images". Every event type stands on its own.
+function sysmonFlow(events, opts) {
+    return _chartFlow(events, [
+        ['image', ev => sysmonImageName(ev).trim() || '(unknown)', _alertsNameKey, 'other images'],
+        ['type', sysmonEventType, _alertsNameKey, null],
+    ], opts);
+}
+
+// EVENTS OVER TIME from what renderSysmonCharts counted: the bars for the
+// width of their plot (beside the legend renderSysmonCharts wrote) and the
+// height of the cards, the time window marked, a bar without events inert,
+// under them the note of the events in no bar; the table view (a row per
+// bar with events, its total, its events per type)
+function _drawSysmonTime(drawn) {
+    const plot = document.getElementById('sysmon-time-plot'), table = document.getElementById('sysmon-time-table');
+    const { time, types } = drawn;
+    const missed = _alertsTimeNote(time);
+    const note = missed ? '<div class="sysmon-chart-note" title="Events without a readable time or with one no clock can have had (before 2000, more than a day ahead) are in no bar; the legend and PROCESS → EVENT TYPE count them">'
+        + `${escapeHtml(missed)}</div>` : '';
+    const colors = Object.create(null);         // types from the data: none may be special (__proto__)
+    types.forEach(item => { colors[item.key] = item.color; });
+    const { from, to } = sysmonTimeWindow;
+    const svg = drawn.empty ? '' : stackedBarsSvg(time.bins, { width: drawn.widths.time || 560, height: drawn.height - (note ? 18 : 0),
+        keys: types.map(item => item.key).reverse(), colors, unit: time.unit, step: time.step,
+        selection: from !== null && to !== null ? { from, to } : null });
+    if (plot) {
+        plot.innerHTML = (svg || chartEmptyHtml(drawn.empty || 'No events with a time')) + note;
+        _alertsChartInert(plot, '[data-bin-start]', el => !(Number(el.getAttribute('data-total')) > 0));
+    }
+    if (table) {
+        table.innerHTML = _timeBinsTableHtml(time, [{ head: 'Total', count: bin => bin.total },
+            ...types.map(item => ({ head: item.label, count: bin => bin.counts[item.key] || 0 }))],
+        drawn.empty || 'No events with a time', '<table class="view-table" data-sortable data-sort-id="sysmon-time">');
+    }
+}
+
+// PROCESS → EVENT TYPE from what renderSysmonCharts counted: the Sankey for
+// the width of its card and the height of the cards, the event types on the
+// right with the room for their names, by square roots or in true
+// proportions (LINEAR); "other images" and its bands inert; the table view
+function _drawSysmonFlow(drawn) {
+    const view = document.getElementById('sysmon-flow-chart'), table = document.getElementById('sysmon-flow-table');
+    const { flow } = drawn;
+    const width = drawn.widths.flow || 480;
+    const into = new Map();
+    flow.links.forEach(link => into.set(link.target, (into.get(link.target) || 0) + link.value));
+    const longest = Math.max(0, ...(flow.columns[1] || []).map(id => String(flow.labels[id] ?? id).length + _chartNumber(into.get(id)).length + 1));
+    const layout = layoutSankey(flow.columns, flow.links, { width, height: drawn.height - 12, scale: sysmonFlowView.linear ? 'linear' : 'sqrt',
+        labelWidth: Math.max(width / 4, Math.min(width / 2, 6 * longest + 24)) });
+    if (view) {
+        view.innerHTML = sankeySvg(layout, { labels: flow.labels, colors: _sysmonFlowColors(flow) }) || chartEmptyHtml(drawn.empty || 'No events');
+        _flowInert(view, _sysmonFlowFilter);
+    }
+    if (table) {
+        table.innerHTML = _flowTableHtml(flow, drawn.empty || 'No events', '<table class="view-table" data-sortable data-sort-id="sysmon-flow">',
+                                         ['Image', 'Event type']);
+    }
+}
+
+// The colours of the nodes: an image from the palette by its place (without
+// its muted last colour, which is that of "other images"), an event type in
+// its colour of EVENTS OVER TIME
+function _sysmonFlowColors(flow) {
+    const colors = Object.create(null);
+    (flow.columns[0] || []).forEach((id, i) => {
+        colors[id] = id === 'other images' ? 'var(--text-muted)' : CHART_PALETTE[i % (CHART_PALETTE.length - 1)];
+    });
+    (flow.columns[1] || []).forEach(id => { colors[id] = sysmonTypeColor(flow.labels[id]); });
+    return colors;
+}
+
+// The filter a node of PROCESS → EVENT TYPE stands for: {image} or {type}
+// with its name; none ({}) for "other images", which stands for several
+function _sysmonFlowFilter(id) {
+    const m = /^(image|type):([\s\S]*)$/.exec(String(id ?? ''));
+    return m && m[2] ? { [m[1]]: m[2] } : {};
+}
+
+// The widths the charts are drawn for: of the plot of the bars (beside the
+// legend) and of the Sankey's card (0 while hidden)
+function _sysmonChartWidths() {
+    const width = el => Math.floor(el?.getBoundingClientRect().width || 0);
+    return { time: width(document.getElementById('sysmon-time-plot')),
+             flow: width(document.querySelector('#sysmon-flow-card .chart-card-head')) };
+}
+
+// A click on a chart of the Sysmon tab sets the filter of the part clicked:
+// a bar the time window of its period (with Shift, the window from the one
+// set to it), a legend row its event type, a node of the Sankey its image or
+// event type, a band both. A bar without events and "other images" (and its
+// bands) set nothing: each would list other events than it shows.
+function onSysmonChartClick(event, chart) {
+    const target = event && event.target;
+    if (!target || typeof target.closest !== 'function') return;
+    if (chart === 'time') {
+        const bin = target.closest('[data-bin-start]');
+        const row = bin ? null : target.closest('.chart-legend-row');
+        if (bin && Number(bin.getAttribute('data-total')) > 0) {
+            let from = Number(bin.getAttribute('data-bin-start')), to = Number(bin.getAttribute('data-bin-end'));
+            if (event.shiftKey && sysmonTimeWindow.from !== null && sysmonTimeWindow.to !== null) {
+                from = Math.min(from, sysmonTimeWindow.from);
+                to = Math.max(to, sysmonTimeWindow.to);
+            }
+            setSysmonFilters({ from, to });
+        } else if (row && row.getAttribute('data-key')) {
+            setSysmonFilters({ type: row.getAttribute('data-key') });
+        }
+    } else if (chart === 'flow') {
+        const change = _flowClickFilter(target, _sysmonFlowFilter);
+        if (change) setSysmonFilters(change);
+    }
+}
+
+// Sets some of the filters the charts set and keeps the others: {from, to}
+// a time window (null for none), {image}, {type} (null takes one off); then
+// renders the table and the charts
+function setSysmonFilters(changes) {
+    changes = changes || {};
+    if ('from' in changes || 'to' in changes) {
+        const from = _alertsTimeBound(changes.from), to = _alertsTimeBound(changes.to);
+        Object.assign(sysmonTimeWindow, from !== null && to !== null && to > from ? { from, to } : { from: null, to: null });
+    }
+    for (const kind of ['image', 'type']) {
+        if (kind in changes) sysmonFlowFilter[kind] = String(changes[kind] ?? '').trim() || null;
+    }
+    renderSysmonTable();
+}
+
+// The filters the charts set as chips in the filter bar, one each:
+// "× 19:32:00 – 19:32:30", "× image: …", "× type: …"; a click takes off
+// that filter only. The row is hidden while there is none.
+function renderSysmonActiveFilters() {
+    const holder = document.getElementById('sysmon-active-filters');
+    if (!holder) return;
+    const { from, to } = sysmonTimeWindow, { image, type } = sysmonFlowFilter;
+    const chips = [];
+    if (from !== null && to !== null) {
+        chips.push({ kind: 'window', value: _sysmonWindowLabel(from, to),
+                     title: `Remove the time window ${formatAlertTime(from)} – ${formatAlertTime(to)} (end not included)` });
+    }
+    if (image !== null) chips.push({ kind: 'image', name: 'image', value: image, title: `Remove the image filter: ${image}` });
+    if (type !== null) chips.push({ kind: 'type', name: 'type', value: type, title: `Remove the event type filter: ${type}` });
+    holder.innerHTML = chips.map(chip => filterChipHtml(chip, `removeSysmonFilter(${jsArg(chip.kind)})`)).join('');
+    holder.hidden = chips.length === 0;
+}
+
+// The × of a chip ('window', 'image' or 'type'). A chip in focus hands it on
+// to the chip that takes its place, the search box after the last.
+function removeSysmonFilter(kind) {
+    if (!['window', 'image', 'type'].includes(kind)) return;
+    const holder = document.getElementById('sysmon-active-filters');
+    const chips = () => (holder ? [...holder.querySelectorAll('.alerts-filter-chip')] : []);
+    const focused = chips().indexOf(document.activeElement);
+    setSysmonFilters(kind === 'window' ? { from: null, to: null } : { [kind]: null });
+    if (focused < 0) return;
+    const left = chips();
+    (left[Math.min(focused, left.length - 1)] || document.getElementById('sysmon-search'))?.focus();
+}
+
+// A time window as its chip names it: "19:32:00 – 19:32:30" in local time
+// (hours 00-23), with the dates when it does not lie within one day or
+// covers a whole one (the bar of a day)
+function _sysmonWindowLabel(from, to) {
+    const day = _chartPeriodStart(from, 'day'), next = _chartPeriodNext(day, 'day');
+    const oneDay = to <= next && !(from === day && to === next);
+    const at = t => `${oneDay ? '' : _chartDate(t) + ' '}${_chartClock(t, true)}`;
+    return `${at(from)} – ${at(to)}`;
+}
+
+// New events keep the time window while their plausible times reach it
+// (also when none of them lies in it: it may be a quiet stretch between
+// them), and drop it when they lie all before or after it
+function _sysmonKeepWindow(events) {
+    const { from, to } = sysmonTimeWindow;
+    if (from === null || to === null) return;
+    const latest = Date.now() + 86400000;
+    let first = Infinity, last = -Infinity;
+    for (const ev of events || []) {
+        const t = Date.parse(ev?.timestamp);
+        if (!(t >= ALERT_TIME_MIN && t < latest)) continue;
+        first = Math.min(first, t);
+        last = Math.max(last, t);
+    }
+    if (!(first < to && last >= from)) Object.assign(sysmonTimeWindow, { from: null, to: null });
+}
+
+// LINEAR: the Sankey in true proportions, or by square roots again
+function toggleSysmonFlowScale() {
+    sysmonFlowView.linear = !sysmonFlowView.linear;
+    _pressFlowScale(document.getElementById('sysmon-flow-linear'), sysmonFlowView.linear);
+    if (_sysmonChartsDrawn) _drawSysmonFlow(_sysmonChartsDrawn);
+}
+
+// The bars and the Sankey for the new widths of their places; neither while
+// it is hidden (0) or for the width it was drawn for
+function redrawSysmonChartsOnResize() {
+    const drawn = _sysmonChartsDrawn;
+    if (!drawn) return;
+    const widths = _sysmonChartWidths();
+    if (widths.time && widths.time !== drawn.widths.time) {
+        drawn.widths.time = widths.time;
+        _drawSysmonTime(drawn);
+    }
+    if (widths.flow && widths.flow !== drawn.widths.flow) {
+        drawn.widths.flow = widths.flow;
+        _drawSysmonFlow(drawn);
+    }
+}
+
+// The table head stands right under the filter bar (--sysmon-bar-height on
+// the table's box, which its renders keep); the charts are drawn for their
+// widths again, in the next frame, when the cards or the plot of the bars
+// change their size (the window, the theme, the tab or the chart view shown
+// again)
+function initSysmonTab() {
+    if (typeof ResizeObserver === 'undefined') return;
+    const bar = document.querySelector('#tab-sysmon .sysmon-filters'), table = document.getElementById('sysmon-table');
+    if (bar && table) _followBarHeight(bar, table, '--sysmon-bar-height');
+    const charts = document.getElementById('sysmon-charts'), plot = document.getElementById('sysmon-time-plot');
+    if (!charts) return;
+    const observer = new ResizeObserver(() => requestAnimationFrame(redrawSysmonChartsOnResize));
+    observer.observe(charts);
+    if (plot) observer.observe(plot);
 }
 
 // --- LitterBox Integration ---

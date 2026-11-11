@@ -33,7 +33,7 @@
 
 <p align="center">
   <img src="static/theme_cyberpunk.png" alt="Dashboard in the Cyberpunk theme" width="90%">
-  <br><sub>Service Dashboard &mdash; real-time health monitoring, alert feed, and detection metrics (Cyberpunk theme, the default; ✶ switches to Classic)</sub>
+  <br><sub>Service Dashboard &mdash; detection metrics, alert activity by severity and category, and service health (Cyberpunk theme, the default; ✶ switches to Classic)</sub>
 </p>
 
 ---
@@ -116,18 +116,18 @@ make open       # Opens http://<vm-ip>:9000 in browser
 
 | Tab | Description |
 |-----|-------------|
-| **Dashboard** | Stats strip (alerts, processes, services, rules, tools), service health cards, recent activity feed; each tile opens what it counts |
-| **Alerts** | Every alert in one table, newest first, with severity (multi-select), engine and text filters and an "n of m" count; a row opens the alert detail, the process name its process (only processes in the process list are links); the newest 2000 matches are listed |
+| **Dashboard** | Stats strip (alerts, processes, services, rules, tools; TOTAL ALERTS and PROCESSES TRACKED with 45-day sparklines), ALERT ACTIVITY with the SEVERITY and CATEGORY donuts of its range (see [Charts](#charts)), service health cards, recent activity feed; each tile opens what it counts |
+| **Alerts** | Every alert in one table, newest first, under charts of the current filter (severity and engine pies, bars over time, an engine → rule → process Sankey), with severity (multi-select), engine and text filters, the time range, category, rule and process filters a chart click sets (each a chip with ×) and an "n of m" count; a row opens the alert detail, the process name its process (only processes in the process list are links); the newest 2000 matches are listed |
 | **Tracing** | Per-process console: verdict, timeline by event type, process tree, alerts with full raw events (Sigma match details) |
-| **Graph** | Process tree around a process: tree, force-directed and isometric layouts, landing page with samples and candidate processes, detail panel with Sysmon events and children |
+| **Graph** | Process tree around a process: tree, force-directed and isometric layouts, landing page with samples and candidate processes, detail panel with Sysmon events, ACTIVITY MIX and children |
 | **Pipes** | Named pipes: Sysmon pipe events (EID 17/18) with name/PID filters and C2-family hits, and interception sessions (attach to an existing pipe or arm for a name/prefix/regex; observe or hold messages to forward, edit or drop them; JSON export) |
-| **Sysmon** | Sysmon event viewer with search, type/PID filters and Sysmon → Windows Event ID correlation |
-| **ThreatScan** | ThreatCheck, DefenderCheck, EMBER2024 and capa on a file, plus the **Live Process Memory** panel (Aether scan, memory dump, host baseline, system sweep) and the scan history |
+| **Sysmon** | Sysmon event viewer with search, type/PID filters and Sysmon → Windows Event ID correlation; EVENTS OVER TIME and a process → event type Sankey narrow the table by time window, image or event type |
+| **ThreatScan** | ThreatCheck, DefenderCheck, EMBER2024 and capa on a file, plus the **Live Process Memory** panel (Aether scan, memory dump, host baseline, system sweep) and the scan history with its SCORE HISTORY |
 | **ETW** | Multi-channel Event Log browser with live threat highlighting (see below) |
 | **Hex** | Hex editor with data inspector, structure minimap, PE/ELF analysis and section inspection |
 | **FileMap** | Byteplot / entropy / PE-ELF structure planes side by side, import/export trees, click-to-offset |
 | **LitterBox** | Files in the LitterBox sandbox with their static/dynamic/EDR results |
-| **Submit** | Detonation with stage-by-stage progress and combined verdict (EDR alerts, live memory, exit capture, network beaconing, LitterBox) |
+| **Submit** | Detonation with stage-by-stage progress and combined verdict (EDR alerts, live memory, exit capture, network beaconing, LitterBox) with its VERDICT FLOW; the submission history with VERDICT HISTORY |
 
 Every process in the UI is a process *instance*: Windows reuses PIDs, so the
 newest process with a PID is addressed by the plain PID and earlier ones as
@@ -165,8 +165,9 @@ Both themes share the card controls:
   Esc or a click elsewhere closes the explanation.
 - **CHART / TABLE** shows the numbers of a chart as a table: the sidebar
   timeline, the Tracing timeline and severity bar, the file structure of the
-  PE/ELF binary analysis and the file map strip of the PE analysis. The choice
-  holds per card until the page is reloaded.
+  PE/ELF binary analysis, the file map strip of the PE analysis and every
+  chart card under [Charts](#charts) (not the sparklines in the tiles). The
+  choice holds per card until the page is reloaded.
 - **Sortable tables:** a click on a column head sorts ascending, a second
   click descending (↕ / ▲ / ▼). Numbers sort numerically, times
   chronologically, empty cells last. The order survives the table being
@@ -181,6 +182,80 @@ Both themes share the card controls:
 
 Tiles and column heads also take Enter and Space. The **Alerts** tab (see the
 table above) exists in both themes.
+
+### Charts
+
+The Web UI draws its charts itself, as SVG (no chart library). They take
+their colours from the theme, so ✶ recolours them at once, and every chart
+card has an **(i)** and **CHART / TABLE** (the sparklines in the tiles are
+not cards and have neither): the table lists the same numbers and sorts like
+the other tables. Screenshots:
+[Dashboard & Alerts Charts](#dashboard--alerts-charts).
+
+| Where | Chart | Shows | Click / drag |
+|-------|-------|-------|--------------|
+| Dashboard | Sparklines in TOTAL ALERTS and PROCESSES TRACKED | Alerts and newly seen processes per day over the last 45 days | — |
+| Dashboard | **ALERT ACTIVITY** | Alerts per hour, day or week, stacked by severity, for **24H / 7D / 30D / ALL** (default ALL) | A drag across the bars narrows the donuts to that range (a chip; its × goes back to the preset); a bar opens the Alerts tab filtered to its period |
+| Dashboard | **SEVERITY**, **CATEGORY** | Donuts of the range with name, count and share; the six most frequent categories, the rest as *other categories* | A segment or a legend row opens the Alerts tab with that severity or category, within the range |
+| Alerts | **SEVERITY**, **OVER TIME**, **ENGINE** | Pies and bars of the alerts the filters let through | A slice or a legend row shows only its severity (the chips in the filter bar switch severities on or off) or chooses its engine; a bar sets its period |
+| Alerts | **FLOW: ENGINE → RULE → PROCESS** | Sankey of the same alerts: the six most frequent rules and processes, the rest as *other rules* / *other processes* | A node sets its engine, rule or process, a band both of its ends |
+| Sysmon | **EVENTS OVER TIME** | The loaded events per period (seconds, minutes or longer, by their span), stacked by event type | A bar sets a time window (Shift+click widens it to another bar), a legend row the event type |
+| Sysmon | **PROCESS → EVENT TYPE** | Sankey image → event type: the six most frequent images, the rest as *other images* | A node sets its image or event type, a band both of its ends |
+| ThreatScan | **SCORE HISTORY** | A point per scan, oldest left: Aether and Exit Capture at their evidence score, with dashed lines at SUSPICIOUS 2 and MALICIOUS 6; every other tool in the lane *no score* (EMBER2024's probability in the tooltip); coloured by verdict | A point opens its scan in the history list, scrolls to it and marks it |
+| Submit | **VERDICT HISTORY** | A bar per submission, oldest left, as high as its verdict's score on the verdict's own scale (SUSPICIOUS from 1, MALICIOUS from 3) and in its colour; grey: *not evaluated* | A bar opens its results, as its Results button does |
+| Submit, detail panel | **VERDICT FLOW** | Sankey of a detonation's findings: process → kind (LitterBox score, EDR alerts, live memory, exit capture, network beaconing, named pipes) → *counted* / *not counted* | — |
+| Graph | **ACTIVITY MIX** | Donut in a process node's detail: the Sysmon activity of that process instance (network, DNS, file, registry, named pipes, the injections it made); its alerts as a number beside it, not part of the ring | — |
+
+- **Click filters:** a time range, category, rule or process (Alerts) and a
+  time window, image or event type (Sysmon) set by a click show as chips in
+  the filter bar; the × of a chip takes that filter off. A severity or an
+  engine sets the filter bar's own controls. The count of the table ("n of
+  m" in the Alerts tab, "Showing n of m events" in Sysmon) is then exactly
+  what the part counted. Some parts set no filter: a bucket (*other rules*,
+  *other processes*, *other images*, *other categories*) and every band into
+  or out of one (*other rules* → a process, *other images* → an event type),
+  which stand for several names and would list more than they show; the
+  alerts without an engine and a severity no chip names, which no control
+  of the filter bar selects; and a bar without alerts or events, which
+  would list nothing.
+- **Charts and filters:** the charts of the Alerts and Sysmon tabs count
+  everything the current filters let through (the Alerts table lists the
+  newest 2000 of it, the charts all; Sysmon: all but its time window, which
+  the bars mark; the window narrows the table). Both tabs scroll as a whole
+  while the filter bar stays at the top; a click on the dashboard opens the
+  Alerts tab at its top.
+- **Times:** bars follow local hours and days. An alert or event without a
+  readable time, or with one before 2000 or more than a day ahead (a sample
+  can set the clock), is in no bar: a note under the bars counts those, and
+  the pies, donuts and Sankeys of the same filter include them. Sigma's
+  level `informational` counts as info.
+- **Sankeys** are drawn by square roots, so small flows stay visible;
+  **LINEAR** shows true proportions.
+- **VERDICT FLOW** counts each finding once, as the results list it: every
+  EDR alert (those beyond the 50 the server lists flow from *(not listed)*),
+  the LitterBox score when it added points to the verdict (4 of 10 or more;
+  it flows from *(sample file)*) and every memory finding by its source;
+  *named pipes* counts the pipe findings, not the pipes the Named Pipes tab
+  counts. A memory finding is *counted* while the memory evidence reaches
+  SUSPICIOUS and it keeps a weight, also one marked "uncorroborated — weight
+  reduced"; findings the host baseline suppressed, repeats capped at weight
+  0 and all findings of an evidence below SUSPICIOUS are *not counted*.
+- **Stored verdicts:** the server keeps a detonation's verdict (label and
+  score) on its submission each time it computes the results: every poll
+  of the Submit tab, every opening of the results, the MCP tools that read
+  them. It goes to the submission of the run it was computed for: the
+  sample run as that PID, without a PID the one of the sample that ran
+  without (LitterBox only). Results for a PID none of the sample's
+  submissions ran as, or without a PID for a sample that always ran with
+  one (`tdc_detonation_results` with a hash only), are stored nowhere.
+  VERDICT HISTORY shows the last verdict stored, so it can be provisional: if
+  polling stopped early or services were offline then, it is the verdict of
+  that moment. Opening the results again computes and stores it anew;
+  submissions from before verdicts were stored stay grey until then.
+- **Polling:** the charts of the dashboard and the Alerts tab count again
+  only when the alerts or the range change, not on every refresh (the
+  alerts every 5 s, the dashboard every 10 s), and not while their tab is
+  hidden.
 
 ### ETW Browser
 
@@ -240,7 +315,8 @@ unnoticed: process instances and PID reuse, attribution of alerts and
 processes to a detonation, timestamp handling, persisted memory results,
 scanner output parsing, the evidence model and baseline, CSRF / DNS-rebinding
 / write restrictions, proxied content types, XSS (unescaped event fields and
-unsafe inline handlers in `app.js`), MCP tool output, and README/help drift
+unsafe inline handlers in `app.js`), charts that count other numbers than
+their tables and filters, MCP tool output, and README/help drift
 against the routes and tools. GitHub Actions runs the suite on every push
 (`.github/workflows/tests.yml`). `make test` is different: it submits a test
 sample to the running VM.
@@ -749,13 +825,19 @@ programs that mimic implant behaviour).
 </p>
 
 > Stats strip (alerts by severity, tracked processes, services online, loaded
-> Sigma/YARA rules, scanner tools), where each tile opens what it counts, and
-> one card per service: Rustinel, DetonatorAgent, LitterBox, Sysmon, Fibratus,
-> AV/AMSI scanner, EMBER2024 and capa. Offline services are struck through and
-> can be launched from their card. The left sidebar holds the tabs (Alerts,
-> the second, lists every alert), ✶ below "? Help" (switches to the default
-> Cyberpunk theme), the tracked processes and the alert timeline: the 60 newest alerts
-> coloured by severity, which TABLE lists as a table.
+> Sigma/YARA rules, scanner tools), where each tile opens what it counts;
+> TOTAL ALERTS and PROCESSES TRACKED carry 45-day sparklines. Below it
+> **ALERT ACTIVITY** on ALL: the 9,620 alerts per day from 14 Jul to 10 Nov,
+> stacked by severity, beside the **SEVERITY** and **CATEGORY** donuts of
+> that range (196 critical, 2,700 high, 6,720 medium, 4 low; registry,
+> process, api, file, module). Then one card per service: Rustinel,
+> DetonatorAgent and LitterBox, below them Sysmon, Fibratus and the AV/AMSI
+> scanner (EMBER2024 and capa follow further down). Offline services are
+> struck through and can be launched from their card (here LitterBox). The
+> left sidebar holds the tabs (Alerts, the second, lists every alert), ✶
+> below "? Help" (switches to the default Cyberpunk theme), the tracked
+> processes and the alert timeline: the 60 newest alerts coloured by
+> severity, which TABLE lists as a table.
 
 ---
 
@@ -774,7 +856,10 @@ programs that mimic implant behaviour).
 > (LitterBox is offline; a click lists them); the SERVICES ONLINE tile shows
 > *4/6* because it also counts the Detonator, which is offline as well. Below
 > the head area the stats tiles carry a coloured edge; a click on a tile opens
-> what it counts, a click on *2896 high* the critical and high alerts.
+> what it counts, a click on *2896 high* the critical and high alerts. The
+> charts follow in the theme's colours: ALERT ACTIVITY on ALL (its switch
+> 24H / 7D / 30D / ALL at the top right), the SEVERITY and CATEGORY donuts,
+> then the service cards.
 
 ---
 
@@ -784,11 +869,49 @@ programs that mimic implant behaviour).
   <img src="static/alerts_tab.png" alt="Alerts tab filtered by severity and engine" width="100%">
 </p>
 
-> The **Alerts** tab filtered to the critical and high alerts of the fibratus
-> engine: *6 of 9620*, newest first, each with its time, severity, engine,
-> rule, process and PID, and the rule's description. A click on a row opens
-> the alert detail; process names that are in the process list (here
-> `services.exe`) are links to the process. Column heads sort the table.
+> The **Alerts** tab (Classic) filtered to the critical and high alerts of
+> the fibratus engine: *6 of 9620*. The charts above the filter bar count
+> the same six: SEVERITY 1 critical and 5 high, OVER TIME one alert on each
+> of six days between 28 Oct and 10 Nov, ENGINE fibratus alone, and FLOW
+> from fibratus through six rules to six processes (a click on a part would
+> narrow the list further). Below the bar the six rows, newest first, each
+> with its time, severity, engine, rule, process and PID, and the rule's
+> description. A click on a row opens the alert detail; process names that
+> are in the process list (here `services.exe`) are links to the process.
+> Column heads sort the table.
+
+---
+
+### Dashboard & Alerts Charts
+
+<p align="center">
+  <img src="static/dashboard_charts.png" alt="Dashboard charts with a range drawn across ALERT ACTIVITY" width="100%">
+</p>
+
+> The dashboard (Cyberpunk) with a range drawn across **ALERT ACTIVITY**:
+> the bars of ALL show the 9,620 alerts per day from 14 Jul to 10 Nov,
+> stacked by severity; the range 23 Jul – 21 Aug is marked on them and
+> stands as a chip before 24H / 7D / 30D / ALL, whose × goes back to ALL.
+> **SEVERITY** and **CATEGORY** count that range only: 5,833 alerts (7
+> critical, 1,761 high, 4,065 medium), in three categories (registry,
+> process, api). The TOTAL ALERTS and PROCESSES TRACKED tiles carry their
+> 45-day sparklines. A click on a bar or a segment opens the Alerts tab
+> filtered to it.
+
+<p align="center">
+  <img src="static/alerts_charts.png" alt="Alerts tab with its chart strip and the engine, rule and process Sankey" width="100%">
+</p>
+
+> The **Alerts** tab with all 9,620 alerts: **SEVERITY** and **ENGINE** as
+> pies beside their legends (Sigma 9,415, Yara 195, fibratus 10), **OVER
+> TIME** per day stacked by severity, and **FLOW: ENGINE → RULE → PROCESS**
+> drawn by square roots. It shows the noise at a glance: the Run-key rule
+> alone has 6,150 of the alerts, 5,757 of them on `MsMpEng.exe` (6,190
+> alerts in all). The
+> six most frequent rules and processes stand on their own, the rest as
+> *other rules* (72) and *other processes* (483). A click on a slice, a
+> bar, a node or a band sets its filter; no filter is set here (*9620 of
+> 9620* in the filter bar).
 
 ---
 
@@ -1015,9 +1138,14 @@ programs that mimic implant behaviour).
   <img src="static/etw_browser.png" alt="ETW browser" width="100%">
 </p>
 
-> **Sysmon:** the last 500 events with type counters (ProcessCreate, FileCreate,
-> DNSQuery, NetworkConnect), command lines and the Windows Event IDs each Sysmon
-> event corresponds to; the detail view lists the correlated Security events.
+> **Sysmon** (Classic): the 500 newest events. **EVENTS OVER TIME** stacks
+> them by event type in 15-second bars, **PROCESS → EVENT TYPE** shows who
+> raised them (`python.exe`, the web UI itself, 236, nearly all of them pipe
+> events; the images after the sixth are *other images*). Under the filter
+> bar the type counters (PipeConnected, PipeCreated, ProcessCreate,
+> FileCreate, DNSQuery) and the table with command lines and the Windows
+> Event IDs each Sysmon event corresponds to; the detail view (right) lists
+> the correlated Security events.
 >
 > **ETW browser:** the Sysmon channel with one event expanded; all fields of the
 > event are shown, suspicious values are highlighted.

@@ -34,6 +34,9 @@ def tdc(app_module, monkeypatch, tmp_path):
         m.events_store["processes"] = {}
         m.events_store["alerts_version"] = None
     monkeypatch.setattr(m, "_load_submissions", lambda: [])
+    # webui/submissions.json is in the repository: a test that writes the
+    # submissions (a verdict kept on one) writes a file of its own
+    monkeypatch.setattr(m, "SUBMISSIONS_FILE", str(tmp_path / "submissions.json"))
     monkeypatch.setattr(m, "_load_scan_history", lambda: [])
     monkeypatch.setattr(m, "_is_sysmon_running", lambda: False)
     monkeypatch.setattr(m, "VM_WEBUI_URL", "")
