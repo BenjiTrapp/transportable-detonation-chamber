@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="tdc-logo.png" alt="Transportable Detonation Chamber" width="200">
+  <img src="tdc-logo.png" alt="Transportable Detonation Chamber">
 </p>
 
 <h1 align="center">Transportable Detonation Chamber</h1>
