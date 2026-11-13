@@ -1545,6 +1545,14 @@ One rizin session per opened file and browser tab (RIZIN tab). Addresses are int
 
 Proxied responses are only relayed as data (JSON, text, binary); HTML is served as plain text.
 
+### Tool Updates
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/updates` | Update state: `mode` (`idle`/`checking`/`updating`), `checked_at`, one entry per tool (`installed`, `available`, `status`, `pinned`, `detail`, `log`), `progress`, `last_run` |
+| POST | `/api/updates/check` | Start an update check in the background (202; 409 while a check or install runs) |
+| POST | `/api/updates/apply` | Install updates. Body: `tools` (list of tool ids or `"all"`), `include_pinned` (default `false`). 202; 400 for a bad body or unknown ids; 409 with the reason while a detonation, memory sweep or process dump runs. While an install runs, POST/PUT/PATCH/DELETE requests elsewhere answer 503 (`maintenance: true`) |
+
 ---
 
 ## MCP Server

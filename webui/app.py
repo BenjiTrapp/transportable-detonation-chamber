@@ -12,6 +12,7 @@ import atexit
 import base64
 import bisect
 import json
+import logging
 import os
 import glob
 import platform
@@ -40,6 +41,8 @@ import pipe_proxy
 import minidump_analysis
 # rizin sessions for the RIZIN tab.
 import rizin_sessions
+# Tool update checks and installs (Tool Updates section of the dashboard).
+import tool_updates
 
 app = Flask(__name__)
 
@@ -93,6 +96,27 @@ def _block_cross_site_requests():
     return None
 
 
+# Created on first use (see _get_update_manager); None until then, and the
+# maintenance gate below never creates it.
+_update_manager = None
+MAINTENANCE_MESSAGE = "Maintenance: tool updates are running. Detonations, scans and uploads are paused."
+
+
+@app.before_request
+def _reject_during_maintenance():
+    """While tool updates run, detonations, scans and uploads are paused.
+
+    Registered after the cross-site check, so a cross-site request still gets
+    its 403. GET stays open for the dashboard and its banner; /api/updates/
+    stays open so a run can be watched and a check or apply gets its own 409."""
+    manager = _update_manager
+    if manager is None or request.method not in _UNSAFE_METHODS:
+        return None
+    if request.path.startswith("/api/updates/") or not manager.maintenance:
+        return None
+    return jsonify({"error": MAINTENANCE_MESSAGE, "maintenance": True}), 503
+
+
 @app.after_request
 def _security_headers(resp):
     # No framing (clickjacking), no MIME sniffing of served samples/JSON, and
@@ -119,6 +143,7 @@ WEBUI_PORT = int(os.environ.get("WEBUI_PORT", "9000"))
 VM_IP = os.environ.get("TDC_VM_IP", "")
 VM_WEBUI_URL = os.environ.get("TDC_VM_WEBUI", "")
 SUBMISSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "submissions.json")
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SCAN_HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scan_history.json")
 SCAN_HISTORY_MAX = 200
 
@@ -10316,6 +10341,118 @@ def api_file_visualize():
     return jsonify(result)
 
 
+# --- Tool updates ---
+_update_manager_lock = threading.Lock()
+
+
+def _close_all_rizin():
+    """End every rizin session; a rizin update replaces the files they run from."""
+    manager = _rizin_manager
+    if manager is not None:
+        manager.shutdown()
+
+
+def _update_preconditions():
+    """Why an update must not start now, or None. Runs without the manager lock."""
+    resp = _probe_http(f"{DETONATOR_AGENT_API}/api/lock/status")
+    if resp is not None:
+        try:
+            lock = resp.json()
+        except ValueError:
+            lock = None
+        # An unreachable agent or an unreadable answer is not a running detonation
+        if isinstance(lock, dict) and (lock.get("in_use") or lock.get("locked")):
+            return "A detonation is running. Wait until it finishes."
+    with _sweep_lock:
+        sweeping = bool(_sweep_state.get("running"))
+    if sweeping:
+        return "A memory sweep is running."
+    with _pd_db_lock:
+        dumping = bool(_pd_db_state.get("running"))
+    if dumping:
+        return "A process dump is running."
+    return None
+
+
+def _get_update_manager():
+    global _update_manager
+    with _update_manager_lock:
+        if _update_manager is None:
+            default_log = (r"C:\tools\logs\tool-updates.log" if os.name == "nt"
+                           else os.path.join(APP_DIR, "tool-updates.log"))
+            _update_manager = tool_updates.UpdateManager(
+                tool_updates.Env(),
+                state_path=os.path.join(APP_DIR, "tool_updates_state.json"),
+                log_path=os.environ.get("TDC_UPDATE_LOG") or default_log,
+                scripts_dir=os.environ.get("TDC_SCRIPTS_DIR") or r"C:\tdc\scripts",
+                preconditions=_update_preconditions,
+                close_rizin=_close_all_rizin)
+        return _update_manager
+
+
+@app.route("/api/updates")
+def api_updates():
+    """State of the tool updates: mode, last check, one entry per tool, progress."""
+    return jsonify(_get_update_manager().snapshot())
+
+
+@app.route("/api/updates/check", methods=["POST"])
+def api_updates_check():
+    """Start an update check in the background (202; 409 while busy)."""
+    status, body = _get_update_manager().start_check()
+    return jsonify(body), status
+
+
+@app.route("/api/updates/apply", methods=["POST"])
+def api_updates_apply():
+    """Install updates. Body: {"tools": [ids] | "all", "include_pinned": false}."""
+    data = request.get_json(silent=True)
+    tools = data.get("tools") if isinstance(data, dict) else None
+    include_pinned = data.get("include_pinned", False) if isinstance(data, dict) else False
+    valid = tools == "all" or (isinstance(tools, list) and all(isinstance(t, str) for t in tools))
+    if not valid:
+        return jsonify({"error": 'tools must be "all" or a list of tool ids'}), 400
+    if not isinstance(include_pinned, bool):
+        return jsonify({"error": "include_pinned must be true or false"}), 400
+    status, body = _get_update_manager().start_apply(tools, include_pinned=include_pinned)
+    return jsonify(body), status
+
+
+def _update_check_hours():
+    """TDC_UPDATE_CHECK_HOURS: hours between automatic checks, 0 = never (default 24)."""
+    try:
+        return float(os.environ.get("TDC_UPDATE_CHECK_HOURS", "24"))
+    except ValueError:
+        return 24
+
+
+def _update_check_loop(hours, sleep=time.sleep, rounds=None):
+    """Check for updates every ``hours`` hours, after a first wait of 5 minutes.
+
+    Only looks, never installs, and skips a round while a check or install is
+    already running. ``rounds`` limits the loop for tests."""
+    sleep(300)
+    done = 0
+    while rounds is None or done < rounds:
+        done += 1
+        try:
+            manager = _get_update_manager()
+            if manager.snapshot()["mode"] == "idle":
+                manager.start_check()
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Daily tool update check failed: %s", exc)
+        sleep(hours * 3600)
+
+
+def _start_update_check_thread():
+    hours = _update_check_hours()
+    if hours <= 0:
+        return None
+    thread = threading.Thread(target=_update_check_loop, args=(hours,), name="tool-update-check", daemon=True)
+    thread.start()
+    return thread
+
+
 # --- Main ---
 # Start background alert loader (works with both direct run and import by dev_server)
 # When Flask reloader is active, only start in the child process to avoid duplicate threads
@@ -10327,6 +10464,7 @@ _background_disabled = os.environ.get("TDC_NO_BACKGROUND") == "1"
 if not _background_disabled and (_is_reloader_child or not _reloader_active):
     loader = threading.Thread(target=alert_loader_thread, daemon=True)
     loader.start()
+    _start_update_check_thread()
 
 if __name__ == "__main__":
     print(f"[*] Detonation Chamber UI starting on http://0.0.0.0:{WEBUI_PORT}")

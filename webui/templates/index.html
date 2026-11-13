@@ -1418,6 +1418,16 @@
                             <tr><td class="api-get">GET</td><td><code>/api/pipes/intercept/&lt;sid&gt;/export</code></td><td>Session and all messages as a JSON download</td></tr>
                         </tbody>
                     </table>
+
+                    <h4>Tool Updates</h4>
+                    <table class="help-api-table">
+                        <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td class="api-get">GET</td><td><code>/api/updates</code></td><td>Update state: mode, last check, one entry per tool, progress</td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/updates/check</code></td><td>Start an update check in the background</td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/updates/apply</code></td><td>Install updates. Params: <code>tools</code> (ids or <code>"all"</code>), <code>include_pinned</code>. Other POST/PUT/PATCH/DELETE requests answer 503 while it runs</td></tr>
+                        </tbody>
+                    </table>
                 </div>
 
                 <!-- Architecture -->

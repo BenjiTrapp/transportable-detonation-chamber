@@ -1070,3 +1070,187 @@ def test_mode_change_during_preconditions_gives_busy(tmp_path):
     assert m.start_apply("all") == (409, {"error": "An update check or install is already running."})
     assert snap_tool(m, "capa")["status"] == "update_available"
     assert m.snapshot()["mode"] == "checking"
+
+
+# ---------------------------------------------------------------------------
+# Flask routes, maintenance gate, preconditions, daily check (webui/app.py)
+# ---------------------------------------------------------------------------
+
+MAINTENANCE_TEXT = "Maintenance: tool updates are running. Detonations, scans and uploads are paused."
+DETONATION_TEXT = "A detonation is running. Wait until it finishes."
+
+
+class _Reply:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status_code = status
+
+    def json(self):
+        return self._payload
+
+
+@pytest.fixture
+def update_manager(tdc, monkeypatch, tmp_path):
+    """A manager on a FakeEnv wired into the web UI; no thread, no real process."""
+    manager = tu.UpdateManager(FakeEnv(), str(tmp_path / "state.json"), str(tmp_path / "updates.log"),
+                               str(tmp_path / "scripts"), preconditions=tdc._update_preconditions,
+                               spawn=lambda work: None)
+    monkeypatch.setattr(tdc, "_update_manager", manager)
+    monkeypatch.setattr(tdc, "_probe_http", lambda url, timeout=2: None)
+    monkeypatch.setattr(tdc, "_sweep_state", {"running": False})
+    monkeypatch.setattr(tdc, "_pd_db_state", {"running": False})
+    return manager
+
+
+def test_updates_get_shape(client, update_manager):
+    resp = client.get("/api/updates")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert {"mode", "checked_at", "tools", "progress", "last_run"} <= set(body)
+    assert body["mode"] == "idle"
+
+
+def test_maintenance_blocks_unsafe_requests(client, update_manager):
+    update_manager._state["mode"] = "updating"
+    assert update_manager.maintenance
+    for method, path in (("post", "/api/submit"), ("post", "/api/service/launch"),
+                         ("put", "/api/anything"), ("delete", "/api/anything")):
+        resp = getattr(client, method)(path)
+        assert resp.status_code == 503, path
+        assert resp.get_json() == {"error": MAINTENANCE_TEXT, "maintenance": True}
+    assert client.get("/api/status").status_code != 503
+    assert client.get("/api/updates").status_code == 200
+    assert client.post("/api/updates/check").status_code == 409  # busy, but not blocked
+    assert client.post("/api/updates/apply", json={"tools": "all"}).status_code == 409
+
+
+def test_no_gate_when_idle(client, update_manager):
+    assert client.post("/api/service/launch").status_code != 503
+
+
+def test_gate_does_not_create_the_manager(client, tdc, monkeypatch):
+    monkeypatch.setattr(tdc, "_update_manager", None)
+    client.post("/api/service/launch")
+    assert tdc._update_manager is None
+
+
+def test_apply_refused_during_detonation(client, tdc, update_manager, monkeypatch):
+    monkeypatch.setattr(tdc, "_probe_http", lambda url, timeout=2: _Reply({"in_use": True}))
+    resp = client.post("/api/updates/apply", json={"tools": "all"})
+    assert resp.status_code == 409
+    assert resp.get_json() == {"error": DETONATION_TEXT}
+    assert update_manager.snapshot()["mode"] == "idle"
+
+
+def test_preconditions_reasons(tdc, update_manager, monkeypatch):
+    assert tdc._update_preconditions() is None  # agent unreachable is not a detonation
+    monkeypatch.setattr(tdc, "_probe_http", lambda url, timeout=2: _Reply({"locked": True}))
+    assert tdc._update_preconditions() == DETONATION_TEXT
+    monkeypatch.setattr(tdc, "_probe_http", lambda url, timeout=2: _Reply({"in_use": False}))
+    assert tdc._update_preconditions() is None
+    monkeypatch.setattr(tdc, "_probe_http", lambda url, timeout=2: _Reply("not json at all", 500))
+    assert tdc._update_preconditions() is None
+    monkeypatch.setattr(tdc, "_sweep_state", {"running": True})
+    assert tdc._update_preconditions() == "A memory sweep is running."
+    monkeypatch.setattr(tdc, "_sweep_state", {"running": False})
+    monkeypatch.setattr(tdc, "_pd_db_state", {"running": True})
+    assert tdc._update_preconditions() == "A process dump is running."
+
+
+def test_agent_probe_uses_the_lock_status_url(tdc, update_manager, monkeypatch):
+    urls = []
+    monkeypatch.setattr(tdc, "_probe_http", lambda url, timeout=2: urls.append(url))
+    tdc._update_preconditions()
+    assert urls == [tdc.DETONATOR_AGENT_API + "/api/lock/status"]
+
+
+@pytest.mark.parametrize("body", [None, {}, {"tools": 5}, {"tools": None}, {"tools": ["a", 3]},
+                                  {"tools": {"a": 1}}, ["all"], {"tools": "all", "include_pinned": "yes"}])
+def test_apply_bad_body_400(client, update_manager, body):
+    resp = client.post("/api/updates/apply", json=body) if body is not None else \
+        client.post("/api/updates/apply", data="not json", content_type="text/plain")
+    assert resp.status_code == 400
+    assert resp.get_json()["error"]
+
+
+def test_apply_bad_body_message(client, update_manager):
+    resp = client.post("/api/updates/apply", json={"tools": 5})
+    assert resp.get_json() == {"error": 'tools must be "all" or a list of tool ids'}
+
+
+def test_apply_passes_the_request_to_the_manager(client, update_manager, monkeypatch):
+    calls = []
+    monkeypatch.setattr(update_manager, "start_apply",
+                        lambda tools, include_pinned=False: calls.append((tools, include_pinned)) or (202, {"started": True}))
+    assert client.post("/api/updates/apply", json={"tools": ["capa"], "include_pinned": True}).status_code == 202
+    assert client.post("/api/updates/apply", json={"tools": "all"}).get_json() == {"started": True}
+    assert calls == [(["capa"], True), ("all", False)]
+
+
+def test_check_route_starts_a_check(client, update_manager):
+    resp = client.post("/api/updates/check")
+    assert resp.status_code == 202 and resp.get_json() == {"started": True}
+    assert update_manager.snapshot()["mode"] == "checking"
+    assert client.post("/api/updates/check").status_code == 409
+
+
+def test_cross_site_post_still_403(client, update_manager):
+    update_manager._state["mode"] = "updating"
+    resp = client.post("/api/updates/apply", json={"tools": "all"}, headers={"Origin": "http://evil.example"})
+    assert resp.status_code == 403
+    resp = client.post("/api/submit", headers={"Origin": "http://evil.example"})
+    assert resp.status_code == 403  # the cross-site check runs before the gate
+
+
+def test_manager_is_created_lazily_from_the_environment(tdc, monkeypatch, tmp_path):
+    monkeypatch.setattr(tdc, "_update_manager", None)
+    monkeypatch.setenv("TDC_UPDATE_LOG", str(tmp_path / "u.log"))
+    monkeypatch.setenv("TDC_SCRIPTS_DIR", str(tmp_path / "scripts"))
+    manager = tdc._get_update_manager()
+    assert manager is tdc._get_update_manager()
+    assert manager.log_path == str(tmp_path / "u.log")
+    assert manager.scripts_dir == str(tmp_path / "scripts")
+    assert manager.state_path == os.path.join(tdc.APP_DIR, "tool_updates_state.json")
+    assert manager.preconditions == tdc._update_preconditions
+
+
+def test_close_rizin_shuts_the_sessions_down(tdc, monkeypatch):
+    class Sessions:
+        closed = 0
+
+        def shutdown(self):
+            Sessions.closed += 1
+    monkeypatch.setattr(tdc, "_rizin_manager", None)
+    tdc._close_all_rizin()  # no manager yet: nothing to do
+    monkeypatch.setattr(tdc, "_rizin_manager", Sessions())
+    tdc._close_all_rizin()
+    assert Sessions.closed == 1
+
+
+def test_daily_check_waits_then_checks_only_when_idle(tdc, update_manager, monkeypatch):
+    sleeps, starts = [], []
+    monkeypatch.setattr(update_manager, "start_check", lambda: starts.append(1) or (202, {"started": True}))
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            update_manager._state["mode"] = "updating"  # busy during the second round
+        if len(sleeps) == 3:
+            update_manager._state["mode"] = "idle"
+    tdc._update_check_loop(12, sleep=sleep, rounds=3)
+    assert sleeps == [300, 12 * 3600, 12 * 3600, 12 * 3600]
+    assert len(starts) == 2  # idle, busy, idle; the check in the busy round was skipped
+
+
+def test_daily_check_thread_off_for_zero_hours(tdc, monkeypatch):
+    monkeypatch.setenv("TDC_UPDATE_CHECK_HOURS", "0")
+    assert tdc._start_update_check_thread() is None
+
+
+def test_daily_check_default_is_24_hours(tdc, monkeypatch):
+    monkeypatch.delenv("TDC_UPDATE_CHECK_HOURS", raising=False)
+    assert tdc._update_check_hours() == 24
+    monkeypatch.setenv("TDC_UPDATE_CHECK_HOURS", "junk")
+    assert tdc._update_check_hours() == 24
+    monkeypatch.setenv("TDC_UPDATE_CHECK_HOURS", "6")
+    assert tdc._update_check_hours() == 6
