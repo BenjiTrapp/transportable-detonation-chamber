@@ -29,6 +29,7 @@ prebuilt/
 webui/scan_history.json
 webui/memory_baseline.json
 webui/memory_results/
+webui/rizin_projects/
 # A write of submissions.json that did not finish (the file itself is in the repository)
 webui/submissions.json.tmp
 

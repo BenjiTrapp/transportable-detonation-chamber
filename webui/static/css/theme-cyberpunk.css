@@ -2159,3 +2159,383 @@
     letter-spacing: .04em;
     color: var(--cp-text-dim);
 }
+
+/* --- RIZIN tab as in its mockup: the toolbar and the panels on the card
+   surface with a faint magenta edge, cyan heads, tabs as small cyan labels
+   with the chosen one filled, the current function and instruction in
+   magenta; the instructions take their colours from the accents (cyan
+   addresses, magenta calls, green jumps, amber symbols, gold strings) --- */
+[data-theme="cyberpunk"] .rizin-toolbar {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-muted);
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+}
+[data-theme="cyberpunk"] .rizin-file-path {
+    color: var(--cp-text);
+}
+[data-theme="cyberpunk"] .rizin-file-tag {
+    color: var(--cp-text-muted);
+    background: var(--cp-raised);
+}
+[data-theme="cyberpunk"] .rizin-file-sha,
+[data-theme="cyberpunk"] .rizin-seek-label {
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .rizin-state {
+    font-family: var(--cp-font-label);
+    letter-spacing: .04em;
+}
+[data-theme="cyberpunk"] .rizin-seek-input {
+    background-color: var(--cp-bg);
+    border-color: rgba(var(--cp-magenta-rgb), .35);
+}
+[data-theme="cyberpunk"] .rizin-open-menu {
+    background: var(--cp-card);
+    border: 1px solid rgba(var(--cp-magenta-rgb), .45);
+    border-radius: 6px;
+    box-shadow: 0 14px 36px -12px rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme="cyberpunk"] .rizin-open-head {
+    font-family: var(--cp-font-label);
+    letter-spacing: .1em;
+    color: var(--cp-cyan);
+}
+[data-theme="cyberpunk"] .rizin-open-item {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text);
+}
+[data-theme="cyberpunk"] .rizin-open-item:hover,
+[data-theme="cyberpunk"] .rizin-open-item:focus-visible {
+    background: rgba(var(--cp-magenta-rgb), .12);
+    border-color: rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme="cyberpunk"] .rizin-open-meta,
+[data-theme="cyberpunk"] .rizin-open-empty {
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .rizin-panel {
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+}
+[data-theme="cyberpunk"] .rizin-panel-title {
+    font-family: var(--cp-font-label);
+    letter-spacing: .1em;
+    color: var(--cp-cyan);
+}
+[data-theme="cyberpunk"] .rizin-fold {
+    color: var(--cp-cyan);
+}
+[data-theme="cyberpunk"] .rizin-fold:hover {
+    border-color: rgba(var(--cp-cyan-rgb), .45);
+}
+[data-theme="cyberpunk"] .rizin-fold:focus-visible,
+[data-theme="cyberpunk"] .rizin-tab:focus-visible,
+[data-theme="cyberpunk"] .rizin-tool:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: 1px;
+}
+[data-theme="cyberpunk"] .rizin-filter {
+    border-color: rgba(var(--cp-magenta-rgb), .22);
+}
+[data-theme="cyberpunk"] .rizin-fn-head {
+    color: var(--cp-cyan);
+    border-bottom-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .rizin-fn {
+    font-family: var(--cp-font-label);
+}
+[data-theme="cyberpunk"] .rizin-fn:hover {
+    background: var(--cp-raised);
+}
+[data-theme="cyberpunk"] .rizin-fn.current {
+    background: rgba(var(--cp-magenta-rgb), .16);
+    box-shadow: inset 0 0 0 1px rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme="cyberpunk"] .rizin-fn-name {
+    color: var(--c-slate-300);
+}
+[data-theme="cyberpunk"] .rizin-fn.current .rizin-fn-name {
+    color: var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .rizin-fn-size,
+[data-theme="cyberpunk"] .rizin-fn-count {
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .rizin-split {
+    color: var(--text-dim);
+    border-left-color: var(--cp-line);
+    border-right-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .rizin-split:hover,
+[data-theme="cyberpunk"] .rizin-split.rizin-split-drag,
+[data-theme="cyberpunk"] .rizin-split:focus-visible {
+    color: var(--cp-magenta);
+    border-color: rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme="cyberpunk"] .rizin-tab {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-dim);
+    border-color: rgba(var(--cp-cyan-rgb), .3);
+}
+[data-theme="cyberpunk"] .rizin-tab:hover {
+    color: var(--cp-text);
+}
+[data-theme="cyberpunk"] .rizin-tab[aria-selected="true"] {
+    color: var(--cp-on-magenta);
+    background: var(--cp-cyan);
+    border-color: var(--cp-cyan);
+}
+[data-theme="cyberpunk"] .rizin-disasm {
+    background: none;
+    border-color: transparent;
+}
+[data-theme="cyberpunk"] .rizin-op {
+    font-family: var(--cp-font-label);
+    color: var(--c-slate-300);
+}
+[data-theme="cyberpunk"] .rizin-op:hover {
+    background: rgba(var(--cp-magenta-rgb), .05);
+}
+[data-theme="cyberpunk"] .rizin-op.current {
+    background: rgba(var(--cp-magenta-rgb), .12);
+    box-shadow: inset 0 0 0 1px rgba(var(--cp-magenta-rgb), .35);
+}
+[data-theme="cyberpunk"] .rizin-console {
+    background: var(--c-navy-990);
+    border-color: var(--cp-line);
+    border-radius: 4px;
+}
+[data-theme="cyberpunk"] .rizin-empty {
+    font-family: var(--cp-font-text);
+    color: var(--cp-text-dim);
+}
+/* GRAPH as in its mockup: dark blocks with a faint violet edge on the panel,
+   cyan addresses, the instructions in the muted text colour, the block of the
+   current address edged in magenta; the edges keep the accents (green jump,
+   red fall-through, dim unconditional) */
+[data-theme="cyberpunk"] .rizin-tool {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-dim);
+    border-color: rgba(var(--cp-cyan-rgb), .3);
+}
+[data-theme="cyberpunk"] .rizin-tool:hover:not(:disabled) {
+    color: var(--cp-text);
+}
+[data-theme="cyberpunk"] .rizin-tool[aria-pressed="true"] {
+    color: var(--cp-on-magenta);
+    background: var(--cp-cyan);
+    border-color: var(--cp-cyan);
+}
+[data-theme="cyberpunk"] .rizin-graph-view {
+    background: none;
+    border-color: transparent;
+}
+[data-theme="cyberpunk"] .rizin-graph-svg text {
+    font-family: var(--cp-font-label);
+}
+[data-theme="cyberpunk"] .rizin-block-box {
+    fill: rgba(var(--cp-bg-rgb), .7);
+    stroke: rgba(var(--cp-violet-rgb), .25);
+}
+[data-theme="cyberpunk"] .rizin-block:hover .rizin-block-box {
+    stroke: rgba(var(--cp-magenta-rgb), .55);
+}
+[data-theme="cyberpunk"] .rizin-block.current .rizin-block-box {
+    fill: rgba(var(--cp-magenta-rgb), .08);
+    stroke: var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .rizin-block-addr {
+    fill: var(--cp-cyan);
+}
+[data-theme="cyberpunk"] .rizin-block-line {
+    fill: var(--cp-text-muted);
+}
+[data-theme="cyberpunk"] .rizin-block-more {
+    fill: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .rizin-graph-overview .rizin-block-box {
+    fill: rgba(var(--cp-magenta-rgb), .14);
+    stroke: rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme="cyberpunk"] .rizin-graph-overview .rizin-block.current .rizin-block-box {
+    fill: var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .rizin-graph-info {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] #tab-rizin.rizin-dragover .rizin-work {
+    outline-color: var(--cp-magenta);
+}
+/* The dock as in its mockup: ═ dim until it is used, the note dim, the quick
+   commands as small cyan labels; the console on the page's deepest violet
+   with the prompt in amber, the command in white, rizin's text in the muted
+   colour and the caret in magenta; the lists' rows and the menu in the
+   colours of FUNCTIONS (the current row in magenta) */
+[data-theme="cyberpunk"] .rizin-dock-grip {
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .rizin-dock-grip:hover,
+[data-theme="cyberpunk"] .rizin-dock-grip.rizin-dock-drag,
+[data-theme="cyberpunk"] .rizin-dock-grip:focus-visible {
+    color: var(--cp-magenta);
+    background: rgba(var(--cp-magenta-rgb), .1);
+}
+[data-theme="cyberpunk"] .rizin-dock-note {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .rizin-quick .rizin-tool {
+    color: var(--cp-cyan);
+    border-color: rgba(var(--cp-cyan-rgb), .3);
+}
+[data-theme="cyberpunk"] .rizin-quick .rizin-tool:hover {
+    color: var(--cp-on-magenta);
+    background: var(--cp-cyan);
+}
+[data-theme="cyberpunk"] .rizin-list-filter {
+    border-color: rgba(var(--cp-magenta-rgb), .22);
+}
+[data-theme="cyberpunk"] .rizin-pager {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .rizin-console-out {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-muted);
+}
+[data-theme="cyberpunk"] .rizin-console-cmd,
+[data-theme="cyberpunk"] .rizin-prompt {
+    color: var(--cp-amber);
+}
+[data-theme="cyberpunk"] .rizin-console-typed {
+    color: var(--cp-text);
+}
+[data-theme="cyberpunk"] .rizin-console-line {
+    border-top-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .rizin-console-input {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text);
+    caret-color: var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .rizin-console-input::placeholder {
+    color: var(--text-dim);
+}
+[data-theme="cyberpunk"] .rz-ansi-white {
+    color: var(--cp-text-muted);
+}
+[data-theme="cyberpunk"] .rizin-console-file {
+    border-top-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .rizin-xrefs-head {
+    font-family: var(--cp-font-label);
+    color: var(--cp-cyan);
+}
+[data-theme="cyberpunk"] .rizin-xrefs-head b {
+    color: var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .rizin-xref,
+[data-theme="cyberpunk"] .rizin-row {
+    font-family: var(--cp-font-label);
+    color: var(--c-slate-300);
+}
+[data-theme="cyberpunk"] .rizin-xref:hover,
+[data-theme="cyberpunk"] .rizin-row:hover {
+    background: var(--cp-raised);
+}
+[data-theme="cyberpunk"] .rizin-row.current {
+    background: rgba(var(--cp-magenta-rgb), .16);
+    box-shadow: inset 0 0 0 1px rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme="cyberpunk"] .rizin-string-text {
+    color: var(--cp-gold);
+}
+[data-theme="cyberpunk"] .rizin-import-lib,
+[data-theme="cyberpunk"] .rizin-row-meta,
+[data-theme="cyberpunk"] .rizin-xref-type {
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .rizin-import-name,
+[data-theme="cyberpunk"] .rizin-xref-fn {
+    color: var(--cp-text);
+}
+[data-theme="cyberpunk"] .rizin-menu {
+    background: var(--cp-card);
+    border: 1px solid rgba(var(--cp-magenta-rgb), .45);
+    border-radius: 6px;
+    box-shadow: 0 14px 36px -12px rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme="cyberpunk"] .rizin-menu-head {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-dim);
+    border-bottom-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .rizin-menu-item {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text);
+}
+[data-theme="cyberpunk"] .rizin-menu-item:hover,
+[data-theme="cyberpunk"] .rizin-menu-item:focus-visible {
+    background: rgba(var(--cp-magenta-rgb), .12);
+    border-color: rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme="cyberpunk"] .rizin-menu-item:disabled {
+    color: var(--text-dim);
+    background: none;
+    border-color: transparent;
+}
+[data-theme="cyberpunk"] .rizin-menu-label {
+    color: var(--cp-text-dim);
+}
+/* DECOMPILER and HEX as the disassembly: on the panel, the lines in the
+   label font, the current line and byte in magenta, the ASCII in gold; the
+   line above the bytes on the card; a stopped analysis in orange */
+[data-theme="cyberpunk"] .rizin-decompiler,
+[data-theme="cyberpunk"] .rizin-hex {
+    background: none;
+    border-color: transparent;
+}
+[data-theme="cyberpunk"] .rizin-dec-line,
+[data-theme="cyberpunk"] .rizin-hex-row {
+    font-family: var(--cp-font-label);
+    color: var(--c-slate-300);
+}
+[data-theme="cyberpunk"] .rizin-dec-line.rizin-dec-jump:hover {
+    background: rgba(var(--cp-magenta-rgb), .05);
+}
+[data-theme="cyberpunk"] .rizin-dec-line.current {
+    background: rgba(var(--cp-magenta-rgb), .12);
+    box-shadow: inset 0 0 0 1px rgba(var(--cp-magenta-rgb), .35);
+}
+[data-theme="cyberpunk"] .rizin-hex-bar {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-dim);
+    background: var(--cp-card);
+    border-bottom-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .rizin-hex-bytes {
+    color: var(--cp-text-muted);
+}
+[data-theme="cyberpunk"] .rizin-hex-ascii {
+    color: var(--cp-gold);
+}
+[data-theme="cyberpunk"] .rizin-hex-cur {
+    color: var(--cp-magenta);
+    background: rgba(var(--cp-magenta-rgb), .16);
+    box-shadow: 0 0 0 1px rgba(var(--cp-magenta-rgb), .5);
+}
+[data-theme="cyberpunk"] .rizin-state-stopped {
+    color: var(--cp-orange);
+    background: rgba(var(--cp-orange-rgb), .12);
+}
+[data-theme="cyberpunk"] .rizin-ended {
+    font-family: var(--cp-font-text);
+    color: var(--c-red-300);
+}
+[data-theme="cyberpunk"] .rizin-more:hover {
+    color: var(--cp-magenta);
+}

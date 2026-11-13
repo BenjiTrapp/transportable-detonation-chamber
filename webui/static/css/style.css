@@ -169,6 +169,10 @@
     --alerts-path-height: 0px;
     /* The same for the Sysmon tab (initSysmonTab sets it on #sysmon-table) */
     --sysmon-bar-height: 0px;
+    /* Nor this: how many times wider than at zoom 1 the lines of the RIZIN
+       graph are drawn, so that they stay about as wide on screen however far
+       it is zoomed out (rizinGraphApplyView sets it on the graph's SVG) */
+    --rizin-stroke: 1;
 }
 
 * {
@@ -8716,4 +8720,1295 @@ table[data-sortable] > thead > tr > th:focus-visible {
 .verdict-flow-table .view-table td:nth-child(2) {
     width: auto;
     max-width: none;
+}
+
+/* =============================================
+   RIZIN tab (block RIZIN of app.js): the toolbar in one line, FUNCTIONS on
+   the left, the code views and the graph in two halves with a line between
+   them, the dock with the console and the lists below. The work area fills
+   the tab, a column of the window's height that does not scroll; each list
+   and view scrolls in itself. Monospaced like the hex editor.
+   ============================================= */
+.rizin-toolbar {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 8px;
+    margin: 10px 14px 0;
+    padding: 6px 10px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-secondary);
+}
+.rizin-toolbar > * {
+    flex: 0 0 auto;
+}
+/* Narrower than the room for one line (Classic keeps 260 px for the sidebar):
+   the toolbar takes a second line */
+@media (max-width: 1200px) {
+    .rizin-toolbar {
+        flex-wrap: wrap;
+    }
+}
+.rizin-open-wrap {
+    position: relative;
+}
+.rizin-open-menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    z-index: 60;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    width: min(620px, 80vw);
+    max-height: 60vh;
+    padding: 10px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-accent);
+    border-radius: var(--radius);
+    box-shadow: 0 12px 28px rgba(var(--c-black-rgb), .45);
+}
+.rizin-open-menu[hidden] {
+    display: none;
+}
+.rizin-open-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+.rizin-open-row .rizin-path-input {
+    flex: 1;
+    width: auto;
+    min-width: 0;
+    font-family: var(--font-mono);
+}
+.rizin-open-sources {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-height: 0;
+    overflow: auto;
+}
+.rizin-open-head {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    margin-bottom: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: .08em;
+    color: var(--text-muted);
+}
+.rizin-open-n {
+    font-weight: 400;
+    color: var(--text-dim);
+}
+.rizin-open-item {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 12px;
+    width: 100%;
+    padding: 3px 6px;
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    text-align: left;
+    color: var(--text-primary);
+    cursor: pointer;
+}
+.rizin-open-item:hover,
+.rizin-open-item:focus-visible {
+    background: rgba(var(--accent-cyan-rgb), .1);
+    border-color: rgba(var(--accent-cyan-rgb), .3);
+}
+.rizin-open-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.rizin-open-meta {
+    font-size: 10.5px;
+    white-space: nowrap;
+    color: var(--text-muted);
+}
+.rizin-open-empty {
+    padding: 2px 6px;
+    font-size: 11px;
+    color: var(--text-dim);
+}
+/* One line: the file's details stand beside its path, SEEK at the right end;
+   when the room runs short the path gives way first, shortened with an
+   ellipsis (in full on hover), and a note in the toolbar gives way as well */
+.rizin-toolbar > .rizin-file-path {
+    flex: 0 1000 auto;
+    min-width: 40px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+}
+.rizin-toolbar > .rizin-toolbar-gap {
+    flex: 1 1 0;
+}
+.rizin-file-tag {
+    padding: 1px 6px;
+    white-space: nowrap;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    border-radius: 3px;
+}
+.rizin-file-sha {
+    white-space: nowrap;
+    color: var(--text-muted);
+}
+.rizin-analysis {
+    white-space: nowrap;
+    color: var(--text-muted);
+}
+/* A dot in the colour of the state, without text a screen reader would read */
+.rizin-analysis::before {
+    content: "";
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    margin-right: 6px;
+    vertical-align: 1px;
+    background: currentColor;
+    border-radius: 50%;
+}
+.rizin-analysis-running {
+    color: var(--accent-yellow);
+}
+.rizin-analysis-running::before {
+    animation: rizin-pulse 1.2s ease-in-out infinite;
+}
+.rizin-analysis-done {
+    color: var(--accent-green);
+}
+.rizin-analysis-stopped {
+    color: var(--accent-orange);
+}
+.rizin-analysis-failed {
+    color: var(--accent-red);
+}
+@keyframes rizin-pulse {
+    50% { opacity: .3; }
+}
+.rizin-state {
+    padding: 1px 6px;
+    white-space: nowrap;
+    color: var(--accent-yellow);
+    background: rgba(var(--accent-yellow-rgb), .1);
+    border-radius: 3px;
+}
+.rizin-toolbar > .rizin-state {
+    flex: 0 3 auto;
+    min-width: 10ch;
+    max-width: 48ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+/* The short states stay whole: SEEK and the file's details give way to them */
+.rizin-toolbar > .rizin-state-busy,
+.rizin-toolbar > .rizin-state-moved,
+.rizin-toolbar > .rizin-state-ended {
+    flex-shrink: 0;
+}
+/* While a state, its button or Full analysis needs the room (the tab sets
+   .rizin-crowded), the file's details give way one after the other: the
+   path, then the SHA256 (it can go entirely), then the format; the analysis
+   text and SEEK last. Each is in full on hover; the buttons and the short
+   states keep their size. */
+.rizin-toolbar.rizin-crowded > .rizin-file-path {
+    flex-shrink: 1000000;
+}
+.rizin-toolbar.rizin-crowded > .rizin-file-sha {
+    flex: 0 1000 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.rizin-toolbar.rizin-crowded > .rizin-file-tag {
+    flex: 0 50 auto;
+    min-width: 6ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.rizin-toolbar.rizin-crowded > .rizin-analysis {
+    flex: 0 1 auto;
+    min-width: 24ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.rizin-toolbar.rizin-crowded > .rizin-seek-input {
+    flex: 0 4 220px;
+    min-width: 120px;
+}
+.rizin-toolbar > .rizin-full,
+.rizin-toolbar > .rizin-state-btn {
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+.rizin-state-moved,
+.rizin-state-ended,
+.rizin-state-not-installed,
+.rizin-state-note {
+    color: var(--c-red-300);
+    background: rgba(var(--accent-red-rgb), .1);
+}
+/* Why a stopped analysis stopped, in the colour of its state */
+.rizin-state-stopped {
+    color: var(--accent-orange);
+    background: rgba(var(--accent-orange-rgb), .1);
+}
+.rizin-seek-label {
+    font-size: 10px;
+    letter-spacing: .1em;
+    color: var(--text-muted);
+}
+.rizin-toolbar > .rizin-seek-input {
+    flex: 0 1 220px;
+    min-width: 150px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+}
+.rizin-history {
+    min-width: 28px;
+}
+
+.rizin-work {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 8px 14px 12px;
+}
+.rizin-main {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: clamp(220px, 15vw, 300px) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+    gap: 8px;
+}
+.rizin-work.rizin-fn-folded .rizin-main {
+    grid-template-columns: 34px minmax(0, 1fr);
+}
+.rizin-panel {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    min-width: 0;
+    padding: 8px 10px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+}
+.rizin-panel-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    margin-bottom: 6px;
+}
+.rizin-panel-title {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    margin: 0;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: .1em;
+    white-space: nowrap;
+    color: var(--accent-cyan);
+}
+/* The name of the current function in the head of the code views */
+#rizin-code-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    letter-spacing: .04em;
+}
+.rizin-fold {
+    margin-left: auto;
+    padding: 0 6px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.3;
+    color: var(--accent-cyan);
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    cursor: pointer;
+}
+.rizin-fold:hover {
+    border-color: var(--border-accent);
+}
+.rizin-fn-body {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+/* Folded: a narrow strip with » and the title written upwards */
+.rizin-work.rizin-fn-folded .rizin-fn-body {
+    display: none;
+}
+.rizin-work.rizin-fn-folded .rizin-functions {
+    padding: 8px 2px;
+}
+.rizin-work.rizin-fn-folded .rizin-functions .rizin-panel-head {
+    flex-direction: column;
+    gap: 10px;
+}
+.rizin-work.rizin-fn-folded .rizin-fold {
+    order: -1;
+    margin-left: 0;
+}
+.rizin-work.rizin-fn-folded .rizin-functions .rizin-panel-title {
+    writing-mode: vertical-rl;
+    transform: rotate(180deg);
+}
+.rizin-filter {
+    width: 100%;
+    margin-bottom: 6px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+}
+.rizin-fn-head,
+.rizin-fn {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 52px;
+    gap: 6px;
+    padding: 0 4px;
+}
+.rizin-fn-head {
+    padding-bottom: 2px;
+    margin-bottom: 2px;
+    font-size: 9.5px;
+    font-weight: 600;
+    letter-spacing: .08em;
+    color: var(--accent-cyan);
+    border-bottom: 1px solid var(--border-primary);
+}
+.rizin-fn-head > :last-child,
+.rizin-fn-size {
+    text-align: right;
+}
+/* position: relative makes the list the offsetParent of its rows (rizinReveal) */
+.rizin-fn-list {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+}
+.rizin-fn {
+    font-size: 12px;
+    line-height: 1.65;
+    border-radius: 2px;
+    cursor: pointer;
+}
+.rizin-fn:hover {
+    background: var(--bg-card-hover);
+}
+.rizin-fn.current {
+    background: rgba(var(--accent-cyan-rgb), .14);
+    box-shadow: inset 2px 0 0 var(--accent-cyan);
+}
+.rizin-fn-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+}
+.rizin-fn.current .rizin-fn-name {
+    font-weight: 600;
+    color: var(--accent-cyan);
+}
+.rizin-fn-size {
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+}
+.rizin-fn-count {
+    margin-top: 6px;
+    font-size: 10.5px;
+    color: var(--text-muted);
+}
+
+.rizin-center {
+    display: grid;
+    grid-template-columns: minmax(0, 1.15fr) 10px minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+    padding: 8px 0;
+}
+.rizin-half {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    min-width: 0;
+    padding: 0 10px;
+}
+.rizin-split {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 12px;
+    color: var(--text-dim);
+    border-left: 1px solid var(--border-primary);
+    border-right: 1px solid var(--border-primary);
+    user-select: none;
+    cursor: col-resize;
+    touch-action: none;
+}
+.rizin-split:hover,
+.rizin-split.rizin-split-drag,
+.rizin-split:focus-visible {
+    color: var(--accent-cyan);
+    border-color: rgba(var(--accent-cyan-rgb), .45);
+    outline: none;
+}
+/* ⇱: one half with the whole width (rizinApplyCenterLayout) */
+.rizin-center.rizin-max-code,
+.rizin-center.rizin-max-graph {
+    grid-template-columns: minmax(0, 1fr);
+}
+.rizin-center.rizin-max-graph > .rizin-code,
+.rizin-center.rizin-max-graph > .rizin-split,
+.rizin-center.rizin-max-code > .rizin-graph,
+.rizin-center.rizin-max-code > .rizin-split {
+    display: none;
+}
+/* Below 1400 px of window width one area with the tabs DISASSEMBLY,
+   DECOMPILER, HEX and GRAPH: the halves give their parts to the grid, the
+   head of the code views with the tabs on top, the graph's tools beside it
+   while GRAPH is chosen, the chosen view below */
+.rizin-center.rizin-narrow {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    column-gap: 10px;
+    padding: 8px 10px;
+}
+.rizin-center.rizin-narrow > .rizin-half {
+    display: contents;
+}
+.rizin-center.rizin-narrow > .rizin-split {
+    display: none;
+}
+.rizin-center.rizin-narrow > .rizin-code > .rizin-panel-head {
+    grid-row: 1;
+    grid-column: 1;
+}
+.rizin-center.rizin-narrow > .rizin-graph > .rizin-panel-head {
+    grid-row: 1;
+    grid-column: 2;
+}
+.rizin-center.rizin-narrow > .rizin-half > .rizin-view {
+    grid-row: 2;
+    grid-column: 1 / -1;
+}
+.rizin-center.rizin-narrow > .rizin-graph > .rizin-graph-info {
+    grid-row: 3;
+    grid-column: 1 / -1;
+}
+.rizin-center.rizin-narrow > .rizin-graph .rizin-panel-title {
+    display: none;
+}
+.rizin-center.rizin-narrow:not(.rizin-show-graph) > .rizin-graph > * {
+    display: none;
+}
+/* The tools keep their room while GRAPH is not chosen: the tabs stay where they are */
+.rizin-center.rizin-narrow:not(.rizin-show-graph) > .rizin-graph > .rizin-panel-head {
+    display: flex;
+    visibility: hidden;
+}
+.rizin-center.rizin-narrow.rizin-show-graph > .rizin-code > .rizin-view {
+    display: none;
+}
+.rizin-center.rizin-narrow .rizin-max-btn {
+    display: none;
+}
+.rizin-tabs {
+    display: flex;
+    gap: 2px;
+    margin-left: auto;
+}
+.rizin-dock .rizin-tabs {
+    margin-left: 0;
+}
+.rizin-tab {
+    padding: 2px 8px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: .06em;
+    color: var(--text-muted);
+    background: none;
+    border: 1px solid var(--border-primary);
+    border-radius: 3px;
+    cursor: pointer;
+}
+.rizin-tab:hover {
+    color: var(--text-primary);
+}
+.rizin-tab[aria-selected="true"] {
+    color: var(--accent-cyan);
+    background: rgba(var(--accent-cyan-rgb), .12);
+    border-color: rgba(var(--accent-cyan-rgb), .45);
+}
+/* position: relative: the offsetParent of the lines (rizinReveal) */
+.rizin-view {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+}
+/* Where two scroll bars meet, the view shows through (not the browser's white corner) */
+.rizin-view::-webkit-scrollbar-corner,
+.rizin-console-out::-webkit-scrollbar-corner {
+    background: transparent;
+}
+.rizin-disasm {
+    padding: 4px 0;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.6;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 3px;
+}
+/* Each line as wide as its text and at least the view: a long line scrolls
+   the view sideways, the mark of the current line runs under all of it */
+.rizin-op {
+    width: max-content;
+    min-width: 100%;
+    padding: 0 10px;
+    white-space: pre;
+    color: var(--c-slate-300);
+    cursor: pointer;
+}
+.rizin-op:hover {
+    background: rgba(var(--accent-cyan-rgb), .05);
+}
+.rizin-op.current {
+    background: rgba(var(--accent-cyan-rgb), .14);
+    box-shadow: inset 2px 0 0 var(--accent-cyan);
+}
+/* The colours of the instructions: addresses cyan, calls pink, jumps green,
+   returns violet, symbols and strings yellow, comments dim */
+.rz-addr {
+    margin-right: 1.5ch;
+    color: var(--accent-cyan);
+}
+.rz-mnem {
+    display: inline-block;
+    min-width: 6ch;
+    color: var(--text-primary);
+}
+.rz-call {
+    font-weight: 600;
+    color: var(--accent-pink);
+}
+.rz-jump {
+    font-weight: 600;
+    color: var(--accent-green);
+}
+.rz-ret {
+    font-weight: 600;
+    color: var(--accent-purple);
+}
+.rz-sym {
+    color: var(--accent-yellow);
+}
+.rz-str {
+    color: var(--c-amber-300);
+}
+.rz-comment {
+    color: var(--text-muted);
+}
+.rz-target {
+    text-decoration: underline dotted;
+    text-underline-offset: 3px;
+    cursor: pointer;
+}
+.rz-target:hover {
+    text-decoration-style: solid;
+}
+.rizin-more {
+    padding: 2px 10px;
+    color: var(--text-dim);
+    cursor: pointer;
+}
+.rizin-more:hover {
+    color: var(--accent-cyan);
+}
+/* Where the linear disassembly stops (RIZIN_MORE.linear lines): a note, no link */
+.rizin-disasm-end {
+    padding: 2px 10px;
+    color: var(--text-dim);
+}
+.rizin-empty {
+    padding: 14px 10px;
+    font-size: 11.5px;
+    line-height: 1.5;
+    white-space: normal;
+    color: var(--text-muted);
+}
+/* A view whose request ended the session: why, and Reopen */
+.rizin-ended {
+    color: var(--c-red-300);
+}
+.rizin-ended .btn {
+    margin-left: 8px;
+}
+/* DECOMPILER: rz-ghidra's C a line at a time, as wide as its text; a line
+   with an address takes a click, the line of the current address is marked
+   like the current instruction. Keywords violet, called functions pink,
+   strings and comments as in the disassembly. */
+.rizin-decompiler {
+    padding: 4px 0;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.6;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 3px;
+}
+.rizin-dec-line {
+    width: max-content;
+    min-width: 100%;
+    padding: 0 10px;
+    white-space: pre;
+    color: var(--c-slate-300);
+}
+.rizin-dec-line.rizin-dec-jump {
+    cursor: pointer;
+}
+.rizin-dec-line.rizin-dec-jump:hover {
+    background: rgba(var(--accent-cyan-rgb), .05);
+}
+.rizin-dec-line.current {
+    background: rgba(var(--accent-cyan-rgb), .14);
+    box-shadow: inset 2px 0 0 var(--accent-cyan);
+}
+.rz-kw {
+    color: var(--accent-purple);
+}
+.rz-fn {
+    color: var(--accent-pink);
+}
+/* HEX: 16 bytes a row with their ASCII; the line above them (with Open in
+   Hex tab) stays in sight while they scroll; the byte of the current address
+   is marked in both columns */
+.rizin-hex {
+    padding: 0 0 4px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.6;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 3px;
+}
+.rizin-hex-bar {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 4px 10px;
+    margin-bottom: 4px;
+    font-size: 11px;
+    color: var(--text-muted);
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-primary);
+}
+.rizin-hex-what {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.rizin-hex-row {
+    width: max-content;
+    min-width: 100%;
+    padding: 0 10px;
+    white-space: pre;
+    color: var(--c-slate-300);
+}
+.rizin-hex-bytes {
+    display: inline-block;
+    min-width: 49ch;
+    margin-right: 2ch;
+}
+.rizin-hex-ascii {
+    color: var(--accent-yellow);
+}
+.rizin-hex-cur {
+    color: var(--accent-cyan);
+    background: rgba(var(--accent-cyan-rgb), .18);
+    box-shadow: 0 0 0 1px rgba(var(--accent-cyan-rgb), .5);
+}
+/* The graph's tools (− + FIT ⇱) and the ⇱ of the code views, small like the tabs */
+.rizin-graph-tools {
+    display: flex;
+    gap: 2px;
+    margin-left: auto;
+}
+.rizin-tool {
+    min-width: 24px;
+    padding: 1px 7px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    line-height: 1.4;
+    color: var(--text-muted);
+    background: none;
+    border: 1px solid var(--border-primary);
+    border-radius: 3px;
+    cursor: pointer;
+}
+.rizin-tool:hover:not(:disabled) {
+    color: var(--text-primary);
+}
+.rizin-tool[aria-pressed="true"] {
+    color: var(--accent-cyan);
+    background: rgba(var(--accent-cyan-rgb), .12);
+    border-color: rgba(var(--accent-cyan-rgb), .45);
+}
+.rizin-tool:disabled {
+    opacity: .4;
+    cursor: default;
+}
+/* GRAPH (rizinGraphSvg): the SVG is moved and scaled by a CSS transform in a
+   view that does not scroll; the edges take the colour of their kind
+   (currentColor), and stay about as wide on screen however far the graph is
+   zoomed out (--rizin-stroke, set with the zoom) */
+.rizin-graph-view {
+    overflow: hidden;
+    touch-action: none;
+    user-select: none;
+    cursor: grab;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 3px;
+}
+.rizin-graph-view.rizin-panning {
+    cursor: grabbing;
+}
+.rizin-graph-svg {
+    position: absolute;
+    left: 0;
+    top: 0;
+    transform-origin: 0 0;
+    overflow: visible;
+}
+/* 11 px: rizinLayoutGraph sizes the blocks for it (RIZIN_GRAPH.char) */
+.rizin-graph-svg text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    white-space: pre;
+}
+.rizin-edge {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: calc(1.4px * var(--rizin-stroke));
+}
+.rizin-arrow {
+    fill: currentColor;
+    stroke: none;
+}
+/* Green: the jump of a conditional jump; red: its fall-through; dim: always */
+.rizin-edge-jump {
+    color: var(--accent-green);
+}
+.rizin-edge-fail {
+    color: var(--accent-red);
+}
+.rizin-edge-plain {
+    color: var(--text-muted);
+}
+.rizin-block {
+    cursor: pointer;
+}
+.rizin-block-box {
+    fill: var(--bg-card);
+    stroke: var(--border-accent);
+    stroke-width: calc(1px * var(--rizin-stroke));
+}
+.rizin-block:hover .rizin-block-box {
+    stroke: rgba(var(--accent-cyan-rgb), .6);
+}
+.rizin-block.current .rizin-block-box {
+    fill: rgba(var(--accent-cyan-rgb), .1);
+    stroke: var(--accent-cyan);
+    stroke-width: calc(2px * var(--rizin-stroke));
+}
+.rizin-block-addr {
+    font-weight: 600;
+    fill: var(--accent-cyan);
+}
+.rizin-block-line {
+    fill: var(--c-slate-300);
+}
+.rizin-block-more {
+    fill: var(--text-muted);
+}
+/* The overview of a big function: the blocks as filled boxes, without text */
+.rizin-graph-overview .rizin-block-box {
+    fill: rgba(var(--accent-cyan-rgb), .18);
+    stroke: rgba(var(--accent-cyan-rgb), .5);
+}
+.rizin-graph-overview .rizin-block.current .rizin-block-box {
+    fill: var(--accent-cyan);
+}
+.rizin-graph-overview .rizin-block {
+    cursor: zoom-in;
+}
+.rizin-graph-info {
+    flex: 0 0 auto;
+    margin-top: 4px;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: var(--text-muted);
+}
+.rizin-key {
+    margin-left: 4px;
+}
+/* The dock: ═ on top drags its height (rizinSetDockHeight sets it inline),
+   ▾ folds it to its head; the tools of the pane shown sit at the right of
+   the head (the quick commands, a list's filter and pager) */
+.rizin-dock {
+    flex: 0 0 auto;
+    height: clamp(140px, 24vh, 260px);
+    padding-top: 2px;
+}
+.rizin-dock.rizin-dock-folded {
+    height: auto;
+}
+.rizin-dock.rizin-dock-folded > .rizin-dock-body,
+.rizin-dock.rizin-dock-folded > .rizin-dock-grip {
+    display: none;
+}
+.rizin-dock-grip {
+    flex: 0 0 auto;
+    height: 9px;
+    margin: -2px 0 2px;
+    font-size: 10px;
+    line-height: 9px;
+    text-align: center;
+    color: var(--text-dim);
+    border-radius: 3px;
+    user-select: none;
+    touch-action: none;
+    cursor: row-resize;
+}
+.rizin-dock-grip:hover,
+.rizin-dock-grip.rizin-dock-drag,
+.rizin-dock-grip:focus-visible {
+    color: var(--accent-cyan);
+    background: rgba(var(--accent-cyan-rgb), .08);
+    outline: none;
+}
+.rizin-dock-head {
+    gap: 8px;
+}
+.rizin-dock-note {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    margin-right: auto;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    white-space: nowrap;
+    color: var(--text-muted);
+}
+.rizin-dock-note > #rizin-dock-note {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.rizin-dock-tools {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 3px;
+}
+.rizin-dock-tools[hidden] {
+    display: none;
+}
+.rizin-quick .rizin-tool {
+    min-width: 30px;
+    font-weight: 500;
+    color: var(--text-secondary);
+}
+.rizin-dock-fold {
+    margin-left: 2px;
+}
+.rizin-list-filter {
+    width: clamp(150px, 14vw, 240px);
+    padding-top: 2px;
+    padding-bottom: 2px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+}
+.rizin-pager {
+    min-width: 17ch;
+    padding: 0 4px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    text-align: right;
+    white-space: nowrap;
+    color: var(--text-muted);
+}
+.rizin-dock-body {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+/* CONSOLE: the output scrolls in itself above the line where commands are
+   typed; rizin's colours are the rz-ansi-* classes (rizinAnsiHtml) */
+.rizin-console {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.5;
+    background: var(--c-navy-990);
+    border: 1px solid var(--border-primary);
+    border-radius: 3px;
+}
+.rizin-console[hidden] {
+    display: none;
+}
+.rizin-console-out {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 4px 10px 2px;
+    white-space: pre;
+    color: var(--c-slate-300);
+}
+.rizin-console-entry + .rizin-console-entry {
+    margin-top: 3px;
+}
+.rizin-console-cmd {
+    color: var(--accent-yellow);
+}
+.rizin-console-typed {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+.rizin-console-wait,
+.rizin-console-note,
+.rizin-console-hint,
+.rizin-console-complete,
+.rizin-console-cut {
+    color: var(--text-muted);
+}
+.rizin-console-hint,
+.rizin-console-complete {
+    white-space: pre-wrap;
+}
+.rizin-console-cut {
+    font-style: italic;
+}
+.rizin-console-refused,
+.rizin-console-error {
+    color: var(--c-red-300);
+}
+.rizin-console-busy {
+    color: var(--accent-yellow);
+}
+/* The file a new session opened: a line across the output */
+.rizin-console-file {
+    margin: 6px 0 2px;
+    padding-top: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--text-dim);
+    border-top: 1px dashed var(--border-primary);
+}
+.rizin-console-line {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 10px 4px;
+    border-top: 1px dashed var(--border-primary);
+}
+.rizin-prompt {
+    white-space: nowrap;
+    color: var(--accent-yellow);
+}
+.rizin-console-input {
+    flex: 1;
+    min-width: 0;
+    padding: 1px 0;
+    font: inherit;
+    color: var(--text-primary);
+    caret-color: var(--accent-pink);
+    background: none;
+    border: none;
+    outline: none;
+}
+.rizin-console-input::placeholder {
+    color: var(--text-dim);
+}
+/* The 16 colours of rizin's output, a background in 8, and the looks */
+.rz-ansi-black { color: var(--text-dim); }
+.rz-ansi-red { color: var(--accent-red); }
+.rz-ansi-green { color: var(--accent-green); }
+.rz-ansi-yellow { color: var(--accent-yellow); }
+.rz-ansi-blue { color: var(--accent-blue); }
+.rz-ansi-magenta { color: var(--accent-purple); }
+.rz-ansi-cyan { color: var(--accent-cyan); }
+.rz-ansi-white { color: var(--c-slate-300); }
+.rz-ansi-gray { color: var(--text-muted); }
+.rz-ansi-bright-red { color: var(--c-red-400); }
+.rz-ansi-bright-green { color: var(--c-green-400); }
+.rz-ansi-bright-yellow { color: var(--c-amber-200); }
+.rz-ansi-bright-blue { color: var(--c-blue-400); }
+.rz-ansi-bright-magenta { color: var(--accent-pink); }
+.rz-ansi-bright-cyan { color: var(--c-cyan-300); }
+.rz-ansi-bright-white { color: var(--text-primary); }
+.rz-ansi-bg-black { background: rgba(var(--c-black-rgb), .35); }
+.rz-ansi-bg-red { background: rgba(var(--accent-red-rgb), .25); }
+.rz-ansi-bg-green { background: rgba(var(--accent-green-rgb), .22); }
+.rz-ansi-bg-yellow { background: rgba(var(--accent-yellow-rgb), .22); }
+.rz-ansi-bg-blue { background: rgba(var(--accent-blue-rgb), .25); }
+.rz-ansi-bg-magenta { background: rgba(var(--accent-purple-rgb), .25); }
+.rz-ansi-bg-cyan { background: rgba(var(--accent-cyan-rgb), .2); }
+.rz-ansi-bg-white { background: rgba(var(--text-secondary-rgb), .2); }
+.rz-ansi-bold { font-weight: 700; }
+.rz-ansi-dim { opacity: .65; }
+.rz-ansi-italic { font-style: italic; }
+.rz-ansi-under { text-decoration: underline; }
+/* XREFS in two columns, each scrolling in itself */
+.rizin-xrefs {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+    gap: 0 16px;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.6;
+}
+.rizin-xrefs[hidden] {
+    display: none;
+}
+.rizin-xrefs-empty {
+    grid-column: 1 / -1;
+}
+.rizin-xrefs-col {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+}
+.rizin-xrefs-head {
+    flex: 0 0 auto;
+    margin-bottom: 2px;
+    overflow: hidden;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: .08em;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: var(--accent-cyan);
+}
+.rizin-xrefs-head b {
+    letter-spacing: .02em;
+    color: var(--accent-pink);
+}
+.rizin-xrefs-list {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+}
+.rizin-xref {
+    padding: 0 6px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: var(--c-slate-300);
+    border-radius: 2px;
+    cursor: pointer;
+}
+.rizin-xref:hover {
+    background: rgba(var(--accent-cyan-rgb), .06);
+}
+.rizin-xref .rz-addr {
+    margin-right: .5ch;
+}
+.rizin-xref .rz-addr:hover {
+    text-decoration: underline dotted;
+    text-underline-offset: 3px;
+}
+.rizin-xref-fn {
+    color: var(--text-primary);
+}
+.rizin-xref-type {
+    font-size: 10px;
+    color: var(--text-muted);
+}
+/* STRINGS and IMPORTS: one row per item, each part shortened on one line;
+   the columns follow rizin's iz (address, section, string) and ii (address,
+   type, library, name) */
+.rizin-list {
+    padding: 2px 0;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.6;
+}
+.rizin-row {
+    display: grid;
+    grid-template-columns: 13ch minmax(6ch, 14ch) minmax(0, 1fr);
+    gap: 12px;
+    padding: 0 8px;
+    color: var(--c-slate-300);
+    border-radius: 2px;
+    cursor: pointer;
+}
+.rizin-row > span {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+.rizin-row:hover {
+    background: rgba(var(--accent-cyan-rgb), .06);
+}
+.rizin-row.current {
+    background: rgba(var(--accent-cyan-rgb), .14);
+    box-shadow: inset 2px 0 0 var(--accent-cyan);
+}
+.rizin-row .rz-addr {
+    margin-right: 0;
+}
+.rizin-import {
+    grid-template-columns: 13ch minmax(4ch, 7ch) minmax(10ch, 22ch) minmax(0, 1fr);
+}
+.rizin-row-none {
+    cursor: default;
+    opacity: .6;
+}
+.rizin-string-text {
+    color: var(--c-amber-300);
+}
+.rizin-import-lib,
+.rizin-row-meta {
+    color: var(--text-muted);
+}
+.rizin-import-name {
+    color: var(--text-primary);
+}
+/* Rename and Comment on a right-click, at the mouse */
+.rizin-menu {
+    position: fixed;
+    z-index: 80;
+    min-width: 220px;
+    max-width: min(420px, 90vw);
+    padding: 4px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-accent);
+    border-radius: var(--radius);
+    box-shadow: 0 12px 28px rgba(var(--c-black-rgb), .45);
+}
+.rizin-menu[hidden] {
+    display: none;
+}
+.rizin-menu-head {
+    margin-bottom: 3px;
+    padding: 3px 8px 5px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: var(--text-muted);
+    border-bottom: 1px solid var(--border-primary);
+}
+.rizin-menu-items[hidden] {
+    display: none;
+}
+.rizin-menu-item {
+    display: block;
+    width: 100%;
+    padding: 4px 8px;
+    font: inherit;
+    text-align: left;
+    color: var(--text-primary);
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    cursor: pointer;
+}
+.rizin-menu-item:hover,
+.rizin-menu-item:focus-visible {
+    background: rgba(var(--accent-cyan-rgb), .1);
+    border-color: rgba(var(--accent-cyan-rgb), .3);
+    outline: none;
+}
+.rizin-menu-item:disabled {
+    color: var(--text-dim);
+    background: none;
+    border-color: transparent;
+    cursor: default;
+}
+.rizin-menu-form {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 4px 6px 2px;
+}
+.rizin-menu-form[hidden] {
+    display: none;
+}
+.rizin-menu-label {
+    font-size: 10.5px;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    color: var(--text-muted);
+}
+.rizin-menu-input {
+    width: 100%;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+}
+.rizin-menu-buttons {
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
+}
+.rizin-menu-note {
+    font-size: 10.5px;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    color: var(--c-red-300);
+}
+.rizin-menu-note:empty {
+    display: none;
+}
+.rizin-menu-note.rizin-menu-wait {
+    color: var(--accent-yellow);
+}
+/* A file dragged over the tab: dropped, it is uploaded and opened */
+#tab-rizin.rizin-dragover .rizin-work {
+    outline: 2px dashed var(--accent-cyan);
+    outline-offset: -4px;
 }

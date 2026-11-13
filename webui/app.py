@@ -9,16 +9,23 @@ Access: http://localhost:9000
 
 import datetime
 import atexit
+import base64
+import bisect
 import json
 import os
 import glob
 import platform
+import re
+import stat
+import tempfile
 import time
 import hashlib
 import math
 import struct
 import threading
 import subprocess
+import sys
+import weakref
 from pathlib import Path
 from flask import Flask, render_template, jsonify, request, send_from_directory
 from werkzeug.utils import secure_filename
@@ -31,6 +38,8 @@ import pipe_analysis
 import pipe_proxy
 # Offline analysis of exit-time minidumps (no scanner binary involved).
 import minidump_analysis
+# rizin sessions for the RIZIN tab.
+import rizin_sessions
 
 app = Flask(__name__)
 
@@ -160,18 +169,25 @@ def _path_within(path, roots):
     is fooled by junctions; this resolves the real path and compares whole
     path components, case-insensitively as Windows does.
     """
+    return _resolve_within(path, roots) is not None
+
+
+def _resolve_within(path, roots):
+    """The real path of `path` (links and junctions resolved) if it lies inside one of `roots`, else None:
+    as _path_within, for a caller that goes on with the path it checked."""
     try:
-        real = os.path.normcase(os.path.realpath(path))
+        real = os.path.realpath(path)
+        key = os.path.normcase(real)
     except (OSError, ValueError):
-        return False
+        return None
     for root in roots:
         try:
             base = os.path.normcase(os.path.realpath(root))
-            if os.path.commonpath([real, base]) == base:
-                return True
+            if os.path.commonpath([key, base]) == base:
+                return real
         except (OSError, ValueError):
             continue  # different drive, or unresolvable root
-    return False
+    return None
 
 
 def _wevtutil_query(log, query=None, count=None, newest_first=True, timeout=30):
@@ -541,6 +557,8 @@ def _build_samples(proc_map, by_sha, by_name):
 # Held by every write of submissions.json, from reading the list to putting the
 # new file in its place, and by every read; not re-entrant
 submissions_lock = threading.Lock()
+# Where the agent drops the samples it runs.
+SAMPLE_DROP_DIR = r"C:\Users\Public\Downloads"
 # On Windows another program holding submissions.json for a moment (the virus
 # scanner, an indexer) fails putting a new file in its place with
 # PermissionError: tried this often, this many seconds apart
@@ -557,6 +575,21 @@ def _load_submissions():
         except (json.JSONDecodeError, IOError):
             return []
     return []
+
+
+def _submission_file(sub):
+    """Where a submission's sample is now: its recorded path, else the same name in
+    the agent's drop folder (entries recorded before the path fix point at a folder
+    that never existed); None when neither exists."""
+    path = sub.get("file_path")
+    if isinstance(path, str) and path and os.path.isfile(path):
+        return path
+    name = sub.get("filename")
+    if isinstance(name, str) and name:
+        alt = os.path.join(SAMPLE_DROP_DIR, os.path.basename(name))
+        if os.path.isfile(alt):
+            return alt
+    return None
 
 
 def _save_submissions(submissions):
@@ -645,7 +678,7 @@ def _record_submission(filename, sha256, size, target, results):
         candidates = []
         if entry.get("agent_pid"):
             candidates.append(_image_path_for_pid(entry["agent_pid"]))
-        candidates.append(os.path.join(r"C:\Users\Public\Downloads", os.path.basename(filename)))
+        candidates.append(os.path.join(SAMPLE_DROP_DIR, os.path.basename(filename)))
         entry["file_path"] = next((c for c in candidates if c and os.path.isfile(c)), None)
 
     with submissions_lock:
@@ -3927,15 +3960,13 @@ def api_submissions():
     """Return submission history list."""
     with submissions_lock:
         subs = _load_submissions()
-    # Entries recorded before the path fix point at a folder that never
-    # existed; show where the sample actually is when it is still there.
+    # Show where a sample actually is when it is still there.
     out = []
     for sub in subs:
-        path = sub.get("file_path")
-        if isinstance(sub, dict) and (not path or not os.path.isfile(path)) and sub.get("filename"):
-            alt = os.path.join(r"C:\Users\Public\Downloads", os.path.basename(sub["filename"]))
-            if os.path.isfile(alt):
-                sub = dict(sub, file_path=alt)
+        if isinstance(sub, dict):
+            found = _submission_file(sub)
+            if found and found != sub.get("file_path"):
+                sub = dict(sub, file_path=found)
         out.append(sub)
     return jsonify(out)
 
@@ -4630,6 +4661,47 @@ def _add_hash_to_ioc(sha256_hash, filename=""):
         return {"status": "error", "error": str(e)}
 
 
+def _readable_roots():
+    """The folders whose files the web UI hands out: /api/file/download and the RIZIN tab."""
+    return [
+        os.path.normpath(RUSTINEL_ALERTS_DIR),
+        r"C:\Users",
+        r"C:\Windows\Temp",
+        r"C:\Temp",
+        # Memory dumps and the artifacts extracted from them
+        PROCESSDUMP_DIR,
+        RIZIN_UPLOAD_DIR,
+    ]
+
+
+def _readable(path):
+    """True if `path` is a local path inside one of _readable_roots() (see _readable_path)."""
+    return _readable_path(path) is not None
+
+
+# A drive path on Windows (after normpath): the only form a readable path may have there
+_DRIVE_PATH_RE = re.compile(r"[A-Za-z]:\\")
+
+
+def _readable_path(path):
+    r"""The real path of `path` if it is a local path inside one of _readable_roots(), else None. The
+    caller opens or sends the real path, the one that was checked: a link swapped in afterwards changes
+    nothing.
+
+    Only absolute paths, and on Windows only drive paths (X:\...). UNC, device and NT paths (\\host\share,
+    \\?\, \\.\, \??\UNC\host) and drive-relative ones (C:x, \x) are refused before anything resolves
+    them: resolving \\host\share would connect to that host.
+    """
+    if not isinstance(path, str) or not path or "\0" in path:
+        return None
+    if path.replace("/", "\\").startswith("\\\\"):
+        return None
+    norm = os.path.normpath(path)
+    if not os.path.isabs(norm) or (os.name == "nt" and not _DRIVE_PATH_RE.match(norm)):
+        return None
+    return _resolve_within(norm, _readable_roots())
+
+
 @app.route("/api/file/download")
 def api_file_download():
     """Serve a file for download given its path (only from monitored directories)."""
@@ -4637,24 +4709,16 @@ def api_file_download():
     if not filepath:
         return jsonify({"error": "No path specified"}), 400
 
-    # Security: only allow files from known monitored directories
-    allowed_prefixes = [
-        os.path.normpath(RUSTINEL_ALERTS_DIR),
-        r"C:\Users",
-        r"C:\Windows\Temp",
-        r"C:\Temp",
-        # Memory dumps and the artifacts extracted from them
-        PROCESSDUMP_DIR,
-    ]
-    norm_path = os.path.normpath(filepath)
-    if not _path_within(norm_path, allowed_prefixes):
+    # Security: only allow files from known monitored directories; the file sent is the one checked
+    real_path = _readable_path(filepath)
+    if real_path is None:
         return jsonify({"error": "Access denied: path outside allowed directories"}), 403
 
-    if not os.path.isfile(norm_path):
+    if not os.path.isfile(real_path):
         return jsonify({"error": "File not found"}), 404
 
-    directory = os.path.dirname(norm_path)
-    filename = os.path.basename(norm_path)
+    directory = os.path.dirname(real_path)
+    filename = os.path.basename(real_path)
     # Samples can be HTML/SVG; never let the browser render one on this origin.
     resp = send_from_directory(directory, filename, as_attachment=True,
                                mimetype="application/octet-stream")
@@ -4816,6 +4880,902 @@ def api_file_hex_write():
         })
     except (IOError, OSError) as e:
         return jsonify({"error": str(e)}), 500
+
+
+# --- Rizin (RIZIN tab) ---
+# One rizin session per opened file and browser tab (rizin_sessions). The
+# views run fixed commands that the server builds from validated numbers; text
+# from the browser reaches rizin only through the console and its allowlist.
+# Strings and imports are filtered and paged here, from a copy kept per session;
+# the flag names for the console's Tab as well. Those copies are bounded: rows as
+# tuples, at most RIZIN_ROWS_MAX, none of a list larger than VIEW_ANSWER_MAX.
+RIZIN_UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "rizin_uploads")
+RIZIN_UPLOADS_KEEP = 40
+RIZIN_DUMPS_LISTED = 500        # newest dump files in /api/rizin/files
+RIZIN_SCAN_MAX = 20000          # files looked at under a folder for that list
+RIZIN_REAP_INTERVAL = 60        # seconds; idle sessions also end without any call
+RIZIN_DISASM_COUNT = 400
+RIZIN_DISASM_MAX = 2000
+RIZIN_DISASM_CONTEXT = 64       # at most this many ops after addr on a first page that has to reach addr
+RIZIN_HEX_LEN = 512
+RIZIN_HEX_MAX = 4096
+RIZIN_PAGE = 200
+RIZIN_PAGE_MAX = 1000
+RIZIN_FLAGS_MAX = 200           # names in one /flags answer (the console's Tab)
+# Rows of izj, iij or flj kept per session; the rest is left out (truncated in the answer). An answer over
+# rizin_sessions.VIEW_ANSWER_MAX is not read in at all: the list says to filter in the console instead
+RIZIN_ROWS_MAX = 200000
+RIZIN_FILTER_HINT = {"strings": "iz~text", "imports": "ii~name"}
+RIZIN_XREFS_MAX = 500
+# Addresses per "pdj 1 @@= ..." command: rizin reads command lines of up to 4 KB.
+RIZIN_BATCH = 100
+RIZIN_NO_DECOMPILER = "Decompiler not available (rz-ghidra missing)"
+# Why a decompile ended the session: pdgj ran over rizin_sessions.DECOMPILE_TIMEOUT and rizin was stopped
+RIZIN_DECOMPILE_SLOW = "Decompiling took too long, the session ended."
+_RIZIN_TAB_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+# A function or flag name for seek; nothing rizin reads as an operator, modifier or variable.
+_RIZIN_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,255}")
+_RIZIN_HEX_RE = re.compile(r"0[xX][0-9a-fA-F]{1,16}")
+_RIZIN_DEC_RE = re.compile(r"[0-9]{1,20}")
+_RIZIN_NUMBER_RE = re.compile(r"[0-9]{1,10}")
+_RIZIN_GHIDRA_RE = re.compile(r"(?m)^\s*ghidra\b")
+_rizin_manager = None
+_rizin_lock = threading.Lock()
+# session -> {"gen": n, key: (version, value)}: strings, imports, flags and whether rz-ghidra loads.
+_rizin_cache = weakref.WeakKeyDictionary()
+_rizin_cache_lock = threading.Lock()
+# session -> {key: _RizinLoad}: the copies being loaded now (see _rizin_cached)
+_rizin_loading = weakref.WeakKeyDictionary()
+RIZIN_LOAD_WAIT = 2.0           # s a request waits for a copy another one loads, as for rizin's pipe
+_rizin_install = {"key": None, "value": None}
+_rizin_install_lock = threading.Lock()
+
+
+def _get_rizin():
+    """The rizin sessions of this process, created on first use (no threads at import)."""
+    global _rizin_manager
+    with _rizin_lock:
+        if _rizin_manager is None:
+            _rizin_manager = rizin_sessions.RizinSessions(exe=rizin_sessions.RIZIN_EXE)
+            atexit.register(_rizin_manager.shutdown)
+            threading.Thread(target=_rizin_reaper, args=(_rizin_manager,), daemon=True,
+                             name="rizin-reaper").start()
+        return _rizin_manager
+
+
+def _rizin_reaper(manager):
+    # Every call reaps too; this ends idle sessions when no tab calls any more.
+    while True:
+        time.sleep(RIZIN_REAP_INTERVAL)
+        try:
+            manager.reap()
+        except Exception as e:
+            print(f"[rizin] reaping idle sessions failed: {e}")
+
+
+def _rizin_reap():
+    manager = _rizin_manager
+    if manager is not None:
+        manager.reap()
+
+
+def _rizin_installation():
+    """installed, path, version and ghidra for rizin_sessions.RIZIN_EXE; rizin is asked once per file."""
+    exe = rizin_sessions.RIZIN_EXE
+    try:
+        st = os.stat(exe)
+    except (OSError, ValueError):
+        st = None
+    if st is None or not stat.S_ISREG(st.st_mode):
+        return {"installed": False, "path": exe, "version": None, "ghidra": False}
+    key = (exe, st.st_mtime_ns, st.st_size)
+    with _rizin_install_lock:
+        if _rizin_install["key"] != key:
+            _rizin_install.update(key=key, value=_rizin_probe(exe))
+        return dict(_rizin_install["value"], installed=True, path=exe)
+
+
+def _rizin_probe(exe):
+    env = rizin_sessions.rizin_environment(exe)
+
+    def run(*args):
+        try:
+            return _run_cmd([exe, *args], timeout=60, stdin=subprocess.DEVNULL, cwd=tempfile.gettempdir(),
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), env=env).stdout
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    version = re.match(r"rizin (\S+)", run("-v").strip())
+    # Lc lists the core plugins; rz-ghidra is "ghidra" there once it loads (as install-rizin.ps1 checks).
+    return {"version": version.group(1) if version else None,
+            "ghidra": bool(_RIZIN_GHIDRA_RE.search(run("-N", "-qc", "Lc", "--")))}
+
+
+def _rizin_refused(reason):
+    return jsonify({"refused": reason}), 400
+
+
+def _rizin_call(sid, view):
+    """jsonify(view(session)) for the session `sid`; its states and refusals as HTTP answers."""
+    try:
+        return jsonify(view(_get_rizin().get(sid)))
+    except rizin_sessions.RizinRefused as e:
+        return _rizin_refused(e.reason)
+    except rizin_sessions.RizinBusy as e:
+        return jsonify({"busy": True, "step": e.step}), 409
+    except rizin_sessions.SessionMoved:
+        return jsonify({"moved": True}), 409
+    except rizin_sessions.SessionEnded:
+        return jsonify({"error": "session ended"}), 404
+    except (rizin_sessions.RizinTimeout, rizin_sessions.RizinDied) as e:
+        # rizin was stopped and the session ended with it.
+        return jsonify({"error": "session ended", "reason": str(e)}), 404
+    except rizin_sessions.RizinTooLarge as e:
+        return jsonify({"error": str(e)}), 500
+    except ValueError as e:
+        return jsonify({"error": f"rizin answered something unexpected: {e}"}), 500
+    except OSError as e:
+        # a full disk, for one: the pending save that Full analysis writes first
+        return jsonify({"error": f"a file could not be read or written on the VM: {e}"}), 500
+
+
+class _RizinLoad:
+    """A copy being loaded for one request; the requests that want the same copy meanwhile wait for it."""
+
+    def __init__(self, gen, version):
+        self.gen, self.version = gen, version
+        self.done = threading.Event()
+        self.value = self.error = None
+
+
+def _rizin_cached(session, key, load, version=None):
+    """load() once per session (and version); a console command (see _rizin_forget) makes it load again.
+
+    Requests that want the copy while another one loads it wait for that load (up to RIZIN_LOAD_WAIT, then
+    busy as for rizin's pipe) rather than ask rizin once more: Tab pressed again right after a console
+    command runs flj once.
+    """
+    with _rizin_cache_lock:
+        cache = _rizin_cache.setdefault(session, {"gen": 0})
+        if key in cache and cache[key][0] == version:
+            return cache[key][1]
+        gen = cache["gen"]
+        loading = _rizin_loading.setdefault(session, {})
+        flight = loading.get(key)
+        mine = flight is None or flight.gen != gen or flight.version != version
+        if mine:
+            flight = loading[key] = _RizinLoad(gen, version)
+    if not mine:
+        if not flight.done.wait(RIZIN_LOAD_WAIT):
+            raise rizin_sessions.RizinBusy("view")
+        if flight.error is not None:
+            raise flight.error
+        return flight.value
+    try:
+        flight.value = load()
+    except BaseException as e:
+        flight.error = e
+        raise
+    finally:
+        with _rizin_cache_lock:
+            if _rizin_loading.get(session, {}).get(key) is flight:
+                del _rizin_loading[session][key]
+            cache = _rizin_cache.setdefault(session, {"gen": 0})
+            if flight.error is None and cache["gen"] == gen:
+                cache[key] = (version, flight.value)
+        flight.done.set()
+    return flight.value
+
+
+def _rizin_forget(session, keys=None):
+    """Drop the session's copies (only those of keys, if given); a load that runs meanwhile keeps nothing."""
+    with _rizin_cache_lock:
+        cache = _rizin_cache.get(session, {"gen": 0})
+        kept = {k: v for k, v in cache.items() if keys is not None and k != "gen" and k not in keys}
+        _rizin_cache[session] = dict(kept, gen=cache["gen"] + 1)
+
+
+def _rizin_address(value, what="addr"):
+    """An address from a request: an integer, or text in decimal or 0x hex."""
+    if isinstance(value, str):
+        text = value.strip()
+        if _RIZIN_HEX_RE.fullmatch(text):
+            value = int(text, 16)
+        elif _RIZIN_DEC_RE.fullmatch(text):
+            value = int(text)
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2 ** 64:
+        raise rizin_sessions.RizinRefused(f"{what} must be an address from 0 to 2^64-1, decimal or 0x...")
+    return value
+
+
+def _rizin_arg_address(session):
+    """The addr parameter; without it the session's current address."""
+    raw = request.args.get("addr")
+    if raw is None:
+        seek = session.status()["seek"]
+        if seek is None:
+            raise rizin_sessions.RizinRefused("addr is missing")
+        return seek
+    return _rizin_address(raw)
+
+
+def _rizin_arg_number(name, default, low, high):
+    raw = request.args.get(name)
+    if raw is None:
+        return default
+    if not _RIZIN_NUMBER_RE.fullmatch(raw) or not low <= int(raw) <= high:
+        raise rizin_sessions.RizinRefused(f"{name} must be a whole number from {low} to {high}")
+    return int(raw)
+
+
+def _rizin_arg_text():
+    q = request.args.get("q", "")
+    if len(q) > 200 or any(ord(c) < 32 or ord(c) == 127 for c in q):
+        raise rizin_sessions.RizinRefused("q must be plain text of up to 200 characters")
+    return q.casefold()
+
+
+def _rizin_body():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        raise rizin_sessions.RizinRefused("a JSON object is expected")
+    return body
+
+
+def _rizin_int(value):
+    """An address in rizin's JSON; None for none (rizin also writes 2^64-1 for none)."""
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2 ** 64 - 1:
+        return None
+    return value
+
+
+def _rizin_function(session, addr):
+    """afij's description of the function at (or around) addr, or None."""
+    info = session.json(f"afij @ {addr:#x}")
+    fn = info[0] if isinstance(info, list) and info else None
+    if isinstance(fn, dict) and _rizin_int(fn.get("offset")) is not None and isinstance(fn.get("name"), str):
+        return fn
+    return None
+
+
+def _rizin_function_ops(session, fn):
+    data = session.json(f"pdfj @ {fn['offset']:#x}")
+    return _rizin_ops(data.get("ops") if isinstance(data, dict) else None)
+
+
+def _rizin_ops(raw):
+    """Ops of pdfj/pdj as the views show them, in address order."""
+    ops = []
+    for op in raw if isinstance(raw, list) else []:
+        if not isinstance(op, dict) or _rizin_int(op.get("offset")) is None:
+            continue
+        comment = op.get("comment")
+        try:
+            # rizin's JSON carries comments in base64
+            comment = base64.b64decode(comment, validate=True).decode("utf-8", "replace") \
+                if isinstance(comment, str) else None
+        except ValueError:
+            comment = None
+        size = op.get("size")
+        ops.append({"offset": op["offset"],
+                    "size": size if isinstance(size, int) and not isinstance(size, bool) and size > 0 else 1,
+                    "text": str(op.get("disasm") or op.get("opcode") or "invalid"),
+                    "type": str(op.get("type") or "invalid"),
+                    "jump": _rizin_int(op.get("jump")),
+                    "comment": comment})
+    ops.sort(key=lambda op: op["offset"])
+    return ops
+
+
+def _rizin_functions(session):
+    rows = session.json("aflj", timeout=rizin_sessions.CONSOLE_TIMEOUT)
+    out = [{"name": f["name"], "offset": f["offset"], "size": f.get("size"), "nbbs": f.get("nbbs")}
+           for f in (rows if isinstance(rows, list) else [])
+           if isinstance(f, dict) and isinstance(f.get("name"), str) and _rizin_int(f.get("offset")) is not None]
+    return sorted(out, key=lambda f: f["offset"])
+
+
+def _rizin_disasm(session):
+    """The function around addr from its start (the first page reaches addr), else linear from addr.
+
+    `after` continues after that op; `more` says whether another page follows.
+    """
+    addr = _rizin_arg_address(session)
+    after = request.args.get("after")
+    after = None if after is None else _rizin_address(after, "after")
+    count = _rizin_arg_number("count", RIZIN_DISASM_COUNT, 1, RIZIN_DISASM_MAX)
+    fn = _rizin_function(session, addr)
+    if fn is None:
+        # pdj decodes only rizin's block (256 bytes from the address) and then repeats a broken op, unless the
+        # command sets the block for the page (@!): 16 bytes an instruction at most
+        if after is None:
+            ops = _rizin_ops(session.json(f"pdj {count} @! {count * 16} @ {addr:#x}"))
+        else:
+            ops = [op for op in _rizin_ops(session.json(f"pdj {count + 1} @! {(count + 1) * 16} @ {after:#x}"))
+                   if op["offset"] > after]
+        ops = ops[:count]
+        # rizin reads on without end; a page of nothing but invalid instructions (data, or memory without
+        # bytes, read as 0xff) is no code, and no page follows it
+        return {"function": None, "ops": ops,
+                "more": len(ops) == count and any(op["type"] != "invalid" for op in ops)}
+    ops = _rizin_function_ops(session, fn)
+    if after is None:
+        at = next((i for i, op in enumerate(ops) if op["offset"] <= addr < op["offset"] + op["size"]), 0)
+        context = min(RIZIN_DISASM_CONTEXT, count // 4)
+        start, end = 0, count if at + context < count else at + 1 + context
+    else:
+        start = next((i for i, op in enumerate(ops) if op["offset"] > after), len(ops))
+        end = start + count
+    return {"function": fn["name"], "ops": ops[start:end], "more": end < len(ops)}
+
+
+def _rizin_graph(session):
+    """The basic blocks of the function around addr, with their instructions and edges."""
+    addr = _rizin_arg_address(session)
+    fn = _rizin_function(session, addr)
+    if fn is None:
+        return {"function": None, "offset": None, "nodes": []}
+    blocks = session.json(f"afbj @ {fn['offset']:#x}")
+    nodes = []
+    for block in blocks if isinstance(blocks, list) else []:
+        if not isinstance(block, dict) or _rizin_int(block.get("addr")) is None:
+            continue
+        size = block.get("size")
+        switch = block.get("switch_op") if isinstance(block.get("switch_op"), dict) else {}
+        cases = switch.get("cases") if isinstance(switch.get("cases"), list) else []
+        nodes.append({"offset": block["addr"],
+                      "size": size if isinstance(size, int) and not isinstance(size, bool) and size > 0 else 0,
+                      "lines": [], "jump": _rizin_int(block.get("jump")), "fail": _rizin_int(block.get("fail")),
+                      "cases": [_rizin_int(c.get("jump")) for c in cases if isinstance(c, dict)]})
+    nodes.sort(key=lambda n: n["offset"])
+    starts = [n["offset"] for n in nodes]
+    for op in _rizin_function_ops(session, fn):
+        i = bisect.bisect_right(starts, op["offset"]) - 1
+        if i >= 0 and op["offset"] < starts[i] + nodes[i]["size"]:
+            nodes[i]["lines"].append(op["text"])
+    known = set(starts)
+    for node in nodes:
+        # Edges only between this function's blocks: a tail call or a jump elsewhere has no block here.
+        node["jump"] = node["jump"] if node["jump"] in known else None
+        node["fail"] = node["fail"] if node["fail"] in known else None
+        node["cases"] = list(dict.fromkeys(c for c in node["cases"] if c in known))
+    # offset: the function's entry, where the graph starts (a rename keeps it, unlike the name)
+    return {"function": fn["name"], "offset": fn["offset"], "nodes": nodes}
+
+
+def _rizin_decompile(session):
+    """rz-ghidra's C for the function around addr, line by line with the addresses of each line."""
+    addr = _rizin_arg_address(session)
+    if not _rizin_cached(session, "ghidra", lambda: bool(_RIZIN_GHIDRA_RE.search(session.text("Lc")))):
+        return {"available": False, "reason": RIZIN_NO_DECOMPILER, "function": None, "lines": []}
+    fn = _rizin_function(session, addr)
+    if fn is None:
+        return {"available": True, "reason": f"No function at {addr:#x}", "function": None, "lines": []}
+    try:
+        # rz-ghidra takes long on a big function under x64 emulation: a limit of its own, above the console's
+        data = session.json(f"pdgj @ {fn['offset']:#x}", timeout=rizin_sessions.DECOMPILE_TIMEOUT)
+    except rizin_sessions.RizinTimeout:
+        # rizin was stopped and the session ended with it (RizinSession._call); the tab says why
+        raise rizin_sessions.RizinTimeout(RIZIN_DECOMPILE_SLOW) from None
+    if not isinstance(data, dict) or not isinstance(data.get("code"), str):
+        return {"available": True, "reason": f"rz-ghidra returned no code for {fn['name']}",
+                "function": fn["name"], "lines": []}
+    return {"available": True, "reason": None, "function": fn["name"],
+            "lines": _rizin_code_lines(data["code"], data.get("annotations"))}
+
+
+def _rizin_code_lines(code, annotations):
+    """pdgj's code as [{text, offset, offsets}]: offsets are the addresses of the line's offset annotations,
+    offset is the first of them in rizin's order (the address pdgo shows for the line).
+
+    Annotation positions count bytes of the UTF-8 code, not characters.
+    """
+    raw = code.encode("utf-8", "surrogatepass")
+    parts = raw.split(b"\n")
+    if len(parts) > 1 and not parts[-1]:
+        parts.pop()
+    starts, end_of_code = [], 0
+    for part in parts:
+        starts.append(end_of_code)
+        end_of_code += len(part) + 1
+    first, every = [None] * len(parts), [set() for _ in parts]
+    for note in annotations if isinstance(annotations, list) else []:
+        if not isinstance(note, dict) or note.get("type") != "offset":
+            continue
+        start, end, offset = note.get("start"), note.get("end"), _rizin_int(note.get("offset"))
+        if offset is None or not all(isinstance(v, int) and not isinstance(v, bool) for v in (start, end)) \
+                or not 0 <= start < end_of_code:
+            continue
+        line = bisect.bisect_right(starts, start) - 1
+        while line < len(parts) and starts[line] < max(end, start + 1):
+            if first[line] is None:
+                first[line] = offset
+            every[line].add(offset)
+            line += 1
+    return [{"text": part.decode("utf-8", "replace"), "offset": first[i], "offsets": sorted(every[i])}
+            for i, part in enumerate(parts)]
+
+
+def _rizin_hex(session):
+    addr = _rizin_arg_address(session)
+    length = _rizin_arg_number("len", RIZIN_HEX_LEN, 1, RIZIN_HEX_MAX)
+    data = session.json(f"pxj {length} @ {addr:#x}")
+    if not isinstance(data, list) or not all(
+            isinstance(b, int) and not isinstance(b, bool) and 0 <= b <= 255 for b in data):
+        data = []
+    return {"offset": addr, "bytes": data[:length], "paddr": _rizin_paddr(session, addr)}
+
+
+def _rizin_paddr(session, addr):
+    """Where the byte at addr is in the file rizin has open (ol.j): the map there (oml.j) is one of that
+    file, at delta + (addr - from). None where no byte of the file is: a zero-filled map (a section's room
+    past its data, .bss), no map, or past the end of the file."""
+    def number(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+    try:
+        opened = session.json("ol.j")
+        mapped = session.json(f"oml.j @ {addr:#x}")
+    except ValueError:
+        return None
+    if not isinstance(opened, dict) or not isinstance(mapped, dict):
+        return None
+    fd, start, delta = number(opened.get("fd")), number(mapped.get("from")), number(mapped.get("delta"))
+    if fd is None or number(mapped.get("fd")) != fd or start is None or delta is None or addr < start:
+        return None
+    paddr, size = delta + addr - start, number(opened.get("size"))
+    return paddr if size is None or paddr < size else None
+
+
+def _rizin_refs(raw):
+    refs = [{"from": x["from"], "to": x["to"], "type": str(x.get("type") or "")}
+            for x in (raw if isinstance(raw, list) else [])
+            if isinstance(x, dict) and _rizin_int(x.get("from")) is not None and _rizin_int(x.get("to")) is not None]
+    return sorted(refs, key=lambda x: (x["from"], x["to"]))
+
+
+def _rizin_ops_at(session, addrs):
+    """The instruction at each address as pdj shows it ({addr: op}), RIZIN_BATCH addresses per command."""
+    found, todo = {}, sorted(set(addrs))
+    while todo:
+        part = todo[:RIZIN_BATCH]
+        lines = session.text("pdj 1 @@= " + " ".join(f"{a:#x}" for a in part)).split("\n")
+        done = 0
+        for addr, line in zip(part, lines):
+            try:
+                op = json.loads(line)[0]
+            except (ValueError, IndexError, KeyError, TypeError):
+                break
+            if not isinstance(op, dict) or op.get("offset") != addr:
+                break
+            found[addr] = op
+            done += 1
+        # rizin stops the loop at an address it cannot read: that one is left out, the others go on.
+        todo = todo[done + (done < len(part)):]
+    return found
+
+
+def _rizin_op_function(op):
+    fcn, last = _rizin_int(op.get("fcn_addr")), _rizin_int(op.get("fcn_last"))
+    return fcn if fcn is not None and (fcn or last) else None  # 0/0 means: in no function
+
+
+def _rizin_xrefs(session):
+    """References to addr and from it; at a function's entry, from the whole function."""
+    addr = _rizin_arg_address(session)
+    fn = _rizin_function(session, addr)
+    whole = fn is not None and fn["offset"] == addr
+    refs_to = _rizin_refs(session.json(f"axtj @ {addr:#x}"))
+    refs_from = _rizin_refs(session.json(f"afxj @ {addr:#x}" if whole else f"axfj @ {addr:#x}"))
+    truncated = len(refs_to) > RIZIN_XREFS_MAX or len(refs_from) > RIZIN_XREFS_MAX
+    refs_to, refs_from = refs_to[:RIZIN_XREFS_MAX], refs_from[:RIZIN_XREFS_MAX]
+    ops = _rizin_ops_at(session, [x["from"] for x in refs_to + refs_from])
+    names = {}
+    if any(_rizin_op_function(op) is not None for op in ops.values()):
+        names = {f["offset"]: f["name"] for f in _rizin_functions(session)}
+    for ref in refs_to + refs_from:
+        op = ops.get(ref["from"])
+        ref["text"] = str(op.get("disasm") or op.get("opcode") or "") or None if op else None
+        ref["function"] = names.get(_rizin_op_function(op)) if op else None
+    return {"scope": "function" if whole else "address", "function": fn["name"] if fn else None,
+            "to": refs_to, "from": refs_from, "truncated": truncated}
+
+
+def _rizin_page(session, key, command, item, fields):
+    """One page of izj or iij, filtered by q. The rows are kept per session as tuples (the folded text to
+    filter by, then the fields' values), RIZIN_ROWS_MAX of them at most (truncated says that rizin listed
+    more); a list larger than rizin_sessions.VIEW_ANSWER_MAX is not read in, and the answer says to filter
+    in the console instead (that is kept too: rizin is asked again after a console command)."""
+    q = _rizin_arg_text()
+    offset = _rizin_arg_number("offset", 0, 0, 10 ** 9)
+    limit = _rizin_arg_number("limit", RIZIN_PAGE, 1, RIZIN_PAGE_MAX)
+
+    def load():
+        try:
+            rows = session.json(command, timeout=rizin_sessions.CONSOLE_TIMEOUT)
+        except rizin_sessions.RizinTooLarge:
+            return None
+        rows = rows if isinstance(rows, list) else []
+        return [found for found in map(item, rows[:RIZIN_ROWS_MAX]) if found], len(rows) > RIZIN_ROWS_MAX
+
+    copy = _rizin_cached(session, key, load)
+    if copy is None:
+        raise rizin_sessions.RizinTooLarge(
+            f"too many {key} to list here (rizin's list is larger than "
+            f"{rizin_sessions.VIEW_ANSWER_MAX / (1024 * 1024):g} MB): filter them in the console, e.g. "
+            f"{RIZIN_FILTER_HINT[key]}")
+    rows, truncated = copy
+    found = [row for row in rows if q in row[0]]
+    return {"total": len(found), "items": [dict(zip(fields, row[1:])) for row in found[offset:offset + limit]],
+            "truncated": truncated}
+
+
+def _rizin_shared(text):
+    """A text of rizin's that many rows repeat (a section, a type), kept once."""
+    return sys.intern(text) if type(text) is str else text
+
+
+def _rizin_folded(text):
+    folded = text.casefold()
+    return text if folded == text else folded
+
+
+_RIZIN_STRING_FIELDS = ("offset", "string", "length", "section", "type")
+_RIZIN_IMPORT_FIELDS = ("offset", "name", "library", "type", "ordinal")
+
+
+def _rizin_string(row):
+    if not isinstance(row, dict) or _rizin_int(row.get("vaddr")) is None or not isinstance(row.get("string"), str):
+        return None
+    return (_rizin_folded(row["string"]), row["vaddr"], row["string"], row.get("length"),
+            _rizin_shared(row.get("section")), _rizin_shared(row.get("type")))
+
+
+def _rizin_import(row):
+    if not isinstance(row, dict) or not isinstance(row.get("name"), str):
+        return None
+    library = row.get("libname") if isinstance(row.get("libname"), str) else ""
+    return (f"{row['name']}\0{library}".casefold(), _rizin_int(row.get("plt")) or None, row["name"],
+            _rizin_shared(library) or None, _rizin_shared(row.get("type")), row.get("ordinal"))
+
+
+def _rizin_flags(session):
+    """The flag names that start with q, in any case, sorted; at most limit of them (the console's Tab), and
+    the start that all of them share (common), also those past the limit.
+
+    rizin 0.9.1 lists the flags with flj. The sorted names are kept per session, like strings and imports,
+    and are asked for again after a console command, a rename or a comment, and once the analysis has
+    gone on (its steps add and rename flags). As for those, RIZIN_ROWS_MAX rows of flj are kept at most
+    (truncated), and none if flj is larger than rizin_sessions.VIEW_ANSWER_MAX: Tab completes the
+    function names then.
+    """
+    prefix = _rizin_arg_text()
+    limit = _rizin_arg_number("limit", RIZIN_FLAGS_MAX, 1, RIZIN_FLAGS_MAX)
+    analysis = session.analysis
+
+    def load():
+        try:
+            rows = session.json("flj", timeout=rizin_sessions.CONSOLE_TIMEOUT)
+        except rizin_sessions.RizinTooLarge:
+            return [], True
+        rows = rows if isinstance(rows, list) else []
+        names = {row["name"] for row in rows[:RIZIN_ROWS_MAX]
+                 if isinstance(row, dict) and isinstance(row.get("name"), str) and row["name"]}
+        return sorted((_rizin_folded(name), name) for name in names), len(rows) > RIZIN_ROWS_MAX
+
+    names, truncated = _rizin_cached(session, "flags", load,
+                                     version=(analysis["state"], len(analysis["done_steps"])))
+    found, i = [], bisect.bisect_left(names, (prefix,))
+    while i < len(names) and names[i][0].startswith(prefix):
+        found.append(names[i][1])
+        i += 1
+    return {"total": len(found), "names": found[:limit], "common": os.path.commonprefix(found),
+            "truncated": truncated}
+
+
+def _rizin_seek(session):
+    value = _rizin_body().get("addr")
+    if isinstance(value, str) and _RIZIN_NAME_RE.fullmatch(value.strip()):
+        name = value.strip()
+        before = session.status()["seek"]
+        # A name is text from the browser: it goes through the console and its allowlist.
+        out = session.console("s " + name)
+        if out["output"].strip() and out["seek"] == before:
+            raise rizin_sessions.RizinRefused(f"unknown address or name: '{name}'")
+        return {"seek": out["seek"], "function": out["function"]}
+    return session.seek(_rizin_address(value))
+
+
+def _rizin_console(session):
+    cmd = _rizin_body().get("cmd")
+    if not isinstance(cmd, str):
+        raise rizin_sessions.RizinRefused("cmd must be text")
+    try:
+        return session.console(cmd)
+    finally:
+        _rizin_forget(session)  # a setting such as bin.demangle changes the imports
+
+
+def _rizin_rename(session):
+    body = _rizin_body()
+    try:
+        return session.rename(_rizin_address(body.get("addr")), body.get("name"))
+    finally:
+        _rizin_forget(session, ("flags",))  # the function's flag has the new name
+
+
+def _rizin_comment(session):
+    body = _rizin_body()
+    try:
+        return session.comment(_rizin_address(body.get("addr")), body.get("text"))
+    finally:
+        _rizin_forget(session, ("flags",))
+
+
+def _rizin_comment_at(session):
+    """The comment at addr as the disassembly shows it ('' without one): the right-click menu's Comment… field
+    shows it also where the disassembly has not loaded it, so that an empty field removes only what was seen."""
+    addr = _rizin_arg_address(session)
+    op = next((op for op in _rizin_ops(session.json(f"pdj 1 @ {addr:#x}")) if op["offset"] == addr), None)
+    return {"offset": addr, "comment": (op["comment"] or "") if op else ""}
+
+
+def _rizin_listable(path):
+    try:
+        return _readable(path) and os.path.isfile(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
+def _rizin_folder_files(folder, recursive, limit):
+    """Non-empty files in `folder` (and below), newest first: [{name relative to folder, path, size}].
+
+    Subfolders are walked newest first, so the newest files are found before RIZIN_SCAN_MAX stops the walk.
+    """
+    def mtime(path):
+        try:
+            return os.stat(path).st_mtime
+        except OSError:
+            return 0
+
+    found = []
+    for root, dirs, names in os.walk(folder):
+        if recursive:
+            dirs.sort(key=lambda d: mtime(os.path.join(root, d)), reverse=True)
+        else:
+            dirs.clear()
+        for name in names:
+            path = os.path.join(root, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode) and st.st_size > 0 and not name.startswith("."):
+                found.append((st.st_mtime, path, st.st_size))
+        if len(found) >= RIZIN_SCAN_MAX:
+            break
+    found.sort(key=lambda f: f[0], reverse=True)
+    out = []
+    for _, path, size in found:
+        if len(out) >= limit:
+            break
+        if _readable(path):
+            out.append({"name": os.path.relpath(path, folder), "path": path, "size": size})
+    return out
+
+
+def _rizin_prune_uploads(keep):
+    # The oldest uploads go; one that rizin has open stays (Windows refuses to delete it).
+    for old in _rizin_folder_files(RIZIN_UPLOAD_DIR, False, RIZIN_SCAN_MAX)[RIZIN_UPLOADS_KEEP:]:
+        if old["path"] != keep:
+            try:
+                os.remove(old["path"])
+            except OSError:
+                pass
+
+
+@app.route("/api/rizin/status")
+def api_rizin_status():
+    """Whether rizin is installed (TDC_RIZIN), its version and whether rz-ghidra loads."""
+    _rizin_reap()
+    return jsonify(_rizin_installation())
+
+
+@app.route("/api/rizin/files")
+def api_rizin_files():
+    """What the RIZIN tab can open: submitted samples, dump files and uploads (existing, non-empty files)."""
+    _rizin_reap()
+    with submissions_lock:
+        subs = _load_submissions()
+    submissions, seen = [], set()
+    for sub in subs if isinstance(subs, list) else []:
+        path = _submission_file(sub) if isinstance(sub, dict) else None
+        key = path and os.path.normcase(os.path.abspath(path))
+        if not path or key in seen or not _rizin_listable(path):
+            continue
+        seen.add(key)
+        submissions.append({"filename": sub.get("filename") or os.path.basename(path), "path": path,
+                            "sha256": sub.get("sha256"), "time": sub.get("timestamp")})
+    return jsonify({"submissions": submissions,
+                    "dumps": _rizin_folder_files(PROCESSDUMP_DIR, True, RIZIN_DUMPS_LISTED),
+                    "uploads": _rizin_folder_files(RIZIN_UPLOAD_DIR, False, RIZIN_UPLOADS_KEEP)})
+
+
+@app.route("/api/rizin/upload", methods=["POST"])
+def api_rizin_upload():
+    """Store an uploaded file (multipart "file") under RIZIN_UPLOAD_DIR, named by its content."""
+    _rizin_reap()
+    upload = request.files.get("file")
+    if upload is None:
+        return _rizin_refused("no file was uploaded")
+    try:
+        os.makedirs(RIZIN_UPLOAD_DIR, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=RIZIN_UPLOAD_DIR, prefix=".upload-")
+    except OSError as e:
+        return jsonify({"error": f"the upload could not be stored: {e.strerror or e}"}), 500
+    digest, size = hashlib.sha256(), 0
+    try:
+        with os.fdopen(fd, "wb") as out:
+            for chunk in iter(lambda: upload.stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+                size += len(chunk)
+                out.write(chunk)
+        if not size:
+            return _rizin_refused("the file is empty")
+        stem, ext = os.path.splitext(secure_filename(upload.filename or "") or "upload.bin")
+        dest = os.path.join(RIZIN_UPLOAD_DIR, f"{digest.hexdigest()[:16]}_{stem[:80]}{ext[:16]}")
+        if os.path.isfile(dest):  # the same content and name is there already (rizin may have it open)
+            try:
+                os.utime(dest)  # newest again, so pruning keeps it
+            except OSError:
+                pass
+        else:
+            os.replace(tmp, dest)
+    except OSError as e:
+        # a full disk, for one
+        return jsonify({"error": f"the upload could not be stored: {e.strerror or e}"}), 500
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    _rizin_prune_uploads(keep=dest)
+    return jsonify({"path": dest})
+
+
+@app.route("/api/rizin/open", methods=["POST"])
+def api_rizin_open():
+    """Open a file in a rizin session for one browser tab. JSON: path, tab.
+
+    One file per tab: a new file replaces the tab's old session, and the same file
+    in another tab moves its session there (the old tab then gets 409 moved).
+    """
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return _rizin_refused("a JSON object with path and tab is expected")
+    path, tab = body.get("path"), body.get("tab")
+    if not isinstance(path, str) or not path or len(path) > 4096 or "\0" in path:
+        return _rizin_refused("path must be the path of a file on the VM")
+    if not isinstance(tab, str) or not _RIZIN_TAB_RE.fullmatch(tab):
+        return _rizin_refused("tab must be 1 to 64 of A-Z a-z 0-9 _ -")
+    exe = rizin_sessions.RIZIN_EXE
+    if not os.path.isfile(exe):
+        return jsonify({"error": "rizin not installed", "path": exe}), 503
+    # rizin gets the path that was checked (the real one): a link swapped in afterwards changes nothing
+    path = _readable_path(path)
+    if path is None:
+        return jsonify({"error": "Access denied: path outside allowed directories"}), 403
+    if os.path.isdir(path):
+        return _rizin_refused("the path is a folder, not a file")
+    if not os.path.isfile(path):
+        return _rizin_refused("the file does not exist")
+    try:
+        with open(path, "rb") as fh:
+            empty = not fh.read(1)
+    except OSError as e:
+        return _rizin_refused(f"the file cannot be read: {e.strerror or e}")
+    if empty:
+        return _rizin_refused("the file is empty")
+    try:
+        return jsonify(_get_rizin().open(path, tab))
+    except FileNotFoundError:
+        return _rizin_refused("the file does not exist")
+    except rizin_sessions.SessionSuperseded:
+        # The tab opened something else meanwhile and drops this answer
+        return jsonify({"error": "a newer OPEN of this browser tab came first", "superseded": True}), 409
+    except (rizin_sessions.RizinTimeout, rizin_sessions.RizinDied, OSError, ValueError) as e:
+        return jsonify({"error": f"rizin could not open the file: {e}"}), 500
+
+
+@app.route("/api/rizin/<sid>/status")
+def api_rizin_session_status(sid):
+    """analysis, seek and function of a session, without asking rizin."""
+    return _rizin_call(sid, lambda session: session.status())
+
+
+@app.route("/api/rizin/<sid>/analyze", methods=["POST"])
+def api_rizin_analyze(sid):
+    """Start the full analysis (aaa's steps one by one)."""
+    return _rizin_call(sid, lambda session: {"analysis": session.analyze_full()})
+
+
+@app.route("/api/rizin/<sid>/close", methods=["POST"])
+def api_rizin_close(sid):
+    """End a session; also sent by the page's pagehide beacon. An ID that moved leaves the session running."""
+    _get_rizin().close(sid)
+    return jsonify({"closed": True})
+
+
+@app.route("/api/rizin/<sid>/functions")
+def api_rizin_functions(sid):
+    return _rizin_call(sid, _rizin_functions)
+
+
+@app.route("/api/rizin/<sid>/disasm")
+def api_rizin_disasm(sid):
+    return _rizin_call(sid, _rizin_disasm)
+
+
+@app.route("/api/rizin/<sid>/graph")
+def api_rizin_graph(sid):
+    return _rizin_call(sid, _rizin_graph)
+
+
+@app.route("/api/rizin/<sid>/decompile")
+def api_rizin_decompile(sid):
+    return _rizin_call(sid, _rizin_decompile)
+
+
+@app.route("/api/rizin/<sid>/hex")
+def api_rizin_hex(sid):
+    return _rizin_call(sid, _rizin_hex)
+
+
+@app.route("/api/rizin/<sid>/xrefs")
+def api_rizin_xrefs(sid):
+    return _rizin_call(sid, _rizin_xrefs)
+
+
+@app.route("/api/rizin/<sid>/strings")
+def api_rizin_strings(sid):
+    return _rizin_call(sid, lambda session: _rizin_page(session, "strings", "izj", _rizin_string, _RIZIN_STRING_FIELDS))
+
+
+@app.route("/api/rizin/<sid>/imports")
+def api_rizin_imports(sid):
+    return _rizin_call(sid, lambda session: _rizin_page(session, "imports", "iij", _rizin_import, _RIZIN_IMPORT_FIELDS))
+
+
+@app.route("/api/rizin/<sid>/flags")
+def api_rizin_flags(sid):
+    """Flag names for the console's Tab: q is the start of the name (any case), limit at most 200."""
+    return _rizin_call(sid, _rizin_flags)
+
+
+@app.route("/api/rizin/<sid>/seek", methods=["POST"])
+def api_rizin_seek(sid):
+    return _rizin_call(sid, _rizin_seek)
+
+
+@app.route("/api/rizin/<sid>/console", methods=["POST"])
+def api_rizin_console(sid):
+    return _rizin_call(sid, _rizin_console)
+
+
+@app.route("/api/rizin/<sid>/rename", methods=["POST"])
+def api_rizin_rename(sid):
+    return _rizin_call(sid, _rizin_rename)
+
+
+@app.route("/api/rizin/<sid>/comment", methods=["POST"])
+def api_rizin_comment(sid):
+    return _rizin_call(sid, _rizin_comment)
+
+
+@app.route("/api/rizin/<sid>/comment", methods=["GET"])
+def api_rizin_comment_at(sid):
+    """The comment at addr ('' without one), for the right-click menu's Comment… field."""
+    return _rizin_call(sid, _rizin_comment_at)
 
 
 # --- ThreatCheck / DefenderCheck Integration ---
@@ -5634,7 +6594,8 @@ def api_scan_status():
 def api_scan_history():
     """Return the shared scan-history timeline (most recent first).
 
-    Optional ?limit=N caps the number of entries returned.
+    Optional ?limit=N caps the number of entries returned. Each entry says whether the file it scanned
+    (result.filepath) is still there for the RIZIN tab to open (exists, by the rule of the rizin routes).
     """
     history = _load_scan_history()
     try:
@@ -5643,6 +6604,19 @@ def api_scan_history():
             history = history[:limit]
     except (TypeError, ValueError):
         pass
+    found = {}
+
+    def exists(entry):
+        result = entry.get("result")
+        path = result.get("filepath") if isinstance(result, dict) else None
+        if not isinstance(path, str) or not path:
+            return False
+        if path not in found:
+            found[path] = _rizin_listable(path)
+        return found[path]
+
+    if isinstance(history, list):
+        history = [dict(entry, exists=exists(entry)) if isinstance(entry, dict) else entry for entry in history]
     return jsonify({"count": len(history), "history": history})
 
 

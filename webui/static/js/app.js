@@ -383,6 +383,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initHexDropZone();
     initHexResizeHandle();
     initFileMapDropZone();
+    initRizinTab();
     initThreatScan();
     initScoreHistory();
     initSubmissionVerdicts();
@@ -453,6 +454,9 @@ function switchTab(tabName) {
     }
     if (tabName === 'filemap') {
         initFileMapTab();
+    }
+    if (tabName === 'rizin') {
+        rizinTabShown();
     }
 }
 
@@ -4730,10 +4734,11 @@ function renderScanResult(data, container) {
         html += `<pre class="scan-output">${escapeHtml(data.output)}</pre>`;
     }
 
-    // If detected, offer to open in hex editor
+    // If detected, offer to open in hex editor, or in the RIZIN tab
     if (data.detected && data.filepath) {
         html += `<div class="scan-actions">`;
         html += `<button class="btn btn-sm" onclick="hexOpenFile(${jsArg(data.filepath)})">Open in Hex Editor</button>`;
+        html += ` <button class="btn btn-sm" onclick="openInRizin(${jsArg(data.filepath)})" title="Reverse engineer the file in the RIZIN tab">Open in Rizin</button>`;
         html += `</div>`;
     }
 
@@ -4815,12 +4820,17 @@ function renderUnifiedHistory(history) {
     history.forEach((entry, i) => {
         const ts = _histTime(entry).text;
         const st = _histStatus(entry);
+        // The file scanned, while it is still on the VM (the server's exists): Rizin opens it there
+        const path = entry.exists === true && entry.result && typeof entry.result.filepath === 'string' ? entry.result.filepath : '';
         // data-history-index: the point of SCORE HISTORY that leads here
         html += `<div class="scan-history-entry ${st.cls}" data-history-index="${i}" onclick="toggleHistoryDetail(this)">`;
         html += `<span class="scan-history-more">&#9656;</span>`;
         html += `<span class="scan-history-time">${escapeHtml(ts)}</span>`;
         html += `<span class="scan-history-tool">${escapeHtml(entry.tool || '?')}</span>`;
         html += `<span class="scan-history-file" title="${escapeHtml(entry.filename || '')}">${escapeHtml(entry.filename || '--')}</span>`;
+        if (path) {
+            html += `<button class="btn btn-xs" onclick="event.stopPropagation(); openInRizin(${jsArg(path)})" title="Open ${escapeHtml(path)} in the RIZIN tab">Rizin</button>`;
+        }
         html += `<span class="scan-history-status">${escapeHtml(st.text)}</span>`;
         html += `</div>`;
         html += `<div class="scan-history-detail" style="display:none">${renderHistoryDetail(entry)}</div>`;
@@ -5461,18 +5471,35 @@ function hexResetDropZone() {
     zone.querySelector('p').innerHTML = 'Drop a file here or <span class="hex-browse-link" onclick="document.getElementById(\'hex-file-input\').click()">browse</span>';
 }
 
-function hexOpenFile(path) {
-    // Switch to hex tab and load a specific file
+// Switch to the hex tab and load a file there; with an offset (a file offset, as Open in Hex tab of the
+// RIZIN tab gives it) the page starts at its row of 16 and that byte is selected once loaded
+function hexOpenFile(path, offset = null) {
     switchTab('hexeditor');
+    const at = Number.isInteger(offset) && offset >= 0 ? offset : null;
+    const start = at === null ? 0 : at - (at % 16);
     document.getElementById('hex-filepath').value = path;
-    document.getElementById('hex-offset').value = 0;
+    document.getElementById('hex-offset').value = start;
     // Collapse drop zone
     const zone = document.getElementById('hex-drop-zone');
     zone.classList.add('has-file');
     zone.querySelector('p').innerHTML = `<strong>${escapeHtml(path.split('\\').pop())}</strong> <span class="hex-change-file" onclick="hexResetDropZone()">change</span>`;
-    hexLoad();
+    return hexLoad().then(loaded => {
+        if (loaded && at !== null) hexSelectByte(at - start);
+    });
 }
 
+// Rizin in the toolbar: the file loaded here (else the path typed) in the RIZIN tab
+function hexOpenInRizin() {
+    const input = document.getElementById('hex-filepath');
+    const path = state.hexFilePath || (input ? input.value.trim() : '');
+    if (!path) {
+        alert('Load a file first: enter its path, drop it here or browse.');
+        return Promise.resolve(false);
+    }
+    return openInRizin(path);
+}
+
+// Loads the page of the file at the offset given; true once its bytes are shown
 async function hexLoad() {
     const filepath = document.getElementById('hex-filepath').value.trim();
     const offset = parseInt(document.getElementById('hex-offset').value) || 0;
@@ -5480,7 +5507,7 @@ async function hexLoad() {
 
     if (!filepath) {
         alert('Enter a file path to load.');
-        return;
+        return false;
     }
 
     state.hexFilePath = filepath;
@@ -5492,7 +5519,7 @@ async function hexLoad() {
 
         if (data.error) {
             document.getElementById('hex-file-info').innerHTML = `<span class="hex-info-item" style="color:var(--accent-red);">Error: ${escapeHtml(data.error)}</span>`;
-            return;
+            return false;
         }
 
         state.hexFileSize = data.size || 0;
@@ -5524,9 +5551,11 @@ async function hexLoad() {
             if (minimap) minimap.dataset.path = filepath;
             hexRenderMinimap();
         }
+        return true;
 
     } catch (e) {
         document.getElementById('hex-file-info').innerHTML = `<span class="hex-info-item" style="color:var(--accent-red);">Failed: ${escapeHtml(e.message)}</span>`;
+        return false;
     }
 }
 
@@ -8597,6 +8626,7 @@ async function refreshSubmissions() {
             const shortHash = sub.sha256 ? sub.sha256.substring(0, 12) + '...' : '--';
             let actions = sub.file_path
                 ? `<button class="btn btn-xs" onclick="hexOpenFile(${jsArg(sub.file_path)})" title="Open in Hex Editor">Hex</button>`
+                  + ` <button class="btn btn-xs" onclick="openInRizin(${jsArg(sub.file_path)})" title="Open in the RIZIN tab">Rizin</button>`
                 : '';
             // Results: LitterBox's and the EDRs' results if the submission went to LitterBox, else the EDRs'
             const args = submissionResultArgs(sub);
@@ -13298,7 +13328,7 @@ function renderAetherBlock(aether, opts = {}) {
 }
 
 function renderProcessDumpBlock(pd) {
-    let html = `<div class="det-sub-title" data-info="Process Dump writes unpacked modules, hidden modules and loose code from memory to disk and skips the modules in its clean-hash database. Map and Hex open a dump in the file map or the hex editor.">Process Dump &mdash; memory extraction</div>`;
+    let html = `<div class="det-sub-title" data-info="Process Dump writes unpacked modules, hidden modules and loose code from memory to disk and skips the modules in its clean-hash database. Map, Hex and Rizin open a dump in the file map, the hex editor or the RIZIN tab.">Process Dump &mdash; memory extraction</div>`;
     if (pd.error) {
         return html + `<div class="det-sub-value det-warn">${escapeHtml(pd.error)}</div>`;
     }
@@ -13334,6 +13364,7 @@ function renderProcessDumpBlock(pd) {
         html += `<td class="mem-dump-actions">`;
         html += `<button class="btn btn-sm" onclick="fileMapRender(${esc});switchTab('filemap');">Map</button>`;
         html += `<button class="btn btn-sm" onclick="hexOpenFile(${esc})">Hex</button>`;
+        html += `<button class="btn btn-sm" onclick="openInRizin(${esc})" title="Open in the RIZIN tab">Rizin</button>`;
         html += `</td></tr>`;
     });
     html += `</tbody></table>`;
@@ -13735,7 +13766,8 @@ function renderExitCaptureBlock(ec) {
             if (a.is_pe) {
                 html += `<button class="btn btn-sm" onclick="fileMapRender(${esc});switchTab('filemap');">Map</button>`;
             }
-            html += `<button class="btn btn-sm" onclick="hexOpenFile(${esc})">Hex</button></td></tr>`;
+            html += `<button class="btn btn-sm" onclick="hexOpenFile(${esc})">Hex</button>`
+                + `<button class="btn btn-sm" onclick="openInRizin(${esc})" title="Open in the RIZIN tab">Rizin</button></td></tr>`;
         });
         html += `</tbody></table>`;
     }
@@ -14589,4 +14621,3969 @@ function renderNamedPipesBlock(np) {
     });
     html += '</tbody></table>';
     return html;
+}
+
+// =============================================
+// RIZIN
+// =============================================
+// One rizin session on the VM per browser tab (/api/rizin/...): the toolbar,
+// FUNCTIONS, DISASSEMBLY, the GRAPH, and in the dock the CONSOLE, XREFS,
+// STRINGS and IMPORTS, with Rename and Comment on a right-click. Names,
+// instructions, comments, strings and console output come from the file, so
+// they are escaped or set as text. Clicks go to one handler per list,
+// which reads the address from data-addr: a "0x…" string, as every request
+// sends it (JavaScript numbers lose precision above 2^53). rizinSeek() is the
+// one way to jump: it moves the session's seek, then rizinRefreshViews() draws
+// every view at the new place (the views are registered in RIZIN_VIEWS).
+const RIZIN_POLL_MS = 1000;
+const RIZIN_HISTORY_MAX = 200;
+const RIZIN_TAB_KEY = 'tdc-rizin-tab';
+// The graph's sizes and distances in px at zoom 1. Its text is 11 px
+// monospaced (style.css .rizin-graph-svg text); a character is taken as
+// 6.7 px, a little wider than such fonts are, so that a line fits its block.
+// lineMax cuts a long line, linesMax a long block; portGap: the room of each
+// edge on a block's edge; longSpan: an edge over more layers runs around the
+// outside like a loop; readable: the smallest zoom with text in a big
+// function; splitDefault: the code views' share of the width (style.css
+// .rizin-center).
+const RIZIN_GRAPH = {
+    char: 6.7, line: 14, head: 17, padX: 8, padY: 6, lineMax: 60, linesMax: 200, portGap: 6,
+    gapBox: 26, gapDummy: 14, gapLink: 8, gapMin: 36, gapPad: 12, track: 7, trackSep: 6, nudge: 3,
+    lane: 9, laneMargin: 22, margin: 14, longSpan: 30, sweeps: 6, placeSweeps: 6, arrow: 4,
+    reveal: 24, fitStart: 0.75, readable: 0.5, zoomMax: 3, splitDefault: 0.535,
+};
+// From this many blocks the graph is an overview without the instructions
+const RIZIN_GRAPH_OVERVIEW = 200;
+// Below this window width the code views and the graph are tabs of one area
+const RIZIN_NARROW_PX = 1400;
+// The 16 colours of the console. rizin's own theme writes them in 24 bits (scr.color=3) with these
+// values; a colour of the output takes the class of the nearest one
+// (rz-ansi-<name>, its theme's colour in style.css).
+const RIZIN_ANSI = [
+    ['black', 12, 12, 12], ['red', 197, 15, 31], ['green', 19, 161, 14], ['yellow', 193, 156, 0],
+    ['blue', 0, 55, 218], ['magenta', 136, 23, 152], ['cyan', 58, 150, 221], ['white', 204, 204, 204],
+    ['gray', 118, 118, 118], ['bright-red', 231, 72, 86], ['bright-green', 22, 198, 12], ['bright-yellow', 249, 241, 165],
+    ['bright-blue', 59, 120, 255], ['bright-magenta', 180, 0, 158], ['bright-cyan', 97, 214, 214], ['bright-white', 242, 242, 242],
+];
+// The console: commands kept for ↑ ↓, characters and entries of output kept, names asked for by Tab
+// (the flags route gives 200 at most) and names listed when they share no more
+const RIZIN_CONSOLE = { history: 100, keep: 2000000, entries: 300, names: 200, shown: 60 };
+// What Tab completes as a command: rizin 0.9.1's commands that the console's allowlist lets through
+const RIZIN_CONSOLE_COMMANDS = [
+    '?', 'afb', 'afi', 'afl', 'afll', 'afn', 'afvl', 'afx', 'agf', 'axf', 'axt', 'C', 'CC', 'CC-', 'e', 'fl', 'fs',
+    'i', 'iE', 'iI', 'iS', 'ie', 'ih', 'ii', 'il', 'ir', 'is', 'iz', 'izz', 'pd', 'pdf', 'pdg', 'pdr', 'pdsf', 'pif',
+    'ps', 'px', 'pxq', 'pxr', 'pxw', 's', 'sf', '/R', '/x', '/z', 'x',
+];
+// STRINGS and IMPORTS: items per page, and the wait after typing in their filter before it is asked for (ms)
+const RIZIN_PAGE = 200;
+const RIZIN_FILTER_MS = 250;
+// The dock's height (px): at least min, and keep this much of the work area for the views; ↑ ↓ move it by step
+const RIZIN_DOCK = { min: 90, keep: 180, step: 24 };
+// HEX: the bytes shown from the current address
+const RIZIN_HEX_LEN = 512;
+// DISASSEMBLY asks for the next page of a long function this close to its end (px, at least a view's
+// height), and after a failed try waits this long (ms) before it asks again on a scroll; outside functions
+// (rizin reads on through zeros and bytes it cannot decode) it stops after linear lines
+const RIZIN_MORE = { px: 400, wait: 1000, linear: 2000 };
+// The words DECOMPILER shows as C's keywords: C's own and the types rz-ghidra writes
+const RIZIN_C_WORDS = new Set([
+    'auto', 'break', 'case', 'const', 'continue', 'default', 'do', 'else', 'enum', 'extern', 'for', 'goto', 'if',
+    'register', 'return', 'sizeof', 'static', 'struct', 'switch', 'typedef', 'union', 'volatile', 'while', 'void',
+    'char', 'short', 'int', 'long', 'float', 'double', 'signed', 'unsigned', 'bool', 'true', 'false', 'NULL', 'byte',
+    'uchar', 'ushort', 'uint', 'ulong', 'longlong', 'ulonglong', 'code', 'undefined', 'undefined1', 'undefined2',
+    'undefined4', 'undefined8', 'wchar_t', 'size_t',
+]);
+// The views that follow the current place. load(force) brings a view to it:
+// it asks rizin when what the view shows is of another place, and always with
+// force (a finished analysis step may have changed it). The requests go out
+// together, in this order: rizin answers one after the other and each waits
+// up to 2 s for it, so quick views go first. HEX, DECOMPILER, XREFS, STRINGS
+// and IMPORTS ask only while they are shown (STRINGS and IMPORTS come from the
+// server's copy then); XREFS runs several commands and rz-ghidra can take
+// long, so they come last.
+const RIZIN_VIEWS = {
+    disasm: force => rizinLoadDisasm(force),
+    graph: force => rizinLoadGraph(force),
+    hex: force => rizinLoadHex(force),
+    strings: force => rizinLoadList('strings', force),
+    imports: force => rizinLoadList('imports', force),
+    functions: force => (force ? rizinLoadFunctions() : rizinRenderFunctions()),
+    xrefs: force => rizinLoadXrefs(force),
+    decompiler: force => rizinLoadDecompiler(force),
+};
+const rizinState = {
+    session: null,      // the session's ID (/api/rizin/open)
+    tab: '',            // this browser tab's ID (rizinTabId)
+    file: null,         // path, sha256, size, format, arch, bits
+    seek: null,         // the current address, "0x…"
+    func: null,         // the name of the function at seek, or null
+    history: [],        // the addresses jumped to, "0x…", for ◀ ▶
+    historyAt: -1,      // the place of seek in history
+    analysis: null,     // state, step, done_steps, level, elapsed, note
+    ui: { state: '', step: null, reason: null, path: null },   // busy, moved, ended or not-installed
+    note: '',           // why SEEK did not work
+    openNote: '',       // why OPEN or Upload did not work; shown before the session's state
+    opening: false,     // an OPEN waits for its answer
+    functions: null,    // name, offset, size, nbbs by address; null until loaded
+    functionsGen: 0,    // a new list
+    functionsSeq: 0,    // the newest request for the list
+    functionsDone: false,   // the list is the one after the analysis
+    functionsError: '', // why the list could not be loaded (not busy)
+    disasm: null,       // the page shown: session, addr (asked for), function, ops, more
+    views: { code: 'disasm', dock: 'console' },   // the panes shown
+    retry: new Map(),   // the views to ask again once the step that kept rizin busy is over, with their force
+    landed: false,      // the first jump after the analysis was made
+    serverSeek: null,   // the session's seek in /status, the entry point before the first jump
+    openSeq: 0,         // the newest OPEN
+    seekSeq: 0,         // the newest jump
+    seekChain: Promise.resolve(),   // one jump or console command at a time, in order
+    seekKept: new Set(),    // the jumps a console command waits for: they run, also when a newer one waits
+    pollTimer: null,
+    polling: false,
+    pollPaused: false,  // the browser tab is hidden: the poll waits for visibilitychange
+    fnShown: '',        // what the function list shows: session, filter, list (the function only moves the mark)
+    fnPlace: '',        // the session, filter and function the list was scrolled for
+    fnFilterTimer: null,    // typing in the function filter: the list is drawn once it pauses
+    disasmShown: '',    // what DISASSEMBLY shows: place and lines
+    disasmAt: '',       // the place (session, seek) DISASSEMBLY was scrolled for
+    jumpSeq: 0,         // the jumps made: each brings the current place into sight, the place shown too
+    jumpFrom: '',       // who made the last jump (rizinSeek's source): a click in the graph does not move it
+    disasmJump: 0,      // the jump DISASSEMBLY brought into sight
+    graph: null,        // the graph shown: session, addr (asked for), function, nodes, json, layout, gen, big
+    graphGen: 0,        // a new graph
+    graphPending: null, // the graph was wanted while hidden: null, or whether forced
+    graphPlace: '',     // the session and function the view was made for
+    graphView: null,    // scale, x, y: the graph's zoom and its place in the view (px)
+    graphJump: 0,       // the jump the graph brought into sight
+    graphShown: '',     // what the view shows: session, graph, mode, section
+    graphMode: '',      // all, detail (a big graph's text around the view) or overview
+    graphSection: null, // the part of a big graph drawn with its text
+    graphSize: null,    // the size of the view when last measured
+    graphDrag: null,    // a drag that moves the graph
+    graphDragged: false,    // the click that ends a drag does not jump
+    graphSettleTimer: null,
+    layout: { narrow: false, narrowGraph: false, max: '', split: null, dock: null, dockFolded: false },   // tabs below 1400 px, ⇱, the line between the halves, the dock's height and ▾
+    splitDrag: null,    // the line between the halves is being dragged
+    dockDrag: null,     // the dock's ═ is being dragged
+    checked: false,     // /api/rizin/status was asked
+    // The console: the commands typed (↑ ↓ walk them from at; draft: what was being typed), the newest Tab,
+    // the /flags request out (key, ask)
+    console: { history: [], at: 0, draft: '', completing: 0, flags: null },
+    xrefs: null,        // the references shown: session, addr (asked for), data (the route's answer)
+    xrefsPending: null, // XREFS was wanted while hidden: null, or whether forced
+    xrefsShown: '',     // what XREFS shows
+    placeName: null,    // addr, name: what a click in IMPORTS jumped to, for the head of XREFS
+    // STRINGS and IMPORTS: the filter (q) and page (offset) wanted; at: the session, filter and page shown,
+    // with total and items (truncated: the server kept only the first rows rizin listed); seq: the newest
+    // request; stale: to be asked again when shown; shown, shownAt: the markup drawn and the page it was
+    // drawn for
+    lists: {
+        strings: { q: '', offset: 0, total: 0, items: null, truncated: false, at: '', seq: 0, stale: false, problem: '', shown: '', shownAt: '', timer: null },
+        imports: { q: '', offset: 0, total: 0, items: null, truncated: false, at: '', seq: 0, stale: false, problem: '', shown: '', shownAt: '', timer: null },
+    },
+    menu: null,         // the right-click menu: addr, source, name (of the function), comment, action, saving
+    // DECOMPILER: the C shown (session, addr asked for, function, available, reason, lines, gen; or ended: why
+    // the session ended), its newest copy, the request out (session, addr, func, force), what it waits for
+    // while hidden (null, or whether forced), what it shows, the function it was scrolled for, the jump it
+    // brought into sight, and the line clicked (addr, line: it stays marked while it is the place)
+    decompiler: null,
+    decompilerGen: 0,
+    decompilerAsk: null,
+    decompilerPending: null,
+    decompilerShown: '',
+    decompilerAt: '',
+    decompilerJump: 0,
+    decompilerClick: null,
+    // HEX: the bytes shown (session, addr asked for, data: offset, bytes, paddr), the request out, what it
+    // waits for while hidden, what it shows
+    hex: null,
+    hexAsk: null,
+    hexPending: null,
+    hexShown: '',
+    backTo: null,       // Reopen and Take it back: where the tab was (seek, history, at), to land there again
+    analyzing: false,   // POST analyze (Full analysis) waits for its answer
+    statusEpoch: 0,     // Full analysis asked for: a status asked for before it does not count
+    // Decompiles that ended a session (rizin stopped during pdgj), {path, func}: kept over Reopen and other
+    // files (rizinReset leaves it), so DECOMPILER does not run them again on its own (rizinDecompileSlow)
+    decompileSlow: [],
+};
+
+// This browser tab's ID: random and kept in sessionStorage, so a reload of the
+// tab keeps it (the server gives each browser tab one session). With storage
+// blocked the ID lasts as long as the page.
+function rizinTabId() {
+    if (rizinState.tab) return rizinState.tab;
+    let id = null;
+    try {
+        id = sessionStorage.getItem(RIZIN_TAB_KEY);
+    } catch (e) {
+        id = null;
+    }
+    if (!/^[A-Za-z0-9_-]{16,64}$/.test(id || '')) {
+        id = rizinRandomId();
+        try {
+            sessionStorage.setItem(RIZIN_TAB_KEY, id);
+        } catch (e) {
+            // Storage blocked or full: the ID lasts until the page is reloaded.
+        }
+    }
+    rizinState.tab = id;
+    return id;
+}
+
+function rizinRandomId() {
+    const bytes = new Uint8Array(16);
+    if (globalThis.crypto && typeof globalThis.crypto.getRandomValues === 'function') globalThis.crypto.getRandomValues(bytes);
+    else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+    return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// A request of the tab, answered as {ok, status, data, error, state}. state is
+// what a failure means: busy (rizin works on an analysis step or another
+// request), moved (the file is open in another browser tab), ended (the session
+// is gone), not-installed, refused (the reason is in error) or error. busy,
+// moved, ended and not-installed are kept in rizinState.ui, only for this tab's
+// session: the late answer of a session that is gone changes nothing.
+async function rizinApi(path, opts) {
+    opts = opts || {};
+    const init = { method: opts.method || 'GET' };
+    if (opts.body !== undefined) {
+        if (typeof FormData !== 'undefined' && opts.body instanceof FormData) {
+            init.body = opts.body;
+        } else {
+            init.headers = { 'Content-Type': 'application/json' };
+            init.body = JSON.stringify(opts.body);
+        }
+    }
+    let resp;
+    try {
+        resp = await fetch(path, init);
+    } catch (e) {
+        return { ok: false, status: 0, data: {}, error: `the web UI did not answer (${e.message})`, state: 'error' };
+    }
+    let data = null;
+    try {
+        data = await resp.json();
+    } catch (e) {
+        data = null;
+    }
+    if (data === null || typeof data !== 'object') data = {};
+    const sid = /^\/api\/rizin\/([^/?]+)\//.exec(path);
+    const mine = !sid || decodeURIComponent(sid[1]) === rizinState.session;
+    if (resp.ok) {
+        if (mine && rizinState.ui.state === 'busy' && rizinUsesPipe(path)) rizinSetUi('');
+        return { ok: true, status: resp.status, data, error: '', state: '' };
+    }
+    let state = 'error';
+    if (resp.status === 409 && data.busy) state = 'busy';
+    else if (resp.status === 409 && data.moved) state = 'moved';
+    else if (resp.status === 404 && data.error === 'session ended') state = 'ended';
+    else if (resp.status === 503 && data.error === 'rizin not installed') state = 'not-installed';
+    else if (resp.status === 400 && typeof data.refused === 'string') state = 'refused';
+    if (mine && state === 'busy') rizinSetUi('busy', { step: data.step ? String(data.step) : null });
+    else if (mine && state === 'moved') rizinSetUi('moved');
+    // While an OPEN waits, the server may have ended the session it replaces: no "session ended" for it
+    else if (mine && state === 'ended' && !rizinState.opening) {
+        rizinSetUi('ended', { reason: typeof data.reason === 'string' ? data.reason : null });
+    }
+    else if (mine && state === 'not-installed') rizinSetUi('not-installed', { path: typeof data.path === 'string' ? data.path : null });
+    return { ok: false, status: resp.status, data, error: String(data.refused || data.error || `HTTP ${resp.status}`), state };
+}
+
+// Whether a route asks rizin itself (a view, a jump, the console): its answer
+// means that rizin is free. /status, /close and the routes outside a session
+// do not, nor STRINGS, IMPORTS and the flag names, which mostly come from the
+// server's copy.
+function rizinUsesPipe(path) {
+    const m = /^\/api\/rizin\/[^/?]+\/([a-z]+)/.exec(String(path));
+    return !!m && !['status', 'close', 'strings', 'imports', 'flags'].includes(m[1]);
+}
+
+function rizinSetUi(state, extra) {
+    rizinState.ui = { state, step: null, reason: null, path: null, ...extra };
+    if (state === 'moved' || state === 'ended') {
+        rizinStopPoll();
+        rizinState.retry.clear();
+    }
+    rizinRenderState();
+    // Without a session DISASSEMBLY says how rizin gets installed
+    if (state === 'not-installed' && !rizinState.session) rizinRenderDisasm();
+}
+
+// An address as the tab keeps it: "0x" and lower-case hex digits without
+// leading zeros, from a number, a "0x…" string or a decimal string below 2^64;
+// anything else (a name, a negative or broken number) is null.
+function rizinHex(value) {
+    if (typeof value === 'number') {
+        return Number.isInteger(value) && value >= 0 && value < 2 ** 64 ? '0x' + value.toString(16) : null;
+    }
+    if (typeof value !== 'string') return null;
+    const text = value.trim();
+    const hex = /^0x([0-9a-f]{1,16})$/i.exec(text);
+    if (hex) return '0x' + hex[1].toLowerCase().replace(/^0+(?=.)/, '');
+    if (!/^[0-9]{1,20}$/.test(text)) return null;
+    const n = BigInt(text);
+    return n < 2n ** 64n ? '0x' + n.toString(16) : null;
+}
+
+// The number of a "0x…" address, to compare it with the offsets in the
+// server's answers (JSON numbers)
+function rizinNum(hex) {
+    return typeof hex === 'string' && hex.startsWith('0x') ? parseInt(hex.slice(2), 16) : NaN;
+}
+
+// What POST seek gets: an address as "0x…", or a name as typed (the server
+// resolves function and flag names)
+function rizinSeekTarget(value) {
+    return rizinHex(value) || (typeof value === 'string' ? value.trim() : '');
+}
+
+// The colour class of an instruction's mnemonic, from rizin's op type
+function rizinOpClass(type) {
+    const t = String(type || '');
+    if (t.includes('call')) return 'rz-call';
+    if (t.includes('jmp')) return 'rz-jump';
+    return t === 'ret' || t === 'cret' ? 'rz-ret' : '';
+}
+
+// The operands of an instruction as markup: symbols (a letter, then parts
+// joined by dots: sym.main, str.child) in their colour, and the jump or call
+// target (the token that names its address, else the last one) taking a click,
+// with the address in data-addr. The pattern takes the dots as optional and
+// only words with one are coloured: each repeated part starts with a dot that
+// the part before it cannot match, so a long word costs linear time (with the
+// dots required, a long word without one cost quadratic time).
+function rizinOperandsHtml(text, jump) {
+    const symbols = part => part.split(/([A-Za-z_][\w$@?]*(?:\.[\w$@?:-]+)*)/)
+        .map((piece, i) => (i % 2 && piece.includes('.') ? `<span class="rz-sym">${escapeHtml(piece)}</span>`
+            : escapeHtml(piece))).join('');
+    const source = String(text ?? '');
+    const tokens = jump ? [...source.matchAll(/[^\s,[\]()+*]+/g)] : [];
+    const target = tokens.find(m => rizinHex(m[0]) === jump) || tokens[tokens.length - 1];
+    if (!target) return symbols(source);
+    const end = target.index + target[0].length;
+    const symbol = target[0].includes('.') && /^[A-Za-z_][\w$@?]*(?:\.[\w$@?:-]+)*$/.test(target[0]);
+    return symbols(source.slice(0, target.index))
+        + `<span class="rz-target${symbol ? ' rz-sym' : ''}" data-addr="${escapeHtml(jump)}" title="Jump to ${escapeHtml(jump)}">${escapeHtml(target[0])}</span>`
+        + symbols(source.slice(end));
+}
+
+// An instruction's comment (any text: the file's, or the user's) as markup,
+// on one line, with strings in quotes in their colour (a backslash escapes
+// the character after it). Both patterns cost linear time: a run of
+// whitespace is matched once, and every try of the second one at a quote
+// succeeds: a string, or a quote nothing closes, which takes the rest (no
+// later quote can start a string then either).
+function rizinCommentHtml(comment) {
+    const text = String(comment).replace(/\s+/g, space => (space.includes('\n') ? ' ↵ ' : space));
+    let html = '', at = 0;
+    for (const m of text.matchAll(/("(?:[^"\\]|\\[\s\S])*")|"[\s\S]*/g)) {
+        if (!m[1]) break;
+        html += `${escapeHtml(text.slice(at, m.index))}<span class="rz-str">${escapeHtml(m[1])}</span>`;
+        at = m.index + m[1].length;
+    }
+    return `<span class="rz-comment">; ${html}${escapeHtml(text.slice(at))}</span>`;
+}
+
+// The rows of FUNCTIONS: name and size, the address in data-addr and on hover.
+// The filter keeps the functions whose name or address contains it, in any
+// case; current (a name, or an address) is marked.
+function rizinFunctionsHtml(funcs, options) {
+    const { filter = '', current = null } = options || {};
+    const q = String(filter || '').trim().toLowerCase();
+    const at = typeof current === 'string' ? rizinHex(current) : null;
+    let html = '';
+    for (const fn of Array.isArray(funcs) ? funcs : []) {
+        const addr = rizinHex(fn && fn.offset);
+        if (!addr) continue;
+        const name = String(fn.name ?? '');
+        if (q && !name.toLowerCase().includes(q) && !addr.includes(q)) continue;
+        const marked = current !== null && current !== undefined && (name === current || addr === at);
+        html += `<div class="rizin-fn${marked ? ' current' : ''}" data-addr="${addr}" title="${addr} · ${escapeHtml(name)}">`
+            + `<span class="rizin-fn-name">${escapeHtml(name)}</span><span class="rizin-fn-size">${escapeHtml(fn.size ?? '')}</span></div>`;
+    }
+    return html;
+}
+
+// The lines of DISASSEMBLY: address, the mnemonic in the colour of its kind,
+// operands and comment. Each line carries its address in data-addr; the one
+// that holds current (an address) is marked.
+function rizinDisasmHtml(ops, options) {
+    const { current = null } = options || {};
+    const at = rizinNum(rizinHex(current));
+    let marked = false;
+    let html = '';
+    for (const op of Array.isArray(ops) ? ops : []) {
+        const addr = rizinHex(op && op.offset);
+        if (!addr) continue;
+        const size = Number.isInteger(op.size) && op.size > 0 ? op.size : 1;
+        const here = !marked && at >= op.offset && at < op.offset + size;
+        marked = marked || here;
+        const [, mnemonic, operands] = /^(\S*)\s*([\s\S]*)$/.exec(String(op.text ?? ''));
+        const kind = rizinOpClass(op.type);
+        html += `<div class="rizin-op${here ? ' current' : ''}" data-addr="${addr}"><span class="rz-addr">${addr}</span> `
+            + `<span class="rz-mnem${kind ? ' ' + kind : ''}">${escapeHtml(mnemonic)}</span>`
+            + (operands ? ' ' + rizinOperandsHtml(operands, rizinHex(op.jump)) : '')
+            + (op.comment ? '  ' + rizinCommentHtml(op.comment) : '') + '</div>';
+    }
+    return html;
+}
+
+// The analysis in the toolbar: what runs or ran, at which level, how long (no time of 0 s: a project
+// restored, an analysis just started); between two steps of Full analysis, the step finished last
+function rizinAnalysisText(analysis) {
+    if (!analysis || typeof analysis !== 'object') return '';
+    const level = analysis.level ? ` (${analysis.level})` : '';
+    const time = Number.isFinite(analysis.elapsed) && analysis.elapsed > 0 ? ` ${analysis.elapsed.toFixed(1)} s` : '';
+    const done = Array.isArray(analysis.done_steps) && analysis.done_steps.length ? analysis.done_steps[analysis.done_steps.length - 1] : '';
+    if (analysis.state === 'running') return `analysing${analysis.step ? ` (${analysis.step})` : done ? ` (${done} done)` : level}${time}`;
+    if (analysis.state === 'done') return `analysed${level}${time}`;
+    if (analysis.state === 'stopped') return `analysis stopped${level}${time}`;
+    return analysis.state === 'failed' ? 'analysis failed' : '';
+}
+
+// Format, architecture and size of the open file: "PE64 · x86-64 · 151.7 KB"
+function rizinFileTag(file) {
+    if (!file) return '';
+    const arch = file.arch ? String(file.arch) + (file.bits ? `-${file.bits}` : '') : '';
+    return [file.format ? String(file.format).toUpperCase() : '', arch,
+            Number.isFinite(file.size) ? formatSize(file.size) : ''].filter(Boolean).join(' · ');
+}
+
+// The entries of OPEN ▾: submitted samples, dumps and uploads (/api/rizin/files),
+// each a button with its path in data-path
+function rizinOpenSourcesHtml(files) {
+    const list = key => (files && Array.isArray(files[key]) ? files[key] : []);
+    const section = (title, items, label, meta) => `<div class="rizin-open-section"><div class="rizin-open-head">${title}`
+        + `<span class="rizin-open-n">${items.length}</span></div>`
+        + (items.length ? items.map(item => `<button type="button" class="rizin-open-item" data-path="${escapeHtml(item.path)}" title="${escapeHtml(item.path)}">`
+            + `<span class="rizin-open-name">${escapeHtml(label(item))}</span><span class="rizin-open-meta">${escapeHtml(meta(item))}</span></button>`).join('')
+            : '<div class="rizin-open-empty">none</div>')
+        + '</div>';
+    const when = time => String(time || '').replace('T', ' ').slice(0, 16);
+    return section('SUBMISSIONS', list('submissions'), item => item.filename || item.path, item => when(item.time))
+        + section('DUMPS', list('dumps'), item => item.name || item.path, item => formatSize(item.size))
+        + section('UPLOADS', list('uploads'), item => String(item.name || item.path).replace(/^[0-9a-f]{16}_/, ''),
+                  item => formatSize(item.size));
+}
+
+// A new session (the answer of /api/rizin/open): what the tab showed before goes.
+// The console keeps what it printed and its history, with a line that names
+// the new file; STRINGS and IMPORTS keep their filters.
+function rizinReset(described) {
+    rizinStopPoll();
+    Object.assign(rizinState, {
+        session: described.session,
+        file: described.file && typeof described.file === 'object' ? described.file : null,
+        analysis: described.analysis && typeof described.analysis === 'object' ? described.analysis : null,
+        seek: null, func: null, history: [], historyAt: -1, note: '', openNote: '', functions: null,
+        functionsDone: false, functionsError: '', disasm: null, retry: new Map(), landed: false, serverSeek: null,
+        fnShown: '', fnPlace: '', disasmShown: '', disasmAt: '',
+        graph: null, graphPending: null, graphPlace: '', graphView: null, graphShown: '', graphMode: '', graphSection: null,
+        graphDrag: null, graphDragged: false, xrefs: null, xrefsPending: null, xrefsShown: '', placeName: null,
+        decompiler: null, decompilerAsk: null, decompilerPending: null, decompilerShown: '', decompilerAt: '',
+        decompilerClick: null, hex: null, hexAsk: null, hexPending: null, hexShown: '', backTo: null,
+    });
+    for (const list of Object.values(rizinState.lists)) {
+        if (list.timer !== null) clearTimeout(list.timer);
+        Object.assign(list, { offset: 0, total: 0, items: null, truncated: false, at: '', stale: false, problem: '', shown: '', shownAt: '', timer: null });
+        list.seq++;                     // a late page of the old session is dropped
+    }
+    rizinState.functionsGen++;
+    rizinState.seekSeq++;           // a jump of the old session that still waits does not happen
+    rizinState.seekKept.clear();
+    rizinCloseMenu();
+    // The lists of the file before go at once: their rows' addresses would go to the new session
+    rizinRenderList('strings');
+    rizinRenderList('imports');
+    rizinRenderXrefs();
+    rizinRenderDecompiler();
+    rizinRenderHex();
+    if (rizinState.file) rizinConsoleNote(`${rizinState.file.path ?? ''}`, 'file');
+    rizinSetUi('');
+}
+
+// Opens a file in this tab's session (the server ends the tab's old one); the
+// analysis starts at once, the status poll follows it. While the OPEN waits,
+// the session it replaces is not polled; if it fails, its reason shows and
+// the old session goes on. back (Reopen, Take it back): the place the tab
+// showed, to land there instead of at main (rizinLand). The file the tab has
+// open already (a Rizin button for it) comes back as the same session: the
+// place, the history and the views stay.
+async function rizinOpen(path, back) {
+    const target = String(path ?? '').trim();
+    if (!target) return false;
+    const seq = ++rizinState.openSeq;
+    rizinStopPoll();
+    rizinCloseOpenMenu();
+    rizinState.openNote = '';
+    rizinState.opening = true;
+    rizinRenderState();
+    rizinRenderFile(`Opening ${target}…`);
+    const r = await rizinApi('/api/rizin/open', { method: 'POST', body: { path: target, tab: rizinTabId() } });
+    if (seq !== rizinState.openSeq) return false;           // a newer OPEN
+    rizinState.opening = false;
+    if (!r.ok || typeof r.data.session !== 'string' || !r.data.session) {
+        rizinState.openNote = r.ok ? 'the server answered without a session' : r.error;
+        rizinRenderToolbar();
+        rizinPollSoon();
+        return false;
+    }
+    if (!back && r.data.session === rizinState.session) {
+        if (r.data.file && typeof r.data.file === 'object') rizinState.file = r.data.file;
+        if (r.data.analysis && typeof r.data.analysis === 'object') rizinState.analysis = r.data.analysis;
+        rizinRenderToolbar();
+        rizinPollSoon();
+        return true;
+    }
+    rizinReset(r.data);
+    // Reopen, Take it back: the history is back at once, so that a jump made while the tab lands goes on from it
+    rizinState.backTo = back && back.seek ? back : null;
+    if (rizinState.backTo) Object.assign(rizinState, { history: back.history.slice(), historyAt: back.at });
+    await rizinRefreshViews();
+    if (rizinState.analysis && rizinState.analysis.state === 'running') {
+        // Between two steps rizin answers; else the list is busy, and the poll asks again.
+        rizinLoadFunctions();
+        rizinSchedulePoll();
+    } else {
+        rizinSchedulePoll(0);
+    }
+    return true;
+}
+
+// Opens a file of the VM in the RIZIN tab; the "Rizin" buttons of other tabs call it. The OPEN goes out
+// first, so that showing the tab does not ask for the session it replaces (rizinCheckSession)
+function openInRizin(path) {
+    const opened = rizinOpen(path);
+    switchTab('rizin');
+    return opened;
+}
+
+function rizinOpenPath() {
+    const input = document.getElementById('rizin-path');
+    return rizinOpen(input ? input.value : '');
+}
+
+// Upload (OPEN ▾ or a file dropped on the tab): stored on the VM, then opened
+async function rizinUpload(file) {
+    if (!file) return false;
+    rizinCloseOpenMenu();
+    rizinRenderFile(`Uploading ${file.name} (${formatSize(file.size)})…`);
+    const form = new FormData();
+    form.append('file', file);
+    const r = await rizinApi('/api/rizin/upload', { method: 'POST', body: form });
+    if (!r.ok || typeof r.data.path !== 'string') {
+        rizinState.openNote = r.ok ? 'the upload has no path' : r.error;
+        rizinRenderToolbar();
+        return false;
+    }
+    return rizinOpen(r.data.path);
+}
+
+async function rizinLoadFiles() {
+    const box = document.getElementById('rizin-open-sources');
+    if (!box) return;
+    box.innerHTML = '<div class="rizin-open-empty">Loading…</div>';
+    const r = await rizinApi('/api/rizin/files');
+    box.innerHTML = r.ok ? rizinOpenSourcesHtml(r.data) : `<div class="rizin-open-empty">${escapeHtml(r.error)}</div>`;
+}
+
+function rizinToggleOpenMenu() {
+    const menu = document.getElementById('rizin-open-menu');
+    if (!menu) return;
+    if (!menu.hidden) {
+        rizinCloseOpenMenu();
+        return;
+    }
+    menu.hidden = false;
+    document.getElementById('rizin-open-toggle')?.setAttribute('aria-expanded', 'true');
+    document.getElementById('rizin-path')?.focus();
+    rizinLoadFiles();
+}
+
+function rizinCloseOpenMenu(focusButton = false) {
+    const menu = document.getElementById('rizin-open-menu');
+    const button = document.getElementById('rizin-open-toggle');
+    if (menu) menu.hidden = true;
+    if (!button) return;
+    button.setAttribute('aria-expanded', 'false');
+    if (focusButton) button.focus();
+}
+
+function rizinOnOpenSourceClick(event) {
+    const item = event.target && event.target.closest ? event.target.closest('[data-path]') : null;
+    if (item) rizinOpen(item.getAttribute('data-path'));
+}
+
+function rizinSchedulePoll(delay = RIZIN_POLL_MS) {
+    rizinStopPoll();
+    rizinState.pollTimer = setTimeout(rizinPoll, delay);
+}
+
+function rizinStopPoll() {
+    if (rizinState.pollTimer !== null) clearTimeout(rizinState.pollTimer);
+    rizinState.pollTimer = null;
+}
+
+// A view or a jump found rizin busy: the poll runs again, if it does not
+function rizinPollSoon() {
+    if (rizinState.pollTimer === null && !rizinState.polling && rizinNeedsPoll()) rizinSchedulePoll();
+}
+
+// The status is asked while the analysis runs, while rizin is busy or a view
+// waits for it, and until the first jump after the analysis; then it stops,
+// so that an unused session ends after its idle time. Never for a session
+// that moved or ended, nor while an OPEN waits (it may replace the session).
+function rizinNeedsPoll() {
+    if (!rizinState.session || rizinState.opening) return false;
+    if (rizinState.ui.state === 'moved' || rizinState.ui.state === 'ended') return false;
+    const running = !!rizinState.analysis && rizinState.analysis.state === 'running';
+    return running || rizinState.retry.size > 0 || !rizinState.landed || rizinState.ui.state === 'busy';
+}
+
+// /status never waits for rizin. It shows the analysis; once that is over the
+// tab makes its first jump. When a step of the analysis has finished (the
+// last one too), every view is asked for again at once: rizin serves requests
+// before its next step. A view that found rizin busy is asked again once the
+// step that kept it busy is over, or rizin answered another request since
+// (busy goes then as well). The poll pauses while the browser tab is hidden,
+// like the other polls of the page. An answer to a status asked for before
+// Full analysis was (statusEpoch) is dropped: it may say the analysis is over.
+async function rizinPoll() {
+    rizinState.pollTimer = null;
+    if (typeof document !== 'undefined' && document.hidden) {
+        rizinState.pollPaused = true;
+        return;
+    }
+    // The poll before (of the file opened before this one) still waits for its answer: this one comes next
+    if (rizinState.polling) {
+        rizinSchedulePoll();
+        return;
+    }
+    const sid = rizinState.session, epoch = rizinState.statusEpoch;
+    if (!rizinNeedsPoll()) return;
+    rizinState.polling = true;
+    try {
+        const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/status`);
+        // Another session meanwhile, an OPEN waits that may replace this one, or Full analysis since
+        if (sid !== rizinState.session || rizinState.opening || !r.ok || epoch !== rizinState.statusEpoch) return;
+        const before = rizinState.analysis;
+        const analysis = r.data.analysis && typeof r.data.analysis === 'object' ? r.data.analysis : null;
+        rizinState.analysis = analysis;
+        if ('seek' in r.data) rizinState.serverSeek = r.data.seek;
+        rizinRenderAnalysis();
+        rizinRenderPrompt();
+        const running = !!analysis && analysis.state === 'running';
+        const step = running ? analysis.step || null : null;
+        const busy = rizinState.ui.state === 'busy' ? rizinState.ui.step : null;
+        const free = busy === null || step !== busy;
+        const stepped = !!analysis && !!before && Array.isArray(analysis.done_steps)
+            && analysis.done_steps.length > (Array.isArray(before.done_steps) ? before.done_steps.length : 0);
+        // An analysis that ran after the first jump (Full analysis) is over
+        const over = !running && !!before && before.state === 'running';
+        if (!running && !rizinState.landed) {
+            await rizinLand();
+        } else if ((running && stepped) || over) {
+            await rizinReloadViews();
+        } else if (rizinState.retry.size && free) {
+            await rizinRetryViews();
+        } else if (rizinState.ui.state === 'busy' && free) {
+            rizinSetUi('');
+        }
+    } finally {
+        rizinState.polling = false;
+        // The next poll for the session shown now, which may be another one than this poll's
+        if (rizinState.pollTimer === null && rizinNeedsPoll()) rizinSchedulePoll();
+    }
+}
+
+// Every view registered in RIZIN_VIEWS (but skip) asked for again, all at
+// once, so that each request counts as waiting while rizin answers the others
+// (the gap after a step stays open for them); the views that wait in retry
+// are among them.
+async function rizinReloadViews(skip) {
+    rizinState.retry.clear();
+    const names = Object.keys(RIZIN_VIEWS).filter(name => !(skip || []).includes(name));
+    await Promise.all(names.map(name => RIZIN_VIEWS[name](true)));
+}
+
+// Once the analysis is over: the whole function list, and one jump, to main
+// or sym.main if there is one, else to where rizin stands (the entry point),
+// so that the toolbar names the function. After Reopen or Take it back
+// (backTo) the jump goes back to the place the tab showed, with its history.
+// A jump the user made before stays, and the views at that place are asked
+// for again (the last step may have changed them). A list that cannot be
+// loaded (not busy) shows why, and the tab lands without it: the poll stops,
+// so the session can still end when unused.
+async function rizinLand() {
+    const sid = rizinState.session;
+    if (!sid || rizinState.landed) return false;
+    // The list once more after the analysis; not again for a jump that found rizin busy
+    if (!rizinState.functionsDone) {
+        const loaded = await rizinLoadFunctions();
+        if (sid !== rizinState.session || rizinState.landed) return false;
+        if (!loaded && !rizinState.functionsError) return false;
+    }
+    const back = rizinState.backTo;
+    // A jump the user made before stays: after Reopen or Take it back one in this session (the history is back
+    // since the file opened, rizinOpen)
+    const stay = back ? !!rizinState.seek : rizinState.history.length > 0;
+    const funcs = rizinState.functions || [];
+    const main = funcs.find(fn => fn.name === 'main') || funcs.find(fn => fn.name === 'sym.main');
+    const target = stay ? null : rizinHex(main ? main.offset : rizinState.serverSeek);
+    // The jump draws every view at the new place: back where the tab was, else (or if that failed and no jump
+    // came meanwhile) main
+    if (!stay && back) {
+        const moved = await rizinSeek(back.seek, 'history');
+        if (sid !== rizinState.session) return false;
+        if (!moved && rizinState.ui.state === 'busy') return false;
+        if (!moved && !rizinState.seek && target && !(await rizinSeek(target, 'open')) && rizinState.ui.state === 'busy') {
+            return false;
+        }
+    } else if (target && !(await rizinSeek(target, 'open')) && rizinState.ui.state === 'busy') {
+        return false;
+    }
+    if (sid !== rizinState.session) return false;
+    rizinState.backTo = null;
+    rizinState.landed = true;
+    if (stay) await rizinReloadViews(['functions']);
+    else if (!target && !rizinState.seek) await rizinRefreshViews();
+    return true;
+}
+
+// The views that found rizin busy, each as forced as it was asked for, at once
+async function rizinRetryViews() {
+    const retry = new Map(rizinState.retry);
+    rizinState.retry.clear();
+    const names = Object.keys(RIZIN_VIEWS).filter(name => retry.has(name));
+    await Promise.all(names.map(name => RIZIN_VIEWS[name](retry.get(name))));
+}
+
+// A view found rizin busy: the poll asks for it again (forced if it was, or
+// if an earlier try was) once the step that kept rizin busy is over
+function rizinViewBusy(name, force) {
+    rizinState.retry.set(name, !!force || !!rizinState.retry.get(name));
+    rizinPollSoon();
+}
+
+async function rizinLoadFunctions() {
+    const sid = rizinState.session;
+    if (!sid) return false;
+    const seq = ++rizinState.functionsSeq;
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/functions`);
+    if (sid !== rizinState.session || seq !== rizinState.functionsSeq) return false;
+    if (!r.ok) {
+        if (r.state === 'busy') rizinViewBusy('functions', true);
+        // Not busy (rizin answered something it should not, the web UI did not answer): asking again
+        // every second would not help
+        rizinState.functionsError = r.state === 'error' || r.state === 'refused' ? r.error : '';
+        rizinRenderFunctions();
+        return false;
+    }
+    rizinState.retry.delete('functions');
+    const funcs = Array.isArray(r.data) ? r.data : [];
+    // The same list again (a step found nothing new) is not drawn again: a selection in it stays
+    if (!rizinState.functions || JSON.stringify(funcs) !== JSON.stringify(rizinState.functions)) {
+        // The current function under another name now (an analysis step or a rename): the place keeps it
+        const before = (rizinState.functions || []).find(f => f && f.name === rizinState.func);
+        const now = before && !funcs.some(f => f && f.name === rizinState.func) ? funcs.find(f => f && f.offset === before.offset) : null;
+        if (now && typeof now.name === 'string') rizinState.func = now.name;
+        rizinState.functions = funcs;
+        rizinState.functionsGen++;
+    }
+    rizinState.functionsError = '';
+    rizinState.functionsDone = !rizinState.analysis || rizinState.analysis.state !== 'running';
+    rizinRenderFunctions();
+    rizinRenderLocation();
+    return true;
+}
+
+// Whether the page of instructions shown is the one for the current place:
+// asked for at this address, or of the current function and holding it
+function rizinPageHolds(page) {
+    if (!page || page.session !== rizinState.session) return false;
+    if (page.addr === rizinState.seek) return true;
+    const at = rizinNum(rizinState.seek);
+    return page.function === rizinState.func
+        && page.ops.some(op => at >= op.offset && at < op.offset + (Number.isInteger(op.size) && op.size > 0 ? op.size : 1));
+}
+
+// DISASSEMBLY at seek: the page shown when it holds seek and is of the same
+// function (unless force: a finished analysis step may have changed it), else
+// the function around seek (from its start to a little after seek), linear
+// outside functions. A page that cannot be loaded for the new place shows
+// why (busy: until the poll finds rizin free, and asks as forced as now)
+// instead of the old one. A forced answer that a jump dropped is asked for
+// again, forced: the jump finds the old page holding its place when it lies
+// in it, and asks rizin nothing.
+async function rizinLoadDisasm(force) {
+    const sid = rizinState.session, seek = rizinState.seek;
+    if (sid && seek && (force || !rizinPageHolds(rizinState.disasm))) {
+        const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/disasm?addr=${encodeURIComponent(seek)}`);
+        if (sid !== rizinState.session || seek !== rizinState.seek) {      // a later jump draws
+            if (force && sid === rizinState.session) rizinViewBusy('disasm', true);
+            return false;
+        }
+        if (!r.ok) {
+            if (r.state === 'busy') rizinViewBusy('disasm', force);
+            rizinRenderDisasm(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); the instructions follow.`
+                : `The instructions could not be loaded: ${r.error}`);
+            return false;
+        }
+        rizinState.retry.delete('disasm');
+        rizinState.disasm = { session: sid, addr: seek, function: typeof r.data.function === 'string' ? r.data.function : null,
+                              ops: Array.isArray(r.data.ops) ? r.data.ops : [], more: !!r.data.more };
+    }
+    rizinRenderDisasm();
+    return true;
+}
+
+// The one way to jump: POST seek with the address as "0x…" (or a name), then
+// every view at the new place. addr: a number, "0x…" or a function or flag
+// name; source: who asked (functions, disasm, target, seek, open, history…;
+// history walks the history instead of adding to it). One jump at a time and
+// in order: a jump asked for while another one waits takes its place, unless
+// a console command typed after it waits for it (seekKept); only the newest
+// jump draws the views, and only the place it draws goes into the history (◀ ▶
+// walk the places shown, not those of jumps a newer one replaced).
+async function rizinSeek(addr, source = '') {
+    const sid = rizinState.session;
+    const target = rizinSeekTarget(addr);
+    if (!sid || !target) return false;
+    const ticket = ++rizinState.seekSeq;
+    const previous = rizinState.seekChain;
+    let release;
+    rizinState.seekChain = new Promise(resolve => { release = resolve; });
+    let r = null;
+    try {
+        await previous;
+        if ((ticket === rizinState.seekSeq || rizinState.seekKept.has(ticket)) && sid === rizinState.session) {
+            r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/seek`, { method: 'POST', body: { addr: target } });
+        }
+    } finally {
+        release();
+    }
+    if (!r || sid !== rizinState.session) return false;
+    const seek = r.ok ? rizinHex(r.data.seek) : null;
+    if (seek) {
+        rizinState.seek = seek;
+        rizinState.func = typeof r.data.function === 'string' && r.data.function ? r.data.function : null;
+        rizinState.note = '';
+        rizinState.openNote = '';
+        // The views bring the place into sight, also when they show it already (the user scrolled away)
+        rizinState.jumpSeq++;
+        rizinState.jumpFrom = source;
+    } else {
+        rizinState.note = r.state === 'refused' || r.state === 'error' ? r.error : '';
+        if (r.state === 'busy') rizinPollSoon();
+    }
+    // A newer jump draws the views itself. The place drawn is where rizin is now: this jump's, or (if it did
+    // not happen) that of a jump it replaced whose answer moved rizin
+    if (ticket === rizinState.seekSeq) {
+        if (source !== 'history' && rizinState.seek) rizinPushHistory(rizinState.seek);
+        await rizinRefreshViews();
+    }
+    return !!seek;
+}
+
+function rizinPushHistory(addr) {
+    const history = rizinState.history;
+    if (history[rizinState.historyAt] === addr) return;
+    history.splice(rizinState.historyAt + 1);
+    history.push(addr);
+    if (history.length > RIZIN_HISTORY_MAX) history.splice(0, history.length - RIZIN_HISTORY_MAX);
+    rizinState.historyAt = history.length - 1;
+}
+
+// ◀ ▶: the next place in the history at once (so that another click goes on
+// from there); a step that did not happen (rizin busy) is taken back.
+async function rizinHistoryStep(delta) {
+    const from = rizinState.historyAt, at = from + delta;
+    if (!rizinState.session || at < 0 || at >= rizinState.history.length) return false;
+    rizinState.historyAt = at;
+    rizinRenderLocation();
+    const moved = await rizinSeek(rizinState.history[at], 'history');
+    if (!moved && rizinState.historyAt === at && rizinState.seek !== rizinState.history[at]) {
+        rizinState.historyAt = from;
+        rizinRenderLocation();
+    }
+    return moved;
+}
+
+function rizinGo() {
+    const input = document.getElementById('rizin-seek');
+    const value = input ? input.value.trim() : '';
+    return value ? rizinSeek(value, 'seek') : Promise.resolve(false);
+}
+
+// After a jump: the toolbar, and every view registered in RIZIN_VIEWS at the
+// new place, all at once
+async function rizinRefreshViews() {
+    rizinRenderToolbar();
+    await Promise.all(Object.values(RIZIN_VIEWS).map(load => load(false)));
+}
+
+function rizinRenderToolbar() {
+    rizinRenderFile();
+    rizinRenderAnalysis();
+    rizinRenderState();
+    rizinRenderLocation();
+}
+
+// The open file: its path, format, architecture and size, and its SHA256
+// (shortened, in full on hover); note: what happens instead (opening, uploading)
+function rizinRenderFile(note) {
+    const file = rizinState.session ? rizinState.file : null;
+    const path = document.getElementById('rizin-file-path');
+    const tag = document.getElementById('rizin-file-tag');
+    const sha = document.getElementById('rizin-file-sha');
+    if (path) {
+        path.textContent = note || (file ? String(file.path ?? '') : 'No file open');
+        path.title = note || (file ? String(file.path ?? '') : '');
+    }
+    if (tag) {
+        tag.textContent = rizinFileTag(file);
+        tag.hidden = !tag.textContent;
+    }
+    if (sha) {
+        const full = file && typeof file.sha256 === 'string' ? file.sha256 : '';
+        sha.textContent = full.length > 16 ? `${full.slice(0, 8)}…${full.slice(-8)}` : full;
+        sha.title = full;
+        sha.hidden = !full;
+    }
+}
+
+function rizinRenderAnalysis() {
+    const el = document.getElementById('rizin-analysis');
+    const analysis = rizinState.session ? rizinState.analysis : null;
+    if (el) {
+        const text = rizinAnalysisText(analysis);
+        el.textContent = text;
+        el.title = analysis && analysis.note ? String(analysis.note) : text;
+        el.hidden = !text;
+        el.className = 'rizin-analysis' + (analysis && analysis.state ? ' rizin-analysis-' + cssToken(analysis.state) : '');
+    }
+    // Why a stopped analysis stopped, and Full analysis, follow the analysis
+    rizinRenderState();
+}
+
+// The session's state in a few words: rizin not installed (with its path)
+// first, then why an OPEN failed (also when the session it was to replace
+// ended meanwhile), the file open in another tab (Take it back), the session
+// ended (Reopen), busy, why SEEK did not work, why the analysis stopped. Full
+// analysis is offered for a file analysed with aa (over 20 MB, or after aaa
+// had to stop) and for an analysis that stopped (Full analysis goes on with
+// the steps left). In a narrow toolbar the texts are cut, in full on hover.
+// The state is a live region: it is written only when its text changes.
+function rizinRenderState() {
+    const ui = rizinState.ui;
+    const analysis = rizinState.session ? rizinState.analysis : null;
+    const halted = !!analysis && (analysis.state === 'stopped' || analysis.state === 'failed') && typeof analysis.note === 'string'
+        ? analysis.note : '';
+    const texts = {
+        busy: [`busy (${ui.step || 'rizin'})`, 'rizin works on an analysis step or another request; the views follow once it is free.'],
+        moved: ['Open in another tab', 'This file is open in another browser tab now. Take it back opens it here again.'],
+        ended: ['Session ended', ui.reason || 'The session ended: unused for 30 minutes, its page left, or rizin stopped. Reopen opens the file again.'],
+        'not-installed': [`rizin not installed${ui.path ? ': ' + ui.path : ''}`,
+                          `rizin is not installed on the VM${ui.path ? ` (${ui.path})` : ''}; scripts/install-rizin.ps1 installs it.`],
+    };
+    let kind = '', text = '', title = '';
+    if (ui.state === 'not-installed') [kind, [text, title]] = [ui.state, texts[ui.state]];
+    else if (rizinState.openNote) [kind, text] = ['note', rizinState.openNote];
+    else if (texts[ui.state]) [kind, [text, title]] = [ui.state, texts[ui.state]];
+    else if (rizinState.note) [kind, text] = ['note', rizinState.note];
+    else if (halted) [kind, text] = ['stopped', halted];
+    const el = document.getElementById('rizin-state');
+    if (el) {
+        const className = 'rizin-state' + (kind ? ' rizin-state-' + kind : '');
+        if (el.textContent !== text) el.textContent = text;
+        if (el.title !== (title || text)) el.title = title || text;
+        if (el.hidden !== !text) el.hidden = !text;
+        if (el.className !== className) el.className = className;
+    }
+    // Take it back and Reopen open the same file again in this tab
+    const action = document.getElementById('rizin-state-btn');
+    const again = rizinState.file && (ui.state === 'moved' || ui.state === 'ended') ? ui.state : '';
+    if (action) {
+        action.hidden = !again;
+        action.disabled = rizinState.opening;
+        if (again) {
+            action.textContent = again === 'moved' ? 'Take it back' : 'Reopen';
+            action.title = again === 'moved' ? 'Open the file in this tab again; the other tab then says it is open elsewhere'
+                : 'Open the file again, back at the place shown';
+        }
+    }
+    const full = document.getElementById('rizin-full');
+    if (full) {
+        full.hidden = !analysis || analysis.state === 'running' || (analysis.level !== 'aa' && analysis.state !== 'stopped')
+            || ['moved', 'ended', 'not-installed'].includes(ui.state);
+        full.disabled = rizinState.analyzing || rizinState.opening;
+    }
+    // A state or its buttons need the room: the file's details give way (style.css .rizin-crowded)
+    const bar = document.getElementById('rizin-toolbar');
+    if (bar) bar.classList.toggle('rizin-crowded', !!text || !!again || (!!full && !full.hidden));
+}
+
+// SEEK shows where the views are: the name of the function at its start, else
+// the address (also in data-addr). A name that was refused stays, to be
+// corrected; without a place yet (another file opened) it is empty again. The
+// name of the place changed (a rename, an analysis step): SEEK shows the new
+// one, unless the user typed over what it showed (data-shown). ◀ ▶ follow the
+// history, the console's prompt the place.
+function rizinRenderLocation() {
+    const input = document.getElementById('rizin-seek');
+    const seek = rizinState.session ? rizinState.seek : null;
+    if (input && seek) {
+        const fn = (rizinState.functions || []).find(f => f.name === rizinState.func);
+        const text = fn && rizinHex(fn.offset) === seek ? rizinState.func : seek;
+        const shown = input.getAttribute('data-shown');
+        if (input.getAttribute('data-addr') !== seek || (shown !== text && input.value === shown)) {
+            input.value = text;
+            input.setAttribute('data-addr', seek);
+            input.setAttribute('data-shown', text);
+        }
+    } else if (input && !seek && input.hasAttribute('data-addr')) {
+        input.value = '';
+        input.removeAttribute('data-addr');
+        input.removeAttribute('data-shown');
+    }
+    if (input) input.title = seek ? `${seek}${rizinState.func ? ' in ' + rizinState.func : ''}` : '';
+    const back = document.getElementById('rizin-back');
+    const forward = document.getElementById('rizin-forward');
+    if (back) back.disabled = !seek || rizinState.historyAt <= 0;
+    if (forward) forward.disabled = !seek || rizinState.historyAt >= rizinState.history.length - 1;
+    rizinRenderPrompt();
+}
+
+// FUNCTIONS, drawn again when the list or the filter changes; another
+// function only moves the mark. A new function, filter or file brings the
+// current function into sight; a list drawn again for the analysis keeps the
+// rows in sight where they are (the user may be reading while it runs).
+function rizinRenderFunctions() {
+    const list = document.getElementById('rizin-fn-list');
+    if (!list) return;
+    const input = document.getElementById('rizin-fn-filter');
+    const filter = input ? input.value : '';
+    const funcs = rizinState.session ? rizinState.functions : null;
+    const running = !!rizinState.analysis && rizinState.analysis.state === 'running';
+    const failed = rizinState.functionsError;
+    const place = JSON.stringify([rizinState.session, filter, rizinState.func]);
+    const rows = JSON.stringify([rizinState.session, filter, rizinState.functionsGen, funcs ? null : [running, failed]]);
+    if (rows === rizinState.fnShown) {
+        // The same rows (10 000 functions are about 1.7 MB of markup): the mark goes to the current function
+        if (funcs && place !== rizinState.fnPlace) {
+            const func = rizinState.func;
+            rizinMoveMark(list, '.rizin-fn', func === null ? []
+                : funcs.filter(fn => fn && String(fn.name ?? '') === func).map(fn => rizinHex(fn.offset)).filter(Boolean));
+            rizinState.fnPlace = place;
+        }
+        return;
+    }
+    rizinState.fnShown = rows;
+    const anchor = place === rizinState.fnPlace ? rizinScrollAnchor(list) : null;
+    const html = funcs ? rizinFunctionsHtml(funcs, { filter, current: rizinState.func }) : '';
+    const empty = !rizinState.session ? 'No file open.'
+        : !funcs ? (failed ? `The functions could not be loaded: ${failed}` : running ? 'Analysing…' : 'Loading the functions…')
+            : funcs.length ? 'No function matches the filter.' : 'rizin found no functions.';
+    list.innerHTML = html || `<div class="rizin-empty">${escapeHtml(empty)}</div>`;
+    const count = document.getElementById('rizin-fn-count');
+    if (count) {
+        const shown = (html.match(/class="rizin-fn[ "]/g) || []).length;
+        count.textContent = !funcs ? '' : filter.trim() ? `${shown} of ${funcs.length} functions`
+            : `${funcs.length} functions · address on hover`;
+    }
+    if (anchor) rizinRestoreScroll(list, anchor);
+    else rizinReveal(list, list.querySelector('.rizin-fn.current'));
+    rizinState.fnPlace = funcs ? place : '';
+}
+
+// Typing in the filter of FUNCTIONS draws the list once the typing pauses (RIZIN_FILTER_MS)
+function rizinOnFunctionFilter() {
+    if (rizinState.fnFilterTimer !== null) clearTimeout(rizinState.fnFilterTimer);
+    rizinState.fnFilterTimer = setTimeout(() => {
+        rizinState.fnFilterTimer = null;
+        rizinRenderFunctions();
+    }, RIZIN_FILTER_MS);
+}
+
+// DISASSEMBLY: the page when it holds the current place, else why not
+// (problem: busy or an error; else it is on its way). A jump brings the
+// current line into sight, also when the page shows it already; another
+// place in the lines shown only moves the mark (a page of 20 000
+// instructions is about 4 MB of markup); the page drawn again at the same
+// place (a step of the analysis changed it) keeps the lines in sight where
+// they are, and the same lines are not drawn again at all (a selection
+// stays). Under the last line of a function that goes on, a line says how
+// its next page comes (rizinLoadMore).
+function rizinRenderDisasm(problem) {
+    const pane = document.getElementById('rizin-disasm');
+    if (!pane) return;
+    const title = document.getElementById('rizin-code-title');
+    const page = rizinState.disasm;
+    if (!rizinState.session || !rizinState.seek || !rizinPageHolds(page)) {
+        const ui = rizinState.ui;
+        const text = !rizinState.session
+            ? (ui.state === 'not-installed'
+                ? `rizin is not installed on the VM: ${ui.path || 'rizin.exe'} is missing. scripts/install-rizin.ps1 installs it.`
+                : 'Open a file with OPEN ▾: a submitted sample, a dump, an upload or a path on the VM.')
+            : rizinState.seek ? problem || 'Loading…' : 'No address yet: click a function, or enter an address or a name in SEEK.';
+        pane.innerHTML = `<div class="rizin-empty">${escapeHtml(text)}</div>`;
+        if (title) title.textContent = (rizinState.session && (rizinState.func || rizinState.seek)) || 'DISASSEMBLY';
+        rizinState.disasmShown = '';
+        rizinState.disasmAt = '';
+        return;
+    }
+    if (title) title.textContent = page.function || rizinState.seek;
+    const at = JSON.stringify([rizinState.session, rizinState.seek]);
+    // The lines as JSON, once for each list of them (a page that loads on gets a new one)
+    if (page.linesOf !== page.ops) Object.assign(page, { lines: JSON.stringify(page.ops), linesOf: page.ops });
+    const shown = JSON.stringify([rizinState.session, page.function, page.more, !!page.capped]) + page.lines;
+    const jumped = rizinState.disasmJump !== rizinState.jumpSeq;
+    // Without a size (another code view chosen, GRAPH below 1400 px, the RIZIN tab in the background) the
+    // place cannot be scrolled into sight: rizinCodeShown does it once DISASSEMBLY is in sight again
+    if (pane.clientHeight > 0) rizinState.disasmJump = rizinState.jumpSeq;
+    if (shown === rizinState.disasmShown) {
+        if (at !== rizinState.disasmAt) {
+            rizinState.disasmAt = at;
+            const seek = rizinNum(rizinState.seek);
+            const op = page.ops.find(o => seek >= o.offset && seek < o.offset + (Number.isInteger(o.size) && o.size > 0 ? o.size : 1));
+            rizinMoveMark(pane, '.rizin-op', op ? [rizinHex(op.offset)].filter(Boolean) : []);
+        } else if (jumped) {
+            rizinReveal(pane, pane.querySelector('.rizin-op.current'));
+        }
+        return;
+    }
+    const anchor = at === rizinState.disasmAt && !jumped ? rizinScrollAnchor(pane) : null;
+    rizinState.disasmShown = shown;
+    rizinState.disasmAt = at;
+    const end = `The linear disassembly stops here, after ${RIZIN_MORE.linear} instructions: enter a later address in SEEK to read on.`;
+    pane.innerHTML = (page.ops.length ? rizinDisasmHtml(page.ops, { current: rizinState.seek })
+        : '<div class="rizin-empty">No instructions at this address.</div>')
+        + (page.more ? `<div class="rizin-more" title="The instructions go on below">${escapeHtml(rizinMoreText(page))}</div>`
+            : page.capped ? `<div class="rizin-disasm-end">${escapeHtml(end)}</div>` : '');
+    if (anchor) rizinRestoreScroll(pane, anchor);
+    else rizinReveal(pane, pane.querySelector('.rizin-op.current'));
+    // Lines that do not reach the end of the view yet: the next page at once (only while in sight)
+    rizinDisasmCatchUp();
+}
+
+// A click on a function jumps to it
+function rizinOnFunctionClick(event) {
+    const row = event.target && event.target.closest ? event.target.closest('[data-addr]') : null;
+    if (row) rizinSeek(row.getAttribute('data-addr'), 'functions');
+}
+
+// A click on an instruction moves there, on a jump or call target jumps to it;
+// not when the click ends a selection of text. A click on the line under the
+// last one asks for the next page at once.
+function rizinOnDisasmClick(event) {
+    const more = event.target && event.target.closest ? event.target.closest('.rizin-more') : null;
+    if (more) {
+        if (rizinState.disasm) rizinState.disasm.moreTried = 0;
+        rizinLoadMore();
+        return;
+    }
+    if (typeof window.getSelection === 'function' && String(window.getSelection())) return;
+    const el = event.target && event.target.closest ? event.target.closest('[data-addr]') : null;
+    if (el) rizinSeek(el.getAttribute('data-addr'), el.classList.contains('rz-target') ? 'target' : 'disasm');
+}
+
+// DISASSEMBLY / DECOMPILER / HEX and CONSOLE / XREFS / STRINGS / IMPORTS: a
+// click on a tab shows its pane. Below 1400 px GRAPH is a tab of the code
+// views too: it shows the graph in their place.
+function rizinOnTabClick(event) {
+    const tab = event.target && event.target.closest ? event.target.closest('[data-rizin-tab]') : null;
+    const group = tab && tab.closest('[data-rizin-tabs]');
+    const panel = group && group.closest('.rizin-half, .rizin-dock');
+    if (!panel) return;
+    const name = tab.getAttribute('data-rizin-tab');
+    const kind = group.getAttribute('data-rizin-tabs');
+    if (kind === 'dock') {
+        rizinShowDock(name);
+        return;
+    }
+    if (kind === 'code') {
+        rizinState.layout.narrowGraph = name === 'graph';
+        if (name === 'graph') {
+            rizinApplyCenterLayout();
+            return;
+        }
+    }
+    group.querySelectorAll('[data-rizin-tab]').forEach(t => t.setAttribute('aria-selected', String(t === tab)));
+    panel.querySelectorAll('[data-rizin-pane]').forEach(pane => { pane.hidden = pane.getAttribute('data-rizin-pane') !== name; });
+    rizinState.views[kind] = name;
+    // DECOMPILER and HEX load what they waited for, DISASSEMBLY a page shorter than the view its next one
+    // (unless the halves' layout did, bringing the code views back)
+    if (kind === 'code' && !rizinApplyCenterLayout()) rizinCodeShown(name);
+}
+
+// « folds FUNCTIONS into a narrow strip, » brings it back (until the page is reloaded)
+function rizinToggleFunctions() {
+    const work = document.getElementById('rizin-work');
+    if (!work) return;
+    const folded = work.classList.toggle('rizin-fn-folded');
+    const button = document.getElementById('rizin-fn-fold');
+    if (!button) return;
+    const label = folded ? 'Show the function list' : 'Fold the function list away';
+    button.textContent = folded ? '»' : '«';
+    button.title = label;
+    button.setAttribute('aria-label', label);
+    button.setAttribute('aria-expanded', String(!folded));
+}
+
+// Scrolls a list so that el shows, to the middle when it was out of sight.
+// Only the list scrolls (it is el's offsetParent), never the tab.
+function rizinReveal(container, el) {
+    if (!container || !el) return;
+    const top = el.offsetTop, height = el.offsetHeight, view = container.clientHeight;
+    if (![top, height, view].every(Number.isFinite) || !view) return;
+    if (top >= container.scrollTop && top + height <= container.scrollTop + view) return;
+    container.scrollTop = Math.max(0, top - Math.round((view - height) / 2));
+}
+
+// The mark (.current) of a list drawn already moves to its rows (selector) of the addresses addrs
+// (data-addr), and the first of them comes into sight; the rows are not drawn again
+function rizinMoveMark(container, selector, addrs) {
+    for (const el of container.querySelectorAll(`${selector}.current`)) {
+        if (!addrs.includes(el.getAttribute('data-addr'))) el.classList.remove('current');
+    }
+    for (const addr of addrs) container.querySelector(`${selector}[data-addr="${addr}"]`)?.classList.add('current');
+    rizinReveal(container, container.querySelector(`${selector}.current`));
+}
+
+// What a scrolled list shows at its top: the first row in sight (its
+// data-addr) and how far it is from the top, to put it back there when the
+// list is drawn again. At the top the list stays at the top.
+function rizinScrollAnchor(container) {
+    const top = container.scrollTop;
+    if (!Number.isFinite(top) || top <= 0) return { top: 0, addr: null, delta: 0 };
+    for (const row of Array.from(container.children)) {
+        const addr = row.getAttribute('data-addr');
+        if (addr && Number.isFinite(row.offsetTop) && row.offsetTop + row.offsetHeight > top) {
+            return { top, addr, delta: row.offsetTop - top };
+        }
+    }
+    return { top, addr: null, delta: 0 };
+}
+
+// The list drawn again: the same row at the same height, else the same scroll
+// position (rows that came in above the ones in sight push the list on)
+function rizinRestoreScroll(container, anchor) {
+    const row = anchor.addr ? Array.from(container.children).find(r => r.getAttribute('data-addr') === anchor.addr) : null;
+    const top = row && Number.isFinite(row.offsetTop) ? row.offsetTop - anchor.delta : anchor.top;
+    container.scrollTop = Math.max(0, top);
+}
+
+// --- GRAPH: the control flow graph of the current function ---
+// rizinLayoutGraph places the blocks in layers, rizinGraphSvg draws them; the
+// SVG is moved and scaled with a CSS transform (rizinState.graphView), so a
+// drag or a zoom draws nothing again. From RIZIN_GRAPH_OVERVIEW blocks the
+// graph is an overview without the instructions until the user zooms in;
+// then only the part around the view has its text.
+
+// A block's box: as wide as its longest line (cut at lineMax), as high as its
+// lines (at most linesMax, then one "… n more") under the address
+function rizinGraphBoxSize(node) {
+    const g = RIZIN_GRAPH;
+    const lines = node && Array.isArray(node.lines) ? node.lines : [];
+    const shown = Math.min(lines.length, g.linesMax);
+    let chars = Math.max(14, (rizinHex(node && node.offset) || '').length);
+    for (let i = 0; i < shown; i++) chars = Math.max(chars, Math.min(String(lines[i] ?? '').length, g.lineMax));
+    return { w: Math.ceil(chars * g.char) + 2 * g.padX, h: 2 * g.padY + g.head + (shown + (lines.length > shown ? 1 : 0)) * g.line };
+}
+
+// How many links between neighbouring layers cross: per pair of layers the
+// links by their upper end, and those whose lower ends come in the other order
+// (counted with a Fenwick tree)
+function rizinGraphCrossings(rows, pos, links, down) {
+    let total = 0;
+    for (let r = 0; r + 1 < rows.length; r++) {
+        const size = rows[r + 1].length + 1;
+        const keys = [];
+        for (const a of rows[r]) for (const id of down[a]) keys.push(pos[a] * size + pos[links[id].b]);
+        const sorted = Float64Array.from(keys).sort();
+        const tree = new Int32Array(size + 1);
+        sorted.forEach((key, seen) => {
+            const b = key % size;
+            let below = 0;
+            for (let i = b + 1; i > 0; i -= i & -i) below += tree[i];
+            total += seen - below;
+            for (let i = b + 1; i <= size; i += i & -i) tree[i]++;
+        });
+    }
+    return total;
+}
+
+// The places in one layer nearest to where its items want to be (desired,
+// with their weights), in their order and apart by gaps: the weighted
+// isotonic regression of desired minus the gaps before each item (pool
+// adjacent violators), linear in the items
+function rizinGraphPlaceLayer(row, desired, weight, gaps, x) {
+    const offset = new Float64Array(row.length);
+    for (let i = 1; i < row.length; i++) offset[i] = offset[i - 1] + gaps[i];
+    const sums = [], weights = [], counts = [];
+    for (let i = 0; i < row.length; i++) {
+        let sum = weight[i] * (desired[i] - offset[i]), w = weight[i], count = 1;
+        while (sums.length && sums[sums.length - 1] / weights[weights.length - 1] >= sum / w) {
+            sum += sums.pop();
+            w += weights.pop();
+            count += counts.pop();
+        }
+        sums.push(sum);
+        weights.push(w);
+        counts.push(count);
+    }
+    for (let k = 0, i = 0; k < sums.length; k++) {
+        for (let j = 0; j < counts[k]; j++, i++) x[row[i]] = sums[k] / weights[k] + offset[i];
+    }
+}
+
+// The layout of a function's blocks (the graph route's nodes, the entry
+// first): {width, height, boxes: [{offset, x, y, w, h}], edges: [{from, to,
+// kind, back, points}]}, pure and the same for the same nodes.
+// - Edges: a conditional jump's target (kind jump) and fall-through (fail),
+//   else unconditional (plain), switch cases plain; once per pair of blocks.
+// - Loops: a depth-first search from the entry, then from each block not
+//   reached; an edge to a block on the path is a back edge.
+// - Layers: the longest path to each block without the back edges, so every
+//   block lies below the blocks it comes from.
+// - Order in each layer: by the barycentre of the neighbours, sweeping down
+//   and up; the order with the fewest crossings is kept. An edge across
+//   layers passes each layer between in a column of its own.
+// - Places: per layer as near as the order allows to the ports of the
+//   neighbours (rizinGraphPlaceLayer), sweeping down and up.
+// - Edges in right angles: down from the block's lower edge, across in the
+//   gap below the layer (a track of its own where they overlap), down into
+//   the next block's upper edge. Back edges and edges over more than longSpan
+//   layers run around the outside, in lanes left or right of all blocks.
+// Time about O((B + E + D) log(B + D)) per sweep for B blocks, E edges and D
+// layers passed by edges (at most longSpan per edge).
+function rizinLayoutGraph(nodes) {
+    const g = RIZIN_GRAPH;
+    const list = [], index = new Map();
+    for (const node of Array.isArray(nodes) ? nodes : []) {
+        if (!node || !Number.isFinite(node.offset) || index.has(node.offset)) continue;
+        index.set(node.offset, list.length);
+        list.push(node);
+    }
+    const n = list.length;
+    if (!n) return { width: 0, height: 0, boxes: [], edges: [] };
+    const edges = [], outs = list.map(() => []);
+    list.forEach((node, i) => {
+        const targets = new Set();
+        const add = (target, kind) => {
+            const j = index.get(target);
+            if (j === undefined || targets.has(j)) return;
+            targets.add(j);
+            outs[i].push(edges.length);
+            edges.push({ id: edges.length, from: i, to: j, kind, back: false, lane: false, links: [] });
+        };
+        const jump = index.has(node.jump) ? node.jump : null, fail = index.has(node.fail) ? node.fail : null;
+        const both = jump !== null && fail !== null && jump !== fail;
+        if (jump !== null) add(jump, both ? 'jump' : 'plain');
+        if (fail !== null) add(fail, both ? 'fail' : 'plain');
+        for (const target of Array.isArray(node.cases) ? node.cases : []) add(target, 'plain');
+    });
+
+    // Loops, and the order in which the search met the blocks
+    const state = new Uint8Array(n), pre = new Int32Array(n);
+    let met = 0;
+    for (let root = 0; root < n; root++) {
+        if (state[root]) continue;
+        state[root] = 1;
+        pre[root] = met++;
+        const path = [root], next = [0];
+        while (path.length) {
+            const v = path[path.length - 1], k = next[next.length - 1];
+            if (k < outs[v].length) {
+                next[next.length - 1]++;
+                const e = edges[outs[v][k]];
+                if (state[e.to] === 1) e.back = true;
+                else if (!state[e.to]) {
+                    state[e.to] = 1;
+                    pre[e.to] = met++;
+                    path.push(e.to);
+                    next.push(0);
+                }
+            } else {
+                state[v] = 2;
+                path.pop();
+                next.pop();
+            }
+        }
+    }
+
+    // Layers: the longest path without the back edges
+    const rank = new Int32Array(n), waiting = new Int32Array(n);
+    for (const e of edges) if (!e.back) waiting[e.to]++;
+    const queue = [];
+    for (let v = 0; v < n; v++) if (!waiting[v]) queue.push(v);
+    for (let q = 0; q < queue.length; q++) {
+        const v = queue[q];
+        for (const id of outs[v]) {
+            const e = edges[id];
+            if (e.back) continue;
+            rank[e.to] = Math.max(rank[e.to], rank[v] + 1);
+            if (!--waiting[e.to]) queue.push(e.to);
+        }
+    }
+    let layers = 0;
+    for (let v = 0; v < n; v++) layers = Math.max(layers, rank[v] + 1);
+
+    // Items: the blocks, then one per layer an edge passes; links join items of neighbouring layers.
+    // A block is at least as wide as its ports need (a switch with many cases), each portGap apart.
+    const sizes = list.map(rizinGraphBoxSize);
+    const ins = new Int32Array(n);
+    for (const e of edges) ins[e.to]++;
+    const layerOf = Array.from(rank), dummyOf = new Array(n).fill(-1);
+    const itemW = sizes.map((s, v) => Math.max(s.w, (Math.max(outs[v].length, ins[v]) + 1) * g.portGap));
+    const up = list.map(() => []), down = list.map(() => []), links = [];
+    const link = (a, b, e) => {
+        links.push({ a, b, e, fa: 0, fb: 0 });
+        down[a].push(links.length - 1);
+        up[b].push(links.length - 1);
+        return links.length - 1;
+    };
+    for (const e of edges) {
+        e.lane = e.back || rank[e.to] - rank[e.from] > g.longSpan;
+        if (e.lane) continue;
+        let prev = e.from;
+        for (let r = rank[e.from] + 1; r < rank[e.to]; r++) {
+            const d = layerOf.length;
+            layerOf.push(r);
+            itemW.push(0);
+            dummyOf.push(e.id);
+            up.push([]);
+            down.push([]);
+            e.links.push(link(prev, d, e.id));
+            prev = d;
+        }
+        e.links.push(link(prev, e.to, e.id));
+    }
+    const items = layerOf.length;
+    const isDummy = v => dummyOf[v] >= 0;
+
+    // Order: first as the search met them, then by barycentres (a block's
+    // ports by their place on it: the jump left of the fall-through)
+    let rows = Array.from({ length: layers }, () => []);
+    const key = new Float64Array(items);
+    for (let v = 0; v < items; v++) {
+        key[v] = isDummy(v) ? pre[edges[dummyOf[v]].from] + 0.5 : pre[v];
+        rows[layerOf[v]].push(v);
+    }
+    for (const row of rows) row.sort((a, b) => key[a] - key[b] || a - b);
+    const pos = new Int32Array(items);
+    const number = row => row.forEach((v, i) => { pos[v] = i; });
+    rows.forEach(number);
+    const ports = () => {
+        for (let v = 0; v < items; v++) {
+            down[v].forEach((id, k) => { links[id].fa = (k + 1) / (down[v].length + 1) - 0.5; });
+            up[v].forEach((id, k) => { links[id].fb = (k + 1) / (up[v].length + 1) - 0.5; });
+        }
+    };
+    ports();
+    const bary = new Float64Array(items);
+    const sortRow = (row, fromAbove) => {
+        for (const v of row) {
+            const near = fromAbove ? up[v] : down[v];
+            let sum = 0;
+            for (const id of near) sum += fromAbove ? pos[links[id].a] + links[id].fa : pos[links[id].b] + links[id].fb;
+            bary[v] = near.length ? sum / near.length : pos[v];
+        }
+        row.sort((a, b) => bary[a] - bary[b] || pos[a] - pos[b]);
+        number(row);
+    };
+    let best = rows.map(row => row.slice()), fewest = rizinGraphCrossings(rows, pos, links, down);
+    for (let sweep = 0; sweep < g.sweeps && fewest > 0; sweep++) {
+        for (let r = 1; r < layers; r++) sortRow(rows[r], true);
+        for (let r = layers - 2; r >= 0; r--) sortRow(rows[r], false);
+        const crossings = rizinGraphCrossings(rows, pos, links, down);
+        if (crossings < fewest) {
+            fewest = crossings;
+            best = rows.map(row => row.slice());
+        }
+    }
+    rows = best;
+    rows.forEach(number);
+    // The ports of each item in the order of the items they lead to
+    for (let v = 0; v < items; v++) {
+        down[v].sort((p, q) => pos[links[p].b] - pos[links[q].b] || p - q);
+        up[v].sort((p, q) => pos[links[p].a] - pos[links[q].a] || p - q);
+    }
+    ports();
+
+    // Places: packed, then near the ports of the neighbours, layer by layer
+    const x = new Float64Array(items);
+    const gap = (a, b) => (itemW[a] + itemW[b]) / 2
+        + (!isDummy(a) && !isDummy(b) ? g.gapBox : isDummy(a) && isDummy(b) ? g.gapLink : g.gapDummy);
+    const gapsOf = rows.map(row => row.map((v, i) => (i ? gap(row[i - 1], v) : 0)));
+    rows.forEach((row, r) => {
+        let at = 0;
+        row.forEach((v, i) => { at += gapsOf[r][i]; x[v] = at; });
+        row.forEach(v => { x[v] -= at / 2; });
+    });
+    const place = (r, fromAbove) => {
+        const row = rows[r], desired = new Float64Array(row.length), weight = new Float64Array(row.length);
+        row.forEach((v, i) => {
+            const near = fromAbove ? up[v] : down[v];
+            if (!near.length) {
+                desired[i] = x[v];
+                weight[i] = 0.01;
+                return;
+            }
+            let sum = 0;
+            for (const id of near) {
+                const l = links[id], other = fromAbove ? l.a : l.b;
+                sum += x[other] + itemW[other] * (fromAbove ? l.fa : l.fb) - itemW[v] * (fromAbove ? l.fb : l.fa);
+            }
+            desired[i] = sum / near.length;
+            weight[i] = isDummy(v) ? 4 : 1;
+        });
+        rizinGraphPlaceLayer(row, desired, weight, gapsOf[r], x);
+    };
+    for (let sweep = 0; sweep < g.placeSweeps; sweep++) {
+        for (let r = 1; r < layers; r++) place(r, true);
+        for (let r = layers - 2; r >= 0; r--) place(r, false);
+    }
+    const half = v => Math.round(v * 2) / 2;
+    let minX = Infinity, maxX = -Infinity;
+    for (let v = 0; v < items; v++) {
+        x[v] = half(x[v]);
+        minX = Math.min(minX, x[v] - itemW[v] / 2);
+        maxX = Math.max(maxX, x[v] + itemW[v] / 2);
+    }
+
+    // Lanes outside the blocks, on the nearer side; nested loops further out,
+    // edges whose gaps do not meet share a lane
+    const laned = edges.filter(e => e.lane);
+    const lanesOf = { left: [], right: [] };
+    for (const e of laned) {
+        e.side = (x[e.from] + x[e.to]) / 2 < (minX + maxX) / 2 ? 'left' : 'right';
+        e.lo = Math.min(rank[e.from], rank[e.to] - 1);
+        e.hi = Math.max(rank[e.from], rank[e.to] - 1);
+    }
+    laned.sort((p, q) => p.hi - p.lo - (q.hi - q.lo) || p.lo - q.lo || p.id - q.id);
+    for (const e of laned) {
+        const lanes = lanesOf[e.side];
+        let k = lanes.findIndex(used => used.every(([lo, hi]) => e.hi < lo || e.lo > hi));
+        if (k < 0) k = lanes.push([]) - 1;
+        lanes[k].push([e.lo, e.hi]);
+        e.laneX = e.side === 'left' ? minX - g.laneMargin - k * g.lane : maxX + g.laneMargin + k * g.lane;
+    }
+    const leftmost = lanesOf.left.length ? minX - g.laneMargin - (lanesOf.left.length - 1) * g.lane : minX;
+    const rightmost = lanesOf.right.length ? maxX + g.laneMargin + (lanesOf.right.length - 1) * g.lane : maxX;
+
+    // Ports on the blocks' edges, in the order of where their edges go
+    const top = new Float64Array(links.length), bottom = new Float64Array(links.length);
+    links.forEach((l, id) => { top[id] = x[l.a]; bottom[id] = x[l.b]; });
+    const laneFrom = list.map(() => []), laneTo = list.map(() => []);
+    for (const e of laned) {
+        laneFrom[e.from].push(e);
+        laneTo[e.to].push(e);
+    }
+    for (let v = 0; v < n; v++) {
+        const left = x[v] - itemW[v] / 2;
+        const spread = (all, set) => {
+            all.sort((p, q) => p[0] - q[0] || p[1] - q[1]);
+            all.forEach(([, , item], k) => set(item, half(left + itemW[v] * (k + 1) / (all.length + 1))));
+        };
+        spread(down[v].map(id => [x[links[id].b], id, id]).concat(laneFrom[v].map(e => [e.laneX, links.length + e.id, e])),
+               (item, px) => { if (typeof item === 'number') top[item] = px; else item.outX = px; });
+        spread(up[v].map(id => [x[links[id].a], id, id]).concat(laneTo[v].map(e => [e.laneX, links.length + e.id, e])),
+               (item, px) => { if (typeof item === 'number') bottom[item] = px; else item.inX = px; });
+    }
+
+    // Tracks in the gap below each layer (gap -1 above the first): a
+    // horizontal piece of its own wherever two pieces would overlap
+    const pieces = Array.from({ length: layers + 1 }, () => []);
+    const gapOf = r => pieces[r + 1];
+    const leaving = Array.from({ length: layers }, () => []), entering = Array.from({ length: layers }, () => []);
+    for (const e of laned) {
+        leaving[rank[e.from]].push(e);
+        entering[rank[e.to]].push(e);
+    }
+    for (let r = 0; r + 1 < layers; r++) {
+        const tops = new Set(), bottoms = new Set();
+        const bends = [];
+        for (const a of rows[r]) {
+            for (const id of down[a]) {
+                const b = links[id].b;
+                if (Math.abs(top[id] - bottom[id]) < 1) {
+                    // Straight down: a column passed on keeps the line straight
+                    bottom[id] = top[id];
+                    if (isDummy(b)) {
+                        x[b] = top[id];
+                        for (const next of down[b]) top[next] = top[id];
+                    }
+                } else {
+                    tops.add(top[id]);
+                    bends.push(id);
+                }
+                bottoms.add(bottom[id]);
+            }
+        }
+        for (const e of leaving[r]) tops.add(e.outX);
+        for (const e of entering[r + 1]) bottoms.add(e.inX);
+        // A line that turns down where another one comes down would run on top of it: a little aside,
+        // where no other line comes down or goes on, and on its block
+        const shift = (at, b) => {
+            if (!tops.has(at)) return at;
+            const left = x[b] - itemW[b] / 2, right = x[b] + itemW[b] / 2;
+            for (const step of [g.nudge, -g.nudge, 2 * g.nudge, -2 * g.nudge]) {
+                const to = at + step;
+                if (tops.has(to) || bottoms.has(to) || (!isDummy(b) && (to <= left + 1 || to >= right - 1))) continue;
+                bottoms.add(to);
+                return to;
+            }
+            return at;
+        };
+        for (const id of bends) {
+            const b = links[id].b, moved = shift(bottom[id], b);
+            if (moved === bottom[id]) continue;
+            bottom[id] = moved;
+            if (isDummy(b)) {
+                x[b] = moved;
+                for (const next of down[b]) top[next] = moved;
+            }
+        }
+        for (const e of entering[r + 1]) e.inX = shift(e.inX, e.to);
+        for (const id of bends) gapOf(r).push({ lo: Math.min(top[id], bottom[id]), hi: Math.max(top[id], bottom[id]), id, link: id });
+    }
+    for (const e of laned) {
+        gapOf(rank[e.from]).push({ lo: Math.min(e.outX, e.laneX), hi: Math.max(e.outX, e.laneX), id: links.length + 2 * e.id, leave: e });
+        gapOf(rank[e.to] - 1).push({ lo: Math.min(e.inX, e.laneX), hi: Math.max(e.inX, e.laneX), id: links.length + 2 * e.id + 1, enter: e });
+    }
+    const tracks = pieces.map(gapPieces => {
+        gapPieces.sort((p, q) => p.lo - q.lo || p.hi - q.hi || p.id - q.id);
+        const ends = [];
+        for (const piece of gapPieces) {
+            let t = ends.findIndex(end => end + g.trackSep < piece.lo);
+            if (t < 0) t = ends.push(0) - 1;
+            ends[t] = piece.hi;
+            piece.track = t;
+        }
+        return ends.length;
+    });
+
+    // Heights: each layer as its highest block, each gap as its tracks
+    const layerH = new Float64Array(layers);
+    for (let v = 0; v < n; v++) layerH[rank[v]] = Math.max(layerH[rank[v]], sizes[v].h);
+    const gapH = pieces.map((_, i) => (tracks[i] ? Math.max(g.gapMin, 2 * g.gapPad + (tracks[i] - 1) * g.track)
+        : i > 0 && i < layers ? g.gapMin : 0));
+    const layerY = new Float64Array(layers), gapY = new Float64Array(layers + 1);
+    let y = g.margin;
+    for (let i = 0; i <= layers; i++) {
+        if (i) {
+            layerY[i - 1] = y;
+            y += layerH[i - 1];
+        }
+        gapY[i] = y;
+        y += gapH[i];
+    }
+    const trackY = (r, t) => gapY[r + 1] + (gapH[r + 1] - (tracks[r + 1] - 1) * g.track) / 2 + t * g.track;
+    const trackOf = new Map();
+    pieces.forEach(gapPieces => gapPieces.forEach(p => trackOf.set(p.link !== undefined ? 'l' + p.link : p.leave ? 'o' + p.leave.id : 'i' + p.enter.id, p.track)));
+
+    // Points, moved right by the room of the lanes on the left; a point on the
+    // line through its neighbours (or the same as the one before) is dropped
+    const dx = g.margin - leftmost;
+    const point = (px, py) => [px + dx, py];
+    const tidy = pts => {
+        const out = [];
+        for (const p of pts) {
+            const last = out[out.length - 1], prev = out[out.length - 2];
+            if (last && last[0] === p[0] && last[1] === p[1]) continue;
+            if (prev && ((prev[0] === last[0] && last[0] === p[0]) || (prev[1] === last[1] && last[1] === p[1]))) out.pop();
+            out.push(p);
+        }
+        return out;
+    };
+    const result = edges.map(e => {
+        const from = e.from, to = e.to;
+        let pts;
+        if (e.lane) {
+            const leaveY = trackY(rank[from], trackOf.get('o' + e.id)), enterY = trackY(rank[to] - 1, trackOf.get('i' + e.id));
+            pts = [point(e.outX, layerY[rank[from]] + sizes[from].h), point(e.outX, leaveY), point(e.laneX, leaveY),
+                   point(e.laneX, enterY), point(e.inX, enterY), point(e.inX, layerY[rank[to]])];
+        } else {
+            pts = [point(top[e.links[0]], layerY[rank[from]] + sizes[from].h)];
+            for (const id of e.links) {
+                if (top[id] === bottom[id]) continue;
+                const ty = trackY(layerOf[links[id].a], trackOf.get('l' + id));
+                pts.push(point(top[id], ty), point(bottom[id], ty));
+            }
+            pts.push(point(bottom[e.links[e.links.length - 1]], layerY[rank[to]]));
+        }
+        return { from: list[from].offset, to: list[to].offset, kind: e.kind, back: e.back, points: tidy(pts) };
+    });
+    return {
+        width: rightmost - leftmost + 2 * g.margin,
+        height: y + g.margin,
+        boxes: list.map((node, v) => ({ offset: node.offset, x: x[v] - itemW[v] / 2 + dx, y: layerY[rank[v]], w: itemW[v], h: sizes[v].h })),
+        edges: result,
+    };
+}
+
+// The box of the block that holds address at (a number), or null
+function rizinGraphBoxAt(layout, nodes, at) {
+    if (!layout || !Array.isArray(layout.boxes) || !Number.isFinite(at)) return null;
+    const size = new Map();
+    for (const node of Array.isArray(nodes) ? nodes : []) {
+        if (node && Number.isFinite(node.offset) && !size.has(node.offset)) {
+            size.set(node.offset, Number.isInteger(node.size) && node.size > 0 ? node.size : 1);
+        }
+    }
+    let found = null;
+    for (const box of layout.boxes) {
+        if (box.offset <= at && at < box.offset + (size.get(box.offset) || 1) && (!found || box.offset > found.offset)) found = box;
+    }
+    return found;
+}
+
+// The graph as SVG: the edges in the colour of their kind (a class each),
+// then the blocks, each a group with its address in data-addr and a title;
+// the block of current (an address) is marked. overview: no instructions
+// and no arrow heads; section {x, y, w, h}: only the blocks that reach into
+// it have their text. Every text of the file is escaped.
+function rizinGraphSvg(layout, graph, options) {
+    const { current = null, overview = false, section = null } = options || {};
+    if (!layout || !Array.isArray(layout.boxes) || !layout.boxes.length) return '';
+    const g = RIZIN_GRAPH;
+    const nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
+    const byOffset = new Map();
+    for (const node of nodes) if (node && Number.isFinite(node.offset) && !byOffset.has(node.offset)) byOffset.set(node.offset, node);
+    const here = rizinGraphBoxAt(layout, nodes, rizinNum(rizinHex(current)));
+    const c = v => String(Math.round(v * 10) / 10);
+    const cut = line => {
+        const text = String(line ?? '');
+        return text.length > g.lineMax ? text.slice(0, g.lineMax - 1) + '…' : text;
+    };
+    let svg = `<svg class="rizin-graph-svg${overview ? ' rizin-graph-overview' : ''}" xmlns="http://www.w3.org/2000/svg" `
+        + `width="${c(layout.width)}" height="${c(layout.height)}" viewBox="0 0 ${c(layout.width)} ${c(layout.height)}"><g class="rizin-edges">`;
+    for (const edge of layout.edges) {
+        const pts = edge.points, kind = edge.kind === 'jump' || edge.kind === 'fail' ? edge.kind : 'plain';
+        svg += `<path class="rizin-edge rizin-edge-${kind}" data-from="${rizinHex(edge.from)}" data-to="${rizinHex(edge.to)}" `
+            + `d="M${pts.map(p => `${c(p[0])} ${c(p[1])}`).join('L')}"></path>`;
+        if (overview) continue;
+        const [ex, ey] = pts[pts.length - 1];
+        svg += `<path class="rizin-arrow rizin-edge-${kind}" d="M${c(ex - g.arrow)} ${c(ey - 2 * g.arrow)}L${c(ex)} ${c(ey)}`
+            + `L${c(ex + g.arrow)} ${c(ey - 2 * g.arrow)}Z"></path>`;
+    }
+    svg += '</g><g class="rizin-blocks">';
+    for (const box of layout.boxes) {
+        const node = byOffset.get(box.offset);
+        const lines = node && Array.isArray(node.lines) ? node.lines : [];
+        const addr = rizinHex(box.offset);
+        const count = `${addr} · ${lines.length} instruction${lines.length === 1 ? '' : 's'}`;
+        svg += `<g class="rizin-block${box === here ? ' current' : ''}" data-addr="${addr}"><title>${escapeHtml(count)}</title>`
+            + `<rect class="rizin-block-box" x="${c(box.x)}" y="${c(box.y)}" width="${c(box.w)}" height="${c(box.h)}" rx="3"></rect>`;
+        const reaches = !section || (box.x < section.x + section.w && box.x + box.w > section.x
+            && box.y < section.y + section.h && box.y + box.h > section.y);
+        if (!overview && reaches) {
+            const left = c(box.x + g.padX);
+            svg += `<text class="rizin-block-addr" x="${left}" y="${c(box.y + g.padY + 12)}">${addr}</text>`;
+            const shown = Math.min(lines.length, g.linesMax);
+            for (let i = 0; i < shown; i++) {
+                svg += `<text class="rizin-block-line" x="${left}" y="${c(box.y + g.padY + g.head + i * g.line + 11)}">${escapeHtml(cut(lines[i]))}</text>`;
+            }
+            if (lines.length > shown) {
+                svg += `<text class="rizin-block-more" x="${left}" y="${c(box.y + g.padY + g.head + shown * g.line + 11)}">… ${lines.length - shown} more</text>`;
+            }
+        }
+        svg += '</g>';
+    }
+    return svg + '</g></svg>';
+}
+
+// The view that shows the whole graph, at most at its full size, in the
+// middle of a view w × h
+function rizinGraphFitView(layout, w, h) {
+    const m = RIZIN_GRAPH.reveal;
+    let scale = Math.min(1, (w - 2 * m) / layout.width, (h - 2 * m) / layout.height);
+    if (!(scale > 0)) scale = Math.min(1, w / layout.width, h / layout.height) || 1;
+    return { scale, x: (w - layout.width * scale) / 2, y: (h - layout.height * scale) / 2 };
+}
+
+// The view zoomed by factor around the point (cx, cy) of the view, which
+// stays where it is; from half the scale that fits the whole graph to zoomMax
+function rizinGraphZoomView(view, factor, cx, cy, layout, w, h) {
+    const least = rizinGraphFitView(layout, w, h).scale * 0.5;
+    const scale = Math.min(RIZIN_GRAPH.zoomMax, Math.max(least, view.scale * factor));
+    const k = scale / view.scale;
+    return { scale, x: cx - (cx - view.x) * k, y: cy - (cy - view.y) * k };
+}
+
+// The view kept on the graph: snug (no room shown beyond a graph larger than
+// the view, a smaller one in the middle), or loose for a drag (at least 30 %
+// of the view or the whole graph stays in sight)
+function rizinGraphClampView(view, layout, w, h, snug) {
+    const cw = layout.width * view.scale, ch = layout.height * view.scale, m = RIZIN_GRAPH.reveal;
+    const axis = (at, content, room) => {
+        if (snug) return content + 2 * m <= room ? (room - content) / 2 : Math.min(m, Math.max(room - m - content, at));
+        const keep = Math.min(content, room * 0.3);
+        return Math.min(room - keep, Math.max(keep - content, at));
+    };
+    return { scale: view.scale, x: axis(view.x, cw, w), y: axis(view.y, ch, h) };
+}
+
+// The view with box in sight: unchanged when its top part shows already
+// (unless always), else with the box in the middle, or its top left near the
+// view's when it is larger than the view
+function rizinGraphRevealView(view, box, w, h, layout, always) {
+    if (!box) return view;
+    const s = view.scale, m = RIZIN_GRAPH.reveal;
+    const left = view.x + box.x * s, top = view.y + box.y * s, bw = box.w * s, bh = box.h * s;
+    const seen = left >= -0.5 && left + Math.min(bw, w) <= w + 0.5 && top >= -0.5 && top + Math.min(bh, h) <= h + 0.5;
+    if (seen && !always) return view;
+    const x = bw + 2 * m <= w ? w / 2 - (box.x + box.w / 2) * s : m - box.x * s;
+    const y = bh + 2 * m <= h ? h / 2 - (box.y + box.h / 2) * s : m - box.y * s;
+    return rizinGraphClampView({ scale: s, x, y }, layout, w, h, true);
+}
+
+// The part of the graph in sight, in the graph's own px
+function rizinGraphVisible(view, w, h) {
+    return { x: -view.x / view.scale, y: -view.y / view.scale, w: w / view.scale, h: h / view.scale };
+}
+
+// The part of a big graph drawn with its text: what is in sight and as much
+// again on each side, so a drag does not leave it at once
+function rizinGraphSection(view, w, h) {
+    const seen = rizinGraphVisible(view, w, h);
+    return { x: seen.x - seen.w, y: seen.y - seen.h, w: 3 * seen.w, h: 3 * seen.h };
+}
+
+// The first view of a function: a big one as an overview, one that almost
+// fits as a whole, else at full size with the current block in the middle
+// (the entry at the top)
+function rizinGraphStartView(layout, w, h, box, big) {
+    const fit = rizinGraphFitView(layout, w, h);
+    if (big || fit.scale >= RIZIN_GRAPH.fitStart) return fit;
+    return rizinGraphRevealView({ scale: 1, x: 0, y: 0 }, box || layout.boxes[0], w, h, layout, true);
+}
+
+function rizinGraphPane() {
+    return document.getElementById('rizin-graph');
+}
+
+// Whether the graph is in sight: below 1400 px when GRAPH is the chosen tab,
+// else unless ⇱ gave the code views the whole width
+function rizinGraphOnScreen() {
+    const layout = rizinState.layout;
+    return layout.narrow ? layout.narrowGraph : layout.max !== 'code';
+}
+
+// Whether the graph shown is the one for the current place: asked for at
+// this address, or of the current function with a block that holds it
+function rizinGraphHolds(graph) {
+    if (!graph || graph.session !== rizinState.session) return false;
+    if (graph.addr === rizinState.seek) return true;
+    return graph.function !== null && graph.function === rizinState.func
+        && rizinGraphBoxAt(graph.layout, graph.nodes, rizinNum(rizinState.seek)) !== null;
+}
+
+// GRAPH at seek, as DISASSEMBLY: asked for when the graph shown is not the
+// current function's (or with force), kept when the answer is the same; a
+// hidden graph is asked for once it is shown (rizinGraphShown). Busy shows
+// until the poll finds rizin free; a forced answer that a jump dropped is
+// asked for again, forced.
+async function rizinLoadGraph(force) {
+    const sid = rizinState.session, seek = rizinState.seek;
+    const wanted = !!sid && !!seek && (!!force || !rizinGraphHolds(rizinState.graph));
+    if (!rizinGraphOnScreen()) {
+        if (wanted) rizinState.graphPending = !!force || rizinState.graphPending === true;
+        return true;
+    }
+    if (wanted) {
+        const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/graph?addr=${encodeURIComponent(seek)}`);
+        if (sid !== rizinState.session || seek !== rizinState.seek) {      // a later jump draws
+            if (force && sid === rizinState.session) rizinViewBusy('graph', true);
+            return false;
+        }
+        if (!r.ok) {
+            if (r.state === 'busy') rizinViewBusy('graph', force);
+            rizinRenderGraph(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); the graph follows.`
+                : `The graph could not be loaded: ${r.error}`);
+            return false;
+        }
+        rizinState.retry.delete('graph');
+        const fn = typeof r.data.function === 'string' ? r.data.function : null;
+        const nodes = Array.isArray(r.data.nodes) ? r.data.nodes : [];
+        const json = JSON.stringify(nodes);
+        // The entry, where the layout starts: the route's offset of the function, else its address in
+        // the list, else (null) the lowest block
+        const listed = (rizinState.functions || []).find(f => f && f.name === fn);
+        const entry = Number.isFinite(r.data.offset) ? r.data.offset : listed ? listed.offset : null;
+        const old = rizinState.graph;
+        if (old && old.session === sid && old.entry === entry && old.json === json) {
+            old.addr = seek;                // the same graph (a rename too): the view, and a selection in it, stay
+            old.function = fn;
+        } else {
+            const first = entry !== null ? nodes.findIndex(node => node && node.offset === entry) : -1;
+            const ordered = first > 0 ? [nodes[first], ...nodes.slice(0, first), ...nodes.slice(first + 1)] : nodes;
+            rizinState.graph = { session: sid, addr: seek, function: fn, entry, nodes, json, layout: rizinLayoutGraph(ordered),
+                                 gen: ++rizinState.graphGen, big: nodes.length >= RIZIN_GRAPH_OVERVIEW };
+        }
+    }
+    rizinRenderGraph();
+    return true;
+}
+
+// The graph shown again (GRAPH chosen below 1400 px, ⇱ taken back): what was
+// asked for meanwhile, else the view for the view's size now
+function rizinGraphShown() {
+    const pending = rizinState.graphPending;
+    rizinState.graphPending = null;
+    if (pending !== null) return rizinLoadGraph(pending);
+    rizinRenderGraph();
+    return Promise.resolve(true);
+}
+
+// GRAPH: the graph when it holds the current place, else why not (problem:
+// busy or an error). A new function gets its first view; a jump brings its
+// block into sight; a drag, a zoom or a step of the analysis keeps the view.
+// A big graph is drawn again when its mode (overview or text) or the part in
+// sight changes; otherwise only the mark moves.
+function rizinRenderGraph(problem) {
+    const pane = rizinGraphPane();
+    if (!pane) return;
+    const title = document.getElementById('rizin-graph-title');
+    const info = document.getElementById('rizin-graph-info');
+    const graph = rizinState.graph;
+    const holds = rizinGraphHolds(graph);
+    if (!rizinState.session || !rizinState.seek || !holds || !graph.layout.boxes.length) {
+        const text = !rizinState.session ? 'The control flow graph of the current function shows here.'
+            : !rizinState.seek ? 'No address yet: click a function, or enter an address or a name in SEEK.'
+            : holds ? `No function at ${rizinState.seek}: the graph shows the blocks of a function.` : problem || 'Loading…';
+        pane.innerHTML = `<div class="rizin-empty">${escapeHtml(text)}</div>`;
+        if (title) title.textContent = 'GRAPH';
+        if (info) info.textContent = '';
+        Object.assign(rizinState, { graphShown: '', graphMode: '', graphSection: null });
+        return;
+    }
+    if (title) title.textContent = graph.function ? `GRAPH · ${graph.function}` : 'GRAPH';
+    const layout = graph.layout;
+    const box = rizinGraphBoxAt(layout, graph.nodes, rizinNum(rizinState.seek));
+    // The view is the function's, by its entry: a rename keeps it
+    const place = JSON.stringify([graph.session, graph.entry ?? layout.boxes[0].offset]);
+    if (place !== rizinState.graphPlace) {
+        rizinState.graphPlace = place;
+        rizinState.graphView = null;
+    }
+    const w = Number(pane.clientWidth) || 0, h = Number(pane.clientHeight) || 0;
+    if (w && h) {
+        // The view's size changed while it was hidden or resized: the middle stays
+        const last = rizinState.graphSize, view = rizinState.graphView;
+        if (view && last && (last[0] !== w || last[1] !== h)) {
+            rizinState.graphView = { scale: view.scale, x: view.x + (w - last[0]) / 2, y: view.y + (h - last[1]) / 2 };
+        }
+        rizinState.graphSize = [w, h];
+        if (!rizinState.graphView) {
+            rizinState.graphView = rizinGraphStartView(layout, w, h, box, graph.big);
+            rizinState.graphJump = rizinState.jumpSeq;
+        } else if (rizinState.graphJump !== rizinState.jumpSeq) {
+            // The block clicked in the graph is where the user looks: the graph stays
+            rizinState.graphJump = rizinState.jumpSeq;
+            if (rizinState.jumpFrom !== 'graph') rizinState.graphView = rizinGraphRevealView(rizinState.graphView, box, w, h, layout);
+        }
+    }
+    const view = rizinState.graphView;
+    const mode = !graph.big ? 'all' : view && view.scale >= RIZIN_GRAPH.readable ? 'detail' : 'overview';
+    let section = null;
+    if (mode === 'detail') {
+        const seen = rizinGraphVisible(view, w, h), old = rizinState.graphSection;
+        const holdsSeen = old && old.x <= seen.x && old.y <= seen.y && old.x + old.w >= seen.x + seen.w && old.y + old.h >= seen.y + seen.h;
+        section = holdsSeen && rizinState.graphMode === 'detail' ? old : rizinGraphSection(view, w, h);
+    }
+    const shown = JSON.stringify([graph.session, graph.gen, mode, section]);
+    if (shown !== rizinState.graphShown) {
+        pane.innerHTML = rizinGraphSvg(layout, graph, { current: rizinState.seek, overview: mode === 'overview', section });
+        rizinState.graphShown = shown;
+    } else {
+        rizinGraphMark(pane, box);
+    }
+    rizinState.graphMode = mode;
+    rizinState.graphSection = section;
+    rizinGraphApplyView();
+    if (info) {
+        const n = layout.boxes.length;
+        const blocks = `${n} block${n === 1 ? '' : 's'}`;
+        info.innerHTML = mode === 'overview' ? `${blocks} · overview without the instructions: click to zoom in`
+            : `${blocks}${mode === 'detail' ? ' · FIT shows the overview' : ''} · `
+              + '<span class="rizin-key rizin-edge-jump">━ jump</span> <span class="rizin-key rizin-edge-fail">━ no jump</span> '
+              + '<span class="rizin-key rizin-edge-plain">━ unconditional</span>';
+    }
+}
+
+// The mark on the block of the current address, without drawing the graph again
+function rizinGraphMark(pane, box) {
+    const addr = box ? rizinHex(box.offset) : null;
+    pane.querySelectorAll('.rizin-block.current').forEach(el => {
+        if (el.getAttribute('data-addr') !== addr) el.classList.remove('current');
+    });
+    if (addr) pane.querySelector(`.rizin-block[data-addr="${addr}"]`)?.classList.add('current');
+}
+
+// The view's zoom and place on the SVG (a CSS transform); lines and edges
+// stay at least 1 px wide however far it is zoomed out (--rizin-stroke)
+function rizinGraphApplyView() {
+    const pane = rizinGraphPane(), view = rizinState.graphView;
+    const svg = pane && pane.querySelector('svg');
+    if (!svg || !view) return;
+    svg.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.scale})`;
+    if (typeof svg.style.setProperty === 'function') svg.style.setProperty('--rizin-stroke', String(Math.max(1, 1 / view.scale)));
+}
+
+// After a drag or a zoom: a big graph drawn again when its mode or the part
+// in sight changed (rizinRenderGraph keeps it otherwise)
+function rizinGraphSettle() {
+    rizinState.graphSettleTimer = null;
+    const graph = rizinState.graph;
+    if (graph && graph.big && rizinGraphHolds(graph) && rizinState.graphView) rizinRenderGraph();
+}
+
+// The view's size changed (the window, the line between the halves, ⇱, a tab)
+function rizinGraphResized() {
+    const pane = rizinGraphPane();
+    if (!pane || !(Number(pane.clientWidth) > 0) || !(Number(pane.clientHeight) > 0)) return;
+    if (rizinGraphHolds(rizinState.graph)) rizinRenderGraph();
+    else rizinState.graphSize = [Number(pane.clientWidth), Number(pane.clientHeight)];
+}
+
+// A click: in the overview it zooms into the part around it; else a click on
+// a block jumps to its address (not the click that ends a drag)
+function rizinOnGraphClick(event) {
+    if (rizinState.graphDragged) {
+        rizinState.graphDragged = false;
+        return;
+    }
+    const pane = rizinGraphPane(), graph = rizinState.graph, view = rizinState.graphView;
+    if (!pane || !view || !rizinGraphHolds(graph)) return;
+    if (rizinState.graphMode === 'overview') {
+        const rect = pane.getBoundingClientRect();
+        const w = Number(pane.clientWidth) || 0, h = Number(pane.clientHeight) || 0;
+        const lx = (event.clientX - rect.left - view.x) / view.scale, ly = (event.clientY - rect.top - view.y) / view.scale;
+        rizinState.graphView = rizinGraphClampView({ scale: 1, x: w / 2 - lx, y: h / 2 - ly }, graph.layout, w, h, false);
+        rizinRenderGraph();
+        return;
+    }
+    const block = event.target && event.target.closest ? event.target.closest('[data-addr]') : null;
+    if (block) rizinSeek(block.getAttribute('data-addr'), 'graph');
+}
+
+// Dragging moves the graph; the pointer is captured once it moves, so that a
+// plain click still reaches the block under it
+function rizinOnGraphPointerDown(event) {
+    if ((event.button !== undefined && event.button !== 0) || !rizinState.graphView) return;
+    const view = rizinState.graphView;
+    rizinState.graphDrag = { x: event.clientX, y: event.clientY, vx: view.x, vy: view.y, moved: false, id: event.pointerId };
+    rizinState.graphDragged = false;
+}
+
+function rizinOnGraphPointerMove(event) {
+    const drag = rizinState.graphDrag, pane = rizinGraphPane(), graph = rizinState.graph;
+    if (!drag || !pane || !graph || !rizinState.graphView) return;
+    // No button held any more: the press ended outside the graph before it moved (no capture yet)
+    if (event.buttons === 0) {
+        rizinOnGraphPointerUp();
+        return;
+    }
+    const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
+    if (!drag.moved) {
+        if (Math.abs(dx) + Math.abs(dy) < 4) return;
+        drag.moved = true;
+        pane.classList.add('rizin-panning');
+        if (typeof pane.setPointerCapture === 'function' && drag.id !== undefined) {
+            try {
+                pane.setPointerCapture(drag.id);
+            } catch (e) {
+                // The pointer is gone already: the drag ends with it
+            }
+        }
+    }
+    const w = Number(pane.clientWidth) || 0, h = Number(pane.clientHeight) || 0;
+    rizinState.graphView = rizinGraphClampView({ scale: rizinState.graphView.scale, x: drag.vx + dx, y: drag.vy + dy }, graph.layout, w, h, false);
+    rizinGraphApplyView();
+}
+
+function rizinOnGraphPointerUp() {
+    const drag = rizinState.graphDrag;
+    rizinState.graphDrag = null;
+    if (!drag || !drag.moved) return;
+    rizinGraphPane()?.classList.remove('rizin-panning');
+    rizinState.graphDragged = true;
+    rizinGraphSettle();
+}
+
+// The wheel zooms around the mouse
+function rizinOnGraphWheel(event) {
+    const pane = rizinGraphPane(), graph = rizinState.graph, view = rizinState.graphView;
+    if (!pane || !view || !rizinGraphHolds(graph)) return;
+    event.preventDefault();
+    const rect = pane.getBoundingClientRect();
+    const w = Number(pane.clientWidth) || 0, h = Number(pane.clientHeight) || 0;
+    const step = (Number(event.deltaY) || 0) * (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? h : 1);
+    const factor = Math.min(2, Math.max(0.5, Math.exp(-step * 0.0015)));
+    const zoomed = rizinGraphZoomView(view, factor, event.clientX - rect.left, event.clientY - rect.top, graph.layout, w, h);
+    rizinState.graphView = rizinGraphClampView(zoomed, graph.layout, w, h, false);
+    rizinGraphApplyView();
+    if (rizinState.graphSettleTimer !== null) clearTimeout(rizinState.graphSettleTimer);
+    rizinState.graphSettleTimer = setTimeout(rizinGraphSettle, 150);
+}
+
+// − and + zoom around the middle of the view
+function rizinGraphZoomBy(factor) {
+    const pane = rizinGraphPane(), graph = rizinState.graph, view = rizinState.graphView;
+    if (!pane || !view || !rizinGraphHolds(graph)) return;
+    const w = Number(pane.clientWidth) || 0, h = Number(pane.clientHeight) || 0;
+    rizinState.graphView = rizinGraphClampView(rizinGraphZoomView(view, factor, w / 2, h / 2, graph.layout, w, h), graph.layout, w, h, false);
+    rizinGraphApplyView();
+    rizinGraphSettle();
+}
+
+// FIT: the whole graph in sight (a big one as the overview)
+function rizinGraphFit() {
+    const pane = rizinGraphPane(), graph = rizinState.graph;
+    if (!pane || !rizinGraphHolds(graph) || !rizinState.graphView) return;
+    rizinState.graphView = rizinGraphFitView(graph.layout, Number(pane.clientWidth) || 0, Number(pane.clientHeight) || 0);
+    rizinGraphApplyView();
+    rizinGraphSettle();
+}
+
+// ⇱ gives one half (code or graph) the whole width, ⇲ takes it back
+function rizinToggleMax(half) {
+    rizinState.layout.max = rizinState.layout.max === half ? '' : half;
+    rizinApplyCenterLayout();
+}
+
+// The two halves in the middle: below 1400 px of window width one area with
+// the tabs DISASSEMBLY, DECOMPILER, HEX and GRAPH, else side by side with the
+// line between them where it was dragged to, or one of them with the whole
+// width (⇱). A half that comes into sight brings its place into sight; true
+// when the code views came into sight (the one shown loads what it waited for).
+function rizinApplyCenterLayout() {
+    const center = document.getElementById('rizin-center');
+    if (!center) return false;
+    const layout = rizinState.layout;
+    // What was in sight before: the classes as applied last
+    const wasNarrow = center.classList.contains('rizin-narrow'), wasGraph = center.classList.contains('rizin-show-graph');
+    const graphBefore = wasNarrow ? wasGraph : !center.classList.contains('rizin-max-code');
+    const codeBefore = wasNarrow ? !wasGraph : !center.classList.contains('rizin-max-graph');
+    const width = Number(window.innerWidth) || 0;
+    layout.narrow = width > 0 && width < RIZIN_NARROW_PX;
+    const max = layout.narrow ? '' : layout.max;
+    const showGraph = layout.narrow && layout.narrowGraph;
+    center.classList.toggle('rizin-narrow', layout.narrow);
+    center.classList.toggle('rizin-show-graph', showGraph);
+    center.classList.toggle('rizin-max-code', max === 'code');
+    center.classList.toggle('rizin-max-graph', max === 'graph');
+    center.style.gridTemplateColumns = !layout.narrow && !max && layout.split !== null ? rizinSplitColumns(layout.split) : '';
+    for (const tab of center.querySelectorAll('[data-rizin-tabs="code"] [data-rizin-tab]')) {
+        const name = tab.getAttribute('data-rizin-tab');
+        if (name === 'graph') tab.hidden = !layout.narrow;
+        tab.setAttribute('aria-selected', String(showGraph ? name === 'graph' : name === rizinState.views.code));
+    }
+    for (const [id, half, what] of [['rizin-code-max', 'code', 'the code views'], ['rizin-graph-max', 'graph', 'the graph']]) {
+        const button = document.getElementById(id);
+        if (!button) continue;
+        const on = max === half;
+        const label = on ? 'Show the code views and the graph side by side' : `Give ${what} the whole width`;
+        button.textContent = on ? '⇲' : '⇱';
+        button.title = label;
+        button.setAttribute('aria-label', label);
+        button.setAttribute('aria-pressed', String(on));
+    }
+    const split = document.getElementById('rizin-split');
+    if (split) split.setAttribute('aria-valuenow', String(Math.round((layout.split ?? RIZIN_GRAPH.splitDefault) * 100)));
+    if (!graphBefore && rizinGraphOnScreen()) rizinGraphShown();
+    const codeNow = layout.narrow ? !layout.narrowGraph : max !== 'graph';
+    if (codeBefore || !codeNow) return false;
+    const pane = document.getElementById('rizin-disasm');
+    if (pane) rizinReveal(pane, pane.querySelector('.rizin-op.current'));
+    rizinCodeShown(rizinState.views.code);
+    return true;
+}
+
+// The columns of the halves for the code views' share frac of the width
+function rizinSplitColumns(frac) {
+    return `minmax(0, ${Math.round(frac * 1e4) / 1e4}fr) 10px minmax(0, ${Math.round((1 - frac) * 1e4) / 1e4}fr)`;
+}
+
+// The line between the halves at frac of the width (null: where the style
+// sheet puts it), each half at least 280 px wide; kept until the page loads again
+function rizinSetSplit(frac) {
+    const center = document.getElementById('rizin-center');
+    if (!center) return;
+    if (frac === null || !Number.isFinite(frac)) {
+        rizinState.layout.split = null;
+    } else {
+        const room = (Number(center.getBoundingClientRect().width) || 0) - 10;
+        const lo = room > 0 ? Math.max(0.2, 280 / room) : 0.2, hi = room > 0 ? Math.min(0.8, 1 - 280 / room) : 0.8;
+        rizinState.layout.split = lo <= hi ? Math.min(hi, Math.max(lo, frac)) : 0.5;
+    }
+    rizinApplyCenterLayout();
+}
+
+function rizinOnSplitDown(event) {
+    const layout = rizinState.layout, center = document.getElementById('rizin-center');
+    if ((event.button !== undefined && event.button !== 0) || layout.narrow || layout.max || !center) return;
+    event.preventDefault();
+    const rect = center.getBoundingClientRect();
+    rizinState.splitDrag = { left: Number(rect.left) || 0, room: (Number(rect.width) || 0) - 10 };
+    const split = document.getElementById('rizin-split');
+    if (!split) return;
+    split.classList.add('rizin-split-drag');
+    if (typeof split.setPointerCapture === 'function' && event.pointerId !== undefined) {
+        try {
+            split.setPointerCapture(event.pointerId);
+        } catch (e) {
+            // The pointer is gone already: the drag ends with it
+        }
+    }
+}
+
+function rizinOnSplitMove(event) {
+    const drag = rizinState.splitDrag;
+    if (drag && event.buttons === 0) rizinOnSplitUp();
+    else if (drag && drag.room > 0) rizinSetSplit((event.clientX - drag.left - 5) / drag.room);
+}
+
+function rizinOnSplitUp() {
+    rizinState.splitDrag = null;
+    document.getElementById('rizin-split')?.classList.remove('rizin-split-drag');
+}
+
+// ← → move the line between the halves
+function rizinOnSplitKey(event) {
+    const step = event.key === 'ArrowLeft' ? -0.05 : event.key === 'ArrowRight' ? 0.05 : 0;
+    if (!step || rizinState.layout.narrow || rizinState.layout.max) return;
+    event.preventDefault();
+    rizinSetSplit((rizinState.layout.split ?? RIZIN_GRAPH.splitDefault) + step);
+}
+
+// --- CONSOLE: rizin commands, through the server's allowlist ---
+// After each command the place is the answer's seek and function: when rizin
+// moved (s, @ …) every view follows, as after a jump; when the command renamed
+// or commented (changed) every view is drawn again, also at the same place.
+// rizinAnsiHtml turns rizin's colours into theme classes; nothing of the
+// output becomes markup.
+
+// The nearest of the 16 colours (an index into RIZIN_ANSI) to r, g, b (0 to 255), or null
+function rizinAnsiColor(r, g, b) {
+    if (![r, g, b].every(v => Number.isInteger(v) && v >= 0 && v <= 255)) return null;
+    let best = null, least = Infinity;
+    RIZIN_ANSI.forEach(([, cr, cg, cb], i) => {
+        // Weighted roughly as the eye tells colours apart
+        const distance = 2 * (r - cr) ** 2 + 4 * (g - cg) ** 2 + 3 * (b - cb) ** 2;
+        if (distance < least) [best, least] = [i, distance];
+    });
+    return best;
+}
+
+// One of the 256 colours (SGR 38;5;n): the 16, then a 6 × 6 × 6 cube and 24 greys, as the nearest of the 16
+function rizinAnsi256(n) {
+    if (!Number.isInteger(n) || n < 0 || n > 255) return null;
+    if (n < 16) return n;
+    if (n >= 232) return rizinAnsiColor(8 + 10 * (n - 232), 8 + 10 * (n - 232), 8 + 10 * (n - 232));
+    const steps = [0, 95, 135, 175, 215, 255], i = n - 16;
+    return rizinAnsiColor(steps[Math.floor(i / 36)], steps[Math.floor(i / 6) % 6], steps[i % 6]);
+}
+
+// The parameters of one SGR sequence (ESC [ … m) applied to style: colours in 16, 256 or 24 bits (also
+// in the colon form 38:2::r:g:b), bold, dim, italic and underline, and their resets; anything else
+// (blink, reverse, hidden, …) is left out
+function rizinAnsiSgr(params, style) {
+    const list = String(params).split(';');
+    for (let i = 0; i < list.length; i++) {
+        const sub = list[i].split(':');
+        const code = sub[0] === '' ? 0 : Number(sub[0]);
+        if (code === 38 || code === 48) {
+            let colour = null;
+            if (sub.length > 1) {
+                const rgb = (sub.length >= 6 ? sub.slice(3, 6) : sub.slice(2, 5)).map(Number);
+                colour = sub[1] === '5' ? rizinAnsi256(Number(sub[2])) : sub[1] === '2' ? rizinAnsiColor(...rgb) : null;
+            } else if (list[i + 1] === '5') {
+                colour = rizinAnsi256(Number(list[i + 2]));
+                i += 2;
+            } else if (list[i + 1] === '2') {
+                colour = rizinAnsiColor(Number(list[i + 2]), Number(list[i + 3]), Number(list[i + 4]));
+                i += 4;
+            }
+            if (colour !== null) style[code === 38 ? 'fg' : 'bg'] = colour;
+        } else if (code === 0) {
+            Object.assign(style, { fg: null, bg: null, bold: false, dim: false, italic: false, under: false });
+        } else if (code >= 1 && code <= 4) {
+            style[['bold', 'dim', 'italic', 'under'][code - 1]] = true;
+        } else if (code === 22) {
+            style.bold = style.dim = false;
+        } else if (code === 23 || code === 24) {
+            style[code === 23 ? 'italic' : 'under'] = false;
+        } else if (code >= 30 && code <= 37) {
+            style.fg = code - 30;
+        } else if (code >= 90 && code <= 97) {
+            style.fg = code - 82;
+        } else if (code >= 40 && code <= 47) {
+            style.bg = code - 40;
+        } else if (code >= 100 && code <= 107) {
+            style.bg = code - 92;
+        } else if (code === 39 || code === 49) {
+            style[code === 39 ? 'fg' : 'bg'] = null;
+        }
+    }
+}
+
+// The classes of a look: its colour (rz-ansi-<name>), its background (one of the first 8), bold, dim,
+// italic and underline
+function rizinAnsiClass(style) {
+    const names = [];
+    if (style.fg !== null) names.push('rz-ansi-' + RIZIN_ANSI[style.fg][0]);
+    if (style.bg !== null) names.push('rz-ansi-bg-' + RIZIN_ANSI[style.bg % 8][0]);
+    for (const key of ['bold', 'dim', 'italic', 'under']) if (style[key]) names.push('rz-ansi-' + key);
+    return names.join(' ');
+}
+
+// rizin's console output as markup: the colours of SGR sequences (16, 256 and 24 bits) as theme
+// classes, bold too; every other escape sequence (cursor, erase, character sets, OSC titles and
+// hyperlinks, DCS, …) and control character goes, and the text is escaped. One pass in linear time:
+// each kind of sequence is a run of one character class, and an OSC or DCS that nothing ends takes
+// the rest. Text of one look shares a span; spaces join the text before them while nothing shows on
+// them (no background, no underline).
+function rizinAnsiHtml(text) {
+    const source = String(text ?? '');
+    const style = { fg: null, bg: null, bold: false, dim: false, italic: false, under: false };
+    let html = '', run = '', runClass = '', runShowsSpace = false;
+    const flush = () => {
+        if (run) html += runClass ? `<span class="${runClass}">${escapeHtml(run)}</span>` : escapeHtml(run);
+        run = '';
+    };
+    const add = chunk => {
+        const clean = chunk.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '');
+        if (!clean) return;
+        const showsSpace = style.bg !== null || style.under;
+        if (run && !showsSpace && !runShowsSpace && !/\S/.test(clean)) {
+            run += clean;
+            return;
+        }
+        const cls = rizinAnsiClass(style);
+        if (cls !== runClass) {
+            flush();
+            runClass = cls;
+            runShowsSpace = showsSpace;
+        }
+        run += clean;
+    };
+    const sequences = /\x1b\[([0-?]*)[ -\/]*([@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[PX^_][^\x1b]*(?:\x1b\\)?|\x1b[ -\/]*[0-~]?/g;
+    let at = 0;
+    for (const m of source.matchAll(sequences)) {
+        add(source.slice(at, m.index));
+        at = m.index + m[0].length;
+        if (m[2] === 'm') rizinAnsiSgr(m[1], style);
+    }
+    add(source.slice(at));
+    flush();
+    return html;
+}
+
+// A text of the file on one line: line breaks, tabs and other control characters as \n, \t, \xNN
+function rizinVisibleText(text) {
+    return String(text ?? '').replace(/[\x00-\x1f\x7f-\x9f]/g, c => ({ '\n': '\\n', '\r': '\\r', '\t': '\\t' }[c]
+        || '\\x' + c.charCodeAt(0).toString(16).padStart(2, '0')));
+}
+
+// The console's prompt: where the views are (before the first jump, where rizin stands)
+function rizinConsolePrompt() {
+    const at = rizinState.session ? rizinState.seek || rizinHex(rizinState.serverSeek) : null;
+    return `[${at || '-'}]>`;
+}
+
+function rizinRenderPrompt() {
+    const prompt = document.getElementById('rizin-prompt');
+    if (prompt) prompt.textContent = rizinConsolePrompt();
+}
+
+// A command in the console's output: the prompt and the command at once, the answer under them
+// once it comes (rizinConsoleFill), so that the output keeps the order of the commands
+function rizinConsoleEntry(prompt, cmd) {
+    const out = document.getElementById('rizin-console-out');
+    if (!out) return null;
+    const entry = document.createElement('div');
+    entry.className = 'rizin-console-entry';
+    entry.innerHTML = `<div class="rizin-console-cmd"><span class="rizin-console-at">${escapeHtml(prompt)}</span> `
+        + `<span class="rizin-console-typed">${escapeHtml(cmd)}</span></div><div class="rizin-console-text rizin-console-wait">…</div>`;
+    out.appendChild(entry);
+    rizinConsoleTrim(out);
+    out.scrollTop = out.scrollHeight;
+    return entry;
+}
+
+// The answer under its command: rizin's output (markup of rizinAnsiHtml) or one line that says why
+// there is none (kind: output, refused, busy, error or note); cut: rizin printed more than the
+// server sends. The start of a long answer comes into sight, a short one at the bottom.
+function rizinConsoleFill(entry, kind, html, cut) {
+    if (!entry) return;
+    const text = entry.lastElementChild;
+    text.className = 'rizin-console-text' + (kind === 'output' ? '' : ' rizin-console-' + kind);
+    text.innerHTML = html;
+    if (cut) {
+        const note = document.createElement('div');
+        note.className = 'rizin-console-cut';
+        note.textContent = 'The output was cut at about 1 MB.';
+        entry.appendChild(note);
+    }
+    entry.setAttribute('data-size', String(html.length));
+    const out = entry.parentNode;
+    if (!out) return;
+    rizinConsoleTrim(out);
+    const top = entry.offsetTop, end = out.scrollHeight - out.clientHeight;
+    out.scrollTop = Number.isFinite(top) && Number.isFinite(end) ? Math.max(0, Math.min(top, end)) : out.scrollHeight;
+}
+
+// A line of its own in the console (kind: complete, the names Tab found; file, a new session's file)
+function rizinConsoleNote(text, kind) {
+    const out = document.getElementById('rizin-console-out');
+    if (!out) return null;
+    const note = document.createElement('div');
+    note.className = `rizin-console-entry rizin-console-${kind}`;
+    note.textContent = text;
+    note.setAttribute('data-size', String(text.length));
+    out.appendChild(note);
+    rizinConsoleTrim(out);
+    out.scrollTop = out.scrollHeight;
+    return note;
+}
+
+// The oldest output goes while the console holds more than RIZIN_CONSOLE.keep characters of markup
+// or RIZIN_CONSOLE.entries entries
+function rizinConsoleTrim(out) {
+    let size = 0;
+    for (const entry of out.children) size += Number(entry.getAttribute('data-size')) || 0;
+    while (out.children.length > 1 && (size > RIZIN_CONSOLE.keep || out.children.length > RIZIN_CONSOLE.entries)) {
+        const first = out.firstElementChild;
+        size -= Number(first.getAttribute('data-size')) || 0;
+        out.removeChild(first);
+    }
+}
+
+// Runs a command in the console. Commands and jumps go one at a time and in order (seekChain). A
+// command is no jump: the jumps asked for before it run first and draw the views themselves, also one
+// that a newer jump would replace (seekKept), so the command runs where the views were when it was
+// typed. A jump asked for after it is newer: that one draws the views, and the command only moves the
+// place (where the views go should that jump not happen).
+async function rizinConsoleRun(command) {
+    const cmd = String(command ?? '');
+    if (!cmd.trim()) return false;
+    rizinConsoleRemember(cmd);
+    const entry = rizinConsoleEntry(rizinConsolePrompt(), cmd);
+    const sid = rizinState.session;
+    if (!sid) {
+        rizinConsoleFill(entry, 'note', escapeHtml('No file is open: OPEN ▾ opens one.'));
+        return false;
+    }
+    const ticket = rizinState.seekSeq;
+    rizinState.seekKept.add(ticket);
+    const previous = rizinState.seekChain;
+    let release;
+    rizinState.seekChain = new Promise(resolve => { release = resolve; });
+    let r = null;
+    try {
+        await previous;
+        rizinState.seekKept.delete(ticket);
+        if (sid === rizinState.session) {
+            // The prompt of where it runs: the commands and jumps before it may have moved the place
+            const at = entry && entry.querySelector('.rizin-console-at');
+            if (at) at.textContent = rizinConsolePrompt();
+            r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/console`, { method: 'POST', body: { cmd } });
+        }
+    } finally {
+        release();
+    }
+    if (!r || sid !== rizinState.session) {
+        rizinConsoleFill(entry, 'note', escapeHtml(r ? 'Another file was opened meanwhile.' : 'Not run: another file was opened.'));
+        return false;
+    }
+    if (!r.ok) {
+        const running = !!rizinState.analysis && rizinState.analysis.state === 'running';
+        const step = r.data.step || 'rizin';
+        const texts = {
+            refused: `refused: ${r.error}`,
+            busy: running ? `busy: the analysis runs (${step}). Commands run between its steps, renames and comments once it is done.`
+                : `busy: rizin works on another request (${step}); try again in a moment.`,
+            moved: 'The file is open in another tab: Take it back in the toolbar brings it here.',
+            ended: `${rizinEndedText(r.data.reason)} Reopen in the toolbar opens the file again.`,
+        };
+        rizinConsoleFill(entry, ['refused', 'busy'].includes(r.state) ? r.state : 'error', escapeHtml(texts[r.state] || r.error));
+        if (r.state === 'busy') rizinPollSoon();
+        return false;
+    }
+    rizinConsoleFill(entry, 'output', rizinAnsiHtml(typeof r.data.output === 'string' ? r.data.output : ''), !!r.data.truncated);
+    const seek = rizinHex(r.data.seek);
+    const moved = !!seek && seek !== rizinState.seek;
+    const before = rizinState.func;
+    if (seek) rizinState.seek = seek;
+    rizinState.func = typeof r.data.function === 'string' && r.data.function ? r.data.function : null;
+    if (moved) {
+        // A jump of the console: in ◀ ▶ too (unless a jump asked for after the command draws the views
+        // instead), and the views bring the place into sight
+        rizinState.note = '';
+        rizinState.openNote = '';
+        rizinState.jumpSeq++;
+        rizinState.jumpFrom = 'console';
+        if (ticket === rizinState.seekSeq) rizinPushHistory(seek);
+    } else if (before && rizinState.func && before !== rizinState.func) {
+        // The function at the place has another name (afn): the list and SEEK take it at once
+        const old = (rizinState.functions || []).find(f => f.name === before);
+        if (old) rizinFunctionRenamed(rizinHex(old.offset), rizinState.func);
+    }
+    if (r.data.changed) await rizinAnnotated();
+    else if (moved && ticket === rizinState.seekSeq) await rizinRefreshViews();
+    else rizinRenderToolbar();
+    return true;
+}
+
+function rizinConsoleRemember(cmd) {
+    const c = rizinState.console;
+    if (c.history[c.history.length - 1] !== cmd) c.history.push(cmd);
+    if (c.history.length > RIZIN_CONSOLE.history) c.history.splice(0, c.history.length - RIZIN_CONSOLE.history);
+    c.at = c.history.length;
+    c.draft = '';
+}
+
+// ↑ ↓: the commands typed before, then back to the line that was being typed
+function rizinConsoleBrowse(input, delta) {
+    const c = rizinState.console;
+    const at = Math.max(0, Math.min(c.history.length, c.at + delta));
+    if (at === c.at) return false;
+    if (c.at === c.history.length) c.draft = input.value;
+    c.at = at;
+    input.value = at === c.history.length ? c.draft : c.history[at];
+    rizinSetCaret(input, input.value.length);
+    return true;
+}
+
+// The word before the caret (back to a space or a ';'), where it starts, and whether it is the
+// command of its statement (nothing but spaces before it since the start or a ';')
+function rizinCompleteToken(value, caret) {
+    const before = String(value ?? '').slice(0, Math.max(0, caret));
+    const token = /[^\s;]*$/.exec(before)[0];
+    const start = before.length - token.length;
+    return { token, start, command: !before.slice(0, start).split(';').pop().trim() };
+}
+
+// The longest start that all names share
+function rizinCommonPrefix(names) {
+    let prefix = names.length ? String(names[0]) : '';
+    for (const name of names) {
+        let i = 0;
+        while (i < prefix.length && i < name.length && prefix[i] === name[i]) i++;
+        prefix = prefix.slice(0, i);
+    }
+    return prefix;
+}
+
+// Tab: the word before the caret completed, a command of RIZIN_CONSOLE_COMMANDS where a statement
+// starts, else a function or flag name (the function list and /flags, by the first letters in any
+// case). One match is taken whole, several as far as they agree (with more flags than /flags sends, as
+// far as all of them agree: its common); when they agree no further than what is typed, they are
+// listed in the console. An answer that comes after the line changed (the user typed on) changes nothing.
+async function rizinConsoleComplete(input) {
+    const value = input.value;
+    const caret = Number.isInteger(input.selectionStart) ? input.selectionStart : value.length;
+    const { token, start, command } = rizinCompleteToken(value, caret);
+    const seq = ++rizinState.console.completing;
+    let names = [], more = false, shared = null, own = [];
+    if (command) {
+        names = RIZIN_CONSOLE_COMMANDS.filter(c => c.startsWith(token));
+    } else if (token) {
+        const low = token.toLowerCase();
+        own = (rizinState.functions || []).map(f => String(f.name ?? '')).filter(n => n.toLowerCase().startsWith(low));
+        const sid = rizinState.session;
+        let flags = [];
+        if (sid) {
+            const r = await rizinConsoleFlags(sid, token, seq);
+            if (!r || seq !== rizinState.console.completing || sid !== rizinState.session || input.value !== value) return false;
+            if (r.ok && Array.isArray(r.data.names)) {
+                flags = r.data.names.filter(n => typeof n === 'string');
+                // truncated: the server kept only some of rizin's flags, so there may be more that match
+                more = Number(r.data.total) > flags.length || r.data.truncated === true;
+                // Not all the flags that match came: they agree as far as the server says (else no further)
+                if (more) shared = typeof r.data.common === 'string' ? r.data.common : token;
+            } else if (r.state === 'busy') {
+                rizinPollSoon();            // the names of the function list still complete
+            }
+        }
+        names = [...new Set([...own, ...flags])].sort();
+    }
+    if (!names.length) return false;
+    const common = rizinCommonPrefix(shared === null ? names : [shared, ...own]);
+    if ((names.length === 1 && !more) || common.length > token.length) {
+        const insert = names.length === 1 && !more ? names[0] + (command ? ' ' : '') : common;
+        input.value = value.slice(0, start) + insert + value.slice(caret);
+        rizinSetCaret(input, start + insert.length);
+        return true;
+    }
+    const shown = names.slice(0, RIZIN_CONSOLE.shown);
+    rizinConsoleNote(shown.join('  ') + (more || names.length > shown.length ? '  …' : ''), 'complete');
+    return true;
+}
+
+// The flag names that start with token (/flags), one request at a time: a Tab while one is out takes its
+// answer when it asks the same, else waits for it and then asks, unless a newer Tab came meanwhile (seq;
+// null then). The server loads them once for the requests that come together (_rizin_cached).
+async function rizinConsoleFlags(sid, token, seq) {
+    const c = rizinState.console;
+    const key = JSON.stringify([sid, token]);
+    while (c.flags) {
+        if (c.flags.key === key) return c.flags.ask;
+        await c.flags.ask;
+        if (seq !== c.completing) return null;
+    }
+    const out = { key, ask: rizinApi(`/api/rizin/${encodeURIComponent(sid)}/flags?q=${encodeURIComponent(token)}&limit=${RIZIN_CONSOLE.names}`) };
+    c.flags = out;
+    const done = () => { if (c.flags === out) c.flags = null; };
+    out.ask.then(done, done);
+    return out.ask;
+}
+
+function rizinSetCaret(input, at) {
+    if (typeof input.setSelectionRange === 'function') input.setSelectionRange(at, at);
+}
+
+// Enter runs the line, ↑ ↓ walk the history, Tab completes (on an empty line Tab moves the focus on)
+function rizinOnConsoleKey(event) {
+    const input = event.target;
+    if (!input || event.isComposing) return;
+    if (event.key === 'Enter') {
+        event.preventDefault();
+        const cmd = input.value;
+        input.value = '';
+        rizinConsoleRun(cmd);
+    } else if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+        event.preventDefault();
+        rizinConsoleBrowse(input, event.key === 'ArrowUp' ? -1 : 1);
+    } else if (event.key === 'Tab' && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey && input.value.trim()) {
+        event.preventDefault();
+        rizinConsoleComplete(input);
+    }
+}
+
+// The quick commands above the console run at once
+function rizinOnQuickClick(event) {
+    const button = event.target && event.target.closest ? event.target.closest('[data-cmd]') : null;
+    if (!button) return;
+    document.getElementById('rizin-console-input')?.focus();
+    rizinConsoleRun(button.getAttribute('data-cmd'));
+}
+
+// The function at addr is called name now (a rename in the menu or the console): the list, SEEK and
+// the marks take it at once, before the views are asked for again
+function rizinFunctionRenamed(addr, name) {
+    const funcs = rizinState.functions;
+    const fn = addr && name && Array.isArray(funcs) ? funcs.find(f => f && rizinHex(f.offset) === addr) : null;
+    if (!fn || fn.name === name) return false;
+    if (fn.name === rizinState.func) rizinState.func = name;
+    rizinState.functions = funcs.map(f => (f === fn ? { ...f, name } : f));
+    rizinState.functionsGen++;
+    rizinRenderFunctions();
+    rizinRenderLocation();
+    return true;
+}
+
+// After a rename or a comment (the menu, or a console command that changed something): every view
+// again, also at the same place
+async function rizinAnnotated() {
+    rizinRenderToolbar();
+    await rizinReloadViews();
+}
+
+// --- XREFS, STRINGS and IMPORTS: the dock's lists ---
+// Each one asks only while it is shown, and otherwise when it is shown
+// again. STRINGS and IMPORTS come in pages of RIZIN_PAGE, filtered on the
+// server; XREFS follows the current place. Every text of the file is escaped.
+
+// The rows of STRINGS, in the order of rizin's iz: address, section and the string on one line (in
+// full on hover); the string at current is marked
+function rizinStringsHtml(items, options) {
+    const at = rizinNum(rizinHex((options || {}).current));
+    let html = '';
+    for (const item of Array.isArray(items) ? items : []) {
+        const addr = rizinHex(item && item.offset);
+        if (!addr) continue;
+        const text = rizinVisibleText(item.string);
+        const meta = [item.section, item.type].filter(v => typeof v === 'string' && v).join(' · ');
+        html += `<div class="rizin-row rizin-string${item.offset === at ? ' current' : ''}" data-addr="${addr}" `
+            + `title="${escapeHtml(`${addr}${meta ? ' · ' + meta : ''} · ${text}`)}"><span class="rz-addr">${addr}</span>`
+            + `<span class="rizin-row-meta">${escapeHtml(typeof item.section === 'string' ? item.section : '')}</span>`
+            + `<span class="rizin-row-text rizin-string-text">${escapeHtml(text)}</span></div>`;
+    }
+    return html;
+}
+
+// The rows of IMPORTS, in the order of rizin's ii: address (its slot), type, library and name; one
+// without an address takes no click
+function rizinImportsHtml(items, options) {
+    const at = rizinNum(rizinHex((options || {}).current));
+    let html = '';
+    for (const item of Array.isArray(items) ? items : []) {
+        if (!item || typeof item !== 'object') continue;
+        const addr = rizinHex(item.offset);
+        const library = typeof item.library === 'string' ? item.library : '';
+        const title = `${addr || 'no address'}${library ? ' · ' + library : ''} · ${String(item.name ?? '')}`
+            + (addr ? ' · a click shows its references' : '');
+        html += `<div class="rizin-row rizin-import${addr && item.offset === at ? ' current' : ''}${addr ? '' : ' rizin-row-none'}"`
+            + `${addr ? ` data-addr="${addr}"` : ''} title="${escapeHtml(title)}"><span class="rz-addr">${addr || '—'}</span>`
+            + `<span class="rizin-row-meta">${escapeHtml(typeof item.type === 'string' ? item.type : '')}</span>`
+            + `<span class="rizin-import-lib">${escapeHtml(library)}</span>`
+            + `<span class="rizin-row-text rizin-import-name">${escapeHtml(item.name ?? '')}</span></div>`;
+    }
+    return html;
+}
+
+// XREFS in two columns: the references to the place (from where: address, function, type and
+// instruction) and from it (address → where to). A row's click follows the reference, a click on one
+// of its addresses goes there.
+function rizinXrefsHtml(data, options) {
+    const { label = '' } = options || {};
+    const list = (refs, to) => {
+        let html = '';
+        for (const ref of refs) {
+            const from = rizinHex(ref && ref.from), dest = rizinHex(ref && ref.to);
+            if (!from || !dest) continue;
+            const go = to ? from : dest;
+            html += `<div class="rizin-xref" data-addr="${go}" title="Jump to ${go}"><span class="rz-addr" data-addr="${from}">${from}</span> `
+                + (to ? `<span class="rizin-xref-fn">${escapeHtml(ref.function || '(no function)')}</span> `
+                    : `→ <span class="rz-addr" data-addr="${dest}">${dest}</span> `)
+                + `<span class="rizin-xref-type">${escapeHtml(ref.type || '')}</span> `
+                + `<span class="rizin-xref-text">${escapeHtml(ref.text || '')}</span></div>`;
+        }
+        return html || '<div class="rizin-empty">none</div>';
+    };
+    const column = (word, refs, to) => {
+        // The server sends 500 of each at most (truncated)
+        const cut = data.truncated && refs.length >= 500 ? ', more not shown' : '';
+        return `<div class="rizin-xrefs-col"><div class="rizin-xrefs-head">XREFS ${word} <b>${escapeHtml(label)}</b> · ${refs.length}${cut}</div>`
+            + `<div class="rizin-xrefs-list">${list(refs, to)}</div></div>`;
+    };
+    const to = Array.isArray(data && data.to) ? data.to : [], from = Array.isArray(data && data.from) ? data.from : [];
+    return column('TO', to, true) + column('FROM', from, false);
+}
+
+// STRINGS or IMPORTS (kind) at the filter and page wanted: asked for when it shows another session,
+// filter or page, or with force (or when stale); only while it is shown, else it is marked stale. A
+// jump draws it again with the new place marked. A late answer (another one asked for since) is dropped.
+async function rizinLoadList(kind, force) {
+    const list = rizinState.lists[kind];
+    const sid = rizinState.session;
+    if (!list) return false;
+    if (!rizinDockOnScreen(kind)) {
+        if (force) list.stale = true;
+        return true;
+    }
+    const want = JSON.stringify([sid, list.q, list.offset]);
+    if (!sid || (!force && !list.stale && list.at === want)) {
+        rizinRenderList(kind);
+        return true;
+    }
+    const seq = ++list.seq;
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/${kind}?q=${encodeURIComponent(list.q)}&offset=${list.offset}&limit=${RIZIN_PAGE}`);
+    if (sid !== rizinState.session || seq !== list.seq) return false;
+    if (!r.ok) {
+        if (r.state === 'busy') rizinViewBusy(kind, force);
+        list.problem = r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); the ${kind} follow.`
+            : `The ${kind} could not be loaded: ${r.error}`;
+        rizinRenderList(kind);
+        return false;
+    }
+    rizinState.retry.delete(kind);
+    Object.assign(list, { at: want, total: Number.isInteger(r.data.total) ? r.data.total : 0,
+                          items: Array.isArray(r.data.items) ? r.data.items : [], stale: false, problem: '',
+                          truncated: r.data.truncated === true });
+    rizinRenderList(kind);
+    return true;
+}
+
+// STRINGS or IMPORTS drawn: the page, else why there is none, and the pager in the dock's head (a + when the
+// server kept only the first rows rizin listed). The same page drawn again (a jump moved the mark) keeps the
+// rows in sight where they are.
+function rizinRenderList(kind) {
+    const pane = document.getElementById(`rizin-${kind}`), list = rizinState.lists[kind];
+    if (!pane || !list) return;
+    const sid = rizinState.session;
+    const at = JSON.stringify([sid, list.q, list.offset]);
+    const ready = !!sid && Array.isArray(list.items) && list.at === at && !list.problem;
+    let html;
+    if (ready && list.items.length) {
+        html = (kind === 'strings' ? rizinStringsHtml : rizinImportsHtml)(list.items, { current: rizinState.seek });
+    } else {
+        const text = !sid ? 'No file open.' : list.problem || (!ready ? 'Loading…'
+            : list.q ? 'Nothing matches the filter.' : `rizin found no ${kind}.`);
+        html = `<div class="rizin-empty">${escapeHtml(text)}</div>`;
+    }
+    if (html !== list.shown) {
+        const anchor = ready && list.shownAt === at ? rizinScrollAnchor(pane) : null;
+        pane.innerHTML = html;
+        if (anchor) rizinRestoreScroll(pane, anchor);
+        else pane.scrollTop = 0;
+        list.shown = html;
+        list.shownAt = ready ? at : '';
+    }
+    const pager = document.getElementById(`rizin-${kind}-pager`);
+    const prev = document.getElementById(`rizin-${kind}-prev`), next = document.getElementById(`rizin-${kind}-next`);
+    if (pager) {
+        const cut = ready && !!list.truncated;
+        pager.textContent = !ready ? '' : !list.total ? 'none' : `${list.offset + 1}–${list.offset + list.items.length} of ${list.total}${cut ? '+' : ''}`;
+        pager.title = cut ? `rizin listed more ${kind} than are kept here; the console lists the others (${kind === 'strings' ? 'iz~text' : 'ii~name'}).` : '';
+    }
+    if (prev) prev.disabled = !ready || list.offset <= 0;
+    if (next) next.disabled = !ready || list.offset + RIZIN_PAGE >= list.total;
+}
+
+// Typing in the filter of STRINGS or IMPORTS asks for its first page a moment later, Enter (now) at once
+function rizinOnListFilter(kind, now) {
+    const list = rizinState.lists[kind];
+    const input = document.getElementById(`rizin-${kind}-filter`);
+    if (!list || !input) return;
+    if (list.timer !== null) clearTimeout(list.timer);
+    list.timer = null;
+    const apply = () => {
+        list.timer = null;
+        const changed = input.value !== list.q;
+        if (!changed && !now) return;
+        list.q = input.value;
+        list.offset = 0;
+        rizinLoadList(kind, !changed);
+    };
+    if (now) apply();
+    else list.timer = setTimeout(apply, RIZIN_FILTER_MS);
+}
+
+// ‹ › the page before or after
+function rizinListPage(kind, delta) {
+    const list = rizinState.lists[kind];
+    const next = list ? list.offset + delta * RIZIN_PAGE : -1;
+    if (!list || !Array.isArray(list.items) || next < 0 || next >= list.total) return Promise.resolve(false);
+    list.offset = next;
+    return rizinLoadList(kind, false);
+}
+
+// Whether XREFS shows the references of the current place
+function rizinXrefsHold(xrefs) {
+    return !!xrefs && xrefs.session === rizinState.session && xrefs.addr === rizinState.seek;
+}
+
+// XREFS at seek, as the other views: asked for when it shows another place (or with force), only
+// while it is shown (else when it is shown again, rizinDockShown); busy shows until the poll finds
+// rizin free; a forced answer that a jump dropped is asked for again, forced.
+async function rizinLoadXrefs(force) {
+    const sid = rizinState.session, seek = rizinState.seek;
+    const wanted = !!sid && !!seek && (!!force || !rizinXrefsHold(rizinState.xrefs));
+    if (!rizinDockOnScreen('xrefs')) {
+        if (wanted) rizinState.xrefsPending = !!force || rizinState.xrefsPending === true;
+        return true;
+    }
+    if (wanted) {
+        const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/xrefs?addr=${encodeURIComponent(seek)}`);
+        if (sid !== rizinState.session || seek !== rizinState.seek) {      // a later jump draws
+            if (force && sid === rizinState.session) rizinViewBusy('xrefs', true);
+            return false;
+        }
+        if (!r.ok) {
+            if (r.state === 'busy') rizinViewBusy('xrefs', force);
+            rizinRenderXrefs(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); the references follow.`
+                : `The references could not be loaded: ${r.error}`);
+            return false;
+        }
+        rizinState.retry.delete('xrefs');
+        rizinState.xrefs = { session: sid, addr: seek, data: r.data };
+    }
+    rizinRenderXrefs();
+    return true;
+}
+
+// XREFS: the references of the place, named by its function (at a function's entry: the whole
+// function), the import clicked, or its address; else why there are none (problem)
+function rizinRenderXrefs(problem) {
+    const pane = document.getElementById('rizin-xrefs');
+    if (!pane) return;
+    const x = rizinState.xrefs;
+    let html;
+    if (rizinState.session && rizinState.seek && rizinXrefsHold(x)) {
+        const data = x.data && typeof x.data === 'object' ? x.data : {};
+        const fn = typeof data.function === 'string' ? data.function : null;
+        const named = rizinState.placeName && rizinState.placeName.addr === x.addr ? rizinState.placeName.name : null;
+        const label = data.scope === 'function' && fn ? fn : named || (fn ? `${x.addr} in ${fn}` : x.addr);
+        html = rizinXrefsHtml(data, { label });
+    } else {
+        const text = !rizinState.session ? 'No file open.'
+            : !rizinState.seek ? 'No address yet: click a function, or enter an address or a name in SEEK.' : problem || 'Loading…';
+        html = `<div class="rizin-empty rizin-xrefs-empty">${escapeHtml(text)}</div>`;
+    }
+    if (html === rizinState.xrefsShown) return;
+    rizinState.xrefsShown = html;
+    pane.innerHTML = html;
+}
+
+// A click in XREFS, STRINGS or IMPORTS (kind) jumps to the address of its row, in XREFS to the
+// address clicked; an import's jump shows its references (XREFS). Not when it ends a selection.
+function rizinOnDockClick(event, kind) {
+    if (typeof window.getSelection === 'function' && String(window.getSelection())) return false;
+    const el = event.target && event.target.closest ? event.target.closest('[data-addr]') : null;
+    const addr = el ? rizinHex(el.getAttribute('data-addr')) : null;
+    if (!addr) return false;
+    if (kind !== 'imports') return rizinSeek(addr, kind);
+    const item = (rizinState.lists.imports.items || []).find(i => i && rizinHex(i.offset) === addr);
+    rizinState.placeName = item ? { addr, name: `${item.name ?? ''}${item.library ? ` (${item.library})` : ''}` } : null;
+    return rizinSeek(addr, 'imports').then(moved => (moved ? rizinShowDock('xrefs') : false));
+}
+
+// Shows a pane of the dock (console, xrefs, strings or imports)
+function rizinShowDock(name) {
+    const dock = document.getElementById('rizin-dock');
+    if (!dock) return Promise.resolve(false);
+    dock.querySelectorAll('[data-rizin-tab]').forEach(t => t.setAttribute('aria-selected', String(t.getAttribute('data-rizin-tab') === name)));
+    dock.querySelectorAll('[data-rizin-pane]').forEach(pane => { pane.hidden = pane.getAttribute('data-rizin-pane') !== name; });
+    rizinState.views.dock = name;
+    return rizinDockShown(name);
+}
+
+// A pane of the dock came into sight (its tab, or ▾ unfolded the dock): its tools in the head, its
+// note, and what it waited for
+function rizinDockShown(name) {
+    document.querySelectorAll('[data-rizin-tools]').forEach(el => { el.hidden = el.getAttribute('data-rizin-tools') !== name; });
+    rizinRenderDockNote();
+    if (!rizinDockOnScreen(name)) return Promise.resolve(true);
+    if (name === 'xrefs') {
+        const pending = rizinState.xrefsPending;
+        rizinState.xrefsPending = null;
+        return rizinLoadXrefs(pending === true);
+    }
+    if (name === 'strings' || name === 'imports') return rizinLoadList(name, false);
+    return Promise.resolve(true);
+}
+
+function rizinDockOnScreen(name) {
+    return rizinState.views.dock === name && !rizinState.layout.dockFolded;
+}
+
+function rizinRenderDockNote() {
+    const note = document.getElementById('rizin-dock-note');
+    if (note) note.textContent = { console: 'follows the views', imports: 'a click shows its references' }[rizinState.views.dock] || 'a click jumps there';
+}
+
+// ▾ folds the dock to its head, ▴ brings it back with the pane it showed
+function rizinToggleDock() {
+    rizinState.layout.dockFolded = !rizinState.layout.dockFolded;
+    rizinApplyDockLayout();
+    if (!rizinState.layout.dockFolded) rizinDockShown(rizinState.views.dock);
+}
+
+// The dock's height and ▾; ═, a separator, says the height (px) and its range to assistive technology
+function rizinApplyDockLayout() {
+    const dock = document.getElementById('rizin-dock');
+    if (!dock) return;
+    const { dock: height, dockFolded: folded } = rizinState.layout;
+    dock.classList.toggle('rizin-dock-folded', folded);
+    dock.style.height = !folded && height !== null ? `${height}px` : '';
+    const grip = document.getElementById('rizin-dock-grip');
+    const now = height ?? Math.round(Number(dock.getBoundingClientRect().height) || 0);
+    const room = Number(document.getElementById('rizin-work')?.getBoundingClientRect().height) || 0;
+    if (grip && !folded && now > 0) {
+        grip.setAttribute('aria-valuenow', String(now));
+        grip.setAttribute('aria-valuetext', `${now} px`);
+        if (room > 0) grip.setAttribute('aria-valuemax', String(Math.max(RIZIN_DOCK.min, Math.round(room - RIZIN_DOCK.keep))));
+    }
+    const button = document.getElementById('rizin-dock-fold');
+    if (!button) return;
+    const label = folded ? 'Show the console and the lists' : 'Fold the console and the lists away';
+    button.textContent = folded ? '▴' : '▾';
+    button.title = label;
+    button.setAttribute('aria-label', label);
+    button.setAttribute('aria-expanded', String(!folded));
+}
+
+// The dock's height in px, at least RIZIN_DOCK.min and leaving the views RIZIN_DOCK.keep of the work
+// area (null: the style sheet's); kept until the page is loaded again
+function rizinSetDockHeight(px) {
+    const layout = rizinState.layout;
+    if (px === null || !Number.isFinite(px)) {
+        layout.dock = null;
+    } else {
+        const room = Number(document.getElementById('rizin-work')?.getBoundingClientRect().height) || 0;
+        const most = room > 0 ? Math.max(RIZIN_DOCK.min, room - RIZIN_DOCK.keep) : Infinity;
+        layout.dock = Math.round(Math.min(most, Math.max(RIZIN_DOCK.min, px)));
+    }
+    rizinApplyDockLayout();
+}
+
+// ═ drags the dock's height (up: higher)
+function rizinOnDockGripDown(event) {
+    const dock = document.getElementById('rizin-dock'), grip = document.getElementById('rizin-dock-grip');
+    if ((event.button !== undefined && event.button !== 0) || rizinState.layout.dockFolded || !dock || !grip) return;
+    event.preventDefault();
+    rizinState.dockDrag = { y: event.clientY, height: rizinState.layout.dock ?? (Number(dock.getBoundingClientRect().height) || 0) };
+    grip.classList.add('rizin-dock-drag');
+    if (typeof grip.setPointerCapture === 'function' && event.pointerId !== undefined) {
+        try {
+            grip.setPointerCapture(event.pointerId);
+        } catch (e) {
+            // The pointer is gone already: the drag ends with it
+        }
+    }
+}
+
+function rizinOnDockGripMove(event) {
+    const drag = rizinState.dockDrag;
+    if (drag && event.buttons === 0) rizinOnDockGripUp();
+    else if (drag) rizinSetDockHeight(drag.height + drag.y - event.clientY);
+}
+
+function rizinOnDockGripUp() {
+    rizinState.dockDrag = null;
+    document.getElementById('rizin-dock-grip')?.classList.remove('rizin-dock-drag');
+}
+
+// ↑ ↓ on ═ make the dock higher or lower
+function rizinOnDockGripKey(event) {
+    const step = event.key === 'ArrowUp' ? RIZIN_DOCK.step : event.key === 'ArrowDown' ? -RIZIN_DOCK.step : 0;
+    if (!step || rizinState.layout.dockFolded) return;
+    event.preventDefault();
+    const dock = document.getElementById('rizin-dock');
+    rizinSetDockHeight((rizinState.layout.dock ?? (Number(dock && dock.getBoundingClientRect().height) || 0)) + step);
+}
+
+// --- Rename and Comment: the right-click menu ---
+// A right-click on a function, a line of the disassembly or a block of the
+// graph opens it for that address; Rename names the function there (afn on
+// the server), Comment sets or, empty, removes the comment there. Both are
+// kept in the file's project, and every view is drawn again.
+
+// source: functions, disasm or graph; elsewhere the browser's own menu shows
+function rizinOnContextMenu(event, source) {
+    const selector = { functions: '.rizin-fn', disasm: '.rizin-op', graph: '.rizin-block' }[source];
+    const el = selector && event.target && event.target.closest ? event.target.closest(selector) : null;
+    const addr = el ? rizinHex(el.getAttribute('data-addr')) : null;
+    if (!addr || !rizinState.session) return;
+    event.preventDefault();
+    let name = null;
+    if (source === 'functions') {
+        const fn = (rizinState.functions || []).find(f => f && rizinHex(f.offset) === addr);
+        name = fn ? String(fn.name ?? '') : null;
+    } else if (source === 'disasm') {
+        name = rizinPageHolds(rizinState.disasm) ? rizinState.disasm.function : null;
+    } else {
+        name = rizinGraphHolds(rizinState.graph) ? rizinState.graph.function : null;
+    }
+    const page = rizinState.disasm;
+    const op = page && page.session === rizinState.session ? page.ops.find(o => o && rizinHex(o.offset) === addr) : null;
+    // The comment there, if the page shown has the address; else null: Comment… reads it first
+    rizinOpenMenu({ addr, source, name: name || null, comment: op ? (typeof op.comment === 'string' ? op.comment : '') : null },
+                  Number(event.clientX) || 0, Number(event.clientY) || 0);
+}
+
+// The menu at x, y (inside the window) for info (addr, source, name of the function, comment there or
+// null when it is not known here)
+function rizinOpenMenu(info, x, y) {
+    const menu = document.getElementById('rizin-menu');
+    if (!menu) return;
+    const back = rizinState.menu ? rizinState.menu.back : document.activeElement;
+    rizinState.menu = { ...info, action: null, saving: false, back, x, y };
+    const head = document.getElementById('rizin-menu-head');
+    if (head) head.textContent = info.name ? `${info.addr} · ${info.name}` : info.addr;
+    const rename = document.getElementById('rizin-menu-rename');
+    if (rename) {
+        rename.disabled = !info.name;
+        rename.title = info.name ? `Rename ${info.name}` : 'No function at this address';
+    }
+    const items = document.getElementById('rizin-menu-items'), form = document.getElementById('rizin-menu-form');
+    const note = document.getElementById('rizin-menu-note');
+    if (items) items.hidden = false;
+    if (form) form.hidden = true;
+    if (note) note.textContent = '';
+    menu.hidden = false;
+    rizinPlaceMenu();
+    (rename && !rename.disabled ? rename : document.getElementById('rizin-menu-comment'))?.focus();
+}
+
+// The menu at the place it was opened at, moved so that it stays inside the window: again once the
+// field makes it taller. Measured at the top left, where nothing narrows it.
+function rizinPlaceMenu() {
+    const menu = document.getElementById('rizin-menu'), info = rizinState.menu;
+    if (!menu || !info) return;
+    menu.style.left = '0px';
+    menu.style.top = '0px';
+    const size = menu.getBoundingClientRect();
+    const left = Math.max(4, Math.min(info.x, (Number(window.innerWidth) || 0) - (Number(size.width) || 0) - 4));
+    const top = Math.max(4, Math.min(info.y, (Number(window.innerHeight) || 0) - (Number(size.height) || 0) - 4));
+    menu.style.left = `${Math.round(left)}px`;
+    menu.style.top = `${Math.round(top)}px`;
+}
+
+// Closes the menu; refocus (Esc, Cancel): the focus goes back to where it was before the menu opened
+function rizinCloseMenu(refocus) {
+    const back = rizinState.menu && rizinState.menu.back;
+    rizinState.menu = null;
+    const menu = document.getElementById('rizin-menu');
+    if (menu) menu.hidden = true;
+    rizinMenuWaits(false);
+    if (refocus && back && back.isConnected && typeof back.focus === 'function') back.focus();
+}
+
+// The menu's field and Save while the comment there is read (waiting), or ready
+function rizinMenuWaits(waiting) {
+    const input = document.getElementById('rizin-menu-input'), save = document.getElementById('rizin-menu-save');
+    if (input) input.disabled = waiting;
+    if (save) save.disabled = waiting;
+}
+
+// The line under the menu's field (waiting: a request is out); the menu stays inside the window as the
+// line makes it taller
+function rizinMenuNote(text, waiting) {
+    const note = document.getElementById('rizin-menu-note');
+    if (!note) return;
+    note.className = 'rizin-menu-note' + (waiting ? ' rizin-menu-wait' : '');
+    note.textContent = text;
+    rizinPlaceMenu();
+}
+
+// Rename…, Comment…, Save and Cancel in the menu
+function rizinOnMenuClick(event) {
+    const button = event.target && event.target.closest ? event.target.closest('[data-action]') : null;
+    if (!button || button.disabled) return;
+    const action = button.getAttribute('data-action');
+    if (action === 'rename' || action === 'comment') rizinMenuForm(action);
+    else if (action === 'save') rizinMenuSubmit();
+    else if (action === 'cancel') rizinCloseMenu(true);
+}
+
+// Esc closes the menu (and goes no further), Enter saves, ↑ ↓ move between its items
+function rizinOnMenuKey(event) {
+    if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        rizinCloseMenu(true);
+    } else if (event.key === 'Enter' && event.target && event.target.id === 'rizin-menu-input') {
+        event.preventDefault();
+        rizinMenuSubmit();
+    } else if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && document.getElementById('rizin-menu-items')?.hidden === false) {
+        const items = [...document.querySelectorAll('#rizin-menu .rizin-menu-item')].filter(b => !b.disabled);
+        if (!items.length) return;
+        event.preventDefault();
+        const at = items.indexOf(document.activeElement);
+        items[(at + (event.key === 'ArrowDown' ? 1 : items.length - 1)) % items.length].focus();
+    }
+}
+
+// The menu's field for the new name (filled with the old one) or the comment (with the one there, read
+// from rizin first when the page shown does not have it); the menu stays inside the window
+function rizinMenuForm(action) {
+    const menu = rizinState.menu;
+    const input = document.getElementById('rizin-menu-input');
+    if (!menu || !input) return;
+    menu.action = action;
+    document.getElementById('rizin-menu-items').hidden = true;
+    document.getElementById('rizin-menu-form').hidden = false;
+    document.getElementById('rizin-menu-label').textContent = action === 'rename' ? `New name for ${menu.name}`
+        : `Comment at ${menu.addr} (empty removes it)`;
+    document.getElementById('rizin-menu-note').textContent = '';
+    input.value = action === 'rename' ? menu.name || '' : menu.comment || '';
+    input.setAttribute('maxlength', action === 'rename' ? '128' : '500');
+    rizinMenuWaits(false);
+    rizinPlaceMenu();
+    if (action === 'comment' && menu.comment === null) {
+        rizinMenuReadComment(menu);
+        return;
+    }
+    input.focus();
+    if (typeof input.select === 'function') input.select();
+}
+
+// Comment… at an address the page shown does not have: the field waits while the comment there is read,
+// so that an empty field removes only a comment that was seen. If it cannot be read the field opens
+// empty, and rizinMenuSubmit does not send it empty. A reading for a menu closed meanwhile is dropped.
+async function rizinMenuReadComment(menu) {
+    const input = document.getElementById('rizin-menu-input');
+    const sid = rizinState.session;
+    if (!input || !sid) return false;
+    rizinMenuWaits(true);
+    rizinMenuNote('Reading the comment here…', true);
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/comment?addr=${encodeURIComponent(menu.addr)}`);
+    if (rizinState.menu !== menu || menu.action !== 'comment' || sid !== rizinState.session) return false;
+    rizinMenuWaits(false);
+    if (r.ok && typeof r.data.comment === 'string') {
+        menu.comment = r.data.comment;
+        input.value = r.data.comment;
+        rizinMenuNote('');
+    } else {
+        const running = !!rizinState.analysis && rizinState.analysis.state === 'running';
+        rizinMenuNote(r.state !== 'busy' ? `The comment here could not be read: ${r.error}`
+            : running || r.data.step === 'analysis' ? 'Available when the analysis is done.'
+                : `rizin is busy (${r.data.step || 'rizin'}); the comment here could not be read.`);
+        if (r.state === 'busy') rizinPollSoon();
+    }
+    input.focus();
+    if (typeof input.select === 'function') input.select();
+    return !!r.ok;
+}
+
+// Save: the name or the comment goes to rizin; the menu closes and every view is drawn again, or it
+// stays and says why (a name rizin does not take; renames and comments wait for the analysis; an empty
+// comment where the one there could not be read, which it would remove unseen)
+async function rizinMenuSubmit() {
+    const menu = rizinState.menu;
+    const input = document.getElementById('rizin-menu-input');
+    if (!menu || !menu.action || menu.saving || !input || input.disabled) return false;
+    if (menu.action === 'rename' && !input.value.trim()) {
+        rizinMenuNote('Type the new name.');
+        return false;
+    }
+    if (menu.action === 'comment' && menu.comment === null && !input.value) {
+        rizinMenuNote('Not saved: the comment here could not be read, and an empty field would remove it.');
+        return false;
+    }
+    const sid = rizinState.session;
+    menu.saving = true;
+    rizinMenuNote('Saving…', true);
+    const r = menu.action === 'rename' ? await rizinRename(menu.addr, input.value.trim()) : await rizinComment(menu.addr, input.value);
+    if (sid !== rizinState.session) return false;
+    if (r.ok) {
+        if (rizinState.menu === menu) rizinCloseMenu();
+        await rizinAnnotated();
+        return true;
+    }
+    if (rizinState.menu !== menu) return false;
+    menu.saving = false;
+    if (r.state === 'moved' || r.state === 'ended') {
+        rizinCloseMenu();
+        return false;
+    }
+    const running = !!rizinState.analysis && rizinState.analysis.state === 'running';
+    rizinMenuNote(r.state !== 'busy' ? r.error : running || r.data.step === 'analysis' ? 'Available when the analysis is done.'
+        : `rizin is busy (${r.data.step || 'rizin'}); try again in a moment.`, r.state === 'busy');
+    if (r.state === 'busy') rizinPollSoon();
+    return false;
+}
+
+// POST rename for the function at addr; when it names the function anew, the list and SEEK take the
+// name at once (rizinFunctionRenamed)
+async function rizinRename(addr, name) {
+    const sid = rizinState.session;
+    if (!sid) return { ok: false, status: 0, data: {}, error: 'no file is open', state: 'error' };
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/rename`, { method: 'POST', body: { addr: rizinHex(addr) || String(addr), name } });
+    if (r.ok && sid === rizinState.session) rizinFunctionRenamed(rizinHex(r.data.offset), typeof r.data.name === 'string' ? r.data.name : null);
+    return r;
+}
+
+// POST comment at addr (an empty text removes it)
+async function rizinComment(addr, text) {
+    const sid = rizinState.session;
+    if (!sid) return { ok: false, status: 0, data: {}, error: 'no file is open', state: 'error' };
+    return rizinApi(`/api/rizin/${encodeURIComponent(sid)}/comment`, { method: 'POST', body: { addr: rizinHex(addr) || String(addr), text } });
+}
+
+// --- DECOMPILER and HEX: the current function in C (rz-ghidra), the bytes at the current address ---
+// Both are code views beside DISASSEMBLY: each asks only while it is the one shown, else once it is shown
+// again (rizinCodeShown). DECOMPILER keeps the C of the current function while the place moves in it and
+// marks the line of the current address; HEX shows RIZIN_HEX_LEN bytes from it.
+
+// Whether the code view name (disasm, decompiler or hex) is in sight: its tab chosen, and the code views
+// shown (not GRAPH chosen below 1400 px, nor ⇱ given to the graph)
+function rizinCodeOnScreen(name) {
+    const layout = rizinState.layout;
+    return rizinState.views.code === name && (layout.narrow ? !layout.narrowGraph : layout.max !== 'graph');
+}
+
+// A code view came into sight: what it waited for while hidden, else the current place; DISASSEMBLY the
+// place a jump reached while it had no size, and the next page if its page is shorter than the view
+function rizinCodeShown(name) {
+    if (!rizinCodeOnScreen(name)) return Promise.resolve(true);
+    if (name === 'disasm') {
+        const pane = document.getElementById('rizin-disasm');
+        if (pane && pane.clientHeight > 0 && rizinState.disasmJump !== rizinState.jumpSeq) {
+            rizinState.disasmJump = rizinState.jumpSeq;
+            rizinReveal(pane, pane.querySelector('.rizin-op.current'));
+        }
+        rizinDisasmCatchUp();
+    }
+    if (name === 'decompiler') {
+        const pending = rizinState.decompilerPending;
+        rizinState.decompilerPending = null;
+        return rizinLoadDecompiler(pending === true);
+    }
+    if (name === 'hex') {
+        const pending = rizinState.hexPending;
+        rizinState.hexPending = null;
+        return rizinLoadHex(pending === true);
+    }
+    return Promise.resolve(true);
+}
+
+// The addresses of a line of C: its offsets, and its offset
+function rizinLineOffsets(line) {
+    const offsets = line && Array.isArray(line.offsets) ? line.offsets.filter(o => Number.isInteger(o) && o >= 0) : [];
+    if (line && Number.isInteger(line.offset) && line.offset >= 0 && !offsets.includes(line.offset)) offsets.push(line.offset);
+    return offsets;
+}
+
+// The line of the current address (its index, -1 for none): of the lines with the nearest of rizin's
+// addresses at or before it the first line of code, else the first of them (rz-ghidra gives the WARNING
+// comments above a function's signature the function's address, and a comment the address it is at); the
+// line clicked (prefer) when it has that address too
+function rizinDecompilerMark(lines, current, prefer) {
+    const at = rizinNum(rizinHex(current));
+    const list = Array.isArray(lines) ? lines : [];
+    if (!Number.isFinite(at)) return -1;
+    let best = -1, code = -1, nearest = -1;
+    list.forEach((line, i) => {
+        const text = String((line && line.text) ?? '').trim();
+        const comment = !text || text.startsWith('//') || (text.startsWith('/*') && text.endsWith('*/'));
+        for (const offset of rizinLineOffsets(line)) {
+            if (offset > at || offset < nearest) continue;
+            if (offset > nearest) [best, code, nearest] = [i, -1, offset];
+            if (code < 0 && !comment) code = i;
+        }
+    });
+    if (code >= 0) best = code;
+    if (best >= 0 && Number.isInteger(prefer) && rizinLineOffsets(list[prefer]).includes(nearest)) best = prefer;
+    return best;
+}
+
+// A line of rz-ghidra's C as markup: keywords and types, the names of the functions it calls (rizin's names
+// have dots: sym.imp.KERNEL32.dll_Sleep), strings and comments in their colours, everything else as text.
+// Linear: every try at a quote or a comment matches (one that nothing closes takes the rest of the line),
+// and each name is looked at once.
+function rizinCHtml(text) {
+    const source = String(text ?? '');
+    const call = /\s*\(/y;
+    let html = '', at = 0;
+    for (const m of source.matchAll(/\/\*[\s\S]*?(?:\*\/|$)|\/\/[\s\S]*|"(?:[^"\\]|\\[\s\S])*"?|'(?:[^'\\]|\\[\s\S])*'?|[A-Za-z_][\w.]*/g)) {
+        const token = m[0];
+        let kind = '';
+        if (token[0] === '/') kind = 'rz-comment';
+        else if (token[0] === '"' || token[0] === "'") kind = 'rz-str';
+        else if (RIZIN_C_WORDS.has(token)) kind = 'rz-kw';
+        else {
+            call.lastIndex = m.index + token.length;
+            if (call.test(source)) kind = 'rz-fn';
+        }
+        if (!kind) continue;
+        html += `${escapeHtml(source.slice(at, m.index))}<span class="${kind}">${escapeHtml(token)}</span>`;
+        at = m.index + token.length;
+    }
+    return html + escapeHtml(source.slice(at));
+}
+
+// The lines of DECOMPILER: rz-ghidra's C, each with its index in data-line; a line with an address (its
+// offset, as pdgo shows it) carries it in data-addr and all its addresses on hover. current (an address)
+// marks its line (rizinDecompilerMark), line is the line clicked.
+function rizinDecompilerHtml(lines, options) {
+    const { current = null, line = null } = options || {};
+    const list = Array.isArray(lines) ? lines : [];
+    const mark = rizinDecompilerMark(list, current, line);
+    let html = '';
+    list.forEach((item, i) => {
+        const text = item && item.text !== null && item.text !== undefined ? String(item.text) : '';
+        const addr = rizinHex(item && item.offset);
+        const all = rizinLineOffsets(item).sort((a, b) => a - b).map(rizinHex).filter(Boolean);
+        html += `<div class="rizin-dec-line${i === mark ? ' current' : ''}${addr ? ' rizin-dec-jump' : ''}" data-line="${i}"`
+            + (addr ? ` data-addr="${addr}" title="${escapeHtml(all.join(' '))}"` : '')
+            + `>${text ? rizinCHtml(text) : ' '}</div>`;
+    });
+    return html;
+}
+
+// Whether the C shown is for the current place: asked for at this address, or of the current function;
+// rz-ghidra missing holds for the whole session
+function rizinDecompilerHolds(dec) {
+    if (!dec || dec.session !== rizinState.session) return false;
+    if (dec.addr === rizinState.seek || dec.available === false) return true;
+    return !dec.ended && typeof dec.function === 'string' && dec.function === rizinState.func;
+}
+
+// What a view says when its request ended the session: the server's reason (a sentence of its own, as
+// "Decompiling took too long, the session ended."), else the reason in brackets
+function rizinEndedText(reason) {
+    const why = typeof reason === 'string' ? reason.trim() : '';
+    if (!why) return 'Session ended.';
+    return /[.!?]$/.test(why) ? why : `The session ended (${why}).`;
+}
+
+// The current place's function (its name, else the address) if its decompile ended a session of this file
+// (rizin was stopped during it): DECOMPILER does not ask for it again on its own, Decompile again does
+function rizinDecompileSlow() {
+    const path = rizinState.file && typeof rizinState.file.path === 'string' ? rizinState.file.path : null;
+    const key = rizinState.func || rizinState.seek;
+    return rizinState.decompileSlow.find(s => s.path === path && s.func === key) || null;
+}
+
+// Decompile again (the function whose decompile ended a session): asked for once more, and remembered again
+// if it ends this session too
+function rizinDecompileAgain() {
+    const slow = rizinDecompileSlow();
+    if (slow) rizinState.decompileSlow = rizinState.decompileSlow.filter(s => s !== slow);
+    return rizinLoadDecompiler(true);
+}
+
+// DECOMPILER at seek, as the graph: asked for when the C shown is not of the current function (or with
+// force), only while it is shown, else once it is (rizinCodeShown). A request out for the same function is
+// waited for rather than sent again: rz-ghidra can take long. Busy shows until the poll finds rizin free; a
+// decompile that ended the session (pdgj over its time limit) says why, with Reopen, and its function is not
+// asked for again on its own in a session of the file (rizinDecompileSlow). rz-ghidra missing holds for the
+// session, forced or not. The same C again keeps the lines drawn; a forced answer that a jump out of the
+// function dropped is asked for again, forced.
+async function rizinLoadDecompiler(force) {
+    const sid = rizinState.session, seek = rizinState.seek, dec = rizinState.decompiler;
+    const missing = !!dec && dec.session === sid && dec.available === false;
+    const wanted = !!sid && !!seek && !missing && (!!force || !rizinDecompilerHolds(dec));
+    if (!rizinCodeOnScreen('decompiler')) {
+        if (wanted) rizinState.decompilerPending = !!force || rizinState.decompilerPending === true;
+        return true;
+    }
+    const out = rizinState.decompilerAsk;
+    const coming = !!out && out.session === sid && (!force || out.force)
+        && (out.addr === seek || (!!out.func && out.func === rizinState.func));
+    if (!wanted || coming) {
+        rizinRenderDecompiler();
+        return true;
+    }
+    const slow = rizinDecompileSlow();
+    if (slow) {
+        rizinState.decompiler = { session: sid, addr: seek, function: rizinState.func, slow: slow.func };
+        rizinRenderDecompiler();
+        return true;
+    }
+    const ask = { session: sid, addr: seek, func: rizinState.func, force: !!force };
+    rizinState.decompilerAsk = ask;
+    rizinRenderDecompiler();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/decompile?addr=${encodeURIComponent(seek)}`);
+    if (rizinState.decompilerAsk === ask) rizinState.decompilerAsk = null;
+    if (sid !== rizinState.session) return false;
+    const fn = r.ok && typeof r.data.function === 'string' ? r.data.function : null;
+    // A later jump inside the same function takes the answer; one out of it asks for its own
+    if (seek !== rizinState.seek && (fn === null || fn !== rizinState.func)) {
+        if (force) rizinViewBusy('decompiler', true);
+        rizinRenderDecompiler();
+        return false;
+    }
+    if (!r.ok) {
+        if (r.state === 'busy') rizinViewBusy('decompiler', force);
+        if (r.state === 'ended') {
+            // With a reason rizin was stopped during the decompile: Reopen must not run it again on its own
+            const path = rizinState.file && typeof rizinState.file.path === 'string' ? rizinState.file.path : null;
+            const func = ask.func || ask.addr;
+            if (r.data.reason && path && !rizinState.decompileSlow.some(s => s.path === path && s.func === func)) {
+                rizinState.decompileSlow.push({ path, func });
+            }
+            rizinState.decompiler = { session: sid, addr: rizinState.seek, ended: rizinEndedText(r.data.reason) };
+            rizinRenderDecompiler();
+        } else {
+            rizinRenderDecompiler(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); the code follows.`
+                : `The code could not be loaded: ${r.error}`);
+        }
+        return false;
+    }
+    rizinState.retry.delete('decompiler');
+    const lines = Array.isArray(r.data.lines) ? r.data.lines : [];
+    const available = r.data.available !== false, reason = typeof r.data.reason === 'string' ? r.data.reason : null;
+    const json = JSON.stringify([fn, available, reason, lines]);
+    const old = rizinState.decompiler;
+    if (old && old.session === sid && old.json === json) {
+        old.addr = seek;                // the same C (an analysis step that changed nothing): the lines drawn stay
+    } else {
+        rizinState.decompiler = { session: sid, addr: seek, function: fn, available, reason, lines, json,
+                                  gen: ++rizinState.decompilerGen };
+    }
+    rizinRenderDecompiler();
+    return true;
+}
+
+// DECOMPILER: the C when it holds the current place, else why not (problem: busy or an error; else it is
+// on its way). The same C at another place in it only moves the mark (a selection stays); a jump brings
+// the marked line into sight, and C drawn again for the same function keeps the lines in sight where they
+// are.
+function rizinRenderDecompiler(problem) {
+    const pane = document.getElementById('rizin-decompiler');
+    if (!pane) return;
+    const dec = rizinState.decompiler, sid = rizinState.session, seek = rizinState.seek;
+    const holds = !!sid && !!seek && rizinDecompilerHolds(dec);
+    if (!holds || dec.ended || dec.slow || dec.available === false || !dec.lines.length) {
+        let html;
+        if (holds && dec.ended) {
+            html = `<div class="rizin-empty rizin-ended">${escapeHtml(dec.ended)} `
+                + '<button type="button" class="btn btn-sm btn-primary" data-action="reopen">Reopen</button></div>';
+        } else if (holds && dec.slow) {
+            html = `<div class="rizin-empty rizin-ended">${escapeHtml(`Decompiling ${dec.slow} took too long and ended the session; it is not asked for again on its own.`)} `
+                + '<button type="button" class="btn btn-sm btn-primary" data-action="decompile-again">Decompile again</button></div>';
+        } else {
+            const text = !sid ? 'The current function in C (rz-ghidra) shows here once a file is open.'
+                : !seek ? 'No address yet: click a function, or enter an address or a name in SEEK.'
+                    : holds ? dec.reason || `rz-ghidra returned no code for ${dec.function || seek}.`
+                        : problem || (rizinState.decompilerAsk ? `Decompiling ${rizinState.func || seek}…` : 'Loading…');
+            html = `<div class="rizin-empty">${escapeHtml(text)}</div>`;
+        }
+        if (html !== rizinState.decompilerShown) pane.innerHTML = html;
+        rizinState.decompilerShown = html;
+        rizinState.decompilerAt = '';
+        return;
+    }
+    const click = rizinState.decompilerClick;
+    const prefer = rizinState.jumpFrom === 'decompiler' && click && click.addr === seek ? click.line : null;
+    const jumped = rizinState.decompilerJump !== rizinState.jumpSeq;
+    rizinState.decompilerJump = rizinState.jumpSeq;
+    const shown = JSON.stringify([sid, dec.gen]);
+    if (shown !== rizinState.decompilerShown) {
+        const place = JSON.stringify([sid, dec.function]);
+        const anchor = place === rizinState.decompilerAt && !jumped ? rizinScrollAnchor(pane) : null;
+        pane.innerHTML = rizinDecompilerHtml(dec.lines, { current: seek, line: prefer });
+        rizinState.decompilerShown = shown;
+        if (anchor) {
+            rizinRestoreScroll(pane, anchor);
+        } else {
+            if (place !== rizinState.decompilerAt) pane.scrollTop = 0;
+            rizinReveal(pane, pane.querySelector('.rizin-dec-line.current'));
+        }
+        rizinState.decompilerAt = place;
+        return;
+    }
+    const mark = rizinDecompilerMark(dec.lines, seek, prefer);
+    pane.querySelectorAll('.rizin-dec-line.current').forEach(el => {
+        if (el.getAttribute('data-line') !== String(mark)) el.classList.remove('current');
+    });
+    if (mark >= 0) pane.querySelector(`.rizin-dec-line[data-line="${mark}"]`)?.classList.add('current');
+    if (jumped) rizinReveal(pane, pane.querySelector('.rizin-dec-line.current'));
+}
+
+// A click on a line of C with an address jumps there (not when it ends a selection of text); Reopen opens
+// the file again, Decompile again asks for the function whose decompile ended a session
+function rizinOnDecompilerClick(event) {
+    const el = event.target && event.target.closest ? event.target : null;
+    if (!el) return false;
+    if (el.closest('[data-action="reopen"]')) return rizinReopen();
+    if (el.closest('[data-action="decompile-again"]')) return rizinDecompileAgain();
+    if (typeof window.getSelection === 'function' && String(window.getSelection())) return false;
+    const line = el.closest('[data-addr]');
+    const addr = line ? rizinHex(line.getAttribute('data-addr')) : null;
+    if (!addr) return false;
+    rizinState.decompilerClick = { addr, line: Number(line.getAttribute('data-line')) };
+    return rizinSeek(addr, 'decompiler');
+}
+
+// The rows of HEX: 16 bytes each from the address asked for, the address in data-addr, then the bytes in
+// hex (two groups of eight) and as ASCII (a dot for a byte that is no printable ASCII); the first byte,
+// the current address, marked in both
+function rizinHexHtml(data) {
+    const base = data && Number.isInteger(data.offset) && data.offset >= 0 ? data.offset : null;
+    const bytes = base !== null && Array.isArray(data.bytes) ? data.bytes : [];
+    let html = '';
+    for (let i = 0; i < bytes.length; i += 16) {
+        const addr = rizinHex(base + i);
+        if (!addr) break;
+        const row = bytes.slice(i, i + 16).map(b => (Number.isInteger(b) && b >= 0 && b <= 255 ? b : 0));
+        const mark = (j, cell) => (i + j === 0 ? `<span class="rizin-hex-cur">${cell}</span>` : cell);
+        const hex = row.map((b, j) => mark(j, b.toString(16).padStart(2, '0')));
+        const ascii = row.map((b, j) => mark(j, escapeHtml(b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : '.')));
+        html += `<div class="rizin-hex-row" data-addr="${addr}"><span class="rz-addr">${addr}</span>`
+            + `<span class="rizin-hex-bytes">${hex.slice(0, 8).join(' ')}${row.length > 8 ? '  ' + hex.slice(8).join(' ') : ''}</span>`
+            + `<span class="rizin-hex-ascii">${ascii.join('')}</span></div>`;
+    }
+    return html;
+}
+
+// The line above the bytes: how many at which address and where that is in the file, with Open in Hex tab
+// (not where no byte of the file is: rizin shows zeros or nothing there)
+function rizinHexBarHtml(data) {
+    const n = data && Array.isArray(data.bytes) ? data.bytes.length : 0;
+    const at = rizinHex(data && data.offset) || '';
+    const paddr = data && Number.isInteger(data.paddr) && data.paddr >= 0 ? rizinHex(data.paddr) : null;
+    const title = paddr ? `The file in the Hex tab at offset ${paddr}` : 'No byte of the file is at this address: rizin shows zeros or nothing here';
+    return `<div class="rizin-hex-bar"><span class="rizin-hex-what">${n} bytes at ${at} · ${paddr ? `file offset ${paddr}` : 'not in the file'}</span>`
+        + `<button type="button" class="rizin-tool rizin-hex-open" data-action="hex-tab" title="${escapeHtml(title)}"${paddr ? '' : ' disabled'}>`
+        + 'Open in Hex tab</button></div>';
+}
+
+function rizinHexHolds(hex) {
+    return !!hex && hex.session === rizinState.session && hex.addr === rizinState.seek;
+}
+
+// HEX at seek: asked for at every new place (or with force), only while it is shown, else once it is
+// (rizinCodeShown); a request out for the place is not sent again; busy shows until the poll finds rizin
+// free, and a forced answer that a jump dropped is asked for again, forced
+async function rizinLoadHex(force) {
+    const sid = rizinState.session, seek = rizinState.seek;
+    const wanted = !!sid && !!seek && (!!force || !rizinHexHolds(rizinState.hex));
+    if (!rizinCodeOnScreen('hex')) {
+        if (wanted) rizinState.hexPending = !!force || rizinState.hexPending === true;
+        return true;
+    }
+    const out = rizinState.hexAsk;
+    if (wanted && !(out && out.session === sid && out.addr === seek && (!force || out.force))) {
+        const ask = { session: sid, addr: seek, force: !!force };
+        rizinState.hexAsk = ask;
+        const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/hex?addr=${encodeURIComponent(seek)}&len=${RIZIN_HEX_LEN}`);
+        if (rizinState.hexAsk === ask) rizinState.hexAsk = null;
+        if (sid !== rizinState.session || seek !== rizinState.seek) {      // a later jump draws
+            if (force && sid === rizinState.session) rizinViewBusy('hex', true);
+            return false;
+        }
+        if (!r.ok) {
+            if (r.state === 'busy') rizinViewBusy('hex', force);
+            rizinRenderHex(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); the bytes follow.`
+                : `The bytes could not be loaded: ${r.error}`);
+            return false;
+        }
+        rizinState.retry.delete('hex');
+        rizinState.hex = { session: sid, addr: seek, data: r.data };
+    }
+    rizinRenderHex();
+    return true;
+}
+
+// HEX: the bytes when they are of the current address, else why not (problem: busy or an error; else they
+// are on their way)
+function rizinRenderHex(problem) {
+    const pane = document.getElementById('rizin-hex');
+    if (!pane) return;
+    const hex = rizinState.hex;
+    let html;
+    if (rizinState.session && rizinState.seek && rizinHexHolds(hex)) {
+        const rows = rizinHexHtml(hex.data);
+        html = rows ? rizinHexBarHtml(hex.data) + rows : `<div class="rizin-empty">${escapeHtml(`No bytes at ${rizinState.seek}.`)}</div>`;
+    } else {
+        const text = !rizinState.session ? 'The bytes at the current address show here once a file is open.'
+            : !rizinState.seek ? 'No address yet: click a function, or enter an address or a name in SEEK.' : problem || 'Loading…';
+        html = `<div class="rizin-empty">${escapeHtml(text)}</div>`;
+    }
+    if (html === rizinState.hexShown) return;
+    rizinState.hexShown = html;
+    pane.innerHTML = html;
+    pane.scrollTop = 0;
+}
+
+// Open in Hex tab, in HEX's line above the bytes (a delegated click)
+function rizinOnHexClick(event) {
+    const button = event.target && event.target.closest ? event.target.closest('[data-action="hex-tab"]') : null;
+    if (!button || button.disabled || button.hasAttribute('disabled')) return false;
+    return rizinOpenHexTab();
+}
+
+// The file shown in the Hex tab, at the file offset of the current address (the Hex tab's own open)
+function rizinOpenHexTab() {
+    const hex = rizinState.hex, file = rizinState.file;
+    const paddr = rizinHexHolds(hex) && hex.data && Number.isInteger(hex.data.paddr) && hex.data.paddr >= 0 ? hex.data.paddr : null;
+    if (paddr === null || !file || typeof file.path !== 'string' || !file.path) return false;
+    hexOpenFile(file.path, paddr);
+    return true;
+}
+
+// --- More of a long disassembly ---
+
+// The line under the last instruction while the function goes on: what scrolling there does, a page on
+// its way, or why the last try failed
+function rizinMoreText(page) {
+    if (page && page.loading) return 'Loading the next instructions…';
+    if (page && page.moreError) return `${page.moreError} Scroll down or click here to try again.`;
+    return 'More instructions below: scroll down or click here.';
+}
+
+function rizinRenderMore() {
+    const el = document.querySelector('#rizin-disasm .rizin-more');
+    if (el) el.textContent = rizinMoreText(rizinState.disasm);
+}
+
+// DISASSEMBLY of a long function (or outside functions): the next page, after the last line shown, once
+// the view is scrolled near its end (rizinOnDisasmScroll) or the line under the last one is clicked. It is
+// added to the page shown, so a jump into it asks nothing and the right-click menu finds its comments. One
+// request at a time; after a failed one the next try waits RIZIN_MORE.wait; a page asked for meanwhile
+// (another place, a step of the analysis) drops it.
+async function rizinLoadMore() {
+    const page = rizinState.disasm, sid = rizinState.session;
+    if (!page || page.session !== sid || !page.more || page.loading || !page.ops.length || !rizinPageHolds(page)) return false;
+    if (page.moreError && Date.now() - (page.moreTried || 0) < RIZIN_MORE.wait) return false;
+    const last = page.ops[page.ops.length - 1].offset;
+    const after = rizinHex(last);
+    if (!after) return false;
+    page.loading = true;
+    rizinRenderMore();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/disasm?addr=${encodeURIComponent(page.addr)}&after=${encodeURIComponent(after)}`);
+    page.loading = false;
+    if (rizinState.disasm !== page || sid !== rizinState.session) return false;
+    if (!r.ok) {
+        page.moreError = r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}).` : `The next instructions could not be loaded: ${r.error}.`;
+        page.moreTried = Date.now();
+        rizinRenderMore();
+        if (r.state === 'busy') rizinPollSoon();        // the toolbar's busy goes once rizin is free
+        return false;
+    }
+    const ops = (Array.isArray(r.data.ops) ? r.data.ops : []).filter(op => op && Number.isInteger(op.offset) && op.offset > last);
+    // Outside functions the linear disassembly stops after RIZIN_MORE.linear lines (rizinRenderDisasm says how
+    // to read on)
+    const all = page.ops.concat(ops), linear = page.function === null;
+    page.ops = linear ? all.slice(0, RIZIN_MORE.linear) : all;
+    page.capped = linear && all.length >= RIZIN_MORE.linear && (all.length > RIZIN_MORE.linear || !!r.data.more);
+    page.more = !!r.data.more && ops.length > 0 && !page.capped;
+    page.moreError = '';
+    rizinRenderDisasm();
+    return true;
+}
+
+// DISASSEMBLY scrolled: near its end (RIZIN_MORE.px, at least a view's height) the next page comes. Only while
+// it is in sight: a pane that is not laid out (DECOMPILER, HEX or GRAPH below 1400 px chosen, the RIZIN tab in
+// the background) has no height, which would read as scrolled to its end.
+function rizinOnDisasmScroll() {
+    const pane = document.getElementById('rizin-disasm'), page = rizinState.disasm;
+    if (!pane || !page || !page.more || page.loading || !rizinCodeOnScreen('disasm')) return false;
+    const view = Number(pane.clientHeight) || 0;
+    if (!view) return false;
+    const rest = Number(pane.scrollHeight) - Number(pane.scrollTop) - view;
+    if (!Number.isFinite(rest) || rest > Math.max(RIZIN_MORE.px, view)) return false;
+    rizinLoadMore();
+    return true;
+}
+
+// DISASSEMBLY drawn or back in sight (its tab, the RIZIN tab, GRAPH or ⇱ giving the place back): a page that
+// does not reach the end of the view yet asks for the next one now; not after a failed try (a scroll does)
+function rizinDisasmCatchUp() {
+    const page = rizinState.disasm;
+    return !!page && !!page.more && !page.moreError && rizinOnDisasmScroll();
+}
+
+// --- The session's states: Full analysis, Take it back and Reopen, the page going ---
+
+// Full analysis (a file analysed with aa: over 20 MB, or after aaa had to stop): aaa's steps one by one,
+// the views usable between them. A status asked for before it may still say the analysis is over, which
+// would end the poll: the poll drops such answers (statusEpoch).
+async function rizinFullAnalysis() {
+    const sid = rizinState.session;
+    if (!sid || rizinState.analyzing || rizinState.opening) return false;
+    rizinState.statusEpoch++;
+    rizinState.analyzing = true;
+    rizinRenderState();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/analyze`, { method: 'POST' });
+    rizinState.analyzing = false;
+    if (sid !== rizinState.session) return false;
+    rizinState.statusEpoch++;
+    if (r.ok && r.data.analysis && typeof r.data.analysis === 'object') rizinState.analysis = r.data.analysis;
+    else if (r.state === 'refused' || r.state === 'error') rizinState.note = r.error;
+    rizinRenderToolbar();
+    rizinPollSoon();
+    return r.ok;
+}
+
+// Take it back (the file is open in another tab) and Reopen (the session ended): the same path opened again
+// for this tab, which then lands at the place it showed, with its history (rizinLand)
+function rizinReopen() {
+    const path = rizinState.file && typeof rizinState.file.path === 'string' ? rizinState.file.path : '';
+    if (!path || rizinState.opening) return Promise.resolve(false);
+    const back = rizinState.seek ? { seek: rizinState.seek, history: rizinState.history.slice(), at: rizinState.historyAt } : null;
+    return rizinOpen(path, back);
+}
+
+// The browser tab is in sight again: whether its session is still its own (another tab may have taken the
+// file, or it ended meanwhile); /status answers without asking rizin, and rizinApi keeps what it says
+async function rizinCheckSession() {
+    const sid = rizinState.session;
+    if (!sid || rizinState.opening || rizinState.polling || rizinState.pollTimer !== null
+        || rizinState.ui.state === 'moved' || rizinState.ui.state === 'ended') return false;
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/status`);
+    return r.ok;
+}
+
+// Whether the RIZIN tab is the TDC tab shown (switchTab marks it active)
+function rizinTabActive() {
+    const tab = document.getElementById('tab-rizin');
+    return !!tab && tab.classList.contains('active');
+}
+
+// The page goes (a reload, another address, its browser tab closed): its session ends with it, through
+// sendBeacon, which still goes out while the page unloads; not once the session moved to another tab or
+// ended. Back from the browser's cache, the toolbar says the session ended, with Reopen.
+function rizinOnPageHide() {
+    const sid = rizinState.session;
+    if (!sid || rizinState.ui.state === 'moved' || rizinState.ui.state === 'ended') return false;
+    if (typeof navigator === 'undefined' || !navigator || typeof navigator.sendBeacon !== 'function') return false;
+    const sent = navigator.sendBeacon(`/api/rizin/${encodeURIComponent(sid)}/close`, '');
+    rizinSetUi('ended');
+    return sent;
+}
+
+// Wired once at start-up: Upload, a file dropped on the tab, OPEN ▾ closing
+// on Esc and on a click beside it, the graph's drag and wheel, the line
+// between the halves, the halves for the window's width, the dock's ═, the
+// right-click menu closing beside it, the check of the session when the
+// browser tab comes back, its end when the page goes, and the next page of a
+// long disassembly
+function initRizinTab() {
+    const input = document.getElementById('rizin-file-input');
+    if (input) {
+        input.addEventListener('change', () => {
+            if (input.files && input.files.length) rizinUpload(input.files[0]);
+            input.value = '';
+        });
+    }
+    const tab = document.getElementById('tab-rizin');
+    if (tab) {
+        const files = e => !!e.dataTransfer && [...(e.dataTransfer.types || [])].includes('Files');
+        tab.addEventListener('dragover', e => {
+            if (!files(e)) return;
+            e.preventDefault();
+            tab.classList.add('rizin-dragover');
+        });
+        tab.addEventListener('dragleave', e => {
+            if (!tab.contains(e.relatedTarget)) tab.classList.remove('rizin-dragover');
+        });
+        tab.addEventListener('drop', e => {
+            tab.classList.remove('rizin-dragover');
+            if (!files(e)) return;
+            e.preventDefault();
+            if (e.dataTransfer.files.length) rizinUpload(e.dataTransfer.files[0]);
+        });
+    }
+    const wrap = document.getElementById('rizin-open-wrap');
+    if (wrap) {
+        wrap.addEventListener('keydown', e => {
+            if (e.key !== 'Escape' || document.getElementById('rizin-open-menu')?.hidden !== false) return;
+            e.stopPropagation();
+            rizinCloseOpenMenu(true);
+        });
+    }
+    document.addEventListener('click', e => {
+        const menu = document.getElementById('rizin-open-menu');
+        const home = document.getElementById('rizin-open-wrap');
+        if (menu && !menu.hidden && home && !home.contains(e.target)) rizinCloseOpenMenu();
+        const context = document.getElementById('rizin-menu');
+        if (context && !context.hidden && !context.contains(e.target)) rizinCloseMenu();
+    });
+    // The right-click menu also closes on a right-click elsewhere, the user's scrolls and presses
+    // elsewhere (wheel, touch, scroll keys, a scroll bar), a scroll of the page, a new window size, and
+    // on Esc wherever the focus is (before the page's own Esc, which would close a detail view). Not on
+    // the tab's own scrolls (the console going to its end, a list keeping its rows): what is typed stays.
+    const outsideMenu = e => {
+        const context = document.getElementById('rizin-menu');
+        return !!context && !context.hidden && !(e.target && e.target.nodeType === 1 && context.contains(e.target));
+    };
+    document.addEventListener('contextmenu', e => {
+        if (outsideMenu(e) && !e.defaultPrevented) rizinCloseMenu();
+    });
+    document.addEventListener('keydown', e => {
+        if (!rizinState.menu) return;
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            e.stopPropagation();
+            rizinCloseMenu(true);
+        } else if (['PageUp', 'PageDown', 'Home', 'End', 'ArrowUp', 'ArrowDown', ' '].includes(e.key) && outsideMenu(e)) {
+            rizinCloseMenu();
+        }
+    }, true);
+    for (const type of ['wheel', 'touchmove', 'pointerdown']) {
+        document.addEventListener(type, e => {
+            // A right-click (on a Mac also Ctrl + click) goes on to contextmenu, which opens the menu anew
+            // there with the focus to go back to, or closes it
+            if (type === 'pointerdown' && (e.button === 2 || e.ctrlKey)) return;
+            if (outsideMenu(e)) rizinCloseMenu();
+        }, { capture: true, passive: true });
+    }
+    addEventListener('scroll', () => {
+        if (rizinState.menu) rizinCloseMenu();
+    });
+    addEventListener('resize', () => {
+        if (rizinState.menu) rizinCloseMenu();
+        if (rizinState.layout.dock !== null) rizinSetDockHeight(rizinState.layout.dock);
+        else rizinApplyDockLayout();
+    });
+    // The poll paused while the browser tab was hidden goes on when it is shown; else, while the RIZIN tab is
+    // the one shown, the tab asks whether its session is still its own (another tab may have taken the file
+    // meanwhile). Not in another TDC tab: /status counts as use, and an unused session is to end.
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) return;
+        if (!rizinState.pollPaused) {
+            if (rizinTabActive()) rizinCheckSession();
+            return;
+        }
+        rizinState.pollPaused = false;
+        rizinPollSoon();
+    });
+    addEventListener('focus', () => {
+        if (rizinTabActive()) rizinCheckSession();
+    });
+    // The page going ends its session
+    addEventListener('pagehide', rizinOnPageHide);
+    // DISASSEMBLY of a long function: the next page once scrolled near its end
+    document.getElementById('rizin-disasm')?.addEventListener('scroll', rizinOnDisasmScroll, { passive: true });
+    // GRAPH: drag, wheel, and its size (the window, the line between the halves, ⇱)
+    const graph = document.getElementById('rizin-graph');
+    if (graph) {
+        graph.addEventListener('pointerdown', rizinOnGraphPointerDown);
+        graph.addEventListener('pointermove', rizinOnGraphPointerMove);
+        graph.addEventListener('pointerup', rizinOnGraphPointerUp);
+        graph.addEventListener('pointercancel', rizinOnGraphPointerUp);
+        graph.addEventListener('wheel', rizinOnGraphWheel, { passive: false });
+        if (typeof ResizeObserver === 'function') new ResizeObserver(() => rizinGraphResized()).observe(graph);
+    }
+    const split = document.getElementById('rizin-split');
+    if (split) {
+        split.addEventListener('pointerdown', rizinOnSplitDown);
+        split.addEventListener('pointermove', rizinOnSplitMove);
+        split.addEventListener('pointerup', rizinOnSplitUp);
+        split.addEventListener('pointercancel', rizinOnSplitUp);
+        split.addEventListener('keydown', rizinOnSplitKey);
+        split.addEventListener('dblclick', () => rizinSetSplit(null));
+    }
+    // The dock's ═: drag, ↑ ↓, a double click for the default height
+    const grip = document.getElementById('rizin-dock-grip');
+    if (grip) {
+        grip.addEventListener('pointerdown', rizinOnDockGripDown);
+        grip.addEventListener('pointermove', rizinOnDockGripMove);
+        grip.addEventListener('pointerup', rizinOnDockGripUp);
+        grip.addEventListener('pointercancel', rizinOnDockGripUp);
+        grip.addEventListener('keydown', rizinOnDockGripKey);
+        grip.addEventListener('dblclick', () => rizinSetDockHeight(null));
+    }
+    addEventListener('resize', rizinApplyCenterLayout);
+    rizinApplyCenterLayout();
+    rizinApplyDockLayout();
+    rizinRenderDockNote();
+    rizinRenderPrompt();
+}
+
+// The tab is shown: the halves for the window's width, the graph for its
+// view's size and DISASSEMBLY's next page if its page drawn meanwhile is
+// shorter than the view, the dock's height for ═, and whether the session is
+// still this tab's; once, whether rizin is installed, and the empty views. A
+// right-click menu left open in another tab's time closes.
+function rizinTabShown() {
+    rizinCloseMenu();
+    rizinApplyCenterLayout();
+    rizinGraphResized();
+    rizinCodeShown('disasm');
+    rizinApplyDockLayout();
+    rizinCheckSession();
+    if (rizinState.checked) return;
+    rizinState.checked = true;
+    if (!rizinState.session) {
+        rizinRenderFunctions();
+        rizinRenderDisasm();
+        rizinRenderGraph();
+        rizinRenderDecompiler();
+        rizinRenderHex();
+    }
+    rizinCheckInstalled();
+}
+
+async function rizinCheckInstalled() {
+    const r = await rizinApi('/api/rizin/status');
+    if (!r.ok) {
+        rizinState.checked = false;
+        return false;
+    }
+    const subtitle = document.getElementById('rizin-subtitle');
+    if (r.data.installed && r.data.version && subtitle) {
+        subtitle.textContent = `Reverse engineering with rizin ${r.data.version} on the analysis VM`;
+    }
+    // Without rz-ghidra the quick pdg has nothing to run (DECOMPILER says so too)
+    const pdg = document.querySelector('#rizin-quick [data-cmd="pdg"]');
+    if (pdg && r.data.installed && r.data.ghidra === false) {
+        pdg.disabled = true;
+        pdg.title = 'pdg: needs rz-ghidra, which is missing on the VM';
+    }
+    if (!r.data.installed && !rizinState.session) {
+        rizinSetUi('not-installed', { path: typeof r.data.path === 'string' ? r.data.path : null });
+    }
+    return !!r.data.installed;
 }

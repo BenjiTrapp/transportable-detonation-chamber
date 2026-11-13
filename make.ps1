@@ -324,6 +324,7 @@ switch ($Target) {
             Copy-Item 'webui\pipe_signatures.json' -Destination 'C:\DetonationChamberUI\pipe_signatures.json' -ToSession $s -Force
             Copy-Item 'webui\pipe_backends.py' -Destination 'C:\DetonationChamberUI\pipe_backends.py' -ToSession $s -Force
             Copy-Item 'webui\pipe_proxy.py' -Destination 'C:\DetonationChamberUI\pipe_proxy.py' -ToSession $s -Force
+            Copy-Item 'webui\rizin_sessions.py' -Destination 'C:\DetonationChamberUI\rizin_sessions.py' -ToSession $s -Force
             Copy-Item 'webui\templates\index.html' -Destination 'C:\DetonationChamberUI\templates\index.html' -ToSession $s -Force
             Copy-Item 'webui\static\css\style.css' -Destination 'C:\DetonationChamberUI\static\css\style.css' -ToSession $s -Force
             Copy-Item 'webui\static\css\theme-cyberpunk.css' -Destination 'C:\DetonationChamberUI\static\css\theme-cyberpunk.css' -ToSession $s -Force
@@ -346,6 +347,7 @@ switch ($Target) {
             Copy-Item 'webui\pipe_signatures.json' -Destination 'C:\DetonationChamberUI\pipe_signatures.json' -ToSession $s -Force
             Copy-Item 'webui\pipe_backends.py' -Destination 'C:\DetonationChamberUI\pipe_backends.py' -ToSession $s -Force
             Copy-Item 'webui\pipe_proxy.py' -Destination 'C:\DetonationChamberUI\pipe_proxy.py' -ToSession $s -Force
+            Copy-Item 'webui\rizin_sessions.py' -Destination 'C:\DetonationChamberUI\rizin_sessions.py' -ToSession $s -Force
             Write-Host "[deploy-app] app.py and modules synced." -ForegroundColor Green
         } finally {
             Remove-PSSession $s

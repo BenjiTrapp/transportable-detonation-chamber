@@ -2713,13 +2713,13 @@ def test_info_texts_cover_every_tab():
         return lambda e: name in e["attrs"].get("class", "").split()
 
     headers = find(elements.root, with_class("content-header"))
-    assert len(headers) == 10, "a tab head is missing or the pattern is out of date"
+    assert len(headers) == 11, "a tab head is missing or the pattern is out of date"
     rows = find(elements.root, with_class("rtrace-header")) + find(elements.root, with_class("graph-toolbar"))
     assert len(rows) == 2, "the head rows of Tracing and Graph"
     assert [h["children"][0]["text"] if h["children"] else "" for h in headers if not has_info(h)] == []
     assert all(has_info(row) for row in rows), "Tracing or Graph without (i)"
     tabs = find(elements.root, with_class("tab-content"))
-    assert len(tabs) == 12 and all(has_info(tab) for tab in tabs)
+    assert len(tabs) == 13 and all(has_info(tab) for tab in tabs)
     texts = INFO_ATTR.findall(html) + INFO_ATTR.findall(_read(APP_JS))
     assert len(texts) >= 30
     for text in texts:

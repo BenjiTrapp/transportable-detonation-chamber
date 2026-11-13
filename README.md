@@ -49,6 +49,7 @@
 - [Usage](#usage)
 - [Live Memory Analysis](#live-memory-analysis)
 - [Named Pipes](#named-pipes)
+- [Rizin](#rizin)
 - [Demo](#demo)
 - [API Reference](#api-reference)
 - [MCP Server](#mcp-server)
@@ -126,6 +127,7 @@ make open       # Opens http://<vm-ip>:9000 in browser
 | **ETW** | Multi-channel Event Log browser with live threat highlighting (see below) |
 | **Hex** | Hex editor with data inspector, structure minimap, PE/ELF analysis and section inspection |
 | **FileMap** | Byteplot / entropy / PE-ELF structure planes side by side, import/export trees, click-to-offset |
+| **Rizin** | Reverse engineering with rizin and rz-ghidra on the VM, one session per browser tab (see [Rizin](#rizin)): OPEN a submitted sample, a dump, an upload or a VM path; FUNCTIONS, DISASSEMBLY, DECOMPILER and HEX beside the control flow GRAPH (tabs below 1400 px), all at one current address that a click, SEEK + GO, ◀ ▶ or a seek in the console moves; below, a CONSOLE for rizin commands (an allowlist on the server: no programs, no files), XREFS, STRINGS and IMPORTS; a right-click renames a function or comments an address, kept in a project; `aaa` up to 20 MB, `aa` and a Full analysis button above; Rizin buttons in the Submit history, Process Dump, Exit Capture, ThreatScan (result and history) and the Hex tab open a file here |
 | **LitterBox** | Files in the LitterBox sandbox with their static/dynamic/EDR results |
 | **Submit** | Detonation with stage-by-stage progress and combined verdict (EDR alerts, live memory, exit capture, network beaconing, LitterBox) with its VERDICT FLOW; the submission history with VERDICT HISTORY |
 
@@ -340,6 +342,7 @@ Threat detection rules cover:
 | **Detect It Easy (DiE)** | PE/ELF/Mach-O identification — packers, compilers, protectors |
 | **WinDbg (Preview)** | Kernel/user-mode debugger — crash dumps, live debugging, TTD |
 | **Ghidra** | NSA RE framework — disassembly, decompilation, scripting |
+| **rizin + rz-ghidra** | Reverse engineering in the browser ([Rizin](#rizin) tab): analysis, disassembly, control flow graph, decompiler, console |
 
 ### Tests
 
@@ -353,7 +356,9 @@ processes to a detonation, timestamp handling, persisted memory results,
 scanner output parsing, the evidence model and baseline, CSRF / DNS-rebinding
 / write restrictions, proxied content types, XSS (unescaped event fields and
 unsafe inline handlers in `app.js`), charts that count other numbers than
-their tables and filters, MCP tool output, and README/help drift
+their tables and filters, the RIZIN tab (the console allowlist, sessions and
+views, against a stand-in for rizin; with a real rizin where one is
+installed), MCP tool output, and README/help drift
 against the routes and tools. GitHub Actions runs the suite on every push
 (`.github/workflows/tests.yml`). `make test` is different: it submits a test
 sample to the running VM.
@@ -450,6 +455,7 @@ sample to the running VM.
 | Process Dump | Emulated (x86_64) | `-closemon` is **not used**: it writes x64 hook bytes into every process and cannot tell ARM64 processes apart (Exit Capture replaces it) |
 | Exit Capture | Native | OS feature (Silent Process Exit); emulator translation cache is recognized and not scored |
 | Hunt-Sleeping-Beacons / BeaconEye | Emulated (x86_64) | x64 builds; reliable for x64 (emulated) targets, results for native ARM64 processes are marked as limited |
+| rizin + rz-ghidra | Emulated (x86_64) | Cutter's Windows package is x64 only; `aaa` of a 150 KB sample takes about 2 s, `aa` of a 31 MB exit dump about 3 s (see [Rizin](#rizin)) |
 
 ---
 
@@ -849,6 +855,171 @@ Submit tab → detonate the sample → the session attaches to \msagent_<hex>
   event list as `python.exe`; they are never attributed to a sample (the web
   UI is not in a sample's process tree).
 
+## Rizin
+
+The **Rizin** tab reverse engineers a file on the VM in the browser. rizin
+0.9.1 with the rz-ghidra decompiler runs on the VM, one process per opened
+file; the tab draws its views itself, in both themes. The file is only read:
+nothing is written into it or next to it, and there is no debugging. Screenshot:
+[Rizin (Reverse Engineering)](#rizin-reverse-engineering).
+
+### Opening a file
+
+- **OPEN ▾** lists SUBMISSIONS (the submitted samples in
+  `C:\Users\Public\Downloads`), DUMPS (Process Dump and Exit Capture files in
+  `C:\dumps`, newest first) and UPLOADS, and takes a path or an upload
+  (**Upload…**, or a file dropped on the tab). Paths have to lie in the folders
+  `/api/file/download` serves (`C:\Users`, `C:\Windows\Temp`, `C:\Temp`,
+  `C:\dumps`, the Rustinel logs); UNC paths are refused. Uploads are kept in
+  `%TEMP%\rizin_uploads` (a Defender exclusion), the newest 40.
+- **Rizin** buttons open a file from the Submit history, the files Process
+  Dump and Exit Capture dumped (each beside its Hex button), ThreatScan (the
+  result, beside Open in Hex Editor, and history entries whose file is still
+  there) and the Hex tab's toolbar.
+- The analysis starts at once and the toolbar shows it: `aaa` up to 20 MB,
+  `aa` above. For those **Full analysis** runs `aaa`'s steps one by one (for
+  an x86 PE `aa`, `aac`, `aar`, `aaft`, `Fa`, `aanr`, `aaC`, `avrr`). Between
+  two steps rizin answers for about 2 s (up to 10 s while requests come), so
+  the views fill in and stay usable; while a step runs they say busy. Once the
+  analysis is done the tab jumps to `main` or `sym.main` if the file has one,
+  else to the entry point.
+
+Measured on the ARM64 UTM VM (rizin runs as x64 under emulation), from the
+click to the first view of the place the tab lands on:
+
+| File | Analysis | First view |
+|------|----------|------------|
+| `pipesim.exe` built with mingw (symbols), 151.7 KB, 84 functions, uploaded | `aaa` 1.6–2.5 s | 2.7–3.8 s, at `sym.main` |
+| `pipesim.exe` from SUBMISSIONS (no symbols), 186.5 KB, 127 functions | `aaa` 2.1–2.2 s | 3.6 s, at the entry point |
+| its image from its exit dump (DUMPS), 212.0 KB, 127 functions | `aaa` 2.0 s | 2.6–3.6 s, at the entry point |
+| its exit dump from DUMPS, a 31.0 MB minidump, 10 295 functions | `aa` 3.3–3.9 s, then Full analysis 23–24 s | 6.1–6.9 s, at the entry point |
+
+The same project opened again shows its first view after about 1 s.
+
+### One place in every view
+
+- **FUNCTIONS** lists the functions with name and size (the address on hover),
+  filters by name or address, marks the current one, and « folds it away.
+- **DISASSEMBLY** shows the current function with the current address marked;
+  a long function loads on as you scroll, outside functions the linear
+  disassembly stops after 2000 instructions. **DECOMPILER** shows rz-ghidra's
+  C with the line of the current address marked, **HEX** 512 bytes from it
+  with **Open in Hex tab** at that byte of the file.
+- **GRAPH** beside them shows the control flow graph with the block of the
+  current address marked: green edges are taken jumps, red ones the
+  fall-through, dim ones unconditional. Drag, the wheel and − + FIT move and
+  zoom it; from 200 blocks it starts as an overview. ⇱ gives one half the
+  whole width, the line between the halves can be dragged, and below 1400 px
+  window width DISASSEMBLY, DECOMPILER, HEX and GRAPH are tabs.
+- Below them **CONSOLE**, **XREFS** (references to the current address and
+  from it; at a function's start from the whole function), **STRINGS** and
+  **IMPORTS** (paged and filtered on the VM; a click on an import shows its
+  references). ═ sets the height, ▾ folds them away.
+- A click on a function, an instruction, a jump or call target, a block, a
+  line of C, a reference, a string or an import moves every view there, and
+  so do **SEEK** (an address, a function or a flag name) + **GO**, **◀ ▶**
+  (the jumps made) and a seek in the console (`s`, `pdf @ …`).
+
+### Console without a shell
+
+The console runs rizin commands at the current address, which its prompt
+shows (`[0x1400014b7]>`): ↑ ↓ walk the history, Tab completes commands,
+functions and flags, and quick buttons run `afl`, `pdf`, `pdg`, `iz`, `ii`,
+`axt` and `?`. The output keeps rizin's colours, drawn in the theme's
+palette, and is cut at about 1 MB.
+
+rizin has no restricted mode of its own (0.9.1 has neither `cfg.sandbox` nor a
+web server), and the web UI runs as SYSTEM without a login. So the server
+checks every command against an allowlist before rizin gets it; a refused
+command answers with one line, e.g. `refused: '!' is not allowed: no shell
+commands`, and nothing moves.
+
+| Refused | Why |
+|---------|-----|
+| `!`, `\|`, `>`, `<`, backticks, `$(…)`, `#!` | They run programs, or write output to files and read input from them |
+| Command families other than `a p i f C s / ? x t b e` (analysis, print, info, flags, comments, seek, search, help, hexdump, types, block size, settings): among them `o` (open files), `w` (write), `d` (debug), `.` (scripts), `(` (macros) | Other files, writing, debugging and stored scripts are not part of static analysis |
+| Inside the families: the sub-commands and `@` forms that read or write files, assemble (rizin can hand that to an external assembler), wait for input or open an interactive view, run stored or nested commands, or change the settings, arch or file for one command (`@e:`, `@a:`, `@f:` …) | The same reasons, one level down; the list comes from rizin 0.9.1's own help, and the tests check every entry |
+| Setting anything but `asm.*` (not `asm.assembler` and `asm.debuginfo.file`), `analysis.*` and `bin.demangle`; arch values other than rizin's built-in disassemblers | Some settings and arch plugins start programs or read files; reading a setting is fine |
+| `aa`, `aaa` and the other whole-program analyses | They outlast a console command's 60 s; **Full analysis** runs them in steps |
+| Backslashes, control characters, several lines, more than 2000 characters | rizin would read such input differently from the check |
+
+### Sessions
+
+- A session is one rizin process for one file and one browser tab; opening
+  another file in the tab replaces it.
+- The same file opened in a second browser tab takes the session there, so
+  two sessions never write the same project. The first tab says "Open in
+  another tab" and offers **Take it back**.
+- At most three sessions run at once; a fourth ends the one unused longest. A
+  session ends after 30 minutes without use, when its page is closed or left,
+  or when rizin stops; the toolbar then says "Session ended", and **Reopen**
+  opens the file again at the same place. rizin ends with the web UI, also
+  when that is killed (on Windows each rizin runs in a job object).
+- Every command has a time limit: views 30 s, lists and console commands
+  60 s, a decompile 120 s. A rizin that does not answer in time is ended and
+  the tab says so; nothing else in the web UI waits for it. A decompile that
+  ended its session is not asked for again on its own: **Decompile again**
+  asks once more.
+- An analysis stops at the next step after 10 minutes and says why; what it
+  found stays usable, and **Full analysis** goes on with the steps left. A
+  step still running after 12 minutes counts as hung: rizin is ended, and the
+  session starts again with the steps it had finished (after an `aaa`, with
+  `aa` and the Full analysis button). A file opened again after a Full
+  analysis that did not finish runs nothing by itself.
+
+### Projects
+
+- A right-click on a function, an instruction or a graph block offers
+  **Rename function…** (`afn`) and **Comment…** (`CC`; an empty comment
+  removes it); in the console `CC` works anywhere and `afn` at a function's
+  start. Both are refused (busy) until the analysis is done, because a later
+  step could change them again.
+- They are saved as a rizin project in `webui/rizin_projects/<sha256>.rzdb`
+  (`C:\DetonationChamberUI\rizin_projects\` on the VM, git-ignored like
+  `webui/memory_results/`): 3 s after the last change and when the session
+  ends. A file gets a project only once something is renamed or commented.
+- The same file opened again, under any path, loads its project: names and
+  comments are back (while its session still closes, it waits for that
+  session's last save). A project that cannot be loaded is kept as
+  `<sha256>.rzdb.broken`, and the file opens without it.
+
+### Installation
+
+`scripts/install-rizin.ps1` runs during provisioning, after
+`install-re-tools.ps1`. It downloads Cutter v2.5.0's Windows package (only
+for rizin 0.9.1, the rz tools and rz-ghidra; Cutter itself is never run),
+checks its SHA-256 against the pinned digest GitHub publishes for the
+release, installs the bundled VC++ runtime if it is missing or older, unpacks
+the package to `C:\tools\cutter`, sets `SLEIGHHOME` so that rz-ghidra finds
+its processor specifications (the web UI also hands it to rizin) and adds the
+Defender exclusion for the uploads. It ends with a self-test (`rizin -v`, the
+plugin list and a decompile). A failed download or checksum only warns and
+provisioning goes on; the tab then says "rizin not installed". It is safe to
+run again. On a running VM:
+
+```bash
+python3 scripts/deploy-utm.py --vm-ip <vm> --vm-user tdc --vm-pass tdc --install install-rizin.ps1
+```
+
+`TDC_RIZIN` points the web UI at another `rizin` (for example a local one for
+development; without rz-ghidra DECOMPILER says "Decompiler not available
+(rz-ghidra missing)").
+
+### Limitations
+
+- Static analysis only: no debugging, no patching, and the console allowlist
+  leaves out a few rizin features (assembling, scripts, other files).
+- Full analysis analyses variables less than `aaa` does (the toolbar's note
+  says so).
+- Under x64 emulation big files are slow: `aaa` on a 5 MB sample takes about
+  17 s, and a long function may hit the decompile limit.
+- A click on a string or an import jumps to its address, which holds data:
+  DISASSEMBLY decodes it as instructions (HEX shows the bytes). For an import
+  XREFS opens with its callers.
+- "Duplicate tab" in the browser copies the tab's ID, so both pages drive one
+  session without "Open in another tab"; open the file in a new tab instead.
+- Addresses above 2^53 (kernel space) lose precision in the browser.
+
 ## Demo
 
 Screenshots from the ARM64 UTM VM with the test samples used during development
@@ -1138,6 +1309,26 @@ programs that mimic implant behaviour).
 
 ---
 
+### Rizin (Reverse Engineering)
+
+<p align="center">
+  <img src="static/rizin.png" alt="Rizin tab: pipesim.exe at sym.main in DISASSEMBLY and GRAPH, the console after afl~main" width="100%">
+</p>
+
+> The **Rizin** tab (Cyberpunk) with `pipesim.exe`, the harmless named-pipe
+> test program, built with mingw and uploaded through OPEN ▾. The toolbar
+> shows its path in the upload folder on the VM, *PE64 · x86-64 · 151.7 KB*,
+> the shortened SHA256 and *analysed (aaa) 1.7 s*; SEEK says `sym.main`, where
+> the tab landed after the analysis. FUNCTIONS (84) marks `sym.main`,
+> DISASSEMBLY shows its first instructions with 0x1400014b7 marked (calls in
+> pink, conditional jumps in green, symbols in amber), and GRAPH beside it the
+> function's entry block among its 30 blocks, marked in magenta, with the
+> taken `jle` in green and the fall-through to 0x140001507 in red. Below, the
+> CONSOLE after `afl~main`: the six functions whose name contains "main", and
+> the prompt `[0x1400014b7]>` at the place the views show.
+
+---
+
 ### Live Process Memory
 
 <p align="center">
@@ -1274,6 +1465,34 @@ Windows hands a connecting client the oldest free instance of a pipe, whoever ow
 | GET | `/api/file/pe` | PE header analysis. Param: `path` |
 | GET | `/api/file/elf` | ELF binary analysis. Param: `path` |
 
+### Rizin
+
+One rizin session per opened file and browser tab (RIZIN tab). Addresses are integers in answers; in requests `addr` is decimal or `0x…`. Errors: 400 `{"refused": reason}` for invalid input, a refused console command or a file that cannot be opened (missing, empty, a folder); 403 for a UNC path or a path outside the folders that `/api/file/download` serves too (which include the uploads in `%TEMP%\rizin_uploads`); 404 `{"error": "session ended"}` (with `reason` when rizin stopped during that request); 409 `{"busy": true, "step"}` while an analysis step or another request has rizin (views wait about 2 s first), `{"moved": true}` once the file was opened in another tab, or `{"superseded": true}` for an open that a newer open of the same tab overtook; 500 `{"error"}` when rizin could not open the file ("rizin could not open the file: …"), answered something unexpected ("rizin answered something unexpected: …") or more than 32 MB ("too many strings to list here …: filter them in the console"), or a file on the VM could not be read or written (a full disk: "a file could not be read or written on the VM: …", "the upload could not be stored: …"); 503 `{"error": "rizin not installed", "path"}`.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/rizin/status` | `installed`, `path` (`TDC_RIZIN`), `version`, `ghidra` (rz-ghidra loads) |
+| GET | `/api/rizin/files` | What the tab can open, existing non-empty files only: `submissions` (`filename`, `path`, `sha256`, `time`), `dumps` under `C:\dumps` (newest 500) and `uploads` (`name`, `path`, `size`) |
+| POST | `/api/rizin/upload` | Upload a file (multipart `file`) to `%TEMP%\rizin_uploads` → `{"path"}` |
+| POST | `/api/rizin/open` | Open a file. JSON: `path`, `tab` (browser tab ID) → `session`, `file` (`path`, the real one that was checked, `sha256`, `size`, `format`, `arch`, `bits`), `analysis`. A new file replaces the tab's session; the same file in another tab moves its session there, and while its session still closes it waits for that session's last save |
+| GET | `/api/rizin/<sid>/status` | `analysis` (`state`, `step`, `done_steps`, `level`, `elapsed`, `note`), `seek`, `function`, without asking rizin |
+| POST | `/api/rizin/<sid>/analyze` | Start the full analysis (aaa's steps one by one) → `analysis`. Between two steps the session pauses about 2 s, longer while requests use rizin (at most about 10 s), and answers requests; `step` is `null` then |
+| POST | `/api/rizin/<sid>/close` | End the session (also the page's `sendBeacon` on pagehide) → `{"closed": true}` |
+| GET | `/api/rizin/<sid>/functions` | `[{name, offset, size, nbbs}]` by address |
+| GET | `/api/rizin/<sid>/disasm` | The function around `addr` from its start (the first page reaches `addr`), linear outside functions → `function`, `ops` (`offset`, `size`, `text`, `type`, `jump`, `comment`), `more` (outside functions not after a page of only invalid instructions; the RIZIN tab stops the linear disassembly after 2000 lines). Params: `addr`, `count` (default 400, at most 2000), `after` (the next page) |
+| GET | `/api/rizin/<sid>/graph` | Basic blocks of the function around `addr` → `function`, `offset` (its entry), `nodes` (`offset`, `size`, `lines`, `jump`, `fail`, `cases`; edges only between its blocks) |
+| GET | `/api/rizin/<sid>/decompile` | rz-ghidra's C for the function around `addr` → `available`, `reason`, `function`, `lines` (`text`, `offset` as `pdgo` shows it, `offsets`: every address of the line). `pdgj` may take up to 120 s (`DECOMPILE_TIMEOUT`); over it rizin is stopped and the session ends: 404 with `reason` "Decompiling took too long, the session ended." |
+| GET | `/api/rizin/<sid>/hex` | Bytes at `addr` → `offset`, `bytes`, `paddr` (where they are in the opened file, from rizin's map there; `null` where no byte of the file is: a zero-filled part, no map, past the end). Param: `len` (default 512, at most 4096) |
+| GET | `/api/rizin/<sid>/xrefs` | References to `addr` and from it; at a function's entry from the whole function → `scope`, `function`, `to`, `from` (`from`, `to`, `type`, `text`, `function`), `truncated` (over 500) |
+| GET | `/api/rizin/<sid>/strings` | Strings, filtered and paged on the server → `total`, `items` (`offset`, `string`, `length`, `section`, `type`), `truncated` (rizin listed more than 200 000: the rest is left out). Params: `q`, `offset`, `limit` (default 200, at most 1000) |
+| GET | `/api/rizin/<sid>/imports` | Imports, filtered (name or library) and paged → `total`, `items` (`offset`, `name`, `library`, `type`, `ordinal`), `truncated`. Params: `q`, `offset`, `limit` |
+| GET | `/api/rizin/<sid>/flags` | Flag names for the console's Tab: those that start with `q` (any case), sorted → `total`, `names` (at most `limit`, default and most 200), `common` (the start all of them share, also those past `limit`), `truncated` (of more than 200 000 flags the rest is left out; of more than 32 MB none: Tab completes the function names). rizin is asked again after a console command, a rename, a comment or an analysis step; requests that come while it is asked wait for that answer |
+| POST | `/api/rizin/<sid>/seek` | JSON: `addr` (a number, `0x…`, or a function or flag name) → `seek`, `function` |
+| POST | `/api/rizin/<sid>/console` | Run a rizin command. JSON: `cmd` → `output` (ANSI colours), `seek`, `function`, `truncated` (about 1 MB), `changed` (it renamed or commented). Allowlist on the server: no shell, no files, no other files opened, no debugging |
+| POST | `/api/rizin/<sid>/rename` | Rename the function at `addr`. JSON: `addr`, `name` → `offset`, `name`; kept in the project |
+| POST | `/api/rizin/<sid>/comment` | Comment at `addr` (an empty `text` removes it). JSON: `addr`, `text` → `offset`, `comment`; kept in the project |
+| GET | `/api/rizin/<sid>/comment` | The comment at `addr` as the disassembly shows it → `offset`, `comment` (`""` without one); the right-click menu's Comment… field reads it where the disassembly has not loaded the address |
+
 ### Sysmon
 
 | Method | Endpoint | Description |
@@ -1297,7 +1516,7 @@ Windows hands a connecting client the oldest free instance of a pipe, whoever ow
 | POST | `/api/scan/ember` | EMBER2024 ML score. Params: `file`/`path`, `model`, `threshold` |
 | POST | `/api/scan/capa` | capa capability detection (ATT&CK/MBC). Params: `file`/`path` |
 | GET | `/api/scan/status` | Tool availability (ThreatCheck, DefenderCheck, EMBER2024, capa, Aether, Process Dump, Exit Capture) |
-| GET | `/api/scan/history` | Static scan timeline, newest first. Param: `limit` |
+| GET | `/api/scan/history` | Static scan timeline, newest first; each entry's `exists` says whether its file (`result.filepath`) is still there for the RIZIN tab (inside the folders the download serves, not empty). Param: `limit` |
 | POST | `/api/scan/history/clear` | Clear the scan timeline |
 | POST | `/api/scan/beacons` | Hunt-Sleeping-Beacons. Param: `pid` (omit for all) |
 | POST | `/api/scan/beaconeye` | BeaconEye (Cobalt Strike configs). Param: `pid` (omit for all) |
@@ -1374,6 +1593,7 @@ edit) and the raw service proxies.
 | `TDC_ALLOWED_HOSTS` | — | Extra host names accepted in the `Host` header (comma-separated; IPs and `localhost` always work) |
 | `VM_WEBUI_URL` | — | Web UI of the VM, used by a host-side instance when it has no local Sysmon/alerts |
 | `TDC_VM_USER` / `TDC_VM_PASS` | — | WinRM credentials for starting VM services from a host-side instance |
+| `TDC_RIZIN` | `C:\tools\cutter\rizin.exe` | The rizin of the RIZIN tab (`scripts/install-rizin.ps1` installs it there) |
 
 ### Custom Detection Rules
 
@@ -1451,7 +1671,8 @@ transportable-detonation-chamber/
 ├── .mcp.json                      # Registers the MCP server for Claude Code
 │
 ├── tests/                          # Unit tests (make unit-test), run by GitHub Actions
-│   └── samples/pipesim.c          # Harmless named-pipe test sample (build with zig cc)
+│   ├── samples/pipesim.c          # Harmless named-pipe test sample (build with zig cc)
+│   └── fake_rizin.py              # Stands in for rizin's pipe mode in the RIZIN tests
 │
 ├── webui/                          # Unified Web UI
 │   ├── app.py                     # Flask backend (APIs, proxying, PE/ELF analysis)
@@ -1463,6 +1684,8 @@ transportable-detonation-chamber/
 │   ├── pipe_proxy.py              # Interception engine (sessions, hold queue, recording)
 │   ├── pipe_backends.py           # Win32 (ctypes) and in-memory fake pipe backends
 │   ├── pipe_sessions/             # Ended interception recordings (git-ignored)
+│   ├── rizin_sessions.py          # RIZIN tab: rizin processes, console allowlist, analysis steps, projects
+│   ├── rizin_projects/            # Renames and comments per file, <sha256>.rzdb (git-ignored)
 │   ├── memory_baseline.json       # Host memory baseline (git-ignored)
 │   ├── dev_server.py              # Dev server with live-reload
 │   ├── requirements.txt           # Python deps (flask, requests, watchdog, pefile)
@@ -1496,6 +1719,7 @@ transportable-detonation-chamber/
 │   ├── install-process-dump.ps1  # Process Dump + clean-hash baseline (genquick)
 │   ├── build-aether.sh           # Cross-compile Aether on the host into prebuilt/
 │   ├── install-re-tools.ps1      # Detect It Easy, WinDbg, Ghidra
+│   ├── install-rizin.ps1         # rizin 0.9.1 + rz-ghidra from Cutter's Windows package (pinned SHA-256)
 │   ├── install-webui.ps1          # Web UI deployment
 │   ├── deploy-utm.py             # Push code to a UTM VM over WinRM, restart, run installers
 │   ├── pipe-roundtrip-test.py    # Interception round trip on the VM (observe, edit, squat)
@@ -1526,6 +1750,9 @@ C:\tools\theZoo-WebUI\                  theZoo malware sample browser (:8888)
 C:\tools\detection-rules\               Sigma + YARA + IOC rules
 C:\ProgramData\chocolatey\lib\die\      Detect It Easy (DiE 3.21)
 C:\ProgramData\chocolatey\lib\ghidra\   Ghidra 12.1.2
+C:\tools\cutter\                        rizin 0.9.1 + rz-ghidra (Cutter's Windows package; only rizin runs)
+C:\Windows\Temp\rizin_uploads\          Files uploaded in the RIZIN tab (newest 40)
+C:\DetonationChamberUI\rizin_projects\  RIZIN projects (renames and comments)
 WinDbgX.exe                             WinDbg Preview (via winget)
 C:\Users\Public\Downloads\              Samples written by DetonatorAgent
 ```
@@ -1664,6 +1891,11 @@ make install    # or: .\make.ps1 install
 - **Writes:** `/api/file/hex/write` only writes inside the hex-upload folder,
   `C:\Temp`, `C:\Users\Public\Downloads` and `C:\dumps`, and never to script
   or shortcut files.
+- **RIZIN console:** every command passes an allowlist on the server before
+  rizin gets it: no programs, no other files, no writing, no debugging, and
+  settings only for the disassembly and the analysis (see
+  [Console without a shell](#console-without-a-shell)). rizin opens files
+  read-only, and names, strings and comments from a file are shown as text.
 - **Headers:** no framing (clickjacking), `nosniff`, same-origin referrers.
 - `WEBUI_HOST=127.0.0.1` restricts the listener to the VM itself.
 
@@ -1687,6 +1919,9 @@ make install    # or: .\make.ps1 install
 | [kawaiipantsu/theZoo-WebUI](https://github.com/kawaiipantsu/theZoo-WebUI) | theZoo web frontend |
 | [horsicq/DIE-engine](https://github.com/horsicq/DIE-engine) | Detect It Easy |
 | [NationalSecurityAgency/ghidra](https://github.com/NationalSecurityAgency/ghidra) | Ghidra RE framework |
+| [rizinorg/rizin](https://github.com/rizinorg/rizin) | Reverse engineering framework of the RIZIN tab (LGPL-3.0; run as a separate process) |
+| [rizinorg/rz-ghidra](https://github.com/rizinorg/rz-ghidra) | Ghidra's decompiler as a rizin plugin (DECOMPILER) |
+| [rizinorg/cutter](https://github.com/rizinorg/cutter) | Its Windows package supplies rizin and rz-ghidra |
 | [Microsoft WinDbg](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/) | Windows debugger |
 
 ---

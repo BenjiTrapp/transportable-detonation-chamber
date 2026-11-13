@@ -310,6 +310,7 @@ deploy:
 		vagrant upload webui/pipe_signatures.json C:\\DetonationChamberUI\\pipe_signatures.json; \
 		vagrant upload webui/pipe_backends.py C:\\DetonationChamberUI\\pipe_backends.py; \
 		vagrant upload webui/pipe_proxy.py C:\\DetonationChamberUI\\pipe_proxy.py; \
+		vagrant upload webui/rizin_sessions.py C:\\DetonationChamberUI\\rizin_sessions.py; \
 		vagrant upload webui/static/icon.png C:\\DetonationChamberUI\\static\\icon.png || true; \
 		echo "[deploy] Done."; \
 	fi
@@ -328,6 +329,7 @@ deploy-app:
 		vagrant upload webui/pipe_signatures.json C:\\DetonationChamberUI\\pipe_signatures.json; \
 		vagrant upload webui/pipe_backends.py C:\\DetonationChamberUI\\pipe_backends.py; \
 		vagrant upload webui/pipe_proxy.py C:\\DetonationChamberUI\\pipe_proxy.py; \
+		vagrant upload webui/rizin_sessions.py C:\\DetonationChamberUI\\rizin_sessions.py; \
 		echo "[deploy-app] app.py and modules synced."; \
 	fi
 

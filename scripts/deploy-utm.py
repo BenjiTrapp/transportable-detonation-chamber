@@ -42,6 +42,7 @@ FILES = {
     "webui/pipe_signatures.json": r"C:\DetonationChamberUI\pipe_signatures.json",
     "webui/pipe_backends.py": r"C:\DetonationChamberUI\pipe_backends.py",
     "webui/pipe_proxy.py": r"C:\DetonationChamberUI\pipe_proxy.py",
+    "webui/rizin_sessions.py": r"C:\DetonationChamberUI\rizin_sessions.py",
     "webui/static/js/app.js": r"C:\DetonationChamberUI\static\js\app.js",
     "webui/static/css/style.css": r"C:\DetonationChamberUI\static\css\style.css",
     "webui/static/css/theme-cyberpunk.css": r"C:\DetonationChamberUI\static\css\theme-cyberpunk.css",

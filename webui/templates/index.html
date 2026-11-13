@@ -19,8 +19,8 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=60">
-    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=20">
+    <link rel="stylesheet" href="/static/css/style.css?v=65">
+    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=24">
 </head>
 <body>
     <!-- Global loading overlay (shown on slow fetches) -->
@@ -82,6 +82,7 @@
                     <button class="tab" data-tab="etw">ETW</button>
                     <button class="tab" data-tab="hexeditor">Hex</button>
                     <button class="tab" data-tab="filemap">FileMap</button>
+                    <button class="tab" data-tab="rizin">Rizin</button>
                     <button class="tab" data-tab="litterbox">LitterBox</button>
                     <button class="tab" data-tab="submit">Submit</button>
                 </nav>
@@ -792,6 +793,7 @@
                     <div class="header-actions">
                         <button class="btn btn-sm btn-accent" id="pe-analyze-btn" onclick="peAnalyze()" title="Parse PE header">PE Analysis</button>
                         <button class="btn btn-sm btn-accent" id="elf-analyze-btn" onclick="elfAnalyze()" title="Parse ELF header">ELF Analysis</button>
+                        <button class="btn btn-sm btn-accent" id="hex-rizin-btn" onclick="hexOpenInRizin()" title="Reverse engineer the loaded file in the RIZIN tab">Rizin</button>
                         <input type="number" id="hex-offset" class="filter-input hex-offset-input" placeholder="Offset" value="0" min="0">
                         <select id="hex-bytes-per-page" class="filter-select">
                             <option value="256">256 bytes</option>
@@ -925,6 +927,156 @@
                         <div class="filemap-empty">Enter a file path (or load a file in the hex editor) and click Render.</div>
                     </div>
                     <div class="filemap-trees" id="filemap-trees"></div>
+                </div>
+            </div>
+
+            <!-- Rizin Tab: a rizin session on the VM for this browser tab (block RIZIN
+                 of app.js). The toolbar in one line, FUNCTIONS on the left, the code
+                 views and the graph in two halves, the console and the lists in the
+                 dock below; the work area fills the tab and each list scrolls in
+                 itself. Clicks in the lists go to one handler each, which reads the
+                 address from data-addr. -->
+            <div class="tab-content" id="tab-rizin">
+                <div class="content-header">
+                    <h2 data-info="Reverse engineering of a file on the VM in a rizin session of this browser tab; OPEN takes a submitted sample, a dump, an upload or a path. A click on a function, an instruction or a jump target moves every view there, and ◀ ▶ walk back and forth.">Rizin</h2>
+                    <span class="content-subtitle" id="rizin-subtitle">Reverse engineering with rizin on the analysis VM</span>
+                </div>
+                <div class="rizin-toolbar" id="rizin-toolbar">
+                    <div class="rizin-open-wrap" id="rizin-open-wrap">
+                        <button type="button" class="btn btn-sm btn-primary" id="rizin-open-toggle" aria-haspopup="true" aria-expanded="false" aria-controls="rizin-open-menu" onclick="rizinToggleOpenMenu()">OPEN ▾</button>
+                        <div class="rizin-open-menu" id="rizin-open-menu" hidden>
+                            <div class="rizin-open-row">
+                                <input type="text" id="rizin-path" class="filter-input rizin-path-input" placeholder="C:\path\to\file on the VM" aria-label="Path of a file on the VM" autocomplete="off" spellcheck="false" onkeydown="if (event.key === 'Enter') rizinOpenPath()">
+                                <button type="button" class="btn btn-sm btn-primary" onclick="rizinOpenPath()">Open</button>
+                                <button type="button" class="btn btn-sm" onclick="document.getElementById('rizin-file-input').click()">Upload…</button>
+                                <input type="file" id="rizin-file-input" hidden>
+                            </div>
+                            <div class="rizin-open-sources" id="rizin-open-sources" onclick="rizinOnOpenSourceClick(event)"></div>
+                        </div>
+                    </div>
+                    <span class="rizin-file-path" id="rizin-file-path">No file open</span>
+                    <span class="rizin-file-tag" id="rizin-file-tag" hidden></span>
+                    <span class="rizin-file-sha" id="rizin-file-sha" hidden></span>
+                    <span class="rizin-analysis" id="rizin-analysis" hidden></span>
+                    <button type="button" class="btn btn-sm rizin-full" id="rizin-full" title="Run aaa's steps one by one; rizin answers between them, so the views stay usable. A big file takes minutes." onclick="rizinFullAnalysis()" hidden>Full analysis</button>
+                    <span class="rizin-state" id="rizin-state" role="status" hidden></span>
+                    <button type="button" class="btn btn-sm btn-primary rizin-state-btn" id="rizin-state-btn" onclick="rizinReopen()" hidden>Reopen</button>
+                    <span class="rizin-toolbar-gap"></span>
+                    <label class="rizin-seek-label" for="rizin-seek">SEEK</label>
+                    <input type="text" id="rizin-seek" class="filter-input rizin-seek-input" placeholder="address, function or flag" autocomplete="off" spellcheck="false" onkeydown="if (event.key === 'Enter') rizinGo()">
+                    <button type="button" class="btn btn-sm btn-primary" id="rizin-go" onclick="rizinGo()">GO</button>
+                    <button type="button" class="btn btn-sm rizin-history" id="rizin-back" title="Back" aria-label="Back" onclick="rizinHistoryStep(-1)" disabled>◀</button>
+                    <button type="button" class="btn btn-sm rizin-history" id="rizin-forward" title="Forward" aria-label="Forward" onclick="rizinHistoryStep(1)" disabled>▶</button>
+                </div>
+                <div class="rizin-work" id="rizin-work">
+                    <div class="rizin-main">
+                        <section class="rizin-panel rizin-functions" id="rizin-functions" aria-label="Functions">
+                            <div class="rizin-panel-head">
+                                <h3 class="rizin-panel-title" data-info="The functions rizin found, in address order, with their size in bytes; the address shows on hover. Type to filter by name or address, click a function to jump to it, and « folds the list away.">FUNCTIONS</h3>
+                                <button type="button" class="rizin-fold" id="rizin-fn-fold" aria-expanded="true" aria-controls="rizin-fn-body" title="Fold the function list away" aria-label="Fold the function list away" onclick="rizinToggleFunctions()">«</button>
+                            </div>
+                            <div class="rizin-fn-body" id="rizin-fn-body">
+                                <input type="text" id="rizin-fn-filter" class="filter-input rizin-filter" placeholder="filter functions…" aria-label="Filter the functions by name or address" autocomplete="off" spellcheck="false" oninput="rizinOnFunctionFilter()">
+                                <div class="rizin-fn-head" aria-hidden="true"><span>NAME</span><span>SIZE</span></div>
+                                <div class="rizin-fn-list" id="rizin-fn-list" onclick="rizinOnFunctionClick(event)" oncontextmenu="rizinOnContextMenu(event, 'functions')"></div>
+                                <div class="rizin-fn-count" id="rizin-fn-count"></div>
+                            </div>
+                        </section>
+                        <section class="rizin-panel rizin-center" id="rizin-center">
+                            <div class="rizin-half rizin-code" id="rizin-code">
+                                <div class="rizin-panel-head">
+                                    <h3 class="rizin-panel-title" data-info="The current function as instructions, as C from rz-ghidra (DECOMPILER) or as bytes (HEX), with the current address marked. A click on an instruction or a line of C moves there, a click on a jump or call target jumps to it, and a long function loads on as you scroll."><span id="rizin-code-title">DISASSEMBLY</span></h3>
+                                    <div class="rizin-tabs" role="tablist" aria-label="Code views" data-rizin-tabs="code" onclick="rizinOnTabClick(event)">
+                                        <button type="button" class="rizin-tab" role="tab" aria-selected="true" aria-controls="rizin-disasm" data-rizin-tab="disasm">DISASSEMBLY</button>
+                                        <button type="button" class="rizin-tab" role="tab" aria-selected="false" aria-controls="rizin-decompiler" data-rizin-tab="decompiler">DECOMPILER</button>
+                                        <button type="button" class="rizin-tab" role="tab" aria-selected="false" aria-controls="rizin-hex" data-rizin-tab="hex">HEX</button>
+                                        <button type="button" class="rizin-tab rizin-tab-graph" role="tab" aria-selected="false" aria-controls="rizin-graph" data-rizin-tab="graph" hidden>GRAPH</button>
+                                    </div>
+                                    <button type="button" class="rizin-tool rizin-max-btn" id="rizin-code-max" title="Give the code views the whole width" aria-label="Give the code views the whole width" aria-pressed="false" onclick="rizinToggleMax('code')">⇱</button>
+                                </div>
+                                <div class="rizin-view rizin-disasm" id="rizin-disasm" role="tabpanel" data-rizin-pane="disasm" onclick="rizinOnDisasmClick(event)" oncontextmenu="rizinOnContextMenu(event, 'disasm')"></div>
+                                <div class="rizin-view rizin-decompiler" id="rizin-decompiler" role="tabpanel" data-rizin-pane="decompiler" onclick="rizinOnDecompilerClick(event)" hidden></div>
+                                <div class="rizin-view rizin-hex" id="rizin-hex" role="tabpanel" data-rizin-pane="hex" onclick="rizinOnHexClick(event)" hidden></div>
+                            </div>
+                            <div class="rizin-split" id="rizin-split" role="separator" aria-orientation="vertical" tabindex="0" aria-label="Width of the code views and the graph" aria-controls="rizin-code rizin-graph-half" aria-valuemin="20" aria-valuemax="80" aria-valuenow="54" title="Drag to share the width; ← → with the keyboard, a double click for the default">⋮</div>
+                            <div class="rizin-half rizin-graph" id="rizin-graph-half">
+                                <div class="rizin-panel-head">
+                                    <h3 class="rizin-panel-title" data-info="The control flow graph of the current function with the block of the current address marked: green edges are taken jumps, red ones the fall-through, dim ones unconditional. Drag to move it, scroll to zoom and click a block to jump there; from 200 blocks it is an overview that a click zooms into."><span id="rizin-graph-title">GRAPH</span></h3>
+                                    <div class="rizin-graph-tools" role="group" aria-label="Zoom of the graph">
+                                        <button type="button" class="rizin-tool" id="rizin-graph-out" title="Zoom out" aria-label="Zoom out" onclick="rizinGraphZoomBy(0.8)">−</button>
+                                        <button type="button" class="rizin-tool" id="rizin-graph-in" title="Zoom in" aria-label="Zoom in" onclick="rizinGraphZoomBy(1.25)">+</button>
+                                        <button type="button" class="rizin-tool" id="rizin-graph-fit" title="Show the whole graph" aria-label="Show the whole graph" onclick="rizinGraphFit()">FIT</button>
+                                        <button type="button" class="rizin-tool rizin-max-btn" id="rizin-graph-max" title="Give the graph the whole width" aria-label="Give the graph the whole width" aria-pressed="false" onclick="rizinToggleMax('graph')">⇱</button>
+                                    </div>
+                                </div>
+                                <div class="rizin-view rizin-graph-view" id="rizin-graph" role="tabpanel" onclick="rizinOnGraphClick(event)" oncontextmenu="rizinOnContextMenu(event, 'graph')"></div>
+                                <div class="rizin-graph-info" id="rizin-graph-info"></div>
+                            </div>
+                        </section>
+                    </div>
+                    <section class="rizin-panel rizin-dock" id="rizin-dock" aria-label="Console and lists">
+                        <div class="rizin-dock-grip" id="rizin-dock-grip" role="separator" aria-orientation="horizontal" tabindex="0" aria-label="Height of the console and the lists" aria-controls="rizin-dock" aria-valuemin="90" aria-valuemax="600" aria-valuenow="230" title="Drag to change the height; ↑ ↓ with the keyboard, a double click for the default">═</div>
+                        <div class="rizin-panel-head rizin-dock-head">
+                            <div class="rizin-tabs" role="tablist" aria-label="Console and lists" data-rizin-tabs="dock" onclick="rizinOnTabClick(event)">
+                                <button type="button" class="rizin-tab" role="tab" aria-selected="true" aria-controls="rizin-console" data-rizin-tab="console">CONSOLE</button>
+                                <button type="button" class="rizin-tab" role="tab" aria-selected="false" aria-controls="rizin-xrefs" data-rizin-tab="xrefs">XREFS</button>
+                                <button type="button" class="rizin-tab" role="tab" aria-selected="false" aria-controls="rizin-strings" data-rizin-tab="strings">STRINGS</button>
+                                <button type="button" class="rizin-tab" role="tab" aria-selected="false" aria-controls="rizin-imports" data-rizin-tab="imports">IMPORTS</button>
+                            </div>
+                            <span class="rizin-dock-note" data-info="The console runs rizin commands where the views are and moves them when it seeks; ↑ ↓ walk the history and Tab completes commands and names. XREFS, STRINGS and IMPORTS list references, strings and imports: a click jumps there, and an import shows its references."><span id="rizin-dock-note">follows the views</span></span>
+                            <div class="rizin-dock-tools rizin-quick" id="rizin-quick" data-rizin-tools="console" role="toolbar" aria-label="Quick commands" onclick="rizinOnQuickClick(event)">
+                                <button type="button" class="rizin-tool" data-cmd="afl" title="afl: the functions">afl</button>
+                                <button type="button" class="rizin-tool" data-cmd="pdf" title="pdf: the current function's disassembly">pdf</button>
+                                <button type="button" class="rizin-tool" data-cmd="pdg" title="pdg: the current function in C (rz-ghidra)">pdg</button>
+                                <button type="button" class="rizin-tool" data-cmd="iz" title="iz: the strings of the data sections">iz</button>
+                                <button type="button" class="rizin-tool" data-cmd="ii" title="ii: the imports">ii</button>
+                                <button type="button" class="rizin-tool" data-cmd="axt" title="axt: the references to the current address">axt</button>
+                                <button type="button" class="rizin-tool" data-cmd="?" title="?: rizin's commands">?</button>
+                            </div>
+                            <div class="rizin-dock-tools" data-rizin-tools="strings" hidden>
+                                <input type="text" id="rizin-strings-filter" class="filter-input rizin-list-filter" placeholder="filter strings…" aria-label="Filter the strings" autocomplete="off" spellcheck="false" oninput="rizinOnListFilter('strings')" onkeydown="if (event.key === 'Enter') rizinOnListFilter('strings', true)">
+                                <span class="rizin-pager" id="rizin-strings-pager" aria-live="polite"></span>
+                                <button type="button" class="rizin-tool" id="rizin-strings-prev" title="The page before" aria-label="The page before" onclick="rizinListPage('strings', -1)" disabled>‹</button>
+                                <button type="button" class="rizin-tool" id="rizin-strings-next" title="The page after" aria-label="The page after" onclick="rizinListPage('strings', 1)" disabled>›</button>
+                            </div>
+                            <div class="rizin-dock-tools" data-rizin-tools="imports" hidden>
+                                <input type="text" id="rizin-imports-filter" class="filter-input rizin-list-filter" placeholder="filter imports…" title="Filters the imports by name or library" aria-label="Filter the imports by name or library" autocomplete="off" spellcheck="false" oninput="rizinOnListFilter('imports')" onkeydown="if (event.key === 'Enter') rizinOnListFilter('imports', true)">
+                                <span class="rizin-pager" id="rizin-imports-pager" aria-live="polite"></span>
+                                <button type="button" class="rizin-tool" id="rizin-imports-prev" title="The page before" aria-label="The page before" onclick="rizinListPage('imports', -1)" disabled>‹</button>
+                                <button type="button" class="rizin-tool" id="rizin-imports-next" title="The page after" aria-label="The page after" onclick="rizinListPage('imports', 1)" disabled>›</button>
+                            </div>
+                            <button type="button" class="rizin-fold rizin-dock-fold" id="rizin-dock-fold" aria-expanded="true" aria-controls="rizin-dock-body" title="Fold the console and the lists away" aria-label="Fold the console and the lists away" onclick="rizinToggleDock()">▾</button>
+                        </div>
+                        <div class="rizin-dock-body" id="rizin-dock-body">
+                            <div class="rizin-view rizin-console" id="rizin-console" role="tabpanel" data-rizin-pane="console">
+                                <div class="rizin-console-out" id="rizin-console-out" role="log" aria-label="Console output"><div class="rizin-console-entry rizin-console-hint">rizin commands run where the views are, and a seek moves them; ↑ ↓ walk the history, Tab completes, ? lists the commands. Programs, the shell and other files are not available.</div></div>
+                                <div class="rizin-console-line">
+                                    <label class="rizin-prompt" id="rizin-prompt" for="rizin-console-input">[-]&gt;</label>
+                                    <input type="text" id="rizin-console-input" class="rizin-console-input" placeholder="type a rizin command — ↑↓ history · Tab completes · ? help" aria-label="A rizin command" autocomplete="off" spellcheck="false" onkeydown="rizinOnConsoleKey(event)">
+                                </div>
+                            </div>
+                            <div class="rizin-view rizin-xrefs" id="rizin-xrefs" role="tabpanel" data-rizin-pane="xrefs" hidden onclick="rizinOnDockClick(event, 'xrefs')"></div>
+                            <div class="rizin-view rizin-list" id="rizin-strings" role="tabpanel" data-rizin-pane="strings" hidden onclick="rizinOnDockClick(event, 'strings')"></div>
+                            <div class="rizin-view rizin-list" id="rizin-imports" role="tabpanel" data-rizin-pane="imports" hidden onclick="rizinOnDockClick(event, 'imports')"></div>
+                        </div>
+                    </section>
+                </div>
+                <!-- Rename and Comment for the function, line or block right-clicked (rizinOnContextMenu) -->
+                <div class="rizin-menu" id="rizin-menu" hidden onclick="rizinOnMenuClick(event)" onkeydown="rizinOnMenuKey(event)">
+                    <div class="rizin-menu-head" id="rizin-menu-head"></div>
+                    <div class="rizin-menu-items" id="rizin-menu-items" role="menu" aria-label="Rename and comment">
+                        <button type="button" class="rizin-menu-item" role="menuitem" id="rizin-menu-rename" data-action="rename">Rename function…</button>
+                        <button type="button" class="rizin-menu-item" role="menuitem" id="rizin-menu-comment" data-action="comment">Comment…</button>
+                    </div>
+                    <div class="rizin-menu-form" id="rizin-menu-form" role="group" aria-labelledby="rizin-menu-label" hidden>
+                        <label class="rizin-menu-label" id="rizin-menu-label" for="rizin-menu-input"></label>
+                        <input type="text" id="rizin-menu-input" class="filter-input rizin-menu-input" autocomplete="off" spellcheck="false">
+                        <div class="rizin-menu-buttons">
+                            <button type="button" class="btn btn-sm" data-action="cancel">Cancel</button>
+                            <button type="button" class="btn btn-sm btn-primary" id="rizin-menu-save" data-action="save">Save</button>
+                        </div>
+                        <div class="rizin-menu-note" id="rizin-menu-note" role="status"></div>
+                    </div>
                 </div>
             </div>
 
@@ -1101,7 +1253,7 @@
                         <div class="help-card">
                             <div class="help-card-icon" style="color:var(--c-purple-500)">&#x1F4CA;</div>
                             <div class="help-card-title">Binary Analysis</div>
-                            <div class="help-card-desc">PE/ELF parsing, packer detection, entropy, file map, hex editor</div>
+                            <div class="help-card-desc">PE/ELF parsing, packer detection, entropy, file map, hex editor; reverse engineering with rizin and rz-ghidra</div>
                         </div>
                     </div>
 
@@ -1111,11 +1263,14 @@
                         <li><strong>DetonatorAgent</strong> runs it; exit capture is armed first</li>
                         <li><strong>Rustinel, Fibratus, Sysmon</strong> record what it does</li>
                         <li><strong>Live-memory scanners</strong> examine the running process (1&ndash;2 minutes); if it exits, its exit dump is analyzed instead</li>
-                        <li><strong>Read the verdict</strong> in Submit, then follow up in Tracing, Graph and Sysmon</li>
+                        <li><strong>Read the verdict</strong> in Submit, then follow up in Tracing, Graph and Sysmon, or open the sample or a dump in Rizin</li>
                     </ol>
 
                     <h4>Process instances</h4>
                     <p>Windows reuses PIDs. The UI tracks every process instance separately: <code>1234</code> is the newest process with PID 1234, <code>1234@1789372861</code> an earlier one. Alerts, events and children belong to the instance that was running at the time.</p>
+
+                    <h4>Reverse engineering</h4>
+                    <p>The <strong>Rizin</strong> tab opens a submitted sample, a dump, an upload or a path in rizin 0.9.1 on the VM and only reads the file: the functions, the disassembly, the control flow graph, rz-ghidra's C and the bytes all show one current address, which a click or a seek moves, with a console for rizin commands below. The server lets the console start no programs and touch no other files; renames and comments are kept in a project for the file. Each browser tab has a session of its own, three at most at a time.</p>
 
                     <h4>Themes and card controls</h4>
                     <p><strong>✶</strong> switches between the Classic and the Cyberpunk theme at once, without reloading the page: the open tab, an open detail view, filters and drilldown steps, the graph and running interception sessions stay as they are. This browser remembers the choice; without one the UI starts in Cyberpunk, the default. In Classic ✶ sits below "? Help". In Cyberpunk it is at the right end of the top bar, where ☰ PROCESSES opens the process list and the timeline, "…" holds the tabs that do not fit and "n/m ONLINE" lists the five services of the status row (Rustinel, Sysmon, Fibratus, Agent, LitterBox); the SERVICES ONLINE tile also counts the Detonator.</p>
@@ -1169,6 +1324,10 @@
                         <div class="help-guide-item">
                             <h4>FileMap</h4>
                             <p>Byteplot, entropy and PE/ELF structure planes side by side with import/export trees; click to jump to an offset.</p>
+                        </div>
+                        <div class="help-guide-item">
+                            <h4>Rizin</h4>
+                            <p>Reverse engineering with rizin on the VM, one session per browser tab; the file is only read, nothing is written into it or next to it. OPEN ▾ lists the submitted samples, the dumps and the uploads, and takes an upload or a path in the folders the download serves; the toolbar shows the file with its format, architecture and size, the SHA256 (in full on hover) and the analysis, which starts at once (<code>aaa</code>, <code>aa</code> above 20 MB). FUNCTIONS lists the functions by address with name and size (the address on hover), filtered by name or address, and « folds it away; DISASSEMBLY shows the current function with the current address marked, calls, jumps and symbols in colour. GRAPH beside it shows the control flow graph of the function with the block of the current address marked: green edges are taken jumps, red ones the fall-through, dim ones unconditional, and loops run around the outside. Drag to move the graph, scroll or use − + to zoom and FIT to see it whole; from 200 blocks it starts as an overview without the instructions, which a click zooms into. ⇱ gives one half the whole width, the line between the halves can be dragged (← → when it has the focus, a double click puts it back), and below 1400 px of window width the two halves are tabs. A click on a function, an instruction, a jump or call target or a block, or SEEK with an address, a function or a flag name and GO, moves every view there; ◀ ▶ walk back and forth through the jumps. Once the analysis is done the tab jumps to <code>main</code> if there is one. While rizin works on an analysis step the toolbar says busy, and the views load once the step is over. The dock below holds the CONSOLE for rizin commands at the current address (the prompt shows it): a seek there (<code>s</code>, <code>pdf @ …</code>) moves every view, ↑ ↓ walk the history, Tab completes commands, functions and flags, and the quick commands above it run <code>afl</code>, <code>pdf</code>, <code>pdg</code>, <code>iz</code>, <code>ii</code>, <code>axt</code> and <code>?</code>; the server lets no command start a program, read or write a file, open another one or debug, settings are limited to <code>asm.*</code>, <code>analysis.*</code> and <code>bin.demangle</code>, whole-program analysis (<code>aa</code>, <code>aaa</code> …) runs from Full analysis instead, and a refused command says why in one line. XREFS lists the references to the current address and from it, at a function's start from the whole function; STRINGS and IMPORTS come in pages, filtered on the VM, and a click jumps there and, on an import, shows its references. ═ drags the dock's height and ▾ folds it away. A right-click on a function, an instruction or a block renames the function or comments the address (an empty comment removes it), also with <code>afn</code> and <code>CC</code> in the console; both are refused (busy) until the analysis is done, because a later step could change them, are saved 3 s later in a project for the file on the VM (<code>webui\rizin_projects\&lt;sha256&gt;.rzdb</code>, made only once something is renamed or commented) and are back when the file is opened again, under any path. DECOMPILER beside DISASSEMBLY shows the function in C from rz-ghidra with the line of the current address marked, and a click on a line goes there; HEX shows 512 bytes from the current address with their ASCII, and Open in Hex tab opens the file in the Hex tab at that byte. Scrolling down a long function loads its next instructions; outside functions the disassembly stops after 2000 instructions, and a later address in SEEK reads on. A function whose decompile took too long and ended the session is not decompiled again on its own in that file: Decompile again asks once more. A file over 20 MB is analysed with <code>aa</code>: Full analysis runs <code>aaa</code>'s steps one by one, the views usable between them; an analysis stops at the next step after 10 minutes and says why, what it found stays usable, and Full analysis goes on with the steps left. The same file opened in another browser tab takes the session there, and this tab offers Take it back; a session that ended (30 minutes unused, its page closed, rizin stopped) comes back with Reopen, at the same place. At most three sessions run at once, and a fourth ends the one unused longest; every command has a time limit (views 30 s, the console 60 s, a decompile 120 s), and a rizin that does not answer in time is ended without holding up the rest of the web UI. The Rizin buttons of the Submit history, Process Dump, Exit Capture, ThreatScan (its result and its history) and the Hex tab open their file here.</p>
                         </div>
                         <div class="help-guide-item">
                             <h4>LitterBox</h4>
@@ -1273,7 +1432,9 @@ Web UI :9000 ──submit──▶ DetonatorAgent :8080 ──runs──▶ samp
      ├──── live memory ──▶ Aether · Process Dump · HSB · BeaconEye
      │                    Exit Capture (dump at process exit)
      │
-     └──── named pipes ──▶ Sysmon EID 17/18 (observe) · pipe proxy (intercept)</pre>
+     ├──── named pipes ──▶ Sysmon EID 17/18 (observe) · pipe proxy (intercept)
+     │
+     └──── RIZIN tab ────▶ rizin + rz-ghidra, one process per file (read-only)</pre>
 
                     <h4>Data Flow</h4>
                     <ol class="help-steps">
@@ -1287,7 +1448,7 @@ Web UI :9000 ──submit──▶ DetonatorAgent :8080 ──runs──▶ samp
                     </ol>
 
                     <h4>File Layout</h4>
-                    <pre class="help-code">C:\DetonationChamberUI\           Web UI (this interface), memory_results\, pipe_sessions\, baseline
+                    <pre class="help-code">C:\DetonationChamberUI\           Web UI (this interface), memory_results\, pipe_sessions\, rizin_projects\, baseline
 C:\tools\rustinel\                Rustinel ETW engine
 C:\tools\fibratus\                Fibratus kernel tracer
 C:\DetonatorAgent\                .NET execution agent
@@ -1296,6 +1457,7 @@ C:\tools\Aether\                  Memory forensics scanner + rules
 C:\tools\ProcessDump\             pd64.exe + clean-hash database
 C:\tools\Hunt-Sleeping-Beacons\   Sleeping beacon scanner
 C:\tools\BeaconEye\               Cobalt Strike config scanner
+C:\tools\cutter\                  rizin + rz-ghidra (RIZIN tab)
 C:\dumps\                         Memory dumps; exit\ = exit-time dumps
 C:\tools\detection-rules\         Sigma + YARA + IOC rules
 C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
@@ -1362,6 +1524,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
          in app.js); set as text, never as markup -->
     <div id="info-popover" class="info-popover" role="status" hidden></div>
 
-    <script src="/static/js/app.js?v=86"></script>
+    <script src="/static/js/app.js?v=96"></script>
 </body>
 </html>

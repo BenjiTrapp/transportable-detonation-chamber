@@ -110,7 +110,7 @@ def test_proxied_responses_never_render_as_pages(tdc, ctype, served):
 def test_downloads_are_attachments_in_a_sandbox(tdc, client, monkeypatch, tmp_path):
     f = tmp_path / "evil.html"
     f.write_text("<script>alert(1)</script>")
-    monkeypatch.setattr(tdc, "_path_within", lambda p, roots: True)
+    monkeypatch.setattr(tdc, "_readable_roots", lambda: [str(tmp_path)])
     r = client.get(f"/api/file/download?path={f}")
     assert r.status_code == 200
     assert r.mimetype == "application/octet-stream"
