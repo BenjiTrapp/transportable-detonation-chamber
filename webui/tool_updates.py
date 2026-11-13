@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -58,20 +59,59 @@ class HttpResult(NamedTuple):
     text: str
 
 
+def _as_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
+
+
 class Env:
     """The real environment: subprocesses, HTTP and the file system."""
 
     def run(self, args: List[str], timeout: float) -> RunResult:
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        # Popen instead of subprocess.run: on timeout the whole process tree
+        # is killed, because grandchildren (git-remote-https, choco, scripts)
+        # keep the pipes open and run() would block in communicate().
+        windows = os.name == "nt"
+        kwargs: Dict[str, Any] = {}
+        if windows:
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        else:
+            kwargs["start_new_session"] = True
+        child_env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=timeout, creationflags=flags, encoding="utf-8", errors="replace")
+                encoding="utf-8", errors="replace", env=child_env, **kwargs)
         except FileNotFoundError:
             return RunResult(127, "", "not found: %s" % args[0])
+        try:
+            out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
-            return RunResult(124, "", "timed out after %ss" % timeout)
-        return RunResult(proc.returncode, proc.stdout or "", proc.stderr or "")
+            self._kill_tree(proc, windows)
+            try:
+                out, err = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired as late:
+                out, err = _as_text(late.stdout), _as_text(late.stderr)
+            note = "timed out after %ss" % timeout
+            return RunResult(124, out or "", ((err or "").rstrip() + "\n" + note).strip())
+        return RunResult(proc.returncode, out or "", err or "")
+
+    @staticmethod
+    def _kill_tree(proc, windows: bool) -> None:
+        try:
+            if windows:
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            else:
+                os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
     def http_get(self, url: str, timeout: float, method: str = "GET") -> HttpResult:
         headers = {"User-Agent": "tdc-tool-updates"}
@@ -247,8 +287,19 @@ def check_choco(env) -> List[Dict[str, Any]]:
         return [{"id": "choco", "name": "Chocolatey", "kind": "choco", "installed": None,
                  "available": None, "status": "not_installed", "pinned": None,
                  "detail": "Chocolatey is not installed", "log": [], "updated_at": None}]
+    rows = parse_choco_outdated(res.stdout)
+    # choco may exit with 2 when packages are outdated; any other failure
+    # must not look like "all packages are current"
+    if res.returncode == 124 or (res.returncode not in (0, 2) and not rows):
+        if res.returncode == 124:
+            detail = "choco outdated timed out"
+        else:
+            detail = _one_line(res.stderr or res.stdout or "choco outdated failed (exit %d)" % res.returncode)
+        return [{"id": "choco", "name": "Chocolatey", "kind": "choco", "installed": None,
+                 "available": None, "status": "error", "pinned": None,
+                 "detail": detail, "log": [], "updated_at": None}]
     entries = []
-    for row in parse_choco_outdated(res.stdout):
+    for row in rows:
         pinned = row["pinned"]
         entries.append({
             "id": "choco:" + row["package"], "name": row["package"], "kind": "choco",
@@ -378,12 +429,23 @@ def _check_sysinternals(spec, env) -> Dict[str, Any]:
     return _entry(spec, recorded, current, "up_to_date")
 
 
+# winget's "no installed package found matching input criteria", signed and unsigned
+WINGET_NO_MATCH = (-1978335212, 2316632084)
+
+
+def _winget_error(spec, res) -> Dict[str, Any]:
+    detail = _one_line(res.stderr.strip() or res.stdout.strip() or "winget failed (exit %d)" % res.returncode)
+    return _entry(spec, status="error", detail=detail)
+
+
 def _check_winget(spec, env) -> Dict[str, Any]:
     winget_id = WINGET_IDS.get(spec.id, spec.id)
     res = env.run(["winget", "list", "--id", winget_id, "--upgrade-available",
                    "--accept-source-agreements"], CHECK_TIMEOUT)
     if res.returncode == 127:
         return _entry(spec, status="unknown", detail="winget is not available for SYSTEM")
+    if res.returncode not in (0,) + WINGET_NO_MATCH:
+        return _winget_error(spec, res)
     for line in res.stdout.splitlines():
         tokens = line.split()
         if winget_id in tokens:
@@ -392,7 +454,9 @@ def _check_winget(spec, env) -> Dict[str, Any]:
             available = tokens[i + 2] if len(tokens) > i + 2 and re.search(r"\d", tokens[i + 2]) else None
             return _entry(spec, installed, available, "update_available")
     listed = env.run(["winget", "list", "--id", winget_id, "--accept-source-agreements"], CHECK_TIMEOUT)
-    if winget_id not in listed.stdout:
+    if listed.returncode not in (0,) + WINGET_NO_MATCH:
+        return _winget_error(spec, listed)
+    if listed.returncode in WINGET_NO_MATCH or winget_id not in listed.stdout:
         return _entry(spec, status="not_installed")
     return _entry(spec, status="up_to_date")
 

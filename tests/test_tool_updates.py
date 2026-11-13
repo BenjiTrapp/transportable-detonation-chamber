@@ -132,6 +132,20 @@ def test_check_choco_entries_and_missing_choco():
     assert [(e["id"], e["status"]) for e in entries] == [("choco", "not_installed")]
 
 
+def test_check_choco_failures_are_errors_not_an_empty_list():
+    env = FakeEnv(commands={("choco", "outdated"): RunResult(124, "", "timed out after 180s")})
+    entries = tu.check_choco(env)
+    assert [(e["id"], e["status"]) for e in entries] == [("choco", "error")]
+    assert entries[0]["detail"] == "choco outdated timed out"
+    env = FakeEnv(commands={("choco", "outdated"): fail("Access denied\nmore", code=1)})
+    entries = tu.check_choco(env)
+    assert [(e["id"], e["status"], e["detail"]) for e in entries] == [("choco", "error", "Access denied")]
+    # exit code 2 with a list is choco's "outdated packages found"
+    env = FakeEnv(commands={("choco", "outdated"): RunResult(2, "git|2.40.0|2.41.0|false\n", "")})
+    assert [e["id"] for e in tu.check_choco(env)] == ["choco:git"]
+    assert tu.check_choco(FakeEnv(commands={("choco", "outdated"): ok("")})) == []
+
+
 def test_git_behind_reports_commits():
     path = "C:\\LitterBox"
     env = git_env(path, behind="3")
@@ -260,6 +274,29 @@ def test_winget_missing_and_update_available():
     assert entry["available"] == "1.3.0.0"
 
 
+def test_winget_failures_are_errors_and_no_match_is_not_installed():
+    spec = spec_of("windbg")
+    entry = tu.check_tool(spec, FakeEnv(commands={("winget", "list"): fail("Failed when opening source\nx", 1)}))
+    assert (entry["status"], entry["detail"]) == ("error", "Failed when opening source")
+    for code in (-1978335212, 2316632084):
+        env = FakeEnv(commands={("winget", "list"): RunResult(code, "No installed package found matching input criteria.", "")})
+        assert tu.check_tool(spec, env)["status"] == "not_installed"
+    # upgrade list says nothing, the plain list shows the package: up to date
+    def listing(args):
+        if "--upgrade-available" in args:
+            return RunResult(-1978335212, "No installed package found matching input criteria.", "")
+        return ok("WinDbg  Microsoft.WinDbg  1.3.0.0  winget\n")
+    entry = tu.check_tool(spec, FakeEnv(commands={("winget", "list"): listing}))
+    assert entry["status"] == "up_to_date"
+    # the second call failing is an error too
+    def failing_second(args):
+        if "--upgrade-available" in args:
+            return ok("")
+        return fail("access denied", 5)
+    entry = tu.check_tool(spec, FakeEnv(commands={("winget", "list"): failing_second}))
+    assert (entry["status"], entry["detail"]) == ("error", "access denied")
+
+
 def test_missing_tool_is_not_installed():
     for tool_id in ("capa", "litterbox", "sysmon", "rizin"):
         entry = tu.check_tool(spec_of(tool_id), FakeEnv())
@@ -368,6 +405,30 @@ class TestEnv:
         assert res.returncode == 124
         res = env.run([sys.executable, "-c", "print('hi')"], 10)
         assert (res.returncode, res.stdout.strip()) == (0, "hi")
+
+    def test_timeout_kills_the_child_and_returns_quickly(self):
+        import sys
+        import time
+        start = time.monotonic()
+        res = tu.Env().run([sys.executable, "-c", "print('partial', flush=True); import time; time.sleep(5)"], 0.5)
+        assert res.returncode == 124
+        assert time.monotonic() - start < 4
+        assert "timed out" in res.stderr
+
+    def test_timeout_kills_grandchildren_holding_the_pipes(self):
+        import sys
+        import time
+        code = ("import subprocess, sys, time; "
+                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)']); time.sleep(20)")
+        start = time.monotonic()
+        res = tu.Env().run([sys.executable, "-c", code], 0.5)
+        assert res.returncode == 124
+        assert time.monotonic() - start < 8
+
+    def test_child_gets_git_terminal_prompt_disabled(self):
+        import sys
+        res = tu.Env().run([sys.executable, "-c", "import os; print(os.environ.get('GIT_TERMINAL_PROMPT'))"], 10)
+        assert res.stdout.strip() == "0"
 
     def test_read_text_and_exists(self, tmp_path):
         f = tmp_path / "m.txt"
