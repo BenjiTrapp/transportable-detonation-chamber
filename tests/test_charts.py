@@ -5044,7 +5044,8 @@ def test_dashboard_charts_have_info_and_table():
 
     parts = find(body, lambda e: "dashboard-body" in e["attrs"].get("class", "").split())[0]["children"]
     assert [c["attrs"].get("id") or c["attrs"].get("class") for c in parts] == \
-        ["dashboard-stats", "dashboard-charts", "dashboard-grid", "dashboard-activity"], "the charts are not above the service cards"
+        ["dashboard-stats", "dashboard-charts", "dashboard-grid", "tool-updates", "dashboard-activity"], \
+        "the charts are not above the service cards"
     charts = by_id(body, "dashboard-charts")
     cards = find(charts, lambda e: "chart-card" in e["attrs"].get("class", "").split())
     assert [c["attrs"].get("id") for c in cards] == ["dashboard-alerts-card", "dashboard-severity-card", "dashboard-category-card"]

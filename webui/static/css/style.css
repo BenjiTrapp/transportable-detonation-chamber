@@ -159,6 +159,7 @@
     --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
     --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     --radius: 4px;
+    --maintenance-height: 36px;
     --radius-lg: 8px;
     /* Not a colour: the height of the Alerts tab's filter bar, which its
        table head stands under; app.js (initAlertsTab) sets it on the head */
@@ -10011,4 +10012,155 @@ table[data-sortable] > thead > tr > th:focus-visible {
 #tab-rizin.rizin-dragover .rizin-work {
     outline: 2px dashed var(--accent-cyan);
     outline-offset: -4px;
+}
+
+/* --- Tool Updates (dashboard) and the maintenance banner --- */
+.dashboard-updates {
+    padding: 0 20px 16px;
+    border-top: 1px solid var(--border-primary);
+}
+.updates-body {
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+    background: var(--bg-secondary);
+}
+.updates-bar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border-primary);
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+.updates-note {
+    color: var(--accent-cyan);
+}
+.updates-buttons {
+    margin-left: auto;
+    display: flex;
+    gap: 8px;
+}
+.updates-bar .btn:disabled,
+.updates-row-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+.updates-table .updates-row {
+    cursor: pointer;
+}
+.updates-table .updates-row:hover td,
+.updates-table .updates-row.open td {
+    background: var(--bg-card-hover);
+}
+.updates-name {
+    font-weight: 600;
+}
+.updates-version {
+    font-family: var(--font-mono);
+}
+.updates-pin {
+    margin-left: 4px;
+    font-size: 9px;
+    color: var(--accent-purple);
+}
+.updates-action {
+    text-align: right;
+}
+.updates-empty {
+    padding: 14px;
+    font-size: 11px;
+    color: var(--text-muted);
+    text-align: center;
+    white-space: normal;
+}
+.updates-detail {
+    margin-bottom: 6px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    white-space: normal;
+}
+.updates-log {
+    margin: 0;
+    max-height: 220px;
+    overflow: auto;
+    padding: 8px 10px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+    background: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+.updates-status {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    white-space: nowrap;
+    color: var(--text-muted);
+    background: rgba(var(--text-muted-rgb), 0.12);
+}
+.updates-status-up-to-date,
+.updates-status-updated { color: var(--accent-green); background: rgba(var(--accent-green-rgb), 0.12); }
+.updates-status-update-available,
+.updates-status-updating { color: var(--accent-cyan); background: rgba(var(--accent-cyan-rgb), 0.12); }
+.updates-status-pinned-update { color: var(--accent-purple); background: rgba(var(--accent-purple-rgb), 0.12); }
+.updates-status-reboot-required { color: var(--accent-yellow); background: rgba(var(--accent-yellow-rgb), 0.14); }
+.updates-status-offline { color: var(--accent-orange); background: rgba(var(--accent-orange-rgb), 0.12); }
+.updates-status-error,
+.updates-status-failed { color: var(--accent-red); background: rgba(var(--accent-red-rgb), 0.12); }
+.updates-status-unknown,
+.updates-status-not-installed,
+.updates-status-queued { color: var(--text-muted); background: rgba(var(--text-muted-rgb), 0.12); }
+
+/* Under the top bar on every tab; the app moves down by its height while it shows */
+.maintenance-banner {
+    position: fixed;
+    top: 0;
+    right: 0;
+    left: 0;
+    z-index: 250;
+    height: var(--maintenance-height);
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 0 16px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent-orange);
+    background: linear-gradient(rgba(var(--accent-orange-rgb), 0.16), rgba(var(--accent-orange-rgb), 0.16)), var(--bg-secondary);
+    border-bottom: 1px solid rgba(var(--accent-orange-rgb), 0.5);
+}
+.maintenance-banner[hidden] {
+    display: none;
+}
+.maintenance-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.maintenance-progress {
+    flex: 0 0 160px;
+    height: 6px;
+    border-radius: 3px;
+    background: rgba(var(--accent-orange-rgb), 0.2);
+    overflow: hidden;
+}
+.maintenance-progress-bar {
+    display: block;
+    height: 100%;
+    width: 0;
+    background: var(--accent-orange);
+    transition: width 0.4s ease;
+}
+body.maintenance-active #app {
+    padding-top: var(--maintenance-height);
 }

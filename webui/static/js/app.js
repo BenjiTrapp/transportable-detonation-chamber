@@ -393,9 +393,9 @@ document.addEventListener('DOMContentLoaded', () => {
     // Polls pause while the browser tab is hidden; refreshAll() above already
     // loaded the dashboard, so it is not fetched a second time here.
     setInterval(() => { if (!document.hidden) refreshAlerts(); }, 5000);
-    setInterval(() => { if (!document.hidden) refreshDashboard(); }, 10000);
+    setInterval(() => { if (!document.hidden) { refreshDashboard(); refreshUpdates(); } }, 10000);
     document.addEventListener('visibilitychange', () => {
-        if (!document.hidden) { refreshAlerts(); refreshDashboard(); }
+        if (!document.hidden) { refreshAlerts(); refreshDashboard(); refreshUpdates(); }
     });
     loadScanToolStatus();
     loadScanHistory();
@@ -521,7 +521,7 @@ async function loadScanToolStatus() {
 // --- Data fetching ---
 async function refreshAll() {
     await LoadingSpinner.wrap(
-        Promise.all([refreshAlerts(), refreshProcesses(), refreshDashboard()])
+        Promise.all([refreshAlerts(), refreshProcesses(), refreshDashboard(), refreshUpdates()])
     );
 }
 
@@ -7687,6 +7687,225 @@ async function launchService(serviceName, btnElement) {
             btn.classList.remove('launch-failed');
         }, 5000);
     }
+}
+
+// --- Tool updates ---
+// The "Tool Updates" section of the dashboard and the maintenance banner under
+// the top bar. GET /api/updates is asked for on the dashboard's 10 s interval,
+// and every 3 s while a check or an update is running.
+const UPDATES_POLL_MS = 3000;
+const UPDATE_STATUS_LABELS = {
+    up_to_date: 'Up to date',
+    update_available: 'Update available',
+    pinned_update: 'Pinned \u2013 newer available',
+    unknown: 'Unknown',
+    not_installed: 'Not installed',
+    offline: 'Offline',
+    error: 'Check failed',
+    queued: 'Queued',
+    updating: 'Updating\u2026',
+    updated: 'Updated',
+    failed: 'Update failed',
+    reboot_required: 'Reboot required',
+};
+let updatesState = null;
+let updatesPollTimer = null;
+// Tools whose log row is open, the markup last drawn and the number of the last request
+let updatesOpenLogs = new Set();
+let updatesRendered = null;
+let updatesSeq = 0;
+
+function updateStatusLabel(status) {
+    return Object.prototype.hasOwnProperty.call(UPDATE_STATUS_LABELS, status) ? UPDATE_STATUS_LABELS[status] : 'Unknown';
+}
+
+// A tool that only installs after a question: it stays on its pin
+function updatesIsPinned(tool) {
+    return tool.status === 'pinned_update' || (tool.status === 'failed' && !!tool.pinned);
+}
+
+function updateRowHtml(tool, idle) {
+    const status = String(tool.status || '');
+    const open = updatesOpenLogs.has(tool.id);
+    const canUpdate = status === 'update_available' || status === 'pinned_update' || status === 'failed';
+    const pin = tool.pinned ? ` <span class="updates-pin">pinned ${escapeHtml(tool.pinned)}</span>` : '';
+    const button = canUpdate
+        ? `<button type="button" class="btn btn-sm updates-row-btn"${idle ? '' : ' disabled'} onclick="updateOne(${jsArg(tool.id)})">Update</button>`
+        : '';
+    let html = `<tr class="updates-row${open ? ' open' : ''}" onclick="toggleUpdateLog(event, ${jsArg(tool.id)})">`
+        + `<td class="updates-name">${escapeHtml(tool.name || tool.id)}</td>`
+        + `<td>${escapeHtml(tool.kind)}</td>`
+        + `<td class="updates-version">${escapeHtml(tool.installed || '\u2014')}${pin}</td>`
+        + `<td class="updates-version">${escapeHtml(tool.available || '\u2014')}</td>`
+        + `<td><span class="updates-status updates-status-${cssToken(status).replace(/_/g, '-')}">${escapeHtml(updateStatusLabel(status))}</span></td>`
+        + `<td class="updates-action">${button}</td></tr>`;
+    if (open) {
+        const log = Array.isArray(tool.log) ? tool.log.join('\n') : '';
+        html += '<tr class="updates-log-row" data-sort-detail><td colspan="6">'
+            + (tool.detail ? `<div class="updates-detail">${escapeHtml(tool.detail)}</div>` : '')
+            + `<pre class="updates-log">${escapeHtml(log || '(no log)')}</pre></td></tr>`;
+    }
+    return html;
+}
+
+function updatesHtml(data) {
+    const tools = Array.isArray(data.tools) ? data.tools : [];
+    const idle = data.mode === 'idle';
+    const available = tools.filter(t => t.status === 'update_available').length;
+    let checked = 'Never checked';
+    if (data.checked_at) {
+        const when = new Date(data.checked_at);
+        checked = 'Last checked ' + (isNaN(when.getTime()) ? String(data.checked_at) : when.toLocaleString('en-GB'));
+    }
+    const note = data.mode === 'checking' ? 'Checking\u2026' : data.mode === 'updating' ? 'Updating\u2026' : '';
+    const rows = tools.length
+        ? tools.map(t => updateRowHtml(t, idle)).join('')
+        : '<tr data-sort-skip><td colspan="6" class="updates-empty">No tools known yet. Check for updates to look for them.</td></tr>';
+    return '<div class="updates-bar">'
+        + `<span class="updates-checked">${escapeHtml(checked)}</span>`
+        + (note ? `<span class="updates-note">${note}</span>` : '')
+        + '<span class="updates-buttons">'
+        + `<button type="button" id="updates-check" class="btn btn-sm"${idle ? '' : ' disabled'} onclick="checkUpdates()">Check for updates</button>`
+        + `<button type="button" id="updates-all" class="btn btn-sm btn-primary"${idle && available > 0 ? '' : ' disabled'} onclick="updateAll()">Update all (${available})</button>`
+        + '</span></div>'
+        + '<div class="view-table-wrap"><table class="view-table updates-table" data-sortable data-sort-id="tool-updates">'
+        + '<thead><tr><th>Tool</th><th>Source</th><th>Installed</th><th>Available</th><th>Status</th><th data-no-sort>Action</th></tr></thead>'
+        + `<tbody>${rows}</tbody></table></div>`;
+}
+
+function renderUpdates(data) {
+    const root = document.getElementById('tool-updates-body');
+    if (!root || !data) return;
+    const html = updatesHtml(data);
+    if (html === updatesRendered) return;
+    updatesRendered = html;
+    root.innerHTML = html;
+}
+
+function renderMaintenanceBanner(data) {
+    const updating = !!data && data.mode === 'updating';
+    document.body.classList.toggle('maintenance-active', updating);
+    const banner = document.getElementById('maintenance-banner');
+    if (banner) banner.hidden = !updating;
+    if (!updating) return;
+    const progress = data.progress || {};
+    const total = Number(progress.total) || 0;
+    const done = Math.min(Number(progress.done) || 0, total);
+    const position = total ? ` (${Math.min(done + 1, total)}/${total}${progress.current ? ': ' + progress.current : ''})` : '';
+    const text = document.getElementById('maintenance-text');
+    if (text) text.textContent = `MAINTENANCE \u2014 Updating tools${position}. Detonations, scans and uploads are paused.`;
+    const bar = document.getElementById('maintenance-progress-bar');
+    if (bar) bar.style.width = (total ? Math.round(done / total * 100) : 0) + '%';
+}
+
+// "2 updated, 1 failed" of the results of the last run; a tool that waits for a reboot is installed
+function updatesSummary(results) {
+    const values = Object.values(results || {});
+    const updated = values.filter(s => s === 'updated' || s === 'reboot_required').length;
+    const failed = values.filter(s => s === 'failed').length;
+    return { updated, failed, text: `${updated} updated, ${failed} failed` };
+}
+
+function scheduleUpdatesPoll() {
+    if (updatesPollTimer) clearTimeout(updatesPollTimer);
+    updatesPollTimer = null;
+    if (!updatesState || updatesState.mode === 'idle') return;
+    updatesPollTimer = setTimeout(() => {
+        updatesPollTimer = null;
+        if (document.hidden) scheduleUpdatesPoll();
+        else refreshUpdates();
+    }, UPDATES_POLL_MS);
+}
+
+async function refreshUpdates() {
+    const seq = ++updatesSeq;
+    try {
+        const resp = await fetch('/api/updates');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (seq !== updatesSeq) return;
+        const was = updatesState;
+        updatesState = data;
+        renderUpdates(data);
+        renderMaintenanceBanner(data);
+        if (was && was.mode === 'updating' && data.mode === 'idle') {
+            const summary = updatesSummary(data.last_run && data.last_run.results);
+            showToast(summary.failed ? 'warning' : 'success', 'Tool updates finished', summary.text, 8000);
+        }
+    } catch (e) {
+        // the server is away for a moment (it may be restarting): the next poll asks again
+    } finally {
+        scheduleUpdatesPoll();
+    }
+}
+
+async function updatesPost(url, body, failTitle) {
+    try {
+        const resp = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: body === undefined ? undefined : JSON.stringify(body),
+        });
+        let data = {};
+        try { data = await resp.json(); } catch (e) { data = {}; }
+        if (!resp.ok) {
+            showToast('error', failTitle, data.error || `Server returned ${resp.status}`);
+            return null;
+        }
+        return data;
+    } catch (e) {
+        showToast('error', failTitle, e.message || 'Could not reach the server');
+        return null;
+    }
+}
+
+async function checkUpdates() {
+    await updatesPost('/api/updates/check', undefined, 'Update check failed');
+    await refreshUpdates();
+}
+
+// ids: a list of tool ids or 'all' (every tool with an update, pinned ones left out).
+// A pinned tool is installed only after the user said so; includePinned means they did.
+async function applyUpdates(ids, includePinned) {
+    const tools = (updatesState && updatesState.tools) || [];
+    let body;
+    if (ids === 'all') {
+        const count = tools.filter(t => t.status === 'update_available').length;
+        if (!count) return;
+        if (!confirm(`Install ${count} updates? Detonations, scans and uploads are paused while they run.`)) return;
+        body = { tools: 'all', include_pinned: false };
+    } else {
+        let pinned = false;
+        for (const id of ids) {
+            const tool = tools.find(t => t.id === id);
+            if (!tool || !updatesIsPinned(tool)) continue;
+            pinned = true;
+            if (!includePinned && !confirm(`${tool.name} is pinned to ${tool.pinned} for compatibility. Install ${tool.available || 'the update'} anyway?`)) return;
+        }
+        body = { tools: ids, include_pinned: pinned };
+    }
+    const data = await updatesPost('/api/updates/apply', body, 'Update failed');
+    if (data) {
+        const n = Array.isArray(data.tools) ? data.tools.length : 0;
+        showToast('info', 'Updating tools', n ? `${n} tool${n === 1 ? '' : 's'} queued` : 'Started');
+    }
+    await refreshUpdates();
+}
+
+function updateOne(id) {
+    return applyUpdates([id], false);
+}
+
+function updateAll() {
+    return applyUpdates('all', false);
+}
+
+// A click on a row opens or closes its log; the Update button of the row is not a click on the row
+function toggleUpdateLog(e, id) {
+    if (e && e.target && e.target.closest && e.target.closest('button')) return;
+    if (updatesOpenLogs.has(id)) updatesOpenLogs.delete(id);
+    else updatesOpenLogs.add(id);
+    renderUpdates(updatesState);
 }
 
 // --- Detail Panel: Navigation ---

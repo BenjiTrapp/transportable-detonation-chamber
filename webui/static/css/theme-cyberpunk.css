@@ -2539,3 +2539,66 @@
 [data-theme="cyberpunk"] .rizin-more:hover {
     color: var(--cp-magenta);
 }
+
+/* --- Tool Updates and the maintenance banner --- */
+[data-theme="cyberpunk"] .dashboard-updates {
+    border-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .updates-body {
+    background-color: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow);
+}
+[data-theme="cyberpunk"] .updates-bar {
+    font-family: var(--cp-font-label);
+    letter-spacing: .06em;
+    border-bottom-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .updates-table th {
+    font-family: var(--cp-font-label);
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--cp-text-dim);
+    background: var(--cp-bar-bottom);
+    border-bottom-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .updates-table td {
+    border-bottom-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .updates-table .updates-row:hover td,
+[data-theme="cyberpunk"] .updates-table .updates-row.open td {
+    background: var(--cp-raised);
+}
+[data-theme="cyberpunk"] .updates-name {
+    font-family: var(--cp-font-label);
+    letter-spacing: .06em;
+}
+[data-theme="cyberpunk"] .updates-log {
+    background: var(--cp-bg);
+    border-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .updates-status {
+    font-family: var(--cp-font-label);
+    letter-spacing: .08em;
+    text-transform: uppercase;
+}
+[data-theme="cyberpunk"] .maintenance-banner {
+    top: var(--topbar-height);
+    font-family: var(--cp-font-label);
+    letter-spacing: .1em;
+    color: var(--cp-amber);
+    background: linear-gradient(rgba(var(--cp-amber-rgb), .14), rgba(var(--cp-amber-rgb), .14)), var(--cp-bar-bottom);
+    border-bottom-color: rgba(var(--cp-amber-rgb), .6);
+    box-shadow: 0 0 18px rgba(var(--cp-amber-rgb), .22);
+}
+[data-theme="cyberpunk"] .maintenance-progress {
+    background: rgba(var(--cp-amber-rgb), .2);
+}
+[data-theme="cyberpunk"] .maintenance-progress-bar {
+    background: var(--cp-amber);
+    box-shadow: 0 0 8px rgba(var(--cp-amber-rgb), .7);
+}
+[data-theme="cyberpunk"] body.maintenance-active #app {
+    padding-top: calc(var(--topbar-height) + var(--maintenance-height));
+}

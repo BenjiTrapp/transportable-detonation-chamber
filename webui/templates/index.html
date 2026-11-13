@@ -19,8 +19,8 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=65">
-    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=24">
+    <link rel="stylesheet" href="/static/css/style.css?v=66">
+    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=25">
 </head>
 <body>
     <!-- Global loading overlay (shown on slow fetches) -->
@@ -55,6 +55,13 @@
             <button class="btn-help" onclick="openHelp()" title="Help &amp; Documentation">? Help</button>
             <button class="btn-theme" id="theme-toggle-top" onclick="toggleTheme()" title="Switch to Classic theme" aria-label="Switch to Classic theme">✶</button>
         </header>
+
+        <!-- Shown while tool updates run (renderMaintenanceBanner in app.js); it sits under the top bar
+             on every tab, as detonations, scans and uploads are paused then -->
+        <div id="maintenance-banner" class="maintenance-banner" role="status" aria-live="polite" hidden>
+            <span class="maintenance-text" id="maintenance-text"></span>
+            <span class="maintenance-progress"><span class="maintenance-progress-bar" id="maintenance-progress-bar"></span></span>
+        </div>
 
         <!-- Darkens the content while the Cyberpunk drawer is open; a click on it
              closes the drawer like any click beside it (onTopbarOutsideClick) -->
@@ -180,6 +187,15 @@
                     <!-- Service Cards -->
                     <div class="dashboard-grid" id="dashboard-grid">
                         <!-- Service cards rendered by JS -->
+                    </div>
+                    <!-- Tool Updates: renderUpdates() in app.js fills the body -->
+                    <div class="dashboard-updates" id="tool-updates">
+                        <div class="activity-header">
+                            <h3 data-info="Checks every installed tool for a newer version and installs it. While an update runs, detonations, scans and uploads are paused.">Tool Updates</h3>
+                        </div>
+                        <div id="tool-updates-body" class="updates-body">
+                            <div class="updates-empty">Loading...</div>
+                        </div>
                     </div>
                     <!-- Recent Activity -->
                     <div class="dashboard-activity">
@@ -1287,7 +1303,7 @@
                     <div class="help-tab-guide">
                         <div class="help-guide-item">
                             <h4>Dashboard</h4>
-                            <p>Stats strip (alerts, processes, services, rules, tools; TOTAL ALERTS and PROCESSES TRACKED with 45-day sparklines), ALERT ACTIVITY (alerts stacked by severity) with the SEVERITY and CATEGORY donuts of its range, one card per service with launch buttons, recent activity. A tile opens what it counts (the high / med / low counts of TOTAL ALERTS open the Alerts tab filtered by severity); a bar or a segment opens the Alerts tab filtered to it, and a drag across the bars narrows the donuts to the range drawn.</p>
+                            <p>Stats strip (alerts, processes, services, rules, tools; TOTAL ALERTS and PROCESSES TRACKED with 45-day sparklines), ALERT ACTIVITY (alerts stacked by severity) with the SEVERITY and CATEGORY donuts of its range, one card per service with launch buttons, Tool Updates (Check for updates looks for a newer version of every installed tool, Update all or the Update button of a row installs it; a pinned tool asks first, and while updates run a banner says that detonations, scans and uploads are paused), recent activity. A tile opens what it counts (the high / med / low counts of TOTAL ALERTS open the Alerts tab filtered by severity); a bar or a segment opens the Alerts tab filtered to it, and a drag across the bars narrows the donuts to the range drawn.</p>
                         </div>
                         <div class="help-guide-item">
                             <h4>Alerts</h4>
@@ -1534,6 +1550,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
          in app.js); set as text, never as markup -->
     <div id="info-popover" class="info-popover" role="status" hidden></div>
 
-    <script src="/static/js/app.js?v=96"></script>
+    <script src="/static/js/app.js?v=97"></script>
 </body>
 </html>
