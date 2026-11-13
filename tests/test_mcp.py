@@ -195,10 +195,43 @@ def test_detonation_results_mentions_pipes(api):
     assert "Named pipes: unavailable (Sysmon not running)" in server.tdc_detonation_results(pid=4072)
 
 
+def test_updates_status_lists_tools_and_progress(api):
+    api({"/api/updates": {
+        "mode": "updating", "checked_at": "2026-11-13T10:00:00Z", "progress": {"done": 1, "total": 3, "current": "LitterBox"},
+        "tools": [{"id": "capa", "status": "update_available", "installed": "9.0.0", "available": "9.1.0"},
+                  {"id": "rustinel", "status": "pinned_update", "installed": "1.1.1", "available": "1.2.0",
+                   "pinned": "1.1.1", "detail": "Pinned"}]}})
+    out = server.tdc_updates_status()
+    assert "Mode: updating" in out and "Updating 1/3: LitterBox" in out
+    assert "capa: update_available (9.0.0 -> 9.1.0)" in out
+    assert "[pinned 1.1.1]" in out
+
+
+def test_updates_apply_sends_a_list_of_ids(monkeypatch):
+    sent = {}
+
+    def fake_call(method, path, **kwargs):
+        sent.update(method=method, path=path, **kwargs)
+        return {"started": True, "tools": ["capa", "litterbox"]}
+
+    monkeypatch.setattr(server, "_call", fake_call)
+    out = server.tdc_updates_apply(tools="capa, litterbox", include_pinned=True)
+    assert sent["method"] == "POST" and sent["path"] == "/api/updates/apply"
+    assert sent["json"] == {"tools": ["capa", "litterbox"], "include_pinned": True}
+    assert "capa, litterbox" in out
+    server.tdc_updates_apply()
+    assert sent["json"] == {"tools": "all", "include_pinned": False}
+
+
+def test_updates_apply_reports_the_refusal(monkeypatch):
+    monkeypatch.setattr(server, "_call", lambda *a, **k: {"error": "A detonation is running. Wait until it finishes."})
+    assert server.tdc_updates_apply().startswith("Error: A detonation is running")
+
+
 def test_every_tool_has_a_docstring_with_its_arguments():
     import inspect
     tools = [getattr(server, n) for n in dir(server) if n.startswith("tdc_")]
-    assert len(tools) >= 41
+    assert len(tools) >= 46
     for tool in tools:
         doc = inspect.getdoc(tool) or ""
         assert doc, f"{tool.__name__} has no docstring"

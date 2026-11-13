@@ -50,6 +50,7 @@
 - [Live Memory Analysis](#live-memory-analysis)
 - [Named Pipes](#named-pipes)
 - [Rizin](#rizin)
+- [Tool Updates](#tool-updates)
 - [Demo](#demo)
 - [API Reference](#api-reference)
 - [MCP Server](#mcp-server)
@@ -369,6 +370,7 @@ sample to the running VM.
 - **`make run-debug`**: Flask auto-reload on file changes
 - **Toast Notifications**: Throttled error/warning/info toasts with 15s dedup
 - **Help Modal**: Built-in documentation ("? Help" next to the logo)
+- **Tool Updates**: The dashboard checks every VM tool for a newer version and installs updates, one tool or all, while a maintenance mode pauses detonations (see [Tool Updates](#tool-updates))
 - **Submissions History**: Persisted to JSON with quick hex inspection
 
 ---
@@ -1020,6 +1022,83 @@ development; without rz-ghidra DECOMPILER says "Decompiler not available
   session without "Open in another tab"; open the file in a new tab instead.
 - Addresses above 2^53 (kernel space) lose precision in the browser.
 
+## Tool Updates
+
+The **Tool Updates** panel on the Dashboard (below the service cards) lists every
+tool on the VM with its installed and available version and a status, and
+installs updates without re-provisioning the VM. The VM needs internet access
+for this; without it the rows say "No internet access from the VM" (`offline`).
+
+- **Check for updates** runs in the background. The server also checks once a
+  day on its own (first check 5 minutes after start; `TDC_UPDATE_CHECK_HOURS`),
+  but it never installs anything by itself.
+- **Update** on a row installs that tool; **Update all (N)** installs every tool
+  with an update except the pinned ones. A tool whose update failed can be
+  retried. Click a row to see the last lines of its log.
+- The check and the update use the same API as the MCP tools
+  `tdc_updates_status`, `tdc_updates_check` and `tdc_updates_apply`.
+
+### What is checked
+
+| Source | Tools | Check | Update |
+|--------|-------|-------|--------|
+| Chocolatey | every package `choco outdated` reports (git, python312, dotnet-8.0-sdk, 7zip, php, ...) | `choco outdated` | `choco upgrade <package>` |
+| winget | WinDbg | `winget list --upgrade-available` | `winget upgrade` |
+| git | Rustinel rules, Elastic YARA rules, DetonatorAgent, Detonator, LitterBox, theZoo WebUI, theZoo, Hunt-Sleeping-Beacons, EMBER2024, Aether | `git fetch`, commits behind upstream | `git pull --ff-only --autostash`, then the install script rebuilds |
+| GitHub release | capa, BeaconEye, Process Dump, ThreatCheck, DefenderCheck, Rustinel, Fibratus, Rizin (Cutter) | latest release against the installed version | the `install-*.ps1` script with `-Force` |
+| Sysinternals | Sysmon, Sysmon config | `ETag` of the download against the one recorded at install | `install-sysmon.ps1` |
+
+Not covered: the web UI itself and its pip packages (update them with
+`make deploy`), system pip, uv, OpenSSH, and DIE or Ghidra when they came from
+the fallback zip instead of Chocolatey. A tool that is not on the VM shows
+`not_installed` without a button.
+
+The release tools write the installed tag to `tdc-release.txt` in their folder.
+Without it the installed version shows as `unknown` and the tool as
+`update_available` until its first update.
+
+### Pinned tools
+
+Rustinel (1.1.1), Fibratus (3.0.0) and Rizin (Cutter 2.5.0) are pinned by their
+install scripts, as are Chocolatey packages that are pinned in Chocolatey. A
+newer version shows as `pinned_update`; **Update all** skips it. The row's own
+button asks first ("Pinned to X for compatibility. Install Y anyway?"), and the
+API needs `include_pinned: true`. Rizin is installed only with the SHA-256
+GitHub publishes for the package; without one the update is refused. After
+re-provisioning, the VM has the pinned versions from the install scripts again.
+
+### Maintenance mode
+
+While an update runs (`mode: updating`) the web UI is in maintenance mode. A
+banner on every page shows the progress, and the server answers every POST,
+PUT, PATCH and DELETE outside `/api/updates/` with `503` and
+`"maintenance": true`. Reading stays possible, so the dashboard keeps working.
+An update does not start (409 with the reason) while a detonation is running
+(DetonatorAgent `in_use`), a memory sweep or a Process Dump job is running, or
+another check or update is in progress.
+
+For each tool the run closes Rizin sessions if needed, stops the services that
+use the tool (for example LitterBox and the Detonator tasks for `python312`),
+updates it, starts the services that were running before, and checks the tool
+again. A failure of one tool does not stop the run. A script gets at most 45
+minutes. `python312` is always updated last. If the web UI restarts during an
+update, the tool being updated is marked `failed` ("Interrupted") and the mode
+returns to `idle`.
+
+An exit code of 3010 or 1641 means the VM must restart to finish the update;
+the tool shows `reboot_required`. There is no rollback to an older version.
+
+### Scripts and logs
+
+The web UI runs the install scripts from `TDC_SCRIPTS_DIR` (default
+`C:\tdc\scripts`). `make deploy`, `make.ps1 deploy` and `deploy-utm.py` upload
+them, and the Vagrant boxes get them from a file provisioner. If a script is
+missing the update fails with "Install script missing: ... (run make deploy)".
+Each update appends to `TDC_UPDATE_LOG`; the last 200 lines per tool are also
+shown in the panel. Status values: `up_to_date`, `update_available`,
+`pinned_update`, `unknown`, `not_installed`, `offline`, `error`, `queued`,
+`updating`, `updated`, `failed`, `reboot_required`.
+
 ## Demo
 
 Screenshots from the ARM64 UTM VM with the test samples used during development
@@ -1570,6 +1649,7 @@ there if the VM is not at `http://192.168.64.4:9000`.
 | Area | Tools |
 |------|-------|
 | Status | `tdc_status`, `tdc_service_launch`, `tdc_tools_status`, `tdc_rustinel_info` |
+| Tool updates | `tdc_updates_status`, `tdc_updates_check`, `tdc_updates_apply` |
 | Detonation | `tdc_submit_file`, `tdc_submissions`, `tdc_detonation_results`, `tdc_detonation_memory` |
 | Alerts | `tdc_alerts`, `tdc_alert_detail`, `tdc_sessions`, `tdc_search` |
 | Processes | `tdc_processes`, `tdc_process_detail`, `tdc_process_graph`, `tdc_process_lookup`, `tdc_powershell_activity` |
@@ -1602,6 +1682,10 @@ edit) and the raw service proxies.
 | `VM_WEBUI_URL` | — | Web UI of the VM, used by a host-side instance when it has no local Sysmon/alerts |
 | `TDC_VM_USER` / `TDC_VM_PASS` | — | WinRM credentials for starting VM services from a host-side instance |
 | `TDC_RIZIN` | `C:\tools\cutter\rizin.exe` | The rizin of the RIZIN tab (`scripts/install-rizin.ps1` installs it there) |
+| `TDC_SCRIPTS_DIR` | `C:\tdc\scripts` | Where the web UI finds the install scripts it runs for [tool updates](#tool-updates) |
+| `TDC_UPDATE_LOG` | `C:\tools\logs\tool-updates.log` | Log of the tool updates (off Windows: `tool-updates.log` next to `app.py`) |
+| `TDC_UPDATE_CHECK_HOURS` | `24` | Hours between the automatic update checks; `0` turns them off |
+| `TDC_GITHUB_TOKEN` | — | Optional GitHub token for the update checks, to avoid the API rate limit |
 
 ### Custom Detection Rules
 
@@ -1674,7 +1758,7 @@ transportable-detonation-chamber/
 ├── static/                         # Screenshots for this README
 │
 ├── mcp/
-│   ├── server.py                  # MCP server (43 tools, talks to the web UI API)
+│   ├── server.py                  # MCP server (46 tools, talks to the web UI API)
 │   └── requirements.txt           # mcp, httpx  (make mcp-setup)
 ├── .mcp.json                      # Registers the MCP server for Claude Code
 │

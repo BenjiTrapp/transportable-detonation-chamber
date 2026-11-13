@@ -1382,6 +1382,60 @@ def tdc_rustinel_info() -> str:
     return "\n".join(lines)
 
 
+# --- Tool updates ---
+
+
+@mcp.tool()
+def tdc_updates_status() -> str:
+    """Tool updates on the VM: the mode (idle, checking, updating), when the last
+    check ran, progress of a running update, and one line per tool with its
+    installed version, the available version and its status. While mode is
+    'updating' the VM is in maintenance: detonations, scans and uploads are paused."""
+    d = _call("GET", "/api/updates")
+    if d.get("error"):
+        return f"Error: {d['error']}"
+    lines = [f"Mode: {d.get('mode')}; last check: {d.get('checked_at') or 'never'}"]
+    prog = d.get("progress") or {}
+    if d.get("mode") == "updating":
+        lines.append(f"Updating {prog.get('done', 0)}/{prog.get('total', 0)}: {prog.get('current') or '-'}")
+    for t in d.get("tools") or []:
+        versions = f"{t.get('installed') or '?'} -> {t.get('available') or '?'}"
+        pin = f" [pinned {t['pinned']}]" if t.get("pinned") else ""
+        detail = f" - {t['detail']}" if t.get("detail") else ""
+        lines.append(f"  {t.get('id')}: {t.get('status')} ({versions}){pin}{detail}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def tdc_updates_check() -> str:
+    """Start a check for tool updates in the background (needs internet access
+    from the VM). Read the result with tdc_updates_status. Nothing is installed."""
+    d = _call("POST", "/api/updates/check", timeout=30.0)
+    if d.get("error"):
+        return f"Error: {d['error']}"
+    return "Check started. Read the result with tdc_updates_status."
+
+
+@mcp.tool()
+def tdc_updates_apply(tools: str = "all", include_pinned: bool = False) -> str:
+    """Install tool updates. The VM goes into maintenance mode until the run is
+    done: detonations, scans and uploads are paused, and services that use a
+    tool are stopped and restarted. Refused while a detonation, memory sweep or
+    process dump runs. Follow progress with tdc_updates_status.
+
+    Args:
+        tools: "all" (every tool with an update that is not pinned) or tool IDs, comma-separated (e.g. "capa,litterbox,choco:git"); IDs come from tdc_updates_status
+        include_pinned: Also install a newer version of a pinned tool (Rustinel, Fibratus, Rizin, pinned choco packages) that was not tested with TDC (default False)
+    """
+    ids = "all" if tools.strip().lower() == "all" else [t.strip() for t in tools.split(",") if t.strip()]
+    if not ids:
+        return "Error: tools must be 'all' or a comma-separated list of tool IDs"
+    d = _call("POST", "/api/updates/apply", json={"tools": ids, "include_pinned": include_pinned}, timeout=30.0)
+    if d.get("error"):
+        return f"Error: {d['error']}"
+    return f"Update started for: {', '.join(d.get('tools') or [])}. Follow it with tdc_updates_status."
+
+
 # --- Named pipes (read-only: interception is driven from the web UI) ---
 
 
