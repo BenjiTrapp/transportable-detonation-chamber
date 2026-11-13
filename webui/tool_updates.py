@@ -22,6 +22,7 @@ import copy
 import datetime
 import json
 import logging
+import ntpath
 import os
 import re
 import signal
@@ -563,28 +564,76 @@ def consumer_running(cid: str, env) -> bool:
     return res.returncode == 0 and res.stdout.strip().lower() == "true"
 
 
+def _safe_kill_dirs(dirs, windows_dir: Optional[str] = None, program_files: Optional[List[str]] = None) -> List[str]:
+    """The folders from which running processes may be ended for a task.
+
+    Refused: anything that is not an absolute drive path, drive roots and
+    folders with fewer than two components counting the drive (C:\\ and C:
+    are out, C:\\LitterBox is fine), and anything under the Windows folder,
+    Program Files, Program Files (x86) or a base Python install (C:\\Python3*).
+    Those hold shared binaries, and ending everything started from them would
+    end unrelated programs."""
+    windows_dir = windows_dir or os.environ.get("SystemRoot") or "C:\\Windows"
+    if program_files is None:
+        program_files = [os.environ.get("ProgramFiles") or "C:\\Program Files",
+                         os.environ.get("ProgramFiles(x86)") or "C:\\Program Files (x86)"]
+    refused = [windows_dir] + list(program_files)
+
+    def norm(path: str) -> str:
+        return ntpath.normpath(str(path).strip().strip('"').strip()).rstrip("\\").lower()
+
+    protected = [norm(p) for p in refused if p]
+    result: List[str] = []
+    for raw in dirs or []:
+        text = str(raw or "").strip().strip('"').strip()
+        if not text:
+            continue
+        drive, rest = ntpath.splitdrive(ntpath.normpath(text))
+        if len(drive) != 2 or drive[1] != ":" or not rest.startswith("\\"):
+            continue  # relative, UNC or without a drive
+        path = norm(text)
+        parts = [p for p in path.split("\\") if p]
+        if len(parts) < 2 or ".." in parts:
+            continue
+        if any(path == p or path.startswith(p + "\\") for p in protected):
+            continue
+        if re.fullmatch(r"[a-z]:\\python3[^\\]*(\\.*)?", path):
+            continue
+        clean = ntpath.normpath(text).rstrip("\\")
+        if clean not in result:
+            result.append(clean)
+    return result
+
+
 def stop_consumer(cid: str, env) -> None:
     """Stop a task (and what runs from its install folder) or a service.
 
-    Raises RuntimeError when the stop command fails."""
+    Raises RuntimeError when a command fails."""
     kind, name = _split_consumer(cid)
     if kind == "task":
         # Stop-ScheduledTask leaves child processes behind at times, so
-        # processes started from the task's folder are ended as well. Never
-        # the web UI itself, and never anything under the Windows folder.
-        script = (
-            "$n=%s; $t=Get-ScheduledTask -TaskName $n -ErrorAction Stop; "
-            "$dirs=@(); foreach($a in $t.Actions){ "
-            "if($a.WorkingDirectory){$dirs+=$a.WorkingDirectory} "
-            "elseif($a.Execute){$dirs+=Split-Path -Parent ([Environment]::ExpandEnvironmentVariables($a.Execute))} }; "
-            "Stop-ScheduledTask -TaskName $n -ErrorAction Stop; "
-            "$win=[Environment]::GetFolderPath('Windows'); "
-            "foreach($d in $dirs){ $d=([string]$d).Trim([char]34).TrimEnd([char]92); "
-            "if(-not $d -or $d.StartsWith($win,[StringComparison]::OrdinalIgnoreCase)){continue}; "
-            "Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Id -ne %d -and "
-            "$_.Path.StartsWith($d+[char]92,[StringComparison]::OrdinalIgnoreCase) } | "
-            "Stop-Process -Force -ErrorAction SilentlyContinue }"
-        ) % (_ps_quote(name), os.getpid())
+        # processes started from the task's own folder are ended as well. The
+        # folders come from the task, pass _safe_kill_dirs, and never touch
+        # the web UI or its parents.
+        query = (
+            "$t=Get-ScheduledTask -TaskName %s -ErrorAction Stop; foreach($a in $t.Actions){ "
+            "if($a.WorkingDirectory){[Environment]::ExpandEnvironmentVariables($a.WorkingDirectory)} "
+            "elseif($a.Execute){Split-Path -Parent ([Environment]::ExpandEnvironmentVariables($a.Execute))} }"
+        ) % _ps_quote(name)
+        res = _powershell(env, query, CONSUMER_TIMEOUT)
+        if res.returncode != 0:
+            raise RuntimeError(_one_line(res.stderr or res.stdout or "exit code %d" % res.returncode))
+        dirs = _safe_kill_dirs(res.stdout.splitlines())
+        script = "$n=%s; Stop-ScheduledTask -TaskName $n -ErrorAction Stop" % _ps_quote(name)
+        if dirs:
+            script += (
+                "; $keep=@(); $p=%d; for($i=0; $p -and $i -lt 32; $i++){ $keep+=$p; "
+                "$p=(Get-CimInstance Win32_Process -Filter ('ProcessId='+$p) -ErrorAction SilentlyContinue).ParentProcessId }; "
+                "foreach($d in @(%s)){ "
+                "Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $keep -notcontains $_.Id -and "
+                "$_.Path.StartsWith($d+[char]92,[StringComparison]::OrdinalIgnoreCase) } | "
+                "Stop-Process -Force -ErrorAction SilentlyContinue }"
+            ) % (os.getpid(), ",".join(_ps_quote(d) for d in dirs))
     else:
         script = "Stop-Service -Name %s -Force -ErrorAction Stop" % _ps_quote(name)
     res = _powershell(env, script, CONSUMER_TIMEOUT)
@@ -790,18 +839,33 @@ class UpdateManager:
                 return (0, i)
         return (1, 0)
 
+    @staticmethod
+    def _needs_include_pinned(entry: Dict[str, Any]) -> bool:
+        if entry["status"] == "pinned_update":
+            return True
+        if entry["status"] != "failed":
+            return False
+        spec = next((t for t in CATALOG if t.id == entry["id"]), None)
+        pin = entry.get("pinned") or (spec.pinned if spec else None)
+        available = entry.get("available")
+        return bool(pin and available and compare_versions(str(available), str(pin)) != 0)
+
     def start_apply(self, tools, include_pinned: bool = False) -> Tuple[int, Dict[str, Any]]:
+        busy = (409, {"error": BUSY_MESSAGE})
         with self._lock:
             if self._state["mode"] != "idle":
-                return 409, {"error": BUSY_MESSAGE}
-            reason = self.preconditions()
-            if reason:
-                return 409, {"error": reason}
+                return busy
+        # The callback may probe other services; do not hold the lock for it
+        reason = self.preconditions()
+        if reason:
+            return 409, {"error": reason}
+        with self._lock:
+            if self._state["mode"] != "idle":
+                return busy
             entries = self._state["tools"]
             known = {t["id"]: t for t in entries}
             requested = [tools] if isinstance(tools, str) else list(tools or [])
-            take_all = "all" in requested
-            if take_all:
+            if "all" in requested:
                 chosen = [t["id"] for t in entries if t["status"] == "update_available"
                           or (include_pinned and t["status"] == "pinned_update")]
             else:
@@ -811,11 +875,10 @@ class UpdateManager:
                 chosen = []
                 for tool_id in requested:
                     entry = known[tool_id]
-                    if entry["status"] == "pinned_update" and not include_pinned:
+                    if self._needs_include_pinned(entry) and not include_pinned:
                         return 409, {"error": "%s is pinned to %s. Pass include_pinned to install %s." % (
                             entry["name"], entry.get("pinned"), entry.get("available"))}
-                    if (entry["status"] == "update_available" or (
-                            entry["status"] == "pinned_update" and include_pinned)) and tool_id not in chosen:
+                    if entry["status"] in ("update_available", "pinned_update", "failed") and tool_id not in chosen:
                         chosen.append(tool_id)
             if not chosen:
                 return 409, {"error": "No updates to install."}
@@ -966,9 +1029,12 @@ class UpdateManager:
             raise _Failure("Install script missing: %s (run make deploy)" % script_path)
         args = list(spec.script_args)
         if spec.pinned:
-            args += ["-Version", str(entry.get("available") or "")]
+            available = str(entry.get("available") or "").strip()
+            if not available or available.lower() == "unknown":
+                raise _Failure("No target version known for %s; run Check for updates first." % spec.name)
+            args += ["-Version", available]
             if spec.id == "rizin":
-                digest = _rizin_sha256(spec, self.env, str(entry.get("available") or ""))
+                digest = _rizin_sha256(spec, self.env, available)
                 if not digest:
                     raise _Failure("GitHub publishes no SHA-256 for this package; not installed.")
                 args += ["-PackageSha256", digest]

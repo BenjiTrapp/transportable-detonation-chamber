@@ -498,6 +498,7 @@ class World:
         self.running = set()
         self.events = []
         self.installed_done = set()
+        self.task_dirs = ""
         if entries is not None:
             with open(self.state_path, "w") as handle:
                 json.dump({"mode": "idle", "checked_at": "2026-01-01T00:00:00Z", "tools": entries}, handle)
@@ -514,6 +515,8 @@ class World:
         script = args[-1]
         name = re.search(r"(?:-TaskName|-Name|\$n=) ?'([^']+)'", script)
         name = name.group(1) if name else "?"
+        if ".Actions" in script and "Stop-ScheduledTask" not in script:
+            return ok(self.task_dirs)
         if "Stop-ScheduledTask" in script or "Stop-Service" in script:
             self.events.append(("stop", name))
         elif "Start-ScheduledTask" in script or "Start-Service" in script:
@@ -913,10 +916,157 @@ def test_consumer_helpers_quote_names_and_use_powershell():
     tu.stop_consumer("service:fibratus", env)
     assert "Stop-Service -Name 'fibratus' -Force" in seen[-1]
     tu.stop_consumer("task:LitterBox", env)
-    assert "Stop-ScheduledTask" in seen[-1] and "Stop-Process" in seen[-1]
+    assert "Stop-ScheduledTask -TaskName $n" in seen[-1] and "'LitterBox'" in seen[-1]
     tu.start_consumer("task:LitterBox", env)
     assert "Start-ScheduledTask -TaskName 'LitterBox'" in seen[-1]
     env.on(PS, fail("access denied"))
     with pytest.raises(RuntimeError):
         tu.stop_consumer("service:fibratus", env)
     assert tu.consumer_running("service:fibratus", env) is False
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: retry of failed, kill scope, preconditions outside the lock
+# ---------------------------------------------------------------------------
+
+import threading  # noqa: E402
+
+
+def test_retry_of_failed_tool(tmp_path):
+    failed = tool_entry("capa", "failed", installed="1.0.0", available="1.1.0")
+    failed["detail"] = "Exit code 1; see the log."
+    w = World(tmp_path, [failed, tool_entry("beaconeye", "failed")])
+    w.script("install-capa.ps1")
+    m = w.build()
+    code, body = m.start_apply(["capa"])
+    assert (code, body) == (202, {"started": True, "tools": ["capa"]})
+    assert w.kinds() == ["script"]
+    assert snap_tool(m, "beaconeye")["status"] == "failed"  # not selected
+
+
+def test_all_ignores_failed_tools(tmp_path):
+    w = World(tmp_path, [tool_entry("capa", "failed"), tool_entry("beaconeye", "update_available")])
+    w.script("install-beaconeye.ps1")
+    m = w.build()
+    code, body = m.start_apply("all")
+    assert body["tools"] == ["beaconeye"]
+    assert m.snapshot()["last_run"]["results"].keys() == {"beaconeye"}
+    assert snap_tool(m, "capa")["status"] == "failed"
+
+
+def test_retry_of_failed_pinned_tool_needs_include_pinned(tmp_path):
+    entries = [tool_entry("rustinel", "failed", "1.1.1", "1.2.0", pinned="1.1.1")]
+    w = release_world(tmp_path, "rustinel", "install-rustinel.ps1", "1.2.0", entries)
+    m = w.build()
+    code, body = m.start_apply(["rustinel"])
+    assert code == 409
+    assert body == {"error": "Rustinel is pinned to 1.1.1. Pass include_pinned to install 1.2.0."}
+    assert snap_tool(m, "rustinel")["status"] == "failed"
+    assert m.snapshot()["mode"] == "idle"
+    code, body = m.start_apply(["rustinel"], include_pinned=True)
+    assert code == 202
+    assert [e for e in w.events if e[0] == "script"][0][2] == ["-Force", "-Version", "1.2.0"]
+    assert snap_tool(m, "rustinel")["status"] == "updated"
+
+
+def test_failed_pinned_tool_at_its_pin_needs_no_include_pinned(tmp_path):
+    entries = [tool_entry("rustinel", "failed", "1.0.0", "1.1.1", pinned="1.1.1")]
+    w = release_world(tmp_path, "rustinel", "install-rustinel.ps1", "1.1.1", entries, available="1.1.1")
+    assert w.build().start_apply(["rustinel"])[0] == 202
+
+
+def test_pinned_tool_without_target_version_fails_cleanly(tmp_path):
+    for i, available in enumerate((None, "", "unknown")):
+        sub = tmp_path / ("case%d" % i)
+        sub.mkdir()
+        entries = [tool_entry("rustinel", "failed", "1.1.1", available, pinned="1.1.1")]
+        w = release_world(sub, "rustinel", "install-rustinel.ps1", "1.2.0", entries)
+        m = w.build()
+        assert m.start_apply(["rustinel"], include_pinned=True)[0] == 202
+        assert "script" not in w.kinds()
+        assert snap_tool(m, "rustinel")["status"] == "failed"
+        assert snap_tool(m, "rustinel")["detail"] == (
+            "No target version known for Rustinel; run Check for updates first.")
+
+
+@pytest.mark.parametrize("path", [
+    "C:\\", "C:", "C:\\Windows", "C:\\Windows\\System32", "c:\\windows\\system32\\wbem",
+    "C:\\Program Files", "C:\\Program Files\\Fibratus\\Bin", "C:\\Program Files (x86)\\X",
+    "C:\\Python312", "C:\\Python312\\Scripts", "C:\\python311", "C:\\Python3",
+    "", "relative\\dir", "\\\\server\\share\\dir", "LitterBox", "C:\\LitterBox\\..\\Windows",
+])
+def test_safe_kill_dirs_refuses(path):
+    assert tu._safe_kill_dirs([path]) == []
+
+
+def test_safe_kill_dirs_accepts_install_folders():
+    dirs = ['"C:\\LitterBox"', "C:\\LitterBox\\", "C:\\tools\\theZoo-WebUI", "D:\\detonator", "C:\\Windows",
+            "C:\\Python312x\\"]
+    assert tu._safe_kill_dirs(dirs) == ["C:\\LitterBox", "C:\\tools\\theZoo-WebUI", "D:\\detonator"]
+    # custom Windows / Program Files folders
+    assert tu._safe_kill_dirs(["E:\\Win\\x", "E:\\Apps\\y"], windows_dir="E:\\Win", program_files=["E:\\Apps"]) == []
+
+
+def test_stop_task_kills_only_approved_dirs():
+    env = FakeEnv()
+    seen = []
+
+    def answer(args):
+        seen.append(args[-1])
+        if ".Actions" in args[-1] and "Stop-ScheduledTask" not in args[-1]:
+            return ok("C:\\Python312\nC:\\LitterBox\nC:\\\n")
+        return ok()
+    env.on(PS, answer)
+    tu.stop_consumer("task:LitterBox", env)
+    stop = seen[-1]
+    assert "Stop-ScheduledTask" in stop and "Stop-Process" in stop
+    assert "'C:\\LitterBox'" in stop
+    assert "Python312" not in stop and "'C:\\'" not in stop
+    assert str(os.getpid()) in stop and "ParentProcessId" in stop
+
+
+def test_stop_task_without_approved_dirs_kills_no_processes():
+    env = FakeEnv()
+    seen = []
+    env.on(PS, lambda a: (seen.append(a[-1]) or ok("C:\\Python312\n")))
+    tu.stop_consumer("task:LitterBox", env)
+    assert "Stop-ScheduledTask" in seen[-1] and "Stop-Process" not in seen[-1]
+
+
+def test_stop_task_query_failure_raises():
+    env = FakeEnv()
+    env.on(PS, fail("no such task"))
+    with pytest.raises(RuntimeError):
+        tu.stop_consumer("task:Nope", env)
+
+
+def test_preconditions_callback_does_not_hold_the_lock(tmp_path):
+    w = World(tmp_path, [tool_entry("capa")])
+    w.script("install-capa.ps1")
+    m = w.build()
+    seen = {}
+
+    def reason():
+        # another thread must get the lock while the callback is running
+        worker = threading.Thread(target=lambda: seen.setdefault("snap", m.snapshot()))
+        worker.start()
+        worker.join(2)
+        seen["finished"] = not worker.is_alive()
+        return None
+    m.preconditions = reason
+    assert m.start_apply("all")[0] == 202
+    assert seen["finished"] and seen["snap"]["mode"] == "idle"
+
+
+def test_mode_change_during_preconditions_gives_busy(tmp_path):
+    w = World(tmp_path, [tool_entry("capa")])
+    w.script("install-capa.ps1")
+    m = tu.UpdateManager(w.env, w.state_path, w.log_path, w.scripts, spawn=lambda f: None)
+
+    def reason():
+        assert m.start_check()[0] == 202  # someone else got in first
+        return None
+    m.preconditions = reason
+    assert m.start_apply("all") == (409, {"error": "An update check or install is already running."})
+    assert snap_tool(m, "capa")["status"] == "update_available"
+    assert m.snapshot()["mode"] == "checking"
