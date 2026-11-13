@@ -1042,7 +1042,7 @@ for this; without it the rows say "No internet access from the VM" (`offline`).
 
 | Source | Tools | Check | Update |
 |--------|-------|-------|--------|
-| Chocolatey | every package `choco outdated` reports (git, python312, dotnet-8.0-sdk, 7zip, php, ...) | `choco outdated` | `choco upgrade <package>` |
+| Chocolatey | every package `choco outdated` reports (git, python312, dotnet-8.0-sdk, 7zip, php, ...); a `<x>.install` row is dropped when `<x>` is listed too | `choco outdated` | `choco upgrade <package>` |
 | winget | WinDbg | `winget list --upgrade-available` | `winget upgrade` |
 | git | Rustinel rules, Elastic YARA rules, DetonatorAgent, Detonator, LitterBox, theZoo WebUI, theZoo, Hunt-Sleeping-Beacons, EMBER2024, Aether | `git fetch`, commits behind upstream | `git pull --ff-only --autostash`, then the install script rebuilds |
 | GitHub release | capa, BeaconEye, Process Dump, ThreatCheck, DefenderCheck, Rustinel, Fibratus, Rizin (Cutter) | latest release against the installed version | the `install-*.ps1` script with `-Force` |
@@ -1055,7 +1055,11 @@ the fallback zip instead of Chocolatey. A tool that is not on the VM shows
 
 The release tools write the installed tag to `tdc-release.txt` in their folder.
 Without it the installed version shows as `unknown` and the tool as
-`update_available` until its first update.
+`update_available` until its first update. Repos that publish no GitHub release
+(BeaconEye, ThreatCheck, DefenderCheck) show `unknown` with "Upstream publishes
+no GitHub releases."; there is nothing to compare, so they have no Update
+button. Sysmon and Sysmon config without a recorded ETag in `tdc-source.json`
+show `update_available` ("Installed version unknown; an update records it").
 
 ### Pinned tools
 

@@ -48,6 +48,8 @@ HTTP_TIMEOUT = 20
 PROBE_TIMEOUT = 5
 OFFLINE_DETAIL = "No internet access from the VM"
 GITHUB_API = "https://api.github.com"
+NO_RELEASES_DETAIL = "Upstream publishes no GitHub releases."
+VERSION_UNKNOWN_DETAIL = "Installed version unknown; an update records it"
 
 SYSMON_BINARY_URL = "https://download.sysinternals.com/files/Sysmon.zip"
 SYSMON_CONFIG_URL = "https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml"
@@ -311,6 +313,10 @@ def check_choco(env) -> List[Dict[str, Any]]:
         return [{"id": "choco", "name": "Chocolatey", "kind": "choco", "installed": None,
                  "available": None, "status": "error", "pinned": None,
                  "detail": detail, "log": [], "updated_at": None}]
+    # Upgrading a metapackage (git) upgrades its <x>.install too; list it once.
+    listed = {row["package"] for row in rows}
+    rows = [row for row in rows
+            if not (row["package"].endswith(".install") and row["package"][:-len(".install")] in listed)]
     entries = []
     for row in rows:
         pinned = row["pinned"]
@@ -386,10 +392,12 @@ def _installed_release(spec, env) -> str:
 
 
 def _github_latest(spec, env):
-    """The latest release tag, or (None, error-detail)."""
+    """The latest release tag, or (None, error-detail); (None, "") when the repo has no releases."""
     res = env.http_get("%s/repos/%s/releases/latest" % (GITHUB_API, spec.repo), HTTP_TIMEOUT)
     if res.status == 0:
         return None, "GitHub is not reachable"
+    if res.status == 404:
+        return None, ""
     if res.status in (403, 429) and str(res.headers.get("x-ratelimit-remaining", "")) == "0":
         return None, "GitHub API rate limit reached; set TDC_GITHUB_TOKEN to raise it"
     if res.status != 200 or not isinstance(res.json, dict) or not res.json.get("tag_name"):
@@ -400,6 +408,8 @@ def _github_latest(spec, env):
 def _check_release(spec, env) -> Dict[str, Any]:
     installed = _installed_release(spec, env)
     available, problem = _github_latest(spec, env)
+    if available is None and not problem:
+        return _entry(spec, installed, None, "unknown", NO_RELEASES_DETAIL)
     if available is None:
         return _entry(spec, installed, None, "error", problem)
     newer = installed == "unknown" or compare_versions(installed, available) < 0
@@ -408,7 +418,7 @@ def _check_release(spec, env) -> Dict[str, Any]:
     if spec.pinned:
         detail = "Pinned to %s for compatibility; %s is available" % (spec.pinned, available)
         return _entry(spec, installed, available, "pinned_update", detail)
-    detail = "Installed version unknown; an update records it" if installed == "unknown" else ""
+    detail = VERSION_UNKNOWN_DETAIL if installed == "unknown" else ""
     return _entry(spec, installed, available, "update_available", detail)
 
 
@@ -436,7 +446,7 @@ def _check_sysinternals(spec, env) -> Dict[str, Any]:
     if not current:
         return _entry(spec, recorded or None, None, "unknown", "The server sent no ETag")
     if not recorded:
-        return _entry(spec, None, current, "unknown", "Not checked yet; an update records the current version")
+        return _entry(spec, None, current, "update_available", VERSION_UNKNOWN_DETAIL)
     if recorded != current:
         return _entry(spec, recorded, current, "update_available", "The download changed since the install")
     return _entry(spec, recorded, current, "up_to_date")

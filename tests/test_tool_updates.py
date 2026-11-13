@@ -132,6 +132,17 @@ def test_check_choco_entries_and_missing_choco():
     assert [(e["id"], e["status"]) for e in entries] == [("choco", "not_installed")]
 
 
+def test_check_choco_drops_install_duplicates_of_listed_metapackages():
+    text = ("git|2.40.0|2.41.0|false\ngit.install|2.40.0|2.41.0|false\n"
+            "7zip|23.1|24.0|false\n7zip.install|23.1|24.0|false\n"
+            "dotnet-8.0-sdk|8.0.100|8.0.200|false\ndotnet-8.0-sdk-4xx|8.0.400|8.0.500|false\n"
+            "vlc.install|3.0|3.1|false\n")
+    env = FakeEnv(commands={("choco", "outdated"): ok(text)})
+    ids = [e["id"] for e in tu.check_choco(env)]
+    assert ids == ["choco:git", "choco:7zip", "choco:dotnet-8.0-sdk", "choco:dotnet-8.0-sdk-4xx",
+                   "choco:vlc.install"]
+
+
 def test_check_choco_failures_are_errors_not_an_empty_list():
     env = FakeEnv(commands={("choco", "outdated"): RunResult(124, "", "timed out after 180s")})
     entries = tu.check_choco(env)
@@ -219,6 +230,25 @@ def test_release_api_errors_are_one_line_errors():
     entry = tu.check_tool(spec, FakeEnv(paths=[spec.path], urls={("GET", url): js({}, status=500)}))
     assert entry["status"] == "error"
     assert "\n" not in entry["detail"]
+    entry = tu.check_tool(spec, FakeEnv(paths=[spec.path], urls={("GET", url): js({}, status=429)}))
+    assert entry["status"] == "error"
+    assert entry["detail"] == "GitHub API answered HTTP 429 for CCob/BeaconEye"
+
+
+def test_release_repo_without_releases_is_unknown():
+    for tool_id, repo in (("beaconeye", "CCob/BeaconEye"), ("threatcheck", "rasta-mouse/ThreatCheck"),
+                          ("defendercheck", "matterpreter/DefenderCheck")):
+        spec = spec_of(tool_id)
+        url = "https://api.github.com/repos/%s/releases/latest" % repo
+        env = FakeEnv(paths=[spec.path], urls={("GET", url): js({"message": "Not Found"}, status=404)})
+        entry = tu.check_tool(spec, env)
+        assert entry["status"] == "unknown"
+        assert entry["detail"] == "Upstream publishes no GitHub releases."
+        assert entry["installed"] == "unknown"
+        assert entry["available"] is None
+    env = FakeEnv(paths=[spec.path], files={spec.marker: "v1.2\n"},
+                  urls={("GET", url): js({"message": "Not Found"}, status=404)})
+    assert tu.check_tool(spec, env)["installed"] == "1.2"
 
 
 def test_rizin_reads_cutter_version_from_package_marker():
@@ -246,8 +276,18 @@ def test_sysinternals_etag_compare_and_missing_marker():
     assert tu.check_tool(spec, env)["status"] == "up_to_date"
     env = FakeEnv(paths=[spec.path], urls=head)
     entry = tu.check_tool(spec, env)
+    assert entry["status"] == "update_available"
+    assert entry["installed"] is None
+    assert entry["available"] == "abc"
+    assert entry["detail"] == "Installed version unknown; an update records it"
+    # a marker without the key behaves the same
+    env = FakeEnv(paths=[spec.path], files={spec.marker: '{"config_etag": "x"}'}, urls=head)
+    assert tu.check_tool(spec, env)["status"] == "update_available"
+    # without a known remote ETag nothing can be said
+    env = FakeEnv(paths=[spec.path], urls={("HEAD", url): HttpResult(200, {}, None, "")})
+    entry = tu.check_tool(spec, env)
     assert entry["status"] == "unknown"
-    assert entry["detail"] == "Not checked yet; an update records the current version"
+    assert entry["detail"] == "The server sent no ETag"
 
 
 def test_sysmon_config_uses_its_own_etag():
