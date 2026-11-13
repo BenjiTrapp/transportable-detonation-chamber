@@ -70,6 +70,7 @@ if (-not $assetUrl) {
 # Download + extract capa.exe
 $zipPath = "$env:TEMP\capa-windows.zip"
 $extractDir = "$env:TEMP\capa_extract"
+$installed = $false
 try {
     Write-Host "[*] Downloading: $assetUrl" -ForegroundColor Gray
     Invoke-WebRequest -Uri $assetUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 120
@@ -78,7 +79,9 @@ try {
 
     $foundExe = Get-ChildItem -Path $extractDir -Recurse -Filter "capa.exe" | Select-Object -First 1
     if ($foundExe) {
-        Copy-Item -Path "$($foundExe.DirectoryName)\*" -Destination $capaInstallDir -Recurse -Force
+        # -ErrorAction Stop: a locked capa.exe must not count as installed
+        Copy-Item -Path "$($foundExe.DirectoryName)\*" -Destination $capaInstallDir -Recurse -Force -ErrorAction Stop
+        $installed = $true
         Write-Host "[+] capa installed to $capaInstallDir" -ForegroundColor Green
         if ($releaseTag) {
             Set-Content -Path "$capaInstallDir\tdc-release.txt" -Value $releaseTag -Encoding ASCII
@@ -91,6 +94,11 @@ try {
 } finally {
     Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
     Remove-Item $extractDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+if ($Force -and -not $installed) {
+    Write-Host "[!] capa was not replaced - the old install (if any) is unchanged" -ForegroundColor Red
+    exit 1
 }
 
 # Windows Defender exclusion (capa.exe + bundled rules can trip heuristics)

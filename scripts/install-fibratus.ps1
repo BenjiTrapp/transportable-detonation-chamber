@@ -123,6 +123,9 @@ try {
 # Reinstall: the service holds the files, the old MSI has to go first
 if ($alreadyInstalled) {
     Stop-FibratusService
+    # The marker is not part of the MSI and would outlive the uninstall, claiming
+    # the old version if the new install fails.
+    Remove-Item "$fibratusInstallDir\tdc-release.txt" -Force -ErrorAction SilentlyContinue
     Uninstall-FibratusMsi
 }
 
@@ -135,6 +138,12 @@ if ($process.ExitCode -in 3010, 1641) {
 }
 if ($process.ExitCode -ne 0) {
     Write-Host "[!] MSI install returned exit code $($process.ExitCode), checking if installed anyway..." -ForegroundColor Yellow
+}
+if ($Force -and ($process.ExitCode -notin 0, 3010, 1641)) {
+    # The old MSI is already gone: tell the caller instead of reporting success.
+    Remove-Item $fibratusMsiPath -Force -ErrorAction SilentlyContinue
+    Write-Host "[!] Fibratus MSI install failed (exit code $($process.ExitCode)) - Fibratus is not installed" -ForegroundColor Red
+    exit 1
 }
 
 # Verify installation (MSI installs binary to Bin\ subdirectory)
@@ -166,6 +175,9 @@ if (Test-Path $fibratusExe) {
     }
     if (-not $found) {
         Write-Host "[!] Fibratus installation may have failed. Check manually." -ForegroundColor Red
+        if ($Force -and $rebootExit -eq 0) {
+            exit 1
+        }
     }
 }
 

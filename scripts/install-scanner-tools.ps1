@@ -56,6 +56,9 @@ function Get-LatestReleaseTag {
     }
 }
 
+# Set when a tool that was asked for could not be (re)installed
+$updateFailed = $false
+
 # --- ThreatCheck ---
 $tcInstallDir = "C:\tools\ThreatCheck"
 $tcBinDir = "$tcInstallDir\bin"
@@ -90,7 +93,8 @@ if (-not $doThreatCheck) {
             $foundExe = Get-ChildItem -Path "$env:TEMP\ThreatCheck_extract" -Recurse -Filter "ThreatCheck.exe" | Select-Object -First 1
             if ($foundExe) {
                 # Copy all files from the same directory (includes dependencies)
-                Copy-Item -Path "$($foundExe.DirectoryName)\*" -Destination $tcBinDir -Recurse -Force
+                # -ErrorAction Stop: a locked ThreatCheck.exe must not count as installed
+                Copy-Item -Path "$($foundExe.DirectoryName)\*" -Destination $tcBinDir -Recurse -Force -ErrorAction Stop
                 $tcDownloaded = $true
                 if ($url -match "/releases/download/([^/]+)/") { $tcTag = $Matches[1] }
                 Write-Host "[+] ThreatCheck downloaded from release" -ForegroundColor Green
@@ -148,8 +152,12 @@ if (-not $doThreatCheck) {
                     Remove-Item $propsDir -Recurse -Force -ErrorAction SilentlyContinue
 
                     Write-Host "[*] Building ThreatCheck (.NET 8.0)..." -ForegroundColor Yellow
-                    & dotnet publish $csproj.FullName -c Release -o $tcBinDir --self-contained false 2>$null
-                    if ((Test-Path $tcExe) -or (Test-Path "$tcBinDir\ThreatCheck.dll")) {
+                    # Built beside the install: an old ThreatCheck.exe must not pass for the build's output
+                    $tcBuildOut = "$env:TEMP\ThreatCheck_build"
+                    Remove-Item $tcBuildOut -Recurse -Force -ErrorAction SilentlyContinue
+                    & dotnet publish $csproj.FullName -c Release -o $tcBuildOut --self-contained false 2>$null
+                    if ((Test-Path "$tcBuildOut\ThreatCheck.exe") -or (Test-Path "$tcBuildOut\ThreatCheck.dll")) {
+                        Copy-Item -Path "$tcBuildOut\*" -Destination $tcBinDir -Recurse -Force -ErrorAction Stop
                         $tcDownloaded = $true
                         Write-Host "[+] ThreatCheck built from source (net8.0)" -ForegroundColor Green
                     } else {
@@ -157,6 +165,7 @@ if (-not $doThreatCheck) {
                     }
                 }
                 Remove-Item $tcSrcDir -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item "$env:TEMP\ThreatCheck_build" -Recurse -Force -ErrorAction SilentlyContinue
             } catch {
                 Write-Host "[!] Build from source failed: $_" -ForegroundColor Yellow
             }
@@ -172,6 +181,7 @@ if (-not $doThreatCheck) {
     if (-not $tcDownloaded) {
         Write-Host "[!] ThreatCheck installation FAILED - no download source available" -ForegroundColor Red
         Write-Host "    Manual install: place ThreatCheck.exe at $tcExe" -ForegroundColor Red
+        $updateFailed = $true
     }
 }
 
@@ -208,7 +218,8 @@ if (-not $doDefenderCheck) {
 
                 $foundExe = Get-ChildItem -Path "$env:TEMP\DefenderCheck_extract" -Recurse -Filter "DefenderCheck.exe" | Select-Object -First 1
                 if ($foundExe) {
-                    Copy-Item -Path "$($foundExe.DirectoryName)\*" -Destination $dcBinDir -Recurse -Force
+                    # -ErrorAction Stop: a locked DefenderCheck.exe must not count as installed
+                    Copy-Item -Path "$($foundExe.DirectoryName)\*" -Destination $dcBinDir -Recurse -Force -ErrorAction Stop
                     $dcDownloaded = $true
                     Write-Host "[+] DefenderCheck downloaded from release" -ForegroundColor Green
                 }
@@ -261,8 +272,12 @@ if (-not $doDefenderCheck) {
                     Remove-Item $propsDir -Recurse -Force -ErrorAction SilentlyContinue
 
                     Write-Host "[*] Building DefenderCheck (.NET 8.0)..." -ForegroundColor Yellow
-                    & dotnet publish $csproj.FullName -c Release -o $dcBinDir --self-contained false 2>$null
-                    if ((Test-Path $dcExe) -or (Test-Path "$dcBinDir\DefenderCheck.dll")) {
+                    # Built beside the install: an old DefenderCheck.exe must not pass for the build's output
+                    $dcBuildOut = "$env:TEMP\DefenderCheck_build"
+                    Remove-Item $dcBuildOut -Recurse -Force -ErrorAction SilentlyContinue
+                    & dotnet publish $csproj.FullName -c Release -o $dcBuildOut --self-contained false 2>$null
+                    if ((Test-Path "$dcBuildOut\DefenderCheck.exe") -or (Test-Path "$dcBuildOut\DefenderCheck.dll")) {
+                        Copy-Item -Path "$dcBuildOut\*" -Destination $dcBinDir -Recurse -Force -ErrorAction Stop
                         $dcDownloaded = $true
                         Write-Host "[+] DefenderCheck built from source (net8.0)" -ForegroundColor Green
                     } else {
@@ -270,6 +285,7 @@ if (-not $doDefenderCheck) {
                     }
                 }
                 Remove-Item $dcSrcDir -Recurse -Force -ErrorAction SilentlyContinue
+                Remove-Item "$env:TEMP\DefenderCheck_build" -Recurse -Force -ErrorAction SilentlyContinue
             } catch {
                 Write-Host "[!] Build from source failed: $_" -ForegroundColor Yellow
             }
@@ -285,6 +301,7 @@ if (-not $doDefenderCheck) {
     if (-not $dcDownloaded) {
         Write-Host "[!] DefenderCheck installation FAILED - no download source available" -ForegroundColor Red
         Write-Host "    Manual install: place DefenderCheck.exe at $dcExe" -ForegroundColor Red
+        $updateFailed = $true
     }
 }
 
@@ -302,3 +319,5 @@ if (Test-Path $dcExe) {
     Write-Host "[-] DefenderCheck: NOT INSTALLED" -ForegroundColor Red
 }
 Write-Host ""
+# Under -Force a failed (re)install is an error for the caller; without it the script stays tolerant.
+if ($Force -and $updateFailed) { exit 1 }

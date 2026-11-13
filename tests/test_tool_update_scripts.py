@@ -90,3 +90,34 @@ def test_scripts_reach_the_vm():
     assert "SCRIPT_FILES" in _read("scripts", "deploy-utm.py")
     assert "C:\\\\tdc\\\\scripts" in _read("Makefile")
     assert "C:\\tdc\\scripts" in _read("make.ps1")
+
+
+@pytest.mark.parametrize("name", ["capa", "beaconeye", "process-dump", "scanner-tools"])
+def test_overwrites_fail_loudly(name):
+    """A locked exe must not count as replaced: no marker, and -Force exits non-zero."""
+    script = _script(name)
+    for m in re.finditer(r"(?m)^[^#\n]*\b(?:Copy-Item|Move-Item)\b[^\n]*$", script):
+        line = m.group(0)
+        if "-Destination" in line and ("$binDir" in line or "$capaInstallDir" in line or "BinDir" in line
+                                       or "$bin.Path" in line):
+            assert "-ErrorAction Stop" in line, line
+    assert re.search(r"\$Force[^\n]*(?:\{[^}]*)?exit 1", script)
+
+
+@pytest.mark.parametrize("name,exe", [("beaconeye", "BeaconEye"), ("scanner-tools", "ThreatCheck"),
+                                      ("scanner-tools", "DefenderCheck")])
+def test_source_build_does_not_count_the_old_exe(name, exe):
+    script = _script(name)
+    assert f"{exe}_build" in script
+    # The old exe in the install dir must not be what the build check looks at.
+    assert not re.search(rf"dotnet publish[^\n]*-o \$(?:tcBinDir|dcBinDir|binDir)\b", script)
+
+
+def test_fibratus_force_failure_is_reported():
+    script = _script("fibratus")
+    # The stale marker is removed before the old MSI goes.
+    assert script.index("Remove-Item \"$fibratusInstallDir\\tdc-release.txt\"") < script.index("Uninstall-FibratusMsi\n}")
+    # A failed MSI install under -Force ends with exit 1, before the marker or "complete".
+    fail = re.search(r"if \(\$Force -and \(\$process\.ExitCode -notin 0, 3010, 1641\)\) \{.*?exit 1", script, re.S)
+    assert fail
+    assert fail.start() < script.index("tdc-release.txt\" -Value", script.index("Installing Fibratus MSI"))

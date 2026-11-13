@@ -80,7 +80,8 @@ foreach ($url in $releaseUrls) {
         $foundExe = Get-ChildItem -Path $extractDir -Recurse -Filter "BeaconEye.exe" | Select-Object -First 1
         if ($foundExe) {
             # Copy all files from the same directory (includes dependencies)
-            Copy-Item -Path "$($foundExe.DirectoryName)\*" -Destination $binDir -Recurse -Force
+            # -ErrorAction Stop: a locked BeaconEye.exe must not count as installed
+            Copy-Item -Path "$($foundExe.DirectoryName)\*" -Destination $binDir -Recurse -Force -ErrorAction Stop
             $downloaded = $true
             if ($url -match "/releases/download/([^/]+)/") { $releaseTag = $Matches[1] } else { $releaseTag = $latestTag }
             Write-Host "[+] BeaconEye downloaded from release" -ForegroundColor Green
@@ -105,7 +106,10 @@ if (-not $downloaded) {
     if ($dotnet -and $git) {
         try {
             $srcDir = "$env:TEMP\BeaconEye_src"
+            # Built beside the install: an old BeaconEye.exe must not pass for the build's output
+            $buildOut = "$env:TEMP\BeaconEye_build"
             Remove-Item $srcDir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item $buildOut -Recurse -Force -ErrorAction SilentlyContinue
 
             Write-Host "[*] Cloning BeaconEye repository..." -ForegroundColor Yellow
             & git clone --depth 1 "https://github.com/CCob/BeaconEye.git" $srcDir 2>$null
@@ -116,14 +120,15 @@ if (-not $downloaded) {
                 $sln = Get-ChildItem -Path $srcDir -Recurse -Filter "*.sln" | Select-Object -First 1
                 if ($sln) {
                     Write-Host "[*] Building BeaconEye solution..." -ForegroundColor Yellow
-                    & dotnet publish $sln.FullName -c Release -o $binDir --self-contained true -r win-x64 2>$null
+                    & dotnet publish $sln.FullName -c Release -o $buildOut --self-contained true -r win-x64 2>$null
                 }
             } else {
                 Write-Host "[*] Building BeaconEye project..." -ForegroundColor Yellow
-                & dotnet publish $csproj.FullName -c Release -o $binDir --self-contained true -r win-x64 2>$null
+                & dotnet publish $csproj.FullName -c Release -o $buildOut --self-contained true -r win-x64 2>$null
             }
 
-            if (Test-Path $exePath) {
+            if (Test-Path "$buildOut\BeaconEye.exe") {
+                Copy-Item -Path "$buildOut\*" -Destination $binDir -Recurse -Force -ErrorAction Stop
                 $downloaded = $true
                 # Built from the default branch: the latest tag is the closest name for it.
                 $releaseTag = $latestTag
@@ -131,12 +136,13 @@ if (-not $downloaded) {
             } else {
                 Write-Host "[!] Build completed but BeaconEye.exe not found at expected path" -ForegroundColor Yellow
                 # List what was produced
-                Get-ChildItem -Path $binDir -Filter "*.exe" | ForEach-Object {
+                Get-ChildItem -Path $buildOut -Filter "*.exe" -ErrorAction SilentlyContinue | ForEach-Object {
                     Write-Host "    Found: $($_.Name)" -ForegroundColor Gray
                 }
             }
 
             Remove-Item $srcDir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item $buildOut -Recurse -Force -ErrorAction SilentlyContinue
         } catch {
             Write-Host "[!] Build from source failed: $_" -ForegroundColor Yellow
         }
@@ -176,3 +182,7 @@ if (Test-Path $exePath) {
     Write-Host "    Manual install: place BeaconEye.exe at $exePath" -ForegroundColor Red
 }
 Write-Host ""
+if ($Force -and -not $downloaded) {
+    Write-Host "[!] BeaconEye was not replaced - the old install (if any) is unchanged" -ForegroundColor Red
+    exit 1
+}

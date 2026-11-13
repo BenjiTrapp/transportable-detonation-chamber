@@ -64,6 +64,7 @@ $binaries = @(
 )
 
 $downloadedAny = $false
+$downloadFailed = $false
 foreach ($bin in $binaries) {
     if ((Test-Path $bin.Path) -and -not $Force) {
         Write-Host "[+] $($bin.Name) already present" -ForegroundColor Green
@@ -75,18 +76,20 @@ foreach ($bin in $binaries) {
         $partial = "$($bin.Path).download"
         Invoke-WebRequest -Uri "$baseUrl/$($bin.Name)" -OutFile $partial `
             -UseBasicParsing -TimeoutSec 300
-        Move-Item -Path $partial -Destination $bin.Path -Force
+        # -ErrorAction Stop: a locked (running) binary must not count as replaced
+        Move-Item -Path $partial -Destination $bin.Path -Force -ErrorAction Stop
         $downloadedAny = $true
         $kb = [math]::Round((Get-Item $bin.Path).Length / 1KB)
         Write-Host "[+] $($bin.Name) ($kb KB)" -ForegroundColor Green
     } catch {
         Remove-Item "$($bin.Path).download" -Force -ErrorAction SilentlyContinue
+        $downloadFailed = $true
         Write-Host "[-] $($bin.Name) failed: $($_.Exception.Message)" -ForegroundColor DarkGray
     }
 }
 
 # Release marker (read by the tool updates)
-if ($downloadedAny) {
+if ($downloadedAny -and -not $downloadFailed) {
     try {
         $release = Invoke-RestMethod -Uri "https://api.github.com/repos/glmcdona/Process-Dump/releases/latest" `
             -Headers @{ "User-Agent" = "tdc-installer" } -TimeoutSec 30
@@ -97,6 +100,11 @@ if ($downloadedAny) {
     } catch {
         Write-Host "[!] Could not read the release tag: $($_.Exception.Message)" -ForegroundColor Yellow
     }
+}
+
+if ($Force -and $downloadFailed) {
+    Write-Host "[!] Process Dump was not fully replaced - the caller is told" -ForegroundColor Red
+    exit 1
 }
 
 if (-not (Test-Path $Exe64)) {
