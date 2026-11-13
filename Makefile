@@ -311,6 +311,7 @@ deploy:
 		vagrant upload webui/pipe_backends.py C:\\DetonationChamberUI\\pipe_backends.py; \
 		vagrant upload webui/pipe_proxy.py C:\\DetonationChamberUI\\pipe_proxy.py; \
 		vagrant upload webui/rizin_sessions.py C:\\DetonationChamberUI\\rizin_sessions.py; \
+		vagrant upload webui/tool_updates.py C:\\DetonationChamberUI\\tool_updates.py; \
 		vagrant upload webui/static/icon.png C:\\DetonationChamberUI\\static\\icon.png || true; \
 		for f in scripts/install-*.ps1; do \
 			vagrant upload $$f C:\\tdc\\scripts\\$$(basename $$f); \
@@ -333,6 +334,7 @@ deploy-app:
 		vagrant upload webui/pipe_backends.py C:\\DetonationChamberUI\\pipe_backends.py; \
 		vagrant upload webui/pipe_proxy.py C:\\DetonationChamberUI\\pipe_proxy.py; \
 		vagrant upload webui/rizin_sessions.py C:\\DetonationChamberUI\\rizin_sessions.py; \
+		vagrant upload webui/tool_updates.py C:\\DetonationChamberUI\\tool_updates.py; \
 		echo "[deploy-app] app.py and modules synced."; \
 	fi
 

@@ -1686,6 +1686,7 @@ transportable-detonation-chamber/
 │   ├── pipe_sessions/             # Ended interception recordings (git-ignored)
 │   ├── rizin_sessions.py          # RIZIN tab: rizin processes, console allowlist, analysis steps, projects
 │   ├── rizin_projects/            # Renames and comments per file, <sha256>.rzdb (git-ignored)
+│   ├── tool_updates.py            # Tool Updates: tool catalog and update checks
 │   ├── memory_baseline.json       # Host memory baseline (git-ignored)
 │   ├── dev_server.py              # Dev server with live-reload
 │   ├── requirements.txt           # Python deps (flask, requests, watchdog, pefile)
