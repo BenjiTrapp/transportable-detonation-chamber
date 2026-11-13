@@ -16,6 +16,16 @@
 #   C:\tools\capa\capa.exe
 #
 # Run as Administrator
+#
+# Parameters:
+#   -Force   reinstall even if capa.exe exists (used by the tool updates)
+#
+# After each successful install the release tag is written to
+# C:\tools\capa\tdc-release.txt.
+
+param(
+    [switch]$Force
+)
 
 $ErrorActionPreference = "Continue"
 Set-StrictMode -Version Latest
@@ -28,7 +38,7 @@ $capaInstallDir = "C:\tools\capa"
 $capaExe = "$capaInstallDir\capa.exe"
 $fallbackVersion = "v9.4.0"  # used if the GitHub API is unreachable
 
-if (Test-Path $capaExe) {
+if ((Test-Path $capaExe) -and -not $Force) {
     Write-Host "[+] capa already installed at $capaExe" -ForegroundColor Green
     return
 }
@@ -37,6 +47,7 @@ New-Item -ItemType Directory -Path $capaInstallDir -Force | Out-Null
 
 # Resolve the latest Windows release asset URL (fall back to a pinned version).
 $assetUrl = $null
+$releaseTag = $null
 try {
     Write-Host "[*] Querying latest capa release..." -ForegroundColor Yellow
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/mandiant/capa/releases/latest" `
@@ -44,6 +55,7 @@ try {
     $asset = $release.assets | Where-Object { $_.name -match "^capa-.*-windows\.zip$" } | Select-Object -First 1
     if ($asset) {
         $assetUrl = $asset.browser_download_url
+        $releaseTag = $release.tag_name
         Write-Host "    Latest: $($release.tag_name) ($($asset.name))" -ForegroundColor Gray
     }
 } catch {
@@ -51,6 +63,7 @@ try {
 }
 if (-not $assetUrl) {
     $assetUrl = "https://github.com/mandiant/capa/releases/download/$fallbackVersion/capa-$fallbackVersion-windows.zip"
+    $releaseTag = $fallbackVersion
     Write-Host "[*] Falling back to pinned version $fallbackVersion" -ForegroundColor Yellow
 }
 
@@ -67,6 +80,9 @@ try {
     if ($foundExe) {
         Copy-Item -Path "$($foundExe.DirectoryName)\*" -Destination $capaInstallDir -Recurse -Force
         Write-Host "[+] capa installed to $capaInstallDir" -ForegroundColor Green
+        if ($releaseTag) {
+            Set-Content -Path "$capaInstallDir\tdc-release.txt" -Value $releaseTag -Encoding ASCII
+        }
     } else {
         Write-Host "[!] capa.exe not found in archive" -ForegroundColor Red
     }

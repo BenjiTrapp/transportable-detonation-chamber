@@ -330,6 +330,11 @@ switch ($Target) {
             Copy-Item 'webui\static\css\theme-cyberpunk.css' -Destination 'C:\DetonationChamberUI\static\css\theme-cyberpunk.css' -ToSession $s -Force
             Copy-Item 'webui\static\js\app.js' -Destination 'C:\DetonationChamberUI\static\js\app.js' -ToSession $s -Force
             Copy-Item 'webui\static\icon.png' -Destination 'C:\DetonationChamberUI\static\icon.png' -ToSession $s -Force -ErrorAction SilentlyContinue
+            # Install scripts for the tool updates
+            Invoke-Command -Session $s -ScriptBlock { New-Item -ItemType Directory -Path 'C:\tdc\scripts' -Force | Out-Null }
+            foreach ($installScript in Get-ChildItem 'scripts' -Filter 'install-*.ps1') {
+                Copy-Item $installScript.FullName -Destination "C:\tdc\scripts\$($installScript.Name)" -ToSession $s -Force
+            }
             Write-Host "[deploy] Files synced successfully." -ForegroundColor Green
         } finally {
             Remove-PSSession $s

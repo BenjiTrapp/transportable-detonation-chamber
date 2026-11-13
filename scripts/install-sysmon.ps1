@@ -16,6 +16,19 @@
 # Events logged to: Microsoft-Windows-Sysmon/Operational
 #
 # Run as Administrator
+#
+# Parameters:
+#   -Force   reinstall the Sysmon binary even if the service runs (used by the
+#            tool updates): Sysmon64[a].exe -u force, then -accepteula -i <config>.
+#            Without -Force and with Sysmon running, only the config is refreshed.
+#
+# The ETag of every download (Sysmon.zip, the SwiftOnSecurity config) is kept
+# in C:\tools\sysmon\tdc-source.json as {"binary_etag": "...", "config_etag": "..."},
+# so the tool updates can tell whether Sysinternals or the config changed.
+
+param(
+    [switch]$Force
+)
 
 $ErrorActionPreference = "Continue"
 Set-StrictMode -Version Latest
@@ -34,6 +47,7 @@ if ($isArm64) {
     $sysmonServiceName = "Sysmon64"
 }
 $configPath = "$sysmonDir\sysmonconfig.xml"
+$sourceMarker = "$sysmonDir\tdc-source.json"
 
 # The upstream config only logs a short list of pipe names (include mode), so
 # almost no EID 17/18 events are written. Replace every PipeEvent filter with
@@ -86,19 +100,48 @@ function Set-SysmonLogSize {
     }
 }
 
+# ETag of a download response, or "" when the server sent none.
+function Get-ETag {
+    param($Response)
+    try {
+        $value = $Response.Headers["ETag"]
+        if ($value -is [array]) { $value = $value[0] }
+        if ($value) { return [string]$value }
+    } catch { }
+    return ""
+}
+
+# Records the ETag of a download in tdc-source.json, keeping the other key.
+function Set-SourceEtag {
+    param([string]$Key, [string]$Value)
+    $record = [ordered]@{ binary_etag = ""; config_etag = "" }
+    if (Test-Path $sourceMarker) {
+        try {
+            $old = Get-Content -Path $sourceMarker -Raw | ConvertFrom-Json
+            foreach ($name in @("binary_etag", "config_etag")) {
+                if ($old.PSObject.Properties[$name]) { $record[$name] = [string]$old.$name }
+            }
+        } catch { }
+    }
+    $record[$Key] = $Value
+    New-Item -ItemType Directory -Path $sysmonDir -Force | Out-Null
+    Set-Content -Path $sourceMarker -Value ($record | ConvertTo-Json) -Encoding ASCII
+}
+
 # Check if already installed and running
 $sysmonSvc = Get-Service -Name $sysmonServiceName -ErrorAction SilentlyContinue
 if (-not $sysmonSvc) {
     # Also check alternate service name (ARM64 may register as Sysmon64)
     $sysmonSvc = Get-Service -Name "Sysmon64" -ErrorAction SilentlyContinue
 }
-if ($sysmonSvc -and $sysmonSvc.Status -eq "Running") {
+if ($sysmonSvc -and $sysmonSvc.Status -eq "Running" -and -not $Force) {
     Write-Host "[+] Sysmon already installed and running" -ForegroundColor Green
     Write-Host "[*] Updating configuration..." -ForegroundColor Yellow
     # Re-download config to get latest updates
     $configUrl = "https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml"
     try {
-        Invoke-WebRequest -Uri $configUrl -OutFile $configPath -UseBasicParsing
+        $response = Invoke-WebRequest -Uri $configUrl -OutFile $configPath -UseBasicParsing -PassThru
+        Set-SourceEtag -Key "config_etag" -Value (Get-ETag $response)
         Set-PipeEventExclude -Path $configPath
         & $sysmonExe -c $configPath 2>$null
         Set-SysmonLogSize
@@ -119,9 +162,15 @@ $sysmonZipPath = "$env:TEMP\Sysmon.zip"
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 try {
-    Invoke-WebRequest -Uri $sysmonZipUrl -OutFile $sysmonZipPath -UseBasicParsing
+    $response = Invoke-WebRequest -Uri $sysmonZipUrl -OutFile $sysmonZipPath -UseBasicParsing -PassThru
+    Set-SourceEtag -Key "binary_etag" -Value (Get-ETag $response)
     Write-Host "[+] Sysmon downloaded" -ForegroundColor Green
 } catch {
+    if ($Force) {
+        # The old install is still in place; do not report it as a fresh one.
+        Write-Host "[!] Download failed: $($_.Exception.Message) - Sysmon left as it was" -ForegroundColor Red
+        exit 1
+    }
     Write-Host "[!] Download failed, trying Chocolatey fallback..." -ForegroundColor Yellow
     choco install sysmon -y --no-progress 2>$null
     if (Get-Service -Name "Sysmon64" -ErrorAction SilentlyContinue) {
@@ -161,7 +210,8 @@ if (-not (Test-Path $sysmonExe)) {
 Write-Host "[*] Downloading SwiftOnSecurity sysmon-config..." -ForegroundColor Yellow
 $configUrl = "https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml"
 try {
-    Invoke-WebRequest -Uri $configUrl -OutFile $configPath -UseBasicParsing
+    $response = Invoke-WebRequest -Uri $configUrl -OutFile $configPath -UseBasicParsing -PassThru
+    Set-SourceEtag -Key "config_etag" -Value (Get-ETag $response)
     Write-Host "[+] Sysmon config downloaded" -ForegroundColor Green
 } catch {
     Write-Host "[!] Config download failed, using minimal config" -ForegroundColor Yellow
@@ -196,6 +246,13 @@ try {
     Set-Content -Path $configPath -Value $minimalConfig
 }
 Set-PipeEventExclude -Path $configPath
+
+# Reinstall: the old service and driver have to go before the new ones
+if ($Force -and ((Get-Service -Name $sysmonServiceName -ErrorAction SilentlyContinue) -or (Get-Service -Name "Sysmon64" -ErrorAction SilentlyContinue))) {
+    Write-Host "[*] Uninstalling the running Sysmon (-u force)..." -ForegroundColor Yellow
+    & $sysmonExe -accepteula -u force 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
+    Start-Sleep -Seconds 3
+}
 
 # Install Sysmon as a service
 Write-Host "[*] Installing Sysmon service..." -ForegroundColor Yellow

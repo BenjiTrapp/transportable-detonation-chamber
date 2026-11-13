@@ -2,15 +2,17 @@
 # Installs Rizin with the rz-ghidra decompiler for the web UI's RIZIN tab.
 #
 # Rizin (https://rizin.re) is the reverse engineering framework behind Cutter.
-# Both come from the Windows package of Cutter v2.5.0, which contains:
-#   - rizin.exe (Rizin 0.9.1) and the rz-* tools
+# Both come from the Windows package of Cutter (pinned: Cutter-v2.5.0-Windows-x86_64.zip),
+# which contains:
+#   - rizin.exe (Rizin 0.9.1 in the pinned package) and the rz-* tools
 #   - lib\rizin\plugins\core_ghidra.dll with rz_ghidra_sleigh (pdg)
 #   - vc_redist.x64.exe, the Visual C++ runtime they need
 # Taking Rizin and rz-ghidra from one package guarantees that the plugin was
 # built for exactly this Rizin. The Cutter GUI is unpacked too but never run.
 #
-# The package is pinned to the SHA-256 GitHub publishes for the release asset;
-# a download that does not match is deleted and nothing is installed.
+# The package is pinned to the SHA-256 GitHub publishes for the release asset
+# (the "digest" of the asset); a download that does not match is deleted and
+# nothing is installed.
 # Rizin is optional for the lab: when the download, the checksum or the
 # self-test fails, the script warns and exits 0, so provisioning goes on and
 # the RIZIN tab reports what is missing.
@@ -38,9 +40,20 @@
 #   -PackageUrl <url>  download the package from here instead of GitHub, e.g.
 #                      a copy the host serves to a VM without internet. The
 #                      SHA-256 pin applies to any source.
+#   -Version <x.y.z>   Cutter release to install (default: the pin, 2.5.0). The
+#                      package name and the download URL are built from it.
+#   -PackageSha256 <hex>  SHA-256 the package must have (default: the pin for
+#                      2.5.0). Another -Version needs its own checksum, taken
+#                      from the "digest" of the release asset.
+#   -RizinVersion <x.y.z>  Rizin version the self-test expects. Default 0.9.1
+#                      for Cutter 2.5.0; for any other -Version the version
+#                      check is skipped, but rizin -v is printed.
 
 param(
-    [string]$PackageUrl = ""
+    [string]$PackageUrl = "",
+    [string]$Version = "2.5.0",
+    [string]$PackageSha256 = "a04154a03a392dbf5886a629938582f7d23a93636fa0611c3e1c34905b197e69",
+    [string]$RizinVersion = ""
 )
 
 $ErrorActionPreference = "Continue"
@@ -48,16 +61,17 @@ Set-StrictMode -Version Latest
 # The progress bar slows Invoke-WebRequest down badly on a package this size.
 $ProgressPreference = "SilentlyContinue"
 
-Write-Host "=== Installing Rizin + rz-ghidra (Cutter v2.5.0 package) ===" -ForegroundColor Cyan
+Write-Host "=== Installing Rizin + rz-ghidra (Cutter v$Version package) ===" -ForegroundColor Cyan
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$PackageName   = "Cutter-v2.5.0-Windows-x86_64.zip"
-# "digest" of the asset in https://api.github.com/repos/rizinorg/cutter/releases/tags/v2.5.0
-$PackageSha256 = "a04154a03a392dbf5886a629938582f7d23a93636fa0611c3e1c34905b197e69"
-$RizinVersion  = "0.9.1"
+# The pin of -PackageSha256 is the "digest" of the asset in
+# https://api.github.com/repos/rizinorg/cutter/releases/tags/v2.5.0
+$PackageSha256 = $PackageSha256 -replace "^sha256:", ""
+if (-not $RizinVersion -and $Version -eq "2.5.0") { $RizinVersion = "0.9.1" }
+$PackageName   = "Cutter-v$Version-Windows-x86_64.zip"
 if (-not $PackageUrl) {
-    $PackageUrl = "https://github.com/rizinorg/cutter/releases/download/v2.5.0/$PackageName"
+    $PackageUrl = "https://github.com/rizinorg/cutter/releases/download/v$Version/$PackageName"
 }
 
 $InstallDir     = "C:\tools\cutter"
@@ -67,7 +81,8 @@ $SleighHome     = "$InstallDir\lib\rizin\plugins\rz_ghidra_sleigh"
 $VcRedist       = "$InstallDir\vc_redist.x64.exe"
 $MarkerName     = "tdc-package.txt"
 $MarkerText     = "$PackageName sha256:$PackageSha256"
-$VersionPattern = "^rizin $([regex]::Escape($RizinVersion))\b"
+# Without a known Rizin version any "rizin ..." line passes; it is printed either way.
+$VersionPattern = if ($RizinVersion) { "^rizin $([regex]::Escape($RizinVersion))\b" } else { "^rizin\b" }
 $UploadDir      = "C:\Windows\Temp\rizin_uploads"
 
 # Ends the script without failing it, so provisioning of the web UI goes on.
@@ -78,6 +93,13 @@ function Skip-Install {
         Write-Host "    Rizin is not installed; the RIZIN tab reports it. Provisioning goes on." -ForegroundColor Yellow
     }
     exit 0
+}
+
+# Checked before anything is touched: the values end up in a URL and a file name.
+if (($Version -notmatch '^\d+\.\d+\.\d+$') -or ($RizinVersion -and $RizinVersion -notmatch '^\d+\.\d+\.\d+$') -or `
+    ($PackageSha256 -notmatch '^[0-9a-fA-F]{64}$')) {
+    Write-Host "[!] Invalid -Version '$Version', -RizinVersion '$RizinVersion' or -PackageSha256" -ForegroundColor Red
+    Skip-Install
 }
 
 function Get-RizinVersionLine {
@@ -107,7 +129,7 @@ if ((Test-Path $RizinExe) -and (Test-Path $GhidraDll)) {
     $versionLine = Get-RizinVersionLine
     if (($markerNow -eq $MarkerText) -and ($versionLine -match $VersionPattern)) {
         $installed = $true
-        Write-Host "[+] Rizin $RizinVersion already installed at $InstallDir" -ForegroundColor Green
+        Write-Host "[+] Rizin already installed at $InstallDir ($versionLine, $PackageName)" -ForegroundColor Green
     } else {
         Write-Host "[*] Replacing $InstallDir (rizin -v: '$versionLine', package: '$markerNow')" -ForegroundColor Yellow
     }
@@ -150,7 +172,7 @@ if (-not $installed) {
         if (Test-Path $oldDir) { Remove-Item $oldDir -Recurse -Force -ErrorAction Stop }
         Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction Stop
         [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $extractDir)
-        # The archive has a single top folder, Cutter-v2.5.0-Windows-x86_64\.
+        # The archive has a single top folder, Cutter-v<version>-Windows-x86_64\.
         # It becomes C:\tools\cutter, so rizin.exe is C:\tools\cutter\rizin.exe.
         $top = Get-ChildItem $extractDir -Directory | Select-Object -First 1
         if (-not $top -or -not (Test-Path (Join-Path $top.FullName "rizin.exe"))) {
@@ -237,7 +259,10 @@ Write-Host "[*] Self-testing rizin..." -ForegroundColor Yellow
 $selfTestOk = $true
 
 if (-not $installed) { $versionLine = Get-RizinVersionLine }
-if ($versionLine -match $VersionPattern) {
+if (-not $RizinVersion) {
+    Write-Host "[*] No expected Rizin version for Cutter v$Version - version not checked: '$versionLine'" -ForegroundColor Yellow
+    if ($versionLine -notmatch $VersionPattern) { $selfTestOk = $false }
+} elseif ($versionLine -match $VersionPattern) {
     Write-Host "[+] $versionLine" -ForegroundColor Green
 } else {
     Write-Host "[!] rizin -v: expected $RizinVersion, got '$versionLine'" -ForegroundColor Red

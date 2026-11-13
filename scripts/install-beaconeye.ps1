@@ -12,6 +12,16 @@
 # Expected path: C:\tools\BeaconEye\BeaconEye.exe
 #
 # Run as Administrator
+#
+# Parameters:
+#   -Force   reinstall even if BeaconEye.exe exists (used by the tool updates)
+#
+# After each successful install the release tag is written to
+# C:\tools\BeaconEye\tdc-release.txt.
+
+param(
+    [switch]$Force
+)
 
 $ErrorActionPreference = "Continue"
 Set-StrictMode -Version Latest
@@ -25,7 +35,7 @@ $binDir = "$installDir"
 $exePath = "$binDir\BeaconEye.exe"
 
 # Check if already installed (an empty folder from a failed run does not count)
-if (Test-Path $exePath) {
+if ((Test-Path $exePath) -and -not $Force) {
     Write-Host "[+] BeaconEye already installed at $exePath" -ForegroundColor Green
     exit 0
 }
@@ -34,6 +44,17 @@ New-Item -ItemType Directory -Path $binDir -Force | Out-Null
 
 # --- Try downloading pre-built release from GitHub ---
 $downloaded = $false
+$releaseTag = $null
+# Tag of the latest release; the "latest" download URL does not name it.
+$latestTag = $null
+try {
+    $latest = Invoke-RestMethod -Uri "https://api.github.com/repos/CCob/BeaconEye/releases/latest" `
+        -Headers @{ "User-Agent" = "tdc-installer" } -TimeoutSec 30
+    $latestTag = $latest.tag_name
+    Write-Host "[*] Latest BeaconEye release: $latestTag" -ForegroundColor Gray
+} catch {
+    Write-Host "[!] GitHub API query failed: $_" -ForegroundColor Yellow
+}
 # Release assets are BeaconEye_x64.zip / BeaconEye_x86.zip (0.2, 0.3); the
 # names tried before do not exist, so every install fell through to a source
 # build. x64 also on ARM64: beacons there run as emulated x64 processes.
@@ -61,6 +82,7 @@ foreach ($url in $releaseUrls) {
             # Copy all files from the same directory (includes dependencies)
             Copy-Item -Path "$($foundExe.DirectoryName)\*" -Destination $binDir -Recurse -Force
             $downloaded = $true
+            if ($url -match "/releases/download/([^/]+)/") { $releaseTag = $Matches[1] } else { $releaseTag = $latestTag }
             Write-Host "[+] BeaconEye downloaded from release" -ForegroundColor Green
         } else {
             Write-Host "[!] BeaconEye.exe not found in archive" -ForegroundColor Yellow
@@ -103,6 +125,8 @@ if (-not $downloaded) {
 
             if (Test-Path $exePath) {
                 $downloaded = $true
+                # Built from the default branch: the latest tag is the closest name for it.
+                $releaseTag = $latestTag
                 Write-Host "[+] BeaconEye built from source" -ForegroundColor Green
             } else {
                 Write-Host "[!] Build completed but BeaconEye.exe not found at expected path" -ForegroundColor Yellow
@@ -121,6 +145,11 @@ if (-not $downloaded) {
         if (-not $git) { Write-Host "[!] git not found" -ForegroundColor Yellow }
         Write-Host "[!] Cannot build from source without dotnet SDK and git" -ForegroundColor Yellow
     }
+}
+
+# --- Release marker (read by the tool updates) ---
+if ((Test-Path $exePath) -and $downloaded -and $releaseTag) {
+    Set-Content -Path "$installDir\tdc-release.txt" -Value $releaseTag -Encoding ASCII
 }
 
 # --- Add Windows Defender exclusion ---

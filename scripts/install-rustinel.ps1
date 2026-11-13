@@ -1,5 +1,5 @@
 # install-rustinel.ps1
-# Downloads and installs Rustinel v1.1.1 (Sigma/YARA/IOC-based EDR)
+# Downloads and installs Rustinel (Sigma/YARA/IOC-based EDR), pinned to v1.1.1
 #
 # Rustinel provides:
 #   - ETW-based telemetry collection
@@ -10,6 +10,22 @@
 #   - ECS 9.3.0 NDJSON alert output
 #
 # Run as Administrator
+#
+# Parameters:
+#   -Version <x.y.z>  release to install (default: the pin, 1.1.1)
+#   -Force            replace an existing install (used by the tool updates).
+#                     Only rustinel.exe is replaced; rules\, logs\, alerts\ and
+#                     config.toml stay. The Rustinel task, the nssm service
+#                     "Rustinel" and any rustinel process are stopped first and
+#                     NOT restarted: the caller starts them again.
+#
+# After each successful install the release tag is written to
+# C:\tools\rustinel\tdc-release.txt.
+
+param(
+    [string]$Version = "1.1.1",
+    [switch]$Force
+)
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
@@ -24,21 +40,62 @@ if ($isArm64) {
     Write-Host "[*] Note: ETW tracing should work under emulation but with slight overhead" -ForegroundColor Yellow
 }
 
-$rustinelVersion = "1.1.1"
+if ($Version -notmatch '^\d+\.\d+\.\d+$') {
+    Write-Host "[!] -Version must look like 1.1.1 (got '$Version')" -ForegroundColor Red
+    exit 1
+}
+$rustinelVersion = $Version
 $rustinelInstallDir = "C:\tools\rustinel"
 $rustinelZipUrl = "https://github.com/Karib0u/rustinel/releases/download/v${rustinelVersion}/rustinel-${rustinelVersion}-x86_64-pc-windows-msvc.zip"
 $rustinelZipPath = "$env:TEMP\rustinel-${rustinelVersion}-x86_64-pc-windows-msvc.zip"
 
 # Check if already installed
+$replaceOnly = $false
 if (Test-Path "$rustinelInstallDir\rustinel.exe") {
-    Write-Host "[+] Rustinel already installed at $rustinelInstallDir" -ForegroundColor Green
-    exit 0
+    if (-not $Force) {
+        Write-Host "[+] Rustinel already installed at $rustinelInstallDir" -ForegroundColor Green
+        exit 0
+    }
+    $replaceOnly = $true
 }
 
 # Download Rustinel
 Write-Host "[*] Downloading Rustinel v${rustinelVersion}..." -ForegroundColor Yellow
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 Invoke-WebRequest -Uri $rustinelZipUrl -OutFile $rustinelZipPath -UseBasicParsing
+
+# Update: swap rustinel.exe only, rules and config stay
+if ($replaceOnly) {
+    Write-Host "[*] Extracting Rustinel v${rustinelVersion}..." -ForegroundColor Yellow
+    $updateDir = "$env:TEMP\rustinel-update"
+    if (Test-Path $updateDir) { Remove-Item $updateDir -Recurse -Force }
+    Expand-Archive -Path $rustinelZipPath -DestinationPath $updateDir -Force
+    $newExe = Get-ChildItem -Path $updateDir -Recurse -Filter "rustinel.exe" | Select-Object -First 1
+    if (-not $newExe) {
+        Remove-Item $updateDir -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item $rustinelZipPath -Force -ErrorAction SilentlyContinue
+        Write-Host "[!] rustinel.exe not found in the archive - install left as it was" -ForegroundColor Red
+        exit 1
+    }
+
+    # Whatever runs rustinel.exe has to stop before the file can be replaced.
+    Write-Host "[*] Stopping Rustinel..." -ForegroundColor Yellow
+    Stop-ScheduledTask -TaskName "Rustinel" -ErrorAction SilentlyContinue
+    if (Get-Service -Name "Rustinel" -ErrorAction SilentlyContinue) {
+        Stop-Service -Name "Rustinel" -Force -ErrorAction SilentlyContinue
+    }
+    Stop-Process -Name "rustinel" -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+
+    Copy-Item -Path $newExe.FullName -Destination "$rustinelInstallDir\rustinel.exe" -Force
+    Set-Content -Path "$rustinelInstallDir\tdc-release.txt" -Value "v${rustinelVersion}" -Encoding ASCII
+    Remove-Item $updateDir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $rustinelZipPath -Force -ErrorAction SilentlyContinue
+
+    Write-Host "[+] Rustinel replaced by v${rustinelVersion} (rules and config kept)" -ForegroundColor Green
+    Write-Host "    Binary: $rustinelInstallDir\rustinel.exe" -ForegroundColor Gray
+    exit 0
+}
 
 # Extract
 Write-Host "[*] Extracting Rustinel..." -ForegroundColor Yellow
@@ -119,6 +176,9 @@ if (Test-Path "C:\vagrant_config\rustinel-config.toml") {
 
 # Create logs output directory (where alerts are written)
 New-Item -ItemType Directory -Path "$rustinelInstallDir\logs" -Force | Out-Null
+
+# Release marker (read by the tool updates)
+Set-Content -Path "$rustinelInstallDir\tdc-release.txt" -Value "v${rustinelVersion}" -Encoding ASCII
 
 # Clean up
 Remove-Item $rustinelZipPath -Force -ErrorAction SilentlyContinue

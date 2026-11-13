@@ -56,6 +56,8 @@ Vagrant.configure("2") do |config|
   config.vm.provision "file", source: "config", destination: "C:\\vagrant_config"
   config.vm.provision "file", source: "webui", destination: "C:\\vagrant\\webui"
   config.vm.provision "file", source: "rules", destination: "C:\\vagrant\\rules"
+  # Install scripts for the tool updates (the web UI re-runs them with -Force)
+  config.vm.provision "file", source: "scripts", destination: "C:\\tdc\\scripts"
 
   # Host-built binaries (scripts/build-aether.sh). Optional: the installers
   # fall back to building or downloading inside the VM when absent.

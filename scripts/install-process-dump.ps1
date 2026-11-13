@@ -24,6 +24,18 @@
 #   C:\dumps\                                (default output folder)
 #
 # Run as Administrator
+#
+# Parameters:
+#   -Force   download pd64.exe / pd32.exe again even if present (used by the
+#            tool updates). An existing clean.hashes is never regenerated: a
+#            baseline taken after a detonation would whitelist the malware.
+#
+# After a download the release tag is written to
+# C:\tools\ProcessDump\tdc-release.txt.
+
+param(
+    [switch]$Force
+)
 
 $ErrorActionPreference = "Continue"
 Set-StrictMode -Version Latest
@@ -51,19 +63,39 @@ $binaries = @(
     @{ Name = "pd32.exe"; Path = $Exe32 }
 )
 
+$downloadedAny = $false
 foreach ($bin in $binaries) {
-    if (Test-Path $bin.Path) {
+    if ((Test-Path $bin.Path) -and -not $Force) {
         Write-Host "[+] $($bin.Name) already present" -ForegroundColor Green
         continue
     }
     try {
         Write-Host "[*] Downloading $($bin.Name)..." -ForegroundColor Yellow
-        Invoke-WebRequest -Uri "$baseUrl/$($bin.Name)" -OutFile $bin.Path `
+        # Download beside the target first, so a failed download keeps a working binary.
+        $partial = "$($bin.Path).download"
+        Invoke-WebRequest -Uri "$baseUrl/$($bin.Name)" -OutFile $partial `
             -UseBasicParsing -TimeoutSec 300
+        Move-Item -Path $partial -Destination $bin.Path -Force
+        $downloadedAny = $true
         $kb = [math]::Round((Get-Item $bin.Path).Length / 1KB)
         Write-Host "[+] $($bin.Name) ($kb KB)" -ForegroundColor Green
     } catch {
+        Remove-Item "$($bin.Path).download" -Force -ErrorAction SilentlyContinue
         Write-Host "[-] $($bin.Name) failed: $($_.Exception.Message)" -ForegroundColor DarkGray
+    }
+}
+
+# Release marker (read by the tool updates)
+if ($downloadedAny) {
+    try {
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/glmcdona/Process-Dump/releases/latest" `
+            -Headers @{ "User-Agent" = "tdc-installer" } -TimeoutSec 30
+        if ($release.tag_name) {
+            Set-Content -Path "$ToolRoot\tdc-release.txt" -Value $release.tag_name -Encoding ASCII
+            Write-Host "[+] Release marker: $($release.tag_name)" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "[!] Could not read the release tag: $($_.Exception.Message)" -ForegroundColor Yellow
     }
 }
 

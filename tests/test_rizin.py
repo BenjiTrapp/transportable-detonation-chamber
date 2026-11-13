@@ -32,7 +32,7 @@ def _read(*parts):
 
 
 def _assigned_var(script, value_pattern):
-    m = re.search(r'^\s*\$(\w+)\s*=\s*"' + value_pattern + '"', script, re.M)
+    m = re.search(r'^\s*(?:\[\w+\])?\$(\w+)\s*=\s*"' + value_pattern + '"', script, re.M)
     assert m, value_pattern
     return m.group(1)
 

@@ -33,10 +33,14 @@
 #   -ToolRoot <dir>   install location (default C:\tools\Aether)
 #   -NoPrebuilt       ignore C:\vagrant\prebuilt and always build in the VM
 #                     (used to verify the in-VM Zig build path)
+#   -Force            rebuild even if Aether.exe exists (used by the tool
+#                     updates, together with -NoPrebuilt, to build from the
+#                     latest source)
 
 param(
     [string]$ToolRoot = "C:\tools\Aether",
-    [switch]$NoPrebuilt
+    [switch]$NoPrebuilt,
+    [switch]$Force
 )
 
 $ErrorActionPreference = "Continue"
@@ -71,7 +75,7 @@ if ((-not $NoPrebuilt) -and (Test-Path $prebuilt)) {
     exit 0
 }
 
-if (Test-Path $ExePath) {
+if ((Test-Path $ExePath) -and -not $Force) {
     Write-Host "[+] Aether already installed at $ExePath" -ForegroundColor Green
     exit 0
 }

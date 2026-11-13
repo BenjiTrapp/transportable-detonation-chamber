@@ -1,5 +1,5 @@
 # install-fibratus.ps1
-# Downloads and installs Fibratus v3.0.0 (adversary tradecraft detection)
+# Downloads and installs Fibratus (adversary tradecraft detection), pinned to v3.0.0
 #
 # Fibratus provides:
 #   - ETW-based kernel event collection
@@ -8,6 +8,23 @@
 #   - Eventlog alerts in JSON format (used by DetonatorAgent)
 #
 # Run as Administrator
+#
+# Parameters:
+#   -Version <x.y.z>  release to install (default: the pin, 3.0.0)
+#   -Force            reinstall an existing install (used by the tool updates):
+#                     stop the fibratus service, uninstall the old MSI, install
+#                     the new one, copy fibratus.yml from C:\vagrant_config
+#                     back, install the service and start it. A msiexec exit
+#                     code of 3010 or 1641 (reboot needed) is passed on as the
+#                     script's exit code.
+#
+# After each successful install the release tag is written to
+# C:\Program Files\Fibratus\tdc-release.txt.
+
+param(
+    [string]$Version = "3.0.0",
+    [switch]$Force
+)
 
 $ErrorActionPreference = "Continue"
 Set-StrictMode -Version Latest
@@ -22,15 +39,56 @@ if ($isArm64) {
     Write-Host "[*] Note: ETW kernel tracing may have limitations under emulation" -ForegroundColor Yellow
 }
 
-$fibratusVersion = "3.0.0"
+if ($Version -notmatch '^\d+\.\d+\.\d+$') {
+    Write-Host "[!] -Version must look like 3.0.0 (got '$Version')" -ForegroundColor Red
+    exit 1
+}
+$fibratusVersion = $Version
 $fibratusInstallDir = "$env:ProgramFiles\Fibratus"
 $fibratusMsiUrl = "https://github.com/rabbitstack/fibratus/releases/download/v${fibratusVersion}/fibratus-${fibratusVersion}-amd64.msi"
 $fibratusMsiPath = "$env:TEMP\fibratus-${fibratusVersion}-amd64.msi"
 
 # Check if already installed (MSI puts binary in Bin\ subdirectory)
-if ((Test-Path "$fibratusInstallDir\Bin\fibratus.exe") -or (Test-Path "$fibratusInstallDir\fibratus.exe")) {
+$alreadyInstalled = (Test-Path "$fibratusInstallDir\Bin\fibratus.exe") -or (Test-Path "$fibratusInstallDir\fibratus.exe")
+if ($alreadyInstalled -and -not $Force) {
     Write-Host "[+] Fibratus already installed at $fibratusInstallDir" -ForegroundColor Green
     exit 0
+}
+
+# Exit code of msiexec when it asks for a reboot; -Force hands it to the caller.
+$rebootExit = 0
+
+function Stop-FibratusService {
+    if (Get-Service -Name "fibratus" -ErrorAction SilentlyContinue) {
+        Write-Host "[*] Stopping the fibratus service..." -ForegroundColor Yellow
+        Stop-Service -Name "fibratus" -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+    }
+}
+
+function Uninstall-FibratusMsi {
+    $keys = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    )
+    $entry = Get-ItemProperty -Path $keys -ErrorAction SilentlyContinue |
+        Where-Object { $_.PSObject.Properties["DisplayName"] -and $_.DisplayName -like "Fibratus*" } |
+        Select-Object -First 1
+    if (-not $entry) {
+        Write-Host "[!] No Fibratus MSI registered - installing over the existing files" -ForegroundColor Yellow
+        return
+    }
+    if ($entry.PSChildName -notmatch '^\{[0-9A-Fa-f-]{36}\}$') {
+        Write-Host "[!] $($entry.DisplayName) has no MSI product code - installing over the existing files" -ForegroundColor Yellow
+        return
+    }
+    Write-Host "[*] Uninstalling $($entry.DisplayName) $($entry.DisplayVersion)..." -ForegroundColor Yellow
+    $un = Start-Process msiexec.exe -ArgumentList "/x $($entry.PSChildName) /qn /norestart" -Wait -PassThru
+    if ($un.ExitCode -in 3010, 1641) {
+        $script:rebootExit = $un.ExitCode
+    } elseif ($un.ExitCode -ne 0) {
+        Write-Host "[!] MSI uninstall returned exit code $($un.ExitCode)" -ForegroundColor Yellow
+    }
 }
 
 # Download Fibratus MSI
@@ -45,6 +103,7 @@ try {
     Invoke-WebRequest -Uri $fibratusZipUrl -OutFile $fibratusZipPath -UseBasicParsing
 
     # Extract ZIP
+    if ($Force) { Stop-FibratusService }
     Write-Host "[*] Extracting Fibratus..." -ForegroundColor Yellow
     New-Item -ItemType Directory -Path $fibratusInstallDir -Force | Out-Null
     Expand-Archive -Path $fibratusZipPath -DestinationPath $fibratusInstallDir -Force
@@ -56,14 +115,24 @@ try {
         [Environment]::SetEnvironmentVariable("Path", "$machinePath;$fibratusInstallDir", "Machine")
         $env:Path = "$fibratusInstallDir;$env:Path"
     }
+    Set-Content -Path "$fibratusInstallDir\tdc-release.txt" -Value "v${fibratusVersion}" -Encoding ASCII
     Write-Host "[+] Fibratus installed (ZIP method) at $fibratusInstallDir" -ForegroundColor Green
     exit 0
+}
+
+# Reinstall: the service holds the files, the old MSI has to go first
+if ($alreadyInstalled) {
+    Stop-FibratusService
+    Uninstall-FibratusMsi
 }
 
 # Install MSI silently
 Write-Host "[*] Installing Fibratus MSI..." -ForegroundColor Yellow
 $msiArgs = "/i `"$fibratusMsiPath`" /qn /norestart INSTALLDIR=`"$fibratusInstallDir`""
 $process = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
+if ($process.ExitCode -in 3010, 1641) {
+    $rebootExit = $process.ExitCode
+}
 if ($process.ExitCode -ne 0) {
     Write-Host "[!] MSI install returned exit code $($process.ExitCode), checking if installed anyway..." -ForegroundColor Yellow
 }
@@ -75,6 +144,8 @@ if (-not (Test-Path $fibratusExe)) {
 }
 if (Test-Path $fibratusExe) {
     Write-Host "[+] Fibratus installed successfully at $fibratusExe" -ForegroundColor Green
+    # Release marker (read by the tool updates)
+    Set-Content -Path "$fibratusInstallDir\tdc-release.txt" -Value "v${fibratusVersion}" -Encoding ASCII
 } else {
     # Try alternative install location
     $altPaths = @(
@@ -126,8 +197,16 @@ if (Test-Path $fibratusExe) {
     & $fibratusExe install-service 2>$null
     Set-Service -Name "fibratus" -StartupType Automatic -ErrorAction SilentlyContinue
     Write-Host "[+] Fibratus service installed (set to Automatic start)" -ForegroundColor Green
+    if ($Force) {
+        Start-Service -Name "fibratus" -ErrorAction SilentlyContinue
+        Write-Host "[*] fibratus service: $((Get-Service -Name 'fibratus' -ErrorAction SilentlyContinue).Status)" -ForegroundColor Gray
+    }
 } else {
     Write-Host "[!] Cannot install service - fibratus.exe not found" -ForegroundColor Yellow
 }
 
 Write-Host "[+] Fibratus installation complete!" -ForegroundColor Green
+if ($Force -and $rebootExit -ne 0) {
+    Write-Host "[!] A reboot is needed to finish (msiexec exit code $rebootExit)" -ForegroundColor Yellow
+    exit $rebootExit
+}

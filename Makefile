@@ -312,6 +312,9 @@ deploy:
 		vagrant upload webui/pipe_proxy.py C:\\DetonationChamberUI\\pipe_proxy.py; \
 		vagrant upload webui/rizin_sessions.py C:\\DetonationChamberUI\\rizin_sessions.py; \
 		vagrant upload webui/static/icon.png C:\\DetonationChamberUI\\static\\icon.png || true; \
+		for f in scripts/install-*.ps1; do \
+			vagrant upload $$f C:\\tdc\\scripts\\$$(basename $$f); \
+		done; \
 		echo "[deploy] Done."; \
 	fi
 

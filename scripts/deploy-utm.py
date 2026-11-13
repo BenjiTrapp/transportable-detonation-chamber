@@ -15,6 +15,7 @@ Usage:
 """
 import argparse
 import functools
+import glob
 import http.server
 import os
 import socketserver
@@ -48,6 +49,13 @@ FILES = {
     "webui/static/css/theme-cyberpunk.css": r"C:\DetonationChamberUI\static\css\theme-cyberpunk.css",
     "webui/templates/index.html": r"C:\DetonationChamberUI\templates\index.html",
     "webui/static/icon.png": r"C:\DetonationChamberUI\static\icon.png",
+}
+
+# The install scripts the tool updates re-run, kept next to the provisioning copy
+SCRIPTS_REMOTE_DIR = r"C:\tdc\scripts"
+SCRIPT_FILES = {
+    f"scripts/{os.path.basename(path)}": SCRIPTS_REMOTE_DIR + "\\" + os.path.basename(path)
+    for path in sorted(glob.glob(os.path.join(REPO, "scripts", "install-*.ps1")))
 }
 
 RESTART_PS = (
@@ -129,7 +137,9 @@ def do_deploy(sess, args):
     httpd = serve()
     print(f"[*] Host HTTP server on :{PORT}, deploying to {args.vm_ip} ...")
     try:
-        for local, remote in FILES.items():
+        ps = f'New-Item -ItemType Directory -Path "{SCRIPTS_REMOTE_DIR}" -Force | Out-Null'
+        run_ps(sess, ps, label="scripts dir")
+        for local, remote in {**FILES, **SCRIPT_FILES}.items():
             if not os.path.isfile(os.path.join(REPO, local)):
                 print(f"  [-] skip {local} (not found)")
                 continue

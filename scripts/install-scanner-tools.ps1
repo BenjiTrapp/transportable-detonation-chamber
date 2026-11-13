@@ -15,6 +15,18 @@
 #   C:\tools\DefenderCheck\bin\DefenderCheck.exe
 #
 # Run as Administrator
+#
+# Parameters:
+#   -Force   reinstall a tool even if its exe exists (used by the tool updates)
+#   -Only    ThreatCheck or DefenderCheck: install just that tool (default: both)
+#
+# After each successful install the release tag is written to
+# C:\tools\ThreatCheck\tdc-release.txt / C:\tools\DefenderCheck\tdc-release.txt.
+
+param(
+    [switch]$Force,
+    [string]$Only = ""
+)
 
 $ErrorActionPreference = "Continue"
 Set-StrictMode -Version Latest
@@ -23,15 +35,39 @@ Write-Host "=== Installing Scanner Tools (ThreatCheck + DefenderCheck) ===" -For
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+if ($Only -and ($Only -notin @("ThreatCheck", "DefenderCheck"))) {
+    Write-Host "[!] -Only must be ThreatCheck or DefenderCheck (got '$Only')" -ForegroundColor Red
+    exit 1
+}
+$doThreatCheck = (-not $Only) -or ($Only -eq "ThreatCheck")
+$doDefenderCheck = (-not $Only) -or ($Only -eq "DefenderCheck")
+
+# Tag of the latest release of a repo, or $null. The "latest" download URLs do
+# not name it, and the tool updates compare it with the marker.
+function Get-LatestReleaseTag {
+    param([string]$Repo)
+    try {
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest" `
+            -Headers @{ "User-Agent" = "tdc-installer" } -TimeoutSec 30
+        return $release.tag_name
+    } catch {
+        Write-Host "[!] Could not read the latest $Repo release: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $null
+    }
+}
+
 # --- ThreatCheck ---
 $tcInstallDir = "C:\tools\ThreatCheck"
 $tcBinDir = "$tcInstallDir\bin"
 $tcExe = "$tcBinDir\ThreatCheck.exe"
 
-if (Test-Path $tcExe) {
+if (-not $doThreatCheck) {
+    Write-Host "[*] Skipping ThreatCheck (-Only $Only)" -ForegroundColor Gray
+} elseif ((Test-Path $tcExe) -and -not $Force) {
     Write-Host "[+] ThreatCheck already installed at $tcExe" -ForegroundColor Green
 } else {
     Write-Host "[*] Installing ThreatCheck..." -ForegroundColor Yellow
+    $tcTag = Get-LatestReleaseTag "rasta-mouse/ThreatCheck"
 
     New-Item -ItemType Directory -Path $tcBinDir -Force | Out-Null
 
@@ -56,6 +92,7 @@ if (Test-Path $tcExe) {
                 # Copy all files from the same directory (includes dependencies)
                 Copy-Item -Path "$($foundExe.DirectoryName)\*" -Destination $tcBinDir -Recurse -Force
                 $tcDownloaded = $true
+                if ($url -match "/releases/download/([^/]+)/") { $tcTag = $Matches[1] }
                 Write-Host "[+] ThreatCheck downloaded from release" -ForegroundColor Green
             } else {
                 Write-Host "[!] ThreatCheck.exe not found in archive" -ForegroundColor Yellow
@@ -128,6 +165,10 @@ if (Test-Path $tcExe) {
         }
     }
 
+    if ($tcDownloaded -and $tcTag) {
+        Set-Content -Path "$tcInstallDir\tdc-release.txt" -Value $tcTag -Encoding ASCII
+    }
+
     if (-not $tcDownloaded) {
         Write-Host "[!] ThreatCheck installation FAILED - no download source available" -ForegroundColor Red
         Write-Host "    Manual install: place ThreatCheck.exe at $tcExe" -ForegroundColor Red
@@ -139,10 +180,13 @@ $dcInstallDir = "C:\tools\DefenderCheck"
 $dcBinDir = "$dcInstallDir\bin"
 $dcExe = "$dcBinDir\DefenderCheck.exe"
 
-if (Test-Path $dcExe) {
+if (-not $doDefenderCheck) {
+    Write-Host "[*] Skipping DefenderCheck (-Only $Only)" -ForegroundColor Gray
+} elseif ((Test-Path $dcExe) -and -not $Force) {
     Write-Host "[+] DefenderCheck already installed at $dcExe" -ForegroundColor Green
 } else {
     Write-Host "[*] Installing DefenderCheck..." -ForegroundColor Yellow
+    $dcTag = Get-LatestReleaseTag "matterpreter/DefenderCheck"
 
     New-Item -ItemType Directory -Path $dcBinDir -Force | Out-Null
 
@@ -232,6 +276,10 @@ if (Test-Path $dcExe) {
         } else {
             Write-Host "[!] dotnet SDK not found - cannot build from source" -ForegroundColor Yellow
         }
+    }
+
+    if ($dcDownloaded -and $dcTag) {
+        Set-Content -Path "$dcInstallDir\tdc-release.txt" -Value $dcTag -Encoding ASCII
     }
 
     if (-not $dcDownloaded) {
