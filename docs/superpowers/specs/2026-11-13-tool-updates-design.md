@@ -49,7 +49,7 @@ Diese Fälle gelten als Fehlschlag, auch wenn das Update technisch durchläuft:
 
 | id | Anzeige | Art | Prüfung | Update | Pin | Stoppt |
 |---|---|---|---|---|---|---|
-| `choco:<paket>` | jedes Paket, das `choco outdated` meldet (git, dotnet-8.0-sdk, python312, 7zip, brave, die, ghidra, php, temurin21jdk, visualstudio2022buildtools, chocolatey …) | choco | `choco outdated -r --ignore-unfound` | `choco upgrade <paket> -y --no-progress` | gepinnt, wenn choco es als pinned meldet | `python312`: LitterBox, Detonator; `dotnet-8.0-sdk`: DetonatorAgent; `php`: theZoo-WebUI |
+| `choco:<paket>` | jedes Paket, das `choco outdated` meldet (git, dotnet-8.0-sdk, python312, 7zip, brave, die, ghidra, php, temurin21jdk, visualstudio2022buildtools, chocolatey …) | choco | `choco outdated -r --ignore-unfound` | `choco upgrade <paket> -y --no-progress` | gepinnt, wenn choco es als pinned meldet (`choco_pinned`: `choco upgrade` kann es nicht, auch nicht mit `include_pinned`); `python312` ist immer von TDC gepinnt (`pinned_update`, `pinned` = installierte Version): das Web-UI läuft auf diesem Python | `python312`: LitterBox, Detonator; `dotnet-8.0-sdk`: DetonatorAgent; `php`: theZoo-WebUI |
 | `windbg` | WinDbg | winget | `winget list --id Microsoft.WinDbg --upgrade-available` | `winget upgrade --id Microsoft.WinDbg --silent --accept-source-agreements --accept-package-agreements` | – | – |
 | `rustinel_rules` | Rustinel rules | git | `C:\tools\detection-rules\rustinel-rules` | pull + `install-detection-rules.ps1` | – | – |
 | `elastic_rules` | Elastic YARA rules | git | `C:\tools\detection-rules\elastic-protections` | pull + `install-detection-rules.ps1` | – | – |
@@ -72,8 +72,8 @@ Diese Fälle gelten als Fehlschlag, auch wenn das Update technisch durchläuft:
 | `sysmon` | Sysmon | sysinternals | `ETag` von `https://download.sysinternals.com/files/Sysmon.zip` gegen Marker | `install-sysmon.ps1 -Force` | – | (Skript selbst) |
 | `sysmon_config` | Sysmon config | sysinternals | `ETag` der SwiftOnSecurity-Config gegen Marker | `install-sysmon.ps1` (lädt die Config neu, wenn Sysmon läuft) | – | – |
 
-- **Git-Prüfung:** `git -c safe.directory=* -C <dir> fetch --quiet`, dann `rev-list --count HEAD..@{u}`. Das Web-UI läuft als SYSTEM, die Repos gehören einem anderen Nutzer; ohne `safe.directory` meldet Git „dubious ownership“.
-- **Git-Update:** `git -c safe.directory=* -C <dir> pull --ff-only --autostash`. Das hebt lokale Änderungen wie LitterBox' `config.yaml` auf. Danach läuft das Skript, das neu baut. Sein eigener Pull ändert dann nichts mehr.
+- **Git-Prüfung:** `git -c core.fsmonitor=false -c core.hooksPath=NUL -c core.sshCommand= -c credential.helper= -c safe.directory=<dir> -C <dir> fetch --quiet`, dann `rev-list --count HEAD..@{u}`. Das Web-UI läuft als SYSTEM, die Repos gehören einem anderen Nutzer; ohne `safe.directory` meldet Git „dubious ownership“.
+- **Git-Update:** `git -c core.fsmonitor=false -c core.hooksPath=NUL -c core.sshCommand= -c credential.helper= -c safe.directory=<dir> -C <dir> pull --ff-only --autostash`. Das hebt lokale Änderungen wie LitterBox' `config.yaml` auf. Danach läuft das Skript, das neu baut. Sein eigener Pull ändert dann nichts mehr.
 - **Release-Prüfung:** `GET https://api.github.com/repos/<repo>/releases/latest`. Ein optionales Token kommt aus `TDC_GITHUB_TOKEN`. Versionen werden ohne führendes `v` verglichen.
 - **Marker:** `tdc-release.txt` im Installordner enthält den installierten Tag. Die Install-Skripte schreiben ihn nach jeder Installation. Fehlt er, ist die installierte Version `unknown` und der Status `update_available`. Er wird erst nach dem ersten Update gefüllt.
 - **Gepinnte Tools:**

@@ -128,6 +128,16 @@ function Set-SourceEtag {
     Set-Content -Path $sourceMarker -Value ($record | ConvertTo-Json) -Encoding ASCII
 }
 
+# A marker write failure is a warning of its own, never a failed install.
+function Save-SourceEtag {
+    param([string]$Key, [string]$Value)
+    try {
+        Set-SourceEtag -Key $Key -Value $Value
+    } catch {
+        Write-Host "[!] Could not record the $Key in tdc-source.json: $_" -ForegroundColor Yellow
+    }
+}
+
 # Check if already installed and running
 $sysmonSvc = Get-Service -Name $sysmonServiceName -ErrorAction SilentlyContinue
 if (-not $sysmonSvc) {
@@ -137,18 +147,29 @@ if (-not $sysmonSvc) {
 if ($sysmonSvc -and $sysmonSvc.Status -eq "Running" -and -not $Force) {
     Write-Host "[+] Sysmon already installed and running" -ForegroundColor Green
     Write-Host "[*] Updating configuration..." -ForegroundColor Yellow
-    # Re-download config to get latest updates
+    # Re-download config to get latest updates (to a temp file first, so a
+    # failed download never leaves a half-written config behind)
     $configUrl = "https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml"
+    $configTmp = "$env:TEMP\sysmonconfig.xml.download"
     try {
-        $response = Invoke-WebRequest -Uri $configUrl -OutFile $configPath -UseBasicParsing -PassThru
-        Set-SourceEtag -Key "config_etag" -Value (Get-ETag $response)
+        $response = Invoke-WebRequest -Uri $configUrl -OutFile $configTmp -UseBasicParsing -PassThru
+        $configEtag = Get-ETag $response
+        Move-Item -Path $configTmp -Destination $configPath -Force -ErrorAction Stop
         Set-PipeEventExclude -Path $configPath
         & $sysmonExe -c $configPath 2>$null
+        $configExit = $LASTEXITCODE
         Set-SysmonLogSize
-        Write-Host "[+] Sysmon config updated" -ForegroundColor Green
+        if ($configExit -ne 0) {
+            # The marker keeps the old ETag, so the next check still offers the update
+            Write-Host "[!] sysmon -c failed (exit $configExit) - config not applied" -ForegroundColor Yellow
+        } else {
+            Save-SourceEtag -Key "config_etag" -Value $configEtag
+            Write-Host "[+] Sysmon config updated" -ForegroundColor Green
+        }
     } catch {
         Write-Host "[!] Config update failed: $_" -ForegroundColor Yellow
     }
+    Remove-Item $configTmp -Force -ErrorAction SilentlyContinue
     exit 0
 }
 
@@ -161,9 +182,10 @@ $sysmonZipUrl = "https://download.sysinternals.com/files/Sysmon.zip"
 $sysmonZipPath = "$env:TEMP\Sysmon.zip"
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$binaryEtag = ""
 try {
     $response = Invoke-WebRequest -Uri $sysmonZipUrl -OutFile $sysmonZipPath -UseBasicParsing -PassThru
-    Set-SourceEtag -Key "binary_etag" -Value (Get-ETag $response)
+    $binaryEtag = Get-ETag $response
     Write-Host "[+] Sysmon downloaded" -ForegroundColor Green
 } catch {
     if ($Force) {
@@ -209,11 +231,19 @@ if (-not (Test-Path $sysmonExe)) {
 # Download SwiftOnSecurity sysmon config (comprehensive, well-tuned)
 Write-Host "[*] Downloading SwiftOnSecurity sysmon-config..." -ForegroundColor Yellow
 $configUrl = "https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml"
+$configEtag = ""
+$configTmp = "$env:TEMP\sysmonconfig.xml.download"
 try {
-    $response = Invoke-WebRequest -Uri $configUrl -OutFile $configPath -UseBasicParsing -PassThru
-    Set-SourceEtag -Key "config_etag" -Value (Get-ETag $response)
+    $response = Invoke-WebRequest -Uri $configUrl -OutFile $configTmp -UseBasicParsing -PassThru
+    $configEtag = Get-ETag $response
+    Move-Item -Path $configTmp -Destination $configPath -Force -ErrorAction Stop
     Write-Host "[+] Sysmon config downloaded" -ForegroundColor Green
 } catch {
+    Remove-Item $configTmp -Force -ErrorAction SilentlyContinue
+    if ($Force -and (Test-Path $configPath)) {
+        # The config in place is the one the admin has; a minimal one would be a downgrade
+        Write-Host "[!] Config download failed - keeping the existing $configPath" -ForegroundColor Yellow
+    } else {
     Write-Host "[!] Config download failed, using minimal config" -ForegroundColor Yellow
     # Minimal config that logs everything important
     $minimalConfig = @"
@@ -244,6 +274,7 @@ try {
 </Sysmon>
 "@
     Set-Content -Path $configPath -Value $minimalConfig
+    }
 }
 Set-PipeEventExclude -Path $configPath
 
@@ -265,7 +296,9 @@ $sysmonSvc = Get-Service -Name $sysmonServiceName -ErrorAction SilentlyContinue
 if (-not $sysmonSvc) {
     $sysmonSvc = Get-Service -Name "Sysmon64" -ErrorAction SilentlyContinue
 }
+$sysmonRunning = $false
 if ($sysmonSvc -and $sysmonSvc.Status -eq "Running") {
+    $sysmonRunning = $true
     Write-Host "[+] Sysmon installed and running (service: $($sysmonSvc.Name))" -ForegroundColor Green
 } else {
     # Try starting it
@@ -274,10 +307,21 @@ if ($sysmonSvc -and $sysmonSvc.Status -eq "Running") {
     Start-Sleep -Seconds 2
     $sysmonSvc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
     if ($sysmonSvc -and $sysmonSvc.Status -eq "Running") {
+        $sysmonRunning = $true
         Write-Host "[+] Sysmon installed and started" -ForegroundColor Green
     } else {
         Write-Host "[!] Sysmon service not running - check logs" -ForegroundColor Red
     }
+}
+if ($Force -and -not $sysmonRunning) {
+    # The tool updates must not report an update when Sysmon is down
+    Write-Host "[!] Sysmon is not running after the reinstall" -ForegroundColor Red
+    exit 1
+}
+# The ETags are recorded only for an install that runs
+if ($sysmonRunning) {
+    if ($binaryEtag) { Save-SourceEtag -Key "binary_etag" -Value $binaryEtag }
+    if ($configEtag) { Save-SourceEtag -Key "config_etag" -Value $configEtag }
 }
 
 # Add Sysmon to PATH

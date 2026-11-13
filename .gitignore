@@ -44,3 +44,4 @@ tests/samples/*.pdb
 # Tool update state
 webui/tool_updates_state.json
 webui/tool_updates_state.json.tmp
+webui/tool-updates.log

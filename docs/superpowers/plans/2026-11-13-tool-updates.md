@@ -20,7 +20,7 @@
 - **Testbarkeit:**
   - Alles, was Prozesse startet, Dateien liest oder HTTP spricht, geht in `tool_updates.py` über ein injiziertes `Env`-Objekt. Die Tests nutzen eine Fake-`Env`.
   - Die CI hat kein Windows und kein PowerShell. `conftest.py` setzt `TDC_NO_BACKGROUND=1`, dann startet kein Hintergrund-Thread.
-- **Git als SYSTEM:** Jeder Git-Aufruf beginnt mit `git -c safe.directory=* -C <dir>`. Ein Update nutzt `pull --ff-only --autostash`.
+- **Git als SYSTEM:** Jeder Git-Aufruf beginnt mit `git -c core.fsmonitor=false -c core.hooksPath=NUL -c core.sshCommand= -c credential.helper= -c safe.directory=<dir> -C <dir>`. Ein Update nutzt `pull --ff-only --autostash`.
 - **Status-Werte, genau so:** `up_to_date`, `update_available`, `pinned_update`, `unknown`, `not_installed`, `offline`, `error`, `queued`, `updating`, `updated`, `failed`, `reboot_required`.
 - **Modus-Werte:** `idle`, `checking`, `updating`.
 - **503-Text, genau so:** `Maintenance: tool updates are running. Detonations, scans and uploads are paused.` mit `"maintenance": true`. Gesperrt sind POST, PUT, PATCH und DELETE, außer Pfaden, die mit `/api/updates/` beginnen.
@@ -219,7 +219,7 @@
   - `test_parse_choco_outdated`: `"Chocolatey v2.2.2\ngit|2.40.0|2.41.0|false\nphp|8.2.1|8.3.0|true\n"` → zwei Einträge; `php` hat `pinned` True.
   - `test_git_behind_reports_commits`:
     - `fetch` ok, `rev-list --count HEAD..@{u}` ergibt `3`, was `update_available` mit Detail `3 new commits` ergibt.
-    - Jeder Git-Aufruf beginnt mit `["git","-c","safe.directory=*","-C",path]`.
+    - Jeder Git-Aufruf beginnt mit `webui/tool_updates.py:git_command(path, ...)` (fsmonitor, hooksPath, sshCommand and credential.helper off, `safe.directory=<path>`, `-C path`).
   - `test_release_pinned_newer`: rustinel `--version` gibt `rustinel 1.1.1`, latest ist `v1.2.0`. Erwartet: `pinned_update`, `installed == "1.1.1"`, `available == "1.2.0"`.
   - `test_release_without_marker_is_unknown_and_updatable`: beaconeye ohne Marker ergibt `installed == "unknown"` und `update_available`.
   - `test_offline_marks_network_tools`: Die Netzprobe gibt `status=0`. Alle installierten Tools mit Netz bekommen `offline` und dieses Detail. Die FakeEnv bestätigt, dass kein `fetch` aufgerufen wurde.

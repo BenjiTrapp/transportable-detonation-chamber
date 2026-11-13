@@ -289,6 +289,26 @@ def test_a_pinned_tool_asks_before_it_is_installed():
 
 
 @needs_node
+def test_a_choco_package_asks_with_its_own_detail_and_a_choco_pin_goes_to_the_server():
+    r = _run_with({"/api/updates/apply": {"status": 409, "body": {"error": "php is pinned in Chocolatey."}}}, r"""
+        updatesState = state([
+            tool('py', 'pinned_update', { kind: 'choco', name: 'python312', pinned: '3.12.1', available: '3.12.2',
+                                          detail: 'The web UI runs on this Python.' }),
+            tool('php', 'pinned_update', { kind: 'choco', name: 'php', pinned: '8.2.1', available: '8.3.0',
+                                           choco_pinned: true, detail: 'Pinned in Chocolatey' })]);
+        (async () => {
+            await applyUpdates(['py'], false);
+            await applyUpdates(['php'], false);
+            console.log(JSON.stringify({ questions, requests }));
+        })();
+    """)
+    assert r["questions"] == ["python312: The web UI runs on this Python. Install 3.12.2 anyway?"]
+    posts = [q for q in r["requests"] if q.get("method") == "POST"]
+    assert [p["body"] for p in posts] == [{"tools": ["py"], "include_pinned": True},
+                                          {"tools": ["php"], "include_pinned": True}]
+
+
+@needs_node
 def test_a_refused_question_sends_nothing():
     r = _run_with({}, r"""
         updatesState = state([tool('c', 'pinned_update', { name: 'Ghidra', pinned: '11.0', available: '11.3' }),

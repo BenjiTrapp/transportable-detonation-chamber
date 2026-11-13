@@ -1064,10 +1064,15 @@ show `update_available` ("Installed version unknown; an update records it").
 ### Pinned tools
 
 Rustinel (1.1.1), Fibratus (3.0.0) and Rizin (Cutter 2.5.0) are pinned by their
-install scripts, as are Chocolatey packages that are pinned in Chocolatey. A
-newer version shows as `pinned_update`; **Update all** skips it. The row's own
-button asks first ("Pinned to X for compatibility. Install Y anyway?"), and the
-API needs `include_pinned: true`. Rizin is installed only with the SHA-256
+install scripts, and `python312` is held back by TDC itself (the web UI runs on
+that Python: updating it restarts services and may need a reboot). A newer
+version shows as `pinned_update`; **Update all** skips it. The row's own button
+asks first ("Pinned to X for compatibility. Install Y anyway?"; for `python312`
+the question carries the warning above), and the API needs `include_pinned: true`.
+A package that is pinned in Chocolatey (`choco_pinned: true` in the entry) cannot
+be upgraded by `choco upgrade`: the API refuses it with 409 even with
+`include_pinned` ("php is pinned in Chocolatey. Unpin it with choco pin remove -n
+php first."). Rizin is installed only with the SHA-256
 GitHub publishes for the package; without one the update is refused. After
 re-provisioning, the VM has the pinned versions from the install scripts again.
 
@@ -1078,7 +1083,8 @@ banner on every page shows the progress, and the server answers every POST,
 PUT, PATCH and DELETE outside `/api/updates/` with `503` and
 `"maintenance": true`. Reading stays possible, so the dashboard keeps working.
 An update does not start (409 with the reason) while a detonation is running
-(DetonatorAgent `in_use`), a memory sweep or a Process Dump job is running, or
+(DetonatorAgent `in_use`), a memory sweep, a Process Dump job or any scan is
+running (also the memory scans a detonation starts in the background), or
 another check or update is in progress.
 
 For each tool the run closes Rizin sessions if needed, stops the services that
@@ -1087,7 +1093,9 @@ updates it, starts the services that were running before, and checks the tool
 again. A failure of one tool does not stop the run. A script gets at most 45
 minutes. `python312` is always updated last. If the web UI restarts during an
 update, the tool being updated is marked `failed` ("Interrupted") and the mode
-returns to `idle`.
+returns to `idle`. The services the run had stopped are listed in the state file
+before they are stopped; on the next start the web UI starts them again and adds
+"Restarted: <names>." to the tool's detail.
 
 An exit code of 3010 or 1641 means the VM must restart to finish the update;
 the tool shows `reboot_required`. There is no rollback to an older version.
@@ -1634,7 +1642,7 @@ Proxied responses are only relayed as data (JSON, text, binary); HTML is served 
 |--------|----------|-------------|
 | GET | `/api/updates` | Update state: `mode` (`idle`/`checking`/`updating`), `checked_at`, one entry per tool (`installed`, `available`, `status`, `pinned`, `detail`, `log`), `progress`, `last_run` |
 | POST | `/api/updates/check` | Start an update check in the background (202; 409 while a check or install runs) |
-| POST | `/api/updates/apply` | Install updates. Body: `tools` (list of tool ids or `"all"`), `include_pinned` (default `false`). 202; 400 for a bad body or unknown ids; 409 with the reason while a detonation, memory sweep or process dump runs. While an install runs, POST/PUT/PATCH/DELETE requests elsewhere answer 503 (`maintenance: true`) |
+| POST | `/api/updates/apply` | Install updates. Body: `tools` (list of tool ids or `"all"` alone), `include_pinned` (default `false`). 202; 400 for a bad body, unknown ids or `"all"` mixed into a list; 409 with the reason while a detonation, memory sweep or process dump runs. While an install runs, POST/PUT/PATCH/DELETE requests elsewhere answer 503 (`maintenance: true`) |
 
 ---
 

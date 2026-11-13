@@ -1424,8 +1424,8 @@ def tdc_updates_apply(tools: str = "all", include_pinned: bool = False) -> str:
     process dump runs. Follow progress with tdc_updates_status.
 
     Args:
-        tools: "all" (every tool with an update that is not pinned) or tool IDs, comma-separated (e.g. "capa,litterbox,choco:git"); IDs come from tdc_updates_status
-        include_pinned: Also install a newer version of a pinned tool (Rustinel, Fibratus, Rizin, pinned choco packages) that was not tested with TDC (default False)
+        tools: "all" (every tool with an update that is not pinned; do not mix it with IDs) or tool IDs, comma-separated (e.g. "capa,litterbox,choco:git"); IDs come from tdc_updates_status
+        include_pinned: Also install a newer version of a pinned tool (Rustinel, Fibratus, Rizin, python312) that was not tested with TDC (default False). Packages pinned in Chocolatey are refused: unpin them with choco pin remove first
     """
     ids = "all" if tools.strip().lower() == "all" else [t.strip() for t in tools.split(",") if t.strip()]
     if not ids:

@@ -121,3 +121,42 @@ def test_fibratus_force_failure_is_reported():
     fail = re.search(r"if \(\$Force -and \(\$process\.ExitCode -notin 0, 3010, 1641\)\) \{.*?exit 1", script, re.S)
     assert fail
     assert fail.start() < script.index("tdc-release.txt\" -Value", script.index("Installing Fibratus MSI"))
+
+
+def test_sysmon_force_failure_is_not_an_update():
+    script = _script("sysmon")
+    verify = script.index("# Verify installation")
+    # -Force with a service that is not running ends with exit 1
+    fail = re.search(r"if \(\$Force -and -not \$sysmonRunning\) \{.*?exit 1", script, re.S)
+    assert fail and fail.start() > verify
+    # The ETags are recorded only after that check, and only for a running service
+    for key in ("binary_etag", "config_etag"):
+        calls = [m.start() for m in re.finditer(r'Save-SourceEtag -Key "%s"' % key, script)]
+        assert calls, key
+        assert any(c > fail.end() for c in calls), key
+    # Nothing in the download steps writes the marker (a marker failure is no download failure)
+    assert "\n    Set-SourceEtag -Key" not in script
+    download = script[script.index("# Download Sysmon"):verify]
+    assert "SourceEtag" not in download
+    # ...and the marker write has its own guard
+    assert re.search(r"function Save-SourceEtag \{.*?try \{\s*Set-SourceEtag.*?\} catch", script, re.S)
+
+
+def test_sysmon_config_refresh_checks_the_exit_code():
+    script = _script("sysmon")
+    branch = script[script.index("-not $Force) {"):script.index("# Create directory")]
+    apply_at = branch.index("& $sysmonExe -c $configPath")
+    assert apply_at < branch.index("$LASTEXITCODE") < branch.index('Save-SourceEtag -Key "config_etag"')
+    assert re.search(r"if \(\$configExit -ne 0\)", branch)
+
+
+def test_sysmon_force_keeps_the_existing_config_when_the_download_fails():
+    script = _script("sysmon")
+    section = script[script.index("# Download SwiftOnSecurity sysmon config"):script.index("# Reinstall:")]
+    # downloaded to a temp file, moved into place only on success
+    assert "-OutFile $configTmp" in section and "-OutFile $configPath" not in section
+    assert re.search(r"Move-Item -Path \$configTmp -Destination \$configPath -Force -ErrorAction Stop", section)
+    assert re.search(r"if \(\$Force -and \(Test-Path \$configPath\)\) \{[^}]*keeping the existing", section)
+    # the minimal config is the fallback of the else branch only
+    assert section.index("keeping the existing") < section.index("$minimalConfig = @\"")
+    assert re.search(r"\} else \{\s*\n\s*Write-Host \"\[!\] Config download failed, using minimal config", section)

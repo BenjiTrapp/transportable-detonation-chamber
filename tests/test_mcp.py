@@ -223,6 +223,19 @@ def test_updates_apply_sends_a_list_of_ids(monkeypatch):
     assert sent["json"] == {"tools": "all", "include_pinned": False}
 
 
+def test_updates_apply_passes_a_mixed_list_on_for_the_server_to_refuse(monkeypatch):
+    sent = {}
+
+    def fake_call(method, path, **kwargs):
+        sent.update(kwargs)
+        return {"error": 'Use "all" alone or a list of tool ids'}
+
+    monkeypatch.setattr(server, "_call", fake_call)
+    out = server.tdc_updates_apply(tools="all,capa")
+    assert sent["json"]["tools"] == ["all", "capa"]
+    assert out == 'Error: Use "all" alone or a list of tool ids'
+
+
 def test_updates_apply_reports_the_refusal(monkeypatch):
     monkeypatch.setattr(server, "_call", lambda *a, **k: {"error": "A detonation is running. Wait until it finishes."})
     assert server.tdc_updates_apply().startswith("Error: A detonation is running")

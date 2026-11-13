@@ -7880,7 +7880,12 @@ async function applyUpdates(ids, includePinned) {
             const tool = tools.find(t => t.id === id);
             if (!tool || !updatesIsPinned(tool)) continue;
             pinned = true;
-            if (!includePinned && !confirm(`${tool.name} is pinned to ${tool.pinned} for compatibility. Install ${tool.available || 'the update'} anyway?`)) return;
+            // A Chocolatey pin cannot be upgraded; the server answers with how to unpin it
+            if (tool.choco_pinned) continue;
+            const why = tool.kind === 'choco' && tool.detail
+                ? `${tool.name}: ${tool.detail}`
+                : `${tool.name} is pinned to ${tool.pinned} for compatibility.`;
+            if (!includePinned && !confirm(`${why} Install ${tool.available || 'the update'} anyway?`)) return;
         }
         body = { tools: ids, include_pinned: pinned };
     }

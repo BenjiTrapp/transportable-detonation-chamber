@@ -17,7 +17,13 @@ from tool_updates import HttpResult, RunResult
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SPEC = os.path.join(ROOT, "docs", "superpowers", "specs", "2026-11-13-tool-updates-design.md")
 
-GIT_PREFIX = ["git", "-c", "safe.directory=*", "-C"]
+GIT_HARDENING = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=NUL", "-c", "core.sshCommand=",
+                 "-c", "credential.helper="]
+
+
+def git_base(path):
+    """The start of every git call: hardened for SYSTEM, safe.directory for this repo only."""
+    return ["git"] + GIT_HARDENING + ["-c", "safe.directory=" + path.replace("\\", "/"), "-C", path]
 
 
 def ok(stdout="", stderr=""):
@@ -91,7 +97,7 @@ def by_id(entries):
 
 def git_env(path, behind="0", fetch=None):
     env = FakeEnv(paths=[path + "\\.git", path])
-    base = GIT_PREFIX + [path]
+    base = git_base(path)
     env.on(base + ["fetch"], fetch or ok())
     env.on(base + ["rev-parse", "--short", "HEAD"], ok("abc1234\n"))
     env.on(base + ["rev-parse", "--short", "@{u}"], ok("def5678\n"))
@@ -132,6 +138,18 @@ def test_check_choco_entries_and_missing_choco():
     assert [(e["id"], e["status"]) for e in entries] == [("choco", "not_installed")]
 
 
+def test_python312_is_held_back_by_tdc_not_by_choco():
+    env = FakeEnv(commands={("choco", "outdated"): ok(
+        "python312|3.12.1|3.12.2|false\ngit|2.40.0|2.41.0|false\nphp|8.2.1|8.3.0|true\n")})
+    entries = by_id(tu.check_choco(env))
+    py = entries["choco:python312"]
+    assert py["status"] == "pinned_update" and py["pinned"] == "3.12.1"
+    assert py["detail"] == "The web UI runs on this Python; updating it restarts services and may need a reboot."
+    assert py["choco_pinned"] is False
+    assert entries["choco:git"]["status"] == "update_available" and entries["choco:git"]["choco_pinned"] is False
+    assert entries["choco:php"]["choco_pinned"] is True and entries["choco:php"]["pinned"] == "8.2.1"
+
+
 def test_check_choco_drops_install_duplicates_of_listed_metapackages():
     text = ("git|2.40.0|2.41.0|false\ngit.install|2.40.0|2.41.0|false\n"
             "7zip|23.1|24.0|false\n7zip.install|23.1|24.0|false\n"
@@ -167,7 +185,8 @@ def test_git_behind_reports_commits():
     assert entry["available"] == "def5678"
     assert env.run_calls
     for call in env.run_calls:
-        assert call[:5] == GIT_PREFIX + [path]
+        assert call[:len(git_base(path))] == git_base(path)
+        assert "safe.directory=*" not in call
 
 
 def test_git_up_to_date_and_fetch_failure():
@@ -425,8 +444,11 @@ def test_catalog_values():
     assert (spec_of("rustinel").pinned, spec_of("fibratus").pinned, spec_of("rizin").pinned) == (
         "1.1.1", "3.0.0", "2.5.0")
     assert spec_of("litterbox").script == "install-litterbox.ps1"
-    assert spec_of("detonator_agent").consumers == ["task:DetonatorAgent"]
-    assert spec_of("detonator").consumers == ["task:DetonatorAPI", "task:DetonatorUI"]
+    # both rows run install-detonator.ps1, so both stop the tasks of both
+    both = ["task:DetonatorAgent", "task:DetonatorAPI", "task:DetonatorUI"]
+    assert spec_of("detonator_agent").consumers == both
+    assert spec_of("detonator").consumers == both
+    assert spec_of("detonator_agent").script == spec_of("detonator").script
     assert spec_of("thezoo").consumers == ["task:theZoo-WebUI"]
     for t in tu.CATALOG:
         assert t.kind in ("winget", "git", "release", "sysinternals")
@@ -578,7 +600,7 @@ class World:
         self.env.on(SCRIPT_PREFIX + [path], handler)
 
     def git_tool(self, path, behind_before="2"):
-        base = GIT_PREFIX + [path]
+        base = git_base(path)
         self.env.paths.update([path + "\\.git", path])
         self.env.on(base + ["fetch"], ok())
         self.env.on(base + ["rev-parse", "--short", "HEAD"], ok("abc1234\n"))
@@ -791,7 +813,7 @@ def test_failed_pull_skips_the_script(tmp_path):
     w = World(tmp_path, [tool_entry("litterbox")])
     w.git_tool("C:\\LitterBox")
     w.script("install-litterbox.ps1")
-    w.env.on(GIT_PREFIX + ["C:\\LitterBox", "pull"], fail("not fast-forward", 1))
+    w.env.on(git_base("C:\\LitterBox") + ["pull"], fail("not fast-forward", 1))
     m = w.build()
     m.start_apply(["litterbox"])
     assert "script" not in w.kinds()
@@ -1034,6 +1056,7 @@ def test_pinned_tool_without_target_version_fails_cleanly(tmp_path):
     "C:\\Program Files", "C:\\Program Files\\Fibratus\\Bin", "C:\\Program Files (x86)\\X",
     "C:\\Python312", "C:\\Python312\\Scripts", "C:\\python311", "C:\\Python3",
     "", "relative\\dir", "\\\\server\\share\\dir", "LitterBox", "C:\\LitterBox\\..\\Windows",
+    "C:\\Users", "C:\\Users\\bob\\tools", "c:\\users\\Public", "C:\\ProgramData", "C:\\ProgramData\\Tool\\bin",
 ])
 def test_safe_kill_dirs_refuses(path):
     assert tu._safe_kill_dirs([path]) == []
@@ -1294,3 +1317,366 @@ def test_daily_check_default_is_24_hours(tdc, monkeypatch):
     assert tdc._update_check_hours() == 24
     monkeypatch.setenv("TDC_UPDATE_CHECK_HOURS", "6")
     assert tdc._update_check_hours() == 6
+
+
+# ---------------------------------------------------------------------------
+# Final review fixes
+# ---------------------------------------------------------------------------
+
+def test_safe_kill_dirs_does_not_refuse_lookalikes():
+    assert tu._safe_kill_dirs(["C:\\UsersTools", "C:\\ProgramDataX\\a"]) == ["C:\\UsersTools", "C:\\ProgramDataX\\a"]
+
+
+def test_git_calls_are_hardened_for_system():
+    path = "C:\\LitterBox"
+    cmd = tu.git_command(path, "fetch", "--quiet")
+    assert cmd == ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=NUL", "-c", "core.sshCommand=",
+                   "-c", "credential.helper=", "-c", "safe.directory=C:/LitterBox", "-C", path, "fetch", "--quiet"]
+    assert not any(a == "safe.directory=*" for a in cmd)
+
+
+def test_the_update_pull_uses_the_hardened_git(tmp_path):
+    w = World(tmp_path, [tool_entry("litterbox", installed="abc1234", available="def5678")])
+    w.git_tool("C:\\LitterBox")
+    w.script("install-litterbox.ps1", effect=lambda a: w.installed_done.add("x"))
+    m = w.build()
+    m.start_apply(["litterbox"])
+    pulls = w.env.commands_matching("pull")
+    assert pulls == [git_base("C:\\LitterBox") + ["pull", "--ff-only", "--autostash"]]
+
+
+# -- python312 is pinned by TDC; Chocolatey pins cannot be upgraded ----------
+
+def python_world(tmp_path):
+    w = World(tmp_path, [
+        tool_entry("choco:python312", "pinned_update", installed="3.12.1", available="3.12.2", pinned="3.12.1"),
+        tool_entry("choco:git", installed="2.40.0", available="2.41.0"),
+    ])
+    w.env.on(["choco", "upgrade"], ok())
+    w.env.on(["choco", "outdated"], ok(""))
+    return w
+
+
+def test_apply_all_skips_python312(tmp_path):
+    m = python_world(tmp_path).build()
+    code, body = m.start_apply("all")
+    assert (code, body["tools"]) == (202, ["choco:git"])
+    assert snap_tool(m, "choco:python312")["status"] == "pinned_update"
+
+
+def test_python312_needs_include_pinned_and_then_runs_last(tmp_path):
+    w = python_world(tmp_path)
+    m = w.build()
+    code, body = m.start_apply(["choco:python312"])
+    assert code == 409 and "include_pinned" in body["error"]
+    assert not w.env.commands_matching("choco", "upgrade")
+    code, body = m.start_apply("all", include_pinned=True)
+    assert (code, body["tools"]) == (202, ["choco:git", "choco:python312"])
+    assert snap_tool(m, "choco:python312")["status"] == "updated"
+
+
+def choco_pinned_world(tmp_path, status="pinned_update"):
+    entry = tool_entry("choco:php", status, installed="8.2.1", available="8.3.0", pinned="8.2.1", name="php")
+    entry["choco_pinned"] = True
+    w = World(tmp_path, [entry, tool_entry("choco:git", installed="2.40.0", available="2.41.0")])
+    w.env.on(["choco", "upgrade"], ok())
+    w.env.on(["choco", "outdated"], ok(""))
+    return w
+
+
+def test_choco_pinned_package_is_refused_even_with_include_pinned(tmp_path):
+    w = choco_pinned_world(tmp_path)
+    m = w.build()
+    for include in (False, True):
+        code, body = m.start_apply(["choco:php"], include_pinned=include)
+        assert code == 409
+        assert body == {"error": "php is pinned in Chocolatey. Unpin it with choco pin remove -n php first."}
+    assert not w.env.commands_matching("choco", "upgrade")
+    assert m.snapshot()["mode"] == "idle"
+
+
+def test_all_with_include_pinned_leaves_choco_pinned_packages_out(tmp_path):
+    w = choco_pinned_world(tmp_path)
+    m = w.build()
+    code, body = m.start_apply("all", include_pinned=True)
+    assert (code, body["tools"]) == (202, ["choco:git"])
+
+
+def test_all_with_a_choco_pinned_package_alone_has_nothing_to_install(tmp_path):
+    w = World(tmp_path, [dict(tool_entry("choco:php", "pinned_update", pinned="8.2.1"), choco_pinned=True)])
+    assert w.build().start_apply("all", include_pinned=True) == (409, {"error": "No updates to install."})
+
+
+# -- "all" must stand alone ---------------------------------------------------
+
+@pytest.mark.parametrize("tools", [["all", "capa"], ["capa", "all"], ["all"]])
+def test_all_in_a_list_is_rejected(tmp_path, tools):
+    w = World(tmp_path, [tool_entry("capa"), tool_entry("beaconeye")])
+    w.script("install-capa.ps1")
+    w.script("install-beaconeye.ps1")
+    m = w.build()
+    assert m.start_apply(tools) == (400, {"error": 'Use "all" alone or a list of tool ids'})
+    assert m.snapshot()["mode"] == "idle"
+    assert snap_tool(m, "capa")["status"] == "update_available"
+    assert m.start_apply("all")[0] == 202
+
+
+# -- interrupted run: what was stopped is started again -------------------------
+
+def test_stopped_consumers_are_saved_before_they_are_stopped_and_cleared_after(tmp_path):
+    w = World(tmp_path, [tool_entry("litterbox")])
+    w.git_tool("C:\\LitterBox")
+    w.script("install-litterbox.ps1", effect=lambda a: w.installed_done.add("x"))
+    w.running.add("task:LitterBox")
+    seen = []
+
+    def saved():
+        with open(w.state_path) as handle:
+            return json.load(handle).get("stopped")
+    base = w._powershell
+
+    def spy(args):
+        if "Stop-ScheduledTask" in args[-1]:
+            seen.append(("stop", saved()))
+        elif "Start-ScheduledTask" in args[-1]:
+            seen.append(("start", saved()))
+        return base(args)
+    w.env.commands = [(k, v) for k, v in w.env.commands if k != tuple(PS)]
+    w.env.on(PS, spy)
+    m = w.build()
+    m.start_apply(["litterbox"])
+    wanted = {"tool": "litterbox", "consumers": ["task:LitterBox"]}
+    assert seen == [("stop", wanted), ("start", wanted)]
+    assert saved() is None
+    assert m.snapshot()["mode"] == "idle"
+
+
+def test_nothing_saved_when_no_consumer_runs(tmp_path):
+    w = World(tmp_path, [tool_entry("litterbox")])
+    w.git_tool("C:\\LitterBox")
+    w.script("install-litterbox.ps1", effect=lambda a: w.installed_done.add("x"))
+    m = w.build()
+    m.start_apply(["litterbox"])
+    with open(w.state_path) as handle:
+        assert json.load(handle).get("stopped") is None
+
+
+def interrupted_world(tmp_path, consumers, spawn=None):
+    w = World(tmp_path, None)
+    with open(w.state_path, "w") as handle:
+        json.dump({"mode": "updating", "checked_at": "2026-01-01T00:00:00Z",
+                   "stopped": {"tool": "litterbox", "consumers": consumers},
+                   "tools": [tool_entry("litterbox", "updating")]}, handle)
+    if spawn is not None:
+        w.kwargs["spawn"] = spawn
+    return w
+
+
+def build_with(w):
+    kwargs = dict(w.kwargs)
+    return tu.UpdateManager(w.env, w.state_path, w.log_path, w.scripts, **kwargs)
+
+
+def test_interrupted_run_restarts_what_it_had_stopped(tmp_path):
+    jobs = []
+    w = interrupted_world(tmp_path, ["task:LitterBox", "service:Rustinel"], spawn=jobs.append)
+    m = build_with(w)
+    # the load itself only marks the tool; the restart runs through spawn
+    assert w.events == [] and len(jobs) == 1
+    assert snap_tool(m, "litterbox")["detail"] == tu.INTERRUPTED_DETAIL
+    jobs[0]()
+    assert w.events == [("start", "LitterBox"), ("start", "Rustinel")]
+    detail = snap_tool(m, "litterbox")["detail"]
+    assert detail == "Interrupted: the web UI restarted during the update. Restarted: LitterBox, Rustinel."
+    assert detail.startswith("Interrupted: the web UI restarted during the update.")
+    assert snap_tool(m, "litterbox")["status"] == "failed"
+    with open(w.state_path) as handle:
+        assert json.load(handle).get("stopped") is None
+    # a second start has nothing left to restart
+    again = []
+    tu.UpdateManager(w.env, w.state_path, w.log_path, w.scripts, spawn=again.append)
+    assert again == []
+
+
+def test_interrupted_restart_failure_is_logged_not_fatal(tmp_path):
+    w = interrupted_world(tmp_path, ["task:Gone", "task:LitterBox"], spawn=lambda f: f())
+    base = w._powershell
+    w.env.commands = [(k, v) for k, v in w.env.commands if k != tuple(PS)]
+    w.env.on(PS, lambda a: fail("no such task") if "'Gone'" in a[-1] else base(a))
+    m = build_with(w)
+    assert ("start", "LitterBox") in w.events
+    assert snap_tool(m, "litterbox")["detail"] == tu.INTERRUPTED_DETAIL + " Restarted: LitterBox."
+    assert m.snapshot()["mode"] == "idle"
+
+
+def test_interrupted_restart_nothing_restarted_keeps_the_plain_sentence(tmp_path):
+    w = interrupted_world(tmp_path, ["task:Gone"], spawn=lambda f: f())
+    w.env.commands = [(k, v) for k, v in w.env.commands if k != tuple(PS)]
+    w.env.on(PS, fail("no such task"))
+    m = build_with(w)
+    assert snap_tool(m, "litterbox")["detail"] == tu.INTERRUPTED_DETAIL
+
+
+def test_interrupted_state_without_saved_consumers_starts_nothing(tmp_path):
+    jobs = []
+    w = World(tmp_path, None)
+    with open(w.state_path, "w") as handle:
+        json.dump({"mode": "updating", "tools": [tool_entry("capa", "updating")]}, handle)
+    tu.UpdateManager(w.env, w.state_path, w.log_path, w.scripts, spawn=jobs.append)
+    assert jobs == []
+
+
+# -- scans in flight (webui/app.py) ----------------------------------------------
+
+def test_a_running_scan_blocks_updates(tdc, update_manager):
+    assert tdc._update_preconditions() is None
+    tdc._scan_started()
+    try:
+        assert tdc._update_preconditions() == "A scan is running. Wait until it finishes."
+        tdc._scan_started()
+        tdc._scan_finished()
+        assert tdc._update_preconditions() == "A scan is running. Wait until it finishes."
+    finally:
+        tdc._scan_finished()
+    assert tdc._update_preconditions() is None
+
+
+def test_scan_reason_comes_after_the_other_reasons(tdc, update_manager, monkeypatch):
+    tdc._scan_started()
+    try:
+        monkeypatch.setattr(tdc, "_probe_http", lambda url, timeout=2: _Reply({"in_use": True}))
+        assert tdc._update_preconditions() == DETONATION_TEXT
+        monkeypatch.setattr(tdc, "_probe_http", lambda url, timeout=2: None)
+        monkeypatch.setattr(tdc, "_sweep_state", {"running": True})
+        assert tdc._update_preconditions() == "A memory sweep is running."
+        monkeypatch.setattr(tdc, "_sweep_state", {"running": False})
+        monkeypatch.setattr(tdc, "_pd_db_state", {"running": True})
+        assert tdc._update_preconditions() == "A process dump is running."
+    finally:
+        tdc._scan_finished()
+
+
+def test_apply_refused_while_a_scan_runs(client, tdc, update_manager):
+    tdc._scan_started()
+    try:
+        resp = client.post("/api/updates/apply", json={"tools": "all"})
+    finally:
+        tdc._scan_finished()
+    assert resp.status_code == 409
+    assert resp.get_json() == {"error": "A scan is running. Wait until it finishes."}
+
+
+def test_the_scan_counter_never_goes_below_zero(tdc):
+    tdc._scan_finished()
+    assert tdc._scans_running() == 0
+
+
+def test_sync_scan_endpoint_counts_while_it_runs(client, tdc, update_manager, monkeypatch):
+    seen = []
+    monkeypatch.setattr(tdc, "PROCESSDUMP_EXE", __file__)  # any existing file
+    monkeypatch.setattr(tdc, "_image_name_for_pid", lambda pid: "x.exe")
+
+    def run(**kwargs):
+        seen.append(tdc._update_preconditions())
+        return {"tool": "Process Dump"}, None
+    monkeypatch.setattr(tdc, "_run_process_dump", run)
+    resp = client.post("/api/scan/processdump", json={"pid": 4})
+    assert resp.status_code == 200
+    assert seen == ["A scan is running. Wait until it finishes."]
+    assert tdc._scans_running() == 0 and tdc._update_preconditions() is None
+
+
+def test_sync_scan_endpoint_uncounts_after_an_error(client, tdc, update_manager, monkeypatch):
+    monkeypatch.setattr(tdc, "THREATCHECK_EXE", __file__)
+
+    def boom(*a, **k):
+        raise RuntimeError("tool crashed")
+    monkeypatch.setattr(tdc, "_run_cmd", boom)
+    resp = client.post("/api/scan/threatcheck", data={"path": __file__})
+    assert resp.status_code == 500
+    assert tdc._scans_running() == 0
+
+
+def test_a_scan_rejected_by_the_maintenance_gate_is_not_counted(client, tdc, update_manager):
+    update_manager._state["mode"] = "updating"
+    assert client.post("/api/scan/processdump", json={"pid": 4}).status_code == 503
+    assert client.post("/api/scan/processdump", json={"pid": 4}, headers={"Origin": "http://evil.example"}
+                       ).status_code == 403
+    assert tdc._scans_running() == 0
+
+
+def test_reading_scan_endpoints_is_not_counted(client, tdc, update_manager):
+    client.get("/api/scan/status")
+    client.get("/api/scan/history")
+    assert tdc._scans_running() == 0
+
+
+def test_memory_scans_after_a_detonation_count_until_they_end(tdc, update_manager, monkeypatch):
+    import threading as th
+    release, entered, seen = th.Event(), th.Event(), []
+    monkeypatch.setattr(tdc.time, "sleep", lambda s: None)
+
+    def hsb(pid):
+        seen.append(tdc._update_preconditions())
+        entered.set()
+        release.wait(5)
+        return {"tool": "hsb"}, None
+    monkeypatch.setattr(tdc, "_run_hsb", hsb)
+    monkeypatch.setattr(tdc, "_run_beaconeye", lambda pid: (None, "not installed"))
+    monkeypatch.setattr(tdc, "AETHER_EXE", "/nonexistent/aether")
+    monkeypatch.setattr(tdc, "PROCESSDUMP_EXE", "/nonexistent/pd")
+    monkeypatch.setattr(tdc, "_image_name_for_pid", lambda pid: "x.exe")
+    tdc._run_memory_scans_async(4, "abc")
+    # counted from the call on, before the worker thread has even started
+    assert tdc._update_preconditions() == "A scan is running. Wait until it finishes."
+    assert entered.wait(5)
+    release.set()
+    for _ in range(100):
+        if tdc._scans_running() == 0:
+            break
+        th.Event().wait(0.05)
+    assert tdc._scans_running() == 0
+    assert seen == ["A scan is running. Wait until it finishes."]
+
+
+def test_memory_scan_counter_ends_when_a_tool_raises(tdc, update_manager, monkeypatch):
+    import threading as th
+    monkeypatch.setattr(tdc.time, "sleep", lambda s: None)
+    crashes = []
+    monkeypatch.setattr(th, "excepthook", lambda args: crashes.append(args.exc_type))
+
+    def hsb(pid):
+        raise RuntimeError("scanner crashed")
+    monkeypatch.setattr(tdc, "_run_hsb", hsb)
+    tdc._run_memory_scans_async(4, "abc")
+    for _ in range(100):
+        if tdc._scans_running() == 0:
+            break
+        th.Event().wait(0.05)
+    assert tdc._scans_running() == 0
+    th.Event().wait(0.1)
+    assert crashes == [RuntimeError]
+
+
+# -- TDC_UPDATE_CHECK_HOURS ---------------------------------------------------------
+
+@pytest.mark.parametrize("value", ["nan", "NaN", "inf", "-inf", "Infinity", "junk", ""])
+def test_check_hours_not_finite_falls_back_to_24(tdc, monkeypatch, value):
+    monkeypatch.setenv("TDC_UPDATE_CHECK_HOURS", value)
+    assert tdc._update_check_hours() == 24
+
+
+def test_check_loop_survives_a_sleep_that_raises(tdc, update_manager, monkeypatch):
+    monkeypatch.setattr(update_manager, "start_check", lambda: (202, {"started": True}))
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if seconds != 24 * 3600 and seconds != 300:
+            raise OverflowError("timestamp too large")
+    tdc._update_check_loop(1e300, sleep=sleep, rounds=2)
+    assert sleeps.count(24 * 3600) >= 2  # the loop kept going on the default
+
+    sleeps.clear()
+    tdc._update_check_loop(float("nan"), sleep=sleep, rounds=1)
+    assert sleeps == [300, 24 * 3600]

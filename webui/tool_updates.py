@@ -54,6 +54,12 @@ VERSION_UNKNOWN_DETAIL = "Installed version unknown; an update records it"
 SYSMON_BINARY_URL = "https://download.sysinternals.com/files/Sysmon.zip"
 SYSMON_CONFIG_URL = "https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml"
 
+PYTHON_PACKAGE = "python312"
+PYTHON_DETAIL = "The web UI runs on this Python; updating it restarts services and may need a reboot."
+# Packages TDC itself holds back; unlike a Chocolatey pin, an explicit update may install them.
+TDC_PINNED_CHOCO = (PYTHON_PACKAGE,)
+DETONATOR_CONSUMERS = ["task:DetonatorAgent", "task:DetonatorAPI", "task:DetonatorUI"]
+
 CHOCO_CONSUMERS = {
     "python312": ["task:LitterBox", "task:DetonatorAPI", "task:DetonatorUI"],
     "dotnet-8.0-sdk": ["task:DetonatorAgent"],
@@ -190,10 +196,11 @@ CATALOG: List[ToolSpec] = [
              script="install-detection-rules.ps1"),
     ToolSpec("elastic_rules", "Elastic YARA rules", "git", "C:\\tools\\detection-rules\\elastic-protections",
              script="install-detection-rules.ps1"),
+    # one script installs both, so a run of either stops the tasks of both
     ToolSpec("detonator_agent", "DetonatorAgent", "git", "C:\\DetonatorAgent",
-             script="install-detonator.ps1", consumers=["task:DetonatorAgent"]),
+             script="install-detonator.ps1", consumers=list(DETONATOR_CONSUMERS)),
     ToolSpec("detonator", "Detonator", "git", "C:\\detonator",
-             script="install-detonator.ps1", consumers=["task:DetonatorAPI", "task:DetonatorUI"]),
+             script="install-detonator.ps1", consumers=list(DETONATOR_CONSUMERS)),
     ToolSpec("litterbox", "LitterBox", "git", "C:\\LitterBox",
              script="install-litterbox.ps1", consumers=["task:LitterBox"]),
     ToolSpec("thezoo_webui", "theZoo WebUI", "git", "C:\\tools\\theZoo-WebUI",
@@ -319,19 +326,36 @@ def check_choco(env) -> List[Dict[str, Any]]:
             if not (row["package"].endswith(".install") and row["package"][:-len(".install")] in listed)]
     entries = []
     for row in rows:
-        pinned = row["pinned"]
+        choco_pinned = row["pinned"]
+        held = choco_pinned or row["package"] in TDC_PINNED_CHOCO
+        if choco_pinned:
+            detail = "Pinned in Chocolatey; unpin it to upgrade"
+        else:
+            detail = PYTHON_DETAIL if held else ""
         entries.append({
             "id": "choco:" + row["package"], "name": row["package"], "kind": "choco",
             "installed": row["current"], "available": row["available"],
-            "status": "pinned_update" if pinned else "update_available",
-            "pinned": row["current"] if pinned else None,
-            "detail": "Pinned in Chocolatey; unpin it to upgrade" if pinned else "",
+            "status": "pinned_update" if held else "update_available",
+            "pinned": row["current"] if held else None,
+            "choco_pinned": choco_pinned,
+            "detail": detail,
             "log": [], "updated_at": None})
     return entries
 
 
+def git_command(path: str, *args: str) -> List[str]:
+    """A git call for a repository that belongs to another user, run as SYSTEM.
+
+    safe.directory names this one repository (git compares forward slashes);
+    fsmonitor, hooks, the ssh command and credential helpers of the repo or of
+    the user config must not run code as SYSTEM."""
+    return (["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=NUL", "-c", "core.sshCommand=",
+             "-c", "credential.helper=", "-c", "safe.directory=" + path.replace("\\", "/"), "-C", path]
+            + list(args))
+
+
 def _git(env, path: str, *args: str) -> RunResult:
-    return env.run(["git", "-c", "safe.directory=*", "-C", path] + list(args), CHECK_TIMEOUT)
+    return env.run(git_command(path, *args), CHECK_TIMEOUT)
 
 
 def _check_git(spec, env) -> Dict[str, Any]:
@@ -580,7 +604,8 @@ def _safe_kill_dirs(dirs, windows_dir: Optional[str] = None, program_files: Opti
     Refused: anything that is not an absolute drive path, drive roots and
     folders with fewer than two components counting the drive (C:\\ and C:
     are out, C:\\LitterBox is fine), and anything under the Windows folder,
-    Program Files, Program Files (x86) or a base Python install (C:\\Python3*).
+    Program Files, Program Files (x86), C:\\Users, C:\\ProgramData or a base
+    Python install (C:\\Python3*).
     Those hold shared binaries, and ending everything started from them would
     end unrelated programs."""
     windows_dir = windows_dir or os.environ.get("SystemRoot") or "C:\\Windows"
@@ -609,6 +634,8 @@ def _safe_kill_dirs(dirs, windows_dir: Optional[str] = None, program_files: Opti
             continue
         if re.fullmatch(r"[a-z]:\\python3[^\\]*(\\.*)?", path):
             continue
+        if re.fullmatch(r"[a-z]:\\(users|programdata)(\\.*)?", path):
+            continue  # profiles and shared program data hold per-user and shared binaries
         clean = ntpath.normpath(text).rstrip("\\")
         if clean not in result:
             result.append(clean)
@@ -707,13 +734,19 @@ class UpdateManager:
         self._queue: List[str] = []
         self._include_pinned = False
         self._state = self._load()
+        if self._state.get("stopped"):
+            try:
+                self.spawn(self._restart_stopped)
+            except Exception as exc:
+                logger.warning("Could not start the restart of interrupted consumers: %s", exc)
 
     # -- state -------------------------------------------------------------
 
     @staticmethod
     def _fresh() -> Dict[str, Any]:
         return {"mode": "idle", "checked_at": None, "tools": [], "queued_prev": {},
-                "progress": {"done": 0, "total": 0, "current": None}, "last_run": None}
+                "progress": {"done": 0, "total": 0, "current": None}, "last_run": None,
+                "stopped": None}
 
     def _load(self) -> Dict[str, Any]:
         state = self._fresh()
@@ -739,6 +772,11 @@ class UpdateManager:
         state["checked_at"] = data.get("checked_at")
         if isinstance(data.get("last_run"), dict):
             state["last_run"] = data["last_run"]
+        stopped = data.get("stopped")
+        if isinstance(stopped, dict) and stopped.get("consumers"):
+            state["stopped"] = {"tool": str(stopped.get("tool") or ""),
+                                "consumers": [str(c) for c in stopped["consumers"] if isinstance(c, str)]}
+            changed = True
         if changed or data.get("mode") in ("updating", "checking"):
             self._state = state
             self._persist()
@@ -772,6 +810,42 @@ class UpdateManager:
                     os.remove(tmp)
                 except OSError:
                     pass
+
+    def _restart_stopped(self) -> None:
+        """Start again what an interrupted run had stopped (the web UI restarted
+        in the middle of an update), and say so in the failed tool's detail."""
+        with self._lock:
+            pending = self._state.get("stopped")
+        if not pending:
+            return
+        restarted: List[str] = []
+        lines: List[str] = []
+        for cid in pending["consumers"]:
+            try:
+                start_consumer(cid, self.env)
+                restarted.append(cid.split(":", 1)[-1])
+                lines.append("Started %s after the interrupted update" % cid)
+                logger.info("Restarted %s after an interrupted update", cid)
+            except Exception as exc:
+                lines.append("Could not start %s: %s" % (cid, _one_line(exc)))
+                logger.warning("Could not restart %s after an interrupted update: %s", cid, exc)
+        stamp = _now()
+        with self._lock:
+            entry = self._entry(pending["tool"])
+            if entry is not None and restarted and entry.get("status") == "failed" \
+                    and str(entry.get("detail", "")).startswith(INTERRUPTED_DETAIL):
+                entry["detail"] = "%s Restarted: %s." % (INTERRUPTED_DETAIL, ", ".join(restarted))
+            if self._state.get("stopped") is pending:
+                self._state["stopped"] = None
+            self._persist()
+        self._append_log_file(["%s [%s] %s" % (stamp, pending["tool"], l) for l in lines])
+
+    def _set_stopped(self, tool_id: str, consumers: List[str]) -> None:
+        with self._lock:
+            if not consumers and not self._state.get("stopped"):
+                return
+            self._state["stopped"] = {"tool": tool_id, "consumers": list(consumers)} if consumers else None
+            self._persist()
 
     @property
     def maintenance(self) -> bool:
@@ -874,10 +948,13 @@ class UpdateManager:
                 return busy
             entries = self._state["tools"]
             known = {t["id"]: t for t in entries}
+            if isinstance(tools, list) and "all" in tools:
+                return 400, {"error": 'Use "all" alone or a list of tool ids'}
             requested = [tools] if isinstance(tools, str) else list(tools or [])
             if "all" in requested:
                 chosen = [t["id"] for t in entries if t["status"] == "update_available"
-                          or (include_pinned and t["status"] == "pinned_update")]
+                          or (include_pinned and t["status"] == "pinned_update"
+                              and not t.get("choco_pinned"))]
             else:
                 unknown = [t for t in requested if t not in known]
                 if unknown:
@@ -885,6 +962,9 @@ class UpdateManager:
                 chosen = []
                 for tool_id in requested:
                     entry = known[tool_id]
+                    if entry.get("choco_pinned") and entry["status"] in ("update_available", "pinned_update", "failed"):
+                        return 409, {"error": "%s is pinned in Chocolatey. Unpin it with choco pin remove -n %s first." % (
+                            entry["name"], tool_id.split(":", 1)[-1])}
                     if self._needs_include_pinned(entry) and not include_pinned:
                         return 409, {"error": "%s is pinned to %s. Pass include_pinned to install %s." % (
                             entry["name"], entry.get("pinned"), entry.get("available"))}
@@ -997,6 +1077,9 @@ class UpdateManager:
                         stopped.append(cid)
                 except Exception as exc:
                     note("Could not check %s: %s" % (cid, _one_line(exc)))
+            # Written before anything is stopped: if the web UI dies from here
+            # on, the next start knows what to start again.
+            self._set_stopped(tool_id, stopped)
             for cid in stopped:
                 try:
                     stop_consumer(cid, self.env)
@@ -1018,6 +1101,7 @@ class UpdateManager:
                         note("Started %s" % cid)
                     except Exception as exc:
                         note("Could not start %s: %s" % (cid, _one_line(exc)))
+                self._set_stopped(tool_id, [])
             if status in ("updated", "reboot_required"):
                 status, detail = self._recheck(tool_id, spec, status, detail)
         except _Failure as exc:
@@ -1050,8 +1134,7 @@ class UpdateManager:
                 args += ["-PackageSha256", digest]
         commands: List[Tuple[List[str], float]] = []
         if spec.kind == "git":
-            commands.append((["git", "-c", "safe.directory=*", "-C", spec.path,
-                              "pull", "--ff-only", "--autostash"], GIT_PULL_TIMEOUT))
+            commands.append((git_command(spec.path, "pull", "--ff-only", "--autostash"), GIT_PULL_TIMEOUT))
         commands.append((self._script_call(spec.script, args), SCRIPT_TIMEOUT))
         return commands
 

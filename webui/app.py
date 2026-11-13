@@ -28,7 +28,7 @@ import subprocess
 import sys
 import weakref
 from pathlib import Path
-from flask import Flask, render_template, jsonify, request, send_from_directory
+from flask import Flask, render_template, jsonify, request, send_from_directory, g
 from werkzeug.utils import secure_filename
 import requests
 
@@ -115,6 +115,48 @@ def _reject_during_maintenance():
     if request.path.startswith("/api/updates/") or not manager.maintenance:
         return None
     return jsonify({"error": MAINTENANCE_MESSAGE, "maintenance": True}), 503
+
+
+# Scans that run catalog tools (the /api/scan/* POST handlers, and the memory
+# scans a detonation starts in the background). A tool update must not replace
+# their exe in the middle of a run, so the update preconditions look here.
+_scans_in_flight = 0
+_scans_in_flight_lock = threading.Lock()
+
+
+def _scan_started():
+    global _scans_in_flight
+    with _scans_in_flight_lock:
+        _scans_in_flight += 1
+
+
+def _scan_finished():
+    global _scans_in_flight
+    with _scans_in_flight_lock:
+        _scans_in_flight = max(0, _scans_in_flight - 1)
+
+
+def _scans_running():
+    with _scans_in_flight_lock:
+        return _scans_in_flight
+
+
+@app.before_request
+def _count_scan_request():
+    """Counts a /api/scan/* POST while it runs; the matching teardown ends it.
+
+    Registered after the maintenance gate: a request the gate rejects never
+    starts a scan and is not counted."""
+    if request.method == "POST" and request.path.startswith("/api/scan/"):
+        _scan_started()
+        g._scan_counted = True
+    return None
+
+
+@app.teardown_request
+def _uncount_scan_request(exc=None):
+    if g.pop("_scan_counted", False):
+        _scan_finished()
 
 
 @app.after_request
@@ -7815,6 +7857,12 @@ def _run_memory_scans_async(pid, sha256):
     is undisturbed, and Process Dump runs last because it writes files.
     """
     def _scan():
+        try:
+            _scan_all()
+        finally:
+            _scan_finished()
+
+    def _scan_all():
         import time as _time
         # Wait a few seconds for the beacon to initialize and enter sleep
         _time.sleep(5)
@@ -7861,8 +7909,15 @@ def _run_memory_scans_async(pid, sha256):
                 _beacon_results_cache.put("processdump", {"tool": "Process Dump", "error": str(e)},
                                           pid=pid, sha256=sha256)
 
-    thread = threading.Thread(target=_scan, daemon=True)
-    thread.start()
+    # Counted from here, not from the thread's first line, so no tool update
+    # slips in between the detonation and the scans it starts
+    _scan_started()
+    try:
+        thread = threading.Thread(target=_scan, daemon=True)
+        thread.start()
+    except Exception:
+        _scan_finished()
+        raise
 
 
 # --- PE Analysis ---
@@ -10371,6 +10426,8 @@ def _update_preconditions():
         dumping = bool(_pd_db_state.get("running"))
     if dumping:
         return "A process dump is running."
+    if _scans_running() > 0:
+        return "A scan is running. Wait until it finishes."
     return None
 
 
@@ -10419,11 +10476,14 @@ def api_updates_apply():
 
 
 def _update_check_hours():
-    """TDC_UPDATE_CHECK_HOURS: hours between automatic checks, 0 = never (default 24)."""
+    """TDC_UPDATE_CHECK_HOURS: hours between automatic checks, 0 = never (default 24).
+
+    Anything that is not a finite number (junk, nan, inf) counts as the default."""
     try:
-        return float(os.environ.get("TDC_UPDATE_CHECK_HOURS", "24"))
+        hours = float(os.environ.get("TDC_UPDATE_CHECK_HOURS", "24"))
     except ValueError:
         return 24
+    return hours if math.isfinite(hours) else 24
 
 
 def _update_check_loop(hours, sleep=time.sleep, rounds=None):
@@ -10431,7 +10491,21 @@ def _update_check_loop(hours, sleep=time.sleep, rounds=None):
 
     Only looks, never installs, and skips a round while a check or install is
     already running. ``rounds`` limits the loop for tests."""
-    sleep(300)
+    log = logging.getLogger(__name__)
+    seconds = hours * 3600 if math.isfinite(hours) and hours > 0 else 24 * 3600
+
+    def pause(span):
+        # a sleep that raises (a huge or odd value) must not end the thread
+        try:
+            sleep(span)
+        except Exception as exc:
+            log.warning("Daily tool update check: cannot sleep %s s (%s); using 24 h", span, exc)
+            try:
+                sleep(24 * 3600)
+            except Exception:
+                pass
+
+    pause(300)
     done = 0
     while rounds is None or done < rounds:
         done += 1
@@ -10440,8 +10514,8 @@ def _update_check_loop(hours, sleep=time.sleep, rounds=None):
             if manager.snapshot()["mode"] == "idle":
                 manager.start_check()
         except Exception as exc:
-            logging.getLogger(__name__).warning("Daily tool update check failed: %s", exc)
-        sleep(hours * 3600)
+            log.warning("Daily tool update check failed: %s", exc)
+        pause(seconds)
 
 
 def _start_update_check_thread():
