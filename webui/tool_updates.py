@@ -18,18 +18,30 @@ one-line detail and never stops the check of the others.
 
 from __future__ import annotations
 
+import copy
+import datetime
 import json
+import logging
 import os
 import re
 import signal
 import subprocess
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, NamedTuple, Optional
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import requests
 
+logger = logging.getLogger(__name__)
+
 CHECK_TIMEOUT = 60
+SCRIPT_TIMEOUT = 45 * 60
+GIT_PULL_TIMEOUT = 10 * 60
+CONSUMER_TIMEOUT = 120
+LOG_LINES = 200
+REBOOT_CODES = (3010, 1641)
 CHOCO_TIMEOUT = 180
 HTTP_TIMEOUT = 20
 PROBE_TIMEOUT = 5
@@ -511,3 +523,519 @@ def check_all(env, max_workers: int = 4) -> List[Dict[str, Any]]:
                         "detail": _one_line(exc), "log": [], "updated_at": None}]
         entries.extend(f.result() for f in futures)
     return entries
+
+
+# ---------------------------------------------------------------------------
+# Update runner
+# ---------------------------------------------------------------------------
+
+BUSY_MESSAGE = "An update check or install is already running."
+INTERRUPTED_DETAIL = "Interrupted: the web UI restarted during the update."
+WINGET_UPGRADE = ["winget", "upgrade", "--id", "Microsoft.WinDbg", "--silent",
+                  "--accept-source-agreements", "--accept-package-agreements"]
+_STATE_REPLACE_ATTEMPTS = 10
+_STATE_REPLACE_PAUSE = 0.05
+_POWERSHELL = ["powershell", "-NoProfile", "-Command"]
+
+
+def _ps_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _split_consumer(cid: str) -> Tuple[str, str]:
+    kind, _, name = cid.partition(":")
+    if kind not in ("task", "service") or not name:
+        raise ValueError("Unknown consumer: %s" % cid)
+    return kind, name
+
+
+def _powershell(env, script: str, timeout: float) -> RunResult:
+    return env.run(_POWERSHELL + [script], timeout)
+
+
+def consumer_running(cid: str, env) -> bool:
+    kind, name = _split_consumer(cid)
+    if kind == "task":
+        script = "(Get-ScheduledTask -TaskName %s -ErrorAction SilentlyContinue).State -eq 'Running'" % _ps_quote(name)
+    else:
+        script = "(Get-Service -Name %s -ErrorAction SilentlyContinue).Status -eq 'Running'" % _ps_quote(name)
+    res = _powershell(env, script, CONSUMER_TIMEOUT)
+    return res.returncode == 0 and res.stdout.strip().lower() == "true"
+
+
+def stop_consumer(cid: str, env) -> None:
+    """Stop a task (and what runs from its install folder) or a service.
+
+    Raises RuntimeError when the stop command fails."""
+    kind, name = _split_consumer(cid)
+    if kind == "task":
+        # Stop-ScheduledTask leaves child processes behind at times, so
+        # processes started from the task's folder are ended as well. Never
+        # the web UI itself, and never anything under the Windows folder.
+        script = (
+            "$n=%s; $t=Get-ScheduledTask -TaskName $n -ErrorAction Stop; "
+            "$dirs=@(); foreach($a in $t.Actions){ "
+            "if($a.WorkingDirectory){$dirs+=$a.WorkingDirectory} "
+            "elseif($a.Execute){$dirs+=Split-Path -Parent ([Environment]::ExpandEnvironmentVariables($a.Execute))} }; "
+            "Stop-ScheduledTask -TaskName $n -ErrorAction Stop; "
+            "$win=[Environment]::GetFolderPath('Windows'); "
+            "foreach($d in $dirs){ $d=([string]$d).Trim([char]34).TrimEnd([char]92); "
+            "if(-not $d -or $d.StartsWith($win,[StringComparison]::OrdinalIgnoreCase)){continue}; "
+            "Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Id -ne %d -and "
+            "$_.Path.StartsWith($d+[char]92,[StringComparison]::OrdinalIgnoreCase) } | "
+            "Stop-Process -Force -ErrorAction SilentlyContinue }"
+        ) % (_ps_quote(name), os.getpid())
+    else:
+        script = "Stop-Service -Name %s -Force -ErrorAction Stop" % _ps_quote(name)
+    res = _powershell(env, script, CONSUMER_TIMEOUT)
+    if res.returncode != 0:
+        raise RuntimeError(_one_line(res.stderr or res.stdout or "exit code %d" % res.returncode))
+
+
+def start_consumer(cid: str, env) -> None:
+    """Start a task or service. Raises RuntimeError when the command fails."""
+    kind, name = _split_consumer(cid)
+    if kind == "task":
+        script = "Start-ScheduledTask -TaskName %s -ErrorAction Stop" % _ps_quote(name)
+    else:
+        script = "Start-Service -Name %s -ErrorAction Stop" % _ps_quote(name)
+    res = _powershell(env, script, CONSUMER_TIMEOUT)
+    if res.returncode != 0:
+        raise RuntimeError(_one_line(res.stderr or res.stdout or "exit code %d" % res.returncode))
+
+
+def _now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _spawn_thread(work: Callable[[], None]) -> None:
+    threading.Thread(target=work, name="tool-updates", daemon=True).start()
+
+
+def _rizin_sha256(spec, env, available: str) -> Optional[str]:
+    """The SHA-256 GitHub publishes for the Cutter package, or None."""
+    res = env.http_get("%s/repos/%s/releases/latest" % (GITHUB_API, spec.repo), HTTP_TIMEOUT)
+    if res.status != 200 or not isinstance(res.json, dict):
+        return None
+    wanted = "Cutter-v%s-Windows-x86_64.zip" % available
+    for asset in res.json.get("assets") or []:
+        if isinstance(asset, dict) and asset.get("name") == wanted:
+            digest = str(asset.get("digest") or "")
+            if digest.lower().startswith("sha256:") and re.fullmatch(r"[0-9a-fA-F]{64}", digest[7:]):
+                return digest[7:].lower()
+    return None
+
+
+class _Failure(Exception):
+    """A tool failed in a way that has a ready-made detail."""
+
+
+class UpdateManager:
+    """State, run order and maintenance mode of the tool updates."""
+
+    def __init__(self, env, state_path: str, log_path: str, scripts_dir: str,
+                 preconditions: Callable[[], Optional[str]] = lambda: None,
+                 close_rizin: Callable[[], None] = lambda: None,
+                 spawn: Callable[[Callable[[], None]], None] = _spawn_thread):
+        self.env = env
+        self.state_path = state_path
+        self.log_path = log_path
+        self.scripts_dir = scripts_dir
+        self.preconditions = preconditions
+        self.close_rizin = close_rizin
+        self.spawn = spawn
+        self._lock = threading.RLock()
+        self._queue: List[str] = []
+        self._include_pinned = False
+        self._state = self._load()
+
+    # -- state -------------------------------------------------------------
+
+    @staticmethod
+    def _fresh() -> Dict[str, Any]:
+        return {"mode": "idle", "checked_at": None, "tools": [], "queued_prev": {},
+                "progress": {"done": 0, "total": 0, "current": None}, "last_run": None}
+
+    def _load(self) -> Dict[str, Any]:
+        state = self._fresh()
+        try:
+            with open(self.state_path, encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, ValueError):
+            return state
+        if not isinstance(data, dict):
+            return state
+        tools = [t for t in data.get("tools") or [] if isinstance(t, dict) and t.get("id")]
+        prev = data.get("queued_prev") if isinstance(data.get("queued_prev"), dict) else {}
+        changed = False
+        for tool in tools:
+            if tool.get("status") == "updating":
+                tool["status"] = "failed"
+                tool["detail"] = INTERRUPTED_DETAIL
+                changed = True
+            elif tool.get("status") == "queued":
+                tool["status"] = prev.get(tool["id"]) or "unknown"
+                changed = True
+        state["tools"] = tools
+        state["checked_at"] = data.get("checked_at")
+        if isinstance(data.get("last_run"), dict):
+            state["last_run"] = data["last_run"]
+        if changed or data.get("mode") in ("updating", "checking"):
+            self._state = state
+            self._persist()
+        return state
+
+    def _persist(self) -> None:
+        """Write the state beside the file, flush it to disk, then put it in
+        place, so a crash halfway leaves the old state."""
+        with self._lock:
+            payload = {k: v for k, v in self._state.items() if k != "progress"}
+            tmp = self.state_path + ".tmp"
+            try:
+                parent = os.path.dirname(self.state_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(tmp, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, indent=2)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                for attempt in range(1, _STATE_REPLACE_ATTEMPTS + 1):
+                    try:
+                        os.replace(tmp, self.state_path)
+                        break
+                    except PermissionError:
+                        if attempt == _STATE_REPLACE_ATTEMPTS:
+                            raise
+                        time.sleep(_STATE_REPLACE_PAUSE)
+            except (OSError, TypeError, ValueError) as exc:
+                logger.warning("Could not save the tool update state: %s", exc)
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
+    @property
+    def maintenance(self) -> bool:
+        with self._lock:
+            return self._state["mode"] == "updating"
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            s = self._state
+            return copy.deepcopy({"mode": s["mode"], "checked_at": s["checked_at"], "tools": s["tools"],
+                                  "progress": s["progress"], "last_run": s["last_run"]})
+
+    def _entry(self, tool_id: str) -> Optional[Dict[str, Any]]:
+        for tool in self._state["tools"]:
+            if tool["id"] == tool_id:
+                return tool
+        return None
+
+    # -- check -------------------------------------------------------------
+
+    def start_check(self) -> Tuple[int, Dict[str, Any]]:
+        with self._lock:
+            if self._state["mode"] != "idle":
+                return 409, {"error": BUSY_MESSAGE}
+            self._state["mode"] = "checking"
+            self._state["progress"] = {"done": 0, "total": 0, "current": None}
+            self._persist()
+        try:
+            self.spawn(self.run_check_sync)
+        except Exception:
+            self._finish_mode()
+            raise
+        return 202, {"started": True}
+
+    def _finish_mode(self) -> None:
+        with self._lock:
+            self._state["mode"] = "idle"
+            self._state["progress"]["current"] = None
+            self._persist()
+
+    def run_check_sync(self) -> None:
+        with self._lock:
+            if self._state["mode"] == "idle":
+                self._state["mode"] = "checking"
+        try:
+            entries = check_all(self.env)
+            with self._lock:
+                old = {t["id"]: t for t in self._state["tools"]}
+                for entry in entries:
+                    previous = old.get(entry["id"])
+                    if previous:
+                        entry["log"] = previous.get("log", [])
+                        entry["updated_at"] = previous.get("updated_at")
+                self._state["tools"] = entries
+                self._state["checked_at"] = _now()
+        except Exception as exc:
+            logger.warning("Tool update check failed: %s", exc)
+        finally:
+            self._finish_mode()
+
+    # -- apply -------------------------------------------------------------
+
+    @staticmethod
+    def _spec(tool_id: str) -> Optional[ToolSpec]:
+        return next((t for t in CATALOG if t.id == tool_id), None)
+
+    @staticmethod
+    def _order_key(tool_id: str) -> Tuple[int, int]:
+        if tool_id == "choco:python312":
+            return (2, 0)
+        if tool_id.startswith("choco:"):
+            return (1, 0)
+        for i, spec in enumerate(CATALOG):
+            if spec.id == tool_id:
+                return (0, i)
+        return (1, 0)
+
+    def start_apply(self, tools, include_pinned: bool = False) -> Tuple[int, Dict[str, Any]]:
+        with self._lock:
+            if self._state["mode"] != "idle":
+                return 409, {"error": BUSY_MESSAGE}
+            reason = self.preconditions()
+            if reason:
+                return 409, {"error": reason}
+            entries = self._state["tools"]
+            known = {t["id"]: t for t in entries}
+            requested = [tools] if isinstance(tools, str) else list(tools or [])
+            take_all = "all" in requested
+            if take_all:
+                chosen = [t["id"] for t in entries if t["status"] == "update_available"
+                          or (include_pinned and t["status"] == "pinned_update")]
+            else:
+                unknown = [t for t in requested if t not in known]
+                if unknown:
+                    return 400, {"error": "Unknown tools: %s" % ", ".join(unknown)}
+                chosen = []
+                for tool_id in requested:
+                    entry = known[tool_id]
+                    if entry["status"] == "pinned_update" and not include_pinned:
+                        return 409, {"error": "%s is pinned to %s. Pass include_pinned to install %s." % (
+                            entry["name"], entry.get("pinned"), entry.get("available"))}
+                    if (entry["status"] == "update_available" or (
+                            entry["status"] == "pinned_update" and include_pinned)) and tool_id not in chosen:
+                        chosen.append(tool_id)
+            if not chosen:
+                return 409, {"error": "No updates to install."}
+            chosen.sort(key=self._order_key)
+            self._queue = chosen
+            self._include_pinned = include_pinned
+            self._state["queued_prev"] = {i: known[i]["status"] for i in chosen}
+            for tool_id in chosen:
+                known[tool_id]["status"] = "queued"
+            self._state["mode"] = "updating"
+            self._state["progress"] = {"done": 0, "total": len(chosen), "current": None}
+            self._persist()
+        try:
+            self.spawn(self.run_apply_sync)
+        except Exception:
+            self._abort_queue()
+            raise
+        return 202, {"started": True, "tools": list(chosen)}
+
+    def _abort_queue(self) -> None:
+        with self._lock:
+            for tool_id in self._queue:
+                entry = self._entry(tool_id)
+                if entry and entry["status"] == "queued":
+                    entry["status"] = self._state["queued_prev"].get(tool_id) or "unknown"
+            self._queue = []
+            self._state["mode"] = "idle"
+            self._persist()
+
+    def run_apply_sync(self) -> None:
+        with self._lock:
+            queue = list(self._queue)
+            if not queue or self._state["mode"] != "updating":
+                return
+        started = _now()
+        results: Dict[str, str] = {}
+        try:
+            for i, tool_id in enumerate(queue):
+                try:
+                    results[tool_id] = self._run_tool(tool_id)
+                except Exception as exc:  # one tool never stops the run
+                    logger.exception("Update of %s crashed", tool_id)
+                    self._set(tool_id, status="failed", detail=_one_line(exc))
+                    results[tool_id] = "failed"
+                with self._lock:
+                    self._state["progress"]["done"] = i + 1
+                    self._persist()
+        finally:
+            with self._lock:
+                self._queue = []
+                self._state["queued_prev"] = {}
+                self._state["last_run"] = {"started_at": started, "finished_at": _now(), "results": results}
+                self._state["mode"] = "idle"
+                self._state["progress"]["current"] = None
+                self._persist()
+
+    def _set(self, tool_id: str, **fields) -> None:
+        with self._lock:
+            entry = self._entry(tool_id)
+            if entry is not None:
+                entry.update(fields)
+
+    # -- one tool ----------------------------------------------------------
+
+    def _script_call(self, script: str, args: List[str]) -> List[str]:
+        return ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                os.path.join(self.scripts_dir, script)] + list(args)
+
+    def _run_tool(self, tool_id: str) -> str:
+        with self._lock:
+            entry = copy.deepcopy(self._entry(tool_id))
+            self._state["progress"]["current"] = entry["name"]
+            self._set(tool_id, status="updating", detail="")
+            self._persist()
+        spec = self._spec(tool_id)
+        if spec is not None:
+            consumers = list(spec.consumers)
+        else:
+            consumers = list(CHOCO_CONSUMERS.get(tool_id.split(":", 1)[1], []))
+        lines: List[str] = []
+
+        def note(text: str) -> None:
+            lines.extend(l for l in str(text).splitlines() if l.strip())
+
+        def run(args: List[str], timeout: float) -> RunResult:
+            note("> " + " ".join(args))
+            res = self.env.run(args, timeout)
+            note(res.stdout.rstrip())
+            note(res.stderr.rstrip())
+            return res
+
+        status, detail = "failed", ""
+        stopped: List[str] = []
+        try:
+            if "rizin_sessions" in consumers:
+                try:
+                    self.close_rizin()
+                except Exception as exc:
+                    note("Closing the Rizin sessions failed: %s" % _one_line(exc))
+            commands = self._plan(spec, entry, note)
+            for cid in consumers:
+                if cid == "rizin_sessions":
+                    continue
+                try:
+                    if consumer_running(cid, self.env):
+                        stopped.append(cid)
+                except Exception as exc:
+                    note("Could not check %s: %s" % (cid, _one_line(exc)))
+            for cid in stopped:
+                try:
+                    stop_consumer(cid, self.env)
+                    note("Stopped %s" % cid)
+                except Exception as exc:
+                    note("Could not stop %s: %s" % (cid, _one_line(exc)))
+            try:
+                code = 0
+                for args, timeout in commands:
+                    res = run(args, timeout)
+                    code = res.returncode
+                    if code != 0:
+                        break
+                status, detail = self._outcome(code, commands)
+            finally:
+                for cid in stopped:
+                    try:
+                        start_consumer(cid, self.env)
+                        note("Started %s" % cid)
+                    except Exception as exc:
+                        note("Could not start %s: %s" % (cid, _one_line(exc)))
+            if status in ("updated", "reboot_required"):
+                status, detail = self._recheck(tool_id, spec, status, detail)
+        except _Failure as exc:
+            status, detail = "failed", str(exc)
+        except Exception as exc:
+            status, detail = "failed", _one_line(exc)
+        self._finish_tool(tool_id, status, detail, lines)
+        return status
+
+    def _plan(self, spec, entry, note) -> List[Tuple[List[str], float]]:
+        """The commands that update one tool, or a _Failure."""
+        if spec is None:  # a choco package
+            package = entry["id"].split(":", 1)[1]
+            return [(["choco", "upgrade", package, "-y", "--no-progress"], SCRIPT_TIMEOUT)]
+        if spec.kind == "winget":
+            return [(list(WINGET_UPGRADE), SCRIPT_TIMEOUT)]
+        script_path = os.path.join(self.scripts_dir, spec.script or "")
+        if not spec.script or not self.env.exists(script_path):
+            raise _Failure("Install script missing: %s (run make deploy)" % script_path)
+        args = list(spec.script_args)
+        if spec.pinned:
+            args += ["-Version", str(entry.get("available") or "")]
+            if spec.id == "rizin":
+                digest = _rizin_sha256(spec, self.env, str(entry.get("available") or ""))
+                if not digest:
+                    raise _Failure("GitHub publishes no SHA-256 for this package; not installed.")
+                args += ["-PackageSha256", digest]
+        commands: List[Tuple[List[str], float]] = []
+        if spec.kind == "git":
+            commands.append((["git", "-c", "safe.directory=*", "-C", spec.path,
+                              "pull", "--ff-only", "--autostash"], GIT_PULL_TIMEOUT))
+        commands.append((self._script_call(spec.script, args), SCRIPT_TIMEOUT))
+        return commands
+
+    @staticmethod
+    def _outcome(code: int, commands) -> Tuple[str, str]:
+        if code == 0:
+            return "updated", ""
+        if code in REBOOT_CODES:
+            return "reboot_required", "Restart the VM to finish the update."
+        if code == 124:
+            return "failed", "Timed out; see the log."
+        if code == 127:
+            return "failed", "Command not found; see the log."
+        return "failed", "Exit code %d; see the log." % code
+
+    def _recheck(self, tool_id: str, spec, status: str, detail: str) -> Tuple[str, str]:
+        """The new check is the truth: a script may exit 0 and install nothing."""
+        if spec is None:
+            fresh = {e["id"]: e for e in check_choco(self.env)}
+            current = fresh.get(tool_id) or fresh.get("choco")  # "choco" = the list itself failed
+            if current is None:
+                with self._lock:
+                    old = self._entry(tool_id)
+                    old["installed"] = old.get("available")
+                return status, detail
+        else:
+            current = check_tool(spec, self.env)
+        with self._lock:
+            old = self._entry(tool_id)
+            if current["status"] in ("update_available", "pinned_update"):
+                if status == "reboot_required":
+                    return status, detail
+                return "failed", "Install finished but the tool still reports %s; see the log." % (
+                    current.get("installed") or "an old version")
+            if current["status"] == "not_installed":
+                return "failed", "Install finished but the tool is not found; see the log."
+            if current["status"] == "up_to_date":
+                old["installed"] = current["installed"]
+                old["available"] = current["available"]
+                return status, detail
+        # unknown, error, offline: no proof either way, and the install itself succeeded
+        if status == "updated":
+            detail = "Installed; could not re-check (%s)" % (current.get("detail") or current["status"])
+        return status, detail
+
+    def _finish_tool(self, tool_id: str, status: str, detail: str, lines: List[str]) -> None:
+        stamp = _now()
+        tail = lines[-LOG_LINES:]
+        formatted = ["%s [%s] %s" % (stamp, tool_id, l) for l in tail]
+        self._set(tool_id, status=status, detail=detail, log=formatted, updated_at=stamp)
+        self._append_log_file(formatted)
+        with self._lock:
+            self._persist()
+
+    def _append_log_file(self, lines: List[str]) -> None:
+        try:
+            parent = os.path.dirname(self.log_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(self.log_path, "a", encoding="utf-8") as handle:
+                handle.write("\n".join(lines) + "\n")
+        except OSError as exc:
+            logger.warning("Could not write the tool update log: %s", exc)

@@ -40,3 +40,7 @@ webui/pipe_sessions/
 # Locally built test samples (source only is committed)
 tests/samples/*.exe
 tests/samples/*.pdb
+
+# Tool update state
+webui/tool_updates_state.json
+webui/tool_updates_state.json.tmp

@@ -55,7 +55,7 @@ class FakeEnv:
         self.run_calls.append(args)
         best = None
         for prefix, result in self.commands:
-            if tuple(args[:len(prefix)]) == prefix and (best is None or len(prefix) > len(best[0])):
+            if tuple(args[:len(prefix)]) == prefix and (best is None or len(prefix) >= len(best[0])):
                 best = (prefix, result)
         if best is None:
             return RunResult(127, "", "not found: %s" % args[0])
@@ -467,3 +467,456 @@ class TestEnv:
 
         monkeypatch.setattr(tu.requests, "request", boom)
         assert tu.Env().http_get("https://api.github.com", 5).status == 0
+
+
+# ---------------------------------------------------------------------------
+# UpdateManager
+# ---------------------------------------------------------------------------
+
+import json  # noqa: E402
+
+PS = ["powershell", "-NoProfile", "-Command"]
+SCRIPT_PREFIX = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]
+
+
+def tool_entry(tool_id, status="update_available", installed="1.0.0", available="1.1.0", pinned=None, name=None):
+    spec = next((t for t in tu.CATALOG if t.id == tool_id), None)
+    return {"id": tool_id, "name": name or (spec.name if spec else tool_id.split(":")[-1]),
+            "kind": spec.kind if spec else "choco", "installed": installed, "available": available,
+            "status": status, "pinned": pinned, "detail": "", "log": [], "updated_at": None}
+
+
+class World:
+    """A FakeEnv with a script dir, plus a manager seeded with a state file."""
+
+    def __init__(self, tmp_path, entries, **manager_kwargs):
+        self.tmp = tmp_path
+        self.scripts = str(tmp_path / "scripts")
+        self.state_path = str(tmp_path / "state.json")
+        self.log_path = str(tmp_path / "logs" / "tool-updates.log")
+        self.env = FakeEnv()
+        self.running = set()
+        self.events = []
+        self.installed_done = set()
+        if entries is not None:
+            with open(self.state_path, "w") as handle:
+                json.dump({"mode": "idle", "checked_at": "2026-01-01T00:00:00Z", "tools": entries}, handle)
+        self.env.on(PS, self._powershell)
+        self.manager = None
+        self.kwargs = manager_kwargs
+
+    def build(self):
+        self.manager = tu.UpdateManager(
+            self.env, self.state_path, self.log_path, self.scripts, spawn=lambda f: f(), **self.kwargs)
+        return self.manager
+
+    def _powershell(self, args):
+        script = args[-1]
+        name = re.search(r"(?:-TaskName|-Name|\$n=) ?'([^']+)'", script)
+        name = name.group(1) if name else "?"
+        if "Stop-ScheduledTask" in script or "Stop-Service" in script:
+            self.events.append(("stop", name))
+        elif "Start-ScheduledTask" in script or "Start-Service" in script:
+            self.events.append(("start", name))
+        else:
+            key = ("task:" if "ScheduledTask" in script else "service:") + name
+            return ok("True\n" if key in self.running else "False\n")
+        return ok()
+
+    def script(self, name, result=None, effect=None):
+        path = os.path.join(self.scripts, name)
+        self.env.paths.add(path)
+
+        def handler(args):
+            self.events.append(("script", name, args[len(SCRIPT_PREFIX) + 1:]))
+            if effect:
+                effect(args)
+            return result if result is not None else ok("done\n")
+        self.env.on(SCRIPT_PREFIX + [path], handler)
+
+    def git_tool(self, path, behind_before="2"):
+        base = GIT_PREFIX + [path]
+        self.env.paths.update([path + "\\.git", path])
+        self.env.on(base + ["fetch"], ok())
+        self.env.on(base + ["rev-parse", "--short", "HEAD"], ok("abc1234\n"))
+        self.env.on(base + ["rev-parse", "--short", "@{u}"], ok("def5678\n"))
+        self.env.on(base + ["rev-list", "--count", "HEAD..@{u}"],
+                    lambda a: ok("0\n" if self.installed_done else behind_before + "\n"))
+        self.env.on(base + ["pull"], lambda a: (self.events.append(("pull", path, a[len(base):])) or ok("Updating\n")))
+
+    def kinds(self):
+        return [e[0] for e in self.events]
+
+
+def snap_tool(manager, tool_id):
+    return next(t for t in manager.snapshot()["tools"] if t["id"] == tool_id)
+
+
+def test_apply_all_skips_pinned(tmp_path):
+    w = World(tmp_path, [
+        tool_entry("capa"), tool_entry("beaconeye"),
+        tool_entry("rustinel", "pinned_update", "1.1.1", "1.2.0", pinned="1.1.1"),
+        tool_entry("process_dump", "up_to_date"),
+    ])
+    w.script("install-capa.ps1", effect=lambda a: w.installed_done.add("capa"))
+    w.script("install-beaconeye.ps1")
+    m = w.build()
+    code, body = m.start_apply("all")
+    assert (code, body) == (202, {"started": True, "tools": ["capa", "beaconeye"]})
+    assert snap_tool(m, "rustinel")["status"] == "pinned_update"
+    assert not [e for e in w.events if e[0] == "script" and "rustinel" in e[1]]
+    assert m.snapshot()["last_run"]["results"].keys() == {"capa", "beaconeye"}
+
+
+def release_world(tmp_path, tool_id, script, version_after, entries, available="1.2.0", installed="1.1.1"):
+    """A release tool whose version command reports the old version until the script ran."""
+    spec = spec_of(tool_id)
+    w = World(tmp_path, entries)
+    w.env.paths.add(spec.path)
+    w.env.on(spec.version_cmd, lambda a: ok(
+        "x %s\n" % (version_after if w.installed_done else installed)))
+    w.env.urls[("GET", "https://api.github.com/repos/%s/releases/latest" % spec.repo)] = js(
+        {"tag_name": "v" + available})
+    w.script(script, effect=lambda a: w.installed_done.add(tool_id))
+    return w
+
+
+def test_apply_pinned_needs_include_pinned(tmp_path):
+    entries = [tool_entry("rustinel", "pinned_update", "1.1.1", "1.2.0", pinned="1.1.1")]
+    w = release_world(tmp_path, "rustinel", "install-rustinel.ps1", "1.2.0", entries)
+    m = w.build()
+    code, body = m.start_apply(["rustinel"])
+    assert code == 409
+    assert body == {"error": "Rustinel is pinned to 1.1.1. Pass include_pinned to install 1.2.0."}
+    assert m.snapshot()["mode"] == "idle"
+    code, body = m.start_apply(["rustinel"], include_pinned=True)
+    assert code == 202
+    script = [e for e in w.events if e[0] == "script"]
+    assert script[0][2] == ["-Force", "-Version", "1.2.0"]
+    assert snap_tool(m, "rustinel")["status"] == "updated"
+    assert snap_tool(m, "rustinel")["installed"] == "1.2.0"
+
+
+def test_running_consumer_restarted_after_failure(tmp_path):
+    w = World(tmp_path, [tool_entry("litterbox", installed="abc1234", available="def5678")])
+    w.git_tool("C:\\LitterBox")
+    w.script("install-litterbox.ps1", result=fail("kaboom", 1))
+    w.running.add("task:LitterBox")
+    m = w.build()
+    assert m.start_apply(["litterbox"])[0] == 202
+    kinds = w.kinds()
+    assert kinds.index("stop") < kinds.index("script") < kinds.index("start")
+    assert ("stop", "LitterBox") in w.events and ("start", "LitterBox") in w.events
+    assert snap_tool(m, "litterbox")["status"] == "failed"
+    assert "Exit code 1" in snap_tool(m, "litterbox")["detail"]
+
+
+def test_consumer_not_running_is_not_started(tmp_path):
+    w = World(tmp_path, [tool_entry("detonator"), ])
+    w.git_tool("C:\\detonator")
+    w.script("install-detonator.ps1", effect=lambda a: w.installed_done.add("d"))
+    w.running.add("task:DetonatorAPI")
+    m = w.build()
+    m.start_apply(["detonator"])
+    assert ("stop", "DetonatorAPI") in w.events and ("start", "DetonatorAPI") in w.events
+    assert ("stop", "DetonatorUI") not in w.events and ("start", "DetonatorUI") not in w.events
+
+
+def test_consumers_restarted_even_when_the_script_raises(tmp_path):
+    w = World(tmp_path, [tool_entry("litterbox")])
+    w.git_tool("C:\\LitterBox")
+    w.script("install-litterbox.ps1", effect=lambda a: (_ for _ in ()).throw(RuntimeError("crash")))
+    w.running.add("task:LitterBox")
+    m = w.build()
+    m.start_apply(["litterbox"])
+    assert ("start", "LitterBox") in w.events
+    assert snap_tool(m, "litterbox")["status"] == "failed"
+    assert m.snapshot()["mode"] == "idle"
+
+
+def test_reboot_required_exit_code(tmp_path):
+    w = World(tmp_path, [tool_entry("choco:git", installed="2.40.0", available="2.41.0")])
+    w.env.on(["choco", "upgrade", "git"], RunResult(3010, "reboot", ""))
+    w.env.on(["choco", "outdated"], ok("git|2.40.0|2.41.0|false\n"))
+    m = w.build()
+    assert m.start_apply(["choco:git"])[0] == 202
+    assert snap_tool(m, "choco:git")["status"] == "reboot_required"
+    assert w.env.commands_matching("choco", "upgrade", "git", "-y", "--no-progress")
+
+
+def test_choco_success_rechecks_with_choco_outdated(tmp_path):
+    w = World(tmp_path, [tool_entry("choco:git", installed="2.40.0", available="2.41.0")])
+    w.env.on(["choco", "upgrade"], ok("upgraded"))
+    w.env.on(["choco", "outdated"], ok(""))
+    m = w.build()
+    m.start_apply("all")
+    assert snap_tool(m, "choco:git")["status"] == "updated"
+    assert snap_tool(m, "choco:git")["installed"] == "2.41.0"
+
+
+def test_preconditions_block(tmp_path):
+    w = World(tmp_path, [tool_entry("capa")])
+    w.script("install-capa.ps1")
+    m = w.build()
+    m.preconditions = lambda: "A detonation is running."
+    assert m.start_apply("all") == (409, {"error": "A detonation is running."})
+    assert w.env.run_calls == []
+    assert m.snapshot()["mode"] == "idle"
+    assert snap_tool(m, "capa")["status"] == "update_available"
+
+
+def test_busy_returns_409(tmp_path):
+    w = World(tmp_path, [tool_entry("capa")])
+    w.kwargs["spawn"] = None
+    m = tu.UpdateManager(w.env, w.state_path, w.log_path, w.scripts, spawn=lambda f: None)
+    assert m.start_check() == (202, {"started": True})
+    assert m.snapshot()["mode"] == "checking"
+    busy = (409, {"error": "An update check or install is already running."})
+    assert m.start_check() == busy
+    assert m.start_apply("all") == busy
+    assert not m.maintenance
+
+
+def test_unknown_tool_400(tmp_path):
+    w = World(tmp_path, [tool_entry("capa")])
+    m = w.build()
+    assert m.start_apply(["nope", "capa", "other"]) == (400, {"error": "Unknown tools: nope, other"})
+    assert m.snapshot()["mode"] == "idle"
+
+
+def test_nothing_to_install_409(tmp_path):
+    w = World(tmp_path, [tool_entry("capa", "up_to_date")])
+    m = w.build()
+    assert m.start_apply("all") == (409, {"error": "No updates to install."})
+    assert m.start_apply([]) == (409, {"error": "No updates to install."})
+
+
+def test_maintenance_flag_during_run(tmp_path):
+    w = World(tmp_path, [tool_entry("capa")])
+    seen = []
+    m = w.build()
+    w.script("install-capa.ps1", effect=lambda a: seen.append((m.maintenance, m.snapshot()["mode"],
+                                                              m.snapshot()["progress"]["current"],
+                                                              snap_tool(m, "capa")["status"])))
+    assert not m.maintenance
+    m.start_apply("all")
+    assert seen == [(True, "updating", "capa", "updating")]
+    assert not m.maintenance
+
+
+def test_interrupted_state_recovered(tmp_path):
+    w = World(tmp_path, None)
+    with open(w.state_path, "w") as handle:
+        json.dump({"mode": "updating", "checked_at": "2026-01-01T00:00:00Z",
+                   "queued_prev": {"beaconeye": "update_available"},
+                   "tools": [tool_entry("capa", "updating"), tool_entry("beaconeye", "queued"),
+                             tool_entry("process_dump", "queued")]}, handle)
+    m = w.build()
+    snap = m.snapshot()
+    assert snap["mode"] == "idle" and not m.maintenance
+    assert snap_tool(m, "capa")["status"] == "failed"
+    assert snap_tool(m, "capa")["detail"] == "Interrupted: the web UI restarted during the update."
+    assert snap_tool(m, "beaconeye")["status"] == "update_available"
+    assert snap_tool(m, "process_dump")["status"] == "unknown"
+    with open(w.state_path) as handle:
+        assert json.load(handle)["mode"] == "idle"
+    assert tu.UpdateManager(w.env, w.state_path, w.log_path, w.scripts).snapshot()["mode"] == "idle"
+
+
+def test_checking_state_becomes_idle_and_garbage_state_is_ignored(tmp_path):
+    w = World(tmp_path, None)
+    with open(w.state_path, "w") as handle:
+        json.dump({"mode": "checking", "tools": []}, handle)
+    assert w.build().snapshot()["mode"] == "idle"
+    with open(w.state_path, "w") as handle:
+        handle.write("{broken")
+    assert w.build().snapshot()["tools"] == []
+
+
+def test_git_update_pulls_with_autostash_then_runs_script(tmp_path):
+    w = World(tmp_path, [tool_entry("litterbox", installed="abc1234", available="def5678")])
+    w.git_tool("C:\\LitterBox")
+    w.script("install-litterbox.ps1", effect=lambda a: w.installed_done.add("x"))
+    m = w.build()
+    m.start_apply(["litterbox"])
+    assert w.kinds() == ["pull", "script"]
+    assert w.events[0][2] == ["pull", "--ff-only", "--autostash"]
+    assert snap_tool(m, "litterbox")["status"] == "updated"
+
+
+def test_failed_pull_skips_the_script(tmp_path):
+    w = World(tmp_path, [tool_entry("litterbox")])
+    w.git_tool("C:\\LitterBox")
+    w.script("install-litterbox.ps1")
+    w.env.on(GIT_PREFIX + ["C:\\LitterBox", "pull"], fail("not fast-forward", 1))
+    m = w.build()
+    m.start_apply(["litterbox"])
+    assert "script" not in w.kinds()
+    assert snap_tool(m, "litterbox")["status"] == "failed"
+
+
+def rizin_entry():
+    return tool_entry("rizin", "pinned_update", "2.5.0", "2.6.0", pinned="2.5.0")
+
+
+def test_rizin_without_digest_fails_and_closes_sessions(tmp_path):
+    closed = []
+    w = World(tmp_path, [rizin_entry()], close_rizin=lambda: closed.append(1))
+    w.script("install-rizin.ps1")
+    w.env.urls[("GET", "https://api.github.com/repos/rizinorg/cutter/releases/latest")] = js(
+        {"tag_name": "v2.6.0", "assets": [{"name": "Cutter-v2.6.0-Windows-x86_64.zip"}]})
+    m = w.build()
+    assert m.start_apply(["rizin"], include_pinned=True)[0] == 202
+    assert closed == [1]
+    assert snap_tool(m, "rizin")["status"] == "failed"
+    assert snap_tool(m, "rizin")["detail"] == "GitHub publishes no SHA-256 for this package; not installed."
+    assert "script" not in w.kinds()
+
+
+def test_rizin_passes_version_and_digest(tmp_path):
+    w = World(tmp_path, [rizin_entry()])
+    w.script("install-rizin.ps1", effect=lambda a: w.installed_done.add("r"))
+    spec = spec_of("rizin")
+    w.env.paths.add(spec.path)
+    w.env.on(["C:\\tools\\cutter\\never"], ok())
+    w.env.files[spec.marker] = "Cutter-v2.5.0-Windows-x86_64.zip sha256:" + "ab" * 32
+
+    def new_marker(a):
+        w.env.files[spec.marker] = "Cutter-v2.6.0-Windows-x86_64.zip sha256:" + "cd" * 32
+        w.installed_done.add("r")
+    w.script("install-rizin.ps1", effect=new_marker)
+    w.env.urls[("GET", "https://api.github.com/repos/rizinorg/cutter/releases/latest")] = js(
+        {"tag_name": "v2.6.0", "assets": [
+            {"name": "Cutter-v2.6.0-Windows-x86_64.zip", "digest": "sha256:" + "CD" * 32}]})
+    m = w.build()
+    m.start_apply(["rizin"], include_pinned=True)
+    script = [e for e in w.events if e[0] == "script"][0]
+    assert script[2] == ["-Version", "2.6.0", "-PackageSha256", "cd" * 32]
+    assert snap_tool(m, "rizin")["status"] == "updated"
+
+
+def test_exit_zero_without_effect_is_failed(tmp_path):
+    w = World(tmp_path, [tool_entry("litterbox", installed="abc1234", available="def5678")])
+    w.git_tool("C:\\LitterBox")
+    w.script("install-litterbox.ps1")  # exits 0, installs nothing
+    m = w.build()
+    m.start_apply(["litterbox"])
+    tool = snap_tool(m, "litterbox")
+    assert tool["status"] == "failed"
+    assert tool["detail"] == "Install finished but the tool still reports abc1234; see the log."
+
+
+def test_installed_tool_missing_after_the_run_is_failed(tmp_path):
+    w = World(tmp_path, [tool_entry("capa")])
+    w.script("install-capa.ps1")
+    m = w.build()
+    m.start_apply("all")
+    assert snap_tool(m, "capa")["status"] == "failed"
+    assert snap_tool(m, "capa")["detail"] == "Install finished but the tool is not found; see the log."
+
+
+def test_missing_script_fails_cleanly(tmp_path):
+    w = World(tmp_path, [tool_entry("capa"), tool_entry("beaconeye")])
+    w.script("install-beaconeye.ps1", effect=lambda a: w.installed_done.add("b"))
+    w.running.add("task:LitterBox")
+    m = w.build()
+    m.start_apply("all")
+    path = os.path.join(w.scripts, "install-capa.ps1")
+    assert snap_tool(m, "capa")["status"] == "failed"
+    assert snap_tool(m, "capa")["detail"] == "Install script missing: %s (run make deploy)" % path
+    assert m.snapshot()["last_run"]["results"]["capa"] == "failed"
+    assert "beaconeye" in m.snapshot()["last_run"]["results"]
+    assert m.snapshot()["mode"] == "idle"
+
+
+def test_python312_runs_last(tmp_path):
+    w = World(tmp_path, [
+        tool_entry("choco:python312", installed="3.12.1", available="3.12.2"),
+        tool_entry("choco:git", installed="2.40.0", available="2.41.0"),
+        tool_entry("capa"),
+    ])
+    w.script("install-capa.ps1")
+    w.env.on(["choco", "upgrade"], ok())
+    w.env.on(["choco", "outdated"], ok(""))
+    w.running.update(["task:LitterBox", "task:DetonatorAPI"])
+    m = w.build()
+    code, body = m.start_apply("all")
+    assert body["tools"] == ["capa", "choco:git", "choco:python312"]
+    order = [c for c in w.env.run_calls if c[:2] == ["choco", "upgrade"] or c[:5] == SCRIPT_PREFIX]
+    assert [c[2] if c[0] == "choco" else "capa" for c in order] == ["capa", "git", "python312"]
+    stops = [e[1] for e in w.events if e[0] == "stop"]
+    assert stops == ["LitterBox", "DetonatorAPI"]
+    assert [e[1] for e in w.events if e[0] == "start"] == ["LitterBox", "DetonatorAPI"]
+
+
+def test_log_is_capped_and_written_to_file(tmp_path):
+    w = World(tmp_path, [tool_entry("capa")])
+    w.script("install-capa.ps1", result=ok("\n".join("line %d" % i for i in range(500))))
+    m = w.build()
+    m.start_apply("all")
+    log = snap_tool(m, "capa")["log"]
+    assert len(log) == 200
+    assert log[-1].endswith("[capa] line 499")
+    assert re.match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ \[capa\] ", log[0])
+    with open(w.log_path) as handle:
+        assert handle.read().splitlines() == log
+    assert snap_tool(m, "capa")["updated_at"]
+
+
+def test_state_written_atomically(tmp_path):
+    w = World(tmp_path, [tool_entry("capa")])
+    w.script("install-capa.ps1")
+    w.env.paths.add(spec_of("capa").path)
+    m = w.build()
+    m.start_apply("all")
+    assert not os.path.exists(w.state_path + ".tmp")
+    with open(w.state_path) as handle:
+        data = json.load(handle)
+    assert data["mode"] == "idle"
+    assert data["last_run"]["results"] == {"capa": "updated"}
+    assert data["tools"][0]["detail"].startswith("Installed; could not re-check")
+
+
+def test_check_keeps_log_and_updated_at_and_sets_checked_at(tmp_path):
+    spec = spec_of("litterbox")
+    previous = tool_entry("litterbox", "failed")
+    previous.update(log=["a line"], updated_at="2026-01-02T00:00:00Z")
+    w = World(tmp_path, [previous])
+    w.git_tool(spec.path, behind_before="1")
+    m = w.build()
+    assert m.start_check() == (202, {"started": True})
+    snap = m.snapshot()
+    assert snap["mode"] == "idle"
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", snap["checked_at"])
+    tool = snap_tool(m, "litterbox")
+    assert tool["status"] == "update_available"
+    assert tool["log"] == ["a line"] and tool["updated_at"] == "2026-01-02T00:00:00Z"
+
+
+def test_snapshot_is_a_deep_copy(tmp_path):
+    w = World(tmp_path, [tool_entry("capa")])
+    m = w.build()
+    snap = m.snapshot()
+    snap["tools"][0]["status"] = "hacked"
+    assert snap_tool(m, "capa")["status"] == "update_available"
+    assert set(snap) == {"mode", "checked_at", "tools", "progress", "last_run"}
+
+
+def test_consumer_helpers_quote_names_and_use_powershell():
+    env = FakeEnv()
+    seen = []
+    env.on(PS, lambda a: (seen.append(a[-1]) or ok("True\n")))
+    assert tu.consumer_running("task:Lit'ter", env) is True
+    assert "'Lit''ter'" in seen[-1] and "Get-ScheduledTask" in seen[-1]
+    assert tu.consumer_running("service:fibratus", env) is True
+    assert "Get-Service" in seen[-1]
+    tu.stop_consumer("service:fibratus", env)
+    assert "Stop-Service -Name 'fibratus' -Force" in seen[-1]
+    tu.stop_consumer("task:LitterBox", env)
+    assert "Stop-ScheduledTask" in seen[-1] and "Stop-Process" in seen[-1]
+    tu.start_consumer("task:LitterBox", env)
+    assert "Start-ScheduledTask -TaskName 'LitterBox'" in seen[-1]
+    env.on(PS, fail("access denied"))
+    with pytest.raises(RuntimeError):
+        tu.stop_consumer("service:fibratus", env)
+    assert tu.consumer_running("service:fibratus", env) is False
