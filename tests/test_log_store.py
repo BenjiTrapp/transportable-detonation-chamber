@@ -321,6 +321,31 @@ def test_netflow_key_ignores_source_port_but_not_src_ip():
     assert sorted(f["fields"]["count"] for f in flows) == [1, 2]
 
 
+def test_netflow_ignores_sysmon_dash_placeholders():
+    flows = ls.netflows_from_sysmon([
+        conn("2026-11-14T11:00:01+01:00", image="C:\\Windows\\System32\\cmd.exe", dst="192.168.64.1",
+             port="8766", host="-"),
+        conn("2026-11-14T11:00:02+01:00", image="C:\\Windows\\System32\\cmd.exe", dst="192.168.64.1",
+             port="8766", host="  "),
+        conn("2026-11-14T11:00:03+01:00", image="-", dst="-", port="53", host="-", src="-"),
+    ])
+    cmd = next(f for f in flows if f["fields"]["dst_port"] == 8766)
+    assert cmd["fields"]["dst_hostname"] is None and cmd["fields"]["dst_ip"] == "192.168.64.1"
+    assert cmd["fields"]["count"] == 2
+    assert cmd["message"] == "C:\\Windows\\System32\\cmd.exe \u2192 192.168.64.1:8766 (2\u00d7)"
+    blank = next(f for f in flows if f["fields"]["dst_port"] == 53)
+    assert blank["fields"]["image"] == "" and blank["fields"]["src_ip"] == "" and blank["fields"]["dst_ip"] == ""
+    assert blank["fields"]["dst_hostname"] is None
+    assert "-" not in blank["message"]
+
+
+def test_dns_ignores_sysmon_dash_placeholders():
+    dns = ls.dns_from_sysmon([{"timestamp": "2026-11-14T11:00:01+01:00", "event_id": 22, "pid": "7",
+                               "image": "-", "query": "nx.example", "result": "-"}])
+    assert dns[0]["message"] == "nx.example" and dns[0]["fields"]["image"] == ""
+    assert dns[0]["fields"]["result"] == ""
+
+
 def test_dns_events_from_sysmon():
     events = [
         {"timestamp": "2026-11-14T11:00:02+01:00", "event_id": 22, "pid": "4242", "image": "C:\\x\\a.exe",

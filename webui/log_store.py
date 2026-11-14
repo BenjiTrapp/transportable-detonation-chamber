@@ -531,6 +531,12 @@ def _is_event(ev: Any, eid: int) -> bool:
     return isinstance(ev, dict) and ev.get("event_id") == eid and not ev.get("error")
 
 
+def _sysmon_str(value: Any) -> str:
+    """A Sysmon string value; Sysmon's "-" placeholder and blanks mean unknown (empty string)."""
+    text = "" if value is None else str(value).strip()
+    return "" if text == "-" else text
+
+
 def netflows_from_sysmon(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Bundle Sysmon EID 3 events into flows per (image, pid, protocol, src_ip, dst_ip, dst_port).
 
@@ -544,24 +550,24 @@ def netflows_from_sysmon(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         epoch = _sysmon_epoch(ev.get("timestamp"))
         if epoch is None:
             continue
-        key = (ev.get("image", ""), str(ev.get("pid") or ""), ev.get("protocol", ""), ev.get("src_ip", ""),
-               ev.get("dst_ip", ""), str(ev.get("dst_port", "")))
+        key = (_sysmon_str(ev.get("image")), str(ev.get("pid") or ""), ev.get("protocol", ""),
+               _sysmon_str(ev.get("src_ip")), _sysmon_str(ev.get("dst_ip")), str(ev.get("dst_port", "")))
         flow = flows.get(key)
         if flow is None:
             flows[key] = {"key": key, "count": 1, "first": epoch, "last": epoch,
-                          "dst_hostname": ev.get("dst_hostname", "") or ""}
+                          "dst_hostname": _sysmon_str(ev.get("dst_hostname"))}
             continue
         flow["count"] += 1
         flow["first"] = min(flow["first"], epoch)
         flow["last"] = max(flow["last"], epoch)
         if not flow["dst_hostname"]:
-            flow["dst_hostname"] = ev.get("dst_hostname", "") or ""
+            flow["dst_hostname"] = _sysmon_str(ev.get("dst_hostname"))
     out: List[Dict[str, Any]] = []
     for flow in sorted(flows.values(), key=lambda f: f["last"]):
         image, pid, protocol, src_ip, dst_ip, dst_port = flow["key"]
         port = _to_int(dst_port)
         fields = {"image": image, "pid": _to_int(pid), "protocol": protocol, "src_ip": src_ip, "dst_ip": dst_ip,
-                  "dst_port": port if port is not None else dst_port, "dst_hostname": flow["dst_hostname"],
+                  "dst_port": port if port is not None else dst_port, "dst_hostname": flow["dst_hostname"] or None,
                   "count": flow["count"], "first_seen": _iso(flow["first"]), "last_seen": _iso(flow["last"])}
         target = f"{flow['dst_hostname'] or dst_ip}:{dst_port}"
         out.append({"time": fields["last_seen"], "source": "netflow",
@@ -578,8 +584,8 @@ def dns_from_sysmon(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         epoch = _sysmon_epoch(ev.get("timestamp"))
         if epoch is None:
             continue
-        query, result = ev.get("query", "") or "", ev.get("result", "") or ""
-        fields = {"query": query, "result": result, "image": ev.get("image", ""),
+        query, result = _sysmon_str(ev.get("query")), _sysmon_str(ev.get("result"))
+        fields = {"query": query, "result": result, "image": _sysmon_str(ev.get("image")),
                   "pid": _to_int(ev.get("pid")), "status": ev.get("status")}
         message = f"{query} -> {result}" if result else query
         out.append((epoch, {"time": _iso(epoch), "source": "dns", "message": message, "fields": fields}))
