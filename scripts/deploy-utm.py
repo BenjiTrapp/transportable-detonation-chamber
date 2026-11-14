@@ -56,9 +56,11 @@ FILES = {
 
 # The install scripts the tool updates re-run, kept next to the provisioning copy
 SCRIPTS_REMOTE_DIR = r"C:\tdc\scripts"
+# (plus configure-logging.ps1, which an existing VM runs once to turn on the logs of the LOGS tab)
 SCRIPT_FILES = {
     f"scripts/{os.path.basename(path)}": SCRIPTS_REMOTE_DIR + "\\" + os.path.basename(path)
-    for path in sorted(glob.glob(os.path.join(REPO, "scripts", "install-*.ps1")))
+    for path in sorted(glob.glob(os.path.join(REPO, "scripts", "install-*.ps1"))
+                       + [os.path.join(REPO, "scripts", "configure-logging.ps1")])
 }
 
 RESTART_PS = (

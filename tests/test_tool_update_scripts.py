@@ -160,3 +160,44 @@ def test_sysmon_force_keeps_the_existing_config_when_the_download_fails():
     # the minimal config is the fallback of the else branch only
     assert section.index("keeping the existing") < section.index("$minimalConfig = @\"")
     assert re.search(r"\} else \{\s*\n\s*Write-Host \"\[!\] Config download failed, using minimal config", section)
+
+
+def test_logging_script_enables_the_log_sources():
+    script = _read("scripts", "configure-logging.ps1")
+    assert "EnableScriptBlockLogging" in script and "EnableModuleLogging" in script
+    assert "HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell" in script
+    assert "ScriptBlockLogging" in script and "ModuleLogging" in script
+    assert re.search(r"ModuleNames", script)
+    assert "wevtutil sl Microsoft-Windows-PowerShell/Operational /ms:268435456" in script
+    assert "-LogAllowed True" in script and "-LogBlocked True" in script
+    assert "-LogMaxSizeKilobytes 32767" in script
+    assert "%SystemRoot%\\System32\\LogFiles\\Firewall\\pfirewall.log" in script
+    assert "exit 0" in script
+
+
+def test_logging_script_is_provisioned_before_the_services():
+    for name in ("Vagrantfile", "Vagrantfile.utm"):
+        text = _read(name)
+        assert 'path: "scripts/configure-logging.ps1"' in text, name
+        assert text.index("configure-logging.ps1") < text.index("configure-services.ps1"), name
+    setup = _read("scripts", "setup-macos-utm.sh")
+    assert setup.index('"configure-logging.ps1"') < setup.index('"configure-services.ps1"')
+
+
+def test_logging_script_reaches_an_existing_vm_through_every_deploy_path():
+    assert "configure-logging.ps1" in _read("scripts", "deploy-utm.py")
+    assert "configure-logging.ps1" in _read("Makefile")
+    assert "configure-logging.ps1" in _read("make.ps1")
+
+
+def test_logging_script_parses():
+    import shutil
+    import subprocess
+    pwsh = shutil.which("pwsh") or ("/opt/homebrew/bin/pwsh" if os.path.exists("/opt/homebrew/bin/pwsh") else None)
+    if not pwsh:
+        pytest.skip("pwsh not installed")
+    path = os.path.join(ROOT, "scripts", "configure-logging.ps1")
+    cmd = ("$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile("
+           f"'{path}', [ref]$null, [ref]$e); if ($e) {{ $e | ForEach-Object {{ $_.Message }}; exit 1 }}")
+    proc = subprocess.run([pwsh, "-NoProfile", "-Command", cmd], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stdout + proc.stderr

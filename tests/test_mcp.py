@@ -250,3 +250,93 @@ def test_every_tool_has_a_docstring_with_its_arguments():
         assert doc, f"{tool.__name__} has no docstring"
         for param in inspect.signature(tool).parameters:
             assert param in doc, f"{tool.__name__}: argument '{param}' not documented"
+
+
+class _FakeResponse:
+    is_error = False
+    status_code = 200
+    text = "{}"
+
+    def __init__(self, body):
+        self._body = body
+
+    def json(self):
+        return self._body
+
+
+def _record_httpx(monkeypatch, body):
+    sent = []
+
+    def fake(*args, **kwargs):
+        sent.append({"args": args, **kwargs})
+        return _FakeResponse(body)
+
+    for name in ("get", "post", "request"):
+        monkeypatch.setattr(server.httpx, name, fake)
+    return sent
+
+
+def test_requests_carry_the_mcp_headers_and_the_tool_name(monkeypatch):
+    sent = _record_httpx(monkeypatch, {"sysmon": {"online": True}})
+    server.tdc_status()
+    assert sent[0]["headers"]["X-TDC-Client"] == "mcp"
+    assert sent[0]["headers"]["X-TDC-MCP-Tool"] == "tdc_status"
+
+
+def test_post_and_call_helpers_carry_the_headers_too(monkeypatch):
+    sent = _record_httpx(monkeypatch, {"ok": True})
+    server.tdc_service_launch("sysmon")                    # _post
+    server.tdc_updates_check()                             # _call
+    assert [s["headers"]["X-TDC-MCP-Tool"] for s in sent] == ["tdc_service_launch", "tdc_updates_check"]
+    assert all(s["headers"]["X-TDC-Client"] == "mcp" for s in sent)
+
+
+def test_every_registered_tool_sets_its_own_name():
+    seen = {}
+
+    def spy(*a, **k):
+        seen["tool"] = server._current_tool.get()
+        raise RuntimeError("stop")
+
+    names = [n for n in dir(server) if n.startswith("tdc_")]
+    assert len(names) >= 47
+    original = server._get, server._post, server._call
+    server._get = server._post = server._call = spy
+    try:
+        for name in names:
+            fn = getattr(server, name)
+            import inspect
+            args = {p.name: "1" for p in inspect.signature(fn).parameters.values()
+                    if p.default is inspect.Parameter.empty}
+            seen.clear()
+            try:
+                fn(**args)
+            except Exception:
+                pass
+            assert seen.get("tool") in (name, None), name
+    finally:
+        server._get, server._post, server._call = original
+    assert server._current_tool.get() == ""
+
+
+def test_logs_search_sends_the_query_and_the_headers(monkeypatch):
+    sent = _record_httpx(monkeypatch, {
+        "type": "events", "count": 2, "matched": 2, "truncated": False, "took_ms": 3,
+        "events": [{"time": "2026-11-14T10:00:00Z", "source": "dns", "message": "evil.example -> 1.2.3.4"},
+                   {"time": "2026-11-14T09:00:00Z", "source": "mcp", "message": "tdc_status \u2192 GET /api/status (200)"}]})
+    out = server.tdc_logs_search(query="source=dns", earliest="-1h", limit=50)
+    call = sent[0]
+    assert call["args"][0] == "GET" and call["args"][1].endswith("/api/logs/search")
+    assert call["params"] == {"q": "source=dns", "earliest": "-1h", "limit": 50}
+    assert call["headers"]["X-TDC-MCP-Tool"] == "tdc_logs_search"
+    assert "2 events" in out and "evil.example -> 1.2.3.4" in out and "dns" in out
+
+
+def test_logs_search_formats_a_table_and_errors(monkeypatch):
+    _record_httpx(monkeypatch, {"type": "table", "count": 2, "matched": 9, "truncated": False, "events": [],
+                                "columns": ["source", "count"], "rows": [["dns", 5], ["mcp", 4]]})
+    out = server.tdc_logs_search("* | stats count by source")
+    assert "source" in out and "dns" in out and "5" in out and "2 rows" in out
+    monkeypatch.setattr(server, "_call", lambda *a, **k: {"error": "Unknown command bogus", "pos": 9})
+    out = server.tdc_logs_search("x | bogus")
+    assert out.startswith("Search error: Unknown command bogus") and "9" in out

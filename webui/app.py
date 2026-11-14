@@ -43,6 +43,9 @@ import minidump_analysis
 import rizin_sessions
 # Tool update checks and installs (Tool Updates section of the dashboard).
 import tool_updates
+# LOGS tab: event store, source parsers and the search language.
+import log_search
+import log_store
 
 app = Flask(__name__)
 
@@ -81,6 +84,79 @@ def _host_allowed(host):
         return True
     except ValueError:
         return False
+
+
+# --- LOGS tab: capture of every request ---------------------------------
+# One "access" event per response (and an "mcp" event when the MCP server made
+# the request). Registered before the checks below so a request they refuse is
+# timed and logged too; it returns nothing, so their order does not change.
+LOG_DIR = os.environ.get("TDC_LOG_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+_log_logger = logging.getLogger("tdc.logs")
+_default_log_store = log_store.LogStore(persist_dir=LOG_DIR)
+_logs = _default_log_store
+try:
+    _logs.load_persisted()
+except Exception as _exc:   # a damaged log file must not stop the web UI
+    _log_logger.warning("could not read the persisted logs: %s", _exc)
+
+_NOT_LOGGED_PREFIXES = ("/static/", "/favicon")
+_POLL_PREFIXES = ("/api/logs/", "/api/status", "/api/updates", "/api/alerts", "/api/health")
+_LOG_TEXT_LIMIT = 2000
+
+
+def set_log_store(store):
+    """Use ``store`` for the LOGS tab (tests); ``None`` goes back to the default one."""
+    global _logs
+    _logs = store if store is not None else _default_log_store
+
+
+def _log_now():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+@app.before_request
+def _log_request_start():
+    g._log_started = time.perf_counter()
+    return None
+
+
+def _log_request_client(headers):
+    if headers.get("X-TDC-Client") == "mcp":
+        return "mcp"
+    return "browser" if "Mozilla" in (headers.get("User-Agent") or "") else "other"
+
+
+def _log_request(resp):
+    path = request.path
+    if path.startswith(_NOT_LOGGED_PREFIXES):
+        return
+    started = g.get("_log_started")
+    duration = round((time.perf_counter() - started) * 1000, 1) if started is not None else 0.0
+    client_kind = _log_request_client(request.headers)
+    query = request.query_string.decode("utf-8", "replace")[:_LOG_TEXT_LIMIT]
+    fields = {
+        "method": request.method, "path": path[:_LOG_TEXT_LIMIT], "query": query, "status": resp.status_code,
+        "duration_ms": duration, "remote_addr": request.remote_addr or "",
+        "user_agent": (request.headers.get("User-Agent") or "")[:500], "client": client_kind,
+        "poll": request.method == "GET" and path.startswith(_POLL_PREFIXES),
+    }
+    now = _log_now()
+    store = _logs
+    store.add("access", now, f"{request.method} {path} ({resp.status_code}, {duration:g} ms)", fields)
+    if client_kind == "mcp":
+        tool = (request.headers.get("X-TDC-MCP-Tool") or "unknown")[:100]
+        store.add("mcp", now, f"{tool} \u2192 {request.method} {path} ({resp.status_code})",
+                  {"tool": tool, "method": request.method, "path": fields["path"], "status": resp.status_code,
+                   "duration_ms": duration})
+
+
+@app.after_request
+def _log_response(resp):
+    try:
+        _log_request(resp)
+    except Exception:   # logging must never change a response
+        _log_logger.debug("request logging failed", exc_info=True)
+    return resp
 
 
 @app.before_request
@@ -3667,6 +3743,8 @@ def _read_sysmon_events(max_events=100, since=None, pid=None, event_id=None, eve
             event["dst_port"] = item.get("DestinationPort", "")
             event["dst_hostname"] = item.get("DestinationHostname", "")
             event["protocol"] = item.get("Protocol", "")
+            event["src_ip"] = item.get("SourceIp", "")
+            event["src_port"] = item.get("SourcePort", "")
         elif eid == 5:  # ProcessTerminate
             event["type"] = "ProcessTerminate"
         elif eid == 11:  # FileCreate
@@ -3680,6 +3758,7 @@ def _read_sysmon_events(max_events=100, since=None, pid=None, event_id=None, eve
             event["type"] = "DNSQuery"
             event["query"] = item.get("QueryName", "")
             event["result"] = item.get("QueryResults", "")
+            event["status"] = item.get("QueryStatus", "")
         elif eid == 7:  # ImageLoad
             event["type"] = "ImageLoad"
             event["loaded_image"] = item.get("ImageLoaded", "")
@@ -10527,6 +10606,194 @@ def _start_update_check_thread():
     return thread
 
 
+# --- LOGS tab: sources, search and the collector -----------------------
+_IS_WINDOWS = sys.platform == "win32"
+_WINDOWS_ONLY_HINT = "Windows event logs are only available on the VM."
+POWERSHELL_LOG = "Microsoft-Windows-PowerShell/Operational"
+_PS_EVENT_IDS = "(EventID=4103 or EventID=4104 or EventID=4100)"
+_RECORD_ID = re.compile(r"<EventRecordID>(\d+)</EventRecordID>")
+LOG_POLL_SECONDS = 10
+LOG_READ_LIMIT = 5000
+FIREWALL_LOG = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                            "System32", "LogFiles", "Firewall", "pfirewall.log")
+FIREWALL_FIRST_READ_BYTES = 4 * 1024 * 1024
+FIREWALL_READ_BYTES = 8 * 1024 * 1024
+FIREWALL_HEADER_BYTES = 8192
+FIREWALL_MAX_LINE = 65536
+FIREWALL_OFF_HINT = "Firewall is off; no packets are logged."
+FIREWALL_MISSING_HINT = ("The firewall log does not exist yet; run scripts/configure-logging.ps1 "
+                         "to log allowed and blocked packets.")
+_firewall_off_cache = (0.0, False)
+_firewall_off_lock = threading.Lock()
+
+
+def _read_powershell_log(since_record_id):
+    """The PowerShell events (4100, 4103, 4104) of the operational log; see log_store.Collector."""
+    if not _IS_WINDOWS:
+        raise RuntimeError(_WINDOWS_ONLY_HINT)
+    if since_record_id is None:
+        # first read: the newest events of the last 24 h
+        query = f"*[System[{_PS_EVENT_IDS} and TimeCreated[timediff(@SystemTime) <= 86400000]]]"
+        newest_first = True
+    else:
+        query = f"*[System[{_PS_EVENT_IDS} and EventRecordID>{int(since_record_id)}]]"
+        newest_first = False       # oldest first: a cut-off count never skips events
+    raw, proc = _wevtutil_query(POWERSHELL_LOG, query, count=LOG_READ_LIMIT, newest_first=newest_first,
+                                timeout=60)
+    if proc.returncode != 0 and not proc.stdout:
+        msg = _decode_console(proc.stderr).strip()
+        raise RuntimeError(msg.splitlines()[0] if msg else f"wevtutil failed ({proc.returncode})")
+    ids = [int(m) for m in _RECORD_ID.findall(raw or "")]
+    return raw or "", max(ids) if ids else since_record_id
+
+
+def _read_sysmon_for_logs(event_ids, since_iso):
+    if not _IS_WINDOWS:
+        raise RuntimeError(_WINDOWS_ONLY_HINT)
+    return _read_sysmon_events(event_ids=list(event_ids), since=since_iso, max_events=LOG_READ_LIMIT)
+
+
+def _firewall_is_off():
+    """True when the Windows Firewall is off in every profile (registry, cached for a minute)."""
+    global _firewall_off_cache
+    with _firewall_off_lock:
+        stamp, value = _firewall_off_cache
+        if time.time() - stamp < 60:
+            return value
+    off = False
+    try:
+        import winreg
+        base = r"SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy"
+        states = []
+        for profile in ("DomainProfile", "StandardProfile", "PublicProfile"):
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base + "\\" + profile) as key:
+                states.append(int(winreg.QueryValueEx(key, "EnableFirewall")[0]))
+        off = bool(states) and not any(states)
+    except Exception:
+        off = False
+    with _firewall_off_lock:
+        _firewall_off_cache = (time.time(), off)
+    return off
+
+
+def _whole_lines(data, at_eof_limit=FIREWALL_MAX_LINE):
+    """The bytes of ``data`` up to its last newline (all of it for an overlong unfinished line)."""
+    cut = data.rfind(b"\n") + 1
+    if cut == 0 and len(data) >= at_eof_limit:
+        return data
+    return data[:cut]
+
+
+def _read_firewall_log(offset):
+    """New text of the Windows Firewall log: ``(text, new_offset, hint)``; see log_store.Collector.
+
+    Only complete lines are returned; the first read takes the header and the
+    end of the file, because the collector only keeps the last 24 h anyway.
+    """
+    if not _IS_WINDOWS:
+        raise RuntimeError(_WINDOWS_ONLY_HINT)
+    try:
+        size = os.path.getsize(FIREWALL_LOG)
+    except OSError:
+        return "", None, (FIREWALL_OFF_HINT if _firewall_is_off() else FIREWALL_MISSING_HINT)
+    header = b""
+    with open(FIREWALL_LOG, "rb") as f:
+        if offset is None:
+            start = max(0, size - FIREWALL_FIRST_READ_BYTES)
+            if start > 0:
+                head = f.read(FIREWALL_HEADER_BYTES)
+                header = b"".join(line for line in head.splitlines(keepends=True)
+                                  if line.startswith(b"#") and line.endswith(b"\n"))
+        else:
+            start = offset if 0 <= offset <= size else 0       # a smaller file was rotated
+        limit = FIREWALL_READ_BYTES
+        f.seek(start)
+        data = f.read(min(limit, max(0, size - start)))
+        skipped = 0
+        if offset is None and start > 0:
+            nl = data.find(b"\n")
+            skipped = nl + 1 if nl >= 0 else len(data)           # the cut-off start of a line
+            data = data[skipped:]
+    data = _whole_lines(data)
+    new_offset = start + (skipped if offset is None else 0) + len(data)
+    return (header + data).decode("utf-8", errors="replace"), new_offset, ""
+
+
+def make_log_collector(store):
+    """A ``Collector`` for ``store`` reading the real Windows sources."""
+    return log_store.Collector(
+        store, _read_powershell_log, _read_sysmon_for_logs, _read_firewall_log,
+        now=lambda: datetime.datetime.now(datetime.timezone.utc))
+
+
+def _log_collector_loop(collector, seconds=LOG_POLL_SECONDS, rounds=None, sleep=time.sleep):
+    done = 0
+    while rounds is None or done < rounds:
+        done += 1
+        try:
+            collector.tick()
+        except Exception:
+            _log_logger.exception("log collector tick failed")
+        sleep(seconds)
+
+
+def _start_log_collector_thread():
+    # one thread only: Collector.tick is not thread-safe
+    thread = threading.Thread(target=_log_collector_loop, args=(make_log_collector(_logs),),
+                              name="log-collector", daemon=True)
+    thread.start()
+    return thread
+
+
+def _json_safe(value):
+    """``value`` with NaN and infinity replaced by None (JSON cannot carry them)."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+def _json_response(payload, status=200):
+    try:
+        body = json.dumps(payload, allow_nan=False)
+    except ValueError:
+        body = json.dumps(_json_safe(payload), allow_nan=False)
+    return app.response_class(body, status=status, mimetype="application/json")
+
+
+@app.route("/api/logs/search")
+def api_logs_search():
+    """Search the LOGS store: ?q= (default *), earliest (default -24h), latest, limit (1-1000, default 200)."""
+    query = request.args.get("q", "*")
+    if not query.strip():
+        query = "*"
+    earliest = request.args.get("earliest")
+    earliest = "-24h" if earliest is None else (earliest.strip() or None)
+    latest = (request.args.get("latest") or "").strip() or None
+    limit = request.args.get("limit", 200, type=int)
+    limit = max(1, min(200 if limit is None else limit, 1000))
+    started = time.perf_counter()
+    try:
+        result = log_search.run(query, _logs.snapshot(), datetime.datetime.now(datetime.timezone.utc),
+                                earliest=earliest, latest=latest, max_rows=limit)
+    except log_search.SearchError as e:
+        return jsonify({"error": str(e), "pos": e.pos}), 400
+    except Exception:
+        _log_logger.exception("log search failed: %r", query[:200])
+        return jsonify({"error": "The search failed; see the web UI log."}), 500
+    result["took_ms"] = round((time.perf_counter() - started) * 1000, 1)
+    return _json_response(result)
+
+
+@app.route("/api/logs/sources")
+def api_logs_sources():
+    """The six log sources with event count, last event time, status and hint."""
+    return _json_response(_logs.sources())
+
+
 # --- Main ---
 # Start background alert loader (works with both direct run and import by dev_server)
 # When Flask reloader is active, only start in the child process to avoid duplicate threads
@@ -10539,6 +10806,7 @@ if not _background_disabled and (_is_reloader_child or not _reloader_active):
     loader = threading.Thread(target=alert_loader_thread, daemon=True)
     loader.start()
     _start_update_check_thread()
+    _start_log_collector_thread()
 
 if __name__ == "__main__":
     print(f"[*] Detonation Chamber UI starting on http://0.0.0.0:{WEBUI_PORT}")

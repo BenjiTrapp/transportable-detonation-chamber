@@ -332,6 +332,7 @@ SCRIPTS=(
     "install-re-tools.ps1"
     "install-rizin.ps1"
     "install-webui.ps1"
+    "configure-logging.ps1"
     "configure-services.ps1"
 )
 

@@ -1359,7 +1359,7 @@
                 <!-- API Reference -->
                 <div class="help-section" id="help-api">
                     <h3>API</h3>
-                    <p class="help-muted">Served on port <code>9000</code>, JSON. No login (keep the VM on an isolated network); state-changing requests from other web sites are refused. The full reference with all endpoints is in the README; the MCP server (<code>mcp/server.py</code>, 46 tools) wraps the same API.</p>
+                    <p class="help-muted">Served on port <code>9000</code>, JSON. No login (keep the VM on an isolated network); state-changing requests from other web sites are refused. The full reference with all endpoints is in the README; the MCP server (<code>mcp/server.py</code>, 47 tools) wraps the same API.</p>
 
                     <h4>Core</h4>
                     <table class="help-api-table">
@@ -1442,6 +1442,15 @@
                             <tr><td class="api-get">GET</td><td><code>/api/updates</code></td><td>Update state: mode, last check, one entry per tool, progress</td></tr>
                             <tr><td class="api-post">POST</td><td><code>/api/updates/check</code></td><td>Start an update check in the background</td></tr>
                             <tr><td class="api-post">POST</td><td><code>/api/updates/apply</code></td><td>Install updates. Params: <code>tools</code> (ids or <code>"all"</code>), <code>include_pinned</code>. Other POST/PUT/PATCH/DELETE requests answer 503 while it runs</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h4>Logs</h4>
+                    <table class="help-api-table">
+                        <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td class="api-get">GET</td><td><code>/api/logs/search</code></td><td>Search the logs with an SPL-like query. Params: <code>q</code> (default <code>*</code>), <code>earliest</code> (default <code>-24h</code>), <code>latest</code>, <code>limit</code> (1-1000, default 200). 400 with <code>error</code> and <code>pos</code> for a query that cannot be read</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/logs/sources</code></td><td>The six log sources with event count, last event, status and hint</td></tr>
                         </tbody>
                     </table>
                 </div>

@@ -7,6 +7,7 @@ never touch the files next to app.py or talk to the VM.
 
 import os
 import sys
+import tempfile
 
 import pytest
 
@@ -15,6 +16,8 @@ sys.path.insert(0, os.path.join(ROOT, "webui"))
 sys.path.insert(0, os.path.join(ROOT, "mcp"))
 
 os.environ["TDC_NO_BACKGROUND"] = "1"
+# the access log of the web UI never goes to webui/logs during tests
+os.environ["TDC_LOG_DIR"] = tempfile.mkdtemp(prefix="tdc-test-logs-")
 os.environ.pop("TDC_VM_WEBUI", None)
 
 
@@ -44,7 +47,9 @@ def tdc(app_module, monkeypatch, tmp_path):
     monkeypatch.setattr(m, "_memory_baseline",
                         m.memory_evidence.MemoryBaseline(str(tmp_path / "baseline.json")))
     m._alerts_body_cache["entry"] = None
-    return m
+    m.set_log_store(m.log_store.LogStore(persist_dir=str(tmp_path / "logs")))
+    yield m
+    m.set_log_store(None)
 
 
 @pytest.fixture

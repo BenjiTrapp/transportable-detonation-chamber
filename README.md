@@ -1644,6 +1644,13 @@ Proxied responses are only relayed as data (JSON, text, binary); HTML is served 
 | POST | `/api/updates/check` | Start an update check in the background (202; 409 while a check or install runs) |
 | POST | `/api/updates/apply` | Install updates. Body: `tools` (list of tool ids or `"all"` alone), `include_pinned` (default `false`). 202; 400 for a bad body, unknown ids or `"all"` mixed into a list; 409 with the reason while a detonation, memory sweep or process dump runs. While an install runs, POST/PUT/PATCH/DELETE requests elsewhere answer 503 (`maintenance: true`) |
 
+### Logs
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/logs/search` | Search the log store with an SPL-like query. Params: `q` (default `*`), `earliest` (default `-24h`; `-15m`, `-2h`, `now` or ISO-8601), `latest`, `limit` (1-1000, default 200). 200 with `type` (`events`, `table` or `timechart`), `events`, `columns`, `rows`, `count`, `matched`, `truncated`, `histogram`, `fields` and `took_ms`; 400 with `error` and `pos` (index in the query) for a query or time that cannot be read; 500 with a general `error` for anything else. Every request is itself logged (`access`; `mcp` too when the MCP server made it), polling paths with `poll=true` |
+| GET | `/api/logs/sources` | The six sources (`powershell`, `access`, `mcp`, `netflow`, `dns`, `firewall`): `count`, `last_time`, `status` (`ok` or `unavailable`) and `hint` (why a source is unavailable) |
+
 ---
 
 ## MCP Server
@@ -1669,7 +1676,12 @@ there if the VM is not at `http://192.168.64.4:9000`.
 | Static analysis | `tdc_scan_ember`, `tdc_scan_capa`, `tdc_scan_threatcheck`, `tdc_scan_defendercheck`, `tdc_scan_history` |
 | Files (paths in the VM) | `tdc_pe_analyze`, `tdc_pe_section`, `tdc_elf_analyze`, `tdc_file_signature`, `tdc_file_hex`, `tdc_file_map` |
 | Named pipes (read-only) | `tdc_pipes`, `tdc_pipe_sessions` |
+| Logs | `tdc_logs_search` |
 | Live memory | `tdc_memory_scan`, `tdc_memory_dump`, `tdc_memory_evidence`, `tdc_memory_baseline`, `tdc_memory_sweep`, `tdc_memory_sweep_status`, `tdc_processdump_baseline`, `tdc_scan_beacons`, `tdc_scan_beaconeye` |
+
+Every request of the MCP server carries `X-TDC-Client: mcp` and
+`X-TDC-MCP-Tool: <tool name>`; the web UI logs them as `mcp` events, so a search
+such as `source=mcp | stats count by tool` shows what an MCP client did.
 
 Not exposed on purpose: byte patching (`/api/file/hex/write`), clearing the
 scan history, starting, stopping or steering pipe interception (forward, drop,
@@ -1698,6 +1710,7 @@ edit) and the raw service proxies.
 | `TDC_UPDATE_LOG` | `C:\tools\logs\tool-updates.log` | Log of the tool updates (off Windows: `tool-updates.log` next to `app.py`) |
 | `TDC_UPDATE_CHECK_HOURS` | `24` | Hours between the automatic update checks; `0` turns them off |
 | `TDC_GITHUB_TOKEN` | — | Optional GitHub token for the update checks, to avoid the API rate limit |
+| `TDC_LOG_DIR` | `webui/logs` (next to `app.py`) | Where the access and MCP logs of the LOGS tab are kept (`access.jsonl`, `mcp.jsonl`; 10 MB each, one older file) |
 
 ### Custom Detection Rules
 
@@ -1770,7 +1783,7 @@ transportable-detonation-chamber/
 ├── static/                         # Screenshots for this README
 │
 ├── mcp/
-│   ├── server.py                  # MCP server (46 tools, talks to the web UI API)
+│   ├── server.py                  # MCP server (47 tools, talks to the web UI API)
 │   └── requirements.txt           # mcp, httpx  (make mcp-setup)
 ├── .mcp.json                      # Registers the MCP server for Claude Code
 │
@@ -1829,6 +1842,7 @@ transportable-detonation-chamber/
 │   ├── install-re-tools.ps1      # Detect It Easy, WinDbg, Ghidra
 │   ├── install-rizin.ps1         # rizin 0.9.1 + rz-ghidra from Cutter's Windows package (pinned SHA-256)
 │   ├── install-webui.ps1          # Web UI deployment
+│   ├── configure-logging.ps1     # PowerShell script block/module logging and Windows Firewall log (LOGS tab)
 │   ├── deploy-utm.py             # Push code to a UTM VM over WinRM, restart, run installers
 │   ├── pipe-roundtrip-test.py    # Interception round trip on the VM (observe, edit, squat)
 │   └── configure-services.ps1    # Service registration (runs on every boot)

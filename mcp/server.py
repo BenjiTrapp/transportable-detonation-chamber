@@ -7,7 +7,9 @@ Connects to the TDC Web UI API running on the analysis VM.
 """
 
 import base64
+import contextvars
 import datetime
+import functools
 import json
 import os
 import sys
@@ -22,6 +24,43 @@ mcp = FastMCP(
     "Transportable Detonation Chamber",
     instructions="Malware analysis lab - submit samples, query Sysmon/ETW events, inspect processes, and manage detonations",
 )
+
+# Every request tells the web UI that it comes from this server and from which
+# tool (the LOGS tab shows it). The tool name travels in a ContextVar that a
+# wrapper around each registered tool sets, so no tool has to pass it on.
+_current_tool: contextvars.ContextVar = contextvars.ContextVar("tdc_mcp_tool", default="")
+
+
+def _mcp_headers() -> dict:
+    headers = {"X-TDC-Client": "mcp"}
+    tool = _current_tool.get()
+    if tool:
+        headers["X-TDC-MCP-Tool"] = tool
+    return headers
+
+
+_register_tool = mcp.tool
+
+
+def _tool(*args, **kwargs):
+    """``mcp.tool`` whose tools set ``_current_tool`` while they run."""
+    register = _register_tool(*args, **kwargs)
+
+    def decorate(fn):
+        @functools.wraps(fn)
+        def run(*a, **kw):
+            token = _current_tool.set(fn.__name__)
+            try:
+                return fn(*a, **kw)
+            finally:
+                _current_tool.reset(token)
+
+        return register(run)
+
+    return decorate
+
+
+mcp.tool = _tool
 
 
 def _raise_with_body(r: httpx.Response) -> None:
@@ -41,14 +80,14 @@ def _raise_with_body(r: httpx.Response) -> None:
 
 def _get(path: str, params: dict | None = None, timeout: float = 15.0) -> dict | list:
     """GET request to TDC API."""
-    r = httpx.get(f"{TDC_BASE_URL}{path}", params=params, timeout=timeout)
+    r = httpx.get(f"{TDC_BASE_URL}{path}", params=params, timeout=timeout, headers=_mcp_headers())
     _raise_with_body(r)
     return r.json()
 
 
 def _post(path: str, data: dict | None = None, files: dict | None = None, timeout: float = 60.0) -> dict | list:
     """POST request to TDC API."""
-    r = httpx.post(f"{TDC_BASE_URL}{path}", data=data, files=files, timeout=timeout)
+    r = httpx.post(f"{TDC_BASE_URL}{path}", data=data, files=files, timeout=timeout, headers=_mcp_headers())
     _raise_with_body(r)
     return r.json()
 
@@ -61,7 +100,8 @@ def _call(method: str, path: str, timeout: float = 60.0, **kwargs) -> dict:
     an MCP client than an HTTP exception.
     """
     try:
-        r = httpx.request(method, f"{TDC_BASE_URL}{path}", timeout=timeout, **kwargs)
+        headers = {**(kwargs.pop("headers", None) or {}), **_mcp_headers()}
+        r = httpx.request(method, f"{TDC_BASE_URL}{path}", timeout=timeout, headers=headers, **kwargs)
     except httpx.TimeoutException:
         return {"error": f"No answer within {timeout:.0f}s - the server may still be working"}
     except httpx.HTTPError as e:
@@ -1561,6 +1601,53 @@ def tdc_pipe_sessions(session_id: Optional[str] = None, max_messages: int = 20, 
         lines.append(f"    {_hex_preview(msg.get('data_b64'))}")
         if msg.get("original_b64") is not None:
             lines.append(f"    original: {_hex_preview(msg['original_b64'])}")
+    return "\n".join(lines)
+
+
+# --- Logs ---
+
+
+def _one_line(value, limit: int = 300) -> str:
+    text = " ".join(str(value if value is not None else "").split())
+    return text if len(text) <= limit else text[:limit - 3] + "..."
+
+
+@mcp.tool()
+def tdc_logs_search(query: str = "*", earliest: str = "-24h", limit: int = 100) -> str:
+    """Search the logs the web UI keeps (the LOGS tab) with an SPL-like query.
+
+    Sources: powershell (script blocks, module logging), access (every request to the web UI),
+    mcp (the requests made by these tools), netflow and dns (from Sysmon), firewall (Windows Firewall log).
+    Examples: `source=dns evil.example`, `source=mcp | stats count by tool`,
+    `source=firewall action=DROP | top 10 dst_ip`. Pipes: head, tail, sort, dedup, table, fields,
+    stats, top, rare, timechart.
+
+    Args:
+        query: Search text, field=value comparisons, AND/OR/NOT and pipes (default "*" = everything)
+        earliest: Start of the time range: -15m, -2h, -1d, now or an ISO time (default -24h)
+        limit: Most event lines or table rows to return, 1-1000 (default 100)
+    """
+    r = _call("GET", "/api/logs/search", params={"q": query, "earliest": earliest, "limit": limit})
+    if r.get("error"):
+        pos = r.get("pos")
+        return f"Search error: {r['error']}" + (f" (at position {pos})" if pos is not None else "")
+    kind = r.get("type")
+    count = r.get("count", 0)
+    matched = r.get("matched", count)
+    note = f"; {matched} events matched" if matched != count else ""
+    cut = " (truncated)" if r.get("truncated") else ""
+    if kind in ("table", "timechart"):
+        columns = r.get("columns") or []
+        rows = r.get("rows") or []
+        lines = [f"{count} rows{note}{cut}", " | ".join(str(c) for c in columns)]
+        lines += [" | ".join(_one_line(v, 120) for v in row) for row in rows]
+        return "\n".join(lines)
+    events = r.get("events") or []
+    lines = [f"{count} events{note}{cut}"]
+    for ev in events:
+        lines.append(f"{ev.get('time', '')} {ev.get('source', ''):<10} {_one_line(ev.get('message'))}")
+    if count > len(events):
+        lines.append(f"... {count - len(events)} more; narrow the query or raise limit")
     return "\n".join(lines)
 
 

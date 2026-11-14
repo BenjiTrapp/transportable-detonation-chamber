@@ -315,7 +315,7 @@ deploy:
 		vagrant upload webui/rizin_sessions.py C:\\DetonationChamberUI\\rizin_sessions.py; \
 		vagrant upload webui/tool_updates.py C:\\DetonationChamberUI\\tool_updates.py; \
 		vagrant upload webui/static/icon.png C:\\DetonationChamberUI\\static\\icon.png || true; \
-		for f in scripts/install-*.ps1; do \
+		for f in scripts/install-*.ps1 scripts/configure-logging.ps1; do \
 			vagrant upload $$f C:\\tdc\\scripts\\$$(basename $$f); \
 		done; \
 		echo "[deploy] Done."; \
