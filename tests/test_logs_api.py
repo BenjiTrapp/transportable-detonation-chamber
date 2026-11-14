@@ -29,6 +29,14 @@ def _events(store, source):
     return [e for e in store.snapshot() if e["source"] == source]
 
 
+def _boom_route(tdc, monkeypatch):
+    """/api/health raises (the view of the shared app is swapped for one test)."""
+    def boom():
+        raise RuntimeError("boom")
+
+    monkeypatch.setitem(tdc.app.view_functions, "api_health", boom)
+
+
 # ---- capture ---------------------------------------------------------------------------------
 
 
@@ -80,12 +88,54 @@ def test_static_and_favicon_are_not_logged(client, logs):
 
 @pytest.mark.parametrize("path, poll", [
     ("/api/status", True), ("/api/health", True), ("/api/updates", True), ("/api/alerts", True),
-    ("/api/logs/sources", True), ("/api/scan/history", False),
+    ("/api/rustinel", True), ("/api/logs/sources", True), ("/api/logs/event/access-1", True),
+    ("/api/scan/history", False), ("/api/alerts/some-alert", False), ("/api/status/extra", False),
+    ("/api/updates/check", False), ("/api/healthz", False), ("/api/alerts-export", False),
 ])
 def test_polling_paths_are_marked(client, logs, tdc, monkeypatch, path, poll):
     client.get(path)
     ev = [e for e in _events(logs, "access") if e["fields"]["path"] == path][0]
     assert ev["fields"]["poll"] is poll
+
+
+def test_only_get_requests_are_polls(client, logs):
+    client.post("/api/status")
+    assert _events(logs, "access")[0]["fields"]["poll"] is False
+
+
+def test_the_access_message_uses_the_truncated_path(client, logs):
+    path = "/api/" + "x" * 5000
+    client.get(path)
+    (ev,) = _events(logs, "access")
+    assert len(ev["fields"]["path"]) == 2000
+    assert ev["message"] == f"GET {ev['fields']['path']} (404, {ev['message'].split(', ')[1]}"
+    assert len(ev["message"]) < 2100
+
+
+def test_an_unhandled_exception_is_logged_as_a_500(client, logs, tdc, monkeypatch):
+    _boom_route(tdc, monkeypatch)
+    monkeypatch.setitem(tdc.app.config, "PROPAGATE_EXCEPTIONS", True)       # what TESTING and debug do
+    with pytest.raises(RuntimeError):
+        client.get("/api/health?x=1", headers={"X-TDC-Client": "mcp", "X-TDC-MCP-Tool": "tdc_boom"})
+    (ev,) = _events(logs, "access")
+    assert ev["fields"]["status"] == 500 and ev["fields"]["path"] == "/api/health"
+    assert ev["fields"]["query"] == "x=1" and ev["fields"]["client"] == "mcp"
+    assert "500" in ev["message"]
+    (mcp,) = _events(logs, "mcp")
+    assert mcp["fields"]["status"] == 500 and mcp["fields"]["tool"] == "tdc_boom"
+
+
+def test_a_handled_500_is_logged_once(client, logs, tdc, monkeypatch):
+    _boom_route(tdc, monkeypatch)
+    monkeypatch.setitem(tdc.app.config, "PROPAGATE_EXCEPTIONS", False)
+    assert client.get("/api/health").status_code == 500
+    (ev,) = _events(logs, "access")
+    assert ev["fields"]["status"] == 500
+
+
+def test_a_normal_response_is_logged_once(client, logs):
+    client.get("/api/health")
+    assert len(_events(logs, "access")) == 1
 
 
 def test_a_rejected_request_is_logged_with_its_status(client, logs):
@@ -167,6 +217,46 @@ def test_limit_is_clamped(client, logs, limit, shown):
     body = client.get(f"/api/logs/search?q=*&earliest=1970-01-01&limit={limit}").get_json()
     assert len(body["events"]) == shown
     assert body["count"] == 1200 and body["truncated"] is True
+
+
+def test_a_long_value_is_cut_in_the_search_response_and_the_event_route_has_all_of_it(client, logs):
+    big = "S" * 200_000
+    ev = logs.add("powershell", "2026-11-14T10:00:00Z", big,
+                  {"path": "C:\\x.ps1", "payload": big, "list": [big, "short"], "event_id": 4104})
+    small = logs.add("access", "2026-11-14T10:00:01Z", "GET /x", {"path": "/x"})
+    body = client.get("/api/logs/search?earliest=1970-01-01").get_json()
+    by_id = {e["id"]: e for e in body["events"]}
+    cut = by_id[ev["id"]]
+    assert cut["truncated_fields"] is True
+    assert len(cut["message"]) == 65536 and len(cut["fields"]["payload"]) == 65536
+    assert [len(x) for x in cut["fields"]["list"]] == [65536, 5]
+    assert cut["fields"]["path"] == "C:\\x.ps1" and cut["fields"]["event_id"] == 4104
+    assert "truncated_fields" not in by_id[small["id"]]
+    assert len(logs.snapshot()[0]["message"]) == 200_000                  # the store is not shortened
+    full = client.get(f"/api/logs/event/{ev['id']}")
+    assert full.status_code == 200
+    got = full.get_json()
+    assert got["message"] == big and got["fields"]["payload"] == big and got["id"] == ev["id"]
+    assert "truncated_fields" not in got
+
+
+def test_cells_of_a_table_are_cut_too(client, logs):
+    logs.add("powershell", "2026-11-14T10:00:00Z", "M" * 100_000, {})
+    body = client.get("/api/logs/search?earliest=1970-01-01&q=" + "*%20%7C%20table%20message").get_json()
+    assert len(body["rows"][0][0]) == 65536
+
+
+def test_event_route_404_for_a_missing_event(client, logs):
+    r = client.get("/api/logs/event/access-99")
+    assert r.status_code == 404 and r.get_json()["error"]
+    assert client.get("/api/logs/event/nonsense").status_code == 404
+
+
+def test_searching_script_finds_the_message_of_a_script_block(client, logs):
+    logs.add("powershell", "2026-11-14T10:00:00Z", "iex (New-Object Net.WebClient)", {"event_id": 4104})
+    logs.add("powershell", "2026-11-14T10:00:01Z", "Get-Process", {"event_id": 4104})
+    body = client.get("/api/logs/search?earliest=1970-01-01&q=" + "script%3D*WebClient*").get_json()
+    assert [e["message"] for e in body["events"]] == ["iex (New-Object Net.WebClient)"]
 
 
 def test_the_response_is_strict_json(client, logs):
@@ -294,7 +384,28 @@ def test_sysmon_reader_passes_ids_and_since(tdc, monkeypatch):
     monkeypatch.setattr(tdc, "_read_sysmon_events", lambda **kw: seen.update(kw) or [])
     tdc._read_sysmon_for_logs([3, 22], "2026-11-14T10:00:00Z")
     assert seen["event_ids"] == [3, 22] and seen["since"] == "2026-11-14T10:00:00Z"
-    assert seen["max_events"] == 5000
+    assert seen["max_events"] == 5000 and seen["newest_first"] is False
+
+
+def test_sysmon_events_default_to_newest_first_and_the_logs_reader_reads_oldest_first(tdc, monkeypatch):
+    """A fake wevtutil with the real /c and /rd semantics: a backlog is drained oldest first."""
+    times = ["2026-11-14T10:00:0%d.0000000Z" % i for i in range(6)]
+    xml = [_sysmon_xml(22, QueryName=f"h{i}.example").replace("2026-11-14T10:00:00.1234567Z", t)
+           for i, t in enumerate(times)]
+    calls = []
+
+    def fake(log, query=None, count=None, newest_first=True, timeout=30):
+        calls.append(newest_first)
+        pick = list(reversed(xml)) if newest_first else list(xml)
+        return "".join(pick[:count]), _Proc()
+
+    monkeypatch.setattr(tdc, "_IS_WINDOWS", True)
+    monkeypatch.setattr(tdc, "_wevtutil_query", fake)
+    newest = tdc._read_sysmon_events(event_ids=[22], max_events=2)
+    assert [e["query"] for e in newest] == ["h5.example", "h4.example"] and calls == [True]
+    monkeypatch.setattr(tdc, "LOG_READ_LIMIT", 2)
+    oldest = tdc._read_sysmon_for_logs([22], "2026-11-14T10:00:00Z")
+    assert [e["query"] for e in oldest] == ["h0.example", "h1.example"] and calls == [True, False]
 
 
 @pytest.fixture

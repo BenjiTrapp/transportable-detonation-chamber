@@ -655,3 +655,14 @@ def test_fifty_thousand_events_search_fast():
         took = time.perf_counter() - start
         assert r["matched"] > 0
         assert took < 1.0, (q, took)
+
+
+def test_script_is_an_alias_of_the_message_of_a_powershell_event():
+    events = [ev("s1", 10, "powershell", "iex (New-Object Net.WebClient)", event_id=4104),
+              ev("s2", 20, "powershell", "Get-Process", event_id=4104, script="explicit"),
+              ev("s3", 30, "access", "GET /iex", path="/iex")]
+    r = ls.run("script=*WebClient*", events, NOW, earliest=None)
+    assert [e["id"] for e in r["events"]] == ["s1"]
+    r = ls.run("source=powershell | table script", events, NOW, earliest=None)
+    assert sorted(row[0] for row in r["rows"]) == ["explicit", "iex (New-Object Net.WebClient)"]
+    assert [e["id"] for e in ls.run("script=*iex*", events, NOW, earliest=None)["events"]] == ["s1"]

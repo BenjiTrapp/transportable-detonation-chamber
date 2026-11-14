@@ -1122,8 +1122,8 @@ markup.
 
 | Source | Content |
 |--------|---------|
-| `powershell` | Script Blocks (4104), module and pipeline logging (4103) and engine errors (4100) of `Microsoft-Windows-PowerShell/Operational`; the parts of a long script block are joined into one event |
-| `access` | Every HTTP request to the web UI (not `/static/`): `method`, `path`, `query`, `status`, `duration_ms`, `remote_addr`, `user_agent`, `client` (`browser`, `mcp` or `other`). The regular polls of the UI itself (`/api/status`, `/api/updates`, `/api/alerts`, `/api/health`, `/api/logs/*`) carry `poll=true` |
+| `powershell` | Script Blocks (4104), module and pipeline logging (4103) and engine errors (4100) of `Microsoft-Windows-PowerShell/Operational`; the parts of a long script block are joined into one event; the script is the `message` (`script=` searches it too) |
+| `access` | Every HTTP request to the web UI (not `/static/`): `method`, `path`, `query`, `status`, `duration_ms`, `remote_addr`, `user_agent`, `client` (`browser`, `mcp` or `other`). The regular polls of the UI itself (the exact paths `/api/status`, `/api/updates`, `/api/alerts`, `/api/health` and `/api/rustinel`, and everything under `/api/logs/`) carry `poll=true`; `/api/alerts/<id>` does not. A request that ends in an unhandled error is logged with status 500 |
 | `mcp` | Every action of the MCP server (it sends `X-TDC-Client: mcp` and `X-TDC-MCP-Tool: <name>`): `tool`, `method`, `path`, `status`, `duration_ms` |
 | `netflow` | Network connections (Sysmon 3) bundled into flows per image, PID, protocol and address pair, with `count`, `first_seen` and `last_seen` |
 | `dns` | DNS queries (Sysmon 22): `query`, `result`, `image`, `pid` |
@@ -1132,10 +1132,10 @@ markup.
 A chip per source shows its event count and status; a click on it searches that
 source. A source without data says why in its tooltip (the Windows sources are
 `unavailable` when the web UI does not run on the VM; the firewall log stays
-empty while the firewall is off). The store keeps up to 50,000 events in memory;
+empty while the firewall is off). Every source has its own ring in memory, so a burst in one cannot push out another: `powershell` 15,000 events, `firewall`, `dns` and `access` 10,000 each, `netflow` and `mcp` 5,000 each, and 50 million characters of text in all, split in proportion. A search response cuts every value at 64 KB (the event then has `truncated_fields: true`; the UI loads the whole event when you unfold it);
 `access` and `mcp` are also written to `webui/logs/` (10 MB per file, one older
 file kept) and loaded again at start. The Windows sources read the last 24 hours
-at start (at most 5000 events each) and then every 10 seconds.
+at start (at most 5000 events each) and then every 10 seconds; a Sysmon backlog of more than 5000 events is read oldest first, over several rounds.
 
 **Search syntax.** Words and `"phrases"` match anywhere in the message and the
 fields, without regard to case; `*` is a wildcard. `field=value`, `field!=value`,
@@ -1715,6 +1715,7 @@ Proxied responses are only relayed as data (JSON, text, binary); HTML is served 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/api/logs/search` | Search the log store with an SPL-like query. Params: `q` (default `*`), `earliest` (default `-24h`; `-15m`, `-2h`, `now` or ISO-8601), `latest`, `limit` (1-1000, default 200). 200 with `type` (`events`, `table` or `timechart`), `events`, `columns`, `rows`, `count`, `matched`, `truncated`, `histogram`, `fields` and `took_ms`; 400 with `error` and `pos` (index in the query) for a query or time that cannot be read; 500 with a general `error` for anything else. Every request is itself logged (`access`; `mcp` too when the MCP server made it), polling paths with `poll=true` |
+| GET | `/api/logs/event/<id>` | One event of the log store in full (`id`, `time`, `source`, `message`, `fields`). A search response cuts every string at 64 KB and marks the event with `truncated_fields: true`; this route has the whole text. 404 with `error` when the event has left the store |
 | GET | `/api/logs/sources` | The six sources (`powershell`, `access`, `mcp`, `netflow`, `dns`, `firewall`): `count`, `last_time`, `status` (`ok` or `unavailable`) and `hint` (why a source is unavailable) |
 
 ---

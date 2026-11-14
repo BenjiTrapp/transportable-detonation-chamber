@@ -10,7 +10,8 @@ can neither fail on odd characters nor run away on a crafted pattern.
 An event is ``{"id", "time", "source", "message", "fields": {...}}``. A field
 name is looked up in ``id``/``time``/``source``/``message`` first and then in
 ``fields``; ``sourcetype`` and ``index`` are aliases for ``source`` (and
-``_time``/``_raw`` for ``time``/``message``). A field that is absent or
+``_time``/``_raw`` for ``time``/``message``; for a ``powershell`` event ``script``
+too, unless it has a field of that name). A field that is absent or
 ``None`` counts as missing.
 
 The query is parsed once into an AST (``parse``) and compiled into predicate
@@ -221,7 +222,10 @@ def _event_getter(name: str) -> Callable[[Dict[str, Any]], Any]:
 
     def get(ev):
         fields = ev.get("fields")
-        return fields.get(name) if isinstance(fields, dict) else None
+        value = fields.get(name) if isinstance(fields, dict) else None
+        if value is None and name == "script" and ev.get("source") == "powershell":
+            return ev.get("message")        # a script block is stored once, as the message
+        return value
     return get
 
 

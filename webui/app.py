@@ -100,8 +100,15 @@ except Exception as _exc:   # a damaged log file must not stop the web UI
     _log_logger.warning("could not read the persisted logs: %s", _exc)
 
 _NOT_LOGGED_PREFIXES = ("/static/", "/favicon")
-_POLL_PREFIXES = ("/api/logs/", "/api/status", "/api/updates", "/api/alerts", "/api/health")
+# The regular polls of the UI itself: these exact paths, and everything under /api/logs/.
+# (/api/alerts/<id> is a user action, not a poll.)
+_POLL_PATHS = frozenset(("/api/status", "/api/updates", "/api/alerts", "/api/health", "/api/rustinel"))
+_POLL_PREFIX = "/api/logs/"
 _LOG_TEXT_LIMIT = 2000
+
+
+def _is_poll_path(path):
+    return path in _POLL_PATHS or path.startswith(_POLL_PREFIX)
 
 
 def set_log_store(store):
@@ -126,37 +133,49 @@ def _log_request_client(headers):
     return "browser" if "Mozilla" in (headers.get("User-Agent") or "") else "other"
 
 
-def _log_request(resp):
+def _log_request(status):
     path = request.path
-    if path.startswith(_NOT_LOGGED_PREFIXES):
+    if path.startswith(_NOT_LOGGED_PREFIXES) or g.get("_log_done"):
         return
+    g._log_done = True
     started = g.get("_log_started")
     duration = round((time.perf_counter() - started) * 1000, 1) if started is not None else 0.0
     client_kind = _log_request_client(request.headers)
     query = request.query_string.decode("utf-8", "replace")[:_LOG_TEXT_LIMIT]
     fields = {
-        "method": request.method, "path": path[:_LOG_TEXT_LIMIT], "query": query, "status": resp.status_code,
+        "method": request.method, "path": path[:_LOG_TEXT_LIMIT], "query": query, "status": status,
         "duration_ms": duration, "remote_addr": request.remote_addr or "",
         "user_agent": (request.headers.get("User-Agent") or "")[:500], "client": client_kind,
-        "poll": request.method == "GET" and path.startswith(_POLL_PREFIXES),
+        "poll": request.method == "GET" and _is_poll_path(path),
     }
     now = _log_now()
     store = _logs
-    store.add("access", now, f"{request.method} {path} ({resp.status_code}, {duration:g} ms)", fields)
+    store.add("access", now, f"{request.method} {fields['path']} ({status}, {duration:g} ms)", fields)
     if client_kind == "mcp":
         tool = (request.headers.get("X-TDC-MCP-Tool") or "unknown")[:100]
-        store.add("mcp", now, f"{tool} \u2192 {request.method} {path} ({resp.status_code})",
-                  {"tool": tool, "method": request.method, "path": fields["path"], "status": resp.status_code,
+        store.add("mcp", now, f"{tool} \u2192 {request.method} {fields['path']} ({status})",
+                  {"tool": tool, "method": request.method, "path": fields["path"], "status": status,
                    "duration_ms": duration})
 
 
 @app.after_request
 def _log_response(resp):
     try:
-        _log_request(resp)
+        _log_request(resp.status_code)
     except Exception:   # logging must never change a response
         _log_logger.debug("request logging failed", exc_info=True)
     return resp
+
+
+@app.teardown_request
+def _log_failed_request(exc):
+    """An unhandled exception (no after_request when it propagates, as in TESTING and debug) is a 500."""
+    if exc is None:
+        return
+    try:
+        _log_request(500)
+    except Exception:
+        _log_logger.debug("request logging failed", exc_info=True)
 
 
 @app.before_request
@@ -3666,7 +3685,7 @@ def _sysmon_xpath(event_ids=None, since=None, pid=None, parent_pid=None, until=N
 
 
 def _read_sysmon_events(max_events=100, since=None, pid=None, event_id=None, event_ids=None,
-                        parent_pid=None, until=None, pipe_names=None):
+                        parent_pid=None, until=None, pipe_names=None, newest_first=True):
     """Read Sysmon events from the Windows Event Log with full field extraction.
 
     Uses wevtutil with an XPath filter and parses the XML here. The former
@@ -3680,7 +3699,7 @@ def _read_sysmon_events(max_events=100, since=None, pid=None, event_id=None, eve
                           pipe_names=pipe_names)
     try:
         raw, proc = _wevtutil_query("Microsoft-Windows-Sysmon/Operational", query,
-                                    count=max_events, timeout=30)
+                                    count=max_events, newest_first=newest_first, timeout=30)
     except subprocess.TimeoutExpired:
         return [{"error": "Sysmon event query timed out"}]
     except (FileNotFoundError, OSError) as e:
@@ -10650,7 +10669,9 @@ def _read_powershell_log(since_record_id):
 def _read_sysmon_for_logs(event_ids, since_iso):
     if not _IS_WINDOWS:
         raise RuntimeError(_WINDOWS_ONLY_HINT)
-    return _read_sysmon_events(event_ids=list(event_ids), since=since_iso, max_events=LOG_READ_LIMIT)
+    # oldest first: when more than LOG_READ_LIMIT events are due, the rest comes with the next tick
+    return _read_sysmon_events(event_ids=list(event_ids), since=since_iso, max_events=LOG_READ_LIMIT,
+                               newest_first=False)
 
 
 def _firewall_is_off():
@@ -10764,6 +10785,35 @@ def _json_response(payload, status=200):
     return app.response_class(body, status=status, mimetype="application/json")
 
 
+LOG_VALUE_LIMIT = 65536        # characters of one value in a search response; /api/logs/event/<id> has it all
+
+
+def _cap_log_value(value):
+    """``(value, cut)``: every string in ``value`` shortened to LOG_VALUE_LIMIT characters."""
+    if isinstance(value, str):
+        return (value[:LOG_VALUE_LIMIT], True) if len(value) > LOG_VALUE_LIMIT else (value, False)
+    if isinstance(value, (list, tuple)):
+        pairs = [_cap_log_value(v) for v in value]
+        return ([p[0] for p in pairs], True) if any(p[1] for p in pairs) else (value, False)
+    if isinstance(value, dict):
+        pairs = {k: _cap_log_value(v) for k, v in value.items()}
+        return ({k: p[0] for k, p in pairs.items()}, True) if any(p[1] for p in pairs.values()) else (value, False)
+    return value, False
+
+
+def _cap_log_event(event):
+    """The event itself when all its values are short, else a copy with cut values and ``truncated_fields``."""
+    if not isinstance(event, dict):
+        return event
+    message, cut_message = _cap_log_value(event.get("message"))
+    fields, cut_fields = _cap_log_value(event.get("fields"))
+    if not (cut_message or cut_fields):
+        return event
+    out = dict(event)
+    out["message"], out["fields"], out["truncated_fields"] = message, fields, True
+    return out
+
+
 @app.route("/api/logs/search")
 def api_logs_search():
     """Search the LOGS store: ?q= (default *), earliest (default -24h), latest, limit (1-1000, default 200)."""
@@ -10784,8 +10834,19 @@ def api_logs_search():
     except Exception:
         _log_logger.exception("log search failed: %r", query[:200])
         return jsonify({"error": "The search failed; see the web UI log."}), 500
+    result["events"] = [_cap_log_event(e) for e in result["events"]]
+    result["rows"] = [[_cap_log_value(cell)[0] for cell in row] for row in result["rows"]]
     result["took_ms"] = round((time.perf_counter() - started) * 1000, 1)
     return _json_response(result)
+
+
+@app.route("/api/logs/event/<event_id>")
+def api_logs_event(event_id):
+    """One event of the LOGS store in full (the search response cuts long values)."""
+    event = _logs.get(event_id)
+    if event is None:
+        return jsonify({"error": "Event not found; it may have left the store."}), 404
+    return _json_response(event)
 
 
 @app.route("/api/logs/sources")

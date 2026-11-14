@@ -31,7 +31,7 @@ LOGS_FUNCTION_NAME = re.compile(
     r"^(?:async )?function ((?:logs|runLogs|renderLogs|onLogs|submitLogs|toggleLogs|closeLogs|refreshLogs|initLogs)\w*)\(", re.M)
 LOGS_FUNCTIONS = list(dict.fromkeys(LOGS_FUNCTION_NAME.findall(SOURCE)))
 LOGS_CONSTS = ["LOGS_RANGES", "LOGS_DEFAULT_RANGE", "LOGS_RECENT_KEY", "LOGS_RANGE_KEY", "LOGS_LAST_KEY", "LOGS_RECENT_MAX",
-               "LOGS_LIVE_MS", "LOGS_PAGE", "LOGS_PAGE_MAX", "LOGS_EXAMPLES", "LOGS_SOURCE_COLORS", "LOGS_SYNTAX_HINT",
+               "LOGS_LIVE_MS", "LOGS_PAGE", "LOGS_RAW_FULL_LIMIT", "LOGS_PAGE_MAX", "LOGS_EXAMPLES", "LOGS_SOURCE_COLORS", "LOGS_SYNTAX_HINT",
                "LOGS_TOKEN", "LOGS_BARS_BRUSH"]
 LOGS_LETS = re.findall(r"^let logs\w+ = [^\n]*?;(?=[ \t]*(?://[^\n]*)?$)", SOURCE, re.M)
 OTHER_FUNCTIONS = CHART_FUNCTIONS + ["escapeHtml", "jsArg", "cssToken", "formatAlertTime", "filterChipHtml",
@@ -674,3 +674,40 @@ def test_the_tab_reopens_with_the_last_query_even_a_bare_star():
         initLogs();
         console.log(JSON.stringify({ stored, last, input, fallback: els['logs-query'].value }));""")
     assert r == {"stored": "*", "last": "*", "input": "*", "fallback": "source=mcp"}
+
+
+@needs_node
+def test_a_cut_event_loads_in_full_when_it_is_unfolded_and_stays_escaped():
+    r = _run(r"""
+        const full = { id: 'powershell-9', time: '2026-11-14T10:00:00.123Z', source: 'powershell', message: '<script>FULL</script> ' + 'x'.repeat(30000),
+            fields: { payload: '<b>whole payload</b>' } };
+        const base = globalThis.fetch;
+        globalThis.fetch = async url => {
+            calls.push(url);
+            if (url === '/api/logs/event/powershell-9') return reply(full);
+            if (url.startsWith('/api/logs/event/')) return reply({ error: 'gone' }, 404);
+            return base(url);
+        };
+        const cut = ev('powershell-9', 'cut message', { fields: { payload: 'cut payload' }, truncated_fields: true });
+        const gone = ev('powershell-10', 'other cut', { truncated_fields: true });
+        const short = ev('powershell-11', 'short message');
+        renderLogsResult(events([cut, gone, short]));
+        const hit = id => ({ target: { closest: sel => (sel === '[data-logs-toggle]' ? { getAttribute: () => id } : null) } });
+        onLogsClick(hit('powershell-11'));
+        onLogsClick(hit('powershell-9'));
+        const loading = els['logs-results'].innerHTML;
+        await new Promise(r => setTimeout(r, 0));
+        const loaded = els['logs-results'].innerHTML;
+        onLogsClick(hit('powershell-10'));
+        await new Promise(r => setTimeout(r, 0));
+        const missing = els['logs-results'].innerHTML;
+        onLogsClick(hit('powershell-9'));
+        onLogsClick(hit('powershell-9'));
+        await new Promise(r => setTimeout(r, 0));
+        console.log(JSON.stringify({ calls: calls.filter(u => u.startsWith('/api/logs/event/')), loading, loaded, missing }));""")
+    assert r["calls"] == ["/api/logs/event/powershell-9", "/api/logs/event/powershell-10"], "short events and a second unfold fetch nothing"
+    assert "cut message" in r["loading"] and "Loading the full event" in r["loading"]
+    assert "&lt;script&gt;FULL&lt;/script&gt;" in r["loaded"] and "<script>" not in r["loaded"]
+    assert "&lt;b&gt;whole payload&lt;/b&gt;" in r["loaded"] and "cut payload" not in r["loaded"]
+    assert "more characters are not shown" not in r["loaded"], "the whole event is shown after the load"
+    assert "no longer in the store" in r["missing"]

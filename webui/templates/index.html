@@ -1506,6 +1506,7 @@
                         <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
                         <tbody>
                             <tr><td class="api-get">GET</td><td><code>/api/logs/search</code></td><td>Search the logs with an SPL-like query. Params: <code>q</code> (default <code>*</code>), <code>earliest</code> (default <code>-24h</code>), <code>latest</code>, <code>limit</code> (1-1000, default 200). 400 with <code>error</code> and <code>pos</code> for a query that cannot be read</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/logs/event/&lt;id&gt;</code></td><td>One log event in full (a search cuts values at 64 KB). 404 when it has left the store</td></tr>
                             <tr><td class="api-get">GET</td><td><code>/api/logs/sources</code></td><td>The six log sources with event count, last event, status and hint</td></tr>
                         </tbody>
                     </table>

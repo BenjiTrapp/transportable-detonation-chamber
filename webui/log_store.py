@@ -1,10 +1,13 @@
 """Event store and source parsers for the LOGS tab.
 
-The store is a thread-safe ring buffer of event dicts shared by all sources::
+The store is a thread-safe set of ring buffers of event dicts, one per source::
 
     {"id": "<source>-<n>", "time": "<ISO-8601 UTC, Z>", "source": ..., "message": ..., "fields": {...}}
 
-When it is full the event that was added first, whatever its source, is dropped.
+Every source has its own cap on events (``SOURCE_CAPS``) and its share of the
+character budget (``MAX_CHARS`` split in proportion to the caps). When a source
+is full, its own oldest event is dropped: a burst in one source (the UI's own
+polling, a busy firewall) never pushes the evidence of another one out.
 ``access`` and ``mcp`` events are also appended to ``<persist_dir>/<source>.jsonl``
 (rotated to ``.jsonl.1`` at 10 MB, one old file is kept) and read back at start.
 The Windows sources are re-read from the system on every start, so they are not
@@ -19,7 +22,8 @@ Reader contract for ``Collector`` (``None`` as the position means first read: th
 reader returns at most the last 24 h and 5000 entries; the collector trims too)::
 
     read_powershell(since_record_id) -> (xml_text, max_record_id)
-    read_sysmon(event_ids, since_iso) -> [event dict as _read_sysmon_events]
+    read_sysmon(event_ids, since_iso) -> [event dict as _read_sysmon_events], oldest first
+                                         (a read that hits its cap leaves the newer events for the next tick)
     read_firewall(offset)            -> (text, new_offset, status_hint)
 
 ``read_firewall``: ``offset`` is a byte offset into the log file and ``new_offset`` is
@@ -30,7 +34,8 @@ the unfinished last line, so the next read starts at its beginning. A last line
 longer than 64 KB without a newline is consumed as it is.
 ``read_powershell``: the position moves to ``max_record_id`` even when some of the
 returned events cannot be parsed (they are skipped and counted in the source hint).
-The store holds at most 50 000 events and 200 million characters of text.
+A 4104 script block is stored once, as ``message``; there is no ``script`` field.
+The store holds at most 55 000 events (see ``SOURCE_CAPS``) and 50 million characters of text.
 
 A reader that raises, or a Sysmon reader that returns ``{"error": ...}``, marks
 its sources ``unavailable`` with the first line of the message; the other sources
@@ -39,6 +44,7 @@ carry on.
 
 from __future__ import annotations
 
+import heapq
 import json
 import logging
 import os
@@ -54,8 +60,9 @@ logger = logging.getLogger(__name__)
 SOURCES = ("powershell", "access", "mcp", "netflow", "dns", "firewall")
 PERSISTED_SOURCES = ("access", "mcp")
 
-MAX_EVENTS = 50000
-MAX_CHARS = 200_000_000
+SOURCE_CAPS = {"powershell": 15000, "firewall": 10000, "dns": 10000, "access": 10000,
+               "netflow": 5000, "mcp": 5000}
+MAX_CHARS = 50_000_000
 ROTATE_BYTES = 10 * 1024 * 1024
 START_WINDOW_S = 24 * 3600
 START_LIMIT = 5000
@@ -63,6 +70,7 @@ SYSMON_CACHE_LIMIT = 20000
 DNS_SEEN_LIMIT = 20000
 MAX_PENDING_LINE = 65536
 SYSMON_OVERLAP_S = 5
+SYSMON_PAGE = 5000        # most events one Sysmon read returns
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -124,17 +132,26 @@ def _flow_key(fields: Optional[Dict[str, Any]]) -> Tuple:
 
 
 class LogStore:
-    def __init__(self, max_events: int = MAX_EVENTS, persist_dir: Optional[str] = None,
-                 max_chars: int = MAX_CHARS):
-        self.max_events = max(1, int(max_events))
+    """Per-source ring buffers; ``max_events`` (when given) is the cap of every source, ``caps`` overrides single ones."""
+
+    def __init__(self, max_events: Optional[int] = None, persist_dir: Optional[str] = None,
+                 max_chars: int = MAX_CHARS, caps: Optional[Dict[str, int]] = None):
+        merged = dict(SOURCE_CAPS)
+        if max_events is not None:
+            merged = {s: int(max_events) for s in SOURCES}
+        merged.update(caps or {})
+        self.caps = {s: max(1, int(merged[s])) for s in SOURCES}
         self.max_chars = max(1, int(max_chars))
+        total = sum(self.caps.values())
+        self.budgets = {s: max(1, self.max_chars * self.caps[s] // total) for s in SOURCES}
         self.persist_dir = persist_dir
         self._lock = threading.Lock()
         self._io_lock = threading.Lock()
-        self._events: Deque[Tuple[Dict[str, Any], int]] = deque()   # (event, characters)
-        self._chars = 0
+        # per source: (event, characters, insertion number), oldest first
+        self._rings: Dict[str, Deque[Tuple[Dict[str, Any], int, int]]] = {s: deque() for s in SOURCES}
+        self._chars: Dict[str, int] = {s: 0 for s in SOURCES}
+        self._order = 0
         self._flow_ids: Dict[Tuple, str] = {}
-        self._counts: Counter = Counter()
         self._last: Dict[str, str] = {}
         self._status: Dict[str, Tuple[str, str]] = {}
         self._seq = 0
@@ -156,14 +173,8 @@ class LogStore:
         that is being replaced keeps its id, so the UI can follow it across polls.
         """
         with self._lock:
-            kept: Deque[Tuple[Dict[str, Any], int]] = deque()
-            for item in self._events:
-                if item[0]["source"] == "netflow":
-                    self._chars -= item[1]
-                else:
-                    kept.append(item)
-            self._events = kept
-            self._counts["netflow"] = 0
+            self._rings["netflow"].clear()
+            self._chars["netflow"] = 0
             self._last.pop("netflow", None)
             ids: Dict[Tuple, str] = {}
             out = []
@@ -180,8 +191,9 @@ class LogStore:
                 event_id: Optional[str] = None) -> Dict[str, Any]:
         """Add one event and evict; the caller holds ``self._lock``.
 
-        Eviction drops the event that was added first, whole, while there are
-        too many events or too many characters (the newest event always stays).
+        Eviction drops the source's own event that was added first, whole, while
+        the source has too many events or too many characters (its newest event
+        always stays).
         """
         if source not in SOURCES:
             raise ValueError(f"unknown log source: {source!r}")
@@ -191,17 +203,17 @@ class LogStore:
         event = {"id": event_id, "time": time, "source": source,
                  "message": message, "fields": dict(fields or {})}
         cost = _cost(event)
-        self._events.append((event, cost))
-        self._chars += cost
-        self._counts[source] += 1
+        ring = self._rings[source]
+        self._order += 1
+        ring.append((event, cost, self._order))
+        self._chars[source] += cost
         if source not in self._last or _sort_key(time) > _sort_key(self._last[source]):
             self._last[source] = time
-        while len(self._events) > self.max_events or (self._chars > self.max_chars and len(self._events) > 1):
-            old, old_cost = self._events.popleft()
-            self._chars -= old_cost
-            self._counts[old["source"]] -= 1
-            if self._counts[old["source"]] <= 0:
-                self._last.pop(old["source"], None)
+        while len(ring) > self.caps[source] or (self._chars[source] > self.budgets[source] and len(ring) > 1):
+            _, old_cost, _ = ring.popleft()
+            self._chars[source] -= old_cost
+        if not ring:
+            self._last.pop(source, None)
         return event
 
     def _append(self, source: str, time: str, message: str, fields: Optional[Dict[str, Any]],
@@ -215,12 +227,26 @@ class LogStore:
     # -- reading --
 
     def snapshot(self) -> List[Dict[str, Any]]:
+        """Every event, in the order in which they were added (the rings merged)."""
         with self._lock:
-            return [e for e, _ in self._events]
+            rings = [r for r in self._rings.values() if r]
+            return [e for e, _, _ in heapq.merge(*rings, key=lambda item: item[2])]
+
+    def get(self, event_id: str) -> Optional[Dict[str, Any]]:
+        """The event with this id, or ``None`` when it is gone (or never was)."""
+        source = str(event_id).rpartition("-")[0]
+        with self._lock:
+            ring = self._rings.get(source)
+            if ring is None:
+                return None
+            for event, _, _ in reversed(ring):
+                if event["id"] == event_id:
+                    return event
+        return None
 
     def counts(self) -> Dict[str, int]:
         with self._lock:
-            return {s: self._counts.get(s, 0) for s in SOURCES}
+            return {s: len(self._rings[s]) for s in SOURCES}
 
     def last_time(self, source: str) -> Optional[str]:
         with self._lock:
@@ -232,7 +258,7 @@ class LogStore:
 
     def sources(self) -> List[Dict[str, Any]]:
         with self._lock:
-            return [{"source": s, "count": self._counts.get(s, 0), "last_time": self._last.get(s),
+            return [{"source": s, "count": len(self._rings[s]), "last_time": self._last.get(s),
                      "status": self._status.get(s, ("ok", ""))[0], "hint": self._status.get(s, ("ok", ""))[1]}
                     for s in SOURCES]
 
@@ -412,7 +438,7 @@ def _script_block_event(block_id: str, parts: List[Dict[str, Any]]) -> Tuple[flo
     script = "".join(by_number[n]["data"].get("ScriptBlockText", "") for n in numbers)
     fields = _common_fields(first)
     fields.update({"script_block_id": block_id, "message_number": numbers[0], "message_total": total,
-                   "path": first["data"].get("Path", ""), "script": script})
+                   "path": first["data"].get("Path", "")})
     if numbers != list(range(1, total + 1)):
         fields["partial"] = True
     return first["epoch"], {"time": _iso(first["epoch"], True), "source": "powershell",
@@ -431,7 +457,7 @@ def _powershell_event(ev: Dict[str, Any]) -> Dict[str, Any]:
         fields.update({"script_block_id": data.get("ScriptBlockId", ""),
                        "message_number": _to_int(data.get("MessageNumber")),
                        "message_total": _to_int(data.get("MessageTotal")),
-                       "path": data.get("Path", ""), "script": script})
+                       "path": data.get("Path", "")})
         message = script
     elif eid == 4103:
         payload, context = data.get("Payload", ""), data.get("ContextInfo", "")
@@ -675,8 +701,9 @@ class Collector:
             if isinstance(item, dict) and item.get("error") and not item.get("event_id"):
                 raise RuntimeError(str(item["error"]))
         cutoff = now - START_WINDOW_S
-        newest = self._sysmon_since
-        first = self._sysmon_since is None
+        previous = self._sysmon_since
+        newest_seen: Optional[float] = None
+        first = previous is None
         new_dns: List[Dict[str, Any]] = []
         for ev in raw:
             if not isinstance(ev, dict):
@@ -687,14 +714,23 @@ class Collector:
             key = json.dumps(ev, sort_keys=True, default=str)
             if ev.get("event_id") == 3:
                 self._conns.setdefault(key, (epoch, ev))
-            elif ev.get("event_id") == 22 and key not in self._dns_seen:
-                self._dns_seen[key] = epoch
-                new_dns.append(ev)
+            elif ev.get("event_id") == 22:
+                if key not in self._dns_seen:
+                    self._dns_seen[key] = epoch
+                    new_dns.append(ev)
             else:
                 continue
-            if newest is None or epoch - SYSMON_OVERLAP_S > newest:
-                newest = epoch - SYSMON_OVERLAP_S
-        self._sysmon_since = newest
+            # a timestamp in the future (clock skew) must not move the position beyond now
+            epoch = min(epoch, now)
+            if newest_seen is None or epoch > newest_seen:
+                newest_seen = epoch
+        if newest_seen is not None:
+            candidate = newest_seen - SYSMON_OVERLAP_S
+            if previous is not None and candidate <= previous and len(raw) >= SYSMON_PAGE:
+                # a full page that lies within the overlap: without this the next read returns it again
+                candidate = newest_seen
+            if previous is None or candidate > previous:
+                self._sysmon_since = candidate
         self._conns = {k: v for k, v in self._conns.items() if v[0] >= cutoff}
         if len(self._conns) > SYSMON_CACHE_LIMIT:
             keep = sorted(self._conns.items(), key=lambda kv: kv[1][0])[-SYSMON_CACHE_LIMIT:]

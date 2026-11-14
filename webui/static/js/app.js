@@ -12056,6 +12056,8 @@ const LOGS_LAST_KEY = 'tdc.logs.last';
 const LOGS_RECENT_MAX = 10;
 const LOGS_LIVE_MS = 10000;
 const LOGS_PAGE = 200;
+// characters of a whole event (fetched after a search cut it) shown raw
+const LOGS_RAW_FULL_LIMIT = 1000000;
 const LOGS_PAGE_MAX = 1000;
 const LOGS_EXAMPLES = [
     { label: 'PowerShell script blocks', query: 'source=powershell' },
@@ -12078,7 +12080,7 @@ const LOGS_SYNTAX_HINT = [
     'Example: source=mcp | stats count by tool',
 ].join('\n');
 // What is searched and what came back; openIds holds the ids of the unfolded events
-let logsState = { query: '*', earliest: '-24h', latest: '', live: false, result: null, openIds: new Set() };
+let logsState = { query: '*', earliest: '-24h', latest: '', live: false, result: null, openIds: new Set(), full: new Map() };
 let logsSeq = 0;                       // a response older than the last request is dropped
 let logsReady = false;
 let logsLimit = LOGS_PAGE;
@@ -12610,7 +12612,11 @@ function logsValueHtml(name, value, terms) {
         : `<span class="logs-fv logs-fv-plain">${html}</span>`;
 }
 
-function logsEventDetailHtml(ev, terms) {
+function logsEventDetailHtml(shownEvent, terms) {
+    // a search cuts long values (truncated_fields); the whole event is fetched when it is unfolded
+    const loaded = shownEvent.truncated_fields ? logsState.full.get(String(shownEvent.id)) : null;
+    const full = loaded && loaded.fields ? loaded : null;
+    const ev = full || shownEvent;
     const fields = ev.fields && typeof ev.fields === 'object' ? ev.fields : {};
     const rows = [['time', ev.time], ['source', ev.source], ...Object.keys(fields).sort().map(k => [k, fields[k]])];
     const grid = rows.filter(([, v]) => v !== null && v !== undefined && v !== '').map(([k, v]) => {
@@ -12618,10 +12624,36 @@ function logsEventDetailHtml(ev, terms) {
         return `<div class="logs-detail-key">${escapeHtml(k)}</div><div class="logs-detail-val">${items.map(item => logsValueHtml(k, item, terms)).join(' ')}</div>`;
     }).join('');
     const raw = String(ev.message ?? '');
-    const cut = raw.length > 20000;
+    const limit = full ? LOGS_RAW_FULL_LIMIT : 20000;
+    const cut = raw.length > limit;
+    let note = '';
+    if (shownEvent.truncated_fields && !full) {
+        note = loaded && loaded.missing
+            ? '<div class="logs-raw-note">The full event is no longer in the store; the first 64 KB of each long value are shown.</div>'
+            : '<div class="logs-raw-note">Loading the full event…</div>';
+    }
     return `<div class="logs-event-detail"><div class="logs-detail-grid">${grid}</div>`
-        + `<div class="logs-raw-label">RAW</div><pre class="logs-raw">${logsHighlight(cut ? raw.slice(0, 20000) : raw, terms)}</pre>`
-        + (cut ? `<div class="logs-raw-note">${logsNumber(raw.length - 20000)} more characters are not shown.</div>` : '') + '</div>';
+        + `<div class="logs-raw-label">RAW</div><pre class="logs-raw">${logsHighlight(cut ? raw.slice(0, limit) : raw, terms)}</pre>`
+        + (cut ? `<div class="logs-raw-note">${logsNumber(raw.length - limit)} more characters are not shown.</div>` : '') + note + '</div>';
+}
+
+// The whole event of one a search cut (GET /api/logs/event/<id>), kept for the
+// next unfold; a few are kept, the oldest go first
+async function logsLoadFull(id) {
+    const key = String(id);
+    if (logsState.full.has(key)) return;
+    logsState.full.set(key, null);
+    while (logsState.full.size > 20) logsState.full.delete(logsState.full.keys().next().value);
+    let value = { missing: true };
+    try {
+        const resp = await fetch(`/api/logs/event/${encodeURIComponent(key)}`);
+        if (resp.ok) value = await resp.json();
+    } catch (e) {
+        logsState.full.delete(key);
+        return;
+    }
+    logsState.full.set(key, value);
+    if (logsState.openIds.has(key) && logsState.result) renderLogsResultBody(logsState.result);
 }
 
 // The list: a row a click unfolds (time, source, the message cut to two
@@ -12649,8 +12681,13 @@ function logsEventsHtml(events, terms, result) {
 
 function toggleLogsEvent(id) {
     const key = String(id ?? '');
-    if (logsState.openIds.has(key)) logsState.openIds.delete(key);
-    else logsState.openIds.add(key);
+    if (logsState.openIds.has(key)) {
+        logsState.openIds.delete(key);
+    } else {
+        logsState.openIds.add(key);
+        const events = logsState.result && Array.isArray(logsState.result.events) ? logsState.result.events : [];
+        if (events.some(ev => ev && String(ev.id) === key && ev.truncated_fields)) logsLoadFull(key);
+    }
     if (logsState.result) renderLogsResultBody(logsState.result);
 }
 
