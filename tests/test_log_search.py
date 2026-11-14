@@ -3,6 +3,7 @@
 Every test uses the fixed NOW below: no wall clock and no local time zone.
 """
 
+import json
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -516,6 +517,106 @@ def test_other_malformed_queries_are_search_errors_not_crashes(query):
 def test_too_many_time_buckets_is_an_error():
     with pytest.raises(SearchError):
         run("| timechart span=1s count", [ev("x1", 10, "dns", "m"), ev("x2", 10 + 86400 * 30, "dns", "m")])
+
+
+# ---- robustness: nesting, huge numbers, extreme times -------------------------------------
+
+
+def _strict_json(result):
+    json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.parametrize("query", ["(" * 300, "(" * 300 + "a" + ")" * 300, "NOT " * 900 + "a",
+                                   "(" * 60 + "a" + ")" * 60, "(NOT " * 30 + "a" + ")" * 30],
+                         ids=["open-300", "balanced-300", "not-1000", "paren-60", "paren-not-30"])
+def test_deep_nesting_is_a_search_error_not_a_recursion_error(query):
+    with pytest.raises(SearchError) as e:
+        run(query)
+    assert e.value.args[0] == "Query too nested" and 0 <= e.value.pos <= len(query)
+    with pytest.raises(SearchError):
+        ls.parse(query)
+
+
+def test_reasonable_nesting_still_works():
+    assert len(run("(" * 20 + "source=dns" + ")" * 20)["events"]) == 7
+    assert len(run("NOT " * 21 + "source=dns")["events"]) == len(EVENTS) - 7
+    assert len(run("zzz OR " * 500 + "evil")["events"]) == 3
+
+
+BIG_EVENTS = [ev("b1", 10, "dns", "m", c="1e999", d=10 ** 400, e=1e308, f="x", g=3),
+              ev("b2", 20, "dns", "m", c="1e999", d=10 ** 400 + 1, e=1e308, f="y", g=4)]
+
+
+@pytest.mark.parametrize("query", [
+    "c>5", "c=5", "d>5", "d=5", "d<=1e9", "g<d", "e>1", "| sort c", "| sort -d", "| sort d, e",
+    "| stats sum(c)", "| stats max(c), min(c), avg(c), dc(c), values(c)", "| stats sum(d)", "| stats avg(d), max(d)",
+    "| stats sum(e)", "| stats avg(e)", "| stats sum(e) by f", "| stats avg(e), min(e), max(e) by f",
+    "| top d", "| table c, d, e", "| dedup d | stats sum(g)", "c=1e999", "d>1e999",
+])
+def test_huge_numbers_never_crash_or_leak_inf_and_nan(query):
+    r = run(query, BIG_EVENTS)
+    _strict_json({k: v for k, v in r.items() if k != "events"})
+
+
+def test_huge_number_semantics():
+    assert ls._num("1e999") is None and ls._num(10 ** 400) is None and ls._num(float("inf")) is None
+    assert ls._num("1e308") == 1e308
+    r = run("| stats sum(e) as s, avg(e) as a, max(e) as m", BIG_EVENTS)
+    row = dict(zip(r["columns"], r["rows"][0]))
+    assert row["s"] is None and row["a"] is None and row["m"] == 1e308
+    assert run("| stats sum(c)", BIG_EVENTS)["rows"] == [[None]]
+    assert len(run("c=1e999", BIG_EVENTS)["events"]) == 2  # text equality
+    assert ids(run("g<5", BIG_EVENTS)) == ["b1", "b2"]
+
+
+@pytest.mark.parametrize("value", ["1960-01-01", "1969-12-31T23:59:59Z", "-999999999w", "-5000w", "-99999999999d",
+                                   "0001-01-01", "9999-12-31T23:59:59-05:00", "+999999999w"])
+def test_times_outside_1970_to_9999_are_invalid(value):
+    for q in (f"earliest={value}", f"latest={value}"):
+        with pytest.raises(SearchError) as e:
+            run(q)
+        assert e.value.args[0] == f"Invalid time: {value}"
+    with pytest.raises(SearchError) as e:
+        run("a", earliest=value)
+    assert e.value.args[0] == f"Invalid time: {value}"
+    with pytest.raises(SearchError):
+        ls.resolve_time(value, NOW)
+
+
+def test_times_at_the_edges_of_the_range_are_fine():
+    assert ls.resolve_time("1970-01-01", NOW).year == 1970
+    assert ls.resolve_time("9999-12-31T23:59:59Z", NOW).year == 9999
+    r = run("earliest=1970-01-01 latest=9999-12-31T23:59:59Z | timechart count", EVENTS)
+    assert r["type"] == "timechart" and len(r["rows"]) <= 1000
+    _strict_json(r)
+    h = run("earliest=1970-01-01", EVENTS)["histogram"]
+    assert 1 <= len(h["bins"]) <= 70 and h["bins"][0]["start"] == "1970-01-01T00:00:00Z"
+    h = run("latest=9999-12-31", EVENTS)["histogram"]
+    assert 1 <= len(h["bins"]) <= 70 and h["bins"][-1]["end"] <= "9999-12-31T23:59:59Z"
+
+
+def test_events_with_out_of_range_times_are_handled():
+    events = [{"id": "old", "time": "1960-05-05T00:00:00Z", "source": "dns", "message": "m", "fields": {}},
+              {"id": "far", "time": "9999-12-31T23:59:59Z", "source": "dns", "message": "m", "fields": {}},
+              {"id": "ok", "time": "2026-11-14T11:59:00Z", "source": "dns", "message": "m", "fields": {}}]
+    for q in ["", "| timechart count", "| stats count by source", "| timechart count by source"]:
+        _strict_json(run(q, events))
+    with pytest.raises(SearchError):
+        run("| timechart span=1d count", events)  # 8000 years of daily buckets
+    assert ids(run("", events))[0] in ("far", "ok")
+
+
+def test_timechart_bins_are_bounded():
+    events = [ev("x1", 10, "dns", "m"), ev("x2", 10 + 86400 * 365, "dns", "m")]
+    for q in ("| timechart span=1s count", "| timechart span=1m count", "| timechart span=5m count by source"):
+        with pytest.raises(SearchError) as e:
+            run(q, events)
+        assert e.value.args[0] == "Too many time buckets; use a larger span"
+    r = run("| timechart span=1d count", events)
+    assert 360 <= len(r["rows"]) <= 1000
+    r = run("| timechart count", events)
+    assert len(r["rows"]) <= 100
+    _strict_json(r)
 
 
 # ---- AST -------------------------------------------------------------------------------------

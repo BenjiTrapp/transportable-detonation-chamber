@@ -32,7 +32,6 @@ from __future__ import annotations
 import math
 import operator
 import re
-import time
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -40,7 +39,8 @@ from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Tu
 
 MAX_QUERY_LEN = 4000
 MAX_VALUES = 100
-MAX_TIMECHART_BINS = 5000
+MAX_TIMECHART_BINS = 1000
+MAX_NESTING = 50
 MAX_TIMECHART_SERIES = 10
 HISTOGRAM_BINS = 60
 SIDEBAR_VALUES = 10
@@ -52,6 +52,9 @@ _NICE_SPANS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10
                86400, 172800, 604800, 2592000]
 _EPOCH_ORDINAL = date(1970, 1, 1).toordinal()
 _SEP = "\x00"
+# Times outside 1970-01-01..9999-12-31 are rejected: strftime/gmtime cannot show them everywhere.
+_MAX_EPOCH = 253402300800
+_PARSE_ANCHOR = 2000000000.0
 
 _ISO = re.compile(
     r"^(\d{4})-(\d\d)-(\d\d)(?:[T ](\d\d):(\d\d)(?::(\d\d)(?:[.,](\d+))?)?)?\s*(Z|[+-]\d\d(?::?\d\d)?)?$")
@@ -95,22 +98,27 @@ def _parse_iso(value: str) -> Optional[float]:
             epoch -= offset if zone[0] == "+" else -offset
     except (ValueError, OverflowError):
         return None
-    return float(epoch)
+    return float(epoch) if 0 <= epoch < _MAX_EPOCH else None
 
 
 def _iso(epoch: float) -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+    """ISO-8601 UTC text, clamped to 1970..9999 (no gmtime: it fails on negative values on Windows)."""
+    epoch = min(max(epoch, 0.0), _MAX_EPOCH - 1.0)
+    return (datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(seconds=int(epoch))).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _to_epoch(value: str, now_epoch: float) -> Optional[float]:
     """Epoch seconds of ``now``, a relative time (-15m) or an ISO-8601 time; None when invalid."""
     if value == "now":
-        return now_epoch
-    m = _REL.match(value)
-    if m:
-        delta = int(m.group(2)) * _UNITS[m.group(3)]
-        return now_epoch - delta if m.group(1) == "-" else now_epoch + delta
-    return _parse_iso(value)
+        epoch: Optional[float] = now_epoch
+    else:
+        m = _REL.match(value)
+        if m:
+            delta = int(m.group(2)) * _UNITS[m.group(3)]
+            epoch = now_epoch - delta if m.group(1) == "-" else now_epoch + delta
+        else:
+            epoch = _parse_iso(value)
+    return epoch if epoch is not None and 0 <= epoch < _MAX_EPOCH else None
 
 
 def _now_epoch(now: datetime) -> float:
@@ -161,20 +169,34 @@ def _text(v: Any) -> str:
 def _num(v: Any) -> Optional[float]:
     if isinstance(v, bool):
         return None
-    if isinstance(v, (int, float)):
-        return float(v) if math.isfinite(v) else None
-    if isinstance(v, str) and _NUMBER.match(v.strip()):
-        try:
-            return float(v)
-        except ValueError:
+    if isinstance(v, str):
+        if not _NUMBER.match(v.strip()):
             return None
-    return None
+    elif not isinstance(v, (int, float)):
+        return None
+    try:
+        f = float(v)
+    except (ValueError, OverflowError):
+        return None
+    return f if math.isfinite(f) else None
 
 
 def _clean(x: float) -> Any:
+    """A number for a result cell; None when it is not finite (JSON has no inf/nan)."""
+    if not math.isfinite(x):
+        return None
     if x == int(x) and abs(x) < 1e15:
         return int(x)
     return round(x, 6)
+
+
+def _finite(v: Any) -> Any:
+    """A result cell without inf/nan (JSON cannot carry them); lists are checked item by item."""
+    if isinstance(v, float):
+        return v if math.isfinite(v) else None
+    if isinstance(v, (list, tuple)):
+        return [_finite(x) for x in v]
+    return v
 
 
 def _scalar(v: Any) -> Any:
@@ -339,6 +361,7 @@ class _Parser:
         self.text = text
         self.toks = _tokenize(text)
         self.i = 0
+        self.depth = 0
         self.earliest: Optional[str] = None
         self.latest: Optional[str] = None
 
@@ -401,16 +424,27 @@ class _Parser:
                 nodes.append(self.not_expr(""))
         return nodes[0] if len(nodes) == 1 else ("and", nodes)
 
+    def enter(self, t: Token) -> None:
+        """Count one level of nesting (parenthesis or NOT); the AST and its compiler recurse as deep."""
+        self.depth += 1
+        if self.depth > MAX_NESTING:
+            raise SearchError("Query too nested", t.pos)
+
     def not_expr(self, ctx: str) -> tuple:
-        if self.is_kw(self.peek(), "NOT"):
+        t = self.peek()
+        if self.is_kw(t, "NOT"):
+            self.enter(t)
             self.next()
-            return ("not", self.not_expr("NOT"))
+            node = ("not", self.not_expr("NOT"))
+            self.depth -= 1
+            return node
         return self.primary(ctx)
 
     def primary(self, ctx: str) -> tuple:
         self.skip_commas()
         t = self.peek()
         if t.kind == "lp":
+            self.enter(t)
             self.next()
             if self.peek().kind == "rp":
                 raise SearchError("Expected a search term", self.peek().pos)
@@ -418,6 +452,7 @@ class _Parser:
             if self.peek().kind != "rp":
                 raise SearchError("Unbalanced parenthesis", t.pos)
             self.next()
+            self.depth -= 1
             return node
         if t.kind in ("word", "str"):
             return self.term()
@@ -437,7 +472,7 @@ class _Parser:
         if t.kind == "word" and t.value in ("earliest", "latest"):
             if op.value != "=":
                 raise SearchError(f"Expected = after {t.value}", op.pos)
-            if _to_epoch(v.value, 0.0) is None:
+            if _to_epoch(v.value, _PARSE_ANCHOR) is None:
                 raise SearchError(f"Invalid time: {v.value}", v.pos)
             if t.value == "earliest":
                 self.earliest = v.value
@@ -773,7 +808,7 @@ def _aggregate(func: str, arg: Optional[str], items: List[Dict[str, Any]], get) 
     if func == "sum":
         return _clean(sum(nums)) if nums else None
     if func == "avg":
-        return round(sum(nums) / len(nums), 4) if nums else None
+        return _clean(round(sum(nums) / len(nums), 4)) if nums else None
     if not values:
         return None
     if len(nums) == len(values):
@@ -1033,7 +1068,7 @@ def run(query: str, events: Iterable[Dict[str, Any]], now: datetime, earliest: O
     }
     if state.rows:
         result["columns"] = state.columns
-        result["rows"] = [[row.get(c) for c in state.columns or []] for row in shown]
+        result["rows"] = [[_finite(row.get(c)) for c in state.columns or []] for row in shown]
     else:
         result["events"] = shown
     return result
