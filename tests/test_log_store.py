@@ -513,3 +513,193 @@ def test_firewall_hint_without_data_is_unavailable():
     c.tick()
     row = {s["source"]: s for s in store.sources()}["firewall"]
     assert row["status"] == "unavailable" and row["hint"] == "Windows Firewall logging is off"
+
+
+# ---- review fixes ------------------------------------------------------------------------
+
+
+def test_lone_surrogate_in_an_event_does_not_break_add_and_survives_the_file(tmp_path):
+    s = ls.LogStore(persist_dir=str(tmp_path))
+    e = s.add("mcp", "2026-11-14T10:00:00Z", "tool x\ud800y", {"arg": "\ud800"})
+    assert e["id"] == "mcp-1" and s.counts()["mcp"] == 1
+    s2 = ls.LogStore(persist_dir=str(tmp_path))
+    assert s2.load_persisted() == 1
+    assert s2.snapshot()[0]["fields"] == {"arg": "\ud800"}
+
+
+def test_any_persist_error_is_swallowed_once(tmp_path, caplog):
+    class Bad:
+        def __str__(self):
+            raise RuntimeError("no text")
+
+    s = ls.LogStore(persist_dir=str(tmp_path))
+    assert s.add("access", "2026-11-14T10:00:00Z", "a", {"o": Bad()})["id"] == "access-1"
+    assert s.add("access", "2026-11-14T10:00:01Z", "b", {"o": Bad()})["id"] == "access-2"
+    assert len([r for r in caplog.records if "persistence failed" in r.getMessage()]) == 1
+
+
+def test_store_has_a_character_budget_that_evicts_whole_oldest_events():
+    assert ls.MAX_CHARS == 200_000_000
+    s = ls.LogStore(max_events=100, max_chars=100)
+    s.add("access", "2026-11-14T10:00:01Z", "a" * 40, {})
+    s.add("dns", "2026-11-14T10:00:02Z", "b" * 30, {"query": "q" * 10})
+    assert s.counts()["access"] == 1
+    s.add("mcp", "2026-11-14T10:00:03Z", "c" * 40, {})
+    assert [e["source"] for e in s.snapshot()] == ["dns", "mcp"]
+    assert s.counts()["access"] == 0 and s.last_time("access") is None
+    assert s.snapshot()[1]["message"] == "c" * 40          # never shortened
+
+
+def test_an_event_over_the_budget_alone_is_kept_whole():
+    s = ls.LogStore(max_chars=10)
+    s.add("access", "2026-11-14T10:00:01Z", "old", {})
+    s.add("access", "2026-11-14T10:00:02Z", "x" * 50, {})
+    assert [e["message"] for e in s.snapshot()] == ["x" * 50]
+
+
+def test_budget_counts_string_fields_and_replaced_netflows():
+    s = ls.LogStore(max_chars=60)
+    s.add("access", "2026-11-14T10:00:01Z", "m", {"path": "p" * 50})
+    s.replace_netflows([{"time": "2026-11-14T10:00:02Z", "message": "n" * 30, "fields": {"image": "i" * 20}}])
+    assert [e["source"] for e in s.snapshot()] == ["netflow"]
+
+
+def test_a_failing_chunk_is_skipped_and_counted(monkeypatch):
+    real = ls._xml_event
+
+    def flaky(chunk):
+        if "<EventID>4100</EventID>" in chunk:
+            raise RuntimeError("boom")
+        return real(chunk)
+
+    monkeypatch.setattr(ls, "_xml_event", flaky)
+    stats = {}
+    events = ls.parse_powershell_events(sample("ps_misc.xml"), stats)
+    assert [e["fields"]["event_id"] for e in events] == [4103, 4104]
+    assert stats == {"skipped": 2}          # the broken XML and the failing chunk
+
+
+def test_powershell_position_advances_past_skipped_events(monkeypatch):
+    real = ls._xml_event
+    monkeypatch.setattr(ls, "_xml_event", lambda c: (_ for _ in ()).throw(RuntimeError("x"))
+                        if "<EventID>4100<" in c else real(c))
+    r = Readers()
+    store, c = make_collector(r)
+    c.tick()
+    row = {s["source"]: s for s in store.sources()}["powershell"]
+    assert row["status"] == "ok" and row["hint"] == "2 events could not be parsed"
+    c.tick()
+    assert r.ps_calls == [None, 203]
+    assert {s["source"]: s for s in store.sources()}["powershell"]["hint"] == ""
+
+
+@pytest.mark.parametrize("frac,expected", [("", 0.0), (".1", 0.1), (".123", 0.123), (".1234567", 0.123456)])
+def test_fractions_of_any_length_parse(frac, expected):
+    base = ls._sysmon_epoch("2026-11-14T10:00:00Z")
+    assert ls._sysmon_epoch(f"2026-11-14T10:00:00{frac}Z") == pytest.approx(base + expected, abs=1e-6)
+    assert ls._sysmon_epoch(f"2026-11-14T11:00:00{frac}+01:00") == pytest.approx(base + expected, abs=1e-6)
+    xml = ('<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><EventID>4100</EventID>'
+           f'<TimeCreated SystemTime="2026-11-14T10:00:00{frac}Z"/></System><EventData>'
+           '<Data Name="Payload">err</Data></EventData></Event>')
+    assert len(ls.parse_powershell_events(xml)) == 1
+
+
+def flow(ts, port=443, count=1, host="h"):
+    fields = {"image": "a.exe", "pid": 1, "protocol": "tcp", "src_ip": "10.0.0.1", "dst_ip": "1.2.3.4",
+              "dst_port": port, "dst_hostname": host, "count": count}
+    return {"time": ts, "source": "netflow", "message": f"a.exe -> {port}", "fields": fields}
+
+
+def test_a_flow_keeps_its_id_across_replacements():
+    s = ls.LogStore()
+    s.add("dns", "2026-11-14T10:00:00Z", "d", {})
+    first = s.replace_netflows([flow("2026-11-14T10:00:01Z", 443), flow("2026-11-14T10:00:02Z", 80)])
+    ids = {e["fields"]["dst_port"]: e["id"] for e in first}
+    second = s.replace_netflows([flow("2026-11-14T10:00:09Z", 80, count=2), flow("2026-11-14T10:00:03Z", 443, 5),
+                                 flow("2026-11-14T10:00:10Z", 22)])
+    again = {e["fields"]["dst_port"]: e["id"] for e in second}
+    assert again[443] == ids[443] and again[80] == ids[80]
+    assert again[22] not in ids.values()
+    assert len({e["id"] for e in s.snapshot()}) == len(s.snapshot()) == 4
+    assert [e["fields"]["dst_port"] for e in s.snapshot() if e["source"] == "netflow"] == [443, 80, 22]
+    third = s.replace_netflows([flow("2026-11-14T10:00:20Z", 22)])
+    assert third[0]["id"] == again[22]
+    fourth = s.replace_netflows([flow("2026-11-14T10:00:21Z", 443)])
+    assert fourth[0]["id"] != ids[443]                       # a flow that was gone gets a new id
+
+
+def test_collector_netflow_ids_are_stable_between_ticks():
+    r = Readers()
+    r.sysmon = [conn("2026-11-14T11:00:01+01:00")]
+    store, c = make_collector(r)
+    c.tick()
+    before = [e["id"] for e in store.snapshot() if e["source"] == "netflow"]
+    r.sysmon = [conn("2026-11-14T11:00:09+01:00")]
+    c.tick()
+    assert [e["id"] for e in store.snapshot() if e["source"] == "netflow"] == before
+
+
+@pytest.mark.parametrize("stamp", ["0001-01-01 00:00:00", "9999-12-31 23:59:59"])
+@pytest.mark.parametrize("offset", [None, -14 * 3600, 14 * 3600])
+def test_out_of_range_firewall_dates_are_skipped(stamp, offset):
+    text = (f"{stamp} ALLOW TCP 1.1.1.1 2.2.2.2 1 2 0 - - - - - - - SEND 7\n"
+            "2026-11-14 10:00:00 ALLOW TCP 1.1.1.1 2.2.2.2 1 2 0 - - - - - - - SEND 7\n")
+    events = ls.parse_firewall_log(text, utc_offset_s=offset)
+    assert [e["time"][:4] for e in events if e["time"].startswith("2026")] == ["2026"]
+
+
+def test_out_of_range_sysmon_time_is_skipped():
+    for stamp in ("0001-01-01T00:00:00", "9999-12-31T23:59:59", "0001-01-01T00:00:00+14:00"):
+        assert ls._sysmon_epoch(stamp) is None or isinstance(ls._sysmon_epoch(stamp), float)
+
+
+def test_firewall_incomplete_last_line_is_left_for_the_next_read():
+    complete = "2026-11-14 10:00:01 ALLOW TCP 10.0.0.5 1.2.3.4 52311 443 0 - - - - - - - SEND 7\n"
+    rest = "2026-11-14 10:00:02 DROP UDP 10.0.0.5 1.2.3.4 5000 53 0 - - - - - - - SEND 7\n"
+    cut = len(rest) - 9
+    calls = []
+
+    def fw(offset):
+        calls.append(offset)
+        if offset is None:
+            return complete + rest[:cut], 5000, ""
+        assert offset == 5000 - cut
+        return rest, offset + len(rest), ""
+
+    r = Readers()
+    r.ps_xml = ""
+    store = ls.LogStore()
+    c = ls.Collector(store, r.powershell, r.sysmon_read, fw, lambda: NOW, utc_offset_s=0)
+    c.tick()
+    assert store.counts()["firewall"] == 1
+    c.tick()
+    assert calls == [None, 5000 - cut]
+    assert [e["fields"]["dst_port"] for e in store.snapshot() if e["source"] == "firewall"] == [443, 53]
+    c.tick()
+    assert store.counts()["firewall"] == 2
+
+
+def test_firewall_text_without_any_newline_is_not_consumed():
+    calls = []
+
+    def fw(offset):
+        calls.append(offset)
+        return "2026-11-14 10:00:01 ALLOW TCP 10.0", (offset or 0) + 34, ""
+
+    r = Readers()
+    store = ls.LogStore()
+    c = ls.Collector(store, r.powershell, r.sysmon_read, fw, lambda: NOW, utc_offset_s=0)
+    c.tick()
+    c.tick()
+    assert calls == [None, 0]
+
+
+def test_dns_seen_cache_is_capped(monkeypatch):
+    monkeypatch.setattr(ls, "DNS_SEEN_LIMIT", 3)
+    r = Readers()
+    r.sysmon = [{"timestamp": f"2026-11-14T11:00:{i:02d}+01:00", "event_id": 22, "pid": "1", "image": "a.exe",
+                 "query": f"q{i}.example", "result": "1.2.3.4"} for i in range(10)]
+    store, c = make_collector(r)
+    c.tick()
+    assert len(c._dns_seen) == 3
+    assert store.counts()["dns"] == 10

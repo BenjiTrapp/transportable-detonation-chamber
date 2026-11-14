@@ -22,6 +22,16 @@ reader returns at most the last 24 h and 5000 entries; the collector trims too):
     read_sysmon(event_ids, since_iso) -> [event dict as _read_sysmon_events]
     read_firewall(offset)            -> (text, new_offset, status_hint)
 
+``read_firewall``: ``offset`` is a byte offset into the log file and ``new_offset`` is
+the byte offset right after the returned ``text`` (decoded as UTF-8 or ASCII). The
+text may end in the middle of a line (the firewall is still writing it); the
+collector only consumes whole lines and moves ``new_offset`` back by the bytes of
+the unfinished last line, so the next read starts at its beginning. A last line
+longer than 64 KB without a newline is consumed as it is.
+``read_powershell``: the position moves to ``max_record_id`` even when some of the
+returned events cannot be parsed (they are skipped and counted in the source hint).
+The store holds at most 50 000 events and 200 million characters of text.
+
 A reader that raises, or a Sysmon reader that returns ``{"error": ...}``, marks
 its sources ``unavailable`` with the first line of the message; the other sources
 carry on.
@@ -45,10 +55,13 @@ SOURCES = ("powershell", "access", "mcp", "netflow", "dns", "firewall")
 PERSISTED_SOURCES = ("access", "mcp")
 
 MAX_EVENTS = 50000
+MAX_CHARS = 200_000_000
 ROTATE_BYTES = 10 * 1024 * 1024
 START_WINDOW_S = 24 * 3600
 START_LIMIT = 5000
 SYSMON_CACHE_LIMIT = 20000
+DNS_SEEN_LIMIT = 20000
+MAX_PENDING_LINE = 65536
 SYSMON_OVERLAP_S = 5
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -64,21 +77,22 @@ def _iso(epoch: float, millis: bool = False) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-_FRACTION = re.compile(r"(\.\d{1,6})\d*")
+_FRACTION = re.compile(r"\.(\d+)")
 
 
 def _sysmon_epoch(value: Any) -> Optional[float]:
     """Epoch seconds of a Sysmon event timestamp (ISO with offset, or ``Z``); naive means local time."""
     if not isinstance(value, str) or not value:
         return None
-    text = _FRACTION.sub(r"\1", value.strip().replace("Z", "+00:00"), count=1)
+    # Python 3.9 reads only 3 or 6 fractional digits
+    text = _FRACTION.sub(lambda m: "." + (m.group(1) + "000000")[:6], value.strip().replace("Z", "+00:00"), count=1)
     try:
         dt = datetime.fromisoformat(text)
-    except ValueError:
+        if dt.tzinfo is None:
+            dt = dt.astimezone()
+        return (dt - _EPOCH).total_seconds()
+    except (ValueError, OverflowError, OSError):
         return None
-    if dt.tzinfo is None:
-        dt = dt.astimezone()
-    return (dt - _EPOCH).total_seconds()
 
 
 def _sort_key(t: str) -> str:
@@ -87,16 +101,39 @@ def _sort_key(t: str) -> str:
     return base + "." + (frac + "000000")[:6]
 
 
+def _cost(event: Dict[str, Any]) -> int:
+    """Characters an event holds (message and string field values); the unit of the store's budget."""
+    total = len(event["message"]) if isinstance(event["message"], str) else 0
+    for v in event["fields"].values():
+        if isinstance(v, str):
+            total += len(v)
+        elif isinstance(v, (list, tuple)):
+            total += sum(len(x) for x in v if isinstance(x, str))
+    return total
+
+
+_FLOW_KEY_FIELDS = ("image", "pid", "protocol", "src_ip", "dst_ip", "dst_port")
+
+
+def _flow_key(fields: Optional[Dict[str, Any]]) -> Tuple:
+    f = fields or {}
+    return tuple(f.get(k) for k in _FLOW_KEY_FIELDS)
+
+
 # ---- store -----------------------------------------------------------------------------------
 
 
 class LogStore:
-    def __init__(self, max_events: int = MAX_EVENTS, persist_dir: Optional[str] = None):
+    def __init__(self, max_events: int = MAX_EVENTS, persist_dir: Optional[str] = None,
+                 max_chars: int = MAX_CHARS):
         self.max_events = max(1, int(max_events))
+        self.max_chars = max(1, int(max_chars))
         self.persist_dir = persist_dir
         self._lock = threading.Lock()
         self._io_lock = threading.Lock()
-        self._events: Deque[Dict[str, Any]] = deque()
+        self._events: Deque[Tuple[Dict[str, Any], int]] = deque()   # (event, characters)
+        self._chars = 0
+        self._flow_ids: Dict[Tuple, str] = {}
         self._counts: Counter = Counter()
         self._last: Dict[str, str] = {}
         self._status: Dict[str, Tuple[str, str]] = {}
@@ -113,26 +150,55 @@ class LogStore:
         return [self.add(e["source"], e["time"], e.get("message", ""), e.get("fields")) for e in events]
 
     def replace_netflows(self, flows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Replace every ``netflow`` event by ``flows`` (the re-bundled window) in one step."""
+        """Replace every ``netflow`` event by ``flows`` (the re-bundled window) in one step.
+
+        A flow with the same key (image, pid, protocol, addresses, port) as one
+        that is being replaced keeps its id, so the UI can follow it across polls.
+        """
         with self._lock:
-            self._events = deque(e for e in self._events if e["source"] != "netflow")
+            kept: Deque[Tuple[Dict[str, Any], int]] = deque()
+            for item in self._events:
+                if item[0]["source"] == "netflow":
+                    self._chars -= item[1]
+                else:
+                    kept.append(item)
+            self._events = kept
             self._counts["netflow"] = 0
             self._last.pop("netflow", None)
-            return [self._insert("netflow", f["time"], f.get("message", ""), f.get("fields")) for f in flows]
+            ids: Dict[Tuple, str] = {}
+            out = []
+            for f in sorted(flows, key=lambda f: _sort_key(f["time"])):
+                key = _flow_key(f.get("fields"))
+                event = self._insert("netflow", f["time"], f.get("message", ""), f.get("fields"),
+                                     event_id=None if key in ids else self._flow_ids.get(key))
+                ids[key] = event["id"]
+                out.append(event)
+            self._flow_ids = ids
+            return out
 
-    def _insert(self, source: str, time: str, message: str, fields: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-        """Add one event; the caller holds ``self._lock``."""
+    def _insert(self, source: str, time: str, message: str, fields: Optional[Dict[str, Any]],
+                event_id: Optional[str] = None) -> Dict[str, Any]:
+        """Add one event and evict; the caller holds ``self._lock``.
+
+        Eviction drops the event that was added first, whole, while there are
+        too many events or too many characters (the newest event always stays).
+        """
         if source not in SOURCES:
             raise ValueError(f"unknown log source: {source!r}")
-        self._seq += 1
-        event = {"id": f"{source}-{self._seq}", "time": time, "source": source,
+        if event_id is None:
+            self._seq += 1
+            event_id = f"{source}-{self._seq}"
+        event = {"id": event_id, "time": time, "source": source,
                  "message": message, "fields": dict(fields or {})}
-        self._events.append(event)
+        cost = _cost(event)
+        self._events.append((event, cost))
+        self._chars += cost
         self._counts[source] += 1
         if source not in self._last or _sort_key(time) > _sort_key(self._last[source]):
             self._last[source] = time
-        while len(self._events) > self.max_events:
-            old = self._events.popleft()
+        while len(self._events) > self.max_events or (self._chars > self.max_chars and len(self._events) > 1):
+            old, old_cost = self._events.popleft()
+            self._chars -= old_cost
             self._counts[old["source"]] -= 1
             if self._counts[old["source"]] <= 0:
                 self._last.pop(old["source"], None)
@@ -150,7 +216,7 @@ class LogStore:
 
     def snapshot(self) -> List[Dict[str, Any]]:
         with self._lock:
-            return list(self._events)
+            return [e for e, _ in self._events]
 
     def counts(self) -> Dict[str, int]:
         with self._lock:
@@ -176,26 +242,30 @@ class LogStore:
         return os.path.join(self.persist_dir or "", source + ".jsonl")
 
     def _persist(self, event: Dict[str, Any]) -> None:
+        try:
+            self._write(event)
+        except Exception as e:  # never let a log file problem reach the request that logged
+            if not self._persist_failed:
+                self._persist_failed = True
+                logger.warning("log persistence failed: %s: %s", type(e).__name__, e)
+
+    def _write(self, event: Dict[str, Any]) -> None:
         source = event["source"]
+        # ASCII-only JSON: a lone surrogate (cannot be encoded as UTF-8) stays a \udXXX escape
         line = json.dumps({k: event[k] for k in ("time", "source", "message", "fields")},
-                          ensure_ascii=False, default=str) + "\n"
-        data = line.encode("utf-8")
+                          default=str) + "\n"
+        data = line.encode("ascii")
         path = self._path(source)
         with self._io_lock:
-            try:
-                os.makedirs(self.persist_dir, exist_ok=True)
-                if source not in self._sizes:
-                    self._sizes[source] = os.path.getsize(path) if os.path.exists(path) else 0
-                if self._sizes[source] > 0 and self._sizes[source] + len(data) > ROTATE_BYTES:
-                    os.replace(path, path + ".1")
-                    self._sizes[source] = 0
-                with open(path, "ab") as f:
-                    f.write(data)
-                self._sizes[source] += len(data)
-            except OSError as e:
-                if not self._persist_failed:
-                    self._persist_failed = True
-                    logger.warning("log persistence failed: %s", e)
+            os.makedirs(self.persist_dir, exist_ok=True)
+            if source not in self._sizes:
+                self._sizes[source] = os.path.getsize(path) if os.path.exists(path) else 0
+            if self._sizes[source] > 0 and self._sizes[source] + len(data) > ROTATE_BYTES:
+                os.replace(path, path + ".1")
+                self._sizes[source] = 0
+            with open(path, "ab") as f:
+                f.write(data)
+            self._sizes[source] += len(data)
 
     def load_persisted(self) -> int:
         """Read the persisted files (old file first) back in time order; bad lines are ignored."""
@@ -281,45 +351,72 @@ def _xml_event(chunk: str) -> Optional[Dict[str, Any]]:
             "user_sid": sec.get("UserID", "") if sec is not None else "", "data": data}
 
 
-def parse_powershell_events(xml_text: str) -> List[Dict[str, Any]]:
+def _event_chunks(text: str) -> Iterable[str]:
+    """The ``<Event>...</Event>`` pieces of ``text``, one at a time (no copy of the whole text)."""
+    pos = 0
+    while True:
+        begin = text.find("<Event", pos)
+        if begin < 0:
+            return
+        end = text.find("</Event>", begin)
+        if end < 0:
+            yield text[begin:]
+            return
+        pos = end + len("</Event>")
+        yield text[begin:pos]
+
+
+def parse_powershell_events(xml_text: str, stats: Optional[Dict[str, int]] = None) -> List[Dict[str, Any]]:
     """Events of ``wevtutil qe Microsoft-Windows-PowerShell/Operational /f:xml`` (no root element).
 
     Script blocks split over several 4104 events are joined by ``ScriptBlockId``;
     a block with missing parts is marked ``partial``. Returns events without ``id``,
-    oldest first. Script text stays raw (escaping is the UI's job).
+    oldest first. Script text stays raw (escaping is the UI's job). An event that
+    cannot be parsed, for whatever reason, is skipped; ``stats["skipped"]`` gets the count.
     """
+    skipped = 0
     singles: List[Tuple[float, Dict[str, Any]]] = []
     blocks: Dict[str, List[Dict[str, Any]]] = {}
-    for chunk in (xml_text or "").split("</Event>"):
-        begin = chunk.find("<Event")
-        if begin < 0:
-            continue
-        ev = _xml_event(chunk[begin:] + "</Event>")
-        if ev is None:
-            continue
-        data = ev["data"]
-        if ev["event_id"] == 4104 and data.get("ScriptBlockId"):
-            blocks.setdefault(data["ScriptBlockId"], []).append(ev)
-            continue
-        singles.append((ev["epoch"], _powershell_event(ev)))
+    for chunk in _event_chunks(xml_text or ""):
+        try:
+            ev = _xml_event(chunk)
+            if ev is None:
+                skipped += 1
+                continue
+            data = ev["data"]
+            if ev["event_id"] == 4104 and data.get("ScriptBlockId"):
+                blocks.setdefault(data["ScriptBlockId"], []).append(ev)
+            else:
+                singles.append((ev["epoch"], _powershell_event(ev)))
+        except Exception:
+            skipped += 1
 
     for block_id, parts in blocks.items():
-        by_number: Dict[int, Dict[str, Any]] = {}
-        for p in parts:
-            by_number[_to_int(p["data"].get("MessageNumber")) or 1] = p
-        numbers = sorted(by_number)
-        first = by_number[numbers[0]]
-        total = max([_to_int(p["data"].get("MessageTotal")) or 1 for p in parts] + [len(numbers)])
-        script = "".join(by_number[n]["data"].get("ScriptBlockText", "") for n in numbers)
-        fields = _common_fields(first)
-        fields.update({"script_block_id": block_id, "message_number": numbers[0], "message_total": total,
-                       "path": first["data"].get("Path", ""), "script": script})
-        if numbers != list(range(1, total + 1)):
-            fields["partial"] = True
-        singles.append((first["epoch"], {"time": _iso(first["epoch"], True), "source": "powershell",
-                                         "message": script, "fields": fields}))
+        try:
+            singles.append(_script_block_event(block_id, parts))
+        except Exception:
+            skipped += len(parts)
+    if stats is not None:
+        stats["skipped"] = skipped
     singles.sort(key=lambda t: t[0])
     return [e for _, e in singles]
+
+
+def _script_block_event(block_id: str, parts: List[Dict[str, Any]]) -> Tuple[float, Dict[str, Any]]:
+    by_number: Dict[int, Dict[str, Any]] = {}
+    for p in parts:
+        by_number[_to_int(p["data"].get("MessageNumber")) or 1] = p
+    numbers = sorted(by_number)
+    first = by_number[numbers[0]]
+    total = max([_to_int(p["data"].get("MessageTotal")) or 1 for p in parts] + [len(numbers)])
+    script = "".join(by_number[n]["data"].get("ScriptBlockText", "") for n in numbers)
+    fields = _common_fields(first)
+    fields.update({"script_block_id": block_id, "message_number": numbers[0], "message_total": total,
+                   "path": first["data"].get("Path", ""), "script": script})
+    if numbers != list(range(1, total + 1)):
+        fields["partial"] = True
+    return first["epoch"], {"time": _iso(first["epoch"], True), "source": "powershell",
+                            "message": script, "fields": fields}
 
 
 def _common_fields(ev: Dict[str, Any]) -> Dict[str, Any]:
@@ -395,6 +492,10 @@ def parse_firewall_log(text: str, utc_offset_s: Optional[int] = None,
         epoch = _fw_epoch(row.get("date", ""), row.get("time", ""), utc_offset_s)
         if epoch is None:
             continue
+        try:
+            when = _iso(epoch)
+        except (ValueError, OverflowError, OSError):
+            continue
         ev_fields: Dict[str, Any] = {}
         for src, dst in (("action", "action"), ("protocol", "protocol"), ("src-ip", "src_ip"),
                          ("dst-ip", "dst_ip"), ("path", "path")):
@@ -409,18 +510,18 @@ def parse_firewall_log(text: str, utc_offset_s: Optional[int] = None,
         src_ep = ev_fields.get("src_ip", "-") + (f":{ev_fields['src_port']}" if "src_port" in ev_fields else "")
         dst_ep = ev_fields.get("dst_ip", "-") + (f":{ev_fields['dst_port']}" if "dst_port" in ev_fields else "")
         message = f"{ev_fields.get('action', '-')} {ev_fields.get('protocol', '-')} {src_ep} -> {dst_ep}"
-        events.append({"time": _iso(epoch), "source": "firewall", "message": message, "fields": ev_fields})
+        events.append({"time": when, "source": "firewall", "message": message, "fields": ev_fields})
     return events
 
 
 def _fw_epoch(date: str, clock: str, utc_offset_s: Optional[int]) -> Optional[float]:
     try:
         naive = datetime.strptime(f"{date} {clock}", "%Y-%m-%d %H:%M:%S")
-    except ValueError:
+        if utc_offset_s is None:
+            return (naive.astimezone(timezone.utc) - _EPOCH).total_seconds()
+        return (naive.replace(tzinfo=timezone.utc) - _EPOCH).total_seconds() - utc_offset_s
+    except (ValueError, OverflowError, OSError):
         return None
-    if utc_offset_s is None:
-        return (naive.astimezone(timezone.utc) - _EPOCH).total_seconds()
-    return (naive.replace(tzinfo=timezone.utc) - _EPOCH).total_seconds() - utc_offset_s
 
 
 # ---- Sysmon ----------------------------------------------------------------------------------
@@ -545,15 +646,19 @@ class Collector:
     def _tick_powershell(self) -> Dict[str, int]:
         first = self._ps_record is None
         xml_text, max_record = self._read_powershell(self._ps_record)
-        events = parse_powershell_events(xml_text)
-        if first:
-            events = self._trim_start(events)
+        # move on first: whatever the parser makes of this text, it is not read again
         if max_record is not None:
             self._ps_record = max(self._ps_record or 0, int(max_record))
         elif first:
             self._ps_record = 0
+        stats: Dict[str, int] = {}
+        events = parse_powershell_events(xml_text, stats)
+        if first:
+            events = self._trim_start(events)
         self.store.extend(events)
-        self.store.set_status("powershell", "ok", "")
+        skipped = stats.get("skipped", 0)
+        self.store.set_status("powershell", "ok",
+                              f"{skipped} event{'s' if skipped != 1 else ''} could not be parsed" if skipped else "")
         return {"powershell": len(events)}
 
     def _tick_sysmon(self) -> Dict[str, int]:
@@ -589,6 +694,9 @@ class Collector:
             keep = sorted(self._conns.items(), key=lambda kv: kv[1][0])[-SYSMON_CACHE_LIMIT:]
             self._conns = dict(keep)
         self._dns_seen = {k: t for k, t in self._dns_seen.items() if t >= cutoff}
+        if len(self._dns_seen) > DNS_SEEN_LIMIT:
+            keep = sorted(self._dns_seen.items(), key=lambda kv: kv[1])[-DNS_SEEN_LIMIT:]
+            self._dns_seen = dict(keep)
 
         dns = dns_from_sysmon(new_dns)
         if first:
@@ -603,6 +711,14 @@ class Collector:
     def _tick_firewall(self) -> Dict[str, int]:
         first = self._fw_offset is None
         text, new_offset, hint = self._read_firewall(self._fw_offset)
+        read_text = text
+        if text and not text.endswith("\n") and new_offset is not None:
+            # an unfinished last line: leave it for the next read (bytes of complete lines only)
+            cut = text.rfind("\n") + 1
+            tail = text[cut:]
+            if len(tail) <= MAX_PENDING_LINE:
+                text = text[:cut]
+                new_offset = max(0, new_offset - len(tail.encode("utf-8")))
         found = firewall_fields(text)
         if found:
             self._fw_fields = found
@@ -614,7 +730,7 @@ class Collector:
         elif first:
             self._fw_offset = 0
         self.store.extend(events)
-        if hint and not text.strip():
+        if hint and not read_text.strip():
             self.store.set_status("firewall", "unavailable", hint)
         else:
             self.store.set_status("firewall", "ok", hint or "")
