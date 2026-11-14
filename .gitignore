@@ -37,6 +37,8 @@ webui/submissions.json.tmp
 .superpowers/
 # Pipe interception recordings
 webui/pipe_sessions/
+# LOGS tab persisted access/MCP logs
+webui/logs/
 # Locally built test samples (source only is committed)
 tests/samples/*.exe
 tests/samples/*.pdb

