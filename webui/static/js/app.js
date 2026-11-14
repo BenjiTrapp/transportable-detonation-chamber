@@ -7748,6 +7748,46 @@ function updateRowHtml(tool, idle) {
     return html;
 }
 
+// A round glossy red badge with a black skull and crossed bones. Colours come from the --skull-*
+// variables; the gradient ids carry the suffix so a second copy on the page does not share them.
+function skullButtonSvg(suffix = '') {
+    const id = name => `tdc-skull-${name}${suffix}`;
+    const stop = (offset, colour, opacity) =>
+        `<stop offset="${offset}" style="stop-color:var(${colour})${opacity === undefined ? '' : `;stop-opacity:${opacity}`}"/>`;
+    const bone = angle => `<g transform="translate(32 38) rotate(${angle})" fill="var(--skull-ink)">`
+        + '<rect x="-19" y="-2.3" width="38" height="4.6" rx="2.3"/>'
+        + '<circle cx="-19.5" cy="-2.7" r="3"/><circle cx="-19.5" cy="2.7" r="3"/>'
+        + '<circle cx="19.5" cy="-2.7" r="3"/><circle cx="19.5" cy="2.7" r="3"/></g>';
+    return '<svg class="btn-skull-svg" viewBox="0 0 64 64" width="56" height="56" aria-hidden="true" focusable="false">'
+        + '<defs>'
+        + `<radialGradient id="${id('glass')}" cx="36%" cy="26%" r="82%">${stop(0, '--skull-red-light')}${stop(0.5, '--skull-red')}${stop(1, '--skull-red-dark')}</radialGradient>`
+        + `<linearGradient id="${id('shine')}" x1="0" y1="0" x2="0" y2="1">${stop(0, '--skull-shine', 0.7)}${stop(1, '--skull-shine', 0)}</linearGradient>`
+        + `<radialGradient id="${id('glow')}" cx="50%" cy="100%" r="70%">${stop(0, '--skull-red-light', 0.6)}${stop(1, '--skull-red-light', 0)}</radialGradient>`
+        + '</defs>'
+        + `<circle cx="32" cy="32" r="30" fill="url(#${id('glass')})" stroke="var(--skull-rim)" stroke-width="2"/>`
+        + '<circle cx="32" cy="32" r="27.4" fill="none" stroke="var(--skull-red-light)" stroke-opacity="0.35" stroke-width="1"/>'
+        + `<ellipse cx="32" cy="53" rx="22" ry="9" fill="url(#${id('glow')})"/>`
+        + bone(30) + bone(-30)
+        + '<path d="M32 11.5C22 11.5 15.5 18.5 15.5 27c0 5 2.4 8.6 6 10.6v6.9c0 1.7 1.3 3 3 3h15c1.7 0 3-1.3 3-3v-6.9c3.6-2 6-5.6 6-10.6C48.5 18.5 42 11.5 32 11.5Z"'
+        + ' fill="var(--skull-ink)" stroke="var(--skull-red-dark)" stroke-width="1"/>'
+        + '<ellipse cx="25" cy="17" rx="5.5" ry="2.6" fill="var(--skull-bone)" fill-opacity="0.55" transform="rotate(-20 25 17)"/>'
+        + '<g fill="var(--skull-eye)" stroke="var(--skull-eye)" stroke-opacity="0.45" stroke-width="2.6" stroke-linejoin="round">'
+        + '<path d="M20 24.5 30 29.2 29 33.8Q24.5 36 21 32.8Q19.2 29 20 24.5Z"/>'
+        + '<path d="M44 24.5 34 29.2 35 33.8Q39.5 36 43 32.8Q44.8 29 44 24.5Z"/></g>'
+        + '<path d="M32 35.6 28.8 41.6 32 40 35.2 41.6Z" fill="var(--skull-red-dark)"/>'
+        + '<path d="M26.3 43.2V46.5M29.4 43.2V46.5M32 43.2V46.5M34.6 43.2V46.5M37.7 43.2V46.5" fill="none" stroke="var(--skull-bone)" stroke-width="1.1" stroke-linecap="round"/>'
+        + `<ellipse cx="32" cy="14" rx="18" ry="8.5" fill="url(#${id('shine')})"/>`
+        + '</svg>';
+}
+
+function updateAllButtonHtml(available, idle) {
+    const reason = available <= 0 ? 'No updates to install' : idle ? '' : 'An update check or install is running';
+    const title = reason || `Install ${available} update${available === 1 ? '' : 's'}`;
+    return `<button type="button" id="updates-all" class="btn-skull"${reason ? ' disabled' : ''} title="${escapeHtml(title)}" aria-label="Update all (${available})" onclick="updateAll()">`
+        + `<span class="btn-skull-art">${skullButtonSvg()}<span class="btn-skull-badge">${available}</span></span>`
+        + '<span class="btn-skull-label">UPDATE ALL</span></button>';
+}
+
 function updatesHtml(data) {
     const tools = Array.isArray(data.tools) ? data.tools : [];
     const idle = data.mode === 'idle';
@@ -7766,7 +7806,7 @@ function updatesHtml(data) {
         + (note ? `<span class="updates-note">${note}</span>` : '')
         + '<span class="updates-buttons">'
         + `<button type="button" id="updates-check" class="btn btn-sm"${idle ? '' : ' disabled'} onclick="checkUpdates()">Check for updates</button>`
-        + `<button type="button" id="updates-all" class="btn btn-sm btn-primary"${idle && available > 0 ? '' : ' disabled'} onclick="updateAll()">Update all (${available})</button>`
+        + updateAllButtonHtml(available, idle)
         + '</span></div>'
         + '<div class="view-table-wrap"><table class="view-table updates-table" data-sortable data-sort-id="tool-updates">'
         + '<thead><tr><th>Tool</th><th>Source</th><th>Installed</th><th>Available</th><th>Status</th><th data-no-sort>Action</th></tr></thead>'
@@ -7864,15 +7904,124 @@ async function checkUpdates() {
     await refreshUpdates();
 }
 
+// A themed confirmation dialog; resolves true on confirm, false on cancel, Esc or a click on the backdrop.
+// options: {title, message, items = [{name, from, to}], confirmLabel, cancelLabel, danger}
+let tdcConfirmClose = null;
+
+function tdcConfirm(options) {
+    const opts = options || {};
+    const items = Array.isArray(opts.items) ? opts.items : [];
+    const maxItems = 12;
+    if (tdcConfirmClose) tdcConfirmClose(false);
+    return new Promise(resolve => {
+        const previous = document.activeElement;
+        const make = (tag, className, text) => {
+            const el = document.createElement(tag);
+            if (className) el.className = className;
+            if (text !== undefined) el.textContent = text;
+            return el;
+        };
+        const root = make('div', 'tdc-confirm');
+        root.id = 'tdc-confirm';
+        const backdrop = make('div', 'tdc-confirm-backdrop');
+        const dialog = make('div', opts.danger ? 'tdc-confirm-dialog danger' : 'tdc-confirm-dialog');
+        dialog.setAttribute('role', 'dialog');
+        dialog.setAttribute('aria-modal', 'true');
+        dialog.setAttribute('aria-labelledby', 'tdc-confirm-title');
+        dialog.setAttribute('aria-describedby', 'tdc-confirm-message');
+        const head = make('div', 'tdc-confirm-head');
+        if (opts.danger) {
+            const skull = make('span', 'tdc-confirm-skull');
+            skull.innerHTML = skullButtonSvg('-dialog');
+            head.appendChild(skull);
+        }
+        const title = make('h3', 'tdc-confirm-title', String(opts.title || ''));
+        title.id = 'tdc-confirm-title';
+        head.appendChild(title);
+        dialog.appendChild(head);
+        const message = make('p', 'tdc-confirm-message', String(opts.message || ''));
+        message.id = 'tdc-confirm-message';
+        dialog.appendChild(message);
+        if (items.length) {
+            const list = make('ul', 'tdc-confirm-list');
+            for (const item of items.slice(0, maxItems)) {
+                const row = make('li');
+                row.appendChild(make('span', 'tdc-confirm-item-name', String(item.name || '')));
+                row.appendChild(make('span', 'tdc-confirm-item-versions',
+                    `${item.from || '\u2014'} \u2192 ${item.to || '\u2014'}`));
+                list.appendChild(row);
+            }
+            if (items.length > maxItems) {
+                list.appendChild(make('li', 'tdc-confirm-more', `+ ${items.length - maxItems} more`));
+            }
+            dialog.appendChild(list);
+        }
+        const actions = make('div', 'tdc-confirm-actions');
+        const cancel = make('button', 'btn tdc-confirm-cancel', String(opts.cancelLabel || 'Cancel'));
+        cancel.type = 'button';
+        const ok = make('button', opts.danger ? 'btn tdc-confirm-ok danger' : 'btn btn-primary tdc-confirm-ok',
+            String(opts.confirmLabel || 'Confirm'));
+        ok.type = 'button';
+        actions.appendChild(cancel);
+        actions.appendChild(ok);
+        dialog.appendChild(actions);
+        root.appendChild(backdrop);
+        root.appendChild(dialog);
+
+        let done = false;
+        const close = answer => {
+            if (done) return;
+            done = true;
+            document.removeEventListener('keydown', onKey, true);
+            root.remove();
+            if (tdcConfirmClose === close) tdcConfirmClose = null;
+            // The button that opened the dialog may have been redrawn meanwhile
+            const back = previous && previous.isConnected !== false ? previous
+                : previous && previous.id ? document.getElementById(previous.id) : null;
+            if (back && back.focus) back.focus();
+            resolve(answer);
+        };
+        function onKey(e) {
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                e.stopPropagation();
+                close(false);
+            } else if (e.key === 'Enter' && e.target === ok) {
+                e.preventDefault();
+                close(true);
+            } else if (e.key === 'Tab') {
+                // Two buttons: Tab and Shift+Tab both go to the other one, and never out of the dialog
+                e.preventDefault();
+                (document.activeElement === cancel ? ok : cancel).focus();
+            }
+        }
+        tdcConfirmClose = close;
+        backdrop.addEventListener('click', () => close(false));
+        cancel.addEventListener('click', () => close(false));
+        ok.addEventListener('click', () => close(true));
+        document.addEventListener('keydown', onKey, true);
+        document.body.appendChild(root);
+        cancel.focus();
+    });
+}
+
 // ids: a list of tool ids or 'all' (every tool with an update, pinned ones left out).
 // A pinned tool is installed only after the user said so; includePinned means they did.
 async function applyUpdates(ids, includePinned) {
     const tools = (updatesState && updatesState.tools) || [];
     let body;
     if (ids === 'all') {
-        const count = tools.filter(t => t.status === 'update_available').length;
+        const due = tools.filter(t => t.status === 'update_available');
+        const count = due.length;
         if (!count) return;
-        if (!confirm(`Install ${count} updates? Detonations, scans and uploads are paused while they run.`)) return;
+        const yes = await tdcConfirm({
+            title: `Install ${count} update${count === 1 ? '' : 's'}?`,
+            message: 'Detonations, scans and uploads are paused while they run.',
+            items: due.map(t => ({ name: t.name || t.id, from: t.installed, to: t.available })),
+            confirmLabel: 'Install',
+            danger: true,
+        });
+        if (!yes) return;
         body = { tools: 'all', include_pinned: false };
     } else {
         let pinned = false;
@@ -7885,7 +8034,12 @@ async function applyUpdates(ids, includePinned) {
             const why = tool.kind === 'choco' && tool.detail
                 ? `${tool.name}: ${tool.detail}`
                 : `${tool.name} is pinned to ${tool.pinned} for compatibility.`;
-            if (!includePinned && !confirm(`${why} Install ${tool.available || 'the update'} anyway?`)) return;
+            if (!includePinned && !await tdcConfirm({
+                title: `${tool.name} is pinned`,
+                message: `${why} Install ${tool.available || 'the update'} anyway?`,
+                confirmLabel: 'Install anyway',
+                danger: true,
+            })) return;
         }
         body = { tools: ids, include_pinned: pinned };
     }

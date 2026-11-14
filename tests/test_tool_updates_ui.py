@@ -22,7 +22,8 @@ from test_theme import INDEX_HTML, _Elements, _const_source, _read
 UPDATE_FUNCTIONS = [
     "updateStatusLabel", "updateRowHtml", "updatesHtml", "renderUpdates", "renderMaintenanceBanner",
     "updatesIsPinned", "updatesSummary", "scheduleUpdatesPoll", "refreshUpdates", "checkUpdates", "updatesPost", "applyUpdates",
-    "updateOne", "updateAll", "toggleUpdateLog", "escapeHtml", "jsArg", "cssToken",
+    "updateOne", "updateAll", "toggleUpdateLog", "escapeHtml", "jsArg", "cssToken", "skullButtonSvg",
+    "updateAllButtonHtml",
 ]
 STATUSES = ["up_to_date", "update_available", "pinned_update", "unknown", "not_installed", "offline", "error",
             "queued", "updating", "updated", "failed", "reboot_required"]
@@ -63,22 +64,66 @@ def _run(script):
     return _run_node(UPDATE_FUNCTIONS, script, PRELUDE)
 
 
+def _all_button(html):
+    return re.search(r'<button[^>]*id="updates-all"[^>]*>', html).group(0)
+
+
 @needs_node
 def test_update_all_count_excludes_pinned():
     r = _run(r"""
         renderUpdates(state([tool('a', 'update_available'), tool('b', 'update_available'),
                              tool('c', 'pinned_update', { pinned: '1.0' }), tool('d', 'up_to_date')]));
-        const html = els['tool-updates-body'].innerHTML;
-        const all = html.match(/<button[^>]*id="updates-all"[^>]*>[^<]*<\/button>/)[0];
+        const all = els['tool-updates-body'].innerHTML;
         renderUpdates(state([tool('c', 'pinned_update', { pinned: '1.0' })]));
-        const none = els['tool-updates-body'].innerHTML.match(/<button[^>]*id="updates-all"[^>]*>[^<]*<\/button>/)[0];
+        const none = els['tool-updates-body'].innerHTML;
         renderUpdates(state([tool('a', 'update_available')], { mode: 'checking' }));
-        const busy = els['tool-updates-body'].innerHTML.match(/<button[^>]*id="updates-all"[^>]*>[^<]*<\/button>/)[0];
+        const busy = els['tool-updates-body'].innerHTML;
         console.log(JSON.stringify({ all, none, busy }));
     """)
-    assert "Update all (2)" in r["all"] and "disabled" not in r["all"]
-    assert "Update all (0)" in r["none"] and "disabled" in r["none"]
-    assert "Update all (1)" in r["busy"] and "disabled" in r["busy"]
+    assert 'aria-label="Update all (2)"' in _all_button(r["all"]) and "disabled" not in _all_button(r["all"])
+    assert 'aria-label="Update all (0)"' in _all_button(r["none"]) and "disabled" in _all_button(r["none"])
+    assert 'aria-label="Update all (1)"' in _all_button(r["busy"]) and "disabled" in _all_button(r["busy"])
+
+
+@needs_node
+def test_update_all_uses_skull_button():
+    r = _run(r"""
+        const out = {};
+        renderUpdates(state([tool('a', 'update_available'), tool('b', 'update_available')]));
+        out.two = els['tool-updates-body'].innerHTML;
+        renderUpdates(state([]));
+        out.zero = els['tool-updates-body'].innerHTML;
+        renderUpdates(state([tool('a', 'update_available')], { mode: 'updating' }));
+        out.busy = els['tool-updates-body'].innerHTML;
+        console.log(JSON.stringify(out));
+    """)
+    two, zero, busy = _all_button(r["two"]), _all_button(r["zero"]), _all_button(r["busy"])
+    assert 'class="btn-skull"' in two and 'aria-label="Update all (2)"' in two and "disabled" not in two
+    assert "UPDATE ALL" in r["two"] and '<span class="btn-skull-badge">2</span>' in r["two"]
+    assert "<svg" in r["two"] and 'id="tdc-skull-' in r["two"]
+    assert "disabled" in zero and 'title="No updates to install"' in zero
+    assert "disabled" in busy and 'title="An update check or install is running"' in busy
+
+
+@needs_node
+def test_skull_svg_has_no_colour_literals():
+    r = _run(r"""
+        console.log(JSON.stringify({ a: skullButtonSvg(), b: skullButtonSvg('-dlg') }));
+    """)
+    for svg in r.values():
+        assert svg.startswith("<svg") and svg.endswith("</svg>") and 'aria-hidden="true"' in svg
+        assert not re.search(r"#[0-9a-fA-F]{3,8}\b", svg.replace("url(#tdc-skull-", "url(")), svg
+        assert not re.search(r"rgba?\(|hsla?\(", svg)
+        for attr, value in re.findall(r'\b(fill|stroke|stop-color)="([^"]*)"', svg):
+            assert value == "none" or value.startswith(("var(--skull-", "url(#tdc-skull-")), (attr, value)
+        for value in re.findall(r"stop-color:\s*([^;\"]*)", svg):
+            assert value.startswith("var(--skull-"), value
+        ids = re.findall(r'\bid="([^"]*)"', svg)
+        assert ids and all(i.startswith("tdc-skull-") for i in ids)
+        for ref in re.findall(r"url\(#([^)]*)\)", svg):
+            assert ref in ids, ref
+    assert not set(re.findall(r'\bid="([^"]*)"', r["a"])) & set(re.findall(r'\bid="([^"]*)"', r["b"])), \
+        "the dialog's skull must not share gradient ids with the button's"
 
 
 @needs_node
@@ -109,7 +154,9 @@ def test_tool_names_are_escaped():
         console.log(JSON.stringify({ html: els['tool-updates-body'].innerHTML }));
     """)
     html = r["html"]
-    assert "<img" not in html and "<script" not in html and "<svg" not in html
+    # the skull button is the one <svg> of the section; a hostile one never gets in
+    assert "<img" not in html and "<script" not in html and "<svg onload" not in html
+    assert html.count("<svg") == 1
     assert "<b>" not in html and "<i>" not in html and "<u>" not in html and "<s>" not in html
     assert "&lt;img src=x onerror=alert(1)&gt;" in html
     assert "&lt;/pre&gt;&lt;script&gt;" in html
@@ -251,7 +298,7 @@ def test_every_status_has_a_badge_colour_in_both_sheets():
 
 
 def _fetch_prelude(responses, confirm_answer=True):
-    """fetch answers from `responses` (by url), confirm records its questions."""
+    """fetch answers from `responses` (by url), tdcConfirm records its questions."""
     import json
     return PRELUDE + f"""
 const requests = [];
@@ -262,7 +309,8 @@ globalThis.fetch = async (url, opts = {{}}) => {{
     const r = responses[url] || {{ status: 200, body: {{}} }};
     return {{ ok: r.status < 400, status: r.status, json: async () => r.body }};
 }};
-globalThis.confirm = q => {{ questions.push(q); return {'true' if confirm_answer else 'false'}; }};
+globalThis.confirm = () => {{ throw new Error('native confirm() used'); }};
+globalThis.tdcConfirm = async opts => {{ questions.push(opts); return {'true' if confirm_answer else 'false'}; }};
 globalThis.refreshUpdates = async () => {{ requests.push({{ refresh: true }}); }};
 """
 
@@ -282,7 +330,8 @@ def test_a_pinned_tool_asks_before_it_is_installed():
             console.log(JSON.stringify({ questions, requests }));
         })();
     """)
-    assert r["questions"] == ["Ghidra is pinned to 11.0 for compatibility. Install 11.3 anyway?"]
+    assert [(q["title"], q["message"], q["confirmLabel"], q["danger"]) for q in r["questions"]] == [
+        ("Ghidra is pinned", "Ghidra is pinned to 11.0 for compatibility. Install 11.3 anyway?", "Install anyway", True)]
     posts = [q for q in r["requests"] if q.get("method") == "POST"]
     assert posts[0]["body"] == {"tools": ["c"], "include_pinned": True}
     assert posts[1]["body"] == {"tools": ["a"], "include_pinned": False}
@@ -302,7 +351,8 @@ def test_a_choco_package_asks_with_its_own_detail_and_a_choco_pin_goes_to_the_se
             console.log(JSON.stringify({ questions, requests }));
         })();
     """)
-    assert r["questions"] == ["python312: The web UI runs on this Python. Install 3.12.2 anyway?"]
+    assert [(q["title"], q["message"]) for q in r["questions"]] == [
+        ("python312 is pinned", "python312: The web UI runs on this Python. Install 3.12.2 anyway?")]
     posts = [q for q in r["requests"] if q.get("method") == "POST"]
     assert [p["body"] for p in posts] == [{"tools": ["py"], "include_pinned": True},
                                           {"tools": ["php"], "include_pinned": True}]
@@ -320,7 +370,12 @@ def test_a_refused_question_sends_nothing():
         })();
     """, confirm_answer=False)
     assert r["requests"] == []
-    assert r["questions"][1] == "Install 2 updates? Detonations, scans and uploads are paused while they run."
+    ask = r["questions"][1]
+    assert ask["title"] == "Install 2 updates?"
+    assert ask["message"] == "Detonations, scans and uploads are paused while they run."
+    assert ask["confirmLabel"] == "Install" and ask["danger"] is True
+    assert [i["name"] for i in ask["items"]] == ["A", "B"]
+    assert ask["items"][0] == {"name": "A", "from": "1.0", "to": "2.0"}
 
 
 @needs_node
@@ -439,6 +494,258 @@ def test_the_poll_does_not_run_while_the_page_is_hidden():
         console.log(JSON.stringify({ timers: calls.length, fetched }));
     """, PRELUDE)
     assert r == {"timers": 1, "fetched": 0}
+
+
+@needs_node
+def test_update_all_calls_tdcConfirm_not_native_confirm():
+    """confirm() throws in the stub: the flow has to go through tdcConfirm."""
+    r = _run_with({"/api/updates/apply": {"status": 202, "body": {"started": True, "tools": ["a"]}}}, r"""
+        updatesState = state([tool('a', 'update_available'), tool('c', 'pinned_update', { pinned: '1.0' })]);
+        (async () => {
+            let error = null;
+            try { await updateAll(); await applyUpdates(['c'], false); } catch (e) { error = e.message; }
+            console.log(JSON.stringify({ error, asked: questions.length, requests }));
+        })();
+    """)
+    assert r["error"] is None and r["asked"] == 2
+    assert len([q for q in r["requests"] if q.get("method") == "POST"]) == 2
+
+
+@needs_node
+def test_singular_title():
+    r = _run_with({"/api/updates/apply": {"status": 202, "body": {"started": True, "tools": ["a"]}}}, r"""
+        updatesState = state([tool('a', 'update_available')]);
+        (async () => { await updateAll(); console.log(JSON.stringify({ questions })); })();
+    """)
+    assert r["questions"][0]["title"] == "Install 1 update?"
+
+
+# --- tdcConfirm -------------------------------------------------------------------
+
+CONFIRM_FUNCTIONS = ["tdcConfirm", "skullButtonSvg"]
+CONFIRM_PRELUDE = PRELUDE + r"""
+let tdcConfirmClose = null;
+class El {
+    constructor(tag) {
+        this.tag = tag; this.children = []; this.parent = null; this.attrs = {}; this.listeners = {};
+        this.id = ''; this.className = ''; this._text = ''; this._html = ''; this.disabled = false;
+        this.style = {}; this.type = ''; this.classList = classes();
+    }
+    get innerHTML() { return this._html; }
+    set innerHTML(v) { this._html = String(v); this.children = []; }
+    get textContent() { return this._text + this.children.map(c => c.textContent).join(''); }
+    set textContent(v) { this._text = String(v); this.children = []; }
+    setAttribute(k, v) { this.attrs[k] = String(v); if (k === 'id') this.id = String(v); }
+    getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }
+    appendChild(c) { c.parent = this; this.children.push(c); return c; }
+    remove() { if (this.parent) { this.parent.children = this.parent.children.filter(x => x !== this); this.parent = null; } }
+    addEventListener(t, f) { (this.listeners[t] = this.listeners[t] || []).push(f); }
+    removeEventListener(t, f) { this.listeners[t] = (this.listeners[t] || []).filter(x => x !== f); }
+    focus() { document.activeElement = this; }
+    get isConnected() { let n = this; while (n.parent) n = n.parent; return n === document.body; }
+    click() { fire(this, 'click'); }
+}
+const fire = (el, type, extra = {}) => {
+    const ev = { type, target: el, key: '', shiftKey: false, defaultPrevented: false,
+                 preventDefault() { this.defaultPrevented = true; }, stopPropagation() {}, ...extra };
+    for (const f of [...(el.listeners[type] || [])]) f(ev);
+    return ev;
+};
+const walk = function* (n) { yield n; for (const c of n.children) yield* walk(c); };
+const find = pred => { for (const n of walk(document.body)) if (pred(n)) return n; return null; };
+const findAll = pred => [...walk(document.body)].filter(pred);
+const press = (key, extra = {}) => fire(document, 'keydown', { key, target: document.activeElement, ...extra });
+const trigger = new El('button');
+globalThis.document = Object.assign(new El('document'), {
+    body: new El('body'), activeElement: null, hidden: false,
+    createElement: tag => new El(tag),
+    getElementById: id => find(n => n.id === id),
+});
+document.body.appendChild(trigger);
+trigger.focus();
+const buttons = () => ({ cancel: find(n => n.className.includes('tdc-confirm-cancel')),
+                         ok: find(n => n.className.includes('tdc-confirm-ok')) });
+"""
+
+
+def _confirm(script):
+    return _run_node(CONFIRM_FUNCTIONS, script, CONFIRM_PRELUDE)
+
+
+@needs_node
+def test_confirm_builds_an_accessible_dialog_and_removes_it():
+    r = _confirm(r"""
+        (async () => {
+            const p = tdcConfirm({ title: 'Install 2 updates?', message: 'Paused.', confirmLabel: 'Install',
+                                   items: [{ name: 'A', from: '1', to: '2' }] });
+            const dlg = find(n => n.attrs.role === 'dialog');
+            const root = document.getElementById('tdc-confirm');
+            const titleId = dlg && dlg.attrs['aria-labelledby'];
+            const b = buttons();
+            const open = { root: !!root, modal: dlg && dlg.attrs['aria-modal'],
+                           title: titleId && document.getElementById(titleId).textContent,
+                           focus: document.activeElement === b.cancel, cancel: b.cancel.textContent,
+                           ok: b.ok.textContent, text: root.textContent };
+            b.ok.click();
+            const result = await p;
+            console.log(JSON.stringify({ open, result, gone: document.getElementById('tdc-confirm') === null,
+                                         back: document.activeElement === trigger,
+                                         keydown: document.listeners.keydown.length }));
+        })();
+    """)
+    assert r["open"]["root"] and r["open"]["modal"] == "true" and r["open"]["title"] == "Install 2 updates?"
+    assert r["open"]["focus"] and r["open"]["cancel"] == "Cancel" and r["open"]["ok"] == "Install"
+    assert "Paused." in r["open"]["text"] and "1" in r["open"]["text"] and "2" in r["open"]["text"]
+    assert r["result"] is True and r["gone"] and r["back"] and r["keydown"] == 0
+
+
+@needs_node
+def test_confirm_resolves_false_on_escape_and_backdrop():
+    r = _confirm(r"""
+        (async () => {
+            const out = {};
+            let p = tdcConfirm({ title: 't', message: 'm' });
+            press('Escape');
+            out.escape = await p;
+            p = tdcConfirm({ title: 't', message: 'm' });
+            find(n => n.className.includes('tdc-confirm-backdrop')).click();
+            out.backdrop = await p;
+            p = tdcConfirm({ title: 't', message: 'm' });
+            find(n => n.attrs.role === 'dialog').click();
+            const stillOpen = document.getElementById('tdc-confirm') !== null;
+            buttons().cancel.click();
+            out.cancel = await p;
+            out.stillOpenAfterDialogClick = stillOpen;
+            out.gone = document.getElementById('tdc-confirm') === null;
+            console.log(JSON.stringify(out));
+        })();
+    """)
+    assert r == {"escape": False, "backdrop": False, "cancel": False, "stillOpenAfterDialogClick": True, "gone": True}
+
+
+@needs_node
+def test_confirm_resolves_true_on_confirm():
+    r = _confirm(r"""
+        (async () => {
+            const out = {};
+            let p = tdcConfirm({ title: 't', message: 'm' });
+            buttons().ok.click();
+            out.click = await p;
+            p = tdcConfirm({ title: 't', message: 'm' });
+            buttons().ok.focus();
+            const ev = press('Enter');
+            out.enter = await p;
+            out.prevented = ev.defaultPrevented;
+            p = tdcConfirm({ title: 't', message: 'm' });
+            press('Enter');   // focus is on Cancel: Enter there is Cancel, not a confirmation
+            buttons().cancel.click();
+            out.enterOnCancel = await p;
+            console.log(JSON.stringify(out));
+        })();
+    """)
+    assert r["click"] is True and r["enter"] is True and r["enterOnCancel"] is False
+
+
+@needs_node
+def test_confirm_keeps_tab_inside_the_dialog():
+    r = _confirm(r"""
+        (async () => {
+            const p = tdcConfirm({ title: 't', message: 'm' });
+            const b = buttons();
+            const seen = [];
+            for (let i = 0; i < 3; i++) { press('Tab'); seen.push(document.activeElement === b.ok ? 'ok' : 'cancel'); }
+            press('Tab', { shiftKey: true });
+            seen.push(document.activeElement === b.ok ? 'ok' : 'cancel');
+            document.activeElement = trigger;   // focus got out: Tab brings it back
+            press('Tab');
+            seen.push(document.activeElement === b.cancel || document.activeElement === b.ok ? 'in' : 'out');
+            press('Escape');
+            await p;
+            console.log(JSON.stringify(seen));
+        })();
+    """)
+    assert r == ["ok", "cancel", "ok", "cancel", "in"]
+
+
+@needs_node
+def test_confirm_escapes_items():
+    r = _confirm(r"""
+        (async () => {
+            const p = tdcConfirm({ title: '<b>t</b>', message: '<i>m</i>', confirmLabel: '<u>go</u>',
+                items: [{ name: '<img src=x onerror=alert(1)>', from: '<s>1', to: '"><svg onload=1>' }] });
+            const root = document.getElementById('tdc-confirm');
+            const markup = [...walk(root)].map(n => n.innerHTML).join('');
+            const text = root.textContent;
+            buttons().cancel.click();
+            await p;
+            console.log(JSON.stringify({ markup, text }));
+        })();
+    """)
+    for hostile in ("<img", "<b>", "<i>", "<u>", "<s>", "<svg onload"):
+        assert hostile not in r["markup"], hostile
+    assert "<img src=x onerror=alert(1)>" in r["text"] and '"><svg onload=1>' in r["text"]
+    assert "<b>t</b>" in r["text"] and "<u>go</u>" in r["text"]
+
+
+@needs_node
+def test_confirm_lists_at_most_12_items():
+    r = _confirm(r"""
+        (async () => {
+            const items = Array.from({ length: 15 }, (_, i) => ({ name: 'tool' + i, from: '1', to: '2' }));
+            let p = tdcConfirm({ title: 't', message: 'm', items });
+            const li = findAll(n => n.tag === 'li').map(n => n.textContent);
+            buttons().cancel.click(); await p;
+            p = tdcConfirm({ title: 't', message: 'm', items: items.slice(0, 12) });
+            const exact = findAll(n => n.tag === 'li').map(n => n.textContent);
+            buttons().cancel.click(); await p;
+            p = tdcConfirm({ title: 't', message: 'm' });
+            const none = findAll(n => n.tag === 'li').length;
+            buttons().cancel.click(); await p;
+            console.log(JSON.stringify({ li, exact, none }));
+        })();
+    """)
+    assert len(r["li"]) == 13 and r["li"][-1] == "+ 3 more"
+    assert [t for t in r["li"][:12] if t.startswith("tool")] == r["li"][:12]
+    assert len(r["exact"]) == 12 and not any("more" in t for t in r["exact"]) and r["none"] == 0
+
+
+@needs_node
+def test_confirm_shows_the_skull_only_when_dangerous():
+    r = _confirm(r"""
+        (async () => {
+            const out = {};
+            let p = tdcConfirm({ title: 't', message: 'm' });
+            out.plain = findAll(n => n.innerHTML.includes('<svg')).length;
+            out.plainClass = find(n => n.attrs.role === 'dialog').className;
+            buttons().cancel.click(); await p;
+            p = tdcConfirm({ title: 't', message: 'm', danger: true });
+            out.danger = findAll(n => n.innerHTML.includes('<svg')).length;
+            out.dangerClass = find(n => n.attrs.role === 'dialog').className;
+            buttons().cancel.click(); await p;
+            console.log(JSON.stringify(out));
+        })();
+    """)
+    assert r["plain"] == 0 and r["danger"] == 1
+    assert "danger" not in r["plainClass"] and "danger" in r["dangerClass"]
+
+
+@needs_node
+def test_a_second_confirm_resolves_the_first_with_false():
+    r = _confirm(r"""
+        (async () => {
+            const first = tdcConfirm({ title: 'one', message: 'm' });
+            const second = tdcConfirm({ title: 'two', message: 'm' });
+            const roots = findAll(n => n.id === 'tdc-confirm').length;
+            const titles = findAll(n => n.className.includes('tdc-confirm-title')).map(n => n.textContent);
+            const firstResult = await first;
+            buttons().ok.click();
+            console.log(JSON.stringify({ firstResult, secondResult: await second, roots, titles,
+                                         back: document.activeElement === trigger,
+                                         keydown: document.listeners.keydown.length }));
+        })();
+    """)
+    assert r["firstResult"] is False and r["secondResult"] is True
+    assert r["roots"] == 1 and r["titles"] == ["two"] and r["back"] and r["keydown"] == 0
 
 
 # --- Markup and wiring ---------------------------------------------------------

@@ -54,6 +54,17 @@
     --c-white-rgb: 255, 255, 255;
     --c-black: #000;
     --c-black-rgb: 0, 0, 0;
+    /* The Update all skull button and the confirm dialog: red glass, black skull */
+    --skull-red: #d61f26;
+    --skull-red-rgb: 214, 31, 38;
+    --skull-red-light: #ff6a5c;
+    --skull-red-dark: #6e0a10;
+    --skull-rim: #3f0508;
+    --skull-shine: #fff1ee;
+    --skull-ink: #0a0506;
+    --skull-eye: #ff2a1f;
+    --skull-eye-rgb: 255, 42, 31;
+    --skull-bone: #5a4545;
     --c-red-300: #fca5a5;
     --c-red-400: #f87171;
     --c-red-600: #dc2626;
@@ -10163,4 +10174,218 @@ table[data-sortable] > thead > tr > th:focus-visible {
 }
 body.maintenance-active #app {
     padding-top: var(--maintenance-height);
+}
+
+/* --- Update all skull button and the confirm dialog (tdcConfirm) --- */
+.btn-skull {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    padding: 2px 12px 2px 2px;
+    background: none;
+    border: 0;
+    border-radius: 999px;
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: 0.1em;
+    cursor: pointer;
+}
+.btn-skull-art {
+    position: relative;
+    display: inline-block;
+    flex: none;
+    width: 56px;
+    height: 56px;
+    border-radius: 50%;
+    box-shadow: 0 4px 10px rgba(var(--c-black-rgb), 0.55), 0 0 0 1px rgba(var(--skull-red-rgb), 0.35);
+    transition: transform 0.15s, box-shadow 0.15s, filter 0.15s;
+}
+.btn-skull-svg {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+.btn-skull-badge {
+    position: absolute;
+    top: -4px;
+    right: -8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 20px;
+    height: 20px;
+    padding: 0 5px;
+    box-sizing: border-box;
+    border: 2px solid var(--skull-red);
+    border-radius: 10px;
+    background: var(--skull-ink);
+    color: var(--c-white);
+    font-size: 11px;
+    font-weight: 800;
+    line-height: 1;
+}
+.btn-skull:not(:disabled):hover .btn-skull-art,
+.btn-skull:not(:disabled):focus-visible .btn-skull-art {
+    transform: translateY(-1px) scale(1.05);
+    animation: tdcSkullPulse 1.1s ease-in-out infinite;
+}
+.btn-skull:not(:disabled):active .btn-skull-art {
+    transform: scale(0.96);
+}
+.btn-skull:focus-visible {
+    outline: 2px solid var(--accent-cyan);
+    outline-offset: 3px;
+}
+.btn-skull:disabled {
+    cursor: not-allowed;
+}
+.btn-skull:disabled .btn-skull-art {
+    filter: saturate(0.15) brightness(0.7);
+    box-shadow: none;
+}
+.btn-skull:disabled .btn-skull-label {
+    opacity: 0.5;
+}
+@keyframes tdcSkullPulse {
+    0%, 100% { box-shadow: 0 4px 10px rgba(var(--c-black-rgb), 0.55), 0 0 6px 0 rgba(var(--skull-red-rgb), 0.5); }
+    50% { box-shadow: 0 4px 10px rgba(var(--c-black-rgb), 0.55), 0 0 24px 7px rgba(var(--skull-red-rgb), 0.85); }
+}
+
+.tdc-confirm {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 10050;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    animation: tdcConfirmFade 0.18s ease;
+}
+@keyframes tdcConfirmFade { from { opacity: 0; } to { opacity: 1; } }
+.tdc-confirm-backdrop {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(var(--c-black-rgb), 0.7);
+    backdrop-filter: blur(5px);
+}
+.tdc-confirm-dialog {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    width: 90vw;
+    max-width: 460px;
+    max-height: 85vh;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 20px 60px rgba(var(--c-black-rgb), 0.6);
+    overflow: hidden;
+}
+.tdc-confirm-dialog.danger {
+    border-color: rgba(var(--skull-red-rgb), 0.6);
+}
+.tdc-confirm-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border-primary);
+    background: var(--bg-primary);
+}
+.tdc-confirm-skull {
+    flex: none;
+    width: 44px;
+    height: 44px;
+    filter: drop-shadow(0 0 6px rgba(var(--skull-red-rgb), 0.6));
+}
+.tdc-confirm-skull .btn-skull-svg {
+    width: 44px;
+    height: 44px;
+}
+.tdc-confirm-title {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 700;
+    color: var(--text-primary);
+}
+.tdc-confirm-message {
+    margin: 0;
+    padding: 14px 18px 4px;
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-secondary);
+}
+.tdc-confirm-list {
+    margin: 10px 18px 0;
+    padding: 0;
+    list-style: none;
+    overflow-y: auto;
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+    font-family: var(--font-mono);
+    font-size: 12px;
+}
+.tdc-confirm-list li {
+    display: flex;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 5px 10px;
+    border-bottom: 1px solid var(--border-primary);
+}
+.tdc-confirm-list li:last-child {
+    border-bottom: 0;
+}
+.tdc-confirm-item-name {
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+.tdc-confirm-item-versions {
+    flex: none;
+    color: var(--text-secondary);
+}
+.tdc-confirm-list .tdc-confirm-more {
+    justify-content: center;
+    color: var(--text-muted);
+}
+.tdc-confirm-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    padding: 16px 18px;
+}
+.tdc-confirm-actions .btn {
+    padding: 7px 16px;
+    font-size: 12px;
+}
+.tdc-confirm-ok.danger {
+    color: var(--c-white);
+    background: var(--skull-red);
+    border-color: var(--skull-red-light);
+    font-weight: 700;
+}
+.tdc-confirm-ok.danger:hover {
+    color: var(--c-white);
+    background: var(--skull-red-dark);
+    border-color: var(--skull-red-light);
+}
+.tdc-confirm-actions .btn:focus-visible {
+    outline: 2px solid var(--accent-cyan);
+    outline-offset: 2px;
+}
+@media (prefers-reduced-motion: reduce) {
+    .btn-skull:not(:disabled):hover .btn-skull-art,
+    .btn-skull:not(:disabled):focus-visible .btn-skull-art,
+    .tdc-confirm {
+        animation: none;
+    }
+    .btn-skull-art {
+        transition: none;
+    }
 }

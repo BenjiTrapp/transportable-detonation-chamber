@@ -121,6 +121,16 @@
     --c-white-rgb: 255, 255, 255;
     --c-black: #000;
     --c-black-rgb: 0, 0, 0;
+    --skull-red: #ff2d55;
+    --skull-red-rgb: 255, 45, 85;
+    --skull-red-light: #ff8aa3;
+    --skull-red-dark: #8a0a33;
+    --skull-rim: #4a0630;
+    --skull-shine: #ffe3f6;
+    --skull-ink: #06020d;
+    --skull-eye: #ff1f4d;
+    --skull-eye-rgb: 255, 31, 77;
+    --skull-bone: #6a3f78;
     --c-red-300: #ff9a9a;
     --c-red-400: #ff6b6b;
     --c-red-600: var(--cp-tile-critical);
@@ -2601,4 +2611,100 @@
 }
 [data-theme="cyberpunk"] body.maintenance-active #app {
     padding-top: calc(var(--topbar-height) + var(--maintenance-height));
+}
+
+/* --- Update all skull button and the confirm dialog --- */
+[data-theme="cyberpunk"] .btn-skull {
+    font-family: var(--cp-font-label);
+    letter-spacing: .14em;
+    text-shadow: 0 0 8px rgba(var(--skull-red-rgb), .55);
+}
+[data-theme="cyberpunk"] .btn-skull-art {
+    box-shadow: 0 0 0 1px rgba(var(--skull-red-rgb), .55), 0 0 14px -2px rgba(var(--skull-red-rgb), .7);
+}
+[data-theme="cyberpunk"] .btn-skull-badge {
+    font-family: var(--cp-font-label);
+    border-color: var(--skull-red);
+    box-shadow: 0 0 8px rgba(var(--skull-red-rgb), .7);
+}
+[data-theme="cyberpunk"] .btn-skull:disabled .btn-skull-art {
+    box-shadow: none;
+}
+[data-theme="cyberpunk"] .tdc-confirm-backdrop {
+    background: rgba(var(--cp-bg-rgb), .8);
+}
+[data-theme="cyberpunk"] .tdc-confirm-dialog {
+    background: var(--cp-card);
+    border: 1px solid rgba(var(--cp-magenta-rgb), .6);
+    border-radius: 6px;
+    box-shadow: 0 0 0 1px rgba(var(--cp-black-rgb), .35), 0 0 28px -4px rgba(var(--cp-magenta-rgb), .6), 0 24px 70px -20px rgba(var(--cp-magenta-rgb), .45);
+    animation: tdcConfirmGlitch .42s steps(1, end);
+}
+[data-theme="cyberpunk"] .tdc-confirm-dialog.danger {
+    border-color: rgba(var(--skull-red-rgb), .8);
+    box-shadow: 0 0 0 1px rgba(var(--cp-black-rgb), .35), 0 0 30px -4px rgba(var(--skull-red-rgb), .7), 0 24px 70px -20px rgba(var(--skull-red-rgb), .5);
+}
+[data-theme="cyberpunk"] .tdc-confirm-dialog::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    pointer-events: none;
+    background: repeating-linear-gradient(0deg, rgba(var(--cp-black-rgb), .22) 0, rgba(var(--cp-black-rgb), .22) 1px, transparent 1px, transparent 3px);
+}
+[data-theme="cyberpunk"] .tdc-confirm-head {
+    background: linear-gradient(180deg, var(--cp-bar-top), var(--cp-bar-bottom));
+    border-bottom-color: rgba(var(--cp-magenta-rgb), .35);
+}
+[data-theme="cyberpunk"] .tdc-confirm-title {
+    font-family: var(--cp-font-label);
+    font-size: 16px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .tdc-confirm-dialog.danger .tdc-confirm-title {
+    color: var(--skull-red);
+    text-shadow: 0 0 10px rgba(var(--skull-red-rgb), .6);
+}
+[data-theme="cyberpunk"] .tdc-confirm-list {
+    background: var(--cp-bg);
+    border-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .tdc-confirm-list li {
+    border-bottom-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .tdc-confirm-item-name {
+    font-family: var(--cp-font-label);
+    letter-spacing: .05em;
+}
+[data-theme="cyberpunk"] .tdc-confirm-ok.danger {
+    font-family: var(--cp-font-label);
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--c-white);
+    background: var(--skull-red);
+    border-color: var(--skull-red-light);
+    box-shadow: 0 0 12px -2px rgba(var(--skull-red-rgb), .8);
+}
+[data-theme="cyberpunk"] .tdc-confirm-ok.danger:hover:not(:disabled) {
+    color: var(--c-white);
+    background: var(--skull-red);
+    border-color: var(--skull-red-light);
+    box-shadow: 0 0 20px 0 rgba(var(--skull-red-rgb), .95);
+}
+@keyframes tdcConfirmGlitch {
+    0% { transform: translate(-6px, 0) skewX(-4deg); opacity: .4; clip-path: inset(10% 0 55% 0); }
+    20% { transform: translate(5px, 0) skewX(3deg); opacity: .7; clip-path: inset(55% 0 12% 0); }
+    40% { transform: translate(-3px, 0); opacity: .85; clip-path: inset(0); }
+    60% { transform: translate(3px, 0) skewX(-2deg); opacity: .9; }
+    80% { transform: translate(-1px, 0); opacity: 1; }
+    100% { transform: none; opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+    [data-theme="cyberpunk"] .tdc-confirm-dialog {
+        animation: none;
+    }
 }
