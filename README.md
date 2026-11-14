@@ -1788,6 +1788,7 @@ transportable-detonation-chamber/
 │   ├── pipe_proxy.py              # Interception engine (sessions, hold queue, recording)
 │   ├── pipe_backends.py           # Win32 (ctypes) and in-memory fake pipe backends
 │   ├── pipe_sessions/             # Ended interception recordings (git-ignored)
+│   ├── log_search.py              # LOGS tab: SPL-like search language (parser, evaluator, pipes)
 │   ├── rizin_sessions.py          # RIZIN tab: rizin processes, console allowlist, analysis steps, projects
 │   ├── rizin_projects/            # Renames and comments per file, <sha256>.rzdb (git-ignored)
 │   ├── tool_updates.py            # Tool Updates: tool catalog and update checks
