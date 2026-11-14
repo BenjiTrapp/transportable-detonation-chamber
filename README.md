@@ -51,6 +51,7 @@
 - [Named Pipes](#named-pipes)
 - [Rizin](#rizin)
 - [Tool Updates](#tool-updates)
+- [Logs](#logs)
 - [Demo](#demo)
 - [API Reference](#api-reference)
 - [MCP Server](#mcp-server)
@@ -124,6 +125,7 @@ make open       # Opens http://<vm-ip>:9000 in browser
 | **Graph** | Process tree around a process: tree, force-directed and isometric layouts, landing page with samples and candidate processes, detail panel with Sysmon events, ACTIVITY MIX and children |
 | **Pipes** | Named pipes: Sysmon pipe events (EID 17/18) with name/PID filters and C2-family hits, and interception sessions (attach to an existing pipe or arm for a name/prefix/regex; observe or hold messages to forward, edit or drop them; JSON export) |
 | **Sysmon** | Sysmon event viewer with search, type/PID filters and Sysmon → Windows Event ID correlation; EVENTS OVER TIME and a process → event type Sankey narrow the table by time window, image or event type |
+| **LOGS** | Search the PowerShell, access, MCP, NetFlow, DNS and firewall logs with a Splunk-like query (see [Logs](#logs)): source chips with their counts, EVENTS OVER TIME stacked by source (drag across the bars to zoom), a field bar with the top values, a list of events that unfold to their fields and raw text, or a sortable table after `stats`, `top` and the like; time range buttons, example and last searches, LIVE |
 | **ThreatScan** | ThreatCheck, DefenderCheck, EMBER2024 and capa on a file, plus the **Live Process Memory** panel (Aether scan, memory dump, host baseline, system sweep) and the scan history with its SCORE HISTORY |
 | **ETW** | Multi-channel Event Log browser with live threat highlighting (see below) |
 | **Hex** | Hex editor with data inspector, structure minimap, PE/ELF analysis and section inspection |
@@ -1110,6 +1112,70 @@ Each update appends to `TDC_UPDATE_LOG`; the last 200 lines per tool are also
 shown in the panel. Status values: `up_to_date`, `update_available`,
 `pinned_update`, `unknown`, `not_installed`, `offline`, `error`, `queued`,
 `updating`, `updated`, `failed`, `reboot_required`.
+
+## Logs
+
+The **LOGS** tab searches six log sources in one place with a small subset of
+Splunk's search language. Everything in it is text from the sample or the VM
+(a PowerShell script block above all), so it is always shown as text, never as
+markup.
+
+| Source | Content |
+|--------|---------|
+| `powershell` | Script Blocks (4104), module and pipeline logging (4103) and engine errors (4100) of `Microsoft-Windows-PowerShell/Operational`; the parts of a long script block are joined into one event |
+| `access` | Every HTTP request to the web UI (not `/static/`): `method`, `path`, `query`, `status`, `duration_ms`, `remote_addr`, `user_agent`, `client` (`browser`, `mcp` or `other`). The regular polls of the UI itself (`/api/status`, `/api/updates`, `/api/alerts`, `/api/health`, `/api/logs/*`) carry `poll=true` |
+| `mcp` | Every action of the MCP server (it sends `X-TDC-Client: mcp` and `X-TDC-MCP-Tool: <name>`): `tool`, `method`, `path`, `status`, `duration_ms` |
+| `netflow` | Network connections (Sysmon 3) bundled into flows per image, PID, protocol and address pair, with `count`, `first_seen` and `last_seen` |
+| `dns` | DNS queries (Sysmon 22): `query`, `result`, `image`, `pid` |
+| `firewall` | The Windows Firewall log (`pfirewall.log`): `action`, `protocol`, source and destination address and port, `path` |
+
+A chip per source shows its event count and status; a click on it searches that
+source. A source without data says why in its tooltip (the Windows sources are
+`unavailable` when the web UI does not run on the VM; the firewall log stays
+empty while the firewall is off). The store keeps up to 50,000 events in memory;
+`access` and `mcp` are also written to `webui/logs/` (10 MB per file, one older
+file kept) and loaded again at start. The Windows sources read the last 24 hours
+at start (at most 5000 events each) and then every 10 seconds.
+
+**Search syntax.** Words and `"phrases"` match anywhere in the message and the
+fields, without regard to case; `*` is a wildcard. `field=value`, `field!=value`,
+`field>n` (also `<`, `>=`, `<=`; numbers compare as numbers) test a field;
+`AND` (implied), `OR`, `NOT` and parentheses combine them. `source`,
+`sourcetype` and `index` all mean the source. Pipes transform the result:
+`head N`, `tail N`, `sort -field`, `dedup field`, `table f1, f2`, `fields f1`,
+`stats count|dc(f)|sum(f)|avg(f)|min(f)|max(f)|values(f) by f1, f2`, `top field`,
+`rare field` and `timechart span=5m count by field`. A search that cannot be
+read shows the message and marks the place of the mistake under the search box.
+At most 10,000 matches go into the pipes and 1000 rows come back (200 at first;
+"Show up to 1000" asks for more).
+
+```
+source=powershell "Invoke-Expression"
+source=mcp | stats count by tool
+source=access NOT poll=true
+source=netflow | sort -count | head 20
+source=dns | top query
+source=firewall action=DROP
+* | timechart span=5m count by source
+```
+
+**Time.** The buttons `15M`, `1H`, `4H`, `24H`, `7D` and `ALL` set the range
+(default 24 hours); `earliest=-15m` and `latest=now` in the query take
+precedence. A range drawn across the bars of EVENTS OVER TIME (or a click on a
+bar) zooms to it and shows it as a chip whose × goes back to the button. The
+field bar on the left lists the fields of the matches with their ten most
+frequent values; a click on a value adds `field="value"` to the search. A
+click on an event unfolds its fields and its raw text with the search words
+marked. The EXAMPLES menu holds the searches above and your last ten, **LIVE**
+searches again every 10 seconds while the tab is open, and the `?` button shows
+the syntax as a tooltip.
+
+PowerShell and firewall logging are off on a Windows install. New VMs get them
+turned on during provisioning; on an **existing VM** run
+`C:\tdc\scripts\configure-logging.ps1` once as Administrator (`make deploy`
+uploads it). It enables Script Block Logging and Module Logging, sets the
+PowerShell operational log to 256 MB and turns on Windows Firewall logging of
+allowed and blocked packets. It is safe to run again.
 
 ## Demo
 

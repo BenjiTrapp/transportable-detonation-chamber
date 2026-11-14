@@ -431,6 +431,9 @@ function switchTab(tabName) {
     if (tabName === 'sysmon' && sysmonEvents.length === 0) {
         refreshSysmon();
     }
+    if (tabName === 'logs') {
+        logsTabShown();
+    }
     if (tabName === 'tracing') {
         renderRtraceConsole();
     }
@@ -12030,6 +12033,818 @@ function initSysmonTab() {
     const observer = new ResizeObserver(() => requestAnimationFrame(redrawSysmonChartsOnResize));
     observer.observe(charts);
     if (plot) observer.observe(plot);
+}
+
+// =============================================
+// LOGS (search the log store: PowerShell, access, MCP, NetFlow, DNS, firewall)
+// =============================================
+// One search box in a Splunk-like language (free words, "phrases", field=value,
+// AND / OR / NOT, pipes such as | stats count by tool; the cheat sheet in
+// LOGS_SYNTAX_HINT). Under it the sources as chips (a click searches one),
+// EVENTS OVER TIME stacked by source (a range drawn across the bars zooms in),
+// the fields of the matches on the left (a value adds field="value" to the
+// search) and the result: a list of events that a click unfolds, or, after
+// stats / table / top / rare / timechart, a sortable table (timechart: a chart
+// too). Everything in a log is written by the sample or the VM, a script block
+// above all, so every text goes through escapeHtml or logsHighlight (which
+// escapes what it does not mark).
+const LOGS_RANGES = ['15m', '1h', '4h', '24h', '7d', 'All'];
+const LOGS_DEFAULT_RANGE = '24h';
+const LOGS_RECENT_KEY = 'tdc.logs.recent';
+const LOGS_RANGE_KEY = 'tdc.logs.range';
+const LOGS_RECENT_MAX = 10;
+const LOGS_LIVE_MS = 10000;
+const LOGS_PAGE = 200;
+const LOGS_PAGE_MAX = 1000;
+const LOGS_EXAMPLES = [
+    { label: 'PowerShell script blocks', query: 'source=powershell' },
+    { label: 'MCP calls per tool', query: 'source=mcp | stats count by tool' },
+    { label: 'Access without polling', query: 'source=access NOT poll=true' },
+    { label: 'Busiest NetFlow pairs', query: 'source=netflow | sort -count | head 20' },
+    { label: 'Most queried DNS names', query: 'source=dns | top query' },
+    { label: 'Dropped connections', query: 'source=firewall action=DROP' },
+    { label: 'Events over time by source', query: '* | timechart span=5m count by source' },
+];
+const LOGS_SOURCE_COLORS = {
+    powershell: 'var(--accent-cyan)', access: 'var(--accent-green)', mcp: 'var(--accent-pink)',
+    netflow: 'var(--c-purple-500)', dns: 'var(--c-blue-400)', firewall: 'var(--c-amber-400)',
+};
+const LOGS_SYNTAX_HINT = [
+    'Search: words, "a phrase", field=value, field!=value, field>5, AND / OR / NOT, ( ), * as wildcard',
+    'Pipes: | head N | tail N | sort -field | dedup f | table f1,f2 | stats count by f',
+    '       | top f | rare f | timechart span=5m count by f',
+    'Time: earliest=-15m latest=now (or use the range buttons)',
+    'Example: source=mcp | stats count by tool',
+].join('\n');
+// What is searched and what came back; openIds holds the ids of the unfolded events
+let logsState = { query: '*', earliest: '-24h', latest: '', live: false, result: null, openIds: new Set() };
+let logsSeq = 0;                       // a response older than the last request is dropped
+let logsReady = false;
+let logsLimit = LOGS_PAGE;
+let logsTimer = null;
+let logsBase = LOGS_DEFAULT_RANGE;     // the range button a zoom goes back to
+let logsDrawn = null;                  // the bars on screen: {bins}
+let logsLastSig = '';
+let logsFieldFilter = '';
+let logsFieldsOpen = new Set(['source']);
+let logsSources = [];
+let logsQueryError = null;
+let logsColumnsKey = '';              // the columns of the table on screen
+
+// Searches whose bars a range drawn across them zooms to
+const LOGS_BARS_BRUSH = {
+    view: 'logs-histogram',
+    bins: () => (logsDrawn ? logsDrawn.bins : []),
+    onRange: (first, last, bins) => logsZoom(bins[first].start, bins[last].end),
+};
+
+function logsNumber(n) {
+    const value = Number(n);
+    return Number.isFinite(value) ? value.toLocaleString('en-US', { maximumFractionDigits: 1 }) : '0';
+}
+
+function logsIso(ms) {
+    return new Date(ms).toISOString().replace(/\.\d+Z$/, 'Z');
+}
+
+// --- Stored settings: the last searches (newest first, at most 10) and the range ---
+function logsRecent() {
+    try {
+        const list = JSON.parse(localStorage.getItem(LOGS_RECENT_KEY));
+        return Array.isArray(list) ? list.filter(q => typeof q === 'string' && q.trim()).slice(0, LOGS_RECENT_MAX) : [];
+    } catch (e) {
+        return [];
+    }
+}
+
+function logsRemember(query) {
+    const q = String(query ?? '').trim();
+    if (!q || q === '*') return logsRecent();
+    const list = [q, ...logsRecent().filter(item => item !== q)].slice(0, LOGS_RECENT_MAX);
+    try {
+        localStorage.setItem(LOGS_RECENT_KEY, JSON.stringify(list));
+    } catch (e) {
+        // storage blocked: the searches are not kept
+    }
+    return list;
+}
+
+// --- The query text ---
+// The tokens of a query: strings, operators, brackets, words, blanks
+const LOGS_TOKEN = /"(?:\\"|[^"])*"?|!=|>=|<=|[=<>|(),]|[^\s"|()=<>!,]+|\s+|./g;
+
+// The query as HTML for the layer behind the search box: pipes, commands,
+// fields, strings and AND / OR / NOT in their colours; the text is escaped
+function logsQueryHtml(query) {
+    const parts = String(query ?? '').slice(0, 4000).match(LOGS_TOKEN) || [];
+    const isOp = part => /^(!=|>=|<=|[=<>])$/.test(part || '');
+    const solid = i => {
+        for (let j = i + 1; j < parts.length; j++) if (!/^\s+$/.test(parts[j])) return parts[j];
+        return '';
+    };
+    let out = '', piped = false, command = false;
+    parts.forEach((part, i) => {
+        let cls = '';
+        if (/^\s+$/.test(part)) {
+            out += escapeHtml(part);
+            return;
+        }
+        if (part === '|') {
+            cls = 'lq-pipe';
+            piped = true;
+            command = true;
+        } else if (part[0] === '"') {
+            cls = 'lq-str';
+        } else if (isOp(part)) {
+            cls = 'lq-op';
+        } else if (/^[(),]$/.test(part)) {
+            cls = 'lq-punct';
+        } else if (command) {
+            cls = 'lq-cmd';
+            command = false;
+        } else if (/^(AND|OR|NOT)$/i.test(part)) {
+            cls = 'lq-bool';
+        } else if (piped && /^(by|span)$/i.test(part)) {
+            cls = 'lq-kw';
+        } else if (isOp(solid(i))) {
+            cls = 'lq-field';
+        }
+        out += cls ? `<span class="${cls}">${escapeHtml(part)}</span>` : escapeHtml(part);
+    });
+    return out;
+}
+
+// The words the search part of a query looks for, to mark them in the events:
+// free words, phrases and the values of field=value (not those of !=, > or <,
+// of NOT, source, earliest and latest), split at the * wildcards; no more than 20
+function logsQueryTerms(query) {
+    const parts = (String(query ?? '').slice(0, 4000).match(LOGS_TOKEN) || []).filter(part => !/^\s+$/.test(part));
+    const isOp = part => /^(!=|>=|<=|[=<>])$/.test(part || '');
+    const terms = [];
+    for (let i = 0; i < parts.length; i++) {
+        const part = parts[i], before = parts[i - 1] || '', after = parts[i + 1] || '';
+        if (part === '|') break;
+        if (isOp(part) || /^[(),]$/.test(part) || /^(AND|OR|NOT)$/i.test(part)) continue;
+        if (/^NOT$/i.test(before) || (isOp(before) && before !== '=')) continue;
+        if (isOp(after) && part[0] !== '"') continue;
+        if (isOp(before) && /^(earliest|latest|source|sourcetype|index)$/i.test(parts[i - 2] || '')) continue;
+        const text = part[0] === '"' ? part.slice(1).replace(/"$/, '').replace(/\\"/g, '"') : part;
+        for (const piece of text.split('*')) if (piece && !terms.includes(piece)) terms.push(piece);
+    }
+    return terms.slice(0, 20);
+}
+
+// The text as HTML in which the terms (any case) are inside <mark>: nothing
+// but the escaped text and <mark> comes out, whatever the text holds
+function logsHighlight(text, terms) {
+    const s = String(text ?? '');
+    const lower = s.toLowerCase();
+    // A letter whose lower case is longer than itself would shift the places
+    const hay = lower.length === s.length ? lower : s;
+    const spans = [];
+    for (const term of terms || []) {
+        const needle = (lower.length === s.length ? String(term ?? '').toLowerCase() : String(term ?? ''));
+        if (!needle) continue;
+        let at = hay.indexOf(needle), found = 0;
+        while (at >= 0 && found < 200) {
+            spans.push([at, at + needle.length]);
+            at = hay.indexOf(needle, at + needle.length);
+            found++;
+        }
+    }
+    spans.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+    // Overlapping and touching hits make one mark
+    const marks = [];
+    for (const span of spans) {
+        const last = marks[marks.length - 1];
+        if (last && span[0] <= last[1]) last[1] = Math.max(last[1], span[1]);
+        else marks.push([span[0], span[1]]);
+    }
+    let out = '', pos = 0;
+    for (const [from, to] of marks) {
+        out += escapeHtml(s.slice(pos, from)) + '<mark>' + escapeHtml(s.slice(from, to)) + '</mark>';
+        pos = to;
+    }
+    return out + escapeHtml(s.slice(pos));
+}
+
+// Where the search part of a query ends: the first | outside a string, or -1
+function logsPipeIndex(query) {
+    let quoted = false;
+    for (let i = 0; i < query.length; i++) {
+        const c = query[i];
+        if (quoted && c === '\\' && query[i + 1] === '"') i++;
+        else if (c === '"') quoted = !quoted;
+        else if (c === '|' && !quoted) return i;
+    }
+    return -1;
+}
+
+// A value as a string of the language: quotes escaped; one that ends in a
+// backslash would escape the closing quote, so a * stands after it
+function logsQuote(value) {
+    let v = String(value ?? '');
+    if (v.endsWith('\\')) v += '*';
+    return `"${v.replace(/"/g, '\\"')}"`;
+}
+
+// `term` added to the search part of the query (before the first pipe; the
+// bare * gives way to it); `replace`, a pattern, is the term it takes the place of
+function logsInsertTerm(query, term, replace) {
+    const q = String(query ?? '');
+    const cut = logsPipeIndex(q);
+    let head = (cut < 0 ? q : q.slice(0, cut)).trim();
+    const tail = cut < 0 ? '' : q.slice(cut).trim();
+    if (replace && replace.test(head)) head = head.replace(replace, (m, pre) => pre + term);
+    else head = head === '' || head === '*' ? term : `${head} ${term}`;
+    return tail ? `${head} ${tail}` : head;
+}
+
+// field="value" added to the search, which runs; false for a name the
+// language cannot take
+function logsAddFilter(field, value) {
+    const name = String(field ?? '');
+    if (!/^[^\s"()|,=<>!]+$/.test(name)) return false;
+    logsSetQuery(logsInsertTerm(logsCurrentQuery(), `${name}=${logsQuote(value)}`));
+    submitLogsSearch();
+    return true;
+}
+
+// A source chip: source=x in the place of the source the search has
+function logsAddSource(source) {
+    const name = String(source ?? '');
+    if (!/^[\w.-]+$/.test(name)) return false;
+    logsSetQuery(logsInsertTerm(logsCurrentQuery(), `source=${name}`, /(^|[\s(])source\s*=\s*(?:"(?:\\"|[^"])*"|[^\s"|()]+)/i));
+    submitLogsSearch();
+    return true;
+}
+
+function logsCurrentQuery() {
+    const input = document.getElementById('logs-query');
+    return input ? input.value : logsState.query;
+}
+
+// The query in the state, the box and the layer behind it
+function logsSetQuery(query) {
+    logsState.query = String(query ?? '');
+    const input = document.getElementById('logs-query');
+    if (input) input.value = logsState.query;
+    renderLogsQueryHighlight();
+}
+
+function renderLogsQueryHighlight() {
+    const layer = document.getElementById('logs-hl'), input = document.getElementById('logs-query');
+    if (!layer || !input) return;
+    layer.innerHTML = logsQueryHtml(input.value);
+    layer.scrollLeft = input.scrollLeft || 0;
+}
+
+// --- Range ---
+// The range button the state stands for ('' for a zoomed range)
+function logsRangeLabel(earliest, latest) {
+    if (latest) return '';
+    if (earliest === '') return 'All';
+    const m = /^-(\d+[mhd])$/.exec(earliest || '');
+    return m && LOGS_RANGES.includes(m[1]) ? m[1] : '';
+}
+
+function logsRangeHtml() {
+    const label = logsRangeLabel(logsState.earliest, logsState.latest);
+    const buttons = LOGS_RANGES.map(name => `<button type="button" class="chart-range-btn" data-range="${escapeHtml(name)}" aria-pressed="${name === label}" onclick="logsSetRange(${jsArg(name)})">${escapeHtml(name.toUpperCase())}</button>`).join('');
+    let chip = '';
+    if (!label) {
+        const from = Date.parse(logsState.earliest), to = Date.parse(logsState.latest);
+        const text = Number.isFinite(from) || Number.isFinite(to) ? chartRangeLabel(from, to) : 'custom range';
+        chip = filterChipHtml({ value: text, title: `Remove the range ${text}: back to ${logsBase.toUpperCase()}` }, `logsSetRange(${jsArg(logsBase)})`);
+    }
+    return `<span class="chart-range" role="group" aria-label="Time range">${buttons}</span>${chip}`;
+}
+
+function renderLogsRange() {
+    const host = document.getElementById('logs-range');
+    if (host) host.innerHTML = logsRangeHtml();
+}
+
+// One of the range buttons: the search runs again for it
+function logsSetRange(label) {
+    if (!LOGS_RANGES.includes(label)) return false;
+    logsState.earliest = label === 'All' ? '' : `-${label}`;
+    logsState.latest = '';
+    logsBase = label;
+    try {
+        localStorage.setItem(LOGS_RANGE_KEY, label);
+    } catch (e) {
+        // storage blocked
+    }
+    renderLogsRange();
+    runLogsSearch();
+    return true;
+}
+
+// A range drawn across the bars (epoch ms, `to` not included)
+function logsZoom(from, to) {
+    if (!Number.isFinite(from) || !Number.isFinite(to) || !(to > from)) return false;
+    logsState.earliest = logsIso(from);
+    logsState.latest = logsIso(to);
+    renderLogsRange();
+    runLogsSearch();
+    return true;
+}
+
+// A click on a bar zooms to its period (the click of a press that drew a range does nothing)
+function onLogsHistogramClick(event) {
+    const period = barsClickPeriod(event, LOGS_BARS_BRUSH);
+    if (period) logsZoom(period.from, period.to);
+}
+
+// --- The search ---
+// A press on SEARCH or Enter in the box: the box is the query, the first page
+function submitLogsSearch() {
+    closeLogsMenu();
+    logsLimit = LOGS_PAGE;
+    logsSetQuery(logsCurrentQuery());
+    return runLogsSearch();
+}
+
+// Searches with the state. `silent` (the live switch, opening the tab again,
+// more rows) leaves the list of last searches alone. A response that is no
+// longer the last one asked for is dropped.
+async function runLogsSearch(opts) {
+    const silent = !!(opts && opts.silent);
+    const seq = ++logsSeq;
+    const query = logsState.query.trim() ? logsState.query : '*';
+    const params = new URLSearchParams({ q: query, earliest: logsState.earliest, limit: String(logsLimit) });
+    if (logsState.latest) params.set('latest', logsState.latest);
+    const results = document.getElementById('logs-results');
+    if (results && !silent) results.classList.add('is-loading');
+    let resp, data;
+    try {
+        resp = await fetch(`/api/logs/search?${params.toString()}`);
+        data = await resp.json().catch(() => ({}));
+    } catch (e) {
+        if (seq !== logsSeq) return null;
+        if (results) results.classList.remove('is-loading');
+        renderLogsError({ error: `The search could not be loaded: ${e && e.message ? e.message : e}` }, query);
+        return null;
+    }
+    if (seq !== logsSeq) return null;
+    if (results) results.classList.remove('is-loading');
+    if (!resp.ok) {
+        renderLogsError(data && data.error ? data : { error: `The search failed (HTTP ${resp.status}).` }, query);
+        return null;
+    }
+    logsQueryError = null;
+    renderLogsError(null);
+    const sig = JSON.stringify([data.type, data.count, data.matched, (data.events || []).map(ev => ev && ev.id), data.rows]);
+    const same = silent && sig === logsLastSig;
+    logsLastSig = sig;
+    logsState.result = data;
+    if (!silent) logsRemember(logsState.query);
+    if (!same) renderLogsResult(data);
+    else renderLogsSummary(data);
+    return data;
+}
+
+// The line under the search box: the message, and for a 400 the query with
+// the place of the mistake marked (err.pos counts characters of the query)
+function logsErrorHtml(err, query) {
+    const message = escapeHtml(err && err.error ? err.error : 'The search failed.');
+    const pos = err && Number.isInteger(err.pos) && err.pos >= 0 ? err.pos : null;
+    if (pos === null) return `<span class="logs-error-msg">${message}</span>`;
+    const chars = Array.from(String(query ?? ''));
+    const at = Math.min(pos, chars.length);
+    const from = Math.max(0, at - 50);
+    const before = chars.slice(from, at).join(''), mark = chars[at] || ' ';
+    const after = chars.slice(at + 1, at + 51).join('');
+    return `<span class="logs-error-msg">${message}</span>`
+        + `<code class="logs-error-query">${from > 0 ? '…' : ''}${escapeHtml(before)}<mark class="logs-error-pos">${escapeHtml(mark)}</mark>${escapeHtml(after)}</code>`;
+}
+
+function renderLogsError(err, query) {
+    const host = document.getElementById('logs-error');
+    logsQueryError = err || null;
+    if (!host) return;
+    host.innerHTML = err ? logsErrorHtml(err, query) : '';
+    host.hidden = !err;
+    const input = document.getElementById('logs-query');
+    if (input) input.setAttribute('aria-invalid', err ? 'true' : 'false');
+}
+
+// --- The result ---
+function renderLogsResult(result) {
+    const r = result || {};
+    logsState.result = r;
+    renderLogsSummary(r);
+    renderLogsHistogram(r);
+    renderLogsFields(r.fields);
+    renderLogsResultBody(r);
+    renderLogsSources(logsSources);
+}
+
+function renderLogsResultBody(result) {
+    const host = document.getElementById('logs-results');
+    if (!host) return;
+    const r = result || {};
+    if (r.type === 'events') {
+        host.innerHTML = logsEventsHtml(r.events || [], logsQueryTerms(logsState.query), r);
+        return;
+    }
+    const key = JSON.stringify(r.columns || []);
+    if (key !== logsColumnsKey) {
+        // Another table: the order of the last one means nothing here
+        delete tableSortState['logs-result'];
+        logsColumnsKey = key;
+    }
+    host.innerHTML = (r.type === 'timechart' ? logsTimechartHtml(r) : '') + logsTableHtml(r);
+}
+
+function renderLogsSummary(result) {
+    const host = document.getElementById('logs-summary');
+    if (!host) return;
+    const r = result || {};
+    const isEvents = r.type === 'events';
+    const shown = (isEvents ? r.events : r.rows || []).length;
+    const count = Number(r.count) || 0;
+    let text = isEvents ? `<strong>${logsNumber(count)}</strong> ${count === 1 ? 'event' : 'events'}`
+        : `<strong>${logsNumber(count)}</strong> ${count === 1 ? 'row' : 'rows'} from ${logsNumber(r.matched)} events`;
+    if (shown < count) text += ` <span class="logs-summary-note">(the first ${logsNumber(shown)} shown)</span>`;
+    else if (r.truncated) text += ' <span class="logs-summary-note">(only the newest 10,000 matches were searched)</span>';
+    if (Number.isFinite(Number(r.took_ms))) text += ` <span class="logs-summary-took">${logsNumber(r.took_ms)} ms</span>`;
+    host.innerHTML = text;
+}
+
+// The width a chart is drawn for: its box, 720 where it has none (hidden)
+function logsWidth(id) {
+    const el = document.getElementById(id);
+    const rect = el && typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null;
+    return Math.floor(rect && rect.width > 0 ? rect.width : 720);
+}
+
+// The unit stackedBarsSvg labels bars of this length (ms) in
+function logsBinUnit(step) {
+    return step < 60000 ? 'second' : step < 3600000 ? 'minute' : step < 86400000 ? 'hour' : step < 7 * 86400000 ? 'day' : 'week';
+}
+
+// The sources of the bars, the six known ones first
+function logsSourceKeys(bins) {
+    const seen = new Set();
+    bins.forEach(bin => Object.keys(bin.counts).forEach(k => seen.add(k)));
+    const known = Object.keys(LOGS_SOURCE_COLORS).filter(k => seen.has(k));
+    return known.concat([...seen].filter(k => !known.includes(k)).sort());
+}
+
+// EVENTS OVER TIME: the bins of the search (all the events that matched) by source
+function renderLogsHistogram(result) {
+    const view = document.getElementById('logs-histogram');
+    if (!view || barsBrushActive(LOGS_BARS_BRUSH)) return;
+    const histogram = (result && result.histogram) || {};
+    const bins = (histogram.bins || []).map(bin => {
+        const counts = Object.create(null);
+        let total = 0;
+        for (const [name, n] of Object.entries(bin.counts || {})) {
+            const value = Number(n);
+            if (value > 0) {
+                counts[name] = value;
+                total += value;
+            }
+        }
+        return { start: Date.parse(bin.start), end: Date.parse(bin.end), counts, total };
+    }).filter(bin => Number.isFinite(bin.start) && Number.isFinite(bin.end) && bin.end > bin.start);
+    const keys = logsSourceKeys(bins);
+    const colors = Object.create(null);
+    keys.forEach(k => { if (LOGS_SOURCE_COLORS[k]) colors[k] = LOGS_SOURCE_COLORS[k]; });
+    const step = bins.length ? bins[0].end - bins[0].start : 0;
+    // The first source at the foot of a bar: the keys go in from the top
+    const stack = keys.slice().reverse();
+    const svg = bins.length ? stackedBarsSvg(bins, { width: logsWidth('logs-histogram'), height: 96, keys: stack,
+        colors, unit: logsBinUnit(step), step }) : '';
+    logsDrawn = { bins };
+    view.innerHTML = svg || chartEmptyHtml('No events in this range');
+    if (svg) _alertsChartInert(view, '[data-bin-start]', el => !(Number(el.getAttribute('data-total')) > 0));
+    const legend = document.getElementById('logs-legend');
+    if (legend) {
+        const totals = keys.map(k => bins.reduce((sum, bin) => sum + (bin.counts[k] || 0), 0));
+        legend.innerHTML = svg ? keys.map((k, i) => `<span class="logs-legend-item" title="${escapeHtml(k)}"><span class="logs-legend-swatch" style="background:${_chartColor(colors[k], stack.indexOf(k))}"></span>${escapeHtml(k)} <span class="logs-legend-count">${logsNumber(totals[i])}</span></span>`).join('') : '';
+    }
+}
+
+// The fields of the matches, each with its most frequent values
+function renderLogsFields(fields) {
+    const host = document.getElementById('logs-field-list');
+    if (!host) return;
+    const list = Array.isArray(fields) ? fields : [];
+    const needle = logsFieldFilter.trim().toLowerCase();
+    const shown = needle ? list.filter(f => String(f.name).toLowerCase().includes(needle)) : list;
+    const count = document.getElementById('logs-fields-count');
+    if (count) count.textContent = list.length ? String(list.length) : '';
+    host.innerHTML = shown.length ? shown.map(logsFieldHtml).join('')
+        : `<div class="logs-fields-empty">${list.length ? 'No field matches.' : 'No fields.'}</div>`;
+}
+
+function logsFieldHtml(f) {
+    const name = String(f.name ?? '');
+    const open = logsFieldsOpen.has(name);
+    const total = Number(f.count) || 0;
+    const values = open ? (f.top || []).map(v => {
+        const share = total > 0 ? Math.max(1, Math.min(100, Math.round(100 * (Number(v.count) || 0) / total))) : 0;
+        return `<li><button type="button" class="logs-value" data-logs-value data-field="${escapeHtml(name)}" data-value="${escapeHtml(v.value)}" style="--share:${share}%" title="Add ${escapeHtml(name)}=${escapeHtml(JSON.stringify(String(v.value ?? '')))} to the search">`
+            + `<span class="logs-value-text">${escapeHtml(v.value)}</span><span class="logs-value-count">${logsNumber(v.count)}</span></button></li>`;
+    }).join('') : '';
+    return `<div class="logs-field${open ? ' is-open' : ''}">`
+        + `<button type="button" class="logs-field-head" data-logs-field="${escapeHtml(name)}" aria-expanded="${open}" title="${escapeHtml(name)}: in ${logsNumber(total)} events">`
+        + `<span class="logs-caret" aria-hidden="true"></span><span class="logs-field-name">${escapeHtml(name)}</span><span class="logs-field-count">${logsNumber(total)}</span></button>`
+        + (open ? `<ul class="logs-values">${values || '<li class="logs-fields-empty">No values.</li>'}</ul>` : '') + '</div>';
+}
+
+function onLogsFieldFilter(text) {
+    logsFieldFilter = String(text ?? '');
+    renderLogsFields(logsState.result && logsState.result.fields);
+}
+
+// --- Events ---
+// A value as text: a list joined, an object as JSON
+function logsFieldText(value) {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'object') {
+        try {
+            return JSON.stringify(value);
+        } catch (e) {
+            return String(value);
+        }
+    }
+    return String(value);
+}
+
+// The value of a field of an event: a button that adds it to the search
+// when it is a short scalar, plain text otherwise
+function logsValueHtml(name, value, terms) {
+    const text = logsFieldText(value);
+    const shown = text.length > 2000 ? `${text.slice(0, 2000)}…` : text;
+    const scalar = ['string', 'number', 'boolean'].includes(typeof value) && text.length > 0 && text.length <= 200;
+    const html = logsHighlight(shown, terms);
+    return scalar ? `<button type="button" class="logs-fv" data-logs-value data-field="${escapeHtml(name)}" data-value="${escapeHtml(text)}" title="Add to the search">${html}</button>`
+        : `<span class="logs-fv logs-fv-plain">${html}</span>`;
+}
+
+function logsEventDetailHtml(ev, terms) {
+    const fields = ev.fields && typeof ev.fields === 'object' ? ev.fields : {};
+    const rows = [['time', ev.time], ['source', ev.source], ...Object.keys(fields).sort().map(k => [k, fields[k]])];
+    const grid = rows.filter(([, v]) => v !== null && v !== undefined && v !== '').map(([k, v]) => {
+        const items = Array.isArray(v) ? v : [v];
+        return `<div class="logs-detail-key">${escapeHtml(k)}</div><div class="logs-detail-val">${items.map(item => logsValueHtml(k, item, terms)).join(' ')}</div>`;
+    }).join('');
+    const raw = String(ev.message ?? '');
+    const cut = raw.length > 20000;
+    return `<div class="logs-event-detail"><div class="logs-detail-grid">${grid}</div>`
+        + `<div class="logs-raw-label">RAW</div><pre class="logs-raw">${logsHighlight(cut ? raw.slice(0, 20000) : raw, terms)}</pre>`
+        + (cut ? `<div class="logs-raw-note">${logsNumber(raw.length - 20000)} more characters are not shown.</div>` : '') + '</div>';
+}
+
+// The list: a row a click unfolds (time, source, the message cut to two
+// lines), under it a note when the search has more events than it brought
+function logsEventsHtml(events, terms, result) {
+    if (!events.length) {
+        return '<div class="logs-empty">No events match this search in the time range. Widen the range or loosen the query.</div>';
+    }
+    const rows = events.map((ev, i) => {
+        const id = String(ev && ev.id !== undefined && ev.id !== null ? ev.id : `#${i}`);
+        const open = logsState.openIds.has(id);
+        const source = String(ev.source ?? '');
+        return `<div class="logs-event${open ? ' is-open' : ''}" role="listitem">`
+            + `<button type="button" class="logs-event-row" data-logs-toggle="${escapeHtml(id)}" aria-expanded="${open}">`
+            + `<span class="logs-caret" aria-hidden="true"></span>`
+            + `<span class="logs-time" title="${escapeHtml(ev.time)}">${escapeHtml(formatAlertTime(ev.time))}</span>`
+            + `<span class="logs-src logs-src-${cssToken(source)}">${escapeHtml(source)}</span>`
+            + `<span class="logs-msg">${logsHighlight(String(ev.message ?? '').slice(0, 600), terms)}</span></button>`
+            + (open ? logsEventDetailHtml(ev, terms) : '') + '</div>';
+    }).join('');
+    const more = result && Number(result.count) > events.length && logsLimit < LOGS_PAGE_MAX
+        ? `<button type="button" class="btn btn-sm logs-more" data-logs-more>Show up to ${LOGS_PAGE_MAX}</button>` : '';
+    return `<div class="logs-events" role="list">${rows}</div>${more}`;
+}
+
+function toggleLogsEvent(id) {
+    const key = String(id ?? '');
+    if (logsState.openIds.has(key)) logsState.openIds.delete(key);
+    else logsState.openIds.add(key);
+    if (logsState.result) renderLogsResultBody(logsState.result);
+}
+
+// A click in the list or in the field bar: an event unfolds, a value goes
+// into the search, a field shows its values, "Show up to" asks for more rows
+function onLogsClick(event) {
+    const target = event && event.target && typeof event.target.closest === 'function' ? event.target : null;
+    if (!target) return;
+    const value = target.closest('[data-logs-value]');
+    if (value) {
+        logsAddFilter(value.getAttribute('data-field'), value.getAttribute('data-value'));
+        return;
+    }
+    const head = target.closest('[data-logs-field]');
+    if (head) {
+        const name = head.getAttribute('data-logs-field');
+        if (logsFieldsOpen.has(name)) logsFieldsOpen.delete(name);
+        else logsFieldsOpen.add(name);
+        renderLogsFields(logsState.result && logsState.result.fields);
+        return;
+    }
+    const row = target.closest('[data-logs-toggle]');
+    if (row) {
+        toggleLogsEvent(row.getAttribute('data-logs-toggle'));
+        return;
+    }
+    if (target.closest('[data-logs-more]')) {
+        logsLimit = LOGS_PAGE_MAX;
+        runLogsSearch({ silent: true });
+    }
+}
+
+// --- Tables ---
+function logsCellHtml(column, value) {
+    if (value === null || value === undefined || value === '') return '<td data-sort-value="" class="logs-cell-empty">&mdash;</td>';
+    if (typeof value === 'number') return `<td class="logs-cell-num" data-sort-value="${value}">${escapeHtml(logsNumber(value))}</td>`;
+    const text = logsFieldText(value);
+    if (column === '_time') return `<td class="logs-cell-time" data-sort-value="${escapeHtml(text)}">${escapeHtml(formatAlertTime(text))}</td>`;
+    return `<td title="${escapeHtml(text)}">${escapeHtml(text.length > 400 ? `${text.slice(0, 400)}…` : text)}</td>`;
+}
+
+function logsTableHtml(result) {
+    const columns = result.columns || [], rows = result.rows || [];
+    if (!columns.length) return '<div class="logs-empty">The search has no result table.</div>';
+    const head = columns.map(c => `<th>${escapeHtml(c)}</th>`).join('');
+    const body = rows.map(row => `<tr>${columns.map((c, i) => logsCellHtml(c, row[i])).join('')}</tr>`).join('')
+        || `<tr data-sort-skip><td colspan="${columns.length}" class="logs-cell-empty">No rows.</td></tr>`;
+    const more = Number(result.count) > rows.length && logsLimit < LOGS_PAGE_MAX
+        ? `<button type="button" class="btn btn-sm logs-more" data-logs-more>Show up to ${LOGS_PAGE_MAX}</button>` : '';
+    return `<div class="logs-table-wrap"><table class="logs-table" data-sortable data-sort-id="logs-result"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>${more}`;
+}
+
+// The bars of a timechart: a bar per row, the series (the first 10 and OTHER) stacked
+function logsTimechartHtml(result) {
+    const columns = result.columns || [], rows = result.rows || [];
+    if (columns[0] !== '_time' || columns.length < 2 || !rows.length) return '';
+    const starts = rows.map(row => Date.parse(row[0]));
+    if (starts.some(t => !Number.isFinite(t))) return '';
+    const gaps = starts.slice(1).map((t, i) => t - starts[i]).filter(d => d > 0);
+    const step = gaps.length ? Math.min(...gaps) : (Number(result.histogram && result.histogram.span_s) || 60) * 1000;
+    const series = columns.slice(1);
+    const bins = rows.map((row, i) => {
+        const counts = Object.create(null);
+        let total = 0;
+        series.forEach((name, j) => {
+            const n = Number(row[j + 1]) || 0;
+            counts[name] = n;
+            total += n;
+        });
+        return { start: starts[i], end: starts[i] + step, counts, total };
+    });
+    const stack = series.slice().reverse();
+    const svg = stackedBarsSvg(bins, { width: logsWidth('logs-results') - 2, height: 150, keys: stack,
+        unit: logsBinUnit(step), step });
+    if (!svg) return '';
+    const legend = series.map(name => `<span class="logs-legend-item"><span class="logs-legend-swatch" style="background:${_chartColor(undefined, stack.indexOf(name))}"></span>${escapeHtml(name)}</span>`).join('');
+    return `<div class="chart-card logs-timechart"><div class="chart-card-head"><h3 class="chart-card-title">TIMECHART</h3></div>${svg}<div class="logs-legend">${legend}</div></div>`;
+}
+
+// --- Sources ---
+function renderLogsSources(list) {
+    logsSources = Array.isArray(list) ? list : [];
+    const host = document.getElementById('logs-sources');
+    if (!host) return;
+    const cut = logsPipeIndex(logsState.query);
+    const chosen = /(?:^|[\s(])source\s*=\s*"?([^\s"|()]+)/i.exec(cut < 0 ? logsState.query : logsState.query.slice(0, cut));
+    const active = chosen ? chosen[1].toLowerCase() : '';
+    host.innerHTML = logsSources.map(s => {
+        const name = String(s.source ?? ''), status = cssToken(s.status || 'empty');
+        const last = s.last_time ? `last event ${formatAlertTime(s.last_time)}` : '';
+        const title = [s.hint, last].filter(Boolean).join(' · ') || `${name}: ${status}`;
+        return `<button type="button" class="logs-source logs-source-${cssToken(name)}${name.toLowerCase() === active ? ' is-active' : ''}" aria-pressed="${name.toLowerCase() === active}" data-source="${escapeHtml(name)}" data-status="${status}" title="${escapeHtml(title)}" onclick="logsAddSource(${jsArg(name)})">`
+            + `<span class="logs-source-dot" aria-hidden="true"></span><span class="logs-source-name">${escapeHtml(name)}</span><span class="logs-source-count">${logsNumber(s.count)}</span></button>`;
+    }).join('');
+}
+
+async function refreshLogsSources() {
+    try {
+        const resp = await fetch('/api/logs/sources');
+        if (!resp.ok) return;
+        renderLogsSources(await resp.json());
+    } catch (e) {
+        // the chips keep what they showed
+    }
+}
+
+// --- Examples and recent searches ---
+function logsMenuHtml() {
+    const recent = logsRecent();
+    const item = (label, query) => `<button type="button" class="logs-menu-item" role="menuitem" data-logs-query="${escapeHtml(query)}"><span class="logs-menu-label">${escapeHtml(label)}</span><code class="logs-menu-query">${escapeHtml(query)}</code></button>`;
+    return (recent.length ? `<div class="logs-menu-head">RECENT</div>${recent.map(q => item('', q)).join('')}` : '')
+        + `<div class="logs-menu-head">EXAMPLES</div>${LOGS_EXAMPLES.map(e => item(e.label, e.query)).join('')}`;
+}
+
+function toggleLogsMenu(force) {
+    const menu = document.getElementById('logs-menu'), button = document.getElementById('logs-menu-btn');
+    if (!menu) return;
+    const open = typeof force === 'boolean' ? force : menu.hidden;
+    if (open) menu.innerHTML = logsMenuHtml();
+    menu.hidden = !open;
+    if (button) button.setAttribute('aria-expanded', String(open));
+}
+
+function closeLogsMenu() {
+    toggleLogsMenu(false);
+}
+
+function onLogsMenuClick(event) {
+    const item = event && event.target && typeof event.target.closest === 'function' ? event.target.closest('[data-logs-query]') : null;
+    if (!item) return;
+    logsSetQuery(item.getAttribute('data-logs-query'));
+    submitLogsSearch();
+}
+
+// --- Live ---
+function toggleLogsLive() {
+    logsState.live = !logsState.live;
+    const button = document.getElementById('logs-live');
+    if (button) button.setAttribute('aria-pressed', String(logsState.live));
+    if (logsState.live) {
+        if (!logsTimer) logsTimer = setInterval(logsLiveTick, LOGS_LIVE_MS);
+        logsLiveTick();
+    } else if (logsTimer) {
+        clearInterval(logsTimer);
+        logsTimer = null;
+    }
+}
+
+// Every 10 s while LIVE is on: the search again, only while the tab is on
+// screen and the browser tab is not hidden, and not during a press on the bars
+function logsLiveTick() {
+    if (!logsState.live || document.hidden || state.activeTab !== 'logs' || barsBrushActive(LOGS_BARS_BRUSH)) return false;
+    runLogsSearch({ silent: true });
+    refreshLogsSources();
+    return true;
+}
+
+// --- The tab ---
+// Set up once, when the tab is first opened: the last search and range come back, and it runs
+function initLogs() {
+    if (logsReady) return;
+    const input = document.getElementById('logs-query');
+    if (!input) return;
+    logsReady = true;
+    const help = document.getElementById('logs-syntax');
+    if (help) help.title = LOGS_SYNTAX_HINT;
+    input.addEventListener('keydown', event => {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            submitLogsSearch();
+        } else if (event.key === 'Escape') {
+            closeLogsMenu();
+        }
+    });
+    input.addEventListener('input', renderLogsQueryHighlight);
+    input.addEventListener('scroll', renderLogsQueryHighlight);
+    for (const id of ['logs-results', 'logs-field-list']) document.getElementById(id)?.addEventListener('click', onLogsClick);
+    document.getElementById('logs-menu')?.addEventListener('click', onLogsMenuClick);
+    document.addEventListener('click', event => {
+        const wrap = event.target && typeof event.target.closest === 'function' ? event.target.closest('.logs-menu-wrap') : null;
+        if (!wrap) closeLogsMenu();
+    });
+    initBarsBrush(LOGS_BARS_BRUSH);
+    const histogram = document.getElementById('logs-histogram');
+    if (histogram && typeof ResizeObserver !== 'undefined') {
+        let width = 0;
+        new ResizeObserver(() => requestAnimationFrame(() => {
+            const now = Math.floor(histogram.getBoundingClientRect().width);
+            if (!now || now === width || barsBrushActive(LOGS_BARS_BRUSH) || !logsState.result) return;
+            width = now;
+            renderLogsHistogram(logsState.result);
+        })).observe(histogram);
+    }
+    let range = LOGS_DEFAULT_RANGE;
+    try {
+        const stored = localStorage.getItem(LOGS_RANGE_KEY);
+        if (LOGS_RANGES.includes(stored)) range = stored;
+    } catch (e) {
+        // storage blocked
+    }
+    logsBase = range;
+    logsState.earliest = range === 'All' ? '' : `-${range}`;
+    logsState.latest = '';
+    logsSetQuery(logsRecent()[0] || '*');
+    renderLogsRange();
+    refreshLogsSources();
+    runLogsSearch({ silent: true });
+}
+
+// The tab is opened: the first time it is set up, later it searches again
+function logsTabShown() {
+    if (!logsReady) {
+        initLogs();
+        return;
+    }
+    refreshLogsSources();
+    runLogsSearch({ silent: true });
 }
 
 // --- LitterBox Integration ---

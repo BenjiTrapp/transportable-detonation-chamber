@@ -19,8 +19,8 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=67">
-    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=26">
+    <link rel="stylesheet" href="/static/css/style.css?v=68">
+    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=27">
 </head>
 <body>
     <!-- Global loading overlay (shown on slow fetches) -->
@@ -85,6 +85,7 @@
                     <button class="tab" data-tab="graph">Graph</button>
                     <button class="tab" data-tab="pipes">Pipes</button>
                     <button class="tab" data-tab="sysmon">Sysmon</button>
+                    <button class="tab" data-tab="logs">LOGS</button>
                     <button class="tab" data-tab="threatscan">ThreatScan</button>
                     <button class="tab" data-tab="etw">ETW</button>
                     <button class="tab" data-tab="hexeditor">Hex</button>
@@ -629,6 +630,57 @@
                 <div id="sysmon-correlation-panel" class="sysmon-correlation" style="display:none;"></div>
                 <div class="sysmon-stats" id="sysmon-stats"></div>
                 <div id="sysmon-table" class="events-table"></div>
+            </div>
+
+            <!-- Logs Tab: search the log store (initLogs in app.js): the search bar with its range,
+                 sources and live switch, EVENTS OVER TIME, the fields of the matches, the result -->
+            <div class="tab-content" id="tab-logs">
+                <div class="content-header">
+                    <h2 data-info="Search the PowerShell, access, MCP, NetFlow, DNS and firewall logs in one place with a Splunk-like query. A click on a source, a bar or a field value narrows the search.">Logs</h2>
+                    <div class="header-actions">
+                        <span class="logs-summary" id="logs-summary" aria-live="polite"></span>
+                        <button type="button" class="btn btn-sm logs-live" id="logs-live" aria-pressed="false" title="Search again every 10 seconds while this tab is open" onclick="toggleLogsLive()"><span class="logs-live-dot" aria-hidden="true"></span>LIVE</button>
+                    </div>
+                </div>
+                <div class="logs-bar">
+                    <div class="logs-search">
+                        <div class="logs-input-wrap">
+                            <div class="logs-hl" id="logs-hl" aria-hidden="true"></div>
+                            <input type="text" id="logs-query" class="logs-input" spellcheck="false" autocomplete="off" autocapitalize="off" placeholder="Search, e.g. source=powershell &quot;Invoke-Expression&quot; or source=mcp | stats count by tool" aria-label="Log search" aria-invalid="false">
+                        </div>
+                        <span class="logs-menu-wrap">
+                            <button type="button" class="btn btn-sm logs-menu-btn" id="logs-menu-btn" aria-haspopup="true" aria-expanded="false" title="Example and recent searches" onclick="toggleLogsMenu()">EXAMPLES &#9662;</button>
+                            <div class="logs-menu" id="logs-menu" role="menu" hidden></div>
+                        </span>
+                        <button type="button" class="btn btn-sm logs-syntax" id="logs-syntax" aria-label="Search syntax" title="Search syntax">?</button>
+                        <button type="button" class="btn btn-sm btn-primary logs-go" onclick="submitLogsSearch()">SEARCH</button>
+                    </div>
+                    <div class="logs-error" id="logs-error" role="alert" hidden></div>
+                    <div class="logs-bar-row">
+                        <div class="logs-range" id="logs-range"></div>
+                        <div class="logs-sources" id="logs-sources" role="group" aria-label="Log sources"></div>
+                    </div>
+                </div>
+                <div class="chart-card logs-histogram-card">
+                    <div class="chart-card-head">
+                        <h3 class="chart-card-title" data-info="The events that match the search per period, stacked by source. Drag across the bars to zoom in on that range, or click a bar for its period.">EVENTS OVER TIME</h3>
+                        <span class="logs-legend" id="logs-legend"></span>
+                    </div>
+                    <div class="logs-histogram chart-clickable" id="logs-histogram" onclick="onLogsHistogramClick(event)"></div>
+                </div>
+                <div class="logs-body">
+                    <aside class="logs-fields" aria-label="Fields">
+                        <div class="logs-fields-head">
+                            <h3 class="chart-card-title" data-info="The fields of the events that match, with how many have them. Open a field for its most frequent values; a click on a value adds it to the search.">FIELDS</h3>
+                            <span class="logs-fields-count" id="logs-fields-count"></span>
+                        </div>
+                        <input type="text" class="filter-input logs-fields-filter" id="logs-fields-filter" placeholder="Filter fields..." aria-label="Filter fields" oninput="onLogsFieldFilter(this.value)">
+                        <div class="logs-field-list" id="logs-field-list"></div>
+                    </aside>
+                    <div class="logs-main">
+                        <div class="logs-results" id="logs-results"><div class="logs-empty">Searching the logs&hellip;</div></div>
+                    </div>
+                </div>
             </div>
 
             <!-- ThreatScan Tab (unified static analysis: ThreatCheck / DefenderCheck / EMBER2024 / capa) -->
@@ -1326,6 +1378,10 @@
                             <p>Sysmon events with search, type and PID filters, and the Windows Event IDs each event corresponds to. EVENTS OVER TIME and the Sankey PROCESS &rarr; EVENT TYPE count the events of the filters, all but the time window, which the bars mark (it narrows the table): a click on a bar sets a time window (Shift+click widens it to another bar), on a legend row or a node an event type or image, each a chip in the filter bar.</p>
                         </div>
                         <div class="help-guide-item">
+                            <h4>LOGS</h4>
+                            <p>Search the PowerShell, access, MCP, NetFlow, DNS and firewall logs with a Splunk-like query: words, "phrases", <code>field=value</code>, AND / OR / NOT and pipes such as <code>| stats count by tool</code>, <code>| top</code> or <code>| timechart span=5m count by source</code>. The range buttons (15M to ALL) set the time; EVENTS OVER TIME zooms by a range drawn across its bars. A source chip searches one source (a grey one says why it has no data), a field value on the left adds <code>field="value"</code>, and a click on an event unfolds its fields and raw text. LIVE searches again every 10 s. EXAMPLES lists searches to start from and your last ten.</p>
+                        </div>
+                        <div class="help-guide-item">
                             <h4>ThreatScan</h4>
                             <p>ThreatCheck, DefenderCheck, EMBER2024 and capa on a file. The Live Process Memory panel scans a running PID with Aether, dumps it with Process Dump, captures the host baseline or sweeps every process. SCORE HISTORY plots the scan history: Aether and Exit Capture at their evidence score against SUSPICIOUS 2 and MALICIOUS 6, the other tools in the lane "no score"; a point opens its scan in the list.</p>
                         </div>
@@ -1559,6 +1615,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
          in app.js); set as text, never as markup -->
     <div id="info-popover" class="info-popover" role="status" hidden></div>
 
-    <script src="/static/js/app.js?v=98"></script>
+    <script src="/static/js/app.js?v=99"></script>
 </body>
 </html>

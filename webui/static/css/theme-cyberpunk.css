@@ -84,6 +84,7 @@
     --text-primary: var(--cp-text);
     --text-secondary: var(--cp-text-muted);
     --text-secondary-rgb: var(--cp-text-muted-rgb);
+    --logs-src-rgb: var(--cp-text-muted-rgb);
     --text-muted: var(--cp-text-dim);
     --text-muted-rgb: var(--cp-text-dim-rgb);
     --text-dim: #665c8c;
@@ -2707,4 +2708,227 @@
     [data-theme="cyberpunk"] .tdc-confirm-dialog {
         animation: none;
     }
+}
+
+/* --- LOGS tab: the search bar in the page colour with the search box as a
+   dark field that glows magenta when it has the focus (the layer behind it
+   paints the query), the chips, badges and heads in the label font, the
+   source colours kept (--logs-src), the raw text and the table in the table look --- */
+[data-theme="cyberpunk"] .logs-bar {
+    gap: 10px;
+    padding: 12px 24px;
+    background: var(--cp-bg);
+}
+[data-theme="cyberpunk"] .logs-hl {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text);
+    background-color: rgba(var(--cp-bg-rgb), .8);
+    border-color: var(--cp-line);
+    border-radius: 4px;
+}
+[data-theme="cyberpunk"] .logs-input {
+    font-family: var(--cp-font-label);
+    caret-color: var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .logs-input::placeholder {
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .logs-input-wrap:focus-within .logs-hl {
+    border-color: var(--cp-magenta);
+    box-shadow: 0 0 0 1px rgba(var(--cp-magenta-rgb), .35), var(--cp-glow);
+}
+[data-theme="cyberpunk"] .logs-input::selection {
+    background: rgba(var(--cp-magenta-rgb), .35);
+}
+[data-theme="cyberpunk"] .lq-pipe { color: var(--cp-magenta); }
+[data-theme="cyberpunk"] .lq-cmd { color: var(--cp-gold); }
+[data-theme="cyberpunk"] .lq-field { color: var(--cp-cyan); }
+[data-theme="cyberpunk"] .lq-str { color: var(--cp-green); }
+[data-theme="cyberpunk"] .lq-bool { color: var(--cp-violet); }
+[data-theme="cyberpunk"] .lq-kw { color: var(--cp-orange); }
+[data-theme="cyberpunk"] .logs-menu {
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow), 0 14px 34px -12px rgba(var(--cp-black-rgb), .8);
+}
+[data-theme="cyberpunk"] .logs-menu-head {
+    font-family: var(--cp-font-label);
+    letter-spacing: .1em;
+    color: var(--cp-cyan);
+}
+[data-theme="cyberpunk"] .logs-menu-item {
+    border-radius: 4px;
+}
+[data-theme="cyberpunk"] .logs-menu-item:hover,
+[data-theme="cyberpunk"] .logs-menu-item:focus-visible {
+    background: var(--cp-raised);
+    box-shadow: inset 2px 0 0 var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .logs-menu-query {
+    font-family: var(--cp-font-label);
+    color: var(--cp-cyan);
+}
+[data-theme="cyberpunk"] .logs-error {
+    font-family: var(--cp-font-label);
+    color: var(--cp-red);
+    background: rgba(var(--cp-red-rgb), .1);
+    border-color: rgba(var(--cp-red-rgb), .5);
+    border-radius: 4px;
+}
+[data-theme="cyberpunk"] .logs-error-query {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-muted);
+}
+[data-theme="cyberpunk"] .logs-error-pos {
+    background: var(--cp-red);
+    box-shadow: 0 0 8px rgba(var(--cp-red-rgb), .6);
+}
+[data-theme="cyberpunk"] .logs-summary,
+[data-theme="cyberpunk"] .logs-legend,
+[data-theme="cyberpunk"] .logs-fields-count {
+    font-family: var(--cp-font-label);
+    letter-spacing: .04em;
+    color: var(--cp-text-dim);
+}
+[data-theme="cyberpunk"] .logs-summary strong {
+    color: var(--cp-text);
+}
+[data-theme="cyberpunk"] .logs-summary-note {
+    color: var(--cp-amber);
+}
+[data-theme="cyberpunk"] .logs-live[aria-pressed="true"] {
+    color: var(--cp-green);
+    background: rgba(var(--cp-green-rgb), .12);
+    border-color: var(--cp-green);
+    box-shadow: 0 0 12px rgba(var(--cp-green-rgb), .35);
+}
+[data-theme="cyberpunk"] .logs-source {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--cp-text-muted);
+    background: var(--cp-raised);
+    border-color: rgba(var(--cp-magenta-rgb), .22);
+    border-radius: 4px;
+}
+[data-theme="cyberpunk"] .logs-source:hover {
+    color: var(--cp-text);
+    border-color: var(--logs-src);
+    box-shadow: 0 0 10px rgba(var(--logs-src-rgb), .35);
+}
+[data-theme="cyberpunk"] .logs-source.is-active {
+    color: var(--cp-text);
+    background: rgba(var(--logs-src-rgb), .16);
+    border-color: var(--logs-src);
+    box-shadow: 0 0 12px rgba(var(--logs-src-rgb), .35);
+}
+[data-theme="cyberpunk"] .logs-source:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+}
+[data-theme="cyberpunk"] .logs-histogram-card {
+    margin: 14px 24px 0;
+}
+[data-theme="cyberpunk"] .logs-body {
+    gap: 14px;
+    padding: 14px 24px 24px;
+}
+[data-theme="cyberpunk"] .logs-fields,
+[data-theme="cyberpunk"] .logs-events,
+[data-theme="cyberpunk"] .logs-table-wrap {
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow);
+}
+[data-theme="cyberpunk"] .logs-field-head,
+[data-theme="cyberpunk"] .logs-value,
+[data-theme="cyberpunk"] .logs-event-row,
+[data-theme="cyberpunk"] .logs-detail-grid,
+[data-theme="cyberpunk"] .logs-raw {
+    font-family: var(--cp-font-label);
+}
+[data-theme="cyberpunk"] .logs-field-head:hover {
+    background: var(--cp-raised);
+}
+[data-theme="cyberpunk"] .logs-value {
+    background: linear-gradient(90deg, rgba(var(--cp-magenta-rgb), .2) var(--share, 0%), transparent var(--share, 0%));
+}
+[data-theme="cyberpunk"] .logs-value:hover {
+    color: var(--cp-text);
+    box-shadow: inset 0 0 0 1px rgba(var(--cp-magenta-rgb), .6);
+}
+[data-theme="cyberpunk"] .logs-event + .logs-event {
+    border-top-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .logs-event-row:hover {
+    background: var(--cp-raised);
+    box-shadow: inset 2px 0 0 var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .logs-event.is-open > .logs-event-row {
+    background: rgba(var(--cp-magenta-rgb), .08);
+    box-shadow: inset 2px 0 0 var(--cp-magenta);
+}
+[data-theme="cyberpunk"] .logs-event-row:focus-visible,
+[data-theme="cyberpunk"] .logs-field-head:focus-visible,
+[data-theme="cyberpunk"] .logs-value:focus-visible,
+[data-theme="cyberpunk"] .logs-fv:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+}
+[data-theme="cyberpunk"] .logs-src {
+    font-family: var(--cp-font-label);
+    font-size: 9.5px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    border-radius: 3px;
+}
+[data-theme="cyberpunk"] .logs-msg {
+    color: var(--cp-text);
+}
+[data-theme="cyberpunk"] .logs-results mark {
+    color: var(--cp-text);
+    background: rgba(var(--cp-gold-rgb), .3);
+    box-shadow: 0 0 0 1px rgba(var(--cp-gold-rgb), .45);
+}
+[data-theme="cyberpunk"] .logs-event-detail {
+    background: rgba(var(--cp-bg-rgb), .55);
+    border-top-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .logs-detail-key {
+    color: var(--cp-cyan);
+}
+[data-theme="cyberpunk"] .logs-fv:hover {
+    color: var(--cp-text);
+    background: rgba(var(--cp-magenta-rgb), .2);
+}
+[data-theme="cyberpunk"] .logs-raw-label {
+    font-family: var(--cp-font-label);
+    letter-spacing: .1em;
+    color: var(--cp-cyan);
+}
+[data-theme="cyberpunk"] .logs-raw {
+    color: var(--cp-text);
+    background: var(--cp-bg);
+    border-color: var(--cp-line);
+    border-radius: 4px;
+}
+[data-theme="cyberpunk"] .logs-table th {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    color: var(--cp-cyan);
+    background: var(--cp-raised);
+    border-bottom: 1px solid var(--cp-line);
+}
+[data-theme="cyberpunk"] .logs-table td {
+    color: var(--cp-text-muted);
+    border-bottom-color: var(--cp-line);
+}
+[data-theme="cyberpunk"] .logs-table tbody tr:hover {
+    background: var(--cp-raised);
+}
+[data-theme="cyberpunk"] .logs-cell-num {
+    color: var(--cp-text);
 }
