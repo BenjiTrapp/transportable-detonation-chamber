@@ -10400,7 +10400,8 @@ body.maintenance-active #app {
    examples menu; the line of a mistake; the range buttons and the source
    chips. Under it EVENTS OVER TIME, the field bar on the left and the result
    (a list of events that unfold, or a sortable table). The colour of a source
-   (--logs-src) is shared by its chip, its badge and its bars. --- */
+   (--logs-src, default in :root) is shared by its chip and its badge; the rules
+   of the sources have to stay free of any generic rule that sets it. --- */
 #tab-logs { overflow-x: hidden; overflow-y: auto; }
 .logs-summary {
     font-family: var(--font-mono);
@@ -10573,8 +10574,6 @@ body.maintenance-active #app {
 .logs-src-dns, .logs-source-dns { --logs-src: var(--c-blue-400); --logs-src-rgb: var(--c-blue-400-rgb); }
 .logs-src-firewall, .logs-source-firewall { --logs-src: var(--c-amber-400); --logs-src-rgb: var(--c-amber-400-rgb); }
 .logs-source {
-    --logs-src: var(--text-secondary);
-    --logs-src-rgb: var(--text-secondary-rgb);
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -10731,8 +10730,6 @@ body.maintenance-active #app {
 .logs-event-row .logs-caret { margin-top: 5px; }
 .logs-time { padding-top: 1px; font-size: 11px; white-space: nowrap; color: var(--text-muted); }
 .logs-src {
-    --logs-src: var(--text-secondary);
-    --logs-src-rgb: var(--text-secondary-rgb);
     justify-self: start;
     max-width: 100%;
     padding: 1px 7px;

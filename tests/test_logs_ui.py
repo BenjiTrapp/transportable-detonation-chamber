@@ -24,13 +24,13 @@ import json
 import re
 
 from test_frontend import SOURCE, _function_source, _run_node, needs_node
-from test_theme import (CHART_CONSTS, CHART_FUNCTIONS, INDEX_HTML, STYLE_CSS, THEME_CSS, _const_source, _Elements,
-                        _read)
+from test_theme import (CHART_CONSTS, CHART_FUNCTIONS, INDEX_HTML, STYLE_CSS, THEME_CSS, _const_source, _css_blocks,
+                        _Elements, _read, _selectors, _strip_comments)
 
 LOGS_FUNCTION_NAME = re.compile(
     r"^(?:async )?function ((?:logs|runLogs|renderLogs|onLogs|submitLogs|toggleLogs|closeLogs|refreshLogs|initLogs)\w*)\(", re.M)
 LOGS_FUNCTIONS = list(dict.fromkeys(LOGS_FUNCTION_NAME.findall(SOURCE)))
-LOGS_CONSTS = ["LOGS_RANGES", "LOGS_DEFAULT_RANGE", "LOGS_RECENT_KEY", "LOGS_RANGE_KEY", "LOGS_RECENT_MAX",
+LOGS_CONSTS = ["LOGS_RANGES", "LOGS_DEFAULT_RANGE", "LOGS_RECENT_KEY", "LOGS_RANGE_KEY", "LOGS_LAST_KEY", "LOGS_RECENT_MAX",
                "LOGS_LIVE_MS", "LOGS_PAGE", "LOGS_PAGE_MAX", "LOGS_EXAMPLES", "LOGS_SOURCE_COLORS", "LOGS_SYNTAX_HINT",
                "LOGS_TOKEN", "LOGS_BARS_BRUSH"]
 LOGS_LETS = re.findall(r"^let logs\w+ = [^\n]*?;(?=[ \t]*(?://[^\n]*)?$)", SOURCE, re.M)
@@ -623,3 +623,54 @@ def test_both_themes_style_the_tab():
         assert re.search(r"\.%s\b" % cls, classic), f"style.css has no rule for .{cls}"
         assert re.search(r'\[data-theme="cyberpunk"\][^{]*\.%s\b' % cls, theme), f"Cyberpunk has no rule for .{cls}"
     assert "@keyframes logs-live-pulse" in classic and "@keyframes logs-live-pulse" not in theme
+
+
+SIX_SOURCES = ["powershell", "access", "mcp", "netflow", "dns", "firewall"]
+
+
+def test_a_generic_rule_never_overrides_the_colour_of_a_source():
+    """.logs-source and .logs-src used to reset --logs-src after the rules of
+    the sources, which have the same specificity: every chip and badge was grey."""
+    for path in (STYLE_CSS, THEME_CSS):
+        order = []     # (selector, sets the colour) in the order of the sheet
+        for prelude, body in _css_blocks(_strip_comments(_read(path))):
+            if body is None or prelude.startswith("@"):
+                continue
+            sets = bool(re.search(r"--logs-src(?:-rgb)?\s*:", body))
+            order += [(selector.strip(), sets) for selector in _selectors(prelude)]
+        for kind in ("src", "source"):
+            per = [i for i, (sel, sets) in enumerate(order) if sets and re.search(r"\.logs-%s-(%s)$" % (kind, "|".join(SIX_SOURCES)), sel)]
+            if path == STYLE_CSS:
+                assert len(per) == 6, (kind, [order[i][0] for i in per])
+            generic = [i for i, (sel, sets) in enumerate(order)
+                       if sets and re.search(r"\.logs-%s$" % kind, sel)]
+            late = [order[i][0] for i in generic if per and i > min(per)]
+            assert not late, f"{path}: {late} set the source colour after the rules of the sources"
+            # the sources set it more specifically than any later generic rule could undo
+            assert not generic or all(i < min(per) for i in generic), (path, kind)
+
+
+@needs_node
+def test_the_tab_reopens_with_the_last_query_even_a_bare_star():
+    r = _run(r"""
+        store[LOGS_RECENT_KEY] = JSON.stringify(['source=dns']);
+        logsSetQuery('*');
+        await submitLogsSearch();
+        const stored = store['tdc.logs.last'];
+        logsSetQuery('source=mcp');
+        await submitLogsSearch();
+        logsSetQuery('*');
+        await submitLogsSearch();
+        // a live search does not change what is restored
+        logsState.query = 'other';
+        await runLogsSearch({ silent: true });
+        const last = store['tdc.logs.last'];
+        logsState.query = '*'; logsReady = false;
+        initLogs();
+        await new Promise(r => setTimeout(r, 0));
+        const input = els['logs-query'].value;
+        // without a stored last query the newest recent one comes back
+        delete store['tdc.logs.last']; logsReady = false;
+        initLogs();
+        console.log(JSON.stringify({ stored, last, input, fallback: els['logs-query'].value }));""")
+    assert r == {"stored": "*", "last": "*", "input": "*", "fallback": "source=mcp"}

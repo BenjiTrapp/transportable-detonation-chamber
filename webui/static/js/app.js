@@ -12052,6 +12052,7 @@ const LOGS_RANGES = ['15m', '1h', '4h', '24h', '7d', 'All'];
 const LOGS_DEFAULT_RANGE = '24h';
 const LOGS_RECENT_KEY = 'tdc.logs.recent';
 const LOGS_RANGE_KEY = 'tdc.logs.range';
+const LOGS_LAST_KEY = 'tdc.logs.last';
 const LOGS_RECENT_MAX = 10;
 const LOGS_LIVE_MS = 10000;
 const LOGS_PAGE = 200;
@@ -12115,6 +12116,25 @@ function logsRecent() {
     } catch (e) {
         return [];
     }
+}
+
+// The query of the last search, even a bare *, for the next visit
+function logsRememberLast(query) {
+    try {
+        localStorage.setItem(LOGS_LAST_KEY, String(query ?? ''));
+    } catch (e) {
+        // storage blocked
+    }
+}
+
+function logsLastQuery() {
+    try {
+        const last = localStorage.getItem(LOGS_LAST_KEY);
+        if (typeof last === 'string' && last.trim()) return last;
+    } catch (e) {
+        // storage blocked
+    }
+    return logsRecent()[0] || '*';
 }
 
 function logsRemember(query) {
@@ -12399,7 +12419,10 @@ async function runLogsSearch(opts) {
     const same = silent && sig === logsLastSig;
     logsLastSig = sig;
     logsState.result = data;
-    if (!silent) logsRemember(logsState.query);
+    if (!silent) {
+        logsRemember(logsState.query);
+        logsRememberLast(logsState.query);
+    }
     if (!same) renderLogsResult(data);
     else renderLogsSummary(data);
     return data;
@@ -12831,7 +12854,7 @@ function initLogs() {
     logsBase = range;
     logsState.earliest = range === 'All' ? '' : `-${range}`;
     logsState.latest = '';
-    logsSetQuery(logsRecent()[0] || '*');
+    logsSetQuery(logsLastQuery());
     renderLogsRange();
     refreshLogsSources();
     runLogsSearch({ silent: true });
