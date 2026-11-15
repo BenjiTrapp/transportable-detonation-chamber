@@ -18,13 +18,15 @@ Environment:
   FAKE_RIZIN_CRASH  rizin dies on the command with this first word
   FAKE_RIZIN_FLAGS  this many more flags (str.extra_0000, ...) in ``flj``
   FAKE_RIZIN_STRINGS  this many more strings (text 0, ...) in ``izj``, after the others
+  FAKE_RIZIN_FUNCTIONS  this many more functions (fcn.00000, ...) in ``afl``, ``aflj`` and ``flj``
+  FAKE_RIZIN_AFL_NOISE  set: ``afl`` also prints a line that is no function row
 
 Like rizin 0.9.1 it dies on ``aflj`` once a project with DWARF variable
 origins has been loaded (see rizin_sessions._sanitize_project), and ``Poo``
 brings back the settings (/core/config) and hints that a project holds.
 ``-v`` prints the version and ``-qc <cmd>`` runs one command, without a file.
 
-The views (pdfj, afbj, pdj, axtj, axfj, afxj, izj, iij, flj, pxj, pdgj, ol.j, oml.j) answer
+The views (afl, pdfj, afbj, pdj, axtj, axfj, afxj, izj, iij, flj, pxj, pdgj, ol.j, oml.j) answer
 from one model of the code: entry0 calls sym.main, whose blocks branch, run
 a long block, switch over two cases and leave by a tail call to
 sym.watchdog. ``cmd @@= a b ...`` runs cmd at each address and, like rizin,
@@ -51,6 +53,9 @@ FUNCTIONS = [] if os.environ.get("FAKE_RIZIN_NO_CODE") else [
     {"offset": 0x140001490, "name": "sym.watchdog", "size": 38, "nbbs": 1},
     {"offset": 0x1400014B7, "name": "sym.main", "size": 1382, "nbbs": 30},
 ]
+# A big dump: that many more functions, far from the ones above (a dump's thousands of fcn.*)
+FUNCTIONS += [{"offset": 0x140010000 + i * 0x20, "name": f"fcn.{i:05d}", "size": 16, "nbbs": 1}
+              for i in range(int(os.environ.get("FAKE_RIZIN_FUNCTIONS") or 0))]
 SLEEP, PIPE, THREAD = 0x1400093A8, 0x1400093B0, 0x140009340
 FLAGS = {"sym.imp.KERNEL32.dll_Sleep": SLEEP, "sym.imp.KERNEL32.dll_CreateNamedPipeA": PIPE,
          "str.child": 0x140005014}
@@ -195,7 +200,9 @@ def err(text):
 
 
 def unquote(arg):
-    arg = arg.strip()
+    # Only spaces and tabs around the argument: a name may start or end with \x85, U+2028 or U+2029,
+    # which str.strip() would take off, and rizin 0.9.1 keeps those (checked with afn + afl).
+    arg = arg.strip(" \t")
     if len(arg) >= 2 and arg[0] == arg[-1] == "'":
         return arg[1:-1].replace("\\'", "'")
     return arg
@@ -359,6 +366,15 @@ def answer(cmd):
         return json.dumps({"core": {"file": sys.argv[-1], "size": os.path.getsize(sys.argv[-1]),
                                     "format": fmt},
                            "bin": {"arch": "x86", "bits": 64, "bintype": "pe", "lang": "c"}}) + "\n"
+    if word == "afl":
+        # rizin 0.9.1: "<offset> <nbbs> <size>[ -> <realsz>]  <name>", by address; realsz where there are gaps
+        lines = []
+        if os.environ.get("FAKE_RIZIN_AFL_NOISE"):
+            lines += ["WARN: a line that is no function row", "0x140001440 nbbs size name"]
+        for fn in sorted(FUNCTIONS, key=lambda f: f["offset"]):
+            real = f" -> {fn['size'] - 82}" if fn["nbbs"] > 1 else ""
+            lines.append(f"{fn['offset']:#011x} {fn['nbbs']:4} {fn['size']:<4}{real:<7}  {name_of(fn)}")
+        return "".join(line + "\n" for line in lines)
     if word == "aflj":
         if state["dwarf"]:
             os._exit(139)

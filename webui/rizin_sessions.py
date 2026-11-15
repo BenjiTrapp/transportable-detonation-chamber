@@ -7,8 +7,11 @@ console input are treated as hostile.
 RizinPipe speaks rizin's pipe protocol: one NUL after start-up and one after
 every answer. Two threads drain stdout and stderr, so every command has a
 time limit; a command that runs over it gets rizin killed (RizinTimeout). An
-answer to a view that is larger than VIEW_ANSWER_MAX is read to its end but
-not kept (RizinTooLarge). On Windows every rizin runs in a job object that
+answer larger than the command's limit is read to its end but not kept
+(RizinTooLarge): the lists of strings, imports and flags keep at most
+VIEW_ANSWER_MAX, a disassembly or a decompile of one function
+FUNCTION_ANSWER_MAX, every other answer ANSWER_MAX, the backstop no
+legitimate answer reaches. On Windows every rizin runs in a job object that
 ends it when the web UI's process ends, also when that is killed (_Job).
 
 check_console_command is the console filter. Fail-closed: a command has to
@@ -75,8 +78,21 @@ STEP_GAP = 2.0
 STEP_GAP_LIMIT = 10.0
 SAVE_DELAY = 3.0
 CONSOLE_LIMIT = 1024 * 1024
-# The largest answer to a view that is kept: rizin's lists of a big dump (izj, flj) run to hundreds of MB
+# The largest answer that the lists of strings, imports and flags keep: their JSON of a big dump (izj,
+# flj) runs to hundreds of MB, and the web UI filters and pages them from a copy of its own.
 VIEW_ANSWER_MAX = 32 * 1024 * 1024
+# The largest answer that a command covering one whole function keeps (pdfj, pdgj). Such an answer is
+# decoded, parsed and turned into the view's own rows, which takes several times its size in the web UI
+# (64 MB of pdfj measured at about 510 MB), so the backstop below would be far too much for one request
+# on the VM's 8 GB. 64 MB is about 220 000 instructions in one function, while DISASSEMBLY shows 2000
+# per page and rz-ghidra gives up long before that.
+FUNCTION_ANSWER_MAX = 64 * 1024 * 1024
+# The largest answer that every other command keeps: a backstop on the memory one answer can take in the
+# web UI, far above what rizin answers to any of them. The function list reads afl's text (about 63 B per
+# function, 80 times smaller than aflj's JSON) and is read row by row, a linear disassembly and a hexdump
+# are bounded by the count the route asks for, and the lists of references (axtj, axfj, afxj) hold one
+# line per reference, so nothing legitimate comes near it.
+ANSWER_MAX = 256 * 1024 * 1024
 MAX_CONSOLE_COMMAND = 2000
 MAX_COMMENT = 500
 NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.@$:-]{0,127}$")
@@ -542,7 +558,9 @@ class RizinPipe:
         return not self._dead and self._proc.poll() is None
 
     def cmd(self, text, timeout=VIEW_TIMEOUT, limit=None):
-        """Run a command; an answer of more than ``limit`` bytes is read to its end and not kept (RizinTooLarge)."""
+        """Run a command; an answer of more than ``limit`` bytes (ANSWER_MAX by default) is read to its
+        end and not kept (RizinTooLarge)."""
+        limit = ANSWER_MAX if limit is None else limit
         self._send([text])
         data, cut = self._answer(time.monotonic() + timeout, limit)
         if cut:
@@ -845,6 +863,31 @@ def _arch_is_safe(pipe):
 
 # --- Sessions ---------------------------------------------------------------
 
+def _first_line(text):
+    """The first line of rizin's output that holds something, without its spaces, tabs and "\\r" around.
+
+    Only "\\n" ends a line here: a function name may hold \\x85, U+2028 or U+2029, which str.splitlines()
+    breaks at and str.strip() takes off, and rizin prints such a name as it is (see _rizin_functions in
+    app.py, which reads afl's rows the same way).
+    """
+    for line in text.split("\n"):
+        if line.strip(" \t\r"):
+            return line.strip(" \t\r")
+    return ""
+
+
+def _afl_line(text):
+    """The address and the name of rizin's ``afl.`` answer: ("0x…", name), both empty if it has neither.
+
+    Split at the column separator only, never at arbitrary whitespace: str.split() would read a name's
+    leading \\x85, U+2028, U+2029 or "\\r" as part of the separator, and the function list (afl's rows,
+    see _rizin_functions in app.py) and a rename's answer keep such a character. Partitioning also means
+    there is nothing to index, so a line without an address gives ("", ""), not an IndexError.
+    """
+    address, _, name = _first_line(text).partition(" ")
+    return address, name.lstrip(" \t")
+
+
 _ALL_STEPS = ("aaa", "aa", "aalg", "aalos", "aac", "aap", "aar", "aalor", "aav", "aaef", "aan",
               "aaft", "Fa", "aanr", "aaC", "avrr")
 _CALLS_STEPS = ("aac", "aar")  # aaa runs them with analysis.calls=true
@@ -1054,14 +1097,15 @@ class RizinSession:
         """Analysis, seek and function without touching the pipe."""
         return {"analysis": self.analysis, "seek": self.at, "function": self.function}
 
-    def json(self, cmd, wait=2.0, timeout=VIEW_TIMEOUT):
+    def json(self, cmd, wait=2.0, timeout=VIEW_TIMEOUT, limit=None):
         """Run a JSON command built by the web UI. User input goes through console(). An answer over
-        VIEW_ANSWER_MAX raises RizinTooLarge; the session goes on."""
-        return self._call("view", wait, lambda pipe: pipe.cmdj(cmd, timeout, VIEW_ANSWER_MAX))
+        ``limit`` (ANSWER_MAX by default; the list views pass VIEW_ANSWER_MAX, the views of one function
+        FUNCTION_ANSWER_MAX) raises RizinTooLarge; the session goes on."""
+        return self._call("view", wait, lambda pipe: pipe.cmdj(cmd, timeout, limit))
 
-    def text(self, cmd, wait=2.0, timeout=VIEW_TIMEOUT):
+    def text(self, cmd, wait=2.0, timeout=VIEW_TIMEOUT, limit=None):
         """Like json() for a command whose output is text."""
-        return self._call("view", wait, lambda pipe: pipe.cmd(cmd, timeout, VIEW_ANSWER_MAX))
+        return self._call("view", wait, lambda pipe: pipe.cmd(cmd, timeout, limit))
 
     def console(self, text, wait=2.0):
         reason = check_console_command(text)
@@ -1114,16 +1158,16 @@ class RizinSession:
 
         def run(pipe):
             self._refuse_while_analysing()
-            found = pipe.cmd(f"afl. @ {addr:#x}").strip()
-            if not found:
-                raise RizinRefused(f"there is no function at {addr:#x}")
             # rizin 0.9.1's afn renames only at a function's start: the function around addr by its entry.
-            entry = int(found.splitlines()[0].split(None, 1)[0], 16)
+            try:
+                entry = int(_afl_line(pipe.cmd(f"afl. @ {addr:#x}"))[0], 16)
+            except ValueError:
+                raise RizinRefused(f"there is no function at {addr:#x}") from None
             # In single quotes the name's @ $ : stay text.
             pipe.cmd(f"afn {_rz_quote(name)} @ {entry:#x}")
-            offset, _, new_name = pipe.cmd(f"afl. @ {entry:#x}").strip().splitlines()[0].partition(" ")
+            offset, new_name = _afl_line(pipe.cmd(f"afl. @ {entry:#x}"))
             self._where(pipe)
-            return {"offset": int(offset, 16), "name": new_name.strip()}
+            return {"offset": int(offset, 16), "name": new_name}
 
         result = self._call("rename", wait, run)
         self._schedule_save()
@@ -1488,9 +1532,7 @@ class RizinSession:
             self.at = int(pipe.cmd("s").strip(), 16)
         except ValueError:
             self.at = None
-        lines = pipe.cmd("afl.").strip().splitlines()
-        parts = lines[0].split(None, 1) if lines else []
-        self.function = parts[1].strip() if len(parts) == 2 else None
+        self.function = _afl_line(pipe.cmd("afl."))[1] or None
 
     def _project_snapshot(self, pipe):
         """``Ps`` to a temporary file (gate held); _finish_save then makes it the project."""
