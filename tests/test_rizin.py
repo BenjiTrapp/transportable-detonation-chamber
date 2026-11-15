@@ -486,7 +486,9 @@ def test_pipe_answers_and_times_out(fake, sample, monkeypatch):
         started = time.monotonic()
         with pytest.raises(RizinTimeout):
             pipe.cmdj("pdfj @ sym.main", timeout=1.0)
-        assert 1.0 <= time.monotonic() - started <= 2.0
+        # It waited for its limit, not for the answer (which takes 30 s); the upper bound is wide, so a
+        # stall on a loaded runner does not fail it (follow-up finding 3)
+        assert 1.0 <= time.monotonic() - started <= 10.0
         assert not pipe.alive
         assert pipe._proc.poll() is not None
     finally:
@@ -632,8 +634,9 @@ def _steps_in(commands):
 def test_analysis_runs_in_steps_and_stays_usable(sessions, sample, fake, monkeypatch):
     from rizin_sessions import RizinBusy
 
-    # Up to 20 MB: aaa, as one step, so the result is exactly rizin's.
-    monkeypatch.setenv("FAKE_RIZIN_SLOW", "aaa:1.5")
+    # Up to 20 MB: aaa, as one step, so the result is exactly rizin's. The fake steps take seconds, so
+    # that a stall on a loaded runner cannot end them while the test looks at them (follow-up finding 3).
+    monkeypatch.setenv("FAKE_RIZIN_SLOW", "aaa:4")
     mgr = sessions()
     small = mgr.open(sample(), "tab1")
     assert small["analysis"]["level"] == "aaa"
@@ -642,14 +645,18 @@ def test_analysis_runs_in_steps_and_stays_usable(sessions, sample, fake, monkeyp
     started = time.monotonic()
     with pytest.raises(RizinBusy) as busy:
         session.json("aflj", wait=0.3)
-    assert busy.value.step == "aaa" and time.monotonic() - started < 1.0
+    # It gave up during the step instead of waiting for it: it waited its turn (and not much longer: the
+    # ceiling is wide for a stall, far below the step), and the step it named is the one still running.
+    took = time.monotonic() - started
+    assert busy.value.step == "aaa" and 0.3 <= took < 2.0, took
+    assert session.analysis["step"] == "aaa" and session.analysis["state"] == "running"
     state = _wait_state(session, "done")
     assert state["done_steps"] == ["aaa"] and state["level"] == "aaa" and state["note"] is None
-    assert state["elapsed"] >= 1.5
+    assert state["elapsed"] >= 4.0
     assert _steps_in(fake.by_process()[0]) == ["aaa"]
 
     # Over 20 MB: aa.
-    monkeypatch.setenv("FAKE_RIZIN_SLOW", "aac:1.5,aar:1.5")
+    monkeypatch.setenv("FAKE_RIZIN_SLOW", "aac:4")
     big = mgr.open(sample("big.bin", b"MZ", size=BIG), "tab2")
     assert big["analysis"]["level"] == "aa"
     session = mgr.get(big["session"])
@@ -662,8 +669,8 @@ def test_analysis_runs_in_steps_and_stays_usable(sessions, sample, fake, monkeyp
     assert wait_for(lambda: session.analysis["step"] == "aac")
     with pytest.raises(RizinBusy) as busy:
         session.json("aflj", wait=0.3)
-    assert busy.value.step == "aac"
-    assert len(session.json("aflj", wait=5.0)) == 3
+    assert busy.value.step == "aac" and session.analysis["step"] == "aac"
+    assert len(session.json("aflj", wait=10.0)) == 3
     state = _wait_state(session, "done")
     assert state["done_steps"] == FULL and state["level"] == "aaa"
     assert "variables are analysed less than with aaa" in state["note"]
@@ -678,9 +685,12 @@ def test_analysis_runs_in_steps_and_stays_usable(sessions, sample, fake, monkeyp
 def test_full_analysis_serves_requests_between_steps(sessions, sample, fake, monkeypatch):
     """The controller's ruling: between two steps of Full analysis the session holds off for step_gap
     seconds, so a view asked for just after a step is answered before the next step starts (not busy),
-    and the status shows no running step then. aaa and aa, one step each, have no gap."""
+    and the status shows no running step then. aaa and aa, one step each, have no gap.
+
+    The gap is seconds long here, so that a stall between the step's end and the request does not use it
+    up (follow-up finding 3); what is pinned is the state (no step runs) and the order in rizin's log."""
     monkeypatch.setenv("FAKE_RIZIN_SLOW", "aac:0.4,aar:0.4")
-    mgr = sessions(big_file=1, step_gap=0.8, step_gap_limit=3.0)
+    mgr = sessions(big_file=1, step_gap=1.5, step_gap_limit=4.0)
     session = mgr.get(mgr.open(sample("gap.exe", b"MZ gap"), "tab")["session"])
     _wait_state(session, "done")
     session.analyze_full()
@@ -702,7 +712,10 @@ def test_full_analysis_serves_requests_between_steps(sessions, sample, fake, mon
 
 def test_the_gap_between_steps_is_bounded_when_requests_keep_coming(sessions, sample, fake, monkeypatch):
     """Requests that use or wait for the pipe hold the next step off, step_gap_limit seconds after the
-    step at most; then the step goes first, and the requests that wait come after it."""
+    step at most; then the step goes first, and the requests that wait come after it.
+
+    That the step comes at all while requests keep coming is what this pins; the upper bound on when it
+    comes is wide, so a stall on a loaded runner does not fail it (follow-up finding 3)."""
     from rizin_sessions import RizinBusy
 
     monkeypatch.setenv("FAKE_RIZIN_SLOW", "aac:0.3,aflj:0.1")
@@ -728,13 +741,14 @@ def test_the_gap_between_steps_is_bounded_when_requests_keep_coming(sessions, sa
         assert wait_for(lambda: "aac" in session.analysis["done_steps"], timeout=5.0)
         ended = time.monotonic()
         assert wait_for(lambda: session.analysis["step"] == "aar" or "aar" in session.analysis["done_steps"],
-                        timeout=4.0), "the next step never started while requests kept coming"
+                        timeout=10.0), "the next step never started while requests kept coming"
         started = time.monotonic()
     finally:
         stop.set()
         for asker in askers:
             asker.join(timeout=10)
-    assert started - ended < 1.2 + 0.6, started - ended
+    # Bounded by step_gap_limit, with room for a stall but still near enough to pin the limit's value
+    assert started - ended < 1.2 + 1.5, started - ended
     assert any(ended <= t <= started for t in served), "no request was served between the two steps"
     assert _wait_state(session, "done")["done_steps"] == FULL
 
@@ -786,7 +800,9 @@ def test_analysis_stops_at_the_limit_and_restarts_hanging_steps(sessions, sample
 def test_no_renames_or_comments_while_the_analysis_runs(sessions, sample, fake, monkeypatch):
     from rizin_sessions import RizinBusy
 
-    monkeypatch.setenv("FAKE_RIZIN_SLOW", "aaa:1.5,aac:1.5")
+    # Steps of seconds: the refusals are measured against one wait for the pipe (2 s), not against a
+    # step that may already be over (follow-up finding 3).
+    monkeypatch.setenv("FAKE_RIZIN_SLOW", "aaa:4,aac:4")
     mgr = sessions()
     session = mgr.get(mgr.open(sample(), "tab")["session"])
     assert wait_for(lambda: session.analysis["step"] == "aaa")
@@ -796,7 +812,9 @@ def test_no_renames_or_comments_while_the_analysis_runs(sessions, sample, fake, 
         with pytest.raises(RizinBusy) as busy:
             annotate()
         assert busy.value.step == "aaa"
-    assert time.monotonic() - started < 1.0  # refused at once, not after waiting for the pipe
+    # Refused at once: four of them took less than one wait for the pipe, and the step still runs
+    assert time.monotonic() - started < 2.0
+    assert session.analysis["step"] == "aaa"
     assert not [c for c in fake.commands() if "early" in c]
     _wait_state(session, "done")
     assert session.rename(0x1400014B7, "late")["name"] == "late"
@@ -811,7 +829,8 @@ def test_no_renames_or_comments_while_the_analysis_runs(sessions, sample, fake, 
     started = time.monotonic()
     with pytest.raises(RizinBusy) as busy:
         session.comment(0x1400014B7, "between", wait=5.0)
-    assert busy.value.step == "aac" and time.monotonic() - started < 1.0
+    assert busy.value.step == "aac" and time.monotonic() - started < 2.0
+    assert session.analysis["step"] == "aac"
     _wait_state(session, "done")
 
 
@@ -1021,10 +1040,11 @@ def test_a_failed_final_save_leaves_the_analysis_done(sessions, sample, fake, tm
 
 
 def test_close_does_not_wait_for_a_save_that_waits_for_the_pipe(sessions, sample, fake, tmp_path, monkeypatch):
-    # A view holds the pipe for 4 s, and the timer's save waits for it (holding the save lock) when the
-    # tab closes: close() returns after about 2 s, the save is written once the pipe is free, and then
-    # the session ends.
-    monkeypatch.setenv("FAKE_RIZIN_SLOW", "pdfj:4")
+    # A view holds the pipe for 10 s, and the timer's save waits for it (holding the save lock) when the
+    # tab closes: close() returns after about 2 s (_CLOSE_WAIT), the save is written once the pipe is
+    # free, and then the session ends. The view is long, so that the upper bound on close() lies far
+    # below the time a close that waited for the save would take (follow-up finding 3).
+    monkeypatch.setenv("FAKE_RIZIN_SLOW", "pdfj:10")
     timers = Timers()
     mgr = sessions(timer=timers)
     opened = mgr.open(sample(), "tab")
@@ -1039,13 +1059,13 @@ def test_close_does_not_wait_for_a_save_that_waits_for_the_pipe(sessions, sample
     assert wait_for(lambda: session._save_lock.locked())
     started = time.monotonic()
     mgr.close(opened["session"])
-    assert time.monotonic() - started < 3.0
+    assert time.monotonic() - started < 6.0
     assert not session.closed
-    assert wait_for(lambda: session.closed, 15)
+    assert wait_for(lambda: session.closed, 25)
     project = tmp_path / "projects" / (opened["file"]["sha256"] + ".rzdb")
     assert "pending at close" in project.read_text()
-    view.join(5)
-    saver.join(5)
+    view.join(15)
+    saver.join(15)
     assert len([c for c in fake.commands() if c.startswith("Ps ")]) == 1
 
 
@@ -1276,7 +1296,8 @@ def test_rizin_ends_with_the_web_ui_on_windows(fake, sample, monkeypatch, capsys
 
 def test_view_answers_are_capped_and_the_pipe_stays_in_sync(fake, sample, monkeypatch):
     """Final review, S6: an answer of a view command over the cap is not kept (the reader goes on to its
-    end without keeping it, so the next answer is the next command's), and the view says it is too large."""
+    end without keeping it, so the next answer is the next command's), and the view says it is too large.
+    Follow-up finding 1: without a limit of its own a command keeps ANSWER_MAX, the backstop."""
     import rizin_sessions
 
     monkeypatch.setenv("FAKE_RIZIN_STRINGS", "2000")
@@ -1297,6 +1318,12 @@ def test_view_answers_are_capped_and_the_pipe_stays_in_sync(fake, sample, monkey
         assert pipe.cmd("echo next") == "next\n", "the pipe is out of step after a capped answer"
         assert len(pipe.cmdj("izj")) == 2006
         assert pipe.alive
+        # No limit asked for: the backstop, which no legitimate answer reaches
+        monkeypatch.setattr(rizin_sessions, "ANSWER_MAX", 4096)
+        with pytest.raises(rizin_sessions.RizinTooLarge) as too_large:
+            pipe.cmdj("izj")
+        assert "4096 bytes" in str(too_large.value)
+        assert pipe.cmd("echo after") == "after\n"
     finally:
         pipe.close()
 
@@ -1822,7 +1849,9 @@ def test_rizin_open_refuses_paths_outside_and_odd_files(rz, monkeypatch):
 
 
 def test_rizin_busy_session_does_not_block_other_routes(rz, monkeypatch):
-    monkeypatch.setenv("FAKE_RIZIN_SLOW", "aaa:5")
+    """The step takes long enough that an answer which waited for it could not be mistaken for a quick
+    one, so the bounds here are wide (follow-up finding 3)."""
+    monkeypatch.setenv("FAKE_RIZIN_SLOW", "aaa:20")
     sid = rz.open(rz.write("slow.exe", b"MZ slow"))["session"]
     assert wait_for(lambda: rz.status(sid)["analysis"]["step"] == "aaa")
     answers = {}
@@ -1842,13 +1871,13 @@ def test_rizin_busy_session_does_not_block_other_routes(rz, monkeypatch):
     for url in ("/api/health", f"/api/rizin/{sid}/status", "/api/rizin/status"):
         started = time.monotonic()
         assert rz.get(url).status_code == 200, url
-        assert time.monotonic() - started < 0.5, url
+        assert time.monotonic() - started < 5.0, url  # they do not wait for the step (20 s)
     for thread in threads:
-        thread.join(5)
+        thread.join(15)
     for name in ("functions", "console"):
         status, body, took = answers[name]
         assert status == 409 and body == {"busy": True, "step": "aaa"}, name
-        assert took < 3.0, name
+        assert took < 10.0, name  # busy after about 2 s of waiting, not after the step
 
 
 def test_rizin_console_refusal_and_cross_site(rz):
@@ -2141,15 +2170,16 @@ def test_rizin_flags_load_once_for_requests_at_once(rz, monkeypatch):
 
     # A load that takes longer than a request waits for it: that request is busy, the load goes on
     monkeypatch.setattr(rz.tdc, "RIZIN_LOAD_WAIT", 0.3)
-    monkeypatch.setenv("FAKE_RIZIN_SLOW", "flj:1.2")
+    monkeypatch.setenv("FAKE_RIZIN_SLOW", "flj:4")
     slow = rz.open(rz.write("slow.exe", b"MZ slow flags"), "tab2")["session"]
     rz.wait_done(slow)
     first = threading.Thread(target=tab, args=("first", slow, "sym"))
     first.start()
     assert wait_for(lambda: "flj" in rz.rizin_runs()[-1], 5)
     tab("second", slow, "sym")
-    first.join(10)
-    assert answers["second"] == (409, {"busy": True, "step": "view"}) and took["second"] < 0.9, took
+    first.join(15)
+    # It gave up after RIZIN_LOAD_WAIT; the load it did not wait for takes 4 s (follow-up finding 3)
+    assert answers["second"] == (409, {"busy": True, "step": "view"}) and took["second"] < 2.0, took
     assert answers["first"][0] == 200 and answers["first"][1]["total"] == 4
     assert rz.read(f"/api/rizin/{slow}/flags?q=sym")["total"] == 4
     assert rz.rizin_runs()[-1].count("flj") == 1
@@ -2221,13 +2251,14 @@ def test_rizin_decompile_time_limit_ends_the_session(rz, monkeypatch):
 
     assert rizin_sessions.DECOMPILE_TIMEOUT == 120 and rizin_sessions.DECOMPILE_TIMEOUT > rizin_sessions.CONSOLE_TIMEOUT
     assert rizin_sessions._FLUSH_WAIT > rizin_sessions.DECOMPILE_TIMEOUT
-    monkeypatch.setenv("FAKE_RIZIN_SLOW", "pdgj:3")
+    monkeypatch.setenv("FAKE_RIZIN_SLOW", "pdgj:20")
     monkeypatch.setattr(rizin_sessions, "DECOMPILE_TIMEOUT", 0.5)
     sid = rz.open(rz.write("pipesim.exe"))["session"]
     rz.wait_done(sid)
     started = time.monotonic()
     out = rz.get(f"/api/rizin/{sid}/decompile?addr={MAIN:#x}")
-    assert time.monotonic() - started < 2.5, "pdgj did not stop at the decompile limit"
+    # Stopped at its limit, far below the 20 s the answer would take (follow-up finding 3)
+    assert time.monotonic() - started < 10.0, "pdgj did not stop at the decompile limit"
     assert out.status_code == 404 and out.get_json() == {"error": "session ended",
                                                          "reason": "Decompiling took too long, the session ended."}
     assert rz.get(f"/api/rizin/{sid}/status").status_code == 404
@@ -2297,6 +2328,223 @@ def test_rizin_big_lists_stay_bounded(rz, monkeypatch):
     assert flags["truncated"] is True and len(flags["names"]) == 3 and flags["total"] < 2000
     rows = rz.tdc._rizin_cache[rz.mgr.get(sid)]["strings"][1][0]
     assert len(rows) == 1000 and all(isinstance(row, tuple) for row in rows), "the copy keeps whole rows"
+
+
+def test_rizin_function_list_does_not_depend_on_the_answer_cap(rz, monkeypatch):
+    """Follow-up finding 1: the answer cap was made for the lists whose JSON runs to hundreds of MB
+    (izj, iij, flj), but it also covered aflj, which carries about 2.7 KB per function (44 MB for a
+    16 000-function dump): from about 12 000 functions /functions answered 500 and the tab had no
+    function list, and XREFS then named no function. The list comes from afl's text instead (about
+    63 B per function), so a small cap does not reach it; the lists it was made for still refuse."""
+    import rizin_sessions
+
+    monkeypatch.setenv("FAKE_RIZIN_FUNCTIONS", "20000")
+    monkeypatch.setenv("FAKE_RIZIN_STRINGS", "2000")
+    sid = rz.open(rz.write("dump.bin"))["session"]
+    rz.wait_done(sid)
+    monkeypatch.setattr(rizin_sessions, "VIEW_ANSWER_MAX", 8192)
+
+    functions = rz.read(f"/api/rizin/{sid}/functions")
+    assert len(functions) == 20003, "the function list was cut (or refused) for its size"
+    assert functions[:3] == [{"name": "entry0", "offset": ENTRY, "size": 29, "nbbs": 1},
+                             {"name": "sym.watchdog", "offset": WATCHDOG, "size": 38, "nbbs": 1},
+                             {"name": "sym.main", "offset": MAIN, "size": 1382, "nbbs": 30}]
+    assert functions[3] == {"name": "fcn.00000", "offset": 0x140010000, "size": 16, "nbbs": 1}
+    assert [f["offset"] for f in functions] == sorted(f["offset"] for f in functions)
+    # The names of the functions that references lie in come from the same list
+    assert rz.read(f"/api/rizin/{sid}/xrefs?addr={MAIN:#x}")["to"][0]["function"] == "entry0"
+    # rizin's own JSON of this list is not asked for at all
+    assert "afl" in rz.fake.commands() and not [c for c in rz.fake.commands() if c.startswith("aflj")]
+    # The lists the cap was made for still say to filter in the console
+    assert rz.get(f"/api/rizin/{sid}/strings").status_code == 500
+
+
+def test_rizin_function_list_reads_afls_text(rz, monkeypatch):
+    """Follow-up finding 1: afl's rows are read defensively (a line that is no row is left out) and at
+    most RIZIN_ROWS_MAX of them are kept, as for the other lists; the answer keeps its shape, so the
+    rows of a function with gaps (``-> realsz``) and a name with spaces come through as rizin has them."""
+    monkeypatch.setenv("FAKE_RIZIN_AFL_NOISE", "1")
+    sid = rz.open(rz.write("pipesim.exe"))["session"]
+    rz.wait_done(sid)
+    assert rz.read(f"/api/rizin/{sid}/functions") == [
+        {"name": "entry0", "offset": ENTRY, "size": 29, "nbbs": 1},
+        {"name": "sym.watchdog", "offset": WATCHDOG, "size": 38, "nbbs": 1},
+        {"name": "sym.main", "offset": MAIN, "size": 1382, "nbbs": 30}]
+
+    # rizin 0.9.1's own rows (afl of a sample built with mingw), odd lines and a row cap
+    class Pipe:
+        def __init__(self, text):
+            self.text = lambda cmd, **kw: text
+
+    rows = ("0x140001000    1 1            sym.__mingw_invalidParameterHandler\n"
+            "0x140001020   49 1024 -> 980  sym.__tmainCRTStartup\n"
+            "0x140001a70    8 114  -> 111  sym.__do_global_ctors\n"
+            "0x140001440    1 29           entry0\n"
+            "0x140002000    2 32           sym.a name with spaces\n")
+    odd = "\nWARN: no row\n0x140003000 x 4 name\nxx 1 4 name\n0x140004000 1\n0x1 1 4\n"
+    functions = rz.tdc._rizin_functions(Pipe(rows + odd))
+    assert functions == [
+        {"name": "sym.__mingw_invalidParameterHandler", "offset": 0x140001000, "size": 1, "nbbs": 1},
+        {"name": "sym.__tmainCRTStartup", "offset": 0x140001020, "size": 1024, "nbbs": 49},
+        {"name": "entry0", "offset": 0x140001440, "size": 29, "nbbs": 1},
+        {"name": "sym.__do_global_ctors", "offset": 0x140001A70, "size": 114, "nbbs": 8},
+        {"name": "sym.a name with spaces", "offset": 0x140002000, "size": 32, "nbbs": 2}]
+    monkeypatch.setattr(rz.tdc, "RIZIN_ROWS_MAX", 2)
+    assert [f["name"] for f in rz.tdc._rizin_functions(Pipe(rows))] == [
+        "sym.__mingw_invalidParameterHandler", "sym.__tmainCRTStartup"]
+
+
+# The separators that str.splitlines() breaks a line at, besides rizin's own "\n" (and "\r\n"); those
+# that are no ASCII control character can be set through the console's afn, the others can come from a
+# symbol name in the file.
+ODD_SEPARATORS = "\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+ODD_IN_A_NAME = "\x85\u2028\u2029"
+
+
+def test_rizin_function_names_keep_rizins_own_line_separator(rz):
+    """Review, Important 2: a function name may hold a character that str.splitlines() breaks a line at
+    (\\x0b, \\x0c, \\x1c-\\x1e, \\x85, U+2028, U+2029). The console's name check refuses only the ASCII
+    control characters, so afn can set such a name (and a symbol in the file can carry any of them), and
+    rizin keeps the raw UTF-8 and prints it in afl. Split at those, the row was listed with its name cut
+    there and the rest dropped as unparsable, while the tab takes the current function's name from afij,
+    whole: the mark in FUNCTIONS, the rename follow-up and the right-click menu then missed that
+    function. Only "\\n" ends a row, and a separator at the start of a name belongs to the name.
+    """
+    import rizin_sessions
+
+    sid = rz.open(rz.write("pipesim.exe"))["session"]
+    rz.wait_done(sid)
+    for odd in ("sym.a" + ODD_IN_A_NAME + "b", "\x85foo", "\u2028lead"):
+        assert rz.send(f"/api/rizin/{sid}/console", {"cmd": f"afn {odd} @ {MAIN:#x}"})["changed"] is True
+        assert [f["name"] for f in rz.read(f"/api/rizin/{sid}/functions")] == ["entry0", "sym.watchdog", odd]
+        # The name the tab marks the row by (afij, through the disassembly) is the same text
+        assert rz.read(f"/api/rizin/{sid}/disasm?addr={MAIN:#x}&count=1")["function"] == odd
+        # Review round 3, item 4: and so is the session's own function (afl.), which /status, /seek and
+        # /console answer with and the tab's SEEK box, its mark and the rename shortcut go by. Review
+        # round 4: a separator at the start of the name belongs to the name too, as the row has it.
+        assert rz.status(sid)["function"] == odd
+        assert rz.send(f"/api/rizin/{sid}/seek", {"addr": f"{MAIN:#x}"})["function"] == odd
+        assert rz.send(f"/api/rizin/{sid}/console", {"cmd": f"pd 1 @ {MAIN:#x}"})["function"] == odd
+
+    # A name starting with a carriage return: rizin lists it, so the session has to name it the same way
+    # (the console cannot set one - a command is a single line - but a symbol in the file can carry it)
+    class Afl:
+        @staticmethod
+        def cmd(text, **kwargs):
+            return "0x140001440\n" if text == "s" else "0x140001440 \rcr\n"
+
+    session = rz.mgr.get(sid)
+    session._where(Afl)
+    assert session.function == "\rcr"
+    assert session.status()["function"] == "\rcr"
+
+    # A line of afl. that holds no address: refused as "no function", never an IndexError
+    class NoAddress:
+        @staticmethod
+        def cmd(text, **kwargs):
+            return "0x140001440\n" if text == "s" else "\x85\n"
+
+    real_pipe = session._pipe
+    session._pipe = NoAddress
+    try:
+        with pytest.raises(rizin_sessions.RizinRefused) as refused:
+            session.rename(MAIN, "clean")
+    finally:
+        session._pipe = real_pipe
+    assert "no function" in refused.value.reason
+
+    # A row still ends at "\n" alone, and a "\r\n" line ending leaves no carriage return in the name
+    class Pipe:
+        def __init__(self, text):
+            self.text = lambda cmd, **kw: text
+
+    rows = f"0x140001000    1 1            sym.a{ODD_SEPARATORS}b\r\n0x140001020    1 2            second\n"
+    assert rz.tdc._rizin_functions(Pipe(rows)) == [
+        {"name": f"sym.a{ODD_SEPARATORS}b", "offset": 0x140001000, "size": 1, "nbbs": 1},
+        {"name": "second", "offset": 0x140001020, "size": 2, "nbbs": 1}]
+    # Review round 3, item 5: a name whose first character is a carriage return is a name too, while a
+    # row whose name is nothing but one (a "\r\n" ending with no name) is no row
+    odd_first = f"0x140001040    1 3            \rthird\r\n0x140001060    1 4            \r\n"
+    assert rz.tdc._rizin_functions(Pipe(odd_first)) == [
+        {"name": "\rthird", "offset": 0x140001040, "size": 3, "nbbs": 1}]
+
+
+def test_rizin_function_list_stops_reading_at_the_row_cap(rz, monkeypatch):
+    """Review, Minor 6: the row cap has to bound the memory the list takes, not only the work after it:
+    the rows are read one by one (no list of every line of the answer), so a dump far above the cap
+    costs the rows kept, not the whole answer again."""
+    import tracemalloc
+
+    class Pipe:
+        def __init__(self, text):
+            self.text = lambda cmd, **kw: text
+
+    rows = "".join(f"{0x140000000 + i * 16:#011x}    1 16           sym.fcn_{i:06d}\n"
+                   for i in range(400000))
+    assert len(rows) > 16 * 1024 * 1024
+    pipe = Pipe(rows)
+    monkeypatch.setattr(rz.tdc, "RIZIN_ROWS_MAX", 1000)
+    tracemalloc.start()
+    try:
+        functions = rz.tdc._rizin_functions(pipe)
+        taken = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert len(functions) == 1000 and functions[0]["name"] == "sym.fcn_000000"
+    assert taken < 2 * 1024 * 1024, f"{taken} bytes for 1000 rows of a {len(rows)}-byte answer"
+
+
+def test_rizin_the_answer_cap_belongs_to_the_lists_it_was_made_for(rz, monkeypatch):
+    """Follow-up finding 1: VIEW_ANSWER_MAX is passed by the three list views only (izj, iij, flj).
+
+    Review, Important 1: the commands that answer for one whole function (pdfj, pdgj) carry
+    FUNCTION_ANSWER_MAX, not the backstop: their answer is decoded and parsed, which takes several
+    times its size, so the backstop's band would let one request take gigabytes. Everything else keeps
+    ANSWER_MAX, so a function list, a linear page, a graph or a hexdump is never refused for its size.
+    """
+    import rizin_sessions
+
+    assert rizin_sessions.ANSWER_MAX >= 8 * rizin_sessions.VIEW_ANSWER_MAX
+    assert rizin_sessions.VIEW_ANSWER_MAX < rizin_sessions.FUNCTION_ANSWER_MAX < rizin_sessions.ANSWER_MAX
+    seen = []
+    real = rizin_sessions.RizinPipe.cmd
+
+    def spy(self, text, timeout=rizin_sessions.VIEW_TIMEOUT, limit=None):
+        seen.append((text.split("~")[0].split(" ")[0],
+                     rizin_sessions.ANSWER_MAX if limit is None else limit))
+        return real(self, text, timeout, limit)
+
+    monkeypatch.setattr(rizin_sessions.RizinPipe, "cmd", spy)
+    sid = rz.open(rz.write("pipesim.exe"))["session"]
+    rz.wait_done(sid)
+    del seen[:]
+    for url in (f"/api/rizin/{sid}/functions", f"/api/rizin/{sid}/disasm?addr={MAIN:#x}",
+                f"/api/rizin/{sid}/disasm?addr=0x140003098", f"/api/rizin/{sid}/graph?addr={MAIN:#x}",
+                f"/api/rizin/{sid}/decompile?addr={MAIN:#x}", f"/api/rizin/{sid}/hex?addr={MAIN:#x}",
+                f"/api/rizin/{sid}/xrefs?addr={MAIN:#x}", f"/api/rizin/{sid}/xrefs?addr=0x140001630",
+                f"/api/rizin/{sid}/comment?addr={MAIN:#x}",
+                f"/api/rizin/{sid}/strings", f"/api/rizin/{sid}/imports", f"/api/rizin/{sid}/flags?q=sym"):
+        rz.read(url)
+    rz.send(f"/api/rizin/{sid}/seek", {"addr": "entry0"})
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "afl"})
+    by_limit = {}
+    for cmd, limit in seen:
+        by_limit.setdefault(limit, set()).add(cmd)
+    assert by_limit[rizin_sessions.VIEW_ANSWER_MAX] == {"izj", "iij", "flj"}
+    assert by_limit[rizin_sessions.FUNCTION_ANSWER_MAX] == {"pdfj", "pdgj"}
+    assert {"afl", "afij", "pdj", "afbj", "pxj", "axtj", "axfj", "afxj", "Lc"} \
+        <= by_limit[rizin_sessions.ANSWER_MAX]
+    assert set(by_limit) == {rizin_sessions.VIEW_ANSWER_MAX, rizin_sessions.FUNCTION_ANSWER_MAX,
+                             rizin_sessions.ANSWER_MAX}
+    # A function of that size is refused, with the command and the limit in the error
+    monkeypatch.setattr(rizin_sessions, "FUNCTION_ANSWER_MAX", 512)
+    for url, command in ((f"/api/rizin/{sid}/disasm?addr={MAIN:#x}", "pdfj"),
+                         (f"/api/rizin/{sid}/graph?addr={MAIN:#x}", "pdfj"),
+                         (f"/api/rizin/{sid}/decompile?addr={MAIN:#x}", "pdgj")):
+        r = rz.get(url)
+        assert r.status_code == 500 and r.get_json()["error"] == \
+            f"rizin's answer to {command} is larger than 512 bytes", (url, r.get_json())
+    assert len(rz.read(f"/api/rizin/{sid}/functions")) == 3, "the pipe is out of step after a capped answer"
 
 
 def test_rizin_open_and_download_use_the_path_that_was_checked(rz):
@@ -2387,6 +2635,16 @@ def test_real_rizin_routes(tdc, tmp_path, monkeypatch):
         functions = api.read(f"/api/rizin/{sid}/functions")
         main = next(f for f in functions if f["name"] == "sym.main")
         assert main["nbbs"] == 30
+        # The list is read from afl's text, not from aflj (2.7 KB per function there): the same functions.
+        # Follow-up finding 1: aflj of a big dump is larger than the answer cap, so the tab had no list.
+        session = mgr.get(sid)
+        aflj = [{"name": f["name"], "offset": f["offset"], "size": f.get("size"), "nbbs": f.get("nbbs")}
+                for f in session.json("aflj", timeout=rizin_sessions.CONSOLE_TIMEOUT)]
+        assert len(functions) > 80
+        assert functions == sorted(aflj, key=lambda f: f["offset"])
+        assert len(session.text("afl", timeout=rizin_sessions.CONSOLE_TIMEOUT)) * 8 < \
+            len(json.dumps(session.json("aflj", timeout=rizin_sessions.CONSOLE_TIMEOUT))), \
+            "afl's text is not much smaller than aflj's JSON"
 
         disasm = api.read(f"/api/rizin/{sid}/disasm?addr={main['offset']}&count=2000")
         assert disasm["function"] == "sym.main" and disasm["more"] is False
@@ -2444,6 +2702,19 @@ def test_real_rizin_routes(tdc, tmp_path, monkeypatch):
         assert api.send(f"/api/rizin/{sid}/rename", {"addr": call["from"], "name": "tdc_main"}) == {
             "offset": main["offset"], "name": "tdc_main"}
         assert api.read(f"/api/rizin/{sid}/disasm?addr={call['from']}&count=2000")["function"] == "tdc_main"
+        # Review, Important 2: rizin keeps a name with U+2028 or U+0085 as it is and prints it in afl;
+        # the row is read whole, like afij's name that the tab marks the row by
+        odd = "sym.odd" + ODD_IN_A_NAME + "tail"
+        api.send(f"/api/rizin/{sid}/console", {"cmd": f"afn {odd} @ {main['offset']:#x}"})
+        assert odd in [f["name"] for f in api.read(f"/api/rizin/{sid}/functions")]
+        assert api.read(f"/api/rizin/{sid}/disasm?addr={call['from']}&count=1")["function"] == odd
+        assert api.status(sid)["function"] == odd  # the session's own (afl.)
+        # Review round 4: a separator at the start of the name belongs to the name, in both
+        lead = "\u2028lead"
+        api.send(f"/api/rizin/{sid}/console", {"cmd": f"afn {lead} @ {main['offset']:#x}"})
+        assert lead in [f["name"] for f in api.read(f"/api/rizin/{sid}/functions")]
+        assert api.status(sid)["function"] == lead
+        api.send(f"/api/rizin/{sid}/rename", {"addr": main["offset"], "name": "tdc_main"})
         decompiled = api.read(f"/api/rizin/{sid}/decompile?addr={main['offset']}")
         if status["ghidra"]:
             assert decompiled["available"] and any(line["offset"] for line in decompiled["lines"])

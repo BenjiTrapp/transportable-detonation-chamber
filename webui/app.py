@@ -5053,7 +5053,9 @@ def api_file_hex_write():
 # from the browser reaches rizin only through the console and its allowlist.
 # Strings and imports are filtered and paged here, from a copy kept per session;
 # the flag names for the console's Tab as well. Those copies are bounded: rows as
-# tuples, at most RIZIN_ROWS_MAX, none of a list larger than VIEW_ANSWER_MAX.
+# tuples, at most RIZIN_ROWS_MAX, none of a list larger than VIEW_ANSWER_MAX. That
+# cap is for those three lists only; the function list reads afl's text, which is
+# small enough for a dump of any size (see _rizin_functions).
 RIZIN_UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "rizin_uploads")
 RIZIN_UPLOADS_KEEP = 40
 RIZIN_DUMPS_LISTED = 500        # newest dump files in /api/rizin/files
@@ -5067,8 +5069,9 @@ RIZIN_HEX_MAX = 4096
 RIZIN_PAGE = 200
 RIZIN_PAGE_MAX = 1000
 RIZIN_FLAGS_MAX = 200           # names in one /flags answer (the console's Tab)
-# Rows of izj, iij or flj kept per session; the rest is left out (truncated in the answer). An answer over
-# rizin_sessions.VIEW_ANSWER_MAX is not read in at all: the list says to filter in the console instead
+# Rows of izj, iij, flj or afl kept per session; the rest is left out (truncated in the answer, which the
+# function list's shape has no room for). An answer of the first three over rizin_sessions.VIEW_ANSWER_MAX
+# is not read in at all: the list says to filter in the console instead
 RIZIN_ROWS_MAX = 200000
 RIZIN_FILTER_HINT = {"strings": "iz~text", "imports": "ii~name"}
 RIZIN_XREFS_MAX = 500
@@ -5304,7 +5307,8 @@ def _rizin_function(session, addr):
 
 
 def _rizin_function_ops(session, fn):
-    data = session.json(f"pdfj @ {fn['offset']:#x}")
+    # pdfj covers the whole function: FUNCTION_ANSWER_MAX bounds what decoding and parsing it can take
+    data = session.json(f"pdfj @ {fn['offset']:#x}", limit=rizin_sessions.FUNCTION_ANSWER_MAX)
     return _rizin_ops(data.get("ops") if isinstance(data, dict) else None)
 
 
@@ -5332,11 +5336,36 @@ def _rizin_ops(raw):
     return ops
 
 
+_AFL_ROW_RE = re.compile(r"^[ \t]*(0x[0-9a-fA-F]{1,16})[ \t]+([0-9]{1,9})[ \t]+([0-9]{1,19})"
+                         r"(?:[ \t]*->[ \t]*[0-9]{1,19})?[ \t]+([^ \t\r\n]|[^ \t\n][^\n]*?[^ \t\r\n])"
+                         r"[ \t]*\r?$", re.M)
+
+
 def _rizin_functions(session):
-    rows = session.json("aflj", timeout=rizin_sessions.CONSOLE_TIMEOUT)
-    out = [{"name": f["name"], "offset": f["offset"], "size": f.get("size"), "nbbs": f.get("nbbs")}
-           for f in (rows if isinstance(rows, list) else [])
-           if isinstance(f, dict) and isinstance(f.get("name"), str) and _rizin_int(f.get("offset")) is not None]
+    """The functions as rizin's ``afl`` lists them: [{name, offset, size, nbbs}] by address.
+
+    Read from afl's text, not from aflj: rizin's JSON of a function carries its references and variables
+    too (about 2.7 KB per function, 44 MB for a 16 000-function dump), so the list of a big dump ran into
+    the answer cap and the tab had none. afl's row is about 63 B (offset, nbbs, size, optionally
+    "-> realsz", name), the same four values the answer has. A line that is no row is left out, and at
+    most RIZIN_ROWS_MAX rows are kept, as for the other lists.
+
+    The rows are matched one by one, so the cap bounds the memory the list takes, not only the work
+    after it. Only "\\n" ends a row: str.splitlines() also breaks at \\x0b, \\x0c, \\x1c-\\x1e, \\x85,
+    U+2028 and U+2029, which a function name may hold (the console's afn takes them, and so can a
+    symbol in the file), and rizin prints such a name as it is. A name may also start with a "\\r"; one
+    that is nothing but a "\\r" is a line ending, not a name.
+    """
+    text = session.text("afl", timeout=rizin_sessions.CONSOLE_TIMEOUT)
+    out = []
+    for row in _AFL_ROW_RE.finditer(text):
+        offset = _rizin_int(int(row.group(1), 16))
+        if offset is None:
+            continue
+        out.append({"name": row.group(4), "offset": offset, "size": int(row.group(3)),
+                    "nbbs": int(row.group(2))})
+        if len(out) >= RIZIN_ROWS_MAX:
+            break
     return sorted(out, key=lambda f: f["offset"])
 
 
@@ -5418,7 +5447,8 @@ def _rizin_decompile(session):
         return {"available": True, "reason": f"No function at {addr:#x}", "function": None, "lines": []}
     try:
         # rz-ghidra takes long on a big function under x64 emulation: a limit of its own, above the console's
-        data = session.json(f"pdgj @ {fn['offset']:#x}", timeout=rizin_sessions.DECOMPILE_TIMEOUT)
+        data = session.json(f"pdgj @ {fn['offset']:#x}", timeout=rizin_sessions.DECOMPILE_TIMEOUT,
+                            limit=rizin_sessions.FUNCTION_ANSWER_MAX)
     except rizin_sessions.RizinTimeout:
         # rizin was stopped and the session ended with it (RizinSession._call); the tab says why
         raise rizin_sessions.RizinTimeout(RIZIN_DECOMPILE_SLOW) from None
@@ -5557,7 +5587,8 @@ def _rizin_page(session, key, command, item, fields):
 
     def load():
         try:
-            rows = session.json(command, timeout=rizin_sessions.CONSOLE_TIMEOUT)
+            rows = session.json(command, timeout=rizin_sessions.CONSOLE_TIMEOUT,
+                                limit=rizin_sessions.VIEW_ANSWER_MAX)
         except rizin_sessions.RizinTooLarge:
             return None
         rows = rows if isinstance(rows, list) else []
@@ -5611,8 +5642,8 @@ def _rizin_flags(session):
     rizin 0.9.1 lists the flags with flj. The sorted names are kept per session, like strings and imports,
     and are asked for again after a console command, a rename or a comment, and once the analysis has
     gone on (its steps add and rename flags). As for those, RIZIN_ROWS_MAX rows of flj are kept at most
-    (truncated), and none if flj is larger than rizin_sessions.VIEW_ANSWER_MAX: Tab completes the
-    function names then.
+    (truncated), and none if flj is larger than rizin_sessions.VIEW_ANSWER_MAX: with no name and an
+    empty common the tab's Tab lists the names of its function list without completing one.
     """
     prefix = _rizin_arg_text()
     limit = _rizin_arg_number("limit", RIZIN_FLAGS_MAX, 1, RIZIN_FLAGS_MAX)
@@ -5620,7 +5651,8 @@ def _rizin_flags(session):
 
     def load():
         try:
-            rows = session.json("flj", timeout=rizin_sessions.CONSOLE_TIMEOUT)
+            rows = session.json("flj", timeout=rizin_sessions.CONSOLE_TIMEOUT,
+                                limit=rizin_sessions.VIEW_ANSWER_MAX)
         except rizin_sessions.RizinTooLarge:
             return [], True
         rows = rows if isinstance(rows, list) else []

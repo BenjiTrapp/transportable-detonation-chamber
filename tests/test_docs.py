@@ -86,6 +86,31 @@ def test_every_deploy_path_uploads_the_web_ui_modules():
         assert f"'webui\\{win}' -Destination 'C:\\DetonationChamberUI\\{win}'" in hyperv, name
 
 
+def test_readme_rizin_rows_say_what_the_server_answers():
+    """Follow-up findings 1 and 2: the flags row claimed that over the 32 MB cap "Tab completes the
+    function names"; the server answers names: [], common: "" and truncated: true then, and the UI's Tab
+    lists the names of its function list without completing one (tests/test_rizin_ui.py). The function
+    list itself has no such cap any anymore: it reads rizin's afl, whose rows are about 63 B each.
+
+    Review, Minors 3 and 4: the other views are not without a limit (they carry their own, and a view
+    over it answers 500), and FUNCTIONS does have the row cap - only no 32 MB one."""
+    rows = {path: line for line in README.splitlines()
+            for path in re.findall(r"`(/api/rizin/[^`]+)`", line)}
+    flags = rows["/api/rizin/<sid>/flags"]
+    assert "completes the function names" not in flags, flags
+    assert "without completing" in flags and "truncated" in flags, flags
+    functions = rows["/api/rizin/<sid>/functions"]
+    assert "`afl`" in functions and "200 000" in functions, functions
+    # The error list names the lists that the cap refuses, and the limit the other views carry
+    errors = next(line for line in README.splitlines() if line.startswith("One rizin session per opened file"))
+    assert "too many strings to list here" in errors
+    assert "the other views have no such limit" not in errors, errors
+    assert "is larger than" in errors, errors
+    # The Limitations bullet does not read as if the function list had no cap at all
+    limits = next(line for line in README.splitlines() if "FUNCTIONS has no" in line)
+    assert "no 32 MB limit" in limits, limits
+
+
 def test_help_lists_every_pipe_interception_route():
     routes = set()
     for m in re.finditer(r'@app\.route\("(/api/pipes/intercept[^"]*)"(?:, methods=\[([^\]]*)\])?', APP):
