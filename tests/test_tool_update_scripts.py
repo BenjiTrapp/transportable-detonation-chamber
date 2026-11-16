@@ -201,3 +201,43 @@ def test_logging_script_parses():
            f"'{path}', [ref]$null, [ref]$e); if ($e) {{ $e | ForEach-Object {{ $_.Message }}; exit 1 }}")
     proc = subprocess.run([pwsh, "-NoProfile", "-Command", cmd], capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+ARCH_SCRIPTS = ["sysmon", "fibratus", "rustinel", "rizin", "hunt-sleeping-beacons"]
+REGISTRY_ARCH = r"HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment"
+
+
+def test_no_script_decides_arm64_on_the_process_environment_alone():
+    # The web UI runs as emulated x64 Python; its children inherit PROCESSOR_ARCHITECTURE=AMD64.
+    scripts_dir = os.path.join(ROOT, "scripts")
+    for fname in sorted(os.listdir(scripts_dir)):
+        if not fname.endswith(".ps1"):
+            continue
+        text = _read("scripts", fname)
+        assert not re.search(r'\$env:PROCESSOR_ARCHITECTURE\s+-eq\s+"ARM64"', text, re.I), fname
+
+
+@pytest.mark.parametrize("name", ARCH_SCRIPTS)
+def test_arm64_detected_from_the_registry(name):
+    script = _script(name)
+    assert "$isArm64" in script
+    assert re.search(REGISTRY_ARCH, script, re.I)
+    assert "PROCESSOR_ARCHITEW6432" in script
+    assert re.search(r"\$isArm64\s*=\s*\(\$osArch\s+-eq\s+\"ARM64\"\)", script)
+
+
+def test_every_script_with_isarm64_uses_the_registry_lookup():
+    scripts_dir = os.path.join(ROOT, "scripts")
+    for fname in sorted(os.listdir(scripts_dir)):
+        if fname.endswith(".ps1"):
+            text = _read("scripts", fname)
+            if "$isArm64" in text:
+                assert re.search(REGISTRY_ARCH, text, re.I), fname
+
+
+def test_sysmon_force_uninstalls_with_the_binary_of_the_installed_service():
+    script = _script("sysmon")
+    assert re.search(r'Get-Service -Name "Sysmon64a"', script)
+    assert re.search(r'\$installedExe\b', script)
+    assert re.search(r'\$installedExe\s+-accepteula\s+-u\s+force', script)
+    assert not re.search(r'\$sysmonExe\s+-accepteula\s+-u\s+force', script)

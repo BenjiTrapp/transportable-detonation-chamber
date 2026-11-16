@@ -33,7 +33,15 @@ Set-StrictMode -Version Latest
 Write-Host "=== Installing Rustinel ===" -ForegroundColor Cyan
 
 # Architecture detection
-$isArm64 = ($env:PROCESSOR_ARCHITECTURE -eq "ARM64")
+# OS architecture: the registry holds the real value; the process environment
+# says AMD64 for children of an emulated x64 process (e.g. the web UI's Python)
+$osArch = $null
+try {
+    $osArch = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment" -Name PROCESSOR_ARCHITECTURE -ErrorAction Stop).PROCESSOR_ARCHITECTURE
+} catch { $osArch = $null }
+if (-not $osArch) { $osArch = $env:PROCESSOR_ARCHITEW6432 }
+if (-not $osArch) { $osArch = $env:PROCESSOR_ARCHITECTURE }
+$isArm64 = ($osArch -eq "ARM64")
 if ($isArm64) {
     Write-Host "[!] ARM64 detected - Rustinel has no native ARM64 build" -ForegroundColor Yellow
     Write-Host "[*] Installing x86_64 build (runs under Windows ARM emulation layer)" -ForegroundColor Yellow

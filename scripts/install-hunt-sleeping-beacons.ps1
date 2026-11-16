@@ -30,7 +30,16 @@ $RepoUrl = "https://github.com/thefLink/Hunt-Sleeping-Beacons.git"
 # configuration does not compile. On ARM64 the x64 build runs under emulation
 # and inspects x64 processes - which is what emulated implants are.
 $arch = "x64"
-Write-Host "[*] Building for $arch (OS: $env:PROCESSOR_ARCHITECTURE)" -ForegroundColor Yellow
+# OS architecture: the registry holds the real value; the process environment
+# says AMD64 for children of an emulated x64 process (e.g. the web UI's Python)
+$osArch = $null
+try {
+    $osArch = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment" -Name PROCESSOR_ARCHITECTURE -ErrorAction Stop).PROCESSOR_ARCHITECTURE
+} catch { $osArch = $null }
+if (-not $osArch) { $osArch = $env:PROCESSOR_ARCHITEW6432 }
+if (-not $osArch) { $osArch = $env:PROCESSOR_ARCHITECTURE }
+$isArm64 = ($osArch -eq "ARM64")
+Write-Host "[*] Building for $arch (OS: $osArch)" -ForegroundColor Yellow
 
 # --- Install Visual Studio Build Tools 2022 (C++ workload) ---
 $msbuildPaths = @(

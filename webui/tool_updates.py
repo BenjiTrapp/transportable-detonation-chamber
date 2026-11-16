@@ -81,9 +81,15 @@ class HttpResult(NamedTuple):
 
 
 def _as_text(value: Any) -> str:
-    if isinstance(value, bytes):
-        return value.decode("utf-8", errors="replace")
-    return value or ""
+    """Decode child output; Sysmon and friends print UTF-16LE, which UTF-8 turns into text with NULs."""
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if not value:
+        return ""
+    text = value.decode("utf-8", errors="replace")
+    if text.count("\x00") > len(text) * 0.1:
+        text = value.decode("utf-16-le", errors="replace").lstrip("\ufeff")
+    return text.replace("\x00", "").replace("\r\n", "\n")
 
 
 class Env:
@@ -103,7 +109,7 @@ class Env:
         try:
             proc = subprocess.Popen(
                 args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                encoding="utf-8", errors="replace", env=child_env, **kwargs)
+                env=child_env, **kwargs)
         except FileNotFoundError:
             return RunResult(127, "", "not found: %s" % args[0])
         try:
@@ -115,8 +121,9 @@ class Env:
             except subprocess.TimeoutExpired as late:
                 out, err = _as_text(late.stdout), _as_text(late.stderr)
             note = "timed out after %ss" % timeout
-            return RunResult(124, out or "", ((err or "").rstrip() + "\n" + note).strip())
-        return RunResult(proc.returncode, out or "", err or "")
+            out, err = _as_text(out), _as_text(err)
+            return RunResult(124, out, (err.rstrip() + "\n" + note).strip())
+        return RunResult(proc.returncode, _as_text(out), _as_text(err))
 
     @staticmethod
     def _kill_tree(proc, windows: bool) -> None:

@@ -299,7 +299,15 @@ if ($selfTestOk) {
 Write-Host "    Executable: $RizinExe" -ForegroundColor Gray
 Write-Host "    Decompiler: $GhidraDll" -ForegroundColor Gray
 Write-Host "    Usage:      rizin.exe -A <file>, then pdg @ main" -ForegroundColor Gray
-if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") {
+# OS architecture from the registry (children of emulated x64 processes see AMD64)
+$osArch = $null
+try {
+    $osArch = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment" -Name PROCESSOR_ARCHITECTURE -ErrorAction Stop).PROCESSOR_ARCHITECTURE
+} catch { $osArch = $null }
+if (-not $osArch) { $osArch = $env:PROCESSOR_ARCHITEW6432 }
+if (-not $osArch) { $osArch = $env:PROCESSOR_ARCHITECTURE }
+$isArm64 = ($osArch -eq "ARM64")
+if ($isArm64) {
     Write-Host "    NOTE: the package is x64 only; rizin.exe runs under x64 emulation." -ForegroundColor Gray
 }
 exit 0

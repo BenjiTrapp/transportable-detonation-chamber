@@ -457,6 +457,20 @@ def test_catalog_values():
 
 
 class TestEnv:
+    def test_run_decodes_utf16_output(self):
+        import sys
+        code = ("import sys; "
+                "sys.stdout.buffer.write('Sysmon installed\\r\\nService running'.encode('utf-16-le')); "
+                "sys.stderr.buffer.write('Error: driver'.encode('utf-16-le'))")
+        res = tu.Env().run([sys.executable, "-c", code], 10)
+        assert res.stdout == "Sysmon installed\nService running"
+        assert res.stderr == "Error: driver"
+
+    def test_run_strips_stray_nuls_and_keeps_plain_utf8(self):
+        import sys
+        res = tu.Env().run([sys.executable, "-c", "print('caf\\u00e9 is fine, plain output with one stray NUL\\x00')"], 10)
+        assert res.stdout.strip() == "caf\u00e9 is fine, plain output with one stray NUL"
+
     def test_run_maps_missing_exe_and_timeout(self):
         env = tu.Env()
         res = env.run(["tdc-definitely-not-an-exe-xyz"], 5)

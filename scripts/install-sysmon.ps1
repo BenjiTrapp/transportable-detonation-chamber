@@ -36,7 +36,15 @@ Set-StrictMode -Version Latest
 Write-Host "=== Installing Sysmon ===" -ForegroundColor Cyan
 
 # Detect architecture - ARM64 uses Sysmon64a.exe, x86_64 uses Sysmon64.exe
-$isArm64 = ($env:PROCESSOR_ARCHITECTURE -eq "ARM64")
+# OS architecture: the registry holds the real value; the process environment
+# says AMD64 for children of an emulated x64 process (e.g. the web UI's Python)
+$osArch = $null
+try {
+    $osArch = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment" -Name PROCESSOR_ARCHITECTURE -ErrorAction Stop).PROCESSOR_ARCHITECTURE
+} catch { $osArch = $null }
+if (-not $osArch) { $osArch = $env:PROCESSOR_ARCHITEW6432 }
+if (-not $osArch) { $osArch = $env:PROCESSOR_ARCHITECTURE }
+$isArm64 = ($osArch -eq "ARM64")
 $sysmonDir = "C:\tools\sysmon"
 if ($isArm64) {
     $sysmonExe = "$sysmonDir\Sysmon64a.exe"
@@ -278,11 +286,21 @@ try {
 }
 Set-PipeEventExclude -Path $configPath
 
-# Reinstall: the old service and driver have to go before the new ones
-if ($Force -and ((Get-Service -Name $sysmonServiceName -ErrorAction SilentlyContinue) -or (Get-Service -Name "Sysmon64" -ErrorAction SilentlyContinue))) {
-    Write-Host "[*] Uninstalling the running Sysmon (-u force)..." -ForegroundColor Yellow
-    & $sysmonExe -accepteula -u force 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
-    Start-Sleep -Seconds 3
+# Reinstall: the old service and driver have to go before the new ones. The
+# uninstall must use the binary that matches the installed service name.
+if ($Force) {
+    $installedExe = $null
+    if (Get-Service -Name "Sysmon64a" -ErrorAction SilentlyContinue) {
+        $installedExe = "$sysmonDir\Sysmon64a.exe"
+    } elseif (Get-Service -Name "Sysmon64" -ErrorAction SilentlyContinue) {
+        $installedExe = "$sysmonDir\Sysmon64.exe"
+    }
+    if ($installedExe) {
+        if (-not (Test-Path $installedExe)) { $installedExe = $sysmonExe }
+        Write-Host "[*] Uninstalling the installed Sysmon (-u force, $([System.IO.Path]::GetFileName($installedExe)))..." -ForegroundColor Yellow
+        & $installedExe -accepteula -u force 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
+        Start-Sleep -Seconds 3
+    }
 }
 
 # Install Sysmon as a service
