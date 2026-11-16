@@ -431,11 +431,58 @@ def test_the_own_addresses_are_remembered_and_a_box_that_answers_neither_is_empt
     assert fetcher.own_addresses() == frozenset()
 
 
-def test_this_machines_real_addresses_are_found_and_are_addresses(monkeypatch):
+class _ProbeSocket:
+    """A datagram socket whose connect() reports a chosen source address, or fails."""
+
+    def __init__(self, sources, family, kind):
+        self.source = sources.get(family)
+
+    def connect(self, probe):
+        if self.source is None:
+            raise OSError("network unreachable")
+
+    def getsockname(self):
+        return (self.source, 0)
+
+    def close(self):
+        pass
+
+
+def _fake_host(monkeypatch, names, sources):
+    """This machine as a test says: what its name resolves to, and the source address of each family's route."""
+    import socket as socket_mod
+    monkeypatch.setattr(fetcher.socket, "gethostname", lambda: "chamber")
+
+    def resolve(host, *args, **kwargs):
+        assert host == "chamber"
+        if isinstance(names, Exception):
+            raise names
+        return [(socket_mod.AF_INET6 if ":" in a else socket_mod.AF_INET, 2, 17, "", (a, 0)) for a in names]
+    monkeypatch.setattr(fetcher.socket, "getaddrinfo", resolve)
+    monkeypatch.setattr(fetcher.socket, "socket", lambda family, kind: _ProbeSocket(sources, family, kind))
+
+
+def test_the_interface_addresses_are_the_names_answers_and_the_route_sources(monkeypatch):
+    import socket as socket_mod
+    # loopback can be among them (a name resolving to 127.0.1.1 is common): refuse_address turns it away by
+    # its own rule, so own_addresses has no need to leave it out
+    _fake_host(monkeypatch, ["10.0.2.15", "127.0.1.1", "fe80::1%12"],
+               {socket_mod.AF_INET: "10.0.2.15", socket_mod.AF_INET6: "2001:db8::15"})
+    assert fetcher._interface_addresses() == {"10.0.2.15", "127.0.1.1", "fe80::1", "2001:db8::15"}
+
+
+def test_a_name_that_does_not_resolve_and_a_family_without_a_route_add_nothing(monkeypatch):
+    import socket as socket_mod
+    _fake_host(monkeypatch, OSError("no such host"), {socket_mod.AF_INET: "192.168.56.20"})
+    assert fetcher._interface_addresses() == {"192.168.56.20"}
+
+
+def test_the_real_lookup_of_this_machine_answers_with_addresses(monkeypatch):
+    # A smoke test only: which addresses this machine has is not the test's business, just that the real
+    # calls do not raise and answer with IP literals
     monkeypatch.setattr(fetcher, "_own_cache", (0.0, frozenset()))
     found = fetcher.own_addresses(refresh=True)
-    assert all(fetcher.is_ip_literal(a) for a in found)
-    assert not any(a.startswith("127.") for a in found)       # loopback is refused by its own rule
+    assert isinstance(found, frozenset) and all(fetcher.is_ip_literal(a) for a in found)
 
 
 # ---- what is left over ----------------------------------------------------------------------

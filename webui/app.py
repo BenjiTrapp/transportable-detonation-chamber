@@ -11193,6 +11193,8 @@ def _fw_forget_rules():
 # time, so it is asked again soon); an enforcement route forgets it. The enforcement routes themselves never use
 # the cache: they read the profiles fresh (_fw_firewall_off_message) and store what they found.
 FIREWALL_PROFILES_TTL_S = 60
+# How far Sysmon's time of a connection and Windows' start time of a process may disagree (kill's PID-reuse test)
+FIREWALL_KILL_CLOCK_SLACK_S = 2.0
 FIREWALL_PROFILES_ERROR_TTL_S = 10
 _fw_profiles_cache = None                         # (stamp, off, error) or None
 _fw_profiles_lock = threading.Lock()
@@ -12338,8 +12340,10 @@ def api_firewall_enable():
 def api_firewall_kill():
     """End a process with ``taskkill /PID <pid> /F``. Body: ``{pid}``.
 
-    Only a process the tab shows: its pid is in the connections the collector has seen, and none of those is one
-    of TDC's own (409 otherwise, also for a pid ``firewall_rules.kill`` refuses). 500 when taskkill fails."""
+    Only a process the tab shows, and only the one that made its connections: the process holding ``pid`` now
+    must have started no later than (``FIREWALL_KILL_CLOCK_SLACK_S``) a connection the collector saw under that
+    pid, or Windows has given the pid to another process since. The image and TDC's own check come from those
+    connections alone. 409 otherwise (also for a pid ``firewall_rules.kill`` refuses), 500 when taskkill fails."""
     data, problem = _fw_body(("pid",), ("pid",))
     if problem:
         return _fw_error(problem, 400)
@@ -12347,9 +12351,18 @@ def api_firewall_kill():
     if isinstance(pid, bool) or not isinstance(pid, int):
         return _fw_error("pid is a number", 400)
     flows, _ = _fw_classified(None, None)
-    mine = [f for f in flows if f["pid"] == pid]
-    if not mine:
+    named = [f for f in flows if f["pid"] == pid]
+    if not named:
         return _fw_error(f"PID {pid} is not a process with connections in this tab.", 409)
+    started = _process_started_at(pid)
+    if started is None:
+        return _fw_error(f"PID {pid} is not running, or its start time cannot be read, so it is not killed.", 409)
+    # A connection the running process can have made: not before it started (the same test as the detonation
+    # windows use against a reused submission PID)
+    mine = [f for f in named if f["last_seen"] >= started - FIREWALL_KILL_CLOCK_SLACK_S]
+    if not mine:
+        return _fw_error(f"PID {pid} now belongs to a process that started after its connections were seen: "
+                         "Windows has given the PID to another process, which is not killed.", 409)
     if any(f["self"] for f in mine):
         return _fw_error(f"PID {pid} is one of TDC's own processes; it is not killed from here.", 409)
     try:

@@ -339,6 +339,9 @@ def test_a_javascript_url_stays_text():
     assert fw_defang("localhost:8080") == "localhost:8080"
     assert fw_defang("evil.example:8080/x.exe") == "evil[.]example:8080/x.exe"
     assert fw_defang("mailto:a@evil.example") == "mailto[:]a@evil[.]example"
+    assert fw_defang("javascript:1/alert(1)") == "javascript[:]1/alert(1)"
+    assert fw_defang("JavaScript:0") == "JavaScript[:]0" and fw_defang("data:1,x") == "data[:]1,x"
+    assert fw_defang("localhost:8080/x") == "localhost:8080/x"
 
 
 @needs_node
@@ -958,3 +961,32 @@ def test_the_bands_are_not_drawn_again_when_nothing_changed():
         renderFirewallBands();
         console.log(JSON.stringify(writes));""")
     assert r == 1
+
+
+
+# --- Fix round 3 ---------------------------------------------------------------------
+
+@needs_node
+def test_a_get_of_the_state_older_than_an_isolated_post_does_not_overwrite_it():
+    r = _run(r"""
+        const gates = [];
+        answer = (url, init) => (init && init.method === 'POST') ? reply({ isolated: true, state: { isolated: true, profiles_off: [] } })
+            : new Promise(resolve => gates.push({ url, resolve }));
+        fwState.isolate = { isolated: false, profiles_off: [] };
+        refreshFirewall({ slow: false });               // a GET of the state and of the connections goes out
+        confirmAnswer = true;
+        const toggled = fwToggleIsolated();
+        await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+        // the old answers arrive after the POST: both say "not isolated"
+        gates.forEach(g => g.resolve(reply(g.url.startsWith('/api/firewall/connections') ? { connections: [], isolated: false }
+            : g.url === '/api/firewall/isolate' ? { isolated: false, profiles_off: [] } : { pending: [] })));
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+        console.log(JSON.stringify({ isolated: fwState.isolated, state: fwState.isolate.isolated }));
+        process.exit(0);""")
+    assert r == {"isolated": True, "state": True}
+
+
+@needs_node
+def test_a_blocked_row_says_no_list_could_be_read():
+    out = render_tree([{"state": "blocked", "rule_id": "TDC-FW-cccccccccccc"}], extra="fwState.rulesListError = 'HTTP 500';")
+    assert "no list of rules could be read" in out and "not in the list read" not in out

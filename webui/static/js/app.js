@@ -13116,6 +13116,9 @@ const FW_MAX = 5000;
 const FW_MAP_MAX = 300;
 const FW_LIST_MAX = 1000;
 const FW_EP_PAGE = 50;
+// Schemes fwDefang always takes as schemes, even before digits ("javascript:1/alert(1)" is no host and port)
+const FW_SCHEMES = ['http', 'https', 'ftp', 'ftps', 'sftp', 'file', 'smb', 'javascript', 'vbscript', 'jscript', 'data', 'blob',
+    'about', 'mailto', 'tel', 'ws', 'wss', 'ldap', 'ms-msdt', 'search-ms', 'ms-officecmd', 'ms-word', 'ms-excel', 'mhtml'];
 // How long the filter waits for the typing to pause
 const FW_FILTER_MS = 200;
 const FW_ASK_MODES = [
@@ -13218,7 +13221,9 @@ function fwDefang(text) {
     const s = _worldText(text);
     if (!s) return '';
     const m = /^([a-z][a-z0-9+.-]*):/i.exec(s);
-    const scheme = m && !m[1].includes('.') && !/^\d+(?:[/?#\\]|$)/.test(s.slice(m[0].length)) ? m[1] : '';
+    // A known scheme is always one (javascript:1/alert(1)); an unknown word followed by digits is a host and a port
+    const known = m && FW_SCHEMES.includes(m[1].toLowerCase());
+    const scheme = m && (known || (!m[1].includes('.') && !/^\d+(?:[/?#\\]|$)/.test(s.slice(m[0].length)))) ? m[1] : '';
     let head = '', rest = s;
     if (scheme) {
         rest = s.slice(scheme.length + 1);
@@ -13381,7 +13386,8 @@ function fwEndpointSwitch(flow) {
         const rule = fwRuleById(flow.rule_id);
         const proto = fwRuleProto(rule);
         const mismatch = fwProtoMismatch(flow, rule);
-        const what = !rule ? (fwState.rules === null ? 'a rule whose protocol is still being read' : 'a rule not in the list read') : rule.protocol ? `a rule for ${proto} only` : 'a rule for every protocol';
+        const what = !rule ? (fwState.rulesListError ? 'a rule whose protocol is unknown, because no list of rules could be read'
+            : fwState.rules === null ? 'a rule whose protocol is still being read' : 'a rule not in the list read') : rule.protocol ? `a rule for ${proto} only` : 'a rule for every protocol';
         const title = `Blocked by ${fwText(flow.rule_id)}, ${what}`
             + (mismatch ? `; this connection is ${String(flow.protocol).toUpperCase()}, so it may still get through` : '')
             + '. Click to remove the rule.';
@@ -13560,8 +13566,8 @@ async function fwKill(proc) {
     const name = fwShort(fwBase(p.image), 60);
     const ok = await tdcConfirm({ title: `Kill ${name} (PID ${pid})?`, danger: true, confirmLabel: 'KILL',
         message: `taskkill /F ends ${name} at once, without letting it clean up. Its telemetry stops there: no more connections, `
-            + 'files or child processes of it to watch, and whatever it was about to fetch stays unknown. If Windows has given '
-            + `PID ${pid} to another process since, that one dies instead.` });
+            + 'files or child processes of it to watch, and whatever it was about to fetch stays unknown. TDC refuses if the '
+            + `process holding PID ${pid} now started after its connections were seen, because then Windows has given the PID to another process.` });
     if (!ok) return false;
     const r = await fwPost('/api/firewall/kill', { pid });
     if (!r.ok) {
@@ -13581,10 +13587,7 @@ async function fwEnableFirewall() {
             + 'differently from here on. TDC never does this by itself; it is your call. Blocks and ISOLATED take effect only once it is on.' });
     if (!ok) return false;
     const r = await fwPost('/api/firewall/enable', {});
-    if (r.data && r.data.state && typeof r.data.state === 'object') {
-        fwState.isolate = r.data.state;
-        fwState.isolateError = null;
-    }
+    if (r.data && r.data.state && typeof r.data.state === 'object') fwSetIsolateState(r.data.state);
     if (!r.ok) {
         showToast('error', 'The firewall is not on', r.error);
     } else {
@@ -14122,6 +14125,16 @@ async function fwLoadFlows() {
     return true;
 }
 
+// ISOLATED's state as an enforcement route answered it: newer than any GET of the state (or of the connections,
+// which carry `isolated`) still on its way, so those are dropped when they come
+function fwSetIsolateState(state) {
+    fwIsoSeq += 1;
+    fwSeq += 1;
+    fwState.isolate = state;
+    fwState.isolateError = null;
+    if (typeof state.isolated === 'boolean') fwState.isolated = state.isolated;
+}
+
 // ISOLATED's state: whether the firewall is off, ISOLATED, its residual and any way out left open. Every tick,
 // but never two at once (a request may be the one that reads the profiles again)
 async function fwLoadIsolate() {
@@ -14271,9 +14284,10 @@ async function fwToggleIsolated() {
         return false;
     }
     if (r.data.state && typeof r.data.state === 'object') {
-        fwState.isolate = r.data.state;
-        fwState.isolated = !!r.data.state.isolated;
+        fwSetIsolateState(r.data.state);
     } else {
+        fwIsoSeq += 1;
+        fwSeq += 1;
         fwState.isolated = !on;
     }
     showToast(on ? 'info' : 'warning', on ? 'ISOLATED is off' : 'ISOLATED is on', on ? 'Outbound connections are allowed again.'

@@ -1376,7 +1376,13 @@ def test_enable_takes_no_fields(client, fw):
     assert "Enable" not in fw.run.ops()
 
 
-def test_kill_ends_a_process_the_tab_shows(client, fw):
+def started(monkeypatch, tdc, ago):
+    """The process holding a pid started ``ago`` seconds before now (None: no such process)."""
+    monkeypatch.setattr(tdc, "_process_started_at", lambda pid: None if ago is None else time.time() - ago)
+
+
+def test_kill_ends_a_process_the_tab_shows(client, fw, tdc, monkeypatch):
+    started(monkeypatch, tdc, 60)
     fw.store.add_connections([conn(pid=4812)])
     r = client.post("/api/firewall/kill", json={"pid": 4812})
     assert r.status_code == 200 and r.json == {"pid": 4812, "killed": True, "image": IMAGE}
@@ -1385,24 +1391,63 @@ def test_kill_ends_a_process_the_tab_shows(client, fw):
 
 @pytest.mark.parametrize("body, status", [({"pid": "4812"}, 400), ({"pid": True}, 400), ({}, 400),
                                           ({"pid": 4812, "force": True}, 400), ({"pid": 999}, 409)])
-def test_kill_refuses_what_is_no_process_of_the_tab(client, fw, body, status):
+def test_kill_refuses_what_is_no_process_of_the_tab(client, fw, tdc, monkeypatch, body, status):
+    started(monkeypatch, tdc, 60)
     fw.store.add_connections([conn(pid=4812)])
     assert client.post("/api/firewall/kill", json=body).status_code == status
     assert not any(c[0].lower().endswith("taskkill.exe") for c in fw.run.calls)
 
 
-def test_kill_refuses_tdcs_own_processes(client, fw):
+def test_kill_refuses_tdcs_own_processes(client, fw, tdc, monkeypatch):
+    started(monkeypatch, tdc, 60)
     fw.store.add_connections([conn(pid=3300, image=r"C:\DetonationChamberUI\venv\Scripts\python.exe")])
     r = client.post("/api/firewall/kill", json={"pid": 3300})
     assert r.status_code == 409 and "TDC" in r.json["error"]
     assert not any(c[0].lower().endswith("taskkill.exe") for c in fw.run.calls)
 
 
-def test_a_failing_taskkill_is_a_failure(client, fw):
+def test_a_failing_taskkill_is_a_failure(client, fw, tdc, monkeypatch):
+    started(monkeypatch, tdc, 60)
     fw.store.add_connections([conn(pid=4812)])
     fw.run.fail["taskkill"] = (128, "", "ERROR: The process \"4812\" not found.")
     r = client.post("/api/firewall/kill", json={"pid": 4812})
     assert r.status_code == 500 and "4812" in r.json["error"]
+
+
+
+def _taskkills(fw):
+    return [c for c in fw.run.calls if c[0].lower().endswith("taskkill.exe")]
+
+
+def test_kill_refuses_a_pid_windows_has_given_to_another_process(client, fw, tdc, monkeypatch):
+    # the loader connected 5 s ago and ended; a process that started 1 s ago holds its PID now
+    fw.store.add_connections([conn(pid=4812, t=-5.0)])
+    started(monkeypatch, tdc, 1)
+    r = client.post("/api/firewall/kill", json={"pid": 4812})
+    assert r.status_code == 409 and "another process" in r.json["error"] and _taskkills(fw) == []
+
+
+def test_kill_does_not_judge_a_reused_pid_by_the_old_processs_image(client, fw, tdc, monkeypatch):
+    # PID 3300 was TDC's own python, long ago; the sample holds it now and connected after it started
+    own = r"C:\DetonationChamberUI\venv\Scripts\python.exe"
+    fw.store.add_connections([conn(pid=3300, image=own, t=-600.0), conn(pid=3300, image=IMAGE, t=-5.0)])
+    started(monkeypatch, tdc, 60)
+    r = client.post("/api/firewall/kill", json={"pid": 3300})
+    assert r.status_code == 200 and r.json["image"] == IMAGE and len(_taskkills(fw)) == 1
+
+
+def test_kill_refuses_a_pid_that_is_not_running(client, fw, tdc, monkeypatch):
+    fw.store.add_connections([conn(pid=4812)])
+    started(monkeypatch, tdc, None)
+    r = client.post("/api/firewall/kill", json={"pid": 4812})
+    assert r.status_code == 409 and "not running" in r.json["error"] and _taskkills(fw) == []
+
+
+def test_kill_allows_for_a_little_clock_disagreement(client, fw, tdc, monkeypatch):
+    # Sysmon stamps the connection a moment before Windows' start time of the same process
+    fw.store.add_connections([conn(pid=4812, t=-5.0)])
+    started(monkeypatch, tdc, 5.0 - tdc.FIREWALL_KILL_CLOCK_SLACK_S / 2)
+    assert client.post("/api/firewall/kill", json={"pid": 4812}).status_code == 200
 
 
 # ---- GET /isolate is cheap enough to poll -----------------------------------------------------
