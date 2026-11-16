@@ -12275,6 +12275,52 @@ def api_firewall_ask():
     return _fw_json({"ask_mode": _fw_settings.ask_mode})
 
 
+@app.route("/api/firewall/enable", methods=["POST"])
+def api_firewall_enable():
+    """Switch the Windows Firewall on for Domain, Private and Public. Body: ``{}``.
+
+    TDC never does this by itself: it changes what the malware sees, so it is the analyst's call (the UI asks
+    first). Answers ``{enabled, profiles_off, state}`` (``state`` as GET /isolate); 500 when a profile stays off."""
+    data, problem = _fw_body(())
+    if problem:
+        return _fw_error(problem, 400)
+    try:
+        firewall_rules.enable_firewall(_fw_runner)
+    except firewall_rules.RuleError as e:
+        state = _fw_isolate_state()
+        return _fw_json({"error": _fw_reason(e), "enabled": False, "profiles_off": state["profiles_off"],
+                         "state": state}, 500)
+    finally:
+        _fw_forget_rules()
+    state = _fw_isolate_state()
+    return _fw_json({"enabled": True, "profiles_off": state["profiles_off"], "state": state})
+
+
+@app.route("/api/firewall/kill", methods=["POST"])
+def api_firewall_kill():
+    """End a process with ``taskkill /PID <pid> /F``. Body: ``{pid}``.
+
+    Only a process the tab shows: its pid is in the connections the collector has seen, and none of those is one
+    of TDC's own (409 otherwise, also for a pid ``firewall_rules.kill`` refuses). 500 when taskkill fails."""
+    data, problem = _fw_body(("pid",), ("pid",))
+    if problem:
+        return _fw_error(problem, 400)
+    pid = data["pid"]
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        return _fw_error("pid is a number", 400)
+    flows, _ = _fw_classified(None, None)
+    mine = [f for f in flows if f["pid"] == pid]
+    if not mine:
+        return _fw_error(f"PID {pid} is not a process with connections in this tab.", 409)
+    if any(f["self"] for f in mine):
+        return _fw_error(f"PID {pid} is one of TDC's own processes; it is not killed from here.", 409)
+    try:
+        firewall_rules.kill(_fw_runner, pid)
+    except firewall_rules.RuleError as e:
+        return _fw_error(_fw_reason(e), 409 if "may be killed" in str(e) else 500)
+    return _fw_json({"pid": pid, "killed": True, "image": mine[0]["image"]})
+
+
 @app.route("/api/firewall/captures")
 def api_firewall_captures():
     """The secured samples, newest first."""

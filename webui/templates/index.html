@@ -19,7 +19,7 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=73">
+    <link rel="stylesheet" href="/static/css/style.css?v=74">
     <link rel="stylesheet" href="/static/css/theme-layout.css?v=2">
     <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=30">
 </head>
@@ -1422,7 +1422,7 @@
                         </div>
                         <div class="help-guide-item">
                             <h4>FIREWALL</h4>
-                            <p>Every connection of the chamber, bundled per process and endpoint and tagged by what is suspicious about it (IOC, beaconing, a hard-coded address, a download, a LOLBin, a DGA-like name&hellip;); the colour of a row or an arc is its most severe tag. On the left the process tree with a filter, each process with its activity and its endpoints; TDC's own processes and local addresses are groups of their own. In the middle MAP (an arc from the chamber to each public destination), LIST (a sortable table) and ASN (the destinations by the organisation that owns them). Below, the summary counts connections, blocks, open decisions and secured samples; there are no byte figures, because Sysmon records none. ALLOW / DENY blocks a process or one endpoint of it in the Windows Firewall (a rule <code>TDC-FW-&hellip;</code>, checked before it counts as blocked) and shows the protocol of the rule; a selected endpoint can also be blocked for every program. ASK sets what happens when a process in the chamber fetches a file: Detonation (default) blocks it and asks, All does so for every process, Off only tags. ISOLATED, after a confirmation, cuts every outbound connection but loopback; the band says what stays open, and <code>scripts/tdc-unisolate.ps1</code> on the VM is the way back if the web UI is gone. While a Windows Firewall profile is off nothing can be enforced: the switches are disabled and a red band says so. HUNT FURTHER lists ready LOGS queries for the selection; SECURED SAMPLES opens a fetched file in Rizin, Hex or ThreatScan, never runs it.</p>
+                            <p>Every connection of the chamber, bundled per process and endpoint and tagged by what is suspicious about it (IOC, beaconing, a hard-coded address, a download, a LOLBin, a DGA-like name&hellip;); the colour of a row or an arc is its most severe tag. On the left the process tree with a filter, each process with its activity and its endpoints; TDC's own processes and local addresses are groups of their own. In the middle MAP (an arc from the chamber to each public destination), LIST (a sortable table) and ASN (the destinations by the organisation that owns them). Below, the summary counts connections, blocks, open decisions and secured samples; there are no byte figures, because Sysmon records none. ALLOW / DENY blocks a process or one endpoint of it in the Windows Firewall (a rule <code>TDC-FW-&hellip;</code>, checked before it counts as blocked) and shows the protocol of the rule; a selected endpoint can also be blocked for every program, and KILL on a selected process ends it with <code>taskkill /F</code> (after a confirmation; never TDC's own). A click selects; <strong>in LOGS &#9656;</strong> on the selected row, on its point of the map and above the hints opens the logs about it. ASK sets what happens when a process in the chamber fetches a file: Detonation (default) blocks it and asks, All does so for every process, Off only tags. ISOLATED, after a confirmation, cuts every outbound connection but loopback; the band says what stays open, and <code>scripts/tdc-unisolate.ps1</code> on the VM is the way back if the web UI is gone. While a Windows Firewall profile is off nothing can be enforced: the switches are disabled and a red band says so, with TURN THE FIREWALL ON (after a confirmation, because it changes what the sample sees). A switch that cannot know whether it blocks, because the rules are not read yet or could not be, shows ?. HUNT FURTHER lists ready LOGS queries for the selection; SECURED SAMPLES opens a fetched file in Rizin, Hex or ThreatScan, never runs it.</p>
                         </div>
                         <div class="help-guide-item">
                             <h4>LOGS</h4>
@@ -1663,6 +1663,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
          in app.js); set as text, never as markup -->
     <div id="info-popover" class="info-popover" role="status" hidden></div>
 
-    <script src="/static/js/app.js?v=102"></script>
+    <script src="/static/js/app.js?v=103"></script>
 </body>
 </html>

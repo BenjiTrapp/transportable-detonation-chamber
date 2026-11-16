@@ -11262,11 +11262,25 @@ body.maintenance-active #app {
     user-select: all;
 }
 .fw-more { margin: 4px 0 2px 8px; }
+.fw-row-actions { display: flex; justify-content: flex-end; gap: 6px; padding: 0 4px 4px; }
+.fw-kill { color: var(--severity-critical); border-color: rgba(var(--severity-critical-rgb), 0.5); }
+.fw-kill:disabled { opacity: 0.45; cursor: not-allowed; }
+.fw-logs { white-space: nowrap; }
+.fw-enable { margin-left: 4px; color: var(--severity-critical); border-color: var(--severity-critical); font-weight: 700; }
+.fw-stale { margin: 0 0 8px; font-size: 11px; color: var(--accent-yellow); }
+/* DENY with a rule the server did not name: still a claim of a block, with an open question */
+.fw-switch.is-unknown-rule { border-style: dashed; cursor: help; }
+.fw-cell-state.is-mismatch { text-decoration: underline dashed; text-underline-offset: 3px; }
 
 /* MAP | LIST | ASN */
 .fw-center { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
 .fw-view { min-height: 160px; }
+.fw-map-wrap { position: relative; }
 .fw-map-wrap .fw-map { display: block; width: 100%; height: auto; }
+/* in LOGS ▸ on the selected point: just right of it, never wider than the map */
+.fw-map-pin { position: absolute; transform: translate(10px, -50%); pointer-events: none; }
+.fw-map-pin.is-left { transform: translate(calc(-100% - 10px), -50%); }
+.fw-map-pin .fw-logs { pointer-events: auto; background: var(--bg-card); }
 .fw-map-notes {
     display: flex;
     flex-wrap: wrap;

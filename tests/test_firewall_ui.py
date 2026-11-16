@@ -43,6 +43,8 @@ ALL_FUNCTIONS = list(dict.fromkeys(FW_FUNCTIONS + OTHER_FUNCTIONS))
 ELEMENT_IDS = ["tab-firewall", "firewall-tree", "firewall-view", "firewall-summary", "firewall-hints", "firewall-captures",
                "firewall-views", "firewall-range", "firewall-live", "firewall-ask-btn", "firewall-ask-menu",
                "firewall-isolated", "firewall-bands", "firewall-search", "firewall-count"]
+# Elements of other tabs a firewall function writes to
+OTHER_IDS = ["threatscan-filepath"]
 
 LOADER = r"C:\Users\analyst\Desktop\loader.exe"
 TDC_PYTHON = r"C:\tdc\webui\.venv\Scripts\python.exe"
@@ -56,7 +58,7 @@ const classes = () => {
 };
 const els = {};
 for (const id of %s) {
-    els[id] = { id, innerHTML: '', textContent: '', value: '', hidden: false, disabled: false, title: '', style: {}, attrs: {},
+    els[id] = { focused: 0, focus() { this.focused++; }, id, innerHTML: '', textContent: '', value: '', hidden: false, disabled: false, title: '', style: {}, attrs: {},
         listeners: {}, classList: classes(),
         setAttribute(k, v) { this.attrs[k] = String(v); }, getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; },
         removeAttribute(k) { delete this.attrs[k]; },
@@ -96,7 +98,11 @@ const flow = (o = {}) => ({
     tags: o.tags ?? ['detonated'], severity: 'high', state: o.state ?? 'allowed', rule_id: o.rule_id ?? null,
     capture_ids: o.capture_ids ?? [], self: !!o.self,
 });
-""" % (json.dumps(ELEMENT_IDS), json.dumps(LOADER))
+const timers = [];
+globalThis.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return timers.length; };
+globalThis.clearTimeout = id => { if (timers[id - 1]) timers[id - 1].fn = null; };
+const runTimers = () => timers.splice(0).forEach(t => t.fn && t.fn());
+""" % (json.dumps(ELEMENT_IDS + OTHER_IDS), json.dumps(LOADER))
 
 
 def _run(script):
@@ -112,6 +118,7 @@ def render_tree(flows, isolate=None, extra=""):
     return _run(r"""
         fwState.loaded = true;
         fwState.isolate = %s;
+        fwState.rules = [];
         %s
         fwState.flows = %s;
         renderFirewallTree(fwState.flows);
@@ -172,7 +179,7 @@ def tone_of(tags):
     return _run("console.log(JSON.stringify(fwToneOf(%s)));" % json.dumps(tags))
 
 
-HOSTILE = "<script>alert(1)</script><img src=x onerror=alert(1)>"
+HOSTILE = "<script>alert(1)</script><img src=x onerror=alert(1)>\" onmouseover=\"x' autofocus data-pwned='"
 
 
 def _parsed(markup):
@@ -190,7 +197,7 @@ def _parsed(markup):
 def _no_live_markup(markup, name=""):
     for tag, attrs in _parsed(markup):
         assert tag not in ("script", "img", "a", "b", "i", "iframe"), (name, tag)
-        assert not any(a.startswith("on") or a in ("href", "src") for a in attrs), (name, tag, attrs)
+        assert not any(a.startswith("on") or a in ("href", "src", "autofocus", "data-pwned") for a in attrs), (name, tag, attrs)
 
 
 # --- Markup ---------------------------------------------------------------------
@@ -325,6 +332,13 @@ def test_a_javascript_url_stays_text():
     assert fw_defang("cdn.evil.example") == "cdn[.]evil[.]example"
     assert fw_defang(None) == "" and fw_defang("") == ""
     assert "\u202e" not in fw_defang("evil\u202eexe.example")
+    assert fw_defang("http:\\\\evil.example\\a") == "hxxp:\\\\evil[.]example\\a"
+    assert fw_defang("http:evil.example") == "hxxp:evil[.]example"
+    assert fw_defang("//evil.example/a") == "//evil[.]example/a"
+    assert fw_defang("\\\\evil.example\\share") == "\\\\evil[.]example\\share"
+    assert fw_defang("localhost:8080") == "localhost:8080"
+    assert fw_defang("evil.example:8080/x.exe") == "evil[.]example:8080/x.exe"
+    assert fw_defang("mailto:a@evil.example") == "mailto[:]a@evil[.]example"
 
 
 @needs_node
@@ -388,8 +402,10 @@ def test_deny_is_disabled_while_a_profile_is_off():
 
 @needs_node
 def test_tdcs_own_process_offers_no_block():
-    out = render_tree([{"image": TDC_PYTHON, "self": True}], extra="fwOpen.set('tdc', true);")
-    assert 'data-fw-block="process"' not in out or "disabled" in out
+    out = render_tree([{"image": TDC_PYTHON, "self": True}], extra="fwOpen.set('tdc', true); fwOpen.set('p:' + %s + '|4242', true);"
+                      % json.dumps(TDC_PYTHON))
+    blocks = re.findall(r'<button[^>]*data-fw-block="(?:process|endpoint)"[^>]*>', out)
+    assert len(blocks) == 2 and all(" disabled" in b and "TDC&#39;s own processes" in b for b in blocks), blocks
 
 
 @needs_node
@@ -433,7 +449,14 @@ def test_a_long_tag_list_is_cut_to_a_few_chips():
 
 @needs_node
 def test_local_endpoints_are_not_on_the_map():
-    out = render_map([{"dst": "192.168.64.1", "scope": "local"}, {"dst": "1.2.3.4"}])
+    # the local address has a position: only its scope keeps it off the map
+    out = _run(r"""
+        fwState.loaded = true;
+        const local = flow({ dst: '192.168.64.1', scope: 'local' });
+        local.geo.lat = 52.1;
+        local.geo.lon = 5.3;
+        renderFirewallMap([local, flow({ dst: '1.2.3.4' })]);
+        console.log(JSON.stringify(els['firewall-view'].innerHTML));""")
     ids = set(re.findall(r'data-fw-id="([^"]*)"', out))
     assert ids == {"@chamber", "a:1.2.3.4"}, ids
 
@@ -507,7 +530,7 @@ def test_the_hints_are_ready_queries_for_the_selection():
     assert 4 <= r["n"] <= 6 and r["none"] >= 3
     assert r["calls"][0][0] == 'dst_ip="203.0.113.7" | top image'
     assert r["calls"][0][1] == "-4h"
-    assert 'image=&quot;C:\\\\x\\\\a\\&quot;b.exe&quot;' in r["html"] or 'a\\&quot;b.exe' in r["html"]
+    assert 'image=&quot;C:\\x\\a\\&quot;b.exe&quot;' in r["html"]
 
 
 @needs_node
@@ -526,9 +549,10 @@ def test_the_capture_buttons_open_its_path():
         const button = kind => ({ closest: sel => sel === 'button[data-fw-open]'
             ? { getAttribute: k => (k === 'data-fw-open' ? kind : 'c1'), disabled: false } : null });
         for (const kind of ['rizin', 'hex', 'threatscan']) onFirewallClick({ target: button(kind) });
-        console.log(JSON.stringify({ opened, value: els['firewall-search'].value }));""")
+        console.log(JSON.stringify({ opened, value: els['threatscan-filepath'].value }));""")
     path = r"C:\tdc\samples\a3\a3f1"
     assert ["rizin", path] in r["opened"] and ["hex", path] in r["opened"] and ["tab", "threatscan"] in r["opened"]
+    assert r["value"] == path and r["opened"].index(["reset"]) < r["opened"].index(["tab", "threatscan"])
 
 
 # --- Fetching, LIVE -------------------------------------------------------------
@@ -545,6 +569,7 @@ def test_a_stale_response_does_not_overwrite_a_newer_one():
         const pend = gates.filter(g => g.url.startsWith('/api/firewall/pending'));
         conn[1].resolve(reply({ connections: [flow({ dst: '198.51.100.2' })], count: 1 }));
         pend[1].resolve(reply({ pending: [], history: [] }));
+        gates.filter(g => g.url === '/api/firewall/isolate').forEach(g => g.resolve(reply({ isolated: false, profiles_off: [] })));
         await second;
         conn[0].resolve(reply({ connections: [flow({ dst: '198.51.100.1' })], count: 1 }));
         pend[0].resolve(reply({ pending: [], history: [] }));
@@ -568,7 +593,10 @@ def test_the_window_and_the_size_are_asked_for():
     assert "since=" in conn and "max=" in conn
     assert any(u.startswith("/api/firewall/summary?since=") for u in r["urls"])
     assert {"/api/firewall/isolate", "/api/firewall/captures", "/api/firewall/rules"} <= set(r["urls"])
-    assert all("since=" not in u for u in r["all"]) and len(r["all"]) == 2, "a light tick asks for more than the poll paths"
+    light = sorted(u.split("?")[0] for u in r["all"])
+    assert light == ["/api/firewall/connections", "/api/firewall/isolate", "/api/firewall/pending"], \
+        "a light tick asks for more than the poll paths and ISOLATED's state, or not for ISOLATED's state"
+    assert all("since=" not in u for u in r["all"])
 
 
 @needs_node
@@ -701,3 +729,232 @@ def test_the_perspective_switches_are_stubs_for_task_9():
     r = _run(r"""
         console.log(JSON.stringify([typeof openLogsTab, typeof openFirewallTab]));""")
     assert r == ["function", "function"]
+
+
+# --- Fix round 1: never claim what is not known ------------------------------------
+
+PROC_RULE = {"rule_id": "TDC-FW-aaaaaaaaaaaa", "name": "TDC-FW-aaaaaaaaaaaa", "kind": "block", "action": "Block",
+             "enabled": True, "image": LOADER, "ip": None, "port": None, "protocol": None, "blocking": True}
+
+
+def _process_switch(out):
+    row = re.search(r'<div class="fw-proc-row">(.*?)</div>', out).group(1)
+    return row[row.rindex("fw-num"):]
+
+
+@needs_node
+def test_a_process_switch_is_unknown_until_the_rules_are_read():
+    blocked = {"state": "blocked", "rule_id": PROC_RULE["rule_id"]}
+    loading = render_tree([blocked], extra="fwState.rules = null;")
+    failed = render_tree([blocked], extra="fwState.rulesListError = 'HTTP <b>500</b>';")
+    known = render_tree([blocked], extra="fwState.rules = %s;" % json.dumps([PROC_RULE]))
+    for out in (loading, failed):
+        switch = _process_switch(out)
+        assert "ALLOW" not in switch and "is-unknown" in switch, switch
+    assert "still being read" in _process_switch(loading)
+    assert "could not be loaded" in _process_switch(failed) and "&lt;b&gt;500" in _process_switch(failed)
+    assert 'data-fw-unblock="TDC-FW-aaaaaaaaaaaa"' in _process_switch(known)
+
+
+@needs_node
+def test_a_rule_list_that_fails_is_said_in_a_band():
+    r = _run(r"""
+        fwState.rulesListError = 'HTTP 500';
+        renderFirewallBands();
+        console.log(JSON.stringify(els['firewall-bands'].innerHTML));""")
+    assert "could not be loaded" in r and "HTTP 500" in r
+
+
+@needs_node
+def test_blocked_without_a_rule_is_never_allow():
+    out = render_tree([{"state": "blocked", "rule_id": None}])
+    ep = out[out.index('class="fw-ep '):]
+    assert "DENY" in ep and "ALLOW" not in ep[:ep.index("</div></div>")]
+    cell = render_list([{"state": "blocked", "rule_id": None}])
+    assert "DENY ?" in cell and ">ALLOW<" not in cell
+
+
+@needs_node
+def test_the_blocked_tile_is_unknown_while_the_rules_are_unreadable():
+    out = _run(r"""
+        fwState.rulesError = 'Access denied';
+        renderFirewallSummary(%s);
+        console.log(JSON.stringify(els['firewall-summary'].innerHTML));""" % json.dumps(dict(SUMMARY, blocked=0)))
+    tile = out[out.index("BLOCKED"):]
+    tile = tile[:tile.index("</div>")]
+    assert ">?<" in tile and ">0<" not in tile and "rules unreadable" in tile
+
+
+@needs_node
+def test_a_route_that_fails_says_so_where_its_data_is():
+    r = _run(r"""
+        answer = url => url.startsWith('/api/firewall/connections') ? reply({ connections: [], count: 0 })
+            : url.startsWith('/api/firewall/pending') ? reply({ pending: [] }) : reply({ error: 'boom <b>x</b>' }, 500);
+        await refreshFirewall();
+        console.log(JSON.stringify({ summary: els['firewall-summary'].innerHTML, captures: els['firewall-captures'].innerHTML,
+            bands: els['firewall-bands'].innerHTML }));""")
+    assert "summary could not be loaded" in r["summary"] and "Loading" not in r["summary"]
+    assert "could not be loaded" in r["captures"] and "None yet" not in r["captures"] and "&lt;b&gt;x" in r["captures"]
+    assert "state could not be read" in r["bands"] and "unknown" in r["bands"]
+
+
+@needs_node
+def test_before_anything_came_the_captures_are_not_none():
+    out = render_captures(None)
+    assert "None yet" not in out and "Loading" in out
+
+
+@needs_node
+def test_an_ipv6_endpoint_without_a_name_keeps_its_whole_suffix():
+    out = render_tree([{"dst": "2001:db8::1", "port": 443}])
+    assert re.search(r'class="fw-ep-addr">:443/TCP<', out), out[:2000]
+    assert ">1]:443" not in out and "[2001:db8::1]:443/TCP" in out
+
+
+@needs_node
+def test_list_marks_a_rule_for_another_protocol():
+    rule = dict(PROC_RULE, rule_id="TDC-FW-bbbbbbbbbbbb", ip="203.0.113.7", protocol="tcp")
+    out = _run(r"""
+        fwState.loaded = true;
+        fwState.rules = %s;
+        renderFirewallList([flow({ protocol: 'udp', state: 'blocked', rule_id: 'TDC-FW-bbbbbbbbbbbb' })]);
+        console.log(JSON.stringify(els['firewall-view'].innerHTML));""" % json.dumps([rule]))
+    cell = re.search(r'<td class="fw-cell-state[^"]*"[^>]*>[^<]*</td>', out).group(0)
+    assert "is-mismatch" in cell and "TCP" in cell and "UDP" in cell and "may still get through" in cell
+
+
+@needs_node
+def test_escape_closes_the_ask_menu():
+    r = _run(r"""
+        fwToggleAskMenu(true);
+        const open = els['firewall-ask-menu'].hidden;
+        const other = onFirewallKeydown({ key: 'Enter' });
+        const closed = onFirewallKeydown({ key: 'Escape' });
+        console.log(JSON.stringify({ open, other, closed, hidden: els['firewall-ask-menu'].hidden,
+            focus: els['firewall-ask-btn'].focused, expanded: els['firewall-ask-btn'].attrs['aria-expanded'] }));""")
+    assert r == {"open": False, "other": False, "closed": True, "hidden": True, "focus": 1, "expanded": "false"}
+
+
+@needs_node
+def test_the_filter_waits_for_the_typing_to_pause():
+    r = _run(r"""
+        fwState.loaded = true;
+        fwState.rules = [];
+        fwState.flows = [flow(), flow({ image: 'C:\\x\\other.exe', pid: 7 })];
+        let draws = 0;
+        const real = renderFirewallTree;
+        globalThis.renderFirewallTree = f => { draws++; real(f); };
+        for (const text of ['o', 'ot', 'oth', 'othe']) fwFilterSoon(text);
+        const before = draws;
+        runTimers();
+        console.log(JSON.stringify({ before, after: draws, filter: fwFilter, ms: timers.length,
+            tree: els['firewall-tree'].innerHTML.includes('loader.exe') }));""")
+    assert r["before"] == 0 and r["after"] == 1 and r["filter"] == "othe" and r["tree"] is False
+
+
+# --- Fix round 1: the perspective switch, KILL, TURN THE FIREWALL ON ------------------
+
+@needs_node
+def test_in_logs_is_one_click_away_on_the_selected_row_point_and_hints():
+    r = _run(r"""
+        const calls2 = [];
+        globalThis.openLogsTab = (...args) => { calls2.push(args); return true; };
+        fwState.loaded = true;
+        fwState.rules = [];
+        fwState.flows = [flow()];
+        fwRange = '24h';
+        const key = fwFlowKey(fwState.flows[0]);
+        fwSelect('a:203.0.113.7');
+        const map = els['firewall-view'].innerHTML, hints = els['firewall-hints'].innerHTML;
+        fwSelect('f:' + key);
+        const tree = els['firewall-tree'].innerHTML;
+        const click = sel => ({ target: { closest: s => (s === sel ? { getAttribute: () => null, disabled: false } : null) } });
+        onFirewallClick(click('[data-fw-logs]'));
+        fwSelect('p:' + %s + '|4242');
+        const proc = els['firewall-tree'].innerHTML;
+        onFirewallClick(click('[data-fw-logs]'));
+        console.log(JSON.stringify({ map, hints, tree, proc, calls: calls2 }));""" % json.dumps(LOADER))
+    assert re.search(r'class="fw-map-pin[^"]*"[^>]*>.*data-fw-logs', r["map"])
+    assert "data-fw-logs" in r["hints"] and "in LOGS ▸" in r["hints"]
+    assert r["tree"].count("data-fw-logs") == 1 and r["proc"].count("data-fw-logs") == 1
+    assert r["calls"][0][:2] == ['image="%s" dst_ip="203.0.113.7"' % LOADER, "-24h"]
+    assert r["calls"][0][3]["tab"] == "firewall"
+    assert r["calls"][1][0] == 'image="%s"' % LOADER
+
+
+@needs_node
+def test_kill_sits_on_the_selected_process_and_asks_first():
+    r = _run(r"""
+        fwState.loaded = true;
+        fwState.rules = [];
+        fwState.flows = [flow(), flow({ image: %s, pid: 3300, self: true })];
+        fwOpen.set('tdc', true);
+        fwSelect('p:' + %s + '|4242');
+        const row = els['firewall-tree'].innerHTML;
+        fwSelect('p:' + %s + '|3300');
+        const own = els['firewall-tree'].innerHTML;
+        answer = url => reply(url === '/api/firewall/kill' ? { pid: 4242, killed: true } : { connections: [], pending: [] });
+        confirmAnswer = false;
+        await fwKill(fwState.flows[0]);
+        const declined = calls.filter(c => c.method === 'POST').length;
+        confirmAnswer = true;
+        await fwKill(fwState.flows[0]);
+        await fwKill(fwState.flows[1]);
+        console.log(JSON.stringify({ row, own, declined, posts: calls.filter(c => c.method === 'POST').map(c => [c.url, c.body]),
+            confirm: confirms[0] }));""" % (json.dumps(TDC_PYTHON), json.dumps(LOADER), json.dumps(TDC_PYTHON)))
+    assert 'data-fw-kill="%s|4242"' % LOADER in r["row"]
+    kill_own = re.search(r'<button[^>]*data-fw-kill="[^"]*3300"[^>]*>', r["own"]).group(0)
+    assert " disabled" in kill_own
+    assert r["declined"] == 0 and r["posts"] == [["/api/firewall/kill", {"pid": 4242}]]
+    assert r["confirm"]["danger"] is True and "telemetry stops" in r["confirm"]["message"]
+
+
+@needs_node
+def test_the_red_band_offers_to_turn_the_firewall_on_and_asks_first():
+    r = _run(r"""
+        fwState.isolate = { isolated: false, profiles_off: ['Public'] };
+        renderFirewallBands();
+        const band = els['firewall-bands'].innerHTML;
+        answer = url => reply(url === '/api/firewall/enable' ? { enabled: true, profiles_off: [], state: { isolated: false, profiles_off: [] } }
+            : url === '/api/firewall/isolate' ? { isolated: false, profiles_off: [] } : { connections: [], pending: [] });
+        confirmAnswer = false;
+        await fwEnableFirewall();
+        const declined = calls.filter(c => c.method === 'POST').length;
+        confirmAnswer = true;
+        const ok = await fwEnableFirewall();
+        renderFirewallBands();
+        console.log(JSON.stringify({ band, declined, ok, posts: calls.filter(c => c.method === 'POST').map(c => [c.url, c.body]),
+            message: confirms[0].message, after: els['firewall-bands'].innerHTML }));""")
+    assert 'data-fw-enable' in r["band"] and "TURN THE FIREWALL ON" in r["band"]
+    assert r["declined"] == 0 and r["ok"] is True and r["posts"] == [["/api/firewall/enable", {}]]
+    assert "what the malware sees" in r["message"] and "your call" in r["message"]
+    assert "fw-band-off" not in r["after"]
+
+
+@needs_node
+def test_the_isolate_state_is_never_asked_twice_at_once():
+    r = _run(r"""
+        const gates = [];
+        answer = url => new Promise(resolve => gates.push({ url, resolve }));
+        refreshFirewall({ slow: false });
+        refreshFirewall({ slow: false });
+        await Promise.resolve();
+        console.log(JSON.stringify(gates.filter(g => g.url === '/api/firewall/isolate').length));
+        process.exit(0);""")
+    assert r == 1
+
+
+@needs_node
+def test_the_bands_are_not_drawn_again_when_nothing_changed():
+    r = _run(r"""
+        fwState.isolate = { isolated: false, profiles_off: ['Public'] };
+        renderFirewallBands();
+        const host = els['firewall-bands'];
+        let writes = 0, html = host.innerHTML;
+        Object.defineProperty(host, 'innerHTML', { get: () => html, set: v => { writes++; html = v; } });
+        renderFirewallBands();
+        renderFirewallBands();
+        fwState.isolate = { isolated: false, profiles_off: [] };
+        renderFirewallBands();
+        console.log(JSON.stringify(writes));""")
+    assert r == 1

@@ -1,4 +1,4 @@
-"""FIREWALL tab back end: the twelve routes, the readers, the decisions, the guarded fetch and the capture store.
+"""FIREWALL tab back end: the fourteen routes, the readers, the decisions, the guarded fetch and the capture store.
 
 The Windows firewall, the network and the event logs are fakes (``fw`` in conftest.py); what is tested is the
 wiring: what a route refuses, what a decision does to the firewall and to the fetch, and that a fetch only
@@ -1349,3 +1349,56 @@ def test_the_first_step_of_the_collector_thread_does_what_start_up_needs(fw, tdc
     assert fw.run.rules == {}                                    # no way out of ISOLATED left standing
     assert primed == [True]                                      # no fetch pays for that lookup itself
     assert tdc._fw_isolate_state()["startup"]["announce"] is False
+
+
+# ---- switching the firewall on, killing a process -----------------------------------------------
+
+
+def test_enable_switches_every_profile_on_and_says_so(client, fw):
+    fw.profiles = {"Domain": True, "Private": False, "Public": False}
+    r = client.post("/api/firewall/enable", json={})
+    assert r.status_code == 200 and r.json["enabled"] is True and r.json["profiles_off"] == []
+    assert r.json["state"]["profiles_off"] == [] and fw.run.off() == []
+    assert "Enable" in fw.run.ops()
+
+
+def test_enable_that_leaves_a_profile_off_is_a_failure(client, fw, monkeypatch):
+    fw.profiles = {"Domain": False, "Private": True, "Public": True}
+    monkeypatch.setattr(fw.run, "op_Enable", lambda p: (0, "", ""))
+    r = client.post("/api/firewall/enable", json={})
+    assert r.status_code == 500 and r.json["enabled"] is False and r.json["profiles_off"] == ["Domain"]
+    assert "Domain" in r.json["error"]
+
+
+def test_enable_takes_no_fields(client, fw):
+    assert client.post("/api/firewall/enable", json={"profiles": ["Public"]}).status_code == 400
+    assert "Enable" not in fw.run.ops()
+
+
+def test_kill_ends_a_process_the_tab_shows(client, fw):
+    fw.store.add_connections([conn(pid=4812)])
+    r = client.post("/api/firewall/kill", json={"pid": 4812})
+    assert r.status_code == 200 and r.json == {"pid": 4812, "killed": True, "image": IMAGE}
+    assert [c[1:] for c in fw.run.calls if c[0].lower().endswith("taskkill.exe")] == [["/PID", "4812", "/F"]]
+
+
+@pytest.mark.parametrize("body, status", [({"pid": "4812"}, 400), ({"pid": True}, 400), ({}, 400),
+                                          ({"pid": 4812, "force": True}, 400), ({"pid": 999}, 409)])
+def test_kill_refuses_what_is_no_process_of_the_tab(client, fw, body, status):
+    fw.store.add_connections([conn(pid=4812)])
+    assert client.post("/api/firewall/kill", json=body).status_code == status
+    assert not any(c[0].lower().endswith("taskkill.exe") for c in fw.run.calls)
+
+
+def test_kill_refuses_tdcs_own_processes(client, fw):
+    fw.store.add_connections([conn(pid=3300, image=r"C:\DetonationChamberUI\venv\Scripts\python.exe")])
+    r = client.post("/api/firewall/kill", json={"pid": 3300})
+    assert r.status_code == 409 and "TDC" in r.json["error"]
+    assert not any(c[0].lower().endswith("taskkill.exe") for c in fw.run.calls)
+
+
+def test_a_failing_taskkill_is_a_failure(client, fw):
+    fw.store.add_connections([conn(pid=4812)])
+    fw.run.fail["taskkill"] = (128, "", "ERROR: The process \"4812\" not found.")
+    r = client.post("/api/firewall/kill", json={"pid": 4812})
+    assert r.status_code == 500 and "4812" in r.json["error"]
