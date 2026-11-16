@@ -129,13 +129,13 @@ make open       # Opens http://<vm-ip>:9000 in browser
 
 | Tab | Description |
 |-----|-------------|
-| **Dashboard** | Stats strip (alerts, processes, services, rules, tools; TOTAL ALERTS and PROCESSES TRACKED with 45-day sparklines), ALERT ACTIVITY with the SEVERITY and CATEGORY donuts of its range (see [Charts](#charts)), service health cards, recent activity feed; each tile opens what it counts |
+| **Dashboard** | Stats strip (alerts, processes, services, rules, tools; TOTAL ALERTS and PROCESSES TRACKED with 45-day sparklines), ALERT ACTIVITY with the SEVERITY and CATEGORY donuts of its range (see [Charts](#charts)), service health cards, recent activity feed; each tile opens what it counts. Under the head a row of pages: SERVICES is all of that, beside it the dashboards of your own with the tiles saved in the LOGS tab (see [Own dashboards](#own-dashboards)) |
 | **Alerts** | Every alert in one table, newest first, under charts of the current filter (severity and engine pies, bars over time, an engine → rule → process Sankey), with severity (multi-select), engine and text filters, the time range, category, rule and process filters a chart click or a range drawn across the bars sets (each a chip with ×), a drilldown bar with BACK and the path of those steps (see [Charts](#charts)) and an "n of m" count; a row opens the alert detail, the process name its process (only processes in the process list are links); the newest 2000 matches are listed |
 | **Tracing** | Per-process console: verdict, timeline by event type, process tree, alerts with full raw events (Sigma match details) |
 | **Graph** | Process tree around a process: tree, force-directed and isometric layouts, landing page with samples and candidate processes, detail panel with Sysmon events, ACTIVITY MIX and children |
 | **Pipes** | Named pipes: Sysmon pipe events (EID 17/18) with name/PID filters and C2-family hits, and interception sessions (attach to an existing pipe or arm for a name/prefix/regex; observe or hold messages to forward, edit or drop them; JSON export) |
 | **Sysmon** | Sysmon event viewer with search, type/PID filters and Sysmon → Windows Event ID correlation; EVENTS OVER TIME and a process → event type Sankey narrow the table by time window, image or event type |
-| **LOGS** | Search the PowerShell, access, MCP, NetFlow, DNS and firewall logs with a Splunk-like query (see [Logs](#logs)): source chips with their counts, EVENTS OVER TIME stacked by source (drag across the bars to zoom), a field bar with the top values, a list of events that unfold to their fields and raw text, or a sortable table after `stats`, `top` and the like; time range buttons, example and last searches, LIVE |
+| **LOGS** | Search the PowerShell, access, MCP, NetFlow, DNS and firewall logs with a Splunk-like query (see [Logs](#logs)): source chips with their counts, EVENTS OVER TIME stacked by source (drag across the bars to zoom), a field bar with the top values, a COMMANDS card with the whole search language, a list of events that unfold to their fields and raw text, or a sortable table after `stats`, `top` and the like, or one chart of it (pie, bars, line, Sankey) that SAVE puts on a dashboard of your own; time range buttons, example and last searches, LIVE |
 | **ThreatScan** | ThreatCheck, DefenderCheck, EMBER2024 and capa on a file, plus the **Live Process Memory** panel (Aether scan, memory dump, host baseline, system sweep) and the scan history with its SCORE HISTORY |
 | **ETW** | Multi-channel Event Log browser with live threat highlighting (see below) |
 | **Hex** | Hex editor with data inspector, structure minimap, PE/ELF analysis and section inspection |
@@ -319,6 +319,74 @@ the other tables. Screenshots:
   only when the alerts or the range change, not on every refresh (the
   alerts every 5 s, the dashboard every 10 s), and not while their tab is
   hidden.
+
+### Own dashboards
+
+Under the head of the **Dashboard** tab a row of pages: **SERVICES** is the
+service dashboard described above, beside it one page per dashboard of your
+own, and **+ NEW** for another one (it asks for a name; once ten dashboards
+exist it is grey and asks nothing). The open page is kept in the
+browser, so the tab comes back to it; a page that is gone falls back to
+SERVICES. Screenshot: [Own Dashboard Tiles](#own-dashboard-tiles).
+
+A **tile** is a search of the LOGS tab, saved with SAVE (see
+[Logs](#logs)). The store keeps its name, the query, the form (`table`,
+`pie`, `bars`, `line` or `sankey`) and the time range — either the relative
+one of the tab (`last 24 h`, which moves with the clock) or a window frozen
+in UTC. Nothing else: a tile holds no numbers. It computes its own, through
+the same `/api/logs/search` the tab uses, and asks for 1000 rows for a chart
+and 200 for a table.
+
+**When a tile computes.** The tiles of a page run **one after the other**,
+never two at a time: before its turn a tile says `Queued`, during it
+`Loading…`. Opening a page computes every tile of it once — eight tiles of
+the test VM took about 2 s. After that nothing recomputes by itself: the 10 s
+poll of the dashboard and the browser tab becoming visible again leave the
+tiles alone, and so does a click on the button of the page that is already
+open. Leaving the Dashboard tab abandons the run (the answer of an
+abandoned tile draws nothing), and coming back to it computes every tile of
+the open page again, as opening a page does — so a page of searches is the
+price of every trip through the Dashboard tab. Three things compute on
+purpose: **Refresh** in the head takes every tile of the open page, the **↻**
+of a tile only that one, and **Change form** in a tile's menu recomputes that
+tile, because another form may need more rows than the last search asked for.
+The clock beside a tile says when its numbers are from (the clock in the page
+head is the newest of them). A change to another page abandons what is still
+queued, the same way leaving the tab does.
+
+| On a tile | |
+|---|---|
+| Head | the name, the range, the clock, **↻** and **⋯** |
+| Body | the saved form, an error, or `Queued` / `Loading…` (a tile that computes again keeps its numbers under that word) |
+| Foot | the query, cut to 140 characters (the whole text in its tooltip) |
+
+The **⋯** of a tile holds **Open in LOGS** (the LOGS tab with that query, that
+window and that form, searched once), **Rename**, **Change form** (the five forms as
+switches; the ones the columns of the last answer cannot carry are grey, with
+the reason in the tooltip, and a tile that has not computed yet offers all
+five), **Move up** / **Move down** and **Delete**, which asks first. The
+**⋯** beside the name of the page renames or deletes the whole dashboard
+("Delete 'Log watch' and its 4 tiles?"). Only one menu is open at a time; Esc
+or a click elsewhere closes it. Every change is written to the server at once and
+the list read again afterwards, so a second browser tab on the same dashboard
+cannot work from an old list: a write against a tile that the other tab
+deleted says `Panel not found.` and the page corrects itself.
+
+A tile whose search is refused shows the server's message in its own body,
+in red, and leaves the other tiles alone; its head, **↻** and **⋯** keep
+working. A tile whose saved form no longer fits the columns that came back
+shows the table instead, with a line saying why ("saved as pie, which needs
+one name column and one number column"). A table tile shows at most **20**
+rows and says so ("the first 20 of 40 rows"); an incomplete result carries
+the same warning line as the tab, but as plain text — a tile's query belongs
+to the store, so sharpen it in LOGS and save it again.
+
+**Limits:** **10** dashboards, **12** tiles per dashboard, a name of 1 to 60
+characters, a query of at most 4000 characters. The dashboards live in
+`webui/dashboards.json` beside the web UI (`C:\DetonationChamberUI\` on the
+VM), written as a whole file after every change; a damaged file is read as
+far as it is readable instead of breaking the tab. The seven routes behind
+all of this are in the [API reference](#dashboards).
 
 ### ETW Browser
 
@@ -1223,9 +1291,62 @@ bar) zooms to it and shows it as a chip whose × goes back to the button. The
 field bar on the left lists the fields of the matches with their ten most
 frequent values; a click on a value adds `field="value"` to the search. A
 click on an event unfolds its fields and its raw text with the search words
-marked. The EXAMPLES menu holds the searches above and your last ten, **LIVE**
-searches again every 10 seconds while the tab is open, and the `?` button shows
-the syntax as a tooltip.
+marked. The EXAMPLES menu holds the searches above and your last ten, and
+**LIVE** searches again every 10 seconds while the tab is open.
+
+**The COMMANDS card.** The `?` button beside EXAMPLES opens a card in the
+left column that lists the whole search language in four groups — **SEARCH**
+(the terms above), **PIPES**, **TIME** and **SOURCES** — one group open at a
+time, each row with the command and what it does. A click **adds** the
+command to the search box instead of replacing what is there and does not
+search, so you can finish the field name and press Enter: a pipe goes behind
+the whole query, a term where the search part ends (before the first pipe),
+and a bare `*` gives way. A source row is the exception: like a source chip
+it takes the place of the source the query has, and searches. A click on the
+head of the card folds it to its one-line head and back; the `?` does the
+same. Whether the card is open and which group it shows are kept in the
+browser; in a window narrower than 1100 px the card lies over the results at
+full width and starts folded.
+
+**The result: EVENTS · STATISTICS · VISUALIZATION.** Over the result stand
+three tabs and, beside them, the forms **TABLE · PIE · BARS · LINE ·
+SANKEY**; at the right end **SAVE**. Which of them can be used comes
+from the answer: a search without a pipe has only EVENTS (the list of
+matches), a `stats`/`top`/`table` answer opens in STATISTICS (the sortable
+table) and a `timechart` in VISUALIZATION as a LINE. A tab or form that the
+result cannot carry stays in the row, grey, with the reason in its tooltip
+("needs a timechart, such as `| timechart span=5m count by source`"). The
+chosen tab holds while type and columns stay the same; other columns open the
+default of their type again.
+
+**SAVE** puts the result on a dashboard of your own (see
+[Own dashboards](#own-dashboards)): it asks for a name (prefilled from the
+pipes — the fields after `by`, or the field of `top` / `rare`), the dashboard
+or **+ New**, and whether the tile keeps the moving range of the tab or the
+window on screen, frozen in UTC. A result without a form cannot be a tile,
+which is exactly a search without a pipe: SAVE is grey then.
+
+Which chart a table can be drawn as follows from its columns: **column 0 is
+the name, the first column after it whose values are all numbers is the
+value** (`| top query` is drawn by its count, not its percent), and further
+columns are unused. Without a number column only TABLE is left; PIE and BARS
+need a name and a number column, SANKEY two name columns and a number column
+(`| stats count by a, b`), and a timechart draws as LINE or BARS, never as a
+pie. PIE and BARS show the twelve largest values plus *other*, SANKEY the
+twelve largest per side, LINE the series the server sends (at most ten plus
+*OTHER*). A chart asks for 1000 rows instead of the 200 of the list and the
+table, and only when it needs more than the last search brought.
+
+If the chart stands for less than the whole result, a line under it says so
+and offers the pipe that helps: `only 1,000 of 3,773 groups shown — add | sort
+-count | head 20` when more groups were counted than came back, otherwise
+`only the newest 10,000 matches went into the pipes — add …` when the search
+hit the cap on what goes through the pipes at all (the group line wins when
+both are true). A click appends exactly that pipe and
+searches again. The line is plain text, without the offer, when the query
+already ends in that pipe and for a timechart, whose periods must not be cut
+to twenty (it then reads `only N of M periods shown` or the line about the
+10,000 matches).
 
 PowerShell and firewall logging are off on a Windows install. New VMs get them
 turned on during provisioning; on an **existing VM** run
@@ -1356,6 +1477,28 @@ programs that mimic implant behaviour).
 > Persistence (506) mostly to `MsMpEng.exe` (539 in all). The range stands
 > as a chip under the filter bar (*1345 of 9950*), and the table lists those
 > alerts, newest first.
+
+---
+
+### Own Dashboard Tiles
+
+<p align="center">
+  <img src="static/dashboards.png" alt="An own dashboard page with four tiles in the Cyberpunk theme" width="100%">
+</p>
+
+> The dashboard page **Log watch** (Cyberpunk), *4 of 12 tiles*, each one a
+> search of the LOGS tab saved with SAVE. The page row above it holds
+> SERVICES, this page and + NEW. **REQUESTS BY PATH** draws
+> `source=access | stats count by path` as a pie of the twelve largest paths
+> plus *other*, **DNS NAMES** `source=dns | top query` as bars beside their
+> legend, **SOURCES OVER TIME** `* | timechart span=5m count by source` as a
+> line per source — with the warning line that only the newest 10,000
+> matches went into the pipes — and **FIREWALL FLOW**
+> `source=firewall | stats count by action, protocol` as a Sankey from the
+> verdict to the protocol. Table, line and Sankey tiles take a whole row,
+> pies and bars half of one. Each head carries the range (`last 24 h`), the
+> time its numbers are from, **↻** for that tile alone and **⋯** for its
+> menu; the foot shows the query it runs.
 
 ---
 
@@ -1799,6 +1942,27 @@ Proxied responses are only relayed as data (JSON, text, binary); HTML is served 
 | GET | `/api/logs/search` | Search the log store with an SPL-like query. Params: `q` (default `*`), `earliest` (default `-24h`; `-15m`, `-2h`, `now` or ISO-8601), `latest`, `limit` (1-1000, default 200). 200 with `type` (`events`, `table` or `timechart`), `events`, `columns`, `rows`, `count`, `matched`, `truncated`, `histogram`, `fields` and `took_ms`; 400 with `error` and `pos` (index in the query) for a query or time that cannot be read; 500 with a general `error` for anything else. Every request is itself logged (`access`; `mcp` too when the MCP server made it), polling paths with `poll=true` |
 | GET | `/api/logs/event/<id>` | One event of the log store in full (`id`, `time`, `source`, `message`, `fields`). A search response cuts every string at 64 KB and marks the event with `truncated_fields: true`; this route has the whole text. 404 with `error` when the event has left the store |
 | GET | `/api/logs/sources` | The six sources (`powershell`, `access`, `mcp`, `netflow`, `dns`, `firewall`): `count`, `last_time`, `status` (`ok` or `unavailable`) and `hint` (why a source is unavailable) |
+
+### Dashboards
+
+Own dashboards of the Dashboard tab: a tile is a saved log search. Nothing is computed
+on the server — the browser fetches every tile's numbers from `/api/logs/search`. Kept in
+`webui/dashboards.json`; at most 10 dashboards, 12 tiles each, name 1-60 characters without
+control characters, query at most 4000 characters, `earliest`/`latest` at most 40. A body that is
+not a JSON object, carries an unknown field (it is named) or breaks a limit answers 400 with
+`error`; an id that is gone 404 `Dashboard not found.` / `Panel not found.`; a write that fails 500
+`The dashboards could not be saved; see the web UI log.`
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/dashboards` | Every dashboard in order: `id` (`d-` and 12 hex characters), `name`, `created` (ISO-8601 Z) and `panels`, each tile with `id` (`p-`), `name`, `query`, `form`, `earliest`, `latest` and `created`. A damaged file reads as what is still readable, never as an error |
+| POST | `/api/dashboards` | Add a dashboard → 201 `{"dashboard": {...}}`. JSON: `name` (required). Names may repeat, the `id` is the key |
+| PATCH | `/api/dashboards/<id>` | Rename a dashboard → `{"dashboard": {...}}`. JSON: `name` (required) |
+| DELETE | `/api/dashboards/<id>` | Delete a dashboard and all its tiles → `{"deleted": true}` |
+| POST | `/api/dashboards/<id>/panels` | Save a search as a tile → 201 `{"panel": {...}}`. JSON: `name`, `query`, `form` (`table`, `pie`, `bars`, `line` or `sankey`), `earliest`, `latest` (both optional, default empty = the whole store) |
+| PATCH | `/api/dashboards/<id>/panels/<pid>` | Change a tile → `{"panel": {...}}`. JSON: `name`, `form`, `move` (`up`/`down`; at the end of the list it does nothing); at least one of them. Query and time range do not change — that is a new tile |
+| DELETE | `/api/dashboards/<id>/panels/<pid>` | Delete one tile → `{"deleted": true}` |
+
 
 ---
 

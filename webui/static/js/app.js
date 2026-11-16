@@ -377,6 +377,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initAlertsTab();
     initSysmonTab();
     initDashboardCharts();
+    initDashboardPages();
     initUpload();
     initHexDropZone();
     initHexResizeHandle();
@@ -413,6 +414,10 @@ function switchTab(tabName) {
     // Guard: an unknown name used to deactivate every tab and then throw,
     // leaving the main area blank.
     if (!document.getElementById(`tab-${tabName}`)) return;
+    // The tiles of an own dashboard page belong to the tab on screen: leaving
+    // it abandons the searches that are running, so their answers draw
+    // nothing. Coming back starts them again (dashboardTabShown).
+    if (state.activeTab === 'dashboard' && tabName !== 'dashboard') dashboardStopPanels();
     state.activeTab = tabName;
     document.querySelectorAll('.sidebar-tabs .tab').forEach(t => t.classList.remove('active'));
     document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
@@ -422,6 +427,8 @@ function switchTab(tabName) {
     updateTabOverflow();
     if (tabName === 'dashboard') {
         renderDashboardCharts();
+        // and the pages beside them: the tiles of the one that is open
+        dashboardTabShown();
     }
     if (tabName === 'alerts') {
         renderAlertsTab();
@@ -526,7 +533,7 @@ async function refreshAll() {
     );
 }
 
-async function refreshDashboard() {
+async function refreshDashboard(opts) {
     try {
         const [statusResp, rustinelResp] = await Promise.all([
             fetch('/api/status'),
@@ -550,6 +557,10 @@ async function refreshDashboard() {
     } catch (e) {
         showToast('error', 'Dashboard unreachable', e.message || 'Connection to server lost', 6000);
     }
+    // The Refresh button of the header passes {panels: true}: on an own page it
+    // computes its tiles again, one after the other. The 10 s poll calls this
+    // without it, so nothing on a dashboard recomputes by itself.
+    if (opts && opts.panels && dashboardOwnPage()) await loadPanels();
 }
 
 let _alertsInFlight = null;
@@ -1248,6 +1259,731 @@ function redrawDashboardChartsOnResize() {
         || (drawn.size && size.width === drawn.size.width && size.height === drawn.size.height)) return;
     drawn.size = size;
     _drawDashboardBars(drawn);
+}
+
+// --- Own dashboard pages ---
+// Under the header of the Dashboard tab stands a row of pages: SERVICES (the
+// stats, the charts and the service cards, unchanged) and one page per own
+// dashboard, plus "+ NEW". An own page draws its tiles: each tile is a search
+// of the LOGS tab that was saved with a name, a form and a range
+// (webui/dashboards.py keeps them). The tiles compute one after the other,
+// never at the same time — eight tiles are eight searches over up to 10,000
+// matches on the VM that also detonates — and nothing recomputes by itself:
+// Refresh in the header computes every tile of the page again, the ↻ of a
+// tile only that one, and the clock in its head says how old its numbers are.
+const DASHBOARD_PAGE_KEY = 'tdc.dashboard.page';
+const DASHBOARD_SERVICES = 'services';
+// The rows a table tile shows, so no unbounded raw log text stands on the
+// front page, and the room a tile's chart is drawn for
+const DASHBOARD_PANEL_ROWS = 20;
+const DASHBOARD_PANEL_HEIGHT = 190;
+// Forms that read better over the whole row than beside another tile
+const DASHBOARD_PANEL_WIDE = ['table', 'line', 'sankey'];
+// From this window width the tiles stand in two columns (the style sheet says
+// the same; the chart is drawn for the room it then has)
+const DASHBOARD_PANEL_COLUMNS = 1100;
+// Characters of the query under a tile; the whole one stands in its title
+const DASHBOARD_QUERY_MAX = 140;
+// What a tile says before its numbers are there
+const DASHBOARD_PANEL_WAIT = { queued: 'Queued', loading: 'Loading…' };
+// The entries of a tile's ⋯ menu, in this order; "Change form" is the row of
+// form switches between Rename and Move up
+const DASHBOARD_PANEL_ACTIONS = [
+    { action: 'open', label: 'Open in LOGS', hint: 'The search of this tile in the LOGS tab' },
+    { action: 'rename', label: 'Rename', hint: 'Another name for this tile' },
+    { action: 'up', label: 'Move up', hint: 'One place earlier on the page' },
+    { action: 'down', label: 'Move down', hint: 'One place later on the page' },
+    { action: 'delete', label: 'Delete', hint: 'Take this tile off the dashboard' },
+];
+// The pages: the dashboards of the server, the page on screen ('services' or
+// a dashboard id), whether a run of tiles is on its way and the number of
+// that run (an answer of an older run draws nothing)
+let dashboardPages = { list: [], page: DASHBOARD_SERVICES, loading: false, at: 0 };
+// What is known about a tile: {state: 'queued'|'loading'|'ready'|'error',
+// result, error, at (the clock of the answer), menu (its ⋯ is open)}
+let dashboardPanelState = new Map();
+let dashboardQueue = [];              // the tiles waiting for their turn, in order
+let dashboardAbort = null;            // the AbortController of the request on its way
+let dashboardPageRead = false;        // the page of the last visit has been taken over once
+let dashboardOwnMenu = false;         // the ⋯ beside the name of the page is open
+let dashboardDrawnWidth = 0;          // the width the tiles on screen were drawn for
+// The tile whose request is really on its way ('' for none): a run that starts
+// meanwhile leaves that one its turn, and an abandoned request clears it
+let dashboardFlight = '';
+
+// The dashboard of the page on screen, null on SERVICES or for one that is gone
+function dashboardOwnPage() {
+    if (dashboardPages.page === DASHBOARD_SERVICES) return null;
+    return dashboardPages.list.find(board => board && board.id === dashboardPages.page) || null;
+}
+
+// A tile by its id: its dashboard, the tile and its place on the page. A tile
+// id is unique across the whole file, so the open page is enough to look in.
+function dashboardPanelOf(pid) {
+    const want = String(pid ?? '');
+    const open = dashboardOwnPage();
+    const list = open && Array.isArray(open.panels) ? open.panels : [];
+    const index = list.findIndex(tile => tile && tile.id === want);
+    return index < 0 ? null : { dashboard: open, panel: list[index], index, count: list.length };
+}
+
+// What is known about a tile; a tile that was never computed is queued
+function panelState(pid) {
+    const key = String(pid ?? '');
+    if (!dashboardPanelState.has(key)) {
+        dashboardPanelState.set(key, { state: 'queued', result: null, error: '', at: 0, menu: false });
+    }
+    return dashboardPanelState.get(key);
+}
+
+// A change to what is known about a tile, and that tile drawn again (the
+// clock of the page follows the newest tile)
+function panelSet(pid, change) {
+    const record = Object.assign(panelState(pid), change || {});
+    renderPanelCard(pid);
+    renderOwnClock();
+    return record;
+}
+
+// The clock in the head of the page: the newest numbers on it
+function renderOwnClock() {
+    const slot = document.getElementById('dashboard-own-time');
+    const open = dashboardOwnPage();
+    if (!slot || !open) return false;
+    const times = (Array.isArray(open.panels) ? open.panels : [])
+        .map(tile => (tile && tile.id ? panelState(tile.id).at : 0)).filter(at => at > 0);
+    slot.textContent = times.length ? new Date(Math.max(...times)).toLocaleTimeString('en-GB') : '—';
+    return true;
+}
+
+// The id of a tile's card element: a tile id is d-/p- plus hex, so it is safe
+// in an id and in a selector
+function dashboardPanelId(pid) {
+    return `dashboard-panel-${cssToken(pid)}`;
+}
+
+// The sort state of a tile's table (tableSortState). Every table of one id
+// takes the order of a click on any of them, so a tile needs its own — the
+// result of the LOGS tab and a second tile must not reorder it.
+function dashboardPanelSortId(pid) {
+    return `logs-tile-${cssToken(pid)}`;
+}
+
+// The room a tile of this form has for its chart: the whole row for a table, a
+// line or a sankey, half of it for a pie or bars, and the whole row in one
+// column (a narrow window). The style sheet puts two tiles in a row from
+// DASHBOARD_PANEL_COLUMNS of window width, so the same number decides here —
+// a chart drawn for more room than its tile has would push its legend out.
+function dashboardPanelWidth(form) {
+    const total = logsWidth('dashboard-panels') - 28;        // the padding of the card
+    const room = typeof window !== 'undefined' && window.innerWidth > 0 ? window.innerWidth : total + 280;
+    const wide = room < DASHBOARD_PANEL_COLUMNS || DASHBOARD_PANEL_WIDE.includes(form);
+    return Math.max(wide ? total : Math.floor((total - 12) / 2), 240);
+}
+
+// The range of a tile as a word for its head: the range of the tab it was
+// saved with, which moves with the clock, or the window it keeps
+function dashboardRangeWord(panel) {
+    const tile = panel || {};
+    const earliest = String(tile.earliest ?? ''), latest = String(tile.latest ?? '');
+    if (!earliest && !latest) return 'all time';
+    const span = /^-(\d+)([mhd])$/.exec(earliest);
+    if (span && !latest) return `last ${span[1]} ${LOGS_RANGE_UNITS[span[2]]}`;
+    return chartRangeLabel(Date.parse(earliest), Date.parse(latest)) || 'a window';
+}
+
+// The forms a tile's columns can carry. Before its first answer every form is
+// offered: which ones fit is only known once the columns are there.
+function panelFormsFor(state) {
+    const result = (state || {}).result;
+    if (!result) return { table: true, pie: true, bars: true, line: true, sankey: true, why: {} };
+    return logsFormsFor(logsResultShape(result));
+}
+
+// The line under a tile that stands for less than the whole result. A tile's
+// query cannot be changed from here (the store keeps it; LOGS is where a
+// search is sharpened), so the line of the LOGS tab, which writes into its
+// search box, becomes plain text here.
+function panelNoteHtml(shape, query) {
+    const note = logsTruncNoteHtml(shape, query);
+    const button = /^<button[^>]*>([\s\S]*)<\/button>$/.exec(note);
+    return button ? `<div class="logs-trunc">${button[1]}</div>` : note;
+}
+
+// The body of a tile: what it is waiting for, the message of a search that was
+// refused, or its result in the form it was saved with. A form that no longer
+// fits the columns — the server answers other columns than when it was saved —
+// shows the table and says what the form would need. A tile that is being
+// computed again keeps the numbers it has, with the word of its turn over
+// them: the Refresh of the header would otherwise blank the whole page.
+function panelBodyHtml(panel, state) {
+    const tile = panel || {}, s = state || {};
+    const waiting = s.state === 'queued' || s.state === 'loading';
+    const result = s.result;
+    if (waiting && !result) {
+        return `<div class="dashboard-panel-wait">${escapeHtml(DASHBOARD_PANEL_WAIT[s.state])}</div>`;
+    }
+    if (!waiting && s.error) return `<div class="dashboard-panel-error">${escapeHtml(s.error)}</div>`;
+    if (!result) return `<div class="dashboard-panel-wait">${escapeHtml(DASHBOARD_PANEL_WAIT.queued)}</div>`;
+    const again = waiting
+        ? `<div class="dashboard-panel-wait is-again">${escapeHtml(DASHBOARD_PANEL_WAIT[s.state])}</div>` : '';
+    const form = LOGS_FORMS.includes(tile.form) ? tile.form : 'table';
+    const shape = logsResultShape(result);
+    const note = panelNoteHtml(shape, tile.query);
+    if (form !== 'table') {
+        const chart = logsChartHtml(result, form, { width: s.width > 0 ? s.width : dashboardPanelWidth(form),
+            height: DASHBOARD_PANEL_HEIGHT });
+        if (chart) return `${again}<div class="logs-chart">${chart}</div>${note}`;
+    }
+    // The rows as a table: at most twenty of them, so no sample's raw text
+    // fills the front page. The count goes down with them, so logsTableHtml
+    // offers no "Show up to 1000" — that button belongs to the LOGS tab,
+    // whose page size it raises. Each tile sorts under its own id: every table
+    // of one id takes the order of a click on any of them.
+    const rows = Array.isArray(result.rows) ? result.rows : [];
+    const shown = rows.slice(0, DASHBOARD_PANEL_ROWS);
+    const cut = { ...result, rows: shown, count: shown.length };
+    const table = logsTableHtml(cut, { sortId: dashboardPanelSortId(tile.id) });
+    const why = form === 'table' ? '' : `<div class="dashboard-panel-why">`
+        + `${escapeHtml(`saved as ${form}, which ${panelFormsFor(s).why[form] || LOGS_LOCKED.columns}`)}</div>`;
+    const more = rows.length > DASHBOARD_PANEL_ROWS
+        ? `<div class="dashboard-panel-why">${escapeHtml(`the first ${DASHBOARD_PANEL_ROWS} of ${logsNumber(rows.length)} rows`)}</div>`
+        : '';
+    // The note belongs under the table as well: a tile that fell back to it
+    // still stands for less than the whole result
+    return `${again}${table}${why}${more}${note}`;
+}
+
+// A tile as markup: pure, so a card can be drawn again from what is known
+// about it. `state` is its record (panelState), with `first` / `last` (its
+// place on the page, which locks Move up and Move down) and `width` (the room
+// its chart has) added by the caller.
+function panelCardHtml(panel, state) {
+    const tile = panel || {}, s = state || {};
+    const pid = String(tile.id ?? '');
+    const form = LOGS_FORMS.includes(tile.form) ? tile.form : 'table';
+    const wide = DASHBOARD_PANEL_WIDE.includes(form);
+    const forms = panelFormsFor(s);
+    const clock = s.at > 0 ? new Date(s.at).toLocaleTimeString('en-GB') : '—';
+    const items = DASHBOARD_PANEL_ACTIONS.map(entry => {
+        const locked = (entry.action === 'up' && s.first) || (entry.action === 'down' && s.last);
+        return `<button type="button" class="dashboard-panel-item" data-panel-action="${entry.action}"`
+            + ` aria-disabled="${!!locked}" title="${escapeHtml(locked ? 'It is already there' : entry.hint)}"`
+            + ` onclick="panelMenu(${jsArg(pid)}, ${jsArg(entry.action)})">${escapeHtml(entry.label)}</button>`;
+    });
+    const switches = LOGS_FORMS.map(name => `<button type="button" class="dashboard-panel-form"`
+        + ` data-panel-form="${name}" aria-pressed="${name === form}" aria-disabled="${!forms[name]}"`
+        + ` title="${escapeHtml(forms[name] ? LOGS_FORM_HINTS[name] : forms.why[name] || LOGS_LOCKED.columns)}"`
+        + ` onclick="panelMenu(${jsArg(pid)}, ${jsArg(`form-${name}`)})">${escapeHtml(name.toUpperCase())}</button>`).join('');
+    const menu = `<div class="dashboard-panel-menu" role="group" aria-label="This tile"${s.menu ? '' : ' hidden'}>`
+        + items.slice(0, 2).join('')
+        + `<div class="dashboard-panel-head-row">Change form</div>`
+        + `<div class="dashboard-panel-forms">${switches}</div>`
+        + items.slice(2).join('') + `</div>`;
+    const query = String(tile.query ?? '');
+    return `<div class="chart-card dashboard-panel dashboard-panel-${cssToken(form)}${wide ? ' dashboard-panel-wide' : ''}"`
+        + ` id="${dashboardPanelId(pid)}" data-panel="${escapeHtml(pid)}">`
+        + `<div class="chart-card-head dashboard-panel-head">`
+        + `<h3 class="chart-card-title dashboard-panel-title" title="${escapeHtml(tile.name)}">${escapeHtml(tile.name)}</h3>`
+        + `<span class="chart-card-tools dashboard-panel-tools">`
+        + `<span class="dashboard-panel-range">${escapeHtml(dashboardRangeWord(tile))}</span>`
+        + `<span class="dashboard-panel-time" title="The clock of the numbers on this tile">${escapeHtml(clock)}</span>`
+        + `<button type="button" class="dashboard-panel-tool" aria-disabled="false"`
+        + ` title="Compute this tile again" aria-label="Compute this tile again"`
+        + ` onclick="refreshPanel(${jsArg(pid)})">↻</button>`
+        + `<span class="dashboard-menu-wrap">`
+        + `<button type="button" class="dashboard-panel-tool" aria-disabled="false" aria-haspopup="true"`
+        + ` aria-expanded="${!!s.menu}" title="What can be done with this tile" aria-label="Tile menu"`
+        + ` onclick="togglePanelMenu(${jsArg(pid)})">⋯</button>${menu}</span>`
+        + `</span></div>`
+        + `<div class="dashboard-panel-body">${panelBodyHtml(tile, s)}</div>`
+        + `<div class="dashboard-panel-foot"><code class="dashboard-panel-query" title="${escapeHtml(query)}">`
+        + `${escapeHtml(_chartEllipsis(query, DASHBOARD_QUERY_MAX))}</code></div>`
+        + `</div>`;
+}
+
+// One tile drawn again, in its place: only that card, so the charts of the
+// others are not redrawn. Without a card of its own the page is drawn again.
+function renderPanelCard(pid) {
+    const at = dashboardPanelOf(pid);
+    if (!at) return false;
+    const card = document.getElementById(dashboardPanelId(pid));
+    if (!card) return renderOwnDashboard();
+    card.outerHTML = panelCardHtml(at.panel, dashboardPanelView(at));
+    return true;
+}
+
+// What a card is drawn from: what is known about the tile, its place on the
+// page and the room its chart has
+function dashboardPanelView(at) {
+    const tile = at.panel || {};
+    const form = LOGS_FORMS.includes(tile.form) ? tile.form : 'table';
+    return { ...panelState(tile.id), first: at.index === 0, last: at.index === at.count - 1,
+        width: dashboardPanelWidth(form) };
+}
+
+// The head of the open page (its name, the clock of its newest tile and the ⋯
+// that renames or deletes it) and its tiles
+function renderOwnDashboard() {
+    const head = document.getElementById('dashboard-own-head'), host = document.getElementById('dashboard-panels');
+    if (!head || !host) return false;
+    const open = dashboardOwnPage();
+    if (!open) {
+        head.innerHTML = '';
+        host.innerHTML = '';
+        return false;
+    }
+    const list = (Array.isArray(open.panels) ? open.panels : []).filter(tile => tile && typeof tile.id === 'string');
+    const times = list.map(tile => panelState(tile.id).at).filter(at => at > 0);
+    const clock = times.length ? new Date(Math.max(...times)).toLocaleTimeString('en-GB') : '—';
+    head.innerHTML = `<h3 class="dashboard-own-title" title="${escapeHtml(open.name)}">${escapeHtml(open.name)}</h3>`
+        + `<span class="dashboard-own-count">${escapeHtml(`${list.length} of ${LOGS_TILE_MAX} tiles`)}</span>`
+        + `<span class="dashboard-own-tools">`
+        + `<span class="dashboard-own-time" id="dashboard-own-time" title="The clock of the newest numbers on this page">${escapeHtml(clock)}</span>`
+        + `<span class="dashboard-menu-wrap">`
+        + `<button type="button" class="dashboard-panel-tool" id="dashboard-own-menu-btn" aria-disabled="false"`
+        + ` aria-haspopup="true" aria-expanded="${dashboardOwnMenu}" title="What can be done with this dashboard"`
+        + ` aria-label="Dashboard menu" onclick="toggleDashboardMenu()">⋯</button>`
+        + `<div class="dashboard-menu" role="group" aria-label="This dashboard"${dashboardOwnMenu ? '' : ' hidden'}>`
+        + `<button type="button" class="dashboard-menu-item" title="Another name for this dashboard"`
+        + ` onclick="renameDashboard(${jsArg(open.id)})">Rename</button>`
+        + `<button type="button" class="dashboard-menu-item" title="This dashboard and every tile on it"`
+        + ` onclick="deleteDashboard(${jsArg(open.id)})">Delete</button>`
+        + `</div></span></span>`;
+    host.innerHTML = list.length
+        ? list.map((tile, index) => panelCardHtml(tile, dashboardPanelView({ panel: tile, index, count: list.length }))).join('')
+        : `<div class="dashboard-own-empty">No tiles yet. Search in the LOGS tab and press SAVE to put a result here.</div>`;
+    dashboardDrawnWidth = logsWidth('dashboard-panels');
+    return true;
+}
+
+// The tiles for the room a new window width gives them: the legend of a pie or
+// of bars keeps a column of its own, which does not scale with the svg, so a
+// chart drawn for another width has to be drawn again. Nothing is computed
+// again — the cards come from the numbers that are already there.
+function redrawPanelsOnResize() {
+    const now = logsWidth('dashboard-panels');
+    if (!now || now === dashboardDrawnWidth || !dashboardOwnPage()) return false;
+    renderOwnDashboard();
+    return true;
+}
+
+// The row of pages, and which of the two bodies is on screen
+function renderDashboardPages() {
+    const row = document.getElementById('dashboard-pages');
+    if (!row) return false;
+    const page = dashboardPages.page;
+    const list = dashboardPages.list.filter(board => board && typeof board.id === 'string');
+    const buttons = [`<button type="button" class="dashboard-page" id="dashboard-page-services"`
+        + ` data-dashboard-page="${DASHBOARD_SERVICES}" aria-pressed="${page === DASHBOARD_SERVICES}"`
+        + ` aria-disabled="false" title="The services of the chamber, its alerts and its tiles"`
+        + ` onclick="setDashboardPage(${jsArg(DASHBOARD_SERVICES)})">SERVICES</button>`];
+    for (const board of list) {
+        const tiles = Array.isArray(board.panels) ? board.panels.length : 0;
+        buttons.push(`<button type="button" class="dashboard-page" data-dashboard-page="${escapeHtml(board.id)}"`
+            + ` aria-pressed="${board.id === page}" aria-disabled="false"`
+            + ` title="${escapeHtml(`${tiles} of ${LOGS_TILE_MAX} tiles`)}"`
+            + ` onclick="setDashboardPage(${jsArg(board.id)})">${escapeHtml(board.name)}</button>`);
+    }
+    const room = list.length < LOGS_DASH_MAX;
+    buttons.push(`<button type="button" class="dashboard-page dashboard-page-new" id="dashboard-page-new"`
+        + ` aria-disabled="${!room}" title="${escapeHtml(room ? 'A new, empty dashboard' : LOGS_SAVE_LOCKED.dashboards)}"`
+        + ` onclick="addDashboard()">+ NEW</button>`);
+    row.innerHTML = buttons.join('');
+    const services = page === DASHBOARD_SERVICES;
+    const body = document.getElementById('dashboard-body'), own = document.getElementById('dashboard-own');
+    if (body) body.hidden = !services;
+    if (own) own.hidden = services;
+    renderOwnDashboard();
+    return true;
+}
+
+// The page of the last visit ('' where nothing was stored or storage is blocked)
+function dashboardStoredPage() {
+    try {
+        const stored = localStorage.getItem(DASHBOARD_PAGE_KEY);
+        return typeof stored === 'string' ? stored : '';
+    } catch (e) {
+        return '';
+    }
+}
+
+// One of the pages. A dashboard that is not there (deleted in another browser
+// tab, or an id from an older visit) falls back to SERVICES. The tiles of the
+// page that was open are abandoned, and the tiles of the new one start.
+function setDashboardPage(id) {
+    const want = String(id ?? '');
+    const known = want === DASHBOARD_SERVICES || dashboardPages.list.some(board => board && board.id === want);
+    const page = known ? want : DASHBOARD_SERVICES;
+    // The page that is already open, with its tiles: the buttons behave like
+    // tabs, where a click on the open one does nothing. Stopping and queueing
+    // them again would be up to twelve searches for numbers that are on
+    // screen. The other callers always change the page, so this is their way
+    // through: a page whose tiles have never run has no record yet.
+    if (page === dashboardPages.page && dashboardPanelState.size) return known;
+    dashboardPages.page = page;
+    try {
+        localStorage.setItem(DASHBOARD_PAGE_KEY, page);
+    } catch (e) {
+        // storage blocked: the page is not kept for the next visit
+    }
+    dashboardStopPanels();
+    closeDashboardMenus();
+    renderDashboardPages();
+    if (page !== DASHBOARD_SERVICES) loadPanels();
+    return known;
+}
+
+// The dashboards of the server: one GET brings every tile of every page. Every
+// write reads them again, so a second browser tab cannot leave this one
+// working from a list that is out of date.
+async function loadDashboardPages() {
+    let list = null, why = '';
+    try {
+        const resp = await fetch('/api/dashboards');
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok) list = Array.isArray(data && data.dashboards) ? data.dashboards : [];
+        else why = logsSaveMessage(resp.status, data);
+    } catch (e) {
+        why = `the dashboards could not be read: ${e && e.message ? e.message : e}`;
+    }
+    // A list that could not be read is no answer about the dashboards: what is
+    // known stays, the page stays, and the storage is not written. Only a
+    // dashboard the server really does not have any more falls back to
+    // SERVICES — a blip must not lose the page of the last visit.
+    if (why) {
+        renderDashboardPages();
+        showToast('error', 'Dashboards unreachable', why, 6000);
+        return false;
+    }
+    dashboardPages.list = list || [];
+    // Only the tiles the server still has keep their record: one holds a whole
+    // result, so a tile or a dashboard deleted in another browser tab would
+    // leave up to 1000 rows behind for the life of the page
+    const alive = new Set();
+    for (const page of dashboardPages.list) {
+        for (const tile of (page && page.panels) || []) alive.add(String(tile && tile.id));
+    }
+    for (const pid of [...dashboardPanelState.keys()]) {
+        if (!alive.has(String(pid))) dashboardPanelState.delete(pid);
+    }
+    if (!dashboardPageRead) {
+        // The page of the last visit, once: a click since then wins
+        dashboardPageRead = true;
+        const stored = dashboardStoredPage();
+        if (stored) dashboardPages.page = stored;
+    }
+    if (dashboardPages.page !== DASHBOARD_SERVICES && !dashboardOwnPage()) {
+        setDashboardPage(DASHBOARD_SERVICES);
+    } else {
+        renderDashboardPages();
+    }
+    return true;
+}
+
+// The tiles that were waiting are let go of and the request on its way is
+// abandoned: a page or a tab that is left takes its searches with it. The tile
+// that was waiting for that answer is waiting for its turn again — nothing is
+// on its way for it, so the next run has to pick it up.
+function dashboardStopPanels() {
+    dashboardPages.at++;
+    dashboardQueue = [];
+    dashboardPages.loading = false;
+    dashboardFlight = '';
+    if (dashboardAbort) {
+        dashboardAbort.abort();
+        dashboardAbort = null;
+    }
+    for (const [pid, record] of dashboardPanelState) {
+        if (record.state === 'loading') panelSet(pid, { state: 'queued' });
+    }
+}
+
+// The tiles of the open page, one after the other: `ids` are the tiles to
+// compute (every one of them without it). A tile that is already waiting is
+// not queued twice, and a run that is on its way takes the new ones over.
+async function loadPanels(ids) {
+    const open = dashboardOwnPage();
+    if (!open) return 0;
+    const list = (Array.isArray(open.panels) ? open.panels : [])
+        .filter(tile => tile && typeof tile.id === 'string'
+            && (!Array.isArray(ids) || ids.map(String).includes(tile.id)));
+    if (!list.length) return 0;
+    for (const tile of list) {
+        // The tile whose answer is really on its way keeps its turn: queueing
+        // it again would let that answer land as its result and search it a
+        // second time. Its state alone must not decide that — a tile whose
+        // request was abandoned keeps `loading` until a run reaches it, and
+        // inferring it from there left such a tile waiting for ever.
+        if (tile.id === dashboardFlight) continue;
+        panelSet(tile.id, { state: 'queued', error: '' });
+        if (!dashboardQueue.includes(tile.id)) dashboardQueue.push(tile.id);
+    }
+    if (dashboardPages.loading || !dashboardQueue.length) return 0;
+    const run = ++dashboardPages.at, page = dashboardPages.page;
+    dashboardPages.loading = true;
+    let done = 0;
+    try {
+        while (dashboardQueue.length) {
+            if (run !== dashboardPages.at || page !== dashboardPages.page) break;
+            const pid = dashboardQueue.shift();
+            if (!dashboardPanelOf(pid)) continue;
+            if (await loadOnePanel(pid, run, page)) done++;
+        }
+    } finally {
+        if (run === dashboardPages.at) {
+            dashboardPages.loading = false;
+            dashboardAbort = null;
+        }
+    }
+    return done;
+}
+
+// One tile: its own search, with the limit of its form (200 for a table, 1000
+// for a picture — a chart stands for every group the server will give) and the
+// signal of its run. `dashboardFlight` is this tile while its request is on
+// its way, so a run that starts meanwhile leaves it its turn and nothing else.
+// An answer is only drawn while its page and its run are still the ones on
+// screen.
+async function loadOnePanel(pid, run, page) {
+    const at = dashboardPanelOf(pid);
+    if (!at) return false;
+    const tile = at.panel;
+    panelSet(pid, { state: 'loading', error: '' });
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    dashboardAbort = controller;
+    dashboardFlight = String(pid);
+    const query = String(tile.query ?? '').trim() || '*';
+    const params = new URLSearchParams({ q: query, earliest: String(tile.earliest ?? ''),
+        limit: String(logsChartLimit(tile.form)) });
+    if (tile.latest) params.set('latest', String(tile.latest));
+    let result = null, error = '';
+    try {
+        const resp = await fetch(`/api/logs/search?${params.toString()}`,
+            controller ? { signal: controller.signal } : undefined);
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok) result = data;
+        else error = data && data.error ? String(data.error) : `The search failed (HTTP ${resp.status}).`;
+    } catch (e) {
+        if (e && e.name === 'AbortError') return false;
+        error = `The search could not be loaded: ${e && e.message ? e.message : e}`;
+    } finally {
+        if (dashboardFlight === String(pid)) dashboardFlight = '';
+    }
+    if (run !== dashboardPages.at || page !== dashboardPages.page) return false;
+    // Another table: the order a click left on this tile means nothing in it
+    const columns = JSON.stringify((result && result.columns) || []);
+    const had = panelState(pid).columns;
+    if (had !== undefined && had !== columns) delete tableSortState[dashboardPanelSortId(pid)];
+    panelSet(pid, { state: error ? 'error' : 'ready', error, result, at: Date.now(), columns });
+    return !error;
+}
+
+// The ↻ of one tile: that tile alone, which is one search
+async function refreshPanel(pid) {
+    if (!dashboardPanelOf(pid)) return 0;
+    closeDashboardMenus();
+    return loadPanels([String(pid)]);
+}
+
+// Open in LOGS: the tab with the search of the tile, the range it keeps and
+// the form it was saved with. The query, the window and the form are put in
+// place first and the tab is shown afterwards: the tab searches when it is
+// shown (logsTabShown, initLogs on a first visit), and that one search is the
+// one of the tile.
+function openPanelInLogs(pid) {
+    const at = dashboardPanelOf(pid);
+    if (!at) return false;
+    const tile = at.panel;
+    closeDashboardMenus();
+    const earliest = String(tile.earliest ?? ''), latest = String(tile.latest ?? '');
+    const label = logsRangeLabel(earliest, latest);
+    logsLimit = LOGS_PAGE;
+    logsState.earliest = earliest;
+    logsState.latest = latest;
+    if (label) logsRememberRange(label);
+    logsSetQuery(String(tile.query ?? ''));
+    logsWantForm = LOGS_FORMS.includes(tile.form) ? tile.form : '';
+    logsOpenPending = true;
+    renderLogsRange();
+    switchTab('logs');
+    return true;
+}
+
+// The ⋯ of a tile: one menu at a time, so two of them never stand open
+function togglePanelMenu(pid) {
+    const want = String(pid ?? '');
+    if (!dashboardPanelOf(want)) return false;
+    const open = !panelState(want).menu;
+    closeDashboardMenus();
+    if (open) panelSet(want, { menu: true });
+    return open;
+}
+
+// The ⋯ beside the name of the page
+function toggleDashboardMenu() {
+    const open = !dashboardOwnMenu;
+    closeDashboardMenus();
+    dashboardOwnMenu = open;
+    renderOwnDashboard();
+    return open;
+}
+
+// Every ⋯ menu of the page shut: a click elsewhere, a page change and every
+// entry that was chosen close them
+function closeDashboardMenus() {
+    const had = dashboardOwnMenu;
+    dashboardOwnMenu = false;
+    const open = [...dashboardPanelState].filter(([, record]) => record.menu).map(([pid]) => pid);
+    for (const pid of open) panelState(pid).menu = false;
+    if (had) renderOwnDashboard();
+    else for (const pid of open) renderPanelCard(pid);
+    return had || open.length > 0;
+}
+
+// One write of the dashboard routes: {ok, status, data}. A refusal says so as
+// a toast with the sentence of the server — the tile or the page it belongs to
+// stays on screen, so there is nowhere else to put it.
+async function dashboardWrite(url, method, body) {
+    let status = 0, data = {};
+    try {
+        const opts = { method, headers: { 'Content-Type': 'application/json' } };
+        if (body !== undefined) opts.body = JSON.stringify(body);
+        const resp = await fetch(url, opts);
+        status = resp.status;
+        data = (await resp.json().catch(() => ({}))) || {};
+        if (resp.ok) return { ok: true, status, data };
+        showToast('error', 'The dashboard was not changed', logsSaveMessage(status, data), 6000);
+    } catch (e) {
+        showToast('error', 'The dashboard was not changed',
+            `the change did not reach the server: ${e && e.message ? e.message : e}`, 6000);
+    }
+    return { ok: false, status, data };
+}
+
+// A name the analyst typed, or '' where it cannot be used (and why, as a
+// toast); null where the question was cancelled
+function dashboardAskName(question, value, why) {
+    const answer = typeof prompt === 'function' ? prompt(question, value) : null;
+    if (answer === null || answer === undefined) return null;
+    const name = String(answer).trim();
+    if (!name || name.length > LOGS_NAME_MAX) {
+        showToast('error', 'The name was not taken', why, 6000);
+        return '';
+    }
+    return name;
+}
+
+// + NEW in the row of pages: an empty dashboard, which then opens
+async function addDashboard() {
+    if (dashboardPages.list.length >= LOGS_DASH_MAX) {
+        showToast('error', 'No room for another dashboard', LOGS_SAVE_LOCKED.dashboards, 6000);
+        return false;
+    }
+    const name = dashboardAskName('Name of the new dashboard', logsSaveBoardName(dashboardPages.list),
+        LOGS_SAVE_LOCKED.dashboard);
+    if (!name) return false;
+    const made = await dashboardWrite('/api/dashboards', 'POST', { name });
+    const fresh = made.ok && made.data.dashboard ? String(made.data.dashboard.id || '') : '';
+    await loadDashboardPages();
+    if (fresh) setDashboardPage(fresh);
+    return !!fresh;
+}
+
+// Rename of the open dashboard, from its ⋯
+async function renameDashboard(id) {
+    const board = dashboardPages.list.find(item => item && item.id === String(id ?? ''));
+    if (!board) return false;
+    closeDashboardMenus();
+    const name = dashboardAskName('Name of the dashboard', board.name, LOGS_SAVE_LOCKED.dashboard);
+    if (!name) return false;
+    const done = await dashboardWrite(`/api/dashboards/${encodeURIComponent(board.id)}`, 'PATCH', { name });
+    await loadDashboardPages();
+    return done.ok;
+}
+
+// Delete of the open dashboard, from its ⋯: it asks once and names the tiles
+// that go with it
+async function deleteDashboard(id) {
+    const board = dashboardPages.list.find(item => item && item.id === String(id ?? ''));
+    if (!board) return false;
+    closeDashboardMenus();
+    const tiles = Array.isArray(board.panels) ? board.panels.length : 0;
+    const question = `Delete '${board.name}' and its ${tiles} ${tiles === 1 ? 'tile' : 'tiles'}?`;
+    if (typeof confirm !== 'function' || !confirm(question)) return false;
+    const done = await dashboardWrite(`/api/dashboards/${encodeURIComponent(board.id)}`, 'DELETE');
+    await loadDashboardPages();
+    return done.ok;
+}
+
+// One entry of a tile's ⋯ menu: 'open', 'rename', 'up', 'down', 'delete' or
+// 'form-<name>'. Every write sends exactly the one field it is about (the
+// query and the range of a tile cannot change: that is a new tile from LOGS)
+// and reads the list again afterwards.
+async function panelMenu(pid, action) {
+    const at = dashboardPanelOf(pid);
+    if (!at) return false;
+    const tile = at.panel, what = String(action ?? '');
+    if (what === 'open') return openPanelInLogs(pid);
+    closeDashboardMenus();
+    const url = `/api/dashboards/${encodeURIComponent(at.dashboard.id)}`
+        + `/panels/${encodeURIComponent(tile.id)}`;
+    let body = null;
+    if (what === 'rename') {
+        const name = dashboardAskName('Name of the tile', tile.name, LOGS_SAVE_LOCKED.name);
+        if (!name) return false;
+        body = { name };
+    } else if (what === 'up' || what === 'down') {
+        if ((what === 'up' && at.index === 0) || (what === 'down' && at.index === at.count - 1)) return false;
+        body = { move: what };
+    } else if (what === 'delete') {
+        if (typeof confirm !== 'function' || !confirm(`Delete the tile '${tile.name}'?`)) return false;
+        const gone = await dashboardWrite(url, 'DELETE');
+        // Only a tile that is really gone lets go of its numbers: a refused
+        // delete leaves the tile standing, with what it had on it
+        if (gone.ok) dashboardPanelState.delete(tile.id);
+        await loadDashboardPages();
+        return gone.ok;
+    } else if (what.startsWith('form-')) {
+        const form = what.slice(5);
+        if (!LOGS_FORMS.includes(form)) return false;
+        // A form the columns of the last answer cannot carry is grey in the
+        // menu, and that is all aria-disabled is: a click on it stores a form
+        // the tile can never draw and pays a search for it
+        if (!panelFormsFor(panelState(tile.id))[form]) return false;
+        body = { form };
+    } else {
+        return false;
+    }
+    const done = await dashboardWrite(url, 'PATCH', body);
+    await loadDashboardPages();
+    // Another form may need rows the last search did not ask for (200 or 1000)
+    if (done.ok && body.form) await refreshPanel(tile.id);
+    return done.ok;
+}
+
+// The pages and the tiles of the one that is open: the Dashboard tab was
+// shown (switchTab draws its charts beside this) or the page has just loaded
+// with that tab open. The list is read again every time — another browser tab
+// may have added, renamed or deleted a dashboard since the last look.
+function dashboardTabShown() {
+    return loadDashboardPages().then(() => (dashboardOwnPage() ? loadPanels() : 0));
+}
+
+// A click outside a ⋯ menu shuts it, as the menu of the LOGS tab does; the
+// tab stands open when the page loads, so its pages are read right away
+function initDashboardPages() {
+    if (!document.getElementById('dashboard-pages')) return;
+    document.addEventListener('click', event => {
+        const wrap = event.target && typeof event.target.closest === 'function'
+            ? event.target.closest('.dashboard-menu-wrap') : null;
+        if (!wrap) closeDashboardMenus();
+    });
+    const host = document.getElementById('dashboard-panels');
+    if (host && typeof ResizeObserver !== 'undefined') {
+        new ResizeObserver(() => requestAnimationFrame(redrawPanelsOnResize)).observe(host);
+    }
+    if (state.activeTab === 'dashboard') dashboardTabShown();
 }
 
 // --- A range drawn across bars ---
@@ -2935,6 +3671,8 @@ const CHART_PALETTE = ['var(--accent-pink)', 'var(--accent-cyan)', 'var(--accent
 const CHART_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 // A clock set to the year 9999 must not give a chart millions of bins
 const CHART_MAX_BINS = 1000;
+// Characters of a label a tooltip repeats (a value from a log can be 64 KB)
+const CHART_LABEL_MAX = 200;
 
 // --- Counting ---
 // An alert's category in lower case: the first of a list (["registry"]) or
@@ -3363,6 +4101,79 @@ function sparklineSvg(values, opts) {
     return `<svg class="chart-svg chart-spark" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">`
         + `<polygon class="chart-spark-area" points="0,${height} ${points} ${width},${height}" style="fill:${color}"/>`
         + `<polyline class="chart-spark-line" points="${points}" fill="none" style="stroke:${color}"/></svg>`;
+}
+
+// Lines over time, one per series [{key, label, color, points: [[t, value],
+// …]}] (the LINE of a timechart): a grid under them, the highest value of all
+// series at the top left, labels of times or dates under the plot (`unit` and
+// `step` of the buckets, else hours, days or weeks by their length). A
+// series' points are drawn by their time, whatever order they come in; a
+// value that is none (null, '') is skipped and the line goes on to the next
+// one, so a bucket the server left out is no count of 0. A series of at most
+// 30 points also gets a dot per value, which names its period and its count.
+// Each line is a <path class="chart-line" data-key> whose <title> names its
+// series, the span of its values and their sum, each dot a <circle
+// class="chart-point" data-key data-value data-time>; colours come from
+// _chartColor by the place in `series`, so a line and its legend row match.
+// A label is cut to CHART_LABEL_MAX for those tooltips, which repeat it once
+// per series and once per dot. A series without a drawable point draws
+// nothing, and when none has one the answer is '', as with the other drawers.
+function lineSvg(series, opts) {
+    opts = opts || {};
+    // Number(null) is 0: a bucket without events must stay a gap, not a count
+    const value = v => (v === null || v === undefined || v === '' ? NaN : Number(v));
+    const list = (Array.isArray(series) ? series : []).map((s, i) => ({
+        key: s?.key, label: _chartEllipsis(String(s?.label ?? s?.key ?? ''), CHART_LABEL_MAX),
+        color: _chartColor(s?.color, i),
+        points: (s?.points || []).map(p => [value(p?.[0]), value(p?.[1])])
+            .filter(([t, v]) => Number.isFinite(t) && Number.isFinite(v))
+            .sort((a, b) => a[0] - b[0]),
+    })).filter(s => s.points.length);
+    let max = 0;                                    // not Math.max(...): a tile may hold thousands of points
+    for (const s of list) for (const [, v] of s.points) max = Math.max(max, v);
+    if (!(max > 0)) return '';
+    const width = opts.width > 0 ? Number(opts.width) : 560, height = opts.height > 0 ? Number(opts.height) : 140;
+    const top = 12, plotH = Math.max(height - top - 16, 10), bottom = top + plotH;
+    const times = [...new Set(list.flatMap(s => s.points.map(([t]) => t)))].sort((a, b) => a - b);
+    const gaps = times.slice(1).map((t, i) => t - times[i]);
+    const step = opts.step > 0 ? Number(opts.step) : gaps.length ? Math.min(...gaps) : 0;
+    const unit = ['second', 'minute', 'hour', 'day', 'week'].includes(opts.unit) ? opts.unit
+        : step <= 2 * 3600000 ? 'hour' : step <= 2 * 86400000 ? 'day' : 'week';
+    // A dot or a line cap on the first or last time stays inside the chart
+    const inset = 3, plotW = Math.max(width - 2 * inset, 1);
+    const first = times[0], last = times[times.length - 1];
+    const xOf = t => (last > first ? inset + plotW * (t - first) / (last - first) : width / 2);
+    const yOf = v => bottom - plotH * Math.min(Math.max(v, 0), max) / max;
+    const period = t => _chartPeriodLabel(t, step > 0 ? t + step : _chartPeriodNext(t, unit, step), unit);
+    let svg = [0.25, 0.5, 0.75, 1].map(f => {
+        const y = _chartCoord(bottom - plotH * f);
+        return `<line class="chart-grid" x1="0" x2="${width}" y1="${y}" y2="${y}"/>`;
+    }).join('') + `<text class="chart-ymax" x="0" y="${top - 3}">${_chartNumber(max)}</text>`;
+    for (const s of list) {
+        const values = s.points.map(([, v]) => v);
+        let lo = values[0], hi = values[0], total = 0;
+        for (const v of values) { lo = Math.min(lo, v); hi = Math.max(hi, v); total += v; }
+        const span = lo === hi ? _chartNumber(hi) : `${_chartNumber(lo)}–${_chartNumber(hi)}`;
+        const title = `${s.label}: ${span} per point, ${_chartNumber(total)} in all`;
+        // A single point is no line: its path draws nothing, its dot shows it
+        const d = s.points.map(([t, v], i) => `${i ? 'L' : 'M'}${_chartCoord(xOf(t))} ${_chartCoord(yOf(v))}`).join('');
+        svg += `<path class="chart-line" data-key="${escapeHtml(s.key)}" data-total="${total}" d="${d}"`
+            + ` fill="none" stroke-width="2" style="stroke:${s.color}"><title>${escapeHtml(title)}</title></path>`;
+        if (s.points.length > 30) continue;         // more dots than that are a thick line, not values
+        for (const [t, v] of s.points) {
+            svg += `<circle class="chart-point" data-key="${escapeHtml(s.key)}" data-value="${v}" data-time="${t}"`
+                + ` cx="${_chartCoord(xOf(t))}" cy="${_chartCoord(yOf(v))}" r="3" style="fill:${s.color}">`
+                + `<title>${escapeHtml(`${s.label} · ${period(t)}: ${_chartNumber(v)}`)}</title></circle>`;
+        }
+    }
+    svg += `<line class="chart-axis" x1="0" x2="${width}" y1="${bottom}" y2="${bottom}"/>`;
+    const bins = times.map(t => ({ start: t, end: t + Math.max(step, 0) }));
+    for (const { i, text } of _chartTicks(bins, unit, plotW / times.length, step)) {
+        const x = xOf(times[i]);
+        if (x + text.length * 5.6 > width) continue;     // it would run past the right edge
+        svg += `<text class="chart-tick" x="${_chartCoord(x)}" y="${height - 3}">${escapeHtml(text)}</text>`;
+    }
+    return `<svg class="chart-svg chart-lines" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${svg}</svg>`;
 }
 
 // Points [{x, y, color, title, key}] along x (a time or a rank) at height y
@@ -12036,13 +12847,15 @@ function initSysmonTab() {
 // LOGS (search the log store: PowerShell, access, MCP, NetFlow, DNS, firewall)
 // =============================================
 // One search box in a Splunk-like language (free words, "phrases", field=value,
-// AND / OR / NOT, pipes such as | stats count by tool; the cheat sheet in
-// LOGS_SYNTAX_HINT). Under it the sources as chips (a click searches one),
-// EVENTS OVER TIME stacked by source (a range drawn across the bars zooms in),
-// the fields of the matches on the left (a value adds field="value" to the
-// search) and the result: a list of events that a click unfolds, or, after
-// stats / table / top / rare / timechart, a sortable table (timechart: a chart
-// too). Everything in a log is written by the sample or the VM, a script block
+// AND / OR / NOT, pipes such as | stats count by tool; the whole language sits
+// in LOGS_COMMANDS, which draws the COMMANDS card the ? button opens). Under
+// the box the sources as chips (a click searches one), EVENTS OVER TIME stacked
+// by source (a range drawn across the bars zooms in), the COMMANDS card and the
+// fields of the matches on the left (a value adds field="value" to the
+// search) and the result in one of three tabs: EVENTS (the matches, a click
+// unfolds one), STATISTICS (the table of the pipes) and VISUALIZATION (the
+// result as a pie, bars, a line or a sankey, whichever its columns carry).
+// Everything in a log is written by the sample or the VM, a script block
 // above all, so every text goes through escapeHtml or logsHighlight (which
 // escapes what it does not mark).
 const LOGS_RANGES = ['15m', '1h', '4h', '24h', '7d', 'All'];
@@ -12069,13 +12882,113 @@ const LOGS_SOURCE_COLORS = {
     powershell: 'var(--accent-cyan)', access: 'var(--accent-green)', mcp: 'var(--accent-pink)',
     netflow: 'var(--c-purple-500)', dns: 'var(--c-blue-400)', firewall: 'var(--c-amber-400)',
 };
-const LOGS_SYNTAX_HINT = [
-    'Search: words, "a phrase", field=value, field!=value, field>5, AND / OR / NOT, ( ), * as wildcard',
-    'Pipes: | head N | tail N | sort -field | dedup f | table f1,f2 | stats count by f',
-    '       | top f | rare f | timechart span=5m count by f',
-    'Time: earliest=-15m latest=now (or use the range buttons)',
-    'Example: source=mcp | stats count by tool',
-].join('\n');
+const LOGS_COMMANDS_KEY = 'tdc.logs.commands';
+const LOGS_COMMANDS_GROUP_KEY = 'tdc.logs.commands.group';
+// Below this window width the card lies over the results and starts closed
+const LOGS_COMMANDS_WIDE = 1100;
+// The whole language of the search box, group by group, for the COMMANDS card:
+// the command as it goes into the query, a half sentence on what it does, and
+// how a click puts it in — a pipe behind the query, a term where the search
+// part ends, a source in the place of the source the query has.
+const LOGS_COMMANDS = [
+    { group: 'SEARCH', items: [
+        { text: 'word', hint: 'any event that holds the word', kind: 'term' },
+        { text: '"a phrase"', hint: 'the words in that order', kind: 'term' },
+        { text: 'field=value', hint: 'only events whose field is that', kind: 'term' },
+        { text: 'field!=value', hint: 'everything but that value', kind: 'term' },
+        { text: 'field>5', hint: 'a number above five', kind: 'term' },
+        { text: 'AND', hint: 'both sides have to match', kind: 'term' },
+        { text: 'OR', hint: 'either side matches', kind: 'term' },
+        { text: 'NOT', hint: 'drops what follows', kind: 'term' },
+        { text: '( )', hint: 'brackets group a condition', kind: 'term' },
+        { text: '*', hint: 'stands for anything', kind: 'term' },
+    ] },
+    { group: 'PIPES', items: [
+        { text: '| head 20', hint: 'the first twenty rows', kind: 'pipe' },
+        { text: '| tail 20', hint: 'the last twenty rows', kind: 'pipe' },
+        { text: '| sort -count', hint: 'the largest count first', kind: 'pipe' },
+        { text: '| dedup field', hint: 'one row per value', kind: 'pipe' },
+        { text: '| table f1, f2', hint: 'these columns as a table', kind: 'pipe' },
+        { text: '| fields f1', hint: 'keeps these fields only', kind: 'pipe' },
+        { text: '| stats count by field', hint: 'how many per value', kind: 'pipe' },
+        { text: '| top field', hint: 'the most frequent values', kind: 'pipe' },
+        { text: '| rare field', hint: 'the least frequent values', kind: 'pipe' },
+        { text: '| timechart span=5m count by source', hint: 'a count per five minutes', kind: 'pipe' },
+    ] },
+    { group: 'TIME', items: [
+        { text: 'earliest=-15m', hint: 'the last fifteen minutes', kind: 'term' },
+        { text: 'latest=now', hint: 'up to this moment', kind: 'term' },
+    ] },
+    { group: 'SOURCES', items: [
+        { text: 'source=powershell', hint: 'script blocks and the event logs', kind: 'source' },
+        { text: 'source=access', hint: 'requests to the web UI', kind: 'source' },
+        { text: 'source=mcp', hint: 'calls of the MCP tools', kind: 'source' },
+        { text: 'source=netflow', hint: 'connections of the VM', kind: 'source' },
+        { text: 'source=dns', hint: 'names the VM looked up', kind: 'source' },
+        { text: 'source=firewall', hint: 'what it let through or dropped', kind: 'source' },
+    ] },
+];
+// --- The result area: the three tabs, the form of the chart ---
+// EVENTS (the matches), STATISTICS (the table of the pipes) and VISUALIZATION
+// (one chart). Which tab can be used hangs on the type of the answer, which
+// form on its columns: column 0 is the name, the first column after it whose
+// values are all numbers is the value.
+const LOGS_VIEWS = ['events', 'statistics', 'visualization'];
+const LOGS_FORMS = ['table', 'pie', 'bars', 'line', 'sankey'];
+// Without a single row the name of a column says whether it holds numbers
+const LOGS_NUMBER_COLUMN = /^(?:count|percent)$|^(?:avg|sum|dc|min|max)\(/i;
+// Groups a pie, bars or a side of a sankey show on their own; the rest is one part
+const LOGS_CHART_TOP = 12;
+const LOGS_CHART_OTHER = 'other';
+// Characters of a group name a chart draws (a value in a log can be 64 KB)
+const LOGS_CHART_NAME_MAX = 200;
+const LOGS_SORT_PIPE = '| sort -count | head 20';
+// Why a tab or a form cannot be used; the text stands in its title. Every
+// reason of a *form* begins with "needs": a tile whose saved form no longer
+// fits reads it as "saved as <form>, which <reason>" (panelBodyHtml). `table`
+// is the reason of the EVENTS tab, which that line never uses.
+const LOGS_LOCKED = {
+    pipe: 'needs a pipe such as | stats count by field',
+    table: 'the pipes made a table; remove them to see events',
+    columns: 'needs one name column and one number column',
+    timechart: 'needs a timechart, such as | timechart span=5m count by source',
+    pie: 'needs groups rather than periods; a timechart draws as a line or as bars',
+    sankey: 'needs two name columns and one number column, as | stats count by a, b',
+};
+const LOGS_VIEW_HINTS = {
+    events: 'The events that match the search',
+    statistics: 'The result of the pipes as a table',
+    visualization: 'The result of the pipes as a chart',
+};
+const LOGS_FORM_HINTS = {
+    table: 'The rows as they are',
+    pie: 'The groups as slices of a disc',
+    bars: 'A bar per group, a stack per period for a timechart',
+    line: 'A line per series over time',
+    sankey: 'The flow from the first name column to the second',
+};
+// --- SAVE: the result as a tile on one of the own dashboards ---
+// What a range button stands for, as milliseconds and as a word of the dialog
+const LOGS_RANGE_MS = { m: 60000, h: 3600000, d: 86400000 };
+const LOGS_RANGE_UNITS = { m: 'min', h: 'h', d: 'd' };
+// The caps of the store (webui/dashboards.py); the dialog locks what is full
+const LOGS_NAME_MAX = 60;
+const LOGS_DASH_MAX = 10;
+const LOGS_TILE_MAX = 12;
+const LOGS_SAVE_WORD = '+ New';
+const LOGS_SAVE_HINT = 'Put this result on a dashboard as a tile';
+// The fields of the dialog that keep the focus through a re-render
+const LOGS_SAVE_FOCUS = ['logs-save-name', 'logs-save-new', 'logs-save-go'];
+// Why a save cannot be made: the SAVE button, a dashboard switch, the dialog
+const LOGS_SAVE_LOCKED = {
+    dashboards: `at most ${LOGS_DASH_MAX} dashboards; delete one first`,
+    tiles: `at most ${LOGS_TILE_MAX} tiles per dashboard; delete one first`,
+    full: `every one of the ${LOGS_DASH_MAX} dashboards holds its ${LOGS_TILE_MAX} tiles: delete a tile or a whole dashboard to make room`,
+    name: `the tile needs a name of 1 to ${LOGS_NAME_MAX} characters`,
+    dashboard: `the new dashboard needs a name of 1 to ${LOGS_NAME_MAX} characters`,
+    busy: 'a save is still on its way; wait for its answer',
+    maintenance: 'a tool update is running; the dashboards cannot be changed until it has finished',
+};
 // What is searched and what came back; openIds holds the ids of the unfolded events
 let logsState = { query: '*', earliest: '-24h', latest: '', live: false, result: null, openIds: new Set(), full: new Map() };
 let logsSeq = 0;                       // a response older than the last request is dropped
@@ -12090,6 +13003,20 @@ let logsFieldsOpen = new Set(['source']);
 let logsSources = [];
 let logsQueryError = null;
 let logsColumnsKey = '';              // the columns of the table on screen
+let logsCommandsGroup = 'SEARCH';     // the one open group of the COMMANDS card ('' for none)
+let logsView = { view: '', form: '' };  // the tab on screen and the form of its chart ('' for none)
+let logsViewKey = '';                 // type and columns the view and the form were chosen for
+let logsAsked = LOGS_PAGE;            // the limit of the request the rows on screen came from
+let logsAskedQuery = '';              // the query it brought them for: another one is no answer about its form
+let logsWantForm = '';                // a form asked for from outside (a tile opened in LOGS), for its first answer
+let logsOpenPending = false;          // its query and window are in the state already: the tab's setup keeps them
+// The save dialog: whether it is open, the dashboards of the server, the one
+// chosen ('' for a new one) and whether the tile keeps the window instead of
+// the range
+let logsSave = { open: false, dashboards: [], dashboard: '', fixed: false };
+let logsSaveWhy = '';                 // why the last save was refused ('' for nothing)
+let logsSaveBusy = false;             // a save is on its way: no second one, whatever the dialog does
+let logsSaveSeq = 0;                  // the opening a save belongs to: a later one is not its dialog
 
 // Searches whose bars a range drawn across them zooms to
 const LOGS_BARS_BRUSH = {
@@ -12259,6 +13186,21 @@ function logsPipeIndex(query) {
     return -1;
 }
 
+// The query without a pipe dangling at its end (one outside a string, so
+// `a "b |"` keeps its own): appending `| head 20` to `a |` would otherwise
+// make the invalid `a | | head 20`
+function logsTrimTrailingPipe(query) {
+    const q = String(query ?? '').trimEnd();
+    let quoted = false, last = -1;
+    for (let i = 0; i < q.length; i++) {
+        const c = q[i];
+        if (quoted && c === '\\' && q[i + 1] === '"') i++;
+        else if (c === '"') quoted = !quoted;
+        else if (c === '|' && !quoted) last = i;
+    }
+    return last === q.length - 1 ? q.slice(0, last).trimEnd() : q;
+}
+
 // A value as a string of the language: quotes escaped; one that ends in a
 // backslash would escape the closing quote, so a * stands after it
 function logsQuote(value) {
@@ -12344,17 +13286,22 @@ function renderLogsRange() {
     if (host) host.innerHTML = logsRangeHtml();
 }
 
-// One of the range buttons: the search runs again for it
-function logsSetRange(label) {
-    if (!LOGS_RANGES.includes(label)) return false;
-    logsState.earliest = label === 'All' ? '' : `-${label}`;
-    logsState.latest = '';
+// The range the tab keeps, which a zoom goes back to
+function logsRememberRange(label) {
     logsBase = label;
     try {
         localStorage.setItem(LOGS_RANGE_KEY, label);
     } catch (e) {
         // storage blocked
     }
+}
+
+// One of the range buttons: the search runs again for it
+function logsSetRange(label) {
+    if (!LOGS_RANGES.includes(label)) return false;
+    logsState.earliest = label === 'All' ? '' : `-${label}`;
+    logsState.latest = '';
+    logsRememberRange(label);
     renderLogsRange();
     runLogsSearch();
     return true;
@@ -12392,7 +13339,8 @@ async function runLogsSearch(opts) {
     const silent = !!(opts && opts.silent);
     const seq = ++logsSeq;
     const query = logsState.query.trim() ? logsState.query : '*';
-    const params = new URLSearchParams({ q: query, earliest: logsState.earliest, limit: String(logsLimit) });
+    const limit = Math.max(logsLimit, logsNextLimit(query));
+    const params = new URLSearchParams({ q: query, earliest: logsState.earliest, limit: String(limit) });
     if (logsState.latest) params.set('latest', logsState.latest);
     const results = document.getElementById('logs-results');
     if (results && !silent) results.classList.add('is-loading');
@@ -12403,21 +13351,27 @@ async function runLogsSearch(opts) {
     } catch (e) {
         if (seq !== logsSeq) return null;
         if (results) results.classList.remove('is-loading');
+        logsWantForm = '';             // no answer, so no form to put it on
         renderLogsError({ error: `The search could not be loaded: ${e && e.message ? e.message : e}` }, query);
         return null;
     }
     if (seq !== logsSeq) return null;
     if (results) results.classList.remove('is-loading');
     if (!resp.ok) {
+        logsWantForm = '';
         renderLogsError(data && data.error ? data : { error: `The search failed (HTTP ${resp.status}).` }, query);
         return null;
     }
     logsQueryError = null;
     renderLogsError(null);
     const sig = JSON.stringify([data.type, data.count, data.matched, (data.events || []).map(ev => ev && ev.id), data.rows]);
-    const same = silent && sig === logsLastSig;
+    // The same answer as the one on screen is only the summary again — unless a
+    // form is waiting for it, which only the result draws
+    const same = silent && !logsWantForm && sig === logsLastSig;
     logsLastSig = sig;
     logsState.result = data;
+    logsAsked = limit;                 // the rows on screen are the ones this limit brought
+    logsAskedQuery = query;
     if (!silent) {
         logsRemember(logsState.query);
         logsRememberLast(logsState.query);
@@ -12463,11 +13417,22 @@ function renderLogsResult(result) {
     renderLogsSources(logsSources);
 }
 
+// The result in the tab that is open: the list of events, the table of the
+// pipes, or one chart in the form that was chosen (with the line that says
+// what the chart leaves out). The form is chosen here, so the search again
+// where it needs rows the last request did not bring belongs here too: a
+// timechart typed into the box opens as a line, which wants every period.
 function renderLogsResultBody(result) {
+    const r = result || {};
+    const shape = logsSyncView(r);
+    // `logsAsked` is the limit the rows came from, so this asks once and the
+    // answer of the second request ends it, whatever the server gives
+    const short = shape.count > shape.rows || shape.truncated;
+    if (short && logsChartLimit(logsView.form) > logsAsked) runLogsSearch({ silent: true });
     const host = document.getElementById('logs-results');
     if (!host) return;
-    const r = result || {};
-    if (r.type === 'events') {
+    if (logsView.view === 'events') {
+        // No table on screen: the order of the one before it still means something
         host.innerHTML = logsEventsHtml(r.events || [], logsQueryTerms(logsState.query), r);
         return;
     }
@@ -12477,7 +13442,13 @@ function renderLogsResultBody(result) {
         delete tableSortState['logs-result'];
         logsColumnsKey = key;
     }
-    host.innerHTML = (r.type === 'timechart' ? logsTimechartHtml(r) : '') + logsTableHtml(r);
+    if (logsView.view === 'statistics') {
+        host.innerHTML = logsTableHtml(r);
+        return;
+    }
+    const chart = logsChartHtml(r, logsView.form, { width: logsWidth('logs-results') - 24, height: 220 });
+    host.innerHTML = `<div class="chart-card logs-chart-card"><div class="logs-chart">`
+        + `${chart || chartEmptyHtml('No chart for this result')}</div>${logsTruncNoteHtml(shape)}</div>`;
 }
 
 function renderLogsSummary(result) {
@@ -12671,7 +13642,9 @@ function logsEventsHtml(events, terms, result) {
             + `<span class="logs-msg">${logsHighlight(String(ev.message ?? '').slice(0, 600), terms)}</span></button>`
             + (open ? logsEventDetailHtml(ev, terms) : '') + '</div>';
     }).join('');
+    // Only while a search can bring more: a chart's 1000 rows are already the ceiling
     const more = result && Number(result.count) > events.length && logsLimit < LOGS_PAGE_MAX
+        && events.length < LOGS_PAGE_MAX
         ? `<button type="button" class="btn btn-sm logs-more" data-logs-more>Show up to ${LOGS_PAGE_MAX}</button>` : '';
     return `<div class="logs-events" role="list">${rows}</div>${more}`;
 }
@@ -12689,7 +13662,8 @@ function toggleLogsEvent(id) {
 }
 
 // A click in the list or in the field bar: an event unfolds, a value goes
-// into the search, a field shows its values, "Show up to" asks for more rows
+// into the search, a field shows its values, the line under a chart adds the
+// pipe it names, "Show up to" asks for more rows
 function onLogsClick(event) {
     const target = event && event.target && typeof event.target.closest === 'function' ? event.target : null;
     if (!target) return;
@@ -12711,6 +13685,10 @@ function onLogsClick(event) {
         toggleLogsEvent(row.getAttribute('data-logs-toggle'));
         return;
     }
+    if (target.closest('[data-logs-sort]')) {
+        logsAddSortPipe();
+        return;
+    }
     if (target.closest('[data-logs-more]')) {
         logsLimit = LOGS_PAGE_MAX;
         runLogsSearch({ silent: true });
@@ -12726,42 +13704,451 @@ function logsCellHtml(column, value) {
     return `<td title="${escapeHtml(text)}">${escapeHtml(text.length > 400 ? `${text.slice(0, 400)}…` : text)}</td>`;
 }
 
-function logsTableHtml(result) {
+// The rows as a table. `opts.sortId` is the table's sort id: every table of
+// the same id on the page takes the order of a click on one of them
+// (sortTableBy), so a tile has to bring its own — otherwise two table tiles
+// and the result of the LOGS tab would reorder each other.
+function logsTableHtml(result, opts) {
     const columns = result.columns || [], rows = result.rows || [];
     if (!columns.length) return '<div class="logs-empty">The search has no result table.</div>';
+    const sortId = (opts && opts.sortId) || 'logs-result';
     const head = columns.map(c => `<th>${escapeHtml(c)}</th>`).join('');
     const body = rows.map(row => `<tr>${columns.map((c, i) => logsCellHtml(c, row[i])).join('')}</tr>`).join('')
         || `<tr data-sort-skip><td colspan="${columns.length}" class="logs-cell-empty">No rows.</td></tr>`;
-    const more = Number(result.count) > rows.length && logsLimit < LOGS_PAGE_MAX
+    const more = Number(result.count) > rows.length && logsLimit < LOGS_PAGE_MAX && rows.length < LOGS_PAGE_MAX
         ? `<button type="button" class="btn btn-sm logs-more" data-logs-more>Show up to ${LOGS_PAGE_MAX}</button>` : '';
-    return `<div class="logs-table-wrap"><table class="logs-table" data-sortable data-sort-id="logs-result"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>${more}`;
+    return `<div class="logs-table-wrap"><table class="logs-table" data-sortable data-sort-id="${escapeHtml(sortId)}"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>${more}`;
 }
 
-// The bars of a timechart: a bar per row, the series (the first 10 and OTHER) stacked
-function logsTimechartHtml(result) {
-    const columns = result.columns || [], rows = result.rows || [];
-    if (columns[0] !== '_time' || columns.length < 2 || !rows.length) return '';
-    const starts = rows.map(row => Date.parse(row[0]));
-    if (starts.some(t => !Number.isFinite(t))) return '';
+// --- The result: the tabs, the forms and their charts ---
+// Whether column `i` of `rows` holds numbers only: a cell without a value is
+// no text, and without a single value anywhere the name decides (count,
+// percent, avg(x), sum(x), dc(x), min(x), max(x)), so an empty answer locks
+// no form.
+function logsNumberColumn(rows, i, name) {
+    let seen = false;
+    for (const row of rows) {
+        const v = Array.isArray(row) ? row[i] : undefined;
+        if (v === null || v === undefined || v === '') continue;
+        const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN;
+        if (!Number.isFinite(n)) return false;
+        seen = true;
+    }
+    return seen || LOGS_NUMBER_COLUMN.test(String(name ?? ''));
+}
+
+// What a result can carry: its type, the column of the name (0) and the first
+// column after it whose values are all numbers (`value`), the name columns
+// before that one (`labels`; a sankey needs two), and how much of the whole
+// it holds (`rows` of `count`, `truncated` when the pipes saw only the newest
+// 10,000 matches).
+function logsResultShape(result) {
+    const r = result || {};
+    const type = r.type === 'table' || r.type === 'timechart' ? r.type : 'events';
+    const columns = Array.isArray(r.columns) ? r.columns : [];
+    const rows = Array.isArray(r.rows) ? r.rows : [];
+    let value = null;
+    for (let i = 1; i < columns.length; i++) {
+        if (logsNumberColumn(rows, i, columns[i])) {
+            value = i;
+            break;
+        }
+    }
+    const label = columns.length ? 0 : null;
+    const labels = label === null ? [] : Array.from({ length: value === null ? 1 : value }, (_, i) => i);
+    return { type, label, value, labels, rows: rows.length, count: Number(r.count) || 0, truncated: !!r.truncated };
+}
+
+// The forms the columns of a result can carry, each locked one with its
+// reason: the table always, a pie and bars with one name and one number
+// column, a line only over time, a sankey with two name columns.
+function logsFormsFor(shape) {
+    const s = shape || {};
+    const named = s.label !== null && s.value !== null;
+    const out = { table: true, pie: false, bars: false, line: false, sankey: false, why: {} };
+    if (s.type === 'events') {
+        for (const form of ['pie', 'bars', 'line', 'sankey']) out.why[form] = LOGS_LOCKED.pipe;
+        return out;
+    }
+    if (s.type === 'timechart') {
+        out.line = out.bars = named;
+        if (!named) out.why.line = out.why.bars = LOGS_LOCKED.columns;
+        out.why.pie = LOGS_LOCKED.pie;
+        out.why.sankey = LOGS_LOCKED.sankey;
+        return out;
+    }
+    out.pie = out.bars = named;
+    if (!named) out.why.pie = out.why.bars = LOGS_LOCKED.columns;
+    out.why.line = LOGS_LOCKED.timechart;
+    out.sankey = named && (s.labels || []).length >= 2;
+    if (!out.sankey) out.why.sankey = LOGS_LOCKED.sankey;
+    return out;
+}
+
+// The tabs a result can use, each locked one with its reason: a search
+// without a pipe has events only, a result of the pipes has no events, and
+// VISUALIZATION needs columns that carry a chart.
+function logsViewsFor(shape) {
+    const s = shape || {};
+    const forms = logsFormsFor(s);
+    const events = s.type === 'events';
+    const drawable = LOGS_FORMS.some(form => form !== 'table' && forms[form]);
+    const why = {};
+    if (events) why.statistics = why.visualization = LOGS_LOCKED.pipe;
+    else why.events = LOGS_LOCKED.table;
+    if (!events && !drawable) why.visualization = forms.why.bars || LOGS_LOCKED.columns;
+    return { events, statistics: !events, visualization: !events && drawable, why };
+}
+
+// The tab a result opens in: the events of a search, the table of the pipes,
+// a timechart as its chart (so nothing of what was shown before hides behind a click)
+function logsViewFor(shape) {
+    const type = (shape || {}).type;
+    return type === 'timechart' ? 'visualization' : type === 'table' ? 'statistics' : 'events';
+}
+
+// The form VISUALIZATION opens with: the line of a timechart, else the first
+// form the columns carry
+function logsFormFor(shape, forms) {
+    const order = (shape || {}).type === 'timechart' ? ['line', 'bars'] : ['pie', 'bars', 'sankey'];
+    return order.find(form => forms[form]) || 'table';
+}
+
+// The rows a form asks the server for: a chart needs every group (the
+// server's ceiling), a list or a table the page that is shown
+function logsChartLimit(form) {
+    return form && form !== 'table' && LOGS_FORMS.includes(form) ? LOGS_PAGE_MAX : LOGS_PAGE;
+}
+
+// The commands of the pipes of a query: the first word behind each `|` that is
+// not inside a string, so `a "b | stats c"` is a phrase and no pipe at all
+function logsQueryPipeNames(query) {
+    const q = String(query ?? '');
+    const names = [];
+    let quoted = false;
+    for (let i = 0; i < q.length; i++) {
+        const c = q[i];
+        if (quoted && c === '\\' && q[i + 1] === '"') i++;
+        else if (c === '"') quoted = !quoted;
+        else if (c === '|' && !quoted) names.push((/^\s*([A-Za-z_]+)/.exec(q.slice(i + 1)) || ['', ''])[1].toLowerCase());
+    }
+    return names;
+}
+
+// What a query will answer, read from its text before the server says so: the
+// last command that sets the shape of the result decides, as it does in
+// log_search.py — `timechart` makes a timechart, the other table commands a
+// table, and pipes that only cut rows (`head`, `sort`, …) leave a list of events
+function logsQueryShape(query) {
+    const last = logsQueryPipeNames(query)
+        .filter(name => ['stats', 'top', 'rare', 'table', 'fields', 'timechart'].includes(name)).pop();
+    return last === 'timechart' ? 'timechart' : last ? 'table' : 'events';
+}
+
+// The rows the next search asks for. The form on screen counts for the query
+// it was chosen for — LIVE, a zoom and a second Enter keep it — while a new
+// query is read from its own pipes: a timechart opens as a line and wants
+// every period (1000), a table its page (200). A tile opened in LOGS brings
+// its form with it. Where the guess is too low, the render path asks again.
+function logsNextLimit(query) {
+    const q = String(query ?? '');
+    if (logsWantForm) return logsChartLimit(logsWantForm);
+    if (q === logsAskedQuery) return logsChartLimit(logsView.form);
+    return logsQueryShape(q) === 'timechart' ? LOGS_PAGE_MAX : LOGS_PAGE;
+}
+
+// The tab and the form that fit this result, before it is drawn: the chosen
+// ones hold while type and columns stay the same, a tab that becomes
+// unusable falls back to the first usable one, and other columns open their
+// own default again. Returns the shape, which the caller draws from.
+function logsSyncView(result) {
+    const shape = logsResultShape(result);
+    const views = logsViewsFor(shape), forms = logsFormsFor(shape);
+    const columns = result && Array.isArray(result.columns) ? result.columns : [];
+    // A timechart carries the same forms whatever its series, and LIVE brings a
+    // series more or less with every tick: its key must not hold their names
+    const key = shape.type === 'timechart' ? JSON.stringify(['timechart', columns[0] ?? null])
+        : JSON.stringify([shape.type, columns]);
+    const same = key === logsViewKey;
+    logsViewKey = key;
+    // A form asked for from outside (a tile opened in LOGS, the click on the
+    // warning line) counts for this one answer and only where its columns
+    // carry it; afterwards the chosen form holds as any other does
+    const want = logsWantForm;
+    logsWantForm = '';
+    const wanted = want && forms[want] ? want : '';
+    let view = wanted ? (wanted === 'table' ? 'statistics' : 'visualization')
+        : same && views[logsView.view] ? logsView.view : logsViewFor(shape);
+    if (!views[view]) view = LOGS_VIEWS.find(name => views[name]) || 'events';
+    const held = same && logsView.form && logsView.form !== 'table' && forms[logsView.form];
+    const form = view === 'events' ? '' : view === 'statistics' ? 'table'
+        : wanted || (held ? logsView.form : logsFormFor(shape, forms));
+    logsView = { view, form };
+    renderLogsTabs(shape);
+    return shape;
+}
+
+// The tab row and the form switches: the chosen one marked, every one the
+// result cannot use aria-disabled with its reason in the title. The switches
+// are hidden where there is no form at all (a search without a pipe).
+function renderLogsTabs(shape) {
+    const views = logsViewsFor(shape), forms = logsFormsFor(shape);
+    const set = (el, mark, on, ok, hint, why) => {
+        if (!el) return;
+        el.setAttribute(mark, String(ok && on));
+        el.setAttribute('aria-disabled', String(!ok));
+        el.setAttribute('title', ok ? hint : why || LOGS_LOCKED.pipe);
+    };
+    for (const name of LOGS_VIEWS) {
+        set(document.getElementById(`logs-tab-${name}`), 'aria-selected', name === logsView.view,
+            !!views[name], LOGS_VIEW_HINTS[name], views.why[name]);
+    }
+    const host = document.getElementById('logs-forms');
+    if (host) host.hidden = !views.statistics && !views.visualization;
+    for (const name of LOGS_FORMS) {
+        const ok = !!forms[name] && (name === 'table' ? views.statistics : views.visualization);
+        set(document.getElementById(`logs-form-${name}`), 'aria-pressed', name === logsView.form,
+            ok, LOGS_FORM_HINTS[name], forms.why[name]);
+    }
+    // SAVE can only put a form on a dashboard: without one (a search without a
+    // pipe) it is locked and names the reason, like a tab or a form switch
+    const save = document.getElementById('logs-save-btn');
+    if (save) {
+        save.setAttribute('aria-disabled', String(!logsView.form));
+        save.setAttribute('title', logsView.form ? LOGS_SAVE_HINT : LOGS_LOCKED.pipe);
+    }
+}
+
+// One of the three tabs: the form follows it (the table in STATISTICS, the
+// chart that was chosen last or the default in VISUALIZATION)
+function setLogsView(view) {
+    const shape = logsResultShape(logsState.result);
+    const views = logsViewsFor(shape);
+    if (!views[view]) return false;
+    const forms = logsFormsFor(shape);
+    const held = logsView.form && logsView.form !== 'table' && forms[logsView.form];
+    const form = view === 'events' ? '' : view === 'statistics' ? 'table'
+        : held ? logsView.form : logsFormFor(shape, forms);
+    return logsShowView(view, form);
+}
+
+// One of the form switches: the table stands in STATISTICS, every chart in VISUALIZATION
+function setLogsForm(form) {
+    const shape = logsResultShape(logsState.result);
+    const view = form === 'table' ? 'statistics' : 'visualization';
+    if (!LOGS_FORMS.includes(form) || !logsFormsFor(shape)[form] || !logsViewsFor(shape)[view]) return false;
+    return logsShowView(view, form);
+}
+
+// The tab and the form on screen: the result again, which renderLogsResultBody
+// draws — and which asks for more rows where the new form needs them (a result
+// that holds every group already draws exactly, and going back to the table
+// keeps the rows that are there; the next search asks for 200 again)
+function logsShowView(view, form) {
+    logsView = { view, form };
+    renderLogsResultBody(logsState.result);
+    return true;
+}
+
+// The line under a chart that stands for less than the whole: how many groups
+// of how many it shows, and the pipe that cuts the search down to the largest
+// ones, which a click adds (`query`, the search the result came from, defaults
+// to the one of the tab). It is plain text where that pipe would not help: a
+// timechart has no groups to sort and no count to sort by, and a search that
+// already ends in the pipe would only run again.
+function logsTruncNoteHtml(shape, query) {
+    const s = shape || {};
+    if (s.type !== 'table' && s.type !== 'timechart') return '';
+    const rows = Number(s.rows) || 0, count = Number(s.count) || 0;
+    const more = count > rows;
+    if (!more && !s.truncated) return '';
+    const what = s.type === 'timechart' ? 'periods' : 'groups';
+    const text = more ? `only ${logsNumber(rows)} of ${logsNumber(count)} ${what} shown`
+        : 'only the newest 10,000 matches went into the pipes';
+    const head = logsTrimTrailingPipe(query === undefined ? logsState.query : query);
+    if (s.type === 'timechart' || head.endsWith(LOGS_SORT_PIPE)) {
+        return `<div class="logs-trunc">${escapeHtml(text)}</div>`;
+    }
+    return `<button type="button" class="logs-trunc" data-logs-sort title="Add ${LOGS_SORT_PIPE} to the search and run it">`
+        + `${escapeHtml(text)} &mdash; add <code>${escapeHtml(LOGS_SORT_PIPE)}</code></button>`;
+}
+
+// The warning line was clicked: the query keeps its search and gets the pipe
+// that leaves the twenty largest groups, and it runs. The picture on screen is
+// what the click is for, so the search asks for its rows and it stays.
+function logsAddSortPipe() {
+    const head = logsTrimTrailingPipe(logsCurrentQuery()) || '*';
+    const query = head.endsWith(LOGS_SORT_PIPE) ? head : `${head} ${LOGS_SORT_PIPE}`;
+    logsSetQuery(query);
+    logsWantForm = logsView.form;
+    submitLogsSearch();
+    return true;
+}
+
+// The name of a group as text: a value the server did not give is "(none)",
+// a value longer than a tooltip can show is cut (a log value can be 64 KB)
+function logsChartName(value) {
+    const text = logsFieldText(value);
+    return text === '' ? '(none)' : _chartEllipsis(text, LOGS_CHART_NAME_MAX);
+}
+
+// The groups of a table result as items of a pie or of bars: the name column
+// and the number column, equal names added up, the largest first, the twelve
+// largest on their own and the rest as "other" (topWithOther, which keeps a
+// thirteenth group rather than hiding a single one behind "other").
+function logsChartGroups(result, shape) {
+    const r = result || {}, s = shape || logsResultShape(r);
+    if (s.label === null || s.value === null) return [];
+    const sums = new Map();
+    for (const row of Array.isArray(r.rows) ? r.rows : []) {
+        if (!Array.isArray(row)) continue;
+        const n = Number(row[s.value]);
+        if (!Number.isFinite(n)) continue;
+        const name = logsChartName(row[s.label]);
+        sums.set(name, (sums.get(name) || 0) + n);
+    }
+    const counts = [...sums].map(([key, count]) => ({ key, count })).sort((a, b) => b.count - a.count);
+    const { keep } = topWithOther(counts, LOGS_CHART_TOP, LOGS_CHART_OTHER);
+    const items = counts.filter(c => keep.has(c.key)).map(c => ({ key: c.key, label: c.key, value: c.count }));
+    const rest = counts.filter(c => !keep.has(c.key)).reduce((sum, c) => sum + c.count, 0);
+    if (rest > 0) items.push({ key: LOGS_CHART_OTHER, label: LOGS_CHART_OTHER, value: rest });
+    return items;
+}
+
+// The two name columns and the number column of a table result as a flow for
+// layoutSankey: per side the twelve largest names on their own and the rest
+// as "other", the rows as the bands. An id carries its side ("0:<name>"), so
+// the same name on both sides stays two nodes.
+function logsSankeyData(result, shape) {
+    const r = result || {}, s = shape || logsResultShape(r);
+    const at = [(s.labels || [])[0], (s.labels || [])[1]];
+    const empty = { columns: [[], []], links: [], labels: {} };
+    if (at[0] === undefined || at[1] === undefined || s.value === null) return empty;
+    const pairs = [];
+    for (const row of Array.isArray(r.rows) ? r.rows : []) {
+        if (!Array.isArray(row)) continue;
+        const n = Number(row[s.value]);
+        if (!(n > 0) || !Number.isFinite(n)) continue;
+        pairs.push([logsChartName(row[at[0]]), logsChartName(row[at[1]]), n]);
+    }
+    const sides = [0, 1].map(side => {
+        const sums = new Map();
+        for (const pair of pairs) sums.set(pair[side], (sums.get(pair[side]) || 0) + pair[2]);
+        const counts = [...sums].map(([key, count]) => ({ key, count })).sort((a, b) => b.count - a.count);
+        const { label } = topWithOther(counts, LOGS_CHART_TOP, LOGS_CHART_OTHER);
+        return { label, order: counts.map(c => label(c.key)) };
+    });
+    const labels = Object.create(null);
+    const columns = sides.map(({ order }, side) => {
+        const ids = [];
+        for (const name of order) {
+            const id = `${side}:${name}`;
+            if (!ids.includes(id)) {
+                ids.push(id);
+                labels[id] = name;
+            }
+        }
+        return ids;
+    });
+    // layoutSankey adds up the rows that run between the same two nodes
+    const links = pairs.map(pair => ({ source: `0:${sides[0].label(pair[0])}`,
+        target: `1:${sides[1].label(pair[1])}`, value: pair[2] }));
+    return { columns, links, labels };
+}
+
+// The rows of a timechart as bins for stackedBarsSvg: a bin per row, the
+// series in the order of the columns (so a series keeps the colour of its
+// line and of its legend row), the length of a bucket from the times (the
+// span of the histogram where there is only one row)
+function logsChartBins(result) {
+    const r = result || {};
+    const columns = Array.isArray(r.columns) ? r.columns : [], rows = Array.isArray(r.rows) ? r.rows : [];
+    const keys = [...new Set(columns.slice(1).map(logsChartName))];
+    const none = { bins: [], keys, step: 0, unit: 'hour' };
+    if (columns[0] !== '_time' || !keys.length || !rows.length) return none;
+    const starts = rows.map(row => Date.parse(Array.isArray(row) ? row[0] : null));
+    if (starts.some(t => !Number.isFinite(t))) return none;
     const gaps = starts.slice(1).map((t, i) => t - starts[i]).filter(d => d > 0);
-    const step = gaps.length ? Math.min(...gaps) : (Number(result.histogram && result.histogram.span_s) || 60) * 1000;
-    const series = columns.slice(1);
+    const step = gaps.length ? Math.min(...gaps) : (Number(r.histogram && r.histogram.span_s) || 60) * 1000;
     const bins = rows.map((row, i) => {
         const counts = Object.create(null);
         let total = 0;
-        series.forEach((name, j) => {
-            const n = Number(row[j + 1]) || 0;
-            counts[name] = n;
+        columns.slice(1).forEach((name, j) => {
+            const key = logsChartName(name), n = Number(Array.isArray(row) ? row[j + 1] : 0) || 0;
+            counts[key] = (counts[key] || 0) + n;
             total += n;
         });
         return { start: starts[i], end: starts[i] + step, counts, total };
     });
-    const stack = series.slice().reverse();
-    const svg = stackedBarsSvg(bins, { width: logsWidth('logs-results') - 2, height: 150, keys: stack,
-        unit: logsBinUnit(step), step });
-    if (!svg) return '';
-    const legend = series.map(name => `<span class="logs-legend-item"><span class="logs-legend-swatch" style="background:${_chartColor(undefined, stack.indexOf(name))}"></span>${escapeHtml(name)}</span>`).join('');
-    return `<div class="chart-card logs-timechart"><div class="chart-card-head"><h3 class="chart-card-title">TIMECHART</h3></div>${svg}<div class="logs-legend">${legend}</div></div>`;
+    return { bins, keys, step, unit: logsBinUnit(step) };
+}
+
+// The series of a timechart as lines for lineSvg, in the order of the columns
+function logsChartSeries(result) {
+    const r = result || {};
+    const columns = Array.isArray(r.columns) ? r.columns : [], rows = Array.isArray(r.rows) ? r.rows : [];
+    return columns.slice(1).map((name, c) => ({
+        key: logsChartName(name), label: logsChartName(name),
+        points: rows.map(row => (Array.isArray(row) ? [Date.parse(row[0]), row[c + 1]] : [NaN, NaN])),
+    }));
+}
+
+// The legend of a timechart: a chip per series in its colour, with its total
+function logsSeriesLegendHtml(keys, bins) {
+    const rows = keys.map((name, i) => {
+        const total = bins.reduce((sum, bin) => sum + (Number(bin.counts[name]) || 0), 0);
+        return `<span class="logs-legend-item" title="${escapeHtml(name)}">`
+            + `<span class="logs-legend-swatch" style="background:${_chartColor(undefined, i)}"></span>`
+            + `${escapeHtml(name)} <span class="logs-legend-count">${logsNumber(total)}</span></span>`;
+    }).join('');
+    return rows ? `<div class="logs-legend">${rows}</div>` : '';
+}
+
+// The bars of a timechart: a bar per row, the series of the columns stacked
+function logsTimechartHtml(result, opts) {
+    const o = opts || {};
+    const { bins, keys, step, unit } = logsChartBins(result);
+    if (!bins.length) return '';
+    const svg = stackedBarsSvg(bins, { width: o.width > 0 ? Number(o.width) : 720,
+        height: o.height > 0 ? Number(o.height) : 220, keys, unit, step });
+    return svg ? svg + logsSeriesLegendHtml(keys, bins) : '';
+}
+
+// The result as one chart in the form that was chosen: pure, and '' where the
+// form does not fit the result (so a caller can fall back to another one).
+// Where the form fits but there is nothing to draw, the hint of an empty
+// chart stands in the chart's place. opts {width, height} is the room it has.
+function logsChartHtml(result, form, opts) {
+    const o = opts || {}, r = result || {};
+    const shape = logsResultShape(r);
+    if (!LOGS_FORMS.includes(form) || form === 'table' || !logsFormsFor(shape)[form]) return '';
+    const width = o.width > 0 ? Math.floor(Number(o.width)) : 720;
+    const height = o.height > 0 ? Math.floor(Number(o.height)) : 220;
+    // A query that simply matched nothing, whatever the form: the words of the
+    // spec, which the timechart has always used
+    const empty = chartEmptyHtml('No events in this range');
+    if (shape.type === 'timechart') {
+        if (form === 'bars') return logsTimechartHtml(r, { width, height }) || empty;
+        const { bins, keys, step, unit } = logsChartBins(r);
+        const svg = lineSvg(logsChartSeries(r), { width, height, unit, step });
+        return svg ? svg + logsSeriesLegendHtml(keys, bins) : empty;
+    }
+    const items = logsChartGroups(r, shape);
+    if (form === 'sankey') {
+        const flow = logsSankeyData(r, shape);
+        // A sankey of two columns reads better narrow than drawn out over a wide card
+        const layout = layoutSankey(flow.columns, flow.links, { width: Math.min(width, 900), height });
+        return sankeySvg(layout, { labels: flow.labels }) || empty;
+    }
+    const legend = chartLegendHtml(items);
+    if (form === 'pie') {
+        const svg = pieSvg(items, { size: Math.max(Math.min(height, width), 80) });
+        return svg ? `<div class="chart-split">${svg}${legend}</div>` : empty;
+    }
+    // The bars leave the room of the legend beside them
+    const bars = verdictBarsSvg(items.map(item => ({ key: item.key, y: item.value,
+        title: `${item.label}: ${logsNumber(item.value)}` })), { width: Math.max(width - 340, 160), height });
+    return bars ? `<div class="chart-split">${bars}${legend}</div>` : empty;
 }
 
 // --- Sources ---
@@ -12819,6 +14206,132 @@ function onLogsMenuClick(event) {
     submitLogsSearch();
 }
 
+// --- The COMMANDS card ---
+// The language of the search box, drawn from LOGS_COMMANDS: every group with
+// its rows, one group open at a time (the others are folded away by CSS), and
+// every row a button that carries its command in data attributes (no inline
+// handler, so no command can break out of one).
+function logsCommandsHtml() {
+    return LOGS_COMMANDS.map(group => {
+        const open = group.group === logsCommandsGroup;
+        const rows = group.items.map(item => `<li><button type="button" class="logs-cmd" data-logs-cmd="${escapeHtml(item.text)}" data-logs-kind="${escapeHtml(item.kind)}">`
+            + `<code class="logs-cmd-text">${escapeHtml(item.text)}</code><span class="logs-cmd-hint">${escapeHtml(item.hint)}</span></button></li>`).join('');
+        return `<div class="logs-cmd-group${open ? ' is-open' : ''}">`
+            + `<button type="button" class="logs-cmd-head" data-logs-cmd-head="${escapeHtml(group.group)}" aria-expanded="${open}">`
+            + `<span class="logs-caret" aria-hidden="true"></span><span class="logs-cmd-group-name">${escapeHtml(group.group)}</span>`
+            + `<span class="logs-cmd-count">${group.items.length}</span></button>`
+            + `<ul class="logs-cmd-list">${rows}</ul></div>`;
+    }).join('');
+}
+
+function renderLogsCommands() {
+    const host = document.getElementById('logs-commands-list');
+    if (host) host.innerHTML = logsCommandsHtml();
+}
+
+// Was the card open last time? A window too narrow for the column starts closed
+function logsCommandsOpen() {
+    try {
+        const stored = localStorage.getItem(LOGS_COMMANDS_KEY);
+        if (stored === '1') return true;
+        if (stored === '0') return false;
+    } catch (e) {
+        // storage blocked
+    }
+    const width = typeof window !== 'undefined' ? window.innerWidth : 0;
+    return !(width && width < LOGS_COMMANDS_WIDE);
+}
+
+function logsRememberCommands(open) {
+    try {
+        localStorage.setItem(LOGS_COMMANDS_KEY, open ? '1' : '0');
+    } catch (e) {
+        // storage blocked: the card opens as it did
+    }
+    return !!open;
+}
+
+// The ? button and the card's own head: the card open or shut. Shut, the card
+// keeps its head — one line that says what it is and opens it again. `remember`
+// false sets the state without storing it, for the first draw of the tab.
+function toggleLogsCommands(force, remember) {
+    const card = document.getElementById('logs-commands');
+    if (!card) return false;
+    const open = typeof force === 'boolean' ? force : card.classList.contains('is-shut');
+    if (open) renderLogsCommands();
+    if (open) card.classList.remove('is-shut');
+    else card.classList.add('is-shut');
+    for (const id of ['logs-syntax', 'logs-commands-toggle']) {
+        document.getElementById(id)?.setAttribute('aria-expanded', String(open));
+    }
+    if (remember !== false) logsRememberCommands(open);
+    return open;
+}
+
+// A group head: that group open and every other shut, the open one again shuts it
+function toggleLogsCommandGroup(name) {
+    const group = LOGS_COMMANDS.some(g => g.group === name) && name !== logsCommandsGroup ? name : '';
+    logsCommandsGroup = group;
+    try {
+        localStorage.setItem(LOGS_COMMANDS_GROUP_KEY, group);
+    } catch (e) {
+        // storage blocked: the group opens as it did
+    }
+    renderLogsCommands();
+    return group;
+}
+
+// A command of the card into the query: it is added, never substituted, and
+// the search does not run — a pipe or a term usually needs a field name first
+function logsInsertCommand(text, kind) {
+    const command = String(text ?? '');
+    if (!command.trim()) return false;
+    if (kind === 'source') return logsAddSource(command.replace(/^\s*source\s*=\s*/i, ''));
+    const query = logsCurrentQuery();
+    if (kind === 'pipe') {
+        const head = logsTrimTrailingPipe(query) || '*';
+        logsSetQuery(`${head} ${command}`);
+        logsFocusQuery(head.length + 1 + command.length);
+        return true;
+    }
+    if (kind === 'term') {
+        const cut = logsPipeIndex(query);
+        const before = (cut < 0 ? query : query.slice(0, cut)).trim();
+        logsSetQuery(logsInsertTerm(query, command));
+        logsFocusQuery((before === '' || before === '*' ? 0 : before.length + 1) + command.length);
+        return true;
+    }
+    return false;
+}
+
+// The caret in the search box at `at`, so the next keystroke lands behind the
+// command that was just put in
+function logsFocusQuery(at) {
+    const input = document.getElementById('logs-query');
+    if (!input) return;
+    if (typeof input.focus === 'function') input.focus();
+    if (typeof input.setSelectionRange === 'function') input.setSelectionRange(at, at);
+    renderLogsQueryHighlight();
+}
+
+function onLogsCommandsClick(event) {
+    const target = event && event.target && typeof event.target.closest === 'function' ? event.target : null;
+    if (!target) return;
+    const group = target.closest('[data-logs-cmd-head]');
+    if (group) {
+        toggleLogsCommandGroup(group.getAttribute('data-logs-cmd-head'));
+        return;
+    }
+    const row = target.closest('[data-logs-cmd]');
+    if (row) {
+        logsInsertCommand(row.getAttribute('data-logs-cmd'), row.getAttribute('data-logs-kind'));
+        return;
+    }
+    // The head of the card: the second way to open and shut it (the (i) button
+    // inside it stops its own click before it gets here)
+    if (target.closest('[data-logs-cmd-card]')) toggleLogsCommands();
+}
+
 // --- Live ---
 function toggleLogsLive() {
     logsState.live = !logsState.live;
@@ -12842,6 +14355,440 @@ function logsLiveTick() {
     return true;
 }
 
+// --- SAVE: the result as a tile on one of the own dashboards ---
+// The tile keeps the query, the form on screen and a range; the server
+// (webui/dashboards.py) keeps the dashboards and checks every value again.
+// SAVE is locked while the result has no form, which is exactly a search
+// without a pipe: a raw list of events never becomes a tile.
+
+// The name a tile starts with: the fields the query groups by, else the field
+// of `top`/`rare`, else the first word of the search, and a word for a result
+// over time. Control characters (which the store refuses) become blanks, and
+// the name is cut to 60 characters. The analyst can write over it.
+function logsSaveName(query, shape) {
+    const q = String(query ?? '').replace(/[\x00-\x1f\x7f]+/g, ' ');
+    const cut = logsPipeIndex(q);
+    // A field name is a word or a string, commas and pipes separate them
+    const tokens = text => text.match(/"(?:\\"|[^"])*"?|[^\s,|]+|\|/g) || [];
+    const bare = token => (token.startsWith('"') ? token.slice(1).replace(/"$/, '').replace(/\\"/g, '"') : token)
+        .replace(/"/g, '');
+    let pick = [], taking = '', command = false;
+    for (const token of tokens(cut < 0 ? '' : q.slice(cut))) {
+        if (token === '|') {
+            command = true;
+            taking = '';
+            continue;
+        }
+        const word = token.toLowerCase();
+        // `top` and `rare` carry their field, `by` the fields of a grouping;
+        // the last of them is the one the columns on screen came from
+        if (command && (word === 'top' || word === 'rare')) {
+            command = false;
+            taking = 'top';
+            pick = [];
+            continue;
+        }
+        command = false;
+        if (word === 'by') {
+            taking = 'by';
+            pick = [];
+        } else if (taking === 'by') {
+            pick.push(bare(token));
+        } else if (taking === 'top' && !(pick.length === 0 && /^\d+$/.test(token))) {
+            pick = [bare(token)];
+            taking = '';
+        }
+    }
+    let name = pick.join(', ').trim();
+    if (!name) {
+        const head = tokens(cut < 0 ? q : q.slice(0, cut));
+        name = head.length ? bare(head[0]) : '';
+    }
+    name = name.replace(/\s+/g, ' ').trim();
+    if ((shape || {}).type === 'timechart' && name && `${name} over time`.length <= LOGS_NAME_MAX) {
+        name = `${name} over time`;
+    }
+    return name.slice(0, LOGS_NAME_MAX).trim();
+}
+
+// The two ranges a tile can keep: the range of the tab, which moves with the
+// clock (`relative` is null for a window the tab is zoomed into — there is no
+// range to keep then), and the window on screen, frozen in UTC.
+function logsSaveRanges() {
+    const label = logsRangeLabel(logsState.earliest, logsState.latest);
+    const now = Date.now();
+    const span = /^-(\d+)([mhd])$/.exec(logsState.earliest || '');
+    const from = span ? now - Number(span[1]) * LOGS_RANGE_MS[span[2]] : Date.parse(logsState.earliest);
+    const to = logsState.latest ? Date.parse(logsState.latest) : now;
+    const fixed = {
+        earliest: Number.isFinite(from) ? logsIso(from) : '',
+        latest: Number.isFinite(to) ? logsIso(to) : '',
+        label: chartRangeLabel(from, to) || 'everything',
+    };
+    const count = /^(\d+)([mhd])$/.exec(label || '');
+    const relative = !label ? null : {
+        earliest: logsState.earliest,
+        latest: '',
+        label: count ? `last ${count[1]} ${LOGS_RANGE_UNITS[count[2]]}` : 'all time',
+    };
+    return { relative, fixed };
+}
+
+// The tiles a dashboard of the server holds
+function logsSaveTiles(dashboard) {
+    return dashboard && Array.isArray(dashboard.panels) ? dashboard.panels.length : 0;
+}
+
+// The dashboard a tile goes on by default: the first one that still has room,
+// else a new one
+function logsSavePickDefault(list) {
+    const open = (Array.isArray(list) ? list : []).find(d => d && logsSaveTiles(d) < LOGS_TILE_MAX);
+    return open ? String(open.id) : '';
+}
+
+// The name a new dashboard starts with, so the first one is one click away
+function logsSaveBoardName(list) {
+    return `Dashboard ${(Array.isArray(list) ? list.length : 0) + 1}`;
+}
+
+// The fields of the dialog: the name, the dashboards as a row of switches with
+// "+ New" and its own name field, the form that is on screen and the range the
+// tile keeps. `pick` is the id of the chosen dashboard, '' for a new one; a
+// dashboard with twelve tiles and "+ New" beyond ten dashboards are locked
+// with their reason, the caps of the store.
+function logsSaveHtml(dashboards, pick) {
+    const list = (Array.isArray(dashboards) ? dashboards : []).filter(d => d && typeof d.id === 'string');
+    const fresh = !list.some(d => d.id === pick);
+    const ranges = logsSaveRanges();
+    const fixed = logsSave.fixed || !ranges.relative;
+    const switches = list.map(d => {
+        const tiles = logsSaveTiles(d), full = tiles >= LOGS_TILE_MAX;
+        return `<button type="button" class="logs-save-pick" data-logs-dash="${escapeHtml(d.id)}"`
+            + ` aria-pressed="${!fresh && d.id === pick}" aria-disabled="${full}"`
+            + ` title="${escapeHtml(full ? LOGS_SAVE_LOCKED.tiles : `${tiles} of ${LOGS_TILE_MAX} tiles`)}"`
+            + ` onclick="logsSavePick(${jsArg(d.id)})">${escapeHtml(d.name)}</button>`;
+    }).join('');
+    const room = list.length < LOGS_DASH_MAX;
+    const newPick = `<button type="button" class="logs-save-pick" data-logs-dash=""`
+        + ` aria-pressed="${fresh}" aria-disabled="${!room}"`
+        + ` title="${escapeHtml(room ? 'A new dashboard for this tile' : LOGS_SAVE_LOCKED.dashboards)}"`
+        + ` onclick="logsSavePick(&quot;&quot;)">${escapeHtml(LOGS_SAVE_WORD)}</button>`;
+    const relative = !ranges.relative ? '' : `<button type="button" class="logs-save-pick" data-logs-range="relative"`
+        + ` aria-pressed="${!fixed}" aria-disabled="false"`
+        + ` title="The range of the tab: the tile moves with the clock"`
+        + ` onclick="logsSaveFixed(false)">${escapeHtml(ranges.relative.label)}</button>`;
+    const frozen = `<button type="button" class="logs-save-pick" data-logs-range="fixed"`
+        + ` aria-pressed="${fixed}" aria-disabled="false"`
+        + ` title="${escapeHtml(`${ranges.fixed.earliest || 'the oldest event'} to ${ranges.fixed.latest || 'now'}`)}"`
+        + ` onclick="logsSaveFixed(true)">${escapeHtml(ranges.fixed.label)}</button>`;
+    return `<label class="logs-save-field" for="logs-save-name"><span class="logs-save-label">NAME</span>`
+        + `<input type="text" class="filter-input logs-save-input" id="logs-save-name" maxlength="${LOGS_NAME_MAX}"`
+        + ` autocomplete="off" spellcheck="false"`
+        + ` value="${escapeHtml(logsSaveName(logsState.query, logsResultShape(logsState.result)))}"></label>`
+        + `<div class="logs-save-field"><span class="logs-save-label">DASHBOARD</span>`
+        + `<div class="logs-save-picks" role="group" aria-label="Dashboard">${switches}${newPick}</div>`
+        + `<input type="text" class="filter-input logs-save-input" id="logs-save-new" maxlength="${LOGS_NAME_MAX}"`
+        + ` autocomplete="off" spellcheck="false" aria-label="Name of the new dashboard"`
+        + ` placeholder="Name of the new dashboard" value="${escapeHtml(logsSaveBoardName(list))}"`
+        + `${fresh ? '' : ' hidden'}></div>`
+        + `<div class="logs-save-field"><span class="logs-save-label">FORM</span>`
+        + `<span class="logs-save-form">${escapeHtml(String(logsView.form || '').toUpperCase())}</span></div>`
+        + `<div class="logs-save-field"><span class="logs-save-label">RANGE</span>`
+        + `<div class="logs-save-picks" role="group" aria-label="Time range">${relative}${frozen}</div></div>`
+        + `<div class="logs-save-error" id="logs-save-error" role="alert" hidden></div>`
+        + `<div class="logs-save-actions">`
+        + `<button type="button" class="btn btn-sm" onclick="closeLogsSave()">CANCEL</button>`
+        + `<button type="button" class="btn btn-sm btn-primary" id="logs-save-go" onclick="submitLogsSave()">SAVE</button>`
+        + `</div>`;
+}
+
+// Why the last save was refused, in the dialog itself: it stays open, so the
+// analyst can pick another dashboard or another name instead of starting again
+function renderLogsSaveError(text) {
+    logsSaveWhy = String(text ?? '');
+    const line = document.getElementById('logs-save-error');
+    if (line) {
+        line.innerHTML = escapeHtml(logsSaveWhy);
+        line.hidden = !logsSaveWhy;
+    }
+    return !!logsSaveWhy;
+}
+
+// The fields of the dialog again. `prefill` starts them from the query (a
+// fresh dialog); without it the two names stay as they were typed, which is
+// what a click on another dashboard or on a range must not throw away.
+function renderLogsSave(prefill) {
+    const body = document.getElementById('logs-save-body');
+    if (!body) return false;
+    const typed = document.getElementById('logs-save-name'), board = document.getElementById('logs-save-new');
+    const keep = prefill ? null : { name: typed ? typed.value : '', fresh: board ? board.value : '' };
+    // Writing the body takes the fields off the page, and a browser leaves the
+    // focus on the body then: whichever field had it gets it back, with its
+    // caret, or what is typed after the list of dashboards arrived falls out of
+    // the dialog. A switch that was pressed is followed by logsSaveFocusPick.
+    const had = document.activeElement;
+    const hadId = had && LOGS_SAVE_FOCUS.includes(had.id) ? had.id : '';
+    const caret = hadId ? [had.selectionStart, had.selectionEnd] : null;
+    body.innerHTML = logsSaveHtml(logsSave.dashboards, logsSave.dashboard);
+    const name = document.getElementById('logs-save-name'), fresh = document.getElementById('logs-save-new');
+    if (name) name.value = keep ? keep.name : logsSaveName(logsState.query, logsResultShape(logsState.result));
+    if (fresh) fresh.value = keep ? keep.fresh : logsSaveBoardName(logsSave.dashboards);
+    // A save of an earlier opening may still be on its way: then this SAVE is
+    // no more pressable than the one that started it
+    const go = document.getElementById('logs-save-go');
+    if (go) go.disabled = logsSaveBusy;
+    renderLogsSaveError(logsSaveWhy);
+    const back = hadId ? document.getElementById(hadId) : null;
+    if (back) {
+        back.focus();
+        if (caret && caret[0] != null && typeof back.setSelectionRange === 'function') {
+            back.setSelectionRange(caret[0], caret[1] == null ? caret[0] : caret[1]);
+        }
+    }
+    return true;
+}
+
+// The switch that was pressed is another element after the re-render: the
+// focus follows it, so Tab goes on from there and a reader hears the change
+function logsSaveFocusPick(attr, value) {
+    const body = document.getElementById('logs-save-body');
+    const list = body && typeof body.querySelectorAll === 'function'
+        ? Array.from(body.querySelectorAll(`[${attr}]`)) : [];
+    const pick = list.find(el => el && el.getAttribute(attr) === String(value ?? ''));
+    if (pick && typeof pick.focus === 'function') pick.focus();
+    return !!pick;
+}
+
+// SAVE in the tab row: the dialog over the result, the focus in the name
+// field. Nothing opens while the result has no form (a search without a pipe).
+function openLogsSave() {
+    const modal = document.getElementById('logs-save');
+    if (!modal || !logsView.form) return false;
+    logsSave.open = true;
+    logsSave.fixed = !logsSaveRanges().relative;
+    logsSaveWhy = '';
+    logsSaveSeq++;
+    // logsSaveBusy belongs to the request, not to the dialog: a save that is
+    // still on its way keeps SAVE locked here too, or it would write twice
+    renderLogsSave(true);
+    modal.classList.remove('hidden');
+    // The name is a suggestion: it is selected, so typing writes a name of
+    // one's own instead of growing the prefilled one from its first character.
+    const name = document.getElementById('logs-save-name');
+    name?.focus();
+    name?.setSelectionRange(0, (name.value || '').length);
+    logsSaveDashboards();
+    return true;
+}
+
+// The dialog is done with: its fields go, so the next opening starts from the
+// search that is on screen then, and the focus goes back to SAVE. A save that
+// is on its way keeps running — the server cannot be called back — but its
+// answer finds another opening (logsSaveSeq) and so changes nothing here.
+function closeLogsSave() {
+    logsSave.open = false;
+    logsSaveWhy = '';
+    logsSaveSeq++;
+    const modal = document.getElementById('logs-save');
+    if (modal) modal.classList.add('hidden');
+    const body = document.getElementById('logs-save-body');
+    if (body) body.innerHTML = '';
+    const inside = modal && document.activeElement && typeof modal.contains === 'function'
+        && modal.contains(document.activeElement);
+    if (inside) document.getElementById('logs-save-btn')?.focus();
+    return true;
+}
+
+// The dashboards of the server, once per opening: the list of the dialog. The
+// chosen one holds while it is there and has room, else the default takes
+// over. A list that could not be read is no list — only "+ New" is left
+// beside the reason, so what is on screen says what is known.
+async function logsSaveDashboards() {
+    let list = null, why = '';
+    try {
+        const resp = await fetch('/api/dashboards');
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok) list = Array.isArray(data && data.dashboards) ? data.dashboards : [];
+        else why = logsSaveMessage(resp.status, data);
+    } catch (e) {
+        why = `the dashboards could not be read: ${e.message}`;
+    }
+    logsSave.dashboards = list || [];
+    const chosen = logsSave.dashboards.find(d => d && d.id === logsSave.dashboard);
+    if (!chosen || logsSaveTiles(chosen) >= LOGS_TILE_MAX) {
+        logsSave.dashboard = logsSavePickDefault(logsSave.dashboards);
+    }
+    // A reason of its own only; one that stands already (a refused save) holds
+    if (why) renderLogsSaveError(why);
+    if (logsSave.open) renderLogsSave();
+    return !why;
+}
+
+// One of the dashboard switches, '' for a new one: a full dashboard and a new
+// one beyond the tenth cannot be chosen (the switch says so in its title)
+function logsSavePick(id) {
+    const want = String(id ?? '');
+    const board = logsSave.dashboards.find(d => d && d.id === want);
+    if (want === '' ? logsSave.dashboards.length >= LOGS_DASH_MAX
+        : !board || logsSaveTiles(board) >= LOGS_TILE_MAX) return false;
+    logsSave.dashboard = want;
+    logsSaveWhy = '';
+    renderLogsSave();
+    logsSaveFocusPick('data-logs-dash', want);
+    return true;
+}
+
+// The range the tile keeps: the one of the tab, or the window frozen in UTC
+function logsSaveFixed(on) {
+    logsSave.fixed = !!on || !logsSaveRanges().relative;
+    renderLogsSave();
+    logsSaveFocusPick('data-logs-range', logsSave.fixed ? 'fixed' : 'relative');
+    return logsSave.fixed;
+}
+
+// What a refused write says. The server answers a sentence in English, which
+// is shown as it is; a tool update answers every write with 503 and a text
+// about detonations, so the dialog says what it means here.
+function logsSaveMessage(status, data) {
+    const d = data || {};
+    if (status === 503 || d.maintenance) return LOGS_SAVE_LOCKED.maintenance;
+    const error = typeof d.error === 'string' ? d.error.trim() : '';
+    return error || `the server refused the save (HTTP ${status})`;
+}
+
+// One write of the dashboard routes: {ok, status, data} and, where the request
+// did not get through at all, `failed` with the reason
+async function logsSavePost(url, body) {
+    try {
+        const resp = await fetch(url, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        const data = await resp.json().catch(() => ({}));
+        return { ok: resp.ok, status: resp.status, data: data || {} };
+    } catch (e) {
+        return { ok: false, status: 0, data: {}, failed: `the save did not reach the server: ${e.message}` };
+    }
+}
+
+// SAVE in the dialog: the tile on the chosen dashboard, with the query of the
+// search on screen, the form that is open and the range that is chosen. "+ New"
+// is two writes, the dashboard first — a refused tile then leaves the dashboard
+// standing, so the list and the switch row take it over and a second press
+// writes the tile instead of a second dashboard of the same name. A refusal
+// stays in the dialog; only a save that worked closes it and says so as a toast.
+// A save whose dialog was closed or opened again while it was on its way
+// (logsSaveSeq) leaves that dialog alone: its tile is on the dashboard, so it
+// still says so, but it neither closes nor writes into what is open now.
+async function submitLogsSave() {
+    if (!logsSave.open || !logsView.form) return false;
+    if (logsSaveBusy) {
+        renderLogsSaveError(LOGS_SAVE_LOCKED.busy);
+        return false;
+    }
+    const form = logsView.form;
+    const name = (document.getElementById('logs-save-name')?.value || '').trim();
+    if (!name || name.length > LOGS_NAME_MAX) {
+        renderLogsSaveError(LOGS_SAVE_LOCKED.name);
+        return false;
+    }
+    let did = logsSave.dashboard;
+    const board = did === '' ? (document.getElementById('logs-save-new')?.value || '').trim() : '';
+    if (did === '' && (!board || board.length > LOGS_NAME_MAX)) {
+        renderLogsSaveError(LOGS_SAVE_LOCKED.dashboard);
+        return false;
+    }
+    // No dashboard with room and no room for one more: say what makes room,
+    // which the cap of the server ("at most 10 dashboards") does not
+    if (did === '' && logsSave.dashboards.length >= LOGS_DASH_MAX) {
+        renderLogsSaveError(LOGS_SAVE_LOCKED.full);
+        return false;
+    }
+    const ranges = logsSaveRanges();
+    const range = logsSave.fixed || !ranges.relative ? ranges.fixed : ranges.relative;
+    const seq = logsSaveSeq;
+    logsSaveBusy = true;
+    renderLogsSaveError('');
+    const go = document.getElementById('logs-save-go');
+    if (go) go.disabled = true;
+    try {
+        if (did === '') {
+            const made = await logsSavePost('/api/dashboards', { name: board });
+            if (!made.ok) {
+                if (seq !== logsSaveSeq) return false;
+                renderLogsSaveError(made.failed || logsSaveMessage(made.status, made.data));
+                return false;
+            }
+            const fresh = made.data.dashboard || {};
+            did = String(fresh.id || '');
+            // Only this dialog's list takes it: one that was opened again in
+            // the meantime has read the list of the server itself, which holds
+            // the new dashboard already — adding it would be a second switch
+            // for the same id
+            if (seq === logsSaveSeq) {
+                logsSave.dashboards = [...logsSave.dashboards, fresh];
+                logsSave.dashboard = did;
+            }
+        }
+        const saved = await logsSavePost(`/api/dashboards/${encodeURIComponent(did)}/panels`, {
+            name, query: logsState.query, form, earliest: range.earliest, latest: range.latest,
+        });
+        if (!saved.ok) {
+            if (seq !== logsSaveSeq) return false;
+            renderLogsSaveError(saved.failed || logsSaveMessage(saved.status, saved.data));
+            // Gone from under us (another tab deleted it): the list again.
+            // Otherwise the fields again, which the dashboard of a "+ New"
+            // that worked has to reach — it is the chosen one now.
+            if (saved.status === 404) await logsSaveDashboards();
+            else renderLogsSave();
+            return false;
+        }
+        const on = logsSave.dashboards.find(d => d && d.id === did);
+        const where = on && on.name ? on.name : board;
+        // The title names the tile: showToast drops a second toast of the same
+        // type and title within 15 s, and a dashboard is built tile by tile
+        showToast('success', `Saved ${name}`, `as a ${form} tile on ${where}`);
+        if (seq === logsSaveSeq) closeLogsSave();
+        return true;
+    } finally {
+        logsSaveBusy = false;
+        const button = document.getElementById('logs-save-go');
+        if (button) button.disabled = false;
+    }
+}
+
+// The keys of the dialog: Enter in a field saves, Tab stays inside it. Escape
+// is the key of the page (handleGlobalKeydown), which closes the top layer.
+function onLogsSaveKeydown(event) {
+    if (!event || !logsSave.open) return false;
+    const stop = () => {
+        if (typeof event.preventDefault === 'function') event.preventDefault();
+    };
+    const target = event.target || {};
+    if (event.key === 'Enter' && target.tagName === 'INPUT') {
+        stop();
+        submitLogsSave();
+        return true;
+    }
+    if (event.key !== 'Tab') return false;
+    const modal = document.getElementById('logs-save');
+    const able = modal && typeof modal.querySelectorAll === 'function'
+        ? Array.from(modal.querySelectorAll('button, input')).filter(
+            el => !el.hidden && !el.disabled && el.getAttribute('aria-disabled') !== 'true') : [];
+    if (able.length < 2) return false;
+    const first = able[0], last = able[able.length - 1];
+    if (!event.shiftKey && document.activeElement === last) {
+        stop();
+        first.focus();
+        return true;
+    }
+    if (event.shiftKey && document.activeElement === first) {
+        stop();
+        last.focus();
+        return true;
+    }
+    return false;
+}
+
 // --- The tab ---
 // Set up once, when the tab is first opened: the last search and range come back, and it runs
 function initLogs() {
@@ -12849,8 +14796,6 @@ function initLogs() {
     const input = document.getElementById('logs-query');
     if (!input) return;
     logsReady = true;
-    const help = document.getElementById('logs-syntax');
-    if (help) help.title = LOGS_SYNTAX_HINT;
     input.addEventListener('keydown', event => {
         if (event.key === 'Enter') {
             event.preventDefault();
@@ -12863,11 +14808,23 @@ function initLogs() {
     input.addEventListener('scroll', renderLogsQueryHighlight);
     for (const id of ['logs-results', 'logs-field-list']) document.getElementById(id)?.addEventListener('click', onLogsClick);
     document.getElementById('logs-menu')?.addEventListener('click', onLogsMenuClick);
+    document.getElementById('logs-commands')?.addEventListener('click', onLogsCommandsClick);
+    document.getElementById('logs-save')?.addEventListener('keydown', onLogsSaveKeydown);
+    try {
+        const group = localStorage.getItem(LOGS_COMMANDS_GROUP_KEY);
+        if (group === '' || LOGS_COMMANDS.some(g => g.group === group)) logsCommandsGroup = group;
+    } catch (e) {
+        // storage blocked: the first group is open
+    }
+    toggleLogsCommands(logsCommandsOpen(), false);
     document.addEventListener('click', event => {
         const wrap = event.target && typeof event.target.closest === 'function' ? event.target.closest('.logs-menu-wrap') : null;
         if (!wrap) closeLogsMenu();
     });
     initBarsBrush(LOGS_BARS_BRUSH);
+    const bar = document.getElementById('logs-bar'), side = document.getElementById('logs-side');
+    // The search bar is sticky too: the card stands under it, not over it
+    if (bar && side && typeof ResizeObserver !== 'undefined') _followBarHeight(bar, side, '--logs-bar-height');
     const histogram = document.getElementById('logs-histogram');
     if (histogram && typeof ResizeObserver !== 'undefined') {
         let width = 0;
@@ -12885,10 +14842,18 @@ function initLogs() {
     } catch (e) {
         // storage blocked
     }
-    logsBase = range;
-    logsState.earliest = range === 'All' ? '' : `-${range}`;
-    logsState.latest = '';
-    logsSetQuery(logsLastQuery());
+    // A tile opened in LOGS before the tab was ever shown has put its query
+    // and its window in the state: they stay, and only the range a zoom goes
+    // back to comes from the store (a window of its own has no button)
+    if (logsOpenPending) {
+        logsOpenPending = false;
+        if (!logsRangeLabel(logsState.earliest, logsState.latest)) logsBase = range;
+    } else {
+        logsBase = range;
+        logsState.earliest = range === 'All' ? '' : `-${range}`;
+        logsState.latest = '';
+        logsSetQuery(logsLastQuery());
+    }
     renderLogsRange();
     refreshLogsSources();
     runLogsSearch({ silent: true });
@@ -12896,10 +14861,14 @@ function initLogs() {
 
 // The tab is opened: the first time it is set up, later it searches again
 function logsTabShown() {
+    // The dialog belongs to the result that was on screen: a trip through
+    // another tab leaves it behind
+    closeLogsSave();
     if (!logsReady) {
         initLogs();
         return;
     }
+    logsOpenPending = false;           // the tab is set up: nothing of it to keep
     refreshLogsSources();
     runLogsSearch({ silent: true });
 }
@@ -13529,8 +15498,9 @@ function activityCounter(label, value) {
 
 // --- Keyboard shortcuts ---
 // Esc closes one layer per press, the top-most first: the (i) popover (the
-// focus goes back to its button), help, a drop-down of the top bar and the
-// drawer (the focus goes back to their button), the detail view.
+// focus goes back to its button), the save dialog of the LOGS tab, help, a
+// drop-down of the top bar and the drawer (the focus goes back to their
+// button), the detail view.
 function handleGlobalKeydown(e) {
     if (e.key === 'Escape') {
         const infoPopover = document.getElementById('info-popover');
@@ -13538,11 +15508,26 @@ function handleGlobalKeydown(e) {
             closeInfoPopover()?.focus();
             return;
         }
+        const logsSaveModal = document.getElementById('logs-save');
+        if (logsSaveModal && !logsSaveModal.classList.contains('hidden')) {
+            closeLogsSave();
+            return;
+        }
         const helpModal = document.getElementById('help-modal');
         if (helpModal && !helpModal.classList.contains('hidden')) {
             closeHelp();
             return;
         }
+        // An open ⋯ menu, which a click elsewhere closes too: the one beside
+        // the search box of the LOGS tab, and the ones of a tile and of a page
+        // on the Dashboard tab. The focus goes back to the button that opened it.
+        const logsMenu = document.getElementById('logs-menu');
+        if (logsMenu && !logsMenu.hidden) {
+            closeLogsMenu();
+            document.getElementById('logs-menu-btn')?.focus();
+            return;
+        }
+        if (closeDashboardMenus()) return;
         // An open drop-down closes and gives the focus back to its button.
         const menuButton = Object.keys(TOPBAR_MENUS).find(isTopbarMenuOpen);
         if (menuButton) {

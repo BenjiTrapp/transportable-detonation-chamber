@@ -45,6 +45,7 @@ FILES = {
     "webui/pipe_proxy.py": r"C:\DetonationChamberUI\pipe_proxy.py",
     "webui/log_search.py": r"C:\DetonationChamberUI\log_search.py",
     "webui/log_store.py": r"C:\DetonationChamberUI\log_store.py",
+    "webui/dashboards.py": r"C:\DetonationChamberUI\dashboards.py",
     "webui/rizin_sessions.py": r"C:\DetonationChamberUI\rizin_sessions.py",
     "webui/tool_updates.py": r"C:\DetonationChamberUI\tool_updates.py",
     "webui/static/js/app.js": r"C:\DetonationChamberUI\static\js\app.js",

@@ -313,6 +313,7 @@ deploy:
 		vagrant upload webui/pipe_proxy.py C:\\DetonationChamberUI\\pipe_proxy.py; \
 		vagrant upload webui/log_search.py C:\\DetonationChamberUI\\log_search.py; \
 		vagrant upload webui/log_store.py C:\\DetonationChamberUI\\log_store.py; \
+		vagrant upload webui/dashboards.py C:\\DetonationChamberUI\\dashboards.py; \
 		vagrant upload webui/rizin_sessions.py C:\\DetonationChamberUI\\rizin_sessions.py; \
 		vagrant upload webui/tool_updates.py C:\\DetonationChamberUI\\tool_updates.py; \
 		vagrant upload webui/static/icon.png C:\\DetonationChamberUI\\static\\icon.png || true; \
@@ -338,6 +339,7 @@ deploy-app:
 		vagrant upload webui/pipe_proxy.py C:\\DetonationChamberUI\\pipe_proxy.py; \
 		vagrant upload webui/log_search.py C:\\DetonationChamberUI\\log_search.py; \
 		vagrant upload webui/log_store.py C:\\DetonationChamberUI\\log_store.py; \
+		vagrant upload webui/dashboards.py C:\\DetonationChamberUI\\dashboards.py; \
 		vagrant upload webui/rizin_sessions.py C:\\DetonationChamberUI\\rizin_sessions.py; \
 		vagrant upload webui/tool_updates.py C:\\DetonationChamberUI\\tool_updates.py; \
 		echo "[deploy-app] app.py and modules synced."; \

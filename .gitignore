@@ -32,6 +32,9 @@ webui/memory_results/
 webui/rizin_projects/
 # A write of submissions.json that did not finish (the file itself is in the repository)
 webui/submissions.json.tmp
+# Own dashboards of the Dashboard tab (saved per lab, written by the web UI)
+webui/dashboards.json
+webui/dashboards.json.tmp
 
 # Subagent-driven development scratch (ledger, briefs, review packages)
 .superpowers/
