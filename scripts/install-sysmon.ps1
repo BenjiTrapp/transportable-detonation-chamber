@@ -98,6 +98,43 @@ function Set-PipeEventExclude {
     }
 }
 
+# The upstream config logs EID 3 (NetworkConnect) only for images under C:\Users, C:\ProgramData and the like, for
+# a list of LOLBins and for a few ports. The FIREWALL tab needs the connection of every download it is to catch:
+# System32's curl.exe, the BITS service (svchost.exe), and TDC's own python (the tdc-anomaly net) are not on that
+# list, so a curl or BITS download could never become a finding. Add them to every include-mode NetworkConnect
+# filter; a config without one (exclude mode, the minimal config) logs them already.
+function Set-NetworkConnectIncludes {
+    param([string]$Path)
+    $wanted = @(
+        @{ Condition = 'image'; Value = 'curl.exe' },
+        @{ Condition = 'image'; Value = 'python.exe' },
+        @{ Condition = 'image'; Value = 'pythonw.exe' },
+        @{ Condition = 'is'; Value = 'C:\Windows\System32\svchost.exe' }
+    )
+    try {
+        [xml]$cfg = Get-Content -Path $Path -Raw
+        $includes = @($cfg.SelectNodes("//NetworkConnect[@onmatch='include']"))
+        foreach ($node in $includes) {
+            foreach ($w in $wanted) {
+                $have = @($node.SelectNodes("Image") | Where-Object {
+                    $_.GetAttribute('condition') -eq $w.Condition -and $_.InnerText -eq $w.Value })
+                if ($have.Count -gt 0) { continue }
+                $image = $cfg.CreateElement('Image')
+                $image.SetAttribute('name', 'TDC firewall tab')
+                $image.SetAttribute('condition', $w.Condition)
+                $image.InnerText = $w.Value
+                [void]$node.AppendChild($image)
+            }
+        }
+        $cfg.Save($Path)
+        if ($includes.Count -gt 0) {
+            Write-Host "[+] NetworkConnect also logs curl.exe, python.exe and svchost.exe (BITS)" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "[!] NetworkConnect post-processing failed - curl and BITS downloads may never become a FIREWALL finding: $_" -ForegroundColor Red
+    }
+}
+
 function Set-SysmonLogSize {
     # 512 MB so pipe events do not rotate out short detonations
     wevtutil sl Microsoft-Windows-Sysmon/Operational /ms:536870912
@@ -380,6 +417,7 @@ if ($sysmonSvc -and $sysmonSvc.Status -eq "Running" -and -not $Force) {
         $configEtag = Get-ETag $response
         Move-Item -Path $configTmp -Destination $configPath -Force -ErrorAction Stop
         Set-PipeEventExclude -Path $configPath
+        Set-NetworkConnectIncludes -Path $configPath
         $installedNow = Get-InstalledSysmon
         $configExe = if ($installedNow -and $installedNow.Exe) { $installedNow.Exe } else { $sysmonExe }
         & $configExe -c $configPath 2>$null
@@ -522,6 +560,7 @@ try {
     }
 }
 Set-PipeEventExclude -Path $configPath
+Set-NetworkConnectIncludes -Path $configPath
 
 # Same or older version already running: keep it, only apply the new config
 $downloadedVersion = Get-BinaryVersion -Path $sysmonExe
