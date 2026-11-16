@@ -17,7 +17,7 @@
 #   SetDefaultOutbound -DefaultOutboundAction [-Profiles Domain,Private]
 #
 # Exit codes: 0 done, 1 failed (the first line of stderr says why), 3 a profile is off, 4 the rule exists.
-# Rules are only ever named TDC-FW-<letters, digits, hyphens>; a name with a wildcard is refused.
+# Rules are only ever named TDC-FW-<letters, digits, hyphens>; a name with a wildcard or a trailing newline is refused.
 
 param(
     [Parameter(Mandatory = $true)]
@@ -41,7 +41,7 @@ $AllProfiles = @('Domain', 'Private', 'Public')
 
 function Assert-OurName {
     param([string]$Value)
-    if ($Value -notmatch '^TDC-FW-[A-Za-z0-9-]{1,40}$' -or [WildcardPattern]::ContainsWildcardCharacters($Value)) {
+    if ($Value -notmatch '^TDC-FW-[A-Za-z0-9-]{1,40}\z' -or [WildcardPattern]::ContainsWildcardCharacters($Value)) {
         throw "not a TDC rule name: $Value"
     }
 }

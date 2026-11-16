@@ -28,8 +28,8 @@ ISOLATED sets ``DefaultOutboundAction Block`` on all profiles and allows exactly
 (``127.0.0.0/8``, ``::1``) and the fetcher's program. Inbound is untouched. The order is: profiles checked, the
 previous ``DefaultOutboundAction`` and the marker saved in ``Settings`` *before* anything changes, the two allow
 rules written, then Block, then read back. Leaving goes backwards and is never refused for a profile that is off.
-A crash in between leaves the marker, and ``startup_state`` reports an isolation it finds and does **not** lift
-it. ``scripts/tdc-unisolate.ps1`` is the way out when the Web UI is not reachable.
+The marker (``Settings.isolated``) alone says that TDC is isolating; the profiles are never used to infer it. A crash in
+between leaves the marker, and ``startup_state`` reports an isolation it finds and does **not** lift it. ``scripts/tdc-unisolate.ps1`` is the way out when the Web UI is not reachable.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import ntpath
 import os
 import re
 import subprocess
@@ -57,6 +58,11 @@ PROFILE_NAMES = ("Domain", "Private", "Public")
 OUTBOUND_ACTIONS = ("Allow", "Block", "NotConfigured")
 UNISOLATE_SCRIPT = "scripts/tdc-unisolate.ps1"
 
+_SYSTEM32 = ntpath.join(os.environ.get("SystemRoot") or r"C:\Windows", "System32")
+POWERSHELL = ntpath.join(_SYSTEM32, "WindowsPowerShell", "v1.0", "powershell.exe")
+TASKKILL = ntpath.join(_SYSTEM32, "taskkill.exe")
+SWAP_SUFFIX = "-new"       # a stand-in rule while a rule is replaced, so that there is never a gap
+
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "firewall_rules.ps1")
 RUN_TIMEOUT_S = 90
 MAX_PATH_CHARS = 4096
@@ -65,8 +71,8 @@ MIN_KILL_PID = 5           # 0 is the idle process, 4 the system; both cannot be
 EXIT_PROFILE_OFF = 3       # the exit codes of firewall_rules.ps1
 EXIT_EXISTS = 4
 
-_NAME = re.compile(r"^TDC-FW-[A-Za-z0-9-]{1,40}$")
-_BLOCK_NAME = re.compile(r"^TDC-FW-[0-9a-f]{12}$")
+_NAME = re.compile(r"TDC-FW-[A-Za-z0-9-]{1,40}")
+_BLOCK_NAME = re.compile(r"TDC-FW-[0-9a-f]{12}(?:-new)?")
 
 _LOCK = threading.RLock()
 
@@ -112,7 +118,7 @@ def _call(run, args: List[str]) -> Tuple[int, str, str]:
 
 
 def _ps(run, op: str, **params: Optional[str]) -> Tuple[int, str, str]:
-    args = ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", SCRIPT, "-Op", op]
+    args = [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", SCRIPT, "-Op", op]
     for name, value in params.items():
         if value is not None:
             args += ["-" + name, str(value)]
@@ -157,11 +163,13 @@ def _clean_ip(value: Any) -> str:
         raise RuleError(f"not an address: {str(value)[:60]!r}")
     if addr.version == 6 and addr.ipv4_mapped is not None:
         addr = addr.ipv4_mapped
+    if addr.is_loopback or addr.is_unspecified or addr.is_multicast:
+        raise RuleError(f"{addr} is loopback, unspecified or multicast: blocking it would cut TDC's own traffic")
     return str(addr)
 
 
 def _clean_port(value: Any) -> int:
-    if isinstance(value, str) and value.strip().isdigit():
+    if isinstance(value, str) and value.strip().isascii() and value.strip().isdigit():
         value = int(value.strip())
     if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
         raise RuleError(f"not a port: {str(value)[:20]!r}")
@@ -196,6 +204,10 @@ def rule_id_for(scope: str, image: Optional[str], ip: Optional[str], port: Optio
     """``TDC-FW-`` and 12 hex digits: the same block is the same rule, whoever asks and in whatever case the image is."""
     text = "\0".join([scope, (image or "").lower(), ip or "", str(port or ""), protocol or ""])
     return RULE_PREFIX + hashlib.blake2s(text.encode("utf-8", "replace"), digest_size=6).hexdigest()
+
+
+def _same_path(a: str, b: str) -> bool:
+    return a.lower().replace("/", "\\") == b.lower().replace("/", "\\")
 
 
 def _block_spec(image: Any, ip: Any, port: Any, protocol: Any) -> Dict[str, Any]:
@@ -344,18 +356,31 @@ def _create(run, spec: Dict[str, Any]) -> int:
     return rc
 
 
+def _replace(run, spec: Dict[str, Any]) -> None:
+    """Replace the rule of ``spec["name"]`` without a moment in which no such rule stands: a stand-in with the
+    same parameters is written first, the old rule goes, the new one is written, then the stand-in goes. (A rule
+    that vanishes for a moment is a block that does not hold, or, for ISOLATED, a fetcher that is cut off.) If it
+    fails halfway the stand-in (``<name>-new``) stays and keeps the effect; ``rules()`` lists it and the hatch removes it."""
+    stand_in = dict(spec, name=spec["name"] + SWAP_SUFFIX)
+    _ok(run, "Remove", Name=stand_in["name"])
+    if _create(run, stand_in) != 0:
+        raise RuleError(f"{stand_in['name']} is already there")
+    _ok(run, "Remove", Name=spec["name"])
+    _create(run, spec)
+    _ok(run, "Remove", Name=stand_in["name"])
+
+
 def _write(run, spec: Dict[str, Any]) -> Optional[str]:
     """Write one rule and read it back. Returns why it does not stand, or None when it does.
 
     A rule of that name that is already there and is what was asked for, and enabled, is left alone: replacing it
-    would open a gap in a block that holds. One that differs or is disabled is replaced.
+    would open a gap in a block that holds. One that differs or is disabled is replaced (``_replace``).
     """
     view = None
     if _create(run, spec) == EXIT_EXISTS:
         view = _describe(run, spec["name"])
         if view is None or not _matches(view, spec) or not view["enabled"]:
-            _ok(run, "Remove", Name=spec["name"])
-            _create(run, spec)
+            _replace(run, spec)
             view = None
     if view is None:
         view = _describe(run, spec["name"])
@@ -370,7 +395,7 @@ def _write(run, spec: Dict[str, Any]) -> Optional[str]:
 
 
 def block(run, *, image: Optional[str] = None, ip: Optional[str] = None, port: Optional[int] = None,
-          protocol: Optional[str] = None) -> Dict[str, Any]:
+          protocol: Optional[str] = None, fetcher: Optional[str] = None) -> Dict[str, Any]:
     """Block outbound traffic and check that the block stands.
 
     ``image`` and ``ip``: this program to this address (the automatic block, always program-scoped). ``image`` alone:
@@ -383,8 +408,15 @@ def block(run, *, image: Optional[str] = None, ip: Optional[str] = None, port: O
     the rule was read back from the firewall, is what was asked for, is enabled, and every profile it covers is
     on; otherwise ``problem`` says why and the caller must not call the endpoint blocked. Raises ``RuleError`` when
     a profile is off (nothing is written then), when the arguments are unsound, or when the write fails.
+
+    Two blocks would cut TDC off from itself and are refused: an address that is loopback, unspecified or
+    multicast, and a block on the program ``fetcher``, because an explicit Block beats the fetcher's Allow rule
+    of ISOLATED. This module cannot know the fetcher's path, so **the caller must pass it** (the ``python.exe`` of the
+    web UI venv, the same path it gives ``isolate``); without it that guard is off.
     """
     spec = _block_spec(image, ip, port, protocol)
+    if fetcher is not None and spec["image"] is not None and _same_path(spec["image"], _clean_path(fetcher, "fetcher")):
+        raise RuleError("that program is TDC's own fetcher: blocking it would cut TDC off from its fetch targets")
     with _LOCK:
         problem = _write(run, spec)
     return {"rule_id": spec["name"], "name": spec["name"], "image": spec["image"], "ip": spec["ip"],
@@ -397,7 +429,7 @@ def unblock(run, rule_id: str) -> None:
     Only ``TDC-FW-`` and 12 hex digits are accepted: no wildcard, no foreign rule, and not the allow rules of
     ISOLATED, which only ``isolate`` writes and removes.
     """
-    if not isinstance(rule_id, str) or not _BLOCK_NAME.match(rule_id):
+    if not isinstance(rule_id, str) or not _BLOCK_NAME.fullmatch(rule_id):
         raise RuleError(f"not a TDC block rule: {str(rule_id)[:60]!r}")
     with _LOCK:
         _ok(run, "Remove", Name=rule_id)
@@ -411,7 +443,7 @@ def verify(run, rule_id: str) -> bool:
     False for anything else, and for anything that cannot be read: it never raises.
     """
     try:
-        if not isinstance(rule_id, str) or not _NAME.match(rule_id):
+        if not isinstance(rule_id, str) or not _NAME.fullmatch(rule_id):
             return False
         view = _describe(run, rule_id)
         return view is not None and view["action"] == "block" and _standing_problem(view, _profiles(run)) is None
@@ -438,9 +470,15 @@ def rules(run) -> List[Dict[str, Any]]:
     ``{rule_id, name, kind, action, enabled, image, ip, port, protocol, key, blocking}``. ``kind`` is ``"block"``
     (written by ``block``) or ``"isolate"`` (the allow rules of ISOLATED). ``blocking`` is True for a Block rule
     that stands, in the shape ``block`` writes, with every profile it covers on; ``key`` is then
-    ``firewall.rule_key`` of the rule's real image, address and port. The ``Context.rules`` dict is
-    ``{r["key"]: r["rule_id"] for r in rules(run) if r["blocking"]}``. A rule that is listed but not
+    ``firewall.rule_key`` of the rule's real image, address and port. A rule that is listed but not
     ``blocking`` (disabled, a profile off, or changed by someone) must not be shown as a block.
+
+    **Several rules can share a key**: ``firewall.rule_key`` has no protocol and a rule id has (tcp/443 and udp/443 at
+    one endpoint are two rules, a stand-in left by a failed replacement is a third). Each is its own entry here,
+    with its own ``rule_id`` and ``protocol``. The caller groups by ``key``: ``Context.rules`` takes any one id per key,
+    and *unblocking a key must remove every ``rule_id`` of that key*, or the endpoint still reads as blocked. Known
+    limitation: a tcp rule makes a udp flow to the same endpoint read as blocked in the classifier, which does not
+    look at the protocol; the UI shows the rule's ``protocol`` beside the claim.
     """
     data = _json(_ok(run, "List"), "the rule list")
     if not isinstance(data, dict) or not isinstance(data.get("rules"), list):
@@ -474,7 +512,7 @@ def kill(run, pid: int) -> None:
     below 5 (idle, system) and this process."""
     if isinstance(pid, bool) or not isinstance(pid, int) or pid < MIN_KILL_PID or pid == os.getpid():
         raise RuleError(f"not a process that may be killed: {str(pid)[:20]!r}")
-    rc, out, err = _call(run, ["taskkill", "/PID", str(pid), "/F"])
+    rc, out, err = _call(run, [TASKKILL, "/PID", str(pid), "/F"])
     if rc != 0:
         raise RuleError(f"could not kill {pid} ({rc}): {_first_line(err) or _first_line(out) or 'no message'}")
 
@@ -523,9 +561,10 @@ def _apply_outbound(run, target: Dict[str, str]) -> List[Dict[str, Any]]:
 
 
 def _remove_isolate_rules(run) -> None:
-    for name in (FETCHER_RULE, LOOPBACK_RULE):
+    names = [n + suffix for n in (FETCHER_RULE, LOOPBACK_RULE) for suffix in ("", SWAP_SUFFIX)]
+    for name in names:
         _ok(run, "Remove", Name=name)
-    still = [n for n in (FETCHER_RULE, LOOPBACK_RULE) if _describe(run, n) is not None]
+    still = [n for n in names if _describe(run, n) is not None]
     if still:
         raise RuleError(f"{', '.join(still)} is still there after it was removed")
 
@@ -544,11 +583,16 @@ def isolate(run, on: bool, *, fetcher: str, settings) -> Dict[str, Any]:
     back; if even that fails the marker stays and the message names ``scripts/tdc-unisolate.ps1``. Isolating while
     isolated keeps the first memory. Returns ``{"isolated": True, "outbound_before", "verified": True}``.
 
-    Off: the way back, in reverse: ``DefaultOutboundAction`` back to what was saved (per profile, when they
-    differed), the two allow rules removed, the marker and the memory forgotten last. It works whatever
-    the profiles are. With nothing remembered but an isolation to lift (the marker, or Block on a profile), it assumes
-    ``Allow``, the Windows default, and says so (``assumed_allow``); with neither it does nothing.
-    Returns ``{"isolated": False, "changed", "assumed_allow", "outbound_after"}``.
+    ``settings.isolated`` is the only authority for "TDC is isolating"; nothing is inferred from the profiles. An
+    isolation may start from an egress that is already Block: that is recorded as the baseline like any other.
+
+    Off: the way back, in reverse, to **the recorded baseline**: ``DefaultOutboundAction`` back to what was saved (per
+    profile, when they differed), the allow rules removed, the marker and the memory forgotten last. It works whatever
+    the profiles are. When the baseline is itself Block the egress stays shut and the fetcher is no longer allowed:
+    that is the VM's own baseline and not a TDC lockout, and ``note`` says so. With the marker but no baseline it
+    assumes ``Allow``, the Windows default, and says so (``assumed_allow``). Without the marker it changes nothing,
+    and if the egress is nonetheless shut ``note`` says that TDC is not the one isolating and names the hatch.
+    Returns ``{"isolated": False, "changed", "assumed_allow", "outbound_after", "note"}``.
     """
     with _LOCK:
         return _isolate_on(run, fetcher, settings) if on else _isolate_off(run, settings)
@@ -582,9 +626,11 @@ def _isolate_on(run, fetcher: str, settings) -> Dict[str, Any]:
     except Exception as e:
         if not already:
             _roll_back(run, settings, current, changed_default, e)
-        if isinstance(e, RuleError):
-            raise
-        raise RuleError(f"isolating failed: {type(e).__name__}: {_first_line(e)}") from e
+            if isinstance(e, RuleError):
+                raise
+            raise RuleError(f"isolating failed: {type(e).__name__}: {_first_line(e)}") from e
+        raise RuleError(f"{_first_line(e)}. ISOLATED was on and stays as it is, which may cut TDC's fetcher off; "
+                        f"run {UNISOLATE_SCRIPT} on the VM to open the egress.") from e
     return {"isolated": True, "outbound_before": remembered, "verified": True}
 
 
@@ -602,28 +648,53 @@ def _roll_back(run, settings, before: Dict[str, str], changed_default: bool, cau
 
 
 def _isolate_off(run, settings) -> Dict[str, Any]:
+    if not settings.isolated:
+        return _not_isolating(run)
     target = _decode_outbound(settings.outbound_before)
     assumed = target is None
     if assumed:
-        current = {s["name"]: s["outbound"] for s in _profiles(run)}
-        if not settings.isolated and "Block" not in current.values():
-            return {"isolated": False, "changed": False, "assumed_allow": False, "outbound_after": current}
         target = {n: "Allow" for n in PROFILE_NAMES}
     _apply_outbound(run, target)
     _remove_isolate_rules(run)
     _forget(settings)
-    return {"isolated": False, "changed": True, "assumed_allow": assumed, "outbound_after": target}
+    shut = [n for n in PROFILE_NAMES if target[n] == "Block"]
+    note = None
+    if assumed:
+        note = "No baseline was recorded; Allow, the Windows default, was assumed."
+    elif shut:
+        note = (f"The baseline recorded before ISOLATED is Block on {', '.join(shut)}: outbound stays shut there and "
+                "TDC's fetcher is no longer allowed. That is the VM's own baseline, not a TDC lockout.")
+    return {"isolated": False, "changed": True, "assumed_allow": assumed, "outbound_after": target, "note": note}
+
+
+def _not_isolating(run) -> Dict[str, Any]:
+    """Leaving ISOLATED when TDC is not isolating: nothing is changed, and an egress that is shut anyway is said."""
+    try:
+        current: Optional[Dict[str, str]] = {s["name"]: s["outbound"] for s in _profiles(run)}
+    except RuleError:
+        current = None
+    note = None
+    if current and "Block" in current.values():
+        note = (f"TDC is not isolating (there is no marker), so nothing was changed, but outbound is blocked on "
+                f"{', '.join(n for n in PROFILE_NAMES if current[n] == 'Block')}. If that is not wanted, "
+                f"run {UNISOLATE_SCRIPT} on the VM.")
+    return {"isolated": False, "changed": False, "assumed_allow": False, "outbound_after": current, "note": note}
 
 
 def startup_state(run, settings) -> Dict[str, Any]:
     """What the firewall is like when the service starts: ``{"isolated", "profiles_off", "announce", "note"}``.
 
-    An isolation found here was not set in this session, so it is announced and **never lifted**: a crash in the
-    middle of a detonation must not open the egress. ``isolated`` is what is really in force: Block on all three
-    profiles and all three on. A marker (``settings.isolated``) over an egress that is plainly open (no profile on Block)
-    is stale, because ``scripts/tdc-unisolate.ps1`` was used or the switch never happened; it is cleared, which is
-    bookkeeping and opens nothing. A marker over a partial or ineffective state is kept and announced. When the firewall
-    cannot be read, the marker is believed and announced.
+    ``settings.isolated`` (the marker) is the only authority for "TDC is isolating"; the profiles are only checked
+    against it. ``isolated`` is True when there is a marker **and** it is in force: Block on all three profiles, all
+    three on. Whatever is found here was not set in this session, so it is announced and **never lifted**: a crash in
+    the middle of a detonation must not open the egress.
+
+    - marker, in force: ``isolated``, announced.
+    - marker, Block on some profiles only or a profile off: not isolated, announced, marker kept.
+    - marker, outbound plainly open (no profile on Block): stale, because ``scripts/tdc-unisolate.ps1`` was used or
+      the switch never happened. The marker is cleared (bookkeeping, it opens nothing) and it is announced.
+    - no marker, outbound shut anyway: not isolated, but announced: whoever shut it, the analyst must know.
+    - cannot read the firewall: the marker is believed, announced.
     """
     marker = bool(settings.isolated)
     try:
@@ -633,17 +704,20 @@ def startup_state(run, settings) -> Dict[str, Any]:
                 "note": f"the firewall could not be read: {_first_line(e)}"}
     off = _off_names(states)
     blocking = [s["name"] for s in states if s["outbound"] == "Block"]
-    isolated = len(blocking) == len(PROFILE_NAMES) and not off
+    in_force = marker and len(blocking) == len(PROFILE_NAMES) and not off
     note = None
-    if isolated:
+    if in_force:
         note = "ISOLATED is on: all outbound traffic is blocked except loopback and TDC's fetcher."
-    elif blocking:
-        note = (f"Outbound is blocked on {', '.join(blocking)} only"
-                + (f", and the firewall is off for {', '.join(off)}" if off else "") + ": this is not a working isolation.")
+    elif marker and blocking:
+        note = (f"ISOLATED is marked, but outbound is blocked on {', '.join(blocking)} only"
+                + (f" and the firewall is off for {', '.join(off)}" if off else "") + ": this is not a working isolation.")
     elif marker:
         try:
             _forget(settings)
-            note = "A stale ISOLATED marker was cleared: outbound is open."
+            note = "A stale ISOLATED marker was cleared: outbound is open (was scripts/tdc-unisolate.ps1 run?)."
         except Exception as e:
             note = f"The ISOLATED marker is stale but could not be cleared: {_first_line(e)}"
-    return {"isolated": isolated, "profiles_off": off, "announce": isolated or bool(blocking), "note": note}
+    elif blocking:
+        note = (f"Outbound is blocked on {', '.join(blocking)}, but TDC did not set it (there is no ISOLATED marker). "
+                f"Nothing was changed; {UNISOLATE_SCRIPT} opens it.")
+    return {"isolated": in_force, "profiles_off": off, "announce": marker or bool(blocking), "note": note}
