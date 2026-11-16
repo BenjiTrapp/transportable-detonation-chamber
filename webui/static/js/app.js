@@ -148,10 +148,12 @@ document.addEventListener('tdc:themechange', onThemeChange);
 // --- Theme switch (✶) ---
 // <html data-theme> selects the theme; the inline script in index.html sets it
 // from localStorage before the first paint. A switch never reloads the page:
-// the tab bar and the service status move between the sidebar (Classic) and
-// the top bar (Cyberpunk) as the same nodes, so handlers and state stay.
+// the tab bar and the service status stay the same nodes, so handlers and
+// state stay. Both themes share one window layout (theme-layout.css): the tab
+// bar and the service status sit in the top bar. "classic" is the ID that
+// localStorage keeps; the theme is called Telemetry.
 const THEMES = ['classic', 'cyberpunk'];
-const THEME_LABELS = { classic: 'Classic', cyberpunk: 'Cyberpunk' };
+const THEME_LABELS = { classic: 'Telemetry', cyberpunk: 'Cyberpunk' };
 
 function normalizeTheme(value) {
     // Cyberpunk is the default theme (same rule as the boot script in index.html).
@@ -171,24 +173,17 @@ function applyThemeLayout(theme) {
     // must not stop the rest of the page from being set up.
     const nav = document.querySelector('nav.sidebar-tabs');
     const status = document.getElementById('service-status');
-    if (theme === 'cyberpunk') {
-        const navHome = document.getElementById('topbar-nav');
-        const statusHome = document.getElementById('topbar-services-panel');
-        if (nav && navHome) navHome.prepend(nav);               // in front of the "…" menu
-        if (status && statusHome) statusHome.appendChild(status);
-    } else {
-        const logo = document.querySelector('.logo-container');
-        const sidebar = document.getElementById('sidebar');
-        if (nav && logo) logo.after(nav);
-        if (status && sidebar) sidebar.appendChild(status);
-    }
-    // The drawer and the drop-downs start closed in either theme (their state
-    // is not kept), and the tabs are fitted to the bar they are now in.
+    const navHome = document.getElementById('topbar-nav');
+    const statusHome = document.getElementById('topbar-services-panel');
+    if (nav && navHome) navHome.prepend(nav);                   // in front of the "…" menu
+    if (status && statusHome) statusHome.appendChild(status);
+    // The drawer and the drop-downs start closed (their state is not kept),
+    // and the tabs are fitted to the bar.
     closeDrawer();
     closeTopbarMenus();
     updateTabOverflow();
-    // Set here rather than in setTheme(), so a page loaded in Cyberpunk names
-    // the right target as well.
+    // Set here rather than in setTheme(), so a page loaded in either theme
+    // names the right target as well.
     const label = `Switch to ${THEME_LABELS[nextTheme(theme)]} theme`;
     for (const id of ['theme-toggle', 'theme-toggle-top']) {
         const button = document.getElementById(id);
@@ -214,8 +209,8 @@ function setTheme(name) {
             // Storage blocked or full: the choice lasts until the page is reloaded.
         }
         applyThemeLayout(theme);
-        // The ✶ just used is hidden in the new theme: keyboard focus moves to the visible one.
-        if (toggleHadFocus) document.getElementById(theme === 'cyberpunk' ? 'theme-toggle-top' : 'theme-toggle')?.focus();
+        // The ✶ in the drawer is hidden once the theme changes (the drawer closes): keyboard focus moves to the one in the top bar.
+        if (toggleHadFocus) document.getElementById('theme-toggle-top')?.focus();
         document.dispatchEvent(new CustomEvent('tdc:themechange', { detail: { theme } }));
     } finally {
         // Even after an error transitions come back on, a frame later.
@@ -230,9 +225,9 @@ function toggleTheme() {
     setTheme(nextTheme(currentTheme()));
 }
 
-// --- Cyberpunk top bar: drawer, drop-downs, tab overflow ---
-// In Cyberpunk the sidebar is a drawer that slides in over the content while
-// #app has .drawer-open (theme-cyberpunk.css). Its open state is not kept.
+// --- Top bar: drawer, drop-downs, tab overflow ---
+// The sidebar is a drawer that slides in over the content while
+// #app has .drawer-open (theme-layout.css). Its open state is not kept.
 function isDrawerOpen() {
     return !!document.getElementById('app')?.classList.contains('drawer-open');
 }
@@ -243,7 +238,7 @@ function setDrawerOpen(open) {
 }
 
 function openDrawer() {
-    if (currentTheme() === 'cyberpunk') setDrawerOpen(true);     // Classic shows the sidebar anyway
+    setDrawerOpen(true);
 }
 
 function closeDrawer() {
@@ -256,7 +251,7 @@ function toggleDrawer() {
 }
 
 // The drop-downs of the top bar, button -> panel. A button's aria-expanded
-// shows or hides the panel right after it (theme-cyberpunk.css).
+// shows or hides the panel right after it (theme-layout.css).
 const TOPBAR_MENUS = { 'topbar-services': 'topbar-services-panel', 'topbar-more-toggle': 'topbar-more' };
 
 function isTopbarMenuOpen(buttonId) {
@@ -311,7 +306,7 @@ function computeVisibleTabs(widths, available, moreWidth, activeIndex) {
     return visible.sort((a, b) => a - b);
 }
 
-// Tabs that do not fit into the Cyberpunk top bar get .tab-overflow (hidden)
+// Tabs that do not fit into the top bar get .tab-overflow (hidden)
 // and an entry in the "…" menu. Runs when the room changes, after every tab
 // switch and on a theme switch; in Classic it only clears what it set.
 function updateTabOverflow() {
@@ -325,7 +320,7 @@ function updateTabOverflow() {
     tabs.forEach(tab => tab.classList.remove('tab-overflow'));
     menu.replaceChildren();
     wrap.hidden = false;
-    if (currentTheme() !== 'cyberpunk' || !area.contains(nav)) {
+    if (!area.contains(nav)) {
         wrap.hidden = true;
         setTopbarMenu('topbar-more-toggle', false);
         return;
@@ -420,7 +415,7 @@ function switchTab(tabName) {
     document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
     document.querySelector(`.tab[data-tab="${tabName}"]`).classList.add('active');
     document.getElementById(`tab-${tabName}`).classList.add('active');
-    // Cyberpunk: a tab picked from the "…" menu takes a place in the top bar.
+    // A tab picked from the "…" menu takes a place in the top bar.
     updateTabOverflow();
     if (tabName === 'dashboard') {
         renderDashboardCharts();
@@ -547,7 +542,7 @@ async function refreshDashboard() {
         const updated = new Date().toLocaleTimeString('en-GB');
         const timeEl = document.getElementById('dashboard-time');
         if (timeEl) timeEl.textContent = 'Updated ' + updated;
-        const topbarTime = document.getElementById('topbar-time');      // the same clock in the Cyberpunk top bar
+        const topbarTime = document.getElementById('topbar-time');      // the same clock in the top bar
         if (topbarTime) topbarTime.textContent = updated;
     } catch (e) {
         showToast('error', 'Dashboard unreachable', e.message || 'Connection to server lost', 6000);
@@ -2908,10 +2903,9 @@ function revealElement(el, block, ms) {
     el._revealTimer = setTimeout(() => el.classList.remove('reveal-flash'), ms);
 }
 
-// PROCESSES TRACKED: the process list, in the sidebar (Classic) or in the drawer (Cyberpunk)
+// PROCESSES TRACKED: the process list, in the drawer
 function revealProcessList() {
-    if (currentTheme() === 'cyberpunk') openDrawer();
-    else revealSection('process-list-section');
+    openDrawer();
 }
 
 // =============================================
@@ -7454,8 +7448,8 @@ function openProcessDetail(pid) {
     state.selectedProcess = pid;
     renderProcessList();
     pushDetailHistory('process', pid);
-    // Cyberpunk: picking a process in the drawer closes it, so the detail view is in sight.
-    if (currentTheme() === 'cyberpunk') closeDrawer();
+    // Picking a process in the drawer closes it, so the detail view is in sight.
+    closeDrawer();
 
     const proc = state.processes[pid] || state.processes[String(pid)];
     if (!proc) {
@@ -7535,7 +7529,7 @@ function openProcessDetail(pid) {
 function renderProcessList() {
     const container = document.getElementById('process-list');
     const count = document.getElementById('process-count');
-    const drawerCount = document.getElementById('drawer-count');    // ☰ PROCESSES in the Cyberpunk top bar
+    const drawerCount = document.getElementById('drawer-count');    // ☰ PROCESSES in the top bar
     const procs = Object.values(state.processes);
     count.textContent = procs.length;
     if (drawerCount) drawerCount.textContent = procs.length;
@@ -7594,7 +7588,7 @@ function timelineTableHtml(alerts) {
 }
 
 // --- Render: Service status ---
-// The services of the status row (sidebar; the drop-down of the Cyberpunk top bar)
+// The services of the status row (the drop-down of the top bar)
 const STATUS_SERVICES = [
     {key: 'rustinel', id: 'status-rustinel', name: 'Rustinel'},
     {key: 'sysmon', id: 'status-sysmon', name: 'Sysmon'},
@@ -7622,7 +7616,7 @@ function updateServiceStatus(status) {
     updateTopbarServices(status);
 }
 
-// Summary on the services button of the Cyberpunk top bar: a dot and "n/m ONLINE"
+// Summary on the services button of the top bar: a dot and "n/m ONLINE"
 function updateTopbarServices(status = state.serviceStatus) {
     const button = document.getElementById('topbar-services');
     if (!button) return;

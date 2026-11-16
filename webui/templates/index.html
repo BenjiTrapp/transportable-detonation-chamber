@@ -9,7 +9,7 @@
     <link rel="icon" type="image/png" sizes="192x192" href="/static/favicon-192.png">
     <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
     <!-- The stored theme is applied before the styles and the first paint, so a
-         page loaded in Cyberpunk never shows Classic first (setTheme in app.js) -->
+         page loaded in Cyberpunk never shows the other theme first (setTheme in app.js) -->
     <script>
         // Cyberpunk is the default; only a stored "classic" keeps Classic.
         try {
@@ -19,8 +19,9 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=69">
-    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=27">
+    <link rel="stylesheet" href="/static/css/style.css?v=70">
+    <link rel="stylesheet" href="/static/css/theme-layout.css?v=1">
+    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=28">
 </head>
 <body>
     <!-- Global loading overlay (shown on slow fetches) -->
@@ -1616,6 +1617,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
          in app.js); set as text, never as markup -->
     <div id="info-popover" class="info-popover" role="status" hidden></div>
 
-    <script src="/static/js/app.js?v=100"></script>
+    <script src="/static/js/app.js?v=101"></script>
 </body>
 </html>

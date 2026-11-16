@@ -1893,7 +1893,8 @@ transportable-detonation-chamber/
 │   │   └── index.html             # SPA with all tabs + Help modal
 │   └── static/
 │       ├── css/style.css          # Classic theme (every colour a variable in :root)
-│       ├── css/theme-cyberpunk.css # Cyberpunk theme, scoped to [data-theme="cyberpunk"]
+│       ├── css/theme-layout.css   # Window layout and controls, shared by both themes ([data-theme])
+│       ├── css/theme-cyberpunk.css # Cyberpunk palette, scoped to [data-theme="cyberpunk"]
 │       ├── js/app.js              # Frontend logic (single file, no build step)
 │       └── icon.png               # Logo
 │

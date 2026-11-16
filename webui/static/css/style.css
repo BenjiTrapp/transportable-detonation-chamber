@@ -175,6 +175,49 @@
     --radius: 4px;
     --maintenance-height: 36px;
     --radius-lg: 8px;
+    /* Geometry of the window layout (theme-layout.css), the same in both themes */
+    --topbar-height: 56px;
+    --drawer-width: 320px;
+    /* The names theme-layout.css paints with, in Classic's colours (each
+       *-rgb is the same colour as "r, g, b"). theme-cyberpunk.css sets them
+       again for Cyberpunk. */
+    --cp-bg: #080c14;
+    --cp-bg-rgb: 8, 12, 20;
+    --cp-bar-top: #111827;
+    --cp-bar-bottom: #0d1220;
+    --cp-card: #0f1629;
+    --cp-card-rgb: 15, 22, 41;
+    --cp-raised: #111827;
+    --cp-line: #1a2744;
+    --cp-text: #e2e8f0;
+    --cp-text-muted: #94a3b8;
+    --cp-text-muted-rgb: 148, 163, 184;
+    --cp-text-dim: #64748b;
+    --cp-magenta: #f472b6;
+    --cp-magenta-rgb: 244, 114, 182;
+    --cp-on-magenta: #0b1220;
+    --cp-cyan: #22d3ee;
+    --cp-cyan-rgb: 34, 211, 238;
+    --cp-green: #22c55e;
+    --cp-green-rgb: 34, 197, 94;
+    --cp-gold: #fcd34d;
+    --cp-gold-rgb: 252, 211, 77;
+    --cp-amber: #eab308;
+    --cp-amber-rgb: 234, 179, 8;
+    --cp-orange: #f97316;
+    --cp-orange-rgb: 249, 115, 22;
+    --cp-red: #ef4444;
+    --cp-red-rgb: 239, 68, 68;
+    --cp-violet: #a78bfa;
+    --cp-violet-rgb: 167, 139, 250;
+    --cp-tile-critical: #dc2626;
+    --cp-black-rgb: 0, 0, 0;
+    --cp-heading: linear-gradient(90deg, var(--cp-gold), var(--cp-amber) 45%, var(--cp-red));
+    --cp-glow: 0 0 14px rgba(var(--cp-magenta-rgb), .35);
+    --cp-card-border: 1px solid rgba(var(--cp-magenta-rgb), .22);
+    --cp-card-shadow: 0 0 0 1px rgba(var(--cp-black-rgb), .35), 0 8px 24px -16px rgba(var(--cp-magenta-rgb), .35);
+    --cp-font-label: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --cp-font-text: system-ui, -apple-system, "Segoe UI", sans-serif;
     /* Not a colour: the height of the Alerts tab's filter bar, which its
        table head stands under; app.js (initAlertsTab) sets it on the head */
     --alerts-bar-height: 0px;
@@ -213,16 +256,6 @@ body.hex-resizing {
     display: flex;
     height: 100vh;
     overflow: hidden;
-}
-
-/* Top bar of the Cyberpunk theme (theme-cyberpunk.css); Classic has none */
-#topbar {
-    display: none;
-}
-
-/* Darkens the content behind the Cyberpunk drawer; Classic has no drawer */
-#drawer-scrim {
-    display: none;
 }
 
 /* While the theme switches (setTheme in app.js, for one frame), in either

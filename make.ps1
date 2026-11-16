@@ -330,6 +330,7 @@ switch ($Target) {
             Copy-Item 'webui\tool_updates.py' -Destination 'C:\DetonationChamberUI\tool_updates.py' -ToSession $s -Force
             Copy-Item 'webui\templates\index.html' -Destination 'C:\DetonationChamberUI\templates\index.html' -ToSession $s -Force
             Copy-Item 'webui\static\css\style.css' -Destination 'C:\DetonationChamberUI\static\css\style.css' -ToSession $s -Force
+            Copy-Item 'webui\static\css\theme-layout.css' -Destination 'C:\DetonationChamberUI\static\css\theme-layout.css' -ToSession $s -Force
             Copy-Item 'webui\static\css\theme-cyberpunk.css' -Destination 'C:\DetonationChamberUI\static\css\theme-cyberpunk.css' -ToSession $s -Force
             Copy-Item 'webui\static\js\app.js' -Destination 'C:\DetonationChamberUI\static\js\app.js' -ToSession $s -Force
             Copy-Item 'webui\static\icon.png' -Destination 'C:\DetonationChamberUI\static\icon.png' -ToSession $s -Force -ErrorAction SilentlyContinue

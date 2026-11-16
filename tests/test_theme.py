@@ -82,6 +82,8 @@ from test_frontend import _function_source, _run_node, needs_node
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STYLE_CSS = os.path.join(ROOT, "webui", "static", "css", "style.css")
 THEME_CSS = os.path.join(ROOT, "webui", "static", "css", "theme-cyberpunk.css")
+LAYOUT_CSS = os.path.join(ROOT, "webui", "static", "css", "theme-layout.css")
+OLD_THEME_CSS = os.path.join(ROOT, "tests", "samples", "theme-cyberpunk-e11a9dd.css")
 APP_JS = os.path.join(ROOT, "webui", "static", "js", "app.js")
 INDEX_HTML = os.path.join(ROOT, "webui", "templates", "index.html")
 
@@ -157,8 +159,21 @@ def test_style_css_colour_variables_are_defined():
     assert not problems, "\n".join(problems[:20])
 
 
-def _read(path):
+def _raw(path):
     return open(path, encoding="utf-8").read()
+
+
+def _read(path):
+    """The text of a file. THEME_CSS reads as Cyberpunk's whole style sheet as
+    the browser sees it: the layout rules of theme-layout.css (their [data-theme]
+    prefix written as [data-theme="cyberpunk"]) and the palette of
+    theme-cyberpunk.css. Its rules were all in that one file until Classic took
+    over the layout; the tests about "the Cyberpunk rules" keep reading them
+    as one sheet. Tests of the single files use _raw()."""
+    if path == THEME_CSS:
+        layout = re.sub(r"\[data-theme\]", '[data-theme="cyberpunk"]', _raw(LAYOUT_CSS))
+        return _raw(THEME_CSS) + "\n" + layout
+    return _raw(path)
 
 
 def _root_values():
@@ -211,8 +226,8 @@ def test_app_js_and_index_html_colour_variables_are_defined():
 CYBERPUNK_ROOT = re.compile(r""":root\[data-theme=(["'])cyberpunk\1\]\s*\{([^}]*)\}""")
 # A colour: hex, an "r, g, b" triplet, rgb()/rgba() or a gradient
 COLOUR_VALUE = re.compile(r"#[0-9a-fA-F]{3,8}\b|^\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*$|rgba?\(|gradient\(")
-# The same in every theme
-NEUTRAL_COLOURS = {"--c-white", "--c-white-rgb", "--c-black", "--c-black-rgb"}
+# The same in every theme (--cp-black-rgb: the shadow colour of the shared layout)
+NEUTRAL_COLOURS = {"--c-white", "--c-white-rgb", "--c-black", "--c-black-rgb", "--cp-black-rgb"}
 
 
 def _cyberpunk_values():
@@ -801,9 +816,10 @@ def test_theme_toggles_and_topbar_exist():
     for part in ("topbar", "drawer-toggle", "drawer-count", "topbar-nav", "topbar-more-wrap", "topbar-more-toggle",
                  "topbar-more", "topbar-services", "topbar-services-panel", "topbar-time", "drawer-scrim"):
         assert f'id="{part}"' in html, part
+    # Classic uses the top bar layout as well (it used to hide both): style.css must not hide them any more
     css = _strip_comments(_read(STYLE_CSS))
-    assert re.search(r"^#topbar\s*\{\s*display:\s*none;\s*\}", css, re.M), "the top bar shows in Classic"
-    assert re.search(r"^#drawer-scrim\s*\{\s*display:\s*none;\s*\}", css, re.M), "the drawer scrim shows in Classic"
+    assert not re.search(r"^(#topbar|#drawer-scrim)\s*\{[^}]*display:\s*none", css, re.M), \
+        "style.css hides the top bar or the drawer scrim in Classic"
 
 
 THEME_SWITCH_FUNCTIONS = ["normalizeTheme", "nextTheme", "currentTheme", "applyThemeLayout", "setTheme",
@@ -995,7 +1011,6 @@ def test_set_theme_moves_tabs_and_status_and_back():
         const events = [];
         document.addEventListener('tdc:themechange', e => events.push(e.detail));
         const shape = e => [e.tagName, e.id, e.attrs.class || '', e.children.map(shape)];
-        const markup = JSON.stringify(shape(page));
         const nav = document.querySelector('nav.sidebar-tabs');
         const tabs = [...nav.children];
         const status = document.getElementById('service-status');
@@ -1011,6 +1026,7 @@ def test_set_theme_moves_tabs_and_status_and_back():
         });
         setTheme('cyberpunk');
         const cyberpunk = view();
+        const markup = JSON.stringify(shape(page));
         const order = document.getElementById('topbar-nav').children.map(e => e.tagName + '#' + e.id);
         toggleTheme();
         const classic = view();
@@ -1019,13 +1035,15 @@ def test_set_theme_moves_tabs_and_status_and_back():
             sameNodes: document.querySelector('nav.sidebar-tabs') === nav
                 && tabs.every((tab, i) => nav.children[i] === tab) }));
     """, _switch_prelude())
-    to_classic, to_cyberpunk = ["Switch to Classic theme"] * 2, ["Switch to Cyberpunk theme"] * 2
+    # Both themes share the top bar layout (Classic is shown as "Telemetry"): the tab bar and the status
+    # stay in the top bar in either direction; only the target of the ✶ changes
+    to_telemetry, to_cyberpunk = ["Switch to Telemetry theme"] * 2, ["Switch to Cyberpunk theme"] * 2
     assert r["cyberpunk"] == {"theme": "cyberpunk", "stored": "cyberpunk", "nav": "topbar-nav",
-                              "status": "topbar-services-panel", "labels": [to_classic, to_classic]}
-    assert r["classic"] == {"theme": "classic", "stored": "classic", "nav": "sidebar-header",
-                            "status": "sidebar", "labels": [to_cyberpunk, to_cyberpunk]}
+                              "status": "topbar-services-panel", "labels": [to_telemetry, to_telemetry]}
+    assert r["classic"] == {"theme": "classic", "stored": "classic", "nav": "topbar-nav",
+                            "status": "topbar-services-panel", "labels": [to_cyberpunk, to_cyberpunk]}
     assert r["order"] == ["NAV#", "DIV#topbar-more-wrap"], "the tab bar is not in front of the … menu"
-    assert r["restored"], "after switching back the sidebar is not in the order of the markup"
+    assert r["restored"], "a switch rearranged the top bar"
     assert r["sameNodes"], "the tab bar was re-created: its click handlers are gone"
     assert r["events"] == [{"theme": "cyberpunk"}, {"theme": "classic"}]
     assert r["calls"] == [], "the switch reloaded the page or set the UI up again"
@@ -1068,20 +1086,22 @@ def test_page_load_lays_out_the_stored_theme():
 
 @needs_node
 def test_switching_with_the_keyboard_keeps_the_focus_on_a_visible_toggle():
-    """Each theme hides the other theme's ✶: the focus moves along with the switch."""
+    """A switch closes the drawer and with it the ✶ in the sidebar: a focus on that one moves to the ✶ in
+    the top bar (both themes have the top bar layout; the sidebar view of Classic is gone)."""
     r = _run_node(THEME_SWITCH_FUNCTIONS, r"""
         const $ = id => document.getElementById(id);
         setTheme('classic');                // start from Classic (Cyberpunk is the default)
         $('theme-toggle').focus();
         toggleTheme();
         const toCyberpunk = document.activeElement.id;
+        $('theme-toggle').focus();
         toggleTheme();
         const toClassic = document.activeElement.id;
         $('drawer-toggle').focus();
         setTheme('cyberpunk');
         console.log(JSON.stringify([toCyberpunk, toClassic, document.activeElement.id]));
     """, _switch_prelude())
-    assert r == ["theme-toggle-top", "theme-toggle", "drawer-toggle"]
+    assert r == ["theme-toggle-top", "theme-toggle-top", "drawer-toggle"]
 
 
 @needs_node
@@ -1285,7 +1305,9 @@ def test_tabs_that_do_not_fit_move_into_the_more_menu():
     assert r["mid"] == r["midAgain"] == {"shown": ["Alpha", "Beta", "Gamma", "Epsilon"], "menu": ["Delta", "Zeta"],
                                          "more": True}
     assert r["justTooNarrow"] == {"shown": six[:5], "menu": ["Zeta"], "more": True}
-    assert r["classic"] == {"shown": six, "menu": [], "more": False}, "Classic lost tabs to the … menu"
+    # Classic has the top bar as well now (it listed all tabs in its sidebar before): a switch keeps the tabs
+    # fitted to the bar, in the same place as in Cyberpunk
+    assert r["classic"] == r["justTooNarrow"], "Classic does not build the … menu"
 
 
 @needs_node
@@ -1379,6 +1401,8 @@ def test_drawer_and_drop_downs_open_and_close():
         setTheme('classic'); r.classic = [drawer(), services()];
         openDrawer(); r.classicOpen = drawer();
         toggleDrawer(); r.classicToggle = drawer();
+        toggleDrawer(); r.classicToggleAgain = drawer();
+        closeDrawer();
         setTheme('cyberpunk'); r.back = [drawer(), services()];
         console.log(JSON.stringify(r));
     """, _switch_prelude())
@@ -1392,7 +1416,8 @@ def test_drawer_and_drop_downs_open_and_close():
     assert r["layers"] == [[True, True, True, True], [False, True, True, True], [False, False, True, True],
                            [False, False, False, True], [False, False, False, False]]
     assert r["classic"] == [closed, "false"] and r["back"] == [closed, "false"]
-    assert r["classicOpen"] == r["classicToggle"] == closed, "Classic has no drawer"
+    # Classic has the drawer as well now (its sidebar view is gone)
+    assert r["classicOpen"] == r["classicToggleAgain"] == opened and r["classicToggle"] == closed, "no drawer in Classic"
 
 
 # /api/status as the VM answers it; "detonator" is not one of the five services.
@@ -1567,13 +1592,183 @@ def _unscoped_rules(css):
 
 
 def test_cyberpunk_css_is_scoped():
-    theme = _read(THEME_CSS)
+    theme = _raw(THEME_CSS)
     unscoped = _unscoped_rules(theme)
     assert not unscoped, "rules in theme-cyberpunk.css that also apply in Classic:\n" + "\n".join(unscoped)
-    names = [set(KEYFRAMES.findall(_strip_comments(_read(p)))) for p in (THEME_CSS, STYLE_CSS)]
-    assert not names[0] & names[1], f"@keyframes that replace Classic's animations: {sorted(names[0] & names[1])}"
+    names = [set(KEYFRAMES.findall(_strip_comments(_raw(p)))) for p in (THEME_CSS, LAYOUT_CSS, STYLE_CSS)]
+    for i, j in ((0, 2), (1, 2), (0, 1)):
+        assert not names[i] & names[j], f"@keyframes that replace another sheet's animations: {sorted(names[i] & names[j])}"
 
 
+# --- theme-layout.css: one window layout for both themes ------------------------
+
+LAYOUT_SCOPE = re.compile(r"(?::root)?\[data-theme\]")
+NAMED_COLOURS = re.compile(r"(?:^|[\s:,(])(?:white|black|red|green|blue|yellow|orange|gray|grey|cyan|magenta|purple|pink"
+                           r"|silver|gold|navy|teal|lime|aqua|maroon|olive)(?=[\s;,)!]|$)", re.I)
+
+
+def _layout_scope_problems(css):
+    """Rules that do not start with [data-theme] (see _unscoped_rules for the shape)."""
+    found = []
+    for prelude, body in _css_blocks(_strip_comments(css)):
+        at_rule = re.match(r"@(?:-\w+-)?([\w-]+)", prelude)
+        if not at_rule:
+            found += [s for s in _selectors(prelude) if not LAYOUT_SCOPE.match(s)]
+        elif at_rule.group(1).lower() in ("media", "supports") and body is not None:
+            found += _layout_scope_problems(body)
+        elif at_rule.group(1).lower() != "keyframes" or body is None:
+            found.append(prelude)
+    return found
+
+
+def test_layout_css_is_scoped_and_colourless():
+    """theme-layout.css applies in both themes ([data-theme], whatever its value) and paints with
+    variables only: a colour written in it would be the same in both palettes."""
+    css = _strip_comments(_raw(LAYOUT_CSS))
+    assert not _layout_scope_problems(css), "rules without the [data-theme] prefix:\n" + "\n".join(_layout_scope_problems(css))
+    assert not re.search(r"\[data-theme\s*=", css), "a rule of the layout that names a theme"
+    literals = [f"line {n}: {_literal(line, m)}" for n, line in enumerate(css.split("\n"), 1)
+                for m in LITERAL_COLOR.finditer(line)]
+    named = [f"line {n}: {line.strip()}" for n, line in enumerate(css.split("\n"), 1)
+             if re.match(r"\s*[\w-]+\s*:", line) and NAMED_COLOURS.search(line.split(":", 1)[1])]
+    assert not literals + named, "colours in theme-layout.css (use var(--...)):\n" + "\n".join((literals + named)[:20])
+    assert not re.search(r"\bhsla?\(|\bcolor-mix\(", css)
+
+
+def test_layout_scope_check_finds_what_it_should():
+    cases = {
+        ".tab { }": [".tab"],
+        "[data-theme] .a, .b {}": [".b"],
+        ':root[data-theme] { --a: 1; } [data-theme="x"] .c {}': ['[data-theme="x"] .c'],
+        "@media (max-width: 1px) { [data-theme] .d {} .e {} }": [".e"],
+        "@keyframes k { from { opacity: 0; } to { opacity: 1; } }": [],
+    }
+    assert {css: _layout_scope_problems(css) for css in cases} == cases
+
+
+def test_every_layout_variable_is_defined_in_both_themes():
+    """A var(--x) of theme-layout.css that a theme does not define stays empty there: Classic defines the
+    names in style.css :root, Cyberpunk in theme-cyberpunk.css :root (or style.css :root)."""
+    css = _strip_comments(_raw(LAYOUT_CSS))
+    used = set(re.findall(r"var\(\s*(--[\w-]+)\s*\)", css))
+    own = set(re.findall(r"(--[\w-]+)\s*:", css))            # set by a rule of the layout itself
+    classic = set(re.findall(r"(--[\w-]+)\s*:", ROOT_BLOCK.search(_strip_comments(_raw(STYLE_CSS))).group(0)))
+    cyberpunk = classic | set(re.findall(r"(--[\w-]+)\s*:", _strip_comments(_raw(THEME_CSS))))
+    assert used, "no variables found: the pattern is out of date"
+    problems = [f"{name} is not defined in {theme}" for name in sorted(used - own)
+                for theme, defined in (("Classic (style.css :root)", classic), ("Cyberpunk", cyberpunk))
+                if name not in defined]
+    assert not problems, "\n".join(problems)
+
+
+def _declarations(body):
+    """The declarations of a rule body as a set of 'property: value' (whitespace normalised)."""
+    out, depth, start, quote = set(), 0, 0, None
+    for i, ch in enumerate(body + ";"):
+        if quote:
+            quote = None if ch == quote else quote
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == ";" and depth == 0:
+            text = re.sub(r"\s+", " ", body[start:i]).strip()
+            if text:
+                out.add(text)
+            start = i + 1
+    return out
+
+
+def _flat_rules(css, context=""):
+    """(context, selector) -> list of declaration sets, the context being the chain of @media/@supports
+    preludes; @keyframes as one entry per name."""
+    rules = {}
+    for prelude, body in _css_blocks(_strip_comments(css)):
+        at_rule = re.match(r"@(?:-\w+-)?([\w-]+)", prelude)
+        if body is None:
+            continue
+        if not at_rule:
+            for selector in _selectors(prelude):
+                rules.setdefault((context, selector), []).append(frozenset(_declarations(body)))
+        elif at_rule.group(1).lower() in ("media", "supports"):
+            for key, value in _flat_rules(body, context + prelude + " | ").items():
+                rules.setdefault(key, []).extend(value)
+        else:
+            rules.setdefault((context, prelude), []).append(frozenset(re.sub(r"\s+", " ", body).strip().split(";")))
+    return rules
+
+
+def _as_cyberpunk(selector):
+    return re.sub(r"\[data-theme\]", '[data-theme="cyberpunk"]', selector)
+
+
+def test_cyberpunk_rules_unchanged():
+    """Splitting theme-cyberpunk.css into theme-layout.css and the palette must not change Cyberpunk: every
+    rule of the file as of e11a9dd (before the split; tests/samples/) is still there, with the same
+    declarations, once the [data-theme] prefix of the layout is read as [data-theme="cyberpunk"]; nothing
+    else is added. The :root blocks (variables) are compared by their effective values."""
+    def non_root(rules):
+        return {k: v for k, v in rules.items() if ":root" not in k[1]}
+    old = non_root(_flat_rules(_raw(OLD_THEME_CSS)))
+    new = {(c, _as_cyberpunk(s)): v
+           for (c, s), v in non_root({**_flat_rules(_raw(LAYOUT_CSS)), **_flat_rules(_raw(THEME_CSS))}).items()}
+    assert old and len(old) > 700, "the old sheet was not read"
+    missing = sorted(set(old) - set(new))
+    extra = sorted(set(new) - set(old))
+    assert not missing and not extra, f"missing: {missing[:5]}\nextra: {extra[:5]}"
+    changed = [key for key in old if sorted(map(sorted, old[key])) != sorted(map(sorted, new[key]))]
+    assert not changed, "rules with other declarations:\n" + "\n".join(f"{c}{s}" for c, s in changed[:10])
+    # The key selectors by name, so a failure reads well
+    for selector in ("#topbar", "#sidebar", ".stat-card", ".content-header", ".tab", ".btn", "#drawer-scrim"):
+        assert any(s.endswith(" " + selector) for _, s in old), selector
+    # Variables: every one the old file set on :root[data-theme="cyberpunk"] has its value (for the
+    # geometry, the one of style.css :root)
+    old_vars = {}
+    for m in CYBERPUNK_ROOT.finditer(_strip_comments(_raw(OLD_THEME_CSS))):
+        old_vars.update((n, v.strip()) for n, v in re.findall(r"(--[\w-]+)\s*:([^;]*);", m.group(2)))
+    new_vars = {**_root_values(), **_cyberpunk_values()}
+    assert {n: re.sub(r"\s+", "", v) for n, v in old_vars.items()} == {n: re.sub(r"\s+", "", new_vars[n]) for n in old_vars}
+
+
+@needs_node
+def test_classic_uses_the_topbar_layout():
+    """Classic has the top bar, the drawer and the "..." menu like Cyberpunk: setTheme('classic') moves the
+    tabs into #topbar-nav, builds the overflow menu, and the process list opens in the drawer."""
+    r = _run_node(THEME_SWITCH_FUNCTIONS + ["switchTab", "onTopbarOutsideClick", "initTopbar"], r"""
+        globalThis.state = { activeTab: 'alpha' };
+        globalThis.ResizeObserver = class { constructor() {} observe() {} };
+        const nav = document.querySelector('nav.sidebar-tabs');
+        nav.replaceChildren(...['Alpha', 'Beta', 'Gamma', 'Delta'].map((label, i) => {
+            const name = label.toLowerCase();
+            page.appendChild(new El({ tag: 'div', attrs: { id: 'tab-' + name, class: 'tab-content' } }));
+            return new El({ tag: 'button', attrs: { class: i ? 'tab' : 'tab active', 'data-tab': name }, text: label });
+        }));
+        nav.querySelectorAll('.tab').forEach(tab => { tab.width = 100; });
+        nav.computed = { columnGap: '2px', paddingLeft: '2px', paddingRight: '2px',
+                         borderLeftWidth: '0px', borderRightWidth: '0px' };
+        const area = document.getElementById('topbar-nav');
+        area.computed = { columnGap: '6px' };
+        area.width = 250;
+        document.getElementById('topbar-more-wrap').width = 40;
+        setTheme('classic');
+        initTopbar();
+        const wrap = document.getElementById('topbar-more-wrap');
+        const built = {
+            theme: document.documentElement.dataset.theme,
+            navIn: nav.parentElement.id,
+            statusIn: document.getElementById('service-status').parentElement.id,
+            menu: document.getElementById('topbar-more').children.map(i => i.textContent),
+            more: !wrap.hidden,
+        };
+        openDrawer();
+        console.log(JSON.stringify({ ...built, drawer: isDrawerOpen() }));
+    """, _switch_prelude())
+    assert r["theme"] == "classic" and r["navIn"] == "topbar-nav" and r["statusIn"] == "topbar-services-panel", r
+    # 250 px: Alpha, Beta and the 40 px … fit (254 px with the gaps do not leave room for a third tab)
+    assert r["more"] is True and r["menu"] and r["menu"][-1] == "Delta", "the … menu is not built in Classic"
+    assert r["drawer"] is True, "no drawer in Classic"
 def test_scope_check_finds_rules_that_reach_classic():
     cases = {
         ".tab { color: red; }": [".tab"],
@@ -3053,31 +3248,21 @@ def test_dashboard_tiles_count_and_open_their_lists():
 
 @needs_node
 def test_processes_tile_reveals_the_process_list():
-    """Classic: the process list of the sidebar scrolls into view and is
-    marked for about a second; Cyberpunk: the drawer with the list opens."""
-    r = _run_node(["revealProcessList", "revealSection", "revealElement", "currentTheme", "normalizeTheme", "openDrawer",
-                   "setDrawerOpen", "isDrawerOpen"], r"""
-        const timers = [];
-        globalThis.setTimeout = (fn, ms) => { timers.push([fn, ms]); return timers.length; };
-        globalThis.clearTimeout = () => {};
+    """In both themes the drawer with the process list opens. (Classic used to scroll its sidebar's list
+    into view and mark it for a second; the sidebar view is gone.)"""
+    r = _run_node(["revealProcessList", "openDrawer", "setDrawerOpen", "isDrawerOpen"], r"""
         const scrolled = [];
         El.prototype.scrollIntoView = function () { scrolled.push(this.id); };
-        const section = document.getElementById('process-list-section');
-        const marked = () => section.classList.contains('reveal-flash');
         const r = {};
-        document.documentElement.dataset.theme = 'classic';
-        revealProcessList();
-        r.classic = [scrolled.splice(0), marked(), isDrawerOpen(), timers.map(t => t[1])];
-        timers.splice(0).forEach(([fn]) => fn());
-        r.classicLater = marked();
-        document.documentElement.dataset.theme = 'cyberpunk';
-        revealProcessList();
-        r.cyberpunk = [scrolled.splice(0), marked(), isDrawerOpen()];
+        for (const theme of ['classic', 'cyberpunk']) {
+            document.documentElement.dataset.theme = theme;
+            setDrawerOpen(false);
+            revealProcessList();
+            r[theme] = [isDrawerOpen(), scrolled.splice(0)];
+        }
         console.log(JSON.stringify(r));
     """, _switch_prelude())
-    assert r["classic"] == [["process-list-section"], True, False, [1000]]
-    assert r["classicLater"] is False, "the mark stays"
-    assert r["cyberpunk"] == [[], False, True]
+    assert r == {"classic": [True, []], "cyberpunk": [True, []]}
 
 
 @needs_node

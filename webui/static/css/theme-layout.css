@@ -1,0 +1,2720 @@
+/* Detonation Chamber - window layout and controls, for both themes
+   Applies in every theme ([data-theme] is set on <html> by the boot script in
+   index.html): the top bar with the tabs and the "..." menu, the services
+   panel, the drawer, the tab heads, cards, tables, buttons and inputs.
+   It holds no colour of its own: every colour is a var(--...) that the
+   palette of the theme sets (style.css :root for Classic, theme-cyberpunk.css
+   for Cyberpunk), and the --cp-* names are defined by both
+   (tests/test_theme.py::test_every_layout_variable_is_defined_in_both_themes).
+   The rules were Cyberpunk's own until Classic took over the layout. */
+
+/* The fonts and the corner radius of the layout, in both themes. Cyberpunk
+   sets the same values again on its own :root. */
+:root[data-theme] {
+    --font-mono: var(--cp-font-label);
+    --font-sans: var(--cp-font-text);
+    --radius-lg: 6px;
+}
+
+/* --- Page: deep violet with a fine magenta grid and two glows at the top;
+   running text in the sans-serif, labels and data in the monospace --- */
+[data-theme] body {
+    font-family: var(--font-sans);
+    font-size: 14px;
+    background-color: var(--cp-bg);
+    background-image:
+        radial-gradient(1100px 520px at 14% -14%, rgba(var(--cp-magenta-rgb), .22), transparent 65%),
+        radial-gradient(900px 480px at 86% -16%, rgba(var(--cp-amber-rgb), .10), transparent 62%),
+        linear-gradient(rgba(var(--cp-magenta-rgb), .045) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(var(--cp-magenta-rgb), .045) 1px, transparent 1px);
+    background-size: auto, auto, 28px 28px, 28px 28px;
+}
+[data-theme] ::selection {
+    color: var(--cp-on-magenta);
+    background: var(--cp-magenta);
+}
+
+/* --- Layout: the top bar is fixed above, the content gets the full width
+   below it, and the sidebar becomes a drawer over the content --- */
+[data-theme] #app {
+    padding-top: var(--topbar-height);
+}
+
+/* The detail view slides in below the top bar, not under it */
+[data-theme] .detail-panel {
+    top: var(--topbar-height);
+    bottom: 0;
+    height: auto;
+}
+
+[data-theme] .toast-container {
+    top: calc(var(--topbar-height) + 12px);
+}
+
+/* --- Top bar: one row; only the tab area shrinks, and tabs that do not fit
+   go into the "…" menu (updateTabOverflow in app.js) --- */
+[data-theme] #topbar {
+    position: fixed;
+    top: 0;
+    right: 0;
+    left: 0;
+    z-index: 300;
+    height: var(--topbar-height);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 0 16px;
+    white-space: nowrap;
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-muted);
+    background: linear-gradient(180deg, var(--cp-bar-top), var(--cp-bar-bottom));
+    border-bottom: 1px solid rgba(var(--cp-magenta-rgb), .5);
+    box-shadow: 0 1px 0 rgba(var(--cp-magenta-rgb), .25), 0 8px 28px rgba(var(--cp-magenta-rgb), .12);
+}
+[data-theme] #topbar > * {
+    flex-shrink: 0;
+}
+
+/* Buttons of the top bar */
+[data-theme] #drawer-toggle,
+[data-theme] #topbar-services,
+[data-theme] #topbar-more-toggle,
+[data-theme] #topbar .btn-help,
+[data-theme] #topbar .btn-theme {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    height: 32px;
+    margin: 0;
+    padding: 0 12px;
+    font-family: var(--cp-font-label);
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-text-muted);
+    background: var(--cp-raised);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: color .15s, border-color .15s, box-shadow .15s;
+}
+[data-theme] #drawer-toggle:hover:not(:disabled),
+[data-theme] #drawer-toggle[aria-expanded="true"],
+[data-theme] #topbar-services:hover:not(:disabled),
+[data-theme] #topbar-services[aria-expanded="true"],
+[data-theme] #topbar-more-toggle:hover:not(:disabled),
+[data-theme] #topbar-more-toggle[aria-expanded="true"],
+[data-theme] #topbar .btn-help:hover:not(:disabled),
+[data-theme] #topbar .btn-theme:hover:not(:disabled) {
+    color: var(--cp-text);
+    border-color: var(--cp-magenta);
+    box-shadow: var(--cp-glow);
+}
+[data-theme] #topbar button:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: 2px;
+}
+[data-theme] #drawer-toggle {
+    color: var(--cp-text);
+}
+[data-theme] #drawer-count {
+    min-width: 22px;
+    padding: 2px 6px;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .05em;
+    text-align: center;
+    color: var(--cp-on-magenta);
+    background: var(--cp-magenta);
+    border-radius: 9px;
+}
+[data-theme] #topbar .btn-theme {
+    padding: 0 11px;
+    font-size: 14px;
+    letter-spacing: 0;
+}
+
+/* Logo (the original icon.png, only scaled) and name */
+[data-theme] .topbar-brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+[data-theme] .topbar-logo {
+    width: 32px;
+    height: 32px;
+    object-fit: contain;
+    border-radius: 6px;
+}
+[data-theme] .topbar-title {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .12em;
+    color: transparent;
+    background: var(--cp-heading);
+    -webkit-background-clip: text;
+    background-clip: text;
+}
+
+/* The tabs as one switch strip; the active tab is magenta with a glow */
+[data-theme] #topbar-nav {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+[data-theme] #topbar-nav .sidebar-tabs {
+    flex: none;
+    flex-wrap: nowrap;
+    gap: 2px;
+    padding: 2px;
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+}
+[data-theme] #topbar-nav .tab {
+    flex: none;
+    height: 26px;
+    padding: 0 10px;
+    font-family: var(--cp-font-label);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-text-muted);
+    background: transparent;
+    border: 0;
+    border-radius: 4px;
+    transition: color .15s, background .15s, box-shadow .15s;
+}
+[data-theme] #topbar-nav .tab:hover {
+    color: var(--cp-text);
+    background: var(--cp-raised);
+}
+[data-theme] #topbar-nav .tab.active {
+    color: var(--cp-on-magenta);
+    background: var(--cp-magenta);
+    box-shadow: var(--cp-glow);
+}
+[data-theme] #topbar-nav .tab.tab-overflow {
+    display: none;
+}
+
+/* "…": the tabs that do not fit */
+[data-theme] .topbar-more-wrap {
+    position: relative;
+    flex: none;
+}
+[data-theme] .topbar-more-wrap[hidden] {
+    display: none;
+}
+[data-theme] #topbar-more-toggle {
+    padding: 0 10px 7px;            /* "…" sits on the baseline: lift it to the middle */
+    font-size: 17px;
+    letter-spacing: 0;
+}
+
+/* Drop-downs below their button, open while it has aria-expanded="true" */
+[data-theme] #topbar-more,
+[data-theme] #topbar-services-panel {
+    display: none;
+    position: absolute;
+    top: calc(100% + 10px);
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: 0 0 0 1px rgba(var(--cp-black-rgb), .35), 0 14px 32px -12px rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme] #topbar-more {
+    left: 0;
+    min-width: 180px;
+    flex-direction: column;
+    gap: 2px;
+    padding: 6px;
+}
+[data-theme] #topbar-more-toggle[aria-expanded="true"] + #topbar-more {
+    display: flex;
+}
+[data-theme] .topbar-more-item {
+    padding: 8px 10px;
+    font-family: var(--cp-font-label);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .08em;
+    text-align: left;
+    text-transform: uppercase;
+    color: var(--cp-text-muted);
+    background: transparent;
+    border: 0;
+    border-radius: 4px;
+    cursor: pointer;
+}
+[data-theme] .topbar-more-item:hover,
+[data-theme] .topbar-more-item:focus-visible {
+    color: var(--cp-text);
+    background: var(--cp-raised);
+}
+/* The cyan focus ring of the top bar, inside the item */
+[data-theme] #topbar .topbar-more-item:focus-visible {
+    outline-offset: -2px;
+}
+
+/* Services: a dot and "n/m ONLINE"; the drop-down holds the status row */
+[data-theme] .topbar-services-wrap {
+    position: relative;
+}
+[data-theme] #topbar-services::after {
+    /* Not part of the button's name (aria-expanded says it opens) */
+    content: "\25BE";
+    content: "\25BE" / "";
+    font-size: 10px;
+    color: var(--cp-text-dim);
+}
+[data-theme] .topbar-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--cp-text-dim);
+}
+[data-theme] .topbar-dot.ok {
+    background: var(--cp-green);
+    box-shadow: 0 0 8px rgba(var(--cp-green-rgb), .7);
+}
+[data-theme] .topbar-dot.partial {
+    background: var(--cp-amber);
+    box-shadow: 0 0 8px rgba(var(--cp-amber-rgb), .7);
+}
+[data-theme] .topbar-dot.down {
+    background: var(--cp-red);
+    box-shadow: 0 0 8px rgba(var(--cp-red-rgb), .7);
+}
+[data-theme] #topbar-services-panel {
+    right: 0;
+    min-width: 230px;
+    padding: 12px 14px;
+}
+[data-theme] #topbar-services[aria-expanded="true"] + #topbar-services-panel {
+    display: block;
+}
+[data-theme] #topbar-services-panel::before {
+    content: "SERVICE STATUS";
+    display: block;
+    margin-bottom: 10px;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .12em;
+    color: var(--cp-cyan);
+}
+[data-theme] #topbar-services-panel .sidebar-footer {
+    padding: 0;
+    border-top: 0;
+    gap: 8px;
+}
+[data-theme] #topbar-services-panel .status-item {
+    gap: 8px;
+    font-family: var(--cp-font-label);
+    font-size: 11px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--cp-text-muted);
+}
+[data-theme] #topbar-services-panel .status-item .dot {
+    width: 8px;
+    height: 8px;
+    background: var(--cp-text-dim);
+}
+[data-theme] #topbar-services-panel .status-item.online .dot {
+    background: var(--cp-green);
+    box-shadow: 0 0 8px rgba(var(--cp-green-rgb), .7);
+}
+[data-theme] #topbar-services-panel .status-item.offline .dot {
+    background: var(--cp-red);
+    box-shadow: 0 0 8px rgba(var(--cp-red-rgb), .7);
+}
+[data-theme] #topbar-services-panel .status-item::after {
+    margin-left: auto;
+    padding-left: 16px;
+    font-size: 10.5px;
+    color: var(--cp-text-dim);
+}
+[data-theme] #topbar-services-panel .status-item.online::after {
+    content: "online";
+    color: var(--cp-green);
+}
+[data-theme] #topbar-services-panel .status-item.offline::after {
+    content: "offline";
+    color: var(--cp-red);
+}
+
+/* Time of the last status update */
+[data-theme] #topbar-time {
+    min-width: 9ch;
+    font-size: 11px;
+    letter-spacing: .05em;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    color: var(--cp-text-dim);
+}
+
+/* --- Drawer: process list and timeline, slid out of view until
+   ☰ PROCESSES opens it (#app.drawer-open) --- */
+[data-theme] #sidebar {
+    position: fixed;
+    top: var(--topbar-height);
+    bottom: 0;
+    left: 0;
+    z-index: 250;
+    width: var(--drawer-width);
+    min-width: 0;
+    background: var(--cp-card);
+    border-right: 1px solid rgba(var(--cp-magenta-rgb), .35);
+    box-shadow: 12px 0 36px -12px rgba(var(--cp-magenta-rgb), .35);
+    transform: translateX(-100%);
+    visibility: hidden;
+    transition: transform .22s ease, visibility 0s linear .22s;
+}
+[data-theme] #app.drawer-open #sidebar {
+    transform: none;
+    visibility: visible;
+    transition: transform .22s ease;
+}
+/* Logo, Help and ✶ are in the top bar */
+[data-theme] #sidebar .sidebar-header {
+    display: none;
+}
+[data-theme] #sidebar .sidebar-section {
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--cp-line);
+}
+[data-theme] #sidebar .section-header {
+    margin-bottom: 10px;
+}
+[data-theme] #sidebar .section-title {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .12em;
+    color: var(--cp-cyan);
+}
+[data-theme] #sidebar .badge {
+    padding: 1px 7px;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: .05em;
+    color: var(--cp-magenta);
+    background: rgba(var(--cp-magenta-rgb), .14);
+    border: 1px solid rgba(var(--cp-magenta-rgb), .35);
+    border-radius: 9px;
+}
+[data-theme] #sidebar .process-item:hover {
+    background: var(--cp-raised);
+}
+[data-theme] #sidebar .process-item.active {
+    background: rgba(var(--cp-magenta-rgb), .14);
+    box-shadow: inset 2px 0 0 var(--cp-magenta);
+}
+[data-theme] #sidebar .process-item .proc-icon {
+    background: var(--cp-cyan);
+}
+[data-theme] #sidebar .process-item .proc-icon.threat {
+    background: var(--cp-red);
+    box-shadow: 0 0 6px rgba(var(--cp-red-rgb), .6);
+}
+[data-theme] #sidebar .process-item .proc-name {
+    color: var(--cp-text);
+}
+[data-theme] #sidebar .process-item .proc-pid {
+    color: var(--cp-text-dim);
+}
+
+/* Darkens the content (not the top bar) while the drawer is open. Closed,
+   it lets every click through at once, not only after its fade. */
+[data-theme] #drawer-scrim {
+    display: block;
+    position: fixed;
+    top: var(--topbar-height);
+    right: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 200;
+    background: rgba(var(--cp-bg-rgb), .66);
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition: opacity .22s ease, visibility 0s linear .22s;
+}
+[data-theme] #app.drawer-open #drawer-scrim {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transition: opacity .22s ease;
+}
+
+/* --- Tab heads: the .content-header of each tab is a head area with a
+   green kicker line, the title in the heading gradient and the subtitle
+   below it; the controls stay on the right --- */
+[data-theme] .content-header {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "kicker actions" "title actions" "sub actions";
+    align-items: center;
+    column-gap: 24px;
+    padding: 16px 24px 14px;
+    background: linear-gradient(180deg, rgba(var(--cp-magenta-rgb), .06), rgba(var(--cp-magenta-rgb), 0));
+    border-bottom: 1px solid var(--cp-line);
+}
+[data-theme] .content-header::before {
+    /* Decoration: the empty alternative text keeps screen readers from reading
+       it before every title (the first line is for browsers without it) */
+    content: "TDC // DETONATION CHAMBER";
+    content: "TDC // DETONATION CHAMBER" / "";
+    grid-area: kicker;
+    margin-bottom: 4px;
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: .12em;
+    color: var(--cp-green);
+}
+[data-theme] .content-header h2 {
+    grid-area: title;
+    justify-self: start;
+    font-family: var(--cp-font-label);
+    font-size: 22px;
+    font-weight: 700;
+    line-height: 1.15;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: transparent;
+    background: var(--cp-heading);
+    -webkit-background-clip: text;
+    background-clip: text;
+}
+[data-theme] .content-subtitle {
+    grid-area: sub;
+    margin-top: 4px;
+    font-family: var(--cp-font-text);
+    font-size: 14px;
+    color: var(--cp-text-muted);
+}
+[data-theme] .content-header .header-actions {
+    grid-area: actions;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+[data-theme] .header-meta,
+[data-theme] .scanner-status {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    letter-spacing: .06em;
+    color: var(--cp-text-dim);
+}
+[data-theme] .scanner-status.online {
+    color: var(--cp-green);
+}
+
+/* Tracing and Graph have their own head rows: the same look, no kicker */
+[data-theme] .rtrace-header,
+[data-theme] .graph-toolbar {
+    padding: 12px 20px;
+    background: linear-gradient(180deg, rgba(var(--cp-magenta-rgb), .06), rgba(var(--cp-magenta-rgb), 0));
+    border-bottom: 1px solid var(--cp-line);
+}
+[data-theme] .rtrace-brand,
+[data-theme] .graph-title {
+    font-family: var(--cp-font-label);
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-text-muted);
+}
+[data-theme] .rtrace-brand-highlight,
+[data-theme] .graph-title {
+    font-style: normal;
+    color: transparent;
+    background: var(--cp-heading);
+    -webkit-background-clip: text;
+    background-clip: text;
+}
+[data-theme] .graph-subtitle {
+    font-family: var(--cp-font-text);
+    font-size: 13px;
+    color: var(--cp-text-muted);
+}
+
+/* --- Cards: card surface, a faint magenta edge, 6 px corners --- */
+[data-theme] .stat-card,
+[data-theme] .service-card,
+[data-theme] .activity-feed,
+[data-theme] .pipes-panel,
+[data-theme] .scanner-livemem,
+[data-theme] .scanner-placeholder,
+[data-theme] .ts-tools,
+[data-theme] .ts-tool-card,
+[data-theme] .die-overview,
+[data-theme] .pe-card,
+[data-theme] .elf-card,
+[data-theme] .det-panel,
+[data-theme] .detonation-section,
+[data-theme] .graph-sample-card,
+[data-theme] .help-card,
+[data-theme] .help-guide-item,
+[data-theme] .child-card,
+[data-theme] .fmap-tree,
+[data-theme] .fmap-inline,
+[data-theme] .hex-minimap-wrap,
+[data-theme] .sysmon-correlation,
+[data-theme] .lb-detail-panel {
+    background-color: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow);
+}
+/* Cards whose left edge shows a state or a severity keep it */
+[data-theme] .det-stage,
+[data-theme] .graph-landing-card {
+    background-color: var(--cp-card);
+    border-top-color: rgba(var(--cp-magenta-rgb), .22);
+    border-right-color: rgba(var(--cp-magenta-rgb), .22);
+    border-bottom-color: rgba(var(--cp-magenta-rgb), .22);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow);
+}
+[data-theme] .service-card:hover,
+[data-theme] .graph-landing-card:hover,
+[data-theme] .graph-sample-card:hover,
+[data-theme] .child-card:hover,
+[data-theme] .help-card:hover {
+    background-color: var(--cp-raised);
+    border-color: rgba(var(--cp-magenta-rgb), .6);
+    box-shadow: var(--cp-card-shadow), var(--cp-glow);
+}
+[data-theme] .service-card {
+    padding: 16px;
+}
+[data-theme] .service-card-glow {
+    opacity: .07;
+}
+[data-theme] .service-card-title h3 {
+    font-family: var(--cp-font-label);
+    font-size: 12px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+}
+[data-theme] .service-card-desc,
+[data-theme] .help-card-desc,
+[data-theme] .help-guide-item p {
+    font-family: var(--cp-font-text);
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--cp-text-muted);
+}
+[data-theme] .service-metric,
+[data-theme] .activity-counter {
+    background: rgba(var(--cp-bg-rgb), .7);
+    border-color: var(--cp-line);
+}
+[data-theme] .service-metric-value {
+    font-family: var(--cp-font-label);
+}
+[data-theme] .service-metric-label,
+[data-theme] .counter-label {
+    font-family: var(--cp-font-label);
+    font-size: 10px;
+    letter-spacing: .1em;
+    color: var(--cp-text-dim);
+}
+[data-theme] .service-status-badge {
+    font-family: var(--cp-font-label);
+    letter-spacing: .1em;
+    border: 1px solid currentColor;
+}
+/* Activity list and the rows inside cards keep the card surface */
+[data-theme] .dashboard-stats,
+[data-theme] .dashboard-activity {
+    border-color: var(--cp-line);
+}
+
+/* --- Tiles: a 3 px edge on the left in the colour of their severity
+   (alerts critical, processes info, services low, rules medium, tools
+   high), the figure in 28 px --- */
+[data-theme] .stat-card {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    padding: 16px 16px 14px 19px;
+    text-align: left;
+}
+[data-theme] .stat-card::before {
+    top: 0;
+    right: auto;
+    bottom: 0;
+    left: 0;
+    width: 3px;
+    height: auto;
+}
+[data-theme] .stat-card.stat-alerts::before {
+    background: var(--cp-tile-critical);
+}
+[data-theme] .stat-card.stat-processes::before {
+    background: var(--cp-cyan);
+}
+[data-theme] .stat-card.stat-services::before {
+    background: var(--cp-green);
+}
+[data-theme] .stat-card.stat-rules::before {
+    background: var(--cp-amber);
+}
+[data-theme] .stat-card.stat-tools::before {
+    background: var(--cp-orange);
+}
+[data-theme] .stat-value {
+    font-family: var(--cp-font-label);
+    font-size: 28px;
+    font-weight: 600;
+    margin-bottom: 8px;
+}
+[data-theme] .stat-label {
+    order: -1;
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    letter-spacing: .12em;
+    color: var(--cp-text-dim);
+}
+[data-theme] .stat-breakdown {
+    justify-content: flex-start;
+}
+[data-theme] .stat-tag {
+    font-family: var(--cp-font-label);
+    font-size: 10px;
+    letter-spacing: .04em;
+}
+
+/* --- Section titles: cyan, monospace, upper case --- */
+[data-theme] .activity-header h3,
+[data-theme] .scanner-history-header h3,
+[data-theme] .submissions-header h3,
+[data-theme] .pe-panel-header h3,
+[data-theme] .elf-panel-header h3,
+[data-theme] .detail-section-title,
+[data-theme] .det-sub-title,
+[data-theme] .det-panel-title,
+[data-theme] .detonation-section-title,
+[data-theme] .die-title,
+[data-theme] .die-section-title,
+[data-theme] .pe-card-title,
+[data-theme] .elf-card-title,
+[data-theme] .hex-minimap-title,
+[data-theme] .hex-inspector-title,
+[data-theme] .pipes-panel-title,
+[data-theme] .lb-scanners-title,
+[data-theme] .lb-sub-title,
+[data-theme] .lb-detail-title,
+[data-theme] .corr-panel-title,
+[data-theme] .fmap-legend-title,
+[data-theme] .fmap-tree-head,
+[data-theme] .capa-group-title,
+[data-theme] .rtrace-tree-header,
+[data-theme] .rtrace-timeline-label,
+[data-theme] .graph-landing-title,
+[data-theme] .help-section h4 {
+    font-family: var(--cp-font-label);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--cp-cyan);
+}
+[data-theme] .graph-landing-title {
+    font-size: 12px;
+}
+[data-theme] .det-panel-title {
+    background: rgba(var(--cp-cyan-rgb), .04);
+}
+
+/* --- Tables: head in cyan on the raised surface, rows divided by the line
+   colour, hover raised --- */
+[data-theme] .sysmon-events-table thead th,
+[data-theme] .alerts-table thead th,
+[data-theme] .pe-table th,
+[data-theme] .elf-table th,
+[data-theme] .corr-ref-table th,
+[data-theme] .submissions-table th,
+[data-theme] .help-api-table th,
+[data-theme] .det-alert-table th,
+[data-theme] .ember-more-table th,
+[data-theme] .mem-dump-table th,
+[data-theme] .pipes-table th,
+[data-theme] .rtrace-event-table-header {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-cyan);
+    background: var(--cp-raised);
+    border-bottom: 1px solid var(--cp-line);
+}
+[data-theme] .submissions-table thead,
+[data-theme] .help-api-table thead {
+    background: var(--cp-raised);
+}
+[data-theme] .sysmon-events-table td,
+[data-theme] .submissions-table td,
+[data-theme] .help-api-table td,
+[data-theme] .det-alert-table td,
+[data-theme] .mem-dump-table td,
+[data-theme] .pipes-table td,
+[data-theme] .pe-table td,
+[data-theme] .elf-table td {
+    border-bottom-color: var(--cp-line);
+}
+[data-theme] .sysmon-events-table tbody tr,
+[data-theme] .rtrace-event-row {
+    border-bottom-color: var(--cp-line);
+}
+[data-theme] .sysmon-events-table tbody tr:hover,
+[data-theme] .submissions-table tr:hover td,
+[data-theme] .help-api-table tr:hover td,
+[data-theme] .pipes-table tr:hover td,
+[data-theme] .rtrace-event-row:hover {
+    background: var(--cp-raised);
+}
+[data-theme] .help-api-table {
+    border-color: var(--cp-line);
+}
+
+/* --- Alerts tab: the filter bar on the page, the severity chips as switches
+   (a pressed one in its severity's colour with its glow), the count as a
+   label; the table takes the table look above. The bar stands at the top of
+   the tab while it scrolls (below the top bar): it is opaque, in the colour
+   of the page, so the rows pass under it unseen; so does the Sysmon tab's.
+   The chips of the chart filters: cyan, their × in magenta --- */
+[data-theme] .alerts-filters,
+[data-theme] .sysmon-filters {
+    padding: 12px 24px;
+    background: var(--cp-bg);
+}
+[data-theme] .alerts-sev-chip {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    letter-spacing: .08em;
+    color: var(--cp-text-dim);
+    background: var(--cp-raised);
+    border-color: rgba(var(--cp-magenta-rgb), .22);
+    border-radius: 4px;
+}
+[data-theme] .alerts-sev-chip[aria-pressed="false"]:hover:not(:disabled) {
+    color: var(--cp-text);
+    background: var(--cp-raised);
+    border-color: var(--cp-magenta);
+}
+[data-theme] .alerts-sev-chip.critical[aria-pressed="true"] {
+    box-shadow: 0 0 12px rgba(var(--severity-critical-rgb), .35);
+}
+[data-theme] .alerts-sev-chip.high[aria-pressed="true"] {
+    box-shadow: 0 0 12px rgba(var(--severity-high-rgb), .35);
+}
+[data-theme] .alerts-sev-chip.medium[aria-pressed="true"] {
+    box-shadow: 0 0 12px rgba(var(--severity-medium-rgb), .35);
+}
+[data-theme] .alerts-sev-chip.low[aria-pressed="true"] {
+    box-shadow: 0 0 12px rgba(var(--severity-low-rgb), .35);
+}
+[data-theme] .alerts-sev-chip.info[aria-pressed="true"] {
+    box-shadow: 0 0 12px rgba(var(--severity-info-rgb), .35);
+}
+[data-theme] .alerts-sev-chip:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: 2px;
+}
+[data-theme] .alerts-count {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-text-dim);
+}
+[data-theme] .alerts-filter-chip {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    letter-spacing: .04em;
+    color: var(--cp-text);
+    background: rgba(var(--cp-cyan-rgb), .08);
+    border-color: rgba(var(--cp-cyan-rgb), .45);
+    border-radius: 4px;
+}
+[data-theme] .alerts-filter-chip:hover {
+    background: rgba(var(--cp-cyan-rgb), .14);
+    border-color: var(--cp-cyan);
+    box-shadow: 0 0 12px rgba(var(--cp-cyan-rgb), .3);
+}
+[data-theme] .alerts-filter-chip:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: 2px;
+}
+[data-theme] .alerts-filter-chip-x {
+    color: var(--cp-magenta);
+}
+[data-theme] .alerts-filter-chip:hover .alerts-filter-chip-x {
+    color: var(--cp-magenta);
+    text-shadow: var(--cp-glow);
+}
+[data-theme] .alerts-filter-chip-kind {
+    color: var(--cp-text-dim);
+}
+[data-theme] .alerts-table-wrap {
+    padding: 0 24px 16px;
+}
+[data-theme] .alerts-table .alerts-limit-row td {
+    font-family: var(--cp-font-label);
+    letter-spacing: .06em;
+}
+
+/* --- Alerts tab: the drilldown bar of the design of the drilldown, a raised
+   card with a magenta edge and a faint glow; BACK filled in magenta with its
+   glow, as the main buttons; the steps a click goes back to in cyan and
+   underlined, the current one white; DRILLDOWN, the separators and the count
+   dim. It stands at the top of the tab as in Classic (style.css). The chips
+   of the chart filters in the tab: larger, cyan with a cyan edge, their × in
+   magenta --- */
+[data-theme] .alerts-drill {
+    margin: 14px 24px 0;
+    font-family: var(--cp-font-label);
+    letter-spacing: .04em;
+    background: var(--cp-raised);
+    border: 1px solid var(--cp-magenta);
+    border-radius: 6px;
+    box-shadow: 0 0 18px rgba(var(--cp-magenta-rgb), .25);
+}
+[data-theme] .alerts-drill-back {
+    background: var(--cp-magenta);
+    color: var(--cp-on-magenta);
+    border-color: var(--cp-magenta);
+    border-radius: 4px;
+    box-shadow: 0 0 12px rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme] .alerts-drill-back:hover {
+    background: var(--cp-magenta);
+    box-shadow: 0 0 20px rgba(var(--cp-magenta-rgb), .6);
+}
+[data-theme] .alerts-drill-back:focus-visible,
+[data-theme] .alerts-drill-step:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: 2px;
+}
+[data-theme] .alerts-drill-label {
+    color: var(--cp-text-dim);
+}
+[data-theme] .alerts-drill-step {
+    color: var(--cp-cyan);
+    text-decoration-color: rgba(var(--cp-cyan-rgb), .35);
+}
+[data-theme] .alerts-drill-step:hover {
+    text-decoration-color: var(--cp-cyan);
+    text-shadow: 0 0 8px rgba(var(--cp-cyan-rgb), .5);
+}
+[data-theme] .alerts-drill-step.is-current {
+    color: var(--cp-text);
+    text-shadow: none;
+}
+[data-theme] .alerts-drill-more,
+[data-theme] .alerts-drill-sep,
+[data-theme] .alerts-drill-count {
+    color: var(--cp-text-dim);
+}
+[data-theme] #tab-alerts .alerts-filter-chip {
+    font-size: 12px;
+    color: var(--cp-cyan);
+    border-color: var(--cp-cyan);
+}
+
+/* --- Buttons: raised, faint magenta edge; magenta with a glow on hover.
+   Primary actions are magenta with dark text. --- */
+[data-theme] .btn,
+[data-theme] .btn-xs,
+[data-theme] .btn-help,
+[data-theme] .btn-theme {
+    font-family: var(--cp-font-label);
+    font-weight: 600;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--cp-text-muted);
+    background: var(--cp-raised);
+    border: 1px solid rgba(var(--cp-magenta-rgb), .22);
+    border-radius: 4px;
+    transition: color .15s, border-color .15s, box-shadow .15s, background-color .15s;
+}
+[data-theme] .btn:hover:not(:disabled),
+[data-theme] .btn-xs:hover:not(:disabled),
+[data-theme] .btn-help:hover:not(:disabled),
+[data-theme] .btn-theme:hover:not(:disabled) {
+    color: var(--cp-text);
+    background: var(--cp-raised);
+    border-color: var(--cp-magenta);
+    box-shadow: var(--cp-glow);
+}
+[data-theme] .btn-primary,
+[data-theme] .etw-btn,
+[data-theme] .gd-focus-btn,
+[data-theme] .pivot-graph-btn {
+    font-family: var(--cp-font-label);
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-on-magenta);
+    background: var(--cp-magenta);
+    border: 1px solid var(--cp-magenta);
+    border-radius: 4px;
+    box-shadow: var(--cp-glow);
+}
+[data-theme] .btn-primary:hover:not(:disabled),
+[data-theme] .etw-btn:hover:not(:disabled),
+[data-theme] .gd-focus-btn:hover:not(:disabled),
+[data-theme] .pivot-graph-btn:hover:not(:disabled) {
+    color: var(--cp-on-magenta);
+    background: var(--cp-magenta);
+    border-color: var(--cp-magenta);
+    box-shadow: 0 0 20px rgba(var(--cp-magenta-rgb), .6);
+    opacity: 1;
+}
+[data-theme] .btn-primary:disabled,
+[data-theme] .etw-btn:disabled {
+    box-shadow: none;
+}
+[data-theme] .pivot-graph-btn.secondary {
+    color: var(--cp-magenta);
+    background: transparent;
+    box-shadow: none;
+}
+[data-theme] .btn-accent,
+[data-theme] .btn-lb-results {
+    color: var(--cp-cyan);
+    background: rgba(var(--cp-cyan-rgb), .08);
+    border-color: rgba(var(--cp-cyan-rgb), .35);
+}
+[data-theme] .btn-accent:hover:not(:disabled),
+[data-theme] .btn-lb-results:hover:not(:disabled) {
+    color: var(--cp-text);
+    background: rgba(var(--cp-cyan-rgb), .16);
+    border-color: var(--cp-cyan);
+    box-shadow: 0 0 14px rgba(var(--cp-cyan-rgb), .3);
+}
+/* Buttons that keep Classic's meaning: the outline variant, and stopping a
+   session or forwarding / dropping a held message in red and green */
+[data-theme] .btn-outline {
+    background: transparent;
+}
+[data-theme] .pipes-stop-btn {
+    color: var(--c-red-300);
+    border-color: rgba(var(--accent-red-rgb), .35);
+}
+[data-theme] .pipe-btn-forward {
+    color: var(--c-green-400);
+    border-color: rgba(var(--accent-green-rgb), .4);
+}
+[data-theme] .pipe-btn-drop {
+    color: var(--c-red-400);
+    border-color: rgba(var(--accent-red-rgb), .4);
+}
+/* Close buttons: wide enough for "✕ close" */
+[data-theme] .btn-close {
+    width: auto;
+    min-width: 28px;
+    padding: 0 8px;
+    font-size: 12px;
+    letter-spacing: .06em;
+    white-space: nowrap;
+}
+[data-theme] .btn:focus-visible,
+[data-theme] .btn-xs:focus-visible,
+[data-theme] .etw-btn:focus-visible,
+[data-theme] .tab:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: 2px;
+}
+
+/* --- Inputs: a dark field with a line edge; magenta edge when focused --- */
+[data-theme] .filter-input,
+[data-theme] .filter-select,
+[data-theme] .etw-filter,
+[data-theme] .etw-select,
+[data-theme] .graph-search-input,
+[data-theme] .rtrace-process-dropdown,
+[data-theme] .pipe-edit-hex {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text);
+    background-color: rgba(var(--cp-bg-rgb), .8);
+    border: 1px solid var(--cp-line);
+    border-radius: 4px;
+}
+[data-theme] .filter-input:focus,
+[data-theme] .filter-select:focus,
+[data-theme] .etw-filter:focus,
+[data-theme] .etw-select:focus,
+[data-theme] .graph-search-input:focus,
+[data-theme] .rtrace-process-dropdown:focus,
+[data-theme] .pipe-edit-hex:focus {
+    outline: none;
+    border-color: var(--cp-magenta);
+    box-shadow: 0 0 0 1px rgba(var(--cp-magenta-rgb), .35), var(--cp-glow);
+}
+[data-theme] .filter-input::placeholder,
+[data-theme] .etw-filter::placeholder,
+[data-theme] .graph-search-input::placeholder {
+    color: var(--cp-text-dim);
+}
+[data-theme] input[type="checkbox"],
+[data-theme] input[type="radio"] {
+    accent-color: var(--cp-magenta);
+}
+[data-theme] .option-label,
+[data-theme] .ts-opts-label,
+[data-theme] .pipes-field,
+[data-theme] .filemap-ctl,
+[data-theme] .hex-path-or {
+    font-family: var(--cp-font-label);
+    letter-spacing: .06em;
+    color: var(--cp-text-dim);
+}
+
+/* Drop zones: dashed magenta edge on the card surface */
+[data-theme] .hex-drop-zone,
+[data-theme] .scanner-drop-zone,
+[data-theme] .upload-zone,
+[data-theme] .lb-drop-zone {
+    background: rgba(var(--cp-card-rgb), .75);
+    border-color: rgba(var(--cp-magenta-rgb), .3);
+    border-radius: 6px;
+}
+[data-theme] .hex-drop-zone:hover,
+[data-theme] .hex-drop-zone.dragover,
+[data-theme] .scanner-drop-zone:hover,
+[data-theme] .scanner-drop-zone.dragover,
+[data-theme] .upload-zone:hover,
+[data-theme] .upload-zone.dragover,
+[data-theme] .lb-drop-zone:hover,
+[data-theme] .lb-drop-zone.dragover {
+    background: rgba(var(--cp-magenta-rgb), .06);
+    border-color: var(--cp-magenta);
+    box-shadow: var(--cp-glow);
+}
+[data-theme] .hex-drop-zone.has-file {
+    border-color: rgba(var(--cp-magenta-rgb), .35);
+}
+[data-theme] .hex-browse-link,
+[data-theme] .hex-change-file {
+    color: var(--cp-magenta);
+}
+
+/* --- Badges and chips: monospace, with an edge in their own colour --- */
+[data-theme] .badge,
+[data-theme] .stat-tag,
+[data-theme] .sev-badge,
+[data-theme] .event-severity,
+[data-theme] .detail-badge,
+[data-theme] .rtrace-sev-pill,
+[data-theme] .rtrace-engine-chip,
+[data-theme] .rtrace-rule-chip,
+[data-theme] .rtrace-tag,
+[data-theme] .rtrace-action-badge,
+[data-theme] .glc-badge,
+[data-theme] .pipe-action,
+[data-theme] .pipe-family,
+[data-theme] .pipe-flag,
+[data-theme] .pipes-state,
+[data-theme] .pipe-msg-state,
+[data-theme] .category-badge,
+[data-theme] .tag {
+    font-family: var(--cp-font-label);
+    letter-spacing: .05em;
+}
+[data-theme] .badge {
+    color: var(--cp-magenta);
+    background: rgba(var(--cp-magenta-rgb), .14);
+}
+[data-theme] .badge-green {
+    color: var(--cp-green);
+    background: rgba(var(--cp-green-rgb), .14);
+}
+[data-theme] .badge-red {
+    color: var(--cp-red);
+    background: rgba(var(--cp-red-rgb), .14);
+}
+[data-theme] .badge-dim {
+    color: var(--cp-text-dim);
+    background: rgba(var(--cp-text-muted-rgb), .08);
+}
+[data-theme] .rtrace-verdict-badge {
+    font-family: var(--cp-font-label);
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    box-shadow: 0 0 12px rgba(var(--cp-red-rgb), .45);
+}
+[data-theme] .rtrace-verdict-badge.clean,
+[data-theme] .rtrace-verdict-badge.unknown {
+    box-shadow: none;
+}
+/* --- Severity indicators: the spec's five colours, tints of the same
+   colour. Classic marks "high" partly in the red of critical, "medium" in
+   amber-400, "low" in blue and "info" in grey; here each severity has one
+   colour (tests/test_theme.py::test_cyberpunk_severity_indicators_use_the_spec_colours) --- */
+/* critical */
+[data-theme] .rtrace-sev-pill.critical,
+[data-theme] .rtrace-rule-chip.critical,
+[data-theme] .graph-detail-body .gd-badge.critical,
+[data-theme] .gd-activity-cell.critical .gd-act-num,
+[data-theme] .lb-risk-critical,
+[data-theme] .activity-entry.sev-high[data-sev="critical"] .activity-sev {
+    color: var(--severity-critical);
+}
+[data-theme] .rtrace-sev-pill.critical .sev-dot {
+    background: var(--severity-critical);
+}
+/* The feed's class sev-high covers critical and high; data-sev tells them
+   apart. The shared .sev-high colours every border !important (style.css),
+   so the edge of a critical entry has to be !important as well. */
+[data-theme] .activity-entry.sev-high[data-sev="critical"] {
+    border-left-color: rgba(var(--severity-critical-rgb), .55) !important;
+    background: rgba(var(--severity-critical-rgb), .03);
+}
+/* high */
+[data-theme] .rtrace-sev-pill.high,
+[data-theme] .rtrace-rule-chip.high,
+[data-theme] .graph-detail-body .gd-badge.high,
+[data-theme] .lb-risk-high,
+[data-theme] .pe-flag-item.sev-high .pe-flag-sev,
+[data-theme] .elf-flag-item.sev-high .elf-flag-sev,
+[data-theme] .sev-high .activity-sev,
+[data-theme] .det-alert-item.sev-high .det-alert-sev {
+    color: var(--severity-high);
+}
+[data-theme] .rtrace-sev-pill.high .sev-dot {
+    background: var(--severity-high);
+}
+[data-theme] .pe-flag-badge.high,
+[data-theme] .elf-flag-badge.high,
+[data-theme] .pe-status-tag.high,
+[data-theme] .elf-status-badge.high,
+[data-theme] .stat-tag.high,
+[data-theme] .lb-entry-score.high {
+    color: var(--severity-high);
+    background: rgba(var(--severity-high-rgb), .15);
+}
+[data-theme] .pe-flag-item.sev-high,
+[data-theme] .elf-flag-item.sev-high,
+[data-theme] .activity-entry.sev-high,
+[data-theme] .det-alert-item.sev-high {
+    border-left-color: var(--severity-high);
+    background: rgba(var(--severity-high-rgb), .03);
+}
+/* medium; the entropy status "warn" and the log level "warning" with it */
+[data-theme] .rtrace-sev-pill.medium,
+[data-theme] .lb-risk-medium,
+[data-theme] .pe-flag-item.sev-medium .pe-flag-sev,
+[data-theme] .elf-flag-item.sev-medium .elf-flag-sev,
+[data-theme] .sev-med .activity-sev,
+[data-theme] .det-alert-item.sev-medium .det-alert-sev {
+    color: var(--severity-medium);
+}
+[data-theme] .rtrace-sev-pill.medium .sev-dot {
+    background: var(--severity-medium);
+}
+[data-theme] .pe-flag-badge.med,
+[data-theme] .elf-flag-badge.med,
+[data-theme] .pe-status-tag.warn,
+[data-theme] .elf-status-badge.warn,
+[data-theme] .stat-tag.med,
+[data-theme] .lb-entry-score.med,
+[data-theme] .det-alert-sev.sev-medium,
+[data-theme] .etw-event-level.warning {
+    color: var(--severity-medium);
+    background: rgba(var(--severity-medium-rgb), .15);
+}
+[data-theme] .pe-flag-item.sev-medium,
+[data-theme] .elf-flag-item.sev-medium {
+    border-left-color: var(--severity-medium);
+    background: rgba(var(--severity-medium-rgb), .03);
+}
+[data-theme] .activity-entry.sev-med,
+[data-theme] .det-alert-item.sev-medium {
+    border-left-color: var(--severity-medium);
+}
+/* Detonation alert items of severity info: the info colour (Classic
+   leaves them unmarked) */
+[data-theme] .det-alert-item.sev-info {
+    border-left-color: var(--severity-info);
+}
+[data-theme] .det-alert-item.sev-info .det-alert-sev {
+    color: var(--severity-info);
+}
+[data-theme] .det-alert-sev.sev-info {
+    color: var(--severity-info);
+    background: rgba(var(--severity-info-rgb), .15);
+}
+[data-theme] .ev-sev-dot.info {
+    background: var(--severity-info);
+}
+/* low */
+[data-theme] .rtrace-sev-pill.low,
+[data-theme] .lb-risk-low,
+[data-theme] .pe-flag-item.sev-low .pe-flag-sev,
+[data-theme] .elf-flag-item.sev-low .elf-flag-sev,
+[data-theme] .sev-low .activity-sev,
+[data-theme] .det-alert-item.sev-low .det-alert-sev {
+    color: var(--severity-low);
+}
+[data-theme] .rtrace-sev-pill.low .sev-dot,
+[data-theme] .ev-sev-dot.low {
+    background: var(--severity-low);
+}
+[data-theme] .stat-tag.low,
+[data-theme] .pe-flag-badge.low,
+[data-theme] .elf-flag-badge.low,
+[data-theme] .det-alert-sev.sev-low {
+    color: var(--severity-low);
+    background: rgba(var(--severity-low-rgb), .15);
+}
+[data-theme] .activity-entry.sev-low,
+[data-theme] .pe-flag-item.sev-low,
+[data-theme] .elf-flag-item.sev-low,
+[data-theme] .det-alert-item.sev-low {
+    border-left-color: var(--severity-low);
+}
+/* info; Classic's border of .sev-info is !important */
+[data-theme] .sev-info {
+    color: var(--severity-info);
+    border-color: rgba(var(--severity-info-rgb), .55) !important;
+}
+[data-theme] .mem-finding.sev-info {
+    border-left-color: var(--severity-info);
+}
+[data-theme] .etw-event-level.information,
+[data-theme] .etw-event-level.info,
+[data-theme] .etw-event-level.verbose {
+    color: var(--severity-info);
+    background: rgba(var(--severity-info-rgb), .08);
+}
+
+/* --- Tracing console: bands on the page, the split view in cards --- */
+[data-theme] .rtrace-info-bar,
+[data-theme] .rtrace-severity-bar,
+[data-theme] .rtrace-timeline-section {
+    background: transparent;
+    border-bottom-color: var(--cp-line);
+}
+[data-theme] .rtrace-proc-name {
+    font-family: var(--cp-font-label);
+    font-size: 15px;
+    letter-spacing: .04em;
+}
+[data-theme] .rtrace-timeline-bar {
+    background: rgba(var(--cp-card-rgb), .85);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+}
+[data-theme] .rtrace-timeline-cursor {
+    background: var(--cp-magenta);
+}
+[data-theme] .rtrace-split {
+    border-top: 0;
+    gap: 12px;
+    padding: 12px 16px 16px;
+}
+[data-theme] .rtrace-tree-panel,
+[data-theme] .rtrace-detail-panel {
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow);
+}
+[data-theme] .rtrace-tree-header,
+[data-theme] .rtrace-detail-tabs {
+    background: var(--cp-raised);
+    border-bottom-color: var(--cp-line);
+}
+[data-theme] .rtrace-tab {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-text-dim);
+}
+[data-theme] .rtrace-tab:hover {
+    color: var(--cp-text);
+}
+[data-theme] .rtrace-tab.active {
+    color: var(--cp-text);
+    border-bottom-color: var(--cp-magenta);
+    box-shadow: inset 0 -12px 16px -14px rgba(var(--cp-magenta-rgb), .6);
+}
+[data-theme] .rtrace-tab.active .rtrace-tab-count {
+    color: var(--cp-magenta);
+}
+[data-theme] .rtrace-tree-item.active {
+    background: rgba(var(--cp-magenta-rgb), .1);
+    border-left-color: var(--cp-magenta);
+}
+[data-theme] .rtrace-event-row.selected {
+    background: rgba(var(--cp-magenta-rgb), .1);
+}
+
+/* --- Graph: the canvas on the page grid; legend, tooltip and detail view
+   as cards --- */
+[data-theme] .graph-container {
+    background-color: transparent;
+    background-image: radial-gradient(circle, rgba(var(--cp-magenta-rgb), .16) 1px, transparent 1px);
+}
+[data-theme] .graph-landing {
+    background-color: var(--cp-bg);
+    background-image:
+        linear-gradient(rgba(var(--cp-magenta-rgb), .045) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(var(--cp-magenta-rgb), .045) 1px, transparent 1px);
+    background-size: 28px 28px;
+    background-attachment: fixed;           /* on the grid of the page */
+}
+[data-theme] .graph-loading {
+    background: rgba(var(--cp-bg-rgb), .6);
+}
+[data-theme] .graph-zoom-controls,
+[data-theme] .graph-time-filter {
+    background: rgba(var(--cp-bg-rgb), .8);
+    border-color: var(--cp-line);
+}
+[data-theme] .graph-zoom-btn {
+    color: var(--cp-text-muted);
+    background: transparent;
+    border: 0;
+    box-shadow: none;
+}
+[data-theme] .graph-zoom-btn:hover:not(:disabled) {
+    color: var(--cp-text);
+    background: var(--cp-raised);
+    box-shadow: none;
+}
+[data-theme] .graph-time-btn.active {
+    color: var(--cp-on-magenta);
+    background: var(--cp-magenta);
+}
+[data-theme] .graph-toggle {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    letter-spacing: .04em;
+    color: var(--cp-text-muted);
+}
+[data-theme] .graph-legend {
+    font-family: var(--cp-font-label);
+    background: rgba(var(--cp-card-rgb), .92);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow);
+}
+[data-theme] .graph-tooltip,
+[data-theme] .fmap-tooltip {
+    background: rgba(var(--cp-card-rgb), .97);
+    border: 1px solid rgba(var(--cp-magenta-rgb), .45);
+    border-radius: 6px;
+    box-shadow: 0 0 0 1px rgba(var(--cp-black-rgb), .35), 0 10px 28px -10px rgba(var(--cp-magenta-rgb), .5);
+}
+[data-theme] .graph-breadcrumb {
+    font-family: var(--cp-font-label);
+    background: transparent;
+    border-bottom-color: var(--cp-line);
+}
+[data-theme] .graph-detail-panel {
+    background: rgba(var(--cp-card-rgb), .96);
+    border: 1px solid rgba(var(--cp-magenta-rgb), .35);
+    border-radius: 6px;
+    box-shadow: 0 0 0 1px rgba(var(--cp-black-rgb), .35), 0 12px 32px -12px rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme] .graph-detail-header {
+    font-family: var(--cp-font-label);
+    letter-spacing: .06em;
+    background: var(--cp-raised);
+    border-bottom-color: var(--cp-line);
+    border-radius: 6px 6px 0 0;
+}
+
+/* --- Hex editor and file map --- */
+/* With the PE/ELF panel open (up to 65 % of the window, and it scrolls)
+   the card keeps at least the room Classic leaves it at 1920 x 960: the
+   structure map, the file row, the status row and the top of the
+   inspector; the panel gives way. */
+[data-theme] .hex-editor-container {
+    min-height: 244px;
+    margin: 0 16px 12px;
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow);
+}
+[data-theme] .hex-minimap-wrap {
+    margin: 8px 8px 0;
+}
+[data-theme] .hex-file-info,
+[data-theme] .hex-status-bar {
+    font-family: var(--cp-font-label);
+    background: var(--cp-raised);
+    border-color: var(--cp-line);
+}
+[data-theme] .hex-editor-body {
+    background: rgba(var(--cp-bg-rgb), .85);
+}
+[data-theme] .hex-offset-col {
+    color: var(--cp-text-dim);
+    background: var(--cp-card);
+    border-right-color: var(--cp-line);
+}
+[data-theme] .hex-view .hex-byte.selected,
+[data-theme] .hex-ascii-col .ascii-char.selected {
+    color: var(--cp-on-magenta);
+    background: var(--cp-magenta);
+}
+[data-theme] .hex-view .hex-byte:hover,
+[data-theme] .hex-ascii-col .ascii-char:hover {
+    background: rgba(var(--cp-magenta-rgb), .2);
+}
+[data-theme] .hex-resize-handle {
+    background: var(--cp-line);
+}
+[data-theme] .hex-resize-handle:hover,
+[data-theme] .hex-resize-handle.active {
+    background: var(--cp-magenta);
+}
+[data-theme] .hex-inspector {
+    background: var(--cp-card);
+    border-left-color: var(--cp-line);
+}
+[data-theme] .pe-panel,
+[data-theme] .elf-panel {
+    margin: 0 16px 12px;
+    background: rgba(var(--cp-card-rgb), .6);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+}
+/* The ELF panel scrolls like the PE panel: the card above keeps its minimum
+   height, and a panel that does not scroll (Classic) would lose its end */
+[data-theme] .elf-panel {
+    max-height: 65vh;
+    overflow-y: auto;
+}
+[data-theme] .pe-panel-header,
+[data-theme] .elf-panel-header {
+    background: var(--cp-raised);
+    border-bottom-color: var(--cp-line);
+}
+[data-theme] .fmap-view {
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow);
+}
+[data-theme] .fmap-canvas {
+    border-color: var(--cp-line);
+}
+[data-theme] .fmap-strip-viewport {
+    border-color: var(--cp-magenta);
+    box-shadow: 0 0 10px rgba(var(--cp-magenta-rgb), .5);
+}
+
+/* --- Pipes tab --- */
+[data-theme] .pipes-body {
+    gap: 14px;
+    padding: 14px 16px 16px;
+}
+[data-theme] .pipes-panel-head {
+    background: var(--cp-raised);
+    border-bottom-color: var(--cp-line);
+}
+[data-theme] .pipes-session-item.active {
+    background: rgba(var(--cp-magenta-rgb), .1);
+    box-shadow: inset 2px 0 0 var(--cp-magenta);
+}
+[data-theme] .pipes-session-item:hover {
+    background: var(--cp-raised);
+}
+[data-theme] .pss-pattern,
+[data-theme] .pipes-sh-name {
+    font-family: var(--cp-font-label);
+}
+[data-theme] .pipe-msg {
+    background: rgba(var(--cp-bg-rgb), .55);
+    border-color: var(--cp-line);
+    border-radius: 4px;
+}
+[data-theme] .pipe-msg-c2s {
+    border-left-color: var(--c-sky-400);
+}
+[data-theme] .pipe-msg-s2c {
+    border-left-color: var(--accent-purple);
+}
+[data-theme] .pipe-msg-held {
+    border-color: rgba(var(--c-amber-400-rgb), .55);
+}
+[data-theme] .pipe-msg-head {
+    font-family: var(--cp-font-label);
+}
+[data-theme] .pipes-limits {
+    font-family: var(--cp-font-text);
+    font-size: 12px;
+    border-bottom-color: var(--cp-line);
+}
+
+/* --- Detail view: the same structure, as a card that slides over the
+   content with a magenta edge --- */
+[data-theme] .detail-panel {
+    background: var(--cp-card);
+    border-left: 1px solid rgba(var(--cp-magenta-rgb), .45);
+    box-shadow: -14px 0 40px -12px rgba(var(--cp-magenta-rgb), .35), -4px 0 20px rgba(var(--cp-black-rgb), .5);
+}
+[data-theme] .detail-header {
+    background: linear-gradient(180deg, var(--cp-bar-top), var(--cp-raised));
+    border-bottom-color: rgba(var(--cp-magenta-rgb), .25);
+}
+[data-theme] .detail-title {
+    font-family: var(--cp-font-label);
+    font-size: 14px;
+    letter-spacing: .04em;
+}
+[data-theme] .detail-meta {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-dim);
+}
+[data-theme] .detail-section-title {
+    border-bottom-color: var(--cp-line);
+}
+[data-theme] .field-label {
+    font-family: var(--cp-font-label);
+    font-size: 11px;
+    letter-spacing: .04em;
+    color: var(--cp-text-dim);
+}
+[data-theme] .activity-counter.active {
+    border-color: var(--cp-magenta);
+    box-shadow: var(--cp-glow);
+}
+[data-theme] .raw-structured {
+    background: var(--cp-line);
+    border-color: var(--cp-line);
+}
+[data-theme] .raw-field,
+[data-theme] .raw-json,
+[data-theme] .raw-json-pretty,
+[data-theme] .hex-preview {
+    background: rgba(var(--cp-bg-rgb), .92);
+}
+[data-theme] .raw-field:hover {
+    background: var(--cp-raised);
+}
+[data-theme] .related-card {
+    background: var(--cp-raised);
+    border-color: rgba(var(--cp-magenta-rgb), .3);
+    border-radius: 6px;
+}
+
+/* --- Help --- */
+[data-theme] .help-modal-backdrop {
+    background: rgba(var(--cp-bg-rgb), .78);
+}
+[data-theme] .help-modal-content {
+    background: var(--cp-card);
+    border: 1px solid rgba(var(--cp-magenta-rgb), .45);
+    border-radius: 6px;
+    box-shadow: 0 0 0 1px rgba(var(--cp-black-rgb), .35), 0 24px 70px -20px rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme] .help-header {
+    background: linear-gradient(180deg, var(--cp-bar-top), var(--cp-bar-bottom));
+    border-bottom-color: rgba(var(--cp-magenta-rgb), .35);
+}
+[data-theme] .help-title {
+    font-family: var(--cp-font-label);
+    font-size: 16px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: transparent;
+    background: var(--cp-heading);
+    -webkit-background-clip: text;
+    background-clip: text;
+}
+[data-theme] .help-version {
+    font-family: var(--cp-font-label);
+    letter-spacing: .06em;
+    color: var(--cp-green);
+}
+[data-theme] .help-tabs {
+    background: var(--cp-raised);
+    border-bottom-color: var(--cp-line);
+}
+[data-theme] .help-tab {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-text-dim);
+}
+[data-theme] .help-tab:hover {
+    color: var(--cp-text);
+    background: rgba(var(--cp-magenta-rgb), .06);
+}
+[data-theme] .help-tab.active {
+    color: var(--cp-text);
+    border-bottom-color: var(--cp-magenta);
+}
+[data-theme] .help-section h3 {
+    font-family: var(--cp-font-label);
+    font-size: 15px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+}
+[data-theme] .help-section p,
+[data-theme] .help-steps li,
+[data-theme] .help-list li {
+    font-family: var(--cp-font-text);
+    font-size: 14px;
+    line-height: 1.6;
+}
+[data-theme] .help-card-title,
+[data-theme] .help-guide-item h4 {
+    font-family: var(--cp-font-label);
+    font-size: 11px;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+}
+[data-theme] .help-guide-item h4 {
+    color: var(--cp-cyan);
+}
+[data-theme] .help-arch-diagram,
+[data-theme] .help-code {
+    background: rgba(var(--cp-bg-rgb), .9);
+    border-color: var(--cp-line);
+}
+[data-theme] .help-footer {
+    font-family: var(--cp-font-label);
+    background: var(--cp-bar-bottom);
+    border-top-color: var(--cp-line);
+}
+[data-theme] .help-footer a {
+    color: var(--cp-magenta);
+}
+
+/* --- Toasts: cards with a coloured edge --- */
+[data-theme] .toast {
+    font-family: var(--cp-font-text);
+    font-size: 13px;
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-left-width: 3px;
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow), 0 10px 28px -12px rgba(var(--cp-black-rgb), .6);
+}
+[data-theme] .toast-title {
+    font-family: var(--cp-font-label);
+    font-size: 11px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+}
+[data-theme] .toast.toast-success {
+    border-left-color: var(--cp-green);
+}
+[data-theme] .toast.toast-error {
+    border-left-color: var(--cp-red);
+}
+[data-theme] .toast.toast-warning {
+    border-left-color: var(--cp-amber);
+}
+[data-theme] .toast.toast-info {
+    border-left-color: var(--cp-cyan);
+}
+
+/* --- Loading overlay and scroll bars --- */
+[data-theme] .loading-spinner {
+    border-color: rgba(var(--cp-magenta-rgb), .2);
+    border-top-color: var(--cp-magenta);
+    box-shadow: 0 0 12px rgba(var(--cp-magenta-rgb), .3);
+}
+[data-theme] .loading-text {
+    font-family: var(--cp-font-label);
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--cp-text-muted);
+}
+[data-theme] ::-webkit-scrollbar-track {
+    background: transparent;
+}
+[data-theme] ::-webkit-scrollbar-thumb {
+    background: var(--cp-line);
+}
+[data-theme] ::-webkit-scrollbar-thumb:hover {
+    background: rgba(var(--cp-magenta-rgb), .55);
+}
+
+/* --- (i) explanations and sortable tables: the (i) as a small cyan switch
+   that lights up while its text is open, the popover as a card with a
+   magenta edge; the sorted column's arrow in magenta with a glow --- */
+[data-theme] .info-btn {
+    width: 16px;
+    height: 16px;
+    font-family: var(--cp-font-label);
+    font-size: 10px;
+    color: var(--cp-cyan);
+    background: var(--cp-raised);
+    border: 1px solid rgba(var(--cp-cyan-rgb), .45);
+}
+[data-theme] .info-btn:hover:not(:disabled),
+[data-theme] .info-btn[aria-expanded="true"] {
+    color: var(--cp-on-magenta);
+    background: var(--cp-cyan);
+    border-color: var(--cp-cyan);
+    box-shadow: 0 0 10px rgba(var(--cp-cyan-rgb), .45);
+}
+[data-theme] .info-btn:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: 2px;
+}
+[data-theme] .info-popover {
+    padding: 10px 12px;
+    font-family: var(--cp-font-text);
+    font-size: 13px;
+    color: var(--cp-text);
+    background: rgba(var(--cp-card-rgb), .98);
+    border: 1px solid rgba(var(--cp-magenta-rgb), .45);
+    border-radius: 6px;
+    box-shadow: 0 0 0 1px rgba(var(--cp-black-rgb), .35), 0 10px 28px -10px rgba(var(--cp-magenta-rgb), .5);
+}
+[data-theme] table[data-sortable] > thead > tr > th:not([data-no-sort]):not(:empty):hover {
+    color: var(--cp-text);
+}
+[data-theme] table[data-sortable] > thead > tr > th:not([data-no-sort]):not(:empty)[aria-sort]::after {
+    color: var(--cp-magenta);
+    text-shadow: 0 0 8px rgba(var(--cp-magenta-rgb), .6);
+}
+[data-theme] table[data-sortable] > thead > tr > th:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: -2px;
+}
+
+/* --- CHART / TABLE, the tiles and the Tracing grid heads: the switch as a
+   small cyan control that turns magenta under the pointer, the table views in
+   the table look above, tiles lit like the cards under the pointer, the
+   sorted grid head's arrow in magenta with a glow --- */
+[data-theme] .view-toggle {
+    height: 16px;
+    padding: 0 8px;
+    font-family: var(--cp-font-label);
+    font-size: 10px;
+    letter-spacing: .1em;
+    color: var(--cp-cyan);
+    background: var(--cp-raised);
+    border: 1px solid rgba(var(--cp-cyan-rgb), .45);
+    border-radius: 4px;
+    transition: color .15s, border-color .15s, box-shadow .15s, background-color .15s;
+}
+[data-theme] .view-toggle:hover:not(:disabled) {
+    color: var(--cp-on-magenta);
+    background: var(--cp-magenta);
+    border-color: var(--cp-magenta);
+    box-shadow: var(--cp-glow);
+}
+[data-theme] .view-toggle:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: 2px;
+}
+[data-theme] .view-table th {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-cyan);
+    background: var(--cp-raised);
+    border-bottom: 1px solid var(--cp-line);
+}
+[data-theme] .view-table td {
+    border-bottom-color: var(--cp-line);
+}
+[data-theme] .view-table tbody tr:hover td {
+    background: var(--cp-raised);
+}
+[data-theme] .stat-card[role="button"] {
+    transition: border-color .15s, background-color .15s, box-shadow .15s;
+}
+[data-theme] .stat-card[role="button"]:hover {
+    background-color: var(--cp-raised);
+    border-color: rgba(var(--cp-magenta-rgb), .6);
+    box-shadow: var(--cp-card-shadow), var(--cp-glow);
+}
+[data-theme] .stat-card[role="button"]:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: 2px;
+}
+[data-theme] .rtrace-event-table-header > .rtrace-col:hover {
+    color: var(--cp-text);
+}
+[data-theme] .rtrace-event-table-header > .rtrace-col[aria-sort="ascending"]::after,
+[data-theme] .rtrace-event-table-header > .rtrace-col[aria-sort="descending"]::after {
+    color: var(--cp-magenta);
+    text-shadow: 0 0 8px rgba(var(--cp-magenta-rgb), .6);
+}
+[data-theme] .rtrace-event-table-header > .rtrace-col:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: -2px;
+}
+
+/* --- Charts: the cards in the card look, their titles like the section
+   titles (cyan, monospace, upper case); the parts of the charts take the
+   palette through the variables of style.css --- */
+[data-theme] .chart-card {
+    background-color: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow);
+}
+[data-theme] .chart-card-title {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--cp-cyan);
+}
+
+/* --- Alerts tab charts: the cards above the filter bar spaced like the
+   bar, the note in the label font, LINEAR pressed in cyan --- */
+[data-theme] .alerts-charts {
+    gap: 12px;
+    padding: 14px 24px 12px;
+}
+[data-theme] .alerts-chart-strip {
+    gap: 12px;
+}
+[data-theme] .alerts-chart-note {
+    font-family: var(--cp-font-label);
+    letter-spacing: .04em;
+    color: var(--cp-text-dim);
+}
+[data-theme] .chart-scale-toggle[aria-pressed="true"] {
+    color: var(--cp-cyan);
+    background: rgba(var(--cp-cyan-rgb), .16);
+    border-color: var(--cp-cyan);
+    box-shadow: 0 0 10px rgba(var(--cp-cyan-rgb), .35);
+}
+
+/* --- Sysmon tab charts: the cards above the filter bar spaced like the
+   bar, the note in the label font --- */
+[data-theme] .sysmon-charts {
+    gap: 12px;
+    padding: 14px 24px 12px;
+}
+[data-theme] .sysmon-chart-note {
+    font-family: var(--cp-font-label);
+    letter-spacing: .04em;
+    color: var(--cp-text-dim);
+}
+
+/* --- Dashboard charts: the row spaced like the tiles, the switch of the
+   range as small labels with the preset in effect in magenta (as the tab in
+   the top bar), the sparkline of a tile under its tags on the left, the
+   notes in the label font --- */
+[data-theme] .chart-range {
+    border-color: rgba(var(--cp-magenta-rgb), .35);
+    border-radius: 4px;
+}
+[data-theme] .chart-range-btn {
+    height: 16px;
+    padding: 0 7px;
+    font-family: var(--cp-font-label);
+    font-size: 10px;
+    letter-spacing: .1em;
+    color: var(--cp-text-muted);
+    border-left-color: rgba(var(--cp-magenta-rgb), .22);
+    transition: color .15s, background-color .15s, box-shadow .15s;
+}
+[data-theme] .chart-range-btn:hover:not(:disabled) {
+    color: var(--cp-text);
+    background: var(--cp-raised);
+}
+[data-theme] .chart-range-btn[aria-pressed="true"] {
+    color: var(--cp-on-magenta);
+    background: var(--cp-magenta);
+    box-shadow: var(--cp-glow);
+}
+[data-theme] .chart-range-btn:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: -2px;
+}
+[data-theme] .stat-spark {
+    justify-content: flex-start;
+    margin-top: 10px;
+}
+[data-theme] .stat-spark-label,
+[data-theme] .dashboard-bars-note {
+    font-family: var(--cp-font-label);
+    letter-spacing: .04em;
+    color: var(--cp-text-dim);
+}
+
+/* --- RIZIN tab as in its mockup: the toolbar and the panels on the card
+   surface with a faint magenta edge, cyan heads, tabs as small cyan labels
+   with the chosen one filled, the current function and instruction in
+   magenta; the instructions take their colours from the accents (cyan
+   addresses, magenta calls, green jumps, amber symbols, gold strings) --- */
+[data-theme] .rizin-toolbar {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-muted);
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+}
+[data-theme] .rizin-file-path {
+    color: var(--cp-text);
+}
+[data-theme] .rizin-file-tag {
+    color: var(--cp-text-muted);
+    background: var(--cp-raised);
+}
+[data-theme] .rizin-file-sha,
+[data-theme] .rizin-seek-label {
+    color: var(--cp-text-dim);
+}
+[data-theme] .rizin-state {
+    font-family: var(--cp-font-label);
+    letter-spacing: .04em;
+}
+[data-theme] .rizin-seek-input {
+    background-color: var(--cp-bg);
+    border-color: rgba(var(--cp-magenta-rgb), .35);
+}
+[data-theme] .rizin-open-menu {
+    background: var(--cp-card);
+    border: 1px solid rgba(var(--cp-magenta-rgb), .45);
+    border-radius: 6px;
+    box-shadow: 0 14px 36px -12px rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme] .rizin-open-head {
+    font-family: var(--cp-font-label);
+    letter-spacing: .1em;
+    color: var(--cp-cyan);
+}
+[data-theme] .rizin-open-item {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text);
+}
+[data-theme] .rizin-open-item:hover,
+[data-theme] .rizin-open-item:focus-visible {
+    background: rgba(var(--cp-magenta-rgb), .12);
+    border-color: rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme] .rizin-open-meta,
+[data-theme] .rizin-open-empty {
+    color: var(--cp-text-dim);
+}
+[data-theme] .rizin-panel {
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+}
+[data-theme] .rizin-panel-title {
+    font-family: var(--cp-font-label);
+    letter-spacing: .1em;
+    color: var(--cp-cyan);
+}
+[data-theme] .rizin-fold {
+    color: var(--cp-cyan);
+}
+[data-theme] .rizin-fold:hover {
+    border-color: rgba(var(--cp-cyan-rgb), .45);
+}
+[data-theme] .rizin-fold:focus-visible,
+[data-theme] .rizin-tab:focus-visible,
+[data-theme] .rizin-tool:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: 1px;
+}
+[data-theme] .rizin-filter {
+    border-color: rgba(var(--cp-magenta-rgb), .22);
+}
+[data-theme] .rizin-fn-head {
+    color: var(--cp-cyan);
+    border-bottom-color: var(--cp-line);
+}
+[data-theme] .rizin-fn {
+    font-family: var(--cp-font-label);
+}
+[data-theme] .rizin-fn:hover {
+    background: var(--cp-raised);
+}
+[data-theme] .rizin-fn.current {
+    background: rgba(var(--cp-magenta-rgb), .16);
+    box-shadow: inset 0 0 0 1px rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme] .rizin-fn-name {
+    color: var(--c-slate-300);
+}
+[data-theme] .rizin-fn.current .rizin-fn-name {
+    color: var(--cp-magenta);
+}
+[data-theme] .rizin-fn-size,
+[data-theme] .rizin-fn-count {
+    color: var(--cp-text-dim);
+}
+[data-theme] .rizin-split {
+    color: var(--text-dim);
+    border-left-color: var(--cp-line);
+    border-right-color: var(--cp-line);
+}
+[data-theme] .rizin-split:hover,
+[data-theme] .rizin-split.rizin-split-drag,
+[data-theme] .rizin-split:focus-visible {
+    color: var(--cp-magenta);
+    border-color: rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme] .rizin-tab {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-dim);
+    border-color: rgba(var(--cp-cyan-rgb), .3);
+}
+[data-theme] .rizin-tab:hover {
+    color: var(--cp-text);
+}
+[data-theme] .rizin-tab[aria-selected="true"] {
+    color: var(--cp-on-magenta);
+    background: var(--cp-cyan);
+    border-color: var(--cp-cyan);
+}
+[data-theme] .rizin-disasm {
+    background: none;
+    border-color: transparent;
+}
+[data-theme] .rizin-op {
+    font-family: var(--cp-font-label);
+    color: var(--c-slate-300);
+}
+[data-theme] .rizin-op:hover {
+    background: rgba(var(--cp-magenta-rgb), .05);
+}
+[data-theme] .rizin-op.current {
+    background: rgba(var(--cp-magenta-rgb), .12);
+    box-shadow: inset 0 0 0 1px rgba(var(--cp-magenta-rgb), .35);
+}
+[data-theme] .rizin-console {
+    background: var(--c-navy-990);
+    border-color: var(--cp-line);
+    border-radius: 4px;
+}
+[data-theme] .rizin-empty {
+    font-family: var(--cp-font-text);
+    color: var(--cp-text-dim);
+}
+/* GRAPH as in its mockup: dark blocks with a faint violet edge on the panel,
+   cyan addresses, the instructions in the muted text colour, the block of the
+   current address edged in magenta; the edges keep the accents (green jump,
+   red fall-through, dim unconditional) */
+[data-theme] .rizin-tool {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-dim);
+    border-color: rgba(var(--cp-cyan-rgb), .3);
+}
+[data-theme] .rizin-tool:hover:not(:disabled) {
+    color: var(--cp-text);
+}
+[data-theme] .rizin-tool[aria-pressed="true"] {
+    color: var(--cp-on-magenta);
+    background: var(--cp-cyan);
+    border-color: var(--cp-cyan);
+}
+[data-theme] .rizin-graph-view {
+    background: none;
+    border-color: transparent;
+}
+[data-theme] .rizin-graph-svg text {
+    font-family: var(--cp-font-label);
+}
+[data-theme] .rizin-block-box {
+    fill: rgba(var(--cp-bg-rgb), .7);
+    stroke: rgba(var(--cp-violet-rgb), .25);
+}
+[data-theme] .rizin-block:hover .rizin-block-box {
+    stroke: rgba(var(--cp-magenta-rgb), .55);
+}
+[data-theme] .rizin-block.current .rizin-block-box {
+    fill: rgba(var(--cp-magenta-rgb), .08);
+    stroke: var(--cp-magenta);
+}
+[data-theme] .rizin-block-addr {
+    fill: var(--cp-cyan);
+}
+[data-theme] .rizin-block-line {
+    fill: var(--cp-text-muted);
+}
+[data-theme] .rizin-block-more {
+    fill: var(--cp-text-dim);
+}
+[data-theme] .rizin-graph-overview .rizin-block-box {
+    fill: rgba(var(--cp-magenta-rgb), .14);
+    stroke: rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme] .rizin-graph-overview .rizin-block.current .rizin-block-box {
+    fill: var(--cp-magenta);
+}
+[data-theme] .rizin-graph-info {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-dim);
+}
+[data-theme] #tab-rizin.rizin-dragover .rizin-work {
+    outline-color: var(--cp-magenta);
+}
+/* The dock as in its mockup: ═ dim until it is used, the note dim, the quick
+   commands as small cyan labels; the console on the page's deepest violet
+   with the prompt in amber, the command in white, rizin's text in the muted
+   colour and the caret in magenta; the lists' rows and the menu in the
+   colours of FUNCTIONS (the current row in magenta) */
+[data-theme] .rizin-dock-grip {
+    color: var(--cp-text-dim);
+}
+[data-theme] .rizin-dock-grip:hover,
+[data-theme] .rizin-dock-grip.rizin-dock-drag,
+[data-theme] .rizin-dock-grip:focus-visible {
+    color: var(--cp-magenta);
+    background: rgba(var(--cp-magenta-rgb), .1);
+}
+[data-theme] .rizin-dock-note {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-dim);
+}
+[data-theme] .rizin-quick .rizin-tool {
+    color: var(--cp-cyan);
+    border-color: rgba(var(--cp-cyan-rgb), .3);
+}
+[data-theme] .rizin-quick .rizin-tool:hover {
+    color: var(--cp-on-magenta);
+    background: var(--cp-cyan);
+}
+[data-theme] .rizin-list-filter {
+    border-color: rgba(var(--cp-magenta-rgb), .22);
+}
+[data-theme] .rizin-pager {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-dim);
+}
+[data-theme] .rizin-console-out {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-muted);
+}
+[data-theme] .rizin-console-cmd,
+[data-theme] .rizin-prompt {
+    color: var(--cp-amber);
+}
+[data-theme] .rizin-console-typed {
+    color: var(--cp-text);
+}
+[data-theme] .rizin-console-line {
+    border-top-color: var(--cp-line);
+}
+[data-theme] .rizin-console-input {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text);
+    caret-color: var(--cp-magenta);
+}
+[data-theme] .rizin-console-input::placeholder {
+    color: var(--text-dim);
+}
+[data-theme] .rz-ansi-white {
+    color: var(--cp-text-muted);
+}
+[data-theme] .rizin-console-file {
+    border-top-color: var(--cp-line);
+}
+[data-theme] .rizin-xrefs-head {
+    font-family: var(--cp-font-label);
+    color: var(--cp-cyan);
+}
+[data-theme] .rizin-xrefs-head b {
+    color: var(--cp-magenta);
+}
+[data-theme] .rizin-xref,
+[data-theme] .rizin-row {
+    font-family: var(--cp-font-label);
+    color: var(--c-slate-300);
+}
+[data-theme] .rizin-xref:hover,
+[data-theme] .rizin-row:hover {
+    background: var(--cp-raised);
+}
+[data-theme] .rizin-row.current {
+    background: rgba(var(--cp-magenta-rgb), .16);
+    box-shadow: inset 0 0 0 1px rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme] .rizin-string-text {
+    color: var(--cp-gold);
+}
+[data-theme] .rizin-import-lib,
+[data-theme] .rizin-row-meta,
+[data-theme] .rizin-xref-type {
+    color: var(--cp-text-dim);
+}
+[data-theme] .rizin-import-name,
+[data-theme] .rizin-xref-fn {
+    color: var(--cp-text);
+}
+[data-theme] .rizin-menu {
+    background: var(--cp-card);
+    border: 1px solid rgba(var(--cp-magenta-rgb), .45);
+    border-radius: 6px;
+    box-shadow: 0 14px 36px -12px rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme] .rizin-menu-head {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-dim);
+    border-bottom-color: var(--cp-line);
+}
+[data-theme] .rizin-menu-item {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text);
+}
+[data-theme] .rizin-menu-item:hover,
+[data-theme] .rizin-menu-item:focus-visible {
+    background: rgba(var(--cp-magenta-rgb), .12);
+    border-color: rgba(var(--cp-magenta-rgb), .45);
+}
+[data-theme] .rizin-menu-item:disabled {
+    color: var(--text-dim);
+    background: none;
+    border-color: transparent;
+}
+[data-theme] .rizin-menu-label {
+    color: var(--cp-text-dim);
+}
+/* DECOMPILER and HEX as the disassembly: on the panel, the lines in the
+   label font, the current line and byte in magenta, the ASCII in gold; the
+   line above the bytes on the card; a stopped analysis in orange */
+[data-theme] .rizin-decompiler,
+[data-theme] .rizin-hex {
+    background: none;
+    border-color: transparent;
+}
+[data-theme] .rizin-dec-line,
+[data-theme] .rizin-hex-row {
+    font-family: var(--cp-font-label);
+    color: var(--c-slate-300);
+}
+[data-theme] .rizin-dec-line.rizin-dec-jump:hover {
+    background: rgba(var(--cp-magenta-rgb), .05);
+}
+[data-theme] .rizin-dec-line.current {
+    background: rgba(var(--cp-magenta-rgb), .12);
+    box-shadow: inset 0 0 0 1px rgba(var(--cp-magenta-rgb), .35);
+}
+[data-theme] .rizin-hex-bar {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-dim);
+    background: var(--cp-card);
+    border-bottom-color: var(--cp-line);
+}
+[data-theme] .rizin-hex-bytes {
+    color: var(--cp-text-muted);
+}
+[data-theme] .rizin-hex-ascii {
+    color: var(--cp-gold);
+}
+[data-theme] .rizin-hex-cur {
+    color: var(--cp-magenta);
+    background: rgba(var(--cp-magenta-rgb), .16);
+    box-shadow: 0 0 0 1px rgba(var(--cp-magenta-rgb), .5);
+}
+[data-theme] .rizin-state-stopped {
+    color: var(--cp-orange);
+    background: rgba(var(--cp-orange-rgb), .12);
+}
+[data-theme] .rizin-ended {
+    font-family: var(--cp-font-text);
+    color: var(--c-red-300);
+}
+[data-theme] .rizin-more:hover {
+    color: var(--cp-magenta);
+}
+
+/* --- Tool Updates and the maintenance banner --- */
+[data-theme] .dashboard-updates {
+    border-color: var(--cp-line);
+}
+[data-theme] .updates-body {
+    background-color: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow);
+}
+[data-theme] .updates-bar {
+    font-family: var(--cp-font-label);
+    letter-spacing: .06em;
+    border-bottom-color: var(--cp-line);
+}
+[data-theme] .updates-table th {
+    font-family: var(--cp-font-label);
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--cp-text-dim);
+    background: var(--cp-bar-bottom);
+    border-bottom-color: var(--cp-line);
+}
+[data-theme] .updates-table td {
+    border-bottom-color: var(--cp-line);
+}
+[data-theme] .updates-table .updates-row:hover td,
+[data-theme] .updates-table .updates-row.open td {
+    background: var(--cp-raised);
+}
+[data-theme] .updates-name {
+    font-family: var(--cp-font-label);
+    letter-spacing: .06em;
+}
+[data-theme] .updates-log {
+    background: var(--cp-bg);
+    border-color: var(--cp-line);
+}
+[data-theme] .updates-status {
+    font-family: var(--cp-font-label);
+    letter-spacing: .08em;
+    text-transform: uppercase;
+}
+[data-theme] .maintenance-banner {
+    top: var(--topbar-height);
+    font-family: var(--cp-font-label);
+    letter-spacing: .1em;
+    color: var(--cp-amber);
+    background: linear-gradient(rgba(var(--cp-amber-rgb), .14), rgba(var(--cp-amber-rgb), .14)), var(--cp-bar-bottom);
+    border-bottom-color: rgba(var(--cp-amber-rgb), .6);
+    box-shadow: 0 0 18px rgba(var(--cp-amber-rgb), .22);
+}
+[data-theme] .maintenance-progress {
+    background: rgba(var(--cp-amber-rgb), .2);
+}
+[data-theme] .maintenance-progress-bar {
+    background: var(--cp-amber);
+    box-shadow: 0 0 8px rgba(var(--cp-amber-rgb), .7);
+}
+[data-theme] body.maintenance-active #app {
+    padding-top: calc(var(--topbar-height) + var(--maintenance-height));
+}
+
+/* --- Update all skull button and the confirm dialog --- */
+[data-theme] .btn-skull {
+    font-family: var(--cp-font-label);
+    letter-spacing: .14em;
+    text-shadow: 0 0 8px rgba(var(--skull-red-rgb), .55);
+}
+[data-theme] .btn-skull-art {
+    box-shadow: 0 0 0 1px rgba(var(--skull-red-rgb), .55), 0 0 14px -2px rgba(var(--skull-red-rgb), .7);
+}
+[data-theme] .btn-skull-badge {
+    font-family: var(--cp-font-label);
+    border-color: var(--skull-red);
+    box-shadow: 0 0 8px rgba(var(--skull-red-rgb), .7);
+}
+[data-theme] .btn-skull:disabled .btn-skull-art {
+    box-shadow: none;
+}
+[data-theme] .tdc-confirm-backdrop {
+    background: rgba(var(--cp-bg-rgb), .8);
+}
+[data-theme] .tdc-confirm-dialog {
+    background: var(--cp-card);
+    border: 1px solid rgba(var(--cp-magenta-rgb), .6);
+    border-radius: 6px;
+    box-shadow: 0 0 0 1px rgba(var(--cp-black-rgb), .35), 0 0 28px -4px rgba(var(--cp-magenta-rgb), .6), 0 24px 70px -20px rgba(var(--cp-magenta-rgb), .45);
+    animation: tdcConfirmGlitch .42s steps(1, end);
+}
+[data-theme] .tdc-confirm-dialog.danger {
+    border-color: rgba(var(--skull-red-rgb), .8);
+    box-shadow: 0 0 0 1px rgba(var(--cp-black-rgb), .35), 0 0 30px -4px rgba(var(--skull-red-rgb), .7), 0 24px 70px -20px rgba(var(--skull-red-rgb), .5);
+}
+[data-theme] .tdc-confirm-dialog::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    pointer-events: none;
+    background: repeating-linear-gradient(0deg, rgba(var(--cp-black-rgb), .22) 0, rgba(var(--cp-black-rgb), .22) 1px, transparent 1px, transparent 3px);
+}
+[data-theme] .tdc-confirm-head {
+    background: linear-gradient(180deg, var(--cp-bar-top), var(--cp-bar-bottom));
+    border-bottom-color: rgba(var(--cp-magenta-rgb), .35);
+}
+[data-theme] .tdc-confirm-title {
+    font-family: var(--cp-font-label);
+    font-size: 16px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--cp-magenta);
+}
+[data-theme] .tdc-confirm-dialog.danger .tdc-confirm-title {
+    color: var(--skull-red);
+    text-shadow: 0 0 10px rgba(var(--skull-red-rgb), .6);
+}
+[data-theme] .tdc-confirm-list {
+    background: var(--cp-bg);
+    border-color: var(--cp-line);
+}
+[data-theme] .tdc-confirm-list li {
+    border-bottom-color: var(--cp-line);
+}
+[data-theme] .tdc-confirm-item-name {
+    font-family: var(--cp-font-label);
+    letter-spacing: .05em;
+}
+[data-theme] .tdc-confirm-ok.danger {
+    font-family: var(--cp-font-label);
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--c-white);
+    background: var(--skull-red);
+    border-color: var(--skull-red-light);
+    box-shadow: 0 0 12px -2px rgba(var(--skull-red-rgb), .8);
+}
+[data-theme] .tdc-confirm-ok.danger:hover:not(:disabled) {
+    color: var(--c-white);
+    background: var(--skull-red);
+    border-color: var(--skull-red-light);
+    box-shadow: 0 0 20px 0 rgba(var(--skull-red-rgb), .95);
+}
+@keyframes tdcConfirmGlitch {
+    0% { transform: translate(-6px, 0) skewX(-4deg); opacity: .4; clip-path: inset(10% 0 55% 0); }
+    20% { transform: translate(5px, 0) skewX(3deg); opacity: .7; clip-path: inset(55% 0 12% 0); }
+    40% { transform: translate(-3px, 0); opacity: .85; clip-path: inset(0); }
+    60% { transform: translate(3px, 0) skewX(-2deg); opacity: .9; }
+    80% { transform: translate(-1px, 0); opacity: 1; }
+    100% { transform: none; opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+    [data-theme] .tdc-confirm-dialog {
+        animation: none;
+    }
+}
+
+/* --- LOGS tab: the search bar in the page colour with the search box as a
+   dark field that glows magenta when it has the focus (the layer behind it
+   paints the query), the chips, badges and heads in the label font, the
+   source colours kept (--logs-src), the raw text and the table in the table look --- */
+[data-theme] .logs-bar {
+    gap: 10px;
+    padding: 12px 24px;
+    background: var(--cp-bg);
+}
+[data-theme] .logs-hl {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text);
+    background-color: rgba(var(--cp-bg-rgb), .8);
+    border-color: var(--cp-line);
+    border-radius: 4px;
+}
+[data-theme] .logs-input {
+    font-family: var(--cp-font-label);
+    caret-color: var(--cp-magenta);
+}
+[data-theme] .logs-input::placeholder {
+    color: var(--cp-text-dim);
+}
+[data-theme] .logs-input-wrap:focus-within .logs-hl {
+    border-color: var(--cp-magenta);
+    box-shadow: 0 0 0 1px rgba(var(--cp-magenta-rgb), .35), var(--cp-glow);
+}
+[data-theme] .logs-input::selection {
+    background: rgba(var(--cp-magenta-rgb), .35);
+}
+[data-theme] .lq-pipe { color: var(--cp-magenta); }
+[data-theme] .lq-cmd { color: var(--cp-gold); }
+[data-theme] .lq-field { color: var(--cp-cyan); }
+[data-theme] .lq-str { color: var(--cp-green); }
+[data-theme] .lq-bool { color: var(--cp-violet); }
+[data-theme] .lq-kw { color: var(--cp-orange); }
+[data-theme] .logs-menu {
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow), 0 14px 34px -12px rgba(var(--cp-black-rgb), .8);
+}
+[data-theme] .logs-menu-head {
+    font-family: var(--cp-font-label);
+    letter-spacing: .1em;
+    color: var(--cp-cyan);
+}
+[data-theme] .logs-menu-item {
+    border-radius: 4px;
+}
+[data-theme] .logs-menu-item:hover,
+[data-theme] .logs-menu-item:focus-visible {
+    background: var(--cp-raised);
+    box-shadow: inset 2px 0 0 var(--cp-magenta);
+}
+[data-theme] .logs-menu-query {
+    font-family: var(--cp-font-label);
+    color: var(--cp-cyan);
+}
+[data-theme] .logs-error {
+    font-family: var(--cp-font-label);
+    color: var(--cp-red);
+    background: rgba(var(--cp-red-rgb), .1);
+    border-color: rgba(var(--cp-red-rgb), .5);
+    border-radius: 4px;
+}
+[data-theme] .logs-error-query {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-muted);
+}
+[data-theme] .logs-error-pos {
+    background: var(--cp-red);
+    box-shadow: 0 0 8px rgba(var(--cp-red-rgb), .6);
+}
+[data-theme] .logs-summary,
+[data-theme] .logs-legend,
+[data-theme] .logs-fields-count {
+    font-family: var(--cp-font-label);
+    letter-spacing: .04em;
+    color: var(--cp-text-dim);
+}
+[data-theme] .logs-summary strong {
+    color: var(--cp-text);
+}
+[data-theme] .logs-summary-note {
+    color: var(--cp-amber);
+}
+[data-theme] .logs-live[aria-pressed="true"] {
+    color: var(--cp-green);
+    background: rgba(var(--cp-green-rgb), .12);
+    border-color: var(--cp-green);
+    box-shadow: 0 0 12px rgba(var(--cp-green-rgb), .35);
+}
+[data-theme] .logs-source {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    color: var(--cp-text-muted);
+    background: var(--cp-raised);
+    border-color: rgba(var(--cp-magenta-rgb), .22);
+    border-radius: 4px;
+}
+[data-theme] .logs-source:hover {
+    color: var(--cp-text);
+    border-color: var(--logs-src);
+    box-shadow: 0 0 10px rgba(var(--logs-src-rgb), .35);
+}
+[data-theme] .logs-source.is-active {
+    color: var(--cp-text);
+    background: rgba(var(--logs-src-rgb), .16);
+    border-color: var(--logs-src);
+    box-shadow: 0 0 12px rgba(var(--logs-src-rgb), .35);
+}
+[data-theme] .logs-source:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+}
+[data-theme] .logs-histogram-card {
+    margin: 14px 24px 0;
+}
+[data-theme] .logs-body {
+    gap: 14px;
+    padding: 14px 24px 24px;
+}
+[data-theme] .logs-fields,
+[data-theme] .logs-events,
+[data-theme] .logs-table-wrap {
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow);
+}
+[data-theme] .logs-field-head,
+[data-theme] .logs-value,
+[data-theme] .logs-event-row,
+[data-theme] .logs-detail-grid,
+[data-theme] .logs-raw {
+    font-family: var(--cp-font-label);
+}
+[data-theme] .logs-field-head:hover {
+    background: var(--cp-raised);
+}
+[data-theme] .logs-value {
+    background: linear-gradient(90deg, rgba(var(--cp-magenta-rgb), .2) var(--share, 0%), transparent var(--share, 0%));
+}
+[data-theme] .logs-value:hover {
+    color: var(--cp-text);
+    box-shadow: inset 0 0 0 1px rgba(var(--cp-magenta-rgb), .6);
+}
+[data-theme] .logs-event + .logs-event {
+    border-top-color: var(--cp-line);
+}
+[data-theme] .logs-event-row:hover {
+    background: var(--cp-raised);
+    box-shadow: inset 2px 0 0 var(--cp-magenta);
+}
+[data-theme] .logs-event.is-open > .logs-event-row {
+    background: rgba(var(--cp-magenta-rgb), .08);
+    box-shadow: inset 2px 0 0 var(--cp-magenta);
+}
+[data-theme] .logs-event-row:focus-visible,
+[data-theme] .logs-field-head:focus-visible,
+[data-theme] .logs-value:focus-visible,
+[data-theme] .logs-fv:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+}
+[data-theme] .logs-src {
+    font-family: var(--cp-font-label);
+    font-size: 9.5px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    border-radius: 3px;
+}
+[data-theme] .logs-msg {
+    color: var(--cp-text);
+}
+[data-theme] .logs-results mark {
+    color: var(--cp-text);
+    background: rgba(var(--cp-gold-rgb), .3);
+    box-shadow: 0 0 0 1px rgba(var(--cp-gold-rgb), .45);
+}
+[data-theme] .logs-event-detail {
+    background: rgba(var(--cp-bg-rgb), .55);
+    border-top-color: var(--cp-line);
+}
+[data-theme] .logs-detail-key {
+    color: var(--cp-cyan);
+}
+[data-theme] .logs-fv:hover {
+    color: var(--cp-text);
+    background: rgba(var(--cp-magenta-rgb), .2);
+}
+[data-theme] .logs-raw-label {
+    font-family: var(--cp-font-label);
+    letter-spacing: .1em;
+    color: var(--cp-cyan);
+}
+[data-theme] .logs-raw {
+    color: var(--cp-text);
+    background: var(--cp-bg);
+    border-color: var(--cp-line);
+    border-radius: 4px;
+}
+[data-theme] .logs-table th {
+    font-family: var(--cp-font-label);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    color: var(--cp-cyan);
+    background: var(--cp-raised);
+    border-bottom: 1px solid var(--cp-line);
+}
+[data-theme] .logs-table td {
+    color: var(--cp-text-muted);
+    border-bottom-color: var(--cp-line);
+}
+[data-theme] .logs-table tbody tr:hover {
+    background: var(--cp-raised);
+}
+[data-theme] .logs-cell-num {
+    color: var(--cp-text);
+}

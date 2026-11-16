@@ -65,7 +65,8 @@ def test_help_tab_guide_covers_every_tab():
     assert re.findall(r"<h4>([^<]+)</h4>", guide) == ui_tabs
 
 
-WEB_UI_ASSETS = ["static/js/app.js", "static/css/style.css", "static/css/theme-cyberpunk.css"]
+WEB_UI_ASSETS = ["static/js/app.js", "static/css/style.css", "static/css/theme-layout.css",
+                 "static/css/theme-cyberpunk.css"]
 
 
 def test_every_deploy_path_uploads_the_web_ui_modules():
