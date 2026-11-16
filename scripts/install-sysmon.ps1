@@ -146,6 +146,97 @@ function Save-SourceEtag {
     }
 }
 
+# FileVersion of a binary as [version], or $null.
+function Get-BinaryVersion {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path $Path)) { return $null }
+    try {
+        $raw = (Get-Item -Path $Path).VersionInfo.FileVersion
+        if (-not $raw) { return $null }
+        $text = ([string]$raw -replace ',', '.' -split '\s+')[0]
+        return [version]$text
+    } catch { return $null }
+}
+
+# The executable a Sysmon service runs (ImagePath, e.g. C:\Windows\Sysmon64a.exe), or $null.
+function Get-ServiceExe {
+    param([string]$ServiceName)
+    try {
+        $svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$ServiceName'" -ErrorAction Stop
+        if ($svc -and $svc.PathName) {
+            $path = [string]$svc.PathName
+            if ($path -match '^\s*"([^"]+)"') { $path = $Matches[1] }
+            elseif ($path -match '^\s*(\S+\.exe)') { $path = $Matches[1] }
+            if (Test-Path $path) { return $path }
+        }
+    } catch { }
+    return $null
+}
+
+function Test-ServiceExists {
+    param([string]$Name)
+    & sc.exe query $Name 2>&1 | Out-Null
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Test-SysmonRunning {
+    foreach ($name in @("Sysmon64a", "Sysmon64")) {
+        $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -eq "Running") { return $true }
+    }
+    return $false
+}
+
+# After -u force the services and the event channel go away asynchronously; installing
+# too early fails with "driver already registered" or "event manifest installation failed".
+function Wait-SysmonGone {
+    param([int]$TimeoutSeconds = 60)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        $left = @()
+        foreach ($name in @("Sysmon64a", "Sysmon64", "SysmonDrv")) {
+            if (Test-ServiceExists $name) { $left += $name }
+        }
+        wevtutil gl Microsoft-Windows-Sysmon/Operational 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { $left += "channel" }
+        if ($left.Count -eq 0) { return $true }
+        if ((Get-Date) -ge $deadline) {
+            Write-Host "[!] Still registered after ${TimeoutSeconds}s: $($left -join ', ')" -ForegroundColor Yellow
+            return $false
+        }
+        Start-Sleep -Seconds 2
+    }
+}
+
+function Uninstall-SysmonBinary {
+    param([string]$Exe)
+    & $Exe -accepteula -u force 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
+    [void](Wait-SysmonGone -TimeoutSeconds 60)
+}
+
+# -i with up to 3 attempts; a partial state is removed with -u force between tries.
+function Install-SysmonService {
+    param([string]$Exe)
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        Write-Host "[*] Installing Sysmon service ($([System.IO.Path]::GetFileName($Exe)), attempt $attempt of 3)..." -ForegroundColor Yellow
+        & $Exe -accepteula -i $configPath 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
+        Start-Sleep -Seconds 3
+        if (-not (Test-SysmonRunning)) {
+            foreach ($name in @("Sysmon64a", "Sysmon64")) {
+                if (Test-ServiceExists $name) { Start-Service -Name $name -ErrorAction SilentlyContinue }
+            }
+            Start-Sleep -Seconds 2
+        }
+        if (Test-SysmonRunning) { return $true }
+        if ($attempt -lt 3) {
+            Write-Host "[!] Sysmon is not running - waiting 10 s before the next attempt" -ForegroundColor Yellow
+            Start-Sleep -Seconds 10
+            Uninstall-SysmonBinary -Exe $Exe
+        }
+    }
+    return $false
+}
+
 # Check if already installed and running
 $sysmonSvc = Get-Service -Name $sysmonServiceName -ErrorAction SilentlyContinue
 if (-not $sysmonSvc) {
@@ -209,6 +300,41 @@ try {
     }
     Write-Host "[!] Sysmon installation failed" -ForegroundColor Red
     exit 1
+}
+
+# What is installed now: the binary the service runs, else the one in the tools dir
+$installedExe = $null
+$installedServiceName = $null
+foreach ($name in @("Sysmon64a", "Sysmon64")) {
+    if (Get-Service -Name $name -ErrorAction SilentlyContinue) {
+        $installedServiceName = $name
+        $installedExe = Get-ServiceExe -ServiceName $name
+        if (-not $installedExe) {
+            $installedExe = "$sysmonDir\$name.exe"
+            if (-not (Test-Path $installedExe)) { $installedExe = $null }
+        }
+        break
+    }
+}
+$installedVersion = Get-BinaryVersion -Path $installedExe
+if (-not $installedVersion) {
+    $installedVersion = Get-BinaryVersion -Path $sysmonExe
+}
+
+# Back up the installed binaries before the extraction overwrites them
+$backupDir = "$sysmonDir\backup"
+if ($installedServiceName) {
+    try {
+        New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+        Get-ChildItem -Path $sysmonDir -Filter "Sysmon*.exe" -File -ErrorAction SilentlyContinue |
+            ForEach-Object { Copy-Item -Path $_.FullName -Destination $backupDir -Force }
+        if ($installedExe -and -not (Test-Path (Join-Path $backupDir (Split-Path $installedExe -Leaf)))) {
+            Copy-Item -Path $installedExe -Destination $backupDir -Force
+        }
+        Write-Host "[*] Backed up the installed Sysmon binaries to $backupDir" -ForegroundColor Gray
+    } catch {
+        Write-Host "[!] Could not back up the installed Sysmon: $_" -ForegroundColor Yellow
+    }
 }
 
 # Extract
@@ -286,54 +412,60 @@ try {
 }
 Set-PipeEventExclude -Path $configPath
 
+# Same or older version already running: keep it, only apply the new config
+$downloadedVersion = Get-BinaryVersion -Path $sysmonExe
+if ($Force -and (Test-SysmonRunning) -and $installedExe -and $installedVersion -and $downloadedVersion -and
+    ($downloadedVersion -le $installedVersion)) {
+    Write-Host "[*] Installed Sysmon $installedVersion, downloaded $downloadedVersion - no reinstall needed" -ForegroundColor Yellow
+    & $installedExe -accepteula -c $configPath 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
+    $configExit = $LASTEXITCODE
+    Set-SysmonLogSize
+    if ($configExit -ne 0) {
+        Write-Host "[!] sysmon -c failed (exit $configExit) - config not applied; Sysmon $installedVersion keeps running" -ForegroundColor Red
+        exit 1
+    }
+    if ($binaryEtag) { Save-SourceEtag -Key "binary_etag" -Value $binaryEtag }
+    if ($configEtag) { Save-SourceEtag -Key "config_etag" -Value $configEtag }
+    Write-Host "[+] Sysmon $installedVersion is current; configuration updated" -ForegroundColor Green
+    exit 0
+}
+
 # Reinstall: the old service and driver have to go before the new ones. The
 # uninstall must use the binary that matches the installed service name.
-if ($Force) {
-    $installedExe = $null
-    if (Get-Service -Name "Sysmon64a" -ErrorAction SilentlyContinue) {
-        $installedExe = "$sysmonDir\Sysmon64a.exe"
-    } elseif (Get-Service -Name "Sysmon64" -ErrorAction SilentlyContinue) {
-        $installedExe = "$sysmonDir\Sysmon64.exe"
-    }
-    if ($installedExe) {
-        if (-not (Test-Path $installedExe)) { $installedExe = $sysmonExe }
-        Write-Host "[*] Uninstalling the installed Sysmon (-u force, $([System.IO.Path]::GetFileName($installedExe)))..." -ForegroundColor Yellow
-        & $installedExe -accepteula -u force 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
-        Start-Sleep -Seconds 3
-    }
+if ($Force -and $installedServiceName) {
+    $uninstallExe = $installedExe
+    if (-not $uninstallExe) { $uninstallExe = Join-Path $backupDir "$installedServiceName.exe" }
+    if (-not (Test-Path $uninstallExe)) { $uninstallExe = $sysmonExe }
+    Write-Host "[*] Uninstalling the installed Sysmon (-u force, $([System.IO.Path]::GetFileName($uninstallExe)))..." -ForegroundColor Yellow
+    Uninstall-SysmonBinary -Exe $uninstallExe
 }
 
-# Install Sysmon as a service
-Write-Host "[*] Installing Sysmon service..." -ForegroundColor Yellow
-& $sysmonExe -accepteula -i $configPath 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
+# Verify installation: install with retries, then check that the service runs
+$sysmonRunning = Install-SysmonService -Exe $sysmonExe
 Set-SysmonLogSize
 
-# Verify installation
-Start-Sleep -Seconds 3
-$sysmonSvc = Get-Service -Name $sysmonServiceName -ErrorAction SilentlyContinue
-if (-not $sysmonSvc) {
-    $sysmonSvc = Get-Service -Name "Sysmon64" -ErrorAction SilentlyContinue
-}
-$sysmonRunning = $false
-if ($sysmonSvc -and $sysmonSvc.Status -eq "Running") {
-    $sysmonRunning = $true
-    Write-Host "[+] Sysmon installed and running (service: $($sysmonSvc.Name))" -ForegroundColor Green
+if ($sysmonRunning) {
+    Write-Host "[+] Sysmon installed and running" -ForegroundColor Green
 } else {
-    # Try starting it
-    $svcName = if (Get-Service -Name $sysmonServiceName -ErrorAction SilentlyContinue) { $sysmonServiceName } else { "Sysmon64" }
-    Start-Service -Name $svcName -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 2
-    $sysmonSvc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-    if ($sysmonSvc -and $sysmonSvc.Status -eq "Running") {
-        $sysmonRunning = $true
-        Write-Host "[+] Sysmon installed and started" -ForegroundColor Green
-    } else {
-        Write-Host "[!] Sysmon service not running - check logs" -ForegroundColor Red
-    }
+    Write-Host "[!] Sysmon service not running - check logs" -ForegroundColor Red
 }
+
 if ($Force -and -not $sysmonRunning) {
-    # The tool updates must not report an update when Sysmon is down
-    Write-Host "[!] Sysmon is not running after the reinstall" -ForegroundColor Red
+    # Never leave the VM without Sysmon: put the previous version back
+    $rollbackExe = $null
+    if ($installedServiceName) { $rollbackExe = Join-Path $backupDir "$installedServiceName.exe" }
+    if ($rollbackExe -and (Test-Path $rollbackExe)) {
+        Write-Host "[*] Rolling back to the previous Sysmon ($rollbackExe)..." -ForegroundColor Yellow
+        Uninstall-SysmonBinary -Exe $sysmonExe
+        if (Install-SysmonService -Exe $rollbackExe) {
+            Set-SysmonLogSize
+            Write-Host "[!] New Sysmon failed to install; restored the previous version" -ForegroundColor Red
+        } else {
+            Write-Host "[!] Rollback failed - Sysmon is NOT running. Reinstall by hand: $rollbackExe -accepteula -i $configPath" -ForegroundColor Red
+        }
+    } else {
+        Write-Host "[!] Sysmon failed to install and there is no backed-up binary to roll back to" -ForegroundColor Red
+    }
     exit 1
 }
 # The ETags are recorded only for an install that runs

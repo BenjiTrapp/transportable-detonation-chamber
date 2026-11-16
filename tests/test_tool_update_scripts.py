@@ -126,6 +126,7 @@ def test_fibratus_force_failure_is_reported():
 def test_sysmon_force_failure_is_not_an_update():
     script = _script("sysmon")
     verify = script.index("# Verify installation")
+    assert script.index("is current; configuration updated") < verify
     # -Force with a service that is not running ends with exit 1
     fail = re.search(r"if \(\$Force -and -not \$sysmonRunning\) \{.*?exit 1", script, re.S)
     assert fail and fail.start() > verify
@@ -136,7 +137,7 @@ def test_sysmon_force_failure_is_not_an_update():
         assert any(c > fail.end() for c in calls), key
     # Nothing in the download steps writes the marker (a marker failure is no download failure)
     assert "\n    Set-SourceEtag -Key" not in script
-    download = script[script.index("# Download Sysmon"):verify]
+    download = script[script.index("# Download Sysmon"):script.index("# Same or older version")]
     assert "SourceEtag" not in download
     # ...and the marker write has its own guard
     assert re.search(r"function Save-SourceEtag \{.*?try \{\s*Set-SourceEtag.*?\} catch", script, re.S)
@@ -237,7 +238,71 @@ def test_every_script_with_isarm64_uses_the_registry_lookup():
 
 def test_sysmon_force_uninstalls_with_the_binary_of_the_installed_service():
     script = _script("sysmon")
-    assert re.search(r'Get-Service -Name "Sysmon64a"', script)
+    assert re.search(r'foreach \(\$name in @\("Sysmon64a", "Sysmon64"\)\) \{\s*if \(Get-Service -Name \$name', script)
     assert re.search(r'\$installedExe\b', script)
-    assert re.search(r'\$installedExe\s+-accepteula\s+-u\s+force', script)
+    assert re.search(r'\$uninstallExe\s*=\s*\$installedExe', script)
+    assert re.search(r'Uninstall-SysmonBinary\s+-Exe\s+\$uninstallExe', script)
+    assert re.search(r'& \$Exe\s+-accepteula\s+-u\s+force', script)
     assert not re.search(r'\$sysmonExe\s+-accepteula\s+-u\s+force', script)
+
+
+def _sysmon_code():
+    # The script without comment lines, so a comment cannot satisfy a check.
+    return "\n".join(line for line in _script("sysmon").splitlines() if not line.strip().startswith("#"))
+
+
+def test_sysmon_compares_installed_and_downloaded_versions():
+    code = _sysmon_code()
+    assert "FileVersion" in code
+    assert re.search(r"Win32_Service|ImagePath|PathName", code)
+    assert re.search(r"\$downloadedVersion\s+-le\s+\$installedVersion", code)
+    assert "is current; configuration updated" in code
+    # the "current" branch applies the config with -c and checks the exit code
+    m = re.search(r"is current; configuration updated", code)
+    before = code[:m.start()]
+    assert re.search(r"-accepteula\s+-c\s+\$configPath", before)
+    assert "binary_etag" in code and "config_etag" in code
+
+
+def test_sysmon_current_branch_comes_before_any_uninstall():
+    code = _sysmon_code()
+    assert code.index("is current; configuration updated") < code.index("Uninstall-SysmonBinary -Exe $uninstallExe")
+
+
+def test_sysmon_backs_up_installed_binaries_before_extracting():
+    code = _sysmon_code()
+    assert re.search(r'\$backupDir\s*=\s*"\$sysmonDir\\backup"', code)
+    assert code.index("$backupDir") < code.index("Expand-Archive")
+    assert re.search(r"Copy-Item[^\n]*\$backupDir", code)
+
+
+def test_sysmon_waits_for_the_uninstall_and_retries_the_install():
+    code = _sysmon_code()
+    assert "function Wait-SysmonGone" in code
+    assert "SysmonDrv" in code
+    assert re.search(r"wevtutil(\.exe)?\s+gl\s+Microsoft-Windows-Sysmon/Operational", code)
+    assert re.search(r"-lt\s+60|60\s*\)", code)
+    assert "function Install-SysmonService" in code
+    assert re.search(r"for\s*\(\$attempt\s*=\s*1;\s*\$attempt\s+-le\s+3", code)
+    assert re.search(r"Start-Sleep\s+-Seconds\s+10", code)
+
+
+def test_sysmon_rolls_back_to_the_backed_up_binary():
+    code = _sysmon_code()
+    assert "New Sysmon failed to install; restored the previous version" in code
+    assert re.search(r"Install-SysmonService\s+-Exe\s+\$rollbackExe", code)
+    assert re.search(r"\$rollbackExe\s*=\s*Join-Path\s+\$backupDir", code)
+    assert "rollback" in code.lower() and "Rollback failed" in code
+
+
+def test_sysmon_script_parses():
+    import shutil
+    import subprocess
+    pwsh = shutil.which("pwsh") or ("/opt/homebrew/bin/pwsh" if os.path.exists("/opt/homebrew/bin/pwsh") else None)
+    if not pwsh:
+        pytest.skip("pwsh not installed")
+    path = os.path.join(ROOT, "scripts", "install-sysmon.ps1")
+    cmd = ("$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile("
+           f"'{path}', [ref]$null, [ref]$e); if ($e) {{ $e | ForEach-Object {{ $_.Message }}; exit 1 }}")
+    proc = subprocess.run([pwsh, "-NoProfile", "-Command", cmd], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stdout + proc.stderr

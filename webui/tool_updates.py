@@ -81,15 +81,11 @@ class HttpResult(NamedTuple):
 
 
 def _as_text(value: Any) -> str:
-    """Decode child output; Sysmon and friends print UTF-16LE, which UTF-8 turns into text with NULs."""
-    if isinstance(value, str):
-        return value.replace("\x00", "")
-    if not value:
-        return ""
-    text = value.decode("utf-8", errors="replace")
-    if text.count("\x00") > len(text) * 0.1:
-        text = value.decode("utf-16-le", errors="replace").lstrip("\ufeff")
-    return text.replace("\x00", "").replace("\r\n", "\n")
+    """Decode child output. Sysmon prints UTF-16LE inside an otherwise UTF-8/ASCII stream;
+    dropping the NULs after a UTF-8 decode keeps both parts readable."""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    return (value or "").replace("\x00", "").replace("\r\n", "\n")
 
 
 class Env:

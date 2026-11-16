@@ -115,6 +115,39 @@ Wortlaut und Genauigkeit.
 
 # Teil A · Beobachten und kappen
 
+## Woher die Daten kommen
+
+**Entscheidung — eigener Store, nicht der von LOGS.** Der `netflow`-Ring im
+LOGS-Store ist für diesen Zweck verlustbehaftet: er bündelt sofort und wird bei
+jedem Tick komplett ersetzt (`replace_netflows`), und er liest nur EID 3 und 22.
+Der Tab braucht aber **Einzelverbindungen** (für die Beaconing-Erkennung, die
+`(ts, ip, port)` je Verbindung erwartet) und **EID 1** (Startzeit, Elternkette,
+Kommandozeile — für `newborn`, `detonated` und `download`).
+
+Also ein eigenes `webui/firewall_store.py` mit eigenen `EventRecordID`-Cursorn
+für EID 1, 3 und 22, eigenem Ring (50 000 Verbindungen, 7 Tage) und eigenem
+Thread. `log_store.py` und seine `SOURCES` bleiben unangetastet — die LOGS-Tests
+sollen von diesem Projekt nichts merken. Doppeltes Lesen derselben Ereignisse
+ist der Preis; es sind zwei `wevtutil`-Aufrufe alle 10 s.
+
+Der schnelle Takt (1 s im Detonations-Fenster) ist derselbe Thread mit kürzerem
+Schlaf, kein zweiter — `tick` ist nicht threadsicher, und das soll so bleiben.
+
+**Entscheidung — BITS.** Der BITS-Kanal ist heute nur eine Abfrage auf Zuruf.
+Der Firewall-Collector liest ihn im Detonations-Fenster mit (EID 59/60, `url`),
+außerhalb nicht. Es ist eine Quelle für den Download-Fall, keine Dauerlast.
+
+**Entscheidung — TDCs eigener Verkehr.** Eine Selbstausschluss-Liste: das
+`python.exe` der Web-UI-venv, Detonator, DetonatorAgent, LitterBox, Fibratus,
+Rustinel, der Pipe-Proxy, `git.exe`. Diese Prozesse werden **nie automatisch
+gesperrt** und lösen **nie** einen Toast aus. Sie verschwinden aber nicht: sie
+stehen in einer eingeklappten Gruppe `TDC` im Baum und werden normal getaggt —
+ein blinder Fleck, in den man Code injizieren kann, wäre schlimmer als etwas
+Rauschen. Spricht TDCs python zu einem Endpunkt, der nicht auf seiner kurzen
+Erwartungsliste steht (Loopback, api.github.com, download.sysinternals.com,
+chocolatey, winget, die Fetch-Ziele), gibt es ein Tag `tdc-anomaly` mit hohem
+Schweregrad.
+
 ## Das Verbindungsmodell
 
 Eine **Verbindung** im Tab ist ein gebündelter Flow, nicht ein einzelnes
@@ -144,6 +177,16 @@ Aus EID 22 (`QueryName` → `QueryResults`) wird eine IP→Name-Karte gebaut
 (letzter Gewinner, 20 000 Einträge, TTL 24 h) und als Fallback benutzt. Das ist
 gleichzeitig die Grundlage für die Markierung `direct-ip`.
 
+**Entscheidung — wie `pfirewall.log` angehängt wird.** Das Firewall-Log hat
+keinen Imagenamen und in der Vorgabespalten-Belegung auch keine PID. Der Join
+geht deshalb nur über das Vierer-Tupel `(protocol, src_ip, dst_ip, dst_port)`,
+Protokollschreibweise normalisiert (`tcp`/`TCP`/`6`). Die Zahlen gehören damit
+dem **Endpunkt**, nicht dem Prozess: `fw_records`, `fw_allowed` und
+`fw_dropped` stehen in der Endpunkt-Gruppe, nicht in der Prozesszeile, die
+Spalte heißt `FW (Endpunkt)`, und das Tag `dropped` sitzt am Endpunkt. Sonst
+behauptete die Oberfläche, Prozess X sei abgewiesen worden, obwohl es Prozess Y
+war.
+
 **Entscheidung — keine Byte-Zahlen in Teil A.** Das Mockup zeigt „3,2 MB
 gesendet“; diese Zahl gibt es aus Sysmon nicht, und das `size`-Feld von
 `pfirewall.log` ist pro Datensatz und meist `-`. Echte Zähler bräuchten eine
@@ -164,11 +207,27 @@ abgeleitet aus RouteViews). Eine Datei liefert Bereich → ASN, AS-Name **und**
 Ländercode. Keine Lizenzfalle, frei weiterverteilbar.
 
 **Entscheidung — Form im Repo:** `webui/data/ip2asn-v4.tsv.gz` und `-v6.tsv.gz`
-(~1,5 MB zusammen), plus ein Ziel `make geoip`, das sie neu holt und
-aggregiert. Beim ersten Start baut `webui/geoip.py` daraus eine Binärdatei mit
-festen Satzlängen (`start`, `end`, `asn`, `cc`) neben der Quelle und liest sie
-per `mmap` + `bisect`. Kein messbarer Speicherverbrauch, Lookup in µs.
-AS-Namen stehen in einer eigenen kleinen Tabelle, nur bei Bedarf geladen.
+(~1,5 MB zusammen) liegen **im Git**. Das ist der ganze Sinn der Sache: ein
+frischer Clone kann offline Geo auflösen, und Provisioning braucht dafür kein
+Internet. `make geoip` holt sie nur neu. Beim ersten Start baut
+`webui/geoip.py` daraus eine Binärdatei mit festen Satzlängen (`start`, `end`,
+`asn`, `cc`) nach `%TEMP%\tdc-geoip\` und liest sie per `mmap` + `bisect` — nicht
+neben die Quelle, denn das Installationsverzeichnis wird von `deploy`
+überschrieben. Neu gebaut wird nur, wenn Größe oder mtime der Quelle sich
+geändert haben. Kein messbarer Speicherverbrauch, Lookup in µs. AS-Namen stehen
+in einer eigenen kleinen Tabelle, nur bei Bedarf geladen.
+
+**Entscheidung — fehlen die Dateien,** arbeitet der Tab weiter: Baum, Tags,
+Sperren und Perspektivwechsel brauchen kein Geo. Die Karte zeigt dann die
+Landmaske mit dem Hinweis „keine Geo-Daten — `make geoip`“, und `geo` ist in der
+API `null`. Die Tests bringen eine winzige eigene Tabelle als Fixture mit,
+damit `tests/test_firewall.py` den Lookup auf macOS prüfen kann, ohne die große
+Datei zu lesen.
+
+**Entscheidung — Deploy.** `webui/data/` ist das erste Datenverzeichnis, das
+mitgeliefert werden muss. Die drei Deploy-Pfade kopieren heute einzelne
+benannte Dateien; sie bekommen das Verzeichnis als Ganzes dazu — eine Zeile pro
+Pfad, vom bestehenden Doku-Test erfasst.
 
 **Entscheidung — Koordinaten:** eine Tabelle Ländercode → Name, Schwerpunkt
 (lat/lon) und Region, ~250 Zeilen, direkt im Repo (`webui/data/countries.tsv`).
@@ -221,17 +280,43 @@ entfernbar ist.
 
 | Aktion | Umsetzung |
 |---|---|
-| Endpunkt sperren | `New-NetFirewallRule -DisplayName "TDC-FW-<id>" -Direction Outbound -RemoteAddress <ip> [-RemotePort <p> -Protocol <t>] -Action Block` |
-| Prozess sperren | dasselbe mit `-Program <image>` |
+| Endpunkt sperren | `New-NetFirewallRule -DisplayName "TDC-FW-<id>" -Direction Outbound -Program <image> -RemoteAddress <ip> [-RemotePort <p> -Protocol <t>] -Action Block` |
+| Endpunkt für alle sperren | dasselbe ohne `-Program` — eigener Knopf, nicht die Vorgabe |
+| Prozess sperren | `-Program <image>` ohne `-RemoteAddress` |
 | Sperre lösen | `Remove-NetFirewallRule -DisplayName "TDC-FW-<id>"` |
 | Prozess beenden | `taskkill /PID <pid> /F` — der Hammer, eigener Knopf |
 | Isolated an/aus | `Set-NetFirewallProfile -All -DefaultOutboundAction Block` plus Ausnahmen |
+
+**Entscheidung — die automatische Sperre gilt dem Loader, nicht dem Endpunkt.**
+In der Windows-Firewall schlägt eine Block-Regel jede Allow-Regel. Eine Sperre
+auf `-RemoteAddress <ip>` ohne `-Program` würde deshalb auch TDCs eigenen
+Fetcher aussperren — genau den, der die Datei gleich holen soll. Die
+automatische Sperre bekommt daher immer `-Program <image des Loaders>`. „Für
+alle Prozesse sperren“ gibt es als zweiten, ausdrücklichen Knopf, und solange so
+eine Regel steht, ist `KAPPEN + SELBST HOLEN` an diesem Endpunkt ausgegraut mit
+dem Grund im Tooltip.
 
 **Entscheidung — wie eine stehende Verbindung stirbt.** Eine Ausgangs-Blockregel
 greift in WFP sofort, auch auf einen laufenden Flow. Es gibt kein RST: die
 Verbindung verhungert. Aus Sicht der Malware sieht das wie ein Netzausfall aus —
 genau richtig, denn ein RST verrät, dass jemand zugehört hat. Der Toast sagt das
 so.
+
+**Entscheidung — ist die Firewall aus, beißt keine Regel.** Mit abgeschaltetem
+Profil gehen `New-NetFirewallRule` und `DefaultOutboundAction` durch, ohne zu
+wirken — die Oberfläche würde `blocked` zeigen, und nichts wäre gesperrt. Das
+ist der schlimmste denkbare Fehler dieses Tabs. Also:
+
+- `firewall_rules.py` prüft die Profile (der Code dafür existiert:
+  `_firewall_is_off()`), bevor er irgendetwas anbietet.
+- Ist ein Profil aus, sind `ISOLATED` und alle Deny-Schalter **deaktiviert**,
+  mit dem Grund im Tooltip, und der Kopf trägt ein rotes Band
+  `Windows-Firewall ist aus — keine Durchsetzung möglich`.
+- Daneben ein Knopf `Firewall einschalten`, der im Bestätigungsdialog sagt, was
+  er ändert. TDC schaltet sie **nicht** von sich aus ein: das verändert, was die
+  Malware sieht, und das entscheidet der Analyst.
+- Nach jedem Setzen einer Regel wird gegengeprüft (`Get-NetFirewallRule`), und
+  der Zustand `blocked` wird erst gesetzt, wenn die Regel wirklich steht.
 
 **Entscheidung — Isolated.** Ausnahmen, und nur diese:
 
@@ -264,6 +349,17 @@ sichtbar wurde. Alles andere wird markiert und geloggt, aber nicht gefragt. Im
 Kopf des Tabs steht ein Schalter `ASK: Detonation | Alles | Aus`; Vorgabe
 `Detonation`.
 
+**Entscheidung — was die drei Stellungen bedeuten.** Der Schalter steuert
+Sperren *und* Fragen gemeinsam, sonst wäre er nicht zu verstehen. Er liegt
+**auf dem Server** (in `webui/firewall_state.json`), nicht im Browser — er
+entscheidet über Sperren, die auch ohne offenen Browser gelten.
+
+| Stellung | Verhalten |
+|---|---|
+| `Detonation` (Vorgabe) | Download aus dem Detonations-Kontext: sperren und fragen. Alles andere: nur markieren. |
+| `Alles` | Jeder Download-Fund sperrt und fragt, außer von Prozessen der Selbstausschluss-Liste. |
+| `Aus` | Nichts wird gesperrt, nichts gefragt — nur markiert und geloggt. Für die Detonation, die man ungestört laufen lassen will. Der Kopf zeigt das dauerhaft an, damit niemand glaubt, er sei geschützt. |
+
 **Woher die URL kommt** (in Teil A):
 
 | Quelle | Feld |
@@ -287,13 +383,36 @@ eine zweite Form `showDecisionToast(options)`:
 
 - bleibt stehen, bis entschieden wurde (kein Auto-Dismiss), mit Countdown auf die
   **Vorgabeaktion**;
-- Vorgabe nach Ablauf: `KAPPEN + SELBST HOLEN` — die Variante, die am wenigsten
-  Schaden und am meisten Information bringt;
 - Knöpfe: `KAPPEN + SELBST HOLEN`, `NUR KAPPEN`, `ZULASSEN`, dazu `in LOGS ▸`;
 - mehrere offene Entscheidungen stapeln sich, höchstens drei sichtbar, der Rest
   als „+ n weitere“ mit Sprung in den Tab;
 - die Throttle-Logik von `showToast` (15 s pro Titel) gilt hier **nicht**, sonst
   verschwinden Entscheidungen.
+
+**Entscheidung — wo die Entscheidung lebt.** Nicht im Browser. Offene
+Entscheidungen stehen in `webui/pending.json` (atomar geschrieben wie
+`submissions.json`), mit `id`, Fund, Frist und Ergebnis. Daraus folgt:
+
+- Ein Neustart des Dienstes mitten in der Detonation verliert nichts: die
+  Sperren stehen in der Firewall, die Entscheidungen in der Datei.
+- Zwei offene Browser-Tabs sehen dieselbe Liste, weil beide `/api/firewall/pending`
+  abfragen. Wer zuerst klickt, gewinnt; `decide` ist idempotent und antwortet auf
+  eine zweite Antwort mit dem bereits gefallenen Ergebnis statt mit einem Fehler.
+- Eine beantwortete Entscheidung bleibt 24 h als Verlauf stehen und ist im Tab
+  nachlesbar — „wer hat was wann zugelassen“ ist bei einer Analyse die halbe
+  Arbeit.
+
+**Offen (Rückfrage an den Nutzer) — holt TDC unbeaufsichtigt?** Zwei Haltungen:
+
+- *Vorsichtig:* ohne Klick wird nur gesperrt, nie geholt. TDC baut von sich aus
+  keine Verbindung zu einer bösartigen Adresse auf. Preis: ist niemand am
+  Schirm, ist die Stage-2-URL oft schon tot, wenn man zurückkommt — das Sample
+  ist weg.
+- *Greifend:* läuft die Frist ab, sperrt TDC und **holt die Datei selbst**. Das
+  Sample ist gesichert, aber die Chamber hat ohne Aufsicht einen C2 kontaktiert.
+
+Die Antwort steht hier, sobald sie gefallen ist; sie entscheidet nur, was nach
+Ablauf der Frist passiert — alles andere bleibt gleich.
 
 **Das Nachladen.** `POST /api/firewall/decide` mit `action: block_fetch`:
 
@@ -324,6 +443,10 @@ im Gast TDC als eigenen Proxy benutzt — gerade in Isolated, wo nur TDC rausdar
   Defender-Ausnahmen, wie `scan_uploads` heute schon. Ohne das frisst Defender
   die Stage-2-Datei, bevor sie jemand ansieht. Es ist ein TDC-eigenes
   Verzeichnis, nicht der Detonationspfad — die EDR-Tests bleiben aussagekräftig.
+  **Zweimal eingetragen:** im Provisioning (`install-webui.ps1`, wie bisher)
+  *und* beim Start des Web-UI selbst, idempotent über `Add-MpPreference`. Nur so
+  funktioniert das Feature auch auf einer VM, die schon steht und nur ein
+  `make deploy` bekommt.
 - Das Verzeichnis kommt in `_readable_roots`, damit `/api/file/download` die
   Datei an den Host geben kann, und **nicht** in die Schreib-Allowlist.
 - Knöpfe an der Capture: `RIZIN`, `HEX`, `THREATSCAN` — alle drei haben schon
@@ -475,11 +598,18 @@ Skizze — die ausführliche Fassung entsteht, wenn A steht.
 ## Pflichten zum Abschluss
 
 - README: Tabellenzeile `FIREWALL` in Nav-Reihenfolge, ein Abschnitt
-  `## Firewall` mit dem Hunting-Teil und dem Notausgang, die API-Zeilen,
-  Screenshots in `static/` (von README referenziert, sonst meckert der Test).
+  `## Firewall` mit dem Hunting-Teil und dem Notausgang, die API-Zeilen.
+- **Entscheidung — Screenshots.** Die entstehen nur auf einer laufenden
+  Windows-VM und sind von der Entwicklungsmaschine nicht erreichbar. Der
+  Doku-Test verbietet nur *verwaiste* PNGs, nicht fehlende — also referenziert
+  das README in dieser Arbeit **keinen** neuen Screenshot. Die letzte Aufgabe
+  des Plans ist eine Übergabenotiz, welche drei Bilder zu machen sind (Tab mit
+  Karte, Toast mit offener Entscheidung, Isolated aktiv) und in welche
+  README-Stellen sie dann gehören. „Fertig“ ist damit ohne VM erreichbar.
 - Help-Modal: `#help-usage`-Eintrag in derselben Reihenfolge, `#help-api`-Zeilen.
 - Deploy-Listen: `Makefile`, `make.ps1`, `scripts/deploy-utm.py` für
-  `firewall.py`, `firewall_rules.py`, `geoip.py` und `webui/data/`.
+  `firewall.py`, `firewall_store.py`, `firewall_rules.py`, `geoip.py` und das
+  Verzeichnis `webui/data/`.
 - `?v=` auf `style.css`, `theme-layout.css`, `theme-cyberpunk.css`, `app.js`.
 - `tests/test_theme.py`: 12 → 13 und 14 → 15.
 - Neue Tests: `tests/test_firewall.py` (Bewertung, Bündelung, Geo-Lookup,

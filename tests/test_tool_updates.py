@@ -457,13 +457,15 @@ def test_catalog_values():
 
 
 class TestEnv:
-    def test_run_decodes_utf16_output(self):
+    def test_run_decodes_utf16_lines_inside_a_utf8_stream(self):
         import sys
-        code = ("import sys; "
-                "sys.stdout.buffer.write('Sysmon installed\\r\\nService running'.encode('utf-16-le')); "
+        code = ("import sys; w = sys.stdout.buffer.write; "
+                "w(b'[*] Uninstalling Sysmon...\\r\\n'); "
+                "w('Sysmon64a removed.\\r\\nSysmonDrv removed.\\r\\n'.encode('utf-16-le')); "
+                "w(b'[+] done caf\\xc3\\xa9\\r\\n'); "
                 "sys.stderr.buffer.write('Error: driver'.encode('utf-16-le'))")
         res = tu.Env().run([sys.executable, "-c", code], 10)
-        assert res.stdout == "Sysmon installed\nService running"
+        assert res.stdout == "[*] Uninstalling Sysmon...\nSysmon64a removed.\nSysmonDrv removed.\n[+] done caf\u00e9\n"
         assert res.stderr == "Error: driver"
 
     def test_run_strips_stray_nuls_and_keeps_plain_utf8(self):
