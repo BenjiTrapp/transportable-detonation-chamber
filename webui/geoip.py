@@ -54,6 +54,7 @@ import os
 import struct
 import tempfile
 import threading
+import zlib
 from collections import namedtuple
 
 logger = logging.getLogger(__name__)
@@ -222,7 +223,11 @@ class _Index:
             raise ValueError(f"{os.path.basename(path)}: {size} bytes is not a whole number of records")
         self._count = size // record.size
         if self._count:
-            self._map = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                self._map = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+            except BaseException:
+                self._file.close()
+                raise
 
     def __len__(self):
         return self._count
@@ -272,7 +277,7 @@ class _State:
                             number, _, description = line.rstrip("\n").partition("\t")
                             if number.isdigit():
                                 self._names[int(number)] = description
-                except (OSError, EOFError, TypeError):
+                except (OSError, EOFError, TypeError, zlib.error):
                     pass
         return self._names.get(asn, "")
 
@@ -289,7 +294,7 @@ def _read_countries(path):
     """{cc: (name, lat, lon)} of countries.tsv; comment lines and unusable rows are skipped."""
     countries = {}
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
                 if line.startswith("#"):
                     continue
@@ -300,7 +305,7 @@ def _read_countries(path):
                     countries[parts[0].strip().upper()] = (parts[1].strip(), float(parts[2]), float(parts[3]))
                 except ValueError:
                     continue
-    except OSError:
+    except (OSError, ValueError):
         pass
     return countries
 
@@ -322,13 +327,14 @@ def load(data_dir=DATA_DIR):
     try:
         v4 = _Index(os.path.join(data_dir, INDEX_V4), RECORD_V4, KEY_V4)
         v6 = _Index(os.path.join(data_dir, INDEX_V6), RECORD_V6, KEY_V6)
+        countries = _read_countries(os.path.join(data_dir, COUNTRIES_FILE))
     except (OSError, ValueError) as exc:
         logger.warning("geoip: cannot load the index of %s: %s", data_dir, exc)
-        if v4 is not None:
-            v4.close()
+        for index in (v4, v6):
+            if index is not None:
+                index.close()
         return
-    _state = _State(v4, v6, _read_countries(os.path.join(data_dir, COUNTRIES_FILE)),
-                    os.path.join(data_dir, NAMES_FILE))
+    _state = _State(v4, v6, countries, os.path.join(data_dir, NAMES_FILE))
 
 
 def available():

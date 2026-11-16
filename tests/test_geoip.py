@@ -7,7 +7,10 @@ webui/data and never against the network.
 
 import gzip
 import os
+import runpy
 import struct
+import sys
+import zlib
 
 import pytest
 
@@ -16,13 +19,27 @@ import geoip
 FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "samples", "geoip")
 
 
+@pytest.fixture(autouse=True)
+def reset_geoip_state(tmp_path):
+    """No test leaves the module pointing at its own tmp_path index."""
+    yield
+    geoip.load(str(tmp_path / "nothing"))
+
+
 @pytest.fixture
 def geo(tmp_path):
     geoip.build_index(str(FIXTURE_DIR), str(tmp_path))
     copy_countries(str(tmp_path))
     geoip.load(str(tmp_path))
-    yield geoip
-    geoip.load(str(tmp_path / "nothing"))
+    return geoip
+
+
+def open_files():
+    """The number of open file descriptors of this process (None where there is no /dev/fd)."""
+    try:
+        return len(os.listdir("/dev/fd"))
+    except OSError:
+        return None
 
 
 def copy_countries(directory):
@@ -166,6 +183,83 @@ def test_only_one_family_present_still_resolves_that_family(tmp_path):
     assert geoip.available() is True
     assert geoip.lookup("8.8.8.8").asn == 15169
     assert geoip.lookup("2001:db8::1") is None
+
+
+def test_a_countries_file_that_is_not_utf8_does_not_raise_or_leak(tmp_path):
+    geoip.build_index(str(FIXTURE_DIR), str(tmp_path))
+    with open(os.path.join(FIXTURE_DIR, "countries.tsv"), "rb") as f:
+        text = f.read()
+    (tmp_path / "countries.tsv").write_bytes(text + b"\xff\xfe\tbroken\t1\t2\tX\n")
+    before = open_files()
+    geoip.load(str(tmp_path))
+    assert geoip.available() is True
+    assert geoip.lookup("185.244.25.17").country == "Russia"      # the rows before the bad bytes survive
+    geoip.load(str(tmp_path / "nothing"))
+    assert open_files() == before
+
+
+def test_a_failed_load_closes_the_files_it_opened(tmp_path):
+    geoip.build_index(str(FIXTURE_DIR), str(tmp_path))
+    (tmp_path / "ip2asn-v6.idx").write_bytes(b"\0" * 5)           # not a whole number of records
+    before = open_files()
+    geoip.load(str(tmp_path))
+    assert geoip.available() is False
+    assert open_files() == before
+
+
+def test_a_failing_mmap_closes_the_index_file(tmp_path, monkeypatch):
+    geoip.build_index(str(FIXTURE_DIR), str(tmp_path))
+
+    def refuse(*args, **kwargs):
+        raise OSError("cannot map")
+
+    monkeypatch.setattr(geoip.mmap, "mmap", refuse)
+    before = open_files()
+    with pytest.raises(OSError):
+        geoip._Index(str(tmp_path / "ip2asn-v4.idx"), geoip.RECORD_V4, geoip.KEY_V4)
+    assert open_files() == before
+    geoip.load(str(tmp_path))                                      # load degrades instead of raising
+    assert geoip.available() is False
+    assert open_files() == before
+
+
+@pytest.mark.parametrize("damage", ("garbage", "truncated"))
+def test_a_damaged_names_file_leaves_the_asn_without_a_name(tmp_path, damage):
+    geoip.build_index(str(FIXTURE_DIR), str(tmp_path))
+    copy_countries(str(tmp_path))
+    path = tmp_path / "asn-names.tsv.gz"
+    if damage == "garbage":
+        # a valid gzip header, then a deflate stream that zlib rejects
+        path.write_bytes(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff" + b"\xff" * 50)
+        with pytest.raises(zlib.error):
+            gzip.decompress(path.read_bytes())
+    else:
+        path.write_bytes(path.read_bytes()[:-20])
+    geoip.load(str(tmp_path))
+    g = geoip.lookup("185.244.25.17")
+    assert (g.cc, g.asn, g.as_org) == ("RU", 200557, "")
+
+
+def test_the_fetch_script_reports_a_damaged_download_instead_of_a_traceback(monkeypatch, capsys):
+    class Response:
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff" + b"\xff" * 50
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: Response())
+    script = os.path.join(os.path.dirname(__file__), "..", "scripts", "fetch-geoip.py")
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    with pytest.raises(SystemExit) as stop:
+        runpy.run_path(script, run_name="__main__")
+    assert stop.value.code == 1
+    assert "fetch-geoip failed" in capsys.readouterr().err
 
 
 def test_malformed_lines_are_skipped(tmp_path):

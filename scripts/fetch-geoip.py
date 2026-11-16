@@ -23,6 +23,7 @@ import os
 import sys
 import tempfile
 import urllib.request
+import zlib
 from datetime import datetime, timezone
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -90,6 +91,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, EOFError) as exc:
+    except (OSError, ValueError, EOFError, zlib.error) as exc:
         print(f"fetch-geoip failed: {exc}", file=sys.stderr)
         sys.exit(1)
