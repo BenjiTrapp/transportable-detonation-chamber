@@ -120,10 +120,31 @@ def test_the_store_keeps_connections_only_and_skips_what_it_cannot_place():
 
 
 def test_the_ring_forgets_what_is_older_than_a_week_before_its_newest_entry():
-    s = FirewallStore()
+    s = FirewallStore(now=lambda: BASE + firewall_store.RETAIN_S + 10)
     s.add_connections([conn(t=0, dst="1.1.1.1")])
     s.add_connections([conn(t=firewall_store.RETAIN_S + 5, dst="2.2.2.2")])
     assert [f["dst_ip"] for f in s.connections()] == ["2.2.2.2"]
+
+
+def test_a_future_dated_event_does_not_wipe_the_ring():
+    s = FirewallStore(now=lambda: BASE + 100)
+    s.add_connections([conn(t=0, dst="1.1.1.1"), conn(t=50, dst="2.2.2.2")])
+    s.add_connections([conn(t=60 * 86400, dst="9.9.9.9")])              # two months ahead: a clock set forward
+    assert [f["dst_ip"] for f in s.connections()] == ["1.1.1.1", "2.2.2.2", "9.9.9.9"]
+    assert len(s.events(until=BASE + 100)) == 3                         # it is kept, placed at the collector's now
+    s.add_connections([conn(t=100 + 3600, dst="8.8.8.8")])               # an hour ahead is skew, kept as it is
+    assert len(s.events()) == 4 and len(s.events(until=BASE + 100)) == 3
+
+
+def test_a_future_dated_event_wipes_none_of_the_other_rings_either():
+    s = FirewallStore(now=lambda: BASE + 100)
+    later = 60 * 86400
+    s.add_firewall([{"time": iso(0), "fields": {}}, {"time": iso(later), "fields": {}}])
+    s.add_powershell([ps("iwr http://a.b/c.dll", t=0), ps("iwr http://a.b/d.dll", t=later)])
+    s.add_bits([bits("http://a.b/s.exe", t=0), bits("http://a.b/t.exe", t=later)])
+    s.add_processes([proc(10, t=0), proc(11, t=later)])
+    assert (len(s.firewall_events()), len(s.powershell()), len(s.bits()), len(s.process_events())) == (2, 2, 2, 2)
+    assert s.processes()[11]["start"] == BASE + later                    # what the process says of itself stays
 
 
 def test_dns_map_takes_the_newest_answer_and_survives_more_events():
@@ -145,14 +166,27 @@ def test_processes_know_start_parent_and_a_reused_pid_is_the_newest():
     assert s.processes()[12]["parent_pid"] is None
 
 
-def test_a_huge_commandline_is_cut_and_a_huge_script_is_cut_but_found():
+def test_a_url_behind_a_wall_of_padding_is_still_found():
     s = FirewallStore()
-    s.add_processes([proc(10, cmd="x" * 100000)])
-    assert len(s.process_events()[0]["commandline"]) == firewall_store.MAX_COMMANDLINE_CHARS
-    s.add_powershell([ps("noise\n" * 100000 + "http://a.b/c.dll")])           # no URL within the kept text
-    s.add_powershell([ps("http://a.b/c.dll " + "x" * 200000)])
-    assert len(s.powershell()) == 2
-    assert all(len(e["message"]) <= firewall_store.MAX_SCRIPT_CHARS for e in s.powershell())
+    s.add_powershell([ps("x" * 70000 + " iwr http://a.b/c.dll", pid=4812)])
+    s.add_processes([proc(4812), proc(5000, parent=4812, cmd="y" * 10000 + " curl http://a.b/z.exe")])
+    assert len(s.powershell()[0]["message"]) <= firewall_store.MAX_SCRIPT_CHARS      # the text is cut, the URL is not lost
+    assert len(s.process_events()[1]["commandline"]) == firewall_store.MAX_COMMANDLINE_CHARS
+    flows = [flow(pid=4812), flow(pid=5000, image=r"C:\Windows\curl.exe")]
+    found = download_findings(s.powershell(), s.process_events(), [], flows, {4812})
+    assert {(f["source"], f["url"], f["in_detonation"]) for f in found} == \
+        {("powershell", "http://a.b/c.dll", True), ("sysmon", "http://a.b/z.exe", True)}
+
+
+def test_decoy_urls_before_the_payload_do_not_hide_it():
+    decoys = " ".join(f"http://a.b/page{i}.html" for i in range(40))
+    s = FirewallStore()
+    s.add_powershell([ps(decoys + " iwr http://a.b/c.dll")])
+    found = download_findings(s.powershell(), [], [], FLOWS, {4812})
+    assert [f["url"] for f in found] == ["http://a.b/c.dll"]
+    many = " ".join(f"http://a.b/x{i}.exe" for i in range(30))
+    s.add_powershell([ps(many, t=5)])
+    assert len(s.powershell()[1]["urls"]) == firewall_store.MAX_URLS
 
 
 def test_powershell_and_bits_are_kept_only_with_a_url():
@@ -203,7 +237,16 @@ def test_urls_in_is_linear_on_a_big_text():
     start = time.time()
     assert urls_in("http://a" * 1_000_000 + " ") == []                # one 8 MB token
     assert urls_in("x " * 5_000_000 + "http://a.b/c.dll") == ["http://a.b/c.dll"]
+    assert urls_in("http://a.b/x " * 600_000) == ["http://a.b/x"]
     assert time.time() - start < 5
+
+
+def test_the_store_scans_a_huge_script_once_and_quickly():
+    start = time.time()
+    s = FirewallStore()
+    s.add_powershell([ps("http://a.b/page.html " * 500_000 + "http://a.b/c.dll")])           # 11 MB, 500 000 URLs
+    assert s.powershell()[0]["urls"] == ["http://a.b/c.dll"]
+    assert time.time() - start < 10
 
 
 # ---- the download finding ------------------------------------------------------------------
@@ -269,16 +312,39 @@ def test_a_bits_job_is_in_a_detonation_by_the_window_not_by_the_pid():
     svchost = flow(pid=900, image=SVCHOST, ip="9.9.9.9", port=80)
     started = [proc(4812, parent=1, t=0)]
 
-    def job(t, submissions, procs=started, pid=None):
-        return download_findings([], procs, [bits("http://a.b/s.exe", pid=pid, t=t)], [svchost], submissions)[0]
-    assert job(5, {4812})["in_detonation"] is True            # nobody names the requester; a submission was running
-    assert job(5, {4812}, pid=900)["in_detonation"] is True    # the BITS service's own pid is no submission either
-    assert job(-10, {4812})["in_detonation"] is False          # the job is older than the submission
-    assert job(5, set())["in_detonation"] is False             # no submission in a window
-    assert job(5, {4812}, procs=[])["in_detonation"] is True   # a submission whose start the ring has lost
-    assert job(5, {4812}, procs=[proc(4812, t=50)])["in_detonation"] is False
+    def job(t, submissions, procs=started, pid=None, now=BASE + 30):
+        found = download_findings([], procs, [bits("http://a.b/s.exe", pid=pid, t=t)], [svchost], submissions,
+                                  now=now)
+        return found[0]["in_detonation"]
+    assert job(5, {4812}) is True                       # nobody names the requester; a submission was running
+    assert job(5, {4812}, pid=900) is True              # the BITS service's own pid is no submission either
+    assert job(-10, {4812}) is False                    # the job is older than the submission
+    assert job(5, set()) is False                       # no submission in a window
+    assert job(5, {4812}, procs=[proc(4812, t=50)]) is False
     undated = dict(bits("http://a.b/s.exe", pid=None), timestamp="junk")
     assert download_findings([], started, [undated], [svchost], {4812})[0]["in_detonation"] is False
+
+
+def test_a_bits_job_of_a_submission_with_a_lost_start_counts_only_within_the_lookback():
+    svchost = flow(pid=900, image=SVCHOST, ip="9.9.9.9", port=80)
+    lookback = firewall_store.BITS_LOOKBACK_S
+
+    def job(age):
+        now = BASE + 10_000
+        return download_findings([], [], [bits("http://a.b/s.exe", pid=None, t=10_000 - age)], [svchost], {4812},
+                                 now=now)[0]["in_detonation"]
+    assert job(5) is True and job(lookback - 1) is True
+    assert job(lookback + 1) is False and job(3 * 86400) is False
+
+
+def test_a_reused_pid_does_not_lend_its_old_history_to_a_later_job():
+    svchost = flow(pid=900, image=SVCHOST, ip="9.9.9.9", port=80)
+    reused = [proc(4812, t=0), proc(4812, t=1000)]       # the submission is the newest process with this PID
+
+    def job(t):
+        return download_findings([], reused, [bits("http://a.b/s.exe", pid=None, t=t)], [svchost], {4812},
+                                 now=BASE + 1100)[0]["in_detonation"]
+    assert job(500) is False and job(1050) is True
 
 
 def test_sysmon_commandline_is_a_source_and_an_ancestor_counts():
@@ -315,13 +381,6 @@ def test_every_finding_is_returned_and_says_whether_it_is_in_a_detonation():
     child = [proc(99, parent=50), proc(50, parent=4812)]
     assert download_findings(events, child, [], [flow(pid=99)], {4812})[0]["in_detonation"] is True
     assert download_findings(events, child, [], [flow(pid=99)], {77})[0]["in_detonation"] is False
-
-
-def test_the_ask_policy_is_not_this_modules_business():
-    with pytest.raises(TypeError):
-        download_findings([], [], [], [], set(), "all")
-    with pytest.raises(TypeError):
-        download_findings([], [], [], [], set(), ask_mode="off")
 
 
 def test_a_finding_marks_tdc_own_processes_instead_of_dropping_them():
@@ -435,8 +494,17 @@ def test_set_result_adds_what_the_fetch_found_out(pending_path):
     p.resolve(item["id"], "block_fetch", {"by": "timeout"})
     p.set_result(item["id"], {"capture_id": "c1"})
     assert PendingStore(pending_path).history()[0]["result"] == {"by": "timeout", "capture_id": "c1"}
-    with pytest.raises(KeyError):
-        p.set_result("nope", {})
+    assert p.set_result("nope", {}) is None                      # an ordinary race, not an error
+
+
+def test_set_result_on_an_item_that_was_pruned_is_tolerated(pending_path):
+    now = [1_000_000.0]
+    p = PendingStore(pending_path, clock=lambda: now[0])
+    item = p.add(FINDING, deadline=now[0])
+    p.resolve(item["id"], "block_fetch")
+    now[0] += 25 * 3600
+    assert p.history() == []                                      # the 24 h are over, the item is gone
+    assert p.set_result(item["id"], {"capture_id": "c1"}) is None
 
 
 def test_history_keeps_24_hours_newest_first(pending_path):
@@ -555,6 +623,19 @@ def test_settings_that_cannot_be_saved_raise_and_roll_back(tmp_path, monkeypatch
     assert (s.isolated, s.outbound_before) == (False, None)
 
 
+def test_settings_are_published_only_after_they_are_saved(tmp_path, monkeypatch):
+    s = Settings(str(tmp_path / "state.json"))
+    seen = []
+    real = firewall_store._write_json
+
+    def spy(path, payload):
+        seen.append((s.isolated, payload["isolated"]))           # what a reader sees while the file is written
+        real(path, payload)
+    monkeypatch.setattr(firewall_store, "_write_json", spy)
+    s.set(isolated=True)
+    assert seen == [(False, True)] and s.isolated is True
+
+
 def test_a_corrupt_or_odd_settings_file_gives_defaults_and_says_why(tmp_path):
     path = tmp_path / "state.json"
     path.write_text("{ nope", encoding="utf-8")
@@ -670,11 +751,13 @@ def test_a_reread_answer_does_not_overwrite_a_newer_one(tmp_path):
     assert store.dns() == {"1.2.3.4": "new.example"}
 
 
-def test_the_dedup_memory_is_bounded(tmp_path):
+def test_the_dedup_memory_is_bounded(monkeypatch):
+    monkeypatch.setattr(firewall_store, "MAX_DEDUP_KEYS", 50)
     store = FirewallStore()
-    n = firewall_store.MAX_DEDUP_KEYS + 10
-    store.add_connections([dict(conn(t=0), src_port=str(i)) for i in range(n)])
-    assert len(store._seen["connections"]) == firewall_store.MAX_DEDUP_KEYS
+    events = [dict(conn(t=0), src_port=str(i)) for i in range(60)]
+    assert store.add_connections(events) == 60
+    assert store.add_connections(events[-50:]) == 0               # the latest 50 are still remembered
+    assert store.add_connections(events[:1]) == 1                 # the oldest ones are not: memory has a limit
 
 
 def test_a_full_page_inside_the_overlap_moves_the_position_on(tmp_path):
@@ -705,6 +788,84 @@ def test_a_failed_read_leaves_the_position_and_a_cleared_log_is_read_on(tmp_path
         c.tick()
     assert [a[1] for a in asked] == [BASE + 100 - 86400, BASE + 5, BASE + 5, BASE + 5]
     assert len(store.events()) == 2 and store.stats()["status"]["connections"] == "ok"
+
+
+def test_a_clock_stepped_back_does_not_leave_the_position_in_the_future(tmp_path):
+    asked = []
+    clock = Clock(BASE + 1000)
+    read = sysmon_reader([[conn(t=990)], [conn(t=28)], [conn(t=50)], []], asked)
+    store, c = collector(tmp_path, readers(connections=read), clock=clock)
+    c.tick()                                       # the position is now BASE + 985
+    clock.t = BASE + 30                            # a sample sets the clock back
+    c.tick()
+    clock.t = BASE + 60
+    c.tick()
+    c.tick()
+    assert [a[1] for a in asked] == [BASE + 1000 - 86400, BASE + 30, BASE + 30, BASE + 45]
+    assert len(store.events()) == 3
+
+
+def test_a_clock_stepped_back_does_not_stop_the_slow_sources_in_the_window(tmp_path):
+    calls = []
+    spies = {name: (lambda name=name, **k: calls.append(name) or []) for name in firewall_store.SOURCES}
+    clock = Clock(BASE)
+    _, c = collector(tmp_path, spies, window=True, clock=clock)
+    c.tick()
+    clock.t = BASE - 3600
+    c.tick()
+    assert calls.count("powershell") == 2 and calls.count("firewall") == 2
+    clock.t += 1
+    c.tick()
+    assert calls.count("powershell") == 2                   # and the slow pace goes on from the new time
+
+
+def test_a_cleared_event_log_is_read_again_from_its_start(tmp_path):
+    calls = []
+    answers = iter([([ps("iwr http://a.b/c.dll", record_id=100)], 100), ([], 100),
+                    ([], 3),                                                    # the log restarted: newest id 3 < 100
+                    ([ps("iwr http://a.b/d.dll", record_id=1), ps("iwr http://a.b/e.dll", record_id=3)], 3),
+                    ([], 3)])
+
+    def read_ps(since=None):
+        calls.append(since)
+        return next(answers)
+
+    store, c = collector(tmp_path, readers(powershell=read_ps))
+    for _ in range(3):
+        c.tick()
+    assert calls == [None, 100, 100, 0]
+    assert len(store.powershell()) == 3 and store.stats()["status"]["powershell"] == "ok"
+    assert "cleared" in store.stats()["hints"]["powershell"]
+    c.tick()
+    assert calls[-1] == 3 and store.stats()["hints"]["powershell"] == ""
+
+
+def test_a_cleared_bits_log_is_recovered_the_same_way(tmp_path):
+    calls = []
+    answers = iter([([bits("http://a.b/s.exe", record_id=40)], 40), ([], 2), ([bits("http://a.b/t.exe", record_id=2)], 2)])
+
+    def read_bits(since=None):
+        calls.append(since)
+        return next(answers)
+
+    store, c = collector(tmp_path, readers(bits=read_bits), window=True)
+    c.tick()
+    c.tick()
+    assert calls == [None, 40, 0] and len(store.bits()) == 2
+
+
+def test_a_firewall_offset_that_shrinks_is_a_rotation_the_reader_has_already_handled(tmp_path):
+    calls = []
+    answers = iter([([{"time": iso(0), "fields": {}}], 9000), ([{"time": iso(1), "fields": {}}], 200)])
+
+    def read_firewall(since=None):
+        calls.append(since)
+        return next(answers)
+
+    store, c = collector(tmp_path, readers(firewall=read_firewall))
+    c.tick()
+    c.tick()
+    assert calls == [None, 9000] and len(store.firewall_events()) == 2        # no second read, no double counting
 
 
 def test_a_cursor_never_runs_backwards_and_an_explicit_one_is_taken_as_it_is(tmp_path):

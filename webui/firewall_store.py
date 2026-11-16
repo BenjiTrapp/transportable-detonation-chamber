@@ -9,7 +9,8 @@ once, and the tab needs the single connections (beacon detection) and the proces
 Times: ``since`` and ``until`` are ISO-8601 text (or epoch seconds); what comes out is what
 ``firewall`` works in, epoch floats. ``events`` returns the raw Sysmon events of a window, the input of
 ``firewall.classify``; ``connections`` is the same window bundled by ``firewall.bundle``. A ring
-forgets what is older than ``RETAIN_S`` before its *newest* entry, not before the wall clock.
+forgets what is older than ``RETAIN_S`` before its *newest* entry, not before the wall clock; an entry dated more
+than a day ahead of the clock is kept at the clock, so a sample that sets the time forward cannot empty the ring.
 
 ``FirewallCollector`` reads the sources incrementally through injected readers. A reader is called with
 keyword arguments and returns a list of events, oldest first; a reader that raises, or answers
@@ -22,6 +23,8 @@ keyword arguments and returns a list of events, oldest first; a reader that rais
         The first read is the last 24 h. Time, not ``EventRecordID``: a cleared Sysmon log strands no cursor.
     powershell    ``reader(since=<EventRecordID or None>)``: ``log_store.parse_powershell_events`` events
         (``time``, ``message``, ``fields.record_id``, ``fields.pid``). The position is the highest record id.
+        A reader may answer ``(events, newest_record_id)`` with the newest id of the *log*; one below the
+        position held means the log was cleared, and the collector reads it again from the start (``since=0``).
     bits          the same, BITS client EID 59/60: ``{"timestamp", "event_id", "data": {"url"}}``, optionally ``pid``
     firewall      ``reader(since=<offset or None>)`` returns ``(events, new_offset)``: ``log_store.parse_firewall_log``
 
@@ -69,10 +72,14 @@ MAX_URL_EVENTS = 500       # PowerShell and BITS events with a URL, each
 MAX_SCRIPT_CHARS = 65536   # of a script block that is kept
 MAX_COMMANDLINE_CHARS = 8192
 
+MAX_FUTURE_S = 86400       # an entry dated further ahead than this is placed at "now"
+BITS_LOOKBACK_S = 600      # a BITS job counts for a submission whose start is lost only this long ago
+
 FAST_INTERVAL = 1.0
 SLOW_INTERVAL = 10.0
 SLOW_SLACK_S = 0.5                       # a tick a little early still counts as a slow interval
 SLOW_SOURCES = ("powershell", "firewall")    # read every SLOW_INTERVAL even in a detonation window
+RECORD_SOURCES = ("powershell", "bits")      # event logs read by EventRecordID
 
 # Reading Sysmon by time, as log_store.Collector does
 SYSMON_EVENT_IDS = {"connections": (3,), "dns": (22,), "processes": (1,)}
@@ -178,19 +185,42 @@ def _write_json(path: str, payload: Any) -> None:
 # ---- URLs ------------------------------------------------------------------------------------
 
 
+def _clean_urls(text: str) -> Iterable[str]:
+    for match in URL_RE.finditer(text):
+        url = match.group(0).rstrip(_URL_TRAILING)
+        if len(url) <= MAX_URL_LEN and url.partition("://")[2]:
+            yield url
+
+
 def urls_in(text: str) -> List[str]:
     """The http(s) URLs in ``text``, in order and without repeats: at most ``MAX_URLS``, none longer than
     ``MAX_URL_LEN`` (such a one is dropped, not cut). Trailing punctuation is not part of a URL."""
     if not isinstance(text, str) or not text:
         return []
     found: List[str] = []
-    for match in URL_RE.finditer(text):
-        url = match.group(0).rstrip(_URL_TRAILING)
-        if len(url) > MAX_URL_LEN or not url.partition("://")[2] or url in found:
-            continue
-        found.append(url)
-        if len(found) >= MAX_URLS:
-            break
+    for url in _clean_urls(text):
+        if url not in found:
+            found.append(url)
+            if len(found) >= MAX_URLS:
+                break
+    return found
+
+
+def executable_urls_in(text: str) -> List[str]:
+    """The URLs of ``text`` that name an executable file (``EXECUTABLE_SUFFIXES``), at most ``MAX_URLS``.
+
+    The whole text is scanned and the limit counts executable URLs only, so neither padding nor a crowd of
+    harmless URLs in front of a payload URL hides it.
+    """
+    if not isinstance(text, str) or not text:
+        return []
+    found: List[str] = []
+    for url in _clean_urls(text):
+        parts = _url_parts(url)
+        if parts is not None and _is_executable_name(parts[2]) and url not in found:
+            found.append(url)
+            if len(found) >= MAX_URLS:
+                break
     return found
 
 
@@ -225,8 +255,10 @@ def _window(ring: Iterable[Tuple[float, Any]], since: Optional[float], until: Op
 class FirewallStore:
     """Thread-safe rings of what the collector read; see the module docstring."""
 
-    def __init__(self, max_connections: int = MAX_CONNECTIONS, retain_s: float = RETAIN_S):
+    def __init__(self, max_connections: int = MAX_CONNECTIONS, retain_s: float = RETAIN_S,
+                 now: Callable[[], float] = time.time):
         self.retain_s = retain_s
+        self._now = now
         self._lock = threading.Lock()
         self._connections: Deque[Tuple[float, Tuple, Dict[str, Any]]] = deque(maxlen=max(1, int(max_connections)))
         self._firewall: Deque[Tuple[float, Dict[str, Any]]] = deque(maxlen=MAX_FIREWALL_EVENTS)
@@ -239,6 +271,19 @@ class FirewallStore:
         self._seen: Dict[str, Dict[Tuple[str, ...], None]] = {kind: {} for kind in _DEDUP_FIELDS}
 
     # -- writing --
+
+    def _placed(self, ev: Dict[str, Any]) -> Optional[float]:
+        """The time an event is kept under: its own, but no more than ``MAX_FUTURE_S`` ahead of the clock.
+
+        Setting the clock forward is a sandbox-evasion trick; an entry dated months ahead would otherwise
+        make ``_forget_old`` drop the whole ring. Such an entry is kept at "now" (the event keeps its own text).
+        """
+        epoch = _event_epoch(ev)
+        if epoch is not None:
+            now = self._now()
+            if epoch > now + MAX_FUTURE_S:
+                epoch = now
+        return epoch
 
     def _is_new(self, kind: str, ev: Dict[str, Any]) -> bool:
         """Whether this Sysmon event was not added before (and remember it); the caller holds the lock."""
@@ -263,7 +308,7 @@ class FirewallStore:
         added = 0
         with self._lock:
             for ev in events:
-                epoch = _event_epoch(ev) if _event_id(ev) == 3 and not ev.get("error") else None
+                epoch = self._placed(ev) if _event_id(ev) == 3 and not ev.get("error") else None
                 if epoch is not None and self._is_new("connections", ev):
                     self._connections.append((epoch, firewall.flow_key(ev), ev))
                     added += 1
@@ -287,17 +332,18 @@ class FirewallStore:
         added = 0
         with self._lock:
             for ev in events:
-                epoch = _event_epoch(ev) if _event_id(ev) == 1 and not ev.get("error") else None
+                epoch = self._placed(ev) if _event_id(ev) == 1 and not ev.get("error") else None
                 pid = _to_int(ev.get("pid")) if epoch is not None else None
                 if pid is None or not self._is_new("processes", ev):
                     continue
                 commandline = ev.get("commandline")
-                if isinstance(commandline, str) and len(commandline) > MAX_COMMANDLINE_CHARS:
-                    ev = dict(ev, commandline=commandline[:MAX_COMMANDLINE_CHARS])
+                if isinstance(commandline, str):
+                    # the URLs are taken from the whole text: the part that is cut away may be where the URL is
+                    ev = dict(ev, urls=executable_urls_in(commandline), commandline=commandline[:MAX_COMMANDLINE_CHARS])
                 self._process_events.append((epoch, ev))
                 self._processes.pop(pid, None)       # a reused PID is the newest process
                 self._processes[pid] = {
-                    "start": epoch, "image": str(ev.get("image") or "").strip(),
+                    "start": _event_epoch(ev) or epoch, "image": str(ev.get("image") or "").strip(),
                     "parent_pid": _to_int(ev.get("parent_pid")),
                     "parent_image": str(ev.get("parent_image") or "").strip(),
                     "commandline": ev.get("commandline") or ""}
@@ -312,7 +358,7 @@ class FirewallStore:
         added = 0
         with self._lock:
             for ev in events:
-                epoch = _event_epoch(ev) if isinstance(ev, dict) else None
+                epoch = self._placed(ev) if isinstance(ev, dict) else None
                 if epoch is not None:
                     self._firewall.append((epoch, ev))
                     added += 1
@@ -320,30 +366,33 @@ class FirewallStore:
         return added
 
     def add_powershell(self, events: Iterable[Dict[str, Any]]) -> int:
-        """Keep the PowerShell events whose text holds a URL (the rest is the LOGS tab's business); returns how many."""
+        """Keep the PowerShell events whose text names an executable by URL; returns how many.
+
+        The event is kept with ``urls`` (taken from the whole text) and a text cut to ``MAX_SCRIPT_CHARS``.
+        """
         added = 0
         with self._lock:
             for ev in events:
                 text = ev.get("message") if isinstance(ev, dict) else None
-                epoch = _event_epoch(ev) if urls_in(text) else None
+                urls = executable_urls_in(text)
+                epoch = self._placed(ev) if urls else None
                 if epoch is None:
                     continue
-                if len(text) > MAX_SCRIPT_CHARS:
-                    ev = dict(ev, message=text[:MAX_SCRIPT_CHARS])
-                self._powershell.append((epoch, ev))
+                self._powershell.append((epoch, dict(ev, urls=urls, message=text[:MAX_SCRIPT_CHARS])))
                 added += 1
             self._forget_old(self._powershell)
         return added
 
     def add_bits(self, events: Iterable[Dict[str, Any]]) -> int:
-        """Keep the BITS events that name a URL; returns how many."""
+        """Keep the BITS events that name an executable by URL; returns how many."""
         added = 0
         with self._lock:
             for ev in events:
                 data = ev.get("data") if isinstance(ev, dict) else None
-                epoch = _event_epoch(ev) if isinstance(data, dict) and urls_in(data.get("url")) else None
+                urls = executable_urls_in(data.get("url")) if isinstance(data, dict) else []
+                epoch = self._placed(ev) if urls else None
                 if epoch is not None:
-                    self._bits.append((epoch, ev))
+                    self._bits.append((epoch, dict(ev, urls=urls)))
                     added += 1
             self._forget_old(self._bits)
         return added
@@ -368,6 +417,10 @@ class FirewallStore:
         """``(epoch, dst_ip, dst_port)`` of every single connection of ``image`` to this endpoint, oldest first.
 
         The beaconing detector works on these, not on a bundled flow.
+
+        This scans the whole ring: it is for the detail view of **one** flow and must never be called in a loop
+        over all flows. A caller that wants every flow gives ``events()`` to ``firewall.classify``, which bundles
+        and tags in one pass and needs no scan per flow.
         """
         want = firewall.flow_key({"image": image, "dst_ip": dst_ip, "dst_port": dst_port})
         with self._lock:
@@ -448,39 +501,53 @@ def _flow_for(flows: Iterable[Dict[str, Any]], host: str, port: int, pid: Option
     return best[1] if best else None
 
 
-def _candidates(ps_events, proc_events, bits_events) -> List[Tuple[str, Dict[str, Any], str, bool]]:
-    """``(source, event, text, via_bits)`` of every event that may hold a URL; a BITS job is fetched by the
-    BITS service, so its requester is not the process that connects."""
+def _candidates(ps_events, proc_events, bits_events) -> List[Tuple[str, Dict[str, Any], List[str], bool]]:
+    """``(source, event, urls, via_bits)`` of every event that names an executable by URL; a BITS job is
+    fetched by the BITS service, so its requester is not the process that connects.
+
+    The URLs are those the store took from the whole text before it cut it (``urls``); an event that did not
+    pass the store (a caller's own list) is scanned here.
+    """
+    def urls_of(ev: Dict[str, Any], text: Any) -> List[str]:
+        return ev["urls"] if isinstance(ev.get("urls"), list) else executable_urls_in(text)
+
     out = []
     for ev in ps_events or ():
-        if isinstance(ev, dict) and isinstance(ev.get("message"), str):
-            out.append(("powershell", ev, ev["message"], False))
+        if isinstance(ev, dict):
+            out.append(("powershell", ev, urls_of(ev, ev.get("message")), False))
     for ev in proc_events or ():
-        if isinstance(ev, dict) and _event_id(ev) == 1 and isinstance(ev.get("commandline"), str):
-            out.append(("sysmon", ev, ev["commandline"], False))
+        if isinstance(ev, dict) and _event_id(ev) == 1:
+            out.append(("sysmon", ev, urls_of(ev, ev.get("commandline")), False))
     for ev in bits_events or ():
         data = ev.get("data") if isinstance(ev, dict) else None
-        if isinstance(data, dict) and isinstance(data.get("url"), str):
-            out.append(("bits", ev, data["url"], True))
+        if isinstance(data, dict):
+            out.append(("bits", ev, urls_of(ev, data.get("url")), True))
     return out
 
 
-def _bits_job_in_detonation(job: Optional[float], submission_pids: Set[int],
-                            starts: Dict[int, List[float]]) -> bool:
-    """Whether a submission process had started by the time of the BITS job.
+def _bits_job_in_detonation(job: Optional[float], submission_pids: Set[int], starts: Dict[int, List[float]],
+                            now: float) -> bool:
+    """Whether a submission process was running at the time of the BITS job.
 
-    ``submission_pids`` are the processes of a detonation window that is open now, so one that started
-    before the job was running at the time. A submission whose start is not known (EID 1 left the
-    ring) counts as having started.
+    ``submission_pids`` are the processes of detonation windows that are open now, so the newest process with
+    such a PID is the submission (an older one that had the PID before does not count), and it had started by
+    the job when its newest start is not after it. A submission whose start is not known (EID 1 left the
+    ring) counts only for a job of the last ``BITS_LOOKBACK_S``, not for one from days ago.
     """
     if job is None:
         return False
-    return any(not starts.get(pid) or any(began <= job for began in starts[pid]) for pid in submission_pids)
+    for pid in submission_pids:
+        if starts.get(pid):
+            if max(starts[pid]) <= job:
+                return True
+        elif now - BITS_LOOKBACK_S <= job:
+            return True
+    return False
 
 
 def download_findings(ps_events: List[Dict[str, Any]], proc_events: List[Dict[str, Any]],
                       bits_events: List[Dict[str, Any]], flows: List[Dict[str, Any]],
-                      submission_pids: Iterable[int]) -> List[Dict[str, Any]]:
+                      submission_pids: Iterable[int], now: Optional[float] = None) -> List[Dict[str, Any]]:
     """URLs to executable files that were fetched, with the connection that fetched them.
 
     A URL counts when its file name ends in ``EXECUTABLE_SUFFIXES`` (the path only, not the query) and
@@ -493,12 +560,14 @@ def download_findings(ps_events: List[Dict[str, Any]], proc_events: List[Dict[st
     policy needs: ``in_detonation`` (the process that asked, or an ancestor from ``proc_events``, is in
     ``submission_pids``) and ``self`` (the connecting process is one of TDC's own, ``firewall.is_tdc_image``).
 
+    ``now`` (default: the clock) bounds the BITS test below.
+
     A BITS job is the exception to the PID test. BITS EID 59/60 do not name the requester and the connection
     is made by the BITS service (``svchost.exe``, so ``image`` says that and ``requested_by`` is ``"bits"``,
     to tell a reader why the name looks innocent). A PID test could never be true for a channel that is a
     stealthy download path (T1197); so a BITS job is ``in_detonation`` when a submission process had started
     by its time, which is deliberately wider than the PID test, and the BITS host is matched in any process.
-    The alternative is not to see BITS downloads at all.
+    The alternative is not to see BITS downloads at all. The window still bounds it (``_bits_job_in_detonation``).
 
     A finding is ``{id, pid, image, url, dst_ip, dst_port, source, observed_at, origin_pid, requested_by,
     in_detonation, self}``; ``source`` is ``powershell``, ``sysmon`` or ``bits``, ``origin_pid`` the PID of the
@@ -506,6 +575,7 @@ def download_findings(ps_events: List[Dict[str, Any]], proc_events: List[Dict[st
     same process and URL, so a call at every tick finds a finding again.
     """
     submissions = {int(p) for p in submission_pids}
+    now = time.time() if now is None else now
     parents: Dict[int, Dict[str, Any]] = {}
     starts: Dict[int, List[float]] = {}
     for ev in proc_events or ():
@@ -517,15 +587,15 @@ def download_findings(ps_events: List[Dict[str, Any]], proc_events: List[Dict[st
                 starts.setdefault(pid, []).append(began)
     ancestry = firewall.Context(submission_pids=submissions, processes=parents)
     found: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-    for source, ev, text, via_bits in _candidates(ps_events, proc_events, bits_events):
+    for source, ev, urls, via_bits in _candidates(ps_events, proc_events, bits_events):
         origin = _event_pid(ev)
         epoch = _event_epoch(ev)
         if origin is None and not via_bits:
             continue
         in_detonation = origin is not None and firewall.is_detonated(origin, ancestry)
         if via_bits and not in_detonation:
-            in_detonation = _bits_job_in_detonation(epoch, submissions, starts)
-        for url in urls_in(text):
+            in_detonation = _bits_job_in_detonation(epoch, submissions, starts, now)
+        for url in urls:
             parts = _url_parts(url)
             if parts is None or not _is_executable_name(parts[2]):
                 continue
@@ -672,12 +742,15 @@ class PendingStore:
         """Take the decision and return the item. A second answer is no error and changes nothing: it gets the first item."""
         return self.settle(pending_id, action, result)[0]
 
-    def set_result(self, pending_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
-        """Add to the ``result`` of a decided item what became known later (the fetch that followed it)."""
+    def set_result(self, pending_id: str, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Add to the ``result`` of a decided item what became known later (the fetch that followed it).
+
+        Returns the item, or None when it is gone: a fetch can outlive the 24 h of history, and that is no error.
+        """
         with self._lock:
             item = self._items.get(pending_id)
             if item is None:
-                raise KeyError(pending_id)
+                return None
             item["result"] = dict(item["result"] or {}, **copy.deepcopy(result))
             self._save()
             return copy.deepcopy(item)
@@ -786,25 +859,22 @@ class Settings:
 
     def save(self) -> None:
         with self._lock:
-            self._save()
-
-    def _save(self) -> None:
-        _write_json(self.path, {name: getattr(self, name) for name in self.DEFAULTS})
+            _write_json(self.path, {name: getattr(self, name) for name in self.DEFAULTS})
 
     def set(self, **changes: Any) -> Dict[str, Any]:
-        """Change settings by name and write the file; returns the settings."""
+        """Change settings by name and write the file; returns the settings.
+
+        The file is written first and the attributes are changed after, so a reader that does not take the lock
+        never sees a value that the file then refuses (it raises and changes nothing).
+        """
         checked = {name: _check_setting(name, value) for name, value in changes.items()}
         with self._lock:
-            before = {name: getattr(self, name) for name in checked}
+            merged = {name: getattr(self, name) for name in self.DEFAULTS}
+            merged.update(checked)
+            _write_json(self.path, merged)
             for name, value in checked.items():
                 setattr(self, name, value)
-            try:
-                self._save()
-            except BaseException:
-                for name, value in before.items():
-                    setattr(self, name, value)
-                raise
-            return {name: getattr(self, name) for name in self.DEFAULTS}
+            return merged
 
 
 # ---- collector -------------------------------------------------------------------------------
@@ -857,7 +927,8 @@ class FirewallCollector:
             if name == "bits" and not window:
                 self.store.set_status(name, "idle", "read only in a detonation window")
                 continue
-            due = now - self._last_read.get(name, -math.inf) >= SLOW_INTERVAL - SLOW_SLACK_S
+            elapsed = now - self._last_read.get(name, -math.inf)
+            due = elapsed >= SLOW_INTERVAL - SLOW_SLACK_S or elapsed < 0      # a clock set back is due, not stalled
             if window and name in SLOW_SOURCES and not due:
                 continue
             self._last_read[name] = now
@@ -884,6 +955,8 @@ class FirewallCollector:
         reader = self._reader(name)
         cutoff = now - START_WINDOW_S
         previous = self._since.get(name)
+        if previous is not None:
+            previous = self._since[name] = min(previous, now)       # a clock set back must not leave it in the future
         events = list(reader(event_ids=list(SYSMON_EVENT_IDS[name]),
                              since_iso=_iso(previous if previous is not None else cutoff)) or ())
         self._refuse_errors(events)
@@ -904,15 +977,33 @@ class FirewallCollector:
         return count
 
     def _read(self, name: str) -> int:
-        """An event log by ``EventRecordID`` (PowerShell, BITS) or a log file by offset (the firewall)."""
+        """An event log by ``EventRecordID`` (PowerShell, BITS) or a log file by offset (the firewall).
+
+        A reader answers ``(events, position)``. For an event log the position is the newest record id of the
+        *log*, also when no event came back: one below the one the collector holds means the log was cleared
+        (T1070.001) and its ids start again, so the collector reads it again from the start (``since=0``).
+        For the firewall it is the new offset and is taken as it is (the reader handles a rotation itself).
+        A reader that answers a plain list gets its position from the events' ``record_id``, and never backwards.
+        """
         reader = self._reader(name)
         previous = self._cursors.get(name)
-        result = reader(since=previous)
-        explicit = isinstance(result, tuple) and len(result) == 2
-        events, cursor = (result[0], result[1]) if explicit else (result, None)
-        events = list(events or ())
-        self._refuse_errors(events)
-        if not explicit:
+        hint = ""
+        for _ in range(2):
+            result = reader(since=previous)
+            explicit = isinstance(result, tuple) and len(result) == 2
+            events, reported = (result[0], result[1]) if explicit else (result, None)
+            events = list(events or ())
+            self._refuse_errors(events)
+            if name in RECORD_SOURCES and explicit and previous and _to_int(reported) is not None \
+                    and _to_int(reported) < previous:
+                logger.warning("the %s log restarted its record ids (%s < %s); reading it from the start",
+                               name, reported, previous)
+                previous, hint = 0, "the event log was cleared; read again from its start"
+                continue
+            break
+        if explicit:
+            cursor = reported
+        else:
             cursor = self._newest_record(events)
             if events and cursor is None:
                 raise RuntimeError("the reader returned events without a record_id")
@@ -921,7 +1012,9 @@ class FirewallCollector:
         count = self._adders[name](events)
         if cursor is not None:
             self._cursors[name] = cursor
-        self.store.set_status(name, "ok", "")
+        elif previous == 0:
+            self._cursors[name] = 0
+        self.store.set_status(name, "ok", hint)
         return count
 
     @staticmethod
