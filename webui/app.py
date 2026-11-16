@@ -11500,6 +11500,8 @@ def _fw_claim_fetch_path(names, timeout=None):
             if left <= 0:
                 if state is None:            # a sweep is removing every per-fetch rule; it owns them
                     return False, "a sweep of the per-fetch allow rules is still running", False
+                if state["holders"] == 0:    # busy with no holder: they are being removed, and the entry goes too
+                    return False, "the allow rules of this endpoint are still being removed", False
                 state["holders"] += 1
                 return False, (state["problem"] or
                                "another fetch to this endpoint is still writing its allow rule"), True

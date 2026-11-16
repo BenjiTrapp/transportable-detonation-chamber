@@ -610,6 +610,44 @@ def test_a_fetch_that_could_not_claim_a_rule_holds_nothing(client, fw, tdc, monk
     assert out["allow_rules"] == [] and out["allow_closed"] is None and out["allow_problem"] == problem
 
 
+def test_a_fetch_that_gives_up_on_a_removal_holds_nothing_and_takes_no_later_rule_away(client, fw, tdc, monkeypatch):
+    """A claim that times out while the endpoint's rules are being removed must not take a share of the entry
+    the remover is about to delete: its close would later remove a new fetch's rule and leave it untracked."""
+    import threading
+    monkeypatch.setattr(tdc, "FETCH_CLOSE_PAUSE", 0)
+    client.post("/api/firewall/isolate", json={"on": True})
+    names, _ = tdc._fw_open_fetch_path("203.0.113.50", 8080)
+    real_deny, inside, go = tdc.firewall_rules.deny_fetch, threading.Event(), threading.Event()
+
+    def slow_deny(run, name):
+        inside.set()
+        go.wait(5)
+        return real_deny(run, name)
+    monkeypatch.setattr(tdc.firewall_rules, "deny_fetch", slow_deny)
+    closer = threading.Thread(target=tdc._fw_close_fetch_path, args=(names,))
+    closer.start()
+    assert inside.wait(5)
+
+    monkeypatch.setattr(tdc, "FETCH_PATH_WAIT_S", 0)
+    late_names, late_problem = tdc._fw_open_fetch_path("203.0.113.50", 8080)
+    assert late_names == () and "being removed" in late_problem
+    assert tdc._fw_fetch_paths[names]["holders"] == 0               # the remover's entry was left alone
+    go.set()
+    closer.join(10)
+    monkeypatch.setattr(tdc.firewall_rules, "deny_fetch", real_deny)
+
+    new_names, new_problem = tdc._fw_open_fetch_path("203.0.113.50", 8080)
+    assert new_names == names and new_problem is None
+    assert tdc._fw_close_fetch_path(late_names) == ([], False)    # the one that gave up gives nothing back
+    assert all(n in fw.run.rules for n in names)                    # the new fetch still has its way out
+    assert client.get("/api/firewall/isolate").json["fetches_in_flight"] == 1
+
+    fw.run.fail["Remove"] = (1, "denied")                           # and if it will not close, it is shown
+    assert tdc._fw_close_fetch_path(new_names)[0] == list(names)
+    state = client.get("/api/firewall/isolate").json
+    assert [p["rule_id"] for p in state["fetch_paths_open"]] == list(names)
+
+
 def test_a_capture_says_nothing_was_closed_when_nothing_was_opened(client, fw, tdc):
     out = tdc._fetch_capture(FINDING)
     assert out["allow_rules"] == [] and out["allow_closed"] is None and out["close_problem"] is None
