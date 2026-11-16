@@ -1,0 +1,251 @@
+# cc	name	lat	lon	region  (hand-written, one centroid per ISO 3166-1 alpha-2 code; not fetched, see scripts/fetch-geoip.py)
+AD	Andorra	42.5	1.5	Europe
+AE	United Arab Emirates	23.4	53.8	Asia
+AF	Afghanistan	33.9	67.7	Asia
+AG	Antigua and Barbuda	17.1	-61.8	North America
+AI	Anguilla	18.2	-63.1	North America
+AL	Albania	41.2	20.2	Europe
+AM	Armenia	40.1	45.0	Asia
+AO	Angola	-11.2	17.9	Africa
+AQ	Antarctica	-82.9	-135.0	Antarctica
+AR	Argentina	-38.4	-63.6	South America
+AS	American Samoa	-14.3	-170.7	Oceania
+AT	Austria	47.5	14.6	Europe
+AU	Australia	-25.3	133.8	Oceania
+AW	Aruba	12.5	-70.0	North America
+AX	Aland Islands	60.2	20.0	Europe
+AZ	Azerbaijan	40.1	47.6	Asia
+BA	Bosnia and Herzegovina	43.9	17.7	Europe
+BB	Barbados	13.2	-59.5	North America
+BD	Bangladesh	23.7	90.4	Asia
+BE	Belgium	50.5	4.5	Europe
+BF	Burkina Faso	12.2	-1.6	Africa
+BG	Bulgaria	42.7	25.5	Europe
+BH	Bahrain	26.0	50.6	Asia
+BI	Burundi	-3.4	29.9	Africa
+BJ	Benin	9.3	2.3	Africa
+BL	Saint Barthelemy	17.9	-62.8	North America
+BM	Bermuda	32.3	-64.8	North America
+BN	Brunei	4.5	114.7	Asia
+BO	Bolivia	-16.3	-63.6	South America
+BQ	Bonaire, Sint Eustatius and Saba	12.2	-68.3	North America
+BR	Brazil	-14.2	-51.9	South America
+BS	Bahamas	25.0	-77.4	North America
+BT	Bhutan	27.5	90.4	Asia
+BV	Bouvet Island	-54.4	3.4	Antarctica
+BW	Botswana	-22.3	24.7	Africa
+BY	Belarus	53.7	27.9	Europe
+BZ	Belize	17.2	-88.5	North America
+CA	Canada	56.1	-106.3	North America
+CC	Cocos Islands	-12.2	96.8	Oceania
+CD	Democratic Republic of the Congo	-4.0	21.8	Africa
+CF	Central African Republic	6.6	20.9	Africa
+CG	Republic of the Congo	-0.2	15.8	Africa
+CH	Switzerland	46.8	8.2	Europe
+CI	Cote d'Ivoire	7.5	-5.5	Africa
+CK	Cook Islands	-21.2	-159.8	Oceania
+CL	Chile	-35.7	-71.5	South America
+CM	Cameroon	7.4	12.4	Africa
+CN	China	35.9	104.2	Asia
+CO	Colombia	4.6	-74.3	South America
+CR	Costa Rica	9.7	-83.8	North America
+CU	Cuba	21.5	-77.8	North America
+CV	Cabo Verde	16.0	-24.0	Africa
+CW	Curacao	12.2	-69.0	North America
+CX	Christmas Island	-10.5	105.7	Oceania
+CY	Cyprus	35.1	33.4	Asia
+CZ	Czechia	49.8	15.5	Europe
+DE	Germany	51.2	10.4	Europe
+DJ	Djibouti	11.8	42.6	Africa
+DK	Denmark	56.3	9.5	Europe
+DM	Dominica	15.4	-61.4	North America
+DO	Dominican Republic	18.7	-70.2	North America
+DZ	Algeria	28.0	1.7	Africa
+EC	Ecuador	-1.8	-78.2	South America
+EE	Estonia	58.6	25.0	Europe
+EG	Egypt	26.8	30.8	Africa
+EH	Western Sahara	24.2	-12.9	Africa
+ER	Eritrea	15.2	39.8	Africa
+ES	Spain	40.5	-3.7	Europe
+ET	Ethiopia	9.1	40.5	Africa
+FI	Finland	61.9	25.7	Europe
+FJ	Fiji	-17.7	178.1	Oceania
+FK	Falkland Islands	-51.8	-59.5	South America
+FM	Micronesia	7.4	150.6	Oceania
+FO	Faroe Islands	61.9	-6.9	Europe
+FR	France	46.2	2.2	Europe
+GA	Gabon	-0.8	11.6	Africa
+GB	United Kingdom	55.4	-3.4	Europe
+GD	Grenada	12.1	-61.7	North America
+GE	Georgia	42.3	43.4	Asia
+GF	French Guiana	3.9	-53.1	South America
+GG	Guernsey	49.5	-2.6	Europe
+GH	Ghana	7.9	-1.0	Africa
+GI	Gibraltar	36.1	-5.4	Europe
+GL	Greenland	71.7	-42.6	North America
+GM	Gambia	13.4	-15.3	Africa
+GN	Guinea	9.9	-9.7	Africa
+GP	Guadeloupe	16.3	-61.6	North America
+GQ	Equatorial Guinea	1.7	10.3	Africa
+GR	Greece	39.1	21.8	Europe
+GS	South Georgia and the South Sandwich Islands	-54.4	-36.6	Antarctica
+GT	Guatemala	15.8	-90.2	North America
+GU	Guam	13.4	144.8	Oceania
+GW	Guinea-Bissau	11.8	-15.2	Africa
+GY	Guyana	4.9	-58.9	South America
+HK	Hong Kong	22.3	114.2	Asia
+HM	Heard Island and McDonald Islands	-53.1	73.5	Antarctica
+HN	Honduras	15.2	-86.2	North America
+HR	Croatia	45.1	15.2	Europe
+HT	Haiti	18.9	-72.3	North America
+HU	Hungary	47.2	19.5	Europe
+ID	Indonesia	-0.8	113.9	Asia
+IE	Ireland	53.4	-8.2	Europe
+IL	Israel	31.0	34.9	Asia
+IM	Isle of Man	54.2	-4.5	Europe
+IN	India	20.6	79.0	Asia
+IO	British Indian Ocean Territory	-6.3	71.9	Asia
+IQ	Iraq	33.2	43.7	Asia
+IR	Iran	32.4	53.7	Asia
+IS	Iceland	65.0	-19.0	Europe
+IT	Italy	41.9	12.6	Europe
+JE	Jersey	49.2	-2.1	Europe
+JM	Jamaica	18.1	-77.3	North America
+JO	Jordan	30.6	36.2	Asia
+JP	Japan	36.2	138.3	Asia
+KE	Kenya	0.0	37.9	Africa
+KG	Kyrgyzstan	41.2	74.8	Asia
+KH	Cambodia	12.6	104.99	Asia
+KI	Kiribati	1.9	-157.4	Oceania
+KM	Comoros	-11.9	43.9	Africa
+KN	Saint Kitts and Nevis	17.4	-62.8	North America
+KP	North Korea	40.3	127.5	Asia
+KR	South Korea	35.9	127.8	Asia
+KW	Kuwait	29.3	47.5	Asia
+KY	Cayman Islands	19.3	-81.3	North America
+KZ	Kazakhstan	48.0	66.9	Asia
+LA	Laos	19.9	102.5	Asia
+LB	Lebanon	33.9	35.9	Asia
+LC	Saint Lucia	13.9	-61.0	North America
+LI	Liechtenstein	47.2	9.6	Europe
+LK	Sri Lanka	7.9	80.8	Asia
+LR	Liberia	6.4	-9.4	Africa
+LS	Lesotho	-29.6	28.2	Africa
+LT	Lithuania	55.2	23.9	Europe
+LU	Luxembourg	49.8	6.1	Europe
+LV	Latvia	56.9	24.6	Europe
+LY	Libya	26.3	17.2	Africa
+MA	Morocco	31.8	-7.1	Africa
+MC	Monaco	43.7	7.4	Europe
+MD	Moldova	47.4	28.4	Europe
+ME	Montenegro	42.7	19.4	Europe
+MF	Saint Martin	18.1	-63.1	North America
+MG	Madagascar	-18.8	46.9	Africa
+MH	Marshall Islands	7.1	171.2	Oceania
+MK	North Macedonia	41.6	21.7	Europe
+ML	Mali	17.6	-4.0	Africa
+MM	Myanmar	21.9	95.96	Asia
+MN	Mongolia	46.9	103.8	Asia
+MO	Macao	22.2	113.5	Asia
+MP	Northern Mariana Islands	17.3	145.4	Oceania
+MQ	Martinique	14.6	-61.0	North America
+MR	Mauritania	21.0	-10.9	Africa
+MS	Montserrat	16.7	-62.2	North America
+MT	Malta	35.9	14.4	Europe
+MU	Mauritius	-20.3	57.6	Africa
+MV	Maldives	3.2	73.2	Asia
+MW	Malawi	-13.3	34.3	Africa
+MX	Mexico	23.6	-102.6	North America
+MY	Malaysia	4.2	102.0	Asia
+MZ	Mozambique	-18.7	35.5	Africa
+NA	Namibia	-22.96	18.5	Africa
+NC	New Caledonia	-20.9	165.6	Oceania
+NE	Niger	17.6	8.1	Africa
+NF	Norfolk Island	-29.0	167.95	Oceania
+NG	Nigeria	9.1	8.7	Africa
+NI	Nicaragua	12.9	-85.2	North America
+NL	Netherlands	52.1	5.3	Europe
+NO	Norway	60.5	8.5	Europe
+NP	Nepal	28.4	84.1	Asia
+NR	Nauru	-0.5	166.9	Oceania
+NU	Niue	-19.1	-169.9	Oceania
+NZ	New Zealand	-40.9	174.9	Oceania
+OM	Oman	21.5	55.9	Asia
+PA	Panama	8.5	-80.8	North America
+PE	Peru	-9.2	-75.0	South America
+PF	French Polynesia	-17.7	-149.4	Oceania
+PG	Papua New Guinea	-6.3	143.96	Oceania
+PH	Philippines	12.9	121.8	Asia
+PK	Pakistan	30.4	69.3	Asia
+PL	Poland	51.9	19.1	Europe
+PM	Saint Pierre and Miquelon	46.9	-56.3	North America
+PN	Pitcairn Islands	-24.7	-127.4	Oceania
+PR	Puerto Rico	18.2	-66.6	North America
+PS	Palestine	31.95	35.2	Asia
+PT	Portugal	39.4	-8.2	Europe
+PW	Palau	7.5	134.6	Oceania
+PY	Paraguay	-23.4	-58.4	South America
+QA	Qatar	25.4	51.2	Asia
+RE	Reunion	-21.1	55.5	Africa
+RO	Romania	45.9	25.0	Europe
+RS	Serbia	44.0	21.0	Europe
+RU	Russia	61.5	105.3	Europe
+RW	Rwanda	-1.9	29.9	Africa
+SA	Saudi Arabia	23.9	45.1	Asia
+SB	Solomon Islands	-9.6	160.2	Oceania
+SC	Seychelles	-4.7	55.5	Africa
+SD	Sudan	12.9	30.2	Africa
+SE	Sweden	60.1	18.6	Europe
+SG	Singapore	1.35	103.8	Asia
+SH	Saint Helena, Ascension and Tristan da Cunha	-15.95	-5.7	Africa
+SI	Slovenia	46.15	14.995	Europe
+SJ	Svalbard and Jan Mayen	77.6	23.7	Europe
+SK	Slovakia	48.7	19.7	Europe
+SL	Sierra Leone	8.5	-11.8	Africa
+SM	San Marino	43.9	12.5	Europe
+SN	Senegal	14.5	-14.5	Africa
+SO	Somalia	5.2	46.2	Africa
+SR	Suriname	3.9	-56.0	South America
+SS	South Sudan	6.9	31.3	Africa
+ST	Sao Tome and Principe	0.2	6.6	Africa
+SV	El Salvador	13.8	-88.9	North America
+SX	Sint Maarten	18.04	-63.06	North America
+SY	Syria	34.8	39.0	Asia
+SZ	Eswatini	-26.5	31.5	Africa
+TC	Turks and Caicos Islands	21.7	-71.8	North America
+TD	Chad	15.5	18.7	Africa
+TF	French Southern Territories	-49.3	69.3	Antarctica
+TG	Togo	8.6	0.8	Africa
+TH	Thailand	15.9	100.99	Asia
+TJ	Tajikistan	38.9	71.3	Asia
+TK	Tokelau	-9.2	-171.8	Oceania
+TL	Timor-Leste	-8.9	125.7	Asia
+TM	Turkmenistan	38.97	59.6	Asia
+TN	Tunisia	33.9	9.5	Africa
+TO	Tonga	-21.2	-175.2	Oceania
+TR	Turkey	38.96	35.2	Asia
+TT	Trinidad and Tobago	10.7	-61.2	North America
+TV	Tuvalu	-7.1	177.6	Oceania
+TW	Taiwan	23.7	121.0	Asia
+TZ	Tanzania	-6.4	34.9	Africa
+UA	Ukraine	48.4	31.2	Europe
+UG	Uganda	1.4	32.3	Africa
+UM	United States Minor Outlying Islands	19.3	166.6	Oceania
+US	United States	37.1	-95.7	North America
+UY	Uruguay	-32.5	-55.8	South America
+UZ	Uzbekistan	41.4	64.6	Asia
+VA	Vatican City	41.9	12.45	Europe
+VC	Saint Vincent and the Grenadines	12.98	-61.3	North America
+VE	Venezuela	6.4	-66.6	South America
+VG	British Virgin Islands	18.4	-64.6	North America
+VI	U.S. Virgin Islands	18.3	-64.8	North America
+VN	Vietnam	14.1	108.3	Asia
+VU	Vanuatu	-15.4	166.96	Oceania
+WF	Wallis and Futuna	-13.8	-177.2	Oceania
+WS	Samoa	-13.8	-172.1	Oceania
+XK	Kosovo	42.6	20.9	Europe
+YE	Yemen	15.55	48.5	Asia
+YT	Mayotte	-12.8	45.2	Africa
+ZA	South Africa	-30.6	22.9	Africa
+ZM	Zambia	-13.1	27.8	Africa
+ZW	Zimbabwe	-19.0	29.2	Africa

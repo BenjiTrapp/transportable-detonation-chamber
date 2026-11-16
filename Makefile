@@ -111,6 +111,7 @@ help:
 	@echo "    make deploy-restart  Deploy files then restart (combo)"
 	@echo "    make open            Open Web UI in browser"
 	@echo "    make logs            Show recent Web UI logs"
+	@echo "    make geoip           Refresh the offline IP-to-country/ASN index (needs internet; adds a blob to git history, refresh rarely)"
 	@echo ""
 	@echo "  Interaction:"
 	@echo "    make ssh             SSH into the VM"
@@ -412,6 +413,11 @@ services:
 .PHONY: alerts
 alerts:
 	@curl -sf $(WEBUI_URL)/api/alerts | python3 -c "import json,sys;a=json.load(sys.stdin);print(f'Total: {len(a)} alerts');[print(f\"{x.get('timestamp','')} [{x.get('severity','')}] {x.get('rule_name','')}\") for x in a[-10:]]" 2>/dev/null || echo "Failed to fetch alerts (is VM running?)"
+
+.PHONY: geoip
+geoip:  ## Refresh the offline IP-to-country/ASN index (needs internet)
+	@echo "[geoip] each refresh adds a new few-MB blob to git history: refresh rarely"
+	python3 scripts/fetch-geoip.py
 
 .PHONY: unit-test
 unit-test: $(VENV_DIR)/bin/activate
