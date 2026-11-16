@@ -54,9 +54,9 @@
   - `scope_of(ip: str) -> str` → `"public" | "local" | "invalid"`
   - `lookup(ip: str) -> GeoInfo | None`
   - `jitter(ip: str, lat: float, lon: float) -> tuple[float, float]`
-  - `load(data_dir: str = DATA_DIR, index_dir: str | None = None) -> None`
+  - `load(data_dir: str = DATA_DIR) -> None`
   - `available() -> bool`
-  - `build_index(data_dir: str, index_dir: str) -> str`
+  - `build_index(tables_dir: str, out_dir: str) -> str` — vom Fetch-Skript gerufen, nicht beim Start
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -592,7 +592,9 @@ Alle Antworten über `_json_response` mit `allow_nan=False`, lange Zeichenketten
 
 - [ ] **Step 4: Create the directory and the Defender exclusion at startup**
 
-Beim Start (neben `_start_update_check_thread`, `app.py:10901`): `CAPTURE_DIR` anlegen und `Add-MpPreference -ExclusionPath` idempotent setzen, Fehler nur loggen. Dieselbe Zeile zusätzlich in `scripts/install-webui.ps1` neben der bestehenden `scan_uploads`-Ausnahme. `CAPTURE_DIR` kommt in `_readable_roots` und **nicht** in die Schreib-Allowlist.
+Beim Start (neben `_start_update_check_thread`, `app.py:10901`): `geoip.load()` einmal rufen (Einarmig, `data_dir` vorbelegt; schlägt es fehl, bleibt `available()` falsch und der Tab läuft ohne Geo weiter), `CAPTURE_DIR` anlegen und `Add-MpPreference -ExclusionPath` idempotent setzen, Fehler nur loggen. Dieselbe Zeile zusätzlich in `scripts/install-webui.ps1` neben der bestehenden `scan_uploads`-Ausnahme. `CAPTURE_DIR` kommt in `_readable_roots` und **nicht** in die Schreib-Allowlist.
+
+Dazu ein Test: mit der Geo-Fixture geladen trägt `/api/firewall/connections` für eine öffentliche IP `geo.cc` und `geo.asn`, ohne geladene Daten `geo.scope` und sonst `null` — und keine der beiden Lagen wirft.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
