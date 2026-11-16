@@ -321,8 +321,10 @@ ist der schlimmste denkbare Fehler dieses Tabs. Also:
 **Entscheidung — Isolated.** Ausnahmen, und nur diese:
 
 - Loopback (`127.0.0.0/8`, `::1`) — darüber läuft TDCs ganzer Innenverkehr.
-- Der Fetcher von TDC: eine Allow-Regel auf das `python.exe` der Web-UI-venv.
+- **Kein stehendes Recht für den Fetcher.** Ein Dauer-Allow auf das `python.exe` der Web-UI-venv wäre ein Loch von der Größe „alles, was dieses python starten kann, darf raus" — und ein Interpreter lässt sich zu allem überreden. Stattdessen öffnet `allow_fetch` unmittelbar vor einem Nachladen **eine Regel auf genau die beobachtete Adresse** und nimmt sie danach wieder weg, ob der Fetch gelingt oder nicht; Reste räumt der Start auf.
 - Nichts sonst. Insbesondere kein DNS, kein NTP, keine Updates.
+
+**Restrisiko, ausgeschrieben:** während ein Fetch läuft, könnte etwas, das dieses python ausführen kann, dieselbe eine Adresse erreichen — für die Sekunden des Fetches. Das steht im Isolated-Band der Oberfläche, im Docstring von `firewall_rules` und als `residual` in `GET /api/firewall/isolate`. Teil B schließt es: dort ist der einzige erlaubte Weg nach draußen der Proxy, und der führt keinen fremden Code aus.
 
 Eingehend bleibt unberührt: `DefaultOutboundAction Block` betrifft die Antworten
 auf eingehende Sitzungen nicht, der Host erreicht Port 9000 weiter.
@@ -422,8 +424,8 @@ Daraus folgt:
 - Der Gast holt, nicht der Host. Sonst stünde die echte IP des Analysten im Log
   des Angreifers.
 - Die Allow-Regel des Fetchers macht das auch in Isolated möglich.
-- Grenzen: höchstens 64 MB, 30 s Zeitlimit, höchstens 3 Weiterleitungen, und die
-  Ziel-IP muss die sein, die beobachtet wurde (kein erneutes DNS).
+- Grenzen: höchstens 64 MB, 30 s Zeitlimit **für den ganzen Fetch** (nicht pro Lesevorgang — ein Server, der die Bytes tröpfeln lässt, soll keinen Arbeiter dauerhaft binden), höchstens 3 Weiterleitungen, und die Ziel-IP **und der Port** müssen auf jedem Sprung die beobachteten sein (kein erneutes DNS).
+- Die eigene Seite der VM ist tabu: Loopback, unspezifiziert, Multicast, Link-Local, Reserved, die eigenen Interface-Adressen und die Default-Gateways werden abgelehnt. **Private Adressen sind standardmäßig ebenfalls abgelehnt** und nur mit `TDC_FIREWALL_FETCH_LAN=1` erlaubt (für Labore mit INetSim). Grund: der Host erreicht den Gast über genau so eine Adresse, und in Isolated wäre der Fetcher der einzige Weg dorthin — das würde den Sinn umdrehen, dass der Gast holt und nicht der Host.
 - Der User-Agent des Loaders wird mitgeschickt, wenn er bekannt ist (aus dem
   Skripttext), sonst ein neutraler. Was gesendet wurde, steht in den Metadaten.
 - Das Ergebnis wird **nie** ausgeführt und nie automatisch irgendwohin gemeldet.
