@@ -169,7 +169,12 @@ def _read(path):
     prefix written as [data-theme="cyberpunk"]) and the palette of
     theme-cyberpunk.css. Its rules were all in that one file until Classic took
     over the layout; the tests about "the Cyberpunk rules" keep reading them
-    as one sheet. Tests of the single files use _raw()."""
+    as one sheet. Tests of the single files use _raw().
+
+    Note: because the layout rules (theme-layout.css, which apply to both
+    themes) are rewritten to the cyberpunk prefix, a test using _read(THEME_CSS)
+    treats them as Cyberpunk-only. For checks that must hold for both themes,
+    read LAYOUT_CSS with _raw(LAYOUT_CSS) instead."""
     if path == THEME_CSS:
         layout = re.sub(r"\[data-theme\]", '[data-theme="cyberpunk"]', _raw(LAYOUT_CSS))
         return _raw(THEME_CSS) + "\n" + layout
@@ -1159,6 +1164,30 @@ def test_set_theme_moves_tabs_and_status_and_back():
 
 
 @needs_node
+def test_apply_theme_layout_does_not_reinsert_parts_already_in_place():
+    r = _run_node(THEME_SWITCH_FUNCTIONS, r"""
+        const stored = {};
+        Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: {
+            getItem: k => (k in stored ? stored[k] : null), setItem: (k, v) => { stored[k] = String(v); } } });
+        setTheme('cyberpunk');
+        const moves = [];
+        const navHome = document.getElementById('topbar-nav');
+        const statusHome = document.getElementById('topbar-services-panel');
+        const prepend = navHome.prepend.bind(navHome);
+        const append = statusHome.appendChild.bind(statusHome);
+        navHome.prepend = n => { moves.push('nav'); return prepend(n); };
+        statusHome.appendChild = n => { moves.push('status'); return append(n); };
+        setTheme('classic');
+        toggleTheme();
+        const nav = document.querySelector('nav.sidebar-tabs');
+        const status = document.getElementById('service-status');
+        console.log(JSON.stringify({ moves, nav: nav.parentElement.id, status: status.parentElement.id }));
+    """, _switch_prelude())
+    assert r["moves"] == [], "a theme switch re-inserted a part that was already in place"
+    assert r["nav"] == "topbar-nav" and r["status"] == "topbar-services-panel"
+
+
+@needs_node
 def test_set_theme_survives_blocked_storage():
     r = _run_node(THEME_SWITCH_FUNCTIONS, r"""
         const blocked = [
@@ -1878,6 +1907,8 @@ def test_classic_uses_the_topbar_layout():
     # 250 px: Alpha, Beta and the 40 px … fit (254 px with the gaps do not leave room for a third tab)
     assert r["more"] is True and r["menu"] and r["menu"][-1] == "Delta", "the … menu is not built in Classic"
     assert r["drawer"] is True, "no drawer in Classic"
+
+
 def test_scope_check_finds_rules_that_reach_classic():
     cases = {
         ".tab { color: red; }": [".tab"],

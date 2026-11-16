@@ -175,8 +175,11 @@ function applyThemeLayout(theme) {
     const status = document.getElementById('service-status');
     const navHome = document.getElementById('topbar-nav');
     const statusHome = document.getElementById('topbar-services-panel');
-    if (nav && navHome) navHome.prepend(nav);                   // in front of the "…" menu
-    if (status && statusHome) statusHome.appendChild(status);
+    // Only moved when not already in place: re-inserting would detach a focused tab button.
+    if (nav && navHome && navHome.children[0] !== nav) navHome.prepend(nav);   // in front of the "…" menu
+    if (status && statusHome && statusHome.children[statusHome.children.length - 1] !== status) {
+        statusHome.appendChild(status);
+    }
     // The drawer and the drop-downs start closed (their state is not kept),
     // and the tabs are fitted to the bar.
     closeDrawer();

@@ -10918,7 +10918,6 @@ body.maintenance-active #app {
     z-index: 50;
     pointer-events: none;
     background: repeating-linear-gradient(0deg, rgba(var(--c-black-rgb), .18) 0 1px, transparent 1px 3px);
-    mix-blend-mode: multiply;
 }
 
 /* Cards: the panel gradient (top to bottom) over the card colour of the layout */
@@ -10936,6 +10935,7 @@ body.maintenance-active #app {
     position: relative;
 }
 :root[data-theme="classic"] :is(.service-card, .chart-card, .help-card)::before,
+/* :nth-child(n) matches every card; it only raises specificity over the layout rule */
 :root[data-theme="classic"] .stat-card:nth-child(n)::before {
     content: "";
     position: absolute;
