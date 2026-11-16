@@ -8423,6 +8423,11 @@ table[data-sortable] > thead > tr > th:focus-visible {
 .chart-svg .fw-label {
     fill: var(--text-primary);
 }
+/* A label is no target: the dot and the arcs under its pill are */
+.fw-pill,
+.fw-label {
+    pointer-events: none;
+}
 .chart-clickable .fw-arc,
 .chart-clickable .fw-point {
     cursor: pointer;
@@ -10493,7 +10498,8 @@ body.maintenance-active #app {
     .fw-arc-pending .fw-arc-line {
         animation: none;
     }
-    .btn-skull-art {
+    .btn-skull-art,
+    .fw-arc-line {
         transition: none;
     }
 }

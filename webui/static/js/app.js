@@ -3737,6 +3737,26 @@ function _worldArcPath(a, b, bend, box) {
     return `M${c(a[0])} ${c(a[1])} Q${c(cx)} ${c(cy)} ${c(b[0])} ${c(b[1])}`;
 }
 
+// A ring around b, for an arc whose ends lie on top of each other (a
+// destination next to the chamber): still visibly a connection, and a target
+// of its own. The k-th such arc to the same point gets a wider ring.
+function _worldRingPath(b, r, k) {
+    const c = _chartCoord, R = r + 3 + 2.5 * k;
+    return `M${c(b[0] - R)} ${c(b[1])} A${c(R)} ${c(R)} 0 1 1 ${c(b[0] + R)} ${c(b[1])} A${c(R)} ${c(R)} 0 1 1 ${c(b[0] - R)} ${c(b[1])}`;
+}
+
+// Malware text for a label or a tooltip without bidi controls: an AS name
+// with U+202E would show the analyst its characters in another order
+function _worldText(value) {
+    return String(value ?? '').replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '');
+}
+
+// The width of a label in the map's 9 px monospace: a wide script (CJK,
+// Arabic, …) takes more than the 5.6 px of a Latin character
+function _worldTextWidth(text) {
+    return Array.from(text).reduce((w, ch) => w + (ch.codePointAt(0) < 0x0370 ? 5.6 : 9.5), 0);
+}
+
 // The pill of a label `width` wide beside a dot of radius r at x/y, on its
 // right or (side 'left') its left, moved inside the box where it would cross an edge
 function _worldLabelBox(x, y, r, width, side, box) {
@@ -3753,11 +3773,14 @@ function _worldLabelBox(x, y, r, width, side, box) {
 // by the map itself in the middle. arcs [{from, to, tone, weight, pending,
 // id, title}]: as wide as the square root of their share of the heaviest
 // (1-4 px), the thinnest on top; arcs between the same two points fan out so
-// none hides another; only `pending: true` gets the travelling dash
+// none hides another, and one whose ends touch is a ring around its
+// destination; only `pending: true` gets the travelling dash
 // (.fw-arc-pending). Labels are placed by severity, then size, and one that
-// would cover another is left out (the <title> still has it). Colours are
-// classes (.fw-tone-<severity>), so a theme switch needs no redraw. Every
-// point and arc is a <g data-fw-id> (an arc: its id, else its `to`).
+// would cover another is left out (the <title> still has it); labels and
+// titles lose their bidi controls. The chamber is painted under every other
+// dot. Colours are classes (.fw-tone-<severity>), so a theme switch needs no
+// redraw. Every point and arc is a <g data-fw-id> (an arc: its id, else its
+// `to`).
 function worldMapSvg(points, arcs, opts) {
     opts = opts || {};
     const box = opts.box || WORLD_BOX;
@@ -3794,9 +3817,9 @@ function worldMapSvg(points, arcs, opts) {
         const id = String(p?.id ?? '');
         const xy = p ? project(p.lon, p.lat, box) : null;
         if (!xy || byId.has(id)) return;
-        const label = String(p.label ?? id);
+        const label = _worldText(p.label ?? id);
         const r = Math.min(Math.max(Number(p.r) || 3, 2), 8);
-        byId.set(id, { id, xy, label, title: String(p.title ?? label), r, tone: _worldTone(p.tone), order });
+        byId.set(id, { id, xy, label, title: _worldText(p.title ?? label), r, tone: _worldTone(p.tone), order });
     });
 
     const drawn = [], pairs = new Map();          // pair of ends -> arcs so far between them
@@ -3807,12 +3830,13 @@ function worldMapSvg(points, arcs, opts) {
         const pair = [from.id, to.id].sort().join('\u0000');
         const k = pairs.get(pair) || 0;
         pairs.set(pair, k + 1);
-        const d = _worldArcPath(from.xy, to.xy, 0.17 + 0.1 * k, box);
-        if (!d) continue;
+        // Ends whose dots touch (a destination next to the chamber) get a ring around the destination
+        const touching = Math.hypot(to.xy[0] - from.xy[0], to.xy[1] - from.xy[1]) < from.r + to.r + 2;
+        const d = touching ? _worldRingPath(to.xy, to.r, k) : _worldArcPath(from.xy, to.xy, 0.17 + 0.1 * k, box);
         const weight = Number(arc.weight) > 0 && Number.isFinite(Number(arc.weight)) ? Number(arc.weight) : 0;
         heaviest = Math.max(heaviest, weight);
         drawn.push({ id: String(arc.id ?? to.id), d, weight, tone: _worldTone(arc.tone), pending: arc.pending === true,
-            title: String(arc.title ?? `${from.label} → ${to.label}`) });
+            title: _worldText(arc.title ?? `${from.label} → ${to.label}`) });
     }
     drawn.forEach(a => { a.width = 1 + (heaviest > 0 ? 3 * Math.sqrt(a.weight / heaviest) : 0); });
     drawn.sort((a, b) => b.width - a.width);
@@ -3828,13 +3852,15 @@ function worldMapSvg(points, arcs, opts) {
     const list = [...byId.values()];
     for (const p of [...list].sort((a, b) => rank(a) - rank(b) || b.r - a.r || a.order - b.order)) {
         p.text = _chartEllipsis(p.label, 28);
-        const width = Array.from(p.text).length * 5.6 + 8;
+        const width = _worldTextWidth(p.text) + 8;
         p.pill = ['right', 'left'].map(side => _worldLabelBox(p.xy[0], p.xy[1], p.r, width, side, box))
             .find(pill => !placed.some(other => overlaps(pill, other))) || null;
         if (p.pill) placed.push(p.pill);
     }
-    // Dots: the least severe first, so the most severe is on top
-    for (const p of list.sort((a, b) => rank(b) - rank(a) || a.r - b.r || b.order - a.order)) {
+    // Dots: the chamber first, then the least severe, so the most severe is on top and a destination
+    // next to the chamber is not hidden under it
+    const paintRank = p => (p.chamber ? ALERT_SEVERITIES.length : rank(p));
+    for (const p of list.sort((a, b) => paintRank(b) - paintRank(a) || a.r - b.r || b.order - a.order)) {
         const cls = p.chamber ? 'fw-chamber' : `fw-tone-${p.tone}`;
         svg += `<g class="fw-point ${cls}" data-fw-id="${escapeHtml(p.id)}"><title>${escapeHtml(p.title)}</title>`
             + `<circle class="fw-dot" cx="${c(p.xy[0])}" cy="${c(p.xy[1])}" r="${c(p.r)}"/>`

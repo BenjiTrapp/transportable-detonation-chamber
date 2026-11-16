@@ -18,7 +18,14 @@ Regressions covered:
   * an AS organisation, a label or an id (malware text) reaching the markup
   * a point or an arc that a click cannot tell apart (no data-fw-id)
   * the travelling dash on more than arcs with an open decision, or moving
-    under prefers-reduced-motion
+    under prefers-reduced-motion; the hover fade running there either
+  * a destination at or next to the chamber (0° / 12° N, West Africa) that
+    loses its arc or hides under the chamber's dot
+  * NaN in a coordinate (it kills the whole path) from an infinite radius,
+    a weight that is no number, or an arc whose ends are one point
+  * a label pill that takes the clicks of the dots and arcs under it
+  * a label in a wide script overflowing its pill, or bidi controls in an AS
+    name reordering what the analyst reads
 """
 
 import json
@@ -34,8 +41,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORLD_JSON = os.path.join(ROOT, "webui", "static", "data", "world.json")
 BUILD_SCRIPT = os.path.join(ROOT, "scripts", "build-worldmap.py")
 
-MAP_FUNCTIONS = ["project", "worldMapSvg", "_worldXY", "_worldArcPath", "_worldLabelBox", "_worldTone",
-                 "escapeHtml", "_chartCoord", "_chartEllipsis"]
+MAP_FUNCTIONS = ["project", "worldMapSvg", "_worldXY", "_worldArcPath", "_worldRingPath", "_worldLabelBox",
+                 "_worldTone", "_worldText", "_worldTextWidth", "escapeHtml", "_chartCoord", "_chartEllipsis"]
 MAP_CONSTS = ["ALERT_SEVERITIES", "WORLD_BOX", "WORLD_CHAMBER_ID"]
 
 
@@ -341,5 +348,78 @@ def test_map_tones_are_theme_variables():
 
 
 def test_map_functions_hold_no_colour_literal():
-    for name in ("project", "worldMapSvg", "_worldXY", "_worldArcPath", "_worldLabelBox", "_worldTone"):
+    for name in ("project", "worldMapSvg", "_worldXY", "_worldArcPath", "_worldRingPath", "_worldLabelBox",
+                 "_worldTone", "_worldText", "_worldTextWidth"):
         assert LITERAL_COLOR.search(_function_source(name)) is None, name
+
+
+@needs_node
+def test_world_map_destination_at_the_chamber_keeps_a_visible_target_above_it():
+    r = _map(r"""
+        const points = [
+            { id: 'on', lon: 0, lat: 12, label: 'GH · on the chamber', tone: 'high' },
+            { id: 'near', lon: 1, lat: 12.5, label: 'BF · beside it', tone: 'low' },
+        ];
+        const arcs = [
+            { from: WORLD_CHAMBER_ID, to: 'on', tone: 'high', weight: 2 },
+            { from: WORLD_CHAMBER_ID, to: 'on', tone: 'high', weight: 1, id: 'on-2' },
+            { from: WORLD_CHAMBER_ID, to: 'near', tone: 'low', weight: 1, pending: true },
+        ];
+        console.log(JSON.stringify(worldMapSvg(points, arcs, {})));""")
+    assert "NaN" not in r
+    arcs = {re.search(r'data-fw-id="([^"]*)"', g).group(1): g for g in _svg_elements(r, "fw-arc")}
+    assert set(arcs) == {"on", "on-2", "near"}
+    rings = dict(re.findall(r'<g class="fw-arc [^"]*" data-fw-id="([^"]*)">.*?<path class="fw-arc-hit" d="([^"]+)"', r))
+    assert all(" A" in d for d in rings.values())          # a ring, not a zero-length line
+    assert rings["on"] != rings["on-2"]                     # and two of them do not cover each other
+    assert "fw-arc-pending" in arcs["near"]
+    # The destinations' dots come after (over) the chamber's
+    chamber = r.index('data-fw-id="@chamber"')
+    assert chamber < r.index('<g class="fw-point fw-tone-high" data-fw-id="on"')
+    assert chamber < r.index('<g class="fw-point fw-tone-low" data-fw-id="near"')
+
+
+@needs_node
+def test_world_map_survives_empty_and_broken_numbers():
+    r = _map(r"""
+        console.log(JSON.stringify([
+            worldMapSvg([], [], {}),
+            worldMapSvg(null, undefined),
+            worldMapSvg(
+                [{ id: 'a', lon: 20, lat: 20, label: 'a', r: Infinity }, { id: 'b', lon: 'x', lat: 1, r: NaN },
+                 { id: 'c', lon: -40, lat: Infinity }, { id: 'd', lon: -40, lat: 10, r: -Infinity }],
+                [{ from: 'a', to: 'a', weight: NaN }, { from: WORLD_CHAMBER_ID, to: 'a', weight: Infinity },
+                 { from: WORLD_CHAMBER_ID, to: 'd', weight: NaN }, { from: 'd', to: 'a', weight: -3 }],
+                { world: { scale: 10, shapes: [[0, 0, NaN, 1, 2, 3], [0, 0, 100, 0, 100, 100], 'junk', [1, 2]] } }),
+        ]));""")
+    for svg in r:
+        assert "NaN" not in svg and "Infinity" not in svg
+        assert re.fullmatch(r"<svg [^>]*>.*</svg>", svg, re.S)
+        assert svg.count("<g ") == svg.count("</g>")
+        assert 'data-fw-id="@chamber"' in svg
+    assert "M360 164L380 164L380 144Z" in r[2] and r[2].count('class="fw-land"') == 1
+
+
+@needs_node
+def test_world_map_labels_lose_bidi_controls_and_wide_scripts_get_room():
+    r = _map(r"""
+        const spoof = 'evil\u202Egpj.exe\u2066x\u2069\u200F';
+        const points = [
+            { id: 'b', lon: -100, lat: 40, label: spoof, title: spoof, tone: 'high' },
+            { id: 'cjk', lon: 100, lat: 30, label: '中国电信', tone: 'low' },
+            { id: 'lat', lon: 100, lat: -30, label: 'abcd', tone: 'low' },
+        ];
+        const arcs = [{ from: WORLD_CHAMBER_ID, to: 'b', tone: 'high', weight: 1, title: spoof }];
+        console.log(JSON.stringify(worldMapSvg(points, arcs, {})));""")
+    assert not re.search("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]", r)
+    assert ">evilgpj.exex</text>" in r
+    widths = dict(re.findall(r'data-fw-id="(cjk|lat)">.*?<rect class="fw-pill"[^>]* width="([\d.]+)"', r))
+    assert float(widths["cjk"]) >= 4 * 9 + 8 > float(widths["lat"])
+
+
+def test_map_labels_take_no_clicks_and_nothing_fades_under_reduced_motion():
+    css = re.sub(r"/\*.*?\*/", "", _read(STYLE_CSS), flags=re.S)
+    assert any(".fw-pill" in rule.split("{")[0] and ".fw-label" in rule.split("{")[0]
+               and re.search(r"pointer-events\s*:\s*none", rule) for rule in _css_rules(css, ".fw-pill"))
+    blocks = re.findall(r"@media \(prefers-reduced-motion: reduce\)\s*\{((?:[^{}]*\{[^}]*\})*)\s*\}", css)
+    assert any(re.search(r"\.fw-arc-line[^{]*\{[^}]*transition\s*:\s*none", b) for b in blocks)
