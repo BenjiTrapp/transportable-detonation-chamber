@@ -146,7 +146,7 @@ def test_sysmon_force_failure_is_not_an_update():
 def test_sysmon_config_refresh_checks_the_exit_code():
     script = _script("sysmon")
     branch = script[script.index("-not $Force) {"):script.index("# Create directory")]
-    apply_at = branch.index("& $sysmonExe -c $configPath")
+    apply_at = branch.index("& $configExe -c $configPath")
     assert apply_at < branch.index("$LASTEXITCODE") < branch.index('Save-SourceEtag -Key "config_etag"')
     assert re.search(r"if \(\$configExit -ne 0\)", branch)
 
@@ -272,8 +272,8 @@ def test_sysmon_current_branch_comes_before_any_uninstall():
 def test_sysmon_backs_up_installed_binaries_before_extracting():
     code = _sysmon_code()
     assert re.search(r'\$backupDir\s*=\s*"\$sysmonDir\\backup"', code)
-    assert code.index("$backupDir") < code.index("Expand-Archive")
-    assert re.search(r"Copy-Item[^\n]*\$backupDir", code)
+    assert code.index("Backup-RunningSysmon -Installed") < code.index("Expand-Archive")
+    assert re.search(r"Copy-Item[^\n]*\$dest|Copy-Item[^\n]*\$dir", code)
 
 
 def test_sysmon_waits_for_the_uninstall_and_retries_the_install():
@@ -291,7 +291,7 @@ def test_sysmon_rolls_back_to_the_backed_up_binary():
     code = _sysmon_code()
     assert "New Sysmon failed to install; restored the previous version" in code
     assert re.search(r"Install-SysmonService\s+-Exe\s+\$rollbackExe", code)
-    assert re.search(r"\$rollbackExe\s*=\s*Join-Path\s+\$backupDir", code)
+    assert re.search(r"\$rollbackExe\s*=\s*Join-Path\s+\(Join-Path\s+\$backupDir\s+\"\$installedVersion\"\)", code)
     assert "rollback" in code.lower() and "Rollback failed" in code
 
 
@@ -306,3 +306,97 @@ def test_sysmon_script_parses():
            f"'{path}', [ref]$null, [ref]$e); if ($e) {{ $e | ForEach-Object {{ $_.Message }}; exit 1 }}")
     proc = subprocess.run([pwsh, "-NoProfile", "-Command", cmd], capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_sysmon_backup_is_per_version_from_the_running_service_binary():
+    code = _sysmon_code()
+    fn = re.search(r"function Backup-RunningSysmon \{(.*?)\n\}\n", code, re.S)
+    assert fn, "Backup-RunningSysmon missing"
+    body = fn.group(1)
+    assert "Test-SysmonRunning" in body
+    assert "FromService" in body
+    assert re.search(r'Join-Path\s+\$backupDir\s+"\$Version"', body)
+    # the freshly extracted download is never a backup source
+    assert "$sysmonExe" not in body
+    assert "Get-ChildItem" not in body
+    # the old "copy every tools-dir Sysmon*.exe" backup is gone
+    assert not re.search(r'Get-ChildItem[^\n]*Sysmon\*\.exe', code)
+
+
+def test_sysmon_versions_are_normalised_to_four_parts():
+    code = _sysmon_code()
+    assert "function ConvertTo-NormalVersion" in code
+    assert re.search(r"Math\]::Max\(\$v\.Build,\s*0\)", code)
+    assert re.search(r"Math\]::Max\(\$v\.Revision,\s*0\)", code)
+
+
+def test_sysmon_aborts_on_pending_deletion_before_the_first_uninstall():
+    code = _sysmon_code()
+    assert "function Get-PendingDeletion" in code
+    assert "DeleteFlag" in code
+    assert re.search(r"HKLM:\\SYSTEM\\CurrentControlSet\\Services", code)
+    assert "reboot required" in code
+    assert code.index("$pending = @(Get-PendingDeletion)") < code.index("Uninstall-SysmonBinary -Exe $uninstallExe")
+    m = re.search(r"\$pending = @\(Get-PendingDeletion\)\s*\n\s*if \(\$pending\.Count[^\n]*\{(.*?)exit 1", code, re.S)
+    assert m and "reboot required" in m.group(1)
+
+
+def test_sysmon_registers_a_recovery_task_around_the_uninstall():
+    code = _sysmon_code()
+    assert "TDC-SysmonRecover" in code
+    assert "function Register-SysmonRecovery" in code and "function Unregister-SysmonRecovery" in code
+    assert "New-ScheduledTaskTrigger -AtStartup" in code
+    assert re.search(r'New-ScheduledTaskPrincipal[^\n]*SYSTEM', code)
+    assert re.search(r"-accepteula -i", code[code.index("function Register-SysmonRecovery"):code.index("function Unregister-SysmonRecovery")])
+    assert "Unregister-ScheduledTask" in code
+    # registered before -u force, removed again once Sysmon is verified
+    assert code.index("Register-SysmonRecovery -Exe") < code.index("Uninstall-SysmonBinary -Exe $uninstallExe")
+    assert code.count("Unregister-SysmonRecovery") >= 3
+
+
+def test_sysmon_install_verifies_the_running_version():
+    code = _sysmon_code()
+    assert "function Get-RunningSysmonVersion" in code
+    assert re.search(r"function Install-SysmonService \{\s*param\(\[string\]\$Exe,\s*\$ExpectedVersion", code)
+    assert re.search(r"Install-SysmonService\s+-Exe\s+\$sysmonExe\s+-ExpectedVersion\s+\$downloadedVersion", code)
+    assert re.search(r"Install-SysmonService\s+-Exe\s+\$rollbackExe\s+-ExpectedVersion\s+\$installedVersion", code)
+    # binary_etag only when the running version is the downloaded one
+    tail = code[code.index("$runningVersion = Get-RunningSysmonVersion"):]
+    assert re.search(r"\$runningVersion\s+-eq\s+\$downloadedVersion", tail)
+
+
+def test_sysmon_uninstalls_with_the_version_matched_backup_copy():
+    code = _sysmon_code()
+    m = re.search(r"\$uninstallExe\s*=\s*Join-Path\s+\(Join-Path\s+\$backupDir\s+\"\$installedVersion\"\)", code)
+    assert m
+    assert re.search(r"\$uninstallExe\s*=\s*\$installedExe", code)
+    assert code.index("$backupDir") < code.index("$uninstallExe")
+
+
+def test_sysmon_service_path_is_normalised():
+    code = _sysmon_code()
+    fn = code[code.index("function Get-ServiceExe"):code.index("function Test-ServiceExists")]
+    assert "ExpandEnvironmentVariables" in fn
+    assert r"\\\?\?\\" in fn or r"\?\?" in fn
+    assert "SystemRoot" in fn
+
+
+def test_sysmon_retry_uninstall_only_with_force_and_config_uses_service_binary():
+    code = _sysmon_code()
+    fn = code[code.index("function Install-SysmonService"):code.index("$sysmonSvc = Get-Service -Name $sysmonServiceName")]
+    assert re.search(r"if \(\$Force\)\s*\{\s*\[void\]\(Uninstall-SysmonBinary|if \(\$Force\)\s*\{[^}]*Uninstall-SysmonBinary", fn)
+    plain = code[code.index("$sysmonSvc = Get-Service -Name $sysmonServiceName"):code.index("New-Item -ItemType Directory -Path $sysmonDir -Force | Out-Null\n\n")]
+    assert "$sysmonExe -c" not in plain
+    assert re.search(r"Get-InstalledSysmon", plain)
+
+
+def test_sysmon_current_branch_saves_binary_etag_only_for_the_service_binary():
+    code = _sysmon_code()
+    branch = code[code.index("$downloadedVersion = Get-BinaryVersion"):code.index("is current; configuration updated")]
+    assert re.search(r"if \(\$binaryEtag -and \$installedFromService\)", branch)
+
+
+def test_sysmon_version_parse_takes_the_first_token_not_the_first_char():
+    # ('15.22' | Where-Object)[0] is the char '1'; the token list must be wrapped in @()
+    code = _sysmon_code()
+    assert re.search(r"\$first = @\(\$Text", code)

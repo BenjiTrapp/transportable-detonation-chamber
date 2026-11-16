@@ -146,15 +146,23 @@ function Save-SourceEtag {
     }
 }
 
-# FileVersion of a binary as [version], or $null.
+# A version as 4 parts (15.22 -> 15.22.0.0), so -1 for a missing part never skews a comparison.
+function ConvertTo-NormalVersion {
+    param([string]$Text)
+    try {
+        if (-not $Text) { return $null }
+        $first = @($Text -replace ',', '.' -split '\s+' | Where-Object { $_ })[0]
+        $v = [version]$first
+        return (New-Object System.Version -ArgumentList $v.Major, $v.Minor, ([Math]::Max($v.Build, 0)), ([Math]::Max($v.Revision, 0)))
+    } catch { return $null }
+}
+
+# FileVersion of a binary as a normalised [version], or $null.
 function Get-BinaryVersion {
     param([string]$Path)
     if (-not $Path -or -not (Test-Path $Path)) { return $null }
     try {
-        $raw = (Get-Item -Path $Path).VersionInfo.FileVersion
-        if (-not $raw) { return $null }
-        $text = ([string]$raw -replace ',', '.' -split '\s+')[0]
-        return [version]$text
+        return (ConvertTo-NormalVersion -Text ([string](Get-Item -Path $Path).VersionInfo.FileVersion))
     } catch { return $null }
 }
 
@@ -164,12 +172,32 @@ function Get-ServiceExe {
     try {
         $svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$ServiceName'" -ErrorAction Stop
         if ($svc -and $svc.PathName) {
-            $path = [string]$svc.PathName
-            if ($path -match '^\s*"([^"]+)"') { $path = $Matches[1] }
-            elseif ($path -match '^\s*(\S+\.exe)') { $path = $Matches[1] }
+            $path = ([string]$svc.PathName).Trim()
+            if ($path -match '^"([^"]+)"') { $path = $Matches[1] }
+            elseif ($path -match '^(.+?\.exe)') { $path = $Matches[1] }
+            $path = $path -replace '^\\\?\?\\', ''
+            if ($path -match '^\\SystemRoot\\') { $path = $env:SystemRoot + $path.Substring(11) }
+            $path = [Environment]::ExpandEnvironmentVariables($path)
             if (Test-Path $path) { return $path }
         }
     } catch { }
+    return $null
+}
+
+# The installed Sysmon: service name, the binary the service runs, and whether that
+# binary came from the service ImagePath (FromService) or only from the tools dir.
+function Get-InstalledSysmon {
+    foreach ($name in @("Sysmon64a", "Sysmon64")) {
+        if (Get-Service -Name $name -ErrorAction SilentlyContinue) {
+            $exe = Get-ServiceExe -ServiceName $name
+            $fromService = [bool]$exe
+            if (-not $exe) {
+                $exe = "$sysmonDir\$name.exe"
+                if (-not (Test-Path $exe)) { $exe = $null }
+            }
+            return [pscustomobject]@{ Name = $name; Exe = $exe; FromService = $fromService }
+        }
+    }
     return $null
 }
 
@@ -185,6 +213,83 @@ function Test-SysmonRunning {
         if ($svc -and $svc.Status -eq "Running") { return $true }
     }
     return $false
+}
+
+# Version of the Sysmon that runs now: the process image, else the service ImagePath binary.
+function Get-RunningSysmonVersion {
+    foreach ($name in @("Sysmon64a", "Sysmon64")) {
+        $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+        if (-not ($svc -and $svc.Status -eq "Running")) { continue }
+        try {
+            $proc = Get-Process -Name $name -ErrorAction Stop | Select-Object -First 1
+            $v = ConvertTo-NormalVersion -Text ([string]$proc.MainModule.FileVersionInfo.FileVersion)
+            if ($v) { return $v }
+        } catch { }
+        return (Get-BinaryVersion -Path (Get-ServiceExe -ServiceName $name))
+    }
+    return $null
+}
+
+# Services or driver whose deletion waits for a reboot (DeleteFlag = 1).
+function Get-PendingDeletion {
+    $pending = @()
+    foreach ($name in @("Sysmon64a", "Sysmon64", "SysmonDrv")) {
+        $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$name"
+        try {
+            $flag = (Get-ItemProperty -Path $key -Name DeleteFlag -ErrorAction Stop).DeleteFlag
+            if ($flag -eq 1) { $pending += $name }
+        } catch { }
+    }
+    return $pending
+}
+
+# One backup per version, taken from the binary the running service uses - never from the
+# freshly extracted download. Returns the backup path or $null.
+function Backup-RunningSysmon {
+    param($Installed, $Version)
+    if (-not $Installed -or -not $Installed.FromService -or -not $Version) { return $null }
+    if (-not (Test-SysmonRunning)) { return $null }
+    $runningVersion = Get-RunningSysmonVersion
+    if ($runningVersion -and $runningVersion -ne $Version) {
+        Write-Host "[!] Running Sysmon is $runningVersion but its binary says $Version - no backup taken" -ForegroundColor Yellow
+        return $null
+    }
+    try {
+        $dir = Join-Path $backupDir "$Version"
+        $dest = Join-Path $dir (Split-Path $Installed.Exe -Leaf)
+        if ((Test-Path $dest) -and ((Get-BinaryVersion -Path $dest) -eq $Version)) { return $dest }
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        Copy-Item -Path $Installed.Exe -Destination $dest -Force
+        if ((Get-BinaryVersion -Path $dest) -eq $Version) {
+            Write-Host "[*] Backed up Sysmon $Version to $dest" -ForegroundColor Gray
+            return $dest
+        }
+    } catch {
+        Write-Host "[!] Could not back up the installed Sysmon: $_" -ForegroundColor Yellow
+    }
+    return $null
+}
+
+# A one-shot task that puts the backed-up Sysmon back at the next boot, in case this
+# script is interrupted or the old Sysmon is still pending deletion.
+function Register-SysmonRecovery {
+    param([string]$Exe)
+    try {
+        $command = "if (-not (Get-Service -Name Sysmon64a,Sysmon64 -ErrorAction SilentlyContinue | Where-Object { `$_.Status -eq 'Running' })) { & '$Exe' -accepteula -i '$configPath' }; " +
+            "if (Get-Service -Name Sysmon64a,Sysmon64 -ErrorAction SilentlyContinue | Where-Object { `$_.Status -eq 'Running' }) { Unregister-ScheduledTask -TaskName 'TDC-SysmonRecover' -Confirm:`$false }"
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -EncodedCommand $encoded"
+        $trigger = New-ScheduledTaskTrigger -AtStartup
+        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+        Register-ScheduledTask -TaskName "TDC-SysmonRecover" -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+        Write-Host "[*] Recovery task TDC-SysmonRecover registered (reinstalls the backup at boot)" -ForegroundColor Gray
+    } catch {
+        Write-Host "[!] Could not register the recovery task: $_" -ForegroundColor Yellow
+    }
+}
+
+function Unregister-SysmonRecovery {
+    Unregister-ScheduledTask -TaskName "TDC-SysmonRecover" -Confirm:$false -ErrorAction SilentlyContinue
 }
 
 # After -u force the services and the event channel go away asynchronously; installing
@@ -208,15 +313,33 @@ function Wait-SysmonGone {
     }
 }
 
+# -u force, then wait; $true when everything is gone.
 function Uninstall-SysmonBinary {
     param([string]$Exe)
     & $Exe -accepteula -u force 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
-    [void](Wait-SysmonGone -TimeoutSeconds 60)
+    return (Wait-SysmonGone -TimeoutSeconds 60)
 }
 
-# -i with up to 3 attempts; a partial state is removed with -u force between tries.
+# Sysmon runs and, when a version is expected, it is that version.
+function Test-SysmonInstalledOk {
+    param($ExpectedVersion)
+    if (-not (Test-SysmonRunning)) { return $false }
+    if (-not $ExpectedVersion) { return $true }
+    $runningVersion = Get-RunningSysmonVersion
+    if (-not $runningVersion) {
+        Write-Host "[!] Could not read the running Sysmon version" -ForegroundColor Yellow
+        return $true
+    }
+    if ($runningVersion -ne $ExpectedVersion) {
+        Write-Host "[!] Sysmon $runningVersion runs, expected $ExpectedVersion" -ForegroundColor Yellow
+        return $false
+    }
+    return $true
+}
+
+# -i with up to 3 attempts; with -Force a partial state is removed with -u force between tries.
 function Install-SysmonService {
-    param([string]$Exe)
+    param([string]$Exe, $ExpectedVersion = $null)
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         Write-Host "[*] Installing Sysmon service ($([System.IO.Path]::GetFileName($Exe)), attempt $attempt of 3)..." -ForegroundColor Yellow
         & $Exe -accepteula -i $configPath 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
@@ -227,11 +350,13 @@ function Install-SysmonService {
             }
             Start-Sleep -Seconds 2
         }
-        if (Test-SysmonRunning) { return $true }
+        if (Test-SysmonInstalledOk -ExpectedVersion $ExpectedVersion) { return $true }
         if ($attempt -lt 3) {
-            Write-Host "[!] Sysmon is not running - waiting 10 s before the next attempt" -ForegroundColor Yellow
+            Write-Host "[!] Sysmon is not running as expected - waiting 10 s before the next attempt" -ForegroundColor Yellow
             Start-Sleep -Seconds 10
-            Uninstall-SysmonBinary -Exe $Exe
+            if ($Force) {
+                [void](Uninstall-SysmonBinary -Exe $Exe)
+            }
         }
     }
     return $false
@@ -255,7 +380,9 @@ if ($sysmonSvc -and $sysmonSvc.Status -eq "Running" -and -not $Force) {
         $configEtag = Get-ETag $response
         Move-Item -Path $configTmp -Destination $configPath -Force -ErrorAction Stop
         Set-PipeEventExclude -Path $configPath
-        & $sysmonExe -c $configPath 2>$null
+        $installedNow = Get-InstalledSysmon
+        $configExe = if ($installedNow -and $installedNow.Exe) { $installedNow.Exe } else { $sysmonExe }
+        & $configExe -c $configPath 2>$null
         $configExit = $LASTEXITCODE
         Set-SysmonLogSize
         if ($configExit -ne 0) {
@@ -302,40 +429,24 @@ try {
     exit 1
 }
 
-# What is installed now: the binary the service runs, else the one in the tools dir
-$installedExe = $null
+# What is installed now: the binary the service runs (ImagePath), else the tools dir one
+$installed = Get-InstalledSysmon
 $installedServiceName = $null
-foreach ($name in @("Sysmon64a", "Sysmon64")) {
-    if (Get-Service -Name $name -ErrorAction SilentlyContinue) {
-        $installedServiceName = $name
-        $installedExe = Get-ServiceExe -ServiceName $name
-        if (-not $installedExe) {
-            $installedExe = "$sysmonDir\$name.exe"
-            if (-not (Test-Path $installedExe)) { $installedExe = $null }
-        }
-        break
-    }
+$installedExe = $null
+$installedFromService = $false
+if ($installed) {
+    $installedServiceName = $installed.Name
+    $installedExe = $installed.Exe
+    $installedFromService = $installed.FromService
 }
 $installedVersion = Get-BinaryVersion -Path $installedExe
 if (-not $installedVersion) {
     $installedVersion = Get-BinaryVersion -Path $sysmonExe
 }
 
-# Back up the installed binaries before the extraction overwrites them
+# Back up the running binary (one copy per version) before the extraction overwrites the tools dir
 $backupDir = "$sysmonDir\backup"
-if ($installedServiceName) {
-    try {
-        New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
-        Get-ChildItem -Path $sysmonDir -Filter "Sysmon*.exe" -File -ErrorAction SilentlyContinue |
-            ForEach-Object { Copy-Item -Path $_.FullName -Destination $backupDir -Force }
-        if ($installedExe -and -not (Test-Path (Join-Path $backupDir (Split-Path $installedExe -Leaf)))) {
-            Copy-Item -Path $installedExe -Destination $backupDir -Force
-        }
-        Write-Host "[*] Backed up the installed Sysmon binaries to $backupDir" -ForegroundColor Gray
-    } catch {
-        Write-Host "[!] Could not back up the installed Sysmon: $_" -ForegroundColor Yellow
-    }
-}
+$backupExe = Backup-RunningSysmon -Installed $installed -Version $installedVersion
 
 # Extract
 Write-Host "[*] Extracting Sysmon..." -ForegroundColor Yellow
@@ -424,53 +535,85 @@ if ($Force -and (Test-SysmonRunning) -and $installedExe -and $installedVersion -
         Write-Host "[!] sysmon -c failed (exit $configExit) - config not applied; Sysmon $installedVersion keeps running" -ForegroundColor Red
         exit 1
     }
-    if ($binaryEtag) { Save-SourceEtag -Key "binary_etag" -Value $binaryEtag }
+    if ($binaryEtag -and $installedFromService) { Save-SourceEtag -Key "binary_etag" -Value $binaryEtag }
     if ($configEtag) { Save-SourceEtag -Key "config_etag" -Value $configEtag }
     Write-Host "[+] Sysmon $installedVersion is current; configuration updated" -ForegroundColor Green
     exit 0
 }
 
-# Reinstall: the old service and driver have to go before the new ones. The
-# uninstall must use the binary that matches the installed service name.
+# Reinstall: the old service and driver have to go before the new ones.
+if ($Force) {
+    # A service or driver waiting for deletion blocks the install until a reboot; the old Sysmon still runs here
+    $pending = @(Get-PendingDeletion)
+    if ($pending.Count -gt 0) {
+        Write-Host "[!] reboot required: $($pending -join ', ') is pending deletion. Sysmon was left as it was." -ForegroundColor Red
+        exit 1
+    }
+    if ((Test-SysmonRunning) -and -not $backupExe) {
+        Write-Host "[!] The running Sysmon could not be backed up - not reinstalling, it keeps running" -ForegroundColor Red
+        exit 1
+    }
+    if ($backupExe) { Register-SysmonRecovery -Exe $backupExe }
+}
 if ($Force -and $installedServiceName) {
-    $uninstallExe = $installedExe
-    if (-not $uninstallExe) { $uninstallExe = Join-Path $backupDir "$installedServiceName.exe" }
-    if (-not (Test-Path $uninstallExe)) { $uninstallExe = $sysmonExe }
-    Write-Host "[*] Uninstalling the installed Sysmon (-u force, $([System.IO.Path]::GetFileName($uninstallExe)))..." -ForegroundColor Yellow
-    Uninstall-SysmonBinary -Exe $uninstallExe
+    # Prefer the version-matched backup copy: the service image in C:\Windows may defer its own deletion
+    $uninstallExe = $null
+    if ($backupExe) { $uninstallExe = Join-Path (Join-Path $backupDir "$installedVersion") "$installedServiceName.exe" }
+    if (-not $uninstallExe -or -not (Test-Path $uninstallExe)) { $uninstallExe = $installedExe }
+    if (-not $uninstallExe -or -not (Test-Path $uninstallExe)) { $uninstallExe = $sysmonExe }
+    Write-Host "[*] Uninstalling the installed Sysmon (-u force, $uninstallExe)..." -ForegroundColor Yellow
+    $gone = Uninstall-SysmonBinary -Exe $uninstallExe
+    if (-not $gone) {
+        $pending = @(Get-PendingDeletion)
+        if ($pending.Count -gt 0) {
+            Write-Host "[!] reboot required: $($pending -join ', ') is pending deletion. The recovery task TDC-SysmonRecover reinstalls Sysmon at boot." -ForegroundColor Red
+            exit 1
+        }
+    }
 }
 
-# Verify installation: install with retries, then check that the service runs
-$sysmonRunning = Install-SysmonService -Exe $sysmonExe
+# Verify installation: install with retries, then check that the expected version runs
+$sysmonRunning = Install-SysmonService -Exe $sysmonExe -ExpectedVersion $downloadedVersion
 Set-SysmonLogSize
 
 if ($sysmonRunning) {
     Write-Host "[+] Sysmon installed and running" -ForegroundColor Green
 } else {
-    Write-Host "[!] Sysmon service not running - check logs" -ForegroundColor Red
+    Write-Host "[!] Sysmon service not running (or not the new version) - check logs" -ForegroundColor Red
 }
 
 if ($Force -and -not $sysmonRunning) {
     # Never leave the VM without Sysmon: put the previous version back
     $rollbackExe = $null
-    if ($installedServiceName) { $rollbackExe = Join-Path $backupDir "$installedServiceName.exe" }
+    if ($installedServiceName -and $installedVersion) {
+        $rollbackExe = Join-Path (Join-Path $backupDir "$installedVersion") "$installedServiceName.exe"
+    }
     if ($rollbackExe -and (Test-Path $rollbackExe)) {
         Write-Host "[*] Rolling back to the previous Sysmon ($rollbackExe)..." -ForegroundColor Yellow
-        Uninstall-SysmonBinary -Exe $sysmonExe
-        if (Install-SysmonService -Exe $rollbackExe) {
+        $gone = Uninstall-SysmonBinary -Exe $sysmonExe
+        if (-not $gone -and @(Get-PendingDeletion).Count -gt 0) {
+            Write-Host "[!] reboot required: the failed Sysmon is pending deletion. The recovery task TDC-SysmonRecover restores the previous version at boot." -ForegroundColor Red
+            exit 1
+        }
+        if (Install-SysmonService -Exe $rollbackExe -ExpectedVersion $installedVersion) {
             Set-SysmonLogSize
+            Unregister-SysmonRecovery
             Write-Host "[!] New Sysmon failed to install; restored the previous version" -ForegroundColor Red
         } else {
-            Write-Host "[!] Rollback failed - Sysmon is NOT running. Reinstall by hand: $rollbackExe -accepteula -i $configPath" -ForegroundColor Red
+            Write-Host "[!] Rollback failed - Sysmon is NOT running. The recovery task TDC-SysmonRecover retries at boot, or by hand: $rollbackExe -accepteula -i $configPath" -ForegroundColor Red
         }
     } else {
         Write-Host "[!] Sysmon failed to install and there is no backed-up binary to roll back to" -ForegroundColor Red
     }
     exit 1
 }
-# The ETags are recorded only for an install that runs
+# The ETags are recorded only for an install that runs, binary_etag only for the downloaded version
 if ($sysmonRunning) {
-    if ($binaryEtag) { Save-SourceEtag -Key "binary_etag" -Value $binaryEtag }
+    Unregister-SysmonRecovery
+    $runningVersion = Get-RunningSysmonVersion
+    if ($binaryEtag -and $downloadedVersion -and $runningVersion -and ($runningVersion -eq $downloadedVersion)) {
+        Save-SourceEtag -Key "binary_etag" -Value $binaryEtag
+    }
     if ($configEtag) { Save-SourceEtag -Key "config_etag" -Value $configEtag }
 }
 
