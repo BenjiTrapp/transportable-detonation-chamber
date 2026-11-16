@@ -139,8 +139,13 @@ again when it is left.
 - **Sysmon logs the connections a download needs.** SwiftOnSecurity's config
   logs EID 3 only for an include list; `install-sysmon.ps1` adds `curl.exe`,
   `python.exe`, `pythonw.exe` and `C:\Windows\System32\svchost.exe` (BITS) to
-  it (`Set-NetworkConnectIncludes`). *Check:* `C:\tools\sysmon\sysmonconfig.xml`
-  contains four `<Image name="TDC firewall tab" ...>` lines; then, with ASK on
+  it (`Set-NetworkConnectIncludes`), each as a `Rule` with
+  `<Initiated condition="is">true</Initiated>`, so only their outbound
+  connections are logged. *Check:* `C:\tools\sysmon\sysmonconfig.xml` contains
+  four `<Rule name="TDC firewall tab: ...">` entries and `sysmon -c` accepted
+  the config; browse the web UI from the host for a minute and no `tdc-anomaly`
+  appears on a python flow (an accepted connection must not read as TDC's own
+  outbound traffic); then, with ASK on
   All, `curl.exe -o %TEMP%\x.exe http://<test host>/x.exe` and
   `bitsadmin /transfer t http://<test host>/y.exe %TEMP%\y.exe` must each open a
   decision. *If wrong:* a curl or BITS download never becomes a finding, and

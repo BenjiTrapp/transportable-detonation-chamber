@@ -1315,7 +1315,7 @@ itself shows no URL and is only a connection here: that is the known gap of
 this part. A download also needs its connection, and Sysmon logs a connection
 (EID 3) only for the programs its config includes: SwiftOnSecurity's list
 (images under `C:\Users`, `C:\ProgramData`, `C:\Windows\Temp`, a list of
-LOLBins, a few ports) plus what `scripts/install-sysmon.ps1` adds for this tab:
+LOLBins, a few ports) plus what `scripts/install-sysmon.ps1` adds for this tab, outbound only:
 `curl.exe`, `python.exe` and `pythonw.exe` (TDC's own, for `tdc-anomaly`) and
 `svchost.exe` (BITS). A program outside it, under `Program Files` for one, or
 code injected into another system process, makes no connection the tab sees.

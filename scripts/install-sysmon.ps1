@@ -103,32 +103,43 @@ function Set-PipeEventExclude {
 # System32's curl.exe, the BITS service (svchost.exe), and TDC's own python (the tdc-anomaly net) are not on that
 # list, so a curl or BITS download could never become a finding. Add them to every include-mode NetworkConnect
 # filter; a config without one (exclude mode, the minimal config) logs them already.
+# Each comes as a Rule with Initiated=true: EID 3 is written for accepted connections too, and the reader takes
+# every EID 3 as outbound, so without it the analyst's own browser on port 9000 would become TDC python flows
+# tagged tdc-anomaly, and RDP or SMB into the VM svchost flows.
 function Set-NetworkConnectIncludes {
     param([string]$Path)
     $wanted = @(
-        @{ Condition = 'image'; Value = 'curl.exe' },
-        @{ Condition = 'image'; Value = 'python.exe' },
-        @{ Condition = 'image'; Value = 'pythonw.exe' },
-        @{ Condition = 'is'; Value = 'C:\Windows\System32\svchost.exe' }
+        @{ Name = 'TDC firewall tab: curl'; Condition = 'image'; Value = 'curl.exe' },
+        @{ Name = 'TDC firewall tab: python'; Condition = 'image'; Value = 'python.exe' },
+        @{ Name = 'TDC firewall tab: pythonw'; Condition = 'image'; Value = 'pythonw.exe' },
+        @{ Name = 'TDC firewall tab: svchost (BITS)'; Condition = 'is'; Value = 'C:\Windows\System32\svchost.exe' }
     )
     try {
         [xml]$cfg = Get-Content -Path $Path -Raw
         $includes = @($cfg.SelectNodes("//NetworkConnect[@onmatch='include']"))
         foreach ($node in $includes) {
+            # an earlier version added plain Image entries, which also logged inbound connections
+            foreach ($old in @($node.SelectNodes("Image[@name='TDC firewall tab']"))) { [void]$node.RemoveChild($old) }
             foreach ($w in $wanted) {
-                $have = @($node.SelectNodes("Image") | Where-Object {
-                    $_.GetAttribute('condition') -eq $w.Condition -and $_.InnerText -eq $w.Value })
+                $have = @($node.SelectNodes("Rule") | Where-Object { $_.GetAttribute('name') -eq $w.Name })
                 if ($have.Count -gt 0) { continue }
+                $rule = $cfg.CreateElement('Rule')
+                $rule.SetAttribute('name', $w.Name)
+                $rule.SetAttribute('groupRelation', 'and')
                 $image = $cfg.CreateElement('Image')
-                $image.SetAttribute('name', 'TDC firewall tab')
                 $image.SetAttribute('condition', $w.Condition)
                 $image.InnerText = $w.Value
-                [void]$node.AppendChild($image)
+                [void]$rule.AppendChild($image)
+                $initiated = $cfg.CreateElement('Initiated')
+                $initiated.SetAttribute('condition', 'is')
+                $initiated.InnerText = 'true'
+                [void]$rule.AppendChild($initiated)
+                [void]$node.AppendChild($rule)
             }
         }
         $cfg.Save($Path)
         if ($includes.Count -gt 0) {
-            Write-Host "[+] NetworkConnect also logs curl.exe, python.exe and svchost.exe (BITS)" -ForegroundColor Green
+            Write-Host "[+] NetworkConnect also logs the outbound connections of curl.exe, python.exe and svchost.exe (BITS)" -ForegroundColor Green
         }
     } catch {
         Write-Host "[!] NetworkConnect post-processing failed - curl and BITS downloads may never become a FIREWALL finding: $_" -ForegroundColor Red
