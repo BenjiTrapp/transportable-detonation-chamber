@@ -248,7 +248,7 @@ def _fold(value: Any) -> str:
     return str(value).strip().lower()
 
 
-def _epoch(value: Any) -> Optional[float]:
+def epoch_of(value: Any) -> Optional[float]:
     """Epoch seconds of an ISO timestamp (with offset or ``Z``; no offset means local time), or None."""
     if not isinstance(value, str) or not value.strip():
         return None
@@ -307,7 +307,7 @@ def bundle(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for ev in events:
         if not _is_event(ev, 3):
             continue
-        epoch = _epoch(ev.get("timestamp"))
+        epoch = epoch_of(ev.get("timestamp"))
         if epoch is not None:
             timed.append((epoch, ev))
     timed.sort(key=lambda pair: pair[0])
@@ -343,7 +343,7 @@ def dns_map(events: List[Dict[str, Any]], ttl_s: Optional[float] = None,
     for ev in events:
         if not _is_event(ev, 22):
             continue
-        epoch, name = _epoch(ev.get("timestamp")), _host(ev.get("query"))
+        epoch, name = epoch_of(ev.get("timestamp")), _host(ev.get("query"))
         if epoch is None or not name:
             continue
         for part in _sysmon_str(ev.get("result")).split(";"):
@@ -464,7 +464,8 @@ def _alert_endpoints(alerts: List[Dict[str, Any]]) -> Set[Tuple[str, Optional[in
     return out
 
 
-def _is_tdc_image(image: str) -> bool:
+def is_tdc_image(image: str) -> bool:
+    """Whether ``image`` is one of TDC's own programs (see ``TDC_IMAGES``)."""
     path = image.replace("/", "\\").lower()
     return (path in TDC_IMAGES or path.startswith(TDC_ROOTS)
             or path.rsplit("\\", 1)[-1] in TDC_BASENAMES)
@@ -477,7 +478,7 @@ def _is_loopback(ip: str) -> bool:
         return False
 
 
-def _is_detonated(pid: Optional[int], ctx: Context) -> bool:
+def is_detonated(pid: Optional[int], ctx: Context) -> bool:
     """Whether ``pid`` or one of its ancestors is a submission."""
     seen = set()
     while pid is not None and pid not in seen and len(seen) < _MAX_ANCESTORS:
@@ -522,7 +523,7 @@ def _tag_flow(flow: Dict[str, Any], ctx: Context, alert_endpoints: Set[Tuple[str
         found.add("beacon")
     if (ip, port) in alert_endpoints or (ip, None) in alert_endpoints:
         found.add("sigma")
-    if _is_detonated(flow["pid"], ctx):
+    if is_detonated(flow["pid"], ctx):
         found.add("detonated")
     # A hardcoded target is an address that no name explains. Sysmon fills DestinationHostname from the
     # local DNS cache, so a populated field is evidence that a name was involved, even when the answer
@@ -577,7 +578,7 @@ def classify(events: List[Dict[str, Any]], fw_events: List[Dict[str, Any]], ctx:
         if not flow["dst_hostname"]:
             flow["dst_hostname"] = ctx.dns.get(ip) or None
         flow["geo"] = _geo(ip, ctx)
-        is_tdc = _is_tdc_image(flow["image"])
+        is_tdc = is_tdc_image(flow["image"])
         flow["tags"] = _tag_flow(flow, ctx, alert_endpoints, is_tdc)
         flow["severity"] = severity_of(flow["tags"])
         keys = _rule_keys(flow["image"], ip, flow["dst_port"])

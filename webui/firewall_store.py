@@ -1,0 +1,838 @@
+"""Event store, pending decisions and settings for the FIREWALL tab.
+
+``FirewallStore`` keeps what ``firewall.classify`` needs, as the readers delivered it: the single
+Sysmon connections (EID 3) in a ring of ``MAX_CONNECTIONS`` entries and ``RETAIN_S`` seconds, the
+DNS map (EID 22), the processes (EID 1), the Windows firewall log, and the PowerShell and BITS events
+that carry a URL (the download case). It is a store of its own, not ``log_store``: that one bundles at
+once, and the tab needs the single connections (beacon detection) and the process start (newborn).
+
+Times: ``since`` and ``until`` are ISO-8601 text (or epoch seconds); what comes out is what
+``firewall`` works in, epoch floats. ``events`` returns the raw Sysmon events of a window, the input of
+``firewall.classify``; ``connections`` is the same window bundled by ``firewall.bundle``. A ring
+forgets what is older than ``RETAIN_S`` before its *newest* entry, not before the wall clock.
+
+``FirewallCollector`` reads the sources incrementally through injected readers, like
+``log_store.Collector``. Reader contract: ``reader(since=<cursor>)``, ``None`` on the first read (the
+reader then returns at most the last 24 h and 5000 events), oldest first. It returns the list of events,
+or ``(events, cursor)`` when the position is not an event of its own (the firewall log: a byte offset).
+Without an explicit cursor the position is the highest ``record_id`` of the events (top level or in
+``fields``), so an event log is read through ``EventRecordID``; events without one are refused, as
+they would be read again at every tick. The events:
+
+    connections  Sysmon EID 3, as ``_read_sysmon_events`` yields them (plus ``record_id``)
+    dns          Sysmon EID 22, same
+    processes    Sysmon EID 1: ``pid image parent_pid commandline timestamp``
+    powershell   ``log_store.parse_powershell_events`` (``time``, ``message``, ``fields.pid``)
+    firewall     ``log_store.parse_firewall_log`` (``time``, ``fields``); the cursor is the byte offset
+    bits         BITS client EID 59/60: ``{"timestamp", "event_id", "data": {"url"}, "pid"}`` where
+                 ``pid`` is the requesting process when the reader knows it (the events do not say)
+
+A reader that raises, or answers ``{"error": ...}``, marks its source ``unavailable`` with the first
+line of the message; the other sources carry on. ``tick`` is not thread-safe: one thread calls it, and the
+fast cadence of a detonation window is that thread sleeping less (``interval``). BITS is read only in the
+window. The store itself may be read from other threads.
+
+``download_findings`` is the download case: a URL to an executable file in a script block, a command
+line or a BITS job of a process in a detonation. ``PendingStore`` holds the decisions that follow, and
+``Settings`` the server-side state of the tab (``webui/firewall_state.json``).
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import logging
+import math
+import os
+import re
+import threading
+import time
+import uuid
+from collections import deque
+from datetime import datetime, timezone
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import unquote, urlsplit
+
+import firewall
+
+logger = logging.getLogger(__name__)
+
+SOURCES = ("connections", "dns", "processes", "powershell", "firewall", "bits")
+
+MAX_CONNECTIONS = 50000
+RETAIN_S = 7 * 86400
+MAX_FIREWALL_EVENTS = 50000
+MAX_PROCESS_EVENTS = 5000
+MAX_PROCESSES = 20000
+MAX_URL_EVENTS = 500       # PowerShell and BITS events with a URL, each
+MAX_SCRIPT_CHARS = 65536   # of a script block that is kept
+MAX_COMMANDLINE_CHARS = 8192
+
+FAST_INTERVAL = 1.0
+SLOW_INTERVAL = 10.0
+
+ASK_MODES = ("detonation", "all", "off")
+DECISIONS = ("allow", "block", "block_fetch")
+MAX_OPEN = 200
+MAX_HISTORY = 1000
+HISTORY_S = 24 * 3600
+
+EXECUTABLE_SUFFIXES = frozenset({".exe", ".dll", ".scr", ".ps1", ".bat", ".cmd", ".vbs", ".js", ".hta",
+                                 ".msi", ".jar", ".lnk", ".cpl", ".ocx"})
+# Our own pattern, no input of anyone's: a URL ends at white space, a quote, a bracket or a comma.
+URL_RE = re.compile(r"https?://[^\s'\"<>`|^\\(){},]+", re.IGNORECASE)
+MAX_URL_LEN = 2048
+MAX_URLS = 20
+_URL_TRAILING = ".;:!?"
+
+_REPLACE_ATTEMPTS = 10
+_REPLACE_PAUSE = 0.05
+
+
+# ---- small helpers ---------------------------------------------------------------------------
+
+
+def _iso(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _bound(value: Any) -> Optional[float]:
+    """A window bound as epoch seconds: ISO text or a number; None stays None."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    epoch = firewall.epoch_of(value)
+    if epoch is None:
+        raise ValueError(f"not a time: {value!r}")
+    return epoch
+
+
+def _to_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _event_id(ev: Any) -> Optional[int]:
+    return _to_int(ev.get("event_id")) if isinstance(ev, dict) else None
+
+
+def _event_epoch(ev: Dict[str, Any]) -> Optional[float]:
+    return firewall.epoch_of(ev.get("timestamp") or ev.get("time"))
+
+
+def _first_line(exc: BaseException) -> str:
+    for line in str(exc).splitlines():
+        if line.strip():
+            return line.strip()[:200]
+    return type(exc).__name__
+
+
+def _write_json(path: str, payload: Any) -> None:
+    """Write ``payload`` beside ``path``, flush it to the disk and only then put it in place, so a write
+    that fails halfway leaves the old file as it was (the way ``app._save_submissions`` does it)."""
+    tmp = path + ".tmp"
+    try:
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, default=str)
+            f.flush()
+            os.fsync(f.fileno())
+        for attempt in range(1, _REPLACE_ATTEMPTS + 1):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt == _REPLACE_ATTEMPTS:
+                    raise
+                time.sleep(_REPLACE_PAUSE)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# ---- URLs ------------------------------------------------------------------------------------
+
+
+def urls_in(text: str) -> List[str]:
+    """The http(s) URLs in ``text``, in order and without repeats: at most ``MAX_URLS``, none longer than
+    ``MAX_URL_LEN`` (such a one is dropped, not cut). Trailing punctuation is not part of a URL."""
+    if not isinstance(text, str) or not text:
+        return []
+    found: List[str] = []
+    for match in URL_RE.finditer(text):
+        url = match.group(0).rstrip(_URL_TRAILING)
+        if len(url) > MAX_URL_LEN or not url.partition("://")[2] or url in found:
+            continue
+        found.append(url)
+        if len(found) >= MAX_URLS:
+            break
+    return found
+
+
+def _url_parts(url: str) -> Optional[Tuple[str, int, str]]:
+    """``(host, port, file name)`` of a URL, or None when it cannot be taken apart."""
+    try:
+        parts = urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if not host:
+        return None
+    if port is None:
+        port = 443 if parts.scheme.lower() == "https" else 80
+    name = unquote(parts.path).rsplit("/", 1)[-1].split(";", 1)[0]
+    return host.lower(), port, name
+
+
+def _is_executable_name(name: str) -> bool:
+    dot = name.rfind(".")
+    return dot >= 0 and name[dot:].lower() in EXECUTABLE_SUFFIXES
+
+
+# ---- store -----------------------------------------------------------------------------------
+
+
+def _window(ring: Iterable[Tuple[float, Any]], since: Optional[float], until: Optional[float]) -> List[Any]:
+    return [item for epoch, item in ring
+            if (since is None or epoch >= since) and (until is None or epoch <= until)]
+
+
+class FirewallStore:
+    """Thread-safe rings of what the collector read; see the module docstring."""
+
+    def __init__(self, max_connections: int = MAX_CONNECTIONS, retain_s: float = RETAIN_S):
+        self.retain_s = retain_s
+        self._lock = threading.Lock()
+        self._connections: Deque[Tuple[float, Tuple, Dict[str, Any]]] = deque(maxlen=max(1, int(max_connections)))
+        self._firewall: Deque[Tuple[float, Dict[str, Any]]] = deque(maxlen=MAX_FIREWALL_EVENTS)
+        self._process_events: Deque[Tuple[float, Dict[str, Any]]] = deque(maxlen=MAX_PROCESS_EVENTS)
+        self._powershell: Deque[Tuple[float, Dict[str, Any]]] = deque(maxlen=MAX_URL_EVENTS)
+        self._bits: Deque[Tuple[float, Dict[str, Any]]] = deque(maxlen=MAX_URL_EVENTS)
+        self._dns: Dict[str, str] = {}
+        self._processes: Dict[int, Dict[str, Any]] = {}
+        self._status: Dict[str, Tuple[str, str]] = {}
+
+    # -- writing --
+
+    def _forget_old(self, ring: Deque) -> None:
+        """Drop what lies more than ``retain_s`` before the newest entry; the caller holds the lock."""
+        if ring:
+            newest = ring[-1][0]
+            while ring[0][0] < newest - self.retain_s:
+                ring.popleft()
+
+    def add_connections(self, events: Iterable[Dict[str, Any]]) -> int:
+        """Keep the Sysmon EID 3 events among ``events``; returns how many."""
+        added = 0
+        with self._lock:
+            for ev in events:
+                epoch = _event_epoch(ev) if _event_id(ev) == 3 and not ev.get("error") else None
+                if epoch is not None:
+                    self._connections.append((epoch, firewall.flow_key(ev), ev))
+                    added += 1
+            self._forget_old(self._connections)
+        return added
+
+    def add_dns(self, events: Iterable[Dict[str, Any]]) -> int:
+        """Fold the Sysmon EID 22 answers in the IP -> name map (the newest answer wins); returns how many addresses."""
+        answers = firewall.dns_map(list(events))
+        with self._lock:
+            for ip, name in answers.items():
+                self._dns.pop(ip, None)
+                self._dns[ip] = name
+            while len(self._dns) > firewall.DNS_MAX_ENTRIES:
+                del self._dns[next(iter(self._dns))]
+        return len(answers)
+
+    def add_processes(self, events: Iterable[Dict[str, Any]]) -> int:
+        """Keep the Sysmon EID 1 events among ``events`` and know the process of each; returns how many."""
+        added = 0
+        with self._lock:
+            for ev in events:
+                epoch = _event_epoch(ev) if _event_id(ev) == 1 and not ev.get("error") else None
+                pid = _to_int(ev.get("pid")) if epoch is not None else None
+                if pid is None:
+                    continue
+                commandline = ev.get("commandline")
+                if isinstance(commandline, str) and len(commandline) > MAX_COMMANDLINE_CHARS:
+                    ev = dict(ev, commandline=commandline[:MAX_COMMANDLINE_CHARS])
+                self._process_events.append((epoch, ev))
+                self._processes.pop(pid, None)       # a reused PID is the newest process
+                self._processes[pid] = {
+                    "start": epoch, "image": str(ev.get("image") or "").strip(),
+                    "parent_pid": _to_int(ev.get("parent_pid")),
+                    "parent_image": str(ev.get("parent_image") or "").strip(),
+                    "commandline": ev.get("commandline") or ""}
+                if len(self._processes) > MAX_PROCESSES:
+                    del self._processes[next(iter(self._processes))]
+                added += 1
+            self._forget_old(self._process_events)
+        return added
+
+    def add_firewall(self, events: Iterable[Dict[str, Any]]) -> int:
+        """Keep Windows firewall log events (``log_store.parse_firewall_log``); returns how many."""
+        added = 0
+        with self._lock:
+            for ev in events:
+                epoch = _event_epoch(ev) if isinstance(ev, dict) else None
+                if epoch is not None:
+                    self._firewall.append((epoch, ev))
+                    added += 1
+            self._forget_old(self._firewall)
+        return added
+
+    def add_powershell(self, events: Iterable[Dict[str, Any]]) -> int:
+        """Keep the PowerShell events whose text holds a URL (the rest is the LOGS tab's business); returns how many."""
+        added = 0
+        with self._lock:
+            for ev in events:
+                text = ev.get("message") if isinstance(ev, dict) else None
+                epoch = _event_epoch(ev) if urls_in(text) else None
+                if epoch is None:
+                    continue
+                if len(text) > MAX_SCRIPT_CHARS:
+                    ev = dict(ev, message=text[:MAX_SCRIPT_CHARS])
+                self._powershell.append((epoch, ev))
+                added += 1
+            self._forget_old(self._powershell)
+        return added
+
+    def add_bits(self, events: Iterable[Dict[str, Any]]) -> int:
+        """Keep the BITS events that name a URL; returns how many."""
+        added = 0
+        with self._lock:
+            for ev in events:
+                data = ev.get("data") if isinstance(ev, dict) else None
+                epoch = _event_epoch(ev) if isinstance(data, dict) and urls_in(data.get("url")) else None
+                if epoch is not None:
+                    self._bits.append((epoch, ev))
+                    added += 1
+            self._forget_old(self._bits)
+        return added
+
+    def set_status(self, source: str, status: str, hint: str = "") -> None:
+        with self._lock:
+            self._status[source] = (status, hint)
+
+    # -- reading --
+
+    def events(self, since: Any = None, until: Any = None) -> List[Dict[str, Any]]:
+        """The Sysmon EID 3 events of a window (inclusive), oldest read first: the input of ``firewall.classify``."""
+        lo, hi = _bound(since), _bound(until)
+        with self._lock:
+            return _window(((epoch, ev) for epoch, _, ev in self._connections), lo, hi)
+
+    def connections(self, since: Any = None, until: Any = None) -> List[Dict[str, Any]]:
+        """The connections of a window bundled to flows (``firewall.bundle``)."""
+        return firewall.bundle(self.events(since, until))
+
+    def raw_for(self, image: str, dst_ip: str, dst_port: Optional[int]) -> List[Tuple[float, str, Optional[int]]]:
+        """``(epoch, dst_ip, dst_port)`` of every single connection of ``image`` to this endpoint, oldest first.
+
+        The beaconing detector works on these, not on a bundled flow.
+        """
+        want = firewall.flow_key({"image": image, "dst_ip": dst_ip, "dst_port": dst_port})
+        with self._lock:
+            hits = [(epoch, key[4], key[5]) for epoch, key, _ in self._connections
+                    if key[0].lower() == want[0].lower() and key[4] == want[4] and key[5] == want[5]]
+        return sorted(hits, key=lambda hit: hit[0])
+
+    def dns(self) -> Dict[str, str]:
+        """IP -> the name that last resolved to it."""
+        with self._lock:
+            return dict(self._dns)
+
+    def processes(self) -> Dict[int, Dict[str, Any]]:
+        """PID -> ``{"start": epoch, "image", "parent_pid", "parent_image", "commandline"}``, newest process of a PID."""
+        with self._lock:
+            return {pid: dict(info) for pid, info in self._processes.items()}
+
+    def process_events(self, since: Any = None, until: Any = None) -> List[Dict[str, Any]]:
+        lo, hi = _bound(since), _bound(until)
+        with self._lock:
+            return _window(self._process_events, lo, hi)
+
+    def firewall_events(self, since: Any = None, until: Any = None) -> List[Dict[str, Any]]:
+        lo, hi = _bound(since), _bound(until)
+        with self._lock:
+            return _window(self._firewall, lo, hi)
+
+    def powershell(self, since: Any = None, until: Any = None) -> List[Dict[str, Any]]:
+        lo, hi = _bound(since), _bound(until)
+        with self._lock:
+            return _window(self._powershell, lo, hi)
+
+    def bits(self, since: Any = None, until: Any = None) -> List[Dict[str, Any]]:
+        lo, hi = _bound(since), _bound(until)
+        with self._lock:
+            return _window(self._bits, lo, hi)
+
+    def stats(self) -> Dict[str, Any]:
+        """Entry counts, the span of the connection ring (ISO) and the status and hint of every source."""
+        with self._lock:
+            counts = {"connections": len(self._connections), "dns": len(self._dns),
+                      "processes": len(self._processes), "powershell": len(self._powershell),
+                      "firewall": len(self._firewall), "bits": len(self._bits)}
+            oldest = self._connections[0][0] if self._connections else None
+            newest = self._connections[-1][0] if self._connections else None
+            status = {s: self._status.get(s, ("idle", ""))[0] for s in SOURCES}
+            hints = {s: self._status.get(s, ("idle", ""))[1] for s in SOURCES}
+        return {"counts": counts, "oldest": _iso(oldest) if oldest is not None else None,
+                "newest": _iso(newest) if newest is not None else None, "status": status, "hints": hints}
+
+
+# ---- the download case -----------------------------------------------------------------------
+
+
+def _event_pid(ev: Dict[str, Any]) -> Optional[int]:
+    for holder in (ev, ev.get("fields"), ev.get("data")):
+        if isinstance(holder, dict):
+            for key in ("pid", "processId", "ProcessId"):
+                pid = _to_int(holder.get(key))
+                if pid is not None:
+                    return pid
+    return None
+
+
+def _flow_for(flows: Iterable[Dict[str, Any]], host: str, port: int, pid: Optional[int]) -> Optional[Dict[str, Any]]:
+    """The flow that reached ``host`` (a name or an address), of process ``pid`` if given; prefers ``port``, then the newest."""
+    address = firewall.flow_key({"dst_ip": host})[4]
+    best: Optional[Tuple[Tuple, Dict[str, Any]]] = None
+    for flow in flows:
+        if pid is not None and flow.get("pid") != pid:
+            continue
+        name = str(flow.get("dst_hostname") or "").lower().rstrip(".")
+        if flow.get("dst_ip") != address and name != host:
+            continue
+        rank = (flow.get("dst_port") == port, flow.get("last_seen") or 0)
+        if best is None or rank > best[0]:
+            best = (rank, flow)
+    return best[1] if best else None
+
+
+def _candidates(ps_events, proc_events, bits_events) -> List[Tuple[str, Dict[str, Any], str, bool]]:
+    """``(source, event, text, any_process)`` of every event that may hold a URL; a BITS job is fetched
+    by the BITS service, so its requester is not the process that connects."""
+    out = []
+    for ev in ps_events or ():
+        if isinstance(ev, dict) and isinstance(ev.get("message"), str):
+            out.append(("powershell", ev, ev["message"], False))
+    for ev in proc_events or ():
+        if isinstance(ev, dict) and _event_id(ev) == 1 and isinstance(ev.get("commandline"), str):
+            out.append(("sysmon", ev, ev["commandline"], False))
+    for ev in bits_events or ():
+        data = ev.get("data") if isinstance(ev, dict) else None
+        if isinstance(data, dict) and isinstance(data.get("url"), str):
+            out.append(("bits", ev, data["url"], True))
+    return out
+
+
+def download_findings(ps_events: List[Dict[str, Any]], proc_events: List[Dict[str, Any]],
+                      bits_events: List[Dict[str, Any]], flows: List[Dict[str, Any]],
+                      submission_pids: Iterable[int], ask_mode: str = "detonation") -> List[Dict[str, Any]]:
+    """URLs to executable files that a process of a detonation is fetching, with the connection that fetches them.
+
+    A URL counts when its file name ends in ``EXECUTABLE_SUFFIXES`` (the path only, not the query) and
+    a flow of ``flows`` (``firewall.classify``: it needs ``dst_hostname``) went to its host. That flow
+    gives ``pid``, ``image``, ``dst_ip`` and ``dst_port``, the keys of ``Context.downloads`` and of
+    ``firewall.rule_key``; a URL whose connection was not seen yet gives nothing, the next call may.
+    ``origin_pid`` is the process that asked: the one in the event (for BITS the requester, which the
+    flow, made by the BITS service, does not name). An event without a PID gives nothing.
+
+    ``ask_mode`` is the tab's ASK switch. ``detonation``: the requester or one of its ancestors (from
+    ``proc_events``) must be in ``submission_pids``. ``all``: any process. ``off``: no findings. In both
+    TDC's own programs (``firewall.is_tdc_image``) are left out.
+
+    A finding is ``{id, pid, image, url, dst_ip, dst_port, source, observed_at, origin_pid}``;
+    ``source`` is ``powershell``, ``sysmon`` or ``bits``, ``observed_at`` ISO-8601 (UTC), and ``id``
+    is the same for the same process and URL, so a call at every tick finds a finding again.
+    """
+    if ask_mode not in ASK_MODES:
+        raise ValueError(f"ask_mode must be one of {ASK_MODES}, not {ask_mode!r}")
+    if ask_mode == "off":
+        return []
+    parents: Dict[int, Dict[str, Any]] = {}
+    for ev in proc_events or ():
+        pid = _to_int(ev.get("pid")) if isinstance(ev, dict) and _event_id(ev) == 1 else None
+        if pid is not None:
+            parents[pid] = {"parent_pid": _to_int(ev.get("parent_pid"))}
+    ancestry = firewall.Context(submission_pids={int(p) for p in submission_pids}, processes=parents)
+    found: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+    for source, ev, text, any_process in _candidates(ps_events, proc_events, bits_events):
+        origin = _event_pid(ev)
+        if origin is None or (ask_mode == "detonation" and not firewall.is_detonated(origin, ancestry)):
+            continue
+        for url in urls_in(text):
+            parts = _url_parts(url)
+            if parts is None or not _is_executable_name(parts[2]):
+                continue
+            flow = _flow_for(flows or (), parts[0], parts[1], None if any_process else origin)
+            if flow is None or not flow.get("image") or firewall.is_tdc_image(flow["image"]):
+                continue
+            finding_id = "dl-" + hashlib.sha1(
+                f"{source}|{origin}|{url}".encode("utf-8", "replace")).hexdigest()[:12]
+            epoch = _event_epoch(ev)
+            if finding_id not in found:
+                found[finding_id] = (epoch if epoch is not None else math.inf, {
+                    "id": finding_id, "pid": flow["pid"], "image": flow["image"], "url": url,
+                    "dst_ip": flow["dst_ip"], "dst_port": flow["dst_port"], "source": source,
+                    "observed_at": _iso(epoch) if epoch is not None else None, "origin_pid": origin})
+    return [finding for _, finding in sorted(found.values(), key=lambda pair: pair[0])]
+
+
+# ---- pending decisions -----------------------------------------------------------------------
+
+
+class PendingStore:
+    """The decisions that wait for the analyst, and the 24 h of history of those that were taken.
+
+    An item is ``{id, finding, deadline, created_at, action, result, resolved_at}``, times in epoch
+    seconds. ``deadline`` is absolute and the server's: ``expired(now)`` lists what ran out, and the
+    caller applies the default action to it. ``id`` is the finding's id, so ``add`` of a finding
+    that is already there (open or decided) returns that item and changes nothing. At most ``MAX_OPEN``
+    items are open: when one more comes, the oldest open item goes to the history as ``dropped``.
+    The file ``path`` is written atomically at every change and read back at start; a file that cannot
+    be read is moved aside (``.corrupt``) and the store starts empty. A write that fails is logged,
+    not raised: the decision still stands in memory.
+    """
+
+    def __init__(self, path: str, clock: Callable[[], float] = time.time):
+        self.path = path
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._items: Dict[str, Dict[str, Any]] = {}
+        self._load()
+
+    # -- the file --
+
+    def _load(self) -> None:
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as e:
+            logger.warning("pending decisions unreadable (%s: %s); starting empty", type(e).__name__, e)
+            try:
+                os.replace(self.path, self.path + ".corrupt")
+            except OSError:
+                pass
+            return
+        items = data.get("items") if isinstance(data, dict) else data
+        for raw in items if isinstance(items, list) else ():
+            item = self._valid(raw)
+            if item is not None:
+                self._items[item["id"]] = item
+        with self._lock:
+            self._prune()
+
+    @staticmethod
+    def _valid(raw: Any) -> Optional[Dict[str, Any]]:
+        if not (isinstance(raw, dict) and isinstance(raw.get("id"), str) and raw["id"]
+                and isinstance(raw.get("finding"), dict)):
+            return None
+        numbers = []
+        for key in ("deadline", "created_at"):
+            value = raw.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                return None
+            numbers.append(float(value))
+        action, resolved_at = raw.get("action"), raw.get("resolved_at")
+        if action is not None and not isinstance(action, str):
+            return None
+        if isinstance(resolved_at, bool) or not (resolved_at is None or isinstance(resolved_at, (int, float))):
+            return None
+        return {"id": raw["id"], "finding": raw["finding"], "deadline": numbers[0], "created_at": numbers[1],
+                "action": action, "result": raw.get("result") if isinstance(raw.get("result"), dict) else None,
+                "resolved_at": resolved_at if action is not None else None}
+
+    def _save(self) -> None:
+        try:
+            _write_json(self.path, {"version": 1, "items": list(self._items.values())})
+        except Exception as e:
+            logger.warning("pending decisions not saved (%s: %s)", type(e).__name__, e)
+
+    def _prune(self) -> None:
+        """Forget old history, and the open items beyond ``MAX_OPEN``; the caller holds the lock."""
+        now = self._clock()
+        decided = sorted((i for i in self._items.values() if i["action"] is not None),
+                         key=lambda i: i["resolved_at"] or 0, reverse=True)
+        for rank, item in enumerate(decided):       # newest first
+            if rank >= MAX_HISTORY or (item["resolved_at"] or 0) < now - HISTORY_S:
+                del self._items[item["id"]]
+        open_items = [i for i in self._items.values() if i["action"] is None]
+        for item in open_items[:max(0, len(open_items) - MAX_OPEN)]:
+            item.update(action="dropped", resolved_at=now,
+                        result={"reason": f"more than {MAX_OPEN} open decisions"})
+
+    # -- writing --
+
+    def add(self, finding: Dict[str, Any], deadline: float) -> Dict[str, Any]:
+        """A new open decision for ``finding``, due at the epoch ``deadline`` (a past one is due at once)."""
+        if not isinstance(finding, dict):
+            raise TypeError("a finding is a dict")
+        due = float(deadline)
+        if not math.isfinite(due):
+            raise ValueError("deadline must be a finite time")
+        with self._lock:
+            fid = finding.get("id")
+            item_id = fid if isinstance(fid, str) and fid else uuid.uuid4().hex[:12]
+            if item_id not in self._items:
+                self._items[item_id] = {"id": item_id, "finding": copy.deepcopy(finding), "deadline": due,
+                                        "created_at": self._clock(), "action": None, "result": None,
+                                        "resolved_at": None}
+                self._prune()
+                self._save()
+            return copy.deepcopy(self._items[item_id])
+
+    def settle(self, pending_id: str, action: str,
+               result: Optional[Dict[str, Any]] = None) -> Tuple[Dict[str, Any], bool]:
+        """``(item, won)``: ``won`` is True for the call that took the decision and False for every later one.
+
+        The caller that wins carries the action out; the others get the decision that was taken. Raises
+        ``KeyError`` for an id that is not known and ``ValueError`` for an action outside ``DECISIONS``.
+        """
+        if action not in DECISIONS:
+            raise ValueError(f"action must be one of {DECISIONS}, not {action!r}")
+        with self._lock:
+            item = self._items.get(pending_id)
+            if item is None:
+                raise KeyError(pending_id)
+            if item["action"] is not None:
+                return copy.deepcopy(item), False
+            item.update(action=action, result=copy.deepcopy(result), resolved_at=self._clock())
+            self._save()
+            return copy.deepcopy(item), True
+
+    def resolve(self, pending_id: str, action: str, result: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Take the decision and return the item. A second answer is no error and changes nothing: it gets the first item."""
+        return self.settle(pending_id, action, result)[0]
+
+    def set_result(self, pending_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Add to the ``result`` of a decided item what became known later (the fetch that followed it)."""
+        with self._lock:
+            item = self._items.get(pending_id)
+            if item is None:
+                raise KeyError(pending_id)
+            item["result"] = dict(item["result"] or {}, **copy.deepcopy(result))
+            self._save()
+            return copy.deepcopy(item)
+
+    # -- reading --
+
+    def get(self, pending_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            item = self._items.get(pending_id)
+            return copy.deepcopy(item) if item else None
+
+    def open(self) -> List[Dict[str, Any]]:
+        """The decisions still open, oldest first."""
+        with self._lock:
+            return [copy.deepcopy(i) for i in self._items.values() if i["action"] is None]
+
+    def history(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """The decisions taken in the last 24 h, newest first."""
+        with self._lock:
+            self._prune()
+            decided = sorted((i for i in self._items.values() if i["action"] is not None),
+                             key=lambda i: i["resolved_at"] or 0, reverse=True)
+            return [copy.deepcopy(i) for i in decided[:max(0, int(limit))]]
+
+    def expired(self, now: float) -> List[Dict[str, Any]]:
+        """The open decisions whose deadline is ``now`` or earlier, the earliest first."""
+        with self._lock:
+            due = [i for i in self._items.values() if i["action"] is None and i["deadline"] <= now]
+            return [copy.deepcopy(i) for i in sorted(due, key=lambda i: i["deadline"])]
+
+
+# ---- settings --------------------------------------------------------------------------------
+
+
+def _check_setting(name: str, value: Any) -> Any:
+    if name == "ask_mode":
+        if value not in ASK_MODES:
+            raise ValueError(f"ask_mode must be one of {ASK_MODES}, not {value!r}")
+    elif name == "isolated":
+        if not isinstance(value, bool):
+            raise ValueError("isolated must be true or false")
+    elif name == "outbound_before":
+        if value is not None and not isinstance(value, str):
+            raise ValueError("outbound_before must be text or null")
+    elif name == "isolated_since":
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                  or not math.isfinite(value)):
+            raise ValueError("isolated_since must be an epoch time or null")
+    else:
+        raise ValueError(f"unknown setting: {name!r}")
+    return value
+
+
+class Settings:
+    """The server-side state of the tab, kept in ``webui/firewall_state.json``.
+
+    ``ask_mode``         ``detonation`` | ``all`` | ``off`` (``ASK_MODES``)
+    ``isolated``         whether ISOLATED is on
+    ``outbound_before``  the ``DefaultOutboundAction`` before ISOLATED, to put it back
+    ``isolated_since``   epoch seconds ISOLATED went on, or None
+
+    The attributes can be read freely. ``set`` checks, stores and writes the file, and raises (leaving
+    everything as it was) when it cannot: whoever isolates the VM must know that the way back was not
+    remembered. A file that is missing or cannot be read gives the defaults; ``load_error`` then says why.
+    """
+
+    DEFAULTS = {"ask_mode": "detonation", "isolated": False, "outbound_before": None, "isolated_since": None}
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+        self.load_error: Optional[str] = None
+        self.ask_mode: str = self.DEFAULTS["ask_mode"]
+        self.isolated: bool = self.DEFAULTS["isolated"]
+        self.outbound_before: Optional[str] = self.DEFAULTS["outbound_before"]
+        self.isolated_since: Optional[float] = self.DEFAULTS["isolated_since"]
+        self.load()
+
+    def load(self) -> None:
+        """Read the file again; what it does not hold, or holds in a wrong shape, is the default."""
+        with self._lock:
+            self.load_error = None
+            data: Dict[str, Any] = {}
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    raise ValueError("not a JSON object")
+            except FileNotFoundError:
+                data = {}
+            except (OSError, ValueError) as e:
+                data = {}
+                self.load_error = f"{type(e).__name__}: {_first_line(e)}"
+                logger.warning("firewall settings unreadable (%s); using the defaults", self.load_error)
+            for name, default in self.DEFAULTS.items():
+                try:
+                    value = _check_setting(name, data[name]) if name in data else default
+                except ValueError as e:
+                    value = default
+                    self.load_error = self.load_error or str(e)
+                setattr(self, name, value)
+
+    def as_dict(self) -> Dict[str, Any]:
+        with self._lock:
+            return {name: getattr(self, name) for name in self.DEFAULTS}
+
+    def save(self) -> None:
+        with self._lock:
+            self._save()
+
+    def _save(self) -> None:
+        _write_json(self.path, {name: getattr(self, name) for name in self.DEFAULTS})
+
+    def set(self, **changes: Any) -> Dict[str, Any]:
+        """Change settings by name and write the file; returns the settings."""
+        checked = {name: _check_setting(name, value) for name, value in changes.items()}
+        with self._lock:
+            before = {name: getattr(self, name) for name in checked}
+            for name, value in checked.items():
+                setattr(self, name, value)
+            try:
+                self._save()
+            except BaseException:
+                for name, value in before.items():
+                    setattr(self, name, value)
+                raise
+            return {name: getattr(self, name) for name in self.DEFAULTS}
+
+
+# ---- collector -------------------------------------------------------------------------------
+
+
+class FirewallCollector:
+    """Reads the sources into a ``FirewallStore`` at every ``tick``; see the module docstring for the readers.
+
+    ``fast_window`` says whether a detonation window is open (a submission with a running PID, and
+    a minute after it): then ``interval`` is ``FAST_INTERVAL`` and the BITS channel is read as well.
+    ``settings`` is the tab's ``Settings`` (the caller's loop reads ``ask_mode`` from it).
+    """
+
+    def __init__(self, store: FirewallStore, settings: Settings, readers: Dict[str, Callable[..., Any]],
+                 fast_window: Callable[[], bool]):
+        self.store = store
+        self.settings = settings
+        self._readers = readers
+        self._fast_window = fast_window
+        self._cursors: Dict[str, Optional[int]] = {}
+        self._adders = {"connections": store.add_connections, "dns": store.add_dns,
+                        "processes": store.add_processes, "powershell": store.add_powershell,
+                        "firewall": store.add_firewall, "bits": store.add_bits}
+
+    def _in_window(self) -> bool:
+        try:
+            return bool(self._fast_window())
+        except Exception:
+            return False
+
+    def interval(self) -> float:
+        """Seconds to sleep before the next tick."""
+        return FAST_INTERVAL if self._in_window() else SLOW_INTERVAL
+
+    def tick(self) -> Dict[str, int]:
+        """One incremental read of every source; returns the number of new entries per source that was read."""
+        window = self._in_window()
+        added: Dict[str, int] = {}
+        for name in SOURCES:
+            if name == "bits" and not window:
+                self.store.set_status(name, "idle", "read only in a detonation window")
+                continue
+            try:
+                added[name] = self._read(name)
+            except Exception as e:  # a failing reader must not stop the others
+                self.store.set_status(name, "unavailable", _first_line(e))
+        return added
+
+    def _read(self, name: str) -> int:
+        reader = self._readers.get(name)
+        if reader is None:
+            raise RuntimeError(f"no reader for {name}")
+        previous = self._cursors.get(name)
+        result = reader(since=previous)
+        explicit = isinstance(result, tuple) and len(result) == 2
+        events, cursor = (result[0], result[1]) if explicit else (result, None)
+        events = [ev for ev in events or ()]
+        for ev in events:
+            if isinstance(ev, dict) and ev.get("error") and not ev.get("event_id"):
+                raise RuntimeError(str(ev["error"]))
+        if not explicit:
+            cursor = self._newest_record(events)
+            if events and cursor is None:
+                raise RuntimeError("the reader returned events without a record_id")
+            if cursor is not None and previous is not None:
+                cursor = max(cursor, previous)
+        count = self._adders[name](events)
+        if cursor is not None:
+            self._cursors[name] = cursor
+        self.store.set_status(name, "ok", "")
+        return count
+
+    @staticmethod
+    def _newest_record(events: List[Dict[str, Any]]) -> Optional[int]:
+        ids = []
+        for ev in events:
+            if isinstance(ev, dict):
+                fields = ev.get("fields")
+                record = _to_int(ev.get("record_id"))
+                if record is None and isinstance(fields, dict):
+                    record = _to_int(fields.get("record_id"))
+                if record is not None:
+                    ids.append(record)
+        return max(ids) if ids else None
