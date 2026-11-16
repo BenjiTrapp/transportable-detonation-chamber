@@ -137,13 +137,16 @@ class Env:
         except OSError:
             pass
 
-    def http_get(self, url: str, timeout: float, method: str = "GET") -> HttpResult:
+    def http_get(self, url: str, timeout: float, method: str = "GET",
+                 headers: Optional[Dict[str, str]] = None) -> HttpResult:
+        extra = headers or {}
         headers = {"User-Agent": "tdc-tool-updates"}
         if url.startswith(GITHUB_API):
             headers["Accept"] = "application/vnd.github+json"
             token = os.environ.get("TDC_GITHUB_TOKEN")
             if token:
                 headers["Authorization"] = "Bearer " + token
+        headers.update(extra)
         try:
             resp = requests.request(method, url, headers=headers, timeout=timeout, allow_redirects=True)
         except requests.RequestException as exc:
@@ -464,7 +467,8 @@ def _check_sysinternals(spec, env) -> Dict[str, Any]:
             recorded = _etag(data.get(spec.etag_key))
     except ValueError:
         recorded = ""
-    res = env.http_get(spec.url, HTTP_TIMEOUT, method="HEAD")
+    # the installer records the ETag of the uncompressed download; requests would otherwise get the gzip variant's
+    res = env.http_get(spec.url, HTTP_TIMEOUT, method="HEAD", headers={"Accept-Encoding": "identity"})
     if res.status == 0:
         return _entry(spec, recorded or None, None, "error", "Download server is not reachable")
     if res.status != 200:

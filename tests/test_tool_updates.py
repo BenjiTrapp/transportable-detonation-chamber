@@ -48,6 +48,7 @@ class FakeEnv:
         self.urls = dict(urls or {})
         self.run_calls = []
         self.http_calls = []
+        self.http_headers = []
         if internet:
             self.urls.setdefault(("GET", "https://api.github.com"), js({}))
         else:
@@ -70,8 +71,9 @@ class FakeEnv:
             raise result
         return result(args) if callable(result) else result
 
-    def http_get(self, url, timeout, method="GET"):
+    def http_get(self, url, timeout, method="GET", headers=None):
         self.http_calls.append((method, url))
+        self.http_headers.append(dict(headers or {}))
         result = self.urls.get((method, url))
         if result is None:
             return HttpResult(404, {}, None, "")
@@ -309,6 +311,15 @@ def test_sysinternals_etag_compare_and_missing_marker():
     assert entry["detail"] == "The server sent no ETag"
 
 
+def test_sysinternals_etag_head_requests_the_uncompressed_variant():
+    spec = spec_of("sysmon_config")
+    url = "https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml"
+    env = FakeEnv(paths=[spec.path], urls={("HEAD", url): HttpResult(200, {"etag": '"c"'}, None, "")})
+    tu.check_tool(spec, env)
+    assert env.http_calls == [("HEAD", url)]
+    assert env.http_headers == [{"Accept-Encoding": "identity"}]
+
+
 def test_sysmon_config_uses_its_own_etag():
     spec = spec_of("sysmon_config")
     url = "https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml"
@@ -539,6 +550,11 @@ class TestEnv:
         assert seen["headers"]["Authorization"] == "Bearer tok"
         tu.Env().http_get("https://download.sysinternals.com/files/Sysmon.zip", 5, method="HEAD")
         assert "Authorization" not in seen["headers"] and seen["method"] == "HEAD"
+        assert seen["headers"].get("Accept-Encoding") != "identity"
+        tu.Env().http_get("https://download.sysinternals.com/files/Sysmon.zip", 5, method="HEAD",
+                          headers={"Accept-Encoding": "identity"})
+        assert seen["headers"]["Accept-Encoding"] == "identity"
+        assert seen["headers"]["User-Agent"] == "tdc-tool-updates"
 
         def boom(*a, **k):
             raise tu.requests.ConnectionError("no route")
