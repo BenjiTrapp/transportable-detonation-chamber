@@ -163,8 +163,6 @@ def _clean_ip(value: Any) -> str:
         raise RuleError(f"not an address: {str(value)[:60]!r}")
     if addr.version == 6 and addr.ipv4_mapped is not None:
         addr = addr.ipv4_mapped
-    if addr.is_loopback or addr.is_unspecified or addr.is_multicast:
-        raise RuleError(f"{addr} is loopback, unspecified or multicast: blocking it would cut TDC's own traffic")
     return str(addr)
 
 
@@ -210,11 +208,18 @@ def _same_path(a: str, b: str) -> bool:
     return a.lower().replace("/", "\\") == b.lower().replace("/", "\\")
 
 
+def _is_local_only(address: str) -> bool:
+    addr = ipaddress.ip_address(address)
+    return addr.is_loopback or addr.is_unspecified or addr.is_multicast
+
+
 def _block_spec(image: Any, ip: Any, port: Any, protocol: Any) -> Dict[str, Any]:
     program = _clean_path(image, "image") if image is not None else None
     address = _clean_ip(ip) if ip is not None else None
     if program is None and address is None:
         raise RuleError("a block needs a program, an address, or both")
+    if program is None and _is_local_only(address):
+        raise RuleError(f"{address} is loopback, unspecified or multicast: a block for every program there would cut TDC's own traffic")
     number = None
     kind = None
     if port is not None:
@@ -365,9 +370,13 @@ def _replace(run, spec: Dict[str, Any]) -> None:
     _ok(run, "Remove", Name=stand_in["name"])
     if _create(run, stand_in) != 0:
         raise RuleError(f"{stand_in['name']} is already there")
-    _ok(run, "Remove", Name=spec["name"])
-    _create(run, spec)
-    _ok(run, "Remove", Name=stand_in["name"])
+    try:
+        _ok(run, "Remove", Name=spec["name"])
+        _create(run, spec)
+        _ok(run, "Remove", Name=stand_in["name"])
+    except RuleError as e:
+        raise RuleError(f"{stand_in['name']} is standing in for {spec['name']} and keeps its effect, so the rule may be "
+                        f"missing under its own name; replacing it failed: {_first_line(e)}") from e
 
 
 def _write(run, spec: Dict[str, Any]) -> Optional[str]:
@@ -395,7 +404,7 @@ def _write(run, spec: Dict[str, Any]) -> Optional[str]:
 
 
 def block(run, *, image: Optional[str] = None, ip: Optional[str] = None, port: Optional[int] = None,
-          protocol: Optional[str] = None, fetcher: Optional[str] = None) -> Dict[str, Any]:
+          protocol: Optional[str] = None, fetcher: Optional[str]) -> Dict[str, Any]:
     """Block outbound traffic and check that the block stands.
 
     ``image`` and ``ip``: this program to this address (the automatic block, always program-scoped). ``image`` alone:
@@ -409,10 +418,12 @@ def block(run, *, image: Optional[str] = None, ip: Optional[str] = None, port: O
     on; otherwise ``problem`` says why and the caller must not call the endpoint blocked. Raises ``RuleError`` when
     a profile is off (nothing is written then), when the arguments are unsound, or when the write fails.
 
-    Two blocks would cut TDC off from itself and are refused: an address that is loopback, unspecified or
-    multicast, and a block on the program ``fetcher``, because an explicit Block beats the fetcher's Allow rule
-    of ISOLATED. This module cannot know the fetcher's path, so **the caller must pass it** (the ``python.exe`` of the
-    web UI venv, the same path it gives ``isolate``); without it that guard is off.
+    Two blocks would cut TDC off from itself and are refused. A block for every program (no ``image``) on an address
+    that is loopback, unspecified or multicast: that is where the lockout lives, while a block that names a program
+    touches only that program, so a sample's own loopback, mDNS or SSDP traffic can be cut. And a block on the program
+    ``fetcher``, because an explicit Block beats the fetcher's Allow rule of ISOLATED. This module cannot know the
+    fetcher's path, so ``fetcher`` is a **required** keyword: the caller passes the ``python.exe`` of the web UI venv,
+    the same path it gives ``isolate``. ``fetcher=None`` is the explicit opt-out; leaving it out is a ``TypeError``.
     """
     spec = _block_spec(image, ip, port, protocol)
     if fetcher is not None and spec["image"] is not None and _same_path(spec["image"], _clean_path(fetcher, "fetcher")):
@@ -581,7 +592,9 @@ def isolate(run, on: bool, *, fetcher: str, settings) -> Dict[str, Any]:
     cannot be saved nothing is touched); the allow rules for loopback and for the program ``fetcher`` are written
     and read back; ``DefaultOutboundAction Block`` is set and read back. When a step fails, a fresh isolation is rolled
     back; if even that fails the marker stays and the message names ``scripts/tdc-unisolate.ps1``. Isolating while
-    isolated keeps the first memory. Returns ``{"isolated": True, "outbound_before", "verified": True}``.
+    isolated keeps the first memory; a marker without a recorded baseline (damaged) gets ``Allow`` as its baseline
+    and ``note`` says so, and a failure there is not rolled back either, because the isolation was already on.
+    Returns ``{"isolated": True, "outbound_before", "verified": True, "note"}``.
 
     ``settings.isolated`` is the only authority for "TDC is isolating"; nothing is inferred from the profiles. An
     isolation may start from an egress that is already Block: that is recorded as the baseline like any other.
@@ -605,11 +618,22 @@ def _isolate_on(run, fetcher: str, settings) -> Dict[str, Any]:
     if off:
         raise RuleError(_off_text(off))
     current = {s["name"]: s["outbound"] for s in states}
-    already = bool(settings.isolated) and settings.outbound_before is not None
-    remembered = settings.outbound_before if already else _encode_outbound(current)
+    marker = bool(settings.isolated)
+    already = marker and settings.outbound_before is not None
+    damaged = marker and settings.outbound_before is None
+    note = None
+    if already:
+        remembered = settings.outbound_before
+    elif damaged:
+        remembered = "Allow"
+        note = ("The ISOLATED marker had no recorded baseline, so Allow, the Windows default, is recorded as the way "
+                "back; the egress is Block now because TDC shut it, not because it was the VM's baseline.")
+    else:
+        remembered = _encode_outbound(current)
     if not already:
         try:
-            settings.set(outbound_before=remembered, isolated=True, isolated_since=time.time())
+            settings.set(outbound_before=remembered, isolated=True,
+                         isolated_since=(settings.isolated_since or time.time()) if damaged else time.time())
         except Exception as e:
             raise RuleError(f"the way back could not be saved ({type(e).__name__}: {_first_line(e)}); "
                             "nothing was changed") from e
@@ -624,14 +648,14 @@ def _isolate_on(run, fetcher: str, settings) -> Dict[str, Any]:
         if off:
             raise RuleError(_off_text(off))
     except Exception as e:
-        if not already:
+        if not marker:
             _roll_back(run, settings, current, changed_default, e)
             if isinstance(e, RuleError):
                 raise
             raise RuleError(f"isolating failed: {type(e).__name__}: {_first_line(e)}") from e
         raise RuleError(f"{_first_line(e)}. ISOLATED was on and stays as it is, which may cut TDC's fetcher off; "
                         f"run {UNISOLATE_SCRIPT} on the VM to open the egress.") from e
-    return {"isolated": True, "outbound_before": remembered, "verified": True}
+    return {"isolated": True, "outbound_before": remembered, "verified": True, "note": note}
 
 
 def _roll_back(run, settings, before: Dict[str, str], changed_default: bool, cause: BaseException) -> None:

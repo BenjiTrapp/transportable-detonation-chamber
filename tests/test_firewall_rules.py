@@ -166,7 +166,7 @@ LOOPBACK = "TDC-FW-ISO-loopback"
 
 def test_block_scopes_to_the_program_by_default():
     run = FakeRun()
-    r = rules_mod.block(run, image=r"C:\x\loader.exe", ip="1.2.3.4", port=443, protocol="tcp")
+    r = rules_mod.block(run, image=r"C:\x\loader.exe", ip="1.2.3.4", port=443, protocol="tcp", fetcher=PY)
     cmd = " ".join(run.calls[0])
     assert "-Program" in cmd and r"C:\x\loader.exe" in cmd
     assert "-RemoteAddress 1.2.3.4" in cmd and "-Action Block" in cmd
@@ -175,13 +175,13 @@ def test_block_scopes_to_the_program_by_default():
 
 def test_block_for_everyone_omits_the_program():
     run = FakeRun()
-    rules_mod.block(run, ip="1.2.3.4")
+    rules_mod.block(run, ip="1.2.3.4", fetcher=PY)
     assert "-Program" not in " ".join(run.calls[0])
 
 
 def test_block_is_verified_before_it_counts():
     run = FakeRun(get_rule_returns="")           # the rule is not there
-    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     assert r["verified"] is False
 
 
@@ -226,7 +226,7 @@ def test_rule_names_are_only_ours():
 
 def test_no_shell_and_no_interpolation_of_malware_text():
     run = FakeRun()
-    rules_mod.block(run, image=r'C:\x\a"; Remove-Item C:\ -Recurse #.exe', ip="1.2.3.4")
+    rules_mod.block(run, image=r'C:\x\a"; Remove-Item C:\ -Recurse #.exe', ip="1.2.3.4", fetcher=PY)
     assert all(isinstance(c, list) for c in run.calls)
     assert not any(";" in part for part in run.calls[0][1:] if part.startswith("-"))
 
@@ -237,7 +237,7 @@ def test_no_shell_and_no_interpolation_of_malware_text():
 def test_malware_text_travels_as_its_own_argument_to_a_file_and_never_to_a_command():
     hostile = r'C:\x\a"; Remove-Item C:\ -Recurse #.exe'
     run = FakeRun()
-    rules_mod.block(run, image=hostile, ip="1.2.3.4")
+    rules_mod.block(run, image=hostile, ip="1.2.3.4", fetcher=PY)
     for call in run.calls:
         assert "-Command" not in call and "-EncodedCommand" not in call
         assert call[0] == rules_mod.POWERSHELL and "-File" in call
@@ -251,7 +251,7 @@ def test_the_ops_the_module_emits_are_the_ops_the_script_accepts():
     script = open(os.path.join(ROOT, "webui", "firewall_rules.ps1"), encoding="utf-8").read()
     allowed = set(re.findall(r"'(\w+)'", re.search(r"ValidateSet\(([^)]*)\)\]\s*\[string\]\$Op", script).group(1)))
     run, settings = make()
-    rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+    rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     rules_mod.unblock(run, run.calls[0][run.calls[0].index("-Name") + 1])
     rules_mod.rules(run)
     rules_mod.enable_firewall(run)
@@ -265,7 +265,7 @@ def test_the_ops_the_module_emits_are_the_ops_the_script_accepts():
 def test_an_image_that_cannot_be_a_path_is_refused(image):
     run = FakeRun()
     with pytest.raises(rules_mod.RuleError):
-        rules_mod.block(run, image=image, ip="1.2.3.4")
+        rules_mod.block(run, image=image, ip="1.2.3.4", fetcher=PY)
     assert run.calls == []
 
 
@@ -277,13 +277,13 @@ def test_an_image_that_cannot_be_a_path_is_refused(image):
 def test_a_block_that_names_nothing_sound_is_refused_before_anything_runs(kw):
     run = FakeRun()
     with pytest.raises(rules_mod.RuleError):
-        rules_mod.block(run, **kw)
+        rules_mod.block(run, **kw, fetcher=PY)
     assert run.calls == []
 
 
 def test_an_address_is_written_the_way_the_classifier_reads_it():
     run = FakeRun()
-    r = rules_mod.block(run, image=IMAGE, ip="::ffff:1.2.3.4")
+    r = rules_mod.block(run, image=IMAGE, ip="::ffff:1.2.3.4", fetcher=PY)
     assert r["ip"] == "1.2.3.4" and "-RemoteAddress 1.2.3.4" in " ".join(run.calls[0])
 
 
@@ -291,7 +291,7 @@ def test_an_address_is_written_the_way_the_classifier_reads_it():
 
 
 def test_the_same_block_has_the_same_id_and_a_different_one_another():
-    ids = lambda **kw: rules_mod.block(FakeRun(), **kw)["rule_id"]       # noqa: E731
+    ids = lambda **kw: rules_mod.block(FakeRun(), **kw, fetcher=PY)["rule_id"]       # noqa: E731
     a = ids(image=IMAGE, ip="1.2.3.4", port=443, protocol="tcp")
     assert a == ids(image=IMAGE.upper(), ip="1.2.3.4", port=443, protocol="TCP")
     assert re.fullmatch(r"TDC-FW-[0-9a-f]{12}", a)
@@ -305,14 +305,14 @@ def test_the_same_block_has_the_same_id_and_a_different_one_another():
 
 
 def test_a_program_scoped_and_an_everyone_rule_at_one_address_are_two_rules():
-    program = rules_mod.block(FakeRun(), image=IMAGE, ip="1.2.3.4")
-    everyone = rules_mod.block(FakeRun(), ip="1.2.3.4")
+    program = rules_mod.block(FakeRun(), image=IMAGE, ip="1.2.3.4", fetcher=PY)
+    everyone = rules_mod.block(FakeRun(), ip="1.2.3.4", fetcher=PY)
     assert program["rule_id"] != everyone["rule_id"]
 
 
 def test_a_blocked_process_without_address_is_program_only():
     run = FakeRun()
-    r = rules_mod.block(run, image=IMAGE)
+    r = rules_mod.block(run, image=IMAGE, fetcher=PY)
     cmd = " ".join(run.calls[0])
     assert "-Program" in cmd and "-RemoteAddress" not in cmd and r["verified"] is True
 
@@ -322,7 +322,7 @@ def test_a_blocked_process_without_address_is_program_only():
 
 def test_a_written_rule_that_stands_is_verified_and_says_what_it_is():
     run = FakeRun()
-    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", port=443, protocol="tcp")
+    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", port=443, protocol="tcp", fetcher=PY)
     assert r == {"rule_id": r["rule_id"], "name": r["rule_id"], "image": IMAGE, "ip": "1.2.3.4", "port": 443,
                  "protocol": "tcp", "verified": True, "problem": None}
     assert run.ops() == ["Create", "Get", "Profiles"]
@@ -331,21 +331,21 @@ def test_a_written_rule_that_stands_is_verified_and_says_what_it_is():
 
 def test_a_rule_written_but_disabled_is_not_blocking():
     run = FakeRun(disable_new=True)
-    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     assert r["verified"] is False and "disabled" in r["problem"]
     assert rules_mod.verify(run, r["rule_id"]) is False
 
 
 def test_a_rule_that_stands_but_no_longer_bites_because_a_profile_went_off_is_not_verified():
     run = FakeRun()
-    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     run.profiles["Public"] = False
     assert rules_mod.verify(run, r["rule_id"]) is False
 
 
 def test_verify_fails_closed_when_it_cannot_read_the_profiles():
     run = FakeRun()
-    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     run.fail["Profiles"] = (1, "access denied")
     assert rules_mod.verify(run, r["rule_id"]) is False
 
@@ -359,15 +359,15 @@ def test_verify_of_an_allow_rule_is_false_it_is_not_a_block():
 def test_block_refuses_while_a_profile_is_off_and_writes_nothing():
     run = FakeRun(profiles={"Domain": True, "Private": True, "Public": False})
     with pytest.raises(rules_mod.RuleError) as e:
-        rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+        rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     assert "firewall" in str(e.value).lower() and "Public" in str(e.value)
     assert run.rules == {}
 
 
 def test_blocking_the_same_thing_twice_leaves_one_rule_and_does_not_open_a_gap():
     run = FakeRun()
-    first = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", port=443, protocol="tcp")
-    second = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", port=443, protocol="tcp")
+    first = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", port=443, protocol="tcp", fetcher=PY)
+    second = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", port=443, protocol="tcp", fetcher=PY)
     assert first == second and second["verified"] is True
     assert len(run.rules) == 1
     assert "Remove" not in run.ops()
@@ -375,9 +375,9 @@ def test_blocking_the_same_thing_twice_leaves_one_rule_and_does_not_open_a_gap()
 
 def test_a_rule_with_our_id_but_other_parameters_is_replaced_and_checked():
     run = FakeRun()
-    first = rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+    first = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     run.rules[first["rule_id"]]["RemoteAddress"] = ["9.9.9.9"]       # drifted, or tampered with
-    again = rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+    again = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     assert again["verified"] is True
     assert run.rules[first["rule_id"]]["RemoteAddress"] == ["1.2.3.4"]
     assert "Remove" in run.ops()
@@ -385,25 +385,25 @@ def test_a_rule_with_our_id_but_other_parameters_is_replaced_and_checked():
 
 def test_a_rule_with_our_id_that_is_disabled_is_replaced_not_trusted():
     run = FakeRun()
-    first = rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+    first = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     run.rules[first["rule_id"]]["Enabled"] = False
-    again = rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+    again = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     assert again["verified"] is True and run.rules[first["rule_id"]]["Enabled"] is True
 
 
 def test_parameters_that_differ_in_the_spelling_windows_gives_back_still_match():
     run = FakeRun()
-    first = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", port=443, protocol="tcp")
+    first = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", port=443, protocol="tcp", fetcher=PY)
     view = run.rules[first["rule_id"]]
     view.update(Program=IMAGE.upper(), RemoteAddress=["1.2.3.4/255.255.255.255"], RemotePort=["443"], Protocol="6")
-    assert rules_mod.block(run, image=IMAGE, ip="1.2.3.4", port=443, protocol="tcp")["verified"] is True
+    assert rules_mod.block(run, image=IMAGE, ip="1.2.3.4", port=443, protocol="tcp", fetcher=PY)["verified"] is True
     assert "Remove" not in run.ops()
 
 
 def test_a_failed_write_is_an_error_not_a_quiet_false():
     run = FakeRun(fail={"Create": (1, "The parameter is incorrect.\nmore")})
     with pytest.raises(rules_mod.RuleError) as e:
-        rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+        rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     assert "incorrect" in str(e.value)
 
 
@@ -411,7 +411,7 @@ def test_a_runner_that_raises_becomes_a_rule_error():
     def run(args):
         raise FileNotFoundError("powershell")
     with pytest.raises(rules_mod.RuleError):
-        rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+        rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
 
 
 # ---- unblock and the list -------------------------------------------------------------------
@@ -419,7 +419,7 @@ def test_a_runner_that_raises_becomes_a_rule_error():
 
 def test_unblock_removes_the_rule_and_makes_sure_it_is_gone():
     run = FakeRun()
-    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     rules_mod.unblock(run, r["rule_id"])
     assert run.rules == {} and run.ops()[-2:] == ["Remove", "Get"]
 
@@ -430,7 +430,7 @@ def test_unblock_of_a_rule_that_is_not_there_is_not_an_error():
 
 def test_unblock_fails_when_the_rule_stays():
     run = FakeRun()
-    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     run.op_Remove = lambda p: (0, "", "")
     with pytest.raises(rules_mod.RuleError):
         rules_mod.unblock(run, r["rule_id"])
@@ -447,9 +447,9 @@ def test_unblock_touches_nothing_that_is_not_one_of_our_block_rules(name):
 
 def test_rules_gives_the_keys_the_classifier_looks_up():
     run = FakeRun()
-    a = rules_mod.block(run, image=r"C:\X\Loader.exe", ip="1.2.3.4", port=443, protocol="tcp")
-    b = rules_mod.block(run, ip="5.6.7.8")
-    c = rules_mod.block(run, image=r"C:\x\other.exe")
+    a = rules_mod.block(run, image=r"C:\X\Loader.exe", ip="1.2.3.4", port=443, protocol="tcp", fetcher=PY)
+    b = rules_mod.block(run, ip="5.6.7.8", fetcher=PY)
+    c = rules_mod.block(run, image=r"C:\x\other.exe", fetcher=PY)
     listed = rules_mod.rules(run)
     by_id = {r["rule_id"]: r for r in listed}
     assert by_id[a["rule_id"]]["key"] == firewall.rule_key(r"C:\X\Loader.exe", "1.2.3.4", 443)
@@ -465,7 +465,7 @@ def test_rules_gives_the_keys_the_classifier_looks_up():
 
 def test_a_listed_rule_blocks_only_when_it_stands_and_the_profiles_are_on():
     run = FakeRun()
-    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     assert [x["blocking"] for x in rules_mod.rules(run)] == [True]
     run.rules[r["rule_id"]]["Enabled"] = False
     assert [x["blocking"] for x in rules_mod.rules(run)] == [False]
@@ -697,7 +697,7 @@ def test_isolate_needs_a_fetcher():
 def test_a_block_written_while_isolated_stands_and_survives_leaving_it():
     run, settings = make(outbound="Allow")
     rules_mod.isolate(run, True, fetcher=PY, settings=settings)
-    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     assert r["verified"] is True
     rules_mod.isolate(run, False, fetcher=PY, settings=settings)
     assert list(run.rules) == [r["rule_id"]]
@@ -855,8 +855,8 @@ def test_a_marker_without_a_baseline_says_it_assumed_allow():
 
 def test_two_rules_that_share_a_key_come_back_as_two_entries_with_their_own_protocol():
     run = FakeRun()
-    tcp = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", port=443, protocol="tcp")
-    udp = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", port=443, protocol="udp")
+    tcp = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", port=443, protocol="tcp", fetcher=PY)
+    udp = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", port=443, protocol="udp", fetcher=PY)
     assert tcp["rule_id"] != udp["rule_id"]
     listed = {r["rule_id"]: r for r in rules_mod.rules(run)}
     assert set(listed) == {tcp["rule_id"], udp["rule_id"]}
@@ -913,7 +913,7 @@ def test_the_stand_in_goes_with_isolated_and_can_be_unblocked_by_hand():
     run.rules[FETCHER + "-new"] = run.view(FETCHER + "-new", Action="Allow", Program=PY)
     rules_mod.isolate(run, False, fetcher=PY, settings=settings)
     assert run.rules == {}
-    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+    r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     run.rules[r["rule_id"] + "-new"] = run.view(r["rule_id"] + "-new")
     rules_mod.unblock(run, r["rule_id"] + "-new")
     assert r["rule_id"] + "-new" not in run.rules
@@ -921,23 +921,41 @@ def test_the_stand_in_goes_with_isolated_and_can_be_unblocked_by_hand():
 
 def test_replacing_a_block_does_not_open_a_gap_either():
     run = FakeRun()
-    first = rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+    first = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     run.rules[first["rule_id"]]["Enabled"] = False
     run.standing.clear()
-    rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+    rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     assert all(any(a == "Block" and prog == IMAGE for _, a, prog in moment) for moment in run.standing)
 
 
 # ---- the lockout targets ---------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("ip", ["127.0.0.1", "127.8.9.1", "::1", "0.0.0.0", "::", "224.0.0.251", "ff02::fb", "::ffff:127.0.0.1"])
-@pytest.mark.parametrize("image", [None, IMAGE])
-def test_an_address_that_would_cut_tdc_off_from_itself_is_refused(ip, image):
+LOCAL_ONLY = ["127.0.0.1", "127.8.9.1", "::1", "0.0.0.0", "::", "224.0.0.251", "239.255.255.250", "ff02::fb", "::ffff:127.0.0.1"]
+
+
+@pytest.mark.parametrize("ip", LOCAL_ONLY)
+def test_a_block_for_every_program_on_an_address_that_would_cut_tdc_off_from_itself_is_refused(ip):
     run = FakeRun()
     with pytest.raises(rules_mod.RuleError):
-        rules_mod.block(run, image=image, ip=ip)
+        rules_mod.block(run, ip=ip, fetcher=PY)
     assert run.calls == []
+
+
+@pytest.mark.parametrize("ip", LOCAL_ONLY)
+def test_a_block_that_names_a_program_may_cut_that_programs_loopback_and_multicast(ip):
+    run = FakeRun()
+    r = rules_mod.block(run, image=IMAGE, ip=ip, fetcher=PY)
+    assert r["verified"] is True and r["ip"] == ip.replace("::ffff:", "")
+    assert "-Program" in " ".join(run.calls[0])
+
+
+def test_the_fetcher_is_required_and_none_is_the_explicit_opt_out():
+    run = FakeRun()
+    with pytest.raises(TypeError):
+        rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+    assert run.calls == []
+    assert rules_mod.block(run, image=PY, ip="1.2.3.4", fetcher=None)["verified"] is True
 
 
 def test_a_block_on_the_fetcher_itself_is_refused_when_the_caller_names_it():
@@ -974,7 +992,7 @@ def test_the_system_tools_are_called_by_absolute_path():
     assert ntpath.isabs(rules_mod.POWERSHELL) and rules_mod.POWERSHELL.lower().endswith(r"\system32\windowspowershell\v1.0\powershell.exe")
     assert ntpath.isabs(rules_mod.TASKKILL) and rules_mod.TASKKILL.lower().endswith(r"\system32\taskkill.exe")
     run = FakeRun()
-    rules_mod.block(run, image=IMAGE, ip="1.2.3.4")
+    rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     rules_mod.kill(run, 4812)
     assert all(ntpath.isabs(c[0]) for c in run.calls)
 
@@ -982,11 +1000,11 @@ def test_the_system_tools_are_called_by_absolute_path():
 @pytest.mark.parametrize("port", ["\u0664\u0664\u0663", "\uff14\uff14\uff13", "\u00b2"])
 def test_a_port_in_other_digits_is_refused(port):
     with pytest.raises(rules_mod.RuleError):
-        rules_mod.block(FakeRun(), ip="1.2.3.4", port=port, protocol="tcp")
+        rules_mod.block(FakeRun(), ip="1.2.3.4", port=port, protocol="tcp", fetcher=PY)
 
 
 def test_a_port_in_ascii_digits_as_text_still_works():
-    assert rules_mod.block(FakeRun(), ip="1.2.3.4", port="443", protocol="tcp")["port"] == 443
+    assert rules_mod.block(FakeRun(), ip="1.2.3.4", port="443", protocol="tcp", fetcher=PY)["port"] == 443
 
 
 # ---- the two halves agree on the names -------------------------------------------------------
@@ -999,8 +1017,8 @@ def test_every_parameter_the_module_emits_is_declared_by_the_script():
     assert {"Op", "Name", "Program", "RemoteAddress", "RemotePort", "Protocol", "Action", "Profiles",
             "DefaultOutboundAction"} <= declared
     run, settings = make(outbound={"Domain": "Block", "Private": "Allow", "Public": "Allow"})
-    rules_mod.block(run, image=IMAGE, ip="1.2.3.4", port=443, protocol="tcp")
-    rules_mod.block(run, image=IMAGE)
+    rules_mod.block(run, image=IMAGE, ip="1.2.3.4", port=443, protocol="tcp", fetcher=PY)
+    rules_mod.block(run, image=IMAGE, fetcher=PY)
     rules_mod.rules(run)
     rules_mod.enable_firewall(run)
     rules_mod.isolate(run, True, fetcher=PY, settings=settings)
@@ -1013,3 +1031,65 @@ def test_every_parameter_the_module_emits_is_declared_by_the_script():
             assert all(rest[i].startswith("-") for i in range(0, len(rest), 2))
     assert {"Profiles", "RemotePort", "Protocol", "Program", "RemoteAddress", "DefaultOutboundAction"} <= emitted
     assert emitted <= declared, emitted - declared
+
+
+# ---- a failed replacement says what stands -------------------------------------------------
+
+
+def test_a_block_whose_replacement_fails_says_the_stand_in_is_standing():
+    run = FakeRun()
+    first = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
+    run.rules[first["rule_id"]]["Enabled"] = False
+    real = run.op_Create
+    seen = {"n": 0}
+
+    def create(p):
+        seen["n"] += 1
+        return (1, "", "denied") if seen["n"] == 3 else real(p)      # the exists check, the stand-in, then the new rule fails
+    run.op_Create = create
+    with pytest.raises(rules_mod.RuleError) as e:
+        rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
+    text = str(e.value)
+    assert first["rule_id"] + "-new" in text and "standing in" in text and "denied" in text
+    assert run.rules[first["rule_id"] + "-new"]["Enabled"] is True
+    assert first["rule_id"] not in run.rules
+    assert [x["blocking"] for x in rules_mod.rules(run)] == [True]          # the stand-in blocks, and rules() says so
+
+
+def test_the_stand_in_is_named_on_the_isolate_path_too():
+    run, settings = make(outbound="Allow")
+    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+    tamper_with_the_fetcher_rule(run)
+    real = run.op_Create
+    seen = {"n": 0}
+
+    def create(p):
+        seen["n"] += 1
+        return (1, "", "denied") if seen["n"] == 4 else real(p)
+    run.op_Create = create
+    with pytest.raises(rules_mod.RuleError) as e:
+        rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+    assert "TDC-FW-ISO-fetcher-new is standing in" in str(e.value) and "scripts/tdc-unisolate.ps1" in str(e.value)
+
+
+# ---- a damaged marker ----------------------------------------------------------------------
+
+
+def test_a_marker_without_a_baseline_gets_allow_and_the_note_says_tdc_shut_it():
+    run, settings = make(outbound="Block")
+    settings.isolated, settings.outbound_before, settings.isolated_since = True, None, 123.0
+    out = rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+    assert settings.outbound_before == "Allow" and out["outbound_before"] == "Allow"
+    assert "no recorded baseline" in out["note"] and "because TDC shut it" in out["note"]
+    assert settings.isolated_since == 123.0
+    left = rules_mod.isolate(run, False, fetcher=PY, settings=settings)
+    assert set(run.outbound.values()) == {"Allow"} and left["note"] is None
+
+
+def test_a_failure_with_a_damaged_marker_is_not_rolled_back_to_open():
+    run, settings = make(outbound="Block", fail_once={"SetDefaultOutbound": (1, "denied")})
+    settings.isolated, settings.outbound_before = True, None
+    with pytest.raises(rules_mod.RuleError) as e:
+        rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+    assert "scripts/tdc-unisolate.ps1" in str(e.value)
+    assert settings.isolated is True and set(run.outbound.values()) == {"Block"}
