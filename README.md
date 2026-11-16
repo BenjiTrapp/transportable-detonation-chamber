@@ -174,7 +174,7 @@ and the content in the full width:
   tiles get neon borders (Cyberpunk) or a glowing accent bar at the top left
   (Telemetry).
 
-The themes differ in their colours only: Telemetry paints the page with a
+The themes differ in colours and effects: Telemetry paints the page with a
 40 px grid, glows at the top and left and fine scanlines (they never take a
 click, and nothing moves), the cards with a gradient, the tab titles in a
 cyan–violet–magenta gradient, the kicker line in acid green, and the active
@@ -185,8 +185,8 @@ Both themes share the card controls:
 
 - **(i)** beside a card or section title explains it in a sentence or two;
   Esc or a click elsewhere closes the explanation.
-- **CHART / TABLE** shows the numbers of a chart as a table: the sidebar
-  timeline, the Tracing timeline and severity bar, the file structure of the
+- **CHART / TABLE** shows the numbers of a chart as a table: the timeline
+  in the drawer, the Tracing timeline and severity bar, the file structure of the
   PE/ELF binary analysis, the file map strip of the PE analysis and every
   chart card under [Charts](#charts) (not the sparklines in the tiles). The
   choice holds per card until the page is reloaded.

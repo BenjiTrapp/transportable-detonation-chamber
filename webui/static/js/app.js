@@ -308,7 +308,7 @@ function computeVisibleTabs(widths, available, moreWidth, activeIndex) {
 
 // Tabs that do not fit into the top bar get .tab-overflow (hidden)
 // and an entry in the "…" menu. Runs when the room changes, after every tab
-// switch and on a theme switch; in Classic it only clears what it set.
+// switch and on a theme switch; if the tab bar is not in the top bar it only clears what it set.
 function updateTabOverflow() {
     const area = document.getElementById('topbar-nav');
     const wrap = document.getElementById('topbar-more-wrap');

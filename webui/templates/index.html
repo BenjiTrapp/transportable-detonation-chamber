@@ -11,7 +11,7 @@
     <!-- The stored theme is applied before the styles and the first paint, so a
          page loaded in Cyberpunk never shows the other theme first (setTheme in app.js) -->
     <script>
-        // Cyberpunk is the default; only a stored "classic" keeps Classic.
+        // Cyberpunk is the default; only a stored "classic" (the Telemetry theme) keeps it.
         try {
             document.documentElement.dataset.theme =
                 localStorage.getItem('tdc-theme') === 'classic' ? 'classic' : 'cyberpunk';
@@ -32,8 +32,8 @@
         </div>
     </div>
     <div id="app">
-        <!-- Top bar of the Cyberpunk theme (hidden in Classic). The tab bar and
-             the service status move in here when Cyberpunk is on (applyThemeLayout);
+        <!-- Top bar of both themes. The tab bar and
+             the service status move in here at start-up and on a theme switch (applyThemeLayout);
              the sidebar becomes a drawer that ☰ PROCESSES slides in. Tabs that do
              not fit go into the "…" menu (updateTabOverflow). -->
         <header id="topbar">
@@ -1342,7 +1342,7 @@
                     <p>The <strong>Rizin</strong> tab opens a submitted sample, a dump, an upload or a path in rizin 0.9.1 on the VM and only reads the file: the functions, the disassembly, the control flow graph, rz-ghidra's C and the bytes all show one current address, which a click or a seek moves, with a console for rizin commands below. The server lets the console start no programs and touch no other files; renames and comments are kept in a project for the file. Each browser tab has a session of its own, three at most at a time.</p>
 
                     <h4>Themes and card controls</h4>
-                    <p><strong>✶</strong> switches between the Classic and the Cyberpunk theme at once, without reloading the page: the open tab, an open detail view, filters and drilldown steps, the graph and running interception sessions stay as they are. This browser remembers the choice; without one the UI starts in Cyberpunk, the default. In Classic ✶ sits below "? Help". In Cyberpunk it is at the right end of the top bar, where ☰ PROCESSES opens the process list and the timeline, "…" holds the tabs that do not fit and "n/m ONLINE" lists the five services of the status row (Rustinel, Sysmon, Fibratus, Agent, LitterBox); the SERVICES ONLINE tile also counts the Detonator.</p>
+                    <p><strong>✶</strong> switches between the Telemetry and the Cyberpunk theme at once, without reloading the page: the open tab, an open detail view, filters and drilldown steps, the graph and running interception sessions stay as they are. This browser remembers the choice; without one the UI starts in Cyberpunk, the default. Both themes have the same top bar: ✶ is at its right end (and again below "? Help" in the drawer), ☰ PROCESSES opens the process list and the timeline, "…" holds the tabs that do not fit and "n/m ONLINE" lists the five services of the status row (Rustinel, Sysmon, Fibratus, Agent, LitterBox); the SERVICES ONLINE tile also counts the Detonator.</p>
                     <p>In both themes <strong>(i)</strong> beside a title explains its card, <strong>CHART / TABLE</strong> shows the numbers of a chart as a table, a click on a column head sorts the table (a second click reverses the order), and a dashboard tile opens what it counts.</p>
 
                     <h4>Charts</h4>
