@@ -27,6 +27,9 @@ import threading
 import subprocess
 import sys
 import weakref
+import http.client
+import socket
+import ssl
 from pathlib import Path
 from flask import Flask, render_template, jsonify, request, send_from_directory, g
 from werkzeug.utils import secure_filename
@@ -46,6 +49,11 @@ import tool_updates
 # LOGS tab: event store, source parsers and the search language.
 import log_search
 import log_store
+# FIREWALL tab: offline geo, assessment, event store, enforcement.
+import firewall
+import firewall_rules
+import firewall_store
+import geoip
 
 app = Flask(__name__)
 
@@ -61,7 +69,7 @@ app = Flask(__name__)
 #     and then counts as same-origin - it could read every response. The Host
 #     header still says evil.example, so only IP literals, localhost and the
 #     names in TDC_ALLOWED_HOSTS are served.
-from urllib.parse import urlparse as _urlparse
+from urllib.parse import urlparse as _urlparse, urljoin as _urljoin
 import ipaddress as _ipaddress
 
 _ALLOWED_HOSTNAMES = {"localhost"} | {
@@ -102,7 +110,8 @@ except Exception as _exc:   # a damaged log file must not stop the web UI
 _NOT_LOGGED_PREFIXES = ("/static/", "/favicon")
 # The regular polls of the UI itself: these exact paths, and everything under /api/logs/.
 # (/api/alerts/<id> is a user action, not a poll.)
-_POLL_PATHS = frozenset(("/api/status", "/api/updates", "/api/alerts", "/api/health", "/api/rustinel"))
+_POLL_PATHS = frozenset(("/api/status", "/api/updates", "/api/alerts", "/api/health", "/api/rustinel",
+                         "/api/firewall/pending", "/api/firewall/connections"))
 _POLL_PREFIX = "/api/logs/"
 _LOG_TEXT_LIMIT = 2000
 
@@ -4836,6 +4845,8 @@ def _readable_roots():
         # Memory dumps and the artifacts extracted from them
         PROCESSDUMP_DIR,
         RIZIN_UPLOAD_DIR,
+        # Secured stage-2 samples of the FIREWALL tab (read only: it is not a write target)
+        CAPTURE_DIR,
     ]
 
 
@@ -10537,8 +10548,14 @@ def _close_all_rizin():
         manager.shutdown()
 
 
+ISOLATED_UPDATE_MESSAGE = ("Isolated mode is on: tool updates need the network and would run into TDC's own "
+                           "block. Leave ISOLATED in the FIREWALL tab first.")
+
+
 def _update_preconditions():
     """Why an update must not start now, or None. Runs without the manager lock."""
+    if _fw_settings.isolated:
+        return ISOLATED_UPDATE_MESSAGE
     resp = _probe_http(f"{DETONATOR_AGENT_API}/api/lock/status")
     if resp is not None:
         try:
@@ -10585,7 +10602,9 @@ def api_updates():
 
 @app.route("/api/updates/check", methods=["POST"])
 def api_updates_check():
-    """Start an update check in the background (202; 409 while busy)."""
+    """Start an update check in the background (202; 409 while busy or while ISOLATED is on)."""
+    if _fw_settings.isolated:
+        return jsonify({"error": ISOLATED_UPDATE_MESSAGE}), 409
     status, body = _get_update_manager().start_check()
     return jsonify(body), status
 
@@ -10641,7 +10660,9 @@ def _update_check_loop(hours, sleep=time.sleep, rounds=None):
         done += 1
         try:
             manager = _get_update_manager()
-            if manager.snapshot()["mode"] == "idle":
+            if _fw_settings.isolated:
+                log.info("Daily tool update check skipped: Isolated mode is on")
+            elif manager.snapshot()["mode"] == "idle":
                 manager.start_check()
         except Exception as exc:
             log.warning("Daily tool update check failed: %s", exc)
@@ -10887,6 +10908,1203 @@ def api_logs_sources():
     return _json_response(_logs.sources())
 
 
+# --- FIREWALL tab: readers, decisions, guarded fetch, capture store and routes ---------------
+# firewall_store keeps the events, firewall judges them, firewall_rules acts; this block is the wiring.
+# The collector thread (tick + sweep) never waits for a fetch: a fetch runs on _fw_executor.
+CAPTURE_DIR = r"C:\tdc\samples"
+CAPTURES_FILE = os.path.join(APP_DIR, "captures.json")
+PENDING_FILE = os.path.join(APP_DIR, "pending.json")
+FIREWALL_STATE_FILE = os.path.join(APP_DIR, "firewall_state.json")
+MAX_CAPTURES = 500
+FETCH_MAX_BYTES = 64 * 1024 * 1024
+FETCH_TIMEOUT = 30
+FETCH_MAX_REDIRECTS = 3
+FETCH_CHUNK = 64 * 1024
+FETCH_DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36")
+FIREWALL_DECIDE_SECONDS = 30
+FIREWALL_FINDING_WINDOW_S = 1800       # the connections a sweep looks at for a download (the first sweep: all)
+FIREWALL_FINDING_FRESH_S = 3600        # an older finding is marked but no longer asked about
+FIREWALL_WINDOW_GRACE_S = 60           # a detonation window stays open this long after its process ended
+FIREWALL_RULES_TTL_S = 5
+FIREWALL_MARK_LIMIT = 5000
+
+_fw_store = firewall_store.FirewallStore()
+_fw_settings = firewall_store.Settings(FIREWALL_STATE_FILE)
+_fw_pending = firewall_store.PendingStore(PENDING_FILE)
+_fw_runner = firewall_rules.run_powershell        # run(args) -> (rc, out, err); tests swap it
+_fw_startup = None                                # what startup_state said at start (None before it ran)
+_fw_downloads = {}                                # (pid, dst_ip, dst_port) -> epoch of a download finding
+_fw_scan_state = {"done": False}
+_fw_decision_lock = threading.Lock()              # a decision and its firewall effect are one step
+_fw_rules_lock = threading.Lock()
+_fw_rules_cache = None                            # (epoch, rules | None, error | None)
+_fw_windows_lock = threading.Lock()
+_fw_windows_cache = (0.0, {})
+_fw_window_alive = {}                             # submission id -> last time its process was seen running
+_fw_ioc_cache = (0.0, (frozenset(), frozenset()))
+_captures_lock = threading.Lock()
+_fw_executor = None                               # runs the fetches; created on first use, tests inject one
+
+
+def _fw_int(value):
+    try:
+        return None if isinstance(value, bool) else int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _fw_iso(epoch):
+    if isinstance(epoch, bool) or not isinstance(epoch, (int, float)) or not math.isfinite(epoch):
+        return None
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).isoformat(
+        timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _fw_json(payload, status=200):
+    """``_json_response`` with every long string cut the way the LOGS routes do it."""
+    return _json_response(_cap_log_value(payload)[0], status)
+
+
+def _fw_error(message, status):
+    return _fw_json({"error": message}, status)
+
+
+def _firewall_decide_seconds():
+    """TDC_FIREWALL_DECIDE_SECONDS: seconds an open decision waits before TDC acts (default 30).
+
+    0 means fetch at once without asking. Junk, nan, inf and negative numbers count as the default; the
+    value is held to an hour."""
+    try:
+        seconds = float(os.environ.get("TDC_FIREWALL_DECIDE_SECONDS", FIREWALL_DECIDE_SECONDS))
+    except ValueError:
+        return float(FIREWALL_DECIDE_SECONDS)
+    if not math.isfinite(seconds) or seconds < 0:
+        return float(FIREWALL_DECIDE_SECONDS)
+    return min(seconds, 3600.0)
+
+
+def _fw_fetcher_path():
+    """The program TDC's own fetch runs as: the Allow rule of ISOLATED, and the program that is never blocked."""
+    return sys.executable
+
+
+# ---- detonation windows ---------------------------------------------------------------------
+
+
+def _process_started_at(pid):
+    """Creation time (epoch) of the running process ``pid``; None when there is none (and off Windows)."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    handle = kernel32.OpenProcess(0x1000, False, int(pid))      # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+        code = wintypes.DWORD()
+        if not kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                        ctypes.byref(kernel), ctypes.byref(user)):
+            return None
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:   # STILL_ACTIVE
+            return None
+        return ((created.dwHighDateTime << 32) | created.dwLowDateTime) / 1e7 - 11644473600
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _firewall_open_windows(now=None):
+    """``{pid: submission id}`` of the detonation windows that are open now.
+
+    A window is open while the submission's process runs, and ``FIREWALL_WINDOW_GRACE_S`` after it was last seen
+    running (a dropper that ends within a second of its submission counts for that long, too). It is *not* every
+    submission ever recorded: the BITS test of ``download_findings`` takes these PIDs as "a submission is
+    active", and a six-hour-old one would make every BITS job of the day a detonation.
+    """
+    global _fw_windows_cache
+    now = time.time() if now is None else now
+    with _fw_windows_lock:
+        stamp, cached = _fw_windows_cache
+        if 0 <= now - stamp < 1.0:
+            return dict(cached)
+        try:
+            with submissions_lock:
+                subs = _load_submissions()
+        except Exception:
+            subs = []
+        newest = {}
+        for sub in sorted((s for s in subs if isinstance(s, dict)), key=lambda s: _to_epoch(s.get("timestamp")) or 0):
+            try:
+                pid = int(sub.get("agent_pid"))
+            except (TypeError, ValueError):
+                continue
+            start = _to_epoch(sub.get("timestamp"))
+            if start is not None and 0 <= now - start <= _AGENT_PID_WINDOW and pid > 0:
+                newest[pid] = (start, str(sub.get("id") or pid))
+        open_windows = {}
+        for pid, (start, sub_id) in newest.items():
+            try:
+                began = _process_started_at(pid)
+            except Exception:
+                began = None
+            if began is not None and began <= start + 30:        # the process the submission started, not a later one
+                _fw_window_alive[sub_id] = now
+            last = _fw_window_alive.get(sub_id, start)
+            if now - last <= FIREWALL_WINDOW_GRACE_S:
+                open_windows[pid] = sub_id
+        for sub_id in set(_fw_window_alive) - {v[1] for v in newest.values()}:
+            del _fw_window_alive[sub_id]
+        _fw_windows_cache = (now, dict(open_windows))
+        return open_windows
+
+
+# ---- readers (Windows) ----------------------------------------------------------------------
+
+
+def _fw_newest_record_id(log):
+    """The newest EventRecordID of a log (0 when it is empty): what a reader reports when no event came back."""
+    raw, proc = _wevtutil_query(log, None, count=1, newest_first=True, timeout=30)
+    if proc.returncode != 0 and not proc.stdout:
+        msg = _decode_console(proc.stderr).strip()
+        raise RuntimeError(msg.splitlines()[0] if msg else f"wevtutil failed ({proc.returncode})")
+    ids = [int(m) for m in _RECORD_ID.findall(raw or "")]
+    return max(ids) if ids else 0
+
+
+def _fw_read_record_log(log, event_filter, since, parse):
+    """``(events, newest record id of the log)`` of an event log read by EventRecordID.
+
+    When events came back the id is the newest of them (a cut-off read must not skip the rest). When none did it
+    is the newest id of the *log*, so that the collector sees a cleared log: its ids start again below its cursor.
+    """
+    if not _IS_WINDOWS:
+        raise RuntimeError(_WINDOWS_ONLY_HINT)
+    if since is None:
+        query = f"*[System[{event_filter} and TimeCreated[timediff(@SystemTime) <= 86400000]]]"
+        newest_first = True
+    else:
+        query = f"*[System[{event_filter} and EventRecordID>{int(since)}]]"
+        newest_first = False
+    raw, proc = _wevtutil_query(log, query, count=LOG_READ_LIMIT, newest_first=newest_first, timeout=60)
+    if proc.returncode != 0 and not proc.stdout:
+        msg = _decode_console(proc.stderr).strip()
+        raise RuntimeError(msg.splitlines()[0] if msg else f"wevtutil failed ({proc.returncode})")
+    ids = [int(m) for m in _RECORD_ID.findall(raw or "")]
+    return parse(raw or ""), (max(ids) if ids else _fw_newest_record_id(log))
+
+
+def _fw_read_powershell(since=None):
+    return _fw_read_record_log(POWERSHELL_LOG, _PS_EVENT_IDS, since, log_store.parse_powershell_events)
+
+
+def _fw_parse_bits(raw):
+    """BITS client EID 59/60 as ``{timestamp, event_id, record_id, data}``.
+
+    No top-level ``pid``: the event's own ProcessID is the BITS service, not the process that asked."""
+    out = []
+    for chunk in log_store._event_chunks(raw):
+        ev = log_store._xml_event(chunk)
+        if ev is None or ev["record_id"] is None:
+            continue
+        data = dict(ev["data"])
+        data["url"] = next((v for k, v in ev["data"].items() if k.lower() == "url"), "")
+        out.append({"timestamp": _fw_iso(ev["epoch"]), "event_id": ev["event_id"],
+                    "record_id": ev["record_id"], "data": data})
+    return sorted(out, key=lambda e: e["record_id"])
+
+
+def _fw_read_bits(since=None):
+    return _fw_read_record_log("Microsoft-Windows-Bits-Client/Operational", "(EventID=59 or EventID=60)", since,
+                               _fw_parse_bits)
+
+
+class _FirewallLogReader:
+    """The Windows Firewall log by byte offset; the answer always carries an int offset (or the reader raises)."""
+
+    def __init__(self):
+        self.fields = None
+
+    def __call__(self, since=None):
+        text, new_offset, hint = _read_firewall_log(since)
+        if new_offset is None:
+            raise RuntimeError(hint or "the firewall log cannot be read")
+        found = log_store.firewall_fields(text)
+        if found:
+            self.fields = found
+        return log_store.parse_firewall_log(text, None, self.fields), int(new_offset)
+
+
+def _firewall_readers():
+    return {"connections": _read_sysmon_for_logs, "dns": _read_sysmon_for_logs,
+            "processes": _read_sysmon_for_logs, "powershell": _fw_read_powershell,
+            "firewall": _FirewallLogReader(), "bits": _fw_read_bits}
+
+
+# ---- the context and the rules --------------------------------------------------------------
+
+
+def _fw_rules(force=False):
+    """``(rules, error)`` of the TDC firewall rules; one PowerShell call per ``FIREWALL_RULES_TTL_S``."""
+    global _fw_rules_cache
+    with _fw_rules_lock:
+        cached = _fw_rules_cache
+        if not force and cached is not None and 0 <= time.time() - cached[0] < FIREWALL_RULES_TTL_S:
+            return cached[1], cached[2]
+        try:
+            found, error = firewall_rules.rules(_fw_runner), None
+        except Exception as e:
+            found, error = None, str(e).splitlines()[0][:300] if str(e) else type(e).__name__
+        _fw_rules_cache = (time.time(), found, error)
+        return found, error
+
+
+def _fw_forget_rules():
+    global _fw_rules_cache
+    with _fw_rules_lock:
+        _fw_rules_cache = None
+
+
+def _fw_rule_keys(found):
+    """``{key: rule_id}`` of the rules that stand. Several rules can share a key (tcp and udp): any one id will do."""
+    keys = {}
+    for rule in found or ():
+        if rule.get("blocking") and rule.get("key"):
+            keys.setdefault(rule["key"], rule["rule_id"])
+    return keys
+
+
+def _fw_ioc_sets():
+    """``(ips, domains)`` of Rustinel's IOC lists, normalised; read again after a minute."""
+    global _fw_ioc_cache
+    stamp, cached = _fw_ioc_cache
+    if time.time() - stamp < 60:
+        return cached
+    base = os.path.join(RUSTINEL_INSTALL_DIR, "rules", "ioc")
+
+    def lines(name):
+        try:
+            with open(os.path.join(base, name), "r", encoding="utf-8", errors="replace") as f:
+                return [l.strip() for l in f if l.strip() and not l.lstrip().startswith("#")]
+        except OSError:
+            return []
+    ips = set()
+    for text in lines("ips.txt"):
+        try:
+            addr = _ipaddress.ip_address(text.split()[0])
+            ips.add(str(addr.ipv4_mapped if addr.version == 6 and addr.ipv4_mapped else addr))
+        except ValueError:
+            continue
+    domains = {text.split()[0].lower().rstrip(".") for text in lines("domains.txt")}
+    _fw_ioc_cache = (time.time(), (frozenset(ips), frozenset(domains)))
+    return _fw_ioc_cache[1]
+
+
+def _fw_url_host(url):
+    try:
+        return (_urlparse(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _firewall_context(now=None):
+    """The ``firewall.Context`` of this moment, and the error that kept the rules from it (or None)."""
+    now = time.time() if now is None else now
+    with store_lock:
+        alerts = list(events_store.get("alerts") or [])
+    found, error = _fw_rules()
+    pending = {firewall.rule_key(i["finding"].get("image") or "", i["finding"].get("dst_ip") or "", None)
+               for i in _fw_pending.open() if isinstance(i.get("finding"), dict)}
+    targets = set()
+    for item in _fw_pending.open() + _fw_pending.history(200):
+        finding = item.get("finding") or {}
+        targets.update(v for v in (finding.get("dst_ip"), _fw_url_host(finding.get("url") or "")) if v)
+    for cap in _capture_store():
+        targets.update(v for v in (cap.get("dst_ip"), _fw_url_host(cap.get("url") or "")) if v)
+    ips, domains = _fw_ioc_sets()
+    ctx = firewall.Context(
+        dns=_fw_store.dns(), alerts=alerts, submission_pids=set(_firewall_open_windows(now)),
+        ioc_ips=set(ips), ioc_domains=set(domains), processes=_fw_store.processes(),
+        rules=_fw_rule_keys(found), pending=pending, fetch_targets=targets,
+        downloads=set(_fw_downloads))      # one C-level pass: the collector thread adds to it meanwhile
+    return ctx, error
+
+
+def _fw_classified(since=None, until=None):
+    """``(flows, rules_error)``: the connections of a window, bundled, tagged and placed, with captures attached."""
+    events = _fw_store.events(since, until)
+    ctx, error = _firewall_context()
+    flows = firewall.classify(events, _fw_store.firewall_events(since, until), ctx)
+    by_endpoint = {}
+    for cap in _capture_store():
+        by_endpoint.setdefault((str(cap.get("image") or "").lower(), cap.get("dst_ip"), cap.get("dst_port")),
+                               []).append(cap["id"])
+    for flow in flows:
+        flow["capture_ids"] = by_endpoint.get((flow["image"].lower(), flow["dst_ip"], flow["dst_port"]), [])
+    return flows, error
+
+
+# ---- the capture store ----------------------------------------------------------------------
+
+
+def _capture_store():
+    """The recorded captures, oldest first (``captures.json``); a damaged file reads as empty."""
+    with _captures_lock:
+        try:
+            with open(CAPTURES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return []
+    return [c for c in data if isinstance(c, dict) and isinstance(c.get("id"), str)] if isinstance(data, list) else []
+
+
+def _record_capture(meta):
+    """Add ``meta`` to ``captures.json`` (500 entries at most, the oldest entry goes first; its file stays) and
+    return it with its ``id``. Written like ``submissions.json``: beside the file, flushed, then put in its place."""
+    entry = dict(meta, id=hashlib.sha256(f"{meta.get('sha256')}{meta.get('url')}{time.time()}{os.urandom(4).hex()}"
+                                         .encode()).hexdigest()[:12])
+    with _captures_lock:
+        try:
+            with open(CAPTURES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = []
+        data = [c for c in data if isinstance(c, dict)] if isinstance(data, list) else []
+        data = (data + [entry])[-MAX_CAPTURES:]
+        tmp = CAPTURES_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            for attempt in range(1, _REPLACE_ATTEMPTS + 1):
+                try:
+                    os.replace(tmp, CAPTURES_FILE)
+                    break
+                except PermissionError:
+                    if attempt == _REPLACE_ATTEMPTS:
+                        raise
+                    time.sleep(_REPLACE_PAUSE)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+    return entry
+
+
+def _ensure_capture_dir(run=None):
+    """Create ``CAPTURE_DIR`` and exclude it from Defender (idempotent; only logs when it fails).
+
+    Without the exclusion Defender eats the stage-2 file before anyone looks at it. install-webui.ps1 does the
+    same at provisioning; doing it here as well is what makes the feature work on a VM that only got a deploy."""
+    try:
+        os.makedirs(CAPTURE_DIR, exist_ok=True)
+    except OSError as e:
+        _log_logger.warning("cannot create %s: %s", CAPTURE_DIR, e)
+        return False
+    if os.name != "nt" and run is None:
+        return True
+    quoted = CAPTURE_DIR.replace("'", "''")      # our own constant, not malware text
+    try:
+        rc, _, err = (run or firewall_rules.run_powershell)(
+            [firewall_rules.POWERSHELL, "-NoProfile", "-NonInteractive", "-Command",
+             f"Add-MpPreference -ExclusionPath '{quoted}' -ErrorAction Stop"])
+        if rc != 0:
+            _log_logger.warning("Defender exclusion for %s failed (%s): %s", CAPTURE_DIR, rc, (err or "").strip()[:200])
+            return False
+    except Exception as e:
+        _log_logger.warning("Defender exclusion for %s failed: %s", CAPTURE_DIR, e)
+        return False
+    return True
+
+
+# ---- the guarded fetch ----------------------------------------------------------------------
+
+_MAGICS = ((b"MZ", "MZ"), (b"\x7fELF", "ELF"), (b"PK\x03\x04", "PK"), (b"#!", "#!"), (b"%PDF", "PDF"),
+           (b"\xd0\xcf\x11\xe0", "OLE"), (b"7z\xbc\xaf", "7z"), (b"Rar!", "RAR"), (b"\x1f\x8b", "GZ"),
+           (b"\xca\xfe\xba\xbe", "CAFEBABE"), (b"MSCF", "CAB"))
+_UA_PATTERNS = (
+    re.compile(r"-UserAgent\s+['\"]([^'\"\r\n]{1,300})['\"]", re.I),
+    re.compile(r"User-?Agent['\"]?\s*[,=:]\s*['\"]([^'\"\r\n]{1,300})['\"]", re.I),
+    re.compile(r"(?:^|\s)(?:-A|--user-agent)\s+['\"]([^'\"\r\n]{1,300})['\"]", re.I),
+)
+
+
+class _FetchError(Exception):
+    pass
+
+
+def _magic_of(head):
+    for prefix, name in _MAGICS:
+        if head.startswith(prefix):
+            return name
+    return "text" if head and all(32 <= b < 127 or b in (9, 10, 13) for b in head) else "unknown"
+
+
+def _fw_clean_header_text(value, limit=300):
+    """``value`` when it is printable ASCII (so it cannot split a header), else None."""
+    if isinstance(value, str) and 0 < len(value) <= limit and all(32 <= ord(c) < 127 for c in value):
+        return value
+    return None
+
+
+def _loader_user_agent(finding):
+    """The User-Agent the loader's own script or command line names for this URL, or None."""
+    url = finding.get("url") or ""
+    texts = [ev.get("message") for ev in _fw_store.powershell()] + [ev.get("commandline") for ev in _fw_store.process_events()]
+    for text in texts:
+        if not isinstance(text, str) or url not in text:
+            continue
+        for pattern in _UA_PATTERNS:
+            for match in pattern.finditer(text):
+                agent = _fw_clean_header_text(match.group(1))
+                if agent:
+                    return agent
+    return None
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """Connects to ``ip`` and nothing else: no name is resolved on the way."""
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """The same over TLS, with the loader's host name as SNI. The certificate is not checked: the peer is a
+    suspected C2 and nothing it says is trusted; what comes back is only stored."""
+
+    def __init__(self, ip, port, timeout, sni):
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        super().__init__(ip, port, timeout=timeout, context=context)
+        self._sni = sni
+        self._tls = context
+
+    def connect(self):
+        http.client.HTTPConnection.connect(self)
+        self.sock = self._tls.wrap_socket(self.sock, server_hostname=self._sni)
+
+
+def _pinned_connection(scheme, host, port, ip, timeout):
+    """A connection to ``ip:port`` (an address the sample was seen talking to); ``host`` is only the SNI."""
+    if scheme == "https":
+        sni = None if _is_ip_literal(host) else host
+        return _PinnedHTTPSConnection(ip, port, timeout, sni)
+    return _PinnedHTTPConnection(ip, port, timeout=timeout)
+
+
+def _is_ip_literal(host):
+    try:
+        _ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+def _fw_same_ip(a, b):
+    try:
+        x, y = _ipaddress.ip_address(a), _ipaddress.ip_address(b)
+    except ValueError:
+        return False
+    x = x.ipv4_mapped if x.version == 6 and x.ipv4_mapped else x
+    y = y.ipv4_mapped if y.version == 6 and y.ipv4_mapped else y
+    return x == y
+
+
+def _fw_target(url, observed_ip, observed_port):
+    """``(scheme, host, port, target)`` of a URL, checked against the address that was observed."""
+    if not all(32 < ord(c) < 127 for c in url):
+        raise _FetchError("the URL has characters that cannot be sent as they are")
+    parts = _urlparse(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise _FetchError("not an http(s) URL")
+    try:
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+    except ValueError:
+        raise _FetchError("bad port in the URL")
+    host = parts.hostname
+    if _is_ip_literal(host) and not _fw_same_ip(host, observed_ip):
+        raise _FetchError("the URL names another address than the one observed")
+    path = parts.path or "/"
+    return parts.scheme, host, port, path + ("?" + parts.query if parts.query else "")
+
+
+def _fw_refuse_address(ip):
+    """Why TDC will not connect to ``ip`` (the loopback services and friends), or None.
+
+    Without this a script in the guest could have TDC fetch http://127.0.0.1:8080/... and store the answer.
+    Private LAN addresses stay allowed: a lab often runs its fake C2 (INetSim) there."""
+    try:
+        addr = _ipaddress.ip_address(ip)
+    except ValueError:
+        return "not an IP address"
+    addr = addr.ipv4_mapped if addr.version == 6 and addr.ipv4_mapped else addr
+    if addr.is_loopback or addr.is_unspecified or addr.is_multicast or addr.is_link_local or addr.is_reserved:
+        return "that address is TDC's own side of the VM (loopback, link-local, multicast or reserved)"
+    return None
+
+
+def _submission_for(finding):
+    """The id of the submission whose process, or an ancestor of it, ran the loader; None if none did."""
+    procs = _fw_store.processes()
+    chain, pid = [], finding.get("origin_pid") if finding.get("origin_pid") is not None else finding.get("pid")
+    while isinstance(pid, int) and pid not in chain and len(chain) < 32:
+        chain.append(pid)
+        pid = _fw_int((procs.get(pid) or {}).get("parent_pid"))
+    wanted = {str(p) for p in chain}
+    try:
+        with submissions_lock:
+            subs = _load_submissions()
+    except Exception:
+        return None
+    for sub in reversed([s for s in subs if isinstance(s, dict)]):
+        if str(sub.get("agent_pid")) in wanted:
+            return sub.get("id")
+    return None
+
+
+def _fw_stream_to_file(resp, deadline, conn):
+    """Read the body into a temp file inside CAPTURE_DIR; ``(path, sha256, size, head)``. Never beyond FETCH_MAX_BYTES."""
+    length = resp.getheader("Content-Length")
+    if length and length.strip().isdigit() and int(length) > FETCH_MAX_BYTES:
+        raise _FetchError("too large")
+    staging = os.path.join(CAPTURE_DIR, ".incoming")
+    os.makedirs(staging, exist_ok=True)
+    digest, size, head = hashlib.sha256(), 0, b""
+    tmp = tempfile.NamedTemporaryFile(dir=staging, delete=False)
+    try:
+        with tmp:
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise _FetchError("timed out")
+                sock = getattr(conn, "sock", None)
+                if sock is not None:
+                    sock.settimeout(left)
+                chunk = resp.read(FETCH_CHUNK)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > FETCH_MAX_BYTES:
+                    raise _FetchError("too large")
+                if len(head) < 8:
+                    head = (head + chunk)[:8]
+                digest.update(chunk)
+                tmp.write(chunk)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+    except BaseException:
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            pass
+        raise
+    return tmp.name, digest.hexdigest(), size, head
+
+
+def _fetch_capture_inner(finding):
+    ip = finding.get("dst_ip")
+    refusal = _fw_refuse_address(ip) if isinstance(ip, str) else "no address"
+    if refusal:
+        raise _FetchError("refused: " + refusal)
+    url = finding.get("url")
+    if not isinstance(url, str) or not url or len(url) > 8192:
+        raise _FetchError("no usable URL")
+    scheme, host, port, target = _fw_target(url, ip, finding.get("dst_port"))
+    if finding.get("dst_port") is not None and port != finding.get("dst_port"):
+        raise _FetchError("the URL names another port than the one observed")
+    agent = _loader_user_agent(finding)
+    sent_agent = agent or FETCH_DEFAULT_UA
+    deadline = time.monotonic() + FETCH_TIMEOUT
+    origin_host, redirects, status, content_type = host, 0, None, ""
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise _FetchError("timed out")
+        host_header = host if (port in (80, 443)) else f"{host}:{port}"
+        conn = _pinned_connection(scheme, host, port, ip, left)
+        try:
+            conn.request("GET", target, headers={"Host": host_header, "User-Agent": sent_agent, "Accept": "*/*",
+                                                 "Accept-Encoding": "identity", "Connection": "close"})
+            resp = conn.getresponse()
+            status = resp.status
+            if status in (301, 302, 303, 307, 308):
+                location = resp.getheader("Location")
+                if not location:
+                    raise _FetchError(f"HTTP {status} without a Location")
+                if redirects >= FETCH_MAX_REDIRECTS:
+                    raise _FetchError("too many redirects")
+                redirects += 1
+                url = _urljoin(url, location)
+                scheme, host, port, target = _fw_target(url, ip, None)
+                if host.lower() != origin_host.lower() and not _fw_same_ip(host, ip):
+                    raise _FetchError("a redirect leaves the observed address")
+                continue
+            if status != 200:
+                raise _FetchError(f"HTTP {status}")
+            content_type = _fw_clean_header_text(resp.getheader("Content-Type") or "", 200) or ""
+            tmp_path, sha256, size, head = _fw_stream_to_file(resp, deadline, conn)
+            break
+        except OSError as e:
+            raise _FetchError("timed out" if isinstance(e, (TimeoutError, socket.timeout))
+                              else f"network or disk error: {type(e).__name__}")
+        except http.client.HTTPException as e:
+            raise _FetchError(f"protocol error: {type(e).__name__}")
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    try:
+        if size == 0:
+            raise _FetchError("empty response")
+        final_dir = os.path.join(CAPTURE_DIR, sha256[:2])
+        os.makedirs(final_dir, exist_ok=True)
+        final = os.path.join(final_dir, sha256)
+        os.replace(tmp_path, final)
+    except BaseException:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+    meta = {"sha256": sha256, "size": size, "url": finding.get("url"), "dst_ip": ip,
+            "dst_port": finding.get("dst_port"), "geo": firewall.geo_info(ip), "pid": finding.get("pid"),
+            "image": finding.get("image"), "fetched_at": _fw_iso(time.time()), "origin": "fetch",
+            "content_type": content_type, "magic": _magic_of(head), "submission_id": _submission_for(finding),
+            "executed": False, "path": final, "status": status, "redirects": redirects,
+            "user_agent": sent_agent, "user_agent_source": "loader" if agent else "default",
+            "finding_id": finding.get("id"), "source": finding.get("source")}
+    return _record_capture(meta)
+
+
+def _fetch_capture(pending):
+    """Fetch the file of a download finding, check and store it; the result is never executed or reported.
+
+    ``pending`` is the finding. The connection goes to the address that was observed (``dst_ip``), with the URL's
+    host name only as ``Host`` and SNI: nothing is resolved. At most ``FETCH_MAX_BYTES``, ``FETCH_TIMEOUT``
+    seconds in all, and ``FETCH_MAX_REDIRECTS`` redirects that stay on that address. Returns the capture record,
+    or ``{"error": ...}`` (no ``sha256``) when nothing was stored.
+    """
+    try:
+        return _fetch_capture_inner(pending if isinstance(pending, dict) else {})
+    except _FetchError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        _log_logger.warning("fetch failed: %s: %s", type(e).__name__, e)
+        return {"error": f"fetch failed: {type(e).__name__}"}
+
+
+# ---- decisions ------------------------------------------------------------------------------
+
+
+def _fw_block_key(finding):
+    return firewall.rule_key(finding.get("image") or "", finding.get("dst_ip") or "", None)
+
+
+def _fw_ensure_block(finding):
+    """Make sure the loader is blocked from the endpoint (program-scoped, so TDC's own fetch is not); say what stands.
+
+    ``{rule_id, verified, problem}``, or ``{error}``. Nothing is claimed that was not read back."""
+    try:
+        found, _ = _fw_rules()
+        rule_id = _fw_rule_keys(found).get(_fw_block_key(finding))
+        if rule_id:
+            return {"rule_id": rule_id, "verified": True, "problem": None}
+        done = firewall_rules.block(_fw_runner, image=finding.get("image"), ip=finding.get("dst_ip"),
+                                    fetcher=_fw_fetcher_path())
+        _fw_forget_rules()
+        return {"rule_id": done["rule_id"], "verified": done["verified"], "problem": done["problem"]}
+    except Exception as e:
+        _fw_forget_rules()
+        return {"error": (str(e).splitlines() or [type(e).__name__])[0][:300]}
+
+
+def _fw_other_holds(item_id, finding):
+    """Whether another decision keeps this endpoint blocked: an open one, or one that was taken as block."""
+    key = _fw_block_key(finding)
+    for other in _fw_pending.open() + _fw_pending.history(1000):
+        if other["id"] == item_id or not isinstance(other.get("finding"), dict):
+            continue
+        if _fw_block_key(other["finding"]) == key and (other["action"] in (None, "block", "block_fetch")):
+            return True
+    return False
+
+
+def _fw_release(item_id, finding):
+    """ZULASSEN: remove every rule of the endpoint's key, unless another decision still holds it."""
+    if _fw_other_holds(item_id, finding):
+        return {"unblocked": False, "reason": "another decision for the same endpoint keeps it blocked"}
+    key = _fw_block_key(finding)
+    try:
+        found, _ = _fw_rules(force=True)
+        ids = [r["rule_id"] for r in found or () if r.get("kind") == "block" and r.get("key") == key]
+        for rule_id in ids:
+            firewall_rules.unblock(_fw_runner, rule_id)
+        _fw_forget_rules()
+        return {"unblocked": True, "rule_ids": ids}
+    except Exception as e:
+        _fw_forget_rules()
+        return {"unblocked": False, "error": (str(e).splitlines() or [type(e).__name__])[0][:300]}
+
+
+def _fw_address_wide_block(finding):
+    """Whether a block for every program stands on the endpoint: it would cut TDC's own fetch off as well."""
+    found, _ = _fw_rules()
+    keys = _fw_rule_keys(found)
+    ip = finding.get("dst_ip") or ""
+    return any(firewall.rule_key("", ip, port) in keys for port in (None, finding.get("dst_port")))
+
+
+def _fw_decide(item_id, action, by):
+    """Take the decision ``action`` for an open item. ``(item, won)``; ``KeyError`` for an unknown id.
+
+    The decision and its effect on the firewall are one step under a lock. Only the call that wins (``won``)
+    acts, and a fetch is started outside the lock on the executor."""
+    with _fw_decision_lock:
+        before = _fw_pending.get(item_id)
+        if before is None:
+            raise KeyError(item_id)
+        item, won = _fw_pending.settle(item_id, action, dict(before.get("result") or {}, by=by))
+        if not won:
+            return item, False
+        effect = {}
+        if action == "allow":
+            effect.update(_fw_release(item_id, item["finding"]))
+        else:
+            effect["block"] = _fw_ensure_block(item["finding"])
+        item = _fw_pending.set_result(item_id, effect) or item
+    if action == "block_fetch":
+        _fw_start_fetch(item_id)
+    return _fw_pending.get(item_id) or item, True
+
+
+def _fw_start_fetch(item_id):
+    global _fw_executor
+    if _fw_executor is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _fw_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="firewall-fetch")
+    _fw_executor.submit(_fw_fetch_item, item_id)
+
+
+def _fw_fetch_item(item_id):
+    """Fetch for a decided item and add the outcome to it. A pruned item is no error: the capture is kept."""
+    try:
+        item = _fw_pending.get(item_id)
+        if item is None:
+            return
+        out = _fetch_capture(item["finding"])
+        summary = ({"error": out["error"]} if out.get("error") else
+                   {"capture_id": out["id"], "sha256": out["sha256"], "size": out["size"], "magic": out["magic"]})
+        if _fw_pending.set_result(item_id, {"fetch": summary}) is None:
+            _log_logger.info("firewall: item %s left the history before its fetch finished", item_id)
+    except Exception:
+        _log_logger.exception("firewall: fetch for %s failed", item_id)
+
+
+def _fw_open_decision(finding, now):
+    """A new open decision for ``finding``: the loader is blocked first, then the analyst is asked."""
+    if _fw_pending.get(finding["id"]) is not None:
+        return
+    with _fw_decision_lock:
+        if _fw_pending.get(finding["id"]) is not None:
+            return
+        block = _fw_ensure_block(finding)
+        item = _fw_pending.add(finding, now + _firewall_decide_seconds())
+        _fw_pending.set_result(item["id"], {"block": block})
+
+
+def _fw_descends_from_webui(pid):
+    """Whether ``pid`` is a process the web UI itself started (its tool updater): TDC's own, whatever its image."""
+    procs = _fw_store.processes()
+    seen = set()
+    while isinstance(pid, int) and pid not in seen and len(seen) < 32:
+        if pid == os.getpid():
+            return True
+        seen.add(pid)
+        pid = _fw_int((procs.get(pid) or {}).get("parent_pid"))
+    return False
+
+
+def _fw_scan_downloads(now):
+    """Find downloads in the recent connections and scripts, mark them, and open a decision where the policy says so.
+
+    The tag is never suppressed: every finding is remembered for ``Context.downloads``. Policy (``ask_mode``):
+    ``detonation`` takes findings in a detonation window, ``all`` any finding of a process that is not TDC's own,
+    ``off`` none. A URL on an update host or from a process the web UI started is marked and never asked about."""
+    since = None if not _fw_scan_state["done"] else now - FIREWALL_FINDING_WINDOW_S
+    events = _fw_store.events(since)
+    if not events:
+        return
+    flows = firewall.bundle(events)
+    dns = _fw_store.dns()
+    for flow in flows:
+        flow["dst_hostname"] = flow["dst_hostname"] or dns.get(flow["dst_ip"])
+    windows = set(_firewall_open_windows(now))
+    findings = firewall_store.download_findings(_fw_store.powershell(), _fw_store.process_events(), _fw_store.bits(),
+                                                flows, windows, now=now)
+    _fw_scan_state["done"] = True
+    mode = _fw_settings.ask_mode
+    for finding in findings:
+        _fw_downloads[(finding["pid"], finding["dst_ip"], finding["dst_port"])] = now
+        if mode == "off" or finding["self"]:
+            continue
+        if mode == "detonation" and not finding["in_detonation"]:
+            continue
+        if firewall.is_update_host(_fw_url_host(finding["url"])):
+            continue
+        origin = finding.get("origin_pid") if finding.get("origin_pid") is not None else finding["pid"]
+        if _fw_descends_from_webui(origin):
+            continue
+        observed = firewall.epoch_of(finding.get("observed_at"))
+        if observed is not None and now - observed > FIREWALL_FINDING_FRESH_S:
+            continue
+        _fw_open_decision(finding, now)
+    if len(_fw_downloads) > FIREWALL_MARK_LIMIT:
+        for key in sorted(_fw_downloads, key=_fw_downloads.get)[:len(_fw_downloads) - FIREWALL_MARK_LIMIT]:
+            del _fw_downloads[key]
+
+
+def _firewall_sweep(now=None):
+    """One pass after a collector tick, in the collector's thread: look for new downloads, then act on the open
+    decisions whose deadline has passed (block and fetch, TDC's unattended default). Nothing here waits for the
+    network: a fetch is handed to the executor. With ``ask_mode`` off nothing is blocked and nothing is fetched."""
+    now = time.time() if now is None else now
+    try:
+        _fw_scan_downloads(now)
+    except Exception:
+        _log_logger.exception("firewall: scan for downloads failed")
+    if _fw_settings.ask_mode == "off":
+        return
+    for item in _fw_pending.expired(now):
+        try:
+            action = "block_fetch"
+            if _fw_address_wide_block(item["finding"]):     # TDC's own fetch would be cut as well
+                action = "block"
+            _fw_decide(item["id"], action, "deadline")
+        except KeyError:
+            continue
+        except Exception:
+            _log_logger.exception("firewall: default action for %s failed", item.get("id"))
+
+
+def _firewall_loop(collector, rounds=None, sleep=time.sleep):
+    done = 0
+    while rounds is None or done < rounds:
+        done += 1
+        try:
+            collector.tick()
+        except Exception:
+            _log_logger.exception("firewall collector tick failed")
+        try:
+            _firewall_sweep()
+        except Exception:
+            _log_logger.exception("firewall sweep failed")
+        sleep(collector.interval())
+
+
+def _start_firewall():
+    """Start-up of the FIREWALL tab: load the geo data once, prepare the capture directory and its Defender
+    exclusion, read what a previous run left in the firewall, and start the collector thread."""
+    global _fw_startup
+    try:
+        geoip.load()               # without data the tab runs on: geo is only scope and nulls
+    except Exception:
+        _log_logger.exception("geoip.load failed")
+    threading.Thread(target=_ensure_capture_dir, name="firewall-capture-dir", daemon=True).start()
+    try:
+        _fw_startup = firewall_rules.startup_state(_fw_runner, _fw_settings)
+    except Exception as exc:
+        _log_logger.warning("firewall start-up state unreadable: %s", exc)
+    collector = firewall_store.FirewallCollector(_fw_store, _fw_settings, _firewall_readers(),
+                                                 lambda: bool(_firewall_open_windows()))
+    thread = threading.Thread(target=_firewall_loop, args=(collector,), name="firewall-collector", daemon=True)
+    thread.start()
+    return thread
+
+
+# ---- routes ---------------------------------------------------------------------------------
+
+
+def _fw_time_arg(name):
+    """A ``since``/``until`` query value (ISO-8601 or epoch seconds) as the store takes it; ``ValueError`` if unreadable."""
+    value = (request.args.get(name) or "").strip()
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        if firewall.epoch_of(value) is None:
+            raise ValueError(f"{name} must be an ISO-8601 time or epoch seconds")
+        return value
+
+
+def _fw_flow_view(flow):
+    out = dict(flow)
+    out["first_seen"], out["last_seen"] = _fw_iso(flow["first_seen"]), _fw_iso(flow["last_seen"])
+    return out
+
+
+def _fw_item_view(item, now):
+    out = dict(item)
+    out["remaining"] = max(0.0, item["deadline"] - now) if item["action"] is None else 0.0
+    for key in ("deadline", "created_at", "resolved_at"):
+        out[key] = _fw_iso(item.get(key))
+    return out
+
+
+@app.route("/api/firewall/connections")
+def api_firewall_connections():
+    """Bundled flows with tags and geo. Params: since, until (ISO-8601 or epoch), process, tag, state, max (1-5000, 500)."""
+    try:
+        since, until = _fw_time_arg("since"), _fw_time_arg("until")
+    except ValueError as e:
+        return _fw_error(str(e), 400)
+    state = request.args.get("state")
+    if state not in (None, "", "allowed", "blocked", "pending"):
+        return _fw_error("state must be allowed, blocked or pending", 400)
+    limit = max(1, min(request.args.get("max", 500, type=int) or 500, 5000))
+    flows, rules_error = _fw_classified(since, until)
+    process, tag = (request.args.get("process") or "").strip().lower(), (request.args.get("tag") or "").strip()
+    flows = [f for f in flows
+             if (not process or process in f["image"].lower()) and (not tag or tag in f["tags"])
+             and (not state or f["state"] == state)]
+    rank = {s: i for i, s in enumerate(firewall.SEVERITIES)}
+    flows.sort(key=lambda f: (-rank.get(f["severity"], 0), -f["last_seen"]))
+    return _fw_json({"connections": [_fw_flow_view(f) for f in flows[:limit]], "count": len(flows),
+                     "truncated": len(flows) > limit, "rules_error": rules_error,
+                     "isolated": bool(_fw_settings.isolated), "ask_mode": _fw_settings.ask_mode,
+                     "sources": _fw_store.stats()})
+
+
+@app.route("/api/firewall/summary")
+def api_firewall_summary():
+    """Totals and tops of the same window as /connections (since, until), plus open decisions and captures."""
+    try:
+        since, until = _fw_time_arg("since"), _fw_time_arg("until")
+    except ValueError as e:
+        return _fw_error(str(e), 400)
+    flows, rules_error = _fw_classified(since, until)
+    summary = firewall.summarize(flows)
+    summary.update({"open_decisions": len(_fw_pending.open()), "captures_total": len(_capture_store()),
+                    "rules_error": rules_error, "isolated": bool(_fw_settings.isolated),
+                    "ask_mode": _fw_settings.ask_mode, "geo_available": geoip.available(),
+                    "bytes_note": "Sysmon has no byte counts; the tab counts connections and firewall records."})
+    return _fw_json(summary)
+
+
+@app.route("/api/firewall/geo")
+def api_firewall_geo():
+    """One offline lookup: ?ip= gives ``{ip, geo}`` (``geo`` as in /connections)."""
+    ip = (request.args.get("ip") or "").strip()
+    try:
+        ip = str(_ipaddress.ip_address(ip))
+    except ValueError:
+        return _fw_error("ip must be an IPv4 or IPv6 address", 400)
+    return _fw_json({"ip": ip, "geo": firewall.geo_info(ip), "available": geoip.available()})
+
+
+@app.route("/api/firewall/rules")
+def api_firewall_rules():
+    """The ``TDC-FW-*`` rules that stand, each with its own ``rule_id``, ``protocol`` and ``blocking`` verdict."""
+    found, error = _fw_rules(force=True)
+    if error:
+        return _fw_error(error, 500)
+    return _fw_json({"rules": found})
+
+
+def _fw_body(allowed, required=()):
+    """The JSON body as a dict that has exactly keys of ``allowed`` (all of ``required``), else ``(None, message)``."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return None, "send a JSON object"
+    extra = sorted(set(data) - set(allowed))
+    if extra:
+        return None, "unknown field: " + ", ".join(k[:40] for k in extra)
+    missing = [k for k in required if k not in data]
+    return (None, "missing field: " + ", ".join(missing)) if missing else (data, None)
+
+
+def _fw_firewall_off_message():
+    """The reason enforcement is impossible (a profile is off or unreadable), or None."""
+    try:
+        off = firewall_rules.profiles_off(_fw_runner)
+    except Exception as e:
+        return (str(e).splitlines() or ["the Windows Firewall cannot be read"])[0]
+    if not off:
+        return None
+    return (f"Windows Firewall is switched off for: {', '.join(off)}. A rule or a default action would be "
+            "accepted and do nothing, so nothing is enforced.")
+
+
+@app.route("/api/firewall/block", methods=["POST"])
+def api_firewall_block():
+    """Block outbound traffic. Body: ``{scope, image, ip, port, protocol}``.
+
+    ``endpoint``: this program to ``ip`` (needs ``image`` and ``ip``; ``port`` needs ``protocol``). ``endpoint_all``:
+    every program to ``ip``, a decision of its own, because it includes TDC's fetcher. ``process``: ``image`` anywhere."""
+    data, problem = _fw_body(("scope", "image", "ip", "port", "protocol"), ("scope",))
+    if problem:
+        return _fw_error(problem, 400)
+    scope, image, ip, port, protocol = (data.get(k) for k in ("scope", "image", "ip", "port", "protocol"))
+    if scope not in ("endpoint", "endpoint_all", "process"):
+        return _fw_error("scope must be endpoint, endpoint_all or process", 400)
+    if not all(v is None or isinstance(v, str) for v in (image, ip, protocol)) \
+            or not (port is None or (isinstance(port, int) and not isinstance(port, bool))):
+        return _fw_error("image, ip and protocol are text, port is a number", 400)
+    if scope == "process":
+        if not image or ip or port is not None:
+            return _fw_error("scope process takes an image and nothing else", 400)
+        args = {"image": image}
+    elif scope == "endpoint":
+        if not image or not ip:
+            return _fw_error("scope endpoint takes an image and an ip", 400)
+        args = {"image": image, "ip": ip, "port": port, "protocol": protocol}
+    else:
+        if image or not ip:
+            return _fw_error("scope endpoint_all takes an ip and no image", 400)
+        args = {"ip": ip, "port": port, "protocol": protocol}
+    off = _fw_firewall_off_message()
+    if off:
+        return _fw_error(off, 409)
+    try:
+        done = firewall_rules.block(_fw_runner, fetcher=_fw_fetcher_path(), **args)
+    except firewall_rules.RuleError as e:
+        return _fw_error(str(e), 409)
+    finally:
+        _fw_forget_rules()
+    done["scope"] = scope
+    if not done["verified"]:
+        return _fw_json(dict(done, error=done["problem"] or "the rule could not be verified"), 409)
+    return _fw_json(done)
+
+
+@app.route("/api/firewall/unblock", methods=["POST"])
+def api_firewall_unblock():
+    """Remove a block. Body: ``{rule_id}``; every rule that shares its key goes too (tcp and udp of one endpoint)."""
+    data, problem = _fw_body(("rule_id",), ("rule_id",))
+    if problem:
+        return _fw_error(problem, 400)
+    rule_id = data["rule_id"]
+    if not isinstance(rule_id, str):
+        return _fw_error("rule_id is text", 400)
+    ids = [rule_id]
+    found, _ = _fw_rules(force=True)
+    mine = next((r for r in found or () if r["rule_id"] == rule_id), None)
+    if mine and mine.get("key"):
+        ids = [rule_id] + [r["rule_id"] for r in found if r.get("key") == mine["key"] and r["kind"] == "block"
+                           and r["rule_id"] != rule_id]
+    try:
+        for each in ids:
+            firewall_rules.unblock(_fw_runner, each)
+    except firewall_rules.RuleError as e:
+        return _fw_error(str(e), 400 if "not a TDC block rule" in str(e) else 500)
+    finally:
+        _fw_forget_rules()
+    return _fw_json({"removed": ids})
+
+
+def _fw_isolate_state():
+    out = {"isolated": bool(_fw_settings.isolated), "outbound_before": _fw_settings.outbound_before,
+           "isolated_since": _fw_iso(_fw_settings.isolated_since), "ask_mode": _fw_settings.ask_mode,
+           "settings_error": _fw_settings.load_error, "startup": _fw_startup,
+           "profiles_off": None, "profiles_error": None}
+    try:
+        out["profiles_off"] = firewall_rules.profiles_off(_fw_runner)
+    except Exception as e:
+        out["profiles_error"] = (str(e).splitlines() or [type(e).__name__])[0][:300]
+    return out
+
+
+@app.route("/api/firewall/isolate", methods=["GET", "POST"])
+def api_firewall_isolate():
+    """GET: the state (isolated, the remembered outbound action, which firewall profiles are off, the start-up note).
+    POST ``{on: bool}``: switch ISOLATED; 409 when the Windows Firewall is off (it would accept the change and do nothing)."""
+    if request.method == "GET":
+        return _fw_json(_fw_isolate_state())
+    data, problem = _fw_body(("on",), ("on",))
+    if problem or not isinstance(data["on"], bool):
+        return _fw_error(problem or "on must be true or false", 400)
+    if data["on"]:
+        off = _fw_firewall_off_message()
+        if off:
+            return _fw_error(off, 409)
+    try:
+        done = firewall_rules.isolate(_fw_runner, data["on"], fetcher=_fw_fetcher_path(), settings=_fw_settings)
+    except firewall_rules.RuleError as e:
+        return _fw_error(str(e), 500)
+    finally:
+        _fw_forget_rules()
+    return _fw_json(dict(done, state=_fw_isolate_state()))
+
+
+@app.route("/api/firewall/pending")
+def api_firewall_pending():
+    """Open decisions with their remaining seconds, and the decisions of the last 24 h (``history``)."""
+    now = time.time()
+    return _fw_json({"pending": [_fw_item_view(i, now) for i in _fw_pending.open()],
+                     "history": [_fw_item_view(i, now) for i in _fw_pending.history(100)],
+                     "ask_mode": _fw_settings.ask_mode, "decide_seconds": _firewall_decide_seconds(),
+                     "server_time": _fw_iso(now)})
+
+
+@app.route("/api/firewall/decide", methods=["POST"])
+def api_firewall_decide():
+    """Decide an open item. Body: exactly ``{id, action}``, action ``allow``, ``block`` or ``block_fetch``.
+
+    There is no URL here and there never will be: a URL would let malware in the guest use TDC as its proxy.
+    An id works once; a second answer gets the decision that was taken, with 200."""
+    data, problem = _fw_body(("id", "action"), ("id", "action"))
+    if problem:
+        return _fw_error(problem, 400)
+    item_id, action = data["id"], data["action"]
+    if not isinstance(item_id, str) or action not in firewall_store.DECISIONS:
+        return _fw_error("id is text and action is one of " + ", ".join(firewall_store.DECISIONS), 400)
+    item = _fw_pending.get(item_id)
+    if item is None:
+        return _fw_error("No such decision; it may be older than 24 hours.", 404)
+    if item["action"] is None and action == "block_fetch" and _fw_address_wide_block(item["finding"]):
+        return _fw_error("A block for every program stands on that endpoint, so TDC's own fetch would be cut off. "
+                         "Remove it, or choose block only.", 409)
+    try:
+        item, won = _fw_decide(item_id, action, "analyst")
+    except KeyError:
+        return _fw_error("No such decision; it may be older than 24 hours.", 404)
+    return _fw_json({"id": item_id, "action": item["action"], "won": won, "item": _fw_item_view(item, time.time())})
+
+
+@app.route("/api/firewall/ask", methods=["POST"])
+def api_firewall_ask():
+    """Set the ASK switch. Body: ``{mode: "detonation" | "all" | "off"}`` (kept on the server)."""
+    data, problem = _fw_body(("mode",), ("mode",))
+    if problem or data["mode"] not in firewall_store.ASK_MODES:
+        return _fw_error(problem or "mode must be one of " + ", ".join(firewall_store.ASK_MODES), 400)
+    try:
+        _fw_settings.set(ask_mode=data["mode"])
+    except OSError as e:
+        return _fw_error(f"The setting could not be saved: {e}", 500)
+    return _fw_json({"ask_mode": _fw_settings.ask_mode})
+
+
+@app.route("/api/firewall/captures")
+def api_firewall_captures():
+    """The secured samples, newest first."""
+    return _fw_json({"captures": list(reversed(_capture_store()))})
+
+
+@app.route("/api/firewall/capture/<capture_id>")
+def api_firewall_capture(capture_id):
+    """One capture with its metadata, and whether its file is still there."""
+    cap = next((c for c in _capture_store() if c["id"] == capture_id), None)
+    if cap is None:
+        return _fw_error("Capture not found.", 404)
+    path = cap.get("path")
+    return _fw_json(dict(cap, exists=isinstance(path, str) and os.path.isfile(path)))
+
+
 # --- Main ---
 # Start background alert loader (works with both direct run and import by dev_server)
 # When Flask reloader is active, only start in the child process to avoid duplicate threads
@@ -10900,6 +12118,7 @@ if not _background_disabled and (_is_reloader_child or not _reloader_active):
     loader.start()
     _start_update_check_thread()
     _start_log_collector_thread()
+    _start_firewall()
 
 if __name__ == "__main__":
     print(f"[*] Detonation Chamber UI starting on http://0.0.0.0:{WEBUI_PORT}")

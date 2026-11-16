@@ -1180,7 +1180,7 @@ markup.
 | Source | Content |
 |--------|---------|
 | `powershell` | Script Blocks (4104), module and pipeline logging (4103) and engine errors (4100) of `Microsoft-Windows-PowerShell/Operational`; the parts of a long script block are joined into one event; the script is the `message` (`script=` searches it too) |
-| `access` | Every HTTP request to the web UI (not `/static/`): `method`, `path`, `query`, `status`, `duration_ms`, `remote_addr`, `user_agent`, `client` (`browser`, `mcp` or `other`). The regular polls of the UI itself (the exact paths `/api/status`, `/api/updates`, `/api/alerts`, `/api/health` and `/api/rustinel`, and everything under `/api/logs/`) carry `poll=true`; `/api/alerts/<id>` does not. A request that ends in an unhandled error is logged with status 500 |
+| `access` | Every HTTP request to the web UI (not `/static/`): `method`, `path`, `query`, `status`, `duration_ms`, `remote_addr`, `user_agent`, `client` (`browser`, `mcp` or `other`). The regular polls of the UI itself (the exact paths `/api/status`, `/api/updates`, `/api/alerts`, `/api/health`, `/api/rustinel`, `/api/firewall/pending` and `/api/firewall/connections`, and everything under `/api/logs/`) carry `poll=true`; `/api/alerts/<id>` does not. A request that ends in an unhandled error is logged with status 500 |
 | `mcp` | Every action of the MCP server (it sends `X-TDC-Client: mcp` and `X-TDC-MCP-Tool: <name>`): `tool`, `method`, `path`, `status`, `duration_ms` |
 | `netflow` | Network connections (Sysmon 3) bundled into flows per image, PID, protocol and address pair, with `count`, `first_seen` and `last_seen` |
 | `dns` | DNS queries (Sysmon 22): `query`, `result`, `image`, `pid` |
@@ -1799,6 +1799,25 @@ Proxied responses are only relayed as data (JSON, text, binary); HTML is served 
 | GET | `/api/logs/search` | Search the log store with an SPL-like query. Params: `q` (default `*`), `earliest` (default `-24h`; `-15m`, `-2h`, `now` or ISO-8601), `latest`, `limit` (1-1000, default 200). 200 with `type` (`events`, `table` or `timechart`), `events`, `columns`, `rows`, `count`, `matched`, `truncated`, `histogram`, `fields` and `took_ms`; 400 with `error` and `pos` (index in the query) for a query or time that cannot be read; 500 with a general `error` for anything else. Every request is itself logged (`access`; `mcp` too when the MCP server made it), polling paths with `poll=true` |
 | GET | `/api/logs/event/<id>` | One event of the log store in full (`id`, `time`, `source`, `message`, `fields`). A search response cuts every string at 64 KB and marks the event with `truncated_fields: true`; this route has the whole text. 404 with `error` when the event has left the store |
 | GET | `/api/logs/sources` | The six sources (`powershell`, `access`, `mcp`, `netflow`, `dns`, `firewall`): `count`, `last_time`, `status` (`ok` or `unavailable`) and `hint` (why a source is unavailable) |
+
+### Firewall
+
+Times are ISO-8601 UTC text; a flow's `times` is a list of epoch seconds. Errors are `{"error": ...}` with 400 (malformed), 404, 409 (refused: the Windows Firewall is off, a lockout, a block that could not be verified) or 500. Every action is an `access` event in the LOGS tab.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/firewall/connections` | Bundled flows with `tags`, `severity`, `geo` (`scope`, `cc`, `country`, `lat`, `lon`, `asn`, `as_org`), `state` (`allowed`, `blocked`, `pending`), `rule_id`, `capture_ids`. Params: `since`, `until` (ISO-8601 or epoch), `process` (substring of the image), `tag`, `state`, `max` (1-5000, default 500). Also `count`, `truncated`, `rules_error` (why the rules could not be read; nothing is then claimed as blocked), `isolated`, `ask_mode`, `sources` |
+| GET | `/api/firewall/summary` | Totals, blocked and pending flows, top processes, endpoints and countries of the same window, plus `open_decisions`, `captures_total`, `geo_available` |
+| GET | `/api/firewall/geo` | One offline lookup: `ip` gives `{ip, geo, available}` |
+| GET | `/api/firewall/rules` | The `TDC-FW-*` rules that stand, one entry per rule: `rule_id`, `kind`, `image`, `ip`, `port`, `protocol`, `key`, `blocking` |
+| POST | `/api/firewall/block` | `{scope, image, ip, port, protocol}`. `endpoint`: this program to `ip`; `endpoint_all`: every program, TDC's fetcher included; `process`: `image` anywhere. 409 while a firewall profile is off |
+| POST | `/api/firewall/unblock` | `{rule_id}`; every rule that shares its key is removed |
+| GET / POST | `/api/firewall/isolate` | GET: `isolated`, `outbound_before`, `isolated_since`, `profiles_off`, `startup`. POST `{on}`: switch ISOLATED (409 while a profile is off) |
+| GET | `/api/firewall/pending` | `pending` (open decisions with `remaining` seconds) and `history` (the last 24 h), `ask_mode`, `decide_seconds` |
+| POST | `/api/firewall/decide` | Exactly `{id, action}` (`allow`, `block`, `block_fetch`); no URL is ever taken. An id works once, a second answer gets the decision that was taken |
+| POST | `/api/firewall/ask` | `{mode}`: `detonation`, `all` or `off` (kept on the server) |
+| GET | `/api/firewall/captures` | The secured samples, newest first |
+| GET | `/api/firewall/capture/<id>` | One capture with its metadata and whether its file still exists |
 
 ---
 

@@ -1995,7 +1995,8 @@ def test_rizin_files_and_upload(rz, monkeypatch):
 
 def test_readable_roots_are_shared_by_download_and_rizin(tdc, client, monkeypatch, tmp_path):
     assert tdc._readable_roots() == [os.path.normpath(tdc.RUSTINEL_ALERTS_DIR), r"C:\Users", r"C:\Windows\Temp",
-                                     r"C:\Temp", tdc.PROCESSDUMP_DIR, tdc.RIZIN_UPLOAD_DIR]
+                                     r"C:\Temp", tdc.PROCESSDUMP_DIR, tdc.RIZIN_UPLOAD_DIR,
+                                     tdc.CAPTURE_DIR]
     assert tdc.RIZIN_UPLOAD_DIR == os.path.join(tempfile.gettempdir(), "rizin_uploads")
     root = tmp_path / "root"
     root.mkdir()

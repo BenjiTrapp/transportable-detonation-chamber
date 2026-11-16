@@ -149,6 +149,21 @@ TDC_ENDPOINTS = frozenset({
     "cdn.winget.microsoft.com", "winget.azureedge.net",
 })
 
+# Update and tool CDNs. A download finding whose URL points here is marked like any other but never becomes
+# a decision: a Windows Update or Edge update job (BITS, svchost.exe) inside a detonation window would otherwise
+# be blocked and fetched, and TDC's own tool updater (powershell.exe) is not matched by is_tdc_image. A name
+# matches itself and every subdomain. The hosts of TDC_ENDPOINTS are here too, except the places where anyone
+# can put a file (github.com, *.githubusercontent.com): a stage 2 on a GitHub release or raw file is common,
+# and exempting it would hide exactly what the capture is for. TDC's own updater is told apart by its
+# ancestry instead (the caller treats a process that descends from the web UI as TDC's own).
+UPDATE_HOSTS = frozenset({
+    "windowsupdate.com", "download.windowsupdate.com", "update.microsoft.com", "sls.update.microsoft.com",
+    "delivery.mp.microsoft.com", "msedge.api.cdp.microsoft.com",
+    "api.github.com", "download.sysinternals.com",
+    "chocolatey.org", "community.chocolatey.org", "packages.chocolatey.org",
+    "cdn.winget.microsoft.com", "winget.azureedge.net",
+})
+
 DGA_ENTROPY = 3.5          # Shannon bits per character of the registered name
 DGA_MIN_LEN = 12           # shorter names carry too little to judge
 DGA_DIGIT_RATIO = 0.3      # or this share of digits
@@ -471,6 +486,12 @@ def is_tdc_image(image: str) -> bool:
             or path.rsplit("\\", 1)[-1] in TDC_BASENAMES)
 
 
+def is_update_host(host: str) -> bool:
+    """Whether ``host`` (a name or an address) is one of ``UPDATE_HOSTS`` or a subdomain of one."""
+    name = _host(host) if isinstance(host, str) else ""
+    return bool(name) and any(part in UPDATE_HOSTS for part in _host_chain(name) + [name])
+
+
 def _is_loopback(ip: str) -> bool:
     try:
         return ipaddress.ip_address(ip).is_loopback
@@ -564,6 +585,11 @@ def _geo(ip: str, ctx: Context) -> Dict[str, Any]:
         lat, lon = geoip.jitter(ip, found.lat, found.lon)
     return {"scope": "public", "cc": found.cc, "country": found.country, "lat": lat, "lon": lon,
             "asn": found.asn, "as_org": found.as_org}
+
+
+def geo_info(ip: str, lookup: Optional[Callable[[str], Any]] = None) -> Dict[str, Any]:
+    """The ``geo`` dict of one address, the same shape ``classify`` gives a flow (for the lookup route)."""
+    return _geo(ip, Context(geo_lookup=lookup) if lookup else Context())
 
 
 def classify(events: List[Dict[str, Any]], fw_events: List[Dict[str, Any]], ctx: Context) -> List[Dict[str, Any]]:

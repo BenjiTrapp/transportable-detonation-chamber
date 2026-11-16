@@ -8,6 +8,7 @@ never touch the files next to app.py or talk to the VM.
 import os
 import sys
 import tempfile
+import time
 
 import pytest
 
@@ -77,3 +78,93 @@ def make_alert(i, pid, ts, image, ppid=None, parent_name="", engine="sigma",
     }
     alert.update(extra)
     return alert
+
+
+# --- FIREWALL tab -------------------------------------------------------------------------------
+
+
+class _FakeResponse:
+    def __init__(self, status, body, headers):
+        self.status, self._body, self._pos, self._headers = status, body, 0, headers
+
+    def getheader(self, name, default=None):
+        for key, value in self._headers.items():
+            if key.lower() == name.lower():
+                return value
+        return default
+
+    def read(self, n=-1):
+        chunk = self._body[self._pos:self._pos + (n if n and n > 0 else len(self._body))]
+        self._pos += len(chunk)
+        return chunk
+
+
+class _FakeConnection:
+    def __init__(self, fw, scheme, host, port, ip):
+        self.fw, self.call = fw, {"scheme": scheme, "host": host, "port": port, "ip": ip}
+        self.sock = None
+
+    def request(self, method, target, headers=None):
+        self.call.update(method=method, target=target, headers=dict(headers or {}))
+        self.fw.fetches.append(self.call)
+
+    def getresponse(self):
+        status, headers, body = self.fw.script.pop(0) if self.fw.script else (
+            200, {"Content-Type": "application/octet-stream"}, self.fw.body)
+        return _FakeResponse(status, body, headers)
+
+    def close(self):
+        pass
+
+
+class FirewallFake:
+    """Everything the FIREWALL routes reach outside the process, as fakes: a Windows firewall behind ``run``
+    (``FakeRun`` of the rules tests), a network behind ``fetches``, and stores in tmp_path.
+
+    ``body`` is what a fetch is served, ``script`` a list of ``(status, headers, body)`` served first (redirects),
+    ``lookups`` every name that was resolved (a fetch must resolve none)."""
+
+    def __init__(self, tdc, run, store, settings, pending, tmp_path):
+        self.tdc, self.run, self.store, self.settings, self.pending = tdc, run, store, settings, pending
+        self.samples = tmp_path / "samples"
+        self.fetches, self.script, self.lookups = [], [], []
+        self.body = b"MZ" + b"\x00" * 100
+        self.resolve_to = "9.9.9.9"
+
+    @property
+    def profiles(self):
+        return self.run.profiles
+
+    @profiles.setter
+    def profiles(self, value):
+        self.run.profiles = dict(value)
+
+
+class _InlineExecutor:
+    def submit(self, fn, *args):
+        fn(*args)
+
+
+@pytest.fixture
+def fw(tdc, monkeypatch, tmp_path):
+    from test_firewall_rules import FakeRun
+    import firewall_store
+    m = tdc
+    fake = FirewallFake(m, FakeRun(), firewall_store.FirewallStore(), firewall_store.Settings(str(tmp_path / "state.json")),
+                        firewall_store.PendingStore(str(tmp_path / "pending.json")), tmp_path)
+    for name, value in (("_fw_runner", fake.run), ("_fw_store", fake.store), ("_fw_settings", fake.settings),
+                        ("_fw_pending", fake.pending), ("_fw_executor", _InlineExecutor()),
+                        ("CAPTURE_DIR", str(fake.samples)), ("CAPTURES_FILE", str(tmp_path / "captures.json")),
+                        ("_fw_downloads", {}), ("_fw_scan_state", {"done": False}), ("_fw_rules_cache", None),
+                        ("_fw_windows_cache", (0.0, {})), ("_fw_window_alive", {}),
+                        ("_fw_ioc_cache", (time.time() + 1e6, (frozenset(), frozenset())))):
+        monkeypatch.setattr(m, name, value)
+    monkeypatch.setattr(m, "_process_started_at", lambda pid: None)
+    monkeypatch.setattr(m, "_pinned_connection",
+                        lambda scheme, host, port, ip, timeout: _FakeConnection(fake, scheme, host, port, ip))
+
+    def resolving(host, *args, **kwargs):
+        fake.lookups.append(host)
+        return [(2, 1, 6, "", (fake.resolve_to, 0))]
+    monkeypatch.setattr("socket.getaddrinfo", resolving)
+    return fake

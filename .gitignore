@@ -43,6 +43,14 @@ webui/logs/
 tests/samples/*.exe
 tests/samples/*.pdb
 
+# FIREWALL tab state: decisions, captures, settings (the samples themselves are in C:\tdc\samples)
+webui/pending.json
+webui/pending.json.tmp
+webui/captures.json
+webui/captures.json.tmp
+webui/firewall_state.json
+webui/firewall_state.json.tmp
+
 # Tool update state
 webui/tool_updates_state.json
 webui/tool_updates_state.json.tmp
