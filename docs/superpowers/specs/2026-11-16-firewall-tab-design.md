@@ -251,7 +251,7 @@ Flows, die DNS-Karte, die Alert-Liste, die Submissions, die IOC-Listen.
 | `beacon` | kritisch | `memory_evidence.beaconing_from_connections` findet einen Rhythmus (bestehender Code, wiederverwendet) |
 | `sigma` | hoch | ein Rustinel-/Fibratus-Alert nennt dieses `ip:port` (`raw.destination.*`, `raw.network.destination.*`) |
 | `detonated` | hoch | der Prozess oder ein Vorfahr ist eine Submission (bestehende PID→Submission-Fenster) |
-| `direct-ip` | hoch | keine DNS-Antwort in der Karte löst auf diese IP auf — hartkodiertes Ziel |
+| `direct-ip` | hoch | weder eine DNS-Antwort in der Karte noch Sysmons eigenes `DestinationHostname` erklärt diese IP — hartkodiertes Ziel. Sysmon füllt das Feld aus dem DNS-Cache, ein gesetzter Name ist also Beleg, dass ein Name im Spiel war; ohne diese Ausnahme würde jede zwischengespeicherte Auflösung als „hartkodiertes C2" durchgehen |
 | `download` | hoch | zu dieser Verbindung wurde eine URL auf eine ausführbare Datei gesehen |
 | `lolbin` | mittel | `image` in der LOLBin-Liste (certutil, bitsadmin, mshta, regsvr32, rundll32, curl, wscript, powershell …) |
 | `dga` | mittel | der auflösende Name hat hohe Entropie oder viele Ziffern. **Nicht** „blieb ohne Ergebnis": wo keine Antwort kam, gibt es keine Adresse und damit keine Verbindung zum Markieren — unauflösbare DGA-Namen zeigt der Hunting-Hinweis `source=dns result="-" \| top query` |
