@@ -254,7 +254,7 @@ Flows, die DNS-Karte, die Alert-Liste, die Submissions, die IOC-Listen.
 | `direct-ip` | hoch | keine DNS-Antwort in der Karte löst auf diese IP auf — hartkodiertes Ziel |
 | `download` | hoch | zu dieser Verbindung wurde eine URL auf eine ausführbare Datei gesehen |
 | `lolbin` | mittel | `image` in der LOLBin-Liste (certutil, bitsadmin, mshta, regsvr32, rundll32, curl, wscript, powershell …) |
-| `dga` | mittel | der auflösende Name hat hohe Entropie, viele Ziffern oder blieb ohne Ergebnis |
+| `dga` | mittel | der auflösende Name hat hohe Entropie oder viele Ziffern. **Nicht** „blieb ohne Ergebnis": wo keine Antwort kam, gibt es keine Adresse und damit keine Verbindung zum Markieren — unauflösbare DGA-Namen zeigt der Hunting-Hinweis `source=dns result="-" \| top query` |
 | `risky-tld` | mittel | `.onion`, `.bit`, `.top`, `.xyz`, `.tk`, `.ml`, `.ga`, `.cf` |
 | `dead-drop` | mittel | bekannter Ablage-Dienst (telegram, pastebin, discord, raw.githubusercontent, transfer.sh …) |
 | `rare-port` | mittel | Port außerhalb der üblichen Liste, oder einer der Klassiker 4444/5555/6666/8888/9999/31337 |
