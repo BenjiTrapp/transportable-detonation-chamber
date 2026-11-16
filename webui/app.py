@@ -11483,8 +11483,9 @@ def _fw_claim_fetch_path(names, timeout=None):
     **its** problem, so two fetches sharing a rule tell the same story about it. A set of names that is being
     removed, and a full sweep, are waited out, so no removal can take away a rule a new fetch just made. The
     waiting happens on the condition and never on a PowerShell call, which is why the collector thread is only
-    ever behind the bookkeeping. Waiting longer than ``FETCH_PATH_WAIT_S`` gives up: ``held`` is then False,
-    nothing was claimed and there is nothing to give back.
+    ever behind the bookkeeping. Waiting longer than ``FETCH_PATH_WAIT_S`` gives up. Against a sweep or a
+    removal of these rules ``held`` is then False, nothing was claimed and there is nothing to give back; against
+    another fetch's write the call takes a share anyway (``held`` True), which has to be given back like any other.
     """
     deadline = time.monotonic() + (FETCH_PATH_WAIT_S if timeout is None else timeout)
     with _fw_fetch_cond:
