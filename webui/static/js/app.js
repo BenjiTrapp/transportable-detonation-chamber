@@ -429,6 +429,9 @@ function switchTab(tabName) {
     if (tabName === 'sysmon' && sysmonEvents.length === 0) {
         refreshSysmon();
     }
+    if (tabName === 'firewall') {
+        firewallTabShown();
+    }
     if (tabName === 'logs') {
         logsTabShown();
     }
@@ -13080,6 +13083,1186 @@ function logsTabShown() {
     }
     refreshLogsSources();
     runLogsSearch({ silent: true });
+}
+
+// =============================================
+// FIREWALL (the chamber's connections: who talks to whom, and the switches that cut it)
+// =============================================
+// The head holds LIVE, ASK (what TDC does when a process in the chamber
+// fetches a file; the setting lives on the server), ISOLATED and the range;
+// under it the bands that say what is not enforced (a firewall profile off,
+// ASK off, rules that could not be read, ISOLATED with what it leaves open).
+// On the left the process tree: a process a row, unfolded its endpoints, TDC's
+// own processes and local addresses in groups of their own. In the middle MAP
+// | LIST | ASN, the hunting hints of the selection and the secured samples;
+// the summary below that, or as a third column on a wide window.
+// Everything a flow carries comes from the VM, most of it from the sample:
+// every text goes through escapeHtml, every class part is a known token, a
+// value in a query goes through logsQuote, and a URL or a host name is only
+// ever shown defanged (fwDefang), never as a link.
+const FW_RANGES = ['15m', '1h', '4h', '24h', '7d', 'All'];
+const FW_DEFAULT_RANGE = '1h';
+const FW_RANGE_KEY = 'tdc.firewall.range';
+const FW_VIEW_KEY = 'tdc.firewall.view';
+const FW_VIEWS = ['map', 'list', 'asn'];
+const FW_LIVE_MS = 5000;
+// Every this many LIVE ticks also the summary, ISOLATED, the captures and the rules: they are no poll paths of
+// the access log, and ISOLATED and the rules cost a PowerShell call on the VM
+const FW_SLOW_EVERY = 6;
+// The flows asked for (the most severe first), the destinations drawn on the map, the rows of LIST and the
+// endpoints of a process shown before "Show all"
+const FW_MAX = 5000;
+const FW_MAP_MAX = 300;
+const FW_LIST_MAX = 1000;
+const FW_EP_PAGE = 50;
+const FW_ASK_MODES = [
+    { mode: 'detonation', label: 'Detonation', text: 'A download from the detonation is blocked at once, then asked about; everything else is only tagged.' },
+    { mode: 'all', label: 'All', text: 'Every download seen is blocked and asked about, except those of TDC itself outside a detonation.' },
+    { mode: 'off', label: 'Off', text: 'Nothing is blocked and nothing fetched by TDC: connections are only tagged and logged.' },
+];
+// The tags of webui/firewall.py (TAGS) and their tones: the most severe tag of a row or an arc is its colour
+const FW_TONES = {
+    ioc: 'critical', beacon: 'critical', sigma: 'high', detonated: 'high', 'direct-ip': 'high', download: 'high',
+    'tdc-anomaly': 'high', lolbin: 'medium', dga: 'medium', 'risky-tld': 'medium', 'dead-drop': 'medium',
+    'rare-port': 'medium', newborn: 'low', dropped: 'info',
+};
+const FW_TAG_INFO = {
+    ioc: 'The address or the name is on an IOC list (ioc/ips.txt, ioc/domains.txt).',
+    beacon: 'The connections come in a rhythm: beaconing.',
+    sigma: 'A Rustinel or Fibratus alert names this address and port.',
+    detonated: 'The process or one of its ancestors is a submission.',
+    'direct-ip': 'No DNS answer explains this address: a hard-coded target.',
+    download: 'A URL to an executable file was seen for this connection.',
+    'tdc-anomaly': 'One of TDC\'s own processes talks to an endpoint it has no business with.',
+    lolbin: 'A living-off-the-land binary talks to the network.',
+    dga: 'The name looks generated: high entropy or many digits.',
+    'risky-tld': 'The name is under a top-level domain that malware favours.',
+    'dead-drop': 'A known dead-drop service: paste sites, chat, raw file hosts.',
+    'rare-port': 'An unusual port, or one of the classics of malware (4444, 31337 and the like).',
+    newborn: 'The process was less than a minute old when it connected.',
+    dropped: 'The Windows Firewall dropped packets to this endpoint, of whichever process.',
+};
+const FW_GROUP_INFO = {
+    tdc: 'TDC\'s own processes: tagged like any other, never blocked or asked about from here. A tdc-anomaly tag is an endpoint TDC has no business with.',
+    local: 'Private, loopback, link-local and multicast addresses: they are not on the map.',
+};
+const FW_SELF_NOTE = 'One of TDC\'s own processes: it is not blocked from here, because that could cut TDC itself off.';
+const FW_BYTES_NOTE = 'Sysmon has no byte counts; the tab counts connections and firewall records.';
+const FW_ISOLATE_TEXT = 'ISOLATED sets the default outbound action of every Windows Firewall profile to Block. Cut off: every outbound '
+    + 'connection of every program in the chamber, the sample\'s and Windows\' alike, DNS, NTP and Windows Update included, and '
+    + 'TDC\'s tool updates. Still reachable: loopback, which TDC\'s own services use, and this web UI from the host, since '
+    + 'inbound connections are untouched. TDC\'s own sample fetch is let out to one address at a time, only while it runs. '
+    + 'The way back: this button again, or scripts/tdc-unisolate.ps1 on the VM if the web UI is gone.';
+// Ready LOGS queries for the selection (needs: the part of the selection a hint takes, '' for none)
+const FW_HINTS = [
+    { label: 'Who else talks to this endpoint', needs: 'ip', query: s => `dst_ip=${logsQuote(s.ip)} | top image` },
+    { label: 'The rhythm of this process', needs: 'image', query: s => `source=netflow image=${logsQuote(s.image)} | timechart span=1m count by dst_ip` },
+    { label: 'What the firewall dropped', needs: '', query: () => 'source=firewall action=DROP | stats count by dst_ip, dst_port' },
+    { label: 'Names that never resolved: DGA suspects', needs: '', query: () => 'source=dns result="-" | top query' },
+    { label: 'Download cradles in clear text', needs: '', query: () => 'source=powershell "http" | head 50' },
+];
+const FW_DECIDED = { allow: 'ALLOWED', block: 'BLOCKED', block_fetch: 'BLOCKED + FETCHED' };
+// What the routes said last; isolate, summary, captures and rules come with the slower round
+let fwState = { loaded: false, error: null, flows: [], count: 0, truncated: false, rulesError: null, isolated: false, askMode: 'detonation', pending: [], history: [], summary: null, isolate: null, captures: [], rules: null, rulesListError: null, live: true };
+let fwSeq = 0;                         // a response older than the last request is dropped
+let fwSlowSeq = 0;                     // the same for the slower round
+let fwReady = false;
+let fwTimer = null;
+let fwTicks = 0;
+let fwRange = FW_DEFAULT_RANGE;
+let fwView = 'map';
+let fwSelected = '';                   // 'p:<image|pid>', 'f:<flow key>' or 'a:<address>'
+let fwFilter = '';
+let fwOpen = new Map();                // a group, or 'p:<process key>' -> open, as the analyst left it
+let fwMore = new Set();                // process keys whose endpoints are all shown
+let fwWorld = null;                    // world.json, once it is loaded
+let fwWorldAsked = false;
+let fwLastSig = '';
+
+// --- Text of the VM ---
+function fwOwn(table, key) {
+    return Object.prototype.hasOwnProperty.call(table, String(key)) ? table[String(key)] : undefined;
+}
+
+function fwText(value) {
+    return _worldText(value);
+}
+
+function fwShort(value, max) {
+    return _chartEllipsis(_worldText(value), max);
+}
+
+function fwNumber(n) {
+    const value = Number(n);
+    return Number.isFinite(value) ? value.toLocaleString('en-US') : '0';
+}
+
+function fwBase(image) {
+    const s = String(image ?? '');
+    return s.split(/[\\/]/).pop() || s;
+}
+
+// A URL or a host name as text nobody follows by accident: http(s) becomes
+// hxxp(s), the dots of the host part [.], and any other scheme scheme[:]
+// (javascript:, data:, ftp:); bidi controls go
+function fwDefang(text) {
+    const s = _worldText(text);
+    if (!s) return '';
+    const m = /^([a-z][a-z0-9+.-]*):(\/\/)?/i.exec(s);
+    const scheme = m && (m[2] || !m[1].includes('.')) ? m : null;
+    let head = '', rest = s;
+    if (scheme) {
+        rest = s.slice(scheme[0].length);
+        head = /^https?$/i.test(scheme[1]) ? `${scheme[1].replace(/t/g, 'x').replace(/T/g, 'X')}:${scheme[2] || ''}`
+            : `${scheme[1]}[:]${scheme[2] || ''}`;
+        if (!scheme[2]) return head + rest;
+    }
+    const cut = rest.search(/[/?#]/);
+    const host = cut < 0 ? rest : rest.slice(0, cut);
+    return head + host.replace(/\./g, '[.]') + (cut < 0 ? '' : rest.slice(cut));
+}
+
+// --- Tones ---
+function fwTone(tone) {
+    return ALERT_SEVERITIES.includes(tone) ? tone : 'info';
+}
+
+function fwToneRank(tone) {
+    const i = ALERT_SEVERITIES.indexOf(tone);
+    return i < 0 ? ALERT_SEVERITIES.length - 1 : i;
+}
+
+// The tone of the most severe of the tags ('info' for none, or none it knows)
+function fwToneOf(tags) {
+    let best = ALERT_SEVERITIES.length - 1;
+    for (const tag of tags || []) best = Math.min(best, fwToneRank(fwOwn(FW_TONES, tag)));
+    return ALERT_SEVERITIES[best];
+}
+
+// The tags of a flow and of its endpoint (dropped belongs to the endpoint)
+function fwFlowTags(flow) {
+    return [...new Set([...(flow.tags || []), ...(flow.endpoint_tags || [])].map(String))];
+}
+
+function fwTagChips(tags, max) {
+    const list = [...new Set((tags || []).map(String))]
+        .sort((a, b) => fwToneRank(fwOwn(FW_TONES, a)) - fwToneRank(fwOwn(FW_TONES, b)));
+    const chip = tag => `<span class="fw-tag fw-tone-${fwTone(fwOwn(FW_TONES, tag))}" title="${escapeHtml(fwOwn(FW_TAG_INFO, tag) || 'A tag this tab does not know.')}">${escapeHtml(fwShort(tag, 24))}</span>`;
+    const rest = list.slice(max);
+    return list.slice(0, max).map(chip).join('')
+        + (rest.length ? `<span class="fw-tag fw-tag-more" title="${escapeHtml(rest.map(t => fwShort(t, 40)).join(', '))}">+${rest.length}</span>` : '');
+}
+
+// --- Keys and the selection ---
+function fwFlowKey(f) {
+    return [f.image, f.pid, f.protocol, f.src_ip, f.dst_ip, f.dst_port].join('|');
+}
+
+function fwProcKey(f) {
+    return `${f.image}|${f.pid}`;
+}
+
+function fwAddr(f) {
+    const ip = String(f.dst_ip ?? '');
+    const port = f.dst_port === null || f.dst_port === undefined ? '' : `:${f.dst_port}`;
+    const proto = f.protocol ? `/${String(f.protocol).toUpperCase()}` : '';
+    return `${ip.includes(':') && port ? `[${ip}]` : ip}${port}${proto}`;
+}
+
+function fwIsOpen(id, dflt) {
+    return fwOpen.has(id) ? fwOpen.get(id) : dflt;
+}
+
+// The flows the filter lets through: process, address, host name, AS and country
+function fwVisible(flows) {
+    const needle = fwFilter.trim().toLowerCase();
+    if (!needle) return flows;
+    return flows.filter(f => [f.image, f.dst_ip, f.dst_hostname, f.geo && f.geo.as_org, f.geo && f.geo.country, f.geo && f.geo.cc]
+        .some(v => v !== null && v !== undefined && String(v).toLowerCase().includes(needle)));
+}
+
+// What fwSelected stands for: {id, kind, image, pid, ip, flows}, or null
+function fwSelection() {
+    const id = fwSelected;
+    const flows = fwState.flows || [];
+    let list = [];
+    if (id.startsWith('p:')) list = flows.filter(f => fwProcKey(f) === id.slice(2));
+    else if (id.startsWith('f:')) list = flows.filter(f => fwFlowKey(f) === id.slice(2)).slice(0, 1);
+    else if (id.startsWith('a:')) list = flows.filter(f => f.dst_ip === id.slice(2));
+    if (!list.length) return null;
+    const kind = id[0] === 'p' ? 'process' : id[0] === 'f' ? 'flow' : 'address';
+    const images = new Set(list.map(f => f.image));
+    return { id, kind, flows: list, image: images.size === 1 ? list[0].image : '', pid: kind === 'address' ? null : list[0].pid,
+        ip: kind === 'process' ? '' : list[0].dst_ip };
+}
+
+// A process, an endpoint or a point of the map is chosen: its rows unfold, the hints are about it
+function fwSelect(id) {
+    const next = String(id ?? '');
+    fwSelected = next === WORLD_CHAMBER_ID ? '' : next;
+    const sel = fwSelection();
+    if (sel && sel.kind !== 'process') {
+        for (const f of sel.flows) {
+            fwOpen.set(`p:${fwProcKey(f)}`, true);
+            fwOpen.set(f.self ? 'tdc' : f.geo && f.geo.scope === 'local' ? 'local' : 'main', true);
+        }
+    }
+    renderFirewallTree(fwState.flows);
+    if (fwView !== 'map') renderFirewallView();
+    renderFirewallHints(sel);
+}
+
+// --- Rules and the switches ---
+function fwEnforceOff() {
+    const off = fwState.isolate && Array.isArray(fwState.isolate.profiles_off) ? fwState.isolate.profiles_off : [];
+    return off.length ? `Windows Firewall is off for ${off.map(p => fwText(p)).join(', ')}: a rule would be accepted and do nothing, so nothing can be enforced.` : '';
+}
+
+function fwIsolatedOn() {
+    return !!fwState.isolated;
+}
+
+function fwRuleById(id) {
+    return (fwState.rules || []).find(r => r && r.rule_id === id) || null;
+}
+
+function fwRuleProto(rule) {
+    return rule ? (rule.protocol ? String(rule.protocol).toUpperCase() : 'ANY') : '?';
+}
+
+// The block of a whole program: a TDC rule with this image and no address
+function fwProcessRule(image) {
+    const img = String(image ?? '').toLowerCase();
+    return (fwState.rules || []).find(r => r && r.kind === 'block' && r.blocking !== false && !r.ip && r.image
+        && String(r.image).toLowerCase() === img) || null;
+}
+
+function fwUnknownSwitch() {
+    return `<span class="fw-switch is-unknown" title="${escapeHtml(`The TDC rules could not be read, so whether this is blocked is unknown: ${fwShort(fwState.rulesError, 300)}`)}">?</span>`;
+}
+
+function fwEndpointSwitch(flow) {
+    if (fwState.rulesError) return fwUnknownSwitch();
+    const off = fwEnforceOff();
+    if (flow.state === 'blocked' && flow.rule_id) {
+        const rule = fwRuleById(flow.rule_id);
+        const proto = fwRuleProto(rule);
+        const mismatch = !!(rule && rule.protocol && flow.protocol && String(rule.protocol).toLowerCase() !== String(flow.protocol).toLowerCase());
+        const what = !rule ? 'a rule not in the list read' : rule.protocol ? `a rule for ${proto} only` : 'a rule for every protocol';
+        const title = `Blocked by ${fwText(flow.rule_id)}, ${what}`
+            + (mismatch ? `; this connection is ${String(flow.protocol).toUpperCase()}, so it may still get through` : '')
+            + '. Click to remove the rule.';
+        return `<button type="button" class="fw-switch is-deny${mismatch ? ' is-mismatch' : ''}" data-fw-unblock="${escapeHtml(flow.rule_id)}" aria-pressed="true" title="${escapeHtml(off || title)}"${off ? ' disabled' : ''}>DENY<span class="fw-proto">${escapeHtml(proto)}</span></button>`;
+    }
+    const reason = off || (flow.self ? FW_SELF_NOTE : '');
+    const pending = flow.state === 'pending';
+    const title = pending ? 'A decision about this endpoint is open. Click to block this program to this address now.'
+        : 'Allowed. Click to block this program to this address, on every port.';
+    return `<button type="button" class="fw-switch ${pending ? 'is-pending' : 'is-allow'}" data-fw-block="endpoint" data-fw-key="${escapeHtml(fwFlowKey(flow))}" aria-pressed="false" title="${escapeHtml(reason || title)}"${reason ? ' disabled' : ''}>${pending ? 'PENDING' : 'ALLOW'}</button>`;
+}
+
+function fwProcessSwitch(proc) {
+    if (fwState.rulesError) return fwUnknownSwitch();
+    const off = fwEnforceOff();
+    const rule = fwProcessRule(proc.image);
+    if (rule) {
+        const title = `Every outbound connection of this program is blocked by ${fwText(rule.rule_id)} (${fwRuleProto(rule)}). Click to remove the rule.`;
+        return `<button type="button" class="fw-switch is-deny" data-fw-unblock="${escapeHtml(rule.rule_id)}" aria-pressed="true" title="${escapeHtml(off || title)}"${off ? ' disabled' : ''}>DENY<span class="fw-proto">${escapeHtml(fwRuleProto(rule))}</span></button>`;
+    }
+    const reason = off || (proc.self ? FW_SELF_NOTE : '');
+    return `<button type="button" class="fw-switch is-allow" data-fw-block="process" data-fw-key="${escapeHtml(proc.key)}" aria-pressed="false" title="${escapeHtml(reason || 'Click to block every outbound connection of this program.')}"${reason ? ' disabled' : ''}>ALLOW</button>`;
+}
+
+// --- The tree ---
+// The flows as groups (the sample's, TDC's own, local addresses), each a list of processes, the most severe first
+function fwGroups(flows) {
+    const groups = [{ id: 'main', title: 'PROCESSES', procs: new Map() }, { id: 'tdc', title: 'TDC', procs: new Map() },
+        { id: 'local', title: 'LOCAL', procs: new Map() }];
+    for (const f of flows) {
+        const group = f.self ? groups[1] : f.geo && f.geo.scope === 'local' ? groups[2] : groups[0];
+        const key = fwProcKey(f);
+        let proc = group.procs.get(key);
+        if (!proc) {
+            proc = { key, image: f.image, pid: f.pid, self: !!f.self, flows: [], count: 0, tags: new Set(), rank: ALERT_SEVERITIES.length - 1, times: [] };
+            group.procs.set(key, proc);
+        }
+        proc.flows.push(f);
+        proc.count += Number(f.count) || 0;
+        (f.tags || []).forEach(t => proc.tags.add(String(t)));
+        proc.rank = Math.min(proc.rank, fwToneRank(fwToneOf(fwFlowTags(f))));
+        if (proc.times.length < 2000) proc.times.push(...(f.times || []).slice(-200));
+    }
+    const flowRank = f => fwToneRank(fwToneOf(fwFlowTags(f)));
+    return groups.map(g => {
+        const procs = [...g.procs.values()];
+        procs.forEach(p => {
+            p.tone = ALERT_SEVERITIES[p.rank];
+            p.flows.sort((a, b) => flowRank(a) - flowRank(b) || (Number(b.count) || 0) - (Number(a.count) || 0));
+        });
+        procs.sort((a, b) => a.rank - b.rank || b.count - a.count || fwBase(a.image).localeCompare(fwBase(b.image)));
+        return { id: g.id, title: g.title, procs };
+    });
+}
+
+// Connections over the range, 16 bars of a small SVG
+function fwSparkSvg(times) {
+    const list = (times || []).map(Number).filter(Number.isFinite);
+    if (!list.length) return '<span class="fw-spark" aria-hidden="true"></span>';
+    const span = fwRangeMs(fwRange) / 1000;
+    const to = span ? Date.now() / 1000 : list.reduce((m, t) => Math.max(m, t), -Infinity);
+    let from = span ? to - span : list.reduce((m, t) => Math.min(m, t), Infinity);
+    if (!(to > from)) from = to - 1;
+    const bins = 16, counts = new Array(bins).fill(0);
+    for (const t of list) {
+        const i = Math.floor((t - from) / (to - from) * bins);
+        if (i >= 0) counts[Math.min(i, bins - 1)]++;
+    }
+    const top = Math.max(...counts) || 1;
+    const rects = counts.map((n, i) => {
+        if (!n) return '';
+        const h = Math.max(1.5, 12 * n / top);
+        return `<rect x="${i * 3}" y="${_chartCoord(12 - h)}" width="2" height="${_chartCoord(h)}"/>`;
+    }).join('');
+    return `<svg class="fw-spark" viewBox="0 0 48 12" width="48" height="12" aria-hidden="true"><path class="fw-spark-base" d="M0 11.5H48"/>${rects}</svg>`;
+}
+
+// The URLs seen for an endpoint: of its open and decided downloads, and of the samples secured from it
+function fwUrlsFor(flow) {
+    const out = [], seen = new Set();
+    const add = (url, status) => {
+        const u = String(url ?? '');
+        if (!u || seen.has(u) || out.length >= 5) return;
+        seen.add(u);
+        out.push({ url: u, status });
+    };
+    const mine = item => item && item.finding && item.finding.pid === flow.pid && item.finding.dst_ip === flow.dst_ip
+        && item.finding.dst_port === flow.dst_port;
+    (fwState.pending || []).filter(mine).forEach(item => add(item.finding.url, 'BLOCKED, ASKING'));
+    (fwState.history || []).filter(mine).forEach(item => add(item.finding.url, fwOwn(FW_DECIDED, item.action) || 'DECIDED'));
+    const ids = new Set((flow.capture_ids || []).map(String));
+    (fwState.captures || []).filter(c => c && ids.has(String(c.id))).forEach(c => add(c.url, 'SECURED'));
+    return out;
+}
+
+function fwUrlsHtml(flow) {
+    return fwUrlsFor(flow).map(({ url, status }) => {
+        const text = fwDefang(url);
+        return `<div class="fw-ep-url"><span class="fw-url-state">${escapeHtml(status)}</span><code class="fw-url" title="${escapeHtml(fwShort(text, 2000))}">${escapeHtml(fwShort(text, 120))}</code></div>`;
+    }).join('');
+}
+
+function fwEndpointHtml(flow) {
+    const id = `f:${fwFlowKey(flow)}`;
+    const tags = fwFlowTags(flow);
+    const host = flow.dst_hostname ? fwDefang(flow.dst_hostname) : '';
+    const geo = flow.geo || {};
+    const title = [host && fwShort(host, 500), fwAddr(flow), geo.country && fwShort(geo.country, 80),
+        geo.as_org && `AS${geo.asn ?? '?'} ${fwShort(geo.as_org, 120)}`, `${fwNumber(flow.count)} connections`].filter(Boolean).join(' · ');
+    const fwlog = Number(flow.fw_records) > 0
+        ? `<span class="fw-fwrec" title="${escapeHtml(`FW (endpoint): ${fwNumber(flow.fw_records)} records in the Windows Firewall log for this endpoint, of whichever process: ${fwNumber(flow.fw_allowed)} allowed, ${fwNumber(flow.fw_dropped)} dropped`)}">FW ${fwNumber(flow.fw_records)}</span>` : '';
+    return `<div class="fw-ep fw-tone-${fwToneOf(tags)}${fwSelected === id ? ' is-selected' : ''}" role="listitem">`
+        + `<div class="fw-ep-row"><button type="button" class="fw-ep-main" data-fw-id="${escapeHtml(id)}" title="${escapeHtml(title)}">`
+        + `<span class="fw-ep-host">${escapeHtml(host ? fwShort(host, 80) : fwShort(flow.dst_ip, 46))}</span>`
+        + (geo.cc ? `<span class="fw-cc">${escapeHtml(fwShort(geo.cc, 3))}</span>` : '') + '</button>'
+        + `<span class="fw-num" title="Connections">${fwNumber(flow.count)}</span>${fwEndpointSwitch(flow)}</div>`
+        + `<div class="fw-ep-sub"><span class="fw-ep-addr">${escapeHtml(host ? fwShort(fwAddr(flow), 60) : fwShort(fwAddr(flow).slice(String(flow.dst_ip ?? '').length), 20))}</span>`
+        + `${fwlog}<span class="fw-ep-tags">${fwTagChips(tags.filter(t => t !== 'detonated'), 3)}</span></div>`
+        + fwUrlsHtml(flow) + '</div>';
+}
+
+function fwProcHtml(proc) {
+    const id = `p:${proc.key}`;
+    const open = fwIsOpen(id, fwFilter.trim() ? true : !proc.self && proc.rank <= 1);
+    const detonated = proc.tags.has('detonated');
+    const name = fwShort(fwBase(proc.image), 60);
+    const shown = fwMore.has(proc.key) ? proc.flows : proc.flows.slice(0, FW_EP_PAGE);
+    const more = proc.flows.length > shown.length
+        ? `<button type="button" class="btn btn-xs fw-more" data-fw-more="${escapeHtml(proc.key)}">Show all ${fwNumber(proc.flows.length)} endpoints</button>` : '';
+    return `<div class="fw-proc fw-tone-${proc.tone}${detonated ? ' is-detonated' : ''}${fwSelected === id ? ' is-selected' : ''}">`
+        + `<div class="fw-proc-row"><button type="button" class="fw-caret-btn" data-fw-toggle="${escapeHtml(id)}" aria-expanded="${open}" aria-label="${escapeHtml(`${open ? 'Fold' : 'Unfold'} the endpoints of ${name}`)}"><span class="fw-caret" aria-hidden="true"></span></button>`
+        + `<button type="button" class="fw-name" data-fw-id="${escapeHtml(id)}" title="${escapeHtml(`${fwShort(proc.image, 500)} · PID ${proc.pid ?? '?'}`)}"><span class="fw-name-text">${escapeHtml(name)}</span><span class="fw-pid">${escapeHtml(String(proc.pid ?? ''))}</span></button>`
+        + fwSparkSvg(proc.times)
+        + `<span class="fw-num" title="${escapeHtml(`${fwNumber(proc.count)} connections to ${fwNumber(proc.flows.length)} endpoints`)}">${fwNumber(proc.count)}</span>`
+        + fwProcessSwitch(proc) + '</div>'
+        + (proc.tags.size ? `<div class="fw-proc-tags">${detonated ? '<span class="fw-det" title="The process or one of its ancestors is a submission">DETONATED</span>' : ''}`
+            + `${fwTagChips([...proc.tags].filter(t => t !== 'detonated'), 3)}</div>` : '')
+        + (open ? `<div class="fw-eps" role="list">${shown.map(fwEndpointHtml).join('')}${more}</div>` : '')
+        + '</div>';
+}
+
+function fwGroupHtml(group) {
+    if (group.id === 'main') {
+        return `<div class="fw-group fw-group-main" data-fw-open="true">${group.procs.map(fwProcHtml).join('')}</div>`;
+    }
+    const open = fwIsOpen(group.id, false);
+    const rank = group.procs.reduce((m, p) => Math.min(m, p.rank), ALERT_SEVERITIES.length - 1);
+    const tags = [...new Set(group.procs.flatMap(p => p.flows.flatMap(fwFlowTags)))];
+    const worst = tags.filter(t => fwToneRank(fwOwn(FW_TONES, t)) === rank && rank < ALERT_SEVERITIES.length - 1);
+    return `<div class="fw-group fw-group-${group.id}" data-fw-open="${open}">`
+        + `<button type="button" class="fw-group-head" data-fw-group="${group.id}" aria-expanded="${open}" title="${escapeHtml(FW_GROUP_INFO[group.id])}">`
+        + `<span class="fw-caret" aria-hidden="true"></span><span class="fw-group-name">${group.title}</span>`
+        + `<span class="fw-num">${fwNumber(group.procs.length)}</span>${fwTagChips(worst, 2)}</button>`
+        + (open ? group.procs.map(fwProcHtml).join('') : '') + '</div>';
+}
+
+function fwEmptyText(flows) {
+    if (fwState.error && !fwState.flows.length) return `The connections could not be loaded: ${fwShort(fwState.error, 300)}`;
+    if (!fwState.loaded) return 'Loading connections…';
+    if ((flows || []).length) return 'Nothing matches the filter.';
+    return 'No connections in this range. Sysmon network events appear here as they come in; a wider range shows older ones.';
+}
+
+function renderFirewallTree(flows) {
+    const host = document.getElementById('firewall-tree');
+    if (!host) return;
+    const list = fwVisible(flows || []);
+    host.innerHTML = list.length ? fwGroups(list).filter(g => g.procs.length).map(fwGroupHtml).join('')
+        : `<div class="fw-empty">${escapeHtml(fwEmptyText(flows))}</div>`;
+}
+
+// --- MAP | LIST | ASN ---
+function renderFirewallView() {
+    if (fwView === 'list') renderFirewallList(fwState.flows);
+    else if (fwView === 'asn') renderFirewallAsn(fwState.flows);
+    else renderFirewallMap(fwState.flows);
+}
+
+function renderFirewallViews() {
+    const host = document.getElementById('firewall-views');
+    if (host) host.innerHTML = FW_VIEWS.map(v => `<button type="button" class="chart-range-btn" data-fw-view="${v}" aria-pressed="${v === fwView}">${v.toUpperCase()}</button>`).join('');
+}
+
+function fwMapTitle(p) {
+    const images = [...new Set(p.flows.map(f => fwBase(f.image)))];
+    const ports = [...new Set(p.flows.map(f => `${f.dst_port ?? '?'}/${String(f.protocol || '').toUpperCase()}`))];
+    const geo = p.geo || {};
+    const tags = [...new Set(p.flows.flatMap(fwFlowTags))];
+    return [p.host ? `${fwShort(fwDefang(p.host), 200)} (${p.ip})` : p.ip,
+        `${images.slice(0, 3).map(i => fwShort(i, 60)).join(', ')}${images.length > 3 ? ` and ${images.length - 3} more` : ''} · ${ports.slice(0, 4).join(' ')}`,
+        [geo.as_org && `AS${geo.asn ?? '?'} ${fwShort(geo.as_org, 120)}`, geo.country && fwShort(geo.country, 80)].filter(Boolean).join(' · '),
+        tags.length ? tags.map(t => fwShort(t, 24)).join(', ') : 'no tags', `${fwNumber(p.count)} connections`].filter(Boolean).join('\n');
+}
+
+// MAP: an arc from the chamber to every public destination (by address), as wide as its connections and
+// coloured by its most severe tag; a local address is never drawn
+function renderFirewallMap(flows) {
+    const host = document.getElementById('firewall-view');
+    if (!host) return;
+    const visible = fwVisible(flows || []);
+    const byIp = new Map();
+    let local = 0;
+    for (const f of visible) {
+        if (!f.geo || f.geo.scope !== 'public') {
+            if (f.geo && f.geo.scope === 'local') local++;
+            continue;
+        }
+        let p = byIp.get(f.dst_ip);
+        if (!p) {
+            p = { ip: String(f.dst_ip ?? ''), flows: [], count: 0, rank: ALERT_SEVERITIES.length - 1, pending: false, geo: f.geo, host: '' };
+            byIp.set(f.dst_ip, p);
+        }
+        p.flows.push(f);
+        p.count += Number(f.count) || 0;
+        p.rank = Math.min(p.rank, fwToneRank(fwToneOf(fwFlowTags(f))));
+        if (f.state === 'pending') p.pending = true;
+        if (!p.host && f.dst_hostname) p.host = f.dst_hostname;
+    }
+    const all = [...byIp.values()];
+    const placed = all.filter(p => project(p.geo.lon, p.geo.lat));
+    placed.sort((a, b) => a.rank - b.rank || b.count - a.count);
+    const drawn = placed.slice(0, FW_MAP_MAX);
+    const points = drawn.map(p => ({ id: `a:${p.ip}`, lon: p.geo.lon, lat: p.geo.lat, tone: ALERT_SEVERITIES[p.rank],
+        r: 2.5 + Math.min(3.5, Math.log10(1 + p.count)), label: p.host ? fwDefang(p.host) : p.ip, title: fwMapTitle(p) }));
+    const arcs = drawn.map(p => ({ from: WORLD_CHAMBER_ID, to: `a:${p.ip}`, tone: ALERT_SEVERITIES[p.rank], weight: p.count,
+        pending: p.pending, title: fwMapTitle(p) }));
+    const notes = [];
+    if (fwState.summary && fwState.summary.geo_available === false) {
+        notes.push('No geo data, so no destination can be placed: run make geoip on the host and deploy again.');
+    }
+    if (placed.length > drawn.length) notes.push(`The ${fwNumber(drawn.length)} most severe of ${fwNumber(placed.length)} destinations are drawn; LIST has them all.`);
+    if (all.length > placed.length) notes.push(`${fwNumber(all.length - placed.length)} public destinations without a known position are in LIST.`);
+    if (local) notes.push(`${fwNumber(local)} connections to local addresses are in the tree, not on the map.`);
+    if (fwState.loaded && !all.length && !visible.length) notes.push(fwEmptyText(flows));
+    host.innerHTML = `<div class="fw-map-wrap chart-clickable">${worldMapSvg(points, arcs, { world: fwWorld })}</div>`
+        + (notes.length ? `<div class="fw-map-notes">${notes.map(n => `<span>${escapeHtml(n)}</span>`).join('')}</div>` : '');
+}
+
+function fwStateCell(flow) {
+    if (fwState.rulesError) return ['?', 'The TDC rules could not be read', 'unknown'];
+    if (flow.state === 'blocked') {
+        const rule = fwRuleById(flow.rule_id);
+        return [`DENY ${fwRuleProto(rule)}`, `Blocked by ${fwText(flow.rule_id)}`, 'deny'];
+    }
+    return flow.state === 'pending' ? ['PENDING', 'A decision is open', 'pending'] : ['ALLOW', 'Allowed', 'allow'];
+}
+
+// LIST: the same flows as a sortable table; the firewall log's numbers are the endpoint's
+function renderFirewallList(flows) {
+    const host = document.getElementById('firewall-view');
+    if (!host) return;
+    const list = fwVisible(flows || []);
+    if (!list.length) {
+        host.innerHTML = `<div class="fw-empty">${escapeHtml(fwEmptyText(flows))}</div>`;
+        return;
+    }
+    const rows = list.slice(0, FW_LIST_MAX).map(f => {
+        const id = `f:${fwFlowKey(f)}`, geo = f.geo || {}, tags = fwFlowTags(f), tone = fwToneOf(tags);
+        const host = f.dst_hostname ? fwDefang(f.dst_hostname) : '';
+        const [state, stateTitle, stateKind] = fwStateCell(f);
+        const fwlog = Number(f.fw_records) > 0 ? `${fwNumber(f.fw_allowed)} / ${fwNumber(f.fw_dropped)}` : '';
+        return `<tr class="fw-list-row fw-tone-${tone}${fwSelected === id ? ' is-selected' : ''}" data-fw-id="${escapeHtml(id)}">`
+            + `<td class="fw-cell-proc" title="${escapeHtml(fwShort(f.image, 500))}" data-sort-value="${escapeHtml(fwShort(fwBase(f.image), 200))}">${escapeHtml(fwShort(fwBase(f.image), 60))}</td>`
+            + `<td class="logs-cell-num" data-sort-value="${Number(f.pid) || 0}">${escapeHtml(String(f.pid ?? ''))}</td>`
+            + `<td title="${escapeHtml(fwShort(host, 500))}">${escapeHtml(fwShort(host, 40))}</td>`
+            + `<td>${escapeHtml(fwShort(f.dst_ip, 46))}</td>`
+            + `<td class="logs-cell-num" data-sort-value="${Number(f.dst_port) || 0}">${escapeHtml(String(f.dst_port ?? ''))}</td>`
+            + `<td>${escapeHtml(String(f.protocol || '').toUpperCase().slice(0, 8))}</td>`
+            + `<td title="${escapeHtml(fwShort(geo.country, 80))}">${escapeHtml(fwShort(geo.cc, 3))}</td>`
+            + `<td title="${escapeHtml(fwShort(geo.as_org, 200))}">${escapeHtml(fwShort(geo.as_org, 30))}</td>`
+            + `<td class="fw-cell-tags" data-sort-value="${fwToneRank(tone)}">${fwTagChips(tags, 3)}</td>`
+            + `<td class="logs-cell-num" data-sort-value="${Number(f.count) || 0}">${fwNumber(f.count)}</td>`
+            + `<td class="logs-cell-num" data-sort-value="${Number(f.fw_records) || 0}" title="Allowed / dropped records of the Windows Firewall log for this endpoint, of whichever process">${fwlog}</td>`
+            + `<td class="fw-cell-state fw-state-${stateKind}" title="${escapeHtml(stateTitle)}">${escapeHtml(state)}</td>`
+            + `<td class="logs-cell-time" data-sort-value="${escapeHtml(sortTimeValue(f.last_seen))}">${escapeHtml(formatAlertTime(f.last_seen))}</td></tr>`;
+    }).join('');
+    const head = ['Process', 'PID', 'Destination', 'Address', 'Port', 'Proto', 'CC', 'AS', 'Tags', 'Conn.', 'FW (endpoint)', 'State', 'Last seen']
+        .map(c => `<th>${c}</th>`).join('');
+    const cut = list.length > FW_LIST_MAX ? `<div class="fw-map-notes"><span>The first ${fwNumber(FW_LIST_MAX)} of ${fwNumber(list.length)} are listed.</span></div>` : '';
+    host.innerHTML = `<div class="logs-table-wrap fw-table-wrap"><table class="logs-table fw-table" data-sortable data-sort-id="firewall-list"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>${cut}`;
+}
+
+// ASN: the public destinations by the organisation that owns them, so that five "different" addresses of
+// one hoster stand in one row
+function renderFirewallAsn(flows) {
+    const host = document.getElementById('firewall-view');
+    if (!host) return;
+    const groups = new Map();
+    for (const f of fwVisible(flows || [])) {
+        if (!f.geo || f.geo.scope !== 'public') continue;
+        const geo = f.geo;
+        const key = geo.asn !== null && geo.asn !== undefined ? `AS${geo.asn}` : geo.as_org ? `org:${geo.as_org}` : '?';
+        let g = groups.get(key);
+        if (!g) {
+            g = { asn: geo.asn, org: geo.as_org || '', ips: new Map(), images: new Set(), countries: new Set(), count: 0, rank: ALERT_SEVERITIES.length - 1 };
+            groups.set(key, g);
+        }
+        const rank = fwToneRank(fwToneOf(fwFlowTags(f)));
+        g.ips.set(f.dst_ip, Math.min(g.ips.has(f.dst_ip) ? g.ips.get(f.dst_ip) : rank, rank));
+        g.images.add(f.image);
+        if (geo.cc) g.countries.add(String(geo.cc));
+        g.count += Number(f.count) || 0;
+        g.rank = Math.min(g.rank, rank);
+    }
+    const list = [...groups.values()].sort((a, b) => a.rank - b.rank || b.ips.size - a.ips.size || b.count - a.count);
+    if (!list.length) {
+        host.innerHTML = `<div class="fw-empty">${escapeHtml(fwState.loaded && !(flows || []).length ? fwEmptyText(flows) : 'No public destinations.')}</div>`;
+        return;
+    }
+    const rows = list.map(g => {
+        const tone = ALERT_SEVERITIES[g.rank];
+        const ips = [...g.ips.entries()].sort((a, b) => a[1] - b[1]);
+        const chips = ips.slice(0, 8).map(([ip, rank]) => `<button type="button" class="fw-ip fw-tone-${ALERT_SEVERITIES[rank]}" data-fw-id="${escapeHtml(`a:${ip}`)}">${escapeHtml(fwShort(ip, 46))}</button>`).join('')
+            + (ips.length > 8 ? `<span class="fw-tag fw-tag-more">+${ips.length - 8}</span>` : '');
+        const countries = [...g.countries];
+        return `<tr class="fw-list-row fw-tone-${tone}">`
+            + `<td class="fw-cell-org" title="${escapeHtml(fwShort(g.org, 300))}">${escapeHtml(g.org ? fwShort(g.org, 40) : 'Unknown AS')}</td>`
+            + `<td data-sort-value="${Number(g.asn) || 0}">${g.asn !== null && g.asn !== undefined ? escapeHtml(`AS${fwShort(g.asn, 12)}`) : ''}</td>`
+            + `<td title="${escapeHtml(countries.map(c => fwShort(c, 3)).join(', '))}">${escapeHtml(countries.slice(0, 4).map(c => fwShort(c, 3)).join(' '))}${countries.length > 4 ? ' …' : ''}</td>`
+            + `<td class="logs-cell-num" data-sort-value="${g.ips.size}">${fwNumber(g.ips.size)}</td>`
+            + `<td class="fw-cell-ips">${chips}</td>`
+            + `<td class="logs-cell-num" data-sort-value="${g.images.size}">${fwNumber(g.images.size)}</td>`
+            + `<td class="logs-cell-num" data-sort-value="${g.count}">${fwNumber(g.count)}</td>`
+            + `<td data-sort-value="${g.rank}"><span class="fw-tag fw-tone-${tone}">${tone.toUpperCase()}</span></td></tr>`;
+    }).join('');
+    const head = ['AS organisation', 'ASN', 'Countries', 'Addresses', '', 'Processes', 'Conn.', 'Tone'].map(c => `<th>${c}</th>`).join('');
+    host.innerHTML = `<div class="logs-table-wrap fw-table-wrap"><table class="logs-table fw-table" data-sortable data-sort-id="firewall-asn"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+// --- Summary, hints, captures ---
+function renderFirewallSummary(summary) {
+    const host = document.getElementById('firewall-summary');
+    if (!host) return;
+    if (!summary) {
+        host.innerHTML = '<div class="fw-empty">Loading the summary…</div>';
+        return;
+    }
+    const s = summary;
+    const tile = (label, value, sub, tone) => `<div class="fw-tile${tone ? ` fw-tone-${tone}` : ''}"><span class="fw-tile-label">${label}</span>`
+        + `<span class="fw-tile-value">${fwNumber(value)}</span>${sub ? `<span class="fw-tile-sub">${sub}</span>` : ''}</div>`;
+    const tiles = tile('CONNECTIONS', s.connections, `${fwNumber(s.events)} single connections`, '')
+        + tile('BLOCKED', s.blocked, '', Number(s.blocked) > 0 ? 'high' : '')
+        + tile('OPEN DECISIONS', s.open_decisions, '', Number(s.open_decisions) > 0 ? 'critical' : '')
+        + tile('SAMPLES', s.captures_total, 'secured', '');
+    const top = (title, items, label) => {
+        const list = Array.isArray(items) ? items : [];
+        const max = list.reduce((m, i) => Math.max(m, Number(i && i.count) || 0), 1);
+        const rows = list.map(item => {
+            const [text, full, id] = label(item || {});
+            const share = Math.max(2, Math.min(100, Math.round(100 * (Number(item && item.count) || 0) / max)));
+            const inner = `<span class="fw-top-label">${escapeHtml(text)}</span><span class="fw-num">${fwNumber(item && item.count)}</span>`;
+            return `<li class="fw-top-row" style="--share:${share}%" title="${escapeHtml(full)}">`
+                + (id ? `<button type="button" class="fw-top-btn" data-fw-id="${escapeHtml(id)}">${inner}</button>` : inner) + '</li>';
+        }).join('');
+        return `<div class="fw-top"><h4 class="fw-top-title">${title}</h4><ul class="fw-top-list">${rows || '<li class="fw-top-none">None.</li>'}</ul></div>`;
+    };
+    host.innerHTML = `<div class="chart-card fw-sum-card"><div class="chart-card-head"><h3 class="chart-card-title" data-info="What the range holds: connections (bundled per process and endpoint), blocks, open decisions and secured samples, with the busiest processes, endpoints and countries.">SUMMARY</h3></div>`
+        + `<div class="fw-tiles">${tiles}</div>`
+        + top('TOP PROCESSES', s.top_processes, i => [fwShort(fwBase(i.image), 40), fwShort(i.image, 500), ''])
+        + top('TOP ENDPOINTS', s.top_endpoints, i => {
+            const name = i.dst_hostname ? fwDefang(i.dst_hostname) : String(i.dst_ip ?? '');
+            const port = i.dst_port === null || i.dst_port === undefined ? '' : `:${i.dst_port}`;
+            return [`${fwShort(name, 40)}${port}`, `${fwShort(name, 500)} (${fwShort(i.dst_ip, 46)}${port})`, i.dst_ip ? `a:${i.dst_ip}` : ''];
+        })
+        + top('TOP COUNTRIES', s.top_countries, i => [`${fwShort(i.cc, 3)} ${fwShort(i.country, 40)}`.trim(), fwShort(i.country, 80), ''])
+        + `<p class="fw-sum-note">${escapeHtml(fwShort(s.bytes_note || FW_BYTES_NOTE, 300))} The bars count connections; exact traffic needs the proxy of Part B.</p></div>`;
+}
+
+function fwSelectionHtml(sel) {
+    const f = sel.flows[0];
+    const name = sel.image ? fwShort(fwBase(sel.image), 60) : `${fwNumber(new Set(sel.flows.map(x => x.image)).size)} processes`;
+    const host = f.dst_hostname ? fwDefang(f.dst_hostname) : '';
+    const geo = f.geo || {};
+    let what;
+    if (sel.kind === 'process') what = `${name} · PID ${sel.pid ?? '?'} · ${fwNumber(sel.flows.length)} endpoints`;
+    else what = `${sel.kind === 'flow' ? `${name} → ` : ''}${host ? `${fwShort(host, 80)} ` : ''}${sel.kind === 'flow' ? fwAddr(f) : fwShort(sel.ip, 46)}`
+        + `${sel.kind === 'address' ? ` · ${name}` : ''}${geo.as_org ? ` · ${fwShort(geo.as_org, 40)}` : ''}${geo.cc ? ` · ${fwShort(geo.cc, 3)}` : ''}`;
+    let actions = '';
+    if (sel.ip) {
+        const off = fwEnforceOff();
+        actions = `<button type="button" class="btn btn-xs fw-copy" data-fw-copy="${escapeHtml(host || String(sel.ip))}" title="Copy ${escapeHtml(host ? 'the defanged name' : 'the address')}">COPY</button>`
+            + `<button type="button" class="btn btn-xs fw-block-all" data-fw-block="endpoint_all" data-fw-ip="${escapeHtml(sel.ip)}" title="${escapeHtml(off || 'Block this address for every program, TDC\'s own fetcher included (asks first).')}"${off ? ' disabled' : ''}>BLOCK FOR EVERY PROGRAM</button>`;
+    }
+    return `<span class="fw-sel-what" title="${escapeHtml(what)}">${escapeHtml(what)}</span><span class="fw-sel-actions">${actions}</span>`;
+}
+
+// HUNT FURTHER: ready queries for the LOGS tab about the selection, and those always worth a look
+function renderFirewallHints(sel) {
+    const host = document.getElementById('firewall-hints');
+    if (!host) return;
+    const items = FW_HINTS.map((hint, i) => ({ hint, i })).filter(({ hint }) => !hint.needs || (sel && sel[hint.needs]))
+        .map(({ hint, i }) => `<li><button type="button" class="fw-hint" data-fw-hint="${i}" title="Run this search in LOGS">`
+            + `<span class="fw-hint-label">${escapeHtml(hint.label)}</span><code class="fw-hint-query">${escapeHtml(hint.query(sel || {}))}</code></button></li>`).join('');
+    host.innerHTML = '<div class="chart-card-head"><h3 class="chart-card-title" data-info="Ready searches for the LOGS tab about the selected process or endpoint, and a few that are always worth a look. A click runs one there.">HUNT FURTHER</h3></div>'
+        + `<div class="fw-sel">${sel ? fwSelectionHtml(sel) : '<span class="fw-sel-none">Select a process, an endpoint or a point of the map for the searches about it.</span>'}</div>`
+        + `<ul class="fw-hint-list">${items}</ul>`;
+}
+
+// SECURED SAMPLES: what TDC fetched itself, to open by its path; nothing here runs a file
+function renderFirewallCaptures(captures) {
+    const host = document.getElementById('firewall-captures');
+    if (!host) return;
+    const list = Array.isArray(captures) ? captures : [];
+    const rows = list.slice(0, 50).map(c => {
+        const url = fwDefang(c.url);
+        const sha = String(c.sha256 ?? '');
+        const dis = c.path ? '' : ' disabled';
+        const id = escapeHtml(String(c.id ?? ''));
+        const button = (kind, label, title) => `<button type="button" class="btn btn-xs" data-fw-open="${kind}" data-fw-capture="${id}" title="${title}"${dis}>${label}</button>`;
+        return '<li class="fw-cap">'
+            + `<span class="fw-cap-time">${escapeHtml(formatAlertTime(c.fetched_at))}</span>`
+            + `<code class="fw-url" title="${escapeHtml(fwShort(url, 2000))}">${escapeHtml(fwShort(url, 120))}</code>`
+            + `<span class="fw-cap-meta"><span class="fw-cap-magic">${escapeHtml(fwShort(c.magic || '?', 8))}</span>`
+            + `<span>${escapeHtml(formatSize(Number(c.size) || 0))}</span>`
+            + `<span class="fw-cap-sha" title="${escapeHtml(`SHA-256 ${fwShort(sha, 64)}`)}">${escapeHtml(fwShort(sha, 13))}</span>`
+            + (c.image ? `<span class="fw-cap-proc" title="${escapeHtml(fwShort(c.image, 500))}">${escapeHtml(fwShort(fwBase(c.image), 40))}</span>` : '') + '</span>'
+            + `<span class="fw-cap-actions">${button('rizin', 'RIZIN', 'Open the file in the RIZIN tab')}${button('hex', 'HEX', 'Open the file in the Hex editor')}`
+            + `${button('threatscan', 'THREATSCAN', 'Put the path into ThreatScan')}</span></li>`;
+    }).join('');
+    host.innerHTML = '<div class="chart-card-head"><h3 class="chart-card-title" data-info="The files TDC fetched itself for a download it blocked, kept by their SHA-256 and never run. Open one in Rizin, the Hex editor or ThreatScan.">SECURED SAMPLES</h3>'
+        + `<span class="fw-num">${fwNumber(list.length)}</span></div>`
+        + (rows ? `<ul class="fw-cap-list">${rows}</ul>` : '<div class="fw-empty">None yet.</div>');
+}
+
+function fwOpenCapture(kind, id) {
+    const cap = (fwState.captures || []).find(c => c && String(c.id) === String(id));
+    const path = cap && cap.path ? String(cap.path) : '';
+    if (!path) return false;
+    if (kind === 'rizin') openInRizin(path);
+    else if (kind === 'hex') hexOpenFile(path);
+    else if (kind === 'threatscan') {
+        threatscanResetDrop();
+        const input = document.getElementById('threatscan-filepath');
+        if (input) input.value = path;
+        switchTab('threatscan');
+    } else return false;
+    return true;
+}
+
+function fwOpenHint(index) {
+    const hint = FW_HINTS[index];
+    if (!hint) return false;
+    const sel = fwSelection();
+    if (hint.needs && !(sel && sel[hint.needs])) return false;
+    return openLogsTab(hint.query(sel || {}), fwEarliest(), '', { tab: 'firewall', select: fwSelected });
+}
+
+function fwCopy(text) {
+    const value = String(text ?? '');
+    if (typeof navigator === 'undefined' || !navigator.clipboard) return false;
+    navigator.clipboard.writeText(value).then(() => showToast('info', 'Copied', fwShort(value, 200)), () => showToast('error', 'Not copied', 'The browser refused the clipboard.'));
+    return true;
+}
+
+// The perspective switches between this tab and LOGS (and into this tab from GRAPH and TRACING) come with
+// the back chip of LOGS; until then these placeholders take the calls
+function openLogsTab(query, earliest, latest, back) {
+    return false;
+}
+
+function openFirewallTab(filter) {
+    return false;
+}
+
+// --- The head and the bands ---
+function fwRangeMs(label) {
+    const m = /^(\d+)([mhd])$/.exec(label || '');
+    return m ? Number(m[1]) * { m: 60000, h: 3600000, d: 86400000 }[m[2]] : 0;
+}
+
+function fwSince() {
+    const ms = fwRangeMs(fwRange);
+    return ms ? new Date(Date.now() - ms).toISOString().replace(/\.\d+Z$/, 'Z') : '';
+}
+
+function fwEarliest() {
+    return fwRange === 'All' ? '' : `-${fwRange}`;
+}
+
+function renderFirewallRange() {
+    const host = document.getElementById('firewall-range');
+    if (host) {
+        host.innerHTML = `<span class="chart-range" role="group" aria-label="Time range">${FW_RANGES.map(name => `<button type="button" class="chart-range-btn" data-fw-range="${name}" aria-pressed="${name === fwRange}">${name.toUpperCase()}</button>`).join('')}</span>`;
+    }
+}
+
+function renderFirewallHead() {
+    const live = document.getElementById('firewall-live');
+    if (live) live.setAttribute('aria-pressed', String(!!fwState.live));
+    const ask = document.getElementById('firewall-ask-btn');
+    const mode = FW_ASK_MODES.find(m => m.mode === fwState.askMode) || FW_ASK_MODES[0];
+    if (ask) {
+        ask.textContent = `ASK: ${mode.label} ▾`;
+        ask.title = `${mode.text} Click to change it; the setting is kept on the server.`;
+        ask.classList.toggle('is-off', mode.mode === 'off');
+    }
+    const iso = document.getElementById('firewall-isolated');
+    if (iso) {
+        const on = fwIsolatedOn(), off = fwEnforceOff();
+        iso.setAttribute('aria-pressed', String(on));
+        iso.classList.toggle('is-on', on);
+        iso.disabled = !on && !!off;
+        iso.title = on ? 'ISOLATED is on: every outbound connection is blocked but loopback. Click to leave it (asks first).'
+            : off || 'Block every outbound connection of the chamber but loopback (asks first).';
+    }
+    const count = document.getElementById('firewall-count');
+    if (count) {
+        const n = Number(fwState.count) || 0;
+        count.textContent = fwState.loaded ? `${fwNumber(n)} ${n === 1 ? 'connection' : 'connections'}${fwState.truncated ? `, the ${fwNumber(fwState.flows.length)} most severe shown` : ''}` : '';
+    }
+    renderFirewallRange();
+    renderFirewallViews();
+}
+
+// What is not enforced, or not known, is said above everything else
+function renderFirewallBands() {
+    const host = document.getElementById('firewall-bands');
+    if (!host) return;
+    const iso = fwState.isolate || {};
+    const bands = [];
+    const off = Array.isArray(iso.profiles_off) ? iso.profiles_off : [];
+    if (off.length) {
+        bands.push(['off', `<strong>Windows Firewall is off — no enforcement possible.</strong> Switched off: ${escapeHtml(off.map(p => fwShort(p, 40)).join(', '))}. `
+            + 'A rule or ISOLATED would be accepted and do nothing, so the switches are disabled. Turn the firewall on in Windows Defender Firewall; '
+            + 'TDC does not do it by itself, because it changes what the sample sees.']);
+    }
+    if (iso.profiles_error) bands.push(['warn', `The Windows Firewall profiles could not be read: ${escapeHtml(fwShort(iso.profiles_error, 300))}. Whether a rule takes effect is unknown.`]);
+    if (fwIsolatedOn()) {
+        const n = Number(iso.fetches_in_flight) || 0;
+        bands.push(['isolated', `<strong>ISOLATED${iso.isolated_since ? ` since ${escapeHtml(formatAlertTime(iso.isolated_since))}` : ''}.</strong> `
+            + `${escapeHtml(fwShort(iso.residual || 'Every outbound connection is blocked but loopback.', 600))} `
+            + (n ? `<strong>${n} ${n === 1 ? 'fetch' : 'fetches'} running</strong>: one address each is open while it runs. ` : '')
+            + 'The way back: ISOLATED again, or scripts/tdc-unisolate.ps1 on the VM.']);
+    }
+    for (const hole of Array.isArray(iso.fetch_paths_open) ? iso.fetch_paths_open : []) {
+        bands.push(['hole', `<strong>A way out stands open.</strong> The rule ${escapeHtml(fwShort(hole && hole.rule_id, 80))} of a finished fetch would not go and still lets TDC's fetcher reach one address`
+            + `${hole && hole.problem ? `: ${escapeHtml(fwShort(hole.problem, 300).replace(/[.\s]+$/, ''))}` : ''}. TDC keeps trying to remove it; scripts/tdc-unisolate.ps1 removes it by hand.`]);
+    }
+    if (iso.startup && iso.startup.announce && iso.startup.note) bands.push(['warn', `At start-up: ${escapeHtml(fwShort(iso.startup.note, 400))}`]);
+    if (iso.settings_error) bands.push(['warn', `The firewall settings could not be read: ${escapeHtml(fwShort(iso.settings_error, 300))}`]);
+    if (fwState.askMode === 'off') bands.push(['ask', '<strong>ASK is off</strong>: TDC blocks nothing and fetches nothing by itself; connections are only tagged and logged.']);
+    if (fwState.rulesError) bands.push(['warn', `The TDC rules could not be read (${escapeHtml(fwShort(fwState.rulesError, 300))}): which connections are blocked is unknown, so the switches show ?.`]);
+    if (fwState.error) bands.push(['warn', `The connections could not be loaded: ${escapeHtml(fwShort(fwState.error, 300))}`]);
+    host.innerHTML = bands.map(([kind, html]) => `<div class="fw-band fw-band-${kind}">${html}</div>`).join('');
+    host.hidden = !bands.length;
+}
+
+function fwAskMenuHtml() {
+    return FW_ASK_MODES.map(m => `<button type="button" class="fw-ask-item" role="menuitemradio" aria-checked="${m.mode === fwState.askMode}" data-fw-ask="${m.mode}">`
+        + `<span class="fw-ask-label">${escapeHtml(m.label)}</span><span class="fw-ask-text">${escapeHtml(m.text)}</span></button>`).join('');
+}
+
+function fwToggleAskMenu(force) {
+    const menu = document.getElementById('firewall-ask-menu'), button = document.getElementById('firewall-ask-btn');
+    if (!menu) return;
+    const open = typeof force === 'boolean' ? force : menu.hidden;
+    if (open) menu.innerHTML = fwAskMenuHtml();
+    menu.hidden = !open;
+    if (button) button.setAttribute('aria-expanded', String(open));
+}
+
+function fwCloseAskMenu() {
+    fwToggleAskMenu(false);
+}
+
+// --- Asking the server ---
+async function fwGet(url) {
+    try {
+        const resp = await fetch(url);
+        const data = await resp.json().catch(() => ({}));
+        return resp.ok ? { ok: true, data: data || {} } : { ok: false, data, error: data && data.error ? String(data.error) : `HTTP ${resp.status}` };
+    } catch (e) {
+        return { ok: false, data: null, error: String(e && e.message ? e.message : e) };
+    }
+}
+
+async function fwPost(url, body) {
+    try {
+        const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const data = await resp.json().catch(() => ({}));
+        return resp.ok ? { ok: true, data: data || {} } : { ok: false, data, error: data && data.error ? String(data.error) : `HTTP ${resp.status}` };
+    } catch (e) {
+        return { ok: false, data: null, error: `The request failed: ${e && e.message ? e.message : e}` };
+    }
+}
+
+function fwSignature() {
+    const s = fwState;
+    return JSON.stringify([s.loaded, s.error, s.rulesError, s.flows.map(f => [fwFlowKey(f), f.count, f.state, f.rule_id, f.tags, f.endpoint_tags, f.fw_records, f.last_seen]),
+        (s.pending || []).map(i => [i && i.id, i && i.action]), (s.history || []).map(i => [i && i.id, i && i.action]), s.summary,
+        (s.captures || []).map(c => c && c.id), s.rules, s.isolate && s.isolate.profiles_off]);
+}
+
+// Everything drawn again, unless nothing it shows has changed (LIVE would otherwise take the hover away every 5 s)
+function fwRender() {
+    renderFirewallHead();
+    renderFirewallBands();
+    const sig = fwSignature();
+    if (sig === fwLastSig) return;
+    fwLastSig = sig;
+    renderFirewallTree(fwState.flows);
+    renderFirewallView();
+    renderFirewallHints(fwSelection());
+    renderFirewallSummary(fwState.summary);
+    renderFirewallCaptures(fwState.captures);
+}
+
+// The connections and the open decisions (the poll paths); a response older than the last request is dropped
+async function fwLoadFlows() {
+    const seq = ++fwSeq;
+    const params = new URLSearchParams({ max: String(FW_MAX) });
+    const since = fwSince();
+    if (since) params.set('since', since);
+    const [conn, pending] = await Promise.all([fwGet(`/api/firewall/connections?${params.toString()}`), fwGet('/api/firewall/pending')]);
+    if (seq !== fwSeq) return false;
+    if (conn.ok) {
+        const d = conn.data;
+        fwState.flows = Array.isArray(d.connections) ? d.connections : [];
+        fwState.count = Number.isFinite(Number(d.count)) ? Number(d.count) : fwState.flows.length;
+        fwState.truncated = !!d.truncated;
+        fwState.rulesError = d.rules_error ? String(d.rules_error) : null;
+        if (typeof d.isolated === 'boolean') fwState.isolated = d.isolated;
+        if (typeof d.ask_mode === 'string') fwState.askMode = d.ask_mode;
+        fwState.error = null;
+    } else {
+        fwState.error = conn.error;
+    }
+    fwState.loaded = true;
+    if (pending.ok) {
+        fwState.pending = Array.isArray(pending.data.pending) ? pending.data.pending : [];
+        fwState.history = Array.isArray(pending.data.history) ? pending.data.history : [];
+    }
+    fwRender();
+    return true;
+}
+
+// The summary of the same window, ISOLATED, the captures and the rules
+async function fwLoadSlow() {
+    const seq = ++fwSlowSeq;
+    const since = fwSince();
+    const [summary, isolate, captures, rules] = await Promise.all([
+        fwGet(`/api/firewall/summary${since ? `?since=${encodeURIComponent(since)}` : ''}`), fwGet('/api/firewall/isolate'),
+        fwGet('/api/firewall/captures'), fwGet('/api/firewall/rules')]);
+    if (seq !== fwSlowSeq) return false;
+    if (summary.ok) fwState.summary = summary.data;
+    if (isolate.ok) {
+        fwState.isolate = isolate.data;
+        if (typeof isolate.data.isolated === 'boolean') fwState.isolated = isolate.data.isolated;
+        if (typeof isolate.data.ask_mode === 'string') fwState.askMode = isolate.data.ask_mode;
+    }
+    if (captures.ok) fwState.captures = Array.isArray(captures.data.captures) ? captures.data.captures : [];
+    if (rules.ok) {
+        fwState.rules = Array.isArray(rules.data.rules) ? rules.data.rules : [];
+        fwState.rulesListError = null;
+    } else {
+        fwState.rulesListError = rules.error;
+    }
+    fwRender();
+    return true;
+}
+
+// opts.slow false: only the poll paths (a LIVE tick); otherwise everything
+async function refreshFirewall(opts) {
+    const jobs = [fwLoadFlows()];
+    if (!(opts && opts.slow === false)) jobs.push(fwLoadSlow());
+    await Promise.all(jobs);
+}
+
+async function fwLoadWorld() {
+    if (fwWorld || fwWorldAsked) return;
+    fwWorldAsked = true;
+    const r = await fwGet('/static/data/world.json');
+    if (r.ok && Array.isArray(r.data.shapes)) {
+        fwWorld = r.data;
+        if (fwView === 'map') renderFirewallMap(fwState.flows);
+    } else {
+        fwWorldAsked = false;
+    }
+}
+
+// --- What the switches do ---
+async function fwBlock(scope, flow) {
+    const f = flow || {};
+    const off = fwEnforceOff();
+    if (off) {
+        showToast('error', 'Nothing blocked', off);
+        return false;
+    }
+    const image = String(f.image ?? ''), ip = String(f.dst_ip ?? '');
+    let body, what;
+    if (scope === 'endpoint' && image && ip) {
+        body = { scope, image, ip };
+        what = `${fwShort(fwBase(image), 40)} → ${fwShort(ip, 46)}`;
+    } else if (scope === 'process' && image) {
+        body = { scope, image };
+        what = `${fwShort(fwBase(image), 40)}, everywhere`;
+    } else if (scope === 'endpoint_all' && ip) {
+        const ok = await tdcConfirm({ title: `Block ${fwShort(ip, 46)} for every program?`, danger: true, confirmLabel: 'BLOCK FOR ALL',
+            message: `Every program in the chamber loses ${fwShort(ip, 46)}, TDC's own fetcher included: while this rule stands, TDC cannot `
+                + 'secure a sample from this address, and BLOCK + FETCH is refused there. The DENY switch of any row it blocks removes it again.' });
+        if (!ok) return false;
+        body = { scope, ip };
+        what = `${fwShort(ip, 46)} for every program`;
+    } else {
+        return false;
+    }
+    const r = await fwPost('/api/firewall/block', body);
+    if (!r.ok) {
+        showToast('error', `Not blocked: ${what}`, r.error);
+        await refreshFirewall();
+        return false;
+    }
+    showToast('success', `Blocked: ${what}`, `Rule ${fwShort(r.data.rule_id, 40)} stands and was read back. A running connection starves; it gets no reset.`);
+    await refreshFirewall();
+    return true;
+}
+
+async function fwUnblock(ruleId) {
+    const id = String(ruleId ?? '');
+    if (!id) return false;
+    const r = await fwPost('/api/firewall/unblock', { rule_id: id });
+    if (!r.ok) {
+        showToast('error', `Not unblocked: ${fwShort(id, 40)}`, r.error);
+        await refreshFirewall();
+        return false;
+    }
+    const n = Array.isArray(r.data.removed) ? r.data.removed.length : 1;
+    showToast('success', `Unblocked: ${fwShort(id, 40)}`, n > 1 ? `${n} rules of this endpoint were removed, one per protocol.` : 'The rule was removed.');
+    await refreshFirewall();
+    return true;
+}
+
+async function fwToggleIsolated() {
+    const on = fwIsolatedOn();
+    if (!on) {
+        const off = fwEnforceOff();
+        if (off) {
+            showToast('error', 'ISOLATED not switched on', off);
+            return false;
+        }
+        const ok = await tdcConfirm({ title: 'Cut the chamber off the network?', message: FW_ISOLATE_TEXT, confirmLabel: 'ISOLATE', danger: true });
+        if (!ok) return false;
+    } else {
+        const before = fwState.isolate && fwState.isolate.outbound_before ? fwShort(fwState.isolate.outbound_before, 20) : 'Allow';
+        const ok = await tdcConfirm({ title: 'Leave ISOLATED?', confirmLabel: 'LEAVE ISOLATED',
+            message: `Outbound connections go back to the default action that stood before (${before}). A sample still running can reach the network again.` });
+        if (!ok) return false;
+    }
+    const r = await fwPost('/api/firewall/isolate', { on: !on });
+    if (!r.ok) {
+        showToast('error', on ? 'ISOLATED is still on' : 'ISOLATED is not on', r.error);
+        await refreshFirewall();
+        return false;
+    }
+    if (r.data.state && typeof r.data.state === 'object') {
+        fwState.isolate = r.data.state;
+        fwState.isolated = !!r.data.state.isolated;
+    } else {
+        fwState.isolated = !on;
+    }
+    showToast(on ? 'info' : 'warning', on ? 'ISOLATED is off' : 'ISOLATED is on', on ? 'Outbound connections are allowed again.'
+        : 'Every outbound connection is blocked but loopback.');
+    renderFirewallHead();
+    renderFirewallBands();
+    await refreshFirewall();
+    return true;
+}
+
+async function fwSetAsk(mode) {
+    fwCloseAskMenu();
+    if (!FW_ASK_MODES.some(m => m.mode === mode)) return false;
+    const r = await fwPost('/api/firewall/ask', { mode });
+    if (!r.ok) {
+        showToast('error', 'ASK not changed', r.error);
+        return false;
+    }
+    fwState.askMode = typeof r.data.ask_mode === 'string' ? r.data.ask_mode : mode;
+    renderFirewallHead();
+    renderFirewallBands();
+    return true;
+}
+
+function fwSetRange(label) {
+    if (!FW_RANGES.includes(label)) return false;
+    fwRange = label;
+    try {
+        localStorage.setItem(FW_RANGE_KEY, label);
+    } catch (e) {
+        // storage blocked
+    }
+    renderFirewallRange();
+    refreshFirewall();
+    return true;
+}
+
+function fwSetView(name) {
+    if (!FW_VIEWS.includes(name)) return false;
+    fwView = name;
+    try {
+        localStorage.setItem(FW_VIEW_KEY, name);
+    } catch (e) {
+        // storage blocked
+    }
+    renderFirewallViews();
+    renderFirewallView();
+    return true;
+}
+
+// The flow a switch stands for: by its flow key, or for a process by its process key
+function fwFlowByKey(key, scope) {
+    const k = String(key ?? '');
+    return (fwState.flows || []).find(f => (scope === 'process' ? fwProcKey(f) : fwFlowKey(f)) === k) || null;
+}
+
+// The one click handler of the tab: every control carries a data-fw-* attribute
+function onFirewallClick(event) {
+    const target = event && event.target && typeof event.target.closest === 'function' ? event.target : null;
+    if (!target) return;
+    const hit = selector => {
+        const el = target.closest(selector);
+        return el && !el.disabled ? el : null;
+    };
+    let el;
+    if (hit('[data-fw-ask-menu]')) fwToggleAskMenu();
+    else if ((el = hit('[data-fw-ask]'))) fwSetAsk(el.getAttribute('data-fw-ask'));
+    else if ((el = hit('[data-fw-range]'))) fwSetRange(el.getAttribute('data-fw-range'));
+    else if ((el = hit('[data-fw-view]'))) fwSetView(el.getAttribute('data-fw-view'));
+    else if (hit('[data-fw-live]')) fwToggleLive();
+    else if (hit('[data-fw-isolated]')) fwToggleIsolated();
+    else if ((el = hit('[data-fw-group]'))) {
+        const id = el.getAttribute('data-fw-group');
+        fwOpen.set(id, !fwIsOpen(id, false));
+        renderFirewallTree(fwState.flows);
+    } else if ((el = hit('[data-fw-toggle]'))) {
+        const id = el.getAttribute('data-fw-toggle');
+        fwOpen.set(id, el.getAttribute('aria-expanded') !== 'true');
+        renderFirewallTree(fwState.flows);
+    } else if ((el = hit('[data-fw-more]'))) {
+        fwMore.add(el.getAttribute('data-fw-more'));
+        renderFirewallTree(fwState.flows);
+    } else if ((el = hit('[data-fw-unblock]'))) fwUnblock(el.getAttribute('data-fw-unblock'));
+    else if ((el = hit('[data-fw-block]'))) {
+        const scope = el.getAttribute('data-fw-block');
+        const flow = scope === 'endpoint_all' ? { dst_ip: el.getAttribute('data-fw-ip') } : fwFlowByKey(el.getAttribute('data-fw-key'), scope);
+        if (flow) fwBlock(scope, flow);
+    } else if ((el = hit('button[data-fw-open]'))) fwOpenCapture(el.getAttribute('data-fw-open'), el.getAttribute('data-fw-capture'));
+    else if ((el = hit('[data-fw-hint]'))) fwOpenHint(Number(el.getAttribute('data-fw-hint')));
+    else if ((el = hit('[data-fw-copy]'))) fwCopy(el.getAttribute('data-fw-copy'));
+    else if ((el = hit('[data-fw-id]'))) fwSelect(el.getAttribute('data-fw-id'));
+}
+
+// --- Live ---
+function fwToggleLive() {
+    fwState.live = !fwState.live;
+    renderFirewallHead();
+    if (fwState.live) {
+        if (!fwTimer) fwTimer = setInterval(fwLiveTick, FW_LIVE_MS);
+        fwLiveTick();
+    } else if (fwTimer) {
+        clearInterval(fwTimer);
+        fwTimer = null;
+    }
+}
+
+// Every 5 s while LIVE is on: the poll paths again, everything every FW_SLOW_EVERY ticks; only while the tab
+// is on screen and the browser tab is not hidden
+function fwLiveTick() {
+    if (!fwState.live || document.hidden || state.activeTab !== 'firewall') return false;
+    fwTicks += 1;
+    refreshFirewall({ slow: fwTicks % FW_SLOW_EVERY === 0 });
+    return true;
+}
+
+// --- The tab ---
+// Set up once, when the tab is first opened: the range and the view come back, LIVE starts, the map loads
+function initFirewall() {
+    if (fwReady) return;
+    const tab = document.getElementById('tab-firewall');
+    if (!tab) return;
+    fwReady = true;
+    tab.addEventListener('click', onFirewallClick);
+    const search = document.getElementById('firewall-search');
+    if (search) {
+        search.addEventListener('input', () => {
+            fwFilter = String(search.value ?? '');
+            renderFirewallTree(fwState.flows);
+            renderFirewallView();
+        });
+    }
+    document.addEventListener('click', event => {
+        const wrap = event.target && typeof event.target.closest === 'function' ? event.target.closest('.fw-ask-wrap') : null;
+        if (!wrap) fwCloseAskMenu();
+    });
+    try {
+        const range = localStorage.getItem(FW_RANGE_KEY), view = localStorage.getItem(FW_VIEW_KEY);
+        if (FW_RANGES.includes(range)) fwRange = range;
+        if (FW_VIEWS.includes(view)) fwView = view;
+    } catch (e) {
+        // storage blocked
+    }
+    if (fwState.live && !fwTimer) fwTimer = setInterval(fwLiveTick, FW_LIVE_MS);
+    fwRender();
+    fwLoadWorld();
+    refreshFirewall();
+}
+
+// The tab is opened: the first time it is set up, later everything is asked for again
+function firewallTabShown() {
+    if (!fwReady) {
+        initFirewall();
+        return;
+    }
+    fwLoadWorld();
+    refreshFirewall();
 }
 
 // --- LitterBox Integration ---

@@ -16,7 +16,7 @@ Regressions covered:
     the other way round; a table that keeps the order of the last one
   * a range drawn across the bars that does not become earliest and latest
   * LIVE searching in a hidden tab or a hidden browser tab
-  * the tab button before Sysmon, a tab without its (i), a help guide without
+  * the tab button out of its place after Sysmon and FIREWALL, a tab without its (i), a help guide without
     the entry
 """
 
@@ -91,7 +91,8 @@ def test_the_tab_the_button_and_the_help_entry_exist():
     html = _read(INDEX_HTML)
     nav = re.search(r'<nav class="sidebar-tabs">(.*?)</nav>', html, re.S).group(1)
     tabs = re.findall(r'data-tab="([^"]+)"', nav)
-    assert tabs.index("logs") == tabs.index("sysmon") + 1, tabs
+    # after Sysmon and the FIREWALL tab, whose perspective switch leads here
+    assert tabs.index("logs") == tabs.index("firewall") + 1 == tabs.index("sysmon") + 2, tabs
     assert re.search(r'data-tab="logs">LOGS</button>', html)
     tab = _Elements(html).by_id("tab-logs")
     assert tab and "tab-content" in tab["attrs"]["class"].split()
@@ -105,7 +106,7 @@ def test_the_tab_the_button_and_the_help_entry_exist():
     assert set(ELEMENT_IDS) | {"logs-fields-filter"} <= ids, (set(ELEMENT_IDS) | {"logs-fields-filter"}) - ids
     guide = html[html.index('id="help-usage"'):html.index('id="help-api"')]
     names = re.findall(r"<h4>([^<]+)</h4>", guide)
-    assert names.index("LOGS") == names.index("Sysmon") + 1, names
+    assert names.index("LOGS") == names.index("FIREWALL") + 1 == names.index("Sysmon") + 2, names
 
 
 def test_every_logs_function_and_constant_is_found():

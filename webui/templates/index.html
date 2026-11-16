@@ -19,9 +19,9 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=72">
-    <link rel="stylesheet" href="/static/css/theme-layout.css?v=1">
-    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=29">
+    <link rel="stylesheet" href="/static/css/style.css?v=73">
+    <link rel="stylesheet" href="/static/css/theme-layout.css?v=2">
+    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=30">
 </head>
 <body>
     <!-- Global loading overlay (shown on slow fetches) -->
@@ -86,6 +86,7 @@
                     <button class="tab" data-tab="graph">Graph</button>
                     <button class="tab" data-tab="pipes">Pipes</button>
                     <button class="tab" data-tab="sysmon">Sysmon</button>
+                    <button class="tab" data-tab="firewall">FIREWALL</button>
                     <button class="tab" data-tab="logs">LOGS</button>
                     <button class="tab" data-tab="threatscan">ThreatScan</button>
                     <button class="tab" data-tab="etw">ETW</button>
@@ -631,6 +632,47 @@
                 <div id="sysmon-correlation-panel" class="sysmon-correlation" style="display:none;"></div>
                 <div class="sysmon-stats" id="sysmon-stats"></div>
                 <div id="sysmon-table" class="events-table"></div>
+            </div>
+
+            <!-- Firewall Tab: the connections of the chamber (initFirewall in app.js): the head with LIVE,
+                 ASK, ISOLATED and the range, the bands that say what is not enforced, the process tree,
+                 MAP | LIST | ASN with the hunting hints and the secured samples, the summary -->
+            <div class="tab-content" id="tab-firewall">
+                <div class="content-header">
+                    <h2 data-info="Every connection the chamber made, by process, on a world map and with its tags, and the switches that block it in the Windows Firewall. Select a process or an endpoint for ready LOGS queries about it.">Firewall</h2>
+                    <div class="header-actions fw-head">
+                        <span class="fw-count" id="firewall-count" aria-live="polite"></span>
+                        <button type="button" class="btn btn-sm logs-live" id="firewall-live" data-fw-live aria-pressed="true" title="Ask again every 5 seconds while this tab is open"><span class="logs-live-dot" aria-hidden="true"></span>LIVE</button>
+                        <span class="fw-ask-wrap">
+                            <button type="button" class="btn btn-sm fw-ask-btn" id="firewall-ask-btn" data-fw-ask-menu aria-haspopup="true" aria-expanded="false" title="What TDC does when a process in the chamber fetches a file">ASK: Detonation &#9662;</button>
+                            <div class="fw-ask-menu" id="firewall-ask-menu" role="menu" hidden></div>
+                        </span>
+                        <button type="button" class="btn btn-sm fw-isolated" id="firewall-isolated" data-fw-isolated aria-pressed="false" title="Block every outbound connection of the chamber but loopback">ISOLATED</button>
+                        <span class="fw-range" id="firewall-range"></span>
+                    </div>
+                </div>
+                <div class="fw-bands" id="firewall-bands" role="status"></div>
+                <div class="fw-grid">
+                    <aside class="fw-tree-pane" aria-label="Processes">
+                        <div class="fw-pane-head">
+                            <h3 class="chart-card-title" data-info="Each process with its endpoints, the most severe first; the colour is that of its most severe tag. TDC's own processes and local addresses have groups of their own.">PROCESSES</h3>
+                        </div>
+                        <input type="text" class="filter-input fw-search" id="firewall-search" placeholder="Filter process, domain, IP..." aria-label="Filter processes, domains and addresses" spellcheck="false" autocomplete="off">
+                        <div class="fw-tree" id="firewall-tree"><div class="fw-empty">Loading connections&hellip;</div></div>
+                    </aside>
+                    <section class="fw-center" aria-label="Destinations">
+                        <div class="chart-card fw-view-card">
+                            <div class="chart-card-head">
+                                <h3 class="chart-card-title" data-info="MAP draws an arc from the chamber to every public destination, as wide as its connections and coloured by its most severe tag. LIST is the same set as a table, ASN groups it by the organisation that owns the addresses.">DESTINATIONS</h3>
+                                <span class="chart-range fw-views" id="firewall-views" role="group" aria-label="View"></span>
+                            </div>
+                            <div class="fw-view" id="firewall-view"></div>
+                        </div>
+                        <div class="chart-card fw-hints" id="firewall-hints"></div>
+                        <div class="chart-card fw-captures" id="firewall-captures"></div>
+                    </section>
+                    <aside class="fw-summary" id="firewall-summary" aria-label="Summary"></aside>
+                </div>
             </div>
 
             <!-- Logs Tab: search the log store (initLogs in app.js): the search bar with its range,
@@ -1379,6 +1421,10 @@
                             <p>Sysmon events with search, type and PID filters, and the Windows Event IDs each event corresponds to. EVENTS OVER TIME and the Sankey PROCESS &rarr; EVENT TYPE count the events of the filters, all but the time window, which the bars mark (it narrows the table): a click on a bar sets a time window (Shift+click widens it to another bar), on a legend row or a node an event type or image, each a chip in the filter bar.</p>
                         </div>
                         <div class="help-guide-item">
+                            <h4>FIREWALL</h4>
+                            <p>Every connection of the chamber, bundled per process and endpoint and tagged by what is suspicious about it (IOC, beaconing, a hard-coded address, a download, a LOLBin, a DGA-like name&hellip;); the colour of a row or an arc is its most severe tag. On the left the process tree with a filter, each process with its activity and its endpoints; TDC's own processes and local addresses are groups of their own. In the middle MAP (an arc from the chamber to each public destination), LIST (a sortable table) and ASN (the destinations by the organisation that owns them). Below, the summary counts connections, blocks, open decisions and secured samples; there are no byte figures, because Sysmon records none. ALLOW / DENY blocks a process or one endpoint of it in the Windows Firewall (a rule <code>TDC-FW-&hellip;</code>, checked before it counts as blocked) and shows the protocol of the rule; a selected endpoint can also be blocked for every program. ASK sets what happens when a process in the chamber fetches a file: Detonation (default) blocks it and asks, All does so for every process, Off only tags. ISOLATED, after a confirmation, cuts every outbound connection but loopback; the band says what stays open, and <code>scripts/tdc-unisolate.ps1</code> on the VM is the way back if the web UI is gone. While a Windows Firewall profile is off nothing can be enforced: the switches are disabled and a red band says so. HUNT FURTHER lists ready LOGS queries for the selection; SECURED SAMPLES opens a fetched file in Rizin, Hex or ThreatScan, never runs it.</p>
+                        </div>
+                        <div class="help-guide-item">
                             <h4>LOGS</h4>
                             <p>Search the PowerShell, access, MCP, NetFlow, DNS and firewall logs with a Splunk-like query: words, "phrases", <code>field=value</code>, AND / OR / NOT and pipes such as <code>| stats count by tool</code>, <code>| top</code> or <code>| timechart span=5m count by source</code>. The range buttons (15M to ALL) set the time; EVENTS OVER TIME zooms by a range drawn across its bars. A source chip searches one source (a grey one says why it has no data), a field value on the left adds <code>field="value"</code>, and a click on an event unfolds its fields and raw text. LIVE searches again every 10 s. EXAMPLES lists searches to start from and your last ten.</p>
                         </div>
@@ -1617,6 +1663,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
          in app.js); set as text, never as markup -->
     <div id="info-popover" class="info-popover" role="status" hidden></div>
 
-    <script src="/static/js/app.js?v=101"></script>
+    <script src="/static/js/app.js?v=102"></script>
 </body>
 </html>

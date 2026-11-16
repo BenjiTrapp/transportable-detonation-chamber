@@ -342,9 +342,13 @@ def test_map_css_moves_only_pending_arcs_and_stops_under_reduced_motion():
 
 def test_map_tones_are_theme_variables():
     css = re.sub(r"/\*.*?\*/", "", _read(STYLE_CSS), flags=re.S)
+    root = css[css.index(":root {"):css.index("}", css.index(":root {"))]
     for tone in ("critical", "high", "medium", "low", "info"):
         rules = _css_rules(css, ".fw-tone-%s" % tone)
-        assert rules and any("var(--severity-%s)" % tone in rule for rule in rules), tone
+        # directly, or through the FIREWALL tab's token for that severity
+        token = re.search(r"--fw-tone-%s:\s*var\(--severity-%s\)" % (tone, tone), root)
+        assert rules and any("var(--severity-%s)" % tone in rule or (token and "var(--fw-tone-%s)" % tone in rule)
+                             for rule in rules), tone
 
 
 def test_map_functions_hold_no_colour_literal():

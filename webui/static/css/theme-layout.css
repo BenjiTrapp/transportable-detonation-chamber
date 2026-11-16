@@ -2718,3 +2718,175 @@
 [data-theme] .logs-cell-num {
     color: var(--cp-text);
 }
+
+/* --- FIREWALL tab: where things stand. The process tree on the left (it
+   stays in view while the tab scrolls), MAP | LIST | ASN with the hints and
+   the secured samples in the middle, the summary under the middle; from
+   1400 px the summary is a third column on the right, under 900 px it is all
+   one column, the destinations first. Then the tree pane, the bands, the
+   menus and the controls in the look of the cards --- */
+[data-theme] .fw-bands {
+    padding: 12px 24px 0;
+}
+[data-theme] .fw-grid {
+    display: grid;
+    grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
+    grid-template-areas: "tree center" "tree summary";
+    align-items: start;
+    gap: 14px;
+    padding: 14px 24px 24px;
+}
+[data-theme] .fw-tree-pane {
+    grid-area: tree;
+    position: sticky;
+    top: 14px;
+    max-height: 80vh;
+}
+[data-theme] .fw-center {
+    grid-area: center;
+}
+[data-theme] .fw-summary {
+    grid-area: summary;
+}
+[data-theme] .fw-tiles {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+@media (min-width: 1400px) {
+    [data-theme] .fw-grid {
+        grid-template-columns: minmax(280px, 360px) minmax(0, 1fr) minmax(260px, 320px);
+        grid-template-areas: "tree center summary";
+    }
+    [data-theme] .fw-summary {
+        position: sticky;
+        top: 14px;
+    }
+    [data-theme] .fw-tiles {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+/* The head holds five controls: on a narrower window they go under the title */
+@media (max-width: 1180px) {
+    [data-theme] #tab-firewall .content-header {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas: "kicker" "title" "sub" "actions";
+        row-gap: 8px;
+    }
+    [data-theme] .fw-head {
+        justify-content: flex-start;
+    }
+}
+@media (max-width: 900px) {
+    [data-theme] .fw-bands {
+        padding: 10px 12px 0;
+    }
+    [data-theme] .fw-grid {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas: "center" "tree" "summary";
+        padding: 12px;
+    }
+    [data-theme] .fw-tree-pane {
+        position: static;
+        max-height: 460px;
+    }
+    [data-theme] .fw-tiles {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+    [data-theme] .fw-hint-label {
+        flex-basis: 100%;
+    }
+    [data-theme] .fw-cap {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas: "time" "url" "meta" "actions";
+    }
+}
+[data-theme] .fw-tree-pane {
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow);
+}
+[data-theme] .fw-band {
+    border-radius: 4px;
+}
+[data-theme] .fw-count,
+[data-theme] .fw-group-head,
+[data-theme] .fw-tile-label,
+[data-theme] .fw-top-title,
+[data-theme] .fw-url-state {
+    font-family: var(--cp-font-label);
+    letter-spacing: .08em;
+}
+[data-theme] .fw-group-head,
+[data-theme] .fw-tile-label,
+[data-theme] .fw-top-title {
+    color: var(--cp-cyan);
+}
+[data-theme] .fw-name,
+[data-theme] .fw-ep-main,
+[data-theme] .fw-num,
+[data-theme] .fw-switch,
+[data-theme] .fw-tag,
+[data-theme] .fw-url,
+[data-theme] .fw-hint-query,
+[data-theme] .fw-sel-what,
+[data-theme] .fw-cap-meta,
+[data-theme] .fw-top-row {
+    font-family: var(--cp-font-label);
+}
+[data-theme] .fw-group-head:hover,
+[data-theme] .fw-proc.is-selected > .fw-proc-row,
+[data-theme] .fw-ep.is-selected,
+[data-theme] .logs-table tbody tr.fw-list-row.is-selected {
+    background: rgba(var(--cp-magenta-rgb), .1);
+}
+[data-theme] .fw-ask-menu {
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-radius: 6px;
+    box-shadow: var(--cp-card-shadow), 0 14px 34px -12px rgba(var(--cp-black-rgb), .8);
+}
+[data-theme] .fw-ask-item:hover,
+[data-theme] .fw-ask-item:focus-visible {
+    background: var(--cp-raised);
+    box-shadow: inset 2px 0 0 var(--cp-magenta);
+}
+[data-theme] .fw-ask-item[aria-checked="true"] .fw-ask-label {
+    color: var(--cp-magenta);
+}
+[data-theme] .fw-ask-btn.is-off {
+    color: var(--cp-amber);
+    border-color: var(--cp-amber);
+}
+[data-theme] .fw-isolated.is-on {
+    color: var(--cp-text);
+    background: var(--cp-red);
+    border-color: var(--cp-red);
+    box-shadow: 0 0 14px rgba(var(--cp-red-rgb), .55);
+}
+[data-theme] .fw-hint,
+[data-theme] .fw-tile {
+    background: var(--cp-raised);
+    border-color: var(--cp-line);
+    border-radius: 4px;
+}
+[data-theme] .fw-hint:hover,
+[data-theme] .fw-hint:focus-visible {
+    border-color: var(--cp-magenta);
+    box-shadow: var(--cp-glow);
+}
+[data-theme] .fw-hint-query {
+    color: var(--cp-cyan);
+}
+[data-theme] .fw-top-row {
+    background: linear-gradient(90deg, rgba(var(--cp-magenta-rgb), .2) var(--share, 0%), transparent var(--share, 0%));
+}
+[data-theme] .fw-name:focus-visible,
+[data-theme] .fw-ep-main:focus-visible,
+[data-theme] .fw-caret-btn:focus-visible,
+[data-theme] .fw-group-head:focus-visible,
+[data-theme] .fw-switch:focus-visible,
+[data-theme] .fw-ip:focus-visible,
+[data-theme] .fw-top-btn:focus-visible {
+    outline: 2px solid var(--cp-cyan);
+    outline-offset: 1px;
+}

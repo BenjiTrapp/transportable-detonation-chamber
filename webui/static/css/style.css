@@ -55,6 +55,17 @@
     /* The colour of a log source in the LOGS tab (chip, badge, bars): set per source there */
     --logs-src: var(--text-secondary);
     --logs-src-rgb: 163, 171, 214;
+    /* The FIREWALL tab: the colour of each severity (rows, chips, arcs and
+       points of its map; a .fw-tone-* class also sets it as --fw-tone), and
+       the land, graticule and chamber of the map */
+    --fw-tone-critical: var(--severity-critical);
+    --fw-tone-high: var(--severity-high);
+    --fw-tone-medium: var(--severity-medium);
+    --fw-tone-low: var(--severity-low);
+    --fw-tone-info: var(--severity-info);
+    --fw-land: var(--bg-tertiary);
+    --fw-grat: var(--border-primary);
+    --fw-chamber: var(--accent-cyan);
     --c-white: #fff;
     --c-white-rgb: 255, 255, 255;
     --c-black: #000;
@@ -8371,21 +8382,21 @@ table[data-sortable] > thead > tr > th:focus-visible {
 }
 .fw-grat {
     fill: none;
-    stroke: var(--border-primary);
+    stroke: var(--fw-grat);
     stroke-width: 0.5;
 }
 .fw-land {
-    fill: var(--bg-tertiary);
+    fill: var(--fw-land);
     stroke: var(--border-accent);
     stroke-width: 0.5;
     stroke-linejoin: round;
 }
-.fw-tone-critical { color: var(--severity-critical); }
-.fw-tone-high { color: var(--severity-high); }
-.fw-tone-medium { color: var(--severity-medium); }
-.fw-tone-low { color: var(--severity-low); }
-.fw-tone-info { color: var(--severity-info); }
-.fw-chamber { color: var(--accent-cyan); }
+.fw-tone-critical { --fw-tone: var(--fw-tone-critical); color: var(--fw-tone-critical); }
+.fw-tone-high { --fw-tone: var(--fw-tone-high); color: var(--fw-tone-high); }
+.fw-tone-medium { --fw-tone: var(--fw-tone-medium); color: var(--fw-tone-medium); }
+.fw-tone-low { --fw-tone: var(--fw-tone-low); color: var(--fw-tone-low); }
+.fw-tone-info { --fw-tone: var(--fw-tone-info); color: var(--fw-tone-info); }
+.fw-chamber { color: var(--fw-chamber); }
 .fw-arc-hit {
     fill: none;
     stroke: transparent;
@@ -10499,7 +10510,8 @@ body.maintenance-active #app {
         animation: none;
     }
     .btn-skull-art,
-    .fw-arc-line {
+    .fw-arc-line,
+    .fw-caret {
         transition: none;
     }
 }
@@ -10962,6 +10974,445 @@ body.maintenance-active #app {
     .logs-live[aria-pressed="true"] .logs-live-dot { animation: none; }
     .logs-caret { transition: none; }
 }
+
+/* --- FIREWALL tab (block FIREWALL of app.js) ---
+   The head with LIVE, ASK (a menu), ISOLATED (red while it is on) and the
+   range; the bands of what is not enforced (red: the firewall off, ISOLATED,
+   a way out a fetch left open); the process tree, MAP | LIST | ASN with the
+   hints and the secured samples, the summary. Where these stand is
+   theme-layout.css's (.fw-grid). A row, a chip and an arc take the colour of
+   their most severe tag from .fw-tone-* (as color and as --fw-tone); the
+   text in them keeps its own. Nothing moves but the dash of an arc with an
+   open decision, the LIVE dot and the carets, all still under
+   prefers-reduced-motion. A URL or a host is text, selectable in one click. --- */
+#tab-firewall { overflow-x: hidden; overflow-y: auto; }
+.fw-head { flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.fw-count {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.fw-ask-wrap { position: relative; }
+.fw-ask-btn.is-off {
+    color: var(--accent-yellow);
+    border-color: var(--accent-yellow);
+}
+.fw-ask-menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 20;
+    width: 340px;
+    max-width: 80vw;
+    padding: 6px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-accent);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 10px 30px rgba(var(--c-black-rgb), 0.5);
+}
+.fw-ask-menu[hidden] { display: none; }
+.fw-ask-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 100%;
+    padding: 6px 8px;
+    font-size: 11.5px;
+    text-align: left;
+    color: var(--text-muted);
+    background: transparent;
+    border: 0;
+    border-radius: var(--radius);
+    cursor: pointer;
+}
+.fw-ask-item:hover,
+.fw-ask-item:focus-visible { background: var(--bg-card-hover); outline: none; }
+.fw-ask-label { font-size: 12px; font-weight: 600; color: var(--text-primary); }
+.fw-ask-item[aria-checked="true"] .fw-ask-label { color: var(--accent-cyan); }
+.fw-isolated.is-on {
+    color: var(--c-white);
+    font-weight: 700;
+    background: var(--severity-critical);
+    border-color: var(--severity-critical);
+}
+.fw-isolated:disabled { opacity: 0.5; cursor: not-allowed; }
+.fw-bands { display: flex; flex-direction: column; gap: 6px; }
+.fw-bands[hidden] { display: none; }
+.fw-band {
+    padding: 8px 12px;
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--text-secondary);
+    background: rgba(var(--accent-yellow-rgb), 0.08);
+    border: 1px solid rgba(var(--accent-yellow-rgb), 0.4);
+    border-left-width: 3px;
+    border-radius: var(--radius);
+}
+.fw-band strong { color: var(--text-primary); }
+.fw-band-off,
+.fw-band-isolated,
+.fw-band-hole {
+    background: rgba(var(--severity-critical-rgb), 0.1);
+    border-color: rgba(var(--severity-critical-rgb), 0.55);
+}
+.fw-band-off strong,
+.fw-band-isolated strong,
+.fw-band-hole strong { color: var(--severity-critical); }
+/* A way out that stands open is a hole, not a state: dashed, with a thick edge */
+.fw-band-hole { border-style: dashed; border-left: 6px solid var(--severity-critical); }
+.fw-empty { padding: 14px 10px; font-size: 12px; color: var(--text-muted); }
+
+/* The tree */
+.fw-tree-pane {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius-lg);
+}
+.fw-pane-head { padding: 10px 12px 6px; }
+.fw-search { box-sizing: border-box; width: auto; margin: 0 10px 8px; }
+.fw-tree { flex: 1 1 auto; min-height: 0; padding: 0 6px 8px; overflow-y: auto; font-size: 12px; }
+.fw-group + .fw-group { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border-primary); }
+.fw-group-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 5px 6px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 1px;
+    text-align: left;
+    color: var(--text-muted);
+    background: transparent;
+    border: 0;
+    border-radius: var(--radius);
+    cursor: pointer;
+}
+.fw-group-head:hover { background: var(--bg-card-hover); }
+.fw-group-name { font-weight: 600; }
+.fw-caret {
+    flex: 0 0 auto;
+    width: 0;
+    height: 0;
+    border-top: 4px solid transparent;
+    border-bottom: 4px solid transparent;
+    border-left: 5px solid currentColor;
+    transition: transform 0.15s;
+}
+[aria-expanded="true"] > .fw-caret { transform: rotate(90deg); }
+.fw-proc {
+    margin: 2px 0;
+    border-left: 2px solid var(--fw-tone, transparent);
+    border-radius: 0 var(--radius) var(--radius) 0;
+}
+/* A detonated process is shaded, as in the graph */
+.fw-proc.is-detonated { background: rgba(var(--graph-detonated-rgb), 0.05); }
+.fw-proc.is-selected > .fw-proc-row,
+.fw-ep.is-selected { background: var(--bg-card-hover); }
+.fw-proc-row,
+.fw-ep-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.fw-proc-row { padding: 3px 4px 3px 2px; }
+.fw-ep-row { padding: 2px 4px 2px 6px; }
+.fw-caret-btn {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    color: var(--text-muted);
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+}
+.fw-name,
+.fw-ep-main {
+    display: flex;
+    flex: 1 1 auto;
+    align-items: baseline;
+    gap: 6px;
+    min-width: 0;
+    padding: 0;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    text-align: left;
+    white-space: nowrap;
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+}
+.fw-name { font-size: 12px; color: var(--text-primary); }
+.fw-ep-main { font-size: 11.5px; color: var(--text-secondary); }
+.fw-name-text,
+.fw-ep-host,
+.fw-ep-addr { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.fw-name:hover .fw-name-text,
+.fw-ep-main:hover .fw-ep-host { text-decoration: underline; }
+.fw-ep-host { color: var(--text-primary); }
+.fw-ep-sub { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 0 4px 3px 6px; }
+.fw-ep-addr { flex: 0 1 auto; font-family: var(--font-mono); font-size: 10.5px; white-space: nowrap; color: var(--text-muted); }
+.fw-pid,
+.fw-cc { flex: 0 0 auto; font-size: 10px; color: var(--text-dim); }
+.fw-det {
+    flex: 0 0 auto;
+    padding: 0 4px;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    color: var(--graph-detonated);
+    border: 1px solid var(--graph-detonated);
+    border-radius: 3px;
+}
+.fw-spark { flex: 0 0 48px; width: 48px; height: 12px; fill: var(--fw-tone, var(--text-muted)); }
+.fw-spark-base { fill: none; stroke: var(--border-primary); stroke-width: 1; }
+.fw-num {
+    flex: 0 0 auto;
+    min-width: 28px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    color: var(--text-secondary);
+}
+.fw-switch {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    min-width: 58px;
+    padding: 2px 6px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--accent-green);
+    background: rgba(var(--accent-green-rgb), 0.08);
+    border: 1px solid rgba(var(--accent-green-rgb), 0.5);
+    border-radius: 10px;
+    cursor: pointer;
+}
+.fw-switch:hover:not(:disabled) { border-color: var(--accent-green); }
+.fw-switch.is-deny {
+    color: var(--severity-critical);
+    background: rgba(var(--severity-critical-rgb), 0.12);
+    border-color: var(--severity-critical);
+}
+.fw-switch.is-pending {
+    color: var(--accent-yellow);
+    background: rgba(var(--accent-yellow-rgb), 0.1);
+    border-color: var(--accent-yellow);
+}
+/* The rule is for another protocol than this connection: it may not hold */
+.fw-switch.is-mismatch { border-style: dashed; }
+.fw-switch.is-unknown {
+    color: var(--text-muted);
+    background: transparent;
+    border: 1px dashed var(--border-dashed);
+    cursor: help;
+}
+.fw-switch:disabled { opacity: 0.45; cursor: not-allowed; }
+.fw-proto { font-weight: 400; opacity: 0.85; }
+.fw-proc-tags { display: flex; gap: 4px; padding: 0 4px 3px 26px; overflow: hidden; }
+.fw-ep-tags { display: flex; flex: 0 1 auto; gap: 3px; min-width: 0; overflow: hidden; }
+.fw-tag {
+    flex: 0 0 auto;
+    max-width: 140px;
+    padding: 0 5px;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    line-height: 15px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--fw-tone, var(--text-muted));
+    border: 1px solid currentColor;
+    border-radius: 3px;
+}
+.fw-tag.fw-tag-more { color: var(--text-muted); cursor: help; }
+.fw-eps { padding: 0 0 4px 18px; }
+.fw-ep {
+    margin: 1px 0;
+    border-left: 2px solid var(--fw-tone, transparent);
+    border-radius: 0 var(--radius) var(--radius) 0;
+}
+.fw-fwrec { flex: 0 0 auto; font-family: var(--font-mono); font-size: 9.5px; color: var(--text-dim); cursor: help; }
+.fw-ep-url { display: flex; align-items: baseline; gap: 6px; min-width: 0; padding: 0 6px 3px 12px; }
+.fw-url-state {
+    flex: 0 0 auto;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--accent-yellow);
+}
+.fw-url {
+    min-width: 0;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-secondary);
+    user-select: all;
+}
+.fw-more { margin: 4px 0 2px 8px; }
+
+/* MAP | LIST | ASN */
+.fw-center { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.fw-view { min-height: 160px; }
+.fw-map-wrap .fw-map { display: block; width: 100%; height: auto; }
+.fw-map-notes {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    padding: 6px 2px 0;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.fw-table-wrap { max-height: 560px; overflow: auto; }
+.fw-list-row { cursor: pointer; }
+.fw-list-row > td:first-child { box-shadow: inset 3px 0 0 var(--fw-tone, transparent); }
+.logs-table tbody tr.fw-list-row.is-selected { background: var(--bg-card-hover); }
+.fw-table td.fw-cell-ips { min-width: 180px; white-space: normal; }
+.fw-cell-tags .fw-tag { display: inline-block; margin: 1px 3px 1px 0; vertical-align: middle; }
+.fw-state-deny { font-weight: 700; color: var(--severity-critical); }
+.fw-state-pending { color: var(--accent-yellow); }
+.fw-state-allow { color: var(--accent-green); }
+.fw-state-unknown { color: var(--text-muted); }
+.fw-ip {
+    margin: 1px 3px 1px 0;
+    padding: 0 5px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--text-primary);
+    background: transparent;
+    border: 1px solid var(--fw-tone, var(--border-primary));
+    border-radius: 3px;
+    cursor: pointer;
+}
+
+/* HUNT FURTHER */
+.fw-sel { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 0 0 8px; font-size: 12px; }
+.fw-sel-what {
+    flex: 1 1 260px;
+    min-width: 0;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+}
+.fw-sel-none { color: var(--text-muted); }
+.fw-sel-actions { display: flex; gap: 6px; }
+.fw-block-all { color: var(--severity-critical); border-color: rgba(var(--severity-critical-rgb), 0.5); }
+.fw-hint-list { display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.fw-hint {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 2px 12px;
+    width: 100%;
+    padding: 6px 8px;
+    text-align: left;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+    cursor: pointer;
+}
+.fw-hint:hover,
+.fw-hint:focus-visible { border-color: var(--accent-cyan); outline: none; }
+.fw-hint-label { flex: 0 0 220px; font-size: 11.5px; color: var(--text-secondary); }
+.fw-hint-query {
+    flex: 1 1 260px;
+    min-width: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent-cyan);
+    word-break: break-all;
+}
+
+/* SECURED SAMPLES */
+.fw-cap-list { margin: 0; padding: 0; list-style: none; }
+.fw-cap {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas: "time url actions" "meta meta actions";
+    align-items: center;
+    gap: 2px 10px;
+    padding: 6px 0;
+    border-top: 1px solid var(--border-primary);
+}
+.fw-cap-time { grid-area: time; font-family: var(--font-mono); font-size: 10.5px; white-space: nowrap; color: var(--text-muted); }
+.fw-cap .fw-url { grid-area: url; }
+.fw-cap-meta {
+    display: flex;
+    flex-wrap: wrap;
+    grid-area: meta;
+    gap: 4px 10px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--text-secondary);
+}
+.fw-cap-magic { padding: 0 4px; font-weight: 700; color: var(--accent-pink); border: 1px solid currentColor; border-radius: 3px; }
+.fw-cap-sha { color: var(--text-dim); user-select: all; }
+.fw-cap-proc { color: var(--text-muted); }
+.fw-cap-actions { display: flex; grid-area: actions; gap: 4px; }
+
+/* The summary */
+.fw-summary { min-width: 0; }
+.fw-tiles { display: grid; gap: 8px; margin-bottom: 4px; }
+.fw-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    padding: 8px 10px;
+    color: var(--text-primary);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+}
+.fw-tile-label { font-size: 9.5px; font-weight: 600; letter-spacing: 1.2px; color: var(--text-muted); }
+.fw-tile-value { font-family: var(--font-mono); font-size: 20px; font-weight: 700; }
+.fw-tile[class*="fw-tone-"] .fw-tile-value { color: var(--fw-tone, var(--text-primary)); }
+.fw-tile-sub { font-size: 10px; color: var(--text-dim); }
+.fw-top { margin-top: 10px; }
+.fw-top-title { margin: 0 0 4px; font-size: 9.5px; font-weight: 600; letter-spacing: 1.2px; color: var(--text-muted); }
+.fw-top-list { display: flex; flex-direction: column; gap: 3px; margin: 0; padding: 0; list-style: none; }
+.fw-top-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 6px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+    background: linear-gradient(90deg, rgba(var(--accent-cyan-rgb), 0.14) var(--share, 0%), transparent var(--share, 0%));
+    border-radius: var(--radius);
+}
+.fw-top-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    min-width: 0;
+    padding: 0;
+    font: inherit;
+    text-align: left;
+    color: inherit;
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+}
+.fw-top-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fw-top-none { font-size: 11px; color: var(--text-dim); }
+.fw-sum-note { margin: 12px 0 0; font-size: 11px; line-height: 1.45; color: var(--text-muted); }
 
 /* --- Telemetry: the effects of the "fibre telemetry" page ---
    Only in Telemetry (the theme with the id classic). Cyberpunk keeps its own

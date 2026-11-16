@@ -229,3 +229,11 @@
     --font-sans: var(--cp-font-text);
     --radius-lg: 6px;
 }
+
+/* --- FIREWALL tab: the map in this palette (the tones follow the
+   severities, which are set above) --- */
+:root[data-theme="cyberpunk"] {
+    --fw-land: var(--cp-raised);
+    --fw-grat: var(--cp-line);
+    --fw-chamber: var(--cp-magenta);
+}

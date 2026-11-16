@@ -1842,6 +1842,10 @@ def _as_cyberpunk(selector):
     return re.sub(r"\[data-theme\]", '[data-theme="cyberpunk"]', selector)
 
 
+# The rules of tabs that came after the split (the FIREWALL tab): new, so not in the old sheet
+AFTER_THE_SPLIT = re.compile(r"\.fw-|#tab-firewall\b|#firewall-")
+
+
 def test_cyberpunk_rules_unchanged():
     """Splitting theme-cyberpunk.css into theme-layout.css and the palette must not change Cyberpunk: every
     rule of the file as of e11a9dd (before the split; tests/samples/) is still there, with the same
@@ -1851,7 +1855,8 @@ def test_cyberpunk_rules_unchanged():
         return {k: v for k, v in rules.items() if ":root" not in k[1]}
     old = non_root(_flat_rules(_raw(OLD_THEME_CSS)))
     new = {(c, _as_cyberpunk(s)): v
-           for (c, s), v in non_root({**_flat_rules(_raw(LAYOUT_CSS)), **_flat_rules(_raw(THEME_CSS))}).items()}
+           for (c, s), v in non_root({**_flat_rules(_raw(LAYOUT_CSS)), **_flat_rules(_raw(THEME_CSS))}).items()
+           if not AFTER_THE_SPLIT.search(s)}
     assert old and len(old) > 700, "the old sheet was not read"
     missing = sorted(set(old) - set(new))
     extra = sorted(set(new) - set(old))
@@ -3048,13 +3053,13 @@ def test_info_texts_cover_every_tab():
         return lambda e: name in e["attrs"].get("class", "").split()
 
     headers = find(elements.root, with_class("content-header"))
-    assert len(headers) == 12, "a tab head is missing or the pattern is out of date"
+    assert len(headers) == 13, "a tab head is missing or the pattern is out of date"
     rows = find(elements.root, with_class("rtrace-header")) + find(elements.root, with_class("graph-toolbar"))
     assert len(rows) == 2, "the head rows of Tracing and Graph"
     assert [h["children"][0]["text"] if h["children"] else "" for h in headers if not has_info(h)] == []
     assert all(has_info(row) for row in rows), "Tracing or Graph without (i)"
     tabs = find(elements.root, with_class("tab-content"))
-    assert len(tabs) == 14 and all(has_info(tab) for tab in tabs)
+    assert len(tabs) == 15 and all(has_info(tab) for tab in tabs)
     texts = INFO_ATTR.findall(html) + INFO_ATTR.findall(_read(APP_JS))
     assert len(texts) >= 30
     for text in texts:
