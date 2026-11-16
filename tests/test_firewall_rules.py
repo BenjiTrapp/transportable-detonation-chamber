@@ -729,10 +729,23 @@ def test_a_per_fetch_rule_without_a_port_covers_the_address():
 
 
 def test_one_endpoint_is_one_rule_and_two_endpoints_are_two():
-    same = (rules_mod.fetch_rule_name("1.2.3.4", 8080), rules_mod.fetch_rule_name("1.2.3.4", 8080))
+    same = (rules_mod.fetch_rule_name("1.2.3.4", 8080, PY), rules_mod.fetch_rule_name("1.2.3.4", 8080, PY))
     assert same[0] == same[1]
-    assert len({rules_mod.fetch_rule_name("1.2.3.4", 8080), rules_mod.fetch_rule_name("1.2.3.4", 443),
-                rules_mod.fetch_rule_name("5.6.7.8", 8080), rules_mod.fetch_rule_name("1.2.3.4")}) == 4
+    assert len({rules_mod.fetch_rule_name("1.2.3.4", 8080, PY), rules_mod.fetch_rule_name("1.2.3.4", 443, PY),
+                rules_mod.fetch_rule_name("5.6.7.8", 8080, PY), rules_mod.fetch_rule_name("1.2.3.4", None, PY),
+                rules_mod.fetch_rule_name("1.2.3.4", 8080, r"C:\Python312\python.exe"),
+                rules_mod.fetch_rule_name("1.2.3.4", 8080)}) == 6
+
+
+def test_the_two_binaries_a_venv_fetch_can_run_as_get_a_rule_each():
+    run = FakeRun()
+    base = r"C:\Python312\python.exe"
+    first = rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)
+    second = rules_mod.allow_fetch(run, fetcher=base, ip="1.2.3.4", port=8080)
+    assert first["name"] != second["name"] and first["verified"] and second["verified"]
+    assert {run.rules[first["name"]]["Program"], run.rules[second["name"]]["Program"]} == {PY, base}
+    rules_mod.deny_fetch(run, first["name"])
+    assert set(run.rules) == {second["name"]}          # removing one does not take the other's way out
 
 
 def test_deny_fetch_removes_the_rule_and_a_stand_in_of_it():
@@ -741,6 +754,21 @@ def test_deny_fetch_removes_the_rule_and_a_stand_in_of_it():
     run.rules[name + "-new"] = run.view(name + "-new", Action="Allow", Program=PY)
     rules_mod.deny_fetch(run, name)
     assert run.rules == {}
+
+
+def test_a_stand_in_that_will_not_go_does_not_keep_the_way_out_open():
+    run = FakeRun()
+    name = rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)["name"]
+    run.rules[name + "-new"] = run.view(name + "-new", Action="Allow", Program=PY)
+    real = run.op_Remove
+
+    def remove(p):
+        return (1, "", "denied") if p["Name"].endswith("-new") else real(p)
+    run.op_Remove = remove
+    with pytest.raises(rules_mod.RuleError) as e:
+        rules_mod.deny_fetch(run, name)
+    assert name + "-new" in str(e.value) and "denied" in str(e.value)
+    assert name not in run.rules          # the rule under its own name is the way out, and it is gone
 
 
 @pytest.mark.parametrize("name", ["TDC-FW-0123456789ab", "TDC-FW-ISO-loopback", "TDC-FW-ISO-fetch-*",
@@ -1047,6 +1075,20 @@ def test_a_block_on_the_fetcher_itself_is_refused_when_the_caller_names_it():
     assert run.calls == []
     assert rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)["verified"] is True
     assert rules_mod.block(run, ip="1.2.3.4", fetcher=PY)["verified"] is True
+
+
+def test_every_binary_the_fetch_may_run_as_is_refused_as_a_block_target():
+    run = FakeRun()
+    base = r"C:\Python312\python.exe"
+    for image in (PY, base, base.upper()):
+        with pytest.raises(rules_mod.RuleError) as e:
+            rules_mod.block(run, image=image, ip="1.2.3.4", fetcher=(PY, base))
+        assert "fetcher" in str(e.value)
+    assert run.calls == []
+    assert rules_mod.block(run, image=IMAGE, fetcher=[PY, base])["verified"] is True
+    for bad in ("", "-x", 5, [PY, ""], [PY, None]):
+        with pytest.raises(rules_mod.RuleError):
+            rules_mod.block(FakeRun(), image=IMAGE, fetcher=bad)
 
 
 # ---- names, paths, digits --------------------------------------------------------------------

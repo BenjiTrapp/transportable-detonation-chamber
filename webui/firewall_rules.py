@@ -415,8 +415,22 @@ def _write(run, spec: Dict[str, Any]) -> Optional[str]:
         return str(e)
 
 
+def _fetcher_paths(value: Any) -> Tuple[str, ...]:
+    """``fetcher`` as a tuple of paths: one path, several of them, or none (``None``, the explicit opt-out).
+
+    Several, because a venv's ``python.exe`` on Windows is a launcher that hands the work to the base
+    interpreter: the socket may belong to either binary, and a guard that names one of them has a blind spot.
+    """
+    if value is None:
+        return ()
+    if not isinstance(value, str) and not isinstance(value, (list, tuple)):
+        raise RuleError(f"fetcher must be a path or a list of paths, not {type(value).__name__}")
+    values = [value] if isinstance(value, str) else list(value)
+    return tuple(_clean_path(v, "fetcher") for v in values)
+
+
 def block(run, *, image: Optional[str] = None, ip: Optional[str] = None, port: Optional[int] = None,
-          protocol: Optional[str] = None, fetcher: Optional[str]) -> Dict[str, Any]:
+          protocol: Optional[str] = None, fetcher: Optional[Any]) -> Dict[str, Any]:
     """Block outbound traffic and check that the block stands.
 
     ``image`` and ``ip``: this program to this address (the automatic block, always program-scoped). ``image`` alone:
@@ -432,14 +446,16 @@ def block(run, *, image: Optional[str] = None, ip: Optional[str] = None, port: O
 
     Two blocks would cut TDC off from itself and are refused. A block for every program (no ``image``) on an address
     that is loopback, unspecified or multicast: that is where the lockout lives, while a block that names a program
-    touches only that program, so a sample's own loopback, mDNS or SSDP traffic can be cut. And a block on the program
-    ``fetcher``, because an explicit Block beats the per-fetch Allow rule of ISOLATED. This module cannot know the
-    fetcher's path, so ``fetcher`` is a **required** keyword: the caller passes the ``python.exe`` of the web UI venv,
-    the same path it gives ``allow_fetch``. ``fetcher=None`` is the explicit opt-out; leaving it out is a ``TypeError``.
+    touches only that program, so a sample's own loopback, mDNS or SSDP traffic can be cut. And a block on any program
+    of ``fetcher``, because an explicit Block beats the per-fetch Allow rule of ISOLATED. This module cannot know the
+    fetcher's path, so ``fetcher`` is a **required** keyword: the caller passes the ``python.exe`` of the web UI venv
+    (and the base interpreter behind it, as a list), the same paths it gives ``allow_fetch``. ``fetcher=None`` is the
+    explicit opt-out; leaving it out is a ``TypeError``.
     """
     spec = _block_spec(image, ip, port, protocol)
-    if fetcher is not None and spec["image"] is not None and _same_path(spec["image"], _clean_path(fetcher, "fetcher")):
-        raise RuleError("that program is TDC's own fetcher: blocking it would cut TDC off from its fetch targets")
+    for program in _fetcher_paths(fetcher):
+        if spec["image"] is not None and _same_path(spec["image"], program):
+            raise RuleError("that program is TDC's own fetcher: blocking it would cut TDC off from its fetch targets")
     with _LOCK:
         problem = _write(run, spec)
     return {"rule_id": spec["name"], "name": spec["name"], "image": spec["image"], "ip": spec["ip"],
@@ -477,25 +493,28 @@ def verify(run, rule_id: str) -> bool:
 # ---- the way out of ISOLATED, one fetch at a time --------------------------------------------
 
 
-def fetch_rule_name(ip: Any, port: Optional[int] = None) -> str:
-    """The name of the per-fetch allow rule for one endpoint: ``TDC-FW-ISO-fetch-<12 hex>``.
+def fetch_rule_name(ip: Any, port: Optional[int] = None, fetcher: Optional[str] = None) -> str:
+    """The name of the per-fetch allow rule for one program and one endpoint: ``TDC-FW-ISO-fetch-<12 hex>``.
 
-    It follows from the address and the port, so two fetches to the same endpoint share one rule (the caller
-    counts them) while two to different endpoints can never replace each other's way out.
+    It follows from the program, the address and the port, so the same fetch always asks for the same rule,
+    while two fetches to different endpoints - or to one endpoint as two different programs, which a venv
+    launcher makes possible - can never replace each other's way out.
     """
     address = _clean_ip(ip)
     number = _clean_port(port) if port is not None else None
-    text = "\0".join(["fetch", address, str(number or "")])
+    program = _clean_path(fetcher, "fetcher").lower().replace("/", "\\") if fetcher is not None else ""
+    text = "\0".join(["fetch", program, address, str(number or "")])
     return FETCH_PREFIX + hashlib.blake2s(text.encode("utf-8", "replace"), digest_size=6).hexdigest()
 
 
 def allow_fetch(run, *, fetcher: str, ip: Any, port: Optional[int] = None) -> Dict[str, Any]:
-    """Allow the fetcher program out to one address, for one fetch: ``{name, rule_id, verified, problem}``.
+    """Allow one fetcher program out to one address, for one fetch: ``{name, rule_id, verified, problem}``.
 
     ISOLATED shuts every way out but loopback, so TDC's own fetch needs a hole. This is that hole, as small as
     a program-path rule can be made: one program, one address, one port when it is known, and ``deny_fetch``
     takes it away the moment the fetch ends. See the module docstring for why there is no standing rule for the
-    fetcher any more, and for the residual that is left.
+    fetcher any more, and for the residual that is left. A caller whose fetch may run as more than one binary
+    (``sys.executable`` and the base interpreter a venv launcher starts) calls this once per path.
 
     Raises ``RuleError`` when the arguments are unsound or a profile is off (nothing is enforced then anyway,
     so the caller may go ahead with the fetch and say so); ``problem`` is why a rule that was written cannot be
@@ -504,7 +523,7 @@ def allow_fetch(run, *, fetcher: str, ip: Any, port: Optional[int] = None) -> Di
     program = _clean_path(fetcher, "fetcher")
     address = _clean_ip(ip)
     number = _clean_port(port) if port is not None else None
-    spec = _spec(fetch_rule_name(address, number), "Allow", program, (address,), number,
+    spec = _spec(fetch_rule_name(address, number, program), "Allow", program, (address,), number,
                  "tcp" if number is not None else None)      # http(s) is tcp
     with _LOCK:
         problem = _write(run, spec)
@@ -515,17 +534,24 @@ def deny_fetch(run, name: str) -> None:
     """Remove a per-fetch allow rule, and a stand-in of it, and check that both are gone.
 
     Only ``TDC-FW-ISO-fetch-<12 hex>`` is accepted, so this can be pointed neither at a block rule nor at the
-    loopback rule that ISOLATED needs.
+    loopback rule that ISOLATED needs. Both removals are tried even when the first fails: the rule under its
+    own name is the way out that has to go, and a stand-in that will not budge must not keep it open. What is
+    still standing afterwards is raised, with the failures that were seen.
     """
     if not isinstance(name, str) or not _FETCH_NAME.fullmatch(name):
         raise RuleError(f"not a TDC per-fetch rule: {str(name)[:60]!r}")
     both = (name + SWAP_SUFFIX, name)
     with _LOCK:
+        failed = []
         for each in both:
-            _ok(run, "Remove", Name=each)
+            try:
+                _ok(run, "Remove", Name=each)
+            except RuleError as e:
+                failed.append(f"{each}: {_first_line(e)}")
         still = [n for n in both if _describe(run, n) is not None]
     if still:
-        raise RuleError(f"{', '.join(still)} is still there after it was removed")
+        raise RuleError(f"{', '.join(still)} is still there after it was removed"
+                        + (f" ({'; '.join(failed)})" if failed else ""))
 
 
 def forget_fetch_rules(run) -> List[str]:

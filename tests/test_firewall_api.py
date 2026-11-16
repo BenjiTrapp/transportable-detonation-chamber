@@ -416,7 +416,7 @@ def test_the_fetch_is_let_out_of_isolated_for_one_address_and_no_longer(client, 
     firewall_rules = tdc.firewall_rules
     assert not any(n.startswith(firewall_rules.FETCH_PREFIX) or n == firewall_rules.FETCHER_RULE
                    for n in fw.run.rules)                      # no standing way out for the interpreter
-    name = firewall_rules.fetch_rule_name("203.0.113.50", 8080)
+    names = [firewall_rules.fetch_rule_name("203.0.113.50", 8080, p) for p in tdc._fw_fetcher_paths()]
     windows, standing = fw.run, []
 
     def watch(args):
@@ -425,22 +425,168 @@ def test_the_fetch_is_let_out_of_isolated_for_one_address_and_no_longer(client, 
         return out
     monkeypatch.setattr(tdc, "_fw_runner", watch)
     out = tdc._fetch_capture(FINDING)
-    assert out["sha256"] and out["allow_rule"] == name and out["allow_problem"] is None
-    assert any(name in seen for seen in standing)               # it stood while the fetch ran
-    assert name not in windows.rules                            # and is gone afterwards
-    rule = next(c for c in windows.calls if name in c and "Create" in c)
-    assert "-Program" in rule and tdc._fw_fetcher_path() in rule and "Allow" in rule
+    assert out["sha256"] and out["allow_rules"] == names and out["allow_problem"] is None
+    assert out["allow_closed"] is True and out["close_problem"] is None
+    assert any(set(names) <= seen for seen in standing)        # they stood while the fetch ran
+    assert not any(n in windows.rules for n in names)          # and are gone afterwards
+    rule = next(c for c in windows.calls if names[0] in c and "Create" in c)
+    assert "-Program" in rule and tdc._fw_fetcher_paths()[0] in rule and "Allow" in rule
     assert "203.0.113.50" in rule and "8080" in rule
+    assert tdc._fw_isolate_state()["fetch_paths_open"] == []
+
+
+def test_the_fetch_is_let_out_as_every_binary_a_venv_launcher_may_use(client, fw, tdc, monkeypatch):
+    base = r"C:\Python312\python.exe"
+    monkeypatch.setattr(tdc.sys, "_base_executable", base)
+    assert tdc._fw_fetcher_paths() == (tdc.sys.executable, base)
+    client.post("/api/firewall/isolate", json={"on": True})
+    out = tdc._fetch_capture(FINDING)
+    assert len(out["allow_rules"]) == 2 and out["allow_problem"] is None
+    programs = [c[c.index("-Program") + 1] for c in fw.run.calls
+                if tdc.firewall_rules.FETCH_PREFIX in " ".join(c) and "Create" in c]
+    assert programs == [tdc.sys.executable, base]
+    assert not any(n in fw.run.rules for n in out["allow_rules"])
+    monkeypatch.setattr(tdc.sys, "_base_executable", tdc.sys.executable.upper())
+    assert len(tdc._fw_fetcher_paths()) == 1                   # the same program twice is one rule
 
 
 def test_without_isolated_a_fetch_writes_no_rule_at_all(client, fw, tdc):
-    assert tdc._fetch_capture(FINDING)["allow_rule"] is None
+    assert tdc._fetch_capture(FINDING)["allow_rules"] == []
     assert fw.run.calls == []
 
 
-def test_the_fetcher_can_never_be_blocked(client, fw, tdc):
-    r = client.post("/api/firewall/block", json={"scope": "process", "image": tdc._fw_fetcher_path()})
-    assert r.status_code == 409
+@pytest.mark.parametrize("program", ["executable", "base"])
+def test_no_binary_the_fetch_may_run_as_can_be_blocked(client, fw, tdc, monkeypatch, program):
+    base = r"C:\Python312\python.exe"
+    monkeypatch.setattr(tdc.sys, "_base_executable", base)
+    image = tdc.sys.executable if program == "executable" else base
+    r = client.post("/api/firewall/block", json={"scope": "process", "image": image})
+    assert r.status_code == 409 and "fetcher" in r.json["error"]
+
+
+def test_two_fetches_to_one_endpoint_share_the_way_out_and_the_last_one_closes_it(client, fw, tdc):
+    client.post("/api/firewall/isolate", json={"on": True})
+    first, problem = tdc._fw_open_fetch_path("203.0.113.50", 8080)
+    second, again = tdc._fw_open_fetch_path("203.0.113.50", 8080)
+    assert first == second and problem is None and again is None
+    assert all(n in fw.run.rules for n in first)
+    assert tdc._fw_close_fetch_path(second) == []
+    assert all(n in fw.run.rules for n in first)               # the other fetch still needs it
+    assert tdc._fw_close_fetch_path(first) == []
+    assert not any(n in fw.run.rules for n in first)
+
+
+def test_fetches_running_at_once_never_go_out_without_their_rule(client, fw, tdc, monkeypatch):
+    """One of the two races a per-endpoint count can have: a second fetch passing before the rule stands."""
+    import threading
+    client.post("/api/firewall/isolate", json={"on": True})
+    names = [tdc.firewall_rules.fetch_rule_name("203.0.113.50", 8080, p) for p in tdc._fw_fetcher_paths()]
+    stood, real_allow = [], tdc.firewall_rules.allow_fetch
+
+    def slow_allow(*args, **kwargs):
+        time.sleep(0.15)                      # the window the race lives in
+        return real_allow(*args, **kwargs)
+
+    def slow_fetch(*args, **kwargs):
+        stood.append(all(n in fw.run.rules for n in names))
+        time.sleep(0.05)
+        return {"path": str(fw.samples / "x"), "sha256": "a" * 64, "size": 2, "magic": "MZ", "status": 200,
+                "redirects": 0, "content_type": "", "user_agent": tdc.FETCH_DEFAULT_UA}
+    monkeypatch.setattr(tdc.firewall_rules, "allow_fetch", slow_allow)
+    monkeypatch.setattr(tdc.firewall_fetch, "fetch", slow_fetch)
+    threads = [threading.Thread(target=tdc._fetch_capture, args=(FINDING,)) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+        time.sleep(0.03)
+    for thread in threads:
+        thread.join(10)
+    assert stood == [True] * 4
+    assert not any(n in fw.run.rules for n in names) and tdc._fw_isolate_state()["fetch_paths_open"] == []
+
+
+def test_a_fetch_that_opens_while_another_closes_keeps_its_way_out(client, fw, tdc, monkeypatch):
+    """The other race: the removal of a finished fetch must not take away the rule a new one just made."""
+    import threading
+    client.post("/api/firewall/isolate", json={"on": True})
+    names, _ = tdc._fw_open_fetch_path("203.0.113.50", 8080)
+    real_deny, inside, go = tdc.firewall_rules.deny_fetch, threading.Event(), threading.Event()
+
+    def slow_deny(run, name):
+        inside.set()
+        go.wait(5)
+        return real_deny(run, name)
+    monkeypatch.setattr(tdc.firewall_rules, "deny_fetch", slow_deny)
+    closer = threading.Thread(target=tdc._fw_close_fetch_path, args=(names,))
+    closer.start()
+    assert inside.wait(5)
+    opened = []
+    opener = threading.Thread(target=lambda: opened.append(tdc._fw_open_fetch_path("203.0.113.50", 8080)))
+    opener.start()
+    time.sleep(0.1)                 # the new fetch is waiting for the lock, or (without it) already through
+    go.set()
+    closer.join(10)
+    opener.join(10)
+    assert opened and opened[0][0] == names and opened[0][1] is None
+    assert all(n in fw.run.rules for n in names)       # the new fetch has its way out
+    assert tdc._fw_close_fetch_path(names) == [] and not any(n in fw.run.rules for n in names)
+
+
+def test_a_way_out_that_will_not_close_is_retried_recorded_and_shown(client, fw, tdc, monkeypatch):
+    monkeypatch.setattr(tdc, "FETCH_CLOSE_PAUSE", 0)
+    client.post("/api/firewall/isolate", json={"on": True})
+    names = [tdc.firewall_rules.fetch_rule_name("203.0.113.50", 8080, p) for p in tdc._fw_fetcher_paths()]
+    fw.run.fail["Remove"] = (1, "denied")
+    out = tdc._fetch_capture(FINDING, "deadline")
+    assert out["sha256"] and out["allow_closed"] is False
+    assert names[0] in out["close_problem"] and "could not be closed" in out["close_problem"]
+    assert all(n in fw.run.rules for n in names)               # the hole is really still open
+    removes = [c for c in fw.run.calls if "Remove" in c and names[0] in c]
+    assert len(removes) >= tdc.FETCH_CLOSE_ATTEMPTS            # it was retried, not given up on at once
+
+    state = client.get("/api/firewall/isolate").json
+    assert [p["rule_id"] for p in state["fetch_paths_open"]] == names
+    assert all(p["problem"] and p["since"] for p in state["fetch_paths_open"])
+    (event,) = client.get('/api/logs/search?q=path="/internal/firewall/allow"').json["events"]
+    assert event["fields"]["outcome"] == "still open" and event["fields"]["rule_id"] == names[0]
+    assert event["fields"]["status"] == 500
+    capture = client.get("/api/firewall/captures").json["captures"][0]
+    assert capture["allow_closed"] is False and capture["close_problem"]
+
+    del fw.run.fail["Remove"]                                  # the next sweep gets it
+    tdc._firewall_sweep(now=time.time())
+    assert not any(n in fw.run.rules for n in names)
+    assert client.get("/api/firewall/isolate").json["fetch_paths_open"] == []
+
+
+def test_the_sweep_leaves_a_rule_a_running_fetch_still_needs(client, fw, tdc, monkeypatch):
+    client.post("/api/firewall/isolate", json={"on": True})
+    monkeypatch.setattr(tdc, "_fw_fetch_swept", 0.0)
+    names, _ = tdc._fw_open_fetch_path("203.0.113.50", 8080)
+    tdc._firewall_sweep(now=time.time())
+    assert all(n in fw.run.rules for n in names) and tdc._fw_isolate_state()["fetches_in_flight"] == 1
+    assert tdc._fw_close_fetch_path(names) == []
+
+
+def test_the_sweep_removes_a_per_fetch_rule_no_fetch_is_using(client, fw, tdc, monkeypatch):
+    client.post("/api/firewall/isolate", json={"on": True})
+    monkeypatch.setattr(tdc, "_fw_fetch_swept", 0.0)
+    forgotten = tdc.firewall_rules.fetch_rule_name("198.51.100.9", 443, tdc._fw_fetcher_paths()[0])
+    fw.run.rules[forgotten] = fw.run.view(forgotten, Action="Allow", Program=tdc._fw_fetcher_paths()[0])
+    tdc._firewall_sweep(now=time.time())
+    assert forgotten not in fw.run.rules
+
+
+def test_the_fetch_budget_covers_the_checks_and_the_rule_too(client, fw, tdc, monkeypatch):
+    seen = {}
+    real = tdc.firewall_fetch.fetch
+
+    def watching(*args, **kwargs):
+        seen["timeout"] = kwargs["timeout"]
+        return real(*args, **kwargs)
+    monkeypatch.setattr(tdc.firewall_fetch, "fetch", watching)
+    monkeypatch.setattr(tdc, "_fw_open_fetch_path", lambda ip, port: (time.sleep(0.2), ((), None))[1])
+    assert tdc._fetch_capture(FINDING)["sha256"]
+    assert 0 < seen["timeout"] <= tdc.FETCH_TIMEOUT - 0.2
 
 
 @pytest.mark.parametrize("body", [
@@ -1065,7 +1211,7 @@ def test_the_first_step_of_the_collector_thread_does_what_start_up_needs(fw, tdc
     incoming.mkdir(parents=True)
     (incoming / "half-a-payload").write_bytes(b"MZ")
     fw.run.rules["TDC-FW-ISO-fetch-0123456789ab"] = fw.run.view(
-        "TDC-FW-ISO-fetch-0123456789ab", Action="Allow", Program=tdc._fw_fetcher_path())
+        "TDC-FW-ISO-fetch-0123456789ab", Action="Allow", Program=tdc._fw_fetcher_paths()[0])
     tdc._fw_prepare()
     assert tdc._fw_startup == {"isolated": False, "profiles_off": [], "announce": False, "note": None}
     assert os.listdir(incoming) == []                            # no partial file in a Defender-excluded root

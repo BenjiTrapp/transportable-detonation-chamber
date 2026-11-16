@@ -273,6 +273,52 @@ def test_a_refused_connection_is_a_network_error(tmp_path):
     assert "network" in str(e.value) or str(e.value) == "timed out"
 
 
+class _Late:
+    """A connection whose read ends the way a TLS socket does when the watchdog shut it down mid-read."""
+
+    io_sock = None
+
+    def __init__(self, pause, error):
+        self.pause, self.error = pause, error
+
+    def connect(self):
+        pass
+
+    def request(self, method, target, headers=None):
+        pass
+
+    def getresponse(self):
+        time.sleep(self.pause)
+        raise self.error
+
+    def close(self):
+        pass
+
+
+def test_a_tls_socket_the_watchdog_shut_down_is_a_timeout_not_a_valueerror(tmp_path):
+    late = _Late(0.2, ValueError("Read on closed or unwrapped SSL socket"))
+    with pytest.raises(fetcher.FetchError) as e:
+        fetcher.fetch(f"https://{HOST}/a.dll", "203.0.113.5", 443, capture_dir=str(tmp_path),
+                      refuse=ALLOW_ALL, timeout=0.1, connect=lambda *a: late)
+    assert str(e.value) == "timed out"
+
+
+def test_a_valueerror_that_is_not_the_clock_is_not_dressed_up_as_a_timeout(tmp_path):
+    early = _Late(0, ValueError("something else entirely"))
+    with pytest.raises(ValueError) as e:
+        fetcher.fetch(f"https://{HOST}/a.dll", "203.0.113.5", 443, capture_dir=str(tmp_path),
+                      refuse=ALLOW_ALL, timeout=10, connect=lambda *a: early)
+    assert "something else" in str(e.value)
+
+
+def test_a_budget_that_is_already_spent_asks_nothing(tmp_path):
+    asked = []
+    with pytest.raises(fetcher.FetchError) as e:
+        fetcher.fetch(f"http://{HOST}/a.dll", "203.0.113.5", 80, capture_dir=str(tmp_path), refuse=ALLOW_ALL,
+                      timeout=-5, connect=lambda *a: asked.append(a))
+    assert str(e.value) == "timed out" and asked == []
+
+
 # ---- the URL is held to the endpoint --------------------------------------------------------
 
 

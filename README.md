@@ -1804,7 +1804,7 @@ Proxied responses are only relayed as data (JSON, text, binary); HTML is served 
 
 Times are ISO-8601 UTC text; a flow's `times` is a list of epoch seconds. Errors are `{"error": ...}` with 400 (malformed), 404, 409 (refused: the Windows Firewall is off, a lockout, a block that could not be verified) or 500. Every action is an `access` event in the LOGS tab — the ones TDC takes by itself under `/internal/firewall/block`, `/internal/firewall/decide` and `/internal/firewall/fetch`, each with `by` (`detector`, `analyst` or `deadline`), the endpoint, the URL, the User-Agent that was sent and the outcome.
 
-ISOLATED blocks every way out but loopback. TDC's own fetch is let out one address at a time, only while it runs (`TDC-FW-ISO-fetch-*`, removed when the fetch ends and at start-up); what that leaves open is in `residual` of `GET /api/firewall/isolate`.
+ISOLATED blocks every way out but loopback. TDC's own fetch is let out one address at a time, only while it runs (`TDC-FW-ISO-fetch-*`, one rule per binary the fetch can run as, removed when the fetch ends, retried at every collector round and cleared at start-up); what that leaves open is in `residual` of `GET /api/firewall/isolate`, and a rule that could not be removed again is in `fetch_paths_open` there, on the capture (`allow_closed`, `close_problem`) and in LOGS.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -1814,7 +1814,7 @@ ISOLATED blocks every way out but loopback. TDC's own fetch is let out one addre
 | GET | `/api/firewall/rules` | The `TDC-FW-*` rules that stand, one entry per rule: `rule_id`, `kind`, `image`, `ip`, `port`, `protocol`, `key`, `blocking` |
 | POST | `/api/firewall/block` | `{scope, image, ip, port, protocol}`. `endpoint`: this program to `ip`; `endpoint_all`: every program, TDC's fetcher included; `process`: `image` anywhere. 409 while a firewall profile is off |
 | POST | `/api/firewall/unblock` | `{rule_id}`; every rule that shares its key is removed |
-| GET / POST | `/api/firewall/isolate` | GET: `isolated`, `outbound_before`, `isolated_since`, `profiles_off`, `startup`, `residual`. POST `{on}`: switch ISOLATED (409 while a profile is off) |
+| GET / POST | `/api/firewall/isolate` | GET: `isolated`, `outbound_before`, `isolated_since`, `profiles_off`, `startup`, `residual`, `fetch_paths_open`, `fetches_in_flight`. POST `{on}`: switch ISOLATED (409 while a profile is off) |
 | GET | `/api/firewall/pending` | `pending` (open decisions with `remaining` seconds) and `history` (the last 24 h), `ask_mode`, `decide_seconds` |
 | POST | `/api/firewall/decide` | Exactly `{id, action}` (`allow`, `block`, `block_fetch`); no URL is ever taken. An id works once, a second answer gets the decision that was taken |
 | POST | `/api/firewall/ask` | `{mode}`: `detonation`, `all` or `off` (kept on the server) |

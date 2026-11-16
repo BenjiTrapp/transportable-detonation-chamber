@@ -454,10 +454,14 @@ def fetch(url: Any, ip: Any, port: Optional[int] = None, *, capture_dir: str, us
             break
         except FetchError:
             raise
-        except (OSError, http.client.HTTPException) as e:
+        except (OSError, http.client.HTTPException, ValueError) as e:
+            # The watchdog's shutdown can also surface as ValueError("Read on closed or unwrapped SSL socket"),
+            # because SSLSocket.shutdown clears _sslobj while a read is in it; that is the clock, not a bug.
             if (watchdog is not None and watchdog.fired) or time.monotonic() >= deadline \
                     or isinstance(e, (TimeoutError, socket.timeout)):
                 raise FetchError("timed out") from e
+            if isinstance(e, ValueError):
+                raise                      # a ValueError that is not the clock is a fault, not a fetch result
             if isinstance(e, http.client.HTTPException):
                 raise FetchError(f"protocol error: {type(e).__name__}") from e
             raise FetchError(f"network or disk error: {type(e).__name__}") from e

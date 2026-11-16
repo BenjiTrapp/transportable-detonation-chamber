@@ -3,8 +3,8 @@
 #
 # What it does, and only this:
 #   1. sets DefaultOutboundAction to Allow on the Domain, Private and Public profiles
-#   2. removes every firewall rule named TDC-FW-* (the blocks of the FIREWALL tab and the two
-#      allow rules of ISOLATED mode: loopback and the fetcher)
+#   2. removes every firewall rule named TDC-FW-* (the blocks of the FIREWALL tab, the loopback allow
+#      rule of ISOLATED mode and any per-fetch allow rule a fetch left behind)
 #   3. says what it did
 #
 # It does not switch the firewall on or off, and it does not touch a rule of any other name.

@@ -10924,6 +10924,9 @@ FIREWALL_FINDING_FRESH_S = 3600        # an older finding is marked but no longe
 FIREWALL_WINDOW_GRACE_S = 60           # a detonation window stays open this long after its process ended
 FIREWALL_RULES_TTL_S = 5
 FIREWALL_MARK_LIMIT = 5000
+FETCH_CLOSE_ATTEMPTS = 3               # tries to take the per-fetch allow rule away again
+FETCH_CLOSE_PAUSE = 0.2
+FIREWALL_FETCH_SWEEP_S = 60            # how often the sweep looks for a per-fetch rule no fetch is using
 # What ISOLATED does not close, for the banner of the tab: TDC's fetcher is the venv's python.exe, so a rule
 # naming that program lets out whatever can run it. The rule is therefore written per fetch, for one address,
 # and taken away when the fetch ends (firewall_rules.allow_fetch); what is left is that window.
@@ -10987,9 +10990,21 @@ def _firewall_decide_seconds():
     return min(seconds, 3600.0)
 
 
-def _fw_fetcher_path():
-    """The program TDC's own fetch runs as: the Allow rule of ISOLATED, and the program that is never blocked."""
-    return sys.executable
+def _fw_fetcher_paths():
+    """Every program TDC's own fetch can run as: the one that is never blocked, and the one ISOLATED lets out.
+
+    On Windows a venv's ``python.exe`` is a launcher that starts the base interpreter (``sys._base_executable``)
+    as a child, and that child owns the socket. A rule or a guard naming only one of the two would therefore
+    have a blind spot - the fetch in ISOLATED would be blocked by TDC's own default action, with nothing saying
+    why - so both are used wherever the fetcher is an identity. They are the same path outside a venv, and on a
+    venv whose launcher *is* the interpreter; the duplicate is dropped.
+    """
+    paths = [sys.executable]
+    base = getattr(sys, "_base_executable", None)
+    if isinstance(base, str) and base.strip() and not any(
+            base.strip().lower().replace("/", "\\") == p.strip().lower().replace("/", "\\") for p in paths):
+        paths.append(base)
+    return tuple(paths)
 
 
 # ---- detonation windows ---------------------------------------------------------------------
@@ -11369,8 +11384,23 @@ _UA_PATTERNS = (
     re.compile(r"(?:^|\s)(?:-A|--user-agent)\s+['\"]([^'\"\r\n]{1,300})['\"]", re.I),
 )
 
-_fw_fetch_paths = {}                     # per-fetch allow rule -> how many fetches still need it
-_fw_fetch_paths_lock = threading.Lock()
+_fw_fetch_paths = {}                     # the allow rules of a fetch (a tuple of names) -> how many need them
+_fw_fetch_open = {}                      # rule name -> why it is still standing, for one that would not go
+_fw_fetch_swept = 0.0                    # when the per-fetch rules were last swept for forgotten ones
+_fw_fetch_paths_lock = threading.RLock()
+
+
+def _fw_reason(exc):
+    """The first line of an exception, short enough for a field."""
+    return (str(exc).splitlines() or [type(exc).__name__])[0][:300] or type(exc).__name__
+
+
+def _fw_still_open(names):
+    """Why a caller should worry, when a per-fetch allow rule would not go away; None when all of them went."""
+    if not names:
+        return None
+    return ("the way out of ISOLATED could not be closed again: " + ", ".join(names) +
+            " still allows TDC's fetcher out to that address")
 
 
 def _loader_user_agent(finding):
@@ -11418,56 +11448,132 @@ def _submission_for(finding):
 
 
 def _fw_open_fetch_path(ip, port):
-    """While ISOLATED, let the fetcher out to this one endpoint for as long as this fetch lasts.
+    """While ISOLATED, let TDC's own fetch out to this one endpoint for as long as this fetch lasts.
 
-    ``(rule name | None, problem | None)``. ISOLATED shuts every way out but loopback, so without a rule the
-    fetch cannot happen; a standing allow rule for the fetcher would be much wider, because the fetcher is a
-    Python interpreter (``firewall_rules.allow_fetch`` spells out the residual). The counter keeps two fetches
-    to one endpoint from taking away each other's way out. A rule that cannot be written is not fatal: the
-    fetch is tried and the problem is recorded with the result.
+    ``(names, problem)``: the allow rules that were opened - one per program the fetch may run as - and the
+    first problem, or None. ISOLATED shuts every way out but loopback, so without a rule the fetch cannot
+    happen; a standing allow rule for the fetcher would be much wider, because the fetcher is a Python
+    interpreter (``firewall_rules.allow_fetch`` spells out the residual). A rule that cannot be written is not
+    fatal: the fetch is tried and the problem is recorded with its result.
+
+    The count and the rule writing are one step under ``_fw_fetch_paths_lock``, so a second fetch to the same
+    endpoint neither passes before the rule stands nor removes a rule the first one still needs.
     """
     if not _fw_settings.isolated:
-        return None, None
+        return (), None
+    programs = _fw_fetcher_paths()
     try:
-        name = firewall_rules.fetch_rule_name(ip, port)
+        names = tuple(firewall_rules.fetch_rule_name(ip, port, program) for program in programs)
     except Exception as e:
-        return None, (str(e).splitlines() or [type(e).__name__])[0][:300]
+        return (), _fw_reason(e)
     with _fw_fetch_paths_lock:
-        held = _fw_fetch_paths.get(name, 0)
-        _fw_fetch_paths[name] = held + 1
-    if held:
-        return name, None
-    try:
-        done = firewall_rules.allow_fetch(_fw_runner, fetcher=_fw_fetcher_path(), ip=ip, port=port)
-        return name, done["problem"]
-    except Exception as e:
-        return name, (str(e).splitlines() or [type(e).__name__])[0][:300]
-    finally:
-        _fw_forget_rules()
+        held = _fw_fetch_paths.get(names, 0)
+        _fw_fetch_paths[names] = held + 1
+        if held:
+            return names, None
+        problem = None
+        try:
+            for program, name in zip(programs, names):
+                done = firewall_rules.allow_fetch(_fw_runner, fetcher=program, ip=ip, port=port)
+                problem = problem or done["problem"]
+                _fw_fetch_open.pop(name, None)       # it stands again, so it is no longer a hole left open
+        except Exception as e:
+            problem = _fw_reason(e)
+        finally:
+            _fw_forget_rules()
+        return names, problem
 
 
-def _fw_close_fetch_path(name):
-    """Take the per-fetch allow rule away again, whether the fetch worked or not; the last fetch closes it."""
-    if not name:
-        return
+def _fw_close_fetch_path(names):
+    """Take the per-fetch allow rules away again, whether the fetch worked or not; what is still standing.
+
+    The last fetch that needs them closes them. A removal that fails would leave TDC's fetcher allowed out to
+    a suspected C2 until the next restart - the hole these rules exist to keep shut - so it is retried here,
+    again at every sweep, recorded in LOGS and on the capture, and named in ``/api/firewall/isolate``.
+    """
+    if not names:
+        return []
     with _fw_fetch_paths_lock:
-        left = _fw_fetch_paths.get(name, 1) - 1
+        left = _fw_fetch_paths.get(names, 1) - 1
         if left > 0:
-            _fw_fetch_paths[name] = left
-            return
-        _fw_fetch_paths.pop(name, None)
+            _fw_fetch_paths[names] = left
+            return []
+        _fw_fetch_paths.pop(names, None)
+        return _fw_remove_fetch_rules(names)
+
+
+def _fw_remove_fetch_rules(names, attempts=None, sleep=time.sleep):
+    """Remove per-fetch allow rules, trying ``attempts`` times (``FETCH_CLOSE_ATTEMPTS``); what still stands.
+
+    The caller holds ``_fw_fetch_paths_lock``. What will not go is remembered in ``_fw_fetch_open`` so that
+    the next sweep tries again and the tab can show it; what goes is forgotten there.
+    """
+    attempts = FETCH_CLOSE_ATTEMPTS if attempts is None else max(1, int(attempts))
+    stuck = []
     try:
-        firewall_rules.deny_fetch(_fw_runner, name)
-    except Exception as e:
-        _log_logger.warning("firewall: the per-fetch allow rule %s could not be removed: %s", name, e)
+        for name in names:
+            problem = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    firewall_rules.deny_fetch(_fw_runner, name)
+                    problem = None
+                    break
+                except Exception as e:
+                    problem = _fw_reason(e)
+                    if attempt < attempts:
+                        sleep(FETCH_CLOSE_PAUSE)
+            if problem is None:
+                _fw_fetch_open.pop(name, None)
+                continue
+            first = name not in _fw_fetch_open
+            _fw_fetch_open[name] = {"rule_id": name, "problem": problem,
+                                    "since": _fw_fetch_open.get(name, {}).get("since") or _fw_iso(time.time())}
+            stuck.append(name)
+            _log_logger.warning("firewall: the per-fetch allow rule %s could not be removed (%s); TDC's fetcher "
+                                "stays allowed out to that address until it goes", name, problem)
+            if first:        # one event per hole, not one per retry
+                _fw_log_action("ALLOW", "fetch", 500, None, outcome="still open", rule_id=name, problem=problem)
     finally:
         _fw_forget_rules()
+    return stuck
 
 
-def _fw_fetch_failed(finding, message, by, agent, problem):
+def _fw_retry_fetch_paths(now=None):
+    """Try again to close the fetch paths that would not close, and sweep for forgotten ones; what is left.
+
+    Runs at every sweep. Nothing else would close them: the fetch they belonged to is over, and while one
+    stands TDC's fetcher is allowed out to that address. The full sweep (a rule list, so once a minute at most)
+    only runs while ISOLATED is on and no fetch is in flight, because it removes *every* per-fetch rule.
+    """
+    global _fw_fetch_swept
+    now = time.time() if now is None else now
+    with _fw_fetch_paths_lock:
+        in_flight = {name for names in _fw_fetch_paths for name in names}
+        stuck = [name for name in list(_fw_fetch_open) if name not in in_flight]
+        if stuck:
+            _fw_remove_fetch_rules(stuck, attempts=1)
+        if not _fw_settings.isolated or in_flight or now - _fw_fetch_swept < FIREWALL_FETCH_SWEEP_S:
+            return sorted(_fw_fetch_open)
+        _fw_fetch_swept = now
+        try:
+            left = firewall_rules.forget_fetch_rules(_fw_runner)
+            for name in left:
+                _fw_fetch_open.pop(name, None)
+            if left:
+                _log_logger.warning("firewall: removed %d per-fetch allow rule(s) no fetch was using: %s",
+                                    len(left), ", ".join(left))
+        except Exception as e:
+            _log_logger.warning("firewall: the per-fetch allow rules could not be checked: %s", e)
+        finally:
+            _fw_forget_rules()
+        return sorted(_fw_fetch_open)
+
+
+def _fw_fetch_failed(finding, message, by, agent, problem, stuck=()):
     """Record a fetch that stored nothing in LOGS and answer with its reason."""
     _fw_log_action("FETCH", by, 500, finding, outcome="failed", error=message[:300],
-                   user_agent=agent or firewall_fetch.DEFAULT_USER_AGENT, allow_problem=problem)
+                   user_agent=agent or firewall_fetch.DEFAULT_USER_AGENT, allow_problem=problem,
+                   allow_closed=not stuck, close_problem=_fw_still_open(stuck))
     return {"error": message}
 
 
@@ -11479,28 +11585,34 @@ def _fetch_capture(pending, by="tdc"):
     loader's User-Agent, the way out of ISOLATED for the time of the fetch, the geo and submission of the
     capture, the record in ``captures.json`` and the entry in LOGS. Returns the capture record, or
     ``{"error": ...}`` (with no ``sha256``) when nothing was stored.
+
+    ``FETCH_TIMEOUT`` is the budget for all of it, the address checks and the firewall rule included, so the
+    HTTP exchange gets what those left over.
     """
     finding = pending if isinstance(pending, dict) else {}
+    started = time.monotonic()
     ip, port = finding.get("dst_ip"), finding.get("dst_port")
     agent = firewall_fetch.clean_header_text(_loader_user_agent(finding))
-    rule, problem = None, None
+    rules, problem, out, error = (), None, None, None
     try:
         # checked here as well as inside fetch(): what TDC will not fetch must not even get a firewall rule
         refusal = _fw_refuse_address(ip) if isinstance(ip, str) else "no address"
         if refusal:
             raise firewall_fetch.FetchError("refused: " + refusal)
         firewall_fetch.target_of(finding.get("url"), ip, port)
-        rule, problem = _fw_open_fetch_path(ip, port)
+        rules, problem = _fw_open_fetch_path(ip, port)
         out = firewall_fetch.fetch(finding.get("url"), ip, port, capture_dir=CAPTURE_DIR, user_agent=agent,
-                                   timeout=FETCH_TIMEOUT, max_bytes=FETCH_MAX_BYTES,
-                                   max_redirects=FETCH_MAX_REDIRECTS, refuse=_fw_refuse_address)
+                                   timeout=FETCH_TIMEOUT - (time.monotonic() - started),
+                                   max_bytes=FETCH_MAX_BYTES, max_redirects=FETCH_MAX_REDIRECTS,
+                                   refuse=_fw_refuse_address)
     except firewall_fetch.FetchError as e:
-        return _fw_fetch_failed(finding, str(e), by, agent, problem)
+        error = str(e)
     except Exception as e:
         _log_logger.warning("fetch failed: %s: %s", type(e).__name__, e)
-        return _fw_fetch_failed(finding, f"fetch failed: {type(e).__name__}", by, agent, problem)
-    finally:
-        _fw_close_fetch_path(rule)
+        error = f"fetch failed: {type(e).__name__}"
+    stuck = _fw_close_fetch_path(rules)      # whatever happened, the way out is taken away again
+    if error is not None:
+        return _fw_fetch_failed(finding, error, by, agent, problem, stuck)
     meta = {"sha256": out["sha256"], "size": out["size"], "url": finding.get("url"), "dst_ip": ip,
             "dst_port": port, "geo": firewall.geo_info(ip), "pid": finding.get("pid"),
             "image": finding.get("image"), "fetched_at": _fw_iso(time.time()), "origin": "fetch",
@@ -11508,11 +11620,13 @@ def _fetch_capture(pending, by="tdc"):
             "submission_id": _submission_for(finding), "executed": False, "path": out["path"],
             "status": out["status"], "redirects": out["redirects"], "user_agent": out["user_agent"],
             "user_agent_source": "loader" if agent else "default", "finding_id": finding.get("id"),
-            "source": finding.get("source"), "allow_rule": rule, "allow_problem": problem}
+            "source": finding.get("source"), "allow_rules": list(rules), "allow_problem": problem,
+            "allow_closed": not stuck, "close_problem": _fw_still_open(stuck)}
     entry = _record_capture(meta)
     _fw_log_action("FETCH", by, 200, finding, outcome="stored", capture_id=entry["id"], sha256=entry["sha256"],
                    size=entry["size"], magic=entry["magic"], user_agent=entry["user_agent"],
-                   http_status=out["status"], redirects=out["redirects"], allow_problem=problem)
+                   http_status=out["status"], redirects=out["redirects"], allow_problem=problem,
+                   allow_closed=not stuck, close_problem=_fw_still_open(stuck))
     return entry
 
 
@@ -11533,7 +11647,7 @@ def _fw_ensure_block(finding):
         if rule_id:
             return {"rule_id": rule_id, "verified": True, "problem": None}
         done = firewall_rules.block(_fw_runner, image=finding.get("image"), ip=finding.get("dst_ip"),
-                                    fetcher=_fw_fetcher_path())
+                                    fetcher=_fw_fetcher_paths())
         _fw_forget_rules()
         return {"rule_id": done["rule_id"], "verified": done["verified"], "problem": done["problem"]}
     except Exception as e:
@@ -11703,14 +11817,19 @@ def _fw_scan_downloads(now):
 
 
 def _firewall_sweep(now=None):
-    """One pass after a collector tick, in the collector's thread: look for new downloads, then act on the open
-    decisions whose deadline has passed (block and fetch, TDC's unattended default). Nothing here waits for the
-    network: a fetch is handed to the executor. With ``ask_mode`` off nothing is blocked and nothing is fetched."""
+    """One pass after a collector tick, in the collector's thread: look for new downloads, close a way out of
+    ISOLATED that a fetch left open, then act on the open decisions whose deadline has passed (block and fetch,
+    TDC's unattended default). Nothing here waits for the network: a fetch is handed to the executor. With
+    ``ask_mode`` off nothing is blocked and nothing is fetched."""
     now = time.time() if now is None else now
     try:
         _fw_scan_downloads(now)
     except Exception:
         _log_logger.exception("firewall: scan for downloads failed")
+    try:
+        _fw_retry_fetch_paths(now)      # a way out of ISOLATED that would not close is tried again every round
+    except Exception:
+        _log_logger.exception("firewall: the per-fetch allow rules could not be closed")
     if _fw_settings.ask_mode == "off":
         return
     for item in _fw_pending.expired(now):
@@ -11930,7 +12049,7 @@ def api_firewall_block():
     if off:
         return _fw_error(off, 409)
     try:
-        done = firewall_rules.block(_fw_runner, fetcher=_fw_fetcher_path(), **args)
+        done = firewall_rules.block(_fw_runner, fetcher=_fw_fetcher_paths(), **args)
     except firewall_rules.RuleError as e:
         return _fw_error(str(e), 409)
     finally:
@@ -11967,21 +12086,28 @@ def api_firewall_unblock():
 
 
 def _fw_isolate_state():
+    # A way out that a fetch could not close again: the analyst has to be able to see it. Read without the
+    # lock, because the sweep can hold that across a PowerShell call and this route must not wait for it:
+    # list(dict.values()) is one atomic step, so the snapshot is never a half-changed dict.
+    open_paths = [dict(entry) for entry in list(_fw_fetch_open.values())]
+    in_flight = sum(list(_fw_fetch_paths.values()))
     out = {"isolated": bool(_fw_settings.isolated), "outbound_before": _fw_settings.outbound_before,
            "isolated_since": _fw_iso(_fw_settings.isolated_since), "ask_mode": _fw_settings.ask_mode,
            "settings_error": _fw_settings.load_error, "startup": _fw_startup,
-           "profiles_off": None, "profiles_error": None, "residual": FIREWALL_ISOLATED_RESIDUAL}
+           "profiles_off": None, "profiles_error": None, "residual": FIREWALL_ISOLATED_RESIDUAL,
+           "fetch_paths_open": open_paths, "fetches_in_flight": in_flight}
     try:
         out["profiles_off"] = firewall_rules.profiles_off(_fw_runner)
     except Exception as e:
-        out["profiles_error"] = (str(e).splitlines() or [type(e).__name__])[0][:300]
+        out["profiles_error"] = _fw_reason(e)
     return out
 
 
 @app.route("/api/firewall/isolate", methods=["GET", "POST"])
 def api_firewall_isolate():
     """GET: the state (isolated, the remembered outbound action, which firewall profiles are off, the start-up
-    note, and ``residual``: what ISOLATED does not close, for the banner).
+    note, ``residual``: what ISOLATED does not close, and ``fetch_paths_open``: a way out of a finished fetch
+    that would not close again — all three for the banner).
     POST ``{on: bool}``: switch ISOLATED; 409 when the Windows Firewall is off (it would accept the change and do nothing)."""
     if request.method == "GET":
         return _fw_json(_fw_isolate_state())
