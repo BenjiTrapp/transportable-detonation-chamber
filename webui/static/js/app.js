@@ -13107,8 +13107,8 @@ const FW_VIEW_KEY = 'tdc.firewall.view';
 const FW_VIEWS = ['map', 'list', 'asn'];
 const FW_LIVE_MS = 5000;
 // Every this many LIVE ticks also the summary, the captures and the rules: they are no poll paths of the access
-// log, and the rules cost a PowerShell call on the VM. ISOLATED's state is asked every tick all the same: it
-// says whether the firewall is off and whether a way out of ISOLATED stands open, and that must not wait 30 s
+// log, and the rules cost a PowerShell call on the VM. ISOLATED's state is asked every tick: it says whether a
+// way out of ISOLATED stands open, which must not wait 30 s, and it is a cheap poll (the server caches the profiles)
 const FW_SLOW_EVERY = 6;
 // The flows asked for (the most severe first), the destinations drawn on the map, the rows of LIST and the
 // endpoints of a process shown before "Show all"
@@ -13170,7 +13170,7 @@ let fwState = { loaded: false, error: null, flows: [], count: 0, truncated: fals
 let fwSeq = 0;                         // a response older than the last request is dropped
 let fwSlowSeq = 0;                     // the same for the slower round
 let fwIsoSeq = 0;                      // and for ISOLATED's state, asked every tick
-let fwIsoBusy = false;                 // an ISOLATED request still out (it runs PowerShell): no second one
+let fwIsoBusy = false;                 // an ISOLATED request still out (it may read the profiles): no second one
 let fwReady = false;
 let fwTimer = null;
 let fwTicks = 0;
@@ -14123,7 +14123,7 @@ async function fwLoadFlows() {
 }
 
 // ISOLATED's state: whether the firewall is off, ISOLATED, its residual and any way out left open. Every tick,
-// but never two at once (the route runs PowerShell)
+// but never two at once (a request may be the one that reads the profiles again)
 async function fwLoadIsolate() {
     if (fwIsoBusy) return false;
     fwIsoBusy = true;

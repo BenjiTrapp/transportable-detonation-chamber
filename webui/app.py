@@ -109,7 +109,7 @@ _NOT_LOGGED_PREFIXES = ("/static/", "/favicon")
 # The regular polls of the UI itself: these exact paths, and everything under /api/logs/.
 # (/api/alerts/<id> is a user action, not a poll.)
 _POLL_PATHS = frozenset(("/api/status", "/api/updates", "/api/alerts", "/api/health", "/api/rustinel",
-                         "/api/firewall/pending", "/api/firewall/connections"))
+                         "/api/firewall/pending", "/api/firewall/connections", "/api/firewall/isolate"))
 _POLL_PREFIX = "/api/logs/"
 _LOG_TEXT_LIMIT = 2000
 
@@ -11181,9 +11181,50 @@ def _fw_rules(force=False):
 
 
 def _fw_forget_rules():
+    """Something may have changed in the firewall: the rules and the profiles are read again next time."""
     global _fw_rules_cache
     with _fw_rules_lock:
         _fw_rules_cache = None
+    _fw_forget_profiles()
+
+
+# Which firewall profiles are off, for the state GET /isolate shows every LIVE tick. Reading it is a PowerShell
+# call and it changes about as often as somebody opens the firewall settings, so it is cached (an error for less
+# time, so it is asked again soon); an enforcement route forgets it. The enforcement routes themselves never use
+# the cache: they read the profiles fresh (_fw_firewall_off_message) and store what they found.
+FIREWALL_PROFILES_TTL_S = 60
+FIREWALL_PROFILES_ERROR_TTL_S = 10
+_fw_profiles_cache = None                         # (stamp, off, error) or None
+_fw_profiles_lock = threading.Lock()
+
+
+def _fw_forget_profiles():
+    global _fw_profiles_cache
+    with _fw_profiles_lock:
+        _fw_profiles_cache = None
+
+
+def _fw_read_profiles():
+    """``(off, error)`` read now, and kept for _fw_profiles_off. ``off`` is None when they could not be read."""
+    global _fw_profiles_cache
+    try:
+        off, error = firewall_rules.profiles_off(_fw_runner), None
+    except Exception as e:
+        off, error = None, _fw_reason(e)
+    with _fw_profiles_lock:
+        _fw_profiles_cache = (time.monotonic(), off, error)
+    return off, error
+
+
+def _fw_profiles_off():
+    """``(off, error)`` from the cache while it is fresh, else read now. No lock is held across the PowerShell call."""
+    with _fw_profiles_lock:
+        cached = _fw_profiles_cache
+    if cached is not None:
+        stamp, off, error = cached
+        if time.monotonic() - stamp < (FIREWALL_PROFILES_ERROR_TTL_S if error else FIREWALL_PROFILES_TTL_S):
+            return off, error
+    return _fw_read_profiles()
 
 
 def _fw_rule_keys(found):
@@ -12108,10 +12149,9 @@ def _fw_body(allowed, required=()):
 
 def _fw_firewall_off_message():
     """The reason enforcement is impossible (a profile is off or unreadable), or None."""
-    try:
-        off = firewall_rules.profiles_off(_fw_runner)
-    except Exception as e:
-        return (str(e).splitlines() or ["the Windows Firewall cannot be read"])[0]
+    off, error = _fw_read_profiles()
+    if error is not None:
+        return error or "the Windows Firewall cannot be read"
     if not off:
         return None
     return (f"Windows Firewall is switched off for: {', '.join(off)}. A rule or a default action would be "
@@ -12196,10 +12236,8 @@ def _fw_isolate_state():
            "settings_error": _fw_settings.load_error, "startup": _fw_startup,
            "profiles_off": None, "profiles_error": None, "residual": FIREWALL_ISOLATED_RESIDUAL,
            "fetch_paths_open": open_paths, "fetches_in_flight": in_flight}
-    try:
-        out["profiles_off"] = firewall_rules.profiles_off(_fw_runner)
-    except Exception as e:
-        out["profiles_error"] = _fw_reason(e)
+    # Everything above is in memory and as fresh as the request; only the profiles cost PowerShell (cached)
+    out["profiles_off"], out["profiles_error"] = _fw_profiles_off()
     return out
 
 
@@ -12287,11 +12325,11 @@ def api_firewall_enable():
     try:
         firewall_rules.enable_firewall(_fw_runner)
     except firewall_rules.RuleError as e:
+        _fw_forget_rules()
         state = _fw_isolate_state()
         return _fw_json({"error": _fw_reason(e), "enabled": False, "profiles_off": state["profiles_off"],
                          "state": state}, 500)
-    finally:
-        _fw_forget_rules()
+    _fw_forget_rules()
     state = _fw_isolate_state()
     return _fw_json({"enabled": True, "profiles_off": state["profiles_off"], "state": state})
 

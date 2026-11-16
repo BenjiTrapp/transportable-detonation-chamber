@@ -219,6 +219,7 @@ def test_an_analysts_decision_names_the_analyst_in_the_logs(client, fw):
 
 
 @pytest.mark.parametrize("path, poll", [("/api/firewall/pending", True), ("/api/firewall/connections", True),
+                                        ("/api/firewall/isolate", True),
                                         ("/api/firewall/rules", False), ("/api/firewall/captures", False)])
 def test_only_the_polls_are_marked_as_polls(client, fw, tdc, path, poll):
     client.get(path)
@@ -1402,3 +1403,60 @@ def test_a_failing_taskkill_is_a_failure(client, fw):
     fw.run.fail["taskkill"] = (128, "", "ERROR: The process \"4812\" not found.")
     r = client.post("/api/firewall/kill", json={"pid": 4812})
     assert r.status_code == 500 and "4812" in r.json["error"]
+
+
+# ---- GET /isolate is cheap enough to poll -----------------------------------------------------
+
+
+def _profile_reads(fw):
+    return fw.run.ops().count("Profiles")
+
+
+def test_the_isolate_state_reads_the_profiles_once_a_minute(client, fw, tdc, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(tdc.time, "monotonic", lambda: clock[0])
+    for _ in range(12):
+        assert client.get("/api/firewall/isolate").json["profiles_off"] == []
+    assert _profile_reads(fw) == 1
+    clock[0] += tdc.FIREWALL_PROFILES_TTL_S + 1
+    client.get("/api/firewall/isolate")
+    assert _profile_reads(fw) == 2
+
+
+def test_the_open_way_out_is_as_fresh_as_the_request(client, fw, tdc, monkeypatch):
+    client.get("/api/firewall/isolate")
+    reads = _profile_reads(fw)
+    monkeypatch.setitem(tdc._fw_fetch_open, ("TDC-FW-ISO-fetch-0123456789ab",),
+                        {"rule_id": "TDC-FW-ISO-fetch-0123456789ab", "problem": "Access is denied.", "since": 1.0})
+    monkeypatch.setitem(tdc._fw_fetch_paths, ("TDC-FW-ISO-fetch-0123456789ab",), {"holders": 1, "busy": False, "problem": None})
+    state = client.get("/api/firewall/isolate").json
+    assert [h["rule_id"] for h in state["fetch_paths_open"]] == ["TDC-FW-ISO-fetch-0123456789ab"]
+    assert state["fetches_in_flight"] == 1 and state["residual"]
+    assert _profile_reads(fw) == reads, "the in-memory fields cost a PowerShell call"
+
+
+def test_turning_the_firewall_on_shows_at_once(client, fw):
+    fw.profiles = {"Domain": True, "Private": False, "Public": True}
+    assert client.get("/api/firewall/isolate").json["profiles_off"] == ["Private"]
+    r = client.post("/api/firewall/enable", json={})
+    assert r.json["state"]["profiles_off"] == []
+    assert client.get("/api/firewall/isolate").json["profiles_off"] == []
+
+
+def test_an_enforcement_route_reads_the_profiles_fresh_and_forgets_the_cache(client, fw):
+    assert client.get("/api/firewall/isolate").json["profiles_off"] == []
+    fw.profiles = {"Domain": True, "Private": False, "Public": True}
+    r = client.post("/api/firewall/block", json={"scope": "process", "image": IMAGE})
+    assert r.status_code == 409 and fw.run.rules == {}, "a block went by the cached 'all on'"
+    assert client.get("/api/firewall/isolate").json["profiles_off"] == ["Private"]
+
+
+def test_a_profile_read_that_fails_is_cached_for_less_time(client, fw, tdc, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(tdc.time, "monotonic", lambda: clock[0])
+    fw.run.fail["Profiles"] = (1, "Access is denied.")
+    state = client.get("/api/firewall/isolate").json
+    assert state["profiles_off"] is None and "denied" in state["profiles_error"].lower()
+    del fw.run.fail["Profiles"]
+    clock[0] += tdc.FIREWALL_PROFILES_ERROR_TTL_S + 1
+    assert client.get("/api/firewall/isolate").json["profiles_off"] == [] and _profile_reads(fw) == 2

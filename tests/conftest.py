@@ -165,7 +165,7 @@ def fw(tdc, monkeypatch, tmp_path):
                         ("CAPTURE_DIR", str(fake.samples)), ("CAPTURES_FILE", str(tmp_path / "captures.json")),
                         ("_fw_downloads", {}), ("_fw_scan_state", {"done": False}), ("_fw_rules_cache", None),
                         ("_fw_windows_cache", (0.0, {})), ("_fw_window_alive", {}), ("_fw_fetch_paths", {}),
-                        ("_fw_fetch_open", {}), ("_fw_fetch_swept", 0.0),
+                        ("_fw_fetch_open", {}), ("_fw_fetch_swept", 0.0), ("_fw_profiles_cache", None),
                         ("_fw_ioc_cache", (time.time() + 1e6, (frozenset(), frozenset())))):
         monkeypatch.setattr(m, name, value)
     monkeypatch.setattr(m, "_process_started_at", lambda pid: None)

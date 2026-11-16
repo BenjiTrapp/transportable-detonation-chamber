@@ -1181,7 +1181,7 @@ markup.
 | Source | Content |
 |--------|---------|
 | `powershell` | Script Blocks (4104), module and pipeline logging (4103) and engine errors (4100) of `Microsoft-Windows-PowerShell/Operational`; the parts of a long script block are joined into one event; the script is the `message` (`script=` searches it too) |
-| `access` | Every HTTP request to the web UI (not `/static/`): `method`, `path`, `query`, `status`, `duration_ms`, `remote_addr`, `user_agent`, `client` (`browser`, `mcp` or `other`). The regular polls of the UI itself (the exact paths `/api/status`, `/api/updates`, `/api/alerts`, `/api/health`, `/api/rustinel`, `/api/firewall/pending` and `/api/firewall/connections`, and everything under `/api/logs/`) carry `poll=true`; `/api/alerts/<id>` does not. A request that ends in an unhandled error is logged with status 500 |
+| `access` | Every HTTP request to the web UI (not `/static/`): `method`, `path`, `query`, `status`, `duration_ms`, `remote_addr`, `user_agent`, `client` (`browser`, `mcp` or `other`). The regular polls of the UI itself (the exact paths `/api/status`, `/api/updates`, `/api/alerts`, `/api/health`, `/api/rustinel`, `/api/firewall/pending`, `/api/firewall/connections` and a GET of `/api/firewall/isolate`, and everything under `/api/logs/`) carry `poll=true`; `/api/alerts/<id>` does not. A request that ends in an unhandled error is logged with status 500 |
 | `mcp` | Every action of the MCP server (it sends `X-TDC-Client: mcp` and `X-TDC-MCP-Tool: <name>`): `tool`, `method`, `path`, `status`, `duration_ms` |
 | `netflow` | Network connections (Sysmon 3) bundled into flows per image, PID, protocol and address pair, with `count`, `first_seen` and `last_seen` |
 | `dns` | DNS queries (Sysmon 22): `query`, `result`, `image`, `pid` |
@@ -1815,7 +1815,7 @@ ISOLATED blocks every way out but loopback. TDC's own fetch is let out one addre
 | GET | `/api/firewall/rules` | The `TDC-FW-*` rules that stand, one entry per rule: `rule_id`, `kind`, `image`, `ip`, `port`, `protocol`, `key`, `blocking` |
 | POST | `/api/firewall/block` | `{scope, image, ip, port, protocol}`. `endpoint`: this program to `ip`; `endpoint_all`: every program, TDC's fetcher included; `process`: `image` anywhere. 409 while a firewall profile is off |
 | POST | `/api/firewall/unblock` | `{rule_id}`; every rule that shares its key is removed |
-| GET / POST | `/api/firewall/isolate` | GET: `isolated`, `outbound_before`, `isolated_since`, `profiles_off`, `startup`, `residual`, `fetch_paths_open`, `fetches_in_flight`. POST `{on}`: switch ISOLATED (409 while a profile is off) |
+| GET / POST | `/api/firewall/isolate` | GET: `isolated`, `outbound_before`, `isolated_since`, `profiles_off`, `startup`, `residual`, `fetch_paths_open`, `fetches_in_flight`. Cheap enough to poll: everything but `profiles_off` is in memory, and `profiles_off` (a PowerShell read) is cached for 60 s (an error for 10 s) and read again after every enforcement route. POST `{on}`: switch ISOLATED (409 while a profile is off) |
 | GET | `/api/firewall/pending` | `pending` (open decisions with `remaining` seconds) and `history` (the last 24 h), `ask_mode`, `decide_seconds` |
 | POST | `/api/firewall/decide` | Exactly `{id, action}` (`allow`, `block`, `block_fetch`); no URL is ever taken. An id works once, a second answer gets the decision that was taken |
 | POST | `/api/firewall/ask` | `{mode}`: `detonation`, `all` or `off` (kept on the server) |
