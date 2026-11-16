@@ -1455,6 +1455,18 @@ def test_sysmon_logs_the_connections_curl_bits_and_tdc_python_make():
     for image in ("'curl.exe'", "'python.exe'", r"'C:\Windows\System32\svchost.exe'"):
         assert image in body
     assert "NetworkConnect[@onmatch='include']" in body
+    # outbound only: an accepted connection (the analyst's browser on 9000) must not become a TDC python flow
+    assert "'Initiated'" in body and "'true'" in body and "groupRelation', 'and'" in body
     calls = [m.start() for m in re.finditer(r"Set-NetworkConnectIncludes -Path \$configPath", script)]
     assert len(calls) == 2
     assert script.index("-c $configPath") > calls[0] and script.rindex("-i $configPath") > calls[-1]
+
+
+def test_a_json_list_is_unrolled_the_way_windows_powershell_5_1_needs():
+    """5.1 emits a JSON array from ConvertFrom-Json as one object: @(ConvertFrom-Json ...) is then a list of one
+    list, and every DisableAllowOut / EnableAllowOut call fails. Parenthesised first, it unrolls in 5.1 and 7."""
+    for path in (os.path.join(ROOT, "webui", "firewall_rules.ps1"), os.path.join(ROOT, "scripts", "tdc-unisolate.ps1")):
+        text = open(path, encoding="utf-8").read()
+        assert not re.search(r"@\(\s*ConvertFrom-Json", text), path
+    script = open(os.path.join(ROOT, "webui", "firewall_rules.ps1"), encoding="utf-8").read()
+    assert "@((ConvertFrom-Json -InputObject $json))" in script

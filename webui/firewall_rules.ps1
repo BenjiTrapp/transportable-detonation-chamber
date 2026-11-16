@@ -118,7 +118,9 @@ function Get-NameList {
     param([string]$Text)
     if ($Text -notmatch '^[A-Za-z0-9+/]+={0,2}\z') { throw '-Names must be base64' }
     $json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Text))
-    $list = @(ConvertFrom-Json -InputObject $json)
+    # The inner parentheses matter: Windows PowerShell 5.1 emits a JSON array as one object without enumerating
+    # it, so wrapping the call alone in @() gives a list of one list. Evaluated in parentheses first, it unrolls.
+    $list = @((ConvertFrom-Json -InputObject $json))
     foreach ($n in $list) {
         if (-not ($n -is [string]) -or -not $n -or $n.StartsWith('TDC-FW-')) { throw 'not a usable rule name' }
     }
