@@ -324,6 +324,14 @@ ist der schlimmste denkbare Fehler dieses Tabs. Also:
 - **Kein stehendes Recht für den Fetcher.** Ein Dauer-Allow auf das `python.exe` der Web-UI-venv wäre ein Loch von der Größe „alles, was dieses python starten kann, darf raus" — und ein Interpreter lässt sich zu allem überreden. Stattdessen öffnet `allow_fetch` unmittelbar vor einem Nachladen **eine Regel auf genau die beobachtete Adresse** und nimmt sie danach wieder weg, ob der Fetch gelingt oder nicht; Reste räumt der Start auf.
 - Nichts sonst. Insbesondere kein DNS, kein NTP, keine Updates.
 
+**Korrektur: „default deny" ist nicht „deny".** `Set-NetFirewallProfile -All -DefaultOutboundAction Block` regelt nur Verkehr, auf den **keine Regel passt**. Windows liefert aktivierte Ausgangs-Allow-Regeln mit (Core Networking: DNS, DHCP, Teredo, IP-HTTPS, Gruppenrichtlinien; die Regeln der Store-Apps), und die gelten weiter. Dieser Entwurf hat eine Isolation versprochen, die er nie geliefert hat — das Abschluss-Review hat es gefunden, kein Test konnte es, weil der eingesetzte Fake-Runner außer TDCs eigenen Regeln keine kennt.
+
+Isolated schaltet deshalb **zusätzlich jede aktivierte Ausgangs-Allow-Regel des lokalen Stores** (`PolicyStoreSourceType = Local`) ab, die nicht `TDC-FW-*` ist. Vor der ersten Änderung merkt es ihre Namen in `firewall_state.json` (`allow_disabled`), neben dem vorherigen Default. Beim Verlassen schaltet es genau diese wieder ein — und `scripts/tdc-unisolate.ps1` tut dasselbe, es liest dieselbe Liste. Eine Regel, die sich nicht wieder einschalten lässt, bleibt vermerkt und wird erneut versucht.
+
+**Und es sagt, was offen bleibt.** Eine Regel aus einem anderen Store, vor allem aus einer Gruppenrichtlinie, lässt sich lokal nicht abschalten. Nach dem Umschalten liest TDC zurück, welche Ausgangs-Allow-Regeln noch aktiv sind (`allowed_out`). Das Band und `GET /api/firewall/isolate` nennen sie, und Isolated gilt erst als **geschlossen** (`verified`), wenn diese Liste leer ist. „Kein DNS" stimmt nur dann. Lassen sich die Regeln vor dem Umschalten nicht lesen, verweigert Isolated und ändert nichts; lassen sie sich danach nicht lesen, sagt das Band, dass unbekannt ist, ob Isolated geschlossen ist.
+
+**Nebenwirkung, die in den Befund gehört:** Isolated kappt auch die Cloud-Abfragen und die Telemetrie des getesteten EDR. Seine Urteile sind danach nur mit anderen isolierten Läufen vergleichbar.
+
 **Restrisiko, ausgeschrieben:** während ein Fetch läuft, könnte etwas, das dieses python ausführen kann, dieselbe eine Adresse erreichen — für die Sekunden des Fetches. Das steht im Isolated-Band der Oberfläche, im Docstring von `firewall_rules` und als `residual` in `GET /api/firewall/isolate`. Teil B schließt es: dort ist der einzige erlaubte Weg nach draußen der Proxy, und der führt keinen fremden Code aus.
 
 Eingehend bleibt unberührt: `DefaultOutboundAction Block` betrifft die Antworten
