@@ -1354,7 +1354,7 @@ def test_the_first_step_of_the_collector_thread_does_what_start_up_needs(fw, tdc
     fw.run.rules["TDC-FW-ISO-fetch-0123456789ab"] = fw.run.view(
         "TDC-FW-ISO-fetch-0123456789ab", Action="Allow", Program=tdc._fw_fetcher_paths()[0])
     tdc._fw_prepare()
-    assert tdc._fw_startup == {"isolated": False, "profiles_off": [], "announce": False, "note": None}
+    assert tdc._fw_startup == {"isolated": False, "profiles_off": [], "announce": False, "note": None, "allowed_out": None}
     assert os.listdir(incoming) == []                            # no partial file in a Defender-excluded root
     assert fw.run.rules == {}                                    # no way out of ISOLATED left standing
     assert primed == [True]                                      # no fetch pays for that lookup itself
@@ -1514,3 +1514,52 @@ def test_a_profile_read_that_fails_is_cached_for_less_time(client, fw, tdc, monk
     del fw.run.fail["Profiles"]
     clock[0] += tdc.FIREWALL_PROFILES_ERROR_TTL_S + 1
     assert client.get("/api/firewall/isolate").json["profiles_off"] == [] and _profile_reads(fw) == 2
+
+
+# ---- what ISOLATED does not close, and the start-up toast --------------------------------------
+
+
+def test_isolate_says_what_windows_own_rules_still_let_out_and_caches_it(client, fw, tdc, monkeypatch):
+    from test_firewall_rules import GPO_RULE, STOCK
+    fw.run.foreign = {n: dict(r) for n, r in {**STOCK, **GPO_RULE}.items()}
+    assert client.get("/api/firewall/isolate").json["allowed_out"] is None          # off: nothing to read
+    assert "AllowOut" not in fw.run.ops()
+    on = client.post("/api/firewall/isolate", json={"on": True}).json
+    assert on["verified"] is False and [r["name"] for r in on["allowed_out"]] == ["{gpo-1}"]
+    assert [r["name"] for r in on["state"]["allowed_out"]] == ["{gpo-1}"] and on["state"]["allow_disabled"] == 2
+    reads = fw.run.ops().count("AllowOut")
+    clock = [1000.0]
+    monkeypatch.setattr(tdc.time, "monotonic", lambda: clock[0])
+    tdc._fw_keep_allowed_out(on["allowed_out"], None)
+    for _ in range(5):
+        assert [r["name"] for r in client.get("/api/firewall/isolate").json["allowed_out"]] == ["{gpo-1}"]
+    assert fw.run.ops().count("AllowOut") == reads                                    # cached, like the profiles
+    off = client.post("/api/firewall/isolate", json={"on": False}).json
+    assert off["state"]["allowed_out"] is None and fw.run.enabled_foreign() == sorted(["CoreNet-DHCP-Out", "CoreNet-DNS-Out-UDP", "{gpo-1}"])
+
+
+def test_the_residual_no_longer_promises_that_nothing_but_loopback_gets_out(client, fw):
+    text = client.get("/api/firewall/isolate").json["residual"]
+    assert "Windows' own outbound Allow rules" in text and "group policy" in text and "but loopback" not in text
+
+
+def test_pending_carries_the_start_up_state_for_a_toast_on_every_tab(client, fw, tdc, monkeypatch):
+    monkeypatch.setattr(tdc, "_fw_startup", None)
+    assert client.get("/api/firewall/pending").json["startup"] is None
+    monkeypatch.setattr(tdc, "_fw_startup", {"isolated": True, "announce": True, "note": "ISOLATED is on", "profiles_off": []})
+    fw.settings.set(isolated=True, outbound_before="Allow")
+    r = client.get("/api/firewall/pending").json
+    assert r["isolated"] is True and r["startup"] == {"id": tdc._FW_START_ID, "announce": True, "note": "ISOLATED is on"}
+
+
+def test_the_rules_are_read_once_a_minute_and_again_after_every_enforcement(client, fw, tdc, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(tdc.time, "time", lambda: clock[0])
+    for _ in range(10):
+        client.get("/api/firewall/connections")
+        clock[0] += 5
+    assert fw.run.ops().count("List") == 1
+    client.post("/api/firewall/block", json={"scope": "process", "image": r"C:\x\loader.exe"})
+    before = fw.run.ops().count("List")
+    client.get("/api/firewall/connections")
+    assert fw.run.ops().count("List") == before + 1                                   # forgotten by the block

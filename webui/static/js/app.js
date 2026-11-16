@@ -13300,10 +13300,13 @@ const FW_GROUP_INFO = {
 };
 const FW_SELF_NOTE = 'One of TDC\'s own processes: it is not blocked from here, because that could cut TDC itself off.';
 const FW_BYTES_NOTE = 'Sysmon has no byte counts; the tab counts connections and firewall records.';
-const FW_ISOLATE_TEXT = 'ISOLATED sets the default outbound action of every Windows Firewall profile to Block. Cut off: every outbound '
-    + 'connection of every program in the chamber, the sample\'s and Windows\' alike, DNS, NTP and Windows Update included, and '
-    + 'TDC\'s tool updates. Still reachable: loopback, which TDC\'s own services use, and this web UI from the host, since '
-    + 'inbound connections are untouched. TDC\'s own sample fetch is let out to one address at a time, only while it runs. '
+const FW_ISOLATE_TEXT = 'ISOLATED sets the default outbound action of every Windows Firewall profile to Block and switches off Windows\' own '
+    + 'outbound Allow rules (Core Networking\'s DNS, DHCP and the like), because a default stops only what no rule allows; leaving switches '
+    + 'exactly those on again. Cut off, as far as those go: outbound connections of every program in the chamber, the sample\'s and Windows\' '
+    + 'alike, TDC\'s tool updates, and the cloud lookups and telemetry of the EDR under test, so its verdicts can differ from a connected run. '
+    + 'A rule a group policy sets cannot be switched off from here: whatever is still let out is read back and named in the band. '
+    + 'Still reachable: loopback, which TDC\'s own services use, and this web UI from the host, since inbound connections are untouched. '
+    + 'TDC\'s own sample fetch is let out to one address at a time, only while it runs. '
     + 'The way back: this button again, or scripts/tdc-unisolate.ps1 on the VM if the web UI is gone.';
 // Ready LOGS queries for the selection (needs: the part of the selection a hint takes, '' for none)
 const FW_HINTS = [
@@ -13331,6 +13334,8 @@ const FW_REQUEST_MS = 15000;
 const FW_AWAY_ID = '@away';
 // The unattended results not closed yet, so that a reload brings them back
 const FW_STANDING_KEY = 'tdc.firewall.standing';
+// The server start whose firewall state was toasted
+const FW_STARTUP_KEY = 'tdc.firewall.startup';
 // The server_time of the last /pending answer this browser showed: what resolved after it, nobody here saw
 const FW_SEEN_KEY = 'tdc.firewall.seen';
 const FW_DECIDE_ACTIONS = [
@@ -13368,6 +13373,7 @@ let fwDecisionMore = null;             // the "+ n more" element
 let fwDecisionTimer = null;            // the countdown, only while a toast stands
 let fwPendingTimer = null;
 let fwPendingBusy = false;             // a /pending request still out: no second one
+let fwStartupSeen = '';               // the server start this page has toasted
 let fwPendingReq = 0;                  // /pending requests sent (the tab's too), counted
 let fwPendingApplied = 0;              // the number of the newest one applied: an answer to an older one is dropped
 let fwPendingAsk = 'detonation';       // ask_mode as /pending said it: with off, the server takes no default
@@ -13813,7 +13819,8 @@ async function fwKill(proc) {
     const ok = await tdcConfirm({ title: `Kill ${name} (PID ${pid})?`, danger: true, confirmLabel: 'KILL',
         message: `taskkill /F ends ${name} at once, without letting it clean up. Its telemetry stops there: no more connections, `
             + 'files or child processes of it to watch, and whatever it was about to fetch stays unknown. TDC refuses if the '
-            + `process holding PID ${pid} now started after its connections were seen, because then Windows has given the PID to another process.` });
+            + `process holding PID ${pid} now started after the last connection seen under that PID, because then Windows has given the PID to `
+            + 'another process; the check is only as fine as Sysmon\'s timestamps, a millisecond.' });
     if (!ok) return false;
     const r = await fwPost('/api/firewall/kill', { pid });
     if (!r.ok) {
@@ -14294,8 +14301,8 @@ function renderFirewallHead() {
         iso.setAttribute('aria-pressed', String(on));
         iso.classList.toggle('is-on', on);
         iso.disabled = !on && !!off;
-        iso.title = on ? 'ISOLATED is on: every outbound connection is blocked but loopback. Click to leave it (asks first).'
-            : off || 'Block every outbound connection of the chamber but loopback (asks first).';
+        iso.title = on ? 'ISOLATED is on: outbound is Block and Windows\' own outbound Allow rules are switched off; the band names whatever still gets out. Click to leave it (asks first).'
+            : off || 'Block outbound connections of the chamber and switch off Windows\' own outbound Allow rules; loopback stays open (asks first).';
     }
     const count = document.getElementById('firewall-count');
     if (count) {
@@ -14329,9 +14336,21 @@ function renderFirewallBands() {
     if (fwIsolatedOn()) {
         const n = Number(iso.fetches_in_flight) || 0;
         bands.push(['isolated', `<strong>ISOLATED${iso.isolated_since ? ` since ${escapeHtml(formatAlertTime(iso.isolated_since))}` : ''}.</strong> `
-            + `${escapeHtml(fwShort(iso.residual || 'Every outbound connection is blocked but loopback.', 600))} `
+            + `${escapeHtml(fwShort(iso.residual || 'Outbound is Block; Windows\' own outbound Allow rules are switched off.', 600))} `
             + (n ? `<strong>${n} ${n === 1 ? 'fetch' : 'fetches'} running</strong>: one address each is open while it runs. ` : '')
             + 'The way back: ISOLATED again, or scripts/tdc-unisolate.ps1 on the VM.']);
+        const still = Array.isArray(iso.allowed_out) ? iso.allowed_out : null;
+        if (iso.allowed_out_error || (!still && 'allowed_out' in iso)) {
+            bands.push(['hole', `<strong>Whether ISOLATED is closed is not known.</strong> Which outbound Allow rules are still enabled could not be read`
+                + `${iso.allowed_out_error ? ` (${escapeHtml(fwShort(iso.allowed_out_error, 300))})` : ''}, and each of them would still let traffic out.`]);
+        } else if (still && still.length) {
+            const names = still.slice(0, 8).map(r => `${escapeHtml(fwShort(r && (r.display || r.name), 80))} (${escapeHtml(fwShort(r && r.source, 20))})`).join(', ');
+            bands.push(['hole', `<strong>Still let out despite ISOLATED: ${still.length} outbound Allow ${still.length === 1 ? 'rule' : 'rules'}.</strong> `
+                + `${names}${still.length > 8 ? ` and ${still.length - 8} more` : ''}. The default action does not stop what a rule allows; `
+                + 'a rule a group policy sets cannot be switched off from here.']);
+        } else if (still) {
+            bands.push(['isolated', 'Read back: no outbound Allow rule but TDC\'s own is enabled.']);
+        }
     }
     for (const hole of Array.isArray(iso.fetch_paths_open) ? iso.fetch_paths_open : []) {
         bands.push(['hole', `<strong>A way out stands open.</strong> The rule ${escapeHtml(fwShort(hole && hole.rule_id, 80))} of a finished fetch would not go and still lets TDC's fetcher reach one address`
@@ -14577,7 +14596,7 @@ async function fwBlock(scope, flow) {
         await refreshFirewall();
         return false;
     }
-    showToast('success', `Blocked: ${what}`, `Rule ${fwShort(r.data.rule_id, 40)} stands and was read back. A running connection starves; it gets no reset.`);
+    showToast('success', `Blocked: ${what}`, `Rule ${fwShort(r.data.rule_id, 40)} stands and was read back. A running connection should starve; it gets no reset.`);
     await refreshFirewall();
     return true;
 }
@@ -14610,7 +14629,7 @@ async function fwToggleIsolated() {
     } else {
         const before = fwState.isolate && fwState.isolate.outbound_before ? fwShort(fwState.isolate.outbound_before, 20) : 'Allow';
         const ok = await tdcConfirm({ title: 'Leave ISOLATED?', confirmLabel: 'LEAVE ISOLATED',
-            message: `Outbound connections go back to the default action that stood before (${before}). A sample still running can reach the network again.` });
+            message: `Outbound connections go back to the default action that stood before (${before}), and the outbound Allow rules of Windows' own that ISOLATED switched off are switched on again. A sample still running can reach the network again.` });
         if (!ok) return false;
     }
     const r = await fwPost('/api/firewall/isolate', { on: !on });
@@ -14626,8 +14645,22 @@ async function fwToggleIsolated() {
         fwSeq += 1;
         fwState.isolated = !on;
     }
-    showToast(on ? 'info' : 'warning', on ? 'ISOLATED is off' : 'ISOLATED is on', on ? 'Outbound connections are allowed again.'
-        : 'Every outbound connection is blocked but loopback.');
+    const d = r.data || {};
+    const shut = d.outbound_after && typeof d.outbound_after === 'object'
+        ? Object.keys(d.outbound_after).filter(p => d.outbound_after[p] === 'Block') : [];
+    let detail, tone;
+    if (on) {
+        // The server's own words first: it knows whether the egress stays shut and what would not switch on again
+        detail = d.note ? String(d.note)
+            : shut.length ? `Outbound stays Block on ${shut.join(', ')}.` : 'Outbound is back to the default action that stood before; Windows\' own rules ISOLATED switched off are on again.';
+        tone = d.note || shut.length ? 'warning' : 'info';
+    } else {
+        detail = d.note ? String(d.note)
+            : d.verified === true ? 'Outbound is Block and Windows\' own outbound Allow rules are off; the read back found nothing else let out but loopback.'
+                : 'Outbound is Block, but what still gets out could not be confirmed: see the band.';
+        tone = d.verified === true ? 'warning' : 'error';
+    }
+    showToast(tone, on ? 'ISOLATED is off' : (d.verified === true ? 'ISOLATED is on' : 'ISOLATED is on, not closed'), fwShort(detail, 600));
     renderFirewallHead();
     renderFirewallBands();
     await refreshFirewall();
@@ -15131,7 +15164,9 @@ function fwDecisionOutcome(entry, item, result, block) {
             }
         }
     } else if (action === 'dropped') {
-        lines.push(`${escapeHtml(fwShort(result.reason || 'Dropped', 200))}: it stays blocked, and nothing was fetched.`);
+        lines.push(`${escapeHtml(fwShort(result.reason || 'Dropped', 200))}: `
+            + (block && block.verified ? 'the block stands, and nothing was fetched.'
+                : 'nothing was fetched; dropping lifts no block, but whether one stands was never confirmed.'));
     }
     if (entry.posting) {
         lines.push('Your click is still on its way to TDC; this is what TDC has decided.');
@@ -15412,10 +15447,26 @@ async function fwPendingPoll() {
     }
     if (r.ok) {
         fwApplyPending(r.data, sent);
+        fwAnnounceStartup(r.data);
     } else {
         fwPendingError = r.error;
         fwRenderDecisions();
     }
+    return true;
+}
+
+// What the firewall was like when the server started (a restart into ISOLATED, an egress shut by someone else):
+// a toast on whatever tab is open, once per server start (FW_STARTUP_KEY), and in the FIREWALL band besides
+function fwAnnounceStartup(data) {
+    const s = data && data.startup && typeof data.startup === 'object' ? data.startup : null;
+    if (!s || !s.announce || !s.note || typeof s.id !== 'string' || !s.id || fwStartupSeen === s.id) return false;
+    fwStartupSeen = s.id;
+    try {
+        if (localStorage.getItem(FW_STARTUP_KEY) === s.id) return false;
+        localStorage.setItem(FW_STARTUP_KEY, s.id);
+    } catch (e) { /* storage blocked: once per page then */ }
+    showToast(data.isolated ? 'error' : 'warning', data.isolated ? 'ISOLATED is on since the web UI started' : 'The firewall at start-up',
+        fwShort(String(s.note), 600));
     return true;
 }
 
@@ -15445,7 +15496,7 @@ function fwDecisionBlockCell(item) {
     if (item.action === 'allow') {
         return result.unblocked ? ['lifted', '', ''] : ['still blocked', fwShort(result.reason || result.error || '', 300), 'is-fail'];
     }
-    if (!block && item.action === 'dropped') return ['kept', 'Dropping a decision lifts no block; what it was is not recorded', ''];
+    if (!block && item.action === 'dropped') return ['not recorded', 'Dropping a decision lifts no block, but no block was recorded for it, so whether one stands is not known', 'is-fail'];
     if (!block) return ['not set yet', '', 'is-fail'];
     return block.verified ? ['confirmed', fwShort(block.rule_id || '', 80), ''] : ['NOT confirmed', fwShort(block.problem || block.error || '', 300), 'is-fail'];
 }

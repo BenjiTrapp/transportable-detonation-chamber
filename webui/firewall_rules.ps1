@@ -15,14 +15,25 @@
 #                       an outbound rule. Exit 3: a profile is off (nothing is written). Exit 4: the rule is already there.
 #   Remove -Name        remove the rule (no error when it is not there)
 #   SetDefaultOutbound -DefaultOutboundAction [-Profiles Domain,Private]
+#   AllowOut            {"rules": [{"Name","DisplayName","Group","Source"}]}: every enabled outbound Allow rule in
+#                       force (ActiveStore) that is not TDC's. DefaultOutboundAction Block governs only traffic that no
+#                       rule matches, so each of these still lets traffic out. Source is PolicyStoreSourceType: only
+#                       Local rules (the PersistentStore) can be switched here; a GroupPolicy rule cannot.
+#   DisableAllowOut -Names <base64>, EnableAllowOut -Names <base64>
+#                       switch the named local outbound Allow rules off or on. -Names is base64 of a UTF-8 JSON list
+#                       of rule names, so no name is ever a wildcard or a parameter. Only outbound Allow rules of the
+#                       PersistentStore that are not TDC-FW-* are touched; {"done": [...], "failed": [{"Name","Error"}],
+#                       "missing": [...]} says what happened to each.
 #
 # Exit codes: 0 done, 1 failed (the first line of stderr says why), 3 a profile is off, 4 the rule exists.
 # Rules are only ever named TDC-FW-<letters, digits, hyphens>; a name with a wildcard or a trailing newline is refused.
 
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Profiles', 'Enable', 'List', 'Get', 'Create', 'Remove', 'SetDefaultOutbound')]
+    [ValidateSet('Profiles', 'Enable', 'List', 'Get', 'Create', 'Remove', 'SetDefaultOutbound', 'AllowOut',
+                 'DisableAllowOut', 'EnableAllowOut')]
     [string]$Op,
+    [string]$Names,
     [string]$Name,
     [string]$Program,
     [string]$RemoteAddress,
@@ -86,6 +97,56 @@ function Get-ProfileList {
     return $list
 }
 
+# Not filtered by Get-NetFirewallRule's own -Direction/-Action/-Enabled: with those, "no rule matches" is an
+# error, and telling it apart from a real one would be a guess. A list that cannot be read must fail, never
+# read as "nothing is let out".
+function Get-ForeignAllowOut {
+    @(Get-NetFirewallRule -PolicyStore ActiveStore | Where-Object {
+        [string]$_.Direction -eq 'Outbound' -and [string]$_.Action -eq 'Allow' -and [string]$_.Enabled -eq 'True' -and
+        -not ([string]$_.Name).StartsWith('TDC-FW-')
+    } | ForEach-Object {
+        [pscustomobject]@{
+            Name = [string]$_.Name
+            DisplayName = [string]$_.DisplayName
+            Group = [string]$_.DisplayGroup
+            Source = [string]$_.PolicyStoreSourceType
+        }
+    })
+}
+
+function Get-NameList {
+    param([string]$Text)
+    if ($Text -notmatch '^[A-Za-z0-9+/]+={0,2}\z') { throw '-Names must be base64' }
+    $json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Text))
+    $list = @(ConvertFrom-Json -InputObject $json)
+    foreach ($n in $list) {
+        if (-not ($n -is [string]) -or -not $n -or $n.StartsWith('TDC-FW-')) { throw 'not a usable rule name' }
+    }
+    return $list
+}
+
+function Set-AllowOut {
+    param([string]$Text, [bool]$On)
+    $want = @{}
+    foreach ($n in @(Get-NameList $Text)) { $want[$n] = $true }
+    $found = @(Get-NetFirewallRule -PolicyStore PersistentStore | Where-Object {
+        $want.ContainsKey([string]$_.Name) -and [string]$_.Direction -eq 'Outbound' -and [string]$_.Action -eq 'Allow'
+    })
+    $done = @()
+    $failed = @()
+    foreach ($rule in $found) {
+        try {
+            if ($On) { $rule | Enable-NetFirewallRule -ErrorAction Stop } else { $rule | Disable-NetFirewallRule -ErrorAction Stop }
+            $done += [string]$rule.Name
+        } catch {
+            $failed += [pscustomobject]@{ Name = [string]$rule.Name; Error = [string]$_.Exception.Message }
+        }
+    }
+    $seen = @($found | ForEach-Object { [string]$_.Name })
+    $missing = @($want.Keys | Where-Object { $seen -notcontains $_ })
+    ConvertTo-Json -Compress -Depth 4 -InputObject ([pscustomobject]@{ done = $done; failed = $failed; missing = $missing })
+}
+
 try {
     switch ($Op) {
         'Profiles' {
@@ -134,6 +195,15 @@ try {
         'SetDefaultOutbound' {
             if (-not $DefaultOutboundAction) { throw 'SetDefaultOutbound needs -DefaultOutboundAction' }
             Set-NetFirewallProfile -Profile (Get-ProfileList $Profiles) -DefaultOutboundAction $DefaultOutboundAction
+        }
+        'AllowOut' {
+            ConvertTo-Json -Compress -Depth 4 -InputObject ([pscustomobject]@{ rules = @(Get-ForeignAllowOut) })
+        }
+        'DisableAllowOut' {
+            Set-AllowOut -Text $Names -On $false
+        }
+        'EnableAllowOut' {
+            Set-AllowOut -Text $Names -On $true
         }
     }
 } catch {

@@ -3,7 +3,8 @@
 ``FirewallStore`` keeps what ``firewall.classify`` needs, as the readers delivered it: the single
 Sysmon connections (EID 3) in a ring of ``MAX_CONNECTIONS`` entries and ``RETAIN_S`` seconds, the
 DNS map (EID 22), the processes (EID 1), the Windows firewall log, and the PowerShell and BITS events
-that name an executable file by URL (the download case; one with only other URLs is of no use and not kept). It is a store of its own, not ``log_store``: that one bundles at
+that name an executable file by URL (the download case; one with only other URLs is of no use and
+not kept). It is a store of its own, not ``log_store``: that one bundles at
 once, and the tab needs the single connections (beacon detection) and the process start (newborn).
 
 Times: ``since`` and ``until`` are ISO-8601 text (or epoch seconds); what comes out is what
@@ -580,10 +581,13 @@ def download_findings(ps_events: List[Dict[str, Any]], proc_events: List[Dict[st
     by its time, which is deliberately wider than the PID test, and the BITS host is matched in any process.
     The alternative is not to see BITS downloads at all. The window still bounds it (``_bits_job_in_detonation``).
 
-    A finding is ``{id, pid, image, url, dst_ip, dst_port, source, observed_at, origin_pid, requested_by,
+    A finding is ``{id, pid, image, url, dst_ip, dst_port, source, sources, observed_at, origin_pid, requested_by,
     in_detonation, self}``; ``source`` is ``powershell``, ``sysmon`` or ``bits``, ``origin_pid`` the PID of the
     event (None for BITS unless the reader knew it), ``observed_at`` ISO-8601 (UTC). ``id`` is the same for the
-    same process and URL, so a call at every tick finds a finding again.
+    same process and URL, whichever source saw it, so a call at every tick finds a finding again and one cradle
+    (``powershell -c "iwr URL"`` is both an EID 1 command line and a 4104 script block) is one finding, not two
+    decisions and two fetches of a link that may work once: the earliest event gives ``source`` and the time,
+    ``sources`` lists every source that saw it.
     """
     submissions = {int(p) for p in submission_pids}
     now = time.time() if now is None else now
@@ -613,15 +617,22 @@ def download_findings(ps_events: List[Dict[str, Any]], proc_events: List[Dict[st
             flow = _flow_for(flows or (), parts[0], parts[1], None if via_bits else origin)
             if flow is None or not flow.get("image"):
                 continue
-            finding_id = "dl-" + hashlib.sha1(
-                f"{source}|{origin}|{url}".encode("utf-8", "replace")).hexdigest()[:12]
-            if finding_id not in found:
-                found[finding_id] = (epoch if epoch is not None else math.inf, {
+            owner = origin if origin is not None else flow["pid"]
+            finding_id = "dl-" + hashlib.sha1(f"{owner}|{url}".encode("utf-8", "replace")).hexdigest()[:12]
+            at = epoch if epoch is not None else math.inf
+            known = found.get(finding_id)
+            sources = sorted(set((known[1]["sources"] if known else []) + [source]))
+            if known is None or at < known[0]:
+                found[finding_id] = (at, {
                     "id": finding_id, "pid": flow["pid"], "image": flow["image"], "url": url,
-                    "dst_ip": flow["dst_ip"], "dst_port": flow["dst_port"], "source": source,
+                    "dst_ip": flow["dst_ip"], "dst_port": flow["dst_port"], "source": source, "sources": sources,
                     "observed_at": _iso(epoch) if epoch is not None else None, "origin_pid": origin,
-                    "requested_by": "bits" if via_bits else None, "in_detonation": in_detonation,
+                    "requested_by": "bits" if via_bits else None,
+                    "in_detonation": in_detonation or bool(known and known[1]["in_detonation"]),
                     "self": firewall.is_tdc_image(flow["image"])})
+            else:
+                known[1]["sources"] = sources
+                known[1]["in_detonation"] = known[1]["in_detonation"] or in_detonation
     return [finding for _, finding in sorted(found.values(), key=lambda pair: pair[0])]
 
 
@@ -811,6 +822,10 @@ def _check_setting(name: str, value: Any) -> Any:
         if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
                                   or not math.isfinite(value)):
             raise ValueError("isolated_since must be an epoch time or null")
+    elif name == "allow_disabled":
+        if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
+            raise ValueError("allow_disabled must be a list of rule names")
+        value = list(value)
     else:
         raise ValueError(f"unknown setting: {name!r}")
     return value
@@ -823,13 +838,16 @@ class Settings:
     ``isolated``         whether ISOLATED is on
     ``outbound_before``  the ``DefaultOutboundAction`` before ISOLATED, to put it back
     ``isolated_since``   epoch seconds ISOLATED went on, or None
+    ``allow_disabled``   the names of Windows' own outbound Allow rules ISOLATED switched off, to switch exactly
+                         those on again (``scripts/tdc-unisolate.ps1`` reads it too)
 
     The attributes can be read freely. ``set`` checks, stores and writes the file, and raises (leaving
     everything as it was) when it cannot: whoever isolates the VM must know that the way back was not
     remembered. A file that is missing or cannot be read gives the defaults; ``load_error`` then says why.
     """
 
-    DEFAULTS = {"ask_mode": "detonation", "isolated": False, "outbound_before": None, "isolated_since": None}
+    DEFAULTS = {"ask_mode": "detonation", "isolated": False, "outbound_before": None, "isolated_since": None,
+                "allow_disabled": []}
 
     def __init__(self, path: str):
         self.path = path
@@ -839,6 +857,7 @@ class Settings:
         self.isolated: bool = self.DEFAULTS["isolated"]
         self.outbound_before: Optional[str] = self.DEFAULTS["outbound_before"]
         self.isolated_since: Optional[float] = self.DEFAULTS["isolated_since"]
+        self.allow_disabled: List[str] = []
         self.load()
 
     def load(self) -> None:
@@ -859,9 +878,9 @@ class Settings:
                 logger.warning("firewall settings unreadable (%s); using the defaults", self.load_error)
             for name, default in self.DEFAULTS.items():
                 try:
-                    value = _check_setting(name, data[name]) if name in data else default
+                    value = _check_setting(name, data[name]) if name in data else copy.copy(default)
                 except ValueError as e:
-                    value = default
+                    value = copy.copy(default)
                     self.load_error = self.load_error or str(e)
                 setattr(self, name, value)
 

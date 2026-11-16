@@ -672,6 +672,81 @@ def test_the_isolated_banner_shows_the_residual_and_an_open_way_out():
 
 
 @needs_node
+def test_the_isolated_banner_names_what_windows_own_rules_still_let_out():
+    def bands(extra):
+        return _run(r"""
+            fwState.isolated = true;
+            fwState.isolate = Object.assign({ isolated: true, profiles_off: [], residual: 'r' }, %s);
+            renderFirewallBands();
+            console.log(JSON.stringify(els['firewall-bands'].innerHTML));""" % json.dumps(extra))
+    open_ = bands({"allowed_out": [{"name": "{gpo}", "display": "Lab <b>proxy</b> out", "source": "GroupPolicy", "local": False}]})
+    assert "Still let out despite ISOLATED: 1 outbound Allow rule" in open_ and "Lab &lt;b&gt;proxy" in open_
+    assert "GroupPolicy" in open_ and "fw-band-hole" in open_
+    unknown = bands({"allowed_out": None, "allowed_out_error": "rpc <x>"})
+    assert "Whether ISOLATED is closed is not known" in unknown and "rpc &lt;x&gt;" in unknown
+    closed = bands({"allowed_out": []})
+    assert "no outbound Allow rule but TDC" in closed and "fw-band-hole" not in closed
+
+
+@needs_node
+def test_the_isolated_toast_says_what_the_server_said():
+    def toggle(isolate, data):
+        return _run(r"""
+            confirmAnswer = true;
+            fwState.isolated = %s;
+            fwState.isolate = %s;
+            answer = url => reply(url === '/api/firewall/isolate' ? %s : {});
+            await fwToggleIsolated();
+            console.log(JSON.stringify(toasts.filter(t => t.title.startsWith('ISOLATED'))));""" % (
+            json.dumps(isolate["isolated"]), json.dumps(isolate), json.dumps(data)))
+    left = toggle({"isolated": True, "profiles_off": []},
+                  {"isolated": False, "outbound_after": {"Domain": "Block", "Private": "Block", "Public": "Block"},
+                   "note": "The baseline recorded before ISOLATED is Block on Domain, Private, Public: outbound stays shut there",
+                   "state": {"isolated": False, "profiles_off": []}})
+    assert left[0]["title"] == "ISOLATED is off" and "stays shut" in left[0]["detail"] and left[0]["type"] == "warning"
+    assert "allowed again" not in left[0]["detail"]
+    shut = toggle({"isolated": True, "profiles_off": []},
+                  {"isolated": False, "outbound_after": {"Domain": "Block", "Private": "Allow", "Public": "Allow"}, "note": None,
+                   "state": {"isolated": False, "profiles_off": []}})
+    assert "Block on Domain" in shut[0]["detail"] and shut[0]["type"] == "warning"
+    gone = toggle({"isolated": False, "profiles_off": []},
+                  {"isolated": True, "verified": False, "note": "1 outbound Allow rule is still enabled: Lab proxy out",
+                   "state": {"isolated": True, "profiles_off": []}})
+    assert gone[0]["title"] == "ISOLATED is on, not closed" and "Lab proxy out" in gone[0]["detail"] and gone[0]["type"] == "error"
+    closed = toggle({"isolated": False, "profiles_off": []},
+                    {"isolated": True, "verified": True, "note": None, "state": {"isolated": True, "profiles_off": []}})
+    assert closed[0]["title"] == "ISOLATED is on" and "read back" in closed[0]["detail"]
+
+
+@needs_node
+def test_a_start_into_isolated_is_toasted_once_on_any_tab():
+    r = _run(r"""
+        state.activeTab = 'submit';
+        const data = { pending: [], history: [], isolated: true,
+            startup: { id: 'abc', announce: true, note: 'ISOLATED is on: <b>x</b>' } };
+        fwAnnounceStartup(data);
+        fwAnnounceStartup(data);
+        fwStartupSeen = '';
+        fwAnnounceStartup(data);                         // a reload: the storage remembers it
+        fwAnnounceStartup({ startup: { id: 'def', announce: false, note: 'nothing' } });
+        fwAnnounceStartup({ startup: null });
+        console.log(JSON.stringify(toasts));""")
+    assert len(r) == 1 and r[0]["type"] == "error" and "ISOLATED is on since the web UI started" == r[0]["title"]
+    assert "ISOLATED is on" in r[0]["detail"]
+
+
+@needs_node
+def test_a_dropped_decision_without_a_recorded_block_does_not_claim_one():
+    r = _run(r"""
+        const item = { id: 'd', action: 'dropped', finding: {}, result: { reason: 'more than 200 open decisions' } };
+        const out = fwDecisionOutcome({}, item, item.result, null);
+        const kept = fwDecisionOutcome({}, item, item.result, { verified: true, rule_id: 'TDC-FW-0123456789ab' });
+        console.log(JSON.stringify({ out: out.lines.join(' '), kept: kept.lines.join(' ') }));""")
+    assert "stays blocked" not in r["out"] and "never confirmed" in r["out"]
+    assert "the block stands" in r["kept"]
+
+
+@needs_node
 def test_a_firewall_that_is_off_shows_a_red_band_and_disables_isolated():
     r = _run(r"""
         fwState.isolate = { isolated: false, profiles_off: ['Public', 'Private'] };
@@ -1668,7 +1743,7 @@ def test_decisions_keeps_the_block_of_a_dropped_one_and_says_whose_clock_it_is()
         fwReady = true; fwSetView('decisions');
         console.log(JSON.stringify(els['firewall-view'].innerHTML));""")
     cells = re.findall(r'<td class="fw-dec-block[^"]*"[^>]*>([^<]*)</td>', out)
-    assert cells == ["confirmed", "kept"] and "not set yet" not in out
+    assert cells == ["confirmed", "not recorded"] and "not set yet" not in out and "no block was recorded" in out
     assert "Time (VM clock)" in out
     # Date.now of the tests is months after the server_time of the answer
     assert re.search(r"The VM&#39;s clock is [0-9,]+ (minutes|hours|days) behind this computer&#39;s", out), out[:600]

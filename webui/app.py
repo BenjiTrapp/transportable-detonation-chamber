@@ -10922,25 +10922,31 @@ FIREWALL_DECIDE_SECONDS = 30
 FIREWALL_FINDING_WINDOW_S = 1800       # the connections a sweep looks at for a download (the first sweep: all)
 FIREWALL_FINDING_FRESH_S = 3600        # an older finding is marked but no longer asked about
 FIREWALL_WINDOW_GRACE_S = 60           # a detonation window stays open this long after its process ended
-FIREWALL_RULES_TTL_S = 5
+FIREWALL_RULES_TTL_S = 60              # every enforcement route forgets it, so only a change made outside TDC waits
 FIREWALL_MARK_LIMIT = 5000
 FETCH_CLOSE_ATTEMPTS = 3               # tries to take the per-fetch allow rule away again
 FETCH_CLOSE_PAUSE = 0.2
 FETCH_PATH_WAIT_S = 120                # how long a fetch waits for another one's rule write or removal
 FIREWALL_FETCH_SWEEP_S = 60            # how often the sweep looks for a per-fetch rule no fetch is using
-# What ISOLATED does not close, for the banner of the tab: TDC's fetcher is the venv's python.exe, so a rule
-# naming that program lets out whatever can run it. The rule is therefore written per fetch, for one address,
-# and taken away when the fetch ends (firewall_rules.allow_fetch); what is left is that window.
+# What ISOLATED does not close, for the banner of the tab. Two things: Windows' own outbound Allow rules, which
+# DefaultOutboundAction Block does not stop (ISOLATED switches the local ones off; what is still enabled is read
+# back into ``allowed_out``), and TDC's fetcher, the venv's python.exe: a rule naming that program lets out
+# whatever can run it, so it is written per fetch, for one address, and taken away when the fetch ends
+# (firewall_rules.allow_fetch); what is left is that window.
 FIREWALL_ISOLATED_RESIDUAL = (
-    "ISOLATED blocks every way out but loopback. TDC's own fetch is let out one address at a time, only while "
-    "it runs: the fetcher is a Python interpreter, so a sample able to run it could reach that one address "
-    "during those seconds. Part B's proxy closes this.")
+    "ISOLATED sets the default outbound action to Block, which stops only what no rule allows, so it also switches "
+    "off Windows' own outbound Allow rules (Core Networking's DNS among them) and switches exactly those on again "
+    "when it is left. A rule a group policy sets cannot be switched off from here: what is still enabled is read "
+    "back and named. Loopback stays open. TDC's own fetch is let out one address at a time, only while it runs: "
+    "the fetcher is a Python interpreter, so a sample able to run it could reach that one address during those "
+    "seconds. Part B's proxy closes this.")
 
 _fw_store = firewall_store.FirewallStore()
 _fw_settings = firewall_store.Settings(FIREWALL_STATE_FILE)
 _fw_pending = firewall_store.PendingStore(PENDING_FILE)
 _fw_runner = firewall_rules.run_powershell        # run(args) -> (rc, out, err); tests swap it
 _fw_startup = None                                # what startup_state said at start (None before it ran)
+_FW_START_ID = base64.b32encode(os.urandom(5)).decode("ascii").lower()   # names this server start for the toast
 _fw_downloads = {}                                # (pid, dst_ip, dst_port) -> epoch of a download finding
 _fw_scan_state = {"done": False}
 _fw_decision_lock = threading.Lock()              # a decision and its firewall effect are one step
@@ -11193,17 +11199,19 @@ def _fw_forget_rules():
 # time, so it is asked again soon); an enforcement route forgets it. The enforcement routes themselves never use
 # the cache: they read the profiles fresh (_fw_firewall_off_message) and store what they found.
 FIREWALL_PROFILES_TTL_S = 60
-# How far Sysmon's time of a connection and Windows' start time of a process may disagree (kill's PID-reuse test)
-FIREWALL_KILL_CLOCK_SLACK_S = 2.0
+# How far Sysmon's time of a connection and Windows' start time of a process may disagree (kill's PID-reuse test):
+# both read the same clock, so only Sysmon's millisecond precision, which cuts the time down
+FIREWALL_KILL_CLOCK_SLACK_S = 0.001
 FIREWALL_PROFILES_ERROR_TTL_S = 10
 _fw_profiles_cache = None                         # (stamp, off, error) or None
 _fw_profiles_lock = threading.Lock()
 
 
 def _fw_forget_profiles():
-    global _fw_profiles_cache
+    global _fw_profiles_cache, _fw_allowed_cache
     with _fw_profiles_lock:
         _fw_profiles_cache = None
+        _fw_allowed_cache = None
 
 
 def _fw_read_profiles():
@@ -11227,6 +11235,36 @@ def _fw_profiles_off():
         if time.monotonic() - stamp < (FIREWALL_PROFILES_ERROR_TTL_S if error else FIREWALL_PROFILES_TTL_S):
             return off, error
     return _fw_read_profiles()
+
+
+# What still lets traffic out while ISOLATED is on (Windows' own outbound Allow rules that are enabled), for the
+# band: read back by isolate itself, then cached like the profiles and forgotten with them. Not read while
+# ISOLATED is off: then everything is let out anyway.
+_fw_allowed_cache = None                          # (stamp, rules | None, error | None) or None
+
+
+def _fw_keep_allowed_out(found, error):
+    global _fw_allowed_cache
+    with _fw_profiles_lock:
+        _fw_allowed_cache = (time.monotonic(), found, error)
+
+
+def _fw_allowed_out():
+    """``(rules, error)`` of what ISOLATED does not close; ``(None, None)`` while ISOLATED is off."""
+    if not _fw_settings.isolated:
+        return None, None
+    with _fw_profiles_lock:
+        cached = _fw_allowed_cache
+    if cached is not None:
+        stamp, found, error = cached
+        if time.monotonic() - stamp < (FIREWALL_PROFILES_ERROR_TTL_S if error else FIREWALL_PROFILES_TTL_S):
+            return found, error
+    try:
+        found, error = firewall_rules.allowed_out(_fw_runner), None
+    except Exception as e:
+        found, error = None, _fw_reason(e)
+    _fw_keep_allowed_out(found, error)
+    return found, error
 
 
 def _fw_rule_keys(found):
@@ -11565,7 +11603,7 @@ def _fw_open_fetch_path(ip, port):
     """While ISOLATED, let TDC's own fetch out to this one endpoint for as long as this fetch lasts.
 
     ``(names, problem)``: the allow rules of this fetch - one per program the fetch may run as - and what is
-    wrong with them, or None. ISOLATED shuts every way out but loopback, so without a rule the fetch cannot
+    wrong with them, or None. ISOLATED shuts the default way out, so without a rule the fetch cannot
     happen; a standing allow rule for the fetcher would be much wider, because the fetcher is a Python
     interpreter (``firewall_rules.allow_fetch`` spells out the residual). A rule that cannot be written is not
     fatal: the fetch is tried and the problem is recorded with its result, for every fetch that shares it.
@@ -12237,17 +12275,23 @@ def _fw_isolate_state():
            "isolated_since": _fw_iso(_fw_settings.isolated_since), "ask_mode": _fw_settings.ask_mode,
            "settings_error": _fw_settings.load_error, "startup": _fw_startup,
            "profiles_off": None, "profiles_error": None, "residual": FIREWALL_ISOLATED_RESIDUAL,
+           "allowed_out": None, "allowed_out_error": None,
+           "allow_disabled": len(_fw_settings.allow_disabled or ()),
            "fetch_paths_open": open_paths, "fetches_in_flight": in_flight}
-    # Everything above is in memory and as fresh as the request; only the profiles cost PowerShell (cached)
+    # Everything above is in memory and as fresh as the request; only the profiles and, while ISOLATED is on,
+    # what it does not close cost PowerShell (both cached)
     out["profiles_off"], out["profiles_error"] = _fw_profiles_off()
+    out["allowed_out"], out["allowed_out_error"] = _fw_allowed_out()
     return out
 
 
 @app.route("/api/firewall/isolate", methods=["GET", "POST"])
 def api_firewall_isolate():
     """GET: the state (isolated, the remembered outbound action, which firewall profiles are off, the start-up
-    note, ``residual``: what ISOLATED does not close, and ``fetch_paths_open``: a way out of a finished fetch
-    that would not close again — all three for the banner).
+    note, ``residual``: what ISOLATED does not close, ``allowed_out``: Windows' own outbound Allow rules that are
+    still enabled while ISOLATED is on, read back (``null`` while it is off or when ``allowed_out_error`` says it
+    could not be read), ``allow_disabled``: how many of them ISOLATED holds switched off, and
+    ``fetch_paths_open``: a way out of a finished fetch that would not close again — all for the banner).
     POST ``{on: bool}``: switch ISOLATED; 409 when the Windows Firewall is off (it would accept the change and do nothing)."""
     if request.method == "GET":
         return _fw_json(_fw_isolate_state())
@@ -12264,6 +12308,8 @@ def api_firewall_isolate():
         return _fw_error(str(e), 500)
     finally:
         _fw_forget_rules()
+    if data["on"]:
+        _fw_keep_allowed_out(done.get("allowed_out"), done.get("allowed_out_error"))     # just read back
     return _fw_json(dict(done, state=_fw_isolate_state()))
 
 
@@ -12278,12 +12324,18 @@ def _fw_can_fetch(finding):
 
 @app.route("/api/firewall/pending")
 def api_firewall_pending():
-    """Open decisions with their remaining seconds and ``can_fetch`` (see ``_fw_can_fetch``), and the decisions
-    of the last 24 h (``history``)."""
+    """Open decisions with their remaining seconds and ``can_fetch`` (see ``_fw_can_fetch``), the decisions
+    of the last 24 h (``history``), ``isolated``, and ``startup``: what the firewall was like when this server
+    started (``{id, announce, note}``, ``null`` until it was read) - the poll every tab runs, so a restart into
+    ISOLATED or into a shut egress is told on whatever tab the analyst is on, once per ``id``."""
     now = time.time()
+    startup = None
+    if isinstance(_fw_startup, dict):
+        startup = {"id": _FW_START_ID, "announce": bool(_fw_startup.get("announce")), "note": _fw_startup.get("note")}
     return _fw_json({"pending": [dict(_fw_item_view(i, now), can_fetch=_fw_can_fetch(i["finding"])) for i in _fw_pending.open()],
                      "history": [_fw_item_view(i, now) for i in _fw_pending.history(100)],
                      "ask_mode": _fw_settings.ask_mode, "decide_seconds": _firewall_decide_seconds(),
+                     "isolated": bool(_fw_settings.isolated), "startup": startup,
                      "server_time": _fw_iso(now)})
 
 

@@ -6,6 +6,7 @@ there"), so these tests prove the Python side, the order of what it does and wha
 script really does to Windows only a VM can show.
 """
 
+import base64
 import json
 import ntpath
 import os
@@ -31,7 +32,7 @@ class FakeRun:
     """
 
     def __init__(self, profiles=None, outbound="Allow", rule_list=None, get_rule_returns=None, fail=None,
-                 fail_once=None, disable_new=False, timeline=None):
+                 fail_once=None, disable_new=False, timeline=None, foreign=None, stubborn=()):
         self.calls = []
         self.timeline = timeline if timeline is not None else []
         self.profiles = dict(profiles or ALL_ON)
@@ -45,6 +46,9 @@ class FakeRun:
         self.fail_once = dict(fail_once or {})
         self.disable_new = disable_new
         self.standing = []          # (name, action, program) of every rule, after each call
+        # Windows' own outbound Allow rules: name -> {DisplayName, Group, Source, Enabled}; ``stubborn`` will not switch
+        self.foreign = {n: dict(r) for n, r in (foreign or {}).items()}
+        self.stubborn = set(stubborn)
 
     @staticmethod
     def view(name, **kw):
@@ -118,6 +122,33 @@ class FakeRun:
         self.rules.pop(p["Name"], None)
         return 0, "", ""
 
+    def op_AllowOut(self, p):
+        rows = [{"Name": n, "DisplayName": r.get("DisplayName", n), "Group": r.get("Group", ""), "Source": r["Source"]}
+                for n, r in self.foreign.items() if r["Enabled"]]
+        return 0, json.dumps({"rules": rows}), ""
+
+    def _toggle(self, p, on):
+        done, failed, missing = [], [], []
+        for n in json.loads(base64.b64decode(p["Names"]).decode("utf-8")):
+            r = self.foreign.get(n)
+            if r is None or r["Source"] != "Local":
+                missing.append(n)
+            elif n in self.stubborn:
+                failed.append({"Name": n, "Error": "access is denied"})
+            else:
+                r["Enabled"] = on
+                done.append(n)
+        return 0, json.dumps({"done": done, "failed": failed, "missing": missing}), ""
+
+    def op_DisableAllowOut(self, p):
+        return self._toggle(p, False)
+
+    def op_EnableAllowOut(self, p):
+        return self._toggle(p, True)
+
+    def enabled_foreign(self):
+        return sorted(n for n, r in self.foreign.items() if r["Enabled"])
+
     def op_SetDefaultOutbound(self, p):
         names = p["Profiles"].split(",") if "Profiles" in p else list(self.profiles)
         for n in names:
@@ -130,12 +161,15 @@ class FakeRun:
         return [self.params(c)["Op"] for c in self.calls if c[0] != "taskkill"]
 
     def writes(self):
-        return [o for o in self.ops() if o in ("Create", "Remove", "SetDefaultOutbound", "Enable")]
+        return [o for o in self.ops() if o in ("Create", "Remove", "SetDefaultOutbound", "Enable", "DisableAllowOut",
+                                               "EnableAllowOut")]
 
 
 class FakeSettings:
-    def __init__(self, outbound_before=None, isolated=False, isolated_since=None, timeline=None, fail=False):
+    def __init__(self, outbound_before=None, isolated=False, isolated_since=None, timeline=None, fail=False,
+                 allow_disabled=()):
         self.outbound_before = outbound_before
+        self.allow_disabled = list(allow_disabled)
         self.isolated = isolated
         self.isolated_since = isolated_since
         self.timeline = timeline if timeline is not None else []
@@ -159,6 +193,14 @@ def make(**kw):
 SETTINGS = FakeSettings()
 FETCHER = "TDC-FW-ISO-fetcher"
 LOOPBACK = "TDC-FW-ISO-loopback"
+# A stock Windows: Core Networking's DNS and DHCP rules are local and enabled, a group policy adds one of its own
+DNS_RULE = "CoreNet-DNS-Out-UDP"
+STOCK = {
+    DNS_RULE: {"DisplayName": "Core Networking - DNS (UDP-Out)", "Group": "Core Networking", "Source": "Local", "Enabled": True},
+    "CoreNet-DHCP-Out": {"DisplayName": "Core Networking - DHCP (DHCP-Out)", "Group": "Core Networking", "Source": "Local", "Enabled": True},
+    "CoreNet-Teredo-Out": {"DisplayName": "Core Networking - Teredo (UDP-Out)", "Group": "Core Networking", "Source": "Local", "Enabled": False},
+}
+GPO_RULE = {"{gpo-1}": {"DisplayName": "Lab proxy out", "Group": "", "Source": "GroupPolicy", "Enabled": True}}
 
 
 # ---- the brief's tests ----------------------------------------------------------------------
@@ -250,7 +292,7 @@ def test_malware_text_travels_as_its_own_argument_to_a_file_and_never_to_a_comma
 def test_the_ops_the_module_emits_are_the_ops_the_script_accepts():
     script = open(os.path.join(ROOT, "webui", "firewall_rules.ps1"), encoding="utf-8").read()
     allowed = set(re.findall(r"'(\w+)'", re.search(r"ValidateSet\(([^)]*)\)\]\s*\[string\]\$Op", script).group(1)))
-    run, settings = make()
+    run, settings = make(foreign=STOCK)
     rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     rules_mod.unblock(run, run.calls[0][run.calls[0].index("-Name") + 1])
     rules_mod.rules(run)
@@ -258,7 +300,8 @@ def test_the_ops_the_module_emits_are_the_ops_the_script_accepts():
     rules_mod.isolate(run, True, settings=settings)
     rules_mod.isolate(run, False, settings=settings)
     assert set(run.ops()) <= allowed
-    assert set(run.ops()) == {"Create", "Get", "Remove", "List", "Enable", "Profiles", "SetDefaultOutbound"}
+    assert set(run.ops()) == {"Create", "Get", "Remove", "List", "Enable", "Profiles", "SetDefaultOutbound", "AllowOut",
+                              "DisableAllowOut", "EnableAllowOut"}
 
 
 @pytest.mark.parametrize("image", ["", "-Foo", "C:\\x\\a\nb.exe", "C:\\x\\a\x00.exe", "x" * 5000])
@@ -832,7 +875,7 @@ def test_leaving_isolated_removes_a_per_fetch_rule_that_was_still_open():
 def test_startup_with_nothing_to_say_says_nothing():
     run, settings = FakeRun(), FakeSettings()
     state = rules_mod.startup_state(run, settings)
-    assert state == {"isolated": False, "profiles_off": [], "announce": False, "note": None}
+    assert state == {"isolated": False, "profiles_off": [], "announce": False, "note": None, "allowed_out": None}
 
 
 def test_a_marker_over_an_open_egress_is_cleared_because_the_hatch_was_used():
@@ -1240,3 +1283,178 @@ def test_a_failure_with_a_damaged_marker_is_not_rolled_back_to_open():
         rules_mod.isolate(run, True, settings=settings)
     assert "scripts/tdc-unisolate.ps1" in str(e.value)
     assert settings.isolated is True and set(run.outbound.values()) == {"Block"}
+
+
+# ---- Windows' own outbound Allow rules: DefaultOutboundAction Block does not stop them ------------
+
+
+def test_isolated_switches_off_windows_own_allow_rules_and_leaving_switches_exactly_those_on():
+    run, settings = make(foreign={**STOCK, **{}})
+    out = rules_mod.isolate(run, True, settings=settings)
+    assert run.enabled_foreign() == []                                   # DNS and DHCP are off now
+    assert sorted(settings.allow_disabled) == ["CoreNet-DHCP-Out", DNS_RULE]   # Teredo was off already: not recorded
+    assert out["verified"] is True and out["allowed_out"] == [] and out["note"] is None
+    left = rules_mod.isolate(run, False, settings=settings)
+    assert run.enabled_foreign() == ["CoreNet-DHCP-Out", DNS_RULE] and run.foreign["CoreNet-Teredo-Out"]["Enabled"] is False
+    assert settings.allow_disabled == [] and left["allow_disabled"] == [] and left["note"] is None
+
+
+def test_the_rule_names_are_saved_before_anything_changes_and_closed_before_block():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    kinds = [t[0] for t in run.timeline]
+    first_write = min(i for i, k in enumerate(kinds) if k in ("Create", "DisableAllowOut", "SetDefaultOutbound"))
+    assert kinds[first_write - 1] == "settings" and "allow_disabled" in settings.saved[0]
+    assert kinds.index("AllowOut") < first_write                          # read before anything changes
+    assert max(i for i, k in enumerate(kinds) if k == "Create") < kinds.index("DisableAllowOut") < kinds.index("SetDefaultOutbound")
+    assert kinds[-1] == "AllowOut"                                        # and read back after
+    run.timeline.clear()
+    rules_mod.isolate(run, False, settings=settings)
+    kinds = [t[0] for t in run.timeline]
+    assert kinds.index("SetDefaultOutbound") < kinds.index("EnableAllowOut") < kinds.index("Remove") < kinds.index("settings")
+
+
+def test_a_rule_a_group_policy_sets_cannot_be_closed_and_is_said_never_hidden():
+    run, settings = make(foreign={**STOCK, **GPO_RULE})
+    out = rules_mod.isolate(run, True, settings=settings)
+    assert out["verified"] is False and [r["name"] for r in out["allowed_out"]] == ["{gpo-1}"]
+    assert out["allowed_out"][0]["source"] == "GroupPolicy" and out["allowed_out"][0]["local"] is False
+    assert "Lab proxy out" in out["note"] and "group policy" in out["note"]
+    assert "{gpo-1}" not in settings.allow_disabled and settings.isolated is True
+
+
+def test_a_local_rule_that_will_not_switch_off_stays_in_the_read_back():
+    run, settings = make(foreign=STOCK, stubborn={DNS_RULE})
+    out = rules_mod.isolate(run, True, settings=settings)
+    assert out["verified"] is False and [r["name"] for r in out["allowed_out"]] == [DNS_RULE]
+    assert "Core Networking - DNS (UDP-Out)" in out["note"] and settings.isolated is True
+
+
+def test_isolated_is_refused_when_windows_own_rules_cannot_be_read():
+    run, settings = make(foreign=STOCK, fail={"AllowOut": (1, "access denied")})
+    with pytest.raises(rules_mod.RuleError) as e:
+        rules_mod.isolate(run, True, settings=settings)
+    assert "nothing was changed" in str(e.value)
+    assert run.writes() == [] and settings.saved == [] and run.enabled_foreign() == ["CoreNet-DHCP-Out", DNS_RULE]
+
+
+def test_a_read_back_that_fails_is_unknown_never_closed():
+    run, settings = make(foreign=STOCK)
+    real = run.op_AllowOut
+    seen = {"n": 0}
+
+    def allow_out(p):
+        seen["n"] += 1
+        return real(p) if seen["n"] == 1 else (1, "", "rpc failed")
+    run.op_AllowOut = allow_out
+    out = rules_mod.isolate(run, True, settings=settings)
+    assert out["verified"] is False and out["allowed_out"] is None and "rpc failed" in out["allowed_out_error"]
+    assert "not known" in out["note"]
+
+
+def test_a_failed_isolation_switches_windows_rules_on_again_in_reverse():
+    run, settings = make(foreign=STOCK, fail_once={"SetDefaultOutbound": (1, "denied")})
+    with pytest.raises(rules_mod.RuleError):
+        rules_mod.isolate(run, True, settings=settings)
+    kinds = [t[0] for t in run.timeline]
+    assert kinds.index("DisableAllowOut") < kinds.index("EnableAllowOut") < max(i for i, k in enumerate(kinds) if k == "Remove")
+    assert run.enabled_foreign() == ["CoreNet-DHCP-Out", DNS_RULE] and run.rules == {}
+    assert settings.isolated is False and settings.allow_disabled == []
+
+
+def test_a_rollback_that_cannot_switch_them_on_keeps_the_marker_and_the_names():
+    run, settings = make(foreign=STOCK, fail_once={"SetDefaultOutbound": (1, "denied")}, fail={"EnableAllowOut": (1, "rpc")})
+    with pytest.raises(rules_mod.RuleError) as e:
+        rules_mod.isolate(run, True, settings=settings)
+    assert "scripts/tdc-unisolate.ps1" in str(e.value)
+    assert settings.isolated is True and sorted(settings.allow_disabled) == ["CoreNet-DHCP-Out", DNS_RULE]
+
+
+def test_a_rule_that_will_not_switch_on_again_stays_recorded_and_is_retried():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    run.stubborn = {DNS_RULE}
+    out = rules_mod.isolate(run, False, settings=settings)
+    assert settings.isolated is False and settings.allow_disabled == [DNS_RULE] and out["allow_disabled"] == [DNS_RULE]
+    assert DNS_RULE in out["note"] and "tdc-unisolate" in out["note"]
+    run.stubborn = set()
+    again = rules_mod.isolate(run, False, settings=settings)               # no marker: only the leftover is retried
+    assert again["changed"] is True and settings.allow_disabled == [] and run.foreign[DNS_RULE]["Enabled"] is True
+    assert set(run.outbound.values()) == {"Allow"}
+
+
+def test_a_recorded_rule_that_is_gone_is_not_missed():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    del run.foreign[DNS_RULE]
+    out = rules_mod.isolate(run, False, settings=settings)
+    assert settings.allow_disabled == [] and out["note"] is None
+
+
+def test_isolating_again_closes_a_rule_that_was_switched_on_meanwhile():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    run.foreign["CoreNet-Teredo-Out"]["Enabled"] = True                   # someone (or something) switched it on
+    out = rules_mod.isolate(run, True, settings=settings)
+    assert out["verified"] is True and "CoreNet-Teredo-Out" in settings.allow_disabled
+    rules_mod.isolate(run, False, settings=settings)
+    assert run.enabled_foreign() == sorted(["CoreNet-DHCP-Out", "CoreNet-Teredo-Out", DNS_RULE])
+
+
+def test_a_stale_marker_at_start_switches_the_recorded_rules_on_again():
+    run = FakeRun(outbound="Allow", foreign={DNS_RULE: dict(STOCK[DNS_RULE], Enabled=False)})
+    settings = FakeSettings(isolated=True, outbound_before="Allow", allow_disabled=[DNS_RULE])
+    state = rules_mod.startup_state(run, settings)
+    assert run.foreign[DNS_RULE]["Enabled"] is True and settings.allow_disabled == [] and settings.isolated is False
+    assert state["announce"] is True
+
+
+def test_isolated_found_at_start_says_what_still_gets_out():
+    run = FakeRun(outbound="Block", foreign=GPO_RULE)
+    settings = FakeSettings(isolated=True, outbound_before="Allow")
+    state = rules_mod.startup_state(run, settings)
+    assert state["isolated"] is True and [r["name"] for r in state["allowed_out"]] == ["{gpo-1}"]
+    assert "Lab proxy out" in state["note"] and run.writes() == []
+
+
+def test_many_rule_names_travel_in_several_calls_each_as_base64_never_as_text():
+    names = {f"{{{i:08d}-aaaa-bbbb-cccc-dddddddddddd}} *weird, name": {"DisplayName": f"App {i}", "Source": "Local", "Enabled": True}
+             for i in range(400)}
+    run, settings = make(foreign=names)
+    assert rules_mod.isolate(run, True, settings=settings)["verified"] is True
+    calls = [c for c in run.calls if FakeRun.params(c)["Op"] == "DisableAllowOut"]
+    assert len(calls) > 1
+    for call in calls:
+        value = FakeRun.params(call)["Names"]
+        assert re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", value) and len(value) <= rules_mod.ALLOW_OUT_CHUNK
+        assert not any("weird" in a for a in call)
+    assert run.enabled_foreign() == []
+
+
+def test_the_script_switches_only_local_outbound_allow_rules_that_are_not_ours():
+    text = open(os.path.join(ROOT, "webui", "firewall_rules.ps1"), encoding="utf-8").read()
+    body = text[text.index("function Set-AllowOut"):]
+    body = body[:body.index("\n}\n")]
+    assert "-PolicyStore PersistentStore" in body and "'Outbound'" in body and "'Allow'" in body
+    assert "TDC-FW-" in text[text.index("function Get-NameList"):text.index("function Set-AllowOut")]
+    assert "FromBase64String" in text and "-Name $" not in body
+
+
+def test_the_hatch_switches_the_recorded_rules_on_again():
+    text = open(os.path.join(ROOT, "scripts", "tdc-unisolate.ps1"), encoding="utf-8").read()
+    assert "firewall_state.json" in text and "allow_disabled" in text and "Enable-NetFirewallRule" in text
+    assert "PersistentStore" in text and "Invoke-Expression" not in text
+
+
+def test_sysmon_logs_the_connections_curl_bits_and_tdc_python_make():
+    """The upstream config's NetworkConnect is an include list without curl.exe, svchost.exe (BITS) or python.exe:
+    a curl or BITS download could never become a finding, and tdc-anomaly could never fire."""
+    script = open(os.path.join(ROOT, "scripts", "install-sysmon.ps1"), encoding="utf-8").read()
+    body = script[script.index("function Set-NetworkConnectIncludes"):]
+    body = body[:body.index("\n}\n")]
+    for image in ("'curl.exe'", "'python.exe'", r"'C:\Windows\System32\svchost.exe'"):
+        assert image in body
+    assert "NetworkConnect[@onmatch='include']" in body
+    calls = [m.start() for m in re.finditer(r"Set-NetworkConnectIncludes -Path \$configPath", script)]
+    assert len(calls) == 2
+    assert script.index("-c $configPath") > calls[0] and script.rindex("-i $configPath") > calls[-1]
