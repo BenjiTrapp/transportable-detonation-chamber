@@ -858,3 +858,26 @@ def test_the_way_back_stands_above_the_search_line():
     bar = html[html.index('<div class="logs-bar">'):html.index('id="logs-histogram"')]
     assert bar.index('id="logs-back"') < bar.index('id="logs-query"')
     assert re.search(r'<div[^>]*id="logs-back"[^>]*hidden', bar)
+
+
+@needs_node
+def test_a_note_about_the_range_stands_beside_it_until_the_range_changes():
+    r = _run(r"""
+        initLogs();
+        await settle();
+        openLogsTab('dst_ip="1.2.3.4"', '2026-11-16T14:02:00Z', '', 'firewall', 'To now: <b>still</b> running.');
+        const shown = els['logs-range'].innerHTML;
+        // another search keeps the range and its note
+        logsSetQuery('source=dns'); await submitLogsSearch();
+        const kept = els['logs-range'].innerHTML;
+        logsSetRange('4h');
+        const button = els['logs-range'].innerHTML;
+        openLogsTab('x', '2026-11-16T14:02:00Z', '', null, 'A note');
+        logsZoom(Date.parse('2026-11-16T14:05:00Z'), Date.parse('2026-11-16T14:06:00Z'));
+        const zoomed = els['logs-range'].innerHTML;
+        openLogsTab('y', '-1h', '');
+        console.log(JSON.stringify({ shown, kept, button, zoomed, plain: els['logs-range'].innerHTML }));""")
+    assert "logs-range-note" in r["shown"] and "To now: &lt;b&gt;still&lt;/b&gt; running." in r["shown"]
+    assert "<b>" not in r["shown"] and "&lt;b&gt;" in r["kept"]
+    for key in ("button", "zoomed", "plain"):
+        assert "logs-range-note" not in r[key], key

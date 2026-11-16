@@ -1863,15 +1863,17 @@ function openAlertsTab(filter) {
 // which the tab takes when it is shown: on its first opening initLogs takes it
 // instead of the last search, so that one never runs. The values in `query`
 // are the caller's to quote (logsQuote). False, and nothing changes, for an
-// empty query or one longer than the server takes.
-function openLogsTab(query, earliest, latest, back) {
+// empty query or one longer than the server takes. `note` is shown beside the
+// range for as long as it stands: that it runs to now, or is a fallback.
+function openLogsTab(query, earliest, latest, back, note) {
     const q = String(query ?? '').trim();
     if (!q) return false;
     if (Array.from(q).length > LOGS_QUERY_MAX) {
         showToast('error', 'Not opened in LOGS', `The search would be longer than the ${LOGS_QUERY_MAX} characters LOGS takes.`);
         return false;
     }
-    logsPending = { query: q, earliest: earliest === undefined ? null : String(earliest ?? ''), latest: String(latest ?? '') };
+    logsPending = { query: q, earliest: earliest === undefined ? null : String(earliest ?? ''), latest: String(latest ?? ''),
+        note: String(note ?? '') };
     logsBack = logsBackOf(back);
     logsLimit = LOGS_PAGE;
     switchTab('logs');
@@ -12331,6 +12333,7 @@ let logsSources = [];
 let logsQueryError = null;
 let logsColumnsKey = '';              // the columns of the table on screen
 let logsPending = null;                // a search another tab opened LOGS with ({query, earliest, latest}), not yet run
+let logsRangeNote = '';                // what LOGS says about a range a jump brought (it runs to now, it is a fallback)
 let logsBack = null;                   // the way back to the tab it came from ({tab, label, filter}), a chip over the search line
 
 // Searches whose bars a range drawn across them zooms to
@@ -12578,7 +12581,8 @@ function logsRangeHtml() {
         const text = Number.isFinite(from) || Number.isFinite(to) ? chartRangeLabel(from, to) : 'custom range';
         chip = filterChipHtml({ value: text, title: `Remove the range ${text}: back to ${logsBase.toUpperCase()}` }, `logsSetRange(${jsArg(logsBase)})`);
     }
-    return `<span class="chart-range" role="group" aria-label="Time range">${buttons}</span>${chip}`;
+    const note = logsRangeNote ? `<span class="logs-range-note" role="note">${escapeHtml(logsRangeNote)}</span>` : '';
+    return `<span class="chart-range" role="group" aria-label="Time range">${buttons}</span>${chip}${note}`;
 }
 
 function renderLogsRange() {
@@ -12589,6 +12593,7 @@ function renderLogsRange() {
 // One of the range buttons: the search runs again for it
 function logsSetRange(label) {
     if (!LOGS_RANGES.includes(label)) return false;
+    logsRangeNote = '';
     logsState.earliest = label === 'All' ? '' : `-${label}`;
     logsState.latest = '';
     logsBase = label;
@@ -12605,6 +12610,7 @@ function logsSetRange(label) {
 // A range drawn across the bars (epoch ms, `to` not included)
 function logsZoom(from, to) {
     if (!Number.isFinite(from) || !Number.isFinite(to) || !(to > from)) return false;
+    logsRangeNote = '';
     logsState.earliest = logsIso(from);
     logsState.latest = logsIso(to);
     renderLogsRange();
@@ -13162,6 +13168,7 @@ function logsTakePending() {
     if (p.earliest !== null) {
         logsState.earliest = p.earliest;
         logsState.latest = p.latest;
+        logsRangeNote = p.note || '';
     }
     logsSetQuery(p.query);
     logsClearResult();
@@ -13353,6 +13360,7 @@ let fwLastSig = '';
 let fwLastBands = '';
 let fwFilterTimer = null;
 let fwWant = null;                     // what openFirewallTab asked to select ({select, image, pid, ip, port, text}), until the connections are in
+let fwWantMissed = '';                 // what it asked for and is not among the connections, said where the selection would be
 let fwDecisions = new Map();           // decision id -> its toast: {item, phase open|deciding|due|done, arrived, dueAt, ...}
 let fwDecisionSeq = 0;                 // the order the decisions came in
 let fwDecisionOrder = '';              // the ids the stack shows, in order, and the count behind them
@@ -13502,6 +13510,7 @@ function fwSelection(other) {
 
 // A process, an endpoint or a point of the map is chosen: its rows unfold, the hints are about it
 function fwSelect(id) {
+    fwWantMissed = '';
     const next = String(id ?? '');
     fwSelected = next === WORLD_CHAMBER_ID ? '' : next;
     const sel = fwSelection();
@@ -13730,10 +13739,13 @@ function fwKillButton(proc) {
 }
 
 // The LOGS search for the selection: a process by its image, an endpoint by its address, both for one flow
+// A process and a connection are one run of the image, as their window is: with its PID when it is known
+// (Windows gives a PID to the next process, so the image alone would match every run)
 function fwLogsQuery(sel) {
     if (!sel) return '';
-    if (sel.kind === 'process') return `image=${logsQuote(sel.image)}`;
-    if (sel.kind === 'flow') return `image=${logsQuote(sel.image)} dst_ip=${logsQuote(sel.ip)}`;
+    const pid = Number.isInteger(Number(sel.pid)) && sel.pid !== null && sel.pid !== '' ? ` pid=${logsQuote(String(sel.pid))}` : '';
+    if (sel.kind === 'process') return `image=${logsQuote(sel.image)}${pid}`;
+    if (sel.kind === 'flow') return `image=${logsQuote(sel.image)}${pid} dst_ip=${logsQuote(sel.ip)}`;
     return `dst_ip=${logsQuote(sel.ip)}`;
 }
 
@@ -13742,21 +13754,34 @@ function fwOpenLogs() {
     const query = fwLogsQuery(sel);
     if (!query) return false;
     const range = fwLogsRange(sel.flows);
-    return openLogsTab(query, range.earliest, range.latest, fwBackTo(sel));
+    return openLogsTab(query, range.earliest, range.latest, fwBackTo(sel), range.note);
 }
 
-// The LOGS range of these connections: from the first to the last, FW_LOGS_PAD_MS either side; the tab's range
-// when a time of theirs cannot be read
+// The LOGS range of these connections: from the first to the last, FW_LOGS_PAD_MS either side, with `note`, what
+// LOGS says about it. A last packet less than the margin ago may be from a connection still running: the range
+// runs to now then (the VM's clock, as far as /pending told it), and grows with every search. A time that cannot
+// be read gives the tab's range, and the note says so.
 function fwLogsRange(flows) {
     let first = Infinity, last = -Infinity;
     for (const f of flows || []) {
         const from = Date.parse(f && f.first_seen), to = Date.parse(f && f.last_seen);
-        if (!Number.isFinite(from) || !Number.isFinite(to)) return { earliest: fwEarliest(), latest: '' };
+        if (!Number.isFinite(from) || !Number.isFinite(to)) return fwRangeFallback('A time of these connections could not be read');
         first = Math.min(first, from);
         last = Math.max(last, to);
     }
-    if (!(last >= first)) return { earliest: fwEarliest(), latest: '' };
-    return { earliest: fwIso(first - FW_LOGS_PAD_MS), latest: fwIso(last + FW_LOGS_PAD_MS) };
+    if (!(last >= first)) return fwRangeFallback('These connections have no times');
+    const end = last + FW_LOGS_PAD_MS;
+    if (end >= Date.now() + (fwPendingSkew || 0)) {
+        return { earliest: fwIso(first - FW_LOGS_PAD_MS), latest: '',
+            note: 'To now: the last packet is recent, so the connection may still be running and this search grows with it.' };
+    }
+    return { earliest: fwIso(first - FW_LOGS_PAD_MS), latest: fwIso(end), note: '' };
+}
+
+// The tab's range in place of one that could not be worked out, and why
+function fwRangeFallback(why) {
+    const range = fwRange === 'All' ? 'everything kept' : `the last ${fwRange}`;
+    return { earliest: fwEarliest(), latest: '', note: `${why}: the FIREWALL range (${range}) is used instead, which may hold more than they do.` };
 }
 
 function fwIso(ms) {
@@ -14087,7 +14112,8 @@ function renderFirewallHints(sel) {
         .map(({ hint, i }) => `<li><button type="button" class="fw-hint" data-fw-hint="${i}" title="Run this search in LOGS">`
             + `<span class="fw-hint-label">${escapeHtml(hint.label)}</span><code class="fw-hint-query">${escapeHtml(hint.query(sel || {}))}</code></button></li>`).join('');
     host.innerHTML = '<div class="chart-card-head"><h3 class="chart-card-title" data-info="Ready searches for the LOGS tab about the selected process or endpoint, and a few that are always worth a look. A click runs one there.">HUNT FURTHER</h3></div>'
-        + `<div class="fw-sel">${sel ? fwSelectionHtml(sel) : '<span class="fw-sel-none">Select a process, an endpoint or a point of the map for the searches about it.</span>'}</div>`
+        + `<div class="fw-sel">${sel ? fwSelectionHtml(sel) : fwWantMissed ? `<span class="fw-sel-none fw-sel-missed" role="status">${escapeHtml(fwWantMissed)}</span>`
+            : '<span class="fw-sel-none">Select a process, an endpoint or a point of the map for the searches about it.</span>'}</div>`
         + `<ul class="fw-hint-list">${items}</ul>`;
 }
 
@@ -14141,10 +14167,11 @@ function fwOpenHint(index) {
     const sel = fwSelection();
     if (hint.needs && !(sel && sel[hint.needs])) return false;
     // A hint about the endpoint or the process covers all of its connections, whichever was selected; the others the range
+    const image = String(sel && sel.image || '').toLowerCase();
     const flows = hint.needs === 'ip' ? fwState.flows.filter(f => f.dst_ip === sel.ip)
-        : hint.needs === 'image' ? fwState.flows.filter(f => f.image === sel.image) : null;
-    const range = flows ? fwLogsRange(flows) : { earliest: fwEarliest(), latest: '' };
-    return openLogsTab(hint.query(sel || {}), range.earliest, range.latest, sel ? fwBackTo(sel) : { tab: 'firewall', filter: { text: fwFilter } });
+        : hint.needs === 'image' ? fwState.flows.filter(f => String(f.image ?? '').toLowerCase() === image) : null;
+    const range = flows ? fwLogsRange(flows) : { earliest: fwEarliest(), latest: '', note: '' };
+    return openLogsTab(hint.query(sel || {}), range.earliest, range.latest, sel ? fwBackTo(sel) : { tab: 'firewall', filter: { text: fwFilter } }, range.note);
 }
 
 function fwCopy(text) {
@@ -14195,8 +14222,27 @@ function fwApplyWant(final) {
     const want = fwWant;
     if (!want) return false;
     if (final) fwWant = null;
-    fwSelect(fwWantedId(want, fwState.flows));
+    const id = fwWantedId(want, fwState.flows);
+    fwSelect(id);
+    if (!id && (want.select || want.image || want.ip)) {
+        fwWantMissed = fwMissedText(want);
+        renderFirewallHints(null);
+    }
     return true;
+}
+
+// What was asked for and is gone: by its parts, the select id's when the parts are missing
+function fwMissedText(want) {
+    let image = want.image, ip = want.ip, pid = want.pid;
+    const id = want.select || '';
+    if (!image && !ip) {
+        if (id.startsWith('a:')) ip = id.slice(2);
+        else if (id.startsWith('p:')) [image, pid] = [id.slice(2, id.lastIndexOf('|')), id.slice(id.lastIndexOf('|') + 1)];
+    }
+    const proc = image ? `${fwShort(fwBase(image), 60)}${pid !== null && pid !== undefined && pid !== '' ? ` (PID ${pid})` : ''}` : '';
+    const what = proc && ip ? `${proc} → ${fwShort(ip, 46)}` : proc || fwShort(ip, 46) || 'The selection';
+    const range = fwRange === 'All' ? 'among the connections kept' : `in the last ${fwRange}`;
+    return `${what} has no connections ${range} any more, so nothing is selected.${fwRange === 'All' ? '' : ' A wider range shows older ones.'}`;
 }
 
 // --- The head and the bands ---
@@ -15307,11 +15353,12 @@ function fwDecisionLogs(id) {
     if (!ip) return false;
     // From the download on: what came of it (the drop, a retry, a fetch) is after it
     const at = Date.parse((f.observed_at || entry.item.created_at) ?? '');
-    const earliest = Number.isFinite(at) ? fwIso(at - FW_LOGS_PAD_MS) : '-1h';
+    const range = Number.isFinite(at) ? { earliest: fwIso(at - FW_LOGS_PAD_MS), latest: '', note: '' }
+        : fwRangeFallback('The time of the download is not known');
     const back = { select: `a:${ip}`, ip, text: ip };
     if (image) back.image = image;
     if (f.dst_port !== null && f.dst_port !== undefined) back.port = f.dst_port;
-    return openLogsTab(fwLogsQuery(image ? { kind: 'flow', image, ip } : { kind: 'address', ip }), earliest, '', { tab: 'firewall', filter: back });
+    return openLogsTab(fwLogsQuery(image ? { kind: 'flow', image, ip } : { kind: 'address', ip }), range.earliest, range.latest, { tab: 'firewall', filter: back }, range.note);
 }
 
 // "+ n more" and DECISIONS ▸: the FIREWALL tab with its DECISIONS view

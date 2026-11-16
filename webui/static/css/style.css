@@ -10809,6 +10809,7 @@ body.maintenance-active #app {
 .logs-back-go { min-width: 0; border-color: var(--accent-cyan); }
 .logs-back-go .alerts-filter-chip-kind { color: var(--accent-cyan); }
 .logs-back-x { padding: 3px 7px; }
+.logs-range-note { font-size: 11px; color: var(--accent-yellow); }
 .logs-range { display: inline-flex; align-items: center; gap: 8px; }
 .logs-range .chart-range-btn { height: 22px; padding: 0 10px; font-size: 10px; }
 .logs-sources { display: flex; flex-wrap: wrap; gap: 6px; }

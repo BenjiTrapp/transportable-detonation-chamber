@@ -106,6 +106,9 @@ const timers = [];
 globalThis.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return timers.length; };
 globalThis.clearTimeout = id => { if (timers[id - 1]) timers[id - 1].fn = null; };
 const runTimers = () => timers.splice(0).forEach(t => t.fn && t.fn());
+// The tests' clock: days after every time of the fixtures (whose connections are then over), never the machine's
+const CLOCK = Date.parse('2026-11-20T00:00:00Z');
+Date.now = () => CLOCK;
 """ % (json.dumps(ELEMENT_IDS + OTHER_IDS), json.dumps(LOADER))
 
 
@@ -885,9 +888,10 @@ def test_in_logs_is_one_click_away_on_the_selected_row_point_and_hints():
     assert re.search(r'class="fw-map-pin[^"]*"[^>]*>.*data-fw-logs', r["map"])
     assert "data-fw-logs" in r["hints"] and "in LOGS ▸" in r["hints"]
     assert r["tree"].count("data-fw-logs") == 1 and r["proc"].count("data-fw-logs") == 1
-    assert r["calls"][0][:3] == ['image="%s" dst_ip="203.0.113.7"' % LOADER, "2026-11-16T09:55:00Z", "2026-11-16T10:10:00Z"]
+    # one run of the process: its PID with its image, as its window is that run's
+    assert r["calls"][0][:3] == ['image="%s" pid="4242" dst_ip="203.0.113.7"' % LOADER, "2026-11-16T09:55:00Z", "2026-11-16T10:10:00Z"]
     assert r["calls"][0][3]["tab"] == "firewall"
-    assert r["calls"][1][0] == 'image="%s"' % LOADER
+    assert r["calls"][1][0] == 'image="%s" pid="4242"' % LOADER
 
 
 @needs_node
@@ -1762,6 +1766,8 @@ def test_a_hint_click_quotes_the_value_safely():
         for q in queries:
             parsed = log_search.parse(q)           # the server's own parser: it takes every one of them
             for field, op, value in _cmp_terms(parsed.terms):
+                if field == "pid":
+                    assert (op, value) == ("=", "4242"), q
                 if field not in ("image", "dst_ip"):
                     continue
                 want = image if field == "image" else ip
@@ -1853,10 +1859,10 @@ def test_in_logs_carries_the_connection_lifetime_not_the_last_range():
         fwSelect('');
         fwFilter = 'loader';
         fwOpenHint(2);
-        console.log(JSON.stringify(calls2.map(c => [c[0], c[1], c[2], c[3]])));""")
+        console.log(JSON.stringify(calls2.map(c => [c[0], c[1], c[2], c[3], c[4]])));""")
     flow_, endpoint_hint, rhythm, dropped, dga, cradles, proc, broken, unselected = r
     # one connection: its first and last packet, five minutes either side (DNS before it, a drop after it)
-    assert flow_[1:3] == ["2026-11-16T09:55:00Z", "2026-11-16T10:10:00Z"]
+    assert flow_[1:3] == ["2026-11-16T09:55:00Z", "2026-11-16T10:10:00Z"] and flow_[4] == ""
     assert flow_[3]["tab"] == "firewall" and flow_[3]["filter"]["select"].startswith("f:")
     # the process: all of its connections
     assert proc[1:3] == ["2026-11-16T07:55:00Z", "2026-11-16T12:35:00Z"]
@@ -1871,6 +1877,8 @@ def test_in_logs_carries_the_connection_lifetime_not_the_last_range():
                                                         "image": LOADER, "ip": "203.0.113.7", "pid": 4242, "port": 443}}
     # a time that cannot be read falls back to the tab's range, never to no range at all
     assert broken[1:3] == ["-24h", ""]
+    # ... and says so beside the range in LOGS
+    assert "could not be read" in broken[4] and "FIREWALL range (the last 24h)" in broken[4]
     # without a selection the way back is the tab with the tree's filter as it was
     assert unselected[1:3] == ["-24h", ""] and unselected[3] == {"tab": "firewall", "filter": {"text": "loader"}}
 
@@ -1886,6 +1894,8 @@ def test_the_toast_takes_the_time_of_the_download_to_logs():
         for (const item of [seen, bare, none]) { showDecisionToast(item); fwDecisionLogs(item.id); }
         console.log(JSON.stringify(calls2));""")
     assert [c[1:3] for c in r] == [["2026-11-16T09:53:10Z", ""], ["2026-11-16T09:55:00Z", ""], ["-1h", ""]]
+    # no time of the download: the FIREWALL range, as every other fallback, and said so
+    assert r[0][4] == "" and "not known" in r[2][4] and "FIREWALL range (the last 1h)" in r[2][4]
     assert r[0][3]["filter"]["ip"] == "203.0.113.7" and r[0][3]["filter"]["image"] == LOADER
 
 
@@ -1902,10 +1912,100 @@ def test_graph_network_nodes_and_tracing_lead_to_the_firewall_tab():
         console.log(JSON.stringify({ button, calls: calls2, none }));""")
     assert ">FIREWALL<" in r["button"] and "<script>" not in r["button"] and "data-fw-endpoint-ip" in r["button"]
     assert r["calls"] == [{"image": "C:\\x\\loader.exe", "pid": 4242}] and r["none"] is False
-    graph = _function_source("showGraphDetail")
-    assert "graphFirewallButtonHtml(node)" in graph and "openFirewallTab(" in graph
     html = _read(INDEX_HTML)
     bar = html[html.index('id="rtrace-info-bar"'):]
     bar = bar[:bar.index("</div>")]
     assert re.search(r'<button[^>]*id="rtrace-firewall"[^>]*onclick="rtraceOpenFirewall\(\)"[^>]*>FIREWALL</button>', bar)
     assert "rtrace-firewall" in _function_source("updateRtraceInfoBar")
+
+
+@needs_node
+def test_graph_draws_the_button_on_a_network_node_and_its_click_opens_the_endpoint():
+    r = _run_node(["escapeHtml", "graphFirewallButtonHtml", "showGraphDetail"], r"""
+        const calls2 = [];
+        globalThis.openFirewallTab = f => { calls2.push(f); return true; };
+        globalThis.graphState = { nodes: [], edges: [] };
+        const unescape = t => t.replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+        // A body that finds a button in its markup as a browser would: by its data attributes, with their values decoded
+        const body = { innerHTML: '', listeners: [],
+            querySelector(sel) {
+                const want = /\[(data-[\w-]+)\]$/.exec(sel);
+                const tag = want && (this.innerHTML.match(/<button[^>]*>/g) || []).find(t => t.includes(` ${want[1]}="`));
+                if (!tag) return null;
+                const dataset = {};
+                for (const m of tag.matchAll(/ data-([\w-]+)="([^"]*)"/g)) dataset[m[1].replace(/-(\w)/g, (x, c) => c.toUpperCase())] = unescape(m[2]);
+                return { dataset, addEventListener: (type, fn) => body.listeners.push([type, fn]) };
+            },
+            querySelectorAll: () => [] };
+        const panel = { classList: { add() {} } }, header = { textContent: '' };
+        globalThis.document = { getElementById: id => ({ 'graph-detail-panel': panel, 'graph-detail-header': header, 'graph-detail-body': body })[id] || null };
+        showGraphDetail({ id: 'net_x', type: 'network', ip: '1.2.3.4"><script>', port: 443, protocol: 'tcp' });
+        const html = body.innerHTML;
+        body.listeners.filter(l => l[0] === 'click').forEach(l => l[1]());
+        const dns = (body.innerHTML = '', body.listeners = [], showGraphDetail({ id: 'dns_x', type: 'dns', label: 'x.example' }), body.innerHTML);
+        console.log(JSON.stringify({ html, calls: calls2, dns }));""")
+    assert ">FIREWALL<" in r["html"] and "<script>" not in r["html"]
+    assert r["calls"] == [{"ip": '1.2.3.4"><script>', "port": "443"}]
+    assert "FIREWALL" not in r["dns"]
+
+
+@needs_node
+def test_a_connection_that_may_still_run_searches_to_now():
+    r = _run(r"""
+        const calls2 = [];
+        globalThis.openLogsTab = (...args) => { calls2.push(args); return true; };
+        fwState.loaded = true;
+        fwState.rules = [];
+        const live = flow();
+        // the last packet two minutes before the tests' clock, on the VM's clock (an hour ahead of this computer's)
+        fwPendingSkew = 3600000;
+        live.first_seen = '2026-11-20T00:30:00Z'; live.last_seen = '2026-11-20T00:58:00Z';
+        fwState.flows = [live];
+        fwSelect('f:' + fwFlowKey(live));
+        fwOpenLogs();
+        // the same packet without the skew lies in this computer's future: still to now
+        fwPendingSkew = null;
+        fwOpenLogs();
+        // over for longer than the margin: a closed window
+        live.last_seen = '2026-11-19T23:50:00Z'; live.first_seen = '2026-11-19T23:40:00Z';
+        fwOpenLogs();
+        console.log(JSON.stringify(calls2.map(c => [c[1], c[2], c[4]])));""")
+    assert r[0][:2] == ["2026-11-20T00:25:00Z", ""] and "To now" in r[0][2] and "still be running" in r[0][2]
+    assert r[1][:2] == ["2026-11-20T00:25:00Z", ""]
+    assert r[2] == ["2026-11-19T23:35:00Z", "2026-11-19T23:55:00Z", ""]
+
+
+@needs_node
+def test_the_rhythm_hint_takes_every_run_of_the_image_whatever_its_case():
+    r = _run(r"""
+        const calls2 = [];
+        globalThis.openLogsTab = (...args) => { calls2.push(args); return true; };
+        fwState.loaded = true;
+        fwState.rules = [];
+        const a = flow(), b = flow({ pid: 77, image: %s.toUpperCase() });
+        b.first_seen = '2026-11-16T06:00:00Z';
+        fwState.flows = [a, b];
+        fwSelect('p:' + fwProcKey(a));
+        fwOpenHint(1);
+        console.log(JSON.stringify(calls2[0].slice(1, 3)));""" % json.dumps(LOADER))
+    assert r == ["2026-11-16T05:55:00Z", "2026-11-16T10:10:00Z"]
+
+
+@needs_node
+def test_the_way_back_to_a_selection_that_is_gone_says_so():
+    s = open_firewall_tab({"select": "p:%s|4242" % LOADER, "image": LOADER, "pid": 4242, "text": ""},
+                          load=[{"image": "C:\\x\\other.exe"}])
+    assert s["selected"] == "" and s["filter"] == ""
+    assert "loader.exe (PID 4242) has no connections in the last 1h any more" in s["hints"] and "wider range" in s["hints"]
+    gone = open_firewall_tab({"select": "a:198.51.100.9", "text": ""}, load=[{}])
+    assert "198.51.100.9 has no connections" in gone["hints"]
+    hostile = open_firewall_tab({"image": "C:\\" + HOSTILE + ".exe", "ip": HOSTILE, "text": ""}, load=[{}])
+    assert "<script>" not in hostile["hints"] and "&lt;script&gt;" in hostile["hints"]
+    # a selection of the analyst's own takes the message away
+    r = _run(r"""
+        fwState.loaded = true; fwState.rules = []; fwState.flows = [flow()];
+        openFirewallTab({ ip: '198.51.100.9', text: '' });
+        const before = els['firewall-hints'].innerHTML;
+        fwSelect('a:203.0.113.7');
+        console.log(JSON.stringify([before.includes('has no connections'), els['firewall-hints'].innerHTML.includes('has no connections')]));""")
+    assert r == [True, False]
