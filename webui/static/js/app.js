@@ -1856,6 +1856,29 @@ function openAlertsTab(filter) {
     if (tab) tab.scrollTop = 0;
 }
 
+// Opens the LOGS tab on this search over this range (earliest and latest as
+// the server takes them: -1h or ISO; earliest left out keeps the tab's range),
+// from the first page, and searches. `back` is the way back the tab shows as a
+// chip (logsBackOf), none clears an old one. The search goes to logsPending,
+// which the tab takes when it is shown: on its first opening initLogs takes it
+// instead of the last search, so that one never runs. The values in `query`
+// are the caller's to quote (logsQuote). False, and nothing changes, for an
+// empty query or one longer than the server takes.
+function openLogsTab(query, earliest, latest, back) {
+    const q = String(query ?? '').trim();
+    if (!q) return false;
+    if (Array.from(q).length > LOGS_QUERY_MAX) {
+        showToast('error', 'Not opened in LOGS', `The search would be longer than the ${LOGS_QUERY_MAX} characters LOGS takes.`);
+        return false;
+    }
+    logsPending = { query: q, earliest: earliest === undefined ? null : String(earliest ?? ''), latest: String(latest ?? '') };
+    logsBack = logsBackOf(back);
+    logsLimit = LOGS_PAGE;
+    switchTab('logs');
+    if (logsReady && logsPending) logsTakePending();
+    return true;
+}
+
 // --- The drilldown: the steps that narrowed the tab ---
 // A click on a chart that changes the filters, a range drawn across OVER
 // TIME and a jump from the dashboard that sets a filter are steps:
@@ -4016,9 +4039,18 @@ function updateRtraceInfoBar() {
     document.getElementById('rtrace-stat-events').textContent = `${alertCount} events`;
     document.getElementById('rtrace-stat-duration').textContent = duration || '0m 0s';
     document.getElementById('rtrace-path').textContent = proc.image || proc.command_line || '--';
+    const fwButton = document.getElementById('rtrace-firewall');
+    if (fwButton) fwButton.disabled = !proc.image;
 
     // Update severity bar
     updateRtraceSeverityBar(proc);
+}
+
+// FIREWALL in the info bar: the process's connections in the FIREWALL tab
+function rtraceOpenFirewall() {
+    const proc = state.processes[state.rtraceSelectedPid] || state.processes[String(state.rtraceSelectedPid)];
+    if (!proc || !proc.image) return false;
+    return openFirewallTab({ image: proc.image, pid: proc.pid ?? null });
 }
 
 function updateRtraceSeverityBar(proc) {
@@ -11149,6 +11181,13 @@ function graphActivityMixHtml(node) {
         + '<span class="gd-mix-threats-note">&middot; alerts, not part of the ring</span></div></div>';
 }
 
+// FIREWALL on a network node: the endpoint in the FIREWALL tab, who talks to it and the switch that cuts it
+function graphFirewallButtonHtml(node) {
+    return '<div class="gd-actions"><button type="button" class="gd-focus-btn" '
+        + `data-fw-endpoint-ip="${escapeHtml(String(node.ip ?? ''))}" data-fw-endpoint-port="${escapeHtml(String(node.port ?? ''))}" `
+        + 'title="Show this endpoint in the FIREWALL tab: the processes that talk to it, its tags and the switch that cuts it">FIREWALL</button></div>';
+}
+
 function showGraphDetail(node) {
     const panel = document.getElementById('graph-detail-panel');
     const header = document.getElementById('graph-detail-header');
@@ -11267,6 +11306,7 @@ function showGraphDetail(node) {
                 if (src) html += `<div class="gd-conn-item"><span class="gd-conn-icon proc"></span><a class="gd-link" data-node-id="${escapeHtml(src.id)}">${escapeHtml(src.label)} (${escapeHtml(String(src.pid ?? ''))})</a></div>`;
             });
         }
+        html += graphFirewallButtonHtml(node);
     } else if (node.type === 'dns') {
         headerText = `DNS: ${node.label}`;
         html += `<div class="gd-field"><span class="gd-label">Query</span><span class="gd-value">${escapeHtml(node.label)}</span></div>`;
@@ -11307,6 +11347,9 @@ function showGraphDetail(node) {
 
     const pipeBtn = body.querySelector('.gd-focus-btn[data-pipe-name]');
     if (pipeBtn) pipeBtn.addEventListener('click', () => pipesInterceptFrom(pipeBtn.dataset.pipeName));
+
+    const fwBtn = body.querySelector('.gd-focus-btn[data-fw-endpoint-ip]');
+    if (fwBtn) fwBtn.addEventListener('click', () => openFirewallTab({ ip: fwBtn.dataset.fwEndpointIp, port: fwBtn.dataset.fwEndpointPort || null }));
 
     // Re-root the drilldown on the selected process
     const focusBtn = body.querySelector('.gd-focus-btn[data-focus-pid]');
@@ -12251,6 +12294,8 @@ const LOGS_PAGE = 200;
 // characters of a whole event (fetched after a search cut it) shown raw
 const LOGS_RAW_FULL_LIMIT = 1000000;
 const LOGS_PAGE_MAX = 1000;
+// The longest query the server takes (MAX_QUERY_LEN of log_search.py), in characters as Python counts them
+const LOGS_QUERY_MAX = 4000;
 const LOGS_EXAMPLES = [
     { label: 'PowerShell script blocks', query: 'source=powershell' },
     { label: 'MCP calls per tool', query: 'source=mcp | stats count by tool' },
@@ -12285,6 +12330,8 @@ let logsFieldsOpen = new Set(['source']);
 let logsSources = [];
 let logsQueryError = null;
 let logsColumnsKey = '';              // the columns of the table on screen
+let logsPending = null;                // a search another tab opened LOGS with ({query, earliest, latest}), not yet run
+let logsBack = null;                   // the way back to the tab it came from ({tab, label, filter}), a chip over the search line
 
 // Searches whose bars a range drawn across them zooms to
 const LOGS_BARS_BRUSH = {
@@ -13083,20 +13130,98 @@ function initLogs() {
     logsBase = range;
     logsState.earliest = range === 'All' ? '' : `-${range}`;
     logsState.latest = '';
+    refreshLogsSources();
+    renderLogsBack();
+    if (logsTakePending()) return;
     logsSetQuery(logsLastQuery());
     renderLogsRange();
-    refreshLogsSources();
     runLogsSearch({ silent: true });
 }
 
-// The tab is opened: the first time it is set up, later it searches again
+// The tab is opened: the first time it is set up, later it searches again (or runs the search a jump brought)
 function logsTabShown() {
     if (!logsReady) {
         initLogs();
         return;
     }
     refreshLogsSources();
+    renderLogsBack();
+    if (logsTakePending()) return;
     runLogsSearch({ silent: true });
+}
+
+// --- A jump in from another tab (openLogsTab) and the way back ---
+// The search a jump brought, run as one of the analyst's own (it goes to the
+// recent ones) over its own range; the result of the search before it is
+// gone at once, so a query the server refuses shows its error over nothing
+// rather than over the old events. False when no jump is waiting.
+function logsTakePending() {
+    const p = logsPending;
+    if (!p) return false;
+    logsPending = null;
+    if (p.earliest !== null) {
+        logsState.earliest = p.earliest;
+        logsState.latest = p.latest;
+    }
+    logsSetQuery(p.query);
+    logsClearResult();
+    renderLogsRange();
+    renderLogsBack();
+    runLogsSearch();
+    return true;
+}
+
+function logsClearResult() {
+    logsState.result = null;
+    logsState.openIds = new Set();
+    logsLastSig = '';
+    logsDrawn = null;
+    for (const id of ['logs-summary', 'logs-results', 'logs-histogram', 'logs-legend', 'logs-field-list', 'logs-fields-count']) {
+        const host = document.getElementById(id);
+        if (host) host.innerHTML = '';
+    }
+}
+
+// The way back as the caller of openLogsTab gives it: 'firewall', or {tab: 'firewall', filter} with the filter
+// openFirewallTab takes ({select, image, pid, ip, port, text}); null for none or a tab there is no way back to
+function logsBackOf(back) {
+    const b = typeof back === 'string' ? { tab: back } : back;
+    if (!b || typeof b !== 'object' || b.tab !== 'firewall') return null;
+    const filter = b.filter && typeof b.filter === 'object' ? b.filter : {};
+    const image = String(filter.image ?? '').split(/[\\/]/).pop();
+    const ip = String(filter.ip ?? '');
+    const label = image && ip ? `${image} → ${ip}` : image || ip;
+    return { tab: 'firewall', label: label.length > 80 ? `${label.slice(0, 79)}…` : label, filter };
+}
+
+// ← FIREWALL over the search line: back to the tab with what was selected there; × takes the chip away
+function logsBackChipHtml() {
+    if (!logsBack) return '';
+    const what = logsBack.label ? ` with ${logsBack.label} selected` : '';
+    return '<span class="logs-back" role="group" aria-label="The way back">'
+        + `<button type="button" class="alerts-filter-chip logs-back-go" data-logs-back title="${escapeHtml(`Back to the FIREWALL tab${what}`)}" onclick="logsGoBack()">`
+        + '<span class="alerts-filter-chip-kind">← FIREWALL</span>'
+        + (logsBack.label ? ` <span class="alerts-filter-chip-value">${escapeHtml(logsBack.label)}</span>` : '') + '</button>'
+        + '<button type="button" class="alerts-filter-chip logs-back-x" data-logs-back-x title="Remove the way back" aria-label="Remove the way back" onclick="logsDropBack()">'
+        + '<span class="alerts-filter-chip-x" aria-hidden="true">&times;</span></button></span>';
+}
+
+function renderLogsBack() {
+    const host = document.getElementById('logs-back');
+    if (!host) return;
+    host.innerHTML = logsBackChipHtml();
+    host.hidden = !logsBack;
+}
+
+function logsGoBack() {
+    if (!logsBack) return false;
+    return openFirewallTab(logsBack.filter);
+}
+
+function logsDropBack() {
+    logsBack = null;
+    renderLogsBack();
+    document.getElementById('logs-query')?.focus?.();
 }
 
 // =============================================
@@ -13182,6 +13307,9 @@ const FW_HINTS = [
     { label: 'Download cradles in clear text', needs: '', query: () => 'source=powershell "http" | head 50' },
 ];
 const FW_DECIDED = { allow: 'ALLOWED', block: 'BLOCKED', block_fetch: 'BLOCKED + FETCHED' };
+// A search in LOGS about connections covers their lifetime and this much either side: the DNS answer before the
+// first one, a firewall drop or a script block just after the last
+const FW_LOGS_PAD_MS = 5 * 60000;
 // The decision toasts: /pending is asked every FW_PENDING_MS on every tab (not while the browser tab is hidden),
 // at most FW_TOASTS_VISIBLE toasts stand, the rest is a "+ n more". The countdown is redrawn every FW_CLOCK_MS.
 // A result stays FW_RECEIPT_MS once nothing more is to come, and waits for a fetch at most FW_FETCH_WAIT_MS.
@@ -13224,6 +13352,7 @@ let fwWorldAsked = false;
 let fwLastSig = '';
 let fwLastBands = '';
 let fwFilterTimer = null;
+let fwWant = null;                     // what openFirewallTab asked to select ({select, image, pid, ip, port, text}), until the connections are in
 let fwDecisions = new Map();           // decision id -> its toast: {item, phase open|deciding|due|done, arrived, dueAt, ...}
 let fwDecisionSeq = 0;                 // the order the decisions came in
 let fwDecisionOrder = '';              // the ids the stack shows, in order, and the count behind them
@@ -13356,9 +13485,9 @@ function fwVisible(flows) {
         .some(v => v !== null && v !== undefined && String(v).toLowerCase().includes(needle)));
 }
 
-// What fwSelected stands for: {id, kind, image, pid, ip, flows}, or null
-function fwSelection() {
-    const id = fwSelected;
+// What fwSelected (or another id) stands for: {id, kind, image, pid, ip, flows}, or null
+function fwSelection(other) {
+    const id = other === undefined ? fwSelected : String(other);
     const flows = fwState.flows || [];
     let list = [];
     if (id.startsWith('p:')) list = flows.filter(f => fwProcKey(f) === id.slice(2));
@@ -13609,8 +13738,40 @@ function fwLogsQuery(sel) {
 }
 
 function fwOpenLogs() {
-    const query = fwLogsQuery(fwSelection());
-    return query ? openLogsTab(query, fwEarliest(), '', { tab: 'firewall', select: fwSelected }) : false;
+    const sel = fwSelection();
+    const query = fwLogsQuery(sel);
+    if (!query) return false;
+    const range = fwLogsRange(sel.flows);
+    return openLogsTab(query, range.earliest, range.latest, fwBackTo(sel));
+}
+
+// The LOGS range of these connections: from the first to the last, FW_LOGS_PAD_MS either side; the tab's range
+// when a time of theirs cannot be read
+function fwLogsRange(flows) {
+    let first = Infinity, last = -Infinity;
+    for (const f of flows || []) {
+        const from = Date.parse(f && f.first_seen), to = Date.parse(f && f.last_seen);
+        if (!Number.isFinite(from) || !Number.isFinite(to)) return { earliest: fwEarliest(), latest: '' };
+        first = Math.min(first, from);
+        last = Math.max(last, to);
+    }
+    if (!(last >= first)) return { earliest: fwEarliest(), latest: '' };
+    return { earliest: fwIso(first - FW_LOGS_PAD_MS), latest: fwIso(last + FW_LOGS_PAD_MS) };
+}
+
+function fwIso(ms) {
+    return new Date(ms).toISOString().replace(/\.\d+Z$/, 'Z');
+}
+
+// The way back from LOGS to this selection: its id, its parts should the id not come back (a process that
+// restarted), and the tree's filter as it is now
+function fwBackTo(sel) {
+    const filter = { select: sel.id, text: fwFilter };
+    if (sel.image) filter.image = sel.image;
+    if (sel.ip) filter.ip = sel.ip;
+    if (sel.kind !== 'address' && sel.pid !== null && sel.pid !== undefined) filter.pid = sel.pid;
+    if (sel.kind === 'flow') filter.port = sel.flows[0].dst_port;
+    return { tab: 'firewall', filter };
 }
 
 async function fwKill(proc) {
@@ -13671,7 +13832,11 @@ function fwGroupHtml(group) {
 function fwEmptyText(flows) {
     if (fwState.error && !fwState.flows.length) return `The connections could not be loaded: ${fwShort(fwState.error, 300)}`;
     if (!fwState.loaded) return 'Loading connections…';
-    if ((flows || []).length) return 'Nothing matches the filter.';
+    if ((flows || []).length) {
+        const what = `“${fwShort(fwFilter.trim(), 120)}”`;
+        return fwRange === 'All' ? `No connection kept matches ${what}. Clear the filter for all of them.`
+            : `No connection in the last ${fwRange} matches ${what}. A wider range shows older connections; clear the filter for all of them.`;
+    }
     return 'No connections in this range. Sysmon network events appear here as they come in; a wider range shows older ones.';
 }
 
@@ -13975,7 +14140,11 @@ function fwOpenHint(index) {
     if (!hint) return false;
     const sel = fwSelection();
     if (hint.needs && !(sel && sel[hint.needs])) return false;
-    return openLogsTab(hint.query(sel || {}), fwEarliest(), '', { tab: 'firewall', select: fwSelected });
+    // A hint about the endpoint or the process covers all of its connections, whichever was selected; the others the range
+    const flows = hint.needs === 'ip' ? fwState.flows.filter(f => f.dst_ip === sel.ip)
+        : hint.needs === 'image' ? fwState.flows.filter(f => f.image === sel.image) : null;
+    const range = flows ? fwLogsRange(flows) : { earliest: fwEarliest(), latest: '' };
+    return openLogsTab(hint.query(sel || {}), range.earliest, range.latest, sel ? fwBackTo(sel) : { tab: 'firewall', filter: { text: fwFilter } });
 }
 
 function fwCopy(text) {
@@ -13985,14 +14154,49 @@ function fwCopy(text) {
     return true;
 }
 
-// The perspective switches between this tab and LOGS (and into this tab from GRAPH and TRACING) come with
-// the back chip of LOGS; until then these placeholders take the calls
-function openLogsTab(query, earliest, latest, back) {
-    return false;
+// The perspective switch into this tab (from the way back in LOGS, from GRAPH's network nodes, from TRACING;
+// openLogsTab, beside openAlertsTab, is the one out of it): the tab opens with the tree filtered and the endpoint
+// or the process selected. filter: {ip, port, image, pid}, and from LOGS' way back also `select`, the id that was
+// selected, and `text`, the tree's filter then. The selection is found again once the connections are in: on
+// the first opening there are none yet, and those on screen may be old.
+function openFirewallTab(filter) {
+    const f = filter && typeof filter === 'object' ? filter : {};
+    const want = { select: typeof f.select === 'string' ? f.select : '', image: String(f.image ?? ''), ip: String(f.ip ?? ''),
+        pid: f.pid ?? null, port: f.port ?? null };
+    want.text = typeof f.text === 'string' ? f.text : want.ip || want.image;
+    fwWant = want;
+    fwFilter = want.text;
+    const search = document.getElementById('firewall-search');
+    if (search) search.value = fwFilter;
+    if (fwState.loaded) fwApplyWant(false);
+    switchTab('firewall');
+    return true;
 }
 
-function openFirewallTab(filter) {
-    return false;
+// What fwWant stands for among the connections: the exact id when it is still there, else an endpoint by its
+// address, a process by its image (the newest run, should its PID be gone), one connection by both; '' for none
+function fwWantedId(want, flows) {
+    const list = flows || [];
+    if (want.select && fwSelection(want.select)) return want.select;
+    const image = want.image.toLowerCase(), port = want.port === null || want.port === '' ? null : String(want.port);
+    const pid = want.pid === null || want.pid === '' ? null : String(want.pid);
+    const match = (usePid, usePort) => list.filter(f => (!image || String(f.image ?? '').toLowerCase() === image)
+        && (!want.ip || f.dst_ip === want.ip) && (!usePid || pid === null || String(f.pid) === pid)
+        && (!usePort || port === null || String(f.dst_port) === port));
+    if (!image) return want.ip && match(false, false).length ? `a:${want.ip}` : '';
+    const found = [match(true, true), match(false, true), match(false, false)].find(m => m.length) || [];
+    if (!found.length) return '';
+    const newest = found.reduce((a, b) => (String(b.last_seen ?? '') > String(a.last_seen ?? '') ? b : a));
+    return want.ip ? `f:${fwFlowKey(newest)}` : `p:${fwProcKey(newest)}`;
+}
+
+// Selects what openFirewallTab asked for, with the connections on screen; `final` once they are the new ones
+function fwApplyWant(final) {
+    const want = fwWant;
+    if (!want) return false;
+    if (final) fwWant = null;
+    fwSelect(fwWantedId(want, fwState.flows));
+    return true;
 }
 
 // --- The head and the bands ---
@@ -14196,6 +14400,7 @@ async function fwLoadFlows() {
         fwApplyPending(pending.data, sent);
     }
     fwRender();
+    if (conn.ok) fwApplyWant(true);
     return true;
 }
 
@@ -14422,6 +14627,7 @@ function fwFlowByKey(key, scope) {
 function onFirewallClick(event) {
     const target = event && event.target && typeof event.target.closest === 'function' ? event.target : null;
     if (!target) return;
+    fwWant = null;
     const hit = selector => {
         const el = target.closest(selector);
         return el && !el.disabled ? el : null;
@@ -14478,6 +14684,7 @@ function onFirewallKeydown(event) {
 // The filter, applied once the typing pauses: the tree and the view hold up to 5000 flows
 function fwFilterSoon(text) {
     if (fwFilterTimer) clearTimeout(fwFilterTimer);
+    fwWant = null;
     fwFilterTimer = setTimeout(() => {
         fwFilterTimer = null;
         fwFilter = String(text ?? '');
@@ -15098,7 +15305,13 @@ function fwDecisionLogs(id) {
     const f = (entry && entry.item && entry.item.finding) || {};
     const ip = String(f.dst_ip ?? ''), image = String(f.image ?? '');
     if (!ip) return false;
-    return openLogsTab(fwLogsQuery(image ? { kind: 'flow', image, ip } : { kind: 'address', ip }), '-1h', '', { tab: 'firewall', select: `a:${ip}` });
+    // From the download on: what came of it (the drop, a retry, a fetch) is after it
+    const at = Date.parse((f.observed_at || entry.item.created_at) ?? '');
+    const earliest = Number.isFinite(at) ? fwIso(at - FW_LOGS_PAD_MS) : '-1h';
+    const back = { select: `a:${ip}`, ip, text: ip };
+    if (image) back.image = image;
+    if (f.dst_port !== null && f.dst_port !== undefined) back.port = f.dst_port;
+    return openLogsTab(fwLogsQuery(image ? { kind: 'flow', image, ip } : { kind: 'address', ip }), earliest, '', { tab: 'firewall', filter: back });
 }
 
 // "+ n more" and DECISIONS ▸: the FIREWALL tab with its DECISIONS view

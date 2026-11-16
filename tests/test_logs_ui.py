@@ -18,6 +18,10 @@ Regressions covered:
   * LIVE searching in a hidden tab or a hidden browser tab
   * the tab button out of its place after Sysmon and FIREWALL, a tab without its (i), a help guide without
     the entry
+  * a jump from another tab (openLogsTab) overwritten by the last search on the first open of the session,
+    searching over the tab's last range instead of the one it brought, leaving the old result under a new
+    query, or sending a query longer than the server takes; the way back missing, not removable or not
+    escaped
 """
 
 import json
@@ -32,15 +36,15 @@ LOGS_FUNCTION_NAME = re.compile(
 LOGS_FUNCTIONS = list(dict.fromkeys(LOGS_FUNCTION_NAME.findall(SOURCE)))
 LOGS_CONSTS = ["LOGS_RANGES", "LOGS_DEFAULT_RANGE", "LOGS_RECENT_KEY", "LOGS_RANGE_KEY", "LOGS_LAST_KEY", "LOGS_RECENT_MAX",
                "LOGS_LIVE_MS", "LOGS_PAGE", "LOGS_RAW_FULL_LIMIT", "LOGS_PAGE_MAX", "LOGS_EXAMPLES", "LOGS_SOURCE_COLORS", "LOGS_SYNTAX_HINT",
-               "LOGS_TOKEN", "LOGS_BARS_BRUSH"]
+               "LOGS_TOKEN", "LOGS_BARS_BRUSH", "LOGS_QUERY_MAX"]
 LOGS_LETS = re.findall(r"^let logs\w+ = [^\n]*?;(?=[ \t]*(?://[^\n]*)?$)", SOURCE, re.M)
 OTHER_FUNCTIONS = CHART_FUNCTIONS + ["escapeHtml", "jsArg", "cssToken", "formatAlertTime", "filterChipHtml",
-                                     "chartRangeLabel"]
+                                     "chartRangeLabel", "openLogsTab"]
 ALL_FUNCTIONS = list(dict.fromkeys(LOGS_FUNCTIONS + OTHER_FUNCTIONS))
 
 ELEMENT_IDS = ["logs-query", "logs-hl", "logs-results", "logs-summary", "logs-histogram", "logs-legend",
                "logs-field-list", "logs-fields-count", "logs-sources", "logs-error", "logs-range", "logs-live",
-               "logs-menu", "logs-menu-btn", "logs-syntax"]
+               "logs-menu", "logs-menu-btn", "logs-syntax", "logs-back"]
 
 PRELUDE = "\n".join(_const_source(name) for name in CHART_CONSTS + LOGS_CONSTS) + "\n" + "\n".join(LOGS_LETS) + r"""
 const classes = () => {
@@ -78,6 +82,12 @@ globalThis.fetch = async url => {
 };
 const query = url => new URL('http://x' + url).searchParams;
 const searches = () => calls.filter(u => u.startsWith('/api/logs/search'));
+const toasts = [], jumps = [];
+globalThis.showToast = (type, title, detail) => toasts.push({ type, title, detail });
+// as switchTab does it: the tab is active, then LOGS is told it is shown
+globalThis.switchTab = name => { jumps.push(['tab', name]); state.activeTab = name; if (name === 'logs') logsTabShown(); };
+globalThis.openFirewallTab = filter => { jumps.push(['firewall', filter]); return true; };
+const settle = () => new Promise(r => setTimeout(r, 0));
 """ % json.dumps(ELEMENT_IDS)
 
 
@@ -712,3 +722,139 @@ def test_a_cut_event_loads_in_full_when_it_is_unfolded_and_stays_escaped():
     assert "&lt;b&gt;whole payload&lt;/b&gt;" in r["loaded"] and "cut payload" not in r["loaded"]
     assert "more characters are not shown" not in r["loaded"], "the whole event is shown after the load"
     assert "no longer in the store" in r["missing"]
+
+
+# --- The perspective switch: a jump in from another tab, and the way back ---------
+
+@needs_node
+def test_open_logs_tab_sets_query_and_window():
+    r = _run(r"""
+        state.activeTab = 'firewall';
+        initLogs();
+        await settle();
+        logsLimit = 600;
+        calls.length = 0;
+        const ok = openLogsTab('dst_ip="1.2.3.4"', '2026-11-16T14:02:00Z', '2026-11-16T14:19:00Z');
+        await settle();
+        console.log(JSON.stringify({ ok, activeTab: state.activeTab, query: logsState.query, input: els['logs-query'].value,
+            earliest: logsState.earliest, latest: logsState.latest, sent: searches().map(u => Object.fromEntries(query(u))),
+            range: els['logs-range'].innerHTML, recent: logsRecent(), last: store[LOGS_LAST_KEY] }));""")
+    assert r["ok"] is True and r["activeTab"] == "logs"
+    assert r["query"] == r["input"] == 'dst_ip="1.2.3.4"'
+    assert (r["earliest"], r["latest"]) == ("2026-11-16T14:02:00Z", "2026-11-16T14:19:00Z")
+    # one search, of the jump, from the first page; nothing of the tab's own search on showing it
+    assert r["sent"] == [{"q": 'dst_ip="1.2.3.4"', "earliest": "2026-11-16T14:02:00Z", "latest": "2026-11-16T14:19:00Z",
+                          "limit": "200"}]
+    # the range is a chip that can be taken off, no range button is pressed
+    assert 'aria-pressed="true"' not in r["range"] and "alerts-filter-chip" in r["range"]
+    # a jump is a search of the analyst's: it is in the recent ones and comes back next time
+    assert r["recent"][0] == 'dst_ip="1.2.3.4"' and r["last"] == 'dst_ip="1.2.3.4"'
+
+
+@needs_node
+def test_the_first_open_is_not_overwritten_by_the_last_search():
+    r = _run(r"""
+        store[LOGS_LAST_KEY] = 'source=mcp | stats count by tool';
+        store[LOGS_RANGE_KEY] = '7d';
+        state.activeTab = 'firewall';
+        const before = logsReady;
+        const ok = openLogsTab('dst_ip="1.2.3.4"', '-1h', '');
+        await settle();
+        console.log(JSON.stringify({ before, ok, ready: logsReady, query: logsState.query, input: els['logs-query'].value,
+            earliest: logsState.earliest, latest: logsState.latest, base: logsBase,
+            sent: searches().map(u => Object.fromEntries(query(u))), range: els['logs-range'].innerHTML }));""")
+    assert r["before"] is False and r["ok"] is True and r["ready"] is True
+    assert r["query"] == r["input"] == 'dst_ip="1.2.3.4"'
+    assert (r["earliest"], r["latest"]) == ("-1h", "")
+    # the stored search never went out, not even as a request whose answer is dropped
+    assert r["sent"] == [{"q": 'dst_ip="1.2.3.4"', "earliest": "-1h", "limit": "200"}]
+    assert 'data-range="1h" aria-pressed="true"' in r["range"]
+    # the stored range is still what the analyst set: it is not overwritten by the jump's
+    assert r["base"] == "7d"
+
+
+@needs_node
+def test_a_jump_into_an_open_tab_replaces_its_search_and_its_old_result():
+    r = _run(r"""
+        initLogs();
+        await settle();
+        renderLogsResult(events([ev('1', 'OLD RESULT')]));
+        logsState.openIds.add('1');
+        globalThis.fetch = async url => {
+            calls.push(url);
+            if (url.startsWith('/api/logs/sources')) return reply([]);
+            return reply({ error: 'Unexpected |', pos: 5 }, 400);
+        };
+        calls.length = 0;
+        openLogsTab('dst_ip| top', '-15m', '');
+        const during = els['logs-results'].innerHTML;
+        await settle();
+        console.log(JSON.stringify({ during, after: els['logs-results'].innerHTML, summary: els['logs-summary'].innerHTML,
+            error: els['logs-error'].innerHTML, hidden: els['logs-error'].hidden, sent: searches().length,
+            open: logsState.openIds.size, recent: logsRecent() }));""")
+    assert "OLD RESULT" not in r["during"] and "OLD RESULT" not in r["after"] and r["summary"] == ""
+    assert r["sent"] == 1
+    # a query the server refused says so, with the place marked, and is not kept as a search of the analyst's
+    assert r["hidden"] is False and "Unexpected |" in r["error"] and "logs-error-pos" in r["error"]
+    assert r["open"] == 0 and r["recent"] == []
+
+
+@needs_node
+def test_a_query_longer_than_the_server_takes_does_not_jump():
+    r = _run(r"""
+        initLogs();
+        await settle();
+        logsSetQuery('source=dns');
+        calls.length = 0; jumps.length = 0;
+        const long = openLogsTab('image=' + logsQuote('C:\\' + 'a'.repeat(4000)), '-1h', '');
+        const blank = openLogsTab('   ', '-1h', '');
+        // 4000 characters as the server counts them (code points), not UTF-16 units
+        const wide = '\u{1F600}'.repeat(4000);
+        const fits = openLogsTab(wide, '-1h', '');
+        await settle();
+        console.log(JSON.stringify({ long, blank, fits, jumps: jumps.map(j => j[1]), toasts, sent: searches().length,
+            query: logsState.query === wide }));""")
+    assert r["long"] is False and r["blank"] is False and r["fits"] is True
+    assert r["jumps"] == ["logs"] and r["sent"] == 1 and r["query"] is True
+    assert len(r["toasts"]) == 1 and r["toasts"][0]["type"] == "error" and "4000" in r["toasts"][0]["detail"]
+
+
+def logs_back_chip(back):
+    return _run(r"""
+        logsBack = logsBackOf(%s);
+        console.log(JSON.stringify(logsBackChipHtml()));""" % json.dumps(back))
+
+
+@needs_node
+def test_the_way_back_is_shown_and_removable():
+    out = logs_back_chip("firewall")
+    assert "← FIREWALL" in out and "data-logs-back" in out
+    hostile = logs_back_chip({"tab": "firewall", "filter": {"image": "C:\\x\\" + HOSTILE + ".exe", "ip": HOSTILE}})
+    assert "<script>" not in hostile and "<img" not in hostile and "&lt;script&gt;" in hostile
+    assert logs_back_chip({"tab": "alerts"}) == "" and logs_back_chip(None) == ""
+    r = _run(r"""
+        initLogs();
+        await settle();
+        const filter = { select: 'p:C:\\x\\loader.exe|4242', image: 'C:\\x\\loader.exe', pid: 4242 };
+        openLogsTab('image="C:\\x\\loader.exe"', '-1h', '', { tab: 'firewall', filter });
+        const shown = [els['logs-back'].hidden, els['logs-back'].innerHTML];
+        jumps.length = 0;
+        logsGoBack();
+        const back = jumps.slice();
+        logsDropBack();
+        const dropped = [els['logs-back'].hidden, els['logs-back'].innerHTML, logsBack, logsGoBack()];
+        // a jump that brings no way back takes an old one away
+        openLogsTab('source=dns', '-1h', '', { tab: 'firewall', filter });
+        openLogsTab('source=dns', '-1h', '');
+        console.log(JSON.stringify({ shown, back, dropped, again: els['logs-back'].hidden }));""")
+    assert r["shown"][0] is False and "loader.exe" in r["shown"][1] and "data-logs-back-x" in r["shown"][1]
+    assert r["back"] == [["firewall", {"select": "p:C:\\x\\loader.exe|4242", "image": "C:\\x\\loader.exe", "pid": 4242}]]
+    assert r["dropped"] == [True, "", None, False]
+    assert r["again"] is True
+
+
+def test_the_way_back_stands_above_the_search_line():
+    html = _read(INDEX_HTML)
+    bar = html[html.index('<div class="logs-bar">'):html.index('id="logs-histogram"')]
+    assert bar.index('id="logs-back"') < bar.index('id="logs-query"')
+    assert re.search(r'<div[^>]*id="logs-back"[^>]*hidden', bar)

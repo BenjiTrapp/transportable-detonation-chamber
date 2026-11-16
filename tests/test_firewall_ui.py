@@ -536,7 +536,8 @@ def test_the_hints_are_ready_queries_for_the_selection():
         console.log(JSON.stringify({ n, none, calls: calls2, html }));""")
     assert 4 <= r["n"] <= 6 and r["none"] >= 3
     assert r["calls"][0][0] == 'dst_ip="203.0.113.7" | top image'
-    assert r["calls"][0][1] == "-4h"
+    # the endpoint's own connections, not the tab's range (Task 9)
+    assert r["calls"][0][1:3] == ["2026-11-16T09:55:00Z", "2026-11-16T10:10:00Z"]
     assert 'image=&quot;C:\\x\\a\\&quot;b.exe&quot;' in r["html"]
 
 
@@ -732,7 +733,7 @@ def test_a_refused_block_is_said_and_no_block_goes_out_while_the_firewall_is_off
 
 
 @needs_node
-def test_the_perspective_switches_are_stubs_for_task_9():
+def test_the_perspective_switches_exist():
     r = _run(r"""
         console.log(JSON.stringify([typeof openLogsTab, typeof openFirewallTab]));""")
     assert r == ["function", "function"]
@@ -884,7 +885,7 @@ def test_in_logs_is_one_click_away_on_the_selected_row_point_and_hints():
     assert re.search(r'class="fw-map-pin[^"]*"[^>]*>.*data-fw-logs', r["map"])
     assert "data-fw-logs" in r["hints"] and "in LOGS ▸" in r["hints"]
     assert r["tree"].count("data-fw-logs") == 1 and r["proc"].count("data-fw-logs") == 1
-    assert r["calls"][0][:2] == ['image="%s" dst_ip="203.0.113.7"' % LOADER, "-24h"]
+    assert r["calls"][0][:3] == ['image="%s" dst_ip="203.0.113.7"' % LOADER, "2026-11-16T09:55:00Z", "2026-11-16T10:10:00Z"]
     assert r["calls"][0][3]["tab"] == "firewall"
     assert r["calls"][1][0] == 'image="%s"' % LOADER
 
@@ -1715,3 +1716,196 @@ def test_a_refused_fetch_is_offered_again_once_the_server_says_it_can():
         console.log(JSON.stringify({ stale, fresh: stack() }));""")
     assert "NO FETCH" in r["stale"]
     assert "NO FETCH" not in r["fresh"] and 'data-fw-decide="block_fetch"' in r["fresh"]
+
+
+# --- Task 9: the perspective switch -------------------------------------------------
+
+def _cmp_terms(node):
+    """The (field, op, value) of every comparison in a parsed search part."""
+    if not isinstance(node, tuple):
+        return []
+    if node[0] == "cmp":
+        return [(node[1], node[2], node[3])]
+    if node[0] in ("and", "or"):
+        return [t for n in node[1] for t in _cmp_terms(n)]
+    if node[0] == "not":
+        return _cmp_terms(node[1])
+    return []
+
+
+def hint_queries(image, ip):
+    """Every LOGS query the tab builds for a selection with this image and address: the hints and in LOGS."""
+    return _run(r"""
+        const calls2 = [];
+        globalThis.openLogsTab = (...args) => { calls2.push(args); return true; };
+        fwState.loaded = true;
+        fwState.rules = [];
+        fwState.flows = [flow({ image: %s, dst: %s })];
+        fwSelect('f:' + fwFlowKey(fwState.flows[0]));
+        FW_HINTS.forEach((h, i) => fwOpenHint(i));
+        fwOpenLogs();
+        fwSelect('p:' + fwProcKey(fwState.flows[0]));
+        fwOpenLogs();
+        fwSelect('a:' + fwState.flows[0].dst_ip);
+        fwOpenLogs();
+        console.log(JSON.stringify(calls2.map(c => c[0])));""" % (json.dumps(image), json.dumps(ip)))
+
+
+@needs_node
+def test_a_hint_click_quotes_the_value_safely():
+    import log_search
+    for image, ip in [('C:\\x\\a"b\\', 'a"b\\'),
+                      ('C:\\x\\" | head 1 OR source=* "', '1.2.3.4" OR "x'),
+                      ('C:\\x\\loader.exe', '203.0.113.7')]:
+        queries = hint_queries(image, ip)
+        assert len(queries) == 5 + 3, queries
+        for q in queries:
+            parsed = log_search.parse(q)           # the server's own parser: it takes every one of them
+            for field, op, value in _cmp_terms(parsed.terms):
+                if field not in ("image", "dst_ip"):
+                    continue
+                want = image if field == "image" else ip
+                # the value as given; one ending in a backslash ends in \* (logsQuote), which still matches it
+                assert op == "=" and value in (want, want + "*"), (q, field, value)
+            # a value never adds a pipe of its own: the pipes are those of the hint
+            assert len(parsed.pipes) <= 1, q
+            assert sum(1 for f, _, _ in _cmp_terms(parsed.terms) if f in ("image", "dst_ip")) <= 2, q
+
+
+def open_firewall_tab(filter, flows=None, loaded=True, load=None):
+    return _run(r"""
+        fwState.loaded = %s;
+        fwState.rules = [];
+        fwState.flows = %s;
+        const ok = openFirewallTab(%s);
+        const before = { selected: fwSelected, filter: fwFilter };
+        const load = %s;
+        if (load) {
+            answer = url => url.startsWith('/api/firewall/connections') ? reply({ connections: load.map(o => flow(o)), count: load.length })
+                : reply({ pending: [], history: [] });
+            await fwLoadFlows();
+        }
+        const tab = opened.filter(o => o[0] === 'tab').map(o => o[1]).pop();
+        console.log(JSON.stringify({ ok, activeTab: tab, before, selected: fwSelected, filter: fwFilter,
+            search: els['firewall-search'].value, tree: els['firewall-tree'].innerHTML, hints: els['firewall-hints'].innerHTML }));""" % (
+        json.dumps(loaded), _flows_js(flows if flows is not None else [{}, {"dst": "1.2.3.4", "port": 443}]),
+        json.dumps(filter), json.dumps(load)))
+
+
+@needs_node
+def test_open_firewall_tab_filters_on_the_endpoint():
+    s = open_firewall_tab({"ip": "1.2.3.4", "port": 443})
+    # Task 7's selection of an address (every process and port to it); the tree is filtered on it
+    assert s["activeTab"] == "firewall" and s["selected"] == "a:1.2.3.4"
+    assert s["filter"] == s["search"] == "1.2.3.4" and "203.0.113.7" not in s["tree"]
+    assert "1.2.3.4" in s["hints"] and "data-fw-logs" in s["hints"]
+
+
+@needs_node
+def test_open_firewall_tab_selects_a_process_and_one_flow():
+    proc = open_firewall_tab({"image": LOADER.upper(), "pid": 4242})
+    assert proc["selected"] == "p:%s|4242" % LOADER
+    one = open_firewall_tab({"image": LOADER, "ip": "1.2.3.4", "port": 443})
+    assert one["selected"] == "f:%s|4242|tcp|10.0.2.15|1.2.3.4|443" % LOADER and one["filter"] == "1.2.3.4"
+    # a process that has restarted is found by its image; the newest of its runs is chosen
+    gone = open_firewall_tab({"image": LOADER, "pid": 1}, flows=[{"pid": 7}, {"pid": 8, "dst": "1.2.3.4"}])
+    assert gone["selected"] in ("p:%s|7" % LOADER, "p:%s|8" % LOADER)
+    # the exact selection the way back brings wins over the parts
+    exact = open_firewall_tab({"select": "a:203.0.113.7", "ip": "1.2.3.4", "text": ""})
+    assert exact["selected"] == "a:203.0.113.7" and exact["filter"] == ""
+
+
+@needs_node
+def test_open_firewall_tab_cold_selects_once_the_connections_are_in():
+    s = open_firewall_tab({"ip": "1.2.3.4", "port": 443}, flows=[], loaded=False, load=[{"dst": "1.2.3.4"}, {}])
+    assert s["before"] == {"selected": "", "filter": "1.2.3.4"}
+    assert s["selected"] == "a:1.2.3.4" and "1.2.3.4" in s["hints"]
+
+
+@needs_node
+def test_a_filter_with_no_connections_in_the_range_says_so():
+    s = open_firewall_tab({"image": "C:\\gone\\" + HOSTILE + ".exe"}, load=[{}])
+    assert s["selected"] == ""
+    assert "No connection in the last 1h matches" in s["tree"] and "wider range" in s["tree"]
+    assert "<script>" not in s["tree"] and "&lt;script&gt;" in s["tree"]
+
+
+@needs_node
+def test_in_logs_carries_the_connection_lifetime_not_the_last_range():
+    r = _run(r"""
+        const calls2 = [];
+        globalThis.openLogsTab = (...args) => { calls2.push(args); return true; };
+        fwState.loaded = true;
+        fwState.rules = [];
+        const a = flow(), b = flow({ dst: '1.2.3.4', port: 80 }), c = flow({ pid: 9, image: 'C:\\x\\other.exe' });
+        b.first_seen = '2026-11-16T08:00:00Z'; b.last_seen = '2026-11-16T12:30:00Z';
+        c.first_seen = '2026-11-16T07:00:00Z'; c.last_seen = '2026-11-16T07:01:00Z';
+        fwState.flows = [a, b, c];
+        fwRange = '24h';
+        fwSelect('f:' + fwFlowKey(a));
+        fwOpenLogs();
+        FW_HINTS.forEach((h, i) => fwOpenHint(i));
+        fwSelect('p:' + fwProcKey(a));
+        fwOpenLogs();
+        b.first_seen = 'garbage';
+        fwSelect('a:1.2.3.4');
+        fwOpenLogs();
+        fwSelect('');
+        fwFilter = 'loader';
+        fwOpenHint(2);
+        console.log(JSON.stringify(calls2.map(c => [c[0], c[1], c[2], c[3]])));""")
+    flow_, endpoint_hint, rhythm, dropped, dga, cradles, proc, broken, unselected = r
+    # one connection: its first and last packet, five minutes either side (DNS before it, a drop after it)
+    assert flow_[1:3] == ["2026-11-16T09:55:00Z", "2026-11-16T10:10:00Z"]
+    assert flow_[3]["tab"] == "firewall" and flow_[3]["filter"]["select"].startswith("f:")
+    # the process: all of its connections
+    assert proc[1:3] == ["2026-11-16T07:55:00Z", "2026-11-16T12:35:00Z"]
+    # a hint about the endpoint covers every connection to it, of whichever process; one about the process all of its own
+    # (other.exe talked to it at 07:00, loader.exe's connection to 1.2.3.4 is not about this endpoint)
+    assert endpoint_hint[1:3] == ["2026-11-16T06:55:00Z", "2026-11-16T10:10:00Z"]
+    assert rhythm[1:3] == ["2026-11-16T07:55:00Z", "2026-11-16T12:35:00Z"]
+    # the hints about everything take the tab's range
+    assert [h[1:3] for h in (dropped, dga, cradles)] == [["-24h", ""]] * 3
+    # and their way back keeps the tree as it was (the selection's, with its filter)
+    assert dropped[3] == {"tab": "firewall", "filter": {"select": dropped[3]["filter"]["select"], "text": "",
+                                                        "image": LOADER, "ip": "203.0.113.7", "pid": 4242, "port": 443}}
+    # a time that cannot be read falls back to the tab's range, never to no range at all
+    assert broken[1:3] == ["-24h", ""]
+    # without a selection the way back is the tab with the tree's filter as it was
+    assert unselected[1:3] == ["-24h", ""] and unselected[3] == {"tab": "firewall", "filter": {"text": "loader"}}
+
+
+@needs_node
+def test_the_toast_takes_the_time_of_the_download_to_logs():
+    r = _decisions(r"""
+        const calls2 = [];
+        globalThis.openLogsTab = (...args) => { calls2.push(args); return true; };
+        const seen = pitem({ id: 'dl-1' }); seen.finding.observed_at = '2026-11-16T09:58:10Z';
+        const bare = pitem({ id: 'dl-2' });
+        const none = pitem({ id: 'dl-3' }); none.created_at = null;
+        for (const item of [seen, bare, none]) { showDecisionToast(item); fwDecisionLogs(item.id); }
+        console.log(JSON.stringify(calls2));""")
+    assert [c[1:3] for c in r] == [["2026-11-16T09:53:10Z", ""], ["2026-11-16T09:55:00Z", ""], ["-1h", ""]]
+    assert r[0][3]["filter"]["ip"] == "203.0.113.7" and r[0][3]["filter"]["image"] == LOADER
+
+
+@needs_node
+def test_graph_network_nodes_and_tracing_lead_to_the_firewall_tab():
+    r = _run_node(["escapeHtml", "graphFirewallButtonHtml", "rtraceOpenFirewall"], r"""
+        const calls2 = [];
+        globalThis.openFirewallTab = f => { calls2.push(f); return true; };
+        globalThis.state = { processes: { '4242': { image: 'C:\\x\\loader.exe', pid: 4242 }, '9': { pid: 9 } }, rtraceSelectedPid: '4242' };
+        const button = graphFirewallButtonHtml({ ip: '1.2.3.4"><script>', port: 443 });
+        rtraceOpenFirewall();
+        state.rtraceSelectedPid = '9';
+        const none = rtraceOpenFirewall();
+        console.log(JSON.stringify({ button, calls: calls2, none }));""")
+    assert ">FIREWALL<" in r["button"] and "<script>" not in r["button"] and "data-fw-endpoint-ip" in r["button"]
+    assert r["calls"] == [{"image": "C:\\x\\loader.exe", "pid": 4242}] and r["none"] is False
+    graph = _function_source("showGraphDetail")
+    assert "graphFirewallButtonHtml(node)" in graph and "openFirewallTab(" in graph
+    html = _read(INDEX_HTML)
+    bar = html[html.index('id="rtrace-info-bar"'):]
+    bar = bar[:bar.index("</div>")]
+    assert re.search(r'<button[^>]*id="rtrace-firewall"[^>]*onclick="rtraceOpenFirewall\(\)"[^>]*>FIREWALL</button>', bar)
+    assert "rtrace-firewall" in _function_source("updateRtraceInfoBar")

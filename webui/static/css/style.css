@@ -686,6 +686,7 @@ body.hex-resizing {
     color: var(--text-muted);
 }
 
+.rtrace-firewall { flex: none; }
 .rtrace-path {
     font-size: 11px;
     color: var(--text-muted);
@@ -10801,6 +10802,13 @@ body.maintenance-active #app {
     border-radius: 2px;
 }
 .logs-bar-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+/* The way back to the tab a jump came from (openLogsTab): ← FIREWALL and its × */
+.logs-back-row { display: flex; }
+.logs-back-row[hidden] { display: none; }
+.logs-back { display: inline-flex; align-items: stretch; gap: 2px; max-width: 100%; }
+.logs-back-go { min-width: 0; border-color: var(--accent-cyan); }
+.logs-back-go .alerts-filter-chip-kind { color: var(--accent-cyan); }
+.logs-back-x { padding: 3px 7px; }
 .logs-range { display: inline-flex; align-items: center; gap: 8px; }
 .logs-range .chart-range-btn { height: 22px; padding: 0 10px; font-size: 10px; }
 .logs-sources { display: flex; flex-wrap: wrap; gap: 6px; }

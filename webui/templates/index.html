@@ -19,7 +19,7 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=76">
+    <link rel="stylesheet" href="/static/css/style.css?v=77">
     <link rel="stylesheet" href="/static/css/theme-layout.css?v=4">
     <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=30">
 </head>
@@ -327,6 +327,7 @@
                     <span class="rtrace-stat" id="rtrace-stat-events">0 events</span>
                     <span class="rtrace-stat" id="rtrace-stat-duration">0m 0s</span>
                     <span class="rtrace-path" id="rtrace-path">--</span>
+                    <button type="button" class="btn btn-xs rtrace-firewall" id="rtrace-firewall" title="Show the connections of this process in the FIREWALL tab" onclick="rtraceOpenFirewall()" disabled>FIREWALL</button>
                 </div>
 
                 <!-- Severity Summary Bar: the counts as pills (CHART) or as a table
@@ -686,6 +687,7 @@
                     </div>
                 </div>
                 <div class="logs-bar">
+                    <div class="logs-back-row" id="logs-back" hidden></div>
                     <div class="logs-search">
                         <div class="logs-input-wrap">
                             <div class="logs-hl" id="logs-hl" aria-hidden="true"></div>
@@ -1669,6 +1671,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
     </div>
 
-    <script src="/static/js/app.js?v=108"></script>
+    <script src="/static/js/app.js?v=109"></script>
 </body>
 </html>
