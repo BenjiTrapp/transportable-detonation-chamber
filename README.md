@@ -62,6 +62,7 @@
 - [Rizin](#rizin)
 - [Tool Updates](#tool-updates)
 - [Logs](#logs)
+- [Firewall](#firewall)
 - [Demo](#demo)
 - [API Reference](#api-reference)
 - [MCP Server](#mcp-server)
@@ -1235,6 +1236,139 @@ uploads it). It enables Script Block Logging and Module Logging, sets the
 PowerShell operational log to 256 MB and turns on Windows Firewall logging of
 allowed and blocked packets. It is safe to run again.
 
+## Firewall
+
+The **FIREWALL** tab shows whom the chamber talks to and lets you act on it
+while the sample runs: a process tree with each process's endpoints, a world
+map of the destinations, and the switches that write rules into the Windows
+Firewall. It is built from what Windows already records (Sysmon 1, 3 and 22,
+`pfirewall.log`, PowerShell 4104/4103 and the BITS client log), read every 10
+seconds; while a detonation runs, Sysmon and BITS every second. It sees a connection
+**after** it was made, about a second late; it does not hold one back.
+Everything in it is text from the sample and is shown as text: URLs and host
+names are defanged (`hxxp://`, `example[.]com`), never a link.
+
+A connection here is a flow: one process (image and PID) to one endpoint
+(protocol, address, port), with its count and its first and last packet. The
+firewall log has no process, so its numbers (`FW (endpoint)`, the `dropped`
+tag) belong to the endpoint, not to the process beside them. There are **no
+byte counts**: Sysmon records none, and the `size` field of `pfirewall.log` is
+per record and mostly empty. The tree's bars and the map's lines scale with the
+number of connections instead, and the summary says why. Countries and AS
+names come from an offline table in `webui/data` (iptoasn.com, public domain);
+TDC never asks anyone online about an address it has seen from malware.
+Private, loopback and link-local addresses are a group of their own and are not
+on the map; TDC's own processes (the web UI, Detonator, LitterBox, Fibratus,
+Rustinel, git) are a group of their own and are never blocked automatically.
+
+| Tag | Severity | When |
+|-----|----------|------|
+| `ioc` | critical | the address or host name is on Rustinel's IOC lists |
+| `beacon` | critical | the connection times have a regular rhythm (the beaconing detector of Live Memory) |
+| `sigma` | high | a Rustinel or Fibratus alert names this address and port |
+| `detonated` | high | the process, or one of its ancestors, is a submission |
+| `direct-ip` | high | no DNS answer and no Sysmon host name explains the address: a hard-coded destination |
+| `download` | high | a URL to an executable file (`.exe`, `.dll`, `.ps1`, `.hta`, `.msi`, ...) was seen for this connection |
+| `tdc-anomaly` | high | one of TDC's own processes talks to an endpoint it has no business with |
+| `lolbin` | medium | the image is a living-off-the-land binary (certutil, bitsadmin, mshta, rundll32, powershell, ...) |
+| `dga` | medium | the name it resolved has high entropy or many digits |
+| `risky-tld` | medium | `.onion`, `.bit`, `.top`, `.xyz`, `.tk`, `.ml`, `.ga`, `.cf` |
+| `dead-drop` | medium | a paste, chat or file-drop service (telegram, pastebin, discord, raw.githubusercontent, transfer.sh, ...) |
+| `rare-port` | medium | a port outside the usual list, or 4444, 5555, 6666, 8888, 9999, 31337 |
+| `newborn` | low | the process was less than 60 s old when the connection began |
+| `dropped` | info | the firewall dropped packets to this endpoint |
+
+The colour of a row and of an arc is its most severe tag.
+
+**Blocking.** ALLOW / DENY writes a rule named `TDC-FW-...`: for one process to
+one endpoint, for one process everywhere, or (a separate switch) for an
+endpoint and every program, TDC's own fetch included. A rule only counts as a
+block once it reads back from Windows as written and every profile it covers is
+on. A blocked connection is not reset: it starves, which looks like a network
+failure to the sample. The UI shows each rule's protocol, because the
+assessment does not compare it: a tcp rule makes a udp flow to the same
+endpoint read as blocked too. KILL ends a selected process with `taskkill /F`
+after a confirmation (never one of TDC's own). While a Windows Firewall profile
+is off no rule would bite, so every switch is disabled and a red band says so,
+with TURN THE FIREWALL ON. TDC never turns it on by itself: that changes what
+the sample sees.
+
+**ASK** decides what happens when a process fetches a file. The setting lives
+on the server, because the blocks it causes hold without a browser.
+
+| Position | What happens |
+|----------|--------------|
+| `Detonation` (default) | A download of a process in a detonation (a submission or its descendants; a BITS job while a submission runs) is blocked at once and then asked about. Everything else is only tagged. |
+| `All` | Every download is blocked and asked about, except those of TDC's own processes and of the tool-update hosts. |
+| `Off` | Nothing is blocked, nothing is asked or fetched; downloads are still tagged and logged. The head says so the whole time. |
+
+A download is seen when its URL appears in a PowerShell script block, in a
+Sysmon command line (`certutil -urlcache`, `bitsadmin /transfer`, `curl`,
+`mshta http://...`) or in the BITS log. A compiled loader that calls WinHTTP
+itself shows no URL and is only a connection here: that is the known gap of
+this part. The connection has already happened when TDC sees the URL, so the
+question is honest about it: the toast, on every tab, says the loader **is
+blocked** and offers CUT + FETCH (keep the block, TDC fetches the file itself),
+CUT ONLY and ALLOW (lift the block). When nobody answers within
+`TDC_FIREWALL_DECIDE_SECONDS` (30 s), TDC keeps the block and fetches the file
+anyway, because a stage-2 URL is often good for one download only; that means
+the chamber contacts the C2 unattended. The deadline runs on the server, so
+closing the page changes nothing, and what was decided while nobody watched
+stays as a toast until it is closed. DECISIONS lists the open decisions and
+those of the last 24 h: who took which, and when. `POST /api/firewall/decide`
+takes only the id of a decision TDC opened, never a URL, so a sample cannot
+use TDC as its proxy.
+
+**The fetch** runs in the guest, never on the host, with the loader's
+User-Agent when the script named one. It goes only to the address and port the
+loader used (on every one of at most 3 redirects, no new DNS lookup), within
+64 MB and 30 s in all. It refuses the VM's own addresses, its gateways and,
+unless `TDC_FIREWALL_FETCH_LAN=1`, every private address: the analyst's host is
+one of those.
+
+**Secured samples** are stored in `C:\tdc\samples\<sha256[:2]>\<sha256>`
+(excluded from Defender, both at provisioning and at every start of the web
+UI), with their metadata in `webui/captures.json` (at most 500: URL, endpoint,
+process, SHA-256, size, the first bytes' type, the User-Agent sent). They are
+**never executed**: SECURED SAMPLES opens one in Rizin, Hex or ThreatScan.
+To detonate one, submit it again on purpose in SUBMIT.
+
+**ISOLATED**, after a confirmation, sets the outbound default of every profile
+to Block and lets out loopback only: no DNS, no NTP, no updates (the tool
+updates refuse to run). The host still reaches port 9000, because that is
+inbound. TDC's own fetch gets an allow rule for one address while it runs and
+loses it when it ends; for those seconds anything that can run the web UI's
+Python interpreter could reach that one address too. The band says so, and so
+does `residual` in `GET /api/firewall/isolate`. The previous outbound default
+is kept in `webui/firewall_state.json` and put back when ISOLATED is switched
+off. A web UI that restarts in ISOLATED stays isolated and says so: a crash in
+the middle of a detonation must not lift the block. The way out without the web
+UI is `C:\tdc\scripts\tdc-unisolate.ps1` (`scripts/tdc-unisolate.ps1` here; `make
+deploy` uploads it), run as Administrator in the VM: it sets the outbound
+default to Allow on all three profiles and removes every `TDC-FW-*` rule,
+nothing else.
+
+**Hunting further.** HUNT FURTHER lists ready LOGS searches for the selection,
+each one click away; `in LOGS ▸` on a row, a point of the map or a toast opens
+LOGS with the query and the time of those connections (5 minutes either side),
+and `← FIREWALL` there leads back to the same selection.
+
+- `dst_ip="203.0.113.7" | top image`: who else talks to this endpoint
+- `source=netflow image="C:\Users\...\loader.exe" | timechart span=1m count by dst_ip`: the rhythm of a process
+- `source=firewall action=DROP | stats count by dst_ip, dst_port`: what the firewall dropped
+- `source=dns result="-" | top query`: names that never resolved, DGA suspects
+- `source=powershell "http" | head 50`: download cradles in clear text
+
+A network node in GRAPH has a FIREWALL button that opens this tab on that
+endpoint, and so does the TRACING console for its process. Every action, the analyst's and TDC's own, is an
+`access` event in LOGS (TDC's under `/internal/firewall/...`, with `by`:
+`detector`, `analyst` or `deadline`).
+
+On an **existing VM**, run `C:\tdc\scripts\configure-logging.ps1` once as
+Administrator after `make deploy`: it also turns on the BITS client log the
+download detection reads. The offline geo table travels with `make deploy`;
+`make geoip` on the host only refreshes it.
+
 ## Demo
 
 Screenshots from the ARM64 UTM VM with the test samples used during development
@@ -1850,6 +1984,7 @@ there if the VM is not at `http://192.168.64.4:9000`.
 | Files (paths in the VM) | `tdc_pe_analyze`, `tdc_pe_section`, `tdc_elf_analyze`, `tdc_file_signature`, `tdc_file_hex`, `tdc_file_map` |
 | Named pipes (read-only) | `tdc_pipes`, `tdc_pipe_sessions` |
 | Logs | `tdc_logs_search` |
+| Firewall (read-only) | `tdc_firewall_connections`, `tdc_firewall_captures` |
 | Live memory | `tdc_memory_scan`, `tdc_memory_dump`, `tdc_memory_evidence`, `tdc_memory_baseline`, `tdc_memory_sweep`, `tdc_memory_sweep_status`, `tdc_processdump_baseline`, `tdc_scan_beacons`, `tdc_scan_beaconeye` |
 
 Every request of the MCP server carries `X-TDC-Client: mcp` and
@@ -1858,7 +1993,10 @@ such as `source=mcp | stats count by tool` shows what an MCP client did.
 
 Not exposed on purpose: byte patching (`/api/file/hex/write`), clearing the
 scan history, starting, stopping or steering pipe interception (forward, drop,
-edit) and the raw service proxies.
+edit), the raw service proxies, and everything of the FIREWALL tab that acts
+(block, unblock, ISOLATED, the ASK switch, answering a decision, KILL, turning
+the firewall on): a model must not take the chamber off the network or lift a
+block on its own.
 
 ---
 
@@ -1958,7 +2096,7 @@ transportable-detonation-chamber/
 ├── static/                         # Screenshots for this README
 │
 ├── mcp/
-│   ├── server.py                  # MCP server (47 tools, talks to the web UI API)
+│   ├── server.py                  # MCP server (49 tools, talks to the web UI API)
 │   └── requirements.txt           # mcp, httpx  (make mcp-setup)
 ├── .mcp.json                      # Registers the MCP server for Claude Code
 │
@@ -1982,6 +2120,13 @@ transportable-detonation-chamber/
 │   ├── rizin_sessions.py          # RIZIN tab: rizin processes, console allowlist, analysis steps, projects
 │   ├── rizin_projects/            # Renames and comments per file, <sha256>.rzdb (git-ignored)
 │   ├── tool_updates.py            # Tool Updates: tool catalog and update checks
+│   ├── firewall.py                # FIREWALL tab: bundling and tagging of connections (pure, no I/O)
+│   ├── firewall_store.py          # FIREWALL tab: connection ring, collector, download findings, decisions, settings
+│   ├── firewall_rules.py          # FIREWALL tab: TDC-FW-* rules, ISOLATED, kill (through firewall_rules.ps1)
+│   ├── firewall_rules.ps1         # One firewall verb per call, values as -File parameters
+│   ├── firewall_fetch.py          # FIREWALL tab: the guarded fetch of a stage-2 file
+│   ├── geoip.py                   # Offline IP -> country / AS lookup
+│   ├── data/                      # Offline geo index (iptoasn.com, CC0) and country centroids; `make geoip` refreshes it
 │   ├── memory_baseline.json       # Host memory baseline (git-ignored)
 │   ├── dev_server.py              # Dev server with live-reload
 │   ├── requirements.txt           # Python deps (flask, requests, watchdog, pefile)
@@ -1992,6 +2137,7 @@ transportable-detonation-chamber/
 │       ├── css/theme-layout.css   # Window layout and controls, shared by both themes ([data-theme])
 │       ├── css/theme-cyberpunk.css # Cyberpunk palette, scoped to [data-theme="cyberpunk"]
 │       ├── js/app.js              # Frontend logic (single file, no build step)
+│       ├── data/world.json        # Land mask of the FIREWALL map (Natural Earth 110m, public domain)
 │       └── icon.png               # Logo
 │
 ├── config/
@@ -2018,7 +2164,10 @@ transportable-detonation-chamber/
 │   ├── install-re-tools.ps1      # Detect It Easy, WinDbg, Ghidra
 │   ├── install-rizin.ps1         # rizin 0.9.1 + rz-ghidra from Cutter's Windows package (pinned SHA-256)
 │   ├── install-webui.ps1          # Web UI deployment
-│   ├── configure-logging.ps1     # PowerShell script block/module logging and Windows Firewall log (LOGS tab)
+│   ├── configure-logging.ps1     # PowerShell script block/module logging, Windows Firewall log, BITS log (LOGS, FIREWALL)
+│   ├── tdc-unisolate.ps1         # The way out of ISOLATED without the web UI (run as Administrator)
+│   ├── fetch-geoip.py            # `make geoip`: refresh webui/data from iptoasn.com (host, needs internet)
+│   ├── build-worldmap.py         # Build webui/static/data/world.json from Natural Earth
 │   ├── deploy-utm.py             # Push code to a UTM VM over WinRM, restart, run installers
 │   ├── pipe-roundtrip-test.py    # Interception round trip on the VM (observe, edit, squat)
 │   └── configure-services.ps1    # Service registration (runs on every boot)
@@ -2051,6 +2200,8 @@ C:\ProgramData\chocolatey\lib\ghidra\   Ghidra 12.1.2
 C:\tools\cutter\                        rizin 0.9.1 + rz-ghidra (Cutter's Windows package; only rizin runs)
 C:\Windows\Temp\rizin_uploads\          Files uploaded in the RIZIN tab (newest 40)
 C:\DetonationChamberUI\rizin_projects\  RIZIN projects (renames and comments)
+C:\tdc\samples\                         Samples the FIREWALL tab fetched (<sha256[:2]>\<sha256>; never executed, Defender-excluded)
+C:\tdc\scripts\                         Provisioning scripts; configure-logging.ps1, tdc-unisolate.ps1
 WinDbgX.exe                             WinDbg Preview (via winget)
 C:\Users\Public\Downloads\              Samples written by DetonatorAgent
 ```

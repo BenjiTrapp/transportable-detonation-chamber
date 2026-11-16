@@ -74,8 +74,13 @@ def test_every_deploy_path_uploads_the_web_ui_modules():
     the same files: a missing module is an ImportError on the VM, a missing
     script or style sheet a page without its behaviour or its theme."""
     utm = open(os.path.join(ROOT, "scripts", "deploy-utm.py"), encoding="utf-8").read()
-    modules = set(re.findall(r'"webui/([\w.]+\.(?:py|json))"', utm))
+    modules = set(re.findall(r'"webui/([\w.]+\.(?:py|json|ps1))"', utm))
     assert {"app.py", "pipe_proxy.py", "pipe_backends.py", "pipe_signatures.json"} <= modules
+    # Every module app.py imports from webui/ (the FIREWALL tab brought five), and the script firewall_rules.py runs
+    local = {f[:-3] for f in os.listdir(os.path.join(ROOT, "webui")) if f.endswith(".py")}
+    imported = set(re.findall(r"^import (\w+)", APP, re.M)) & local
+    assert {"firewall", "firewall_fetch", "firewall_rules", "firewall_store", "geoip"} <= imported
+    assert {f"{m}.py" for m in imported} | {"firewall_rules.ps1"} <= modules
     make = open(os.path.join(ROOT, "Makefile"), encoding="utf-8").read()
     ps1 = open(os.path.join(ROOT, "make.ps1"), encoding="utf-8").read()
     vagrant = make[make.index("\ndeploy:"):make.index("\n.PHONY: deploy-app")]
@@ -85,6 +90,26 @@ def test_every_deploy_path_uploads_the_web_ui_modules():
         assert f'"webui/{name}": r"C:\\DetonationChamberUI\\{win}"' in utm, name
         assert f"webui/{name} C:\\\\DetonationChamberUI\\\\" + win.replace("\\", "\\\\") in vagrant, name
         assert f"'webui\\{win}' -Destination 'C:\\DetonationChamberUI\\{win}'" in hyperv, name
+
+
+def test_every_deploy_path_ships_the_data_directories_and_the_way_out_of_isolated():
+    """The FIREWALL tab reads webui/data (the offline geo index) and webui/static/data (the world map). The deploy
+    paths copied named files only, so both directories are shipped whole, each file of them. tdc-unisolate.ps1 is
+    the way out of ISOLATED without the web UI: a VM that only gets a deploy needs it in C:\\tdc\\scripts too."""
+    utm = open(os.path.join(ROOT, "scripts", "deploy-utm.py"), encoding="utf-8").read()
+    make = open(os.path.join(ROOT, "Makefile"), encoding="utf-8").read()
+    ps1 = open(os.path.join(ROOT, "make.ps1"), encoding="utf-8").read()
+    vagrant = make[make.index("\ndeploy:"):make.index("\n.PHONY: deploy-app")]
+    hyperv = ps1[ps1.index("'deploy' {"):ps1.index("'deploy-app' {")]
+    for local in ("data", "static/data"):
+        assert os.listdir(os.path.join(ROOT, "webui", *local.split("/")))
+        win = local.replace("/", "\\")
+        assert f'"webui/{local}": r"C:\\DetonationChamberUI\\{win}"' in utm, local
+        assert f"webui/{local}/*" in vagrant, local
+        assert f"'{win}'" in hyperv and "Get-ChildItem \"webui\\$dataDir\" -File" in hyperv, local
+    assert "DATA_FILES" in utm[utm.index("def do_deploy"):]
+    assert 'os.path.join(REPO, "scripts", "tdc-unisolate.ps1")' in utm
+    assert "scripts/tdc-unisolate.ps1" in vagrant and "'scripts\\tdc-unisolate.ps1'" in hyperv
 
 
 def test_readme_rizin_rows_say_what_the_server_answers():
@@ -122,3 +147,14 @@ def test_help_lists_every_pipe_interception_route():
         r'<td class="api-\w+">(\w+)</td><td><code>(/api/pipes/intercept[^<]*)</code>', HELP)}
     assert routes <= rows, routes - rows
     assert '<td class="api-delete">DELETE</td>' in HELP
+
+
+def test_help_lists_every_firewall_route():
+    routes = set()
+    for m in re.finditer(r'@app\.route\("(/api/firewall/[^"]*)"(?:, methods=\[([^\]]*)\])?', APP):
+        for method in re.findall(r'"(\w+)"', m.group(2) or '"GET"'):
+            routes.add((method, _norm(m.group(1))))
+    assert len(routes) == 15
+    rows = {(m, _norm(p.replace("&lt;", "<").replace("&gt;", ">"))) for m, p in re.findall(
+        r'<td class="api-\w+">(\w+)</td><td><code>(/api/firewall/[^<]*)</code>', HELP)}
+    assert rows == routes

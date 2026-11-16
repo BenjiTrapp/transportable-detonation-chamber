@@ -16,6 +16,7 @@ Usage:
 import argparse
 import functools
 import glob
+import hashlib
 import http.server
 import os
 import socketserver
@@ -47,6 +48,12 @@ FILES = {
     "webui/log_store.py": r"C:\DetonationChamberUI\log_store.py",
     "webui/rizin_sessions.py": r"C:\DetonationChamberUI\rizin_sessions.py",
     "webui/tool_updates.py": r"C:\DetonationChamberUI\tool_updates.py",
+    "webui/firewall.py": r"C:\DetonationChamberUI\firewall.py",
+    "webui/firewall_fetch.py": r"C:\DetonationChamberUI\firewall_fetch.py",
+    "webui/firewall_rules.py": r"C:\DetonationChamberUI\firewall_rules.py",
+    "webui/firewall_rules.ps1": r"C:\DetonationChamberUI\firewall_rules.ps1",
+    "webui/firewall_store.py": r"C:\DetonationChamberUI\firewall_store.py",
+    "webui/geoip.py": r"C:\DetonationChamberUI\geoip.py",
     "webui/static/js/app.js": r"C:\DetonationChamberUI\static\js\app.js",
     "webui/static/css/style.css": r"C:\DetonationChamberUI\static\css\style.css",
     "webui/static/css/theme-layout.css": r"C:\DetonationChamberUI\static\css\theme-layout.css",
@@ -55,14 +62,36 @@ FILES = {
     "webui/static/icon.png": r"C:\DetonationChamberUI\static\icon.png",
 }
 
+# Data directories, shipped whole: the offline geo index (webui/data) and the world map (webui/static/data)
+DATA_DIRS = {
+    "webui/data": r"C:\DetonationChamberUI\data",
+    "webui/static/data": r"C:\DetonationChamberUI\static\data",
+}
+DATA_FILES = {
+    f"{local}/{name}": remote + "\\" + name
+    for local, remote in DATA_DIRS.items()
+    if os.path.isdir(os.path.join(REPO, local))
+    for name in sorted(os.listdir(os.path.join(REPO, local)))
+    if not name.startswith(".") and os.path.isfile(os.path.join(REPO, local, name))
+}
+
 # The install scripts the tool updates re-run, kept next to the provisioning copy
 SCRIPTS_REMOTE_DIR = r"C:\tdc\scripts"
-# (plus configure-logging.ps1, which an existing VM runs once to turn on the logs of the LOGS tab)
+# (plus configure-logging.ps1, which an existing VM runs once to turn on the logs of the LOGS and FIREWALL tabs,
+# and tdc-unisolate.ps1, the way out of ISOLATED when the web UI cannot be reached)
 SCRIPT_FILES = {
     f"scripts/{os.path.basename(path)}": SCRIPTS_REMOTE_DIR + "\\" + os.path.basename(path)
     for path in sorted(glob.glob(os.path.join(REPO, "scripts", "install-*.ps1"))
-                       + [os.path.join(REPO, "scripts", "configure-logging.ps1")])
+                       + [os.path.join(REPO, "scripts", "configure-logging.ps1"),
+                          os.path.join(REPO, "scripts", "tdc-unisolate.ps1")])
 }
+
+# Files the running web UI keeps mapped (geoip.py), which Windows will not let a deploy overwrite
+MAPPED_SUFFIXES = (".idx",)
+
+STOP_PS = (
+    "Get-Process -Name python* -EA SilentlyContinue | Stop-Process -Force; Start-Sleep 2"
+)
 
 RESTART_PS = (
     "Get-Process -Name python* -EA SilentlyContinue | Stop-Process -Force;"
@@ -139,19 +168,51 @@ def stop(httpd):
     httpd.server_close()
 
 
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _data_on_vm(sess):
+    """``{local: sha256}`` of the data files that are on the VM already (one PowerShell call)."""
+    remote = run_ps(sess, ";".join(
+        f'if (Test-Path "{r}") {{ "{l}=" + (Get-FileHash -Algorithm SHA256 "{r}").Hash }}'
+        for l, r in DATA_FILES.items()), label="data hashes")
+    return {l.strip(): h.strip().lower() for l, h in (line.split("=", 1) for line in remote.splitlines() if "=" in line)}
+
+
 def do_deploy(sess, args):
+    """Copy the files; returns True when it stopped the web UI (to replace a file the web UI maps)."""
     httpd = serve()
     print(f"[*] Host HTTP server on :{PORT}, deploying to {args.vm_ip} ...")
+    stopped = False
     try:
-        ps = f'New-Item -ItemType Directory -Path "{SCRIPTS_REMOTE_DIR}" -Force | Out-Null'
-        run_ps(sess, ps, label="scripts dir")
-        for local, remote in {**FILES, **SCRIPT_FILES}.items():
+        dirs = ",".join(f'"{d}"' for d in [SCRIPTS_REMOTE_DIR, *DATA_DIRS.values()])
+        ps = f'New-Item -ItemType Directory -Path {dirs} -Force | Out-Null'
+        run_ps(sess, ps, label="directories")
+        # The data rarely changes, so an unchanged file is left alone. A changed geo index can only be replaced
+        # with the web UI stopped: it maps the file, and Windows refuses to overwrite a mapped file.
+        there = _data_on_vm(sess)
+        data = {}
+        for local, remote in DATA_FILES.items():
+            if there.get(local) == _sha256(os.path.join(REPO, local)):
+                print(f"  [=] {local} unchanged")
+            else:
+                data[local] = remote
+        if any(l.endswith(MAPPED_SUFFIXES) and l in there for l in data):
+            print("[*] Stopping the web UI to replace the geo index it holds open ...")
+            run_ps(sess, STOP_PS, "stop")
+            stopped = True
+        for local, remote in {**FILES, **data, **SCRIPT_FILES}.items():
             if not os.path.isfile(os.path.join(REPO, local)):
                 print(f"  [-] skip {local} (not found)")
                 continue
             url = f"http://{HOST_IP}:{PORT}/{local}"
             ps = (
-                '$ErrorActionPreference="Stop";'
+                '$ErrorActionPreference="Stop"; $ProgressPreference="SilentlyContinue";'
                 f'Invoke-WebRequest -Uri "{url}" -OutFile "{remote}" -UseBasicParsing;'
                 f'(Get-Item "{remote}").Length'
             )
@@ -159,6 +220,7 @@ def do_deploy(sess, args):
             print(f"  [+] {local} -> {remote} ({out} bytes)")
     finally:
         stop(httpd)
+    return stopped
 
 
 def do_install(sess, args):
@@ -248,8 +310,8 @@ def main():
         return
 
     # default action: deploy (optionally followed by restart)
-    do_deploy(sess, args)
-    if args.restart:
+    stopped = do_deploy(sess, args)
+    if args.restart or stopped:
         print("[*] Restarting DetonationChamberUI ...")
         print("    Task state:", run_ps(sess, RESTART_PS, "restart"))
     print("[+] Done.")

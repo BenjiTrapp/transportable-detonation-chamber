@@ -1,0 +1,215 @@
+# FIREWALL tab: handover for the first run on a real VM
+
+Everything in the FIREWALL tab was written and tested on macOS, against mocked
+Windows answers. **None of it has run on Windows yet.** This note is for
+whoever first deploys it to a VM: what to do once, which screenshots to take,
+and the list of assumptions about Windows that only a real VM can confirm.
+
+## 1. Once, on an existing VM
+
+A new VM gets all of this from provisioning. A VM that was provisioned before
+the FIREWALL tab needs:
+
+1. **`make deploy`, then `make restart`** (`.\make.ps1 deploy` on Hyper-V). The
+   deploy now ships the five new modules (`firewall.py`, `firewall_fetch.py`,
+   `firewall_rules.py`, `firewall_store.py`, `geoip.py`), `firewall_rules.ps1`,
+   the data directories `webui/data/` (the offline geo index, about 9 MB) and
+   `webui/static/data/` (the world map), and `scripts/tdc-unisolate.ps1` to
+   `C:\tdc\scripts`. Without the restart the old `app.py` keeps running.
+   - A data file that is the same on the VM is skipped (by SHA-256). A changed
+     geo index (`*.idx`) can only be replaced with the web UI stopped, because
+     `geoip.py` maps it and Windows refuses to overwrite a mapped file; the
+     deploy then stops the web UI and starts it again by itself. Its stop is
+     the same `Get-Process python* | Stop-Process` as `make restart`, which also
+     ends Detonator's and LitterBox's Python (an old limitation of `restart`,
+     not new here). On the very first deploy the index is not on the VM yet, so
+     nothing is stopped.
+2. **`C:\tdc\scripts\configure-logging.ps1`, once, as Administrator.** It turns
+   on what the tab reads besides Sysmon: PowerShell script block and module
+   logging, Windows Firewall logging of allowed and dropped packets
+   (`pfirewall.log`), and now also the BITS client operational log (32 MB).
+   Without it the tab still shows Sysmon's connections, but finds no download
+   in a script or a BITS job, and `FW (endpoint)` and `dropped` stay empty.
+3. **`make geoip` is not needed on the VM.** The geo index is committed in
+   `webui/data/` and travels with the deploy. `make geoip` runs on the **host**
+   (it needs internet) and only refreshes that index; each refresh adds a
+   few-MB blob to git history, so do it rarely, then deploy. If the map says
+   "No geo data ... run make geoip on the host and deploy again" after a
+   deploy, the data directory did not arrive: check
+   `C:\DetonationChamberUI\data\ip2asn-v4.idx`, rather than running `make geoip`.
+
+The web UI makes `C:\tdc\samples` and its Defender exclusion at its own start,
+so the secured samples need no extra step (provisioning does it too).
+
+## 2. Three screenshots
+
+They can only be made on a running VM. The README references **none** of them
+yet: `tests/test_docs.py::test_readme_images_exist_and_none_are_orphaned`
+fails on a PNG in `static/` that the README does not use, and on a README
+image that does not exist. So add each PNG and its reference **in the same
+commit**, in the shape the LOGS section uses:
+
+```html
+<p align="center">
+  <img src="static/firewall_tab.png" alt="..." width="100%">
+</p>
+
+> One or two sentences on what the picture shows.
+```
+
+| File | What it shows | Where in `README.md` |
+|------|---------------|----------------------|
+| `static/firewall_tab.png` | The tab during a detonation: the process tree with a detonated loader unfolded (its endpoints, tags and activity bars), MAP with arcs to a few countries, the summary below. A selected endpoint, so HUNT FURTHER shows its queries. | `## Firewall`, after the first paragraph (as `logs_tab.png` sits in `## Logs`) |
+| `static/firewall_decision.png` | A decision toast with an open decision: the defanged URL, the countdown, CUT + FETCH, CUT ONLY, ALLOW and `in LOGS ▸`. Best over another tab, to show that it comes on every tab. | `## Firewall`, after the paragraph that ends "...so a sample cannot use TDC as its proxy." |
+| `static/firewall_isolated.png` | ISOLATED on: the red ISOLATED switch and the band with what stays open (the per-fetch residual). | `## Firewall`, after the **ISOLATED** paragraph |
+
+A detonation that makes such a picture without real malware: a submitted
+PowerShell script that runs `Invoke-WebRequest http://<a public test host>/x.exe`
+(a URL to an `.exe` in a script block, from a submission) opens a decision in
+ASK `Detonation`.
+
+## 3. What has never run on Windows
+
+Gathered from the reports of Tasks 1-9. For each: what to check on the VM,
+and what breaks if the assumption is wrong. Most checks are one command in an
+elevated PowerShell on the VM.
+
+### Processes and Sysmon
+
+- **The ctypes process-time check** (`_process_started_at` in `webui/app.py`:
+  `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`, `GetProcessTimes`,
+  `GetExitCodeProcess == STILL_ACTIVE`, run as SYSTEM).
+  *Check:* during a detonation, `/api/firewall/connections` tags the
+  submission's connections `detonated`, and KILL on a sample process asks for
+  confirmation instead of answering "its start time cannot be read".
+  *If wrong:* detonation windows close 60 s after the submission's timestamp
+  instead of when the process ends (`FIREWALL_WINDOW_GRACE_S`), so a loader
+  that downloads later is not "in a detonation" and ASK `Detonation` asks
+  nothing; the fast 1 s collector tick stops early; and KILL refuses every PID
+  (409).
+- **A venv's `python.exe` is a launcher.** On Windows the venv's
+  `Scripts\python.exe` starts the base interpreter (`sys._base_executable`, e.g.
+  `C:\Python312\python.exe`), and the child owns the sockets.
+  *Check:* the `Image` Sysmon EID 3 reports for the web UI's own connections and
+  for a fetch (LOGS: `source=netflow image="*python*" | stats count by image`).
+  *If wrong:* the fetch and the "never block TDC's fetcher" guard already name
+  both binaries (`_fw_fetcher_paths`), so the fetch is covered. But
+  `firewall.TDC_IMAGES` lists only the venv path: if Sysmon reports the base
+  interpreter, the web UI's own traffic is not in the `TDC` group, carries no
+  `tdc-anomaly`, and looks like any other process (it could be blocked by hand).
+  Adding the base path to `TDC_IMAGES` would exempt every Python on the box, so
+  it was deliberately not done blind.
+- **Sysmon field names for alerts** (`sigma` tag): `raw.destination.ip|address|port`
+  and `raw.network.destination.*` are a reading of `app.py`; only the port keys
+  were seen in code. *If wrong:* no connection ever gets `sigma`.
+
+### BITS, PowerShell and the firewall log
+
+- **The BITS `Url` field name** (EID 59/60 of
+  `Microsoft-Windows-Bits-Client/Operational`, matched case-insensitively as
+  `url`). *Check:* `bitsadmin /transfer t http://<host>/x.exe %TEMP%\x.exe`, then
+  `wevtutil qe Microsoft-Windows-Bits-Client/Operational /c:2 /rd:true /f:xml`
+  and look for `<Data Name='url'>`. *If wrong:* no BITS download is ever found;
+  BITS (T1197) is then invisible as a download.
+- **The BITS log is on** after `configure-logging.ps1` (`wevtutil gl
+  Microsoft-Windows-Bits-Client/Operational` shows `enabled: true`). *If not:*
+  same as above.
+- **`pfirewall.log` and the `dropped` tag**: after `configure-logging.ps1`, a
+  blocked connection shows `DROP` lines (LOGS: `source=firewall action=DROP`).
+
+### Running `firewall_rules.ps1`
+
+Every rule change goes through
+`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File firewall_rules.ps1 -Op <verb> ...`.
+
+- **`exit 3` and `exit 4` under `-File`.** The script refuses `Create` with
+  `exit 3` when a profile is off and `exit 4` when the rule exists.
+  *Check:* with one profile off, `powershell -File firewall_rules.ps1 -Op Create
+  -Name TDC-FW-test -Action Block -RemoteAddress 192.0.2.1; $LASTEXITCODE`
+  prints `3`; a second identical call with all profiles on prints `4`.
+  *If wrong:* a refusal reads as a plain failure (1) or as success (0): a block
+  while a profile is off could be reported with the wrong reason, and the
+  repair of an existing rule takes the wrong branch.
+- **`-File` takes `$`, `;`, `"` and `,` in a value as text.** *Check:* a block
+  of a program whose path holds a `;` or `$` creates exactly one rule with that
+  path. *If wrong:* a hostile image path could become PowerShell code. This is
+  the one security assumption on this list.
+- **`-ExecutionPolicy Bypass` is allowed.** A policy set by GPO (MachinePolicy)
+  overrides it. *If wrong:* every call fails: no rule, no ISOLATED, the tab says
+  the rules cannot be read.
+- **`Get-NetFirewallProfile -PolicyStore ActiveStore`** reports
+  `DefaultOutboundAction` **per profile** as `Allow` / `Block` (and `Enabled` as
+  `True` / `False`). *Check:* `Get-NetFirewallProfile -PolicyStore ActiveStore |
+  Select Name, Enabled, DefaultOutboundAction`. *If it says `NotConfigured`* (the
+  persistent store's word for "default"): ISOLATED's previous value is
+  remembered as `NotConfigured` and put back as such (harmless), but the
+  start-up check that decides whether an ISOLATED marker is still in force
+  compares against `Block`; a misread makes it call a real isolation stale and
+  clear the marker, or the reverse.
+- **The `ConvertTo-Json` shapes** (Windows PowerShell 5.1). The script uses
+  `-InputObject` and `@(...)` so that one profile or one rule is still a list,
+  and `RemoteAddress` / `RemotePort` are arrays. *Check:* `-Op List` with zero,
+  one and two `TDC-FW-*` rules, and `-Op Profiles`; each must be valid JSON with
+  `rules` a list and `profiles` three objects. PowerShell 5.1 can wrap an array
+  as `{"value": [...], "Count": n}`. *If wrong:* the rule list cannot be read:
+  `rules_error` is set, nothing is claimed as blocked, and the switches show `?`.
+- **Windows' spellings of a rule.** `Profile` (`Any`, or `Domain, Private,
+  Public`), `Protocol` (`TCP` or `6`), `Program` (`Any` when none, the path's
+  case), `RemoteAddress` (`1.2.3.4`, or with `/32` or `/255.255.255.255`). The
+  read-back normalises these; that a rule written by `Create` reads back with
+  `Profile: Any` and enabled is assumed. *Check:* block one endpoint, then
+  `GET /api/firewall/rules` shows it with `blocking: true`.
+  *If wrong:* `verified` is false, the flow never turns `blocked`, and every
+  repeat block removes and rewrites the rule (the repair path).
+- **An Allow rule with `-RemotePort` and `-Protocol`.** ISOLATED's per-fetch
+  rule is `Create -Action Allow -Program <python> -RemoteAddress <ip>
+  -RemotePort <port> -Protocol tcp`. *Check:* with ISOLATED on, answer a
+  decision with CUT + FETCH; the capture appears, its `allow_closed` is `true`,
+  and `Get-NetFirewallRule -Name 'TDC-FW-ISO-fetch-*'` is empty afterwards.
+  *If wrong:* the fetch in ISOLATED fails (`allow_problem` says why) or the rule
+  does not read back as written.
+- **Loopback needs no allow rule** under `DefaultOutboundAction Block`. The rule
+  `TDC-FW-ISO-loopback` is written anyway. *Check:* with ISOLATED on, every tab
+  still works (Detonator 8000, Agent 8080, LitterBox 1337, Fibratus 8180).
+- **The host still reaches port 9000 in ISOLATED** (an outbound default does not
+  touch the answers to inbound sessions). *Check:* the web UI stays usable from
+  the host with ISOLATED on. *If wrong:* ISOLATED locks the analyst out, and
+  `C:\tdc\scripts\tdc-unisolate.ps1` from the VM console is the way back; run it
+  once on purpose to see that it works.
+
+### The guarded fetch
+
+- **`route print -4`'s columns.** The default gateway is taken from the line
+  that starts with `0.0.0.0` (destination, mask, gateway, interface, metric).
+  *Check:* `firewall_fetch.own_addresses(refresh=True)` in the web UI's Python
+  contains the gateway (`ipconfig` shows it). *If wrong:* the gateway is not
+  refused as a fetch target. The private-address refusal still covers it unless
+  `TDC_FIREWALL_FETCH_LAN=1` is set.
+- **`socket.getaddrinfo(socket.gethostname())` answers locally.** In ISOLATED
+  DNS is blocked; if this call goes to DNS it can take a while. It runs at
+  start-up and at most every 5 minutes, off the fetch's own deadline. *If slow:*
+  a fetch that refreshes the list can be late.
+
+### Deploy
+
+- **`make deploy` with a changed geo index** stops the web UI, replaces the
+  index and starts it again (Section 1). *Check once:* after a `make geoip`, the
+  deploy prints that it stops the web UI, and the map has data afterwards.
+  *If wrong:* the old index stays (the upload fails while the file is mapped).
+
+## 4. Limits that are by design, not bugs
+
+So that nobody files them:
+
+- **No byte counts.** Sysmon has none; the tab counts connections and firewall
+  records (Part B's proxy would add them).
+- **Seen after the fact.** A connection is seen about a second after it was
+  made; a download decision blocks first and asks then. A compiled loader that
+  calls WinHTTP shows no URL.
+- **"blocked" ignores the protocol.** A tcp rule makes a udp flow to the same
+  endpoint read as blocked; the UI shows the rule's protocol beside the claim.
+- **ISOLATED's residual.** While a fetch runs, anything that can run the web
+  UI's Python could reach that one address for those seconds.
+- **The MCP server only reads** (`tdc_firewall_connections`,
+  `tdc_firewall_captures`): no tool blocks, isolates, decides, kills or turns
+  the firewall on.

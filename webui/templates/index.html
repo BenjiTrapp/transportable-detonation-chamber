@@ -1559,6 +1559,28 @@
                             <tr><td class="api-get">GET</td><td><code>/api/logs/sources</code></td><td>The six log sources with event count, last event, status and hint</td></tr>
                         </tbody>
                     </table>
+
+                    <h4>Firewall</h4>
+                    <table class="help-api-table">
+                        <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td class="api-get">GET</td><td><code>/api/firewall/connections</code></td><td>Bundled flows with tags, severity, geo, state (<code>allowed</code>, <code>blocked</code>, <code>pending</code>) and rule. Params: <code>since</code>, <code>until</code> (ISO-8601 or epoch), <code>process</code>, <code>tag</code>, <code>state</code>, <code>max</code> (1-5000, default 500); most severe first, with <code>count</code> and <code>truncated</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/firewall/summary</code></td><td>Totals, blocked and pending flows, top processes, endpoints and countries of the same window; open decisions, captures, <code>geo_available</code>. No byte counts: Sysmon has none</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/firewall/geo</code></td><td>One offline lookup: <code>ip</code> gives country and AS, never an online query</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/firewall/rules</code></td><td>The <code>TDC-FW-*</code> rules that stand, with <code>blocking</code> for those that really block</td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/firewall/block</code></td><td><code>{scope, image, ip, port, protocol}</code>: <code>endpoint</code> (this program to <code>ip</code>), <code>endpoint_all</code> (every program, TDC's fetch included) or <code>process</code>. Blocked only once the rule reads back; 409 while a firewall profile is off</td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/firewall/unblock</code></td><td><code>{rule_id}</code>; every rule of the same key goes</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/firewall/isolate</code></td><td>ISOLATED's state: <code>isolated</code>, the outbound action before it, <code>profiles_off</code>, <code>residual</code> (what stays open), <code>fetch_paths_open</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/firewall/isolate</code></td><td><code>{on}</code>: block every outbound connection but loopback, or go back. 409 while a profile is off; <code>scripts/tdc-unisolate.ps1</code> is the way back without the web UI</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/firewall/pending</code></td><td>Open download decisions with <code>remaining</code> seconds and <code>can_fetch</code>, the last 24 h as <code>history</code>, <code>ask_mode</code>, <code>decide_seconds</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/firewall/decide</code></td><td><code>{id, action}</code> with <code>allow</code>, <code>block</code> or <code>block_fetch</code>. Takes no URL; an id works once</td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/firewall/ask</code></td><td><code>{mode}</code>: <code>detonation</code>, <code>all</code> or <code>off</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/firewall/enable</code></td><td>Switch the Windows Firewall on for every profile (TDC never does it by itself)</td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/firewall/kill</code></td><td><code>{pid}</code>: <code>taskkill /F</code> for a process with connections in the tab, never one of TDC's own</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/firewall/captures</code></td><td>The secured samples, newest first; never executed</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/firewall/capture/&lt;id&gt;</code></td><td>One capture with its metadata and whether its file still exists</td></tr>
+                        </tbody>
+                    </table>
                 </div>
 
                 <!-- Architecture -->
@@ -1671,6 +1693,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
     </div>
 
-    <script src="/static/js/app.js?v=110"></script>
+    <script src="/static/js/app.js?v=111"></script>
 </body>
 </html>

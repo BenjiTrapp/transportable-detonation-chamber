@@ -316,8 +316,27 @@ deploy:
 		vagrant upload webui/log_store.py C:\\DetonationChamberUI\\log_store.py; \
 		vagrant upload webui/rizin_sessions.py C:\\DetonationChamberUI\\rizin_sessions.py; \
 		vagrant upload webui/tool_updates.py C:\\DetonationChamberUI\\tool_updates.py; \
+		vagrant upload webui/firewall.py C:\\DetonationChamberUI\\firewall.py; \
+		vagrant upload webui/firewall_fetch.py C:\\DetonationChamberUI\\firewall_fetch.py; \
+		vagrant upload webui/firewall_rules.py C:\\DetonationChamberUI\\firewall_rules.py; \
+		vagrant upload webui/firewall_rules.ps1 C:\\DetonationChamberUI\\firewall_rules.ps1; \
+		vagrant upload webui/firewall_store.py C:\\DetonationChamberUI\\firewall_store.py; \
+		vagrant upload webui/geoip.py C:\\DetonationChamberUI\\geoip.py; \
+		vagrant winrm -c "New-Item -ItemType Directory -Force -Path C:\\DetonationChamberUI\\data,C:\\DetonationChamberUI\\static\\data | Out-Null" >/dev/null; \
+		stopped=; \
+		for f in webui/data/* webui/static/data/*; do \
+			rel=$${f#webui/}; win=C:\\DetonationChamberUI\\$$(printf '%s' "$$rel" | tr / '\\'); \
+			mine=$$(shasum -a 256 "$$f" | cut -d' ' -f1); \
+			remote=$$(vagrant winrm -c "if (Test-Path '$$win') { (Get-FileHash -Algorithm SHA256 '$$win').Hash }" 2>/dev/null | tr -d '\r\n ' | tr A-F a-f); \
+			if [ "$$mine" = "$$remote" ]; then echo "[deploy] $$f unchanged"; continue; fi; \
+			case "$$f" in *.idx) if [ -n "$$remote" ] && [ -z "$$stopped" ]; then \
+				echo "[deploy] Stopping the web UI: it maps the geo index, and Windows will not overwrite a mapped file"; \
+				vagrant winrm -c "Get-Process -Name python* -EA SilentlyContinue | Stop-Process -Force; Start-Sleep 2"; stopped=1; fi;; esac; \
+			vagrant upload "$$f" "$$win"; \
+		done; \
+		if [ -n "$$stopped" ]; then vagrant winrm -c "Start-ScheduledTask -TaskName DetonationChamberUI"; echo "[deploy] Web UI started again"; fi; \
 		vagrant upload webui/static/icon.png C:\\DetonationChamberUI\\static\\icon.png || true; \
-		for f in scripts/install-*.ps1 scripts/configure-logging.ps1; do \
+		for f in scripts/install-*.ps1 scripts/configure-logging.ps1 scripts/tdc-unisolate.ps1; do \
 			vagrant upload $$f C:\\tdc\\scripts\\$$(basename $$f); \
 		done; \
 		echo "[deploy] Done."; \
@@ -341,6 +360,12 @@ deploy-app:
 		vagrant upload webui/log_store.py C:\\DetonationChamberUI\\log_store.py; \
 		vagrant upload webui/rizin_sessions.py C:\\DetonationChamberUI\\rizin_sessions.py; \
 		vagrant upload webui/tool_updates.py C:\\DetonationChamberUI\\tool_updates.py; \
+		vagrant upload webui/firewall.py C:\\DetonationChamberUI\\firewall.py; \
+		vagrant upload webui/firewall_fetch.py C:\\DetonationChamberUI\\firewall_fetch.py; \
+		vagrant upload webui/firewall_rules.py C:\\DetonationChamberUI\\firewall_rules.py; \
+		vagrant upload webui/firewall_rules.ps1 C:\\DetonationChamberUI\\firewall_rules.ps1; \
+		vagrant upload webui/firewall_store.py C:\\DetonationChamberUI\\firewall_store.py; \
+		vagrant upload webui/geoip.py C:\\DetonationChamberUI\\geoip.py; \
 		echo "[deploy-app] app.py and modules synced."; \
 	fi
 
