@@ -1289,8 +1289,9 @@ The colour of a row and of an arc is its most severe tag.
 one endpoint, for one process everywhere, or (a separate switch) for an
 endpoint and every program, TDC's own fetch included. A rule only counts as a
 block once it reads back from Windows as written and every profile it covers is
-on. A blocked connection is not reset: it starves, which looks like a network
-failure to the sample. The UI shows each rule's protocol, because the
+on. A blocked connection is not reset: a running one is expected to starve, which
+looks like a network failure to the sample (Windows re-checks an established
+flow against a new Block filter; the handover has the check that confirms it). The UI shows each rule's protocol, because the
 assessment does not compare it: a tcp rule makes a udp flow to the same
 endpoint read as blocked too. KILL ends a selected process with `taskkill /F`
 after a confirmation (never one of TDC's own). While a Windows Firewall profile
@@ -1311,7 +1312,16 @@ A download is seen when its URL appears in a PowerShell script block, in a
 Sysmon command line (`certutil -urlcache`, `bitsadmin /transfer`, `curl`,
 `mshta http://...`) or in the BITS log. A compiled loader that calls WinHTTP
 itself shows no URL and is only a connection here: that is the known gap of
-this part. The connection has already happened when TDC sees the URL, so the
+this part. A download also needs its connection, and Sysmon logs a connection
+(EID 3) only for the programs its config includes: SwiftOnSecurity's list
+(images under `C:\Users`, `C:\ProgramData`, `C:\Windows\Temp`, a list of
+LOLBins, a few ports) plus what `scripts/install-sysmon.ps1` adds for this tab:
+`curl.exe`, `python.exe` and `pythonw.exe` (TDC's own, for `tdc-anomaly`) and
+`svchost.exe` (BITS). A program outside it, under `Program Files` for one, or
+code injected into another system process, makes no connection the tab sees.
+A loader that runs as the very Python interpreter TDC's fetch runs as is never
+blocked (a block on it would cut TDC's fetch off); its toast says the block is
+NOT confirmed. The connection has already happened when TDC sees the URL, so the
 question is honest about it: the toast, on every tab, says the loader **is
 blocked** and offers CUT + FETCH (keep the block, TDC fetches the file itself),
 CUT ONLY and ALLOW (lift the block). When nobody answers within
@@ -1339,18 +1349,31 @@ process, SHA-256, size, the first bytes' type, the User-Agent sent). They are
 To detonate one, submit it again on purpose in SUBMIT.
 
 **ISOLATED**, after a confirmation, sets the outbound default of every profile
-to Block and lets out loopback only: no DNS, no NTP, no updates (the tool
-updates refuse to run). The host still reaches port 9000, because that is
+to Block. A default stops only the traffic that no rule allows, and Windows
+ships enabled outbound Allow rules (Core Networking's DNS, DHCP, Teredo,
+IP-HTTPS, Group Policy, the Store apps' rules), so ISOLATED also switches off
+every enabled outbound Allow rule of this machine that is not TDC's, records
+exactly which in `webui/firewall_state.json` (`allow_disabled`) and switches
+exactly those on again when it is left. A rule a group policy sets cannot be
+switched off locally: after the switch TDC reads back which outbound Allow
+rules are still enabled and names them in the band and in `allowed_out` of
+`GET /api/firewall/isolate`; ISOLATED counts as closed (`verified`) only when
+that list is empty. What it cuts, as far as those rules go: DNS, NTP, updates
+(the tool updates refuse to run), and the cloud lookups and telemetry of the
+EDR under test, whose verdicts may therefore differ from a connected run.
+Loopback stays open, and the host still reaches port 9000, because that is
 inbound. TDC's own fetch gets an allow rule for one address while it runs and
 loses it when it ends; for those seconds anything that can run the web UI's
 Python interpreter could reach that one address too. The band says so, and so
 does `residual` in `GET /api/firewall/isolate`. The previous outbound default
-is kept in `webui/firewall_state.json` and put back when ISOLATED is switched
-off. A web UI that restarts in ISOLATED stays isolated and says so: a crash in
-the middle of a detonation must not lift the block. The way out without the web
-UI is `C:\tdc\scripts\tdc-unisolate.ps1` (`scripts/tdc-unisolate.ps1` here; `make
+is kept in `webui/firewall_state.json` too and put back when ISOLATED is
+switched off. A web UI that restarts in ISOLATED stays isolated and says so, in
+the band and as a toast on whatever tab is open: a crash in the middle of a
+detonation must not lift the block. The way out without the web UI is
+`C:\tdc\scripts\tdc-unisolate.ps1` (`scripts/tdc-unisolate.ps1` here; `make
 deploy` uploads it), run as Administrator in the VM: it sets the outbound
-default to Allow on all three profiles and removes every `TDC-FW-*` rule,
+default to Allow on all three profiles, switches on again the rules recorded in
+`allow_disabled` (it only reads the file) and removes every `TDC-FW-*` rule,
 nothing else.
 
 **Hunting further.** HUNT FURTHER lists ready LOGS searches for the selection,
@@ -1944,7 +1967,7 @@ Proxied responses are only relayed as data (JSON, text, binary); HTML is served 
 
 Times are ISO-8601 UTC text; a flow's `times` is a list of epoch seconds. Errors are `{"error": ...}` with 400 (malformed), 404, 409 (refused: the Windows Firewall is off, a lockout, a block that could not be verified) or 500. Every action is an `access` event in the LOGS tab — the ones TDC takes by itself under `/internal/firewall/block`, `/internal/firewall/decide` and `/internal/firewall/fetch`, each with `by` (`detector`, `analyst` or `deadline`), the endpoint, the URL, the User-Agent that was sent and the outcome.
 
-ISOLATED blocks every way out but loopback. TDC's own fetch is let out one address at a time, only while it runs (`TDC-FW-ISO-fetch-*`, one rule per binary the fetch can run as, removed when the fetch ends, retried at every collector round, and swept at start-up and once a minute for a rule a crash left behind); what that leaves open is in `residual` of `GET /api/firewall/isolate`. A rule that could not be removed again is named in `fetch_paths_open` there, on the capture (`allow_closed`: `true` gone, `false` still standing with `close_problem` saying why, `null` nothing to close because ISOLATED is off, or because ISOLATED is on but the fetch gave up waiting for a sweep (or for the removal of that endpoint's rules) and opened none, with `allow_problem` saying so) and as an `/internal/firewall/allow` event in LOGS.
+ISOLATED blocks the default way out and switches off Windows' own outbound Allow rules; what still gets out is in `allowed_out`. TDC's own fetch is let out one address at a time, only while it runs (`TDC-FW-ISO-fetch-*`, one rule per binary the fetch can run as, removed when the fetch ends, retried at every collector round, and swept at start-up and once a minute for a rule a crash left behind); what that leaves open is in `residual` of `GET /api/firewall/isolate`. A rule that could not be removed again is named in `fetch_paths_open` there, on the capture (`allow_closed`: `true` gone, `false` still standing with `close_problem` saying why, `null` nothing to close because ISOLATED is off, or because ISOLATED is on but the fetch gave up waiting for a sweep (or for the removal of that endpoint's rules) and opened none, with `allow_problem` saying so) and as an `/internal/firewall/allow` event in LOGS.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -1954,8 +1977,8 @@ ISOLATED blocks every way out but loopback. TDC's own fetch is let out one addre
 | GET | `/api/firewall/rules` | The `TDC-FW-*` rules that stand, one entry per rule: `rule_id`, `kind`, `image`, `ip`, `port`, `protocol`, `key`, `blocking` |
 | POST | `/api/firewall/block` | `{scope, image, ip, port, protocol}`. `endpoint`: this program to `ip`; `endpoint_all`: every program, TDC's fetcher included; `process`: `image` anywhere. 409 while a firewall profile is off |
 | POST | `/api/firewall/unblock` | `{rule_id}`; every rule that shares its key is removed |
-| GET / POST | `/api/firewall/isolate` | GET: `isolated`, `outbound_before`, `isolated_since`, `profiles_off`, `startup`, `residual`, `fetch_paths_open`, `fetches_in_flight`. Cheap enough to poll: everything but `profiles_off` is in memory, and `profiles_off` (a PowerShell read) is cached for 60 s (an error for 10 s) and read again after every enforcement route. POST `{on}`: switch ISOLATED (409 while a profile is off) |
-| GET | `/api/firewall/pending` | `pending` (open decisions with `remaining` seconds and `can_fetch`: `false` while a block for every program stands on the endpoint, so CUT + FETCH is refused and the deadline only blocks; `null` when the rules cannot be read) and `history` (the last 24 h), `ask_mode`, `decide_seconds` |
+| GET / POST | `/api/firewall/isolate` | GET: `isolated`, `outbound_before`, `isolated_since`, `profiles_off`, `startup`, `residual`, `allowed_out` (while ISOLATED is on: Windows' own outbound Allow rules still enabled, read back, each `{name, display, group, source, local}`; `null` while it is off or when `allowed_out_error` says it could not be read), `allow_disabled` (how many rules ISOLATED holds switched off), `fetch_paths_open`, `fetches_in_flight`. Cheap enough to poll: everything but `profiles_off` and `allowed_out` is in memory, and those two (PowerShell reads) are cached for 60 s (an error for 10 s) and read again after every enforcement route. POST `{on}`: switch ISOLATED (409 while a profile is off); the answer has `verified` (Block read back and `allowed_out` empty), `allowed_out` and `note` going on, `outbound_after`, `allow_disabled` (rules that would not switch on again) and `note` going off |
+| GET | `/api/firewall/pending` | `pending` (open decisions with `remaining` seconds and `can_fetch`: `false` while a block for every program stands on the endpoint, so CUT + FETCH is refused and the deadline only blocks; `null` when the rules cannot be read) and `history` (the last 24 h), `ask_mode`, `decide_seconds`, `isolated`, `startup` (`{id, announce, note}` of this server start, `null` until it was read: the toast on every tab) |
 | POST | `/api/firewall/decide` | Exactly `{id, action}` (`allow`, `block`, `block_fetch`); no URL is ever taken. An id works once, a second answer gets the decision that was taken |
 | POST | `/api/firewall/ask` | `{mode}`: `detonation`, `all` or `off` (kept on the server) |
 | POST | `/api/firewall/enable` | `{}`: switch the Windows Firewall on for every profile (TDC never does it by itself: it changes what the sample sees). `{enabled, profiles_off, state}`; 500 when a profile stays off |

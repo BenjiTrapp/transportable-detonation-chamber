@@ -70,9 +70,46 @@ ASK `Detonation`.
 
 ## 3. What has never run on Windows
 
-Gathered from the reports of Tasks 1-9. For each: what to check on the VM,
-and what breaks if the assumption is wrong. Most checks are one command in an
-elevated PowerShell on the VM.
+Gathered from the reports of Tasks 1-9 and the final review. For each: what to
+check on the VM, and what breaks if the assumption is wrong. Most checks are
+one command in an elevated PowerShell on the VM. Run them in this order: the
+ISOLATED check, the curl and BITS decisions, blocking a running transfer, then
+the rest.
+
+### ISOLATED really closes (first)
+
+`DefaultOutboundAction Block` stops only what **no** rule allows, and Windows
+ships enabled outbound Allow rules (Core Networking's DNS above all). ISOLATED
+therefore switches off every enabled local outbound Allow rule that is not
+TDC's, records the names in `allow_disabled` of
+`C:\DetonationChamberUI\firewall_state.json`, and switches exactly those on
+again when it is left.
+
+- **Nothing but TDC's own rules is let out.** *Check:* turn ISOLATED on; then
+  `Resolve-DnsName example.com -DnsOnly` fails, and
+  `Get-NetFirewallRule -PolicyStore ActiveStore -Direction Outbound -Action Allow -Enabled True | Select Name, DisplayName, PolicyStoreSourceType`
+  lists only `TDC-FW-ISO-*`. The band says "Read back: no outbound Allow rule
+  but TDC's own is enabled", and `GET /api/firewall/isolate` has
+  `allowed_out: []`. *If wrong:* DNS-tunnel C2 and DNS exfiltration still work
+  in the one mode meant to stop them. If a rule is still listed, the band and
+  `allowed_out` must name it (that half holds even when a rule resists); if
+  the band says nothing while the command lists one, the read back is broken.
+- **The way back is exact.** *Check:* note
+  `(Get-NetFirewallRule -PolicyStore PersistentStore -Direction Outbound -Action Allow -Enabled True).Count`
+  before ISOLATED, leave ISOLATED, count again: the same number, and
+  `allow_disabled` in `firewall_state.json` is `[]`. Do it once more leaving
+  through `C:\tdc\scripts\tdc-unisolate.ps1` instead of the UI (it prints one
+  "Switched on again" line per rule). *If wrong:* Core Networking stays off
+  after ISOLATED, and the VM has no DNS until someone notices.
+- **`PolicyStoreSourceType` says `Local` for the built-in rules.** Only `Local`
+  rules are switched off; any other source is only reported. *Check:* the
+  command above shows `Local` for `CoreNet-DNS-Out-UDP`. *If wrong:* ISOLATED
+  switches nothing off and the band lists every Windows rule as still open
+  (honest, but not closed).
+- **How long switching takes.** The Store apps bring dozens of outbound Allow
+  rules; ISOLATED switches them in one PowerShell per ~6000 characters of names.
+  *Check:* time `POST /api/firewall/isolate {on: true}`; it must stay well
+  under `RUN_TIMEOUT_S` (90 s), and should be a few seconds.
 
 ### Processes and Sysmon
 
@@ -99,6 +136,17 @@ elevated PowerShell on the VM.
   `tdc-anomaly`, and looks like any other process (it could be blocked by hand).
   Adding the base path to `TDC_IMAGES` would exempt every Python on the box, so
   it was deliberately not done blind.
+- **Sysmon logs the connections a download needs.** SwiftOnSecurity's config
+  logs EID 3 only for an include list; `install-sysmon.ps1` adds `curl.exe`,
+  `python.exe`, `pythonw.exe` and `C:\Windows\System32\svchost.exe` (BITS) to
+  it (`Set-NetworkConnectIncludes`). *Check:* `C:\tools\sysmon\sysmonconfig.xml`
+  contains four `<Image name="TDC firewall tab" ...>` lines; then, with ASK on
+  All, `curl.exe -o %TEMP%\x.exe http://<test host>/x.exe` and
+  `bitsadmin /transfer t http://<test host>/y.exe %TEMP%\y.exe` must each open a
+  decision. *If wrong:* a curl or BITS download never becomes a finding, and
+  `tdc-anomaly` never fires because TDC's own python is not logged. If BITS
+  still opens none, its connection is not reported as `svchost.exe`, and the
+  BITS window logic of Task 3 serves nothing.
 - **Sysmon field names for alerts** (`sigma` tag): `raw.destination.ip|address|port`
   and `raw.network.destination.*` are a reading of `app.py`; only the port keys
   were seen in code. *If wrong:* no connection ever gets `sigma`.
@@ -146,6 +194,12 @@ Every rule change goes through
   start-up check that decides whether an ISOLATED marker is still in force
   compares against `Block`; a misread makes it call a real isolation stale and
   clear the marker, or the reverse.
+- **`AllowOut`, `DisableAllowOut` and `EnableAllowOut` under 5.1.** They were
+  run only under PowerShell 7 on a Mac, against stub cmdlets. `-Names` is base64
+  of a JSON list, decoded with `ConvertFrom-Json`. *Check:* `-Op AllowOut` gives
+  `{"rules": [...]}` with zero, one and many rules; ISOLATED on and off with the
+  checks above. *If wrong:* ISOLATED is refused ("could not be read; nothing was
+  changed"), or the band says whether it is closed is unknown.
 - **The `ConvertTo-Json` shapes** (Windows PowerShell 5.1). The script uses
   `-InputObject` and `@(...)` so that one profile or one rule is still a list,
   and `RemoteAddress` / `RemotePort` are arrays. *Check:* `-Op List` with zero,
@@ -177,6 +231,23 @@ Every rule change goes through
   `C:\tdc\scripts\tdc-unisolate.ps1` from the VM console is the way back; run it
   once on purpose to see that it works.
 
+### Blocking
+
+- **A running connection starves when it is blocked.** The toast says so ("a
+  running connection should starve; it gets no reset"), assuming Windows
+  re-checks an established flow against a new Block filter. *Check:* start a
+  long download from a test host (`curl.exe -o NUL --limit-rate 50k
+  http://<test host>/big.bin`), block that endpoint from the tab, and the
+  transfer must stall within a few seconds. *If wrong:* a block only stops new
+  connections, the toast over-claims on every block, and the text must say so.
+- **Detection to confirmed block.** A verified block is three to four PowerShell
+  launches (Create with its own profile check, Get, Profiles, the List after it)
+  behind `_fw_decision_lock`, after the 1 s tick (10 s for PowerShell script
+  blocks) that saw the URL. *Check:* with ASK on All, note the time of a
+  cradle's connection in LOGS and the `created_at` of its decision and of the
+  block's read back in DECISIONS; put the number next to the README's "up to
+  about ten seconds". *If longer:* the README states the real figure.
+
 ### The guarded fetch
 
 - **`route print -4`'s columns.** The default gateway is taken from the line
@@ -198,30 +269,61 @@ Every rule change goes through
   policy-managed Defender or a Defender service that is not running can refuse
   it quietly. *Check:* after a web UI start, `Get-MpPreference | Select
   -ExpandProperty ExclusionPath` lists `C:\tdc\samples`; then let TDC fetch an
-  EICAR test file (CUT + FETCH on a test decision) and check that the file is
-  still in `C:\tdc\samples\<sha256[:2]>\` a minute later, and that
-  `GET /api/firewall/capture/<id>` says `exists: true`. *If wrong:* Defender
-  quarantines every fetched stage-2, which is the one output of the download
-  path; the capture's metadata stays, its file is gone, and nothing says why.
-  Add the exclusion by hand or by policy.
+  EICAR test file and check that the file is still in
+  `C:\tdc\samples\<sha256[:2]>\` a minute later, and that
+  `GET /api/firewall/capture/<id>` says `exists: true`. To get one: on the host,
+  `printf '%s' 'X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > eicar.exe`
+  and `python3 -m http.server 8081` in that directory; start the web UI with
+  `TDC_FIREWALL_FETCH_LAN=1` (the host is a private address, refused
+  otherwise), set ASK to All, and in the VM run
+  `powershell -c "iwr http://<host ip>:8081/eicar.exe -OutFile $env:TEMP\e.exe"`;
+  answer CUT + FETCH. Unset `TDC_FIREWALL_FETCH_LAN` afterwards. *If wrong:*
+  Defender quarantines every fetched stage-2, which is the one output of the
+  download path; the capture's metadata stays, its file is gone, and nothing
+  says why. Add the exclusion by hand or by policy.
+- **Other EDRs.** The exclusion is Defender's only. An EDR under test (the
+  reason TDC exists) may quarantine or delete files in `C:\tdc\samples`
+  regardless. *Check:* the same EICAR run with each EDR the lab uses installed.
+  *If wrong:* that EDR's runs lose their captures; give it an exclusion of its
+  own, or say in the run's notes that captures are not kept under it.
 
 ### Load and policy
 
-- **The collector's process load.** During a detonation the collector starts
-  `wevtutil` for Sysmon (EID 1, 3, 22) and the BITS log every second, and with
-  the tab open and LIVE on, `GET /api/firewall/isolate` starts a PowerShell for
-  the profiles at most once a minute (cached; every 10 s after an error) while
-  the tab polls it every 5 s. Neither was measured. *Check:* the CPU of the web
-  UI's Python and its child processes during a detonation with the tab open
-  (Task Manager, or `Get-Process wevtutil, powershell`). *If too high:* the
-  sample runs on a busier box than it would, and timing-sensitive samples may
-  notice; the fast tick's sources can be split further (`firewall_store.py`).
+- **The collector's process load.** Every process TDC starts for the tab, and
+  how often:
+  - `wevtutil` for Sysmon (EID 1, 3, 22) and the BITS log every second during a
+    detonation window, every 10 s outside one; the PowerShell log every 10 s
+    (the firewall log is a file read, no process).
+  - `powershell -Op List` (the TDC rules): at most once a minute
+    (`FIREWALL_RULES_TTL_S`, shared by LIVE ticks, `/summary`, every tab's
+    `/pending` poll and the sweep), and once after each block, unblock,
+    decision, fetch rule, ISOLATED switch or TURN THE FIREWALL ON. While
+    ISOLATED is on, the sweep's own `List` once a minute too.
+  - `powershell -Op Profiles`: at most once a minute for `GET /isolate` (every
+    10 s after an error), and fresh in every enforcement route.
+  - `powershell -Op AllowOut`: at most once a minute while ISOLATED is on.
+  - Per decision: Create, Get, Profiles and the List after it.
+  None was measured. *Check:* during a detonation with the tab open on LIVE and
+  a second browser tab open, watch the web UI's Python and its children for a
+  minute (Task Manager, or `Get-Process wevtutil, powershell`). **Too high**
+  is more than 10 % of one core for the web UI's Python with its children,
+  averaged over that minute, or more than one `powershell.exe` started per
+  10 s on average with no decision open. *If too high:* the sample runs on a
+  busier box than it would, and timing-sensitive samples may notice; the fast
+  tick's sources can be split further (`firewall_store.py`).
+- **Classifying a full window.** `/connections` and `/summary` each classify
+  the whole range (the beaconing test per flow) and read `captures.json`
+  twice. *Check:* with range All and the ring near its 50 000 connections, time
+  `GET /api/firewall/connections?max=5000`. **Too slow** is more than 1 s:
+  LIVE then overlaps itself.
 - **TURN THE FIREWALL ON under a managed profile.** `Set-NetFirewallProfile
-  -Enabled True` can be overridden by a GPO; the route then answers 500 with the
-  profiles still off. *Check:* switch one profile off in Windows Defender
-  Firewall, press TURN THE FIREWALL ON once, and see the red band go. *If
-  wrong:* the button cannot help; the profile has to be turned on where the
-  policy comes from.
+  -Enabled True` may be overridden by a GPO. What the route then does has not
+  been seen: the expectation is a 500 with the profiles still off, which the
+  band shows. *Check, on a VM without a GPO:* switch one profile off in Windows
+  Defender Firewall, press TURN THE FIREWALL ON once, and see the red band go.
+  *Open question, only on a VM with a firewall GPO:* does the route answer 500
+  and does the band stay? If it answers 200 with a profile still off, the
+  route's read back is wrong.
 
 ### Deploy
 
@@ -253,7 +355,13 @@ So that nobody files them:
 - **"blocked" ignores the protocol.** A tcp rule makes a udp flow to the same
   endpoint read as blocked; the UI shows the rule's protocol beside the claim.
 - **ISOLATED's residual.** While a fetch runs, anything that can run the web
-  UI's Python could reach that one address for those seconds.
+  UI's Python could reach that one address for those seconds. An outbound
+  Allow rule a group policy sets cannot be switched off locally; it is named in
+  the band and in `allowed_out`, and ISOLATED is then not `verified`.
+- **ISOLATED changes what the EDR under test can do.** No cloud lookups, no
+  telemetry upload: compare its verdicts only with other isolated runs.
+- **A loader that runs as TDC's base Python is never blocked**, because a block
+  on that program would cut TDC's own fetch off; its toast says NOT confirmed.
 - **The MCP server only reads** (`tdc_firewall_connections`,
   `tdc_firewall_captures`): no tool blocks, isolates, decides, kills or turns
   the firewall on.
