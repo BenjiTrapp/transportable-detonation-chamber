@@ -262,13 +262,19 @@ def _same_value(a, b):
     return re.sub(r"\s+", "", a).lower() == re.sub(r"\s+", "", b).lower()
 
 
+# Colours both themes take from their specs: the severities high (#ff7a1a) and medium (#ffb000) are
+# the same orange and amber in both, and so are the accents and layout colours that carry them
+SHARED_BY_SPEC = {f"--{base}{suffix}" for base in ("severity-high", "severity-medium", "accent-orange", "accent-yellow",
+                                                   "cp-orange", "cp-amber") for suffix in ("", "-rgb")}
+
+
 def test_cyberpunk_sets_every_palette_variable():
     classic, cyberpunk = _root_values(), _cyberpunk_values()
     missing = sorted(_palette_names(classic) - set(cyberpunk))
     assert not missing, (f"{len(missing)} colours and fonts of style.css :root that theme-cyberpunk.css does not "
                          f"set; they stay Classic in Cyberpunk:\n" + "\n".join(missing))
     effective = _cyberpunk_palette()
-    same = sorted(name for name in _palette_names(classic) - NEUTRAL_COLOURS
+    same = sorted(name for name in _palette_names(classic) - NEUTRAL_COLOURS - SHARED_BY_SPEC
                   if _same_value(effective[name], classic[name]))
     assert not same, "set to their Classic value in Cyberpunk:\n" + "\n".join(same)
 
@@ -728,7 +734,10 @@ def test_graph_colours_come_from_the_theme():
     assert not foreign, f"graph colours that bypass the theme: {foreign}"
     assert len(r["marked"]) == len(r["classic"]["colours"]) == len(r["cyberpunk"]["colours"]) > 100
     neutral = {_root_values()[n].lower() for n in NEUTRAL_COLOURS if not n.endswith("-rgb")} | {"#fff", "#000"}
-    classic_only = sorted(set(r["classic"]["colours"]) & set(r["cyberpunk"]["colours"]) - neutral)
+    shared = {_root_values()[n].lower() for n in SHARED_BY_SPEC if not n.endswith("-rgb")}
+    shared_rgb = {"rgba(%d, %d, %d, " % _hex_rgb(h) for h in shared}
+    classic_only = sorted(c for c in set(r["classic"]["colours"]) & set(r["cyberpunk"]["colours"]) - neutral - shared
+                          if not c.startswith(tuple(shared_rgb)))
     assert not classic_only, f"Classic colours in the Cyberpunk graph: {classic_only}"
 
 
@@ -742,7 +751,7 @@ def test_graph_node_kinds_are_distinguishable():
     def distance(a, b):
         return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
     problems = []
-    for theme, values in (("Classic", _root_values()), ("Cyberpunk", _cyberpunk_palette())):
+    for theme, values in (("Telemetry", _root_values()), ("Cyberpunk", _cyberpunk_palette())):
         rgb = {kind: _hex_rgb(values[kind]) for kind in GRAPH_KINDS}
         background = _hex_rgb(values["--bg-primary"])
         problems += [f"{theme}: {a} and {b} look alike" for i, a in enumerate(GRAPH_KINDS)
@@ -750,6 +759,106 @@ def test_graph_node_kinds_are_distinguishable():
         problems += [f"{theme}: {kind} is too close to the background" for kind in GRAPH_KINDS
                      if distance(rgb[kind], background) < 150]
     assert not problems, "\n".join(problems)
+
+
+# --- Telemetry (the theme with the id classic) -----------------------------------
+
+# The palette of docs/superpowers/specs/2026-11-16-classic-telemetry-design.md
+TELEMETRY_SPEC = {
+    "--bg-primary": "#07080f", "--bg-card": "#0d0f1c", "--bg-secondary": "#121528",
+    "--border-primary": "#23284a", "--fx-grid": "#1a1e38",
+    "--text-primary": "#e8ecff", "--text-secondary": "#a3abd6", "--text-muted": "#6c7399",
+    "--accent-cyan": "#00e5ff", "--accent-pink": "#ff2bd6", "--accent-purple": "#9b8cff",
+    "--accent-red": "#ff2b4a", "--accent-orange": "#ff7a1a", "--accent-yellow": "#ffb000",
+    "--severity-critical": "#ff2b4a", "--severity-high": "#ff7a1a", "--severity-medium": "#ffb000",
+    "--severity-low": "#d4ff00", "--severity-info": "#00e5ff",
+}
+
+
+def _telemetry_rules():
+    """The rules of style.css that only Telemetry gets ([data-theme="classic"]), as (selector, body)."""
+    css = _strip_comments(_raw(STYLE_CSS))
+    return [(s, body) for prelude, body in _css_blocks(css) if body is not None and not prelude.startswith("@")
+            for s in _selectors(prelude) if 'data-theme="classic"' in s]
+
+
+def test_telemetry_uses_the_spec_values():
+    values = _root_values()
+    wrong = {name: values.get(name) for name, value in TELEMETRY_SPEC.items()
+             if not _same_value(values.get(name, ""), value)}
+    assert not wrong, wrong
+    # The roles of the layout: the accent of the layout (--cp-magenta) is cyan, the kicker line and the
+    # tab titles take the acid green and the cyan-violet-magenta gradient of the reference
+    assert _same_value(values["--cp-magenta"], values["--accent-cyan"]), "active tab and primary button are not cyan"
+    assert _same_value(values["--cp-green"], "#d4ff00"), "the kicker is not acid green"
+    heading = values["--cp-heading"]
+    assert [heading.index(c) for c in ("--accent-cyan", "--accent-purple", "--accent-pink")] == sorted(
+        heading.index(c) for c in ("--accent-cyan", "--accent-purple", "--accent-pink")), heading
+    rules = _telemetry_rules()
+    page = " ".join(b for s, b in rules if s.endswith(" body"))
+    assert "var(--fx-grid)" in page and "40px 40px" in page, "no 40 px grid on the page"
+    assert "--accent-pink-rgb" in page and "--accent-cyan-rgb" in page, "no magenta and cyan glows on the page"
+    for tile in ("stat-card", "service-card", "chart-card"):
+        bar = " ".join(b for s, b in rules if f".{tile}" in s and s.endswith("::before"))
+        assert "width: 60px" in bar and "height: 2px" in bar and "box-shadow" in bar, f"no glowing 60 px bar on {tile}"
+        accents = set(re.findall(r"background:\s*var\((--[\w-]+)\)", bar))
+        assert accents == {"--accent-cyan", "--accent-pink", "--cp-green"}, f"{tile}: bars do not alternate: {accents}"
+    assert any("linear-gradient(180deg, var(--bg-secondary), var(--bg-card))" in b for _, b in rules), "no panel gradient"
+
+
+def _luminance(value):
+    def channel(c):
+        c /= 255
+        return c / 12.92 if c <= .03928 else ((c + .055) / 1.055) ** 2.4
+    r, g, b = map(channel, _hex_rgb(value))
+    return .2126 * r + .7152 * g + .0722 * b
+
+
+def _contrast(a, b):
+    hi, lo = sorted((_luminance(a), _luminance(b)), reverse=True)
+    return (hi + .05) / (lo + .05)
+
+
+def test_telemetry_text_contrast():
+    """Running text on the page, the cards and the panel top: 4.5:1 (primary and secondary text), 3:1 for the muted."""
+    values = _root_values()
+    problems = []
+    for text, minimum in (("--text-primary", 4.5), ("--text-secondary", 4.5), ("--text-muted", 3)):
+        for ground in ("--bg-primary", "--bg-card", "--bg-secondary"):
+            ratio = _contrast(values[text], values[ground])
+            if ratio < minimum:
+                problems.append(f"{text} on {ground}: {ratio:.2f}:1, needs {minimum}:1")
+    assert not problems, "\n".join(problems)
+    assert _contrast("#ffffff", "#000000") > 20 and abs(_contrast("#777777", "#ffffff") - 4.48) < .01, "the helper is off"
+
+
+def test_effect_layers_ignore_pointer():
+    """The scanlines and the glows that Telemetry lays over the page never take a click: every pseudo-element
+    layer of its rules, and each fixed overlay, says pointer-events: none."""
+    rules = _telemetry_rules()
+    layers = [(s, b) for s, b in rules if re.search(r"::(?:before|after)$", s)]
+    assert any(s.endswith("body::after") for s, _ in layers), "no scanline layer"
+    missing = [s for s, b in layers if "content:" in b and "pointer-events: none" not in b]
+    assert not missing, f"layers that can catch clicks: {missing}"
+    scanlines = next(b for s, b in layers if s.endswith("body::after"))
+    assert "position: fixed" in scanlines and "repeating-linear-gradient" in scanlines and "pointer-events: none" in scanlines
+
+
+def test_reduced_motion_disables_new_animations():
+    """Whatever moves in Telemetry (animation, transition) stops under prefers-reduced-motion."""
+    raw = _raw(STYLE_CSS)
+    start = raw.find("/* --- Telemetry")
+    assert start >= 0, "style.css has no Telemetry section"
+    section = _strip_comments(raw[start:])
+    moving = re.findall(r"([^{}]+)\{[^{}]*\b(?:animation|transition)\s*:[^;]*;", re.sub(r"@media[^{]*\{", "", section))
+    still = ""
+    for prelude, body in _css_blocks(section):
+        if "prefers-reduced-motion" in prelude:
+            still += body
+    needing = [s.strip() for sel in moving for s in sel.split(",") if s.strip()]
+    missing = [s for s in needing if s not in still]
+    assert not missing, f"animated in Telemetry, not stilled under prefers-reduced-motion: {missing}"
+    assert "@keyframes" not in section or "animation: none" in still
 
 
 # --- Theme switch ------------------------------------------------------------

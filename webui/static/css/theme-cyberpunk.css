@@ -86,6 +86,8 @@
     --text-muted: var(--cp-text-dim);
     --text-muted-rgb: var(--cp-text-dim-rgb);
     --text-dim: #665c8c;
+    /* Telemetry's page grid; Cyberpunk draws its own magenta grid (theme-layout.css) */
+    --fx-grid: var(--cp-line);
     /* Accents; the severities take the spec's colours */
     --accent-cyan: var(--cp-cyan);
     --accent-cyan-rgb: var(--cp-cyan-rgb);

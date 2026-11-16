@@ -33,7 +33,12 @@
 
 <p align="center">
   <img src="static/theme_cyberpunk.png" alt="Dashboard in the Cyberpunk theme" width="90%">
-  <br><sub>Service Dashboard &mdash; detection metrics, alert activity by severity and category, and service health (Cyberpunk theme, the default; ✶ switches to Classic)</sub>
+  <br><sub>Service Dashboard &mdash; detection metrics, alert activity by severity and category, and service health (Cyberpunk theme, the default; ✶ switches to Telemetry)</sub>
+</p>
+
+<p align="center">
+  <img src="static/theme_telemetry.png" alt="Dashboard in the Telemetry theme" width="90%">
+  <br><sub>The same dashboard in the Telemetry theme (cyan, magenta and acid green on near-black blue)</sub>
 </p>
 
 ---
@@ -142,16 +147,19 @@ that was running at the time.
 ### Themes
 
 The Web UI has two themes: **Cyberpunk** (the default: neon on deep violet)
-and **Classic** (the original look, shown in most screenshots). **✶** switches
-between them at once, without reloading the page; the open tab, an open detail
+and **Telemetry** (cyan, magenta and acid green on near-black blue, with a
+fine grid and scanlines; it replaces the former blue Classic look, and a
+browser that stored "classic" simply gets Telemetry). Most of the screenshots
+below were taken in that former look, with its sidebar. **✶** switches between
+the themes at once, without reloading the page; the open tab, an open detail
 view, filters and drilldown steps, sort orders, the graph and running pipe
 interception sessions stay as they are. The choice is stored in the browser
-(`localStorage`), so a browser without a stored choice starts in Cyberpunk. In
-Classic ✶ sits below "? Help" in the sidebar header, in Cyberpunk at the right
-end of the top bar.
+(`localStorage`), so a browser without a stored choice starts in Cyberpunk. ✶
+sits at the right end of the top bar, and again in the drawer, below
+"? Help".
 
-Cyberpunk replaces the sidebar with a top bar and gives the content the full
-width:
+Both themes have the same window layout, with a top bar instead of a sidebar
+and the content in the full width:
 
 - **☰ PROCESSES** (with the number of tracked processes) opens the process
   list and the timeline in a drawer over the content. Esc, a click beside it or
@@ -163,7 +171,15 @@ width:
   each. The SERVICES ONLINE tile on the dashboard counts six: it adds the
   Detonator.
 - Tab heads get a large title in a head area of their own, and cards and
-  tiles get neon borders.
+  tiles get neon borders (Cyberpunk) or a glowing accent bar at the top left
+  (Telemetry).
+
+The themes differ in their colours only: Telemetry paints the page with a
+40 px grid, glows at the top and left and fine scanlines (they never take a
+click, and nothing moves), the cards with a gradient, the tab titles in a
+cyan–violet–magenta gradient, the kicker line in acid green, and the active
+tab and the primary buttons in cyan. Severities are red (critical), orange
+(high), amber (medium), acid green (low) and cyan (info).
 
 Both themes share the card controls:
 
@@ -1195,10 +1211,10 @@ Screenshots from the ARM64 UTM VM with the test samples used during development
 (`shortlived.exe`, `injectsim.exe`, `beaconsim.exe`, `pipesim.exe` — harmless
 programs that mimic implant behaviour).
 
-### Service Dashboard (Classic)
+### Service Dashboard (former Classic look)
 
 <p align="center">
-  <img src="static/dashboard.png" alt="Dashboard in the Classic theme" width="100%">
+  <img src="static/dashboard.png" alt="Dashboard in the former Classic theme, with the sidebar" width="100%">
 </p>
 
 > Stats strip (alerts by severity, tracked processes, services online, loaded
@@ -1210,11 +1226,12 @@ programs that mimic implant behaviour).
 > process, api, file, module). Then one card per service: Rustinel,
 > DetonatorAgent and LitterBox, below them Sysmon, Fibratus and the AV/AMSI
 > scanner (EMBER2024 and capa follow further down). Offline services are
-> struck through and can be launched from their card (here LitterBox). The
-> left sidebar holds the tabs (Alerts, the second, lists every alert), ✶
-> below "? Help" (switches to the default Cyberpunk theme), the tracked
+> struck through and can be launched from their card (here LitterBox). This
+> screenshot predates the top bar: the left sidebar held the tabs (Alerts,
+> the second, lists every alert), ✶ below "? Help", the tracked
 > processes and the alert timeline: the 60 newest alerts coloured by
-> severity, which TABLE lists as a table.
+> severity, which TABLE lists as a table. They now sit in the drawer behind
+> ☰ PROCESSES, and the colours are those of the Telemetry theme above.
 
 ---
 
@@ -1228,8 +1245,8 @@ programs that mimic implant behaviour).
 > stored choice starts in. The top bar holds ☰ PROCESSES
 > (363 tracked processes, opens the process list and the timeline in a
 > drawer), the logo, the tabs with the active one in magenta, the service
-> summary, the time of the last update, Help and ✶, which switches back to
-> Classic. The summary *4/5 ONLINE* counts the five services of the status row
+> summary, the time of the last update, Help and ✶, which switches to
+> Telemetry. The summary *4/5 ONLINE* counts the five services of the status row
 > (LitterBox is offline; a click lists them); the SERVICES ONLINE tile shows
 > *4/6* because it also counts the Detonator, which is offline as well. Below
 > the head area the stats tiles carry a coloured edge; a click on a tile opens
@@ -1246,7 +1263,7 @@ programs that mimic implant behaviour).
   <img src="static/alerts_tab.png" alt="Alerts tab filtered by severity and engine" width="100%">
 </p>
 
-> The **Alerts** tab (Classic) filtered to the critical and high alerts of
+> The **Alerts** tab (former Classic look) filtered to the critical and high alerts of
 > the fibratus engine: *6 of 9641*. The charts above the filter bar count
 > the same six: SEVERITY 1 critical and 5 high, OVER TIME one alert on each
 > of six days between 28 Oct and 10 Nov (under the bars the hint how to use
@@ -1556,7 +1573,7 @@ programs that mimic implant behaviour).
   <img src="static/etw_browser.png" alt="ETW browser" width="100%">
 </p>
 
-> **Sysmon** (Classic): the 500 newest events. **EVENTS OVER TIME** stacks
+> **Sysmon** (former Classic look): the 500 newest events. **EVENTS OVER TIME** stacks
 > them by event type in 15-second bars, **PROCESS → EVENT TYPE** shows who
 > raised them (`python.exe`, the web UI itself, 236, nearly all of them pipe
 > events; the images after the sixth are *other images*). Under the filter
@@ -1892,7 +1909,7 @@ transportable-detonation-chamber/
 │   ├── templates/
 │   │   └── index.html             # SPA with all tabs + Help modal
 │   └── static/
-│       ├── css/style.css          # Classic theme (every colour a variable in :root)
+│       ├── css/style.css          # Base styles and the Telemetry palette (every colour a variable in :root)
 │       ├── css/theme-layout.css   # Window layout and controls, shared by both themes ([data-theme])
 │       ├── css/theme-cyberpunk.css # Cyberpunk palette, scoped to [data-theme="cyberpunk"]
 │       ├── js/app.js              # Frontend logic (single file, no build step)

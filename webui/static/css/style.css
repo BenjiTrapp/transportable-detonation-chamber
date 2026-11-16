@@ -2,174 +2,176 @@
    Dark theme inspired by Rustinel tracing frontend */
 
 :root {
-    /* The colours of Classic; theme-cyberpunk.css sets each of them again for
+    /* The colours of Telemetry (the theme with the id classic: the palette of
+       the "fibre telemetry" page); theme-cyberpunk.css sets each of them again for
        Cyberpunk. Each *-rgb variable is the same colour as "r, g, b", for
        rgba(var(--name-rgb), alpha). */
-    --bg-primary: #080c14;
-    --bg-primary-rgb: 8, 12, 20;
-    --bg-secondary: #0d1220;
-    --bg-tertiary: #111827;
-    --bg-card: #0f1629;
-    --bg-card-hover: #141d33;
-    --bg-counter: #0a1628;
-    --border-primary: #1a2744;
-    --border-primary-rgb: 26, 39, 68;
-    --border-accent: #1e3a5f;
-    --border-dashed: #2a3f5f;
-    --text-primary: #e2e8f0;
-    --text-secondary: #94a3b8;
-    --text-secondary-rgb: 148, 163, 184;
-    --text-muted: #64748b;
-    --text-muted-rgb: 100, 116, 139;
-    --text-dim: #475569;
-    --accent-cyan: #22d3ee;
-    --accent-cyan-rgb: 34, 211, 238;
-    --accent-blue: #3b82f6;
-    --accent-blue-rgb: 59, 130, 246;
-    --accent-purple: #a78bfa;
-    --accent-purple-rgb: 167, 139, 250;
-    --accent-pink: #f472b6;
-    --accent-pink-rgb: 244, 114, 182;
-    --accent-red: #ef4444;
-    --accent-red-rgb: 239, 68, 68;
-    --accent-orange: #f97316;
-    --accent-orange-rgb: 249, 115, 22;
-    --accent-yellow: #eab308;
-    --accent-yellow-rgb: 234, 179, 8;
-    --accent-green: #22c55e;
-    --accent-green-rgb: 34, 197, 94;
-    --severity-critical: #ef4444;
-    --severity-critical-rgb: 239, 68, 68;
-    --severity-high: #f97316;
-    --severity-high-rgb: 249, 115, 22;
-    --severity-medium: #eab308;
-    --severity-medium-rgb: 234, 179, 8;
-    --severity-low: #22c55e;
-    --severity-low-rgb: 34, 197, 94;
-    /* info has no colour of its own in Classic: the secondary text colour */
-    --severity-info: #94a3b8;
-    --severity-info-rgb: 148, 163, 184;
+    --bg-primary: #07080f;
+    --bg-primary-rgb: 7, 8, 15;
+    --bg-secondary: #121528;
+    --bg-tertiary: #181c36;
+    --bg-card: #0d0f1c;
+    --bg-card-hover: #161a33;
+    --bg-counter: #0a0c18;
+    --border-primary: #23284a;
+    --border-primary-rgb: 35, 40, 74;
+    --border-accent: #2f3a6e;
+    --border-dashed: #3a4378;
+    --text-primary: #e8ecff;
+    --text-secondary: #a3abd6;
+    --text-secondary-rgb: 163, 171, 214;
+    --text-muted: #6c7399;
+    --text-muted-rgb: 108, 115, 153;
+    --text-dim: #4d5580;
+    /* The 40 px grid on the Telemetry page (the lines are a step above the page) */
+    --fx-grid: #1a1e38;
+    --accent-cyan: #00e5ff;
+    --accent-cyan-rgb: 0, 229, 255;
+    --accent-blue: #4d8dff;
+    --accent-blue-rgb: 77, 141, 255;
+    --accent-purple: #9b8cff;
+    --accent-purple-rgb: 155, 140, 255;
+    --accent-pink: #ff2bd6;
+    --accent-pink-rgb: 255, 43, 214;
+    --accent-red: #ff2b4a;
+    --accent-red-rgb: 255, 43, 74;
+    --accent-orange: #ff7a1a;
+    --accent-orange-rgb: 255, 122, 26;
+    --accent-yellow: #ffb000;
+    --accent-yellow-rgb: 255, 176, 0;
+    --accent-green: #34f5a0;
+    --accent-green-rgb: 52, 245, 160;
+    --severity-critical: #ff2b4a;
+    --severity-critical-rgb: 255, 43, 74;
+    --severity-high: #ff7a1a;
+    --severity-high-rgb: 255, 122, 26;
+    --severity-medium: #ffb000;
+    --severity-medium-rgb: 255, 176, 0;
+    --severity-low: #d4ff00;
+    --severity-low-rgb: 212, 255, 0;
+    --severity-info: #00e5ff;
+    --severity-info-rgb: 0, 229, 255;
     /* Further colours, named after the Tailwind palette */
     /* The colour of a log source in the LOGS tab (chip, badge, bars): set per source there */
     --logs-src: var(--text-secondary);
-    --logs-src-rgb: 148, 163, 184;
+    --logs-src-rgb: 163, 171, 214;
     --c-white: #fff;
     --c-white-rgb: 255, 255, 255;
     --c-black: #000;
     --c-black-rgb: 0, 0, 0;
     /* The Update all skull button and the confirm dialog: red glass, black skull */
-    --skull-red: #d61f26;
-    --skull-red-rgb: 214, 31, 38;
-    --skull-red-light: #ff6a5c;
-    --skull-red-dark: #6e0a10;
-    --skull-rim: #3f0508;
-    --skull-shine: #fff1ee;
-    --skull-ink: #0a0506;
-    --skull-eye: #ff2a1f;
-    --skull-eye-rgb: 255, 42, 31;
-    --skull-bone: #5a4545;
-    --c-red-300: #fca5a5;
-    --c-red-400: #f87171;
-    --c-red-600: #dc2626;
-    --c-orange-400: #fb923c;
-    --c-orange-600: #ea580c;
-    --c-amber-200: #fde68a;
-    --c-amber-300: #fcd34d;
-    --c-amber-400: #fbbf24;
-    --c-amber-400-rgb: 251, 191, 36;
-    --c-amber-500: #f59e0b;
-    --c-yellow-400: #facc15;
-    --c-yellow-600: #ca8a04;
-    --c-lime-400: #a3e635;
-    --c-lime-400-rgb: 163, 230, 53;
-    --c-lime-600: #65a30d;
-    --c-lime-600-rgb: 101, 163, 13;
-    --c-green-400: #4ade80;
-    --c-green-400-rgb: 74, 222, 128;
-    --c-teal-400: #2dd4bf;
-    --c-teal-400-rgb: 45, 212, 191;
-    --c-teal-500: #14b8a6;
-    --c-cyan-300: #67e8f9;
-    --c-sky-400: #38bdf8;
-    --c-sky-400-rgb: 56, 189, 248;
-    --c-sky-500: #0ea5e9;
-    --c-blue-400: #60a5fa;
-    --c-blue-400-rgb: 96, 165, 250;
-    --c-violet-300: #c4b5fd;
-    --c-purple-400: #c084fc;
-    --c-purple-500: #a855f7;
-    --c-purple-500-rgb: 168, 85, 247;
-    --c-slate-300: #cbd5e1;
-    --c-slate-800: #1e293b;
-    --c-slate-900: #0f172a;
-    --c-slate-900-rgb: 15, 23, 42;
+    --skull-red: #ff2b4a;
+    --skull-red-rgb: 255, 43, 74;
+    --skull-red-light: #ff8a9c;
+    --skull-red-dark: #7a0a25;
+    --skull-rim: #3f0516;
+    --skull-shine: #ffe3ea;
+    --skull-ink: #06070d;
+    --skull-eye: #ff3b5c;
+    --skull-eye-rgb: 255, 59, 92;
+    --skull-bone: #5a4f7a;
+    --c-red-300: #ff9aa8;
+    --c-red-400: #ff6378;
+    --c-red-600: #d81f3c;
+    --c-orange-400: #ff9644;
+    --c-orange-600: #e85f0a;
+    --c-amber-200: #ffe29a;
+    --c-amber-300: #ffd24d;
+    --c-amber-400: #ffbf26;
+    --c-amber-400-rgb: 255, 191, 38;
+    --c-amber-500: #ff9f0a;
+    --c-yellow-400: #ffe45c;
+    --c-yellow-600: #c28400;
+    --c-lime-400: #d4ff00;
+    --c-lime-400-rgb: 212, 255, 0;
+    --c-lime-600: #9cc400;
+    --c-lime-600-rgb: 156, 196, 0;
+    --c-green-400: #5af7b0;
+    --c-green-400-rgb: 90, 247, 176;
+    --c-teal-400: #22e6d0;
+    --c-teal-400-rgb: 34, 230, 208;
+    --c-teal-500: #18c9b8;
+    --c-cyan-300: #7df3ff;
+    --c-sky-400: #3dbdff;
+    --c-sky-400-rgb: 61, 189, 255;
+    --c-sky-500: #14a3f2;
+    --c-blue-400: #7a9fff;
+    --c-blue-400-rgb: 122, 159, 255;
+    --c-violet-300: #cfc6ff;
+    --c-purple-400: #d27bff;
+    --c-purple-500: #a35cff;
+    --c-purple-500-rgb: 163, 92, 255;
+    --c-slate-300: #cfd6f5;
+    --c-slate-800: #1e2342;
+    --c-slate-900: #0d0f1c;
+    --c-slate-900-rgb: 13, 15, 28;
     /* Steps between or below the Tailwind ones (sky-550: between sky-500
        and sky-600, at the hue of sky-400) */
-    --c-slate-650: #3b4a61;
-    --c-amber-990: #1f1300;
-    --c-sky-550: #1d8ab7;
-    --c-sky-550-rgb: 29, 138, 183;
+    --c-slate-650: #3b4577;
+    --c-amber-990: #261800;
+    --c-sky-550: #1a8fd0;
+    --c-sky-550-rgb: 26, 143, 208;
     /* Dark blues outside the Tailwind palette; a higher step is darker.
        800: primary buttons on hover; 900: file map canvases behind the
        structure regions; 950: text on sky buttons and graph badges;
        960: file map canvas background; 970, 980: backdrops of the loading
        overlay and the raw JSON modal; 990: file map panel */
-    --c-navy-800: #1e4070;
-    --c-navy-900: #10182b;
-    --c-navy-950: #0b1220;
-    --c-navy-960: #0b1120;
-    --c-navy-970-rgb: 10, 12, 16;
-    --c-navy-980-rgb: 4, 8, 16;
-    --c-navy-990: #05070d;
+    --c-navy-800: #12405f;
+    --c-navy-900: #0e1226;
+    --c-navy-950: #07080f;
+    --c-navy-960: #090b17;
+    --c-navy-970-rgb: 7, 8, 15;
+    --c-navy-980-rgb: 4, 5, 10;
+    --c-navy-990: #05060b;
     /* GitHub dark syntax colours (Primer scale names) for raw and JSON views */
-    --c-gh-blue-1: #a5d6ff;
-    --c-gh-blue-2: #79c0ff;
-    --c-gh-green-1: #7ee787;
-    --c-gh-orange-2: #ffa657;
-    --c-gh-red-3: #ff7b72;
-    --c-gh-gray-4: #6e7681;
+    --c-gh-blue-1: #9aeaff;
+    --c-gh-blue-2: #74b8ff;
+    --c-gh-green-1: #8dffbf;
+    --c-gh-orange-2: #ffae5c;
+    --c-gh-red-3: #ff7b8f;
+    --c-gh-gray-4: #6c7399;
     /* Data colours: each marks a kind of thing, so a theme can keep the kinds
        apart. --graph-*: event kinds in the process graph and the Tracing
        timeline; --pe-*: sections, entropy levels and detected tools in the
        PE/ELF analysis; --assess-*: the CLEAN/PACKED/... badge. */
-    --graph-process: #3b82f6;
-    --graph-process-rgb: 59, 130, 246;
-    --graph-network: #22c55e;
-    --graph-network-rgb: 34, 197, 94;
-    --graph-dns: #a78bfa;
-    --graph-dns-rgb: 167, 139, 250;
-    --graph-file: #f97316;
-    --graph-file-rgb: 249, 115, 22;
-    --graph-registry: #f472b6;
-    --graph-registry-rgb: 244, 114, 182;
-    --graph-pipe: #38bdf8;
-    --graph-pipe-rgb: 56, 189, 248;
-    --graph-detonated: #fbbf24;
-    --graph-detonated-rgb: 251, 191, 36;
-    --pe-code: #3b82f6;
-    --pe-data: #22c55e;
-    --pe-readonly: #64748b;
-    --pe-packer: #a855f7;
-    --pe-overlay: #6b7280;
-    --pe-entropy-high: #ef4444;
-    --pe-entropy-warn: #fbbf24;
-    --pe-entropy-normal: #22c55e;
-    --pe-compiler: #60a5fa;
-    --pe-linker: #818cf8;
-    --pe-protector: #f59e0b;
-    --pe-language: #22d3ee;
-    --pe-runtime: #34d399;
-    --assess-clean: #22c55e;
-    --assess-clean-rgb: 34, 197, 94;
-    --assess-packed: #a855f7;
-    --assess-packed-rgb: 168, 85, 247;
-    --assess-encrypted: #ef4444;
-    --assess-encrypted-rgb: 239, 68, 68;
-    --assess-protected: #f59e0b;
+    --graph-process: #4d8dff;
+    --graph-process-rgb: 77, 141, 255;
+    --graph-network: #34f5a0;
+    --graph-network-rgb: 52, 245, 160;
+    --graph-dns: #9b8cff;
+    --graph-dns-rgb: 155, 140, 255;
+    --graph-file: #ff9a3c;
+    --graph-file-rgb: 255, 154, 60;
+    --graph-registry: #ff2bd6;
+    --graph-registry-rgb: 255, 43, 214;
+    --graph-pipe: #00e5ff;
+    --graph-pipe-rgb: 0, 229, 255;
+    --graph-detonated: #d4ff00;
+    --graph-detonated-rgb: 212, 255, 0;
+    --pe-code: #4d8dff;
+    --pe-data: #34f5a0;
+    --pe-readonly: #6c7399;
+    --pe-packer: #a35cff;
+    --pe-overlay: #5d648c;
+    --pe-entropy-high: #ff2b4a;
+    --pe-entropy-warn: #ffbf26;
+    --pe-entropy-normal: #34f5a0;
+    --pe-compiler: #7a9fff;
+    --pe-linker: #8f84ff;
+    --pe-protector: #ff9f0a;
+    --pe-language: #00e5ff;
+    --pe-runtime: #22e6d0;
+    --assess-clean: #34f5a0;
+    --assess-clean-rgb: 52, 245, 160;
+    --assess-packed: #a35cff;
+    --assess-packed-rgb: 163, 92, 255;
+    --assess-encrypted: #ff2b4a;
+    --assess-encrypted-rgb: 255, 43, 74;
+    --assess-protected: #ff9f0a;
     /* PROTECTED is tinted with amber-400 behind its amber-500 text */
-    --assess-protected-tint-rgb: 251, 191, 36;
-    --assess-suspicious: #fbbf24;
-    --assess-suspicious-rgb: 251, 191, 36;
+    --assess-protected-tint-rgb: 255, 191, 38;
+    --assess-suspicious: #ffbf26;
+    --assess-suspicious-rgb: 255, 191, 38;
     --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
     --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     --radius: 4px;
@@ -178,41 +180,45 @@
     /* Geometry of the window layout (theme-layout.css), the same in both themes */
     --topbar-height: 56px;
     --drawer-width: 320px;
-    /* The names theme-layout.css paints with, in Classic's colours (each
+    /* The names theme-layout.css paints with, in Telemetry's colours (each
        *-rgb is the same colour as "r, g, b"). theme-cyberpunk.css sets them
-       again for Cyberpunk. */
-    --cp-bg: #080c14;
-    --cp-bg-rgb: 8, 12, 20;
-    --cp-bar-top: #111827;
-    --cp-bar-bottom: #0d1220;
-    --cp-card: #0f1629;
-    --cp-card-rgb: 15, 22, 41;
-    --cp-raised: #111827;
-    --cp-line: #1a2744;
-    --cp-text: #e2e8f0;
-    --cp-text-muted: #94a3b8;
-    --cp-text-muted-rgb: 148, 163, 184;
-    --cp-text-dim: #64748b;
-    --cp-magenta: #f472b6;
-    --cp-magenta-rgb: 244, 114, 182;
-    --cp-on-magenta: #0b1220;
-    --cp-cyan: #22d3ee;
-    --cp-cyan-rgb: 34, 211, 238;
-    --cp-green: #22c55e;
-    --cp-green-rgb: 34, 197, 94;
-    --cp-gold: #fcd34d;
-    --cp-gold-rgb: 252, 211, 77;
-    --cp-amber: #eab308;
-    --cp-amber-rgb: 234, 179, 8;
-    --cp-orange: #f97316;
-    --cp-orange-rgb: 249, 115, 22;
-    --cp-red: #ef4444;
-    --cp-red-rgb: 239, 68, 68;
-    --cp-violet: #a78bfa;
-    --cp-violet-rgb: 167, 139, 250;
-    --cp-tile-critical: #dc2626;
+       again for Cyberpunk. They are named after Cyberpunk's colours, and keep
+       their roles: --cp-magenta is the accent of the layout (active tab,
+       primary buttons, edges and glows), --cp-cyan its second accent, --cp-green
+       the kicker line and "online". In Telemetry the accent is cyan, the second
+       accent magenta and the kicker acid green. */
+    --cp-bg: #07080f;
+    --cp-bg-rgb: 7, 8, 15;
+    --cp-bar-top: #131730;
+    --cp-bar-bottom: #0d0f1c;
+    --cp-card: #0d0f1c;
+    --cp-card-rgb: 13, 15, 28;
+    --cp-raised: #181c36;
+    --cp-line: #23284a;
+    --cp-text: #e8ecff;
+    --cp-text-muted: #a3abd6;
+    --cp-text-muted-rgb: 163, 171, 214;
+    --cp-text-dim: #6c7399;
+    --cp-magenta: #00e5ff;
+    --cp-magenta-rgb: 0, 229, 255;
+    --cp-on-magenta: #07080f;
+    --cp-cyan: #ff2bd6;
+    --cp-cyan-rgb: 255, 43, 214;
+    --cp-green: #d4ff00;
+    --cp-green-rgb: 212, 255, 0;
+    --cp-gold: #ffd24d;
+    --cp-gold-rgb: 255, 210, 77;
+    --cp-amber: #ffb000;
+    --cp-amber-rgb: 255, 176, 0;
+    --cp-orange: #ff7a1a;
+    --cp-orange-rgb: 255, 122, 26;
+    --cp-red: #ff2b4a;
+    --cp-red-rgb: 255, 43, 74;
+    --cp-violet: #9b8cff;
+    --cp-violet-rgb: 155, 140, 255;
+    --cp-tile-critical: #e0263f;
     --cp-black-rgb: 0, 0, 0;
-    --cp-heading: linear-gradient(90deg, var(--cp-gold), var(--cp-amber) 45%, var(--cp-red));
+    --cp-heading: linear-gradient(90deg, var(--accent-cyan), var(--accent-purple) 55%, var(--accent-pink));
     --cp-glow: 0 0 14px rgba(var(--cp-magenta-rgb), .35);
     --cp-card-border: 1px solid rgba(var(--cp-magenta-rgb), .22);
     --cp-card-shadow: 0 0 0 1px rgba(var(--cp-black-rgb), .35), 0 8px 24px -16px rgba(var(--cp-magenta-rgb), .35);
@@ -10883,4 +10889,80 @@ body.maintenance-active #app {
 @media (prefers-reduced-motion: reduce) {
     .logs-live[aria-pressed="true"] .logs-live-dot { animation: none; }
     .logs-caret { transition: none; }
+}
+
+/* --- Telemetry: the effects of the "fibre telemetry" page ---
+   Only in Telemetry (the theme with the id classic). Cyberpunk keeps its own
+   grid and cards, so these rules are scoped to it instead of going into
+   theme-layout.css, which both themes share (and which
+   tests/test_theme.py::test_cyberpunk_rules_unchanged keeps as it is).
+   theme-layout.css loads after this file; :root[data-theme] gives these
+   rules the weight to win over its [data-theme] rules. Colours come from the
+   variables of :root. Nothing here moves: no animation, no transition. */
+
+/* Page: a 40 px grid, a magenta glow at the top right, a cyan one on the
+   left; a layer of fine scanlines over everything (it takes no click) */
+:root[data-theme="classic"] body {
+    background-image:
+        radial-gradient(1200px 600px at 80% -10%, rgba(var(--accent-pink-rgb), .13), transparent 60%),
+        radial-gradient(900px 500px at -10% 20%, rgba(var(--accent-cyan-rgb), .10), transparent 60%),
+        linear-gradient(var(--fx-grid) 1px, transparent 1px),
+        linear-gradient(90deg, var(--fx-grid) 1px, transparent 1px);
+    background-size: auto, auto, 40px 40px, 40px 40px;
+    background-attachment: fixed;
+}
+:root[data-theme="classic"] body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    pointer-events: none;
+    background: repeating-linear-gradient(0deg, rgba(var(--c-black-rgb), .18) 0 1px, transparent 1px 3px);
+    mix-blend-mode: multiply;
+}
+
+/* Cards: the panel gradient (top to bottom) over the card colour of the layout */
+:root[data-theme="classic"] :is(.stat-card, .service-card, .chart-card, .help-card, .activity-feed, .pipes-panel,
+        .det-panel, .detonation-section, .pe-card, .elf-card, .die-overview, .ts-tool-card, .ts-tools) {
+    background-image: linear-gradient(180deg, var(--bg-secondary), var(--bg-card));
+}
+:root[data-theme="classic"] :is(.service-card, .help-card):hover {
+    background-image: linear-gradient(180deg, var(--bg-tertiary), var(--bg-secondary));
+}
+
+/* A glowing bar, 60 px long, at the top left of the tiles and the cards: cyan,
+   magenta and acid green in turn */
+:root[data-theme="classic"] :is(.stat-card, .service-card, .chart-card, .help-card) {
+    position: relative;
+}
+:root[data-theme="classic"] :is(.service-card, .chart-card, .help-card)::before,
+:root[data-theme="classic"] .stat-card:nth-child(n)::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: auto;
+    bottom: auto;
+    width: 60px;
+    height: 2px;
+    pointer-events: none;
+    background: var(--accent-cyan);
+    box-shadow: 0 0 12px var(--accent-cyan);
+}
+:root[data-theme="classic"] :is(.stat-card, .service-card, .chart-card, .help-card):nth-child(3n+1)::before {
+    background: var(--accent-cyan);
+    box-shadow: 0 0 12px var(--accent-cyan);
+}
+:root[data-theme="classic"] :is(.stat-card, .service-card, .chart-card, .help-card):nth-child(3n+2)::before {
+    background: var(--accent-pink);
+    box-shadow: 0 0 12px var(--accent-pink);
+}
+:root[data-theme="classic"] :is(.stat-card, .service-card, .chart-card, .help-card):nth-child(3n)::before {
+    background: var(--cp-green);
+    box-shadow: 0 0 12px var(--cp-green);
+}
+
+/* Tab titles: the gradient (--cp-heading) with a cyan glow */
+:root[data-theme="classic"] .content-header h2 {
+    filter: drop-shadow(0 0 22px rgba(var(--accent-cyan-rgb), .25));
 }
