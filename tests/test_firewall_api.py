@@ -470,9 +470,9 @@ def test_two_fetches_to_one_endpoint_share_the_way_out_and_the_last_one_closes_i
     second, again = tdc._fw_open_fetch_path("203.0.113.50", 8080)
     assert first == second and problem is None and again is None
     assert all(n in fw.run.rules for n in first)
-    assert tdc._fw_close_fetch_path(second) == []
-    assert all(n in fw.run.rules for n in first)               # the other fetch still needs it
-    assert tdc._fw_close_fetch_path(first) == []
+    assert tdc._fw_close_fetch_path(second) == ([], True)      # still held by the other fetch
+    assert all(n in fw.run.rules for n in first)
+    assert tdc._fw_close_fetch_path(first) == ([], False)
     assert not any(n in fw.run.rules for n in first)
 
 
@@ -528,7 +528,7 @@ def test_a_fetch_that_opens_while_another_closes_keeps_its_way_out(client, fw, t
     opener.join(10)
     assert opened and opened[0][0] == names and opened[0][1] is None
     assert all(n in fw.run.rules for n in names)       # the new fetch has its way out
-    assert tdc._fw_close_fetch_path(names) == [] and not any(n in fw.run.rules for n in names)
+    assert tdc._fw_close_fetch_path(names) == ([], False) and not any(n in fw.run.rules for n in names)
 
 
 def test_a_way_out_that_will_not_close_is_retried_recorded_and_shown(client, fw, tdc, monkeypatch):
@@ -558,13 +558,106 @@ def test_a_way_out_that_will_not_close_is_retried_recorded_and_shown(client, fw,
     assert client.get("/api/firewall/isolate").json["fetch_paths_open"] == []
 
 
+def test_a_way_out_a_crash_left_behind_that_will_not_go_is_named_at_start_up(client, fw, tdc, tmp_path, monkeypatch):
+    """After a restart the names are gone with the process, so the rule list is the only backstop - and what
+    it cannot remove has to reach LOGS and the tab instead of a Python warning nobody reads."""
+    monkeypatch.setattr(tdc, "CAPTURE_DIR", str(tmp_path / "samples"))
+    monkeypatch.setattr(tdc.firewall_fetch, "own_addresses", lambda refresh=False: frozenset())
+    client.post("/api/firewall/isolate", json={"on": True})
+    stuck = tdc.firewall_rules.fetch_rule_name("203.0.113.50", 8080, tdc._fw_fetcher_paths()[0])
+    goes = tdc.firewall_rules.fetch_rule_name("198.51.100.9", 443, tdc._fw_fetcher_paths()[0])
+    for name in (stuck, goes):
+        fw.run.rules[name] = fw.run.view(name, Action="Allow", Program=tdc._fw_fetcher_paths()[0])
+    real = fw.run.op_Remove
+    fw.run.op_Remove = lambda p: (1, "", "denied") if p["Name"] == stuck else real(p)
+
+    tdc._fw_prepare()
+    assert goes not in fw.run.rules and stuck in fw.run.rules      # the second one was still tried
+    state = client.get("/api/firewall/isolate").json
+    assert [p["rule_id"] for p in state["fetch_paths_open"]] == [stuck]
+    assert "denied" in state["fetch_paths_open"][0]["problem"]
+    (event,) = client.get('/api/logs/search?q=path="/internal/firewall/allow"').json["events"]
+    assert event["fields"]["by"] == "startup" and event["fields"]["rule_id"] == stuck
+
+    fw.run.op_Remove = real                                        # and the sweep keeps trying
+    tdc._firewall_sweep(now=time.time())
+    assert stuck not in fw.run.rules
+    assert client.get("/api/firewall/isolate").json["fetch_paths_open"] == []
+
+
+def test_a_fetch_sharing_a_rule_is_told_what_is_wrong_with_it(client, fw, tdc, monkeypatch):
+    """Two fetches to one endpoint must tell the same story: a write that failed is not 'opened cleanly'."""
+    client.post("/api/firewall/isolate", json={"on": True})
+    monkeypatch.setattr(tdc.firewall_rules, "allow_fetch",
+                        lambda *a, **kw: (_ for _ in ()).throw(tdc.firewall_rules.RuleError("no rule for you")))
+    first_names, first = tdc._fw_open_fetch_path("203.0.113.50", 8080)
+    second_names, second = tdc._fw_open_fetch_path("203.0.113.50", 8080)
+    assert first_names == second_names
+    assert first == "no rule for you" and second == first
+    assert tdc._fw_close_fetch_path(second_names) == ([], True)
+    assert tdc._fw_close_fetch_path(first_names) == ([], False)
+
+
+def test_a_fetch_that_could_not_claim_a_rule_holds_nothing(client, fw, tdc, monkeypatch):
+    """While the sweep is removing every per-fetch rule, a fetch waits; if it gives up it owns nothing, and
+    says why, instead of reporting a way out it never had."""
+    client.post("/api/firewall/isolate", json={"on": True})
+    monkeypatch.setattr(tdc, "_fw_fetch_sweeping", True)
+    monkeypatch.setattr(tdc, "FETCH_PATH_WAIT_S", 0)
+    names, problem = tdc._fw_open_fetch_path("203.0.113.50", 8080)
+    assert names == () and "sweep" in problem and tdc._fw_fetch_paths == {}
+    out = tdc._fetch_capture(FINDING)
+    assert out["allow_rules"] == [] and out["allow_closed"] is None and out["allow_problem"] == problem
+
+
+def test_a_capture_says_nothing_was_closed_when_nothing_was_opened(client, fw, tdc):
+    out = tdc._fetch_capture(FINDING)
+    assert out["allow_rules"] == [] and out["allow_closed"] is None and out["close_problem"] is None
+
+
+def test_a_capture_says_so_while_another_fetch_still_holds_the_rule(client, fw, tdc):
+    client.post("/api/firewall/isolate", json={"on": True})
+    held, _ = tdc._fw_open_fetch_path("203.0.113.50", 8080)
+    out = tdc._fetch_capture(FINDING)
+    assert out["sha256"] and out["allow_closed"] is False
+    assert "another fetch" in out["close_problem"] and all(n in fw.run.rules for n in held)
+    assert tdc._fw_close_fetch_path(held) == ([], False) and not any(n in fw.run.rules for n in held)
+
+
+def test_no_powershell_runs_while_the_fetch_path_lock_is_held(client, fw, tdc, monkeypatch):
+    """The collector takes that lock at every sweep, so nothing may hold it across a PowerShell call."""
+    import threading
+    free = []
+
+    def watch(args):
+        seen = []
+
+        def probe():                     # from another thread: for this one the lock is re-entrant
+            got = tdc._fw_fetch_cond.acquire(timeout=0.5)
+            if got:
+                tdc._fw_fetch_cond.release()
+            seen.append(got)
+        prober = threading.Thread(target=probe)
+        prober.start()
+        prober.join(5)
+        free.append(bool(seen) and seen[0])
+        return fw.run(args)
+    monkeypatch.setattr(tdc, "_fw_runner", watch)
+    client.post("/api/firewall/isolate", json={"on": True})
+    names, _ = tdc._fw_open_fetch_path("203.0.113.50", 8080)
+    assert tdc._fw_close_fetch_path(names) == ([], False)
+    monkeypatch.setattr(tdc, "_fw_fetch_swept", 0.0)
+    tdc._firewall_sweep(now=time.time())
+    assert free and all(free)                      # every call found the lock free
+
+
 def test_the_sweep_leaves_a_rule_a_running_fetch_still_needs(client, fw, tdc, monkeypatch):
     client.post("/api/firewall/isolate", json={"on": True})
     monkeypatch.setattr(tdc, "_fw_fetch_swept", 0.0)
     names, _ = tdc._fw_open_fetch_path("203.0.113.50", 8080)
     tdc._firewall_sweep(now=time.time())
     assert all(n in fw.run.rules for n in names) and tdc._fw_isolate_state()["fetches_in_flight"] == 1
-    assert tdc._fw_close_fetch_path(names) == []
+    assert tdc._fw_close_fetch_path(names) == ([], False)
 
 
 def test_the_sweep_removes_a_per_fetch_rule_no_fetch_is_using(client, fw, tdc, monkeypatch):

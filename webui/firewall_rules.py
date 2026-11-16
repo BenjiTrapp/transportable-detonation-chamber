@@ -554,20 +554,31 @@ def deny_fetch(run, name: str) -> None:
                         + (f" ({'; '.join(failed)})" if failed else ""))
 
 
-def forget_fetch_rules(run) -> List[str]:
+def forget_fetch_rules(run) -> Tuple[List[str], List[Dict[str, str]]]:
     """Remove every per-fetch allow rule that stands, and the standing fetcher rule older versions wrote.
 
-    A fetch that was interrupted (the service stopped, the VM reverted) would otherwise leave its way out of
-    ISOLATED open for good. Called once at start-up; returns the names it removed.
+    ``(removed, stuck)``: the names that went, and ``{rule_id, problem}`` for each one that would not. A failed
+    removal does **not** stop the others: every one of them is a way out of ISOLATED standing open, and after a
+    crash this is the only thing that can find them, because the names died with the process that held them.
+    The caller is told which are left so that it can say so instead of leaving a hole nobody sees.
+
+    A fetch that is in flight owns its rules; the caller only runs this when none is.
     """
-    left = []
+    removed: List[str] = []
+    stuck: List[Dict[str, str]] = []
     with _LOCK:
         for rule in rules(run):
             name = rule["rule_id"]
-            if name.startswith(FETCH_PREFIX) or name in (FETCHER_RULE, FETCHER_RULE + SWAP_SUFFIX):
+            if not (name.startswith(FETCH_PREFIX) or name in (FETCHER_RULE, FETCHER_RULE + SWAP_SUFFIX)):
+                continue
+            try:
                 _ok(run, "Remove", Name=name)
-                left.append(name)
-    return left
+                if _describe(run, name) is not None:    # Remove is quiet about a rule it did not remove
+                    raise RuleError(f"{name} is still there after it was removed")
+                removed.append(name)
+            except RuleError as e:
+                stuck.append({"rule_id": name, "problem": _first_line(e)})
+    return removed, stuck
 
 
 def _identity(view: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[str], bool]:

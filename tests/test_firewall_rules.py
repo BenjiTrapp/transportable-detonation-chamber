@@ -786,9 +786,36 @@ def test_forget_fetch_rules_clears_what_an_interrupted_run_left():
     stale = rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)["name"]
     run.rules[FETCHER] = run.view(FETCHER, Action="Allow", Program=PY)      # the standing rule of an older version
     kept = rules_mod.block(run, image=IMAGE, ip="5.6.7.8", fetcher=PY)["rule_id"]
-    assert sorted(rules_mod.forget_fetch_rules(run)) == sorted([stale, FETCHER])
+    removed, stuck = rules_mod.forget_fetch_rules(run)
+    assert sorted(removed) == sorted([stale, FETCHER]) and stuck == []
     assert set(run.rules) == {LOOPBACK, kept}             # the isolation and the blocks stay
-    assert rules_mod.forget_fetch_rules(run) == []
+    assert rules_mod.forget_fetch_rules(run) == ([], [])
+
+
+def test_forget_fetch_rules_keeps_going_past_one_that_will_not_go_and_names_it():
+    """A way out a crash left behind is only findable here, so one that sticks must not stop the others."""
+    run, settings = make()
+    rules_mod.isolate(run, True, settings=settings)
+    first = rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)["name"]
+    second = rules_mod.allow_fetch(run, fetcher=PY, ip="5.6.7.8", port=443)["name"]
+    real = run.op_Remove
+
+    def remove(p):
+        return (1, "", "denied") if p["Name"] == first else real(p)
+    run.op_Remove = remove
+    removed, stuck = rules_mod.forget_fetch_rules(run)
+    assert removed == [second] and [s["rule_id"] for s in stuck] == [first]
+    assert "denied" in stuck[0]["problem"] and first in run.rules and second not in run.rules
+
+
+def test_a_removal_that_says_nothing_but_leaves_the_rule_is_still_stuck():
+    """Remove is quiet about a rule it did not remove, so the read-back is what notices."""
+    run = FakeRun()
+    name = rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)["name"]
+    run.op_Remove = lambda p: (0, "", "")                  # says yes, does nothing
+    removed, stuck = rules_mod.forget_fetch_rules(run)
+    assert removed == [] and [s["rule_id"] for s in stuck] == [name]
+    assert "still there" in stuck[0]["problem"]
 
 
 def test_leaving_isolated_removes_a_per_fetch_rule_that_was_still_open():
