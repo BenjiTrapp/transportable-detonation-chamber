@@ -377,6 +377,11 @@ def test_firewall_captures_lists_the_newest_with_a_defanged_url(api):
          "url": "http://203.0.113.7:8443/stage2.exe", "dst_ip": "203.0.113.7", "dst_port": 8443,
          "image": "C:\\Users\\a\\loader.exe", "pid": 4242, "path": "C:\\tdc\\samples\\ab\\" + "ab" * 32},
         {"fetched_at": "2026-11-16T09:00:00Z", "sha256": "cd" * 32, "url": "https://x.example/a"}]}})
+    # review m-1: the forms Task 7 m-4 fixed in the UI's fwDefang, a scheme with backslashes and no scheme at all
+    assert server._defang("http:\\\\evil.example\\a.exe") == "hxxp:\\\\evil[.]example\\a.exe"
+    assert server._defang("//evil.example/a") == "//evil[.]example/a"
+    assert server._defang("javascript:alert(1).x") == "javascript[:]alert(1)[.]x"
+    assert server._defang("evil.example:8080/x.exe") == "evil[.]example:8080/x.exe"
     out = server.tdc_firewall_captures(limit=1)
     assert fake.calls[0][0] == "/api/firewall/captures"
     assert "2 captures, the newest 1 shown" in out and "ab" * 32 in out and "cd" * 32 not in out

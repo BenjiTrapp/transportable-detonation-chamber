@@ -357,3 +357,49 @@ def test_jitter_stays_on_the_map_near_the_edges():
         assert -90 <= lat <= 90 and -180 <= lon <= 180
         lat, lon = geoip.jitter(f"185.244.26.{i}", -89.5, -179.5)
         assert -90 <= lat <= 90 and -180 <= lon <= 180
+
+
+def test_load_maps_a_copy_and_never_holds_the_committed_index_open(tmp_path, geoip_cache):
+    """Windows refuses to overwrite a mapped file. With the committed index mapped, a deploy could not replace it
+    while the web UI ran; so load maps a copy in CACHE_DIR and leaves the source closed."""
+    geoip.build_index(str(FIXTURE_DIR), str(tmp_path / "data"))
+    copy_countries(str(tmp_path / "data"))
+    geoip.load(str(tmp_path / "data"))
+    assert geoip.lookup("8.8.8.8").asn == 15169
+    copies = sorted(os.listdir(geoip_cache))
+    assert [c.split("-")[1] for c in copies] == ["v4", "v6"] and all(c.endswith(".idx") for c in copies)
+    mapped = [geoip._state.v4._file.name, geoip._state.v6._file.name]
+    assert all(os.path.dirname(m) == str(geoip_cache) for m in mapped), mapped
+    # the source can be replaced (as a deploy does) and the next load answers from the new one
+    write_tables(str(tmp_path / "src"), [("8.8.8.0", "8.8.8.255", "64500", "NL", "EXAMPLE-AS")])
+    geoip.build_index(str(tmp_path / "src"), str(tmp_path / "data"))
+    geoip.load(str(tmp_path / "data"))
+    assert geoip.lookup("8.8.8.8").asn == 64500
+    assert len([c for c in os.listdir(geoip_cache) if c.startswith("ip2asn-v4-")]) == 1   # the old copy is gone
+
+
+def test_a_changed_source_of_the_same_size_is_not_answered_from_a_stale_copy(tmp_path, geoip_cache):
+    geoip.build_index(str(FIXTURE_DIR), str(tmp_path))
+    geoip.load(str(tmp_path))
+    assert geoip.lookup("8.8.8.8").asn == 15169
+    path = tmp_path / "ip2asn-v4.idx"
+    data = bytearray(path.read_bytes())
+    for i in range(0, len(data), geoip.RECORD_V4.size):            # same size, other AS numbers
+        start, end, _asn, word = geoip.RECORD_V4.unpack_from(data, i)
+        geoip.RECORD_V4.pack_into(data, i, start, end, 64511, word)
+    path.write_bytes(bytes(data))
+    stat = os.stat(path)
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    geoip.load(str(tmp_path))
+    assert geoip.lookup("8.8.8.8").asn == 64511
+
+
+def test_a_copy_that_cannot_be_made_leaves_no_geo_data_instead_of_raising(tmp_path, monkeypatch):
+    geoip.build_index(str(FIXTURE_DIR), str(tmp_path))
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("x")
+    monkeypatch.setattr(geoip, "CACHE_DIR", str(blocker / "cache"))
+    before = open_files()
+    geoip.load(str(tmp_path))
+    assert geoip.available() is False and geoip.lookup("8.8.8.8") is None
+    assert open_files() == before

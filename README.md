@@ -1242,9 +1242,14 @@ The **FIREWALL** tab shows whom the chamber talks to and lets you act on it
 while the sample runs: a process tree with each process's endpoints, a world
 map of the destinations, and the switches that write rules into the Windows
 Firewall. It is built from what Windows already records (Sysmon 1, 3 and 22,
-`pfirewall.log`, PowerShell 4104/4103 and the BITS client log), read every 10
-seconds; while a detonation runs, Sysmon and BITS every second. It sees a connection
-**after** it was made, about a second late; it does not hold one back.
+`pfirewall.log`, PowerShell 4104/4103 and the BITS client log). It sees a
+connection **after** it was made and does not hold one back. How late depends on
+the source: everything is read every 10 seconds; while a detonation runs, Sysmon
+(processes, connections, DNS) and the BITS log are read every second, but
+PowerShell and the firewall log stay at 10 seconds. A download found in a
+PowerShell script needs both the URL (from the script block) and the connection
+(from Sysmon), so a PowerShell download cradle can be found, and its loader
+blocked, up to about ten seconds after the connection.
 Everything in it is text from the sample and is shown as text: URLs and host
 names are defanged (`hxxp://`, `example[.]com`), never a link.
 

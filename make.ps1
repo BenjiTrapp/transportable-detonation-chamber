@@ -339,26 +339,12 @@ switch ($Target) {
             Copy-Item 'webui\static\css\theme-layout.css' -Destination 'C:\DetonationChamberUI\static\css\theme-layout.css' -ToSession $s -Force
             Copy-Item 'webui\static\css\theme-cyberpunk.css' -Destination 'C:\DetonationChamberUI\static\css\theme-cyberpunk.css' -ToSession $s -Force
             Copy-Item 'webui\static\js\app.js' -Destination 'C:\DetonationChamberUI\static\js\app.js' -ToSession $s -Force
-            # Data directories, whole: the offline geo index and the world map. An unchanged file is left alone; a
-            # changed geo index needs the web UI stopped, because it maps the file and Windows will not overwrite it.
+            # Data directories, whole: the offline geo index and the world map
             Invoke-Command -Session $s -ScriptBlock { New-Item -ItemType Directory -Path 'C:\DetonationChamberUI\data', 'C:\DetonationChamberUI\static\data' -Force | Out-Null }
-            $stopped = $false
             foreach ($dataDir in @('data', 'static\data')) {
                 foreach ($dataFile in @(Get-ChildItem "webui\$dataDir" -File)) {
-                    $remote = "C:\DetonationChamberUI\$dataDir\$($dataFile.Name)"
-                    $there = Invoke-Command -Session $s -ArgumentList $remote -ScriptBlock { param($p) if (Test-Path $p) { (Get-FileHash -Algorithm SHA256 $p).Hash } }
-                    if ($there -eq (Get-FileHash -Algorithm SHA256 $dataFile.FullName).Hash) { Write-Host "[deploy] webui\$dataDir\$($dataFile.Name) unchanged"; continue }
-                    if ($dataFile.Extension -eq '.idx' -and $there -and -not $stopped) {
-                        Write-Host "[deploy] Stopping the web UI to replace the geo index it holds open..." -ForegroundColor Yellow
-                        Invoke-Command -Session $s -ScriptBlock { Get-Process -Name python* -EA SilentlyContinue | Stop-Process -Force; Start-Sleep 2 }
-                        $stopped = $true
-                    }
-                    Copy-Item $dataFile.FullName -Destination $remote -ToSession $s -Force
+                    Copy-Item $dataFile.FullName -Destination "C:\DetonationChamberUI\$dataDir\$($dataFile.Name)" -ToSession $s -Force
                 }
-            }
-            if ($stopped) {
-                Invoke-Command -Session $s -ScriptBlock { Start-ScheduledTask -TaskName DetonationChamberUI }
-                Write-Host "[deploy] Web UI started again" -ForegroundColor Yellow
             }
             Copy-Item 'webui\static\icon.png' -Destination 'C:\DetonationChamberUI\static\icon.png' -ToSession $s -Force -ErrorAction SilentlyContinue
             # Install scripts for the tool updates, the logging set-up and the way out of ISOLATED
@@ -393,7 +379,15 @@ switch ($Target) {
             Copy-Item 'webui\firewall_rules.ps1' -Destination 'C:\DetonationChamberUI\firewall_rules.ps1' -ToSession $s -Force
             Copy-Item 'webui\firewall_store.py' -Destination 'C:\DetonationChamberUI\firewall_store.py' -ToSession $s -Force
             Copy-Item 'webui\geoip.py' -Destination 'C:\DetonationChamberUI\geoip.py' -ToSession $s -Force
-            Write-Host "[deploy-app] app.py and modules synced." -ForegroundColor Green
+            # What the modules need at run time: the FIREWALL data and the way out of ISOLATED
+            Invoke-Command -Session $s -ScriptBlock { New-Item -ItemType Directory -Path 'C:\DetonationChamberUI\data', 'C:\DetonationChamberUI\static\data', 'C:\tdc\scripts' -Force | Out-Null }
+            foreach ($dataDir in @('data', 'static\data')) {
+                foreach ($dataFile in @(Get-ChildItem "webui\$dataDir" -File)) {
+                    Copy-Item $dataFile.FullName -Destination "C:\DetonationChamberUI\$dataDir\$($dataFile.Name)" -ToSession $s -Force
+                }
+            }
+            Copy-Item 'scripts\tdc-unisolate.ps1' -Destination 'C:\tdc\scripts\tdc-unisolate.ps1' -ToSession $s -Force
+            Write-Host "[deploy-app] app.py, modules, FIREWALL data and tdc-unisolate.ps1 synced." -ForegroundColor Green
         } finally {
             Remove-PSSession $s
         }

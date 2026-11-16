@@ -12,6 +12,7 @@ import datetime
 import functools
 import json
 import os
+import re
 import sys
 from typing import Optional
 
@@ -1667,16 +1668,40 @@ def _fw_since(since: str) -> Optional[str]:
     return text
 
 
+# The schemes that are always one, as in the FIREWALL tab's fwDefang (app.js), which this follows rule for rule
+_FW_SCHEMES = frozenset({
+    "http", "https", "ftp", "ftps", "sftp", "file", "smb", "javascript", "vbscript", "jscript", "data", "blob",
+    "about", "mailto", "tel", "ws", "wss", "ldap", "ms-msdt", "search-ms", "ms-officecmd", "ms-word", "ms-excel",
+    "mhtml"})
+_BIDI = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
 def _defang(text) -> str:
-    """A URL or host name as the FIREWALL tab shows it: hxxp://, example[.]com. Never a working link."""
-    s = _one_line(text, 300)
+    """A URL or host name as the FIREWALL tab shows it: hxxp://, example[.]com. Never a working link.
+
+    A known scheme is always one (javascript:1/alert(1)); another word before a colon is one only without a dot and
+    not followed by digits (host:port). The host is what follows the scheme, with or without // or \\\\ before it."""
+    s = _BIDI.sub("", _one_line(text, 300))
+    if not s:
+        return ""
+    m = re.match(r"([a-z][a-z0-9+.-]*):", s, re.I)
+    scheme = ""
+    if m:
+        after = s[m.end():]
+        if m.group(1).lower() in _FW_SCHEMES or ("." not in m.group(1) and not re.match(r"\d+(?:[/?#\\]|$)", after)):
+            scheme = m.group(1)
     head, rest = "", s
-    if "://" in s:
-        scheme, rest = s.split("://", 1)
-        head = (scheme.replace("t", "x").replace("T", "X") + ":" if scheme.lower() in ("http", "https")
-                else scheme + "[:]") + "//"
-    cut = min([i for i in (rest.find(c) for c in "/?#\\") if i >= 0] or [len(rest)])
-    return head + rest[:cut].replace(".", "[.]") + rest[cut:]
+    if scheme:
+        rest = s[len(scheme) + 1:]
+        web = scheme.lower() in ("http", "https")
+        head = (scheme.replace("t", "x").replace("T", "X") + ":") if web else scheme + "[:]"
+        if not web and not re.match(r"[/\\]{2}", rest):
+            return head + rest.replace(".", "[.]")
+    lead = re.match(r"[/\\]*", rest).group(0)
+    after = rest[len(lead):]
+    cut = re.search(r"[/\\?#]", after)
+    host, tail = (after, "") if cut is None else (after[:cut.start()], after[cut.start():])
+    return head + lead + host.replace(".", "[.]") + tail
 
 
 def _fw_base(image) -> str:

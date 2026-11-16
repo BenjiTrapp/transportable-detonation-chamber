@@ -22,6 +22,15 @@ os.environ["TDC_LOG_DIR"] = tempfile.mkdtemp(prefix="tdc-test-logs-")
 os.environ.pop("TDC_VM_WEBUI", None)
 
 
+@pytest.fixture(autouse=True)
+def geoip_cache(tmp_path, monkeypatch):
+    """geoip.load maps copies of the index in a cache directory: in tests the test's own, never the system's."""
+    import geoip  # noqa: WPS433 - after sys.path is set
+    cache = tmp_path / "geoip-cache"
+    monkeypatch.setattr(geoip, "CACHE_DIR", str(cache))
+    return cache
+
+
 @pytest.fixture(scope="session")
 def app_module():
     import app as app_module  # noqa: WPS433 - imported after env setup on purpose

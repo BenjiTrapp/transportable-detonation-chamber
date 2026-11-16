@@ -110,6 +110,16 @@ def test_every_deploy_path_ships_the_data_directories_and_the_way_out_of_isolate
     assert "DATA_FILES" in utm[utm.index("def do_deploy"):]
     assert 'os.path.join(REPO, "scripts", "tdc-unisolate.ps1")' in utm
     assert "scripts/tdc-unisolate.ps1" in vagrant and "'scripts\\tdc-unisolate.ps1'" in hyperv
+    # deploy-app ships app.py and its modules; without the data and the hatch it would leave a tab with no geo
+    # data and no way out of ISOLATED (review m-4)
+    vagrant_app = make[make.index("\ndeploy-app:"):make.index("\n.PHONY: restart")]
+    hyperv_app = ps1[ps1.index("'deploy-app' {"):ps1.index("'restart' {")]
+    for local in ("data", "static/data"):
+        assert f"webui/{local}/*" in vagrant_app and f"'{local.replace('/', chr(92))}'" in hyperv_app, local
+    assert "scripts/tdc-unisolate.ps1" in vagrant_app and "'scripts\\tdc-unisolate.ps1'" in hyperv_app
+    # The geo index is not held open by the web UI any more (geoip maps a copy), so no path stops it to deploy
+    for path in (utm, vagrant, hyperv):
+        assert "Stop-Process" not in path.replace(utm[utm.index("RESTART_PS"):utm.index("LOGS_PS")], "")
 
 
 def test_readme_rizin_rows_say_what_the_server_answers():

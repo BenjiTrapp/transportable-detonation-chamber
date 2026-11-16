@@ -25,10 +25,15 @@ than a /64, and the partial /64 at the edge of a range, share their /64 with
 another AS and cannot be told apart at this resolution, so they are left out:
 an address in one of them gets no answer (0.2 % of the ranges of 2026-11).
 
-``load`` maps the two index files with ``mmap`` and ``lookup`` bisects over them,
-so a lookup reads a few pages and the tables are not held in memory. There is no
-build step at start-up and nothing is written at run time. The AS names are read
-from their file on the first hit.
+``load`` copies the two index files into ``CACHE_DIR`` (``%TEMP%\tdc-geoip`` on
+the VM), maps the copies with ``mmap`` and ``lookup`` bisects over them, so a
+lookup reads a few pages and the tables are not held in memory. The committed
+files are never held open: Windows refuses to overwrite a mapped file, and a
+deploy must be able to replace them while the web UI runs. A copy is named
+after its source's size and modification time, so a changed source can never be
+answered from a stale copy; copies of older sources are removed when they are
+not in use. There is no build step at start-up. The AS names are read from
+their file on the first hit and closed again.
 
 ``lookup(ip)`` returns a ``GeoInfo`` for a public address in a routed range and
 ``None`` when nothing is known about the address: a local address, a string that
@@ -60,6 +65,7 @@ from collections import namedtuple
 logger = logging.getLogger(__name__)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+CACHE_DIR = os.path.join(tempfile.gettempdir(), "tdc-geoip")    # where load maps its copies of the index
 
 SOURCE_V4 = "ip2asn-v4.tsv.gz"      # the upstream tables, read by build_index only
 SOURCE_V6 = "ip2asn-v6.tsv.gz"
@@ -310,12 +316,54 @@ def _read_countries(path):
     return countries
 
 
-def load(data_dir=DATA_DIR):
-    """(Re)load the index files of ``data_dir``.
+def _cached_copy(path):
+    """The copy of the index file ``path`` in ``CACHE_DIR`` that ``load`` maps; ``path`` itself when there is none.
 
-    Never raises: without index files, or with one that is not a whole number of
-    records, ``available()`` is False. Meant for start-up and for tests, not to be
-    called while another thread looks up.
+    The copy's name carries the source's size and mtime (ns), so a source that changed gets a new copy and an old
+    copy is never read for it. Copies of other versions of the same file are removed, which fails harmlessly for one
+    that another process still maps. OSError when the copy cannot be made.
+    """
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return path                                   # _Index treats a missing file as no data
+    stem, ext = os.path.splitext(os.path.basename(path))
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    copy = os.path.join(CACHE_DIR, f"{stem}-{st.st_size}-{st.st_mtime_ns}{ext}")
+    try:
+        fresh = os.path.getsize(copy) == st.st_size
+    except OSError:
+        fresh = False
+    if not fresh:
+        fd, tmp = tempfile.mkstemp(dir=CACHE_DIR, prefix=os.path.basename(copy) + ".")
+        try:
+            with os.fdopen(fd, "wb") as out, open(path, "rb") as src:
+                for block in iter(lambda: src.read(1 << 20), b""):
+                    out.write(block)
+            if os.path.getsize(tmp) != st.st_size or os.stat(path).st_mtime_ns != st.st_mtime_ns:
+                raise OSError(f"{os.path.basename(path)} changed while it was copied")
+            os.replace(tmp, copy)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    for name in os.listdir(CACHE_DIR):
+        if name != os.path.basename(copy) and name.startswith(stem + "-") and name.endswith(ext):
+            try:
+                os.unlink(os.path.join(CACHE_DIR, name))
+            except OSError:
+                pass
+    return copy
+
+
+def load(data_dir=DATA_DIR):
+    """(Re)load the index files of ``data_dir``, through copies in ``CACHE_DIR`` (see the module docstring).
+
+    Never raises: without index files, with one that is not a whole number of
+    records, or when the copies cannot be made, ``available()`` is False. Meant for
+    start-up and for tests, not to be called while another thread looks up.
     """
     global _state
     old, _state = _state, _State()
@@ -325,8 +373,8 @@ def load(data_dir=DATA_DIR):
         return
     v4 = v6 = None
     try:
-        v4 = _Index(os.path.join(data_dir, INDEX_V4), RECORD_V4, KEY_V4)
-        v6 = _Index(os.path.join(data_dir, INDEX_V6), RECORD_V6, KEY_V6)
+        v4 = _Index(_cached_copy(os.path.join(data_dir, INDEX_V4)), RECORD_V4, KEY_V4)
+        v6 = _Index(_cached_copy(os.path.join(data_dir, INDEX_V6)), RECORD_V6, KEY_V6)
         countries = _read_countries(os.path.join(data_dir, COUNTRIES_FILE))
     except (OSError, ValueError) as exc:
         logger.warning("geoip: cannot load the index of %s: %s", data_dir, exc)

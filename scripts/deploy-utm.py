@@ -16,7 +16,6 @@ Usage:
 import argparse
 import functools
 import glob
-import hashlib
 import http.server
 import os
 import socketserver
@@ -85,13 +84,6 @@ SCRIPT_FILES = {
                        + [os.path.join(REPO, "scripts", "configure-logging.ps1"),
                           os.path.join(REPO, "scripts", "tdc-unisolate.ps1")])
 }
-
-# Files the running web UI keeps mapped (geoip.py), which Windows will not let a deploy overwrite
-MAPPED_SUFFIXES = (".idx",)
-
-STOP_PS = (
-    "Get-Process -Name python* -EA SilentlyContinue | Stop-Process -Force; Start-Sleep 2"
-)
 
 RESTART_PS = (
     "Get-Process -Name python* -EA SilentlyContinue | Stop-Process -Force;"
@@ -168,45 +160,14 @@ def stop(httpd):
     httpd.server_close()
 
 
-def _sha256(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _data_on_vm(sess):
-    """``{local: sha256}`` of the data files that are on the VM already (one PowerShell call)."""
-    remote = run_ps(sess, ";".join(
-        f'if (Test-Path "{r}") {{ "{l}=" + (Get-FileHash -Algorithm SHA256 "{r}").Hash }}'
-        for l, r in DATA_FILES.items()), label="data hashes")
-    return {l.strip(): h.strip().lower() for l, h in (line.split("=", 1) for line in remote.splitlines() if "=" in line)}
-
-
 def do_deploy(sess, args):
-    """Copy the files; returns True when it stopped the web UI (to replace a file the web UI maps)."""
     httpd = serve()
     print(f"[*] Host HTTP server on :{PORT}, deploying to {args.vm_ip} ...")
-    stopped = False
     try:
         dirs = ",".join(f'"{d}"' for d in [SCRIPTS_REMOTE_DIR, *DATA_DIRS.values()])
         ps = f'New-Item -ItemType Directory -Path {dirs} -Force | Out-Null'
         run_ps(sess, ps, label="directories")
-        # The data rarely changes, so an unchanged file is left alone. A changed geo index can only be replaced
-        # with the web UI stopped: it maps the file, and Windows refuses to overwrite a mapped file.
-        there = _data_on_vm(sess)
-        data = {}
-        for local, remote in DATA_FILES.items():
-            if there.get(local) == _sha256(os.path.join(REPO, local)):
-                print(f"  [=] {local} unchanged")
-            else:
-                data[local] = remote
-        if any(l.endswith(MAPPED_SUFFIXES) and l in there for l in data):
-            print("[*] Stopping the web UI to replace the geo index it holds open ...")
-            run_ps(sess, STOP_PS, "stop")
-            stopped = True
-        for local, remote in {**FILES, **data, **SCRIPT_FILES}.items():
+        for local, remote in {**FILES, **DATA_FILES, **SCRIPT_FILES}.items():
             if not os.path.isfile(os.path.join(REPO, local)):
                 print(f"  [-] skip {local} (not found)")
                 continue
@@ -220,7 +181,6 @@ def do_deploy(sess, args):
             print(f"  [+] {local} -> {remote} ({out} bytes)")
     finally:
         stop(httpd)
-    return stopped
 
 
 def do_install(sess, args):
@@ -310,8 +270,8 @@ def main():
         return
 
     # default action: deploy (optionally followed by restart)
-    stopped = do_deploy(sess, args)
-    if args.restart or stopped:
+    do_deploy(sess, args)
+    if args.restart:
         print("[*] Restarting DetonationChamberUI ...")
         print("    Task state:", run_ps(sess, RESTART_PS, "restart"))
     print("[+] Done.")

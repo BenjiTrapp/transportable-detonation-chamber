@@ -16,14 +16,13 @@ the FIREWALL tab needs:
    the data directories `webui/data/` (the offline geo index, about 9 MB) and
    `webui/static/data/` (the world map), and `scripts/tdc-unisolate.ps1` to
    `C:\tdc\scripts`. Without the restart the old `app.py` keeps running.
-   - A data file that is the same on the VM is skipped (by SHA-256). A changed
-     geo index (`*.idx`) can only be replaced with the web UI stopped, because
-     `geoip.py` maps it and Windows refuses to overwrite a mapped file; the
-     deploy then stops the web UI and starts it again by itself. Its stop is
-     the same `Get-Process python* | Stop-Process` as `make restart`, which also
-     ends Detonator's and LitterBox's Python (an old limitation of `restart`,
-     not new here). On the very first deploy the index is not on the VM yet, so
-     nothing is stopped.
+   `deploy-app` ships the same modules, data and `tdc-unisolate.ps1`, without
+   the page assets.
+   - The deploy overwrites the geo index while the web UI runs. That works
+     because `geoip.load` maps a **copy** in `%TEMP%\tdc-geoip` (named after
+     the source's size and mtime), never the file in `webui\data`; Windows
+     refuses to overwrite a mapped file. A new index takes effect at the next
+     start of the web UI.
 2. **`C:\tdc\scripts\configure-logging.ps1`, once, as Administrator.** It turns
    on what the tab reads besides Sysmon: PowerShell script block and module
    logging, Windows Firewall logging of allowed and dropped packets
@@ -38,8 +37,9 @@ the FIREWALL tab needs:
    deploy, the data directory did not arrive: check
    `C:\DetonationChamberUI\data\ip2asn-v4.idx`, rather than running `make geoip`.
 
-The web UI makes `C:\tdc\samples` and its Defender exclusion at its own start,
-so the secured samples need no extra step (provisioning does it too).
+The web UI tries to make `C:\tdc\samples` and its Defender exclusion at its own
+start (provisioning does too). Whether the exclusion really holds is one of the
+open Windows questions in Section 3: a failure is only logged.
 
 ## 2. Three screenshots
 
@@ -190,12 +190,47 @@ Every rule change goes through
   start-up and at most every 5 minutes, off the fetch's own deadline. *If slow:*
   a fetch that refreshes the list can be late.
 
+### The secured samples and Defender
+
+- **The Defender exclusion for `C:\tdc\samples`.** The web UI runs
+  `Add-MpPreference -ExclusionPath C:\tdc\samples` at every start
+  (`_ensure_capture_dir`), and only logs a failure. Tamper Protection, a
+  policy-managed Defender or a Defender service that is not running can refuse
+  it quietly. *Check:* after a web UI start, `Get-MpPreference | Select
+  -ExpandProperty ExclusionPath` lists `C:\tdc\samples`; then let TDC fetch an
+  EICAR test file (CUT + FETCH on a test decision) and check that the file is
+  still in `C:\tdc\samples\<sha256[:2]>\` a minute later, and that
+  `GET /api/firewall/capture/<id>` says `exists: true`. *If wrong:* Defender
+  quarantines every fetched stage-2, which is the one output of the download
+  path; the capture's metadata stays, its file is gone, and nothing says why.
+  Add the exclusion by hand or by policy.
+
+### Load and policy
+
+- **The collector's process load.** During a detonation the collector starts
+  `wevtutil` for Sysmon (EID 1, 3, 22) and the BITS log every second, and with
+  the tab open and LIVE on, `GET /api/firewall/isolate` starts a PowerShell for
+  the profiles at most once a minute (cached; every 10 s after an error) while
+  the tab polls it every 5 s. Neither was measured. *Check:* the CPU of the web
+  UI's Python and its child processes during a detonation with the tab open
+  (Task Manager, or `Get-Process wevtutil, powershell`). *If too high:* the
+  sample runs on a busier box than it would, and timing-sensitive samples may
+  notice; the fast tick's sources can be split further (`firewall_store.py`).
+- **TURN THE FIREWALL ON under a managed profile.** `Set-NetFirewallProfile
+  -Enabled True` can be overridden by a GPO; the route then answers 500 with the
+  profiles still off. *Check:* switch one profile off in Windows Defender
+  Firewall, press TURN THE FIREWALL ON once, and see the red band go. *If
+  wrong:* the button cannot help; the profile has to be turned on where the
+  policy comes from.
+
 ### Deploy
 
-- **`make deploy` with a changed geo index** stops the web UI, replaces the
-  index and starts it again (Section 1). *Check once:* after a `make geoip`, the
-  deploy prints that it stops the web UI, and the map has data afterwards.
-  *If wrong:* the old index stays (the upload fails while the file is mapped).
+- **`make deploy` while the web UI runs** overwrites `webui\data\*.idx`
+  (Section 1). *Check once:* deploy twice in a row with the web UI running; no
+  upload of an `.idx` fails, and `%TEMP%\tdc-geoip` (as SYSTEM:
+  `C:\Windows\Temp\tdc-geoip`) holds one copy of each index. *If wrong:* the
+  deploy of the index fails while the web UI runs, and a new index needs the
+  web UI stopped first.
 
 ## 4. Limits that are by design, not bugs
 
@@ -203,9 +238,18 @@ So that nobody files them:
 
 - **No byte counts.** Sysmon has none; the tab counts connections and firewall
   records (Part B's proxy would add them).
-- **Seen after the fact.** A connection is seen about a second after it was
-  made; a download decision blocks first and asks then. A compiled loader that
-  calls WinHTTP shows no URL.
+- **Seen after the fact.** During a detonation Sysmon and BITS are read every
+  second, PowerShell and the firewall log every 10 s; outside one, everything
+  every 10 s. A download in a PowerShell script needs the URL and the
+  connection, so a cradle can be found, and its loader blocked, up to about
+  10 s after the connection. A download decision blocks first and asks then. A
+  compiled loader that calls WinHTTP shows no URL.
+- **A Windows Update BITS job during a detonation counts as the detonation's.**
+  The BITS log does not name who asked, so a BITS job for an executable while a
+  submission runs is `in_detonation`; under ASK `Detonation` its `svchost.exe`
+  gets a block to that address and a decision is opened. Deliberate: without it
+  BITS (T1197) would be invisible as a download path. Update hosts that TDC
+  knows are never asked about.
 - **"blocked" ignores the protocol.** A tcp rule makes a udp flow to the same
   endpoint read as blocked; the UI shows the rule's protocol beside the claim.
 - **ISOLATED's residual.** While a fetch runs, anything that can run the web
