@@ -2005,7 +2005,49 @@ def test_the_way_back_to_a_selection_that_is_gone_says_so():
     r = _run(r"""
         fwState.loaded = true; fwState.rules = []; fwState.flows = [flow()];
         openFirewallTab({ ip: '198.51.100.9', text: '' });
+        answer = url => url.startsWith('/api/firewall/connections') ? reply({ connections: [flow()], count: 1 })
+            : reply({ pending: [], history: [] });
+        await fwLoadFlows();
         const before = els['firewall-hints'].innerHTML;
         fwSelect('a:203.0.113.7');
         console.log(JSON.stringify([before.includes('has no connections'), els['firewall-hints'].innerHTML.includes('has no connections')]));""")
     assert r == [True, False]
+
+
+@needs_node
+def test_a_selection_is_gone_only_by_the_fresh_full_list():
+    """Task 9 re-review: the message was also set on the first apply, which runs on the list on screen. It showed
+    while the load was still out, stayed when the load failed, and claimed "no connections" of a list the server
+    had cut to its most severe rows."""
+    r = _run(r"""
+        fwState.loaded = true; fwState.rules = []; fwState.flows = [flow()];
+        openFirewallTab({ ip: '198.51.100.9', text: '' });
+        const stale = els['firewall-hints'].innerHTML.includes('has no connections');
+        answer = url => url.startsWith('/api/firewall/connections') ? reply({ error: 'down' }, 500)
+            : reply({ pending: [], history: [] });
+        await fwLoadFlows();
+        const failed = fwWantMissed;
+        answer = url => url.startsWith('/api/firewall/connections')
+            ? reply({ connections: [flow()], count: 900, truncated: true }) : reply({ pending: [], history: [] });
+        await fwLoadFlows();
+        console.log(JSON.stringify([stale, failed, fwWantMissed]));""")
+    stale, failed, cut = r
+    assert stale is False and failed == ""
+    assert "198.51.100.9 is not among the 1 most severe connections shown" in cut and "has no connections" not in cut
+
+
+@needs_node
+def test_the_fallback_range_does_not_claim_to_hold_more():
+    """Task 9 re-review: a range that ends now can also miss what came before it, so "may hold more" was not true."""
+    r = _run(r"""
+        const notes = [];
+        fwRange = '1h';
+        notes.push(fwRangeFallback('These connections have no times'));
+        fwRange = 'All';
+        notes.push(fwRangeFallback('These connections have no times'));
+        console.log(JSON.stringify(notes));""")
+    hour, every = r
+    assert hour["earliest"] == "-1h" and "may hold more" not in hour["note"]
+    assert "misses whatever of them came before it" in hour["note"] and "old download" in hour["note"]
+    assert every["earliest"] == "" and "everything kept" in every["note"] and "may hold more" not in every["note"]
+    assert "LOGS may no longer keep the oldest of theirs" in every["note"]

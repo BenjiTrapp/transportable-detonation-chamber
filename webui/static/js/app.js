@@ -13780,8 +13780,14 @@ function fwLogsRange(flows) {
 
 // The tab's range in place of one that could not be worked out, and why
 function fwRangeFallback(why) {
-    const range = fwRange === 'All' ? 'everything kept' : `the last ${fwRange}`;
-    return { earliest: fwEarliest(), latest: '', note: `${why}: the FIREWALL range (${range}) is used instead, which may hold more than they do.` };
+    if (fwRange === 'All') {
+        return { earliest: '', latest: '', note: `${why}: the FIREWALL range (everything kept) is used instead. `
+            + 'It is not theirs: it holds other events too, and LOGS may no longer keep the oldest of theirs.' };
+    }
+    // A range that ends now and starts fwRange ago is not theirs: it holds other events, and misses whatever of
+    // theirs came before it (an old download, the start of a connection that was already open)
+    return { earliest: fwEarliest(), latest: '', note: `${why}: the FIREWALL range (the last ${fwRange}) is used instead. `
+        + 'It is not theirs: it can hold more than they do, and it misses whatever of them came before it, such as an old download or the start of a connection that was already open.' };
 }
 
 function fwIso(ms) {
@@ -14224,7 +14230,8 @@ function fwApplyWant(final) {
     if (final) fwWant = null;
     const id = fwWantedId(want, fwState.flows);
     fwSelect(id);
-    if (!id && (want.select || want.image || want.ip)) {
+    // Only the fresh list can say the selection is gone: the one on screen may be old, and its load may still fail
+    if (final && !id && (want.select || want.image || want.ip)) {
         fwWantMissed = fwMissedText(want);
         renderFirewallHints(null);
     }
@@ -14241,6 +14248,10 @@ function fwMissedText(want) {
     }
     const proc = image ? `${fwShort(fwBase(image), 60)}${pid !== null && pid !== undefined && pid !== '' ? ` (PID ${pid})` : ''}` : '';
     const what = proc && ip ? `${proc} → ${fwShort(ip, 46)}` : proc || fwShort(ip, 46) || 'The selection';
+    // A cut list cannot say it has no connections, only that none is among those shown
+    if (fwState.truncated) {
+        return `${what} is not among the ${fwNumber(fwState.flows.length)} most severe connections shown, so nothing is selected. It may have connections that were left out; a shorter range shows fewer and may bring them in.`;
+    }
     const range = fwRange === 'All' ? 'among the connections kept' : `in the last ${fwRange}`;
     return `${what} has no connections ${range} any more, so nothing is selected.${fwRange === 'All' ? '' : ' A wider range shows older ones.'}`;
 }
