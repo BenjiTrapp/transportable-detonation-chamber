@@ -8362,6 +8362,71 @@ table[data-sortable] > thead > tr > th:focus-visible {
 .chart-svg .sankey-value {
     fill: var(--text-muted);
 }
+/* World map of the FIREWALL tab (worldMapSvg): the land is cut at the edges
+   of the map; a point or an arc takes the colour of its severity as
+   currentColor. Only an arc with an open decision moves: a dash runs from
+   the chamber outwards (still under prefers-reduced-motion). */
+.chart-svg.fw-map {
+    overflow: hidden;
+}
+.fw-grat {
+    fill: none;
+    stroke: var(--border-primary);
+    stroke-width: 0.5;
+}
+.fw-land {
+    fill: var(--bg-tertiary);
+    stroke: var(--border-accent);
+    stroke-width: 0.5;
+    stroke-linejoin: round;
+}
+.fw-tone-critical { color: var(--severity-critical); }
+.fw-tone-high { color: var(--severity-high); }
+.fw-tone-medium { color: var(--severity-medium); }
+.fw-tone-low { color: var(--severity-low); }
+.fw-tone-info { color: var(--severity-info); }
+.fw-chamber { color: var(--accent-cyan); }
+.fw-arc-hit {
+    fill: none;
+    stroke: transparent;
+    stroke-width: 8;
+}
+.fw-arc-line {
+    fill: none;
+    stroke: currentColor;
+    stroke-linecap: round;
+    opacity: 0.7;
+    pointer-events: none;
+    transition: opacity 0.15s;
+}
+.fw-arc:hover .fw-arc-line {
+    opacity: 1;
+}
+.fw-arc-pending .fw-arc-line {
+    stroke-dasharray: 6 4;
+    animation: fw-arc-dash 0.8s linear infinite;
+}
+@keyframes fw-arc-dash {
+    to { stroke-dashoffset: -10; }
+}
+.fw-dot {
+    fill: currentColor;
+    stroke: var(--bg-card);
+    stroke-width: 1;
+}
+.fw-pill {
+    fill: var(--bg-card);
+    stroke: currentColor;
+    stroke-width: 0.75;
+    opacity: 0.9;
+}
+.chart-svg .fw-label {
+    fill: var(--text-primary);
+}
+.chart-clickable .fw-arc,
+.chart-clickable .fw-point {
+    cursor: pointer;
+}
 .chart-clickable .chart-seg,
 .chart-clickable .chart-bin,
 .chart-clickable .chart-slot,
@@ -10424,7 +10489,8 @@ body.maintenance-active #app {
 @media (prefers-reduced-motion: reduce) {
     .btn-skull:not(:disabled):hover .btn-skull-art,
     .btn-skull:not(:disabled):focus-visible .btn-skull-art,
-    .tdc-confirm {
+    .tdc-confirm,
+    .fw-arc-pending .fw-arc-line {
         animation: none;
     }
     .btn-skull-art {

@@ -3693,6 +3693,158 @@ function sankeySvg(layout, opts) {
     return `<svg class="chart-svg chart-sankey" width="${width}" height="${height + 12}" viewBox="0 -6 ${width} ${height + 12}">${svg}</svg>`;
 }
 
+// --- World map (FIREWALL tab) ---
+// The part of the world the map shows: equirectangular, 2 px per degree, cut
+// at 82° N and 58° S. The chamber's own point sits in the middle of it: the
+// host's real location is never determined, and never guessed.
+const WORLD_BOX = { lon0: -180, lon1: 180, lat0: 82, lat1: -58, w: 720, h: 280 };
+const WORLD_CHAMBER_ID = '@chamber';
+
+// lon/lat to x/y of the box, not cut to it (the land beyond is cut by the SVG)
+function _worldXY(lon, lat, box) {
+    return [(lon - box.lon0) * box.w / (box.lon1 - box.lon0), (box.lat0 - lat) * box.h / (box.lat0 - box.lat1)];
+}
+
+// lon/lat to [x, y] in the box (default WORLD_BOX), cut to its edges; null
+// when either is missing or no number (a destination without geo is not at 0°/0°)
+function project(lon, lat, box) {
+    box = box || WORLD_BOX;
+    const num = v => (v === null || v === undefined || v === '' ? NaN : Number(v));
+    const lo = num(lon), la = num(lat);
+    if (!Number.isFinite(lo) || !Number.isFinite(la)) return null;
+    const [x, y] = _worldXY(lo, la, box);
+    return [Math.min(Math.max(x, 0), box.w), Math.min(Math.max(y, 0), box.h)];
+}
+
+// A tone as the class suffix of its severity; anything else (data of the VM) is info
+function _worldTone(tone) {
+    const t = String(tone ?? '').toLowerCase();
+    return ALERT_SEVERITIES.includes(t) ? t : 'info';
+}
+
+// A quadratic Bézier from a to b whose control point stands off the middle by
+// `bend` times the length, on the upper side (to the right for a vertical
+// arc), and inside the box: the curve stays in the triangle of its three
+// points, so it never leaves the map. '' for an arc too short to see.
+function _worldArcPath(a, b, bend, box) {
+    const dx = b[0] - a[0], dy = b[1] - a[1], len = Math.hypot(dx, dy);
+    if (len < 1) return '';
+    let nx = -dy / len, ny = dx / len;
+    if (ny > 0 || (ny === 0 && nx < 0)) { nx = -nx; ny = -ny; }
+    const cx = Math.min(Math.max((a[0] + b[0]) / 2 + nx * len * bend, 0), box.w);
+    const cy = Math.min(Math.max((a[1] + b[1]) / 2 + ny * len * bend, 0), box.h);
+    const c = _chartCoord;
+    return `M${c(a[0])} ${c(a[1])} Q${c(cx)} ${c(cy)} ${c(b[0])} ${c(b[1])}`;
+}
+
+// The pill of a label `width` wide beside a dot of radius r at x/y, on its
+// right or (side 'left') its left, moved inside the box where it would cross an edge
+function _worldLabelBox(x, y, r, width, side, box) {
+    const h = 12;
+    const left = side === 'left' ? x - r - 3 - width : x + r + 3;
+    return { x: Math.min(Math.max(left, 0), box.w - width), y: Math.min(Math.max(y - h / 2, 0), box.h - h), w: width, h };
+}
+
+// The world map of the FIREWALL tab: the graticule, the land of opts.world
+// (world.json: {scale, shapes: [[lon0, lat0, lon1, lat1, …], …]}, filled
+// even-odd so a hole stays open), the arcs, then the points. points [{id,
+// lon, lat, label, tone, r, title}]: one without a position is left out, and
+// so are the arcs to it; the chamber (WORLD_CHAMBER_ID, "CHAMBER") is drawn
+// by the map itself in the middle. arcs [{from, to, tone, weight, pending,
+// id, title}]: as wide as the square root of their share of the heaviest
+// (1-4 px), the thinnest on top; arcs between the same two points fan out so
+// none hides another; only `pending: true` gets the travelling dash
+// (.fw-arc-pending). Labels are placed by severity, then size, and one that
+// would cover another is left out (the <title> still has it). Colours are
+// classes (.fw-tone-<severity>), so a theme switch needs no redraw. Every
+// point and arc is a <g data-fw-id> (an arc: its id, else its `to`).
+function worldMapSvg(points, arcs, opts) {
+    opts = opts || {};
+    const box = opts.box || WORLD_BOX;
+    const c = _chartCoord;
+    let svg = '';
+    // Graticule: every 30 degrees
+    let grat = '';
+    for (let lon = Math.ceil(box.lon0 / 30) * 30; lon <= box.lon1; lon += 30) {
+        const [x] = _worldXY(lon, 0, box);
+        grat += `M${c(x)} 0V${box.h}`;
+    }
+    for (let lat = Math.floor(box.lat0 / 30) * 30; lat >= box.lat1; lat -= 30) {
+        const [, y] = _worldXY(0, lat, box);
+        grat += `M0 ${c(y)}H${box.w}`;
+    }
+    svg += `<path class="fw-grat" d="${grat}"/>`;
+    const scale = Number(opts.world?.scale) > 0 ? Number(opts.world.scale) : 10;
+    let land = '';
+    for (const ring of opts.world?.shapes || []) {
+        if (!Array.isArray(ring) || ring.length < 6) continue;
+        const values = ring.map(Number);
+        if (!values.every(Number.isFinite)) continue;
+        for (let i = 0; i + 1 < values.length; i += 2) {
+            const [x, y] = _worldXY(values[i] / scale, values[i + 1] / scale, box);
+            land += `${i ? 'L' : 'M'}${c(x)} ${c(y)}`;
+        }
+        land += 'Z';
+    }
+    if (land) svg += `<path class="fw-land" fill-rule="evenodd" d="${land}"/>`;
+
+    const chamber = { id: WORLD_CHAMBER_ID, xy: [box.w / 2, box.h / 2], label: 'CHAMBER', title: 'CHAMBER', r: 4, chamber: true, order: -1 };
+    const byId = new Map([[chamber.id, chamber]]);
+    (points || []).forEach((p, order) => {
+        const id = String(p?.id ?? '');
+        const xy = p ? project(p.lon, p.lat, box) : null;
+        if (!xy || byId.has(id)) return;
+        const label = String(p.label ?? id);
+        const r = Math.min(Math.max(Number(p.r) || 3, 2), 8);
+        byId.set(id, { id, xy, label, title: String(p.title ?? label), r, tone: _worldTone(p.tone), order });
+    });
+
+    const drawn = [], pairs = new Map();          // pair of ends -> arcs so far between them
+    let heaviest = 0;
+    for (const arc of arcs || []) {
+        const from = byId.get(String(arc?.from ?? '')), to = byId.get(String(arc?.to ?? ''));
+        if (!from || !to) continue;
+        const pair = [from.id, to.id].sort().join('\u0000');
+        const k = pairs.get(pair) || 0;
+        pairs.set(pair, k + 1);
+        const d = _worldArcPath(from.xy, to.xy, 0.17 + 0.1 * k, box);
+        if (!d) continue;
+        const weight = Number(arc.weight) > 0 && Number.isFinite(Number(arc.weight)) ? Number(arc.weight) : 0;
+        heaviest = Math.max(heaviest, weight);
+        drawn.push({ id: String(arc.id ?? to.id), d, weight, tone: _worldTone(arc.tone), pending: arc.pending === true,
+            title: String(arc.title ?? `${from.label} → ${to.label}`) });
+    }
+    drawn.forEach(a => { a.width = 1 + (heaviest > 0 ? 3 * Math.sqrt(a.weight / heaviest) : 0); });
+    drawn.sort((a, b) => b.width - a.width);
+    for (const a of drawn) {
+        svg += `<g class="fw-arc fw-tone-${a.tone}${a.pending ? ' fw-arc-pending' : ''}" data-fw-id="${escapeHtml(a.id)}"><title>${escapeHtml(a.title)}</title>`
+            + `<path class="fw-arc-hit" d="${a.d}"/><path class="fw-arc-line" d="${a.d}" stroke-width="${c(a.width)}"/></g>`;
+    }
+
+    // Labels: the chamber first, then the most severe and largest; one that would cover another is left out
+    const rank = p => (p.chamber ? -1 : ALERT_SEVERITIES.indexOf(p.tone));
+    const placed = [];
+    const overlaps = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+    const list = [...byId.values()];
+    for (const p of [...list].sort((a, b) => rank(a) - rank(b) || b.r - a.r || a.order - b.order)) {
+        p.text = _chartEllipsis(p.label, 28);
+        const width = Array.from(p.text).length * 5.6 + 8;
+        p.pill = ['right', 'left'].map(side => _worldLabelBox(p.xy[0], p.xy[1], p.r, width, side, box))
+            .find(pill => !placed.some(other => overlaps(pill, other))) || null;
+        if (p.pill) placed.push(p.pill);
+    }
+    // Dots: the least severe first, so the most severe is on top
+    for (const p of list.sort((a, b) => rank(b) - rank(a) || a.r - b.r || b.order - a.order)) {
+        const cls = p.chamber ? 'fw-chamber' : `fw-tone-${p.tone}`;
+        svg += `<g class="fw-point ${cls}" data-fw-id="${escapeHtml(p.id)}"><title>${escapeHtml(p.title)}</title>`
+            + `<circle class="fw-dot" cx="${c(p.xy[0])}" cy="${c(p.xy[1])}" r="${c(p.r)}"/>`
+            + (p.pill ? `<rect class="fw-pill" x="${c(p.pill.x)}" y="${c(p.pill.y)}" width="${c(p.pill.w)}" height="${p.pill.h}" rx="3"/>`
+                + `<text class="fw-label" x="${c(p.pill.x + 4)}" y="${c(p.pill.y + p.pill.h - 3)}">${escapeHtml(p.text)}</text>` : '')
+            + '</g>';
+    }
+    return `<svg class="chart-svg fw-map" width="${box.w}" height="${box.h}" viewBox="0 0 ${box.w} ${box.h}">${svg}</svg>`;
+}
+
 // =============================================
 // RUSTINEL TRACE ANALYSIS CONSOLE
 // =============================================
