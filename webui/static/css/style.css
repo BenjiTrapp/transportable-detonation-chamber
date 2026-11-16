@@ -6165,6 +6165,88 @@ body.hex-resizing {
     to { opacity: 1; transform: translateX(0); }
 }
 
+/* --- The decision toast (showDecisionToast; block FIREWALL of app.js) ---
+   A firewall decision: it stands above the other toasts until it is
+   answered. The edge says its state: red while it asks or the time is up,
+   amber when the block is not confirmed or something failed, cyan for a
+   result. It slides in once, when it comes (is-new), never again when it is
+   drawn anew; the countdown is text, not a motion. --- */
+.decision-stack { display: flex; flex-direction: column; gap: 8px; }
+.decision-stack:empty { display: none; }
+.toast.toast-decision {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 5px;
+    padding: 11px 14px 10px;
+    border-color: rgba(var(--severity-critical-rgb), 0.45);
+    border-left: 3px solid var(--severity-critical);
+    background: var(--bg-card);
+    animation: none;
+}
+.toast.toast-decision.is-new { animation: toastSlideIn 0.25s ease-out; }
+.toast.toast-decision.is-warn,
+.toast.toast-decision.is-fail {
+    border-color: rgba(var(--accent-yellow-rgb), 0.45);
+    border-left-color: var(--accent-yellow);
+}
+.toast.toast-decision.is-done {
+    border-color: rgba(var(--accent-cyan-rgb), 0.4);
+    border-left-color: var(--accent-cyan);
+}
+.decision-head { display: flex; align-items: baseline; gap: 10px; padding-right: 18px; }
+.decision-head .toast-title { flex: 1; min-width: 0; margin: 0; }
+.decision-clock {
+    flex: 0 0 auto;
+    font-family: var(--font-mono);
+    font-size: 15px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--severity-critical);
+    cursor: help;
+}
+.toast-decision.is-warn .decision-clock { color: var(--accent-yellow); }
+.decision-who {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+.decision-url-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.decision-url-row .fw-url { flex: 1; font-size: 11px; color: var(--text-primary); }
+.decision-via { font-size: 10.5px; color: var(--text-muted); }
+.decision-line { font-size: 11.5px; line-height: 1.4; color: var(--text-secondary); overflow-wrap: anywhere; }
+.decision-line strong { color: var(--text-primary); }
+.decision-note { color: var(--accent-yellow); }
+.decision-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 3px; }
+.decision-actions .btn-xs { font-size: 10.5px; padding: 4px 9px; }
+.decision-actions .fw-logs { margin-left: auto; }
+.decision-btn { font-weight: 600; letter-spacing: 0.03em; }
+.decision-btn.is-primary {
+    color: var(--text-primary);
+    background: rgba(var(--severity-critical-rgb), 0.2);
+    border-color: var(--severity-critical);
+    font-weight: 700;
+}
+.decision-btn.is-primary:hover:not(:disabled) { background: rgba(var(--severity-critical-rgb), 0.32); }
+.decision-btn.is-allow { color: var(--accent-yellow); border-color: rgba(var(--accent-yellow-rgb), 0.5); }
+.decision-actions .btn-xs:disabled { opacity: 0.45; cursor: not-allowed; }
+.decision-actions .btn-xs:focus-visible,
+.decision-more:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: 2px; }
+.decision-more {
+    align-self: flex-end;
+    pointer-events: auto;
+    padding: 4px 10px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--text-primary);
+    background: var(--bg-card);
+    border: 1px solid rgba(var(--severity-critical-rgb), 0.5);
+    border-radius: 6px;
+    cursor: pointer;
+}
+.decision-more:hover { border-color: var(--severity-critical); }
+
 /* === ETW Browser === */
 .etw-controls {
     display: flex;
@@ -10506,7 +10588,8 @@ body.maintenance-active #app {
     .btn-skull:not(:disabled):hover .btn-skull-art,
     .btn-skull:not(:disabled):focus-visible .btn-skull-art,
     .tdc-confirm,
-    .fw-arc-pending .fw-arc-line {
+    .fw-arc-pending .fw-arc-line,
+    .toast.toast-decision.is-new {
         animation: none;
     }
     .btn-skull-art,

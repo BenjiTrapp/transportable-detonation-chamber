@@ -1842,8 +1842,8 @@ def _as_cyberpunk(selector):
     return re.sub(r"\[data-theme\]", '[data-theme="cyberpunk"]', selector)
 
 
-# The rules of tabs that came after the split (the FIREWALL tab): new, so not in the old sheet
-AFTER_THE_SPLIT = re.compile(r"\.fw-|#tab-firewall\b|#firewall-")
+# The rules of what came after the split (the FIREWALL tab, the decision toast): new, so not in the old sheet
+AFTER_THE_SPLIT = re.compile(r"\.fw-|#tab-firewall\b|#firewall-|\.toast-decision\b|\.decision-")
 
 
 def test_cyberpunk_rules_unchanged():

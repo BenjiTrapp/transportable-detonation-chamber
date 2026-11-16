@@ -20,6 +20,10 @@ Regressions covered:
   * a capture without its RIZIN, HEX and THREATSCAN buttons, or with anything
     that runs it
   * the tab button out of place, the tab without its (i) or its help entry
+  * a decision toast that dismisses itself, falls to showToast's throttle,
+    sends two answers for a double click, shows what was clicked instead of
+    what was taken, claims a block that is not confirmed, a fetch at the
+    deadline that the server will not do, or lets a decision vanish unanswered
 """
 
 import json
@@ -31,7 +35,7 @@ from test_theme import INDEX_HTML, INFO_ATTR, STYLE_CSS, _const_source, _Element
 
 FW_FUNCTION_NAME = re.compile(
     r"^(?:async )?function ((?:fw|renderFirewall|refreshFirewall|initFirewall|firewallTabShown|onFirewall|openLogsTab"
-    r"|openFirewallTab)\w*)\(", re.M)
+    r"|openFirewallTab|showDecisionToast)\w*)\(", re.M)
 FW_FUNCTIONS = list(dict.fromkeys(FW_FUNCTION_NAME.findall(SOURCE)))
 FW_CONSTS = list(dict.fromkeys(re.findall(r"^const (FW_\w+) = ", SOURCE, re.M)))
 FW_LETS = re.findall(r"^let fw\w+ = [^\n]*?;(?=[ \t]*(?://[^\n]*)?$)", SOURCE, re.M)
@@ -990,3 +994,427 @@ def test_a_get_of_the_state_older_than_an_isolated_post_does_not_overwrite_it():
 def test_a_blocked_row_says_no_list_could_be_read():
     out = render_tree([{"state": "blocked", "rule_id": "TDC-FW-cccccccccccc"}], extra="fwState.rulesListError = 'HTTP 500';")
     assert "no list of rules could be read" in out and "not in the list read" not in out
+
+
+# --- The decision toast (Task 8) --------------------------------------------------------
+
+# A stack host that holds real child elements, and a clock the tests set
+DECISIONS = r"""
+const esc = v => String(v).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const mk = tag => ({
+    tagName: tag.toUpperCase(), id: '', className: '', innerHTML: '', textContent: '', attrs: {}, children: [], parentNode: null,
+    listeners: {}, hidden: false,
+    setAttribute(k, v) { this.attrs[k] = String(v); }, getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; },
+    addEventListener(type, fn) { (this.listeners[type] = this.listeners[type] || []).push(fn); },
+    appendChild(c) { if (c.parentNode) c.remove(); c.parentNode = this; this.children.push(c); return c; },
+    replaceChildren(...cs) { this.children.forEach(c => { c.parentNode = null; }); this.children = []; cs.forEach(c => this.appendChild(c)); },
+    replaceWith(n) { const p = this.parentNode; if (!p) return; if (n.parentNode) n.remove(); p.children[p.children.indexOf(this)] = n; n.parentNode = p; this.parentNode = null; },
+    remove() { const p = this.parentNode; if (p) { p.children.splice(p.children.indexOf(this), 1); this.parentNode = null; } },
+    querySelector() { return null; },
+    get outerHTML() { return `<${tag} class="${esc(this.className)}"${Object.entries(this.attrs).map(([k, v]) => ` ${k}="${esc(v)}"`).join('')}>${this.innerHTML}</${tag}>`; },
+});
+document.createElement = mk;
+els['decision-toasts'] = mk('div');
+const host = els['decision-toasts'];
+const stack = () => host.children.map(c => c.outerHTML).join('');
+let now = 1800000000000;
+Date.now = () => now;
+const pitem = (o = {}) => ({
+    id: o.id ?? 'dl-000000000001',
+    finding: { id: o.id ?? 'dl-000000000001', pid: o.pid ?? 4242, image: o.image ?? %s, url: o.url ?? 'http://evil.example/stage2.dll',
+               dst_ip: o.dst ?? '203.0.113.7', dst_port: o.port ?? 80, source: o.source ?? 'powershell', in_detonation: true },
+    deadline: '2026-11-16T10:00:30.000Z', created_at: '2026-11-16T10:00:00.000Z',
+    resolved_at: o.resolved_at ?? null, action: o.action ?? null,
+    result: o.result === undefined ? { block: { rule_id: 'TDC-FW-0123456789ab', verified: true } } : o.result,
+    remaining: o.remaining ?? 24,
+});
+const answerOf = (o = {}) => ({ pending: o.pending ?? [], history: o.history ?? [], ask_mode: o.ask_mode ?? 'detonation',
+    decide_seconds: 30, server_time: o.server_time ?? '2026-11-16T10:00:06.000Z' });
+const target = (selectors, attrs = {}) => ({ closest: s => (selectors[s] ? { disabled: false, getAttribute: k => (k in (selectors[s]) ? selectors[s][k] : null) } : null) });
+""" % json.dumps(LOADER)
+
+
+def _decisions(script):
+    return _run(DECISIONS + script)
+
+
+def decision_toast(o):
+    item = {"remaining": o["deadline_in"]} if "deadline_in" in o else {}
+    item.update({k: v for k, v in o.items() if k != "deadline_in"})
+    return _decisions(r"""
+        const el = showDecisionToast(pitem(%s));
+        console.log(JSON.stringify(el ? el.outerHTML : null));""" % json.dumps(item))
+
+
+def decision_toast_timers():
+    return _decisions(r"""
+        fwApplyPending(answerOf({ pending: [pitem()] }));
+        const shown = host.children.length;
+        // An hour later, with no answer from the server: the clock ran out, the toast is still there
+        for (let i = 0; i < 3600; i++) { now += 1000; fwDecisionTick(); }
+        if (shown !== 1 || host.children.length !== 1) throw new Error('the toast went: ' + shown + ' -> ' + host.children.length);
+        console.log(JSON.stringify(timers.map(t => t.ms)));""")
+
+
+def render_pending(items):
+    return _decisions(r"""
+        fwApplyPending(answerOf({ pending: [%s] }));
+        console.log(JSON.stringify(stack()));""" % ", ".join("pitem(%s)" % json.dumps(i) for i in items))
+
+
+def p(n):
+    return {"id": "dl-%012d" % n, "remaining": 20 + n}
+
+
+def decision_toasts_for_same_title(n):
+    return _decisions(r"""
+        for (let i = 1; i <= %d; i++) showDecisionToast(pitem({ id: 'dl-same-' + i }));
+        console.log(JSON.stringify(host.children.filter(c => /\btoast-decision\b/.test(c.className)).length));""" % n)
+
+
+def decide_clicks_sent_after_double_click():
+    r = _decisions(r"""
+        let release;
+        answer = (url, init) => (init && init.method === 'POST') ? new Promise(resolve => { release = resolve; }) : reply({});
+        fwApplyPending(answerOf({ pending: [pitem()] }));
+        const click = () => onFirewallDecisionClick({ target: target({ '[data-fw-decide]': { 'data-fw-decide': 'block_fetch' },
+            '[data-fw-decision]': { 'data-fw-decision': 'dl-000000000001' } }) });
+        click();
+        click();
+        const disabled = stack().includes('disabled');
+        release(reply({ id: 'dl-000000000001', action: 'block_fetch', won: true,
+            item: pitem({ action: 'block_fetch', resolved_at: '2026-11-16T10:00:07.000Z', remaining: 0,
+                result: { by: 'analyst', block: { rule_id: 'TDC-FW-0123456789ab', verified: true } } }) }));
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        click();
+        console.log(JSON.stringify({ posts: calls.filter(c => c.method === 'POST').map(c => [c.url, c.body]), disabled }));""")
+    assert r["disabled"], "the buttons stay pressable while the answer is out"
+    assert r["posts"] == [["/api/firewall/decide", {"id": "dl-000000000001", "action": "block_fetch"}]], r["posts"]
+    return len(r["posts"])
+
+
+def absence_toast(o):
+    r = _decisions(r"""
+        const done = n => pitem({ id: 'dl-away-' + n, action: 'block_fetch', resolved_at: '2026-11-16T09:00:00.000Z', remaining: 0,
+            result: { by: 'deadline', block: { rule_id: 'TDC-FW-0123456789ab', verified: true },
+                      fetch: { capture_id: 'cap' + n, sha256: 'ab'.repeat(32), size: 4096, magic: 'MZ' } } });
+        const history = Array.from({ length: %d }, (_, i) => done(i));
+        fwApplyPending(answerOf({ history }));
+        fwApplyPending(answerOf({ history, server_time: '2026-11-16T10:00:09.000Z' }));
+        console.log(JSON.stringify(toasts));""" % o["captures"])
+    assert len(r) == 1, r
+    return r[0]["type"] + " " + r[0]["title"] + " " + (r[0]["detail"] or "")
+
+
+@needs_node
+def test_a_decision_toast_never_dismisses_itself():
+    assert decision_toast_timers() == []
+
+
+@needs_node
+def test_the_countdown_names_the_default_action():
+    out = decision_toast({"deadline_in": 24})
+    assert "0:24" in out and "FETCH" in out.upper()
+
+
+@needs_node
+def test_three_are_shown_and_the_rest_counted():
+    out = render_pending([p(1), p(2), p(3), p(4), p(5)])
+    assert out.count("toast-decision") == 3 and "+ 2 more" in out
+
+
+@needs_node
+def test_the_throttle_of_showToast_does_not_apply():
+    assert decision_toasts_for_same_title(2) == 2
+
+
+@needs_node
+def test_the_url_in_a_toast_is_defanged_text():
+    out = decision_toast({"url": "http://evil.example/a.dll"})
+    assert "hxxp://evil[.]example/a.dll" in out and "<a " not in out
+
+
+@needs_node
+def test_answering_twice_sends_one_request():
+    assert decide_clicks_sent_after_double_click() == 1
+
+
+@needs_node
+def test_an_absence_summary_is_announced_once():
+    out = absence_toast({"captures": 3})
+    assert "3" in out and "away" in out.lower()
+
+
+def _toast_buttons(html):
+    return {m.group(2): " disabled" in m.group(1) for m in re.finditer(r'(<button[^>]*data-fw-decide="(\w+)"[^>]*>)', html)}
+
+
+@needs_node
+def test_the_toast_offers_the_three_answers_and_in_logs():
+    r = _decisions(r"""
+        const calls2 = [];
+        globalThis.openLogsTab = (...args) => { calls2.push(args); return true; };
+        const out = showDecisionToast(pitem()).outerHTML;
+        onFirewallDecisionClick({ target: target({ '[data-fw-decide-logs]': {}, '[data-fw-decision]': { 'data-fw-decision': 'dl-000000000001' } }) });
+        console.log(JSON.stringify({ out, calls: calls2 }));""")
+    out = r["out"]
+    assert _toast_buttons(out) == {"block_fetch": False, "block": False, "allow": False}
+    assert out.index("CUT + FETCH") < out.index("CUT ONLY") < out.index("ALLOW") < out.index("in LOGS ▸")
+    assert re.search(r'class="[^"]*is-primary[^"]*"[^>]*data-fw-decide="block_fetch"', out)
+    assert "Download blocked" in out and "loader.exe" in out and "203.0.113.7:80" in out
+    assert r["calls"][0][0] == 'image="%s" dst_ip="203.0.113.7"' % LOADER and r["calls"][0][3]["tab"] == "firewall"
+
+
+@needs_node
+def test_hostile_text_in_a_toast_stays_text():
+    out = decision_toast({"url": "http://x.example/" + HOSTILE, "image": "C:\\" + HOSTILE + ".exe", "id": "dl-" + HOSTILE,
+                          "source": HOSTILE, "result": {"block": {"verified": False, "problem": HOSTILE}}})
+    inner = out[out.index(">") + 1:]
+    _no_live_markup(inner, "toast")
+    assert "&lt;script&gt;" in inner
+    for _, attrs in _parsed(out):
+        assert not any(a.startswith("on") for a in attrs)
+
+
+@needs_node
+def test_a_javascript_url_in_a_toast_is_inert():
+    out = decision_toast({"url": "javascript:alert(document.cookie)"})
+    assert "javascript[:]" in out and "javascript:" not in out
+
+
+@needs_node
+def test_a_block_that_is_not_confirmed_is_not_called_a_block():
+    out = decision_toast({"result": {"block": {"rule_id": "TDC-FW-0123456789ab", "verified": False, "problem": "not read back"}}})
+    assert "Download blocked" not in out and "NOT confirmed" in out and "not read back" in out
+    pending = decision_toast({"result": None})
+    assert "Download blocked" not in pending and "being set" in pending
+
+
+@needs_node
+def test_the_clock_counts_down_from_what_the_server_said_and_stands_as_a_receipt_at_zero():
+    r = _decisions(r"""
+        const clock = { textContent: '' };
+        const real = mk;
+        document.createElement = tag => Object.assign(real(tag), { querySelector: s => (s === '[data-fw-clock]' ? clock : null) });
+        fwApplyPending(answerOf({ pending: [pitem({ remaining: 3 })] }));
+        const first = stack();
+        now += 1000; fwDecisionTick();
+        const ticking = clock.textContent;
+        const sameEl = host.children[0];
+        now += 1000; fwDecisionTick();
+        const kept = host.children[0] === sameEl;
+        now += 1500; fwDecisionTick();
+        const due = stack();
+        // The sweep has not run yet: the server still lists it, with nothing left
+        fwApplyPending(answerOf({ pending: [pitem({ remaining: 0 })], server_time: '2026-11-16T10:00:10.000Z' }));
+        const still = stack();
+        fwApplyPending(answerOf({ history: [pitem({ action: 'block_fetch', remaining: 0, resolved_at: '2026-11-16T10:00:10.500Z',
+            result: { by: 'deadline', block: { rule_id: 'TDC-FW-0123456789ab', verified: true } } })], server_time: '2026-11-16T10:00:11.000Z' }));
+        const receipt = stack();
+        fwApplyPending(answerOf({ history: [pitem({ action: 'block_fetch', remaining: 0, resolved_at: '2026-11-16T10:00:10.500Z',
+            result: { by: 'deadline', block: { rule_id: 'TDC-FW-0123456789ab', verified: true },
+                      fetch: { capture_id: 'c1', sha256: 'ab'.repeat(32), size: 73728, magic: 'MZ' } } })], server_time: '2026-11-16T10:00:14.000Z' }));
+        const fetched = stack();
+        now += 9000; fwDecisionTick();
+        const before = host.children.length;
+        now += 2000; fwDecisionTick();
+        console.log(JSON.stringify({ first, ticking, kept, due, still, receipt, fetched, before, after: host.children.length }));""")
+    assert "0:03" in r["first"] and r["ticking"] == "0:02" and r["kept"], "the toast is drawn again every second"
+    for key in ("due", "still"):
+        assert "Time is up" in r[key] and all(_toast_buttons(r[key]).values()), key
+    assert "CUT + FETCHED" in r["receipt"] and "deadline" in r["receipt"] and "fetching" in r["receipt"].lower()
+    assert "MZ" in r["fetched"] and "72.0 KB" in r["fetched"] and "abababababab" in r["fetched"]
+    assert r["before"] == 1 and r["after"] == 0
+
+
+@needs_node
+def test_the_toast_shows_the_decision_taken_not_the_one_clicked():
+    r = _decisions(r"""
+        answer = (url, init) => reply(init && init.method === 'POST' ? { id: 'dl-000000000001', action: 'allow', won: false,
+            item: pitem({ action: 'allow', remaining: 0, resolved_at: '2026-11-16T10:00:05.000Z',
+                          result: { by: 'analyst', unblocked: true } }) } : {});
+        fwApplyPending(answerOf({ pending: [pitem()] }));
+        await fwDecide('dl-000000000001', 'block_fetch');
+        console.log(JSON.stringify(stack()));""")
+    assert "ALLOWED" in r and "CUT + FETCH" not in r and "Already answered" in r
+    assert _toast_buttons(r) == {}
+
+
+@needs_node
+def test_a_refused_answer_keeps_the_decision_open_and_says_why():
+    r = _decisions(r"""
+        answer = (url, init) => reply(init && init.method === 'POST'
+            ? { error: 'A block for every program stands on that endpoint, so TDC\'s own fetch would be cut off.' } : {}, init && init.method === 'POST' ? 409 : 200);
+        fwApplyPending(answerOf({ pending: [pitem()] }));
+        const ok = await fwDecide('dl-000000000001', 'block_fetch');
+        const out = stack();
+        console.log(JSON.stringify({ ok, out }));""")
+    out = r["out"]
+    assert r["ok"] is False and "Refused" in out and "every program" in out and "still open" in out
+    assert _toast_buttons(out) == {"block_fetch": False, "block": False, "allow": False}
+    assert "cannot fetch" in out
+
+
+@needs_node
+def test_a_decision_answered_elsewhere_becomes_a_receipt():
+    r = _decisions(r"""
+        fwApplyPending(answerOf({ pending: [pitem()] }));
+        fwApplyPending(answerOf({ history: [pitem({ action: 'allow', remaining: 0, resolved_at: '2026-11-16T10:00:07.000Z',
+            result: { by: 'analyst', unblocked: false, reason: 'another decision for the same endpoint keeps it blocked' } })],
+            server_time: '2026-11-16T10:00:08.000Z' }));
+        console.log(JSON.stringify({ out: stack(), toasts }));""")
+    assert "ALLOWED" in r["out"] and "elsewhere" in r["out"] and "Still blocked" in r["out"] and "keeps it blocked" in r["out"]
+    assert r["toasts"] == []
+
+
+@needs_node
+def test_an_older_answer_does_not_reopen_a_decision():
+    r = _decisions(r"""
+        answer = (url, init) => reply(init && init.method === 'POST' ? { id: 'dl-000000000001', action: 'block', won: true,
+            item: pitem({ action: 'block', remaining: 0, resolved_at: '2026-11-16T10:00:07.000Z',
+                          result: { by: 'analyst', block: { rule_id: 'TDC-FW-0123456789ab', verified: true } } }) } : {});
+        fwApplyPending(answerOf({ pending: [pitem()] }), ++fwPendingReq);
+        const before = ++fwPendingReq;                   // a poll that went out before the answer
+        await fwDecide('dl-000000000001', 'block');
+        const applied = fwApplyPending(answerOf({ pending: [pitem({ remaining: 20 })] }), before);
+        const stale = stack();
+        fwApplyPending(answerOf({ pending: [pitem({ remaining: 20 })] }), ++fwPendingReq);
+        console.log(JSON.stringify({ applied, stale, late: stack() }));""")
+    assert r["applied"] is False
+    for key in ("stale", "late"):
+        assert "CUT ONLY" not in r[key] and "CUT" in r[key] and "The block stands" in r[key], key
+
+
+@needs_node
+def test_a_clock_set_back_on_the_vm_does_not_stop_the_toasts():
+    out = _decisions(r"""
+        fwApplyPending(answerOf({ server_time: '2026-11-16T10:00:00.000Z' }), ++fwPendingReq);
+        // The VM went back to a snapshot: its clock is hours behind
+        fwApplyPending(answerOf({ pending: [pitem({ id: 'dl-after-revert' })], server_time: '2026-11-16T07:00:00.000Z' }), ++fwPendingReq);
+        console.log(JSON.stringify(stack()));""")
+    assert 'data-fw-decision="dl-after-revert"' in out
+
+
+@needs_node
+def test_with_ask_off_the_toast_promises_no_default():
+    out = _decisions(r"""
+        fwApplyPending(answerOf({ pending: [pitem()], ask_mode: 'off' }));
+        now += 60000; fwDecisionTick();
+        console.log(JSON.stringify(stack()));""")
+    assert "ASK is off" in out and "Time is up" not in out and "fetches the file" not in out
+    assert _toast_buttons(out) == {"block_fetch": False, "block": False, "allow": False}
+
+
+@needs_node
+def test_the_more_line_opens_the_tab_and_the_next_decision_moves_up():
+    r = _decisions(r"""
+        answer = (url, init) => reply(init && init.method === 'POST' ? { id: 'dl-000000000001', action: 'block', won: true,
+            item: pitem({ action: 'block', remaining: 0, resolved_at: '2026-11-16T10:00:07.000Z',
+                          result: { by: 'analyst', block: { rule_id: 'TDC-FW-0123456789ab', verified: true } } }) } : {});
+        fwApplyPending(answerOf({ pending: [1, 2, 3, 4].map(n => pitem({ id: 'dl-' + n, remaining: 20 + n })) }));
+        onFirewallDecisionClick({ target: target({ '[data-fw-decide-more]': {} }) });
+        const ids = () => host.children.map(c => c.getAttribute('data-fw-decision')).filter(Boolean);
+        const before = ids();
+        fwApplyPending(answerOf({ pending: [2, 3, 4].map(n => pitem({ id: 'dl-' + n, remaining: 20 + n })),
+            history: [pitem({ id: 'dl-1', action: 'block', remaining: 0, resolved_at: '2026-11-16T10:00:07.000Z',
+                              result: { by: 'analyst', block: { rule_id: 'TDC-FW-0123456789ab', verified: true } } })],
+            server_time: '2026-11-16T10:00:08.000Z' }));
+        console.log(JSON.stringify({ opened, before, after: ids(), out: stack() }));""")
+    assert ["tab", "firewall"] in r["opened"]
+    assert r["before"] == ["dl-1", "dl-2", "dl-3"]
+    assert r["after"] == ["dl-2", "dl-3", "dl-4"] and "+ 1 more" in r["out"]
+
+
+@needs_node
+def test_the_poll_stands_down_while_hidden_and_never_runs_twice_at_once():
+    r = _decisions(r"""
+        const gates = [];
+        answer = url => new Promise(resolve => gates.push({ url, resolve }));
+        document.hidden = true;
+        const hidden = fwPendingPoll();
+        document.hidden = false;
+        fwPendingPoll();
+        fwPendingPoll();
+        await Promise.resolve();
+        const out = gates.length;
+        gates[0].resolve(reply(answerOf({ pending: [pitem()] })));
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        // Hidden, the clock does not touch the page
+        document.hidden = true;
+        const ticked = fwDecisionTick();
+        console.log(JSON.stringify({ hidden: await hidden, out, urls: gates.map(g => g.url), shown: host.children.length, ticked }));""")
+    assert r["hidden"] is False and r["out"] == 1 and r["urls"] == ["/api/firewall/pending"]
+    assert r["shown"] == 1 and r["ticked"] is False
+
+
+@needs_node
+def test_the_poll_runs_every_three_seconds_from_page_load():
+    r = _decisions(r"""
+        answer = () => reply(answerOf());
+        fwInitDecisions();
+        fwInitDecisions();
+        for (let i = 0; i < 5; i++) await Promise.resolve();
+        console.log(JSON.stringify({ intervals, urls: calls.map(c => c.url), listeners: (host.listeners.click || []).length }));""")
+    assert r["intervals"].count(3000) == 1 and r["urls"] == ["/api/firewall/pending"] and r["listeners"] == 1
+    assert "fwInitDecisions()" in _function_source_of_dom_ready()
+
+
+def _function_source_of_dom_ready():
+    start = SOURCE.index("document.addEventListener('DOMContentLoaded'")
+    return SOURCE[start:SOURCE.index("\n});\n", start)]
+
+
+@needs_node
+def test_an_absence_summary_counts_only_what_nobody_saw():
+    r = _decisions(r"""
+        store['tdc.firewall.seen'] = '2026-11-16T09:30:00.000Z';
+        const done = (id, at, result, action = 'block_fetch') => pitem({ id, action, resolved_at: at, remaining: 0, result });
+        const block = { rule_id: 'TDC-FW-0123456789ab', verified: true };
+        fwApplyPending(answerOf({ history: [
+            done('old', '2026-11-16T09:00:00.000Z', { by: 'deadline', block, fetch: { capture_id: 'c0', size: 1, magic: 'MZ' } }),
+            done('a', '2026-11-16T09:40:00.000Z', { by: 'deadline', block, fetch: { capture_id: 'c1', size: 1, magic: 'MZ' } }),
+            done('b', '2026-11-16T09:41:00.000Z', { by: 'deadline', block, fetch: { error: 'timed out' } }),
+            done('c', '2026-11-16T09:42:00.000Z', { by: 'analyst', block }, 'block'),
+        ] }));
+        console.log(JSON.stringify({ toasts, seen: store['tdc.firewall.seen'], shown: host.children.length }));""")
+    assert len(r["toasts"]) == 1 and r["toasts"][0]["type"] == "info"
+    text = r["toasts"][0]["title"] + " " + r["toasts"][0]["detail"]
+    assert "1 sample secured" in text and "1 fetch failed" in text and "2 decisions" in text, text
+    assert r["seen"] == "2026-11-16T10:00:06.000Z" and r["shown"] == 0
+
+
+@needs_node
+def test_a_decision_the_page_never_saw_open_still_shows_once_the_page_is_watching():
+    r = _decisions(r"""
+        fwApplyPending(answerOf({}));
+        fwApplyPending(answerOf({ history: [pitem({ id: 'dl-fast', action: 'block_fetch', remaining: 0, resolved_at: '2026-11-16T10:00:07.000Z',
+            result: { by: 'deadline', block: { rule_id: 'TDC-FW-0123456789ab', verified: true } } })], server_time: '2026-11-16T10:00:09.000Z' }));
+        console.log(JSON.stringify({ out: stack(), toasts }));""")
+    assert "CUT + FETCHED" in r["out"] and "deadline" in r["out"] and r["toasts"] == []
+
+
+@needs_node
+def test_the_tabs_own_pending_answer_feeds_the_toasts():
+    r = _decisions(r"""
+        answer = url => reply(url.startsWith('/api/firewall/pending') ? answerOf({ pending: [pitem()] }) : { connections: [] });
+        await refreshFirewall({ slow: false });
+        console.log(JSON.stringify(host.children.length));""")
+    assert r == 1
+
+
+def test_the_decision_toast_has_its_own_look_in_both_themes():
+    css, layout = _read(STYLE_CSS), _read(STYLE_CSS.replace("style.css", "theme-layout.css"))
+    assert re.search(r"\.toast\.toast-decision\s*\{", css) and re.search(r"\[data-theme\] \.toast\.toast-decision\s*\{", layout)
+    motion = css[css.index("@media (prefers-reduced-motion: reduce)", css.index(".toast.toast-decision")):]
+    assert ".toast-decision.is-new" in motion[:motion.index("\n}\n")]
+    html = _read(INDEX_HTML)
+    assert re.search(r'<div id="toast-container" class="toast-container">\s*<div id="decision-toasts"', html)
+
+
+@needs_node
+def test_a_block_for_every_program_on_the_address_means_the_default_cuts_only():
+    out = _decisions(r"""
+        fwState.rules = [{ rule_id: 'TDC-FW-dddddddddddd', kind: 'block', blocking: true, image: null, ip: '203.0.113.7', port: null }];
+        fwApplyPending(answerOf({ pending: [pitem()] }));
+        console.log(JSON.stringify(stack()));""")
+    assert "cannot fetch" in out and "fetches the file itself" not in out

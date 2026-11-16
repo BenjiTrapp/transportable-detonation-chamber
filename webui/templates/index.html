@@ -19,8 +19,8 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=74">
-    <link rel="stylesheet" href="/static/css/theme-layout.css?v=2">
+    <link rel="stylesheet" href="/static/css/style.css?v=75">
+    <link rel="stylesheet" href="/static/css/theme-layout.css?v=3">
     <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=30">
 </head>
 <body>
@@ -1663,6 +1663,12 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
          in app.js); set as text, never as markup -->
     <div id="info-popover" class="info-popover" role="status" hidden></div>
 
-    <script src="/static/js/app.js?v=105"></script>
+    <!-- Toasts (showToast in app.js); the firewall decisions stand above the others, until they are
+         answered (showDecisionToast) -->
+    <div id="toast-container" class="toast-container">
+        <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
+    </div>
+
+    <script src="/static/js/app.js?v=106"></script>
 </body>
 </html>

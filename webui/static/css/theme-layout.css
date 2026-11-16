@@ -1729,6 +1729,29 @@
 [data-theme] .toast.toast-info {
     border-left-color: var(--cp-cyan);
 }
+/* The decision toast: the edge of its state, the countdown and the answers in the label face */
+[data-theme] .toast.toast-decision {
+    border-left-width: 3px;
+    border-left-color: var(--cp-red);
+}
+[data-theme] .toast.toast-decision.is-warn,
+[data-theme] .toast.toast-decision.is-fail {
+    border-left-color: var(--cp-amber);
+}
+[data-theme] .toast.toast-decision.is-done {
+    border-left-color: var(--cp-cyan);
+}
+[data-theme] .decision-clock,
+[data-theme] .decision-who,
+[data-theme] .decision-btn,
+[data-theme] .decision-more {
+    font-family: var(--cp-font-label);
+    letter-spacing: .06em;
+}
+[data-theme] .decision-more {
+    background: var(--cp-card);
+    border-radius: 4px;
+}
 
 /* --- Loading overlay and scroll bars --- */
 [data-theme] .loading-spinner {
