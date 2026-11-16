@@ -6081,6 +6081,11 @@ body.hex-resizing {
     gap: 8px;
     pointer-events: none;
     max-width: 420px;
+    /* Three decisions, a "+ n more" and the other toasts fit on a short screen: the stack scrolls */
+    max-height: calc(100vh - var(--topbar-height) - 28px);
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
 }
 .toast {
     position: relative;
@@ -6189,7 +6194,8 @@ body.hex-resizing {
     border-color: rgba(var(--accent-yellow-rgb), 0.45);
     border-left-color: var(--accent-yellow);
 }
-.toast.toast-decision.is-done {
+.toast.toast-decision.is-done,
+.toast.toast-decision.is-away {
     border-color: rgba(var(--accent-cyan-rgb), 0.4);
     border-left-color: var(--accent-cyan);
 }
@@ -6246,6 +6252,31 @@ body.hex-resizing {
     cursor: pointer;
 }
 .decision-more:hover { border-color: var(--severity-critical); }
+
+/* DECISIONS, the fourth view of the FIREWALL tab: open decisions on top, with their answers */
+.fw-dec-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 0 2px 8px;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.fw-dec-row.is-open { background: rgba(var(--severity-critical-rgb), 0.06); }
+.fw-dec-what { white-space: nowrap; font-family: var(--font-mono); font-size: 10.5px; font-weight: 700; }
+.fw-dec-what.is-open { color: var(--severity-critical); }
+.fw-dec-url .fw-url { display: inline-block; max-width: 260px; vertical-align: bottom; }
+.fw-dec-block.is-fail,
+.fw-dec-fail { color: var(--accent-yellow); }
+.fw-dec-wait,
+.fw-dec-none { color: var(--text-muted); }
+.fw-dec-cap { font-family: var(--font-mono); font-size: 10.5px; margin-right: 6px; }
+.fw-dec-fetch .btn-xs { margin-left: 4px; }
+.fw-dec-actions { white-space: nowrap; }
+.fw-dec-actions .decision-btn { margin-right: 4px; font-size: 10px; }
+.fw-dec-actions .decision-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* === ETW Browser === */
 .etw-controls {

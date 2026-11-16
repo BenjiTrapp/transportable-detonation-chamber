@@ -19,8 +19,8 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=75">
-    <link rel="stylesheet" href="/static/css/theme-layout.css?v=3">
+    <link rel="stylesheet" href="/static/css/style.css?v=76">
+    <link rel="stylesheet" href="/static/css/theme-layout.css?v=4">
     <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=30">
 </head>
 <body>
@@ -636,7 +636,7 @@
 
             <!-- Firewall Tab: the connections of the chamber (initFirewall in app.js): the head with LIVE,
                  ASK, ISOLATED and the range, the bands that say what is not enforced, the process tree,
-                 MAP | LIST | ASN with the hunting hints and the secured samples, the summary -->
+                 MAP | LIST | ASN | DECISIONS with the hunting hints and the secured samples, the summary -->
             <div class="tab-content" id="tab-firewall">
                 <div class="content-header">
                     <h2 data-info="Every connection the chamber made, by process, on a world map and with its tags, and the switches that block it in the Windows Firewall. Select a process or an endpoint for ready LOGS queries about it.">Firewall</h2>
@@ -663,7 +663,7 @@
                     <section class="fw-center" aria-label="Destinations">
                         <div class="chart-card fw-view-card">
                             <div class="chart-card-head">
-                                <h3 class="chart-card-title" data-info="MAP draws an arc from the chamber to every public destination, as wide as its connections and coloured by its most severe tag. LIST is the same set as a table, ASN groups it by the organisation that owns the addresses.">DESTINATIONS</h3>
+                                <h3 class="chart-card-title" data-info="MAP draws an arc from the chamber to every public destination, as wide as its connections and coloured by its most severe tag. LIST is the same set as a table, ASN groups it by owner, DECISIONS lists who decided what about a download, and when.">DESTINATIONS</h3>
                                 <span class="chart-range fw-views" id="firewall-views" role="group" aria-label="View"></span>
                             </div>
                             <div class="fw-view" id="firewall-view"></div>
@@ -1422,7 +1422,7 @@
                         </div>
                         <div class="help-guide-item">
                             <h4>FIREWALL</h4>
-                            <p>Every connection of the chamber, bundled per process and endpoint and tagged by what is suspicious about it (IOC, beaconing, a hard-coded address, a download, a LOLBin, a DGA-like name&hellip;); the colour of a row or an arc is its most severe tag. On the left the process tree with a filter, each process with its activity and its endpoints; TDC's own processes and local addresses are groups of their own. In the middle MAP (an arc from the chamber to each public destination), LIST (a sortable table) and ASN (the destinations by the organisation that owns them). Below, the summary counts connections, blocks, open decisions and secured samples; there are no byte figures, because Sysmon records none. ALLOW / DENY blocks a process or one endpoint of it in the Windows Firewall (a rule <code>TDC-FW-&hellip;</code>, checked before it counts as blocked) and shows the protocol of the rule; a selected endpoint can also be blocked for every program, and KILL on a selected process ends it with <code>taskkill /F</code> (after a confirmation; never TDC's own). A click selects; <strong>in LOGS &#9656;</strong> on the selected row, on its point of the map and above the hints opens the logs about it. ASK sets what happens when a process in the chamber fetches a file: Detonation (default) blocks it and asks, All does so for every process, Off only tags. ISOLATED, after a confirmation, cuts every outbound connection but loopback; the band says what stays open, and <code>scripts/tdc-unisolate.ps1</code> on the VM is the way back if the web UI is gone. While a Windows Firewall profile is off nothing can be enforced: the switches are disabled and a red band says so, with TURN THE FIREWALL ON (after a confirmation, because it changes what the sample sees). A switch that cannot know whether it blocks, because the rules are not read yet or could not be, shows ?. HUNT FURTHER lists ready LOGS queries for the selection; SECURED SAMPLES opens a fetched file in Rizin, Hex or ThreatScan, never runs it.</p>
+                            <p>Every connection of the chamber, bundled per process and endpoint and tagged by what is suspicious about it (IOC, beaconing, a hard-coded address, a download, a LOLBin, a DGA-like name&hellip;); the colour of a row or an arc is its most severe tag. On the left the process tree with a filter, each process with its activity and its endpoints; TDC's own processes and local addresses are groups of their own. In the middle MAP (an arc from the chamber to each public destination), LIST (a sortable table) ASN (the destinations by the organisation that owns them) and DECISIONS (the open decisions with their answers, then those of the last 24 h: when, which process, the defanged URL, what was taken and by whom, the block and the fetch with its capture). Below, the summary counts connections, blocks, open decisions and secured samples; there are no byte figures, because Sysmon records none. ALLOW / DENY blocks a process or one endpoint of it in the Windows Firewall (a rule <code>TDC-FW-&hellip;</code>, checked before it counts as blocked) and shows the protocol of the rule; a selected endpoint can also be blocked for every program, and KILL on a selected process ends it with <code>taskkill /F</code> (after a confirmation; never TDC's own). A click selects; <strong>in LOGS &#9656;</strong> on the selected row, on its point of the map and above the hints opens the logs about it. ASK sets what happens when a process in the chamber fetches a file: Detonation (default) blocks it and asks, All does so for every process, Off only tags. The question is a toast on every tab, with CUT + FETCH, CUT ONLY and ALLOW and a countdown to what TDC does by itself when nobody answers (it keeps the block and fetches the file; only cuts while a block for every program stands on the address); closing the page changes nothing. What TDC decided while nobody answered stays as a toast until it is closed, and a summary says what came while the page was not looked at. ISOLATED, after a confirmation, cuts every outbound connection but loopback; the band says what stays open, and <code>scripts/tdc-unisolate.ps1</code> on the VM is the way back if the web UI is gone. While a Windows Firewall profile is off nothing can be enforced: the switches are disabled and a red band says so, with TURN THE FIREWALL ON (after a confirmation, because it changes what the sample sees). A switch that cannot know whether it blocks, because the rules are not read yet or could not be, shows ?. HUNT FURTHER lists ready LOGS queries for the selection; SECURED SAMPLES opens a fetched file in Rizin, Hex or ThreatScan, never runs it.</p>
                         </div>
                         <div class="help-guide-item">
                             <h4>LOGS</h4>
@@ -1669,6 +1669,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
     </div>
 
-    <script src="/static/js/app.js?v=106"></script>
+    <script src="/static/js/app.js?v=107"></script>
 </body>
 </html>

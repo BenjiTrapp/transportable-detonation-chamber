@@ -13118,7 +13118,7 @@ const FW_RANGES = ['15m', '1h', '4h', '24h', '7d', 'All'];
 const FW_DEFAULT_RANGE = '1h';
 const FW_RANGE_KEY = 'tdc.firewall.range';
 const FW_VIEW_KEY = 'tdc.firewall.view';
-const FW_VIEWS = ['map', 'list', 'asn'];
+const FW_VIEWS = ['map', 'list', 'asn', 'decisions'];
 const FW_LIVE_MS = 5000;
 // Every this many LIVE ticks also the summary, the captures and the rules: they are no poll paths of the access
 // log, and the rules cost a PowerShell call on the VM. ISOLATED's state is asked every tick: it says whether a
@@ -13190,6 +13190,10 @@ const FW_TOASTS_VISIBLE = 3;
 const FW_CLOCK_MS = 1000;
 const FW_RECEIPT_MS = 10000;
 const FW_FETCH_WAIT_MS = 120000;
+// How long a /pending or /decide request may hang before the toasts give up on it
+const FW_REQUEST_MS = 15000;
+// The id of the standing summary of what was decided while nobody watched (no decision id starts with @)
+const FW_AWAY_ID = '@away';
 // The server_time of the last /pending answer this browser showed: what resolved after it, nobody here saw
 const FW_SEEN_KEY = 'tdc.firewall.seen';
 const FW_DECIDE_ACTIONS = [
@@ -13230,6 +13234,8 @@ let fwPendingApplied = 0;              // the number of the newest one applied: 
 let fwPendingAsk = 'detonation';       // ask_mode as /pending said it: with off, the server takes no default
 let fwPendingError = null;             // the last poll failed: the toasts say they may be stale
 let fwPendingFirst = true;             // the next answer is the first since the page loaded or came back: it summarises
+let fwPendingData = null;               // the last /pending answer applied: the DECISIONS view lists it
+let fwLastDecisionsHtml = '';
 let fwSeenMs = null;                   // FW_SEEN_KEY as this page knows it, should the storage be blocked
 
 // --- Text of the VM ---
@@ -13676,6 +13682,7 @@ function renderFirewallTree(flows) {
 function renderFirewallView() {
     if (fwView === 'list') renderFirewallList(fwState.flows);
     else if (fwView === 'asn') renderFirewallAsn(fwState.flows);
+    else if (fwView === 'decisions') renderFirewallDecisions();
     else renderFirewallMap(fwState.flows);
 }
 
@@ -14098,19 +14105,35 @@ function fwCloseAskMenu() {
 }
 
 // --- Asking the server ---
-async function fwGet(url) {
+// `timeoutMs` (optional) gives up on a request that hangs: the decision toasts must not wait on one for good
+async function fwFetch(url, init, timeoutMs) {
+    if (!timeoutMs || typeof AbortController !== 'function') return fetch(url, init);
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), timeoutMs);
     try {
-        const resp = await fetch(url);
-        const data = await resp.json().catch(() => ({}));
-        return resp.ok ? { ok: true, data: data || {} } : { ok: false, data, error: data && data.error ? String(data.error) : `HTTP ${resp.status}` };
+        return await fetch(url, Object.assign({}, init, { signal: abort.signal }));
     } catch (e) {
-        return { ok: false, data: null, error: String(e && e.message ? e.message : e) };
+        if (abort.signal.aborted) throw new Error(`TDC did not answer within ${Math.round(timeoutMs / 1000)} s`);
+        throw e;
+    } finally {
+        clearTimeout(timer);
     }
 }
 
-async function fwPost(url, body) {
+async function fwGet(url, timeoutMs) {
     try {
-        const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        const resp = await fwFetch(url, undefined, timeoutMs);
+        const data = await resp.json().catch(() => ({}));
+        return resp.ok ? { ok: true, status: resp.status, data: data || {} }
+            : { ok: false, status: resp.status, data, error: data && data.error ? String(data.error) : `HTTP ${resp.status}` };
+    } catch (e) {
+        return { ok: false, status: 0, data: null, error: String(e && e.message ? e.message : e) };
+    }
+}
+
+async function fwPost(url, body, timeoutMs) {
+    try {
+        const resp = await fwFetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, timeoutMs);
         const data = await resp.json().catch(() => ({}));
         return resp.ok ? { ok: true, status: resp.status, data: data || {} }
             : { ok: false, status: resp.status, data, error: data && data.error ? String(data.error) : `HTTP ${resp.status}` };
@@ -14405,6 +14428,10 @@ function onFirewallClick(event) {
     else if ((el = hit('[data-fw-view]'))) fwSetView(el.getAttribute('data-fw-view'));
     else if (hit('[data-fw-live]')) fwToggleLive();
     else if (hit('[data-fw-isolated]')) fwToggleIsolated();
+    else if ((el = hit('[data-fw-decide]'))) {
+        const row = target.closest('[data-fw-decision]');
+        if (row) fwDecide(row.getAttribute('data-fw-decision'), el.getAttribute('data-fw-decide'));
+    } else if (hit('[data-fw-decisions-clear]')) fwDismissResults();
     else if ((el = hit('[data-fw-group]'))) {
         const id = el.getAttribute('data-fw-group');
         fwOpen.set(id, !fwIsOpen(id, false));
@@ -14519,7 +14546,9 @@ function firewallTabShown() {
 // is the server's: when it runs out, the server keeps the block and fetches the file itself, whether a browser is
 // open or not. So the countdown only shows what is going to happen anyway; nothing here is the way the default
 // is taken, and a closed page changes no outcome. Every tab asks /pending (fwPendingPoll), and the FIREWALL
-// tab's own answers come in too. A toast says what the server says happened, never what was clicked.
+// tab's own answers come in too. A toast says what the server says happened, never what was clicked. A result
+// nobody here answered (taken by the deadline, dropped, gone from the lists) stays until it is closed: that the
+// page was on screen says nothing about whether anybody looked at it.
 
 function fwClock(seconds) {
     const s = Math.max(0, Math.ceil(Number(seconds) || 0));
@@ -14536,16 +14565,17 @@ function fwDecisionDue(entry, now) {
     return fwPendingAsk !== 'off' && now >= entry.dueAt;
 }
 
-// A decision of an answer into fwDecisions: a new one comes in at the end. One that is decided keeps that, and
-// one whose answer is still out keeps waiting for it, whatever an older look of the server says
+// A decision of an answer into fwDecisions: a new one comes in at the end. One that is decided keeps that,
+// whatever an older look of the server says. One whose click is still on its way shows the server's decision
+// at once, and the answer to the click says later whose it was
 function fwTrackDecision(item, now) {
-    if (!item || typeof item !== 'object' || typeof item.id !== 'string' || !item.id) return null;
+    if (!item || typeof item !== 'object' || typeof item.id !== 'string' || !item.id || item.id === FW_AWAY_ID) return null;
     const open = item.action === null || item.action === undefined;
     let entry = fwDecisions.get(item.id);
     if (!entry) {
-        entry = { item, arrived: ++fwDecisionSeq, phase: open ? 'open' : 'done', dueAt: now, doneAt: open ? null : now, until: null,
-            note: '', noFetch: false, mine: false, won: true, clicked: null, seenDone: false, waitedOut: false, gone: null, lost: false,
-            el: null, sig: '', clock: null, fresh: true };
+        entry = { kind: 'decision', item, arrived: ++fwDecisionSeq, phase: open ? 'open' : 'done', dueAt: now, doneAt: open ? null : now,
+            until: null, note: '', noFetch: false, mine: false, won: true, clicked: null, posting: false, tried: null, waitedOut: false,
+            gone: null, lost: false, el: null, sig: '', clock: null, fresh: true };
         fwDecisions.set(item.id, entry);
     }
     if (entry.phase === 'done') {
@@ -14555,32 +14585,35 @@ function fwTrackDecision(item, now) {
         }
         return entry;
     }
+    entry.item = item;
     if (!open) {
-        entry.item = item;
-        if (entry.phase === 'deciding') {
-            entry.seenDone = true;              // the answer to the click will say whose it was
-        } else {
-            entry.phase = 'done';
-            entry.doneAt = now;
-        }
+        entry.phase = 'done';
+        entry.doneAt = now;
         return entry;
     }
-    entry.item = item;
     entry.dueAt = now + Math.max(0, Number(item.remaining) || 0) * 1000;
     if (entry.phase !== 'deciding') entry.phase = fwDecisionDue(entry, now) ? 'due' : 'open';
     return entry;
 }
 
-// A result goes FW_RECEIPT_MS after nothing more is to come: a fetch is waited for, up to FW_FETCH_WAIT_MS.
-// True when that changed what it says
+// A result that somebody answered may go once it has been read; one nobody answered stays until it is closed
+function fwDecisionAttended(entry) {
+    if (entry.kind !== 'decision' || entry.posting || entry.lost) return false;
+    const result = entry.item && entry.item.result && typeof entry.item.result === 'object' ? entry.item.result : {};
+    return entry.mine || !!entry.gone || !!entry.tried || result.by === 'analyst';
+}
+
+// An attended result goes FW_RECEIPT_MS after nothing more is to come: a fetch is waited for, up to
+// FW_FETCH_WAIT_MS, then it says where the sample will show. True when that changed what it says
 function fwDecisionSettle(entry, now) {
-    if (entry.phase !== 'done' || entry.until !== null) return false;
+    if (entry.kind !== 'decision' || entry.phase !== 'done' || entry.until !== null) return false;
     const item = entry.item || {};
     const waiting = !entry.gone && !entry.lost && item.action === 'block_fetch' && !(item.result && item.result.fetch);
     if (waiting && now - entry.doneAt < FW_FETCH_WAIT_MS) return false;
+    const changed = waiting && !entry.waitedOut;
     entry.waitedOut = waiting;
-    entry.until = now + FW_RECEIPT_MS;
-    return waiting;
+    if (fwDecisionAttended(entry)) entry.until = now + FW_RECEIPT_MS;
+    return changed;
 }
 
 // What resolved while nobody here could see it: by the deadline or dropped, after FW_SEEN_KEY
@@ -14621,14 +14654,33 @@ function fwAbsenceText(items, sinceUnknown) {
     if (running) parts.push(`${count(running, 'fetch', 'fetches')} still running`);
     if (cut) parts.push(`${cut} cut without a fetch (a block for every program stood)`);
     if (dropped) parts.push(`${count(dropped, 'decision', 'decisions')} dropped, too many were open (still blocked)`);
-    return { title, detail: `${parts.join('; ')}${sinceUnknown ? ' (in the last 24 h)' : ''}. The FIREWALL tab shows them by endpoint, the samples under SECURED SAMPLES.` };
+    return { title, detail: `${parts.join('; ')}${sinceUnknown ? ' (in the last 24 h)' : ''}. DECISIONS in the FIREWALL tab lists every one, the samples are under SECURED SAMPLES.` };
+}
+
+// The standing summary of what was decided while nobody watched: one toast in the stack, with no throttle and
+// no timer, that takes in what comes on the next return as long as it is not closed
+function fwAddAway(items, sinceUnknown, now) {
+    let entry = fwDecisions.get(FW_AWAY_ID);
+    if (!entry) {
+        entry = { kind: 'summary', item: { id: FW_AWAY_ID }, items: new Map(), sinceUnknown: false, arrived: ++fwDecisionSeq, phase: 'done',
+            doneAt: now, until: null, note: '', el: null, sig: '', clock: null, fresh: true };
+        fwDecisions.set(FW_AWAY_ID, entry);
+    }
+    items.forEach(i => entry.items.set(i.id, i));
+    entry.sinceUnknown = entry.sinceUnknown || sinceUnknown;
+    return entry;
 }
 
 // An answer of GET /api/firewall/pending (from fwPendingPoll or the tab). `sent` is the request's number
 // (++fwPendingReq when it went out): an answer to a request older than one applied, or than an answer of
-// /decide, is dropped. Requests are counted here, not by server_time, since the VM's clock may be set back
+// /decide, is dropped. Requests are counted here, not by server_time, since the VM's clock may be set back.
+// An answer without a list of open decisions is no answer: it says nothing about the decisions shown
 function fwApplyPending(data, sent) {
-    if (!data || typeof data !== 'object') return false;
+    if (!data || typeof data !== 'object' || !Array.isArray(data.pending)) {
+        fwPendingError = 'TDC answered without a list of open decisions';
+        fwRenderDecisions();
+        return false;
+    }
     if (typeof sent === 'number') {
         if (sent <= fwPendingApplied) return false;
         fwPendingApplied = sent;
@@ -14638,17 +14690,21 @@ function fwApplyPending(data, sent) {
     if (typeof data.ask_mode === 'string') fwPendingAsk = data.ask_mode;
     const now = Date.now();
     const listed = new Set();
-    for (const item of Array.isArray(data.pending) ? data.pending : []) {
+    for (const item of data.pending) {
         if (item && (item.action === null || item.action === undefined) && fwTrackDecision(item, now)) listed.add(item.id);
     }
-    const history = (Array.isArray(data.history) ? data.history : [])
+    const historyKnown = Array.isArray(data.history);
+    const history = (historyKnown ? data.history : [])
         .filter(i => i && typeof i === 'object' && typeof i.id === 'string' && i.id && i.action !== null && i.action !== undefined);
+    fwPendingData = { pending: data.pending.filter(i => i && typeof i === 'object' && typeof i.id === 'string'), history };
     const decided = new Map(history.map(i => [i.id, i]));
+    const away = fwDecisions.get(FW_AWAY_ID);
+    if (away) [...away.items.keys()].forEach(id => { if (decided.has(id)) away.items.set(id, decided.get(id)); });
     for (const [id, entry] of fwDecisions) {
-        if (listed.has(id)) continue;
+        if (entry.kind !== 'decision' || listed.has(id)) continue;
         if (decided.has(id)) {
             fwTrackDecision(decided.get(id), now);
-        } else if (entry.phase === 'open' || entry.phase === 'due') {
+        } else if (historyKnown && (entry.phase === 'open' || entry.phase === 'due')) {
             // In neither list: decided and already out of the history, or gone with the server's file
             entry.phase = 'done';
             entry.lost = true;
@@ -14656,13 +14712,11 @@ function fwApplyPending(data, sent) {
         }
     }
     const mark = fwSeenMark();
-    const unseen = history.filter(i => !fwDecisions.has(i.id) && (i.action === 'dropped' || (i.result && i.result.by === 'deadline'))
+    const unseen = history.filter(i => !fwDecisions.has(i.id) && !(away && away.items.has(i.id))
+        && (i.action === 'dropped' || (i.result && i.result.by === 'deadline'))
         && (mark === null || (fwEpochMs(i.resolved_at) ?? 0) > mark));
     if (fwPendingFirst) {
-        if (unseen.length) {
-            const text = fwAbsenceText(unseen, mark === null);
-            showToast('info', text.title, text.detail, 20000);
-        }
+        if (unseen.length) fwAddAway(unseen, mark === null, now);
     } else {
         unseen.forEach(i => fwTrackDecision(i, now));
     }
@@ -14674,17 +14728,27 @@ function fwApplyPending(data, sent) {
     return true;
 }
 
-// Whether the rules read by the tab hold a block for every program on the finding's address (and its port, or
-// all ports): then the server's default at the deadline is to cut only, because its own fetch would be cut too.
-// Unknown until the tab has read the rules; a refused CUT + FETCH (409) says it as well
-function fwAddressWideBlock(finding) {
-    const f = finding && typeof finding === 'object' ? finding : {};
-    return (Array.isArray(fwState.rules) ? fwState.rules : []).some(r => r && r.blocking && !r.image && f.dst_ip && r.ip === f.dst_ip
-        && (r.port === null || r.port === undefined || Number(r.port) === Number(f.dst_port)));
+// Whether TDC could fetch an open decision's file: the server says it (can_fetch, false while a block for every
+// program stands on the address), and a refused CUT + FETCH (409) says it too. null: the server could not tell
+function fwDecisionCanFetch(entry) {
+    if (entry.noFetch || (entry.item && entry.item.can_fetch === false)) return false;
+    return entry.item && entry.item.can_fetch === null ? null : true;
 }
 
-// What a toast says: {tone, title, lines (markup, every value escaped), actions, clock, close}
+// The answers a decision offers: without a fetch, the primary one says it only cuts, and why
+function fwDecisionChoices(entry) {
+    if (fwDecisionCanFetch(entry) !== false) return FW_DECIDE_ACTIONS;
+    const allow = FW_DECIDE_ACTIONS.find(c => c.action === 'allow');
+    return [{ action: 'block', label: 'CUT — NO FETCH', primary: true,
+        title: 'TDC cannot fetch this file: a block for every program stands on this address, and it cuts TDC\'s own fetch as well. This keeps it cut; remove that block in the FIREWALL tab to let TDC fetch.' }, allow];
+}
+
+// What a toast says: {tone, title, lines (markup, every value escaped), actions, clock, close, away}
 function fwDecisionView(entry) {
+    if (entry.kind === 'summary') {
+        const text = fwAbsenceText([...entry.items.values()], entry.sinceUnknown);
+        return { tone: 'away', title: text.title, lines: [escapeHtml(text.detail)], actions: false, clock: false, close: true, away: true };
+    }
     const item = entry.item || {};
     const result = item.result && typeof item.result === 'object' ? item.result : {};
     const block = result.block && typeof result.block === 'object' ? result.block : null;
@@ -14699,22 +14763,24 @@ function fwDecisionView(entry) {
         title = 'Download seen: the block is NOT confirmed';
         lines.push(`The rule could not be confirmed (${escapeHtml(fwShort(block.problem || block.error || 'it was not read back', 300))}): the process may still get through.`);
     }
-    const off = fwPendingAsk === 'off';
-    const noFetch = entry.noFetch || fwAddressWideBlock(item.finding);
-    const cutOnly = 'TDC keeps it cut, and cannot fetch the file while a block for every program stands on this address';
+    const confirmed = !!(block && block.verified);
+    const canFetch = fwDecisionCanFetch(entry);
+    const keep = confirmed ? 'TDC keeps it cut' : 'TDC blocks it';
+    const what = canFetch === false ? `${keep}; it cannot fetch the file while a block for every program stands on this address`
+        : `${keep} and fetches the file itself${canFetch === null ? ' (unless a block for every program stands on this address: TDC could not read its rules)' : ''}`;
     if (entry.phase === 'due') {
         tone = 'due';
-        lines.push(`<strong>Time is up:</strong> ${noFetch ? `${cutOnly}.` : 'TDC keeps it cut and fetches the file itself now.'}`);
-    } else if (off) {
-        lines.push('<strong>ASK is off:</strong> TDC takes no default; it stays cut until you answer.');
+        lines.push(`<strong>Time is up:</strong> ${what}, now.`);
+    } else if (fwPendingAsk === 'off') {
+        lines.push(`<strong>ASK is off:</strong> TDC takes no default${confirmed ? '; it stays cut until you answer' : ''}.`);
     } else {
-        lines.push(`When the clock runs out, ${noFetch ? cutOnly : 'TDC keeps it cut and fetches the file itself'}, with this page open or not.`);
+        lines.push(`When the clock runs out, ${what}, with this page open or not.`);
     }
     if (entry.note) lines.push(`<span class="decision-note">${escapeHtml(fwShort(entry.note, 500))}</span>`);
     if (fwPendingError) {
         lines.push(`<span class="decision-note">No update from TDC (${escapeHtml(fwShort(fwPendingError, 200))}); the server keeps its deadline all the same.</span>`);
     }
-    return { tone, title, lines, actions: true, clock: !off, close: false };
+    return { tone, title, lines, actions: true, clock: fwPendingAsk !== 'off', close: false };
 }
 
 function fwDecisionOutcome(entry, item, result, block) {
@@ -14755,43 +14821,60 @@ function fwDecisionOutcome(entry, item, result, block) {
     } else if (action === 'dropped') {
         lines.push(`${escapeHtml(fwShort(result.reason || 'Dropped', 200))}: it stays blocked, and nothing was fetched.`);
     }
-    if (entry.mine && !entry.won) {
+    if (entry.posting) {
+        lines.push('Your click is still on its way to TDC; this is what TDC has decided.');
+    } else if (entry.mine && !entry.won) {
         lines.push(result.by === 'deadline' ? 'The deadline came first: this is the default TDC took before your click.'
             : 'Already answered before your click: this is the decision that stands.');
     } else if (result.by === 'deadline') {
         lines.push('Taken by the deadline: nobody answered in time.');
     } else if (result.by === 'analyst' && !entry.mine) {
-        lines.push('Answered elsewhere: in another browser tab or window.');
+        lines.push(entry.tried && entry.tried === action ? 'Probably your click: its answer did not arrive, and this is the decision it asked for.'
+            : 'Answered elsewhere: in another browser tab or window.');
     }
     if (entry.note) lines.push(`<span class="decision-note">${escapeHtml(fwShort(entry.note, 500))}</span>`);
     return { tone, title: fwOwn(FW_TAKEN, action) || `DECIDED: ${fwShort(action, 40)}`, lines, actions: false, clock: false, close: true };
 }
 
+// The answer buttons of a decision, for its toast and its row in DECISIONS
+function fwDecisionButtons(entry) {
+    const disabled = entry && entry.phase === 'open' ? '' : ' disabled';
+    return fwDecisionChoices(entry || {}).map(choice => {
+        const label = entry && entry.phase === 'deciding' && entry.clicked === choice.action ? `${choice.label}…` : choice.label;
+        const kind = choice.primary || choice.action === 'block_fetch' ? ' is-primary' : choice.action === 'allow' ? ' is-allow' : '';
+        return `<button type="button" class="btn btn-xs decision-btn${kind}" data-fw-decide="${escapeHtml(choice.action)}" `
+            + `title="${escapeHtml(choice.title)}"${disabled}>${escapeHtml(label)}</button>`;
+    }).join('');
+}
+
+function fwDecisionWhere(f) {
+    const ip = fwShort(f.dst_ip, 46), port = f.dst_port === null || f.dst_port === undefined ? '' : fwShort(f.dst_port, 6);
+    return ip ? `${ip.includes(':') ? `[${ip}]` : ip}${port ? `:${port}` : ''}` : '';
+}
+
 // The markup of a toast; `clock` is the countdown's text ('' for the signature that says whether to draw it again)
 function fwDecisionHtml(entry, clock) {
     const view = fwDecisionView(entry);
+    const close = view.close ? '<button type="button" class="toast-close" data-fw-decide-close aria-label="Close" title="Close">&times;</button>' : '';
+    if (view.away) {
+        return `<div class="decision-head"><span class="toast-title">${escapeHtml(view.title)}</span>${close}</div>`
+            + view.lines.map(line => `<div class="decision-line">${line}</div>`).join('')
+            + '<div class="decision-actions"><button type="button" class="btn btn-xs decision-btn" data-fw-decide-more title="Open DECISIONS in the FIREWALL tab: every decision of the last 24 h">DECISIONS ▸</button></div>';
+    }
     const f = entry.item && entry.item.finding && typeof entry.item.finding === 'object' ? entry.item.finding : {};
     const url = fwDefang(f.url);
-    const ip = fwShort(f.dst_ip, 46), port = f.dst_port === null || f.dst_port === undefined ? '' : fwShort(f.dst_port, 6);
-    const where = ip ? `${ip.includes(':') ? `[${ip}]` : ip}${port ? `:${port}` : ''}` : '';
+    const where = fwDecisionWhere(f);
     const who = `${fwShort(fwBase(f.image), 60) || 'A process'}${f.pid !== null && f.pid !== undefined ? ` (PID ${fwShort(f.pid, 12)})` : ''}${where ? ` → ${where}` : ''}`;
     const via = [f.source && `seen in ${fwShort(f.source, 40)}`, f.requested_by === 'bits' && 'requested through BITS'].filter(Boolean).join(', ');
-    const disabled = entry.phase === 'open' ? '' : ' disabled';
-    const buttons = view.actions ? FW_DECIDE_ACTIONS.map(choice => {
-        const label = entry.phase === 'deciding' && entry.clicked === choice.action ? `${choice.label}…` : choice.label;
-        const kind = choice.action === 'block_fetch' ? ' is-primary' : choice.action === 'allow' ? ' is-allow' : '';
-        return `<button type="button" class="btn btn-xs decision-btn${kind}" data-fw-decide="${escapeHtml(choice.action)}" `
-            + `title="${escapeHtml(choice.title)}"${disabled}>${escapeHtml(label)}</button>`;
-    }).join('') : '';
     return `<div class="decision-head"><span class="toast-title">${escapeHtml(view.title)}</span>`
         + (view.clock ? `<span class="decision-clock" data-fw-clock title="What TDC does then, kept by the server: closing this page changes nothing">${escapeHtml(clock)}</span>` : '')
-        + (view.close ? '<button type="button" class="toast-close" data-fw-decide-close aria-label="Close" title="Close">&times;</button>' : '') + '</div>'
+        + close + '</div>'
         + `<div class="decision-who" title="${escapeHtml(fwShort(f.image, 500))}">${escapeHtml(who)}</div>`
         + (url ? `<div class="decision-url-row"><code class="fw-url decision-url" title="${escapeHtml(fwShort(url, 2000))}">${escapeHtml(fwShort(url, 160))}</code>`
             + `<button type="button" class="btn btn-xs fw-copy" data-fw-copy="${escapeHtml(fwShort(url, 2000))}" title="Copy the defanged URL">COPY</button></div>` : '')
         + (via ? `<div class="decision-via">${escapeHtml(via)}</div>` : '')
         + view.lines.map(line => `<div class="decision-line">${line}</div>`).join('')
-        + `<div class="decision-actions">${buttons}<button type="button" class="btn btn-xs fw-logs" data-fw-decide-logs title="Search the logs for this process and address in the LOGS tab">in LOGS ▸</button></div>`;
+        + `<div class="decision-actions">${view.actions ? fwDecisionButtons(entry) : ''}<button type="button" class="btn btn-xs fw-logs" data-fw-decide-logs title="Search the logs for this process and address in the LOGS tab">in LOGS ▸</button></div>`;
 }
 
 function fwDecisionElement(entry, now) {
@@ -14807,14 +14890,16 @@ function fwDecisionElement(entry, now) {
     return el;
 }
 
-// The stack: open decisions first, in the order they came, then the results; FW_TOASTS_VISIBLE of them, and a
-// "+ n more" that opens the tab. A toast is drawn again only when what it says changes (the countdown is its
-// text alone), so a button is not replaced under the pointer
+// The stack: open decisions first, in the order they came, then the summary, then the results;
+// FW_TOASTS_VISIBLE of them, and a "+ n more" that opens DECISIONS. A toast is drawn again only when what it
+// says changes (the countdown is its text alone), so a button is not replaced under the pointer
 function fwRenderDecisions() {
+    fwSyncDecisionsView();
     const host = document.getElementById('decision-toasts');
     if (!host) return;
     const now = Date.now();
-    const list = [...fwDecisions.values()].sort((a, b) => (a.phase === 'done') - (b.phase === 'done') || a.arrived - b.arrived);
+    const rank = entry => (entry.phase !== 'done' ? 0 : entry.kind === 'summary' ? 1 : 2);
+    const list = [...fwDecisions.values()].sort((a, b) => rank(a) - rank(b) || a.arrived - b.arrived);
     const shown = list.slice(0, FW_TOASTS_VISIBLE), behind = list.length - shown.length;
     list.slice(FW_TOASTS_VISIBLE).forEach(entry => {
         entry.el = null;
@@ -14839,7 +14924,7 @@ function fwRenderDecisions() {
         const open = list.slice(FW_TOASTS_VISIBLE).filter(entry => entry.phase !== 'done').length;
         fwDecisionMore.innerHTML = escapeHtml(`+ ${behind} more`);
         fwDecisionMore.setAttribute('title', `${open} more open ${open === 1 ? 'decision' : 'decisions'} and ${behind - open} more `
-            + `${behind - open === 1 ? 'result' : 'results'}: each moves up when one above is answered. Click to open the FIREWALL tab.`);
+            + `${behind - open === 1 ? 'result' : 'results'}: each moves up when one above is answered or closed. Click to open DECISIONS in the FIREWALL tab.`);
     }
     const order = shown.map(entry => entry.item.id).join('\n') + (behind > 0 ? '\n+' : '');
     if (order === fwDecisionOrder) {
@@ -14887,40 +14972,44 @@ function fwDecisionClockOff() {
     fwDecisionTimer = null;
 }
 
-// The answer of a toast. The buttons are disabled at once, and a decision whose answer is out takes no second one
+// The answer of a toast or a row of DECISIONS. The buttons are disabled at once, and a decision whose answer is
+// out takes no second one. A click whose answer never came is remembered (tried): if the server then shows that
+// very action by an analyst, it was most likely this click
 async function fwDecide(id, action) {
     const entry = fwDecisions.get(String(id ?? ''));
-    if (!entry || entry.phase !== 'open' || !FW_DECIDE_ACTIONS.some(a => a.action === action)) return false;
+    if (!entry || entry.kind !== 'decision' || entry.phase !== 'open' || !fwDecisionChoices(entry).some(c => c.action === action)) return false;
     entry.phase = 'deciding';
     entry.clicked = action;
+    entry.posting = true;
     entry.note = '';
     fwRenderDecisions();
-    const r = await fwPost('/api/firewall/decide', { id: entry.item.id, action });
+    const r = await fwPost('/api/firewall/decide', { id: entry.item.id, action }, FW_REQUEST_MS);
     const now = Date.now();
+    entry.posting = false;
     const item = r.ok && r.data && r.data.item && typeof r.data.item === 'object' ? r.data.item : null;
     if (item && item.action !== null && item.action !== undefined) {
+        if (entry.phase !== 'done') entry.doneAt = now;
         entry.item = item;
         entry.phase = 'done';
-        entry.doneAt = now;
         entry.mine = true;
         entry.won = r.data.won !== false;
         // An answer of /pending to a request sent before this answer may show it open again
         fwPendingApplied = fwPendingReq;
-    } else if (r.status === 404) {
+    } else if (r.status === 404 && entry.phase !== 'done') {
         entry.phase = 'done';
         entry.doneAt = now;
         entry.gone = r.error || 'TDC no longer knows this decision.';
-    } else if (entry.seenDone) {
-        // TDC decided it meanwhile (the item came in decided), and the answer to the click did not arrive
-        entry.phase = 'done';
-        entry.doneAt = now;
-        entry.note = `The answer to your click did not arrive (${r.error || 'no answer'}); this is the decision that stands.`;
+    } else if (entry.phase === 'done') {
+        // A poll showed it decided meanwhile, and the answer to the click did not arrive
+        entry.tried = action;
+        entry.note = `The answer to your click did not arrive (${r.error || 'no answer'}).`;
     } else {
         entry.phase = fwDecisionDue(entry, now) ? 'due' : 'open';
         if (r.status === 409) {
             if (action === 'block_fetch') entry.noFetch = true;
             entry.note = `Refused: ${r.error || 'HTTP 409'} The decision is still open.`;
         } else {
+            entry.tried = action;
             entry.note = `${r.error || 'No answer'}. Whether it was taken shows with the next update.`;
         }
     }
@@ -14939,12 +15028,32 @@ function fwDismissDecision(id) {
     return true;
 }
 
+// CLOSE THE RESULTS of DECISIONS: every result toast and the summary go, the open decisions stay
+function fwDismissResults() {
+    let n = 0;
+    for (const [id, entry] of fwDecisions) {
+        if (entry.phase === 'done') {
+            fwDecisions.delete(id);
+            n++;
+        }
+    }
+    fwRenderDecisions();
+    return n;
+}
+
 function fwDecisionLogs(id) {
     const entry = fwDecisions.get(String(id ?? ''));
     const f = (entry && entry.item && entry.item.finding) || {};
     const ip = String(f.dst_ip ?? ''), image = String(f.image ?? '');
     if (!ip) return false;
     return openLogsTab(fwLogsQuery(image ? { kind: 'flow', image, ip } : { kind: 'address', ip }), '-1h', '', { tab: 'firewall', select: `a:${ip}` });
+}
+
+// "+ n more" and DECISIONS ▸: the FIREWALL tab with its DECISIONS view
+function fwOpenDecisions() {
+    switchTab('firewall');
+    fwSetView('decisions');
+    return true;
 }
 
 // The one click handler of the stack (it lives outside the tab: onFirewallClick does not see it)
@@ -14958,21 +15067,23 @@ function onFirewallDecisionClick(event) {
     const toast = target.closest('[data-fw-decision]');
     const id = toast ? toast.getAttribute('data-fw-decision') : null;
     let el;
-    if (hit('[data-fw-decide-more]')) switchTab('firewall');
+    if (hit('[data-fw-decide-more]')) fwOpenDecisions();
     else if (hit('[data-fw-decide-close]')) fwDismissDecision(id);
     else if (hit('[data-fw-decide-logs]')) fwDecisionLogs(id);
     else if ((el = hit('[data-fw-decide]'))) fwDecide(id, el.getAttribute('data-fw-decide'));
     else if ((el = hit('[data-fw-copy]'))) fwCopy(el.getAttribute('data-fw-copy'));
 }
 
-// Every FW_PENDING_MS on every tab, but not while the browser tab is hidden, and never two at once
+// Every FW_PENDING_MS on every tab, but not while the browser tab is hidden, never two at once, and not while
+// the FIREWALL tab's LIVE poll asks /pending itself (its answers come in through fwLoadFlows)
 async function fwPendingPoll() {
     if (document.hidden || fwPendingBusy) return false;
+    if (fwReady && fwState.live && state.activeTab === 'firewall') return false;
     fwPendingBusy = true;
     const sent = ++fwPendingReq;
     let r;
     try {
-        r = await fwGet('/api/firewall/pending');
+        r = await fwGet('/api/firewall/pending', FW_REQUEST_MS);
     } finally {
         fwPendingBusy = false;
     }
@@ -14998,6 +15109,93 @@ function fwInitDecisions() {
         fwPendingPoll();
     });
     fwPendingPoll();
+}
+
+// --- DECISIONS: who decided what, when ---
+// The fourth view: the open decisions (with their answers), then the decisions of the last 24 h, newest first,
+// each with its time, the process, the defanged URL, the endpoint, what was taken and by whom, the block and
+// the fetch with its capture. Drawn from the last /pending answer; drawn again only when it changes, so a
+// button is not replaced under the pointer (the open rows show the time of their default, not a countdown)
+function fwDecisionBlockCell(item) {
+    const result = item.result && typeof item.result === 'object' ? item.result : {};
+    const block = result.block && typeof result.block === 'object' ? result.block : null;
+    if (item.action === 'allow') {
+        return result.unblocked ? ['lifted', '', ''] : ['still blocked', fwShort(result.reason || result.error || '', 300), 'is-fail'];
+    }
+    if (!block) return ['not set yet', '', 'is-fail'];
+    return block.verified ? ['confirmed', fwShort(block.rule_id || '', 80), ''] : ['NOT confirmed', fwShort(block.problem || block.error || '', 300), 'is-fail'];
+}
+
+function fwDecisionFetchCell(item) {
+    const result = item.result && typeof item.result === 'object' ? item.result : {};
+    const fetch = result.fetch && typeof result.fetch === 'object' ? result.fetch : null;
+    if (item.action !== 'block_fetch') return '<span class="fw-dec-none">—</span>';
+    if (!fetch) return '<span class="fw-dec-wait">fetching…</span>';
+    if (fetch.error) return `<span class="fw-dec-fail" title="${escapeHtml(fwShort(fetch.error, 500))}">failed: ${escapeHtml(fwShort(fetch.error, 80))}</span>`;
+    const cap = (fwState.captures || []).find(c => c && fetch.capture_id !== undefined && String(c.id) === String(fetch.capture_id));
+    const open = cap && cap.path ? ['rizin', 'hex'].map(kind => `<button type="button" class="btn btn-xs" data-fw-open="${kind}" data-fw-capture="${escapeHtml(String(cap.id))}" title="Open the secured file in ${kind === 'rizin' ? 'Rizin' : 'the Hex editor'} (it is never run)">${kind.toUpperCase()}</button>`).join('')
+        : '<span class="fw-dec-none" title="The capture is listed under SECURED SAMPLES once the tab has read them">SECURED SAMPLES</span>';
+    return `<span class="fw-dec-cap" title="SHA-256 ${escapeHtml(fwShort(fetch.sha256, 64))}">${escapeHtml(fwShort(fetch.magic || '?', 12))} · ${escapeHtml(formatSize(Number(fetch.size) || 0))} · ${escapeHtml(String(fetch.sha256 ?? '').slice(0, 12))}…</span>${open}`;
+}
+
+function fwDecisionRow(item, open) {
+    const f = item.finding && typeof item.finding === 'object' ? item.finding : {};
+    const entry = fwDecisions.get(item.id);
+    const result = item.result && typeof item.result === 'object' ? item.result : {};
+    const url = fwDefang(f.url);
+    const [block, blockTitle, blockKind] = fwDecisionBlockCell(item);
+    let decision, by, kind = '';
+    if (open) {
+        const phase = entry ? entry.phase : 'open';
+        decision = phase === 'deciding' ? 'ANSWERING…' : phase === 'due' ? 'OPEN, time is up'
+            : fwPendingAsk === 'off' ? 'OPEN, no default (ASK off)'
+                : `OPEN, default at ${escapeHtml(formatAlertTime(item.deadline).slice(11) || '?')}`;
+        by = '';
+        kind = ' is-open';
+    } else {
+        decision = escapeHtml(fwOwn(FW_TAKEN, item.action) || `DECIDED: ${fwShort(item.action, 40)}`);
+        by = result.by === 'deadline' ? 'the deadline' : result.by === 'analyst' ? 'an analyst' : item.action === 'dropped' ? 'TDC (too many open)' : '';
+    }
+    const when = open ? item.created_at : item.resolved_at;
+    return `<tr class="fw-dec-row${kind}" data-fw-decision="${escapeHtml(item.id)}">`
+        + `<td class="logs-cell-time" data-sort-value="${escapeHtml(sortTimeValue(when))}">${escapeHtml(formatAlertTime(when))}</td>`
+        + `<td class="fw-cell-proc" title="${escapeHtml(fwShort(f.image, 500))}">${escapeHtml(fwShort(fwBase(f.image), 40))}${f.pid !== null && f.pid !== undefined ? ` <span class="fw-pid">${escapeHtml(fwShort(f.pid, 12))}</span>` : ''}</td>`
+        + `<td class="fw-dec-url"><code class="fw-url" title="${escapeHtml(fwShort(url, 2000))}">${escapeHtml(fwShort(url, 70))}</code></td>`
+        + `<td>${escapeHtml(fwDecisionWhere(f))}</td>`
+        + `<td class="fw-dec-what${kind}">${decision}</td>`
+        + `<td>${escapeHtml(by)}</td>`
+        + `<td class="fw-dec-block ${blockKind}" title="${escapeHtml(blockTitle)}">${escapeHtml(block)}</td>`
+        + `<td class="fw-dec-fetch">${fwDecisionFetchCell(item)}</td>`
+        + `<td class="fw-dec-actions">${open ? fwDecisionButtons(entry || { phase: 'unknown', item }) : ''}</td></tr>`;
+}
+
+function fwDecisionsViewHtml() {
+    const data = fwPendingData || { pending: fwState.pending || [], history: fwState.history || [] };
+    const valid = i => i && typeof i === 'object' && typeof i.id === 'string' && i.id;
+    const open = (data.pending || []).filter(valid), done = (data.history || []).filter(valid);
+    if (!open.length && !done.length) {
+        return '<div class="fw-empty">No decisions in the last 24 h: TDC asks when a process of the detonation fetches a file (see ASK).</div>';
+    }
+    const results = [...fwDecisions.values()].filter(e => e.phase === 'done').length;
+    const head = ['Time', 'Process', 'URL', 'Endpoint', 'Decision', 'By', 'Block', 'Fetch', ''].map(c => `<th>${c}</th>`).join('');
+    return `<div class="fw-dec-head"><span>${fwNumber(open.length)} open, ${fwNumber(done.length)} decided in the last 24 h</span>`
+        + (results ? `<button type="button" class="btn btn-xs" data-fw-decisions-clear title="Close every result toast and the summary; the open decisions stay">CLOSE ${fwNumber(results)} RESULT ${results === 1 ? 'TOAST' : 'TOASTS'}</button>` : '')
+        + '</div>'
+        + `<div class="logs-table-wrap fw-table-wrap"><table class="logs-table fw-table fw-dec-table" data-sortable data-sort-id="firewall-decisions"><thead><tr>${head}</tr></thead>`
+        + `<tbody>${open.map(i => fwDecisionRow(i, true)).join('')}${done.map(i => fwDecisionRow(i, false)).join('')}</tbody></table></div>`;
+}
+
+function renderFirewallDecisions() {
+    const host = document.getElementById('firewall-view');
+    if (!host) return;
+    fwLastDecisionsHtml = fwDecisionsViewHtml();
+    host.innerHTML = fwLastDecisionsHtml;
+}
+
+// DECISIONS on screen follows every answer of /pending and every click, but only when what it shows changed
+function fwSyncDecisionsView() {
+    if (!fwReady || fwView !== 'decisions') return;
+    if (fwDecisionsViewHtml() !== fwLastDecisionsHtml) renderFirewallDecisions();
 }
 
 // --- LitterBox Integration ---

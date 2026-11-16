@@ -12267,11 +12267,21 @@ def api_firewall_isolate():
     return _fw_json(dict(done, state=_fw_isolate_state()))
 
 
+def _fw_can_fetch(finding):
+    """Whether TDC's own fetch could reach the finding's endpoint: False while a block for every program stands
+    there (``block_fetch`` is refused then, and the deadline only blocks), None when the rules cannot be read."""
+    found, _ = _fw_rules()
+    if found is None:
+        return None
+    return not _fw_address_wide_block(finding)
+
+
 @app.route("/api/firewall/pending")
 def api_firewall_pending():
-    """Open decisions with their remaining seconds, and the decisions of the last 24 h (``history``)."""
+    """Open decisions with their remaining seconds and ``can_fetch`` (see ``_fw_can_fetch``), and the decisions
+    of the last 24 h (``history``)."""
     now = time.time()
-    return _fw_json({"pending": [_fw_item_view(i, now) for i in _fw_pending.open()],
+    return _fw_json({"pending": [dict(_fw_item_view(i, now), can_fetch=_fw_can_fetch(i["finding"])) for i in _fw_pending.open()],
                      "history": [_fw_item_view(i, now) for i in _fw_pending.history(100)],
                      "ask_mode": _fw_settings.ask_mode, "decide_seconds": _firewall_decide_seconds(),
                      "server_time": _fw_iso(now)})

@@ -383,6 +383,15 @@ def test_the_pending_route_lists_open_and_decided_with_the_time_left(client, fw)
     assert out["ask_mode"] == "detonation"
 
 
+def test_an_open_decision_says_whether_tdc_can_fetch_it(client, fw, tdc, monkeypatch):
+    fw.pending.add(FINDING, deadline=time.time() + 30)
+    assert client.get("/api/firewall/pending").json["pending"][0]["can_fetch"] is True
+    client.post("/api/firewall/block", json={"scope": "endpoint_all", "ip": "203.0.113.50"})
+    assert client.get("/api/firewall/pending").json["pending"][0]["can_fetch"] is False
+    monkeypatch.setattr(tdc, "_fw_rules", lambda force=False: (None, "PowerShell failed"))
+    assert client.get("/api/firewall/pending").json["pending"][0]["can_fetch"] is None
+
+
 def test_a_fetch_that_finishes_after_its_item_was_pruned_still_keeps_the_capture(client, fw, tdc, monkeypatch):
     fw.pending.add(FINDING, deadline=time.time() + 30)
     monkeypatch.setattr(fw.pending, "set_result", lambda *a, **k: None)
