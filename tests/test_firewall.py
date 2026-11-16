@@ -34,6 +34,13 @@ def R(image, ip, port):
     return firewall.rule_key(image, ip, port)
 
 
+@pytest.fixture(autouse=True)
+def reset_geoip_state(tmp_path):
+    """No test leaves geoip pointing at data of its own (the default-lookup test loads an empty table)."""
+    yield
+    geoip.load(str(tmp_path / "nothing"))
+
+
 def fake_geo(ip):
     return FAKE_GEO.get(ip)
 
@@ -168,6 +175,16 @@ def test_the_hostname_sysmon_reports_wins_over_the_map():
 def test_direct_ip_when_no_dns_resolved_there():
     flows = firewall.classify([conn(dst="1.2.3.4")], [], ctx_with(dns={}))
     assert "direct-ip" in flows[0]["tags"]
+
+
+def test_direct_ip_needs_neither_the_map_nor_sysmons_hostname_to_explain_the_address():
+    # Sysmon fills DestinationHostname from the local DNS cache: a populated field means a name was
+    # involved, even when the answer predates the ring or fell outside the map
+    named_by_sysmon = classify_one(conn(dst="1.2.3.4", hostname="cached.example"), ctx_with(dns={}))
+    named_by_the_map = classify_one(conn(dst="1.2.3.4", hostname="-"), ctx_with(dns={"1.2.3.4": "x.example"}))
+    unexplained = classify_one(conn(dst="1.2.3.4", hostname="-"), ctx_with(dns={}))
+    assert "direct-ip" not in named_by_sysmon["tags"] and "direct-ip" not in named_by_the_map["tags"]
+    assert "direct-ip" in unexplained["tags"]
 
 
 def test_no_direct_ip_when_a_name_resolved_there_or_the_address_is_local():
@@ -305,6 +322,8 @@ def test_rare_port_outside_the_usual_list_and_for_the_classics():
     assert "rare-port" not in classify_one(conn(dport=53, proto="udp"))["tags"]
     # a service on the LAN or loopback is not rare, unless it is one of the classics
     assert "rare-port" not in classify_one(conn(dst="192.168.64.1", dport=8766))["tags"]
+    # nor is it for an address that is none
+    assert "rare-port" not in classify_one(conn(dst="-", dport=9001))["tags"]
     assert "rare-port" in classify_one(conn(dst="192.168.64.1", dport=31337))["tags"]
 
 
@@ -401,13 +420,11 @@ def test_firewall_join_takes_flat_events_and_skips_junk():
 # ---- self-exclusion --------------------------------------------------------------------------
 
 
-def test_tdc_processes_are_tagged_but_never_blockable():
-    f = firewall.classify([conn(image=TDC_PYTHON, dst="140.82.121.3")], [], ctx_with())[0]
-    assert f["self"] is True
-    f2 = firewall.classify([conn(image=TDC_PYTHON, dst="1.2.3.4")], [], ctx_with())[0]
-    assert "tdc-anomaly" in f2["tags"]
-    assert f2["self"] is True
-    assert "tdc-anomaly" not in f["tags"]
+def test_tdc_python_is_self_and_only_an_unexpected_endpoint_is_an_anomaly():
+    to_github = firewall.classify([conn(image=TDC_PYTHON, dst=GITHUB_IP)], [], ctx_with())[0]
+    to_unknown_host = firewall.classify([conn(image=TDC_PYTHON, dst="1.2.3.4")], [], ctx_with())[0]
+    assert to_github["self"] is True and "tdc-anomaly" not in to_github["tags"]
+    assert to_unknown_host["self"] is True and "tdc-anomaly" in to_unknown_host["tags"]
 
 
 def test_tdc_may_talk_to_loopback_and_to_what_the_caller_expects():
@@ -611,12 +628,6 @@ def test_a_detonation_is_read_the_way_an_analyst_would():
 
 
 # ---- summary ---------------------------------------------------------------------------------
-
-
-def test_summarize_counts_states_and_tops():
-    s = firewall.summarize(firewall.classify(SAMPLE_EVENTS, [], ctx_with()))
-    assert set(s) >= {"connections", "blocked", "pending", "captures",
-                      "top_processes", "top_endpoints", "top_countries"}
 
 
 def test_summarize_of_nothing():

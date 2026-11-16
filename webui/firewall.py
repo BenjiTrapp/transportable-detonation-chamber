@@ -180,7 +180,6 @@ class Context:
     pending          rule_key(...) keys that have an open decision
     downloads        {(pid, dst_ip, dst_port)} of connections for which a URL to an executable was seen
     fetch_targets    IPs and names TDC's own fetcher was sent to; not an anomaly for ``tdc-anomaly``
-    now              wall-clock time of the assessment; the tags depend on the event times only
     geo_lookup       ``ip -> GeoInfo | None``
     """
 
@@ -191,7 +190,6 @@ class Context:
     ioc_domains: Set[str] = field(default_factory=set)
     processes: Dict[int, Dict[str, Any]] = field(default_factory=dict)
     rules: Dict[str, str] = field(default_factory=dict)
-    now: float = 0.0
     pending: Set[str] = field(default_factory=set)
     downloads: Set[Tuple[Optional[int], str, Optional[int]]] = field(default_factory=set)
     fetch_targets: Set[str] = field(default_factory=set)
@@ -507,7 +505,12 @@ def _tdc_expects(flow: Dict[str, Any], host: str, ctx: Context) -> bool:
             or any(h in TDC_ENDPOINTS or h in ctx.fetch_targets for h in _host_chain(host)))
 
 
-def _tag_flow(flow: Dict[str, Any], ctx: Context, alert_endpoints: Set[Tuple[str, Optional[int]]]) -> List[str]:
+def _tag_flow(flow: Dict[str, Any], ctx: Context, alert_endpoints: Set[Tuple[str, Optional[int]]],
+              is_tdc: bool) -> List[str]:
+    """What is suspicious about this process talking to this endpoint, most severe first.
+
+    Only tags of the flow itself: ``dropped`` belongs to the endpoint (``attach_firewall``).
+    """
     ip, port, image = flow["dst_ip"], flow["dst_port"], flow["image"]
     host = flow.get("dst_hostname") or ctx.dns.get(ip) or ""
     chain = _host_chain(host)
@@ -521,11 +524,16 @@ def _tag_flow(flow: Dict[str, Any], ctx: Context, alert_endpoints: Set[Tuple[str
         found.add("sigma")
     if _is_detonated(flow["pid"], ctx):
         found.add("detonated")
-    if scope == "public" and ip not in ctx.dns:
+    # A hardcoded target is an address that no name explains. Sysmon fills DestinationHostname from the
+    # local DNS cache, so a populated field is evidence that a name was involved, even when the answer
+    # predates the ring or fell outside the map. A C2 with a usable cache entry escapes this tag, but it is
+    # high severity and the false positive is the common case; ioc, beacon, rare-port, risky-tld and
+    # dead-drop still catch such a C2.
+    if scope == "public" and ip not in ctx.dns and not flow.get("dst_hostname"):
         found.add("direct-ip")
     if (flow["pid"], ip, port) in ctx.downloads:
         found.add("download")
-    if _is_tdc_image(image) and not _tdc_expects(flow, host, ctx):
+    if is_tdc and not _tdc_expects(flow, host, ctx):
         found.add("tdc-anomaly")
     if image.replace("/", "\\").rsplit("\\", 1)[-1].lower() in LOLBINS:
         found.add("lolbin")
@@ -535,19 +543,11 @@ def _tag_flow(flow: Dict[str, Any], ctx: Context, alert_endpoints: Set[Tuple[str
         found.add("risky-tld")
     if any(h in DEAD_DROPS for h in chain):
         found.add("dead-drop")
-    if port is not None and (port in SUSPICIOUS_PORTS or (scope != "local" and port not in COMMON_PORTS)):
+    if port is not None and (port in SUSPICIOUS_PORTS or (scope == "public" and port not in COMMON_PORTS)):
         found.add("rare-port")
     if _is_newborn(flow, ctx):
         found.add("newborn")
     return [tag for tag in TAGS if tag in found]
-
-
-def tag_flow(flow: Dict[str, Any], ctx: Context) -> List[str]:
-    """What is suspicious about this process talking to this endpoint, most severe first.
-
-    Only tags of the flow itself: ``dropped`` belongs to the endpoint (``attach_firewall``).
-    """
-    return _tag_flow(flow, ctx, _alert_endpoints(ctx.alerts))
 
 
 # ---- the whole pipeline ----------------------------------------------------------------------
@@ -577,14 +577,15 @@ def classify(events: List[Dict[str, Any]], fw_events: List[Dict[str, Any]], ctx:
         if not flow["dst_hostname"]:
             flow["dst_hostname"] = ctx.dns.get(ip) or None
         flow["geo"] = _geo(ip, ctx)
-        flow["tags"] = _tag_flow(flow, ctx, alert_endpoints)
+        is_tdc = _is_tdc_image(flow["image"])
+        flow["tags"] = _tag_flow(flow, ctx, alert_endpoints, is_tdc)
         flow["severity"] = severity_of(flow["tags"])
         keys = _rule_keys(flow["image"], ip, flow["dst_port"])
         rule_id = next((rules[k] for k in keys if k in rules), None)
         flow["rule_id"] = rule_id
         flow["state"] = "blocked" if rule_id is not None else "pending" if pending & set(keys) else "allowed"
         flow["capture_ids"] = []
-        flow["self"] = _is_tdc_image(flow["image"])
+        flow["self"] = is_tdc
     return flows
 
 
