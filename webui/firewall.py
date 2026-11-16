@@ -42,11 +42,17 @@ that follows from them. They are in ``fw_*`` and ``endpoint_tags``, never in
 country and AS, and a position moved by ``geoip.jitter`` when the country has a
 centroid. Anything else has ``scope`` from ``geoip.scope_of`` and no data.
 
-``state`` follows ``ctx.rules``, ``{key: rule_id}`` where a key is an IP
-("1.2.3.4"), an endpoint ("1.2.3.4:443", ``endpoint_key``) or an image path, in
-that order of precedence; a flow that no rule hits and that a key of
-``ctx.pending`` names is "pending". The state is what the rules say, also for
-a TDC process: ``self`` only tells the UI that it must not offer to block it.
+``state`` follows ``ctx.rules``, ``{key: rule_id}``, where a key is made by ``rule_key``:
+a program, an endpoint, or both. The automatic block is program-scoped (this loader, this
+address), so a rule for one image must not mark another process's flow to the same address.
+``classify`` tries five levels, the most specific first, and the first hit is ``rule_id``:
+
+    1. this image, this ip:port      2. this image, this ip      3. this image, any address
+    4. any image, this ip:port       5. any image, this ip
+
+A flow that no rule hits and that a key of ``ctx.pending`` (same keys, same levels) names is
+"pending". The state is what the rules say, also for a TDC process: ``self`` only tells the UI
+that it must not offer to block it.
 
 The tags are the thirteen of the design plus ``tdc-anomaly`` (TDC's own python
 talking to an endpoint it has no business with). ``TAGS`` maps each to its
@@ -109,18 +115,29 @@ RISKY_TLDS = frozenset({"onion", "bit", "top", "xyz", "tk", "ml", "ga", "cf"})
 COMMON_PORTS = frozenset({21, 22, 25, 53, 80, 110, 123, 143, 443, 465, 587, 853, 993, 995})
 SUSPICIOUS_PORTS = frozenset({4444, 5555, 6666, 8888, 9999, 31337})
 
-# TDC's own programs, lower case. A trailing backslash means "everything below this folder".
-# The full path is what counts: a file named git.exe in %TEMP% is not git.
+# TDC's own programs, matched case-insensitively: these exact paths (the python of the web UI,
+# of the Detonator and of LitterBox, see scripts/configure-services.ps1), anything below one of
+# the install roots (a trailing backslash: the root itself is not a program), and git.exe by name.
+# Git's own folder is a root too, because ``git fetch`` does its network work in git-remote-https.exe.
+# Matching by path and by name can be abused: a file named git.exe in %TEMP% counts as TDC's, and so
+# does anything a sample drops into one of these folders. ``tdc-anomaly`` is the net under this: a TDC
+# image that reaches an endpoint outside TDC_ENDPOINTS (and the caller's fetch targets) is flagged
+# high whatever the image really is.
 TDC_IMAGES = (
     "c:\\detonationchamberui\\venv\\scripts\\python.exe",
-    "c:\\detonationchamberui\\venv\\scripts\\pythonw.exe",
+    "c:\\detonator\\.venv\\scripts\\python.exe",
+    "c:\\litterbox\\venv\\scripts\\python.exe",
+)
+TDC_ROOTS = (
+    "c:\\detonationchamberui\\",
     "c:\\detonator\\",
     "c:\\detonatoragent\\",
     "c:\\litterbox\\",
-    "c:\\program files\\fibratus\\",
     "c:\\tools\\rustinel\\",
+    "c:\\program files\\fibratus\\",
     "c:\\program files\\git\\",
 )
+TDC_BASENAMES = frozenset({"git.exe"})
 
 # What TDC's python may reach besides loopback and the endpoints a Context lists as
 # fetch targets: tool updates, package managers and ``git fetch``. A name matches
@@ -138,7 +155,6 @@ DGA_DIGIT_RATIO = 0.3      # or this share of digits
 NEWBORN_S = 60             # a process younger than this when it connects
 
 MAX_TIMES = 200            # single connection times kept per flow
-DNS_TTL_S = 24 * 3600      # a DNS answer older than this (against the newest one) is forgotten
 DNS_MAX_ENTRIES = 20000
 TOP_N = 5
 
@@ -160,8 +176,8 @@ class Context:
     ioc_ips          IPs of the IOC list, normalised (``1.2.3.4``)
     ioc_domains      names of the IOC list, lower case, without a trailing dot
     processes        PID -> {"start": epoch, "image", "parent_pid"} from Sysmon EID 1
-    rules            {key: rule_id} of the TDC firewall rules that stand (see the module docstring)
-    pending          keys (same kind as ``rules``) that have an open decision
+    rules            {rule_key(...): rule_id} of the TDC firewall rules that stand (see the module docstring)
+    pending          rule_key(...) keys that have an open decision
     downloads        {(pid, dst_ip, dst_port)} of connections for which a URL to an executable was seen
     fetch_targets    IPs and names TDC's own fetcher was sent to; not an anomaly for ``tdc-anomaly``
     now              wall-clock time of the assessment; the tags depend on the event times only
@@ -250,10 +266,32 @@ def _is_event(ev: Any, eid: int) -> bool:
 
 
 def endpoint_key(ip: str, port: Optional[int]) -> str:
-    """The key of an endpoint in ``Context.rules``: ``1.2.3.4:443``, ``[2001:db8::1]:443``, or the IP alone."""
+    """An endpoint as text: ``1.2.3.4:443``, ``[2001:db8::1]:443``, or the IP alone when there is no port."""
     if port is None:
         return ip
     return f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"
+
+
+def rule_key(image: str, ip: str, port: Optional[int]) -> str:
+    """The key of a rule in ``Context.rules`` and ``Context.pending``: ``<image>|<endpoint>``, image in lower case.
+
+    An empty ``image`` means every process, an empty ``ip`` every address (the port then does not count).
+    ``rule_key(loader, "1.2.3.4", 443)`` is the automatic block, ``rule_key("", "1.2.3.4", None)`` the
+    endpoint blocked for everyone.
+    """
+    return f"{image.lower()}|{endpoint_key(ip, port) if ip else ''}"
+
+
+def _rule_keys(image: str, ip: str, port: Optional[int]) -> List[str]:
+    """The keys a flow can be hit by, most specific first; levels that would name nothing are left out."""
+    keys = []
+    if image and ip:
+        keys += [rule_key(image, ip, port), rule_key(image, ip, None)]
+    if image:
+        keys.append(rule_key(image, "", None))
+    if ip:
+        keys += [rule_key("", ip, port), rule_key("", ip, None)]
+    return [_fold(k) for k in keys]
 
 
 # ---- bundling --------------------------------------------------------------------------------
@@ -294,12 +332,14 @@ def bundle(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return list(flows.values())
 
 
-def dns_map(events: List[Dict[str, Any]], ttl_s: Optional[float] = DNS_TTL_S,
+def dns_map(events: List[Dict[str, Any]], ttl_s: Optional[float] = None,
             limit: int = DNS_MAX_ENTRIES) -> Dict[str, str]:
     """IP -> queried name from Sysmon EID 22 events; the newest answer for an address wins.
 
-    Answers older than ``ttl_s`` seconds measured against the newest answer are forgotten
-    (``None`` keeps them all), and at most ``limit`` addresses are kept, the most recently answered.
+    A name, once seen, explains its address for as long as the caller holds the flow: forgetting it
+    would turn every older flow into a hardcoded target (``direct-ip``). Memory is bounded by ``limit``
+    (the most recently answered addresses are kept) and by the store's ring. A caller that wants an
+    expiry passes ``ttl_s``: answers older than that, measured against the newest answer, are dropped.
     """
     answers = []
     for ev in events:
@@ -428,7 +468,8 @@ def _alert_endpoints(alerts: List[Dict[str, Any]]) -> Set[Tuple[str, Optional[in
 
 def _is_tdc_image(image: str) -> bool:
     path = image.replace("/", "\\").lower()
-    return any(path.startswith(p) if p.endswith("\\") else path == p for p in TDC_IMAGES)
+    return (path in TDC_IMAGES or path.startswith(TDC_ROOTS)
+            or path.rsplit("\\", 1)[-1] in TDC_BASENAMES)
 
 
 def _is_loopback(ip: str) -> bool:
@@ -538,7 +579,7 @@ def classify(events: List[Dict[str, Any]], fw_events: List[Dict[str, Any]], ctx:
         flow["geo"] = _geo(ip, ctx)
         flow["tags"] = _tag_flow(flow, ctx, alert_endpoints)
         flow["severity"] = severity_of(flow["tags"])
-        keys = [_fold(k) for k in (ip, endpoint_key(ip, flow["dst_port"]), flow["image"]) if k]
+        keys = _rule_keys(flow["image"], ip, flow["dst_port"])
         rule_id = next((rules[k] for k in keys if k in rules), None)
         flow["rule_id"] = rule_id
         flow["state"] = "blocked" if rule_id is not None else "pending" if pending & set(keys) else "allowed"

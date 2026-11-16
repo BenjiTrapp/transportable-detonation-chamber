@@ -30,6 +30,10 @@ FAKE_GEO = {
 }
 
 
+def R(image, ip, port):
+    return firewall.rule_key(image, ip, port)
+
+
 def fake_geo(ip):
     return FAKE_GEO.get(ip)
 
@@ -193,13 +197,22 @@ def test_dns_map_last_answer_wins_whatever_the_order_of_the_events():
     assert firewall.dns_map(events) == {"1.2.3.4": "new.example"}
 
 
-def test_dns_map_forgets_old_answers_and_keeps_a_bounded_size():
-    day = firewall.DNS_TTL_S
+def test_dns_map_keeps_every_answer_unless_the_caller_asks_for_a_ttl():
+    day = 24 * 3600
     events = [{"timestamp": iso(0), "event_id": 22, "query": "old.example", "result": "1.1.1.1;"},
               {"timestamp": iso(day + 5), "event_id": 22, "query": "new.example", "result": "2.2.2.2;"}]
-    assert firewall.dns_map(events) == {"2.2.2.2": "new.example"}
-    assert firewall.dns_map(events, ttl_s=None) == {"1.1.1.1": "old.example", "2.2.2.2": "new.example"}
-    assert list(firewall.dns_map(events, ttl_s=None, limit=1)) == ["2.2.2.2"]
+    assert firewall.dns_map(events) == {"1.1.1.1": "old.example", "2.2.2.2": "new.example"}
+    assert firewall.dns_map(events, ttl_s=day) == {"2.2.2.2": "new.example"}
+    assert list(firewall.dns_map(events, limit=1)) == ["2.2.2.2"]
+
+
+def test_a_flow_long_after_its_dns_answer_is_not_a_hardcoded_target():
+    two_days = 2 * 24 * 3600
+    dns_events = [{"timestamp": iso(0), "event_id": 22, "query": "old.example", "result": "1.2.3.4;"},
+                  {"timestamp": iso(two_days), "event_id": 22, "query": "other.example", "result": "5.6.7.8;"}]
+    ctx = ctx_with(dns=firewall.dns_map(dns_events))
+    f = classify_one(conn(dst="1.2.3.4", t=two_days), ctx)
+    assert "direct-ip" not in f["tags"] and f["dst_hostname"] == "old.example"
 
 
 # ---- the tags --------------------------------------------------------------------------------
@@ -417,14 +430,28 @@ def test_other_processes_are_not_self_and_never_anomalous():
 def test_self_matches_the_paths_in_tdc_images_ignoring_case():
     assert classify_one(conn(image=TDC_PYTHON.upper()))["self"] is True
     assert classify_one(conn(image=r"C:\Program Files\Git\mingw64\libexec\git-core\git-remote-https.exe"))["self"]
-    assert classify_one(conn(image=r"C:\Users\x\Temp\git.exe"))["self"] is False
+    assert classify_one(conn(image=r"c:\litterbox\venv\scripts\python.exe"))["self"] is True
+    assert classify_one(conn(image=r"C:\detonator\.venv\Scripts\python.exe"))["self"] is True
+    assert classify_one(conn(image=r"C:\DetonatorAgent\publish\DetonatorAgent.exe"))["self"] is True
+    assert classify_one(conn(image=r"C:\Program Files\Fibratus\Bin\fibratus.exe"))["self"] is True
+    assert classify_one(conn(image=r"C:\tools\rustinel\rustinel.exe"))["self"] is True
+    assert classify_one(conn(image=r"C:\Program Files\Git\cmd\GIT.EXE"))["self"] is True
+
+
+def test_git_counts_by_name_and_tdc_anomaly_is_the_net_under_that():
+    # matching is by path and by name, and both can be abused: a dropped git.exe is "self"
+    # but is flagged the moment it reaches anything TDC has no business with
+    dropped = classify_one(conn(image=r"C:\Users\x\Temp\git.exe", dst="1.2.3.4"))
+    assert dropped["self"] is True and "tdc-anomaly" in dropped["tags"]
+    assert classify_one(conn(image=r"C:\Users\x\Temp\gitt.exe"))["self"] is False
+    assert classify_one(conn(image=r"C:\DetonationChamberUI2\x.exe"))["self"] is False
 
 
 # ---- state, rules ----------------------------------------------------------------------------
 
 
 def test_state_is_allowed_unless_a_rule_or_a_pending_decision_says_otherwise():
-    ctx = ctx_with(rules={"1.2.3.4:443": "TDC-FW-a1"}, pending={"5.6.7.8"})
+    ctx = ctx_with(rules={R(IMAGE, "1.2.3.4", 443): "TDC-FW-a1"}, pending={R("", "5.6.7.8", None)})
     blocked = classify_one(conn(dst="1.2.3.4", dport=443), ctx)
     other_port = classify_one(conn(dst="1.2.3.4", dport=80), ctx)
     pending = classify_one(conn(dst="5.6.7.8"), ctx)
@@ -433,25 +460,74 @@ def test_state_is_allowed_unless_a_rule_or_a_pending_decision_says_otherwise():
     assert (pending["state"], pending["rule_id"]) == ("pending", None)
 
 
-def test_rule_keys_ip_endpoint_image_and_the_first_hit_wins():
-    ctx = ctx_with(rules={"1.2.3.4": "ip-rule", "1.2.3.4:443": "endpoint-rule", IMAGE.upper(): "image-rule"})
-    assert classify_one(conn(dst="1.2.3.4", dport=443), ctx)["rule_id"] == "ip-rule"
-    assert classify_one(conn(dst="9.9.9.9", dport=443), ctx)["rule_id"] == "image-rule"
-    ctx2 = ctx_with(rules={"1.2.3.4:443": "endpoint-rule", IMAGE: "image-rule"})
-    assert classify_one(conn(dst="1.2.3.4", dport=443), ctx2)["rule_id"] == "endpoint-rule"
+def test_rule_keys_are_what_rule_key_says_and_endpoint_key_is_unchanged():
+    assert firewall.rule_key(IMAGE, "1.2.3.4", 443) == r"c:\x\a.exe|1.2.3.4:443"
+    assert firewall.rule_key(IMAGE, "1.2.3.4", None) == r"c:\x\a.exe|1.2.3.4"
+    assert firewall.rule_key(IMAGE, "", None) == r"c:\x\a.exe|"
+    assert firewall.rule_key("", "1.2.3.4", 443) == "|1.2.3.4:443"
+    assert firewall.rule_key("", "2001:db8::1", 443) == "|[2001:db8::1]:443"
     assert firewall.endpoint_key("2001:db8::1", 443) == "[2001:db8::1]:443"
     assert firewall.endpoint_key("1.2.3.4", 443) == "1.2.3.4:443"
-    ctx3 = ctx_with(rules={"[2001:db8::1]:443": "v6"})
-    assert classify_one(conn(dst="2001:db8::1", dport=443), ctx3)["state"] == "blocked"
+    assert firewall.endpoint_key("1.2.3.4", None) == "1.2.3.4"
+
+
+def test_a_block_for_one_program_leaves_another_programs_flow_to_the_same_endpoint_allowed():
+    ctx = ctx_with(rules={R(IMAGE, "1.2.3.4", 443): "r1"})
+    mine = classify_one(conn(image=IMAGE, dst="1.2.3.4", dport=443), ctx)
+    other = classify_one(conn(image=r"C:\x\b.exe", dst="1.2.3.4", dport=443), ctx)
+    elsewhere = classify_one(conn(image=IMAGE, dst="1.2.3.4", dport=80), ctx)
+    assert (mine["state"], mine["rule_id"]) == ("blocked", "r1")
+    assert (other["state"], other["rule_id"]) == ("allowed", None)
+    assert elsewhere["state"] == "allowed"
+    for rules in ({R(IMAGE, "1.2.3.4", None): "r"}, {R(IMAGE, "", None): "r"}):
+        ctx = ctx_with(rules=rules)
+        assert classify_one(conn(image=r"C:\x\b.exe", dst="1.2.3.4"), ctx)["state"] == "allowed"
+        assert classify_one(conn(image=IMAGE, dst="1.2.3.4", dport=80), ctx)["state"] == "blocked"
+
+
+def test_a_block_for_every_process_hits_all_of_them():
+    ip_port = ctx_with(rules={R("", "1.2.3.4", 443): "r"})
+    whole_ip = ctx_with(rules={R("", "1.2.3.4", None): "r"})
+    for ctx in (ip_port, whole_ip):
+        for image in (IMAGE, r"C:\x\b.exe", TDC_PYTHON):
+            assert classify_one(conn(image=image, dst="1.2.3.4", dport=443), ctx)["state"] == "blocked"
+        assert classify_one(conn(dst="5.6.7.8", dport=443), ctx)["state"] == "allowed"
+    assert classify_one(conn(dst="1.2.3.4", dport=80), ip_port)["state"] == "allowed"
+    assert classify_one(conn(dst="1.2.3.4", dport=80), whole_ip)["state"] == "blocked"
+
+
+def test_the_most_specific_rule_wins_in_the_documented_order():
+    ladder = [(R(IMAGE, "1.2.3.4", 443), "1"), (R(IMAGE, "1.2.3.4", None), "2"), (R(IMAGE, "", None), "3"),
+              (R("", "1.2.3.4", 443), "4"), (R("", "1.2.3.4", None), "5")]
+    for n in range(5):
+        ctx = ctx_with(rules=dict(ladder[n:]))
+        assert classify_one(conn(dst="1.2.3.4", dport=443), ctx)["rule_id"] == str(n + 1)
+
+
+def test_rule_keys_ignore_case_and_cover_ipv6():
+    ctx = ctx_with(rules={R(IMAGE.upper(), "2001:db8::1", 443): "v6"})
+    assert classify_one(conn(dst="2001:db8::1", dport=443), ctx)["rule_id"] == "v6"
+
+
+def test_a_flow_without_an_image_or_address_matches_no_rule_by_accident():
+    ctx = ctx_with(rules={"|": "everything", R("", "", None): "nothing"})
+    assert classify_one(conn(image="-", dst="1.2.3.4"), ctx)["state"] == "allowed"
+    assert classify_one(conn(image=IMAGE, dst="-"), ctx)["state"] == "allowed"
 
 
 def test_a_blocked_decision_beats_a_pending_one():
-    ctx = ctx_with(rules={"5.6.7.8": "r"}, pending={"5.6.7.8"})
+    ctx = ctx_with(rules={R("", "5.6.7.8", None): "r"}, pending={R("", "5.6.7.8", None)})
     assert classify_one(conn(dst="5.6.7.8"), ctx)["state"] == "blocked"
 
 
+def test_a_pending_decision_is_program_scoped_too():
+    ctx = ctx_with(pending={R(IMAGE, "5.6.7.8", 443)})
+    assert classify_one(conn(image=IMAGE, dst="5.6.7.8", dport=443), ctx)["state"] == "pending"
+    assert classify_one(conn(image=r"C:\x\b.exe", dst="5.6.7.8", dport=443), ctx)["state"] == "allowed"
+
+
 def test_a_rule_that_bites_a_tdc_process_is_shown_as_it_is():
-    ctx = ctx_with(rules={"1.2.3.4": "r2"})
+    ctx = ctx_with(rules={R("", "1.2.3.4", None): "r2"})
     f = classify_one(conn(image=TDC_PYTHON, dst="1.2.3.4"), ctx)
     assert f["self"] is True and f["state"] == "blocked" and f["rule_id"] == "r2"
 
@@ -550,7 +626,7 @@ def test_summarize_of_nothing():
 
 
 def test_summarize_numbers():
-    ctx = ctx_with(rules={"5.6.7.8": "r"}, pending={"9.9.9.9"})
+    ctx = ctx_with(rules={R("", "5.6.7.8", None): "r"}, pending={R("", "9.9.9.9", None)})
     events = ([conn(pid=1, dst="1.2.3.4", t=t) for t in range(3)] + [conn(pid=2, dst="1.2.3.4", t=9)]
               + [conn(pid=1, dst="5.6.7.8", dport=80, t=5)] + [conn(pid=3, dst="9.9.9.9", t=6)]
               + [conn(pid=1, dst="192.168.64.1", dport=53, t=7)])
