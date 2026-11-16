@@ -98,11 +98,16 @@ class _FakeResponse:
         self._pos += len(chunk)
         return chunk
 
+    read1 = read
+
 
 class _FakeConnection:
     def __init__(self, fw, scheme, host, port, ip):
         self.fw, self.call = fw, {"scheme": scheme, "host": host, "port": port, "ip": ip}
-        self.sock = None
+        self.sock = self.io_sock = None
+
+    def connect(self):
+        pass
 
     def request(self, method, target, headers=None):
         self.call.update(method=method, target=target, headers=dict(headers or {}))
@@ -122,7 +127,8 @@ class FirewallFake:
     (``FakeRun`` of the rules tests), a network behind ``fetches``, and stores in tmp_path.
 
     ``body`` is what a fetch is served, ``script`` a list of ``(status, headers, body)`` served first (redirects),
-    ``lookups`` every name that was resolved (a fetch must resolve none)."""
+    ``lookups`` every name that was resolved (a fetch must resolve none), ``own`` the addresses that count as
+    this VM's own (a fetch must refuse them)."""
 
     def __init__(self, tdc, run, store, settings, pending, tmp_path):
         self.tdc, self.run, self.store, self.settings, self.pending = tdc, run, store, settings, pending
@@ -130,6 +136,7 @@ class FirewallFake:
         self.fetches, self.script, self.lookups = [], [], []
         self.body = b"MZ" + b"\x00" * 100
         self.resolve_to = "9.9.9.9"
+        self.own = {"192.168.64.129", "192.168.64.1"}      # the VM's own address and its gateway
 
     @property
     def profiles(self):
@@ -148,6 +155,7 @@ class _InlineExecutor:
 @pytest.fixture
 def fw(tdc, monkeypatch, tmp_path):
     from test_firewall_rules import FakeRun
+    import firewall_fetch
     import firewall_store
     m = tdc
     fake = FirewallFake(m, FakeRun(), firewall_store.FirewallStore(), firewall_store.Settings(str(tmp_path / "state.json")),
@@ -156,12 +164,16 @@ def fw(tdc, monkeypatch, tmp_path):
                         ("_fw_pending", fake.pending), ("_fw_executor", _InlineExecutor()),
                         ("CAPTURE_DIR", str(fake.samples)), ("CAPTURES_FILE", str(tmp_path / "captures.json")),
                         ("_fw_downloads", {}), ("_fw_scan_state", {"done": False}), ("_fw_rules_cache", None),
-                        ("_fw_windows_cache", (0.0, {})), ("_fw_window_alive", {}),
+                        ("_fw_windows_cache", (0.0, {})), ("_fw_window_alive", {}), ("_fw_fetch_paths", {}),
                         ("_fw_ioc_cache", (time.time() + 1e6, (frozenset(), frozenset())))):
         monkeypatch.setattr(m, name, value)
     monkeypatch.setattr(m, "_process_started_at", lambda pid: None)
-    monkeypatch.setattr(m, "_pinned_connection",
+    # the fetch mechanism itself (real sockets, the deadline, the SNI) is tested in test_firewall_fetch.py;
+    # here the connection is a fake, so these tests stay about the policy around it
+    monkeypatch.setattr(firewall_fetch, "pinned_connection",
                         lambda scheme, host, port, ip, timeout: _FakeConnection(fake, scheme, host, port, ip))
+    # the addresses of this machine are not asked for: they would be a lookup, and every test would see it
+    monkeypatch.setattr(firewall_fetch, "_own_cache", (time.time(), frozenset(fake.own)))
 
     def resolving(host, *args, **kwargs):
         fake.lookups.append(host)

@@ -193,22 +193,22 @@ def test_a_disabled_profile_is_reported():
 def test_enforcement_refuses_while_a_profile_is_off():
     run = FakeRun(profiles={"Domain": False, "Private": False, "Public": False})
     with pytest.raises(rules_mod.RuleError) as e:
-        rules_mod.isolate(run, True, fetcher=PY, settings=SETTINGS)
+        rules_mod.isolate(run, True, settings=SETTINGS)
     assert "firewall" in str(e.value).lower()
 
 
 def test_isolate_remembers_the_previous_outbound_action():
     run, settings = FakeRun(outbound="Allow"), FakeSettings()
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, True, settings=settings)
     assert settings.outbound_before == "Allow"
     assert any("DefaultOutboundAction Block" in " ".join(c) for c in run.calls)
-    assert any("-Program " + PY in " ".join(c) and "-Action Allow" in " ".join(c) for c in run.calls)
+    assert not any("-Program" in c for c in run.calls)     # the fetcher's way out is per fetch, see allow_fetch
     assert any("127.0.0.0/8" in " ".join(c) for c in run.calls)
 
 
 def test_leaving_isolated_restores_exactly_what_was_there():
     run, settings = FakeRun(), FakeSettings(outbound_before="Allow", isolated=True)
-    rules_mod.isolate(run, False, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, False, settings=settings)
     assert any("DefaultOutboundAction Allow" in " ".join(c) for c in run.calls)
     assert settings.isolated is False and settings.outbound_before is None
 
@@ -255,8 +255,8 @@ def test_the_ops_the_module_emits_are_the_ops_the_script_accepts():
     rules_mod.unblock(run, run.calls[0][run.calls[0].index("-Name") + 1])
     rules_mod.rules(run)
     rules_mod.enable_firewall(run)
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
-    rules_mod.isolate(run, False, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, True, settings=settings)
+    rules_mod.isolate(run, False, settings=settings)
     assert set(run.ops()) <= allowed
     assert set(run.ops()) == {"Create", "Get", "Remove", "List", "Enable", "Profiles", "SetDefaultOutbound"}
 
@@ -486,9 +486,10 @@ def test_a_rule_we_would_not_have_written_is_listed_but_never_counts_as_a_block(
 
 def test_the_allow_rules_of_isolated_are_listed_as_such_and_never_as_blocks():
     run, settings = make()
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, True, settings=settings)
+    fetch = rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)["name"]
     listed = {r["rule_id"]: r for r in rules_mod.rules(run)}
-    assert set(listed) == {"TDC-FW-ISO-loopback", "TDC-FW-ISO-fetcher"}
+    assert set(listed) == {"TDC-FW-ISO-loopback", fetch}
     assert all(r["kind"] == "isolate" and r["action"] == "Allow" and not r["blocking"] for r in listed.values())
 
 
@@ -545,24 +546,23 @@ def test_isolate_refused_for_a_profile_that_is_off_changes_and_remembers_nothing
     run = FakeRun(profiles={"Domain": True, "Private": False, "Public": True})
     settings = FakeSettings()
     with pytest.raises(rules_mod.RuleError) as e:
-        rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+        rules_mod.isolate(run, True, settings=settings)
     assert "Private" in str(e.value)
     assert run.ops() == ["Profiles"] and settings.saved == []
 
 
-def test_isolate_allows_loopback_and_the_fetcher_and_nothing_else():
+def test_isolate_allows_loopback_and_nothing_else():
     run, settings = make()
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
-    assert set(run.rules) == {"TDC-FW-ISO-loopback", "TDC-FW-ISO-fetcher"}
-    loop, fetch = run.rules["TDC-FW-ISO-loopback"], run.rules["TDC-FW-ISO-fetcher"]
+    rules_mod.isolate(run, True, settings=settings)
+    assert set(run.rules) == {"TDC-FW-ISO-loopback"}          # no standing rule for the fetcher: allow_fetch does that
+    loop = run.rules["TDC-FW-ISO-loopback"]
     assert loop["Action"] == "Allow" and sorted(loop["RemoteAddress"]) == ["127.0.0.0/8", "::1"] and loop["Program"] == "Any"
-    assert fetch["Action"] == "Allow" and fetch["Program"] == PY and fetch["RemoteAddress"] == ["Any"]
     assert run.outbound == {"Domain": "Block", "Private": "Block", "Public": "Block"}
 
 
 def test_isolate_orders_memory_then_allow_rules_then_block():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, True, settings=settings)
     kinds = [t[0] for t in run.timeline]
     first_write = min(i for i, k in enumerate(kinds) if k in ("Create", "SetDefaultOutbound"))
     assert kinds[first_write - 1] == "settings"                       # the way back is saved before anything changes
@@ -572,7 +572,7 @@ def test_isolate_orders_memory_then_allow_rules_then_block():
 
 def test_isolate_marks_the_time():
     run, settings = make()
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, True, settings=settings)
     assert settings.isolated is True and isinstance(settings.isolated_since, float)
 
 
@@ -580,40 +580,40 @@ def test_isolate_changes_nothing_when_the_way_back_cannot_be_saved():
     run = FakeRun()
     settings = FakeSettings(fail=True)
     with pytest.raises(rules_mod.RuleError):
-        rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+        rules_mod.isolate(run, True, settings=settings)
     assert run.writes() == [] and settings.isolated is False
 
 
 def test_isolating_twice_keeps_the_first_memory():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, True, settings=settings)
+    rules_mod.isolate(run, True, settings=settings)
     assert settings.outbound_before == "Allow"
-    rules_mod.isolate(run, False, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, False, settings=settings)
     assert run.outbound == {"Domain": "Allow", "Private": "Allow", "Public": "Allow"}
 
 
 def test_a_vm_that_was_already_on_block_comes_back_on_block():
     run, settings = make(outbound="Block")
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, True, settings=settings)
     assert settings.outbound_before == "Block"
-    rules_mod.isolate(run, False, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, False, settings=settings)
     assert run.outbound == {"Domain": "Block", "Private": "Block", "Public": "Block"}
 
 
 def test_profiles_that_differ_come_back_each_as_they_were():
     run, settings = make(outbound={"Domain": "Block", "Private": "Allow", "Public": "Allow"})
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, True, settings=settings)
     assert run.outbound == {"Domain": "Block", "Private": "Block", "Public": "Block"}
-    rules_mod.isolate(run, False, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, False, settings=settings)
     assert run.outbound == {"Domain": "Block", "Private": "Allow", "Public": "Allow"}
 
 
 def test_isolate_off_goes_backwards_and_forgets_last():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, True, settings=settings)
     run.timeline.clear()
-    rules_mod.isolate(run, False, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, False, settings=settings)
     kinds = [t[0] for t in run.timeline]
     assert kinds.index("SetDefaultOutbound") < kinds.index("Remove") < kinds.index("settings")
     assert run.rules == {} and settings.outbound_before is None and settings.isolated_since is None
@@ -621,36 +621,36 @@ def test_isolate_off_goes_backwards_and_forgets_last():
 
 def test_isolate_off_still_works_when_a_profile_is_off():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, True, settings=settings)
     run.profiles["Public"] = False
-    rules_mod.isolate(run, False, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, False, settings=settings)
     assert settings.isolated is False and run.outbound["Public"] == "Allow"
 
 
 def test_isolate_off_with_no_memory_assumes_allow_and_says_so():
     run, settings = FakeRun(outbound="Block"), FakeSettings(isolated=True, outbound_before=None)
-    out = rules_mod.isolate(run, False, fetcher=PY, settings=settings)
+    out = rules_mod.isolate(run, False, settings=settings)
     assert out["assumed_allow"] is True and set(run.outbound.values()) == {"Allow"}
     assert settings.isolated is False
 
 
 def test_isolate_off_when_not_isolated_touches_nothing():
     run, settings = FakeRun(outbound="Allow"), FakeSettings()
-    out = rules_mod.isolate(run, False, fetcher=PY, settings=settings)
+    out = rules_mod.isolate(run, False, settings=settings)
     assert out["isolated"] is False and out["changed"] is False and out["note"] is None
     assert run.writes() == [] and settings.saved == []
 
 
 def test_a_memory_nobody_can_read_is_not_obeyed_blindly():
     run, settings = FakeRun(outbound="Block"), FakeSettings(isolated=True, outbound_before="Whatever")
-    out = rules_mod.isolate(run, False, fetcher=PY, settings=settings)
+    out = rules_mod.isolate(run, False, settings=settings)
     assert out["assumed_allow"] is True and set(run.outbound.values()) == {"Allow"}
 
 
 def test_a_failure_while_switching_rolls_back_to_what_was_there():
     run, settings = make(outbound="Allow", fail_once={"SetDefaultOutbound": (1, "denied")})
     with pytest.raises(rules_mod.RuleError) as e:
-        rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+        rules_mod.isolate(run, True, settings=settings)
     assert "denied" in str(e.value) and "tdc-unisolate" not in str(e.value)
     assert run.rules == {} and settings.isolated is False and settings.outbound_before is None
     assert set(run.outbound.values()) == {"Allow"}
@@ -659,7 +659,7 @@ def test_a_failure_while_switching_rolls_back_to_what_was_there():
 def test_a_failure_writing_the_allow_rules_never_reaches_the_block():
     run, settings = make(outbound="Allow", fail={"Create": (1, "denied")})
     with pytest.raises(rules_mod.RuleError):
-        rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+        rules_mod.isolate(run, True, settings=settings)
     assert "SetDefaultOutbound" not in run.ops()
     assert set(run.outbound.values()) == {"Allow"} and settings.isolated is False and settings.outbound_before is None
 
@@ -668,7 +668,7 @@ def test_isolated_is_not_claimed_when_the_block_did_not_take():
     run, settings = make(outbound="Allow")
     run.op_SetDefaultOutbound = lambda p: (0, "", "")             # succeeds and does nothing
     with pytest.raises(rules_mod.RuleError):
-        rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+        rules_mod.isolate(run, True, settings=settings)
     assert settings.isolated is False and run.rules == {}
 
 
@@ -681,26 +681,94 @@ def test_a_rollback_that_fails_keeps_the_marker_and_points_at_the_hatch():
         return (0, "", "") if calls["n"] == 1 else (1, "", "denied")        # the block does nothing, the undo fails
     run.op_SetDefaultOutbound = flaky
     with pytest.raises(rules_mod.RuleError) as e:
-        rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+        rules_mod.isolate(run, True, settings=settings)
     assert "scripts/tdc-unisolate.ps1" in str(e.value)
     assert settings.isolated is True and settings.outbound_before == "Allow"
 
 
-def test_isolate_needs_a_fetcher():
+def test_the_way_out_of_isolated_needs_a_usable_fetcher_and_address():
     for bad in ("", None, "-x"):
-        run, settings = make()
+        run = FakeRun()
         with pytest.raises(rules_mod.RuleError):
-            rules_mod.isolate(run, True, fetcher=bad, settings=settings)
-        assert run.writes() == [] and settings.saved == []
+            rules_mod.allow_fetch(run, fetcher=bad, ip="1.2.3.4")
+        assert run.writes() == []
+    for bad in ("", None, "not-an-ip", "1.2.3.4/24"):
+        run = FakeRun()
+        with pytest.raises(rules_mod.RuleError):
+            rules_mod.allow_fetch(run, fetcher=PY, ip=bad)
+        assert run.writes() == []
 
 
 def test_a_block_written_while_isolated_stands_and_survives_leaving_it():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, True, settings=settings)
     r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     assert r["verified"] is True
-    rules_mod.isolate(run, False, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, False, settings=settings)
     assert list(run.rules) == [r["rule_id"]]
+
+
+# ---- the way out of ISOLATED, one fetch at a time --------------------------------------------
+
+
+def test_a_per_fetch_rule_names_one_program_one_address_and_one_port():
+    run = FakeRun()
+    done = rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)
+    assert done["verified"] is True and done["problem"] is None
+    assert done["name"].startswith(rules_mod.FETCH_PREFIX)
+    rule = run.rules[done["name"]]
+    assert rule["Action"] == "Allow" and rule["Program"] == PY and rule["RemoteAddress"] == ["1.2.3.4"]
+    assert rule["RemotePort"] == ["8080"] and rule["Protocol"] == "TCP"
+
+
+def test_a_per_fetch_rule_without_a_port_covers_the_address():
+    run = FakeRun()
+    done = rules_mod.allow_fetch(run, fetcher=PY, ip="2001:db8::1")
+    rule = run.rules[done["name"]]
+    assert rule["RemoteAddress"] == ["2001:db8::1"] and rule["RemotePort"] == ["Any"] and rule["Protocol"] == "Any"
+
+
+def test_one_endpoint_is_one_rule_and_two_endpoints_are_two():
+    same = (rules_mod.fetch_rule_name("1.2.3.4", 8080), rules_mod.fetch_rule_name("1.2.3.4", 8080))
+    assert same[0] == same[1]
+    assert len({rules_mod.fetch_rule_name("1.2.3.4", 8080), rules_mod.fetch_rule_name("1.2.3.4", 443),
+                rules_mod.fetch_rule_name("5.6.7.8", 8080), rules_mod.fetch_rule_name("1.2.3.4")}) == 4
+
+
+def test_deny_fetch_removes_the_rule_and_a_stand_in_of_it():
+    run = FakeRun()
+    name = rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)["name"]
+    run.rules[name + "-new"] = run.view(name + "-new", Action="Allow", Program=PY)
+    rules_mod.deny_fetch(run, name)
+    assert run.rules == {}
+
+
+@pytest.mark.parametrize("name", ["TDC-FW-0123456789ab", "TDC-FW-ISO-loopback", "TDC-FW-ISO-fetch-*",
+                                  "TDC-FW-ISO-fetch-ZZZZZZZZZZZZ", "", None, 5])
+def test_deny_fetch_takes_nothing_but_a_per_fetch_rule(name):
+    run = FakeRun()
+    with pytest.raises(rules_mod.RuleError):
+        rules_mod.deny_fetch(run, name)
+    assert run.writes() == []
+
+
+def test_forget_fetch_rules_clears_what_an_interrupted_run_left():
+    run, settings = make()
+    rules_mod.isolate(run, True, settings=settings)
+    stale = rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)["name"]
+    run.rules[FETCHER] = run.view(FETCHER, Action="Allow", Program=PY)      # the standing rule of an older version
+    kept = rules_mod.block(run, image=IMAGE, ip="5.6.7.8", fetcher=PY)["rule_id"]
+    assert sorted(rules_mod.forget_fetch_rules(run)) == sorted([stale, FETCHER])
+    assert set(run.rules) == {LOOPBACK, kept}             # the isolation and the blocks stay
+    assert rules_mod.forget_fetch_rules(run) == []
+
+
+def test_leaving_isolated_removes_a_per_fetch_rule_that_was_still_open():
+    run, settings = make(outbound="Allow")
+    rules_mod.isolate(run, True, settings=settings)
+    rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)
+    rules_mod.isolate(run, False, settings=settings)
+    assert run.rules == {}
 
 
 # ---- the state at start ---------------------------------------------------------------------
@@ -815,18 +883,18 @@ def test_a_shut_egress_without_a_marker_is_not_isolated_but_is_announced_and_lef
 
 def test_leaving_without_a_marker_leaves_a_shut_egress_shut_and_says_why():
     run, settings = FakeRun(outbound="Block"), FakeSettings()
-    out = rules_mod.isolate(run, False, fetcher=PY, settings=settings)
+    out = rules_mod.isolate(run, False, settings=settings)
     assert out["changed"] is False and "not isolating" in out["note"] and "tdc-unisolate" in out["note"]
     assert run.writes() == [] and set(run.outbound.values()) == {"Block"}
 
 
 def test_isolating_from_a_baseline_that_is_already_block_and_leaving_it_back_to_block():
     run, settings = make(outbound="Block")
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, True, settings=settings)
     assert settings.isolated is True and settings.outbound_before == "Block"
-    assert FETCHER in run.rules and LOOPBACK in run.rules
+    assert set(run.rules) == {LOOPBACK}
     assert rules_mod.startup_state(run, settings)["isolated"] is True
-    out = rules_mod.isolate(run, False, fetcher=PY, settings=settings)
+    out = rules_mod.isolate(run, False, settings=settings)
     assert out["isolated"] is False and set(run.outbound.values()) == {"Block"} and run.rules == {}
     assert "baseline" in out["note"] and "not a TDC lockout" in out["note"] and "Domain, Private, Public" in out["note"]
     assert settings.isolated is False and settings.outbound_before is None
@@ -834,20 +902,20 @@ def test_isolating_from_a_baseline_that_is_already_block_and_leaving_it_back_to_
 
 def test_leaving_to_a_baseline_that_is_open_has_nothing_to_explain():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
-    assert rules_mod.isolate(run, False, fetcher=PY, settings=settings)["note"] is None
+    rules_mod.isolate(run, True, settings=settings)
+    assert rules_mod.isolate(run, False, settings=settings)["note"] is None
 
 
 def test_a_mixed_baseline_names_the_profiles_that_stay_shut():
     run, settings = make(outbound={"Domain": "Block", "Private": "Allow", "Public": "Allow"})
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
-    out = rules_mod.isolate(run, False, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, True, settings=settings)
+    out = rules_mod.isolate(run, False, settings=settings)
     assert "Block on Domain:" in out["note"]
 
 
 def test_a_marker_without_a_baseline_says_it_assumed_allow():
     run, settings = FakeRun(outbound="Block"), FakeSettings(isolated=True, outbound_before=None)
-    assert "assumed" in rules_mod.isolate(run, False, fetcher=PY, settings=settings)["note"]
+    assert "assumed" in rules_mod.isolate(run, False, settings=settings)["note"]
 
 
 # ---- several rules, one key ------------------------------------------------------------------
@@ -874,44 +942,54 @@ def test_two_rules_that_share_a_key_come_back_as_two_entries_with_their_own_prot
 # ---- a replacement never leaves a gap --------------------------------------------------------
 
 
-def tamper_with_the_fetcher_rule(run):
-    run.rules[FETCHER]["RemoteAddress"] = ["9.9.9.9"]
+def tamper_with_the_loopback_rule(run):
+    run.rules[LOOPBACK]["RemoteAddress"] = ["9.9.9.9"]
 
 
-def test_replacing_the_fetchers_allow_rule_while_isolated_never_leaves_none():
+def test_replacing_the_loopback_allow_rule_while_isolated_never_leaves_none():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
-    tamper_with_the_fetcher_rule(run)
+    rules_mod.isolate(run, True, settings=settings)
+    tamper_with_the_loopback_rule(run)
     run.standing.clear()
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
-    assert run.standing and all(any(a == "Allow" and prog == PY for _, a, prog in moment) for moment in run.standing)
-    assert run.rules[FETCHER]["RemoteAddress"] == ["Any"] and FETCHER + "-new" not in run.rules
+    rules_mod.isolate(run, True, settings=settings)
+    assert run.standing and all(any(a == "Allow" for _, a, _ in moment) for moment in run.standing)
+    assert sorted(run.rules[LOOPBACK]["RemoteAddress"]) == ["127.0.0.0/8", "::1"] and LOOPBACK + "-new" not in run.rules
     assert settings.isolated is True and set(run.outbound.values()) == {"Block"}
+
+
+def test_replacing_a_per_fetch_rule_never_leaves_the_fetcher_without_one():
+    run = FakeRun()
+    name = rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)["name"]
+    run.rules[name]["RemoteAddress"] = ["9.9.9.9"]           # someone changed it under us
+    run.standing.clear()
+    assert rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)["verified"] is True
+    assert run.standing and all(any(a == "Allow" and prog == PY for _, a, prog in moment) for moment in run.standing)
+    assert run.rules[name]["RemoteAddress"] == ["1.2.3.4"] and name + "-new" not in run.rules
 
 
 def test_a_replacement_that_fails_halfway_keeps_the_stand_in_and_names_the_hatch():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
-    tamper_with_the_fetcher_rule(run)
+    rules_mod.isolate(run, True, settings=settings)
+    tamper_with_the_loopback_rule(run)
     real = run.op_Create
     seen = {"n": 0}
 
     def create(p):
         seen["n"] += 1
-        return (1, "", "denied") if seen["n"] == 4 else real(p)       # loopback exists, fetcher exists, the stand-in is written, the new one fails
+        return (1, "", "denied") if seen["n"] == 3 else real(p)   # loopback exists, the stand-in is written, the new one fails
     run.op_Create = create
     with pytest.raises(rules_mod.RuleError) as e:
-        rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+        rules_mod.isolate(run, True, settings=settings)
     assert "scripts/tdc-unisolate.ps1" in str(e.value) and "denied" in str(e.value)
-    assert FETCHER + "-new" in run.rules and run.rules[FETCHER + "-new"]["Program"] == PY
+    assert LOOPBACK + "-new" in run.rules and run.rules[LOOPBACK + "-new"]["Action"] == "Allow"
     assert settings.isolated is True and set(run.outbound.values()) == {"Block"}      # not rolled back to open
 
 
 def test_the_stand_in_goes_with_isolated_and_can_be_unblocked_by_hand():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, True, settings=settings)
     run.rules[FETCHER + "-new"] = run.view(FETCHER + "-new", Action="Allow", Program=PY)
-    rules_mod.isolate(run, False, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, False, settings=settings)
     assert run.rules == {}
     r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     run.rules[r["rule_id"] + "-new"] = run.view(r["rule_id"] + "-new")
@@ -1021,8 +1099,8 @@ def test_every_parameter_the_module_emits_is_declared_by_the_script():
     rules_mod.block(run, image=IMAGE, fetcher=PY)
     rules_mod.rules(run)
     rules_mod.enable_firewall(run)
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
-    rules_mod.isolate(run, False, fetcher=PY, settings=settings)
+    rules_mod.isolate(run, True, settings=settings)
+    rules_mod.isolate(run, False, settings=settings)
     emitted = set()
     for call in run.calls:
         if ntpath.basename(call[0]).lower() == "powershell.exe":
@@ -1058,18 +1136,18 @@ def test_a_block_whose_replacement_fails_says_the_stand_in_is_standing():
 
 def test_the_stand_in_is_named_on_the_isolate_path_too():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, fetcher=PY, settings=settings)
-    tamper_with_the_fetcher_rule(run)
+    rules_mod.isolate(run, True, settings=settings)
+    tamper_with_the_loopback_rule(run)
     real = run.op_Create
     seen = {"n": 0}
 
     def create(p):
         seen["n"] += 1
-        return (1, "", "denied") if seen["n"] == 4 else real(p)
+        return (1, "", "denied") if seen["n"] == 3 else real(p)
     run.op_Create = create
     with pytest.raises(rules_mod.RuleError) as e:
-        rules_mod.isolate(run, True, fetcher=PY, settings=settings)
-    assert "TDC-FW-ISO-fetcher-new is standing in" in str(e.value) and "scripts/tdc-unisolate.ps1" in str(e.value)
+        rules_mod.isolate(run, True, settings=settings)
+    assert "TDC-FW-ISO-loopback-new is standing in" in str(e.value) and "scripts/tdc-unisolate.ps1" in str(e.value)
 
 
 # ---- a damaged marker ----------------------------------------------------------------------
@@ -1078,11 +1156,11 @@ def test_the_stand_in_is_named_on_the_isolate_path_too():
 def test_a_marker_without_a_baseline_gets_allow_and_the_note_says_tdc_shut_it():
     run, settings = make(outbound="Block")
     settings.isolated, settings.outbound_before, settings.isolated_since = True, None, 123.0
-    out = rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+    out = rules_mod.isolate(run, True, settings=settings)
     assert settings.outbound_before == "Allow" and out["outbound_before"] == "Allow"
     assert "no recorded baseline" in out["note"] and "because TDC shut it" in out["note"]
     assert settings.isolated_since == 123.0
-    left = rules_mod.isolate(run, False, fetcher=PY, settings=settings)
+    left = rules_mod.isolate(run, False, settings=settings)
     assert set(run.outbound.values()) == {"Allow"} and left["note"] is None
 
 
@@ -1090,6 +1168,6 @@ def test_a_failure_with_a_damaged_marker_is_not_rolled_back_to_open():
     run, settings = make(outbound="Block", fail_once={"SetDefaultOutbound": (1, "denied")})
     settings.isolated, settings.outbound_before = True, None
     with pytest.raises(rules_mod.RuleError) as e:
-        rules_mod.isolate(run, True, fetcher=PY, settings=settings)
+        rules_mod.isolate(run, True, settings=settings)
     assert "scripts/tdc-unisolate.ps1" in str(e.value)
     assert settings.isolated is True and set(run.outbound.values()) == {"Block"}

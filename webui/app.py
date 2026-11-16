@@ -27,9 +27,6 @@ import threading
 import subprocess
 import sys
 import weakref
-import http.client
-import socket
-import ssl
 from pathlib import Path
 from flask import Flask, render_template, jsonify, request, send_from_directory, g
 from werkzeug.utils import secure_filename
@@ -51,6 +48,7 @@ import log_search
 import log_store
 # FIREWALL tab: offline geo, assessment, event store, enforcement.
 import firewall
+import firewall_fetch
 import firewall_rules
 import firewall_store
 import geoip
@@ -69,7 +67,7 @@ app = Flask(__name__)
 #     and then counts as same-origin - it could read every response. The Host
 #     header still says evil.example, so only IP literals, localhost and the
 #     names in TDC_ALLOWED_HOSTS are served.
-from urllib.parse import urlparse as _urlparse, urljoin as _urljoin
+from urllib.parse import urlparse as _urlparse
 import ipaddress as _ipaddress
 
 _ALLOWED_HOSTNAMES = {"localhost"} | {
@@ -10909,25 +10907,30 @@ def api_logs_sources():
 
 
 # --- FIREWALL tab: readers, decisions, guarded fetch, capture store and routes ---------------
-# firewall_store keeps the events, firewall judges them, firewall_rules acts; this block is the wiring.
-# The collector thread (tick + sweep) never waits for a fetch: a fetch runs on _fw_executor.
+# firewall_store keeps the events, firewall judges them, firewall_rules acts, firewall_fetch fetches; this
+# block is the wiring. The collector thread (tick + sweep) never waits for a fetch: a fetch runs on _fw_executor.
 CAPTURE_DIR = r"C:\tdc\samples"
 CAPTURES_FILE = os.path.join(APP_DIR, "captures.json")
 PENDING_FILE = os.path.join(APP_DIR, "pending.json")
 FIREWALL_STATE_FILE = os.path.join(APP_DIR, "firewall_state.json")
 MAX_CAPTURES = 500
-FETCH_MAX_BYTES = 64 * 1024 * 1024
+FETCH_MAX_BYTES = 64 * 1024 * 1024     # the three limits of the spec; firewall_fetch holds the fetch to them
 FETCH_TIMEOUT = 30
 FETCH_MAX_REDIRECTS = 3
-FETCH_CHUNK = 64 * 1024
-FETCH_DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36")
+FETCH_DEFAULT_UA = firewall_fetch.DEFAULT_USER_AGENT
 FIREWALL_DECIDE_SECONDS = 30
 FIREWALL_FINDING_WINDOW_S = 1800       # the connections a sweep looks at for a download (the first sweep: all)
 FIREWALL_FINDING_FRESH_S = 3600        # an older finding is marked but no longer asked about
 FIREWALL_WINDOW_GRACE_S = 60           # a detonation window stays open this long after its process ended
 FIREWALL_RULES_TTL_S = 5
 FIREWALL_MARK_LIMIT = 5000
+# What ISOLATED does not close, for the banner of the tab: TDC's fetcher is the venv's python.exe, so a rule
+# naming that program lets out whatever can run it. The rule is therefore written per fetch, for one address,
+# and taken away when the fetch ends (firewall_rules.allow_fetch); what is left is that window.
+FIREWALL_ISOLATED_RESIDUAL = (
+    "ISOLATED blocks every way out but loopback. TDC's own fetch is let out one address at a time, only while "
+    "it runs: the fetcher is a Python interpreter, so a sample able to run it could reach that one address "
+    "during those seconds. Part B's proxy closes this.")
 
 _fw_store = firewall_store.FirewallStore()
 _fw_settings = firewall_store.Settings(FIREWALL_STATE_FILE)
@@ -11297,15 +11300,21 @@ def _record_capture(meta):
 
 
 def _ensure_capture_dir(run=None):
-    """Create ``CAPTURE_DIR`` and exclude it from Defender (idempotent; only logs when it fails).
+    """Create ``CAPTURE_DIR``, empty its staging folder and exclude it from Defender (idempotent; only logs).
 
     Without the exclusion Defender eats the stage-2 file before anyone looks at it. install-webui.ps1 does the
-    same at provisioning; doing it here as well is what makes the feature work on a VM that only got a deploy."""
+    same at provisioning; doing it here as well is what makes the feature work on a VM that only got a deploy.
+    ``.incoming`` is emptied because a fetch that was killed leaves a partial body in a folder that Defender
+    ignores and ``/api/file/download`` can read."""
     try:
         os.makedirs(CAPTURE_DIR, exist_ok=True)
     except OSError as e:
         _log_logger.warning("cannot create %s: %s", CAPTURE_DIR, e)
         return False
+    left = firewall_fetch.clear_staging(CAPTURE_DIR)
+    if left:
+        _log_logger.info("firewall: removed %d unfinished download(s) from %s", left,
+                         os.path.join(CAPTURE_DIR, firewall_fetch.STAGING))
     if os.name != "nt" and run is None:
         return True
     quoted = CAPTURE_DIR.replace("'", "''")      # our own constant, not malware text
@@ -11322,34 +11331,46 @@ def _ensure_capture_dir(run=None):
     return True
 
 
-# ---- the guarded fetch ----------------------------------------------------------------------
+# ---- what TDC did by itself, in LOGS --------------------------------------------------------
 
-_MAGICS = ((b"MZ", "MZ"), (b"\x7fELF", "ELF"), (b"PK\x03\x04", "PK"), (b"#!", "#!"), (b"%PDF", "PDF"),
-           (b"\xd0\xcf\x11\xe0", "OLE"), (b"7z\xbc\xaf", "7z"), (b"Rar!", "RAR"), (b"\x1f\x8b", "GZ"),
-           (b"\xca\xfe\xba\xbe", "CAFEBABE"), (b"MSCF", "CAB"))
+
+def _fw_log_action(method, by, status, finding=None, **fields):
+    """Write one ``access`` event for something the FIREWALL tab did by itself, so LOGS can find it.
+
+    A route becomes an ``access`` event through ``_log_request``; the block the detector places, the decision a
+    deadline takes and the fetch that follows pass through no route at all, and the spec names all three among
+    the actions that have to be traceable ("nothing happens silently"). The unattended contact with a C2 is the
+    one action an analyst most needs to find again, so it is an event with the endpoint, the URL, the
+    User-Agent that was sent and the outcome. ``by`` is ``detector``, ``analyst`` or ``deadline``.
+    """
+    finding = finding if isinstance(finding, dict) else {}
+    path = "/internal/firewall/" + method.lower()
+    event = {"method": method, "path": path, "query": "", "status": int(status), "duration_ms": 0.0,
+             "remote_addr": "", "user_agent": "", "client": "tdc", "poll": False, "by": by,
+             "image": str(finding.get("image") or "")[:_LOG_TEXT_LIMIT],
+             "dst_ip": finding.get("dst_ip"), "dst_port": finding.get("dst_port"),
+             "url": str(finding.get("url") or "")[:_LOG_TEXT_LIMIT], "finding_id": finding.get("id")}
+    event.update({k: (v[:_LOG_TEXT_LIMIT] if isinstance(v, str) else v) for k, v in fields.items()})
+    detail = " ".join(str(v) for v in (event.get("outcome"), event["dst_ip"], event["url"]) if v)
+    try:
+        _logs.add("access", _log_now(), f"{method} {path} ({event['status']}) {by}: {detail}".strip(), event)
+    except Exception:       # an event that cannot be stored must not stop the action
+        _log_logger.debug("firewall: action not written to the log", exc_info=True)
+
+
+# ---- the guarded fetch ----------------------------------------------------------------------
+# The mechanism - one address, one deadline, one size - is ``firewall_fetch``. What is here is the policy
+# around it: which addresses this lab allows, the loader's own User-Agent, the way out of ISOLATED for the
+# seconds a fetch takes, and the record that is kept of it.
+
 _UA_PATTERNS = (
     re.compile(r"-UserAgent\s+['\"]([^'\"\r\n]{1,300})['\"]", re.I),
     re.compile(r"User-?Agent['\"]?\s*[,=:]\s*['\"]([^'\"\r\n]{1,300})['\"]", re.I),
     re.compile(r"(?:^|\s)(?:-A|--user-agent)\s+['\"]([^'\"\r\n]{1,300})['\"]", re.I),
 )
 
-
-class _FetchError(Exception):
-    pass
-
-
-def _magic_of(head):
-    for prefix, name in _MAGICS:
-        if head.startswith(prefix):
-            return name
-    return "text" if head and all(32 <= b < 127 or b in (9, 10, 13) for b in head) else "unknown"
-
-
-def _fw_clean_header_text(value, limit=300):
-    """``value`` when it is printable ASCII (so it cannot split a header), else None."""
-    if isinstance(value, str) and 0 < len(value) <= limit and all(32 <= ord(c) < 127 for c in value):
-        return value
-    return None
+_fw_fetch_paths = {}                     # per-fetch allow rule -> how many fetches still need it
+_fw_fetch_paths_lock = threading.Lock()
 
 
 def _loader_user_agent(finding):
@@ -11361,90 +11382,20 @@ def _loader_user_agent(finding):
             continue
         for pattern in _UA_PATTERNS:
             for match in pattern.finditer(text):
-                agent = _fw_clean_header_text(match.group(1))
+                agent = firewall_fetch.clean_header_text(match.group(1))
                 if agent:
                     return agent
     return None
 
 
-class _PinnedHTTPConnection(http.client.HTTPConnection):
-    """Connects to ``ip`` and nothing else: no name is resolved on the way."""
-
-
-class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    """The same over TLS, with the loader's host name as SNI. The certificate is not checked: the peer is a
-    suspected C2 and nothing it says is trusted; what comes back is only stored."""
-
-    def __init__(self, ip, port, timeout, sni):
-        context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        super().__init__(ip, port, timeout=timeout, context=context)
-        self._sni = sni
-        self._tls = context
-
-    def connect(self):
-        http.client.HTTPConnection.connect(self)
-        self.sock = self._tls.wrap_socket(self.sock, server_hostname=self._sni)
-
-
-def _pinned_connection(scheme, host, port, ip, timeout):
-    """A connection to ``ip:port`` (an address the sample was seen talking to); ``host`` is only the SNI."""
-    if scheme == "https":
-        sni = None if _is_ip_literal(host) else host
-        return _PinnedHTTPSConnection(ip, port, timeout, sni)
-    return _PinnedHTTPConnection(ip, port, timeout=timeout)
-
-
-def _is_ip_literal(host):
-    try:
-        _ipaddress.ip_address(host)
-        return True
-    except ValueError:
-        return False
-
-
-def _fw_same_ip(a, b):
-    try:
-        x, y = _ipaddress.ip_address(a), _ipaddress.ip_address(b)
-    except ValueError:
-        return False
-    x = x.ipv4_mapped if x.version == 6 and x.ipv4_mapped else x
-    y = y.ipv4_mapped if y.version == 6 and y.ipv4_mapped else y
-    return x == y
-
-
-def _fw_target(url, observed_ip, observed_port):
-    """``(scheme, host, port, target)`` of a URL, checked against the address that was observed."""
-    if not all(32 < ord(c) < 127 for c in url):
-        raise _FetchError("the URL has characters that cannot be sent as they are")
-    parts = _urlparse(url)
-    if parts.scheme not in ("http", "https") or not parts.hostname:
-        raise _FetchError("not an http(s) URL")
-    try:
-        port = parts.port or (443 if parts.scheme == "https" else 80)
-    except ValueError:
-        raise _FetchError("bad port in the URL")
-    host = parts.hostname
-    if _is_ip_literal(host) and not _fw_same_ip(host, observed_ip):
-        raise _FetchError("the URL names another address than the one observed")
-    path = parts.path or "/"
-    return parts.scheme, host, port, path + ("?" + parts.query if parts.query else "")
+def _fw_fetch_lan():
+    """``TDC_FIREWALL_FETCH_LAN=1``: TDC may fetch from private addresses (a lab whose stage 2 sits on the LAN)."""
+    return (os.environ.get("TDC_FIREWALL_FETCH_LAN") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _fw_refuse_address(ip):
-    """Why TDC will not connect to ``ip`` (the loopback services and friends), or None.
-
-    Without this a script in the guest could have TDC fetch http://127.0.0.1:8080/... and store the answer.
-    Private LAN addresses stay allowed: a lab often runs its fake C2 (INetSim) there."""
-    try:
-        addr = _ipaddress.ip_address(ip)
-    except ValueError:
-        return "not an IP address"
-    addr = addr.ipv4_mapped if addr.version == 6 and addr.ipv4_mapped else addr
-    if addr.is_loopback or addr.is_unspecified or addr.is_multicast or addr.is_link_local or addr.is_reserved:
-        return "that address is TDC's own side of the VM (loopback, link-local, multicast or reserved)"
-    return None
+    """Why TDC will not connect to ``ip``, or None (``firewall_fetch.refuse_address`` with this lab's setting)."""
+    return firewall_fetch.refuse_address(ip, allow_lan=_fw_fetch_lan())
 
 
 def _submission_for(finding):
@@ -11466,136 +11417,103 @@ def _submission_for(finding):
     return None
 
 
-def _fw_stream_to_file(resp, deadline, conn):
-    """Read the body into a temp file inside CAPTURE_DIR; ``(path, sha256, size, head)``. Never beyond FETCH_MAX_BYTES."""
-    length = resp.getheader("Content-Length")
-    if length and length.strip().isdigit() and int(length) > FETCH_MAX_BYTES:
-        raise _FetchError("too large")
-    staging = os.path.join(CAPTURE_DIR, ".incoming")
-    os.makedirs(staging, exist_ok=True)
-    digest, size, head = hashlib.sha256(), 0, b""
-    tmp = tempfile.NamedTemporaryFile(dir=staging, delete=False)
-    try:
-        with tmp:
-            while True:
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    raise _FetchError("timed out")
-                sock = getattr(conn, "sock", None)
-                if sock is not None:
-                    sock.settimeout(left)
-                chunk = resp.read(FETCH_CHUNK)
-                if not chunk:
-                    break
-                size += len(chunk)
-                if size > FETCH_MAX_BYTES:
-                    raise _FetchError("too large")
-                if len(head) < 8:
-                    head = (head + chunk)[:8]
-                digest.update(chunk)
-                tmp.write(chunk)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-    except BaseException:
-        try:
-            os.remove(tmp.name)
-        except OSError:
-            pass
-        raise
-    return tmp.name, digest.hexdigest(), size, head
+def _fw_open_fetch_path(ip, port):
+    """While ISOLATED, let the fetcher out to this one endpoint for as long as this fetch lasts.
 
-
-def _fetch_capture_inner(finding):
-    ip = finding.get("dst_ip")
-    refusal = _fw_refuse_address(ip) if isinstance(ip, str) else "no address"
-    if refusal:
-        raise _FetchError("refused: " + refusal)
-    url = finding.get("url")
-    if not isinstance(url, str) or not url or len(url) > 8192:
-        raise _FetchError("no usable URL")
-    scheme, host, port, target = _fw_target(url, ip, finding.get("dst_port"))
-    if finding.get("dst_port") is not None and port != finding.get("dst_port"):
-        raise _FetchError("the URL names another port than the one observed")
-    agent = _loader_user_agent(finding)
-    sent_agent = agent or FETCH_DEFAULT_UA
-    deadline = time.monotonic() + FETCH_TIMEOUT
-    origin_host, redirects, status, content_type = host, 0, None, ""
-    while True:
-        left = deadline - time.monotonic()
-        if left <= 0:
-            raise _FetchError("timed out")
-        host_header = host if (port in (80, 443)) else f"{host}:{port}"
-        conn = _pinned_connection(scheme, host, port, ip, left)
-        try:
-            conn.request("GET", target, headers={"Host": host_header, "User-Agent": sent_agent, "Accept": "*/*",
-                                                 "Accept-Encoding": "identity", "Connection": "close"})
-            resp = conn.getresponse()
-            status = resp.status
-            if status in (301, 302, 303, 307, 308):
-                location = resp.getheader("Location")
-                if not location:
-                    raise _FetchError(f"HTTP {status} without a Location")
-                if redirects >= FETCH_MAX_REDIRECTS:
-                    raise _FetchError("too many redirects")
-                redirects += 1
-                url = _urljoin(url, location)
-                scheme, host, port, target = _fw_target(url, ip, None)
-                if host.lower() != origin_host.lower() and not _fw_same_ip(host, ip):
-                    raise _FetchError("a redirect leaves the observed address")
-                continue
-            if status != 200:
-                raise _FetchError(f"HTTP {status}")
-            content_type = _fw_clean_header_text(resp.getheader("Content-Type") or "", 200) or ""
-            tmp_path, sha256, size, head = _fw_stream_to_file(resp, deadline, conn)
-            break
-        except OSError as e:
-            raise _FetchError("timed out" if isinstance(e, (TimeoutError, socket.timeout))
-                              else f"network or disk error: {type(e).__name__}")
-        except http.client.HTTPException as e:
-            raise _FetchError(f"protocol error: {type(e).__name__}")
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-    try:
-        if size == 0:
-            raise _FetchError("empty response")
-        final_dir = os.path.join(CAPTURE_DIR, sha256[:2])
-        os.makedirs(final_dir, exist_ok=True)
-        final = os.path.join(final_dir, sha256)
-        os.replace(tmp_path, final)
-    except BaseException:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
-        raise
-    meta = {"sha256": sha256, "size": size, "url": finding.get("url"), "dst_ip": ip,
-            "dst_port": finding.get("dst_port"), "geo": firewall.geo_info(ip), "pid": finding.get("pid"),
-            "image": finding.get("image"), "fetched_at": _fw_iso(time.time()), "origin": "fetch",
-            "content_type": content_type, "magic": _magic_of(head), "submission_id": _submission_for(finding),
-            "executed": False, "path": final, "status": status, "redirects": redirects,
-            "user_agent": sent_agent, "user_agent_source": "loader" if agent else "default",
-            "finding_id": finding.get("id"), "source": finding.get("source")}
-    return _record_capture(meta)
-
-
-def _fetch_capture(pending):
-    """Fetch the file of a download finding, check and store it; the result is never executed or reported.
-
-    ``pending`` is the finding. The connection goes to the address that was observed (``dst_ip``), with the URL's
-    host name only as ``Host`` and SNI: nothing is resolved. At most ``FETCH_MAX_BYTES``, ``FETCH_TIMEOUT``
-    seconds in all, and ``FETCH_MAX_REDIRECTS`` redirects that stay on that address. Returns the capture record,
-    or ``{"error": ...}`` (no ``sha256``) when nothing was stored.
+    ``(rule name | None, problem | None)``. ISOLATED shuts every way out but loopback, so without a rule the
+    fetch cannot happen; a standing allow rule for the fetcher would be much wider, because the fetcher is a
+    Python interpreter (``firewall_rules.allow_fetch`` spells out the residual). The counter keeps two fetches
+    to one endpoint from taking away each other's way out. A rule that cannot be written is not fatal: the
+    fetch is tried and the problem is recorded with the result.
     """
+    if not _fw_settings.isolated:
+        return None, None
     try:
-        return _fetch_capture_inner(pending if isinstance(pending, dict) else {})
-    except _FetchError as e:
-        return {"error": str(e)}
+        name = firewall_rules.fetch_rule_name(ip, port)
+    except Exception as e:
+        return None, (str(e).splitlines() or [type(e).__name__])[0][:300]
+    with _fw_fetch_paths_lock:
+        held = _fw_fetch_paths.get(name, 0)
+        _fw_fetch_paths[name] = held + 1
+    if held:
+        return name, None
+    try:
+        done = firewall_rules.allow_fetch(_fw_runner, fetcher=_fw_fetcher_path(), ip=ip, port=port)
+        return name, done["problem"]
+    except Exception as e:
+        return name, (str(e).splitlines() or [type(e).__name__])[0][:300]
+    finally:
+        _fw_forget_rules()
+
+
+def _fw_close_fetch_path(name):
+    """Take the per-fetch allow rule away again, whether the fetch worked or not; the last fetch closes it."""
+    if not name:
+        return
+    with _fw_fetch_paths_lock:
+        left = _fw_fetch_paths.get(name, 1) - 1
+        if left > 0:
+            _fw_fetch_paths[name] = left
+            return
+        _fw_fetch_paths.pop(name, None)
+    try:
+        firewall_rules.deny_fetch(_fw_runner, name)
+    except Exception as e:
+        _log_logger.warning("firewall: the per-fetch allow rule %s could not be removed: %s", name, e)
+    finally:
+        _fw_forget_rules()
+
+
+def _fw_fetch_failed(finding, message, by, agent, problem):
+    """Record a fetch that stored nothing in LOGS and answer with its reason."""
+    _fw_log_action("FETCH", by, 500, finding, outcome="failed", error=message[:300],
+                   user_agent=agent or firewall_fetch.DEFAULT_USER_AGENT, allow_problem=problem)
+    return {"error": message}
+
+
+def _fetch_capture(pending, by="tdc"):
+    """Fetch the file of a download finding, check it and store it; it is never executed and never reported.
+
+    ``pending`` is the finding (``url``, ``dst_ip``, ``dst_port``, ``image``, ``pid``). The limits and the
+    pinning to the observed address are ``firewall_fetch``; what this adds is the lab's address policy, the
+    loader's User-Agent, the way out of ISOLATED for the time of the fetch, the geo and submission of the
+    capture, the record in ``captures.json`` and the entry in LOGS. Returns the capture record, or
+    ``{"error": ...}`` (with no ``sha256``) when nothing was stored.
+    """
+    finding = pending if isinstance(pending, dict) else {}
+    ip, port = finding.get("dst_ip"), finding.get("dst_port")
+    agent = firewall_fetch.clean_header_text(_loader_user_agent(finding))
+    rule, problem = None, None
+    try:
+        # checked here as well as inside fetch(): what TDC will not fetch must not even get a firewall rule
+        refusal = _fw_refuse_address(ip) if isinstance(ip, str) else "no address"
+        if refusal:
+            raise firewall_fetch.FetchError("refused: " + refusal)
+        firewall_fetch.target_of(finding.get("url"), ip, port)
+        rule, problem = _fw_open_fetch_path(ip, port)
+        out = firewall_fetch.fetch(finding.get("url"), ip, port, capture_dir=CAPTURE_DIR, user_agent=agent,
+                                   timeout=FETCH_TIMEOUT, max_bytes=FETCH_MAX_BYTES,
+                                   max_redirects=FETCH_MAX_REDIRECTS, refuse=_fw_refuse_address)
+    except firewall_fetch.FetchError as e:
+        return _fw_fetch_failed(finding, str(e), by, agent, problem)
     except Exception as e:
         _log_logger.warning("fetch failed: %s: %s", type(e).__name__, e)
-        return {"error": f"fetch failed: {type(e).__name__}"}
+        return _fw_fetch_failed(finding, f"fetch failed: {type(e).__name__}", by, agent, problem)
+    finally:
+        _fw_close_fetch_path(rule)
+    meta = {"sha256": out["sha256"], "size": out["size"], "url": finding.get("url"), "dst_ip": ip,
+            "dst_port": port, "geo": firewall.geo_info(ip), "pid": finding.get("pid"),
+            "image": finding.get("image"), "fetched_at": _fw_iso(time.time()), "origin": "fetch",
+            "content_type": out["content_type"], "magic": out["magic"],
+            "submission_id": _submission_for(finding), "executed": False, "path": out["path"],
+            "status": out["status"], "redirects": out["redirects"], "user_agent": out["user_agent"],
+            "user_agent_source": "loader" if agent else "default", "finding_id": finding.get("id"),
+            "source": finding.get("source"), "allow_rule": rule, "allow_problem": problem}
+    entry = _record_capture(meta)
+    _fw_log_action("FETCH", by, 200, finding, outcome="stored", capture_id=entry["id"], sha256=entry["sha256"],
+                   size=entry["size"], magic=entry["magic"], user_agent=entry["user_agent"],
+                   http_status=out["status"], redirects=out["redirects"], allow_problem=problem)
+    return entry
 
 
 # ---- decisions ------------------------------------------------------------------------------
@@ -11663,7 +11581,8 @@ def _fw_decide(item_id, action, by):
     """Take the decision ``action`` for an open item. ``(item, won)``; ``KeyError`` for an unknown id.
 
     The decision and its effect on the firewall are one step under a lock. Only the call that wins (``won``)
-    acts, and a fetch is started outside the lock on the executor."""
+    acts, and a fetch is started outside the lock on the executor. What was decided and what it did to the
+    firewall goes to LOGS, because a deadline's decision passes through no route."""
     with _fw_decision_lock:
         before = _fw_pending.get(item_id)
         if before is None:
@@ -11677,26 +11596,31 @@ def _fw_decide(item_id, action, by):
         else:
             effect["block"] = _fw_ensure_block(item["finding"])
         item = _fw_pending.set_result(item_id, effect) or item
+    done = effect.get("block") or effect
+    _fw_log_action("DECIDE", by, 500 if done.get("error") else 200, item["finding"], action=action,
+                   outcome=action, decision=item_id, rule_id=done.get("rule_id"),
+                   verified=done.get("verified"), unblocked=effect.get("unblocked"),
+                   problem=done.get("problem") or done.get("error") or effect.get("reason"))
     if action == "block_fetch":
-        _fw_start_fetch(item_id)
+        _fw_start_fetch(item_id, by)
     return _fw_pending.get(item_id) or item, True
 
 
-def _fw_start_fetch(item_id):
+def _fw_start_fetch(item_id, by="tdc"):
     global _fw_executor
     if _fw_executor is None:
         from concurrent.futures import ThreadPoolExecutor
         _fw_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="firewall-fetch")
-    _fw_executor.submit(_fw_fetch_item, item_id)
+    _fw_executor.submit(_fw_fetch_item, item_id, by)
 
 
-def _fw_fetch_item(item_id):
+def _fw_fetch_item(item_id, by="tdc"):
     """Fetch for a decided item and add the outcome to it. A pruned item is no error: the capture is kept."""
     try:
         item = _fw_pending.get(item_id)
         if item is None:
             return
-        out = _fetch_capture(item["finding"])
+        out = _fetch_capture(item["finding"], by)
         summary = ({"error": out["error"]} if out.get("error") else
                    {"capture_id": out["id"], "sha256": out["sha256"], "size": out["size"], "magic": out["magic"]})
         if _fw_pending.set_result(item_id, {"fetch": summary}) is None:
@@ -11715,6 +11639,11 @@ def _fw_open_decision(finding, now):
         block = _fw_ensure_block(finding)
         item = _fw_pending.add(finding, now + _firewall_decide_seconds())
         _fw_pending.set_result(item["id"], {"block": block})
+    _fw_log_action("BLOCK", "detector", 500 if block.get("error") else 200, finding,
+                   outcome="blocked" if block.get("verified") else "not verified", decision=item["id"],
+                   rule_id=block.get("rule_id"), verified=block.get("verified"),
+                   problem=block.get("problem") or block.get("error"),
+                   deadline=_fw_iso(item["deadline"]))
 
 
 def _fw_descends_from_webui(pid):
@@ -11750,9 +11679,14 @@ def _fw_scan_downloads(now):
     mode = _fw_settings.ask_mode
     for finding in findings:
         _fw_downloads[(finding["pid"], finding["dst_ip"], finding["dst_port"])] = now
-        if mode == "off" or finding["self"]:
+        if mode == "off":
             continue
         if mode == "detonation" and not finding["in_detonation"]:
+            continue
+        # The self list is a list of paths, and a sample chooses its own: C:\Program Files\Git\ ships curl.exe,
+        # and any file named git.exe counts. Inside a detonation the ancestry from a submission says whose
+        # process it really is, so only a finding outside one is left to TDC's own programs.
+        if finding["self"] and not finding["in_detonation"]:
             continue
         if firewall.is_update_host(_fw_url_host(finding["url"])):
             continue
@@ -11791,7 +11725,38 @@ def _firewall_sweep(now=None):
             _log_logger.exception("firewall: default action for %s failed", item.get("id"))
 
 
+def _fw_prepare():
+    """The first step of the collector thread: everything at start-up that has to wait for Windows.
+
+    It runs there and not at import, so that a PowerShell which hangs cannot hold up the web UI: Flask already
+    serves while this works, and ``/api/firewall/isolate`` answers ``startup: null`` until it is done. The
+    per-fetch allow rules of a run that was interrupted are removed here, because they are a way out of
+    ISOLATED that nothing would otherwise close."""
+    global _fw_startup
+    _ensure_capture_dir()
+    try:
+        firewall_fetch.own_addresses(refresh=True)      # a fetch must not pay for this lookup itself
+    except Exception as exc:
+        _log_logger.warning("firewall: this VM's own addresses could not be read: %s", exc)
+    try:
+        _fw_startup = firewall_rules.startup_state(_fw_runner, _fw_settings)
+    except Exception as exc:
+        _log_logger.warning("firewall start-up state unreadable: %s", exc)
+    try:
+        left = firewall_rules.forget_fetch_rules(_fw_runner)
+        if left:
+            _log_logger.warning("firewall: removed %d per-fetch allow rule(s) left by an earlier run: %s",
+                                len(left), ", ".join(left))
+    except Exception as exc:
+        _log_logger.warning("firewall: the per-fetch allow rules could not be checked: %s", exc)
+    _fw_forget_rules()
+
+
 def _firewall_loop(collector, rounds=None, sleep=time.sleep):
+    try:
+        _fw_prepare()
+    except Exception:
+        _log_logger.exception("firewall start-up step failed")
     done = 0
     while rounds is None or done < rounds:
         done += 1
@@ -11807,18 +11772,12 @@ def _firewall_loop(collector, rounds=None, sleep=time.sleep):
 
 
 def _start_firewall():
-    """Start-up of the FIREWALL tab: load the geo data once, prepare the capture directory and its Defender
-    exclusion, read what a previous run left in the firewall, and start the collector thread."""
-    global _fw_startup
+    """Start-up of the FIREWALL tab: load the geo data once and start the collector thread, which does the rest
+    (the capture directory, its Defender exclusion, the state a previous run left) as its first step."""
     try:
         geoip.load()               # without data the tab runs on: geo is only scope and nulls
     except Exception:
         _log_logger.exception("geoip.load failed")
-    threading.Thread(target=_ensure_capture_dir, name="firewall-capture-dir", daemon=True).start()
-    try:
-        _fw_startup = firewall_rules.startup_state(_fw_runner, _fw_settings)
-    except Exception as exc:
-        _log_logger.warning("firewall start-up state unreadable: %s", exc)
     collector = firewall_store.FirewallCollector(_fw_store, _fw_settings, _firewall_readers(),
                                                  lambda: bool(_firewall_open_windows()))
     thread = threading.Thread(target=_firewall_loop, args=(collector,), name="firewall-collector", daemon=True)
@@ -12011,7 +11970,7 @@ def _fw_isolate_state():
     out = {"isolated": bool(_fw_settings.isolated), "outbound_before": _fw_settings.outbound_before,
            "isolated_since": _fw_iso(_fw_settings.isolated_since), "ask_mode": _fw_settings.ask_mode,
            "settings_error": _fw_settings.load_error, "startup": _fw_startup,
-           "profiles_off": None, "profiles_error": None}
+           "profiles_off": None, "profiles_error": None, "residual": FIREWALL_ISOLATED_RESIDUAL}
     try:
         out["profiles_off"] = firewall_rules.profiles_off(_fw_runner)
     except Exception as e:
@@ -12021,7 +11980,8 @@ def _fw_isolate_state():
 
 @app.route("/api/firewall/isolate", methods=["GET", "POST"])
 def api_firewall_isolate():
-    """GET: the state (isolated, the remembered outbound action, which firewall profiles are off, the start-up note).
+    """GET: the state (isolated, the remembered outbound action, which firewall profiles are off, the start-up
+    note, and ``residual``: what ISOLATED does not close, for the banner).
     POST ``{on: bool}``: switch ISOLATED; 409 when the Windows Firewall is off (it would accept the change and do nothing)."""
     if request.method == "GET":
         return _fw_json(_fw_isolate_state())
@@ -12033,7 +11993,7 @@ def api_firewall_isolate():
         if off:
             return _fw_error(off, 409)
     try:
-        done = firewall_rules.isolate(_fw_runner, data["on"], fetcher=_fw_fetcher_path(), settings=_fw_settings)
+        done = firewall_rules.isolate(_fw_runner, data["on"], settings=_fw_settings)
     except firewall_rules.RuleError as e:
         return _fw_error(str(e), 500)
     finally:

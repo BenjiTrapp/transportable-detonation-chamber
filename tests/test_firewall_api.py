@@ -175,6 +175,49 @@ def test_every_action_is_written_to_the_access_log(client, fw):
     assert hits["count"] >= 1
 
 
+def test_what_tdc_does_on_its_own_is_in_the_logs_too(client, fw, tdc, monkeypatch):
+    """The block of the detector, the decision at the deadline and the fetch pass through no route."""
+    monkeypatch.setenv("TDC_FIREWALL_DECIDE_SECONDS", "0")
+    seed(fw)
+    open_window(monkeypatch, tdc)
+    sweep(tdc)
+    assert len(fw.fetches) == 1
+
+    def one(path):
+        hits = client.get(f'/api/logs/search?q=path="{path}"').json
+        assert hits["count"] == 1, path
+        return hits["events"][0]["fields"]
+
+    block = one("/internal/firewall/block")
+    assert block["by"] == "detector" and block["status"] == 200 and block["verified"] is True
+    assert block["image"] == IMAGE and block["dst_ip"] == "203.0.113.50" and block["url"] == URL
+    assert block["rule_id"].startswith("TDC-FW-") and block["client"] == "tdc" and block["poll"] is False
+
+    decide = one("/internal/firewall/decide")
+    assert decide["by"] == "deadline" and decide["action"] == "block_fetch" and decide["status"] == 200
+
+    fetch = one("/internal/firewall/fetch")
+    assert fetch["by"] == "deadline" and fetch["outcome"] == "stored" and fetch["url"] == URL
+    assert fetch["sha256"] and fetch["size"] and fetch["user_agent"] == tdc.FETCH_DEFAULT_UA
+    assert fetch["dst_ip"] == "203.0.113.50" and fetch["dst_port"] == 8080
+    assert client.get('/api/logs/search?q=by=deadline').json["count"] == 2
+
+
+def test_a_fetch_that_stores_nothing_says_so_in_the_logs(client, fw, tdc):
+    fw.body = b""
+    assert tdc._fetch_capture(FINDING, "analyst")["error"] == "empty response"
+    (event,) = client.get('/api/logs/search?q=path="/internal/firewall/fetch"').json["events"]
+    assert event["fields"]["status"] == 500 and event["fields"]["error"] == "empty response"
+    assert event["fields"]["by"] == "analyst" and event["fields"]["outcome"] == "failed"
+
+
+def test_an_analysts_decision_names_the_analyst_in_the_logs(client, fw):
+    pid = fw.pending.add(FINDING, deadline=time.time() + 30)["id"]
+    client.post("/api/firewall/decide", json={"id": pid, "action": "allow"})
+    (event,) = client.get('/api/logs/search?q=path="/internal/firewall/decide"').json["events"]
+    assert event["fields"]["by"] == "analyst" and event["fields"]["action"] == "allow"
+
+
 @pytest.mark.parametrize("path, poll", [("/api/firewall/pending", True), ("/api/firewall/connections", True),
                                         ("/api/firewall/rules", False), ("/api/firewall/captures", False)])
 def test_only_the_polls_are_marked_as_polls(client, fw, tdc, path, poll):
@@ -240,6 +283,27 @@ def test_start_up_loads_the_geo_data_once(tdc, monkeypatch):
     monkeypatch.setattr(tdc, "_firewall_loop", lambda collector: None)
     tdc._start_firewall().join(2)
     assert loaded == [()]
+
+
+def test_the_geo_of_one_address_comes_from_the_table_and_sits_in_the_same_place_every_time(geo_loaded):
+    out = firewall.geo_info("8.8.8.8")
+    assert out["scope"] == "public" and out["cc"] == "US" and out["country"] == "United States"
+    assert out["asn"] == 15169 and "GOOGLE" in out["as_org"]
+    assert -90 <= out["lat"] <= 90 and -180 <= out["lon"] <= 180
+    assert firewall.geo_info("8.8.8.8") == out                 # jittered, but always to the same point
+    assert firewall.geo_info("8.8.8.9") != out                 # and not to the neighbour's point
+    nl = firewall.geo_info("193.0.0.1")                        # a country the centroid table does not know
+    assert nl["asn"] == 3333 and nl["cc"] == "NL" and nl["lat"] is None
+    assert firewall.geo_info("10.0.0.9") == {"scope": "local", "cc": None, "country": None, "lat": None,
+                                             "lon": None, "asn": None, "as_org": None}
+
+
+def test_the_geo_of_one_address_can_be_asked_of_a_lookup_of_its_own():
+    answer = geoip.GeoInfo("DE", "Germany", 51.0, 9.0, 3320, "DTAG", "public")
+    out = firewall.geo_info("203.0.113.9", lambda ip: answer)
+    assert out["cc"] == "DE" and out["asn"] == 3320 and out["as_org"] == "DTAG"
+    assert out["lat"] != 51.0 and abs(out["lat"] - 51.0) < 3   # moved off the centroid, deterministically
+    assert firewall.geo_info("203.0.113.9", lambda ip: None)["scope"] == "public"
 
 
 # ---- the decide route ------------------------------------------------------------------------
@@ -347,11 +411,34 @@ def test_isolate_state_and_switch(client, fw):
     assert client.post("/api/firewall/isolate", json={"on": "yes"}).status_code == 400
 
 
-def test_the_fetcher_is_the_program_isolated_allows(client, fw, tdc):
+def test_the_fetch_is_let_out_of_isolated_for_one_address_and_no_longer(client, fw, tdc, monkeypatch):
     client.post("/api/firewall/isolate", json={"on": True})
-    assert any("-Program " + tdc._fw_fetcher_path() in " ".join(c) and "-Action Allow" in " ".join(c)
-               for c in fw.run.calls)
-    # and the fetcher cannot be blocked
+    firewall_rules = tdc.firewall_rules
+    assert not any(n.startswith(firewall_rules.FETCH_PREFIX) or n == firewall_rules.FETCHER_RULE
+                   for n in fw.run.rules)                      # no standing way out for the interpreter
+    name = firewall_rules.fetch_rule_name("203.0.113.50", 8080)
+    windows, standing = fw.run, []
+
+    def watch(args):
+        out = windows(args)
+        standing.append(set(windows.rules))
+        return out
+    monkeypatch.setattr(tdc, "_fw_runner", watch)
+    out = tdc._fetch_capture(FINDING)
+    assert out["sha256"] and out["allow_rule"] == name and out["allow_problem"] is None
+    assert any(name in seen for seen in standing)               # it stood while the fetch ran
+    assert name not in windows.rules                            # and is gone afterwards
+    rule = next(c for c in windows.calls if name in c and "Create" in c)
+    assert "-Program" in rule and tdc._fw_fetcher_path() in rule and "Allow" in rule
+    assert "203.0.113.50" in rule and "8080" in rule
+
+
+def test_without_isolated_a_fetch_writes_no_rule_at_all(client, fw, tdc):
+    assert tdc._fetch_capture(FINDING)["allow_rule"] is None
+    assert fw.run.calls == []
+
+
+def test_the_fetcher_can_never_be_blocked(client, fw, tdc):
     r = client.post("/api/firewall/block", json={"scope": "process", "image": tdc._fw_fetcher_path()})
     assert r.status_code == 409
 
@@ -507,6 +594,33 @@ def test_user_content_on_github_is_not_exempt():
     assert firewall.is_update_host("a.b.download.windowsupdate.com")
 
 
+@pytest.mark.parametrize("host, update", [
+    ("windowsupdate.com", True), ("WindowsUpdate.COM", True), ("download.windowsupdate.com.", True),
+    ("sls.update.microsoft.com", True), ("windowsupdate.com.evil.example", False),
+    ("notwindowsupdate.com", False), ("evil-windowsupdate.com", False), ("203.0.113.50", False),
+    ("::1", False), ("", False), (None, False), ("microsoft.com", False),
+])
+def test_an_update_host_matches_itself_or_a_subdomain_and_an_address_never(host, update):
+    assert firewall.is_update_host(host) is update
+
+
+def test_a_detonated_loader_cannot_hide_behind_a_path_that_looks_like_tdcs(client, fw, tdc, monkeypatch):
+    curl = r"C:\Program Files\Git\mingw64\bin\curl.exe"       # Git ships it, and the sample chose that path
+    seed(fw, url="http://203.0.113.50:8080/s2.exe", image=curl)
+    open_window(monkeypatch, tdc)
+    sweep(tdc)
+    (item,) = fw.pending.open()
+    assert item["finding"]["self"] is True and item["finding"]["image"] == curl
+    assert item["result"]["block"]["verified"] is True
+
+
+def test_outside_a_detonation_tdcs_own_programs_are_still_left_alone(client, fw, tdc):
+    client.post("/api/firewall/ask", json={"mode": "all"})
+    seed(fw, url="http://203.0.113.50:8080/s2.exe", image=r"C:\Program Files\Git\mingw64\bin\curl.exe")
+    sweep(tdc)
+    assert fw.pending.open() == [] and fw.run.calls == []
+
+
 def test_what_the_web_ui_started_is_not_asked_about(client, fw, tdc, monkeypatch):
     client.post("/api/firewall/ask", json={"mode": "all"})
     fw.store.add_processes([{"timestamp": iso(-60), "event_id": 1, "pid": "4812", "image": r"C:\Windows\powershell.exe",
@@ -649,6 +763,16 @@ def test_a_redirect_to_another_address_literal_is_refused(fw, tdc):
     assert "error" in tdc._fetch_capture(FINDING) and len(fw.fetches) == 1
 
 
+@pytest.mark.parametrize("location, why", [
+    ("http://stage.example.net:8081/a.dll", "another port"),
+    ("https://stage.example.net:8080/a.dll", "scheme"),
+])
+def test_a_redirect_that_changes_the_port_or_the_scheme_is_refused(fw, tdc, location, why):
+    fw.script = [(302, {"Location": location}, b"")]
+    out = tdc._fetch_capture({**FINDING, "url": "http://stage.example.net:8080/a.dll"})
+    assert why in out["error"] and len(fw.fetches) == 1 and fw.lookups == []
+
+
 def test_at_most_three_redirects(fw, tdc):
     fw.script = [(302, {"Location": f"/{i}"}, b"") for i in range(5)]
     out = tdc._fetch_capture({**FINDING, "url": "http://stage.example.net:8080/a.dll"})
@@ -686,9 +810,19 @@ def test_the_vms_own_side_is_never_fetched_from(fw, tdc, ip):
     assert out["error"] and fw.fetches == []
 
 
-def test_a_lan_address_is_allowed_for_a_lab_c2(fw, tdc):
-    out = tdc._fetch_capture({**FINDING, "dst_ip": "192.168.64.1", "url": "http://192.168.64.1:8080/a.dll"})
-    assert out["sha256"]
+@pytest.mark.parametrize("ip", ["192.168.64.129", "192.168.64.1", "::ffff:192.168.64.1"])
+def test_this_vms_own_address_and_its_gateway_are_refused_even_on_the_lan(fw, tdc, monkeypatch, ip):
+    monkeypatch.setenv("TDC_FIREWALL_FETCH_LAN", "1")
+    out = tdc._fetch_capture({**FINDING, "dst_ip": ip, "url": "http://stage.example.net:8080/a.dll"})
+    assert "own address or its gateway" in out["error"] and fw.fetches == []
+
+
+def test_a_private_address_needs_the_lab_switch(fw, tdc, monkeypatch):
+    finding = {**FINDING, "dst_ip": "10.9.9.9", "url": "http://10.9.9.9:8080/a.dll"}
+    out = tdc._fetch_capture(finding)
+    assert "TDC_FIREWALL_FETCH_LAN" in out["error"] and fw.fetches == []
+    monkeypatch.setenv("TDC_FIREWALL_FETCH_LAN", "1")
+    assert tdc._fetch_capture(finding)["sha256"]
 
 
 @pytest.mark.parametrize("url", ["ftp://203.0.113.50:8080/a.dll", "http://203.0.113.50:9999/a.dll", "javascript:1",
@@ -903,7 +1037,7 @@ def test_the_readers_fit_the_collector(tdc, fw, monkeypatch):
     assert calls[0]["event_ids"] == [22] and calls[0]["since"] == "2026-11-16T10:00:00Z"
 
 
-def test_the_loop_ticks_then_sweeps_and_survives_both_failing(tdc, monkeypatch):
+def test_the_loop_prepares_once_then_ticks_and_sweeps_and_survives_all_three_failing(tdc, monkeypatch):
     order = []
 
     class Collector:
@@ -914,7 +1048,27 @@ def test_the_loop_ticks_then_sweeps_and_survives_both_failing(tdc, monkeypatch):
         def interval(self):
             return 1.0
 
+    monkeypatch.setattr(tdc, "_fw_prepare", lambda: order.append("prepare") or 1 / 0)
     monkeypatch.setattr(tdc, "_firewall_sweep", lambda now=None: order.append("sweep") or 1 / 0)
     slept = []
     tdc._firewall_loop(Collector(), rounds=2, sleep=slept.append)
-    assert order == ["tick", "sweep"] * 2 and slept == [1.0, 1.0]
+    assert order == ["prepare"] + ["tick", "sweep"] * 2 and slept == [1.0, 1.0]
+
+
+def test_the_first_step_of_the_collector_thread_does_what_start_up_needs(fw, tdc, tmp_path, monkeypatch):
+    """It runs there, not at import: a PowerShell that hangs must not hold up the web UI."""
+    monkeypatch.setattr(tdc, "CAPTURE_DIR", str(tmp_path / "samples"))
+    monkeypatch.setattr(tdc, "_fw_startup", None)
+    primed = []
+    monkeypatch.setattr(tdc.firewall_fetch, "own_addresses", lambda refresh=False: primed.append(refresh))
+    incoming = tmp_path / "samples" / tdc.firewall_fetch.STAGING
+    incoming.mkdir(parents=True)
+    (incoming / "half-a-payload").write_bytes(b"MZ")
+    fw.run.rules["TDC-FW-ISO-fetch-0123456789ab"] = fw.run.view(
+        "TDC-FW-ISO-fetch-0123456789ab", Action="Allow", Program=tdc._fw_fetcher_path())
+    tdc._fw_prepare()
+    assert tdc._fw_startup == {"isolated": False, "profiles_off": [], "announce": False, "note": None}
+    assert os.listdir(incoming) == []                            # no partial file in a Defender-excluded root
+    assert fw.run.rules == {}                                    # no way out of ISOLATED left standing
+    assert primed == [True]                                      # no fetch pays for that lookup itself
+    assert tdc._fw_isolate_state()["startup"]["announce"] is False

@@ -24,10 +24,20 @@ only when it stands, is enabled, is what was asked for and every profile it cove
 read counts as off. ``_firewall_is_off`` of app.py is not used: it is in the module that imports this one, it only
 says "off in *all* profiles", it answers False when it cannot read the registry, and it caches for a minute.
 
-ISOLATED sets ``DefaultOutboundAction Block`` on all profiles and allows exactly two things out: loopback
-(``127.0.0.0/8``, ``::1``) and the fetcher's program. Inbound is untouched. The order is: profiles checked, the
-previous ``DefaultOutboundAction`` and the marker saved in ``Settings`` *before* anything changes, the two allow
-rules written, then Block, then read back. Leaving goes backwards and is never refused for a profile that is off.
+ISOLATED sets ``DefaultOutboundAction Block`` on all profiles and allows one thing out: loopback
+(``127.0.0.0/8``, ``::1``), over which TDC's whole inner traffic runs. Inbound is untouched. The order is:
+profiles checked, the previous ``DefaultOutboundAction`` and the marker saved in ``Settings`` *before* anything
+changes, the loopback rule written, then Block, then read back. Leaving goes backwards and is never refused for
+a profile that is off.
+
+TDC's own fetch gets its way out **per fetch**, not as a standing rule: ``allow_fetch`` writes an allow rule
+for the fetcher program to the one address it is about to fetch from and ``deny_fetch`` removes it when the
+fetch ends (``forget_fetch_rules`` clears what an interrupted run left). The reason is that the fetcher is a
+Python interpreter: a standing allow rule for it would let anything in the guest that can run that python out
+to anywhere, for as long as ISOLATED is on. The residual, stated plainly: while a fetch runs, something able to
+run that python could reach that one address. Part B's proxy, which executes nothing it is sent, is the
+structural fix.
+
 The marker (``Settings.isolated``) alone says that TDC is isolating; the profiles are never used to infer it. A crash in
 between leaves the marker, and ``startup_state`` reports an isolation it finds and does **not** lift it. ``scripts/tdc-unisolate.ps1`` is the way out when the Web UI is not reachable.
 """
@@ -51,7 +61,8 @@ import firewall
 RULE_PREFIX = "TDC-FW-"
 ISOLATE_PREFIX = RULE_PREFIX + "ISO-"
 LOOPBACK_RULE = ISOLATE_PREFIX + "loopback"
-FETCHER_RULE = ISOLATE_PREFIX + "fetcher"
+FETCHER_RULE = ISOLATE_PREFIX + "fetcher"     # the standing fetcher rule of older versions: only removed now
+FETCH_PREFIX = ISOLATE_PREFIX + "fetch-"      # one allow rule per fetch, for as long as that fetch lasts
 LOOPBACK_ADDRESSES = ("127.0.0.0/8", "::1")
 
 PROFILE_NAMES = ("Domain", "Private", "Public")
@@ -73,6 +84,7 @@ EXIT_EXISTS = 4
 
 _NAME = re.compile(r"TDC-FW-[A-Za-z0-9-]{1,40}")
 _BLOCK_NAME = re.compile(r"TDC-FW-[0-9a-f]{12}(?:-new)?")
+_FETCH_NAME = re.compile(re.escape(FETCH_PREFIX) + r"[0-9a-f]{12}")
 
 _LOCK = threading.RLock()
 
@@ -421,9 +433,9 @@ def block(run, *, image: Optional[str] = None, ip: Optional[str] = None, port: O
     Two blocks would cut TDC off from itself and are refused. A block for every program (no ``image``) on an address
     that is loopback, unspecified or multicast: that is where the lockout lives, while a block that names a program
     touches only that program, so a sample's own loopback, mDNS or SSDP traffic can be cut. And a block on the program
-    ``fetcher``, because an explicit Block beats the fetcher's Allow rule of ISOLATED. This module cannot know the
+    ``fetcher``, because an explicit Block beats the per-fetch Allow rule of ISOLATED. This module cannot know the
     fetcher's path, so ``fetcher`` is a **required** keyword: the caller passes the ``python.exe`` of the web UI venv,
-    the same path it gives ``isolate``. ``fetcher=None`` is the explicit opt-out; leaving it out is a ``TypeError``.
+    the same path it gives ``allow_fetch``. ``fetcher=None`` is the explicit opt-out; leaving it out is a ``TypeError``.
     """
     spec = _block_spec(image, ip, port, protocol)
     if fetcher is not None and spec["image"] is not None and _same_path(spec["image"], _clean_path(fetcher, "fetcher")):
@@ -460,6 +472,76 @@ def verify(run, rule_id: str) -> bool:
         return view is not None and view["action"] == "block" and _standing_problem(view, _profiles(run)) is None
     except RuleError:
         return False
+
+
+# ---- the way out of ISOLATED, one fetch at a time --------------------------------------------
+
+
+def fetch_rule_name(ip: Any, port: Optional[int] = None) -> str:
+    """The name of the per-fetch allow rule for one endpoint: ``TDC-FW-ISO-fetch-<12 hex>``.
+
+    It follows from the address and the port, so two fetches to the same endpoint share one rule (the caller
+    counts them) while two to different endpoints can never replace each other's way out.
+    """
+    address = _clean_ip(ip)
+    number = _clean_port(port) if port is not None else None
+    text = "\0".join(["fetch", address, str(number or "")])
+    return FETCH_PREFIX + hashlib.blake2s(text.encode("utf-8", "replace"), digest_size=6).hexdigest()
+
+
+def allow_fetch(run, *, fetcher: str, ip: Any, port: Optional[int] = None) -> Dict[str, Any]:
+    """Allow the fetcher program out to one address, for one fetch: ``{name, rule_id, verified, problem}``.
+
+    ISOLATED shuts every way out but loopback, so TDC's own fetch needs a hole. This is that hole, as small as
+    a program-path rule can be made: one program, one address, one port when it is known, and ``deny_fetch``
+    takes it away the moment the fetch ends. See the module docstring for why there is no standing rule for the
+    fetcher any more, and for the residual that is left.
+
+    Raises ``RuleError`` when the arguments are unsound or a profile is off (nothing is enforced then anyway,
+    so the caller may go ahead with the fetch and say so); ``problem`` is why a rule that was written cannot be
+    relied on.
+    """
+    program = _clean_path(fetcher, "fetcher")
+    address = _clean_ip(ip)
+    number = _clean_port(port) if port is not None else None
+    spec = _spec(fetch_rule_name(address, number), "Allow", program, (address,), number,
+                 "tcp" if number is not None else None)      # http(s) is tcp
+    with _LOCK:
+        problem = _write(run, spec)
+    return {"name": spec["name"], "rule_id": spec["name"], "verified": problem is None, "problem": problem}
+
+
+def deny_fetch(run, name: str) -> None:
+    """Remove a per-fetch allow rule, and a stand-in of it, and check that both are gone.
+
+    Only ``TDC-FW-ISO-fetch-<12 hex>`` is accepted, so this can be pointed neither at a block rule nor at the
+    loopback rule that ISOLATED needs.
+    """
+    if not isinstance(name, str) or not _FETCH_NAME.fullmatch(name):
+        raise RuleError(f"not a TDC per-fetch rule: {str(name)[:60]!r}")
+    both = (name + SWAP_SUFFIX, name)
+    with _LOCK:
+        for each in both:
+            _ok(run, "Remove", Name=each)
+        still = [n for n in both if _describe(run, n) is not None]
+    if still:
+        raise RuleError(f"{', '.join(still)} is still there after it was removed")
+
+
+def forget_fetch_rules(run) -> List[str]:
+    """Remove every per-fetch allow rule that stands, and the standing fetcher rule older versions wrote.
+
+    A fetch that was interrupted (the service stopped, the VM reverted) would otherwise leave its way out of
+    ISOLATED open for good. Called once at start-up; returns the names it removed.
+    """
+    left = []
+    with _LOCK:
+        for rule in rules(run):
+            name = rule["rule_id"]
+            if name.startswith(FETCH_PREFIX) or name in (FETCHER_RULE, FETCHER_RULE + SWAP_SUFFIX):
+                _ok(run, "Remove", Name=name)
+                left.append(name)
+    return left
 
 
 def _identity(view: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optional[int], Optional[str], bool]:
@@ -572,7 +654,13 @@ def _apply_outbound(run, target: Dict[str, str]) -> List[Dict[str, Any]]:
 
 
 def _remove_isolate_rules(run) -> None:
+    """Remove the allow rules of ISOLATED in whatever shape they are found: the loopback rule, the per-fetch
+    rules of a fetch that was still running, their stand-ins, and the standing fetcher rule of older versions."""
     names = [n + suffix for n in (FETCHER_RULE, LOOPBACK_RULE) for suffix in ("", SWAP_SUFFIX)]
+    try:
+        names += [r["rule_id"] for r in rules(run) if r["rule_id"].startswith(FETCH_PREFIX)]
+    except RuleError:
+        pass                      # the list cannot be read; the names above are still removed
     for name in names:
         _ok(run, "Remove", Name=name)
     still = [n for n in names if _describe(run, n) is not None]
@@ -584,35 +672,37 @@ def _forget(settings) -> None:
     settings.set(isolated=False, outbound_before=None, isolated_since=None)
 
 
-def isolate(run, on: bool, *, fetcher: str, settings) -> Dict[str, Any]:
+def isolate(run, on: bool, *, settings) -> Dict[str, Any]:
     """Turn ISOLATED on or off.
 
     On: all profiles must be on (``RuleError`` otherwise, with nothing changed); the previous
     ``DefaultOutboundAction`` and the marker are saved in ``settings`` before anything else changes (when that
-    cannot be saved nothing is touched); the allow rules for loopback and for the program ``fetcher`` are written
-    and read back; ``DefaultOutboundAction Block`` is set and read back. When a step fails, a fresh isolation is rolled
+    cannot be saved nothing is touched); the allow rule for loopback is written and read back;
+    ``DefaultOutboundAction Block`` is set and read back. When a step fails, a fresh isolation is rolled
     back; if even that fails the marker stays and the message names ``scripts/tdc-unisolate.ps1``. Isolating while
     isolated keeps the first memory; a marker without a recorded baseline (damaged) gets ``Allow`` as its baseline
     and ``note`` says so, and a failure there is not rolled back either, because the isolation was already on.
     Returns ``{"isolated": True, "outbound_before", "verified": True, "note"}``.
 
+    TDC's own fetch is **not** allowed out by this: ``allow_fetch`` opens one address for the time of one fetch
+    (see the module docstring).
+
     ``settings.isolated`` is the only authority for "TDC is isolating"; nothing is inferred from the profiles. An
     isolation may start from an egress that is already Block: that is recorded as the baseline like any other.
 
     Off: the way back, in reverse, to **the recorded baseline**: ``DefaultOutboundAction`` back to what was saved (per
-    profile, when they differed), the allow rules removed, the marker and the memory forgotten last. It works whatever
-    the profiles are. When the baseline is itself Block the egress stays shut and the fetcher is no longer allowed:
+    profile, when they differed), the allow rules removed (whatever shape they are in), the marker and the memory
+    forgotten last. It works whatever the profiles are. When the baseline is itself Block the egress stays shut:
     that is the VM's own baseline and not a TDC lockout, and ``note`` says so. With the marker but no baseline it
     assumes ``Allow``, the Windows default, and says so (``assumed_allow``). Without the marker it changes nothing,
     and if the egress is nonetheless shut ``note`` says that TDC is not the one isolating and names the hatch.
     Returns ``{"isolated": False, "changed", "assumed_allow", "outbound_after", "note"}``.
     """
     with _LOCK:
-        return _isolate_on(run, fetcher, settings) if on else _isolate_off(run, settings)
+        return _isolate_on(run, settings) if on else _isolate_off(run, settings)
 
 
-def _isolate_on(run, fetcher: str, settings) -> Dict[str, Any]:
-    program = _clean_path(fetcher, "fetcher")
+def _isolate_on(run, settings) -> Dict[str, Any]:
     states = _profiles(run)
     off = _off_names(states)
     if off:
@@ -639,10 +729,9 @@ def _isolate_on(run, fetcher: str, settings) -> Dict[str, Any]:
                             "nothing was changed") from e
     changed_default = False
     try:
-        for spec in (_spec(LOOPBACK_RULE, "Allow", addresses=LOOPBACK_ADDRESSES), _spec(FETCHER_RULE, "Allow", program)):
-            problem = _write(run, spec)
-            if problem:
-                raise RuleError(f"{spec['name']}: {problem}")
+        problem = _write(run, _spec(LOOPBACK_RULE, "Allow", addresses=LOOPBACK_ADDRESSES))
+        if problem:
+            raise RuleError(f"{LOOPBACK_RULE}: {problem}")
         changed_default = True
         off = _off_names(_apply_outbound(run, {n: "Block" for n in PROFILE_NAMES}))
         if off:
@@ -686,8 +775,8 @@ def _isolate_off(run, settings) -> Dict[str, Any]:
     if assumed:
         note = "No baseline was recorded; Allow, the Windows default, was assumed."
     elif shut:
-        note = (f"The baseline recorded before ISOLATED is Block on {', '.join(shut)}: outbound stays shut there and "
-                "TDC's fetcher is no longer allowed. That is the VM's own baseline, not a TDC lockout.")
+        note = (f"The baseline recorded before ISOLATED is Block on {', '.join(shut)}: outbound stays shut there, "
+                "and TDC's own fetch is no longer let out either. That is the VM's own baseline, not a TDC lockout.")
     return {"isolated": False, "changed": True, "assumed_allow": assumed, "outbound_after": target, "note": note}
 
 
@@ -731,7 +820,8 @@ def startup_state(run, settings) -> Dict[str, Any]:
     in_force = marker and len(blocking) == len(PROFILE_NAMES) and not off
     note = None
     if in_force:
-        note = "ISOLATED is on: all outbound traffic is blocked except loopback and TDC's fetcher."
+        note = ("ISOLATED is on: all outbound traffic is blocked except loopback, and TDC's own fetch, which is "
+                "let out to one address for the seconds that fetch takes.")
     elif marker and blocking:
         note = (f"ISOLATED is marked, but outbound is blocked on {', '.join(blocking)} only"
                 + (f" and the firewall is off for {', '.join(off)}" if off else "") + ": this is not a working isolation.")
