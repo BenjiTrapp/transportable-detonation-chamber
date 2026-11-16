@@ -3,7 +3,7 @@
 ``FirewallStore`` keeps what ``firewall.classify`` needs, as the readers delivered it: the single
 Sysmon connections (EID 3) in a ring of ``MAX_CONNECTIONS`` entries and ``RETAIN_S`` seconds, the
 DNS map (EID 22), the processes (EID 1), the Windows firewall log, and the PowerShell and BITS events
-that carry a URL (the download case). It is a store of its own, not ``log_store``: that one bundles at
+that name an executable file by URL (the download case; one with only other URLs is of no use and not kept). It is a store of its own, not ``log_store``: that one bundles at
 once, and the tab needs the single connections (beacon detection) and the process start (newborn).
 
 Times: ``since`` and ``until`` are ISO-8601 text (or epoch seconds); what comes out is what
@@ -68,7 +68,7 @@ RETAIN_S = 7 * 86400
 MAX_FIREWALL_EVENTS = 50000
 MAX_PROCESS_EVENTS = 5000
 MAX_PROCESSES = 20000
-MAX_URL_EVENTS = 500       # PowerShell and BITS events with a URL, each
+MAX_URL_EVENTS = 500       # PowerShell and BITS events that name an executable by URL, each
 MAX_SCRIPT_CHARS = 65536   # of a script block that is kept
 MAX_COMMANDLINE_CHARS = 8192
 
@@ -103,7 +103,11 @@ EXECUTABLE_SUFFIXES = frozenset({".exe", ".dll", ".scr", ".ps1", ".bat", ".cmd",
                                  ".msi", ".jar", ".lnk", ".cpl", ".ocx"})
 # Our own pattern, no input of anyone's: a URL ends at white space, a quote, a bracket or a comma.
 URL_RE = re.compile(r"https?://[^\s'\"<>`|^\\(){},]+", re.IGNORECASE)
-MAX_URL_LEN = 2048
+# A URL may carry a base64 blob (a stage-2 URL with its query string), so 8 kB. Twenty of them are 160 kB per
+# event, still firmly bounded. Longer is dropped: there is no sane URL up there and the bound has to stop
+# somewhere. The residual evasion, padding the URL itself past 8 kB, is accepted; Part B's proxy closes it
+# because it sees the request, not a text that mentions it.
+MAX_URL_LEN = 8192
 MAX_URLS = 20
 _URL_TRAILING = ".;:!?"
 
@@ -297,7 +301,14 @@ class FirewallStore:
         return True
 
     def _forget_old(self, ring: Deque) -> None:
-        """Drop what lies more than ``retain_s`` before the newest entry; the caller holds the lock."""
+        """Drop what lies more than ``retain_s`` before the newest entry; the caller holds the lock.
+
+        Not covered: a sample that moves the VM clock forward for good. The collector shares that clock, so
+        the new entries are not "ahead of now" (``_placed`` clamps only those that are), and the ring ages
+        out as time has passed. Anchoring to a monotonic clock would close it, but a VM that is suspended
+        and resumed would then disagree with the wall clock by design, and age out nothing for days or
+        clamp everything. The count cap and the 24 h read-back still hold.
+        """
         if ring:
             newest = ring[-1][0]
             while ring[0][0] < newest - self.retain_s:
@@ -984,6 +995,13 @@ class FirewallCollector:
         (T1070.001) and its ids start again, so the collector reads it again from the start (``since=0``).
         For the firewall it is the new offset and is taken as it is (the reader handles a rotation itself).
         A reader that answers a plain list gets its position from the events' ``record_id``, and never backwards.
+        A position that is no whole number (or None) is not kept: the events' ``record_id`` is used instead, and
+        events that give none either are refused, as they would be read again.
+
+        The cleared-log recovery is a heuristic. It sees a clear only when the log's newest id is *below* the
+        position held. A sample that clears the log and writes more records than the old position before the
+        next read leaves the newest id above it: the clear goes unnoticed and the records up to the old
+        position are skipped. Nothing cheap fixes that.
         """
         reader = self._reader(name)
         previous = self._cursors.get(name)
@@ -1001,9 +1019,8 @@ class FirewallCollector:
                 previous, hint = 0, "the event log was cleared; read again from its start"
                 continue
             break
-        if explicit:
-            cursor = reported
-        else:
+        cursor = _to_int(reported) if explicit else None
+        if cursor is None:
             cursor = self._newest_record(events)
             if events and cursor is None:
                 raise RuntimeError("the reader returned events without a record_id")
