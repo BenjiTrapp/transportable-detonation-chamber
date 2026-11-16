@@ -1568,18 +1568,6 @@ def test_an_answer_without_a_list_is_said_on_the_open_toasts():
 
 
 @needs_node
-def test_the_global_poll_stands_aside_while_the_tabs_live_poll_runs():
-    r = _decisions(r"""
-        answer = () => reply(answerOf());
-        fwReady = true; fwState.live = true; state.activeTab = 'firewall';
-        const aside = await fwPendingPoll();
-        state.activeTab = 'logs';
-        const elsewhere = await fwPendingPoll();
-        console.log(JSON.stringify({ aside, elsewhere, urls: calls.map(c => c.url) }));""")
-    assert r == {"aside": False, "elsewhere": True, "urls": ["/api/firewall/pending"]}
-
-
-@needs_node
 def test_hostile_text_in_every_result_path_stays_text():
     r = _decisions(r"""
         const H = %s;
@@ -1633,3 +1621,97 @@ def test_decisions_lists_the_open_and_the_decided_with_who_what_and_the_capture(
     assert r["posts"] == [{"id": "o1", "action": "block"}]
     assert ["rizin", "C:\\tdc\\samples\\ab\\abab"] in r["opened"]
     assert re.search(r'data-fw-decision="o1".*?CUT<', r["after"]) and "ANSWERING" not in r["after"]
+
+
+# --- Task 8, fix round 2 -------------------------------------------------------------------
+
+@needs_node
+def test_a_slow_connections_answer_does_not_keep_a_decision_from_its_toast():
+    r = _decisions(r"""
+        // The tab is open on LIVE and /connections hangs: every tick of the tab waits on it
+        answer = url => url.startsWith('/api/firewall/connections') ? new Promise(() => {}) : reply(url.startsWith('/api/firewall/pending')
+            ? answerOf({ pending: [pitem({ id: 'dl-new' })] }) : {});
+        fwReady = true; fwState.live = true; state.activeTab = 'firewall';
+        refreshFirewall({ slow: false });
+        refreshFirewall({ slow: false });
+        const polled = await fwPendingPoll();
+        console.log(JSON.stringify({ polled, ids: host.children.map(c => c.getAttribute('data-fw-decision')) }));
+        process.exit(0);""")
+    assert r == {"polled": True, "ids": ["dl-new"]}
+
+
+@needs_node
+def test_a_failed_click_then_the_deadline_is_a_result_nobody_saw():
+    out = _decisions(DEADLINE_DONE + r"""
+        answer = (url, init) => (init && init.method === 'POST') ? reply({ error: 'Bad gateway' }, 502) : reply({});
+        fwApplyPending(answerOf({ pending: [pitem()] }));
+        await fwDecide('dl-000000000001', 'allow');
+        fwApplyPending(answerOf({ history: [deadlineDone('dl-000000000001', '2026-11-16T10:00:30.000Z')], server_time: '2026-11-16T10:00:35.000Z' }));
+        for (let i = 0; i < 600; i++) { now += 1000; fwDecisionTick(); }
+        console.log(JSON.stringify(stack()));""")
+    assert "CUT + FETCHED" in out and "Taken by the deadline" in out
+
+
+@needs_node
+def test_decisions_keeps_the_block_of_a_dropped_one_and_says_whose_clock_it_is():
+    out = _decisions(r"""
+        fwApplyPending(answerOf({ history: [
+            pitem({ id: 'x1', action: 'dropped', remaining: 0, resolved_at: '2026-11-16T10:00:00.000Z',
+                    result: { reason: 'more than 200 open decisions', block: { rule_id: 'TDC-FW-0123456789ab', verified: true } } }),
+            pitem({ id: 'x2', action: 'dropped', remaining: 0, resolved_at: '2026-11-16T10:00:00.000Z', result: { reason: 'more than 200 open decisions' } }),
+        ] }));
+        fwReady = true; fwSetView('decisions');
+        console.log(JSON.stringify(els['firewall-view'].innerHTML));""")
+    cells = re.findall(r'<td class="fw-dec-block[^"]*"[^>]*>([^<]*)</td>', out)
+    assert cells == ["confirmed", "kept"] and "not set yet" not in out
+    assert "Time (VM clock)" in out
+    # Date.now of the tests is months after the server_time of the answer
+    assert re.search(r"The VM&#39;s clock is [0-9,]+ (minutes|hours|days) behind this computer&#39;s", out), out[:600]
+
+
+@needs_node
+def test_decisions_says_when_it_is_not_up_to_date_or_the_rules_are_unknown():
+    r = _decisions(r"""
+        fwReady = true;
+        fwApplyPending({ pending: 'x' });
+        fwSetView('decisions');
+        const never = els['firewall-view'].innerHTML;
+        fwApplyPending(answerOf({ pending: [Object.assign(pitem(), { can_fetch: null })], server_time: new Date(now).toISOString() }));
+        const unknown = els['firewall-view'].innerHTML;
+        answer = () => reply({ error: 'boom <b>x</b>' }, 500);
+        await fwPendingPoll();
+        console.log(JSON.stringify({ never, unknown, stale: els['firewall-view'].innerHTML }));""")
+    assert "could not be loaded" in r["never"] and "No decisions" not in r["never"]
+    assert "could not read its rules" in r["unknown"] and "behind" not in r["unknown"] and "ahead" not in r["unknown"]
+    assert "Not up to date" in r["stale"] and "&lt;b&gt;x" in r["stale"] and 'data-fw-decision="dl-000000000001"' in r["stale"]
+
+
+@needs_node
+def test_a_reload_brings_back_the_results_nobody_closed():
+    r = _decisions(DEADLINE_DONE + r"""
+        const history = [deadlineDone('kept', '2026-11-16T10:00:07.000Z'), deadlineDone('closed', '2026-11-16T10:00:07.500Z')];
+        fwApplyPending(answerOf({ pending: [pitem({ id: 'kept' }), pitem({ id: 'closed' })] }));
+        fwApplyPending(answerOf({ history, server_time: '2026-11-16T10:00:08.000Z' }));
+        fwDismissDecision('closed');
+        const standing = store['tdc.firewall.standing'];
+        // The page is loaded again: everything in memory is gone, the storage stays
+        fwDecisions = new Map(); fwDecisionOrder = ''; fwPendingFirst = true; fwPendingApplied = 0; fwStandingLoaded = false; fwStandingJson = ''; host.replaceChildren();
+        fwApplyPending(answerOf({ history, server_time: '2026-11-16T10:05:00.000Z' }));
+        console.log(JSON.stringify({ standing, ids: host.children.map(c => c.getAttribute('data-fw-decision')), out: stack() }));""")
+    assert json.loads(r["standing"]) == {"results": ["kept"], "away": []}
+    assert r["ids"] == ["kept"] and "Taken by the deadline" in r["out"]
+
+
+@needs_node
+def test_a_refused_fetch_is_offered_again_once_the_server_says_it_can():
+    r = _decisions(r"""
+        answer = (url, init) => (init && init.method === 'POST') ? reply({ error: 'A block for every program stands' }, 409) : reply({});
+        fwApplyPending(answerOf({ pending: [pitem()] }), ++fwPendingReq);
+        const before = ++fwPendingReq;
+        await fwDecide('dl-000000000001', 'block_fetch');
+        fwApplyPending(answerOf({ pending: [Object.assign(pitem(), { can_fetch: true })] }), before);
+        const stale = stack();
+        fwApplyPending(answerOf({ pending: [Object.assign(pitem(), { can_fetch: true })] }), ++fwPendingReq);
+        console.log(JSON.stringify({ stale, fresh: stack() }));""")
+    assert "NO FETCH" in r["stale"]
+    assert "NO FETCH" not in r["fresh"] and 'data-fw-decide="block_fetch"' in r["fresh"]

@@ -13194,6 +13194,8 @@ const FW_FETCH_WAIT_MS = 120000;
 const FW_REQUEST_MS = 15000;
 // The id of the standing summary of what was decided while nobody watched (no decision id starts with @)
 const FW_AWAY_ID = '@away';
+// The unattended results not closed yet, so that a reload brings them back
+const FW_STANDING_KEY = 'tdc.firewall.standing';
 // The server_time of the last /pending answer this browser showed: what resolved after it, nobody here saw
 const FW_SEEN_KEY = 'tdc.firewall.seen';
 const FW_DECIDE_ACTIONS = [
@@ -13236,6 +13238,9 @@ let fwPendingError = null;             // the last poll failed: the toasts say t
 let fwPendingFirst = true;             // the next answer is the first since the page loaded or came back: it summarises
 let fwPendingData = null;               // the last /pending answer applied: the DECISIONS view lists it
 let fwLastDecisionsHtml = '';
+let fwPendingSkew = null;               // the VM's clock minus this computer's (ms), from server_time
+let fwStandingLoaded = false;           // the saved results came back (fwRestoreStanding)
+let fwStandingJson = '';
 let fwSeenMs = null;                   // FW_SEEN_KEY as this page knows it, should the storage be blocked
 
 // --- Text of the VM ---
@@ -14596,11 +14601,12 @@ function fwTrackDecision(item, now) {
     return entry;
 }
 
-// A result that somebody answered may go once it has been read; one nobody answered stays until it is closed
+// A result that somebody answered may go once it has been read; one nobody answered stays until it is closed.
+// A click that failed is no answer: what the deadline then took, nobody saw
 function fwDecisionAttended(entry) {
     if (entry.kind !== 'decision' || entry.posting || entry.lost) return false;
     const result = entry.item && entry.item.result && typeof entry.item.result === 'object' ? entry.item.result : {};
-    return entry.mine || !!entry.gone || !!entry.tried || result.by === 'analyst';
+    return entry.mine || !!entry.gone || result.by === 'analyst';
 }
 
 // An attended result goes FW_RECEIPT_MS after nothing more is to come: a fetch is waited for, up to
@@ -14657,6 +14663,40 @@ function fwAbsenceText(items, sinceUnknown) {
     return { title, detail: `${parts.join('; ')}${sinceUnknown ? ' (in the last 24 h)' : ''}. DECISIONS in the FIREWALL tab lists every one, the samples are under SECURED SAMPLES.` };
 }
 
+// The results nobody closed, kept across a reload (FW_STANDING_KEY): the ids of the unattended result toasts and
+// of the summary's items. Written only once the first answer has brought them back, so a page that has not heard
+// from TDC yet cannot wipe them
+function fwSaveStanding() {
+    if (!fwStandingLoaded) return;
+    const results = [], away = fwDecisions.get(FW_AWAY_ID);
+    fwDecisions.forEach(entry => {
+        if (entry.kind === 'decision' && entry.phase === 'done' && !entry.lost && !fwDecisionAttended(entry)) results.push(entry.item.id);
+    });
+    const json = JSON.stringify({ results, away: away ? [...away.items.keys()] : [] });
+    if (json === fwStandingJson) return;
+    fwStandingJson = json;
+    try {
+        localStorage.setItem(FW_STANDING_KEY, json);
+    } catch (e) {
+        // storage blocked
+    }
+}
+
+function fwRestoreStanding(decided, now) {
+    fwStandingLoaded = true;
+    let saved = null;
+    try {
+        saved = JSON.parse(localStorage.getItem(FW_STANDING_KEY) || 'null');
+    } catch (e) {
+        saved = null;
+    }
+    if (!saved || typeof saved !== 'object') return;
+    const ids = list => (Array.isArray(list) ? list : []).filter(id => typeof id === 'string' && decided.has(id) && !fwDecisions.has(id));
+    ids(saved.results).forEach(id => fwTrackDecision(decided.get(id), now));
+    const away = ids(saved.away).map(id => decided.get(id));
+    if (away.length) fwAddAway(away, false, now);
+}
+
 // The standing summary of what was decided while nobody watched: one toast in the stack, with no throttle and
 // no timer, that takes in what comes on the next return as long as it is not closed
 function fwAddAway(items, sinceUnknown, now) {
@@ -14687,18 +14727,24 @@ function fwApplyPending(data, sent) {
     }
     const t = fwEpochMs(data.server_time);
     fwPendingError = null;
+    fwPendingSkew = t === null ? null : t - Date.now();
     if (typeof data.ask_mode === 'string') fwPendingAsk = data.ask_mode;
     const now = Date.now();
     const listed = new Set();
     for (const item of data.pending) {
-        if (item && (item.action === null || item.action === undefined) && fwTrackDecision(item, now)) listed.add(item.id);
+        if (!item || (item.action !== null && item.action !== undefined)) continue;
+        const entry = fwTrackDecision(item, now);
+        if (!entry) continue;
+        listed.add(item.id);
+        // The address-wide block a 409 met is gone, says an answer asked after it: the fetch is offered again
+        if (entry.noFetch && item.can_fetch === true && typeof sent === 'number' && sent > (entry.noFetchReq || 0)) entry.noFetch = false;
     }
     const historyKnown = Array.isArray(data.history);
     const history = (historyKnown ? data.history : [])
         .filter(i => i && typeof i === 'object' && typeof i.id === 'string' && i.id && i.action !== null && i.action !== undefined);
     fwPendingData = { pending: data.pending.filter(i => i && typeof i === 'object' && typeof i.id === 'string'), history };
     const decided = new Map(history.map(i => [i.id, i]));
-    const away = fwDecisions.get(FW_AWAY_ID);
+    let away = fwDecisions.get(FW_AWAY_ID);
     if (away) [...away.items.keys()].forEach(id => { if (decided.has(id)) away.items.set(id, decided.get(id)); });
     for (const [id, entry] of fwDecisions) {
         if (entry.kind !== 'decision' || listed.has(id)) continue;
@@ -14711,7 +14757,9 @@ function fwApplyPending(data, sent) {
             entry.doneAt = now;
         }
     }
+    if (!fwStandingLoaded) fwRestoreStanding(decided, now);
     const mark = fwSeenMark();
+    away = fwDecisions.get(FW_AWAY_ID);
     const unseen = history.filter(i => !fwDecisions.has(i.id) && !(away && away.items.has(i.id))
         && (i.action === 'dropped' || (i.result && i.result.by === 'deadline'))
         && (mark === null || (fwEpochMs(i.resolved_at) ?? 0) > mark));
@@ -14895,6 +14943,7 @@ function fwDecisionElement(entry, now) {
 // says changes (the countdown is its text alone), so a button is not replaced under the pointer
 function fwRenderDecisions() {
     fwSyncDecisionsView();
+    fwSaveStanding();
     const host = document.getElementById('decision-toasts');
     if (!host) return;
     const now = Date.now();
@@ -15006,7 +15055,10 @@ async function fwDecide(id, action) {
     } else {
         entry.phase = fwDecisionDue(entry, now) ? 'due' : 'open';
         if (r.status === 409) {
-            if (action === 'block_fetch') entry.noFetch = true;
+            if (action === 'block_fetch') {
+                entry.noFetch = true;
+                entry.noFetchReq = fwPendingReq;    // only a /pending asked after this refusal may lift it
+            }
             entry.note = `Refused: ${r.error || 'HTTP 409'} The decision is still open.`;
         } else {
             entry.tried = action;
@@ -15074,11 +15126,11 @@ function onFirewallDecisionClick(event) {
     else if ((el = hit('[data-fw-copy]'))) fwCopy(el.getAttribute('data-fw-copy'));
 }
 
-// Every FW_PENDING_MS on every tab, but not while the browser tab is hidden, never two at once, and not while
-// the FIREWALL tab's LIVE poll asks /pending itself (its answers come in through fwLoadFlows)
+// Every FW_PENDING_MS on every tab, the FIREWALL tab included, but not while the browser tab is hidden, and
+// never two at once. The tab's LIVE poll asks /pending too, but waits on /connections and drops an answer a later
+// tick overtook: on a busy chamber that may be every answer, so the toasts do not rely on it
 async function fwPendingPoll() {
     if (document.hidden || fwPendingBusy) return false;
-    if (fwReady && fwState.live && state.activeTab === 'firewall') return false;
     fwPendingBusy = true;
     const sent = ++fwPendingReq;
     let r;
@@ -15122,6 +15174,7 @@ function fwDecisionBlockCell(item) {
     if (item.action === 'allow') {
         return result.unblocked ? ['lifted', '', ''] : ['still blocked', fwShort(result.reason || result.error || '', 300), 'is-fail'];
     }
+    if (!block && item.action === 'dropped') return ['kept', 'Dropping a decision lifts no block; what it was is not recorded', ''];
     if (!block) return ['not set yet', '', 'is-fail'];
     return block.verified ? ['confirmed', fwShort(block.rule_id || '', 80), ''] : ['NOT confirmed', fwShort(block.problem || block.error || '', 300), 'is-fail'];
 }
@@ -15149,7 +15202,7 @@ function fwDecisionRow(item, open) {
         const phase = entry ? entry.phase : 'open';
         decision = phase === 'deciding' ? 'ANSWERING…' : phase === 'due' ? 'OPEN, time is up'
             : fwPendingAsk === 'off' ? 'OPEN, no default (ASK off)'
-                : `OPEN, default at ${escapeHtml(formatAlertTime(item.deadline).slice(11) || '?')}`;
+                : `OPEN, default at ${escapeHtml(formatAlertTime(item.deadline).slice(11) || '?')} (VM clock)`;
         by = '';
         kind = ' is-open';
     } else {
@@ -15169,18 +15222,36 @@ function fwDecisionRow(item, open) {
         + `<td class="fw-dec-actions">${open ? fwDecisionButtons(entry || { phase: 'unknown', item }) : ''}</td></tr>`;
 }
 
+// How far the VM's clock is from this computer's, in words, when it is a minute or more (the times of DECISIONS
+// are the VM's; a sample may have set its clock on purpose)
+function fwSkewText(ms) {
+    if (ms === null || !Number.isFinite(ms) || Math.abs(ms) < 60000) return '';
+    const a = Math.abs(ms) / 60000;
+    const [n, unit] = a < 120 ? [Math.round(a), 'minutes'] : a < 2880 ? [Math.round(a / 60), 'hours'] : [Math.round(a / 1440), 'days'];
+    return `The VM's clock is ${fwNumber(n)} ${unit} ${ms > 0 ? 'ahead of' : 'behind'} this computer's: the times here are the VM's, the countdowns of the toasts are not affected.`;
+}
+
 function fwDecisionsViewHtml() {
     const data = fwPendingData || { pending: fwState.pending || [], history: fwState.history || [] };
     const valid = i => i && typeof i === 'object' && typeof i.id === 'string' && i.id;
     const open = (data.pending || []).filter(valid), done = (data.history || []).filter(valid);
+    if (!fwPendingData && fwPendingError) {
+        return `<div class="fw-empty">The decisions could not be loaded: ${escapeHtml(fwShort(fwPendingError, 300))}. Whether any is open is unknown.</div>`;
+    }
+    const notes = [];
+    if (fwPendingError) notes.push(`Not up to date: ${escapeHtml(fwShort(fwPendingError, 300))}. This is the last list TDC gave.`);
+    if (open.some(i => i.can_fetch === null)) notes.push('TDC could not read its rules: whether it can fetch a file is unknown.');
+    const skew = fwSkewText(fwPendingSkew);
+    if (skew) notes.push(escapeHtml(skew));
+    const noteHtml = notes.map(n => `<div class="fw-stale">${n}</div>`).join('');
     if (!open.length && !done.length) {
-        return '<div class="fw-empty">No decisions in the last 24 h: TDC asks when a process of the detonation fetches a file (see ASK).</div>';
+        return `${noteHtml}<div class="fw-empty">No decisions in the last 24 h: TDC asks when a process of the detonation fetches a file (see ASK).</div>`;
     }
     const results = [...fwDecisions.values()].filter(e => e.phase === 'done').length;
-    const head = ['Time', 'Process', 'URL', 'Endpoint', 'Decision', 'By', 'Block', 'Fetch', ''].map(c => `<th>${c}</th>`).join('');
+    const head = ['Time (VM clock)', 'Process', 'URL', 'Endpoint', 'Decision', 'By', 'Block', 'Fetch', ''].map(c => `<th>${c}</th>`).join('');
     return `<div class="fw-dec-head"><span>${fwNumber(open.length)} open, ${fwNumber(done.length)} decided in the last 24 h</span>`
         + (results ? `<button type="button" class="btn btn-xs" data-fw-decisions-clear title="Close every result toast and the summary; the open decisions stay">CLOSE ${fwNumber(results)} RESULT ${results === 1 ? 'TOAST' : 'TOASTS'}</button>` : '')
-        + '</div>'
+        + `</div>${noteHtml}`
         + `<div class="logs-table-wrap fw-table-wrap"><table class="logs-table fw-table fw-dec-table" data-sortable data-sort-id="firewall-decisions"><thead><tr>${head}</tr></thead>`
         + `<tbody>${open.map(i => fwDecisionRow(i, true)).join('')}${done.map(i => fwDecisionRow(i, false)).join('')}</tbody></table></div>`;
 }

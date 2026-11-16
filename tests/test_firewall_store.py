@@ -543,6 +543,17 @@ def test_at_most_200_decisions_stay_open_and_the_oldest_goes_to_the_history(pend
     assert len(dropped) == 5 and dropped[0]["result"]["reason"]
 
 
+def test_a_dropped_decision_keeps_what_was_known_of_its_block(pending_path):
+    p = PendingStore(pending_path)
+    p.add(dict(FINDING, id="f0"), deadline=time.time() + 30)
+    p.set_result("f0", {"block": {"rule_id": "TDC-FW-0123456789ab", "verified": True}})
+    for i in range(1, 201):
+        p.add(dict(FINDING, id=f"f{i}"), deadline=time.time() + 30)
+    dropped = next(h for h in p.history(limit=500) if h["id"] == "f0")
+    assert dropped["action"] == "dropped" and dropped["result"]["reason"]
+    assert dropped["result"]["block"] == {"rule_id": "TDC-FW-0123456789ab", "verified": True}
+
+
 def test_a_corrupt_pending_file_is_set_aside_and_the_store_starts_empty(tmp_path):
     path = tmp_path / "pending.json"
     path.write_text("{ not json", encoding="utf-8")

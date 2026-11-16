@@ -707,8 +707,9 @@ class PendingStore:
                 del self._items[item["id"]]
         open_items = [i for i in self._items.values() if i["action"] is None]
         for item in open_items[:max(0, len(open_items) - MAX_OPEN)]:
+            # what was known of it (the block that stands) is kept: dropping it lifts nothing
             item.update(action="dropped", resolved_at=now,
-                        result={"reason": f"more than {MAX_OPEN} open decisions"})
+                        result=dict(item.get("result") or {}, reason=f"more than {MAX_OPEN} open decisions"))
 
     # -- writing --
 
