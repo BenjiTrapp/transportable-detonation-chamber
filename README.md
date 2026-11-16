@@ -41,6 +41,11 @@
   <br><sub>The same dashboard in the Telemetry theme (cyan, magenta and acid green on near-black blue)</sub>
 </p>
 
+<p align="center">
+  <img src="static/demo.gif" alt="Demo: a walk through the Web UI in the Telemetry theme" width="90%">
+  <br><sub>A walk through the Web UI in the Telemetry theme: Dashboard with Tool Updates, Alerts (charts and drilldown), Tracing, Graph, Pipes, Sysmon, LOGS, ThreatScan, Hex and File map, Rizin, ETW, and a switch to Cyberpunk and back (see <a href="#demo">Demo</a> for the screenshots)</sub>
+</p>
+
 ---
 
 ## Table of Contents
@@ -149,8 +154,8 @@ that was running at the time.
 The Web UI has two themes: **Cyberpunk** (the default: neon on deep violet)
 and **Telemetry** (cyan, magenta and acid green on near-black blue, with a
 fine grid and scanlines; it replaces the former blue Classic look, and a
-browser that stored "classic" simply gets Telemetry). Most of the screenshots
-below were taken in that former look, with its sidebar. **✶** switches between
+browser that stored "classic" simply gets Telemetry). The screenshots below
+were taken in Telemetry, except the one that says Cyberpunk. **✶** switches between
 the themes at once, without reloading the page; the open tab, an open detail
 view, filters and drilldown steps, sort orders, the graph and running pipe
 interception sessions stay as they are. The choice is stored in the browser
@@ -1059,6 +1064,18 @@ tool on the VM with its installed and available version and a status, and
 installs updates without re-provisioning the VM. The VM needs internet access
 for this; without it the rows say "No internet access from the VM" (`offline`).
 
+<p align="center">
+  <img src="static/tool_updates.png" alt="Dashboard: the Tool Updates panel with CHECK FOR UPDATES and the skull UPDATE ALL button" width="100%">
+</p>
+
+> The panel in the Telemetry theme, scrolled to the top of the window:
+> the time of the last check, **CHECK FOR UPDATES** and the skull button
+> **UPDATE ALL** with the number of tools it would install (2: Sysmon and its
+> config, the only rows with *update available*). Rustinel and Fibratus are
+> pinned (1.1.1 and 3.0.0), so a newer version (1.11.0, 3.1.1) is shown but
+> only their own **UPDATE** button installs it; most git and release tools
+> are *up to date*, and a few have no version to compare (*unknown*).
+
 - **Check for updates** runs in the background. The server also checks once a
   day on its own (first check 5 minutes after start; `TDC_UPDATE_CHECK_HOURS`),
   but it never installs anything by itself.
@@ -1148,6 +1165,18 @@ Splunk's search language. Everything in it is text from the sample or the VM
 (a PowerShell script block above all), so it is always shown as text, never as
 markup.
 
+<p align="center">
+  <img src="static/logs_tab.png" alt="LOGS tab: the search source=dns | top 10 query over 7 days" width="100%">
+</p>
+
+> The search `source=dns | top 10 query` over the last 7 days: the 252 DNS
+> events of the VM, counted by queried name (`github.com` 70, then
+> `dc.services.visualstudio.com` 38, `api.nuget.org` 24, ...) as a table with
+> its share, over the **EVENTS OVER TIME** histogram of the range. The chips
+> under the search box count the six sources (the DNS one is the active
+> source), the range buttons sit left of them, and the field list left of the
+> table shows the six fields of the result.
+
 | Source | Content |
 |--------|---------|
 | `powershell` | Script Blocks (4104), module and pipeline logging (4103) and engine errors (4100) of `Microsoft-Windows-PowerShell/Operational`; the parts of a long script block are joined into one event; the script is the `message` (`script=` searches it too) |
@@ -1211,27 +1240,26 @@ Screenshots from the ARM64 UTM VM with the test samples used during development
 (`shortlived.exe`, `injectsim.exe`, `beaconsim.exe`, `pipesim.exe` — harmless
 programs that mimic implant behaviour).
 
-### Service Dashboard (former Classic look)
+### Service Dashboard (Telemetry theme)
 
 <p align="center">
-  <img src="static/dashboard.png" alt="Dashboard in the former Classic theme, with the sidebar" width="100%">
+  <img src="static/dashboard.png" alt="Dashboard in the Telemetry theme" width="100%">
 </p>
 
 > Stats strip (alerts by severity, tracked processes, services online, loaded
 > Sigma/YARA rules, scanner tools), where each tile opens what it counts;
 > TOTAL ALERTS and PROCESSES TRACKED carry 45-day sparklines. Below it
-> **ALERT ACTIVITY** on ALL: the 9,620 alerts per day from 14 Jul to 10 Nov,
-> stacked by severity, beside the **SEVERITY** and **CATEGORY** donuts of
-> that range (196 critical, 2,700 high, 6,720 medium, 4 low; registry,
-> process, api, file, module). Then one card per service: Rustinel,
-> DetonatorAgent and LitterBox, below them Sysmon, Fibratus and the AV/AMSI
-> scanner (EMBER2024 and capa follow further down). Offline services are
-> struck through and can be launched from their card (here LitterBox). This
-> screenshot predates the top bar: the left sidebar held the tabs (Alerts,
-> the second, lists every alert), ✶ below "? Help", the tracked
-> processes and the alert timeline: the 60 newest alerts coloured by
-> severity, which TABLE lists as a table. They now sit in the drawer behind
-> ☰ PROCESSES, and the colours are those of the Telemetry theme above.
+> **ALERT ACTIVITY** on ALL: the 9,950 alerts per week from 13 Jul to 16 Nov
+> (5 without a time), stacked by severity, beside the **SEVERITY** and
+> **CATEGORY** donuts of that range (238 critical, 2,983 high, 6,720 medium,
+> 9 low; registry, process, api, file, module). Then one card per service:
+> Rustinel, DetonatorAgent and LitterBox, below them Sysmon, Fibratus and the
+> AV/AMSI scanner (EMBER2024 and capa follow further down). An offline service
+> is struck through and can be launched from its card; all of them are online
+> here. The top bar holds ☰ PROCESSES (362 tracked processes; the process list
+> and the alert timeline, the 60 newest alerts coloured by severity, which
+> TABLE lists as a table, sit in the drawer behind it), the tabs, the service
+> summary, Help and ✶, which switches to Cyberpunk.
 
 ---
 
@@ -1243,14 +1271,14 @@ programs that mimic implant behaviour).
 
 > The same dashboard in the **Cyberpunk** theme, which a browser without a
 > stored choice starts in. The top bar holds ☰ PROCESSES
-> (363 tracked processes, opens the process list and the timeline in a
-> drawer), the logo, the tabs with the active one in magenta, the service
-> summary, the time of the last update, Help and ✶, which switches to
-> Telemetry. The summary *4/5 ONLINE* counts the five services of the status row
-> (LitterBox is offline; a click lists them); the SERVICES ONLINE tile shows
-> *4/6* because it also counts the Detonator, which is offline as well. Below
+> (362 tracked processes, opens the process list and the timeline in a
+> drawer), the logo, the tabs (Dashboard to Submit, LOGS among them) with the
+> active one in magenta, the service summary, the time of the last update,
+> Help and ✶, which switches to Telemetry. The summary *5/5 ONLINE* counts the
+> five services of the status row (a click lists them); the SERVICES ONLINE
+> tile shows *6/6* because it also counts the Detonator. Below
 > the head area the stats tiles carry a coloured edge; a click on a tile opens
-> what it counts, a click on *2896 high* the critical and high alerts. The
+> what it counts, a click on *3221 high* the critical and high alerts. The
 > charts follow in the theme's colours: ALERT ACTIVITY on ALL (its switch
 > 24H / 7D / 30D / ALL at the top right), the SEVERITY and CATEGORY donuts,
 > then the service cards.
@@ -1263,18 +1291,19 @@ programs that mimic implant behaviour).
   <img src="static/alerts_tab.png" alt="Alerts tab filtered by severity and engine" width="100%">
 </p>
 
-> The **Alerts** tab (former Classic look) filtered to the critical and high alerts of
-> the fibratus engine: *6 of 9641*. The charts above the filter bar count
-> the same six: SEVERITY 1 critical and 5 high, OVER TIME one alert on each
-> of six days between 28 Oct and 10 Nov (under the bars the hint how to use
-> them), ENGINE fibratus alone, and FLOW from fibratus through six rules to
-> six processes (a click on a part would narrow the list further). The
-> severity chips and the engine are set in the filter bar itself, which is
-> no drilldown step, so no drilldown bar shows. Below the bar the six rows,
-> newest first, each with its time, severity, engine, rule, process and
-> PID, and the rule's description. A click on a row opens the alert detail;
-> process names that are in the process list (here `services.exe`) are
-> links to the process. Column heads sort the table.
+> The **Alerts** tab (Telemetry) filtered to the critical and high alerts of
+> the fibratus engine: *9 of 9950*. The charts above the filter bar count
+> the same nine: SEVERITY 1 critical and 8 high, OVER TIME bars between
+> 28 Oct and 16 Nov (under the bars the hint how to use them), ENGINE
+> fibratus alone, and FLOW from fibratus through seven rules (six named, the
+> rest as *other rules*) to the processes they ran in (a click on a part would
+> narrow the list further). The severity chips and the engine are set in the
+> filter bar itself, which is no drilldown step, so no drilldown bar shows.
+> Below the bar the rows, newest first, each with its time, severity, engine,
+> rule, process and PID, and the rule's description. A click on a row opens
+> the alert detail; process names that are in the process list (here
+> `XtaCache.exe` and `powershell.exe`) are links to the process. Column heads
+> sort the table.
 
 ---
 
@@ -1284,13 +1313,13 @@ programs that mimic implant behaviour).
   <img src="static/dashboard_charts.png" alt="Dashboard charts with a range drawn across ALERT ACTIVITY" width="100%">
 </p>
 
-> The dashboard (Cyberpunk) with a range drawn across **ALERT ACTIVITY**:
-> the bars of ALL show the 9,620 alerts per day from 14 Jul to 10 Nov,
-> stacked by severity; the range 23 Jul – 21 Aug is marked on them and
+> The dashboard (Telemetry) with a range drawn across **ALERT ACTIVITY**:
+> the bars of ALL show the 9,950 alerts per week from 13 Jul to 16 Nov,
+> stacked by severity; the range 20 Jul – 16 Aug is marked on them and
 > stands as a chip before 24H / 7D / 30D / ALL, whose × goes back to ALL.
-> **SEVERITY** and **CATEGORY** count that range only: 5,833 alerts (7
-> critical, 1,761 high, 4,065 medium), in three categories (registry,
-> process, api). The TOTAL ALERTS and PROCESSES TRACKED tiles carry their
+> **SEVERITY** and **CATEGORY** count that range only: 6,215 alerts (7
+> critical, 1,767 high, 4,441 medium), in three categories (registry 4,441,
+> process 1,648, api 126). The TOTAL ALERTS and PROCESSES TRACKED tiles carry their
 > 45-day sparklines. A click on a bar or a segment opens the Alerts tab
 > filtered to it.
 
@@ -1298,34 +1327,34 @@ programs that mimic implant behaviour).
   <img src="static/alerts_charts.png" alt="Alerts tab with its chart strip and the engine, rule and process Sankey" width="100%">
 </p>
 
-> The **Alerts** tab with all 9,641 alerts: **SEVERITY** and **ENGINE** as
-> pies beside their legends (Sigma 9,415, Yara 216, fibratus 10), **OVER
-> TIME** per week stacked by severity (the week of 27 Jul has 3,372 alerts)
+> The **Alerts** tab with all 9,950 alerts: **SEVERITY** and **ENGINE** as
+> pies beside their legends (Sigma 9,694, Yara 237, fibratus 14, litterbox 5),
+> **OVER TIME** per week stacked by severity (the week of 27 Jul has 3,372 alerts)
 > with the hint how to draw a range below it, and **FLOW: ENGINE → RULE →
 > PROCESS** drawn by square roots. It shows the noise at a glance: the
-> Run-key rule alone has 6,150 of the alerts, 5,757 of them on `MsMpEng.exe`
-> (6,190 alerts in all). The six most frequent rules and processes stand on
-> their own, the rest as *other rules* (79) and *other processes* (504). A
+> Run-key rule alone has 6,150 of the alerts, and `MsMpEng.exe` alone has
+> 6,190. The six most frequent rules and processes stand on
+> their own, the rest as *other rules* (95) and *other processes* (534). A
 > click on a slice, a bar, a node or a band, or a range drawn across the
-> bars, narrows the tab by a step; no filter is set here (*9641 of 9641* in
+> bars, narrows the tab by a step; no filter is set here (*9950 of 9950* in
 > the filter bar), so no drilldown bar shows.
 
 <p align="center">
   <img src="static/alerts_drilldown.png" alt="Alerts tab narrowed in three drilldown steps, with BACK and the path above the charts" width="100%">
 </p>
 
-> The **Alerts** tab (Cyberpunk) after three steps: a click on the week
+> The **Alerts** tab (Telemetry) after three steps: a click on the week
 > 27 Jul – 02 Aug in OVER TIME, a click on its day 27 Jul, then a range
 > drawn across the hours 10:00 and 11:00. The drilldown bar above the charts
 > shows **‹ BACK**, the path
 > `ALL ALERTS › 27 Jul – 02 Aug › 27 Jul › 27 Jul 10:00–12:00` (a click on a
-> step goes back to it) and *1,345 of 9,641 alerts*. OVER TIME divides the
+> step goes back to it) and *1,345 of 9,950 alerts*. OVER TIME divides the
 > two hours into 24 bars of 5 minutes; the busiest, 10:30–10:35, has 373
 > alerts. SEVERITY counts 6 critical, 784 high and 555 medium, ENGINE Sigma
 > 1,339 and Yara 6, and FLOW leads Suspicious Encoded PowerShell Command
 > Line (766) to `powershell.exe` (767 in all) and Registry Run Key
 > Persistence (506) mostly to `MsMpEng.exe` (539 in all). The range stands
-> as a chip under the filter bar (*1345 of 9641*), and the table lists those
+> as a chip under the filter bar (*1345 of 9950*), and the table lists those
 > alerts, newest first.
 
 ---
@@ -1356,7 +1385,7 @@ programs that mimic implant behaviour).
 > each with Map/Hex shortcuts.
 >
 > **Right:** `beaconsim.exe` is **SUSPICIOUS (3.8)**: Sysmon network events show
-> 7 connections to the same endpoint every 2.0 s (robust CoV 0.00), and that
+> 8 connections to the same endpoint every 2.0 s (robust CoV 0.00), and that
 > rhythm corroborates the in-memory signature hits from Aether (3 of 3 samples)
 > and the exit dump.
 
@@ -1474,12 +1503,13 @@ programs that mimic implant behaviour).
   <img src="static/file_map.png" alt="File map" width="100%">
 </p>
 
-> **PE header analysis** of `injectsim.exe`: IOC flags (code-injection APIs,
-> a `.tls` section matching a packer name, two TLS callbacks), file/optional
-> headers with an invalid checksum, security features, and the section table
-> with entropy bars.
+> **PE header analysis** of `injectsim.exe`, scrolled to the lower part of the
+> panel: the last three IOC flags (code-injection APIs, a `.tls` section
+> matching a packer name, two TLS callbacks), file/optional headers with an
+> invalid checksum, security features, and the start of the section table
+> with its entropy bars.
 >
-> **Packing analysis** of `capa.exe` (a PyInstaller bundle): Detect-It-Easy
+> **Packing analysis** of `capa.exe` (a PyInstaller bundle, 35 MB): Detect-It-Easy
 > style cards (linker, 36 MB data overlay at entropy 8.00), entropy map and
 > file layout — almost the whole file is overlay.
 >
@@ -1498,20 +1528,23 @@ programs that mimic implant behaviour).
 ### Rizin (Reverse Engineering)
 
 <p align="center">
-  <img src="static/rizin.png" alt="Rizin tab: pipesim.exe at sym.main in DISASSEMBLY and GRAPH, the console after afl~main" width="100%">
+  <img src="static/rizin.png" alt="Rizin tab: pipesim.exe at the instruction that loads the pipe name string, in DISASSEMBLY and GRAPH, the console after iz~msagent, axt and a seek" width="100%">
 </p>
 
-> The **Rizin** tab (Cyberpunk) with `pipesim.exe`, the harmless named-pipe
-> test program, built with mingw and uploaded through OPEN ▾. The toolbar
-> shows its path in the upload folder on the VM, *PE64 · x86-64 · 151.7 KB*,
-> the shortened SHA256 and *analysed (aaa) 1.7 s*; SEEK says `sym.main`, where
-> the tab landed after the analysis. FUNCTIONS (84) marks `sym.main`,
-> DISASSEMBLY shows its first instructions with 0x1400014b7 marked (calls in
-> pink, conditional jumps in green, symbols in amber), and GRAPH beside it the
-> function's entry block among its 30 blocks, marked in magenta, with the
-> taken `jle` in green and the fall-through to 0x140001507 in red. Below, the
-> CONSOLE after `afl~main`: the six functions whose name contains "main", and
-> the prompt `[0x1400014b7]>` at the place the views show.
+> The **Rizin** tab (Telemetry) with `pipesim.exe`, the harmless named-pipe
+> test program, opened from its path in `C:\Users\Public\Downloads` on the VM
+> (the OPEN ▾ menu also takes a submitted sample, a dump or an upload). The
+> toolbar shows the path, *PE64 · x86-64 · 186.5 KB*, the shortened SHA256 and
+> *analysed (aaa) 3.3 s*; FUNCTIONS lists the 127 functions Rizin found, with
+> `fcn.140001000` marked. DISASSEMBLY shows that function around 0x1400010a7
+> (marked, SEEK says the same): the `lea r8` that loads the pipe-name string
+> `\\.\pipe\msagent_%04x%02x`, among calls (pink), the imports of
+> `KERNEL32.dll` and the C runtime (amber). GRAPH beside it draws the
+> function's 31 blocks, here the block that starts at 0x140001067 (marked).
+> Below, the CONSOLE shows how the view got there: `iz~msagent` finds the
+> string at 0x140026056, `s 0x140026056` seeks to it, `axt` lists its only
+> reference (`fcn.140001000` at 0x1400010a7) and `s 0x1400010a7` follows it;
+> the prompt `[0x1400010a7]>` stands at the place the views show.
 
 ---
 
@@ -1521,10 +1554,19 @@ programs that mimic implant behaviour).
   <img src="static/live_memory.png" alt="Live process memory" width="100%">
 </p>
 
-> An Aether scan of a running `explorer.exe` (3 samples, 3 s apart): 30
-> signature hits in four categories, all of them known for this host — the
-> baseline suppresses 7 findings and the result is **CLEAN (0)**. Below: the
-> scan history with every scanner's verdict and score.
+> The **LIVE PROCESS MEMORY** panel of the ThreatScan tab with the **SCAN
+> HISTORY** under it. The panel takes a PID, or a name to look up, and offers
+> Aether scan (set to 3 samples, 3 s apart), Dump memory, the host
+> baseline (explorer.exe, svchost.exe, msedge.exe, with CAPTURE and CLEAR; the
+> baseline holds 575 keys, updated 2026-10-20) and the whole-system sweep
+> buttons; no scan is running. Below, the score history plots every scan of
+> the history as a point (clean 29, suspicious 12, detected 3, no verdict 17
+> of the 61 entries; the dashed lines mark SUSPICIOUS at 2 and MALICIOUS at
+> 6), and the list gives each entry's time, scanner, target and verdict with
+> its score. A click on an entry or a point opens its details. An Aether
+> result as the scan shows it (hits by category, the baseline, MITRE
+> techniques) is drawn in the detonation results (LIVE MEMORY above) and
+> after a scan started here.
 
 ---
 
@@ -1534,22 +1576,30 @@ programs that mimic implant behaviour).
   <img src="static/pipes_tab.png" alt="Pipes tab: events and an interception session" width="100%">
 </p>
 
-> **Pipes tab:** the Sysmon pipe events filtered to `\msagent_5e62b5` - the
-> harmless test sample `pipesim.exe` creates it and its child connects; both
-> rows are tagged **Cobalt Strike**. Below: an interception session armed for
-> the prefix `msagent_` before the detonation. It took the new pipe, relayed
-> the whole 60 s run (58 messages, `beacon n` client → server and `task n`
-> server → client, hex and ASCII) and the sample exited normally.
+> **Pipes tab:** PIPE EVENTS lists the Sysmon pipe events of the last hour on
+> the VM (12 events on 2 pipes when the screenshot was taken: `powershell.exe`
+> connecting to `\wkssvc` and `\DAV RPC SERVICE`; the pipe events of the
+> `pipesim.exe` detonation are no longer in the Sysmon log, so a filter on
+> its pipe finds none). Below, the interception session list and
+> the session `\msagent_5e62b5` (pattern `\msagent_`, armed with a prefix
+> match before the detonation, mode observe, 10:51:35 to 10:53:05): it took
+> the new pipe and relayed the whole run (1 connection, 58 messages, 446 B
+> recorded; `beacon n` client → server and `task n` server → client, hex and
+> ASCII, every one PASSED), and the sample exited normally. The notice
+> above the messages says the upstream connect landed on the proxy's own
+> instance once and was retried.
 
 <p align="center">
   <img src="static/detonation_pipes.png" alt="Detonation results: NAMED PIPES section" width="100%">
 </p>
 
-> **NAMED PIPES** in the detonation results of `pipesim.exe`: one pipe, created
-> by PID 4268 and connected by its child 14484, flags *C2 default name* and
-> *random name*. Both findings enter the memory evidence (source
-> `sysmon-pipes`, verdict **MALICIOUS** together with the memory findings), and
-> **Intercept** opens the Pipes tab with an attach form for this pipe.
+> **NAMED PIPES** in the detonation results of `pipesim.exe` (the run of
+> 11 Nov): one pipe, `\msagent_4872a0`, created by the sample (PID 7824) and
+> connected by PID 7184, flags *C2 default name*, *cross-process* and
+> *random name*, family Cobalt Strike. The 3 findings enter the memory
+> evidence (source `sysmon-pipes`, verdict **MALICIOUS** together with the
+> memory findings), and **Intercept** opens the Pipes tab with an attach form
+> for this pipe.
 
 ---
 
@@ -1573,17 +1623,20 @@ programs that mimic implant behaviour).
   <img src="static/etw_browser.png" alt="ETW browser" width="100%">
 </p>
 
-> **Sysmon** (former Classic look): the 500 newest events. **EVENTS OVER TIME** stacks
-> them by event type in 15-second bars, **PROCESS → EVENT TYPE** shows who
-> raised them (`python.exe`, the web UI itself, 236, nearly all of them pipe
-> events; the images after the sixth are *other images*). Under the filter
-> bar the type counters (PipeConnected, PipeCreated, ProcessCreate,
-> FileCreate, DNSQuery) and the table with command lines and the Windows
-> Event IDs each Sysmon event corresponds to; the detail view (right) lists
-> the correlated Security events.
+> **Sysmon:** the 500 newest events. **EVENTS OVER TIME** stacks
+> them by event type in bars of a few seconds, **PROCESS → EVENT TYPE** shows
+> who raised them (`python.exe`, the web UI itself, 395, nearly all of them
+> pipe events; then `wevtutil.exe` 45, `tasklist.exe` 33, `sc.exe` 20,
+> `powershell.exe` 6 and `rustinel.exe` 1). Under the filter
+> bar the type counters (PipeConnected 201, PipeCreated 198, ProcessCreate
+> 100, FileCreate 1) and the table with command lines and the Windows
+> Event IDs each Sysmon event corresponds to; the detail view (right, for a
+> `wevtutil.exe` ProcessCreate) lists the correlated Security events 4688
+> and 4689.
 >
-> **ETW browser:** the Sysmon channel with one event expanded; all fields of the
-> event are shown, suspicious values are highlighted.
+> **ETW browser:** the Sysmon channel with one event expanded (a Process
+> Create of `wevtutil.exe`); all fields of the event are shown, suspicious
+> values are highlighted.
 
 ---
 
