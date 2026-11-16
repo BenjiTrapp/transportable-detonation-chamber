@@ -1563,3 +1563,28 @@ def test_the_rules_are_read_once_a_minute_and_again_after_every_enforcement(clie
     before = fw.run.ops().count("List")
     client.get("/api/firewall/connections")
     assert fw.run.ops().count("List") == before + 1                                   # forgotten by the block
+
+
+# ---- enforcement never takes the 60 s rule cache -----------------------------------------------
+
+
+def test_a_block_removed_outside_tdc_is_written_again_not_confirmed_from_the_cache(client, fw, tdc):
+    first = tdc._fw_ensure_block(FINDING)
+    assert first["verified"] is True
+    tdc._fw_rules()                                   # the cache now holds the rule
+    fw.run.rules.pop(first["rule_id"])                # the hatch, wf.msc or the sample removes it
+    creates = fw.run.ops().count("Create")
+    again = tdc._fw_ensure_block(FINDING)
+    assert fw.run.ops().count("Create") > creates and first["rule_id"] in fw.run.rules
+    assert again["verified"] is True and again["rule_id"] == first["rule_id"]
+
+
+def test_an_address_wide_block_removed_outside_tdc_no_longer_refuses_block_fetch(client, fw, tdc):
+    client.post("/api/firewall/block", json={"scope": "endpoint_all", "ip": "203.0.113.50"})
+    tdc._fw_rules()                                   # cached with the block for every program
+    for name in [n for n, r in fw.run.rules.items() if r["Program"] == "Any"]:
+        fw.run.rules.pop(name)                        # removed outside TDC
+    assert tdc._fw_address_wide_block(FINDING) is True                  # the poll path may lag a minute...
+    assert tdc._fw_address_wide_block(FINDING, force=True) is False     # ...enforcement reads it fresh
+    pid = fw.pending.add(FINDING, deadline=time.time() + 30)["id"]
+    assert client.post("/api/firewall/decide", json={"id": pid, "action": "block_fetch"}).status_code == 200

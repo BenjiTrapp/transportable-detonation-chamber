@@ -11819,9 +11819,11 @@ def _fw_block_key(finding):
 def _fw_ensure_block(finding):
     """Make sure the loader is blocked from the endpoint (program-scoped, so TDC's own fetch is not); say what stands.
 
-    ``{rule_id, verified, problem}``, or ``{error}``. Nothing is claimed that was not read back."""
+    ``{rule_id, verified, problem}``, or ``{error}``. Nothing is claimed that was not read back: the rules are read
+    fresh, never from the cache, because a rule removed outside TDC (the hatch, wf.msc, the sample) must not make a
+    confirmed block."""
     try:
-        found, _ = _fw_rules()
+        found, _ = _fw_rules(force=True)
         rule_id = _fw_rule_keys(found).get(_fw_block_key(finding))
         if rule_id:
             return {"rule_id": rule_id, "verified": True, "problem": None}
@@ -11862,9 +11864,12 @@ def _fw_release(item_id, finding):
         return {"unblocked": False, "error": (str(e).splitlines() or [type(e).__name__])[0][:300]}
 
 
-def _fw_address_wide_block(finding):
-    """Whether a block for every program stands on the endpoint: it would cut TDC's own fetch off as well."""
-    found, _ = _fw_rules()
+def _fw_address_wide_block(finding, force=False):
+    """Whether a block for every program stands on the endpoint: it would cut TDC's own fetch off as well.
+
+    ``force`` reads the rules fresh: what enforces (a decision's refusal, the deadline) passes it; only the poll
+    path's ``can_fetch`` takes the cache."""
+    found, _ = _fw_rules(force=force)
     keys = _fw_rule_keys(found)
     ip = finding.get("dst_ip") or ""
     return any(firewall.rule_key("", ip, port) in keys for port in (None, finding.get("dst_port")))
@@ -12014,7 +12019,7 @@ def _firewall_sweep(now=None):
     for item in _fw_pending.expired(now):
         try:
             action = "block_fetch"
-            if _fw_address_wide_block(item["finding"]):     # TDC's own fetch would be cut as well
+            if _fw_address_wide_block(item["finding"], force=True):     # TDC's own fetch would be cut as well
                 action = "block"
             _fw_decide(item["id"], action, "deadline")
         except KeyError:
@@ -12354,7 +12359,7 @@ def api_firewall_decide():
     item = _fw_pending.get(item_id)
     if item is None:
         return _fw_error("No such decision; it may be older than 24 hours.", 404)
-    if item["action"] is None and action == "block_fetch" and _fw_address_wide_block(item["finding"]):
+    if item["action"] is None and action == "block_fetch" and _fw_address_wide_block(item["finding"], force=True):
         return _fw_error("A block for every program stands on that endpoint, so TDC's own fetch would be cut off. "
                          "Remove it, or choose block only.", 409)
     try:
