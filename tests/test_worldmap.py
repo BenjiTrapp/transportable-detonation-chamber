@@ -19,8 +19,11 @@ Regressions covered:
   * a point or an arc that a click cannot tell apart (no data-fw-id)
   * the travelling dash on more than arcs with an open decision, or moving
     under prefers-reduced-motion; the hover fade running there either
-  * a destination at or next to the chamber (0° / 12° N, West Africa) that
-    loses its arc or hides under the chamber's dot
+  * the chamber drawn as a place: at a lon/lat (it stood at 0° / 12° N,
+    in Burkina Faso, though the host's location is never determined), on
+    the land, as a dot like a destination's, or given a coordinate by a
+    point with its id
+  * two destinations at one position whose arcs cover each other
   * NaN in a coordinate (it kills the whole path) from an infinite radius,
     a weight that is no number, or an arc whose ends are one point
   * a label pill that takes the clicks of the dots and arcs under it
@@ -41,9 +44,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORLD_JSON = os.path.join(ROOT, "webui", "static", "data", "world.json")
 BUILD_SCRIPT = os.path.join(ROOT, "scripts", "build-worldmap.py")
 
-MAP_FUNCTIONS = ["project", "worldMapSvg", "_worldXY", "_worldArcPath", "_worldRingPath", "_worldLabelBox",
+MAP_FUNCTIONS = ["project", "worldMapSvg", "_worldXY", "_worldChamber", "_worldArcPath", "_worldLabelBox",
                  "_worldTone", "_worldText", "_worldTextWidth", "escapeHtml", "_chartCoord", "_chartEllipsis"]
-MAP_CONSTS = ["ALERT_SEVERITIES", "WORLD_BOX", "WORLD_CHAMBER_ID"]
+MAP_CONSTS = ["ALERT_SEVERITIES", "WORLD_BOX", "WORLD_DOCK", "WORLD_CHAMBER_ID"]
 
 
 def _map_prelude():
@@ -138,7 +141,7 @@ def test_world_map_draws_graticule_land_arcs_and_points_in_that_order():
         console.log(JSON.stringify(worldMapSvg(points, arcs, { world })));""")
     svg = r
     assert svg.startswith("<svg") and svg.endswith("</svg>")
-    assert 'viewBox="0 0 720 280"' in svg
+    assert svg.startswith('<svg class="chart-svg fw-map" width="720" height="320" viewBox="0 0 720 320">')
     order = [svg.index(m) for m in ('class="fw-grat"', 'class="fw-land"', "fw-arc ", "fw-point ")]
     assert order == sorted(order)
     land = re.search(r'<path class="fw-land"[^>]* d="([^"]+)"', svg).group(1)
@@ -149,19 +152,74 @@ def test_world_map_draws_graticule_land_arcs_and_points_in_that_order():
     assert LITERAL_COLOR.search(svg) is None and "style=" not in svg
 
 
+def _chamber(svg):
+    m = re.search(r'<g class="fw-chamber" data-fw-id="@chamber">(.*?)</g>', svg)
+    assert m, svg
+    return m.group(1)
+
+
 @needs_node
-def test_world_map_chamber_sits_in_the_middle_and_arcs_start_there():
+def test_world_map_chamber_is_a_device_under_the_map_and_arcs_start_there():
     r = _map(r"""
         const points = [{ id: 'a', lon: 100, lat: 12, label: 'A', tone: 'low' }];
         const arcs = [{ from: WORLD_CHAMBER_ID, to: 'a', tone: 'low', weight: 1 }];
         console.log(JSON.stringify(worldMapSvg(points, arcs, {})));""")
-    chamber = re.search(r'<g class="fw-point fw-chamber"[^>]*data-fw-id="([^"]*)"[^>]*>(.*?)</g>', r)
-    assert chamber, r
-    assert chamber.group(1) == "@chamber"
-    assert 'cx="360" cy="140"' in chamber.group(2)
-    assert ">CHAMBER</text>" in chamber.group(2)
+    chamber = _chamber(r)
+    # A framed device with its name, no dot and no pill like a destination's
+    assert ">CHAMBER</text>" in chamber and 'class="fw-device"' in chamber
+    assert "<circle" not in chamber and "fw-pill" not in chamber and "fw-point" not in chamber
+    assert chamber.count('data-fw-id=') == 0 and r.count('data-fw-id="@chamber"') == 1
+    frame = re.search(r'<rect class="fw-device" x="([\d.]+)" y="([\d.]+)" width="([\d.]+)" height="([\d.]+)"', chamber)
+    x, y, w, h = map(float, frame.groups())
+    # Wholly under the map (280 px high), in the strip of its own, in the middle
+    assert 280 < y and y + h < 320 and x + w / 2 == 360
+    for ys in re.findall(r' y="([\d.]+)"', chamber):
+        assert float(ys) > 280
+    # The strip is a panel of its own, edged off the map
+    assert re.search(r'<rect class="fw-dock" x="0" y="280" width="720" height="40"/>', r)
+    assert '<path class="fw-dock-edge" d="M0 280H720"/>' in r
+    # Every arc leaves the port, the middle of the device's top edge
     arc = re.search(r'<path class="fw-arc-line" d="M([\d.]+) ([\d.]+) Q', r)
-    assert arc and arc.group(1, 2) == ("360", "140")
+    assert arc and (float(arc.group(1)), float(arc.group(2))) == (x + w / 2, y)
+
+
+@needs_node
+def test_the_chamber_has_no_coordinate():
+    # Nothing project() can return reaches the chamber's place: project() cuts
+    # every lon/lat to the 280 px of the map, the device lies below them. And
+    # a point with the chamber's id cannot give it one.
+    r = _map(r"""
+        const dev = _worldChamber(WORLD_BOX);
+        const ys = [];
+        for (let lon = -360; lon <= 360; lon += 7.5)
+            for (let lat = -180; lat <= 180; lat += 7.5) ys.push(project(lon, lat)[1]);
+        const svg = worldMapSvg([{ id: WORLD_CHAMBER_ID, lon: 8, lat: 50, label: 'Frankfurt', tone: 'low' }],
+                                [{ from: WORLD_CHAMBER_ID, to: WORLD_CHAMBER_ID, weight: 1 }], {});
+        console.log(JSON.stringify({ dev, maxY: Math.max(...ys), svg,
+            src: _worldChamber.toString() + worldMapSvg.toString() }));""")
+    assert r["maxY"] == 280
+    assert r["dev"]["y"] > r["maxY"] and r["dev"]["port"][1] > r["maxY"]
+    svg = r["svg"]
+    assert "Frankfurt" not in svg and "<circle" not in svg and "fw-arc " not in svg
+    assert re.search(r'<rect class="fw-device" x="308" y="289"', svg)
+    # Where the device is drawn is reckoned from the box, never projected
+    src = r["src"]
+    body = src[src.index("function _worldChamber"):src.index("function worldMapSvg")]
+    assert "project(" not in body and "_worldXY(" not in body and "lon" not in body and "lat" not in body
+    assert re.search(r"const dev = _worldChamber\(box\);", src)
+    assert "_worldArcPath(dev.port, to.xy" in src
+
+
+@needs_node
+def test_the_land_is_cut_at_the_map_and_never_reaches_the_chamber_strip():
+    r = _map(r"""
+        const world = { scale: 10, shapes: [[-1800, -650, 1800, -650, 1800, -900, -1800, -900]] };
+        console.log(JSON.stringify(worldMapSvg([], [], { world })));""")
+    # Antarctica runs to 90° S (y 344): the land sits in a viewport of the map's 280 px, which cuts it
+    world = re.search(r'<svg class="fw-world" x="0" y="0" width="720" height="280" viewBox="0 0 720 280">(.*?)</svg>', r)
+    assert world and 'class="fw-land"' in world.group(1) and 'class="fw-grat"' in world.group(1)
+    assert r.count('class="fw-land"') == 1 and r.count('class="fw-grat"') == 1
+    assert r.index("</svg>") < r.index('class="fw-dock"') < r.index('class="fw-chamber"')
 
 
 @needs_node
@@ -180,7 +238,7 @@ def test_world_map_marks_every_point_and_arc_with_its_id_and_tone():
         console.log(JSON.stringify(worldMapSvg(points, arcs, {})));""")
     point_groups = _svg_elements(r, "fw-point")
     arc_groups = _svg_elements(r, "fw-arc")
-    assert len(point_groups) == 4 and len(arc_groups) == 3     # the chamber is a point too
+    assert len(point_groups) == 3 and len(arc_groups) == 3     # the chamber is no point
     assert all("data-fw-id=" in g for g in point_groups + arc_groups)
     ids = {re.search(r'data-fw-id="([^"]*)"', g).group(1) for g in arc_groups}
     assert ids == {"p1", "flow-7", "p3"}
@@ -297,7 +355,7 @@ def test_world_map_labels_at_the_edge_stay_inside():
         console.log(JSON.stringify(worldMapSvg(points, [], {})));""")
     pills = [tuple(map(float, m)) for m in
              re.findall(r'<rect class="fw-pill" x="([-\d.]+)" y="([-\d.]+)" width="([\d.]+)" height="([\d.]+)"', r)]
-    assert len(pills) == 4
+    assert len(pills) == 3
     for x, y, w, h in pills:
         assert 0 <= x and x + w <= 720 and 0 <= y and y + h <= 280
 
@@ -352,35 +410,34 @@ def test_map_tones_are_theme_variables():
 
 
 def test_map_functions_hold_no_colour_literal():
-    for name in ("project", "worldMapSvg", "_worldXY", "_worldArcPath", "_worldRingPath", "_worldLabelBox",
+    for name in ("project", "worldMapSvg", "_worldXY", "_worldChamber", "_worldArcPath", "_worldLabelBox",
                  "_worldTone", "_worldText", "_worldTextWidth"):
         assert LITERAL_COLOR.search(_function_source(name)) is None, name
 
 
 @needs_node
-def test_world_map_destination_at_the_chamber_keeps_a_visible_target_above_it():
+def test_world_map_destinations_at_one_position_fan_out():
+    # Two addresses that GeoIP puts on one spot (a city's centre), and what
+    # used to be the chamber's spot: every arc is a curve of its own
     r = _map(r"""
         const points = [
-            { id: 'on', lon: 0, lat: 12, label: 'GH · on the chamber', tone: 'high' },
-            { id: 'near', lon: 1, lat: 12.5, label: 'BF · beside it', tone: 'low' },
+            { id: 'x', lon: 8.68, lat: 50.11, label: 'DE · one', tone: 'high' },
+            { id: 'y', lon: 8.68, lat: 50.11, label: 'DE · two', tone: 'low' },
+            { id: 'on', lon: 0, lat: 12, label: 'BF', tone: 'high' },
         ];
         const arcs = [
-            { from: WORLD_CHAMBER_ID, to: 'on', tone: 'high', weight: 2 },
-            { from: WORLD_CHAMBER_ID, to: 'on', tone: 'high', weight: 1, id: 'on-2' },
-            { from: WORLD_CHAMBER_ID, to: 'near', tone: 'low', weight: 1, pending: true },
+            { from: WORLD_CHAMBER_ID, to: 'x', tone: 'high', weight: 2 },
+            { from: WORLD_CHAMBER_ID, to: 'y', tone: 'low', weight: 1, pending: true },
+            { to: 'on', tone: 'high', weight: 1 },
+            { from: 'x', to: 'y', tone: 'high', weight: 1 },
         ];
         console.log(JSON.stringify(worldMapSvg(points, arcs, {})));""")
     assert "NaN" not in r
-    arcs = {re.search(r'data-fw-id="([^"]*)"', g).group(1): g for g in _svg_elements(r, "fw-arc")}
-    assert set(arcs) == {"on", "on-2", "near"}
-    rings = dict(re.findall(r'<g class="fw-arc [^"]*" data-fw-id="([^"]*)">.*?<path class="fw-arc-hit" d="([^"]+)"', r))
-    assert all(" A" in d for d in rings.values())          # a ring, not a zero-length line
-    assert rings["on"] != rings["on-2"]                     # and two of them do not cover each other
-    assert "fw-arc-pending" in arcs["near"]
-    # The destinations' dots come after (over) the chamber's
-    chamber = r.index('data-fw-id="@chamber"')
-    assert chamber < r.index('<g class="fw-point fw-tone-high" data-fw-id="on"')
-    assert chamber < r.index('<g class="fw-point fw-tone-low" data-fw-id="near"')
+    paths = dict(re.findall(r'<g class="fw-arc [^"]*" data-fw-id="([^"]*)">.*?<path class="fw-arc-hit" d="([^"]+)"', r))
+    # An arc between two destinations is none of the chamber's and is left out
+    assert set(paths) == {"x", "y", "on"}
+    assert paths["x"] != paths["y"]
+    assert all(re.fullmatch(r"M360 289 Q[\d.]+ [\d.]+ [\d.]+ [\d.]+", d) for d in paths.values())
 
 
 @needs_node

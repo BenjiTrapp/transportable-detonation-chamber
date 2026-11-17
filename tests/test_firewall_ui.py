@@ -39,7 +39,7 @@ FW_FUNCTION_NAME = re.compile(
 FW_FUNCTIONS = list(dict.fromkeys(FW_FUNCTION_NAME.findall(SOURCE)))
 FW_CONSTS = list(dict.fromkeys(re.findall(r"^const (FW_\w+) = ", SOURCE, re.M)))
 FW_LETS = re.findall(r"^let fw\w+ = [^\n]*?;(?=[ \t]*(?://[^\n]*)?$)", SOURCE, re.M)
-WORLD_FUNCTIONS = ["_worldXY", "project", "_worldTone", "_worldArcPath", "_worldRingPath", "_worldText", "_worldTextWidth",
+WORLD_FUNCTIONS = ["_worldXY", "project", "_worldChamber", "_worldTone", "_worldArcPath", "_worldText", "_worldTextWidth",
                    "_worldLabelBox", "worldMapSvg", "_chartCoord", "_chartEllipsis"]
 OTHER_FUNCTIONS = WORLD_FUNCTIONS + ["escapeHtml", "jsArg", "cssToken", "formatAlertTime", "formatSize", "logsQuote", "sortTimeValue"]
 ALL_FUNCTIONS = list(dict.fromkeys(FW_FUNCTIONS + OTHER_FUNCTIONS))
@@ -53,7 +53,7 @@ OTHER_IDS = ["threatscan-filepath"]
 LOADER = r"C:\Users\analyst\Desktop\loader.exe"
 TDC_PYTHON = r"C:\tdc\webui\.venv\Scripts\python.exe"
 
-PRELUDE = "\n".join(_const_source(name) for name in ["ALERT_SEVERITIES", "WORLD_BOX", "WORLD_CHAMBER_ID"] + FW_CONSTS) \
+PRELUDE = "\n".join(_const_source(name) for name in ["ALERT_SEVERITIES", "WORLD_BOX", "WORLD_DOCK", "WORLD_CHAMBER_ID"] + FW_CONSTS) \
     + "\n" + "\n".join(FW_LETS) + r"""
 const classes = () => {
     const set = new Set();
@@ -469,6 +469,30 @@ def test_local_endpoints_are_not_on_the_map():
         console.log(JSON.stringify(els['firewall-view'].innerHTML));""")
     ids = set(re.findall(r'data-fw-id="([^"]*)"', out))
     assert ids == {"@chamber", "a:1.2.3.4"}, ids
+
+
+@needs_node
+def test_the_chamber_on_the_map_is_a_device_under_it_and_a_click_on_it_clears_the_selection():
+    # The destination in the Netherlands, selected: its pin stands at its spot, as a share of
+    # the whole picture (map and strip), and the chamber is in the strip, not on any land
+    r = _run(r"""
+        fwState.loaded = true;
+        fwState.rules = [];
+        fwState.flows = [flow()];
+        fwSelect('a:203.0.113.7');
+        const map = els['firewall-view'].innerHTML;
+        const click = { target: { closest: s => (s === '[data-fw-id]' ? { getAttribute: () => WORLD_CHAMBER_ID, disabled: false } : null) } };
+        onFirewallClick(click);
+        console.log(JSON.stringify({ map, selected: fwSelected, xy: project(5.3, 52.1) }));""")
+    m = r["map"]
+    assert re.search(r'<svg class="chart-svg fw-map" width="720" height="320" viewBox="0 0 720 320">', m)
+    chamber = re.search(r'<g class="fw-chamber" data-fw-id="@chamber">(.*?)</g>', m).group(1)
+    assert 'class="fw-device"' in chamber and "<circle" not in chamber
+    assert all(float(y) > 280 for y in re.findall(r' y="([\d.]+)"', chamber))
+    pin = re.search(r'class="fw-map-pin[^"]*" style="left:([\d.]+)%;top:([\d.]+)%"', m)
+    x, y = r["xy"]
+    assert abs(float(pin.group(1)) - 100 * x / 720) < 0.01 and abs(float(pin.group(2)) - 100 * y / 320) < 0.01
+    assert r["selected"] == ""
 
 
 @needs_node

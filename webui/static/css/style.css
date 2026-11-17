@@ -8511,6 +8511,36 @@ table[data-sortable] > thead > tr > th:focus-visible {
 .fw-tone-low { --fw-tone: var(--fw-tone-low); color: var(--fw-tone-low); }
 .fw-tone-info { --fw-tone: var(--fw-tone-info); color: var(--fw-tone-info); }
 .fw-chamber { color: var(--fw-chamber); }
+/* The strip under the map that holds the chamber: a panel, not more sea, so
+   the device in it reads as no place */
+.fw-dock {
+    fill: var(--bg-secondary);
+}
+.fw-dock-edge {
+    fill: none;
+    stroke: var(--border-accent);
+    stroke-width: 1;
+}
+.chart-svg .fw-dock-note {
+    fill: var(--text-muted);
+    font-size: 8px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    pointer-events: none;
+}
+.fw-device {
+    fill: var(--bg-card);
+    stroke: currentColor;
+    stroke-width: 1.25;
+}
+.fw-device-led {
+    fill: currentColor;
+}
+.chart-svg .fw-device-label {
+    fill: currentColor;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+}
 .fw-arc-hit {
     fill: none;
     stroke: transparent;
@@ -8554,7 +8584,8 @@ table[data-sortable] > thead > tr > th:focus-visible {
     pointer-events: none;
 }
 .chart-clickable .fw-arc,
-.chart-clickable .fw-point {
+.chart-clickable .fw-point,
+.chart-clickable .fw-chamber {
     cursor: pointer;
 }
 .chart-clickable .chart-seg,
