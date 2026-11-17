@@ -68,20 +68,40 @@ gründliche Arbeit danach nach.
    und sein Wert kommt aus dem Profil-Lesen — plus einen dritten für den
    Zustand in der Antwort. Macht gemessen **8,8 s**.
 
-   | Weg | gemessen |
-   |---|---|
-   | Druck, ohne laufende Konvergenz | **8,8 s** |
-   | Druck, **während** die Konvergenz läuft | 21,4 s (siehe unten) |
-   | Konvergenz bis `stage: isolated` | 59,3 s |
-   | Verlassen aus `cut` (eine Regel, ein Default) | wenige Sekunden |
-   | Verlassen aus `isolated` (135 Regeln zurück) | 57,5 s |
-   | `GET /isolate`, warm | 0,01–0,15 s |
-   | Das alte ISOLATED, zum Vergleich | **38,5 s** |
+   *Dritte Korrektur, nach dem Aufruf-Log.* Die Streuung (9,9 s bis 16,9 s für
+   denselben Druck) kam **nicht** von einer Sperre: das Log zeigt für die beiden
+   Aufrufe des Drucks `wait_ms=0.0`. Sie kam daraus, dass die Aufrufe selbst
+   langsamer werden, wenn der Server beschäftigt ist — im Druck gemessen
+   `Profiles` 5,66 s und `Cut` 7,29 s, dieselben Ops allein 1,65 s und 2,44 s.
 
-   Gegen 38,5 s bleibt der Punkt bestehen: ein Knopfdruck schließt in
-   einstelligen Sekunden statt in einer halben Minute. Aber die Oberfläche
-   verspricht keine Zahl, die die Maschine nicht hält, und dieses Dokument
-   nennt nur noch gemessene Werte.
+   **Die Ursache liegt nicht im Panikschnitt, sondern in der Aufruf-Bilanz des
+   ganzen Tabs.** Jedes `GET /api/firewall/isolate` löst `Profiles` *und*
+   `AllowOut` aus (gemessen 3,5–7,2 s bzw. 6,1 s), jedes `/connections` und
+   `/rules` ein `List` (3,5–9,4 s) — und die Oberfläche fragt alle 5 Sekunden.
+   Mehrere `powershell.exe` laufen deshalb dauernd gleichzeitig und bremsen
+   sich gegenseitig: die Abfragen sind teurer als ihr Intervall. Der Schnitt
+   erbt das, weil er dieselbe Maschine benutzt.
+
+   | Gemessen | Wert |
+   |---|---|
+   | `Cut` allein, ruhige Maschine | **2,44 s** |
+   | `Cut` im Druck, Server beschäftigt | **7,29 s** |
+   | Druck insgesamt, je nach Last | **9,9 s – 16,9 s** |
+   | Wartezeit auf eine Sperre dabei | **0 ms** |
+   | Konvergenz bis `stage: isolated` | 59,3 s |
+   | Verlassen aus `cut` | wenige Sekunden |
+   | Verlassen aus `isolated` (135 Regeln zurück) | 57,5 s |
+   | Das alte ISOLATED, zum Vergleich | 38,5 s |
+
+   **Was das für das Ziel heißt:** der Schnitt selbst ist zweieinhalb Sekunden
+   und damit so schnell, wie Windows es zulässt. Der *Knopfdruck* ist es nur auf
+   einer ruhigen Maschine. Eine ehrliche Zahl für das Ziel gibt es deshalb erst,
+   wenn die Abfragen des Tabs nicht mehr teurer sind als ihr Intervall — das ist
+   eigene Arbeit und steht als offener Punkt im Handover, nicht in diesem
+   Entwurf. Bis dahin gilt: **einstellige bis knapp zweistellige Sekunden statt
+   38,5 s**, und das Aufruf-Log (`webui/logs/firewall-calls.log`, eine Zeile je
+   PowerShell-Aufruf mit Wartezeit, Laufzeit und Verursacher) sagt in jedem
+   Einzelfall, wohin die Zeit ging.
 
    Steht eine **verfälschte** Regel und muss repariert werden, dauert der
    Schnitt länger (gemessen 5,92 s für eine deaktivierte, 3,38 s für eine

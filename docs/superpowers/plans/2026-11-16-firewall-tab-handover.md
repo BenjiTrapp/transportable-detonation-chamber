@@ -573,3 +573,40 @@ So that nobody files them:
 - **The MCP server only reads** (`tdc_firewall_connections`,
   `tdc_firewall_captures`): no tool blocks, isolates, decides, kills or turns
   the firewall on.
+
+## Offener Punkt: die Aufruf-Bilanz des Tabs (gefunden beim Panikschnitt)
+
+Das Aufruf-Log (`webui/logs/firewall-calls.log`, eine Zeile je
+PowerShell-Aufruf mit Verursacher, Wartezeit auf die Sperre, Laufzeit und
+Exit-Code) hat beim ersten VM-Lauf des Panikschnitts etwas aufgedeckt, das
+**nicht** zu diesem Feature gehört, sondern zum ganzen FIREWALL-Tab:
+
+- `GET /api/firewall/isolate` löst `Profiles` **und** `AllowOut` aus — gemessen
+  3,5–7,2 s bzw. 6,1 s.
+- `GET /api/firewall/connections` und `/rules` lösen je ein `List` aus — 3,5–9,4 s.
+- Die Oberfläche fragt im LIVE-Betrieb **alle 5 Sekunden**.
+
+Die Abfragen sind damit teurer als ihr Intervall. Mehrere `powershell.exe`
+laufen dauernd gleichzeitig und bremsen sich gegenseitig: dieselbe Operation
+kostet allein 2,44 s und unter dieser Last 7,29 s. Gewartet wird dabei auf
+**keine** Sperre (`wait_ms=0.0`) — es ist reine Gleichzeitigkeit.
+
+Folgen, die man sieht: der Panikdruck braucht auf einer ruhigen Maschine
+einstellige Sekunden und unter Last bis 17 s, obwohl der Schnitt selbst 2,44 s
+ist. Und jede Zahl, die die Oberfläche über Zeiten verspricht, hängt an dieser
+Bilanz.
+
+Was dagegen zu tun wäre (eigene Arbeit, nicht Teil des Panikschnitts):
+
+1. Eine Abfrage darf nicht synchron auf einem PowerShell-Aufruf warten. Der
+   Zustand liefert, was bekannt ist, mit seinem Alter („vor 8 s gelesen"), und
+   ein Hintergrund-Auffrischer hält ihn aktuell.
+2. `Profiles`, `AllowOut` und `List` teilen sich einen Cache mit einem
+   gemeinsamen Auffrischer, statt dass drei Routen sie unabhängig anfordern.
+3. Nie zwei gleiche Aufrufe gleichzeitig: wer schon unterwegs ist, wird
+   abgewartet, nicht verdoppelt.
+4. Erst danach ist eine Zielzahl für den Druck wieder sinnvoll — und sie lässt
+   sich dann aus dem Log belegen.
+
+**Vorher gemessen, nachher wieder messen:** `Cut` allein 2,44 s; `Cut` im Druck
+unter Last 7,29 s; Druck insgesamt 9,9–16,9 s; Wartezeit auf Sperren 0 ms.
