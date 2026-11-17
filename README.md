@@ -1289,7 +1289,10 @@ The colour of a row and of an arc is its most severe tag.
 one endpoint, for one process everywhere, or (a separate switch) for an
 endpoint and every program, TDC's own fetch included. A rule only counts as a
 block once it reads back from Windows as written and every profile it covers is
-on. A blocked connection is not reset: a running one is expected to starve, which
+on. A loopback address (`127.0.0.0/8`, `::1`) is never blocked, for one process
+or for all: Windows Firewall does not filter loopback, so such a rule would
+stand, read back, and block nothing; the switch, the API and a download
+decision say so instead. A blocked connection is not reset: a running one is expected to starve, which
 looks like a network failure to the sample (Windows re-checks an established
 flow against a new Block filter; the handover has the check that confirms it). The UI shows each rule's protocol, because the
 assessment does not compare it: a tcp rule makes a udp flow to the same

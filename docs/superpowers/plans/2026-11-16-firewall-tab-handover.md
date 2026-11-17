@@ -377,6 +377,12 @@ So that nobody files them:
   gets a block to that address and a decision is opened. Deliberate: without it
   BITS (T1197) would be invisible as a download path. Update hosts that TDC
   knows are never asked about.
+- **Loopback cannot be blocked.** Windows Firewall does not filter loopback
+  (seen on the VM: a "verified" rule for curl.exe to 127.0.0.1 let curl through
+  with HTTP 200), so TDC refuses a block on `127.0.0.0/8` or `::1`, for one
+  program and for all, and a download from a loopback address opens a decision
+  whose block says why it was not written. To stop such a process: block it
+  everywhere, or KILL it.
 - **"blocked" ignores the protocol.** A tcp rule makes a udp flow to the same
   endpoint read as blocked; the UI shows the rule's protocol beside the claim.
 - **ISOLATED's residual.** While a fetch runs, anything that can run the web
