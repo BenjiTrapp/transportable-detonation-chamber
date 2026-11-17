@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 
 import pytest
 
@@ -2676,3 +2677,72 @@ def test_the_hatch_is_named_once_when_the_cut_rule_cannot_be_removed_and_outboun
     assert done["cut_removed"] is False and done["changed"] is False
     assert done["note"].count("tdc-unisolate") == 1 and "could not be removed" in done["note"]
     assert "nothing was changed" in done["note"]
+
+
+# ---- every PowerShell call is attributable: its op, the wait for the lock, its run time -------
+
+
+class _Ticks:
+    """A clock for ``rules_mod._clock`` that moves one second per reading, so durations are known, not measured."""
+
+    def __init__(self):
+        self.now = 100.0
+
+    def __call__(self):
+        self.now += 1.0
+        return self.now
+
+
+def _observed(monkeypatch):
+    seen = []
+    monkeypatch.setattr(rules_mod, "_clock", _Ticks())
+    monkeypatch.setattr(rules_mod, "CALL_OBSERVER", seen.append)
+    return seen
+
+
+def test_every_call_of_a_locked_run_is_reported_with_its_op_its_wait_and_its_run_time(monkeypatch):
+    seen = _observed(monkeypatch)
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    assert [r["op"] for r in seen] == ["Profiles", "Cut"]
+    for record in seen:
+        assert set(record) == {"op", "lock", "wait_ms", "run_ms", "rc", "thread"}
+        assert record["lock"] == "isolate" and record["rc"] == 0 and isinstance(record["thread"], str)
+        assert record["run_ms"] == 1000.0                     # one tick between the start and the end of the call
+    # the wait is the outermost acquisition's, given to the first call of the run; the next one waited for nothing
+    assert seen[0]["wait_ms"] == 1000.0 and seen[1]["wait_ms"] == 0.0
+
+
+def test_a_read_that_takes_no_lock_says_so(monkeypatch):
+    seen = _observed(monkeypatch)
+    run, _ = make()
+    rules_mod.rules(run)
+    assert [(r["op"], r["lock"], r["wait_ms"]) for r in seen] == [("List", None, None)]
+
+
+def test_the_wait_is_measured_where_the_lock_is_taken(monkeypatch):
+    seen = []
+    clock = [0.0]
+    asked = threading.Event()
+
+    def reading():
+        asked.set()
+        return clock[0]
+    monkeypatch.setattr(rules_mod, "_clock", reading)
+    monkeypatch.setattr(rules_mod, "CALL_OBSERVER", seen.append)
+    run, settings = make(foreign=STOCK)
+    worker = threading.Thread(target=lambda: rules_mod.isolate(run, True, settings=settings))
+    with rules_mod._LOCK:                                     # someone else's run holds it
+        worker.start()
+        assert asked.wait(5)                                  # the press has read the clock and now waits
+        clock[0] = 7.5                                        # seven and a half seconds pass while it waits
+    worker.join(5)
+    assert seen[0]["op"] == "Profiles" and seen[0]["wait_ms"] == 7500.0
+
+
+def test_an_observer_that_fails_changes_nothing(monkeypatch):
+    def broken(record):
+        raise RuntimeError("observer bug")
+    monkeypatch.setattr(rules_mod, "CALL_OBSERVER", broken)
+    run, settings = make(foreign=STOCK)
+    assert rules_mod.isolate(run, True, settings=settings)["verified"] is True

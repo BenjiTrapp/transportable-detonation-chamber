@@ -109,6 +109,37 @@ _FETCH_NAME = re.compile(re.escape(FETCH_PREFIX) + r"[0-9a-f]{12}")
 
 _LOCK = threading.RLock()
 
+# Every PowerShell call is reported to CALL_OBSERVER (set by the caller, None for none) as ``{op, lock, wait_ms,
+# run_ms, rc, thread}``: the op, which run holds the lock (None for a call made without it), how long that run
+# waited for the lock (given to its first call, 0.0 to the rest; None without the lock), how long the call ran,
+# its exit code and the thread's name. No parameter and no output is in it. The wait is measured where the lock is
+# taken, because a press that waits for someone else's run is the variance a single call cannot show.
+CALL_OBSERVER: Optional[Callable[[Dict[str, Any]], None]] = None
+_clock = time.perf_counter                # tests pin it
+_held = threading.local()                 # per thread: depth, what holds the lock, the wait not yet reported
+
+
+class _Locked:
+    """``_LOCK`` as a context manager that measures how long its outermost acquisition waited."""
+
+    def __init__(self, what: str):
+        self.what = what
+
+    def __enter__(self) -> None:
+        started = _clock()
+        _LOCK.acquire()
+        depth = getattr(_held, "depth", 0)
+        if depth == 0:
+            _held.what, _held.wait_ms = self.what, (_clock() - started) * 1000.0
+        _held.depth = depth + 1
+
+    def __exit__(self, *exc: Any) -> None:
+        _held.depth -= 1
+        _LOCK.release()
+
+
+_locked = _Locked
+
 
 class RuleError(Exception):
     """A firewall change that could not be made, or a state that cannot be trusted. The message is for the analyst."""
@@ -147,11 +178,33 @@ def _first_line(text: Any) -> str:
 
 
 def _call(run, args: List[str]) -> Tuple[int, str, str]:
+    started = _clock()
+    rc: Any = None
     try:
         rc, out, err = run(args)
     except Exception as e:
         raise RuleError(f"could not run {args[0]}: {type(e).__name__}: {_first_line(e)}") from e
+    finally:
+        _report(args, started, rc)
     return int(rc), out or "", err or ""
+
+
+def _report(args: List[str], started: float, rc: Any) -> None:
+    """Tell CALL_OBSERVER about one call; never raises, and changes nothing."""
+    observer = CALL_OBSERVER
+    if observer is None:
+        return
+    try:
+        ran = (_clock() - started) * 1000.0
+        op = args[args.index("-Op") + 1] if "-Op" in args[:-1] else ntpath.basename(str(args[0]))
+        locked = getattr(_held, "depth", 0) > 0
+        wait = None
+        if locked:
+            wait, _held.wait_ms = _held.wait_ms, 0.0
+        observer({"op": str(op), "lock": _held.what if locked else None, "wait_ms": wait, "run_ms": ran,
+                  "rc": rc if isinstance(rc, int) else None, "thread": threading.current_thread().name})
+    except Exception:
+        pass
 
 
 def _ps(run, op: str, **params: Optional[str]) -> Tuple[int, str, str]:
@@ -339,7 +392,7 @@ def enable_firewall(run) -> None:
 
     This changes what the malware sees, so TDC never does it by itself: the caller asks the analyst first.
     """
-    with _LOCK:
+    with _locked("enable"):
         _ok(run, "Enable")
         off = profiles_off(run)
     if off:
@@ -507,7 +560,7 @@ def block(run, *, image: Optional[str] = None, ip: Optional[str] = None, port: O
     for program in _fetcher_paths(fetcher):
         if spec["image"] is not None and _same_path(spec["image"], program):
             raise RuleError("that program is TDC's own fetcher: blocking it would cut TDC off from its fetch targets")
-    with _LOCK:
+    with _locked("block"):
         problem = _write(run, spec)
     return {"rule_id": spec["name"], "name": spec["name"], "image": spec["image"], "ip": spec["ip"],
             "port": spec["port"], "protocol": spec["protocol"], "verified": problem is None, "problem": problem}
@@ -521,7 +574,7 @@ def unblock(run, rule_id: str) -> None:
     """
     if not isinstance(rule_id, str) or not _BLOCK_NAME.fullmatch(rule_id):
         raise RuleError(f"not a TDC block rule: {str(rule_id)[:60]!r}")
-    with _LOCK:
+    with _locked("unblock"):
         _ok(run, "Remove", Name=rule_id)
         if _describe(run, rule_id) is not None:
             raise RuleError(f"{rule_id} is still there after it was removed")
@@ -575,7 +628,7 @@ def cut(run) -> Dict[str, Any]:
     only when the rule was read back and ``problem`` is None; ``profiles_off`` is always empty (a profile that is off
     is a ``ProfileOffError`` and nothing is written). Raises ``RuleError`` when the call fails or its answer cannot be read.
     """
-    with _LOCK:
+    with _locked("cut"):
         rc, out, err = _ps(run, "Cut")
         if rc == EXIT_PROFILE_OFF:
             raise ProfileOffError(_off_text(_first_line(err)))
@@ -597,7 +650,7 @@ def uncut(run) -> Dict[str, Any]:
     """Remove ``CUT_RULE`` and read it back: ``{removed, problem}``. ``removed`` is True only when the rule is read as
     gone (a rule that was never there is gone too); a failure is told in ``problem`` and never raised, because the way
     out must be able to say what it could not do. Never refused for a profile that is off."""
-    with _LOCK:
+    with _locked("uncut"):
         try:
             _ok(run, "Remove", Name=CUT_RULE)
             if _describe(run, CUT_RULE) is not None:      # Remove is quiet about a rule it did not remove
@@ -651,7 +704,7 @@ def allow_fetch(run, *, fetcher: str, ip: Any, port: Optional[int] = None) -> Di
     number = _clean_port(port) if port is not None else None
     spec = _spec(fetch_rule_name(address, number, program), "Allow", program, (address,), number,
                  "tcp" if number is not None else None)      # http(s) is tcp
-    with _LOCK:
+    with _locked("allow_fetch"):
         problem = _write(run, spec)
     return {"name": spec["name"], "rule_id": spec["name"], "verified": problem is None, "problem": problem}
 
@@ -666,7 +719,7 @@ def deny_fetch(run, name: str) -> None:
     if not isinstance(name, str) or not _FETCH_NAME.fullmatch(name):
         raise RuleError(f"not a TDC per-fetch rule: {str(name)[:60]!r}")
     both = (name + SWAP_SUFFIX, name)
-    with _LOCK:
+    with _locked("deny_fetch"):
         failed = []
         for each in both:
             try:
@@ -691,7 +744,7 @@ def forget_fetch_rules(run) -> Tuple[List[str], List[Dict[str, str]]]:
     """
     removed: List[str] = []
     stuck: List[Dict[str, str]] = []
-    with _LOCK:
+    with _locked("forget_fetch_rules"):
         for rule in rules(run):
             name = rule["rule_id"]
             if not (name.startswith(FETCH_PREFIX) or name in (FETCHER_RULE, FETCHER_RULE + SWAP_SUFFIX)):
@@ -1052,7 +1105,7 @@ def isolate(run, on: bool, *, settings) -> Dict[str, Any]:
     was among what was removed (in stage ``isolated`` it is not there any more). Both directions give ``profiles_off``
     so that the caller need not read the profiles once more.
     """
-    with _LOCK:
+    with _locked("isolate"):
         return _isolate_on(run, settings) if on else _isolate_off(run, settings)
 
 
@@ -1151,7 +1204,7 @@ def converge(run, *, settings, cancelled: Callable[[], bool]) -> Dict[str, Any]:
     whether the rule may be dropped, and then it may not. So ``verified`` is True in ``cut_policy`` (the rule read back as
     standing) and in ``isolated`` (Block read back, the list read and empty, the rule read as gone); do not "fix" the
     first by tying it to the list."""
-    with _LOCK:
+    with _locked("converge"):
         return _converge(run, settings, cancelled)
 
 
@@ -1406,7 +1459,7 @@ def startup_state(run, settings) -> Dict[str, Any]:
     It holds the module's lock for its whole run: it writes the stage, can forget the marker and can switch rules on,
     and a press or a convergence must not interleave with that.
     """
-    with _LOCK:
+    with _locked("startup_state"):
         return _startup_state(run, settings)
 
 

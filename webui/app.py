@@ -13,6 +13,7 @@ import base64
 import bisect
 import json
 import logging
+import logging.handlers
 import os
 import glob
 import platform
@@ -28,7 +29,7 @@ import subprocess
 import sys
 import weakref
 from pathlib import Path
-from flask import Flask, render_template, jsonify, request, send_from_directory, g
+from flask import Flask, render_template, jsonify, request, send_from_directory, g, has_request_context
 from werkzeug.utils import secure_filename
 import requests
 
@@ -11171,26 +11172,104 @@ def _firewall_readers():
 # ---- the context and the rules --------------------------------------------------------------
 
 
+# One debug line per PowerShell call of firewall_rules (its op, who asked, the wait for firewall_rules' lock, how long
+# it ran), and one per wait for the rule cache's lock where that lock is held across a call: a press whose seconds
+# vary is waiting for work it did not start, and these lines say whose. Only names TDC chose itself go in (the op,
+# the route's rule, the thread's name), never a parameter or anything Windows answered.
+_fw_call_logger = _log_logger.getChild("firewall_calls")
+
+
+def _fw_caller():
+    """The route that asked (method and its rule, not the requested path), or ``thread`` outside a request."""
+    try:
+        if has_request_context() and request.url_rule is not None:
+            return f"{request.method} {request.url_rule.rule}"
+    except Exception:
+        pass
+    return "thread"
+
+
+def _fw_ms(value):
+    return "-" if value is None else f"{value:.1f}"
+
+
+def _fw_log_call(record):
+    if not _fw_call_logger.isEnabledFor(logging.DEBUG):
+        return
+    _fw_call_logger.debug("firewall call op=%r caller=%r thread=%r lock=%s wait_ms=%s run_ms=%s rc=%s",
+                          record["op"], _fw_caller(), record["thread"], record["lock"] or "-",
+                          _fw_ms(record["wait_ms"]), _fw_ms(record["run_ms"]),
+                          "-" if record["rc"] is None else record["rc"])
+
+
+firewall_rules.CALL_OBSERVER = _fw_log_call
+FIREWALL_CALL_LOG_BYTES = 1024 * 1024
+FIREWALL_CALL_LOG_KEEP = 3
+
+
+def _fw_keep_call_log():
+    """Write the lines of _fw_call_logger to ``firewall-calls.log`` beside the access log (rotated, a few MB at
+    most), and nowhere else. Only the server itself does this (``__main__``); an import, a test above all, does not."""
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(os.path.join(LOG_DIR, "firewall-calls.log"),
+                                                       maxBytes=FIREWALL_CALL_LOG_BYTES,
+                                                       backupCount=FIREWALL_CALL_LOG_KEEP, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        _fw_call_logger.addHandler(handler)
+        _fw_call_logger.setLevel(logging.DEBUG)
+        _fw_call_logger.propagate = False
+    except Exception as e:      # a log that cannot be kept must not stop the web UI
+        _log_logger.warning("firewall: the call log cannot be written: %s", e)
+
+
+def _fw_take_rules_lock():
+    """Take _fw_rules_lock; returns how long that waited in ms (it can be held across another thread's ``List``)."""
+    started = time.perf_counter()
+    _fw_rules_lock.acquire()
+    return (time.perf_counter() - started) * 1000.0
+
+
+def _fw_log_rules_wait(waited):
+    if not _fw_call_logger.isEnabledFor(logging.DEBUG):
+        return
+    try:
+        _fw_call_logger.debug("firewall wait lock=rules-cache caller=%r thread=%r wait_ms=%s", _fw_caller(),
+                              threading.current_thread().name, _fw_ms(waited))
+    except Exception:
+        pass
+
+
 def _fw_rules(force=False):
-    """``(rules, error)`` of the TDC firewall rules; one PowerShell call per ``FIREWALL_RULES_TTL_S``."""
+    """``(rules, error)`` of the TDC firewall rules; one PowerShell call per ``FIREWALL_RULES_TTL_S``.
+
+    The cache's lock is held across that call. Its wait is logged only when a call follows, because a cache hit
+    waits for nothing worth a line."""
     global _fw_rules_cache
-    with _fw_rules_lock:
+    waited = _fw_take_rules_lock()
+    try:
         cached = _fw_rules_cache
         if not force and cached is not None and 0 <= time.time() - cached[0] < FIREWALL_RULES_TTL_S:
             return cached[1], cached[2]
+        _fw_log_rules_wait(waited)
         try:
             found, error = firewall_rules.rules(_fw_runner), None
         except Exception as e:
             found, error = None, str(e).splitlines()[0][:300] if str(e) else type(e).__name__
         _fw_rules_cache = (time.time(), found, error)
         return found, error
+    finally:
+        _fw_rules_lock.release()
 
 
 def _fw_forget_rules():
     """Something may have changed in the firewall: the rules and the profiles are read again next time."""
     global _fw_rules_cache
-    with _fw_rules_lock:
+    _fw_log_rules_wait(_fw_take_rules_lock())
+    try:
         _fw_rules_cache = None
+    finally:
+        _fw_rules_lock.release()
     _fw_forget_profiles()
 
 
@@ -12821,6 +12900,7 @@ if __name__ == "__main__":
     print(f"    Detonator API:   {DETONATOR_API}")
     print(f"    Agent API:       {DETONATOR_AGENT_API}")
     print(f"    LitterBox:       {LITTERBOX_API}")
+    _fw_keep_call_log()
 
     # 0.0.0.0 keeps the UI reachable from the host over the VM network; set
     # WEBUI_HOST=127.0.0.1 to restrict it to the VM itself.

@@ -2286,3 +2286,47 @@ def test_a_worker_that_dies_outside_its_catches_is_logged_and_says_so(client, fw
     assert any("stopped unexpectedly" in r.getMessage() for r in caplog.records)
     state = client.get("/api/firewall/isolate").json
     assert state["converging"] is False and "stopped unexpectedly" in state["converge_note"]
+
+
+# ---- every PowerShell call of a press is a log line that says where its seconds went -------------
+
+
+_CALL_LINE = re.compile(r"firewall call op='(\w+)' caller='([^']+)' thread='[^']*' lock=(\w+|-) "
+                        r"wait_ms=(\d+\.\d|-) run_ms=\d+\.\d rc=-?\d+")
+
+
+def test_a_press_logs_one_line_per_powershell_call_with_its_caller_and_its_wait(client, fw, tdc, caplog):
+    with caplog.at_level("DEBUG", logger="tdc.logs.firewall_calls"):
+        client.post("/api/firewall/isolate", json={"on": True})
+    lines = [r.getMessage() for r in caplog.records if r.name == "tdc.logs.firewall_calls"]
+    calls = [_CALL_LINE.fullmatch(line) for line in lines if line.startswith("firewall call ")]
+    assert all(calls) and [(m.group(1), m.group(2), m.group(3)) for m in calls] == [
+        ("Profiles", "POST /api/firewall/isolate", "isolate"), ("Cut", "POST /api/firewall/isolate", "isolate")]
+    # the press also takes the rule cache's lock to forget it: that wait is a line of its own
+    waits = [line for line in lines if line.startswith("firewall wait ")]
+    assert waits and all(re.fullmatch(r"firewall wait lock=rules-cache caller='[^']+' thread='[^']*' wait_ms=\d+\.\d",
+                                       w) for w in waits)
+
+
+def test_a_call_from_a_background_thread_names_the_thread_as_its_caller(fw, tdc, caplog):
+    with caplog.at_level("DEBUG", logger="tdc.logs.firewall_calls"):
+        tdc._fw_rules(force=True)
+    match = _CALL_LINE.fullmatch(next(r.getMessage() for r in caplog.records if r.name == "tdc.logs.firewall_calls"
+                                      and r.getMessage().startswith("firewall call ")))
+    assert match and match.group(1) == "List" and match.group(2) == "thread" and match.group(3) == "-"
+
+
+def test_the_server_keeps_the_call_lines_in_a_rotated_file_beside_the_access_log(fw, tdc, monkeypatch, tmp_path):
+    logger = tdc._fw_call_logger
+    monkeypatch.setattr(tdc, "LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setattr(logger, "handlers", [])
+    monkeypatch.setattr(logger, "level", logger.level)
+    monkeypatch.setattr(logger, "propagate", logger.propagate)
+    tdc._fw_keep_call_log()
+    try:
+        tdc._fw_rules(force=True)
+    finally:
+        for handler in logger.handlers:
+            handler.close()
+    text = (tmp_path / "logs" / "firewall-calls.log").read_text(encoding="utf-8")
+    assert "firewall call op='List' caller='thread'" in text and logger.propagate is False
