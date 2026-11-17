@@ -650,6 +650,33 @@ def test_isolated_asks_before_it_cuts():
 
 
 @needs_node
+def test_the_isolated_button_says_it_is_working_and_takes_no_second_click():
+    r = _run(r"""
+        confirmAnswer = true;
+        fwState.isolate = { isolated: false, profiles_off: [] };
+        let release;
+        const held = new Promise(res => { release = res; });
+        answer = url => url === '/api/firewall/isolate'
+            ? held.then(() => reply({ isolated: true, verified: true, note: null, state: { isolated: true, profiles_off: [] } }))
+            : reply({});
+        const first = fwToggleIsolated();
+        for (let i = 0; i < 5; i++) await Promise.resolve();
+        const b = els['firewall-isolated'];
+        const during = { text: b.textContent, disabled: b.disabled, busy: b.attrs['aria-busy'], title: b.title };
+        const second = await fwToggleIsolated();
+        release();
+        await first;
+        console.log(JSON.stringify({ during, second, posts: calls.filter(c => c.method === 'POST').length,
+            after: { text: b.textContent, busy: b.attrs['aria-busy'] }, toasts }));""")
+    assert r["during"]["text"] == "ISOLATING…" and r["during"]["disabled"] is True and r["during"]["busy"] == "true"
+    assert "PowerShell" in r["during"]["title"] and "minute" in r["during"]["title"]
+    assert r["second"] is False and r["posts"] == 1
+    assert r["after"] == {"text": "ISOLATED", "busy": "false"}
+    assert r["toasts"][0]["title"] == "Switching ISOLATED on…" and "does not stop it" in r["toasts"][0]["detail"]
+    assert r["toasts"][-1]["title"] == "ISOLATED is on"
+
+
+@needs_node
 def test_isolated_cannot_be_switched_on_while_a_profile_is_off():
     r = fw_toggle_isolated_clicks(confirm=True, isolate={"isolated": False, "profiles_off": ["Domain"]})
     assert r["post"] == 0 and r["confirm"] == 0

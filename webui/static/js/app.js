@@ -13308,6 +13308,9 @@ const FW_ISOLATE_TEXT = 'ISOLATED sets the default outbound action of every Wind
     + 'Still reachable: loopback, which TDC\'s own services use, and this web UI from the host, since inbound connections are untouched. '
     + 'TDC\'s own sample fetch is let out to one address at a time, only while it runs. '
     + 'The way back: this button again, or scripts/tdc-unisolate.ps1 on the VM if the web UI is gone.';
+const FW_ISOLATE_WAIT = 'TDC switches Windows\' own outbound Allow rules and the default outbound action through PowerShell, then reads '
+    + 'the firewall back before it says anything. Every PowerShell call takes seconds on a small VM, so this can take up to about a '
+    + 'minute; the button stays busy until the firewall has answered. The switch runs on the server: closing or reloading this page does not stop it.';
 // Ready LOGS queries for the selection (needs: the part of the selection a hint takes, '' for none)
 const FW_HINTS = [
     { label: 'Who else talks to this endpoint', needs: 'ip', query: s => `dst_ip=${logsQuote(s.ip)} | top image` },
@@ -13350,6 +13353,7 @@ let fwSeq = 0;                         // a response older than the last request
 let fwSlowSeq = 0;                     // the same for the slower round
 let fwIsoSeq = 0;                      // and for ISOLATED's state, asked every tick
 let fwIsoBusy = false;                 // an ISOLATED request still out (it may read the profiles): no second one
+let fwIsoSwitching = '';              // 'on' or 'off' while a switch of ISOLATED is on its way: the button waits for it
 let fwReady = false;
 let fwTimer = null;
 let fwTicks = 0;
@@ -14300,8 +14304,10 @@ function renderFirewallHead() {
         const on = fwIsolatedOn(), off = fwEnforceOff();
         iso.setAttribute('aria-pressed', String(on));
         iso.classList.toggle('is-on', on);
-        iso.disabled = !on && !!off;
-        iso.title = on ? 'ISOLATED is on: outbound is Block and Windows\' own outbound Allow rules are switched off; the band names whatever still gets out. Click to leave it (asks first).'
+        iso.setAttribute('aria-busy', String(!!fwIsoSwitching));
+        iso.textContent = fwIsoSwitching === 'on' ? 'ISOLATING…' : fwIsoSwitching === 'off' ? 'LEAVING…' : 'ISOLATED';
+        iso.disabled = !!fwIsoSwitching || (!on && !!off);
+        iso.title = fwIsoSwitching ? FW_ISOLATE_WAIT : on ? 'ISOLATED is on: outbound is Block and Windows\' own outbound Allow rules are switched off; the band names whatever still gets out. Click to leave it (asks first).'
             : off || 'Block outbound connections of the chamber and switch off Windows\' own outbound Allow rules; loopback stays open (asks first).';
     }
     const count = document.getElementById('firewall-count');
@@ -14617,6 +14623,7 @@ async function fwUnblock(ruleId) {
 }
 
 async function fwToggleIsolated() {
+    if (fwIsoSwitching) return false;
     const on = fwIsolatedOn();
     if (!on) {
         const off = fwEnforceOff();
@@ -14632,7 +14639,16 @@ async function fwToggleIsolated() {
             message: `Outbound connections go back to the default action that stood before (${before}), and the outbound Allow rules of Windows' own that ISOLATED switched off are switched on again. A sample still running can reach the network again.` });
         if (!ok) return false;
     }
-    const r = await fwPost('/api/firewall/isolate', { on: !on });
+    // Each step is a PowerShell call on the VM, seconds each: say that it is working, and keep a second click out
+    fwIsoSwitching = on ? 'off' : 'on';
+    renderFirewallHead();
+    showToast('info', on ? 'Leaving ISOLATED…' : 'Switching ISOLATED on…', FW_ISOLATE_WAIT);
+    let r;
+    try {
+        r = await fwPost('/api/firewall/isolate', { on: !on });
+    } finally {
+        fwIsoSwitching = '';
+    }
     if (!r.ok) {
         showToast('error', on ? 'ISOLATED is still on' : 'ISOLATED is not on', r.error);
         await refreshFirewall();
