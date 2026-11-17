@@ -1369,12 +1369,16 @@ loses it when it ends; for those seconds anything that can run the web UI's
 Python interpreter could reach that one address too. The band says so, and so
 does `residual` in `GET /api/firewall/isolate`. The previous outbound default
 is kept in `webui/firewall_state.json` too and put back when ISOLATED is
-switched off. A web UI that restarts in ISOLATED stays isolated and says so, in
+switched off: the value as configured, `NotConfigured` included, not the
+`Allow` it resolves to in force, so the firewall is left configured as it was
+found. A web UI that restarts in ISOLATED stays isolated and says so, in
 the band and as a toast on whatever tab is open: a crash in the middle of a
 detonation must not lift the block. The way out without the web UI is
 `C:\tdc\scripts\tdc-unisolate.ps1` (`scripts/tdc-unisolate.ps1` here; `make
-deploy` uploads it), run as Administrator in the VM: it sets the outbound
-default to Allow on all three profiles, switches on again the rules recorded in
+deploy` uploads it), run as Administrator in the VM: it opens the outbound
+default on all three profiles (back to the recorded value when that is `Allow`
+or `NotConfigured`, otherwise `Allow`; a recorded `Block` it names and leaves to
+the analyst), switches on again the rules recorded in
 `allow_disabled` (it only reads the file) and removes every `TDC-FW-*` rule,
 nothing else.
 

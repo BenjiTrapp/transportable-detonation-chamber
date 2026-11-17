@@ -113,7 +113,19 @@ again when it is left.
   pipeline per call (one call per ~6000 characters of names). *Check:* time
   `POST /api/firewall/isolate` both ways; it must stay well under
   `RUN_TIMEOUT_S` (90 s). While it runs the button reads ISOLATING… / LEAVING…
-  and an info toast says why it takes a while.
+  and an info toast says why it takes a while. **Measured** on the Windows 11
+  ARM VM (135 local outbound Allow rules, 2026-11-17): **41.9 s on, 30.1 s
+  off**. That is the expected figure, not a hang: switching that many rules is
+  slow on Windows even in one pipeline per call.
+- **What is put back is what was configured.** The baseline is read from the
+  PersistentStore (`Configured` in `-Op Profiles`), the store
+  `SetDefaultOutbound` writes; the ActiveStore (what is in force) answers
+  whether ISOLATED holds. *Check:* with all three profiles `NotConfigured`
+  (`Get-NetFirewallProfile -PolicyStore PersistentStore | Select Name,
+  DefaultOutboundAction`), ISOLATED on records `outbound_before:
+  "NotConfigured"`, the ActiveStore shows `Block`, and after leaving the
+  PersistentStore shows `NotConfigured` again, not `Allow`. *If wrong:* the
+  host is left configured differently from how it was found.
 
 ### Processes and Sysmon
 
