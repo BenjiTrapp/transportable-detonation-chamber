@@ -73,10 +73,183 @@ ASK `Detonation`.
 Gathered from the reports of Tasks 1-9 and the final review. For each: what to
 check on the VM, and what breaks if the assumption is wrong. Most checks are
 one command in an elevated PowerShell on the VM. Run them in this order: the
-ISOLATED check, the curl and BITS decisions, blocking a running transfer, then
-the rest.
+panic cut, the ISOLATED check, the curl and BITS decisions, blocking a running
+transfer, then the rest.
 
-### ISOLATED really closes (first)
+### The panic cut (mandatory, first)
+
+The switch-on path of ISOLATED is now two stages, specified in
+`docs/superpowers/specs/2026-11-17-panic-cut-design.md`. A press writes **one**
+catch-all outbound Block rule, `TDC-FW-ISO-cut`, and returns with `stage: "cut"`
+after ~3.6 s (the old path, 135 rules switched off one by one, took 38.5 s). A
+background worker, `converge`, then does what ISOLATED always did, so that a
+per-fetch Allow exception is possible again: when `allowed_out` comes back empty
+the cut rule is dropped and the stage is `isolated`; when it does not (a group
+policy Allow rule), the cut rule stays and the stage is `cut_policy`.
+
+**These checks are mandatory, not optional.** The reason is one, and it holds for
+every item below: the fake PowerShell runner in the tests does not model WFP
+semantics. It cannot know that a Block rule beats an Allow rule, so **no test on
+macOS can prove that the cut works**. That same blindness let the original
+"default deny" ship while 135 Allow rules stayed enabled. What was measured on the
+VM before the design (below) is evidence for the design; it is not a check of
+what was built. Do all eight on the finished build.
+
+Measured on the Windows 11 ARM VM (135 local outbound Allow rules, 2026-11-17),
+for what to expect:
+
+| Measured | Result |
+|---|---|
+| One catch-all Block rule written and read back, one PowerShell call | 2.13 s (hand-written script), 2.49 s (the finished `Cut` verb) |
+| `Profiles` alone | 1.13 s |
+| The press end to end (profiles read first, then the cut) | ~3.6 s |
+| Repairing a rule of that name that was **disabled** | 5.92 s |
+| Repairing one **narrowed** to one program and address | 3.38 s |
+| With the cut standing: `curl https://1.1.1.1` | `http=000`, instantly |
+| With the cut standing: DNS | dead |
+| With the cut standing: `curl http://127.0.0.1:9000` | `http=200` (Windows does not filter loopback) |
+| After removing the cut | `http=301`, DNS back |
+| The old full ISOLATED cycle | 38.5 s on, 41.4 s off |
+
+The rows about the cut standing held **while all 135 Allow rules were still
+enabled**; that is the point of the design.
+
+1. **Time to `stage: "cut"`.** *Check:* time
+   `POST /api/firewall/isolate {"on": true}` from the request to the answer; the
+   answer carries `stage: "cut"`, `verified: true`, `converging: true`. It must be
+   **≤ 5 s**; expect ~3.6 s. Do it with the three profiles on and no
+   `TDC-FW-ISO-cut` present. *If wrong:* the button is not a panic button again.
+   Where it is slower, look at which of the two PowerShell calls it is (`Profiles`,
+   then `Cut`): the figures above are 1.13 s and 2.49 s. A repair of a falsified
+   rule (item 7) is slower by design and does not count here.
+2. **The egress is shut while the cut stands.** *Check:* right after the answer of
+   item 1, while `converging` is still `true` (the Allow rules are still mostly
+   enabled; that is what is being tested):
+   `Resolve-DnsName example.com -DnsOnly` fails;
+   `curl.exe -s -o NUL -m 5 -w "%{http_code}" https://1.1.1.1` prints `000` at
+   once, not after the timeout; `curl.exe -s -o NUL -w "%{http_code}"
+   http://127.0.0.1:9000` prints `200`. *If wrong:* the cut does not close, or
+   closes the UI as well. In the first case the band must not say closed:
+   `verified` is only "the cut rule was read back", so a rule that reads back and
+   does nothing is exactly what this check exists to catch. Repeat it once more in
+   `cut_policy` if the VM has a group-policy Allow rule: the cut stays and must
+   still close.
+3. **Time to `stage: "isolated"`, and the cut is gone by then.** *Check:* poll
+   `GET /api/firewall/isolate` after item 1 until `stage` is `isolated`; note the
+   time. At that moment `Get-NetFirewallRule -Name TDC-FW-ISO-cut` finds nothing,
+   `allowed_out` is `[]`, `converging` is `false`, DNS is still dead, and the
+   `Get-NetFirewallRule -PolicyStore ActiveStore -Direction Outbound -Action Allow
+   -Enabled True` check of the section below lists nothing. Run
+   `curl.exe -s -o NUL -m 2 -w "%{http_code}\n" https://1.1.1.1` in a loop from
+   before the press until after this stage: it must never print anything but
+   `000`, in particular not at the moment the cut rule falls (the Allow rules are
+   switched off and the default is Block *before* the cut is dropped). The old
+   path took 38.5 s; the design expects about 40 s for the whole convergence, a
+   figure of the design, **not measured on the finished code**: write down what you
+   see. *If it stays `cut`:* the worker failed and the band must say why (the cut
+   stands and the egress is shut, which is the safe side). *If it stays
+   `cut_policy`:* `allowed_out` names the rule and its store.
+4. **Leaving in the middle of the convergence.** *Check:* press ISOLATED on; 5-10 s
+   later, while `converging` is `true`, read `allow_disabled` in
+   `C:\DetonationChamberUI\firewall_state.json` (it is written before the first
+   switch is flipped, and may still be empty), then `POST /api/firewall/isolate
+   {"on": false}`. It must **not** wait for the whole convergence: the worker
+   stops between its PowerShell calls and the leave takes its normal path, so the
+   time is the running call plus a normal leave, not the convergence's remaining
+   time on top. Then **every rule named in `allow_disabled` is enabled again**
+   (compare with the list read before leaving, and with the section below's
+   count), `allow_disabled` is `[]`, no `TDC-FW-ISO-*` rule is left, `converging`
+   is `false` and does **not** turn `true` again afterwards (a worker that kept
+   running would switch the Allow rules off again behind the leave), and DNS
+   works. Do it at least twice, at different moments (also right after the press,
+   before the first rule is switched). *If wrong:* a leave that waits is a cut
+   that cannot be undone for forty seconds; a rule left off is the VM without DNS,
+   which is the failure the section below is about. No figure was measured for
+   this path: write down the time of the leave.
+5. **The round trip.** *Check:* before the press, record
+   `(Get-NetFirewallProfile -PolicyStore PersistentStore | Select Name,
+   DefaultOutboundAction)` and the names
+   `Get-NetFirewallRule -PolicyStore PersistentStore -Direction Outbound -Action Allow
+   -Enabled True | Sort Name | Select -Expand Name` (135 on this VM). On a VM where
+   the profiles are `NotConfigured`, ISOLATED records `outbound_before:
+   "NotConfigured"`. Press on, wait for `isolated`, press off, and record both
+   again: `DefaultOutboundAction` is back to the **configured** value, so
+   `NotConfigured` is `NotConfigured` and **not** `Allow`; the 135 names are
+   identical (`Compare-Object` prints nothing); `Get-NetFirewallRule -Name 'TDC-FW-*'`
+   finds nothing (on a VM with no rule blocked by hand). Do it again leaving
+   through `C:\tdc\scripts\tdc-unisolate.ps1`. *If wrong:* the host is left
+   configured differently from how it was found, which is the one property of this
+   feature that was proven on the VM and must not be lost.
+6. **A restart in stage `cut` changes nothing.** *Check:* press on and restart the
+   web UI (`make restart`, or stop the process) while `stage` is still `cut`, within
+   a few seconds. After the start: `GET /api/firewall/isolate` says `stage: "cut"`,
+   `TDC-FW-ISO-cut` is still standing, the marker in `firewall_state.json` is
+   **not** cleared, `allow_disabled` is as it was, the egress is still shut (item 2's
+   commands), and the convergence is **not** resumed by itself (`converging` stays
+   `false`; the analyst decides to leave or to press again). Then leaving restores
+   everything as in item 5. *If wrong:* the start treats "marker set, no profile on
+   Block" as stale, switches the Allow rules back on and clears the marker, with the
+   cut rule still standing: the state this design exists to avoid, and the one a
+   crash in this stage leaves.
+7. **The repair path.** *Check:* with ISOLATED off, make the rule wrong by hand,
+   then press, once for each shape:
+   - **Disabled:** `New-NetFirewallRule -Name TDC-FW-ISO-cut -DisplayName x
+     -Direction Outbound -Action Block -Enabled False`.
+   - **Narrowed:** `New-NetFirewallRule -Name TDC-FW-ISO-cut -DisplayName x
+     -Direction Outbound -Action Block -Program C:\Windows\System32\notepad.exe
+     -RemoteAddress 192.0.2.1` (a program and an address that do not include
+     `1.1.1.1`, so the egress is open before the press).
+
+   With the `curl` loop of item 3 running from before the press: the press ends
+   with `stage: "cut"`, `verified: true`, the rule is the catch-all
+   (`Get-NetFirewallRule -Name TDC-FW-ISO-cut | Get-NetFirewallApplicationFilter,
+   Get-NetFirewallAddressFilter`: `Program Any`, `RemoteAddress Any`, enabled,
+   `Profile Any`, `Block`, `Outbound`), and once the loop prints `000` it **never
+   prints anything else** again: the repair must not remove the rule and write a new
+   one (a gap with an open egress). Measured: **5.92 s** for the disabled rule,
+   **3.38 s** for the narrowed one, both ending with the egress shut. That is slower
+   than item 1 and is why the UI must not promise two seconds here. Leave
+   afterwards, and check that `TDC-FW-ISO-cut` is gone. *If wrong:* a falsified
+   cut rule is read as "cut", or repaired through a moment of open egress.
+8. **A profile switched off after a cut.** *Check:* press on; once `stage: "cut"`
+   (and again once `isolated`), switch one profile off with
+   `Set-NetFirewallProfile -Profile Public -Enabled False`. Nothing may read as
+   confirmed closed: `verified` is `false`; the skull button reads
+   `CUT · FIREWALL OFF` and is **disabled**, with the reason in its title; the
+   header switch shows the same state, not another one; and the red band offers
+   `LEAVE ISOLATED` next to `TURN THE FIREWALL ON`, and that button works
+   (it asks first, and gives the firewall back as found). Then switch the profile
+   on again and see the state read confirmed again. *If wrong:* a rule that stands
+   and reads back but does nothing is called closed (the same finding as the
+   loopback block), or the panic button turns into a "reopen the network?" dialog
+   in exactly the state where a reflexive yes throws the marker and the baseline
+   away.
+
+**To watch, not to assert: a deadline during a convergence.** Found in review, not
+yet seen on a VM. A decision deadline that falls due while `converge` is running
+stalls the sweep, and with it the collector, for tens of seconds. The deadline's
+per-program block waits on the rules module's lock, which the convergence holds
+across its PowerShell calls, and it waits inside `_fw_decision_lock`. A deadline
+shortly after a press nearly always coincides with the convergence that follows
+it, so in the cut this is the common case, not a corner case. A newly detected
+download (`_fw_open_decision`, which blocks the loader first and asks then) waits
+on the same lock in the same way. *What to look for:* press ISOLATED on during a
+detonation with ASK on `Detonation` (or All) and a short decision deadline, and let
+a decision open or fall due in the first minute. Watch for the LIVE list not
+advancing (the newest connection ages while the sample is active), `/connections`
+and `/pending` answering late, and the gap between a decision's `created_at` or
+deadline and its block's `BLOCK` line in LOGS. By reading the code,
+an analyst's answer to a decision takes `_fw_decision_lock` too, so a CUT ONLY or
+ALLOW pressed in that window may hang as well: that is an inference, look for it.
+Write down how long the stall lasts. It does not open anything (the cut stands and
+the egress stays shut); the cost is that the tab is blind for that time.
+
+### ISOLATED really closes
+
+The text below is the old description of the whole of ISOLATED, written before the
+panic cut. It still holds for the **end state** (stage `isolated`) and for the way
+back. Where it speaks of how ISOLATED is switched **on** (the number of PowerShell
+calls, how long switching takes), the panic cut above replaces it.
 
 `DefaultOutboundAction Block` stops only what **no** rule allows, and Windows
 ships enabled outbound Allow rules (Core Networking's DNS above all). ISOLATED
@@ -85,7 +258,8 @@ TDC's, records the names in `allow_disabled` of
 `C:\DetonationChamberUI\firewall_state.json`, and switches exactly those on
 again when it is left.
 
-- **Nothing but TDC's own rules is let out.** *Check:* turn ISOLATED on; then
+- **Nothing but TDC's own rules is let out.** *Check:* turn ISOLATED on and wait for
+  `stage: "isolated"`; then
   `Resolve-DnsName example.com -DnsOnly` fails, and
   `Get-NetFirewallRule -PolicyStore ActiveStore -Direction Outbound -Action Allow -Enabled True | Select Name, DisplayName, PolicyStoreSourceType`
   lists nothing, or only a `TDC-FW-ISO-fetch-*` rule while a fetch runs
@@ -107,7 +281,10 @@ again when it is left.
   command above shows `Local` for `CoreNet-DNS-Out-UDP`. *If wrong:* ISOLATED
   switches nothing off and the band lists every Windows rule as still open
   (honest, but not closed).
-- **How long switching takes.** ISOLATED on is four PowerShell calls (AllowOut,
+- **How long switching takes.** *Superseded for switching on:* a press now cuts in
+  ~3.6 s and the thorough work below runs in the background (see "The panic cut");
+  the figures here are those of the whole convergence and of leaving.
+  ISOLATED on was four PowerShell calls (AllowOut,
   DisableAllowOut, SetDefaultOutbound, AllowOut), off is three
   (SetDefaultOutbound, EnableAllowOut, RemoveIsolate); the rules go through one
   pipeline per call (one call per ~6000 characters of names). *Check:* time

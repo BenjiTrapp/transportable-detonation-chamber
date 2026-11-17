@@ -337,6 +337,19 @@ ist der schlimmste denkbare Fehler dieses Tabs. Also:
 - Nach jedem Setzen einer Regel wird gegengeprüft (`Get-NetFirewallRule`), und
   der Zustand `blocked` wird erst gesetzt, wenn die Regel wirklich steht.
 
+**Der Einschaltweg ist ersetzt.** Was hier und im Folgenden über das *Einschalten*
+von Isolated steht (jede Ausgangs-Allow-Regel einzeln abschalten, dann
+`DefaultOutboundAction Block`), gilt nicht mehr als Weg des Knopfdrucks; ihn
+ersetzt `docs/superpowers/specs/2026-11-17-panic-cut-design.md`. Dieser Weg
+brauchte auf der echten VM **38,5 s**, für einen Panikknopf unbrauchbar. Jetzt
+schreibt ein Druck **eine** Catch-all-Block-Regel (`TDC-FW-ISO-cut`) und kehrt nach
+etwa **3,6 s** zurück, denn in der Windows-Firewall schlägt eine Block-Regel jede
+Allow-Regel. Die gründliche Arbeit unten läuft danach im Hintergrund (`converge`)
+und endet in der hier beschriebenen Stufe `isolated`, oder, wenn `allowed_out`
+nicht leer wird, in `cut_policy` mit stehender Catch-all-Regel. Der Rest dieses
+Abschnitts gilt weiter, auch die Unterscheidung der zwei Stores und die
+Garantien des Zurückstellens.
+
 **Entscheidung — Isolated.** Ausnahmen, und nur diese:
 
 - **Loopback braucht keine.** Die Windows-Firewall filtert Loopback-Verkehr gar nicht, eine Allow-Regel dafür wäre also eine Behauptung über etwas, das ohnehin nicht blockiert werden kann. Und ihre IPv6-Hälfte ließ sich nicht einmal schreiben: Windows lehnt `::1` als Regeladresse ab („Es wurde eine nicht definierte Multicast-, Broadcast- oder Loopback-IPv6-Adresse angegeben") — der erste Lauf auf einer echten VM scheiterte an genau dieser Regel, bevor irgendetwas isoliert war. Sie ist entfallen.
