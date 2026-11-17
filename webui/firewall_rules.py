@@ -49,6 +49,13 @@ structural fix.
 The marker (``Settings.isolated``) alone says that TDC is isolating; the profiles are never used to infer it. A crash in
 between leaves the marker, and ``startup_state`` reports an isolation it finds and does **not** lift it.
 ``scripts/tdc-unisolate.ps1`` is the way out when the Web UI is not reachable; it reads ``allow_disabled`` too.
+
+The cut is the fast way to shut the egress: **one** outbound Block rule, ``TDC-FW-ISO-cut``, for every program and
+every address, written and read back by one call (``cut``). In Windows Firewall a Block rule beats every Allow rule, so
+the ~135 Allow rules that Windows ships need not be switched off one by one (that measured 38.5 s; the cut, 2 s).
+Loopback is in the rule's address set and that is harmless: Windows does not filter loopback, so the Web UI stays
+reachable. No Allow exception gets through the cut, **so there is no ``allow_fetch`` while it stands**. Its name
+starts ``TDC-FW-ISO-``, so ``RemoveIsolate`` and ``scripts/tdc-unisolate.ps1`` remove it with no cleanup path of its own.
 """
 
 from __future__ import annotations
@@ -73,6 +80,7 @@ ISOLATE_PREFIX = RULE_PREFIX + "ISO-"
 LOOPBACK_RULE = ISOLATE_PREFIX + "loopback"  # written by older versions: only removed now (see the module docstring)
 FETCHER_RULE = ISOLATE_PREFIX + "fetcher"     # the standing fetcher rule of older versions: only removed now
 FETCH_PREFIX = ISOLATE_PREFIX + "fetch-"      # one allow rule per fetch, for as long as that fetch lasts
+CUT_RULE = ISOLATE_PREFIX + "cut"             # the one catch-all outbound Block rule of the cut (see the module docstring)
 
 PROFILE_NAMES = ("Domain", "Private", "Public")
 OUTBOUND_ACTIONS = ("Allow", "Block", "NotConfigured")
@@ -526,6 +534,72 @@ def verify(run, rule_id: str) -> bool:
         return _standing_problem(view, _profiles(run)) is None
     except RuleError:
         return False
+
+
+# ---- the cut: one rule that shuts the egress -------------------------------------------------
+
+
+def _cut_problem(view: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Why a rule read back as ``CUT_RULE`` does not shut the egress, or None when it does: there, a Block, outbound for
+    every program and address, enabled, and covering all three profiles (the profiles were on when it was written)."""
+    if view is None:
+        return "the rule is not there after it was written"
+    if not _matches(view, _spec(CUT_RULE, "Block")):
+        return "the rule is there, but it is not a block for every program and address"
+    if not view["enabled"]:
+        return "the rule is there, but it is disabled"
+    uncovered = [n for n in PROFILE_NAMES if n not in view["profiles"]]
+    if uncovered:
+        return f"the rule is there, but it does not cover: {', '.join(uncovered)}"
+    return None
+
+
+def cut(run) -> Dict[str, Any]:
+    """Shut the egress with one outbound Block rule for everything, and read it back, in **one** PowerShell call.
+
+    ``Cut`` checks the profiles, writes ``CUT_RULE`` when it is not there and gives the rule as ``Get`` does; one call
+    instead of three because loading the NetSecurity module is 1-2 s of every call. A rule that already stands is left
+    alone and read back like a new one. Returns ``{rule_id, verified, problem, profiles_off}``: ``verified`` is True
+    only when the rule was read back and ``problem`` is None; ``profiles_off`` is always empty (a profile that is off
+    is a ``ProfileOffError`` and nothing is written). Raises ``RuleError`` when the call fails or its answer cannot be read.
+    """
+    with _LOCK:
+        rc, out, err = _ps(run, "Cut")
+        if rc == EXIT_PROFILE_OFF:
+            raise ProfileOffError(_off_text(_first_line(err)))
+        if rc != 0:
+            raise RuleError(f"could not write {CUT_RULE} ({rc}): {_first_line(err) or _first_line(out) or 'no message'}")
+        view = None
+        if out.strip():
+            data = _json(out, CUT_RULE)
+            if isinstance(data, list):
+                data = data[0] if data else None
+            view = _view(data) if isinstance(data, dict) else None
+        problem = _cut_problem(view)
+    return {"rule_id": CUT_RULE, "verified": problem is None, "problem": problem, "profiles_off": []}
+
+
+def uncut(run) -> Dict[str, Any]:
+    """Remove ``CUT_RULE`` and read it back: ``{removed, problem}``. ``removed`` is True only when the rule is read as
+    gone (a rule that was never there is gone too); a failure is told in ``problem`` and never raised, because the way
+    out must be able to say what it could not do. Never refused for a profile that is off."""
+    with _LOCK:
+        try:
+            _ok(run, "Remove", Name=CUT_RULE)
+            if _describe(run, CUT_RULE) is not None:      # Remove is quiet about a rule it did not remove
+                return {"removed": False, "problem": f"{CUT_RULE} is still there after it was removed"}
+        except RuleError as e:
+            return {"removed": False, "problem": _first_line(e)}
+    return {"removed": True, "problem": None}
+
+
+def cut_stands(run) -> Optional[bool]:
+    """Whether the cut shuts the egress now: ``CUT_RULE`` read from the firewall and holding up (``_cut_problem``).
+    True or False; ``None`` when it cannot be read, so that "cannot tell" is never taken for either answer."""
+    try:
+        return _cut_problem(_describe(run, CUT_RULE)) is None
+    except RuleError:
+        return None
 
 
 # ---- the way out of ISOLATED, one fetch at a time --------------------------------------------

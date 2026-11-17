@@ -29,6 +29,11 @@
 #                       "missing": [...]} says what happened to each. All of them go through one pipeline; a rule
 #                       the pipeline did not change is tried once more on its own, for its own error.
 #   RemoveIsolate       remove every rule named TDC-FW-ISO-*: {"removed": [...], "still": [...]}, read back
+#   Cut                 the panic cut: one outbound Block rule for every program and address, named TDC-FW-ISO-cut,
+#                       written if it is not there, then read back as Get gives it. Takes no parameter. Exit 3: a profile
+#                       is off (nothing is written). There is no exit 4: a rule that already stands is the wanted result.
+#                       It is one verb where profile check, write and read back could be three calls, because loading the
+#                       NetSecurity module costs 1-2 s per call and the cut has to stand in 3 s or less.
 #
 # Exit codes: 0 done, 1 failed (the first line of stderr says why), 3 a profile is off, 4 the rule exists.
 # Rules are only ever named TDC-FW-<letters, digits, hyphens>; a name with a wildcard or a trailing newline is refused.
@@ -36,7 +41,7 @@
 param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('Profiles', 'Enable', 'List', 'Get', 'Create', 'Remove', 'SetDefaultOutbound', 'AllowOut',
-                 'DisableAllowOut', 'EnableAllowOut', 'RemoveIsolate')]
+                 'DisableAllowOut', 'EnableAllowOut', 'RemoveIsolate', 'Cut')]
     [string]$Op,
     [string]$Names,
     [string]$Name,
@@ -243,6 +248,19 @@ try {
             if ($RemotePort) { $splat['RemotePort'] = $RemotePort }
             if ($Protocol) { $splat['Protocol'] = $Protocol }
             New-NetFirewallRule @splat | Out-Null
+        }
+        'Cut' {
+            $cut = 'TDC-FW-ISO-cut'
+            Assert-OurName $cut
+            $off = @((Get-ProfileStates) | Where-Object { -not $_.Enabled } | ForEach-Object { $_.Name })
+            if ($off.Count -gt 0) {
+                [Console]::Error.WriteLine($off -join ', ')
+                exit 3
+            }
+            if (-not (Get-NetFirewallRule -Name $cut -ErrorAction SilentlyContinue)) {
+                New-NetFirewallRule -Name $cut -DisplayName $cut -Direction Outbound -Action Block -Enabled True -Profile Any | Out-Null
+            }
+            ConvertTo-Json -Compress -Depth 4 -InputObject (Get-RuleView $cut)
         }
         'Remove' {
             Assert-OurName $Name

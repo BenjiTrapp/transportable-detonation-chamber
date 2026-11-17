@@ -126,6 +126,15 @@ class FakeRun:
             RemotePort=[p["RemotePort"]] if "RemotePort" in p else ["Any"], Protocol=p.get("Protocol", "Any"))
         return 0, "", ""
 
+    def op_Cut(self, p):
+        """The whole verb in one call: profiles checked, the rule written if it is not there, its view given as ``Get`` gives it."""
+        assert set(p) == {"Op"}, p          # the verb takes no parameters: nothing of it can come from outside
+        if self.off():
+            return 3, "", ", ".join(self.off())
+        if rules_mod.CUT_RULE not in self.rules:
+            self.rules[rules_mod.CUT_RULE] = self.view(rules_mod.CUT_RULE, Action="Block", Enabled=not self.disable_new)
+        return self.op_Get({"Name": rules_mod.CUT_RULE})
+
     def op_Remove(self, p):
         self.rules.pop(p["Name"], None)
         return 0, "", ""
@@ -315,9 +324,11 @@ def test_the_ops_the_module_emits_are_the_ops_the_script_accepts():
     rules_mod.enable_firewall(run)
     rules_mod.isolate(run, True, settings=settings)
     rules_mod.isolate(run, False, settings=settings)
+    rules_mod.cut(run)
+    rules_mod.uncut(run)
     assert set(run.ops()) <= allowed
     assert set(run.ops()) == {"Create", "Get", "Remove", "List", "Enable", "Profiles", "SetDefaultOutbound", "AllowOut",
-                              "DisableAllowOut", "EnableAllowOut", "RemoveIsolate"}
+                              "DisableAllowOut", "EnableAllowOut", "RemoveIsolate", "Cut"}
 
 
 @pytest.mark.parametrize("image", ["", "-Foo", "C:\\x\\a\nb.exe", "C:\\x\\a\x00.exe", "x" * 5000])
@@ -1584,3 +1595,132 @@ def test_the_script_reads_the_configured_value_where_it_writes_it():
     assert "Get-NetFirewallProfile -PolicyStore PersistentStore" in states and "Get-NetFirewallProfile -PolicyStore ActiveStore" in states
     assert "Configured = " in states
     assert "Set-NetFirewallProfile -PolicyStore PersistentStore -Profile" in text
+
+
+# ---- the cut: one catch-all outbound Block rule, written and read back in one call -----------
+
+
+def test_the_cut_is_one_call_that_writes_and_reads_back():
+    run = FakeRun()
+    done = rules_mod.cut(run)
+    assert done == {"rule_id": "TDC-FW-ISO-cut", "verified": True, "problem": None, "profiles_off": []}
+    assert run.ops() == ["Cut"]          # one PowerShell call, not four
+
+
+def test_the_cut_rule_is_outbound_block_for_every_program_and_address():
+    run = FakeRun()
+    rules_mod.cut(run)
+    view = run.rules["TDC-FW-ISO-cut"]
+    assert (view["Direction"], view["Action"], view["Enabled"]) == ("Outbound", "Block", True)
+    assert (view["Program"], view["RemoteAddress"], view["Protocol"]) == ("Any", ["Any"], "Any")
+
+
+def test_the_cut_refuses_while_a_profile_is_off_and_writes_nothing():
+    run = FakeRun(profiles={"Domain": True, "Private": False, "Public": True})
+    with pytest.raises(rules_mod.ProfileOffError) as e:
+        rules_mod.cut(run)
+    assert "Private" in str(e.value)
+    assert run.rules == {}
+
+
+def test_a_cut_rule_that_does_not_read_back_enabled_is_not_verified():
+    run = FakeRun(disable_new=True)
+    done = rules_mod.cut(run)
+    assert done["verified"] is False and "disabled" in done["problem"]
+
+
+def test_a_cut_rule_that_is_not_there_when_read_back_is_not_verified():
+    run = FakeRun(get_rule_returns="")
+    done = rules_mod.cut(run)
+    assert done["verified"] is False and "not there" in done["problem"]
+
+
+def test_a_cut_rule_that_reads_back_as_something_else_is_not_verified():
+    run = FakeRun(rule_list=["TDC-FW-ISO-cut"])        # a stand-in that blocks one program, not everything
+    run.rules["TDC-FW-ISO-cut"]["Program"] = IMAGE
+    done = rules_mod.cut(run)
+    assert done["verified"] is False and "every program and address" in done["problem"]
+
+
+def test_a_cut_rule_that_covers_only_some_profiles_is_not_verified():
+    run = FakeRun(rule_list=["TDC-FW-ISO-cut"])
+    run.rules["TDC-FW-ISO-cut"]["Profile"] = "Domain, Private"
+    done = rules_mod.cut(run)
+    assert done["verified"] is False and "Public" in done["problem"]
+
+
+def test_cutting_twice_leaves_one_rule_and_stays_verified():
+    run = FakeRun()
+    rules_mod.cut(run)
+    done = rules_mod.cut(run)
+    assert done["verified"] is True
+    assert [n for n in run.rules] == ["TDC-FW-ISO-cut"]
+
+
+@pytest.mark.parametrize("fail", [{"Cut": (1, "access is denied")}, {"Cut": (4, "")}, {"Cut": (127, "no powershell")}])
+def test_a_cut_that_fails_raises_and_claims_nothing(fail):
+    with pytest.raises(rules_mod.RuleError) as e:
+        rules_mod.cut(FakeRun(fail=fail))
+    assert not isinstance(e.value, rules_mod.ProfileOffError)
+
+
+def test_a_cut_whose_answer_cannot_be_read_raises():
+    with pytest.raises(rules_mod.RuleError):
+        rules_mod.cut(FakeRun(get_rule_returns="not json"))
+
+
+def test_the_cut_takes_no_parameter_from_outside():
+    run = FakeRun()
+    rules_mod.cut(run)
+    call = run.calls[0]
+    assert call[call.index("-File") + 2:] == ["-Op", "Cut"]
+    assert "-Command" not in call
+
+
+def test_uncut_removes_it_and_says_so():
+    run = FakeRun()
+    rules_mod.cut(run)
+    assert rules_mod.uncut(run) == {"removed": True, "problem": None}
+    assert run.rules == {}
+
+
+def test_uncut_without_a_rule_is_not_an_error():
+    assert rules_mod.uncut(FakeRun()) == {"removed": True, "problem": None}
+
+
+def test_uncut_says_when_the_rule_is_still_there():
+    run = FakeRun()
+    rules_mod.cut(run)
+    run.op_Remove = lambda p: (0, "", "")              # Remove is quiet about a rule it did not remove
+    done = rules_mod.uncut(run)
+    assert done["removed"] is False and "still there" in done["problem"]
+
+
+def test_uncut_that_fails_says_so_instead_of_raising():
+    run = FakeRun(fail={"Remove": (1, "access is denied")})
+    done = rules_mod.uncut(run)
+    assert done["removed"] is False and "access is denied" in done["problem"]
+
+
+def test_cut_stands_reads_the_rule_and_fails_closed():
+    run = FakeRun()
+    assert rules_mod.cut_stands(run) is False
+    rules_mod.cut(run)
+    assert rules_mod.cut_stands(run) is True
+    assert rules_mod.cut_stands(FakeRun(fail={"Get": (1, "no")})) is None
+
+
+def test_a_disabled_cut_rule_does_not_stand():
+    run = FakeRun(disable_new=True)
+    rules_mod.cut(run)
+    assert rules_mod.cut_stands(run) is False
+
+
+def test_the_cut_branch_of_the_script_names_no_parameter_and_one_rule():
+    text = open(os.path.join(ROOT, "webui", "firewall_rules.ps1"), encoding="utf-8").read()
+    branch = text[text.index("'Cut' {"):]
+    branch = branch[:branch.index("\n        }\n")]
+    assert "TDC-FW-ISO-cut" in branch and "Assert-OurName" in branch
+    assert "exit 3" in branch and "exit 4" not in branch
+    assert "Get-ProfileStates" in branch and "Get-RuleView" in branch
+    assert not re.search(r"\$(Name|Program|RemoteAddress|RemotePort|Protocol|Action)\b", branch)
