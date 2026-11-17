@@ -559,7 +559,8 @@ def cut(run) -> Dict[str, Any]:
 
     ``Cut`` checks the profiles, writes ``CUT_RULE`` when it is not there and gives the rule as ``Get`` does; one call
     instead of three because loading the NetSecurity module is 1-2 s of every call. A rule that already stands is left
-    alone and read back like a new one. Returns ``{rule_id, verified, problem, profiles_off}``: ``verified`` is True
+    alone; one that is there disabled or narrower is brought to the catch-all shape in place (never removed, so there is no
+    moment without it) by the same call. Either way it is read back. Returns ``{rule_id, verified, problem, profiles_off}``: ``verified`` is True
     only when the rule was read back and ``problem`` is None; ``profiles_off`` is always empty (a profile that is off
     is a ``ProfileOffError`` and nothing is written). Raises ``RuleError`` when the call fails or its answer cannot be read.
     """
@@ -576,6 +577,8 @@ def cut(run) -> Dict[str, Any]:
                 data = data[0] if data else None
             view = _view(data) if isinstance(data, dict) else None
         problem = _cut_problem(view)
+        if problem and _first_line(err):
+            problem += f" (repair: {_first_line(err)})"
     return {"rule_id": CUT_RULE, "verified": problem is None, "problem": problem, "profiles_off": []}
 
 

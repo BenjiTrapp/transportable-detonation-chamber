@@ -30,8 +30,11 @@
 #                       the pipeline did not change is tried once more on its own, for its own error.
 #   RemoveIsolate       remove every rule named TDC-FW-ISO-*: {"removed": [...], "still": [...]}, read back
 #   Cut                 the panic cut: one outbound Block rule for every program and address, named TDC-FW-ISO-cut,
-#                       written if it is not there, then read back as Get gives it. Takes no parameter. Exit 3: a profile
-#                       is off (nothing is written). There is no exit 4: a rule that already stands is the wanted result.
+#                       written if it is not there, brought to that shape in place (Set-NetFirewallRule, never removed
+#                       and written again: that would open the egress for a moment) if it is there disabled or narrower,
+#                       then read back as Get gives it. Takes no parameter. Exit 3: a profile is off (nothing is written).
+#                       There is no exit 4: a rule that already stands is the wanted result. A repair that fails is
+#                       said on stderr with exit 0; the view that follows is what the caller judges.
 #                       It is one verb where profile check, write and read back could be three calls, because loading the
 #                       NetSecurity module costs 1-2 s per call and the cut has to stand in 3 s or less.
 #
@@ -105,6 +108,17 @@ function Get-RuleView {
         RemotePort = @($port.RemotePort | ForEach-Object { [string]$_ })
         Protocol = [string]$port.Protocol
     }
+}
+
+# The catch-all block of the cut, as Get-RuleView shows it: an enabled outbound Block rule for every program, address,
+# port and protocol, on every profile.
+function Test-CutShape {
+    param($View)
+    if (-not $View) { return $false }
+    return [bool]($View.Enabled -and $View.Action -eq 'Block' -and $View.Direction -eq 'Outbound' -and
+        $View.Profile -eq 'Any' -and $View.Program -eq 'Any' -and $View.Protocol -eq 'Any' -and
+        @($View.RemoteAddress).Count -eq 1 -and @($View.RemoteAddress)[0] -eq 'Any' -and
+        @($View.RemotePort).Count -eq 1 -and @($View.RemotePort)[0] -eq 'Any')
 }
 
 function Get-ProfileList {
@@ -257,10 +271,27 @@ try {
                 [Console]::Error.WriteLine($off -join ', ')
                 exit 3
             }
-            if (-not (Get-NetFirewallRule -Name $cut -ErrorAction SilentlyContinue)) {
+            $view = Get-RuleView $cut
+            if (-not $view) {
                 New-NetFirewallRule -Name $cut -DisplayName $cut -Direction Outbound -Action Block -Enabled True -Profile Any | Out-Null
+                $view = Get-RuleView $cut
+            } elseif (-not (Test-CutShape $view)) {
+                # A rule of this name that is disabled or narrower than the catch-all (a crash, an older version, a sample
+                # with admin rights) is brought to the wanted shape in place: Set-NetFirewallRule changes the rule under its
+                # own name, so there is never a moment without it. Remove and New would open the egress in between.
+                # A repair that fails is said on stderr, and the view below is what the caller judges.
+                try {
+                    $want = @{
+                        Name = $cut; Direction = 'Outbound'; Action = 'Block'; Enabled = 'True'; Profile = 'Any'
+                        Program = 'Any'; RemoteAddress = 'Any'; RemotePort = 'Any'; Protocol = 'Any'
+                    }
+                    Set-NetFirewallRule @want
+                } catch {
+                    [Console]::Error.WriteLine($_.Exception.Message)
+                }
+                $view = Get-RuleView $cut
             }
-            ConvertTo-Json -Compress -Depth 4 -InputObject (Get-RuleView $cut)
+            ConvertTo-Json -Compress -Depth 4 -InputObject $view
         }
         'Remove' {
             Assert-OurName $Name

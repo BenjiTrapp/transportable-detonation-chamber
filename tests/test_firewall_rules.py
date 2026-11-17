@@ -32,7 +32,7 @@ class FakeRun:
     """
 
     def __init__(self, profiles=None, outbound="Allow", rule_list=None, get_rule_returns=None, fail=None,
-                 fail_once=None, disable_new=False, timeline=None, foreign=None, stubborn=()):
+                 fail_once=None, disable_new=False, timeline=None, foreign=None, stubborn=(), repair_fails=False):
         self.calls = []
         self.timeline = timeline if timeline is not None else []
         self.profiles = dict(profiles or ALL_ON)
@@ -45,6 +45,7 @@ class FakeRun:
         self.fail = fail or {}
         self.fail_once = dict(fail_once or {})
         self.disable_new = disable_new
+        self.repair_fails = repair_fails   # Set-NetFirewallRule on the cut rule errors and changes nothing
         self.standing = []          # (name, action, program) of every rule, after each call
         # Windows' own outbound Allow rules: name -> {DisplayName, Group, Source, Enabled}; ``stubborn`` will not switch
         self.foreign = {n: dict(r) for n, r in (foreign or {}).items()}
@@ -126,14 +127,25 @@ class FakeRun:
             RemotePort=[p["RemotePort"]] if "RemotePort" in p else ["Any"], Protocol=p.get("Protocol", "Any"))
         return 0, "", ""
 
+    CATCH_ALL = {"Enabled": True, "Action": "Block", "Direction": "Outbound", "Profile": "Any", "Program": "Any",
+                 "RemoteAddress": ["Any"], "RemotePort": ["Any"], "Protocol": "Any"}
+
     def op_Cut(self, p):
-        """The whole verb in one call: profiles checked, the rule written if it is not there, its view given as ``Get`` gives it."""
-        assert set(p) == {"Op"}, p          # the verb takes no parameters: nothing of it can come from outside
+        """The whole verb in one call: profiles checked, the rule written if it is not there, brought to the catch-all
+        shape *in place* if it is there in another (Set-NetFirewallRule: the rule is never absent), its view given as ``Get`` does."""
+        assert set(p) == {"Op"}, p          # the verb takes no parameter: nothing of it can come from outside
         if self.off():
             return 3, "", ", ".join(self.off())
+        err = ""
         if rules_mod.CUT_RULE not in self.rules:
             self.rules[rules_mod.CUT_RULE] = self.view(rules_mod.CUT_RULE, Action="Block", Enabled=not self.disable_new)
-        return self.op_Get({"Name": rules_mod.CUT_RULE})
+        elif any(self.rules[rules_mod.CUT_RULE].get(k) != v for k, v in self.CATCH_ALL.items()):
+            if self.repair_fails:
+                err = "Set-NetFirewallRule: access is denied"
+            else:
+                self.rules[rules_mod.CUT_RULE].update(self.CATCH_ALL)
+        rc, out, _ = self.op_Get({"Name": rules_mod.CUT_RULE})
+        return rc, out, err
 
     def op_Remove(self, p):
         self.rules.pop(p["Name"], None)
@@ -1636,14 +1648,14 @@ def test_a_cut_rule_that_is_not_there_when_read_back_is_not_verified():
 
 
 def test_a_cut_rule_that_reads_back_as_something_else_is_not_verified():
-    run = FakeRun(rule_list=["TDC-FW-ISO-cut"])        # a stand-in that blocks one program, not everything
+    run = FakeRun(rule_list=["TDC-FW-ISO-cut"], repair_fails=True)   # blocks one program, not everything
     run.rules["TDC-FW-ISO-cut"]["Program"] = IMAGE
     done = rules_mod.cut(run)
     assert done["verified"] is False and "every program and address" in done["problem"]
 
 
 def test_a_cut_rule_that_covers_only_some_profiles_is_not_verified():
-    run = FakeRun(rule_list=["TDC-FW-ISO-cut"])
+    run = FakeRun(rule_list=["TDC-FW-ISO-cut"], repair_fails=True)
     run.rules["TDC-FW-ISO-cut"]["Profile"] = "Domain, Private"
     done = rules_mod.cut(run)
     assert done["verified"] is False and "Public" in done["problem"]
@@ -1724,3 +1736,90 @@ def test_the_cut_branch_of_the_script_names_no_parameter_and_one_rule():
     assert "exit 3" in branch and "exit 4" not in branch
     assert "Get-ProfileStates" in branch and "Get-RuleView" in branch
     assert not re.search(r"\$(Name|Program|RemoteAddress|RemotePort|Protocol|Action)\b", branch)
+
+
+# ---- the cut repairs a rule of its name that is not the catch-all, in place and in the same call ----
+
+
+class WatchedRules(dict):
+    """The rules of a FakeRun, noting every moment a rule is taken away: a gap in the egress block."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.removed = []
+
+    def pop(self, key, *default):
+        self.removed.append(key)
+        return super().pop(key, *default)
+
+    def __delitem__(self, key):
+        self.removed.append(key)
+        super().__delitem__(key)
+
+
+def _standing_cut(**changes):
+    run = FakeRun(rule_list=["TDC-FW-ISO-cut"])
+    run.rules["TDC-FW-ISO-cut"].update(changes)
+    run.rules = WatchedRules(run.rules)
+    return run
+
+
+def test_a_disabled_cut_rule_is_enabled_again_by_the_cut():
+    run = _standing_cut(Enabled=False)
+    assert rules_mod.cut_stands(run) is False
+    run.calls.clear()
+    done = rules_mod.cut(run)
+    assert done == {"rule_id": "TDC-FW-ISO-cut", "verified": True, "problem": None, "profiles_off": []}
+    assert run.rules["TDC-FW-ISO-cut"]["Enabled"] is True
+    assert run.ops() == ["Cut"]                        # the repair is in the same single call
+
+
+@pytest.mark.parametrize("changes", [
+    {"Program": IMAGE},
+    {"RemoteAddress": ["1.2.3.4"]},
+    {"RemotePort": ["443"], "Protocol": "TCP"},
+    {"Action": "Allow"},
+    {"Direction": "Inbound"},
+    {"Profile": "Domain, Private"},
+])
+def test_a_cut_rule_with_other_parameters_is_brought_to_the_catch_all_shape(changes):
+    run = _standing_cut(**changes)
+    done = rules_mod.cut(run)
+    assert done["verified"] is True and done["problem"] is None
+    view = run.rules["TDC-FW-ISO-cut"]
+    assert (view["Direction"], view["Action"], view["Enabled"], view["Profile"]) == ("Outbound", "Block", True, "Any")
+    assert (view["Program"], view["RemoteAddress"], view["RemotePort"], view["Protocol"]) == ("Any", ["Any"], ["Any"], "Any")
+    assert rules_mod.cut_stands(run) is True
+
+
+def test_the_repair_never_leaves_a_moment_without_the_rule():
+    run = _standing_cut(Enabled=False, Program=IMAGE)
+    rules_mod.cut(run)
+    assert run.rules.removed == []
+    assert all(any(n == "TDC-FW-ISO-cut" for n, _, _ in snapshot) for snapshot in run.standing)
+
+
+def test_the_cut_branch_of_the_script_repairs_in_place_and_never_removes():
+    text = open(os.path.join(ROOT, "webui", "firewall_rules.ps1"), encoding="utf-8").read()
+    branch = text[text.index("'Cut' {"):]
+    branch = branch[:branch.index("\n        }\n")]
+    assert "Set-NetFirewallRule @want" in branch and "Name = $cut" in branch
+    assert "Remove-NetFirewallRule" not in branch and "Remove-IsolateRules" not in branch
+
+
+def test_a_repair_that_does_not_take_still_says_verified_false_and_why():
+    run = _standing_cut(Enabled=False)
+    run.repair_fails = True
+    done = rules_mod.cut(run)
+    assert done["verified"] is False
+    assert "disabled" in done["problem"] and "access is denied" in done["problem"]
+    assert rules_mod.cut_stands(run) is False
+
+
+def test_a_cut_rule_that_stands_is_not_touched_again():
+    run = FakeRun()
+    rules_mod.cut(run)
+    before = dict(run.rules["TDC-FW-ISO-cut"])
+    run.repair_fails = True                            # would show as a problem if a repair were attempted
+    done = rules_mod.cut(run)
+    assert done["verified"] is True and run.rules["TDC-FW-ISO-cut"] == before
