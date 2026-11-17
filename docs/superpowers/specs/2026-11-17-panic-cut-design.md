@@ -55,25 +55,43 @@ gründliche Arbeit danach nach.
 
 ## Ziele
 
-1. Von einem Knopfdruck bis „nichts geht mehr raus" **in etwa dreieinhalb
-   Sekunden** (Obergrenze für den Test: 5 s), und zwar nachweisbar — die Regel
-   wird zurückgelesen, DNS stirbt.
+1. Von einem Knopfdruck bis „nichts geht mehr raus" **in einstelligen Sekunden**
+   (gemessen 8,8 s; Obergrenze für den Test: 12 s), und zwar nachweisbar — die
+   Regel wird zurückgelesen, DNS stirbt.
 
-   *Korrektur nach der Messung am fertigen Verb:* der Entwurf rechnete mit
-   2,13 s, weil er eine einzige PowerShell-Runde annahm. Es sind zwei: der
-   Rückweg (`outbound_before`, Marker) muss **vor** jeder Änderung gemerkt
-   werden, und sein Wert kommt aus einem Profil-Lesen (1,13 s) vor dem Schnitt
-   (2,49 s gemessen). Die Alternative — zuerst schneiden, dann merken — wäre
-   schneller und ist **verworfen**: sie erlaubt eine stehende Catch-all-Regel
-   ohne Marker, also eine abgesperrte VM ohne Aufzeichnung des Rückwegs, und die
-   Glaubwürdigkeit dieses Features hängt an „die Firewall kommt exakt zurück".
-   Gegen 38,5 s ist der Unterschied zwischen 2 s und 3,6 s nicht der zwischen
-   Panikknopf und keinem.
+   *Zweite Korrektur, nach der Messung am fertigen Weg.* Der Entwurf rechnete
+   erst mit 2,13 s, dann mit 3,6 s. Beides war aus der **günstigsten** Messung
+   hergeleitet. Ein einzelner PowerShell-Start gegen das NetSecurity-Modul
+   kostet auf dieser VM **2,1–3,5 s, je nach Last** (`Profiles` 1,13 s im
+   leeren Moment, 2,10 s unter Last; `Cut` 2,49 s bzw. 3,12 s; `List` 3,49 s).
+   Der Druck braucht davon zwei — der Rückweg wird vor jeder Änderung gemerkt,
+   und sein Wert kommt aus dem Profil-Lesen — plus einen dritten für den
+   Zustand in der Antwort. Macht gemessen **8,8 s**.
+
+   | Weg | gemessen |
+   |---|---|
+   | Druck, ohne laufende Konvergenz | **8,8 s** |
+   | Druck, **während** die Konvergenz läuft | 21,4 s (siehe unten) |
+   | Konvergenz bis `stage: isolated` | 59,3 s |
+   | Verlassen aus `cut` (eine Regel, ein Default) | wenige Sekunden |
+   | Verlassen aus `isolated` (135 Regeln zurück) | 57,5 s |
+   | `GET /isolate`, warm | 0,01–0,15 s |
+   | Das alte ISOLATED, zum Vergleich | **38,5 s** |
+
+   Gegen 38,5 s bleibt der Punkt bestehen: ein Knopfdruck schließt in
+   einstelligen Sekunden statt in einer halben Minute. Aber die Oberfläche
+   verspricht keine Zahl, die die Maschine nicht hält, und dieses Dokument
+   nennt nur noch gemessene Werte.
 
    Steht eine **verfälschte** Regel und muss repariert werden, dauert der
    Schnitt länger (gemessen 5,92 s für eine deaktivierte, 3,38 s für eine
-   verengte Regel). Die Oberfläche darf in diesem Fall keine zwei Sekunden
-   behaupten.
+   verengte Regel, im leeren Moment). Die Oberfläche darf in diesem Fall keine
+   festen Sekunden behaupten.
+
+   **Verlassen ist aus dem Schnitt schnell und aus `isolated` langsam**, und das
+   ist kein Fehler: aus `cut` fällt eine Regel und ein Default geht zurück, aus
+   `isolated` müssen 135 Regeln wieder an. Der Knopf sagt `LEAVING…`, solange es
+   läuft.
 2. Ein großer, unübersehbarer Knopf an der Stelle, auf die der Nutzer gezeigt
    hat: in der rechten Spalte unter SUMMARY, in der Bildsprache des
    `UPDATE ALL`-Skull-Knopfes.
@@ -307,6 +325,14 @@ Welche Form Marke und Warten bekommen (der vorhandene Lock der Sweep-Schleife
 oder ein eigener), ist dem Builder überlassen, solange nachweislich nie zwei
 Läufe gleichzeitig laufen und die Marke zwischen *jedem* Paar von Aufrufen
 gesehen wird.
+
+**Auch zwischen den Teilen eines gestückelten Schritts.** `DisableAllowOut`
+schaltet die 135 Regeln in Blöcken ab; ohne eine Prüfung *zwischen* den Blöcken
+wartet ein Druck oder ein Verlassen den ganzen Schritt ab. Auf der VM gemessen:
+ein zweiter Druck während der Konvergenz brauchte **21,4 s**, gegen 8,8 s ohne
+laufende Konvergenz. Damit wäre die Begründung dafür, dass der Schnitt keine
+Rückfrage stellt, hinfällig — sie lautet „ein Fehldruck ist in Sekunden
+rückgängig zu machen". Die Marke wird deshalb auch zwischen den Blöcken geprüft.
 
 ### Neustart, Absturz, Notausgang
 
