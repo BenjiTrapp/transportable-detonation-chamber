@@ -1033,9 +1033,9 @@ def isolate(run, on: bool, *, settings) -> Dict[str, Any]:
     that a crash left standing (it says so in ``note``), and if the egress is nonetheless shut ``note`` says that TDC
     is not the one isolating and names the hatch.
     Returns ``{"isolated": False, "changed", "assumed_allow", "cut_removed", "outbound_after", "allow_disabled",
-    "note"}``, and ``profiles_off`` as read back when it changed something. ``cut_removed`` is True when the cut rule was
-    among what was removed (in stage ``isolated`` it is not there any more). Both directions give ``profiles_off`` so that the
-    caller need not read the profiles once more.
+    "note"}``, and ``profiles_off`` as read back when it changed something. ``cut_removed`` is True when the cut rule
+    was among what was removed (in stage ``isolated`` it is not there any more). Both directions give ``profiles_off``
+    so that the caller need not read the profiles once more.
     """
     with _LOCK:
         return _isolate_on(run, settings) if on else _isolate_off(run, settings)
@@ -1267,23 +1267,22 @@ def _not_isolating(run, settings) -> Dict[str, Any]:
         current: Optional[Dict[str, str]] = {s["name"]: s["outbound"] for s in _profiles(run)}
     except RuleError:
         current = None
-    note = None
+    changed = cut_removed or len(stuck) < len(leftover)
+    shut = ", ".join(n for n in PROFILE_NAMES if current and current[n] == "Block")
+    parts: List[Optional[str]] = []
     if cut_removed:
-        note = f"{CUT_RULE} was standing without a marker (a crash left it); it was removed."
+        parts.append(f"{CUT_RULE} was standing without a marker (a crash left it); it was removed.")
     elif cut_problem:
-        note = (f"{CUT_RULE} may be standing without a marker and could not be removed ({cut_problem}); "
-                f"run {UNISOLATE_SCRIPT} on the VM.")
-    if current and "Block" in current.values():
-        shut = ", ".join(n for n in PROFILE_NAMES if current[n] == "Block")
-        if cut_removed:
-            note = _join(note, f"Outbound is still blocked on {shut}, and TDC is not isolating (there is no marker). "
-                               f"If that is not wanted, run {UNISOLATE_SCRIPT} on the VM.")
-        else:
-            note = _join(note, f"TDC is not isolating (there is no marker), so nothing was changed, but outbound is "
-                               f"blocked on {shut}. If that is not wanted, run {UNISOLATE_SCRIPT} on the VM.")
-    return {"isolated": False, "changed": cut_removed or len(stuck) < len(leftover), "assumed_allow": False,
-            "cut_removed": cut_removed, "outbound_after": current, "allow_disabled": stuck,
-            "note": _join(note, _stuck_text(stuck, problem) if stuck else None)}
+        parts.append(f"{CUT_RULE} may be standing without a marker and could not be removed ({cut_problem}).")
+    if shut:
+        parts.append(f"Outbound is still blocked on {shut}, and TDC is not isolating (there is no marker)." if changed else
+                     f"TDC is not isolating (there is no marker), so nothing was changed, but outbound is blocked on {shut}.")
+    if shut or (cut_problem and not cut_removed):
+        parts.append(f"{'If that is not wanted, run' if shut else 'Run'} {UNISOLATE_SCRIPT} on the VM.")
+    if stuck:
+        parts.append(_stuck_text(stuck, problem))
+    return {"isolated": False, "changed": changed, "assumed_allow": False,
+            "cut_removed": cut_removed, "outbound_after": current, "allow_disabled": stuck, "note": _join(*parts)}
 
 
 def startup_state(run, settings) -> Dict[str, Any]:

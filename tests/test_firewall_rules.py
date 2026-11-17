@@ -2200,3 +2200,42 @@ def test_the_note_after_a_stray_cut_rule_was_removed_does_not_say_nothing_was_ch
     assert done["cut_removed"] is True and rules_mod.CUT_RULE not in run.rules
     assert "was removed" in done["note"] and "still blocked" in done["note"] and "tdc-unisolate" in done["note"]
     assert "nothing was changed" not in done["note"]
+
+
+def test_the_note_without_a_marker_says_nothing_was_changed_only_when_nothing_was():
+    unisolate = "tdc-unisolate"
+    # nothing at all was done, the egress is shut anyway: the old sentence is true
+    run, settings = make(foreign=STOCK, outbound="Block")
+    done = rules_mod.isolate(run, False, settings=settings)
+    assert done["changed"] is False and "nothing was changed" in done["note"] and done["note"].count(unisolate) == 1
+    # a leftover rule was switched on again: something was changed, and it is not denied
+    run, settings = make(foreign=STOCK, outbound="Block")
+    run.foreign[DNS_RULE]["Enabled"] = False
+    settings.allow_disabled = [DNS_RULE]
+    done = rules_mod.isolate(run, False, settings=settings)
+    assert done["changed"] is True and run.foreign[DNS_RULE]["Enabled"] is True
+    assert "nothing was changed" not in done["note"] and "still blocked" in done["note"] and done["note"].count(unisolate) == 1
+    # partly stuck: no "nothing was changed" next to "could not be switched on again"
+    run, settings = make(foreign=STOCK, outbound="Block", stubborn={DNS_RULE})
+    run.foreign[DNS_RULE]["Enabled"] = False
+    run.foreign["CoreNet-DHCP-Out"]["Enabled"] = False
+    settings.allow_disabled = [DNS_RULE, "CoreNet-DHCP-Out"]
+    done = rules_mod.isolate(run, False, settings=settings)
+    assert done["changed"] is True and done["allow_disabled"] == [DNS_RULE]
+    assert "nothing was changed" not in done["note"] and "could not be switched on again" in done["note"]
+    # all stuck: nothing changed, and the note says both things without contradiction
+    run, settings = make(foreign=STOCK, outbound="Block", stubborn={DNS_RULE})
+    run.foreign[DNS_RULE]["Enabled"] = False
+    settings.allow_disabled = [DNS_RULE]
+    done = rules_mod.isolate(run, False, settings=settings)
+    assert done["changed"] is False and "nothing was changed" in done["note"] and "could not be switched on again" in done["note"]
+
+
+def test_the_hatch_is_named_once_when_the_cut_rule_cannot_be_removed_and_outbound_is_blocked():
+    run, settings = make(foreign=STOCK, outbound="Block")
+    rules_mod.cut(run)
+    run.stuck_rules = {rules_mod.CUT_RULE}
+    done = rules_mod.isolate(run, False, settings=settings)
+    assert done["cut_removed"] is False and done["changed"] is False
+    assert done["note"].count("tdc-unisolate") == 1 and "could not be removed" in done["note"]
+    assert "nothing was changed" in done["note"]
