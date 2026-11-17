@@ -55,9 +55,25 @@ gründliche Arbeit danach nach.
 
 ## Ziele
 
-1. Von einem Knopfdruck bis „nichts geht mehr raus" **in etwa zwei Sekunden**
-   (gemessen 2,13 s, Obergrenze für den Test: 3 s), und zwar nachweisbar — die
-   Regel wird zurückgelesen, DNS stirbt.
+1. Von einem Knopfdruck bis „nichts geht mehr raus" **in etwa dreieinhalb
+   Sekunden** (Obergrenze für den Test: 5 s), und zwar nachweisbar — die Regel
+   wird zurückgelesen, DNS stirbt.
+
+   *Korrektur nach der Messung am fertigen Verb:* der Entwurf rechnete mit
+   2,13 s, weil er eine einzige PowerShell-Runde annahm. Es sind zwei: der
+   Rückweg (`outbound_before`, Marker) muss **vor** jeder Änderung gemerkt
+   werden, und sein Wert kommt aus einem Profil-Lesen (1,13 s) vor dem Schnitt
+   (2,49 s gemessen). Die Alternative — zuerst schneiden, dann merken — wäre
+   schneller und ist **verworfen**: sie erlaubt eine stehende Catch-all-Regel
+   ohne Marker, also eine abgesperrte VM ohne Aufzeichnung des Rückwegs, und die
+   Glaubwürdigkeit dieses Features hängt an „die Firewall kommt exakt zurück".
+   Gegen 38,5 s ist der Unterschied zwischen 2 s und 3,6 s nicht der zwischen
+   Panikknopf und keinem.
+
+   Steht eine **verfälschte** Regel und muss repariert werden, dauert der
+   Schnitt länger (gemessen 5,92 s für eine deaktivierte, 3,38 s für eine
+   verengte Regel). Die Oberfläche darf in diesem Fall keine zwei Sekunden
+   behaupten.
 2. Ein großer, unübersehbarer Knopf an der Stelle, auf die der Nutzer gezeigt
    hat: in der rechten Spalte unter SUMMARY, in der Bildsprache des
    `UPDATE ALL`-Skull-Knopfes.
@@ -225,21 +241,38 @@ sichern?*
 
 ### Der Ablauf beim Einschalten
 
-1. Profile lesen. Ist eines aus: verweigern, nichts ändern.
-2. `TDC-FW-ISO-cut` schreiben, zurücklesen. Ab hier ist der Ausgang zu.
-3. `isolated: true` und `stage: "cut"` in `firewall_state.json`, **bevor**
-   geantwortet wird — ein Absturz danach hinterlässt einen Marker, den der Start
-   anzeigt, und nie eine stehende Regel ohne Marker.
-4. Antworten. Der Knopfdruck ist hier fertig.
-5. Im Hintergrund, in *einem* Arbeiter: der heutige `_isolate_on`-Weg
-   (Allow-Regeln merken und abschalten, Default auf Block), dann `allowed_out`
-   zurücklesen.
+1. **Profile lesen** (`Profiles`, 1,13 s), nicht die Allow-Regeln. Ist eines
+   aus: verweigern, nichts ändern. **Nicht** `AllowOut`: vor dem Schnitt wird
+   keine Allow-Regel abgeschaltet, es gibt also noch nichts aufzuschreiben, und
+   *was offen bliebe* ist für den Schnitt bedeutungslos — er schließt, weil
+   Block jede Allow-Regel schlägt. `allow_disabled` wird in `converge` notiert,
+   direkt bevor dort abgeschaltet wird, und dort bleibt auch die Weigerung,
+   etwas zu ändern, wenn die Liste nicht lesbar ist.
+2. `outbound_before`, Marker und `stage: "cut"` mit `settings.set` sichern.
+   Scheitert das, wird **nichts** angefasst.
+3. `TDC-FW-ISO-cut` schreiben (oder eine verfälschte Regel reparieren) und
+   zurücklesen — ein Aufruf, 2,49 s gemessen. Ab hier ist der Ausgang zu.
+4. Antworten. Der Knopfdruck ist hier fertig, nach rund 3,6 s.
+5. Im Hintergrund, in *einem* Arbeiter: `allowed_out` lesen (nicht lesbar ⇒
+   nichts ändern), `allow_disabled` notieren, die Allow-Regeln des lokalen
+   Stores abschalten, Default auf Block, dann `allowed_out` zurücklesen.
 6. Ist `allowed_out` leer: `TDC-FW-ISO-cut` entfernen, `stage: "isolated"`.
    Sonst: Regel stehen lassen, `stage: "cut_policy"`, und `allowed_out` nennen.
 7. Scheitert Schritt 5, **bleibt die Catch-all-Regel stehen**. Der Zustand ist
    weiter geschlossen, `stage` bleibt `cut`, und die Oberfläche sagt, dass der
    gründliche Teil nicht durchkam und warum. Der Rückweg, der heute schon beim
    Scheitern zurückrollt, rollt nur das zurück, was er selbst geändert hat.
+
+**`verified` heißt in den Schnitt-Stufen: die Catch-all-Regel wurde
+zurückgelesen** — und nichts weiter. Sie schließt unabhängig davon, ob die
+Allow-Liste lesbar war, denn Block schlägt Allow; auf der VM war der Ausgang zu,
+*während alle 135 Allow-Regeln aktiviert blieben*. Eine unlesbare Allow-Liste
+entscheidet nicht, ob geschlossen ist, sondern nur, ob die Regel fallen darf —
+und das darf sie dann nicht.
+
+**`converge` prüft selbst, ob der Marker noch steht**, und tut nichts, wenn
+nicht. Sonst könnte ein Arbeiter, der nach einem Verlassen noch läuft, Windows'
+Allow-Regeln wieder abschalten, die das Verlassen gerade eingeschaltet hat.
 
 Die Reihenfolge in 6 ist bewusst: die Allow-Regeln sind schon ab und der
 Default steht auf Block, *bevor* die Catch-all-Regel fällt. Zu keinem Zeitpunkt
