@@ -488,9 +488,18 @@ Gruppe „lokal“ am Ende. Detonierte Prozesse sind hinterlegt und tragen
   bestehenden Chart-Kits (`stackedBarsSvg` & Co.), damit sie sich beim
   Theme-Wechsel von selbst umfärbt. Projektion: äquidistant zylindrisch, von
   82° N bis 58° S beschnitten.
-- Vom Chamber-Punkt (Standort des Hosts ist unbekannt und wird **nicht**
-  ermittelt — der Punkt sitzt in der Mitte und heißt `CHAMBER`) geht ein Bogen
-  zu jedem Ziel. Breite nach `count`, Farbe nach höchstem Tag.
+- Von der **Chamber** aus geht ein Bogen zu jedem Ziel. Sie ist **kein Punkt der
+  Karte**, sondern ein eigenes Gerät in einem Streifen unter ihr, mit eigenem
+  Hintergrundton, Trennlinie und der Beschriftung `LOCATION NOT DETERMINED`.
+  Grund: der Standort des Hosts ist unbekannt und wird **nicht** ermittelt — das
+  hieße, irgendeinen Dienst zu fragen, wo diese Maschine steht, und die Chamber
+  fragt niemanden nach einer Adresse. Ein Punkt mitten in der Projektion
+  behauptet aber trotzdem einen Standort: die Mitte dieses Ausschnitts ist
+  0°/12° N, also Burkina Faso, und genau so hat der erste Nutzer die Karte
+  gelesen („ich bin nicht in Afrika"). Die Position des Geräts wird deshalb
+  ausschließlich aus der Kartengröße gerechnet, nie über `project()` aus
+  Längen- und Breitengrad — ein Test hält das fest. Breite der Bögen nach
+  `count`, Farbe nach höchstem Tag.
 - Hover zeigt Prozess, Endpunkt, AS-Organisation, Tags. Klick wechselt die
   Perspektive.
 - **Entscheidung — Bewegung:** gesperrte Bögen pulsieren nicht. Es gibt eine
