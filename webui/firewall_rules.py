@@ -1029,8 +1029,9 @@ def isolate(run, on: bool, *, settings) -> Dict[str, Any]:
     in ``allow_disabled`` and ``note`` names it; a rule that is gone is not missed. It works whatever the profiles are.
     When the baseline is itself Block the egress stays shut: that is the VM's own baseline and not a TDC lockout, and
     ``note`` says so. With the marker but no baseline it assumes ``Allow``, the Windows default, and says so
-    (``assumed_allow``). Without the marker it changes nothing but the rules a failed leaving left off, and if the
-    egress is nonetheless shut ``note`` says that TDC is not the one isolating and names the hatch.
+    (``assumed_allow``). Without the marker it changes nothing but the rules a failed leaving left off and a cut rule
+    that a crash left standing (it says so in ``note``), and if the egress is nonetheless shut ``note`` says that TDC
+    is not the one isolating and names the hatch.
     Returns ``{"isolated": False, "changed", "assumed_allow", "cut_removed", "outbound_after", "allow_disabled",
     "note"}``, and ``profiles_off`` as read back when it changed something. ``cut_removed`` is True when the cut rule was
     among what was removed (in stage ``isolated`` it is not there any more). Both directions give ``profiles_off`` so that the
@@ -1240,7 +1241,8 @@ def _isolate_off(run, settings) -> Dict[str, Any]:
 def _not_isolating(run, settings) -> Dict[str, Any]:
     """Leaving ISOLATED when TDC is not isolating: nothing is changed but the rules a failed leaving left switched
     off and a cut rule that a crash left standing (a catch-all Block with no marker is the state in which someone needs
-    help, so it goes and the note says so; it is looked for first, so that with none there nothing is written), and an egress that is shut anyway is said."""
+    help, so it goes and the note says so; it is looked for first, so that with none there nothing is written), and an
+    egress that is shut anyway is said."""
     cut_removed = False
     cut_problem = None
     try:
@@ -1272,9 +1274,13 @@ def _not_isolating(run, settings) -> Dict[str, Any]:
         note = (f"{CUT_RULE} may be standing without a marker and could not be removed ({cut_problem}); "
                 f"run {UNISOLATE_SCRIPT} on the VM.")
     if current and "Block" in current.values():
-        note = _join(note, f"TDC is not isolating (there is no marker), so nothing was changed, but outbound is blocked on "
-                           f"{', '.join(n for n in PROFILE_NAMES if current[n] == 'Block')}. If that is not wanted, "
-                           f"run {UNISOLATE_SCRIPT} on the VM.")
+        shut = ", ".join(n for n in PROFILE_NAMES if current[n] == "Block")
+        if cut_removed:
+            note = _join(note, f"Outbound is still blocked on {shut}, and TDC is not isolating (there is no marker). "
+                               f"If that is not wanted, run {UNISOLATE_SCRIPT} on the VM.")
+        else:
+            note = _join(note, f"TDC is not isolating (there is no marker), so nothing was changed, but outbound is "
+                               f"blocked on {shut}. If that is not wanted, run {UNISOLATE_SCRIPT} on the VM.")
     return {"isolated": False, "changed": cut_removed or len(stuck) < len(leftover), "assumed_allow": False,
             "cut_removed": cut_removed, "outbound_after": current, "allow_disabled": stuck,
             "note": _join(note, _stuck_text(stuck, problem) if stuck else None)}

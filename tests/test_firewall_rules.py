@@ -2191,3 +2191,12 @@ def test_leaving_without_a_marker_sweeps_when_the_cut_rule_cannot_be_looked_up()
     run.fail = {"Get": (1, "rpc failed")}
     done = rules_mod.isolate(run, False, settings=settings)
     assert rules_mod.CUT_RULE not in run.rules and done["cut_removed"] is True
+
+
+def test_the_note_after_a_stray_cut_rule_was_removed_does_not_say_nothing_was_changed():
+    run, settings = make(foreign=STOCK, outbound="Block")        # the default is Block as well: the egress stays shut
+    rules_mod.cut(run)
+    done = rules_mod.isolate(run, False, settings=settings)
+    assert done["cut_removed"] is True and rules_mod.CUT_RULE not in run.rules
+    assert "was removed" in done["note"] and "still blocked" in done["note"] and "tdc-unisolate" in done["note"]
+    assert "nothing was changed" not in done["note"]
