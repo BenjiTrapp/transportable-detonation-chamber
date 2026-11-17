@@ -95,6 +95,7 @@ _DEDUP_FIELDS = {
 }
 
 ASK_MODES = ("detonation", "all", "off")
+STAGES = ("open", "cut", "isolated", "cut_policy")
 DECISIONS = ("allow", "block", "block_fetch")
 MAX_OPEN = 200
 MAX_HISTORY = 1000
@@ -826,6 +827,9 @@ def _check_setting(name: str, value: Any) -> Any:
         if not isinstance(value, list) or not all(isinstance(v, str) and v for v in value):
             raise ValueError("allow_disabled must be a list of rule names")
         value = list(value)
+    elif name == "stage":
+        if value not in STAGES:
+            raise ValueError(f"stage must be one of {STAGES}, not {value!r}")
     else:
         raise ValueError(f"unknown setting: {name!r}")
     return value
@@ -840,6 +844,8 @@ class Settings:
     ``isolated_since``   epoch seconds ISOLATED went on, or None
     ``allow_disabled``   the names of Windows' own outbound Allow rules ISOLATED switched off, to switch exactly
                          those on again (``scripts/tdc-unisolate.ps1`` reads it too)
+    ``stage``            ``open`` | ``cut`` | ``isolated`` | ``cut_policy`` (``STAGES``): which stage of ISOLATED holds;
+                         it is kept in the file and so survives a restart of the web UI
 
     The attributes can be read freely. ``set`` checks, stores and writes the file, and raises (leaving
     everything as it was) when it cannot: whoever isolates the VM must know that the way back was not
@@ -847,7 +853,7 @@ class Settings:
     """
 
     DEFAULTS = {"ask_mode": "detonation", "isolated": False, "outbound_before": None, "isolated_since": None,
-                "allow_disabled": []}
+                "allow_disabled": [], "stage": "open"}
 
     def __init__(self, path: str):
         self.path = path
@@ -858,6 +864,7 @@ class Settings:
         self.outbound_before: Optional[str] = self.DEFAULTS["outbound_before"]
         self.isolated_since: Optional[float] = self.DEFAULTS["isolated_since"]
         self.allow_disabled: List[str] = []
+        self.stage: str = self.DEFAULTS["stage"]
         self.load()
 
     def load(self) -> None:

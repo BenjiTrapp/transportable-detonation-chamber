@@ -204,8 +204,9 @@ class FakeRun:
 
 class FakeSettings:
     def __init__(self, outbound_before=None, isolated=False, isolated_since=None, timeline=None, fail=False,
-                 allow_disabled=()):
+                 allow_disabled=(), stage="open"):
         self.outbound_before = outbound_before
+        self.stage = stage
         self.allow_disabled = list(allow_disabled)
         self.isolated = isolated
         self.isolated_since = isolated_since
@@ -240,6 +241,15 @@ STOCK = {
 GPO_RULE = {"{gpo-1}": {"DisplayName": "Lab proxy out", "Group": "", "Source": "GroupPolicy", "Enabled": True}}
 
 
+def thorough(run, settings):
+    """What ISOLATED on was before the panic cut: the cut, then the convergence behind it. ``verified`` and the lists
+    are those of the convergence; the rest is the answer of the press."""
+    pressed = rules_mod.isolate(run, True, settings=settings)
+    tidied = rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    notes = " ".join(n for n in (pressed["note"], tidied["note"]) if n)
+    return {**pressed, **tidied, "note": notes or None}
+
+
 # ---- the brief's tests ----------------------------------------------------------------------
 
 
@@ -272,13 +282,13 @@ def test_a_disabled_profile_is_reported():
 def test_enforcement_refuses_while_a_profile_is_off():
     run = FakeRun(profiles={"Domain": False, "Private": False, "Public": False})
     with pytest.raises(rules_mod.RuleError) as e:
-        rules_mod.isolate(run, True, settings=SETTINGS)
+        thorough(run, SETTINGS)
     assert "firewall" in str(e.value).lower()
 
 
 def test_isolate_remembers_the_previous_outbound_action():
     run, settings = FakeRun(outbound="Allow"), FakeSettings()
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     assert settings.outbound_before == "Allow"
     assert any("DefaultOutboundAction Block" in " ".join(c) for c in run.calls)
     assert not any("-Program" in c for c in run.calls)     # the fetcher's way out is per fetch, see allow_fetch
@@ -334,7 +344,7 @@ def test_the_ops_the_module_emits_are_the_ops_the_script_accepts():
     rules_mod.unblock(run, run.calls[0][run.calls[0].index("-Name") + 1])
     rules_mod.rules(run)
     rules_mod.enable_firewall(run)
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     rules_mod.isolate(run, False, settings=settings)
     rules_mod.cut(run)
     rules_mod.uncut(run)
@@ -568,7 +578,7 @@ def test_a_rule_we_would_not_have_written_is_listed_but_never_counts_as_a_block(
 
 def test_the_allow_rules_of_isolated_are_listed_as_such_and_never_as_blocks():
     run, settings = make()
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     fetch = rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)["name"]
     listed = {r["rule_id"]: r for r in rules_mod.rules(run)}
     assert set(listed) == {fetch}
@@ -628,7 +638,7 @@ def test_isolate_refused_for_a_profile_that_is_off_changes_and_remembers_nothing
     run = FakeRun(profiles={"Domain": True, "Private": False, "Public": True})
     settings = FakeSettings()
     with pytest.raises(rules_mod.ProfileOffError) as e:
-        rules_mod.isolate(run, True, settings=settings)
+        thorough(run, settings)
     assert "Private" in str(e.value)
     assert run.ops() == ["AllowOut"] and settings.saved == []         # the profiles come with Windows' rules
 
@@ -637,14 +647,14 @@ def test_isolate_writes_no_allow_rule_of_its_own():
     """Windows Firewall does not filter loopback, and refuses ::1 as a RemoteAddress: the loopback rule of older
     versions was a no-op that made every isolation fail. The fetcher's way out is per fetch (allow_fetch)."""
     run, settings = make()
-    out = rules_mod.isolate(run, True, settings=settings)
+    out = thorough(run, settings)
     assert run.rules == {} and "Create" not in run.ops() and not any("::1" in c for c in run.calls)
     assert run.outbound == {"Domain": "Block", "Private": "Block", "Public": "Block"} and out["verified"] is True
 
 
 def test_isolate_orders_memory_then_allow_rules_then_block():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     kinds = [t[0] for t in run.timeline]
     first_write = min(i for i, k in enumerate(kinds) if k in ("Create", "DisableAllowOut", "SetDefaultOutbound"))
     assert kinds[first_write - 1] == "settings"                       # the way back is saved before anything changes
@@ -654,7 +664,7 @@ def test_isolate_orders_memory_then_allow_rules_then_block():
 
 def test_isolate_marks_the_time():
     run, settings = make()
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     assert settings.isolated is True and isinstance(settings.isolated_since, float)
 
 
@@ -662,14 +672,14 @@ def test_isolate_changes_nothing_when_the_way_back_cannot_be_saved():
     run = FakeRun()
     settings = FakeSettings(fail=True)
     with pytest.raises(rules_mod.RuleError):
-        rules_mod.isolate(run, True, settings=settings)
+        thorough(run, settings)
     assert run.writes() == [] and settings.isolated is False
 
 
 def test_isolating_twice_keeps_the_first_memory():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, settings=settings)
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
+    thorough(run, settings)
     assert settings.outbound_before == "Allow"
     rules_mod.isolate(run, False, settings=settings)
     assert run.outbound == {"Domain": "Allow", "Private": "Allow", "Public": "Allow"}
@@ -677,7 +687,7 @@ def test_isolating_twice_keeps_the_first_memory():
 
 def test_a_vm_that_was_already_on_block_comes_back_on_block():
     run, settings = make(outbound="Block")
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     assert settings.outbound_before == "Block"
     rules_mod.isolate(run, False, settings=settings)
     assert run.outbound == {"Domain": "Block", "Private": "Block", "Public": "Block"}
@@ -685,7 +695,7 @@ def test_a_vm_that_was_already_on_block_comes_back_on_block():
 
 def test_profiles_that_differ_come_back_each_as_they_were():
     run, settings = make(outbound={"Domain": "Block", "Private": "Allow", "Public": "Allow"})
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     assert run.outbound == {"Domain": "Block", "Private": "Block", "Public": "Block"}
     rules_mod.isolate(run, False, settings=settings)
     assert run.outbound == {"Domain": "Block", "Private": "Allow", "Public": "Allow"}
@@ -693,7 +703,7 @@ def test_profiles_that_differ_come_back_each_as_they_were():
 
 def test_isolate_off_goes_backwards_and_forgets_last():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     run.timeline.clear()
     rules_mod.isolate(run, False, settings=settings)
     kinds = [t[0] for t in run.timeline]
@@ -703,7 +713,7 @@ def test_isolate_off_goes_backwards_and_forgets_last():
 
 def test_isolate_off_still_works_when_a_profile_is_off():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     run.profiles["Public"] = False
     rules_mod.isolate(run, False, settings=settings)
     assert settings.isolated is False and run.outbound["Public"] == "Allow"
@@ -729,41 +739,40 @@ def test_a_memory_nobody_can_read_is_not_obeyed_blindly():
     assert out["assumed_allow"] is True and set(run.outbound.values()) == {"Allow"}
 
 
-def test_a_failure_while_switching_rolls_back_to_what_was_there():
-    run, settings = make(outbound="Allow", fail_once={"SetDefaultOutbound": (1, "denied")})
-    with pytest.raises(rules_mod.RuleError) as e:
-        rules_mod.isolate(run, True, settings=settings)
-    assert "denied" in str(e.value) and "tdc-unisolate" not in str(e.value)
-    assert run.rules == {} and settings.isolated is False and settings.outbound_before is None
+def test_a_default_action_that_will_not_change_leaves_the_cut_standing_and_nothing_rolled_back():
+    run, settings = make(outbound="Allow", foreign=STOCK, fail_once={"SetDefaultOutbound": (1, "denied")})
+    rules_mod.isolate(run, True, settings=settings)
+    done = rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    assert done["stage"] == "cut" and done["verified"] is False and "denied" in done["note"]
+    assert rules_mod.CUT_RULE in run.rules and settings.isolated is True and settings.stage == "cut"
+    assert sorted(settings.allow_disabled) == ["CoreNet-DHCP-Out", DNS_RULE]      # the way back stays noted
+    assert run.enabled_foreign() == [] and "EnableAllowOut" not in run.ops()      # what was switched off stays off
     assert set(run.outbound.values()) == {"Allow"}
 
 
 def test_a_failure_switching_windows_rules_off_never_reaches_the_block():
     run, settings = make(outbound="Allow", foreign=STOCK, fail={"DisableAllowOut": (1, "denied")})
-    with pytest.raises(rules_mod.RuleError):
-        rules_mod.isolate(run, True, settings=settings)
+    rules_mod.isolate(run, True, settings=settings)
+    done = rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    assert done["stage"] == "cut" and "denied" in done["note"]
     assert "SetDefaultOutbound" not in run.ops() and run.enabled_foreign() == ["CoreNet-DHCP-Out", DNS_RULE]
-    assert set(run.outbound.values()) == {"Allow"} and settings.isolated is False and settings.outbound_before is None
+    assert set(run.outbound.values()) == {"Allow"} and settings.isolated is True and settings.outbound_before == "Allow"
+    assert rules_mod.CUT_RULE in run.rules
 
 
 def test_isolated_is_not_claimed_when_the_block_did_not_take():
     run, settings = make(outbound="Allow")
+    rules_mod.isolate(run, True, settings=settings)
     run.op_SetDefaultOutbound = lambda p: (0, "", "")             # succeeds and does nothing
-    with pytest.raises(rules_mod.RuleError):
-        rules_mod.isolate(run, True, settings=settings)
-    assert settings.isolated is False and run.rules == {}
+    done = rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    assert done["stage"] == "cut" and done["verified"] is False and "did not change" in done["note"]
+    assert rules_mod.CUT_RULE in run.rules and settings.isolated is True and settings.stage == "cut"
 
 
 def test_a_rollback_that_fails_keeps_the_marker_and_points_at_the_hatch():
-    run, settings = make(outbound="Allow")
-    calls = {"n": 0}
-
-    def flaky(p):
-        calls["n"] += 1
-        return (0, "", "") if calls["n"] == 1 else (1, "", "denied")        # the block does nothing, the undo fails
-    run.op_SetDefaultOutbound = flaky
+    run, settings = make(outbound="Allow", fail={"Cut": (1, "denied"), "RemoveIsolate": (1, "denied")})
     with pytest.raises(rules_mod.RuleError) as e:
-        rules_mod.isolate(run, True, settings=settings)
+        rules_mod.isolate(run, True, settings=settings)                  # the cut fails, and so does the undo
     assert "scripts/tdc-unisolate.ps1" in str(e.value)
     assert settings.isolated is True and settings.outbound_before == "Allow"
 
@@ -783,7 +792,7 @@ def test_the_way_out_of_isolated_needs_a_usable_fetcher_and_address():
 
 def test_a_block_written_while_isolated_stands_and_survives_leaving_it():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     r = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
     assert r["verified"] is True
     rules_mod.isolate(run, False, settings=settings)
@@ -864,7 +873,7 @@ def test_deny_fetch_takes_nothing_but_a_per_fetch_rule(name):
 
 def test_forget_fetch_rules_clears_what_an_interrupted_run_left():
     run, settings = make()
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     stale = rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)["name"]
     run.rules[FETCHER] = run.view(FETCHER, Action="Allow", Program=PY)      # the standing rule of an older version
     kept = rules_mod.block(run, image=IMAGE, ip="5.6.7.8", fetcher=PY)["rule_id"]
@@ -877,7 +886,7 @@ def test_forget_fetch_rules_clears_what_an_interrupted_run_left():
 def test_forget_fetch_rules_keeps_going_past_one_that_will_not_go_and_names_it():
     """A way out a crash left behind is only findable here, so one that sticks must not stop the others."""
     run, settings = make()
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     first = rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)["name"]
     second = rules_mod.allow_fetch(run, fetcher=PY, ip="5.6.7.8", port=443)["name"]
     real = run.op_Remove
@@ -902,7 +911,7 @@ def test_a_removal_that_says_nothing_but_leaves_the_rule_is_still_stuck():
 
 def test_leaving_isolated_removes_a_per_fetch_rule_that_was_still_open():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)
     rules_mod.isolate(run, False, settings=settings)
     assert run.rules == {}
@@ -1030,7 +1039,7 @@ def test_leaving_without_a_marker_leaves_a_shut_egress_shut_and_says_why():
 
 def test_isolating_from_a_baseline_that_is_already_block_and_leaving_it_back_to_block():
     run, settings = make(outbound="Block")
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     assert settings.isolated is True and settings.outbound_before == "Block"
     assert run.rules == {}
     assert rules_mod.startup_state(run, settings)["isolated"] is True
@@ -1042,13 +1051,13 @@ def test_isolating_from_a_baseline_that_is_already_block_and_leaving_it_back_to_
 
 def test_leaving_to_a_baseline_that_is_open_has_nothing_to_explain():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     assert rules_mod.isolate(run, False, settings=settings)["note"] is None
 
 
 def test_a_mixed_baseline_names_the_profiles_that_stay_shut():
     run, settings = make(outbound={"Domain": "Block", "Private": "Allow", "Public": "Allow"})
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     out = rules_mod.isolate(run, False, settings=settings)
     assert "Block on Domain:" in out["note"]
 
@@ -1094,10 +1103,10 @@ def test_replacing_a_per_fetch_rule_never_leaves_the_fetcher_without_one():
 
 def test_the_loopback_rule_an_older_version_left_goes_when_isolated_is_left():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     for name in (LOOPBACK, LOOPBACK + "-new"):
         run.rules[name] = run.view(name, Action="Allow", RemoteAddress=["127.0.0.0/8"])
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     assert "Create" not in run.ops()                      # isolating again does not rewrite it either
     rules_mod.isolate(run, False, settings=settings)
     assert run.rules == {} and settings.isolated is False
@@ -1105,7 +1114,7 @@ def test_the_loopback_rule_an_older_version_left_goes_when_isolated_is_left():
 
 def test_an_isolate_rule_that_will_not_go_is_said_and_keeps_the_marker():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     run.rules[LOOPBACK] = run.view(LOOPBACK, Action="Allow")
     run.stuck_rules = {LOOPBACK}
     with pytest.raises(rules_mod.RuleError) as e:
@@ -1115,7 +1124,7 @@ def test_an_isolate_rule_that_will_not_go_is_said_and_keeps_the_marker():
 
 def test_the_stand_in_goes_with_isolated_and_can_be_unblocked_by_hand():
     run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     run.rules[FETCHER + "-new"] = run.view(FETCHER + "-new", Action="Allow", Program=PY)
     rules_mod.isolate(run, False, settings=settings)
     assert run.rules == {}
@@ -1276,7 +1285,7 @@ def test_every_parameter_the_module_emits_is_declared_by_the_script():
     rules_mod.block(run, image=IMAGE, fetcher=PY)
     rules_mod.rules(run)
     rules_mod.enable_firewall(run)
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     rules_mod.isolate(run, False, settings=settings)
     emitted = set()
     for call in run.calls:
@@ -1317,7 +1326,7 @@ def test_a_block_whose_replacement_fails_says_the_stand_in_is_standing():
 def test_a_marker_without_a_baseline_gets_allow_and_the_note_says_tdc_shut_it():
     run, settings = make(outbound="Block")
     settings.isolated, settings.outbound_before, settings.isolated_since = True, None, 123.0
-    out = rules_mod.isolate(run, True, settings=settings)
+    out = thorough(run, settings)
     assert settings.outbound_before == "Allow" and out["outbound_before"] == "Allow"
     assert "no recorded baseline" in out["note"] and "because TDC shut it" in out["note"]
     assert settings.isolated_since == 123.0
@@ -1326,12 +1335,12 @@ def test_a_marker_without_a_baseline_gets_allow_and_the_note_says_tdc_shut_it():
 
 
 def test_a_failure_with_a_damaged_marker_is_not_rolled_back_to_open():
-    run, settings = make(outbound="Block", fail_once={"SetDefaultOutbound": (1, "denied")})
+    run, settings = make(outbound="Block", fail={"Cut": (1, "denied")})
     settings.isolated, settings.outbound_before = True, None
     with pytest.raises(rules_mod.RuleError) as e:
         rules_mod.isolate(run, True, settings=settings)
     assert "scripts/tdc-unisolate.ps1" in str(e.value)
-    assert settings.isolated is True and set(run.outbound.values()) == {"Block"}
+    assert settings.isolated is True and set(run.outbound.values()) == {"Block"} and "RemoveIsolate" not in run.ops()
 
 
 # ---- Windows' own outbound Allow rules: DefaultOutboundAction Block does not stop them ------------
@@ -1339,7 +1348,7 @@ def test_a_failure_with_a_damaged_marker_is_not_rolled_back_to_open():
 
 def test_isolated_switches_off_windows_own_allow_rules_and_leaving_switches_exactly_those_on():
     run, settings = make(foreign={**STOCK, **{}})
-    out = rules_mod.isolate(run, True, settings=settings)
+    out = thorough(run, settings)
     assert run.enabled_foreign() == []                                   # DNS and DHCP are off now
     assert sorted(settings.allow_disabled) == ["CoreNet-DHCP-Out", DNS_RULE]   # Teredo was off already: not recorded
     assert out["verified"] is True and out["allowed_out"] == [] and out["note"] is None
@@ -1350,13 +1359,13 @@ def test_isolated_switches_off_windows_own_allow_rules_and_leaving_switches_exac
 
 def test_the_rule_names_are_saved_before_anything_changes_and_closed_before_block():
     run, settings = make(foreign=STOCK)
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     kinds = [t[0] for t in run.timeline]
-    first_write = min(i for i, k in enumerate(kinds) if k in ("Create", "DisableAllowOut", "SetDefaultOutbound"))
+    first_write = min(i for i, k in enumerate(kinds) if k in ("Create", "Cut", "DisableAllowOut", "SetDefaultOutbound"))
     assert kinds[first_write - 1] == "settings" and "allow_disabled" in settings.saved[0]
     assert kinds.index("AllowOut") < first_write                          # read before anything changes
     assert "Create" not in kinds and kinds.index("DisableAllowOut") < kinds.index("SetDefaultOutbound")
-    assert kinds[-1] == "AllowOut"                                        # and read back after
+    assert kinds.index("SetDefaultOutbound") < len(kinds) - 1 - kinds[::-1].index("AllowOut")      # and read back after
     run.timeline.clear()
     rules_mod.isolate(run, False, settings=settings)
     kinds = [t[0] for t in run.timeline]
@@ -1365,29 +1374,39 @@ def test_the_rule_names_are_saved_before_anything_changes_and_closed_before_bloc
 
 def test_a_rule_a_group_policy_sets_cannot_be_closed_and_is_said_never_hidden():
     run, settings = make(foreign={**STOCK, **GPO_RULE})
-    out = rules_mod.isolate(run, True, settings=settings)
-    assert out["verified"] is False and [r["name"] for r in out["allowed_out"]] == ["{gpo-1}"]
+    out = thorough(run, settings)
+    assert out["stage"] == "cut_policy" and [r["name"] for r in out["allowed_out"]] == ["{gpo-1}"]
+    assert out["verified"] is True and rules_mod.CUT_RULE in run.rules      # the cut rule is what closes it, read back
     assert out["allowed_out"][0]["source"] == "GroupPolicy" and out["allowed_out"][0]["local"] is False
     assert "Lab proxy out" in out["note"] and "group policy" in out["note"]
     assert "{gpo-1}" not in settings.allow_disabled and settings.isolated is True
 
 
+def test_a_cut_rule_that_cannot_be_read_back_is_not_called_standing_in_the_policy_stage():
+    run, settings = make(foreign={**STOCK, **GPO_RULE})
+    rules_mod.isolate(run, True, settings=settings)
+    run.rules[rules_mod.CUT_RULE]["Enabled"] = False                       # something disabled it behind our back
+    done = rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    assert done["stage"] == "cut_policy" and done["verified"] is False and "not known" in done["note"]
+
+
 def test_a_local_rule_that_will_not_switch_off_stays_in_the_read_back():
     run, settings = make(foreign=STOCK, stubborn={DNS_RULE})
-    out = rules_mod.isolate(run, True, settings=settings)
-    assert out["verified"] is False and [r["name"] for r in out["allowed_out"]] == [DNS_RULE]
+    out = thorough(run, settings)
+    assert out["stage"] == "cut_policy" and [r["name"] for r in out["allowed_out"]] == [DNS_RULE]
     assert "Core Networking - DNS (UDP-Out)" in out["note"] and settings.isolated is True
+    assert rules_mod.CUT_RULE in run.rules
 
 
 def test_isolated_is_refused_when_windows_own_rules_cannot_be_read():
     run, settings = make(foreign=STOCK, fail={"AllowOut": (1, "access denied")})
     with pytest.raises(rules_mod.RuleError) as e:
-        rules_mod.isolate(run, True, settings=settings)
+        thorough(run, settings)
     assert "nothing was changed" in str(e.value)
     assert run.writes() == [] and settings.saved == [] and run.enabled_foreign() == ["CoreNet-DHCP-Out", DNS_RULE]
 
 
-def test_a_read_back_that_fails_is_unknown_never_closed():
+def test_a_read_back_that_fails_is_unknown_and_keeps_the_cut_rule():
     run, settings = make(foreign=STOCK)
     real = run.op_AllowOut
     seen = {"n": 0}
@@ -1396,32 +1415,14 @@ def test_a_read_back_that_fails_is_unknown_never_closed():
         seen["n"] += 1
         return real(p) if seen["n"] == 1 else (1, "", "rpc failed")
     run.op_AllowOut = allow_out
-    out = rules_mod.isolate(run, True, settings=settings)
-    assert out["verified"] is False and out["allowed_out"] is None and "rpc failed" in out["allowed_out_error"]
-    assert "not known" in out["note"]
-
-
-def test_a_failed_isolation_switches_windows_rules_on_again_in_reverse():
-    run, settings = make(foreign=STOCK, fail_once={"SetDefaultOutbound": (1, "denied")})
-    with pytest.raises(rules_mod.RuleError):
-        rules_mod.isolate(run, True, settings=settings)
-    kinds = [t[0] for t in run.timeline]
-    assert kinds.index("DisableAllowOut") < kinds.index("EnableAllowOut") < kinds.index("RemoveIsolate")
-    assert run.enabled_foreign() == ["CoreNet-DHCP-Out", DNS_RULE] and run.rules == {}
-    assert settings.isolated is False and settings.allow_disabled == []
-
-
-def test_a_rollback_that_cannot_switch_them_on_keeps_the_marker_and_the_names():
-    run, settings = make(foreign=STOCK, fail_once={"SetDefaultOutbound": (1, "denied")}, fail={"EnableAllowOut": (1, "rpc")})
-    with pytest.raises(rules_mod.RuleError) as e:
-        rules_mod.isolate(run, True, settings=settings)
-    assert "scripts/tdc-unisolate.ps1" in str(e.value)
-    assert settings.isolated is True and sorted(settings.allow_disabled) == ["CoreNet-DHCP-Out", DNS_RULE]
+    out = thorough(run, settings)
+    assert out["stage"] == "cut_policy" and out["allowed_out"] is None and "rpc failed" in out["allowed_out_error"]
+    assert "rpc failed" in out["note"] and rules_mod.CUT_RULE in run.rules      # what is not known never drops the cut
 
 
 def test_a_rule_that_will_not_switch_on_again_stays_recorded_and_is_retried():
     run, settings = make(foreign=STOCK)
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     run.stubborn = {DNS_RULE}
     out = rules_mod.isolate(run, False, settings=settings)
     assert settings.isolated is False and settings.allow_disabled == [DNS_RULE] and out["allow_disabled"] == [DNS_RULE]
@@ -1434,7 +1435,7 @@ def test_a_rule_that_will_not_switch_on_again_stays_recorded_and_is_retried():
 
 def test_a_recorded_rule_that_is_gone_is_not_missed():
     run, settings = make(foreign=STOCK)
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     del run.foreign[DNS_RULE]
     out = rules_mod.isolate(run, False, settings=settings)
     assert settings.allow_disabled == [] and out["note"] is None
@@ -1442,9 +1443,9 @@ def test_a_recorded_rule_that_is_gone_is_not_missed():
 
 def test_isolating_again_closes_a_rule_that_was_switched_on_meanwhile():
     run, settings = make(foreign=STOCK)
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     run.foreign["CoreNet-Teredo-Out"]["Enabled"] = True                   # someone (or something) switched it on
-    out = rules_mod.isolate(run, True, settings=settings)
+    out = thorough(run, settings)
     assert out["verified"] is True and "CoreNet-Teredo-Out" in settings.allow_disabled
     rules_mod.isolate(run, False, settings=settings)
     assert run.enabled_foreign() == sorted(["CoreNet-DHCP-Out", "CoreNet-Teredo-Out", DNS_RULE])
@@ -1470,7 +1471,7 @@ def test_many_rule_names_travel_in_several_calls_each_as_base64_never_as_text():
     names = {f"{{{i:08d}-aaaa-bbbb-cccc-dddddddddddd}} *weird, name": {"DisplayName": f"App {i}", "Source": "Local", "Enabled": True}
              for i in range(400)}
     run, settings = make(foreign=names)
-    assert rules_mod.isolate(run, True, settings=settings)["verified"] is True
+    assert thorough(run, settings)["verified"] is True
     calls = [c for c in run.calls if FakeRun.params(c)["Op"] == "DisableAllowOut"]
     assert len(calls) > 1
     for call in calls:
@@ -1524,12 +1525,16 @@ def test_a_json_list_is_unrolled_the_way_windows_powershell_5_1_needs():
 # ---- a button, not a minute: one PowerShell call per step --------------------------------------
 
 
-def test_isolated_on_is_four_powershell_calls_and_off_three_however_many_rules():
+def test_the_press_is_two_powershell_calls_the_convergence_four_and_off_three_however_many_rules():
     names = {f"App-{i:03d}-Out": {"DisplayName": f"App {i}", "Source": "Local", "Enabled": True} for i in range(135)}
     run, settings = make(foreign=names)
-    out = rules_mod.isolate(run, True, settings=settings)
-    assert out["verified"] is True and out["allowed_out"] == [] and out["profiles_off"] == []
-    assert run.ops() == ["AllowOut", "DisableAllowOut", "SetDefaultOutbound", "AllowOut"]
+    pressed = rules_mod.isolate(run, True, settings=settings)
+    assert pressed["verified"] is True and pressed["profiles_off"] == []
+    assert run.ops() == ["AllowOut", "Cut"]
+    run.calls.clear()
+    out = rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    assert out["verified"] is True and out["allowed_out"] == []
+    assert run.ops() == ["DisableAllowOut", "SetDefaultOutbound", "AllowOut", "Remove", "Get"]
     run.calls.clear()
     left = rules_mod.isolate(run, False, settings=settings)
     assert run.ops() == ["SetDefaultOutbound", "EnableAllowOut", "RemoveIsolate"] and left["profiles_off"] == []
@@ -1538,7 +1543,7 @@ def test_isolated_on_is_four_powershell_calls_and_off_three_however_many_rules()
 
 def test_a_mixed_baseline_is_put_back_in_one_call_per_value():
     run, settings = make(outbound={"Domain": "Block", "Private": "Allow", "Public": "Allow"})
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     run.calls.clear()
     rules_mod.isolate(run, False, settings=settings)
     sets = [FakeRun.params(c) for c in run.calls if FakeRun.params(c)["Op"] == "SetDefaultOutbound"]
@@ -1550,7 +1555,7 @@ def test_a_default_action_answer_without_the_profiles_is_read_back_separately():
     run, settings = make()
     real = run.op_SetDefaultOutbound
     run.op_SetDefaultOutbound = lambda p: (real(p)[0], "", "")      # an answer that is not the profiles
-    assert rules_mod.isolate(run, True, settings=settings)["verified"] is True
+    assert thorough(run, settings)["verified"] is True
     assert run.ops().count("Profiles") == 1
 
 
@@ -1573,7 +1578,7 @@ def test_a_baseline_of_not_configured_comes_back_as_not_configured_not_allow():
     differently from how it was found. The baseline is the configured value, and the write is checked there."""
     run, settings = make(foreign=STOCK, outbound="NotConfigured")
     assert {r["DefaultOutboundAction"] for r in run.profile_rows()} == {"Allow"}       # as in force
-    on = rules_mod.isolate(run, True, settings=settings)
+    on = thorough(run, settings)
     assert settings.outbound_before == "NotConfigured" and on["outbound_before"] == "NotConfigured"
     assert on["verified"] is True and set(run.outbound.values()) == {"Block"}
     assert rules_mod.startup_state(run, settings)["isolated"] is True                  # in force: Block
@@ -1585,7 +1590,7 @@ def test_a_baseline_of_not_configured_comes_back_as_not_configured_not_allow():
 
 def test_a_mixed_configured_baseline_comes_back_profile_by_profile():
     run, settings = make(outbound={"Domain": "NotConfigured", "Private": "Allow", "Public": "Block"})
-    rules_mod.isolate(run, True, settings=settings)
+    thorough(run, settings)
     assert settings.outbound_before == "Domain=NotConfigured,Private=Allow,Public=Block"
     rules_mod.isolate(run, False, settings=settings)
     assert run.outbound == {"Domain": "NotConfigured", "Private": "Allow", "Public": "Block"}
@@ -1594,10 +1599,11 @@ def test_a_mixed_configured_baseline_comes_back_profile_by_profile():
 def test_block_that_a_group_policy_keeps_from_force_is_not_isolated():
     run, settings = make(outbound="NotConfigured")
     run.forced = {"Public": "Allow"}                         # configured Block, but a policy keeps Allow in force
-    with pytest.raises(rules_mod.RuleError) as e:
-        rules_mod.isolate(run, True, settings=settings)
-    assert "Public" in str(e.value)
-    assert settings.isolated is False and set(run.outbound.values()) == {"NotConfigured"}   # rolled back as configured
+    rules_mod.isolate(run, True, settings=settings)
+    done = rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    assert done["stage"] == "cut" and done["verified"] is False and "Public" in done["note"]
+    assert rules_mod.CUT_RULE in run.rules and settings.isolated is True        # the cut closes it; nothing was rolled back
+    assert settings.outbound_before == "NotConfigured"
 
 
 def test_the_script_reads_the_configured_value_where_it_writes_it():
@@ -1823,3 +1829,157 @@ def test_a_cut_rule_that_stands_is_not_touched_again():
     run.repair_fails = True                            # would show as a problem if a repair were attempted
     done = rules_mod.cut(run)
     assert done["verified"] is True and run.rules["TDC-FW-ISO-cut"] == before
+
+
+# ---- the two stages: isolate cuts, converge tidies up --------------------------------------------
+
+
+def test_isolating_cuts_first_and_answers_after_the_cut():
+    run, settings = make(foreign=STOCK)
+    done = rules_mod.isolate(run, True, settings=settings)
+    assert (done["stage"], done["verified"], done["converging"]) == ("cut", True, True)
+    # the baseline read (AllowOut: profiles and Windows' rules in one call), then the one Cut; nothing slow before the answer
+    assert run.ops() == ["AllowOut", "Cut"]
+    assert settings.isolated is True and settings.stage == "cut"
+
+
+def test_the_baseline_is_recorded_before_the_rule_is_written():
+    run, settings = make(foreign=STOCK, outbound="NotConfigured")
+    rules_mod.isolate(run, True, settings=settings)
+    assert settings.outbound_before == "NotConfigured"
+    saved = [i for i, (what, _) in enumerate(settings.timeline) if what == "settings"]
+    cut = [i for i, (what, _) in enumerate(settings.timeline) if what == "Cut"]
+    assert saved and cut and saved[0] < cut[0]
+
+
+def test_nothing_is_cut_when_the_way_back_cannot_be_saved():
+    run, settings = make(foreign=STOCK)
+    settings.fail = True
+    with pytest.raises(rules_mod.RuleError):
+        rules_mod.isolate(run, True, settings=settings)
+    assert run.rules == {} and "Cut" not in run.ops()
+
+
+def test_converging_switches_the_allow_rules_off_and_drops_the_cut_rule():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    done = rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    assert done["stage"] == "isolated" and done["verified"] is True
+    assert rules_mod.CUT_RULE not in run.rules
+    assert all(not r["Enabled"] for r in run.foreign.values())
+    assert settings.stage == "isolated"
+    assert set(run.outbound.values()) == {"Block"}
+
+
+def test_the_cut_rule_falls_only_after_the_default_is_block_and_the_allow_rules_are_off():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    ops = run.ops()
+    assert ops.index("DisableAllowOut") < ops.index("SetDefaultOutbound") < ops.index("Remove")
+
+
+def test_a_rule_another_store_keeps_enabled_keeps_the_cut_rule_standing():
+    run, settings = make(foreign={**STOCK, **GPO_RULE})
+    rules_mod.isolate(run, True, settings=settings)
+    done = rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    assert done["stage"] == "cut_policy"
+    assert rules_mod.CUT_RULE in run.rules          # the only thing that closes it there
+    assert done["allowed_out"] and "group policy" in done["note"]
+    assert settings.stage == "cut_policy"
+
+
+def test_converging_stops_at_the_next_call_when_it_is_cancelled():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    done = rules_mod.converge(run, settings=settings, cancelled=lambda: True)
+    assert done["cancelled"] is True and done["stage"] == "cut"
+    assert rules_mod.CUT_RULE in run.rules          # still closed
+    assert run.enabled_foreign() == ["CoreNet-DHCP-Out", DNS_RULE]   # nothing switched off half-way
+    assert "DisableAllowOut" not in run.ops()
+
+
+def test_a_cancel_between_two_steps_stops_before_the_next_one():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    answers = iter([False, True])                    # the Windows rules go off, then it is cancelled
+    done = rules_mod.converge(run, settings=settings, cancelled=lambda: next(answers))
+    assert done["cancelled"] is True and done["stage"] == "cut"
+    assert "DisableAllowOut" in run.ops() and "SetDefaultOutbound" not in run.ops()
+    assert rules_mod.CUT_RULE in run.rules
+    assert settings.allow_disabled                  # the way back was noted before anything was switched off
+
+
+def test_cutting_again_while_isolated_keeps_the_way_back():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    before, disabled = settings.outbound_before, list(settings.allow_disabled)
+    assert before == "Allow" and disabled
+    done = rules_mod.isolate(run, True, settings=settings)
+    assert done["stage"] == "cut"
+    assert settings.outbound_before == before and settings.allow_disabled == disabled
+    assert settings.stage == "cut" and rules_mod.CUT_RULE in run.rules
+
+
+def test_a_failed_converge_leaves_the_cut_standing_and_says_so():
+    run, settings = make(foreign=STOCK, fail={"DisableAllowOut": (1, "denied")})
+    rules_mod.isolate(run, True, settings=settings)
+    done = rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    assert done["stage"] == "cut" and rules_mod.CUT_RULE in run.rules
+    assert "denied" in done["note"] and done["verified"] is False
+    assert settings.isolated is True and settings.allow_disabled   # not rolled back: the way back stays noted
+    assert "EnableAllowOut" not in run.ops()
+
+
+def test_a_failed_cut_of_a_fresh_isolation_leaves_nothing_behind():
+    run, settings = make(foreign=STOCK, fail={"Cut": (1, "access is denied")})
+    with pytest.raises(rules_mod.RuleError):
+        rules_mod.isolate(run, True, settings=settings)
+    assert settings.isolated is False and settings.outbound_before is None and settings.allow_disabled == []
+    assert run.rules == {} and settings.stage == "open"
+
+
+def test_a_profile_that_is_off_cuts_nothing():
+    run, settings = make(foreign=STOCK, profiles={"Domain": True, "Private": True, "Public": False})
+    with pytest.raises(rules_mod.ProfileOffError):
+        rules_mod.isolate(run, True, settings=settings)
+    assert run.rules == {} and settings.saved == [] and "Cut" not in run.ops()
+
+
+def test_a_cancel_just_before_the_cut_rule_falls_leaves_it_standing():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    answers = iter([False, False, False, True])      # Windows' rules off, Block, the read back; then it is cancelled
+    done = rules_mod.converge(run, settings=settings, cancelled=lambda: next(answers))
+    assert done["cancelled"] is True and done["stage"] == "cut" and rules_mod.CUT_RULE in run.rules
+    assert set(run.outbound.values()) == {"Block"} and settings.stage == "cut"
+
+
+def test_a_cut_rule_that_will_not_go_stays_and_the_stage_stays_cut():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    run.op_Remove = lambda p: (0, "", "")             # Remove says nothing and removes nothing
+    done = rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    assert done["stage"] == "cut" and done["verified"] is False and "still there" in done["note"]
+    assert rules_mod.CUT_RULE in run.rules and settings.stage == "cut"
+
+
+def test_a_stage_that_cannot_be_saved_is_said_not_hidden():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    real = settings.set
+
+    def set_(**changes):
+        if "stage" in changes:
+            raise OSError("disk full")
+        return real(**changes)
+    settings.set = set_
+    done = rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    assert done["stage"] == "isolated" and "disk full" in done["note"] and rules_mod.CUT_RULE not in run.rules
+
+
+def test_a_cut_that_is_not_read_back_as_the_catch_all_is_not_verified():
+    run, settings = make(foreign=STOCK, disable_new=True)           # the rule is written, and it stands disabled
+    done = rules_mod.isolate(run, True, settings=settings)
+    assert done["stage"] == "cut" and done["verified"] is False and "disabled" in done["note"]

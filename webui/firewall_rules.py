@@ -34,9 +34,10 @@ TDC's and remembers exactly which (``Settings.allow_disabled``); leaving switche
 from another store, a group policy above all, cannot be switched off locally: what is still enabled is read back
 after the switch (``allowed_out``) and said, and ISOLATED is ``verified`` only when that list is empty. The order is:
 profiles checked, Windows' rules read, the previous ``DefaultOutboundAction``, the rule names and the marker saved
-in ``Settings`` *before* anything changes, Windows' rules switched off, then Block, then read back. Leaving goes
-backwards and is never refused for a profile that is off. Every step is one PowerShell call however many rules
-it touches, because a call costs seconds on a small VM: ISOLATED on is four calls, off is three.
+in ``Settings`` *before* anything changes, then the cut (``isolate``, below); after it ``converge``: Windows' rules
+switched off, then Block, then read back, then the cut rule removed. Leaving goes backwards and is never refused for
+a profile that is off. Every step is one PowerShell call however many rules it touches, because a call costs seconds
+on a small VM.
 
 TDC's own fetch gets its way out **per fetch**, not as a standing rule: ``allow_fetch`` writes an allow rule
 for the fetcher program to the one address it is about to fetch from and ``deny_fetch`` removes it when the
@@ -71,7 +72,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import firewall
 
@@ -984,21 +985,26 @@ def open_text(still: Optional[List[Dict[str, Any]]], error: Optional[str]) -> Op
 
 
 def isolate(run, on: bool, *, settings) -> Dict[str, Any]:
-    """Turn ISOLATED on or off.
+    """Turn ISOLATED on or off. On has two stages: ``isolate`` cuts, ``converge`` tidies up afterwards.
 
     On, in this order: all profiles must be on (``ProfileOffError`` otherwise, with nothing changed). Windows' own enabled
-    outbound Allow rules are read (``allowed_out``); when they cannot be, nothing is changed, because what would stay
-    open is not known. The previous ``DefaultOutboundAction``, the marker and the names of the *local* rules about to
-    be switched off (``settings.allow_disabled``) are saved before anything else changes (when that cannot be saved
-    nothing is touched). Then those rules are switched off, ``DefaultOutboundAction Block`` is set and read back, and what still lets traffic out is read back. When a step
-    fails, a fresh isolation is rolled back in reverse; if even that fails the marker stays and the message names
-    ``scripts/tdc-unisolate.ps1``. Isolating while isolated keeps the first memory of the default action, adds any
-    local rule that is enabled again to the record and switches it off; a marker without a recorded baseline (damaged)
-    gets ``Allow`` as its baseline and ``note`` says so, and a failure there is not rolled back either, because the
-    isolation was already on. Returns ``{"isolated": True, "outbound_before", "verified", "allowed_out",
-    "allowed_out_error", "profiles_off", "note"}``: ``allowed_out`` is what the read back found still enabled (a rule set by a group
-    policy cannot be switched off from here), and ``verified`` is True only when Block was read back **and** that list
-    was read and is empty. ``note`` says what stays open.
+    outbound Allow rules are read (``allowed_out``) together with the profiles; when they cannot be, nothing is changed,
+    because what would stay open is not known. The previous ``DefaultOutboundAction``, the marker and the names of the
+    *local* rules that ``converge`` is about to switch off (``settings.allow_disabled``) are saved before anything else
+    changes (when that cannot be saved nothing is touched). Then ``cut`` writes the one catch-all outbound Block rule and
+    reads it back, ``settings.stage`` becomes ``cut`` and the call returns. That is all that happens here: the egress is
+    shut from that moment (a Block rule beats every Allow rule), and the ~135 Allow rules of Windows are still enabled,
+    the default action still what it was. ``converging`` is True: the slow, thorough part is ``converge``, which the
+    caller runs afterwards and in the background. In stage ``cut`` ``verified`` means that the cut rule was read back
+    as the catch-all, enabled, on all three profiles; it says nothing yet about Windows' own rules, ``allowed_out`` is
+    not part of this answer, and **no fetch is let out while the cut stands** (``allow_fetch`` has nothing to get through).
+    When the cut fails, a fresh isolation is undone (the marker and the memory forgotten, what it may have written
+    removed; if even that fails the marker stays and the message names ``scripts/tdc-unisolate.ps1``). Isolating while
+    isolated cuts again and keeps the first memory of the default action and the record of the rules switched off,
+    adds any local rule that is enabled again to the record, and a marker without a recorded baseline (damaged) gets
+    ``Allow`` as its baseline and ``note`` says so; a failure there is not undone either, because the isolation was
+    already on. Returns ``{"isolated": True, "stage": "cut", "rule_id", "verified", "converging": True,
+    "outbound_before", "profiles_off", "note"}``.
 
     TDC's own fetch is **not** allowed out by this: ``allow_fetch`` opens one address for the time of one fetch
     (see the module docstring).
@@ -1071,39 +1077,106 @@ def _isolate_on(run, settings) -> Dict[str, Any]:
         except Exception as e:
             raise RuleError(f"the way back could not be saved ({type(e).__name__}: {_first_line(e)}); "
                             "nothing was changed") from e
-    step = 0            # 2 Windows' rules off, 3 the default action: how far it got
     try:
-        step = 2
-        _set_allow_out(run, closing, False)       # a rule that stays on is in the read back below
-        step = 3
+        made = cut(run)
+    except Exception as e:
+        if not marker:
+            _roll_back(run, settings, recorded, e)
+            if isinstance(e, RuleError):
+                raise
+            raise RuleError(f"the cut failed: {type(e).__name__}: {_first_line(e)}") from e
+        if isinstance(e, ProfileOffError):
+            raise
+        raise RuleError(f"{_first_line(e)}. ISOLATED was on and stays as it is; the cut was not written again. "
+                        f"Run {UNISOLATE_SCRIPT} on the VM to open the egress.") from e
+    try:
+        settings.set(stage="cut")
+        staged = None
+    except Exception as e:
+        staged = (f"The cut stands, but the stage could not be saved ({type(e).__name__}: {_first_line(e)}); "
+                  "the file may still name an earlier stage.")
+    problem = None if made["verified"] else f"The cut rule is not confirmed: {made['problem']}."
+    return {"isolated": True, "stage": "cut", "rule_id": made["rule_id"], "verified": bool(made["verified"]),
+            "converging": True, "outbound_before": remembered, "profiles_off": [],
+            "note": _join(note, problem, staged)}
+
+
+def converge(run, *, settings, cancelled: Callable[[], bool]) -> Dict[str, Any]:
+    """The thorough half of ISOLATED, after ``isolate`` cut: Windows' own outbound Allow rules that ``isolate`` recorded
+    switched off, ``DefaultOutboundAction Block`` set and read back, what still lets traffic out read back, and then, when
+    nothing does, the cut rule removed. It takes tens of seconds (one call per step, each of them seconds), which is why it
+    is not part of the press: the caller runs it in the background.
+
+    ``cancelled`` is asked before **every** call, and the work stops at the next one when it says True: ``{"cancelled":
+    True, "stage": "cut"}``. The cut rule is still standing then, so the egress is shut; what was switched off stays
+    recorded in ``settings.allow_disabled``, and leaving puts it back. The cut rule falls last, after the default is Block
+    and the rules are off, so that at no moment is anything open. When something is still enabled that cannot be switched
+    off from here (a group policy), the cut rule **stays**: it is the only thing that closes the egress there
+    (``stage`` ``cut_policy``). A step that fails leaves the cut rule standing too and ends in ``stage`` ``cut``, with
+    the failure in ``note``; nothing is rolled back, because the state is closed and the way back is in ``allow_disabled``.
+
+    Returns ``{"stage", "verified", "allowed_out", "allowed_out_error", "cancelled", "note"}``. ``verified`` is True only
+    when Block was read back **and** the list of rules still enabled was read and is empty and the cut rule is read as
+    gone (``isolated``), or the cut rule is read back as standing (``cut_policy``)."""
+    with _LOCK:
+        return _converge(run, settings, cancelled)
+
+
+def _converge(run, settings, cancelled: Callable[[], bool]) -> Dict[str, Any]:
+    def result(stage: str, note: Optional[str] = None, *, verified: bool = False, still=None, error=None,
+               stopped: bool = False) -> Dict[str, Any]:
+        return {"stage": stage, "verified": verified, "allowed_out": still, "allowed_out_error": error,
+                "cancelled": stopped, "note": note}
+
+    try:
+        if cancelled():
+            return result("cut", "Cancelled before anything was switched off; the cut stands.", stopped=True)
+        _set_allow_out(run, getattr(settings, "allow_disabled", None), False)      # one that stays on is read back below
+        if cancelled():
+            return result("cut", "Cancelled after Windows' Allow rules were switched off; the cut stands.", stopped=True)
         off = _off_names(_apply_outbound(run, {n: "Block" for n in PROFILE_NAMES}))
         if off:
             raise RuleError(_off_text(off))
+        if cancelled():
+            return result("cut", "Cancelled after the default action was set to Block; the cut stands.", stopped=True)
+        still, error = _still_open(run)
     except Exception as e:
-        if not marker:
-            _roll_back(run, settings, current, step, closing, e)
-            if isinstance(e, RuleError):
-                raise
-            raise RuleError(f"isolating failed: {type(e).__name__}: {_first_line(e)}") from e
-        raise RuleError(f"{_first_line(e)}. ISOLATED was on and stays as it is, which may cut TDC's fetcher off; "
-                        f"run {UNISOLATE_SCRIPT} on the VM to open the egress.") from e
-    still, error = _still_open(run)
-    return {"isolated": True, "outbound_before": remembered, "verified": still == [], "allowed_out": still,
-            "allowed_out_error": error, "profiles_off": [], "note": _join(note, open_text(still, error))}
-
-
-def _roll_back(run, settings, before: Dict[str, str], step: int, closing: List[str], cause: BaseException) -> None:
-    """A fresh isolation that failed: put back what was there, in reverse. If that fails too the marker stays,
-    because the state is not known and a marker is what makes the next start announce it."""
+        return result("cut", f"The thorough part of ISOLATED did not finish ({_first_line(e)}); the cut stands and the "
+                             "egress is shut. Leaving ISOLATED puts back what was switched off.")
+    if still == []:
+        if cancelled():
+            return result("cut", "Cancelled before the cut rule was removed; the cut stands.", still=still, stopped=True)
+        gone = uncut(run)
+        if not gone["removed"]:
+            return result("cut", f"The cut rule could not be removed ({gone['problem']}); it stands and the egress is shut.",
+                          still=still)
+        stage, verified, note = "isolated", True, None
+    else:
+        stands = cut_stands(run)
+        stage, verified = "cut_policy", stands is True
+        if stands:
+            holds = "The cut rule stays and is read back as standing: it is what closes the egress here."
+        else:
+            holds = "The cut rule could not be read back as standing, so whether the egress is shut is not known."
+        if still is None:
+            note = _join(f"Which of Windows' own outbound Allow rules are still enabled could not be read "
+                         f"({error or 'no answer'}), so the thorough state is not reached.", holds)
+        else:
+            note = _join(open_text(still, error), holds)
     try:
-        if step >= 3:
-            _apply_outbound(run, before)
-        if step >= 2:
-            stuck, problem = _reopen(run, closing)
-            if stuck:
-                raise RuleError(_stuck_text(stuck, problem))
+        settings.set(stage=stage)
+    except Exception as e:
+        note = _join(note, f"The stage could not be saved ({type(e).__name__}: {_first_line(e)}).")
+    return result(stage, note, verified=verified, still=still, error=error)
+
+
+def _roll_back(run, settings, recorded: List[str], cause: BaseException) -> None:
+    """A fresh isolation whose cut failed: forget the marker and the memory (``recorded``, the rules an earlier failed
+    leaving left off, stays) and remove what the cut may have written. If that fails too the marker stays, because
+    the state is not known and a marker is what makes the next start announce it."""
+    try:
         _remove_isolate_rules(run)
-        _forget(settings, [] if step >= 2 else _clean_rule_names(getattr(settings, "allow_disabled", None)))
+        settings.set(isolated=False, outbound_before=None, isolated_since=None, allow_disabled=list(recorded), stage="open")
     except Exception as e:
         raise RuleError(f"isolating failed ({_first_line(cause)}) and could not be undone ({_first_line(e)}); the egress "
                         f"may be shut. Run {UNISOLATE_SCRIPT} on the VM to open it.") from e

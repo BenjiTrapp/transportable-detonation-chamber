@@ -635,7 +635,7 @@ def test_settings_keep_the_way_back_for_isolated(tmp_path):
     again = Settings(path)
     assert (again.isolated, again.outbound_before, again.isolated_since) == (True, "NotConfigured", 1_700_000_000.5)
     assert again.as_dict() == {"ask_mode": "detonation", "isolated": True, "outbound_before": "NotConfigured",
-                               "isolated_since": 1_700_000_000.5, "allow_disabled": []}
+                               "isolated_since": 1_700_000_000.5, "allow_disabled": [], "stage": "open"}
     again.set(isolated=False, outbound_before=None, isolated_since=None)
     assert Settings(path).as_dict() == Settings.DEFAULTS
 
@@ -653,6 +653,27 @@ def test_settings_keep_the_windows_rules_isolated_switched_off(tmp_path):
     damaged = Settings(path)
     assert damaged.allow_disabled == [] and damaged.load_error
     assert Settings.DEFAULTS["allow_disabled"] == []
+
+
+def test_the_stage_is_open_by_default_and_survives_a_restart(tmp_path):
+    path = str(tmp_path / "state.json")
+    s = Settings(path)
+    assert s.stage == "open" and Settings.DEFAULTS["stage"] == "open"
+    for stage in ("cut", "isolated", "cut_policy", "open"):
+        s.set(stage=stage)
+        assert Settings(path).stage == stage
+
+
+def test_a_stage_that_is_not_one_of_the_four_is_refused_and_a_file_with_one_gives_the_default(tmp_path):
+    path = tmp_path / "state.json"
+    s = Settings(str(path))
+    s.set(stage="cut")
+    with pytest.raises(ValueError):
+        s.set(stage="nonsense")
+    assert s.stage == "cut" and Settings(str(path)).stage == "cut"
+    path.write_text(json.dumps({"stage": "nonsense", "isolated": True}), encoding="utf-8")
+    odd = Settings(str(path))
+    assert (odd.stage, odd.isolated) == ("open", True) and "stage" in odd.load_error
 
 
 def test_settings_refuse_wrong_values_and_change_nothing(tmp_path):
