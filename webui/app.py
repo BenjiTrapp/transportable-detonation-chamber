@@ -11280,8 +11280,9 @@ def _fw_keep_allowed_out(found, error):
 
 
 def _fw_allowed_out():
-    """``(rules, error)`` of what ISOLATED does not close; ``(None, None)`` while ISOLATED is off."""
-    if not _fw_settings.isolated:
+    """``(rules, error)`` of what ISOLATED does not close; ``(None, None)`` while ISOLATED is off, and in stage ``cut``,
+    where it is not read on purpose: the catch-all rule closes whatever they allow, and ``converge`` reads them."""
+    if not _fw_settings.isolated or _fw_settings.stage == "cut":
         return None, None
     with _fw_profiles_lock:
         cached = _fw_allowed_cache
@@ -12137,6 +12138,7 @@ _fw_converge_note = None                          # the note of the last round, 
 _fw_converge_gen = 0                              # counts the presses, so a round's result never outranks a later cut
 _fw_cut_verified = None                           # the cut rule read back by the press (or by converge in cut_policy)
 _fw_leaving = 0                                   # leaves under way: every round stops at its next step meanwhile
+_fw_pressing = 0                                  # presses under way: a cut rule may stand before the stage says so
 
 
 def _fw_converge_thread(target):
@@ -12172,6 +12174,8 @@ def _fw_converge_worker():
                 if gen == _fw_converge_gen:            # no later press cut again meanwhile
                     if result is None:
                         _fw_cut_verified = None        # unknown: the failure may have been in removing the rule
+                    elif result["stage"] == "isolated" and _fw_settings.stage != "isolated":
+                        _fw_cut_verified = None        # the rule is gone but the stage was not saved: nothing to verify
                     elif result["stage"] == "cut_policy" and not result["cancelled"] and not result["refused"]:
                         _fw_cut_verified = bool(result["verified"])    # converge read the rule back itself
                     # every other answer read nothing back (cancelled, refused, a step failed): the press's stands
@@ -12179,6 +12183,9 @@ def _fw_converge_worker():
                     _fw_converge_running = False
                     finished = True
                     return
+    except BaseException:
+        _log_logger.exception("firewall: the convergence worker of ISOLATED stopped unexpectedly")
+        raise
     finally:
         if not finished:                               # something above the catches failed: never stay "converging"
             with _fw_converge_lock:
@@ -12213,21 +12220,30 @@ def _fw_converge_start(verified):
 def _fw_converge_cancel(leaving=False):
     """Stop the running round at its next step (and no further round); call it **before** calling firewall_rules.
     True when a worker was running."""
-    global _fw_converge_again, _fw_leaving
+    global _fw_converge_again, _fw_leaving, _fw_pressing
     with _fw_converge_lock:
         _fw_converge_again = False
         _fw_converge_event.set()
         if leaving:
             _fw_leaving += 1
+        else:
+            _fw_pressing += 1
         return _fw_converge_running
 
 
 def _fw_left():
+    """After a leave, whether it worked or not: a failed one may have put the default action back to Allow before it
+    stopped, and it read nothing back about the cut rule, so the press's read-back no longer says anything."""
     global _fw_leaving, _fw_cut_verified
     with _fw_converge_lock:
         _fw_leaving -= 1
-        if not _fw_settings.isolated:
-            _fw_cut_verified = None
+        _fw_cut_verified = None
+
+
+def _fw_pressed():
+    global _fw_pressing
+    with _fw_converge_lock:
+        _fw_pressing -= 1
 
 
 # ---- routes ---------------------------------------------------------------------------------
@@ -12421,11 +12437,12 @@ def _fw_cut_rule_listed():
 
 
 def _fw_cut_may_stand():
-    """True while TDC's own cut rule is meant to stand: the marker is there and the thorough stage is not reached.
+    """True while TDC's own cut rule may stand: a press is under way (its ``Cut`` can be written before the stage
+    is saved, and the cached rule list predates it), or the marker is there and the thorough stage is not reached.
 
     The marker is the authority, not the stage: start-up can save stage ``open`` beside a marker while the cut rule
     holds (a profile was off), and that is no state in which a fetch gets out."""
-    return bool(_fw_settings.isolated) and _fw_settings.stage != "isolated"
+    return _fw_pressing > 0 or (bool(_fw_settings.isolated) and _fw_settings.stage != "isolated")
 
 
 def _fw_state_can_fetch():
@@ -12490,8 +12507,9 @@ def _fw_isolate_state():
 def api_firewall_isolate():
     """GET: the state (isolated, the remembered outbound action, which firewall profiles are off, the start-up
     note, ``residual``: what ISOLATED does not close, ``allowed_out``: Windows' own outbound Allow rules that are
-    still enabled while ISOLATED is on, read back (``null`` while it is off or when ``allowed_out_error`` says it
-    could not be read), ``allow_disabled``: how many of them ISOLATED holds switched off, and
+    still enabled while ISOLATED is on, read back (``null`` with no ``allowed_out_error`` while it is off and in stage
+    ``cut``, where they are not read on purpose because the catch-all rule closes whatever they allow; ``null`` with
+    ``allowed_out_error`` when they could not be read), ``allow_disabled``: how many of them ISOLATED holds switched off, and
     ``fetch_paths_open``: a way out of a finished fetch that would not close again — all for the banner).
     POST ``{on: bool}``: switch ISOLATED; 409 when the Windows Firewall is off (it would accept the change and do nothing).
 
@@ -12525,13 +12543,12 @@ def api_firewall_isolate():
         if not on:
             _fw_left()
         elif done is not None:
-            # the press does not read Windows' Allow rules, so its answer costs no call for them; kept before the
-            # worker starts, so that the worker's forgetting always comes after it
-            _fw_keep_allowed_out(done.get("allowed_out"), done.get("allowed_out_error"))
             # only the press's own read-back counts as verified; converge's answer is never laid over it
             _fw_converge_start(done["verified"])
         elif stopped and _fw_settings.isolated:
             _fw_converge_start(None)       # a refused press stopped the round of an isolation that stays on
+        if on:
+            _fw_pressed()                  # after the start: the stage the press saved now says what holds
     if done.get("profiles_off") is not None:
         _fw_keep_profiles(done["profiles_off"])                                      # just read back
     if on:

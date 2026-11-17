@@ -1372,7 +1372,15 @@ def startup_state(run, settings) -> Dict[str, Any]:
       outbound open they are switched on again too; announced if any stays off. A stage saved without a marker is set back
       to ``open``.
     - cannot read the firewall: the marker is believed, announced.
+
+    It holds the module's lock for its whole run: it writes the stage, can forget the marker and can switch rules on,
+    and a press or a convergence must not interleave with that.
     """
+    with _LOCK:
+        return _startup_state(run, settings)
+
+
+def _startup_state(run, settings) -> Dict[str, Any]:
     marker = bool(settings.isolated)
     saved = getattr(settings, "stage", "open")
     if not marker and saved != "open":

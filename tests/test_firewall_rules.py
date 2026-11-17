@@ -934,6 +934,25 @@ def test_startup_with_nothing_to_say_says_nothing():
                      "stage": "open"}
 
 
+def test_startup_waits_for_a_rule_run_that_holds_the_lock():
+    """It writes the stage, can forget the marker and switch rules on: a press or a convergence must not interleave."""
+    import threading
+    run, settings = FakeRun(outbound="Allow"), FakeSettings(isolated=True, outbound_before="Allow")
+    started, answers = threading.Event(), []
+
+    def start_up():
+        started.set()
+        answers.append(rules_mod.startup_state(run, settings))
+    with rules_mod._LOCK:                       # a convergence is running
+        worker = threading.Thread(target=start_up)
+        worker.start()
+        assert started.wait(5)
+        worker.join(0.2)
+        assert worker.is_alive() and run.calls == [] and settings.isolated is True
+    worker.join(5)
+    assert answers and run.calls and settings.isolated is False          # it ran once the lock was free
+
+
 def test_a_marker_over_an_open_egress_is_cleared_because_the_hatch_was_used():
     run, settings = FakeRun(outbound="Allow"), FakeSettings(isolated=True, outbound_before="Allow", isolated_since=1.0)
     state = rules_mod.startup_state(run, settings)

@@ -191,7 +191,7 @@ def fw(tdc, monkeypatch, tmp_path):
                         # no thread of its own: a test runs the worker with fake.converge(), or swaps in the real spawn
                         ("_fw_converge_spawn", fake.spawn), ("_fw_converge_event", threading.Event()),
                         ("_fw_converge_running", False), ("_fw_converge_again", False), ("_fw_converge_note", None),
-                        ("_fw_converge_gen", 0), ("_fw_cut_verified", None), ("_fw_leaving", 0)):
+                        ("_fw_converge_gen", 0), ("_fw_cut_verified", None), ("_fw_leaving", 0), ("_fw_pressing", 0)):
         monkeypatch.setattr(m, name, value)
     monkeypatch.setattr(m, "_process_started_at", lambda pid: None)
     # the fetch mechanism itself (real sockets, the deadline, the SNI) is tested in test_firewall_fetch.py;

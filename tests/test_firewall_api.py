@@ -1931,3 +1931,93 @@ def test_the_block_route_refuses_loopback_with_the_reason(client, fw):
         r = client.post("/api/firewall/block", json=body)
         assert r.status_code == 409 and "does not filter loopback" in r.json["error"], body
     assert fw.run.rules == {} and "Create" not in fw.run.ops()
+
+
+# ---- what the state no longer claims after a failed leave, a failed save, or while a press is under way -----
+
+
+def test_a_leave_that_fails_half_way_does_not_leave_the_cut_verified(client, fw):
+    client.post("/api/firewall/isolate", json={"on": True})
+    fw.run.fail["RemoveIsolate"] = (1, "Access is denied.")
+    r = client.post("/api/firewall/isolate", json={"on": False})
+    assert r.status_code == 500
+    assert fw.run.outbound == {"Domain": "Allow", "Private": "Allow", "Public": "Allow"}   # already put back
+    state = client.get("/api/firewall/isolate").json
+    assert state["isolated"] is True and state["stage"] == "cut"
+    assert state["verified"] is False and state["can_fetch"] is False
+
+
+def test_a_cut_rule_removed_with_the_stage_unsaved_is_not_verified_from_the_press(client, fw, monkeypatch):
+    client.post("/api/firewall/isolate", json={"on": True})
+    real = fw.settings.set
+
+    def no_isolated_stage(**changes):
+        if changes.get("stage") == "isolated":
+            raise OSError("disk full")
+        return real(**changes)
+    monkeypatch.setattr(fw.settings, "set", no_isolated_stage)
+    fw.converge()
+    assert "TDC-FW-ISO-cut" not in fw.run.rules and fw.settings.stage == "cut"
+    state = client.get("/api/firewall/isolate").json
+    assert state["verified"] is False and "could not be saved" in state["converge_note"]
+
+
+def test_a_press_from_stage_isolated_never_claims_a_fetch_while_its_cut_is_being_written(client, fw, tdc, monkeypatch):
+    client.post("/api/firewall/isolate", json={"on": True})
+    fw.converge()
+    client.get("/api/firewall/connections")                   # the cached rule list: no cut rule in it
+    assert client.get("/api/firewall/isolate").json["can_fetch"] is True
+    inside, gate = _hang_in(fw, "Cut")
+    answers = []
+    presser = threading.Thread(target=lambda: answers.append(
+        tdc.app.test_client().post("/api/firewall/isolate", json={"on": True})))
+    presser.start()
+    assert inside.wait(10)                                    # the cut is being written, the stage still isolated
+    assert fw.settings.stage == "isolated"
+    assert client.get("/api/firewall/isolate").json["can_fetch"] is False
+    fw.pending.add(FINDING, deadline=time.time() + 30)
+    assert client.get("/api/firewall/pending").json["pending"][0]["can_fetch"] is False
+    gate.set()
+    presser.join(10)
+    assert answers[0].status_code == 200 and client.get("/api/firewall/isolate").json["can_fetch"] is False
+
+
+def test_in_stage_cut_the_allow_list_is_not_read_and_the_state_says_so(client, fw, tdc):
+    client.post("/api/firewall/isolate", json={"on": True})
+    with tdc._fw_profiles_lock:
+        tdc._fw_allowed_cache = None                          # whatever the cache: in stage cut it is not read
+    state = client.get("/api/firewall/isolate").json
+    assert state["stage"] == "cut" and state["allowed_out"] is None and state["allowed_out_error"] is None
+    assert "AllowOut" not in fw.run.ops()
+    doc = " ".join(tdc.api_firewall_isolate.__doc__.split())
+    assert "while it is off and in stage ``cut``, where they are not read on purpose" in doc
+
+
+def test_stage_isolated_with_an_unreadable_rule_list_does_not_know_whether_a_fetch_can_go(client, fw):
+    client.post("/api/firewall/isolate", json={"on": True})
+    fw.converge()
+    fw.run.fail["List"] = (1, "Access is denied.")
+    client.get("/api/firewall/connections")                   # the poll finds the list unreadable
+    state = client.get("/api/firewall/isolate").json
+    assert state["stage"] == "isolated" and state["can_fetch"] is None
+
+
+def test_a_worker_that_cannot_be_started_says_so(client, fw, tdc, monkeypatch):
+    def refuse(target):
+        raise RuntimeError("can't start new thread")
+    monkeypatch.setattr(tdc, "_fw_converge_spawn", refuse)
+    r = client.post("/api/firewall/isolate", json={"on": True})
+    assert r.status_code == 200 and r.json["stage"] == "cut" and r.json["converging"] is False
+    state = client.get("/api/firewall/isolate").json
+    assert state["converging"] is False and "could not be started" in state["converge_note"]
+    assert "can't start new thread" in state["converge_note"] and state["verified"] is True
+
+
+def test_a_worker_that_dies_outside_its_catches_is_logged_and_says_so(client, fw, tdc, monkeypatch, caplog):
+    client.post("/api/firewall/isolate", json={"on": True})
+    monkeypatch.setattr(tdc.firewall_rules, "converge", lambda *a, **k: {"note": None})    # no stage: a KeyError
+    with caplog.at_level("ERROR"), pytest.raises(KeyError):
+        fw.converge()
+    assert any("stopped unexpectedly" in r.getMessage() for r in caplog.records)
+    state = client.get("/api/firewall/isolate").json
+    assert state["converging"] is False and "stopped unexpectedly" in state["converge_note"]
