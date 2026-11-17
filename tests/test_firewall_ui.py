@@ -684,7 +684,7 @@ def test_the_isolated_button_says_it_is_working_and_takes_no_second_click():
         let release;
         const held = new Promise(res => { release = res; });
         answer = url => url === '/api/firewall/isolate'
-            ? held.then(() => reply({ isolated: true, stage: 'cut', verified: true, converging: true, note: null,
+            ? held.then(() => reply({ isolated: true, stage: 'cut', verified: true, converging: true, note: null, profiles_off: [],
                 state: { isolated: true, stage: 'cut', verified: true, converging: true, profiles_off: [] } }))
             : reply({});
         const first = fwToggleIsolated();
@@ -2234,16 +2234,18 @@ CUT_STATES = [
           allowed_out=[{"name": "{gpo}", "display": "Lab proxy out", "source": "GroupPolicy"}]), "ISOLATED · OPEN", "cut", False),
     (dict(HELD, isolated=True, stage="cut_policy", converging=False, verified=True, can_fetch=False,
           allowed_out=[{"name": "{gpo}", "display": "Lab proxy out", "source": "GroupPolicy"}]), "CUT · NO FETCH", "leave", False),
-    (dict(HELD, isolated=False, stage="open", profiles_off=["Public"], can_fetch=None), "CUT THE NETWORK", "cut", True),
+    (dict(HELD, isolated=False, stage="open", profiles_off=["Public"], can_fetch=None), "CUT THE NETWORK", "none", True),
     # Not in the spec's table, and never shown as closed: a marker beside stage open (start-up found a profile off),
     # an ISOLATED whose Allow list could not be read, one whose Block was not read back on every profile
     (dict(HELD, isolated=True, stage="open", verified=False, can_fetch=False), "ISOLATED · NOT CONFIRMED", "cut", False),
     (dict(HELD, isolated=True, stage="isolated", verified=False, allowed_out_error="rpc"), "ISOLATED · NOT CONFIRMED", "cut", False),
     (dict(HELD, isolated=True, stage="isolated", verified=False, allowed_out=[]), "ISOLATED · NOT CONFIRMED", "cut", False),
-    # A firewall switched off under a cut or an isolation: cutting cannot be done, so a press leaves, and is not disabled
-    (dict(HELD, isolated=True, stage="cut", converging=True, verified=True, profiles_off=["Public"]), "CUT · SECURING…", "leave", False),
+    # A firewall switched off under a cut or an isolation: nothing is enforced, whatever was read back, and the
+    # button is disabled (it cannot cut, and a panic press must not open the network); leaving is in the off band
+    (dict(HELD, isolated=True, stage="cut", converging=True, verified=True, profiles_off=["Public"]), "CUT · FIREWALL OFF", "none", True),
+    (dict(HELD, isolated=True, stage="cut_policy", verified=True, profiles_off=["Public"]), "CUT · FIREWALL OFF", "none", True),
     (dict(HELD, isolated=True, stage="isolated", verified=False, allowed_out=[], profiles_off=["Public"]),
-     "ISOLATED · NOT CONFIRMED", "leave", False),
+     "ISOLATED · FIREWALL OFF", "none", True),
     # A way out a finished fetch left open lets traffic out as much as an Allow rule does: not shown as closed
     (dict(HELD, isolated=True, stage="isolated", verified=True, allowed_out=[],
           fetch_paths_open=[{"rule_id": "TDC-FW-ISO-fetch-0123456789ab", "problem": "denied"}]), "ISOLATED · OPEN", "cut", False),
@@ -2361,6 +2363,8 @@ def test_whether_tdc_can_secure_a_sample_is_said_in_three_values():
     def note(can_fetch, loaded=True):
         isolate = dict(HELD, isolated=False, stage="open", can_fetch=can_fetch) if loaded else None
         return cut_view(isolate)["note"]
+    # Nothing is read to say no cut stands (a crash can leave a cut rule without a marker): only what TDC is doing
+    assert ">TDC is not isolating the chamber.<" in note(True) and "Not cut" not in note(True)
     assert ">TDC can secure a sample now.<" in note(True)
     assert ">TDC cannot secure a sample now" in note(False)
     for unknown in (note(None), note(None, loaded=False)):    # null, and the state not read yet: not known either
@@ -2446,24 +2450,38 @@ def test_the_help_names_the_cut_and_its_stages():
 
 def _confirmed_closed(iso):
     """The rule, read from the fields of GET /isolate on their own: only what was read back closed is closed."""
-    if not iso["isolated"] or iso.get("verified") is not True:
+    if not iso["isolated"] or iso.get("verified") is not True or iso.get("profiles_off") != []:
         return False
     if iso["stage"] in ("cut", "cut_policy"):
         return True
     return iso["stage"] == "isolated" and iso.get("allowed_out") == [] and not iso.get("fetch_paths_open")
 
 
+MISSING = object()
+
+
 def _every_state():
-    """Every combination of what decides the press, not only the rows of the table."""
-    out = [dict(HELD, isolated=False, stage="open", profiles_off=off) for off in ([], ["Public"])]
+    """Every combination of what decides the press and what is shown, not only the rows of the table: the stage,
+    verified, the worker, the Allow list (read, empty, open, not there at all) and its error, a way out a fetch left
+    open, the profiles (on, one off, unreadable) and can_fetch in its three values."""
+    out = []
+    for off in ([], ["Public"], None):
+        for can in (True, False, None):
+            out.append(dict(HELD, isolated=False, stage="open", profiles_off=off, can_fetch=can))
     for stage in ("open", "cut", "isolated", "cut_policy"):
         for verified in (True, False, None):
             for converging in (True, False):
-                for allowed in (None, [], [{"name": "{gpo}", "display": "Lab proxy out", "source": "GroupPolicy"}]):
-                    for holes in ([], [{"rule_id": "TDC-FW-ISO-fetch-0123456789ab", "problem": "denied"}]):
-                        for off in ([], ["Public"]):
-                            out.append(dict(HELD, isolated=True, stage=stage, verified=verified, converging=converging,
-                                            allowed_out=allowed, fetch_paths_open=holes, profiles_off=off))
+                for allowed in (MISSING, None, [], [{"name": "{gpo}", "display": "Lab proxy out", "source": "GroupPolicy"}]):
+                    for error in (None, "rpc <x>"):
+                        for holes in ([], [{"rule_id": "TDC-FW-ISO-fetch-0123456789ab", "problem": "denied"}]):
+                            for off in ([], ["Public"], None):
+                                for can in (True, False, None):
+                                    iso = dict(HELD, isolated=True, stage=stage, verified=verified, converging=converging,
+                                               allowed_out=allowed, allowed_out_error=error, fetch_paths_open=holes,
+                                               profiles_off=off, can_fetch=can)
+                                    if allowed is MISSING:
+                                        del iso["allowed_out"]
+                                    out.append(iso)
     return out
 
 
@@ -2483,13 +2501,13 @@ def test_the_press_cuts_unless_closed_is_confirmed_and_then_leaves_after_asking(
         }
         console.log(JSON.stringify(out));""" % json.dumps(states))
     for iso, got in zip(states, r):
-        can_cut = not iso["profiles_off"]
-        if not _confirmed_closed(iso) and can_cut:
+        if iso["profiles_off"]:
+            # the firewall off: it cannot cut, and a reflexive press must not become "open the network again"
+            assert got == {"action": "none", "asked": 0, "sent": []}, (iso, got)
+        elif not _confirmed_closed(iso):
             assert got == {"action": "cut", "asked": 0, "sent": [{"on": True}]}, (iso, got)      # a panic press never does nothing
-        elif iso["isolated"]:
-            assert got == {"action": "leave", "asked": 1, "sent": []}, (iso, got)               # declined: nothing sent
         else:
-            assert got["sent"] == [] and got["asked"] == 0, (iso, got)                          # firewall off: nothing can be cut
+            assert got == {"action": "leave", "asked": 1, "sent": []}, (iso, got)               # declined: nothing sent
 
 
 @needs_node
@@ -2509,18 +2527,25 @@ def test_the_band_offers_the_other_action_so_no_state_is_a_dead_end():
                 onFirewallClick(leave);
                 for (let i = 0; i < 30; i++) await Promise.resolve();
             }
-            out.push({ action, leaveButton: (bands.match(/<button[^>]*data-fw-leave[^>]*>([^<]*)<\/button>/) || [])[1] || null,
+            out.push({ action, readBack: /read back/i.test(bands.replace(/was not read back/g, '')),
+                isolatedBand: bands.includes('fw-band-isolated'), leaves: (bands.match(/data-fw-leave/g) || []).length,
+                leaveButton: (bands.match(/<button[^>]*data-fw-leave[^>]*>([^<]*)<\/button>/) || [])[1] || null,
                 asked: confirms.length - c, sent: calls.filter(x => x.method === 'POST').slice(p).map(x => x.body) });
             fwIsoSwitching = '';
         }
-        console.log(JSON.stringify(out));
-        process.exit(0);""" % json.dumps(states))
+        // a long answer: exit only once it is written out
+        process.stdout.write(JSON.stringify(out) + '\n', () => process.exit(0));""" % json.dumps(states))
     for iso, got in zip(states, r):
-        if got["action"] == "cut":
-            # the press re-cuts, so leaving is one press away in the band, and it asks first
-            assert got["leaveButton"] == "LEAVE ISOLATED" and got["asked"] == 1 and got["sent"] == [{"on": False}], (iso, got)
+        if got["action"] in ("cut", "none"):
+            # the press re-cuts, or the firewall is off and it is disabled: leaving is one press away in a band,
+            # once, and it asks first
+            assert got["leaveButton"] == "LEAVE ISOLATED" and got["leaves"] == 1, (iso, got)
+            assert got["asked"] == 1 and got["sent"] == [{"on": False}], (iso, got)
         else:
             assert got["leaveButton"] is None, (iso, got)                  # the press itself leaves
+        if iso["profiles_off"]:
+            # nothing is enforced: no band says something was read back as standing
+            assert not got["readBack"] and not got["isolatedBand"], (iso, got)
 
 
 def test_the_cut_card_stays_in_view_while_its_column_scrolls():

@@ -1764,13 +1764,18 @@ def test_a_second_press_during_the_convergence_waits_for_one_call_and_the_worker
     assert tdc._fw_converge_note is None
 
 
-def test_a_refused_second_press_keeps_the_isolation_converging_and_its_cut_verified(client, fw):
+def test_a_refused_second_press_keeps_the_isolation_converging_and_its_cut_verified(client, fw, tdc):
     client.post("/api/firewall/isolate", json={"on": True})
     fw.profiles = {"Domain": True, "Private": False, "Public": True}
     r = client.post("/api/firewall/isolate", json={"on": True})                # it stopped the round, then refused
     assert r.status_code == 409 and fw.settings.isolated is True
     state = client.get("/api/firewall/isolate").json
-    assert state["converging"] is True and state["verified"] is True and _workers_started(fw) == 1
+    # While the profile is off the rule is not in force, so not verified; the press's read-back is kept for later
+    assert state["converging"] is True and state["verified"] is False and _workers_started(fw) == 1
+    fw.profiles = {"Domain": True, "Private": True, "Public": True}
+    with tdc._fw_profiles_lock:
+        tdc._fw_profiles_cache = None
+    assert client.get("/api/firewall/isolate").json["verified"] is True
 
 
 def test_a_worker_that_runs_after_a_leave_changes_nothing(client, fw):
@@ -1897,6 +1902,37 @@ def test_stage_isolated_with_a_profile_off_or_the_profiles_unreadable_is_not_ver
         tdc._fw_profiles_cache = None
     state = client.get("/api/firewall/isolate").json
     assert state["stage"] == "isolated" and state["verified"] is False and state["profiles_off"] is None
+
+
+def test_a_cut_is_not_verified_while_a_profile_is_off_or_the_profiles_are_unreadable(client, fw, tdc):
+    """A rule does nothing on a profile whose firewall is off: the cut rule read back as written is not in force
+    there. cut() refuses while a profile is off, so this is a profile switched off after the cut."""
+    from test_firewall_rules import GPO_RULE, STOCK
+    for policy in (False, True):
+        if policy:
+            fw.run.foreign = {n: dict(r) for n, r in {**STOCK, **GPO_RULE}.items()}
+        client.post("/api/firewall/isolate", json={"on": True})
+        if policy:
+            fw.converge()
+        stage = "cut_policy" if policy else "cut"
+        with tdc._fw_profiles_lock:
+            tdc._fw_profiles_cache = None
+        assert client.get("/api/firewall/isolate").json["verified"] is True, stage
+        fw.profiles = {"Domain": True, "Private": True, "Public": False}
+        with tdc._fw_profiles_lock:
+            tdc._fw_profiles_cache = None
+        state = client.get("/api/firewall/isolate").json
+        assert state["stage"] == stage and state["profiles_off"] == ["Public"] and state["verified"] is False, state
+        fw.profiles = {"Domain": True, "Private": True, "Public": True}
+        fw.run.fail["Profiles"] = (1, "Access is denied.")
+        with tdc._fw_profiles_lock:
+            tdc._fw_profiles_cache = None
+        state = client.get("/api/firewall/isolate").json
+        assert state["stage"] == stage and state["profiles_off"] is None and state["verified"] is False, state
+        fw.run.fail.pop("Profiles")
+        with tdc._fw_profiles_lock:
+            tdc._fw_profiles_cache = None
+        assert client.post("/api/firewall/isolate", json={"on": False}).status_code == 200
 
 
 def test_the_profile_read_for_verified_is_the_same_cached_read_as_profiles_off(client, fw, tdc):

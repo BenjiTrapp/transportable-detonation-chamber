@@ -12459,6 +12459,9 @@ def _fw_state_can_fetch():
 def _fw_isolate_verified(allowed, off):
     """``verified`` of the state: whether what closes the egress in this stage was read back. None while not isolated.
 
+    In **every** stage it needs every firewall profile read and on (``off == []``): a rule does nothing on a profile
+    whose firewall is off, so a rule read back as written is not in force there. ``cut()`` refuses while a profile is
+    off, so in the cut stages this is a profile switched off after the cut, the case that must not read as closed.
     In ``cut`` and ``cut_policy`` it is the catch-all rule as the press read it back (or ``converge`` in
     ``cut_policy``), and nothing about the Allow list: a Block rule beats every Allow rule. In ``isolated`` the rule
     is gone, so it is the default action Block in force on every profile, all of them on, **and** the Allow list as
@@ -12466,12 +12469,14 @@ def _fw_isolate_verified(allowed, off):
     and TDC writes nothing by itself about that (it changes enforcement on a press only)."""
     if not _fw_settings.isolated:
         return None
+    if off != []:                                  # a profile off, or the profiles unreadable: nothing confirmed in force
+        return False
     stage = _fw_settings.stage
     if stage == "isolated":
         # the cut rule is gone here, so the default action is the one thing that holds the egress: Block in force
-        # on all three profiles, each of them on, read now, and nothing let out beside it
+        # on all three profiles, read now, and nothing let out beside it
         blocking = _fw_outbound_blocking()
-        return (allowed == [] and off == [] and blocking is not None
+        return (allowed == [] and blocking is not None
                 and sorted(blocking) == sorted(firewall_rules.PROFILE_NAMES))
     if stage in ("cut", "cut_policy"):
         return _fw_cut_verified is True
