@@ -2,7 +2,9 @@
 # The way out of ISOLATED mode when the Web UI cannot be reached.
 #
 # What it does, and only this:
-#   1. sets DefaultOutboundAction to Allow on the Domain, Private and Public profiles
+#   1. opens the default outbound action of the Domain, Private and Public profiles: each goes back to the
+#      value ISOLATED recorded (outbound_before in firewall_state.json) when that is Allow or NotConfigured, so the
+#      firewall is configured as it was found, and to Allow otherwise
 #   2. switches on again the outbound Allow rules of Windows' own that ISOLATED switched off (Core Networking's
 #      DNS among them): exactly the names recorded in allow_disabled of the web UI's firewall_state.json, and only
 #      outbound Allow rules of this machine (the PersistentStore)
@@ -11,9 +13,9 @@
 #   4. says what it did
 #
 # It does not switch the firewall on or off, and it touches no other rule.
-# It sets Allow, the Windows default; the default action ISOLATED remembered (outbound_before in
-# firewall_state.json) is not read here. If the VM was on Block before ISOLATED, put that back by hand:
-#   Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Block
+# It never puts back Block: it is the way out. If the VM was on Block before ISOLATED, it says so, and that is
+# put back by hand:
+#   Set-NetFirewallProfile -PolicyStore PersistentStore -Profile Domain,Private,Public -DefaultOutboundAction Block
 # The file is only read, never written: the Web UI notices at its next start that the marker in it is stale,
 # switches the recorded rules on again (which changes nothing they already are) and clears it.
 #
@@ -34,14 +36,6 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([S
 
 Write-Host "=== TDC: leaving ISOLATED mode ===" -ForegroundColor Cyan
 
-try {
-    Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Allow -ErrorAction Stop
-    Write-Host "[+] DefaultOutboundAction is now Allow on Domain, Private and Public" -ForegroundColor Green
-} catch {
-    Write-Host "[!] Could not set DefaultOutboundAction: $($_.Exception.Message)" -ForegroundColor Red
-    $failed = $true
-}
-
 $recorded = @()
 $stateRead = $false
 if (Test-Path -LiteralPath $StateFile) {
@@ -57,6 +51,37 @@ if (Test-Path -LiteralPath $StateFile) {
     Write-Host "[*] No $($StateFile): no Windows rule recorded as switched off by ISOLATED" -ForegroundColor Gray
     $stateRead = $true
 }
+# What was configured before ISOLATED, per profile (outbound_before: "Allow", "NotConfigured", "Block", or
+# "Domain=...,Private=...,Public=..."). Only an opening value is put back; Block, or nothing readable, becomes Allow.
+$profileNames = @('Domain', 'Private', 'Public')
+$before = @{}
+$text = if ($state -and $state.outbound_before -is [string]) { $state.outbound_before.Trim() } else { '' }
+if ($text -in @('Allow', 'NotConfigured', 'Block')) {
+    foreach ($n in $profileNames) { $before[$n] = $text }
+} elseif ($text) {
+    foreach ($part in $text.Split(',')) {
+        $kv = $part.Split('=')
+        if ($kv.Count -eq 2 -and $profileNames -contains $kv[0].Trim() -and @('Allow', 'NotConfigured', 'Block') -contains $kv[1].Trim()) {
+            $before[$kv[0].Trim()] = $kv[1].Trim()
+        }
+    }
+}
+foreach ($n in $profileNames) {
+    $value = if ($before[$n] -in @('Allow', 'NotConfigured')) { $before[$n] } else { 'Allow' }
+    try {
+        Set-NetFirewallProfile -PolicyStore PersistentStore -Profile $n -DefaultOutboundAction $value -ErrorAction Stop
+        Write-Host "[+] $($n): DefaultOutboundAction is now $value" -ForegroundColor Green
+        if ($before[$n] -eq 'Block') {
+            Write-Host "    It was Block before ISOLATED; put that back by hand if it is wanted." -ForegroundColor Yellow
+        } elseif (-not $before[$n]) {
+            Write-Host "    No recorded value before ISOLATED; Allow, the Windows default, was used." -ForegroundColor Gray
+        }
+    } catch {
+        Write-Host "[!] $($n): could not set DefaultOutboundAction: $($_.Exception.Message)" -ForegroundColor Red
+        $failed = $true
+    }
+}
+
 if (-not $stateRead) {
     Write-Host "    The ones that are off now:  Get-NetFirewallRule -PolicyStore PersistentStore -Direction Outbound -Action Allow -Enabled False" -ForegroundColor Yellow
 }

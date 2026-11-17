@@ -7,7 +7,8 @@
 # because that joins the arguments into one line of PowerShell and parses it.
 #
 # Verbs:
-#   Profiles            [{"Name","Enabled","DefaultOutboundAction"}] of the three profiles, as in force
+#   Profiles            [{"Name","Enabled","DefaultOutboundAction","Configured"}] of the three profiles:
+#                       DefaultOutboundAction as in force (ActiveStore), Configured as set (PersistentStore)
 #   Enable              switch the three profiles on
 #   List                {"profiles": [...], "rules": [...]}: every rule named TDC-FW-*
 #   Get -Name           the one rule as JSON, or no output at all when there is none
@@ -15,7 +16,7 @@
 #                       an outbound rule. Exit 3: a profile is off (nothing is written). Exit 4: the rule is already there.
 #   Remove -Name        remove the rule (no error when it is not there)
 #   SetDefaultOutbound -DefaultOutboundAction [-Profiles Domain,Private]
-#                       and then the three profiles as Profiles gives them, read back
+#                       in the PersistentStore, then the three profiles as Profiles gives them, read back
 #   AllowOut            {"profiles": [...], "rules": [{"Name","DisplayName","Group","Source"}]}: the profiles as
 #                       Profiles gives them, and every enabled outbound Allow rule in
 #                       force (ActiveStore) that is not TDC's. DefaultOutboundAction Block governs only traffic that no
@@ -61,12 +62,22 @@ function Assert-OurName {
     }
 }
 
+# Two stores, two questions; do not collapse them into one read.
+#   DefaultOutboundAction: the ActiveStore, what is IN FORCE. NotConfigured resolves there (to Allow, or to what a
+#     group policy sets). "Is ISOLATED in force?", Enabled and everything that is claimed read this.
+#   Configured: the PersistentStore, what this machine has CONFIGURED, NotConfigured included. It is the store
+#     SetDefaultOutbound writes, so it is what ISOLATED remembers and puts back, and what a write is checked against.
 function Get-ProfileStates {
+    $configured = @{}
+    foreach ($p in @(Get-NetFirewallProfile -PolicyStore PersistentStore)) {
+        $configured[[string]$p.Name] = [string]$p.DefaultOutboundAction
+    }
     @(Get-NetFirewallProfile -PolicyStore ActiveStore | ForEach-Object {
         [pscustomobject]@{
             Name = [string]$_.Name
             Enabled = ([string]$_.Enabled -eq 'True')
             DefaultOutboundAction = [string]$_.DefaultOutboundAction
+            Configured = $configured[[string]$_.Name]
         }
     })
 }
@@ -239,7 +250,8 @@ try {
         }
         'SetDefaultOutbound' {
             if (-not $DefaultOutboundAction) { throw 'SetDefaultOutbound needs -DefaultOutboundAction' }
-            Set-NetFirewallProfile -Profile (Get-ProfileList $Profiles) -DefaultOutboundAction $DefaultOutboundAction
+            # The PersistentStore (the default of Set-NetFirewallProfile, named so it is not mistaken for the ActiveStore)
+            Set-NetFirewallProfile -PolicyStore PersistentStore -Profile (Get-ProfileList $Profiles) -DefaultOutboundAction $DefaultOutboundAction
             ConvertTo-Json -Compress -Depth 3 -InputObject (Get-ProfileStates)
         }
         'AllowOut' {

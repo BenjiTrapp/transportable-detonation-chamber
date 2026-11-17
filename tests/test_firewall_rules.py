@@ -50,6 +50,7 @@ class FakeRun:
         self.foreign = {n: dict(r) for n, r in (foreign or {}).items()}
         self.stubborn = set(stubborn)
         self.stuck_rules = set()     # TDC-FW-ISO-* rules RemoveIsolate cannot remove
+        self.forced = {}             # profile -> DefaultOutboundAction a group policy puts in force
 
     @staticmethod
     def view(name, **kw):
@@ -86,8 +87,14 @@ class FakeRun:
         return {rest[k][1:]: rest[k + 1] for k in range(0, len(rest), 2)}
 
     def profile_rows(self):
-        return [{"Name": n, "Enabled": on, "DefaultOutboundAction": self.outbound.get(n, "Allow")}
-                for n, on in self.profiles.items()]
+        """``outbound`` is what is configured (the PersistentStore SetDefaultOutbound writes); in force (the ActiveStore)
+        NotConfigured resolves to Allow, or to what ``forced`` (a group policy) says."""
+        rows = []
+        for n, on in self.profiles.items():
+            configured = self.outbound.get(n, "Allow")
+            active = self.forced.get(n) or ("Allow" if configured == "NotConfigured" else configured)
+            rows.append({"Name": n, "Enabled": on, "DefaultOutboundAction": active, "Configured": configured})
+        return rows
 
     def off(self):
         return [n for n, on in self.profiles.items() if not on]
@@ -966,7 +973,10 @@ def test_run_powershell_does_not_raise_for_a_program_that_is_not_there():
 
 def test_the_hatch_restores_outbound_and_removes_every_rule_of_ours():
     text = open(os.path.join(ROOT, "scripts", "tdc-unisolate.ps1"), encoding="utf-8").read()
-    assert "-DefaultOutboundAction Allow" in text and "TDC-FW-*" in text
+    assert "-DefaultOutboundAction $value" in text and "TDC-FW-*" in text
+    # it opens: Allow, or the recorded value when that is Allow or NotConfigured, never Block
+    assert "$value = if ($before[$n] -in @('Allow', 'NotConfigured')) { $before[$n] } else { 'Allow' }" in text
+    assert "outbound_before" in text and "Set-NetFirewallProfile -PolicyStore PersistentStore" in text
     assert "Remove-NetFirewallRule" in text and "Invoke-Expression" not in text
 
 
@@ -1495,3 +1505,47 @@ def test_the_script_switches_the_rules_in_one_pipeline_and_retries_only_the_ones
     remove = text[text.index("function Remove-IsolateRules"):]
     assert "Get-IsolateRules" in remove and "still" in remove
     assert "'ObjectNotFound'" in text[text.index("function Get-IsolateRules"):text.index("function Remove-IsolateRules")]
+
+
+# ---- what is configured is put back, not what is in force ---------------------------------------
+
+
+def test_a_baseline_of_not_configured_comes_back_as_not_configured_not_allow():
+    """In force, NotConfigured reads Allow; remembering that and writing it back would leave the host configured
+    differently from how it was found. The baseline is the configured value, and the write is checked there."""
+    run, settings = make(foreign=STOCK, outbound="NotConfigured")
+    assert {r["DefaultOutboundAction"] for r in run.profile_rows()} == {"Allow"}       # as in force
+    on = rules_mod.isolate(run, True, settings=settings)
+    assert settings.outbound_before == "NotConfigured" and on["outbound_before"] == "NotConfigured"
+    assert on["verified"] is True and set(run.outbound.values()) == {"Block"}
+    assert rules_mod.startup_state(run, settings)["isolated"] is True                  # in force: Block
+    left = rules_mod.isolate(run, False, settings=settings)
+    assert run.outbound == {"Domain": "NotConfigured", "Private": "NotConfigured", "Public": "NotConfigured"}
+    assert left["outbound_after"] == run.outbound and left["note"] is None
+    assert run.enabled_foreign() == ["CoreNet-DHCP-Out", DNS_RULE]
+
+
+def test_a_mixed_configured_baseline_comes_back_profile_by_profile():
+    run, settings = make(outbound={"Domain": "NotConfigured", "Private": "Allow", "Public": "Block"})
+    rules_mod.isolate(run, True, settings=settings)
+    assert settings.outbound_before == "Domain=NotConfigured,Private=Allow,Public=Block"
+    rules_mod.isolate(run, False, settings=settings)
+    assert run.outbound == {"Domain": "NotConfigured", "Private": "Allow", "Public": "Block"}
+
+
+def test_block_that_a_group_policy_keeps_from_force_is_not_isolated():
+    run, settings = make(outbound="NotConfigured")
+    run.forced = {"Public": "Allow"}                         # configured Block, but a policy keeps Allow in force
+    with pytest.raises(rules_mod.RuleError) as e:
+        rules_mod.isolate(run, True, settings=settings)
+    assert "Public" in str(e.value)
+    assert settings.isolated is False and set(run.outbound.values()) == {"NotConfigured"}   # rolled back as configured
+
+
+def test_the_script_reads_the_configured_value_where_it_writes_it():
+    text = open(os.path.join(ROOT, "webui", "firewall_rules.ps1"), encoding="utf-8").read()
+    states = text[text.index("function Get-ProfileStates"):]
+    states = states[:states.index("\n}\n")]
+    assert "Get-NetFirewallProfile -PolicyStore PersistentStore" in states and "Get-NetFirewallProfile -PolicyStore ActiveStore" in states
+    assert "Configured = " in states
+    assert "Set-NetFirewallProfile -PolicyStore PersistentStore -Profile" in text

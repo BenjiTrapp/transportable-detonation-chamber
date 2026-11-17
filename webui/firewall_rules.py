@@ -272,8 +272,10 @@ def _states(rows: Any) -> List[Dict[str, Any]]:
     found: List[Dict[str, Any]] = []
     for row in rows if isinstance(rows, list) else ():
         if isinstance(row, dict) and row.get("Name") in PROFILE_NAMES:
-            found.append({"name": row["Name"], "enabled": _is_on(row.get("Enabled")),
-                          "outbound": str(row.get("DefaultOutboundAction") or "").strip()})
+            outbound = str(row.get("DefaultOutboundAction") or "").strip()
+            configured = str(row.get("Configured") or "").strip()
+            found.append({"name": row["Name"], "enabled": _is_on(row.get("Enabled")), "outbound": outbound,
+                          "configured": configured if configured in OUTBOUND_ACTIONS else None})
     if {s["name"] for s in found} != set(PROFILE_NAMES):
         raise RuleError("cannot read the Windows Firewall profiles; nothing can be enforced")
     return found
@@ -691,7 +693,11 @@ def _apply_outbound(run, target: Dict[str, str]) -> List[Dict[str, Any]]:
     """Set ``DefaultOutboundAction`` per profile and read it back; returns the profiles as read, raises when it did not take.
 
     One call per distinct value (one when all profiles agree). ``SetDefaultOutbound`` answers with the profiles
-    as it reads them after the change, which is the read back; an answer that is not that is read again."""
+    as it reads them after the change, which is the read back; an answer that is not that is read again.
+
+    The write goes to the PersistentStore, so it is checked there (``configured``): NotConfigured reads back as
+    NotConfigured there, while the ActiveStore shows what it resolves to. A target of Block must in addition be in
+    force (``outbound`` Block), because that is what ISOLATED claims; a group policy that overrides it fails here."""
     groups: Dict[str, List[str]] = {}
     for name in PROFILE_NAMES:
         groups.setdefault(target[name], []).append(name)
@@ -705,8 +711,15 @@ def _apply_outbound(run, target: Dict[str, str]) -> List[Dict[str, Any]]:
         states = _states(json.loads(out))
     except (ValueError, RuleError):
         states = _profiles(run)
-    now = {s["name"]: s["outbound"] for s in states}
-    wrong = [n for n in PROFILE_NAMES if now.get(n) != target[n]]
+    by_name = {s["name"]: s for s in states}
+
+    def took(name: str) -> bool:
+        s = by_name.get(name)
+        if s is None:
+            return False
+        configured = s["configured"] if s["configured"] is not None else s["outbound"]
+        return configured == target[name] and (target[name] != "Block" or s["outbound"] == "Block")
+    wrong = [n for n in PROFILE_NAMES if not took(n)]
     if wrong:
         raise RuleError(f"DefaultOutboundAction did not change for: {', '.join(wrong)}")
     return states
@@ -925,7 +938,10 @@ def _isolate_on(run, settings) -> Dict[str, Any]:
     off = _off_names(states)
     if off:
         raise ProfileOffError(_off_text(off))
-    current = {s["name"]: s["outbound"] for s in states}
+    # What is put back is what is *configured* (the PersistentStore, the store SetDefaultOutbound writes), not what
+    # is in force: a NotConfigured profile is in force as Allow, and restoring that as Allow would leave the host
+    # configured differently from how it was found. ``outbound`` (in force) stays the authority for the claims.
+    current = {s["name"]: s["configured"] or s["outbound"] for s in states}
     marker = bool(settings.isolated)
     already = marker and settings.outbound_before is not None
     damaged = marker and settings.outbound_before is None
