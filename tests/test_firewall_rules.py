@@ -1125,12 +1125,47 @@ def test_a_block_for_every_program_on_an_address_that_would_cut_tdc_off_from_its
     assert run.calls == []
 
 
-@pytest.mark.parametrize("ip", LOCAL_ONLY)
-def test_a_block_that_names_a_program_may_cut_that_programs_loopback_and_multicast(ip):
+LOOPBACK_ADDRESSES = ["127.0.0.1", "127.8.9.1", "::1", "::ffff:127.0.0.1", "::ffff:7f00:1"]
+MULTICAST_UNSPECIFIED = ["0.0.0.0", "::", "224.0.0.251", "239.255.255.250", "ff02::fb", "::ffff:224.0.0.251"]
+
+
+@pytest.mark.parametrize("ip", MULTICAST_UNSPECIFIED)
+def test_a_block_that_names_a_program_may_cut_that_programs_multicast(ip):
+    """mDNS and SSDP are multicast, which Windows does filter: a program-scoped block on them bites."""
     run = FakeRun()
     r = rules_mod.block(run, image=IMAGE, ip=ip, fetcher=PY)
     assert r["verified"] is True and r["ip"] == ip.replace("::ffff:", "")
     assert "-Program" in " ".join(run.calls[0])
+
+
+@pytest.mark.parametrize("ip", LOOPBACK_ADDRESSES)
+@pytest.mark.parametrize("image", [IMAGE, None])
+def test_a_block_on_loopback_is_refused_for_one_program_and_for_all(ip, image):
+    """Windows does not filter loopback: the rule would stand, read back, be called verified, and block nothing
+    (seen on the VM: curl to 127.0.0.1 still answered 200 under a 'verified' rule)."""
+    run = FakeRun()
+    with pytest.raises(rules_mod.RuleError):
+        rules_mod.block(run, image=image, ip=ip, port=9000 if image else None, protocol="tcp" if image else None, fetcher=PY)
+    assert run.calls == []
+
+
+def test_the_loopback_refusal_says_why():
+    with pytest.raises(rules_mod.RuleError) as e:
+        rules_mod.block(FakeRun(), image=IMAGE, ip="::ffff:127.0.0.1", fetcher=PY)
+    text = str(e.value)
+    assert "127.0.0.1 is a loopback address" in text and "does not filter loopback" in text
+    assert "block nothing" in text and "KILL" in text
+
+
+def test_a_loopback_rule_left_by_an_earlier_version_is_never_called_a_block():
+    run = FakeRun()
+    name = "TDC-FW-0123456789ab"
+    run.rules[name] = run.view(name, Action="Block", Program=IMAGE, RemoteAddress=["127.0.0.1"])
+    listed = rules_mod.rules(run)
+    assert [(r["rule_id"], r["blocking"]) for r in listed] == [(name, False)]
+    assert rules_mod.verify(run, name) is False
+    run.rules[name]["RemoteAddress"] = ["1.2.3.4"]
+    assert rules_mod.rules(run)[0]["blocking"] is True and rules_mod.verify(run, name) is True
 
 
 def test_the_fetcher_is_required_and_none_is_the_explicit_opt_out():

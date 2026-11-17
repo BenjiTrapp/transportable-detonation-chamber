@@ -233,6 +233,16 @@ def _same_path(a: str, b: str) -> bool:
     return a.lower().replace("/", "\\") == b.lower().replace("/", "\\")
 
 
+LOOPBACK_TEXT = ("{address} is a loopback address: Windows Firewall does not filter loopback traffic, so a rule for it "
+                 "would stand, read back as written, and block nothing. TDC does not write it, for one program or "
+                 "for all; to stop the process, block it everywhere or KILL it.")
+
+
+def _is_loopback(address: str) -> bool:
+    """127.0.0.0/8 and ::1 (``_clean_ip`` has already unwrapped an IPv4-mapped form): traffic Windows never filters."""
+    return ipaddress.ip_address(address).is_loopback
+
+
 def _is_local_only(address: str) -> bool:
     addr = ipaddress.ip_address(address)
     return addr.is_loopback or addr.is_unspecified or addr.is_multicast
@@ -243,6 +253,8 @@ def _block_spec(image: Any, ip: Any, port: Any, protocol: Any) -> Dict[str, Any]
     address = _clean_ip(ip) if ip is not None else None
     if program is None and address is None:
         raise RuleError("a block needs a program, an address, or both")
+    if address is not None and _is_loopback(address):
+        raise RuleError(LOOPBACK_TEXT.format(address=address))
     if program is None and _is_local_only(address):
         raise RuleError(f"{address} is loopback, unspecified or multicast: a block for every program there would cut TDC's own traffic")
     number = None
@@ -459,9 +471,14 @@ def block(run, *, image: Optional[str] = None, ip: Optional[str] = None, port: O
     on; otherwise ``problem`` says why and the caller must not call the endpoint blocked. Raises ``RuleError`` when
     a profile is off (nothing is written then), when the arguments are unsound, or when the write fails.
 
-    Two blocks would cut TDC off from itself and are refused. A block for every program (no ``image``) on an address
-    that is loopback, unspecified or multicast: that is where the lockout lives, while a block that names a program
-    touches only that program, so a sample's own loopback, mDNS or SSDP traffic can be cut. And a block on any program
+    A block on a loopback address (``127.0.0.0/8``, ``::1``, either IPv4-mapped) is refused for one program and for
+    all: Windows Firewall does not filter loopback, so the rule would stand, read back as written, and block nothing,
+    and nothing that cannot work is written or called verified.
+
+    Two more blocks would cut TDC off from itself and are refused. A block for every program (no ``image``) on an
+    address that is unspecified or multicast: that is where the lockout lives, while a block that names a program
+    touches only that program, so a sample's own mDNS or SSDP traffic (multicast, which Windows does filter) can be
+    cut. And a block on any program
     of ``fetcher``, because an explicit Block beats the per-fetch Allow rule of ISOLATED. This module cannot know the
     fetcher's path, so ``fetcher`` is a **required** keyword: the caller passes the ``python.exe`` of the web UI venv
     (and the base interpreter behind it, as a list), the same paths it gives ``allow_fetch``. ``fetcher=None`` is the
@@ -492,7 +509,8 @@ def unblock(run, rule_id: str) -> None:
 
 
 def verify(run, rule_id: str) -> bool:
-    """Whether ``rule_id`` is a Block rule that stands now: there, outbound, enabled, and every profile it covers on.
+    """Whether ``rule_id`` is a Block rule that stands now: there, outbound, enabled, every profile it covers on, and
+    not on a loopback address (which Windows does not filter).
 
     False for anything else, and for anything that cannot be read: it never raises.
     """
@@ -500,7 +518,12 @@ def verify(run, rule_id: str) -> bool:
         if not isinstance(rule_id, str) or not _NAME.fullmatch(rule_id):
             return False
         view = _describe(run, rule_id)
-        return view is not None and view["action"] == "block" and _standing_problem(view, _profiles(run)) is None
+        if view is None or view["action"] != "block":
+            return False
+        ip = _identity(view)[1]
+        if ip is not None and "/" not in ip and "," not in ip and _is_loopback(ip):
+            return False                         # it stands, and Windows does not filter loopback
+        return _standing_problem(view, _profiles(run)) is None
     except RuleError:
         return False
 
@@ -615,7 +638,8 @@ def rules(run) -> List[Dict[str, Any]]:
     (written by ``block``) or ``"isolate"`` (the allow rules of ISOLATED). ``blocking`` is True for a Block rule
     that stands, in the shape ``block`` writes, with every profile it covers on; ``key`` is then
     ``firewall.rule_key`` of the rule's real image, address and port. A rule that is listed but not
-    ``blocking`` (disabled, a profile off, or changed by someone) must not be shown as a block.
+    ``blocking`` (disabled, a profile off, or changed by someone) must not be shown as a block; nor is a rule on a
+    loopback address, which Windows does not filter.
 
     **Several rules can share a key**: ``firewall.rule_key`` has no protocol and a rule id has (tcp/443 and udp/443 at
     one endpoint are two rules, a stand-in left by a failed replacement is a third). Each is its own entry here,
@@ -640,7 +664,9 @@ def rules(run) -> List[Dict[str, Any]]:
         kind = "isolate" if name.startswith(ISOLATE_PREFIX) else "block"
         image, ip, port, protocol, canonical = _identity(view)
         standing = states is not None and _standing_problem(view, states) is None
-        blocking = kind == "block" and view["action"] == "block" and canonical and standing
+        # a loopback rule (an earlier version could write one) stands and bites nothing: it is no block
+        inert = ip is not None and canonical and _is_loopback(ip)
+        blocking = kind == "block" and view["action"] == "block" and canonical and standing and not inert
         listed.append({"rule_id": name, "name": name, "kind": kind, "action": view["action"].capitalize(),
                        "enabled": view["enabled"], "image": image, "ip": ip, "port": port, "protocol": protocol,
                        "key": firewall.rule_key(image or "", ip or "", port) if canonical else None,

@@ -1609,3 +1609,27 @@ def test_isolated_refused_for_a_profile_that_is_off_is_409_and_changes_nothing(c
     r = client.post("/api/firewall/isolate", json={"on": True})
     assert r.status_code == 409 and "Public" in r.json["error"]
     assert fw.run.writes() == [] and fw.settings.isolated is False
+
+
+# ---- loopback: Windows does not filter it, so nothing is written and nothing is claimed -----------
+
+
+def test_a_download_from_loopback_opens_a_decision_that_claims_no_block(client, fw, tdc, monkeypatch):
+    seed(fw, url="http://127.0.0.1:9000/stage2.dll", dst="127.0.0.1", port=9000)
+    open_window(monkeypatch, tdc)
+    sweep(tdc)
+    (item,) = fw.pending.open()
+    block = item["result"]["block"]
+    assert "verified" not in block and "does not filter loopback" in block["error"]
+    assert fw.run.rules == {} and "Create" not in fw.run.ops()
+    view = client.get("/api/firewall/pending").json["pending"][0]
+    assert view["result"]["block"]["error"] == block["error"]
+
+
+def test_the_block_route_refuses_loopback_with_the_reason(client, fw):
+    for body in ({"scope": "endpoint", "image": IMAGE, "ip": "127.0.0.1"},
+                 {"scope": "endpoint", "image": IMAGE, "ip": "::ffff:127.0.0.1", "port": 9000, "protocol": "tcp"},
+                 {"scope": "endpoint_all", "ip": "::1"}):
+        r = client.post("/api/firewall/block", json=body)
+        assert r.status_code == 409 and "does not filter loopback" in r.json["error"], body
+    assert fw.run.rules == {} and "Create" not in fw.run.ops()
