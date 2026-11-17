@@ -248,10 +248,13 @@ sichern?*
    Block jede Allow-Regel schlägt. `allow_disabled` wird in `converge` notiert,
    direkt bevor dort abgeschaltet wird, und dort bleibt auch die Weigerung,
    etwas zu ändern, wenn die Liste nicht lesbar ist.
-2. `outbound_before`, Marker und `stage: "cut"` mit `settings.set` sichern.
-   Scheitert das, wird **nichts** angefasst.
+2. `outbound_before` und Marker mit `settings.set` sichern. Scheitert das, wird
+   **nichts** angefasst.
 3. `TDC-FW-ISO-cut` schreiben (oder eine verfälschte Regel reparieren) und
    zurücklesen — ein Aufruf, 2,49 s gemessen. Ab hier ist der Ausgang zu.
+   `stage: "cut"` wird **danach** gesichert, denn vorher wäre es eine Stufe, die
+   noch nicht gilt; der Marker aus Schritt 2 ist das, was ein Absturz hier
+   hinterlässt, und den zeigt der Start an.
 4. Antworten. Der Knopfdruck ist hier fertig, nach rund 3,6 s.
 5. Im Hintergrund, in *einem* Arbeiter: `allowed_out` lesen (nicht lesbar ⇒
    nichts ändern), `allow_disabled` notieren, die Allow-Regeln des lokalen
