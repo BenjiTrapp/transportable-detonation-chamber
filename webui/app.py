@@ -11203,7 +11203,7 @@ FIREWALL_PROFILES_TTL_S = 60
 # both read the same clock, so only Sysmon's millisecond precision, which cuts the time down
 FIREWALL_KILL_CLOCK_SLACK_S = 0.001
 FIREWALL_PROFILES_ERROR_TTL_S = 10
-_fw_profiles_cache = None                         # (stamp, off, error) or None
+_fw_profiles_cache = None                         # (stamp, off, error, blocking) or None
 _fw_profiles_lock = threading.Lock()
 
 
@@ -11215,33 +11215,56 @@ def _fw_forget_profiles():
 
 
 def _fw_read_profiles():
-    """``(off, error)`` read now, and kept for _fw_profiles_off. ``off`` is None when they could not be read."""
+    """``(off, error)`` read now, and kept for _fw_profiles_off. ``off`` is None when they could not be read.
+
+    The same read gives the profiles whose default outbound action in force is Block (``blocking``), kept beside
+    them for _fw_outbound_blocking."""
     global _fw_profiles_cache
     try:
-        off, error = firewall_rules.profiles_off(_fw_runner), None
+        states = firewall_rules.profile_states(_fw_runner)
+        off, error = [s["name"] for s in states if not s["enabled"]], None
+        blocking = [s["name"] for s in states if s["outbound"] == "Block"]
     except Exception as e:
-        off, error = None, _fw_reason(e)
+        off, error, blocking = None, _fw_reason(e), None
     with _fw_profiles_lock:
-        _fw_profiles_cache = (time.monotonic(), off, error)
+        _fw_profiles_cache = (time.monotonic(), off, error, blocking)
     return off, error
 
 
 def _fw_keep_profiles(off):
-    """Keep ``off`` (the profiles that are off, as an enforcement route just read them back) for _fw_profiles_off."""
+    """Keep ``off`` (the profiles that are off, as an enforcement route just read them back) for _fw_profiles_off.
+    The default action is not in that answer, so it is kept as unknown and read when it is asked for."""
     global _fw_profiles_cache
     with _fw_profiles_lock:
-        _fw_profiles_cache = (time.monotonic(), list(off), None)
+        _fw_profiles_cache = (time.monotonic(), list(off), None, None)
+
+
+def _fw_fresh_profiles():
+    """The cached ``(stamp, off, error, blocking)`` while it is fresh, else None."""
+    with _fw_profiles_lock:
+        cached = _fw_profiles_cache
+    if cached is not None and time.monotonic() - cached[0] < (FIREWALL_PROFILES_ERROR_TTL_S if cached[2]
+                                                               else FIREWALL_PROFILES_TTL_S):
+        return cached
+    return None
 
 
 def _fw_profiles_off():
     """``(off, error)`` from the cache while it is fresh, else read now. No lock is held across the PowerShell call."""
-    with _fw_profiles_lock:
-        cached = _fw_profiles_cache
+    cached = _fw_fresh_profiles()
     if cached is not None:
-        stamp, off, error = cached
-        if time.monotonic() - stamp < (FIREWALL_PROFILES_ERROR_TTL_S if error else FIREWALL_PROFILES_TTL_S):
-            return off, error
+        return cached[1], cached[2]
     return _fw_read_profiles()
+
+
+def _fw_outbound_blocking():
+    """The profiles whose default outbound action in force is Block, from the same cached read as _fw_profiles_off
+    (read now when the cache does not hold it); None when the profiles cannot be read."""
+    cached = _fw_fresh_profiles()
+    if cached is None or (cached[3] is None and cached[2] is None):
+        _fw_read_profiles()
+        cached = _fw_fresh_profiles() or (0.0, None, None, None)
+    return cached[3]
 
 
 # What still lets traffic out while ISOLATED is on (Windows' own outbound Allow rules that are enabled), for the
@@ -12405,18 +12428,34 @@ def _fw_cut_may_stand():
     return bool(_fw_settings.isolated) and _fw_settings.stage != "isolated"
 
 
-def _fw_isolate_verified(allowed):
+def _fw_state_can_fetch():
+    """``can_fetch`` of the state, for any address: False while the cut may stand or the rule list names the cut rule,
+    True only when the list was read and names none, and None when it is not known (nothing read yet, or unreadable):
+    a cut rule a crash left behind can stand with no marker, and an unread list must not be taken for its absence.
+    The list is never read for this, so the state costs no call for it; the polls of the tab fill it."""
+    if _fw_cut_may_stand():
+        return False
+    listed = _fw_cut_rule_listed()
+    return None if listed is None else not listed
+
+
+def _fw_isolate_verified(allowed, off):
     """``verified`` of the state: whether what closes the egress in this stage was read back. None while not isolated.
 
     In ``cut`` and ``cut_policy`` it is the catch-all rule as the press read it back (or ``converge`` in
     ``cut_policy``), and nothing about the Allow list: a Block rule beats every Allow rule. In ``isolated`` the rule
-    is gone, so it is the Allow list as read now: one that came back on makes it False, and TDC writes nothing by
-    itself about that (it changes enforcement on a press only)."""
+    is gone, so it is the default action Block in force on every profile, all of them on, **and** the Allow list as
+    read now empty: either changed from outside (a group policy refresh, a rule switched on again) makes it False,
+    and TDC writes nothing by itself about that (it changes enforcement on a press only)."""
     if not _fw_settings.isolated:
         return None
     stage = _fw_settings.stage
     if stage == "isolated":
-        return allowed == []
+        # the cut rule is gone here, so the default action is the one thing that holds the egress: Block in force
+        # on all three profiles, each of them on, read now, and nothing let out beside it
+        blocking = _fw_outbound_blocking()
+        return (allowed == [] and off == [] and blocking is not None
+                and sorted(blocking) == sorted(firewall_rules.PROFILE_NAMES))
     if stage in ("cut", "cut_policy"):
         return _fw_cut_verified is True
     return False                                   # a marker with stage open: nothing in force was read back
@@ -12434,7 +12473,7 @@ def _fw_isolate_state():
            "settings_error": _fw_settings.load_error, "startup": _fw_startup,
            "stage": _fw_settings.stage if isolated else "open", "converging": bool(_fw_converge_running),
            "converge_note": _fw_converge_note,
-           "can_fetch": not _fw_cut_may_stand() and _fw_cut_rule_listed() is not True,
+           "can_fetch": _fw_state_can_fetch(),
            "profiles_off": None, "profiles_error": None, "residual": FIREWALL_ISOLATED_RESIDUAL,
            "allowed_out": None, "allowed_out_error": None,
            "allow_disabled": len(_fw_settings.allow_disabled or ()),
@@ -12443,7 +12482,7 @@ def _fw_isolate_state():
     # what it does not close cost PowerShell (both cached)
     out["profiles_off"], out["profiles_error"] = _fw_profiles_off()
     out["allowed_out"], out["allowed_out_error"] = _fw_allowed_out()
-    out["verified"] = _fw_isolate_verified(out["allowed_out"])
+    out["verified"] = _fw_isolate_verified(out["allowed_out"], out["profiles_off"])
     return out
 
 

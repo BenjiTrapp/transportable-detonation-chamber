@@ -1455,10 +1455,17 @@ def test_kill_refuses_a_pid_that_is_not_running(client, fw, tdc, monkeypatch):
 
 
 def test_kill_allows_for_a_little_clock_disagreement(client, fw, tdc, monkeypatch):
-    # Sysmon stamps the connection a moment before Windows' start time of the same process
+    # Sysmon stamps the connection a moment before Windows' start time of the same process. The clock is pinned, so
+    # the disagreement is exactly the one this test sets and not the time the request happens to take.
+    now = 1_800_000_000.0
+    monkeypatch.setattr(tdc.time, "time", lambda: now)
+    slack = tdc.FIREWALL_KILL_CLOCK_SLACK_S
     fw.store.add_connections([conn(pid=4812, t=-5.0)])
-    started(monkeypatch, tdc, 5.0 - tdc.FIREWALL_KILL_CLOCK_SLACK_S / 2)
+    monkeypatch.setattr(tdc, "_process_started_at", lambda pid: now - 5.0 + slack / 2)    # within the slack
     assert client.post("/api/firewall/kill", json={"pid": 4812}).status_code == 200
+    monkeypatch.setattr(tdc, "_process_started_at", lambda pid: now - 5.0 + slack * 2)    # beyond it: another process
+    r = client.post("/api/firewall/kill", json={"pid": 4812})
+    assert r.status_code == 409 and "another process" in r.json["error"] and len(_taskkills(fw)) == 1
 
 
 # ---- GET /isolate is cheap enough to poll -----------------------------------------------------
@@ -1675,7 +1682,9 @@ def test_the_answer_does_not_wait_for_the_slow_part(client, fw):
 
 def test_the_state_names_the_stage_and_whether_a_sample_can_still_be_secured(client, fw):
     off = client.get("/api/firewall/isolate").json
-    assert off["stage"] == "open" and off["converging"] is False and off["can_fetch"] is True
+    assert off["stage"] == "open" and off["converging"] is False and off["can_fetch"] is None   # list not read yet
+    client.get("/api/firewall/connections")                                   # the poll reads the rule list
+    assert client.get("/api/firewall/isolate").json["can_fetch"] is True
     client.post("/api/firewall/isolate", json={"on": True})
     state = client.get("/api/firewall/isolate").json
     assert state["stage"] == "cut" and state["can_fetch"] is False and state["converging"] is True
@@ -1691,6 +1700,7 @@ def test_two_presses_in_a_row_make_one_rule_and_one_worker(client, fw):
     assert _workers_started(fw) == 1 and fw.settings.outbound_before == before
     fw.converge()
     assert fw.settings.stage == "isolated"
+    client.get("/api/firewall/connections")
     state = client.get("/api/firewall/isolate").json
     assert state["converging"] is False and state["verified"] is True and state["can_fetch"] is True
 
@@ -1783,6 +1793,7 @@ def test_a_profile_that_is_off_refuses_the_cut_with_409(client, fw):
 
 def test_a_fetch_in_flight_is_not_claimed_to_be_possible_once_the_cut_stands(client, fw, tdc):
     names = _start_fetch(client, fw, tdc)
+    client.get("/api/firewall/connections")
     assert client.get("/api/firewall/isolate").json["can_fetch"] is True
     client.post("/api/firewall/isolate", json={"on": True})
     state = client.get("/api/firewall/isolate").json
@@ -1835,6 +1846,8 @@ def test_a_marker_in_stage_open_is_not_read_as_free(client, fw):
 
 def test_a_cut_rule_without_a_marker_is_not_a_way_out_for_a_fetch(client, fw):
     fw.run.rules["TDC-FW-ISO-cut"] = fw.run.view("TDC-FW-ISO-cut")            # a crash left it standing
+    # right after start-up nothing has read the rule list: not known, so never True
+    assert client.get("/api/firewall/isolate").json["can_fetch"] is None
     client.get("/api/firewall/connections")                                   # the poll reads the rule list
     state = client.get("/api/firewall/isolate").json
     assert state["isolated"] is False and state["can_fetch"] is False
@@ -1856,6 +1869,44 @@ def test_an_allow_rule_that_comes_back_later_makes_the_state_say_not_closed(clie
     assert state["verified"] is False and [r["name"] for r in state["allowed_out"]] == ["CoreNet-Teredo-Out"]
     assert state["stage"] == "isolated" and "Cut" not in fw.run.ops() and fw.run.writes() == []
     assert _workers_started(fw) == 1                          # TDC does NOT cut again by itself
+
+
+def test_a_default_action_set_back_to_allow_under_stage_isolated_makes_the_state_say_not_closed(client, fw, tdc):
+    from test_firewall_rules import STOCK
+    fw.run.foreign = {n: dict(r) for n, r in STOCK.items()}
+    client.post("/api/firewall/isolate", json={"on": True})
+    fw.converge()                                             # stage isolated: Block holds the egress, the rule is gone
+    assert "TDC-FW-ISO-cut" not in fw.run.rules and client.get("/api/firewall/isolate").json["verified"] is True
+    fw.run.forced["Private"] = "Allow"                        # a group policy refresh puts Allow in force again
+    with tdc._fw_profiles_lock:
+        tdc._fw_profiles_cache = None                         # the minute of the cache has passed
+    state = client.get("/api/firewall/isolate").json
+    assert state["stage"] == "isolated" and state["allowed_out"] == [] and state["verified"] is False
+    assert "Cut" not in fw.run.ops()[-3:] and _workers_started(fw) == 1   # reported, not repaired
+
+
+def test_stage_isolated_with_a_profile_off_or_the_profiles_unreadable_is_not_verified(client, fw, tdc):
+    client.post("/api/firewall/isolate", json={"on": True})
+    fw.converge()
+    fw.profiles = {"Domain": True, "Private": False, "Public": True}          # Block configured, but not enforced
+    with tdc._fw_profiles_lock:
+        tdc._fw_profiles_cache = None
+    assert client.get("/api/firewall/isolate").json["verified"] is False
+    fw.run.fail["Profiles"] = (1, "Access is denied.")
+    with tdc._fw_profiles_lock:
+        tdc._fw_profiles_cache = None
+    state = client.get("/api/firewall/isolate").json
+    assert state["stage"] == "isolated" and state["verified"] is False and state["profiles_off"] is None
+
+
+def test_the_profile_read_for_verified_is_the_same_cached_read_as_profiles_off(client, fw, tdc):
+    client.post("/api/firewall/isolate", json={"on": True})
+    fw.converge()
+    client.get("/api/firewall/isolate")
+    reads = fw.run.ops().count("Profiles")
+    for _ in range(5):
+        assert client.get("/api/firewall/isolate").json["verified"] is True
+    assert fw.run.ops().count("Profiles") == reads
 
 
 # ---- loopback: Windows does not filter it, so nothing is written and nothing is claimed -----------

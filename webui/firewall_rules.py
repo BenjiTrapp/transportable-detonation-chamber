@@ -327,6 +327,13 @@ def profiles_off(run) -> List[str]:
     return _off_names(_profiles(run))
 
 
+def profile_states(run) -> List[Dict[str, Any]]:
+    """``[{"name", "enabled", "outbound", "configured"}]`` of the three profiles, ``outbound`` as in force: one read,
+    for a caller that needs the default action as well as which profiles are off. Raises ``RuleError`` like
+    ``profiles_off``."""
+    return _profiles(run)
+
+
 def enable_firewall(run) -> None:
     """Switch Domain, Private and Public on (``Set-NetFirewallProfile -Enabled True``) and check that they are.
 
