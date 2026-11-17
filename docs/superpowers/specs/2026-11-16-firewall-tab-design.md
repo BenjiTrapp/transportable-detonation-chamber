@@ -343,7 +343,9 @@ von Isolated steht (jede Ausgangs-Allow-Regel einzeln abschalten, dann
 ersetzt `docs/superpowers/specs/2026-11-17-panic-cut-design.md`. Dieser Weg
 brauchte auf der echten VM **38,5 s**, für einen Panikknopf unbrauchbar. Jetzt
 schreibt ein Druck **eine** Catch-all-Block-Regel (`TDC-FW-ISO-cut`) und kehrt nach
-etwa **3,6 s** zurück, denn in der Windows-Firewall schlägt eine Block-Regel jede
+gemessen **8,8 s** auf einer ruhigen Maschine zurück (9,9–16,9 s, wenn die
+Abfragen des Tabs sie belasten; `Cut` allein 2,44 s), denn in der Windows-Firewall
+schlägt eine Block-Regel jede
 Allow-Regel. Die gründliche Arbeit unten läuft danach im Hintergrund (`converge`)
 und endet in der hier beschriebenen Stufe `isolated`, oder, wenn `allowed_out`
 nicht leer wird, in `cut_policy` mit stehender Catch-all-Regel. Der Rest dieses

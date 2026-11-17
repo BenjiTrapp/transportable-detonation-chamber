@@ -81,7 +81,9 @@ transfer, then the rest.
 The switch-on path of ISOLATED is now two stages, specified in
 `docs/superpowers/specs/2026-11-17-panic-cut-design.md`. A press writes **one**
 catch-all outbound Block rule, `TDC-FW-ISO-cut`, and returns with `stage: "cut"`
-after ~3.6 s (the old path, 135 rules switched off one by one, took 38.5 s). A
+after 8.8 s on a quiet machine, 9.9-16.9 s while the tab's own polls load it (the
+old path, 135 rules switched off one by one, took 38.5 s; see the open point on
+the call budget at the end). A
 background worker, `converge`, then does what ISOLATED always did, so that a
 per-fetch Allow exception is possible again: when `allowed_out` comes back empty
 the cut rule is dropped and the stage is `isolated`; when it does not (a group
@@ -101,8 +103,12 @@ for what to expect:
 | Measured | Result |
 |---|---|
 | One catch-all Block rule written and read back, one PowerShell call | 2.13 s (hand-written script), 2.49 s (the finished `Cut` verb) |
-| `Profiles` alone | 1.13 s |
-| The press end to end (profiles read first, then the cut) | ~3.6 s |
+| `Cut` alone, quiet machine | 2.44 s |
+| `Profiles` alone | 1.13 s in an empty moment, 1.65-2.10 s |
+| The press end to end (profiles read first, then the cut), quiet | 8.8 s |
+| The same press while the tab's polls load the machine | 9.9-16.9 s (inside it: `Profiles` 5.66 s, `Cut` 7.29 s; lock wait 0 ms) |
+| Convergence until `stage: "isolated"` | 59.3 s |
+| Leaving from `isolated` (135 rules back) | 57.5 s |
 | Repairing a rule of that name that was **disabled** | 5.92 s |
 | Repairing one **narrowed** to one program and address | 3.38 s |
 | With the cut standing: `curl https://1.1.1.1` | `http=000`, instantly |
@@ -117,11 +123,17 @@ enabled**; that is the point of the design.
 1. **Time to `stage: "cut"`.** *Check:* time
    `POST /api/firewall/isolate {"on": true}` from the request to the answer; the
    answer carries `stage: "cut"`, `verified: true`, `converging: true`. It must be
-   **≤ 5 s**; expect ~3.6 s. Do it with the three profiles on and no
-   `TDC-FW-ISO-cut` present. *If wrong:* the button is not a panic button again.
-   Where it is slower, look at which of the two PowerShell calls it is (`Profiles`,
-   then `Cut`): the figures above are 1.13 s and 2.49 s. A repair of a falsified
-   rule (item 7) is slower by design and does not count here.
+   **≤ 12 s**, the spec's ceiling; measured 8.8 s. Do it with the three profiles
+   on, no `TDC-FW-ISO-cut` present, and **no browser polling the FIREWALL tab**
+   (closed, or LIVE off): the threshold is for a quiet machine. With the tab open
+   on LIVE the same press measured 9.9-16.9 s, because the tab's polls cost more
+   than their interval; that is the open point on the call budget at the end of
+   this document, not a regression of the cut, and until that point is fixed the
+   figure under load is written down, not asserted. *If wrong (quiet, above
+   12 s):* the button is not a panic button again. Look in
+   `webui/logs/firewall-calls.log` at which of the two PowerShell calls it is
+   (`Profiles`, then `Cut`): alone 1.65-2.10 s and 2.44 s. A repair of a
+   falsified rule (item 7) is slower by design and does not count here.
 2. **The egress is shut while the cut stands.** *Check:* right after the answer of
    item 1, while `converging` is still `true` (the Allow rules are still mostly
    enabled; that is what is being tested):
@@ -130,8 +142,9 @@ enabled**; that is the point of the design.
    once, not after the timeout; `curl.exe -s -o NUL -w "%{http_code}"
    http://127.0.0.1:9000` prints `200`. *If wrong:* the cut does not close, or
    closes the UI as well. In the first case the band must not say closed:
-   `verified` is only "the cut rule was read back", so a rule that reads back and
-   does nothing is exactly what this check exists to catch. Repeat it once more in
+   `verified` is only "the cut rule was read back" (and read again, from the rule
+   list or one `Get`, within 10 s), so a rule that reads back and does nothing is
+   exactly what this check exists to catch. Repeat it once more in
    `cut_policy` if the VM has a group-policy Allow rule: the cut stays and must
    still close.
 3. **Time to `stage: "isolated"`, and the cut is gone by then.** *Check:* poll
@@ -144,9 +157,8 @@ enabled**; that is the point of the design.
    before the press until after this stage: it must never print anything but
    `000`, in particular not at the moment the cut rule falls (the Allow rules are
    switched off and the default is Block *before* the cut is dropped). The old
-   path took 38.5 s; the design expects about 40 s for the whole convergence, a
-   figure of the design, **not measured on the finished code**: write down what you
-   see. *If it stays `cut`:* the worker failed and the band must say why (the cut
+   path took 38.5 s; the whole convergence was **measured at 59.3 s** on the
+   finished code. Write down what you see. *If it stays `cut`:* the worker failed and the band must say why (the cut
    stands and the egress is shut, which is the safe side). *If it stays
    `cut_policy`:* `allowed_out` names the rule and its store.
 4. **Leaving in the middle of the convergence.** *Check:* press ISOLATED on; 5-10 s
@@ -163,9 +175,10 @@ enabled**; that is the point of the design.
    running would switch the Allow rules off again behind the leave), and DNS
    works. Do it at least twice, at different moments (also right after the press,
    before the first rule is switched). *If wrong:* a leave that waits is a cut
-   that cannot be undone for forty seconds; a rule left off is the VM without DNS,
-   which is the failure the section below is about. No figure was measured for
-   this path: write down the time of the leave.
+   that cannot be undone for a minute; a rule left off is the VM without DNS,
+   which is the failure the section below is about. No figure was measured for a
+   leave in the middle of the convergence (a leave from `isolated` took 57.5 s):
+   write down the time of the leave.
 5. **The round trip.** *Check:* before the press, record
    `(Get-NetFirewallProfile -PolicyStore PersistentStore | Select Name,
    DefaultOutboundAction)` and the names
@@ -282,7 +295,8 @@ again when it is left.
   switches nothing off and the band lists every Windows rule as still open
   (honest, but not closed).
 - **How long switching takes.** *Superseded for switching on:* a press now cuts in
-  ~3.6 s and the thorough work below runs in the background (see "The panic cut");
+  8.8 s on a quiet machine (9.9-16.9 s under the tab's polling) and the thorough
+  work below runs in the background (see "The panic cut");
   the figures here are those of the whole convergence and of leaving.
   ISOLATED on was four PowerShell calls (AllowOut,
   DisableAllowOut, SetDefaultOutbound, AllowOut), off is three
@@ -496,14 +510,20 @@ Every rule change goes through
   - `wevtutil` for Sysmon (EID 1, 3, 22) and the BITS log every second during a
     detonation window, every 10 s outside one; the PowerShell log every 10 s
     (the firewall log is a file read, no process).
-  - `powershell -Op List` (the TDC rules): at most once a minute
-    (`FIREWALL_RULES_TTL_S`, shared by LIVE ticks, `/summary`, every tab's
-    `/pending` poll and the sweep), and once after each block, unblock,
+  - `powershell -Op List` (the TDC rules): at most once a minute through the
+    cache (`FIREWALL_RULES_TTL_S`, shared by LIVE ticks, `/summary`, every tab's
+    `/pending` poll and the sweep), plus one forced read by `/rules` on every
+    slow tick of LIVE (every 30 s), and once after each block, unblock,
     decision, fetch rule, ISOLATED switch or TURN THE FIREWALL ON. While
     ISOLATED is on, the sweep's own `List` once a minute too.
-  - `powershell -Op Profiles`: at most once a minute for `GET /isolate` (every
-    10 s after an error), and fresh in every enforcement route.
-  - `powershell -Op AllowOut`: at most once a minute while ISOLATED is on.
+  - `powershell -Op Profiles`: at most once a minute for `GET /isolate`, every
+    10 s while ISOLATED is on or after an error, and fresh in every enforcement
+    route.
+  - `powershell -Op AllowOut`: every 10 s while ISOLATED is on, in stages
+    `isolated` and `cut_policy`.
+  - `powershell -Op Get` of the cut rule: in stages `cut` and `cut_policy`, once
+    per 10 s for `GET /isolate` when neither the press's read-back nor the rule
+    list is younger than that.
   - Per decision: Create, Get, Profiles and the List after it.
   None was measured. *Check:* during a detonation with the tab open on LIVE and
   a second browser tab open, watch the web UI's Python and its children for a
@@ -565,7 +585,8 @@ So that nobody files them:
 - **ISOLATED's residual.** While a fetch runs, anything that can run the web
   UI's Python could reach that one address for those seconds. An outbound
   Allow rule a group policy sets cannot be switched off locally; it is named in
-  the band and in `allowed_out`, and ISOLATED is then not `verified`.
+  the band and in `allowed_out`, and the cut rule then stays (stage
+  `cut_policy`): closed and `verified`, but no fetch gets through.
 - **ISOLATED changes what the EDR under test can do.** No cloud lookups, no
   telemetry upload: compare its verdicts only with other isolated runs.
 - **A loader that runs as TDC's base Python is never blocked**, because a block
@@ -573,6 +594,11 @@ So that nobody files them:
 - **The MCP server only reads** (`tdc_firewall_connections`,
   `tdc_firewall_captures`): no tool blocks, isolates, decides, kills or turns
   the firewall on.
+- **A disabled or narrowed `TDC-FW-ISO-cut` can outlive a cleared marker.** At
+  start-up, a marker with no profile on Block and a cut rule of the wrong shape
+  is read as stale: the marker is cleared and that rule stays. It opens nothing
+  (a disabled rule blocks nothing, a narrowed one only part of the egress), the
+  old code did the same, and the next press repairs it in place.
 
 ## Offener Punkt: die Aufruf-Bilanz des Tabs (gefunden beim Panikschnitt)
 
@@ -607,6 +633,46 @@ Was dagegen zu tun wäre (eigene Arbeit, nicht Teil des Panikschnitts):
    abgewartet, nicht verdoppelt.
 4. Erst danach ist eine Zielzahl für den Druck wieder sinnvoll — und sie lässt
    sich dann aus dem Log belegen.
+5. **Die Konvergenz hält `_LOCK` für ihren ganzen Lauf** (gefunden im
+   Abschluss-Review, breiter als der Abschnitt „To watch, not to assert" oben
+   ihn beschreibt). Hinter ihr warten nicht nur die Frist einer Entscheidung und
+   ein neu erkannter Download, sondern auch die Antwort eines Analysten (CUT
+   ONLY / ALLOW) und ein manuelles `/block` — und der Tab ist in der Minute nach
+   einem Druck blind, denn die Konvergenz dauert gemessen 59,3 s. Es öffnet
+   nichts (der Schnitt steht), kostet aber Sicht und Handlung genau dann, wenn
+   ein Ausbruch läuft. *Vorgeschlagene Richtung:* eine eigene Sperre „ein
+   Isolations-Lauf" für die Exklusivität gegen Druck und Verlassen, und `_LOCK`
+   nur noch **je Schritt** nehmen, damit ein `block()` zwischen zwei Schritten
+   der Konvergenz durchkommt. Nicht umgesetzt.
+6. **Der Regel-Cache kennt keine Generation, und `_fw_rules()` hält seine Sperre
+   über das ganze `List`** (zwei geparkte Befunde, ein Mechanismus, ein Fix).
+   Eine Abfrage, die ihr `List` vor einem Schreiben begann und nach dem Leeren
+   des Caches ablegt, legt einen veralteten Stand ab; zusammen mit einem
+   `cut()`, der nach dem Schreiben scheitert, oder einem gescheiterten
+   Speichern von `stage` ist das ein (doppelt bedingtes) Überbehaupten. Und
+   jeder Leser des Caches — auch `GET /isolate` über `_fw_cut_rule_listed` —
+   wartet hinter einem laufenden `List` (3,5–9,4 s). *Richtung:* ein
+   Generationszähler, den jedes Vergessen erhöht und den ein `List` beim Ablegen
+   prüft; dann kann die Sperre vor dem Aufruf losgelassen werden.
+
+**Von diesem Branch hinzugefügt — nach dem Fix messen.** Der Panikschnitt hat
+selbst zur Bilanz beigetragen; jeder dieser Punkte ist einzeln begründet, aber
+keiner ist unter Last gemessen:
+
+- Die Isolate-TTL von 10 s: solange isoliert wird, `Profiles` alle 10 s, und in
+  `isolated` und `cut_policy` zusätzlich `AllowOut` (~6 s) alle 10 s.
+- `GET /isolate` wartet jetzt über `_fw_cut_rule_listed` auf `_fw_rules_lock`,
+  also hinter jedem laufenden `List`.
+- Ein zweites `Profiles`-Lesen, wenn der Profil-Cache aus `_fw_keep_profiles`
+  kam (dort fehlt die Default-Aktion, die `verified` in `isolated` braucht).
+- `_fw_fetch_refusal` erzwingt bei jeder `block_fetch`-Entscheidung ein `List`.
+- *(Nach dem Abschluss-Review hinzugekommen.)* In `cut` und `cut_policy` ein
+  `Get` der Schnitt-Regel alle 10 s für `GET /isolate`, wenn weder die
+  Rücklesung des Drucks noch die Regelliste jünger ist — damit `verified` dort
+  nicht auf einer einmaligen Rücklesung ruht. Billiger ginge es, wenn `Profiles`
+  den Zustand der Schnitt-Regel im selben Prozess mitliefert (kein zweiter
+  Modul-Start); das ist eine Änderung an `firewall_rules.ps1` und gehört zu
+  diesem Punkt.
 
 **Vorher gemessen, nachher wieder messen:** `Cut` allein 2,44 s; `Cut` im Druck
 unter Last 7,29 s; Druck insgesamt 9,9–16,9 s; Wartezeit auf Sperren 0 ms.

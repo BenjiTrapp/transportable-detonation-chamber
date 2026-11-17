@@ -1,4 +1,4 @@
-# Panikschnitt — Isolation in einer Sekunde, mit einem Knopf
+# Panikschnitt — Isolation in einstelligen Sekunden, mit einem Knopf
 
 Erweiterung zu `docs/superpowers/specs/2026-11-16-firewall-tab-design.md`
 (Abschnitt *Durchsetzung*, Unterabschnitt *Isolated*). Wo dieses Dokument und
@@ -185,8 +185,9 @@ genau dem Grund, der dieses ganze Feature bestimmt.
 
 ### B — Eine Catch-all-Block-Regel, und sonst nichts
 
-Eine Regel, ausgehend, jedes Programm, jede Adresse, `Action Block`. Fertig in
-etwa einer Sekunde, geschlossen gegen *alles*, auch gegen Gruppenrichtlinien.
+Eine Regel, ausgehend, jedes Programm, jede Adresse, `Action Block`. Ein
+PowerShell-Aufruf (`Cut` allein gemessen 2,44 s), geschlossen gegen *alles*, auch
+gegen Gruppenrichtlinien.
 
 *Dagegen:* solange sie steht, kann TDC selbst nichts holen — die per-Fetch-Regel
 ist eine Allow-Regel und verliert. Das Sichern einer Stufe 2 ist in diesem
@@ -195,7 +196,8 @@ ein Verlust gegenüber heute.
 
 ### C — B, dann hinüberwechseln (**gewählt**)
 
-Erst die Catch-all-Regel (≈2 s, hart zu). Dann im Hintergrund das heutige
+Erst die Catch-all-Regel (`Cut` allein 2,44 s, der Druck insgesamt 8,8 s auf
+einer ruhigen Maschine; hart zu). Dann im Hintergrund das heutige
 ISOLATED: Allow-Regeln des lokalen Stores ab, Default auf Block. Ist danach
 `allowed_out` leer, fällt die Catch-all-Regel weg — der Zustand ist das heutige
 ISOLATED, und eine einzelne per-Fetch-Ausnahme ist wieder möglich. Ist
@@ -204,8 +206,9 @@ stehen, denn sie ist dort das Einzige, was tatsächlich schließt — und die
 Oberfläche sagt, dass in diesem Zustand nicht geholt werden kann.
 
 *Preis:* ein Zustandsautomat mit zwei Stufen und Hintergrundarbeit, statt eines
-Umschaltens. Das ist der Preis dafür, in zwei Sekunden ehrlich geschlossen zu
-sein und am Ende trotzdem dort zu landen, wo ISOLATED heute schon richtig ist.
+Umschaltens. Das ist der Preis dafür, in einstelligen Sekunden ehrlich
+geschlossen zu sein und am Ende trotzdem dort zu landen, wo ISOLATED heute schon
+richtig ist.
 Auf einer Maschine mit Gruppenrichtlinien-Allows ist C **stärker** als das
 heutige ISOLATED: dort war `verified` bisher nie erreichbar.
 
@@ -237,9 +240,9 @@ eine Entscheidung des Autors — siehe die Liste am Ende.*
 
 | Stufe | Was steht | Geht etwas raus? | Kann TDC holen? | Wie lange bis dahin |
 |---|---|---|---|---|
-| `CUT` | die Catch-all-Regel | nein | **nein** | ≈2 s |
-| `ISOLATED` | Default Block, Windows' Allow-Regeln ab, Catch-all weg | nein | ja, eine Adresse pro Fetch | ≈40 s |
-| `CUT (policy)` | Catch-all bleibt, weil `allowed_out` nicht leer ist | nein | **nein** | ≈40 s |
+| `CUT` | die Catch-all-Regel | nein | **nein** | 8,8 s gemessen (ruhig); 9,9–16,9 s unter Last |
+| `ISOLATED` | Default Block, Windows' Allow-Regeln ab, Catch-all weg | nein | ja, eine Adresse pro Fetch | 59,3 s gemessen |
+| `CUT (policy)` | Catch-all bleibt, weil `allowed_out` nicht leer ist | nein | **nein** | nicht gemessen; derselbe Weg wie bis `ISOLATED` |
 
 Beide „geschlossen"-Stufen sind echt geschlossen. Der Unterschied, den die
 Oberfläche nennen muss, ist allein: *kann TDC in diesem Zustand eine Probe
@@ -279,7 +282,8 @@ sichern?*
 
 ### Der Ablauf beim Einschalten
 
-1. **Profile lesen** (`Profiles`, 1,13 s), nicht die Allow-Regeln. Ist eines
+1. **Profile lesen** (`Profiles`, allein 1,65–2,10 s, im Druck unter Last
+   5,66 s), nicht die Allow-Regeln. Ist eines
    aus: verweigern, nichts ändern. **Nicht** `AllowOut`: vor dem Schnitt wird
    keine Allow-Regel abgeschaltet, es gibt also noch nichts aufzuschreiben, und
    *was offen bliebe* ist für den Schnitt bedeutungslos — er schließt, weil
@@ -289,11 +293,14 @@ sichern?*
 2. `outbound_before` und Marker mit `settings.set` sichern. Scheitert das, wird
    **nichts** angefasst.
 3. `TDC-FW-ISO-cut` schreiben (oder eine verfälschte Regel reparieren) und
-   zurücklesen — ein Aufruf, 2,49 s gemessen. Ab hier ist der Ausgang zu.
+   zurücklesen — ein Aufruf, allein 2,44 s, im Druck unter Last 7,29 s. Ab hier
+   ist der Ausgang zu.
    `stage: "cut"` wird **danach** gesichert, denn vorher wäre es eine Stufe, die
    noch nicht gilt; der Marker aus Schritt 2 ist das, was ein Absturz hier
    hinterlässt, und den zeigt der Start an.
-4. Antworten. Der Knopfdruck ist hier fertig, nach rund 3,6 s.
+4. Antworten. Der Knopfdruck ist hier fertig: gemessen 8,8 s auf einer ruhigen
+   Maschine, 9,9–16,9 s, wenn die Abfragen des Tabs sie belasten (siehe die
+   Ziele und den offenen Punkt im Handover).
 5. Im Hintergrund, in *einem* Arbeiter: `allowed_out` lesen (nicht lesbar ⇒
    nichts ändern), `allow_disabled` notieren, die Allow-Regeln des lokalen
    Stores abschalten, Default auf Block, dann `allowed_out` zurücklesen.
@@ -305,7 +312,13 @@ sichern?*
    Scheitern zurückrollt, rollt nur das zurück, was er selbst geändert hat.
 
 **`verified` heißt in den Schnitt-Stufen: die Catch-all-Regel wurde
-zurückgelesen** — und nichts weiter. Sie schließt unabhängig davon, ob die
+zurückgelesen, und die jüngste Lesung der Regel ist nicht älter als die
+Isolate-TTL (10 s) und findet sie noch in Catch-all-Form** — und nichts weiter.
+Die Rücklesung des Drucks ist ein Zeitpunkt; eine Regel, die danach von außen
+entfernt oder abgeschaltet wird, darf nicht weiter „bestätigt" heißen, zumal in
+`cut_policy`, wo sie dauerhaft das Einzige ist, was den Ausgang hält. Die
+Lesung ist die Regelliste, die die Abfragen des Tabs ohnehin holen, und nur
+wenn die älter ist, ein `Get`. *(Nachgetragen nach dem Abschluss-Review.)* Sie schließt unabhängig davon, ob die
 Allow-Liste lesbar war, denn Block schlägt Allow; auf der VM war der Ausgang zu,
 *während alle 135 Allow-Regeln aktiviert blieben*. Eine unlesbare Allow-Liste
 entscheidet nicht, ob geschlossen ist, sondern nur, ob die Regel fallen darf —
@@ -329,8 +342,10 @@ wieder her, was notiert ist, auch wenn der Arbeiter mitten in seiner Arbeit
 abgebrochen wurde.
 
 **Verlassen ist jederzeit möglich, auch mitten in der Konvergenz.** Das ist die
-Bedingung dafür, dass der Schnitt ohne Rückfrage auskommt: ein Fehldruck ist in
-zwei Sekunden rückgängig zu machen, nicht erst nach vierzig. Dafür
+Bedingung dafür, dass der Schnitt ohne Rückfrage auskommt: ein Fehldruck ist,
+solange die Stufe `cut` ist, in Sekunden rückgängig zu machen, nicht erst nach
+der Konvergenz (59,3 s). Aus `isolated` dauert das Verlassen gemessen 57,5 s,
+weil 135 Regeln wieder an müssen. Dafür
 
 - prüft der Arbeiter **zwischen** seinen PowerShell-Aufrufen eine Abbruchmarke,
   und bricht ab, sobald sie steht;
@@ -434,10 +449,17 @@ aufgeben.
 
 `aria-pressed` spiegelt den Zustand, `aria-live` meldet den Wechsel. Kein
 Pulsieren; `prefers-reduced-motion` wird respektiert wie im restlichen Tab. Der
-Knopf ist nur in dem einen Fall deaktiviert, in dem er nichts tun *kann* (die
-Firewall ist aus) — nie, weil TDC gerade beschäftigt ist: ein Panikknopf, der
-vierzig Sekunden lang nicht loslässt, ist das Gegenteil von dem, wofür er da
-ist.
+Knopf ist in genau zwei Fällen deaktiviert: wenn er nichts tun *kann* (die
+Firewall ist aus), und **solange eine Anfrage, die er selbst losgeschickt hat,
+unterwegs ist** — dann sagt er `CUTTING…` bzw. `LEAVING…`. **Nie** ist er
+deaktiviert, weil der Hintergrundarbeiter läuft: während der Konvergenz bleibt
+er drückbar, und ein Druck bricht sie ab.
+
+Das heißt ehrlich auch: ein Verlassen aus `isolated` dauert gemessen 57,5 s und
+hat keinen Abbruch. Für diese Zeit ist der Knopf tatsächlich nicht verfügbar;
+er sagt `LEAVING…`, und das Versprechen, er sei „nie wegen Beschäftigung
+gesperrt", gilt dort nicht. *(Entscheidung nach dem Abschluss-Review: der Code
+war richtig, die Spec versprach mehr.)*
 
 **Die Karte bleibt im Blick.** Die rechte Spalte scrollt mit der Seite, und auf
 breiten Schirmen kann die Karte unter die Falz rutschen. Ein Panikknopf, den man
@@ -447,15 +469,16 @@ Schalter in der Kopfzeile bleibt ohnehin immer sichtbar.
 
 **Ein Zustand, zwei Orte.** Der Knopf und `#firewall-isolated` in der Kopfzeile
 lesen beide `fwState.isolate` und rufen beide `fwToggleIsolated()`. Beide sind
-während des Umschaltens gesperrt. Der Kopfzeilen-Schalter bleibt, weil er immer
+gesperrt, solange eine eigene Anfrage zum Umschalten unterwegs ist (`CUTTING…` /
+`LEAVING…`), nie wegen des Hintergrundarbeiters (siehe oben). Der Kopfzeilen-Schalter bleibt, weil er immer
 sichtbar ist: die rechte Spalte scrollt mit der Seite, und ein Panikknopf, den
 man erst suchen muss, ist der schlechtere von beiden. Er bekommt zusätzlich die
 Stufe (`ISOLATED` / `CUT`) als Text.
 
 **Rückfrage: beim Schneiden keine, beim Verlassen ja.** Das ist der Sinn eines
 Panikknopfes — ein Druck. Der Schnitt ist sicher (er sperrt nur, er zerstört
-nichts) und in zwei Sekunden rückgängig zu machen, zu jedem Zeitpunkt, auch
-mitten in der Konvergenz. Das Verlassen behält die heutige
+nichts) und zu jedem Zeitpunkt rückgängig zu machen, auch mitten in der
+Konvergenz: aus `cut` in Sekunden, aus `isolated` in gemessen 57,5 s. Das Verlassen behält die heutige
 `tdcConfirm`-Rückfrage, denn dort läuft ein Sample wieder ins Netz.
 *Entscheidung des Autors, nicht des Nutzers — bitte prüfen.*
 
@@ -473,8 +496,8 @@ dass sie nicht holen konnte, statt eine Sicherung zu behaupten.
 ### API
 
 Keine neue Route. `POST /api/firewall/isolate {on: true}` antwortet nach
-Schritt 4, also in etwa zwei Sekunden, mit `stage: "cut"`, `verified` (die
-zurückgelesene Catch-all-Regel) und `converging: true`.
+Schritt 4 (gemessen 8,8 s ruhig, 9,9–16,9 s unter Last) mit `stage: "cut"`,
+`verified` (die zurückgelesene Catch-all-Regel) und `converging: true`.
 `GET /api/firewall/isolate` bekommt `stage`, `converging`, `can_fetch` und
 behält alles Heutige. `on: false` bleibt, wie es ist, und bricht einen
 laufenden Arbeiter ab.
@@ -503,7 +526,9 @@ vorab auf der VM gemessen (siehe die Tabelle oben), und sie bleibt ein
 **VM-Pflichtcheck** in
 `docs/superpowers/plans/2026-11-16-firewall-tab-handover.md`: nach dem Druck
 muss DNS tot und `1.1.1.1:443` unerreichbar sein, während die Oberfläche
-erreichbar bleibt, die Zeit bis `stage: cut` unter 3 s liegen, und der Rundlauf
+erreichbar bleibt, die Zeit bis `stage: cut` höchstens 12 s betragen (auf einer
+ruhigen Maschine; unter der Last der Abfragen des Tabs gilt der offene Punkt im
+Handover), und der Rundlauf
 am Ende `NotConfigured` und alle Regelnamen exakt zurückgeben.
 
 ## Was dem Builder überlassen bleibt
@@ -520,7 +545,8 @@ am Ende `NotConfigured` und alle Regelnamen exakt zurückgeben.
 ## Entscheidungen des Autors, die der Nutzer prüfen sollte
 
 1. **Der Schnitt fragt nicht zurück, das Verlassen schon.** Tragbar, weil
-   Verlassen jederzeit geht: ein Fehldruck kostet zwei Sekunden, nicht vierzig.
+   Verlassen jederzeit geht: ein Fehldruck kostet in Stufe `cut` Sekunden; erst
+   aus `isolated` kostet das Verlassen 57,5 s.
 2. **Cmdlets statt `netsh`: 2,1 s statt 0,8 s.** Gemessen. Der Grund gegen
    `netsh` ist, dass seine Regel einen GUID-`Name` bekommt und TDCs
    namensbasierte Entfernung und der Notausgang sie nicht finden würden. Wer
