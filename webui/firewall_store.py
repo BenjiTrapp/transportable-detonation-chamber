@@ -845,7 +845,8 @@ class Settings:
     ``allow_disabled``   the names of Windows' own outbound Allow rules ISOLATED switched off, to switch exactly
                          those on again (``scripts/tdc-unisolate.ps1`` reads it too)
     ``stage``            ``open`` | ``cut`` | ``isolated`` | ``cut_policy`` (``STAGES``): which stage of ISOLATED holds;
-                         it is kept in the file and so survives a restart of the web UI
+                         it is kept in the file and so survives a restart of the web UI. The stage is not
+                         authoritative without, or beside, the marker (``isolated``): read the two together
 
     The attributes can be read freely. ``set`` checks, stores and writes the file, and raises (leaving
     everything as it was) when it cannot: whoever isolates the VM must know that the way back was not

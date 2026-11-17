@@ -15,6 +15,7 @@ import pytest
 
 import firewall
 import geoip
+from test_frontend import needs_node
 
 IMAGE = r"C:\x\loader.exe"
 URL = "http://203.0.113.50:8080/stage2.dll"
@@ -1993,7 +1994,7 @@ def test_a_second_press_during_the_convergence_waits_for_one_call_and_the_worker
     assert tdc._fw_converge_note is None
 
 
-def test_a_refused_second_press_keeps_the_isolation_converging_and_its_cut_verified(client, fw, tdc):
+def test_a_refused_second_press_keeps_the_isolation_converging_and_its_cut_unverified_only_while_the_profile_is_off(client, fw, tdc):
     client.post("/api/firewall/isolate", json={"on": True})
     fw.profiles = {"Domain": True, "Private": False, "Public": True}
     r = client.post("/api/firewall/isolate", json={"on": True})                # it stopped the round, then refused
@@ -2117,6 +2118,101 @@ def test_a_default_action_set_back_to_allow_under_stage_isolated_makes_the_state
     state = client.get("/api/firewall/isolate").json
     assert state["stage"] == "isolated" and state["allowed_out"] == [] and state["verified"] is False
     assert "Cut" not in fw.run.ops()[-3:] and _workers_started(fw) == 1   # reported, not repaired
+
+
+def _cut_rule_removed_from_outside(client, fw, tdc, monkeypatch, policy):
+    """A press (and, for ``policy``, the convergence to cut_policy), then the cut rule removed outside TDC."""
+    from test_firewall_rules import GPO_RULE, STOCK
+    clock = [1000.0]
+    monkeypatch.setattr(tdc.time, "monotonic", lambda: clock[0])
+    if policy:
+        fw.run.foreign = {n: dict(r) for n, r in {**STOCK, **GPO_RULE}.items()}
+    assert client.post("/api/firewall/isolate", json={"on": True}).json["verified"] is True
+    if policy:
+        fw.converge()
+    stage = "cut_policy" if policy else "cut"
+    assert client.get("/api/firewall/isolate").json["verified"] is True and fw.settings.stage == stage
+    fw.run.rules.pop("TDC-FW-ISO-cut")                      # wf.msc, the hatch, or a sample with admin rights
+    return clock, stage
+
+
+@pytest.mark.parametrize("policy", [False, True])
+def test_a_cut_rule_removed_after_the_press_is_not_verified_once_its_read_back_is_older_than_the_ttl(
+        client, fw, tdc, monkeypatch, policy):
+    clock, stage = _cut_rule_removed_from_outside(client, fw, tdc, monkeypatch, policy)
+    fw.run.calls.clear()
+    clock[0] += tdc.FIREWALL_PROFILES_ERROR_TTL_S + 1       # the press's read-back is older than the isolate TTL
+    state = client.get("/api/firewall/isolate").json
+    assert state["stage"] == stage and state["verified"] is False
+    assert "Get" in fw.run.ops() and fw.run.writes() == []   # read again, not repaired by itself
+    r = client.post("/api/firewall/isolate", json={"on": True})                # a press repairs it
+    assert r.status_code == 200 and r.json["verified"] is True and "TDC-FW-ISO-cut" in fw.run.rules
+    assert client.get("/api/firewall/isolate").json["verified"] is True
+
+
+def test_a_rule_list_read_after_the_removal_unverifies_the_cut_at_once_and_costs_no_call(client, fw, tdc, monkeypatch):
+    clock, _ = _cut_rule_removed_from_outside(client, fw, tdc, monkeypatch, False)
+    client.get("/api/firewall/rules")                       # the slow poll reads the list: the rule is gone
+    fw.run.calls.clear()
+    assert client.get("/api/firewall/isolate").json["verified"] is False
+    assert "Get" not in fw.run.ops()                        # the fresh list said it: nothing read for it
+
+
+def test_a_cut_rule_read_back_is_kept_for_the_isolate_ttl_and_not_read_on_every_poll(client, fw, tdc, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(tdc.time, "monotonic", lambda: clock[0])
+    client.post("/api/firewall/isolate", json={"on": True})
+    fw.run.calls.clear()
+    for _ in range(3):
+        assert client.get("/api/firewall/isolate").json["verified"] is True
+        clock[0] += 2
+    assert "Get" not in fw.run.ops()                        # the press's own read-back is fresh enough
+    clock[0] += tdc.FIREWALL_PROFILES_ERROR_TTL_S
+    for _ in range(3):
+        assert client.get("/api/firewall/isolate").json["verified"] is True
+    assert fw.run.ops().count("Get") == 1                   # read once, then kept for the TTL again
+
+
+@pytest.mark.parametrize("rule_after", ["stands", "gone"])
+def test_a_failed_re_press_does_not_keep_the_old_read_back_and_reads_the_rule_again(client, fw, tdc, monkeypatch,
+                                                                                   rule_after):
+    clock = [1000.0]
+    monkeypatch.setattr(tdc.time, "monotonic", lambda: clock[0])
+    client.post("/api/firewall/isolate", json={"on": True})
+    real = fw.run.op_Cut
+
+    def broken(p):                                          # the call fails after PowerShell wrote (or not)
+        real(p)
+        if rule_after == "gone":
+            fw.run.rules.pop("TDC-FW-ISO-cut")
+        return 0, "{not json", ""
+    fw.run.op_Cut = broken
+    r = client.post("/api/firewall/isolate", json={"on": True})
+    assert r.status_code == 500 and "not known" in r.json["error"] and "open the egress" not in r.json["error"]
+    fw.run.calls.clear()
+    state = client.get("/api/firewall/isolate").json        # within the TTL of the first press, and still read again
+    assert "Get" in fw.run.ops() and state["verified"] is (rule_after == "stands")
+
+
+def test_a_cut_rule_narrowed_from_outside_is_not_verified(client, fw, tdc, monkeypatch):
+    clock, _ = _cut_rule_removed_from_outside(client, fw, tdc, monkeypatch, False)
+    fw.run.rules["TDC-FW-ISO-cut"] = fw.run.view("TDC-FW-ISO-cut", Enabled=False)     # back, but disabled
+    clock[0] += tdc.FIREWALL_PROFILES_ERROR_TTL_S + 1
+    assert client.get("/api/firewall/isolate").json["verified"] is False
+    client.get("/api/firewall/rules")
+    assert client.get("/api/firewall/isolate").json["verified"] is False
+
+
+@needs_node
+def test_a_cut_rule_removed_after_the_press_puts_the_button_on_cut_again(client, fw, tdc, monkeypatch):
+    from test_firewall_ui import cut_view
+    clock, _ = _cut_rule_removed_from_outside(client, fw, tdc, monkeypatch, False)
+    clock[0] += tdc.FIREWALL_PROFILES_ERROR_TTL_S + 1
+    st = cut_view(client.get("/api/firewall/isolate").json)["state"]
+    assert st["key"] == "cutunconfirmed" and st["action"] == "cut"
+    client.post("/api/firewall/isolate", json={"on": True})
+    st = cut_view(client.get("/api/firewall/isolate").json)["state"]
+    assert st["key"] == "securing" and st["action"] == "leave"
 
 
 def test_stage_isolated_with_a_profile_off_or_the_profiles_unreadable_is_not_verified(client, fw, tdc):

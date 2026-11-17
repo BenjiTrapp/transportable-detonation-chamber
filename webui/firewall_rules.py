@@ -32,9 +32,11 @@ governs only the traffic that **no rule matches**, and Windows ships enabled out
 Networking's DNS among them), so ISOLATED also switches off every enabled local outbound Allow rule that is not
 TDC's and remembers exactly which (``Settings.allow_disabled``); leaving switches exactly those on again. A rule
 from another store, a group policy above all, cannot be switched off locally: what is still enabled is read back
-after the switch (``allowed_out``) and said. ``verified`` means that the cut rule (below) was read back: that rule shuts
-the egress whether or not the list could be read. An unreadable or non-empty list only keeps the cut rule standing
-(``cut_policy``); it is dropped, and the state is the plain ISOLATED, only when the list was read and is empty. The order is:
+after the switch (``allowed_out``) and said. ``verified`` depends on the stage. Where the cut rule (below) stands
+(``cut``, ``cut_policy``) it means that rule was read back: it shuts the egress whether or not the list could be read.
+An unreadable or non-empty list only keeps the cut rule standing (``cut_policy``); it is dropped, and the state is the
+plain ISOLATED (``isolated``), only when the list was read and is empty, and there, with the rule gone, ``verified``
+means Block read back and the Allow list read back empty. The order is:
 profiles read and checked, the previous ``DefaultOutboundAction`` and the marker saved in ``Settings`` *before*
 anything changes, then the cut (``isolate``, below); after it ``converge``: Windows' rules read, their names saved,
 they are switched off, then Block, then read back, then the cut rule removed. Leaving goes backwards and is never refused for
@@ -55,7 +57,8 @@ between leaves the marker, and ``startup_state`` reports an isolation it finds a
 
 The cut is the fast way to shut the egress: **one** outbound Block rule, ``TDC-FW-ISO-cut``, for every program and
 every address, written and read back by one call (``cut``). In Windows Firewall a Block rule beats every Allow rule, so
-the ~135 Allow rules that Windows ships need not be switched off one by one (that measured 38.5 s; the cut, 2 s).
+the ~135 Allow rules that Windows ships need not be switched off one by one (that measured 38.5 s; ``Cut`` alone
+2.44 s, the whole press 8.8 s on a quiet VM).
 Loopback is in the rule's address set and that is harmless: Windows does not filter loopback, so the Web UI stays
 reachable. No Allow exception gets through the cut, **so there is no ``allow_fetch`` while it stands**. Its name
 starts ``TDC-FW-ISO-``, so ``RemoveIsolate`` and ``scripts/tdc-unisolate.ps1`` remove it with no cleanup path of its own.
@@ -782,7 +785,8 @@ def _identity(view: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], Optio
 def rules(run) -> List[Dict[str, Any]]:
     """Our rules, and only ours (names starting ``TDC-FW-``), as they really are.
 
-    ``{rule_id, name, kind, action, enabled, image, ip, port, protocol, key, blocking}``. ``kind`` is ``"block"``
+    ``{rule_id, name, kind, action, enabled, image, ip, port, protocol, key, blocking, cuts}``. ``cuts`` is True only
+    for ``CUT_RULE`` in the catch-all shape ``cut`` writes and reads back (``cut_stands``). ``kind`` is ``"block"``
     (written by ``block``) or ``"isolate"`` (the allow rules of ISOLATED). ``blocking`` is True for a Block rule
     that stands, in the shape ``block`` writes, with every profile it covers on; ``key`` is then
     ``firewall.rule_key`` of the rule's real image, address and port. A rule that is listed but not
@@ -818,7 +822,7 @@ def rules(run) -> List[Dict[str, Any]]:
         listed.append({"rule_id": name, "name": name, "kind": kind, "action": view["action"].capitalize(),
                        "enabled": view["enabled"], "image": image, "ip": ip, "port": port, "protocol": protocol,
                        "key": firewall.rule_key(image or "", ip or "", port) if canonical else None,
-                       "blocking": blocking})
+                       "blocking": blocking, "cuts": name == CUT_RULE and _cut_problem(view) is None})
     return listed
 
 
@@ -1167,8 +1171,9 @@ def _isolate_on(run, settings) -> Dict[str, Any]:
             raise RuleError(f"the cut failed: {type(e).__name__}: {_first_line(e)}") from e
         if isinstance(e, ProfileOffError):
             raise
-        raise RuleError(f"{_first_line(e)}. ISOLATED was on and stays as it is; the cut was not written again. "
-                        f"Run {UNISOLATE_SCRIPT} on the VM to open the egress.") from e
+        raise RuleError(f"{_first_line(e)}. ISOLATED was on and stays on. Whether the cut rule was written again is "
+                        "not known (the call can fail after the rule was written); the state reads it again. If the "
+                        "cut shows as not confirmed, press again, or CUT AGAIN in the band.") from e
     try:
         settings.set(stage="cut")
         staged = None
@@ -1206,7 +1211,9 @@ def converge(run, *, settings, cancelled: Callable[[], bool]) -> Dict[str, Any]:
     the failure in ``note``; nothing is rolled back, because the state is closed and the way back is in ``allow_disabled``.
 
     Returns ``{"stage", "verified", "allowed_out", "allowed_out_error", "cancelled", "refused", "note"}``. ``verified``
-    means that the **cut rule was read back** where it stands, and nothing more: it closes the egress whether or not the
+    means, where the cut rule stands (``cut_policy``), that the **cut rule was read back**, and nothing more; in
+    ``isolated``, where it is gone, Block read back, the Allow list read back empty and the rule read as gone. The cut
+    rule closes the egress whether or not the
     list of Allow rules could be read, because a Block rule beats every Allow rule. An unreadable list decides only
     whether the rule may be dropped, and then it may not. So ``verified`` is True in ``cut_policy`` (the rule read back as
     standing) and in ``isolated`` (Block read back, the list read and empty, the rule read as gone); do not "fix" the

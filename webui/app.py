@@ -11252,11 +11252,14 @@ def _fw_rules(force=False):
         if not force and cached is not None and 0 <= time.time() - cached[0] < FIREWALL_RULES_TTL_S:
             return cached[1], cached[2]
         _fw_log_rules_wait(waited)
+        started = time.monotonic()
         try:
             found, error = firewall_rules.rules(_fw_runner), None
         except Exception as e:
             found, error = None, str(e).splitlines()[0][:300] if str(e) else type(e).__name__
         _fw_rules_cache = (time.time(), found, error)
+        if found is not None:
+            _fw_saw_cut(any(r.get("name") == firewall_rules.CUT_RULE and r.get("cuts") for r in found), started)
         return found, error
     finally:
         _fw_rules_lock.release()
@@ -12305,6 +12308,48 @@ _fw_converge_gen = 0                              # counts the presses, so a rou
 _fw_cut_verified = None                           # the cut rule read back by the press (or by converge in cut_policy)
 _fw_leaving = 0                                   # leaves under way: every round stops at its next step meanwhile
 _fw_pressing = 0                                  # presses under way: a cut rule may stand before the stage says so
+# The newest read of the cut rule, whoever made it (the press, converge, the rule list of a poll, _fw_cut_stands):
+# ``(monotonic time the read started, stands)``, ``stands`` True, False or None (not readable). ``verified`` in the
+# cut stages rests on it as well as on the press's read-back, so that a rule removed or disabled from outside after
+# the press (wf.msc, the hatch, a sample with admin rights) stops reading as closed within the isolate TTL.
+_fw_cut_seen = None
+_fw_cut_unseen_at = float("-inf")                # reads that started before this are not kept
+_fw_cut_seen_lock = threading.Lock()
+
+
+def _fw_saw_cut(stands, started):
+    """Keep a read of the cut rule that started at ``started`` (monotonic), unless a read that started later is kept
+    or the reads were forgotten after it started (_fw_unsee_cut)."""
+    global _fw_cut_seen
+    with _fw_cut_seen_lock:
+        if started < _fw_cut_unseen_at:
+            return
+        if _fw_cut_seen is None or started >= _fw_cut_seen[0]:
+            _fw_cut_seen = (started, stands)
+
+
+def _fw_unsee_cut():
+    """Forget every read of the cut rule, and any still under way: the next ``verified`` in a cut stage reads it again."""
+    global _fw_cut_seen, _fw_cut_unseen_at
+    with _fw_cut_seen_lock:
+        _fw_cut_seen = None
+        _fw_cut_unseen_at = time.monotonic()
+
+
+def _fw_cut_stands():
+    """Whether the cut rule stands as the catch-all, from the newest read of it while that is younger than the isolate
+    TTL; otherwise read now (one ``Get``, no lock: never behind a convergence). False when it cannot be read.
+
+    The rule list the tab's polls read anyway is one of those reads, so a poll costs a ``Get`` only when the list is
+    older than the TTL; the price of not reading at all would be a green band over a rule that is gone."""
+    with _fw_cut_seen_lock:
+        seen = _fw_cut_seen
+    now = time.monotonic()
+    if seen is not None and 0 <= now - seen[0] < _fw_isolate_fact_ttl(None):
+        return seen[1] is True
+    stands = firewall_rules.cut_stands(_fw_runner)
+    _fw_saw_cut(stands, now)
+    return stands is True
 
 
 def _fw_converge_thread(target):
@@ -12344,6 +12389,8 @@ def _fw_converge_worker():
                         _fw_cut_verified = None        # the rule is gone but the stage was not saved: nothing to verify
                     elif result["stage"] == "cut_policy" and not result["cancelled"] and not result["refused"]:
                         _fw_cut_verified = bool(result["verified"])    # converge read the rule back itself
+                        # its read-back is its last step, so the round's end is about when it read
+                        _fw_saw_cut(_fw_cut_verified, time.monotonic())
                     # every other answer read nothing back (cancelled, refused, a step failed): the press's stands
                 if not _fw_converge_again:
                     _fw_converge_running = False
@@ -12404,6 +12451,7 @@ def _fw_left():
     with _fw_converge_lock:
         _fw_leaving -= 1
         _fw_cut_verified = None
+    _fw_unsee_cut()
 
 
 def _fw_pressed():
@@ -12629,7 +12677,11 @@ def _fw_isolate_verified(allowed, off):
     whose firewall is off, so a rule read back as written is not in force there. ``cut()`` refuses while a profile is
     off, so in the cut stages this is a profile switched off after the cut, the case that must not read as closed.
     In ``cut`` and ``cut_policy`` it is the catch-all rule as the press read it back (or ``converge`` in
-    ``cut_policy``), and nothing about the Allow list: a Block rule beats every Allow rule. In ``isolated`` the rule
+    ``cut_policy``), **and** the newest read of that rule younger than the isolate TTL still finding it in the
+    catch-all shape (_fw_cut_stands: the rule list a poll read, or one ``Get``): the press's read-back is one moment,
+    and a rule removed or disabled from outside afterwards must stop reading as closed, all the more in
+    ``cut_policy``, where the rule is the only thing holding the egress for as long as the stage lasts. Nothing about
+    the Allow list: a Block rule beats every Allow rule. In ``isolated`` the rule
     is gone, so it is the default action Block in force on every profile, all of them on, **and** the Allow list as
     read now empty: either changed from outside (a group policy refresh, a rule switched on again) makes it False,
     and TDC writes nothing by itself about that (it changes enforcement on a press only)."""
@@ -12645,7 +12697,7 @@ def _fw_isolate_verified(allowed, off):
         return (allowed == [] and blocking is not None
                 and sorted(blocking) == sorted(firewall_rules.PROFILE_NAMES))
     if stage in ("cut", "cut_policy"):
-        return _fw_cut_verified is True
+        return _fw_cut_verified is True and _fw_cut_stands()
     return False                                   # a marker with stage open: nothing in force was read back
 
 
@@ -12704,16 +12756,20 @@ def api_firewall_isolate():
     # No separate profile check first: isolate reads the profiles itself, in its first call, and refuses with
     # ProfileOffError (nothing changed) while one is off. Every PowerShell call costs seconds.
     done = None
+    started = time.monotonic()
     try:
         done = firewall_rules.isolate(_fw_runner, on, settings=_fw_settings)
     except firewall_rules.ProfileOffError as e:
         return _fw_error(str(e), 409)
     except firewall_rules.RuleError as e:
+        if on:
+            _fw_unsee_cut()     # cut() can fail after it wrote: what the cut rule is now is not known
         return _fw_error(str(e), 500)
     finally:
         try:
             _fw_forget_rules()
             if on and done is not None:
+                _fw_saw_cut(bool(done["verified"]), started)    # the press's Cut read the rule back
                 # only the press's own read-back counts as verified; converge's answer is never laid over it
                 _fw_converge_start(done["verified"])
             elif on and stopped and _fw_settings.isolated:

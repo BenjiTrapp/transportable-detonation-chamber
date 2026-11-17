@@ -138,7 +138,12 @@ class FirewallFake:
 
     ``body`` is what a fetch is served, ``script`` a list of ``(status, headers, body)`` served first (redirects),
     ``lookups`` every name that was resolved (a fetch must resolve none), ``own`` the addresses that count as
-    this VM's own (a fetch must refuse them)."""
+    this VM's own (a fetch must refuse them).
+
+    The firewall behind ``run`` stores rules and gives them back; it does not model that a Block rule beats an Allow
+    rule, or that a rule does anything to traffic. No test built on this fake can prove that a rule works (that the
+    cut shuts the egress, that a block stops a flow): only the VM checks in
+    docs/superpowers/plans/2026-11-16-firewall-tab-handover.md do."""
 
     def __init__(self, tdc, run, store, settings, pending, tmp_path):
         self.tdc, self.run, self.store, self.settings, self.pending = tdc, run, store, settings, pending
@@ -191,7 +196,7 @@ def fw(tdc, monkeypatch, tmp_path):
                         # no thread of its own: a test runs the worker with fake.converge(), or swaps in the real spawn
                         ("_fw_converge_spawn", fake.spawn), ("_fw_converge_event", threading.Event()),
                         ("_fw_converge_running", False), ("_fw_converge_again", False), ("_fw_converge_note", None),
-                        ("_fw_converge_gen", 0), ("_fw_cut_verified", None), ("_fw_leaving", 0), ("_fw_pressing", 0)):
+                        ("_fw_converge_gen", 0), ("_fw_cut_verified", None), ("_fw_cut_seen", None), ("_fw_cut_unseen_at", float("-inf")), ("_fw_leaving", 0), ("_fw_pressing", 0)):
         monkeypatch.setattr(m, name, value)
     monkeypatch.setattr(m, "_process_started_at", lambda pid: None)
     # the fetch mechanism itself (real sockets, the deadline, the SNI) is tested in test_firewall_fetch.py;

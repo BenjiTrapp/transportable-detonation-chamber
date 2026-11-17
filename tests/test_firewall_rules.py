@@ -4,6 +4,12 @@ Nothing here touches a firewall: ``FakeRun`` stands in for ``run_powershell``. I
 webui/firewall_rules.ps1 (the ``-Op`` verbs, exit code 3 for "a profile is off", 4 for "the rule is already
 there"), so these tests prove the Python side, the order of what it does and what it refuses to claim. What the
 script really does to Windows only a VM can show.
+
+**The honesty boundary.** ``FakeRun`` does not model that a Block rule beats an Allow rule, nor that a rule does
+anything to traffic at all: it stores rules and gives them back. So no test here can prove that a rule works - that
+the cut shuts the egress, that a block stops a flow, that loopback stays open. That blindness let the original
+"default deny" through. What proves the effect are the VM checks in
+docs/superpowers/plans/2026-11-16-firewall-tab-handover.md; a green run here is never evidence for it.
 """
 
 import base64
@@ -572,6 +578,18 @@ def test_a_listed_rule_blocks_only_when_it_stands_and_the_profiles_are_on():
     run.rules[r["rule_id"]]["Enabled"] = True
     run.profiles["Private"] = False
     assert [x["blocking"] for x in rules_mod.rules(run)] == [False]
+
+
+def test_the_rule_list_says_whether_the_cut_rule_stands_in_the_catch_all_shape():
+    """The poll's rule list is one of the reads ``verified`` rests on in the cut stages (app._fw_cut_stands)."""
+    run = FakeRun()
+    rules_mod.cut(run)
+    other = rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)["rule_id"]
+    listed = {r["rule_id"]: r for r in rules_mod.rules(run)}
+    assert listed[rules_mod.CUT_RULE]["cuts"] is True and listed[other]["cuts"] is False
+    for change in ({"Enabled": False}, {"Action": "Allow"}, {"RemoteAddress": ["1.2.3.4"]}, {"Profile": "Domain"}):
+        run.rules[rules_mod.CUT_RULE] = run.view(rules_mod.CUT_RULE, **change)
+        assert {r["rule_id"]: r for r in rules_mod.rules(run)}[rules_mod.CUT_RULE]["cuts"] is False, change
 
 
 def test_a_rule_we_would_not_have_written_is_listed_but_never_counts_as_a_block():
@@ -1806,7 +1824,8 @@ def test_a_failure_with_a_damaged_marker_is_not_rolled_back_to_open():
     settings.isolated, settings.outbound_before = True, None
     with pytest.raises(rules_mod.RuleError) as e:
         rules_mod.isolate(run, True, settings=settings)
-    assert "scripts/tdc-unisolate.ps1" in str(e.value)
+    # the way out of a failed panic press is to cut again, not the hatch that opens the egress
+    assert "press again" in str(e.value) and "tdc-unisolate" not in str(e.value)
     assert settings.isolated is True and set(run.outbound.values()) == {"Block"} and "RemoveIsolate" not in run.ops()
 
 
@@ -2592,6 +2611,25 @@ def test_a_failed_fresh_cut_keeps_the_record_an_earlier_failed_leave_left():
     with pytest.raises(rules_mod.RuleError):
         rules_mod.isolate(run, True, settings=settings)
     assert settings.isolated is False and settings.allow_disabled == [DNS_RULE] and settings.stage == "open"
+
+
+@pytest.mark.parametrize("failure", ["refused", "unreadable"])
+def test_a_failed_press_while_isolated_does_not_claim_the_cut_was_not_written_and_says_press_again(failure):
+    """``cut`` can raise after PowerShell wrote the rule (an answer it cannot read, a timeout), so whether it was
+    written again is not known; and whoever's panic press just failed wants to cut, not to open the egress."""
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    real = run.op_Cut
+    if failure == "refused":
+        run.fail["Cut"] = (1, "access is denied")
+    else:
+        run.op_Cut = lambda p: (real(p)[0], "{not json", "")          # written, then an answer that cannot be read
+    with pytest.raises(rules_mod.RuleError) as raised:
+        rules_mod.isolate(run, True, settings=settings)
+    text = str(raised.value)
+    assert "not known" in text and "was not written again" not in text
+    assert "press" in text.lower() and "CUT AGAIN" in text
+    assert "open the egress" not in text and settings.isolated is True
 
 
 def test_converging_again_after_a_failed_converge_finishes_the_job_and_records_nothing_twice():
