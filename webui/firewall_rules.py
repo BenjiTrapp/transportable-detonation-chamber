@@ -24,16 +24,19 @@ only when it stands, is enabled, is what was asked for and every profile it cove
 read counts as off. ``_firewall_is_off`` of app.py is not used: it is in the module that imports this one, it only
 says "off in *all* profiles", it answers False when it cannot read the registry, and it caches for a minute.
 
-ISOLATED sets ``DefaultOutboundAction Block`` on all profiles and allows one thing out: loopback
-(``127.0.0.0/8``, ``::1``), over which TDC's whole inner traffic runs. Inbound is untouched. The default action
+ISOLATED sets ``DefaultOutboundAction Block`` on all profiles. Loopback, over which TDC's whole inner traffic
+runs, needs no rule: Windows Firewall does not filter loopback traffic at all, and Windows refuses ``::1`` as a
+rule's RemoteAddress anyway (earlier versions wrote a loopback allow rule; it was a no-op, its IPv6 half could not
+be written, and leaving still removes it if one is found). Inbound is untouched. The default action
 governs only the traffic that **no rule matches**, and Windows ships enabled outbound Allow rules (Core
 Networking's DNS among them), so ISOLATED also switches off every enabled local outbound Allow rule that is not
 TDC's and remembers exactly which (``Settings.allow_disabled``); leaving switches exactly those on again. A rule
 from another store, a group policy above all, cannot be switched off locally: what is still enabled is read back
 after the switch (``allowed_out``) and said, and ISOLATED is ``verified`` only when that list is empty. The order is:
 profiles checked, Windows' rules read, the previous ``DefaultOutboundAction``, the rule names and the marker saved
-in ``Settings`` *before* anything changes, the loopback rule written, Windows' rules switched off, then Block, then
-read back. Leaving goes backwards and is never refused for a profile that is off.
+in ``Settings`` *before* anything changes, Windows' rules switched off, then Block, then read back. Leaving goes
+backwards and is never refused for a profile that is off. Every step is one PowerShell call however many rules
+it touches, because a call costs seconds on a small VM: ISOLATED on is four calls, off is three.
 
 TDC's own fetch gets its way out **per fetch**, not as a standing rule: ``allow_fetch`` writes an allow rule
 for the fetcher program to the one address it is about to fetch from and ``deny_fetch`` removes it when the
@@ -67,10 +70,9 @@ import firewall
 
 RULE_PREFIX = "TDC-FW-"
 ISOLATE_PREFIX = RULE_PREFIX + "ISO-"
-LOOPBACK_RULE = ISOLATE_PREFIX + "loopback"
+LOOPBACK_RULE = ISOLATE_PREFIX + "loopback"  # written by older versions: only removed now (see the module docstring)
 FETCHER_RULE = ISOLATE_PREFIX + "fetcher"     # the standing fetcher rule of older versions: only removed now
 FETCH_PREFIX = ISOLATE_PREFIX + "fetch-"      # one allow rule per fetch, for as long as that fetch lasts
-LOOPBACK_ADDRESSES = ("127.0.0.0/8", "::1")
 
 PROFILE_NAMES = ("Domain", "Private", "Public")
 OUTBOUND_ACTIONS = ("Allow", "Block", "NotConfigured")
@@ -98,6 +100,10 @@ _LOCK = threading.RLock()
 
 class RuleError(Exception):
     """A firewall change that could not be made, or a state that cannot be trusted. The message is for the analyst."""
+
+
+class ProfileOffError(RuleError):
+    """Nothing was changed because a firewall profile is off: a rule or a default action would do nothing."""
 
 
 # ---- running ---------------------------------------------------------------------------------
@@ -517,7 +523,7 @@ def fetch_rule_name(ip: Any, port: Optional[int] = None, fetcher: Optional[str] 
 def allow_fetch(run, *, fetcher: str, ip: Any, port: Optional[int] = None) -> Dict[str, Any]:
     """Allow one fetcher program out to one address, for one fetch: ``{name, rule_id, verified, problem}``.
 
-    ISOLATED shuts every way out but loopback that TDC can shut, so TDC's own fetch needs a hole. This is that hole, as small as
+    ISOLATED shuts every way out that TDC can shut, so TDC's own fetch needs a hole. This is that hole, as small as
     a program-path rule can be made: one program, one address, one port when it is known, and ``deny_fetch``
     takes it away the moment the fetch ends. See the module docstring for why there is no standing rule for the
     fetcher any more, and for the residual that is left. A caller whose fetch may run as more than one binary
@@ -540,8 +546,7 @@ def allow_fetch(run, *, fetcher: str, ip: Any, port: Optional[int] = None) -> Di
 def deny_fetch(run, name: str) -> None:
     """Remove a per-fetch allow rule, and a stand-in of it, and check that both are gone.
 
-    Only ``TDC-FW-ISO-fetch-<12 hex>`` is accepted, so this can be pointed neither at a block rule nor at the
-    loopback rule that ISOLATED needs. Both removals are tried even when the first fails: the rule under its
+    Only ``TDC-FW-ISO-fetch-<12 hex>`` is accepted, so this can be pointed at no other rule. Both removals are tried even when the first fails: the rule under its
     own name is the way out that has to go, and a stand-in that will not budge must not keep it open. What is
     still standing afterwards is raised, with the failures that were seen.
     """
@@ -683,13 +688,23 @@ def _decode_outbound(text: Any) -> Optional[Dict[str, str]]:
 
 
 def _apply_outbound(run, target: Dict[str, str]) -> List[Dict[str, Any]]:
-    """Set ``DefaultOutboundAction`` per profile and read it back; returns the profiles as read, raises when it did not take."""
-    if len(set(target.values())) == 1:
-        _ok(run, "SetDefaultOutbound", DefaultOutboundAction=next(iter(target.values())))
-    else:
-        for name in PROFILE_NAMES:
-            _ok(run, "SetDefaultOutbound", Profiles=name, DefaultOutboundAction=target[name])
-    states = _profiles(run)
+    """Set ``DefaultOutboundAction`` per profile and read it back; returns the profiles as read, raises when it did not take.
+
+    One call per distinct value (one when all profiles agree). ``SetDefaultOutbound`` answers with the profiles
+    as it reads them after the change, which is the read back; an answer that is not that is read again."""
+    groups: Dict[str, List[str]] = {}
+    for name in PROFILE_NAMES:
+        groups.setdefault(target[name], []).append(name)
+    out = ""
+    for value, names in groups.items():
+        if len(groups) == 1:
+            out = _ok(run, "SetDefaultOutbound", DefaultOutboundAction=value)
+        else:
+            out = _ok(run, "SetDefaultOutbound", Profiles=",".join(names), DefaultOutboundAction=value)
+    try:
+        states = _states(json.loads(out))
+    except (ValueError, RuleError):
+        states = _profiles(run)
     now = {s["name"]: s["outbound"] for s in states}
     wrong = [n for n in PROFILE_NAMES if now.get(n) != target[n]]
     if wrong:
@@ -698,18 +713,17 @@ def _apply_outbound(run, target: Dict[str, str]) -> List[Dict[str, Any]]:
 
 
 def _remove_isolate_rules(run) -> None:
-    """Remove the allow rules of ISOLATED in whatever shape they are found: the loopback rule, the per-fetch
-    rules of a fetch that was still running, their stand-ins, and the standing fetcher rule of older versions."""
-    names = [n + suffix for n in (FETCHER_RULE, LOOPBACK_RULE) for suffix in ("", SWAP_SUFFIX)]
-    try:
-        names += [r["rule_id"] for r in rules(run) if r["rule_id"].startswith(FETCH_PREFIX)]
-    except RuleError:
-        pass                      # the list cannot be read; the names above are still removed
-    for name in names:
-        _ok(run, "Remove", Name=name)
-    still = [n for n in names if _describe(run, n) is not None]
+    """Remove the allow rules of ISOLATED in whatever shape they are found, in one call (``RemoveIsolate``: every
+    ``TDC-FW-ISO-*``): the per-fetch rules of a fetch that was still running, their stand-ins, and the loopback
+    and standing fetcher rules of older versions. What is still there afterwards is raised."""
+    data = _json(_ok(run, "RemoveIsolate"), "the removal of the ISOLATED rules")
+    still = data.get("still") if isinstance(data, dict) else None
+    if isinstance(still, str):
+        still = [still]
+    if not isinstance(still, list):
+        raise RuleError("cannot read what is left of the ISOLATED rules")
     if still:
-        raise RuleError(f"{', '.join(still)} is still there after it was removed")
+        raise RuleError(f"{', '.join(str(s) for s in still)} is still there after it was removed")
 
 
 def _forget(settings, stuck=()) -> None:
@@ -744,14 +758,24 @@ def allowed_out(run) -> List[Dict[str, Any]]:
     is a rule of this machine, which ISOLATED can switch off; any other source, a group policy above all, cannot be
     switched off from here. Raises ``RuleError`` when the list cannot be read: "cannot tell" is never "none".
     """
+    return _allow_out_state(run)[1]
+
+
+def _allow_out_state(run) -> Tuple[Optional[List[Dict[str, Any]]], List[Dict[str, Any]]]:
+    """``(profiles, rules)`` from one ``AllowOut`` call: the profiles as ``_profiles`` gives them (None when the answer
+    has no readable profiles) and the rules as ``allowed_out`` gives them."""
     data = _json(_ok(run, "AllowOut"), "the outbound allow rules")
+    try:
+        states: Optional[List[Dict[str, Any]]] = _states(data.get("profiles")) if isinstance(data, dict) else None
+    except RuleError:
+        states = None
     rows = data.get("rules") if isinstance(data, dict) else None
     if isinstance(rows, dict):
         rows = [rows]
     if not isinstance(rows, list):
         raise RuleError("cannot read the outbound allow rules")
     found = [v for v in (_allow_view(r) for r in rows) if v is not None]
-    return sorted(found, key=lambda r: r["name"].lower())
+    return states, sorted(found, key=lambda r: r["name"].lower())
 
 
 def _clean_rule_names(names: Any) -> List[str]:
@@ -846,18 +870,17 @@ def open_text(still: Optional[List[Dict[str, Any]]], error: Optional[str]) -> Op
 def isolate(run, on: bool, *, settings) -> Dict[str, Any]:
     """Turn ISOLATED on or off.
 
-    On, in this order: all profiles must be on (``RuleError`` otherwise, with nothing changed). Windows' own enabled
+    On, in this order: all profiles must be on (``ProfileOffError`` otherwise, with nothing changed). Windows' own enabled
     outbound Allow rules are read (``allowed_out``); when they cannot be, nothing is changed, because what would stay
     open is not known. The previous ``DefaultOutboundAction``, the marker and the names of the *local* rules about to
     be switched off (``settings.allow_disabled``) are saved before anything else changes (when that cannot be saved
-    nothing is touched). Then the allow rule for loopback is written and read back, those rules are switched off,
-    ``DefaultOutboundAction Block`` is set and read back, and what still lets traffic out is read back. When a step
+    nothing is touched). Then those rules are switched off, ``DefaultOutboundAction Block`` is set and read back, and what still lets traffic out is read back. When a step
     fails, a fresh isolation is rolled back in reverse; if even that fails the marker stays and the message names
     ``scripts/tdc-unisolate.ps1``. Isolating while isolated keeps the first memory of the default action, adds any
     local rule that is enabled again to the record and switches it off; a marker without a recorded baseline (damaged)
     gets ``Allow`` as its baseline and ``note`` says so, and a failure there is not rolled back either, because the
     isolation was already on. Returns ``{"isolated": True, "outbound_before", "verified", "allowed_out",
-    "allowed_out_error", "note"}``: ``allowed_out`` is what the read back found still enabled (a rule set by a group
+    "allowed_out_error", "profiles_off", "note"}``: ``allowed_out`` is what the read back found still enabled (a rule set by a group
     policy cannot be switched off from here), and ``verified`` is True only when Block was read back **and** that list
     was read and is empty. ``note`` says what stays open.
 
@@ -875,7 +898,9 @@ def isolate(run, on: bool, *, settings) -> Dict[str, Any]:
     ``note`` says so. With the marker but no baseline it assumes ``Allow``, the Windows default, and says so
     (``assumed_allow``). Without the marker it changes nothing but the rules a failed leaving left off, and if the
     egress is nonetheless shut ``note`` says that TDC is not the one isolating and names the hatch.
-    Returns ``{"isolated": False, "changed", "assumed_allow", "outbound_after", "allow_disabled", "note"}``.
+    Returns ``{"isolated": False, "changed", "assumed_allow", "outbound_after", "allow_disabled", "note"}``, and
+    ``profiles_off`` as read back when it changed something. Both directions give ``profiles_off`` so that the
+    caller need not read the profiles once more.
     """
     with _LOCK:
         return _isolate_on(run, settings) if on else _isolate_off(run, settings)
@@ -887,16 +912,20 @@ def _join(*parts: Optional[str]) -> Optional[str]:
 
 
 def _isolate_on(run, settings) -> Dict[str, Any]:
-    states = _profiles(run)
-    off = _off_names(states)
-    if off:
-        raise RuleError(_off_text(off))
-    current = {s["name"]: s["outbound"] for s in states}
     try:
-        foreign = allowed_out(run)
+        states, foreign = _allow_out_state(run)      # the profiles and Windows' rules, in one call
     except RuleError as e:
+        off = _off_names(_profiles(run))
+        if off:
+            raise ProfileOffError(_off_text(off)) from e
         raise RuleError(f"Windows' own outbound Allow rules could not be read, so what ISOLATED would leave open is not "
                         f"known; nothing was changed ({_first_line(e)})") from e
+    if states is None:
+        states = _profiles(run)
+    off = _off_names(states)
+    if off:
+        raise ProfileOffError(_off_text(off))
+    current = {s["name"]: s["outbound"] for s in states}
     marker = bool(settings.isolated)
     already = marker and settings.outbound_before is not None
     damaged = marker and settings.outbound_before is None
@@ -923,12 +952,8 @@ def _isolate_on(run, settings) -> Dict[str, Any]:
         except Exception as e:
             raise RuleError(f"the way back could not be saved ({type(e).__name__}: {_first_line(e)}); "
                             "nothing was changed") from e
-    step = 0            # 1 the loopback rule, 2 Windows' rules off, 3 the default action: how far it got
+    step = 0            # 2 Windows' rules off, 3 the default action: how far it got
     try:
-        step = 1
-        problem = _write(run, _spec(LOOPBACK_RULE, "Allow", addresses=LOOPBACK_ADDRESSES))
-        if problem:
-            raise RuleError(f"{LOOPBACK_RULE}: {problem}")
         step = 2
         _set_allow_out(run, closing, False)       # a rule that stays on is in the read back below
         step = 3
@@ -945,7 +970,7 @@ def _isolate_on(run, settings) -> Dict[str, Any]:
                         f"run {UNISOLATE_SCRIPT} on the VM to open the egress.") from e
     still, error = _still_open(run)
     return {"isolated": True, "outbound_before": remembered, "verified": still == [], "allowed_out": still,
-            "allowed_out_error": error, "note": _join(note, open_text(still, error))}
+            "allowed_out_error": error, "profiles_off": [], "note": _join(note, open_text(still, error))}
 
 
 def _roll_back(run, settings, before: Dict[str, str], step: int, closing: List[str], cause: BaseException) -> None:
@@ -972,7 +997,7 @@ def _isolate_off(run, settings) -> Dict[str, Any]:
     assumed = target is None
     if assumed:
         target = {n: "Allow" for n in PROFILE_NAMES}
-    _apply_outbound(run, target)
+    states = _apply_outbound(run, target)
     stuck, problem = _reopen(run, getattr(settings, "allow_disabled", None))
     _remove_isolate_rules(run)
     _forget(settings, stuck)
@@ -984,7 +1009,7 @@ def _isolate_off(run, settings) -> Dict[str, Any]:
         note = (f"The baseline recorded before ISOLATED is Block on {', '.join(shut)}: outbound stays shut there, "
                 "and TDC's own fetch is no longer let out either. That is the VM's own baseline, not a TDC lockout.")
     return {"isolated": False, "changed": True, "assumed_allow": assumed, "outbound_after": target,
-            "allow_disabled": stuck, "note": _join(note, _stuck_text(stuck, problem) if stuck else None)}
+            "allow_disabled": stuck, "profiles_off": _off_names(states), "note": _join(note, _stuck_text(stuck, problem) if stuck else None)}
 
 
 def _not_isolating(run, settings) -> Dict[str, Any]:

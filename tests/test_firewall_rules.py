@@ -49,6 +49,7 @@ class FakeRun:
         # Windows' own outbound Allow rules: name -> {DisplayName, Group, Source, Enabled}; ``stubborn`` will not switch
         self.foreign = {n: dict(r) for n, r in (foreign or {}).items()}
         self.stubborn = set(stubborn)
+        self.stuck_rules = set()     # TDC-FW-ISO-* rules RemoveIsolate cannot remove
 
     @staticmethod
     def view(name, **kw):
@@ -125,7 +126,7 @@ class FakeRun:
     def op_AllowOut(self, p):
         rows = [{"Name": n, "DisplayName": r.get("DisplayName", n), "Group": r.get("Group", ""), "Source": r["Source"]}
                 for n, r in self.foreign.items() if r["Enabled"]]
-        return 0, json.dumps({"rules": rows}), ""
+        return 0, json.dumps({"profiles": self.profile_rows(), "rules": rows}), ""
 
     def _toggle(self, p, on):
         done, failed, missing = [], [], []
@@ -153,7 +154,15 @@ class FakeRun:
         names = p["Profiles"].split(",") if "Profiles" in p else list(self.profiles)
         for n in names:
             self.outbound[n] = p["DefaultOutboundAction"]
-        return 0, "", ""
+        return 0, json.dumps(self.profile_rows()), ""
+
+    def op_RemoveIsolate(self, p):
+        names = [n for n in self.rules if n.startswith("TDC-FW-ISO-")]
+        for n in names:
+            if n not in self.stuck_rules:
+                self.rules.pop(n)
+        still = [n for n in names if n in self.rules]
+        return 0, json.dumps({"removed": [n for n in names if n not in still], "still": still}), ""
 
     # -- what a test looks at --
 
@@ -162,7 +171,7 @@ class FakeRun:
 
     def writes(self):
         return [o for o in self.ops() if o in ("Create", "Remove", "SetDefaultOutbound", "Enable", "DisableAllowOut",
-                                               "EnableAllowOut")]
+                                               "EnableAllowOut", "RemoveIsolate")]
 
 
 class FakeSettings:
@@ -245,7 +254,7 @@ def test_isolate_remembers_the_previous_outbound_action():
     assert settings.outbound_before == "Allow"
     assert any("DefaultOutboundAction Block" in " ".join(c) for c in run.calls)
     assert not any("-Program" in c for c in run.calls)     # the fetcher's way out is per fetch, see allow_fetch
-    assert any("127.0.0.0/8" in " ".join(c) for c in run.calls)
+    assert "Create" not in run.ops()                       # loopback needs no rule: Windows does not filter it
 
 
 def test_leaving_isolated_restores_exactly_what_was_there():
@@ -301,7 +310,7 @@ def test_the_ops_the_module_emits_are_the_ops_the_script_accepts():
     rules_mod.isolate(run, False, settings=settings)
     assert set(run.ops()) <= allowed
     assert set(run.ops()) == {"Create", "Get", "Remove", "List", "Enable", "Profiles", "SetDefaultOutbound", "AllowOut",
-                              "DisableAllowOut", "EnableAllowOut"}
+                              "DisableAllowOut", "EnableAllowOut", "RemoveIsolate"}
 
 
 @pytest.mark.parametrize("image", ["", "-Foo", "C:\\x\\a\nb.exe", "C:\\x\\a\x00.exe", "x" * 5000])
@@ -532,7 +541,7 @@ def test_the_allow_rules_of_isolated_are_listed_as_such_and_never_as_blocks():
     rules_mod.isolate(run, True, settings=settings)
     fetch = rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)["name"]
     listed = {r["rule_id"]: r for r in rules_mod.rules(run)}
-    assert set(listed) == {"TDC-FW-ISO-loopback", fetch}
+    assert set(listed) == {fetch}
     assert all(r["kind"] == "isolate" and r["action"] == "Allow" and not r["blocking"] for r in listed.values())
 
 
@@ -588,29 +597,29 @@ def test_enable_firewall_says_so_when_a_profile_stays_off():
 def test_isolate_refused_for_a_profile_that_is_off_changes_and_remembers_nothing():
     run = FakeRun(profiles={"Domain": True, "Private": False, "Public": True})
     settings = FakeSettings()
-    with pytest.raises(rules_mod.RuleError) as e:
+    with pytest.raises(rules_mod.ProfileOffError) as e:
         rules_mod.isolate(run, True, settings=settings)
     assert "Private" in str(e.value)
-    assert run.ops() == ["Profiles"] and settings.saved == []
+    assert run.ops() == ["AllowOut"] and settings.saved == []         # the profiles come with Windows' rules
 
 
-def test_isolate_allows_loopback_and_nothing_else():
+def test_isolate_writes_no_allow_rule_of_its_own():
+    """Windows Firewall does not filter loopback, and refuses ::1 as a RemoteAddress: the loopback rule of older
+    versions was a no-op that made every isolation fail. The fetcher's way out is per fetch (allow_fetch)."""
     run, settings = make()
-    rules_mod.isolate(run, True, settings=settings)
-    assert set(run.rules) == {"TDC-FW-ISO-loopback"}          # no standing rule for the fetcher: allow_fetch does that
-    loop = run.rules["TDC-FW-ISO-loopback"]
-    assert loop["Action"] == "Allow" and sorted(loop["RemoteAddress"]) == ["127.0.0.0/8", "::1"] and loop["Program"] == "Any"
-    assert run.outbound == {"Domain": "Block", "Private": "Block", "Public": "Block"}
+    out = rules_mod.isolate(run, True, settings=settings)
+    assert run.rules == {} and "Create" not in run.ops() and not any("::1" in c for c in run.calls)
+    assert run.outbound == {"Domain": "Block", "Private": "Block", "Public": "Block"} and out["verified"] is True
 
 
 def test_isolate_orders_memory_then_allow_rules_then_block():
     run, settings = make(outbound="Allow")
     rules_mod.isolate(run, True, settings=settings)
     kinds = [t[0] for t in run.timeline]
-    first_write = min(i for i, k in enumerate(kinds) if k in ("Create", "SetDefaultOutbound"))
+    first_write = min(i for i, k in enumerate(kinds) if k in ("Create", "DisableAllowOut", "SetDefaultOutbound"))
     assert kinds[first_write - 1] == "settings"                       # the way back is saved before anything changes
     assert settings.saved[0] == {"outbound_before": "Allow", "isolated": True, "isolated_since": settings.saved[0]["isolated_since"]}
-    assert kinds.index("SetDefaultOutbound") > max(i for i, k in enumerate(kinds) if k == "Create")
+    assert "Create" not in kinds
 
 
 def test_isolate_marks_the_time():
@@ -658,7 +667,7 @@ def test_isolate_off_goes_backwards_and_forgets_last():
     run.timeline.clear()
     rules_mod.isolate(run, False, settings=settings)
     kinds = [t[0] for t in run.timeline]
-    assert kinds.index("SetDefaultOutbound") < kinds.index("Remove") < kinds.index("settings")
+    assert kinds.index("SetDefaultOutbound") < kinds.index("RemoveIsolate") < kinds.index("settings")
     assert run.rules == {} and settings.outbound_before is None and settings.isolated_since is None
 
 
@@ -699,11 +708,11 @@ def test_a_failure_while_switching_rolls_back_to_what_was_there():
     assert set(run.outbound.values()) == {"Allow"}
 
 
-def test_a_failure_writing_the_allow_rules_never_reaches_the_block():
-    run, settings = make(outbound="Allow", fail={"Create": (1, "denied")})
+def test_a_failure_switching_windows_rules_off_never_reaches_the_block():
+    run, settings = make(outbound="Allow", foreign=STOCK, fail={"DisableAllowOut": (1, "denied")})
     with pytest.raises(rules_mod.RuleError):
         rules_mod.isolate(run, True, settings=settings)
-    assert "SetDefaultOutbound" not in run.ops()
+    assert "SetDefaultOutbound" not in run.ops() and run.enabled_foreign() == ["CoreNet-DHCP-Out", DNS_RULE]
     assert set(run.outbound.values()) == {"Allow"} and settings.isolated is False and settings.outbound_before is None
 
 
@@ -831,7 +840,7 @@ def test_forget_fetch_rules_clears_what_an_interrupted_run_left():
     kept = rules_mod.block(run, image=IMAGE, ip="5.6.7.8", fetcher=PY)["rule_id"]
     removed, stuck = rules_mod.forget_fetch_rules(run)
     assert sorted(removed) == sorted([stale, FETCHER]) and stuck == []
-    assert set(run.rules) == {LOOPBACK, kept}             # the isolation and the blocks stay
+    assert set(run.rules) == {kept}                       # the blocks stay
     assert rules_mod.forget_fetch_rules(run) == ([], [])
 
 
@@ -990,7 +999,7 @@ def test_isolating_from_a_baseline_that_is_already_block_and_leaving_it_back_to_
     run, settings = make(outbound="Block")
     rules_mod.isolate(run, True, settings=settings)
     assert settings.isolated is True and settings.outbound_before == "Block"
-    assert set(run.rules) == {LOOPBACK}
+    assert run.rules == {}
     assert rules_mod.startup_state(run, settings)["isolated"] is True
     out = rules_mod.isolate(run, False, settings=settings)
     assert out["isolated"] is False and set(run.outbound.values()) == {"Block"} and run.rules == {}
@@ -1040,21 +1049,6 @@ def test_two_rules_that_share_a_key_come_back_as_two_entries_with_their_own_prot
 # ---- a replacement never leaves a gap --------------------------------------------------------
 
 
-def tamper_with_the_loopback_rule(run):
-    run.rules[LOOPBACK]["RemoteAddress"] = ["9.9.9.9"]
-
-
-def test_replacing_the_loopback_allow_rule_while_isolated_never_leaves_none():
-    run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, settings=settings)
-    tamper_with_the_loopback_rule(run)
-    run.standing.clear()
-    rules_mod.isolate(run, True, settings=settings)
-    assert run.standing and all(any(a == "Allow" for _, a, _ in moment) for moment in run.standing)
-    assert sorted(run.rules[LOOPBACK]["RemoteAddress"]) == ["127.0.0.0/8", "::1"] and LOOPBACK + "-new" not in run.rules
-    assert settings.isolated is True and set(run.outbound.values()) == {"Block"}
-
-
 def test_replacing_a_per_fetch_rule_never_leaves_the_fetcher_without_one():
     run = FakeRun()
     name = rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)["name"]
@@ -1065,22 +1059,25 @@ def test_replacing_a_per_fetch_rule_never_leaves_the_fetcher_without_one():
     assert run.rules[name]["RemoteAddress"] == ["1.2.3.4"] and name + "-new" not in run.rules
 
 
-def test_a_replacement_that_fails_halfway_keeps_the_stand_in_and_names_the_hatch():
+def test_the_loopback_rule_an_older_version_left_goes_when_isolated_is_left():
     run, settings = make(outbound="Allow")
     rules_mod.isolate(run, True, settings=settings)
-    tamper_with_the_loopback_rule(run)
-    real = run.op_Create
-    seen = {"n": 0}
+    for name in (LOOPBACK, LOOPBACK + "-new"):
+        run.rules[name] = run.view(name, Action="Allow", RemoteAddress=["127.0.0.0/8"])
+    rules_mod.isolate(run, True, settings=settings)
+    assert "Create" not in run.ops()                      # isolating again does not rewrite it either
+    rules_mod.isolate(run, False, settings=settings)
+    assert run.rules == {} and settings.isolated is False
 
-    def create(p):
-        seen["n"] += 1
-        return (1, "", "denied") if seen["n"] == 3 else real(p)   # loopback exists, the stand-in is written, the new one fails
-    run.op_Create = create
+
+def test_an_isolate_rule_that_will_not_go_is_said_and_keeps_the_marker():
+    run, settings = make(outbound="Allow")
+    rules_mod.isolate(run, True, settings=settings)
+    run.rules[LOOPBACK] = run.view(LOOPBACK, Action="Allow")
+    run.stuck_rules = {LOOPBACK}
     with pytest.raises(rules_mod.RuleError) as e:
-        rules_mod.isolate(run, True, settings=settings)
-    assert "scripts/tdc-unisolate.ps1" in str(e.value) and "denied" in str(e.value)
-    assert LOOPBACK + "-new" in run.rules and run.rules[LOOPBACK + "-new"]["Action"] == "Allow"
-    assert settings.isolated is True and set(run.outbound.values()) == {"Block"}      # not rolled back to open
+        rules_mod.isolate(run, False, settings=settings)
+    assert LOOPBACK in str(e.value) and settings.isolated is True
 
 
 def test_the_stand_in_goes_with_isolated_and_can_be_unblocked_by_hand():
@@ -1246,22 +1243,6 @@ def test_a_block_whose_replacement_fails_says_the_stand_in_is_standing():
     assert [x["blocking"] for x in rules_mod.rules(run)] == [True]          # the stand-in blocks, and rules() says so
 
 
-def test_the_stand_in_is_named_on_the_isolate_path_too():
-    run, settings = make(outbound="Allow")
-    rules_mod.isolate(run, True, settings=settings)
-    tamper_with_the_loopback_rule(run)
-    real = run.op_Create
-    seen = {"n": 0}
-
-    def create(p):
-        seen["n"] += 1
-        return (1, "", "denied") if seen["n"] == 3 else real(p)
-    run.op_Create = create
-    with pytest.raises(rules_mod.RuleError) as e:
-        rules_mod.isolate(run, True, settings=settings)
-    assert "TDC-FW-ISO-loopback-new is standing in" in str(e.value) and "scripts/tdc-unisolate.ps1" in str(e.value)
-
-
 # ---- a damaged marker ----------------------------------------------------------------------
 
 
@@ -1306,12 +1287,12 @@ def test_the_rule_names_are_saved_before_anything_changes_and_closed_before_bloc
     first_write = min(i for i, k in enumerate(kinds) if k in ("Create", "DisableAllowOut", "SetDefaultOutbound"))
     assert kinds[first_write - 1] == "settings" and "allow_disabled" in settings.saved[0]
     assert kinds.index("AllowOut") < first_write                          # read before anything changes
-    assert max(i for i, k in enumerate(kinds) if k == "Create") < kinds.index("DisableAllowOut") < kinds.index("SetDefaultOutbound")
+    assert "Create" not in kinds and kinds.index("DisableAllowOut") < kinds.index("SetDefaultOutbound")
     assert kinds[-1] == "AllowOut"                                        # and read back after
     run.timeline.clear()
     rules_mod.isolate(run, False, settings=settings)
     kinds = [t[0] for t in run.timeline]
-    assert kinds.index("SetDefaultOutbound") < kinds.index("EnableAllowOut") < kinds.index("Remove") < kinds.index("settings")
+    assert kinds.index("SetDefaultOutbound") < kinds.index("EnableAllowOut") < kinds.index("RemoveIsolate") < kinds.index("settings")
 
 
 def test_a_rule_a_group_policy_sets_cannot_be_closed_and_is_said_never_hidden():
@@ -1357,7 +1338,7 @@ def test_a_failed_isolation_switches_windows_rules_on_again_in_reverse():
     with pytest.raises(rules_mod.RuleError):
         rules_mod.isolate(run, True, settings=settings)
     kinds = [t[0] for t in run.timeline]
-    assert kinds.index("DisableAllowOut") < kinds.index("EnableAllowOut") < max(i for i, k in enumerate(kinds) if k == "Remove")
+    assert kinds.index("DisableAllowOut") < kinds.index("EnableAllowOut") < kinds.index("RemoveIsolate")
     assert run.enabled_foreign() == ["CoreNet-DHCP-Out", DNS_RULE] and run.rules == {}
     assert settings.isolated is False and settings.allow_disabled == []
 
@@ -1470,3 +1451,47 @@ def test_a_json_list_is_unrolled_the_way_windows_powershell_5_1_needs():
         assert not re.search(r"@\(\s*ConvertFrom-Json", text), path
     script = open(os.path.join(ROOT, "webui", "firewall_rules.ps1"), encoding="utf-8").read()
     assert "@((ConvertFrom-Json -InputObject $json))" in script
+
+
+# ---- a button, not a minute: one PowerShell call per step --------------------------------------
+
+
+def test_isolated_on_is_four_powershell_calls_and_off_three_however_many_rules():
+    names = {f"App-{i:03d}-Out": {"DisplayName": f"App {i}", "Source": "Local", "Enabled": True} for i in range(135)}
+    run, settings = make(foreign=names)
+    out = rules_mod.isolate(run, True, settings=settings)
+    assert out["verified"] is True and out["allowed_out"] == [] and out["profiles_off"] == []
+    assert run.ops() == ["AllowOut", "DisableAllowOut", "SetDefaultOutbound", "AllowOut"]
+    run.calls.clear()
+    left = rules_mod.isolate(run, False, settings=settings)
+    assert run.ops() == ["SetDefaultOutbound", "EnableAllowOut", "RemoveIsolate"] and left["profiles_off"] == []
+    assert len(run.enabled_foreign()) == 135
+
+
+def test_a_mixed_baseline_is_put_back_in_one_call_per_value():
+    run, settings = make(outbound={"Domain": "Block", "Private": "Allow", "Public": "Allow"})
+    rules_mod.isolate(run, True, settings=settings)
+    run.calls.clear()
+    rules_mod.isolate(run, False, settings=settings)
+    sets = [FakeRun.params(c) for c in run.calls if FakeRun.params(c)["Op"] == "SetDefaultOutbound"]
+    assert sorted((s["Profiles"], s["DefaultOutboundAction"]) for s in sets) == [("Domain", "Block"), ("Private,Public", "Allow")]
+    assert run.outbound == {"Domain": "Block", "Private": "Allow", "Public": "Allow"}
+
+
+def test_a_default_action_answer_without_the_profiles_is_read_back_separately():
+    run, settings = make()
+    real = run.op_SetDefaultOutbound
+    run.op_SetDefaultOutbound = lambda p: (real(p)[0], "", "")      # an answer that is not the profiles
+    assert rules_mod.isolate(run, True, settings=settings)["verified"] is True
+    assert run.ops().count("Profiles") == 1
+
+
+def test_the_script_switches_the_rules_in_one_pipeline_and_retries_only_the_ones_it_missed():
+    text = open(os.path.join(ROOT, "webui", "firewall_rules.ps1"), encoding="utf-8").read()
+    body = text[text.index("function Set-AllowOut"):]
+    body = body[:body.index("\n}\n")]
+    assert "$found | Disable-NetFirewallRule -PassThru" in body and "$found | Enable-NetFirewallRule -PassThru" in body
+    assert "$took.ContainsKey($name)" in body and "-ErrorAction Stop" in body
+    remove = text[text.index("function Remove-IsolateRules"):]
+    assert "Get-IsolateRules" in remove and "still" in remove
+    assert "'ObjectNotFound'" in text[text.index("function Get-IsolateRules"):text.index("function Remove-IsolateRules")]

@@ -1588,3 +1588,24 @@ def test_an_address_wide_block_removed_outside_tdc_no_longer_refuses_block_fetch
     assert tdc._fw_address_wide_block(FINDING, force=True) is False     # ...enforcement reads it fresh
     pid = fw.pending.add(FINDING, deadline=time.time() + 30)["id"]
     assert client.post("/api/firewall/decide", json={"id": pid, "action": "block_fetch"}).status_code == 200
+
+
+def test_the_isolated_button_costs_four_powershell_calls_on_and_three_off(client, fw):
+    from test_firewall_rules import STOCK
+    fw.run.foreign = {n: dict(r) for n, r in STOCK.items()}
+    fw.run.calls.clear()
+    on = client.post("/api/firewall/isolate", json={"on": True})
+    assert on.status_code == 200 and on.json["verified"] is True and on.json["state"]["allowed_out"] == []
+    assert on.json["state"]["profiles_off"] == []
+    assert fw.run.ops() == ["AllowOut", "DisableAllowOut", "SetDefaultOutbound", "AllowOut"]   # the state is what was read back
+    fw.run.calls.clear()
+    off = client.post("/api/firewall/isolate", json={"on": False})
+    assert off.status_code == 200 and off.json["state"]["profiles_off"] == []
+    assert fw.run.ops() == ["SetDefaultOutbound", "EnableAllowOut", "RemoveIsolate"]
+
+
+def test_isolated_refused_for_a_profile_that_is_off_is_409_and_changes_nothing(client, fw):
+    fw.profiles = {"Domain": True, "Private": True, "Public": False}
+    r = client.post("/api/firewall/isolate", json={"on": True})
+    assert r.status_code == 409 and "Public" in r.json["error"]
+    assert fw.run.writes() == [] and fw.settings.isolated is False

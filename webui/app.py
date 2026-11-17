@@ -11226,6 +11226,13 @@ def _fw_read_profiles():
     return off, error
 
 
+def _fw_keep_profiles(off):
+    """Keep ``off`` (the profiles that are off, as an enforcement route just read them back) for _fw_profiles_off."""
+    global _fw_profiles_cache
+    with _fw_profiles_lock:
+        _fw_profiles_cache = (time.monotonic(), list(off), None)
+
+
 def _fw_profiles_off():
     """``(off, error)`` from the cache while it is fresh, else read now. No lock is held across the PowerShell call."""
     with _fw_profiles_lock:
@@ -12303,16 +12310,18 @@ def api_firewall_isolate():
     data, problem = _fw_body(("on",), ("on",))
     if problem or not isinstance(data["on"], bool):
         return _fw_error(problem or "on must be true or false", 400)
-    if data["on"]:
-        off = _fw_firewall_off_message()
-        if off:
-            return _fw_error(off, 409)
+    # No separate profile check first: isolate reads the profiles itself, in the same call as Windows' own rules,
+    # and refuses with ProfileOffError (nothing changed) while one is off. Every PowerShell call costs seconds.
     try:
         done = firewall_rules.isolate(_fw_runner, data["on"], settings=_fw_settings)
+    except firewall_rules.ProfileOffError as e:
+        return _fw_error(str(e), 409)
     except firewall_rules.RuleError as e:
         return _fw_error(str(e), 500)
     finally:
         _fw_forget_rules()
+    if done.get("profiles_off") is not None:
+        _fw_keep_profiles(done["profiles_off"])                                      # just read back
     if data["on"]:
         _fw_keep_allowed_out(done.get("allowed_out"), done.get("allowed_out_error"))     # just read back
     return _fw_json(dict(done, state=_fw_isolate_state()))

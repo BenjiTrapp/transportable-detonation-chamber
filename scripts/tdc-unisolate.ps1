@@ -6,8 +6,8 @@
 #   2. switches on again the outbound Allow rules of Windows' own that ISOLATED switched off (Core Networking's
 #      DNS among them): exactly the names recorded in allow_disabled of the web UI's firewall_state.json, and only
 #      outbound Allow rules of this machine (the PersistentStore)
-#   3. removes every firewall rule named TDC-FW-* (the blocks of the FIREWALL tab, the loopback allow
-#      rule of ISOLATED mode and any per-fetch allow rule a fetch left behind)
+#   3. removes every firewall rule named TDC-FW-* (the blocks of the FIREWALL tab, any per-fetch allow
+#      rule a fetch left behind, and the loopback allow rule older versions of ISOLATED wrote)
 #   4. says what it did
 #
 # It does not switch the firewall on or off, and it touches no other rule.

@@ -15,7 +15,9 @@
 #                       an outbound rule. Exit 3: a profile is off (nothing is written). Exit 4: the rule is already there.
 #   Remove -Name        remove the rule (no error when it is not there)
 #   SetDefaultOutbound -DefaultOutboundAction [-Profiles Domain,Private]
-#   AllowOut            {"rules": [{"Name","DisplayName","Group","Source"}]}: every enabled outbound Allow rule in
+#                       and then the three profiles as Profiles gives them, read back
+#   AllowOut            {"profiles": [...], "rules": [{"Name","DisplayName","Group","Source"}]}: the profiles as
+#                       Profiles gives them, and every enabled outbound Allow rule in
 #                       force (ActiveStore) that is not TDC's. DefaultOutboundAction Block governs only traffic that no
 #                       rule matches, so each of these still lets traffic out. Source is PolicyStoreSourceType: only
 #                       Local rules (the PersistentStore) can be switched here; a GroupPolicy rule cannot.
@@ -23,7 +25,9 @@
 #                       switch the named local outbound Allow rules off or on. -Names is base64 of a UTF-8 JSON list
 #                       of rule names, so no name is ever a wildcard or a parameter. Only outbound Allow rules of the
 #                       PersistentStore that are not TDC-FW-* are touched; {"done": [...], "failed": [{"Name","Error"}],
-#                       "missing": [...]} says what happened to each.
+#                       "missing": [...]} says what happened to each. All of them go through one pipeline; a rule
+#                       the pipeline did not change is tried once more on its own, for its own error.
+#   RemoveIsolate       remove every rule named TDC-FW-ISO-*: {"removed": [...], "still": [...]}, read back
 #
 # Exit codes: 0 done, 1 failed (the first line of stderr says why), 3 a profile is off, 4 the rule exists.
 # Rules are only ever named TDC-FW-<letters, digits, hyphens>; a name with a wildcard or a trailing newline is refused.
@@ -31,7 +35,7 @@
 param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('Profiles', 'Enable', 'List', 'Get', 'Create', 'Remove', 'SetDefaultOutbound', 'AllowOut',
-                 'DisableAllowOut', 'EnableAllowOut')]
+                 'DisableAllowOut', 'EnableAllowOut', 'RemoveIsolate')]
     [string]$Op,
     [string]$Names,
     [string]$Name,
@@ -134,19 +138,58 @@ function Set-AllowOut {
     $found = @(Get-NetFirewallRule -PolicyStore PersistentStore | Where-Object {
         $want.ContainsKey([string]$_.Name) -and [string]$_.Direction -eq 'Outbound' -and [string]$_.Action -eq 'Allow'
     })
+    $target = if ($On) { 'True' } else { 'False' }
+    # One pipeline for all of them: one cmdlet invocation, not one per rule (each of those cost a fraction of a
+    # second, and the Store apps bring dozens of rules). -PassThru gives back the rules it changed, as they are now;
+    # an error on one rule does not stop the others.
+    $took = @{}
+    if ($found.Count -gt 0) {
+        $changed = if ($On) {
+            @($found | Enable-NetFirewallRule -PassThru -ErrorAction SilentlyContinue)
+        } else {
+            @($found | Disable-NetFirewallRule -PassThru -ErrorAction SilentlyContinue)
+        }
+        foreach ($r in $changed) {
+            if ([string]$r.Enabled -eq $target) { $took[[string]$r.Name] = $true }
+        }
+    }
     $done = @()
     $failed = @()
     foreach ($rule in $found) {
+        $name = [string]$rule.Name
+        if ($took.ContainsKey($name)) { $done += $name; continue }
+        # Not among what the pipeline gave back: once more on its own, so that its own error is said
         try {
             if ($On) { $rule | Enable-NetFirewallRule -ErrorAction Stop } else { $rule | Disable-NetFirewallRule -ErrorAction Stop }
-            $done += [string]$rule.Name
+            $done += $name
         } catch {
-            $failed += [pscustomobject]@{ Name = [string]$rule.Name; Error = [string]$_.Exception.Message }
+            $failed += [pscustomobject]@{ Name = $name; Error = [string]$_.Exception.Message }
         }
     }
     $seen = @($found | ForEach-Object { [string]$_.Name })
     $missing = @($want.Keys | Where-Object { $seen -notcontains $_ })
     ConvertTo-Json -Compress -Depth 4 -InputObject ([pscustomobject]@{ done = $done; failed = $failed; missing = $missing })
+}
+
+# The rules named TDC-FW-ISO-*. "None there" is an empty list; any other error is raised, so that a list that
+# cannot be read never reads as "all removed".
+function Get-IsolateRules {
+    try {
+        @(Get-NetFirewallRule -Name 'TDC-FW-ISO-*' -ErrorAction Stop |
+            Where-Object { [string]$_.Name -match '^TDC-FW-ISO-[A-Za-z0-9-]{1,36}\z' })
+    } catch {
+        if ([string]$_.CategoryInfo.Category -eq 'ObjectNotFound') { @() } else { throw }
+    }
+}
+
+# Every rule named TDC-FW-ISO-* (the per-fetch allow rules, their stand-ins, and the rules of older versions),
+# removed in one call and read back.
+function Remove-IsolateRules {
+    $rules = @(Get-IsolateRules)
+    $names = @($rules | ForEach-Object { [string]$_.Name })
+    if ($rules.Count -gt 0) { $rules | Remove-NetFirewallRule -ErrorAction SilentlyContinue }
+    $still = @(Get-IsolateRules | ForEach-Object { [string]$_.Name })
+    ConvertTo-Json -Compress -Depth 3 -InputObject ([pscustomobject]@{ removed = @($names | Where-Object { $still -notcontains $_ }); still = $still })
 }
 
 try {
@@ -197,9 +240,13 @@ try {
         'SetDefaultOutbound' {
             if (-not $DefaultOutboundAction) { throw 'SetDefaultOutbound needs -DefaultOutboundAction' }
             Set-NetFirewallProfile -Profile (Get-ProfileList $Profiles) -DefaultOutboundAction $DefaultOutboundAction
+            ConvertTo-Json -Compress -Depth 3 -InputObject (Get-ProfileStates)
         }
         'AllowOut' {
-            ConvertTo-Json -Compress -Depth 4 -InputObject ([pscustomobject]@{ rules = @(Get-ForeignAllowOut) })
+            ConvertTo-Json -Compress -Depth 4 -InputObject ([pscustomobject]@{ profiles = (Get-ProfileStates); rules = @(Get-ForeignAllowOut) })
+        }
+        'RemoveIsolate' {
+            Remove-IsolateRules
         }
         'DisableAllowOut' {
             Set-AllowOut -Text $Names -On $false
