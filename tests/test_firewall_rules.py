@@ -1013,9 +1013,28 @@ def test_a_cut_rule_without_a_marker_is_announced_and_left_alone():
     assert run.writes() == []
 
 
-def test_a_cut_rule_without_a_marker_keeps_the_rules_a_failed_leaving_left_off():
+def test_a_cut_rule_without_a_marker_does_not_keep_the_rules_a_failed_leaving_left_off():
+    # Block beats Allow, so switching them on again opens nothing; leaving them off would cost DNS and DHCP later
     run, settings = make(foreign={DNS_RULE: {**STOCK[DNS_RULE], "Enabled": False}})
     rules_mod.cut(run)
+    settings.set(allow_disabled=[DNS_RULE])
+    state = rules_mod.startup_state(run, settings)
+    assert run.foreign[DNS_RULE]["Enabled"] is True and settings.allow_disabled == []
+    assert rules_mod.CUT_RULE in run.rules and state["announce"] is True
+    assert "no ISOLATED marker" in state["note"] and "switched on again" in state["note"]
+    assert state["isolated"] is False
+
+
+def test_a_cut_rule_without_a_marker_says_which_rules_stay_off_when_one_will_not_come_on():
+    run, settings = make(foreign={DNS_RULE: {**STOCK[DNS_RULE], "Enabled": False}}, stubborn=[DNS_RULE])
+    rules_mod.cut(run)
+    settings.set(allow_disabled=[DNS_RULE])
+    note = rules_mod.startup_state(run, settings)["note"]
+    assert DNS_RULE in note and "no ISOLATED marker" in note and settings.allow_disabled == [DNS_RULE]
+
+
+def test_a_default_block_without_a_marker_still_leaves_the_rules_a_failed_leaving_left_off():
+    run, settings = make(foreign={DNS_RULE: {**STOCK[DNS_RULE], "Enabled": False}}, outbound="Block")
     settings.set(allow_disabled=[DNS_RULE])
     rules_mod.startup_state(run, settings)
     assert run.foreign[DNS_RULE]["Enabled"] is False and settings.allow_disabled == [DNS_RULE]
@@ -1084,6 +1103,97 @@ def test_a_cut_rule_that_cannot_be_read_does_not_blur_a_default_that_is_in_force
     settings.set(isolated=True, outbound_before="Allow", stage="isolated")
     state = rules_mod.startup_state(run, settings)
     assert state["isolated"] is True and state["stage"] == "isolated" and settings.isolated is True
+
+
+# -- the derived stage is saved when it differs ---------------------------------------------
+
+
+def test_the_stage_found_is_saved_when_it_differs_from_the_saved_one():
+    run, settings = make(foreign=STOCK)
+    rules_mod.cut(run)
+    settings.set(isolated=True, outbound_before="Allow", stage="isolated")      # the file says more than is true
+    state = rules_mod.startup_state(run, settings)
+    assert state["stage"] == "cut" and settings.stage == "cut"
+    assert run.writes() == [] and rules_mod.CUT_RULE in run.rules               # bookkeeping only
+
+
+def test_the_stage_found_after_a_crash_between_the_marker_and_the_stage_is_saved():
+    run, settings = make(foreign=STOCK)
+    rules_mod.cut(run)
+    settings.set(isolated=True, outbound_before="Allow")                          # stage still "open"
+    state = rules_mod.startup_state(run, settings)
+    assert state["stage"] == "cut" and settings.stage == "cut"
+
+
+def test_a_stage_that_already_matches_is_not_written_again():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    settings.saved.clear()
+    assert rules_mod.startup_state(run, settings)["stage"] == "isolated"
+    assert settings.saved == []
+
+
+def test_a_stage_that_cannot_be_saved_is_said_and_start_up_goes_on():
+    run, settings = make(foreign=STOCK)
+    rules_mod.cut(run)
+    settings.set(isolated=True, outbound_before="Allow", stage="isolated")
+    settings.fail = True
+    state = rules_mod.startup_state(run, settings)
+    assert state["isolated"] is True and state["stage"] == "cut" and settings.stage == "isolated"
+    assert "could not be saved" in state["note"] and "disk full" in state["note"]
+    assert rules_mod.CUT_RULE in run.rules and settings.isolated is True
+
+
+def test_a_stage_that_is_only_recorded_is_not_rewritten_when_the_cut_rule_cannot_be_read():
+    run, settings = make(foreign=STOCK, fail={"Get": (1, "denied")})
+    settings.set(isolated=True, outbound_before="Allow", stage="cut_policy")
+    settings.saved.clear()
+    assert rules_mod.startup_state(run, settings)["stage"] == "cut_policy" and settings.saved == []
+
+
+# -- a cut rule that is not a full cut is named, and left alone -------------------------------
+
+
+def _narrowed(run):
+    rules_mod.cut(run)
+    run.rules[rules_mod.CUT_RULE].update(Program=r"C:\x\loader.exe")          # a Block for one program only
+
+
+def test_a_narrowed_cut_rule_under_a_stale_marker_is_named_and_left_standing():
+    run, settings = make(foreign=STOCK)
+    _narrowed(run)
+    settings.set(isolated=True, outbound_before="Allow", stage="cut")
+    state = rules_mod.startup_state(run, settings)
+    assert state["stage"] == "open" and settings.isolated is False             # stale, as before
+    assert rules_mod.CUT_RULE in run.rules and run.rules[rules_mod.CUT_RULE]["Program"] == r"C:\x\loader.exe"
+    assert rules_mod.CUT_RULE in state["note"] and "not a full cut" in state["note"]
+    assert "left alone" in state["note"] and rules_mod.UNISOLATE_SCRIPT in state["note"]
+    assert state["announce"] is True and "RemoveIsolate" not in run.ops()
+
+
+def test_a_disabled_cut_rule_without_a_marker_is_named_and_announced():
+    run, settings = make(foreign=STOCK)
+    rules_mod.cut(run)
+    run.rules[rules_mod.CUT_RULE]["Enabled"] = False
+    state = rules_mod.startup_state(run, settings)
+    assert state["announce"] is True and state["isolated"] is False
+    assert rules_mod.CUT_RULE in state["note"] and "not a full cut" in state["note"] and "disabled" in state["note"]
+    assert rules_mod.CUT_RULE in run.rules and run.writes() == []
+
+
+def test_a_narrowed_cut_rule_is_not_taken_for_a_cut_that_was_dropped():
+    run, settings = make(outbound="Block")           # nothing else lets traffic out: only the rule is in question
+    _narrowed(run)
+    settings.set(isolated=True, outbound_before="Allow", stage="isolated")
+    state = rules_mod.startup_state(run, settings)
+    assert state["stage"] != "isolated" and settings.stage == state["stage"]
+    assert state["isolated"] is True and "not a full cut" in state["note"]
+
+
+def test_no_cut_rule_at_all_names_nothing():
+    run, settings = make(foreign=STOCK)
+    assert rules_mod.startup_state(run, settings)["note"] is None
 
 
 def test_a_stage_without_a_marker_is_not_a_stage():

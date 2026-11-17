@@ -1312,7 +1312,12 @@ def startup_state(run, settings) -> Dict[str, Any]:
     been reached (the default is not Block on every profile, or the rule was not dropped after it), ``cut_policy`` when
     the default is Block and something still lets traffic out (the cut rule is what closes it when it stands),
     ``isolated`` when the default is Block, nothing lets traffic out and the cut rule is gone, ``open`` when no
-    enforcement is in force. When the cut rule cannot be read, the recorded stage is given.
+    enforcement is in force. When the cut rule cannot be read, the recorded stage is given. A marker's saved stage is
+    **written** when it differs from what was found (bookkeeping, no rule changes; a failed write is said in ``note``),
+    except where the stage is only the recorded one: whoever reads ``settings.stage`` must read the stage that holds.
+    A ``CUT_RULE`` that is there but not a full cut (disabled, narrowed) is no cut: it is named in ``note`` and announced
+    in every case, left alone because removing a rule that blocks part of the egress could open it, and it keeps the
+    stage from being ``isolated`` (the rule is not dropped).
 
     - marker, in force: ``isolated``, announced; Windows' own outbound Allow rules that are still enabled are read
       back into ``allowed_out`` and named in ``note``, because the default action does not stop what they allow.
@@ -1326,13 +1331,16 @@ def startup_state(run, settings) -> Dict[str, Any]:
       egress open, neither opens anything) and it is announced.
     - marker, no Block default and the cut rule cannot be read: the marker is believed, announced, nothing changed.
     - no marker, outbound shut anyway (a Block default or a standing cut rule): not isolated, but announced: whoever
-      shut it, the analyst must know. Nothing is changed, the Allow rules a failed leaving left off included.
+      shut it, the analyst must know. Nothing is changed, except that the Allow rules a failed leaving left off are
+      switched on again when a cut rule stands (a Block rule beats them, so that opens nothing; with only the default
+      on Block it would, so they stay off).
     - no marker, outbound open, rules a failed leaving left off: switched on again; announced if any stays off.
     - no marker, a stage saved: the stage is set back to ``open``; it never says anything without the marker.
     - cannot read the firewall: the marker is believed, announced.
     """
     marker = bool(settings.isolated)
-    if not marker and getattr(settings, "stage", "open") != "open":
+    saved = getattr(settings, "stage", "open")
+    if not marker and saved != "open":
         try:
             settings.set(stage="open")
         except Exception:
@@ -1345,7 +1353,17 @@ def startup_state(run, settings) -> Dict[str, Any]:
     off = _off_names(states)
     blocking = [s["name"] for s in states if s["outbound"] == "Block"]
     all_block = len(blocking) == len(PROFILE_NAMES)
-    cut = cut_stands(run)
+    # one read of the cut rule says all three: a full cut (True), unreadable (None), and a rule that is there but not a
+    # full cut, which ``cut_stands`` would call False like an absent one
+    try:
+        view = _describe(run, CUT_RULE)
+        cut: Optional[bool] = _cut_problem(view) is None
+    except RuleError:
+        view, cut = None, None
+    present = view is not None
+    malformed = (f"{CUT_RULE} was found, but it is not a full cut ({_cut_problem(view)}). It was left alone on purpose, "
+                 f"because removing a rule that blocks only part of the egress could open it; {UNISOLATE_SCRIPT} removes it."
+                 if present and cut is False else None)
     cut_text = (f"{CUT_RULE} could not be read, so whether the egress is shut by it is not known; nothing was changed."
                 if cut is None else None)
     in_force = marker and not off and (all_block or cut is True)
@@ -1353,8 +1371,9 @@ def startup_state(run, settings) -> Dict[str, Any]:
     note = None
     still = None
     stage = "open"
+    derived = True                  # the stage comes from what was found, and so may be saved
     isolated = in_force
-    announce = marker or bool(blocking) or cut is True
+    announce = marker or bool(blocking) or cut is True or malformed is not None
     if in_force:
         if all_block:
             still, error = _still_open(run)
@@ -1364,8 +1383,8 @@ def startup_state(run, settings) -> Dict[str, Any]:
                          f"{CUT_RULE} stands as well and shuts the egress by itself." if cut else None,
                          open_text(still, error) or "The read back found no other outbound Allow rule enabled.", cut_text)
             if cut is None:
-                stage = _recorded_stage(settings, marker)
-            elif cut:
+                stage, derived = _recorded_stage(settings, marker), False
+            elif present:               # a rule that is there, a full cut or not, is not a cut that was dropped
                 stage = "cut" if still == [] else "cut_policy"
             else:
                 stage = "isolated" if still == [] else "cut_policy"
@@ -1376,7 +1395,7 @@ def startup_state(run, settings) -> Dict[str, Any]:
                     "not finish and Windows' own outbound Allow rules may still be enabled. Nothing was changed; leaving "
                     "ISOLATED puts back what was switched off.")
     elif marker and cut is None and not blocking:
-        isolated, stage = True, _recorded_stage(settings, marker)
+        isolated, stage, derived = True, _recorded_stage(settings, marker), False
         note = _join("ISOLATED is marked and the default outbound action is not Block, so the egress is shut only if the cut "
                      "rule stands.", cut_text)
     elif marker and (blocking or cut is True):
@@ -1389,6 +1408,7 @@ def startup_state(run, settings) -> Dict[str, Any]:
             note = (f"ISOLATED is marked and {CUT_RULE} stands, but the firewall is off for {', '.join(off)}, where the "
                     "rule does not apply: this is not a working isolation.")
     elif marker:
+        derived = False             # _forget writes the stage with the marker
         stuck, problem = _reopen(run, leftover)
         try:
             _forget(settings, stuck, stage="open")
@@ -1396,20 +1416,36 @@ def startup_state(run, settings) -> Dict[str, Any]:
                          _stuck_text(stuck, problem) if stuck else None)
         except Exception as e:
             note = f"The ISOLATED marker is stale but could not be cleared: {_first_line(e)}"
-    elif blocking or cut is True:
-        note = _join(f"Outbound is blocked on {', '.join(blocking)}, but TDC did not set it (there is no ISOLATED marker)."
-                     if blocking else None,
-                     f"{CUT_RULE} stands as well and shuts the egress." if blocking and cut else
-                     f"{CUT_RULE} stands and shuts the egress, but TDC did not set it (there is no ISOLATED marker)."
-                     if cut else None,
-                     f"Nothing was changed; {UNISOLATE_SCRIPT} opens it.")
-    elif leftover:
-        stuck, problem = _reopen(run, leftover)
+    else:
+        derived = False
+        if blocking or cut is True:
+            note = _join(f"Outbound is blocked on {', '.join(blocking)}, but TDC did not set it (there is no ISOLATED marker)."
+                         if blocking else None,
+                         f"{CUT_RULE} stands as well and shuts the egress." if blocking and cut else
+                         f"{CUT_RULE} stands and shuts the egress, but TDC did not set it (there is no ISOLATED marker)."
+                         if cut else None,
+                         f"Nothing was changed; {UNISOLATE_SCRIPT} opens it.")
+        # With the default on Block and no cut rule, switching an Allow rule on would open the egress. With a cut rule
+        # standing it opens nothing (a Block rule beats an Allow rule), and leaving them off would cost DNS and DHCP
+        # the moment the cut rule is removed.
+        if leftover and (not blocking or cut is True):
+            stuck, problem = _reopen(run, leftover)
+            try:
+                settings.set(allow_disabled=stuck)
+            except Exception:
+                pass
+            if cut is True and len(stuck) < len(leftover):
+                announce = True
+                note = _join(note, f"{len(leftover) - len(stuck)} of Windows' outbound Allow rules that a failed leaving "
+                                   f"switched off were switched on again; {CUT_RULE} still shuts the egress.")
+            if stuck:
+                note, announce = _join(note, _stuck_text(stuck, problem)), True
+    note = _join(note, malformed)
+    if marker and derived and stage != saved:
         try:
-            settings.set(allow_disabled=stuck)
-        except Exception:
-            pass
-        if stuck:
-            note, announce = _stuck_text(stuck, problem), True
+            settings.set(stage=stage)
+        except Exception as e:
+            note = _join(note, f"The stage found ({stage}) could not be saved ({type(e).__name__}: {_first_line(e)}); "
+                               f"the file still names {saved}.")
     return {"isolated": isolated, "profiles_off": off, "announce": announce, "note": note, "allowed_out": still,
             "stage": stage}
