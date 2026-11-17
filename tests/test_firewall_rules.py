@@ -1022,7 +1022,14 @@ def test_a_cut_rule_without_a_marker_does_not_keep_the_rules_a_failed_leaving_le
     assert run.foreign[DNS_RULE]["Enabled"] is True and settings.allow_disabled == []
     assert rules_mod.CUT_RULE in run.rules and state["announce"] is True
     assert "no ISOLATED marker" in state["note"] and "switched on again" in state["note"]
+    assert "Nothing was changed" not in state["note"]          # something was: the note must not say both
     assert state["isolated"] is False
+
+
+def test_a_cut_rule_without_a_marker_and_nothing_to_reopen_says_nothing_was_changed():
+    run, settings = make(foreign=STOCK)
+    rules_mod.cut(run)
+    assert "Nothing was changed" in rules_mod.startup_state(run, settings)["note"]
 
 
 def test_a_cut_rule_without_a_marker_says_which_rules_stay_off_when_one_will_not_come_on():
@@ -1187,13 +1194,126 @@ def test_a_narrowed_cut_rule_is_not_taken_for_a_cut_that_was_dropped():
     _narrowed(run)
     settings.set(isolated=True, outbound_before="Allow", stage="isolated")
     state = rules_mod.startup_state(run, settings)
-    assert state["stage"] != "isolated" and settings.stage == state["stage"]
+    assert state["stage"] == "cut" and settings.stage == "cut"      # the rule is there: the cut is not dropped
     assert state["isolated"] is True and "not a full cut" in state["note"]
 
 
 def test_no_cut_rule_at_all_names_nothing():
     run, settings = make(foreign=STOCK)
     assert rules_mod.startup_state(run, settings)["note"] is None
+
+
+# -- the whole table: marker x Block x firewall off x cut rule -----------------------------------
+# Every row is one reachable state at start-up. Whatever the row, a rule that was there is still there, unchanged, and
+# nothing but the marker and the stage is written when the marker is cleared.
+
+BLOCKS = {"none": "Allow", "some": {"Domain": "Block", "Private": "Allow", "Public": "Allow"}, "all": "Block"}
+CUTS = ("absent", "full", "wrong", "unreadable")
+# (block, off, cut) -> (isolated, marker kept, stage returned, stage saved after); the file said "cut_policy" before
+MARKED = {
+    ("none", False, "absent"): (False, False, "open", "open"),
+    ("none", False, "full"): (True, True, "cut", "cut"),
+    ("none", False, "wrong"): (False, False, "open", "open"),
+    ("none", False, "unreadable"): (True, True, "cut_policy", "cut_policy"),
+    ("none", True, "absent"): (False, False, "open", "open"),
+    ("none", True, "full"): (False, True, "open", "open"),
+    ("none", True, "wrong"): (False, False, "open", "open"),
+    ("none", True, "unreadable"): (False, True, "open", "cut_policy"),
+    ("some", False, "absent"): (False, True, "open", "open"),
+    ("some", False, "full"): (True, True, "cut", "cut"),
+    ("some", False, "wrong"): (False, True, "open", "open"),
+    ("some", False, "unreadable"): (True, True, "cut_policy", "cut_policy"),
+    ("some", True, "absent"): (False, True, "open", "open"),
+    ("some", True, "full"): (False, True, "open", "open"),
+    ("some", True, "wrong"): (False, True, "open", "open"),
+    ("some", True, "unreadable"): (False, True, "open", "cut_policy"),
+    ("all", False, "absent"): (True, True, "isolated", "isolated"),
+    ("all", False, "full"): (True, True, "cut", "cut"),
+    ("all", False, "wrong"): (True, True, "cut", "cut"),
+    ("all", False, "unreadable"): (True, True, "cut_policy", "cut_policy"),
+    ("all", True, "absent"): (False, True, "open", "open"),
+    ("all", True, "full"): (False, True, "open", "open"),
+    ("all", True, "wrong"): (False, True, "open", "open"),
+    ("all", True, "unreadable"): (False, True, "open", "cut_policy"),
+}
+
+
+def _found(block, off, cut, *, marker, leftover=False):
+    """The run and settings of one row; ``leftover`` adds one Allow rule a failed leaving left off."""
+    foreign = {DNS_RULE: {**STOCK[DNS_RULE], "Enabled": False}} if leftover else None
+    run = FakeRun(outbound=BLOCKS[block], foreign=foreign, fail={"Get": (1, "denied")} if cut == "unreadable" else None)
+    settings = FakeSettings(isolated=marker, outbound_before="Allow" if marker else None,
+                            stage="cut_policy" if marker else "open", allow_disabled=[DNS_RULE] if leftover else ())
+    if cut in ("full", "wrong"):
+        rules_mod.cut(run)
+        if cut == "wrong":
+            run.rules[rules_mod.CUT_RULE]["Enabled"] = False
+    if off:
+        run.profiles["Public"] = False
+    return run, settings
+
+
+@pytest.mark.parametrize("row", sorted(MARKED), ids=lambda r: "-".join(str(x) for x in r))
+def test_every_state_a_restart_can_find_under_a_marker(row):
+    block, off, cut = row
+    isolated, kept, stage, saved = MARKED[row]
+    run, settings = _found(block, off, cut, marker=True)
+    before = {n: dict(v) for n, v in run.rules.items()}
+    state = rules_mod.startup_state(run, settings)
+    assert (state["isolated"], settings.isolated, state["stage"], settings.stage) == (isolated, kept, stage, saved)
+    assert state["announce"] is True and state["note"]
+    assert run.rules == before                                    # a rule that was there is there, as it was
+    assert [o for o in run.ops() if o in ("Remove", "RemoveIsolate", "Create", "SetDefaultOutbound", "Enable")] == []
+    if cut == "unreadable":
+        assert "could not be read" in state["note"] and "not known" in state["note"]
+    if cut == "wrong":
+        assert "not a full cut" in state["note"] and "left alone" in state["note"]
+    if isolated:
+        assert "not a working isolation" not in state["note"]
+    if not isolated and kept:
+        assert "not a working isolation" in state["note"]
+
+
+@pytest.mark.parametrize("cut", ["absent", "wrong", "unreadable"])
+@pytest.mark.parametrize("block", ["none", "some", "all"])
+def test_the_firewall_that_is_off_is_never_isolated_whatever_the_cut_rule_says(block, cut):
+    run, settings = _found(block, True, cut, marker=True)
+    assert rules_mod.startup_state(run, settings)["isolated"] is False
+
+
+def test_an_unreadable_cut_rule_with_a_profile_off_says_so_and_does_not_claim_isolation():
+    run, settings = _found("none", True, "unreadable", marker=True)
+    state = rules_mod.startup_state(run, settings)
+    assert state["isolated"] is False and state["profiles_off"] == ["Public"]
+    assert "not a working isolation" in state["note"] and "not known" in state["note"] and "Public" in state["note"]
+
+
+def test_an_unreadable_cut_rule_with_some_profiles_blocking_is_believed_and_the_stage_kept():
+    run, settings = _found("some", False, "unreadable", marker=True)
+    settings.stage = "cut"
+    state = rules_mod.startup_state(run, settings)
+    assert state["isolated"] is True and state["stage"] == "cut" and settings.stage == "cut"
+    assert "not known" in state["note"] and "Domain" in state["note"] and "not a working isolation" not in state["note"]
+
+
+# The one call that touches enforcement: Allow rules are switched back on only where that opens nothing.
+REOPENED = {("none", False, "absent", True), ("none", False, "wrong", True), ("none", True, "absent", True),
+            ("none", True, "wrong", True)}
+
+
+@pytest.mark.parametrize("marker", [True, False])
+@pytest.mark.parametrize("row", sorted(MARKED), ids=lambda r: "-".join(str(x) for x in r))
+def test_leftover_allow_rules_are_switched_on_again_only_where_that_opens_nothing(row, marker):
+    block, off, cut = row
+    run, settings = _found(block, off, cut, marker=marker, leftover=True)
+    rules_mod.startup_state(run, settings)
+    if marker:
+        reopens = (block, off, cut, True) in REOPENED
+    else:
+        reopens = block == "none" or cut == "full"
+    assert run.foreign[DNS_RULE]["Enabled"] is reopens
+    assert ("EnableAllowOut" in run.ops()) is reopens
+    assert (settings.allow_disabled == []) is reopens
 
 
 def test_a_stage_without_a_marker_is_not_a_stage():
