@@ -320,9 +320,9 @@ ist der schlimmste denkbare Fehler dieses Tabs. Also:
 
 **Entscheidung — Isolated.** Ausnahmen, und nur diese:
 
-- Loopback (`127.0.0.0/8`, `::1`) — darüber läuft TDCs ganzer Innenverkehr.
+- **Loopback braucht keine.** Die Windows-Firewall filtert Loopback-Verkehr gar nicht, eine Allow-Regel dafür wäre also eine Behauptung über etwas, das ohnehin nicht blockiert werden kann. Und ihre IPv6-Hälfte ließ sich nicht einmal schreiben: Windows lehnt `::1` als Regeladresse ab („Es wurde eine nicht definierte Multicast-, Broadcast- oder Loopback-IPv6-Adresse angegeben") — der erste Lauf auf einer echten VM scheiterte an genau dieser Regel, bevor irgendetwas isoliert war. Sie ist entfallen.
 - **Kein stehendes Recht für den Fetcher.** Ein Dauer-Allow auf das `python.exe` der Web-UI-venv wäre ein Loch von der Größe „alles, was dieses python starten kann, darf raus" — und ein Interpreter lässt sich zu allem überreden. Stattdessen öffnet `allow_fetch` unmittelbar vor einem Nachladen **eine Regel auf genau die beobachtete Adresse** und nimmt sie danach wieder weg, ob der Fetch gelingt oder nicht; Reste räumt der Start auf.
-- Nichts sonst. Insbesondere kein DNS, kein NTP, keine Updates.
+- Damit ist die per-Fetch-Regel die **einzige** Ausnahme, die Isolated überhaupt schreibt. Kein DNS, kein NTP, keine Updates.
 
 **Korrektur: „default deny" ist nicht „deny".** `Set-NetFirewallProfile -All -DefaultOutboundAction Block` regelt nur Verkehr, auf den **keine Regel passt**. Windows liefert aktivierte Ausgangs-Allow-Regeln mit (Core Networking: DNS, DHCP, Teredo, IP-HTTPS, Gruppenrichtlinien; die Regeln der Store-Apps), und die gelten weiter. Dieser Entwurf hat eine Isolation versprochen, die er nie geliefert hat — das Abschluss-Review hat es gefunden, kein Test konnte es, weil der eingesetzte Fake-Runner außer TDCs eigenen Regeln keine kennt.
 
