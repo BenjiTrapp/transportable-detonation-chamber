@@ -11533,7 +11533,37 @@ body.maintenance-active #app {
 .fw-cap-actions { display: flex; grid-area: actions; gap: 4px; }
 
 /* The summary */
-.fw-summary { min-width: 0; }
+.fw-summary { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+
+/* The network cut under the summary: the UPDATE ALL skull, larger, its label under it and the stage in it. Its
+   skull does not pulse on hover: a state that matters is not one that blinks. */
+.fw-cut-card { display: flex; flex-direction: column; align-items: stretch; }
+.fw-cut-slot { display: flex; justify-content: center; padding: 6px 0 2px; }
+.fw-cut {
+    flex-direction: column;
+    gap: 8px;
+    padding: 4px 8px;
+    text-align: center;
+}
+.fw-cut .btn-skull-art { width: 84px; height: 84px; }
+.fw-cut:not(:disabled):hover .btn-skull-art,
+.fw-cut:not(:disabled):focus-visible .btn-skull-art { animation: none; }
+.fw-cut[aria-pressed="true"] .btn-skull-label { color: var(--skull-red-light); }
+.fw-cut.fw-cut-reopened .btn-skull-label,
+.fw-cut.fw-cut-unconfirmed .btn-skull-label,
+.fw-cut.fw-cut-unsecured .btn-skull-label { color: var(--accent-yellow); }
+.fw-cut[aria-busy="true"] { cursor: progress; }
+.fw-cut-note {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 8px 0 0;
+    font-size: 11px;
+    line-height: 1.45;
+    text-align: center;
+    color: var(--text-secondary);
+}
+.fw-cut-fetch { color: var(--text-muted); }
 .fw-tiles { display: grid; gap: 8px; margin-bottom: 4px; }
 .fw-tile {
     display: flex;

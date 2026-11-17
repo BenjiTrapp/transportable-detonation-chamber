@@ -41,12 +41,14 @@ FW_CONSTS = list(dict.fromkeys(re.findall(r"^const (FW_\w+) = ", SOURCE, re.M)))
 FW_LETS = re.findall(r"^let fw\w+ = [^\n]*?;(?=[ \t]*(?://[^\n]*)?$)", SOURCE, re.M)
 WORLD_FUNCTIONS = ["_worldXY", "project", "_worldChamber", "_worldTone", "_worldArcPath", "_worldText", "_worldTextWidth",
                    "_worldLabelBox", "worldMapSvg", "_chartCoord", "_chartEllipsis"]
-OTHER_FUNCTIONS = WORLD_FUNCTIONS + ["escapeHtml", "jsArg", "cssToken", "formatAlertTime", "formatSize", "logsQuote", "sortTimeValue"]
+OTHER_FUNCTIONS = WORLD_FUNCTIONS + ["escapeHtml", "jsArg", "cssToken", "formatAlertTime", "formatSize", "logsQuote", "sortTimeValue",
+                                     "skullButtonSvg"]
 ALL_FUNCTIONS = list(dict.fromkeys(FW_FUNCTIONS + OTHER_FUNCTIONS))
 
 ELEMENT_IDS = ["tab-firewall", "firewall-tree", "firewall-view", "firewall-summary", "firewall-hints", "firewall-captures",
                "firewall-views", "firewall-range", "firewall-live", "firewall-ask-btn", "firewall-ask-menu",
-               "firewall-isolated", "firewall-bands", "firewall-search", "firewall-count"]
+               "firewall-isolated", "firewall-bands", "firewall-search", "firewall-count",
+               "firewall-cut-slot", "firewall-cut", "firewall-cut-note"]
 # Elements of other tabs a firewall function writes to
 OTHER_IDS = ["threatscan-filepath"]
 
@@ -655,6 +657,7 @@ def fw_toggle_isolated_clicks(confirm=False, isolate=None):
     return _run(r"""
         confirmAnswer = %s;
         fwState.isolate = %s;
+        fwState.isolated = !!fwState.isolate.isolated;
         answer = url => reply(url === '/api/firewall/isolate' ? { isolated: true, state: { isolated: true, profiles_off: [] } } : {});
         await fwToggleIsolated();
         console.log(JSON.stringify({ confirm: confirms.length, post: calls.filter(c => c.method === 'POST').length,
@@ -663,41 +666,44 @@ def fw_toggle_isolated_clicks(confirm=False, isolate=None):
 
 
 @needs_node
-def test_isolated_asks_before_it_cuts():
-    calls = fw_toggle_isolated_clicks()
-    assert calls["confirm"] == 1 and calls["post"] == 0      # declined: nothing sent
-    done = fw_toggle_isolated_clicks(confirm=True)
-    assert done["post"] == 1 and done["body"] == {"on": True}
-    options = done["options"]
-    assert options["danger"] is True
-    assert "tdc-unisolate.ps1" in options["message"] and "loopback" in options["message"].lower()
+def test_the_cut_sends_at_once_and_leaving_asks_first():
+    cut = fw_toggle_isolated_clicks()
+    assert cut["confirm"] == 0 and cut["post"] == 1 and cut["body"] == {"on": True}
+    leaving = {"isolated": True, "stage": "isolated", "verified": True, "allowed_out": [], "profiles_off": []}
+    declined = fw_toggle_isolated_clicks(isolate=leaving)
+    assert declined["confirm"] == 1 and declined["post"] == 0      # declined: nothing sent
+    done = fw_toggle_isolated_clicks(confirm=True, isolate=leaving)
+    assert done["post"] == 1 and done["body"] == {"on": False}
+    assert "ISOLATED" in done["options"]["message"] and "reach the network again" in done["options"]["message"]
 
 
 @needs_node
 def test_the_isolated_button_says_it_is_working_and_takes_no_second_click():
     r = _run(r"""
-        confirmAnswer = true;
         fwState.isolate = { isolated: false, profiles_off: [] };
         let release;
         const held = new Promise(res => { release = res; });
         answer = url => url === '/api/firewall/isolate'
-            ? held.then(() => reply({ isolated: true, verified: true, note: null, state: { isolated: true, profiles_off: [] } }))
+            ? held.then(() => reply({ isolated: true, stage: 'cut', verified: true, converging: true, note: null,
+                state: { isolated: true, stage: 'cut', verified: true, converging: true, profiles_off: [] } }))
             : reply({});
         const first = fwToggleIsolated();
         for (let i = 0; i < 5; i++) await Promise.resolve();
         const b = els['firewall-isolated'];
-        const during = { text: b.textContent, disabled: b.disabled, busy: b.attrs['aria-busy'], title: b.title };
+        const during = { text: b.textContent, disabled: b.disabled, busy: b.attrs['aria-busy'], title: b.title,
+            big: els['firewall-cut-slot'].innerHTML };
         const second = await fwToggleIsolated();
         release();
         await first;
         console.log(JSON.stringify({ during, second, posts: calls.filter(c => c.method === 'POST').length,
             after: { text: b.textContent, busy: b.attrs['aria-busy'] }, toasts }));""")
-    assert r["during"]["text"] == "ISOLATING…" and r["during"]["disabled"] is True and r["during"]["busy"] == "true"
-    assert "PowerShell" in r["during"]["title"] and "minute" in r["during"]["title"]
+    assert r["during"]["text"] == "CUTTING…" and r["during"]["disabled"] is True and r["during"]["busy"] == "true"
+    assert "CUTTING…" in r["during"]["big"] and 'aria-busy="true"' in r["during"]["big"] and " disabled" in r["during"]["big"]
+    assert "PowerShell" in r["during"]["title"] and "seconds" in r["during"]["title"]
     assert r["second"] is False and r["posts"] == 1
-    assert r["after"] == {"text": "ISOLATED", "busy": "false"}
-    assert r["toasts"][0]["title"] == "Switching ISOLATED on…" and "does not stop it" in r["toasts"][0]["detail"]
-    assert r["toasts"][-1]["title"] == "ISOLATED is on"
+    assert r["after"] == {"text": "CUT · SECURING…", "busy": "false"}
+    assert r["toasts"][0]["title"] == "Cutting the network…" and "does not stop it" in r["toasts"][0]["detail"]
+    assert r["toasts"][-1]["title"] == "The network is cut"
 
 
 @needs_node
@@ -710,7 +716,7 @@ def test_isolated_cannot_be_switched_on_while_a_profile_is_off():
 def test_the_isolated_banner_shows_the_residual_and_an_open_way_out():
     r = _run(r"""
         fwState.isolated = true;
-        fwState.isolate = { isolated: true, profiles_off: [], isolated_since: '2026-11-16T10:00:00Z',
+        fwState.isolate = { isolated: true, stage: 'isolated', profiles_off: [], isolated_since: '2026-11-16T10:00:00Z',
             residual: 'ISOLATED blocks every way out but loopback. <b>x</b>', fetches_in_flight: 1,
             fetch_paths_open: [{ rule_id: 'TDC-FW-ISO-fetch-0123456789ab', problem: 'Access <i>denied</i>', since: 1 }] };
         renderFirewallBands();
@@ -727,7 +733,7 @@ def test_the_isolated_banner_names_what_windows_own_rules_still_let_out():
     def bands(extra):
         return _run(r"""
             fwState.isolated = true;
-            fwState.isolate = Object.assign({ isolated: true, profiles_off: [], residual: 'r' }, %s);
+            fwState.isolate = Object.assign({ isolated: true, stage: 'isolated', profiles_off: [], residual: 'r' }, %s);
             renderFirewallBands();
             console.log(JSON.stringify(els['firewall-bands'].innerHTML));""" % json.dumps(extra))
     open_ = bands({"allowed_out": [{"name": "{gpo}", "display": "Lab <b>proxy</b> out", "source": "GroupPolicy", "local": False}]})
@@ -735,8 +741,12 @@ def test_the_isolated_banner_names_what_windows_own_rules_still_let_out():
     assert "GroupPolicy" in open_ and "fw-band-hole" in open_
     unknown = bands({"allowed_out": None, "allowed_out_error": "rpc <x>"})
     assert "Whether ISOLATED is closed is not known" in unknown and "rpc &lt;x&gt;" in unknown
-    closed = bands({"allowed_out": []})
+    closed = bands({"allowed_out": [], "verified": True})
     assert "no outbound Allow rule but TDC" in closed and "fw-band-hole" not in closed
+    # Nothing let out, but Block not read back in force on every profile: no claim that it is closed
+    unconfirmed = bands({"allowed_out": [], "verified": False})
+    assert "no outbound Allow rule but TDC" not in unconfirmed and "fw-band-hole" in unconfirmed
+    assert "not confirmed" in unconfirmed and "data-fw-cut" in unconfirmed
 
 
 @needs_node
@@ -748,25 +758,29 @@ def test_the_isolated_toast_says_what_the_server_said():
             fwState.isolate = %s;
             answer = url => reply(url === '/api/firewall/isolate' ? %s : {});
             await fwToggleIsolated();
-            console.log(JSON.stringify(toasts.filter(t => t.title.startsWith('ISOLATED'))));""" % (
+            console.log(JSON.stringify(toasts.filter(t => t.type !== 'info')));""" % (
             json.dumps(isolate["isolated"]), json.dumps(isolate), json.dumps(data)))
-    left = toggle({"isolated": True, "profiles_off": []},
+    held = {"isolated": True, "stage": "isolated", "verified": True, "allowed_out": [], "profiles_off": []}
+    left = toggle(held,
                   {"isolated": False, "outbound_after": {"Domain": "Block", "Private": "Block", "Public": "Block"},
                    "note": "The baseline recorded before ISOLATED is Block on Domain, Private, Public: outbound stays shut there",
                    "state": {"isolated": False, "profiles_off": []}})
     assert left[0]["title"] == "ISOLATED is off" and "stays shut" in left[0]["detail"] and left[0]["type"] == "warning"
     assert "allowed again" not in left[0]["detail"]
-    shut = toggle({"isolated": True, "profiles_off": []},
+    shut = toggle(held,
                   {"isolated": False, "outbound_after": {"Domain": "Block", "Private": "Allow", "Public": "Allow"}, "note": None,
                    "state": {"isolated": False, "profiles_off": []}})
     assert "Block on Domain" in shut[0]["detail"] and shut[0]["type"] == "warning"
     gone = toggle({"isolated": False, "profiles_off": []},
-                  {"isolated": True, "verified": False, "note": "1 outbound Allow rule is still enabled: Lab proxy out",
-                   "state": {"isolated": True, "profiles_off": []}})
-    assert gone[0]["title"] == "ISOLATED is on, not closed" and "Lab proxy out" in gone[0]["detail"] and gone[0]["type"] == "error"
+                  {"isolated": True, "stage": "cut", "verified": False, "converging": True,
+                   "note": "The cut rule is not confirmed: it was not found.",
+                   "state": {"isolated": True, "stage": "cut", "profiles_off": []}})
+    assert gone[0]["title"] == "The cut is not confirmed" and "not found" in gone[0]["detail"] and gone[0]["type"] == "error"
     closed = toggle({"isolated": False, "profiles_off": []},
-                    {"isolated": True, "verified": True, "note": None, "state": {"isolated": True, "profiles_off": []}})
-    assert closed[0]["title"] == "ISOLATED is on" and "read back" in closed[0]["detail"]
+                    {"isolated": True, "stage": "cut", "verified": True, "converging": True, "note": None,
+                     "state": {"isolated": True, "stage": "cut", "profiles_off": []}})
+    assert closed[0]["title"] == "The network is cut" and "read back" in closed[0]["detail"]
+    assert "cannot secure a sample" in closed[0]["detail"] and closed[0]["type"] == "warning"
 
 
 @needs_node
@@ -2177,3 +2191,242 @@ def test_the_fallback_range_does_not_claim_to_hold_more():
     assert "misses whatever of them came before it" in hour["note"] and "old download" in hour["note"]
     assert every["earliest"] == "" and "everything kept" in every["note"] and "may hold more" not in every["note"]
     assert "LOGS may no longer keep the oldest of theirs" in every["note"]
+
+
+# --- The cut button: one state in two places (panic cut, Task 6) ----------------------
+
+def cut_view(isolate, extra=""):
+    """The big button, the header switch, the card's note and the bands for one state of GET /isolate."""
+    return _run(r"""
+        fwState.loaded = true;
+        fwState.isolate = %s;
+        fwState.isolated = !!(fwState.isolate && fwState.isolate.isolated);
+        %s
+        renderFirewallHead();
+        renderFirewallBands();
+        const big = els['firewall-cut-slot'].innerHTML, head = els['firewall-isolated'];
+        console.log(JSON.stringify({ big, note: els['firewall-cut-note'].innerHTML, bands: els['firewall-bands'].innerHTML,
+            head: { text: head.textContent, pressed: head.attrs['aria-pressed'], disabled: head.disabled, title: head.title },
+            state: fwCutState() }));""" % (json.dumps(isolate), extra))
+
+
+def _big(markup):
+    """label, aria-pressed and disabled of the big button, as a browser reads them."""
+    button = re.search(r"<button[^>]*>", markup).group(0)
+    label = re.search(r'<span class="btn-skull-label">(.*?)</span>', markup).group(1)
+    return {"label": label.replace("&amp;", "&"), "pressed": re.search(r'aria-pressed="(\w+)"', button).group(1),
+            "disabled": " disabled" in button, "id": 'id="firewall-cut"' in button, "data": "data-fw-cut" in button,
+            "title": re.search(r'title="([^"]*)"', button).group(1)}
+
+
+HELD = {"profiles_off": [], "allowed_out": None, "allowed_out_error": None, "residual": "r", "fetch_paths_open": []}
+# state of GET /isolate -> (label, what a press does, disabled)
+CUT_STATES = [
+    (dict(HELD, isolated=False, stage="open", can_fetch=True), "CUT THE NETWORK", "cut", False),
+    (dict(HELD, isolated=True, stage="cut", converging=True, verified=True, can_fetch=False), "CUT · SECURING…", "leave", False),
+    (dict(HELD, isolated=True, stage="cut", converging=False, verified=True, can_fetch=False,
+          converge_note="Switching off failed"), "CUT · NOT SECURED", "leave", False),
+    (dict(HELD, isolated=True, stage="isolated", verified=True, allowed_out=[], can_fetch=True), "ISOLATED", "leave", False),
+    (dict(HELD, isolated=True, stage="isolated", verified=False, can_fetch=True,
+          allowed_out=[{"name": "{gpo}", "display": "Lab proxy out", "source": "GroupPolicy"}]), "ISOLATED · OPEN", "cut", False),
+    (dict(HELD, isolated=True, stage="cut_policy", converging=False, verified=True, can_fetch=False,
+          allowed_out=[{"name": "{gpo}", "display": "Lab proxy out", "source": "GroupPolicy"}]), "CUT · NO FETCH", "leave", False),
+    (dict(HELD, isolated=False, stage="open", profiles_off=["Public"], can_fetch=None), "CUT THE NETWORK", "cut", True),
+    # Not in the spec's table, and never shown as closed: a marker beside stage open (start-up found a profile off),
+    # an ISOLATED whose Allow list could not be read, one whose Block was not read back on every profile
+    (dict(HELD, isolated=True, stage="open", verified=False, can_fetch=False), "ISOLATED · NOT CONFIRMED", "cut", False),
+    (dict(HELD, isolated=True, stage="isolated", verified=False, allowed_out_error="rpc"), "ISOLATED · NOT CONFIRMED", "cut", False),
+    (dict(HELD, isolated=True, stage="isolated", verified=False, allowed_out=[]), "ISOLATED · NOT CONFIRMED", "cut", False),
+    # A firewall switched off under a cut or an isolation: cutting cannot be done, so a press leaves, and is not disabled
+    (dict(HELD, isolated=True, stage="cut", converging=True, verified=True, profiles_off=["Public"]), "CUT · SECURING…", "leave", False),
+    (dict(HELD, isolated=True, stage="isolated", verified=False, allowed_out=[], profiles_off=["Public"]),
+     "ISOLATED · NOT CONFIRMED", "leave", False),
+    # A way out a finished fetch left open lets traffic out as much as an Allow rule does: not shown as closed
+    (dict(HELD, isolated=True, stage="isolated", verified=True, allowed_out=[],
+          fetch_paths_open=[{"rule_id": "TDC-FW-ISO-fetch-0123456789ab", "problem": "denied"}]), "ISOLATED · OPEN", "cut", False),
+]
+
+
+def test_the_summary_column_holds_the_cut_button():
+    assert "firewall-cut" in ELEMENT_IDS and 'id="firewall-cut"' in SOURCE and "data-fw-cut" in SOURCE
+    html = _read(INDEX_HTML)
+    side = html[html.index('<aside class="fw-summary"'):html.index("</aside>", html.index('<aside class="fw-summary"'))]
+    # under the SUMMARY card, in the same column, and the change of its state is announced
+    assert side.index('id="firewall-summary"') < side.index('id="firewall-cut-slot"') < side.index('id="firewall-cut-note"')
+    assert re.search(r'id="firewall-cut-note"[^>]*aria-live="polite"', side)
+
+
+def test_the_cut_button_is_built_from_the_skull_button():
+    block = _function_source("fwCutButtonHtml")
+    assert "btn-skull" in block and "skullButtonSvg('-cut')" in block
+
+
+def test_only_fw_toggle_isolated_switches_isolated():
+    posts = [m.start() for m in re.finditer(r"fwPost\('/api/firewall/isolate'", SOURCE)]
+    toggle = _function_source("fwToggleIsolated")
+    assert len(posts) == 1 and SOURCE[posts[0]:posts[0] + 40] in toggle
+    assert re.search(r"hit\('\[data-fw-isolated\], \[data-fw-cut\]'\)\) fwToggleIsolated\(\)", _function_source("onFirewallClick"))
+
+
+@needs_node
+def test_every_state_has_its_label_its_press_and_the_same_on_both_controls():
+    for isolate, label, action, disabled in CUT_STATES:
+        r = cut_view(isolate)
+        big, head, st = _big(r["big"]), r["head"], r["state"]
+        assert big["id"] and big["data"], isolate
+        assert (big["label"], st["action"], big["disabled"]) == (label, action, disabled), (isolate, big, st)
+        # One state, two places: pressed, disabled, the title (what a press does) and, while on, the text
+        assert head["pressed"] == big["pressed"] == ("true" if isolate["isolated"] else "false"), isolate
+        assert head["disabled"] is big["disabled"], isolate
+        assert head["title"] == big["title"].replace("&#39;", "'").replace("&quot;", '"').replace("&amp;", "&"), isolate
+        assert head["text"] == (label if isolate["isolated"] else "ISOLATED"), (isolate, head)
+        if disabled:
+            assert "Windows Firewall is off" in big["title"], isolate
+        else:
+            assert ("asks first" in big["title"]) is (action == "leave"), (isolate, big["title"])
+
+
+@needs_node
+def test_pressing_cuts_at_once_or_leaves_after_asking_whatever_the_stage():
+    def press(isolate, confirm):
+        return _run(r"""
+            confirmAnswer = %s;
+            fwState.isolate = %s;
+            fwState.isolated = !!fwState.isolate.isolated;
+            answer = url => reply(url === '/api/firewall/isolate' ? { isolated: true, stage: 'cut', verified: true, converging: true } : {});
+            await fwToggleIsolated();
+            console.log(JSON.stringify({ confirms: confirms.map(c => c.title + ' ' + c.message),
+                sent: calls.filter(c => c.method === 'POST').map(c => c.body) }));""" % (json.dumps(confirm), json.dumps(isolate)))
+    for isolate, label, action, disabled in CUT_STATES:
+        declined = press(isolate, False)
+        if disabled:
+            assert declined == {"confirms": [], "sent": []}, isolate
+        elif action == "cut":
+            assert declined == {"confirms": [], "sent": [{"on": True}]}, isolate    # no question on the way in
+        else:
+            assert len(declined["confirms"]) == 1 and declined["sent"] == [], isolate
+            assert label in declined["confirms"][0], (label, declined)             # it names the stage it leaves
+            assert press(isolate, True)["sent"] == [{"on": False}], isolate
+    securing = press(CUT_STATES[1][0], False)["confirms"][0]
+    assert "background" in securing and "stop" in securing
+
+
+def test_the_cut_does_not_ask_but_leaving_does():
+    assert _function_source("fwToggleIsolated").count("tdcConfirm(") == 1
+
+
+@needs_node
+def test_a_click_on_either_control_goes_through_the_one_toggle():
+    r = _run(r"""
+        fwState.isolate = { isolated: false, stage: 'open', profiles_off: [] };
+        answer = url => reply(url === '/api/firewall/isolate' ? { isolated: true, stage: 'cut', verified: true, converging: true } : {});
+        const target = attr => ({ closest: s => (s.split(', ').includes(attr) ? { disabled: false, getAttribute: () => null } : null) });
+        onFirewallClick({ target: target('[data-fw-cut]') });
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+        fwIsoSwitching = '';
+        fwState.isolated = false;
+        onFirewallClick({ target: target('[data-fw-isolated]') });
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+        console.log(JSON.stringify(calls.filter(c => c.method === 'POST').map(c => [c.url, c.body])));
+        process.exit(0);""")
+    assert r == [["/api/firewall/isolate", {"on": True}], ["/api/firewall/isolate", {"on": True}]]
+
+
+@needs_node
+def test_the_button_is_disabled_only_while_the_firewall_is_off():
+    r = _run(r"""
+        const out = [];
+        for (const [iso, switching] of [[{ isolated: true, stage: 'cut', converging: true, verified: true, profiles_off: [] }, ''],
+                                        [{ isolated: false, stage: 'open', profiles_off: [], can_fetch: null }, ''],
+                                        [{ isolated: false, stage: 'open', profiles_off: ['Domain'] }, '']]) {
+            fwState.isolate = iso; fwState.isolated = iso.isolated; fwIsoSwitching = switching;
+            renderFirewallHead();
+            out.push(/<button[^>]* disabled/.test(els['firewall-cut-slot'].innerHTML));
+        }
+        console.log(JSON.stringify(out));""")
+    assert r == [False, False, True]     # converging (TDC busy) does not disable it; the firewall off does
+
+
+@needs_node
+def test_whether_tdc_can_secure_a_sample_is_said_in_three_values():
+    def note(can_fetch, loaded=True):
+        isolate = dict(HELD, isolated=False, stage="open", can_fetch=can_fetch) if loaded else None
+        return cut_view(isolate)["note"]
+    assert ">TDC can secure a sample now.<" in note(True)
+    assert ">TDC cannot secure a sample now" in note(False)
+    for unknown in (note(None), note(None, loaded=False)):    # null, and the state not read yet: not known either
+        assert "is not known" in unknown and ">TDC can" not in unknown and "cannot" not in unknown
+
+
+@needs_node
+def test_a_cut_stage_says_in_a_band_that_no_sample_can_be_secured():
+    cut = cut_view(CUT_STATES[1][0])["bands"]
+    assert "cannot secure" in cut and "catch-all" in cut and "read back" in cut and "background" in cut
+    # In the cut, the Allow list is not read on purpose: no "not known whether closed", and the residual is not shown
+    assert "Whether ISOLATED is closed is not known" not in cut and "Still let out" not in cut and ">r<" not in cut
+    policy = cut_view(CUT_STATES[5][0])["bands"]
+    assert "cannot secure" in policy and "group polic" in policy and "Lab proxy out" in policy
+
+
+@needs_node
+def test_a_cut_that_was_not_read_back_is_not_called_shut():
+    r = cut_view(dict(CUT_STATES[1][0], verified=False))
+    assert "not confirmed" in r["bands"] and "fw-band-hole" in r["bands"]
+    assert "not confirmed" in r["note"].lower() or "not read back" in r["note"]
+    for text in (r["bands"], r["note"], r["head"]["title"]):
+        assert "stands and was read back" not in text and "is shut" not in text.replace("whether outbound is shut", "")
+
+
+@needs_node
+def test_a_cut_whose_securing_failed_says_what_did_not_get_through_as_text():
+    r = cut_view(dict(CUT_STATES[2][0], converge_note=HOSTILE))
+    assert "did not get through" in r["bands"] and "&lt;script&gt;" in r["bands"]
+    _no_live_markup(r["bands"])
+    _no_live_markup(r["big"])
+    _no_live_markup(r["note"])
+
+
+@needs_node
+def test_an_isolated_stage_that_went_open_again_offers_the_cut():
+    r = cut_view(CUT_STATES[4][0])
+    assert "Still let out despite ISOLATED" in r["bands"]
+    offer = re.search(r'<button[^>]*data-fw-cut[^>]*>([^<]*)</button>', r["bands"])
+    assert offer and "CUT" in offer.group(1)
+    # isolated and closed: nothing offered
+    assert "data-fw-cut" not in cut_view(CUT_STATES[3][0])["bands"]
+
+
+@needs_node
+def test_a_marker_beside_stage_open_is_never_taken_for_nothing_in_force():
+    r = cut_view(CUT_STATES[7][0])
+    assert r["head"]["pressed"] == "true" and "CUT THE NETWORK" not in r["big"]
+    assert "fw-band-hole" in r["bands"] and "data-fw-cut" in r["bands"]
+
+
+@needs_node
+def test_the_cut_button_is_drawn_again_only_when_it_changes_and_keeps_the_focus():
+    r = _run(r"""
+        fwState.isolate = { isolated: false, stage: 'open', profiles_off: [] };
+        renderFirewallHead();
+        const host = els['firewall-cut-slot'];
+        let writes = 0, html = host.innerHTML;
+        Object.defineProperty(host, 'innerHTML', { get: () => html, set: v => { writes++; html = v; } });
+        renderFirewallHead();
+        renderFirewallHead();
+        document.activeElement = els['firewall-cut'];
+        fwState.isolate = { isolated: true, stage: 'cut', converging: true, verified: true, profiles_off: [] };
+        fwState.isolated = true;
+        renderFirewallHead();
+        console.log(JSON.stringify({ writes, focused: els['firewall-cut'].focused }));""")
+    assert r == {"writes": 1, "focused": 1}
+
+
+def test_the_help_names_the_cut_and_its_stages():
+    html = _read(INDEX_HTML)
+    guide = html[html.index('id="help-usage"'):html.index('id="help-api"')]
+    entry = guide[guide.index("<h4>FIREWALL</h4>"):guide.index("<h4>LOGS</h4>")]
+    for text in ("CUT THE NETWORK", "SECURING", "NOT SECURED", "NO FETCH", "ISOLATED &middot; OPEN", "without a confirmation"):
+        assert text in entry, text
+    api = html[html.index('id="help-api"'):]
+    row = re.search(r"<code>/api/firewall/isolate</code></td><td>ISOLATED's state:.*?</td>", api).group(0)
+    assert "stage" in row and "converging" in row and "can_fetch" in row

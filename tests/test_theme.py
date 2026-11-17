@@ -1875,6 +1875,24 @@ def test_cyberpunk_rules_unchanged():
     assert {n: re.sub(r"\s+", "", v) for n, v in old_vars.items()} == {n: re.sub(r"\s+", "", new_vars[n]) for n in old_vars}
 
 
+def test_the_cut_button_takes_its_colours_from_the_theme_and_does_not_pulse():
+    """The panic cut of the FIREWALL tab (.fw-cut-card, .fw-cut): its own block in style.css paints only with
+    variables both themes define, and its skull does not take the hover pulse of UPDATE ALL (nothing pulses on
+    a button whose state matters), with or without prefers-reduced-motion."""
+    style = _flat_rules(_raw(STYLE_CSS))
+    cut = {key: decls for key, decls in style.items() if re.search(r"\.fw-cut\b|\.fw-cut-", key[1])}
+    assert any(s.strip() == ".fw-cut-card" for _, s in cut), "no .fw-cut-card rule in style.css"
+    text = "\n".join(";".join(sorted(d)) for decls in cut.values() for d in decls)
+    assert not LITERAL_COLOR.search(text), text
+    classic = set(re.findall(r"(--[\w-]+)\s*:", ROOT_BLOCK.search(_strip_comments(_read(STYLE_CSS))).group(0)))
+    cyberpunk = classic | set(re.findall(r"(--[\w-]+)\s*:", _read(THEME_CSS)))
+    used = set(re.findall(r"var\(\s*(--[\w-]+)", text))
+    assert used and used <= classic and used <= cyberpunk, used - (classic & cyberpunk)
+    stilled = [d for (ctx, s), decls in cut.items() if ":hover" in s and "btn-skull-art" in s and "reduced-motion" not in ctx
+               for d in decls]
+    assert any("animation:none" in {x.replace(" ", "") for x in d} for d in stilled), stilled
+
+
 @needs_node
 def test_classic_uses_the_topbar_layout():
     """Classic has the top bar, the drawer and the "..." menu like Cyberpunk: setTheme('classic') moves the

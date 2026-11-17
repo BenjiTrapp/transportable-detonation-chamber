@@ -13313,14 +13313,15 @@ const FW_GROUP_INFO = {
 };
 const FW_SELF_NOTE = 'One of TDC\'s own processes: it is not blocked from here, because that could cut TDC itself off.';
 const FW_BYTES_NOTE = 'Sysmon has no byte counts; the tab counts connections and firewall records.';
-const FW_ISOLATE_TEXT = 'ISOLATED sets the default outbound action of every Windows Firewall profile to Block and switches off Windows\' own '
-    + 'outbound Allow rules (Core Networking\'s DNS, DHCP and the like), because a default stops only what no rule allows; leaving switches '
-    + 'exactly those on again. Cut off, as far as those go: outbound connections of every program in the chamber, the sample\'s and Windows\' '
-    + 'alike, TDC\'s tool updates, and the cloud lookups and telemetry of the EDR under test, so its verdicts can differ from a connected run. '
-    + 'A rule a group policy sets cannot be switched off from here: whatever is still let out is read back and named in the band. '
-    + 'Still reachable: loopback, which TDC\'s own services use, and this web UI from the host, since inbound connections are untouched. '
-    + 'TDC\'s own sample fetch is let out to one address at a time, only while it runs. '
-    + 'The way back: this button again, or scripts/tdc-unisolate.ps1 on the VM if the web UI is gone.';
+// What a press of CUT THE NETWORK does: the title of the button while nothing is cut, and the help says the same
+const FW_ISOLATE_TEXT = 'One press, no question: one outbound Block rule for every program shuts every way out of the chamber in a few '
+    + 'seconds, because a Block rule beats every Allow rule. Then, in the background, Windows\' own outbound Allow rules are switched off '
+    + 'and the default outbound action set to Block, and the rule goes; a rule a group policy sets cannot be switched off from here, and '
+    + 'there the rule stays. Cut off: the sample\'s connections and Windows\' alike, TDC\'s tool updates and the cloud lookups of the EDR '
+    + 'under test. While the cut stands TDC cannot secure a sample. Still reachable: loopback and this web UI from the host. '
+    + 'The way back: this button again, which asks before it leaves, or scripts/tdc-unisolate.ps1 on the VM if the web UI is gone.';
+const FW_CUT_WAIT = 'TDC writes one outbound Block rule through PowerShell and reads it back before it says anything; that takes a few '
+    + 'seconds. The cut runs on the server: closing or reloading this page does not stop it.';
 const FW_ISOLATE_WAIT = 'TDC switches Windows\' own outbound Allow rules and the default outbound action through PowerShell, then reads '
     + 'the firewall back before it says anything. Every PowerShell call takes seconds on a small VM, so this can take up to about a '
     + 'minute; the button stays busy until the firewall has answered. The switch runs on the server: closing or reloading this page does not stop it.';
@@ -13380,6 +13381,8 @@ let fwWorld = null;                    // world.json, once it is loaded
 let fwWorldAsked = false;
 let fwLastSig = '';
 let fwLastBands = '';
+let fwLastCut = '';                    // the cut button and its note as last drawn (renderFirewallCut)
+let fwLastCutNote = '';
 let fwFilterTimer = null;
 let fwWant = null;                     // what openFirewallTab asked to select ({select, image, pid, ip, port, text}), until the connections are in
 let fwWantMissed = '';                 // what it asked for and is not among the connections, said where the selection would be
@@ -13556,6 +13559,64 @@ function fwEnforceOff() {
 
 function fwIsolatedOn() {
     return !!fwState.isolated;
+}
+
+// The stage of ISOLATED as GET /isolate said it: open, cut, isolated or cut_policy. The marker (fwIsolatedOn), not
+// the stage, says whether TDC is isolating: start-up can leave stage open beside a marker while the cut rule holds
+function fwStage(iso = fwState.isolate) {
+    return iso && typeof iso.stage === 'string' && iso.stage ? iso.stage : 'open';
+}
+
+// What the cut button and the ISOLATED switch both show and what a press of either does: the one state of the two.
+// action 'cut' (no question) or 'leave' (asks first); disabled only when a press can do nothing: cutting while the
+// firewall is off. Cutting is offered again wherever being cut is not confirmed, since it only closes.
+function fwCutState(iso = fwState.isolate) {
+    const s = iso || {};
+    const off = fwEnforceOff(), stage = fwStage(iso), on = fwIsolatedOn();
+    const still = Array.isArray(s.allowed_out) ? s.allowed_out : null;
+    // A finished fetch's way out that would not close is let out as much as an Allow rule is; a cut closes both
+    const holes = Array.isArray(s.fetch_paths_open) ? s.fetch_paths_open.length : 0;
+    let key;
+    if (!on) key = 'open';
+    else if (stage === 'cut') key = s.converging ? 'securing' : 'unsecured';
+    else if (stage === 'cut_policy') key = 'nofetch';
+    else if (stage === 'isolated') key = (still && still.length) || holes ? 'reopened' : s.verified === true ? 'isolated' : 'unconfirmed';
+    else key = 'unconfirmed';
+    const action = key === 'open' || ((key === 'reopened' || key === 'unconfirmed') && !off) ? 'cut' : 'leave';
+    const held = s.verified === true ? 'Cut by one outbound Block rule, read back.'
+        : 'The cut rule was not read back, so whether outbound is shut is not known.';
+    const [label, now] = {
+        open: ['CUT THE NETWORK', 'Not cut: TDC is not isolating the chamber.'],
+        securing: ['CUT · SECURING…', `${held} Windows' own Allow rules are being switched off in the background.`],
+        unsecured: ['CUT · NOT SECURED', `${held} The securing behind it did not get through; the band says what.`],
+        isolated: ['ISOLATED', 'Isolated: Block on every profile and no outbound Allow rule but TDC\'s own enabled, read back.'],
+        reopened: ['ISOLATED · OPEN', `Isolated, but ${holes && !(still && still.length) ? 'a finished fetch left a way out open' : 'an outbound Allow rule is enabled again'} and lets traffic out.`],
+        nofetch: ['CUT · NO FETCH', `${held} It stays: something a group policy allows cannot be switched off from here.`],
+        unconfirmed: ['ISOLATED · NOT CONFIRMED', 'ISOLATED is on, but that nothing gets out was not read back.'],
+    }[key];
+    const disabled = action === 'cut' && !!off;
+    const press = disabled ? off
+        : key === 'open' ? FW_ISOLATE_TEXT
+            : action === 'cut' ? 'One press cuts again, without a question: a Block rule beats every Allow rule.'
+                : `A press leaves it${key === 'securing' ? ' and stops the background work' : ''} (asks first).`;
+    return { key, label, on, action, disabled, note: disabled ? off : now, title: key === 'open' ? press : `${now} ${press}` };
+}
+
+// Whether TDC's own fetch can get out, as the server knows it: true, false, or null for not known (never either)
+function fwCanFetchText(iso = fwState.isolate) {
+    const can = iso ? iso.can_fetch : null;
+    return can === true ? 'TDC can secure a sample now.' : can === false ? 'TDC cannot secure a sample now: no fetch gets through.'
+        : 'Whether TDC can secure a sample now is not known yet.';
+}
+
+// The panic button under SUMMARY, built like UPDATE ALL; while a switch is on its way it says so and waits
+function fwCutButtonHtml(iso = fwState.isolate) {
+    const st = fwCutState(iso);
+    const busy = fwIsoSwitching === 'on' ? 'CUTTING…' : fwIsoSwitching === 'off' ? 'LEAVING…' : '';
+    const title = busy ? (fwIsoSwitching === 'on' ? FW_CUT_WAIT : FW_ISOLATE_WAIT) : st.title;
+    return `<button type="button" id="firewall-cut" class="btn-skull fw-cut fw-cut-${st.key}" data-fw-cut aria-pressed="${st.on}"`
+        + ` aria-busy="${!!busy}"${busy || st.disabled ? ' disabled' : ''} title="${escapeHtml(title)}">`
+        + `<span class="btn-skull-art">${skullButtonSvg('-cut')}</span><span class="btn-skull-label">${escapeHtml(busy || st.label)}</span></button>`;
 }
 
 function fwRuleById(id) {
@@ -14314,15 +14375,16 @@ function renderFirewallHead() {
     }
     const iso = document.getElementById('firewall-isolated');
     if (iso) {
-        const on = fwIsolatedOn(), off = fwEnforceOff();
+        // The same state as the cut button (fwCutState), and the same press: only its text is shorter while off
+        const st = fwCutState(), on = st.on;
         iso.setAttribute('aria-pressed', String(on));
         iso.classList.toggle('is-on', on);
         iso.setAttribute('aria-busy', String(!!fwIsoSwitching));
-        iso.textContent = fwIsoSwitching === 'on' ? 'ISOLATING…' : fwIsoSwitching === 'off' ? 'LEAVING…' : 'ISOLATED';
-        iso.disabled = !!fwIsoSwitching || (!on && !!off);
-        iso.title = fwIsoSwitching ? FW_ISOLATE_WAIT : on ? 'ISOLATED is on: outbound is Block and Windows\' own outbound Allow rules are switched off; the band names whatever still gets out. Click to leave it (asks first).'
-            : off || 'Block outbound connections of the chamber and switch off Windows\' own outbound Allow rules; loopback stays open (asks first).';
+        iso.textContent = fwIsoSwitching === 'on' ? 'CUTTING…' : fwIsoSwitching === 'off' ? 'LEAVING…' : on ? st.label : 'ISOLATED';
+        iso.disabled = !!fwIsoSwitching || st.disabled;
+        iso.title = fwIsoSwitching === 'on' ? FW_CUT_WAIT : fwIsoSwitching ? FW_ISOLATE_WAIT : st.title;
     }
+    renderFirewallCut();
     const count = document.getElementById('firewall-count');
     if (count) {
         const n = Number(fwState.count) || 0;
@@ -14330,6 +14392,27 @@ function renderFirewallHead() {
     }
     renderFirewallRange();
     renderFirewallViews();
+}
+
+// The cut button and its note; drawn again only when they change (the state comes every tick, and the focus may be on it)
+function renderFirewallCut() {
+    const slot = document.getElementById('firewall-cut-slot');
+    if (!slot) return;
+    const html = fwCutButtonHtml();
+    if (html !== fwLastCut || slot.innerHTML === '') {
+        const focused = !!document.activeElement && document.activeElement.id === 'firewall-cut';
+        fwLastCut = html;
+        slot.innerHTML = html;
+        const button = focused ? document.getElementById('firewall-cut') : null;
+        if (button && typeof button.focus === 'function') button.focus();
+    }
+    const note = document.getElementById('firewall-cut-note');
+    const text = `<span class="fw-cut-now">${escapeHtml(fwCutState().note)}</span><span class="fw-cut-fetch">${escapeHtml(fwCanFetchText())}</span>`;
+    // It is a live region: written only when it says something new, so nothing is read out twice
+    if (note && (text !== fwLastCutNote || note.innerHTML === '')) {
+        fwLastCutNote = text;
+        note.innerHTML = text;
+    }
 }
 
 // What is not enforced, or not known, is said above everything else
@@ -14352,28 +14435,60 @@ function renderFirewallBands() {
         bands.push(['warn', 'The firewall\'s state is still being read: whether it is on and whether ISOLATED holds are not known yet.']);
     }
     if (iso.profiles_error) bands.push(['warn', `The Windows Firewall profiles could not be read: ${escapeHtml(fwShort(iso.profiles_error, 300))}. Whether a rule takes effect is unknown.`]);
-    if (fwIsolatedOn()) {
-        const n = Number(iso.fetches_in_flight) || 0;
-        bands.push(['isolated', `<strong>ISOLATED${iso.isolated_since ? ` since ${escapeHtml(formatAlertTime(iso.isolated_since))}` : ''}.</strong> `
-            + `${escapeHtml(fwShort(iso.residual || 'Outbound is Block; Windows\' own outbound Allow rules are switched off.', 600))} `
-            + (n ? `<strong>${n} ${n === 1 ? 'fetch' : 'fetches'} running</strong>: one address each is open while it runs. ` : '')
-            + 'The way back: ISOLATED again, or scripts/tdc-unisolate.ps1 on the VM.']);
+    // The remedy, one press away, wherever being cut is not confirmed: it goes through the one toggle like the button
+    const cutState = fwCutState();
+    const again = fwIsolatedOn() && cutState.action === 'cut'
+        ? ` <button type="button" class="btn btn-xs fw-cut-again" data-fw-cut title="${escapeHtml(cutState.title)}">CUT AGAIN</button>` : '';
+    if (fwIsolatedOn() && fwState.isolate) {
+        const stage = fwStage();
+        const since = iso.isolated_since ? ` since ${escapeHtml(formatAlertTime(iso.isolated_since))}` : '';
         const still = Array.isArray(iso.allowed_out) ? iso.allowed_out : null;
-        if (iso.allowed_out_error || (!still && 'allowed_out' in iso)) {
-            bands.push(['hole', `<strong>Whether ISOLATED is closed is not known.</strong> Which outbound Allow rules are still enabled could not be read`
-                + `${iso.allowed_out_error ? ` (${escapeHtml(fwShort(iso.allowed_out_error, 300))})` : ''}, and each of them would still let traffic out.`]);
-        } else if (still && still.length) {
-            const names = still.slice(0, 8).map(r => `${escapeHtml(fwShort(r && (r.display || r.name), 80))} (${escapeHtml(fwShort(r && r.source, 20))})`).join(', ');
-            bands.push(['hole', `<strong>Still let out despite ISOLATED: ${still.length} outbound Allow ${still.length === 1 ? 'rule' : 'rules'}.</strong> `
-                + `${names}${still.length > 8 ? ` and ${still.length - 8} more` : ''}. The default action does not stop what a rule allows; `
-                + 'a rule a group policy sets cannot be switched off from here.']);
-        } else if (still) {
-            bands.push(['isolated', 'Read back: no outbound Allow rule but TDC\'s own is enabled.']);
+        const names = list => list.slice(0, 8).map(r => `${escapeHtml(fwShort(r && (r.display || r.name), 80))} (${escapeHtml(fwShort(r && r.source, 20))})`).join(', ')
+            + (list.length > 8 ? ` and ${list.length - 8} more` : '');
+        if (stage === 'cut' || stage === 'cut_policy') {
+            const note = iso.converge_note ? escapeHtml(fwShort(iso.converge_note, 600).replace(/[.\s]+$/, '')) : '';
+            let text = iso.verified === true
+                ? `<strong>CUT${since}.</strong> One outbound Block rule for every program stands and was read back; a Block rule beats every Allow rule, and loopback stays open. `
+                : `<strong>CUT${since}, not confirmed.</strong> The catch-all Block rule was not read back, so whether outbound is shut is not known. `;
+            text += '<strong>TDC cannot secure a sample in this state</strong>: no fetch gets through a catch-all Block rule. ';
+            if (stage === 'cut_policy') {
+                text += 'The rule stays, because something that lets traffic out cannot be switched off from here (a rule a group policy sets)'
+                    + `${still && still.length ? `: ${names(still)}` : ''}. Leaving the cut is the way to secure samples again.`;
+            } else if (iso.converging) {
+                text += 'In the background Windows\' own outbound Allow rules are being switched off and the default set to Block; then the rule goes.';
+            } else {
+                text += `The securing behind the cut did not get through${note ? `: ${note}` : ', and said nothing about why'}. Nothing more happens by itself until the cut is left.`;
+            }
+            if (stage === 'cut_policy' && note) text += ` ${note}.`;
+            bands.push([iso.verified === true ? 'isolated' : 'hole', text]);
+        } else if (stage === 'isolated') {
+            const n = Number(iso.fetches_in_flight) || 0;
+            bands.push(['isolated', `<strong>ISOLATED${since}.</strong> `
+                + `${escapeHtml(fwShort(iso.residual || 'Outbound is Block; Windows\' own outbound Allow rules are switched off.', 600))} `
+                + (n ? `<strong>${n} ${n === 1 ? 'fetch' : 'fetches'} running</strong>: one address each is open while it runs. ` : '')
+                + 'The way back: ISOLATED again, or scripts/tdc-unisolate.ps1 on the VM.']);
+            if (iso.allowed_out_error || (!still && 'allowed_out' in iso)) {
+                bands.push(['hole', `<strong>Whether ISOLATED is closed is not known.</strong> Which outbound Allow rules are still enabled could not be read`
+                    + `${iso.allowed_out_error ? ` (${escapeHtml(fwShort(iso.allowed_out_error, 300))})` : ''}, and each of them would still let traffic out.${again}`]);
+            } else if (still && still.length) {
+                bands.push(['hole', `<strong>Still let out despite ISOLATED: ${still.length} outbound Allow ${still.length === 1 ? 'rule' : 'rules'}.</strong> `
+                    + `${names(still)}. The default action does not stop what a rule allows; `
+                    + `a rule a group policy sets cannot be switched off from here, but a cut closes it: a Block rule beats every Allow rule.${again}`]);
+            } else if (still && iso.verified === true) {
+                bands.push(['isolated', 'Read back: no outbound Allow rule but TDC\'s own is enabled.']);
+            } else if (still) {
+                bands.push(['hole', '<strong>ISOLATED is not confirmed.</strong> No outbound Allow rule but TDC\'s own is enabled, but Block was not '
+                    + `read back in force on every profile, so whether outbound is shut is not known.${again}`]);
+            }
+        } else {
+            bands.push(['hole', `<strong>ISOLATED is on${since}, but nothing in force was read back.</strong> TDC's marker stands in stage `
+                + `${escapeHtml(fwShort(stage, 20))} (start-up may have found a firewall profile off), so whether outbound is shut is not known, `
+                + `and TDC cannot secure a sample while a cut rule may stand.${again}`]);
         }
     }
     for (const hole of Array.isArray(iso.fetch_paths_open) ? iso.fetch_paths_open : []) {
         bands.push(['hole', `<strong>A way out stands open.</strong> The rule ${escapeHtml(fwShort(hole && hole.rule_id, 80))} of a finished fetch would not go and still lets TDC's fetcher reach one address`
-            + `${hole && hole.problem ? `: ${escapeHtml(fwShort(hole.problem, 300).replace(/[.\s]+$/, ''))}` : ''}. TDC keeps trying to remove it; scripts/tdc-unisolate.ps1 removes it by hand.`]);
+            + `${hole && hole.problem ? `: ${escapeHtml(fwShort(hole.problem, 300).replace(/[.\s]+$/, ''))}` : ''}. TDC keeps trying to remove it; scripts/tdc-unisolate.ps1 removes it by hand.${again}`]);
     }
     if (iso.startup && iso.startup.announce && iso.startup.note) bands.push(['warn', `At start-up: ${escapeHtml(fwShort(iso.startup.note, 400))}`]);
     if (iso.settings_error) bands.push(['warn', `The firewall settings could not be read: ${escapeHtml(fwShort(iso.settings_error, 300))}`]);
@@ -14635,35 +14750,38 @@ async function fwUnblock(ruleId) {
     return true;
 }
 
+// The one place that switches, for the cut button and the ISOLATED switch alike: a press does what fwCutState says.
+// Cutting asks nothing (it only closes, and leaving works in seconds from any stage); leaving asks first.
 async function fwToggleIsolated() {
     if (fwIsoSwitching) return false;
-    const on = fwIsolatedOn();
-    if (!on) {
+    const st = fwCutState();
+    const cut = st.action === 'cut';
+    if (cut) {
         const off = fwEnforceOff();
         if (off) {
-            showToast('error', 'ISOLATED not switched on', off);
+            showToast('error', 'The network is not cut', off);
             return false;
         }
-        const ok = await tdcConfirm({ title: 'Cut the chamber off the network?', message: FW_ISOLATE_TEXT, confirmLabel: 'ISOLATE', danger: true });
-        if (!ok) return false;
     } else {
         const before = fwState.isolate && fwState.isolate.outbound_before ? fwShort(fwState.isolate.outbound_before, 20) : 'Allow';
-        const ok = await tdcConfirm({ title: 'Leave ISOLATED?', confirmLabel: 'LEAVE ISOLATED',
-            message: `Outbound connections go back to the default action that stood before (${before}), and the outbound Allow rules of Windows' own that ISOLATED switched off are switched on again. A sample still running can reach the network again.` });
+        const ok = await tdcConfirm({ title: 'Open the network again?', confirmLabel: 'LEAVE',
+            message: `Leaving ${st.label}: ${st.key === 'securing' ? 'the securing in the background stops at its next step, ' : ''}`
+                + `outbound connections go back to the default action that stood before (${before}), the outbound Allow rules of Windows' own `
+                + 'that ISOLATED switched off are switched on again and the cut rule is removed. A sample still running can reach the network again.' });
         if (!ok) return false;
     }
-    // Each step is a PowerShell call on the VM, seconds each: say that it is working, and keep a second click out
-    fwIsoSwitching = on ? 'off' : 'on';
+    // Each step is a PowerShell call on the VM: say that it is working, and keep a second click out
+    fwIsoSwitching = cut ? 'on' : 'off';
     renderFirewallHead();
-    showToast('info', on ? 'Leaving ISOLATED…' : 'Switching ISOLATED on…', FW_ISOLATE_WAIT);
+    showToast('info', cut ? 'Cutting the network…' : 'Leaving ISOLATED…', cut ? FW_CUT_WAIT : FW_ISOLATE_WAIT);
     let r;
     try {
-        r = await fwPost('/api/firewall/isolate', { on: !on });
+        r = await fwPost('/api/firewall/isolate', { on: cut });
     } finally {
         fwIsoSwitching = '';
     }
     if (!r.ok) {
-        showToast('error', on ? 'ISOLATED is still on' : 'ISOLATED is not on', r.error);
+        showToast('error', cut ? (st.on ? 'Not cut again' : 'The network is not cut') : 'ISOLATED is still on', r.error);
         await refreshFirewall();
         return false;
     }
@@ -14672,24 +14790,27 @@ async function fwToggleIsolated() {
     } else {
         fwIsoSeq += 1;
         fwSeq += 1;
-        fwState.isolated = !on;
+        fwState.isolated = cut;
     }
     const d = r.data || {};
     const shut = d.outbound_after && typeof d.outbound_after === 'object'
         ? Object.keys(d.outbound_after).filter(p => d.outbound_after[p] === 'Block') : [];
-    let detail, tone;
-    if (on) {
+    let detail, tone, title;
+    if (!cut) {
         // The server's own words first: it knows whether the egress stays shut and what would not switch on again
         detail = d.note ? String(d.note)
             : shut.length ? `Outbound stays Block on ${shut.join(', ')}.` : 'Outbound is back to the default action that stood before; Windows\' own rules ISOLATED switched off are on again.';
         tone = d.note || shut.length ? 'warning' : 'info';
+        title = 'ISOLATED is off';
     } else {
-        detail = d.note ? String(d.note)
-            : d.verified === true ? 'Outbound is Block and Windows\' own outbound Allow rules are off; the read back found nothing else let out but loopback.'
-                : 'Outbound is Block, but what still gets out could not be confirmed: see the band.';
+        // Only the read-back of the rule says the egress is shut; the securing behind it is the band's
+        detail = d.verified === true ? `${d.note ? `${d.note} ` : ''}One outbound Block rule for every program stands and was read back; `
+            + 'loopback stays open. Windows\' own Allow rules are switched off in the background, and TDC cannot secure a sample while the cut stands.'
+            : d.note ? String(d.note) : 'The cut rule was not read back, so whether outbound is shut is not known: see the band.';
         tone = d.verified === true ? 'warning' : 'error';
+        title = d.verified === true ? 'The network is cut' : 'The cut is not confirmed';
     }
-    showToast(tone, on ? 'ISOLATED is off' : (d.verified === true ? 'ISOLATED is on' : 'ISOLATED is on, not closed'), fwShort(detail, 600));
+    showToast(tone, title, fwShort(detail, 600));
     renderFirewallHead();
     renderFirewallBands();
     await refreshFirewall();
@@ -14757,7 +14878,7 @@ function onFirewallClick(event) {
     else if ((el = hit('[data-fw-range]'))) fwSetRange(el.getAttribute('data-fw-range'));
     else if ((el = hit('[data-fw-view]'))) fwSetView(el.getAttribute('data-fw-view'));
     else if (hit('[data-fw-live]')) fwToggleLive();
-    else if (hit('[data-fw-isolated]')) fwToggleIsolated();
+    else if (hit('[data-fw-isolated], [data-fw-cut]')) fwToggleIsolated();
     else if ((el = hit('[data-fw-decide]'))) {
         const row = target.closest('[data-fw-decision]');
         if (row) fwDecide(row.getAttribute('data-fw-decision'), el.getAttribute('data-fw-decide'));
