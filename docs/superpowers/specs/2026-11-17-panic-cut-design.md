@@ -353,10 +353,38 @@ Label darunter. Statt des Zählers in `.btn-skull-badge` trägt er den Zustand.
 | nicht isoliert | `CUT THE NETWORK` | schneidet, ohne Rückfrage |
 | `stage: cut`, Arbeiter läuft | `CUT · SECURING…` | **verlässt** (mit Rückfrage); der Arbeiter bricht ab |
 | `stage: cut`, Arbeiter gescheitert | `CUT · NOT SECURED` | verlässt; das Band sagt, was nicht durchkam |
+| `stage: cut`, **nicht bestätigt** | `CUT · NOT CONFIRMED` | **schneidet erneut** |
 | `stage: isolated` | `ISOLATED` | verlässt (mit Rückfrage) |
 | `stage: isolated`, `allowed_out` nicht mehr leer | `ISOLATED · OPEN` | schneidet erneut (ein Druck) |
+| `stage: isolated`, **nicht bestätigt** | `ISOLATED · NOT CONFIRMED` | schneidet erneut |
 | `stage: cut_policy` | `CUT · NO FETCH` | verlässt (mit Rückfrage) |
-| Firewall aus | `CUT THE NETWORK`, deaktiviert | nichts; der Grund im Titel |
+| Firewall aus | `CUT · FIREWALL OFF` bzw. `CUT THE NETWORK`, **immer deaktiviert** | nichts; der Grund im Titel, `LEAVE ISOLATED` im Aus-Band |
+
+**Ein Profil, dessen Firewall aus ist, macht jede Regel wirkungslos — also gilt
+der Zustand dort nie als geschlossen.** `verified` verlangt deshalb in *allen*
+Stufen, dass kein Profil aus ist, und der Knopf heißt dann
+`CUT · FIREWALL OFF`: ein Schnitt lässt sich dort nicht schreiben (`Cut` endet
+mit Code 3), also kann der Knopf nichts tun und ist deaktiviert — auch wenn TDC
+gerade isoliert. Sonst würde der Panikknopf in genau dieser Lage zu einem
+„Netzwerk wieder öffnen?"-Dialog, und ein reflexhaftes Ja im Ausbruch wirft
+Marker und Grundlinie weg. Damit der Zustand keine Falle ist, steht
+`LEAVE ISOLATED` neben `TURN THE FIREWALL ON` im Aus-Band.
+
+Das ist derselbe Befund wie beim Loopback-Block: eine Regel, die steht und
+zurückgelesen wird, aber nichts bewirkt, darf nicht „bestätigt" heißen.
+
+**Die Regel hinter der Tabelle, und sie entscheidet jeden Fall, den die Tabelle
+nicht nennt:** ist der Zustand **nicht bestätigt geschlossen**, schneidet der
+Druck (erneut) — ist er bestätigt geschlossen, verlässt er. Ein Panikdruck tut
+damit nie nichts. Die jeweils andere Handlung steht als Knopf im Band, wie
+`TURN THE FIREWALL ON` es schon vormacht: aus einem unbestätigten Zustand führt
+also ein `LEAVE ISOLATED` im Band hinaus, und man muss nicht erst verlassen, um
+wieder schneiden zu können.
+
+*Begründung:* `cut()` repariert eine verfälschte Regel, ein erneuter Druck ist
+also die wirksame Antwort auf „nicht bestätigt". Und wer in einem Ausbruch auf
+einen Knopf drückt, der `CUT · NOT CONFIRMED` sagt, will schneiden, nicht
+aufgeben.
 
 `aria-pressed` spiegelt den Zustand, `aria-live` meldet den Wechsel. Kein
 Pulsieren; `prefers-reduced-motion` wird respektiert wie im restlichen Tab. Der
@@ -364,6 +392,12 @@ Knopf ist nur in dem einen Fall deaktiviert, in dem er nichts tun *kann* (die
 Firewall ist aus) — nie, weil TDC gerade beschäftigt ist: ein Panikknopf, der
 vierzig Sekunden lang nicht loslässt, ist das Gegenteil von dem, wofür er da
 ist.
+
+**Die Karte bleibt im Blick.** Die rechte Spalte scrollt mit der Seite, und auf
+breiten Schirmen kann die Karte unter die Falz rutschen. Ein Panikknopf, den man
+erst suchen muss, ist keiner — die Karte klebt deshalb am oberen Rand ihrer
+Spalte (`position: sticky`), solange das mit dem vorhandenen Layout geht. Der
+Schalter in der Kopfzeile bleibt ohnehin immer sichtbar.
 
 **Ein Zustand, zwei Orte.** Der Knopf und `#firewall-isolated` in der Kopfzeile
 lesen beide `fwState.isolate` und rufen beide `fwToggleIsolated()`. Beide sind
