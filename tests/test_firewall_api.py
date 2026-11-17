@@ -1354,7 +1354,8 @@ def test_the_first_step_of_the_collector_thread_does_what_start_up_needs(fw, tdc
     fw.run.rules["TDC-FW-ISO-fetch-0123456789ab"] = fw.run.view(
         "TDC-FW-ISO-fetch-0123456789ab", Action="Allow", Program=tdc._fw_fetcher_paths()[0])
     tdc._fw_prepare()
-    assert tdc._fw_startup == {"isolated": False, "profiles_off": [], "announce": False, "note": None, "allowed_out": None}
+    assert tdc._fw_startup == {"isolated": False, "profiles_off": [], "announce": False, "note": None, "allowed_out": None,
+                               "stage": "open"}
     assert os.listdir(incoming) == []                            # no partial file in a Defender-excluded root
     assert fw.run.rules == {}                                    # no way out of ISOLATED left standing
     assert primed == [True]                                      # no fetch pays for that lookup itself

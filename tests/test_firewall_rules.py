@@ -930,7 +930,8 @@ def test_leaving_isolated_removes_a_per_fetch_rule_that_was_still_open():
 def test_startup_with_nothing_to_say_says_nothing():
     run, settings = FakeRun(), FakeSettings()
     state = rules_mod.startup_state(run, settings)
-    assert state == {"isolated": False, "profiles_off": [], "announce": False, "note": None, "allowed_out": None}
+    assert state == {"isolated": False, "profiles_off": [], "announce": False, "note": None, "allowed_out": None,
+                     "stage": "open"}
 
 
 def test_a_marker_over_an_open_egress_is_cleared_because_the_hatch_was_used():
@@ -967,6 +968,143 @@ def test_startup_that_cannot_read_the_firewall_keeps_the_marker_and_announces():
 def test_startup_reports_the_profiles_that_are_off():
     run = FakeRun(profiles={"Domain": True, "Private": False, "Public": False})
     assert rules_mod.startup_state(run, FakeSettings())["profiles_off"] == ["Private", "Public"]
+
+
+# ---- a restart finds the cut and does not tidy it away ----------------------------------------
+# A crash in stage ``cut`` leaves the cut rule standing and the default action not yet Block: the egress is shut by
+# the rule alone. A restart that took that for a stale marker would clear it and orphan a catch-all Block.
+
+
+def test_a_standing_cut_rule_is_enforcement_in_force_and_is_not_cleared():
+    run, settings = make(foreign=STOCK)
+    rules_mod.cut(run)
+    settings.set(isolated=True, outbound_before="Allow", stage="cut")
+    state = rules_mod.startup_state(run, settings)
+    assert state["isolated"] is True and state["stage"] == "cut"
+    assert settings.isolated is True                    # the marker is NOT cleared
+    assert rules_mod.CUT_RULE in run.rules              # and the rule is NOT removed
+    assert "cut" in state["note"].lower()
+    assert state["announce"] is True
+    assert run.writes() == []                           # no Allow rule switched on, nothing removed
+
+
+def test_a_marker_with_neither_block_nor_a_cut_rule_is_still_stale():
+    run, settings = make(foreign=STOCK)
+    settings.set(isolated=True, outbound_before="Allow", stage="cut")
+    state = rules_mod.startup_state(run, settings)
+    assert state["isolated"] is False and settings.isolated is False
+    assert state["stage"] == "open" and settings.stage == "open"
+
+
+def test_a_stale_marker_still_switches_back_on_what_it_switched_off():
+    run, settings = make(foreign={DNS_RULE: {**STOCK[DNS_RULE], "Enabled": False}})
+    settings.set(isolated=True, outbound_before="Allow", stage="cut", allow_disabled=[DNS_RULE])
+    state = rules_mod.startup_state(run, settings)
+    assert state["stage"] == "open" and run.foreign[DNS_RULE]["Enabled"] is True
+
+
+def test_a_cut_rule_without_a_marker_is_announced_and_left_alone():
+    run, settings = make(foreign=STOCK)
+    rules_mod.cut(run)
+    state = rules_mod.startup_state(run, settings)
+    assert state["announce"] is True and rules_mod.CUT_RULE in run.rules
+    assert "no ISOLATED marker" in state["note"] or "did not set" in state["note"]
+    assert state["isolated"] is False and state["stage"] == "open"
+    assert run.writes() == []
+
+
+def test_a_cut_rule_without_a_marker_keeps_the_rules_a_failed_leaving_left_off():
+    run, settings = make(foreign={DNS_RULE: {**STOCK[DNS_RULE], "Enabled": False}})
+    rules_mod.cut(run)
+    settings.set(allow_disabled=[DNS_RULE])
+    rules_mod.startup_state(run, settings)
+    assert run.foreign[DNS_RULE]["Enabled"] is False and settings.allow_disabled == [DNS_RULE]
+
+
+def test_the_converged_stage_is_found_again_after_a_restart():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    state = rules_mod.startup_state(run, settings)
+    assert state["stage"] == "isolated" and state["isolated"] is True
+    assert rules_mod.CUT_RULE not in run.rules
+
+
+def test_the_policy_stage_is_found_again_after_a_restart():
+    run, settings = make(foreign=POLICY_STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    state = rules_mod.startup_state(run, settings)
+    assert state["stage"] == "cut_policy" and state["isolated"] is True
+    assert rules_mod.CUT_RULE in run.rules and "Lab proxy out" in state["note"]
+
+
+def test_a_crash_after_block_but_before_the_cut_rule_fell_is_still_the_cut_stage():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    rules_mod.cut(run)                                   # the rule is back: the worker died before it was dropped
+    settings.set(stage="cut")
+    state = rules_mod.startup_state(run, settings)
+    assert state["isolated"] is True and state["stage"] == "cut" and rules_mod.CUT_RULE in run.rules
+
+
+def test_a_cut_rule_over_some_profiles_blocking_is_still_in_force():
+    run, settings = make(foreign=STOCK, outbound={"Domain": "Block", "Private": "Allow", "Public": "Allow"})
+    rules_mod.cut(run)
+    settings.set(isolated=True, outbound_before="Allow", stage="cut")
+    state = rules_mod.startup_state(run, settings)
+    assert state["isolated"] is True and state["stage"] == "cut" and settings.isolated is True
+    assert rules_mod.CUT_RULE in run.rules
+
+
+def test_a_cut_rule_does_not_shut_a_profile_whose_firewall_is_off_and_that_is_said():
+    run, settings = make(foreign=STOCK)
+    rules_mod.cut(run)
+    run.profiles["Public"] = False
+    settings.set(isolated=True, outbound_before="Allow", stage="cut")
+    state = rules_mod.startup_state(run, settings)
+    assert state["isolated"] is False and state["announce"] is True and state["profiles_off"] == ["Public"]
+    assert settings.isolated is True and rules_mod.CUT_RULE in run.rules      # not cleared, not removed
+    assert "Public" in state["note"] and run.writes() == []
+
+
+def test_a_cut_rule_that_cannot_be_read_is_not_taken_for_gone():
+    run, settings = make(foreign=STOCK, fail={"Get": (1, "denied")})
+    settings.set(isolated=True, outbound_before="Allow", stage="cut", allow_disabled=[DNS_RULE])
+    state = rules_mod.startup_state(run, settings)
+    assert state["isolated"] is True and state["announce"] is True and state["stage"] == "cut"
+    assert settings.isolated is True and settings.allow_disabled == [DNS_RULE]
+    assert run.writes() == []
+    assert "cut" in state["note"].lower() and "not known" in state["note"]
+
+
+def test_a_cut_rule_that_cannot_be_read_does_not_blur_a_default_that_is_in_force():
+    run, settings = make(foreign=STOCK, outbound="Block", fail={"Get": (1, "denied")})
+    settings.set(isolated=True, outbound_before="Allow", stage="isolated")
+    state = rules_mod.startup_state(run, settings)
+    assert state["isolated"] is True and state["stage"] == "isolated" and settings.isolated is True
+
+
+def test_a_stage_without_a_marker_is_not_a_stage():
+    run, settings = make(foreign=STOCK)
+    settings.set(stage="cut")
+    state = rules_mod.startup_state(run, settings)
+    assert state["stage"] == "open" and settings.stage == "open"
+    assert state["announce"] is False and run.writes() == []
+
+
+def test_a_stage_without_a_marker_that_cannot_be_forgotten_does_not_stop_start_up():
+    run, settings = make(foreign=STOCK)
+    settings.stage, settings.fail = "isolated", True
+    assert rules_mod.startup_state(run, settings)["stage"] == "open"
+
+
+def test_the_stage_of_a_marker_is_the_recorded_one_when_the_firewall_cannot_be_read():
+    run = FakeRun(fail={"Profiles": (1, "denied")})
+    settings = FakeSettings(isolated=True, outbound_before="Allow", stage="cut_policy")
+    assert rules_mod.startup_state(run, settings)["stage"] == "cut_policy"
+    assert rules_mod.startup_state(run, FakeSettings(stage="cut"))["stage"] == "open"
 
 
 # ---- kill -----------------------------------------------------------------------------------

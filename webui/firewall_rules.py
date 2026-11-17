@@ -1285,58 +1285,124 @@ def _not_isolating(run, settings) -> Dict[str, Any]:
             "cut_removed": cut_removed, "outbound_after": current, "allow_disabled": stuck, "note": _join(*parts)}
 
 
+STAGES = ("open", "cut", "isolated", "cut_policy")
+
+
+def _recorded_stage(settings, marker: bool) -> str:
+    """The stage the settings name, for a state that cannot be judged from the firewall. A stage without a marker is not
+    a stage; a marker with no stage saved means the press died after the marker and before the stage, and the press
+    writes the marker before it cuts, so the cut is the stage that is at least in question."""
+    if not marker:
+        return "open"
+    stage = getattr(settings, "stage", "open")
+    return stage if stage in STAGES and stage != "open" else "cut"
+
+
 def startup_state(run, settings) -> Dict[str, Any]:
     """What the firewall is like when the service starts: ``{"isolated", "profiles_off", "announce", "note",
-    "allowed_out"}``.
+    "allowed_out", "stage"}``.
 
-    ``settings.isolated`` (the marker) is the only authority for "TDC is isolating"; the profiles are only checked
-    against it. ``isolated`` is True when there is a marker **and** the default action is in force: Block on all
-    three profiles, all three on. Whatever is found here was not set in this session, so it is announced and **never
-    lifted**: a crash in the middle of a detonation must not open the egress.
+    ``settings.isolated`` (the marker) is the only authority for "TDC is isolating"; the firewall is only checked
+    against it. ``isolated`` is True when there is a marker **and** the enforcement is in force: all three profiles on
+    and either the default action Block on all three **or** ``CUT_RULE`` standing (a Block rule beats every Allow
+    rule). Whatever is found here was not set in this session, so it is announced and **never lifted**: a crash in the
+    middle of a detonation must not open the egress.
+
+    ``stage`` is what is found, not what was saved: ``cut`` when the cut rule stands and the thorough part has not
+    been reached (the default is not Block on every profile, or the rule was not dropped after it), ``cut_policy`` when
+    the default is Block and something still lets traffic out (the cut rule is what closes it when it stands),
+    ``isolated`` when the default is Block, nothing lets traffic out and the cut rule is gone, ``open`` when no
+    enforcement is in force. When the cut rule cannot be read, the recorded stage is given.
 
     - marker, in force: ``isolated``, announced; Windows' own outbound Allow rules that are still enabled are read
       back into ``allowed_out`` and named in ``note``, because the default action does not stop what they allow.
-    - marker, Block on some profiles only or a profile off: not isolated, announced, marker kept.
-    - marker, outbound plainly open (no profile on Block): stale, because ``scripts/tdc-unisolate.ps1`` was used or
-      the switch never happened. The rules ISOLATED switched off are switched on again and the marker is cleared
-      (bookkeeping: with the default on Allow neither opens anything) and it is announced.
-    - no marker, outbound shut anyway: not isolated, but announced: whoever shut it, the analyst must know.
+    - marker, the cut rule stands and the default is not (all) Block: **in force**, announced, nothing changed. This is
+      the state a crash in stage ``cut`` leaves, and clearing the marker as stale (the stale case below) would open the
+      Windows Allow rules again and leave a catch-all Block rule that nobody owns.
+    - marker, Block on some profiles only, or a profile off, and no cut rule: not isolated, announced, marker kept.
+    - marker, a profile off while the cut rule stands: not isolated (the rule does not apply there), announced, kept.
+    - marker, neither a Block default nor a cut rule: stale, because ``scripts/tdc-unisolate.ps1`` was used or the
+      switch never happened. The rules ISOLATED switched off are switched on again and the marker is cleared (with the
+      egress open, neither opens anything) and it is announced.
+    - marker, no Block default and the cut rule cannot be read: the marker is believed, announced, nothing changed.
+    - no marker, outbound shut anyway (a Block default or a standing cut rule): not isolated, but announced: whoever
+      shut it, the analyst must know. Nothing is changed, the Allow rules a failed leaving left off included.
     - no marker, outbound open, rules a failed leaving left off: switched on again; announced if any stays off.
+    - no marker, a stage saved: the stage is set back to ``open``; it never says anything without the marker.
     - cannot read the firewall: the marker is believed, announced.
     """
     marker = bool(settings.isolated)
+    if not marker and getattr(settings, "stage", "open") != "open":
+        try:
+            settings.set(stage="open")
+        except Exception:
+            pass                    # bookkeeping only: the answer below never reads the saved stage without a marker
     try:
         states = _profiles(run)
     except RuleError as e:
         return {"isolated": marker, "profiles_off": [], "announce": True, "allowed_out": None,
-                "note": f"the firewall could not be read: {_first_line(e)}"}
+                "stage": _recorded_stage(settings, marker), "note": f"the firewall could not be read: {_first_line(e)}"}
     off = _off_names(states)
     blocking = [s["name"] for s in states if s["outbound"] == "Block"]
-    in_force = marker and len(blocking) == len(PROFILE_NAMES) and not off
+    all_block = len(blocking) == len(PROFILE_NAMES)
+    cut = cut_stands(run)
+    cut_text = (f"{CUT_RULE} could not be read, so whether the egress is shut by it is not known; nothing was changed."
+                if cut is None else None)
+    in_force = marker and not off and (all_block or cut is True)
     leftover = _clean_rule_names(getattr(settings, "allow_disabled", None))
     note = None
     still = None
-    announce = marker or bool(blocking)
+    stage = "open"
+    isolated = in_force
+    announce = marker or bool(blocking) or cut is True
     if in_force:
-        still, error = _still_open(run)
-        note = _join("ISOLATED is on: the default outbound action is Block on every profile, and the outbound Allow rules "
-                     "of Windows' own that ISOLATED switched off stay off; loopback, and TDC's own fetch to one address "
-                     "for the seconds that fetch takes, are let out.",
-                     open_text(still, error) or "The read back found no other outbound Allow rule enabled.")
-    elif marker and blocking:
-        note = (f"ISOLATED is marked, but outbound is blocked on {', '.join(blocking)} only"
-                + (f" and the firewall is off for {', '.join(off)}" if off else "") + ": this is not a working isolation.")
+        if all_block:
+            still, error = _still_open(run)
+            note = _join("ISOLATED is on: the default outbound action is Block on every profile, and the outbound Allow "
+                         "rules of Windows' own that ISOLATED switched off stay off; loopback, and TDC's own fetch to one "
+                         "address for the seconds that fetch takes, are let out.",
+                         f"{CUT_RULE} stands as well and shuts the egress by itself." if cut else None,
+                         open_text(still, error) or "The read back found no other outbound Allow rule enabled.", cut_text)
+            if cut is None:
+                stage = _recorded_stage(settings, marker)
+            elif cut:
+                stage = "cut" if still == [] else "cut_policy"
+            else:
+                stage = "isolated" if still == [] else "cut_policy"
+        else:
+            stage = "cut"
+            note = (f"ISOLATED is on, from the cut: {CUT_RULE} stands and shuts the egress (a Block rule beats every Allow "
+                    "rule), but the default outbound action is not Block on every profile yet, so the thorough part did "
+                    "not finish and Windows' own outbound Allow rules may still be enabled. Nothing was changed; leaving "
+                    "ISOLATED puts back what was switched off.")
+    elif marker and cut is None and not blocking:
+        isolated, stage = True, _recorded_stage(settings, marker)
+        note = _join("ISOLATED is marked and the default outbound action is not Block, so the egress is shut only if the cut "
+                     "rule stands.", cut_text)
+    elif marker and (blocking or cut is True):
+        if blocking:
+            note = (f"ISOLATED is marked, but outbound is blocked on {', '.join(blocking)} only"
+                    + (f" and the firewall is off for {', '.join(off)}" if off else "") + ": this is not a working isolation.")
+            if cut:
+                note = _join(note, f"{CUT_RULE} stands, but it does not apply where the firewall is off.")
+        else:
+            note = (f"ISOLATED is marked and {CUT_RULE} stands, but the firewall is off for {', '.join(off)}, where the "
+                    "rule does not apply: this is not a working isolation.")
     elif marker:
         stuck, problem = _reopen(run, leftover)
         try:
-            _forget(settings, stuck)
+            _forget(settings, stuck, stage="open")
             note = _join("A stale ISOLATED marker was cleared: outbound is open (was scripts/tdc-unisolate.ps1 run?).",
                          _stuck_text(stuck, problem) if stuck else None)
         except Exception as e:
             note = f"The ISOLATED marker is stale but could not be cleared: {_first_line(e)}"
-    elif blocking:
-        note = (f"Outbound is blocked on {', '.join(blocking)}, but TDC did not set it (there is no ISOLATED marker). "
-                f"Nothing was changed; {UNISOLATE_SCRIPT} opens it.")
+    elif blocking or cut is True:
+        note = _join(f"Outbound is blocked on {', '.join(blocking)}, but TDC did not set it (there is no ISOLATED marker)."
+                     if blocking else None,
+                     f"{CUT_RULE} stands as well and shuts the egress." if blocking and cut else
+                     f"{CUT_RULE} stands and shuts the egress, but TDC did not set it (there is no ISOLATED marker)."
+                     if cut else None,
+                     f"Nothing was changed; {UNISOLATE_SCRIPT} opens it.")
     elif leftover:
         stuck, problem = _reopen(run, leftover)
         try:
@@ -1345,4 +1411,5 @@ def startup_state(run, settings) -> Dict[str, Any]:
             pass
         if stuck:
             note, announce = _stuck_text(stuck, problem), True
-    return {"isolated": in_force, "profiles_off": off, "announce": announce, "note": note, "allowed_out": still}
+    return {"isolated": isolated, "profiles_off": off, "announce": announce, "note": note, "allowed_out": still,
+            "stage": stage}
