@@ -2045,3 +2045,44 @@ def test_leaving_after_a_failed_converge_switches_the_recorded_rules_back_on_and
     left = rules_mod.isolate(run, False, settings=settings)
     assert run.enabled_foreign() == ["CoreNet-DHCP-Out", DNS_RULE] and left["allow_disabled"] == []
     assert run.rules == {} and settings.isolated is False and set(run.outbound.values()) == {"Allow"}
+
+
+def test_a_cancel_before_the_cut_rule_is_read_back_in_the_policy_stage_stops_there():
+    run, settings = make(foreign={**STOCK, **GPO_RULE})
+    rules_mod.isolate(run, True, settings=settings)
+    answers = iter([False, False, False, False, True])     # read, off, Block, the read back; then the cut rule's own read
+    done = rules_mod.converge(run, settings=settings, cancelled=lambda: next(answers))
+    assert done["cancelled"] is True and done["stage"] == "cut" and rules_mod.CUT_RULE in run.rules
+    assert run.ops()[-1] == "AllowOut" and "Get" not in run.ops()          # no call after the cancel
+    assert settings.stage == "cut"
+
+
+def test_a_callback_that_raises_is_not_taken_for_a_failed_read():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    run.calls.clear()
+
+    def broken():
+        raise RuntimeError("callback bug")
+    with pytest.raises(RuntimeError, match="callback bug"):
+        rules_mod.converge(run, settings=settings, cancelled=broken)
+    assert run.ops() == [] and run.enabled_foreign() == ["CoreNet-DHCP-Out", DNS_RULE]
+
+
+def test_a_failed_fresh_cut_keeps_the_record_an_earlier_failed_leave_left():
+    run, settings = make(foreign=STOCK, fail={"Cut": (1, "access is denied")})
+    settings.allow_disabled = [DNS_RULE]                  # a rule an earlier leave could not switch on again
+    with pytest.raises(rules_mod.RuleError):
+        rules_mod.isolate(run, True, settings=settings)
+    assert settings.isolated is False and settings.allow_disabled == [DNS_RULE] and settings.stage == "open"
+
+
+def test_converging_again_after_a_failed_converge_finishes_the_job_and_records_nothing_twice():
+    run, settings = make(foreign=STOCK, fail_once={"SetDefaultOutbound": (1, "denied")})
+    rules_mod.isolate(run, True, settings=settings)
+    first = rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    assert first["stage"] == "cut" and sorted(settings.allow_disabled) == ["CoreNet-DHCP-Out", DNS_RULE]
+    second = rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    assert second["stage"] == "isolated" and second["verified"] is True and rules_mod.CUT_RULE not in run.rules
+    assert sorted(settings.allow_disabled) == ["CoreNet-DHCP-Out", DNS_RULE] and set(run.outbound.values()) == {"Block"}
+    assert settings.stage == "isolated"

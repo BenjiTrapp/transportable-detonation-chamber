@@ -32,7 +32,9 @@ governs only the traffic that **no rule matches**, and Windows ships enabled out
 Networking's DNS among them), so ISOLATED also switches off every enabled local outbound Allow rule that is not
 TDC's and remembers exactly which (``Settings.allow_disabled``); leaving switches exactly those on again. A rule
 from another store, a group policy above all, cannot be switched off locally: what is still enabled is read back
-after the switch (``allowed_out``) and said, and ISOLATED is ``verified`` only when that list is empty. The order is:
+after the switch (``allowed_out``) and said. ``verified`` means that the cut rule (below) was read back: that rule shuts
+the egress whether or not the list could be read. An unreadable or non-empty list only keeps the cut rule standing
+(``cut_policy``); it is dropped, and the state is the plain ISOLATED, only when the list was read and is empty. The order is:
 profiles read and checked, the previous ``DefaultOutboundAction`` and the marker saved in ``Settings`` *before*
 anything changes, then the cut (``isolate``, below); after it ``converge``: Windows' rules read, their names saved,
 they are switched off, then Block, then read back, then the cut rule removed. Leaving goes backwards and is never refused for
@@ -843,8 +845,9 @@ def _remove_isolate_rules(run) -> None:
         raise RuleError(f"{', '.join(str(s) for s in still)} is still there after it was removed")
 
 
-def _forget(settings, stuck=()) -> None:
-    settings.set(isolated=False, outbound_before=None, isolated_since=None, allow_disabled=list(stuck))
+def _forget(settings, stuck=(), **also: Any) -> None:
+    """Forget the marker and the memory in one write; ``stuck`` stays recorded, ``also`` is written with them."""
+    settings.set(isolated=False, outbound_before=None, isolated_since=None, allow_disabled=list(stuck), **also)
 
 
 # ---- Windows' own outbound Allow rules -------------------------------------------------------
@@ -1105,8 +1108,9 @@ def converge(run, *, settings, cancelled: Callable[[], bool]) -> Dict[str, Any]:
     No marker, no work: when ``settings.isolated`` is False (a leave came first) it changes nothing and says so
     (``refused``), because a worker that outlived a leave would switch off again the very rules the leave switched on.
 
-    ``cancelled`` is asked before **every** call, and the work stops at the next one when it says True: ``{"cancelled":
-    True, "stage": "cut"}``. The cut rule is still standing then, so the egress is shut; what was switched off stays
+    ``cancelled`` is asked before **every** PowerShell step (the read of the rules, their switching off, Block, the read
+    back, the read of the cut rule, its removal), and the work stops at the next one when it says True: ``{"cancelled":
+    True, "stage": "cut"}``. An exception from ``cancelled`` itself is not caught: it is the caller's bug, not a failed step. The cut rule is still standing then, so the egress is shut; what was switched off stays
     recorded in ``settings.allow_disabled``, and leaving puts it back. The cut rule falls last, after the default is Block
     and the rules are off, so that at no moment is anything open. When something is still enabled that cannot be switched
     off from here (a group policy), the cut rule **stays**: it is the only thing that closes the egress there
@@ -1131,9 +1135,9 @@ def _converge(run, settings, cancelled: Callable[[], bool]) -> Dict[str, Any]:
 
     if not settings.isolated:
         return result("open", "ISOLATED is not on (there is no marker), so nothing was changed.", refused=True)
+    if cancelled():
+        return result("cut", "Cancelled before anything was read; the cut stands.", stopped=True)
     try:
-        if cancelled():
-            return result("cut", "Cancelled before anything was read; the cut stands.", stopped=True)
         _, foreign = _allow_out_state(run)
     except Exception as e:
         return result("cut", f"Windows' own outbound Allow rules could not be read, so none was switched off ({_first_line(e)}); "
@@ -1170,6 +1174,9 @@ def _converge(run, settings, cancelled: Callable[[], bool]) -> Dict[str, Any]:
                           still=still)
         stage, verified, note = "isolated", True, None
     else:
+        if cancelled():
+            return result("cut", "Cancelled before the cut rule was read back; the cut stands.", still=still, error=error,
+                          stopped=True)
         stands = cut_stands(run)
         stage, verified = "cut_policy", stands is True
         if stands:
@@ -1194,7 +1201,7 @@ def _roll_back(run, settings, recorded: List[str], cause: BaseException) -> None
     the state is not known and a marker is what makes the next start announce it."""
     try:
         _remove_isolate_rules(run)
-        settings.set(isolated=False, outbound_before=None, isolated_since=None, allow_disabled=list(recorded), stage="open")
+        _forget(settings, recorded, stage="open")
     except Exception as e:
         raise RuleError(f"isolating failed ({_first_line(cause)}) and could not be undone ({_first_line(e)}); the egress "
                         f"may be shut. Run {UNISOLATE_SCRIPT} on the VM to open it.") from e
