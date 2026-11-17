@@ -11901,15 +11901,23 @@ def _fw_address_wide_block(finding, force=False):
     ``force`` reads the rules fresh: what enforces (a decision's refusal, the deadline) passes it; only the poll
     path's ``can_fetch`` takes the cache."""
     found, _ = _fw_rules(force=force)
+    return _fw_address_wide_in(found, finding)
+
+
+def _fw_address_wide_in(found, finding):
+    """Whether the rule list ``found`` holds a block for every program on the finding's endpoint."""
     keys = _fw_rule_keys(found)
     ip = finding.get("dst_ip") or ""
     return any(firewall.rule_key("", ip, port) in keys for port in (None, finding.get("dst_port")))
 
 
+# Why TDC's fetch cannot go (what a settled decision's note keeps), and what to do about it (only for the live refusal
+# of a decision that is still open: advice written into the record of a settled one would be stale)
 _FW_NO_FETCH_CUT = ("The cut stands: one Block rule for every program beats every Allow rule, so no exception lets "
-                    "TDC's own fetch out. Leave the cut first to secure a sample, or choose block only.")
-_FW_NO_FETCH_WIDE = ("A block for every program stands on that endpoint, so TDC's own fetch would be cut off. "
-                     "Remove it, or choose block only.")
+                    "TDC's own fetch out.")
+_FW_NO_FETCH_WIDE = "A block for every program stands on that endpoint, so TDC's own fetch would be cut off."
+_FW_ADVICE_CUT = "Leave the cut first to secure a sample, or choose block only."
+_FW_ADVICE_WIDE = "Remove it, or choose block only."
 
 
 class _FwFetchRefused(Exception):
@@ -11922,15 +11930,21 @@ def _fw_fetch_refusal(finding):
     The cut (stage ``cut``/``cut_policy``, a press under way, or a cut rule a crash left behind) comes first: a
     Block rule for every program beats every Allow rule, the per-fetch exception included. Then a block for
     every program on the endpoint. What enforces reads the rules fresh; an unreadable list refuses nothing here
-    (the poll's ``can_fetch`` is None then, and says it does not know)."""
+    (the poll's ``can_fetch`` is None then, and says it does not know). The reason only: the live refusal adds the
+    advice (``_fw_refusal_text``)."""
     if _fw_cut_may_stand():
         return _FW_NO_FETCH_CUT
     found, _ = _fw_rules(force=True)
     if any(r.get("name") == firewall_rules.CUT_RULE for r in found or ()):
         return _FW_NO_FETCH_CUT
-    if _fw_address_wide_block(finding):
+    if _fw_address_wide_in(found, finding):
         return _FW_NO_FETCH_WIDE
     return None
+
+
+def _fw_refusal_text(reason):
+    """The 409 of a decision that is still open: the reason and what to do about it."""
+    return f"{reason} {_FW_ADVICE_CUT if reason == _FW_NO_FETCH_CUT else _FW_ADVICE_WIDE}"
 
 
 def _fw_decide(item_id, action, by, note=None):
@@ -11941,8 +11955,10 @@ def _fw_decide(item_id, action, by, note=None):
     firewall goes to LOGS, because a deadline's decision passes through no route. ``note`` is why a decision is
     not the one that was wanted (the deadline's block where the fetch could not go), kept in its result.
 
-    ``block_fetch`` while a cut may stand raises ``_FwFetchRefused`` and settles nothing: the routes check this
-    first, but a press can land between their check and this lock, and a fetch must not start behind it."""
+    ``block_fetch`` while a cut may stand raises ``_FwFetchRefused`` and settles nothing. The routes check first;
+    this catches a press that landed before this check (``_fw_pressing`` is raised under another lock, so one
+    that lands after it is not caught here: ``_fw_fetch_item`` looks again when the fetch starts, and says the
+    cut is why when it stands then)."""
     with _fw_decision_lock:
         before = _fw_pending.get(item_id)
         if before is None:
@@ -11983,7 +11999,8 @@ def _fw_fetch_item(item_id, by="tdc"):
         item = _fw_pending.get(item_id)
         if item is None:
             return
-        out = _fetch_capture(item["finding"], by)
+        # a press can land between the decision and this job: say the cut is why, not a timeout of a fetch it cut off
+        out = {"error": _FW_NO_FETCH_CUT} if _fw_cut_may_stand() else _fetch_capture(item["finding"], by)
         summary = ({"error": out["error"]} if out.get("error") else
                    {"capture_id": out["id"], "sha256": out["sha256"], "size": out["size"], "magic": out["magic"]})
         if _fw_pending.set_result(item_id, {"fetch": summary}) is None:
@@ -12073,11 +12090,13 @@ def _fw_decide_at_deadline(item):
     was not secured is never reported as one.
 
     A write of the block waits behind a running convergence (``firewall_rules`` holds its lock across all of it,
-    tens of seconds), and this runs in the collector's thread: while the cut is being converged a deadline can hold
-    up a tick. That is left as it is. Raising the cancel flag from here would stop the analyst's cut midway, and a
-    block the sweep gave up on would be a deadline that did nothing. What stands meanwhile is honest: the decision
-    is settled as ``block`` with no ``block`` in its result until the rule is written, which the tab shows as
-    "not set yet"; a write that fails is recorded as the failure it is."""
+    tens of seconds), and this runs in the collector's thread, so a deadline can hold up a tick. It is the only
+    part of a cut-stage deadline that waits, and a deadline shortly after a press nearly always meets the
+    convergence that follows the press: this is the common case in the cut, not a corner. It is left as it is.
+    Raising the cancel flag from here would stop the analyst's cut midway, and a block the sweep gave up on would
+    be a deadline that did nothing. What stands meanwhile is honest: the decision is settled as ``block`` and its
+    result still holds the ``block`` written when the decision was opened (the same per-program rule key), which
+    the tab keeps showing until this write replaces it; a write that fails is recorded as the failure it is."""
     reason = _fw_fetch_refusal(item["finding"])
     if reason is None:
         try:
@@ -12670,13 +12689,13 @@ def api_firewall_decide():
     if item["action"] is None and action == "block_fetch":
         reason = _fw_fetch_refusal(item["finding"])
         if reason:
-            return _fw_error(reason, 409)
+            return _fw_error(_fw_refusal_text(reason), 409)
     try:
         item, won = _fw_decide(item_id, action, "analyst")
     except KeyError:
         return _fw_error("No such decision; it may be older than 24 hours.", 404)
     except _FwFetchRefused as e:
-        return _fw_error(str(e), 409)
+        return _fw_error(_fw_refusal_text(str(e)), 409)
     return _fw_json({"id": item_id, "action": item["action"], "won": won, "item": _fw_item_view(item, time.time())})
 
 

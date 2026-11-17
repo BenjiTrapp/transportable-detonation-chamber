@@ -1337,8 +1337,10 @@ is not offered, the route refuses `block_fetch` with 409 and says to leave the
 cut first, and a deadline only blocks. It writes no capture and records in the
 decision why it could not secure the file (`result.note`; DECISIONS shows
 "could not fetch"). Writing that block waits behind a running convergence of
-ISOLATED (tens of seconds), which can hold up a collector tick; it is not
-skipped, and until it is written the decision shows no block. The deadline runs
+ISOLATED (tens of seconds), which can hold up a collector tick (a deadline
+shortly after a press nearly always meets that convergence, so this is the
+common case in the cut); it is not skipped, and until the write replaces it the
+decision keeps showing the block written when it was opened (the same rule). The deadline runs
 on the server, so closing the page changes nothing, and what was decided while
 nobody watched stays as a toast until it is closed. DECISIONS lists the open decisions and
 those of the last 24 h: who took which, and when. `POST /api/firewall/decide`

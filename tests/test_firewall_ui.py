@@ -2561,7 +2561,9 @@ def test_the_cut_card_stays_in_view_while_its_column_scrolls():
 # --- What a cut stage no longer claims (Task 7) ----------------------------------------------
 
 CUT_NOTE = ("TDC could not secure the file: The cut stands: one Block rule for every program beats every Allow rule, "
-            "so no exception lets TDC's own fetch out. Leave the cut first to secure a sample, or choose block only.")
+            "so no exception lets TDC's own fetch out.")
+CUT_REFUSAL = ("The cut stands: one Block rule for every program beats every Allow rule, so no exception lets TDC's own "
+               "fetch out. Leave the cut first to secure a sample, or choose block only.")
 
 
 @needs_node
@@ -2608,7 +2610,7 @@ def test_a_refused_fetch_in_the_cut_is_shown_with_the_server_reason_and_keeps_th
         answer = (url, init) => reply(init && init.method === 'POST' ? { error: %s } : {}, init && init.method === 'POST' ? 409 : 200);
         fwApplyPending(answerOf({ pending: [pitem()] }));
         const ok = await fwDecide('dl-000000000001', 'block_fetch');
-        console.log(JSON.stringify({ ok, out: stack() }));""" % json.dumps(CUT_NOTE.split(": ", 1)[1]))
+        console.log(JSON.stringify({ ok, out: stack() }));""" % json.dumps(CUT_REFUSAL))
     assert out["ok"] is False and "Leave the cut first" in out["out"] and "still open" in out["out"]
     assert _toast_buttons(out["out"]) == {"block": False, "allow": False}
 
@@ -2621,7 +2623,7 @@ def test_a_deadline_that_could_not_fetch_says_so_in_its_result_and_never_claims_
         fwApplyPending(answerOf({ history: [item] }));
         fwDecisions.set(item.id, { kind: 'decision', phase: 'done', item, doneAt: now, until: null });
         console.log(JSON.stringify(fwDecisionHtml(fwDecisions.get(item.id), '')));""" % json.dumps(CUT_NOTE))
-    assert "could not secure" in out and "Leave the cut first" in out and "Secured" not in out and "fetching" not in out.lower()
+    assert "could not secure" in out and "cut stands" in out and "Secured" not in out and "fetching" not in out.lower()
     assert "The block stands; nothing was fetched." in out
 
 
@@ -2650,7 +2652,7 @@ def test_decisions_says_why_no_sample_was_secured():
         const row = id => view.slice(view.indexOf('data-fw-decision="' + id + '"')).split('</tr>')[0];
         console.log(JSON.stringify({ noted: row('dl-000000000001'), plain: row('dl-000000000002') }));""" % json.dumps(CUT_NOTE))
     cell = re.search(r'<td class="fw-dec-fetch">(.*?)</td>', r["noted"]).group(1)
-    assert "could not fetch" in cell and "Leave the cut first" in cell          # the reason is in the title
+    assert "could not fetch" in cell and "cut stands" in cell          # the reason is in the title
     assert "SECURED SAMPLES" not in cell and "—" not in cell
     assert '<td class="fw-dec-fetch"><span class="fw-dec-none">—</span></td>' in r["plain"]   # no note, no claim
 

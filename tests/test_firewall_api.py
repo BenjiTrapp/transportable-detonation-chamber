@@ -426,6 +426,58 @@ def test_a_cut_that_lands_between_the_check_and_the_decision_still_fetches_nothi
     assert [i["id"] for i in fw.pending.open()] == [pid] and fw.fetches == [] and fw.run.writes() == []
 
 
+def test_the_route_turns_a_press_that_beat_the_decision_into_409_and_keeps_the_id(client, fw, tdc, monkeypatch):
+    monkeypatch.setattr(tdc, "_fw_fetch_refusal", lambda finding: None)       # the route's own check saw nothing yet
+    pid = fw.pending.add(FINDING, deadline=time.time() + 30)["id"]
+    tdc._fw_pressing = 1                                      # and then the press landed
+    r = client.post("/api/firewall/decide", json={"id": pid, "action": "block_fetch"})
+    assert r.status_code == 409 and "cut" in r.json["error"].lower() and "choose block only" in r.json["error"]
+    assert [i["id"] for i in fw.pending.open()] == [pid] and fw.fetches == [] and fw.run.writes() == []
+
+
+def test_a_deadline_that_a_press_beat_falls_back_to_a_block_with_the_cut_as_its_reason(client, fw, tdc, monkeypatch):
+    monkeypatch.setattr(tdc, "_fw_fetch_refusal", lambda finding: None)       # the sweep's check saw no cut
+    fw.pending.add(FINDING, deadline=time.time() - 1)
+    tdc._fw_pressing = 1                                      # the press landed before the decision
+    sweep(tdc)
+    settled = fw.pending.history(1)[0]
+    assert settled["action"] == "block" and settled["result"]["by"] == "deadline"
+    assert "could not secure" in settled["result"]["note"] and "cut stands" in settled["result"]["note"]
+    assert "fetch" not in settled["result"] and fw.fetches == [] and fw.pending.open() == []
+
+
+def test_a_fetch_that_starts_behind_a_press_says_the_cut_is_why_and_goes_nowhere(client, fw, tdc, monkeypatch):
+    queued = []
+
+    class Deferred:
+        def submit(self, fn, *args):
+            queued.append((fn, args))
+
+    monkeypatch.setattr(tdc, "_fw_executor", Deferred())                       # the job waits for its turn
+    pid = fw.pending.add(FINDING, deadline=time.time() + 30)["id"]
+    assert client.post("/api/firewall/decide", json={"id": pid, "action": "block_fetch"}).status_code == 200
+    tdc._fw_pressing = 1                                      # the press landed after the decision, before the job ran
+    for fn, args in queued:
+        fn(*args)
+    fetch = fw.pending.get(pid)["result"]["fetch"]
+    assert fetch == {"error": tdc._FW_NO_FETCH_CUT} and fw.fetches == []
+    assert client.get("/api/firewall/captures").json["captures"] == []
+
+
+def test_the_note_of_a_settled_decision_is_the_reason_without_the_advice_for_an_open_one(client, fw, tdc):
+    _cut(client)
+    fw.pending.add(FINDING, deadline=time.time() - 1)
+    sweep(tdc)
+    note = fw.pending.history(1)[0]["result"]["note"]
+    assert "cut stands" in note and "choose block only" not in note and "Leave the cut first" not in note
+    client.post("/api/firewall/isolate", json={"on": False})
+    client.post("/api/firewall/block", json={"scope": "endpoint_all", "ip": "203.0.113.50"})
+    fw.pending.add({**FINDING, "id": "dl-wide"}, deadline=time.time() - 1)
+    sweep(tdc)
+    note = fw.pending.get("dl-wide")["result"]["note"]
+    assert "every program" in note and "choose block only" not in note and "Remove it" not in note
+
+
 def test_a_deadline_in_the_cut_stage_blocks_and_says_it_could_not_fetch(client, fw, tdc):
     _cut(client)
     fw.pending.add(FINDING, deadline=time.time() - 1)
