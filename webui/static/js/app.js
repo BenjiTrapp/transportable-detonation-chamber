@@ -14463,7 +14463,9 @@ function renderFirewallBands() {
             const note = iso.converge_note ? escapeHtml(fwShort(iso.converge_note, 600).replace(/[.\s]+$/, '')) : '';
             let text = iso.verified === true
                 ? `<strong>CUT${since}.</strong> One outbound Block rule for every program stands and was read back; a Block rule beats every Allow rule, and loopback stays open. `
-                : `<strong>CUT${since}, not confirmed.</strong> The catch-all Block rule was not read back, so whether outbound is shut is not known. `;
+                : `<strong>CUT${since}, not confirmed.</strong> ${Array.isArray(iso.profiles_off)
+                    ? 'The catch-all Block rule was not read back, so whether outbound is shut is not known. '
+                    : 'The firewall profiles could not be read, so whether the catch-all Block rule is in force, and outbound shut, is not known. '}`;
             text += '<strong>TDC cannot secure a sample in this state</strong>: no fetch gets through a catch-all Block rule. ';
             if (stage === 'cut_policy') {
                 text += 'The rule stays, because something that lets traffic out cannot be switched off from here (a rule a group policy sets)'
@@ -15132,7 +15134,7 @@ function fwAbsenceText(items, sinceUnknown) {
     if (secured) parts.push(`${count(secured, 'sample', 'samples')} secured`);
     if (failed) parts.push(`${count(failed, 'fetch', 'fetches')} failed`);
     if (running) parts.push(`${count(running, 'fetch', 'fetches')} still running`);
-    if (cut) parts.push(`${cut} cut without a fetch (a block for every program stood)`);
+    if (cut) parts.push(`${cut} cut without a fetch: TDC could not secure the file (the cut, or a block for every program on the address, stood)`);
     if (dropped) parts.push(`${count(dropped, 'decision', 'decisions')} dropped, too many were open (still blocked)`);
     return { title, detail: `${parts.join('; ')}${sinceUnknown ? ' (in the last 24 h)' : ''}. DECISIONS in the FIREWALL tab lists every one, the samples are under SECURED SAMPLES.` };
 }
@@ -15250,19 +15252,36 @@ function fwApplyPending(data, sent) {
     return true;
 }
 
-// Whether TDC could fetch an open decision's file: the server says it (can_fetch, false while a block for every
-// program stands on the address), and a refused CUT + FETCH (409) says it too. null: the server could not tell
+// Whether TDC could fetch an open decision's file: the server says it (can_fetch, false while the cut stands or a
+// block for every program stands on the address), and a refused CUT + FETCH (409) says it too. null: the server could not tell
 function fwDecisionCanFetch(entry) {
     if (entry.noFetch || (entry.item && entry.item.can_fetch === false)) return false;
     return entry.item && entry.item.can_fetch === null ? null : true;
 }
 
+// Why TDC cannot fetch, as far as the state says: 'cut' (its can_fetch is false for any address: the cut stands, and
+// no Allow exception gets through a catch-all Block rule), 'address' (the state says a fetch could go, so a block for
+// every program on this address is what cuts it), or 'either' (the state is not known: neither is claimed)
+function fwNoFetchWhy(iso = fwState.isolate) {
+    return iso && iso.can_fetch === false ? 'cut' : iso && iso.can_fetch === true ? 'address' : 'either';
+}
+
+const FW_NO_FETCH_TEXT = {
+    cut: ['the cut stands, and a Block rule for every program beats every Allow rule, so no exception lets TDC\'s fetch out',
+        'This keeps it cut. To secure a sample, leave ISOLATED first (the big button, or LEAVE ISOLATED in the band).'],
+    address: ['a block for every program stands on this address',
+        'This keeps it cut. Remove that block in the FIREWALL tab to let TDC fetch.'],
+    either: ['either the cut stands or a block for every program stands on this address',
+        'This keeps it cut. To let TDC fetch, leave the cut and remove any block for every program on this address.'],
+};
+
 // The answers a decision offers: without a fetch, the primary one says it only cuts, and why
 function fwDecisionChoices(entry) {
     if (fwDecisionCanFetch(entry) !== false) return FW_DECIDE_ACTIONS;
     const allow = FW_DECIDE_ACTIONS.find(c => c.action === 'allow');
+    const [why, what] = FW_NO_FETCH_TEXT[fwNoFetchWhy()];
     return [{ action: 'block', label: 'CUT — NO FETCH', primary: true,
-        title: 'TDC cannot fetch this file: a block for every program stands on this address, and it cuts TDC\'s own fetch as well. This keeps it cut; remove that block in the FIREWALL tab to let TDC fetch.' }, allow];
+        title: `TDC cannot fetch this file: ${why}. It cuts TDC's own fetch as well. ${what}` }, allow];
 }
 
 // What a toast says: {tone, title, lines (markup, every value escaped), actions, clock, close, away}
@@ -15288,7 +15307,7 @@ function fwDecisionView(entry) {
     const confirmed = !!(block && block.verified);
     const canFetch = fwDecisionCanFetch(entry);
     const keep = confirmed ? 'TDC keeps it cut' : 'TDC blocks it';
-    const what = canFetch === false ? `${keep}; it cannot fetch the file while a block for every program stands on this address`
+    const what = canFetch === false ? `${keep}; it cannot fetch the file: ${FW_NO_FETCH_TEXT[fwNoFetchWhy()][0]}`
         : `${keep} and fetches the file itself${canFetch === null ? ' (unless a block for every program stands on this address: TDC could not read its rules)' : ''}`;
     if (entry.phase === 'due') {
         tone = 'due';
@@ -15328,6 +15347,7 @@ function fwDecisionOutcome(entry, item, result, block) {
             tone = 'fail';
             lines.push(`<strong>The block is not confirmed:</strong> ${escapeHtml(fwShort((block && (block.problem || block.error)) || 'no rule was read back', 300))}.`);
         }
+        if (action === 'block' && result.note) lines.push(`<strong>No sample secured.</strong> ${escapeHtml(fwShort(result.note, 400))}`);
         if (action === 'block_fetch') {
             const fetch = result.fetch && typeof result.fetch === 'object' ? result.fetch : null;
             if (!fetch) {
@@ -15681,6 +15701,9 @@ function fwDecisionBlockCell(item) {
 function fwDecisionFetchCell(item) {
     const result = item.result && typeof item.result === 'object' ? item.result : {};
     const fetch = result.fetch && typeof result.fetch === 'object' ? result.fetch : null;
+    if (item.action === 'block' && result.note) {
+        return `<span class="fw-dec-fail" title="${escapeHtml(fwShort(result.note, 500))}">could not fetch</span>`;
+    }
     if (item.action !== 'block_fetch') return '<span class="fw-dec-none">—</span>';
     if (!fetch) return '<span class="fw-dec-wait">fetching…</span>';
     if (fetch.error) return `<span class="fw-dec-fail" title="${escapeHtml(fwShort(fetch.error, 500))}">failed: ${escapeHtml(fwShort(fetch.error, 80))}</span>`;

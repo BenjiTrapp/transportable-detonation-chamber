@@ -373,6 +373,133 @@ def test_the_deadline_falls_back_to_block_only_under_an_address_wide_block(clien
     assert fw.pending.history(1)[0]["action"] == "block"
 
 
+# ---- what is no longer claimed while the cut stands -------------------------------------------
+
+
+def _cut(client):
+    assert client.post("/api/firewall/isolate", json={"on": True}).status_code == 200
+
+
+def test_block_and_fetch_is_refused_while_the_cut_stands(client, fw):
+    _cut(client)
+    pid = fw.pending.add(FINDING, deadline=time.time() + 30)["id"]
+    r = client.post("/api/firewall/decide", json={"id": pid, "action": "block_fetch"})
+    assert r.status_code == 409 and "cut" in r.json["error"].lower()
+    assert "leave" in r.json["error"].lower() and "allow" in r.json["error"].lower()    # it says why, and what to do
+    assert fw.fetches == [] and [i["id"] for i in fw.pending.open()] == [pid]            # the id is kept
+    assert not [n for n in fw.run.rules if n.startswith("TDC-FW-FETCH")]                  # no Allow exception written
+    assert client.post("/api/firewall/decide", json={"id": pid, "action": "block"}).status_code == 200
+
+
+def test_block_and_fetch_is_refused_in_the_stage_cut_policy_too(client, fw):
+    from test_firewall_rules import GPO_RULE, STOCK
+    fw.run.foreign = {n: dict(r) for n, r in {**STOCK, **GPO_RULE}.items()}
+    _cut(client)
+    fw.converge()
+    assert fw.settings.stage == "cut_policy"
+    pid = fw.pending.add(FINDING, deadline=time.time() + 30)["id"]
+    r = client.post("/api/firewall/decide", json={"id": pid, "action": "block_fetch"})
+    assert r.status_code == 409 and "cut" in r.json["error"].lower() and fw.fetches == []
+
+
+def test_block_and_fetch_is_refused_for_a_cut_rule_a_crash_left_behind(client, fw):
+    fw.run.rules["TDC-FW-ISO-cut"] = fw.run.view("TDC-FW-ISO-cut")            # no marker: the rule list says it
+    pid = fw.pending.add(FINDING, deadline=time.time() + 30)["id"]
+    r = client.post("/api/firewall/decide", json={"id": pid, "action": "block_fetch"})
+    assert r.status_code == 409 and "cut" in r.json["error"].lower() and fw.fetches == []
+
+
+def test_block_and_fetch_works_again_once_the_cut_is_left(client, fw):
+    _cut(client)
+    pid = fw.pending.add(FINDING, deadline=time.time() + 30)["id"]
+    assert client.post("/api/firewall/decide", json={"id": pid, "action": "block_fetch"}).status_code == 409
+    client.post("/api/firewall/isolate", json={"on": False})
+    r = client.post("/api/firewall/decide", json={"id": pid, "action": "block_fetch"})
+    assert r.status_code == 200 and len(fw.fetches) == 1 and r.json["item"]["result"]["fetch"]["sha256"]
+
+
+def test_a_cut_that_lands_between_the_check_and_the_decision_still_fetches_nothing(client, fw, tdc):
+    pid = fw.pending.add(FINDING, deadline=time.time() + 30)["id"]
+    tdc._fw_pressing = 1                                      # a press is under way: its Cut may be written already
+    with pytest.raises(tdc._FwFetchRefused):
+        tdc._fw_decide(pid, "block_fetch", "analyst")
+    assert [i["id"] for i in fw.pending.open()] == [pid] and fw.fetches == [] and fw.run.writes() == []
+
+
+def test_a_deadline_in_the_cut_stage_blocks_and_says_it_could_not_fetch(client, fw, tdc):
+    _cut(client)
+    fw.pending.add(FINDING, deadline=time.time() - 1)
+    sweep(tdc)
+    (settled,) = client.get("/api/firewall/pending").json["history"]
+    result = settled["result"]
+    assert settled["action"] == "block" and result["by"] == "deadline" and result["block"]["verified"] is True
+    assert "could not" in result["note"] and "cut" in result["note"]
+    assert "fetch" not in result and "capture_id" not in result
+    assert fw.fetches == [] and client.get("/api/firewall/captures").json["captures"] == []
+
+
+def test_a_deadline_in_cut_policy_says_the_same(client, fw, tdc):
+    from test_firewall_rules import GPO_RULE, STOCK
+    fw.run.foreign = {n: dict(r) for n, r in {**STOCK, **GPO_RULE}.items()}
+    _cut(client)
+    fw.converge()
+    fw.pending.add(FINDING, deadline=time.time() - 1)
+    sweep(tdc)
+    settled = fw.pending.history(1)[0]
+    assert settled["action"] == "block" and "could not" in settled["result"]["note"] and fw.fetches == []
+
+
+def test_a_deadline_whose_block_cannot_be_written_in_the_cut_stage_reports_no_block(client, fw, tdc):
+    _cut(client)
+    fw.run.fail["Create"] = (1, "Access is denied.")
+    fw.pending.add(FINDING, deadline=time.time() - 1)
+    sweep(tdc)
+    result = fw.pending.history(1)[0]["result"]
+    assert result["block"].get("verified") is not True and (result["block"].get("error") or result["block"].get("problem"))
+    assert "could not" in result["note"] and fw.fetches == []
+
+
+def test_a_deadline_under_an_address_wide_block_says_why_it_only_blocked(client, fw, tdc):
+    client.post("/api/firewall/block", json={"scope": "endpoint_all", "ip": "203.0.113.50"})
+    fw.pending.add(FINDING, deadline=time.time() - 1)
+    sweep(tdc)
+    result = fw.pending.history(1)[0]["result"]
+    assert "could not" in result["note"] and "every program" in result["note"] and fw.fetches == []
+
+
+def test_a_deadline_without_the_cut_still_fetches_and_carries_no_note(client, fw, tdc):
+    fw.pending.add(FINDING, deadline=time.time() - 1)
+    sweep(tdc)
+    result = fw.pending.history(1)[0]["result"]
+    assert result["fetch"]["sha256"] and "note" not in result and len(fw.fetches) == 1
+
+
+def test_the_note_of_a_deadline_reaches_the_logs(client, fw, tdc):
+    _cut(client)
+    fw.pending.add(FINDING, deadline=time.time() - 1)
+    sweep(tdc)
+    hits = client.get('/api/logs/search?q=path="/internal/firewall/decide"').json
+    assert "could not" in hits["events"][0]["fields"]["note"]
+
+
+def test_a_press_whose_start_of_the_convergence_fails_does_not_leave_the_press_counted(client, fw, tdc, monkeypatch):
+    def broken(verified):
+        raise RuntimeError("spawn failed")
+    monkeypatch.setattr(tdc, "_fw_converge_start", broken)
+    with pytest.raises(RuntimeError):
+        client.post("/api/firewall/isolate", json={"on": True})
+    assert tdc._fw_pressing == 0                              # not stuck: can_fetch is not held False for ever
+    assert client.get("/api/firewall/isolate").json["can_fetch"] is False        # the cut itself stands, so it is False
+
+
+def test_a_leave_whose_cache_reset_fails_does_not_leave_the_leave_counted(client, fw, tdc, monkeypatch):
+    _cut(client)
+    monkeypatch.setattr(tdc, "_fw_forget_rules", lambda: (_ for _ in ()).throw(RuntimeError("cache failed")))
+    with pytest.raises(RuntimeError):
+        client.post("/api/firewall/isolate", json={"on": False})
+    assert tdc._fw_leaving == 0                               # or every later convergence would stop at its first step
+
+
 def test_the_pending_route_lists_open_and_decided_with_the_time_left(client, fw):
     fw.pending.add(FINDING, deadline=time.time() + 30)
     fw.pending.add({**FINDING, "id": "dl-done"}, deadline=time.time() + 30)

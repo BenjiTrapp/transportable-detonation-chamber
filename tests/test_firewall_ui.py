@@ -2556,3 +2556,109 @@ def test_the_cut_card_stays_in_view_while_its_column_scrolls():
     assert sticky, "no sticky rule for the cut card (the classic cards' position: relative must not win over it)"
     decls = sticky[0][1]
     assert any(d.startswith("top:") for d in decls) and any(d.startswith("bottom:") for d in decls), decls
+
+
+# --- What a cut stage no longer claims (Task 7) ----------------------------------------------
+
+CUT_NOTE = ("TDC could not secure the file: The cut stands: one Block rule for every program beats every Allow rule, "
+            "so no exception lets TDC's own fetch out. Leave the cut first to secure a sample, or choose block only.")
+
+
+@needs_node
+def test_a_cut_that_is_not_confirmed_names_the_profiles_when_they_are_what_could_not_be_read():
+    unreadable = cut_view(dict(_state("CUT · SECURING…"), verified=False, profiles_off=None))["bands"]
+    assert "profiles could not be read" in unreadable and "catch-all Block rule was not read back" not in unreadable
+    assert "fw-band-hole" in unreadable and "not confirmed" in unreadable
+    read = cut_view(dict(_state("CUT · SECURING…"), verified=False))["bands"]            # profiles read, all on
+    assert "catch-all Block rule was not read back" in read and "The firewall profiles could not be read" not in read
+
+
+@needs_node
+def test_a_decision_in_the_cut_stage_offers_no_fetch_and_says_the_cut_is_why():
+    out = _decisions(r"""
+        fwState.isolate = { isolated: true, stage: 'cut', can_fetch: false, profiles_off: [] };
+        fwApplyPending(answerOf({ pending: [Object.assign(pitem(), { can_fetch: false })] }));
+        console.log(JSON.stringify(stack()));""")
+    assert _toast_buttons(out) == {"block": False, "allow": False} and "CUT + FETCH" not in out and "NO FETCH" in out
+    assert "the cut stands" in out.lower() and "leave isolated first" in out.lower()
+    assert "a block for every program stands" not in out and "fetches the file itself" not in out
+
+
+@needs_node
+def test_a_decision_under_an_address_wide_block_still_names_that_block_and_not_the_cut():
+    out = _decisions(r"""
+        fwState.isolate = { isolated: false, stage: 'open', can_fetch: true, profiles_off: [] };
+        fwApplyPending(answerOf({ pending: [Object.assign(pitem(), { can_fetch: false })] }));
+        console.log(JSON.stringify(stack()));""")
+    assert "NO FETCH" in out and "every program" in out and "the cut stands" not in out.lower()
+
+
+@needs_node
+def test_a_decision_whose_reason_is_not_known_names_neither_for_sure():
+    out = _decisions(r"""
+        fwApplyPending(answerOf({ pending: [Object.assign(pitem(), { can_fetch: false })] }));      // no state read yet
+        console.log(JSON.stringify(stack()));""")
+    assert "NO FETCH" in out and "CUT + FETCH" not in out
+    assert "the cut stands" in out.lower() and "every program" in out and " or " in out
+
+
+@needs_node
+def test_a_refused_fetch_in_the_cut_is_shown_with_the_server_reason_and_keeps_the_decision_open():
+    out = _decisions(r"""
+        answer = (url, init) => reply(init && init.method === 'POST' ? { error: %s } : {}, init && init.method === 'POST' ? 409 : 200);
+        fwApplyPending(answerOf({ pending: [pitem()] }));
+        const ok = await fwDecide('dl-000000000001', 'block_fetch');
+        console.log(JSON.stringify({ ok, out: stack() }));""" % json.dumps(CUT_NOTE.split(": ", 1)[1]))
+    assert out["ok"] is False and "Leave the cut first" in out["out"] and "still open" in out["out"]
+    assert _toast_buttons(out["out"]) == {"block": False, "allow": False}
+
+
+@needs_node
+def test_a_deadline_that_could_not_fetch_says_so_in_its_result_and_never_claims_a_sample():
+    out = _decisions(r"""
+        const item = pitem({ action: 'block', resolved_at: '2026-11-16T10:00:31.000Z',
+            result: { by: 'deadline', block: { rule_id: 'TDC-FW-0123456789ab', verified: true }, note: %s } });
+        fwApplyPending(answerOf({ history: [item] }));
+        fwDecisions.set(item.id, { kind: 'decision', phase: 'done', item, doneAt: now, until: null });
+        console.log(JSON.stringify(fwDecisionHtml(fwDecisions.get(item.id), '')));""" % json.dumps(CUT_NOTE))
+    assert "could not secure" in out and "Leave the cut first" in out and "Secured" not in out and "fetching" not in out.lower()
+    assert "The block stands; nothing was fetched." in out
+
+
+@needs_node
+def test_the_note_of_a_decision_is_text_in_the_toast_and_in_decisions():
+    r = _decisions(r"""
+        const item = pitem({ action: 'block', resolved_at: '2026-11-16T10:00:31.000Z',
+            result: { by: 'deadline', block: { verified: true }, note: %s } });
+        fwApplyPending(answerOf({ history: [item] }));
+        fwDecisions.set(item.id, { kind: 'decision', phase: 'done', item, doneAt: now, until: null });
+        console.log(JSON.stringify({ toast: fwDecisionHtml(fwDecisions.get(item.id), ''), view: fwDecisionsViewHtml() }));""" % json.dumps(HOSTILE))
+    for name in ("toast", "view"):
+        _no_live_markup(r[name], name)
+        assert "&lt;script&gt;" in r[name]
+
+
+@needs_node
+def test_decisions_says_why_no_sample_was_secured():
+    r = _decisions(r"""
+        const noted = pitem({ id: 'dl-000000000001', action: 'block', resolved_at: '2026-11-16T10:00:31.000Z',
+            result: { by: 'deadline', block: { rule_id: 'TDC-FW-0123456789ab', verified: true }, note: %s } });
+        const plain = pitem({ id: 'dl-000000000002', action: 'block', resolved_at: '2026-11-16T10:00:32.000Z',
+            result: { by: 'analyst', block: { rule_id: 'TDC-FW-0123456789ab', verified: true } } });
+        fwApplyPending(answerOf({ history: [noted, plain] }));
+        const view = fwDecisionsViewHtml();
+        const row = id => view.slice(view.indexOf('data-fw-decision="' + id + '"')).split('</tr>')[0];
+        console.log(JSON.stringify({ noted: row('dl-000000000001'), plain: row('dl-000000000002') }));""" % json.dumps(CUT_NOTE))
+    cell = re.search(r'<td class="fw-dec-fetch">(.*?)</td>', r["noted"]).group(1)
+    assert "could not fetch" in cell and "Leave the cut first" in cell          # the reason is in the title
+    assert "SECURED SAMPLES" not in cell and "—" not in cell
+    assert '<td class="fw-dec-fetch"><span class="fw-dec-none">—</span></td>' in r["plain"]   # no note, no claim
+
+
+@needs_node
+def test_the_summary_of_what_was_decided_while_away_does_not_call_the_cut_a_block_for_every_program():
+    r = _decisions(r"""
+        const item = pitem({ action: 'block', resolved_at: '2026-11-16T10:00:31.000Z',
+            result: { by: 'deadline', block: { verified: true }, note: %s } });
+        console.log(JSON.stringify(fwAbsenceText([item], false)));""" % json.dumps(CUT_NOTE))
+    assert "could not secure" in r["detail"] and "cut" in r["detail"] and "secured while you were away" not in r["title"]

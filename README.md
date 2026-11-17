@@ -1330,9 +1330,17 @@ blocked** and offers CUT + FETCH (keep the block, TDC fetches the file itself),
 CUT ONLY and ALLOW (lift the block). When nobody answers within
 `TDC_FIREWALL_DECIDE_SECONDS` (30 s), TDC keeps the block and fetches the file
 anyway, because a stage-2 URL is often good for one download only; that means
-the chamber contacts the C2 unattended. The deadline runs on the server, so
-closing the page changes nothing, and what was decided while nobody watched
-stays as a toast until it is closed. DECISIONS lists the open decisions and
+the chamber contacts the C2 unattended. While the cut stands (the panic
+button, stages `cut` and `cut_policy`) none of that can happen: a Block rule for
+every program beats every Allow rule, TDC's own fetch included, so CUT + FETCH
+is not offered, the route refuses `block_fetch` with 409 and says to leave the
+cut first, and a deadline only blocks. It writes no capture and records in the
+decision why it could not secure the file (`result.note`; DECISIONS shows
+"could not fetch"). Writing that block waits behind a running convergence of
+ISOLATED (tens of seconds), which can hold up a collector tick; it is not
+skipped, and until it is written the decision shows no block. The deadline runs
+on the server, so closing the page changes nothing, and what was decided while
+nobody watched stays as a toast until it is closed. DECISIONS lists the open decisions and
 those of the last 24 h: who took which, and when. `POST /api/firewall/decide`
 takes only the id of a decision TDC opened, never a URL, so a sample cannot
 use TDC as its proxy.
@@ -1987,8 +1995,8 @@ ISOLATED blocks the default way out and switches off Windows' own outbound Allow
 | POST | `/api/firewall/block` | `{scope, image, ip, port, protocol}`. `endpoint`: this program to `ip`; `endpoint_all`: every program, TDC's fetcher included; `process`: `image` anywhere. 409 while a firewall profile is off |
 | POST | `/api/firewall/unblock` | `{rule_id}`; every rule that shares its key is removed |
 | GET / POST | `/api/firewall/isolate` | GET: `isolated`, `outbound_before`, `isolated_since`, `profiles_off`, `startup`, `residual`, `allowed_out` (while ISOLATED is on: Windows' own outbound Allow rules still enabled, read back, each `{name, display, group, source, local}`; `null` while it is off or when `allowed_out_error` says it could not be read), `allow_disabled` (how many rules ISOLATED holds switched off), `fetch_paths_open`, `fetches_in_flight`. Cheap enough to poll: everything but `profiles_off` and `allowed_out` is in memory, and those two (PowerShell reads) are cached for 60 s (an error for 10 s) and read again after every enforcement route. POST `{on}`: switch ISOLATED (409 while a profile is off); the answer has `verified` (Block read back and `allowed_out` empty), `allowed_out` and `note` going on, `outbound_after`, `allow_disabled` (rules that would not switch on again) and `note` going off |
-| GET | `/api/firewall/pending` | `pending` (open decisions with `remaining` seconds and `can_fetch`: `false` while a block for every program stands on the endpoint, so CUT + FETCH is refused and the deadline only blocks; `null` when the rules cannot be read) and `history` (the last 24 h), `ask_mode`, `decide_seconds`, `isolated`, `startup` (`{id, announce, note}` of this server start, `null` until it was read: the toast on every tab) |
-| POST | `/api/firewall/decide` | Exactly `{id, action}` (`allow`, `block`, `block_fetch`); no URL is ever taken. An id works once, a second answer gets the decision that was taken |
+| GET | `/api/firewall/pending` | `pending` (open decisions with `remaining` seconds and `can_fetch`: `false` while the cut stands or a block for every program stands on the endpoint, so CUT + FETCH is refused and the deadline only blocks; `null` when the rules cannot be read) and `history` (the last 24 h), `ask_mode`, `decide_seconds`, `isolated`, `startup` (`{id, announce, note}` of this server start, `null` until it was read: the toast on every tab) |
+| POST | `/api/firewall/decide` | Exactly `{id, action}` (`allow`, `block`, `block_fetch`); no URL is ever taken. An id works once, a second answer gets the decision that was taken. `block_fetch` is refused with 409 while the cut stands (no Allow exception gets through the catch-all Block rule) or a block for every program stands on the endpoint |
 | POST | `/api/firewall/ask` | `{mode}`: `detonation`, `all` or `off` (kept on the server) |
 | POST | `/api/firewall/enable` | `{}`: switch the Windows Firewall on for every profile (TDC never does it by itself: it changes what the sample sees). `{enabled, profiles_off, state}`; 500 when a profile stays off |
 | POST | `/api/firewall/kill` | `{pid}`: `taskkill /PID <pid> /F` for a process with connections in the tab, never one of TDC's own (409). `{pid, killed, image}`; 500 when taskkill fails |
