@@ -2224,6 +2224,9 @@ HELD = {"profiles_off": [], "allowed_out": None, "allowed_out_error": None, "res
 CUT_STATES = [
     (dict(HELD, isolated=False, stage="open", can_fetch=True), "CUT THE NETWORK", "cut", False),
     (dict(HELD, isolated=True, stage="cut", converging=True, verified=True, can_fetch=False), "CUT · SECURING…", "leave", False),
+    # Not confirmed closed: the press cuts again (cut() repairs a tampered rule), whether the worker runs or not
+    (dict(HELD, isolated=True, stage="cut", converging=True, verified=False, can_fetch=False), "CUT · NOT CONFIRMED", "cut", False),
+    (dict(HELD, isolated=True, stage="cut_policy", converging=False, verified=False, can_fetch=False), "CUT · NOT CONFIRMED", "cut", False),
     (dict(HELD, isolated=True, stage="cut", converging=False, verified=True, can_fetch=False,
           converge_note="Switching off failed"), "CUT · NOT SECURED", "leave", False),
     (dict(HELD, isolated=True, stage="isolated", verified=True, allowed_out=[], can_fetch=True), "ISOLATED", "leave", False),
@@ -2245,6 +2248,12 @@ CUT_STATES = [
     (dict(HELD, isolated=True, stage="isolated", verified=True, allowed_out=[],
           fetch_paths_open=[{"rule_id": "TDC-FW-ISO-fetch-0123456789ab", "problem": "denied"}]), "ISOLATED · OPEN", "cut", False),
 ]
+
+
+
+def _state(label, **match):
+    """The first state of CUT_STATES with this label (and these fields)."""
+    return next(iso for iso, name, _, _ in CUT_STATES if name == label and all(iso.get(k) == v for k, v in match.items()))
 
 
 def test_the_summary_column_holds_the_cut_button():
@@ -2307,7 +2316,7 @@ def test_pressing_cuts_at_once_or_leaves_after_asking_whatever_the_stage():
             assert len(declined["confirms"]) == 1 and declined["sent"] == [], isolate
             assert label in declined["confirms"][0], (label, declined)             # it names the stage it leaves
             assert press(isolate, True)["sent"] == [{"on": False}], isolate
-    securing = press(CUT_STATES[1][0], False)["confirms"][0]
+    securing = press(_state("CUT · SECURING…"), False)["confirms"][0]
     assert "background" in securing and "stop" in securing
 
 
@@ -2360,17 +2369,17 @@ def test_whether_tdc_can_secure_a_sample_is_said_in_three_values():
 
 @needs_node
 def test_a_cut_stage_says_in_a_band_that_no_sample_can_be_secured():
-    cut = cut_view(CUT_STATES[1][0])["bands"]
+    cut = cut_view(_state("CUT · SECURING…"))["bands"]
     assert "cannot secure" in cut and "catch-all" in cut and "read back" in cut and "background" in cut
     # In the cut, the Allow list is not read on purpose: no "not known whether closed", and the residual is not shown
     assert "Whether ISOLATED is closed is not known" not in cut and "Still let out" not in cut and ">r<" not in cut
-    policy = cut_view(CUT_STATES[5][0])["bands"]
+    policy = cut_view(_state("CUT · NO FETCH"))["bands"]
     assert "cannot secure" in policy and "group polic" in policy and "Lab proxy out" in policy
 
 
 @needs_node
 def test_a_cut_that_was_not_read_back_is_not_called_shut():
-    r = cut_view(dict(CUT_STATES[1][0], verified=False))
+    r = cut_view(dict(_state("CUT · SECURING…"), verified=False))
     assert "not confirmed" in r["bands"] and "fw-band-hole" in r["bands"]
     assert "not confirmed" in r["note"].lower() or "not read back" in r["note"]
     for text in (r["bands"], r["note"], r["head"]["title"]):
@@ -2379,7 +2388,7 @@ def test_a_cut_that_was_not_read_back_is_not_called_shut():
 
 @needs_node
 def test_a_cut_whose_securing_failed_says_what_did_not_get_through_as_text():
-    r = cut_view(dict(CUT_STATES[2][0], converge_note=HOSTILE))
+    r = cut_view(dict(_state("CUT · NOT SECURED"), converge_note=HOSTILE))
     assert "did not get through" in r["bands"] and "&lt;script&gt;" in r["bands"]
     _no_live_markup(r["bands"])
     _no_live_markup(r["big"])
@@ -2388,17 +2397,17 @@ def test_a_cut_whose_securing_failed_says_what_did_not_get_through_as_text():
 
 @needs_node
 def test_an_isolated_stage_that_went_open_again_offers_the_cut():
-    r = cut_view(CUT_STATES[4][0])
+    r = cut_view(_state("ISOLATED · OPEN"))
     assert "Still let out despite ISOLATED" in r["bands"]
     offer = re.search(r'<button[^>]*data-fw-cut[^>]*>([^<]*)</button>', r["bands"])
     assert offer and "CUT" in offer.group(1)
     # isolated and closed: nothing offered
-    assert "data-fw-cut" not in cut_view(CUT_STATES[3][0])["bands"]
+    assert "data-fw-cut" not in cut_view(_state("ISOLATED"))["bands"]
 
 
 @needs_node
 def test_a_marker_beside_stage_open_is_never_taken_for_nothing_in_force():
-    r = cut_view(CUT_STATES[7][0])
+    r = cut_view(_state("ISOLATED · NOT CONFIRMED", stage="open"))
     assert r["head"]["pressed"] == "true" and "CUT THE NETWORK" not in r["big"]
     assert "fw-band-hole" in r["bands"] and "data-fw-cut" in r["bands"]
 
@@ -2425,8 +2434,100 @@ def test_the_help_names_the_cut_and_its_stages():
     html = _read(INDEX_HTML)
     guide = html[html.index('id="help-usage"'):html.index('id="help-api"')]
     entry = guide[guide.index("<h4>FIREWALL</h4>"):guide.index("<h4>LOGS</h4>")]
-    for text in ("CUT THE NETWORK", "SECURING", "NOT SECURED", "NO FETCH", "ISOLATED &middot; OPEN", "without a confirmation"):
+    for text in ("CUT THE NETWORK", "SECURING", "NOT SECURED", "NO FETCH", "ISOLATED &middot; OPEN", "without a confirmation",
+                 "CUT &middot; NOT CONFIRMED", "LEAVE ISOLATED"):
         assert text in entry, text
     api = html[html.index('id="help-api"'):]
     row = re.search(r"<code>/api/firewall/isolate</code></td><td>ISOLATED's state:.*?</td>", api).group(0)
     assert "stage" in row and "converging" in row and "can_fetch" in row
+
+
+# --- One rule decides the press (Task 6 fix round) -------------------------------------
+
+def _confirmed_closed(iso):
+    """The rule, read from the fields of GET /isolate on their own: only what was read back closed is closed."""
+    if not iso["isolated"] or iso.get("verified") is not True:
+        return False
+    if iso["stage"] in ("cut", "cut_policy"):
+        return True
+    return iso["stage"] == "isolated" and iso.get("allowed_out") == [] and not iso.get("fetch_paths_open")
+
+
+def _every_state():
+    """Every combination of what decides the press, not only the rows of the table."""
+    out = [dict(HELD, isolated=False, stage="open", profiles_off=off) for off in ([], ["Public"])]
+    for stage in ("open", "cut", "isolated", "cut_policy"):
+        for verified in (True, False, None):
+            for converging in (True, False):
+                for allowed in (None, [], [{"name": "{gpo}", "display": "Lab proxy out", "source": "GroupPolicy"}]):
+                    for holes in ([], [{"rule_id": "TDC-FW-ISO-fetch-0123456789ab", "problem": "denied"}]):
+                        for off in ([], ["Public"]):
+                            out.append(dict(HELD, isolated=True, stage=stage, verified=verified, converging=converging,
+                                            allowed_out=allowed, fetch_paths_open=holes, profiles_off=off))
+    return out
+
+
+@needs_node
+def test_the_press_cuts_unless_closed_is_confirmed_and_then_leaves_after_asking():
+    states = _every_state()
+    r = _run(r"""
+        const out = [];
+        confirmAnswer = false;
+        answer = url => reply(url === '/api/firewall/isolate' ? { isolated: true, stage: 'cut', verified: true, converging: true } : {});
+        for (const iso of %s) {
+            fwState.isolate = iso; fwState.isolated = iso.isolated;
+            const c = confirms.length, p = calls.filter(x => x.method === 'POST').length;
+            const action = fwCutState().action;
+            await fwToggleIsolated();
+            out.push({ action, asked: confirms.length - c, sent: calls.filter(x => x.method === 'POST').slice(p).map(x => x.body) });
+        }
+        console.log(JSON.stringify(out));""" % json.dumps(states))
+    for iso, got in zip(states, r):
+        can_cut = not iso["profiles_off"]
+        if not _confirmed_closed(iso) and can_cut:
+            assert got == {"action": "cut", "asked": 0, "sent": [{"on": True}]}, (iso, got)      # a panic press never does nothing
+        elif iso["isolated"]:
+            assert got == {"action": "leave", "asked": 1, "sent": []}, (iso, got)               # declined: nothing sent
+        else:
+            assert got["sent"] == [] and got["asked"] == 0, (iso, got)                          # firewall off: nothing can be cut
+
+
+@needs_node
+def test_the_band_offers_the_other_action_so_no_state_is_a_dead_end():
+    states = [s for s in _every_state() if s["isolated"]]
+    r = _run(r"""
+        const out = [];
+        confirmAnswer = true;
+        answer = url => reply(url === '/api/firewall/isolate' ? { isolated: false } : {});
+        const leave = { target: { closest: s => (s === '[data-fw-leave]' ? { disabled: false, getAttribute: () => null } : null) } };
+        for (const iso of %s) {
+            fwState.isolate = iso; fwState.isolated = true; fwLastBands = '';
+            renderFirewallBands();
+            const bands = els['firewall-bands'].innerHTML, action = fwCutState().action;
+            const c = confirms.length, p = calls.filter(x => x.method === 'POST').length;
+            if (bands.includes('data-fw-leave')) {
+                onFirewallClick(leave);
+                for (let i = 0; i < 30; i++) await Promise.resolve();
+            }
+            out.push({ action, leaveButton: (bands.match(/<button[^>]*data-fw-leave[^>]*>([^<]*)<\/button>/) || [])[1] || null,
+                asked: confirms.length - c, sent: calls.filter(x => x.method === 'POST').slice(p).map(x => x.body) });
+            fwIsoSwitching = '';
+        }
+        console.log(JSON.stringify(out));
+        process.exit(0);""" % json.dumps(states))
+    for iso, got in zip(states, r):
+        if got["action"] == "cut":
+            # the press re-cuts, so leaving is one press away in the band, and it asks first
+            assert got["leaveButton"] == "LEAVE ISOLATED" and got["asked"] == 1 and got["sent"] == [{"on": False}], (iso, got)
+        else:
+            assert got["leaveButton"] is None, (iso, got)                  # the press itself leaves
+
+
+def test_the_cut_card_stays_in_view_while_its_column_scrolls():
+    from test_theme import _flat_rules
+    rules = _flat_rules(_read(STYLE_CSS))
+    sticky = [(s, d) for (ctx, s), decls in rules.items() if s.endswith(".fw-cut-card") and s.startswith("#tab-firewall")
+              for d in decls if "position: sticky" in d]
+    assert sticky, "no sticky rule for the cut card (the classic cards' position: relative must not win over it)"
+    decls = sticky[0][1]
+    assert any(d.startswith("top:") for d in decls) and any(d.startswith("bottom:") for d in decls), decls

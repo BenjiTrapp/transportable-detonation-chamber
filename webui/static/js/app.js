@@ -13568,8 +13568,9 @@ function fwStage(iso = fwState.isolate) {
 }
 
 // What the cut button and the ISOLATED switch both show and what a press of either does: the one state of the two.
-// action 'cut' (no question) or 'leave' (asks first); disabled only when a press can do nothing: cutting while the
-// firewall is off. Cutting is offered again wherever being cut is not confirmed, since it only closes.
+// One rule decides the press: not confirmed closed, it cuts (again, without a question: cut() repairs a tampered
+// rule, and a cut only closes); confirmed closed, it leaves (asks first). When the firewall is off nothing can be
+// cut, so a press leaves, or, with nothing to leave, the button is disabled: the one case it can do nothing.
 function fwCutState(iso = fwState.isolate) {
     const s = iso || {};
     const off = fwEnforceOff(), stage = fwStage(iso), on = fwIsolatedOn();
@@ -13578,13 +13579,14 @@ function fwCutState(iso = fwState.isolate) {
     const holes = Array.isArray(s.fetch_paths_open) ? s.fetch_paths_open.length : 0;
     let key;
     if (!on) key = 'open';
+    else if ((stage === 'cut' || stage === 'cut_policy') && s.verified !== true) key = 'cutunconfirmed';
     else if (stage === 'cut') key = s.converging ? 'securing' : 'unsecured';
     else if (stage === 'cut_policy') key = 'nofetch';
-    else if (stage === 'isolated') key = (still && still.length) || holes ? 'reopened' : s.verified === true ? 'isolated' : 'unconfirmed';
+    else if (stage === 'isolated') key = (still && still.length) || holes ? 'reopened' : s.verified === true && still ? 'isolated' : 'unconfirmed';
     else key = 'unconfirmed';
-    const action = key === 'open' || ((key === 'reopened' || key === 'unconfirmed') && !off) ? 'cut' : 'leave';
-    const held = s.verified === true ? 'Cut by one outbound Block rule, read back.'
-        : 'The cut rule was not read back, so whether outbound is shut is not known.';
+    const closed = ['securing', 'unsecured', 'isolated', 'nofetch'].includes(key);
+    const action = !on || (!closed && !off) ? 'cut' : 'leave';
+    const held = 'Cut by one outbound Block rule, read back.';
     const [label, now] = {
         open: ['CUT THE NETWORK', 'Not cut: TDC is not isolating the chamber.'],
         securing: ['CUT · SECURING…', `${held} Windows' own Allow rules are being switched off in the background.`],
@@ -13593,6 +13595,7 @@ function fwCutState(iso = fwState.isolate) {
         reopened: ['ISOLATED · OPEN', `Isolated, but ${holes && !(still && still.length) ? 'a finished fetch left a way out open' : 'an outbound Allow rule is enabled again'} and lets traffic out.`],
         nofetch: ['CUT · NO FETCH', `${held} It stays: something a group policy allows cannot be switched off from here.`],
         unconfirmed: ['ISOLATED · NOT CONFIRMED', 'ISOLATED is on, but that nothing gets out was not read back.'],
+        cutunconfirmed: ['CUT · NOT CONFIRMED', 'The cut rule was not read back, so whether outbound is shut is not known.'],
     }[key];
     const disabled = action === 'cut' && !!off;
     const press = disabled ? off
@@ -14437,8 +14440,11 @@ function renderFirewallBands() {
     if (iso.profiles_error) bands.push(['warn', `The Windows Firewall profiles could not be read: ${escapeHtml(fwShort(iso.profiles_error, 300))}. Whether a rule takes effect is unknown.`]);
     // The remedy, one press away, wherever being cut is not confirmed: it goes through the one toggle like the button
     const cutState = fwCutState();
+    // and beside it the other action, leaving, so that no state is one a single press cannot get out of
     const again = fwIsolatedOn() && cutState.action === 'cut'
-        ? ` <button type="button" class="btn btn-xs fw-cut-again" data-fw-cut title="${escapeHtml(cutState.title)}">CUT AGAIN</button>` : '';
+        ? ` <button type="button" class="btn btn-xs fw-cut-again" data-fw-cut title="${escapeHtml(cutState.title)}">CUT AGAIN</button>`
+            + ' <button type="button" class="btn btn-xs fw-cut-leave" data-fw-leave title="Open the network again: what ISOLATED switched off is '
+            + 'switched on again and the cut rule removed (asks first).">LEAVE ISOLATED</button>' : '';
     if (fwIsolatedOn() && fwState.isolate) {
         const stage = fwStage();
         const since = iso.isolated_since ? ` since ${escapeHtml(formatAlertTime(iso.isolated_since))}` : '';
@@ -14460,7 +14466,7 @@ function renderFirewallBands() {
                 text += `The securing behind the cut did not get through${note ? `: ${note}` : ', and said nothing about why'}. Nothing more happens by itself until the cut is left.`;
             }
             if (stage === 'cut_policy' && note) text += ` ${note}.`;
-            bands.push([iso.verified === true ? 'isolated' : 'hole', text]);
+            bands.push(iso.verified === true ? ['isolated', text] : ['hole', `${text}${again}`]);
         } else if (stage === 'isolated') {
             const n = Number(iso.fetches_in_flight) || 0;
             bands.push(['isolated', `<strong>ISOLATED${since}.</strong> `
@@ -14751,11 +14757,13 @@ async function fwUnblock(ruleId) {
 }
 
 // The one place that switches, for the cut button and the ISOLATED switch alike: a press does what fwCutState says.
-// Cutting asks nothing (it only closes, and leaving works in seconds from any stage); leaving asks first.
-async function fwToggleIsolated() {
+// Cutting asks nothing (it only closes, and leaving works in seconds from any stage); leaving asks first. `want`
+// 'leave' is the band's LEAVE ISOLATED, the other action of a state whose press cuts again.
+async function fwToggleIsolated(want) {
     if (fwIsoSwitching) return false;
     const st = fwCutState();
-    const cut = st.action === 'cut';
+    if (want === 'leave' && !st.on) return false;          // nothing to leave: never taken for a cut
+    const cut = want !== 'leave' && st.action === 'cut';
     if (cut) {
         const off = fwEnforceOff();
         if (off) {
@@ -14879,6 +14887,7 @@ function onFirewallClick(event) {
     else if ((el = hit('[data-fw-view]'))) fwSetView(el.getAttribute('data-fw-view'));
     else if (hit('[data-fw-live]')) fwToggleLive();
     else if (hit('[data-fw-isolated], [data-fw-cut]')) fwToggleIsolated();
+    else if (hit('[data-fw-leave]')) fwToggleIsolated('leave');
     else if ((el = hit('[data-fw-decide]'))) {
         const row = target.closest('[data-fw-decision]');
         if (row) fwDecide(row.getAttribute('data-fw-decision'), el.getAttribute('data-fw-decide'));

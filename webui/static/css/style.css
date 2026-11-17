@@ -11538,6 +11538,14 @@ body.maintenance-active #app {
 /* The network cut under the summary: the UPDATE ALL skull, larger, its label under it and the stage in it. Its
    skull does not pulse on hover: a state that matters is not one that blinks. */
 .fw-cut-card { display: flex; flex-direction: column; align-items: stretch; }
+/* It stays in view while the column scrolls: at the top once the summary has gone up, at the bottom while the
+   summary is taller than the window (over its end, then). The id outweighs the cards' position: relative. */
+#tab-firewall .fw-summary > .fw-cut-card {
+    position: sticky;
+    top: 14px;
+    bottom: 14px;
+    z-index: 2;
+}
 .fw-cut-slot { display: flex; justify-content: center; padding: 6px 0 2px; }
 .fw-cut {
     flex-direction: column;
@@ -11551,7 +11559,8 @@ body.maintenance-active #app {
 .fw-cut[aria-pressed="true"] .btn-skull-label { color: var(--skull-red-light); }
 .fw-cut.fw-cut-reopened .btn-skull-label,
 .fw-cut.fw-cut-unconfirmed .btn-skull-label,
-.fw-cut.fw-cut-unsecured .btn-skull-label { color: var(--accent-yellow); }
+.fw-cut.fw-cut-unsecured .btn-skull-label,
+.fw-cut.fw-cut-cutunconfirmed .btn-skull-label { color: var(--accent-yellow); }
 .fw-cut[aria-busy="true"] { cursor: progress; }
 .fw-cut-note {
     display: flex;
