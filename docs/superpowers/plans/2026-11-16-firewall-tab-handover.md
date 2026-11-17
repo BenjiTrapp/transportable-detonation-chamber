@@ -88,7 +88,8 @@ again when it is left.
 - **Nothing but TDC's own rules is let out.** *Check:* turn ISOLATED on; then
   `Resolve-DnsName example.com -DnsOnly` fails, and
   `Get-NetFirewallRule -PolicyStore ActiveStore -Direction Outbound -Action Allow -Enabled True | Select Name, DisplayName, PolicyStoreSourceType`
-  lists only `TDC-FW-ISO-*`. The band says "Read back: no outbound Allow rule
+  lists nothing, or only a `TDC-FW-ISO-fetch-*` rule while a fetch runs
+  (ISOLATED writes no rule of its own any more). The band says "Read back: no outbound Allow rule
   but TDC's own is enabled", and `GET /api/firewall/isolate` has
   `allowed_out: []`. *If wrong:* DNS-tunnel C2 and DNS exfiltration still work
   in the one mode meant to stop them. If a rule is still listed, the band and
@@ -106,10 +107,13 @@ again when it is left.
   command above shows `Local` for `CoreNet-DNS-Out-UDP`. *If wrong:* ISOLATED
   switches nothing off and the band lists every Windows rule as still open
   (honest, but not closed).
-- **How long switching takes.** The Store apps bring dozens of outbound Allow
-  rules; ISOLATED switches them in one PowerShell per ~6000 characters of names.
-  *Check:* time `POST /api/firewall/isolate {on: true}`; it must stay well
-  under `RUN_TIMEOUT_S` (90 s), and should be a few seconds.
+- **How long switching takes.** ISOLATED on is four PowerShell calls (AllowOut,
+  DisableAllowOut, SetDefaultOutbound, AllowOut), off is three
+  (SetDefaultOutbound, EnableAllowOut, RemoveIsolate); the rules go through one
+  pipeline per call (one call per ~6000 characters of names). *Check:* time
+  `POST /api/firewall/isolate` both ways; it must stay well under
+  `RUN_TIMEOUT_S` (90 s). While it runs the button reads ISOLATING… / LEAVING…
+  and an info toast says why it takes a while.
 
 ### Processes and Sysmon
 
@@ -227,9 +231,13 @@ Every rule change goes through
   and `Get-NetFirewallRule -Name 'TDC-FW-ISO-fetch-*'` is empty afterwards.
   *If wrong:* the fetch in ISOLATED fails (`allow_problem` says why) or the rule
   does not read back as written.
-- **Loopback needs no allow rule** under `DefaultOutboundAction Block`. The rule
-  `TDC-FW-ISO-loopback` is written anyway. *Check:* with ISOLATED on, every tab
-  still works (Detonator 8000, Agent 8080, LitterBox 1337, Fibratus 8180).
+- **Loopback needs no allow rule** under `DefaultOutboundAction Block`: Windows
+  Firewall does not filter loopback, and Windows refuses `::1` as a
+  RemoteAddress, so ISOLATED writes none. *Check:* with ISOLATED on, every tab
+  still works (Detonator 8000, Agent 8080, LitterBox 1337, Fibratus 8180), and
+  `Test-NetConnection 127.0.0.1 -Port 8000` succeeds. *If wrong:* TDC's own
+  services cannot reach each other in ISOLATED; the egress stays shut, so
+  leave ISOLATED (the web UI is reached inbound) or run the hatch.
 - **The host still reaches port 9000 in ISOLATED** (an outbound default does not
   touch the answers to inbound sessions). *Check:* the web UI stays usable from
   the host with ISOLATED on. *If wrong:* ISOLATED locks the analyst out, and

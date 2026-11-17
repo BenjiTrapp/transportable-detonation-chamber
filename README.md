@@ -1361,8 +1361,10 @@ rules are still enabled and names them in the band and in `allowed_out` of
 that list is empty. What it cuts, as far as those rules go: DNS, NTP, updates
 (the tool updates refuse to run), and the cloud lookups and telemetry of the
 EDR under test, whose verdicts may therefore differ from a connected run.
-Loopback stays open, and the host still reaches port 9000, because that is
-inbound. TDC's own fetch gets an allow rule for one address while it runs and
+Loopback stays open without a rule (Windows Firewall does not filter it), and
+the host still reaches port 9000, because that is inbound. Switching takes a
+few PowerShell calls, seconds each on a small VM; the button says it is
+working until the firewall has been read back. TDC's own fetch gets an allow rule for one address while it runs and
 loses it when it ends; for those seconds anything that can run the web UI's
 Python interpreter could reach that one address too. The band says so, and so
 does `residual` in `GET /api/firewall/isolate`. The previous outbound default
