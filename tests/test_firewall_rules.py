@@ -917,6 +917,78 @@ def test_a_removal_that_says_nothing_but_leaves_the_rule_is_still_stuck():
     assert "still there" in stuck[0]["problem"]
 
 
+class _CountingLock:
+    """Stands in for ``rules_mod._LOCK`` and counts how often it is taken."""
+
+    def __init__(self):
+        self.real, self.taken = threading.RLock(), 0
+
+    def acquire(self, *args, **kwargs):
+        self.taken += 1
+        return self.real.acquire(*args, **kwargs)
+
+    def release(self):
+        self.real.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+
+def test_a_sweep_with_nothing_to_remove_takes_no_lock_at_all(monkeypatch):
+    """The press waits for whoever holds the lock; a sweep that only reads and changes nothing must never be that."""
+    lock = _CountingLock()
+    monkeypatch.setattr(rules_mod, "_LOCK", lock)
+    seen = []
+    monkeypatch.setattr(rules_mod, "CALL_OBSERVER", seen.append)
+    run, _ = make()
+    rules_mod.block(run, image=IMAGE, ip="5.6.7.8", fetcher=PY)          # a rule that is not the sweep's
+    lock.taken = 0
+    assert rules_mod.forget_fetch_rules(run) == ([], [])
+    assert lock.taken == 0 and [(r["op"], r["lock"]) for r in seen][-1:] == [("List", None)]
+
+
+def test_a_sweep_reads_without_the_lock_and_removes_under_it(monkeypatch):
+    seen = []
+    monkeypatch.setattr(rules_mod, "CALL_OBSERVER", seen.append)
+    run = FakeRun()
+    name = rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)["name"]
+    seen.clear()
+    assert rules_mod.forget_fetch_rules(run) == ([name], [])
+    assert [(r["op"], r["lock"]) for r in seen] == [("List", None), ("Remove", "forget_fetch_rules"),
+                                                    ("Get", "forget_fetch_rules")]
+
+
+def test_a_rule_gone_between_the_read_and_the_lock_is_read_back_as_gone_not_stuck():
+    run = FakeRun()
+    name = rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)["name"]
+    real = run.op_List
+
+    def listing(p):
+        answer = real(p)
+        run.rules.pop(name)                                # a fetch's own close got there first
+        return answer
+    run.op_List = listing
+    assert rules_mod.forget_fetch_rules(run) == ([name], [])       # Remove is quiet about it, the read-back says gone
+
+
+def test_a_rule_that_appears_after_the_read_is_left_for_the_next_sweep():
+    run = FakeRun()
+    real = run.op_List
+    late = []
+
+    def listing(p):
+        answer = real(p)
+        if not late:
+            late.append(rules_mod.allow_fetch(run, fetcher=PY, ip="1.2.3.4", port=8080)["name"])
+        return answer
+    run.op_List = listing
+    assert rules_mod.forget_fetch_rules(run) == ([], []) and late[0] in run.rules
+    assert rules_mod.forget_fetch_rules(run) == (late, []) and late[0] not in run.rules
+
 def test_leaving_isolated_removes_a_per_fetch_rule_that_was_still_open():
     run, settings = make(outbound="Allow")
     thorough(run, settings)

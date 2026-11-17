@@ -741,14 +741,21 @@ def forget_fetch_rules(run) -> Tuple[List[str], List[Dict[str, str]]]:
     The caller is told which are left so that it can say so instead of leaving a hole nobody sees.
 
     A fetch that is in flight owns its rules; the caller only runs this when none is.
+
+    The list is read **without** the lock, and the lock is taken only when there is something to remove: the sweep
+    runs every minute while ISOLATED is on, nearly always finds nothing, and a press must not wait seconds behind a
+    read that changes nothing. Every removal still happens under the lock and is read back, so the list being a
+    snapshot costs nothing: a rule gone before its removal is read back as gone, and one that appeared after the
+    read is found by the next sweep.
     """
     removed: List[str] = []
     stuck: List[Dict[str, str]] = []
+    names = [r["rule_id"] for r in rules(run)
+             if r["rule_id"].startswith(FETCH_PREFIX) or r["rule_id"] in (FETCHER_RULE, FETCHER_RULE + SWAP_SUFFIX)]
+    if not names:
+        return removed, stuck
     with _locked("forget_fetch_rules"):
-        for rule in rules(run):
-            name = rule["rule_id"]
-            if not (name.startswith(FETCH_PREFIX) or name in (FETCHER_RULE, FETCHER_RULE + SWAP_SUFFIX)):
-                continue
+        for name in names:
             try:
                 _ok(run, "Remove", Name=name)
                 if _describe(run, name) is not None:    # Remove is quiet about a rule it did not remove
