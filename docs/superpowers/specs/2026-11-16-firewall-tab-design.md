@@ -296,6 +296,25 @@ alle Prozesse sperren“ gibt es als zweiten, ausdrücklichen Knopf, und solange
 eine Regel steht, ist `KAPPEN + SELBST HOLEN` an diesem Endpunkt ausgegraut mit
 dem Grund im Tooltip.
 
+**Entscheidung — zwei Sperren schreibt TDC nie**, und die API lehnt sie mit
+Begründung ab:
+
+1. **Loopback** (`127.0.0.0/8`, `::1`, auch IPv4-gemappt), für ein Programm wie
+   für alle. Die Windows-Firewall filtert Loopback nicht: so eine Regel stünde,
+   würde wie geschrieben zurückgelesen und bliebe wirkungslos. Der erste Lauf
+   auf einer echten VM hat genau das gezeigt — `verified: true`, `problem: null`,
+   und `curl http://127.0.0.1:9000/` antwortete weiter mit 200. Nichts, was nicht
+   wirken kann, wird geschrieben oder „bestätigt" genannt. Eine
+   Download-Entscheidung zu einer Loopback-Adresse sagt das, statt eine Sperre zu
+   melden.
+2. **Unspecified und Multicast für alle Programme**: dort läge TDCs
+   Selbstaussperrung. Für ein einzelnes Programm bleiben sie erlaubt, denn
+   Multicast (mDNS, SSDP) filtert Windows sehr wohl, und so eine Sperre greift.
+   Meine frühere Begründung vermischte beides: sie erlaubte Loopback mit dem
+   Argument, mDNS und SSDP wolle man kappen können — die sind aber Multicast.
+
+Hinzu kommt die Sperre auf TDCs eigenen Fetcher.
+
 **Entscheidung — wie eine stehende Verbindung stirbt.** Eine Ausgangs-Blockregel
 greift in WFP sofort, auch auf einen laufenden Flow. Es gibt kein RST: die
 Verbindung verhungert. Aus Sicht der Malware sieht das wie ein Netzausfall aus —
