@@ -8,6 +8,7 @@ never touch the files next to app.py or talk to the VM.
 import os
 import sys
 import tempfile
+import threading
 import time
 
 import pytest
@@ -146,6 +147,17 @@ class FirewallFake:
         self.body = b"MZ" + b"\x00" * 100
         self.resolve_to = "9.9.9.9"
         self.own = {"192.168.64.129", "192.168.64.1"}      # the VM's own address and its gateway
+        # the convergence worker of ISOLATED: started is every worker the route asked for, waiting the ones not run yet
+        self.started, self.waiting = [], []
+
+    def spawn(self, target):
+        self.started.append(target)
+        self.waiting.append(target)
+
+    def converge(self):
+        """Run, here and now, the convergence worker the route started (the test's stand-in for its thread)."""
+        while self.waiting:
+            self.waiting.pop(0)()
 
     @property
     def profiles(self):
@@ -175,7 +187,11 @@ def fw(tdc, monkeypatch, tmp_path):
                         ("_fw_downloads", {}), ("_fw_scan_state", {"done": False}), ("_fw_rules_cache", None),
                         ("_fw_windows_cache", (0.0, {})), ("_fw_window_alive", {}), ("_fw_fetch_paths", {}),
                         ("_fw_fetch_open", {}), ("_fw_fetch_swept", 0.0), ("_fw_profiles_cache", None), ("_fw_allowed_cache", None),
-                        ("_fw_ioc_cache", (time.time() + 1e6, (frozenset(), frozenset())))):
+                        ("_fw_ioc_cache", (time.time() + 1e6, (frozenset(), frozenset()))),
+                        # no thread of its own: a test runs the worker with fake.converge(), or swaps in the real spawn
+                        ("_fw_converge_spawn", fake.spawn), ("_fw_converge_event", threading.Event()),
+                        ("_fw_converge_running", False), ("_fw_converge_again", False), ("_fw_converge_note", None),
+                        ("_fw_converge_gen", 0), ("_fw_cut_verified", None), ("_fw_leaving", 0)):
         monkeypatch.setattr(m, name, value)
     monkeypatch.setattr(m, "_process_started_at", lambda pid: None)
     # the fetch mechanism itself (real sockets, the deadline, the SNI) is tested in test_firewall_fetch.py;

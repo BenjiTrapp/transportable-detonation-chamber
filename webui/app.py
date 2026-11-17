@@ -12097,6 +12097,116 @@ def _start_firewall():
     return thread
 
 
+# ISOLATED has two stages (see firewall_rules.isolate): the press cuts with one catch-all Block rule and answers, and
+# the thorough part (firewall_rules.converge, tens of seconds) runs afterwards in one background worker. There is
+# never more than one: a press while it runs asks it for one more round (``_fw_converge_again``) instead. Never two
+# rule runs at once either, because converge holds firewall_rules' own lock for its whole run; so a press and a leave
+# raise the cancel flag **before** they call in, converge sees it at its next step and lets go of the lock after the
+# one call it is in, instead of after all of them. The flag is an Event per round, so a press that restarts the work
+# never lowers the flag a leave raised for the round still running. The worker writes nothing to a request, catches
+# everything, and leaves what it found in ``_fw_converge_note`` for GET /isolate: a worker that dies quietly would be
+# a surface that says nothing.
+_fw_converge_lock = threading.Lock()
+_fw_converge_event = threading.Event()            # the cancel flag of the current round
+_fw_converge_running = False                      # a worker is started and has not finished
+_fw_converge_again = False                        # a press came while it ran: one more round
+_fw_converge_note = None                          # the note of the last round, or why it failed; None when all went
+_fw_converge_gen = 0                              # counts the presses, so a round's result never outranks a later cut
+_fw_cut_verified = None                           # the cut rule read back by the press (or by converge in cut_policy)
+_fw_leaving = 0                                   # leaves under way: every round stops at its next step meanwhile
+
+
+def _fw_converge_thread(target):
+    threading.Thread(target=target, name="firewall-converge", daemon=True).start()
+
+
+_fw_converge_spawn = _fw_converge_thread          # spawn(target); tests run the worker themselves
+
+
+def _fw_converge_worker():
+    """The background half of ISOLATED: ``converge`` until no press asks for another round."""
+    global _fw_converge_running, _fw_converge_again, _fw_converge_note, _fw_cut_verified
+    finished = False
+    try:
+        while True:
+            with _fw_converge_lock:
+                event, gen, _fw_converge_again = _fw_converge_event, _fw_converge_gen, False
+            result = None
+            try:
+                result = firewall_rules.converge(_fw_runner, settings=_fw_settings,
+                                                 cancelled=lambda: event.is_set() or _fw_leaving > 0)
+                note = result.get("note")
+            except Exception as e:
+                _log_logger.exception("firewall: the convergence of ISOLATED failed")
+                note = (f"The thorough part of ISOLATED failed ({_fw_reason(e)}); whether the cut rule still stands "
+                        "was not read back.")
+            try:
+                _fw_forget_rules()
+            except Exception:
+                _log_logger.exception("firewall: the caches could not be forgotten after the convergence")
+            with _fw_converge_lock:
+                _fw_converge_note = note
+                if gen == _fw_converge_gen:            # no later press cut again meanwhile
+                    if result is None:
+                        _fw_cut_verified = None        # unknown: the failure may have been in removing the rule
+                    elif result["stage"] == "cut_policy" and not result["cancelled"] and not result["refused"]:
+                        _fw_cut_verified = bool(result["verified"])    # converge read the rule back itself
+                    # every other answer read nothing back (cancelled, refused, a step failed): the press's stands
+                if not _fw_converge_again:
+                    _fw_converge_running = False
+                    finished = True
+                    return
+    finally:
+        if not finished:                               # something above the catches failed: never stay "converging"
+            with _fw_converge_lock:
+                _fw_converge_running = False
+                _fw_converge_note = _fw_converge_note or "The thorough part of ISOLATED stopped unexpectedly."
+
+
+def _fw_converge_start(verified):
+    """After a press: keep what it read back (``verified``; None keeps what is known) and have one worker converge.
+    True when one works."""
+    global _fw_converge_event, _fw_converge_running, _fw_converge_again, _fw_converge_note, _fw_converge_gen
+    global _fw_cut_verified
+    with _fw_converge_lock:
+        if _fw_converge_event.is_set():                # it belonged to the round a cancel stopped
+            _fw_converge_event = threading.Event()
+        if verified is not None:
+            _fw_converge_gen += 1
+            _fw_cut_verified = bool(verified)
+        _fw_converge_note = None
+        if _fw_converge_running:
+            _fw_converge_again = True
+            return True
+        try:
+            _fw_converge_spawn(_fw_converge_worker)
+        except Exception as e:
+            _fw_converge_note = f"The thorough part of ISOLATED could not be started ({_fw_reason(e)}); the cut stands."
+            return False
+        _fw_converge_running = True
+        return True
+
+
+def _fw_converge_cancel(leaving=False):
+    """Stop the running round at its next step (and no further round); call it **before** calling firewall_rules.
+    True when a worker was running."""
+    global _fw_converge_again, _fw_leaving
+    with _fw_converge_lock:
+        _fw_converge_again = False
+        _fw_converge_event.set()
+        if leaving:
+            _fw_leaving += 1
+        return _fw_converge_running
+
+
+def _fw_left():
+    global _fw_leaving, _fw_cut_verified
+    with _fw_converge_lock:
+        _fw_leaving -= 1
+        if not _fw_settings.isolated:
+            _fw_cut_verified = None
+
+
 # ---- routes ---------------------------------------------------------------------------------
 
 
@@ -12277,15 +12387,54 @@ def api_firewall_unblock():
     return _fw_json({"removed": ids})
 
 
+def _fw_cut_rule_listed():
+    """Whether the rule list in the cache (never read for this) names the cut rule; None when nothing is cached."""
+    with _fw_rules_lock:
+        cached = _fw_rules_cache
+    found = cached[1] if cached else None
+    if found is None:
+        return None
+    return any(r.get("name") == firewall_rules.CUT_RULE for r in found)
+
+
+def _fw_cut_may_stand():
+    """True while TDC's own cut rule is meant to stand: the marker is there and the thorough stage is not reached.
+
+    The marker is the authority, not the stage: start-up can save stage ``open`` beside a marker while the cut rule
+    holds (a profile was off), and that is no state in which a fetch gets out."""
+    return bool(_fw_settings.isolated) and _fw_settings.stage != "isolated"
+
+
+def _fw_isolate_verified(allowed):
+    """``verified`` of the state: whether what closes the egress in this stage was read back. None while not isolated.
+
+    In ``cut`` and ``cut_policy`` it is the catch-all rule as the press read it back (or ``converge`` in
+    ``cut_policy``), and nothing about the Allow list: a Block rule beats every Allow rule. In ``isolated`` the rule
+    is gone, so it is the Allow list as read now: one that came back on makes it False, and TDC writes nothing by
+    itself about that (it changes enforcement on a press only)."""
+    if not _fw_settings.isolated:
+        return None
+    stage = _fw_settings.stage
+    if stage == "isolated":
+        return allowed == []
+    if stage in ("cut", "cut_policy"):
+        return _fw_cut_verified is True
+    return False                                   # a marker with stage open: nothing in force was read back
+
+
 def _fw_isolate_state():
     # A way out that a fetch could not close again: the analyst has to be able to see it. Read without the
     # lock, because the sweep can hold that across a PowerShell call and this route must not wait for it:
     # list(dict.values()) is one atomic step, so the snapshot is never a half-changed dict.
     open_paths = [dict(entry) for entry in list(_fw_fetch_open.values())]
     in_flight = sum(state.get("holders", 0) for state in list(_fw_fetch_paths.values()))
-    out = {"isolated": bool(_fw_settings.isolated), "outbound_before": _fw_settings.outbound_before,
+    isolated = bool(_fw_settings.isolated)
+    out = {"isolated": isolated, "outbound_before": _fw_settings.outbound_before,
            "isolated_since": _fw_iso(_fw_settings.isolated_since), "ask_mode": _fw_settings.ask_mode,
            "settings_error": _fw_settings.load_error, "startup": _fw_startup,
+           "stage": _fw_settings.stage if isolated else "open", "converging": bool(_fw_converge_running),
+           "converge_note": _fw_converge_note,
+           "can_fetch": not _fw_cut_may_stand() and _fw_cut_rule_listed() is not True,
            "profiles_off": None, "profiles_error": None, "residual": FIREWALL_ISOLATED_RESIDUAL,
            "allowed_out": None, "allowed_out_error": None,
            "allow_disabled": len(_fw_settings.allow_disabled or ()),
@@ -12294,6 +12443,7 @@ def _fw_isolate_state():
     # what it does not close cost PowerShell (both cached)
     out["profiles_off"], out["profiles_error"] = _fw_profiles_off()
     out["allowed_out"], out["allowed_out_error"] = _fw_allowed_out()
+    out["verified"] = _fw_isolate_verified(out["allowed_out"])
     return out
 
 
@@ -12304,35 +12454,65 @@ def api_firewall_isolate():
     still enabled while ISOLATED is on, read back (``null`` while it is off or when ``allowed_out_error`` says it
     could not be read), ``allow_disabled``: how many of them ISOLATED holds switched off, and
     ``fetch_paths_open``: a way out of a finished fetch that would not close again — all for the banner).
-    POST ``{on: bool}``: switch ISOLATED; 409 when the Windows Firewall is off (it would accept the change and do nothing)."""
+    POST ``{on: bool}``: switch ISOLATED; 409 when the Windows Firewall is off (it would accept the change and do nothing).
+
+    ISOLATED on has two stages. The press writes one catch-all outbound Block rule, reads it back and answers
+    (``stage`` ``cut``, ``converging`` true, ``verified``: that rule read back); the thorough part runs afterwards in
+    one background worker (Windows' own Allow rules switched off, the default Block, then the rule dropped: ``stage``
+    ``isolated``, or kept where something still lets traffic out: ``cut_policy``). GET adds ``stage``,
+    ``converging`` (the worker runs), ``converge_note`` (what its last round said, or why it failed), ``verified``
+    (see _fw_isolate_verified) and ``can_fetch``: **always false in** ``cut`` **and** ``cut_policy``, because no
+    per-fetch Allow exception gets through a catch-all Block rule, so TDC cannot secure a sample there. Leaving stops
+    the worker at its next step and works from any stage."""
     if request.method == "GET":
         return _fw_json(_fw_isolate_state())
     data, problem = _fw_body(("on",), ("on",))
     if problem or not isinstance(data["on"], bool):
         return _fw_error(problem or "on must be true or false", 400)
-    # No separate profile check first: isolate reads the profiles itself, in the same call as Windows' own rules,
-    # and refuses with ProfileOffError (nothing changed) while one is off. Every PowerShell call costs seconds.
+    on = data["on"]
+    # The flag goes up before the call: converge holds firewall_rules' lock, and only sees the flag between its steps
+    stopped = _fw_converge_cancel(leaving=not on)
+    # No separate profile check first: isolate reads the profiles itself, in its first call, and refuses with
+    # ProfileOffError (nothing changed) while one is off. Every PowerShell call costs seconds.
+    done = None
     try:
-        done = firewall_rules.isolate(_fw_runner, data["on"], settings=_fw_settings)
+        done = firewall_rules.isolate(_fw_runner, on, settings=_fw_settings)
     except firewall_rules.ProfileOffError as e:
         return _fw_error(str(e), 409)
     except firewall_rules.RuleError as e:
         return _fw_error(str(e), 500)
     finally:
         _fw_forget_rules()
+        if not on:
+            _fw_left()
+        elif done is not None:
+            # the press does not read Windows' Allow rules, so its answer costs no call for them; kept before the
+            # worker starts, so that the worker's forgetting always comes after it
+            _fw_keep_allowed_out(done.get("allowed_out"), done.get("allowed_out_error"))
+            # only the press's own read-back counts as verified; converge's answer is never laid over it
+            _fw_converge_start(done["verified"])
+        elif stopped and _fw_settings.isolated:
+            _fw_converge_start(None)       # a refused press stopped the round of an isolation that stays on
     if done.get("profiles_off") is not None:
         _fw_keep_profiles(done["profiles_off"])                                      # just read back
-    if data["on"]:
-        _fw_keep_allowed_out(done.get("allowed_out"), done.get("allowed_out_error"))     # just read back
+    if on:
+        done = dict(done, converging=bool(_fw_converge_running))
     return _fw_json(dict(done, state=_fw_isolate_state()))
 
 
 def _fw_can_fetch(finding):
-    """Whether TDC's own fetch could reach the finding's endpoint: False while a block for every program stands
-    there (``block_fetch`` is refused then, and the deadline only blocks), None when the rules cannot be read."""
+    """Whether TDC's own fetch could reach the finding's endpoint: False while the cut may stand (stages ``cut`` and
+    ``cut_policy``, or a marker in any stage but ``isolated``: no per-fetch Allow exception gets through a catch-all
+    Block rule), False while the rule list names the cut rule (a crash can leave one without a marker), False while a
+    block for every program stands there (``block_fetch`` is refused then, and the deadline only blocks), None when
+    the rules cannot be read."""
+    if _fw_cut_may_stand():
+        return False
     found, _ = _fw_rules()
     if found is None:
         return None
+    if any(r.get("name") == firewall_rules.CUT_RULE for r in found):
+        return False
     return not _fw_address_wide_block(finding)
 
 
