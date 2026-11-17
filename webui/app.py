@@ -11195,9 +11195,10 @@ def _fw_forget_rules():
 
 
 # Which firewall profiles are off, for the state GET /isolate shows every LIVE tick. Reading it is a PowerShell
-# call and it changes about as often as somebody opens the firewall settings, so it is cached (an error for less
-# time, so it is asked again soon); an enforcement route forgets it. The enforcement routes themselves never use
-# the cache: they read the profiles fresh (_fw_firewall_off_message) and store what they found.
+# call and it changes about as often as somebody opens the firewall settings, so it is cached (an error, and any
+# read while ISOLATED is on, for less time: see _fw_profiles_ttl); an enforcement route forgets it. The enforcement
+# routes themselves never use the cache: they read the profiles fresh (_fw_firewall_off_message) and store what
+# they found.
 FIREWALL_PROFILES_TTL_S = 60
 # How far Sysmon's time of a connection and Windows' start time of a process may disagree (kill's PID-reuse test):
 # both read the same clock, so only Sysmon's millisecond precision, which cuts the time down
@@ -11231,22 +11232,33 @@ def _fw_read_profiles():
     return off, error
 
 
-def _fw_keep_profiles(off):
-    """Keep ``off`` (the profiles that are off, as an enforcement route just read them back) for _fw_profiles_off.
-    The default action is not in that answer, so it is kept as unknown and read when it is asked for."""
+def _fw_keep_profiles(off, blocking=None):
+    """Keep ``off`` (the profiles that are off, as an enforcement route just read them back) for _fw_profiles_off,
+    and ``blocking`` (those whose default outbound action in force is Block, from the same read) for
+    _fw_outbound_blocking. ``blocking`` None is kept as unknown and read when it is asked for."""
     global _fw_profiles_cache
     with _fw_profiles_lock:
-        _fw_profiles_cache = (time.monotonic(), list(off), None, None)
+        _fw_profiles_cache = (time.monotonic(), list(off), None, None if blocking is None else list(blocking))
 
 
 def _fw_fresh_profiles():
     """The cached ``(stamp, off, error, blocking)`` while it is fresh, else None."""
     with _fw_profiles_lock:
         cached = _fw_profiles_cache
-    if cached is not None and time.monotonic() - cached[0] < (FIREWALL_PROFILES_ERROR_TTL_S if cached[2]
-                                                               else FIREWALL_PROFILES_TTL_S):
+    if cached is not None and time.monotonic() - cached[0] < _fw_profiles_ttl(cached[2]):
         return cached
     return None
+
+
+def _fw_profiles_ttl(error):
+    """How long a profile read holds. While TDC isolates (the marker stands) as short as an error: a rule does
+    nothing on a profile whose firewall is off, so a profile switched off after the cut must reach ``verified``
+    within one or two polls of the tab, not a minute later. Being isolated is a deliberate, attended state, so a
+    call every 10 s there is the right price; otherwise the profiles change about as often as someone opens the
+    firewall settings."""
+    if error or _fw_settings.isolated:
+        return FIREWALL_PROFILES_ERROR_TTL_S
+    return FIREWALL_PROFILES_TTL_S
 
 
 def _fw_profiles_off():
@@ -12606,6 +12618,7 @@ def api_firewall_isolate():
         return _fw_error(problem or "on must be true or false", 400)
     on = data["on"]
     # The flag goes up before the call: converge holds firewall_rules' lock, and only sees the flag between its steps
+    # (and between the chunks of switching Windows' Allow rules off)
     stopped = _fw_converge_cancel(leaving=not on)
     # No separate profile check first: isolate reads the profiles itself, in its first call, and refuses with
     # ProfileOffError (nothing changed) while one is off. Every PowerShell call costs seconds.
@@ -12632,7 +12645,7 @@ def api_firewall_isolate():
             else:
                 _fw_left()
     if done.get("profiles_off") is not None:
-        _fw_keep_profiles(done["profiles_off"])                                      # just read back
+        _fw_keep_profiles(done["profiles_off"], done.get("outbound_blocking"))        # just read back
     if on:
         done = dict(done, converging=bool(_fw_converge_running))
     return _fw_json(dict(done, state=_fw_isolate_state()))

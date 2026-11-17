@@ -1704,6 +1704,31 @@ def test_a_profile_read_that_fails_is_cached_for_less_time(client, fw, tdc, monk
     assert client.get("/api/firewall/isolate").json["profiles_off"] == [] and _profile_reads(fw) == 2
 
 
+def test_while_isolated_a_profile_switched_off_shows_within_the_short_ttl(client, fw, tdc, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(tdc.time, "monotonic", lambda: clock[0])
+    assert client.post("/api/firewall/isolate", json={"on": True}).json["verified"] is True
+    assert client.get("/api/firewall/isolate").json["verified"] is True
+    fw.profiles = {"Domain": True, "Private": True, "Public": False}       # switched off right after the cut
+    clock[0] += tdc.FIREWALL_PROFILES_ERROR_TTL_S + 1
+    state = client.get("/api/firewall/isolate").json
+    assert state["profiles_off"] == ["Public"] and state["verified"] is False
+
+
+def test_the_press_keeps_the_default_action_it_read_so_the_state_needs_no_further_read(client, fw, tdc):
+    fw.run.calls.clear()
+    client.post("/api/firewall/isolate", json={"on": True})
+    assert tdc._fw_outbound_blocking() == [] and fw.run.ops() == ["Profiles", "Cut"]
+
+
+def test_the_leave_keeps_the_default_action_it_read_back(client, fw, tdc):
+    client.post("/api/firewall/isolate", json={"on": True})
+    fw.converge()
+    fw.run.calls.clear()
+    client.post("/api/firewall/isolate", json={"on": False})
+    assert tdc._fw_outbound_blocking() == [] and "Profiles" not in fw.run.ops()
+
+
 # ---- what ISOLATED does not close, and the start-up toast --------------------------------------
 
 

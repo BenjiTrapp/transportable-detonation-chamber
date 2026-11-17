@@ -1925,6 +1925,58 @@ def test_many_rule_names_travel_in_several_calls_each_as_base64_never_as_text():
     assert run.enabled_foreign() == []
 
 
+def _many_local_rules(count=400):
+    return {f"{{{i:08d}-aaaa-bbbb-cccc-dddddddddddd}} *weird, name": {"DisplayName": f"App {i}", "Source": "Local",
+                                                                     "Enabled": True}
+            for i in range(count)}
+
+
+def test_a_cancel_is_seen_between_the_chunks_of_switching_the_allow_rules_off():
+    run, settings = make(foreign=_many_local_rules())
+    rules_mod.isolate(run, True, settings=settings)
+    # a press or a leave raises the flag while the first chunk is under way
+    done = rules_mod.converge(run, settings=settings, cancelled=lambda: run.ops().count("DisableAllowOut") >= 1)
+    assert done["cancelled"] is True and done["stage"] == "cut" and rules_mod.CUT_RULE in run.rules
+    assert run.ops().count("DisableAllowOut") == 1, "the rest of the chunks were waited out"
+    assert "SetDefaultOutbound" not in run.ops()
+    still_on = run.enabled_foreign()
+    assert 0 < len(still_on) < 400                                    # half done, and that is said
+    assert str(400 - len(still_on)) in done["note"] and str(len(still_on)) in done["note"]
+    # the record names every one of them, the switched-off and the not-reached alike
+    assert sorted(settings.allow_disabled) == sorted(run.foreign)
+    left = rules_mod.isolate(run, False, settings=settings)
+    assert left["allow_disabled"] == [] and len(run.enabled_foreign()) == 400 and settings.allow_disabled == []
+
+
+def test_setting_the_allow_rules_reports_what_a_cancel_left_unreached():
+    run, _ = make(foreign=_many_local_rules())
+    done, failed, missing, unreached = rules_mod._set_allow_out(
+        run, list(run.foreign), False, cancelled=lambda: run.ops().count("DisableAllowOut") >= 1)
+    assert failed == [] and missing == [] and done and unreached
+    assert sorted(done + unreached) == sorted(run.foreign)
+    assert sorted(unreached) == run.enabled_foreign()
+
+
+def test_without_a_cancel_every_chunk_is_switched():
+    run, _ = make(foreign=_many_local_rules())
+    done, _, _, unreached = rules_mod._set_allow_out(run, list(run.foreign), False)
+    assert unreached == [] and len(done) == 400 and run.enabled_foreign() == []
+
+
+def test_the_press_carries_the_default_action_in_force_out_of_its_one_profile_read():
+    run, settings = make(foreign=STOCK, outbound={"Domain": "Block", "Private": "Allow", "Public": "Allow"})
+    done = rules_mod.isolate(run, True, settings=settings)
+    assert done["outbound_blocking"] == ["Domain"]
+    assert run.ops() == ["Profiles", "Cut"]
+
+
+def test_leaving_carries_the_default_action_it_read_back():
+    run, settings = make(foreign=STOCK)
+    thorough(run, settings)
+    left = rules_mod.isolate(run, False, settings=settings)
+    assert left["outbound_blocking"] == []
+
+
 def test_the_script_switches_only_local_outbound_allow_rules_that_are_not_ours():
     text = open(os.path.join(ROOT, "webui", "firewall_rules.ps1"), encoding="utf-8").read()
     body = text[text.index("function Set-AllowOut"):]
@@ -2461,6 +2513,18 @@ def test_a_callback_that_raises_is_not_taken_for_a_failed_read():
     with pytest.raises(RuntimeError, match="callback bug"):
         rules_mod.converge(run, settings=settings, cancelled=broken)
     assert run.ops() == [] and run.enabled_foreign() == ["CoreNet-DHCP-Out", DNS_RULE]
+
+
+def test_a_callback_that_raises_between_the_chunks_is_not_taken_for_a_failed_step():
+    run, settings = make(foreign=_many_local_rules())
+    rules_mod.isolate(run, True, settings=settings)
+
+    def broken():
+        if run.ops().count("DisableAllowOut") >= 1:
+            raise RuntimeError("callback bug")
+        return False
+    with pytest.raises(RuntimeError, match="callback bug"):
+        rules_mod.converge(run, settings=settings, cancelled=broken)
 
 
 def test_a_failed_fresh_cut_keeps_the_record_an_earlier_failed_leave_left():

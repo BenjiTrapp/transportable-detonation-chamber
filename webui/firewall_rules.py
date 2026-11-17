@@ -315,6 +315,11 @@ def _off_names(states: List[Dict[str, Any]]) -> List[str]:
     return [s["name"] for s in states if not s["enabled"]]
 
 
+def _blocking_names(states: List[Dict[str, Any]]) -> List[str]:
+    """The profiles whose default outbound action in force is Block."""
+    return [s["name"] for s in states if s["outbound"] == "Block"]
+
+
 def _off_text(names: Any) -> str:
     listed = names if isinstance(names, str) else ", ".join(names)
     return (f"Windows Firewall is switched off for: {listed or 'a profile'}. A rule or a default action "
@@ -934,16 +939,23 @@ def _name_chunks(names: List[str]) -> List[str]:
     return chunks
 
 
-def _set_allow_out(run, names: Any, on: bool) -> Tuple[List[str], List[Dict[str, str]], List[str]]:
-    """Switch the named local outbound Allow rules on or off: ``(done, failed, missing)``.
+def _set_allow_out(run, names: Any, on: bool, cancelled: Optional[Callable[[], bool]] = None
+                   ) -> Tuple[List[str], List[Dict[str, str]], List[str], List[str]]:
+    """Switch the named local outbound Allow rules on or off: ``(done, failed, missing, unreached)``.
 
     ``failed`` is ``[{name, problem}]``; ``missing`` the names that are no longer there as a local outbound Allow
-    rule. A call that fails as a whole raises ``RuleError``; what is done before it stays done."""
+    rule. ``cancelled`` is asked between two chunks (not before the first: the caller asks before the step), and when
+    it says True the rest is not sent: ``unreached`` names what no call was made for. A call that fails as a whole
+    raises ``RuleError``; what is done before it stays done."""
     op = "EnableAllowOut" if on else "DisableAllowOut"
     done: List[str] = []
     failed: List[Dict[str, str]] = []
     missing: List[str] = []
-    for chunk in _name_chunks(_clean_rule_names(names)):
+    chunks = _name_chunks(_clean_rule_names(names))
+    for index, chunk in enumerate(chunks):
+        if index and cancelled is not None and cancelled():
+            unreached = [n for rest in chunks[index:] for n in json.loads(base64.b64decode(rest).decode("utf-8"))]
+            return done, failed, missing, unreached
         data = _json(_ok(run, op, Names=chunk), op)
         if not isinstance(data, dict):
             raise RuleError(f"cannot read the answer of {op}")
@@ -954,7 +966,7 @@ def _set_allow_out(run, names: Any, on: bool) -> Tuple[List[str], List[Dict[str,
         missing += [str(n) for n in listed(data.get("missing")) if isinstance(n, str)]
         failed += [{"name": str(f.get("Name") or ""), "problem": _first_line(f.get("Error")) or "no message"}
                    for f in listed(data.get("failed")) if isinstance(f, dict)]
-    return done, failed, missing
+    return done, failed, missing, []
 
 
 def _reopen(run, names: Any) -> Tuple[List[str], Optional[str]]:
@@ -964,7 +976,7 @@ def _reopen(run, names: Any) -> Tuple[List[str], Optional[str]]:
     if not names:
         return [], None
     try:
-        _, failed, _ = _set_allow_out(run, names, True)
+        _, failed, _, _ = _set_allow_out(run, names, True)
     except RuleError as e:
         return names, _first_line(e)
     stuck = [f["name"] for f in failed if f["name"] in names]
@@ -1019,7 +1031,8 @@ def isolate(run, on: bool, *, settings) -> Dict[str, Any]:
     local rule that came back on is added to the record by the next ``converge``), and a marker without a recorded baseline (damaged) gets
     ``Allow`` as its baseline and ``note`` says so; a failure there is not undone either, because the isolation was
     already on. Returns ``{"isolated": True, "stage": "cut", "rule_id", "verified", "converging": True,
-    "outbound_before", "profiles_off", "note"}``.
+    "outbound_before", "profiles_off", "outbound_blocking", "note"}``; ``outbound_blocking`` names the profiles whose
+    default outbound action in force is Block, from the same profile read (the cut does not change it).
 
     TDC's own fetch is **not** allowed out by this: ``allow_fetch`` opens one address for the time of one fetch
     (see the module docstring).
@@ -1041,9 +1054,10 @@ def isolate(run, on: bool, *, settings) -> Dict[str, Any]:
     that a crash left standing (it says so in ``note``), and if the egress is nonetheless shut ``note`` says that TDC
     is not the one isolating and names the hatch.
     Returns ``{"isolated": False, "changed", "assumed_allow", "cut_removed", "outbound_after", "allow_disabled",
-    "note"}``, and ``profiles_off`` as read back when it changed something. ``cut_removed`` is True when the cut rule
-    was among what was removed (in stage ``isolated`` it is not there any more). Both directions give ``profiles_off``
-    so that the caller need not read the profiles once more.
+    "note"}``, and ``profiles_off`` and ``outbound_blocking`` as read back when it changed something.
+    ``cut_removed`` is True when the cut rule was among what was removed (in stage ``isolated`` it is not there any
+    more). Both directions give ``profiles_off`` and ``outbound_blocking`` so that the caller need not read the
+    profiles once more.
     """
     with _LOCK:
         return _isolate_on(run, settings) if on else _isolate_off(run, settings)
@@ -1111,7 +1125,7 @@ def _isolate_on(run, settings) -> Dict[str, Any]:
     problem = None if made["verified"] else f"The cut rule is not confirmed: {made['problem']}."
     return {"isolated": True, "stage": "cut", "rule_id": made["rule_id"], "verified": bool(made["verified"]),
             "converging": True, "outbound_before": remembered, "profiles_off": [],
-            "note": _join(note, problem, staged)}
+            "outbound_blocking": _blocking_names(states), "note": _join(note, problem, staged)}
 
 
 def converge(run, *, settings, cancelled: Callable[[], bool]) -> Dict[str, Any]:
@@ -1126,8 +1140,12 @@ def converge(run, *, settings, cancelled: Callable[[], bool]) -> Dict[str, Any]:
     (``refused``), because a worker that outlived a leave would switch off again the very rules the leave switched on.
 
     ``cancelled`` is asked before **every** PowerShell step (the read of the rules, their switching off, Block, the read
-    back, the read of the cut rule, its removal), and the work stops at the next one when it says True: ``{"cancelled":
-    True, "stage": "cut"}``. An exception from ``cancelled`` itself is not caught: it is the caller's bug, not a failed step. The cut rule is still standing then, so the egress is shut; what was switched off stays
+    back, the read of the cut rule, its removal) and between the chunks of the switching off, and the work stops at the
+    next one when it says True: ``{"cancelled": True, "stage": "cut"}``. A switching off stopped between its chunks
+    leaves the rest of the rules on; every one of them, switched off or not reached, was recorded before the first chunk,
+    so leaving still puts back all that was switched off (switching on one that is on changes nothing). An exception
+    from ``cancelled`` itself is not caught, wherever it is asked: it is the caller's bug, not a failed step. The cut
+    rule is still standing then, so the egress is shut; what was switched off stays
     recorded in ``settings.allow_disabled``, and leaving puts it back. The cut rule falls last, after the default is Block
     and the rules are off, so that at no moment is anything open. When something is still enabled that cannot be switched
     off from here (a group policy), the cut rule **stays**: it is the only thing that closes the egress there
@@ -1145,6 +1163,16 @@ def converge(run, *, settings, cancelled: Callable[[], bool]) -> Dict[str, Any]:
 
 
 def _converge(run, settings, cancelled: Callable[[], bool]) -> Dict[str, Any]:
+    raised: List[BaseException] = []
+
+    def asked() -> bool:
+        # an exception from the callback is the caller's bug: noted here so the catch-all below lets it through
+        try:
+            return cancelled()
+        except BaseException as e:
+            raised.append(e)
+            raise
+
     def result(stage: str, note: Optional[str] = None, *, verified: bool = False, still=None, error=None,
                stopped: bool = False, refused: bool = False) -> Dict[str, Any]:
         return {"stage": stage, "verified": verified, "allowed_out": still, "allowed_out_error": error,
@@ -1152,7 +1180,7 @@ def _converge(run, settings, cancelled: Callable[[], bool]) -> Dict[str, Any]:
 
     if not settings.isolated:
         return result("open", "ISOLATED is not on (there is no marker), so nothing was changed.", refused=True)
-    if cancelled():
+    if asked():
         return result("cut", "Cancelled before anything was read; the cut stands.", stopped=True)
     try:
         _, foreign = _allow_out_state(run)
@@ -1168,22 +1196,30 @@ def _converge(run, settings, cancelled: Callable[[], bool]) -> Dict[str, Any]:
             except Exception as e:
                 raise RuleError(f"the way back could not be saved ({type(e).__name__}: {_first_line(e)}); "
                                 "no rule was switched off") from e
-        if cancelled():
+        if asked():
             return result("cut", "Cancelled before anything was switched off; the cut stands.", stopped=True)
-        _set_allow_out(run, closing, False)       # one that stays on is read back below
-        if cancelled():
+        # the flag is asked between the chunks too: a press or a leave must not wait out a step of 135 rules
+        _, _, _, unreached = _set_allow_out(run, closing, False, asked)     # one that stays on is read back below
+        if unreached:
+            return result("cut", f"Cancelled while Windows' Allow rules were being switched off: "
+                                 f"{len(closing) - len(unreached)} of {len(closing)} were sent, {len(unreached)} were "
+                                 "not reached. The cut stands, and all of them stay recorded, so leaving puts back "
+                                 "every one that was switched off.", stopped=True)
+        if asked():
             return result("cut", "Cancelled after Windows' Allow rules were switched off; the cut stands.", stopped=True)
         off = _off_names(_apply_outbound(run, {n: "Block" for n in PROFILE_NAMES}))
         if off:
             raise RuleError(_off_text(off))
-        if cancelled():
+        if asked():
             return result("cut", "Cancelled after the default action was set to Block; the cut stands.", stopped=True)
         still, error = _still_open(run)
     except Exception as e:
+        if raised:
+            raise
         return result("cut", f"The thorough part of ISOLATED did not finish ({_first_line(e)}); the cut stands and the "
                              "egress is shut. Leaving ISOLATED puts back what was switched off.")
     if still == []:
-        if cancelled():
+        if asked():
             return result("cut", "Cancelled before the cut rule was removed; the cut stands.", still=still, stopped=True)
         gone = uncut(run)
         if not gone["removed"]:
@@ -1191,7 +1227,7 @@ def _converge(run, settings, cancelled: Callable[[], bool]) -> Dict[str, Any]:
                           still=still)
         stage, verified, note = "isolated", True, None
     else:
-        if cancelled():
+        if asked():
             return result("cut", "Cancelled before the cut rule was read back; the cut stands.", still=still, error=error,
                           stopped=True)
         stands = cut_stands(run)
@@ -1243,7 +1279,9 @@ def _isolate_off(run, settings) -> Dict[str, Any]:
         note = (f"The baseline recorded before ISOLATED is Block on {', '.join(shut)}: outbound stays shut there, "
                 "and TDC's own fetch is no longer let out either. That is the VM's own baseline, not a TDC lockout.")
     return {"isolated": False, "changed": True, "assumed_allow": assumed, "cut_removed": CUT_RULE in removed,
-            "outbound_after": target, "allow_disabled": stuck, "profiles_off": _off_names(states), "note": _join(note, _stuck_text(stuck, problem) if stuck else None)}
+            "outbound_after": target, "allow_disabled": stuck, "profiles_off": _off_names(states),
+            "outbound_blocking": _blocking_names(states),
+            "note": _join(note, _stuck_text(stuck, problem) if stuck else None)}
 
 
 def _not_isolating(run, settings) -> Dict[str, Any]:
