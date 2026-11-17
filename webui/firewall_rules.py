@@ -315,11 +315,6 @@ def _off_names(states: List[Dict[str, Any]]) -> List[str]:
     return [s["name"] for s in states if not s["enabled"]]
 
 
-def _blocking_names(states: List[Dict[str, Any]]) -> List[str]:
-    """The profiles whose default outbound action in force is Block."""
-    return [s["name"] for s in states if s["outbound"] == "Block"]
-
-
 def _off_text(names: Any) -> str:
     listed = names if isinstance(names, str) else ", ".join(names)
     return (f"Windows Firewall is switched off for: {listed or 'a profile'}. A rule or a default action "
@@ -1031,8 +1026,7 @@ def isolate(run, on: bool, *, settings) -> Dict[str, Any]:
     local rule that came back on is added to the record by the next ``converge``), and a marker without a recorded baseline (damaged) gets
     ``Allow`` as its baseline and ``note`` says so; a failure there is not undone either, because the isolation was
     already on. Returns ``{"isolated": True, "stage": "cut", "rule_id", "verified", "converging": True,
-    "outbound_before", "profiles_off", "outbound_blocking", "note"}``; ``outbound_blocking`` names the profiles whose
-    default outbound action in force is Block, from the same profile read (the cut does not change it).
+    "outbound_before", "profiles_off", "note"}``.
 
     TDC's own fetch is **not** allowed out by this: ``allow_fetch`` opens one address for the time of one fetch
     (see the module docstring).
@@ -1054,10 +1048,9 @@ def isolate(run, on: bool, *, settings) -> Dict[str, Any]:
     that a crash left standing (it says so in ``note``), and if the egress is nonetheless shut ``note`` says that TDC
     is not the one isolating and names the hatch.
     Returns ``{"isolated": False, "changed", "assumed_allow", "cut_removed", "outbound_after", "allow_disabled",
-    "note"}``, and ``profiles_off`` and ``outbound_blocking`` as read back when it changed something.
-    ``cut_removed`` is True when the cut rule was among what was removed (in stage ``isolated`` it is not there any
-    more). Both directions give ``profiles_off`` and ``outbound_blocking`` so that the caller need not read the
-    profiles once more.
+    "note"}``, and ``profiles_off`` as read back when it changed something. ``cut_removed`` is True when the cut rule
+    was among what was removed (in stage ``isolated`` it is not there any more). Both directions give ``profiles_off``
+    so that the caller need not read the profiles once more.
     """
     with _LOCK:
         return _isolate_on(run, settings) if on else _isolate_off(run, settings)
@@ -1125,7 +1118,7 @@ def _isolate_on(run, settings) -> Dict[str, Any]:
     problem = None if made["verified"] else f"The cut rule is not confirmed: {made['problem']}."
     return {"isolated": True, "stage": "cut", "rule_id": made["rule_id"], "verified": bool(made["verified"]),
             "converging": True, "outbound_before": remembered, "profiles_off": [],
-            "outbound_blocking": _blocking_names(states), "note": _join(note, problem, staged)}
+            "note": _join(note, problem, staged)}
 
 
 def converge(run, *, settings, cancelled: Callable[[], bool]) -> Dict[str, Any]:
@@ -1280,7 +1273,6 @@ def _isolate_off(run, settings) -> Dict[str, Any]:
                 "and TDC's own fetch is no longer let out either. That is the VM's own baseline, not a TDC lockout.")
     return {"isolated": False, "changed": True, "assumed_allow": assumed, "cut_removed": CUT_RULE in removed,
             "outbound_after": target, "allow_disabled": stuck, "profiles_off": _off_names(states),
-            "outbound_blocking": _blocking_names(states),
             "note": _join(note, _stuck_text(stuck, problem) if stuck else None)}
 
 

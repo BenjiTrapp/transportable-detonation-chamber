@@ -1715,18 +1715,43 @@ def test_while_isolated_a_profile_switched_off_shows_within_the_short_ttl(client
     assert state["profiles_off"] == ["Public"] and state["verified"] is False
 
 
-def test_the_press_keeps_the_default_action_it_read_so_the_state_needs_no_further_read(client, fw, tdc):
-    fw.run.calls.clear()
-    client.post("/api/firewall/isolate", json={"on": True})
-    assert tdc._fw_outbound_blocking() == [] and fw.run.ops() == ["Profiles", "Cut"]
-
-
-def test_the_leave_keeps_the_default_action_it_read_back(client, fw, tdc):
+def test_while_isolated_an_allow_rule_switched_on_again_shows_within_the_short_ttl(client, fw, tdc, monkeypatch):
+    from test_firewall_rules import STOCK, DNS_RULE
+    fw.run.foreign = {n: dict(r) for n, r in STOCK.items()}
+    clock = [1000.0]
+    monkeypatch.setattr(tdc.time, "monotonic", lambda: clock[0])
     client.post("/api/firewall/isolate", json={"on": True})
     fw.converge()
+    assert fw.settings.stage == "isolated" and client.get("/api/firewall/isolate").json["verified"] is True
+    fw.run.foreign[DNS_RULE]["Enabled"] = True          # switched on again from outside: the cut rule is gone here
+    clock[0] += tdc.FIREWALL_PROFILES_ERROR_TTL_S + 1
+    state = client.get("/api/firewall/isolate").json
+    assert [r["name"] for r in state["allowed_out"]] == [DNS_RULE] and state["verified"] is False
+
+
+def _press_starting_from(client, fw, tdc, start):
+    """The fake firewall in ``start`` with every cache of the route empty; then the calls of one press."""
+    from test_firewall_rules import STOCK
+    fw.run.foreign = {n: dict(r) for n, r in STOCK.items()}
+    if start != "open":
+        client.post("/api/firewall/isolate", json={"on": True})
+        if start == "isolated":
+            fw.converge()
+        elif start == "cut_policy":
+            fw.settings.set(stage="cut_policy")
+        assert fw.settings.stage == start
+    tdc._fw_forget_rules()
     fw.run.calls.clear()
-    client.post("/api/firewall/isolate", json={"on": False})
-    assert tdc._fw_outbound_blocking() == [] and "Profiles" not in fw.run.ops()
+    r = client.post("/api/firewall/isolate", json={"on": True})
+    assert r.status_code == 200 and r.json["stage"] == "cut" and r.json["state"]["can_fetch"] is False
+    return fw.run.ops()
+
+
+@pytest.mark.parametrize("start", ["open", "cut", "cut_policy", "isolated"])
+def test_the_press_makes_exactly_two_powershell_calls_whatever_it_starts_from(client, fw, tdc, start):
+    # the way back needs the profile read before the cut, so two is the floor: a field added to the answer that
+    # costs a third call (the rule list for can_fetch, the profiles for the default action...) fails here
+    assert _press_starting_from(client, fw, tdc, start) == ["Profiles", "Cut"]
 
 
 # ---- what ISOLATED does not close, and the start-up toast --------------------------------------

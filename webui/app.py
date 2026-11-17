@@ -11196,7 +11196,7 @@ def _fw_forget_rules():
 
 # Which firewall profiles are off, for the state GET /isolate shows every LIVE tick. Reading it is a PowerShell
 # call and it changes about as often as somebody opens the firewall settings, so it is cached (an error, and any
-# read while ISOLATED is on, for less time: see _fw_profiles_ttl); an enforcement route forgets it. The enforcement
+# read while ISOLATED is on, for less time: see _fw_isolate_fact_ttl); an enforcement route forgets it. The enforcement
 # routes themselves never use the cache: they read the profiles fresh (_fw_firewall_off_message) and store what
 # they found.
 FIREWALL_PROFILES_TTL_S = 60
@@ -11232,29 +11232,30 @@ def _fw_read_profiles():
     return off, error
 
 
-def _fw_keep_profiles(off, blocking=None):
-    """Keep ``off`` (the profiles that are off, as an enforcement route just read them back) for _fw_profiles_off,
-    and ``blocking`` (those whose default outbound action in force is Block, from the same read) for
-    _fw_outbound_blocking. ``blocking`` None is kept as unknown and read when it is asked for."""
+def _fw_keep_profiles(off):
+    """Keep ``off`` (the profiles that are off, as an enforcement route just read them back) for _fw_profiles_off.
+    The default action is not in that answer, so it is kept as unknown and read when it is asked for."""
     global _fw_profiles_cache
     with _fw_profiles_lock:
-        _fw_profiles_cache = (time.monotonic(), list(off), None, None if blocking is None else list(blocking))
+        _fw_profiles_cache = (time.monotonic(), list(off), None, None)
 
 
 def _fw_fresh_profiles():
     """The cached ``(stamp, off, error, blocking)`` while it is fresh, else None."""
     with _fw_profiles_lock:
         cached = _fw_profiles_cache
-    if cached is not None and time.monotonic() - cached[0] < _fw_profiles_ttl(cached[2]):
+    if cached is not None and time.monotonic() - cached[0] < _fw_isolate_fact_ttl(cached[2]):
         return cached
     return None
 
 
-def _fw_profiles_ttl(error):
-    """How long a profile read holds. While TDC isolates (the marker stands) as short as an error: a rule does
-    nothing on a profile whose firewall is off, so a profile switched off after the cut must reach ``verified``
-    within one or two polls of the tab, not a minute later. Being isolated is a deliberate, attended state, so a
-    call every 10 s there is the right price; otherwise the profiles change about as often as someone opens the
+def _fw_isolate_fact_ttl(error):
+    """How long a read of the profiles or of the Allow list holds. While TDC isolates (the marker stands) as short
+    as an error: ``verified`` rests on both, and a minute-old fact is the green badge lying. A rule does nothing on
+    a profile whose firewall is off, so a profile switched off after the cut must show within a poll or two; and in
+    stage ``isolated`` the cut rule is gone, so Block plus an empty Allow list is the only thing holding the egress,
+    and a rule switched on again from outside must show as soon. Being isolated is a deliberate, attended state, so
+    a call every 10 s there is the right price; otherwise these change about as often as someone opens the
     firewall settings."""
     if error or _fw_settings.isolated:
         return FIREWALL_PROFILES_ERROR_TTL_S
@@ -11280,7 +11281,8 @@ def _fw_outbound_blocking():
 
 
 # What still lets traffic out while ISOLATED is on (Windows' own outbound Allow rules that are enabled), for the
-# band: read back by isolate itself, then cached like the profiles and forgotten with them. Not read while
+# band: read back by isolate itself, then cached like the profiles (for as short a time while ISOLATED is on, which
+# is the only time it is read: see _fw_isolate_fact_ttl) and forgotten with them. Not read while
 # ISOLATED is off: then everything is let out anyway.
 _fw_allowed_cache = None                          # (stamp, rules | None, error | None) or None
 
@@ -11300,7 +11302,7 @@ def _fw_allowed_out():
         cached = _fw_allowed_cache
     if cached is not None:
         stamp, found, error = cached
-        if time.monotonic() - stamp < (FIREWALL_PROFILES_ERROR_TTL_S if error else FIREWALL_PROFILES_TTL_S):
+        if time.monotonic() - stamp < _fw_isolate_fact_ttl(error):
             return found, error
     try:
         found, error = firewall_rules.allowed_out(_fw_runner), None
@@ -12645,7 +12647,7 @@ def api_firewall_isolate():
             else:
                 _fw_left()
     if done.get("profiles_off") is not None:
-        _fw_keep_profiles(done["profiles_off"], done.get("outbound_blocking"))        # just read back
+        _fw_keep_profiles(done["profiles_off"])                                      # just read back
     if on:
         done = dict(done, converging=bool(_fw_converge_running))
     return _fw_json(dict(done, state=_fw_isolate_state()))

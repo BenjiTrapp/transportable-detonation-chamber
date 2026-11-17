@@ -1963,20 +1963,6 @@ def test_without_a_cancel_every_chunk_is_switched():
     assert unreached == [] and len(done) == 400 and run.enabled_foreign() == []
 
 
-def test_the_press_carries_the_default_action_in_force_out_of_its_one_profile_read():
-    run, settings = make(foreign=STOCK, outbound={"Domain": "Block", "Private": "Allow", "Public": "Allow"})
-    done = rules_mod.isolate(run, True, settings=settings)
-    assert done["outbound_blocking"] == ["Domain"]
-    assert run.ops() == ["Profiles", "Cut"]
-
-
-def test_leaving_carries_the_default_action_it_read_back():
-    run, settings = make(foreign=STOCK)
-    thorough(run, settings)
-    left = rules_mod.isolate(run, False, settings=settings)
-    assert left["outbound_blocking"] == []
-
-
 def test_the_script_switches_only_local_outbound_allow_rules_that_are_not_ours():
     text = open(os.path.join(ROOT, "webui", "firewall_rules.ps1"), encoding="utf-8").read()
     body = text[text.index("function Set-AllowOut"):]
