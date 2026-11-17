@@ -239,6 +239,13 @@ STOCK = {
     "CoreNet-Teredo-Out": {"DisplayName": "Core Networking - Teredo (UDP-Out)", "Group": "Core Networking", "Source": "Local", "Enabled": False},
 }
 GPO_RULE = {"{gpo-1}": {"DisplayName": "Lab proxy out", "Group": "", "Source": "GroupPolicy", "Enabled": True}}
+POLICY_STOCK = {**STOCK, **GPO_RULE}      # a rule no switch from here can turn off: the convergence ends in cut_policy
+
+
+def _after_calls(run, n):
+    """A ``cancelled`` that turns True once ``run`` has seen ``n`` more calls than it had when this was made."""
+    start = len(run.calls)
+    return lambda: len(run.calls) - start >= n
 
 
 def thorough(run, settings):
@@ -2086,3 +2093,101 @@ def test_converging_again_after_a_failed_converge_finishes_the_job_and_records_n
     assert second["stage"] == "isolated" and second["verified"] is True and rules_mod.CUT_RULE not in run.rules
     assert sorted(settings.allow_disabled) == ["CoreNet-DHCP-Out", DNS_RULE] and set(run.outbound.values()) == {"Block"}
     assert settings.stage == "isolated"
+
+
+# ---- leaving: from any stage, and the cut rule goes with it ----------------------------------
+
+
+def test_leaving_from_the_cut_stage_removes_the_rule_and_restores_the_baseline():
+    run, settings = make(foreign=STOCK, outbound="NotConfigured")
+    rules_mod.isolate(run, True, settings=settings)
+    done = rules_mod.isolate(run, False, settings=settings)
+    assert done["cut_removed"] is True and rules_mod.CUT_RULE not in run.rules
+    assert done["outbound_after"] == {n: "NotConfigured" for n in rules_mod.PROFILE_NAMES}
+    assert run.outbound == {n: "NotConfigured" for n in rules_mod.PROFILE_NAMES}
+    assert settings.stage == "open" and settings.isolated is False
+
+
+def test_leaving_half_way_through_a_converge_switches_every_recorded_rule_on_again():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    rules_mod.converge(run, settings=settings, cancelled=_after_calls(run, 1))
+    assert settings.allow_disabled                      # the record was made before anything was switched off
+    rules_mod.isolate(run, False, settings=settings)
+    assert all(r["Enabled"] for n, r in run.foreign.items() if n != "CoreNet-Teredo-Out")
+    assert settings.allow_disabled == [] and rules_mod.CUT_RULE not in run.rules
+
+
+def test_leaving_after_the_rules_were_switched_off_but_before_block_puts_them_back():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    stopped = rules_mod.converge(run, settings=settings, cancelled=_after_calls(run, 2))
+    assert stopped["cancelled"] is True and run.enabled_foreign() == []        # they were off when it stopped
+    done = rules_mod.isolate(run, False, settings=settings)
+    assert run.enabled_foreign() == ["CoreNet-DHCP-Out", DNS_RULE]
+    assert done["cut_removed"] is True and rules_mod.CUT_RULE not in run.rules and settings.stage == "open"
+    assert settings.allow_disabled == [] and set(run.outbound.values()) == {"Allow"}
+
+
+def test_leaving_from_cut_policy_removes_the_rule_too():
+    run, settings = make(foreign=POLICY_STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    assert settings.stage == "cut_policy" and rules_mod.CUT_RULE in run.rules
+    done = rules_mod.isolate(run, False, settings=settings)
+    assert done["cut_removed"] is True and rules_mod.CUT_RULE not in run.rules and settings.stage == "open"
+
+
+def test_leaving_from_the_isolated_stage_has_no_cut_rule_to_remove():
+    run, settings = make(foreign=STOCK)
+    thorough(run, settings)
+    done = rules_mod.isolate(run, False, settings=settings)
+    assert done["cut_removed"] is False and settings.stage == "open" and settings.isolated is False
+
+
+def test_the_stage_and_the_marker_are_forgotten_in_one_write():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    rules_mod.isolate(run, False, settings=settings)
+    assert settings.saved[-1]["stage"] == "open" and settings.saved[-1]["isolated"] is False
+    assert [s for s in settings.saved if "stage" in s and s["stage"] == "open"] == [settings.saved[-1]]
+
+
+def test_a_cut_rule_that_stays_after_leaving_is_raised_and_the_stage_stays_with_the_marker():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    run.stuck_rules = {rules_mod.CUT_RULE}
+    with pytest.raises(rules_mod.RuleError):
+        rules_mod.isolate(run, False, settings=settings)
+    assert settings.isolated is True and settings.stage == "cut"
+
+
+def test_leaving_without_a_marker_still_takes_a_stray_cut_rule_away():
+    run, settings = make(foreign=STOCK)
+    rules_mod.cut(run)                                  # no marker: a crash left it
+    done = rules_mod.isolate(run, False, settings=settings)
+    assert rules_mod.CUT_RULE not in run.rules and done["cut_removed"] is True
+    assert done["changed"] is True and rules_mod.CUT_RULE in done["note"] and "removed" in done["note"]
+
+
+def test_leaving_without_a_marker_and_without_a_cut_rule_removes_nothing():
+    run, settings = make(foreign=STOCK)
+    done = rules_mod.isolate(run, False, settings=settings)
+    assert done["cut_removed"] is False and done["changed"] is False and done["note"] is None
+
+
+def test_a_stray_cut_rule_that_cannot_be_removed_is_said_not_raised():
+    run, settings = make(foreign=STOCK)
+    rules_mod.cut(run)
+    run.stuck_rules = {rules_mod.CUT_RULE}
+    done = rules_mod.isolate(run, False, settings=settings)
+    assert done["cut_removed"] is False and rules_mod.CUT_RULE in run.rules
+    assert rules_mod.CUT_RULE in done["note"] and "tdc-unisolate" in done["note"]
+
+
+def test_leaving_without_a_marker_sweeps_when_the_cut_rule_cannot_be_looked_up():
+    run, settings = make(foreign=STOCK)
+    rules_mod.cut(run)
+    run.fail = {"Get": (1, "rpc failed")}
+    done = rules_mod.isolate(run, False, settings=settings)
+    assert rules_mod.CUT_RULE not in run.rules and done["cut_removed"] is True
