@@ -62,8 +62,9 @@ gründliche Arbeit danach nach.
    *Zweite Korrektur, nach der Messung am fertigen Weg.* Der Entwurf rechnete
    erst mit 2,13 s, dann mit 3,6 s. Beides war aus der **günstigsten** Messung
    hergeleitet. Ein einzelner PowerShell-Start gegen das NetSecurity-Modul
-   kostet auf dieser VM **2,1–3,5 s, je nach Last** (`Profiles` 1,13 s im
-   leeren Moment, 2,10 s unter Last; `Cut` 2,49 s bzw. 3,12 s; `List` 3,49 s).
+   kostet auf dieser VM **2,1–3,5 s, je nach Last** (Lauf A, die Messung am
+   fertigen Weg vor dem Aufruf-Log: `Profiles` 1,13 s im leeren Moment,
+   2,10 s unter Last; `Cut` 2,49 s bzw. 3,12 s; `List` 3,49 s).
    Der Druck braucht davon zwei — der Rückweg wird vor jeder Änderung gemerkt,
    und sein Wert kommt aus dem Profil-Lesen — plus einen dritten für den
    Zustand in der Antwort. Macht gemessen **8,8 s**.
@@ -72,7 +73,9 @@ gründliche Arbeit danach nach.
    denselben Druck) kam **nicht** von einer Sperre: das Log zeigt für die beiden
    Aufrufe des Drucks `wait_ms=0.0`. Sie kam daraus, dass die Aufrufe selbst
    langsamer werden, wenn der Server beschäftigt ist — im Druck gemessen
-   `Profiles` 5,66 s und `Cut` 7,29 s, dieselben Ops allein 1,65 s und 2,44 s.
+   `Profiles` 5,66 s und `Cut` 7,29 s, dieselben Ops allein 1,65 s und 2,44 s
+   (Lauf B, mit dem Aufruf-Log; ein anderer Moment als Lauf A oben, deshalb
+   andere Zahlen für dieselben Ops — beide sind echte Messungen).
 
    **Die Ursache liegt nicht im Panikschnitt, sondern in der Aufruf-Bilanz des
    ganzen Tabs.** Jedes `GET /api/firewall/isolate` löst `Profiles` *und*
@@ -89,7 +92,7 @@ gründliche Arbeit danach nach.
    | Druck insgesamt, je nach Last | **9,9 s – 16,9 s** |
    | Wartezeit auf eine Sperre dabei | **0 ms** |
    | Konvergenz bis `stage: isolated` | 59,3 s |
-   | Verlassen aus `cut` | wenige Sekunden |
+   | Verlassen aus `cut` | nicht gemessen; Schätzung aus den Aufrufen: zwei (`SetDefaultOutbound`, `RemoveIsolate`), ein dritter (`EnableAllowOut`), wenn der Arbeiter schon Regeln notiert hat — bei 1,13–3,49 s je Aufruf auf einer ruhigen Maschine etwa 2,3–10,5 s, unter Last mehr |
    | Verlassen aus `isolated` (135 Regeln zurück) | 57,5 s |
    | Das alte ISOLATED, zum Vergleich | 38,5 s |
 
@@ -282,8 +285,9 @@ sichern?*
 
 ### Der Ablauf beim Einschalten
 
-1. **Profile lesen** (`Profiles`, allein 1,65–2,10 s, im Druck unter Last
-   5,66 s), nicht die Allow-Regeln. Ist eines
+1. **Profile lesen** (`Profiles`: allein 1,13 s in Lauf A und 1,65 s in Lauf
+   B; unter Last 2,10 s in Lauf A und 5,66 s im Druck in Lauf B — siehe die
+   Ziele), nicht die Allow-Regeln. Ist eines
    aus: verweigern, nichts ändern. **Nicht** `AllowOut`: vor dem Schnitt wird
    keine Allow-Regel abgeschaltet, es gibt also noch nichts aufzuschreiben, und
    *was offen bliebe* ist für den Schnitt bedeutungslos — er schließt, weil
@@ -293,7 +297,8 @@ sichern?*
 2. `outbound_before` und Marker mit `settings.set` sichern. Scheitert das, wird
    **nichts** angefasst.
 3. `TDC-FW-ISO-cut` schreiben (oder eine verfälschte Regel reparieren) und
-   zurücklesen — ein Aufruf, allein 2,44 s, im Druck unter Last 7,29 s. Ab hier
+   zurücklesen — ein Aufruf: allein 2,49 s (Lauf A) bzw. 2,44 s (Lauf B), unter
+   Last 3,12 s (Lauf A) bzw. 7,29 s im Druck (Lauf B). Ab hier
    ist der Ausgang zu.
    `stage: "cut"` wird **danach** gesichert, denn vorher wäre es eine Stufe, die
    noch nicht gilt; der Marker aus Schritt 2 ist das, was ein Absturz hier
@@ -343,7 +348,8 @@ abgebrochen wurde.
 
 **Verlassen ist jederzeit möglich, auch mitten in der Konvergenz.** Das ist die
 Bedingung dafür, dass der Schnitt ohne Rückfrage auskommt: ein Fehldruck ist,
-solange die Stufe `cut` ist, in Sekunden rückgängig zu machen, nicht erst nach
+solange die Stufe `cut` ist, in Sekunden rückgängig zu machen (nicht gemessen;
+geschätzt aus zwei bis drei Aufrufen, siehe die Tabelle der Ziele), nicht erst nach
 der Konvergenz (59,3 s). Aus `isolated` dauert das Verlassen gemessen 57,5 s,
 weil 135 Regeln wieder an müssen. Dafür
 
@@ -478,7 +484,8 @@ Stufe (`ISOLATED` / `CUT`) als Text.
 **Rückfrage: beim Schneiden keine, beim Verlassen ja.** Das ist der Sinn eines
 Panikknopfes — ein Druck. Der Schnitt ist sicher (er sperrt nur, er zerstört
 nichts) und zu jedem Zeitpunkt rückgängig zu machen, auch mitten in der
-Konvergenz: aus `cut` in Sekunden, aus `isolated` in gemessen 57,5 s. Das Verlassen behält die heutige
+Konvergenz: aus `cut` in Sekunden (geschätzt, nicht gemessen), aus `isolated`
+in gemessen 57,5 s. Das Verlassen behält die heutige
 `tdcConfirm`-Rückfrage, denn dort läuft ein Sample wieder ins Netz.
 *Entscheidung des Autors, nicht des Nutzers — bitte prüfen.*
 
@@ -498,7 +505,9 @@ dass sie nicht holen konnte, statt eine Sicherung zu behaupten.
 Keine neue Route. `POST /api/firewall/isolate {on: true}` antwortet nach
 Schritt 4 (gemessen 8,8 s ruhig, 9,9–16,9 s unter Last) mit `stage: "cut"`,
 `verified` (die zurückgelesene Catch-all-Regel) und `converging: true`.
-`GET /api/firewall/isolate` bekommt `stage`, `converging`, `can_fetch` und
+`GET /api/firewall/isolate` bekommt `stage`, `converging`, `converge_note` (was
+die letzte Runde des Arbeiters sagte, oder warum sie scheiterte), `verified` (je
+Stufe, siehe oben), `can_fetch` und
 behält alles Heutige. `on: false` bleibt, wie es ist, und bricht einen
 laufenden Arbeiter ab.
 

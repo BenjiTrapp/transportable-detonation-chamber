@@ -2337,6 +2337,13 @@ def test_cut_policy_says_the_rule_stays_only_when_it_was_read_back_standing():
         if allowed is None:
             # an unreadable list is no proof of a group policy rule
             assert "a rule a group policy sets" not in held and "not known" in held
+        if allowed == []:
+            # cut_policy is reached on an open list and on an unreadable one: which, is not known now
+            assert "or the list of Allow rules could not be read" in held
+    # verified stops at the profiles before the rule is looked at: then the rule is not what is unknown
+    base = dict(HELD, isolated=True, stage="cut_policy", converging=False, can_fetch=False, allowed_out=gpo, verified=False)
+    unread = cut_view(dict(base, profiles_off=None))["bands"]
+    assert "but the firewall profiles could not be read" in unread and "but it was not read back as standing" not in unread
 
 
 def test_the_cut_does_not_ask_but_leaving_does():

@@ -102,9 +102,8 @@ for what to expect:
 
 | Measured | Result |
 |---|---|
-| One catch-all Block rule written and read back, one PowerShell call | 2.13 s (hand-written script), 2.49 s (the finished `Cut` verb) |
-| `Cut` alone, quiet machine | 2.44 s |
-| `Profiles` alone | 1.13 s in an empty moment, 1.65-2.10 s |
+| One catch-all Block rule written and read back, one PowerShell call | 2.13 s (hand-written script); the finished `Cut` verb alone 2.44-2.49 s (two quiet-moment runs) |
+| `Profiles` alone | 1.13-1.65 s (two quiet-moment runs); 2.10 s under load in the first run |
 | The press end to end (profiles read first, then the cut), quiet | 8.8 s |
 | The same press while the tab's polls load the machine | 9.9-16.9 s (inside it: `Profiles` 5.66 s, `Cut` 7.29 s; lock wait 0 ms) |
 | Convergence until `stage: "isolated"` | 59.3 s |
@@ -132,7 +131,7 @@ enabled**; that is the point of the design.
    figure under load is written down, not asserted. *If wrong (quiet, above
    12 s):* the button is not a panic button again. Look in
    `webui/logs/firewall-calls.log` at which of the two PowerShell calls it is
-   (`Profiles`, then `Cut`): alone 1.65-2.10 s and 2.44 s. A repair of a
+   (`Profiles`, then `Cut`): alone 1.13-1.65 s and 2.44-2.49 s. A repair of a
    falsified rule (item 7) is slower by design and does not count here.
 2. **The egress is shut while the cut stands.** *Check:* right after the answer of
    item 1, while `converging` is still `true` (the Allow rules are still mostly
@@ -303,7 +302,7 @@ again when it is left.
   (SetDefaultOutbound, EnableAllowOut, RemoveIsolate); the rules go through one
   pipeline per call (one call per ~6000 characters of names). *Check:* time
   `POST /api/firewall/isolate` both ways; it must stay well under
-  `RUN_TIMEOUT_S` (90 s). While it runs the button reads ISOLATING… / LEAVING…
+  `RUN_TIMEOUT_S` (90 s). While it runs the button reads CUTTING… / LEAVING…
   and an info toast says why it takes a while. **Measured** on the Windows 11
   ARM VM (135 local outbound Allow rules, 2026-11-17): **41.9 s on, 30.1 s
   off**. That is the expected figure, not a hang: switching that many rules is
@@ -630,7 +629,10 @@ Was dagegen zu tun wäre (eigene Arbeit, nicht Teil des Panikschnitts):
 2. `Profiles`, `AllowOut` und `List` teilen sich einen Cache mit einem
    gemeinsamen Auffrischer, statt dass drei Routen sie unabhängig anfordern.
 3. Nie zwei gleiche Aufrufe gleichzeitig: wer schon unterwegs ist, wird
-   abgewartet, nicht verdoppelt.
+   abgewartet, nicht verdoppelt. Das gilt auch für das `Get` der Schnitt-Regel,
+   das dieser Branch hinzugefügt hat (siehe unten): es ist **je Anfrage**, nicht
+   je Server — zwei gleichzeitige `GET /isolate` starten je eines, mit N offenen
+   Tabs also bis zu N in einem 10-s-Fenster.
 4. Erst danach ist eine Zielzahl für den Druck wieder sinnvoll — und sie lässt
    sich dann aus dem Log belegen.
 5. **Die Konvergenz hält `_LOCK` für ihren ganzen Lauf** (gefunden im

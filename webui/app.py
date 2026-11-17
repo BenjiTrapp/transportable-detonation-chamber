@@ -12309,8 +12309,10 @@ _fw_cut_verified = None                           # the cut rule read back by th
 _fw_leaving = 0                                   # leaves under way: every round stops at its next step meanwhile
 _fw_pressing = 0                                  # presses under way: a cut rule may stand before the stage says so
 # The newest read of the cut rule, whoever made it (the press, converge, the rule list of a poll, _fw_cut_stands):
-# ``(monotonic time the read started, stands)``, ``stands`` True, False or None (not readable). ``verified`` in the
-# cut stages rests on it as well as on the press's read-back, so that a rule removed or disabled from outside after
+# ``(monotonic time of the read, stands)``: when a List or a Get started; when the press or converge returned, because
+# their read-back is their last step (a List that began during the press saw no rule and must not outrank it).
+# ``stands`` is True, False or None (not readable). ``verified`` in the cut stages rests on it as well as on the
+# press's read-back, so that a rule removed or disabled from outside after
 # the press (wf.msc, the hatch, a sample with admin rights) stops reading as closed within the isolate TTL.
 _fw_cut_seen = None
 _fw_cut_unseen_at = float("-inf")                # reads that started before this are not kept
@@ -12756,9 +12758,12 @@ def api_firewall_isolate():
     # No separate profile check first: isolate reads the profiles itself, in its first call, and refuses with
     # ProfileOffError (nothing changed) while one is off. Every PowerShell call costs seconds.
     done = None
-    started = time.monotonic()
+    read_at = None
     try:
         done = firewall_rules.isolate(_fw_runner, on, settings=_fw_settings)
+        # its read-back of the cut rule is the last thing isolate() did: stamped when it returned, so a poll's List
+        # that began during the press, before Cut wrote, never outranks it
+        read_at = time.monotonic()
     except firewall_rules.ProfileOffError as e:
         return _fw_error(str(e), 409)
     except firewall_rules.RuleError as e:
@@ -12769,7 +12774,7 @@ def api_firewall_isolate():
         try:
             _fw_forget_rules()
             if on and done is not None:
-                _fw_saw_cut(bool(done["verified"]), started)    # the press's Cut read the rule back
+                _fw_saw_cut(bool(done["verified"]), read_at)    # the press's Cut read the rule back
                 # only the press's own read-back counts as verified; converge's answer is never laid over it
                 _fw_converge_start(done["verified"])
             elif on and stopped and _fw_settings.isolated:

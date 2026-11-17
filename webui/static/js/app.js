@@ -14471,11 +14471,16 @@ function renderFirewallBands() {
                 // Only a rule read back as standing "stays": after a restart this stage can be reached with none there
                 const why = still && still.length
                     ? `something that lets traffic out cannot be switched off from here (a rule a group policy sets): ${names(still)}`
-                    : still ? 'something let traffic out when this stage was reached (the list of Allow rules reads empty now)'
+                    : still ? 'when this stage was reached, something still let traffic out or the list of Allow rules could not be read (it reads empty now)'
                         : 'which of Windows\' own outbound Allow rules are still enabled is not known';
+                // Say what is known: verified stops at the profiles before the rule is looked at
+                const unknown = !Array.isArray(iso.profiles_off)
+                    ? 'but the firewall profiles could not be read, so whether it is in force is not known'
+                    : iso.profiles_off.length ? 'but a firewall profile is off, so it is not in force there'
+                        : 'but it was not read back as standing, or no longer stands when read again, so it may not be there';
                 text += iso.verified === true
                     ? `The rule stays, because ${why}. Leaving the cut is the way to secure samples again.`
-                    : `This stage keeps the rule, because ${why}; but it was not read back as standing, so it may not be there.`;
+                    : `This stage keeps the rule, because ${why}; ${unknown}.`;
             } else if (iso.converging) {
                 text += 'In the background Windows\' own outbound Allow rules are being switched off and the default set to Block; then the rule goes.';
             } else {

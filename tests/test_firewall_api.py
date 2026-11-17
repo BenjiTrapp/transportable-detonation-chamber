@@ -2194,6 +2194,47 @@ def test_a_failed_re_press_does_not_keep_the_old_read_back_and_reads_the_rule_ag
     assert "Get" in fw.run.ops() and state["verified"] is (rule_after == "stands")
 
 
+def test_a_rule_list_that_starts_during_the_press_and_lands_after_it_does_not_unverify_the_cut(client, fw, tdc,
+                                                                                                monkeypatch):
+    """The press's read-back is the last thing isolate() did, so it is stamped when isolate() returned: a List that
+    began after the POST started but before Cut wrote saw no cut rule, and must not outrank the read-back."""
+    clock = [1000.0]
+    monkeypatch.setattr(tdc.time, "monotonic", lambda: clock[0])
+    real_profiles, real_cut, real_list = fw.run.op_Profiles, fw.run.op_Cut, fw.run.op_List
+    inside, gate, lister = threading.Event(), threading.Event(), []
+
+    def profiles(p):
+        clock[0] += 3                                       # the profile read of the press takes seconds
+        return real_profiles(p)
+
+    def listing(p):
+        answer = real_list(p)                               # what the firewall holds now: no cut rule yet
+        inside.set()
+        gate.wait(10)
+        return answer
+
+    def cut(p):
+        lister.append(threading.Thread(target=lambda: tdc._fw_rules(force=True)))
+        lister[0].start()                                   # a poll's List begins in the middle of the press
+        assert inside.wait(10)
+        clock[0] += 3
+        return real_cut(p)
+
+    real_forget = tdc._fw_forget_rules
+
+    def forget():
+        gate.set()                                          # the List lands only after isolate() returned
+        lister[0].join(10)
+        real_forget()
+    fw.run.op_Profiles, fw.run.op_Cut, fw.run.op_List = profiles, cut, listing
+    monkeypatch.setattr(tdc, "_fw_forget_rules", forget)
+    r = client.post("/api/firewall/isolate", json={"on": True})
+    assert r.status_code == 200 and r.json["verified"] is True and not lister[0].is_alive()
+    monkeypatch.setattr(tdc, "_fw_forget_rules", real_forget)
+    state = client.get("/api/firewall/isolate").json
+    assert state["stage"] == "cut" and state["verified"] is True
+
+
 def test_a_cut_rule_narrowed_from_outside_is_not_verified(client, fw, tdc, monkeypatch):
     clock, _ = _cut_rule_removed_from_outside(client, fw, tdc, monkeypatch, False)
     fw.run.rules["TDC-FW-ISO-cut"] = fw.run.view("TDC-FW-ISO-cut", Enabled=False)     # back, but disabled
