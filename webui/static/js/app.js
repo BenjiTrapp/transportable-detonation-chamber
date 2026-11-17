@@ -13601,7 +13601,7 @@ function fwCutState(iso = fwState.isolate) {
         reopened: ['ISOLATED · OPEN', `Isolated, but ${holes && !(still && still.length) ? 'a finished fetch left a way out open' : 'an outbound Allow rule is enabled again'} and lets traffic out.`],
         nofetch: ['CUT · NO FETCH', `${held} It stays: something a group policy allows cannot be switched off from here.`],
         unconfirmed: ['ISOLATED · NOT CONFIRMED', 'ISOLATED is on, but that nothing gets out was not confirmed.'],
-        cutunconfirmed: ['CUT · NOT CONFIRMED', 'Whether the cut holds is not confirmed: its rule was not read back, or the firewall profiles could not be.'],
+        cutunconfirmed: ['CUT · NOT CONFIRMED', 'Whether the cut holds is not confirmed: its rule was not read back as standing (or, read again, no longer stands), or the firewall profiles could not be read.'],
         cutoff: ['CUT · FIREWALL OFF', offText],
         isooff: ['ISOLATED · FIREWALL OFF', offText],
     }[key];
@@ -14464,12 +14464,18 @@ function renderFirewallBands() {
             let text = iso.verified === true
                 ? `<strong>CUT${since}.</strong> One outbound Block rule for every program stands and was read back; a Block rule beats every Allow rule, and loopback stays open. `
                 : `<strong>CUT${since}, not confirmed.</strong> ${Array.isArray(iso.profiles_off)
-                    ? 'The catch-all Block rule was not read back, so whether outbound is shut is not known. '
+                    ? 'The catch-all Block rule was not read back as standing, or no longer stands when read again, so whether outbound is shut is not known. '
                     : 'The firewall profiles could not be read, so whether the catch-all Block rule is in force, and outbound shut, is not known. '}`;
             text += '<strong>TDC cannot secure a sample in this state</strong>: no fetch gets through a catch-all Block rule. ';
             if (stage === 'cut_policy') {
-                text += 'The rule stays, because something that lets traffic out cannot be switched off from here (a rule a group policy sets)'
-                    + `${still && still.length ? `: ${names(still)}` : ''}. Leaving the cut is the way to secure samples again.`;
+                // Only a rule read back as standing "stays": after a restart this stage can be reached with none there
+                const why = still && still.length
+                    ? `something that lets traffic out cannot be switched off from here (a rule a group policy sets): ${names(still)}`
+                    : still ? 'something let traffic out when this stage was reached (the list of Allow rules reads empty now)'
+                        : 'which of Windows\' own outbound Allow rules are still enabled is not known';
+                text += iso.verified === true
+                    ? `The rule stays, because ${why}. Leaving the cut is the way to secure samples again.`
+                    : `This stage keeps the rule, because ${why}; but it was not read back as standing, so it may not be there.`;
             } else if (iso.converging) {
                 text += 'In the background Windows\' own outbound Allow rules are being switched off and the default set to Block; then the rule goes.';
             } else {

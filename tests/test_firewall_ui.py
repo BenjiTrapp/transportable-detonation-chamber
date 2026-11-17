@@ -2322,6 +2322,23 @@ def test_pressing_cuts_at_once_or_leaves_after_asking_whatever_the_stage():
     assert "background" in securing and "stop" in securing
 
 
+@needs_node
+def test_cut_policy_says_the_rule_stays_only_when_it_was_read_back_standing():
+    """After a restart cut_policy can be reached with no cut rule standing (start-up knew it is absent) and an Allow
+    list that is open or unreadable: the band must not say the rule stays."""
+    gpo = [{"name": "{gpo}", "display": "Lab proxy out", "source": "GroupPolicy"}]
+    for allowed, error in ((gpo, None), (None, "rpc"), ([], None)):
+        base = dict(HELD, isolated=True, stage="cut_policy", converging=False, can_fetch=False, allowed_out=allowed,
+                    allowed_out_error=error)
+        held = cut_view(dict(base, verified=True))["bands"]
+        absent = cut_view(dict(base, verified=False))["bands"]
+        assert "The rule stays" in held, allowed
+        assert "The rule stays" not in absent and "not read back as standing" in absent, allowed
+        if allowed is None:
+            # an unreadable list is no proof of a group policy rule
+            assert "a rule a group policy sets" not in held and "not known" in held
+
+
 def test_the_cut_does_not_ask_but_leaving_does():
     assert _function_source("fwToggleIsolated").count("tdcConfirm(") == 1
 
