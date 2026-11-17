@@ -1525,8 +1525,9 @@ def test_isolate_says_what_windows_own_rules_still_let_out_and_caches_it(client,
     assert client.get("/api/firewall/isolate").json["allowed_out"] is None          # off: nothing to read
     assert "AllowOut" not in fw.run.ops()
     on = client.post("/api/firewall/isolate", json={"on": True}).json
-    assert on["stage"] == "cut" and on["state"]["allow_disabled"] == 2
+    assert on["stage"] == "cut" and on["state"]["allow_disabled"] == 0         # the press records nothing about them
     done = tdc.firewall_rules.converge(fw.run, settings=fw.settings, cancelled=lambda: False)     # the thorough part
+    assert len(fw.settings.allow_disabled) == 2
     assert done["stage"] == "cut_policy" and [r["name"] for r in done["allowed_out"]] == ["{gpo-1}"]
     reads = fw.run.ops().count("AllowOut")
     clock = [1000.0]
@@ -1591,18 +1592,18 @@ def test_an_address_wide_block_removed_outside_tdc_no_longer_refuses_block_fetch
     assert client.post("/api/firewall/decide", json={"id": pid, "action": "block_fetch"}).status_code == 200
 
 
-def test_the_isolated_button_costs_two_powershell_calls_to_cut_four_to_converge_and_three_off(client, fw, tdc):
+def test_the_isolated_button_costs_two_powershell_calls_to_cut_six_to_converge_and_three_off(client, fw, tdc):
     from test_firewall_rules import STOCK
     fw.run.foreign = {n: dict(r) for n, r in STOCK.items()}
     fw.run.calls.clear()
     on = client.post("/api/firewall/isolate", json={"on": True})
     assert on.status_code == 200 and on.json["verified"] is True and on.json["stage"] == "cut"
     assert on.json["state"]["profiles_off"] == []
-    assert fw.run.ops() == ["AllowOut", "Cut"]
+    assert fw.run.ops() == ["Profiles", "Cut"]
     fw.run.calls.clear()
     done = tdc.firewall_rules.converge(fw.run, settings=fw.settings, cancelled=lambda: False)
     assert done["stage"] == "isolated" and done["verified"] is True
-    assert fw.run.ops() == ["DisableAllowOut", "SetDefaultOutbound", "AllowOut", "Remove", "Get"]
+    assert fw.run.ops() == ["AllowOut", "DisableAllowOut", "SetDefaultOutbound", "AllowOut", "Remove", "Get"]
     fw.run.calls.clear()
     off = client.post("/api/firewall/isolate", json={"on": False})
     assert off.status_code == 200 and off.json["state"]["profiles_off"] == []

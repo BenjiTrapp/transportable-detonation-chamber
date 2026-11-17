@@ -33,9 +33,9 @@ Networking's DNS among them), so ISOLATED also switches off every enabled local 
 TDC's and remembers exactly which (``Settings.allow_disabled``); leaving switches exactly those on again. A rule
 from another store, a group policy above all, cannot be switched off locally: what is still enabled is read back
 after the switch (``allowed_out``) and said, and ISOLATED is ``verified`` only when that list is empty. The order is:
-profiles checked, Windows' rules read, the previous ``DefaultOutboundAction``, the rule names and the marker saved
-in ``Settings`` *before* anything changes, then the cut (``isolate``, below); after it ``converge``: Windows' rules
-switched off, then Block, then read back, then the cut rule removed. Leaving goes backwards and is never refused for
+profiles read and checked, the previous ``DefaultOutboundAction`` and the marker saved in ``Settings`` *before*
+anything changes, then the cut (``isolate``, below); after it ``converge``: Windows' rules read, their names saved,
+they are switched off, then Block, then read back, then the cut rule removed. Leaving goes backwards and is never refused for
 a profile that is off. Every step is one PowerShell call however many rules it touches, because a call costs seconds
 on a small VM.
 
@@ -987,21 +987,22 @@ def open_text(still: Optional[List[Dict[str, Any]]], error: Optional[str]) -> Op
 def isolate(run, on: bool, *, settings) -> Dict[str, Any]:
     """Turn ISOLATED on or off. On has two stages: ``isolate`` cuts, ``converge`` tidies up afterwards.
 
-    On, in this order: all profiles must be on (``ProfileOffError`` otherwise, with nothing changed). Windows' own enabled
-    outbound Allow rules are read (``allowed_out``) together with the profiles; when they cannot be, nothing is changed,
-    because what would stay open is not known. The previous ``DefaultOutboundAction``, the marker and the names of the
-    *local* rules that ``converge`` is about to switch off (``settings.allow_disabled``) are saved before anything else
-    changes (when that cannot be saved nothing is touched). Then ``cut`` writes the one catch-all outbound Block rule and
-    reads it back, ``settings.stage`` becomes ``cut`` and the call returns. That is all that happens here: the egress is
-    shut from that moment (a Block rule beats every Allow rule), and the ~135 Allow rules of Windows are still enabled,
-    the default action still what it was. ``converging`` is True: the slow, thorough part is ``converge``, which the
-    caller runs afterwards and in the background. In stage ``cut`` ``verified`` means that the cut rule was read back
-    as the catch-all, enabled, on all three profiles; it says nothing yet about Windows' own rules, ``allowed_out`` is
-    not part of this answer, and **no fetch is let out while the cut stands** (``allow_fetch`` has nothing to get through).
+    On, in this order: the profiles are read (one call) and must all be on (``ProfileOffError`` otherwise, with nothing
+    changed; unreadable, nothing changed either). The previous ``DefaultOutboundAction`` and the marker are saved before
+    anything else changes (when that cannot be saved nothing is touched). Then ``cut`` writes the one catch-all outbound
+    Block rule and reads it back, ``settings.stage`` becomes ``cut`` and the call returns. That is all that happens here:
+    the egress is shut from that moment (a Block rule beats every Allow rule), and the ~135 Allow rules of Windows are
+    neither read nor touched, the default action still what it was. They need not be: before the cut nothing has been
+    switched off, so there is nothing to record, and what would stay open is no question for a rule that closes by Block
+    beating Allow. ``converging`` is True: the slow, thorough part is ``converge``, which the caller runs afterwards and
+    in the background; it reads those rules and records the local ones in ``settings.allow_disabled`` before it switches
+    any off. In stage ``cut`` ``verified`` means that the cut rule was read back as the catch-all, enabled, on all three
+    profiles, and nothing more; ``allowed_out`` is not part of this answer, and **no fetch is let out while the cut
+    stands** (``allow_fetch`` has nothing to get through).
     When the cut fails, a fresh isolation is undone (the marker and the memory forgotten, what it may have written
     removed; if even that fails the marker stays and the message names ``scripts/tdc-unisolate.ps1``). Isolating while
-    isolated cuts again and keeps the first memory of the default action and the record of the rules switched off,
-    adds any local rule that is enabled again to the record, and a marker without a recorded baseline (damaged) gets
+    isolated cuts again and keeps the first memory of the default action and the record of the rules switched off (a
+    local rule that came back on is added to the record by the next ``converge``), and a marker without a recorded baseline (damaged) gets
     ``Allow`` as its baseline and ``note`` says so; a failure there is not undone either, because the isolation was
     already on. Returns ``{"isolated": True, "stage": "cut", "rule_id", "verified", "converging": True,
     "outbound_before", "profiles_off", "note"}``.
@@ -1034,16 +1035,14 @@ def _join(*parts: Optional[str]) -> Optional[str]:
 
 
 def _isolate_on(run, settings) -> Dict[str, Any]:
+    # Only the profiles are read before the cut: nothing is switched off yet, so there is nothing to record about
+    # Windows' Allow rules, and the cut closes by Block beating Allow whether or not they could be read (``converge``
+    # reads them when it needs them).
     try:
-        states, foreign = _allow_out_state(run)      # the profiles and Windows' rules, in one call
-    except RuleError as e:
-        off = _off_names(_profiles(run))
-        if off:
-            raise ProfileOffError(_off_text(off)) from e
-        raise RuleError(f"Windows' own outbound Allow rules could not be read, so what ISOLATED would leave open is not "
-                        f"known; nothing was changed ({_first_line(e)})") from e
-    if states is None:
         states = _profiles(run)
+    except RuleError as e:
+        raise RuleError(f"the firewall profiles could not be read, so the way back cannot be recorded; nothing was "
+                        f"changed ({_first_line(e)})") from e
     off = _off_names(states)
     if off:
         raise ProfileOffError(_off_text(off))
@@ -1064,16 +1063,10 @@ def _isolate_on(run, settings) -> Dict[str, Any]:
     else:
         remembered = _encode_outbound(current)
     recorded = _clean_rule_names(getattr(settings, "allow_disabled", None))
-    closing = _clean_rule_names(recorded + [r["name"] for r in foreign if r["local"]])
-    changes: Dict[str, Any] = {}
     if not already:
-        changes = {"outbound_before": remembered, "isolated": True,
-                   "isolated_since": (settings.isolated_since or time.time()) if damaged else time.time()}
-    if closing != recorded:
-        changes["allow_disabled"] = closing
-    if changes:
         try:
-            settings.set(**changes)
+            settings.set(outbound_before=remembered, isolated=True,
+                         isolated_since=(settings.isolated_since or time.time()) if damaged else time.time())
         except Exception as e:
             raise RuleError(f"the way back could not be saved ({type(e).__name__}: {_first_line(e)}); "
                             "nothing was changed") from e
@@ -1102,10 +1095,15 @@ def _isolate_on(run, settings) -> Dict[str, Any]:
 
 
 def converge(run, *, settings, cancelled: Callable[[], bool]) -> Dict[str, Any]:
-    """The thorough half of ISOLATED, after ``isolate`` cut: Windows' own outbound Allow rules that ``isolate`` recorded
-    switched off, ``DefaultOutboundAction Block`` set and read back, what still lets traffic out read back, and then, when
-    nothing does, the cut rule removed. It takes tens of seconds (one call per step, each of them seconds), which is why it
-    is not part of the press: the caller runs it in the background.
+    """The thorough half of ISOLATED, after ``isolate`` cut. It reads Windows' own enabled outbound Allow rules
+    (``allowed_out``; unreadable means nothing is switched off), records the *local* ones in ``settings.allow_disabled``
+    **before** it switches them off (not saved means none is touched), sets ``DefaultOutboundAction Block`` and reads it
+    back, reads back what still lets traffic out, and then, when nothing does, removes the cut rule. It takes tens of
+    seconds (one call per step, each of them seconds), which is why it is not part of the press: the caller runs it in
+    the background.
+
+    No marker, no work: when ``settings.isolated`` is False (a leave came first) it changes nothing and says so
+    (``refused``), because a worker that outlived a leave would switch off again the very rules the leave switched on.
 
     ``cancelled`` is asked before **every** call, and the work stops at the next one when it says True: ``{"cancelled":
     True, "stage": "cut"}``. The cut rule is still standing then, so the egress is shut; what was switched off stays
@@ -1115,23 +1113,43 @@ def converge(run, *, settings, cancelled: Callable[[], bool]) -> Dict[str, Any]:
     (``stage`` ``cut_policy``). A step that fails leaves the cut rule standing too and ends in ``stage`` ``cut``, with
     the failure in ``note``; nothing is rolled back, because the state is closed and the way back is in ``allow_disabled``.
 
-    Returns ``{"stage", "verified", "allowed_out", "allowed_out_error", "cancelled", "note"}``. ``verified`` is True only
-    when Block was read back **and** the list of rules still enabled was read and is empty and the cut rule is read as
-    gone (``isolated``), or the cut rule is read back as standing (``cut_policy``)."""
+    Returns ``{"stage", "verified", "allowed_out", "allowed_out_error", "cancelled", "refused", "note"}``. ``verified``
+    means that the **cut rule was read back** where it stands, and nothing more: it closes the egress whether or not the
+    list of Allow rules could be read, because a Block rule beats every Allow rule. An unreadable list decides only
+    whether the rule may be dropped, and then it may not. So ``verified`` is True in ``cut_policy`` (the rule read back as
+    standing) and in ``isolated`` (Block read back, the list read and empty, the rule read as gone); do not "fix" the
+    first by tying it to the list."""
     with _LOCK:
         return _converge(run, settings, cancelled)
 
 
 def _converge(run, settings, cancelled: Callable[[], bool]) -> Dict[str, Any]:
     def result(stage: str, note: Optional[str] = None, *, verified: bool = False, still=None, error=None,
-               stopped: bool = False) -> Dict[str, Any]:
+               stopped: bool = False, refused: bool = False) -> Dict[str, Any]:
         return {"stage": stage, "verified": verified, "allowed_out": still, "allowed_out_error": error,
-                "cancelled": stopped, "note": note}
+                "cancelled": stopped, "refused": refused, "note": note}
 
+    if not settings.isolated:
+        return result("open", "ISOLATED is not on (there is no marker), so nothing was changed.", refused=True)
     try:
         if cancelled():
+            return result("cut", "Cancelled before anything was read; the cut stands.", stopped=True)
+        _, foreign = _allow_out_state(run)
+    except Exception as e:
+        return result("cut", f"Windows' own outbound Allow rules could not be read, so none was switched off ({_first_line(e)}); "
+                             "the cut stands and the egress is shut.")
+    recorded = _clean_rule_names(getattr(settings, "allow_disabled", None))
+    closing = _clean_rule_names(recorded + [r["name"] for r in foreign if r["local"]])
+    try:
+        if closing != recorded:
+            try:
+                settings.set(allow_disabled=closing)
+            except Exception as e:
+                raise RuleError(f"the way back could not be saved ({type(e).__name__}: {_first_line(e)}); "
+                                "no rule was switched off") from e
+        if cancelled():
             return result("cut", "Cancelled before anything was switched off; the cut stands.", stopped=True)
-        _set_allow_out(run, getattr(settings, "allow_disabled", None), False)      # one that stays on is read back below
+        _set_allow_out(run, closing, False)       # one that stays on is read back below
         if cancelled():
             return result("cut", "Cancelled after Windows' Allow rules were switched off; the cut stands.", stopped=True)
         off = _off_names(_apply_outbound(run, {n: "Block" for n in PROFILE_NAMES}))

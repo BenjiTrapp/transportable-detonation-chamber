@@ -640,7 +640,7 @@ def test_isolate_refused_for_a_profile_that_is_off_changes_and_remembers_nothing
     with pytest.raises(rules_mod.ProfileOffError) as e:
         thorough(run, settings)
     assert "Private" in str(e.value)
-    assert run.ops() == ["AllowOut"] and settings.saved == []         # the profiles come with Windows' rules
+    assert run.ops() == ["Profiles"] and settings.saved == []
 
 
 def test_isolate_writes_no_allow_rule_of_its_own():
@@ -656,7 +656,7 @@ def test_isolate_orders_memory_then_allow_rules_then_block():
     run, settings = make(outbound="Allow")
     thorough(run, settings)
     kinds = [t[0] for t in run.timeline]
-    first_write = min(i for i, k in enumerate(kinds) if k in ("Create", "DisableAllowOut", "SetDefaultOutbound"))
+    first_write = min(i for i, k in enumerate(kinds) if k in ("Create", "Cut", "DisableAllowOut", "SetDefaultOutbound"))
     assert kinds[first_write - 1] == "settings"                       # the way back is saved before anything changes
     assert settings.saved[0] == {"outbound_before": "Allow", "isolated": True, "isolated_since": settings.saved[0]["isolated_since"]}
     assert "Create" not in kinds
@@ -1362,8 +1362,10 @@ def test_the_rule_names_are_saved_before_anything_changes_and_closed_before_bloc
     thorough(run, settings)
     kinds = [t[0] for t in run.timeline]
     first_write = min(i for i, k in enumerate(kinds) if k in ("Create", "Cut", "DisableAllowOut", "SetDefaultOutbound"))
-    assert kinds[first_write - 1] == "settings" and "allow_disabled" in settings.saved[0]
-    assert kinds.index("AllowOut") < first_write                          # read before anything changes
+    assert kinds[first_write - 1] == "settings" and "outbound_before" in settings.saved[0]       # before the cut
+    assert kinds[first_write] == "Cut"
+    names = next(i for i, (k, v) in enumerate(run.timeline) if k == "settings" and "allow_disabled" in v)
+    assert kinds.index("AllowOut") < names < kinds.index("DisableAllowOut")      # read, noted, only then switched off
     assert "Create" not in kinds and kinds.index("DisableAllowOut") < kinds.index("SetDefaultOutbound")
     assert kinds.index("SetDefaultOutbound") < len(kinds) - 1 - kinds[::-1].index("AllowOut")      # and read back after
     run.timeline.clear()
@@ -1398,12 +1400,59 @@ def test_a_local_rule_that_will_not_switch_off_stays_in_the_read_back():
     assert rules_mod.CUT_RULE in run.rules
 
 
-def test_isolated_is_refused_when_windows_own_rules_cannot_be_read():
+def test_converging_switches_nothing_off_when_windows_own_rules_cannot_be_read():
     run, settings = make(foreign=STOCK, fail={"AllowOut": (1, "access denied")})
+    rules_mod.isolate(run, True, settings=settings)           # the cut does not need that list
+    done = rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    assert done["stage"] == "cut" and "could not be read" in done["note"] and "access denied" in done["note"]
+    assert "DisableAllowOut" not in run.ops() and "SetDefaultOutbound" not in run.ops()
+    assert run.enabled_foreign() == ["CoreNet-DHCP-Out", DNS_RULE] and rules_mod.CUT_RULE in run.rules
+    assert settings.allow_disabled == []
+
+
+def test_nothing_is_cut_when_the_profiles_cannot_be_read():
+    run, settings = make(foreign=STOCK, fail={"Profiles": (1, "access denied")})
     with pytest.raises(rules_mod.RuleError) as e:
-        thorough(run, settings)
-    assert "nothing was changed" in str(e.value)
-    assert run.writes() == [] and settings.saved == [] and run.enabled_foreign() == ["CoreNet-DHCP-Out", DNS_RULE]
+        rules_mod.isolate(run, True, settings=settings)
+    assert "nothing was changed" in str(e.value) and "access denied" in str(e.value)
+    assert run.rules == {} and settings.saved == [] and "Cut" not in run.ops()
+
+
+def test_converging_switches_nothing_off_when_the_rule_names_cannot_be_saved():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    settings.fail = True
+    done = rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    assert done["stage"] == "cut" and "no rule was switched off" in done["note"]
+    assert "DisableAllowOut" not in run.ops() and rules_mod.CUT_RULE in run.rules
+    assert run.enabled_foreign() == ["CoreNet-DHCP-Out", DNS_RULE]
+
+
+def test_converge_refuses_when_the_marker_is_gone():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    rules_mod.isolate(run, False, settings=settings)               # a leave came first
+    run.calls.clear()
+    done = rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    assert done["refused"] is True and done["stage"] == "open" and "no marker" in done["note"]
+    assert run.ops() == [] and run.enabled_foreign() == ["CoreNet-DHCP-Out", DNS_RULE]    # not one call, not one rule off
+    assert set(run.outbound.values()) == {"Allow"} and settings.allow_disabled == []
+
+
+def test_a_converge_that_runs_is_not_refused():
+    run, settings = make(foreign=STOCK)
+    rules_mod.isolate(run, True, settings=settings)
+    assert rules_mod.converge(run, settings=settings, cancelled=lambda: False)["refused"] is False
+
+
+def test_a_rule_that_came_back_on_is_recorded_by_the_next_converge():
+    run, settings = make(foreign=STOCK)
+    thorough(run, settings)
+    run.foreign["CoreNet-Teredo-Out"]["Enabled"] = True            # a policy refresh switched one on again
+    rules_mod.isolate(run, True, settings=settings)                # cut again: the press records nothing
+    assert "CoreNet-Teredo-Out" not in settings.allow_disabled
+    rules_mod.converge(run, settings=settings, cancelled=lambda: False)
+    assert "CoreNet-Teredo-Out" in settings.allow_disabled and run.enabled_foreign() == []
 
 
 def test_a_read_back_that_fails_is_unknown_and_keeps_the_cut_rule():
@@ -1418,6 +1467,7 @@ def test_a_read_back_that_fails_is_unknown_and_keeps_the_cut_rule():
     out = thorough(run, settings)
     assert out["stage"] == "cut_policy" and out["allowed_out"] is None and "rpc failed" in out["allowed_out_error"]
     assert "rpc failed" in out["note"] and rules_mod.CUT_RULE in run.rules      # what is not known never drops the cut
+    assert out["verified"] is True      # the cut rule was read back, and it closes the egress with or without that list
 
 
 def test_a_rule_that_will_not_switch_on_again_stays_recorded_and_is_retried():
@@ -1525,16 +1575,16 @@ def test_a_json_list_is_unrolled_the_way_windows_powershell_5_1_needs():
 # ---- a button, not a minute: one PowerShell call per step --------------------------------------
 
 
-def test_the_press_is_two_powershell_calls_the_convergence_four_and_off_three_however_many_rules():
+def test_the_press_is_two_powershell_calls_the_convergence_six_and_off_three_however_many_rules():
     names = {f"App-{i:03d}-Out": {"DisplayName": f"App {i}", "Source": "Local", "Enabled": True} for i in range(135)}
     run, settings = make(foreign=names)
     pressed = rules_mod.isolate(run, True, settings=settings)
     assert pressed["verified"] is True and pressed["profiles_off"] == []
-    assert run.ops() == ["AllowOut", "Cut"]
+    assert run.ops() == ["Profiles", "Cut"]
     run.calls.clear()
     out = rules_mod.converge(run, settings=settings, cancelled=lambda: False)
     assert out["verified"] is True and out["allowed_out"] == []
-    assert run.ops() == ["DisableAllowOut", "SetDefaultOutbound", "AllowOut", "Remove", "Get"]
+    assert run.ops() == ["AllowOut", "DisableAllowOut", "SetDefaultOutbound", "AllowOut", "Remove", "Get"]
     run.calls.clear()
     left = rules_mod.isolate(run, False, settings=settings)
     assert run.ops() == ["SetDefaultOutbound", "EnableAllowOut", "RemoveIsolate"] and left["profiles_off"] == []
@@ -1553,9 +1603,11 @@ def test_a_mixed_baseline_is_put_back_in_one_call_per_value():
 
 def test_a_default_action_answer_without_the_profiles_is_read_back_separately():
     run, settings = make()
+    rules_mod.isolate(run, True, settings=settings)
     real = run.op_SetDefaultOutbound
     run.op_SetDefaultOutbound = lambda p: (real(p)[0], "", "")      # an answer that is not the profiles
-    assert thorough(run, settings)["verified"] is True
+    run.calls.clear()
+    assert rules_mod.converge(run, settings=settings, cancelled=lambda: False)["verified"] is True
     assert run.ops().count("Profiles") == 1
 
 
@@ -1838,8 +1890,8 @@ def test_isolating_cuts_first_and_answers_after_the_cut():
     run, settings = make(foreign=STOCK)
     done = rules_mod.isolate(run, True, settings=settings)
     assert (done["stage"], done["verified"], done["converging"]) == ("cut", True, True)
-    # the baseline read (AllowOut: profiles and Windows' rules in one call), then the one Cut; nothing slow before the answer
-    assert run.ops() == ["AllowOut", "Cut"]
+    # the profiles are read for the way back, then the one Cut; Windows' 135 rules are not touched or read before the answer
+    assert run.ops() == ["Profiles", "Cut"]
     assert settings.isolated is True and settings.stage == "cut"
 
 
@@ -1902,7 +1954,7 @@ def test_converging_stops_at_the_next_call_when_it_is_cancelled():
 def test_a_cancel_between_two_steps_stops_before_the_next_one():
     run, settings = make(foreign=STOCK)
     rules_mod.isolate(run, True, settings=settings)
-    answers = iter([False, True])                    # the Windows rules go off, then it is cancelled
+    answers = iter([False, False, True])             # read, noted, the Windows rules go off; then it is cancelled
     done = rules_mod.converge(run, settings=settings, cancelled=lambda: next(answers))
     assert done["cancelled"] is True and done["stage"] == "cut"
     assert "DisableAllowOut" in run.ops() and "SetDefaultOutbound" not in run.ops()
@@ -1950,7 +2002,7 @@ def test_a_profile_that_is_off_cuts_nothing():
 def test_a_cancel_just_before_the_cut_rule_falls_leaves_it_standing():
     run, settings = make(foreign=STOCK)
     rules_mod.isolate(run, True, settings=settings)
-    answers = iter([False, False, False, True])      # Windows' rules off, Block, the read back; then it is cancelled
+    answers = iter([False, False, False, False, True])      # read, off, Block, the read back; then it is cancelled
     done = rules_mod.converge(run, settings=settings, cancelled=lambda: next(answers))
     assert done["cancelled"] is True and done["stage"] == "cut" and rules_mod.CUT_RULE in run.rules
     assert set(run.outbound.values()) == {"Block"} and settings.stage == "cut"
@@ -1983,3 +2035,13 @@ def test_a_cut_that_is_not_read_back_as_the_catch_all_is_not_verified():
     run, settings = make(foreign=STOCK, disable_new=True)           # the rule is written, and it stands disabled
     done = rules_mod.isolate(run, True, settings=settings)
     assert done["stage"] == "cut" and done["verified"] is False and "disabled" in done["note"]
+
+
+def test_leaving_after_a_failed_converge_switches_the_recorded_rules_back_on_and_drops_the_cut_rule():
+    run, settings = make(foreign=STOCK, fail_once={"SetDefaultOutbound": (1, "denied")})
+    rules_mod.isolate(run, True, settings=settings)
+    done = rules_mod.converge(run, settings=settings, cancelled=lambda: False)     # the rules are off, Block did not take
+    assert done["stage"] == "cut" and run.enabled_foreign() == []
+    left = rules_mod.isolate(run, False, settings=settings)
+    assert run.enabled_foreign() == ["CoreNet-DHCP-Out", DNS_RULE] and left["allow_disabled"] == []
+    assert run.rules == {} and settings.isolated is False and set(run.outbound.values()) == {"Allow"}
