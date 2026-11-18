@@ -21,7 +21,7 @@ Dazu drei Dinge, die ins Auge fallen:
 ## Ziele
 
 1. **README als Schaufenster**, etwa 400 Zeilen: Logo, Kurzbeschreibung, die zwei Theme-Bilder und
-   das Demo-Video, acht bis zehn Features mit je einem Satz und einem Bild, das Architektur-Diagramm
+   das Demo-Video, acht bis elf Features mit je einem Satz und einem Bild, das Architektur-Diagramm
    als Mermaid, die Dienste-Tabelle, die Tab-Tabelle, Quick Start in beiden Varianten,
    Plattform-Hinweise, Security Notes, Credits — und Wege in die Doku.
 2. **`docs/` als Führung**: eine Seite je Thema, zwei Leserwege („Ich will es aufsetzen",
@@ -101,7 +101,7 @@ Reihenfolge und Inhalt:
 |---|---|
 | Kopf | Logo, ein Satz, die Badges wie heute |
 | Bilder | die zwei Theme-Bilder, das Demo-Video (verlinkt, nicht eingebettet) |
-| **What it does** | acht bis zehn Features, je eine Zeile und ein Bild: Detonation mit Verdict, Alerts mit Drilldown, Tracing, Prozess-Graph, Named Pipes, Sysmon und ETW, ThreatScan, Hex und File Map, Rizin, LOGS mit eigenen Dashboards |
+| **What it does** | acht bis elf Features, je eine Zeile und ein Bild: Detonation mit Verdict, Alerts mit Drilldown, Tracing, Prozess-Graph, Named Pipes, Sysmon und ETW, Firewall, ThreatScan, Hex und File Map, Rizin, LOGS mit eigenen Dashboards. Die Obergrenze ist von zehn auf elf gestiegen, weil der FIREWALL-Tab ein Feature von demselben Gewicht wie die anderen zehn ist und erst nach dem Entwurf des Schaufensters dazukam |
 | **Architecture** | das Mermaid-Diagramm (Diagramm 1) und die Dienste-Tabelle |
 | **Web UI Tabs** | die Tabelle wie heute (ein Test hängt daran) |
 | **Quick Start** | beide Varianten, je drei bis fünf Zeilen, dann ein Weg in die Doku |
@@ -231,7 +231,7 @@ existiert.
 ## Was der Baumeister entscheidet
 
 - Die Worte: jede Zeile der README, jeder Satz der Doku, die Bildunterschriften.
-- Welche acht bis zehn Features ins Schaufenster kommen und mit welchem Bild.
+- Welche acht bis elf Features ins Schaufenster kommen und mit welchem Bild.
 - Aufbau und Aussehen der Navigation und der Suche im Wiki, solange beide ohne Netz funktionieren.
 - Die Namen der Doku-Dateien, solange die Index-Seite und die Tests zusammenpassen.
 - Wie der Generator Markdown parst (eine Zeile für Zeile arbeitende Funktion reicht; keine

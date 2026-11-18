@@ -114,6 +114,15 @@ the [ETW browser](docs/web-ui.md#etw-browser).
   <img src="static/sysmon_events.png" alt="The Sysmon tab: events over time stacked by event type, a process to event type Sankey, the type counters and a table of events with their command lines and the Windows Event IDs they correspond to" width="88%">
 </p>
 
+**Firewall** — every connection a sample makes, by process and on a world map
+with the owning network and country, a switch that blocks one endpoint or a
+whole program in the Windows Firewall, and one button that cuts the whole
+network ([Firewall](docs/firewall.md)).
+
+<p align="center">
+  <img src="static/firewall_tab.png" alt="The Firewall tab in MAP view with nothing isolated and 12 connections over the last hour: a process tree of three svchost.exe instances with green ALLOW switches and direct-ip tags, the world map with two orange arcs rising from a framed CHAMBER device (LOCATION NOT DETERMINED) to two labelled US endpoints, a summary with CONNECTIONS 12, BLOCKED 0, OPEN DECISIONS 0 and SAMPLES 0 above the top processes, endpoints and countries, and the NETWORK CUT card with its round red skull button CUT THE NETWORK" width="88%">
+</p>
+
 **ThreatScan** — ThreatCheck, DefenderCheck, EMBER2024 and capa against a
 file, Aether, a memory dump or a sweep of the whole system against a running
 process, and a history that keeps every scan with its score

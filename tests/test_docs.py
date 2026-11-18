@@ -1172,8 +1172,8 @@ def test_readme_is_a_showcase():
 
     section = _section_of(README, "What it does")
     features = FEATURE.findall(section)
-    assert 8 <= len(features) <= 10, \
-        "the showcase names %d features, not the eight to ten of the design: %s" % (
+    assert 8 <= len(features) <= 11, \
+        "the showcase names %d features, not the eight to eleven of the design: %s" % (
             len(features), [n for n, _ in features])
     for name, sentence in features:
         one = " ".join(sentence.split())
