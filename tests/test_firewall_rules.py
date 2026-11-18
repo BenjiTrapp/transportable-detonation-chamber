@@ -2966,3 +2966,53 @@ def test_compare_is_accepted_but_the_module_never_emits_it():
     module = open(os.path.join(ROOT, "webui", "firewall_rules.py"), encoding="utf-8").read()
     assert "'Compare'" in _validate_set(_ps1())
     assert '"Compare"' not in module and "'Compare'" not in module
+
+
+# ---- a fallback is not silent: the way that answered reaches the call log ------------------------
+
+
+def _answering(rows):
+    def run(args):
+        return 0, json.dumps(rows), ""
+    return run
+
+
+def _rows(**way):
+    return [{"Name": n, "Enabled": True, "DefaultOutboundAction": "Allow", "Configured": "NotConfigured", **way}
+            for n in ("Domain", "Private", "Public")]
+
+
+def test_a_fallback_and_its_reason_are_reported_with_the_call(monkeypatch):
+    seen = _observed(monkeypatch)
+    reason = "COM DefaultOutboundAction of Public is not a known number: '3'"
+    states = rules_mod._profiles(_answering(_rows(Via="cmdlet", Fallback=reason)))
+    assert [s["configured"] for s in states] == ["NotConfigured"] * 3          # the contract is unchanged
+    assert seen[0]["op"] == "Profiles" and seen[0]["via"] == "cmdlet" and seen[0]["fallback"] == reason
+
+
+def test_the_fast_way_is_reported_without_a_reason(monkeypatch):
+    seen = _observed(monkeypatch)
+    rules_mod._profiles(_answering(_rows(Via="fast")))
+    assert seen[0]["via"] == "fast" and "fallback" not in seen[0]
+
+
+def test_an_answer_without_a_way_adds_nothing_to_the_report(monkeypatch):
+    seen = _observed(monkeypatch)
+    rules_mod._profiles(_answering(_rows()))
+    assert set(seen[0]) == {"op", "lock", "wait_ms", "run_ms", "rc", "thread"}
+
+
+@pytest.mark.parametrize("via", ["weird", 3, None])
+def test_a_way_that_is_not_one_of_the_two_is_not_reported(monkeypatch, via):
+    seen = _observed(monkeypatch)
+    rules_mod._profiles(_answering(_rows(Via=via, Fallback="x")))
+    assert "via" not in seen[0] and "fallback" not in seen[0]
+
+
+def test_a_long_reason_is_cut_and_a_failed_call_is_still_reported(monkeypatch):
+    seen = _observed(monkeypatch)
+    rules_mod._profiles(_answering(_rows(Via="cmdlet", Fallback="x" * 5000)))
+    assert len(seen[0]["fallback"]) == 200
+    with pytest.raises(rules_mod.RuleError):
+        rules_mod._profiles(lambda args: (_ for _ in ()).throw(OSError("gone")))
+    assert seen[1]["op"] == "Profiles" and seen[1]["rc"] is None and "via" not in seen[1]

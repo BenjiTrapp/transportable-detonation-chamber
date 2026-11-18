@@ -2469,6 +2469,20 @@ def test_the_server_keeps_the_call_lines_in_a_rotated_file_beside_the_access_log
     assert "firewall call op='List' caller='thread'" in text and logger.propagate is False
 
 
+def test_a_fallback_and_its_reason_are_on_the_call_line(tdc, caplog):
+    record = {"op": "Profiles", "lock": None, "wait_ms": None, "run_ms": 412.0, "rc": 0, "thread": "t1",
+              "via": "cmdlet", "fallback": "Retrieving the COM class factory failed: 80040154\nsecond"}
+    with caplog.at_level("DEBUG", logger="tdc.logs.firewall_calls"):
+        tdc._fw_log_call(record)
+        tdc._fw_log_call(dict(record, via="fast", fallback=None))
+        tdc._fw_log_call({k: v for k, v in record.items() if k not in ("via", "fallback")})
+    lines = [r.getMessage() for r in caplog.records if r.name == "tdc.logs.firewall_calls"]
+    assert lines[0].endswith(" rc=0 via=cmdlet fallback='Retrieving the COM class factory failed: 80040154\\nsecond'")
+    assert "\n" not in lines[0]                                    # one line, whatever the reason holds
+    assert lines[1].endswith(" rc=0 via=fast")
+    assert _CALL_LINE.fullmatch(lines[2])                         # no way marker: the line is as before
+
+
 # ---- the two slow polls are displays: they take the rule cache -------------------------------------
 # (the /summary case is a regression pin: it passed before the change, /summary never forced; only /rules went red)
 

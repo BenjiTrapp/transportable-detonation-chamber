@@ -11177,7 +11177,8 @@ def _firewall_readers():
 # One debug line per PowerShell call of firewall_rules (its op, who asked, the wait for firewall_rules' lock, how long
 # it ran), and one per wait for the rule cache's lock where that lock is held across a call: a press whose seconds
 # vary is waiting for work it did not start, and these lines say whose. Only names TDC chose itself go in (the op,
-# the route's rule, the thread's name), never a parameter or anything Windows answered.
+# the route's rule, the thread's name), never a parameter or anything Windows answered, with one exception: the way
+# a read answered (via=fast or via=cmdlet) and, on a fallback, its reason, quoted with %r so it stays one line.
 _fw_call_logger = _log_logger.getChild("firewall_calls")
 
 
@@ -11198,10 +11199,15 @@ def _fw_ms(value):
 def _fw_log_call(record):
     if not _fw_call_logger.isEnabledFor(logging.DEBUG):
         return
-    _fw_call_logger.debug("firewall call op=%r caller=%r thread=%r lock=%s wait_ms=%s run_ms=%s rc=%s",
+    way = ""
+    if record.get("via") in firewall_rules.WAYS:
+        way = f" via={record['via']}"
+        if record.get("fallback"):
+            way += f" fallback={str(record['fallback'])!r}"
+    _fw_call_logger.debug("firewall call op=%r caller=%r thread=%r lock=%s wait_ms=%s run_ms=%s rc=%s%s",
                           record["op"], _fw_caller(), record["thread"], record["lock"] or "-",
                           _fw_ms(record["wait_ms"]), _fw_ms(record["run_ms"]),
-                          "-" if record["rc"] is None else record["rc"])
+                          "-" if record["rc"] is None else record["rc"], way)
 
 
 firewall_rules.CALL_OBSERVER = _fw_log_call

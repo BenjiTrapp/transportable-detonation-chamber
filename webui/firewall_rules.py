@@ -115,9 +115,14 @@ _LOCK = threading.RLock()
 # Every PowerShell call is reported to CALL_OBSERVER (set by the caller, None for none) as ``{op, lock, wait_ms,
 # run_ms, rc, thread}``: the op, which run holds the lock (None for a call made without it), how long that run
 # waited for the lock (given to its first call, 0.0 to the rest; None without the lock), how long the call ran,
-# its exit code and the thread's name. No parameter and no output is in it. The wait is measured where the lock is
-# taken, because a press that waits for someone else's run is the variance a single call cannot show.
+# its exit code and the thread's name. No parameter and no output is in it, with one exception: an answer that names
+# the way it was read (``Via``, "fast" or "cmdlet") adds ``via``, and on a fallback ``fallback``, its reason (at most
+# MAX_FALLBACK_CHARS), so that a fallback that keeps happening can be found and does not only show as slowness. The
+# wait is measured where the lock is taken, because a press that waits for someone else's run is the variance a
+# single call cannot show.
 CALL_OBSERVER: Optional[Callable[[Dict[str, Any]], None]] = None
+WAYS = ("fast", "cmdlet")
+MAX_FALLBACK_CHARS = 200
 _clock = time.perf_counter                # tests pin it
 _held = threading.local()                 # per thread: depth, what holds the lock, the wait not yet reported
 
@@ -183,16 +188,37 @@ def _first_line(text: Any) -> str:
 def _call(run, args: List[str]) -> Tuple[int, str, str]:
     started = _clock()
     rc: Any = None
+    out: Any = None
     try:
         rc, out, err = run(args)
     except Exception as e:
         raise RuleError(f"could not run {args[0]}: {type(e).__name__}: {_first_line(e)}") from e
     finally:
-        _report(args, started, rc)
+        _report(args, started, rc, out)
     return int(rc), out or "", err or ""
 
 
-def _report(args: List[str], started: float, rc: Any) -> None:
+def _way(out: Any) -> Dict[str, str]:
+    """``{"via"[, "fallback"]}`` of an answer that names the way it was read: its first row with a ``Via``, at the top
+    or under ``profiles``; ``{}`` for any other answer."""
+    if not isinstance(out, str) or '"Via"' not in out:
+        return {}
+    answer = json.loads(out)
+    rows = answer if isinstance(answer, list) else [answer]
+    if isinstance(answer, dict) and isinstance(answer.get("profiles"), list):
+        rows += answer["profiles"]
+    for row in rows:
+        if isinstance(row, dict) and "Via" in row:
+            if row["Via"] not in WAYS:
+                return {}
+            way = {"via": row["Via"]}
+            if row.get("Fallback"):
+                way["fallback"] = str(row["Fallback"])[:MAX_FALLBACK_CHARS]
+            return way
+    return {}
+
+
+def _report(args: List[str], started: float, rc: Any, out: Any = None) -> None:
     """Tell CALL_OBSERVER about one call; never raises, and changes nothing."""
     observer = CALL_OBSERVER
     if observer is None:
@@ -204,8 +230,13 @@ def _report(args: List[str], started: float, rc: Any) -> None:
         wait = None
         if locked:
             wait, _held.wait_ms = _held.wait_ms, 0.0
-        observer({"op": str(op), "lock": _held.what if locked else None, "wait_ms": wait, "run_ms": ran,
-                  "rc": rc if isinstance(rc, int) else None, "thread": threading.current_thread().name})
+        record = {"op": str(op), "lock": _held.what if locked else None, "wait_ms": wait, "run_ms": ran,
+                  "rc": rc if isinstance(rc, int) else None, "thread": threading.current_thread().name}
+        try:
+            record.update(_way(out))
+        except Exception:
+            pass
+        observer(record)
     except Exception:
         pass
 
