@@ -2470,6 +2470,7 @@ def test_the_server_keeps_the_call_lines_in_a_rotated_file_beside_the_access_log
 
 
 # ---- the two slow polls are displays: they take the rule cache -------------------------------------
+# (the /summary case is a regression pin: it passed before the change, /summary never forced; only /rules went red)
 
 
 @pytest.mark.parametrize("path", ["/api/firewall/summary", "/api/firewall/rules"])

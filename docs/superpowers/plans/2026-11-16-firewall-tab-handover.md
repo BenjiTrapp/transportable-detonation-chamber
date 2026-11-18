@@ -656,11 +656,18 @@ Was dagegen zu tun wäre (eigene Arbeit, nicht Teil des Panikschnitts):
    wartet hinter einem laufenden `List` (3,5–9,4 s). *Richtung:* ein
    Generationszähler, den jedes Vergessen erhöht und den ein `List` beim Ablegen
    prüft; dann kann die Sperre vor dem Aufruf losgelassen werden.
-   *Größe des Fensters seit der Änderung der Aufruf-Bilanz:* ein so abgelegter
-   veralteter Stand hielt vorher höchstens ~30 s (der erzwungene Abruf von
-   `/rules` heilte ihn); jetzt hält er bis zu einer TTL, 60 s, und `can_fetch`
-   kann in dieser Zeit `true` zeigen. Nur Anzeige (Entscheidung und Frist lesen
-   mit `force=True`); `verified` ist nicht betroffen.
+   *Größe des Fensters seit der Änderung der Aufruf-Bilanz — falls es überhaupt
+   auftritt:* für die Schreiber in den Routen (`block`, `unblock`, Druck,
+   Verlassen) ließ es sich nicht herstellen: ihr Vergessen kommt nach dem
+   Schreiben und nimmt die Sperre, die das `List` hält, es räumt also auch einen
+   gerade abgelegten Stand. Möglich scheint es nur im Fenster der Konvergenz
+   (die Schritte schreiben, ein `List` liest zwischendurch, vergessen wird erst am
+   Ende des Workers; gemessen ~59 s). Dann hielt ein so abgelegter veralteter
+   Stand vorher höchstens ~30 s (der erzwungene Abruf von `/rules` heilte ihn);
+   jetzt bis zu einer TTL, 60 s, oder bis zum Ende des Workers, was früher
+   kommt, und `can_fetch` kann in dieser Zeit `true` zeigen. Nur Anzeige
+   (Entscheidung und Frist lesen mit `force=True`); `verified` ist nicht
+   betroffen.
 
 **Von diesem Branch hinzugefügt — nach dem Fix messen.** Der Panikschnitt hat
 selbst zur Bilanz beigetragen; jeder dieser Punkte ist einzeln begründet, aber
@@ -707,8 +714,13 @@ falsch: `/summary` erzwingt nichts und liest die Regelliste nicht selbst. Das
 Oberfläche schickt beide im selben `Promise.all` los, und die erste Messung rief
 sie unmittelbar nacheinander auf. Dass `/summary` 2,75–3,24 s brauchte, lag daran,
 dass es auf der Sperre des Regel-Caches hinter diesem `List` wartete. Allein
-gemessen: 0 Aufrufe. Auch die „16 Aufrufe“ waren damit `/rules` allein: vier
-Abfragen, jede erzwang ein Lesen, überlappende Anfragen erzwangen jeweils wieder.
+gemessen: 0 Aufrufe. Auch die 14 `List` der „16 Aufrufe“ kamen alle aus `/rules`
+— aber aus einem Messaufbau, der `/rules` öfter abfragte als der Tab es tut: er
+rief es in der Taktschleife **und** in einer eigenen Einzelsonde im selben
+Fenster auf, und frühere Läufe hatten Browser-Tabs gegen denselben Server
+offen. Der Tab allein (ein Aufruf je 30 s) ergäbe deutlich weniger; die
+Zahl 16 ist keine Tab-Zahl, und eine Rechnung „vier Abfragen = vierzehn `List`“
+gibt es nicht.
 
 - **Die beiden 5-Sekunden-Abfragen (`/isolate`, `/pending`) sind kostenlos**,
   jedenfalls je Aufruf: Cache-Treffer. (Was `/isolate` über 100 s doch kostet,
@@ -723,7 +735,10 @@ von außen bis zu einer TTL verspätet. Was durchsetzt (Entscheidung, Frist,
 `_fw_fetch_refusal`), liest weiter mit `force=True`. `/summary` brauchte keine
 Änderung.
 
-**Vorher/nachher, gemessen:** 100 s im Dauerbetrieb des Tabs, niemand drückt etwas.
+**Vorher/nachher, gemessen:** 100 s im Dauerbetrieb des Tabs, niemand drückt
+etwas (das „vorher“ stammt aus dem oben beschriebenen Messaufbau, der `/rules`
+häufiger abfragte als der Tab; der Vergleich überzeichnet die Ersparnis des
+Tabs allein).
 
 | | vorher | nachher |
 |---|---|---|
@@ -744,13 +759,26 @@ Vorhergesagt waren 1–2 `List` je 100 s (eingetroffen) und 3–6 % Auslastung
   beim nächsten `GET` noch einmal. *Richtung, eine Zeile:* `_fw_keep_profiles`
   hält `blocking` mit, statt `None` abzulegen.
 
-**Der Regel-Cache ist jetzt bis zu einer TTL alt, wo er vorher durch den
+**Der Regel-Cache ist jetzt bis zu einer TTL (60 s) alt, wo er vorher durch den
 erzwungenen 30-s-Abruf nie älter als ~30 s war.** Das betrifft alles, was ihn
-liest, ohne zu erzwingen: `/pending` (`can_fetch`) und `GET /isolate`
-(`can_fetch` über `_fw_cut_rule_listed`, das nicht einmal das Alter prüft). Zu
-Punkt 6 oben: das geparkte Rennen lebt jetzt bis zu 60 s statt ~30 s, und in
-dieser Zeit kann `can_fetch` `true` zeigen, wo die Entscheidung selbst (mit
-`force=True`) ablehnen würde. Nur Anzeige: nichts wird daraufhin getan.
+liest, ohne zu erzwingen, und das sind vier Oberflächen, die größten zuerst:
+
+- **`/connections`** (alle 5 s): `flow["state"] = "blocked"` kommt aus
+  `ctx.rules` (`_firewall_context` → `firewall.classify`). Das ist die
+  Hauptliste des Tabs.
+- **`/summary`**: dieselbe Liste wird zur Zahl der **BLOCKED-Kachel**
+  (`firewall.summarize`).
+- `/pending` (`can_fetch`) und `GET /isolate` (`can_fetch` über
+  `_fw_cut_rule_listed`, das nicht einmal das Alter prüft).
+
+**Eine Regel, die außerhalb von TDC entfernt wurde, steht damit bis zu 60 s
+weiter als „blocked“ in der Liste und in der BLOCKED-Kachel.** Das ist gewollt
+(60 s ist die Anzeige-TTL, es verspätet nur, was TDC nicht selbst getan hat, und
+alles, was durchsetzt, liest mit `force=True`), aber es muss hier stehen. Die
+Obergrenze ist 60 s: bei offenem Tab lesen `/connections` und `/pending` alle
+3–5 s den Cache, ein abgelaufener wird also sofort erneuert. Zu Punkt 6 oben: in dieser Zeit kann außerdem
+`can_fetch` `true` zeigen, wo die Entscheidung selbst (mit `force=True`)
+ablehnen würde. Nur Anzeige: nichts wird daraufhin getan.
 `verified` ist davon nicht betroffen: ein Cache-Treffer erneuert die Rücklesung
 der Schnitt-Regel nicht (Test:
 `test_a_cached_rule_list_never_renews_the_read_back_of_the_cut`).
@@ -781,5 +809,5 @@ es gibt dort nichts zu sparen. `/rules` und `/summary` speisen immer sichtbare
 Teile der Seite — die Schalter im Prozessbaum und die ganze rechte Spalte —, sie
 ließen sich nicht aufschieben, ohne etwas, das auf dem Bildschirm steht, leer zu
 lassen. Der teure Teil war nicht der Zeitpunkt des Ladens, sondern das
-erzwungene Lesen in `/rules`; das ist behoben (16 → 5 Aufrufe, 42 % → 18 %).
+erzwungene Lesen in `/rules`; das ist behoben (16 → 5 Aufrufe, 42 % → 18 %, im Messaufbau oben).
 **Nicht erneut vorschlagen.**
