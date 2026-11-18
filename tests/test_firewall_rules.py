@@ -3059,3 +3059,114 @@ def test_a_reason_is_one_short_line_in_profiles_and_in_compare_alike():
     assert "$fallback = Get-ShortReason $_" in _functions(script)["Get-ProfileStates"]
     assert 'fast = "error: $(Get-ShortReason $_)"' in _op_case(script, "Compare")
     assert "$_.Exception.Message" not in _op_case(script, "Compare")
+
+
+# ---- TDC's own rules without the module: List and Get over COM --------------------------------
+
+RULE_FIELDS = ("Name", "Enabled", "Action", "Direction", "Profile", "Program", "RemoteAddress", "RemotePort", "Protocol")
+# The properties of a COM rule the fast way reads: Name of every rule, the other eight of TDC's rules only.
+COM_RULE_READS = ("Name", "Enabled", "Action", "Direction", "Profiles", "ApplicationName", "RemoteAddresses",
+                  "RemotePorts", "Protocol")
+
+
+def test_list_keeps_every_field_the_python_side_reads():
+    branch = _op_branch(_ps1(), "List")
+    for field in RULE_FIELDS:
+        assert f'"{field}"' in branch, f"List lost {field}"
+
+
+def test_list_asks_com_only_for_tdc_rules():
+    """538 rules stand on this VM; only TDC-FW-* are ever reported."""
+    branch = _op_branch(_ps1(), "List")
+    assert "TDC-FW-" in branch and "FwPolicy2" in branch
+
+
+def test_the_fast_rule_view_has_exactly_the_fields_of_the_cmdlet_view():
+    functions = _functions(_ps1())
+    fast = functions["Read-FastRuleViews"]
+    assert re.findall(r'^\s*"(\w+)" = ', fast, re.M) == list(RULE_FIELDS)
+    assert re.findall(r"^\s*(\w+) = ", functions["Get-RuleView"], re.M) == list(RULE_FIELDS)
+
+
+def test_every_number_of_the_rule_fast_path_is_written_out():
+    """COM direction 1 In, 2 Out; action 0 Block, 1 Allow; Profiles a bitmask of 1 Domain, 2 Private, 4 Public, each
+    combination spelled as the cmdlets' Profile flags print it and all of them (NET_FW_PROFILE2_ALL) as Any; protocol
+    6 TCP, 17 UDP, 256 Any. Nothing else, and nothing computed: 7, ICMP or a new value is a fallback."""
+    fast = _functions(_ps1())["Read-FastRuleViews"]
+
+    def mapping(var):
+        return dict(re.findall(r"'(\d+)' = '([\w, ]+)'", re.search(r"\$%s = @\{([^}]*)\}" % var, fast).group(1)))
+    assert mapping("ComDirection") == {"1": "Inbound", "2": "Outbound"}
+    assert mapping("ComAction") == {"0": "Block", "1": "Allow"}
+    assert mapping("ComProfiles") == {"1": "Domain", "2": "Private", "3": "Domain, Private", "4": "Public",
+                                      "5": "Domain, Public", "6": "Private, Public", "2147483647": "Any"}
+    assert mapping("ComProtocol") == {"6": "TCP", "17": "UDP", "256": "Any"}
+    assert not re.search(r"-band|-bor|-bxor|-shl|-shr|\[enum\]|-as \[", fast, re.I)
+
+
+def test_an_unknown_rule_number_or_spelling_falls_back_instead_of_guessing():
+    functions = _functions(_ps1())
+    fast = functions["Read-FastRuleViews"]
+    for var in ("ComDirection", "ComAction", "ComProfiles", "ComProtocol"):
+        assert re.search(r"if \(-not \$%s\.ContainsKey\(\$\w+\)\) \{ throw " % var, fast), var
+    assert "if (-not ($enabled -is [bool])) { throw " in fast
+    # an address or a port in a spelling that is not known is not passed on as it is
+    assert fast.count("else { throw ") >= 2
+    assert "if ($count -eq 0) { throw " in fast           # no rules at all is not "none of ours"
+    assert re.search(r"if \(\$seen\.ContainsKey\(\$name\)\) \{ throw ", fast)      # two rules, one name
+    way = functions["Get-OurRuleViews"]
+    assert re.search(r"try \{\s*\$views = @\(Read-FastRuleViews -RuleName \$RuleName\)\s*"
+                     r"return \[pscustomobject\]@\{ Views = \$views; Via = 'fast'; Fallback = \$null \}\s*"
+                     r"\} catch \{\s*\$fallback = Get-ShortReason \$_\s*\}", way)
+    assert "Via = 'cmdlet'; Fallback = $fallback" in way and "Read-CmdletRuleViews -RuleName $RuleName" in way
+
+
+def test_only_tdc_rules_are_read_beyond_their_name():
+    """The collection is enumerated, not queried: every rule costs its Name, and only ours the other eight reads."""
+    fast = _functions(_ps1())["Read-FastRuleViews"]
+    reads = re.findall(r"\$rule\.(\w+)", fast)
+    assert sorted(reads) == sorted(COM_RULE_READS), reads          # each property read once, and nothing else
+    loop = fast[fast.index("foreach ($rule in $policy.Rules) {"):]
+    head, rest = loop.split("$seen[$name] = $true", 1)
+    assert re.findall(r"\$rule\.(\w+)", head) == ["Name"]
+    assert "continue" in head and "StartsWith('TDC-FW-'" in head
+    assert "| Where-Object" not in loop and "| ForEach-Object" not in loop
+
+
+def test_a_name_reaching_com_is_still_checked_and_matched_whole():
+    """Get's -Name is Assert-OurName'd before any lookup, and the fast way compares it whole: no wildcard, no pattern."""
+    script = _ps1()
+    case = _op_case(script, "Get")
+    assert case.index("Assert-OurName $Name") < case.index("Get-OurRuleViews -RuleName $Name")
+    fast = _functions(script)["Read-FastRuleViews"]
+    uses = [l.strip() for l in _lines_mentioning(fast, "$RuleName") if "param(" not in l]
+    assert uses == ["if ($RuleName) {", "if ($name -ne $RuleName) { continue }"], uses
+
+
+def test_list_and_get_say_which_way_answered():
+    script = _ps1()
+    listing = _op_case(script, "List")
+    assert "Get-OurRuleViews" in listing and "Get-ProfileStates -Fast" in listing
+    assert "Via = " in listing and "Fallback" in listing
+    get = _op_case(script, "Get")
+    assert "Get-OurRuleViews -RuleName $Name" in get and "Via" in get and "Fallback" in get
+
+
+def test_the_cut_keeps_reading_its_rule_back_through_the_cmdlets():
+    functions = _functions(_ps1())
+    cut = _op_case(_ps1(), "Cut")
+    assert "Get-RuleView $cut" in cut and "Get-OurRuleViews" not in cut and "Read-FastRuleViews" not in cut
+    assert "FwPolicy2" not in functions["Get-RuleView"]
+
+
+def test_compare_holds_every_rule_field_up_both_ways():
+    script = _ps1()
+    case = _op_case(script, "Compare")
+    branch = _op_branch(script, "Compare")
+    assert "Read-FastRuleViews" in case and "Read-CmdletRuleViews" in case
+    assert "Get-NetFirewallRule -Name 'TDC-FW-*'" in branch and "Get-RuleView" in branch
+    fields = re.search(r"foreach \(\$field in @\(('Name'[^)]*)\)\)", case).group(1)
+    assert re.findall(r"'(\w+)'", fields) == list(RULE_FIELDS)
+    # a rule only one way read is a difference, and the fast Get of one rule is held up as well as the fast List
+    assert "'absent'" in case and "Read-FastRuleViews -RuleName" in case
+    assert 'what = \'rules\'; fast = "error: $(Get-ShortReason $_)"' in case
