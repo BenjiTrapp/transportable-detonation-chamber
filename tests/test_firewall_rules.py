@@ -2856,3 +2856,113 @@ def test_an_observer_that_fails_changes_nothing(monkeypatch):
     monkeypatch.setattr(rules_mod, "CALL_OBSERVER", broken)
     run, settings = make(foreign=STOCK)
     assert rules_mod.isolate(run, True, settings=settings)["verified"] is True
+
+
+# ---- module-free reads: COM for what is in force, CIM for what is configured ---------------------
+
+
+def _ps1():
+    return open(os.path.join(ROOT, "webui", "firewall_rules.ps1"), encoding="utf-8").read()
+
+
+def _validate_set(script):
+    return re.search(r"ValidateSet\(([^)]*)\)\]\s*\[string\]\$Op", script).group(1)
+
+
+def _functions(script):
+    return {m.group(1): script[m.start():script.index("\n}\n", m.start())]
+            for m in re.finditer(r"^function ([\w-]+) \{", script, re.M)}
+
+
+def _op_case(script, verb):
+    case = script[script.index("\n        '%s' {" % verb):]
+    return case[:case.index("\n        }\n")]
+
+
+def _op_branch(script, verb):
+    """The code one verb runs: its case of the switch, and every function of the script it calls, transitively."""
+    functions = _functions(script)
+    parts, seen, todo = [_op_case(script, verb)], set(), [_op_case(script, verb)]
+    while todo:
+        text = todo.pop()
+        for name, body in functions.items():
+            if name not in seen and re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(name), text):
+                seen.add(name)
+                parts.append(body)
+                todo.append(body)
+    return "\n".join(parts)
+
+
+def _lines_mentioning(text, needle):
+    return [line for line in text.splitlines() if needle in line]
+
+
+def test_the_profiles_verb_names_the_way_it_was_answered():
+    script = _ps1()
+    assert "'Compare'" in _validate_set(script), "Compare is not an accepted op"
+    # the contract the Python side reads must be unchanged
+    assert '"Configured"' in script and '"DefaultOutboundAction"' in script
+    branch = _op_branch(script, "Profiles")
+    assert "Via = 'fast'" in branch and "Via = 'cmdlet'" in branch and "Fallback = " in branch
+
+
+def test_com_never_answers_the_configured_store():
+    """COM cannot express NotConfigured, so it must not feed Configured."""
+    branch = _op_branch(_ps1(), "Profiles")
+    com = _lines_mentioning(branch, "FwPolicy2")
+    assert com, "the fast path for Profiles is missing"
+    assert not any("Configured" in l for l in com), \
+        "COM must not answer the configured store: %s" % com
+    fast = _functions(_ps1())["Read-FastProfileStates"]
+    # the configured value comes from the CIM answer, which is never asked for the ActiveStore
+    assert "MSFT_NetFirewallProfile" in fast and "Get-NetFirewall" not in fast
+    assert "PolicyStore" not in "\n".join(_lines_mentioning(fast, "Get-CimInstance"))
+
+
+def test_an_unknown_number_falls_back_instead_of_guessing():
+    branch = _op_branch(_ps1(), "Profiles")
+    assert "Fallback" in branch or "fallback" in branch
+    # every mapped number is named explicitly, no arithmetic on the enum
+    assert "NotConfigured" in branch
+
+
+def test_every_number_of_the_fast_path_is_written_out():
+    """Measured, not documented: COM 0 Block, 1 Allow; CIM 0 NotConfigured, 2 Allow, 4 Block; COM profile types
+    1 Domain, 2 Private, 4 Public. Anything else is not in a map and so is a fallback."""
+    script = _ps1()
+    com = re.search(r"\$ComOutbound = @\{([^}]*)\}", script).group(1)
+    cim = re.search(r"\$CimOutbound = @\{([^}]*)\}", script).group(1)
+    types = re.search(r"\$ComProfileType = \[ordered\]@\{([^}]*)\}", script).group(1)
+    assert dict(re.findall(r"'(\d+)' = '(\w+)'", com)) == {"0": "Block", "1": "Allow"}
+    assert dict(re.findall(r"'(\d+)' = '(\w+)'", cim)) == {"0": "NotConfigured", "2": "Allow", "4": "Block"}
+    assert dict(re.findall(r"(\w+) = (\d+)", types)) == {"Domain": "1", "Private": "2", "Public": "4"}
+    fast = _functions(script)["Read-FastProfileStates"]
+    assert "ContainsKey" in fast and "throw" in fast
+
+
+def test_the_write_verbs_keep_reading_the_profiles_through_the_cmdlets():
+    script = _ps1()
+    for verb in ("Create", "Cut", "SetDefaultOutbound"):
+        case = _op_case(script, verb)
+        assert "Get-ProfileStates" in case and "-Fast" not in case, verb
+    for verb in ("Enable", "Remove", "DisableAllowOut", "EnableAllowOut", "RemoveIsolate"):
+        assert "-Fast" not in _op_case(script, verb), verb
+    assert "Get-ProfileStates -Fast" in _op_case(script, "Profiles")
+
+
+def test_compare_reads_both_ways_and_writes_nothing():
+    script = _ps1()
+    branch = _op_branch(script, "Compare")
+    assert "Read-FastProfileStates" in branch and "Get-NetFirewallProfile -PolicyStore ActiveStore" in branch
+    for field in ("Enabled", "DefaultOutboundAction", "Configured"):
+        assert "'%s'" % field in _op_case(script, "Compare")
+    for out in ("ok = ", "checked = ", "differences = ", "what = ", "fast = ", "cmdlet = "):
+        assert out in branch, out
+    assert "exit 1" in _op_case(script, "Compare")
+    assert not re.search(r"\b(Set|New|Remove|Enable|Disable)-NetFirewall", branch)
+
+
+def test_compare_is_accepted_but_the_module_never_emits_it():
+    module = open(os.path.join(ROOT, "webui", "firewall_rules.py"), encoding="utf-8").read()
+    assert "'Compare'" in _validate_set(_ps1())
+    assert '"Compare"' not in module and "'Compare'" not in module

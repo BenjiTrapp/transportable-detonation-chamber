@@ -7,8 +7,13 @@
 # because that joins the arguments into one line of PowerShell and parses it.
 #
 # Verbs:
-#   Profiles            [{"Name","Enabled","DefaultOutboundAction","Configured"}] of the three profiles:
-#                       DefaultOutboundAction as in force (ActiveStore), Configured as set (PersistentStore)
+#   Profiles            [{"Name","Enabled","DefaultOutboundAction","Configured","Via"[,"Fallback"]}] of the three profiles:
+#                       DefaultOutboundAction as in force (ActiveStore), Configured as set (PersistentStore). Via is
+#                       "fast" (COM and CIM, without the NetSecurity module) or "cmdlet"; Fallback says why the fast
+#                       way did not answer. The verbs that write read the profiles through the cmdlets, without Via.
+#   Compare             reads the profiles both ways and holds them up against each other, field by field:
+#                       {"ok","checked","differences":[{"what","fast","cmdlet"}]}. Exit 0 when they agree, 1 when not
+#                       (or when the cmdlets cannot be read; then stderr says why). Writes nothing.
 #   Enable              switch the three profiles on
 #   List                {"profiles": [...], "rules": [...]}: every rule named TDC-FW-*
 #   Get -Name           the one rule as JSON, or no output at all when there is none
@@ -40,11 +45,26 @@
 #
 # Exit codes: 0 done, 1 failed (the first line of stderr says why), 3 a profile is off, 4 the rule exists.
 # Rules are only ever named TDC-FW-<letters, digits, hyphens>; a name with a wildcard or a trailing newline is refused.
+#
+# Reading without the NetSecurity module. Loading it is most of the cost of a call (measured on the VM: 1.65 s for
+# Get-NetFirewallRule against 0.36 s for a bare powershell.exe), and Get-NetFirewallProfile is only a CDXML shell around
+# the CIM provider. A read verb therefore asks COM and CIM first, and it takes two sources because neither can answer
+# both stores; do not simplify this back to one:
+#   - COM (HNetCfg.FwPolicy2) answers what is IN FORCE, and only that. It has no NotConfigured: measured, COM said
+#     DefaultOutboundAction 1 (Allow) where the PersistentStore said NotConfigured. Fed into Configured, NotConfigured
+#     would become Allow, and ISOLATED would put the host back configured differently from how it found it.
+#   - Raw CIM (MSFT_NetFirewallProfile) answers what is CONFIGURED, and only that. It cannot reach the ActiveStore:
+#     measured, a query with PolicyStore='ActiveStore' is refused ("Die Anfrage ist ungueltig"), and the plain query
+#     answers from the PersistentStore (Domain 0 = NotConfigured).
+# Every number of either is translated through a map written out below, number by number, as measured against the
+# cmdlets; the Compare verb is what confirms them on a machine. A number that is not in its map, a profile that is
+# missing, an empty answer or any error is not guessed at: the verb answers through the cmdlets instead and says so
+# (Via "cmdlet", Fallback the reason).
 
 param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('Profiles', 'Enable', 'List', 'Get', 'Create', 'Remove', 'SetDefaultOutbound', 'AllowOut',
-                 'DisableAllowOut', 'EnableAllowOut', 'RemoveIsolate', 'Cut')]
+                 'DisableAllowOut', 'EnableAllowOut', 'RemoveIsolate', 'Cut', 'Compare')]
     [string]$Op,
     [string]$Names,
     [string]$Name,
@@ -75,19 +95,83 @@ function Assert-OurName {
 #     group policy sets). "Is ISOLATED in force?", Enabled and everything that is claimed read this.
 #   Configured: the PersistentStore, what this machine has CONFIGURED, NotConfigured included. It is the store
 #     SetDefaultOutbound writes, so it is what ISOLATED remembers and puts back, and what a write is checked against.
+# Without -Fast this is the cmdlet read it always was, and the rows carry no Via: the verbs that write use it so.
+# With -Fast it tries Read-FastProfileStates first, and every row says which way answered.
 function Get-ProfileStates {
+    param([switch]$Fast)
+    $fallback = $null
+    if ($Fast) {
+        try {
+            $rows = @(Read-FastProfileStates)
+            return $rows
+        } catch {
+            $fallback = ([string]$_.Exception.Message -split "`r?`n")[0]
+            if ($fallback.Length -gt 200) { $fallback = $fallback.Substring(0, 200) }
+            if (-not $fallback) { $fallback = 'the fast way failed without a message' }
+        }
+    }
     $configured = @{}
     foreach ($p in @(Get-NetFirewallProfile -PolicyStore PersistentStore)) {
         $configured[[string]$p.Name] = [string]$p.DefaultOutboundAction
     }
     @(Get-NetFirewallProfile -PolicyStore ActiveStore | ForEach-Object {
-        [pscustomobject]@{
+        $row = [ordered]@{
             Name = [string]$_.Name
             Enabled = ([string]$_.Enabled -eq 'True')
             DefaultOutboundAction = [string]$_.DefaultOutboundAction
             Configured = $configured[[string]$_.Name]
         }
+        if ($Fast) {
+            $row.Via = 'cmdlet'
+            $row.Fallback = $fallback
+        }
+        [pscustomobject]$row
     })
+}
+
+# The profiles without the NetSecurity module, in the shape of Get-ProfileStates. In force (Enabled,
+# DefaultOutboundAction) from COM, configured from CIM: see the head of this file for why it takes both. Throws on
+# anything it cannot vouch for, and emits nothing until all three profiles are read.
+function Read-FastProfileStates {
+    # The numbers of the fast way, each one written out: derived from a measurement on the VM against the cmdlets,
+    # not from documentation, and confirmed only by Compare. No arithmetic on them; a number that is not here throws.
+    # NET_FW_PROFILE_TYPE2 of COM, in the order the cmdlets give the profiles.
+    $ComProfileType = [ordered]@{ Domain = 1; Private = 2; Public = 4 }
+    # COM DefaultOutboundAction (in force). There is no NotConfigured: COM can only say what is in force.
+    $ComOutbound = @{ '0' = 'Block'; '1' = 'Allow' }
+    # CIM MSFT_NetFirewallProfile.DefaultOutboundAction (the PersistentStore, what is configured).
+    $CimOutbound = @{ '0' = 'NotConfigured'; '2' = 'Allow'; '4' = 'Block' }
+    $policy = New-Object -ComObject HNetCfg.FwPolicy2
+    $inForce = @{}
+    foreach ($name in $ComProfileType.Keys) {
+        $type = $ComProfileType[$name]
+        $on = $policy.FirewallEnabled($type)
+        if (-not ($on -is [bool])) { throw "COM FirewallEnabled of $name is not a boolean: '$on'" }
+        $number = [string]$policy.DefaultOutboundAction($type)
+        if (-not $ComOutbound.ContainsKey($number)) { throw "COM DefaultOutboundAction of $name is not a known number: '$number'" }
+        $inForce[$name] = @{ Enabled = $on; Outbound = $ComOutbound[$number] }
+    }
+    $set = @{}
+    foreach ($p in @(Get-CimInstance -Namespace 'root/StandardCimv2' -ClassName 'MSFT_NetFirewallProfile' -ErrorAction Stop)) {
+        $name = [string]$p.Name
+        if (-not $ComProfileType.Contains($name)) { throw "CIM names a profile that is not known: '$name'" }
+        if ($set.ContainsKey($name)) { throw "CIM names the profile $name twice" }
+        $number = [string]$p.DefaultOutboundAction
+        if (-not $CimOutbound.ContainsKey($number)) { throw "CIM DefaultOutboundAction of $name is not a known number: '$number'" }
+        $set[$name] = $CimOutbound[$number]
+    }
+    $rows = @()
+    foreach ($name in $ComProfileType.Keys) {
+        if (-not $set.ContainsKey($name)) { throw "CIM does not name the profile $name" }
+        $rows += [pscustomobject]@{
+            Name = $name
+            Enabled = $inForce[$name].Enabled
+            DefaultOutboundAction = $inForce[$name].Outbound
+            Configured = $set[$name]
+            Via = 'fast'
+        }
+    }
+    return $rows
 }
 
 function Get-RuleView {
@@ -225,7 +309,36 @@ function Remove-IsolateRules {
 try {
     switch ($Op) {
         'Profiles' {
-            ConvertTo-Json -Compress -Depth 3 -InputObject (Get-ProfileStates)
+            ConvertTo-Json -Compress -Depth 3 -InputObject (Get-ProfileStates -Fast)
+        }
+        'Compare' {
+            # Both ways side by side; this reads and changes nothing. A fast way that cannot answer is a difference
+            # too: what it did not say has not been confirmed.
+            $cmdlet = @{}
+            foreach ($row in @(Get-ProfileStates)) { $cmdlet[[string]$row.Name] = $row }
+            $fast = @{}
+            $differences = @()
+            try {
+                foreach ($row in @(Read-FastProfileStates)) { $fast[[string]$row.Name] = $row }
+            } catch {
+                $differences += [pscustomobject]@{ what = 'profiles'; fast = "error: $($_.Exception.Message)"; cmdlet = 'read' }
+            }
+            $checked = 0
+            if ($differences.Count -eq 0) {
+                foreach ($name in $AllProfiles) {
+                    foreach ($field in @('Enabled', 'DefaultOutboundAction', 'Configured')) {
+                        $checked += 1
+                        $a = if ($fast.ContainsKey($name)) { $fast[$name].$field } else { $null }
+                        $b = if ($cmdlet.ContainsKey($name)) { $cmdlet[$name].$field } else { $null }
+                        if ($null -eq $a -or $null -eq $b -or $a.GetType() -ne $b.GetType() -or [string]$a -cne [string]$b) {
+                            $differences += [pscustomobject]@{ what = "profile $name $field"; fast = $a; cmdlet = $b }
+                        }
+                    }
+                }
+            }
+            $ok = ($differences.Count -eq 0)
+            ConvertTo-Json -Compress -Depth 4 -InputObject ([pscustomobject]@{ ok = $ok; checked = $checked; differences = $differences })
+            if (-not $ok) { exit 1 }
         }
         'Enable' {
             Set-NetFirewallProfile -Profile $AllProfiles -Enabled True
