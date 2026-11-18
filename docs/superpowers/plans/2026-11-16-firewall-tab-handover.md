@@ -678,3 +678,38 @@ keiner ist unter Last gemessen:
 
 **Vorher gemessen, nachher wieder messen:** `Cut` allein 2,44 s; `Cut` im Druck
 unter Last 7,29 s; Druck insgesamt 9,9–16,9 s; Wartezeit auf Sperren 0 ms.
+
+### Aufruf-Bilanz, gemessen je Route (VM, kalt und gleich danach)
+
+Jede Route des Tabs einzeln, auf der echten VM. Ein PowerShell-Aufruf gegen das
+NetSecurity-Modul kostet dort 2,4–3,5 s.
+
+| Route | Dauer je Aufruf | PowerShell |
+|---|---|---|
+| `/api/firewall/isolate` | 0,01–0,17 s | **0 Aufrufe** (Cache-Treffer) |
+| `/api/firewall/connections` | 0,85 s warm | **0 Aufrufe** warm (kalt: `Profiles` + `List`) |
+| `/api/firewall/captures` | 0,02 s | **0 Aufrufe**, reiner Speicher |
+| `/api/firewall/pending` | 0,02 s | kostenlos |
+| `/api/firewall/summary` | 2,75 s, dann 3,24 s | **1 `List` bei jedem Aufruf** |
+| `/api/firewall/rules` | 3,37 s, dann 4,26 s | **1 `List` bei jedem Aufruf** |
+
+- **Die beiden 5-Sekunden-Abfragen (`/isolate`, `/pending`) sind kostenlos.**
+- **`/captures` und `/pending` sind kostenlos.** Sie träge zu laden spart nichts.
+- Der übrige Dauerverbrauch waren diese beiden erzwungenen Lesungen: in 100 s
+  ohne Bedienung 16 PowerShell-Aufrufe, 42 % eines dauernd laufenden
+  `powershell.exe`, ohne Sperrwartezeit. `/rules` rief `_fw_rules(force=True)`
+  auf; das ist weg, beide Routen nehmen jetzt den Regel-Cache
+  (`FIREWALL_RULES_TTL_S = 60`). `/summary` erzwingt im Code nichts: es wartete
+  auf dieselbe Sperre hinter dem erzwungenen `List` von `/rules`, das die
+  Oberfläche im selben `Promise.all` mitschickt (Vorhersage: von ~4 Regel-Lesungen
+  je Minute auf ~1). Nach dem Fix auf der VM nachmessen.
+
+**Gemessen und verworfen: träges Laden der 30-Sekunden-Routen.** Vorgeschlagen
+war, `/captures`, `/pending`, `/rules` und `/summary` erst bei Bedarf zu laden.
+Das bringt nichts: `/captures` und `/pending` kosten **keinen** PowerShell-Aufruf
+(0,02 s, reiner Speicher), es gibt dort nichts zu sparen. `/rules` und
+`/summary` speisen immer sichtbare Teile der Seite — die Schalter im
+Prozessbaum und die ganze rechte Spalte —, sie ließen sich nicht aufschieben,
+ohne etwas, das auf dem Bildschirm steht, leer zu lassen. Der teure Teil war
+nicht der Zeitpunkt des Ladens, sondern das erzwungene Lesen; das ist behoben.
+**Nicht erneut vorschlagen.**

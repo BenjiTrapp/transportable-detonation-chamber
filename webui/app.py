@@ -12518,7 +12518,10 @@ def api_firewall_connections():
 
 @app.route("/api/firewall/summary")
 def api_firewall_summary():
-    """Totals and tops of the same window as /connections (since, until), plus open decisions and captures."""
+    """Totals and tops of the same window as /connections (since, until), plus open decisions and captures.
+
+    A display: the rules come from the cache (``_fw_classified``), never forced. It reads no list of its own, but it
+    waits on the cache's lock behind any read that is under way, which is why a forced read in ``/rules`` slowed it."""
     try:
         since, until = _fw_time_arg("since"), _fw_time_arg("until")
     except ValueError as e:
@@ -12545,8 +12548,14 @@ def api_firewall_geo():
 
 @app.route("/api/firewall/rules")
 def api_firewall_rules():
-    """The ``TDC-FW-*`` rules that stand, each with its own ``rule_id``, ``protocol`` and ``blocking`` verdict."""
-    found, error = _fw_rules(force=True)
+    """The ``TDC-FW-*`` rules that stand, each with its own ``rule_id``, ``protocol`` and ``blocking`` verdict.
+
+    A display, so it takes the rule cache (``FIREWALL_RULES_TTL_S``) and does not force a read: every path that changes
+    a rule forgets the cache itself (block, unblock, the isolate press, the leave, the fetch's rules), so the list can
+    show no stale picture of anything TDC did, only lag a change made outside TDC by up to the TTL. What enforces reads
+    with ``force=True`` and never goes through this route. The forced read cost a PowerShell call every 30 s, and
+    ``/summary``, fired with it, queued behind that call on the cache's lock."""
+    found, error = _fw_rules()
     if error:
         return _fw_error(error, 500)
     return _fw_json({"rules": found})

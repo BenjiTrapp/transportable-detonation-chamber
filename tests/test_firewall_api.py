@@ -2467,3 +2467,38 @@ def test_the_server_keeps_the_call_lines_in_a_rotated_file_beside_the_access_log
             handler.close()
     text = (tmp_path / "logs" / "firewall-calls.log").read_text(encoding="utf-8")
     assert "firewall call op='List' caller='thread'" in text and logger.propagate is False
+
+
+# ---- the two slow polls are displays: they take the rule cache -------------------------------------
+
+
+@pytest.mark.parametrize("path", ["/api/firewall/summary", "/api/firewall/rules"])
+def test_a_display_route_called_again_within_the_ttl_makes_no_powershell_call(client, fw, tdc, monkeypatch, path):
+    clock = [1000.0]
+    monkeypatch.setattr(tdc.time, "time", lambda: clock[0])
+    assert client.get(path).status_code == 200
+    fw.run.calls.clear()
+    for _ in range(5):
+        clock[0] += 5
+        assert client.get(path).status_code == 200
+    assert fw.run.ops() == []
+    clock[0] += tdc.FIREWALL_RULES_TTL_S
+    client.get(path)
+    assert fw.run.ops().count("List") == 1                                            # a minute on, it is read again
+
+
+def test_a_cached_rule_list_never_renews_the_read_back_of_the_cut(client, fw, tdc, monkeypatch):
+    """The rule cache may lag a minute, but ``verified`` rests on the time a read *started*: a hit on the cache does not
+    stamp a new one, so a cut rule removed outside TDC stops reading as closed after the isolate TTL, cache or not."""
+    wall, clock = [1000.0], [1000.0]
+    monkeypatch.setattr(tdc.time, "time", lambda: wall[0])
+    monkeypatch.setattr(tdc.time, "monotonic", lambda: clock[0])
+    assert client.post("/api/firewall/isolate", json={"on": True}).json["verified"] is True
+    assert any(r["name"] == "TDC-FW-ISO-cut" for r in client.get("/api/firewall/rules").json["rules"])   # cached
+    fw.run.rules.pop("TDC-FW-ISO-cut")                                # removed outside TDC
+    fw.run.calls.clear()
+    clock[0] += tdc.FIREWALL_PROFILES_ERROR_TTL_S + 1
+    wall[0] += tdc.FIREWALL_PROFILES_ERROR_TTL_S + 1                  # well inside the 60 s of the rule cache
+    assert any(r["name"] == "TDC-FW-ISO-cut" for r in client.get("/api/firewall/rules").json["rules"])   # the lag
+    assert "List" not in fw.run.ops()
+    assert client.get("/api/firewall/isolate").json["verified"] is False and "Get" in fw.run.ops()
