@@ -446,6 +446,105 @@ Every rule change goes through
   `C:\tdc\scripts\tdc-unisolate.ps1` from the VM console is the way back; run it
   once on purpose to see that it works.
 
+### Reads without the NetSecurity module (`-Op Compare`)
+
+The read verbs of `firewall_rules.ps1` (`Profiles`, `List`, `Get`, and the
+rule read behind them) no longer load the NetSecurity module. **COM**
+(`HNetCfg.FwPolicy2`) answers what is **in force**; **CIM** (`MSFT_NetFirewall*`)
+answers what is **configured**. That split is forced, not chosen: COM has no
+representation for `NotConfigured`, and raw CIM cannot reach the ActiveStore
+(`root/standardcimv2/ActiveStore` answers "Ungültiger Namespace"; raw CIM
+reports `PolicyStoreSource=PersistentStore` for all 538 rules). Every number
+and name is mapped from an exhaustive written-out list; anything not on it
+throws into a fallback onto the old cmdlet path. The fallback is never silent:
+`Via` and a one-line `Fallback` reason reach the call log.
+
+- **`Compare` is a mandatory VM check, and no test on macOS replaces it.** It
+  is a verb in the script, not a test harness, so it runs on any VM, including
+  one with group policies. It reads both paths **independently** and compares
+  them field by field; it prints `ok` and exits 0, or exits 1 on any
+  difference. The fake runner of the tests cannot know what COM and CIM say, so
+  only this run can show that they say what the cmdlets say. *Check:*
+  `powershell -File firewall_rules.ps1 -Op Compare; $LASTEXITCODE` in each of
+  the five states below. *If a field differs:* the fast path is wrong, and the
+  tab stays correct only because the read falls back to the cmdlets: slow, and
+  visible as `Fallback` in the call log.
+
+  Final run, all five green:
+
+  | State | Compare | Fields checked | What it confirms |
+  |---|---|---|---|
+  | A: nothing isolated; an IPv4 **and** an IPv6 rule, each with port and program | exit 0 | 51 | both address spellings, port, program path |
+  | B: the cut standing | exit 0 | 30 | the catch-all: protocol Any, program Any, address Any |
+  | C: converged (Block on all three profiles) | exit 0 | 9 | COM action `0` = Block, CIM `Block` |
+  | D: Domain explicitly `Allow` | exit 0 | 9 | CIM `Allow` |
+  | E: Domain `Allow`, Private `NotConfigured`, Public `Block` | exit 0 | 9 | **COM profile numbers 1 / 2 / 4 = Domain / Private / Public** |
+
+  **Why D and E exist.** A to C left two holes: all three profiles normally
+  stand identical on that VM, and none of the three configures a profile
+  explicitly as `Allow`. CIM's `Allow` form and the profile numbering would
+  have gone unchecked; a swapped number would have shown only as swapped rows,
+  and only with three different states at once. Put everything back to
+  `NotConfigured` afterwards, as the VM was found.
+
+- **Two assumptions the gate disproved.** Both were found only by running it,
+  and neither could have been found on macOS; they are what the gate is worth.
+  1. *CIM hands back the action as a **name*** (`NotConfigured` / `Allow` /
+     `Block`), not only as a number. An earlier probe of the same class on the
+     same VM printed numbers, through a different access path; the cause is
+     unknown. So **both forms are accepted**, each written out, with exact-case
+     matching (a PowerShell hashtable ignores case, so `block` would otherwise
+     have slipped through unlisted).
+  2. *COM writes a single address of either family as a range to itself*:
+     `1.1.1.1-1.1.1.1` and `2606:4700:4700::1111-2606:4700:4700::1111`, where
+     the cmdlets say `1.1.1.1` and `2606:4700:4700::1111`. A range with
+     **different** endpoints still throws, because collapsing it would
+     misstate what the rule covers.
+
+  Through every failing run the tab stayed correct: the reads still answered on
+  the cmdlet path. That is the fallback working as designed.
+
+- **`AllowOut` was deliberately NOT converted. This is the most important
+  line of this section.** Raw CIM answers from the PersistentStore. On a host
+  with group-policy rules the ActiveStore holds rules the PersistentStore does
+  not, and those would be **missing from `allowed_out` entirely**: ISOLATED
+  would report *closed* while they still let traffic out. On the project's VM
+  this is invisible, because it has no group-policy rules at all. The counts
+  there agree exactly (cmdlet ActiveStore 135, cmdlet PersistentStore 135, raw
+  CIM 135), which is precisely why the trap is dangerous. The pin test
+  `test_allowout_stays_on_the_cmdlets_because_cim_cannot_read_the_activestore`
+  holds it. `AllowOut` did not appear in the measured steady-state load.
+  *Do not convert it without a way to read the ActiveStore.*
+
+- **Measured before and after** (VM, unloaded):
+
+  | | before | after |
+  |---|---|---|
+  | one read, fresh process (`Profiles`) | 1.65 s | **0.59 s** |
+  | `List` | 1.65 s | **0.56 s** |
+  | `Get` | 1.65 s | **0.58 s** |
+  | bare `powershell.exe -Command exit` (the floor) | 0.36 s | not applicable |
+  | calls per 100 s of a watching tab | 5 | **2** |
+  | `powershell.exe` busy | 18 % | **3.3 %** |
+  | fallbacks in that window | not applicable | **none** (`{'fast': 2}`) |
+
+  **The timings are also the proof that the module is not loaded.** A module
+  load costs about 1.3 s on its own (0.36 s bare against 1.65 s with it), so a
+  verb answering in 0.6 s cannot have loaded it. A separate module check is not
+  needed, and an attempt to make one by inspecting a child process is
+  meaningless: the child's module state is gone when it exits.
+
+- **What this VM cannot prove.**
+  - **The Local / GroupPolicy distinction**, because it has no group-policy
+    rules. The run shows only that nothing is mis-reported as policy and no
+    rule is lost. *One local GPO outbound Allow rule would prove it.*
+  - **Never exercised, because TDC does not write them:** an inbound rule (COM
+    direction `1`), rules limited to one or two profiles (masks `1` to `6`),
+    and UDP (`17`). If any appears, that read falls back to the cmdlets, so
+    nothing is misreported.
+  - **CIM's numeric form on this script's path** never appeared. Both forms
+    are accepted anyway.
+
 ### Blocking
 
 - **A running connection starves when it is blocked.** The toast says so ("a
@@ -810,4 +909,41 @@ Teile der Seite — die Schalter im Prozessbaum und die ganze rechte Spalte —,
 ließen sich nicht aufschieben, ohne etwas, das auf dem Bildschirm steht, leer zu
 lassen. Der teure Teil war nicht der Zeitpunkt des Ladens, sondern das
 erzwungene Lesen in `/rules`; das ist behoben (16 → 5 Aufrufe, 42 % → 18 %, im Messaufbau oben).
+**Nicht erneut vorschlagen.**
+
+### Stand nach den modulfreien Lesevorgängen (gemessen, VM)
+
+Die Lesevorgänge von `firewall_rules.ps1` laden das NetSecurity-Modul nicht mehr
+(Abschnitt „Reads without the NetSecurity module“ oben). **Die Zahlen der
+Tabellen und der Vorher/nachher-Tabelle oben sind damit überholt.** Ein
+Lesevorgang kostet 0,56–0,59 s statt 1,65 s. Der Tab im Dauerbetrieb, 100 s,
+niemand drückt etwas:
+
+| | davor (18-%-Messung oben) | jetzt |
+|---|---|---|
+| PowerShell-Aufrufe je 100 s | 5 | **2** |
+| `powershell.exe` ausgelastet | 18 % | **3,3 %** |
+| Rückfälle auf die Cmdlets in diesem Fenster | nicht zutreffend | **keine** (`{'fast': 2}`) |
+
+Zur Einordnung: derselbe Tab stand einmal bei 42 % und 16 Aufrufen je 100 s,
+bevor `/rules` aufhörte, ein Lesen zu erzwingen. Welche Routen die beiden
+verbleibenden Aufrufe auslösten, wurde nicht aufgeschrieben; die Aufteilung nach
+`List` und `Profiles` ist hier deshalb nicht angegeben. `AllowOut` kam in der
+Messung nicht vor. Die Punkte 1 bis 6 oben bleiben eigene Arbeit; die
+Zielzahl für den Druck (Punkt 4) lässt sich jetzt aus dem Log neu belegen.
+
+**Verworfen: der residente PowerShell-Prozess.** Er wäre der größere Hebel
+gewesen (~0,2 s je Aufruf), aber:
+
+- Er stellt eine stundenlang lebende, **erhöhte** PowerShell-Sitzung in eine
+  Malware-Kammer, ein privilegiertes Ziel, das es heute nicht gibt: jeder
+  Aufruf ist ein kurzlebiges `powershell.exe -File` mit Argumenten.
+- Eine lange Sitzung sammelt Zustand (`$ErrorActionPreference`, Variablen,
+  Fehlerzustände), und dieser Zustand würde **zwischen Befehlen durchsickern**.
+  Heute beginnt jeder Aufruf frisch, und der nächste Befehl könnte der
+  Panikschnitt sein.
+- **Die Messung hat ihn unnötig gemacht:** der Preis war das Modul-Laden
+  (~1,3 s), nicht der Prozessstart (0,36 s). Ohne Modul ist ein Lesen bei
+  0,56–0,59 s, und die Ruhelast liegt bei 3,3 %.
+
 **Nicht erneut vorschlagen.**
