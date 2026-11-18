@@ -760,7 +760,18 @@ keine kürzere Fehler-TTL wie `FIREWALL_PROFILES_ERROR_TTL_S = 10`: ein einmalig
 Scheitern des `List` zeigt sich bis zu 60 s statt ~30 s. Eine kürzere Fehler-TTL
 wäre eine Zeile, ändert aber die Aufrufzahl bei dauerhaftem Fehler (bis zu
 6 statt 1 Aufruf je Minute, jeder hinter der Sperre) — eine Entscheidung, keine
-Nebensache. Nicht umgesetzt.
+Nebensache.
+
+**Entscheidung: keine kurze Fehler-TTL für den Regel-Cache.** Bei einem
+*dauerhaften* Fehler wären das bis zu 6 scheiternde `List` je Minute zu je
+~3 s, jedes unter `_fw_rules_lock`, hinter der `GET /isolate` wartet: der Pfad,
+der schnell sein muss, würde genau dann ausgehungert, wenn der Analyst ihn am
+dringendsten braucht. Ein einmaliger Fehler, der bis zu 60 s steht, ist der
+billigere Fall: der Tab sagt ehrlich, dass die Regeln nicht gelesen werden
+konnten, und nichts behauptet daraufhin eine Schließung. Beim Profil-Cache ist
+es umgekehrt, deshalb hat er `FIREWALL_PROFILES_ERROR_TTL_S = 10`: dort speist
+ein veralteter Wert eine Aussage darüber, ob überhaupt etwas durchgesetzt wird.
+Die Lücke ist also gewollt, nicht übersehen; bitte nicht „nachziehen".
 
 **Gemessen und verworfen: träges Laden der 30-Sekunden-Routen.** Vorgeschlagen
 war, `/captures`, `/pending`, `/rules` und `/summary` erst bei Bedarf zu laden.
