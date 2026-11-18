@@ -2858,7 +2858,7 @@ def test_an_observer_that_fails_changes_nothing(monkeypatch):
     assert rules_mod.isolate(run, True, settings=settings)["verified"] is True
 
 
-# ---- module-free reads: COM for what is in force, CIM for what is configured ---------------------
+# ---- module-free reads: TDC's rules over COM; the profiles stay on the cmdlets ---------------------
 
 
 def _ps1():
@@ -2895,106 +2895,6 @@ def _op_branch(script, verb):
 
 def _lines_mentioning(text, needle):
     return [line for line in text.splitlines() if needle in line]
-
-
-def test_the_profiles_verb_names_the_way_it_was_answered():
-    script = _ps1()
-    assert "'Compare'" in _validate_set(script), "Compare is not an accepted op"
-    # the contract the Python side reads must be unchanged
-    assert '"Configured"' in script and '"DefaultOutboundAction"' in script
-    branch = _op_branch(script, "Profiles")
-    assert "Via = 'fast'" in branch and "Via = 'cmdlet'" in branch and "Fallback = " in branch
-
-
-def test_com_never_answers_the_configured_store():
-    """COM cannot express NotConfigured, so it must not feed Configured. Exact, line for line: the value that becomes
-    Configured is the CIM instance's number through the CIM map, and nothing COM said can reach it on the way."""
-    branch = _op_branch(_ps1(), "Profiles")
-    com = _lines_mentioning(branch, "FwPolicy2")
-    assert com, "the fast path for Profiles is missing"
-    assert not any("Configured" in l for l in com), \
-        "COM must not answer the configured store: %s" % com
-    fast = _functions(_ps1())["Read-FastProfileStates"]
-    lines = [l.strip() for l in fast.splitlines()]
-    # Configured is assigned once, from the CIM-filled $set and nothing else
-    assigned = [l for l in lines if re.match(r"Configured\s*=", l)]
-    assert assigned == ["Configured = $set[$name]"], assigned
-    assert re.search(r"^\s*Configured = \$set\[\$name\]\s*$", fast, re.M)
-    # $set is filled in one place, from the CIM number through the CIM map, and is otherwise only looked into
-    assert [l for l in lines if "$set" in l] == [
-        "$set = @{}",
-        'if ($set.ContainsKey($name)) { throw "CIM names the profile $name twice" }',
-        "$set[$name] = $CimOutbound[$cimValue]",
-        'if (-not $set.ContainsKey($name)) { throw "CIM does not name the profile $name" }',
-        "Configured = $set[$name]",
-    ]
-    assert not any(re.search(r"\$set\b.*=", l) and re.search(r"\$policy|\$ComOutbound|\$comNumber|\$inForce", l)
-                   for l in lines)
-    # the CIM number comes from the CIM instance, and the CIM instance from the CIM query, and from nowhere else
-    assert [l for l in lines if "$cimValue" in l] == [
-        "$cimValue = [string]$cim.DefaultOutboundAction",
-        'if (-not ($CimOutbound.Keys -ccontains $cimValue)) { throw "CIM DefaultOutboundAction of $name is neither a known name nor a known number: \'$cimValue\'" }',
-        "$set[$name] = $CimOutbound[$cimValue]",
-    ]
-    assert [l for l in lines if re.search(r"\$cim\b", l)] == [
-        "foreach ($cim in @(Get-CimInstance -Namespace 'root/StandardCimv2' -ClassName 'MSFT_NetFirewallProfile' -ErrorAction Stop)) {",
-        "$name = [string]$cim.Name",
-        "$cimValue = [string]$cim.DefaultOutboundAction",
-    ]
-    assert [l for l in lines if re.match(r"\$CimOutbound\s*=", l)] == [
-        "$CimOutbound = @{ '0' = 'NotConfigured'; '2' = 'Allow'; '4' = 'Block'; 'NotConfigured' = 'NotConfigured'; 'Allow' = 'Allow'; 'Block' = 'Block' }"]
-    # the CIM query is never asked for a store (it can only answer the PersistentStore), and no cmdlet is in the way
-    assert "Get-NetFirewall" not in fast and "PolicyStore" not in fast.split("Get-CimInstance", 1)[1].split("\n", 1)[0]
-
-
-def test_an_unknown_number_falls_back_instead_of_guessing():
-    """Each number is looked up in its map and throws when it is not there; the throw is what -Fast turns into the
-    cmdlet answer with Via cmdlet and the reason."""
-    script = _ps1()
-    fast = _functions(script)["Read-FastProfileStates"]
-    assert "if (-not $ComOutbound.ContainsKey($comNumber)) { throw " in fast
-    assert "if (-not ($CimOutbound.Keys -ccontains $cimValue)) { throw " in fast
-    assert "if (-not ($on -is [bool])) { throw " in fast
-    states = _functions(script)["Get-ProfileStates"]
-    assert re.search(r"try \{\s*\$rows = @\(Read-FastProfileStates\)\s*return \$rows\s*\} catch \{\s*\$fallback = ", states)
-    assert "$row.Via = 'cmdlet'" in states and "$row.Fallback = $fallback" in states
-
-
-def test_every_number_of_the_fast_path_is_written_out():
-    """Measured, not documented: COM 0 Block, 1 Allow; CIM 0 NotConfigured, 2 Allow, 4 Block and the
-    same three by name; COM profile types 1 Domain, 2 Private, 4 Public. Anything else is not in a map and so is a fallback."""
-    script = _ps1()
-    com = re.search(r"\$ComOutbound = @\{([^}]*)\}", script).group(1)
-    cim = re.search(r"\$CimOutbound = @\{([^}]*)\}", script).group(1)
-    types = re.search(r"\$ComProfileType = \[ordered\]@\{([^}]*)\}", script).group(1)
-    assert dict(re.findall(r"'(\d+)' = '(\w+)'", com)) == {"0": "Block", "1": "Allow"}
-    assert dict(re.findall(r"'(\w+)' = '(\w+)'", cim)) == {"0": "NotConfigured", "2": "Allow", "4": "Block",
-                                                          "NotConfigured": "NotConfigured", "Allow": "Allow", "Block": "Block"}
-    assert dict(re.findall(r"(\w+) = (\d+)", types)) == {"Domain": "1", "Private": "2", "Public": "4"}
-    fast = _functions(script)["Read-FastProfileStates"]
-    assert "ContainsKey" in fast and "throw" in fast
-
-
-def test_the_write_verbs_keep_reading_the_profiles_through_the_cmdlets():
-    script = _ps1()
-    for verb in ("Create", "Cut", "SetDefaultOutbound"):
-        case = _op_case(script, verb)
-        assert "Get-ProfileStates" in case and "-Fast" not in case, verb
-    for verb in ("Enable", "Remove", "DisableAllowOut", "EnableAllowOut", "RemoveIsolate"):
-        assert "-Fast" not in _op_case(script, verb), verb
-    assert "Get-ProfileStates -Fast" in _op_case(script, "Profiles")
-
-
-def test_compare_reads_both_ways_and_writes_nothing():
-    script = _ps1()
-    branch = _op_branch(script, "Compare")
-    assert "Read-FastProfileStates" in branch and "Get-NetFirewallProfile -PolicyStore ActiveStore" in branch
-    for field in ("Enabled", "DefaultOutboundAction", "Configured"):
-        assert "'%s'" % field in _op_case(script, "Compare")
-    for out in ("ok = ", "checked = ", "differences = ", "what = ", "fast = ", "cmdlet = "):
-        assert out in branch, out
-    assert "exit 1" in _op_case(script, "Compare")
-    assert not re.search(r"\b(Set|New|Remove|Enable|Disable)-NetFirewall", branch)
 
 
 def test_compare_is_accepted_but_the_module_never_emits_it():
@@ -3051,15 +2951,6 @@ def test_a_long_reason_is_cut_and_a_failed_call_is_still_reported(monkeypatch):
     with pytest.raises(rules_mod.RuleError):
         rules_mod._profiles(lambda args: (_ for _ in ()).throw(OSError("gone")))
     assert seen[1]["op"] == "Profiles" and seen[1]["rc"] is None and "via" not in seen[1]
-
-
-def test_a_reason_is_one_short_line_in_profiles_and_in_compare_alike():
-    script = _ps1()
-    reason = _functions(script)["Get-ShortReason"]
-    assert '-split "`r?`n"' in reason and "Substring(0, 200)" in reason
-    assert "$fallback = Get-ShortReason $_" in _functions(script)["Get-ProfileStates"]
-    assert 'fast = "error: $(Get-ShortReason $_)"' in _op_case(script, "Compare")
-    assert "$_.Exception.Message" not in _op_case(script, "Compare")
 
 
 # ---- TDC's own rules without the module: List and Get over COM --------------------------------
@@ -3173,23 +3064,6 @@ def test_a_name_reaching_com_is_still_checked_and_matched_whole():
     assert uses == ["if ($RuleName) {", "if ($name -ne $RuleName) { continue }"], uses
 
 
-def test_list_and_get_say_which_way_answered():
-    script = _ps1()
-    listing = [l.strip() for l in _op_case(script, "List").splitlines()]
-    # fast only when both parts were; otherwise cmdlet, with the rules' reason first and else the profiles'
-    for line in ("$read = Get-OurRuleViews", "$states = @(Get-ProfileStates -Fast)",
-                 "$out = [ordered]@{ profiles = $states; rules = $read.Views; Via = 'fast' }",
-                 "if ($read.Via -ne 'fast') {", "$out.Fallback = $read.Fallback",
-                 "} elseif ($states[0].Via -ne 'fast') {", "$out.Fallback = $states[0].Fallback"):
-        assert line in listing, line
-    assert listing.count("$out.Via = 'cmdlet'") == 2
-    get = [l.strip() for l in _op_case(script, "Get").splitlines()]
-    for line in ("$read = Get-OurRuleViews -RuleName $Name",
-                 "$view | Add-Member -NotePropertyName Via -NotePropertyValue $read.Via",
-                 "if ($read.Via -ne 'fast') { $view | Add-Member -NotePropertyName Fallback -NotePropertyValue $read.Fallback }"):
-        assert line in get, line
-
-
 def test_the_cut_keeps_reading_its_rule_back_through_the_cmdlets():
     functions = _functions(_ps1())
     cut = _op_case(_ps1(), "Cut")
@@ -3266,61 +3140,11 @@ def test_the_way_on_stdout_wins_and_other_stderr_adds_nothing(monkeypatch):
         assert set(seen[-1]) == {"op", "lock", "wait_ms", "run_ms", "rc", "thread"}, err
 
 
-# ---- the configured guard, whatever the case: PowerShell's names are not case-sensitive, so neither is this ----
+# ---- the code lines of a text, comments left out ------------------------------------------------
 
 
 def _code_lines(text):
     return [l.strip() for l in text.splitlines() if l.strip() and not l.strip().startswith("#")]
-
-
-def test_nothing_but_cim_reaches_configured_in_any_spelling():
-    """$Set, $INFORCE and $cimvalue are $set, $inForce and $cimValue to PowerShell. Every line that names one of
-    the CIM-side variables, in any case, is pinned; and no scope prefix, ${...} or variable cmdlet can name them
-    around the pins."""
-    fast = _functions(_ps1())["Read-FastProfileStates"]
-    lines = _code_lines(fast)
-
-    def naming(var):
-        return [l for l in lines if re.search(r"\$%s\b" % var, l, re.I)]
-    assert naming("set") == [
-        "$set = @{}",
-        'if ($set.ContainsKey($name)) { throw "CIM names the profile $name twice" }',
-        "$set[$name] = $CimOutbound[$cimValue]",
-        'if (-not $set.ContainsKey($name)) { throw "CIM does not name the profile $name" }',
-        "Configured = $set[$name]",
-    ]
-    assert naming("cimValue") == [
-        "$cimValue = [string]$cim.DefaultOutboundAction",
-        'if (-not ($CimOutbound.Keys -ccontains $cimValue)) { throw "CIM DefaultOutboundAction of $name is neither a known name nor a known number: \'$cimValue\'" }',
-        "$set[$name] = $CimOutbound[$cimValue]",
-    ]
-    assert naming("cim") == [
-        "foreach ($cim in @(Get-CimInstance -Namespace 'root/StandardCimv2' -ClassName 'MSFT_NetFirewallProfile' -ErrorAction Stop)) {",
-        "$name = [string]$cim.Name",
-        "$cimValue = [string]$cim.DefaultOutboundAction",
-    ]
-    # the CIM map is defined once and then only looked into: nothing assigns into it, adds to it or changes it
-    assert naming("CimOutbound") == [
-        "$CimOutbound = @{ '0' = 'NotConfigured'; '2' = 'Allow'; '4' = 'Block'; 'NotConfigured' = 'NotConfigured'; 'Allow' = 'Allow'; 'Block' = 'Block' }",
-        'if (-not ($CimOutbound.Keys -ccontains $cimValue)) { throw "CIM DefaultOutboundAction of $name is neither a known name nor a known number: \'$cimValue\'" }',
-        "$set[$name] = $CimOutbound[$cimValue]",
-    ]
-    assert not re.search(r"\$\{|\$(local|script|global|private|using|variable):|-Variable\b|\[ref\]", fast, re.I)
-
-
-def test_configured_is_written_in_one_place_per_way_and_read_only_by_compare():
-    """Not a line of the script may name the Configured property but the one fast assignment, the one cmdlet
-    assignment and Compare's field list: no $rows[0].Configured = ..., no $_.Configured, no Add-Member Configured."""
-    code = _code_lines(_ps1())
-    # property access only: a member (.Configured), an assignment (Configured =), a quoted name ('Configured',
-    # "Configured", ['Configured']) or Add-Member naming it; the word in a message or another variable is not counted
-    access = (r"\.configured\b", r"(?<![\w$])configured\s*=", r"['\"]configured['\"]", r"Add-Member\b.*(?<![\w$])configured\b")
-    named = [l for l in code if any(re.search(a, l, re.I) for a in access)]
-    assert named == [
-        "Configured = $configured[[string]$_.Name]",
-        "Configured = $set[$name]",
-        "foreach ($field in @('Enabled', 'DefaultOutboundAction', 'Configured')) {",
-    ], named
 
 
 # ---- the invariant itself, not the name set as its proxy ----------------------------------------
@@ -3404,3 +3228,77 @@ def test_only_a_rule_whose_source_is_local_counts_as_one_isolated_can_switch_off
                         {"Name": "Loc-Out", "DisplayName": "Local one", "Group": "G", "Source": "Local"}]}
     found = rules_mod.allowed_out(_answering(answer))
     assert [(r["name"], r["local"]) for r in found] == [("Loc-Out", True), ("Num-Out", False), ("Pol-Out", False)]
+
+
+# ---- Profiles stays on the cmdlets: COM reads the local store, not what is in force -----------------------------
+
+
+def test_profiles_stays_on_the_cmdlets_because_com_reads_the_local_store_not_what_is_in_force():
+    """Measured on the VM, with the local GPO store written by Set-NetFirewallProfile -PolicyStore <computer name>:
+    local GPO Domain outbound Allow, PersistentStore Block, ActiveStore (in force) Allow, COM 0 = Block. COM reads the
+    local store, so where a policy sets Allow over the local Block that ISOLATED writes, a COM read would say closed
+    while the egress is open: the defect this feature exists to prevent. Raw CIM answers the PersistentStore only.
+    So every verb reads the profiles through Get-ProfileStates, and that reads both stores through the cmdlets and
+    nothing else, with no second way to name."""
+    script = _ps1()
+    assert _code_lines(_op_case(script, "Profiles")) == [
+        "'Profiles' {",
+        "ConvertTo-Json -Compress -Depth 3 -InputObject (Get-ProfileStates)",
+    ]
+    states = _code_lines(_functions(script)["Get-ProfileStates"])
+    assert "foreach ($p in @(Get-NetFirewallProfile -PolicyStore PersistentStore)) {" in states
+    assert "@(Get-NetFirewallProfile -PolicyStore ActiveStore | ForEach-Object {" in states
+    assert not [l for l in states if re.search(r"param\(|try\b|catch\b|Via|Fallback|ComObject|FwPolicy2", l, re.I)], states
+    # no verb has a second way to the profiles: nothing reads them over COM or CIM, and nothing asks for one
+    code = "\n".join(_code_lines(script))
+    assert not re.search(r"FirewallEnabled|DefaultOutboundAction\(|MSFT_NetFirewallProfile|CimInstance|CimSession|"
+                         r"Read-FastProfileStates|-Fast\b|\[switch\]", code, re.I)
+    for verb in ("Profiles", "List", "Create", "Cut", "SetDefaultOutbound", "AllowOut"):
+        assert "FwPolicy2" not in _op_case(script, verb), verb
+        assert "Get-ProfileStates" in _op_case(script, verb), verb
+    # Configured, the store ISOLATED remembers and puts back, is named in exactly one line: the cmdlet assignment
+    access = (r"\.configured\b", r"(?<![\w$])configured\s*=", r"['\"]configured['\"]", r"Add-Member\b.*(?<![\w$])configured\b")
+    assert [l for l in _code_lines(script) if any(re.search(a, l, re.I) for a in access)] == [
+        "Configured = $configured[[string]$_.Name]"]
+    # Compare has no profile section left: with one way there is nothing to compare
+    compare = "\n".join(_code_lines(_op_case(script, "Compare")))
+    assert not re.search(r"Get-ProfileStates|Get-NetFirewallProfile|DefaultOutboundAction|Configured|'profiles'", compare, re.I)
+
+
+def test_compare_counts_each_kind_of_rule_check_on_its_own_and_writes_nothing():
+    """An ok over no rule at all must not read like an ok over fifty fields: how many rules either way found, and
+    each kind of check, are said apart."""
+    script = _ps1()
+    case = _op_case(script, "Compare")
+    lines = _code_lines(case)
+    assert "$checked = [ordered]@{ displayNames = 0; names = 0; fields = 0 }" in lines
+    assert [l for l in lines if "+= 1" in l] == ["$checked.displayNames += 1", "$checked.names += 1", "$checked.fields += 1"]
+    assert "ok = $ok; rules = $ruleNames.Count; checked = [pscustomobject]$checked; differences = $differences" in lines
+    assert "exit 1" in case
+    assert not re.search(r"\b(Set|New|Remove|Enable|Disable)-NetFirewall", _op_branch(script, "Compare"))
+
+
+def test_list_says_the_way_its_rules_were_read_and_get_the_way_of_its_rule():
+    script = _ps1()
+    listing = _code_lines(_op_case(script, "List"))
+    assert listing == [
+        "'List' {",
+        "$read = Get-OurRuleViews",
+        "$out = [ordered]@{ profiles = (Get-ProfileStates); rules = $read.Views; Via = $read.Via }",
+        "if ($read.Via -ne 'fast') { $out.Fallback = $read.Fallback }",
+        "ConvertTo-Json -Compress -Depth 5 -InputObject ([pscustomobject]$out)",
+    ], listing
+    get = _code_lines(_op_case(script, "Get"))
+    for line in ("$read = Get-OurRuleViews -RuleName $Name",
+                 "$view | Add-Member -NotePropertyName Via -NotePropertyValue $read.Via",
+                 "if ($read.Via -ne 'fast') { $view | Add-Member -NotePropertyName Fallback -NotePropertyValue $read.Fallback }"):
+        assert line in get, line
+
+
+def test_a_reason_is_one_short_line_in_the_rule_reads_and_in_compare_alike():
+    script = _ps1()
+    reason = _functions(script)["Get-ShortReason"]
+    assert '-split "`r?`n"' in reason and "Substring(0, 200)" in reason
+    assert "$fallback = Get-ShortReason $_" in _functions(script)["Get-OurRuleViews"]
+    assert 'fast = "error: $(Get-ShortReason $_)"' in _op_case(script, "Compare")
+    assert "$_.Exception.Message" not in _op_case(script, "Compare")
