@@ -656,6 +656,11 @@ Was dagegen zu tun wäre (eigene Arbeit, nicht Teil des Panikschnitts):
    wartet hinter einem laufenden `List` (3,5–9,4 s). *Richtung:* ein
    Generationszähler, den jedes Vergessen erhöht und den ein `List` beim Ablegen
    prüft; dann kann die Sperre vor dem Aufruf losgelassen werden.
+   *Größe des Fensters seit der Änderung der Aufruf-Bilanz:* ein so abgelegter
+   veralteter Stand hielt vorher höchstens ~30 s (der erzwungene Abruf von
+   `/rules` heilte ihn); jetzt hält er bis zu einer TTL, 60 s, und `can_fetch`
+   kann in dieser Zeit `true` zeigen. Nur Anzeige (Entscheidung und Frist lesen
+   mit `force=True`); `verified` ist nicht betroffen.
 
 **Von diesem Branch hinzugefügt — nach dem Fix messen.** Der Panikschnitt hat
 selbst zur Bilanz beigetragen; jeder dieser Punkte ist einzeln begründet, aber
@@ -679,10 +684,12 @@ keiner ist unter Last gemessen:
 **Vorher gemessen, nachher wieder messen:** `Cut` allein 2,44 s; `Cut` im Druck
 unter Last 7,29 s; Druck insgesamt 9,9–16,9 s; Wartezeit auf Sperren 0 ms.
 
-### Aufruf-Bilanz, gemessen je Route (VM, kalt und gleich danach)
+### Aufruf-Bilanz, gemessen je Route (VM)
 
-Jede Route des Tabs einzeln, auf der echten VM. Ein PowerShell-Aufruf gegen das
-NetSecurity-Modul kostet dort 2,4–3,5 s.
+Jede Route des Tabs einzeln, auf der echten VM, kalt und gleich danach. Ein
+PowerShell-Aufruf gegen das NetSecurity-Modul kostet dort 2,4–3,5 s. Die Zahlen
+der Tabelle stammen von **vor** der Änderung; die Zeile `/summary` ist nach einer
+späteren Messung richtiggestellt.
 
 | Route | Dauer je Aufruf | PowerShell |
 |---|---|---|
@@ -690,26 +697,78 @@ NetSecurity-Modul kostet dort 2,4–3,5 s.
 | `/api/firewall/connections` | 0,85 s warm | **0 Aufrufe** warm (kalt: `Profiles` + `List`) |
 | `/api/firewall/captures` | 0,02 s | **0 Aufrufe**, reiner Speicher |
 | `/api/firewall/pending` | 0,02 s | kostenlos |
-| `/api/firewall/summary` | 2,75 s, dann 3,24 s | **1 `List` bei jedem Aufruf** |
-| `/api/firewall/rules` | 3,37 s, dann 4,26 s | **1 `List` bei jedem Aufruf** |
+| `/api/firewall/summary` | 0,45–0,49 s (allein, zweimal im Abstand von 70 s) | **0 Aufrufe**, beide Male |
+| `/api/firewall/rules` | 3,37 s, dann 4,26 s | **1 `List` bei jedem Aufruf** (`_fw_rules(force=True)`) |
 
-- **Die beiden 5-Sekunden-Abfragen (`/isolate`, `/pending`) sind kostenlos.**
+**Korrektur: `/summary` hat nie gelesen.** Eine frühere Fassung dieser Tabelle
+schrieb `/summary` „1 `List` bei jedem Aufruf“ zu (2,75 s, dann 3,24 s). Das war
+falsch: `/summary` erzwingt nichts und liest die Regelliste nicht selbst. Das
+`List` in seinem Zeitfenster war das erzwungene Lesen von `/rules`; die
+Oberfläche schickt beide im selben `Promise.all` los, und die erste Messung rief
+sie unmittelbar nacheinander auf. Dass `/summary` 2,75–3,24 s brauchte, lag daran,
+dass es auf der Sperre des Regel-Caches hinter diesem `List` wartete. Allein
+gemessen: 0 Aufrufe. Auch die „16 Aufrufe“ waren damit `/rules` allein: vier
+Abfragen, jede erzwang ein Lesen, überlappende Anfragen erzwangen jeweils wieder.
+
+- **Die beiden 5-Sekunden-Abfragen (`/isolate`, `/pending`) sind kostenlos**,
+  jedenfalls je Aufruf: Cache-Treffer. (Was `/isolate` über 100 s doch kostet,
+  steht unten.)
 - **`/captures` und `/pending` sind kostenlos.** Sie träge zu laden spart nichts.
-- Der übrige Dauerverbrauch waren diese beiden erzwungenen Lesungen: in 100 s
-  ohne Bedienung 16 PowerShell-Aufrufe, 42 % eines dauernd laufenden
-  `powershell.exe`, ohne Sperrwartezeit. `/rules` rief `_fw_rules(force=True)`
-  auf; das ist weg, beide Routen nehmen jetzt den Regel-Cache
-  (`FIREWALL_RULES_TTL_S = 60`). `/summary` erzwingt im Code nichts: es wartete
-  auf dieselbe Sperre hinter dem erzwungenen `List` von `/rules`, das die
-  Oberfläche im selben `Promise.all` mitschickt (Vorhersage: von ~4 Regel-Lesungen
-  je Minute auf ~1). Nach dem Fix auf der VM nachmessen.
+
+**Die Änderung:** `/rules` nimmt den Regel-Cache (`FIREWALL_RULES_TTL_S = 60`)
+statt zu erzwingen. Das ist sicher, weil jeder Weg, der eine Regel ändert
+(`block`, `unblock`, der Druck, das Verlassen, die Regeln des Abrufs), den Cache
+selbst vergisst: er kann nichts zeigen, was TDC getan hat, nur eine Änderung
+von außen bis zu einer TTL verspätet. Was durchsetzt (Entscheidung, Frist,
+`_fw_fetch_refusal`), liest weiter mit `force=True`. `/summary` brauchte keine
+Änderung.
+
+**Vorher/nachher, gemessen:** 100 s im Dauerbetrieb des Tabs, niemand drückt etwas.
+
+| | vorher | nachher |
+|---|---|---|
+| Aufrufe | 16 | **5** |
+| `List` | 14 (alle `/rules`) | **2** (beide `/connections`, mit eigener TTL) |
+| `Profiles` | 2 | 3 (alle `/isolate`) |
+| `powershell.exe` ausgelastet | 42 % | **18 %** |
+
+Vorhergesagt waren 1–2 `List` je 100 s (eingetroffen) und 3–6 % Auslastung
+(zu niedrig: die drei `Profiles` von `/isolate` sind schwerer als angesetzt).
+
+**Der verbleibende Verbrauch** (nicht Teil dieser Änderung, nicht umgesetzt):
+
+- 2 `List` aus `/connections`: rechtmäßig, es liest mit seiner eigenen TTL.
+- 3 `Profiles` aus `/isolate` in 100 s bei einer TTL von 60 s. Eines davon ist das
+  doppelte Lesen: `_fw_keep_profiles` legt die Default-Aktion (`blocking`) als
+  unbekannt ab, `verified` verlangt sie, also liest der Zustand die Profile
+  beim nächsten `GET` noch einmal. *Richtung, eine Zeile:* `_fw_keep_profiles`
+  hält `blocking` mit, statt `None` abzulegen.
+
+**Der Regel-Cache ist jetzt bis zu einer TTL alt, wo er vorher durch den
+erzwungenen 30-s-Abruf nie älter als ~30 s war.** Das betrifft alles, was ihn
+liest, ohne zu erzwingen: `/pending` (`can_fetch`) und `GET /isolate`
+(`can_fetch` über `_fw_cut_rule_listed`, das nicht einmal das Alter prüft). Zu
+Punkt 6 oben: das geparkte Rennen lebt jetzt bis zu 60 s statt ~30 s, und in
+dieser Zeit kann `can_fetch` `true` zeigen, wo die Entscheidung selbst (mit
+`force=True`) ablehnen würde. Nur Anzeige: nichts wird daraufhin getan.
+`verified` ist davon nicht betroffen: ein Cache-Treffer erneuert die Rücklesung
+der Schnitt-Regel nicht (Test:
+`test_a_cached_rule_list_never_renews_the_read_back_of_the_cut`).
+
+**Ein Fehler wird ebenfalls eine ganze TTL lang gemerkt.** `_fw_rules` kennt
+keine kürzere Fehler-TTL wie `FIREWALL_PROFILES_ERROR_TTL_S = 10`: ein einmaliges
+Scheitern des `List` zeigt sich bis zu 60 s statt ~30 s. Eine kürzere Fehler-TTL
+wäre eine Zeile, ändert aber die Aufrufzahl bei dauerhaftem Fehler (bis zu
+6 statt 1 Aufruf je Minute, jeder hinter der Sperre) — eine Entscheidung, keine
+Nebensache. Nicht umgesetzt.
 
 **Gemessen und verworfen: träges Laden der 30-Sekunden-Routen.** Vorgeschlagen
 war, `/captures`, `/pending`, `/rules` und `/summary` erst bei Bedarf zu laden.
 Das bringt nichts: `/captures` und `/pending` kosten **keinen** PowerShell-Aufruf
-(0,02 s, reiner Speicher), es gibt dort nichts zu sparen. `/rules` und
-`/summary` speisen immer sichtbare Teile der Seite — die Schalter im
-Prozessbaum und die ganze rechte Spalte —, sie ließen sich nicht aufschieben,
-ohne etwas, das auf dem Bildschirm steht, leer zu lassen. Der teure Teil war
-nicht der Zeitpunkt des Ladens, sondern das erzwungene Lesen; das ist behoben.
+(0,02 s, reiner Speicher), `/summary` ebenfalls keinen (0 Aufrufe, 0,45–0,49 s),
+es gibt dort nichts zu sparen. `/rules` und `/summary` speisen immer sichtbare
+Teile der Seite — die Schalter im Prozessbaum und die ganze rechte Spalte —, sie
+ließen sich nicht aufschieben, ohne etwas, das auf dem Bildschirm steht, leer zu
+lassen. Der teure Teil war nicht der Zeitpunkt des Ladens, sondern das
+erzwungene Lesen in `/rules`; das ist behoben (16 → 5 Aufrufe, 42 % → 18 %).
 **Nicht erneut vorschlagen.**
