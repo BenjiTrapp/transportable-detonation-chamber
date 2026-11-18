@@ -2924,25 +2924,25 @@ def test_com_never_answers_the_configured_store():
     assert [l for l in lines if "$set" in l] == [
         "$set = @{}",
         'if ($set.ContainsKey($name)) { throw "CIM names the profile $name twice" }',
-        "$set[$name] = $CimOutbound[$cimNumber]",
+        "$set[$name] = $CimOutbound[$cimValue]",
         'if (-not $set.ContainsKey($name)) { throw "CIM does not name the profile $name" }',
         "Configured = $set[$name]",
     ]
     assert not any(re.search(r"\$set\b.*=", l) and re.search(r"\$policy|\$ComOutbound|\$comNumber|\$inForce", l)
                    for l in lines)
     # the CIM number comes from the CIM instance, and the CIM instance from the CIM query, and from nowhere else
-    assert [l for l in lines if "$cimNumber" in l] == [
-        "$cimNumber = [string]$cim.DefaultOutboundAction",
-        'if (-not $CimOutbound.ContainsKey($cimNumber)) { throw "CIM DefaultOutboundAction of $name is not a known number: \'$cimNumber\'" }',
-        "$set[$name] = $CimOutbound[$cimNumber]",
+    assert [l for l in lines if "$cimValue" in l] == [
+        "$cimValue = [string]$cim.DefaultOutboundAction",
+        'if (-not ($CimOutbound.Keys -ccontains $cimValue)) { throw "CIM DefaultOutboundAction of $name is neither a known name nor a known number: \'$cimValue\'" }',
+        "$set[$name] = $CimOutbound[$cimValue]",
     ]
     assert [l for l in lines if re.search(r"\$cim\b", l)] == [
         "foreach ($cim in @(Get-CimInstance -Namespace 'root/StandardCimv2' -ClassName 'MSFT_NetFirewallProfile' -ErrorAction Stop)) {",
         "$name = [string]$cim.Name",
-        "$cimNumber = [string]$cim.DefaultOutboundAction",
+        "$cimValue = [string]$cim.DefaultOutboundAction",
     ]
     assert [l for l in lines if re.match(r"\$CimOutbound\s*=", l)] == [
-        "$CimOutbound = @{ '0' = 'NotConfigured'; '2' = 'Allow'; '4' = 'Block' }"]
+        "$CimOutbound = @{ '0' = 'NotConfigured'; '2' = 'Allow'; '4' = 'Block'; 'NotConfigured' = 'NotConfigured'; 'Allow' = 'Allow'; 'Block' = 'Block' }"]
     # the CIM query is never asked for a store (it can only answer the PersistentStore), and no cmdlet is in the way
     assert "Get-NetFirewall" not in fast and "PolicyStore" not in fast.split("Get-CimInstance", 1)[1].split("\n", 1)[0]
 
@@ -2953,7 +2953,7 @@ def test_an_unknown_number_falls_back_instead_of_guessing():
     script = _ps1()
     fast = _functions(script)["Read-FastProfileStates"]
     assert "if (-not $ComOutbound.ContainsKey($comNumber)) { throw " in fast
-    assert "if (-not $CimOutbound.ContainsKey($cimNumber)) { throw " in fast
+    assert "if (-not ($CimOutbound.Keys -ccontains $cimValue)) { throw " in fast
     assert "if (-not ($on -is [bool])) { throw " in fast
     states = _functions(script)["Get-ProfileStates"]
     assert re.search(r"try \{\s*\$rows = @\(Read-FastProfileStates\)\s*return \$rows\s*\} catch \{\s*\$fallback = ", states)
@@ -2961,14 +2961,15 @@ def test_an_unknown_number_falls_back_instead_of_guessing():
 
 
 def test_every_number_of_the_fast_path_is_written_out():
-    """Measured, not documented: COM 0 Block, 1 Allow; CIM 0 NotConfigured, 2 Allow, 4 Block; COM profile types
-    1 Domain, 2 Private, 4 Public. Anything else is not in a map and so is a fallback."""
+    """Measured, not documented: COM 0 Block, 1 Allow; CIM 0 NotConfigured, 2 Allow, 4 Block and the
+    same three by name; COM profile types 1 Domain, 2 Private, 4 Public. Anything else is not in a map and so is a fallback."""
     script = _ps1()
     com = re.search(r"\$ComOutbound = @\{([^}]*)\}", script).group(1)
     cim = re.search(r"\$CimOutbound = @\{([^}]*)\}", script).group(1)
     types = re.search(r"\$ComProfileType = \[ordered\]@\{([^}]*)\}", script).group(1)
     assert dict(re.findall(r"'(\d+)' = '(\w+)'", com)) == {"0": "Block", "1": "Allow"}
-    assert dict(re.findall(r"'(\d+)' = '(\w+)'", cim)) == {"0": "NotConfigured", "2": "Allow", "4": "Block"}
+    assert dict(re.findall(r"'(\w+)' = '(\w+)'", cim)) == {"0": "NotConfigured", "2": "Allow", "4": "Block",
+                                                          "NotConfigured": "NotConfigured", "Allow": "Allow", "Block": "Block"}
     assert dict(re.findall(r"(\w+) = (\d+)", types)) == {"Domain": "1", "Private": "2", "Public": "4"}
     fast = _functions(script)["Read-FastProfileStates"]
     assert "ContainsKey" in fast and "throw" in fast
@@ -3121,7 +3122,7 @@ def test_an_unknown_rule_number_or_spelling_falls_back_instead_of_guessing():
     for line in (
             "elseif ($app -is [string] -and $app) { $program = $app }",
             "else { throw \"COM ApplicationName of $name is neither null nor a path: '$app'\" }",
-            "if ($token -match '^(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})/255\\.255\\.255\\.255\\z') { $Matches[1] }",
+            "if ($token -match '^(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})-(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})\\z' -and $Matches[1] -eq $Matches[2]) { $Matches[1] }",
             "elseif ($token -match '^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\z') { $token }",
             "elseif ($token -match '^[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{0,4}){2,7}\\z') { $token }",
             "else { throw \"COM RemoteAddresses of $name has a spelling that is not known: '$token'\" }",
@@ -3262,7 +3263,7 @@ def _code_lines(text):
 
 
 def test_nothing_but_cim_reaches_configured_in_any_spelling():
-    """$Set, $INFORCE and $cimnumber are $set, $inForce and $cimNumber to PowerShell. Every line that names one of
+    """$Set, $INFORCE and $cimvalue are $set, $inForce and $cimValue to PowerShell. Every line that names one of
     the CIM-side variables, in any case, is pinned; and no scope prefix, ${...} or variable cmdlet can name them
     around the pins."""
     fast = _functions(_ps1())["Read-FastProfileStates"]
@@ -3273,25 +3274,25 @@ def test_nothing_but_cim_reaches_configured_in_any_spelling():
     assert naming("set") == [
         "$set = @{}",
         'if ($set.ContainsKey($name)) { throw "CIM names the profile $name twice" }',
-        "$set[$name] = $CimOutbound[$cimNumber]",
+        "$set[$name] = $CimOutbound[$cimValue]",
         'if (-not $set.ContainsKey($name)) { throw "CIM does not name the profile $name" }',
         "Configured = $set[$name]",
     ]
-    assert naming("cimNumber") == [
-        "$cimNumber = [string]$cim.DefaultOutboundAction",
-        'if (-not $CimOutbound.ContainsKey($cimNumber)) { throw "CIM DefaultOutboundAction of $name is not a known number: \'$cimNumber\'" }',
-        "$set[$name] = $CimOutbound[$cimNumber]",
+    assert naming("cimValue") == [
+        "$cimValue = [string]$cim.DefaultOutboundAction",
+        'if (-not ($CimOutbound.Keys -ccontains $cimValue)) { throw "CIM DefaultOutboundAction of $name is neither a known name nor a known number: \'$cimValue\'" }',
+        "$set[$name] = $CimOutbound[$cimValue]",
     ]
     assert naming("cim") == [
         "foreach ($cim in @(Get-CimInstance -Namespace 'root/StandardCimv2' -ClassName 'MSFT_NetFirewallProfile' -ErrorAction Stop)) {",
         "$name = [string]$cim.Name",
-        "$cimNumber = [string]$cim.DefaultOutboundAction",
+        "$cimValue = [string]$cim.DefaultOutboundAction",
     ]
     # the CIM map is defined once and then only looked into: nothing assigns into it, adds to it or changes it
     assert naming("CimOutbound") == [
-        "$CimOutbound = @{ '0' = 'NotConfigured'; '2' = 'Allow'; '4' = 'Block' }",
-        'if (-not $CimOutbound.ContainsKey($cimNumber)) { throw "CIM DefaultOutboundAction of $name is not a known number: \'$cimNumber\'" }',
-        "$set[$name] = $CimOutbound[$cimNumber]",
+        "$CimOutbound = @{ '0' = 'NotConfigured'; '2' = 'Allow'; '4' = 'Block'; 'NotConfigured' = 'NotConfigured'; 'Allow' = 'Allow'; 'Block' = 'Block' }",
+        'if (-not ($CimOutbound.Keys -ccontains $cimValue)) { throw "CIM DefaultOutboundAction of $name is neither a known name nor a known number: \'$cimValue\'" }',
+        "$set[$name] = $CimOutbound[$cimValue]",
     ]
     assert not re.search(r"\$\{|\$(local|script|global|private|using|variable):|-Variable\b|\[ref\]", fast, re.I)
 

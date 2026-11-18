@@ -160,8 +160,11 @@ function Read-FastProfileStates {
     $ComProfileType = [ordered]@{ Domain = 1; Private = 2; Public = 4 }
     # COM DefaultOutboundAction (in force). There is no NotConfigured: COM can only say what is in force.
     $ComOutbound = @{ '0' = 'Block'; '1' = 'Allow' }
-    # CIM MSFT_NetFirewallProfile.DefaultOutboundAction (the PersistentStore, what is configured).
-    $CimOutbound = @{ '0' = 'NotConfigured'; '2' = 'Allow'; '4' = 'Block' }
+    # CIM MSFT_NetFirewallProfile.DefaultOutboundAction (the PersistentStore, what is configured). The VM has handed
+    # back both a number (0 for NotConfigured, from a probe) and a name (NotConfigured, Allow and Block, from this
+    # script); what decides which is not known, so both are accepted, each written out. The guard compares case and
+    # all (-ccontains), because a hashtable's ContainsKey does not.
+    $CimOutbound = @{ '0' = 'NotConfigured'; '2' = 'Allow'; '4' = 'Block'; 'NotConfigured' = 'NotConfigured'; 'Allow' = 'Allow'; 'Block' = 'Block' }
     $policy = New-Object -ComObject HNetCfg.FwPolicy2
     $inForce = @{}
     foreach ($name in $ComProfileType.Keys) {
@@ -177,9 +180,9 @@ function Read-FastProfileStates {
         $name = [string]$cim.Name
         if (-not $ComProfileType.Contains($name)) { throw "CIM names a profile that is not known: '$name'" }
         if ($set.ContainsKey($name)) { throw "CIM names the profile $name twice" }
-        $cimNumber = [string]$cim.DefaultOutboundAction
-        if (-not $CimOutbound.ContainsKey($cimNumber)) { throw "CIM DefaultOutboundAction of $name is not a known number: '$cimNumber'" }
-        $set[$name] = $CimOutbound[$cimNumber]
+        $cimValue = [string]$cim.DefaultOutboundAction
+        if (-not ($CimOutbound.Keys -ccontains $cimValue)) { throw "CIM DefaultOutboundAction of $name is neither a known name nor a known number: '$cimValue'" }
+        $set[$name] = $CimOutbound[$cimValue]
     }
     $rows = @()
     foreach ($name in $ComProfileType.Keys) {
@@ -276,15 +279,17 @@ function Read-FastRuleViews {
         if ($null -eq $app) { $program = 'Any' }
         elseif ($app -is [string] -and $app) { $program = $app }
         else { throw "COM ApplicationName of $name is neither null nor a path: '$app'" }
-        # Every address is * in COM and Any in the cmdlets. A single IPv4 host COM spells with the host mask
-        # /255.255.255.255, the cmdlets without it; an IPv6 host as it is. A subnet, a range or a keyword is a spelling
-        # that has not been compared, and so is not passed on.
+        # Every address is * in COM and Any in the cmdlets. A single IPv4 host COM spells as a range from it to itself,
+        # 1.1.1.1-1.1.1.1 (measured on the VM), the cmdlets as 1.1.1.1; an IPv6 host as it is. Only a range whose two
+        # ends are the same text is read as one host: TDC never writes a real range, and collapsing one to an address
+        # would be a lie about what the rule covers, so a range with different ends throws like any other spelling not
+        # compared (a subnet, a keyword).
         $remote = $rule.RemoteAddresses
         if (-not ($remote -is [string]) -or -not $remote) { throw "COM RemoteAddresses of $name is empty" }
         if ($remote -eq '*') { $addresses = @('Any') }
         else {
             $addresses = @(foreach ($token in $remote.Split(',')) {
-                if ($token -match '^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})/255\.255\.255\.255\z') { $Matches[1] }
+                if ($token -match '^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})-(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\z' -and $Matches[1] -eq $Matches[2]) { $Matches[1] }
                 elseif ($token -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\z') { $token }
                 elseif ($token -match '^[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{0,4}){2,7}\z') { $token }
                 else { throw "COM RemoteAddresses of $name has a spelling that is not known: '$token'" }
