@@ -117,7 +117,8 @@ _LOCK = threading.RLock()
 # waited for the lock (given to its first call, 0.0 to the rest; None without the lock), how long the call ran,
 # its exit code and the thread's name. No parameter and no output is in it, with one exception: an answer that names
 # the way it was read (``Via``, "fast" or "cmdlet") adds ``via``, and on a fallback ``fallback``, its reason (at most
-# MAX_FALLBACK_CHARS), so that a fallback that keeps happening can be found and does not only show as slowness. The
+# MAX_FALLBACK_CHARS), so that a fallback that keeps happening can be found and does not only show as slowness. An
+# answer with no marker on stdout may carry it on stderr (``Get`` for a rule that is not there prints nothing). The
 # wait is measured where the lock is taken, because a press that waits for someone else's run is the variance a
 # single call cannot show.
 CALL_OBSERVER: Optional[Callable[[Dict[str, Any]], None]] = None
@@ -189,12 +190,13 @@ def _call(run, args: List[str]) -> Tuple[int, str, str]:
     started = _clock()
     rc: Any = None
     out: Any = None
+    err: Any = None
     try:
         rc, out, err = run(args)
     except Exception as e:
         raise RuleError(f"could not run {args[0]}: {type(e).__name__}: {_first_line(e)}") from e
     finally:
-        _report(args, started, rc, out)
+        _report(args, started, rc, out, err)
     return int(rc), out or "", err or ""
 
 
@@ -218,7 +220,22 @@ def _way(out: Any) -> Dict[str, str]:
     return {}
 
 
-def _report(args: List[str], started: float, rc: Any, out: Any = None) -> None:
+def _way_on_stderr(err: Any) -> Dict[str, str]:
+    """The way of an answer that has nothing to say on stdout (``Get`` for a rule that is not there): the first line
+    of stderr that is a JSON object with a ``Via``; ``{}`` when there is none."""
+    if not isinstance(err, str):
+        return {}
+    for line in err.splitlines():
+        line = line.strip()
+        if line.startswith("{") and '"Via"' in line:
+            try:
+                return _way(line)
+            except ValueError:
+                continue
+    return {}
+
+
+def _report(args: List[str], started: float, rc: Any, out: Any = None, err: Any = None) -> None:
     """Tell CALL_OBSERVER about one call; never raises, and changes nothing."""
     observer = CALL_OBSERVER
     if observer is None:
@@ -233,7 +250,7 @@ def _report(args: List[str], started: float, rc: Any, out: Any = None) -> None:
         record = {"op": str(op), "lock": _held.what if locked else None, "wait_ms": wait, "run_ms": ran,
                   "rc": rc if isinstance(rc, int) else None, "thread": threading.current_thread().name}
         try:
-            record.update(_way(out))
+            record.update(_way(out) or _way_on_stderr(err))
         except Exception:
             pass
         observer(record)

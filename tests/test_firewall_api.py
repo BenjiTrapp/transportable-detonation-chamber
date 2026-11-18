@@ -2483,6 +2483,21 @@ def test_a_fallback_and_its_reason_are_on_the_call_line(tdc, caplog):
     assert _CALL_LINE.fullmatch(lines[2])                         # no way marker: the line is as before
 
 
+def test_a_get_that_finds_no_rule_still_names_its_way_on_the_call_line(tdc, caplog, monkeypatch):
+    """Get for a missing rule (the cut_stands poll) prints nothing; its way comes from stderr, so a fast path that
+    always falls back there is not silent."""
+    monkeypatch.setattr(tdc.firewall_rules, "CALL_OBSERVER", tdc._fw_log_call)
+    monkeypatch.setattr(tdc.firewall_rules, "_clock", lambda: 5.0)
+    marker = '{"Via":"cmdlet","Fallback":"COM gives no rules at all"}\r\n'
+    with caplog.at_level("DEBUG", logger="tdc.logs.firewall_calls"):
+        assert tdc.firewall_rules._describe(lambda args: (0, "", marker), "TDC-FW-ISO-cut") is None
+        assert tdc.firewall_rules._describe(lambda args: (0, "", ""), "TDC-FW-ISO-cut") is None
+    lines = [r.getMessage() for r in caplog.records if r.name == "tdc.logs.firewall_calls"]
+    assert lines[0].startswith("firewall call op='Get'")
+    assert lines[0].endswith(" rc=0 via=cmdlet fallback='COM gives no rules at all'")
+    assert _CALL_LINE.fullmatch(lines[1])                         # nothing on stderr: the line is as before
+
+
 # ---- the two slow polls are displays: they take the rule cache -------------------------------------
 # (the /summary case is a regression pin: it passed before the change, /summary never forced; only /rules went red)
 

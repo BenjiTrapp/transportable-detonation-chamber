@@ -241,6 +241,12 @@ function Read-FastRuleViews {
     foreach ($rule in $policy.Rules) {
         $count += 1
         $name = [string]$rule.Name
+        # An invariant carries this match. COM's Name is what the cmdlets call DisplayName, not their Name (the ID
+        # that the cmdlets' -Name, so TDC's Get and Remove and the tdc-unisolate hatch, look a rule up by).
+        # The two are one for TDC's rules only because Create and Cut write DisplayName = Name. Should that ever stop
+        # being true (netsh's name= sets only the DisplayName and leaves the ID a GUID), this reads a rule that TDC
+        # can report but not remove by name, and a catch-all Block that cannot be removed keeps the VM off the network.
+        # Compare checks the invariant: the set of names both ways find must be the same.
         if ($RuleName) {
             if ($name -ne $RuleName) { continue }
         } elseif (-not $name.StartsWith('TDC-FW-', [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -491,20 +497,28 @@ try {
             }
             if ($rulesRead) {
                 $ruleNames = @(@($fastWays.List.Keys) + @($cmdletRules.Keys) | Sort-Object -Unique)
+                # The set of names, a check of its own: COM's Name is the cmdlets' DisplayName, and the two ways find
+                # the same rules only while TDC writes DisplayName = Name (see Read-FastRuleViews). A rule found by
+                # one side only is said, with the side that found it.
+                foreach ($way in $fastWays.Keys) {
+                    foreach ($name in $ruleNames) {
+                        $checked += 1
+                        $inFast = $fastWays[$way].ContainsKey($name)
+                        $inCmdlet = $cmdletRules.ContainsKey($name)
+                        if ($inFast -ne $inCmdlet) {
+                            $differences += [pscustomobject]@{
+                                what = "$way rule names: $name found by one side only"
+                                fast = $(if ($inFast) { 'found' } else { 'not found' })
+                                cmdlet = $(if ($inCmdlet) { 'found' } else { 'not found' })
+                            }
+                        }
+                    }
+                }
+                # Then every field of every rule both sides found.
                 foreach ($way in $fastWays.Keys) {
                     $fastRules = $fastWays[$way]
                     foreach ($name in $ruleNames) {
-                        $checked += 1
-                        $inFast = $fastRules.ContainsKey($name)
-                        $inCmdlet = $cmdletRules.ContainsKey($name)
-                        if (-not ($inFast -and $inCmdlet)) {
-                            $differences += [pscustomobject]@{
-                                what = "$way rule $name"
-                                fast = $(if ($inFast) { 'present' } else { 'absent' })
-                                cmdlet = $(if ($inCmdlet) { 'present' } else { 'absent' })
-                            }
-                            continue
-                        }
+                        if (-not ($fastRules.ContainsKey($name) -and $cmdletRules.ContainsKey($name))) { continue }
                         foreach ($field in @('Name', 'Enabled', 'Action', 'Direction', 'Profile', 'Program', 'RemoteAddress', 'RemotePort', 'Protocol')) {
                             $checked += 1
                             $a = $fastRules[$name].$field
@@ -545,6 +559,12 @@ try {
                 $view | Add-Member -NotePropertyName Via -NotePropertyValue $read.Via
                 if ($read.Via -ne 'fast') { $view | Add-Member -NotePropertyName Fallback -NotePropertyValue $read.Fallback }
                 ConvertTo-Json -Compress -Depth 4 -InputObject $view
+            } else {
+                # No rule: stdout stays empty, which the caller reads as "not there". The way goes to stderr, so that
+                # the call log names it even here, the commonest Get (the cut_stands poll).
+                $marker = [ordered]@{ Via = $read.Via }
+                if ($read.Via -ne 'fast') { $marker.Fallback = $read.Fallback }
+                [Console]::Error.WriteLine((ConvertTo-Json -Compress -InputObject ([pscustomobject]$marker)))
             }
         }
         'Create' {

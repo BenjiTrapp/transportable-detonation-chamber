@@ -3168,5 +3168,61 @@ def test_compare_holds_every_rule_field_up_both_ways():
     fields = re.search(r"foreach \(\$field in @\(('Name'[^)]*)\)\)", case).group(1)
     assert re.findall(r"'(\w+)'", fields) == list(RULE_FIELDS)
     # a rule only one way read is a difference, and the fast Get of one rule is held up as well as the fast List
-    assert "'absent'" in case and "Read-FastRuleViews -RuleName" in case
+    assert "'not found'" in case and "Read-FastRuleViews -RuleName" in case
     assert 'what = \'rules\'; fast = "error: $(Get-ShortReason $_)"' in case
+
+
+# ---- the Name/DisplayName invariant, said and checked; and a Get that finds nothing still names its way ----
+
+
+def test_the_com_reader_says_what_its_name_is_and_what_breaks_without_the_invariant():
+    fast = _functions(_ps1())["Read-FastRuleViews"]
+    said = fast[fast.index("$name = [string]$rule.Name"):fast.index("        if ($RuleName) {")]
+    for word in ("DisplayName", "Create", "Cut", "DisplayName = Name", "Remove", "tdc-unisolate", "Compare"):
+        assert word in said, word
+
+
+def test_compare_checks_the_set_of_rule_names_on_its_own():
+    """A rule only one side finds is its own, named difference, checked before and apart from the fields."""
+    case = _op_case(_ps1(), "Compare")
+    names = case.index('what = "$way rule names: $name found by one side only"')
+    fields = case.index("foreach ($field in @('Name'")
+    assert names < fields and case.count("foreach ($way in $fastWays.Keys) {") == 2
+    block = case[:fields][case[:fields].rindex("foreach ($way in $fastWays.Keys) {"):]
+    assert "$differences +=" not in block                  # the field loop says nothing about the name set
+    check = case[case.index("foreach ($way in $fastWays.Keys) {"):fields]
+    assert "if ($inFast -ne $inCmdlet) {" in check and "'found'" in check and "'not found'" in check
+    assert "# The set of names" in case
+
+
+def test_a_get_that_finds_nothing_names_its_way_on_stderr_and_keeps_stdout_empty():
+    case = _op_case(_ps1(), "Get")
+    found, missing = case.split("} else {", 1)
+    assert "ConvertTo-Json" in found and "[Console]::Error" not in found
+    assert "[Console]::Out" not in missing and "Write-Output" not in missing
+    assert "[Console]::Error.WriteLine((ConvertTo-Json -Compress -InputObject ([pscustomobject]$marker)))" in missing
+    assert "Via = $read.Via" in missing and "$marker.Fallback = $read.Fallback" in missing
+
+
+def _answering_err(out, err):
+    def run(args):
+        return 0, out, err
+    return run
+
+
+def test_a_missing_rule_reports_its_way_from_stderr(monkeypatch):
+    seen = _observed(monkeypatch)
+    reason = "COM gives no rules at all"
+    assert rules_mod._describe(_answering_err("", '{"Via":"cmdlet","Fallback":"%s"}\r\n' % reason), "TDC-FW-ISO-cut") is None
+    assert seen[0]["op"] == "Get" and seen[0]["via"] == "cmdlet" and seen[0]["fallback"] == reason
+    assert rules_mod._describe(_answering_err("", '{"Via":"fast"}\n'), "TDC-FW-ISO-cut") is None
+    assert seen[1]["via"] == "fast" and "fallback" not in seen[1]
+
+
+def test_the_way_on_stdout_wins_and_other_stderr_adds_nothing(monkeypatch):
+    seen = _observed(monkeypatch)
+    rules_mod._profiles(_answering_err(json.dumps(_rows(Via="fast")), '{"Via":"cmdlet","Fallback":"x"}'))
+    assert seen[0]["via"] == "fast" and "fallback" not in seen[0]
+    for err in ("WARNING: something\n{not json", '{"Via": broken', '{"Via":"weird"}', "", None, '["Via"]'):
+        rules_mod._describe(_answering_err("", err), "TDC-FW-ISO-cut")
+        assert set(seen[-1]) == {"op", "lock", "wait_ms", "run_ms", "rc", "thread"}, err
