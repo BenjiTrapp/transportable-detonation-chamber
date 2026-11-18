@@ -59,8 +59,11 @@ def tdc(app_module, monkeypatch, tmp_path):
                         m.memory_evidence.MemoryBaseline(str(tmp_path / "baseline.json")))
     m._alerts_body_cache["entry"] = None
     m.set_log_store(m.log_store.LogStore(persist_dir=str(tmp_path / "logs")))
+    # the own dashboards of a test are a file of its own, never webui/dashboards.json
+    m.set_dashboard_store(m.dashboards.DashboardStore(str(tmp_path / "dashboards.json")))
     yield m
     m.set_log_store(None)
+    m.set_dashboard_store(None)
 
 
 @pytest.fixture

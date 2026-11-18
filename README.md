@@ -10,9 +10,9 @@
 
 <p align="center">
   <a href="#quick-start"><img src="https://img.shields.io/badge/Quick_Start-blue?style=for-the-badge" alt="Quick Start"></a>
-  <a href="#features"><img src="https://img.shields.io/badge/Features-purple?style=for-the-badge" alt="Features"></a>
-  <a href="#demo"><img src="https://img.shields.io/badge/Demo-green?style=for-the-badge" alt="Demo"></a>
-  <a href="#api-reference"><img src="https://img.shields.io/badge/API-orange?style=for-the-badge" alt="API"></a>
+  <a href="#what-it-does"><img src="https://img.shields.io/badge/Features-purple?style=for-the-badge" alt="Features"></a>
+  <a href="docs/web-ui.md"><img src="https://img.shields.io/badge/Demo-green?style=for-the-badge" alt="Demo"></a>
+  <a href="docs/api.md"><img src="https://img.shields.io/badge/API-orange?style=for-the-badge" alt="API"></a>
 </p>
 
 <p align="center">
@@ -31,6 +31,13 @@
   <em>Unified dark-themed Web UI &bull; Real-time Sigma/YARA/IOC detection &bull; Kernel ETW telemetry &bull; PE/ELF binary analysis</em>
 </p>
 
+Hand a sample to the chamber and it runs it on a Windows 11 VM of its own while
+every engine on the box watches: Sigma, YARA and IOC rules in real time, kernel
+ETW telemetry, Sysmon, a sandbox, and four scanners that read the memory of the
+running process. One Web UI on port 9000 shows all of it — the alerts, the
+process tree, the pipes the sample opened, its memory, its bytes — and turns it
+into one verdict with the evidence that made it.
+
 <p align="center">
   <img src="static/theme_cyberpunk.png" alt="Dashboard in the Cyberpunk theme" width="90%">
   <br><sub>Service Dashboard &mdash; detection metrics, alert activity by severity and category, and service health (Cyberpunk theme, the default; ✶ switches to Telemetry)</sub>
@@ -42,405 +49,162 @@
 </p>
 
 <p align="center">
-  <img src="static/demo.gif" alt="Demo: a walk through the Web UI in the Telemetry theme" width="90%">
-  <br><sub>A walk through the Web UI in the Telemetry theme: Dashboard with Tool Updates, Alerts (charts and drilldown), Tracing, Graph, Pipes, Sysmon, LOGS, ThreatScan, Hex and File map, Rizin, ETW, and a switch to Cyberpunk and back (see <a href="#demo">Demo</a> for the screenshots)</sub>
+  <a href="static/demo.gif"><strong>▶ Watch the demo</strong></a> &mdash; a walk through the Web UI
+  <br><sub>Dashboard, Alerts with charts and drilldown, Tracing, Graph, Pipes, Sysmon, LOGS, ThreatScan, Hex and File map, Rizin, ETW, and a switch between the themes (10 MB GIF; the stills are in <a href="docs/web-ui.md">the Web UI page</a>)</sub>
 </p>
 
 ---
 
-## Table of Contents
+## What it does
 
-- [Quick Start](#quick-start)
-- [Features](#features)
-- [Architecture](#architecture)
-- [Platform Support](#platform-support)
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Live Memory Analysis](#live-memory-analysis)
-- [Named Pipes](#named-pipes)
-- [Rizin](#rizin)
-- [Tool Updates](#tool-updates)
-- [Logs](#logs)
-- [Firewall](#firewall)
-- [Demo](#demo)
-- [API Reference](#api-reference)
-- [MCP Server](#mcp-server)
-- [Configuration](#configuration)
-- [Detection Rules](#detection-rules)
-- [File Structure](#file-structure)
-- [Troubleshooting](#troubleshooting)
-- [Security Notes](#security-notes)
-- [Credits](#credits)
+The tab a feature lives in is in [Web UI Tabs](#web-ui-tabs), the long version
+in [the guide](docs/README.md).
 
----
+**Detonation with a verdict** — one submission runs the sample, arms the
+exit-time dump and scores every finding into a verdict, here the live-memory
+evidence of a sample that exited before the live scan
+([Workflow](docs/workflow.md)).
 
-## Quick Start
+<p align="center">
+  <img src="static/detonation_results.png" alt="The LIVE MEMORY section of the detonation results of injectsim.exe: MALICIOUS score 6.54 with the scanners that ran, five scored findings from the exit-time memory dump with their weights and why a weight was cut, the exit capture summary and the images extracted from memory" width="88%">
+</p>
 
-### Option A: Local UI Only (no VM)
+**Alerts with drilldown** — every detection of every engine in one table under
+charts of the current filter, where a click on a slice, a bar or a band of the
+engine → rule → process Sankey narrows both, and BACK walks the path back out
+([Charts](docs/web-ui.md#charts)).
 
-Run the Web UI locally for development or UI testing. Backend services won't be available, but all tabs and features render normally.
+<p align="center">
+  <img src="static/alerts_drilldown.png" alt="The Alerts tab after three drilldown steps: BACK and the path above the charts, 1,345 of 9,950 alerts, severity and engine pies, the two hours in bars of five minutes and the engine-rule-process Sankey" width="88%">
+</p>
 
-```bash
-# macOS / Linux
-make install    # Creates venv, installs Flask + deps
-make run        # Starts on http://localhost:9000
+**Tracing** — a console per process with its verdict, a timeline split by event
+type, the process tree with the alert count of every process in it, and the
+table of rules that fired, each row with its raw event
+([Tracing](docs/web-ui.md#tracing-console--alert-detail)).
 
-# Windows (PowerShell)
-.\make.ps1 install
-.\make.ps1 run
-```
+<p align="center">
+  <img src="static/tracing.png" alt="The Rustinel trace analysis console for MsMpEng.exe: verdict badge MALICIOUS 100/100, 760 events, a timeline per event type, the process tree with alert counts and the verdict table with rule, engine and details" width="88%">
+</p>
 
-### Option B: Full VM (recommended for analysis)
+**Process graph** — the processes around one process as a tree, each node with
+its activity counters, the Sysmon events it triggered, the Windows events those
+correspond to, its children, and a signature check one click away
+([Process graph](docs/web-ui.md#process-graph)).
 
-```bash
-# macOS Apple Silicon (M1-M4) — UTM-based setup (recommended)
-./scripts/setup-macos-utm.sh    # Guided: installs tools, creates VM, provisions
+<p align="center">
+  <img src="static/graph_tree.png" alt="The process graph focused on an explorer.exe instance: ancestors above, children below, and a detail panel with image, status, parent, activity counters, the Check who signed this button, the three children and the Sysmon events the process triggered with the Windows event IDs they correspond to" width="88%">
+</p>
 
-# macOS / Linux — Vagrant-based (requires pre-built box)
-make up         # Provisions the full Windows 11 VM
-make open       # Opens http://<vm-ip>:9000 in browser
+**Named pipes** — every pipe event Sysmon saw, with a column for the C2 family
+a pipe name belongs to, and interception sessions that attach to a pipe or wait
+for its name and then relay, hold, edit or drop every message
+([Named pipes](docs/pipes.md)).
 
-# Windows (PowerShell, run as Administrator)
-.\make.ps1 up
-.\make.ps1 open
-```
+<p align="center">
+  <img src="static/pipes_tab.png" alt="The Named Pipes tab: Sysmon pipe events with PID, process, pipe and the C2 family column (empty for these system pipes), and below them an interception session that relayed 58 messages of a detonation, each in hex and ASCII and marked PASSED" width="88%">
+</p>
 
-> First boot takes ~20-30 minutes (Windows) or ~30-45 minutes (macOS ARM).
+**Sysmon and ETW** — the Sysmon log with the Windows Event IDs each event
+corresponds to, over charts that narrow the table to a time window, an image or
+an event type, and twelve event-log channels with live threat highlighting in
+the [ETW browser](docs/web-ui.md#etw-browser).
 
----
+<p align="center">
+  <img src="static/sysmon_events.png" alt="The Sysmon tab: events over time stacked by event type, a process to event type Sankey, the type counters and a table of events with their command lines and the Windows Event IDs they correspond to" width="88%">
+</p>
 
-## Features
+**ThreatScan** — ThreatCheck, DefenderCheck, EMBER2024 and capa against a
+file, Aether, a memory dump or a sweep of the whole system against a running
+process, and a history that keeps every scan with its score
+([Live memory](docs/memory.md)).
 
-### Detection Engines
+<p align="center">
+  <img src="static/live_memory.png" alt="The ThreatScan tab: the live process memory panel with Aether scan, memory dump, host baseline and whole-system sweep, and the scan history with the score history of 61 scans against the suspicious and malicious lines" width="88%">
+</p>
 
-| Engine | Technology | Capabilities |
-|--------|-----------|--------------|
-| **Rustinel** | Rust + ETW | Sigma + YARA rules, IOC hash/IP/domain matching, real-time NDJSON alerts |
-| **Fibratus** | Go + Kernel ETW | Process/file/registry/network telemetry, behavior rules |
-| **Sysmon** | Sysinternals | Event logging (process creation, network, file, registry, image loads) |
-| **LitterBox** | Python | Static (YARA, strings) + Dynamic (PE-Sieve, Moneta, HollowsHunter, RedEdr) |
-| **Aether** | Zig | Live-process memory forensics: thread start-address validation, heap API tables, disk-vs-memory diff, 380 in-memory signatures |
-| **Process Dump** | C++ | Dumps unpacked modules, hidden modules and header-less code from memory, skipping a clean-hash baseline |
-| **Exit Capture** | Windows (built-in) | Full-memory dump at the moment a sample exits, analyzed offline — covers samples too short-lived for live scanners |
-| **Hunt-Sleeping-Beacons** | C++ | Thread call stacks of sleeping implants (unbacked memory, sleep masks, stack spoofing) |
-| **BeaconEye** | .NET | Cobalt Strike beacon configurations in process heaps |
+**Hex and file map** — a hex editor with a data inspector and a structure map
+of the bytes, the entropy and the PE structure of the whole file, with PE
+analysis, ELF analysis and rizin one button away
+([Binary analysis](docs/web-ui.md#binary-analysis-pe--elf)).
 
-### Web UI Tabs
+<p align="center">
+  <img src="static/hex_editor.png" alt="The Hex tab: the structure map of bytes, entropy and sections above the dump, the selected byte at offset 0x40 decoded by the data inspector, and the PE analysis, ELF analysis and Rizin buttons" width="88%">
+</p>
 
-| Tab | Description |
-|-----|-------------|
-| **Dashboard** | Stats strip (alerts, processes, services, rules, tools; TOTAL ALERTS and PROCESSES TRACKED with 45-day sparklines), ALERT ACTIVITY with the SEVERITY and CATEGORY donuts of its range (see [Charts](#charts)), service health cards, recent activity feed; each tile opens what it counts |
-| **Alerts** | Every alert in one table, newest first, under charts of the current filter (severity and engine pies, bars over time, an engine → rule → process Sankey), with severity (multi-select), engine and text filters, the time range, category, rule and process filters a chart click or a range drawn across the bars sets (each a chip with ×), a drilldown bar with BACK and the path of those steps (see [Charts](#charts)) and an "n of m" count; a row opens the alert detail, the process name its process (only processes in the process list are links); the newest 2000 matches are listed |
-| **Tracing** | Per-process console: verdict, timeline by event type, process tree, alerts with full raw events (Sigma match details) |
-| **Graph** | Process tree around a process: tree, force-directed and isometric layouts, landing page with samples and candidate processes, detail panel with Sysmon events, ACTIVITY MIX and children |
-| **Pipes** | Named pipes: Sysmon pipe events (EID 17/18) with name/PID filters and C2-family hits, and interception sessions (attach to an existing pipe or arm for a name/prefix/regex; observe or hold messages to forward, edit or drop them; JSON export) |
-| **Sysmon** | Sysmon event viewer with search, type/PID filters and Sysmon → Windows Event ID correlation; EVENTS OVER TIME and a process → event type Sankey narrow the table by time window, image or event type |
-| **FIREWALL** | The chamber's connections (see [Firewall](#firewall)): a process tree with each process's endpoints, tags and activity (TDC's own processes and local addresses in groups of their own), MAP (arcs from the chamber to every public destination), LIST, ASN and DECISIONS (who decided what about a download, and when, over 24 h); ALLOW / DENY switches that write program-scoped `TDC-FW-*` rules (`?` while the rules are unknown), KILL for a selected process, TURN THE FIREWALL ON in the band that says it is off, `in LOGS ▸` for the selection, the ASK switch, CUT THE NETWORK, the panic button under the summary, and the ISOLATED switch in the head, one state (a press cuts without a confirmation, 8.8 s measured on a quiet VM, leaving asks first; `scripts/tdc-unisolate.ps1` as the way back), the decision toast on every tab (CUT + FETCH, CUT ONLY, ALLOW, with a countdown to the server's default; what TDC decided unattended stays until closed), a summary of connections, blocks, open decisions and secured samples (no byte figures: Sysmon has none), ready LOGS queries for the selection, and the secured samples with RIZIN, HEX and THREATSCAN |
-| **LOGS** | Search the PowerShell, access, MCP, NetFlow, DNS and firewall logs with a Splunk-like query (see [Logs](#logs)): source chips with their counts, EVENTS OVER TIME stacked by source (drag across the bars to zoom), a field bar with the top values, a list of events that unfold to their fields and raw text, or a sortable table after `stats`, `top` and the like; time range buttons, example and last searches, LIVE |
-| **ThreatScan** | ThreatCheck, DefenderCheck, EMBER2024 and capa on a file, plus the **Live Process Memory** panel (Aether scan, memory dump, host baseline, system sweep) and the scan history with its SCORE HISTORY |
-| **ETW** | Multi-channel Event Log browser with live threat highlighting (see below) |
-| **Hex** | Hex editor with data inspector, structure minimap, PE/ELF analysis and section inspection |
-| **FileMap** | Byteplot / entropy / PE-ELF structure planes side by side, import/export trees, click-to-offset |
-| **Rizin** | Reverse engineering with rizin and rz-ghidra on the VM, one session per browser tab (see [Rizin](#rizin)): OPEN a submitted sample, a dump, an upload or a VM path; FUNCTIONS, DISASSEMBLY, DECOMPILER and HEX beside the control flow GRAPH (tabs below 1400 px), all at one current address that a click, SEEK + GO, ◀ ▶ or a seek in the console moves; below, a CONSOLE for rizin commands (an allowlist on the server: no programs, no files), XREFS, STRINGS and IMPORTS; a right-click renames a function or comments an address, kept in a project; `aaa` up to 20 MB, `aa` and a Full analysis button above; Rizin buttons in the Submit history, Process Dump, Exit Capture, ThreatScan (result and history) and the Hex tab open a file here |
-| **LitterBox** | Files in the LitterBox sandbox with their static/dynamic/EDR results |
-| **Submit** | Detonation with stage-by-stage progress and combined verdict (EDR alerts, live memory, exit capture, network beaconing, LitterBox) with its VERDICT FLOW; the submission history with VERDICT HISTORY |
+**Rizin** — rizin and rz-ghidra on the VM, driven from the browser: functions,
+disassembly, decompiler and control-flow graph at one current address, and a
+console whose commands pass an allowlist on the server ([Rizin](docs/rizin.md)).
 
-Every process in the UI is a process *instance*: Windows reuses PIDs, so the
-newest process with a PID is addressed by the plain PID and earlier ones as
-`<pid>@<start epoch>`. Alerts, events and children belong to the instance
-that was running at the time.
+<p align="center">
+  <img src="static/rizin.png" alt="The Rizin tab with pipesim.exe: the function list, the disassembly at the instruction that loads the pipe name, the control flow graph of that function and a console session that found the string and followed its reference" width="88%">
+</p>
 
-### Themes
+**Logs** — the PowerShell, access, MCP, NetFlow, DNS and firewall logs of the
+VM under one Splunk-like query language, as events, as a table or as a chart
+that SAVE keeps on a dashboard of your own ([Logs](docs/logs.md)).
 
-The Web UI has two themes: **Cyberpunk** (the default: neon on deep violet)
-and **Telemetry** (cyan, magenta and acid green on near-black blue, with a
-fine grid and scanlines; it replaces the former blue Classic look, and a
-browser that stored "classic" simply gets Telemetry). The screenshots below
-were taken in Telemetry, except the one that says Cyberpunk. **✶** switches between
-the themes at once, without reloading the page; the open tab, an open detail
-view, filters and drilldown steps, sort orders, the graph and running pipe
-interception sessions stay as they are. The choice is stored in the browser
-(`localStorage`), so a browser without a stored choice starts in Cyberpunk. ✶
-sits at the right end of the top bar, and again in the drawer, below
-"? Help".
-
-Both themes have the same window layout, with a top bar instead of a sidebar
-and the content in the full width:
-
-- **☰ PROCESSES** (with the number of tracked processes) opens the process
-  list and the timeline in a drawer over the content. Esc, a click beside it or
-  picking a process closes it.
-- The tabs sit in the top bar. Tabs that do not fit into a narrow window move
-  into a **"…"** menu; the active tab always stays in the bar.
-- **n/m ONLINE** counts the five services of the status row (Rustinel,
-  Sysmon, Fibratus, Agent, LitterBox) and opens a drop-down with the status of
-  each. The SERVICES ONLINE tile on the dashboard counts six: it adds the
-  Detonator.
-- Tab heads get a large title in a head area of their own, and cards and
-  tiles get neon borders (Cyberpunk) or a glowing accent bar at the top left
-  (Telemetry).
-
-The themes differ in colours and effects: Telemetry paints the page with a
-40 px grid, glows at the top and left and fine scanlines (they never take a
-click, and nothing moves), the cards with a gradient, the tab titles in a
-cyan–violet–magenta gradient, the kicker line in acid green, and the active
-tab and the primary buttons in cyan. Severities are red (critical), orange
-(high), amber (medium), acid green (low) and cyan (info).
-
-Both themes share the card controls:
-
-- **(i)** beside a card or section title explains it in a sentence or two;
-  Esc or a click elsewhere closes the explanation.
-- **CHART / TABLE** shows the numbers of a chart as a table: the timeline
-  in the drawer, the Tracing timeline and severity bar, the file structure of the
-  PE/ELF binary analysis, the file map strip of the PE analysis and every
-  chart card under [Charts](#charts) (not the sparklines in the tiles). The
-  choice holds per card until the page is reloaded.
-- **Sortable tables:** a click on a column head sorts ascending, a second
-  click descending (↕ / ▲ / ▼). Numbers sort numerically, times
-  chronologically, empty cells last. The order survives the table being
-  rendered again: the Alerts tab when the alerts refresh (every 5 s) brings
-  new ones, Sysmon and the pipe events after Refresh or a filter change. The
-  Tracing event list sorts the same way.
-- **Dashboard tiles** open what they count: TOTAL ALERTS the Alerts tab, its
-  high / med / low counts the Alerts tab filtered by that severity (high
-  includes critical, low includes info), PROCESSES TRACKED the process list,
-  SERVICES ONLINE the service cards, DETECTION RULES the help on the detection
-  rules and SCANNER TOOLS the ThreatScan tab.
-
-Tiles and column heads also take Enter and Space. The **Alerts** tab (see the
-table above) exists in both themes.
-
-### Charts
-
-The Web UI draws its charts itself, as SVG (no chart library). They take
-their colours from the theme, so ✶ recolours them at once, and every chart
-card has an **(i)** and **CHART / TABLE** (the sparklines in the tiles are
-not cards and have neither): the table lists the same numbers and sorts like
-the other tables. Screenshots:
-[Dashboard & Alerts Charts](#dashboard--alerts-charts).
-
-| Where | Chart | Shows | Click / drag |
-|-------|-------|-------|--------------|
-| Dashboard | Sparklines in TOTAL ALERTS and PROCESSES TRACKED | Alerts and newly seen processes per day over the last 45 days | — |
-| Dashboard | **ALERT ACTIVITY** | Alerts per hour, day or week, stacked by severity, for **24H / 7D / 30D / ALL** (default ALL) | A drag across the bars narrows the donuts to that range (a chip; its × goes back to the preset); a bar opens the Alerts tab filtered to its period |
-| Dashboard | **SEVERITY**, **CATEGORY** | Donuts of the range with name, count and share; the six most frequent categories, the rest as *other categories* | A segment or a legend row opens the Alerts tab with that severity or category, within the range |
-| Alerts | **SEVERITY**, **ENGINE** | Pies of the alerts the filters let through | A slice or a legend row shows only its severity (the chips in the filter bar switch severities on or off) or chooses its engine |
-| Alerts | **OVER TIME** | The same alerts per hour, day or week, stacked by severity; a span of up to about 20 hours in steps of 1 s to 30 min (at most 40 bars) | A drag across the bars narrows the tab to the bars it covers, a click on a bar to its period |
-| Alerts | **FLOW: ENGINE → RULE → PROCESS** | Sankey of the same alerts: the six most frequent rules and processes, the rest as *other rules* / *other processes* | A node sets its engine, rule or process, a band both of its ends |
-| Sysmon | **EVENTS OVER TIME** | The loaded events per period (seconds, minutes or longer, by their span), stacked by event type | A bar sets a time window (Shift+click widens it to another bar), a legend row the event type |
-| Sysmon | **PROCESS → EVENT TYPE** | Sankey image → event type: the six most frequent images, the rest as *other images* | A node sets its image or event type, a band both of its ends |
-| ThreatScan | **SCORE HISTORY** | A point per scan, oldest left: Aether and Exit Capture at their evidence score, with dashed lines at SUSPICIOUS 2 and MALICIOUS 6; every other tool in the lane *no score* (EMBER2024's probability in the tooltip); coloured by verdict | A point opens its scan in the history list, scrolls to it and marks it |
-| Submit | **VERDICT HISTORY** | A bar per submission, oldest left, as high as its verdict's score on the verdict's own scale (SUSPICIOUS from 1, MALICIOUS from 3) and in its colour; grey: *not evaluated* | A bar opens its results, as its Results button does |
-| Submit, detail panel | **VERDICT FLOW** | Sankey of a detonation's findings: process → kind (LitterBox score, EDR alerts, live memory, exit capture, network beaconing, named pipes) → *counted* / *not counted* | — |
-| Graph | **ACTIVITY MIX** | Donut in a process node's detail: the Sysmon activity of that process instance (network, DNS, file, registry, named pipes, the injections it made); its alerts as a number beside it, not part of the ring | — |
-
-- **Click filters:** a time range, category, rule or process (Alerts) and a
-  time window, image or event type (Sysmon) set by a click (in the Alerts
-  tab also by a range drawn across OVER TIME) show as chips in the filter
-  bar; the × of a chip takes that filter off, and in the Alerts tab BACK
-  takes the last step back (see *Drilldown*). A severity or an engine sets
-  the filter bar's own controls. The count of the table ("n of
-  m" in the Alerts tab, "Showing n of m events" in Sysmon) is then exactly
-  what the part counted. Some parts set no filter: a bucket (*other rules*,
-  *other processes*, *other images*, *other categories*) and every band into
-  or out of one (*other rules* → a process, *other images* → an event type),
-  which stand for several names and would list more than they show; the
-  alerts without an engine and a severity no chip names, which no control
-  of the filter bar selects; and a bar without alerts or events, or a range
-  drawn across such bars only, which would list nothing.
-- **Drawing a range across OVER TIME:** press on the bars and drag by at
-  least 5 px: a dashed box over their whole height snaps to whole bars, as
-  on ALERT ACTIVITY. Letting go narrows the tab from the start of the first
-  to the end of the last bar it covers, so the table lists exactly what
-  those bars counted. The bars then divide the range anew: a day in 24 bars
-  of an hour, 10:00–12:00 in 24 bars of 5 minutes. A range that does not
-  begin and end on a full minute is named with seconds. New alerts (every
-  5 s) do not redraw the bars while a range is being drawn; they are drawn
-  once the button is up.
-- **Drilldown (Alerts tab):** a click on SEVERITY, ENGINE, FLOW or a bar of
-  OVER TIME, or a range drawn across OVER TIME, is a step when it changes a
-  filter (the same slice clicked again is none); so is every jump from the
-  dashboard with a filter. While there is a step, a bar between the head of
-  the tab and the charts shows **‹ BACK** (its tooltip names where it
-  goes), DRILLDOWN, the path and the count ("n of m alerts"). The path
-  reads like
-  `ALL ALERTS › 27 Jul › 27 Jul 10:00–12:00`, the current step last; of
-  more than three steps the oldest fold into "…", whose tooltip names them,
-  and a long name is cut (its tooltip has it in full). BACK takes the last
-  step back: the filters it changed get the values they had before it. A
-  step in the path jumps back to the state after it, ALL ALERTS takes every
-  step back, and the bar disappears. What you set in the filter bar
-  yourself (the severity chips, the engine choice, the search, the × of a
-  chip) is no step, and BACK never undoes it: the steps forget a filter you
-  change that way, and a step leaves the path only once it sets no filter,
-  so the path names only what is still in effect (the step of a band,
-  `Sigma · rule: Run Key`, stays as `rule: Run Key` when you choose the
-  engine yourself). A jump from the dashboard (a high / med / low count of
-  TOTAL ALERTS, a bar, a donut segment or legend row) starts a new path
-  with one step, named `Dashboard: …` (for example
-  `Dashboard: CRITICAL + HIGH`); BACK then shows all alerts and stays in
-  the tab. TOTAL ALERTS itself sets no filter and makes no step. The steps
-  last until the page is reloaded, as the filters do.
-- **Charts and filters:** the charts of the Alerts and Sysmon tabs count
-  everything the current filters let through (the Alerts table lists the
-  newest 2000 of it, the charts all; Sysmon: all but its time window, which
-  the bars mark; the window narrows the table). Both tabs scroll as a whole
-  while the filter bar stays at the top (in the Alerts tab right under the
-  drilldown bar); a click on the dashboard opens the Alerts tab at its top.
-- **Times:** bars follow local hours and days. An alert or event without a
-  readable time, or with one before 2000 or more than a day ahead (a sample
-  can set the clock), is in no bar: a note under the bars counts those, and
-  the pies, donuts and Sankeys of the same filter include them. Sigma's
-  level `informational` counts as info.
-- **Sankeys** are drawn by square roots, so small flows stay visible;
-  **LINEAR** shows true proportions.
-- **VERDICT FLOW** counts each finding once, as the results list it: every
-  EDR alert (those beyond the 50 the server lists flow from *(not listed)*),
-  the LitterBox score when it added points to the verdict (4 of 10 or more;
-  it flows from *(sample file)*) and every memory finding by its source;
-  *named pipes* counts the pipe findings, not the pipes the Named Pipes tab
-  counts. A memory finding is *counted* while the memory evidence reaches
-  SUSPICIOUS and it keeps a weight, also one marked "uncorroborated — weight
-  reduced"; findings the host baseline suppressed, repeats capped at weight
-  0 and all findings of an evidence below SUSPICIOUS are *not counted*.
-- **Stored verdicts:** the server keeps a detonation's verdict (label and
-  score) on its submission each time it computes the results: every poll
-  of the Submit tab, every opening of the results, the MCP tools that read
-  them. It goes to the submission of the run it was computed for: the
-  sample run as that PID, without a PID the one of the sample that ran
-  without (LitterBox only). Results for a PID none of the sample's
-  submissions ran as, or without a PID for a sample that always ran with
-  one (`tdc_detonation_results` with a hash only), are stored nowhere.
-  VERDICT HISTORY shows the last verdict stored, so it can be provisional: if
-  polling stopped early or services were offline then, it is the verdict of
-  that moment. Opening the results again computes and stores it anew;
-  submissions from before verdicts were stored stay grey until then.
-- **Polling:** the charts of the dashboard and the Alerts tab count again
-  only when the alerts or the range change, not on every refresh (the
-  alerts every 5 s, the dashboard every 10 s), and not while their tab is
-  hidden.
-
-### ETW Browser
-
-The ETW tab provides a multi-channel Windows Event Log viewer with automatic threat classification:
-
-| Feature | Details |
-|---------|---------|
-| **12 Channels** | Sysmon, Security, PowerShell, Defender, WMI, Task Scheduler, BITS, DNS, Firewall, AppLocker, WinRM, Application |
-| **Availability Probe** | Channels show ● ACTIVE / ○ NO DATA status on load |
-| **Auto-Refresh** | Polls every 5s (toggleable), keyword filter across all fields |
-| **Threat Highlighting** | Malicious events highlighted red with threat classification badge |
-| **Expandable Details** | Click any event to inspect all data fields; suspicious values marked red |
-
-Threat detection rules cover:
-
-- **Encoded/obfuscated PowerShell** (base64, IEX, downloadstring, bypass, hidden)
-- **LOLBin abuse** (certutil, mshta, regsvr32, rundll32, bitsadmin, wmic)
-- **Credential access** (LSASS access, mimikatz, sekurlsa, procdump)
-- **Persistence** (registry Run keys, scheduled tasks, services, WMI subscriptions)
-- **Defense evasion** (AMSI bypass, ETW patching, process tampering)
-- **Lateral movement** (explicit credential logon, WinRM, net use)
-- **C2 indicators** (suspicious ports, .onion/.tk domains, DNS tunneling)
-- **Sysmon IOCs** (CreateRemoteThread, DLL sideloading, ADS creation, process tampering)
-
-### Binary Analysis (PE / ELF)
-
-| Capability | Details |
-|-----------|---------|
-| **PE Header Analysis** | DOS/COFF/Optional headers, ASLR/DEP/SEH/CFG detection |
-| **DiE-Style Detection** | Compiler, packer, protector, linker identification with assessment |
-| **Entropy Heatmap** | 64-block Shannon entropy visualization (red >= 7.0 = packed) |
-| **Section Layout** | Visual section diagram with RWX permission flagging |
-| **ELF Security Audit** | PIE, NX stack, RELRO, stack canary, Fortify, stripped detection |
-| **Suspicious Imports** | Categorized: injection, evasion, credential access, networking, crypto |
-| **IOC Flags (clickable)** | Expandable detail panels showing matched APIs, detection rules, and explanations |
-| **Packer Detection** | UPX, Themida, VMProtect, ASPack, MPRESS via section + heuristic matching |
-| **TLS Callbacks** | Anti-debug indicator detection |
-| **File Map** | Per-byte class plot, local entropy and structure regions (headers, sections, data directories, overlay, entry point) mapped onto file offsets |
-| **Import / Export Trees** | DLL → function trees with suspicious APIs tagged; ELF `DT_NEEDED` + dynamic symbols |
-
-### Reverse Engineering Tools
-
-| Tool | Purpose |
-|------|---------|
-| **Detect It Easy (DiE)** | PE/ELF/Mach-O identification — packers, compilers, protectors |
-| **WinDbg (Preview)** | Kernel/user-mode debugger — crash dumps, live debugging, TTD |
-| **Ghidra** | NSA RE framework — disassembly, decompilation, scripting |
-| **rizin + rz-ghidra** | Reverse engineering in the browser ([Rizin](#rizin) tab): analysis, disassembly, control flow graph, decompiler, console |
-
-### Tests
-
-```bash
-make unit-test        # or: .\make.ps1 unit-test   (no VM needed)
-```
-
-`tests/` covers the failure classes fixed so far, so they cannot come back
-unnoticed: process instances and PID reuse, attribution of alerts and
-processes to a detonation, timestamp handling, persisted memory results,
-scanner output parsing, the evidence model and baseline, CSRF / DNS-rebinding
-/ write restrictions, proxied content types, XSS (unescaped event fields and
-unsafe inline handlers in `app.js`), charts that count other numbers than
-their tables and filters, the RIZIN tab (the console allowlist, sessions and
-views, against a stand-in for rizin; with a real rizin where one is
-installed), MCP tool output, and README/help drift
-against the routes and tools. GitHub Actions runs the suite on every push
-(`.github/workflows/tests.yml`). `make test` is different: it submits a test
-sample to the running VM.
-
-### Developer Experience
-
-- **`make deploy-restart`**: Edit locally, push to VM, restart Flask in one command
-- **`make run-debug`**: Flask auto-reload on file changes
-- **Toast Notifications**: Throttled error/warning/info toasts with 15s dedup
-- **Help Modal**: Built-in documentation ("? Help" next to the logo)
-- **Tool Updates**: The dashboard checks every VM tool for a newer version and installs updates, one tool or all, while a maintenance mode pauses detonations (see [Tool Updates](#tool-updates))
-- **Submissions History**: Persisted to JSON with quick hex inspection
+<p align="center">
+  <img src="static/logs_tab.png" alt="The LOGS tab running source=dns | top 10 query: the six source chips with their counts, events over time, the field bar and the result as a sortable table" width="88%">
+</p>
 
 ---
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│ Windows 11 VM (Hyper-V x64 / UTM ARM64)                          │
-│                                                                  │
-│  ┌─────────────┐ submit ┌────────────────┐  ┌──────────────┐     │
-│  │ Web UI      │───────▶│ DetonatorAgent │  │ LitterBox    │     │
-│  │ :9000       │───────────────────────────▶│ :1337        │     │
-│  │ REST + SPA  │        └───────┬────────┘  └──────────────┘     │
-│  └──┬───────▲──┘                │ runs the sample                │
-│     │       │                   ▼                                │
-│     │       │ alerts   ┌──────────────┐ ┌──────────┐ ┌────────┐  │
-│     │       └──────────│ Rustinel     │ │ Fibratus │ │ Sysmon │  │
-│     │                  │ Sigma/YARA   │ │ ETW      │ │ EvtLog │  │
-│     │                  └──────────────┘ └──────────┘ └────────┘  │
-│     │ live memory  ┌───────────┐ ┌──────────────┐ ┌───────────┐  │
-│     └─────────────▶│ Aether    │ │ Process Dump │ │ Exit      │  │
-│                    │ HSB       │ │ (pd64)       │ │ Capture   │  │
-│                    │ BeaconEye │ └──────────────┘ └───────────┘  │
-│                    └───────────┘                                 │
-└──────────────────────────────▲───────────────────────────────────┘
-                               │ HTTP :9000
-               Host: browser · MCP server · make / make.ps1
+```mermaid
+flowchart TB
+    subgraph host["Host"]
+        BROWSER["Browser"]
+        MCP["MCP server"]
+        MAKE["make / make.ps1"]
+    end
+    subgraph vm["Windows 11 VM, Hyper-V x64 or UTM ARM64"]
+        WEBUI["Web UI :9000<br/>Flask: REST and the single page"]
+        AGENT["DetonatorAgent :8080"]
+        LITTERBOX["LitterBox :1337"]
+        SAMPLE["The sample process"]
+        RUSTINEL["Rustinel: Sigma, YARA, IOC"]
+        FIBRATUS["Fibratus: kernel ETW"]
+        SYSMON["Sysmon"]
+        SOURCES["Rustinel's NDJSON log files and<br/>Fibratus' events in the Windows event log"]
+        EVTX["Sysmon's own event log"]
+        MEMORY["Live memory against the PID, in this order:<br/>Hunt-Sleeping-Beacons, BeaconEye,<br/>Aether, Process Dump"]
+        EXIT["Exit Capture: Windows dumps<br/>the process as it exits"]
+    end
+    BROWSER -->|"HTTP :9000"| WEBUI
+    MCP -->|"HTTP :9000"| WEBUI
+    MAKE -->|"HTTP :9000"| WEBUI
+    WEBUI -->|"the sample"| AGENT
+    WEBUI -->|"the sample"| LITTERBOX
+    LITTERBOX -->|"static and dynamic results"| WEBUI
+    AGENT -->|"runs it, answers its PID"| SAMPLE
+    SAMPLE -.->|"what it does"| RUSTINEL
+    SAMPLE -.-> FIBRATUS
+    SAMPLE -.-> SYSMON
+    RUSTINEL --> SOURCES
+    FIBRATUS --> SOURCES
+    SYSMON --> EVTX
+    SOURCES -->|"read every 5 s"| WEBUI
+    EVTX -->|"read when a view asks"| WEBUI
+    WEBUI -->|"the PID"| MEMORY
+    MEMORY -->|"findings"| WEBUI
+    WEBUI -->|"armed for the image name"| EXIT
+    EXIT -->|"the dump, analysed offline"| WEBUI
 ```
 
-### Data Flow
+Everything but the browser, the MCP server and `make` runs inside the VM, and
+the host reaches all of it through the Web UI on port 9000. The Web UI hands a
+sample to DetonatorAgent, which runs it and answers its PID, and to LitterBox,
+which analyses it; of the engines watching the process it reloads Rustinel's and
+Fibratus' alerts every five seconds, while Sysmon's log is read whenever a view
+asks for it. Against the PID it runs the live-memory tools itself, one after
+another, and before the sample starts it arms Windows to dump the process as it
+exits.
 
-1. A sample is submitted (Web UI, `make submit`, MCP `tdc_submit_file`) and
-   forwarded to DetonatorAgent and/or LitterBox. Exit capture is armed for
-   its image name first.
-2. DetonatorAgent executes the sample and returns its PID.
-3. Rustinel (Sigma, YARA, IOC), Fibratus and Sysmon record what it does.
-4. The live-memory scanners run against the PID in the background:
-   Hunt-Sleeping-Beacons, BeaconEye, Aether (3 samples), then Process Dump.
-   If the process exits, Windows writes a full dump that is analyzed offline.
-5. Sysmon network events are checked for periodic connections (beaconing).
-6. Every memory finding goes through one evidence model (persistence,
-   corroboration, host baseline); together with the EDR alerts and LitterBox
-   it yields the combined verdict at `/api/detonation/results`.
-7. Results are stored in `webui/memory_results/` and survive restarts.
+The chain of one detonation, stage by stage, is the diagram in
+[Workflow](docs/workflow.md#data-flow); which rules the engines load and what
+each of them can see is in [the guide's index](docs/README.md#detection-engines).
 
 ### Services
 
@@ -459,1931 +223,117 @@ sample to the running VM.
 | **theZoo-WebUI** | 8888 | Malware sample browser | PHP |
 | **Detonator** | 5000/8000 | Orchestration UI + REST API | Python |
 
+### Web UI Tabs
+
+| Tab | Description |
+|-----|-------------|
+| **Dashboard** | Stats strip (alerts, processes, services, rules, tools; TOTAL ALERTS and PROCESSES TRACKED with 45-day sparklines), ALERT ACTIVITY with the SEVERITY and CATEGORY donuts of its range (see [Charts](docs/web-ui.md#charts)), service health cards, recent activity feed; each tile opens what it counts. Under the head a row of pages: SERVICES is all of that, beside it the dashboards of your own with the tiles saved in the LOGS tab (see [Own dashboards](docs/logs.md#own-dashboards)) |
+| **Alerts** | Every alert in one table, newest first, under charts of the current filter (severity and engine pies, bars over time, an engine → rule → process Sankey), with severity (multi-select), engine and text filters, the time range, category, rule and process filters a chart click or a range drawn across the bars sets (each a chip with ×), a drilldown bar with BACK and the path of those steps (see [Charts](docs/web-ui.md#charts)) and an "n of m" count; a row opens the alert detail, the process name its process (only processes in the process list are links); the newest 2000 matches are listed |
+| **Tracing** | Per-process console: verdict, timeline by event type, process tree, alerts with full raw events (Sigma match details) |
+| **Graph** | Process tree around a process: tree, force-directed and isometric layouts, landing page with samples and candidate processes, detail panel with Sysmon events, ACTIVITY MIX and children |
+| **Pipes** | Named pipes: Sysmon pipe events (EID 17/18) with name/PID filters and C2-family hits, and interception sessions (attach to an existing pipe or arm for a name/prefix/regex; observe or hold messages to forward, edit or drop them; JSON export) |
+| **Sysmon** | Sysmon event viewer with search, type/PID filters and Sysmon → Windows Event ID correlation; EVENTS OVER TIME and a process → event type Sankey narrow the table by time window, image or event type |
+| **FIREWALL** | The chamber's connections (see [Firewall](docs/firewall.md)): a process tree with each process's endpoints, tags and activity (TDC's own processes and local addresses in groups of their own), MAP (arcs from the chamber to every public destination), LIST, ASN and DECISIONS (who decided what about a download, and when, over 24 h); ALLOW / DENY switches that write program-scoped `TDC-FW-*` rules (`?` while the rules are unknown), KILL for a selected process, TURN THE FIREWALL ON in the band that says it is off, `in LOGS ▸` for the selection, the ASK switch, CUT THE NETWORK, the panic button under the summary, and the ISOLATED switch in the head, one state (a press cuts without a confirmation, 8.8 s measured on a quiet VM, leaving asks first; `scripts/tdc-unisolate.ps1` as the way back), the decision toast on every tab (CUT + FETCH, CUT ONLY, ALLOW, with a countdown to the server's default; what TDC decided unattended stays until closed), a summary of connections, blocks, open decisions and secured samples (no byte figures: Sysmon has none), ready LOGS queries for the selection, and the secured samples with RIZIN, HEX and THREATSCAN |
+| **LOGS** | Search the PowerShell, access, MCP, NetFlow, DNS and firewall logs with a Splunk-like query (see [Logs](docs/logs.md)): source chips with their counts, EVENTS OVER TIME stacked by source (drag across the bars to zoom), a field bar with the top values, a COMMANDS card with the whole search language, a list of events that unfold to their fields and raw text, or a sortable table after `stats`, `top` and the like, or one chart of it (pie, bars, line, Sankey) that SAVE puts on a dashboard of your own; time range buttons, example and last searches, LIVE |
+| **ThreatScan** | ThreatCheck, DefenderCheck, EMBER2024 and capa on a file, plus the **Live Process Memory** panel (Aether scan, memory dump, host baseline, system sweep) and the scan history with its SCORE HISTORY |
+| **ETW** | Multi-channel Event Log browser with live threat highlighting (see [ETW Browser](docs/web-ui.md#etw-browser)) |
+| **Hex** | Hex editor with data inspector, structure minimap, PE/ELF analysis and section inspection |
+| **FileMap** | Byteplot / entropy / PE-ELF structure planes side by side, import/export trees, click-to-offset |
+| **Rizin** | Reverse engineering with rizin and rz-ghidra on the VM, one session per browser tab (see [Rizin](docs/rizin.md)): OPEN a submitted sample, a dump, an upload or a VM path; FUNCTIONS, DISASSEMBLY, DECOMPILER and HEX beside the control flow GRAPH (tabs below 1400 px), all at one current address that a click, SEEK + GO, ◀ ▶ or a seek in the console moves; below, a CONSOLE for rizin commands (an allowlist on the server: no programs, no files), XREFS, STRINGS and IMPORTS; a right-click renames a function or comments an address, kept in a project; `aaa` up to 20 MB, `aa` and a Full analysis button above; Rizin buttons in the Submit history, Process Dump, Exit Capture, ThreatScan (result and history) and the Hex tab open a file here |
+| **LitterBox** | Files in the LitterBox sandbox with their static/dynamic/EDR results |
+| **Submit** | Detonation with stage-by-stage progress and combined verdict (EDR alerts, live memory, exit capture, network beaconing, LitterBox) with its VERDICT FLOW; the submission history with VERDICT HISTORY |
+
+Every process in the UI is a process *instance*: Windows reuses PIDs, so the
+newest process with a PID is addressed by the plain PID and earlier ones as
+`<pid>@<start epoch>`. Alerts, events and children belong to the instance
+that was running at the time.
+
 ---
 
-## Platform Support
+## Quick Start
 
-| Host OS | Hypervisor | Guest Arch | Vagrantfile | Performance |
-|---------|-----------|------------|-------------|-------------|
-| Windows 10/11 (x86_64) | Hyper-V | x86_64 | `Vagrantfile` | Native |
-| macOS Apple Silicon (M1-M4) | QEMU via vagrant-qemu | ARM64 | `Vagrantfile.utm` | Near-native via hvf |
+### Option A: Local UI Only (no VM)
 
-### ARM64 Compatibility
+The Web UI on its own, for development: every tab renders, the backend services
+are absent.
 
-| Component | ARM64 Support | Notes |
-|-----------|--------------|-------|
-| Sysmon | Native | `Sysmon64a.exe` (ARM64 binary) |
-| Fibratus | Emulated (x86_64) | No ARM64 build; ~10-20% overhead |
-| Rustinel | Emulated (x86_64) | No ARM64 build; ETW works under emulation |
-| .NET 8 / Python 3.12 | Native | Full ARM64 SDK and runtime |
-| DetonatorAgent | Native | Compiled from source via .NET 8 |
-| Detonator / LitterBox | Native | Python-based |
-| Aether | Emulated (x86_64) | Deliberately x64: its thread-context probe uses the AMD64 `CONTEXT` layout, so a native ARM64 build would misread it |
-| Process Dump | Emulated (x86_64) | `-closemon` is **not used**: it writes x64 hook bytes into every process and cannot tell ARM64 processes apart (Exit Capture replaces it) |
-| Exit Capture | Native | OS feature (Silent Process Exit); emulator translation cache is recognized and not scored |
-| Hunt-Sleeping-Beacons / BeaconEye | Emulated (x86_64) | x64 builds; reliable for x64 (emulated) targets, results for native ARM64 processes are marked as limited |
-| rizin + rz-ghidra | Emulated (x86_64) | Cutter's Windows package is x64 only; `aaa` of a 150 KB sample takes about 2 s, `aa` of a 31 MB exit dump about 3 s (see [Rizin](#rizin)) |
-
----
-
-## Prerequisites
-
-### Windows Host
-
-- Windows 10/11 with **Hyper-V** enabled
-- **Vagrant** >= 2.4 ([download](https://www.vagrantup.com/downloads))
-- **Administrator** PowerShell (required for Hyper-V)
-- ~30 GB disk, ~8 GB RAM
+```bash
+make install        # venv with Flask and the rest
+make run            # http://localhost:9000
+```
 
 ```powershell
-# Enable Hyper-V (reboot required)
-Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All
-```
-
-### macOS Host (Apple Silicon)
-
-- macOS on Apple Silicon (M1/M2/M3/M4)
-- **UTM** (recommended): `brew install --cask utm` or [mac.getutm.app](https://mac.getutm.app)
-- **QEMU tools**: `brew install qemu` (for `qemu-img`)
-- **Python 3** with `pywinrm`: `pip3 install pywinrm requests-ntlm`
-- **Windows 11 ARM64 ISO** from [Microsoft](https://www.microsoft.com/software-download/windows11arm64)
-- ~80 GB disk, ~8 GB RAM
-
-#### Recommended Setup (UTM + automated provisioning)
-
-The fastest path on Apple Silicon uses UTM as the hypervisor with automated
-provisioning via WinRM. A single script handles everything after the initial
-Windows installation:
-
-```bash
-# Full guided setup (installs prerequisites, guides VM creation, provisions)
-./scripts/setup-macos-utm.sh
-
-# Or step by step:
-./scripts/setup-macos-utm.sh --skip-prerequisites   # if tools already installed
-./scripts/setup-macos-utm.sh --provision-only --vm-ip 192.168.64.4  # re-provision existing VM
-```
-
-**Manual steps** (the script guides you through these):
-
-1. Install UTM and create a Windows 11 ARM64 VM (8 GB RAM, 4 cores, 80 GB disk)
-2. Install Windows normally with a local admin account (`vagrant`/`vagrant` recommended)
-3. Run `scripts/prepare-vagrant-winrm.ps1` inside the VM (enables WinRM remote management)
-4. Run `./scripts/setup-macos-utm.sh --provision-only --vm-ip <vm-ip>`
-
-The provisioning installs all detection engines, analysis tools, and the unified
-Web UI (~20-40 minutes on first run).
-
-#### Alternative: Vagrant/QEMU (headless, experimental)
-
-For a fully headless Vagrant-managed workflow, see [Vagrantfile.utm](Vagrantfile.utm).
-This path requires building a custom `win11-arm` Vagrant box from the ISO:
-
-```bash
-make prerequisites-fix          # Install QEMU, Vagrant, vagrant-qemu plugin
-./scripts/build-box-macos.sh --iso ~/Downloads/Win11_ARM64.iso
-make build                      # Provision the VM
-```
-
-> **Note:** Headless QEMU boot of Windows 11 ARM64 ISOs can be unreliable on
-> some QEMU/firmware combinations. The UTM path above is recommended.
-
-### Local Development Only
-
-- **Python 3.10+** (any platform)
-- **Make** (macOS: Xcode CLI tools; Windows: not needed, use `make.ps1`)
-
----
-
-## Installation
-
-### Using make / make.ps1
-
-The project includes a cross-platform build system:
-
-| Command | Description |
-|---------|-------------|
-| `install` | Create Python venv + install Flask, requests, watchdog, pefile |
-| `run` | Start Web UI locally on port 9000 |
-| `run-debug` | Start with Flask auto-reload (watches file changes) |
-| `up` | Provision and start the full VM |
-| `halt` | Stop the VM gracefully |
-| `destroy` | Delete the VM |
-| `deploy` | Sync webui files (HTML/CSS/JS) to running VM |
-| `deploy-app` | Sync Flask backend (app.py) to VM |
-| `restart` | Restart the Web UI service on VM |
-| `deploy-restart` | Deploy + restart in one step |
-| `open` | Open Web UI in default browser |
-| `status` | Show VM + service health |
-| `services` | List all service states |
-| `alerts` | Show recent detection alerts |
-| `test` | Submit test sample to verify pipeline |
-| `submit FILE=x` | Submit a file for detonation |
-| `logs` | Tail Web UI logs from VM |
-| `ssh` / `rdp` | Connect to VM |
-| `clean` | Destroy VM + remove .vagrant |
-| `clean-all` | Also remove cached Vagrant boxes |
-| `uninstall` | Remove local Python venv |
-
-**macOS / Linux:**
-```bash
-make install        # Local venv setup
-make run            # Local server
-make up             # Full VM
-make deploy-restart # Push changes to VM
-```
-
-**Windows (PowerShell):**
-```powershell
-.\make.ps1 install
+.\make.ps1 install  # Windows
 .\make.ps1 run
-.\make.ps1 up              # Run as Administrator
-.\make.ps1 deploy-restart
 ```
 
-### Manual Installation
+### Option B: Full VM (recommended for analysis)
 
 ```bash
-cd webui
-python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-python app.py               # http://localhost:9000
+./scripts/setup-macos-utm.sh   # macOS on Apple Silicon: tools, VM, provisioning
+make up                        # or: Vagrant hosts, from a pre-built box
+make open                      # http://<vm-ip>:9000
 ```
-
----
-
-## Usage
-
-### Detonation Workflow
-
-1. Open the Web UI at `http://<vm-ip>:9000` (`make open`)
-2. Go to the **Submit** tab and drop (or browse) a sample
-3. Select the target: **Agent** (execution), **LitterBox** (analysis) or **Both**
-4. Click **Detonate** and watch the stages: agent execution, LitterBox, EDR
-   alerts, exit capture, live memory. Live-memory results arrive 1-2 minutes
-   after the start; the verdict updates while they come in
-5. **Tracing** shows the sample's events and alerts; **Graph** its process tree
-   (the landing page links each executed sample to its tree)
-6. Earlier detonations: **Submit → Submissions → View results**, or MCP
-   `tdc_detonation_results`
-
-### CLI Submission
-
-```bash
-# macOS / Linux
-make submit FILE=./samples/mimikatz.exe TARGET=both
-
-# Windows
-.\make.ps1 submit -File .\samples\mimikatz.exe -Target2 both
-```
-
-### Scanner Workflow
-
-1. Go to the **ThreatScan** tab
-2. Drop a file or enter a path inside the VM
-3. Tick the tools: ThreatCheck (Defender/AMSI engine), DefenderCheck,
-   EMBER2024 (model + threshold), capa
-4. Click **Scan** — each tool reports in its own card; ThreatCheck shows the
-   offset of the flagged bytes with a link into the hex editor
-5. Every scan is kept in the **Scan History** below and on the graph landing page
-
-### PE Analysis
-
-1. Go to the **Hex** tab
-2. Upload a PE file or enter a VM path (samples are in `C:\Users\Public\Downloads\`)
-3. Click **PE Analysis**; **Inspect** on a section shows its hex dump and strings
-4. Review: headers, security features (ASLR/DEP/SEH/CFG), section entropy, suspicious imports, packer indicators, DiE-style detection overview
-
-### ELF Analysis
-
-1. Go to the **Hex** tab
-2. Upload an ELF binary (Linux/BSD executables, shared objects)
-3. Click **ELF Analysis** button
-4. Review: ELF header, security audit (PIE/NX/RELRO/canary/Fortify), sections, segments, dynamic libraries, suspicious symbol imports
-
-### Hunt-Sleeping-Beacons
-
-Scan running processes for sleeping C2 beacons (RDP or SSH into VM):
 
 ```powershell
-# Scan all processes
-Hunt-Sleeping-Beacons.exe
-
-# Scan a specific PID (e.g., after detonation)
-Hunt-Sleeping-Beacons.exe -p 1234
-
-# Include .NET processes (more false positives)
-Hunt-Sleeping-Beacons.exe --dotnet
-
-# Show command lines for suspicious processes
-Hunt-Sleeping-Beacons.exe --commandline
-
-# Shortcut alias
-hsb --commandline
+.\make.ps1 up                  # Windows with Hyper-V, as Administrator
+.\make.ps1 open
 ```
 
-Detections include: unbacked memory in callstacks, non-executable memory pages, module stomping (SharedOriginal check), suspicious APC dispatchers, timer-based sleepmask callbacks, abnormal intermodular calls (module proxying), and return address spoofing (jmp gadget patterns).
+> First boot takes ~20-30 minutes (Windows) or ~30-45 minutes (macOS ARM).
 
-Hunt-Sleeping-Beacons and BeaconEye are x64 builds on every VM, ARM64
-included: Hunt-Sleeping-Beacons reads thread contexts through the AMD64
-`CONTEXT` layout and does not compile for ARM64. Under emulation they see x64
-processes - which is what samples and implants on an ARM64 VM are. Results for
-a native ARM64 target carry a `limitation` note and count only as
-uncorroborated, half-weight evidence. BeaconEye has no PID option; the web UI
-scans all processes (under a second) and keeps the requested PID's results.
+What the host needs first is in [Setup](docs/setup.md); the long way round —
+provisioning, the manual install, every `make` target and deploying to a running
+VM — is in [Installation](docs/installation.md).
 
 ---
 
-## Live Memory Analysis
-
-Packers decrypt themselves in memory and injected implants never touch disk, so
-the chamber also looks at processes while they run - and at the moment they exit.
-
-### What runs after a detonation
-
-When the DetonatorAgent returns a PID, these run automatically (Submit tab →
-**Memory** sub-tab, stage cards **Exit Capture** and **Live Memory**):
-
-| Step | Tool | Notes |
-|------|------|-------|
-| Armed before execution | **Exit Capture** | Windows writes a full-memory dump when the sample exits (`C:\dumps\exit`). Armed per image name for 120 s, then the registry keys are removed again |
-| Live, read-only | Hunt-Sleeping-Beacons, BeaconEye, **Aether** | Aether samples the process 3× (3 s apart) |
-| Live, writes files | **Process Dump** | Runs last; skips modules in the clean-hash database (`C:\dumps\<time>_pid<PID>`) |
-| From the log | **Network beaconing** | Sysmon EID 3 connections scored for check-in periodicity - still available after the process exited |
-
-### How findings become a verdict
-
-All sources go through one tool-independent model (`webui/memory_evidence.py`);
-no scanner's own severity label is trusted directly.
-
-| Factor | Effect |
-|--------|--------|
-| **Evidence class** | structural fact (thread starts in private RX memory, PE in private memory) > behavioural (pointer tables, beaconing) > extracted artifact > byte pattern. String rules are weighted by their own `risk_score` |
-| **Persistence** | finding in every sample ×1.0, in ≥ half ×0.55, once ×0.25 |
-| **Corroboration** | kinds that also occur in legitimate software (hidden module, private RWX, heap API table, low-risk strings) count 40 % until an independent source agrees on the same process |
-| **Host baseline** | findings this box produces on its own are suppressed (shown collapsed, never silently dropped) |
-| **Saturation** | one kind repeated N times in one process counts at most 2× its strongest instance |
-| **Observation** | a scan that read no memory reports **NOT OBSERVED**, not CLEAN |
-
-Thresholds: score ≥ 2.0 SUSPICIOUS, ≥ 6.0 MALICIOUS. Every finding lists the
-factors behind its score.
-
-Measured on the ARM64 UTM VM with three harmless test programs:
-
-| Sample | Behaviour | Verdict |
-|--------|-----------|---------|
-| exits after 6 s | nothing | CLEAN 0.75 |
-| exits after 6 s | private RWX thread, PE copy in private memory, implant string in heap | MALICIOUS 6.54 (from the exit dump; the live scan came too late) |
-| connects every 2 s | 8 outbound connections | SUSPICIOUS 2.9 |
-
-A system-wide sweep of the clean VM (139 processes) scores 0 after a baseline
-sweep; security tools that keep detection rules in memory (Fibratus, Rustinel,
-the web UI itself) are listed as excluded instead of scored.
-
-### Before the first detonation (clean box)
-
-```
-ThreatScan → Live Process Memory → "Sweep as baseline"     # memory baseline, ~4 min
-ThreatScan → Live Process Memory → "Full dump baseline"    # Process Dump -db gen, ~20+ min
-```
-
-Provisioning only runs `pd64.exe -db genquick` (running processes). Anything
-captured into either baseline stops counting as evidence later - never run
-them after a sample has executed.
-
-### ARM64 hosts
-
-x64 samples run under emulation, and the emulator's ARM64 translation cache is
-private executable memory. Exit Capture and Process Dump code chunks are
-classified by content (ARM64 instruction density, single-RET stub pages) and
-listed as host artifacts rather than injected code.
-
-`pd64.exe -closemon` is intentionally not used: it overwrites `NtTerminateProcess`
-with x64 instructions in every process and decides the architecture from
-"PE32+" alone, which is also true for native ARM64 processes.
-
-### Limitations
-
-- Exit Capture is armed by image name; child processes with other names are
-  only covered by the live scanners and the network log.
-- Live-memory findings depend on timing. Use several samples for anything you
-  want to compare.
-- The memory baseline is per host. Rebuild it after installing software.
-- Windows reuses PIDs. Processes are tracked per instance (PID + start time):
-  the newest process with a PID is addressed by the plain PID, earlier ones as
-  `<pid>@<start epoch>`. Alerts, events and children are attributed to the
-  instance that was alive at the time.
-- Live-memory results (Aether, Process Dump, exit capture, beacon scanners) are
-  stored in `webui/memory_results/` and survive restarts of the web UI.
-- Baseline entries are keyed by the process's full image path, so a sample that
-  names itself `svchost.exe` does not inherit the real svchost's entries. A
-  baseline from an older key scheme is reported as outdated and ignored -
-  capture it again ("Sweep as baseline").
-
-## Named Pipes
-
-Beacons talk to their child processes and to each other over named pipes
-(Cobalt Strike's `\msagent_##`, `\postex_*`, `\status_*`; PsExec-style
-`\PSEXESVC`, Covenant's `\gruntsvc`, ...). The chamber watches pipes in two
-ways.
-
-### A: Observation (passive, from Sysmon)
-
-Sysmon logs every pipe creation (EID 17) and connection (EID 18). The
-provisioning switches the SwiftOnSecurity `PipeEvent` filter from its short
-include list to **exclude** mode, so every pipe is logged except a few noisy
-pairs of image *and* pipe name (Chrome/Edge Mojo and Crashpad pipes; `\lsass`
-from `lsass.exe`, `\ntsvcs` from `services.exe`, `\srvsvc`/`\wkssvc` from
-`svchost.exe`, all in `System32`; Defender from its platform folder) - never by
-name alone. Anonymous pipes are logged too (Sysmon writes `<Anonymous Pipe>`)
-and dropped when the events are read. The
-Sysmon log is enlarged to 512 MB.
-
-After a detonation, the pipe events of the sample's process subtree are
-attributed to process instances and listed in the **NAMED PIPES** section of
-the results. The query is pipe-first: the subtree's own PIDs are queried
-first (window: submission to the subtree's last exit + 60 s, at most 6 h),
-then every party on the pipes the sample touched by exact pipe name (up to 20
-names; names with quotes are not queried), so unrelated host activity cannot
-push the sample's events out of the 2000-event cap. `truncated` reports a cap
-hit or names that were not looked up.
-
-| Flag | Meaning | Evidence (weight) |
-|------|---------|-------------------|
-| `c2_default` | name matches the catalog `webui/pipe_signatures.json` (C2 defaults, credential dumpers, remote-exec tools, APT pipes) | structural, weight from the catalog (C2 4.0, remote exec 3.0); never baseline-suppressed, counted once per pipe |
-| `cross_process` | created by the sample tree and connected by a process outside it (or the other way round) | behavioural 1.5, needs corroboration |
-| `sensitive_system` | the sample connects to `\svcctl`, `\lsarpc`, `\samr`, `\netlogon` or `\atsvc` | behavioural 1.0, needs corroboration |
-| `random_name` | a name token looks generated: GUID, hex run (≥ 6, digits and letters), or ≥ 12 characters with high entropy that mix digits and letters or have almost no vowels; tokens are split at `\ - _ . ` and spaces, so PIDs and counters do not count. Common Windows/runtime/browser pipes (`\Winsock2\CatalogChangeListener-*`, `\dotnet-diagnostic-*`, `\PIPE_EVENTROOT\*`, Chrome/Mojo/Crashpad, ...; `BENIGN_PIPE_PREFIXES` in `pipe_analysis.py`) are never flagged - only this flag is affected | string 0.8, needs corroboration |
-
-Pipe findings enter the same evidence model as live memory (source
-`sysmon-pipes`), so a default C2 pipe alone makes a sample SUSPICIOUS, and
-together with a memory finding on the same process it corroborates it. The
-catalog is plain JSON: add an entry (`pattern`, `match` exact/prefix/contains/regex,
-`family`, `weight`, `note`) without touching code. It includes Metasploit's
-`\msf-pipe` (the default `PIPENAME` of `reverse_named_pipe`); Sliver has no
-default pipe name (the operator always chooses it), so it has no entry.
-
-"Sweep as baseline" (Live Process Memory) also records the pipes of the last
-30 minutes as known for this host, keyed by image path and a normalised name
-(`\status_4a3f` → `\status_*`). Catalog pipes, random names and all-wildcard
-names are never baselined.
-
-In the **Graph** tab the **Pipes** toggle (on for detonated roots, off
-otherwise) adds pipe nodes for the processes shown; in the isometric view two
-processes on the same pipe are joined by a bridge. The **Pipes** tab lists raw
-pipe events with name, PID and time filters.
-
-### B: Interception (active, pipe-intercept style)
-
-The **Pipes** tab starts interception sessions in the web UI process:
-
-| Option | Values |
-|--------|--------|
-| How | **attach** to an existing pipe (exact name), or **arm** before a detonation: a watcher takes the first *new* pipe matching an exact name, prefix (e.g. `postex_`) or regex. Arm with an exact name that already exists is refused ("use attach") |
-| Mode | **observe** (relay and record) or **hold** (each message waits until you forward, edit or drop it; auto-forwarded after the hold timeout) |
-| Squat | opt-in, arm + exact only: the proxy creates the pipe before the real server does |
-| Limits | 10 min default session (≤ 1 h), at most 16 live sessions, 1 MiB logged per message, 50 MiB per session. In hold mode a direction stops reading while its first message is held and the session already queues 16 MiB or 1000 messages (the pipe buffer fills and the sender blocks); a message-mode message over 16 MiB closes the connection. `\lsass`, `\ntsvcs`, `\protected_storage` and their NPFS aliases `\lsarpc`, `\samr`, `\netlogon`, `\svcctl`, `\epmapper`, `\InitShutdown` are refused (observation still sees them, e.g. `sensitive_system`) |
-
-The proxy adds its own server instances of the pipe. Each client that lands
-on one gets its own upstream connection to the real server, opened with
-identification-only impersonation so a malicious server cannot borrow the web
-UI's SYSTEM token. Recordings are written to `webui/pipe_sessions/` when a
-session ends and can be exported as JSON; sessions do not resume after a
-restart. The MCP tools can read sessions and recordings but cannot start or
-steer them.
-
-```
-Pipes tab → pattern "msagent_", match prefix, how arm, mode observe → Start
-Submit tab → detonate the sample → the session attaches to \msagent_<hex>
-```
-
-### Limitations
-
-- Interception needs the pipe name (or a prefix/regex) in advance. A client
-  that was already connected before the session, or connects while the
-  session is `starting`, is not intercepted.
-- Servers that check their peer (client PID, token) or that create their pipe
-  with `FILE_FLAG_FIRST_PIPE_INSTANCE` and refuse extra instances can notice
-  or defeat the proxy.
-- Squat creates the pipe first; a server that insists on owning the first
-  instance fails to start. Use it only on purpose.
-- Without an explicit `pipe_mode` the proxy reads the server's byte/message
-  mode from a throw-away instance of its own; it never connects to the server
-  for that. A client that connects in the instant this instance exists (only
-  possible while the server has no free instance) loses its connection when
-  it is closed; passing `pipe_mode` avoids even that.
-- The 30-minute pipe window of "Sweep as baseline" includes a recent
-  detonation's pipes - run it on a clean box only.
-- Observation depends on Sysmon; with `available: false` the results say so
-  instead of showing an empty list.
-- The proxy's own pipe events are hidden by the web UI's current PID. After a
-  restart, events of the previous web UI process show up in the Pipes tab's
-  event list as `python.exe`; they are never attributed to a sample (the web
-  UI is not in a sample's process tree).
-
-## Rizin
-
-The **Rizin** tab reverse engineers a file on the VM in the browser. rizin
-0.9.1 with the rz-ghidra decompiler runs on the VM, one process per opened
-file; the tab draws its views itself, in both themes. The file is only read:
-nothing is written into it or next to it, and there is no debugging. Screenshot:
-[Rizin (Reverse Engineering)](#rizin-reverse-engineering).
-
-### Opening a file
-
-- **OPEN ▾** lists SUBMISSIONS (the submitted samples in
-  `C:\Users\Public\Downloads`), DUMPS (Process Dump and Exit Capture files in
-  `C:\dumps`, newest first) and UPLOADS, and takes a path or an upload
-  (**Upload…**, or a file dropped on the tab). Paths have to lie in the folders
-  `/api/file/download` serves (`C:\Users`, `C:\Windows\Temp`, `C:\Temp`,
-  `C:\dumps`, the Rustinel logs); UNC paths are refused. Uploads are kept in
-  `%TEMP%\rizin_uploads` (a Defender exclusion), the newest 40.
-- **Rizin** buttons open a file from the Submit history, the files Process
-  Dump and Exit Capture dumped (each beside its Hex button), ThreatScan (the
-  result, beside Open in Hex Editor, and history entries whose file is still
-  there) and the Hex tab's toolbar.
-- The analysis starts at once and the toolbar shows it: `aaa` up to 20 MB,
-  `aa` above. For those **Full analysis** runs `aaa`'s steps one by one (for
-  an x86 PE `aa`, `aac`, `aar`, `aaft`, `Fa`, `aanr`, `aaC`, `avrr`). Between
-  two steps rizin answers for about 2 s (up to 10 s while requests come), so
-  the views fill in and stay usable; while a step runs they say busy. Once the
-  analysis is done the tab jumps to `main` or `sym.main` if the file has one,
-  else to the entry point.
-
-Measured on the ARM64 UTM VM (rizin runs as x64 under emulation), from the
-click to the first view of the place the tab lands on:
-
-| File | Analysis | First view |
-|------|----------|------------|
-| `pipesim.exe` built with mingw (symbols), 151.7 KB, 84 functions, uploaded | `aaa` 1.6–2.5 s | 2.7–3.8 s, at `sym.main` |
-| `pipesim.exe` from SUBMISSIONS (no symbols), 186.5 KB, 127 functions | `aaa` 2.1–2.2 s | 3.6 s, at the entry point |
-| its image from its exit dump (DUMPS), 212.0 KB, 127 functions | `aaa` 2.0 s | 2.6–3.6 s, at the entry point |
-| its exit dump from DUMPS, a 31.0 MB minidump, 10 295 functions | `aa` 3.3–3.9 s, then Full analysis 23–24 s | 6.1–6.9 s, at the entry point |
-
-The same project opened again shows its first view after about 1 s.
-
-### One place in every view
-
-- **FUNCTIONS** lists the functions with name and size (the address on hover),
-  filters by name or address, marks the current one, and « folds it away.
-- **DISASSEMBLY** shows the current function with the current address marked;
-  a long function loads on as you scroll, outside functions the linear
-  disassembly stops after 2000 instructions. **DECOMPILER** shows rz-ghidra's
-  C with the line of the current address marked, **HEX** 512 bytes from it
-  with **Open in Hex tab** at that byte of the file.
-- **GRAPH** beside them shows the control flow graph with the block of the
-  current address marked: green edges are taken jumps, red ones the
-  fall-through, dim ones unconditional. Drag, the wheel and − + FIT move and
-  zoom it; from 200 blocks it starts as an overview. ⇱ gives one half the
-  whole width, the line between the halves can be dragged, and below 1400 px
-  window width DISASSEMBLY, DECOMPILER, HEX and GRAPH are tabs.
-- Below them **CONSOLE**, **XREFS** (references to the current address and
-  from it; at a function's start from the whole function), **STRINGS** and
-  **IMPORTS** (paged and filtered on the VM; a click on an import shows its
-  references). ═ sets the height, ▾ folds them away.
-- A click on a function, an instruction, a jump or call target, a block, a
-  line of C, a reference, a string or an import moves every view there, and
-  so do **SEEK** (an address, a function or a flag name) + **GO**, **◀ ▶**
-  (the jumps made) and a seek in the console (`s`, `pdf @ …`).
-
-### Console without a shell
-
-The console runs rizin commands at the current address, which its prompt
-shows (`[0x1400014b7]>`): ↑ ↓ walk the history, Tab completes commands,
-functions and flags, and quick buttons run `afl`, `pdf`, `pdg`, `iz`, `ii`,
-`axt` and `?`. The output keeps rizin's colours, drawn in the theme's
-palette, and is cut at about 1 MB.
-
-rizin has no restricted mode of its own (0.9.1 has neither `cfg.sandbox` nor a
-web server), and the web UI runs as SYSTEM without a login. So the server
-checks every command against an allowlist before rizin gets it; a refused
-command answers with one line, e.g. `refused: '!' is not allowed: no shell
-commands`, and nothing moves.
-
-| Refused | Why |
-|---------|-----|
-| `!`, `\|`, `>`, `<`, backticks, `$(…)`, `#!` | They run programs, or write output to files and read input from them |
-| Command families other than `a p i f C s / ? x t b e` (analysis, print, info, flags, comments, seek, search, help, hexdump, types, block size, settings): among them `o` (open files), `w` (write), `d` (debug), `.` (scripts), `(` (macros) | Other files, writing, debugging and stored scripts are not part of static analysis |
-| Inside the families: the sub-commands and `@` forms that read or write files, assemble (rizin can hand that to an external assembler), wait for input or open an interactive view, run stored or nested commands, or change the settings, arch or file for one command (`@e:`, `@a:`, `@f:` …) | The same reasons, one level down; the list comes from rizin 0.9.1's own help, and the tests check every entry |
-| Setting anything but `asm.*` (not `asm.assembler` and `asm.debuginfo.file`), `analysis.*` and `bin.demangle`; arch values other than rizin's built-in disassemblers | Some settings and arch plugins start programs or read files; reading a setting is fine |
-| `aa`, `aaa` and the other whole-program analyses | They outlast a console command's 60 s; **Full analysis** runs them in steps |
-| Backslashes, control characters, several lines, more than 2000 characters | rizin would read such input differently from the check |
-
-### Sessions
-
-- A session is one rizin process for one file and one browser tab; opening
-  another file in the tab replaces it.
-- The same file opened in a second browser tab takes the session there, so
-  two sessions never write the same project. The first tab says "Open in
-  another tab" and offers **Take it back**.
-- At most three sessions run at once; a fourth ends the one unused longest. A
-  session ends after 30 minutes without use, when its page is closed or left,
-  or when rizin stops; the toolbar then says "Session ended", and **Reopen**
-  opens the file again at the same place. rizin ends with the web UI, also
-  when that is killed (on Windows each rizin runs in a job object).
-- Every command has a time limit: views 30 s, lists and console commands
-  60 s, a decompile 120 s. A rizin that does not answer in time is ended and
-  the tab says so; nothing else in the web UI waits for it. A decompile that
-  ended its session is not asked for again on its own: **Decompile again**
-  asks once more.
-- An analysis stops at the next step after 10 minutes and says why; what it
-  found stays usable, and **Full analysis** goes on with the steps left. A
-  step still running after 12 minutes counts as hung: rizin is ended, and the
-  session starts again with the steps it had finished (after an `aaa`, with
-  `aa` and the Full analysis button). A file opened again after a Full
-  analysis that did not finish runs nothing by itself.
-
-### Projects
-
-- A right-click on a function, an instruction or a graph block offers
-  **Rename function…** (`afn`) and **Comment…** (`CC`; an empty comment
-  removes it); in the console `CC` works anywhere and `afn` at a function's
-  start. Both are refused (busy) until the analysis is done, because a later
-  step could change them again.
-- They are saved as a rizin project in `webui/rizin_projects/<sha256>.rzdb`
-  (`C:\DetonationChamberUI\rizin_projects\` on the VM, git-ignored like
-  `webui/memory_results/`): 3 s after the last change and when the session
-  ends. A file gets a project only once something is renamed or commented.
-- The same file opened again, under any path, loads its project: names and
-  comments are back (while its session still closes, it waits for that
-  session's last save). A project that cannot be loaded is kept as
-  `<sha256>.rzdb.broken`, and the file opens without it.
-
-### Installation
-
-`scripts/install-rizin.ps1` runs during provisioning, after
-`install-re-tools.ps1`. It downloads Cutter v2.5.0's Windows package (only
-for rizin 0.9.1, the rz tools and rz-ghidra; Cutter itself is never run),
-checks its SHA-256 against the pinned digest GitHub publishes for the
-release, installs the bundled VC++ runtime if it is missing or older, unpacks
-the package to `C:\tools\cutter`, sets `SLEIGHHOME` so that rz-ghidra finds
-its processor specifications (the web UI also hands it to rizin) and adds the
-Defender exclusion for the uploads. It ends with a self-test (`rizin -v`, the
-plugin list and a decompile). A failed download or checksum only warns and
-provisioning goes on; the tab then says "rizin not installed". It is safe to
-run again. On a running VM:
-
-```bash
-python3 scripts/deploy-utm.py --vm-ip <vm> --vm-user tdc --vm-pass tdc --install install-rizin.ps1
-```
-
-`TDC_RIZIN` points the web UI at another `rizin` (for example a local one for
-development; without rz-ghidra DECOMPILER says "Decompiler not available
-(rz-ghidra missing)").
-
-### Limitations
-
-- Static analysis only: no debugging, no patching, and the console allowlist
-  leaves out a few rizin features (assembling, scripts, other files).
-- Full analysis analyses variables less than `aaa` does (the toolbar's note
-  says so).
-- Under x64 emulation big files are slow: `aaa` on a 5 MB sample takes about
-  17 s, and a long function may hit the decompile limit.
-- A click on a string or an import jumps to its address, which holds data:
-  DISASSEMBLY decodes it as instructions (HEX shows the bytes). For an import
-  XREFS opens with its callers.
-- STRINGS, IMPORTS and the console's Tab are filtered on the VM from a copy of
-  rizin's own list, at most 200 000 rows of it (the pager says so); of a list
-  larger than 32 MB they keep nothing and say to filter in the console instead
-  (`iz~text`, `ii~name`), and Tab then lists the names of FUNCTIONS without
-  completing one. FUNCTIONS has no 32 MB limit: it reads rizin's `afl`, whose
-  rows are small enough for the thousands of functions of a big dump. Its rows
-  are capped at 200 000 too, and past that the functions left out are missing
-  from the list and from the names XREFS shows for references inside them (no
-  dump measured comes near it: a 16 MB binary has about 17 000 functions).
-- DISASSEMBLY, GRAPH and DECOMPILER read one whole function from rizin at a
-  time: a function whose `pdfj` or `pdgj` is larger than 64 MB (about 220 000
-  instructions) is not shown, and the view says so.
-- "Duplicate tab" in the browser copies the tab's ID, so both pages drive one
-  session without "Open in another tab"; open the file in a new tab instead.
-- Addresses above 2^53 (kernel space) lose precision in the browser.
-
-## Tool Updates
-
-The **Tool Updates** panel on the Dashboard (below the service cards) lists every
-tool on the VM with its installed and available version and a status, and
-installs updates without re-provisioning the VM. The VM needs internet access
-for this; without it the rows say "No internet access from the VM" (`offline`).
-
-<p align="center">
-  <img src="static/tool_updates.png" alt="Dashboard: the Tool Updates panel with CHECK FOR UPDATES and the skull UPDATE ALL button" width="100%">
-</p>
-
-> The panel in the Telemetry theme, scrolled to the top of the window:
-> the time of the last check, **CHECK FOR UPDATES** and the skull button
-> **UPDATE ALL** with the number of tools it would install (2: Sysmon and its
-> config, the only rows with *update available*). Rustinel and Fibratus are
-> pinned (1.1.1 and 3.0.0), so a newer version (1.11.0, 3.1.1) is shown but
-> only their own **UPDATE** button installs it; most git and release tools
-> are *up to date*, and a few have no version to compare (*unknown*).
-
-- **Check for updates** runs in the background. The server also checks once a
-  day on its own (first check 5 minutes after start; `TDC_UPDATE_CHECK_HOURS`),
-  but it never installs anything by itself.
-- **Update** on a row installs that tool; **Update all (N)** installs every tool
-  with an update except the pinned ones. A tool whose update failed can be
-  retried. Click a row to see the last lines of its log.
-- The check and the update use the same API as the MCP tools
-  `tdc_updates_status`, `tdc_updates_check` and `tdc_updates_apply`.
-
-### What is checked
-
-| Source | Tools | Check | Update |
-|--------|-------|-------|--------|
-| Chocolatey | every package `choco outdated` reports (git, python312, dotnet-8.0-sdk, 7zip, php, ...); a `<x>.install` row is dropped when `<x>` is listed too | `choco outdated` | `choco upgrade <package>` |
-| winget | WinDbg | `winget list --upgrade-available` | `winget upgrade` |
-| git | Rustinel rules, Elastic YARA rules, DetonatorAgent, Detonator, LitterBox, theZoo WebUI, theZoo, Hunt-Sleeping-Beacons, EMBER2024, Aether | `git fetch`, commits behind upstream | `git pull --ff-only --autostash`, then the install script rebuilds |
-| GitHub release | capa, BeaconEye, Process Dump, ThreatCheck, DefenderCheck, Rustinel, Fibratus, Rizin (Cutter) | latest release against the installed version | the `install-*.ps1` script with `-Force` |
-| Sysinternals | Sysmon, Sysmon config | `ETag` of the download against the one recorded at install | `install-sysmon.ps1` |
-
-Not covered: the web UI itself and its pip packages (update them with
-`make deploy`), system pip, uv, OpenSSH, and DIE or Ghidra when they came from
-the fallback zip instead of Chocolatey. A tool that is not on the VM shows
-`not_installed` without a button.
-
-The release tools write the installed tag to `tdc-release.txt` in their folder.
-Without it the installed version shows as `unknown` and the tool as
-`update_available` until its first update. Repos that publish no GitHub release
-(BeaconEye, ThreatCheck, DefenderCheck) show `unknown` with "Upstream publishes
-no GitHub releases."; there is nothing to compare, so they have no Update
-button. Sysmon and Sysmon config without a recorded ETag in `tdc-source.json`
-show `update_available` ("Installed version unknown; an update records it").
-
-### Pinned tools
-
-Rustinel (1.1.1), Fibratus (3.0.0) and Rizin (Cutter 2.5.0) are pinned by their
-install scripts, and `python312` is held back by TDC itself (the web UI runs on
-that Python: updating it restarts services and may need a reboot). A newer
-version shows as `pinned_update`; **Update all** skips it. The row's own button
-asks first ("Pinned to X for compatibility. Install Y anyway?"; for `python312`
-the question carries the warning above), and the API needs `include_pinned: true`.
-A package that is pinned in Chocolatey (`choco_pinned: true` in the entry) cannot
-be upgraded by `choco upgrade`: the API refuses it with 409 even with
-`include_pinned` ("php is pinned in Chocolatey. Unpin it with choco pin remove -n
-php first."). Rizin is installed only with the SHA-256
-GitHub publishes for the package; without one the update is refused. After
-re-provisioning, the VM has the pinned versions from the install scripts again.
-
-### Maintenance mode
-
-While an update runs (`mode: updating`) the web UI is in maintenance mode. A
-banner on every page shows the progress, and the server answers every POST,
-PUT, PATCH and DELETE outside `/api/updates/` with `503` and
-`"maintenance": true`. Reading stays possible, so the dashboard keeps working.
-An update does not start (409 with the reason) while a detonation is running
-(DetonatorAgent `in_use`), a memory sweep, a Process Dump job or any scan is
-running (also the memory scans a detonation starts in the background), or
-another check or update is in progress.
-
-For each tool the run closes Rizin sessions if needed, stops the services that
-use the tool (for example LitterBox and the Detonator tasks for `python312`),
-updates it, starts the services that were running before, and checks the tool
-again. A failure of one tool does not stop the run. A script gets at most 45
-minutes. `python312` is always updated last. If the web UI restarts during an
-update, the tool being updated is marked `failed` ("Interrupted") and the mode
-returns to `idle`. The services the run had stopped are listed in the state file
-before they are stopped; on the next start the web UI starts them again and adds
-"Restarted: <names>." to the tool's detail.
-
-An exit code of 3010 or 1641 means the VM must restart to finish the update;
-the tool shows `reboot_required`. There is no rollback to an older version.
-
-### Scripts and logs
-
-The web UI runs the install scripts from `TDC_SCRIPTS_DIR` (default
-`C:\tdc\scripts`). `make deploy`, `make.ps1 deploy` and `deploy-utm.py` upload
-them, and the Vagrant boxes get them from a file provisioner. If a script is
-missing the update fails with "Install script missing: ... (run make deploy)".
-Each update appends to `TDC_UPDATE_LOG`; the last 200 lines per tool are also
-shown in the panel. Status values: `up_to_date`, `update_available`,
-`pinned_update`, `unknown`, `not_installed`, `offline`, `error`, `queued`,
-`updating`, `updated`, `failed`, `reboot_required`.
-
-## Logs
-
-The **LOGS** tab searches six log sources in one place with a small subset of
-Splunk's search language. Everything in it is text from the sample or the VM
-(a PowerShell script block above all), so it is always shown as text, never as
-markup.
-
-<p align="center">
-  <img src="static/logs_tab.png" alt="LOGS tab: the search source=dns | top 10 query over 7 days" width="100%">
-</p>
-
-> The search `source=dns | top 10 query` over the last 7 days: the 252 DNS
-> events of the VM, counted by queried name (`github.com` 70, then
-> `dc.services.visualstudio.com` 38, `api.nuget.org` 24, ...) as a table with
-> its share, over the **EVENTS OVER TIME** histogram of the range. The chips
-> under the search box count the six sources (the DNS one is the active
-> source), the range buttons sit left of them, and the field list left of the
-> table shows the six fields of the result.
-
-| Source | Content |
-|--------|---------|
-| `powershell` | Script Blocks (4104), module and pipeline logging (4103) and engine errors (4100) of `Microsoft-Windows-PowerShell/Operational`; the parts of a long script block are joined into one event; the script is the `message` (`script=` searches it too) |
-| `access` | Every HTTP request to the web UI (not `/static/`): `method`, `path`, `query`, `status`, `duration_ms`, `remote_addr`, `user_agent`, `client` (`browser`, `mcp` or `other`). The regular polls of the UI itself (the exact paths `/api/status`, `/api/updates`, `/api/alerts`, `/api/health`, `/api/rustinel`, `/api/firewall/pending`, `/api/firewall/connections` and a GET of `/api/firewall/isolate`, and everything under `/api/logs/`) carry `poll=true`; `/api/alerts/<id>` does not. A request that ends in an unhandled error is logged with status 500 |
-| `mcp` | Every action of the MCP server (it sends `X-TDC-Client: mcp` and `X-TDC-MCP-Tool: <name>`): `tool`, `method`, `path`, `status`, `duration_ms` |
-| `netflow` | Network connections (Sysmon 3) bundled into flows per image, PID, protocol and address pair, with `count`, `first_seen` and `last_seen` |
-| `dns` | DNS queries (Sysmon 22): `query`, `result`, `image`, `pid` |
-| `firewall` | The Windows Firewall log (`pfirewall.log`): `action`, `protocol`, source and destination address and port, `path` |
-
-A chip per source shows its event count and status; a click on it searches that
-source. A source without data says why in its tooltip (the Windows sources are
-`unavailable` when the web UI does not run on the VM; the firewall log stays
-empty while the firewall is off). Every source has its own ring in memory, so a burst in one cannot push out another: `powershell` 15,000 events, `firewall`, `dns` and `access` 10,000 each, `netflow` and `mcp` 5,000 each, and 50 million characters of text in all, split in proportion. A search response cuts every value at 64 KB (the event then has `truncated_fields: true`; the UI loads the whole event when you unfold it);
-`access` and `mcp` are also written to `webui/logs/` (10 MB per file, one older
-file kept) and loaded again at start. The Windows sources read the last 24 hours
-at start (at most 5000 events each) and then every 10 seconds; a Sysmon backlog of more than 5000 events is read oldest first, over several rounds.
-
-**Search syntax.** Words and `"phrases"` match anywhere in the message and the
-fields, without regard to case; `*` is a wildcard. `field=value`, `field!=value`,
-`field>n` (also `<`, `>=`, `<=`; numbers compare as numbers) test a field;
-`AND` (implied), `OR`, `NOT` and parentheses combine them. `source`,
-`sourcetype` and `index` all mean the source. Pipes transform the result:
-`head N`, `tail N`, `sort -field`, `dedup field`, `table f1, f2`, `fields f1`,
-`stats count|dc(f)|sum(f)|avg(f)|min(f)|max(f)|values(f) by f1, f2`, `top field`,
-`rare field` and `timechart span=5m count by field`. A search that cannot be
-read shows the message and marks the place of the mistake under the search box.
-At most 10,000 matches go into the pipes and 1000 rows come back (200 at first;
-"Show up to 1000" asks for more).
-
-```
-source=powershell "Invoke-Expression"
-source=mcp | stats count by tool
-source=access NOT poll=true
-source=netflow | sort -count | head 20
-source=dns | top query
-source=firewall action=DROP
-* | timechart span=5m count by source
-```
-
-**Time.** The buttons `15M`, `1H`, `4H`, `24H`, `7D` and `ALL` set the range
-(default 24 hours); `earliest=-15m` and `latest=now` in the query take
-precedence. A range drawn across the bars of EVENTS OVER TIME (or a click on a
-bar) zooms to it and shows it as a chip whose × goes back to the button. The
-field bar on the left lists the fields of the matches with their ten most
-frequent values; a click on a value adds `field="value"` to the search. A
-click on an event unfolds its fields and its raw text with the search words
-marked. The EXAMPLES menu holds the searches above and your last ten, **LIVE**
-searches again every 10 seconds while the tab is open, and the `?` button shows
-the syntax as a tooltip.
-
-PowerShell and firewall logging are off on a Windows install. New VMs get them
-turned on during provisioning; on an **existing VM** run
-`C:\tdc\scripts\configure-logging.ps1` once as Administrator (`make deploy`
-uploads it). It enables Script Block Logging and Module Logging, sets the
-PowerShell operational log to 256 MB and turns on Windows Firewall logging of
-allowed and blocked packets. It is safe to run again.
-
-## Firewall
-
-The **FIREWALL** tab shows whom the chamber talks to and lets you act on it
-while the sample runs: a process tree with each process's endpoints, a world
-map of the destinations, and the switches that write rules into the Windows
-Firewall. It is built from what Windows already records (Sysmon 1, 3 and 22,
-`pfirewall.log`, PowerShell 4104/4103 and the BITS client log). It sees a
-connection **after** it was made and does not hold one back. How late depends on
-the source: everything is read every 10 seconds; while a detonation runs, Sysmon
-(processes, connections, DNS) and the BITS log are read every second, but
-PowerShell and the firewall log stay at 10 seconds. A download found in a
-PowerShell script needs both the URL (from the script block) and the connection
-(from Sysmon), so a PowerShell download cradle can be found, and its loader
-blocked, up to about ten seconds after the connection.
-Everything in it is text from the sample and is shown as text: URLs and host
-names are defanged (`hxxp://`, `example[.]com`), never a link.
-
-A connection here is a flow: one process (image and PID) to one endpoint
-(protocol, address, port), with its count and its first and last packet. The
-firewall log has no process, so its numbers (`FW (endpoint)`, the `dropped`
-tag) belong to the endpoint, not to the process beside them. There are **no
-byte counts**: Sysmon records none, and the `size` field of `pfirewall.log` is
-per record and mostly empty. The tree's bars and the map's lines scale with the
-number of connections instead, and the summary says why. Countries and AS
-names come from an offline table in `webui/data` (iptoasn.com, public domain);
-TDC never asks anyone online about an address it has seen from malware.
-Private, loopback and link-local addresses are a group of their own and are not
-on the map; TDC's own processes (the web UI, Detonator, LitterBox, Fibratus,
-Rustinel, git) are a group of their own and are never blocked automatically.
-
-| Tag | Severity | When |
-|-----|----------|------|
-| `ioc` | critical | the address or host name is on Rustinel's IOC lists |
-| `beacon` | critical | the connection times have a regular rhythm (the beaconing detector of Live Memory) |
-| `sigma` | high | a Rustinel or Fibratus alert names this address and port |
-| `detonated` | high | the process, or one of its ancestors, is a submission |
-| `direct-ip` | high | no DNS answer and no Sysmon host name explains the address: a hard-coded destination |
-| `download` | high | a URL to an executable file (`.exe`, `.dll`, `.ps1`, `.hta`, `.msi`, ...) was seen for this connection |
-| `tdc-anomaly` | high | one of TDC's own processes talks to an endpoint it has no business with |
-| `lolbin` | medium | the image is a living-off-the-land binary (certutil, bitsadmin, mshta, rundll32, powershell, ...) |
-| `dga` | medium | the name it resolved has high entropy or many digits |
-| `risky-tld` | medium | `.onion`, `.bit`, `.top`, `.xyz`, `.tk`, `.ml`, `.ga`, `.cf` |
-| `dead-drop` | medium | a paste, chat or file-drop service (telegram, pastebin, discord, raw.githubusercontent, transfer.sh, ...) |
-| `rare-port` | medium | a port outside the usual list, or 4444, 5555, 6666, 8888, 9999, 31337 |
-| `newborn` | low | the process was less than 60 s old when the connection began |
-| `dropped` | info | the firewall dropped packets to this endpoint |
-
-The colour of a row and of an arc is its most severe tag.
-
-**Blocking.** ALLOW / DENY writes a rule named `TDC-FW-...`: for one process to
-one endpoint, for one process everywhere, or (a separate switch) for an
-endpoint and every program, TDC's own fetch included. A rule only counts as a
-block once it reads back from Windows as written and every profile it covers is
-on. A loopback address (`127.0.0.0/8`, `::1`) is never blocked, for one process
-or for all: Windows Firewall does not filter loopback, so such a rule would
-stand, read back, and block nothing; the switch, the API and a download
-decision say so instead. A blocked connection is not reset: a running one is expected to starve, which
-looks like a network failure to the sample (Windows re-checks an established
-flow against a new Block filter; the handover has the check that confirms it). The UI shows each rule's protocol, because the
-assessment does not compare it: a tcp rule makes a udp flow to the same
-endpoint read as blocked too. KILL ends a selected process with `taskkill /F`
-after a confirmation (never one of TDC's own). While a Windows Firewall profile
-is off no rule would bite, so every switch is disabled and a red band says so,
-with TURN THE FIREWALL ON. TDC never turns it on by itself: that changes what
-the sample sees.
-
-**ASK** decides what happens when a process fetches a file. The setting lives
-on the server, because the blocks it causes hold without a browser.
-
-| Position | What happens |
-|----------|--------------|
-| `Detonation` (default) | A download of a process in a detonation (a submission or its descendants; a BITS job while a submission runs) is blocked at once and then asked about. Everything else is only tagged. |
-| `All` | Every download is blocked and asked about, except those of TDC's own processes and of the tool-update hosts. |
-| `Off` | Nothing is blocked, nothing is asked or fetched; downloads are still tagged and logged. The head says so the whole time. |
-
-A download is seen when its URL appears in a PowerShell script block, in a
-Sysmon command line (`certutil -urlcache`, `bitsadmin /transfer`, `curl`,
-`mshta http://...`) or in the BITS log. A compiled loader that calls WinHTTP
-itself shows no URL and is only a connection here: that is the known gap of
-this part. A download also needs its connection, and Sysmon logs a connection
-(EID 3) only for the programs its config includes: SwiftOnSecurity's list
-(images under `C:\Users`, `C:\ProgramData`, `C:\Windows\Temp`, a list of
-LOLBins, a few ports) plus what `scripts/install-sysmon.ps1` adds for this tab, outbound only:
-`curl.exe`, `python.exe` and `pythonw.exe` (TDC's own, for `tdc-anomaly`) and
-`svchost.exe` (BITS). A program outside it, under `Program Files` for one, or
-code injected into another system process, makes no connection the tab sees.
-A loader that runs as the very Python interpreter TDC's fetch runs as is never
-blocked (a block on it would cut TDC's fetch off); its toast says the block is
-NOT confirmed. The connection has already happened when TDC sees the URL, so the
-question is honest about it: the toast, on every tab, says the loader **is
-blocked** and offers CUT + FETCH (keep the block, TDC fetches the file itself),
-CUT ONLY and ALLOW (lift the block). When nobody answers within
-`TDC_FIREWALL_DECIDE_SECONDS` (30 s), TDC keeps the block and fetches the file
-anyway, because a stage-2 URL is often good for one download only; that means
-the chamber contacts the C2 unattended. While the cut stands (the panic
-button, stages `cut` and `cut_policy`) none of that can happen: a Block rule for
-every program beats every Allow rule, TDC's own fetch included, so CUT + FETCH
-is not offered, the route refuses `block_fetch` with 409 and says to leave the
-cut first, and a deadline only blocks. It writes no capture and records in the
-decision why it could not secure the file (`result.note`; DECISIONS shows
-"could not fetch"). Writing that block waits behind a running convergence of
-ISOLATED (tens of seconds), which can hold up a collector tick (a deadline
-shortly after a press nearly always meets that convergence, so this is the
-common case in the cut); it is not skipped, and until the write replaces it the
-decision keeps showing the block written when it was opened (the same rule). The deadline runs
-on the server, so closing the page changes nothing, and what was decided while
-nobody watched stays as a toast until it is closed. DECISIONS lists the open decisions and
-those of the last 24 h: who took which, and when. `POST /api/firewall/decide`
-takes only the id of a decision TDC opened, never a URL, so a sample cannot
-use TDC as its proxy.
-
-**The fetch** runs in the guest, never on the host, with the loader's
-User-Agent when the script named one. It goes only to the address and port the
-loader used (on every one of at most 3 redirects, no new DNS lookup), within
-64 MB and 30 s in all. It refuses the VM's own addresses, its gateways and,
-unless `TDC_FIREWALL_FETCH_LAN=1`, every private address: the analyst's host is
-one of those.
-
-**Secured samples** are stored in `C:\tdc\samples\<sha256[:2]>\<sha256>`
-(excluded from Defender, both at provisioning and at every start of the web
-UI), with their metadata in `webui/captures.json` (at most 500: URL, endpoint,
-process, SHA-256, size, the first bytes' type, the User-Agent sent). They are
-**never executed**: SECURED SAMPLES opens one in Rizin, Hex or ThreatScan.
-To detonate one, submit it again on purpose in SUBMIT.
-
-**ISOLATED** is the panic button: CUT THE NETWORK, the red skull under the
-summary, and the ISOLATED switch in the head are one state and one press. A
-press cuts **without a confirmation**. It writes one outbound Block rule for
-every program and every address, `TDC-FW-ISO-cut`, reads it back in the same
-PowerShell call and answers with `stage: "cut"`: measured 8.8 s on a quiet VM,
-9.9-16.9 s while the tab's own polls load it (the cut call alone is 2.44 s; the
-old ISOLATED took 38.5 s). That is enough because in Windows Firewall a Block
-rule beats every Allow rule: on the VM, with the rule standing, `https://1.1.1.1`
-and DNS were dead while all 135 of Windows' outbound Allow rules were still
-enabled. Then a background worker does the thorough part (measured 59.3 s). A
-default action stops only the traffic that no rule allows, and Windows ships
-enabled outbound Allow rules (Core Networking's DNS, DHCP, Teredo, IP-HTTPS,
-Group Policy, the Store apps' rules), so the worker switches off every enabled
-outbound Allow rule of this machine that is not TDC's, records exactly which in
-`webui/firewall_state.json` (`allow_disabled`) *before* it switches them, sets
-the outbound default of every profile to Block and reads back which outbound
-Allow rules are still enabled. When none is, the cut rule goes and the stage is
-`isolated`, where TDC's own fetch can be let out again one address at a time.
-A rule a group policy sets cannot be switched off locally: then the cut rule
-stays, the stage is `cut_policy`, and the band and `allowed_out` of
-`GET /api/firewall/isolate` name what it holds against. In `cut` and
-`cut_policy` no fetch gets through, so TDC cannot secure a sample there.
-`verified` says what was read back: in the cut stages, the cut rule as written,
-read again from the rule list or one `Get` within 10 s; in `isolated`, Block in
-force on every profile and the list empty. A firewall profile that is off makes
-it false in every stage. A press on a state that is not confirmed closed cuts
-again (and repairs a rule that was disabled or narrowed); on one that is, it
-leaves, after a confirmation. Leaving works from any stage, also in the middle
-of the background work, and switches exactly the recorded rules on again: from
-`cut` that is two or three PowerShell calls, not measured (an estimate of about
-2-10 s on a quiet VM from the per-call figures), measured 57.5 s from `isolated`
-(135 rules back). What it
-cuts, as far as those rules go: DNS, NTP, updates
-(the tool updates refuse to run), and the cloud lookups and telemetry of the
-EDR under test, whose verdicts may therefore differ from a connected run.
-Loopback stays open without a rule (Windows Firewall does not filter it), and
-the host still reaches port 9000, because that is inbound. While a press or a
-leave of its own is on its way the button says CUTTING… or LEAVING… and waits;
-it is never held because the background work runs. TDC's own fetch gets an allow rule for one address while it runs and
-loses it when it ends; for those seconds anything that can run the web UI's
-Python interpreter could reach that one address too. The band says so, and so
-does `residual` in `GET /api/firewall/isolate`. The previous outbound default
-is kept in `webui/firewall_state.json` too and put back when ISOLATED is
-switched off: the value as configured, `NotConfigured` included, not the
-`Allow` it resolves to in force, so the firewall is left configured as it was
-found. A web UI that restarts in ISOLATED stays isolated and says so, in
-the band and as a toast on whatever tab is open: a crash in the middle of a
-detonation must not lift the block. The way out without the web UI is
-`C:\tdc\scripts\tdc-unisolate.ps1` (`scripts/tdc-unisolate.ps1` here; `make
-deploy` uploads it), run as Administrator in the VM: it opens the outbound
-default on all three profiles (back to the recorded value when that is `Allow`
-or `NotConfigured`, otherwise `Allow`; a recorded `Block` it names and leaves to
-the analyst), switches on again the rules recorded in
-`allow_disabled` (it only reads the file) and removes every `TDC-FW-*` rule,
-nothing else.
-
-**Hunting further.** HUNT FURTHER lists ready LOGS searches for the selection,
-each one click away; `in LOGS ▸` on a row, a point of the map or a toast opens
-LOGS with the query and the time of those connections (5 minutes either side),
-and `← FIREWALL` there leads back to the same selection.
-
-- `dst_ip="203.0.113.7" | top image`: who else talks to this endpoint
-- `source=netflow image="C:\Users\...\loader.exe" | timechart span=1m count by dst_ip`: the rhythm of a process
-- `source=firewall action=DROP | stats count by dst_ip, dst_port`: what the firewall dropped
-- `source=dns result="-" | top query`: names that never resolved, DGA suspects
-- `source=powershell "http" | head 50`: download cradles in clear text
-
-A network node in GRAPH has a FIREWALL button that opens this tab on that
-endpoint, and so does the TRACING console for its process. Every action, the analyst's and TDC's own, is an
-`access` event in LOGS (TDC's under `/internal/firewall/...`, with `by`:
-`detector`, `analyst` or `deadline`).
-
-On an **existing VM**, run `C:\tdc\scripts\configure-logging.ps1` once as
-Administrator after `make deploy`: it also turns on the BITS client log the
-download detection reads. The offline geo table travels with `make deploy`;
-`make geoip` on the host only refreshes it.
-
-## Demo
-
-Screenshots from the ARM64 UTM VM with the test samples used during development
-(`shortlived.exe`, `injectsim.exe`, `beaconsim.exe`, `pipesim.exe` — harmless
-programs that mimic implant behaviour).
-
-### Service Dashboard (Telemetry theme)
-
-<p align="center">
-  <img src="static/dashboard.png" alt="Dashboard in the Telemetry theme" width="100%">
-</p>
-
-> Stats strip (alerts by severity, tracked processes, services online, loaded
-> Sigma/YARA rules, scanner tools), where each tile opens what it counts;
-> TOTAL ALERTS and PROCESSES TRACKED carry 45-day sparklines. Below it
-> **ALERT ACTIVITY** on ALL: the 9,950 alerts per week from 13 Jul to 16 Nov
-> (5 without a time), stacked by severity, beside the **SEVERITY** and
-> **CATEGORY** donuts of that range (238 critical, 2,983 high, 6,720 medium,
-> 9 low; registry, process, api, file, module). Then one card per service:
-> Rustinel, DetonatorAgent and LitterBox, below them Sysmon, Fibratus and the
-> AV/AMSI scanner (EMBER2024 and capa follow further down). An offline service
-> is struck through and can be launched from its card; all of them are online
-> here. The top bar holds ☰ PROCESSES (362 tracked processes; the process list
-> and the alert timeline, the 60 newest alerts coloured by severity, which
-> TABLE lists as a table, sit in the drawer behind it), the tabs, the service
-> summary, Help and ✶, which switches to Cyberpunk.
+## Platform support
+
+Two hosts carry the VM: **Windows 10/11 on x86_64** with Hyper-V
+(`Vagrantfile`), and **macOS on Apple Silicon**, where the guest is Windows 11
+ARM64 — with UTM and the guided `scripts/setup-macos-utm.sh`, or over the
+experimental headless Vagrant/QEMU path ([Setup](docs/setup.md)).
+
+On ARM64 the OS, the execution agent and the runtimes are native; Fibratus,
+Rustinel and the memory scanners have no ARM64 build and run under Windows'
+x86_64 emulation — which is what the x64 samples do too. What that changes per
+component is in [Setup](docs/setup.md#arm64-compatibility), what it costs in a
+memory verdict in [Live memory](docs/memory.md#arm64-hosts).
 
 ---
 
-### Cyberpunk Theme (default)
+## Documentation
+
+The guide lives in [`docs/`](docs/README.md): one page per topic, and two reading
+paths through them - set it up, or work with it.
+
+| Page | What it answers |
+|---|---|
+| [Setup](docs/setup.md) | What do I need before the VM, and what does ARM64 change? |
+| [Installation](docs/installation.md) | How do I build, provision and deploy to the VM? |
+| [Configuration](docs/configuration.md) | Which settings exist, how do I add my own rules, and how is the box kept safe? |
+| [Workflow](docs/workflow.md) | How do I detonate a sample and analyse a binary? |
+| [Live memory](docs/memory.md) | What does the chamber see in a running process? |
+| [Named pipes](docs/pipes.md) | How do I watch and intercept named pipes? |
+| [Rizin](docs/rizin.md) | How do I take a sample apart in the browser? |
+| [Logs](docs/logs.md) | How do I search the logs of the VM, and save a search? |
+| [Firewall](docs/firewall.md) | Whom does the sample talk to, and how do I cut it off? |
+| [Tool updates](docs/updates.md) | How do the tools on the VM stay current? |
+| [Web UI](docs/web-ui.md) | What do the themes, the charts and every tab look like? |
+| [API](docs/api.md) | Which routes and MCP tools can I call? |
+| [Development](docs/development.md) | How do I run the tests and change the code? |
+| [Troubleshooting](docs/troubleshooting.md) | Nothing works - where do I look? |
+
+Offline, with navigation and search: `make docs` (or `.\make.ps1 docs`) builds the
+whole guide into `webui/static/wiki.html` - one file with every page, the
+screenshots embedded and the diagrams drawn, and it opens without a network. The
+Web UI's help links it and says when it was built; on the VM, which has no
+internet at all, it is the documentation.
 
 <p align="center">
-  <img src="static/theme_cyberpunk.png" alt="Dashboard in the Cyberpunk theme" width="100%">
+  <img src="static/wiki.png" alt="The offline wiki: the navigation of all fourteen pages on the left with the search box above it, and on the index page the end of the All pages table, the sentence about make docs and the architecture diagram drawn by the embedded Mermaid, with the prose that says it in words and the Detection Engines table under it" width="88%">
 </p>
-
-> The same dashboard in the **Cyberpunk** theme, which a browser without a
-> stored choice starts in. The top bar holds ☰ PROCESSES
-> (362 tracked processes, opens the process list and the timeline in a
-> drawer), the logo, the tabs (Dashboard to Submit, LOGS among them) with the
-> active one in magenta, the service summary, the time of the last update,
-> Help and ✶, which switches to Telemetry. The summary *5/5 ONLINE* counts the
-> five services of the status row (a click lists them); the SERVICES ONLINE
-> tile shows *6/6* because it also counts the Detonator. Below
-> the head area the stats tiles carry a coloured edge; a click on a tile opens
-> what it counts, a click on *3221 high* the critical and high alerts. The
-> charts follow in the theme's colours: ALERT ACTIVITY on ALL (its switch
-> 24H / 7D / 30D / ALL at the top right), the SEVERITY and CATEGORY donuts,
-> then the service cards.
-
----
-
-### Alerts
-
-<p align="center">
-  <img src="static/alerts_tab.png" alt="Alerts tab filtered by severity and engine" width="100%">
-</p>
-
-> The **Alerts** tab (Telemetry) filtered to the critical and high alerts of
-> the fibratus engine: *9 of 9950*. The charts above the filter bar count
-> the same nine: SEVERITY 1 critical and 8 high, OVER TIME bars between
-> 28 Oct and 16 Nov (under the bars the hint how to use them), ENGINE
-> fibratus alone, and FLOW from fibratus through seven rules (six named, the
-> rest as *other rules*) to the processes they ran in (a click on a part would
-> narrow the list further). The severity chips and the engine are set in the
-> filter bar itself, which is no drilldown step, so no drilldown bar shows.
-> Below the bar the rows, newest first, each with its time, severity, engine,
-> rule, process and PID, and the rule's description. A click on a row opens
-> the alert detail; process names that are in the process list (here
-> `XtaCache.exe` and `powershell.exe`) are links to the process. Column heads
-> sort the table.
-
----
-
-### Dashboard & Alerts Charts
-
-<p align="center">
-  <img src="static/dashboard_charts.png" alt="Dashboard charts with a range drawn across ALERT ACTIVITY" width="100%">
-</p>
-
-> The dashboard (Telemetry) with a range drawn across **ALERT ACTIVITY**:
-> the bars of ALL show the 9,950 alerts per week from 13 Jul to 16 Nov,
-> stacked by severity; the range 20 Jul – 16 Aug is marked on them and
-> stands as a chip before 24H / 7D / 30D / ALL, whose × goes back to ALL.
-> **SEVERITY** and **CATEGORY** count that range only: 6,215 alerts (7
-> critical, 1,767 high, 4,441 medium), in three categories (registry 4,441,
-> process 1,648, api 126). The TOTAL ALERTS and PROCESSES TRACKED tiles carry their
-> 45-day sparklines. A click on a bar or a segment opens the Alerts tab
-> filtered to it.
-
-<p align="center">
-  <img src="static/alerts_charts.png" alt="Alerts tab with its chart strip and the engine, rule and process Sankey" width="100%">
-</p>
-
-> The **Alerts** tab with all 9,950 alerts: **SEVERITY** and **ENGINE** as
-> pies beside their legends (Sigma 9,694, Yara 237, fibratus 14, litterbox 5),
-> **OVER TIME** per week stacked by severity (the week of 27 Jul has 3,372 alerts)
-> with the hint how to draw a range below it, and **FLOW: ENGINE → RULE →
-> PROCESS** drawn by square roots. It shows the noise at a glance: the
-> Run-key rule alone has 6,150 of the alerts, and `MsMpEng.exe` alone has
-> 6,190. The six most frequent rules and processes stand on
-> their own, the rest as *other rules* (95) and *other processes* (534). A
-> click on a slice, a bar, a node or a band, or a range drawn across the
-> bars, narrows the tab by a step; no filter is set here (*9950 of 9950* in
-> the filter bar), so no drilldown bar shows.
-
-<p align="center">
-  <img src="static/alerts_drilldown.png" alt="Alerts tab narrowed in three drilldown steps, with BACK and the path above the charts" width="100%">
-</p>
-
-> The **Alerts** tab (Telemetry) after three steps: a click on the week
-> 27 Jul – 02 Aug in OVER TIME, a click on its day 27 Jul, then a range
-> drawn across the hours 10:00 and 11:00. The drilldown bar above the charts
-> shows **‹ BACK**, the path
-> `ALL ALERTS › 27 Jul – 02 Aug › 27 Jul › 27 Jul 10:00–12:00` (a click on a
-> step goes back to it) and *1,345 of 9,950 alerts*. OVER TIME divides the
-> two hours into 24 bars of 5 minutes; the busiest, 10:30–10:35, has 373
-> alerts. SEVERITY counts 6 critical, 784 high and 555 medium, ENGINE Sigma
-> 1,339 and Yara 6, and FLOW leads Suspicious Encoded PowerShell Command
-> Line (766) to `powershell.exe` (767 in all) and Registry Run Key
-> Persistence (506) mostly to `MsMpEng.exe` (539 in all). The range stands
-> as a chip under the filter bar (*1345 of 9950*), and the table lists those
-> alerts, newest first.
-
----
-
-### Detonation Results
-
-<table>
-<tr>
-<td width="50%">
-<p align="center">
-  <img src="static/detonation_results.png" alt="Detonation results: injectsim.exe" width="100%">
-</p>
-</td>
-<td width="50%">
-<p align="center">
-  <img src="static/detonation_beaconing.png" alt="Detonation results: beaconsim.exe" width="100%">
-</p>
-</td>
-</tr>
-</table>
-
-> **Left:** `injectsim.exe` is **MALICIOUS (6.54)**. It exited before the
-> live scan, so the verdict comes from its exit-time memory dump: a PE image in
-> private memory (reflective load), a `beacon.x64.dll` string and a private RWX
-> region. Every finding shows its evidence class, confidence and why its weight
-> was reduced (uncorroborated, group cap). Below: the exit dump summary
-> (modules, regions, emulation on ARM64) and the images extracted from memory,
-> each with Map/Hex shortcuts.
->
-> **Right:** `beaconsim.exe` is **SUSPICIOUS (3.8)**: Sysmon network events show
-> 8 connections to the same endpoint every 2.0 s (robust CoV 0.00), and that
-> rhythm corroborates the in-memory signature hits from Aether (3 of 3 samples)
-> and the exit dump.
-
----
-
-### Tracing Console & Alert Detail
-
-<table>
-<tr>
-<td width="50%">
-<p align="center">
-  <img src="static/tracing.png" alt="Tracing console" width="100%">
-</p>
-</td>
-<td width="50%">
-<p align="center">
-  <img src="static/alert_detail.png" alt="Alert detail" width="100%">
-</p>
-</td>
-</tr>
-</table>
-
-> **Left:** The Tracing console for a process with 760 events: verdict badge,
-> a timeline split by event type, the process tree with alert counts ("time
-> from start"), and the verdict table. Tabs filter HTTP, connections, DNS,
-> files, registry, artifacts and modules.
->
-> **Right:** A Sigma alert ("Suspicious Encoded PowerShell Command Line") with
-> the decoded rule description, pivots to the process and its parent in the
-> graph (opened at the alert's time, so a reused PID does not lead to the wrong
-> process), the full command lines and the Sigma match details (condition,
-> matched fields and patterns), loaded on demand.
-
----
-
-### Process Graph
-
-<table>
-<tr>
-<td width="50%">
-<p align="center">
-  <img src="static/graph_landing.png" alt="Graph landing page" width="100%">
-</p>
-</td>
-<td width="50%">
-<p align="center">
-  <img src="static/graph_tree.png" alt="Process tree with detail panel" width="100%">
-</p>
-</td>
-</tr>
-</table>
-<table>
-<tr>
-<td width="50%">
-<p align="center">
-  <img src="static/graph_isometric.png" alt="Isometric view" width="100%">
-</p>
-</td>
-<td width="50%">
-<p align="center">
-  <img src="static/graph_force.png" alt="Force-directed view" width="100%">
-</p>
-</td>
-</tr>
-</table>
-
-> **Top left:** The landing page lists submitted and scanned samples with their
-> scan verdicts (executed samples open their process tree) and the processes
-> worth investigating — only processes attributed to a submission are marked
-> *detonated*.
->
-> **Top right:** Process tree around an `explorer.exe` instance
-> (`7420@1785739535` — an earlier holder of PID 7420): ancestors above, children
-> below. The detail panel shows image, status, activity counters, signature
-> check and the children.
->
-> **Bottom:** The same kind of tree in the isometric view (sibling spines,
-> hexagon nodes coloured by detonation/severity, foldable subtrees, activity
-> icons per process; remote threads are drawn as raised bridges) and as a
-> force-directed layout.
-
----
-
-### PE Analysis, Hex Editor & File Map
-
-<table>
-<tr>
-<td width="50%">
-<p align="center">
-  <img src="static/pe_header_analyzer.png" alt="PE header analysis" width="100%">
-</p>
-</td>
-<td width="50%">
-<p align="center">
-  <img src="static/pe_packing_analysis.png" alt="Packing analysis" width="100%">
-</p>
-</td>
-</tr>
-</table>
-<table>
-<tr>
-<td width="50%">
-<p align="center">
-  <img src="static/pe_section_inspect.png" alt="Section inspection" width="100%">
-</p>
-</td>
-<td width="50%">
-<p align="center">
-  <img src="static/hex_editor.png" alt="Hex editor" width="100%">
-</p>
-</td>
-</tr>
-</table>
-<p align="center">
-  <img src="static/file_map.png" alt="File map" width="100%">
-</p>
-
-> **PE header analysis** of `injectsim.exe`, scrolled to the lower part of the
-> panel: the last three IOC flags (code-injection APIs, a `.tls` section
-> matching a packer name, two TLS callbacks), file/optional headers with an
-> invalid checksum, security features, and the start of the section table
-> with its entropy bars.
->
-> **Packing analysis** of `capa.exe` (a PyInstaller bundle, 35 MB): Detect-It-Easy
-> style cards (linker, 36 MB data overlay at entropy 8.00), entropy map and
-> file layout — almost the whole file is overlay.
->
-> **Section inspection:** `.text` of `injectsim.exe` with hex dump and
-> extracted strings (`beacon.x64.dll`).
->
-> **Hex editor:** structure minimap above the dump (sections and data
-> directories), selected byte at offset 0x40 decoded by the data inspector.
->
-> **File map:** byteplot, local entropy and PE structure planes of
-> `injectsim.exe` side by side with the legend; clicking a plane jumps to the
-> offset in the hex editor.
-
----
-
-### Rizin (Reverse Engineering)
-
-<p align="center">
-  <img src="static/rizin.png" alt="Rizin tab: pipesim.exe at the instruction that loads the pipe name string, in DISASSEMBLY and GRAPH, the console after iz~msagent, axt and a seek" width="100%">
-</p>
-
-> The **Rizin** tab (Telemetry) with `pipesim.exe`, the harmless named-pipe
-> test program, opened from its path in `C:\Users\Public\Downloads` on the VM
-> (the OPEN ▾ menu also takes a submitted sample, a dump or an upload). The
-> toolbar shows the path, *PE64 · x86-64 · 186.5 KB*, the shortened SHA256 and
-> *analysed (aaa) 3.3 s*; FUNCTIONS lists the 127 functions Rizin found, with
-> `fcn.140001000` marked. DISASSEMBLY shows that function around 0x1400010a7
-> (marked, SEEK says the same): the `lea r8` that loads the pipe-name string
-> `\\.\pipe\msagent_%04x%02x`, among calls (pink), the imports of
-> `KERNEL32.dll` and the C runtime (amber). GRAPH beside it draws the
-> function's 31 blocks, here the block that starts at 0x140001067 (marked).
-> Below, the CONSOLE shows how the view got there: `iz~msagent` finds the
-> string at 0x140026056, `s 0x140026056` seeks to it, `axt` lists its only
-> reference (`fcn.140001000` at 0x1400010a7) and `s 0x1400010a7` follows it;
-> the prompt `[0x1400010a7]>` stands at the place the views show.
-
----
-
-### Live Process Memory
-
-<p align="center">
-  <img src="static/live_memory.png" alt="Live process memory" width="100%">
-</p>
-
-> The **LIVE PROCESS MEMORY** panel of the ThreatScan tab with the **SCAN
-> HISTORY** under it. The panel takes a PID, or a name to look up, and offers
-> Aether scan (set to 3 samples, 3 s apart), Dump memory, the host
-> baseline (explorer.exe, svchost.exe, msedge.exe, with CAPTURE and CLEAR; the
-> baseline holds 575 keys, updated 2026-10-20) and the whole-system sweep
-> buttons; no scan is running. Below, the score history plots every scan of
-> the history as a point (clean 29, suspicious 12, detected 3, no verdict 17
-> of the 61 entries; the dashed lines mark SUSPICIOUS at 2 and MALICIOUS at
-> 6), and the list gives each entry's time, scanner, target and verdict with
-> its score. A click on an entry or a point opens its details. An Aether
-> result as the scan shows it (hits by category, the baseline, MITRE
-> techniques) is drawn in the detonation results (LIVE MEMORY above) and
-> after a scan started here.
-
----
-
-### Named Pipes
-
-<p align="center">
-  <img src="static/pipes_tab.png" alt="Pipes tab: events and an interception session" width="100%">
-</p>
-
-> **Pipes tab:** PIPE EVENTS lists the Sysmon pipe events of the last hour on
-> the VM (12 events on 2 pipes when the screenshot was taken: `powershell.exe`
-> connecting to `\wkssvc` and `\DAV RPC SERVICE`; the pipe events of the
-> `pipesim.exe` detonation are no longer in the Sysmon log, so a filter on
-> its pipe finds none). Below, the interception session list and
-> the session `\msagent_5e62b5` (pattern `\msagent_`, armed with a prefix
-> match before the detonation, mode observe, 10:51:35 to 10:53:05): it took
-> the new pipe and relayed the whole run (1 connection, 58 messages, 446 B
-> recorded; `beacon n` client → server and `task n` server → client, hex and
-> ASCII, every one PASSED), and the sample exited normally. The notice
-> above the messages says the upstream connect landed on the proxy's own
-> instance once and was retried.
-
-<p align="center">
-  <img src="static/detonation_pipes.png" alt="Detonation results: NAMED PIPES section" width="100%">
-</p>
-
-> **NAMED PIPES** in the detonation results of `pipesim.exe` (the run of
-> 11 Nov): one pipe, `\msagent_4872a0`, created by the sample (PID 7824) and
-> connected by PID 7184, flags *C2 default name*, *cross-process* and
-> *random name*, family Cobalt Strike. The 3 findings enter the memory
-> evidence (source `sysmon-pipes`, verdict **MALICIOUS** together with the
-> memory findings), and **Intercept** opens the Pipes tab with an attach form
-> for this pipe.
-
----
-
-### Sysmon & ETW
-
-<table>
-<tr>
-<td width="50%">
-<p align="center">
-  <img src="static/sysmon_events.png" alt="Sysmon events" width="100%">
-</p>
-</td>
-<td width="50%">
-<p align="center">
-  <img src="static/sysmon_correlation.png" alt="Sysmon event correlation" width="100%">
-</p>
-</td>
-</tr>
-</table>
-<p align="center">
-  <img src="static/etw_browser.png" alt="ETW browser" width="100%">
-</p>
-
-> **Sysmon:** the 500 newest events. **EVENTS OVER TIME** stacks
-> them by event type in bars of a few seconds, **PROCESS → EVENT TYPE** shows
-> who raised them (`python.exe`, the web UI itself, 395, nearly all of them
-> pipe events; then `wevtutil.exe` 45, `tasklist.exe` 33, `sc.exe` 20,
-> `powershell.exe` 6 and `rustinel.exe` 1). Under the filter
-> bar the type counters (PipeConnected 201, PipeCreated 198, ProcessCreate
-> 100, FileCreate 1) and the table with command lines and the Windows
-> Event IDs each Sysmon event corresponds to; the detail view (right, for a
-> `wevtutil.exe` ProcessCreate) lists the correlated Security events 4688
-> and 4689.
->
-> **ETW browser:** the Sysmon channel with one event expanded (a Process
-> Create of `wevtutil.exe`); all fields of the event are shown, suspicious
-> values are highlighted.
-
----
-
-## API Reference
-
-All endpoints served on port `9000`. Responses are JSON.
-
-### Core
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/alerts` | All detection alerts (Rustinel + Fibratus + LitterBox). gzip + ETag; `raw` omits fields duplicated at top level (`raw_trimmed: true`). Filters: `severity`, `engine`, `pid`, `since` (ISO-8601), `detonated=true`, `limit` (newest first) |
-| GET | `/api/alerts/<id>` | One alert with its complete raw event |
-| GET | `/api/processes` | Tracked processes with activity counts. Params: `max` (0 = all), `min_threats` (default 1), `sort` (`threats`/`recent`/`severity`), `detonated`, `include_parents` |
-| GET | `/api/processes/<key>` | One process instance with its alerts. `<pid>` = newest process with that PID, `<pid>@<start epoch>` = an earlier one |
-| GET | `/api/sessions` | Alerts grouped into activity bursts (summaries + alert ids). Params: `gap` (s, default 600), `limit` |
-| GET | `/api/status` | Service health status (all components) |
-| GET | `/api/health` | Liveness probe |
-| POST | `/api/service/launch` | Start a service/tool. Param: `service` |
-| GET | `/api/service/configs` | Detected service launch configurations |
-| GET | `/api/rustinel` | Rustinel engine info (rules, version) |
-| GET | `/api/submissions` | Submission history (last 200) |
-
-### Submission & Detonation
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/submit` | Submit sample (multipart). Params: `file`, `target` (agent/litterbox/both) |
-| GET | `/api/detonation/results` | Poll results. Params: `sha256`, `pid`, `litterbox_hash`, `filename` |
-
-### Process Graph
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/process-graph` | Ancestors + descendants of a process with network, DNS, file, registry, injection and named pipe (`pipes`, `pipes_truncated`, `pipes_error`) events. Params: `pid` (PID or instance key), `at` (ISO time: the process that had the PID then), `down_depth` (0 = all), `up_depth`, `max_nodes` |
-| GET | `/api/process-graph/roots` | Candidate focus processes (detonated / most alerts) |
-| GET | `/api/graph/samples` | Submitted and scanned files with their scan verdicts |
-| GET | `/api/pipes` | Sysmon named pipe events (EID 17/18) with catalog family. Params: `pid`, `key` (process instance key; window defaults to its lifetime), `since` (default: one hour ago), `until`, `name` (case-insensitive substring; a leading `\` anchors it at the start of the pipe name), `max` |
-
-### Named Pipe Interception
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/pipes/intercept` | Interception sessions (live and ended), newest first |
-| POST | `/api/pipes/intercept` | Start a session → 201 session (state `starting` until the first upstream is open, then `active`; `armed` while an arm session waits) / 400 error. JSON: `pattern` (required), `mode` (`observe`/`hold`), `how` (`attach`/`arm`), `match` (`exact`/`prefix`/`regex`), `squat` (arm + exact only), `max_duration` (default 600 s, at most 3600), `hold_timeout` (default 30 s, at most `max_duration`; both finite), `pipe_mode` (`byte`/`message`; skips probing the real server). Refused (400): `\lsass`, `\ntsvcs`, `\protected_storage`, `\lsarpc`, `\samr`, `\netlogon`, `\svcctl`, `\epmapper`, `\InitShutdown`; arm + exact for a pipe that already exists. 429 with 16 live sessions; 413 for a body over 2 MiB |
-| GET | `/api/pipes/intercept/<sid>` | One session (state, target, connection and message counts, `self_connect_retries`: upstream connects that landed on the proxy's own instance and were retried) |
-| DELETE | `/api/pipes/intercept/<sid>` | End a session; held messages are forwarded, both ends are closed |
-| GET | `/api/pipes/intercept/<sid>/messages` | Recorded messages (`seq`, `conn`, `dir` `c2s`/`s2c`, `data_b64`, `state`: `held`, `passed`, `auto_passed`, `edited`, `dropped`, or `write_failed` when relaying a decided message failed). Params: `after` (seq), `limit` (default 200, max 1000) |
-| POST | `/api/pipes/intercept/<sid>/messages/<seq>` | Decide a held message. JSON: `action` (`forward`/`drop`/`edit`), `data_b64` (for `edit`) |
-| POST | `/api/pipes/intercept/<sid>/release` | Forward every held message → `{"released": n}` |
-| GET | `/api/pipes/intercept/<sid>/export` | Session and all messages as a JSON attachment |
-
-Windows hands a connecting client the oldest free instance of a pipe, whoever owns it. Once a session is `active` the proxy keeps that a proxy instance: when a client arrives it first creates its next listening instance and only then connects upstream for this client, so the connect takes the real server's current spare and the server's next spare is younger than the proxy's. Only before the first client is an upstream opened in advance (that is what the `starting` state waits for); it consumes the server instance that predates the session, and right after the first client one more upstream is opened and closed at once to consume the spare the server created for it. After that the server never holds an idle proxy connection. If an upstream connect lands on the proxy's own instance instead (the instance's client process id is the web UI's), the proxy closes it, gives the server a moment to create its next instance (backing off up to 1 s) and retries with a fresh instance; each such episode counts once in `self_connect_retries`. Without `pipe_mode`, the proxy reads the real server's pipe mode from a throw-away instance of its own (Windows gives every instance the type of the first one), so the probe never takes one of the server's instances; passing `pipe_mode` skips it. Only one live session may own a pipe: a second session for the same exact name is refused (400), and armed prefix/regex watchers skip pipes another session owns, because one session's upstream connect could otherwise land on the other's listening instance. Not intercepted are connections that existed before the session started or were made while it was `starting`, and a client that connects in the instant in which no proxy instance is listening (during a self-connect retry, or while the real server had no free instance).
-
-### Hex Editor & Binary Analysis
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/file/hex` | Hex dump. Params: `path`, `offset`, `bytes` |
-| POST | `/api/file/hex/upload` | Upload file for hex viewing |
-| POST | `/api/file/hex/write` | Patch bytes (JSON: `path`, `offset`, `bytes`); analysis folders only |
-| GET | `/api/file/download` | Download a file as attachment. Param: `path` |
-| GET | `/api/file/signature` | Authenticode signer and trust. Param: `path` |
-| GET | `/api/file/pe/section` | One PE section: hex dump and strings. Params: `path`, `index`, `max_bytes` |
-| GET | `/api/file/pe` | PE header analysis. Param: `path` |
-| GET | `/api/file/elf` | ELF binary analysis. Param: `path` |
-
-### Rizin
-
-One rizin session per opened file and browser tab (RIZIN tab). Addresses are integers in answers; in requests `addr` is decimal or `0x…`. Errors: 400 `{"refused": reason}` for invalid input, a refused console command or a file that cannot be opened (missing, empty, a folder); 403 for a UNC path or a path outside the folders that `/api/file/download` serves too (which include the uploads in `%TEMP%\rizin_uploads`); 404 `{"error": "session ended"}` (with `reason` when rizin stopped during that request); 409 `{"busy": true, "step"}` while an analysis step or another request has rizin (views wait about 2 s first), `{"moved": true}` once the file was opened in another tab, or `{"superseded": true}` for an open that a newer open of the same tab overtook; 500 `{"error"}` when rizin could not open the file ("rizin could not open the file: …"), answered something unexpected ("rizin answered something unexpected: …") or answered one of the three lists that are filtered on the server (strings, imports, flag names) with more than 32 MB ("too many strings to list here …: filter them in the console") or answered more than the limit of the command it ran ("rizin's answer to pdfj is larger than 67108864 bytes": 64 MB for the disassembly or the decompiler of one function, 256 MB for every other view), or a file on the VM could not be read or written (a full disk: "a file could not be read or written on the VM: …", "the upload could not be stored: …"); 503 `{"error": "rizin not installed", "path"}`.
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/rizin/status` | `installed`, `path` (`TDC_RIZIN`), `version`, `ghidra` (rz-ghidra loads) |
-| GET | `/api/rizin/files` | What the tab can open, existing non-empty files only: `submissions` (`filename`, `path`, `sha256`, `time`), `dumps` under `C:\dumps` (newest 500) and `uploads` (`name`, `path`, `size`) |
-| POST | `/api/rizin/upload` | Upload a file (multipart `file`) to `%TEMP%\rizin_uploads` → `{"path"}` |
-| POST | `/api/rizin/open` | Open a file. JSON: `path`, `tab` (browser tab ID) → `session`, `file` (`path`, the real one that was checked, `sha256`, `size`, `format`, `arch`, `bits`), `analysis`. A new file replaces the tab's session; the same file in another tab moves its session there, and while its session still closes it waits for that session's last save |
-| GET | `/api/rizin/<sid>/status` | `analysis` (`state`, `step`, `done_steps`, `level`, `elapsed`, `note`), `seek`, `function`, without asking rizin |
-| POST | `/api/rizin/<sid>/analyze` | Start the full analysis (aaa's steps one by one) → `analysis`. Between two steps the session pauses about 2 s, longer while requests use rizin (at most about 10 s), and answers requests; `step` is `null` then |
-| POST | `/api/rizin/<sid>/close` | End the session (also the page's `sendBeacon` on pagehide) → `{"closed": true}` |
-| GET | `/api/rizin/<sid>/functions` | `[{name, offset, size, nbbs}]` by address, read from rizin's `afl` (its row is about 63 B, while `aflj` carries about 2.7 KB per function); at most 200 000 of them, a line that is no row left out |
-| GET | `/api/rizin/<sid>/disasm` | The function around `addr` from its start (the first page reaches `addr`), linear outside functions → `function`, `ops` (`offset`, `size`, `text`, `type`, `jump`, `comment`), `more` (outside functions not after a page of only invalid instructions; the RIZIN tab stops the linear disassembly after 2000 lines). Params: `addr`, `count` (default 400, at most 2000), `after` (the next page) |
-| GET | `/api/rizin/<sid>/graph` | Basic blocks of the function around `addr` → `function`, `offset` (its entry), `nodes` (`offset`, `size`, `lines`, `jump`, `fail`, `cases`; edges only between its blocks) |
-| GET | `/api/rizin/<sid>/decompile` | rz-ghidra's C for the function around `addr` → `available`, `reason`, `function`, `lines` (`text`, `offset` as `pdgo` shows it, `offsets`: every address of the line). `pdgj` may take up to 120 s (`DECOMPILE_TIMEOUT`); over it rizin is stopped and the session ends: 404 with `reason` "Decompiling took too long, the session ended." |
-| GET | `/api/rizin/<sid>/hex` | Bytes at `addr` → `offset`, `bytes`, `paddr` (where they are in the opened file, from rizin's map there; `null` where no byte of the file is: a zero-filled part, no map, past the end). Param: `len` (default 512, at most 4096) |
-| GET | `/api/rizin/<sid>/xrefs` | References to `addr` and from it; at a function's entry from the whole function → `scope`, `function`, `to`, `from` (`from`, `to`, `type`, `text`, `function`), `truncated` (over 500) |
-| GET | `/api/rizin/<sid>/strings` | Strings, filtered and paged on the server → `total`, `items` (`offset`, `string`, `length`, `section`, `type`), `truncated` (rizin listed more than 200 000: the rest is left out). Params: `q`, `offset`, `limit` (default 200, at most 1000) |
-| GET | `/api/rizin/<sid>/imports` | Imports, filtered (name or library) and paged → `total`, `items` (`offset`, `name`, `library`, `type`, `ordinal`), `truncated`. Params: `q`, `offset`, `limit` |
-| GET | `/api/rizin/<sid>/flags` | Flag names for the console's Tab: those that start with `q` (any case), sorted → `total`, `names` (at most `limit`, default and most 200), `common` (the start all of them share, also those past `limit`), `truncated` (of more than 200 000 flags the rest is left out; of a `flj` over 32 MB none at all: `names` is empty and `common` is `""`, so Tab then lists the names of the tab's function list without completing one). rizin is asked again after a console command, a rename, a comment or an analysis step; requests that come while it is asked wait for that answer |
-| POST | `/api/rizin/<sid>/seek` | JSON: `addr` (a number, `0x…`, or a function or flag name) → `seek`, `function` |
-| POST | `/api/rizin/<sid>/console` | Run a rizin command. JSON: `cmd` → `output` (ANSI colours), `seek`, `function`, `truncated` (about 1 MB), `changed` (it renamed or commented). Allowlist on the server: no shell, no files, no other files opened, no debugging |
-| POST | `/api/rizin/<sid>/rename` | Rename the function at `addr`. JSON: `addr`, `name` → `offset`, `name`; kept in the project |
-| POST | `/api/rizin/<sid>/comment` | Comment at `addr` (an empty `text` removes it). JSON: `addr`, `text` → `offset`, `comment`; kept in the project |
-| GET | `/api/rizin/<sid>/comment` | The comment at `addr` as the disassembly shows it → `offset`, `comment` (`""` without one); the right-click menu's Comment… field reads it where the disassembly has not loaded the address |
-
-### Sysmon
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/sysmon` | Sysmon events. Params: `max`, `event_id`, `pid`, `parent_pid`, `since`, `until` |
-| GET | `/api/sysmon/stats` | Sysmon statistics and diagnostics |
-
-### ETW Browser
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/etw/channels` | List available channels. Param: `probe=true` adds availability status |
-| GET | `/api/etw/events` | Query events. Params: `channel`, `max`, `since`, `filter` |
-
-### Scanner
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/scan/threatcheck` | ThreatCheck scan. Params: `file`/`path`, `engine`, `type` |
-| POST | `/api/scan/defendercheck` | DefenderCheck scan. Params: `file`/`path` |
-| POST | `/api/scan/ember` | EMBER2024 ML score. Params: `file`/`path`, `model`, `threshold` |
-| POST | `/api/scan/capa` | capa capability detection (ATT&CK/MBC). Params: `file`/`path` |
-| GET | `/api/scan/status` | Tool availability (ThreatCheck, DefenderCheck, EMBER2024, capa, Aether, Process Dump, Exit Capture) |
-| GET | `/api/scan/history` | Static scan timeline, newest first; each entry's `exists` says whether its file (`result.filepath`) is still there for the RIZIN tab (inside the folders the download serves, not empty). Param: `limit` |
-| POST | `/api/scan/history/clear` | Clear the scan timeline |
-| POST | `/api/scan/beacons` | Hunt-Sleeping-Beacons. Param: `pid` (omit for all) |
-| POST | `/api/scan/beaconeye` | BeaconEye (Cobalt Strike configs). Param: `pid` (omit for all) |
-
-### Live Memory
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/api/scan/aether` | Aether scan of a PID, scored. Params: `pid`, `samples` (1-10), `interval` (s) |
-| POST | `/api/scan/processdump` | Dump a PID's memory components. Params: `pid` or `system`, `ignore_clean_db` |
-| POST | `/api/memory/evidence` | Re-score all cached memory results for a PID across sources. Params: `pid` |
-| GET / DELETE | `/api/memory/baseline` | Host memory baseline statistics / clear it. `stale: true` means it was built with an older key scheme and is ignored until captured again |
-| POST | `/api/memory/baseline/capture` | Record findings of named processes as baseline. Params: `names`, `samples` |
-| POST / GET | `/api/memory/sweep` | Background sweep of every process (`aether`, `processdump`, `baseline`) / status + result |
-| GET / POST | `/api/processdump/baseline` | Process Dump clean-hash database status / build it (`mode`: `gen`, `genquick`) |
-| GET | `/api/process/lookup` | Running PIDs by image name. Params: `name` |
-| GET | `/api/file/visualize` | File map planes + structure + import/export trees. Params: `path`, `cols`, `rows` |
-
-### Proxy Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET/POST | `/api/litterbox/<path>` | Proxy to LitterBox API (:1337) |
-| GET/POST | `/api/agent/<path>` | Proxy to DetonatorAgent (:8080) |
-| GET/POST/PUT/DELETE | `/api/detonator/<path>` | Proxy to Detonator |
-
-Proxied responses are only relayed as data (JSON, text, binary); HTML is served as plain text.
-
-### Tool Updates
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/updates` | Update state: `mode` (`idle`/`checking`/`updating`), `checked_at`, one entry per tool (`installed`, `available`, `status`, `pinned`, `detail`, `log`), `progress`, `last_run` |
-| POST | `/api/updates/check` | Start an update check in the background (202; 409 while a check or install runs) |
-| POST | `/api/updates/apply` | Install updates. Body: `tools` (list of tool ids or `"all"` alone), `include_pinned` (default `false`). 202; 400 for a bad body, unknown ids or `"all"` mixed into a list; 409 with the reason while a detonation, memory sweep or process dump runs. While an install runs, POST/PUT/PATCH/DELETE requests elsewhere answer 503 (`maintenance: true`) |
-
-### Logs
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/logs/search` | Search the log store with an SPL-like query. Params: `q` (default `*`), `earliest` (default `-24h`; `-15m`, `-2h`, `now` or ISO-8601), `latest`, `limit` (1-1000, default 200). 200 with `type` (`events`, `table` or `timechart`), `events`, `columns`, `rows`, `count`, `matched`, `truncated`, `histogram`, `fields` and `took_ms`; 400 with `error` and `pos` (index in the query) for a query or time that cannot be read; 500 with a general `error` for anything else. Every request is itself logged (`access`; `mcp` too when the MCP server made it), polling paths with `poll=true` |
-| GET | `/api/logs/event/<id>` | One event of the log store in full (`id`, `time`, `source`, `message`, `fields`). A search response cuts every string at 64 KB and marks the event with `truncated_fields: true`; this route has the whole text. 404 with `error` when the event has left the store |
-| GET | `/api/logs/sources` | The six sources (`powershell`, `access`, `mcp`, `netflow`, `dns`, `firewall`): `count`, `last_time`, `status` (`ok` or `unavailable`) and `hint` (why a source is unavailable) |
-
-### Firewall
-
-Times are ISO-8601 UTC text; a flow's `times` is a list of epoch seconds. Errors are `{"error": ...}` with 400 (malformed), 404, 409 (refused: the Windows Firewall is off, a lockout, a block that could not be verified) or 500. Every action is an `access` event in the LOGS tab — the ones TDC takes by itself under `/internal/firewall/block`, `/internal/firewall/decide` and `/internal/firewall/fetch`, each with `by` (`detector`, `analyst` or `deadline`), the endpoint, the URL, the User-Agent that was sent and the outcome.
-
-ISOLATED blocks the default way out and switches off Windows' own outbound Allow rules; what still gets out is in `allowed_out`. TDC's own fetch is let out one address at a time, only while it runs (`TDC-FW-ISO-fetch-*`, one rule per binary the fetch can run as, removed when the fetch ends, retried at every collector round, and swept at start-up and once a minute for a rule a crash left behind); what that leaves open is in `residual` of `GET /api/firewall/isolate`. A rule that could not be removed again is named in `fetch_paths_open` there, on the capture (`allow_closed`: `true` gone, `false` still standing with `close_problem` saying why, `null` nothing to close because ISOLATED is off, or because ISOLATED is on but the fetch gave up waiting for a sweep (or for the removal of that endpoint's rules) and opened none, with `allow_problem` saying so) and as an `/internal/firewall/allow` event in LOGS.
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/firewall/connections` | Bundled flows with `tags`, `severity`, `geo` (`scope`, `cc`, `country`, `lat`, `lon`, `asn`, `as_org`), `state` (`allowed`, `blocked`, `pending`), `rule_id`, `capture_ids`. Params: `since`, `until` (ISO-8601 or epoch), `process` (substring of the image), `tag`, `state`, `max` (1-5000, default 500). Also `count`, `truncated`, `rules_error` (why the rules could not be read; nothing is then claimed as blocked), `isolated`, `ask_mode`, `sources` |
-| GET | `/api/firewall/summary` | Totals, blocked and pending flows, top processes, endpoints and countries of the same window, plus `open_decisions`, `captures_total`, `geo_available` |
-| GET | `/api/firewall/geo` | One offline lookup: `ip` gives `{ip, geo, available}` |
-| GET | `/api/firewall/rules` | The `TDC-FW-*` rules that stand, one entry per rule: `rule_id`, `kind`, `image`, `ip`, `port`, `protocol`, `key`, `blocking`, `cuts` (true only for `TDC-FW-ISO-cut` standing as the catch-all Block) |
-| POST | `/api/firewall/block` | `{scope, image, ip, port, protocol}`. `endpoint`: this program to `ip`; `endpoint_all`: every program, TDC's fetcher included; `process`: `image` anywhere. 409 while a firewall profile is off |
-| POST | `/api/firewall/unblock` | `{rule_id}`; every rule that shares its key is removed |
-| GET / POST | `/api/firewall/isolate` | GET: `isolated`, `stage` (`open`, `cut`, `isolated`, `cut_policy`), `converging` (the background worker runs), `converge_note` (what its last round said, or why it failed), `verified` (`null` while not isolated; in `cut` and `cut_policy` the cut rule read back and, read again within 10 s, still standing as written; in `isolated` Block in force on every profile and `allowed_out` empty; false in every stage while a profile is off or unreadable), `can_fetch` (always `false` in `cut` and `cut_policy`; `null` when not known), `outbound_before`, `isolated_since`, `profiles_off`, `startup`, `residual`, `allowed_out` (in `isolated` and `cut_policy`: Windows' own outbound Allow rules still enabled, read back, each `{name, display, group, source, local}`; `null` while ISOLATED is off, in stage `cut` on purpose, or when `allowed_out_error` says it could not be read), `allow_disabled` (how many rules ISOLATED holds switched off), `fetch_paths_open`, `fetches_in_flight`. The PowerShell reads behind it are cached: `profiles_off` for 60 s, but for 10 s while ISOLATED is on or after an error; `allowed_out` for 10 s; in the cut stages the read of the cut rule for 10 s (the rule list the tab polls counts as one). `profiles_off` and `allowed_out` are read again after every enforcement route. POST `{on: true}`: cut (409 while a profile is off); answers after the cut with `stage: "cut"`, `rule_id`, `verified` (the cut rule read back by this press), `converging`, `outbound_before`, `note` and `state` (the GET above). POST `{on: false}`: leave from any stage, stopping the worker at its next step (the answer can wait for the call it is in); the answer has `cut_removed`, `outbound_after`, `allow_disabled` (rules that would not switch on again), `note` and `state` |
-| GET | `/api/firewall/pending` | `pending` (open decisions with `remaining` seconds and `can_fetch`: `false` while the cut stands or a block for every program stands on the endpoint, so CUT + FETCH is refused and the deadline only blocks; `null` when the rules cannot be read) and `history` (the last 24 h), `ask_mode`, `decide_seconds`, `isolated`, `startup` (`{id, announce, note}` of this server start, `null` until it was read: the toast on every tab) |
-| POST | `/api/firewall/decide` | Exactly `{id, action}` (`allow`, `block`, `block_fetch`); no URL is ever taken. An id works once, a second answer gets the decision that was taken. `block_fetch` is refused with 409 while the cut stands (no Allow exception gets through the catch-all Block rule) or a block for every program stands on the endpoint |
-| POST | `/api/firewall/ask` | `{mode}`: `detonation`, `all` or `off` (kept on the server) |
-| POST | `/api/firewall/enable` | `{}`: switch the Windows Firewall on for every profile (TDC never does it by itself: it changes what the sample sees). `{enabled, profiles_off, state}`; 500 when a profile stays off |
-| POST | `/api/firewall/kill` | `{pid}`: `taskkill /PID <pid> /F` for a process with connections in the tab, never one of TDC's own (409). `{pid, killed, image}`; 500 when taskkill fails |
-| GET | `/api/firewall/captures` | The secured samples, newest first |
-| GET | `/api/firewall/capture/<id>` | One capture with its metadata and whether its file still exists |
-
----
-
-## MCP Server
-
-`mcp/server.py` exposes the lab to MCP clients (Claude Code, Claude Desktop, ...)
-over stdio. It talks to the web UI API, so the VM must be reachable.
-
-```
-make mcp-setup        # creates mcp/.venv (Python >= 3.10) from mcp/requirements.txt
-```
-
-`.mcp.json` in the repository root registers it for Claude Code; set `TDC_URL`
-there if the VM is not at `http://192.168.64.4:9000`.
-
-| Area | Tools |
-|------|-------|
-| Status | `tdc_status`, `tdc_service_launch`, `tdc_tools_status`, `tdc_rustinel_info` |
-| Tool updates | `tdc_updates_status`, `tdc_updates_check`, `tdc_updates_apply` |
-| Detonation | `tdc_submit_file`, `tdc_submissions`, `tdc_detonation_results`, `tdc_detonation_memory` |
-| Alerts | `tdc_alerts`, `tdc_alert_detail`, `tdc_sessions`, `tdc_search` |
-| Processes | `tdc_processes`, `tdc_process_detail`, `tdc_process_graph`, `tdc_process_lookup`, `tdc_powershell_activity` |
-| Events | `tdc_sysmon_events`, `tdc_sysmon_stats`, `tdc_etw_events`, `tdc_etw_channels` |
-| Static analysis | `tdc_scan_ember`, `tdc_scan_capa`, `tdc_scan_threatcheck`, `tdc_scan_defendercheck`, `tdc_scan_history` |
-| Files (paths in the VM) | `tdc_pe_analyze`, `tdc_pe_section`, `tdc_elf_analyze`, `tdc_file_signature`, `tdc_file_hex`, `tdc_file_map` |
-| Named pipes (read-only) | `tdc_pipes`, `tdc_pipe_sessions` |
-| Logs | `tdc_logs_search` |
-| Firewall (read-only) | `tdc_firewall_connections`, `tdc_firewall_captures` |
-| Live memory | `tdc_memory_scan`, `tdc_memory_dump`, `tdc_memory_evidence`, `tdc_memory_baseline`, `tdc_memory_sweep`, `tdc_memory_sweep_status`, `tdc_processdump_baseline`, `tdc_scan_beacons`, `tdc_scan_beaconeye` |
-
-Every request of the MCP server carries `X-TDC-Client: mcp` and
-`X-TDC-MCP-Tool: <tool name>`; the web UI logs them as `mcp` events, so a search
-such as `source=mcp | stats count by tool` shows what an MCP client did.
-
-Not exposed on purpose: byte patching (`/api/file/hex/write`), clearing the
-scan history, starting, stopping or steering pipe interception (forward, drop,
-edit), the raw service proxies, and everything of the FIREWALL tab that acts
-(block, unblock, ISOLATED, the ASK switch, answering a decision, KILL, turning
-the firewall on): a model must not take the chamber off the network or lift a
-block on its own.
-
----
-
-## Configuration
-
-### Environment Variables (Web UI)
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `RUSTINEL_ALERTS_DIR` | `C:\tools\rustinel\logs` | Rustinel NDJSON alert directory |
-| `RUSTINEL_INSTALL_DIR` | `C:\tools\rustinel` | Rustinel installation root |
-| `DETONATOR_API` | `http://127.0.0.1:8000` | Detonator REST API |
-| `DETONATOR_AGENT_API` | `http://127.0.0.1:8080` | DetonatorAgent API |
-| `LITTERBOX_API` | `http://127.0.0.1:1337` | LitterBox API |
-| `WEBUI_PORT` | `9000` | Web UI listen port |
-| `WEBUI_HOST` | `0.0.0.0` | Listen address (`127.0.0.1` = VM only) |
-| `TDC_ALLOWED_HOSTS` | — | Extra host names accepted in the `Host` header (comma-separated; IPs and `localhost` always work) |
-| `VM_WEBUI_URL` | — | Web UI of the VM, used by a host-side instance when it has no local Sysmon/alerts |
-| `TDC_VM_USER` / `TDC_VM_PASS` | — | WinRM credentials for starting VM services from a host-side instance |
-| `TDC_RIZIN` | `C:\tools\cutter\rizin.exe` | The rizin of the RIZIN tab (`scripts/install-rizin.ps1` installs it there) |
-| `TDC_SCRIPTS_DIR` | `C:\tdc\scripts` | Where the web UI finds the install scripts it runs for [tool updates](#tool-updates) |
-| `TDC_UPDATE_LOG` | `C:\tools\logs\tool-updates.log` | Log of the tool updates (off Windows: `tool-updates.log` next to `app.py`) |
-| `TDC_UPDATE_CHECK_HOURS` | `24` | Hours between the automatic update checks; `0` turns them off |
-| `TDC_GITHUB_TOKEN` | — | Optional GitHub token for the update checks, to avoid the API rate limit |
-| `TDC_LOG_DIR` | `webui/logs` (next to `app.py`) | Where the access and MCP logs of the LOGS tab are kept (`access.jsonl`, `mcp.jsonl`; 10 MB each, one older file) |
-| `TDC_FIREWALL_DECIDE_SECONDS` | `30` | Seconds an open download decision waits before TDC blocks and fetches by itself; `0` fetches at once, without asking (held to one hour) |
-| `TDC_FIREWALL_FETCH_LAN` | — | `1` lets the guarded fetch take a file from a **private** address (a lab whose stage 2 is served by an INetSim box). Refused by default: the analyst's own host is a private address away. This VM's own addresses and its gateways stay refused either way |
-
-### Custom Detection Rules
-
-**Sigma** (hot-reload):
-```
-C:\tools\detection-rules\rustinel-rules\dist\windows-advanced\rules\sigma\
-```
-
-**YARA** (hot-reload):
-```
-C:\tools\detection-rules\yara-combined\
-```
-
-**IOC Hashes** (hot-reload, add SHA-256 one per line):
-```
-C:\tools\detection-rules\rustinel-rules\dist\windows-advanced\rules\ioc\
-```
-
-### Sysmon Pipe Events
-
-`scripts/install-sysmon.ps1` rewrites the downloaded SwiftOnSecurity config:
-all `PipeEvent` include rules are replaced by one exclude group (image + pipe
-name pairs only) and the Sysmon log is set to 512 MB
-(`wevtutil sl Microsoft-Windows-Sysmon/Operational /ms:536870912`). Re-run it
-after updating the config:
-
-```bash
-python3 scripts/deploy-utm.py --vm-ip <vm> --vm-user tdc --vm-pass tdc --install install-sysmon.ps1
-```
-
-The pipe catalog `webui/pipe_signatures.json` is loaded once per web UI process; restart the
-web UI after editing it.
-
-### Defender Exclusions
-
-Provisioning adds exclusions for detonation paths. To fully disable for testing:
-
-```powershell
-# Inside VM, run as Administrator
-Set-MpPreference -DisableRealtimeMonitoring $true
-```
-
----
-
-## Detection Rules
-
-| Type | Source |
-|------|--------|
-| **Sigma** | `Karib0u/rustinel-rules` windows-advanced pack |
-| **YARA** | rustinel-rules + Elastic protections-artifacts (`C:\tools\detection-rules\yara-combined`) |
-| **IOC** | SHA-256 hashes, IPs, domains, path regexes; sample hashes are added on submission |
-| **Aether** | 380 in-memory signatures in `C:\tools\Aether\rules\` |
-
-The number of rules Rustinel actually loaded is shown on the Dashboard and by
-`GET /api/rustinel` / MCP `tdc_rustinel_info`.
-
----
-
-## File Structure
-
-```
-transportable-detonation-chamber/
-├── Makefile                        # Build system (macOS/Linux)
-├── make.ps1                        # Build system (Windows PowerShell)
-├── Vagrantfile                     # VM definition (Hyper-V)
-├── Vagrantfile.utm                 # VM definition (QEMU/UTM, Apple Silicon)
-├── README.md
-├── tdc-logo.png
-│
-├── static/                         # Screenshots for this README
-│
-├── mcp/
-│   ├── server.py                  # MCP server (49 tools, talks to the web UI API)
-│   └── requirements.txt           # mcp, httpx  (make mcp-setup)
-├── .mcp.json                      # Registers the MCP server for Claude Code
-│
-├── tests/                          # Unit tests (make unit-test), run by GitHub Actions
-│   ├── samples/pipesim.c          # Harmless named-pipe test sample (build with zig cc)
-│   └── fake_rizin.py              # Stands in for rizin's pipe mode in the RIZIN tests
-│
-├── webui/                          # Unified Web UI
-│   ├── app.py                     # Flask backend (APIs, proxying, PE/ELF analysis)
-│   ├── memory_evidence.py         # Tool-independent scoring of memory findings
-│   ├── minidump_analysis.py       # Offline analysis of exit-time minidumps
-│   ├── memory_results/            # Persisted live-memory results (git-ignored)
-│   ├── pipe_analysis.py           # Pipe attribution, flags, evidence and baseline keys
-│   ├── pipe_signatures.json       # Named-pipe catalog (C2 defaults, tools, APT pipes)
-│   ├── pipe_proxy.py              # Interception engine (sessions, hold queue, recording)
-│   ├── pipe_backends.py           # Win32 (ctypes) and in-memory fake pipe backends
-│   ├── pipe_sessions/             # Ended interception recordings (git-ignored)
-│   ├── log_search.py              # LOGS tab: SPL-like search language (parser, evaluator, pipes)
-│   ├── log_store.py               # LOGS tab: event ring buffer, source parsers, incremental collector
-│   ├── logs/                      # Persisted access and MCP logs, JSONL (git-ignored)
-│   ├── rizin_sessions.py          # RIZIN tab: rizin processes, console allowlist, analysis steps, projects
-│   ├── rizin_projects/            # Renames and comments per file, <sha256>.rzdb (git-ignored)
-│   ├── tool_updates.py            # Tool Updates: tool catalog and update checks
-│   ├── firewall.py                # FIREWALL tab: bundling and tagging of connections (pure, no I/O)
-│   ├── firewall_store.py          # FIREWALL tab: connection ring, collector, download findings, decisions, settings
-│   ├── firewall_rules.py          # FIREWALL tab: TDC-FW-* rules, ISOLATED, kill (through firewall_rules.ps1)
-│   ├── firewall_rules.ps1         # One firewall verb per call, values as -File parameters
-│   ├── firewall_fetch.py          # FIREWALL tab: the guarded fetch of a stage-2 file
-│   ├── geoip.py                   # Offline IP -> country / AS lookup
-│   ├── data/                      # Offline geo index (iptoasn.com, CC0) and country centroids; `make geoip` refreshes it
-│   ├── memory_baseline.json       # Host memory baseline (git-ignored)
-│   ├── dev_server.py              # Dev server with live-reload
-│   ├── requirements.txt           # Python deps (flask, requests, watchdog, pefile)
-│   ├── templates/
-│   │   └── index.html             # SPA with all tabs + Help modal
-│   └── static/
-│       ├── css/style.css          # Base styles and the Telemetry palette (every colour a variable in :root)
-│       ├── css/theme-layout.css   # Window layout and controls, shared by both themes ([data-theme])
-│       ├── css/theme-cyberpunk.css # Cyberpunk palette, scoped to [data-theme="cyberpunk"]
-│       ├── js/app.js              # Frontend logic (single file, no build step)
-│       ├── data/world.json        # Land mask of the FIREWALL map (Natural Earth 110m, public domain)
-│       └── icon.png               # Logo
-│
-├── config/
-│   ├── rustinel-config.toml       # Rustinel config (sigma/yara/ioc paths)
-│   ├── fibratus.yml               # Fibratus config (JSON eventlog output)
-│   └── profiles_init.yaml         # Detonator target profiles
-│
-├── rules/                          # Detection rules (copied to VM)
-│
-├── scripts/                        # Provisioning scripts
-│   ├── install-prerequisites.ps1  # .NET 8, Python 3.12, Git, 7-Zip
-│   ├── install-sysmon.ps1         # Sysmon (ARM64-aware; PipeEvent in exclude mode, 512 MB log)
-│   ├── install-fibratus.ps1       # Fibratus v3.0.0
-│   ├── install-rustinel.ps1       # Rustinel v1.1.1
-│   ├── install-detection-rules.ps1 # Sigma + YARA rules
-│   ├── install-detonator.ps1      # Detonator + DetonatorAgent
-│   ├── install-litterbox.ps1      # LitterBox sandbox
-│   ├── install-thezoo.ps1        # theZoo malware repository + WebUI
-│   ├── install-hunt-sleeping-beacons.ps1 # Hunt-Sleeping-Beacons (VS Build Tools, x64 build)
-│   ├── install-beaconeye.ps1     # BeaconEye (x64 release)
-│   ├── install-aether.ps1        # Aether (prebuilt/ or Zig 0.16 build in the VM)
-│   ├── install-process-dump.ps1  # Process Dump + clean-hash baseline (genquick)
-│   ├── build-aether.sh           # Cross-compile Aether on the host into prebuilt/
-│   ├── install-re-tools.ps1      # Detect It Easy, WinDbg, Ghidra
-│   ├── install-rizin.ps1         # rizin 0.9.1 + rz-ghidra from Cutter's Windows package (pinned SHA-256)
-│   ├── install-webui.ps1          # Web UI deployment
-│   ├── configure-logging.ps1     # PowerShell script block/module logging, Windows Firewall log, BITS log (LOGS, FIREWALL)
-│   ├── tdc-unisolate.ps1         # The way out of ISOLATED without the web UI (run as Administrator)
-│   ├── fetch-geoip.py            # `make geoip`: refresh webui/data from iptoasn.com (host, needs internet)
-│   ├── build-worldmap.py         # Build webui/static/data/world.json from Natural Earth
-│   ├── deploy-utm.py             # Push code to a UTM VM over WinRM, restart, run installers
-│   ├── pipe-roundtrip-test.py    # Interception round trip on the VM (observe, edit, squat)
-│   └── configure-services.ps1    # Service registration (runs on every boot)
-│
-└── prebuilt/                       # Host-built binaries uploaded by provisioning (git-ignored)
-```
-
-### VM File Layout
-
-```
-C:\DetonationChamberUI\                 Web UI (Flask)
-C:\tools\rustinel\                      Rustinel ETW engine + rules
-C:\tools\fibratus\                      Fibratus kernel tracer
-C:\DetonatorAgent\                      .NET 8 execution agent
-C:\LitterBox\                           Analysis sandbox
-C:\tools\ThreatCheck\                   AV signature scanner
-C:\tools\DefenderCheck\                 Defender evasion tester
-C:\tools\EMBER2024\                     EMBER2024 ML classifier (thrember venv + models)
-C:\tools\capa\                          Mandiant capa (static capability detection)
-C:\tools\Hunt-Sleeping-Beacons\         Sleeping beacon scanner (x64)
-C:\tools\BeaconEye\                     Cobalt Strike config scanner (x64)
-C:\tools\Aether\                        Memory forensics scanner + rules\
-C:\tools\ProcessDump\                   pd64.exe + clean-hash database
-C:\tools\zig\                           Zig 0.16 (only when Aether was built in the VM)
-C:\dumps\                               Process Dump output; exit\ holds exit-time dumps
-C:\tools\theZoo-WebUI\                  theZoo malware sample browser (:8888)
-C:\tools\detection-rules\               Sigma + YARA + IOC rules
-C:\ProgramData\chocolatey\lib\die\      Detect It Easy (DiE 3.21)
-C:\ProgramData\chocolatey\lib\ghidra\   Ghidra 12.1.2
-C:\tools\cutter\                        rizin 0.9.1 + rz-ghidra (Cutter's Windows package; only rizin runs)
-C:\Windows\Temp\rizin_uploads\          Files uploaded in the RIZIN tab (newest 40)
-C:\DetonationChamberUI\rizin_projects\  RIZIN projects (renames and comments)
-C:\tdc\samples\                         Samples the FIREWALL tab fetched (<sha256[:2]>\<sha256>; never executed, Defender-excluded)
-C:\tdc\scripts\                         Provisioning scripts; configure-logging.ps1, tdc-unisolate.ps1
-WinDbgX.exe                             WinDbg Preview (via winget)
-C:\Users\Public\Downloads\              Samples written by DetonatorAgent
-```
-
----
-
-## Troubleshooting
-
-### Check service status
-
-```bash
-# macOS / Linux
-make services
-
-# Windows
-.\make.ps1 services
-```
-
-Expected output:
-```
-  SERVICE               STATE
-  -------               -----
-  DetonationChamberUI   Running
-  Rustinel              Running
-  DetonatorAgent        Running
-  LitterBox             Running
-  Fibratus              Running
-  Sysmon                Running
-  theZoo-WebUI          Running
-```
-
-### Services not starting
-
-```powershell
-# SSH/RDP into the VM
-vagrant ssh  # or: vagrant rdp
-
-# Check and restart services
-Get-ScheduledTask -TaskName DetonationChamberUI | Start-ScheduledTask
-Get-ScheduledTask -TaskName Rustinel | Start-ScheduledTask
-Get-ScheduledTask -TaskName DetonatorAgent | Start-ScheduledTask
-Get-ScheduledTask -TaskName LitterBox | Start-ScheduledTask
-
-# View logs
-Get-Content C:\tools\logs\DetonatorAgent.log -Tail 50
-Get-Content C:\tools\logs\DetonationChamberUI.log -Tail 50
-```
-
-### Port forwarding not working (Hyper-V)
-
-Hyper-V uses a virtual switch. Connect directly via the VM's IP:
-
-```powershell
-# Find VM IP
-.\make.ps1 status
-# Or: vagrant ssh -c "ipconfig"
-
-# Override in make.ps1
-.\make.ps1 status -VMIp 172.17.x.x
-```
-
-### Web UI not loading
-
-```bash
-# Check if Flask is running
-make status  # or: .\make.ps1 status
-
-# Restart it
-make restart  # or: .\make.ps1 restart
-
-# View logs
-make logs  # or: .\make.ps1 logs
-```
-
-### Web UI answers 403 "Host not allowed" or "Cross-site request rejected"
-
-The UI only accepts IP addresses and `localhost` in the `Host` header (DNS
-rebinding protection). Open it by IP, or add the name you use to
-`TDC_ALLOWED_HOSTS`. "Cross-site request rejected" means a POST came from a
-page on another origin, e.g. a bookmarklet or a tool running in the browser;
-send it without an `Origin` header (curl, scripts) or from the UI itself.
-
-### Rustinel not detecting events
-
-```powershell
-# Inside the VM:
-Get-Process rustinel
-Get-Content C:\tools\rustinel\logs\rustinel.log.* | Select-Object -Last 20
-logman query -ets | findstr rustinel
-
-# Restart if stale
-logman stop rustinel-etw-trace -ets 2>$null
-Start-ScheduledTask -TaskName "Rustinel"
-```
-
-### macOS: QEMU won't start
-
-```bash
-qemu-system-aarch64 --accel help  # Should show: hvf
-ls /opt/homebrew/share/qemu/edk2-aarch64-code.fd
-vagrant plugin list | grep qemu
-```
-
-### Local install fails
-
-```bash
-# Verify Python version (needs 3.10+)
-python3 --version
-
-# If venv creation fails, try:
-make uninstall  # or: .\make.ps1 uninstall
-make install    # or: .\make.ps1 install
-```
 
 ---
 
@@ -2391,31 +341,12 @@ make install    # or: .\make.ps1 install
 
 > **This VM is designed for malware analysis — treat it as compromised.**
 
-- Use **snapshots** before each detonation (`vagrant snapshot save clean_state`)
-- **Network isolation** recommended (Hyper-V internal/private switch)
-- Defender exclusions configured for detonation paths only
-- Rustinel active response is **disabled by default**
-- The Web UI has no login — keep it on an isolated network: `/api/submit`
-  executes files by design.
-
-### Web UI hardening
-
-- **Cross-site requests:** state-changing requests (POST/PUT/DELETE) whose
-  `Origin`/`Referer` names another site are refused, so a web page opened in
-  the VM's browser cannot submit samples or change settings. curl, the MCP
-  server and scripts send no such header and are unaffected.
-- **DNS rebinding:** only IP addresses, `localhost` and names listed in
-  `TDC_ALLOWED_HOSTS` (comma-separated) are accepted in the `Host` header.
-- **Writes:** `/api/file/hex/write` only writes inside the hex-upload folder,
-  `C:\Temp`, `C:\Users\Public\Downloads` and `C:\dumps`, and never to script
-  or shortcut files.
-- **RIZIN console:** every command passes an allowlist on the server before
-  rizin gets it: no programs, no other files, no writing, no debugging, and
-  settings only for the disassembly and the analysis (see
-  [Console without a shell](#console-without-a-shell)). rizin opens files
-  read-only, and names, strings and comments from a file are shown as text.
-- **Headers:** no framing (clickjacking), `nosniff`, same-origin referrers.
-- `WEBUI_HOST=127.0.0.1` restricts the listener to the VM itself.
+Snapshot before each detonation, keep the box on an isolated network, and know
+that the Web UI has no login: `/api/submit` executes files by design. The whole
+list — the snapshots, the Defender exclusions, Rustinel's active response, and
+how the Web UI itself refuses cross-site requests, foreign `Host` headers and
+writes outside the detonation paths — is in
+[Security Notes](docs/configuration.md#security-notes).
 
 ---
 
@@ -2441,6 +372,16 @@ make install    # or: .\make.ps1 install
 | [rizinorg/rz-ghidra](https://github.com/rizinorg/rz-ghidra) | Ghidra's decompiler as a rizin plugin (DECOMPILER) |
 | [rizinorg/cutter](https://github.com/rizinorg/cutter) | Its Windows package supplies rizin and rz-ghidra |
 | [Microsoft WinDbg](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/) | Windows debugger |
+| [mermaid-js/mermaid](https://github.com/mermaid-js/mermaid) | Draws the diagrams of the offline wiki (MIT; version 10.9.3 vendored as `scripts/wiki/mermaid.min.js` with its licence, so `make docs` needs no network) |
+
+---
+
+## License
+
+The repository carries no licence file of its own. Every tool the chamber
+installs or calls keeps the licence of its own project; the ones whose terms
+reach the way they are used are named in [Credits](#credits) — Aether
+(GPL-3.0) and rizin (LGPL-3.0) run as separate processes, Process Dump is MIT.
 
 ---
 

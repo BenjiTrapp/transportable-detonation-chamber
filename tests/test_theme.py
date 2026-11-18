@@ -869,9 +869,11 @@ def test_reduced_motion_disables_new_animations():
 # --- Theme switch ------------------------------------------------------------
 
 def _const_source(name):
-    """A top-level `const NAME = ...;` of app.js, for a Node prelude: one line,
-    or up to the first line that ends with `;`."""
-    m = re.search(r"^const %s = .*?;$" % re.escape(name), _read(APP_JS), re.M | re.S)
+    """A top-level `const NAME = ...;` (or `let`) of app.js, for a Node
+    prelude: one line, or up to the first line that ends with `;` (a trailing
+    comment behind it is part of that line)."""
+    m = re.search(r"^(?:const|let) %s = .*?;(?=[ \t]*(?://[^\n]*)?$)" % re.escape(name),
+                  _read(APP_JS), re.M | re.S)
     assert m, f"const {name} not found in app.js"
     return m.group(0)
 
@@ -1087,6 +1089,9 @@ globalThis.document = Object.assign(new EventTarget(), {
     createElement: tag => new El({ tag, attrs: {}, children: [] }),
 });
 globalThis.getComputedStyle = el => el.computed || {};
+// The ⋯ menus of the Dashboard tab are no part of this DOM: handleGlobalKeydown
+// asks them whether one of them was open
+globalThis.closeDashboardMenus = () => false;
 const calls = [];
 for (const f of ['initTabs', 'initGraphControls', 'refreshAll']) globalThis[f] = () => calls.push(f);
 globalThis.location = { reload: () => calls.push('location.reload') };
@@ -1799,6 +1804,25 @@ def test_every_layout_variable_is_defined_in_both_themes():
     assert not problems, "\n".join(problems)
 
 
+def test_both_themes_shape_the_logs_result_and_the_own_dashboards():
+    """The COMMANDS card, the result tabs with the form switches, the save dialog and the tiles of an own
+    dashboard came after the split, so their rules live in theme-layout.css under [data-theme]: Classic
+    is shaped like Cyberpunk and only the palette differs. In theme-cyberpunk.css (the palette) such a
+    rule would reach Cyberpunk alone, and Classic would keep the plainer style.css version."""
+    layout = _strip_comments(_raw(LAYOUT_CSS))
+    missing = [cls for cls in
+               ("logs-commands", "logs-commands-head", "logs-commands-toggle", "logs-cmd-group", "logs-cmd-head",
+                "logs-cmd-text", "logs-result-head", "logs-tab", "logs-forms", "logs-form", "logs-chart-card",
+                "logs-save-btn", "logs-save-content", "logs-save-title", "logs-save-pick",
+                "dashboard-pages", "dashboard-page", "dashboard-own-title", "dashboard-panels", "dashboard-panel",
+                "dashboard-panel-title", "dashboard-panel-form", "dashboard-panel-menu", "dashboard-panel-error")
+               if not re.search(r"\[data-theme\][^{]*\.%s\b" % cls, layout)]
+    assert not missing, "theme-layout.css has no rule for: " + ", ".join("." + c for c in missing)
+    own = re.findall(r"\[data-theme=[\"']cyberpunk[\"']\][^{]*\.(?:logs|dashboard)-[\w-]+",
+                     _strip_comments(_raw(THEME_CSS)))
+    assert not own, "LOGS or dashboard rules in theme-cyberpunk.css; Classic would not get them:\n" + "\n".join(own)
+
+
 def _declarations(body):
     """The declarations of a rule body as a set of 'property: value' (whitespace normalised)."""
     out, depth, start, quote = set(), 0, 0, None
@@ -1849,8 +1873,10 @@ AFTER_THE_SPLIT = re.compile(r"\.fw-|#tab-firewall\b|#firewall-|\.toast-decision
 def test_cyberpunk_rules_unchanged():
     """Splitting theme-cyberpunk.css into theme-layout.css and the palette must not change Cyberpunk: every
     rule of the file as of e11a9dd (before the split; tests/samples/) is still there, with the same
-    declarations, once the [data-theme] prefix of the layout is read as [data-theme="cyberpunk"]; nothing
-    else is added. The :root blocks (variables) are compared by their effective values."""
+    declarations, once the [data-theme] prefix of the layout is read as [data-theme="cyberpunk"]. Nothing
+    is added for an element the old sheet already styled; rules for elements that came after the split
+    (the COMMANDS card, the result tabs, the own dashboards) are allowed, and only for those. The :root
+    blocks (variables) are compared by their effective values."""
     def non_root(rules):
         return {k: v for k, v in rules.items() if ":root" not in k[1]}
     old = non_root(_flat_rules(_raw(OLD_THEME_CSS)))
@@ -1858,8 +1884,12 @@ def test_cyberpunk_rules_unchanged():
            for (c, s), v in non_root({**_flat_rules(_raw(LAYOUT_CSS)), **_flat_rules(_raw(THEME_CSS))}).items()
            if not AFTER_THE_SPLIT.search(s)}
     assert old and len(old) > 700, "the old sheet was not read"
+    # The classes the old sheet knows: a rule may be new only if every class it names is outside them,
+    # so it belongs to an element that did not exist yet and cannot change how an old one looks.
+    old_classes = set(re.findall(r"\.([\w-]+)", _raw(OLD_THEME_CSS)))
     missing = sorted(set(old) - set(new))
-    extra = sorted(set(new) - set(old))
+    extra = sorted(key for key in set(new) - set(old)
+                   if not set(re.findall(r"\.([\w-]+)", key[1])) - old_classes)
     assert not missing and not extra, f"missing: {missing[:5]}\nextra: {extra[:5]}"
     changed = [key for key in old if sorted(map(sorted, old[key])) != sorted(map(sorted, new[key]))]
     assert not changed, "rules with other declarations:\n" + "\n".join(f"{c}{s}" for c, s in changed[:10])
@@ -2068,11 +2098,12 @@ ALERT_ROW_FUNCTIONS = ALERT_FUNCTIONS + ["alertRowsHtml", "alertInstanceIndex", 
                                          "escapeHtml", "jsArg", "cssToken", "procKey", "sortTimeValue",
                                          "severitySortValue"]
 # The building blocks of the charts (block CHARTS of app.js) and their constants
-CHART_CONSTS = ["SEVERITY_ORDER", "SEVERITY_COLORS", "CHART_PALETTE", "CHART_MONTHS", "CHART_MAX_BINS"]
+CHART_CONSTS = ["SEVERITY_ORDER", "SEVERITY_COLORS", "CHART_PALETTE", "CHART_MONTHS", "CHART_MAX_BINS",
+                "CHART_LABEL_MAX"]
 CHART_FUNCTIONS = ["alertCategory", "countBy", "binByTime", "stackedBarsSvg", "donutSvg", "pieSvg", "chartLegendHtml",
-                   "sparklineSvg", "scatterSvg", "verdictBarsSvg", "chartEmptyHtml", "_chartSentence", "_chartColor",
-                   "_chartNumber", "_chartShare", "_chartCoord", "_chartSegments", "_chartPeriodStart", "_chartPeriodNext",
-                   "_chartDate", "_chartClock", "_chartPeriodLabel", "_chartTicks", "_chartFineStep",
+                   "sparklineSvg", "lineSvg", "scatterSvg", "verdictBarsSvg", "chartEmptyHtml", "_chartSentence",
+                   "_chartColor", "_chartNumber", "_chartShare", "_chartCoord", "_chartSegments", "_chartPeriodStart",
+                   "_chartPeriodNext", "_chartDate", "_chartClock", "_chartPeriodLabel", "_chartTicks", "_chartFineStep",
                    "topWithOther", "alertFlow", "_chartFlow", "layoutSankey", "sankeySvg", "_sankeyFit", "_chartEllipsis"]
 # A range drawn across bars (initBarsBrush), which OVER TIME of the Alerts tab shares with ALERT ACTIVITY of the
 # dashboard, and its state: the Alerts tab's prelude declares it, the dashboard's has it from there (once)
@@ -2116,9 +2147,27 @@ DASHBOARD_CHART_FUNCTIONS = ["renderDashboardCharts", "setDashboardRange", "_das
                              "_dashboardFollowTheClock", "_dashboardSparkCounts", "dashboardCategoryItems",
                              "releaseDashboardCounts", "_drawDashboardSparks", "_drawDashboardBars",
                              "_drawDashboardDonuts", "_drawDashboardRange", "_dashboardBarsSize",
-                             "onDashboardChartClick", "initDashboardCharts", "redrawDashboardChartsOnResize"]
+                             "onDashboardChartClick", "initDashboardCharts", "redrawDashboardChartsOnResize",
+                             # The pages of the tab (SERVICES and the own dashboards) and their tiles
+                             "dashboardOwnPage", "dashboardPanelOf", "panelState", "panelSet", "renderOwnClock",
+                             "dashboardPanelId", "dashboardPanelSortId",
+                             "dashboardPanelWidth", "dashboardRangeWord", "panelFormsFor", "panelNoteHtml",
+                             "panelBodyHtml", "panelCardHtml", "renderPanelCard", "dashboardPanelView",
+                             "renderOwnDashboard", "redrawPanelsOnResize", "renderDashboardPages", "dashboardStoredPage",
+                             "setDashboardPage",
+                             "loadDashboardPages", "dashboardStopPanels", "loadPanels", "loadOnePanel",
+                             "refreshPanel", "openPanelInLogs", "togglePanelMenu", "toggleDashboardMenu",
+                             "closeDashboardMenus", "dashboardWrite", "dashboardAskName", "addDashboard",
+                             "renameDashboard", "deleteDashboard", "panelMenu", "dashboardTabShown",
+                             "initDashboardPages"]
 DASHBOARD_CHART_CONSTS = ["DASHBOARD_RANGES", "DASHBOARD_SPARK_DAYS", "dashboardRange", "dashboardBarsRange",
-                          "_dashboardMemo", "_dashboardDrawn", "DASHBOARD_BARS_BRUSH"]
+                          "_dashboardMemo", "_dashboardDrawn", "DASHBOARD_BARS_BRUSH",
+                          # The pages and the tiles: their names, their caps and their state
+                          "DASHBOARD_PAGE_KEY", "DASHBOARD_SERVICES", "DASHBOARD_PANEL_ROWS",
+                          "DASHBOARD_PANEL_HEIGHT", "DASHBOARD_PANEL_WIDE", "DASHBOARD_PANEL_COLUMNS",
+                          "DASHBOARD_QUERY_MAX", "DASHBOARD_PANEL_WAIT", "DASHBOARD_PANEL_ACTIONS",
+                          "dashboardPages", "dashboardPanelState", "dashboardQueue", "dashboardAbort",
+                          "dashboardPageRead", "dashboardOwnMenu", "dashboardDrawnWidth", "dashboardFlight"]
 
 # Four alerts as the engines write them: severity and engine in either case,
 # the process by name, by image only or by PID only, time zones mixed (as a
@@ -2835,11 +2884,16 @@ def test_every_data_table_is_sortable():
             used.update(exempt)
             continue
         sort_id = re.search(r'\sdata-sort-id="([a-z0-9-]+)"', tag)
-        if not re.search(r"\sdata-sortable(?=[\s>])", tag) or not sort_id:
+        # A table that is drawn more than once with a sort state of its own
+        # (a tile of a dashboard) builds its id; its caller keeps those apart
+        # (tests/test_dashboards_ui.py::test_each_table_tile_sorts_on_its_own)
+        built = re.search(r'\sdata-sort-id="\$\{[^"]+\}"', tag)
+        if not re.search(r"\sdata-sortable(?=[\s>])", tag) or not (sort_id or built):
             problems.append(f"{where}:{line}: {tag} is no sortable table (data-sortable data-sort-id) "
                             f"and not in SORT_EXEMPT")
             continue
-        ids.setdefault(sort_id.group(1), []).append(f"{where}:{line}")
+        if sort_id:
+            ids.setdefault(sort_id.group(1), []).append(f"{where}:{line}")
     problems += [f"data-sort-id {sort_id} is used by {', '.join(places)}" for sort_id, places in ids.items()
                  if len(places) > 1]
     problems += [f"SORT_EXEMPT {key} matches no table" for key in SORT_EXEMPT if key not in used]
@@ -3098,6 +3152,8 @@ def test_info_buttons_explain_headings_in_a_popover():
             document.body.innerHTML = BODY;
             globalThis.state = { detailOpen: false };
             globalThis.cardClicks = 0;
+            // The ⋯ menus of the Dashboard tab are no part of this DOM
+            globalThis.closeDashboardMenus = () => false;
             initCardControls();
             const r = {};
             const holders = document.querySelectorAll('[data-info]');
@@ -3166,6 +3222,9 @@ DRAWER_INFO_FUNCTIONS = INFO_TEST_FUNCTIONS + ["onTopbarOutsideClick", "openDraw
 DRAWER_INFO_SETUP = r"""
     document.body.innerHTML = BODY;
     globalThis.state = { detailOpen: false };
+    // The ⋯ menus of the Dashboard tab are no part of this DOM: Escape asks
+    // them whether one of them was open
+    globalThis.closeDashboardMenus = () => false;
     document.addEventListener('click', onTopbarOutsideClick, true);
     initCardControls();
     document.documentElement.setAttribute('data-theme', 'cyberpunk');

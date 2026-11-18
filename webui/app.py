@@ -42,6 +42,8 @@ import pipe_proxy
 import minidump_analysis
 # rizin sessions for the RIZIN tab.
 import rizin_sessions
+# The own dashboards of the Dashboard tab (saved log searches as tiles).
+import dashboards
 # Tool update checks and installs (Tool Updates section of the dashboard).
 import tool_updates
 # LOGS tab: event store, source parsers and the search language.
@@ -12947,6 +12949,127 @@ def api_firewall_capture(capture_id):
         return _fw_error("Capture not found.", 404)
     path = cap.get("path")
     return _fw_json(dict(cap, exists=isinstance(path, str) and os.path.isfile(path)))
+
+
+# --- Own dashboards (Dashboard tab) -------------------------------------
+# A tile is a saved log search; nothing is computed here. The browser fetches
+# every tile's numbers from /api/logs/search, one tile after the other.
+DASHBOARDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboards.json")
+_default_dashboard_store = dashboards.DashboardStore(DASHBOARDS_FILE)
+_dashboards = _default_dashboard_store
+
+# What a body may carry; anything else is named in a 400 so a typo is visible.
+_DASHBOARD_FIELDS = frozenset(("name",))
+_PANEL_FIELDS = frozenset(("name", "query", "form", "earliest", "latest"))
+_PANEL_PATCH_FIELDS = frozenset(("name", "form", "move"))
+DASHBOARD_SAVE_ERROR = "The dashboards could not be saved; see the web UI log."
+
+
+def set_dashboard_store(store):
+    """Use ``store`` for the own dashboards (tests); ``None`` goes back to the default one."""
+    global _dashboards
+    _dashboards = store if store is not None else _default_dashboard_store
+
+
+def _dashboard_body(allowed):
+    """``(body, None)`` for a JSON object that only carries ``allowed`` fields,
+    else ``(None, answer)`` with the 400 that says what was wrong."""
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return None, (jsonify({"error": "JSON object body required"}), 400)
+    unknown = sorted(set(body) - allowed)
+    if unknown:
+        return None, (jsonify({"error": f"unknown field(s): {', '.join(unknown)}"}), 400)
+    return body, None
+
+
+def _dashboard_answer(key, work, status=200):
+    """Run one write on the store and answer in the house style: the reason with
+    400 for a refused value or a reached limit, 404 for a dashboard or tile that
+    is gone (another browser tab deleted it), 500 for a write that failed."""
+    try:
+        value = work()
+    except dashboards.Invalid as e:         # LimitReached is one of these
+        return jsonify({"error": str(e)}), 400
+    except dashboards.NotFound as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception:
+        # Everything else - a failed write, or a bug in the store - answers the
+        # documented message; the log entry stays neutral about which it was, the
+        # traceback says it.
+        _log_logger.exception("a dashboard write failed (%s)", getattr(_dashboards, "path", "?"))
+        return jsonify({"error": DASHBOARD_SAVE_ERROR}), 500
+    return jsonify({key: value} if key else {"deleted": True}), status
+
+
+@app.route("/api/dashboards", methods=["GET", "POST"])
+def api_dashboards():
+    """The own dashboards with their tiles, or add one. POST body: {"name"}."""
+    if request.method == "GET":
+        return jsonify({"dashboards": _dashboards.all()})
+    body, error = _dashboard_body(_DASHBOARD_FIELDS)
+    if error:
+        return error
+    return _dashboard_answer("dashboard", lambda: _dashboards.add(body.get("name")), 201)
+
+
+@app.route("/api/dashboards/<did>", methods=["PATCH", "DELETE"])
+def api_dashboard(did):
+    """Rename a dashboard (body: {"name"}) or delete it with all its tiles."""
+    if request.method == "DELETE":
+        return _dashboard_answer(None, lambda: _dashboards.remove(did))
+    body, error = _dashboard_body(_DASHBOARD_FIELDS)
+    if error:
+        return error
+    return _dashboard_answer("dashboard", lambda: _dashboards.rename(did, body.get("name")))
+
+
+@app.route("/api/dashboards/<did>/panels", methods=["POST"])
+def api_dashboard_panels(did):
+    """Save a search as a tile. Body: {"name", "query", "form", "earliest", "latest"}."""
+    body, error = _dashboard_body(_PANEL_FIELDS)
+    if error:
+        return error
+    return _dashboard_answer("panel", lambda: _dashboards.add_panel(
+        did, body.get("name"), body.get("query"), body.get("form"),
+        body.get("earliest", ""), body.get("latest", "")), 201)
+
+
+@app.route("/api/dashboards/<did>/panels/<pid>", methods=["PATCH", "DELETE"])
+def api_dashboard_panel(did, pid):
+    """Change a tile (body: {"name", "form", "move"}, ``move``: "up"/"down") or delete it."""
+    if request.method == "DELETE":
+        return _dashboard_answer(None, lambda: _dashboards.remove_panel(did, pid))
+    body, error = _dashboard_body(_PANEL_PATCH_FIELDS)
+    if error:
+        return error
+    return _dashboard_answer("panel", lambda: _dashboards.update_panel(
+        did, pid, name=body.get("name"), form=body.get("form"), move=body.get("move")))
+
+
+# --- The offline wiki -------------------------------------------------------
+# `make docs` (or `.\make.ps1 docs`) builds docs/ into one self-contained file
+# beside this app; the three deploy paths carry it up when it is there. It is
+# generated, so it may be missing: the help asks here and shows either the link
+# or the way to build it. Flask serves the file itself as a static file, so
+# nothing reads 15 MB into memory here.
+WIKI_FILE = os.path.join(APP_DIR, "static", "wiki.html")
+
+
+@app.route("/api/wiki")
+def api_wiki():
+    """The offline wiki: {"present", "built"} - its mtime in UTC, or null."""
+    try:
+        if not os.path.isfile(WIKI_FILE):
+            return jsonify({"present": False, "built": None})
+        # The aware form, not utcfromtimestamp, which Python 3.12 deprecates
+        built = datetime.datetime.fromtimestamp(os.path.getmtime(WIKI_FILE),
+                                                datetime.timezone.utc)
+    except OSError:
+        # Unreadable directory, a path that is no longer there: the help says
+        # how to build one rather than linking a file nobody can serve.
+        return jsonify({"present": False, "built": None})
+    return jsonify({"present": True, "built": built.strftime("%Y-%m-%dT%H:%M:%SZ")})
 
 
 # --- Main ---

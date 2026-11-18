@@ -35,6 +35,7 @@ HOST_IP = "192.168.64.1"   # UTM shared-network gateway (host as seen by VM)
 PORT = 8766
 
 # repo-relative source -> remote runtime path used by the DetonationChamberUI task
+WIKI_FILE = "webui/static/wiki.html"
 FILES = {
     "webui/app.py": r"C:\DetonationChamberUI\app.py",
     "webui/memory_evidence.py": r"C:\DetonationChamberUI\memory_evidence.py",
@@ -45,6 +46,7 @@ FILES = {
     "webui/pipe_proxy.py": r"C:\DetonationChamberUI\pipe_proxy.py",
     "webui/log_search.py": r"C:\DetonationChamberUI\log_search.py",
     "webui/log_store.py": r"C:\DetonationChamberUI\log_store.py",
+    "webui/dashboards.py": r"C:\DetonationChamberUI\dashboards.py",
     "webui/rizin_sessions.py": r"C:\DetonationChamberUI\rizin_sessions.py",
     "webui/tool_updates.py": r"C:\DetonationChamberUI\tool_updates.py",
     "webui/firewall.py": r"C:\DetonationChamberUI\firewall.py",
@@ -59,6 +61,10 @@ FILES = {
     "webui/static/css/theme-cyberpunk.css": r"C:\DetonationChamberUI\static\css\theme-cyberpunk.css",
     "webui/templates/index.html": r"C:\DetonationChamberUI\templates\index.html",
     "webui/static/icon.png": r"C:\DetonationChamberUI\static\icon.png",
+    # The offline wiki, built on the host by `make docs` and git-ignored: the VM
+    # has no network, so this one file is the documentation there. A fresh clone
+    # has none, and the loop below skips what is not on disk.
+    WIKI_FILE: r"C:\DetonationChamberUI\static\wiki.html",
 }
 
 # Data directories, shipped whole: the offline geo index (webui/data) and the world map (webui/static/data)
@@ -169,12 +175,25 @@ def do_deploy(sess, args):
         run_ps(sess, ps, label="directories")
         for local, remote in {**FILES, **DATA_FILES, **SCRIPT_FILES}.items():
             if not os.path.isfile(os.path.join(REPO, local)):
-                print(f"  [-] skip {local} (not found)")
+                hint = " - build the wiki with: make docs" if local == WIKI_FILE else ""
+                print(f"  [-] skip {local} (not found){hint}")
                 continue
             url = f"http://{HOST_IP}:{PORT}/{local}"
+            # The copy keeps the date of the file it is a copy of - every file,
+            # not only the wiki: a copy that carries its original's date tells
+            # the truth about what is on the VM, and a download would otherwise
+            # stamp all of them with the deploy's clock. One statement in the
+            # same remote command; `vagrant upload` and `Copy-Item -ToSession`
+            # (the other two deploy paths) have no equivalent, which is why the
+            # help says the wiki's date is the date of the copy here, that a
+            # deploy *can* renew it, and that the build stamp is in the wiki's
+            # own footer.
+            mtime = int(os.path.getmtime(os.path.join(REPO, local)))
             ps = (
                 '$ErrorActionPreference="Stop"; $ProgressPreference="SilentlyContinue";'
                 f'Invoke-WebRequest -Uri "{url}" -OutFile "{remote}" -UseBasicParsing;'
+                f'(Get-Item "{remote}").LastWriteTimeUtc = '
+                f'[datetimeoffset]::FromUnixTimeSeconds({mtime}).UtcDateTime;'
                 f'(Get-Item "{remote}").Length'
             )
             out = run_ps(sess, ps, label=local)

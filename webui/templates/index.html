@@ -19,9 +19,9 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=80">
-    <link rel="stylesheet" href="/static/css/theme-layout.css?v=4">
-    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=30">
+    <link rel="stylesheet" href="/static/css/style.css?v=81">
+    <link rel="stylesheet" href="/static/css/theme-layout.css?v=5">
+    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=36">
 </head>
 <body>
     <!-- Global loading overlay (shown on slow fetches) -->
@@ -136,10 +136,13 @@
                     <h2 data-info="Health of every service in the chamber, the loaded detection rules and the newest alerts. Click a tile to open what it counts, a service card for its details, or Launch to start a service that is offline.">Service Dashboard</h2>
                     <div class="header-actions">
                         <span class="header-meta" id="dashboard-time"></span>
-                        <button class="btn btn-sm" onclick="refreshDashboard()">Refresh</button>
+                        <button class="btn btn-sm" onclick="refreshDashboard({ panels: true })">Refresh</button>
                     </div>
                 </div>
-                <div class="dashboard-body">
+                <!-- The pages of the tab: SERVICES (the cards below) and one per own
+                     dashboard, written by renderDashboardPages() in app.js -->
+                <div class="dashboard-pages" id="dashboard-pages" role="group" aria-label="Dashboard pages"></div>
+                <div class="dashboard-body" id="dashboard-body">
                     <!-- Stats Strip -->
                     <div class="dashboard-stats" id="dashboard-stats">
                         <!-- Rendered by JS -->
@@ -210,6 +213,13 @@
                             <div class="activity-empty">No recent activity. Submit a sample to begin.</div>
                         </div>
                     </div>
+                </div>
+                <!-- An own dashboard: its head (name, the clock of the last run, ⋯)
+                     and its tiles, written by renderOwnDashboard() in app.js. It
+                     stands in the place of .dashboard-body, which is hidden then. -->
+                <div class="dashboard-own" id="dashboard-own" hidden>
+                    <div class="dashboard-own-head" id="dashboard-own-head"></div>
+                    <div class="dashboard-panels" id="dashboard-panels"></div>
                 </div>
             </div>
 
@@ -686,7 +696,8 @@
             </div>
 
             <!-- Logs Tab: search the log store (initLogs in app.js): the search bar with its range,
-                 sources and live switch, EVENTS OVER TIME, the fields of the matches, the result -->
+                 sources and live switch, EVENTS OVER TIME, the COMMANDS card and the fields of the
+                 matches on the left, the result on the right -->
             <div class="tab-content" id="tab-logs">
                 <div class="content-header">
                     <h2 data-info="Search the PowerShell, access, MCP, NetFlow, DNS and firewall logs in one place with a Splunk-like query. A click on a source, a bar or a field value narrows the search.">Logs</h2>
@@ -695,7 +706,7 @@
                         <button type="button" class="btn btn-sm logs-live" id="logs-live" aria-pressed="false" title="Search again every 10 seconds while this tab is open" onclick="toggleLogsLive()"><span class="logs-live-dot" aria-hidden="true"></span>LIVE</button>
                     </div>
                 </div>
-                <div class="logs-bar">
+                <div class="logs-bar" id="logs-bar">
                     <div class="logs-back-row" id="logs-back" hidden></div>
                     <div class="logs-search">
                         <div class="logs-input-wrap">
@@ -706,7 +717,7 @@
                             <button type="button" class="btn btn-sm logs-menu-btn" id="logs-menu-btn" aria-haspopup="true" aria-expanded="false" title="Example and recent searches" onclick="toggleLogsMenu()">EXAMPLES &#9662;</button>
                             <div class="logs-menu" id="logs-menu" role="menu" hidden></div>
                         </span>
-                        <button type="button" class="btn btn-sm logs-syntax" id="logs-syntax" aria-label="Search syntax" title="Search syntax">?</button>
+                        <button type="button" class="btn btn-sm logs-syntax" id="logs-syntax" aria-label="Search commands" aria-expanded="false" aria-controls="logs-commands" title="Show the commands the search knows" onclick="toggleLogsCommands()">?</button>
                         <button type="button" class="btn btn-sm btn-primary logs-go" onclick="submitLogsSearch()">SEARCH</button>
                     </div>
                     <div class="logs-error" id="logs-error" role="alert" hidden></div>
@@ -723,16 +734,54 @@
                     <div class="logs-histogram chart-clickable" id="logs-histogram" onclick="onLogsHistogramClick(event)"></div>
                 </div>
                 <div class="logs-body">
-                    <aside class="logs-fields" aria-label="Fields">
-                        <div class="logs-fields-head">
-                            <h3 class="chart-card-title" data-info="The fields of the events that match, with how many have them. Open a field for its most frequent values; a click on a value adds it to the search.">FIELDS</h3>
-                            <span class="logs-fields-count" id="logs-fields-count"></span>
-                        </div>
-                        <input type="text" class="filter-input logs-fields-filter" id="logs-fields-filter" placeholder="Filter fields..." aria-label="Filter fields" oninput="onLogsFieldFilter(this.value)">
-                        <div class="logs-field-list" id="logs-field-list"></div>
-                    </aside>
+                    <div class="logs-side" id="logs-side">
+                        <section class="logs-commands is-shut" id="logs-commands" aria-label="Search commands">
+                            <div class="logs-commands-head" data-logs-cmd-card>
+                                <h3 class="chart-card-title" data-info="Every command the log search knows, in groups. A click puts one into the search box instead of replacing what is there, so you can finish the field name and press Enter; only a source row is different: it replaces the source the query has and searches, as a source chip does.">COMMANDS</h3>
+                                <button type="button" class="logs-commands-toggle" id="logs-commands-toggle" aria-expanded="false" aria-controls="logs-commands-list" aria-label="Show or hide the search commands" title="Show or hide the commands"><span class="logs-caret" aria-hidden="true"></span></button>
+                            </div>
+                            <div class="logs-commands-list" id="logs-commands-list"></div>
+                        </section>
+                        <aside class="logs-fields" aria-label="Fields">
+                            <div class="logs-fields-head">
+                                <h3 class="chart-card-title" data-info="The fields of the events that match, with how many have them. Open a field for its most frequent values; a click on a value adds it to the search.">FIELDS</h3>
+                                <span class="logs-fields-count" id="logs-fields-count"></span>
+                            </div>
+                            <input type="text" class="filter-input logs-fields-filter" id="logs-fields-filter" placeholder="Filter fields..." aria-label="Filter fields" oninput="onLogsFieldFilter(this.value)">
+                            <div class="logs-field-list" id="logs-field-list"></div>
+                        </aside>
+                    </div>
                     <div class="logs-main">
+                        <div class="logs-result-head" id="logs-result-head">
+                            <div class="logs-tabs" id="logs-tabs" role="tablist" aria-label="Result view">
+                                <button type="button" class="logs-tab" id="logs-tab-events" role="tab" data-logs-view="events" aria-selected="true" aria-disabled="false" aria-controls="logs-results" onclick="setLogsView('events')">EVENTS</button>
+                                <button type="button" class="logs-tab" id="logs-tab-statistics" role="tab" data-logs-view="statistics" aria-selected="false" aria-disabled="false" aria-controls="logs-results" onclick="setLogsView('statistics')">STATISTICS</button>
+                                <button type="button" class="logs-tab" id="logs-tab-visualization" role="tab" data-logs-view="visualization" aria-selected="false" aria-disabled="false" aria-controls="logs-results" onclick="setLogsView('visualization')">VISUALIZATION</button>
+                            </div>
+                            <div class="logs-forms" id="logs-forms" role="group" aria-label="Chart form" hidden>
+                                <button type="button" class="logs-form" id="logs-form-table" data-logs-form="table" aria-pressed="false" aria-disabled="false" onclick="setLogsForm('table')">TABLE</button>
+                                <button type="button" class="logs-form" id="logs-form-pie" data-logs-form="pie" aria-pressed="false" aria-disabled="false" onclick="setLogsForm('pie')">PIE</button>
+                                <button type="button" class="logs-form" id="logs-form-bars" data-logs-form="bars" aria-pressed="false" aria-disabled="false" onclick="setLogsForm('bars')">BARS</button>
+                                <button type="button" class="logs-form" id="logs-form-line" data-logs-form="line" aria-pressed="false" aria-disabled="false" onclick="setLogsForm('line')">LINE</button>
+                                <button type="button" class="logs-form" id="logs-form-sankey" data-logs-form="sankey" aria-pressed="false" aria-disabled="false" onclick="setLogsForm('sankey')">SANKEY</button>
+                            </div>
+                            <button type="button" class="logs-save-btn" id="logs-save-btn" aria-disabled="true" title="needs a pipe such as | stats count by field" onclick="openLogsSave()">SAVE</button>
+                        </div>
                         <div class="logs-results" id="logs-results"><div class="logs-empty">Searching the logs&hellip;</div></div>
+                    </div>
+                </div>
+                <!-- The result as a tile on one of the own dashboards (openLogsSave in
+                     app.js): the dialog after the pattern of the help window, a backdrop
+                     and the content beside it. It stands in the tab, so it goes away with
+                     it; JS writes its fields into #logs-save-body. -->
+                <div class="logs-save hidden" id="logs-save" role="dialog" aria-modal="true" aria-labelledby="logs-save-title">
+                    <div class="logs-save-backdrop" onclick="closeLogsSave()"></div>
+                    <div class="logs-save-content">
+                        <div class="logs-save-head">
+                            <h3 class="logs-save-title" id="logs-save-title">SAVE ON A DASHBOARD</h3>
+                            <button type="button" class="btn btn-sm btn-close" aria-label="Close" onclick="closeLogsSave()">&#x2715;</button>
+                        </div>
+                        <div class="logs-save-body" id="logs-save-body"></div>
                     </div>
                 </div>
             </div>
@@ -1355,6 +1404,21 @@
                     <h3>What is Detonation Chamber?</h3>
                     <p>A pre-configured <strong>Windows 11 VM</strong> for detonating samples and watching them with several EDR-style engines at once. This web UI combines their telemetry with live-memory forensics into one verdict per detonation.</p>
 
+                    <!-- The way to the offline guide. Both lines start hidden;
+                         initHelpWiki() asks /api/wiki and shows the one that is
+                         true for this machine (app.js). The date is the file's
+                         own mtime, which is what the server can know - the
+                         Vagrant and Hyper-V deploys write the copy with the
+                         deploy's clock, the UTM deploy hands it the date of the
+                         file it copied, so it is dated, not called built; the
+                         build stamp and the commit are in the wiki's own
+                         footer. The age in days is there so an old wiki looks
+                         old instead of staying silently wrong. -->
+                    <div class="help-wiki" id="help-wiki" hidden>
+                        <p id="help-wiki-link" hidden><strong>The full guide, offline:</strong> <a href="/static/wiki.html" target="_blank" rel="noopener">open the wiki</a> &mdash; every page of <code>docs/</code> in one file, with navigation, search, the screenshots and the diagrams, and it needs no network. <span id="help-wiki-date" hidden>The file here is dated <span id="help-wiki-built"></span> &mdash; that is when this copy was written, which a deploy can renew; the wiki's own footer carries the date it was built and the commit it was built from.</span> <code>make docs</code> on the host builds it again.</p>
+                        <p id="help-wiki-missing" hidden><strong>The full guide is not on this machine.</strong> Build it on the host with <code>make docs</code> (or <code>.\make.ps1 docs</code>) and deploy again: that writes <code>static/wiki.html</code>, the whole documentation in one file that opens without a network.</p>
+                    </div>
+
                     <h4>Key Capabilities</h4>
                     <div class="help-grid">
                         <div class="help-card">
@@ -1376,6 +1440,11 @@
                             <div class="help-card-icon" style="color:var(--c-purple-500)">&#x1F4CA;</div>
                             <div class="help-card-title">Binary Analysis</div>
                             <div class="help-card-desc">PE/ELF parsing, packer detection, entropy, file map, hex editor; reverse engineering with rizin and rz-ghidra</div>
+                        </div>
+                        <div class="help-card">
+                            <div class="help-card-icon" style="color:var(--accent-green)">&#x1F4DC;</div>
+                            <div class="help-card-title">Log Search &amp; Dashboards</div>
+                            <div class="help-card-desc">Six log sources in one Splunk-like search, drawn as a table, pie, bars, line or Sankey, and kept as tiles on dashboards of your own</div>
                         </div>
                     </div>
 
@@ -1410,6 +1479,8 @@
                         <div class="help-guide-item">
                             <h4>Dashboard</h4>
                             <p>Stats strip (alerts, processes, services, rules, tools; TOTAL ALERTS and PROCESSES TRACKED with 45-day sparklines), ALERT ACTIVITY (alerts stacked by severity) with the SEVERITY and CATEGORY donuts of its range, one card per service with launch buttons, Tool Updates (Check for updates looks for a newer version of every installed tool, Update all or the Update button of a row installs it; a pinned tool asks first, and while updates run a banner says that detonations, scans and uploads are paused), recent activity. A tile opens what it counts (the high / med / low counts of TOTAL ALERTS open the Alerts tab filtered by severity); a bar or a segment opens the Alerts tab filtered to it, and a drag across the bars narrows the donuts to the range drawn.</p>
+                            <p>Under the header a row of pages: SERVICES is everything above, and beside it one page per own dashboard, with + NEW for another one. An own page draws its tiles, each the search it was saved from in the LOGS tab, one tile after the other &mdash; the 10 s poll leaves them alone, as does a click on the page that is already open, and the clock on a tile says how old its numbers are; leaving the Dashboard tab abandons the run, and coming back computes every tile of the open page again. Refresh in the header computes every tile of the page again, the &#8635; of a tile only that one; the &#8943; of a tile opens it in LOGS, renames it, changes its form (which recomputes that tile), moves it or deletes it, and the &#8943; beside the name of the page renames or deletes the whole dashboard.</p>
+                            <p>A tile keeps only its name, its query, its form and its range (the moving one of the tab or a window frozen in UTC); the numbers come from <code>/api/logs/search</code> each time it runs, at most 1000 rows for a chart and 20 shown rows for a table. A form the columns can no longer carry falls back to the table and says why, and a refused search shows the server's message on that tile while the others keep their numbers. At most 10 dashboards, 12 tiles each, names of 1 to 60 characters; the dashboards live in <code>dashboards.json</code> beside the web UI, so they survive a restart, and every change is written at once &mdash; a second browser tab on the same page is corrected by the next write.</p>
                         </div>
                         <div class="help-guide-item">
                             <h4>Alerts</h4>
@@ -1438,6 +1509,8 @@
                         <div class="help-guide-item">
                             <h4>LOGS</h4>
                             <p>Search the PowerShell, access, MCP, NetFlow, DNS and firewall logs with a Splunk-like query: words, "phrases", <code>field=value</code>, AND / OR / NOT and pipes such as <code>| stats count by tool</code>, <code>| top</code> or <code>| timechart span=5m count by source</code>. The range buttons (15M to ALL) set the time; EVENTS OVER TIME zooms by a range drawn across its bars. A source chip searches one source (a grey one says why it has no data), a field value on the left adds <code>field="value"</code>, and a click on an event unfolds its fields and raw text. LIVE searches again every 10 s. EXAMPLES lists searches to start from and your last ten.</p>
+                            <p>The <strong>?</strong> beside EXAMPLES opens the COMMANDS card: the whole search language in four groups, one open at a time. A click on a row adds that command to the search box instead of replacing what is there and does not search &mdash; a pipe behind the query, a term before the first pipe &mdash; so you can finish the field name and press Enter; only a source row replaces the source and searches, as a chip does. A click on the head of the card folds it away.</p>
+                            <p>Over the result EVENTS, STATISTICS and VISUALIZATION switch between the matches, the table of the pipes and one chart: PIE, BARS, LINE or SANKEY, whichever the columns of the result can carry &mdash; column 0 is the name, the first column after it whose values are all numbers is the value, so a pie or bars need one of each, a Sankey two name columns, and a timechart draws as a line or as bars. What a result cannot carry stays in the row, grey, with the reason in its tooltip. A chart shows the twelve largest groups plus <em>other</em> (a line the series of the server) out of at most 1000 rows, and says under itself when that is less than the whole result; a click on that line adds <code>| sort -count | head 20</code> and searches again (on a timechart, whose periods must not be cut, the line is only a note). SAVE at the end of the row puts the result on one of your own dashboards as a tile, with its query, its form and either the range of the tab or the window on screen.</p>
                         </div>
                         <div class="help-guide-item">
                             <h4>ThreatScan</h4>
@@ -1473,7 +1546,7 @@
                 <!-- API Reference -->
                 <div class="help-section" id="help-api">
                     <h3>API</h3>
-                    <p class="help-muted">Served on port <code>9000</code>, JSON. No login (keep the VM on an isolated network); state-changing requests from other web sites are refused. The full reference with all endpoints is in the README; the MCP server (<code>mcp/server.py</code>, 47 tools) wraps the same API.</p>
+                    <p class="help-muted">Served on port <code>9000</code>, JSON. No login (keep the VM on an isolated network); state-changing requests from other web sites are refused. The full reference with all endpoints is the API page of the offline wiki (<a href="/static/wiki.html#api" target="_blank" rel="noopener">open it here</a> &mdash; Overview says whether that file is on this machine), and <code>docs/api.md</code> in the repository; the MCP server (<code>mcp/server.py</code>, 47 tools) wraps the same API.</p>
 
                     <h4>Core</h4>
                     <table class="help-api-table">
@@ -1622,7 +1695,7 @@ Web UI :9000 ──submit──▶ DetonatorAgent :8080 ──runs──▶ samp
                     <h4>File Layout</h4>
                     <pre class="help-code">C:\DetonationChamberUI\           Web UI (this interface), memory_results\, pipe_sessions\, rizin_projects\, baseline
 C:\tools\rustinel\                Rustinel ETW engine
-C:\tools\fibratus\                Fibratus kernel tracer
+C:\Program Files\Fibratus\        Fibratus kernel tracer (Bin\fibratus.exe)
 C:\DetonatorAgent\                .NET execution agent
 C:\LitterBox\                     Analysis sandbox
 C:\tools\Aether\                  Memory forensics scanner + rules
@@ -1702,6 +1775,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
     </div>
 
-    <script src="/static/js/app.js?v=117"></script>
+    <script src="/static/js/app.js?v=119"></script>
 </body>
 </html>

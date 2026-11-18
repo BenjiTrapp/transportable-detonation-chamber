@@ -206,6 +206,7 @@
     --cp-card-rgb: 13, 15, 28;
     --cp-raised: #181c36;
     --cp-line: #23284a;
+    --cp-line-rgb: 35, 40, 74;
     --cp-text: #e8ecff;
     --cp-text-muted: #a3abd6;
     --cp-text-muted-rgb: 163, 171, 214;
@@ -244,6 +245,9 @@
     --alerts-path-height: 0px;
     /* The same for the Sysmon tab (initSysmonTab sets it on #sysmon-table) */
     --sysmon-bar-height: 0px;
+    /* And for the LOGS search bar, which is sticky too: the COMMANDS card
+       stands under it instead of over it (initLogs sets it on .logs-side) */
+    --logs-bar-height: 0px;
     /* Nor this: how many times wider than at zoom 1 the lines of the RIZIN
        graph are drawn, so that they stay about as wide on screen however far
        it is zoomed out (rizinGraphApplyView sets it on the graph's SVG) */
@@ -5950,6 +5954,25 @@ body.hex-resizing {
 
 .help-muted { color: var(--text-muted) !important; font-size: 11px !important; }
 
+/* The way to the offline wiki, at the top of the help. One of its two lines is
+   shown once /api/wiki answered (initHelpWiki); both are hidden before that. */
+.help-wiki {
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-left: 2px solid var(--accent-cyan);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    margin: 0 0 16px 0;
+}
+.help-wiki[hidden],
+.help-wiki p[hidden] { display: none; }
+.help-wiki p:last-child { margin-bottom: 0; }
+.help-wiki a {
+    color: var(--accent-cyan);
+    text-decoration: none;
+}
+.help-wiki a:hover { text-decoration: underline; }
+
 .help-api-table {
     width: 100%;
     border-collapse: collapse;
@@ -8448,6 +8471,13 @@ table[data-sortable] > thead > tr > th:focus-visible {
     stroke-linejoin: round;
     stroke-linecap: round;
 }
+/* A line of a timechart (lineSvg): its colour comes inline, the shape here */
+.chart-line {
+    fill: none;
+    stroke-width: 2;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+}
 .chart-threshold {
     stroke: var(--border-dashed);
     stroke-width: 1;
@@ -10803,7 +10833,7 @@ body.maintenance-active #app {
     color: var(--accent-cyan);
     word-break: break-all;
 }
-.logs-syntax { min-width: 28px; cursor: help; }
+.logs-syntax { min-width: 28px; }
 .logs-error {
     display: flex;
     flex-wrap: wrap;
@@ -10893,7 +10923,6 @@ body.maintenance-active #app {
     font-size: 10px;
     color: var(--text-muted);
 }
-.logs-timechart .logs-legend { margin: 8px 0 0; }
 .logs-legend-swatch {
     display: inline-block;
     width: 8px;
@@ -10910,6 +10939,98 @@ body.maintenance-active #app {
     align-items: start;
     padding: 12px 20px 20px;
 }
+/* The left column: the COMMANDS card over FIELDS. It stretches over the whole
+   result so the sticky card can stay at the top while the result scrolls. */
+.logs-side {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-width: 0;
+    align-self: stretch;
+}
+.logs-commands {
+    position: sticky;
+    top: var(--logs-bar-height);
+    z-index: 3;
+    padding: 10px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-accent);
+    border-radius: var(--radius-lg);
+}
+/* Shut, the card is one line high: the head stays, the list folds away */
+.logs-commands.is-shut .logs-commands-list { display: none; }
+.logs-commands.is-shut .logs-commands-head { margin-bottom: 0; }
+.logs-commands-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    margin-bottom: 6px;
+    cursor: pointer;
+}
+.logs-commands-toggle {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    padding: 2px 4px;
+    color: var(--text-muted);
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+}
+.logs-commands-head:hover .logs-commands-toggle,
+.logs-commands-toggle:focus-visible { color: var(--text-primary); }
+.logs-commands-toggle:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: -2px; }
+.logs-commands:not(.is-shut) .logs-commands-toggle .logs-caret { transform: rotate(90deg); }
+.logs-commands-list { max-height: 52vh; overflow-y: auto; }
+.logs-cmd-group { padding: 1px 0; }
+.logs-cmd-group + .logs-cmd-group { border-top: 1px solid var(--border-primary); }
+.logs-cmd-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-align: left;
+    color: var(--text-muted);
+    background: transparent;
+    border: 0;
+    border-radius: var(--radius);
+    cursor: pointer;
+}
+.logs-cmd-head:hover { color: var(--text-primary); background: var(--bg-card-hover); }
+.logs-cmd-head:focus-visible,
+.logs-cmd:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: -2px; }
+.logs-cmd-group.is-open > .logs-cmd-head .logs-caret { transform: rotate(90deg); }
+.logs-cmd-group-name { flex: 1; min-width: 0; }
+.logs-cmd-count { flex: none; font-family: var(--font-mono); font-size: 10px; color: var(--text-dim); }
+.logs-cmd-list { margin: 0 0 6px; padding: 0; list-style: none; }
+.logs-cmd-group:not(.is-open) > .logs-cmd-list { display: none; }
+.logs-cmd {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    column-gap: 6px;
+    width: 100%;
+    padding: 2px 6px;
+    text-align: left;
+    background: transparent;
+    border: 0;
+    border-radius: 3px;
+    cursor: pointer;
+}
+.logs-cmd:hover { background: var(--bg-card-hover); }
+.logs-cmd-text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent-cyan);
+    overflow-wrap: anywhere;
+}
+.logs-cmd-hint { font-size: 10px; line-height: 1.3; color: var(--text-muted); }
+.logs-cmd:hover .logs-cmd-hint { color: var(--text-secondary); }
 .logs-fields {
     min-width: 0;
     max-height: 72vh;
@@ -10977,6 +11098,256 @@ body.maintenance-active #app {
 .logs-value-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .logs-value-count { flex: none; color: var(--text-muted); }
 .logs-main { min-width: 0; }
+/* Over the result the three tabs (EVENTS, STATISTICS, VISUALIZATION) and, for
+   a result the pipes made, the form of its chart. A tab or a form the result
+   cannot carry stays on the row, grey and aria-disabled, with the reason in
+   its title: a grey button says more than an empty picture. The right end of
+   the row is free for a button that works on the result. */
+.logs-result-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 16px;
+    margin-bottom: 10px;
+    border-bottom: 1px solid var(--border-primary);
+}
+.logs-tabs { display: flex; flex-wrap: wrap; }
+.logs-tab {
+    padding: 5px 12px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    color: var(--text-muted);
+    background: transparent;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+}
+.logs-tab:hover { color: var(--text-primary); }
+.logs-tab[aria-selected="true"] {
+    color: var(--accent-cyan);
+    border-bottom-color: var(--accent-cyan);
+}
+.logs-tab[aria-disabled="true"] {
+    color: var(--text-dim);
+    opacity: 0.5;
+    cursor: default;
+}
+.logs-tab[aria-disabled="true"]:hover { color: var(--text-dim); }
+.logs-tab:focus-visible,
+.logs-form:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: -2px; }
+.logs-forms { display: flex; flex-wrap: wrap; gap: 4px; }
+.logs-forms[hidden] { display: none; }
+.logs-form {
+    padding: 2px 8px;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    background: transparent;
+    border: 1px solid var(--border-accent);
+    border-radius: 3px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s, background-color 0.15s;
+}
+.logs-form:hover { color: var(--accent-cyan); border-color: var(--accent-cyan); }
+.logs-form[aria-pressed="true"] {
+    color: var(--accent-cyan);
+    background: rgba(var(--accent-cyan-rgb), 0.12);
+    border-color: var(--accent-cyan);
+}
+.logs-form[aria-disabled="true"] {
+    color: var(--text-dim);
+    background: transparent;
+    border-color: var(--border-primary);
+    border-style: dashed;
+    cursor: default;
+}
+.logs-form[aria-disabled="true"]:hover { color: var(--text-dim); border-color: var(--border-primary); }
+/* SAVE at the free end of the tab row: the result as a tile on a dashboard.
+   Locked while the result has no form, with the reason in its title. */
+.logs-save-btn {
+    margin-left: auto;
+    padding: 2px 10px;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--accent-cyan);
+    background: transparent;
+    border: 1px solid var(--accent-cyan);
+    border-radius: 3px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s, background-color 0.15s;
+}
+.logs-save-btn:hover { background: rgba(var(--accent-cyan-rgb), 0.12); }
+.logs-save-btn[aria-disabled="true"] {
+    color: var(--text-dim);
+    background: transparent;
+    border-color: var(--border-primary);
+    border-style: dashed;
+    cursor: default;
+}
+.logs-save-btn[aria-disabled="true"]:hover { color: var(--text-dim); border-color: var(--border-primary); }
+.logs-save-btn:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: -2px; }
+/* The dialog that puts the result on a dashboard: a backdrop and the content
+   beside it, like the help window. It never grows past the window (1280x800). */
+.logs-save {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.logs-save.hidden { display: none; }
+.logs-save-backdrop {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(var(--c-black-rgb), 0.7);
+}
+.logs-save-content {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    width: 90vw;
+    max-width: 520px;
+    max-height: 85vh;
+    overflow: hidden;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 20px 60px rgba(var(--c-black-rgb), 0.6);
+}
+.logs-save-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 16px;
+    background: var(--bg-primary);
+    border-bottom: 1px solid var(--border-primary);
+}
+.logs-save-title {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    color: var(--text-primary);
+}
+.logs-save-body {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding: 16px;
+    overflow-y: auto;
+}
+.logs-save-field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+}
+.logs-save-label {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+}
+.logs-save-input { width: 100%; }
+.logs-save-input[hidden] { display: none; }
+.logs-save-form {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--accent-cyan);
+}
+.logs-save-picks { display: flex; flex-wrap: wrap; gap: 6px; }
+.logs-save-pick {
+    max-width: 100%;
+    overflow: hidden;
+    padding: 4px 10px;
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 1px solid var(--border-accent);
+    border-radius: 3px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s, background-color 0.15s;
+}
+.logs-save-pick:hover { color: var(--accent-cyan); border-color: var(--accent-cyan); }
+.logs-save-pick[aria-pressed="true"] {
+    color: var(--accent-cyan);
+    background: rgba(var(--accent-cyan-rgb), 0.12);
+    border-color: var(--accent-cyan);
+}
+.logs-save-pick[aria-disabled="true"] {
+    color: var(--text-dim);
+    background: transparent;
+    border-color: var(--border-primary);
+    border-style: dashed;
+    cursor: default;
+}
+.logs-save-pick[aria-disabled="true"]:hover { color: var(--text-dim); border-color: var(--border-primary); }
+.logs-save-pick:focus-visible,
+.logs-save-input:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: -2px; }
+/* Why a save was refused: the sentence of the server, in the dialog */
+.logs-save-error {
+    font-size: 11px;
+    color: var(--accent-red);
+}
+.logs-save-error[hidden] { display: none; }
+.logs-save-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+}
+/* VISUALIZATION: the chart beside its legend (a timechart's chips under it)
+   and, where the chart stands for less than the whole, the line that says so */
+.logs-chart-card { padding: 12px; }
+.logs-chart {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+}
+.logs-chart .chart-split { flex: 1 1 auto; min-width: 0; }
+/* The legend keeps a column of its own: a name and its count stay side by side */
+.logs-chart .chart-legend { flex: 0 1 300px; }
+.logs-chart .logs-legend { flex-basis: 100%; margin: 0; }
+/* The line under a chart that stands for less than the whole. Only the one
+   that takes a click (a table result, where | sort -count | head 20 helps) is
+   a button; a timechart's line is plain text. */
+.logs-trunc {
+    display: block;
+    width: 100%;
+    margin-top: 8px;
+    padding: 4px 2px;
+    font-size: 11px;
+    text-align: left;
+    color: var(--accent-yellow);
+    background: transparent;
+    border: 0;
+}
+button.logs-trunc { cursor: pointer; }
+button.logs-trunc:hover { color: var(--accent-orange); text-decoration: underline; }
+.logs-trunc:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: -2px; }
+.logs-trunc code { font-family: var(--font-mono); font-size: 11px; color: inherit; }
 .logs-results { min-width: 0; transition: opacity 0.15s; }
 .logs-results.is-loading { opacity: 0.55; }
 .logs-empty { padding: 28px 16px; font-size: 12px; text-align: center; color: var(--text-muted); }
@@ -11083,7 +11454,6 @@ body.maintenance-active #app {
 }
 .logs-raw-note { margin-top: 4px; font-size: 10px; color: var(--text-muted); }
 .logs-more { margin-top: 10px; }
-.logs-timechart { margin-bottom: 12px; }
 .logs-table-wrap {
     overflow-x: auto;
     background: var(--bg-card);
@@ -11117,9 +11487,17 @@ body.maintenance-active #app {
 .logs-cell-num { font-variant-numeric: tabular-nums; text-align: right; color: var(--text-primary); }
 .logs-cell-time { color: var(--text-muted); }
 .logs-cell-empty { color: var(--text-dim); }
-@media (max-width: 900px) {
+/* Too narrow for a column beside the result: the COMMANDS card lies over the
+   result, FIELDS below it, and the card does not stay while it scrolls. */
+@media (max-width: 1100px) {
     .logs-body { grid-template-columns: minmax(0, 1fr); }
-    .logs-fields { max-height: 260px; }
+    .logs-side { display: contents; }
+    .logs-commands { position: static; order: 0; }
+    .logs-commands-list { max-height: 40vh; }
+    .logs-main { order: 1; }
+    .logs-fields { order: 2; max-height: 260px; }
+}
+@media (max-width: 900px) {
     .logs-event-row { grid-template-columns: 10px minmax(0, 1fr); }
     .logs-event-row .logs-time,
     .logs-event-row .logs-src { grid-column: 2; }
@@ -11620,6 +11998,219 @@ body.maintenance-active #app {
 .fw-top-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .fw-top-none { font-size: 11px; color: var(--text-dim); }
 .fw-sum-note { margin: 12px 0 0; font-size: 11px; line-height: 1.45; color: var(--text-muted); }
+
+/* --- The pages of the Dashboard tab and the tiles of an own dashboard ---
+   Under the header a row of pages: SERVICES (the stats, the charts and the
+   service cards, which .dashboard-body holds) and one per own dashboard,
+   plus + NEW. The two bodies are siblings and only one of them is on screen;
+   .dashboard-body is a flex column, so `hidden` alone would not hide it. */
+.dashboard-pages {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 10px 20px;
+    border-bottom: 1px solid var(--border-primary);
+}
+.dashboard-page {
+    max-width: 240px;
+    overflow: hidden;
+    padding: 4px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 1px solid var(--border-accent);
+    border-radius: 3px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s, background-color 0.15s;
+}
+.dashboard-page:not([aria-disabled="true"]):hover { color: var(--accent-cyan); border-color: var(--accent-cyan); }
+.dashboard-page[aria-pressed="true"] {
+    color: var(--accent-cyan);
+    background: rgba(var(--accent-cyan-rgb), 0.12);
+    border-color: var(--accent-cyan);
+}
+.dashboard-page[aria-disabled="true"] {
+    color: var(--text-dim);
+    background: transparent;
+    border-color: var(--border-primary);
+    border-style: dashed;
+    cursor: default;
+}
+.dashboard-page-new { letter-spacing: 0.12em; }
+.dashboard-page:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: 1px; }
+.dashboard-body[hidden] { display: none; }
+.dashboard-own {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow-y: auto;
+}
+.dashboard-own[hidden] { display: none; }
+.dashboard-own-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 20px 0;
+}
+.dashboard-own-title {
+    margin: 0;
+    overflow: hidden;
+    font-size: 13px;
+    font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+}
+.dashboard-own-count { font-size: 11px; color: var(--text-muted); }
+.dashboard-own-tools { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; }
+.dashboard-own-time { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
+.dashboard-own-empty {
+    padding: 28px 20px;
+    font-size: 12px;
+    text-align: center;
+    color: var(--text-muted);
+}
+/* Two tiles side by side; a table, a line or a sankey takes the whole row */
+.dashboard-panels {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    padding: 12px 20px 20px;
+    align-items: start;
+}
+.dashboard-panel { min-width: 0; }
+.dashboard-panel-wide { grid-column: 1 / -1; }
+.dashboard-panel-head { flex-wrap: wrap; }
+.dashboard-panel-title {
+    max-width: 100%;
+    overflow: hidden;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+}
+.dashboard-panel-tools { flex-wrap: wrap; }
+.dashboard-panel-range { font-size: 10px; color: var(--text-muted); }
+.dashboard-panel-time { font-family: var(--font-mono); font-size: 10px; color: var(--text-muted); }
+.dashboard-panel-tool {
+    padding: 0 4px;
+    font-size: 13px;
+    line-height: 1.2;
+    color: var(--text-muted);
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+}
+.dashboard-panel-tool:not([aria-disabled="true"]):hover { color: var(--accent-cyan); }
+.dashboard-panel-tool[aria-disabled="true"] { color: var(--text-dim); cursor: default; }
+.dashboard-panel-tool:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: 1px; }
+.dashboard-panel-body { min-width: 0; min-height: 60px; }
+.dashboard-panel-body .logs-chart { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.dashboard-panel-body .logs-table-wrap { max-height: 280px; overflow: auto; }
+.dashboard-panel-wait {
+    padding: 26px 8px;
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-align: center;
+    color: var(--text-muted);
+}
+/* The same word over the numbers a tile still has while it computes again */
+.dashboard-panel-wait.is-again { padding: 0 0 6px; text-align: left; }
+.dashboard-panel-error {
+    padding: 10px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent-red);
+    background: rgba(var(--accent-red-rgb), 0.08);
+    border: 1px solid rgba(var(--accent-red-rgb), 0.4);
+    border-radius: var(--radius);
+    word-break: break-word;
+}
+.dashboard-panel-why { margin-top: 6px; font-size: 11px; color: var(--accent-yellow); }
+.dashboard-panel-foot { margin-top: 8px; overflow: hidden; }
+.dashboard-panel-query {
+    display: block;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-dim);
+}
+/* The ⋯ menus of a tile and of the page */
+.dashboard-menu-wrap { position: relative; display: inline-flex; }
+.dashboard-menu,
+.dashboard-panel-menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 220px;
+    padding: 6px;
+    text-align: left;
+    background: var(--bg-card);
+    border: 1px solid var(--border-accent);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 10px 30px rgba(var(--c-black-rgb), 0.5);
+}
+.dashboard-menu[hidden],
+.dashboard-panel-menu[hidden] { display: none; }
+.dashboard-menu-item,
+.dashboard-panel-item {
+    width: 100%;
+    padding: 6px 8px;
+    font-size: 11.5px;
+    text-align: left;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 0;
+    border-radius: var(--radius);
+    cursor: pointer;
+}
+.dashboard-menu-item:hover,
+.dashboard-panel-item:not([aria-disabled="true"]):hover { background: var(--bg-card-hover); }
+.dashboard-menu-item:focus-visible,
+.dashboard-panel-item:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: -2px; }
+.dashboard-panel-item[aria-disabled="true"] { color: var(--text-dim); cursor: default; }
+.dashboard-panel-head-row {
+    padding: 6px 8px 2px;
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.15em;
+    color: var(--text-muted);
+}
+.dashboard-panel-forms { display: flex; flex-wrap: wrap; gap: 4px; padding: 0 8px 4px; }
+.dashboard-panel-form {
+    padding: 2px 7px;
+    font-size: 10px;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 1px solid var(--border-accent);
+    border-radius: 3px;
+    cursor: pointer;
+}
+.dashboard-panel-form:not([aria-disabled="true"]):hover { color: var(--accent-cyan); border-color: var(--accent-cyan); }
+.dashboard-panel-form[aria-pressed="true"] { color: var(--accent-cyan); border-color: var(--accent-cyan); }
+.dashboard-panel-form[aria-disabled="true"] {
+    color: var(--text-dim);
+    border-color: var(--border-primary);
+    border-style: dashed;
+    cursor: default;
+}
+/* Too narrow for two tiles beside each other: one column, every tile wide */
+@media (max-width: 1100px) {
+    .dashboard-panels { grid-template-columns: minmax(0, 1fr); }
+}
 
 /* --- Telemetry: the effects of the "fibre telemetry" page ---
    Only in Telemetry (the theme with the id classic). Cyberpunk keeps its own
