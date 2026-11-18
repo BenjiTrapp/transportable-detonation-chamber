@@ -193,12 +193,44 @@ Text oben von „den vier Lese-Verben“, von CIMs `PolicyStoreSourceType` als
 Allow-Out-Menge oder von „Die Python-Seite wird nicht geändert“ spricht, gilt
 das Folgende.
 
+### Das Leistungsziel wurde nicht erreicht
+
+Ziel 1 oben (deutlich unter einer Sekunde je Lesen) gilt nur für `Get`. Das
+Ziel dieser Arbeit, einen ruhigeren Tab im Dauerbetrieb, wurde **verfehlt**:
+100 s eines beobachtenden Tabs, vorher 5 Aufrufe und 18 % eines
+`powershell.exe`, jetzt 6 Aufrufe (`Profiles` ×4, `List` ×2) und **19,5 %**.
+Die beiden Lesevorgänge, die den Ruhezustand bestimmen, müssen das Modul der
+Richtigkeit wegen laden: `Profiles`, weil COM den lokalen Store liest und nicht
+den gültigen, `List`, weil es die Profile mit zurückgibt. Eine frühere Angabe
+von 2 Aufrufen und 3,3 % wurde gemessen, als `Profiles` noch umgestellt war, und
+ist zurückgezogen.
+
+Gewonnen wurde stattdessen (je Verb, frischer Prozess, drei Läufe; der Boden für
+alles, was das Modul lädt, liegt bei 1,08 s, ein nacktes `powershell.exe` bei
+0,37 s):
+
+| Verb | jetzt | Cmdlet-Entsprechung |
+|---|---|---|
+| `Profiles` | 1,16 s | 1,08 s |
+| `List` | 1,43 s | 1,70 s |
+| `Get` | **0,63 s** | 1,08 s |
+| `AllowOut` | 1,69 s | 1,70 s |
+
+`Get` ist modulfrei und spart 0,45 s genau dort, wo Reaktionsfähigkeit zählt
+(`cut_stands` alle 10 s unter ISOLATED, das Zurücklesen jedes Schreibvorgangs);
+`List` spart 0,27 s; `Compare` hat drei Annahmen widerlegt, darunter die, COM
+melde, was in Kraft ist; und die Rücknahme von `AllowOut` und `Profiles` ist
+durch Tests festgehalten, die nach dem Grund benannt sind. Der große Gewinn
+dieser Arbeitsreihe bleibt der frühere: 42 % und 16 Aufrufe je 100 s, bevor
+`/rules` aufhörte, ein Lesen zu erzwingen. Zahlen zu Rückfällen in diesem
+Fenster wurden nicht aufgeschrieben.
+
 ### Was umgestellt ist
 
 Nur **`List` und `Get`** lesen TDCs eigene Regeln über COM
 (`HNetCfg.FwPolicy2.Rules`), mit der geschriebenen Zuordnung, dem Rückfall auf
 die Cmdlets und `Via`/`Fallback` im Aufruf-Log. Ohne Modul läuft damit nur
-`Get` (0,58 s); `List` lädt das Modul für seine Profile weiter. Für Regeln
+`Get` (0,63 s); `List` lädt das Modul für seine Profile weiter. Für Regeln
 lesen beide Wege denselben Store: COM liest den lokalen Store (siehe unten),
 `Get-NetFirewallRule` ohne `-PolicyStore` den PersistentStore, und dorthin
 schreiben `Create` und `Cut`. Deshalb stimmte `Compare` feldweise überein. Der
@@ -268,6 +300,19 @@ Es vergleicht nur TDCs Regeln, wie `List` und wie `Get` sie schnell lesen,
 gegen die Cmdlets, dazu die Namensmenge und `DisplayName = Name`. Die Ausgabe
 zählt getrennt: `{"ok","rules","checked":{"displayNames","names","fields"},
 "differences"}`. `rules: 0` heißt: nichts verglichen, was auch immer `ok` sagt.
+
+Der Lauf nach dem Rückbau, alle drei mit Exit 0:
+
+| Zustand | `rules` | `displayNames` / `names` / `fields` |
+|---|---|---|
+| A: TCP/IPv4-, TCP/IPv6- und **UDP**-Regel, je mit Port und Programm | 3 | 3 / 6 / 54 |
+| B: A plus der Rundumschnitt | 4 | 4 / 8 / 72 |
+| C: keine Regeln | 0 | 0 / 0 / 0 |
+
+Damit ist Protokoll `17` (UDP) bestätigt, ebenso beide Adressfamilien, Ports und
+Programmpfade. Nicht bestätigt bleiben, was in der Übergabe unter „Mapped but
+not confirmed“ steht (Richtung eingehend, Profilmasken `1` bis `6`, Aktion
+Allow an einer Regel, eine deaktivierte Regel).
 
 ### Entscheidung 1 oben
 

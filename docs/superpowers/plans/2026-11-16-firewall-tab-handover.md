@@ -487,20 +487,19 @@ one-line `Fallback` reason reach the call log.
   the read falls back to the cmdlets: slow, and visible as `Fallback` in the
   call log.
 
-  The final run before the `Profiles` revert, all five green. It printed one
-  `checked` total that included 9 profile fields, which are no longer compared;
-  the split below is what the same states give in today's shape:
+  The run after the `Profiles` revert: three states, all exit 0. The counters
+  make an empty pass visible, which is what they were added for.
 
-  | State | Compare then | `checked` total | today: `rules` / `displayNames` / `names` / `fields` | What it confirms |
+  | State | Compare then | `rules` | `displayNames` / `names` / `fields` | What it confirms |
   |---|---|---|---|---|
-  | A: nothing isolated; an IPv4 **and** an IPv6 rule, each with port and program | exit 0 | 51 | 2 / 2 / 4 / 36 | both address spellings, port, program path |
-  | B: the cut standing | exit 0 | 30 | 1 / 1 / 2 / 18 | the catch-all: protocol Any, program Any, address Any |
-  | C: converged (Block on all three profiles) | exit 0 | 9 | 0 / 0 / 0 / 0 | nothing about rules: the 9 were all profile fields |
-  | D: Domain explicitly `Allow` | exit 0 | 9 | 0 / 0 / 0 / 0 | nothing about rules |
-  | E: Domain `Allow`, Private `NotConfigured`, Public `Block` | exit 0 | 9 | 0 / 0 / 0 / 0 | nothing about rules |
+  | A: TCP/IPv4, TCP/IPv6 and **UDP** rules standing, each with a port and a program | exit 0 | 3 | 3 / 6 / 54 | both address spellings, **protocol `17` (UDP)**, port, program path |
+  | B: A plus the catch-all cut | exit 0 | 4 | 4 / 8 / 72 | the catch-all: protocol Any, program Any, address Any |
+  | C: no rules | exit 0 | 0 | 0 / 0 / 0 | nothing: an empty pass, and `rules: 0` says so |
 
-  C, D and E confirmed only the profile mapping, which is gone. Today they are
-  empty passes, and the counts say so.
+  Earlier runs had five states, three of which (converged, Domain `Allow`,
+  Domain `Allow` with Private `NotConfigured` and Public `Block`) confirmed only
+  the profile mapping, which went with the `Profiles` revert. They are not
+  repeated.
 
 - **Three assumptions the gate disproved.** All three were found only by
   running it on the VM, and none could have been found on macOS; they are what
@@ -567,24 +566,62 @@ one-line `Fallback` reason reach the call log.
   in-force read back, for `Profiles` and `AllowOut` alike; until then both stay
   on the cmdlets, and the pin tests forbid that option in the script.
 
-- **Measured before and after** (VM, unloaded). The "after" column is from the
-  run with the fast `Profiles`; it no longer holds for `Profiles` or `List`:
+- **Measured after the `Profiles` revert** (VM, fresh process, three runs each).
+  The "all-cmdlet equivalent" column is the same verb done entirely through
+  the cmdlets, measured in the same re-run; it is what the verb would cost
+  without any of this work.
 
-  | | before | after (fast `Profiles`) | expected now |
+  | verb | now (mean; min) | all-cmdlet equivalent | where the cost sits |
   |---|---|---|---|
-  | `Profiles`, fresh process | 1.65 s | 0.59 s | about 1.65 s again (the module) |
-  | `List` | 1.65 s | 0.56 s | about 1.65 s again: its profiles load the module |
-  | `Get` | 1.65 s | 0.58 s | 0.58 s, unchanged |
-  | bare `powershell.exe -Command exit` (the floor) | 0.36 s | not applicable | not applicable |
-  | calls per 100 s of a watching tab | 5 | 2 | to be measured again |
-  | `powershell.exe` busy | 18 % | 3.3 % | to be measured again |
-  | fallbacks in that window | not applicable | none (`{'fast': 2}`) | to be measured again |
+  | `Profiles` | 1.16 s (min 1.07) | 1.08 s | a single cmdlet profile read; nothing gained |
+  | `List` | 1.43 s (min 1.34) | 1.70 s | profile + all rules; saves 0.27 s |
+  | `Get` | **0.63 s** (min 0.56) | 1.08 s, the floor for anything that loads the module | module-free; saves 0.45 s |
+  | `AllowOut` | 1.69 s (min 1.57) | 1.70 s | unchanged; not converted |
+  | bare `powershell.exe -Command exit` | 0.37 s | not applicable | the process start alone |
 
-  **The timings are also the proof of whether the module was loaded.** A module
-  load costs about 1.3 s on its own (0.36 s bare against 1.65 s with it), so a
-  verb answering in 0.6 s cannot have loaded it. A separate module check is not
-  needed, and an attempt to make one by inspecting a child process is
-  meaningless: the child's module state is gone when it exits.
+  Steady state, 100 s of a watching tab:
+
+  | | before this work | now |
+  |---|---|---|
+  | calls | 5 | **6**: `Profiles` x4, `List` x2 |
+  | `powershell.exe` busy | 18 % | **19.5 %** of one process |
+
+  Fallbacks in the 100 s window were not recorded for this run.
+
+  **The performance goal of this work was not met.** The aim was a quiet
+  steady state, and it is not: the watching tab sat at 18 % before and sits at
+  19.5 % now. The two reads that dominate it have to load the module for
+  correctness: `Profiles`, because COM reads the local store rather than what is
+  in force, and `List`, because it returns the profiles too. They cannot move
+  without a module-free read of the ActiveStore (see below), which does not
+  exist. An earlier figure of 2 calls and 3.3 % was measured while `Profiles`
+  was still converted; it described a read that was wrong and is withdrawn.
+
+  What was gained instead, stated as plainly as the miss:
+
+  1. **`Get` is module-free: 0.63 s against a 1.08 s floor.** It is the read
+     `cut_stands` makes every 10 s while isolated, and the read-back of every
+     write, so the 0.45 s lands where responsiveness matters most.
+  2. **`List` saves 0.27 s**, riding on machinery `Get` already pays for.
+  3. **`Compare` exists.** In this one plan it caught: CIM returning the action
+     as a name rather than a number; COM writing a single address of either
+     family as a range to itself; and the mistaken claim that COM reports what
+     is in force, which a local-GPO experiment then disproved. Without it, a
+     later "let's just use COM" would have shipped the defect that reports
+     *closed* while the egress is open.
+  4. **Reverting `AllowOut` and `Profiles` is itself a result.** Both are
+     pinned by tests named for the reason, so the trap is documented where
+     someone would walk into it.
+
+  For the longer context: the same tab sat at **42 % with 16 calls per 100 s**
+  before `/rules` stopped forcing a read. That was a different and much larger
+  win, and it is the one that holds.
+
+  **The timings are also the proof of whether the module was loaded.** Anything
+  that loads it costs about 1.08 s here (0.37 s bare), so a verb answering in
+  0.63 s cannot have loaded it. A separate module check is not needed, and an
+  attempt to make one by inspecting a child process is meaningless: the child's
+  module state is gone when it exits.
 
 - **What this VM cannot prove.**
   - **The Local / GroupPolicy distinction for rules**, because it has no
@@ -596,14 +633,12 @@ one-line `Fallback` reason reach the call log.
     states had them:
     - rule Direction `1` (Inbound);
     - profile masks `1` to `6` (a rule on one or two profiles);
-    - Protocol `17` (UDP), which TDC does write: `_block_spec` accepts
-      `protocol='udp'` and `_create_params` sends `-Protocol UDP`;
     - Action `1` (Allow) on a rule, which `allow_fetch` writes and `_write`
       verifies through `Get`, so over COM;
     - `Enabled` false, a disabled rule.
 
-    *Check:* a `Compare` run with a UDP block, an `allow_fetch` rule and a
-    disabled TDC rule standing; one hand-made rule on one profile covers the
+    *Check:* a `Compare` run with an `allow_fetch` rule and a disabled TDC rule
+    standing; one hand-made rule on one profile covers the
     masks.
 
 ### Blocking
@@ -974,34 +1009,61 @@ erzwungene Lesen in `/rules`; das ist behoben (16 → 5 Aufrufe, 42 % → 18 %, 
 
 ### Stand nach den modulfreien Lesevorgängen (gemessen, VM)
 
-**Nachtrag nach dem Rückbau von `Profiles`: die Spalte „damals“ unten gilt
-nicht mehr.** `Profiles` liest wieder über die Cmdlets (COM liest den lokalen
-Store, nicht den gültigen; Abschnitt „Reads without the NetSecurity module“
-oben), und `List` lädt für seine Profile damit ebenfalls das Modul. Nur `Get`
-liest noch ohne Modul. Erwartet: `Profiles` und `List` wieder um 1,65 s, `Get`
-unverändert 0,58 s; der Druck (`Profiles`, dann `Cut`) wieder bei den Zahlen
-von vor diesem Plan. Die Zahl der Aufrufe ändert der Rückbau nicht; die
-Auslastung steigt mit der Dauer je Aufruf und ist neu zu messen. Im Aufruf-Log
-heißt `via=fast` bei `List` nur noch „Regeln über COM“, nicht „ohne Modul“, und
-`Profiles` trägt gar kein `via=` mehr: ein neues `{'fast': 2}` wäre also kein
-Beleg für modulfreie Aufrufe.
+**Das Leistungsziel dieser Arbeit wurde nicht erreicht.** Der Tab im
+Dauerbetrieb, 100 s, niemand drückt etwas, nach dem Rückbau von `Profiles`:
 
-Damals, mit dem schnellen `Profiles`: die Lesevorgänge von `firewall_rules.ps1`
-luden das NetSecurity-Modul nicht mehr, ein Lesevorgang kostete 0,56–0,59 s
-statt 1,65 s. Der Tab im Dauerbetrieb, 100 s, niemand drückt etwas:
-
-| | davor (18-%-Messung oben) | damals (schnelles `Profiles`) |
+| | davor (18-%-Messung oben) | jetzt |
 |---|---|---|
-| PowerShell-Aufrufe je 100 s | 5 | **2** |
-| `powershell.exe` ausgelastet | 18 % | **3,3 %** |
-| Rückfälle auf die Cmdlets in diesem Fenster | nicht zutreffend | **keine** (`{'fast': 2}`) |
+| PowerShell-Aufrufe je 100 s | 5 | **6** (`Profiles` ×4, `List` ×2) |
+| `powershell.exe` ausgelastet | 18 % | **19,5 %** von einem Prozess |
+
+Rückfälle auf die Cmdlets in diesem Fenster wurden nicht aufgeschrieben. Die
+frühere Angabe von 2 Aufrufen und 3,3 % stammt aus der Zeit, als `Profiles`
+noch umgestellt war; sie beschrieb ein Lesen, das falsch war, und ist
+zurückgezogen.
+
+Je Verb, frischer Prozess, je drei Läufe (Mittel; Minimum):
+
+| Verb | jetzt | Cmdlet-Entsprechung | Wo das Modul kostet |
+|---|---|---|---|
+| `Profiles` | 1,16 s (min. 1,07) | 1,08 s | ein einzelnes Cmdlet-Lesen der Profile; nichts gewonnen |
+| `List` | 1,43 s (min. 1,34) | 1,70 s | Profile + alle Regeln; spart 0,27 s |
+| `Get` | **0,63 s** (min. 0,56) | 1,08 s, der Boden für alles, was das Modul lädt | modulfrei; spart 0,45 s |
+| `AllowOut` | 1,69 s (min. 1,57) | 1,70 s | unverändert; nicht umgestellt |
+| nacktes `powershell.exe -Command exit` | 0,37 s | nicht zutreffend | der Prozessstart allein |
+
+**Warum sich die beiden Lesevorgänge, die den Ruhezustand bestimmen, nicht
+bewegen lassen:** beide müssen das Modul der Richtigkeit wegen laden. `Profiles`,
+weil COM den lokalen Store liest und nicht den gültigen (Abschnitt „Reads
+without the NetSecurity module“ oben); `List`, weil es die Profile mit
+zurückgibt. Ein modulfreies Lesen des ActiveStore, das beides ändern könnte,
+gibt es nicht.
+
+**Was stattdessen gewonnen wurde**, so deutlich wie der Fehlschlag:
+
+1. **`Get` ist modulfrei: 0,63 s gegen einen Boden von 1,08 s.** Es ist das
+   Lesen, das `cut_stands` alle 10 s macht, solange isoliert ist, und das
+   Zurücklesen jedes Schreibvorgangs; die 0,45 s fallen also dorthin, wo
+   Reaktionsfähigkeit zählt.
+2. **`List` spart 0,27 s** und fährt auf Technik mit, die `Get` ohnehin bezahlt.
+3. **`Compare` gibt es.** Allein in diesem Plan hat es gefangen: CIM liefert die
+   Aktion als Namen statt als Zahl; COM schreibt eine einzelne Adresse beider
+   Familien als Bereich auf sich selbst; und die irrige Behauptung, COM melde,
+   was in Kraft ist, die ein Experiment mit dem lokalen GPO-Store widerlegt hat.
+   Ohne es hätte ein späteres „nehmen wir doch COM“ den Fehler ausgeliefert, der
+   „zu“ meldet, während der Ausgang offen ist.
+4. **Der Rückbau von `AllowOut` und `Profiles` ist selbst ein Ergebnis.** Beide
+   sind durch Tests gehalten, die nach dem Grund benannt sind; die Falle ist
+   dort dokumentiert, wo man in sie laufen würde.
 
 Zur Einordnung: derselbe Tab stand einmal bei 42 % und 16 Aufrufen je 100 s,
-bevor `/rules` aufhörte, ein Lesen zu erzwingen. Welche Routen die beiden
-verbleibenden Aufrufe auslösten, wurde nicht aufgeschrieben; die Aufteilung nach
-`List` und `Profiles` ist hier deshalb nicht angegeben. `AllowOut` kam in der
-Messung nicht vor. Die Punkte 1 bis 6 oben bleiben eigene Arbeit; die
-Zielzahl für den Druck (Punkt 4) lässt sich jetzt aus dem Log neu belegen.
+bevor `/rules` aufhörte, ein Lesen zu erzwingen. Das war der andere, viel
+größere Gewinn, und er gilt. Welche Routen die sechs Aufrufe auslösten, ist
+nur als `Profiles` ×4 und `List` ×2 bekannt; `AllowOut` kam in der Messung nicht
+vor. Die Punkte 1 bis 6 oben bleiben eigene Arbeit; die Zielzahl für den Druck
+(Punkt 4) lässt sich aus dem Log neu belegen. Im Aufruf-Log heißt `via=fast` bei
+`List` nur „Regeln über COM“, nicht „ohne Modul“, und `Profiles` trägt gar kein
+`via=`: ein `{'fast': n}` belegt keine modulfreien Aufrufe, außer bei `Get`.
 
 **Verworfen: der residente PowerShell-Prozess.** Er wäre der größere Hebel
 gewesen (~0,2 s je Aufruf), aber:
@@ -1013,8 +1075,10 @@ gewesen (~0,2 s je Aufruf), aber:
   Fehlerzustände), und dieser Zustand würde **zwischen Befehlen durchsickern**.
   Heute beginnt jeder Aufruf frisch, und der nächste Befehl könnte der
   Panikschnitt sein.
-- **Die Messung hat ihn unnötig gemacht:** der Preis war das Modul-Laden
-  (~1,3 s), nicht der Prozessstart (0,36 s). Ohne Modul ist ein Lesen bei
-  0,56–0,59 s, und die Ruhelast liegt bei 3,3 %.
+- **Dieses Argument ist zurückgezogen.** Es lautete, die Messung habe ihn
+  unnötig gemacht, weil der Preis das Modul-Laden sei und ohne Modul die
+  Ruhelast bei 3,3 % liege. Die Ruhelast liegt bei 19,5 %, weil die beiden
+  dominierenden Lesevorgänge das Modul laden müssen. Die Ablehnung ruht allein
+  auf den beiden Punkten oben; sie tragen sie.
 
 **Nicht erneut vorschlagen.**
