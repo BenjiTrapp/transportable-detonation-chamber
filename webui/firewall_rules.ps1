@@ -64,9 +64,16 @@
 # missing, an empty answer or any error is not guessed at: the verb answers through the cmdlets instead and says so
 # (Via "cmdlet", Fallback the reason).
 # TDC's rules come from COM too (HNetCfg.FwPolicy2.Rules), for List and Get; the verbs that write read their rule back
-# through the cmdlets as before. COM's rule Name is what the cmdlets call DisplayName, not the Name a rule is looked up
-# by: the two are one for TDC's rules only because Create and Cut write DisplayName = Name, and Compare holds both lists
-# against each other, so a rule whose two names differ shows there.
+# through the cmdlets as before. Two stores again, and which one each way reads is said rather than assumed:
+#   - COM's rule collection is taken to be what is IN FORCE, as COM's profile values were measured to be. For the
+#     rules that is not measured yet.
+#   - Get-NetFirewallRule without -PolicyStore reads its default, the PersistentStore: what this machine has
+#     CONFIGURED. Create and Cut write there (New-NetFirewallRule's default store), so TDC's own rules live there.
+#   For TDC's rules the two hold the same rules as long as no group policy or other store adds a TDC-FW-* rule;
+#   should one, it is found by one way only, and Compare reports it as such. The cmdlet fallback of List and Get
+#   stays on the PersistentStore, as it always read: a fallback answers what it answered before, never another store.
+# COM's rule Name is what the cmdlets call DisplayName, not the Name a rule is looked up by: the two are one for TDC's
+# rules only because Create and Cut write DisplayName = Name, and Compare checks exactly that for every TDC rule.
 
 param(
     [Parameter(Mandatory = $true)]
@@ -484,6 +491,19 @@ try {
             # against the cmdlets. A rule only one way finds is a difference, so is a field that is not the same.
             $cmdletRules = @{}
             foreach ($view in @(Read-CmdletRuleViews)) { $cmdletRules[[string]$view.Name] = $view }
+            # The invariant itself: the fast way matches a rule by COM's Name, which is the cmdlets' DisplayName, so
+            # every TDC rule must carry its Name as its DisplayName. Two rules with swapped names give equal name sets
+            # below; they do not get past this.
+            foreach ($rule in @(Get-NetFirewallRule -Name 'TDC-FW-*' -ErrorAction SilentlyContinue)) {
+                $checked += 1
+                if (-not ([string]$rule.DisplayName -ceq [string]$rule.Name)) {
+                    $differences += [pscustomobject]@{
+                        what = "rule $([string]$rule.Name) DisplayName is not its Name"
+                        fast = [string]$rule.DisplayName
+                        cmdlet = [string]$rule.Name
+                    }
+                }
+            }
             $fastWays = [ordered]@{ List = @{}; Get = @{} }
             $rulesRead = $true
             try {

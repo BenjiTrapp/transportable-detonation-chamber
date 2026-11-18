@@ -3077,8 +3077,13 @@ def test_list_keeps_every_field_the_python_side_reads():
 
 def test_list_asks_com_only_for_tdc_rules():
     """538 rules stand on this VM; only TDC-FW-* are ever reported."""
-    branch = _op_branch(_ps1(), "List")
-    assert "TDC-FW-" in branch and "FwPolicy2" in branch
+    script = _ps1()
+    branch = _op_branch(script, "List")
+    fast = _functions(script)["Read-FastRuleViews"]
+    # List's rules come through the COM reader (not only its profiles), and that reader keeps TDC-FW-* alone
+    assert "Read-FastRuleViews" in branch and "Get-OurRuleViews" in _op_case(script, "List")
+    assert "$policy = New-Object -ComObject HNetCfg.FwPolicy2" in fast and "foreach ($rule in $policy.Rules) {" in fast
+    assert "} elseif (-not $name.StartsWith('TDC-FW-', [System.StringComparison]::OrdinalIgnoreCase)) {" in fast
 
 
 def test_the_fast_rule_view_has_exactly_the_fields_of_the_cmdlet_view():
@@ -3110,8 +3115,21 @@ def test_an_unknown_rule_number_or_spelling_falls_back_instead_of_guessing():
     for var in ("ComDirection", "ComAction", "ComProfiles", "ComProtocol"):
         assert re.search(r"if \(-not \$%s\.ContainsKey\(\$\w+\)\) \{ throw " % var, fast), var
     assert "if (-not ($enabled -is [bool])) { throw " in fast
-    # an address or a port in a spelling that is not known is not passed on as it is
-    assert fast.count("else { throw ") >= 2
+    # a program, an address or a port in a spelling that is not known is not passed on as it is: these are the only
+    # ways a token gets through, and everything else throws
+    lines = [l.strip() for l in fast.splitlines()]
+    for line in (
+            "elseif ($app -is [string] -and $app) { $program = $app }",
+            "else { throw \"COM ApplicationName of $name is neither null nor a path: '$app'\" }",
+            "if ($token -match '^(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})/255\\.255\\.255\\.255\\z') { $Matches[1] }",
+            "elseif ($token -match '^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\z') { $token }",
+            "elseif ($token -match '^[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{0,4}){2,7}\\z') { $token }",
+            "else { throw \"COM RemoteAddresses of $name has a spelling that is not known: '$token'\" }",
+            "if ($token -match '^\\d{1,5}\\z') { $token }",
+            "else { throw \"COM RemotePorts of $name has a spelling that is not known: '$token'\" }",
+            "else { throw \"COM RemotePorts of $name is not text: '$remotePorts'\" }"):
+        assert line in lines, line
+    assert len([l for l in lines if re.search(r"\{ \$token \}|\$Matches", l)]) == 4      # three for addresses, one for ports
     assert "if ($count -eq 0) { throw " in fast           # no rules at all is not "none of ours"
     assert re.search(r"if \(\$seen\.ContainsKey\(\$name\)\) \{ throw ", fast)      # two rules, one name
     way = functions["Get-OurRuleViews"]
@@ -3145,11 +3163,19 @@ def test_a_name_reaching_com_is_still_checked_and_matched_whole():
 
 def test_list_and_get_say_which_way_answered():
     script = _ps1()
-    listing = _op_case(script, "List")
-    assert "Get-OurRuleViews" in listing and "Get-ProfileStates -Fast" in listing
-    assert "Via = " in listing and "Fallback" in listing
-    get = _op_case(script, "Get")
-    assert "Get-OurRuleViews -RuleName $Name" in get and "Via" in get and "Fallback" in get
+    listing = [l.strip() for l in _op_case(script, "List").splitlines()]
+    # fast only when both parts were; otherwise cmdlet, with the rules' reason first and else the profiles'
+    for line in ("$read = Get-OurRuleViews", "$states = @(Get-ProfileStates -Fast)",
+                 "$out = [ordered]@{ profiles = $states; rules = $read.Views; Via = 'fast' }",
+                 "if ($read.Via -ne 'fast') {", "$out.Fallback = $read.Fallback",
+                 "} elseif ($states[0].Via -ne 'fast') {", "$out.Fallback = $states[0].Fallback"):
+        assert line in listing, line
+    assert listing.count("$out.Via = 'cmdlet'") == 2
+    get = [l.strip() for l in _op_case(script, "Get").splitlines()]
+    for line in ("$read = Get-OurRuleViews -RuleName $Name",
+                 "$view | Add-Member -NotePropertyName Via -NotePropertyValue $read.Via",
+                 "if ($read.Via -ne 'fast') { $view | Add-Member -NotePropertyName Fallback -NotePropertyValue $read.Fallback }"):
+        assert line in get, line
 
 
 def test_the_cut_keeps_reading_its_rule_back_through_the_cmdlets():
@@ -3226,3 +3252,92 @@ def test_the_way_on_stdout_wins_and_other_stderr_adds_nothing(monkeypatch):
     for err in ("WARNING: something\n{not json", '{"Via": broken', '{"Via":"weird"}', "", None, '["Via"]'):
         rules_mod._describe(_answering_err("", err), "TDC-FW-ISO-cut")
         assert set(seen[-1]) == {"op", "lock", "wait_ms", "run_ms", "rc", "thread"}, err
+
+
+# ---- the configured guard, whatever the case: PowerShell's names are not case-sensitive, so neither is this ----
+
+
+def _code_lines(text):
+    return [l.strip() for l in text.splitlines() if l.strip() and not l.strip().startswith("#")]
+
+
+def test_nothing_but_cim_reaches_configured_in_any_spelling():
+    """$Set, $INFORCE and $cimnumber are $set, $inForce and $cimNumber to PowerShell. Every line that names one of
+    the CIM-side variables, in any case, is pinned; and no scope prefix, ${...} or variable cmdlet can name them
+    around the pins."""
+    fast = _functions(_ps1())["Read-FastProfileStates"]
+    lines = _code_lines(fast)
+
+    def naming(var):
+        return [l for l in lines if re.search(r"\$%s\b" % var, l, re.I)]
+    assert naming("set") == [
+        "$set = @{}",
+        'if ($set.ContainsKey($name)) { throw "CIM names the profile $name twice" }',
+        "$set[$name] = $CimOutbound[$cimNumber]",
+        'if (-not $set.ContainsKey($name)) { throw "CIM does not name the profile $name" }',
+        "Configured = $set[$name]",
+    ]
+    assert naming("cimNumber") == [
+        "$cimNumber = [string]$cim.DefaultOutboundAction",
+        'if (-not $CimOutbound.ContainsKey($cimNumber)) { throw "CIM DefaultOutboundAction of $name is not a known number: \'$cimNumber\'" }',
+        "$set[$name] = $CimOutbound[$cimNumber]",
+    ]
+    assert naming("cim") == [
+        "foreach ($cim in @(Get-CimInstance -Namespace 'root/StandardCimv2' -ClassName 'MSFT_NetFirewallProfile' -ErrorAction Stop)) {",
+        "$name = [string]$cim.Name",
+        "$cimNumber = [string]$cim.DefaultOutboundAction",
+    ]
+    # the CIM map is defined once and then only looked into: nothing assigns into it, adds to it or changes it
+    assert naming("CimOutbound") == [
+        "$CimOutbound = @{ '0' = 'NotConfigured'; '2' = 'Allow'; '4' = 'Block' }",
+        'if (-not $CimOutbound.ContainsKey($cimNumber)) { throw "CIM DefaultOutboundAction of $name is not a known number: \'$cimNumber\'" }',
+        "$set[$name] = $CimOutbound[$cimNumber]",
+    ]
+    assert not re.search(r"\$\{|\$(local|script|global|private|using|variable):|-Variable\b|\[ref\]", fast, re.I)
+
+
+def test_configured_is_written_in_one_place_per_way_and_read_only_by_compare():
+    """Not a line of the script may name the Configured property but the one fast assignment, the one cmdlet
+    assignment and Compare's field list: no $rows[0].Configured = ..., no $_.Configured, no Add-Member Configured."""
+    code = _code_lines(_ps1())
+    named = [l for l in code if re.search(r"(?<![\w$])configured\b", l, re.I)]
+    assert named == [
+        "Configured = $configured[[string]$_.Name]",
+        "Configured = $set[$name]",
+        "foreach ($field in @('Enabled', 'DefaultOutboundAction', 'Configured')) {",
+    ], named
+
+
+# ---- the invariant itself, not the name set as its proxy ----------------------------------------
+
+
+def test_compare_checks_that_each_tdc_rule_has_its_name_as_its_display_name():
+    case = _op_case(_ps1(), "Compare")
+    lines = _code_lines(case)
+    assert "foreach ($rule in @(Get-NetFirewallRule -Name 'TDC-FW-*' -ErrorAction SilentlyContinue)) {" in lines
+    assert "if (-not ([string]$rule.DisplayName -ceq [string]$rule.Name)) {" in lines
+    assert 'what = "rule $([string]$rule.Name) DisplayName is not its Name"' in lines
+    assert "fast = [string]$rule.DisplayName" in lines and "cmdlet = [string]$rule.Name" in lines
+    assert "# The invariant itself" in case
+
+
+# ---- the stderr marker: Get alone, and split where PowerShell breaks a line -----------------------
+
+
+def test_a_marker_whose_reason_holds_unicode_line_separators_is_still_read(monkeypatch):
+    seen = _observed(monkeypatch)
+    reason = "sample said \u2028 and \x85 and \u001c"
+    err = json.dumps({"Via": "cmdlet", "Fallback": reason}, ensure_ascii=False) + "\r\n"
+    assert "\u2028" in err and "\x85" in err
+    rules_mod._describe(_answering_err("", err), "TDC-FW-ISO-cut")
+    assert seen[0]["via"] == "cmdlet" and seen[0]["fallback"] == reason
+
+
+def test_only_get_takes_its_way_from_stderr(monkeypatch):
+    seen = _observed(monkeypatch)
+    marker = '{"Via":"cmdlet","Fallback":"x"}\n'
+    rules_mod._ok(_answering_err("", marker), "Remove", Name="TDC-FW-ISO-cut")
+    rules_mod._ok(_answering_err("", marker), "Enable")
+    assert [set(r) for r in seen] == [{"op", "lock", "wait_ms", "run_ms", "rc", "thread"}] * 2
+    rules_mod._ok(_answering_err("", marker), "Get", Name="TDC-FW-ISO-cut")
+    assert seen[-1]["via"] == "cmdlet"

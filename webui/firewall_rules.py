@@ -118,7 +118,7 @@ _LOCK = threading.RLock()
 # its exit code and the thread's name. No parameter and no output is in it, with one exception: an answer that names
 # the way it was read (``Via``, "fast" or "cmdlet") adds ``via``, and on a fallback ``fallback``, its reason (at most
 # MAX_FALLBACK_CHARS), so that a fallback that keeps happening can be found and does not only show as slowness. An
-# answer with no marker on stdout may carry it on stderr (``Get`` for a rule that is not there prints nothing). The
+# answer of ``Get`` with no marker on stdout carries it on stderr (for a rule that is not there it prints nothing). The
 # wait is measured where the lock is taken, because a press that waits for someone else's run is the variance a
 # single call cannot show.
 CALL_OBSERVER: Optional[Callable[[Dict[str, Any]], None]] = None
@@ -222,11 +222,12 @@ def _way(out: Any) -> Dict[str, str]:
 
 def _way_on_stderr(err: Any) -> Dict[str, str]:
     """The way of an answer that has nothing to say on stdout (``Get`` for a rule that is not there): the first line
-    of stderr that is a JSON object with a ``Via``; ``{}`` when there is none."""
+    of stderr that is a JSON object with a ``Via``; ``{}`` when there is none. Split on the line feed alone, which is
+    what PowerShell ends a line with: ``splitlines`` would also split on U+2028, U+0085 or U+001C inside the reason."""
     if not isinstance(err, str):
         return {}
-    for line in err.splitlines():
-        line = line.strip()
+    for line in err.split("\n"):
+        line = line.rstrip("\r")
         if line.startswith("{") and '"Via"' in line:
             try:
                 return _way(line)
@@ -250,7 +251,10 @@ def _report(args: List[str], started: float, rc: Any, out: Any = None, err: Any 
         record = {"op": str(op), "lock": _held.what if locked else None, "wait_ms": wait, "run_ms": ran,
                   "rc": rc if isinstance(rc, int) else None, "thread": threading.current_thread().name}
         try:
-            record.update(_way(out) or _way_on_stderr(err))
+            way = _way(out)
+            if not way and op == "Get":
+                way = _way_on_stderr(err)
+            record.update(way)
         except Exception:
             pass
         observer(record)
