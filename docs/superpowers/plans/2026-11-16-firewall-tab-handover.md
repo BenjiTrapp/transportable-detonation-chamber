@@ -448,102 +448,163 @@ Every rule change goes through
 
 ### Reads without the NetSecurity module (`-Op Compare`)
 
-The read verbs of `firewall_rules.ps1` (`Profiles`, `List`, `Get`, and the
-rule read behind them) no longer load the NetSecurity module. **COM**
-(`HNetCfg.FwPolicy2`) answers what is **in force**; **CIM** (`MSFT_NetFirewall*`)
-answers what is **configured**. That split is forced, not chosen: COM has no
-representation for `NotConfigured`, and raw CIM cannot reach the ActiveStore
-(`root/standardcimv2/ActiveStore` answers "Ungültiger Namespace"; raw CIM
-reports `PolicyStoreSource=PersistentStore` for all 538 rules). Every number
-and name is mapped from an exhaustive written-out list; anything not on it
-throws into a fallback onto the old cmdlet path. The fallback is never silent:
-`Via` and a one-line `Fallback` reason reach the call log.
+`List` and `Get` read **TDC's own rules** over **COM** (`HNetCfg.FwPolicy2.Rules`)
+without the NetSecurity module. **`Profiles` and `AllowOut` do not**: both stay
+on the cmdlets, module load and all, and every verb (`List` included) reads the
+profiles through the cmdlets. Every number and spelling COM gives for a rule is
+mapped from an exhaustive written-out list; anything not on it throws into a
+fallback onto the old cmdlet path. The fallback is never silent: `Via` and a
+one-line `Fallback` reason reach the call log.
+
+**`via=` names the way of the rules, not whether the module was loaded.** A
+`List` line with `via=fast` has still loaded the module, for its profiles. A
+`Profiles` or `AllowOut` line carries no `via=` at all. Only `Get` with
+`via=fast` ran without the module.
+
+- **Which store each way reads, as measured.** COM reads the **local store**
+  (the PersistentStore), not what is in force (the experiment is under
+  "`Profiles` was converted and reverted" below). `Get-NetFirewallRule` without
+  `-PolicyStore` reads the PersistentStore too, and Create and Cut write TDC's
+  rules there. So for TDC's rules both sides read the same store, which is why
+  `Compare` agreed on every field. The one bounded residual: a rule named
+  `TDC-FW-*` set by a **group policy** is not in the PersistentStore. If COM's
+  rule collection shows policy rules (unmeasured), the fast read sees it and the
+  cmdlet read does not, and `Compare`'s check of the set of names reports it.
 
 - **`Compare` is a mandatory VM check, and no test on macOS replaces it.** It
   is a verb in the script, not a test harness, so it runs on any VM, including
-  one with group policies. It reads both paths **independently** and compares
-  them field by field; it prints `ok` and exits 0, or exits 1 on any
-  difference. The fake runner of the tests cannot know what COM and CIM say, so
-  only this run can show that they say what the cmdlets say. *Check:*
-  `powershell -File firewall_rules.ps1 -Op Compare; $LASTEXITCODE` in each of
-  the five states below. *If a field differs:* the fast path is wrong, and the
-  tab stays correct only because the read falls back to the cmdlets: slow, and
-  visible as `Fallback` in the call log.
+  one with group policies. It reads TDC's rules both ways **independently**
+  (as `List` and as `Get` read them) and compares them field by field, together
+  with the set of names and the invariant `DisplayName = Name`. It prints
+  `{"ok","rules","checked":{"displayNames","names","fields"},"differences"}` and
+  exits 0, or exits 1 on any difference. **`rules` is how many TDC rules either
+  way found; `rules: 0` means nothing was compared, whatever `ok` says.** The
+  profiles are not compared: they have one way only. The fake runner of the
+  tests cannot know what COM says, so only this run can show that it says what
+  the cmdlets say. *Check:* `powershell -File firewall_rules.ps1 -Op Compare;
+  $LASTEXITCODE` with TDC rules standing, at least state A and B below. *If a
+  field differs:* the fast path is wrong, and the tab stays correct only because
+  the read falls back to the cmdlets: slow, and visible as `Fallback` in the
+  call log.
 
-  Final run, all five green:
+  The final run before the `Profiles` revert, all five green. It printed one
+  `checked` total that included 9 profile fields, which are no longer compared;
+  the split below is what the same states give in today's shape:
 
-  | State | Compare | Fields checked | What it confirms |
-  |---|---|---|---|
-  | A: nothing isolated; an IPv4 **and** an IPv6 rule, each with port and program | exit 0 | 51 | both address spellings, port, program path |
-  | B: the cut standing | exit 0 | 30 | the catch-all: protocol Any, program Any, address Any |
-  | C: converged (Block on all three profiles) | exit 0 | 9 | COM action `0` = Block, CIM `Block` |
-  | D: Domain explicitly `Allow` | exit 0 | 9 | CIM `Allow` |
-  | E: Domain `Allow`, Private `NotConfigured`, Public `Block` | exit 0 | 9 | **COM profile numbers 1 / 2 / 4 = Domain / Private / Public** |
+  | State | Compare then | `checked` total | today: `rules` / `displayNames` / `names` / `fields` | What it confirms |
+  |---|---|---|---|---|
+  | A: nothing isolated; an IPv4 **and** an IPv6 rule, each with port and program | exit 0 | 51 | 2 / 2 / 4 / 36 | both address spellings, port, program path |
+  | B: the cut standing | exit 0 | 30 | 1 / 1 / 2 / 18 | the catch-all: protocol Any, program Any, address Any |
+  | C: converged (Block on all three profiles) | exit 0 | 9 | 0 / 0 / 0 / 0 | nothing about rules: the 9 were all profile fields |
+  | D: Domain explicitly `Allow` | exit 0 | 9 | 0 / 0 / 0 / 0 | nothing about rules |
+  | E: Domain `Allow`, Private `NotConfigured`, Public `Block` | exit 0 | 9 | 0 / 0 / 0 / 0 | nothing about rules |
 
-  **Why D and E exist.** A to C left two holes: all three profiles normally
-  stand identical on that VM, and none of the three configures a profile
-  explicitly as `Allow`. CIM's `Allow` form and the profile numbering would
-  have gone unchecked; a swapped number would have shown only as swapped rows,
-  and only with three different states at once. Put everything back to
-  `NotConfigured` afterwards, as the VM was found.
+  C, D and E confirmed only the profile mapping, which is gone. Today they are
+  empty passes, and the counts say so.
 
-- **Two assumptions the gate disproved.** Both were found only by running it,
-  and neither could have been found on macOS; they are what the gate is worth.
-  1. *CIM hands back the action as a **name*** (`NotConfigured` / `Allow` /
-     `Block`), not only as a number. An earlier probe of the same class on the
-     same VM printed numbers, through a different access path; the cause is
-     unknown. So **both forms are accepted**, each written out, with exact-case
-     matching (a PowerShell hashtable ignores case, so `block` would otherwise
-     have slipped through unlisted).
+- **Three assumptions the gate disproved.** All three were found only by
+  running it on the VM, and none could have been found on macOS; they are what
+  the gate is worth.
+  1. *CIM hands back the profile action as a **name***, not only as a number.
+     No longer in the code: the CIM profile read went with the `Profiles`
+     revert.
   2. *COM writes a single address of either family as a range to itself*:
      `1.1.1.1-1.1.1.1` and `2606:4700:4700::1111-2606:4700:4700::1111`, where
      the cmdlets say `1.1.1.1` and `2606:4700:4700::1111`. A range with
      **different** endpoints still throws, because collapsing it would
      misstate what the rule covers.
+  3. *COM reads the local store, not what is in force* (next point). This one
+     cost the `Profiles` conversion.
 
   Through every failing run the tab stayed correct: the reads still answered on
   the cmdlet path. That is the fallback working as designed.
 
-- **`AllowOut` was deliberately NOT converted. This is the most important
-  line of this section.** Raw CIM answers from the PersistentStore. On a host
-  with group-policy rules the ActiveStore holds rules the PersistentStore does
-  not, and those would be **missing from `allowed_out` entirely**: ISOLATED
-  would report *closed* while they still let traffic out. On the project's VM
-  this is invisible, because it has no group-policy rules at all. The counts
-  there agree exactly (cmdlet ActiveStore 135, cmdlet PersistentStore 135, raw
-  CIM 135), which is precisely why the trap is dangerous. The pin test
+- **`Profiles` was converted and reverted. Do not convert it again without a
+  module-free read of the ActiveStore.** The fast path took the in-force value
+  from COM, believed to read the ActiveStore because COM said `Allow` where the
+  PersistentStore said `NotConfigured`. That only shows COM is not the
+  configured store; a COM that reads the local store and resolves
+  `NotConfigured` to its default answers the same. The two diverge only where a
+  group policy sets a different value, and `Set-NetFirewallProfile -PolicyStore
+  $env:COMPUTERNAME` (the local GPO store) builds that:
+
+  | Store | Domain outbound |
+  |---|---|
+  | local GPO | `Allow` |
+  | PersistentStore | `Block` |
+  | ActiveStore (in force; the policy wins) | `Allow` |
+  | COM | `0` = `Block` |
+
+  `Compare` caught it on its own (`exit=1`, `profile Domain
+  DefaultOutboundAction`, fast `Block`, cmdlet `Allow`). On a host where a
+  policy sets outbound `Allow` while ISOLATED writes `Block` locally, the fast
+  path would have reported **closed** while the egress was **open**: the
+  defect this feature exists to prevent. `verified`, the ISOLATED band and
+  `startup_state` all rest on that value. The configured half from CIM was
+  correct, but the in-force half needs the cmdlets and so loads the module
+  anyway, so nothing was left to save. The pin test
+  `test_profiles_stays_on_the_cmdlets_because_com_reads_the_local_store_not_what_is_in_force`
+  holds it. The VM was put back afterwards (`NotConfigured` on all three
+  profiles, an empty GPO store).
+
+- **`AllowOut` was deliberately NOT converted.** Raw CIM answers from the
+  PersistentStore. On a host with group-policy rules the ActiveStore holds rules
+  the PersistentStore does not, and those would be **missing from
+  `allowed_out` entirely**: ISOLATED would report *closed* while they still let
+  traffic out. On the project's VM this is invisible, because it has no
+  group-policy rules at all. The counts there agree exactly (cmdlet ActiveStore
+  135, cmdlet PersistentStore 135, raw CIM 135), which is precisely why the trap
+  is dangerous. The pin test
   `test_allowout_stays_on_the_cmdlets_because_cim_cannot_read_the_activestore`
-  holds it. `AllowOut` did not appear in the measured steady-state load.
-  *Do not convert it without a way to read the ActiveStore.*
+  holds it.
 
-- **Measured before and after** (VM, unloaded):
+- **How far "CIM cannot reach the ActiveStore" goes.** Two routes were tried
+  and both failed: a namespace (`root/standardcimv2/ActiveStore`, "Ungültiger
+  Namespace") and a query filter (`PolicyStore='ActiveStore'`, "Die Anfrage ist
+  ungültig"). The route the NetSecurity CDXML probably takes, `-PolicyStore` as
+  a CIM **operation option** (`CimOperationOptions.SetCustomOption`), was
+  **never measured**. Measuring it is the one thing that could bring a fast
+  in-force read back, for `Profiles` and `AllowOut` alike; until then both stay
+  on the cmdlets, and the pin tests forbid that option in the script.
 
-  | | before | after |
-  |---|---|---|
-  | one read, fresh process (`Profiles`) | 1.65 s | **0.59 s** |
-  | `List` | 1.65 s | **0.56 s** |
-  | `Get` | 1.65 s | **0.58 s** |
-  | bare `powershell.exe -Command exit` (the floor) | 0.36 s | not applicable |
-  | calls per 100 s of a watching tab | 5 | **2** |
-  | `powershell.exe` busy | 18 % | **3.3 %** |
-  | fallbacks in that window | not applicable | **none** (`{'fast': 2}`) |
+- **Measured before and after** (VM, unloaded). The "after" column is from the
+  run with the fast `Profiles`; it no longer holds for `Profiles` or `List`:
 
-  **The timings are also the proof that the module is not loaded.** A module
+  | | before | after (fast `Profiles`) | expected now |
+  |---|---|---|---|
+  | `Profiles`, fresh process | 1.65 s | 0.59 s | about 1.65 s again (the module) |
+  | `List` | 1.65 s | 0.56 s | about 1.65 s again: its profiles load the module |
+  | `Get` | 1.65 s | 0.58 s | 0.58 s, unchanged |
+  | bare `powershell.exe -Command exit` (the floor) | 0.36 s | not applicable | not applicable |
+  | calls per 100 s of a watching tab | 5 | 2 | to be measured again |
+  | `powershell.exe` busy | 18 % | 3.3 % | to be measured again |
+  | fallbacks in that window | not applicable | none (`{'fast': 2}`) | to be measured again |
+
+  **The timings are also the proof of whether the module was loaded.** A module
   load costs about 1.3 s on its own (0.36 s bare against 1.65 s with it), so a
   verb answering in 0.6 s cannot have loaded it. A separate module check is not
   needed, and an attempt to make one by inspecting a child process is
   meaningless: the child's module state is gone when it exits.
 
 - **What this VM cannot prove.**
-  - **The Local / GroupPolicy distinction**, because it has no group-policy
-    rules. The run shows only that nothing is mis-reported as policy and no
-    rule is lost. *One local GPO outbound Allow rule would prove it.*
-  - **Never exercised, because TDC does not write them:** an inbound rule (COM
-    direction `1`), rules limited to one or two profiles (masks `1` to `6`),
-    and UDP (`17`). If any appears, that read falls back to the cmdlets, so
-    nothing is misreported.
-  - **CIM's numeric form on this script's path** never appeared. Both forms
-    are accepted anyway.
+  - **The Local / GroupPolicy distinction for rules**, because it has no
+    group-policy rules. *One local GPO outbound Allow rule would prove it*, the
+    way the local GPO profile value above proved the profile case.
+  - **Mapped but not confirmed by `Compare`.** These values are **in** the
+    maps, so they are read on the fast path and passed through; no `Compare`
+    run has held them up against the cmdlets, because no TDC rule in the five
+    states had them:
+    - rule Direction `1` (Inbound);
+    - profile masks `1` to `6` (a rule on one or two profiles);
+    - Protocol `17` (UDP), which TDC does write: `_block_spec` accepts
+      `protocol='udp'` and `_create_params` sends `-Protocol UDP`;
+    - Action `1` (Allow) on a rule, which `allow_fetch` writes and `_write`
+      verifies through `Get`, so over COM;
+    - `Enabled` false, a disabled rule.
+
+    *Check:* a `Compare` run with a UDP block, an `allow_fetch` rule and a
+    disabled TDC rule standing; one hand-made rule on one profile covers the
+    masks.
 
 ### Blocking
 
@@ -913,13 +974,23 @@ erzwungene Lesen in `/rules`; das ist behoben (16 → 5 Aufrufe, 42 % → 18 %, 
 
 ### Stand nach den modulfreien Lesevorgängen (gemessen, VM)
 
-Die Lesevorgänge von `firewall_rules.ps1` laden das NetSecurity-Modul nicht mehr
-(Abschnitt „Reads without the NetSecurity module“ oben). **Die Zahlen der
-Tabellen und der Vorher/nachher-Tabelle oben sind damit überholt.** Ein
-Lesevorgang kostet 0,56–0,59 s statt 1,65 s. Der Tab im Dauerbetrieb, 100 s,
-niemand drückt etwas:
+**Nachtrag nach dem Rückbau von `Profiles`: die Spalte „damals“ unten gilt
+nicht mehr.** `Profiles` liest wieder über die Cmdlets (COM liest den lokalen
+Store, nicht den gültigen; Abschnitt „Reads without the NetSecurity module“
+oben), und `List` lädt für seine Profile damit ebenfalls das Modul. Nur `Get`
+liest noch ohne Modul. Erwartet: `Profiles` und `List` wieder um 1,65 s, `Get`
+unverändert 0,58 s; der Druck (`Profiles`, dann `Cut`) wieder bei den Zahlen
+von vor diesem Plan. Die Zahl der Aufrufe ändert der Rückbau nicht; die
+Auslastung steigt mit der Dauer je Aufruf und ist neu zu messen. Im Aufruf-Log
+heißt `via=fast` bei `List` nur noch „Regeln über COM“, nicht „ohne Modul“, und
+`Profiles` trägt gar kein `via=` mehr: ein neues `{'fast': 2}` wäre also kein
+Beleg für modulfreie Aufrufe.
 
-| | davor (18-%-Messung oben) | jetzt |
+Damals, mit dem schnellen `Profiles`: die Lesevorgänge von `firewall_rules.ps1`
+luden das NetSecurity-Modul nicht mehr, ein Lesevorgang kostete 0,56–0,59 s
+statt 1,65 s. Der Tab im Dauerbetrieb, 100 s, niemand drückt etwas:
+
+| | davor (18-%-Messung oben) | damals (schnelles `Profiles`) |
 |---|---|---|
 | PowerShell-Aufrufe je 100 s | 5 | **2** |
 | `powershell.exe` ausgelastet | 18 % | **3,3 %** |

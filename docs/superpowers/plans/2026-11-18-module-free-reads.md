@@ -59,7 +59,9 @@ pytest.
 
 ---
 
-### Task 1: `Profiles` ohne Modul, mit Rückfall und `Compare`
+### Task 1: `Profiles` ohne Modul, mit Rückfall und `Compare` — SUPERSEDED
+
+> **Superseded.** Der schnelle Weg für `Profiles` ist zurückgenommen: COM liest den lokalen Store, nicht den gültigen, gemessen mit einem lokalen GPO-Wert. Übrig aus dieser Aufgabe sind nur `Compare` (für die Regeln) und die Rückfall- und `Via`-Mechanik, die `List` und `Get` benutzen. Siehe „Amended after the VM run“ in der Spec.
 
 **Files:**
 - Modify: `webui/firewall_rules.ps1` (Kopfkommentar, `ValidateSet` von `$Op`,
@@ -202,7 +204,9 @@ git commit -m "perf(firewall): List and Get read the rules over COM, with the sa
 
 ---
 
-### Task 3: `AllowOut` ohne Modul — mit der Store-Quelle
+### Task 3: `AllowOut` ohne Modul — mit der Store-Quelle — SUPERSEDED
+
+> **Superseded.** `AllowOut` ist zurückgenommen und liest wie vorher `Get-NetFirewallRule -PolicyStore ActiveStore`: rohes CIM gab alle Regeln aus dem PersistentStore. Siehe „Amended after the VM run“ in der Spec.
 
 **Files:**
 - Modify: `webui/firewall_rules.ps1` (`'AllowOut'`, `Get-ForeignAllowOut`, `Compare`)

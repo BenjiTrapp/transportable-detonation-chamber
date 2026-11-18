@@ -183,3 +183,93 @@ Cmdlets. Genau dafür ist `Compare` da, und es gehört als Pflichtcheck in
    erhöhten Dauer-Sitzung in der Kammer.
 3. **`Compare` lebt im Skript, nicht im Testordner** — damit es auf jeder VM
    läuft, auch auf einer mit Gruppenrichtlinien.
+
+## Amended after the VM run — Nachtrag nach dem VM-Lauf
+
+**Dieser Abschnitt geht allem oben vor.** Oben steht der Entwurf, wie er
+geplant war; der VM-Lauf hat zwei seiner vier Verben zurückgenommen. Wo der
+Text oben von „den vier Lese-Verben“, von CIMs `PolicyStoreSourceType` als
+„die einzige, die die Store-Quelle korrekt liefert“, von `Compare` über die
+Allow-Out-Menge oder von „Die Python-Seite wird nicht geändert“ spricht, gilt
+das Folgende.
+
+### Was umgestellt ist
+
+Nur **`List` und `Get`** lesen TDCs eigene Regeln über COM
+(`HNetCfg.FwPolicy2.Rules`), mit der geschriebenen Zuordnung, dem Rückfall auf
+die Cmdlets und `Via`/`Fallback` im Aufruf-Log. Ohne Modul läuft damit nur
+`Get` (0,58 s); `List` lädt das Modul für seine Profile weiter. Für Regeln
+lesen beide Wege denselben Store: COM liest den lokalen Store (siehe unten),
+`Get-NetFirewallRule` ohne `-PolicyStore` den PersistentStore, und dorthin
+schreiben `Create` und `Cut`. Deshalb stimmte `Compare` feldweise überein. Der
+begrenzte Rest: eine `TDC-FW-*`-Regel aus einer Gruppenrichtlinie liegt nicht
+im PersistentStore; zeigt COM sie (für Regeln nicht gemessen), sieht nur der
+schnelle Weg sie, und `Compare`s Prüfung der Namensmenge meldet das.
+
+### `AllowOut` zurückgenommen
+
+`AllowOut` muss den ActiveStore lesen, Gruppenrichtlinie eingeschlossen. Rohes
+CIM gab auf der VM alle 538 Regeln aus dem PersistentStore; die Zählungen
+stimmten (135/135/135) nur, weil die VM keine Richtlinien-Regeln hat. Auf einem
+Host mit solchen Regeln fehlten sie in `allowed_out`, und ISOLATED meldete
+„zu“, während sie Verkehr hinauslassen. COM hat kein `PolicyStoreSourceType`.
+`AllowOut` liest deshalb wie vorher `Get-NetFirewallRule -PolicyStore
+ActiveStore`; ein Pin-Test hält das fest.
+
+### `Profiles` zurückgenommen — mit dem Experiment
+
+Der schnelle Weg nahm den *in Kraft* befindlichen Wert von COM. Belegt war nur,
+dass COM **nicht** der konfigurierte Store ist (COM `Allow`, wo der
+PersistentStore `NotConfigured` sagte); ein COM, der den lokalen Store liest
+und `NotConfigured` zu seinem Standard auflöst, antwortet genauso. Beide
+unterscheiden sich nur, wo eine Richtlinie einen anderen Wert setzt.
+`Set-NetFirewallProfile -PolicyStore $env:COMPUTERNAME` schreibt den lokalen
+GPO-Store und baut genau diesen Zustand:
+
+| Store | Domain, ausgehend |
+|---|---|
+| lokale GPO | `Allow` |
+| PersistentStore | `Block` |
+| ActiveStore (in Kraft; die Richtlinie gewinnt) | `Allow` |
+| COM | `0` = `Block` |
+
+**COM liest den lokalen Store, nicht den gültigen.** `Compare` hat es selbst
+gefunden (`exit=1`, `profile Domain DefaultOutboundAction`, schnell `Block`,
+Cmdlet `Allow`). Auf einem Host, auf dem eine Richtlinie `Allow` setzt,
+während ISOLATED lokal `Block` schreibt, hätte der schnelle Weg „zu“ gemeldet,
+während der Ausgang offen ist — das erste Anti-Ziel oben. `verified`, das
+ISOLATED-Band und `startup_state` ruhen auf diesem Wert. Die konfigurierte
+Hälfte aus CIM war richtig, aber die gültige braucht die Cmdlets und lädt das
+Modul ohnehin; es bleibt nichts zu sparen. `Profiles` liest deshalb wieder
+beide Stores über die Cmdlets, `Compare` vergleicht keine Profile mehr, und ein
+Pin-Test hält das fest. Die VM wurde danach zurückgesetzt.
+
+### Wie weit „rohes CIM erreicht den ActiveStore nicht“ reicht
+
+Versucht wurden zwei Wege: ein Namespace (`root/standardcimv2/ActiveStore`,
+„Ungültiger Namespace“) und ein Abfragefilter (`PolicyStore='ActiveStore'`,
+„Die Anfrage ist ungültig“). Nicht gemessen ist der Weg, den die
+NetSecurity-CDXML vermutlich nimmt: `-PolicyStore` als CIM-**Operationsoption**
+(`CimOperationOptions.SetCustomOption`). Ihn zu messen ist das Einzige, was ein
+schnelles Lesen des gültigen Werts zurückbringen könnte, für `Profiles` und
+`AllowOut`.
+
+### Die Python-Seite
+
+Sie **wurde** geändert, und nur dafür, was dieser Entwurf selbst verlangt: dass
+ein Rückfall im Aufruf-Log steht. `firewall_rules.py` liest `Via` und
+`Fallback` aus der Antwort (bei einem `Get` ohne Regel von stderr) und gibt sie
+an `CALL_OBSERVER`; `app.py` schreibt sie in die Aufruf-Zeile. Kein Aufrufer,
+kein JSON-Vertrag und kein vorhandener Test der Python-Seite wurde geändert.
+
+### `Compare` heute
+
+Es vergleicht nur TDCs Regeln, wie `List` und wie `Get` sie schnell lesen,
+gegen die Cmdlets, dazu die Namensmenge und `DisplayName = Name`. Die Ausgabe
+zählt getrennt: `{"ok","rules","checked":{"displayNames","names","fields"},
+"differences"}`. `rules: 0` heißt: nichts verglichen, was auch immer `ok` sagt.
+
+### Entscheidung 1 oben
+
+„Der Druck wird schneller, weil sein Profil-Lesen billiger wird“ gilt nicht
+mehr: der Druck liest die Profile wieder über die Cmdlets.
