@@ -92,6 +92,34 @@ result cannot carry stays in the row, grey, with the reason in its tooltip
 chosen tab holds while type and columns stay the same; other columns open the
 default of their type again.
 
+![LOGS tab with the COMMANDS card open: the search source=dns | top 10 query over 24H, the source chips with their counts, EVENTS OVER TIME, the card with the SEARCH group open and PIPES, TIME and SOURCES folded, the field list, the tabs EVENTS, STATISTICS and VISUALIZATION, the forms TABLE, PIE, BARS, LINE and SANKEY with SAVE, and the result as a table of queried names](../static/logs_commands.png)
+
+> The same search over the last 24 hours: 10 rows from 185 events in 134.3 ms,
+> LIVE on. Under the search box (the query highlighted, then EXAMPLES, the `?`
+> button and SEARCH) stand the range buttons with `24H` active and the source
+> chips with their counts: POWERSHELL 1,658, ACCESS 10,000, MCP 1, NETFLOW 234,
+> DNS 197 (the active source) and FIREWALL 10,000. EVENTS OVER TIME draws one
+> series, `dns 185`, in bars from 12:00 to 11:00 the next day, the highest of
+> 27 events. In the left column the **COMMANDS card** has its SEARCH group
+> open with ten rows (`word`, `"a phrase"`, `field=value`, `field!=value`,
+> `field>5`, `AND`, `OR`, `NOT`, `( )` and `*`, each with what it does) and
+> PIPES (10), TIME (2) and SOURCES (6) folded beneath it; under the card the
+> field list shows 6 fields (`image`, `pid`, `query`, `result`, `source`
+> unfolded to `dns 185`, and `status`), each in all 185 events. On the right
+> STATISTICS is the active tab and TABLE the active form, with PIE, BARS, LINE
+> and SANKEY beside it and SAVE at the end of the row. The table counts the
+> queried names: `github.com` 100 (54.1%), `example.com` 21 (11.4%),
+> `www.loldrivers.io` 21 (11.4%), `WIN-T6JBL58QBH8` 12 (6.5%),
+> `www.msftconnecttest.com` 10 (5.4%), then `api.github.com`,
+> `community.chocolatey.org`, `download.sysinternals.com` and
+> `raw.githubusercontent.com` with 5 each and
+> `eip-terr-eu.cdp1.digicert.com.akahost.net` with 1.
+>
+> Two of those names are not the sample's. `www.loldrivers.io` and
+> `download.sysinternals.com` are the downloads of the tool installers on the
+> chamber, and `WIN-T6JBL58QBH8` is a NetBIOS name, not a domain, so a host name
+> in a DNS top list is not always somewhere the malware went.
+
 **SAVE** puts the result on a dashboard of your own (see
 [Own dashboards](#own-dashboards)): it asks for a name (prefilled from the
 pipes — the fields after `by`, or the field of `top` / `rare`), the dashboard
