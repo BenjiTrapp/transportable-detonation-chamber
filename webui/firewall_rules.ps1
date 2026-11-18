@@ -13,7 +13,8 @@
 #                       way did not answer. The verbs that write read the profiles through the cmdlets, without Via.
 #   Compare             reads the profiles and TDC's rules both ways and holds them up against each other, field by
 #                       field: {"ok","checked","differences":[{"what","fast","cmdlet"}]}. Every TDC-FW-* rule with every
-#                       field of List, as List and as Get read it fast; a rule only one way finds is a difference. Exit 0
+#                       field of List, as List and as Get read it fast; a rule only one way finds is a difference. And
+#                       the allow-out set of AllowOut: its names, and each rule's Source, DisplayName and Group. Exit 0
 #                       when they agree, 1 when not (or when the cmdlets cannot be read; then stderr says why). Writes nothing.
 #   Enable              switch the three profiles on
 #   List                {"profiles": [...], "rules": [...], "Via"[, "Fallback"]}: the profiles as Profiles gives them,
@@ -25,11 +26,13 @@
 #   Remove -Name        remove the rule (no error when it is not there)
 #   SetDefaultOutbound -DefaultOutboundAction [-Profiles Domain,Private]
 #                       in the PersistentStore, then the three profiles as Profiles gives them, read back
-#   AllowOut            {"profiles": [...], "rules": [{"Name","DisplayName","Group","Source"}]}: the profiles as
-#                       Profiles gives them, and every enabled outbound Allow rule in
+#   AllowOut            {"profiles": [...], "rules": [{"Name","DisplayName","Group","Source"}], "Via"[, "Fallback"]}: the
+#                       profiles as Profiles gives them, and every enabled outbound Allow rule in
 #                       force (ActiveStore) that is not TDC's. DefaultOutboundAction Block governs only traffic that no
 #                       rule matches, so each of these still lets traffic out. Source is PolicyStoreSourceType: only
-#                       Local rules (the PersistentStore) can be switched here; a GroupPolicy rule cannot.
+#                       Local rules (the PersistentStore) can be switched here; a GroupPolicy rule cannot. Read fast
+#                       (raw CIM), Source is Local or, for any other store source, its number: never Local by a guess.
+#                       Via is "fast" only when both were read without the module.
 #   DisableAllowOut -Names <base64>, EnableAllowOut -Names <base64>
 #                       switch the named local outbound Allow rules off or on. -Names is base64 of a UTF-8 JSON list
 #                       of rule names, so no name is ever a wildcard or a parameter. Only outbound Allow rules of the
@@ -74,6 +77,9 @@
 #   stays on the PersistentStore, as it always read: a fallback answers what it answered before, never another store.
 # COM's rule Name is what the cmdlets call DisplayName, not the Name a rule is looked up by: the two are one for TDC's
 # rules only because Create and Cut write DisplayName = Name, and Compare checks exactly that for every TDC rule.
+# The outbound Allow rules of AllowOut come from raw CIM (MSFT_NetFirewallRule) instead, because COM has no
+# PolicyStoreSourceType, and that is what tells a local rule, which ISOLATED switches off, from a group-policy one,
+# which it cannot and must report as staying open. CIM is asked for the ActiveStore by name, as the cmdlet is.
 
 param(
     [Parameter(Mandatory = $true)]
@@ -383,6 +389,86 @@ function Get-ForeignAllowOut {
     })
 }
 
+# The same list without the NetSecurity module, in the shape of Get-ForeignAllowOut, from raw CIM. Not from COM: COM
+# has no PolicyStoreSourceType, and without it a group-policy rule cannot be told from a local one.
+# The store is asked for, as Get-NetFirewallRule -PolicyStore ActiveStore asks for it: a PolicyStore operation option.
+# A plain query answers the PersistentStore, which holds no group-policy rule at all; such a rule would then not be
+# reported as staying open, and ISOLATED would say closed where traffic still gets out. The option is sent with
+# mustComply, so a provider that does not take it refuses instead of quietly answering another store.
+# Throws on anything it cannot vouch for, and emits nothing until every rule is read.
+function Read-FastAllowOut {
+    # The numbers of MSFT_NetFirewallRule, each written out like those of Read-FastProfileStates and, like them,
+    # confirmed only by Compare. Measured on the VM: Direction 2, Action 2, Enabled 1 find the 135 the cmdlets find;
+    # the others are the provider's documented values. No arithmetic on them; a number that is not here throws.
+    $CimRuleDirection = @{ '1' = 'Inbound'; '2' = 'Outbound' }
+    $CimRuleAction = @{ '2' = 'Allow'; '4' = 'Block' }
+    $CimRuleEnabled = @{ '1' = 'True'; '2' = 'False' }
+    # PolicyStoreSourceType: measured, 1 on a rule of the PersistentStore. Only that one number is named, because it
+    # is the one that makes a rule switchable here. Any other number is passed on as that number, never as a guessed
+    # name, and so is never Local: an unknown store source must not make a rule look as if it could be switched off.
+    $CimStoreSource = @{ '1' = 'Local' }
+    Add-Type -AssemblyName 'Microsoft.Management.Infrastructure'
+    $options = New-Object Microsoft.Management.Infrastructure.Options.CimOperationOptions
+    $options.SetCustomOption('PolicyStore', 'ActiveStore', $true)
+    $session = [Microsoft.Management.Infrastructure.CimSession]::Create($null)
+    try {
+        $instances = @($session.EnumerateInstances('root/StandardCimv2', 'MSFT_NetFirewallRule', $options))
+    } finally {
+        $session.Dispose()
+    }
+    $views = @()
+    $seen = @{}
+    $count = 0
+    foreach ($cim in $instances) {
+        $count += 1
+        # InstanceID is what the cmdlets call Name: the ID that the switching verbs look a rule up by.
+        $name = [string]$cim.InstanceID
+        if (-not $name) { throw "CIM gives a rule without a name" }
+        if ($seen.ContainsKey($name)) { throw "CIM names the rule $name twice" }
+        $seen[$name] = $true
+        # A rule is left out only on a known number that says it is not an enabled outbound Allow; leaving out one
+        # that lets traffic out is the defect, so every number on the way there that is not known throws.
+        $direction = [string]$cim.Direction
+        if (-not $CimRuleDirection.ContainsKey($direction)) { throw "CIM Direction of $name is not a known number: '$direction'" }
+        if ($CimRuleDirection[$direction] -ne 'Outbound') { continue }
+        $action = [string]$cim.Action
+        if (-not $CimRuleAction.ContainsKey($action)) { throw "CIM Action of $name is not a known number: '$action'" }
+        if ($CimRuleAction[$action] -ne 'Allow') { continue }
+        $enabled = [string]$cim.Enabled
+        if (-not $CimRuleEnabled.ContainsKey($enabled)) { throw "CIM Enabled of $name is not a known number: '$enabled'" }
+        if ($CimRuleEnabled[$enabled] -ne 'True') { continue }
+        if ($name.StartsWith('TDC-FW-')) { continue }
+        $sourceNumber = [string]$cim.PolicyStoreSourceType
+        if ($CimStoreSource.ContainsKey($sourceNumber)) { $source = $CimStoreSource[$sourceNumber] }
+        elseif ($sourceNumber -match '^\d+\z') { $source = $sourceNumber }
+        else { throw "CIM PolicyStoreSourceType of $name is not a number: '$sourceNumber'" }
+        # Local is what the switching verbs act on, and they act on the PersistentStore alone: both must say so.
+        if ($source -ceq 'Local' -and [string]$cim.PolicyStoreSource -cne 'PersistentStore') { throw "CIM says $name is Local but from '$([string]$cim.PolicyStoreSource)'" }
+        # DisplayName and Group come from Windows and, for a rule a sample made, from the sample: passed on as text.
+        $views += [pscustomobject]@{
+            "Name" = $name
+            "DisplayName" = [string]$cim.DisplayName
+            "Group" = [string]$cim.DisplayGroup
+            "Source" = $source
+        }
+    }
+    if ($count -eq 0) { throw 'CIM gives no rules at all' }
+    return $views
+}
+
+# The outbound Allow rules for AllowOut, with the way they were read: {Rules, Via, Fallback}. The fast way first; on
+# any doubt the cmdlet read, and Fallback says why.
+function Get-AllowOutRules {
+    try {
+        $rows = @(Read-FastAllowOut)
+        return [pscustomobject]@{ Rules = $rows; Via = 'fast'; Fallback = $null }
+    } catch {
+        $fallback = Get-ShortReason $_
+    }
+    $rows = @(Get-ForeignAllowOut)
+    return [pscustomobject]@{ Rules = $rows; Via = 'cmdlet'; Fallback = $fallback }
+}
+
 function Get-NameList {
     param([string]$Text)
     if ($Text -notmatch '^[A-Za-z0-9+/]+={0,2}\z') { throw '-Names must be base64' }
@@ -550,6 +636,43 @@ try {
                     }
                 }
             }
+            # The allow-out set: every enabled outbound Allow rule that is not TDC's, as AllowOut reads it fast, against
+            # the cmdlets. A rule only one side finds is a difference; so is a store source that is not the same, since
+            # the source is what says whether ISOLATED can switch the rule off.
+            $cmdletAllow = @{}
+            foreach ($row in @(Get-ForeignAllowOut)) { $cmdletAllow[[string]$row.Name] = $row }
+            $fastAllow = @{}
+            $allowRead = $true
+            try {
+                foreach ($row in @(Read-FastAllowOut)) { $fastAllow[[string]$row.Name] = $row }
+            } catch {
+                $allowRead = $false
+                $differences += [pscustomobject]@{ what = 'allow out'; fast = "error: $(Get-ShortReason $_)"; cmdlet = 'read' }
+            }
+            if ($allowRead) {
+                $allowNames = @(@($fastAllow.Keys) + @($cmdletAllow.Keys) | Sort-Object -Unique)
+                foreach ($name in $allowNames) {
+                    $checked += 1
+                    $inFast = $fastAllow.ContainsKey($name)
+                    $inCmdlet = $cmdletAllow.ContainsKey($name)
+                    if ($inFast -ne $inCmdlet) {
+                        $differences += [pscustomobject]@{
+                            what = "AllowOut rule names: $name found by one side only"
+                            fast = $(if ($inFast) { 'found' } else { 'not found' })
+                            cmdlet = $(if ($inCmdlet) { 'found' } else { 'not found' })
+                        }
+                        continue
+                    }
+                    foreach ($field in @('Source', 'DisplayName', 'Group')) {
+                        $checked += 1
+                        $a = $fastAllow[$name].$field
+                        $b = $cmdletAllow[$name].$field
+                        if (-not (Test-SameValue $a $b)) {
+                            $differences += [pscustomobject]@{ what = "AllowOut rule $name $field"; fast = $a; cmdlet = $b }
+                        }
+                    }
+                }
+            }
             $ok = ($differences.Count -eq 0)
             ConvertTo-Json -Compress -Depth 5 -InputObject ([pscustomobject]@{ ok = $ok; checked = $checked; differences = $differences })
             if (-not $ok) { exit 1 }
@@ -651,7 +774,18 @@ try {
             ConvertTo-Json -Compress -Depth 3 -InputObject (Get-ProfileStates)
         }
         'AllowOut' {
-            ConvertTo-Json -Compress -Depth 4 -InputObject ([pscustomobject]@{ profiles = (Get-ProfileStates); rules = @(Get-ForeignAllowOut) })
+            $read = Get-AllowOutRules
+            $states = @(Get-ProfileStates -Fast)
+            # One way for the whole answer, as in List: fast only when the rules and the profiles were both read so.
+            $out = [ordered]@{ profiles = $states; rules = $read.Rules; Via = 'fast' }
+            if ($read.Via -ne 'fast') {
+                $out.Via = 'cmdlet'
+                $out.Fallback = $read.Fallback
+            } elseif ($states[0].Via -ne 'fast') {
+                $out.Via = 'cmdlet'
+                $out.Fallback = $states[0].Fallback
+            }
+            ConvertTo-Json -Compress -Depth 4 -InputObject ([pscustomobject]$out)
         }
         'RemoveIsolate' {
             Remove-IsolateRules

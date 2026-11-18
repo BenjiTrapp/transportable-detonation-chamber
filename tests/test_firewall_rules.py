@@ -3341,3 +3341,198 @@ def test_only_get_takes_its_way_from_stderr(monkeypatch):
     assert [set(r) for r in seen] == [{"op", "lock", "wait_ms", "run_ms", "rc", "thread"}] * 2
     rules_mod._ok(_answering_err("", marker), "Get", Name="TDC-FW-ISO-cut")
     assert seen[-1]["via"] == "cmdlet"
+
+
+# ---- AllowOut without the module: CIM, with the store source that tells a local rule from a policy one ----------
+
+ALLOW_OUT_FIELDS = ("Name", "DisplayName", "Group", "Source")
+
+
+def test_allowout_takes_the_store_source_from_cim_not_com():
+    """COM has no PolicyStoreSourceType; without it a GroupPolicy rule would
+    be reported as local and ISOLATED would try to switch off what it cannot."""
+    branch = _op_branch(_ps1(), "AllowOut")
+    assert "PolicyStoreSourceType" in branch
+    cim = _lines_mentioning(branch, "PolicyStoreSourceType")
+    assert not any("FwPolicy2" in l for l in cim)
+
+
+def test_allowout_keeps_its_four_fields():
+    branch = _op_branch(_ps1(), "AllowOut")
+    for field in ("Name", "DisplayName", "Group", "Source"):
+        assert f'"{field}"' in branch
+
+
+def test_compare_covers_the_allow_out_set_and_its_source():
+    branch = _op_branch(_ps1(), "Compare")
+    assert "AllowOut" in branch and "Source" in branch
+
+
+def test_the_fast_allow_out_view_has_exactly_the_fields_of_the_cmdlet_view():
+    functions = _functions(_ps1())
+    assert re.findall(r'^\s*"(\w+)" = ', functions["Read-FastAllowOut"], re.M) == list(ALLOW_OUT_FIELDS)
+    assert re.findall(r"^\s*(\w+) = \[string\]", functions["Get-ForeignAllowOut"], re.M) == list(ALLOW_OUT_FIELDS)
+
+
+def test_the_fast_allow_out_asks_cim_for_the_store_in_force_and_nothing_else():
+    """Today's read is Get-NetFirewallRule -PolicyStore ActiveStore: what is in force, group policy included. A plain
+    CIM query answers the PersistentStore, which holds no group-policy rule at all: such a rule would not be reported
+    as local, it would not be reported, and ISOLATED would say closed where it is not. So the store is asked for, and
+    the provider must comply or refuse; it may not ignore the option."""
+    fast = _functions(_ps1())["Read-FastAllowOut"]
+    lines = _code_lines(fast)
+    assert "$options.SetCustomOption('PolicyStore', 'ActiveStore', $true)" in lines
+    assert "$instances = @($session.EnumerateInstances('root/StandardCimv2', 'MSFT_NetFirewallRule', $options))" in lines
+    assert len([l for l in lines if "EnumerateInstances" in l or "Get-CimInstance" in l or "QueryInstances" in l]) == 1
+    code = "\n".join(lines)
+    assert "Get-NetFirewall" not in code and "FwPolicy2" not in code and "Get-CimInstance" not in code
+
+
+def test_every_number_of_the_allow_out_fast_path_is_written_out():
+    """CIM Direction 1 In, 2 Out; Action 2 Allow, 4 Block; Enabled 1 True, 2 False; PolicyStoreSourceType 1 Local
+    and nothing else. Nothing computed."""
+    fast = _functions(_ps1())["Read-FastAllowOut"]
+
+    def mapping(var):
+        return dict(re.findall(r"'(\d+)' = '(\w+)'", re.search(r"\$%s = @\{([^}]*)\}" % var, fast).group(1)))
+    assert mapping("CimRuleDirection") == {"1": "Inbound", "2": "Outbound"}
+    assert mapping("CimRuleAction") == {"2": "Allow", "4": "Block"}
+    assert mapping("CimRuleEnabled") == {"1": "True", "2": "False"}
+    assert mapping("CimStoreSource") == {"1": "Local"}
+    assert not re.search(r"-band|-bor|-bxor|-shl|-shr|\[enum\]|-as \[|-like|-ge |-le |-gt |-lt ", fast, re.I)
+
+
+def test_a_rule_is_left_out_only_on_a_number_that_is_known_not_to_be_it():
+    """Leaving out a rule that lets traffic out is the defect; so a rule is skipped only on a known number that says
+    it is not an enabled outbound Allow, and every number on the way there that is not known throws."""
+    fast = _functions(_ps1())["Read-FastAllowOut"]
+    lines = _code_lines(fast)
+    loop = lines[lines.index("foreach ($cim in $instances) {"):]
+    order = [
+        "$direction = [string]$cim.Direction",
+        'if (-not $CimRuleDirection.ContainsKey($direction)) { throw "CIM Direction of $name is not a known number: \'$direction\'" }',
+        "if ($CimRuleDirection[$direction] -ne 'Outbound') { continue }",
+        "$action = [string]$cim.Action",
+        'if (-not $CimRuleAction.ContainsKey($action)) { throw "CIM Action of $name is not a known number: \'$action\'" }',
+        "if ($CimRuleAction[$action] -ne 'Allow') { continue }",
+        "$enabled = [string]$cim.Enabled",
+        'if (-not $CimRuleEnabled.ContainsKey($enabled)) { throw "CIM Enabled of $name is not a known number: \'$enabled\'" }',
+        "if ($CimRuleEnabled[$enabled] -ne 'True') { continue }",
+    ]
+    at = [loop.index(l) for l in order]
+    assert at == sorted(at), "the checks are out of order"
+    assert len([l for l in loop if "continue" in l]) == 4           # the three above and TDC's own rules, nothing else
+    assert "if (-not $name.StartsWith('TDC-FW-')) {" in loop or "if ($name.StartsWith('TDC-FW-')) { continue }" in loop
+    assert "if ($count -eq 0) { throw 'CIM gives no rules at all' }" in lines
+    assert re.search(r"if \(\$seen\.ContainsKey\(\$name\)\) \{ throw ", fast)
+    assert 'if (-not $name) { throw "CIM gives a rule without a name" }' in lines
+
+
+def test_a_rule_is_local_only_when_cim_says_1_and_nothing_else_can_make_it_so():
+    """The whole danger of AllowOut: a group-policy rule reported as Local is one ISOLATED tries to switch off and then
+    does not report as staying open. Local is said in one place, from the number 1 alone; any other number is passed
+    on as that number (which Python reads as not local), and anything that is not a number throws: a text such as
+    'Local' coming from anywhere is never passed on."""
+    fast = _functions(_ps1())["Read-FastAllowOut"]
+    lines = _code_lines(fast)
+    assert [l for l in lines if re.search(r"local", l, re.I) and "PolicyStore" not in l] == [
+        "$CimStoreSource = @{ '1' = 'Local' }"]
+    assert [l for l in lines if re.search(r"\$source\b", l, re.I)] == [
+        "if ($CimStoreSource.ContainsKey($sourceNumber)) { $source = $CimStoreSource[$sourceNumber] }",
+        "elseif ($sourceNumber -match '^\\d+\\z') { $source = $sourceNumber }",
+        "if ($source -ceq 'Local' -and [string]$cim.PolicyStoreSource -cne 'PersistentStore') "
+        "{ throw \"CIM says $name is Local but from '$([string]$cim.PolicyStoreSource)'\" }",
+        '"Source" = $source',
+    ]
+    assert [l for l in lines if re.search(r"\$sourceNumber\b", l, re.I)] == [
+        "$sourceNumber = [string]$cim.PolicyStoreSourceType",
+        "if ($CimStoreSource.ContainsKey($sourceNumber)) { $source = $CimStoreSource[$sourceNumber] }",
+        "elseif ($sourceNumber -match '^\\d+\\z') { $source = $sourceNumber }",
+        'else { throw "CIM PolicyStoreSourceType of $name is not a number: \'$sourceNumber\'" }',
+    ]
+    assert [l for l in lines if re.search(r"\$CimStoreSource\b", l, re.I)] == [
+        "$CimStoreSource = @{ '1' = 'Local' }",
+        "if ($CimStoreSource.ContainsKey($sourceNumber)) { $source = $CimStoreSource[$sourceNumber] }",
+    ]
+    # a rule said to be Local must come from the store DisableAllowOut acts on; otherwise the cmdlets answer
+    assert ("if ($source -ceq 'Local' -and [string]$cim.PolicyStoreSource -cne 'PersistentStore') "
+            "{ throw \"CIM says $name is Local but from '$([string]$cim.PolicyStoreSource)'\" }") in lines
+    assert not re.search(r"\$\{|\$(local|script|global|private|using|variable):|-Variable\b|\[ref\]", fast, re.I)
+
+
+def test_the_display_name_and_group_are_passed_through_as_text():
+    """They come from Windows, and for a rule a sample made, from the sample: text, never a pattern or a command."""
+    fast = _functions(_ps1())["Read-FastAllowOut"]
+    lines = _code_lines(fast)
+    assert '"DisplayName" = [string]$cim.DisplayName' in lines and '"Group" = [string]$cim.DisplayGroup' in lines
+    assert [l for l in lines if re.search(r"DisplayName|DisplayGroup", l)] == [
+        '"DisplayName" = [string]$cim.DisplayName', '"Group" = [string]$cim.DisplayGroup']
+    assert '"Name" = $name' in lines and "$name = [string]$cim.InstanceID" in lines
+    assert not re.search(r"Invoke-Expression|\biex\b|ScriptBlock|-Command|ExpandString|& \$", fast, re.I)
+
+
+def test_allowout_says_which_way_answered_and_falls_back_to_the_cmdlets():
+    script = _ps1()
+    way = _functions(script)["Get-AllowOutRules"]
+    assert re.search(r"try \{\s*\$rows = @\(Read-FastAllowOut\)\s*"
+                     r"return \[pscustomobject\]@\{ Rules = \$rows; Via = 'fast'; Fallback = \$null \}\s*"
+                     r"\} catch \{\s*\$fallback = Get-ShortReason \$_\s*\}", way)
+    assert "$rows = @(Get-ForeignAllowOut)" in way and "Via = 'cmdlet'; Fallback = $fallback" in way
+    case = [l.strip() for l in _op_case(script, "AllowOut").splitlines()]
+    for line in ("$read = Get-AllowOutRules", "$states = @(Get-ProfileStates -Fast)",
+                 "$out = [ordered]@{ profiles = $states; rules = $read.Rules; Via = 'fast' }",
+                 "if ($read.Via -ne 'fast') {", "$out.Fallback = $read.Fallback",
+                 "} elseif ($states[0].Via -ne 'fast') {", "$out.Fallback = $states[0].Fallback"):
+        assert line in case, line
+    assert case.count("$out.Via = 'cmdlet'") == 2
+
+
+def test_the_cmdlet_way_of_allow_out_is_what_it_was():
+    cmdlet = _functions(_ps1())["Get-ForeignAllowOut"]
+    lines = _code_lines(cmdlet)
+    assert "@(Get-NetFirewallRule -PolicyStore ActiveStore | Where-Object {" in lines
+    assert "Source = [string]$_.PolicyStoreSourceType" in lines and "Group = [string]$_.DisplayGroup" in lines
+    assert "-not ([string]$_.Name).StartsWith('TDC-FW-')" in lines
+
+
+def test_the_switching_verbs_are_not_given_what_the_fast_read_found():
+    """DisableAllowOut and EnableAllowOut keep looking the named rules up in the PersistentStore themselves, outbound
+    Allow only, not TDC's: whatever the read said, they act on nothing more."""
+    script = _ps1()
+    for verb in ("DisableAllowOut", "EnableAllowOut", "Create", "Cut", "Remove", "SetDefaultOutbound",
+                 "RemoveIsolate", "Enable"):
+        branch = _op_branch(script, verb)
+        assert "Read-FastAllowOut" not in branch and "Get-AllowOutRules" not in branch and "CimSession" not in branch, verb
+    body = _functions(script)["Set-AllowOut"]
+    assert ("$found = @(Get-NetFirewallRule -PolicyStore PersistentStore | Where-Object {" in body and
+            "$want.ContainsKey([string]$_.Name) -and [string]$_.Direction -eq 'Outbound' -and [string]$_.Action -eq 'Allow'" in body)
+
+
+def test_compare_holds_the_allow_out_set_and_its_source_up_both_ways():
+    case = _op_case(_ps1(), "Compare")
+    lines = _code_lines(case)
+    assert "foreach ($row in @(Get-ForeignAllowOut)) { $cmdletAllow[[string]$row.Name] = $row }" in lines
+    assert "foreach ($row in @(Read-FastAllowOut)) { $fastAllow[[string]$row.Name] = $row }" in lines
+    assert 'what = "AllowOut rule names: $name found by one side only"' in lines
+    fields = re.search(r"foreach \(\$field in @\(('Source'[^)]*)\)\)", case).group(1)
+    assert re.findall(r"'(\w+)'", fields) == ["Source", "DisplayName", "Group"]
+    assert '@{ what = "AllowOut rule $name $field"; fast = $a; cmdlet = $b }' in case
+    assert "$differences += [pscustomobject]@{ what = 'allow out'; fast = \"error: $(Get-ShortReason $_)\"; cmdlet = 'read' }" in lines
+    # the names both ways, each side's own: neither is read from the other
+    names = case[case.index("# The allow-out set"):]
+    assert "$inFast = $fastAllow.ContainsKey($name)" in names and "$inCmdlet = $cmdletAllow.ContainsKey($name)" in names
+    # and over every name either side found, so that a rule only the fast way finds is said too
+    assert "$allowNames = @(@($fastAllow.Keys) + @($cmdletAllow.Keys) | Sort-Object -Unique)" in names
+    assert "foreach ($name in $allowNames) {" in names
+
+
+def test_a_policy_rule_passed_on_as_its_number_is_not_local_and_the_way_is_logged(monkeypatch):
+    """The fast way passes a store source it does not know on as its number; the Python side must read that as a rule
+    it cannot switch off, and log the way the answer came."""
+    seen = _observed(monkeypatch)
+    answer = {"profiles": _rows(Via="fast"), "Via": "cmdlet", "Fallback": "CIM Action of X is not a known number: '3'",
+              "rules": [{"Name": "Pol-Out", "DisplayName": "Policy", "Group": "", "Source": "2"},
+                        {"Name": "Loc-Out", "DisplayName": "Local one", "Group": "G", "Source": "Local"}]}
+    found = rules_mod.allowed_out(_answering(answer))
+    assert [(r["name"], r["local"], r["source"]) for r in found] == [("Loc-Out", True, "Local"), ("Pol-Out", False, "2")]
+    assert seen[0]["op"] == "AllowOut" and seen[0]["via"] == "cmdlet" and seen[0]["fallback"].startswith("CIM Action")
