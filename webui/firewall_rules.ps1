@@ -279,19 +279,23 @@ function Read-FastRuleViews {
         if ($null -eq $app) { $program = 'Any' }
         elseif ($app -is [string] -and $app) { $program = $app }
         else { throw "COM ApplicationName of $name is neither null nor a path: '$app'" }
-        # Every address is * in COM and Any in the cmdlets. A single IPv4 host COM spells as a range from it to itself,
-        # 1.1.1.1-1.1.1.1 (measured on the VM), the cmdlets as 1.1.1.1; an IPv6 host as it is. Only a range whose two
-        # ends are the same text is read as one host: TDC never writes a real range, and collapsing one to an address
-        # would be a lie about what the rule covers, so a range with different ends throws like any other spelling not
-        # compared (a subnet, a keyword).
+        # Every address is * in COM and Any in the cmdlets. COM writes a single address of either family as a range
+        # from it to itself, the cmdlets write it once; both measured on the VM: 1.1.1.1-1.1.1.1 for 1.1.1.1 and
+        # 2606:4700:4700::1111-2606:4700:4700::1111 for 2606:4700:4700::1111. So a token is either one address, or two
+        # ends split on - that are the same text, and that one end must then be an IPv4 or an IPv6 host. A range with
+        # different ends throws: TDC never writes one, and collapsing it to one address would be a lie about what the
+        # rule covers. A subnet or a keyword throws too, as a spelling that has not been compared.
         $remote = $rule.RemoteAddresses
         if (-not ($remote -is [string]) -or -not $remote) { throw "COM RemoteAddresses of $name is empty" }
         if ($remote -eq '*') { $addresses = @('Any') }
         else {
             $addresses = @(foreach ($token in $remote.Split(',')) {
-                if ($token -match '^(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})-(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\z' -and $Matches[1] -eq $Matches[2]) { $Matches[1] }
-                elseif ($token -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\z') { $token }
-                elseif ($token -match '^[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{0,4}){2,7}\z') { $token }
+                $ends = $token.Split('-')
+                if ($ends.Count -eq 1) { $single = $token }
+                elseif ($ends.Count -eq 2 -and $ends[0] -ceq $ends[1]) { $single = $ends[0] }
+                else { throw "COM RemoteAddresses of $name has a spelling that is not known: '$token'" }
+                if ($single -match '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\z') { $single }
+                elseif ($single -match '^[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{0,4}){2,7}\z') { $single }
                 else { throw "COM RemoteAddresses of $name has a spelling that is not known: '$token'" }
             })
         }

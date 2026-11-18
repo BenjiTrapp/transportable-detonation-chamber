@@ -3122,15 +3122,26 @@ def test_an_unknown_rule_number_or_spelling_falls_back_instead_of_guessing():
     for line in (
             "elseif ($app -is [string] -and $app) { $program = $app }",
             "else { throw \"COM ApplicationName of $name is neither null nor a path: '$app'\" }",
-            "if ($token -match '^(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})-(\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})\\z' -and $Matches[1] -eq $Matches[2]) { $Matches[1] }",
-            "elseif ($token -match '^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\z') { $token }",
-            "elseif ($token -match '^[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{0,4}){2,7}\\z') { $token }",
             "else { throw \"COM RemoteAddresses of $name has a spelling that is not known: '$token'\" }",
             "if ($token -match '^\\d{1,5}\\z') { $token }",
             "else { throw \"COM RemotePorts of $name has a spelling that is not known: '$token'\" }",
             "else { throw \"COM RemotePorts of $name is not text: '$remotePorts'\" }"):
         assert line in lines, line
-    assert len([l for l in lines if re.search(r"\{ \$token \}|\$Matches", l)]) == 4      # three for addresses, one for ports
+    assert len([l for l in lines if re.search(r"\{ \$token \}|\$Matches", l)]) == 1      # the port; addresses go by $single
+    # an address is one token, or a range whose two ends are the same text, and that one address must be a host of
+    # either family; these are all the lines that name $single, so no other way through exists
+    assert [l for l in lines if re.search(r"\$single\b", l, re.I)] == [
+        "if ($ends.Count -eq 1) { $single = $token }",
+        "elseif ($ends.Count -eq 2 -and $ends[0] -ceq $ends[1]) { $single = $ends[0] }",
+        "if ($single -match '^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\z') { $single }",
+        "elseif ($single -match '^[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{0,4}){2,7}\\z') { $single }",
+    ]
+    assert [l for l in lines if re.search(r"\$ends\b", l, re.I)] == [
+        "$ends = $token.Split('-')",
+        "if ($ends.Count -eq 1) { $single = $token }",
+        "elseif ($ends.Count -eq 2 -and $ends[0] -ceq $ends[1]) { $single = $ends[0] }",
+    ]
+    assert lines.count("else { throw \"COM RemoteAddresses of $name has a spelling that is not known: '$token'\" }") == 2
     assert "if ($count -eq 0) { throw " in fast           # no rules at all is not "none of ours"
     assert re.search(r"if \(\$seen\.ContainsKey\(\$name\)\) \{ throw ", fast)      # two rules, one name
     way = functions["Get-OurRuleViews"]
