@@ -275,12 +275,27 @@ git commit -m "perf(firewall): AllowOut reads over CIM and keeps the store sourc
 **Files:**
 - Modify: `docs/superpowers/plans/2026-11-16-firewall-tab-handover.md`
 
-- [ ] **Step 1: `Compare` in drei Zuständen fahren**
+- [ ] **Step 1: `Compare` in fünf Zuständen fahren**
 
 Auf der VM, je mit `-Op Compare`: nichts isoliert; Schnitt steht
 (`TDC-FW-ISO-cut`); konvergiert (Default auf Block, Allow-Regeln ab). Jeder Lauf
 muss `ok` und Exit 0 geben. Weicht ein Feld ab, ist der schnelle Weg falsch und
 dieser Plan ist nicht fertig.
+
+**Zwei Zustände mehr, weil die drei oben eine Lücke haben** (vom Implementierer
+von Task 1 gefunden): alle drei Profile stehen auf dieser VM immer gleich, und
+keiner der drei Zustände konfiguriert ein Profil ausdrücklich als `Allow`. Damit
+bliebe **CIM `2` = Allow** ungeprüft, und ein Vertauschen der Profil-Nummern
+(COM `1` = Domain, `2` = Private, `4` = Public) fiele nicht auf. Also zusätzlich:
+
+4. **Ein Profil ausdrücklich auf `Allow`** konfiguriert, die anderen auf
+   `NotConfigured` — prüft CIM `2` und gleichzeitig, dass die Profile nicht
+   vertauscht werden.
+5. **Drei verschiedene Zustände gleichzeitig**, etwa Domain `Allow`,
+   Private `NotConfigured`, Public `Block` — ein Nummern-Tausch zeigt sich dann
+   als vertauschte Zeilen.
+
+Danach alles auf `NotConfigured` zurückstellen, so wie die VM vorgefunden wurde.
 
 - [ ] **Step 2: Vorher/Nachher messen**
 
