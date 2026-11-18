@@ -760,8 +760,8 @@ def test_the_info_of_the_commands_card_names_the_group_that_replaces():
         f"the (i) does not say that a source row replaces the source and searches: {text}"
     guide = html[html.index('id="help-usage"'):html.index('id="help-api"')]
     assert "only a source row replaces the source and searches" in guide
-    readme = _read("README.md")
-    assert "A source row is the exception" in readme
+    # The LOGS section of the README moved into the guide (docs/logs.md)
+    assert "A source row is the exception" in _read("docs/logs.md")
 
 
 @needs_node

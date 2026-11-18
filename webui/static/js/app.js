@@ -398,6 +398,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     loadScanToolStatus();
     loadScanHistory();
+    initHelpWiki();
 });
 
 // --- Tab navigation ---
@@ -15582,6 +15583,60 @@ document.addEventListener('DOMContentLoaded', () => {
         tab.addEventListener('click', () => showHelpSection(tab.dataset.help));
     });
 });
+
+// --- The offline wiki in the help ---
+// webui/static/wiki.html is built on the host by `make docs` and is not in the
+// repository, so it may not be here at all - and on the VM, which has no
+// network, it is the only documentation there is. The help carries both lines
+// and this shows the one that is true.
+
+// "2026-03-04 05:06 UTC" as the wiki's own footer writes it, with the age in
+// days after it: a wiki is built once while the guide moves on, so a reader has
+// to see that he is holding an old file. The stamp is cut out of the ISO text
+// and never parsed into a local time - 05:06 UTC must not read 06:06 in Berlin.
+function wikiBuiltLabel(stamp, now) {
+    const m = /^(\d{4}-\d\d-\d\d)T(\d\d:\d\d):\d\dZ$/.exec(stamp || '');
+    if (!m) return '';
+    const label = m[1] + ' ' + m[2] + ' UTC';
+    const days = Math.floor((now - Date.parse(stamp)) / 86400000);
+    if (!isFinite(days) || days < 1) return label;
+    return label + ' \u00b7 ' + days + (days === 1 ? ' day old' : ' days old');
+}
+
+// Shows the link with the file's date, or the line that says how to build the
+// file. Without a date there is no sentence about one: the whole clause is one
+// element, so a stamp this cannot read leaves no dangling words behind.
+function renderWikiState(data) {
+    const box = document.getElementById('help-wiki');
+    const link = document.getElementById('help-wiki-link');
+    const missing = document.getElementById('help-wiki-missing');
+    const date = document.getElementById('help-wiki-date');
+    const built = document.getElementById('help-wiki-built');
+    if (!box || !link || !missing || !date || !built) return;
+    const present = !!(data && data.present);
+    const label = present ? wikiBuiltLabel(data.built, Date.now()) : '';
+    built.textContent = label;
+    date.hidden = !label;
+    link.hidden = !present;
+    missing.hidden = present;
+    box.hidden = false;
+}
+
+async function initHelpWiki() {
+    try {
+        const resp = await fetch('/api/wiki');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        // Only an answer in the route's shape decides anything. An empty object
+        // or an error body from something in front of Flask would otherwise
+        // read as "no wiki" and tell a reader to build a file he may have.
+        if (!data || typeof data.present !== 'boolean') return;
+        renderWikiState(data);
+    } catch (e) {
+        // No answer: the entry stays hidden rather than linking a file that may
+        // not be there or telling someone to build one he already has.
+    }
+}
 
 // =============================================
 // FILE MAP (BytePlot / Entropy / Structure)

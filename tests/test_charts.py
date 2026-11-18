@@ -2982,7 +2982,7 @@ def test_drilldown_leaves_own_settings_alone():
     steps forget that kind of filter, and a step left without one drops out
     of the path; BACK then skips it. A step of two kinds stays with the one
     left: the band Sigma → Run Key, then the engine chosen by hand, leaves
-    "rule: Run Key" (as the README says), and BACK takes the rule back, not
+    "rule: Run Key" (as docs/web-ui.md says), and BACK takes the rule back, not
     the engine. The render of the click by hand already finds the path that
     is left, and its version is another (what shows the path draws it
     again)."""

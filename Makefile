@@ -21,6 +21,7 @@
 #   make restart      Restart the Web UI service
 #   make logs         Tail Web UI logs from the VM
 #   make test         Submit a test sample and verify pipeline
+#   make docs         Build the offline wiki (webui/static/wiki.html)
 #   make clean        Destroy VM and remove local Vagrant artifacts
 #
 # Prerequisites:
@@ -87,6 +88,9 @@ help:
 	@echo ""
 	@echo "  Tests:"
 	@echo "    make unit-test       Unit tests (no VM needed); make test submits a sample to the VM"
+	@echo ""
+	@echo "  Documentation:"
+	@echo "    make docs            Build the offline wiki -> webui/static/wiki.html"
 	@echo ""
 	@echo "  MCP:"
 	@echo "    make mcp-setup       Create mcp/.venv for the MCP server (Claude Code etc.)"
@@ -317,6 +321,9 @@ deploy:
 		vagrant upload webui/rizin_sessions.py C:\\DetonationChamberUI\\rizin_sessions.py; \
 		vagrant upload webui/tool_updates.py C:\\DetonationChamberUI\\tool_updates.py; \
 		vagrant upload webui/static/icon.png C:\\DetonationChamberUI\\static\\icon.png || true; \
+		if [ -f webui/static/wiki.html ]; then \
+			vagrant upload webui/static/wiki.html C:\\DetonationChamberUI\\static\\wiki.html || echo "[deploy] the wiki did not upload; the rest is synced"; \
+		else echo "[deploy] no webui/static/wiki.html - build the wiki with: make docs"; fi; \
 		for f in scripts/install-*.ps1 scripts/configure-logging.ps1; do \
 			vagrant upload $$f C:\\tdc\\scripts\\$$(basename $$f); \
 		done; \
@@ -425,6 +432,20 @@ unit-test: $(VENV_DIR)/bin/activate
 		echo "[unit-test] MCP server"; \
 		mcp/.venv/bin/python -m pytest tests/test_mcp.py; \
 	else echo "[unit-test] MCP tests skipped (run make mcp-setup)"; fi
+
+# --- Documentation ---
+# Built on the host, never on the VM: the generator is plain Python 3 (standard
+# library only) and the three deploy paths carry the finished file up. It stops
+# with a message when scripts/wiki/mermaid.min.js is missing or its checksum
+# does not match, so a wiki whose diagrams are dead text is never written.
+
+.PHONY: docs
+docs:
+	@echo "[docs] Building the offline wiki from docs/ ..."
+	@PY=$$(for p in python3 python; do \
+		command -v $$p >/dev/null 2>&1 && $$p -c 'import sys; sys.exit(sys.version_info < (3, 9))' && { echo $$p; break; }; done); \
+	[ -n "$$PY" ] || { echo "[docs] no Python on PATH: the generator needs Python >= 3.9 as python3 or python (standard library only, no packages)"; exit 1; }; \
+	$$PY scripts/build-wiki.py -o webui/static/wiki.html
 
 .PHONY: test
 test:

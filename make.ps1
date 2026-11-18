@@ -22,7 +22,7 @@ param(
         'help','prerequisites','install','run','run-debug','dev','uninstall',
         'up','halt','destroy','reload','provision','provision-webui',
         'deploy','deploy-app','restart','deploy-restart','open','logs',
-        'ssh','rdp','status','services','alerts','test','unit-test','submit',
+        'ssh','rdp','status','services','alerts','test','unit-test','docs','submit',
         'clean','clean-all'
     )]
     [string]$Target = 'help',
@@ -74,6 +74,9 @@ switch ($Target) {
         Write-Host ""
         Write-Host "  Setup:" -ForegroundColor Yellow
         Write-Host "    .\make.ps1 prerequisites   Check/install all prerequisites"
+        Write-Host ""
+        Write-Host "  Documentation:" -ForegroundColor Yellow
+        Write-Host "    .\make.ps1 docs            Build the offline wiki -> webui\static\wiki.html"
         Write-Host ""
         Write-Host "  Local (no VM required):" -ForegroundColor Yellow
         Write-Host "    .\make.ps1 install         Install Python venv + dependencies"
@@ -143,6 +146,22 @@ switch ($Target) {
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         } else {
             Write-Host "[unit-test] MCP tests skipped (mcp\.venv not found)" -ForegroundColor Yellow
+        }
+    }
+
+    'docs' {
+        # The offline wiki is built on the host, never on the VM: the generator
+        # is plain Python 3 (standard library only), and the deploy paths carry
+        # the finished file up. It stops with a message when
+        # scripts\wiki\mermaid.min.js is missing or its checksum does not
+        # match, so a wiki whose diagrams are dead text is never written.
+        Write-Host "[docs] Building the offline wiki from docs\ ..." -ForegroundColor Cyan
+        $DocsPy = "webui\.venv\Scripts\python.exe"
+        if (-not (Test-Path $DocsPy)) { $DocsPy = "python" }
+        & $DocsPy scripts\build-wiki.py -o webui\static\wiki.html
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[docs] the wiki was not built" -ForegroundColor Red
+            exit $LASTEXITCODE
         }
     }
 
@@ -335,6 +354,14 @@ switch ($Target) {
             Copy-Item 'webui\static\css\theme-cyberpunk.css' -Destination 'C:\DetonationChamberUI\static\css\theme-cyberpunk.css' -ToSession $s -Force
             Copy-Item 'webui\static\js\app.js' -Destination 'C:\DetonationChamberUI\static\js\app.js' -ToSession $s -Force
             Copy-Item 'webui\static\icon.png' -Destination 'C:\DetonationChamberUI\static\icon.png' -ToSession $s -Force -ErrorAction SilentlyContinue
+            # The offline wiki: built on the host by `.\make.ps1 docs`, git-ignored,
+            # and the only documentation on a VM that has no network. A fresh
+            # clone has none, and a deploy must not stop for that.
+            if (Test-Path 'webui\static\wiki.html') {
+                Copy-Item 'webui\static\wiki.html' -Destination 'C:\DetonationChamberUI\static\wiki.html' -ToSession $s -Force
+            } else {
+                Write-Host "[deploy] no webui\static\wiki.html - build the wiki with: .\make.ps1 docs" -ForegroundColor Yellow
+            }
             # Install scripts for the tool updates
             Invoke-Command -Session $s -ScriptBlock { New-Item -ItemType Directory -Path 'C:\tdc\scripts' -Force | Out-Null }
             foreach ($installScript in @(Get-ChildItem 'scripts' -Filter 'install-*.ps1') + @(Get-Item 'scripts\configure-logging.ps1')) {

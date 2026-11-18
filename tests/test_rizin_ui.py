@@ -5018,7 +5018,7 @@ def test_rizin_full_analysis_goes_on_after_it_stopped_and_big_lists_say_so():
     assert r["pager"][0] == "1–200 of 200000+" and "console" in (r["pager"][1] or ""), r["pager"]
     assert r["tab"] == ["axt str.child", "str.child  str.childhood  …"], "Tab took the flags sent for all there are"
     # Follow-up finding 2: with no flag and no common from the server, Tab lists the function names it
-    # has and completes none of them, not even the only one that matches (the README says so)
+    # has and completes none of them, not even the only one that matches (docs/rizin.md says so)
     assert r["capped"] == ["axt sym.ma", "sym.main  …"], r["capped"]
 
 

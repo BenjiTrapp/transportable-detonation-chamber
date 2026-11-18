@@ -10985,6 +10985,31 @@ def api_dashboard_panel(did, pid):
         did, pid, name=body.get("name"), form=body.get("form"), move=body.get("move")))
 
 
+# --- The offline wiki -------------------------------------------------------
+# `make docs` (or `.\make.ps1 docs`) builds docs/ into one self-contained file
+# beside this app; the three deploy paths carry it up when it is there. It is
+# generated, so it may be missing: the help asks here and shows either the link
+# or the way to build it. Flask serves the file itself as a static file, so
+# nothing reads 15 MB into memory here.
+WIKI_FILE = os.path.join(APP_DIR, "static", "wiki.html")
+
+
+@app.route("/api/wiki")
+def api_wiki():
+    """The offline wiki: {"present", "built"} - its mtime in UTC, or null."""
+    try:
+        if not os.path.isfile(WIKI_FILE):
+            return jsonify({"present": False, "built": None})
+        # The aware form, not utcfromtimestamp, which Python 3.12 deprecates
+        built = datetime.datetime.fromtimestamp(os.path.getmtime(WIKI_FILE),
+                                                datetime.timezone.utc)
+    except OSError:
+        # Unreadable directory, a path that is no longer there: the help says
+        # how to build one rather than linking a file nobody can serve.
+        return jsonify({"present": False, "built": None})
+    return jsonify({"present": True, "built": built.strftime("%Y-%m-%dT%H:%M:%SZ")})
+
+
 # --- Main ---
 # Start background alert loader (works with both direct run and import by dev_server)
 # When Flask reloader is active, only start in the child process to avoid duplicate threads

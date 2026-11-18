@@ -5942,6 +5942,25 @@ body.hex-resizing {
 
 .help-muted { color: var(--text-muted) !important; font-size: 11px !important; }
 
+/* The way to the offline wiki, at the top of the help. One of its two lines is
+   shown once /api/wiki answered (initHelpWiki); both are hidden before that. */
+.help-wiki {
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-left: 2px solid var(--accent-cyan);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    margin: 0 0 16px 0;
+}
+.help-wiki[hidden],
+.help-wiki p[hidden] { display: none; }
+.help-wiki p:last-child { margin-bottom: 0; }
+.help-wiki a {
+    color: var(--accent-cyan);
+    text-decoration: none;
+}
+.help-wiki a:hover { text-decoration: underline; }
+
 .help-api-table {
     width: 100%;
     border-collapse: collapse;

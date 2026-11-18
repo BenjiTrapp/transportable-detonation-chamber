@@ -19,7 +19,7 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=77">
+    <link rel="stylesheet" href="/static/css/style.css?v=79">
     <link rel="stylesheet" href="/static/css/theme-layout.css?v=2">
     <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=35">
 </head>
@@ -1351,6 +1351,21 @@
                     <h3>What is Detonation Chamber?</h3>
                     <p>A pre-configured <strong>Windows 11 VM</strong> for detonating samples and watching them with several EDR-style engines at once. This web UI combines their telemetry with live-memory forensics into one verdict per detonation.</p>
 
+                    <!-- The way to the offline guide. Both lines start hidden;
+                         initHelpWiki() asks /api/wiki and shows the one that is
+                         true for this machine (app.js). The date is the file's
+                         own mtime, which is what the server can know - the
+                         Vagrant and Hyper-V deploys write the copy with the
+                         deploy's clock, the UTM deploy hands it the date of the
+                         file it copied, so it is dated, not called built; the
+                         build stamp and the commit are in the wiki's own
+                         footer. The age in days is there so an old wiki looks
+                         old instead of staying silently wrong. -->
+                    <div class="help-wiki" id="help-wiki" hidden>
+                        <p id="help-wiki-link" hidden><strong>The full guide, offline:</strong> <a href="/static/wiki.html" target="_blank" rel="noopener">open the wiki</a> &mdash; every page of <code>docs/</code> in one file, with navigation, search, the screenshots and the diagrams, and it needs no network. <span id="help-wiki-date" hidden>The file here is dated <span id="help-wiki-built"></span> &mdash; that is when this copy was written, which a deploy can renew; the wiki's own footer carries the date it was built and the commit it was built from.</span> <code>make docs</code> on the host builds it again.</p>
+                        <p id="help-wiki-missing" hidden><strong>The full guide is not on this machine.</strong> Build it on the host with <code>make docs</code> (or <code>.\make.ps1 docs</code>) and deploy again: that writes <code>static/wiki.html</code>, the whole documentation in one file that opens without a network.</p>
+                    </div>
+
                     <h4>Key Capabilities</h4>
                     <div class="help-grid">
                         <div class="help-card">
@@ -1474,7 +1489,7 @@
                 <!-- API Reference -->
                 <div class="help-section" id="help-api">
                     <h3>API</h3>
-                    <p class="help-muted">Served on port <code>9000</code>, JSON. No login (keep the VM on an isolated network); state-changing requests from other web sites are refused. The full reference with all endpoints is in the README; the MCP server (<code>mcp/server.py</code>, 47 tools) wraps the same API.</p>
+                    <p class="help-muted">Served on port <code>9000</code>, JSON. No login (keep the VM on an isolated network); state-changing requests from other web sites are refused. The full reference with all endpoints is the API page of the offline wiki (<a href="/static/wiki.html#api" target="_blank" rel="noopener">open it here</a> &mdash; Overview says whether that file is on this machine), and <code>docs/api.md</code> in the repository; the MCP server (<code>mcp/server.py</code>, 47 tools) wraps the same API.</p>
 
                     <h4>Core</h4>
                     <table class="help-api-table">
@@ -1601,7 +1616,7 @@ Web UI :9000 ──submit──▶ DetonatorAgent :8080 ──runs──▶ samp
                     <h4>File Layout</h4>
                     <pre class="help-code">C:\DetonationChamberUI\           Web UI (this interface), memory_results\, pipe_sessions\, rizin_projects\, baseline
 C:\tools\rustinel\                Rustinel ETW engine
-C:\tools\fibratus\                Fibratus kernel tracer
+C:\Program Files\Fibratus\        Fibratus kernel tracer (Bin\fibratus.exe)
 C:\DetonatorAgent\                .NET execution agent
 C:\LitterBox\                     Analysis sandbox
 C:\tools\Aether\                  Memory forensics scanner + rules
@@ -1675,6 +1690,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
          in app.js); set as text, never as markup -->
     <div id="info-popover" class="info-popover" role="status" hidden></div>
 
-    <script src="/static/js/app.js?v=116"></script>
+    <script src="/static/js/app.js?v=118"></script>
 </body>
 </html>
