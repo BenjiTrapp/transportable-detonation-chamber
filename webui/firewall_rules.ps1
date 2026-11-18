@@ -90,6 +90,15 @@ function Assert-OurName {
     }
 }
 
+# Why the fast way did not answer, as one line of at most 200 characters: it goes into JSON and into the call log.
+function Get-ShortReason {
+    param($ErrorRecord)
+    $reason = ([string]$ErrorRecord.Exception.Message -split "`r?`n")[0]
+    if ($reason.Length -gt 200) { $reason = $reason.Substring(0, 200) }
+    if (-not $reason) { $reason = 'the fast way failed without a message' }
+    return $reason
+}
+
 # Two stores, two questions; do not collapse them into one read.
 #   DefaultOutboundAction: the ActiveStore, what is IN FORCE. NotConfigured resolves there (to Allow, or to what a
 #     group policy sets). "Is ISOLATED in force?", Enabled and everything that is claimed read this.
@@ -105,9 +114,7 @@ function Get-ProfileStates {
             $rows = @(Read-FastProfileStates)
             return $rows
         } catch {
-            $fallback = ([string]$_.Exception.Message -split "`r?`n")[0]
-            if ($fallback.Length -gt 200) { $fallback = $fallback.Substring(0, 200) }
-            if (-not $fallback) { $fallback = 'the fast way failed without a message' }
+            $fallback = Get-ShortReason $_
         }
     }
     $configured = @{}
@@ -147,18 +154,18 @@ function Read-FastProfileStates {
         $type = $ComProfileType[$name]
         $on = $policy.FirewallEnabled($type)
         if (-not ($on -is [bool])) { throw "COM FirewallEnabled of $name is not a boolean: '$on'" }
-        $number = [string]$policy.DefaultOutboundAction($type)
-        if (-not $ComOutbound.ContainsKey($number)) { throw "COM DefaultOutboundAction of $name is not a known number: '$number'" }
-        $inForce[$name] = @{ Enabled = $on; Outbound = $ComOutbound[$number] }
+        $comNumber = [string]$policy.DefaultOutboundAction($type)
+        if (-not $ComOutbound.ContainsKey($comNumber)) { throw "COM DefaultOutboundAction of $name is not a known number: '$comNumber'" }
+        $inForce[$name] = @{ Enabled = $on; Outbound = $ComOutbound[$comNumber] }
     }
     $set = @{}
-    foreach ($p in @(Get-CimInstance -Namespace 'root/StandardCimv2' -ClassName 'MSFT_NetFirewallProfile' -ErrorAction Stop)) {
-        $name = [string]$p.Name
+    foreach ($cim in @(Get-CimInstance -Namespace 'root/StandardCimv2' -ClassName 'MSFT_NetFirewallProfile' -ErrorAction Stop)) {
+        $name = [string]$cim.Name
         if (-not $ComProfileType.Contains($name)) { throw "CIM names a profile that is not known: '$name'" }
         if ($set.ContainsKey($name)) { throw "CIM names the profile $name twice" }
-        $number = [string]$p.DefaultOutboundAction
-        if (-not $CimOutbound.ContainsKey($number)) { throw "CIM DefaultOutboundAction of $name is not a known number: '$number'" }
-        $set[$name] = $CimOutbound[$number]
+        $cimNumber = [string]$cim.DefaultOutboundAction
+        if (-not $CimOutbound.ContainsKey($cimNumber)) { throw "CIM DefaultOutboundAction of $name is not a known number: '$cimNumber'" }
+        $set[$name] = $CimOutbound[$cimNumber]
     }
     $rows = @()
     foreach ($name in $ComProfileType.Keys) {
@@ -321,7 +328,7 @@ try {
             try {
                 foreach ($row in @(Read-FastProfileStates)) { $fast[[string]$row.Name] = $row }
             } catch {
-                $differences += [pscustomobject]@{ what = 'profiles'; fast = "error: $($_.Exception.Message)"; cmdlet = 'read' }
+                $differences += [pscustomobject]@{ what = 'profiles'; fast = "error: $(Get-ShortReason $_)"; cmdlet = 'read' }
             }
             $checked = 0
             if ($differences.Count -eq 0) {

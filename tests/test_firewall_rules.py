@@ -2907,23 +2907,57 @@ def test_the_profiles_verb_names_the_way_it_was_answered():
 
 
 def test_com_never_answers_the_configured_store():
-    """COM cannot express NotConfigured, so it must not feed Configured."""
+    """COM cannot express NotConfigured, so it must not feed Configured. Exact, line for line: the value that becomes
+    Configured is the CIM instance's number through the CIM map, and nothing COM said can reach it on the way."""
     branch = _op_branch(_ps1(), "Profiles")
     com = _lines_mentioning(branch, "FwPolicy2")
     assert com, "the fast path for Profiles is missing"
     assert not any("Configured" in l for l in com), \
         "COM must not answer the configured store: %s" % com
     fast = _functions(_ps1())["Read-FastProfileStates"]
-    # the configured value comes from the CIM answer, which is never asked for the ActiveStore
-    assert "MSFT_NetFirewallProfile" in fast and "Get-NetFirewall" not in fast
-    assert "PolicyStore" not in "\n".join(_lines_mentioning(fast, "Get-CimInstance"))
+    lines = [l.strip() for l in fast.splitlines()]
+    # Configured is assigned once, from the CIM-filled $set and nothing else
+    assigned = [l for l in lines if re.match(r"Configured\s*=", l)]
+    assert assigned == ["Configured = $set[$name]"], assigned
+    assert re.search(r"^\s*Configured = \$set\[\$name\]\s*$", fast, re.M)
+    # $set is filled in one place, from the CIM number through the CIM map, and is otherwise only looked into
+    assert [l for l in lines if "$set" in l] == [
+        "$set = @{}",
+        'if ($set.ContainsKey($name)) { throw "CIM names the profile $name twice" }',
+        "$set[$name] = $CimOutbound[$cimNumber]",
+        'if (-not $set.ContainsKey($name)) { throw "CIM does not name the profile $name" }',
+        "Configured = $set[$name]",
+    ]
+    assert not any(re.search(r"\$set\b.*=", l) and re.search(r"\$policy|\$ComOutbound|\$comNumber|\$inForce", l)
+                   for l in lines)
+    # the CIM number comes from the CIM instance, and the CIM instance from the CIM query, and from nowhere else
+    assert [l for l in lines if "$cimNumber" in l] == [
+        "$cimNumber = [string]$cim.DefaultOutboundAction",
+        'if (-not $CimOutbound.ContainsKey($cimNumber)) { throw "CIM DefaultOutboundAction of $name is not a known number: \'$cimNumber\'" }',
+        "$set[$name] = $CimOutbound[$cimNumber]",
+    ]
+    assert [l for l in lines if re.search(r"\$cim\b", l)] == [
+        "foreach ($cim in @(Get-CimInstance -Namespace 'root/StandardCimv2' -ClassName 'MSFT_NetFirewallProfile' -ErrorAction Stop)) {",
+        "$name = [string]$cim.Name",
+        "$cimNumber = [string]$cim.DefaultOutboundAction",
+    ]
+    assert [l for l in lines if re.match(r"\$CimOutbound\s*=", l)] == [
+        "$CimOutbound = @{ '0' = 'NotConfigured'; '2' = 'Allow'; '4' = 'Block' }"]
+    # the CIM query is never asked for a store (it can only answer the PersistentStore), and no cmdlet is in the way
+    assert "Get-NetFirewall" not in fast and "PolicyStore" not in fast.split("Get-CimInstance", 1)[1].split("\n", 1)[0]
 
 
 def test_an_unknown_number_falls_back_instead_of_guessing():
-    branch = _op_branch(_ps1(), "Profiles")
-    assert "Fallback" in branch or "fallback" in branch
-    # every mapped number is named explicitly, no arithmetic on the enum
-    assert "NotConfigured" in branch
+    """Each number is looked up in its map and throws when it is not there; the throw is what -Fast turns into the
+    cmdlet answer with Via cmdlet and the reason."""
+    script = _ps1()
+    fast = _functions(script)["Read-FastProfileStates"]
+    assert "if (-not $ComOutbound.ContainsKey($comNumber)) { throw " in fast
+    assert "if (-not $CimOutbound.ContainsKey($cimNumber)) { throw " in fast
+    assert "if (-not ($on -is [bool])) { throw " in fast
+    states = _functions(script)["Get-ProfileStates"]
+    assert re.search(r"try \{\s*\$rows = @\(Read-FastProfileStates\)\s*return \$rows\s*\} catch \{\s*\$fallback = ", states)
+    assert "$row.Via = 'cmdlet'" in states and "$row.Fallback = $fallback" in states
 
 
 def test_every_number_of_the_fast_path_is_written_out():
@@ -3016,3 +3050,12 @@ def test_a_long_reason_is_cut_and_a_failed_call_is_still_reported(monkeypatch):
     with pytest.raises(rules_mod.RuleError):
         rules_mod._profiles(lambda args: (_ for _ in ()).throw(OSError("gone")))
     assert seen[1]["op"] == "Profiles" and seen[1]["rc"] is None and "via" not in seen[1]
+
+
+def test_a_reason_is_one_short_line_in_profiles_and_in_compare_alike():
+    script = _ps1()
+    reason = _functions(script)["Get-ShortReason"]
+    assert '-split "`r?`n"' in reason and "Substring(0, 200)" in reason
+    assert "$fallback = Get-ShortReason $_" in _functions(script)["Get-ProfileStates"]
+    assert 'fast = "error: $(Get-ShortReason $_)"' in _op_case(script, "Compare")
+    assert "$_.Exception.Message" not in _op_case(script, "Compare")
