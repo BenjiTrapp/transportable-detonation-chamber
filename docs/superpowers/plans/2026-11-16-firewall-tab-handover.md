@@ -629,8 +629,8 @@ one-line `Fallback` reason reach the call log.
     way the local GPO profile value above proved the profile case.
   - **Mapped but not confirmed by `Compare`.** These values are **in** the
     maps, so they are read on the fast path and passed through; no `Compare`
-    run has held them up against the cmdlets, because no TDC rule in the five
-    states had them:
+    run has held them up against the cmdlets, because no TDC rule in the three
+    states had them (protocol `17`, UDP, is **confirmed** now: state A above):
     - rule Direction `1` (Inbound);
     - profile masks `1` to `6` (a rule on one or two profiles);
     - Action `1` (Allow) on a rule, which `allow_fetch` writes and `_write`
