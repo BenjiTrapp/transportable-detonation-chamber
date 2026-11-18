@@ -18,6 +18,26 @@ blocked, up to about ten seconds after the connection.
 Everything in it is text from the sample and is shown as text: URLs and host
 names are defanged (`hxxp://`, `example[.]com`), never a link.
 
+![The FIREWALL tab in the MAP view with nothing isolated: 12 connections over the last hour, a process tree of three svchost.exe instances with ALLOW switches and direct-ip tags, the world map with two arcs from the CHAMBER device to two destinations, and the summary with the CUT THE NETWORK card](../static/firewall_tab.png)
+
+> **The tab as it opens, in the MAP view.** The head reads 12 connections with
+> LIVE on, ASK at DETONATION, the ISOLATED button and the range buttons
+> 15M, 1H, 4H, 24H, 7D and ALL, 1H the active one. On the left, PROCESSES: three
+> `svchost.exe` instances (PIDs 4052, 3964 and 3008), each with a green ALLOW
+> switch and a `direct-ip` tag, and under them the endpoints they talk to
+> (`48.209.133.15` US :443/TCP with FW 1, `146.75.118.172` US
+> :80/TCP, `72.145.35.97` US :443/TCP), plus a collapsed LOCAL group of 3. In
+> the middle, DESTINATIONS under the MAP, LIST, ASN and DECISIONS switch: two
+> orange arcs rise from the framed CHAMBER device in the strip under the map
+> to `72.145.35.97` and `48.209.133.15`; the strip's left reads
+> LOCATION NOT DETERMINED. Under the map the tab says that the six connections to
+> local addresses are in the tree, not on the map. On the
+> right, the SUMMARY: 12 connections (22 single ones), BLOCKED 0, OPEN DECISIONS
+> 0, SAMPLES 0 secured, the top processes, endpoints and countries, and the note
+> that Sysmon has no byte counts. Below it the NETWORK CUT card with the skull
+> button, and at the bottom HUNT FURTHER with three ready LOGS searches and
+> SECURED SAMPLES, 0 so far.
+
 A connection here is a flow: one process (image and PID) to one endpoint
 (protocol, address, port), with its count and its first and last packet. The
 firewall log has no process, so its numbers (`FW (endpoint)`, the `dropped`
@@ -49,6 +69,20 @@ Rustinel, git) are a group of their own and are never blocked automatically.
 | `dropped` | info | the firewall dropped packets to this endpoint |
 
 The colour of a row and of an arc is its most severe tag.
+
+The **LIST** view of DESTINATIONS is the same flows as a table, one row per
+process and endpoint. Its columns are PROCESS, PID, DESTINATION, ADDRESS, PORT,
+PROTO, CC, AS, TAGS, CONN., FW (ENDPOINT) and STATE.
+
+![The FIREWALL tab in the LIST view with nothing isolated: 14 connections as a table of svchost.exe TCP rows to Microsoft and Fastly addresses on ports 443 and 80 tagged direct-ip and allowed, and UDP rows to multicast addresses and to hackepeter-2 on ports 53 and 67](../static/firewall_list.png)
+
+> **The same tab in the LIST view,** 14 connections, nothing isolated. The TCP
+> rows are `svchost.exe` to `MICROSOFT-CORP-MSN-AS-BLOCK` and to
+> `FASTLY - Fastly, Inc.` on ports 443 and 80, each tagged `direct-ip`, in
+> state ALLOW, with firewall counts such as `1 / 0` under FW (ENDPOINT). Below
+> them the UDP rows: `239.255.255.250:1900`, `224.0.0.252:5355`,
+> `ff02::1:3:5355` and `hackepeter-2` (192.168.64.1) on ports 53 and 67.
+> SECURED SAMPLES at the bottom reads "None yet."
 
 **Blocking.** ALLOW / DENY writes a rule named `TDC-FW-...`: for one process to
 one endpoint, for one process everywhere, or (a separate switch) for an
@@ -181,6 +215,24 @@ or `NotConfigured`, otherwise `Allow`; a recorded `Block` it names and leaves to
 the analyst), switches on again the rules recorded in
 `allow_disabled` (it only reads the file) and removes every `TDC-FW-*` rule,
 nothing else.
+
+![The FIREWALL tab with the network cut: a red band across the top with the time of the cut and the warning that TDC cannot secure a sample, CUT SECURING in red on the header switch and on the skull card, and 17 connections in the list, one tagged dga and one tagged dropped, while the summary reads BLOCKED 0](../static/firewall_cut.png)
+
+> **The panic cut in force** (LIST view, 17 connections). The red band says
+> when it started (2026-11-18 11:20:13), that one outbound Block rule for every
+> program stands and was read back, that a Block rule beats every Allow rule and
+> that loopback stays open, that **TDC cannot secure a sample in this state**
+> because no fetch gets through a catch-all Block rule, and that Windows' own
+> outbound Allow rules are being switched off in the background, the default
+> set to Block, and then the rule goes. The header switch and the skull card
+> both read `CUT · SECURING…` in red: one state, shown in two places. The
+> table shows the tags `direct-ip`, one `dga` row (a defanged
+> `a2-16-168-38`, `deploy`, `static`, `akamai` name, AKAMAI-ASN1, CC NL) and one `dropped`
+> row (`hackepeter-2` 192.168.64.1:53 over UDP, 31 connections).
+>
+> **BLOCKED reads 0 here, and that is not a sign that nothing is blocked.**
+> BLOCKED counts TDC's per-endpoint and per-process rules; the cut is neither,
+> it is one catch-all rule, so the egress is shut while the counter stays at 0.
 
 **Hunting further.** HUNT FURTHER lists ready LOGS searches for the selection,
 each one click away; `in LOGS ▸` on a row, a point of the map or a toast opens

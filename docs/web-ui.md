@@ -554,4 +554,35 @@ programs that mimic implant behaviour).
 > Create of `wevtutil.exe`); all fields of the event are shown, suspicious
 > values are highlighted.
 
+---
+
+### Firewall
+
+![FIREWALL tab in the MAP view: process tree, destinations on the world map, summary and the CUT THE NETWORK card](../static/firewall_tab.png)
+
+> **FIREWALL tab:** 12 connections over the last hour, nothing isolated. The
+> tree on the left holds three `svchost.exe` instances (PIDs 4052, 3964 and
+> 3008) with their ALLOW switches, `direct-ip` tags and endpoints; the map shows
+> two arcs from the framed CHAMBER device to `72.145.35.97` and
+> `48.209.133.15`; the summary counts 12 connections (22 single ones), BLOCKED
+> 0, and the CUT THE NETWORK card sits under it, with HUNT FURTHER and SECURED
+> SAMPLES at the bottom.
+
+![FIREWALL tab in the LIST view: 14 connections as a table with PROCESS, PID, DESTINATION, ADDRESS, PORT, PROTO, CC, AS, TAGS, CONN., FW (ENDPOINT) and STATE](../static/firewall_list.png)
+
+> **LIST view:** the same flows as a table, 14 connections: `svchost.exe` TCP
+> rows to Microsoft and Fastly address blocks on 443 and 80, tagged
+> `direct-ip` and in state ALLOW, and UDP rows to multicast addresses and to
+> `hackepeter-2` on 53 and 67.
+
+![FIREWALL tab with the network cut: a red band, CUT SECURING on the header switch and the skull card, 17 connections](../static/firewall_cut.png)
+
+> **The panic cut in force:** the red band says one outbound Block rule for
+> every program stands and TDC cannot secure a sample in this state; the header
+> switch and the skull card both read `CUT · SECURING…`. The summary shows
+> BLOCKED 0 all the same, because that counter holds TDC's per-endpoint and
+> per-process rules and the cut is one catch-all rule instead. What each switch
+> writes, what the cut stages mean and how to leave are in
+> [Firewall](firewall.md).
+
 **Next:** [API](api.md)
