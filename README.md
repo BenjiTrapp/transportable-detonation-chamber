@@ -332,7 +332,7 @@ Web UI's help links it and says when it was built; on the VM, which has no
 internet at all, it is the documentation.
 
 <p align="center">
-  <img src="static/wiki.png" alt="The offline wiki: the navigation of all fourteen pages on the left with the search box above it, and on the index page the end of the All pages table, the sentence about make docs and the architecture diagram drawn by the embedded Mermaid, with the prose that says it in words and the Detection Engines table under it" width="88%">
+  <img src="static/wiki.png" alt="The offline wiki: the navigation of all fifteen pages on the left with the search box above it, and on the index page the end of the All pages table, the sentence about make docs and the architecture diagram drawn by the embedded Mermaid, with the prose that says it in words and the Detection Engines table under it" width="88%">
 </p>
 
 ---

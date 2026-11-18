@@ -43,6 +43,8 @@ Regressions covered:
 import json
 import re
 
+import pytest
+
 from test_frontend import SOURCE, _function_source, _run_node, needs_node
 from test_theme import (CHART_CONSTS, CHART_FUNCTIONS, INDEX_HTML, LITERAL_COLOR, STYLE_CSS, THEME_CSS, _const_source,
                         _css_blocks, _Elements, _read, _selectors, _strip_comments)
@@ -62,7 +64,7 @@ LOGS_CONSTS = ["LOGS_RANGES", "LOGS_DEFAULT_RANGE", "LOGS_RECENT_KEY", "LOGS_RAN
                "LOGS_SAVE_LOCKED", "LOGS_QUERY_MAX"]
 LOGS_LETS = re.findall(r"^let logs\w+ = [^\n]*?;(?=[ \t]*(?://[^\n]*)?$)", SOURCE, re.M)
 OTHER_FUNCTIONS = CHART_FUNCTIONS + ["escapeHtml", "jsArg", "cssToken", "formatAlertTime", "filterChipHtml",
-                                     "chartRangeLabel", "handleGlobalKeydown", "openLogsTab"]
+                                     "chartRangeLabel", "handleGlobalKeydown", "openLogsTab", "openPanelInLogs"]
 ALL_FUNCTIONS = list(dict.fromkeys(LOGS_FUNCTIONS + OTHER_FUNCTIONS))
 
 ELEMENT_IDS = ["logs-query", "logs-hl", "logs-results", "logs-summary", "logs-histogram", "logs-legend",
@@ -2402,3 +2404,73 @@ def test_a_note_about_the_range_stands_beside_it_until_the_range_changes():
     assert "<b>" not in r["shown"] and "&lt;b&gt;" in r["kept"]
     for key in ("button", "zoomed", "plain"):
         assert "logs-range-note" not in r[key], key
+
+
+# --- Two ways into LOGS: a tile of a dashboard, a jump from FIREWALL ---------------
+# Each parks what it brought (logsOpenPending for the tile, logsPending and the way
+# back for the jump) until the tab is shown, and each clears the other's. switchTab
+# shows the tab at once, so today neither outlives its own call; the "later" runs
+# make the tab appear only after both calls, which is the one way the clearing
+# lines are the whole of the guarantee. The property is that the later action wins
+# and the earlier one leaves nothing behind - not the order the calls were made in.
+
+WAYS_IN = r"""
+const tile = { query: 'source=sysmon image="a.exe"', earliest: '-4h', latest: '', form: 'bars' };
+globalThis.dashboardPanelOf = pid => (pid === 't1' ? { panel: tile } : null);
+const fromTile = () => openPanelInLogs('t1');
+const fromFirewall = () => openLogsTab('dst_ip="1.2.3.4"', '2026-11-16T14:02:00Z', '',
+    { tab: 'firewall', filter: { image: 'C:\\x\\a.exe', ip: '1.2.3.4' } }, 'To now: running.');
+let later = false;
+if (%s) {
+    // the tab appears only when flush() says so, after both calls
+    globalThis.switchTab = name => { jumps.push(['tab', name]); };
+}
+const flush = async () => { state.activeTab = 'logs'; logsTabShown(); await settle(); };
+if (%s) { initLogs(); await settle(); }
+const snap = () => ({ query: logsState.query, input: els['logs-query'].value, earliest: logsState.earliest,
+    latest: logsState.latest, note: logsRangeNote, back: logsBack && logsBack.tab, backHidden: els['logs-back'].hidden,
+    pending: logsPending, openPending: logsOpenPending, wantForm: logsWantForm,
+    sent: query(searches().pop()).get('q') });
+"""
+TILE_WON = {"query": 'source=sysmon image="a.exe"', "input": 'source=sysmon image="a.exe"', "earliest": "-4h",
+            "latest": "", "note": "", "back": None, "backHidden": True, "pending": None, "openPending": False,
+            "sent": 'source=sysmon image="a.exe"'}
+JUMP_WON = {"query": 'dst_ip="1.2.3.4"', "input": 'dst_ip="1.2.3.4"', "earliest": "2026-11-16T14:02:00Z",
+            "latest": "", "note": "To now: running.", "back": "firewall", "backHidden": False, "pending": None,
+            "openPending": False, "sent": 'dst_ip="1.2.3.4"'}
+WAYS = [pytest.param(deferred, ready, id=("tab shown after both" if deferred else "tab shown at once")
+                     + (", tab set up" if ready else ", first visit"))
+        for deferred in (False, True) for ready in (False, True)]
+
+
+def _ways_in(first, second, deferred, ready):
+    return _run(WAYS_IN % ("true" if deferred else "false", "true" if ready else "false") + r"""
+        %s(); %s();
+        const staged = logsWantForm;
+        if (%s) await flush();
+        await settle();
+        const landed = snap();
+        // leave and come back: whatever is still waiting would run now
+        await flush();
+        console.log(JSON.stringify({ staged, landed, again: snap() }));""" % (
+        first, second, "true" if deferred else "false"))
+
+
+@needs_node
+@pytest.mark.parametrize("deferred, ready", WAYS)
+def test_a_jump_from_firewall_after_a_tile_opened_in_logs_wins(deferred, ready):
+    r = _ways_in("fromTile", "fromFirewall", deferred, ready)
+    if deferred:
+        assert r["staged"] == "", "the form the tile asked for outlived the jump that came after it"
+    for key in ("landed", "again"):
+        assert {k: r[key][k] for k in JUMP_WON} == JUMP_WON, (key, r[key])
+
+
+@needs_node
+@pytest.mark.parametrize("deferred, ready", WAYS)
+def test_a_tile_opened_in_logs_after_a_jump_from_firewall_wins(deferred, ready):
+    r = _ways_in("fromFirewall", "fromTile", deferred, ready)
+    if deferred:
+        assert r["staged"] == "bars", "the form the tile was saved with did not survive the jump before it"
+    for key in ("landed", "again"):
+        assert {k: r[key][k] for k in TILE_WON} == TILE_WON, (key, r[key])

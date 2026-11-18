@@ -61,6 +61,8 @@ def test_api_page_lists_every_mcp_tool():
     listed = set(re.findall(r"`(tdc_\w+)`", section))
     assert tools == listed
     assert f"({len(tools)} tools" in api
+    # the help of the Web UI quotes the number too: the one place the count was left behind
+    assert re.findall(r"<code>mcp/server\.py</code>, (\d+) tools", HELP) == [str(len(tools))]
 
 
 def test_images_exist_and_none_are_orphaned():
