@@ -112,7 +112,7 @@
 # guessed at: Profiles answers through the cmdlets instead and says so (Via "cmdlet", Fallback the reason). Compare
 # holds the two ways up against each other; no test off Windows can confirm what the option reads on a machine.
 # The verbs that write (Create, Cut, SetDefaultOutbound) check and read back the profiles through the cmdlets, as they
-# always did.
+# always did, and so does AllowOut (see the comment above Get-ForeignAllowOut).
 
 param(
     [Parameter(Mandatory = $true)]
@@ -205,9 +205,16 @@ function Read-FastProfileStates {
         # The sentinel, before any store is read: a store that cannot exist must fail. If it answers at all, even with
         # nothing, the option is being ignored and every read below would be the PersistentStore under another name.
         # Moved behind a real read, it would prove nothing about that read.
+        # Any error counts as the proof, whatever its (localised) text: a provider that ignored the option would not
+        # look at the store name at all, so it could not fail for this name and then answer for the real ones.
+        # Its name is written in this one line only, so that it changes in one edit. It must be no store and must not
+        # be resolvable as a host: the measured failure, "Der Netzwerkpfad wurde nicht gefunden" (ERROR_BAD_NETPATH),
+        # reads like a path lookup, and Profiles runs on every poll of the tab, inside the chamber whose traffic TDC
+        # captures. A DNS, LLMNR or NBNS query for it on every poll would put TDC's own noise into the capture. The
+        # name is a legal hostname as it stands; whether reading it sends anything is being measured on the VM.
         $honoured = $false
         try { $null = & $enumerate 'TDC-NoSuchStore' } catch { $honoured = $true }
-        if (-not $honoured) { throw 'the PolicyStore option is ignored: the store TDC-NoSuchStore answered, so no store read here can be trusted' }
+        if (-not $honoured) { throw 'the PolicyStore option is ignored: a store that cannot exist answered, so no store read here can be trusted' }
         $inForce = @{}
         $configured = @{}
         foreach ($p in @(& $readStore 'ActiveStore')) { $inForce[$p.Name] = @{ Enabled = (& $mapped $CimEnabled $p 'Enabled'); Outbound = (& $mapped $CimOutbound $p 'DefaultOutboundAction') } }
@@ -233,7 +240,8 @@ function Read-FastProfileStates {
 #     SetDefaultOutbound writes, so it is what ISOLATED remembers and puts back, and what a write is checked against.
 # Every verb reads the profiles through here, as {Rows, Via, Fallback}. The fast way first (Read-FastProfileStates); on
 # any doubt the cmdlet read it always was, and Fallback says why. With -CmdletsOnly the cmdlets alone: the verbs that
-# write check and read back through them as before, and Compare holds them up against the fast way; Fallback is null.
+# write and AllowOut read through them as before, and Compare holds them up against the fast way, which only works if
+# this side can never be the fast reader itself; Fallback is null.
 function Get-ProfileStates {
     param([switch]$CmdletsOnly)
     $fallback = $null
@@ -440,16 +448,18 @@ function Get-ProfileList {
     return $list
 }
 
-# AllowOut stays on the cmdlets, module load and all; do not move it to CIM or COM. It must read the ActiveStore, what
-# is in force, group policy included, and neither fast source can:
-#   - COM has no PolicyStoreSourceType, so a group-policy rule could not be told from a local one.
-#   - Raw CIM has no route to the ActiveStore. Measured on the VM: root/standardcimv2/ActiveStore is "Ungueltiger
-#     Namespace", and the PolicyStoreSource of all 538 rules raw CIM gives is PersistentStore. The counts agreed
-#     (cmdlet ActiveStore 135, cmdlet PersistentStore 135, CIM 135) only because that VM has no group-policy rules.
-#     On a host that has them, they are in the ActiveStore and not in the PersistentStore: read over CIM, they would
-#     vanish from allowed_out, and ISOLATED would say closed while they let traffic out. No guard can catch that,
-#     because seeing the difference takes a read of the ActiveStore.
-# It gains little besides: AllowOut runs only while ISOLATED is on and during a convergence, never in a tab's polls.
+# AllowOut stays on the cmdlets, module load and all, its profiles included; do not move it to CIM or COM. It must
+# read the ActiveStore, what is in force, group policy included. It could without the module, and that is not why it
+# stays:
+#   - COM cannot: it has no PolicyStoreSourceType, so a group-policy rule could not be told from a local one.
+#   - CIM can, with the PolicyStore operation option (see "Profiles over CIM with the PolicyStore option"). Measured
+#     on the VM in the policy state: with the option 'ActiveStore' it finds the same 136 enabled outbound Allow rules
+#     as the cmdlet, the policy's rule among them with PolicyStoreSourceType 2 (GroupPolicy). Raw CIM without the
+#     option does not (root/standardcimv2/ActiveStore is "Ungueltiger Namespace"; it answers the PersistentStore).
+# It stays because the gain does not pay for the risk. It would save about 0.4 s on a call that never appears in the
+# steady load (AllowOut runs only while ISOLATED is on and during a convergence, never in a tab's polls), and it is the
+# verb where a mistake reports closed while traffic still goes out: a rule missed here is a way out that ISOLATED does
+# not know of.
 # Not filtered by Get-NetFirewallRule's own -Direction/-Action/-Enabled: with those, "no rule matches" is an
 # error, and telling it apart from a real one would be a guess. A list that cannot be read must fail, never
 # read as "nothing is let out".
@@ -741,7 +751,7 @@ try {
             ConvertTo-Json -Compress -Depth 3 -InputObject (Get-ProfileStates -CmdletsOnly).Rows
         }
         'AllowOut' {
-            ConvertTo-Json -Compress -Depth 4 -InputObject ([pscustomobject]@{ profiles = (Get-ProfileStates).Rows; rules = @(Get-ForeignAllowOut) })
+            ConvertTo-Json -Compress -Depth 4 -InputObject ([pscustomobject]@{ profiles = (Get-ProfileStates -CmdletsOnly).Rows; rules = @(Get-ForeignAllowOut) })
         }
         'RemoveIsolate' {
             Remove-IsolateRules

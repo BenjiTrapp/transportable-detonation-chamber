@@ -3182,27 +3182,37 @@ def test_only_get_takes_its_way_from_stderr(monkeypatch):
 
 
 
-# ---- AllowOut stays on the cmdlets: raw CIM cannot read the ActiveStore, COM has no store source ------------------
+# ---- AllowOut stays on the cmdlets: CIM could read the ActiveStore now, and the gain does not pay for the risk ------
 
 
-def test_allowout_stays_on_the_cmdlets_because_cim_cannot_read_the_activestore():
-    """Measured on the VM: root/standardcimv2/ActiveStore is an invalid namespace and raw CIM gives all 538 rules from
-    the PersistentStore. A group-policy rule lives in the ActiveStore only; read over CIM it would vanish from
-    allowed_out and ISOLATED would say closed while it lets traffic out. COM has no PolicyStoreSourceType at all.
-    So AllowOut reads Get-NetFirewallRule -PolicyStore ActiveStore, and nothing else, and has no second way to name."""
+def test_allowout_stays_on_the_cmdlets_because_the_gain_does_not_pay_for_the_risk():
+    """The old name said CIM cannot read the ActiveStore. Measured on 2026-11-19 that is false: the PolicyStore
+    operation option reads it and finds the same 136 enabled outbound Allow rules as the cmdlet, the policy rule with
+    PolicyStoreSourceType 2. AllowOut stays on the cmdlets because it would save 0.4 s on a call that never appears in
+    the steady load, and it is the verb where a mistake reports closed while traffic still goes out. So it reads
+    Get-NetFirewallRule -PolicyStore ActiveStore and its profiles through the cmdlets alone, and nothing of it goes over
+    COM or the option."""
     script = _ps1()
     case = _code_lines(_op_case(script, "AllowOut"))
     assert case == [
         "'AllowOut' {",
-        "ConvertTo-Json -Compress -Depth 4 -InputObject ([pscustomobject]@{ profiles = (Get-ProfileStates); "
+        "ConvertTo-Json -Compress -Depth 4 -InputObject ([pscustomobject]@{ profiles = (Get-ProfileStates -CmdletsOnly).Rows; "
         "rules = @(Get-ForeignAllowOut) })",
     ], case
     cmdlet = _code_lines(_functions(script)["Get-ForeignAllowOut"])
     assert "@(Get-NetFirewallRule -PolicyStore ActiveStore | Where-Object {" in cmdlet
-    assert not re.search(r"CimInstance|CimSession|EnumerateInstances|FwPolicy2|ComObject", "\n".join(cmdlet), re.I)
+    assert not re.search(r"CimInstance|CimSession|EnumerateInstances|SetCustomOption|FwPolicy2|ComObject",
+                         "\n".join(cmdlet), re.I)
     # no rule of the firewall is read over CIM anywhere in the script, and Compare has nothing of AllowOut to compare
-    assert not re.search(r"MSFT_NetFirewallRule|SetCustomOption", "\n".join(_code_lines(script)), re.I)
+    assert not re.search(r"MSFT_NetFirewallRule", "\n".join(_code_lines(script)), re.I)
     assert "Get-ForeignAllowOut" not in _op_case(script, "Compare")
+    # its profiles cannot reach the fast reader: -CmdletsOnly skips it (pinned with Compare's cmdlet side below)
+    assert "Read-FastProfileStates" not in _op_case(script, "AllowOut")
+    # and the comment says the true reason, not the refuted one
+    said = script[script.index("# AllowOut stays on the cmdlets"):script.index("function Get-ForeignAllowOut {")]
+    assert "Raw CIM has no route to the ActiveStore" not in said
+    for word in ("136", "PolicyStoreSourceType 2", "0.4 s", "steady load", "reports closed while traffic still goes out"):
+        assert word in said, word
 
 
 def test_the_cmdlet_way_of_allow_out_is_what_it_was():
@@ -3230,49 +3240,16 @@ def test_only_a_rule_whose_source_is_local_counts_as_one_isolated_can_switch_off
     assert [(r["name"], r["local"]) for r in found] == [("Loc-Out", True), ("Num-Out", False), ("Pol-Out", False)]
 
 
-# ---- Profiles stays on the cmdlets: COM reads the local store, not what is in force -----------------------------
-
-
-def test_profiles_stays_on_the_cmdlets_because_com_reads_the_local_store_not_what_is_in_force():
-    """Measured on the VM, with the local GPO store written by Set-NetFirewallProfile -PolicyStore <computer name>:
-    local GPO Domain outbound Allow, PersistentStore Block, ActiveStore (in force) Allow, COM 0 = Block. COM reads the
-    local store, so where a policy sets Allow over the local Block that ISOLATED writes, a COM read would say closed
-    while the egress is open: the defect this feature exists to prevent. Raw CIM answers the PersistentStore only.
-    So every verb reads the profiles through Get-ProfileStates, and that reads both stores through the cmdlets and
-    nothing else, with no second way to name."""
-    script = _ps1()
-    assert _code_lines(_op_case(script, "Profiles")) == [
-        "'Profiles' {",
-        "ConvertTo-Json -Compress -Depth 3 -InputObject (Get-ProfileStates)",
-    ]
-    states = _code_lines(_functions(script)["Get-ProfileStates"])
-    assert "foreach ($p in @(Get-NetFirewallProfile -PolicyStore PersistentStore)) {" in states
-    assert "@(Get-NetFirewallProfile -PolicyStore ActiveStore | ForEach-Object {" in states
-    assert not [l for l in states if re.search(r"param\(|try\b|catch\b|Via|Fallback|ComObject|FwPolicy2", l, re.I)], states
-    # no verb has a second way to the profiles: nothing reads them over COM or CIM, and nothing asks for one
-    code = "\n".join(_code_lines(script))
-    assert not re.search(r"FirewallEnabled|DefaultOutboundAction\(|MSFT_NetFirewallProfile|CimInstance|CimSession|"
-                         r"Read-FastProfileStates|-Fast\b|\[switch\]", code, re.I)
-    for verb in ("Profiles", "List", "Create", "Cut", "SetDefaultOutbound", "AllowOut"):
-        assert "FwPolicy2" not in _op_case(script, verb), verb
-        assert "Get-ProfileStates" in _op_case(script, verb), verb
-    # Configured, the store ISOLATED remembers and puts back, is named in exactly one line: the cmdlet assignment
-    access = (r"\.configured\b", r"(?<![\w$])configured\s*=", r"['\"]configured['\"]", r"Add-Member\b.*(?<![\w$])configured\b")
-    assert [l for l in _code_lines(script) if any(re.search(a, l, re.I) for a in access)] == [
-        "Configured = $configured[[string]$_.Name]"]
-    # Compare has no profile section left: with one way there is nothing to compare
-    compare = "\n".join(_code_lines(_op_case(script, "Compare")))
-    assert not re.search(r"Get-ProfileStates|Get-NetFirewallProfile|DefaultOutboundAction|Configured|'profiles'", compare, re.I)
-
 
 def test_compare_counts_each_kind_of_rule_check_on_its_own_and_writes_nothing():
     """An ok over no rule at all must not read like an ok over fifty fields: how many rules either way found, and
-    each kind of check, are said apart."""
+    each kind of check (the profiles' fields, display names, the name sets, the rules' fields), are said apart."""
     script = _ps1()
     case = _op_case(script, "Compare")
     lines = _code_lines(case)
-    assert "$checked = [ordered]@{ displayNames = 0; names = 0; fields = 0 }" in lines
-    assert [l for l in lines if "+= 1" in l] == ["$checked.displayNames += 1", "$checked.names += 1", "$checked.fields += 1"]
+    assert "$checked = [ordered]@{ profiles = 0; displayNames = 0; names = 0; fields = 0 }" in lines
+    assert [l for l in lines if "+= 1" in l] == ["$checked.profiles += 1", "$checked.displayNames += 1",
+                                                 "$checked.names += 1", "$checked.fields += 1"]
     assert "ok = $ok; rules = $ruleNames.Count; checked = [pscustomobject]$checked; differences = $differences" in lines
     assert "exit 1" in case
     assert not re.search(r"\b(Set|New|Remove|Enable|Disable)-NetFirewall", _op_branch(script, "Compare"))
@@ -3366,6 +3343,19 @@ def test_profiles_reads_cim_with_the_option_and_never_com():
     assert "SetCustomOption" in fast and "MSFT_NetFirewallProfile" in fast
     assert "FwPolicy2" not in fast, "the profiles must not be read over COM"
     assert "Create('.')" in fast, "Create($null) fails with 'Der Parameter ist ungueltig'"
+    # Kept from the pin this replaces, and still the reason it was written: measured on the VM, local GPO Domain
+    # outbound Allow, PersistentStore Block, ActiveStore (in force) Allow, COM 0 = Block. COM reads the local store, so
+    # where a policy sets Allow over the local Block that ISOLATED writes, a COM read says closed while the egress is
+    # open. No way to the profiles, fast or cmdlet, in any verb, goes over COM.
+    script = _ps1()
+    com = r"FwPolicy2|ComObject|FirewallEnabled|DefaultOutboundAction\("
+    assert not re.search(com, "\n".join(_code_lines(_op_branch(script, "Profiles"))), re.I)
+    for name in ("Get-ProfileStates", "Read-FastProfileStates"):
+        assert not re.search(com, _function_body(script, name), re.I), name
+    for verb in ("Profiles", "List", "Create", "Cut", "SetDefaultOutbound", "AllowOut", "Compare"):
+        assert "Get-ProfileStates" in _op_case(script, verb), verb
+        assert not re.search(r"FirewallEnabled|DefaultOutboundAction\(", _op_case(script, verb), re.I), verb
+    assert not re.search(r"FirewallEnabled|DefaultOutboundAction\(", "\n".join(_code_lines(script)), re.I)
 
 
 def test_mustcomply_is_not_used_and_the_script_says_why():
@@ -3477,10 +3467,9 @@ def test_every_other_caller_takes_the_rows_and_the_writing_verbs_keep_the_cmdlet
     for verb in ("List", "AllowOut", "Create", "Cut", "SetDefaultOutbound"):
         uses = re.findall(r"\(Get-ProfileStates[^)]*\)(\.Rows)?", _op_case(script, verb))
         assert uses and all(uses), verb
-    for verb in ("Create", "Cut", "SetDefaultOutbound"):
+    for verb in ("Create", "Cut", "SetDefaultOutbound", "AllowOut"):
         assert "(Get-ProfileStates -CmdletsOnly).Rows" in _op_case(script, verb), verb
-    for verb in ("List", "AllowOut"):
-        assert "(Get-ProfileStates).Rows" in _op_case(script, verb), verb
+    assert "(Get-ProfileStates).Rows" in _op_case(script, "List")
     for verb in ("Enable", "Remove", "DisableAllowOut", "EnableAllowOut", "RemoveIsolate"):
         assert "ProfileStates" not in _op_case(script, verb), verb
 
@@ -3507,3 +3496,35 @@ def test_the_head_comment_says_what_was_measured_and_no_longer_calls_the_option_
     for said in ("SetCustomOption", "mustComply", "sentinel", "Create('.')", "Create($null)",
                  "Ungueltiger Namespace", "Die Anfrage ist ungueltig", "COM                          = 0 = Block"):
         assert said in head, said
+
+
+def test_compares_cmdlet_side_can_never_be_the_fast_reader():
+    """A comparison whose two sides can reach the same reader proves nothing. Compare's cmdlet side is
+    Get-ProfileStates -CmdletsOnly, and with that switch the fast reader is not reached at all: it is called in the one
+    block the switch skips, and nowhere after it."""
+    script = _ps1()
+    states = _function_body(script, "Get-ProfileStates")
+    lines = _code_lines(states)
+    assert lines[0] == "param([switch]$CmdletsOnly)"
+    guard = lines.index("if (-not $CmdletsOnly) {")
+    close = lines.index("}", lines.index("$fallback = Get-ShortReason $_"))
+    calls = [i for i, l in enumerate(lines) if "Read-FastProfileStates" in l]
+    assert calls and all(guard < i < close for i in calls), (guard, close, calls)
+    assert lines[close + 1] == "}", "the try/catch must be the whole of the skipped block"
+    assert not re.search(r"Read-Fast|\$CmdletsOnly", "\n".join(lines[close + 1:])), "nothing after the block may go fast"
+    case = _op_case(script, "Compare")
+    cmdlet_side = [l for l in _code_lines(case) if "$cmdletProfiles[[string]" in l]
+    assert cmdlet_side == ["foreach ($row in @((Get-ProfileStates -CmdletsOnly).Rows)) { $cmdletProfiles[[string]$row.Name] = $row }"]
+    fast_side = [l for l in _code_lines(case) if "$fastProfiles[[string]" in l]
+    assert fast_side == ["foreach ($row in @(Read-FastProfileStates)) { $fastProfiles[[string]$row.Name] = $row }"]
+
+
+def test_the_sentinel_is_named_in_one_place_and_says_why_any_error_is_proof():
+    script = _ps1()
+    assert len([l for l in _code_lines(script) if "TDC-NoSuchStore" in l]) == 1
+    assert "try { $null = & $enumerate 'TDC-NoSuchStore' } catch { $honoured = $true }" in _code_lines(script)
+    fast = _function_body(script, "Read-FastProfileStates")
+    said = fast[:fast.index("try { $null = & $enumerate")]
+    said = said[said.rindex("# The sentinel"):]
+    for word in ("would not", "look at the store name", "resolvable as a host", "ERROR_BAD_NETPATH", "LLMNR", "capture"):
+        assert word in said, word
