@@ -391,10 +391,11 @@ writes outside the detonation paths — is in
 
 ## License
 
-The repository carries no licence file of its own. Every tool the chamber
-installs or calls keeps the licence of its own project; the ones whose terms
-reach the way they are used are named in [Credits](#credits) — Aether
-(GPL-3.0) and rizin (LGPL-3.0) run as separate processes, Process Dump is MIT.
+This repository is [MIT licensed](LICENSE). Every tool the chamber installs or
+calls keeps the licence of its own project; the ones whose terms reach the way
+they are used are named in [Credits](#credits) — Aether (GPL-3.0) and rizin
+(LGPL-3.0) run as separate processes, Process Dump is MIT, and the vendored
+Mermaid copy is MIT with its licence beside it.
 
 ---
 
