@@ -22,7 +22,8 @@ param(
         'help','prerequisites','install','run','run-debug','dev','uninstall',
         'up','halt','destroy','reload','provision','provision-webui',
         'deploy','deploy-app','restart','deploy-restart','open','logs',
-        'ssh','rdp','status','services','alerts','test','unit-test','docs','submit',
+        'ssh','rdp','status','services','alerts','test','unit-test','docs',
+        'site','site-serve','submit',
         'clean','clean-all'
     )]
     [string]$Target = 'help',
@@ -36,7 +37,16 @@ param(
 
     [Parameter()]
     [Alias('IP')]
-    [string]$VMIp = '172.17.251.7'
+    [string]$VMIp = '172.17.251.7',
+
+    # The documentation website: the build folder and the port the local
+    # preview listens on - the same two knobs the Makefile has (SITE_DIR,
+    # SITE_PORT), so the two front ends cannot drift apart.
+    [Parameter()]
+    [string]$SiteDir = 'site',
+
+    [Parameter()]
+    [int]$SitePort = 8099
 )
 
 # --- Configuration ---
@@ -77,6 +87,8 @@ switch ($Target) {
         Write-Host ""
         Write-Host "  Documentation:" -ForegroundColor Yellow
         Write-Host "    .\make.ps1 docs            Build the offline wiki -> webui\static\wiki.html"
+        Write-Host "    .\make.ps1 site            Build the documentation website -> $SiteDir\ (builds the wiki too)"
+        Write-Host "    .\make.ps1 site-serve      Build it and serve it on http://localhost:$SitePort/"
         Write-Host ""
         Write-Host "  Local (no VM required):" -ForegroundColor Yellow
         Write-Host "    .\make.ps1 install         Install Python venv + dependencies"
@@ -163,6 +175,41 @@ switch ($Target) {
             Write-Host "[docs] the wiki was not built" -ForegroundColor Red
             exit $LASTEXITCODE
         }
+    }
+
+    'site' {
+        # The website is the second output of the same generator: one folder
+        # per page for GitHub Pages. The wiki is built first, because the
+        # download the header offers (webui\static\wiki.html) is git-ignored
+        # and is not there in a fresh clone - a site without it would promise
+        # a file nobody can get. The Makefile says `site: docs`; here the arm
+        # is called the same way site-serve calls this one, so the wiki is
+        # built in one place only.
+        & $PSCommandPath docs
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $SitePy = Join-Path $PSScriptRoot "webui\.venv\Scripts\python.exe"
+        if (-not (Test-Path $SitePy)) { $SitePy = "python" }
+        Write-Host "[site] Building the documentation website from docs\ and README.md ..." -ForegroundColor Cyan
+        & $SitePy scripts\build-wiki.py --site $SiteDir -o webui\static\wiki.html
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[site] the website was not built" -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    }
+
+    'site-serve' {
+        # A look at what would be published, before it is: the site has to open
+        # from a plain folder too.
+        & $PSCommandPath site -SiteDir $SiteDir
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        # The interpreter is named from the script's own folder, and before
+        # Push-Location: a relative path would be looked for inside the folder
+        # that is being served, where there is no venv.
+        $SitePy = Join-Path $PSScriptRoot "webui\.venv\Scripts\python.exe"
+        if (-not (Test-Path $SitePy)) { $SitePy = "python" }
+        Write-Host "[site-serve] http://localhost:$SitePort/ - Ctrl-C stops it" -ForegroundColor Cyan
+        Push-Location (Join-Path $PSScriptRoot $SiteDir)
+        try { & $SitePy -m http.server $SitePort } finally { Pop-Location }
     }
 
     'install' {

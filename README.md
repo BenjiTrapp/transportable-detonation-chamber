@@ -13,6 +13,7 @@
   <a href="#what-it-does"><img src="https://img.shields.io/badge/Features-purple?style=for-the-badge" alt="Features"></a>
   <a href="docs/web-ui.md"><img src="https://img.shields.io/badge/Demo-green?style=for-the-badge" alt="Demo"></a>
   <a href="docs/api.md"><img src="https://img.shields.io/badge/API-orange?style=for-the-badge" alt="API"></a>
+  <a href="https://benjitrapp.github.io/transportable-detonation-chamber/"><img src="https://img.shields.io/badge/Documentation-teal?style=for-the-badge" alt="Documentation"></a>
 </p>
 
 <p align="center">
@@ -317,6 +318,9 @@ memory verdict in [Live memory](docs/memory.md#arm64-hosts).
 The guide lives in [`docs/`](docs/README.md): one page per topic, and two reading
 paths through them - set it up, or work with it.
 
+The same pages are on the web: [the documentation website](https://benjitrapp.github.io/transportable-detonation-chamber/)
+is built from `main` on every push - one address per page, and a search.
+
 | Page | What it answers |
 |---|---|
 | [Setup](docs/setup.md) | What do I need before the VM, and what does ARM64 change? |
@@ -387,10 +391,11 @@ writes outside the detonation paths — is in
 
 ## License
 
-The repository carries no licence file of its own. Every tool the chamber
-installs or calls keeps the licence of its own project; the ones whose terms
-reach the way they are used are named in [Credits](#credits) — Aether
-(GPL-3.0) and rizin (LGPL-3.0) run as separate processes, Process Dump is MIT.
+This repository is [MIT licensed](LICENSE). Every tool the chamber installs or
+calls keeps the licence of its own project; the ones whose terms reach the way
+they are used are named in [Credits](#credits) — Aether (GPL-3.0) and rizin
+(LGPL-3.0) run as separate processes, Process Dump is MIT, and the vendored
+Mermaid copy is MIT with its licence beside it.
 
 ---
 
