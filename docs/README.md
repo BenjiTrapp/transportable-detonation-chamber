@@ -1,6 +1,8 @@
 # Transportable Detonation Chamber — Documentation
 
 This is the guide: how to set the chamber up, and how to work with it once it runs.
+The same pages are on the web, one address each and searchable:
+[the documentation website](https://benjitrapp.github.io/transportable-detonation-chamber/).
 
 The Transportable Detonation Chamber is a pre-configured Windows 11 VM for malware
 detonation testing against multiple EDR solutions. A sample goes in; the detection
