@@ -142,8 +142,29 @@ Lesevorgänge dürfen gelten. **Gelingt** er, wird die Option ignoriert, und der
 schnelle Weg wirft — fällt also auf die Cmdlets zurück, statt einen
 konfigurierten Wert als in Kraft auszugeben.
 
-Er kostet 140 ms; die erste echte Abfrage danach nur noch 34 ms, weil die
-Sitzung dann warm ist. Der Prüfstein ist damit fast gratis.
+**Sein Name entscheidet, ob er bezahlbar ist**, und das ist gemessen. Ein
+unbekannter Store wird als **Rechnername** behandelt — was logisch ist, denn
+`-PolicyStore <Rechnername>` *ist* die Adresse des lokalen Richtlinien-Stores.
+Ein Name, der ein legaler Rechnername ist, schickt also eine Namensauflösung los,
+in der Kammer, deren Verkehr TDC aufzeichnet:
+
+| Prüfstein-Name | min / Mittel / max | DNS-Spur | Fehler |
+|---|---|---|---|
+| `TDC-NoSuchStore` | 24 / 545 / **5205** ms | **ja** | Netzwerkpfad nicht gefunden |
+| `not-a-store.invalid` | 34 / 78 / 362 ms | **ja** | Netzwerkpfad nicht gefunden |
+| **`TDC\|NoSuchStore`** | 27 / **46** / **160** ms | **nein** | Syntax des Datei- oder Verzeichnisnamens ist falsch |
+
+Der Name trägt deshalb ein Zeichen, das in keinem Rechner- und keinem
+Pfadnamen vorkommen kann. Er wird dennoch **vom Anbieter** abgelehnt, nicht vom
+Client: der Fehler kommt als „Fehler beim Durchlaufen einer Auflistung", also
+während der Aufzählung, und dass ein legaler Name einen Rechner zu erreichen
+*versucht*, zeigt, dass der Wert durchgereicht wird. Ein Wert, den der Client
+vorher abwiese, würde nichts beweisen.
+
+Bleibender Vorbehalt, ehrlich benannt: auf einer Maschine, deren Client solche
+Werte selbst abweist, wäre der Prüfstein leer — er würde scheitern, ohne den
+Anbieter gefragt zu haben. Dagegen steht `Compare` im Richtlinien-Zustand, das
+genau dann eine Differenz zeigt.
 
 ### Der Rückfall, und dass `List` ihn ganz erzählt
 
