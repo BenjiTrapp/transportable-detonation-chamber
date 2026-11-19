@@ -3404,12 +3404,12 @@ def test_no_store_is_read_before_the_sentinel_and_each_table_holds_its_own_store
     fast = _function_body(_ps1(), "Read-FastProfileStates")
     lines = _code_lines(fast)
     reads = [(i, l) for i, l in enumerate(lines) if re.search(r"& \$(enumerate|readStore) '", l)]
-    assert [re.search(r"& \$(?:enumerate|readStore) '([\w-]+)'", l).group(1) for _, l in reads] == [
-        "TDC-NoSuchStore", "ActiveStore", "PersistentStore"], reads
+    assert [re.search(r"& \$(?:enumerate|readStore) '([^']+)'", l).group(1) for _, l in reads] == [
+        "TDC|NoSuchStore", "ActiveStore", "PersistentStore"], reads
     sentinel = reads[0][0]
     # the sentinel is enumerated raw: any answer, even an empty one, is an answer, and no check of the profiles in
     # between may turn it into a failure that reads as "the option is honoured"
-    assert "try { $null = & $enumerate 'TDC-NoSuchStore' } catch { $honoured = $true }" == lines[sentinel]
+    assert "try { $null = & $enumerate 'TDC|NoSuchStore' } catch { $honoured = $true }" == lines[sentinel]
     assert "foreach ($p in @(& $enumerate $Store)) {" in lines
     assert all(sentinel < i for i, l in enumerate(lines) if re.search(r"ActiveStore|PersistentStore", l)), \
         "no store may be named before the sentinel is read"
@@ -3521,10 +3521,27 @@ def test_compares_cmdlet_side_can_never_be_the_fast_reader():
 
 def test_the_sentinel_is_named_in_one_place_and_says_why_any_error_is_proof():
     script = _ps1()
-    assert len([l for l in _code_lines(script) if "TDC-NoSuchStore" in l]) == 1
-    assert "try { $null = & $enumerate 'TDC-NoSuchStore' } catch { $honoured = $true }" in _code_lines(script)
+    assert len([l for l in _code_lines(script) if "NoSuchStore" in l]) == 1
+    assert "try { $null = & $enumerate 'TDC|NoSuchStore' } catch { $honoured = $true }" in _code_lines(script)
     fast = _function_body(script, "Read-FastProfileStates")
     said = fast[:fast.index("try { $null = & $enumerate")]
     said = said[said.rindex("# The sentinel"):]
-    for word in ("would not", "look at the store name", "resolvable as a host", "ERROR_BAD_NETPATH", "LLMNR", "capture"):
+    for word in ("Fehler beim Durchlaufen einer Auflistung", "reached the provider", "would never look at the name",
+                 "Residual", "vacuous", "Compare", "5205 ms", "AAAA", "capture", "never reaches a command line",
+                 "SetCustomOption"):
         assert word in said, word
+    assert "legal hostname as it stands" not in script and "140 ms" not in script
+
+
+def test_the_sentinel_name_cannot_be_a_computer_or_a_path():
+    """Measured on the VM: an unknown store is taken for a computer name (-PolicyStore <computer name> addresses its
+    GPO store). TDC-NoSuchStore cost up to 5.2 s per read and put an AAAA query for it on the wire inside the captured
+    chamber; not-a-store.invalid queried DNS too. A | can be in no computer name and no path, so the provider refuses
+    the name on its syntax: 46 ms typically, no DNS. A plain name must not come back."""
+    lines = _code_lines(_function_body(_ps1(), "Read-FastProfileStates"))
+    sentinel = [l for l in lines if l.startswith("try { $null = & $enumerate '")]
+    assert len(sentinel) == 1, sentinel
+    name = re.search(r"& \$enumerate '([^']*)'", sentinel[0]).group(1)
+    assert "|" in name, "the sentinel %r could be a computer or a path name, and is then looked for on the network" % name
+    assert name not in ("ActiveStore", "PersistentStore", "RSOP", "SystemDefaults", "StaticServiceStore",
+                        "ConfigurableServiceStore", "localhost", ".")

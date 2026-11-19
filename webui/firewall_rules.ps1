@@ -103,10 +103,11 @@
 # The option cannot be forced: SetCustomOption with mustComply $true is refused for every call by the WS-Man WMI
 # plug-in ("unterstuetzt das angegebene OptionSet-Element nicht"), so it is set with $false. A provider that ignored it
 # would silently answer the PersistentStore, and TDC would give a configured value out as in force. The sentinel stands
-# in for mustComply: before any store is read, Read-FastProfileStates reads a store that cannot exist. Measured, that
-# fails ("Der Netzwerkpfad wurde nicht gefunden", in 140 ms; the real read after it costs 34 ms). Should it answer, the
-# option is being ignored, and the fast way throws instead of answering. It is a proof per call, not a promise of the
-# API, and it proves something only when it comes before the first value that is used.
+# in for mustComply: before any store is read, Read-FastProfileStates reads a store that cannot exist, a name no
+# computer and no path can have. Measured over ten reads each, it always fails, in 46 ms typically and 160 ms at most,
+# with no DNS query. Should it answer, the option is being ignored, and the fast way throws instead of answering. It is
+# a proof per call, not a promise of the API, and it proves something only when it comes before the first value that
+# is used. Why that name, and why its failure proves anything, is written at the sentinel.
 # Every value is translated through a map written out in Read-FastProfileStates and matched case-exactly. A value not in
 # its map, a profile missing or named twice, an empty answer, CIM not being there at all, or any other error is not
 # guessed at: Profiles answers through the cmdlets instead and says so (Via "cmdlet", Fallback the reason). Compare
@@ -205,15 +206,29 @@ function Read-FastProfileStates {
         # The sentinel, before any store is read: a store that cannot exist must fail. If it answers at all, even with
         # nothing, the option is being ignored and every read below would be the PersistentStore under another name.
         # Moved behind a real read, it would prove nothing about that read.
-        # Any error counts as the proof, whatever its (localised) text: a provider that ignored the option would not
-        # look at the store name at all, so it could not fail for this name and then answer for the real ones.
-        # Its name is written in this one line only, so that it changes in one edit. It must be no store and must not
-        # be resolvable as a host: the measured failure, "Der Netzwerkpfad wurde nicht gefunden" (ERROR_BAD_NETPATH),
-        # reads like a path lookup, and Profiles runs on every poll of the tab, inside the chamber whose traffic TDC
-        # captures. A DNS, LLMNR or NBNS query for it on every poll would put TDC's own noise into the capture. The
-        # name is a legal hostname as it stands; whether reading it sends anything is being measured on the VM.
+        # Why its failure proves the option is honoured, whatever the (localised) text of the error:
+        #   - The error arrives during the enumeration ("Fehler beim Durchlaufen einer Auflistung"), so the value
+        #     reached the provider and was interpreted there. A value the client refused before sending would prove
+        #     nothing.
+        #   - That store names do reach the provider is visible on its own: a legal name makes it try to contact a
+        #     machine of that name, because -PolicyStore <computer name> is how a computer's GPO store is addressed.
+        #   - A provider that ignored the option would never look at the name, so it would answer with the
+        #     PersistentStore's three profiles, and that answer is what makes this throw.
+        # Residual: on a machine whose client refused such a value itself, the sentinel would be vacuous (it would fail
+        # without having asked the provider). Compare in a policy state that contradicts the stores is the backstop,
+        # because that is where an option that is not honoured shows as a difference.
+        # The name must be no store, no computer name and no path, and it contains a | for that: no computer or path
+        # name can hold one, so the provider refuses it on its syntax ("Die Syntax fuer den Dateinamen,
+        # Verzeichnisnamen oder die Datentraegerbezeichnung ist falsch"). A legal name is looked for on the network.
+        # Measured on the VM, 20 reads of TDC-NoSuchStore: 24 ms to 5205 ms, 545 ms on average, and an AAAA query
+        # for it in the DNS trace. That is slower than the cmdlets, on a verb that runs on every poll and that the
+        # profile check of the cut waits for, and it puts a name on the wire inside the chamber whose traffic TDC
+        # captures. With the |, ten reads: 27 ms to 160 ms, 46 ms on average, no DNS query, never an answer.
+        # The | never reaches a command line: it is a string argument of SetCustomOption, and this script builds
+        # nothing from a value but the parameters of one call. It is not an injection to be "fixed".
+        # The name is written in this one line only, so that it changes in one edit.
         $honoured = $false
-        try { $null = & $enumerate 'TDC-NoSuchStore' } catch { $honoured = $true }
+        try { $null = & $enumerate 'TDC|NoSuchStore' } catch { $honoured = $true }
         if (-not $honoured) { throw 'the PolicyStore option is ignored: a store that cannot exist answered, so no store read here can be trusted' }
         $inForce = @{}
         $configured = @{}
