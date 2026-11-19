@@ -43,7 +43,7 @@ Kosten, frischer Prozess, unbelastete VM:
 |---|---|---|
 | beide Stores lesen (was `Profiles` braucht) | 1,20 s | **0,61 s** |
 | davon im Prozess | 738 ms | **213 ms** (zweiter Store nur +39 ms) |
-| Prüfstein + echter Lesevorgang | — | **0,57 s** (140 ms + 34 ms) |
+| Prüfstein, im Profil-Lesen enthalten | — | **46 ms** typisch, 160 ms höchstens |
 | NetSecurity geladen | ja | **nein** |
 
 Nebenbei belegt, gegen die Cmdlet-Wahrheit geprüft: CIM `0`/`2`/`4` =
