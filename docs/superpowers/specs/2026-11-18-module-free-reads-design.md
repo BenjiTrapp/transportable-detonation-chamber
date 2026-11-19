@@ -20,8 +20,9 @@
 >   meldet, während Verkehr rausgeht.
 >
 > Die betroffenen Abschnitte unten sind einzeln als überholt markiert. Das
-> Leistungsziel (18 % → 19,5 %) ist ebenfalls überholt: die Ruhelast liegt jetzt
-> bei 11,0 % und 12,9 %.
+> Leistungsziel bleibt **unerreicht**: die Ruhelast liegt über drei saubere
+> Fenster gemessen bei 18,6 % gegen 19,5 % vorher. Gewonnen ist die Zeit je
+> Aufruf, nicht die Ruhelast.
 
 Erweiterung zu `docs/superpowers/specs/2026-11-16-firewall-tab-design.md` und
 `docs/superpowers/specs/2026-11-17-panic-cut-design.md`. Betrifft nur das
@@ -218,7 +219,7 @@ das Folgende.
 
 ### Das Leistungsziel wurde nicht erreicht
 
-*Geschichte, überholt durch `docs/superpowers/specs/2026-11-19-in-force-reads-design.md`: das Ziel ist jetzt erreicht (11,0 % und 12,9 %), `List` lädt kein Modul mehr, und `Profiles` lädt keines mehr; die Zahlen unten stimmen für den Stand nach dem ersten Rückbau.*
+*Teilweise überholt durch `docs/superpowers/specs/2026-11-19-in-force-reads-design.md`: `List` und `Profiles` laden kein Modul mehr, und die Zeit je Lesevorgang hat sich halbiert. **Der Satz in der Überschrift gilt weiter**: die Ruhelast liegt bei 18,6 % gegen 19,5 % — die Ursache ist nur eine andere als damals vermutet, nämlich die Startgebühr von `powershell.exe` aus `python.exe` (1,40–1,65 s gegen 0,35 s), die kein Skript berührt. Die Zahlen unten stimmen für den Stand nach dem ersten Rückbau.*
 
 Ziel 1 oben (deutlich unter einer Sekunde je Lesen) gilt nur für `Get`. Das
 Ziel dieser Arbeit, einen ruhigeren Tab im Dauerbetrieb, wurde **verfehlt**:

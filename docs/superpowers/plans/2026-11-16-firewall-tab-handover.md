@@ -749,7 +749,11 @@ reason. `AllowOut` carries no `via=` at all.
   Python's spawn machinery is not slow: `cmd.exe` costs 0.05 s from Python. What
   is expensive is **`powershell.exe` started by `python.exe`**: 1.40 s against
   0.35 s for the same bare command, a launch cost of about 1.05 s (the
-  difference of the two table cells) on every firewall call. No change to the
+  difference of the two table cells) on every firewall call. Measured the other
+  way round, as a share: `-Op Profiles` through the app's own runner takes
+  2.60 s, and the bare launch from that same Python is 1.40 s in one run and
+  1.65 s in another — so **somewhere between half and two thirds of a call is
+  launch**, before the script runs a line. No change to the
   script can touch it. That is why the tab's load barely moved for any
   script-level work, and why the one large win in this trail, 42 % down to 18 %,
   came from **removing** calls (the `/rules` cache), not from making them
@@ -1289,7 +1293,10 @@ auf dieser VM: Median **2,60 s**, derselbe Aufruf aus PowerShell gestartet 0,62 
 Pythons Startmaschinerie ist also nicht langsam: `cmd.exe` kostet aus Python 0,05 s.
 Teuer ist **`powershell.exe`, von `python.exe` gestartet**: 1,40 s gegen 0,35 s für
 denselben nackten Befehl, ein Startpreis von etwa 1,05 s (Differenz der beiden
-Tabellenzellen) bei jedem Firewall-Aufruf. Keine Änderung am Skript kann ihn
+Tabellenzellen) bei jedem Firewall-Aufruf. Als Anteil gerechnet: von den 2,60 s
+eines `Profiles`-Aufrufs über den Runner der App sind 1,40 s (in einem anderen
+Lauf 1,65 s) der nackte Start — also **zwischen der Hälfte und zwei Dritteln
+eines Aufrufs**, bevor das Skript eine Zeile tut. Keine Änderung am Skript kann ihn
 erreichen. Darum hat sich die Last des Tabs bei keiner Arbeit am Skript nennenswert
 bewegt, und darum kam der eine große Gewinn dieser Spur, 42 % auf 18 %, vom
 **Entfernen** von Aufrufen (dem `/rules`-Cache), nicht vom Beschleunigen. Ohne
