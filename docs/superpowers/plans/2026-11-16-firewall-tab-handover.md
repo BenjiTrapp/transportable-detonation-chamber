@@ -691,16 +691,82 @@ reason. `AllowOut` carries no `via=` at all.
   | a single cmdlet profile read (the module floor) | 1.08 s | not applicable |
   | bare `powershell.exe -Command exit` | 0.37 s | not applicable |
 
-  Steady state, 100 s of a watching tab, **measured twice: 4 calls and 11.0 %**,
-  and **4 calls and 12.9 %** of one `powershell.exe` busy. In the second window
-  **all four reads took the fast path** (`{'fast': 4}`), no fallbacks.
+  **Steady state: the goal is NOT met.** The goal was a steady load below the
+  18 % from before this whole trail. Measured properly (VM settled for 60 s
+  first, CPU 0 %, one PowerShell process, three consecutive 100 s windows with
+  nothing but the tab's own poll pattern):
 
-  **The steady-state goal that the previous plan missed is met this time.** The
-  trail: 42 % with 16 calls at the start, 18 % after `/rules` stopped forcing a
-  read, 19.5 % after the previous plan's reverts, and now about 12 %. It moved
-  because the two reads that dominate the load, `Profiles` and the profile half
-  of `List`, no longer need the module. Timings stay the proof that the module
-  was not loaded: 0.62 s and 0.65 s are far below the 1.08 s floor.
+  | window | calls | busy | per call |
+  |---|---|---|---|
+  | 1 | 6 (`Profiles` x4, `List` x2) | 23.2 % | 3.86 % |
+  | 2 | 3 | 15.1 % | 5.02 % |
+  | 3 | 5 | 17.7 % | 3.54 % |
+  | mean | n/a | **18.6 %** | 3.99 % |
+
+  All reads took the fast path in all three windows. Against **19.5 % with 6
+  calls** before this plan, that is **no improvement**.
+
+  **The earlier "11.0 % and 12.9 %" are withdrawn.** They were two single
+  windows with only **4** calls each, where the pre-change measurement had **6**;
+  they compared fewer calls with more calls. The three-window measurement above
+  supersedes them, and the "goal met" that was written on their strength was
+  wrong. It is the third time this trail's headline figure has been walked back.
+
+  The trail, as it stands: 42 % with 16 calls at the start, 18 % after `/rules`
+  stopped forcing a read, 19.5 % after the previous plan's reverts, and 18.6 %
+  now: no steady-state gain from this plan. Timings stay the proof that the
+  module was not loaded: 0.62 s and 0.65 s are far below the 1.08 s floor.
+
+  **What this plan did gain is real**, and shows wherever a call is on the
+  critical path. Controlled comparison, same machine, same launcher, nothing
+  else running; `AllowOut` serves as the old path, since its profiles still go
+  through the cmdlets in the same script:
+
+  | | new path (`Profiles`) | old path (`AllowOut`'s profiles) |
+  |---|---|---|
+  | three calls in sequence | 0.56 / 0.57 / 0.71 s | 1.72 / 1.97 / 2.10 s |
+  | three calls at once | 1.00 / 1.03 / 1.05 s | 2.55 / 2.56 / 2.57 s |
+
+  The per-call cost of the read itself roughly halved, alone and concurrent. The
+  VM has six cores, so this is not a one-core artefact. It lands on the panic
+  cut's profile check, the `cut_stands` poll every 10 s while isolated, and every
+  write's read-back. It did not lower the steady-state load; the next point says
+  why.
+
+  **Why the load does not follow: the launch, not the script.** Measured on the
+  VM, five runs each:
+
+  | started from | `cmd.exe /c exit` | `powershell.exe -NoProfile -NonInteractive -Command exit` |
+  |---|---|---|
+  | PowerShell | 0.02 s | 0.35 s |
+  | **Python** (as the app does) | **0.05 s** | **1.40 s** |
+  | Python, without `CREATE_NO_WINDOW` | n/a | 3.10 s |
+
+  And `-Op Profiles` through the app's own runner, from the app's own Python on
+  that VM: median **2.60 s**, where the same call started from PowerShell is
+  0.62 s.
+
+  Python's spawn machinery is not slow: `cmd.exe` costs 0.05 s from Python. What
+  is expensive is **`powershell.exe` started by `python.exe`**: 1.40 s against
+  0.35 s for the same bare command, a launch cost of about 1.05 s (the
+  difference of the two table cells) on every firewall call. No change to the
+  script can touch it. That is why the tab's load barely moved for any
+  script-level work, and why the one large win in this trail, 42 % down to 18 %,
+  came from **removing** calls (the `/rules` cache), not from making them
+  faster. Leaving out `CREATE_NO_WINDOW` makes it worse (3.10 s), so that flag
+  stays.
+
+  **Hypothesis, not a fact:** Defender's real-time inspection of the launch.
+  `DisableRealtimeMonitoring` is `False` and `DisableScriptScanning` is `False`
+  on that VM, and `python.exe` spawning `powershell.exe` is exactly the
+  parent/child pattern a detonation chamber should watch closely. Confirming it
+  means changing Defender's configuration on a malware chamber. **That was not
+  done and needs the user's decision.**
+
+  **Next lead for anyone picking up the call budget:** the remaining
+  steady-state cost is in the launch, not in the script. The next step is either
+  **fewer launches** (as the cache did) or a **cheaper launch**. A resident
+  process remains rejected for the reasons already recorded.
 
   A round trip afterwards: the cut closed (`out=000`, loopback 200), converged
   to `isolated` with `verified=True`, left cleanly, the firewall came back to
@@ -729,7 +795,7 @@ reason. `AllowOut` carries no `via=` at all.
 
   Fallbacks in the 100 s window were not recorded for this run.
 
-  **The performance goal of that work was not met** (met by the plan above). The aim was a quiet
+  **The performance goal of that work was not met** (nor by the plan above, see the measurement there). The aim was a quiet
   steady state, and it is not: the watching tab sat at 18 % before and sits at
   19.5 % now. The two reads that dominate it have to load the module for
   correctness: `Profiles`, because COM reads the local store rather than what is
@@ -1161,27 +1227,85 @@ erzwungene Lesen in `/rules`; das ist behoben (16 → 5 Aufrufe, 42 % → 18 %, 
 
 ### Stand nach den Lesevorgängen in Kraft (gemessen, VM)
 
-Nachfolger des Abschnitts darunter; das dort verfehlte Ziel ist **erreicht**.
-Der Plan `2026-11-19-in-force-reads.md` hat `Profiles` modulfrei gemacht (beide
+Nachfolger des Abschnitts darunter; das dort verfehlte Ziel ist **auch hier
+nicht erreicht** (Messung unten). Der Plan `2026-11-19-in-force-reads.md` hat `Profiles` modulfrei gemacht (beide
 Stores über `-PolicyStore` als CIM-Operationsoption, mit einem Prüfstein je
 Aufruf), und damit auch `List`, das das Modul nur noch für seine Profilhälfte
 lud. `AllowOut` bleibt bei den Cmdlets.
 
-**Das Leistungsziel:** der Tab im Dauerbetrieb, 100 s, niemand drückt etwas,
-zweimal gemessen:
+**Das Leistungsziel: nicht erreicht.** Das Ziel war eine Ruhelast unter den 18 %
+von vor dieser ganzen Spur. Sauber gemessen: VM zuvor 60 s beruhigt, CPU 0 %, ein
+PowerShell-Prozess, drei aufeinanderfolgende Fenster zu je 100 s, nichts außer dem
+eigenen Abfragemuster des Tabs:
 
-| | 18-%-Messung | nach dem ersten Rückbau | **jetzt** |
+| Fenster | Aufrufe | ausgelastet | je Aufruf |
 |---|---|---|---|
-| PowerShell-Aufrufe je 100 s | 5 | 6 | **4** und **4** |
-| `powershell.exe` ausgelastet | 18 % | 19,5 % | **11,0 %** und **12,9 %** |
+| 1 | 6 (`Profiles` ×4, `List` ×2) | 23,2 % | 3,86 % |
+| 2 | 3 | 15,1 % | 5,02 % |
+| 3 | 5 | 17,7 % | 3,54 % |
+| Mittel | n. z. | **18,6 %** | 3,99 % |
 
-Im zweiten Fenster nahmen **alle vier Lesevorgänge den schnellen Weg**
-(`{'fast': 4}`), keinen Rückfall. Die Spur: 42 % bei 16 Aufrufen am Anfang, 18 %
-nachdem `/rules` das erzwungene Lesen aufgab, 19,5 % nach den Rückbauten des
-Vorgängers, jetzt rund 12 %. **Das Ziel, das der Vorgänger verfehlt hat, ist
-damit erreicht.** Es hat sich bewegt, weil die beiden Lesevorgänge, die die Last
-bestimmen — `Profiles` und die Profilhälfte von `List` —, das Modul nicht mehr
-brauchen.
+In allen drei Fenstern nahmen alle Lesevorgänge den schnellen Weg. Gegen **19,5 %
+bei 6 Aufrufen** vor diesem Plan ist das **keine Verbesserung**.
+
+**Die früheren Angaben „11,0 % und 12,9 %“ sind zurückgezogen.** Es waren zwei
+einzelne Fenster mit nur **4** Aufrufen, die Messung davor hatte **6**; verglichen
+wurden weniger mit mehr Aufrufen. Die Dreifenstermessung oben ersetzt sie, und das
+auf ihnen geschriebene „Ziel erreicht“ war falsch. Es ist das dritte Mal, dass die
+Kennzahl dieser Spur zurückgenommen werden musste.
+
+Die Spur, wie sie steht: 42 % bei 16 Aufrufen am Anfang, 18 % nachdem `/rules` das
+erzwungene Lesen aufgab, 19,5 % nach den Rückbauten des Vorgängers, jetzt 18,6 %:
+dieser Plan hat die Ruhelast nicht gesenkt.
+
+**Was dieser Plan trotzdem gewonnen hat, und es ist echt:** der Preis des Lesens
+je Aufruf hat sich etwa halbiert. Kontrollierter Vergleich, dieselbe Maschine,
+derselbe Starter, nichts sonst in Betrieb; `AllowOut` dient als alter Weg, weil
+seine Profile im selben Skript noch über die Cmdlets laufen:
+
+| | neuer Weg (`Profiles`) | alter Weg (Profile von `AllowOut`) |
+|---|---|---|
+| drei Aufrufe nacheinander | 0,56 / 0,57 / 0,71 s | 1,72 / 1,97 / 2,10 s |
+| drei Aufrufe gleichzeitig | 1,00 / 1,03 / 1,05 s | 2,55 / 2,56 / 2,57 s |
+
+Allein wie gleichzeitig etwa halbiert. Die VM hat sechs Kerne, es ist also kein Ein-Kern-Artefakt.
+Das zeigt sich überall, wo ein Aufruf auf dem kritischen Pfad liegt: bei der
+Profilprüfung des Panikschnitts, beim `cut_stands`-Abruf alle 10 s, solange
+isoliert ist, und bei der Rücklesung jedes Schreibvorgangs. Die Ruhelast hat es
+nicht gesenkt; der nächste Punkt sagt, warum.
+
+**Warum die Last nicht folgt: der Start, nicht das Skript.** Neu und es erklärt
+die ganze Spur. Gemessen auf der VM, je fünf Läufe:
+
+| gestartet aus | `cmd.exe /c exit` | `powershell.exe -NoProfile -NonInteractive -Command exit` |
+|---|---|---|
+| PowerShell | 0,02 s | 0,35 s |
+| **Python** (wie die App) | **0,05 s** | **1,40 s** |
+| Python, ohne `CREATE_NO_WINDOW` | n. z. | 3,10 s |
+
+Und `-Op Profiles` durch den eigenen Runner der App, aus dem eigenen Python der App
+auf dieser VM: Median **2,60 s**, derselbe Aufruf aus PowerShell gestartet 0,62 s.
+
+Pythons Startmaschinerie ist also nicht langsam: `cmd.exe` kostet aus Python 0,05 s.
+Teuer ist **`powershell.exe`, von `python.exe` gestartet**: 1,40 s gegen 0,35 s für
+denselben nackten Befehl, ein Startpreis von etwa 1,05 s (Differenz der beiden
+Tabellenzellen) bei jedem Firewall-Aufruf. Keine Änderung am Skript kann ihn
+erreichen. Darum hat sich die Last des Tabs bei keiner Arbeit am Skript nennenswert
+bewegt, und darum kam der eine große Gewinn dieser Spur, 42 % auf 18 %, vom
+**Entfernen** von Aufrufen (dem `/rules`-Cache), nicht vom Beschleunigen. Ohne
+`CREATE_NO_WINDOW` wird es schlimmer (3,10 s), das Flag bleibt also.
+
+**Hypothese, kein Befund:** die Echtzeitprüfung von Defender beim Start.
+`DisableRealtimeMonitoring` ist auf dieser VM `False`, `DisableScriptScanning`
+ebenfalls, und `python.exe`, das `powershell.exe` startet, ist genau das
+Eltern/Kind-Muster, das eine Detonationskammer scharf beobachten sollte. Das zu
+bestätigen hieße, Defenders Konfiguration auf einer Malware-Kammer zu ändern. **Das
+ist nicht geschehen und braucht die Entscheidung des Nutzers.**
+
+**Nächste Spur für alle, die das Aufrufbudget weiterverfolgen:** die verbleibende
+Ruhelast sitzt im Start, nicht im Skript. Der nächste Schritt sind entweder
+**weniger Starts** (wie beim Cache) oder ein **billigerer Start**. Ein residenter
+Prozess bleibt aus den schon festgehaltenen Gründen abgelehnt.
 
 Je Verb, frischer Prozess, unbelastete VM:
 
@@ -1224,7 +1348,7 @@ Zustand nach dem ersten Rückbau von `Profiles`, ihre Folgerungen („nicht zu
 bewegen“, „gibt es nicht“) nicht mehr.*
 
 **Das Leistungsziel dieser Arbeit wurde nicht erreicht** (der Folgeplan hat es
-erreicht, siehe oben). Der Tab im
+ebenfalls nicht erreicht, siehe oben). Der Tab im
 Dauerbetrieb, 100 s, niemand drückt etwas, nach dem Rückbau von `Profiles`:
 
 | | davor (18-%-Messung oben) | jetzt |
@@ -1297,8 +1421,10 @@ gewesen (~0,2 s je Aufruf), aber:
 - **Dieses Argument ist zurückgezogen.** Es lautete, die Messung habe ihn
   unnötig gemacht, weil der Preis das Modul-Laden sei und ohne Modul die
   Ruhelast bei 3,3 % liege. Die Ruhelast lag bei 19,5 %, weil die beiden
-  dominierenden Lesevorgänge das Modul laden mussten; sie liegt jetzt bei rund
-  12 %, weil sie es nicht mehr müssen. Die Ablehnung ruht allein auf den beiden
+  dominierenden Lesevorgänge das Modul laden mussten. Dass die Last mit dem
+  modulfreien Lesen sinkt, hat sich nicht bestätigt: gemessen liegt sie bei
+  18,6 %, weil der Start von `powershell.exe` aus Python den Aufruf bestimmt und
+  nicht das Modul (Abschnitt „Stand nach den Lesevorgängen in Kraft“). Die Ablehnung ruht allein auf den beiden
   Punkten oben; sie tragen sie.
 
 **Nicht erneut vorschlagen.**

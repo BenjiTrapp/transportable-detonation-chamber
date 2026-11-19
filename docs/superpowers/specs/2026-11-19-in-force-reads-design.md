@@ -75,6 +75,7 @@ und ein verengter, kein vollständiger (siehe „Bleibender Vorbehalt").
    Sekunde — und damit wird `List` vollständig modulfrei, weil nur noch seine
    Profilhälfte das Modul lud.
 2. Die Ruhelast fällt messbar unter die 18 % von vor dieser ganzen Spur.
+   **Nicht erreicht** (18,6 %, siehe „Nach dem VM-Lauf“).
 3. Die Zwei-Store-Trennung bleibt **exakt**: der ActiveStore beantwortet nur
    „ist es jetzt zu?", der PersistentStore nur „was muss zurück?".
 4. Ein schneller Weg, der die Option nicht erzwingen kann, **beweist je Aufruf**,
@@ -246,13 +247,71 @@ der dort nicht genau die Cmdlet-Antwort gibt, ist falsch.
 
 ## Nach dem VM-Lauf
 
-**Ergebnis: der Entwurf trägt, und das Ziel ist erreicht.** Die Ruhelast eines
-zuschauenden Tabs liegt bei **11,0 %** und **12,9 %** eines `powershell.exe`
-(4 Aufrufe je 100 s, zweimal gemessen; im zweiten Fenster alle vier auf dem
-schnellen Weg, `{'fast': 4}`), gegen 18 % vor der ganzen Spur und 19,5 % nach den
-Rückbauten des Vorgängers. Je Verb, frischer Prozess, unbelastete VM: `Profiles`
-1,16 s → **0,62 s**, `List` 1,43 s → **0,65 s**, `Get` 0,63 s → 0,53 s,
-`AllowOut` 1,69 s → 1,77 s (unverändert, bei den Cmdlets).
+**Ergebnis: der Entwurf trägt, aber das Ziel ist verfehlt.** Die Ruhelast eines
+zuschauenden Tabs liegt gemessen bei **18,6 %** eines `powershell.exe`, gegen
+**19,5 % bei 6 Aufrufen** nach den Rückbauten des Vorgängers und 18 % vor der
+ganzen Spur: **keine Verbesserung**, das Ziel 2 (unter 18 %) ist nicht erreicht.
+Sauber gemessen: VM zuvor 60 s beruhigt, CPU 0 %, ein PowerShell-Prozess, drei
+aufeinanderfolgende Fenster zu je 100 s, nichts außer dem Abfragemuster des Tabs:
+
+| Fenster | Aufrufe | ausgelastet | je Aufruf |
+|---|---|---|---|
+| 1 | 6 (`Profiles` ×4, `List` ×2) | 23,2 % | 3,86 % |
+| 2 | 3 | 15,1 % | 5,02 % |
+| 3 | 5 | 17,7 % | 3,54 % |
+| Mittel | n. z. | **18,6 %** | 3,99 % |
+
+In allen drei Fenstern nahmen alle Lesevorgänge den schnellen Weg.
+
+**Die früher hier stehenden 11,0 % und 12,9 % sind überholt.** Es waren zwei
+einzelne Fenster mit nur **4** Aufrufen, die Vorher-Messung hatte **6**; sie
+verglichen weniger mit mehr Aufrufen, und das darauf geschriebene „Ziel erreicht“
+war falsch. Es ist das dritte Mal, dass die Kennzahl dieser Spur zurückgenommen
+werden musste.
+
+**Gewonnen wurde etwas anderes, und es ist echt: der Preis des Lesens je Aufruf
+hat sich etwa halbiert.** Kontrollierter Vergleich, dieselbe Maschine, derselbe
+Starter, nichts sonst in Betrieb; `AllowOut` dient als alter Weg, weil seine Profile
+im selben Skript noch über die Cmdlets laufen:
+
+| | neuer Weg (`Profiles`) | alter Weg (Profile von `AllowOut`) |
+|---|---|---|
+| drei Aufrufe nacheinander | 0,56 / 0,57 / 0,71 s | 1,72 / 1,97 / 2,10 s |
+| drei Aufrufe gleichzeitig | 1,00 / 1,03 / 1,05 s | 2,55 / 2,56 / 2,57 s |
+
+Die VM hat sechs Kerne, es ist kein Ein-Kern-Artefakt. Das zeigt sich dort, wo ein
+Aufruf auf dem kritischen Pfad liegt: Profilprüfung des Panikschnitts,
+`cut_stands`-Abruf alle 10 s bei Isolierung, Rücklesung jedes Schreibvorgangs. Je
+Verb, frischer Prozess, unbelastete VM (aus PowerShell gestartet): `Profiles`
+1,16 s → **0,62 s**, `List` 1,43 s → **0,65 s**, `Get` 0,63 s → 0,53 s, `AllowOut`
+1,69 s → 1,77 s (unverändert, bei den Cmdlets).
+
+**Warum die Last nicht folgt: der Start von `powershell.exe` aus Python.** Je fünf
+Läufe auf der VM:
+
+| gestartet aus | `cmd.exe /c exit` | `powershell.exe -NoProfile -NonInteractive -Command exit` |
+|---|---|---|
+| PowerShell | 0,02 s | 0,35 s |
+| **Python** (wie die App) | **0,05 s** | **1,40 s** |
+| Python, ohne `CREATE_NO_WINDOW` | n. z. | 3,10 s |
+
+`-Op Profiles` durch den Runner der App, aus deren Python auf der VM: Median
+**2,60 s**, aus PowerShell gestartet 0,62 s. Pythons Startmaschinerie ist nicht
+langsam (`cmd.exe`: 0,05 s); teuer ist `powershell.exe`, von `python.exe` gestartet:
+1,40 s gegen 0,35 s, ein Startpreis von etwa 1,05 s (Differenz der Tabellenzellen)
+bei jedem Firewall-Aufruf, den kein Eingriff am Skript berührt. Darum bewegte sich
+die Last bei Arbeit am Skript kaum, und der eine große Gewinn dieser Spur (42 % auf
+18 %) kam vom **Entfernen** von Aufrufen, dem `/rules`-Cache. Ohne
+`CREATE_NO_WINDOW` wird es schlimmer (3,10 s), das Flag bleibt.
+
+**Hypothese, kein Befund:** die Echtzeitprüfung von Defender beim Start
+(`DisableRealtimeMonitoring` `False`, `DisableScriptScanning` `False` auf der VM;
+`python.exe` startet `powershell.exe` — das Eltern/Kind-Muster, das eine
+Detonationskammer scharf beobachten sollte). Bestätigen hieße, Defenders
+Konfiguration auf einer Malware-Kammer zu ändern; das ist **nicht geschehen und
+braucht die Entscheidung des Nutzers**. **Nächste Spur:** weniger Starts (wie beim
+Cache) oder ein billigerer Start; ein residenter Prozess bleibt abgelehnt. Das
+Handover führt das aus.
 
 **`Compare` in sechs Zuständen, alle Exit 0.** A: nichts isoliert, IPv4, IPv6 und
 **UDP** stehen (`profiles 9, displayNames 3, names 6, fields 54`); B: der Schnitt
