@@ -61,11 +61,13 @@ den **konfigurierten** Wert liefern, den TDC dann als *in Kraft* ausgäbe. Das i
 genau die Richtung, die „geschlossen" meldet, während offen ist.
 
 Gemessen ignoriert dieser Anbieter sie nicht: ein Lesevorgang auf einen Store,
-den es nicht geben kann, **scheitert** („Der Netzwerkpfad wurde nicht
-gefunden"), in 140 ms. Daraus wird der **Prüfstein**: vor jedem schnellen
-Profil-Lesen wird ein unmöglicher Store gelesen, und *gelingt* er, hat sich der
-schnelle Weg selbst disqualifiziert. Das ist ein Beweis **je Aufruf**, keine
-Zusicherung der API.
+den es nicht geben kann, **scheitert** — in der ersten Messung mit „Der
+Netzwerkpfad wurde nicht gefunden"; der ausgelieferte Name (siehe unten) mit
+einem Pfadsyntax-Fehler, typisch 46 ms, höchstens 160 ms. Daraus wird der
+**Prüfstein**: vor jedem schnellen Profil-Lesen wird ein unmöglicher Store
+gelesen, und lehnt der Anbieter ihn nicht ab, hat sich der schnelle Weg selbst
+disqualifiziert. Das ist ein Beweis **je Aufruf**, keine Zusicherung der API —
+und ein verengter, kein vollständiger (siehe „Bleibender Vorbehalt").
 
 ## Ziele
 
@@ -137,10 +139,15 @@ der diesen Weg in der ersten Messung als tot erscheinen ließ. Ein Rechnername,
 ### Der Prüfstein
 
 Vor dem ersten verwertbaren Wert liest der schnelle Weg einen Store, den es
-nicht geben kann. Scheitert er, ist die Option befolgt und die beiden echten
-Lesevorgänge dürfen gelten. **Gelingt** er, wird die Option ignoriert, und der
-schnelle Weg wirft — fällt also auf die Cmdlets zurück, statt einen
-konfigurierten Wert als in Kraft auszugeben.
+nicht geben kann. Als Ablehnung zählt **nur eine `CimException` mit
+`NativeErrorCode` `Failed`**; dann gilt die Option als befolgt, und die beiden
+echten Lesevorgänge dürfen gelten. Alles andere beweist nichts und lässt den
+schnellen Weg werfen, also auf die Cmdlets zurückfallen, statt einen
+konfigurierten Wert als in Kraft auszugeben: eine **Antwort** (auch eine leere —
+die Option wird dann ignoriert), ein anderer Fehlercode (ein falscher Namespace
+gibt `InvalidNamespace`), ein Fehler, der keine CIM-Ausnahme ist, ein
+Transportfehler, verweigerter Zugriff, ein fehlender Typ. Geprüft wird die
+Aufzählung, nicht der lokalisierte Text.
 
 **Sein Name entscheidet, ob er bezahlbar ist**, und das ist gemessen. Ein
 unbekannter Store wird als **Rechnername** behandelt — was logisch ist, denn
@@ -155,16 +162,35 @@ in der Kammer, deren Verkehr TDC aufzeichnet:
 | **`TDC\|NoSuchStore`** | 27 / **46** / **160** ms | **nein** | Syntax des Datei- oder Verzeichnisnamens ist falsch |
 
 Der Name trägt deshalb ein Zeichen, das in keinem Rechner- und keinem
-Pfadnamen vorkommen kann. Er wird dennoch **vom Anbieter** abgelehnt, nicht vom
-Client: der Fehler kommt als „Fehler beim Durchlaufen einer Auflistung", also
-während der Aufzählung, und dass ein legaler Name einen Rechner zu erreichen
-*versucht*, zeigt, dass der Wert durchgereicht wird. Ein Wert, den der Client
-vorher abwiese, würde nichts beweisen.
+Pfadnamen vorkommen kann. Dass er dennoch **vom Anbieter** beurteilt wird und
+nicht vom Client, stützt sich auf zwei Beobachtungen, und nur auf diese:
 
-Bleibender Vorbehalt, ehrlich benannt: auf einer Maschine, deren Client solche
-Werte selbst abweist, wäre der Prüfstein leer — er würde scheitern, ohne den
-Anbieter gefragt zu haben. Dagegen steht `Compare` im Richtlinien-Zustand, das
-genau dann eine Differenz zeigt.
+- Ein legaler Name lässt Windows versuchen, diesen Rechner zu erreichen. Das hat
+  bis zu 5205 ms gekostet und einen DNS-Eintrag hinterlassen — die Werte kommen
+  also erkennbar beim Anbieter an.
+- Die Ablehnung ist ein **Pfadsyntax-Fehler** („Die Syntax für den Dateinamen,
+  Verzeichnisnamen oder die Datenträgerbezeichnung ist falsch"), und das ist
+  Verhalten des Anbieters, keine Prüfung des Clients.
+
+Nicht tragend ist dagegen, *wann* der Fehler auftritt. Er kommt als „Fehler beim
+Durchlaufen einer Auflistung", also während der Aufzählung — aber
+`EnumerateInstances` von MI beginnt erst beim ersten `MoveNext`, und eine
+Ablehnung des Clients oder des Transports käme genauso heraus. Der Zeitpunkt
+beweist nichts über den Urheber; deshalb steht er hier nicht als Begründung.
+
+Bleibender Vorbehalt, ehrlich benannt, **dreifach**; so steht es auch im Kommentar
+des Skripts an dieser Stelle:
+
+1. `Failed` ist ein **allgemeiner Anbieterfehler**. Die Prüfung auf Typ und Code
+   verengt die Lücke, schließt sie nicht.
+2. Ein **vorübergehender Anbieterfehler** bei dieser Operation — der ersten der
+   Sitzung — würde als Ablehnung gelesen, obwohl er keine war.
+3. Auf einer Maschine, deren **Client** solche Werte selbst abweist, würde der
+   Prüfstein scheitern, ohne den Anbieter gefragt zu haben.
+
+`Compare` im Richtlinien-Zustand, der den Stores widerspricht, ist die
+Rückendeckung für alle drei, denn dort zeigt sich eine nicht befolgte Option als
+Differenz.
 
 ### Der Rückfall, und dass `List` ihn ganz erzählt
 
@@ -214,7 +240,7 @@ der dort nicht genau die Cmdlet-Antwort gibt, ist falsch.
 1. **`AllowOut` bleibt zurückgenommen**, obwohl es jetzt ginge — 0,4 s auf einem
    seltenen Aufruf rechtfertigen den gefährlichsten Verb nicht.
 2. **Der Prüfstein kostet einen zusätzlichen CIM-Aufruf je Profil-Lesen.** Er ist
-   mit 140 ms bezahlt und ersetzt eine Zusicherung, die die API verweigert.
+   mit typisch 46 ms, höchstens 160 ms bezahlt und ersetzt eine Zusicherung, die die API verweigert.
 3. **`mustComply` wird nicht verwendet**, weil das Plug-In jeden Aufruf damit
    ablehnt — nicht, weil es unerwünscht wäre.
 

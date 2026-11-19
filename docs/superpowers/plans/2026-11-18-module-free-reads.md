@@ -1,5 +1,27 @@
 # Modulfreie Lesevorgänge — Implementation Plan
 
+> **Teilweise überholt durch
+> `docs/superpowers/specs/2026-11-19-in-force-reads-design.md`** (Plan:
+> `docs/superpowers/plans/2026-11-19-in-force-reads.md`). Dieser Plan bleibt als
+> Stand vom 18.11. stehen; die Schlüsse aus ihm und aus seiner Spec gelten nur zum Teil weiter:
+>
+> - „`List` lädt das Modul für seine Profile weiter“ — **falsch**: `List` ist
+>   vollständig modulfrei.
+> - „`Profiles` liest deshalb wieder beide Stores über die Cmdlets, `Compare`
+>   vergleicht keine Profile mehr, und ein Pin-Test hält das fest“ — **falsch**:
+>   `Profiles` liest beide Stores über CIM mit der Operationsoption, `Compare`
+>   vergleicht wieder neun Profilfelder, und der Pin-Test ist **gelöscht**.
+> - „Nicht gemessen ist der Weg … Operationsoption“ — **gemessen**, und es ist
+>   der Weg, der ausgeliefert wird.
+> - `AllowOut` zurückgenommen, „weil rohes CIM den ActiveStore nicht lesen
+>   kann“ — die Option **kann** ihn lesen. `AllowOut` bleibt bei den Cmdlets,
+>   weil sie 0,4 s auf einem Aufruf spart, der in der Ruhelast nie vorkommt, und
+>   weil dort ein Fehler „geschlossen“ meldet, während Verkehr rausgeht.
+>
+> Task 1 und Task 3 sind unten einzeln als überholt markiert; die Erwartung
+> „Ruhelast deutlich unter den heutigen 18 %“ in Task 4 wurde erst mit dem
+> Folgeplan erreicht.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Die vier Lese-Verben der Firewall antworten in einem Spawn und unter
@@ -61,7 +83,7 @@ pytest.
 
 ### Task 1: `Profiles` ohne Modul, mit Rückfall und `Compare` — SUPERSEDED
 
-> **Superseded.** Der schnelle Weg für `Profiles` ist zurückgenommen: COM liest den lokalen Store, nicht den gültigen, gemessen mit einem lokalen GPO-Wert. Übrig aus dieser Aufgabe sind nur `Compare` (für die Regeln) und die Rückfall- und `Via`-Mechanik, die `List` und `Get` benutzen. Siehe „Amended after the VM run“ in der Spec.
+> **Superseded, und die Rücknahme selbst ist teilweise überholt** (`docs/superpowers/specs/2026-11-19-in-force-reads-design.md`: `Profiles` liest beide Stores wieder schnell, über die CIM-Operationsoption, und `Compare` vergleicht wieder Profile). Der Stand vom 18.11.: Der schnelle Weg für `Profiles` ist zurückgenommen: COM liest den lokalen Store, nicht den gültigen, gemessen mit einem lokalen GPO-Wert. Übrig aus dieser Aufgabe sind nur `Compare` (für die Regeln) und die Rückfall- und `Via`-Mechanik, die `List` und `Get` benutzen. Siehe „Amended after the VM run“ in der Spec.
 
 **Files:**
 - Modify: `webui/firewall_rules.ps1` (Kopfkommentar, `ValidateSet` von `$Op`,
@@ -206,7 +228,7 @@ git commit -m "perf(firewall): List and Get read the rules over COM, with the sa
 
 ### Task 3: `AllowOut` ohne Modul — mit der Store-Quelle — SUPERSEDED
 
-> **Superseded.** `AllowOut` ist zurückgenommen und liest wie vorher `Get-NetFirewallRule -PolicyStore ActiveStore`: rohes CIM gab alle Regeln aus dem PersistentStore. Siehe „Amended after the VM run“ in der Spec.
+> **Superseded, im Grund überholt** (`docs/superpowers/specs/2026-11-19-in-force-reads-design.md`: die Operationsoption *kann* den ActiveStore lesen; `AllowOut` bleibt bei den Cmdlets, weil es 0,4 s auf einem Aufruf spart, der in der Ruhelast nie vorkommt, und weil dort ein Fehler „geschlossen“ meldet, während Verkehr rausgeht). Der Stand vom 18.11.: `AllowOut` ist zurückgenommen und liest wie vorher `Get-NetFirewallRule -PolicyStore ActiveStore`: rohes CIM gab alle Regeln aus dem PersistentStore. Siehe „Amended after the VM run“ in der Spec.
 
 **Files:**
 - Modify: `webui/firewall_rules.ps1` (`'AllowOut'`, `Get-ForeignAllowOut`, `Compare`)
