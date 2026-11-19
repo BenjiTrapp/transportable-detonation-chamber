@@ -3302,3 +3302,208 @@ def test_a_reason_is_one_short_line_in_the_rule_reads_and_in_compare_alike():
     assert "$fallback = Get-ShortReason $_" in _functions(script)["Get-OurRuleViews"]
     assert 'fast = "error: $(Get-ShortReason $_)"' in _op_case(script, "Compare")
     assert "$_.Exception.Message" not in _op_case(script, "Compare")
+
+
+# ---- Profiles in force without the module: CIM with the PolicyStore option, proved per call by a sentinel ---------
+
+
+def _function_body(script, name):
+    """The body of one function of the script: the lines between `function <name> {` and its closing brace."""
+    head = re.search(r"^function %s \{\n" % re.escape(name), script, re.M)
+    assert head, "the script has no function %s" % name
+    return script[head.end():script.index("\n}\n", head.end())]
+
+
+def test_the_sentinel_store_is_read_before_any_value_is_trusted():
+    """The option cannot be forced (mustComply is refused), so a store that
+    cannot exist must be read FIRST: if it answers, the option is ignored."""
+    fast = _function_body(_ps1(), "Read-FastProfileStates")
+    lines = [l for l in fast.splitlines() if l.strip() and not l.strip().startswith("#")]
+    sentinel = next(i for i, l in enumerate(lines) if "Sentinel" in l or "NoSuchStore" in l)
+    active = next(i for i, l in enumerate(lines) if "ActiveStore" in l)
+    assert sentinel < active, "the sentinel must be read before the ActiveStore"
+
+
+def test_a_sentinel_that_answers_makes_the_fast_way_refuse():
+    fast = _function_body(_ps1(), "Read-FastProfileStates")
+    assert re.search(r"throw .*(ignor|sentinel|NoSuchStore)", fast, re.I), \
+        "a sentinel that answers must throw, not be noted and passed"
+
+
+def test_the_activestore_never_fills_the_configured_field():
+    """Shipped twice: an in-force value restored as the configured one leaves
+    the host's firewall configured differently from how it was found."""
+    fast = _function_body(_ps1(), "Read-FastProfileStates")
+    # the one line that creates the empty table is not an assignment of a value; any other `$configured = ...` is
+    assigns = [l.strip() for l in fast.splitlines()
+               if re.search(r"\.?Configured\s*=", l, re.I) and l.strip() != "$configured = @{}"]
+    assert len(assigns) == 1, "Configured is assigned in exactly one place: %s" % assigns
+    assert "$configured[" in assigns[0], assigns[0]
+    for line in fast.splitlines():
+        if re.search(r"\$configured\s*\[.*\]\s*=", line, re.I):
+            assert "ActiveStore" not in line and "$inForce" not in line, line
+
+
+def test_every_cim_number_and_name_is_written_out():
+    fast = _function_body(_ps1(), "Read-FastProfileStates")
+    for token in ("'0'", "'2'", "'4'", "'NotConfigured'", "'Allow'", "'Block'"):
+        assert token in fast, "the action map lost %s" % token
+    assert "ContainsKey" in fast and "throw" in fast
+
+
+def test_enabled_is_mapped_by_the_two_numbers_that_were_measured():
+    """0 and 1 on this path, measured with the Public firewall switched off -
+    not the WMI convention 1/2. Anything else falls back."""
+    fast = _function_body(_ps1(), "Read-FastProfileStates")
+    assert re.search(r"CimEnabled\s*=\s*@\{[^}]*'0'[^}]*'1'[^}]*\}", fast)
+    assert "'2'" not in re.search(r"CimEnabled\s*=\s*@\{[^}]*\}", fast).group(0)
+
+
+def test_profiles_reads_cim_with_the_option_and_never_com():
+    """COM reads the local store, which is why the previous attempt was
+    reverted; the profile read must not go back to it."""
+    fast = _function_body(_ps1(), "Read-FastProfileStates")
+    assert "SetCustomOption" in fast and "MSFT_NetFirewallProfile" in fast
+    assert "FwPolicy2" not in fast, "the profiles must not be read over COM"
+    assert "Create('.')" in fast, "Create($null) fails with 'Der Parameter ist ungueltig'"
+
+
+def test_mustcomply_is_not_used_and_the_script_says_why():
+    fast = _function_body(_ps1(), "Read-FastProfileStates")
+    assert re.search(r"SetCustomOption\([^)]*\$false\s*\)", fast)
+
+
+def test_compare_counts_the_profiles_on_their_own():
+    branch = _op_branch(_ps1(), "Compare")
+    assert re.search(r"profiles\s*=\s*0", branch), \
+        "an empty profile pass must be visible in checked"
+
+
+def test_the_profile_maps_are_exactly_what_was_measured():
+    """DefaultOutboundAction 0 NotConfigured, 2 Allow, 4 Block, and the three names as themselves (both forms were
+    seen from the same class on the same VM); Enabled 0 false, 1 true. Nothing else, nothing computed."""
+    fast = _function_body(_ps1(), "Read-FastProfileStates")
+    outbound = re.search(r"\$CimOutbound = @\{([^}]*)\}", fast).group(1)
+    assert dict(re.findall(r"'(\w+)' = '(\w+)'", outbound)) == {
+        "0": "NotConfigured", "2": "Allow", "4": "Block",
+        "NotConfigured": "NotConfigured", "Allow": "Allow", "Block": "Block"}
+    assert len(re.findall(r"=", outbound)) == 6, outbound
+    enabled = re.search(r"\$CimEnabled = @\{([^}]*)\}", fast).group(1)
+    assert dict(re.findall(r"'(\w+)' = (\$\w+)", enabled)) == {"0": "$false", "1": "$true"}
+    assert len(re.findall(r"=", enabled)) == 2, enabled
+    assert not re.search(r"-band|-bor|-bxor|-shl|-shr|\[enum\]|-as \[|\[bool\]", fast, re.I)
+
+
+def test_a_profile_value_is_matched_case_exactly_or_refused():
+    """A PowerShell hashtable ignores case, so ContainsKey alone would let `block` through unlisted."""
+    fast = _function_body(_ps1(), "Read-FastProfileStates")
+    checks = [l.strip() for l in fast.splitlines() if "ContainsKey($Value)" in l]
+    assert checks == ["if (-not ($Map.ContainsKey($Value) -and @($Map.Keys) -ccontains $Value)) { "
+                      "throw \"CIM $($Row.Store) $Field of $($Row.Name) is not a known value: '$Value'\" }"], checks
+    # every profile value goes through that one check
+    for line in _code_lines(fast):
+        if re.search(r"\$Cim(Outbound|Enabled)\b", line) and "= @{" not in line:
+            assert "& $mapped $Cim" in line, line
+    # a profile name is matched exactly, and every profile must be there once
+    assert "if (-not ($AllProfiles -ccontains $name)) { throw " in fast
+    assert re.search(r"if \(\$rows\.ContainsKey\(\$name\)\) \{ throw ", fast)
+    assert re.search(r"if \(-not \$rows\.ContainsKey\(\$name\)\) \{ throw ", fast)
+
+
+def test_no_store_is_read_before_the_sentinel_and_each_table_holds_its_own_store():
+    fast = _function_body(_ps1(), "Read-FastProfileStates")
+    lines = _code_lines(fast)
+    reads = [(i, l) for i, l in enumerate(lines) if re.search(r"& \$(enumerate|readStore) '", l)]
+    assert [re.search(r"& \$(?:enumerate|readStore) '([\w-]+)'", l).group(1) for _, l in reads] == [
+        "TDC-NoSuchStore", "ActiveStore", "PersistentStore"], reads
+    sentinel = reads[0][0]
+    # the sentinel is enumerated raw: any answer, even an empty one, is an answer, and no check of the profiles in
+    # between may turn it into a failure that reads as "the option is honoured"
+    assert "try { $null = & $enumerate 'TDC-NoSuchStore' } catch { $honoured = $true }" == lines[sentinel]
+    assert "foreach ($p in @(& $enumerate $Store)) {" in lines
+    assert all(sentinel < i for i, l in enumerate(lines) if re.search(r"ActiveStore|PersistentStore", l)), \
+        "no store may be named before the sentinel is read"
+    assert "throw" in lines[sentinel + 1] and "ignored" in lines[sentinel + 1]
+    in_force = [l for l in lines if re.search(r"\$inForce\s*\[.*\]\s*=", l, re.I)]
+    configured = [l for l in lines if re.search(r"\$configured\s*\[.*\]\s*=", l, re.I)]
+    assert len(in_force) == 1 and "& $readStore 'ActiveStore'" in in_force[0], in_force
+    assert len(configured) == 1 and "& $readStore 'PersistentStore'" in configured[0], configured
+    assert "PersistentStore" not in in_force[0] and "Enabled" not in configured[0]
+    rows = [l for l in lines if re.search(r"^(Enabled|DefaultOutboundAction|Configured) = ", l)]
+    assert rows == ["Enabled = $inForce[$name].Enabled", "DefaultOutboundAction = $inForce[$name].Outbound",
+                    "Configured = $configured[$name]"], rows
+
+
+def test_the_cim_session_is_the_local_one_and_is_closed():
+    fast = _function_body(_ps1(), "Read-FastProfileStates")
+    lines = _code_lines(fast)
+    assert "$session = [Microsoft.Management.Infrastructure.CimSession]::Create('.')" in lines
+    assert "$options.SetCustomOption('PolicyStore', $Store, $false)" in lines
+    assert "@($session.EnumerateInstances('root/StandardCimv2', 'MSFT_NetFirewallProfile', $options))" in lines
+    assert "} finally {" in lines and "$session.Dispose()" in lines
+    assert not re.search(r"Import-Module|Get-NetFirewall|Get-CimInstance|ComObject", fast, re.I)
+
+
+def test_profiles_tries_the_fast_way_first_and_falls_back_to_the_cmdlets_unchanged():
+    script = _ps1()
+    states = _function_body(script, "Get-ProfileStates")
+    assert re.search(r"if \(-not \$CmdletsOnly\) \{\s*try \{\s*\$rows = @\(Read-FastProfileStates\)\s*"
+                     r"return \[pscustomobject\]@\{ Rows = \$rows; Via = 'fast'; Fallback = \$null \}\s*"
+                     r"\} catch \{\s*\$fallback = Get-ShortReason \$_\s*\}\s*\}", states), states
+    # the cmdlet read as it always was, now behind the fast one
+    cmdlet = states[states.index("    $configured = @{}"):]
+    assert cmdlet.index("Get-NetFirewallProfile -PolicyStore PersistentStore") < cmdlet.index(
+        "Get-NetFirewallProfile -PolicyStore ActiveStore")
+    assert "Configured = $configured[[string]$_.Name]" in cmdlet
+    assert "return [pscustomobject]@{ Rows = $rows; Via = 'cmdlet'; Fallback = $fallback }" in _code_lines(cmdlet)
+
+
+def test_the_profiles_rows_name_the_way_they_were_read():
+    lines = _code_lines(_op_case(_ps1(), "Profiles"))
+    assert lines == [
+        "'Profiles' {",
+        "$read = Get-ProfileStates",
+        "foreach ($row in $read.Rows) {",
+        "$row | Add-Member -NotePropertyName Via -NotePropertyValue $read.Via",
+        "if ($read.Via -ne 'fast') { $row | Add-Member -NotePropertyName Fallback -NotePropertyValue $read.Fallback }",
+        "}",
+        "ConvertTo-Json -Compress -Depth 3 -InputObject $read.Rows",
+    ], lines
+
+
+def test_every_other_caller_takes_the_rows_and_the_writing_verbs_keep_the_cmdlets():
+    """The verbs that write check and read back the profiles as they always did, through the cmdlets."""
+    script = _ps1()
+    for verb in ("List", "AllowOut", "Create", "Cut", "SetDefaultOutbound"):
+        uses = re.findall(r"\(Get-ProfileStates[^)]*\)(\.Rows)?", _op_case(script, verb))
+        assert uses and all(uses), verb
+    for verb in ("Create", "Cut", "SetDefaultOutbound"):
+        assert "(Get-ProfileStates -CmdletsOnly).Rows" in _op_case(script, verb), verb
+    for verb in ("List", "AllowOut"):
+        assert "(Get-ProfileStates).Rows" in _op_case(script, verb), verb
+    for verb in ("Enable", "Remove", "DisableAllowOut", "EnableAllowOut", "RemoveIsolate"):
+        assert "ProfileStates" not in _op_case(script, verb), verb
+
+
+def test_compare_holds_each_profile_up_both_ways_read_on_their_own():
+    script = _ps1()
+    case = _op_case(script, "Compare")
+    lines = _code_lines(case)
+    assert "$checked = [ordered]@{ profiles = 0; displayNames = 0; names = 0; fields = 0 }" in lines
+    assert "foreach ($row in @((Get-ProfileStates -CmdletsOnly).Rows)) { $cmdletProfiles[[string]$row.Name] = $row }" in lines
+    assert "foreach ($row in @(Read-FastProfileStates)) { $fastProfiles[[string]$row.Name] = $row }" in lines
+    assert "foreach ($field in @('Enabled', 'DefaultOutboundAction', 'Configured')) {" in lines
+    assert "$checked.profiles += 1" in lines
+    assert "if (-not (Test-SameValue $a $b)) {" in lines
+    assert 'what = \'profiles\'; fast = "error: $(Get-ShortReason $_)"' in case
+    # the profiles are compared before the rules, and a profile pass that fails stops at its own difference
+    assert case.index("$checked.profiles += 1") < case.index("$cmdletRules = @{}")
+
+
+def test_the_head_comment_says_what_was_measured_and_no_longer_calls_the_option_unmeasured():
+    script = _ps1()
+    head = script[:script.index("\nparam(")]
+    assert "is unmeasured" not in head and "Profiles stays on the cmdlets" not in script
+    for said in ("SetCustomOption", "mustComply", "sentinel", "Create('.')", "Create($null)",
+                 "Ungueltiger Namespace", "Die Anfrage ist ungueltig", "COM                          = 0 = Block"):
+        assert said in head, said
