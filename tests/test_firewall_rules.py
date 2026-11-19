@@ -3260,7 +3260,6 @@ def test_only_a_rule_whose_source_is_local_counts_as_one_isolated_can_switch_off
     assert [(r["name"], r["local"]) for r in found] == [("Loc-Out", True), ("Num-Out", False), ("Pol-Out", False)]
 
 
-
 def test_compare_counts_each_kind_of_rule_check_on_its_own_and_writes_nothing():
     """An ok over no rule at all must not read like an ok over fifty fields: how many rules either way found, and
     each kind of check (the profiles' fields, display names, the name sets, the rules' fields), are said apart."""
@@ -3307,16 +3306,24 @@ def _script_level_lines(script):
     """(line number, code) of every line after the param() block that is not inside a function: the code that runs in
     the script's own scope, the scope its parameters live in. Comment lines are left out."""
     _, last = _script_parameters(script)
-    lines, inside = [], False
+    lines, inside, found = [], False, 0
     for number, line in enumerate(script.splitlines(), 1):
         if number <= last:
             continue
         if re.match(r"function [\w-]+ \{", line):
-            inside = True
+            assert not inside, ("_script_level_lines: line %d starts a function before the one above it was closed by a "
+                                "`}` at column 0; the line numbers it would give are wrong" % number)
+            inside, found = True, found + 1
         elif inside and line == "}":
             inside = False
         elif not inside and line.strip() and not line.strip().startswith("#"):
             lines.append((number, line.strip()))
+    declared = len(re.findall(r"^function ", script, re.M))
+    assert found == declared and not inside, (
+        "_script_level_lines read %d functions of the form `function Name {` ... `}` at column 0, but the script "
+        "declares %d (and %s): a function written another way (its brace on the next line, or a `}` at column 0 "
+        "inside it, such as in a here-string) is mis-parsed, and the line numbers it gives are wrong. Fix the parser "
+        "before trusting it." % (found, declared, "one is never closed" if inside else "every one it read is closed"))
     return lines
 
 
@@ -3376,51 +3383,6 @@ def _function_body(script, name):
     return script[head.end():script.index("\n}\n", head.end())]
 
 
-def test_the_sentinel_store_is_read_before_any_value_is_trusted():
-    """The option cannot be forced (mustComply is refused), so a store that
-    cannot exist must be read FIRST: if it answers, the option is ignored."""
-    fast = _function_body(_ps1(), "Read-FastProfileStates")
-    lines = [l for l in fast.splitlines() if l.strip() and not l.strip().startswith("#")]
-    sentinel = next(i for i, l in enumerate(lines) if "Sentinel" in l or "NoSuchStore" in l)
-    active = next(i for i, l in enumerate(lines) if "ActiveStore" in l)
-    assert sentinel < active, "the sentinel must be read before the ActiveStore"
-
-
-def test_a_sentinel_that_answers_makes_the_fast_way_refuse():
-    fast = _function_body(_ps1(), "Read-FastProfileStates")
-    assert re.search(r"throw .*(ignor|sentinel|NoSuchStore)", fast, re.I), \
-        "a sentinel that answers must throw, not be noted and passed"
-
-
-def test_the_activestore_never_fills_the_configured_field():
-    """Shipped twice: an in-force value restored as the configured one leaves
-    the host's firewall configured differently from how it was found."""
-    fast = _function_body(_ps1(), "Read-FastProfileStates")
-    # the one line that creates the empty table is not an assignment of a value; any other `$configured = ...` is
-    assigns = [l.strip() for l in fast.splitlines()
-               if re.search(r"\.?Configured\s*=", l, re.I) and l.strip() != "$configured = @{}"]
-    assert len(assigns) == 1, "Configured is assigned in exactly one place: %s" % assigns
-    assert "$configured[" in assigns[0], assigns[0]
-    for line in fast.splitlines():
-        if re.search(r"\$configured\s*\[.*\]\s*=", line, re.I):
-            assert "ActiveStore" not in line and "$inForce" not in line, line
-
-
-def test_every_cim_number_and_name_is_written_out():
-    fast = _function_body(_ps1(), "Read-FastProfileStates")
-    for token in ("'0'", "'2'", "'4'", "'NotConfigured'", "'Allow'", "'Block'"):
-        assert token in fast, "the action map lost %s" % token
-    assert "ContainsKey" in fast and "throw" in fast
-
-
-def test_enabled_is_mapped_by_the_two_numbers_that_were_measured():
-    """0 and 1 on this path, measured with the Public firewall switched off -
-    not the WMI convention 1/2. Anything else falls back."""
-    fast = _function_body(_ps1(), "Read-FastProfileStates")
-    assert re.search(r"CimEnabled\s*=\s*@\{[^}]*'0'[^}]*'1'[^}]*\}", fast)
-    assert "'2'" not in re.search(r"CimEnabled\s*=\s*@\{[^}]*\}", fast).group(0)
-
-
 def test_profiles_reads_cim_with_the_option_and_never_com():
     """COM reads the local store, which is why the previous attempt was
     reverted; the profile read must not go back to it."""
@@ -3441,17 +3403,6 @@ def test_profiles_reads_cim_with_the_option_and_never_com():
         assert "Get-ProfileStates" in _op_case(script, verb), verb
         assert not re.search(r"FirewallEnabled|DefaultOutboundAction\(", _op_case(script, verb), re.I), verb
     assert not re.search(r"FirewallEnabled|DefaultOutboundAction\(", "\n".join(_code_lines(script)), re.I)
-
-
-def test_mustcomply_is_not_used_and_the_script_says_why():
-    fast = _function_body(_ps1(), "Read-FastProfileStates")
-    assert re.search(r"SetCustomOption\([^)]*\$false\s*\)", fast)
-
-
-def test_compare_counts_the_profiles_on_their_own():
-    branch = _op_branch(_ps1(), "Compare")
-    assert re.search(r"profiles\s*=\s*0", branch), \
-        "an empty profile pass must be visible in checked"
 
 
 def test_the_profile_maps_are_exactly_what_was_measured():
@@ -3489,11 +3440,11 @@ def test_a_profile_value_is_matched_case_exactly_or_refused():
 def test_no_store_is_read_before_the_sentinel_and_each_table_holds_its_own_store():
     fast = _function_body(_ps1(), "Read-FastProfileStates")
     lines = _code_lines(fast)
-    reads = [(i, l) for i, l in enumerate(lines) if re.search(r"& \$(enumerate|readStore) '", l)]
-    assert [re.search(r"& \$(?:enumerate|readStore) '([^']+)'", l).group(1) for _, l in reads] == [
+    reads = [(i, l) for i, l in enumerate(lines) if re.search(r"& \$(optionsOf|readStore) '", l)]
+    assert [re.search(r"& \$(?:optionsOf|readStore) '([^']+)'", l).group(1) for _, l in reads] == [
         "TDC|NoSuchStore", "ActiveStore", "PersistentStore"], reads
     sentinel = reads[0][0]
-    assert "foreach ($p in @(& $enumerate $Store)) {" in lines
+    assert "foreach ($p in @(& $enumerate (& $optionsOf $Store))) {" in lines
     assert all(sentinel < i for i, l in enumerate(lines) if re.search(r"ActiveStore|PersistentStore", l)), \
         "no store may be named before the sentinel is read"
     in_force = [l for l in lines if re.search(r"\$inForce\s*\[.*\]\s*=", l, re.I)]
@@ -3513,11 +3464,14 @@ def test_the_sentinels_verdict_is_three_consecutive_exact_lines():
     NativeErrorCode Failed, the refusal measured on the VM, counts as proof; anything else throws into the cmdlets."""
     lines = _code_lines(_function_body(_ps1(), "Read-FastProfileStates"))
     start = lines.index("$refused = $null")
-    assert lines[start + 1] == "try { $null = & $enumerate 'TDC|NoSuchStore' } catch { $refused = $_.Exception.GetBaseException() }"
+    # the options are built before the counted try: only the enumeration may count as the provider's refusal
+    assert re.fullmatch(r"\$sentinel = & \$optionsOf '[^']+'", lines[start - 1]), lines[start - 1]
+    assert lines[start + 1] == "try { $null = & $enumerate $sentinel } catch { $refused = $_.Exception.GetBaseException() }"
     assert re.fullmatch(r'if \(-not \(\$refused -is \[Microsoft\.Management\.Infrastructure\.CimException\] -and '
                         r'\$refused\.NativeErrorCode -eq \[Microsoft\.Management\.Infrastructure\.NativeErrorCode\]::Failed\)\) '
                         r'\{ throw "[^\n]*sentinel[^\n]*" \}', lines[start + 2]), lines[start + 2]
     assert len([l for l in lines if re.search(r"\$refused\b", l)]) == 3, "$refused is used in those three lines only"
+    assert len([l for l in lines if re.search(r"\$sentinel\b", l)]) == 2, "the sentinel's options serve its read only"
 
 
 def test_the_cim_session_is_the_local_one_and_is_closed():
@@ -3525,7 +3479,7 @@ def test_the_cim_session_is_the_local_one_and_is_closed():
     lines = _code_lines(fast)
     assert "$session = [Microsoft.Management.Infrastructure.CimSession]::Create('.')" in lines
     assert "$options.SetCustomOption('PolicyStore', $Store, $false)" in lines
-    assert "@($session.EnumerateInstances('root/StandardCimv2', 'MSFT_NetFirewallProfile', $options))" in lines
+    assert "@($session.EnumerateInstances('root/StandardCimv2', 'MSFT_NetFirewallProfile', $Options))" in lines
     assert "} finally {" in lines and "$session.Dispose()" in lines
     assert not re.search(r"Import-Module|Get-NetFirewall|Get-CimInstance|ComObject", fast, re.I)
 
@@ -3647,7 +3601,7 @@ def test_the_sentinel_is_named_in_one_place():
     """One code line names it, so that a change of name is one edit and cannot leave a second, older name behind."""
     lines = _code_lines(_ps1())
     named = [l for l in lines if "NoSuchStore" in l]
-    assert len(named) == 1 and named[0].startswith("try { $null = & $enumerate '"), named
+    assert len(named) == 1 and named[0].startswith("$sentinel = & $optionsOf '"), named
 
 
 def test_the_sentinel_name_cannot_be_a_computer_or_a_path():
@@ -3656,9 +3610,9 @@ def test_the_sentinel_name_cannot_be_a_computer_or_a_path():
     chamber; not-a-store.invalid queried DNS too. A | can be in no computer name and no path, so the provider refuses
     the name on its syntax: 46 ms typically, no DNS. A plain name must not come back."""
     lines = _code_lines(_function_body(_ps1(), "Read-FastProfileStates"))
-    sentinel = [l for l in lines if l.startswith("try { $null = & $enumerate '")]
+    sentinel = [l for l in lines if l.startswith("$sentinel = & $optionsOf '")]
     assert len(sentinel) == 1, sentinel
-    name = re.search(r"& \$enumerate '([^']*)'", sentinel[0]).group(1)
+    name = re.search(r"& \$optionsOf '([^']*)'", sentinel[0]).group(1)
     assert "|" in name, "the sentinel %r could be a computer or a path name, and is then looked for on the network" % name
     assert name not in ("ActiveStore", "PersistentStore", "RSOP", "SystemDefaults", "StaticServiceStore",
                         "ConfigurableServiceStore", "localhost", ".")
