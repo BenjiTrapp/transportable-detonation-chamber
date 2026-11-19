@@ -3233,11 +3233,6 @@ def test_allowout_stays_on_the_cmdlets_because_the_gain_does_not_pay_for_the_ris
     assert "Get-ForeignAllowOut" not in _op_case(script, "Compare")
     # its profiles cannot reach the fast reader: -CmdletsOnly skips it (pinned with Compare's cmdlet side below)
     assert "Read-FastProfileStates" not in _op_case(script, "AllowOut")
-    # and the comment says the true reason, not the refuted one
-    said = script[script.index("# AllowOut stays on the cmdlets"):script.index("function Get-ForeignAllowOut {")]
-    assert "Raw CIM has no route to the ActiveStore" not in said
-    for word in ("136", "PolicyStoreSourceType 2", "0.4 s", "steady load", "reports closed while traffic still goes out"):
-        assert word in said, word
 
 
 def test_the_cmdlet_way_of_allow_out_is_what_it_was():
@@ -3419,8 +3414,9 @@ def test_a_profile_value_is_matched_case_exactly_or_refused():
     """A PowerShell hashtable ignores case, so ContainsKey alone would let `block` through unlisted."""
     fast = _function_body(_ps1(), "Read-FastProfileStates")
     checks = [l.strip() for l in fast.splitlines() if "ContainsKey($Value)" in l]
-    assert checks == ["if (-not ($Map.ContainsKey($Value) -and @($Map.Keys) -ccontains $Value)) { "
-                      "throw \"CIM $($Row.Store) $Field of $($Row.Name) is not a known value: '$Value'\" }"], checks
+    assert len(checks) == 1 and checks[0].startswith(
+        "if (-not ($Map.ContainsKey($Value) -and @($Map.Keys) -ccontains $Value)) { throw "), checks
+    assert "$Value" in checks[0][checks[0].index("throw "):], "the throw names the value it refused"
     # every profile value goes through that one check
     for line in _code_lines(fast):
         if re.search(r"\$Cim(Outbound|Enabled)\b", line) and "= @{" not in line:
@@ -3438,13 +3434,9 @@ def test_no_store_is_read_before_the_sentinel_and_each_table_holds_its_own_store
     assert [re.search(r"& \$(?:enumerate|readStore) '([^']+)'", l).group(1) for _, l in reads] == [
         "TDC|NoSuchStore", "ActiveStore", "PersistentStore"], reads
     sentinel = reads[0][0]
-    # the sentinel is enumerated raw: any answer, even an empty one, is an answer, and no check of the profiles in
-    # between may turn it into a failure that reads as "the option is honoured"
-    assert "try { $null = & $enumerate 'TDC|NoSuchStore' } catch { $honoured = $true }" == lines[sentinel]
     assert "foreach ($p in @(& $enumerate $Store)) {" in lines
     assert all(sentinel < i for i, l in enumerate(lines) if re.search(r"ActiveStore|PersistentStore", l)), \
         "no store may be named before the sentinel is read"
-    assert "throw" in lines[sentinel + 1] and "ignored" in lines[sentinel + 1]
     in_force = [l for l in lines if re.search(r"\$inForce\s*\[.*\]\s*=", l, re.I)]
     configured = [l for l in lines if re.search(r"\$configured\s*\[.*\]\s*=", l, re.I)]
     assert len(in_force) == 1 and "& $readStore 'ActiveStore'" in in_force[0], in_force
@@ -3455,6 +3447,20 @@ def test_no_store_is_read_before_the_sentinel_and_each_table_holds_its_own_store
                     "Configured = $configured[$name]"], rows
 
 
+def test_the_sentinels_verdict_is_three_consecutive_exact_lines():
+    """The safety of the whole design sits in these lines, and a one-token edit to any of them would silently disable
+    it: starting from a value that passes, a catch that counts any error, a condition that can never be true. The
+    sentinel is read raw through $enumerate, so any answer, even an empty one, is an answer. Only a CimException with
+    NativeErrorCode Failed, the refusal measured on the VM, counts as proof; anything else throws into the cmdlets."""
+    lines = _code_lines(_function_body(_ps1(), "Read-FastProfileStates"))
+    start = lines.index("$refused = $null")
+    assert lines[start + 1] == "try { $null = & $enumerate 'TDC|NoSuchStore' } catch { $refused = $_.Exception.GetBaseException() }"
+    assert re.fullmatch(r'if \(-not \(\$refused -is \[Microsoft\.Management\.Infrastructure\.CimException\] -and '
+                        r'\$refused\.NativeErrorCode -eq \[Microsoft\.Management\.Infrastructure\.NativeErrorCode\]::Failed\)\) '
+                        r'\{ throw "[^\n]*sentinel[^\n]*" \}', lines[start + 2]), lines[start + 2]
+    assert len([l for l in lines if re.search(r"\$refused\b", l)]) == 3, "$refused is used in those three lines only"
+
+
 def test_the_cim_session_is_the_local_one_and_is_closed():
     fast = _function_body(_ps1(), "Read-FastProfileStates")
     lines = _code_lines(fast)
@@ -3463,6 +3469,32 @@ def test_the_cim_session_is_the_local_one_and_is_closed():
     assert "@($session.EnumerateInstances('root/StandardCimv2', 'MSFT_NetFirewallProfile', $options))" in lines
     assert "} finally {" in lines and "$session.Dispose()" in lines
     assert not re.search(r"Import-Module|Get-NetFirewall|Get-CimInstance|ComObject", fast, re.I)
+
+
+def test_configured_is_touched_in_these_lines_of_the_script_and_nowhere_else():
+    """Shipped twice: an in-force value restored as the configured one leaves the host configured differently from
+    how it was found. Configured, the store ISOLATED remembers and puts back, is named in exactly these code lines of
+    the whole script: each reader's own table, filled from the PersistentStore and put into its rows, and the name of
+    the field Compare compares. A new Configured in any verb, or anything else filling the table, is a failure here."""
+    script = _ps1()
+    access = (r"\.configured\b", r"(?<![\w$])configured\s*=", r"['\"]configured['\"]",
+              r"Add-Member\b.*(?<![\w$])configured\b", r"\$configured\b", r"-NotePropertyName\s+['\"]?configured")
+    found = [l for l in _code_lines(script) if any(re.search(a, l, re.I) for a in access)]
+    fast = ["$configured = @{}",
+            "foreach ($p in @(& $readStore 'PersistentStore')) { $configured[$p.Name] = & $mapped $CimOutbound $p 'DefaultOutboundAction' }",
+            "Configured = $configured[$name]"]
+    cmdlet = ["$configured = @{}",
+              "$configured[[string]$p.Name] = [string]$p.DefaultOutboundAction",
+              "Configured = $configured[[string]$_.Name]"]
+    compare = ["foreach ($field in @('Enabled', 'DefaultOutboundAction', 'Configured')) {"]
+    assert found == fast + cmdlet + compare, found
+    # and each sits where it belongs: the fast lines in the fast reader, the cmdlet lines behind the PersistentStore
+    # cmdlet read of Get-ProfileStates, the field name in Compare
+    fast_body = _code_lines(_function_body(script, "Read-FastProfileStates"))
+    states = _code_lines(_function_body(script, "Get-ProfileStates"))
+    assert all(l in fast_body for l in fast) and all(l in states for l in cmdlet)
+    assert states.index(cmdlet[1]) == states.index("foreach ($p in @(Get-NetFirewallProfile -PolicyStore PersistentStore)) {") + 1
+    assert compare[0] in _code_lines(_op_case(script, "Compare"))
 
 
 def test_profiles_tries_the_fast_way_first_and_falls_back_to_the_cmdlets_unchanged():
@@ -3531,15 +3563,6 @@ def test_compare_holds_each_profile_up_both_ways_read_on_their_own():
     assert case.index("$checked.profiles += 1") < case.index("$cmdletRules = @{}")
 
 
-def test_the_head_comment_says_what_was_measured_and_no_longer_calls_the_option_unmeasured():
-    script = _ps1()
-    head = script[:script.index("\nparam(")]
-    assert "is unmeasured" not in head and "Profiles stays on the cmdlets" not in script
-    for said in ("SetCustomOption", "mustComply", "sentinel", "Create('.')", "Create($null)",
-                 "Ungueltiger Namespace", "Die Anfrage ist ungueltig", "COM                          = 0 = Block"):
-        assert said in head, said
-
-
 def test_compares_cmdlet_side_can_never_be_the_fast_reader():
     """A comparison whose two sides can reach the same reader proves nothing. Compare's cmdlet side is
     Get-ProfileStates -CmdletsOnly, and with that switch the fast reader is not reached at all: it is called in the one
@@ -3561,18 +3584,11 @@ def test_compares_cmdlet_side_can_never_be_the_fast_reader():
     assert fast_side == ["foreach ($row in @(Read-FastProfileStates)) { $fastProfiles[[string]$row.Name] = $row }"]
 
 
-def test_the_sentinel_is_named_in_one_place_and_says_why_any_error_is_proof():
-    script = _ps1()
-    assert len([l for l in _code_lines(script) if "NoSuchStore" in l]) == 1
-    assert "try { $null = & $enumerate 'TDC|NoSuchStore' } catch { $honoured = $true }" in _code_lines(script)
-    fast = _function_body(script, "Read-FastProfileStates")
-    said = fast[:fast.index("try { $null = & $enumerate")]
-    said = said[said.rindex("# The sentinel"):]
-    for word in ("Fehler beim Durchlaufen einer Auflistung", "reached the provider", "would never look at the name",
-                 "Residual", "vacuous", "Compare", "5205 ms", "AAAA", "capture", "never reaches a command line",
-                 "SetCustomOption"):
-        assert word in said, word
-    assert "legal hostname as it stands" not in script and "140 ms" not in script
+def test_the_sentinel_is_named_in_one_place():
+    """One code line names it, so that a change of name is one edit and cannot leave a second, older name behind."""
+    lines = _code_lines(_ps1())
+    named = [l for l in lines if "NoSuchStore" in l]
+    assert len(named) == 1 and named[0].startswith("try { $null = & $enumerate '"), named
 
 
 def test_the_sentinel_name_cannot_be_a_computer_or_a_path():
@@ -3587,3 +3603,5 @@ def test_the_sentinel_name_cannot_be_a_computer_or_a_path():
     assert "|" in name, "the sentinel %r could be a computer or a path name, and is then looked for on the network" % name
     assert name not in ("ActiveStore", "PersistentStore", "RSOP", "SystemDefaults", "StaticServiceStore",
                         "ConfigurableServiceStore", "localhost", ".")
+    # measured: an empty store name answers with all three profiles, exactly like no option at all
+    assert name.strip(), "an empty sentinel answers like no option and proves nothing"

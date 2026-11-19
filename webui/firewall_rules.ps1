@@ -106,10 +106,11 @@
 # plug-in ("unterstuetzt das angegebene OptionSet-Element nicht"), so it is set with $false. A provider that ignored it
 # would silently answer the PersistentStore, and TDC would give a configured value out as in force. The sentinel stands
 # in for mustComply: before any store is read, Read-FastProfileStates reads a store that cannot exist, a name no
-# computer and no path can have. Measured over ten reads each, it always fails, in 46 ms typically and 160 ms at most,
-# with no DNS query. Should it answer, the option is being ignored, and the fast way throws instead of answering. It is
-# a proof per call, not a promise of the API, and it proves something only when it comes before the first value that
-# is used. Why that name, and why its failure proves anything, is written at the sentinel.
+# computer and no path can have. Measured over ten reads, the provider always refuses it, in 46 ms typically and 160 ms
+# at most, with no DNS query. Should it answer, or fail in any other way than that refusal, the fast way throws instead
+# of answering. It is a proof per call, not a promise of the API, it narrows the hole of an ignored option rather than
+# closing it, and it proves something only when it comes before the first value that is used. What it proves and what
+# it does not is written at the sentinel.
 # Every value is translated through a map written out in Read-FastProfileStates and matched case-exactly. A value not in
 # its map, a profile missing or named twice, an empty answer, CIM not being there at all, or any other error is not
 # guessed at: Profiles answers through the cmdlets instead and says so (Via "cmdlet", Fallback the reason). Compare
@@ -205,33 +206,37 @@ function Read-FastProfileStates {
             }
             @(foreach ($name in $AllProfiles) { $rows[$name] })
         }
-        # The sentinel, before any store is read: a store that cannot exist must fail. If it answers at all, even with
-        # nothing, the option is being ignored and every read below would be the PersistentStore under another name.
-        # Moved behind a real read, it would prove nothing about that read.
-        # Why its failure proves the option is honoured, whatever the (localised) text of the error:
-        #   - The error arrives during the enumeration ("Fehler beim Durchlaufen einer Auflistung"), so the value
-        #     reached the provider and was interpreted there. A value the client refused before sending would prove
-        #     nothing.
-        #   - That store names do reach the provider is visible on its own: a legal name makes it try to contact a
-        #     machine of that name, because -PolicyStore <computer name> is how a computer's GPO store is addressed.
-        #   - A provider that ignored the option would never look at the name, so it would answer with the
-        #     PersistentStore's three profiles, and that answer is what makes this throw.
-        # Residual: on a machine whose client refused such a value itself, the sentinel would be vacuous (it would fail
-        # without having asked the provider). Compare in a policy state that contradicts the stores is the backstop,
-        # because that is where an option that is not honoured shows as a difference.
-        # The name must be no store, no computer name and no path, and it contains a | for that: no computer or path
-        # name can hold one, so the provider refuses it on its syntax ("Die Syntax fuer den Dateinamen,
-        # Verzeichnisnamen oder die Datentraegerbezeichnung ist falsch"). A legal name is looked for on the network.
-        # Measured on the VM, 20 reads of TDC-NoSuchStore: 24 ms to 5205 ms, 545 ms on average, and an AAAA query
-        # for it in the DNS trace. That is slower than the cmdlets, on a verb that runs on every poll and that the
-        # profile check of the cut waits for, and it puts a name on the wire inside the chamber whose traffic TDC
-        # captures. With the |, ten reads: 27 ms to 160 ms, 46 ms on average, no DNS query, never an answer.
+        # The sentinel, before any store is read: a store that cannot exist must be refused by the provider. If it
+        # answers at all, even with nothing, the option is being ignored and every read below would be the
+        # PersistentStore under another name. Moved behind a real read, it would prove nothing about that read.
+        # What shows that store names reach the provider and are judged there, as measured on the VM:
+        #   - a legal name makes it try to reach a machine of that name (-PolicyStore <computer name> addresses that
+        #     computer's GPO store): up to 5205 ms per read, and the name in the DNS trace;
+        #   - this name is refused with the Win32 path-syntax error ("Die Syntax fuer den Dateinamen, Verzeichnisnamen
+        #     oder die Datentraegerbezeichnung ist falsch"), which is the provider's judgement, not a client check;
+        #   - its base exception is a CimException with NativeErrorCode Failed, every time, which places the failure
+        #     inside CIM. Only that counts as the refusal; anything else (another code, an error that is not CIM's, a
+        #     transport failure, access denied, the type not being there) proves nothing and throws into the
+        #     cmdlets. The check is on an enum, not on the localised text.
+        # That the error surfaces while enumerating proves nothing by itself: EnumerateInstances starts the operation
+        # only on the first MoveNext, so a client or transport refusal would surface the same way.
+        # A provider that ignored the option would never look at the name and would answer with the PersistentStore's
+        # three profiles, and that is what makes this throw.
+        # Residuals: Failed is a generic provider failure, so the code narrows the hole rather than closes it; a
+        # transient provider failure on this, the session's first operation, would still read as a refusal; and on a
+        # machine whose client refused such a value itself, the sentinel would fail without having asked the provider.
+        # Compare in a policy state that contradicts the stores is the backstop for all three, because that is where an
+        # option that is not honoured shows as a difference.
+        # The name must be no store, no computer name and no path, and it holds a | for that: no computer or path name
+        # can, so the provider refuses it on its syntax, in 46 ms typically and 160 ms at most, with no DNS query. A
+        # legal name is looked for on the network, from inside the chamber whose traffic TDC captures. It must never
+        # be empty either: an empty store name answers with all three profiles, exactly like no option at all.
         # The | never reaches a command line: it is a string argument of SetCustomOption, and this script builds
         # nothing from a value but the parameters of one call. It is not an injection to be "fixed".
         # The name is written in this one line only, so that it changes in one edit.
-        $honoured = $false
-        try { $null = & $enumerate 'TDC|NoSuchStore' } catch { $honoured = $true }
-        if (-not $honoured) { throw 'the PolicyStore option is ignored: a store that cannot exist answered, so no store read here can be trusted' }
+        $refused = $null
+        try { $null = & $enumerate 'TDC|NoSuchStore' } catch { $refused = $_.Exception.GetBaseException() }
+        if (-not ($refused -is [Microsoft.Management.Infrastructure.CimException] -and $refused.NativeErrorCode -eq [Microsoft.Management.Infrastructure.NativeErrorCode]::Failed)) { throw "the sentinel store was not refused by the provider, so the PolicyStore option may be ignored: $(if ($null -eq $refused) { 'it answered' } else { "$($refused.GetType().Name) $($refused.NativeErrorCode)" })" }
         $inForce = @{}
         $configured = @{}
         foreach ($p in @(& $readStore 'ActiveStore')) { $inForce[$p.Name] = @{ Enabled = (& $mapped $CimEnabled $p 'Enabled'); Outbound = (& $mapped $CimOutbound $p 'DefaultOutboundAction') } }
