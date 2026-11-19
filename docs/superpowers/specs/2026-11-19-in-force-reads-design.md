@@ -244,7 +244,9 @@ keine TDC-Regeln übrig, Netz wieder bei 200.
 Store gilt als Rechnername, und ein legaler Name schickt eine Namensauflösung
 los: `TDC-NoSuchStore` 24 / 545 / **5205** ms mit einer DNS-Spur,
 `not-a-store.invalid` 34 / 78 / 362 ms mit einer, **`TDC|NoSuchStore`** 27 / **46**
-/ **160** ms **ohne** (je zwanzig Lesevorgänge, DNS-Cache vorher geleert). Nach 5
+/ **160** ms **ohne** (je zehn Lesevorgänge, DNS-Cache vorher geleert; ein
+getrennter Lauf des alten Namens über zwanzig Lesevorgänge gab 35 / 319 / 5429
+ms). Nach 5
 und nach 6 `Profiles`-Aufrufen blieb die DNS-Spur leer. Außerdem zählt nur eine
 `CimException` mit `NativeErrorCode` `Failed` als Ablehnung (über acht Läufe
 stabil; ein falscher Namespace gibt `InvalidNamespace`). Der Vorbehalt bleibt:

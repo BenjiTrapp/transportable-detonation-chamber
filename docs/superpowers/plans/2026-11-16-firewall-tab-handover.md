@@ -494,8 +494,9 @@ reason. `AllowOut` carries no `via=` at all.
 
   **Its name had to be measured, and the result is counter-intuitive:** an
   unknown store is treated as a **computer name** (`-PolicyStore
-  <computername>` is how the local GPO store is addressed). Twenty reads each,
-  DNS cache cleared first:
+  <computername>` is how the local GPO store is addressed). Ten reads each,
+  DNS cache cleared first (a separate twenty-read run of the old name gave
+  35 / 319 / 5429 ms):
 
   | name | min / mean / max | DNS trace |
   |---|---|---|
