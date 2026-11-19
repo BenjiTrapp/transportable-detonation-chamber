@@ -580,6 +580,43 @@ def test_a_listed_rule_blocks_only_when_it_stands_and_the_profiles_are_on():
     assert [x["blocking"] for x in rules_mod.rules(run)] == [False]
 
 
+@pytest.mark.parametrize("profiles, held", [(None, "null"), ([], "0 rows naming no profile"),
+                                            ("Domain", "a str"), ("two", "2 rows naming Domain, Private")])
+def test_a_list_whose_profiles_cannot_be_used_reads_no_block_and_says_why(profiles, held, caplog):
+    """Shipped once: List answered "profiles": null, every block read as not blocking, and nothing said why. That
+    way is still the safe one, but it is logged, with what the answer held and its own reason."""
+    run = FakeRun()
+    rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
+    if profiles == "two":
+        profiles = run.profile_rows()[:2]
+    run.op_List = lambda p: (0, json.dumps({"profiles": profiles, "rules": list(run.rules.values()), "Via": "cmdlet",
+                                            "Fallback": ""}), "")
+    with caplog.at_level("WARNING", logger=rules_mod.__name__):
+        assert [x["blocking"] for x in rules_mod.rules(run)] == [False]
+    said = [r.getMessage() for r in caplog.records if r.name == rules_mod.__name__]
+    assert said == ["List answered profiles that cannot be used (cannot read the Windows Firewall profiles; nothing "
+                    "can be enforced: %s; Via 'cmdlet', Fallback ''): every block rule reads as not blocking" % held]
+
+
+def test_a_list_and_an_allow_out_read_whose_profiles_are_good_say_nothing(caplog):
+    run = FakeRun()
+    rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
+    with caplog.at_level("DEBUG", logger=rules_mod.__name__):
+        assert [x["blocking"] for x in rules_mod.rules(run)] == [True]
+        rules_mod.allowed_out(run)
+    assert [r for r in caplog.records if r.name == rules_mod.__name__] == []
+
+
+def test_an_allow_out_read_whose_profiles_cannot_be_used_says_so_too(caplog):
+    run = FakeRun()
+    run.op_AllowOut = lambda p: (0, json.dumps({"profiles": None, "rules": []}), "")
+    with caplog.at_level("WARNING", logger=rules_mod.__name__):
+        assert rules_mod.allowed_out(run) == []
+    assert [r.getMessage() for r in caplog.records if r.name == rules_mod.__name__] == [
+        "AllowOut answered profiles that cannot be used (cannot read the Windows Firewall profiles; nothing can be "
+        "enforced: null): nothing reads them today, so nothing changes"]
+
+
 def test_the_rule_list_says_whether_the_cut_rule_stands_in_the_catch_all_shape():
     """The poll's rule list is one of the reads ``verified`` rests on in the cut stages (app._fw_cut_stands)."""
     run = FakeRun()
@@ -3302,66 +3339,160 @@ def _script_parameters(script):
     return re.findall(r"\$(\w+)\s*(?=[,=\n])", block.group(1) + "\n"), script[:block.end()].count("\n") + 1
 
 
-def _script_level_lines(script):
-    """(line number, code) of every line after the param() block that is not inside a function: the code that runs in
-    the script's own scope, the scope its parameters live in. Comment lines are left out."""
+def _script_code_lines(script):
+    """(line number, code, inside a function) of every line after the param() block. Comment lines are left out, and
+    so are the lines of a here-string (between a line ending in @' or @" and the line starting '@ or "@), whose text is
+    no code and may hold a `}` at column 0. Code outside a function runs in the script's own scope, the scope its
+    parameters live in."""
     _, last = _script_parameters(script)
-    lines, inside, found = [], False, 0
+    lines, inside, found, declared, closer = [], False, 0, 0, None
     for number, line in enumerate(script.splitlines(), 1):
         if number <= last:
             continue
+        if closer:
+            closer = None if line.startswith(closer) else closer
+            continue
+        here = re.search(r"@(['\"])$", line.rstrip())
+        closer = here and here.group(1) + "@"
+        declared += line.startswith("function ")
         if re.match(r"function [\w-]+ \{", line):
-            assert not inside, ("_script_level_lines: line %d starts a function before the one above it was closed by a "
+            assert not inside, ("_script_code_lines: line %d starts a function before the one above it was closed by a "
                                 "`}` at column 0; the line numbers it would give are wrong" % number)
             inside, found = True, found + 1
         elif inside and line == "}":
             inside = False
-        elif not inside and line.strip() and not line.strip().startswith("#"):
-            lines.append((number, line.strip()))
-    declared = len(re.findall(r"^function ", script, re.M))
-    assert found == declared and not inside, (
-        "_script_level_lines read %d functions of the form `function Name {` ... `}` at column 0, but the script "
+        elif line.strip() and not line.strip().startswith("#"):
+            lines.append((number, line.strip(), inside))
+    assert found == declared and not inside and not closer, (
+        "_script_code_lines read %d functions of the form `function Name {` ... `}` at column 0, but the script "
         "declares %d (and %s): a function written another way (its brace on the next line, or a `}` at column 0 "
-        "inside it, such as in a here-string) is mis-parsed, and the line numbers it gives are wrong. Fix the parser "
-        "before trusting it." % (found, declared, "one is never closed" if inside else "every one it read is closed"))
+        "inside it) is mis-parsed, and the line numbers it gives are wrong. Fix the parser before trusting it."
+        % (found, declared, "a here-string is never closed" if closer else
+           "one is never closed" if inside else "every one it read is closed"))
     return lines
 
 
-_WRITES = (re.compile(r"(?<![\w$`])\$(?:(?:script|local|global|private):)?(\w+)\s*(?:[-+*/%]?=(?!=)|\+\+|--)", re.I),
+def _script_level_lines(script):
+    """(line number, code) of every line that is not inside a function (see _script_code_lines)."""
+    return [(number, code) for number, code, inside in _script_code_lines(script) if not inside]
+
+
+_VARIABLE = r"\$\{?(?:(?:script|local|global|private):)?(\w+)\}?"
+_SCOPED_VARIABLE = r"\$\{?(?:script|global):(\w+)\}?"
+_STREAM_VARIABLE = r"(?<![\w-])-(?:(?:Out|Error|Warning|Information|Pipeline)Variable|ov|ev|wv|iv|pv)(?::|\s+)['\"]?\+?(\w+)"
+_WRITES = (re.compile(r"(?<![\w$`])" + _VARIABLE + r"\s*(?:[-+*/%]?=(?!=)|\+\+|--)", re.I),
+           re.compile(r"(?<![\w$`])(?:\+\+|--)" + _VARIABLE, re.I),
            re.compile(r"\bforeach\s*\(\s*\$(\w+)\s+in\b", re.I),
-           re.compile(r"-(?:Out|Error|Warning|Information|Pipeline)Variable\s+['\"]?\+?(\w+)", re.I),
-           re.compile(r"\b(?:Set|New)-Variable\s+(?:-Name\s+)?['\"]?(\w+)", re.I))
+           re.compile(_STREAM_VARIABLE, re.I))
+_SCOPED_WRITES = (re.compile(r"(?<![\w$`])" + _SCOPED_VARIABLE + r"\s*(?:[-+*/%]?=(?!=)|\+\+|--)", re.I),
+                  re.compile(r"(?<![\w$`])(?:\+\+|--)" + _SCOPED_VARIABLE, re.I))
+_SET_VARIABLE = re.compile(r"\b(?:Set|New)-Variable\b([^|;}]*)", re.I)
+_SWAP = r"(?<![\w$`])((?:\$\w+\s*,\s*)+\$\w+)\s*=(?!=)"
+
+
+def _set_variable_writes(line, scoped):
+    """The names Set-Variable and New-Variable write on a line, by -Name wherever it stands or else by the first
+    argument; with ``scoped`` only those given -Scope Script, Global or a number above 0 (a scope above the caller's)."""
+    names = []
+    for args in _SET_VARIABLE.findall(line):
+        if scoped and not re.search(r"-Scope(?::|\s+)['\"]?(?:script|global|[1-9]\d*)\b", args, re.I):
+            continue
+        named = re.search(r"-Name(?::|\s+)['\"]?(\w+)", args, re.I) or re.match(r"\s+['\"]?(\w+)", args)
+        names += [named.group(1)] if named else []
+    return names
 
 
 def _variables_written(line):
-    names = [n for pattern in _WRITES for n in pattern.findall(line)]
-    multi = re.match(r"((?:\$\w+\s*,\s*)+\$\w+)\s*=(?!=)", line)
-    return names + (re.findall(r"\$(\w+)", multi.group(1)) if multi else [])
+    """Every variable a script-level line writes: an assignment, ++ or -- either side, a foreach variable, a stream
+    variable (-OutVariable and its kind, or their aliases), Set-/New-Variable, and each name of a swap."""
+    names = [n for pattern in _WRITES for n in pattern.findall(line)] + _set_variable_writes(line, scoped=False)
+    return names + [n for swap in re.findall(_SWAP, line) for n in re.findall(r"\$(\w+)", swap)]
+
+
+def _variables_written_above(line):
+    """The variables a line inside a function writes outside it: only a scope-qualified write ($script:, $global:,
+    -Scope Script, Global or a number) leaves the function. An unqualified write there is a fresh local."""
+    return [n for pattern in _SCOPED_WRITES for n in pattern.findall(line)] + _set_variable_writes(line, scoped=True)
+
+
+@pytest.mark.parametrize("line, written", [
+    ("$Profiles = 1", ["Profiles"]), ("${Profiles} = 1", ["Profiles"]), ("$script:Profiles += 1", ["Profiles"]),
+    ("$x++", ["x"]), ("++$x", ["x"]), ("--${x}", ["x"]), ("foreach ($x in $y) {", ["x"]),
+    ("Get-X -OutVariable x", ["x"]), ("Get-X -OutVariable:x", ["x"]), ("Get-X -ov +x", ["x"]), ("Get-X -ev:'x'", ["x"]),
+    ("Set-Variable x 1", ["x"]), ("Set-Variable -Name x -Value 1", ["x"]), ("Set-Variable -Value 1 -Name x", ["x"]),
+    ("$a, $b = $b, $a", ["a", "b"]), ("if ($c) { $Profiles, $x = $x, $Profiles }", ["Profiles", "x"]),
+    ("if ($a -eq $b) { Get-X }", []), ("$h = @{ a = 1 }", ["h"]), ("Get-X -Overwrite:$true -Evidence $e", []),
+])
+def test_the_script_level_scanner_sees_every_form_of_a_write(line, written):
+    assert set(_variables_written(line)) == set(written)
+
+
+@pytest.mark.parametrize("line, written", [
+    ("$script:Profiles = @{}", ["Profiles"]), ("${global:Name} = 1", ["Name"]), ("++$script:Name", ["Name"]),
+    ("Set-Variable -Scope Script -Name Profiles -Value @{}", ["Profiles"]),
+    ("New-Variable -Scope Global -Name Name -Value 1 -Force", ["Name"]), ("Set-Variable Name 1 -Scope 1", ["Name"]),
+    ("$Profiles = 1", []), ("$local:Profiles = 1", []), ("Set-Variable -Name Profiles -Value 1", []),
+    ("Set-Variable -Scope 0 -Name Profiles -Value 1", []), ("Set-Variable -Scope Local -Name Profiles -Value 1", []),
+])
+def test_the_function_scanner_sees_only_the_writes_that_leave_the_function(line, written):
+    assert set(_variables_written_above(line)) == set(written)
 
 
 def test_no_script_level_assignment_writes_into_a_parameter():
     """Shipped once: List did `$profiles = Get-ProfileStates`, and every List answered profiles null, Via cmdlet and
     an empty reason. PowerShell variable names are case-insensitive, and the switch runs in the script's own scope,
     where the parameters live: so $profiles IS the [string]$Profiles parameter, the assignment rebinds it, [string]
-    coerces the read to its ToString(), and .Rows, .Via and .Fallback are then $null. Inside a function the same name
-    is a fresh local, so functions are exempt. The parameters and the script-level code are both read out of the
-    script, so a parameter added tomorrow is guarded too. (No other test could see this: the others read the script
-    as text and the module's tests answer from canned JSON, so none of them ever runs PowerShell.)"""
+    coerces the read to its ToString(), and .Rows, .Via and .Fallback are then $null. Inside a function a plain
+    assignment to the same name is a fresh local, so it is exempt there; a scope-qualified one ($script:Profiles,
+    Set-Variable -Scope Script) is not, and is guarded there too. The parameters and the code are both read out of
+    the script, so a parameter added tomorrow is guarded too. (No other test could see this: the others read the
+    script as text and the module's tests answer from canned JSON, so none of them ever runs PowerShell.)"""
     script = _ps1()
     params, _ = _script_parameters(script)
-    lines = _script_level_lines(script)
+    lines = _script_code_lines(script)
     assert "Op" in params and len(params) > 1, params
-    assert "switch ($Op) {" in [code for _, code in lines], "the switch must be among the script-level lines"
-    written = {name.lower() for _, code in lines for name in _variables_written(code)}
+    assert ("switch ($Op) {", False) in [(code, inside) for _, code, inside in lines], "the switch is script-level"
+    written = {name.lower() for _, code, inside in lines if not inside for name in _variables_written(code)}
     assert {"read", "fallbacks", "out"} <= written, written      # the scanner sees the switch's own assignments
-    collisions = ["line %d: writes into the parameter $%s   ->   %s" % (number, param, code)
-                  for number, code in lines for name in _variables_written(code)
+    collisions = ["line %d: writes into the parameter $%s %s   ->   %s"
+                  % (number, param, "from inside a function" if inside else "at script level", code)
+                  for number, code, inside in lines
+                  for name in (_variables_written_above(code) if inside else _variables_written(code))
                   for param in params if name.lower() == param.lower()]
     assert not collisions, (
-        "\n".join(collisions) + "\nAn assignment at script level (the switch and the code around it, outside any "
-        "function) to a parameter's name, in any case, is not a new local: PowerShell names are case-insensitive and "
-        "this is the parameters' scope, so it rebinds the typed parameter and [string] turns the value into its "
-        "ToString(). Pick a name no parameter has.")
+        "\n".join(collisions) + "\nA write to a parameter's name, in any case, in the parameters' scope (at script "
+        "level: the switch and the code around it, outside any function; or from a function with $script:, $global: "
+        "or -Scope) is not a new local: PowerShell names are case-insensitive, so it rebinds the typed parameter and "
+        "[string] turns the value into its ToString(). Pick a name no parameter has.")
+
+
+def test_a_here_string_is_no_code_and_its_brace_at_column_0_closes_nothing():
+    script = "param(\n    [string]$Op\n)\nfunction A {\n    $t = @'\n}\n$Op = 1\n'@\n    $u = 1\n}\n$v = 2\n"
+    assert _script_code_lines(script) == [(5, "$t = @'", True), (9, "$u = 1", True), (11, "$v = 2", False)]
+    with pytest.raises(AssertionError, match="a here-string is never closed"):
+        _script_code_lines("param(\n    [string]$Op\n)\n$t = @\"\nfunction B {\n")
+
+
+@pytest.mark.parametrize("line", ["$script:Profiles = @{ Rows = @() }",
+                                  "Set-Variable -Scope Script -Name Profiles -Value @{ Rows = @() }",
+                                  "New-Variable -Scope Global -Name Name -Value 1 -Force",
+                                  "${Profiles} = 1"])
+def test_the_guard_goes_red_on_a_write_into_a_parameter_from_a_function_or_in_brace_form(line, monkeypatch):
+    """The guard on a copy of the script with one line added: inside a function, or at script level for the brace
+    form. It must fail and name the line and the parameter."""
+    script = _ps1()
+    lines = script.split("\n")
+    if line.startswith("${"):
+        at = next(i for i, l in enumerate(lines) if l.strip() == "switch ($Op) {")
+    else:
+        at = next(i for i, l in enumerate(lines) if re.match(r"function [\w-]+ \{", l))
+    lines.insert(at + 1, "    " + line)
+    monkeypatch.setattr(sys.modules[__name__], "_ps1", lambda: "\n".join(lines))
+    with pytest.raises(AssertionError) as failed:
+        test_no_script_level_assignment_writes_into_a_parameter()
+    param = re.search(r"-Name (\w+)|\$\{?(?:script:)?(\w+)", line)
+    assert "line %d: writes into the parameter $%s " % (at + 2, param.group(1) or param.group(2)) in str(failed.value)
+    print(str(failed.value).split("\n")[0])
 
 
 def test_a_reason_is_one_short_line_in_the_rule_reads_and_in_compare_alike():

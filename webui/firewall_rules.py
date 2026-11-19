@@ -70,6 +70,7 @@ import base64
 import hashlib
 import ipaddress
 import json
+import logging
 import ntpath
 import os
 import re
@@ -88,6 +89,8 @@ LOOPBACK_RULE = ISOLATE_PREFIX + "loopback"  # written by older versions: only r
 FETCHER_RULE = ISOLATE_PREFIX + "fetcher"     # the standing fetcher rule of older versions: only removed now
 FETCH_PREFIX = ISOLATE_PREFIX + "fetch-"      # one allow rule per fetch, for as long as that fetch lasts
 CUT_RULE = ISOLATE_PREFIX + "cut"             # the one catch-all outbound Block rule of the cut (see the module docstring)
+
+logger = logging.getLogger(__name__)
 
 PROFILE_NAMES = ("Domain", "Private", "Public")
 OUTBOUND_ACTIONS = ("Allow", "Block", "NotConfigured")
@@ -419,6 +422,27 @@ def _states(rows: Any) -> List[Dict[str, Any]]:
     if {s["name"] for s in found} != set(PROFILE_NAMES):
         raise RuleError("cannot read the Windows Firewall profiles; nothing can be enforced")
     return found
+
+
+def _answered_states(data: Dict[str, Any], op: str, consequence: str) -> Optional[List[Dict[str, Any]]]:
+    """The ``profiles`` half of an answer that carries them beside its own rows (``List``, ``AllowOut``), or None when
+    it cannot be used. None is the safe way, but never a quiet one: it is logged with what the answer held and why,
+    so that a broken half is found and does not only show as ``consequence``."""
+    rows = data.get("profiles")
+    try:
+        return _states(rows)
+    except RuleError as e:
+        if rows is None:
+            held = "null"
+        elif isinstance(rows, list):
+            named = [str(r.get("Name"))[:20] for r in rows if isinstance(r, dict)]
+            held = f"{len(rows)} rows naming {', '.join(named) or 'no profile'}"
+        else:
+            held = f"a {type(rows).__name__}"
+        way = f"; Via {str(data.get('Via'))[:20]!r}, Fallback {_first_line(data.get('Fallback'))[:200]!r}" if "Via" in data else ""
+        logger.warning("%s answered profiles that cannot be used (%s: %s%s): %s", op, _first_line(e), held, way,
+                       consequence)
+        return None
 
 
 def _profiles(run) -> List[Dict[str, Any]]:
@@ -863,10 +887,7 @@ def rules(run) -> List[Dict[str, Any]]:
     data = _json(_ok(run, "List"), "the rule list")
     if not isinstance(data, dict) or not isinstance(data.get("rules"), list):
         raise RuleError("cannot read the rule list")
-    try:
-        states: Optional[List[Dict[str, Any]]] = _states(data.get("profiles"))
-    except RuleError:
-        states = None
+    states = _answered_states(data, "List", "every block rule reads as not blocking")
     listed = []
     for raw in data["rules"]:
         name = str(raw.get("Name") or "") if isinstance(raw, dict) else ""
@@ -1020,10 +1041,8 @@ def _allow_out_state(run) -> Tuple[Optional[List[Dict[str, Any]]], List[Dict[str
     """``(profiles, rules)`` from one ``AllowOut`` call: the profiles as ``_profiles`` gives them (None when the answer
     has no readable profiles) and the rules as ``allowed_out`` gives them."""
     data = _json(_ok(run, "AllowOut"), "the outbound allow rules")
-    try:
-        states: Optional[List[Dict[str, Any]]] = _states(data.get("profiles")) if isinstance(data, dict) else None
-    except RuleError:
-        states = None
+    states = (_answered_states(data, "AllowOut", "nothing reads them today, so nothing changes")
+              if isinstance(data, dict) else None)
     rows = data.get("rules") if isinstance(data, dict) else None
     if isinstance(rows, dict):
         rows = [rows]
