@@ -22,8 +22,10 @@
 #   Enable              switch the three profiles on
 #   List                {"profiles": [...], "rules": [...], "Via"[, "Fallback"]}: the profiles as Profiles gives them,
 #                       and every rule named TDC-FW-* as {"Name","Enabled","Action","Direction","Profile","Program",
-#                       "RemoteAddress","RemotePort","Protocol"}. Via is the way the rules were read: "fast" (COM,
-#                       without the NetSecurity module) or "cmdlet", and then Fallback says why.
+#                       "RemoteAddress","RemotePort","Protocol"}. Via is the way the whole answer was read: "fast"
+#                       only when both halves were (the profiles as Profiles reads them, the rules over COM, neither
+#                       with the NetSecurity module), else "cmdlet", and then Fallback names every half that fell back
+#                       with its reason: "profiles: <reason>", "rules: <reason>", or both joined by "; ".
 #   Get -Name           the one rule as JSON, as List gives it plus "Via"[, "Fallback"], or no output at all when there is none
 #   Create -Name -Action [-Program] [-RemoteAddress a,b] [-RemotePort] [-Protocol]
 #                       an outbound rule. Exit 3: a profile is off (nothing is written). Exit 4: the rule is already there.
@@ -680,10 +682,15 @@ try {
             Set-NetFirewallProfile -Profile $AllProfiles -Enabled True
         }
         'List' {
+            $profiles = Get-ProfileStates
             $read = Get-OurRuleViews
-            # Via is the way of the rules alone: the profiles may have come either way, and List does not yet say which.
-            $out = [ordered]@{ profiles = (Get-ProfileStates).Rows; rules = $read.Views; Via = $read.Via }
-            if ($read.Via -ne 'fast') { $out.Fallback = $read.Fallback }
+            # Via is fast only when both halves were. Fallback names every half that fell back, each with its own reason
+            # (already one line of at most 200 characters), joined by "; " so that both stay readable on one line.
+            $fallbacks = @()
+            if ($profiles.Via -ne 'fast') { $fallbacks += "profiles: $($profiles.Fallback)" }
+            if ($read.Via -ne 'fast') { $fallbacks += "rules: $($read.Fallback)" }
+            $out = [ordered]@{ profiles = $profiles.Rows; rules = $read.Views; Via = 'fast' }
+            if ($fallbacks.Count -gt 0) { $out.Via = 'cmdlet'; $out.Fallback = $fallbacks -join '; ' }
             ConvertTo-Json -Compress -Depth 5 -InputObject ([pscustomobject]$out)
         }
         'Get' {

@@ -2944,6 +2944,31 @@ def test_a_way_that_is_not_one_of_the_two_is_not_reported(monkeypatch, via):
     assert "via" not in seen[0] and "fallback" not in seen[0]
 
 
+def test_lists_two_reasons_reach_the_call_log_whole_and_on_one_line(monkeypatch):
+    """When both halves of List fall back, each reason may be as long as Get-ShortReason allows; the log keeps both,
+    and nothing from the machine in either reason can break the call line."""
+    script = _ps1()
+    short = re.search(r"Substring\(0, (\d+)\)", _functions(script)["Get-ShortReason"]).group(1)
+    listing = _op_case(script, "List")
+    parts = tuple(m.group(1) if m else None for m in (re.search(r'"([^"$]*)\$\(\$profiles\.Fallback\)"', listing),
+                                                        re.search(r"-join '([^']*)'", listing),
+                                                        re.search(r'"([^"$]*)\$\(\$read\.Fallback\)"', listing)))
+    assert int(short) == rules_mod.MAX_FALLBACK_CHARS and parts == rules_mod.LIST_FALLBACK_PREFIXES, \
+        "MAX_LIST_FALLBACK_CHARS is two reasons cut by Get-ShortReason plus List's two prefixes and its separator: " \
+        "change MAX_FALLBACK_CHARS / LIST_FALLBACK_PREFIXES in firewall_rules.py to match the script"
+    assert rules_mod.MAX_LIST_FALLBACK_CHARS == 2 * int(short) + sum(map(len, parts))
+    seen = _observed(monkeypatch)
+    # a lone CR, a group separator and two Unicode line breaks survive Get-ShortReason's split on CR LF / LF
+    odd = "a\rb\x1cc\u2028d\x85e"
+    joined = "profiles: " + odd + "p" * (200 - len(odd)) + "; rules: " + odd + "r" * (200 - len(odd))
+    rules_mod.rules(_answering({"profiles": _rows(), "rules": [], "Via": "cmdlet", "Fallback": joined}))
+    assert seen[0]["op"] == "List" and seen[0]["via"] == "cmdlet" and seen[0]["fallback"] == joined
+    logged = repr(seen[0]["fallback"])                    # the call line quotes it with %r
+    assert not any(c in logged for c in "\n\r\x1c\u2028\x85"), logged
+    rules_mod.rules(_answering({"profiles": _rows(), "rules": [], "Via": "cmdlet", "Fallback": joined + "x" * 5000}))
+    assert seen[1]["fallback"] == joined                  # still bounded: past both whole reasons it is cut
+
+
 def test_a_long_reason_is_cut_and_a_failed_call_is_still_reported(monkeypatch):
     seen = _observed(monkeypatch)
     rules_mod._profiles(_answering(_rows(Via="cmdlet", Fallback="x" * 5000)))
@@ -3255,14 +3280,20 @@ def test_compare_counts_each_kind_of_rule_check_on_its_own_and_writes_nothing():
     assert not re.search(r"\b(Set|New|Remove|Enable|Disable)-NetFirewall", _op_branch(script, "Compare"))
 
 
-def test_list_says_the_way_its_rules_were_read_and_get_the_way_of_its_rule():
+def test_list_says_the_way_both_its_halves_were_read_and_get_the_way_of_its_rule():
+    """List has two fast halves, its profiles and its rules: Via is fast only when both were, and Fallback names every
+    half that fell back with its own reason (each already one short line from Get-ShortReason), joined by "; "."""
     script = _ps1()
     listing = _code_lines(_op_case(script, "List"))
     assert listing == [
         "'List' {",
+        "$profiles = Get-ProfileStates",
         "$read = Get-OurRuleViews",
-        "$out = [ordered]@{ profiles = (Get-ProfileStates); rules = $read.Views; Via = $read.Via }",
-        "if ($read.Via -ne 'fast') { $out.Fallback = $read.Fallback }",
+        "$fallbacks = @()",
+        "if ($profiles.Via -ne 'fast') { $fallbacks += \"profiles: $($profiles.Fallback)\" }",
+        "if ($read.Via -ne 'fast') { $fallbacks += \"rules: $($read.Fallback)\" }",
+        "$out = [ordered]@{ profiles = $profiles.Rows; rules = $read.Views; Via = 'fast' }",
+        "if ($fallbacks.Count -gt 0) { $out.Via = 'cmdlet'; $out.Fallback = $fallbacks -join '; ' }",
         "ConvertTo-Json -Compress -Depth 5 -InputObject ([pscustomobject]$out)",
     ], listing
     get = _code_lines(_op_case(script, "Get"))
@@ -3462,14 +3493,25 @@ def test_the_profiles_rows_name_the_way_they_were_read():
 
 
 def test_every_other_caller_takes_the_rows_and_the_writing_verbs_keep_the_cmdlets():
-    """The verbs that write check and read back the profiles as they always did, through the cmdlets."""
+    """The verbs that write check and read back the profiles as they always did, through the cmdlets. And no caller
+    puts the {Rows, Via, Fallback} wrapper itself into an answer, which would change the JSON's shape: a read used
+    in place is used for its .Rows, a read held in a variable only for its .Rows, .Via and .Fallback, and every
+    profiles of an answer is .Rows."""
     script = _ps1()
     for verb in ("List", "AllowOut", "Create", "Cut", "SetDefaultOutbound"):
-        uses = re.findall(r"\(Get-ProfileStates[^)]*\)(\.Rows)?", _op_case(script, verb))
-        assert uses and all(uses), verb
+        case = _op_case(script, verb)
+        inline = re.findall(r"\(Get-ProfileStates[^)]*\)(\.Rows)?", case)
+        held = re.findall(r"(\$\w+) = Get-ProfileStates\b", case)
+        assert inline or held, verb
+        assert all(inline), verb
+        for var in held:
+            uses = re.findall(r"%s(?!\w)(\.\w+)?" % re.escape(var), case)[1:]
+            assert ".Rows" in uses and set(uses) <= {".Rows", ".Via", ".Fallback"}, (verb, var, uses)
+        for value in re.findall(r"(?<![$\w])profiles = ([^;}]+)", case):
+            assert value.strip().endswith(".Rows"), (verb, value)
     for verb in ("Create", "Cut", "SetDefaultOutbound", "AllowOut"):
         assert "(Get-ProfileStates -CmdletsOnly).Rows" in _op_case(script, verb), verb
-    assert "(Get-ProfileStates).Rows" in _op_case(script, "List")
+    assert "$profiles = Get-ProfileStates" in _code_lines(_op_case(script, "List"))
     for verb in ("Enable", "Remove", "DisableAllowOut", "EnableAllowOut", "RemoveIsolate"):
         assert "ProfileStates" not in _op_case(script, verb), verb
 

@@ -117,13 +117,20 @@ _LOCK = threading.RLock()
 # waited for the lock (given to its first call, 0.0 to the rest; None without the lock), how long the call ran,
 # its exit code and the thread's name. No parameter and no output is in it, with one exception: an answer that names
 # the way it was read (``Via``, "fast" or "cmdlet") adds ``via``, and on a fallback ``fallback``, its reason (at most
-# MAX_FALLBACK_CHARS), so that a fallback that keeps happening can be found and does not only show as slowness. An
+# MAX_FALLBACK_CHARS, List's two at most MAX_LIST_FALLBACK_CHARS), so that a fallback that keeps happening can be found and does not only show as slowness. An
 # answer of ``Get`` with no marker on stdout carries it on stderr (for a rule that is not there it prints nothing). The
 # wait is measured where the lock is taken, because a press that waits for someone else's run is the variance a
 # single call cannot show.
 CALL_OBSERVER: Optional[Callable[[Dict[str, Any]], None]] = None
 WAYS = ("fast", "cmdlet")
 MAX_FALLBACK_CHARS = 200
+# List's answer has two halves, and its reason names each one that fell back: "profiles: <reason>; rules: <reason>".
+# Each reason is already cut to 200 characters (MAX_FALLBACK_CHARS, the Substring(0, 200) of Get-ShortReason) before
+# the script joins them, so the longest is the sum of its parts, and this cap holds both whole:
+#   2 reasons x 200 + len("profiles: ") 10 + len("; ") 2 + len("rules: ") 7 = 419
+# A change to the prefixes or the separator in the script's List case must change these three strings with it.
+LIST_FALLBACK_PREFIXES = ("profiles: ", "; ", "rules: ")
+MAX_LIST_FALLBACK_CHARS = 2 * MAX_FALLBACK_CHARS + sum(len(part) for part in LIST_FALLBACK_PREFIXES)
 _clock = time.perf_counter                # tests pin it
 _held = threading.local()                 # per thread: depth, what holds the lock, the wait not yet reported
 
@@ -215,7 +222,8 @@ def _way(out: Any) -> Dict[str, str]:
                 return {}
             way = {"via": row["Via"]}
             if row.get("Fallback"):
-                way["fallback"] = str(row["Fallback"])[:MAX_FALLBACK_CHARS]
+                cap = MAX_LIST_FALLBACK_CHARS if row is answer and "profiles" in answer else MAX_FALLBACK_CHARS
+                way["fallback"] = str(row["Fallback"])[:cap]
             return way
     return {}
 
