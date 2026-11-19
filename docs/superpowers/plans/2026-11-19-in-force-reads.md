@@ -319,7 +319,7 @@ git commit -m "fix(firewall): List says fast only when both halves were, and All
 - Modify: `docs/superpowers/specs/2026-11-19-in-force-reads-design.md` (ein
   „Nach dem VM-Lauf"-Abschnitt)
 
-- [ ] **Step 1: `Compare` in vier Zuständen, einer davon neu**
+- [x] **Step 1: `Compare` in vier Zuständen, einer davon neu**
 
 Je mit `-Op Compare`: nichts isoliert mit stehenden Regeln; Schnitt steht;
 konvergiert; **und der Zustand, den es vorher nicht gab** — eine lokale
@@ -328,19 +328,19 @@ Gruppenrichtlinie, die den Stores widerspricht
 über einem lokalen `Block`), denn genau dort ist COM durchgefallen. Jeder Lauf
 muss Exit 0 geben; der Richtlinien-Zustand ist der, der zählt.
 
-- [ ] **Step 2: Vorher/Nachher messen**
+- [x] **Step 2: Vorher/Nachher messen**
 
 Zeiten je Verb im frischen Prozess und die Ruhelast über 100 s. Erwartung:
 `Profiles` 0,6 s statt 1,16 s, `List` unter 1 s statt 1,43 s, Ruhelast unter
 den 18 % von vor dieser ganzen Spur. **Wird sie nicht erreicht, steht das so in
 den Dokumenten** — wie beim Vorgänger.
 
-- [ ] **Step 3: Alles zurückstellen und prüfen**
+- [x] **Step 3: Alles zurückstellen und prüfen**
 
 Richtlinien-Store leeren, Profile auf `NotConfigured`, `gpupdate`, keine
 TDC-Regeln übrig, Netz wieder da.
 
-- [ ] **Step 4: Dokumente nachziehen**
+- [x] **Step 4: Dokumente nachziehen**
 
 Der Richtlinien-Zustand als Pflichtprüfung in den Handover, mit der Begründung,
 warum die drei alten Zustände ihn nicht ersetzen. Die gemessenen Zahlen in die
@@ -350,7 +350,7 @@ unbestätigten streichen. Und die beiden Punkte, die diese Messung nebenbei
 geschlossen hat: die Local/GroupPolicy-Trennung für Regeln (ActiveStore 539,
 PersistentStore 538) und dass COM eine Richtlinien-Regel nicht sieht.
 
-- [ ] **Step 5: Committen**
+- [x] **Step 5: Committen**
 
 ```bash
 git add docs/

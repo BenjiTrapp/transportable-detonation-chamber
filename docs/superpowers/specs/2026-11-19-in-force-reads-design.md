@@ -217,3 +217,72 @@ der dort nicht genau die Cmdlet-Antwort gibt, ist falsch.
    mit 140 ms bezahlt und ersetzt eine Zusicherung, die die API verweigert.
 3. **`mustComply` wird nicht verwendet**, weil das Plug-In jeden Aufruf damit
    ablehnt — nicht, weil es unerwünscht wäre.
+
+## Nach dem VM-Lauf
+
+**Ergebnis: der Entwurf trägt, und das Ziel ist erreicht.** Die Ruhelast eines
+zuschauenden Tabs liegt bei **11,0 %** und **12,9 %** eines `powershell.exe`
+(4 Aufrufe je 100 s, zweimal gemessen; im zweiten Fenster alle vier auf dem
+schnellen Weg, `{'fast': 4}`), gegen 18 % vor der ganzen Spur und 19,5 % nach den
+Rückbauten des Vorgängers. Je Verb, frischer Prozess, unbelastete VM: `Profiles`
+1,16 s → **0,62 s**, `List` 1,43 s → **0,65 s**, `Get` 0,63 s → 0,53 s,
+`AllowOut` 1,69 s → 1,77 s (unverändert, bei den Cmdlets).
+
+**`Compare` in sechs Zuständen, alle Exit 0.** A: nichts isoliert, IPv4, IPv6 und
+**UDP** stehen (`profiles 9, displayNames 3, names 6, fields 54`); B: der Schnitt
+steht (`… 4, 8, 72`); C: konvergiert (`… 3, 6, 54`); **D: eine lokale
+Gruppenrichtlinie widerspricht dem lokalen Store**; E: D plus eine Regel der
+Richtlinie; F: normal, nach dem Zurückstellen (D bis F: `profiles 9`, Regeln 0).
+D ist der Zustand, der zählt: in Kraft `Allow, Allow, Block`, konfiguriert
+Domain `Block`, und `Profiles` meldete `Allow` mit `Configured: Block` — genau
+die Spaltung, bei der COM `Block` sagte. Ein Durchlauf durch das Isolieren
+danach: Schnitt geschlossen (`out=000`, Loopback 200), konvergiert zu `isolated`
+mit `verified=True`, sauber verlassen, die Firewall zurück auf `NotConfigured`,
+keine TDC-Regeln übrig, Netz wieder bei 200.
+
+**Der Prüfstein hat einen Namen, der gemessen werden musste.** Ein unbekannter
+Store gilt als Rechnername, und ein legaler Name schickt eine Namensauflösung
+los: `TDC-NoSuchStore` 24 / 545 / **5205** ms mit einer DNS-Spur,
+`not-a-store.invalid` 34 / 78 / 362 ms mit einer, **`TDC|NoSuchStore`** 27 / **46**
+/ **160** ms **ohne** (je zwanzig Lesevorgänge, DNS-Cache vorher geleert). Nach 5
+und nach 6 `Profiles`-Aufrufen blieb die DNS-Spur leer. Außerdem zählt nur eine
+`CimException` mit `NativeErrorCode` `Failed` als Ablehnung (über acht Läufe
+stabil; ein falscher Namespace gibt `InvalidNamespace`). Der Vorbehalt bleibt:
+`Failed` ist ein allgemeiner Anbieterfehler, die Lücke wird also verengt, nicht
+geschlossen, und `Compare` im Richtlinien-Zustand ist die Rückendeckung. Ein
+**leerer** Storename antwortet wie keine Option mit allen drei Profilen und darf
+deshalb nie der Wert des Prüfsteins sein.
+
+**Zwei Fehler, die erst die VM fand.**
+
+1. **`List` lieferte `"profiles": null`** und behauptete bei jedem Aufruf `Via:
+   cmdlet` mit leerer Begründung, im Leerlauf wie unter Last. Der `List`-Zweig
+   schrieb in `$profiles`, und der `param()`-Block des Skripts deklariert
+   `[string]$Profiles`: PowerShell unterscheidet bei Variablen Groß- und
+   Kleinschreibung nicht, der `switch` läuft im selben Gültigkeitsbereich wie die
+   Parameter, die Zeile schrieb also in den typisierten Parameter und machte aus
+   dem Objekt dessen `ToString()`. Der Verbraucher verschluckte es:
+   `webui/firewall_rules.py` fängt das fehlerhafte `profiles` ab und setzt
+   `states = None`, ohne ein Wort.
+2. **Vier `foreach ($name in …)`-Schleifen in `Compare`** schrieben ebenso in
+   `[string]$Name`. Heute harmlos, weil sie nur Zeichenketten durchlaufen, aber
+   dieselbe Falle. Ein Test verbietet jetzt jeden Schreibvorgang des Skripts auf
+   einen Parameternamen, die Parameterliste aus dem Skript selbst gelesen, und er
+   ist an fünf Mutationen erprobt.
+
+**Daraus wird eine neue Pflichtprüfung.** `Compare` übt die **Leser**, nicht die
+**Zweige der Verben**; ein kaputter Zweig bleibt ihm unsichtbar — der erste
+Beweislauf war ganz grün, während `List` `null` lieferte. Die Pflichtprüfung auf
+der VM muss deshalb das **JSON jedes Verbs selbst lesen** (`Profiles`, `List`,
+`Get`, `AllowOut`), nicht nur `Compare` laufen lassen. Sie steht im Handover.
+
+**Was das Entwurfsurteil bestätigt:** `AllowOut` bleibt bei den Cmdlets, und der
+Grund ist der wahre — die Option *kann* den ActiveStore lesen (136 aktivierte
+ausgehende Allow-Regeln, wie das Cmdlet, die Richtlinien-Regel mit
+`PolicyStoreSourceType = 2`), spart aber 0,4 s auf einem Aufruf, der in der
+Ruhelast nicht vorkommt, und ist der Verb, bei dem ein Fehler „geschlossen“
+meldet, während Verkehr rausgeht. Die Zuordnungen CIM `0`/`2`/`4`, `Enabled`
+`0`/`1` und `PolicyStoreSourceType` `2` = GroupPolicy sind damit belegt; ebenso
+die Trennung Local/GroupPolicy bei Regeln (ActiveStore 539, PersistentStore 538)
+und dass COM eine Richtlinien-Regel nicht sieht (538 mit und ohne). Die
+Zahlen und das Vorher/Nachher stehen im Handover.
