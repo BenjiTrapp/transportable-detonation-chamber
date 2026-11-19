@@ -2950,7 +2950,7 @@ def test_lists_two_reasons_reach_the_call_log_whole_and_on_one_line(monkeypatch)
     script = _ps1()
     short = re.search(r"Substring\(0, (\d+)\)", _functions(script)["Get-ShortReason"]).group(1)
     listing = _op_case(script, "List")
-    parts = tuple(m.group(1) if m else None for m in (re.search(r'"([^"$]*)\$\(\$profiles\.Fallback\)"', listing),
+    parts = tuple(m.group(1) if m else None for m in (re.search(r'"([^"$]*)\$\(\$profileStates\.Fallback\)"', listing),
                                                         re.search(r"-join '([^']*)'", listing),
                                                         re.search(r'"([^"$]*)\$\(\$read\.Fallback\)"', listing)))
     assert int(short) == rules_mod.MAX_FALLBACK_CHARS and parts == rules_mod.LIST_FALLBACK_PREFIXES, \
@@ -3122,7 +3122,7 @@ def test_the_com_reader_says_what_its_name_is_and_what_breaks_without_the_invari
 def test_compare_checks_the_set_of_rule_names_on_its_own():
     """A rule only one side finds is its own, named difference, checked before and apart from the fields."""
     case = _op_case(_ps1(), "Compare")
-    names = case.index('what = "$way rule names: $name found by one side only"')
+    names = case.index('what = "$way rule names: $ruleName found by one side only"')
     fields = case.index("foreach ($field in @('Name'")
     assert names < fields and case.count("foreach ($way in $fastWays.Keys) {") == 2
     block = case[:fields][case[:fields].rindex("foreach ($way in $fastWays.Keys) {"):]
@@ -3282,12 +3282,12 @@ def test_list_says_the_way_both_its_halves_were_read_and_get_the_way_of_its_rule
     listing = _code_lines(_op_case(script, "List"))
     assert listing == [
         "'List' {",
-        "$profiles = Get-ProfileStates",
+        "$profileStates = Get-ProfileStates",
         "$read = Get-OurRuleViews",
         "$fallbacks = @()",
-        "if ($profiles.Via -ne 'fast') { $fallbacks += \"profiles: $($profiles.Fallback)\" }",
+        "if ($profileStates.Via -ne 'fast') { $fallbacks += \"profiles: $($profileStates.Fallback)\" }",
         "if ($read.Via -ne 'fast') { $fallbacks += \"rules: $($read.Fallback)\" }",
-        "$out = [ordered]@{ profiles = $profiles.Rows; rules = $read.Views; Via = 'fast' }",
+        "$out = [ordered]@{ profiles = $profileStates.Rows; rules = $read.Views; Via = 'fast' }",
         "if ($fallbacks.Count -gt 0) { $out.Via = 'cmdlet'; $out.Fallback = $fallbacks -join '; ' }",
         "ConvertTo-Json -Compress -Depth 5 -InputObject ([pscustomobject]$out)",
     ], listing
@@ -3296,6 +3296,65 @@ def test_list_says_the_way_both_its_halves_were_read_and_get_the_way_of_its_rule
                  "$view | Add-Member -NotePropertyName Via -NotePropertyValue $read.Via",
                  "if ($read.Via -ne 'fast') { $view | Add-Member -NotePropertyName Fallback -NotePropertyValue $read.Fallback }"):
         assert line in get, line
+
+
+def _script_parameters(script):
+    block = re.search(r"^param\((.*?)^\)", script, re.S | re.M)
+    return re.findall(r"\$(\w+)\s*(?=[,=\n])", block.group(1) + "\n"), script[:block.end()].count("\n") + 1
+
+
+def _script_level_lines(script):
+    """(line number, code) of every line after the param() block that is not inside a function: the code that runs in
+    the script's own scope, the scope its parameters live in. Comment lines are left out."""
+    _, last = _script_parameters(script)
+    lines, inside = [], False
+    for number, line in enumerate(script.splitlines(), 1):
+        if number <= last:
+            continue
+        if re.match(r"function [\w-]+ \{", line):
+            inside = True
+        elif inside and line == "}":
+            inside = False
+        elif not inside and line.strip() and not line.strip().startswith("#"):
+            lines.append((number, line.strip()))
+    return lines
+
+
+_WRITES = (re.compile(r"(?<![\w$`])\$(?:(?:script|local|global|private):)?(\w+)\s*(?:[-+*/%]?=(?!=)|\+\+|--)", re.I),
+           re.compile(r"\bforeach\s*\(\s*\$(\w+)\s+in\b", re.I),
+           re.compile(r"-(?:Out|Error|Warning|Information|Pipeline)Variable\s+['\"]?\+?(\w+)", re.I),
+           re.compile(r"\b(?:Set|New)-Variable\s+(?:-Name\s+)?['\"]?(\w+)", re.I))
+
+
+def _variables_written(line):
+    names = [n for pattern in _WRITES for n in pattern.findall(line)]
+    multi = re.match(r"((?:\$\w+\s*,\s*)+\$\w+)\s*=(?!=)", line)
+    return names + (re.findall(r"\$(\w+)", multi.group(1)) if multi else [])
+
+
+def test_no_script_level_assignment_writes_into_a_parameter():
+    """Shipped once: List did `$profiles = Get-ProfileStates`, and every List answered profiles null, Via cmdlet and
+    an empty reason. PowerShell variable names are case-insensitive, and the switch runs in the script's own scope,
+    where the parameters live: so $profiles IS the [string]$Profiles parameter, the assignment rebinds it, [string]
+    coerces the read to its ToString(), and .Rows, .Via and .Fallback are then $null. Inside a function the same name
+    is a fresh local, so functions are exempt. The parameters and the script-level code are both read out of the
+    script, so a parameter added tomorrow is guarded too. (No other test could see this: the others read the script
+    as text and the module's tests answer from canned JSON, so none of them ever runs PowerShell.)"""
+    script = _ps1()
+    params, _ = _script_parameters(script)
+    lines = _script_level_lines(script)
+    assert "Op" in params and len(params) > 1, params
+    assert "switch ($Op) {" in [code for _, code in lines], "the switch must be among the script-level lines"
+    written = {name.lower() for _, code in lines for name in _variables_written(code)}
+    assert {"read", "fallbacks", "out"} <= written, written      # the scanner sees the switch's own assignments
+    collisions = ["line %d: writes into the parameter $%s   ->   %s" % (number, param, code)
+                  for number, code in lines for name in _variables_written(code)
+                  for param in params if name.lower() == param.lower()]
+    assert not collisions, (
+        "\n".join(collisions) + "\nAn assignment at script level (the switch and the code around it, outside any "
+        "function) to a parameter's name, in any case, is not a new local: PowerShell names are case-insensitive and "
+        "this is the parameters' scope, so it rebinds the typed parameter and [string] turns the value into its "
+        "ToString(). Pick a name no parameter has.")
 
 
 def test_a_reason_is_one_short_line_in_the_rule_reads_and_in_compare_alike():
@@ -3543,7 +3602,7 @@ def test_every_other_caller_takes_the_rows_and_the_writing_verbs_keep_the_cmdlet
             assert value.strip().endswith(".Rows"), (verb, value)
     for verb in ("Create", "Cut", "SetDefaultOutbound", "AllowOut"):
         assert "(Get-ProfileStates -CmdletsOnly).Rows" in _op_case(script, verb), verb
-    assert "$profiles = Get-ProfileStates" in _code_lines(_op_case(script, "List"))
+    assert "$profileStates = Get-ProfileStates" in _code_lines(_op_case(script, "List"))
     for verb in ("Enable", "Remove", "DisableAllowOut", "EnableAllowOut", "RemoveIsolate"):
         assert "ProfileStates" not in _op_case(script, verb), verb
 

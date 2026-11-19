@@ -602,13 +602,13 @@ try {
                 $differences += [pscustomobject]@{ what = 'profiles'; fast = "error: $(Get-ShortReason $_)"; cmdlet = 'read' }
             }
             if ($profilesRead) {
-                foreach ($name in @(@($AllProfiles) + @($cmdletProfiles.Keys) + @($fastProfiles.Keys) | Select-Object -Unique)) {
+                foreach ($profileName in @(@($AllProfiles) + @($cmdletProfiles.Keys) + @($fastProfiles.Keys) | Select-Object -Unique)) {
                     foreach ($field in @('Enabled', 'DefaultOutboundAction', 'Configured')) {
                         $checked.profiles += 1
-                        $a = $fastProfiles[$name].$field
-                        $b = $cmdletProfiles[$name].$field
+                        $a = $fastProfiles[$profileName].$field
+                        $b = $cmdletProfiles[$profileName].$field
                         if (-not (Test-SameValue $a $b)) {
-                            $differences += [pscustomobject]@{ what = "profile $name $field"; fast = $a; cmdlet = $b }
+                            $differences += [pscustomobject]@{ what = "profile $profileName $field"; fast = $a; cmdlet = $b }
                         }
                     }
                 }
@@ -635,8 +635,8 @@ try {
             $ruleNames = @($cmdletRules.Keys)
             try {
                 foreach ($view in @(Read-FastRuleViews)) { $fastWays.List[[string]$view.Name] = $view }
-                foreach ($name in @(@($fastWays.List.Keys) + @($cmdletRules.Keys) | Sort-Object -Unique)) {
-                    foreach ($view in @(Read-FastRuleViews -RuleName $name)) { $fastWays.Get[$name] = $view }
+                foreach ($ruleName in @(@($fastWays.List.Keys) + @($cmdletRules.Keys) | Sort-Object -Unique)) {
+                    foreach ($view in @(Read-FastRuleViews -RuleName $ruleName)) { $fastWays.Get[$ruleName] = $view }
                 }
             } catch {
                 $rulesRead = $false
@@ -648,13 +648,13 @@ try {
                 # the same rules only while TDC writes DisplayName = Name (see Read-FastRuleViews). A rule found by
                 # one side only is said, with the side that found it.
                 foreach ($way in $fastWays.Keys) {
-                    foreach ($name in $ruleNames) {
+                    foreach ($ruleName in $ruleNames) {
                         $checked.names += 1
-                        $inFast = $fastWays[$way].ContainsKey($name)
-                        $inCmdlet = $cmdletRules.ContainsKey($name)
+                        $inFast = $fastWays[$way].ContainsKey($ruleName)
+                        $inCmdlet = $cmdletRules.ContainsKey($ruleName)
                         if ($inFast -ne $inCmdlet) {
                             $differences += [pscustomobject]@{
-                                what = "$way rule names: $name found by one side only"
+                                what = "$way rule names: $ruleName found by one side only"
                                 fast = $(if ($inFast) { 'found' } else { 'not found' })
                                 cmdlet = $(if ($inCmdlet) { 'found' } else { 'not found' })
                             }
@@ -664,14 +664,14 @@ try {
                 # Then every field of every rule both sides found.
                 foreach ($way in $fastWays.Keys) {
                     $fastRules = $fastWays[$way]
-                    foreach ($name in $ruleNames) {
-                        if (-not ($fastRules.ContainsKey($name) -and $cmdletRules.ContainsKey($name))) { continue }
+                    foreach ($ruleName in $ruleNames) {
+                        if (-not ($fastRules.ContainsKey($ruleName) -and $cmdletRules.ContainsKey($ruleName))) { continue }
                         foreach ($field in @('Name', 'Enabled', 'Action', 'Direction', 'Profile', 'Program', 'RemoteAddress', 'RemotePort', 'Protocol')) {
                             $checked.fields += 1
-                            $a = $fastRules[$name].$field
-                            $b = $cmdletRules[$name].$field
+                            $a = $fastRules[$ruleName].$field
+                            $b = $cmdletRules[$ruleName].$field
                             if (-not (Test-SameValue $a $b)) {
-                                $differences += [pscustomobject]@{ what = "$way rule $name $field"; fast = $a; cmdlet = $b }
+                                $differences += [pscustomobject]@{ what = "$way rule $ruleName $field"; fast = $a; cmdlet = $b }
                             }
                         }
                     }
@@ -687,14 +687,16 @@ try {
             Set-NetFirewallProfile -Profile $AllProfiles -Enabled True
         }
         'List' {
-            $profiles = Get-ProfileStates
+            # Not $profiles: this is script scope, where that name is the [string]$Profiles parameter (PowerShell
+            # names are case-insensitive), and assigning to it would coerce the read to a string.
+            $profileStates = Get-ProfileStates
             $read = Get-OurRuleViews
             # Via is fast only when both halves were. Fallback names every half that fell back, each with its own reason
             # (already one line of at most 200 characters), joined by "; " so that both stay readable on one line.
             $fallbacks = @()
-            if ($profiles.Via -ne 'fast') { $fallbacks += "profiles: $($profiles.Fallback)" }
+            if ($profileStates.Via -ne 'fast') { $fallbacks += "profiles: $($profileStates.Fallback)" }
             if ($read.Via -ne 'fast') { $fallbacks += "rules: $($read.Fallback)" }
-            $out = [ordered]@{ profiles = $profiles.Rows; rules = $read.Views; Via = 'fast' }
+            $out = [ordered]@{ profiles = $profileStates.Rows; rules = $read.Views; Via = 'fast' }
             if ($fallbacks.Count -gt 0) { $out.Via = 'cmdlet'; $out.Fallback = $fallbacks -join '; ' }
             ConvertTo-Json -Compress -Depth 5 -InputObject ([pscustomobject]$out)
         }
