@@ -1121,6 +1121,9 @@ class RizinSession:
         self._emulation_before = self._emulation_after = None
         self._emulation_big_endian = False
         self._emulation_stack_map = None
+        # The byte addresses this session wrote through patch/patch_op. rizin has one write cache, which
+        # holds an emulation run's writes too and cannot tell them apart; this set can (see patches).
+        self._mine = set()
         self._pipe, contained, level, mode, note = self._boot()
         try:
             self._read_file_info()
@@ -1490,15 +1493,119 @@ class RizinSession:
                 if isinstance(b, dict) and isinstance(b.get("addr"), int) and not isinstance(b["addr"], bool)]
         return sorted(rows, key=lambda b: b["addr"])
 
+    def patch(self, addr, data, wait=2.0):
+        """Write ``data`` (bytes, or an even number of hex digits) at ``addr`` into rizin's write cache
+        and return {"patches": the list}.
+
+        The file on disk is never written: rizin runs without -w, and wci and wc+, which commit the
+        cache, are refused everywhere. io.cache is switched on first (an analyst patches before ever
+        stepping, so there need be no emulation) and read back: without it rizin loses the write and
+        says so on stderr only, which cmd does not read, and px would go on showing the original bytes.
+        """
+        addr = _address(addr)
+        try:
+            data = rizin_emulation.hex_data(data)
+        except ValueError as e:
+            raise RizinRefused(str(e)) from None
+
+        def run(pipe):
+            return self._patch_write(pipe, addr, data)
+
+        return self._call("emulation", wait, run)
+
+    def patch_op(self, addr, kind, wait=2.0):
+        """Patch the instruction at ``addr`` one of rizin_emulation.PATCH_KINDS' ways (nop, flip, always,
+        nocall): the bytes are computed from what ``pdj`` decoded there, nothing is assembled. Returns
+        {"patches": the list}.
+
+        x86 only: all four kinds are x86 encodings (0x90 is a nop here and nowhere else), so on another
+        arch the kind is refused instead of writing bytes that mean something else.
+        """
+        addr = _address(addr)
+        if not isinstance(kind, str) or kind not in rizin_emulation.PATCH_KINDS:
+            raise RizinRefused("kind must be one of " + ", ".join(rizin_emulation.PATCH_KINDS))
+        if self.arch != "x86":
+            raise RizinRefused(f"the patch kinds write x86 bytes, and this file is "
+                               f"{self.arch or 'of an arch rizin did not name'}: write the bytes by hand")
+
+        def run(pipe):
+            op = rizin_emulation.instruction_at(pipe.cmdj(f"pdj 1 @ {addr:#x}"), addr)
+            if op is None:
+                raise RizinRefused(f"rizin decoded no instruction at {addr:#x}")
+            try:
+                data = rizin_emulation.patch_bytes(kind, op)
+            except ValueError as e:
+                raise RizinRefused(str(e)) from None
+            return self._patch_write(pipe, addr, data)
+
+        return self._call("emulation", wait, run)
+
+    def patches(self, wait=2.0):
+        """What rizin's write cache holds (``wcj``), lowest address first: [{"addr", "size", "before",
+        "after", "mine"}].
+
+        One row per write operation, not per byte: a two-byte ``wx`` is one row of size 2, and a second
+        write over the same address is another row whose ``before`` is what the first one wrote
+        (measured). ``mine`` is this session's own patch, as against what an emulation run wrote into
+        the same cache. rizin's own ``idx`` and ``written`` are left out: the index changes with every
+        removal, and nothing here ever commits the cache, so ``written`` is always false.
+        """
+        return self._call("emulation", wait, self._patch_list)
+
+    def unpatch(self, addr=None, wait=2.0):
+        """Take the write at ``addr`` back (``wc-``), or the whole cache (``wc-*``) when ``addr`` is
+        None; returns {"patches": the list}. Taking back where there is nothing is no error.
+
+        ``wc-*`` takes an emulation run's bytes with it, because rizin has one cache for both; the list
+        says which of them are this session's own.
+        """
+        if addr is not None:
+            addr = _address(addr)
+
+        def run(pipe):
+            if addr is None:
+                pipe.cmd("wc-*")
+                self._mine = set()
+            else:
+                # The range, not the address: `wc- <addr>` with no second argument drops every write in
+                # a whole block (0x100 bytes) from there, the neighbours' included (measured).
+                pipe.cmd(f"wc- {addr:#x} {addr + 1:#x}")
+            found = self._patch_list(pipe)
+            if addr is not None and any(r["addr"] <= addr < r["addr"] + r["size"] for r in found):
+                raise RizinRefused(f"rizin kept the patch at {addr:#x}")
+            return {"patches": found}
+
+        return self._call("emulation", wait, run)
+
+    def _patch_write(self, pipe, addr, data):
+        """``wx`` of ``data`` at ``addr`` through the cache (gate held); {"patches": the list}."""
+        if self._emulation is not pipe:
+            pipe.cmd("e io.cache=true")  # the emulation's start sets it too, but a patch needs no start
+        self._require_io_cache(pipe, "the patch")
+        pipe.cmd(f"wx {data.hex()} @ {addr:#x}")
+        self._mine |= set(range(addr, addr + len(data)))
+        found = self._patch_list(pipe)
+        if not any(r["addr"] <= addr < r["addr"] + r["size"] for r in found):
+            raise RizinRefused(f"rizin wrote nothing at {addr:#x}")
+        return {"patches": found}
+
+    def _patch_list(self, pipe):
+        """The write cache as the patch list (gate held), and this session's own addresses kept honest:
+        an address no write operation holds any more (a console ``wc-``, a rizin that was restarted) is
+        dropped from the set, so that what a run writes there later is not taken for a patch."""
+        rows = rizin_emulation.parse_cache(pipe.cmd("wcj"))
+        self._mine = rizin_emulation.cache_covers(rows, self._mine)
+        return rizin_emulation.patch_rows(rows, self._mine)
+
     def _require_emulation(self, pipe):
         # A rizin that was restarted (a hung analysis step) has no emulation, whatever ran before.
         if self._emulation is not pipe:
             raise RizinRefused("the emulation is not started")
 
     @staticmethod
-    def _require_io_cache(pipe):
+    def _require_io_cache(pipe, what="the emulation's writes"):
         if pipe.cmd("e io.cache").strip() != "true":
-            raise RizinRefused("io.cache could not be switched on: the emulation's writes would be lost")
+            raise RizinRefused(f"io.cache could not be switched on: {what} would be lost")
 
     def _emulation_read(self, pipe):
         """The state (gate held). ``changed``: the registers that differ from before the last change of

@@ -44,6 +44,10 @@ reads the stack, ``omlj`` lists it with the file's maps. ``fd`` describes the
 closest flag below an address, ``fd.j`` lists the flags at it; like rizin's
 aei, an armed VM has a flag per register at its value.
 
+The write cache (``wx``, ``wcj``, ``wc-``, ``wc-*``; see write_cache) holds
+the patches *and* what the emulation writes, as rizin's one cache does, and
+every read of a byte goes through it. Without ``io.cache`` a write is lost.
+
 Stepping moves the PC through the code model below: a call pushes its return address and goes to its target
 (an indirect call goes to 0, where nothing is mapped: the callee is read from memory), a ret pops, a jmp
 follows, a conditional jmp falls through (no flags). ``aes`` is one op, ``aeso`` runs a call to its return,
@@ -102,8 +106,9 @@ MAPS = [{"map": i + 1, "fd": fd, "delta": delta, "from": start, "to": end,
             (3, 0x3400, 0x140009000, MAPPED_END, "fmap..idata")))]
 
 
-def _op(offset, size, text, kind, jump=None, fail=None, ptr=None):
-    op = {"offset": offset, "size": size, "opcode": text, "disasm": text, "bytes": "90" * size, "type": kind}
+def _op(offset, size, text, kind, jump=None, fail=None, ptr=None, data=None):
+    op = {"offset": offset, "size": size, "opcode": text, "disasm": text, "type": kind,
+          "bytes": data if data else "90" * size}
     for key, value in (("jump", jump), ("fail", fail), ("ptr", ptr)):
         if value is not None:
             op[key] = value
@@ -154,8 +159,15 @@ BLOCKS = {
                _op(0x14000164B, 5, "jmp sym.watchdog", "jmp", jump=0x140001490)),
     ],
 }
-# Code outside every function (a thunk).
-LOOSE_OPS = [_op(0x140003098, 6, "jmp qword [sym.imp.KERNEL32.dll_CreateNamedPipeA]", "ijmp", ptr=PIPE),
+# Code outside every function: a check whose bytes are the real x86 encodings (each one checked with
+# rz-asm -d -a x86 -b 64 at its address), so the patch kinds have an instruction to work on, and a thunk.
+LOOSE_OPS = [_op(0x140003080, 3, "cmp eax, 0x01", "cmp", data="83f801"),
+             _op(0x140003083, 2, "jz 0x140003090", "cjmp", jump=0x140003090, fail=0x140003085, data="740b"),
+             _op(0x140003085, 6, "jnz 0x140003097", "cjmp", jump=0x140003097, fail=0x14000308B,
+                 data="0f850c000000"),
+             _op(0x14000308B, 5, "call sym.watchdog", "call", jump=0x140001490, fail=0x140003090,
+                 data="e800e4ffff"),
+             _op(0x140003098, 6, "jmp qword [sym.imp.KERNEL32.dll_CreateNamedPipeA]", "ijmp", ptr=PIPE),
              _op(0x14000309E, 1, "int3", "trap")]
 XREFS = [{"from": src, "to": dst, "type": kind} for src, dst, kind in (
     (0x140001444, 0x1400014B7, "CALL"),
@@ -200,6 +212,7 @@ CODE = [
 ]
 
 state = {"seek": 0x140001440, "names": {}, "comments": {}, "prj": "", "dwarf": False, "hints": {}, "bps": {},
+         "cache": [],
          "config": {"asm.arch": "x86", "analysis.arch": "x86", "bin.lang": "c", "analysis.autoname": "false",
                     "analysis.apply.signature": "true", "analysis.calls": "false",
                     "scr.color": "0", "scr.pager": "", "scr.interactive": "false",
@@ -304,6 +317,9 @@ def linear(addr, count):
 
 
 def byte_at(addr):
+    for entry in reversed(state["cache"]):  # the cache sits above every map: the newest write wins
+        if entry["addr"] <= addr < entry["addr"] + entry["size"]:
+            return bytes.fromhex(entry["after"])[addr - entry["addr"]]
     stack = esil["stack"]
     if stack and stack[0] <= addr < stack[0] + len(stack[1]):
         return stack[1][addr - stack[0]]
@@ -311,6 +327,62 @@ def byte_at(addr):
         return 0xFF  # like rizin's io.unalloc
     i = addr - BASE
     return IMAGE[i] if i < len(IMAGE) else 0
+
+
+def cache_write(addr, data, shown=None):
+    """A write through rizin's write cache. Without io.cache it is lost, and rizin says so on stderr
+    only (measured: "ERROR: Could not write hexpair '9090' at e"), which the server's cmd never reads:
+    that is why the server sets io.cache and reads it back itself. UT64_MAX is refused outright
+    (measured: rz_core_write_at asserts addr != UT64_MAX and writes nothing)."""
+    if addr == 2 ** 64 - 1:
+        err("WARNING: rz_core_write_at: assertion 'core && buf && addr != UT64_MAX' failed "
+            "(line 153); returning false\n")
+        err(f"ERROR: Could not write hexpair '{shown or data.hex()}' at {addr:x}\n")
+        return
+    if state["config"].get("io.cache") != "true":
+        err(f"ERROR: Could not write hexpair '{shown or data.hex()}' at {addr:x}\n")
+        return
+    before = bytes(byte_at(addr + i) for i in range(len(data)))
+    state["cache"].append({"addr": addr, "size": len(data), "before": before.hex(), "after": data.hex()})
+
+
+def write_cache(word, rest, seek):
+    """``wx <hex>``, ``wcj``, ``wc- [<from> [<to>]]`` and ``wc-*``, measured on rizin 0.9.1.
+
+    One entry per write operation (a two-byte ``wx`` is one entry of size 2, four single-byte writes are
+    four entries), and a second write over the same address is another entry whose "before" is what the
+    first one wrote. ``wcj`` prints the entries comma separated **without** the brackets of an array,
+    and nothing at all for an empty cache. ``wc-`` drops every entry that overlaps [from, to); without
+    a ``to`` the range is one block (0x100) from ``from``, and without arguments it starts at the seek,
+    so taking exactly one entry back needs an explicit range.
+    """
+    cache = state["cache"]
+    if word == "wcj":
+        return ",".join(json.dumps({"idx": i, "addr": e["addr"], "size": e["size"], "before": e["before"],
+                                    "after": e["after"], "written": False})
+                        for i, e in enumerate(cache)) + "\n"
+    if word == "wc-*":
+        del cache[:]
+        return ""
+    if word == "wc-":
+        args = rest.split()
+        start = number(args[0]) if args else seek
+        if start is None:
+            err(f"ERROR: core: Invalid address ({args[0]})\n")
+            return ""
+        end = number(args[1]) if len(args) > 1 else start + 0x100
+        state["cache"] = [e for e in cache if e["addr"] + e["size"] <= start or e["addr"] >= end]
+        return ""
+    data = rest.strip()
+    try:
+        written = bytes.fromhex(data)
+    except ValueError:
+        written = b""
+    if not written:
+        err(f"ERROR: Could not write hexpair '{data}' at {seek:x}\n")
+        return ""
+    cache_write(seek, written, data)
+    return ""
 
 
 def esil_map_stack(args):
@@ -358,15 +430,18 @@ def esil_push(value):
     regs[ROLES["SP"]] = (regs[ROLES["SP"]] - word) % 2 ** BITS
     at = regs[ROLES["SP"]] - base
     if 0 <= at <= len(memory) - word:
-        memory[at:at + word] = value.to_bytes(word, "little")
+        # like rizin: what the emulation writes goes through the write cache, the one the patches use too
+        cache_write(regs[ROLES["SP"]], value.to_bytes(word, "little"))
 
 
 def esil_pop():
     regs, (base, memory, _name) = esil["regs"], esil["stack"]
     word = BITS // 8
-    at = regs[ROLES["SP"]] - base
-    value = int.from_bytes(memory[at:at + word], "little") if 0 <= at <= len(memory) - word else 0
-    regs[ROLES["SP"]] = (regs[ROLES["SP"]] + word) % 2 ** BITS
+    sp = regs[ROLES["SP"]]
+    at = sp - base
+    value = int.from_bytes(bytes(byte_at(sp + i) for i in range(word)), "little") \
+        if 0 <= at <= len(memory) - word else 0
+    regs[ROLES["SP"]] = (sp + word) % 2 ** BITS
     return value
 
 
@@ -819,6 +894,8 @@ def answer(cmd):
             err("ERROR: Wrong number of arguments passed to `db`, see its help with `db?`\n")
             return ""
         return esil_breakpoints(word, seek)
+    if word in ("wx", "wcj", "wc-", "wc-*"):
+        return write_cache(word, rest, seek)
     stepped = esil_command(word, rest, seek)
     if stepped is not None:
         return stepped

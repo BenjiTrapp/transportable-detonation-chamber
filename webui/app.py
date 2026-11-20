@@ -5767,6 +5767,29 @@ def _rizin_breakpoint_clear(session):
     return session.breakpoint_clear(None if addr is None else _rizin_address(addr))
 
 
+def _rizin_patch(session):
+    """POST: addr, plus either bytes (hex digits) or kind (one of the four patch kinds)."""
+    body = _rizin_body()
+    addr = _rizin_address(body.get("addr"))
+    data, kind = body.get("bytes"), body.get("kind")
+    if (data is None) == (kind is None):
+        raise rizin_sessions.RizinRefused("a patch takes bytes or kind, not both and not neither")
+    try:
+        return session.patch(addr, data) if kind is None else session.patch_op(addr, kind)
+    finally:
+        _rizin_forget(session)  # patched bytes: the strings, imports, flags and functions are stale
+
+
+def _rizin_unpatch(session):
+    """DELETE: addr takes that patch back; a request without one (an empty object, or no body) the whole
+    cache, an emulation run's bytes included (rizin has one)."""
+    addr = _rizin_body(optional=True).get("addr")
+    try:
+        return session.unpatch(None if addr is None else _rizin_address(addr))
+    finally:
+        _rizin_forget(session)
+
+
 def _rizin_listable(path):
     try:
         return _readable(path) and os.path.isfile(path) and os.path.getsize(path) > 0
@@ -6064,6 +6087,22 @@ def api_rizin_breakpoint_set(sid):
 @app.route("/api/rizin/<sid>/breakpoints", methods=["DELETE"])
 def api_rizin_breakpoint_clear(sid):
     return _rizin_call(sid, _rizin_breakpoint_clear)
+
+
+@app.route("/api/rizin/<sid>/patches")
+def api_rizin_patches(sid):
+    """What rizin's write cache holds, lowest address first; `mine` tells a patch from a run's bytes."""
+    return _rizin_call(sid, lambda session: session.patches())
+
+
+@app.route("/api/rizin/<sid>/patch", methods=["POST"])
+def api_rizin_patch(sid):
+    return _rizin_call(sid, _rizin_patch)
+
+
+@app.route("/api/rizin/<sid>/patch", methods=["DELETE"])
+def api_rizin_unpatch(sid):
+    return _rizin_call(sid, _rizin_unpatch)
 
 
 # --- ThreatCheck / DefenderCheck Integration ---

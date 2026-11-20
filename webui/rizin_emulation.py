@@ -4,6 +4,7 @@ rizin_sessions runs the commands; what their answers mean is decided here, where
 wrong value would silently show a wrong register, stack word or pointer.
 """
 
+import json
 import re
 
 # One line of ``ar``: "rax = 0x0000000000000041" (rizin 0.9.1 pads the value to the register's width).
@@ -173,3 +174,162 @@ def next_call_stop(ops, pc):
             return "branch", op["offset"]
         end = op["offset"] + op["size"]
     return "more", end
+
+
+# --- Patching: the bytes, and the write cache's list ------------------------
+
+MAX_PATCH_BYTES = 4096
+
+# x86's conditional jumps and their opposites, for "flip". Both forms: 7x rel8 (two bytes) and 0f 8x rel32
+# (six). In each pair the even opcode is the condition and the odd one its negation, which is why the table
+# is built rather than written out; all 32 checked with rz-asm (-d -a x86 -b 64): 70 is "jo", 71 "jno",
+# 74 "jz", 75 "jnz" ... 7f "jnle", and 0f80..0f8f the same conditions with a 32-bit displacement.
+JUMP_PAIRS = {}
+for _base, _prefix in ((0x70, ""), (0x80, "0f")):
+    for _opcode in range(_base, _base + 0x10, 2):
+        JUMP_PAIRS[f"{_prefix}{_opcode:02x}"] = f"{_prefix}{_opcode + 1:02x}"
+        JUMP_PAIRS[f"{_prefix}{_opcode + 1:02x}"] = f"{_prefix}{_opcode:02x}"
+del _base, _prefix, _opcode
+
+PATCH_KINDS = ("nop", "flip", "always", "nocall")
+_HEX_RE = re.compile(r"(?:[0-9a-fA-F]{2})+")
+
+
+def hex_data(value):
+    """The bytes of a patch from a request: ``value`` is already bytes, or an even-length string of hex
+    digits (nothing else, so a command cannot hide in it); at most MAX_PATCH_BYTES of them."""
+    if isinstance(value, (bytes, bytearray)):
+        data = bytes(value)
+    elif isinstance(value, str) and _HEX_RE.fullmatch(value.strip()):
+        data = bytes.fromhex(value.strip())
+    else:
+        raise ValueError("bytes must be an even number of hex digits, like 9090")
+    if not data:
+        raise ValueError("bytes must hold at least one byte")
+    if len(data) > MAX_PATCH_BYTES:
+        raise ValueError(f"bytes must be at most {MAX_PATCH_BYTES} bytes")
+    return data
+
+
+def instruction_at(ops, addr):
+    """The op of ``pdj``'s answer that starts at ``addr``, None where rizin decoded none (past its block
+    it answers an op whose address is none)."""
+    for op in ops if isinstance(ops, list) else []:
+        if (isinstance(op, dict) and op.get("offset") == addr and isinstance(op.get("size"), int)
+                and op["size"] > 0):
+            return op
+    return None
+
+
+def _mnemonic(op):
+    """What to call the instruction in a refusal. rizin 0.9.1's pdj has no "mnemonic" (measured: it has
+    "opcode" and "disasm"), so the first word of those stands in, and the type where there is neither."""
+    for key in ("mnemonic", "opcode", "disasm"):
+        text = op.get(key)
+        if isinstance(text, str) and text.strip():
+            return text.strip().split(" ")[0]
+    kind = op.get("type")
+    return kind if isinstance(kind, str) and kind else "that instruction"
+
+
+def _conditional_jump(data):
+    """(opcode, displacement) of a conditional jump in one of x86's two forms, 7x rel8 and 0f 8x rel32;
+    None for anything else, among them a prefixed form, the rel16 form, loop and jrcxz, whose bytes this
+    cannot rewrite without changing where the jump goes."""
+    for width, length in ((1, 2), (2, 6)):
+        opcode = data[:width].hex()
+        if len(data) == length and opcode in JUMP_PAIRS:
+            return opcode, data[width:]
+    return None
+
+
+def patch_bytes(kind, op):
+    """The bytes one of the four patch kinds writes over the instruction ``op`` (one op as ``pdj`` gives
+    it: size, bytes, type). x86 only, because a nop is 0x90 here and nowhere else.
+
+    "nop" fills the instruction with nops, "nocall" does the same to a call, "flip" turns a conditional
+    jump into its opposite (JUMP_PAIRS) and "always" into an unconditional one that goes to the same
+    place: eb for the short form, e9 for the near one, which is a byte shorter, so its displacement
+    counts from a byte earlier and goes up by one, with a nop filling the length.
+
+    Raises ValueError, with a reason the route turns into a refusal, where the kind does not apply.
+    """
+    if kind not in PATCH_KINDS:
+        raise ValueError("kind must be one of " + ", ".join(PATCH_KINDS))
+    size = op.get("size")
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0 or op.get("type") in ("invalid", "null"):
+        raise ValueError("rizin decoded no instruction there")
+    try:
+        data = hex_data(op.get("bytes"))
+    except ValueError:
+        raise ValueError("rizin gave no bytes for the instruction there") from None
+    if len(data) != size:
+        raise ValueError("rizin's bytes for the instruction are not as long as it says")
+    name = _mnemonic(op)
+    if kind == "nop":
+        return b"\x90" * size
+    if kind == "nocall":
+        if not is_call(op.get("type")):
+            raise ValueError(f"'{name}' is no call")
+        return b"\x90" * size
+    found = _conditional_jump(data) if op.get("type") == "cjmp" else None
+    if found is None:
+        raise ValueError(f"'{name}' is no x86 conditional jump of the forms 7x rel8 or 0f 8x rel32")
+    opcode, displacement = found
+    if kind == "flip":
+        return bytes.fromhex(JUMP_PAIRS[opcode]) + displacement
+    if len(opcode) == 2:  # 7x rel8 -> eb rel8: the same length, so the same displacement
+        return b"\xeb" + displacement
+    moved = int.from_bytes(displacement, "little") + 1
+    if moved == 2 ** 31:  # the one displacement where the byte saved turns the jump around
+        raise ValueError(f"'{name}' jumps as far as a jump can: making it unconditional would move it")
+    return b"\xe9" + (moved % 2 ** 32).to_bytes(4, "little") + b"\x90"
+
+
+def parse_cache(text):
+    """``wcj``'s write operations: [{"addr", "size", "before", "after"}], in rizin's order (a later write
+    over the same address comes after the one it covers).
+
+    rizin 0.9.1 prints one object per operation, comma separated and **without** the brackets of an array
+    (measured), so the answer is not JSON as it stands; an empty cache prints nothing at all. Anything
+    else raises ValueError, as a view does for a list rizin answered in a shape nobody knows.
+    """
+    text = text.strip()
+    if not text:
+        return []
+    try:
+        found = json.loads(text if text.startswith("[") else "[" + text + "]")
+    except ValueError:
+        raise ValueError("wcj did not answer the write cache") from None
+    rows = []
+    for row in found if isinstance(found, list) else []:
+        if not (isinstance(row, dict) and isinstance(row.get("addr"), int) and not isinstance(row["addr"], bool)
+                and isinstance(row.get("size"), int) and not isinstance(row["size"], bool)
+                and isinstance(row.get("before"), str) and isinstance(row.get("after"), str)):
+            raise ValueError("wcj did not answer the write cache")
+        rows.append({"addr": row["addr"], "size": row["size"], "before": row["before"], "after": row["after"]})
+    return rows
+
+
+def cache_covers(rows, addresses):
+    """Those of ``addresses`` that a write operation of ``rows`` still holds: what a session may go on
+    calling its own after a wc- somewhere else took entries out of the cache."""
+    kept = set()
+    for row in rows:
+        start, end = row["addr"], row["addr"] + row["size"]
+        # whichever side is smaller: a run can leave millions of rows, a session's own writes are few
+        if row["size"] > len(addresses):
+            kept.update(addr for addr in addresses if start <= addr < end)
+        else:
+            kept.update(addr for addr in range(start, end) if addr in addresses)
+    return kept
+
+
+def patch_rows(rows, mine):
+    """``parse_cache``'s rows as the patch list, lowest address first: each with "mine", whether every
+    byte of that write came from this session (the addresses in ``mine``) rather than from an emulation
+    run, which writes into the same cache. rizin's order is kept where two writes sit at one address."""
+    marked = [dict(row, mine=row["size"] <= len(mine)
+                   and all(addr in mine for addr in range(row["addr"], row["addr"] + row["size"])))
+              for row in rows]
+    return sorted(marked, key=lambda row: row["addr"])

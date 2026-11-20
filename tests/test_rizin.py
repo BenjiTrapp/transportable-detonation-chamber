@@ -3187,6 +3187,277 @@ def test_breakpoints_say_the_session_ended_rather_than_fail(rz):
         assert response.status_code == 404 and response.get_json()["error"] == "session ended"
 
 
+# --- Patching (webui/rizin_sessions.py's patch, patch_op, patches, unpatch) --
+
+# The fake's check outside every function, with the x86 encodings the four buttons work on:
+# cmp eax, 1 / jz (short) / jnz (near) / call sym.watchdog.
+CHECK_CMP, CHECK_JZ, CHECK_JNZ, CHECK_CALL = 0x140003080, 0x140003083, 0x140003085, 0x14000308B
+
+
+def _patch(rz, sid, **body):
+    return rz.send(f"/api/rizin/{sid}/patch", body)
+
+
+def _patches(rz, sid):
+    return rz.read(f"/api/rizin/{sid}/patches")
+
+
+def test_patch_writes_through_the_cache_and_lists_before_and_after(rz):
+    sid = rz.session()
+    before = rz.read(f"/api/rizin/{sid}/hex?addr=0x140001440&len=2")["bytes"]
+    rz.post(f"/api/rizin/{sid}/patch", {"addr": "0x140001440", "bytes": "9090"})
+    assert any(c.startswith("wx 9090 @ 0x140001440") for c in rz.commands())
+    rows = _patches(rz, sid)
+    # one row per write operation, not per byte (measured: wx 9090 gives {"size": 2, "after": "9090"})
+    assert rows == [{"addr": 0x140001440, "size": 2, "before": bytes(before).hex(),
+                     "after": "9090", "mine": True}]
+    assert all(r["mine"] is True for r in rows)
+    # and the bytes rizin shows are the patched ones: HEX and DISASSEMBLY read through the cache
+    assert rz.read(f"/api/rizin/{sid}/hex?addr=0x140001440&len=2")["bytes"] == [0x90, 0x90]
+
+
+def test_a_run_s_bytes_are_in_the_list_but_not_mine(rz):
+    sid = rz.session()
+    # at 0x140001444 stands `call sym.main`: the step pushes its return address, which rizin's one
+    # write cache holds just like a patch (measured: one row of size 8 at rsp-8)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001444"})
+    rz.post(f"/api/rizin/{sid}/patch", {"addr": "0x140001440", "bytes": "90"})
+    _run(rz, sid, "step")
+    rows = {r["addr"]: r["mine"] for r in _patches(rz, sid)}
+    assert rows[0x140001440] is True
+    assert any(mine is False for mine in rows.values())
+    assert len(rows) == 2
+
+
+def test_unpatch_takes_one_back_and_all_back(rz):
+    sid = rz.session()
+    rz.post(f"/api/rizin/{sid}/patch", {"addr": "0x140001440", "bytes": "90"})
+    rz.post(f"/api/rizin/{sid}/patch", {"addr": "0x140001450", "bytes": "90"})
+    rz.delete(f"/api/rizin/{sid}/patch", {"addr": "0x140001440"})
+    assert [r["addr"] for r in _patches(rz, sid)] == [0x140001450]
+    # the range, not the address: rizin's `wc- <addr>` drops a whole block of the cache (measured)
+    assert "wc- 0x140001440 0x140001441" in rz.commands()
+    rz.delete(f"/api/rizin/{sid}/patch", {})
+    assert _patches(rz, sid) == []
+    assert "wc-*" in rz.commands()
+    assert rz.read(f"/api/rizin/{sid}/hex?addr=0x140001440&len=1")["bytes"] != [0x90]
+
+
+def test_patch_refuses_what_is_not_bytes(rz):
+    sid = rz.session()
+    mark = len(rz.commands())
+    for body in ({"addr": "0x140001440", "bytes": "9"}, {"addr": "0x140001440", "bytes": "zz"},
+                 {"addr": "0x140001440", "bytes": "90" * 4097}, {"addr": "0x140001440"},
+                 {"addr": "0x140001440", "bytes": "9090", "kind": "nop"},
+                 {"addr": "0x140001440", "bytes": 144}, {"bytes": "90"},
+                 {"addr": "main", "bytes": "90"}, {"addr": -1, "bytes": "90"}):
+        response = rz.post(f"/api/rizin/{sid}/patch", body)
+        answer = response.get_json()
+        assert response.status_code == 400 and "refused" in answer, body
+    for body in (None, [], "wx 90"):
+        assert rz.post(f"/api/rizin/{sid}/patch", body).status_code == 400, body
+    for body in ([], "wx 90"):  # a DELETE of a null body is one without a body: that means all of them
+        assert rz.delete(f"/api/rizin/{sid}/patch", body).status_code == 400, body
+    assert not any(c.startswith(("wx", "wc-")) for c in _commands_since(rz, mark))
+    assert _patches(rz, sid) == []
+
+
+def test_patching_works_without_a_running_emulation(rz):
+    """An analyst neutralises a check before ever stepping: the patch switches io.cache on itself,
+    because without it rizin loses the write ("Could not write hexpair" on stderr, which cmd never reads)."""
+    sid = rz.session()
+    mark = len(rz.commands())
+    _patch(rz, sid, addr=CHECK_CALL, bytes="90" * 5)
+    sent = _commands_since(rz, mark)
+    cache = [i for i, c in enumerate(sent) if "io.cache=true" in c]
+    write = [i for i, c in enumerate(sent) if c.startswith("wx ")]
+    assert cache and write and cache[0] < write[0], sent
+    assert not any(c.startswith(("aei", "aeim", "aepc")) for c in sent), "no emulation was started"
+    assert [r["after"] for r in _patches(rz, sid)] == ["9090909090"]
+
+
+def test_a_patch_is_refused_when_io_cache_did_not_take(rz, monkeypatch):
+    # Without io.cache the write is lost and px keeps showing the original: refused, not answered as done.
+    monkeypatch.setenv("FAKE_RIZIN_NO_IO_CACHE", "1")
+    sid = rz.session()
+    mark = len(rz.commands())
+    response = rz.post(f"/api/rizin/{sid}/patch", {"addr": "0x140001440", "bytes": "90"})
+    assert response.status_code == 400 and "io.cache" in response.get_json()["refused"]
+    assert not any(c.startswith("wx") for c in _commands_since(rz, mark))
+    assert rz.get(f"/api/rizin/{sid}/patches").get_json() == []
+
+
+def test_the_patch_buttons_write_the_bytes_of_the_instruction(rz):
+    """The four kinds over the instruction pdj reports there; every encoding checked with rz-asm."""
+    sid = rz.session()
+    for addr, kind, written in ((CHECK_CMP, "nop", "909090"),
+                                (CHECK_JZ, "flip", "750b"),
+                                (CHECK_JZ, "always", "eb0b"),
+                                (CHECK_JNZ, "flip", "0f840c000000"),
+                                # e9 is a byte shorter, so the displacement goes up by one and a nop fills
+                                (CHECK_JNZ, "always", "e90d00000090"),
+                                (CHECK_CALL, "nocall", "9090909090")):
+        mark = len(rz.commands())
+        answer = _patch(rz, sid, addr=f"{addr:#x}", kind=kind)
+        sent = _commands_since(rz, mark)
+        assert f"pdj 1 @ {addr:#x}" in sent, (kind, sent)
+        assert f"wx {written} @ {addr:#x}" in sent, (kind, sent)
+        assert answer["patches"][-1]["after"] == written
+        rz.delete(f"/api/rizin/{sid}/patch", {})
+    assert not any(c.startswith(("wa", "wci", "wc+")) for c in rz.commands()), "no assembling, no commit"
+
+
+def test_a_patch_kind_that_does_not_apply_is_refused(rz):
+    sid = rz.session()
+    mark = len(rz.commands())
+    for addr, kind in ((CHECK_CALL, "flip"), (CHECK_CALL, "always"), (CHECK_CMP, "nocall"),
+                       (CHECK_JZ, "zap"), (0x140003091, "nop")):  # 0x140003091: no instruction there
+        response = rz.post(f"/api/rizin/{sid}/patch", {"addr": f"{addr:#x}", "kind": kind})
+        assert response.status_code == 400 and "refused" in response.get_json(), (addr, kind)
+    assert not any(c.startswith("wx") for c in _commands_since(rz, mark))
+
+
+def test_what_this_session_wrote_stays_its_own(rz):
+    """`mine` decides what is kept, re-analysed and exported, so it survives a neighbour being taken
+    back and a second write to the same address, and `wc-*` leaves this session claiming nothing."""
+    sid = rz.session()
+    _patch(rz, sid, addr="0x140001440", bytes="9090")
+    _patch(rz, sid, addr="0x140001450", bytes="41")
+    rz.delete(f"/api/rizin/{sid}/patch", {"addr": "0x140001450"})
+    assert [(r["addr"], r["mine"]) for r in _patches(rz, sid)] == [(0x140001440, True)]
+
+    # and the address that was taken back is not claimed any more: what writes there next is not ours
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "wx 42 @ 0x140001450"})
+    assert [(r["addr"], r["mine"]) for r in _patches(rz, sid)] == [(0x140001440, True), (0x140001450, False)]
+    rz.delete(f"/api/rizin/{sid}/patch", {"addr": "0x140001450"})
+
+    # a second write at the same address: rizin stacks the operations and both are this session's
+    _patch(rz, sid, addr="0x140001440", bytes="cccc")
+    rows = _patches(rz, sid)
+    assert [(r["addr"], r["before"], r["after"], r["mine"]) for r in rows] == [
+        (0x140001440, rows[0]["before"], "9090", True), (0x140001440, "9090", "cccc", True)]
+
+    # after wc-* nothing is claimed any more: what a run writes then is the run's
+    rz.delete(f"/api/rizin/{sid}/patch", {})
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001444"})
+    _run(rz, sid, "step")
+    assert [r["mine"] for r in _patches(rz, sid)] == [False]
+
+
+def test_a_patch_drops_the_views_rizin_built_from_the_bytes(rz):
+    sid = rz.session()
+
+    def asked(cmd):
+        return rz.commands().count(cmd)
+
+    rz.read(f"/api/rizin/{sid}/flags?q=sym")
+    rz.read(f"/api/rizin/{sid}/strings")
+    flags, strings = asked("flj"), asked("izj")
+    _patch(rz, sid, addr="0x140001440", bytes="90")
+    rz.read(f"/api/rizin/{sid}/flags?q=sym")
+    rz.read(f"/api/rizin/{sid}/strings")
+    assert (asked("flj"), asked("izj")) == (flags + 1, strings + 1)
+    rz.delete(f"/api/rizin/{sid}/patch", {})
+    rz.read(f"/api/rizin/{sid}/flags?q=sym")
+    assert asked("flj") == flags + 2
+
+
+def test_a_patch_rizin_did_not_write_is_refused_not_reported_as_written(rz):
+    # The highest address of all is the one write rizin refuses (measured: rz_core_write_at asserts
+    # addr != UT64_MAX and says "Could not write hexpair" on stderr, which cmd does not read), so the
+    # answer comes from reading the cache back, not from the command having been sent.
+    sid = rz.session()
+    response = rz.post(f"/api/rizin/{sid}/patch", {"addr": "0xffffffffffffffff", "bytes": "9090"})
+    assert response.status_code == 400 and "0xffffffffffffffff" in response.get_json()["refused"]
+    assert _patches(rz, sid) == []
+
+
+def test_patches_say_the_session_ended_rather_than_fail(rz):
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/close", {})
+    for response in (rz.get(f"/api/rizin/{sid}/patches"),
+                     rz.post(f"/api/rizin/{sid}/patch", {"addr": "0x140001440", "bytes": "90"}),
+                     rz.delete(f"/api/rizin/{sid}/patch", {})):
+        assert response.status_code == 404 and response.get_json()["error"] == "session ended"
+
+
+@pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
+@pytest.mark.skipif(not MINGW, reason="mingw (x86_64-w64-mingw32-gcc) not installed")
+def test_real_rizin_patches_through_the_cache(tdc, tmp_path, monkeypatch):
+    """The three routes against rizin 0.9.1 itself, and the behaviour the fake models for them:
+    wcj groups per write operation, a patch shows through px, wc- and wc-* take it back, and the file
+    on disk is never written."""
+    import rizin_sessions
+
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    exe = allowed / "pipesim.exe"
+    shutil.copy(_build_pipesim(tmp_path), exe)
+    before = hashlib.sha256(exe.read_bytes()).hexdigest()
+    monkeypatch.setattr(rizin_sessions, "RIZIN_EXE", REAL_RIZIN)
+    monkeypatch.setattr(tdc, "_readable_roots", lambda: [str(allowed)])
+    mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(tmp_path / "projects"))
+    monkeypatch.setattr(tdc, "_rizin_manager", mgr)
+    monkeypatch.setattr(tdc, "_rizin_install", {"key": None, "value": None})
+    api = _Api(tdc, None, mgr, tmp_path)
+    try:
+        sid = api.open(str(exe))["session"]
+        api.wait_done(sid, timeout=120)
+        session = mgr.get(sid)
+        main = next(f for f in api.read(f"/api/rizin/{sid}/functions") if f["name"] == "sym.main")["offset"]
+        ops = api.read(f"/api/rizin/{sid}/disasm?addr={main}&count=60")["ops"]
+        original = api.read(f"/api/rizin/{sid}/hex?addr={main}&len=2")["bytes"]
+
+        # one row per write operation, with the bytes that were there before it
+        assert api.read(f"/api/rizin/{sid}/patches") == []
+        answer = api.send(f"/api/rizin/{sid}/patch", {"addr": main, "bytes": "9090"})
+        assert answer["patches"] == [{"addr": main, "size": 2, "before": bytes(original).hex(),
+                                      "after": "9090", "mine": True}]
+        # rizin 0.9.1 prints the rows without the [] of an array, so wcj is read as text, not as JSON
+        assert session.text("wcj").strip().startswith('{"idx":0,')
+        # and the patch shows through px: HEX and DISASSEMBLY need no plumbing of their own
+        assert api.read(f"/api/rizin/{sid}/hex?addr={main}&len=2")["bytes"] == [0x90, 0x90]
+
+        # a kind computes the bytes from the instruction there; a call is nopped over its whole length
+        call = next(op for op in ops if op["type"].endswith("call"))
+        call_bytes = api.read(f"/api/rizin/{sid}/hex?addr={call['offset']}&len={call['size']}")["bytes"]
+        api.send(f"/api/rizin/{sid}/patch", {"addr": call["offset"], "kind": "nocall"})
+        nopped = api.read(f"/api/rizin/{sid}/hex?addr={call['offset']}&len={call['size']}")["bytes"]
+        assert nopped == [0x90] * call["size"]
+        patched = api.read(f"/api/rizin/{sid}/disasm?addr={call['offset']}&count=60")["ops"]
+        assert next(op for op in patched if op["offset"] == call["offset"])["type"] == "nop"
+
+        # what a run writes lands in the same cache and stays the run's: a step into a call pushes the
+        # return address, and that write is one row of the cache too (measured)
+        watchdog = next(f for f in api.read(f"/api/rizin/{sid}/functions")
+                        if f["name"] == "sym.watchdog")["offset"]
+        into = next(op for op in api.read(f"/api/rizin/{sid}/disasm?addr={watchdog}&count=20")["ops"]
+                    if op["type"].endswith("call"))
+        api.send(f"/api/rizin/{sid}/emulation/start", {"addr": into["offset"]})
+        api.send(f"/api/rizin/{sid}/emulation/run", {"kind": "step"})
+        rows = api.read(f"/api/rizin/{sid}/patches")
+        assert [r["mine"] for r in rows if r["addr"] in (main, call["offset"])] == [True, True]
+        run = [r for r in rows if not r["mine"]]
+        assert run and all(r["addr"] >= rizin_sessions.ESIL_STACK_ADDR for r in run), rows
+        assert [r["size"] for r in run] == [8], "one row for the one eight-byte write, not eight rows"
+
+        # the one write rizin refuses: the highest address of all (rz_core_write_at asserts on UT64_MAX)
+        refused = api.post(f"/api/rizin/{sid}/patch", {"addr": "0xffffffffffffffff", "bytes": "90"})
+        assert refused.status_code == 400 and "0xffffffffffffffff" in refused.get_json()["refused"]
+
+        # take one back: only that one goes, and the bytes under it are the file's again
+        api.remove(f"/api/rizin/{sid}/patch", {"addr": main})
+        assert [r["addr"] for r in api.read(f"/api/rizin/{sid}/patches") if r["mine"]] == [call["offset"]]
+        assert api.read(f"/api/rizin/{sid}/hex?addr={main}&len=2")["bytes"] == original
+        # and all of them: the run's bytes too, because rizin has one cache
+        assert api.remove(f"/api/rizin/{sid}/patch", {}) == {"patches": []}
+        assert session.text("wcj").strip() == ""
+        assert api.read(f"/api/rizin/{sid}/hex?addr={call['offset']}&len={call['size']}")["bytes"] == call_bytes
+    finally:
+        mgr.shutdown()
+    assert hashlib.sha256(exe.read_bytes()).hexdigest() == before, "the sample must never be written"
+
+
 @pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
 @pytest.mark.skipif(not MINGW, reason="mingw (x86_64-w64-mingw32-gcc) not installed")
 def test_real_rizin_runs_an_emulation(tmp_path, monkeypatch):

@@ -1,5 +1,7 @@
 """The emulation's pure logic (webui/rizin_emulation.py), without rizin."""
 
+import pytest
+
 import rizin_emulation
 
 
@@ -155,3 +157,130 @@ def test_next_call_stop_runs_to_a_call_to_a_branch_or_on():
     assert rizin_emulation.next_call_stop([], 0x10) == ("more", 0x10)
     assert rizin_emulation.next_call_stop(None, 0x10) == ("more", 0x10)
     assert rizin_emulation.next_call_stop([_op(0x10, 1, "nop"), _op(0x40, 1, "call")], 0x10) == ("more", 0x11)
+
+
+# --- Patching (the four kinds, the cache's list, the bytes from a hex field) ---
+
+JZ_SHORT = {"size": 2, "bytes": "7410", "type": "cjmp", "mnemonic": "jz"}
+# measured with rz-asm: 0f 84 2e120000 at 0 is "jz 0x1234" (6 bytes), e9 2f120000 is "jmp 0x1234" (5)
+JZ_NEAR = {"size": 6, "bytes": "0f842e120000", "type": "cjmp", "mnemonic": "jz"}
+CALL = {"size": 5, "bytes": "e8e18f0000", "type": "call", "mnemonic": "call"}
+
+
+def test_patch_bytes_computes_the_four_kinds():
+    jz = JZ_SHORT
+    assert rizin_emulation.patch_bytes("nop", jz) == b"\x90\x90"
+    assert rizin_emulation.patch_bytes("flip", jz) == b"\x75\x10"
+    assert rizin_emulation.patch_bytes("always", jz) == b"\xeb\x10"
+    call = CALL
+    assert rizin_emulation.patch_bytes("nocall", call) == b"\x90" * 5
+    with pytest.raises(ValueError):
+        rizin_emulation.patch_bytes("flip", call)
+
+
+def test_patch_bytes_keeps_the_target_of_a_near_conditional_jump():
+    """e9 is one byte shorter than 0f 8x, and a jump's displacement counts from its end: keeping the
+    displacement as it is would move the target by one byte, so it is raised by one and a nop fills up."""
+    assert rizin_emulation.patch_bytes("flip", JZ_NEAR) == bytes.fromhex("0f852e120000")
+    assert rizin_emulation.patch_bytes("always", JZ_NEAR) == bytes.fromhex("e92f12000090")
+    assert rizin_emulation.patch_bytes("nop", JZ_NEAR) == b"\x90" * 6
+    # a backwards jump: 0f 84 ffffffff lands on the byte after the instruction, e9 00000000 too
+    back = dict(JZ_NEAR, bytes="0f84ffffffff")
+    assert rizin_emulation.patch_bytes("always", back) == bytes.fromhex("e90000000090")
+    # the one displacement where raising it by one would turn the jump around: refused, not written wrong
+    with pytest.raises(ValueError):
+        rizin_emulation.patch_bytes("always", dict(JZ_NEAR, bytes="0f84ffffff7f"))
+
+
+def test_jump_pairs_name_each_conditional_jump_and_its_opposite():
+    # all 32 checked with rz-asm (-d -a x86 -b 64): 70..7f is jo..jnle rel8, 0f80..0f8f the rel32 forms
+    pairs = rizin_emulation.JUMP_PAIRS
+    assert len(pairs) == 32
+    for opcode, opposite in pairs.items():
+        assert opposite != opcode and pairs[opposite] == opcode, opcode
+    assert pairs["74"] == "75" and pairs["7f"] == "7e" and pairs["70"] == "71"
+    assert pairs["0f84"] == "0f85" and pairs["0f8e"] == "0f8f"
+
+
+def test_patch_bytes_refuses_what_it_cannot_encode():
+    refused = (
+        ("zap", JZ_SHORT),                                              # no such kind
+        ("flip", CALL),                                                 # not a jump at all
+        ("always", CALL),
+        ("nocall", JZ_SHORT),                                           # not a call
+        ("nop", dict(JZ_SHORT, size=3)),                                # bytes and size disagree
+        ("nop", {"size": 0, "bytes": "", "type": "invalid"}),           # rizin decoded nothing
+        ("nop", {"size": 1, "bytes": "ff", "type": "invalid"}),         # a byte that is no instruction
+        ("nop", dict(JZ_SHORT, bytes="zz")),                            # no hex
+        ("flip", {"size": 7, "bytes": "2e0f842e120000", "type": "cjmp"}),   # a prefixed near jump
+        ("flip", {"size": 4, "bytes": "6674100f", "type": "cjmp"}),     # an operand-size prefix
+        ("flip", {"size": 2, "bytes": "e2f0", "type": "cjmp", "mnemonic": "loop"}),
+        ("always", {"size": 2, "bytes": "e3f0", "type": "cjmp", "mnemonic": "jrcxz"}),
+    )
+    for kind, op in refused:
+        with pytest.raises(ValueError):
+            rizin_emulation.patch_bytes(kind, op)
+    # the reason names the instruction, so the route can pass it on
+    with pytest.raises(ValueError, match="call"):
+        rizin_emulation.patch_bytes("flip", CALL)
+
+
+def test_parse_cache_reads_the_objects_wcj_prints_without_an_array():
+    """rizin 0.9.1 prints one object per write operation, comma separated and *without* the [] of an
+    array, so json.loads cannot read the answer as it stands (measured); an empty cache answers nothing."""
+    text = ('{"idx":0,"addr":14,"size":2,"before":"8036","after":"9090","written":false},'
+            '{"idx":1,"addr":1540088,"size":8,"before":"0000000000000000",'
+            '"after":"1f00000000000000","written":false}\n')
+    rows = [{"addr": 14, "size": 2, "before": "8036", "after": "9090"},
+            {"addr": 1540088, "size": 8, "before": "0000000000000000", "after": "1f00000000000000"}]
+    assert rizin_emulation.parse_cache(text) == rows
+    assert rizin_emulation.parse_cache("[" + text.strip() + "]") == rows  # should rizin ever wrap them
+    assert rizin_emulation.parse_cache("\n") == [] and rizin_emulation.parse_cache("") == []
+    for bad in ("ERROR: something", '{"idx":0}', '{"addr":1,"size":1,"before":"0"}', "42",
+                '{"addr":"x","size":1,"before":"0","after":"1"}'):
+        with pytest.raises(ValueError):
+            rizin_emulation.parse_cache(bad)
+
+
+def _row(addr, size, after="90"):
+    return {"addr": addr, "size": size, "before": "00" * size, "after": after}
+
+
+def test_patch_rows_mark_only_what_this_session_wrote():
+    rows = [_row(0x1000, 2, "9090"), _row(0x20, 1, "41"), _row(0x1000, 1, "cc"), _row(0x1001, 2, "4142")]
+    marked = rizin_emulation.patch_rows(rows, {0x1000, 0x1001})
+    # sorted by address, rizin's order kept where two writes sit at the same one (the newer one last)
+    assert [(r["addr"], r["after"], r["mine"]) for r in marked] == [
+        (0x20, "41", False),            # a run's write elsewhere
+        (0x1000, "9090", True),         # this session's patch
+        (0x1000, "cc", True),           # and a write of this session over it
+        (0x1001, "4142", False)]        # reaches past what this session wrote
+    assert all(set(r) == {"addr", "size", "before", "after", "mine"} for r in marked)
+    assert [r["mine"] for r in rizin_emulation.patch_rows(rows, set())] == [False] * 4
+
+
+def test_cache_covers_keeps_only_the_addresses_a_row_still_holds():
+    rows = [_row(0x1000, 2, "9090"), _row(0x20, 1, "41")]
+    assert rizin_emulation.cache_covers(rows, {0x1000, 0x1001, 0x1002, 0x20}) == {0x1000, 0x1001, 0x20}
+    assert rizin_emulation.cache_covers([], {0x1000}) == set()
+    assert rizin_emulation.cache_covers(rows, set()) == set()
+
+
+def test_hex_data_takes_an_even_number_of_hex_digits():
+    assert rizin_emulation.hex_data("9090") == b"\x90\x90"
+    assert rizin_emulation.hex_data("0F84") == b"\x0f\x84"
+    assert rizin_emulation.hex_data(b"\x90") == b"\x90"
+    assert len(rizin_emulation.hex_data("90" * rizin_emulation.MAX_PATCH_BYTES)) == 4096
+    for value in ("9", "zz", "90 90", "", "0x90", "90" * 4097, b"", b"\x90" * 4097, None, 144, True):
+        with pytest.raises(ValueError):
+            rizin_emulation.hex_data(value)
+
+
+def test_instruction_at_takes_the_op_pdj_decoded_there():
+    ops = [{"offset": 0x1000, "size": 2, "bytes": "7410", "type": "cjmp"}]
+    assert rizin_emulation.instruction_at(ops, 0x1000) is ops[0]
+    assert rizin_emulation.instruction_at(ops, 0x1001) is None
+    assert rizin_emulation.instruction_at([], 0x1000) is None
+    assert rizin_emulation.instruction_at(None, 0x1000) is None
+    # past its block rizin 0.9.1 answers a broken op whose address is not one
+    assert rizin_emulation.instruction_at([{"offset": 2 ** 64 - 1, "size": 0, "type": "null"}], 0x1000) is None
