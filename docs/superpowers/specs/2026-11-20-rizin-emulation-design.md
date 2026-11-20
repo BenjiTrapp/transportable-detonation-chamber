@@ -74,6 +74,8 @@ x86-64-Blob mit einer XOR-Entschlüsselungsschleife und einem `call` ins Leere.
 | **`esil.verbose=1` flutet stderr**: ein `int3`/`int N` druckt `WARNING: $ returned 0` je Ausführung — 148 025 Zeilen in einer Sekunde gemessen. `_stderr_until` behält die **ersten** 64 KB, also fiel die abschließende `timeout exceeded`-Zeile heraus und der Lauf meldete „step" | Der Haltegrund wird am **Ende** von stderr gesucht, nicht am Anfang. `int3`-Schleifen sind Standard-Anti-Debug in genau diesen Samples |
 | **`dbw` (Watchpoint) + `aec` hängt rizin endlos** (im `timeout` gestorben) | Watchpoints bleiben draußen |
 | **`Ps` speichert den Patch-Cache nicht** (nur `io.cache=true` landete im Projekt, keine Bytes) | TDC muss Patches selbst behalten |
+| **Breakpoints speichert rizin dagegen selbst**, in `/core/debug/breakpoints`, und `Poo` stellt sie wirksam wieder her (gemessen: `db @ 0x1a`, `Ps`, neu geöffnet, `dblj` listet ihn wieder) | `/tdc` trägt **nur** die Patches. Kein `breakpoints=` und kein `db`-Replay — TDCs Aufgabe ist nur, das Projekt überhaupt schreiben zu lassen |
+| **Ein Breakpoint kann einen rizin-Befehl tragen, und das Projekt speichert ihn**: `dbc CC pwned` an der Haltestelle ergibt `"data":"CC pwned"` in `dblj` und genau so in `/core/debug/breakpoints` | Beim Treffer führt rizin diesen Befehl aus. `_make_safe` muss beim Laden `data` und `cond` jedes Breakpoints leeren — dieselbe Gefahr wie die `cmd.*`-Hooks, die es schon zurücksetzt (R24) |
 | **rizin 0.9.1 hat kein `wt`/`wtf`** (nur `wu`, `wf` — beide lesen Dateien) | Der Export entsteht in Python |
 | `aepc <addr>` wird von der heutigen Allowlist-Regel `aep` fälschlich mitgeblockt | Fehlalarm, der zu beheben ist |
 | `esil.romem` und `io.cache` sind beide standardmäßig `false` | Die Startwerte stimmen; der Server setzt beide bewusst |
@@ -237,11 +239,20 @@ bedienbaren Schritt:
 
 ### 6. Was bleibt und was nicht
 
-- **Von Hand gesetzte Patches und Breakpoints bleiben.** Sie werden im
-  **`/tdc`-Namensraum des rizin-Projekts** gespeichert, dort, wo heute schon
-  `level`, `mode` und `done` stehen (`_sanitize_project`). Das rizin-Projekt
-  selbst speichert den Cache nicht — gemessen.
-- Beim Öffnen derselben Datei werden sie mit `wx` bzw. `db` wieder angewandt,
+- **Von Hand gesetzte Patches bleiben**, im **`/tdc`-Namensraum des
+  rizin-Projekts**, dort, wo heute schon `level`, `mode` und `done` stehen
+  (`_sanitize_project`). Das rizin-Projekt selbst speichert den Cache nicht —
+  gemessen.
+- **Breakpoints speichert rizin selbst** (`/core/debug/breakpoints`), und
+  `Poo` stellt sie wirksam wieder her — gemessen. `/tdc` trägt sie also
+  nicht, und es gibt kein `db`-Replay; TDCs Aufgabe ist nur, das Projekt
+  wegen eines Breakpoints überhaupt schreiben zu lassen.
+- **Ein geladenes Projekt wird entwaffnet:** `_make_safe` leert `data` und
+  `cond` jedes Breakpoints, denn beide tragen einen rizin-Befehl, den rizin
+  beim Treffer ausführt, und das Projekt speichert sie (gemessen:
+  `"data":"CC pwned"`). Das ist dieselbe Gefahr wie die `cmd.*`-Hooks und die
+  ESIL-Hinweise, die `_make_safe` schon zurücksetzt.
+- Beim Öffnen derselben Datei werden die Patches mit `wx` wieder angewandt,
   bevor die Ansichten laden.
 - Ein Projekt entsteht damit künftig auch durch einen Patch oder einen
   Breakpoint, nicht mehr nur durch Umbenennen oder Kommentieren.
