@@ -23,6 +23,11 @@ Environment:
   FAKE_RIZIN_BITS   32: an x86-32 file (``ij`` bits, the ESIL VM's registers); default 64
   FAKE_RIZIN_STACK  "<word>[,...]": the words ``aeim`` leaves at the stack pointer, upwards
   FAKE_RIZIN_NO_IO_CACHE  set: ``e io.cache=true`` does not take, ``e io.cache`` stays false
+  FAKE_RIZIN_IO_CACHE_ONCE  set: only the first ``e io.cache=true`` takes (the console switched it off after)
+  FAKE_RIZIN_AESB_NOOP  set: ``aesb`` answers nothing and moves nothing
+  FAKE_RIZIN_NO_SP  set: ``ar SP`` answers nothing (a file whose profile has no SP role)
+  FAKE_RIZIN_ESIL_RUNAWAY  set: ``aec`` and ``aesu`` run into esil.timeout (the warning on stderr, the PC where
+                    it was)
 
 Like rizin 0.9.1 it dies on ``aflj`` once a project with DWARF variable
 origins has been loaded (see rizin_sessions._sanitize_project), and ``Poo``
@@ -37,6 +42,15 @@ shows, reads (by name or the roles PC and SP) and sets the registers; before
 reads the stack, ``omlj`` lists it with the file's maps. ``fd`` describes the
 closest flag below an address, ``fd.j`` lists the flags at it; like rizin's
 aei, an armed VM has a flag per register at its value.
+
+Stepping moves the PC through the code model below: a call pushes its return address and goes to its target
+(an indirect call goes to 0, where nothing is mapped: the callee is read from memory), a ret pops, a jmp
+follows, a conditional jmp falls through (no flags). ``aes`` is one op, ``aeso`` runs a call to its return,
+``aess`` skips a call (but not an indirect one, like rizin: ``aeso`` neither), ``aesu``/``aecu`` run to an
+address, ``aecc`` to the next direct call (not before an indirect one), ``aec`` on; ``aets+`` records the steps
+for ``aesb``. Like rizin 0.9.1 each stops at a breakpoint (also a disabled one) with
+"[ESIL] hit breakpoint at 0x..." on stdout, and a step at an address nothing is mapped at answers "Stopped
+execution in an invalid instruction" on stderr and stays. ``db @ addr``, ``db- @ addr``, ``dbd``, ``dbe``, ``dblj``.
 
 The views (afl, pdfj, afbj, pdj, axtj, axfj, afxj, izj, iij, flj, pxj, pdgj, ol.j, oml.j) answer
 from one model of the code: entry0 calls sym.main, whose blocks branch, run
@@ -75,7 +89,8 @@ BASE, MAPPED_END = 0x140000000, 0x14000A000
 IMAGE = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00" + bytes(range(256)) * 4
 # The maps as "oml.j @ addr" shows them: parts of the opened file (fd 3, at delta) and a zero-filled part
 # past .text's data (fd 4, like rizin's null:// maps); nothing else is mapped to the file
-MAPS = [{"map": i + 1, "fd": fd, "delta": delta, "from": start, "to": end, "perm": "r--", "name": name}
+MAPS = [{"map": i + 1, "fd": fd, "delta": delta, "from": start, "to": end,
+         "perm": "r-x" if ".text" in name else "r--", "name": name}
         for i, (fd, delta, start, end, name) in enumerate((
             (3, 0, BASE, BASE + 0x400, "fmap.header"),
             (3, 0x400, 0x140001000, 0x140003000, "fmap..text"),
@@ -181,11 +196,11 @@ CODE = [
     ("}", []),
 ]
 
-state = {"seek": 0x140001440, "names": {}, "comments": {}, "prj": "", "dwarf": False, "hints": {},
+state = {"seek": 0x140001440, "names": {}, "comments": {}, "prj": "", "dwarf": False, "hints": {}, "bps": {},
          "config": {"asm.arch": "x86", "analysis.arch": "x86", "bin.lang": "c", "analysis.autoname": "false",
                     "analysis.apply.signature": "true", "analysis.calls": "false",
                     "scr.color": "0", "scr.pager": "", "scr.interactive": "false",
-                    "io.cache": "false", "esil.romem": "false", "esil.stack.addr": "0x100000",
+                    "io.cache": "false", "esil.romem": "false", "esil.breakoninvalid": "false", "esil.stack.addr": "0x100000",
                     "esil.stack.size": "0xf0000"}}
 
 BITS = 32 if os.environ.get("FAKE_RIZIN_BITS") == "32" else 64
@@ -197,7 +212,9 @@ else:
     REG_NAMES = ["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "eflags"]
     ROLES = {"PC": "eip", "SP": "esp", "BP": "ebp"}
 # The ESIL VM: regs is None until aei; stack is (addr, bytearray) while aeim's map is there.
-esil = {"regs": None, "stack": None}
+esil = {"regs": None, "stack": None, "trace": None}
+ESIL_CAP = 200000  # steps of one run: past it the fake's code has run into nothing it models
+ESIL_INVALID = "ERROR: core: esil: Stopped execution in an invalid instruction (see e??esil.breakoninvalid)\n"
 
 
 def log(text):
@@ -312,6 +329,183 @@ def esil_map_stack(args):
     regs[ROLES["PC"]] = state["seek"]
 
 
+def esil_mapped(addr):
+    stack = esil["stack"]
+    if stack and stack[0] <= addr < stack[0] + len(stack[1]):
+        return True
+    return any(m["from"] <= addr < m["to"] for m in MAPS)
+
+
+def esil_executable(addr):
+    stack = esil["stack"]
+    if stack and stack[0] <= addr < stack[0] + len(stack[1]):
+        return False  # aeim maps the stack rw-
+    return any(m["from"] <= addr < m["to"] and "x" in m["perm"] for m in MAPS)
+
+
+def esil_ops():
+    ops = {op["offset"]: op for fn in FUNCTIONS for op in function_ops(fn)}
+    ops.update((op["offset"], op) for op in LOOSE_OPS)
+    return ops
+
+
+def esil_push(value):
+    regs, (base, memory, _name) = esil["regs"], esil["stack"]
+    word = BITS // 8
+    regs[ROLES["SP"]] = (regs[ROLES["SP"]] - word) % 2 ** BITS
+    at = regs[ROLES["SP"]] - base
+    if 0 <= at <= len(memory) - word:
+        memory[at:at + word] = value.to_bytes(word, "little")
+
+
+def esil_pop():
+    regs, (base, memory, _name) = esil["regs"], esil["stack"]
+    word = BITS // 8
+    at = regs[ROLES["SP"]] - base
+    value = int.from_bytes(memory[at:at + word], "little") if 0 <= at <= len(memory) - word else 0
+    regs[ROLES["SP"]] = (regs[ROLES["SP"]] + word) % 2 ** BITS
+    return value
+
+
+def esil_is_call(op):
+    return op is not None and op["type"] in ("call", "ucall", "rcall", "ircall")
+
+
+def esil_step_one(execute=True):
+    """One instruction at the PC, as rizin's rz_core_esil_step does: "ok", "bp" (the new PC is a breakpoint:
+    announced on stdout), "trap" (esil.exectrap: the PC is not in executable memory) or "invalid" (nothing is
+    mapped at the PC and esil.breakoninvalid is on); both are announced on stderr and the PC stays."""
+    regs = esil["regs"]
+    pc = regs[ROLES["PC"]]
+    if state["config"].get("esil.exectrap") == "true" and not esil_executable(pc):
+        err("ERROR: core: esil: Trap, trying to execute on non-executable memory\n")
+        return "trap"
+    if not esil_mapped(pc):
+        if state["config"].get("esil.breakoninvalid") == "true":
+            err(ESIL_INVALID)
+            return "invalid"
+        regs[ROLES["PC"]] = pc + 1
+        return "ok"
+    if esil["trace"] is not None:
+        esil["trace"].append(dict(regs))
+    op = esil_ops().get(pc)
+    nxt = pc + (op["size"] if op else 1)
+    kind = op["type"] if op else "nop"
+    if kind == "call":
+        esil_push(nxt)
+        nxt = op["jump"]
+    elif esil_is_call(op):
+        esil_push(nxt)
+        nxt = 0
+    elif kind == "jmp":
+        nxt = op["jump"]
+    elif kind == "cjmp":
+        nxt = op["fail"]
+    elif kind == "ret":
+        nxt = esil_pop()
+    elif kind == "ijmp":
+        nxt = 0
+    regs[ROLES["PC"]] = nxt % 2 ** BITS
+    return esil_stop_at_breakpoint()
+
+
+def esil_stop_at_breakpoint():
+    pc = esil["regs"][ROLES["PC"]]
+    if pc in state["bps"]:  # rizin 0.9.1 does not look at "enabled": a disabled breakpoint still stops
+        out(f"[ESIL] hit breakpoint at {pc:#x}\n")
+        return "bp"
+    return "ok"
+
+
+def esil_run(until=None, stop_at_call=False, over=None):
+    """aec, aecu, aesu, aecc, aeso's run: step until the PC is ``until`` (or at a call, or ``over``, the
+    address after a call), a breakpoint or an invalid instruction stops it."""
+    for _ in range(ESIL_CAP):
+        result = esil_step_one()
+        pc = esil["regs"][ROLES["PC"]]
+        if result != "ok" or pc == until or pc == over:
+            return
+        if stop_at_call and (esil_ops().get(pc) or {}).get("type") in ("call", "ucall"):  # like aecc: not an ircall
+            err(f"ERROR: call at {pc:#010x}\n")
+            return
+    err("WARNING: core: esil: timeout exceeded.\n")
+
+
+def esil_command(word, rest, seek):
+    """The ESIL step commands; None for a word that is none."""
+    regs = esil["regs"]
+    if word not in ("aes", "aeso", "aess", "aesb", "aesu", "aecu", "aecc", "aec", "aets+", "aets-"):
+        return None
+    if regs is None:
+        err("ERROR: ESIL is not initialized. Use `aei` first.\n")
+        return ""
+    pc = regs[ROLES["PC"]]
+    op = esil_ops().get(pc)
+    if word == "aets+":
+        if esil["trace"] is not None:
+            err("ERROR: ESIL trace already started\n")
+        else:
+            esil["trace"] = []
+    elif word == "aets-":
+        if esil["trace"] is None:
+            err("ERROR: No ESIL trace started\n")
+        esil["trace"] = None
+    elif word == "aes":
+        for _ in range(int(rest) if rest.isdigit() else 1):
+            if esil_step_one() != "ok":
+                break
+    elif word == "aeso":
+        # rizin 0.9.1 steps over a plain "call" only: any other call (ircall) it steps into
+        if op and op["type"] == "call" and esil_step_one() == "ok":
+            esil_run(over=pc + op["size"])
+        elif not op or op["type"] != "call":
+            esil_step_one()
+    elif word == "aess":
+        # rizin 0.9.1 skips these (rz_core_esil_step's stepOver switch); an ircall it runs
+        if op and op["type"] in ("call", "ucall", "rcall", "jmp", "cjmp", "ret"):
+            regs[ROLES["PC"]] = pc + op["size"]  # not run, so not recorded for aesb either
+            esil_stop_at_breakpoint()
+        else:
+            esil_step_one()
+    elif word == "aesb":
+        if os.environ.get("FAKE_RIZIN_AESB_NOOP"):
+            pass  # rizin 0.9.1 sometimes answers nothing and moves nothing
+        elif esil["trace"]:
+            esil["regs"] = dict(esil["trace"].pop())
+        elif esil["trace"] is not None:
+            err("ERROR: cannot step back\n")
+    elif word in ("aesu", "aecu"):
+        target = number(rest)
+        if target is not None and os.environ.get("FAKE_RIZIN_ESIL_RUNAWAY"):
+            err("WARNING: core: esil: timeout exceeded.\n")
+        elif target is not None:
+            esil_run(until=target)
+    elif word == "aecc":
+        esil_run(stop_at_call=True)
+    elif os.environ.get("FAKE_RIZIN_ESIL_RUNAWAY"):  # aec
+        err("WARNING: core: esil: timeout exceeded.\n")
+    else:
+        esil_run()
+    return ""
+
+
+def esil_breakpoints(word, seek):
+    """``db @ addr`` and friends: rizin's db takes no address argument."""
+    bps = state["bps"]
+    if word == "dblj":
+        return json.dumps([{"addr": addr, "size": 1, "perm": "--x", "hw": False, "trace": False,
+                            "enabled": enabled, "valid": True, "data": "", "cond": ""}
+                           for addr, enabled in sorted(bps.items())]) + "\n"
+    if word == "db":
+        bps[seek] = True
+    elif word == "db-":
+        bps.pop(seek, None)
+    elif word in ("dbd", "dbe") and seek in bps:
+        bps[seek] = word == "dbe"
+    return ""
+
+
+
 def esil_registers(rest):
     """``ar``, ``ar <name|PC|SP>``, ``ar <name>=<value>``, like rizin 0.9.1's ``name = 0x%016x`` lines."""
     regs = esil["regs"]
@@ -329,6 +523,8 @@ def esil_registers(rest):
         return ""
     if not arg:
         return "".join(f"{name} = {value:#0{BITS // 4 + 2}x}\n" for name, value in regs.items())
+    if arg == "SP" and os.environ.get("FAKE_RIZIN_NO_SP"):
+        return ""
     name = ROLES.get(arg, arg)
     if name not in regs:
         err(f"ERROR: core: No such register '{arg}'\n")
@@ -570,8 +766,11 @@ def answer(cmd):
         if tokens and all("=" in token for token in tokens):
             for token in tokens:
                 key, _, value = token.partition("=")
-                if key == "io.cache" and os.environ.get("FAKE_RIZIN_NO_IO_CACHE"):
-                    continue
+                if key == "io.cache" and value == "true":
+                    state["cache_sets"] = state.get("cache_sets", 0) + 1
+                    if os.environ.get("FAKE_RIZIN_NO_IO_CACHE") or (
+                            os.environ.get("FAKE_RIZIN_IO_CACHE_ONCE") and state["cache_sets"] > 1):
+                        continue
                 state["config"][key] = value
                 if key in ("asm.arch", "analysis.arch"):  # like rizin, one sets the other
                     state["config"]["asm.arch"] = state["config"]["analysis.arch"] = value
@@ -614,6 +813,14 @@ def answer(cmd):
     if word.startswith("Z") or word == "xyzzy":
         err(f"ERROR: Command '{word}' does not exist.\n")
         return ""
+    if word in ("db", "db-", "dbd", "dbe", "dblj"):
+        if word != "dblj" and at is None:
+            err("ERROR: Wrong number of arguments passed to `db`, see its help with `db?`\n")
+            return ""
+        return esil_breakpoints(word, seek)
+    stepped = esil_command(word, rest, seek)
+    if stepped is not None:
+        return stepped
     if word == "aei":
         # like rizin's reinit: a new VM, the registers stay, the PC goes to the seek
         if esil["regs"] is None:

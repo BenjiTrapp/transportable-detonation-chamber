@@ -79,6 +79,10 @@ STEP_GRACE = 120.0
 # ended an endless `jmp $` after 3.02 s ("esil: timeout exceeded") and rizin went on. It stays well below
 # CONSOLE_TIMEOUT, after which the pipe kills rizin and the session ends.
 ESIL_TIMEOUT = 5.0
+# The pipe's time limit for one run command: esil.timeout plus this, so a run that rizin bounds never trips
+# it (past it the pipe kills rizin and the session ends). Every command a run sends is bounded by
+# esil.timeout: aecc and aesuo are not, which is why to_call does not use them (rizin_emulation.STEP_COMMANDS).
+ESIL_GRACE = 10.0
 # The stack that aeim maps (rizin's own defaults): set by the server at each start, so a size the console
 # set (esil.* is settable there) never becomes an allocation of gigabytes on the VM's 8 GB.
 ESIL_STACK_ADDR = 0x100000
@@ -86,9 +90,11 @@ ESIL_STACK_SIZE = 0xF0000
 # Set in one `e` at the start of an emulation. Without io.cache every write of the run is lost (px keeps
 # the original bytes); with it the file on disk stays untouched. The traps stop the run at an invalid
 # instruction, a jump into memory that does not execute, an invalid read or write and a null pointer,
-# rather than emulating zeros there; romem stays off, so the run can decrypt in place.
+# rather than emulating zeros there; romem stays off, so the run can decrypt in place. esil.verbose=1 makes an
+# invalid read or write say "WARNING: core: TRAP": without it aec stops there without a word. Set again before
+# each run (emulation_run): esil.exectrap takes effect only when it is set after aei.
 ESIL_SETTINGS = ("io.cache=true", f"esil.timeout={ESIL_TIMEOUT:g}", "esil.breakoninvalid=true",
-                 "esil.exectrap=true", "esil.iotrap=true", "esil.nonull=true", "esil.romem=false",
+                 "esil.exectrap=true", "esil.iotrap=true", "esil.nonull=true", "esil.verbose=1", "esil.romem=false",
                  f"esil.stack.addr={ESIL_STACK_ADDR:#x}", f"esil.stack.size={ESIL_STACK_SIZE:#x}")
 # Stack words the emulation state reads from the stack pointer upwards (one pxj and an fd per word).
 RIZIN_STACK_ROWS = 16
@@ -1090,6 +1096,8 @@ class RizinSession:
         # the last change (for "changed"), the file's byte order for the stack words and aeim's stack map
         # as (from, to, name).
         self._emulation = None
+        # The pipe aets+ was sent on: the single steps are recorded for aesb from then on
+        self._emulation_traced = None
         self._emulation_before = self._emulation_after = None
         self._emulation_big_endian = False
         self._emulation_stack_map = None
@@ -1311,6 +1319,105 @@ class RizinSession:
 
         return self._call("emulation", wait, run)
 
+    def emulation_run(self, kind, addr=None, wait=2.0):
+        """Run the emulation one of the ways in rizin_emulation.STEP_COMMANDS and return the state with
+        ``stopped``: why it stopped (rizin_emulation.stop_reason; "trap" also when the PC is where nothing can
+        execute, which rizin only says at the next step). ``addr`` is the address of "until".
+
+        Before it runs, the settings of the start are set again (esil.* can be changed in the console, and
+        esil.timeout=0 would make the run endless; set after aei, esil.exectrap takes effect, which at the
+        start it does not), and io.cache, the stack and, for "back", the record of steps are checked: a run
+        that would write nothing, or into nothing, or step back to nowhere, is refused.
+
+        Only a single step is recorded for "back" (aets+): recording every instruction of an aec took 880 MB
+        in 3 s. Any other run ends the record (aets-), and rizin's aesb restores the registers but not the
+        memory a step wrote (measured), which the interface says.
+        """
+        command = rizin_emulation.STEP_COMMANDS.get(kind) if isinstance(kind, str) else None
+        if command is None:
+            raise RizinRefused("kind must be one of " + ", ".join(rizin_emulation.STEP_COMMANDS))
+        if kind == "until":
+            if addr is None:
+                raise RizinRefused("addr is missing: until runs to an address")
+            addr = _address(addr)
+
+        def run(pipe):
+            self._require_emulation(pipe)
+            pipe.cmd("e " + " ".join(ESIL_SETTINGS))
+            self._require_io_cache(pipe)
+            maps = pipe.cmdj("omlj")
+            if not self._emulation_stack_mapped(maps):
+                raise RizinRefused("the emulation's stack is not mapped any more (aeim- in the console?): "
+                                   "start the emulation again")
+            recorded = self._emulation_traced is pipe
+            if kind in ("step", "back") and not recorded:
+                pipe.cmd("aets+")
+                self._emulation_traced = pipe
+            elif kind not in ("step", "back") and recorded:
+                pipe.cmd("aets-")
+                self._emulation_traced = None
+            if kind == "to_call":
+                stopped = self._emulation_to_call(pipe)
+            else:
+                stopped = self._emulation_command(pipe, kind, command, addr)
+            state = self._emulation_read(pipe)
+            if stopped == "step" and state["pc"] is not None and not rizin_emulation.is_executable(state["pc"], maps):
+                stopped = "trap"
+            state["stopped"] = stopped
+            return state
+
+        return self._call("emulation", wait, run)
+
+    def _emulation_command(self, pipe, kind, command, addr):
+        """One run command (gate held); the reason it stopped."""
+        if kind == "until":
+            command += f" {addr:#x}"
+        elif kind in ("over", "skip"):
+            # aeso and aess do only what rizin's step logic lists as a call: through the import table
+            # (call qword [rip+..]) they run into the callee, which is how the PC ends up in nothing
+            pc = self._emulation_role(pipe, "PC")
+            op = pc is not None and rizin_emulation.op_at(pipe.cmdj(f"pdj 1 @ {pc:#x}"), pc)
+            if op and kind == "over" and rizin_emulation.over_call(op[0]):
+                command = f"aesu {pc + op[1]:#x}"
+            elif op and kind == "skip" and rizin_emulation.skip_call(op[0]):
+                command = f"aepc {pc + op[1]:#x}"
+        before = self._emulation_role(pipe, "PC") if kind == "back" else None
+        out, err, _ = pipe.console(command, timeout=ESIL_TIMEOUT + ESIL_GRACE)
+        if kind == "back" and "cannot step back" in err:
+            raise RizinRefused("there is no step to step back to: only single steps are recorded")
+        if kind == "back" and self._emulation_role(pipe, "PC") == before:
+            # rizin 0.9.1 does this: the second aesb in a row, say, answers nothing and moves nothing
+            raise RizinRefused("rizin did not step back")
+        return rizin_emulation.stop_reason(out, err)
+
+    def _emulation_to_call(self, pipe):
+        """Run to the next call, of any kind (gate held); the reason it stopped. One instruction first, like
+        rizin's aecc, so a call the PC stands on is run. Then hop: look at the straight code ahead (pdj), run
+        to a call in it and stop before it, or to the jump that ends it and take that. Every hop is an aesu,
+        which rizin bounds by esil.timeout, and the whole is bounded by ESIL_TIMEOUT too."""
+        deadline = time.monotonic() + ESIL_TIMEOUT
+        timeout = ESIL_TIMEOUT + ESIL_GRACE
+        out, err, _ = pipe.console("aes", timeout=timeout)
+        while True:
+            stopped = rizin_emulation.stop_reason(out, err)
+            if stopped != "step":
+                return stopped
+            if time.monotonic() > deadline:
+                return "timeout"
+            pc = self._emulation_role(pipe, "PC")
+            if pc is None:
+                return "step"
+            where, target = rizin_emulation.next_call_stop(pipe.cmdj(f"pdj 16 @ {pc:#x}"), pc)
+            if where == "call" and target == pc:
+                return "step"
+            if target != pc:
+                out, err, _ = pipe.console(f"aesu {target:#x}", timeout=timeout)
+                if where == "call":
+                    return rizin_emulation.stop_reason(out, err)
+                continue
+            # at the jump that ends the straight code, or at bytes rizin cannot decode (it says why)
+            out, err, _ = pipe.console("aes", timeout=timeout)
+
     def _require_emulation(self, pipe):
         # A rizin that was restarted (a hung analysis step) has no emulation, whatever ran before.
         if self._emulation is not pipe:
@@ -1333,6 +1440,12 @@ class RizinSession:
                 "stack": self._emulation_stack(pipe, self._emulation_role(pipe, "SP"), set(values)),
                 "stopped": None, "arch": self.arch, "bits": self.bits}
 
+    def _emulation_stack_mapped(self, maps):
+        """Whether the stack that the start mapped is still among ``omlj``'s maps (aeim- in the console)."""
+        stack = self._emulation_stack_map
+        return isinstance(maps, list) and stack is not None and any(
+            isinstance(m, dict) and (m.get("from"), m.get("to"), m.get("name")) == stack for m in maps)
+
     @staticmethod
     def _emulation_role(pipe, role):
         found = rizin_emulation.parse_registers(pipe.cmd("ar " + role))
@@ -1342,15 +1455,14 @@ class RizinSession:
         """Up to RIZIN_STACK_ROWS words from the stack pointer upwards, those inside the stack that the start
         mapped: addr, value and a hint. None at all when the stack pointer is not in that stack (it was
         unmapped, or the code moved the stack pointer elsewhere): rizin reads 0xff where nothing is mapped,
-        which is no stack. Costs omlj and pxj, and for each non-zero word in a map afij, then fd.j if the
-        word is in no function."""
+        which is no stack. Costs omlj and pxj, and for each distinct non-zero word in a map outside the stack
+        afij, then fd.j if the word is in no function (measured: 5.8 ms for 16 words in a 1.4 KB function)."""
         size = {16: 2, 32: 4, 64: 8}.get(self.bits)
         if sp is None or size is None:
             return []
         maps = pipe.cmdj("omlj")
         stack = self._emulation_stack_map
-        if not isinstance(maps, list) or stack is None or not any(
-                isinstance(m, dict) and (m.get("from"), m.get("to"), m.get("name")) == stack for m in maps):
+        if not self._emulation_stack_mapped(maps):
             return []
         if not stack[0] <= sp < stack[1]:
             return []
@@ -1360,10 +1472,17 @@ class RizinSession:
         data = pipe.cmdj(f"pxj {count * size} @ {sp:#x}")
         if not isinstance(data, list) or not all(isinstance(b, int) and 0 <= b < 256 for b in data):
             raise ValueError("pxj did not answer a list of bytes")
-        rows = []
+        rows, known = [], {}
         for i, value in enumerate(rizin_emulation.stack_words(data, size, self._emulation_big_endian)):
-            rows.append({"addr": (sp + i * size) % 2 ** self.bits, "value": value,
-                         "hint": self._emulation_hint(pipe, value, maps, registers)})
+            # A value inside the stack (a saved frame pointer, say) is no function or flag: not asked about.
+            # One value that comes twice in the rows is asked about once.
+            if stack[0] <= value < stack[1]:
+                hint = None
+            elif value in known:
+                hint = known[value]
+            else:
+                hint = known[value] = self._emulation_hint(pipe, value, maps, registers)
+            rows.append({"addr": (sp + i * size) % 2 ** self.bits, "value": value, "hint": hint})
         return rows
 
     @staticmethod

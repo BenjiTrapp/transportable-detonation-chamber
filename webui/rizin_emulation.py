@@ -38,7 +38,9 @@ def stack_words(data, word_size, big_endian):
 def stack_map(maps, sp, size):
     """The map that aeim made for the emulation's stack: of ``omlj``'s maps the one of ``size`` bytes that
     holds the stack pointer and has aeim's name (mem.<addr>_<size>, rizin 0.9.1's get_esil_stack_name);
-    (from, to, name), or None."""
+    (from, to, name), or None (also without a stack pointer: ``ar SP`` answered nothing)."""
+    if sp is None:
+        return None
     name = re.compile(r"mem\.0x[0-9a-f]+_0x%x" % size)
     for m in maps if isinstance(maps, list) else []:
         if (isinstance(m, dict) and isinstance(m.get("from"), int) and isinstance(m.get("to"), int)
@@ -77,3 +79,97 @@ def flag_hint(flags, registers):
         if isinstance(name, str) and name and name not in registers:
             return name
     return None
+
+
+# The run kinds and the rizin 0.9.1 command each one is built on ("until" takes an address: aesu <addr>).
+# "to_call" is no single command: aecc and aesuo, which rizin offers for it, do not stop before a call through
+# the import table (`call qword [rip+..]` is "ircall": they run into it) and ignore esil.timeout, because they
+# step one instruction per rz_core_esil_step, whose timer starts again each time. to_call is built on aesu
+# instead (see next_call_stop). aeso and aess handle only direct calls as well (see skip_call, over_call).
+STEP_COMMANDS = {"step": "aes", "over": "aeso", "skip": "aess", "back": "aesb", "to_call": "aesu",
+                 "cont": "aec", "until": "aesu"}
+
+# What rizin 0.9.1 prints when a run stops, checked with the binary. stdout: "[ESIL] hit breakpoint at 0x14".
+# stderr: "WARNING: core: esil: timeout exceeded." (esil.timeout); "ERROR: core: esil: Stopped execution in
+# an invalid instruction (see e??esil.breakoninvalid)" (esil.breakoninvalid: bytes rizin cannot decode);
+# "ERROR: core: esil: Trap, trying to execute on non-executable memory" (esil.exectrap, which takes effect
+# only when it is set after aei); "WARNING: core: TRAP" (esil.iotrap on an invalid read or write: only with
+# esil.verbose, else the run stops without a word); and from the sources "esil condition breakpoint!".
+# Other ERROR lines are no stop: aecc's "ERROR: call at 0x..." is the goal reached.
+_REASONS = (
+    ("breakpoint", re.compile(r"\[ESIL\] hit breakpoint|esil condition breakpoint")),
+    ("timeout", re.compile(r"esil: timeout exceeded")),
+    ("invalid", re.compile(r"invalid instruction")),
+    ("trap", re.compile(r"esil: Trap,|ESIL TRAP|core: TRAP")),
+)
+
+
+def stop_reason(output, stderr):
+    """Why a run stopped, from what rizin printed: "breakpoint", "timeout", "invalid", "trap", else "step"
+    (it did what it was asked: one step, or up to the address or call)."""
+    text = f"{output}\n{stderr}"
+    for reason, pattern in _REASONS:
+        if pattern.search(text):
+            return reason
+    return "step"
+
+
+def is_executable(value, maps):
+    """Whether ``value`` lies in a map of ``omlj`` that can execute (perm has an x): where rizin's
+    esil.exectrap lets the PC run. Stepping onto an address that is not leaves no message, only the next step."""
+    if not isinstance(maps, list):
+        return False
+    return any(isinstance(m, dict) and isinstance(m.get("from"), int) and isinstance(m.get("to"), int)
+               and isinstance(m.get("perm"), str) and "x" in m["perm"] and m["from"] <= value < m["to"] for m in maps)
+
+
+def op_at(ops, pc):
+    """The op at ``pc`` of ``pdj``'s answer as (type, size), None where rizin decoded none there."""
+    first = ops[0] if isinstance(ops, list) and ops else None
+    if (isinstance(first, dict) and first.get("offset") == pc and isinstance(first.get("type"), str)
+            and isinstance(first.get("size"), int) and first["size"] > 0):
+        return first["type"], first["size"]
+    return None
+
+
+def is_call(op_type):
+    """call, ucall, rcall, ircall, icall, ccall...: rizin's types of an instruction that calls."""
+    return isinstance(op_type, str) and op_type.endswith("call")
+
+
+# What rizin's own commands handle. aess skips these (rz_core_esil_step's stepOver switch); an ircall (and an
+# icall, a ccall) it runs. aeso steps over a plain "call" only; every other call it steps into.
+_AESS_SKIPS = ("call", "ucall", "rcall")
+
+
+def skip_call(op_type):
+    """Whether the op is a call that aess does not skip (so the server sets the PC after it itself)."""
+    return is_call(op_type) and op_type not in _AESS_SKIPS
+
+
+def over_call(op_type):
+    """Whether the op is a call that aeso does not step over (so the server runs to the address after it)."""
+    return is_call(op_type) and op_type != "call"
+
+
+def _ends_a_run(op_type):
+    # an instruction after which the next one is not at the next address, or that stops the emulation
+    return isinstance(op_type, str) and ("jmp" in op_type or "ret" in op_type
+                                         or op_type in ("swi", "cswi", "trap", "ill", "invalid", "null"))
+
+
+def next_call_stop(ops, pc):
+    """Where the emulation runs to, looking for the next call, from ``pdj``'s ops at ``pc`` (the straight
+    code up to its first jump, return or call): ("call", addr) a call that is next, ("branch", addr) a jump
+    or return that ends the straight code, ("more", addr) the end of the ops, none of them yet."""
+    end = pc
+    for op in ops if isinstance(ops, list) else []:
+        if not (isinstance(op, dict) and isinstance(op.get("offset"), int) and isinstance(op.get("size"), int)
+                and op["size"] > 0 and op["offset"] == end):
+            break
+        if is_call(op.get("type")):
+            return "call", op["offset"]
+        if _ends_a_run(op.get("type")):
+            return "branch", op["offset"]
+        end = op["offset"] + op["size"]
+    return "more", end

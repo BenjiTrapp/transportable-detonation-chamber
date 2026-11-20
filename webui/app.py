@@ -5734,6 +5734,15 @@ def _rizin_emulation_start(session):
     return session.emulation_start(None if addr is None else _rizin_address(addr))
 
 
+def _rizin_emulation_run(session):
+    body = _rizin_body()
+    addr = body.get("addr")
+    try:
+        return session.emulation_run(body.get("kind"), None if addr is None else _rizin_address(addr))
+    finally:
+        _rizin_forget(session)  # a run changes bytes, and with them the strings, imports, flags and functions
+
+
 def _rizin_emulation_register(session):
     body = _rizin_body()
     return session.emulation_register(body.get("name"), _rizin_address(body.get("value"), "value"))
@@ -6010,6 +6019,11 @@ def api_rizin_emulation(sid):
 @app.route("/api/rizin/<sid>/emulation/stop", methods=["POST"])
 def api_rizin_emulation_stop(sid):
     return _rizin_call(sid, lambda session: session.emulation_stop())
+
+
+@app.route("/api/rizin/<sid>/emulation/run", methods=["POST"])
+def api_rizin_emulation_run(sid):
+    return _rizin_call(sid, _rizin_emulation_run)
 
 
 @app.route("/api/rizin/<sid>/emulation/register", methods=["POST"])

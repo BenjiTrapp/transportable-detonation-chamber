@@ -2693,6 +2693,19 @@ def test_emulation_state_reads_the_stack_with_hints(rz, monkeypatch):
     assert not any("0x14000a100" in c or c.endswith("@ 0x41") for c in rz.commands() if c.startswith(("afij", "fd.j")))
 
 
+def test_emulation_asks_once_for_a_value_that_comes_twice_and_not_for_the_stack_itself(rz, monkeypatch):
+    # The state is read after every step: a saved frame pointer (a word inside the stack) is no function
+    # or flag, and a return address that fills several rows is one question
+    words = [ENTRY + 9, 0x177FF0, ENTRY + 9, 0x178100, ENTRY + 9, WATCHDOG]
+    monkeypatch.setenv("FAKE_RIZIN_STACK", ",".join(hex(w) for w in words))
+    sid = rz.session()
+    mark = len(rz.commands())
+    stack = rz.send(f"/api/rizin/{sid}/emulation/start", {})["stack"]
+    assert [row["hint"] for row in stack[:6]] == ["entry0 + 9", None, "entry0 + 9", None, "entry0 + 9", "sym.watchdog"]
+    asked = [c for c in _commands_since(rz, mark) if c.startswith(("afij @", "fd.j @"))]
+    assert asked.count(f"afij @ {ENTRY + 9:#x}") == 1 and not any("0x177ff0" in c or "0x178100" in c for c in asked)
+
+
 def test_emulation_shows_no_stack_where_the_stack_pointer_is_not_in_it(rz):
     import rizin_sessions
 
@@ -2771,6 +2784,411 @@ def test_a_register_can_be_set_and_only_a_known_one(rz):
     assert not any(c.startswith(("ar rax;", "ar nope", "ar rax rbx", "ar =")) for c in rz.commands())
     r = rz.post(f"/api/rizin/{sid}/emulation/register", {"name": "rax", "value": "-1"})
     assert r.status_code == 400 and "value" in r.get_json()["refused"]
+
+
+def _run(rz, sid, kind, **body):
+    """POST emulation/run: the state it answers."""
+    return rz.send(f"/api/rizin/{sid}/emulation/run", dict(body, kind=kind))
+
+
+def _commands_since(rz, mark):
+    return rz.commands()[mark:]
+
+
+def _started(rz, addr=None):
+    """A session with the emulation started (at addr, default the entry point): its ID."""
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/emulation/start", {} if addr is None else {"addr": addr})
+    return sid
+
+
+def test_each_run_kind_sends_its_command(rz):
+    sid = _started(rz)
+    for kind, command in (("step", "aes"), ("over", "aeso"), ("skip", "aess"), ("back", "aesb")):
+        mark = len(rz.commands())
+        rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": kind})
+        assert command in _commands_since(rz, mark), kind
+    mark = len(rz.commands())
+    rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": "until", "addr": "0x140001450"})
+    assert "aesu 0x140001450" in _commands_since(rz, mark)
+    mark = len(rz.commands())
+    rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": "cont"})
+    assert "aec" in _commands_since(rz, mark)
+    # to_call: one step, then aesu to the call (rizin's aecc runs past a call through the import table)
+    sid = _started(rz, "0x140001490")
+    mark = len(rz.commands())
+    rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": "to_call"})
+    since = _commands_since(rz, mark)
+    assert "aes" in since and any(c.startswith("aesu 0x") for c in since) and "aecc" not in since
+
+
+def test_a_run_moves_the_pc_through_the_code_and_says_why_it_stopped(rz):
+    sid = _started(rz)
+    state = _run(rz, sid, "step")
+    assert state["pc"] == 0x140001444 and state["stopped"] == "step"
+    assert "rip" in state["changed"] and set(state) >= {"running", "pc", "registers", "stack", "stopped"}
+    # at the call to sym.main: skip passes it
+    state = _run(rz, sid, "skip")
+    assert state["pc"] == 0x140001449 and state["stopped"] == "step"
+    # a state read afterwards does not claim a stop
+    assert rz.read(f"/api/rizin/{sid}/emulation")["stopped"] is None
+
+
+def test_until_runs_to_the_address_and_is_refused_without_one(rz):
+    sid = _started(rz)
+    state = _run(rz, sid, "until", addr="0x140001444")
+    assert state["pc"] == 0x140001444 and state["stopped"] == "step"
+    assert "aesu 0x140001444" in rz.commands()
+    mark = len(rz.commands())
+    for body in ({"kind": "until"}, {"kind": "until", "addr": "-1"}, {"kind": "until", "addr": "main; wci"}):
+        r = rz.post(f"/api/rizin/{sid}/emulation/run", body)
+        assert r.status_code == 400 and "addr" in r.get_json()["refused"], body
+    assert not any(c.startswith("aesu") for c in _commands_since(rz, mark))
+
+
+def test_cont_on_a_breakpoint_runs_on_to_the_next_one(rz):
+    # rizin 0.9.1's aec runs the instruction at the PC before it looks at breakpoints, so it does not hit the
+    # one it stands on again (checked with real rizin, test_real_rizin_runs_an_emulation): no step off it
+    # is needed. Breakpoints are set through the console: db takes its address after "@".
+    sid = _started(rz, "0x140001440")
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "db @ 0x140001440"})
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "db @ 0x1400014b7"})
+    mark = len(rz.commands())
+    state = _run(rz, sid, "cont")
+    assert state["pc"] == 0x1400014B7 and state["stopped"] == "breakpoint"
+    assert "aes" not in _commands_since(rz, mark) and "aec" in _commands_since(rz, mark)
+    # and on from there, past the one it stands on, into code that ends where nothing can execute
+    state = _run(rz, sid, "cont")
+    assert state["pc"] != 0x1400014B7 and state["stopped"] == "trap"
+
+
+def test_cont_that_runs_away_stops_with_timeout_and_keeps_the_session(rz, monkeypatch):
+    monkeypatch.setenv("FAKE_RIZIN_ESIL_RUNAWAY", "1")
+    sid = _started(rz)
+    state = _run(rz, sid, "cont")
+    assert state["stopped"] == "timeout" and state["pc"] == 0x140001440
+    assert rz.status(sid)["analysis"]["state"] in ("done", "stopped")
+    assert rz.send(f"/api/rizin/{sid}/emulation/stop") == {"running": False}
+
+
+def test_run_refuses_an_unknown_kind(rz):
+    sid = _started(rz)
+    mark = len(rz.commands())
+    for kind in ("ood", "", None, 7, "aes; wci", "STEP", "aecc"):
+        r = rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": kind})
+        assert r.status_code == 400 and "kind" in r.get_json()["refused"], kind
+    assert not any(c.split(" ")[0] in ("aes", "aec", "aesu", "wci") for c in _commands_since(rz, mark))
+
+
+def test_run_is_refused_before_the_emulation_starts(rz):
+    sid = rz.session()
+    r = rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": "step"})
+    assert r.status_code == 400 and "not started" in r.get_json()["refused"]
+    assert not any(c.split(" ")[0] == "aes" for c in rz.commands())
+
+
+def test_a_step_into_nothing_is_named_not_shown_as_a_result(rz):
+    # A step INTO a call through the import table leaves the PC where nothing is mapped. rizin 0.9.1 says
+    # nothing about that step, and says "Trap" only at the next one.
+    sid = _started(rz, "0x140001499")
+    state = _run(rz, sid, "step")
+    assert state["pc"] == 0 and state["stopped"] == "trap"
+    state = _run(rz, sid, "step")
+    assert state["pc"] == 0 and state["stopped"] == "trap"
+
+
+def test_skip_passes_a_call_through_the_import_table_too(rz):
+    # rizin 0.9.1's aess skips a direct call but runs call qword [import] (type ircall): the PC would be in
+    # nothing. The server sets the PC after the call itself.
+    sid = _started(rz, "0x140001499")
+    mark = len(rz.commands())
+    state = _run(rz, sid, "skip")
+    assert state["pc"] == 0x14000149F and state["stopped"] == "step"
+    since = _commands_since(rz, mark)
+    assert "aepc 0x14000149f" in since and "aess" not in since
+    # the stack was not touched: nothing was called
+    assert next(r["value"] for r in state["registers"] if r["name"] == "rsp") == 0x178000
+
+
+def test_over_runs_a_call_through_the_import_table_to_its_return_address(rz):
+    # rizin 0.9.1's aeso steps over a direct call only; for the others the server runs to the next address
+    sid = _started(rz, "0x140001499")
+    mark = len(rz.commands())
+    state = _run(rz, sid, "over")
+    since = _commands_since(rz, mark)
+    assert "aesu 0x14000149f" in since and "aeso" not in since
+    # the fake's callee is nothing: the call ends where nothing can execute, and says so
+    assert state["pc"] == 0 and state["stopped"] == "trap"
+
+
+def test_to_call_stops_before_the_next_call_of_any_kind(rz):
+    sid = _started(rz, "0x140001490")  # sub rsp; mov ecx; call qword [Sleep]
+    mark = len(rz.commands())
+    state = _run(rz, sid, "to_call")
+    assert state["pc"] == 0x140001499 and state["stopped"] == "step"
+    since = _commands_since(rz, mark)
+    assert "aesu 0x140001499" in since and "aecc" not in since
+    # standing before a call, it runs that call, as rizin's aecc does: the next one is the one after it
+    state = _run(rz, sid, "to_call")
+    assert state["pc"] == 0 and state["stopped"] == "trap"
+
+
+def test_to_call_stands_still_when_one_step_reaches_a_call(rz):
+    sid = _started(rz, "0x140001440")  # sub rsp; call sym.main
+    mark = len(rz.commands())
+    state = _run(rz, sid, "to_call")
+    assert state["pc"] == 0x140001444 and state["stopped"] == "step"
+    assert not any(c.startswith("aesu") for c in _commands_since(rz, mark))
+
+
+def test_to_call_takes_the_jumps_on_the_way(rz):
+    # cmp; jle (falls through in the fake); then a block of nops and the call qword [CreateNamedPipeA]
+    sid = _started(rz, "0x1400014c5")
+    state = _run(rz, sid, "to_call")
+    assert state["pc"] == 0x1400015B9 and state["stopped"] == "step"
+    assert rz.commands().count("aes") >= 2  # the first step and the jle
+
+
+def test_to_call_stops_at_a_breakpoint_on_the_way(rz):
+    sid = _started(rz, "0x140001490")
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "db @ 0x140001499"})
+    state = _run(rz, sid, "to_call")
+    assert state["pc"] == 0x140001499 and state["stopped"] == "breakpoint"
+
+
+def test_to_call_that_runs_into_the_timeout_says_so(rz, monkeypatch):
+    monkeypatch.setenv("FAKE_RIZIN_ESIL_RUNAWAY", "1")
+    sid = _started(rz, "0x140001490")
+    state = _run(rz, sid, "to_call")
+    assert state["stopped"] == "timeout" and state["pc"] == 0x140001494
+
+
+def test_step_back_returns_to_the_step_before_and_refuses_without_one(rz):
+    sid = _started(rz)
+    r = rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": "back"})
+    assert r.status_code == 400 and "step back" in r.get_json()["refused"]
+    _run(rz, sid, "step")
+    _run(rz, sid, "step")
+    assert _run(rz, sid, "back")["pc"] == 0x140001444
+    assert _run(rz, sid, "back")["pc"] == 0x140001440
+    r = rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": "back"})
+    assert r.status_code == 400 and "step back" in r.get_json()["refused"]
+    # only single steps are recorded: a back after any other run must not reach behind it
+    for kind in ("cont", "skip", "over"):
+        rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001499"})
+        _run(rz, sid, "step")
+        _run(rz, sid, kind)
+        r = rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": "back"})
+        assert r.status_code == 400 and "step back" in r.get_json()["refused"], kind
+
+
+def test_a_step_back_that_moves_nothing_is_refused_not_shown_as_a_step(rz, monkeypatch):
+    # rizin 0.9.1 (pipesim: step, step, back, step, step, back, back): the step after a back does not move,
+    # and the last back stayed where it was. Not a step back, whatever the state says.
+    monkeypatch.setenv("FAKE_RIZIN_AESB_NOOP", "1")
+    sid = _started(rz)
+    _run(rz, sid, "step")
+    r = rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": "back"})
+    assert r.status_code == 400 and "did not step back" in r.get_json()["refused"]
+
+
+def test_only_single_steps_are_recorded_for_step_back(rz):
+    # aets+ records every instruction: 5 s of aec took 880 MB of rizin's memory (measured)
+    sid = _started(rz)
+    _run(rz, sid, "step")
+    _run(rz, sid, "step")
+    assert rz.commands().count("aets+") == 1
+    mark = len(rz.commands())
+    _run(rz, sid, "cont")
+    since = _commands_since(rz, mark)
+    assert since.count("aets-") == 1 and since.index("aets-") < since.index("aec")
+    mark = len(rz.commands())
+    _run(rz, sid, "cont")
+    assert "aets-" not in _commands_since(rz, mark)
+
+
+def test_a_run_sets_the_guards_again_and_checks_what_the_console_may_have_changed(rz):
+    import rizin_sessions
+
+    sid = _started(rz)
+    # esil.timeout=0 would turn the bounded run into an endless one
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "e esil.timeout=0"})
+    mark = len(rz.commands())
+    _run(rz, sid, "step")
+    since = _commands_since(rz, mark)
+    settings = next(c for c in since if c.startswith("e ") and "io.cache=" in c)
+    assert f"esil.timeout={rizin_sessions.ESIL_TIMEOUT:g}" in settings.split()
+    assert since.index(settings) < since.index("aes")
+    # set after aei, esil.exectrap takes effect (rizin 0.9.1 ignores it at the start), and esil.verbose
+    # makes an invalid read or write say so
+    assert "esil.exectrap=true" in settings.split() and "esil.verbose=1" in settings.split()
+    # io.cache switched off in the console is switched on again by that
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "e io.cache=false"})
+    assert _run(rz, sid, "step")["stopped"] == "step"
+
+
+def test_a_run_is_refused_when_io_cache_does_not_hold(rz, monkeypatch):
+    # The start switched io.cache on; the console switches it off, and rizin does not take it on again
+    monkeypatch.setenv("FAKE_RIZIN_IO_CACHE_ONCE", "1")
+    sid = _started(rz)
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "e io.cache=false"})
+    mark = len(rz.commands())
+    r = rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": "step"})
+    assert r.status_code == 400 and "io.cache" in r.get_json()["refused"]
+    assert not any(c.split(" ")[0] in ("aes", "aec", "aets+") for c in _commands_since(rz, mark))
+
+
+def test_a_run_is_refused_when_the_console_unmapped_the_stack(rz):
+    sid = _started(rz)
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "aeim-"})
+    mark = len(rz.commands())
+    r = rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": "step"})
+    assert r.status_code == 400 and "stack" in r.get_json()["refused"]
+    assert not any(c.split(" ")[0] in ("aes", "aec") for c in _commands_since(rz, mark))
+
+
+def test_every_run_command_is_given_more_time_than_esil_timeout_but_less_than_the_console(rz, monkeypatch):
+    import rizin_sessions
+
+    seen = []
+    real = rizin_sessions.RizinPipe.console
+
+    def console(self, text, timeout=rizin_sessions.CONSOLE_TIMEOUT, limit=rizin_sessions.CONSOLE_LIMIT):
+        seen.append((text, timeout))
+        return real(self, text, timeout, limit)
+
+    monkeypatch.setattr(rizin_sessions.RizinPipe, "console", console)
+    sid = _started(rz, "0x140001490")
+    for kind in ("to_call", "step", "over", "cont"):
+        _run(rz, sid, kind)
+    commands = {text.split(" ")[0] for text, _ in seen if text.startswith("ae")}
+    assert {"aes", "aesu", "aec"} <= commands
+    for text, timeout in seen:
+        if text.startswith("ae"):
+            assert rizin_sessions.ESIL_TIMEOUT < timeout < rizin_sessions.CONSOLE_TIMEOUT, text
+
+
+def test_a_run_drops_the_cached_lists(rz):
+    sid = rz.session()
+    rz.read(f"/api/rizin/{sid}/strings")
+    before = rz.commands().count("izj")
+    rz.read(f"/api/rizin/{sid}/strings")
+    assert rz.commands().count("izj") == before, "the strings should have been cached"
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    _run(rz, sid, "step")
+    rz.read(f"/api/rizin/{sid}/strings")
+    assert rz.commands().count("izj") == before + 1, "a run changes bytes, so the strings are read again"
+
+
+def test_a_missing_stack_pointer_is_refused_not_a_server_error(rz, monkeypatch):
+    # `ar SP` answers nothing: stack_map used to compare None with the map and raise TypeError (500)
+    monkeypatch.setenv("FAKE_RIZIN_NO_SP", "1")
+    sid = rz.session()
+    r = rz.post(f"/api/rizin/{sid}/emulation/start", {})
+    assert r.status_code == 400 and "stack" in r.get_json()["refused"]
+
+
+@pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
+@pytest.mark.skipif(not MINGW, reason="mingw (x86_64-w64-mingw32-gcc) not installed")
+def test_real_rizin_runs_an_emulation(tmp_path, monkeypatch):
+    """The start sequence and every run kind against rizin 0.9.1 itself: what the fake models.
+
+    sym.watchdog is `sub rsp, 0x28; mov ecx, 90000; call qword [Sleep]; ...`: a call through the import
+    table, whose callee rizin's emulation cannot run (the import table holds RVAs, nothing is mapped there).
+    """
+    import rizin_sessions
+
+    exe = _build_pipesim(tmp_path)
+    before = hashlib.sha256(exe.read_bytes()).hexdigest()
+    mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(tmp_path / "projects"))
+    try:
+        opened = mgr.open(str(exe), "tab")
+        session = mgr.get(opened["session"])
+        assert _wait_state(session, "done", timeout=120)["state"] == "done"
+        watchdog = next(f["offset"] for f in session.json("aflj") if f["name"] == "sym.watchdog")
+        ops = session.json(f"pdfj @ {watchdog:#x}")["ops"]
+        call = next(op for op in ops if op["type"].endswith("call"))
+        assert call["type"] == "ircall", "call qword [import]: the call that aecc, aess and aeso mishandle"
+        after_call = call["offset"] + call["size"]
+
+        def register(state, name):
+            return next(r["value"] for r in state["registers"] if r["name"] == name)
+
+        # start: the PC is where it was asked, the stack is mapped around rsp, nothing has stopped yet
+        state = session.emulation_start(watchdog)
+        assert state["pc"] == watchdog and state["running"] is True and state["stopped"] is None
+        assert len(state["stack"]) == rizin_sessions.RIZIN_STACK_ROWS
+        sp = register(state, "rsp")
+        assert rizin_sessions.ESIL_STACK_ADDR < sp < rizin_sessions.ESIL_STACK_ADDR + rizin_sessions.ESIL_STACK_SIZE
+
+        # step: the PC moves as rizin moves it, and says why it stopped
+        state = session.emulation_run("step")
+        assert state["pc"] == ops[1]["offset"] and state["stopped"] == "step" and "rip" in state["changed"]
+        assert register(state, "rsp") == sp - 0x28
+        state = session.emulation_run("step")
+        assert state["pc"] == call["offset"] and register(state, "rcx") == 90000
+        assert "rcx" in state["changed"]
+        # back: the registers go back one step (rizin restores no memory, but this step wrote none)
+        state = session.emulation_run("back")
+        assert state["pc"] == ops[1]["offset"] and register(state, "rcx") == 0 and state["stopped"] == "step"
+        session.emulation_run("cont")
+        with pytest.raises(rizin_sessions.RizinRefused) as refused:
+            session.emulation_run("back")  # a cont is not recorded: nothing to go back to
+        assert "step back" in refused.value.reason
+
+        # to_call: stops before the call through the import table (aecc runs past it); until does as well
+        session.emulation_start(watchdog)
+        state = session.emulation_run("to_call")
+        assert state["pc"] == call["offset"] and state["stopped"] == "step"
+        session.emulation_start(watchdog)
+        assert session.emulation_run("until", call["offset"])["pc"] == call["offset"]
+
+        # skip passes the call, which the server has to do itself for call qword [import]
+        state = session.emulation_run("skip")
+        assert state["pc"] == after_call and state["stopped"] == "step"
+        assert register(state, "rsp") == sp - 0x28, "nothing was called, so nothing was pushed"
+
+        # a step into the call ends where nothing is mapped: named, not shown as a result
+        session.emulation_start(watchdog)
+        session.emulation_run("until", call["offset"])
+        state = session.emulation_run("step")
+        assert state["pc"] != after_call and state["pc"] < 0x100000 and state["stopped"] == "trap"
+        state = session.emulation_run("step")  # rizin says it now, on stderr
+        assert state["stopped"] == "trap"
+        # over a call through the import table runs it (aeso would step into it: the same place)
+        session.emulation_start(watchdog)
+        session.emulation_run("until", call["offset"])
+        assert session.emulation_run("over")["stopped"] == "trap"
+
+        # cont: a breakpoint it stands on is not hit again (rizin runs the instruction first), the next is
+        session.emulation_start(watchdog)
+        session.console(f"db @ {watchdog:#x}")
+        session.console(f"db @ {call['offset']:#x}")
+        state = session.emulation_run("cont")
+        assert state["pc"] == call["offset"] and state["stopped"] == "breakpoint"
+        state = session.emulation_run("cont")  # on into the call: nothing can execute there
+        assert state["stopped"] == "trap" and state["pc"] != call["offset"]
+        session.console(f"db- @ {watchdog:#x}")
+        session.console(f"db- @ {call['offset']:#x}")
+
+        # an endless loop (written into the cache): cont stops at esil.timeout, to_call at its own deadline;
+        # the session goes on
+        monkeypatch.setattr(rizin_sessions, "ESIL_TIMEOUT", 1.0)
+        monkeypatch.setattr(rizin_sessions, "ESIL_SETTINGS", tuple(
+            "esil.timeout=1" if c.startswith("esil.timeout=") else c for c in rizin_sessions.ESIL_SETTINGS))
+        session.emulation_start(watchdog)
+        session.console(f"wx ebfe @ {watchdog:#x}")
+        started = time.monotonic()
+        state = session.emulation_run("cont")
+        assert state["stopped"] == "timeout" and state["pc"] == watchdog
+        assert 0.9 < time.monotonic() - started < 10
+        state = session.emulation_run("to_call")
+        assert state["stopped"] == "timeout" and state["pc"] == watchdog
+        assert session.emulation_state()["running"] is True
+        assert session.json("ij")["core"]["file"] == str(exe)
+    finally:
+        mgr.shutdown()
+    assert hashlib.sha256(exe.read_bytes()).hexdigest() == before, "the sample must never be written"
 
 
 def test_readable_takes_only_drive_paths_on_windows(tdc, monkeypatch):
