@@ -248,22 +248,57 @@ def _row(addr, size, after="90"):
 
 def test_patch_rows_mark_only_what_this_session_wrote():
     rows = [_row(0x1000, 2, "9090"), _row(0x20, 1, "41"), _row(0x1000, 1, "cc"), _row(0x1001, 2, "4142")]
-    marked = rizin_emulation.patch_rows(rows, {0x1000, 0x1001})
-    # sorted by address, rizin's order kept where two writes sit at the same one (the newer one last)
+    mine = [rizin_emulation.cache_entry(0x1000, b"\x90\x90"), rizin_emulation.cache_entry(0x1000, b"\xcc")]
+    marked, kept = rizin_emulation.patch_rows(rows, mine)
+    # sorted by address, rizin's order kept where two writes sit at one address (the newer one last)
     assert [(r["addr"], r["after"], r["mine"]) for r in marked] == [
         (0x20, "41", False),            # a run's write elsewhere
         (0x1000, "9090", True),         # this session's patch
         (0x1000, "cc", True),           # and a write of this session over it
         (0x1001, "4142", False)]        # reaches past what this session wrote
     assert all(set(r) == {"addr", "size", "before", "after", "mine"} for r in marked)
-    assert [r["mine"] for r in rizin_emulation.patch_rows(rows, set())] == [False] * 4
+    assert kept == mine
+    assert [r["mine"] for r in rizin_emulation.patch_rows(rows, [])[0]] == [False] * 4
 
 
-def test_cache_covers_keeps_only_the_addresses_a_row_still_holds():
-    rows = [_row(0x1000, 2, "9090"), _row(0x20, 1, "41")]
-    assert rizin_emulation.cache_covers(rows, {0x1000, 0x1001, 0x1002, 0x20}) == {0x1000, 0x1001, 0x20}
-    assert rizin_emulation.cache_covers([], {0x1000}) == set()
-    assert rizin_emulation.cache_covers(rows, set()) == set()
+def test_patch_rows_do_not_claim_a_foreign_write_inside_a_patch():
+    """The hole an address set cannot see: a run (or the console) writing into the range this session
+    patched. Its row is another row of the cache, so it is matched against the mirror, not the range."""
+    mine = [rizin_emulation.cache_entry(0x1000, bytes.fromhex("9090909090"))]
+    rows = [_row(0x1000, 5, "9090909090"), _row(0x1002, 1, "41")]
+    marked, kept = rizin_emulation.patch_rows(rows, mine)
+    assert [(r["addr"], r["after"], r["mine"]) for r in marked] == [
+        (0x1000, "9090909090", True), (0x1002, "41", False)]
+    assert kept == mine
+    # the same bytes at the same address: one row of the two counts as this session's, and it makes no
+    # difference which, because either one exports and persists the same byte
+    same = [_row(0x1000, 1, "90"), _row(0x1000, 1, "90")]
+    marked, kept = rizin_emulation.patch_rows(same, [rizin_emulation.cache_entry(0x1000, b"\x90")])
+    assert [r["mine"] for r in marked] == [True, False] and len(kept) == 1
+    # a foreign write of the same length at the same address, made *before* this session's: the bytes
+    # are part of what is matched, so the foreign row is not the one claimed
+    mine = [rizin_emulation.cache_entry(0x1000, b"\x90")]
+    marked, kept = rizin_emulation.patch_rows([_row(0x1000, 1, "41"), _row(0x1000, 1, "90")], mine)
+    assert [(r["after"], r["mine"]) for r in marked] == [("41", False), ("90", True)]
+    assert kept == mine
+
+
+def test_patch_rows_drop_a_write_the_cache_no_longer_holds():
+    """rizin's cache is append-only and a removal keeps the order of the rest (measured), so a write
+    whose row is gone is dropped from the mirror -- the rows after it stay this session's."""
+    mine = [rizin_emulation.cache_entry(0x10, b"\x11"), rizin_emulation.cache_entry(0x200, b"\x22"),
+            rizin_emulation.cache_entry(0x400, b"\x33")]
+    rows = [_row(0x10, 1, "11"), _row(0x400, 1, "33")]           # the middle one was taken back
+    marked, kept = rizin_emulation.patch_rows(rows, mine)
+    assert [(r["addr"], r["mine"]) for r in marked] == [(0x10, True), (0x400, True)]
+    assert kept == [mine[0], mine[2]]
+    # and with the whole cache gone (wc-*) nothing is left to claim
+    assert rizin_emulation.patch_rows([], mine) == ([], [])
+
+
+def test_cache_entry_is_the_write_in_the_shape_wcj_reports_it():
+    assert rizin_emulation.cache_entry(0x1000, b"\x90\x90") == (0x1000, 2, "9090")
+    assert rizin_emulation.cache_entry(0x20, bytearray(b"\x0f\x84")) == (0x20, 2, "0f84")
 
 
 def test_hex_data_takes_an_even_number_of_hex_digits():
@@ -274,6 +309,9 @@ def test_hex_data_takes_an_even_number_of_hex_digits():
     for value in ("9", "zz", "90 90", "", "0x90", "90" * 4097, b"", b"\x90" * 4097, None, 144, True):
         with pytest.raises(ValueError):
             rizin_emulation.hex_data(value)
+    # the length is checked before the string is parsed, so a field of megabytes is refused by its size
+    with pytest.raises(ValueError, match="at most"):
+        rizin_emulation.hex_data("zz" * 500000)
 
 
 def test_instruction_at_takes_the_op_pdj_decoded_there():

@@ -1121,9 +1121,10 @@ class RizinSession:
         self._emulation_before = self._emulation_after = None
         self._emulation_big_endian = False
         self._emulation_stack_map = None
-        # The byte addresses this session wrote through patch/patch_op. rizin has one write cache, which
-        # holds an emulation run's writes too and cannot tell them apart; this set can (see patches).
-        self._mine = set()
+        # This session's own writes through patch/patch_op, in the order it made them (rizin_emulation.
+        # cache_entry). rizin has one write cache, which holds an emulation run's writes too and cannot
+        # tell them apart; this mirror can, row by row (see patches).
+        self._mine = []
         self._pipe, contained, level, mode, note = self._boot()
         try:
             self._read_file_info()
@@ -1546,15 +1547,19 @@ class RizinSession:
 
         One row per write operation, not per byte: a two-byte ``wx`` is one row of size 2, and a second
         write over the same address is another row whose ``before`` is what the first one wrote
-        (measured). ``mine`` is this session's own patch, as against what an emulation run wrote into
-        the same cache. rizin's own ``idx`` and ``written`` are left out: the index changes with every
+        (measured). ``mine`` is this session's own patch, row by row, as against what an emulation run
+        or the console wrote into the same cache -- also where that write lies inside a range this
+        session patched. rizin's own ``idx`` and ``written`` are left out: the index changes with every
         removal, and nothing here ever commits the cache, so ``written`` is always false.
         """
         return self._call("emulation", wait, self._patch_list)
 
     def unpatch(self, addr=None, wait=2.0):
-        """Take the write at ``addr`` back (``wc-``), or the whole cache (``wc-*``) when ``addr`` is
-        None; returns {"patches": the list}. Taking back where there is nothing is no error.
+        """Take back every write that overlaps ``addr`` (``wc-``), or the whole cache (``wc-*``) when
+        ``addr`` is None; returns {"patches": the list}. Taking back where there is nothing is no error.
+
+        rizin removes a write operation whole, so taking back one byte of a longer ``wx`` takes all of
+        it, and two writes at one address go together (measured); the list says what is left.
 
         ``wc-*`` takes an emulation run's bytes with it, because rizin has one cache for both; the list
         says which of them are this session's own.
@@ -1565,7 +1570,7 @@ class RizinSession:
         def run(pipe):
             if addr is None:
                 pipe.cmd("wc-*")
-                self._mine = set()
+                self._mine = []
             else:
                 # The range, not the address: `wc- <addr>` with no second argument drops every write in
                 # a whole block (0x100 bytes) from there, the neighbours' included (measured).
@@ -1583,19 +1588,19 @@ class RizinSession:
             pipe.cmd("e io.cache=true")  # the emulation's start sets it too, but a patch needs no start
         self._require_io_cache(pipe, "the patch")
         pipe.cmd(f"wx {data.hex()} @ {addr:#x}")
-        self._mine |= set(range(addr, addr + len(data)))
+        self._mine.append(rizin_emulation.cache_entry(addr, data))
         found = self._patch_list(pipe)
         if not any(r["addr"] <= addr < r["addr"] + r["size"] for r in found):
             raise RizinRefused(f"rizin wrote nothing at {addr:#x}")
         return {"patches": found}
 
     def _patch_list(self, pipe):
-        """The write cache as the patch list (gate held), and this session's own addresses kept honest:
-        an address no write operation holds any more (a console ``wc-``, a rizin that was restarted) is
-        dropped from the set, so that what a run writes there later is not taken for a patch."""
-        rows = rizin_emulation.parse_cache(pipe.cmd("wcj"))
-        self._mine = rizin_emulation.cache_covers(rows, self._mine)
-        return rizin_emulation.patch_rows(rows, self._mine)
+        """The write cache as the patch list (gate held), and the mirror of this session's own writes
+        kept honest: a write no row of the cache holds any more (a console ``wc-``, a rizin that was
+        restarted) is dropped from it, so that a later write there is not taken for a patch."""
+        rows, self._mine = rizin_emulation.patch_rows(rizin_emulation.parse_cache(pipe.cmd("wcj")),
+                                                      self._mine)
+        return rows
 
     def _require_emulation(self, pipe):
         # A rizin that was restarted (a hung analysis step) has no emulation, whatever ran before.

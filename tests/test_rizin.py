@@ -3319,19 +3319,40 @@ def test_a_patch_kind_that_does_not_apply_is_refused(rz):
 
 def test_what_this_session_wrote_stays_its_own(rz):
     """`mine` decides what is kept, re-analysed and exported, so it survives a neighbour being taken
-    back and a second write to the same address, and `wc-*` leaves this session claiming nothing."""
+    back and a second write to the same address, claims no foreign write inside a patch of its own, and
+    leaves this session claiming nothing after `wc-*`."""
     sid = rz.session()
     _patch(rz, sid, addr="0x140001440", bytes="9090")
     _patch(rz, sid, addr="0x140001450", bytes="41")
     rz.delete(f"/api/rizin/{sid}/patch", {"addr": "0x140001450"})
     assert [(r["addr"], r["mine"]) for r in _patches(rz, sid)] == [(0x140001440, True)]
 
+    # a write by somebody else *inside* the patched range is its own row, and not this session's
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "wx 41 @ 0x140001441"})
+    assert [(r["addr"], r["after"], r["mine"]) for r in _patches(rz, sid)] == [
+        (0x140001440, "9090", True), (0x140001441, "41", False)]
+
+    # one of the same length at an address this session then patches as well: the row made before it
+    # stays foreign, the session's own is the one claimed
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "wx 41 @ 0x140001460"})
+    _patch(rz, sid, addr="0x140001460", bytes="90")
+    assert [(r["addr"], r["after"], r["mine"]) for r in _patches(rz, sid)][-2:] == [
+        (0x140001460, "41", False), (0x140001460, "90", True)]
+    rz.delete(f"/api/rizin/{sid}/patch", {"addr": "0x140001460"})
+
     # and the address that was taken back is not claimed any more: what writes there next is not ours
     rz.send(f"/api/rizin/{sid}/console", {"cmd": "wx 42 @ 0x140001450"})
-    assert [(r["addr"], r["mine"]) for r in _patches(rz, sid)] == [(0x140001440, True), (0x140001450, False)]
-    rz.delete(f"/api/rizin/{sid}/patch", {"addr": "0x140001450"})
+    assert [(r["addr"], r["mine"]) for r in _patches(rz, sid)] == [
+        (0x140001440, True), (0x140001441, False), (0x140001450, False)]
+
+    # taking back one byte of a write takes the whole write: rizin drops every row that overlaps the
+    # range, so the two-byte patch goes with the foreign byte inside it
+    rz.delete(f"/api/rizin/{sid}/patch", {"addr": "0x140001441"})
+    assert [(r["addr"], r["mine"]) for r in _patches(rz, sid)] == [(0x140001450, False)]
+    rz.delete(f"/api/rizin/{sid}/patch", {})
 
     # a second write at the same address: rizin stacks the operations and both are this session's
+    _patch(rz, sid, addr="0x140001440", bytes="9090")
     _patch(rz, sid, addr="0x140001440", bytes="cccc")
     rows = _patches(rz, sid)
     assert [(r["addr"], r["before"], r["after"], r["mine"]) for r in rows] == [
@@ -3426,6 +3447,21 @@ def test_real_rizin_patches_through_the_cache(tdc, tmp_path, monkeypatch):
         assert nopped == [0x90] * call["size"]
         patched = api.read(f"/api/rizin/{sid}/disasm?addr={call['offset']}&count=60")["ops"]
         assert next(op for op in patched if op["offset"] == call["offset"])["type"] == "nop"
+
+        # flip and always against the binary: the two kinds that would silently invert what the analyst
+        # asked for. rizin reads the bytes back as the opposite jump, and as a jump to the same address.
+        jump = next(op for op in ops if op["type"] == "cjmp")
+        api.send(f"/api/rizin/{sid}/patch", {"addr": jump["offset"], "kind": "flip"})
+        flipped = next(op for op in api.read(
+            f"/api/rizin/{sid}/disasm?addr={jump['offset']}&count=60")["ops"] if op["offset"] == jump["offset"])
+        assert flipped["type"] == "cjmp" and flipped["jump"] == jump["jump"], "the same target"
+        assert flipped["text"].split(" ")[0] != jump["text"].split(" ")[0], (jump["text"], flipped["text"])
+        api.send(f"/api/rizin/{sid}/patch", {"addr": jump["offset"], "kind": "always"})
+        always = next(op for op in api.read(
+            f"/api/rizin/{sid}/disasm?addr={jump['offset']}&count=60")["ops"] if op["offset"] == jump["offset"])
+        assert always["type"] == "jmp" and always["jump"] == jump["jump"], (always, jump)
+        assert always["size"] <= jump["size"], "the patch is no longer than the instruction it covers"
+        api.remove(f"/api/rizin/{sid}/patch", {"addr": jump["offset"]})
 
         # what a run writes lands in the same cache and stays the run's: a step into a call pushes the
         # return address, and that write is one row of the cache too (measured)

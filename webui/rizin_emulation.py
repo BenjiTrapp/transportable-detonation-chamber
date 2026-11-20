@@ -4,6 +4,7 @@ rizin_sessions runs the commands; what their answers mean is decided here, where
 wrong value would silently show a wrong register, stack word or pointer.
 """
 
+import bisect
 import json
 import re
 
@@ -198,6 +199,9 @@ _HEX_RE = re.compile(r"(?:[0-9a-fA-F]{2})+")
 def hex_data(value):
     """The bytes of a patch from a request: ``value`` is already bytes, or an even-length string of hex
     digits (nothing else, so a command cannot hide in it); at most MAX_PATCH_BYTES of them."""
+    if isinstance(value, str) and len(value.strip()) > 2 * MAX_PATCH_BYTES:
+        # the length first: a field of megabytes is refused before it is parsed
+        raise ValueError(f"bytes must be at most {MAX_PATCH_BYTES} bytes")
     if isinstance(value, (bytes, bytearray)):
         data = bytes(value)
     elif isinstance(value, str) and _HEX_RE.fullmatch(value.strip()):
@@ -311,25 +315,40 @@ def parse_cache(text):
     return rows
 
 
-def cache_covers(rows, addresses):
-    """Those of ``addresses`` that a write operation of ``rows`` still holds: what a session may go on
-    calling its own after a wc- somewhere else took entries out of the cache."""
-    kept = set()
-    for row in rows:
-        start, end = row["addr"], row["addr"] + row["size"]
-        # whichever side is smaller: a run can leave millions of rows, a session's own writes are few
-        if row["size"] > len(addresses):
-            kept.update(addr for addr in addresses if start <= addr < end)
-        else:
-            kept.update(addr for addr in range(start, end) if addr in addresses)
-    return kept
+def cache_entry(addr, data):
+    """One write of this session for the mirror ``patch_rows`` matches against: (addr, size, after) in
+    the shape ``wcj`` reports it (rizin's hex is lower case, as bytes.hex() is)."""
+    return addr, len(data), bytes(data).hex()
 
 
 def patch_rows(rows, mine):
-    """``parse_cache``'s rows as the patch list, lowest address first: each with "mine", whether every
-    byte of that write came from this session (the addresses in ``mine``) rather than from an emulation
-    run, which writes into the same cache. rizin's order is kept where two writes sit at one address."""
-    marked = [dict(row, mine=row["size"] <= len(mine)
-                   and all(addr in mine for addr in range(row["addr"], row["addr"] + row["size"])))
-              for row in rows]
-    return sorted(marked, key=lambda row: row["addr"])
+    """``parse_cache``'s rows as the patch list, and the mirror of this session's own writes as it
+    stands afterwards: (rows lowest address first, the mirror entries the cache still holds).
+
+    ``mine`` is this session's writes in the order it made them, each as ``cache_entry`` gives it.
+    rizin's cache is append-only (a second write over the same address becomes another row *after* the
+    rows made before it) and a removal drops whole rows and keeps the order of the rest, both measured.
+    So the session's writes are a subsequence of ``rows``: each row is matched, in order, to the first
+    mirror entry at or after the last match whose address, size and bytes are the same, and only a
+    matched row is "mine". A row no mirror entry matches is foreign even where this session owns the
+    address -- what an emulation run or a console ``wx`` wrote into a range this session patched. A
+    mirror entry that no row matches any more was taken out of the cache and is dropped from the mirror.
+
+    Two writes of the same bytes to the same address cannot be told apart; either of them exports and
+    persists the same byte, which is why that case is left as it is.
+    """
+    places = {}
+    for index, entry in enumerate(mine):
+        places.setdefault(entry, []).append(index)
+    marked, kept, at = [], [], 0
+    for row in rows:
+        spots = places.get((row["addr"], row["size"], row["after"]), ())
+        where = bisect.bisect_left(spots, at)  # the first of those writes at or after the last match
+        index = spots[where] if where < len(spots) else None
+        if index is None:
+            marked.append(dict(row, mine=False))
+            continue
+        marked.append(dict(row, mine=True))
+        kept.append(mine[index])
+        at = index + 1
+    return sorted(marked, key=lambda row: row["addr"]), kept
