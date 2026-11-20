@@ -53,8 +53,11 @@ x86-64-Blob mit einer XOR-Entschlüsselungsschleife und einem `call` ins Leere.
 | `px 8 @ 0x1000` zeigte nach dem Lauf die **entschlüsselten** Bytes | HEX und DISASSEMBLY zeigen das Ergebnis von allein — keine neue Plumbing-Schicht. **FUNCTIONS und STRINGS nicht:** die baut rizin beim Laden aus den Sektionen (siehe §7) |
 | **Ohne `io.cache=true` sind die Schreibzugriffe verloren** (`px` zeigte weiter das Original) | `io.cache=true` ist für die Emulation *zwingend*, nicht optional. Emulation und Patching hängen am selben Mechanismus |
 | SHA-256 der Datei vor und nach dem Lauf **identisch** | Das Anti-Ziel „Sample wird auf der Platte verändert" hält |
-| `wcj` liefert die Patch-Liste als JSON: `{idx, addr, size, before, after, written}` | Fertige Datenquelle für die Patch-Ansicht, mit before/after |
-| `wc- <addr>` nimmt einen Patch zurück, `wc-*` alle | Zurücknehmen ist nativ, einzeln und ganz |
+| `wcj` liefert pro **Schreibvorgang** eine Zeile (nicht pro Byte): `wx 9090 @ 0x0e` gibt eine mit `size 2`, `before 8036`, `after 9090`, vier Einzelbyte-Schreibvorgänge geben vier | Die Patch-Ansicht zeigt Schreibvorgänge, und die Zeilen tragen `size` samt vollem Hex in `before`/`after` |
+| `wc-` **löscht blockweise, nicht einzeln**: nach Patches auf 0x100, 0x180 und 0x300 entfernte `wc- 0x100` auch den bei 0x180 (der ganze 0x100-Block), 0x300 blieb. Die Bereichsform `wc- 0x100 0x101` trifft genau einen | Einen Patch zurücknehmen heißt `wc- <addr> <addr+1>`. Mit `wc- <addr>` allein hätte das Zurücknehmen eines Patches bis zu 255 fremde Bytes stumm mitgelöscht |
+| `wc-*` setzt alles zurück | Alles zurücknehmen ist nativ |
+| **`wcj` ist in 0.9.1 kein gültiges JSON**: kommagetrennte Objekte ohne umschließende `[ ]` | Die Liste wird als Text gelesen und selbst geparst, nicht mit `cmdj` *(Korrektur: eine frühere Messung notierte „als JSON", obwohl ihre eigene Ausgabe die Klammern schon nicht zeigte)* |
+| `pdj` nennt kein `mnemonic` | Die Patch-Bytes werden aus `size`, `bytes` und `type` berechnet |
 | `db @ <addr>` setzt, `dblj` listet als JSON (`addr`, `enabled`, `cond`, `hw`), `aec` hält an: `[ESIL] hit breakpoint at 0x14` | Echte Breakpoints, vom ESIL-Motor beachtet. `db` **ohne** `@` nimmt kein Argument |
 | `aec` von einem Breakpoint aus läuft **weiter**, er trifft ihn nicht erneut: Haltepunkt auf 0x19 (einmal erreicht), das erste `aec` hält dort, das zweite läuft bis `esil.timeout`. rizin prüft Breakpoints *nach* dem Befehl | **Kein Step-off nötig.** *(Korrektur einer früheren Messung, die den Haltepunkt mitten in eine vierfache Schleife setzte und die vier Durchläufe als vier Treffer derselben Stelle las.)* |
 | `dbd` verhindert das Anhalten **nicht** — nur `db-` entfernt einen Breakpoint wirksam | Ein ausgeschalteter Breakpoint hält trotzdem: die Oberfläche bietet kein „aus" an, oder löst es über `db-` |
@@ -220,7 +223,8 @@ bedienbaren Schritt:
   - **Call ausknipsen** — den `call` zu `nop`s, Länge erhalten.
   Dazu ein Feld für Bytes von Hand, das auch über mehrere Befehle reicht.
 - **Patch-Liste** aus `wcj`: Adresse, Größe, before, after, die Funktion
-  dazu. Einzeln zurücknehmen (`wc- <addr>`), alle (`wc-*`).
+  dazu. Einzeln zurücknehmen (`wc- <addr> <addr+1>` — die Bereichsform, weil
+  `wc- <addr>` allein einen ganzen 0x100-Block löscht), alle (`wc-*`).
 - Patches und Emulations-Schreibzugriffe landen **im selben Cache** — rizin
   hat nur einen. Die Liste **muss deshalb beide auseinanderhalten**: TDC kennt
   die Adressen seiner eigenen `wx`-Aufrufe, alles andere im Cache kommt vom
