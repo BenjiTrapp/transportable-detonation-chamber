@@ -5295,8 +5295,11 @@ def _rizin_arg_text():
     return q.casefold()
 
 
-def _rizin_body():
+def _rizin_body(optional=False):
+    """The request's JSON object; with ``optional`` a request without a body counts as an empty one."""
     body = request.get_json(silent=True)
+    if body is None and optional:
+        return {}
     if not isinstance(body, dict):
         raise rizin_sessions.RizinRefused("a JSON object is expected")
     return body
@@ -5748,6 +5751,22 @@ def _rizin_emulation_register(session):
     return session.emulation_register(body.get("name"), _rizin_address(body.get("value"), "value"))
 
 
+def _rizin_breakpoint_set(session):
+    """POST: addr. There is no disabled breakpoint to ask for: rizin 0.9.1 stops a run at one whose
+    `enabled` is false all the same, so an `on` is refused rather than answered with an enabled one."""
+    body = _rizin_body()
+    if "on" in body:
+        raise rizin_sessions.RizinRefused("there is no 'on': rizin 0.9.1 stops at a disabled breakpoint "
+                                          "too, so remove it (DELETE) instead of switching it off")
+    return session.breakpoint_set(_rizin_address(body.get("addr")))
+
+
+def _rizin_breakpoint_clear(session):
+    """DELETE: addr removes that breakpoint; a request without one (an empty object, or no body) all."""
+    addr = _rizin_body(optional=True).get("addr")
+    return session.breakpoint_clear(None if addr is None else _rizin_address(addr))
+
+
 def _rizin_listable(path):
     try:
         return _readable(path) and os.path.isfile(path) and os.path.getsize(path) > 0
@@ -6029,6 +6048,22 @@ def api_rizin_emulation_run(sid):
 @app.route("/api/rizin/<sid>/emulation/register", methods=["POST"])
 def api_rizin_emulation_register(sid):
     return _rizin_call(sid, _rizin_emulation_register)
+
+
+@app.route("/api/rizin/<sid>/breakpoints")
+def api_rizin_breakpoints(sid):
+    """The breakpoints rizin holds, lowest address first; they need no running emulation."""
+    return _rizin_call(sid, lambda session: session.breakpoints())
+
+
+@app.route("/api/rizin/<sid>/breakpoints", methods=["POST"])
+def api_rizin_breakpoint_set(sid):
+    return _rizin_call(sid, _rizin_breakpoint_set)
+
+
+@app.route("/api/rizin/<sid>/breakpoints", methods=["DELETE"])
+def api_rizin_breakpoint_clear(sid):
+    return _rizin_call(sid, _rizin_breakpoint_clear)
 
 
 # --- ThreatCheck / DefenderCheck Integration ---

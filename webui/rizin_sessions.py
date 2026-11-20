@@ -1427,6 +1427,69 @@ class RizinSession:
             # at the jump that ends the straight code, or at bytes rizin cannot decode (it says why)
             out, err, _ = pipe.console("aes", timeout=timeout, tail=True)
 
+    def breakpoints(self, wait=2.0):
+        """The breakpoints rizin holds, lowest address first: [{"addr": int, "enabled": bool}].
+
+        They are rizin's own (``dblj``), not the emulation's: they can be set before it starts and they
+        survive it, so none of the three asks for a running emulation. ``enabled`` is reported as rizin
+        reports it, because a console ``dbd`` can set it; but rizin 0.9.1 stops a run at a disabled
+        breakpoint all the same (``rz_bp_get_at`` looks at neither ``enabled`` nor ``valid``), so nothing
+        here offers to change it: a breakpoint is set or it is removed.
+        """
+        return self._call("emulation", wait, self._breakpoint_list)
+
+    def breakpoint_set(self, addr, wait=2.0):
+        """Set a breakpoint at ``addr`` (``db @ addr``: rizin's db takes no address argument); returns
+        {"breakpoints": the list}.
+
+        One that is there already is left as it is, which is what rizin does too (it says "Breakpoint
+        already set at this address." and keeps it), so setting one twice is no error. An address rizin
+        leaves out of the list afterwards is refused rather than reported as set: on an arch whose
+        breakpoints are wider than a byte another one can cover it (measured on arm64, where ``db``'s size
+        is 4). An address outside every map is set: rizin warns and marks it ``valid: false``, and its runs
+        stop there all the same (measured).
+        """
+        addr = _address(addr)
+
+        def run(pipe):
+            pipe.cmd(f"db @ {addr:#x}")
+            found = self._breakpoint_list(pipe)
+            if not any(b["addr"] == addr for b in found):
+                raise RizinRefused(f"rizin set no breakpoint at {addr:#x}: another one may cover it already")
+            return {"breakpoints": found}
+
+        return self._call("emulation", wait, run)
+
+    def breakpoint_clear(self, addr=None, wait=2.0):
+        """Remove the breakpoint at ``addr`` (``db- @ addr``), or all of them when ``addr`` is None
+        (``db-*``); returns {"breakpoints": the list}. One that is not there is no error: what was asked
+        for is the state that is left."""
+        if addr is not None:
+            addr = _address(addr)
+
+        def run(pipe):
+            pipe.cmd("db-*" if addr is None else f"db- @ {addr:#x}")
+            found = self._breakpoint_list(pipe)
+            if addr is not None and any(b["addr"] == addr for b in found):
+                raise RizinRefused(f"rizin kept the breakpoint at {addr:#x}")
+            return {"breakpoints": found}
+
+        return self._call("emulation", wait, run)
+
+    @staticmethod
+    def _breakpoint_list(pipe):
+        """``dblj``'s breakpoints as addr and enabled, lowest address first (gate held); rizin lists them in
+        the order they were set. Its other fields (size, perm, hw, trace, valid, cond, data) belong to its
+        debugger and say nothing about an ESIL run."""
+        found = pipe.cmdj("dblj")
+        if found is None:
+            return []
+        if not isinstance(found, list):
+            raise ValueError("dblj did not answer a list of breakpoints")
+        rows = [{"addr": b["addr"], "enabled": bool(b.get("enabled"))} for b in found
+                if isinstance(b, dict) and isinstance(b.get("addr"), int) and not isinstance(b["addr"], bool)]
+        return sorted(rows, key=lambda b: b["addr"])
+
     def _require_emulation(self, pipe):
         # A rizin that was restarted (a hung analysis step) has no emulation, whatever ran before.
         if self._emulation is not pipe:

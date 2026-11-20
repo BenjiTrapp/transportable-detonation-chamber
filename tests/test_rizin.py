@@ -1612,6 +1612,9 @@ class _Api:
     def post(self, url, body=None, **kwargs):
         return self.client.post(url, json=body, **kwargs)
 
+    def delete(self, url, body=None, **kwargs):
+        return self.client.delete(url, json=body, **kwargs)
+
     @staticmethod
     def ok(response):
         assert response.status_code == 200, (response.status_code, response.get_json())
@@ -1622,6 +1625,9 @@ class _Api:
 
     def send(self, url, body=None):
         return self.ok(self.post(url, body))
+
+    def remove(self, url, body=None):
+        return self.ok(self.delete(url, body))
 
     def write(self, name, data=SAMPLE):
         path = self.allowed / name
@@ -3081,6 +3087,106 @@ def test_a_missing_stack_pointer_is_refused_not_a_server_error(rz, monkeypatch):
     assert r.status_code == 400 and "stack" in r.get_json()["refused"]
 
 
+def test_breakpoints_are_set_listed_and_cleared(rz):
+    sid = rz.session()
+    # POST and DELETE answer the list under "breakpoints"; GET answers it bare
+    assert rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001440"}) == {
+        "breakpoints": [{"addr": 0x140001440, "enabled": True}]}
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": 0x140001450})
+    assert rz.read(f"/api/rizin/{sid}/breakpoints") == [
+        {"addr": 0x140001440, "enabled": True}, {"addr": 0x140001450, "enabled": True}]
+    assert any(c.startswith("db @ 0x140001440") for c in rz.commands())
+    assert rz.remove(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001440"}) == {
+        "breakpoints": [{"addr": 0x140001450, "enabled": True}]}
+    assert [b["addr"] for b in rz.read(f"/api/rizin/{sid}/breakpoints")] == [0x140001450]
+    assert "db- @ 0x140001440" in rz.commands()
+    rz.remove(f"/api/rizin/{sid}/breakpoints", {})
+    assert rz.read(f"/api/rizin/{sid}/breakpoints") == []
+    assert "db-*" in rz.commands()
+
+
+def test_breakpoints_work_before_emulation_starts(rz):
+    # They are rizin's own, so they can be placed and then run into: no start is needed to set one.
+    sid = rz.session()
+    assert rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001440"})["breakpoints"]
+    assert rz.read(f"/api/rizin/{sid}/breakpoints") == [{"addr": 0x140001440, "enabled": True}]
+    assert "aei" not in rz.commands()
+
+
+def test_a_breakpoint_set_before_the_start_stops_the_run(rz):
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    assert rz.read(f"/api/rizin/{sid}/breakpoints") == [{"addr": 0x1400014B7, "enabled": True}]
+    state = _run(rz, sid, "cont")
+    assert state["pc"] == 0x1400014B7 and state["stopped"] == "breakpoint"
+
+
+def test_setting_a_breakpoint_twice_leaves_the_one(rz):
+    # rizin says "Breakpoint already set at this address." and keeps the one it has: the end state is
+    # what was asked for, so the request is not refused.
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001440"})
+    assert rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001440"}) == {
+        "breakpoints": [{"addr": 0x140001440, "enabled": True}]}
+    # and clearing one that is not there is no error either
+    assert rz.remove(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001450"}) == {
+        "breakpoints": [{"addr": 0x140001440, "enabled": True}]}
+
+
+def test_a_breakpoint_rizin_did_not_set_is_refused_not_reported_as_set(rz, monkeypatch):
+    monkeypatch.setenv("FAKE_RIZIN_BP_IGNORED", "1")
+    sid = rz.session()
+    r = rz.post(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001440"})
+    assert r.status_code == 400 and "0x140001440" in r.get_json()["refused"]
+    assert rz.read(f"/api/rizin/{sid}/breakpoints") == []
+
+
+def test_the_api_offers_no_disabled_breakpoint(rz):
+    # rizin 0.9.1 stops a run at a breakpoint whose enabled is false all the same (dbd changes nothing
+    # that matters), so asking for one is refused rather than answered with an enabled breakpoint.
+    sid = rz.session()
+    mark = len(rz.commands())
+    for body in ({"addr": "0x140001440", "on": False}, {"addr": "0x140001440", "on": True}):
+        r = rz.post(f"/api/rizin/{sid}/breakpoints", body)
+        assert r.status_code == 400 and "on" in r.get_json()["refused"], body
+    assert not any(c.startswith(("db ", "dbd", "dbe")) for c in _commands_since(rz, mark))
+    # what the console disabled is still reported as rizin reports it
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001440"})
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "dbd @ 0x140001440"})
+    assert rz.read(f"/api/rizin/{sid}/breakpoints") == [{"addr": 0x140001440, "enabled": False}]
+    assert [c for c in rz.commands() if c.startswith(("dbd", "dbe"))] == ["dbd @ 0x140001440"]
+
+
+def test_a_breakpoint_address_that_is_no_address_is_refused(rz):
+    sid = rz.session()
+    mark = len(rz.commands())
+    bad = ("-1", "0x140001440; wci", "main", True, 2 ** 64, 1.5)
+    for addr in bad + (None,):  # POST without an addr is a POST without an address
+        r = rz.post(f"/api/rizin/{sid}/breakpoints", {"addr": addr})
+        assert r.status_code == 400 and "addr" in r.get_json()["refused"], addr
+    for addr in bad:  # a DELETE without an addr means all of them, so None is left out here
+        r = rz.delete(f"/api/rizin/{sid}/breakpoints", {"addr": addr})
+        assert (r.status_code, "addr" in r.get_json()["refused"]) == (400, True), addr
+    for body in (None, [], "db"):
+        assert rz.post(f"/api/rizin/{sid}/breakpoints", body).status_code == 400, body
+    for body in ([], "db"):  # a DELETE of a null body is one without a body: that means all of them
+        assert rz.delete(f"/api/rizin/{sid}/breakpoints", body).status_code == 400, body
+    assert not any(c.startswith(("db ", "db-")) for c in _commands_since(rz, mark))
+    # A DELETE without a body at all clears them all, as one with an empty object does.
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001440"})
+    assert rz.ok(rz.client.delete(f"/api/rizin/{sid}/breakpoints")) == {"breakpoints": []}
+
+
+def test_breakpoints_say_the_session_ended_rather_than_fail(rz):
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/close", {})
+    for response in (rz.get(f"/api/rizin/{sid}/breakpoints"),
+                     rz.post(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001440"}),
+                     rz.delete(f"/api/rizin/{sid}/breakpoints", {})):
+        assert response.status_code == 404 and response.get_json()["error"] == "session ended"
+
+
 @pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
 @pytest.mark.skipif(not MINGW, reason="mingw (x86_64-w64-mingw32-gcc) not installed")
 def test_real_rizin_runs_an_emulation(tmp_path, monkeypatch):
@@ -3260,6 +3366,66 @@ def test_readable_takes_only_drive_paths_on_windows(tdc, monkeypatch):
     assert windows == dict(dict.fromkeys(paths, False), **{"C:\\Users\\Public\\x.exe": True}), windows
     assert [p for p in resolved if p != "C:\\Users"] == ["C:\\Users\\Public\\x.exe"], \
         "a path was resolved before it was refused"
+
+
+@pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
+@pytest.mark.skipif(not MINGW, reason="mingw (x86_64-w64-mingw32-gcc) not installed")
+def test_real_rizin_breakpoint_routes(tdc, tmp_path, monkeypatch):
+    """The three routes against rizin 0.9.1 itself: what the fake models for them.
+
+    Task 3's real-rizin test already covers that a disabled breakpoint stops a run and that only db-
+    removes one; this one covers the routes (set, list, clear one, clear all) and the thing only the fake
+    proves otherwise: a breakpoint set before emulation/start is honoured by the run afterwards.
+    """
+    import rizin_sessions
+
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    exe = allowed / "pipesim.exe"
+    shutil.copy(_build_pipesim(tmp_path), exe)
+    before = hashlib.sha256(exe.read_bytes()).hexdigest()
+    monkeypatch.setattr(rizin_sessions, "RIZIN_EXE", REAL_RIZIN)
+    monkeypatch.setattr(tdc, "_readable_roots", lambda: [str(allowed)])
+    mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(tmp_path / "projects"))
+    monkeypatch.setattr(tdc, "_rizin_manager", mgr)
+    monkeypatch.setattr(tdc, "_rizin_install", {"key": None, "value": None})
+    api = _Api(tdc, None, mgr, tmp_path)
+    try:
+        sid = api.open(str(exe))["session"]
+        api.wait_done(sid, timeout=120)
+        url = f"/api/rizin/{sid}/breakpoints"
+        main = next(f for f in api.read(f"/api/rizin/{sid}/functions") if f["name"] == "sym.main")["offset"]
+        ops = api.read(f"/api/rizin/{sid}/disasm?addr={main}&count=4")["ops"]
+        first, second = ops[0]["offset"], ops[1]["offset"]
+
+        # set and list, before any emulation was started
+        assert api.read(url) == []
+        assert api.send(url, {"addr": second}) == {"breakpoints": [{"addr": second, "enabled": True}]}
+        assert api.send(url, {"addr": first})["breakpoints"] == [
+            {"addr": first, "enabled": True}, {"addr": second, "enabled": True}]
+        # the server sorts: rizin's own dblj lists them in the order they were set
+        assert [b["addr"] for b in mgr.get(sid).json("dblj")] == [second, first]
+        assert api.read(url) == [{"addr": first, "enabled": True}, {"addr": second, "enabled": True}]
+
+        # and the run honours the one that was set before the start
+        api.send(f"/api/rizin/{sid}/emulation/start", {"addr": first})
+        state = api.send(f"/api/rizin/{sid}/emulation/run", {"kind": "cont"})
+        assert state["pc"] == second and state["stopped"] == "breakpoint"
+        assert api.read(url) == [{"addr": first, "enabled": True}, {"addr": second, "enabled": True}]
+
+        # clear one, then all
+        assert api.remove(url, {"addr": first}) == {"breakpoints": [{"addr": second, "enabled": True}]}
+        assert api.remove(url, {}) == {"breakpoints": []}
+        assert api.read(url) == [] and mgr.get(sid).json("dblj") == []
+
+        # an address outside every map: rizin warns and sets an invalid breakpoint, which stops a run
+        # all the same, so the route answers it like any other (measured: valid false, aec hits it)
+        assert api.send(url, {"addr": "0x14"}) == {"breakpoints": [{"addr": 0x14, "enabled": True}]}
+        assert [b["valid"] for b in mgr.get(sid).json("dblj")] == [False]
+        assert api.remove(url, {}) == {"breakpoints": []}
+    finally:
+        mgr.shutdown()
+    assert hashlib.sha256(exe.read_bytes()).hexdigest() == before, "the sample must never be written"
 
 
 @pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")

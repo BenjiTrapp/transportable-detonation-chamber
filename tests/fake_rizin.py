@@ -51,7 +51,9 @@ follows, a conditional jmp falls through (no flags). ``aes`` is one op, ``aeso``
 address, ``aecc`` to the next direct call (not before an indirect one), ``aec`` on. Like rizin 0.9.1 each
 stops at a breakpoint (also a disabled one) with
 "[ESIL] hit breakpoint at 0x..." on stdout, and a step at an address nothing is mapped at answers "Stopped
-execution in an invalid instruction" on stderr and stays. ``db @ addr``, ``db- @ addr``, ``dbd``, ``dbe``, ``dblj``.
+execution in an invalid instruction" on stderr and stays. ``db @ addr`` (the one it already has there stays,
+with rizin's two ERROR lines; FAKE_RIZIN_BP_IGNORED sets none at all, as rizin does where another
+breakpoint's width covers the address), ``db- @ addr``, ``db-*``, ``dbd``, ``dbe``, ``dblj``.
 
 The views (afl, pdfj, afbj, pdj, axtj, axfj, afxj, izj, iij, flj, pxj, pdgj, ol.j, oml.j) answer
 from one model of the code: entry0 calls sym.main, whose blocks branch, run
@@ -484,12 +486,21 @@ def esil_breakpoints(word, seek):
     bps = state["bps"]
     if word == "dblj":
         return json.dumps([{"addr": addr, "size": 1, "perm": "--x", "hw": False, "trace": False,
-                            "enabled": enabled, "valid": True, "data": "", "cond": ""}
+                            "enabled": enabled, "valid": esil_mapped(addr), "data": "", "cond": ""}
                            for addr, enabled in sorted(bps.items())]) + "\n"
     if word == "db":
-        bps[seek] = True
+        if seek in bps or os.environ.get("FAKE_RIZIN_BP_IGNORED"):
+            # rizin keeps the breakpoint it has there, disabled or not; FAKE_RIZIN_BP_IGNORED stands for
+            # the address another breakpoint's width covers already, where rizin sets none at all
+            err("ERROR: Breakpoint already set at this address.\n")
+            err(f"ERROR: Cannot set breakpoint at {seek:#x}\n")
+        else:
+            bps[seek] = True
     elif word == "db-":
-        bps.pop(seek, None)
+        if bps.pop(seek, None) is None:
+            err(f"ERROR: Failed to delete breakpoint at {seek:#x}\n")
+    elif word == "db-*":
+        bps.clear()
     elif word in ("dbd", "dbe") and seek in bps:
         bps[seek] = word == "dbe"
     return ""
@@ -803,8 +814,8 @@ def answer(cmd):
     if word.startswith("Z") or word == "xyzzy":
         err(f"ERROR: Command '{word}' does not exist.\n")
         return ""
-    if word in ("db", "db-", "dbd", "dbe", "dblj"):
-        if word != "dblj" and at is None:
+    if word in ("db", "db-", "db-*", "dbd", "dbe", "dblj"):
+        if word not in ("dblj", "db-*") and at is None:
             err("ERROR: Wrong number of arguments passed to `db`, see its help with `db?`\n")
             return ""
         return esil_breakpoints(word, seek)
