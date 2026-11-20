@@ -24,7 +24,8 @@ Environment:
   FAKE_RIZIN_STACK  "<word>[,...]": the words ``aeim`` leaves at the stack pointer, upwards
   FAKE_RIZIN_NO_IO_CACHE  set: ``e io.cache=true`` does not take, ``e io.cache`` stays false
   FAKE_RIZIN_IO_CACHE_ONCE  set: only the first ``e io.cache=true`` takes (the console switched it off after)
-  FAKE_RIZIN_AESB_NOOP  set: ``aesb`` answers nothing and moves nothing
+  FAKE_RIZIN_ESIL_FLOOD  "<n>": a run that runs into esil.timeout first prints n lines of "WARNING: $ returned 0",
+                    as every int3 does under esil.verbose=1 (148 000 a second measured), then the timeout line
   FAKE_RIZIN_NO_SP  set: ``ar SP`` answers nothing (a file whose profile has no SP role)
   FAKE_RIZIN_ESIL_RUNAWAY  set: ``aec`` and ``aesu`` run into esil.timeout (the warning on stderr, the PC where
                     it was)
@@ -47,8 +48,8 @@ Stepping moves the PC through the code model below: a call pushes its return add
 (an indirect call goes to 0, where nothing is mapped: the callee is read from memory), a ret pops, a jmp
 follows, a conditional jmp falls through (no flags). ``aes`` is one op, ``aeso`` runs a call to its return,
 ``aess`` skips a call (but not an indirect one, like rizin: ``aeso`` neither), ``aesu``/``aecu`` run to an
-address, ``aecc`` to the next direct call (not before an indirect one), ``aec`` on; ``aets+`` records the steps
-for ``aesb``. Like rizin 0.9.1 each stops at a breakpoint (also a disabled one) with
+address, ``aecc`` to the next direct call (not before an indirect one), ``aec`` on. Like rizin 0.9.1 each
+stops at a breakpoint (also a disabled one) with
 "[ESIL] hit breakpoint at 0x..." on stdout, and a step at an address nothing is mapped at answers "Stopped
 execution in an invalid instruction" on stderr and stays. ``db @ addr``, ``db- @ addr``, ``dbd``, ``dbe``, ``dblj``.
 
@@ -212,7 +213,7 @@ else:
     REG_NAMES = ["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "eflags"]
     ROLES = {"PC": "eip", "SP": "esp", "BP": "ebp"}
 # The ESIL VM: regs is None until aei; stack is (addr, bytearray) while aeim's map is there.
-esil = {"regs": None, "stack": None, "trace": None}
+esil = {"regs": None, "stack": None}
 ESIL_CAP = 200000  # steps of one run: past it the fake's code has run into nothing it models
 ESIL_INVALID = "ERROR: core: esil: Stopped execution in an invalid instruction (see e??esil.breakoninvalid)\n"
 
@@ -386,8 +387,6 @@ def esil_step_one(execute=True):
             return "invalid"
         regs[ROLES["PC"]] = pc + 1
         return "ok"
-    if esil["trace"] is not None:
-        esil["trace"].append(dict(regs))
     op = esil_ops().get(pc)
     nxt = pc + (op["size"] if op else 1)
     kind = op["type"] if op else "nop"
@@ -431,26 +430,24 @@ def esil_run(until=None, stop_at_call=False, over=None):
     err("WARNING: core: esil: timeout exceeded.\n")
 
 
+def esil_timeout():
+    """A run that ends at esil.timeout: the flood of warnings first (FAKE_RIZIN_ESIL_FLOOD), the timeout last."""
+    for _ in range(int(os.environ.get("FAKE_RIZIN_ESIL_FLOOD") or 0)):
+        err("WARNING: $ returned 0\n")
+    err("WARNING: core: esil: timeout exceeded.\n")
+
+
 def esil_command(word, rest, seek):
     """The ESIL step commands; None for a word that is none."""
     regs = esil["regs"]
-    if word not in ("aes", "aeso", "aess", "aesb", "aesu", "aecu", "aecc", "aec", "aets+", "aets-"):
+    if word not in ("aes", "aeso", "aess", "aesu", "aecu", "aecc", "aec"):
         return None
     if regs is None:
         err("ERROR: ESIL is not initialized. Use `aei` first.\n")
         return ""
     pc = regs[ROLES["PC"]]
     op = esil_ops().get(pc)
-    if word == "aets+":
-        if esil["trace"] is not None:
-            err("ERROR: ESIL trace already started\n")
-        else:
-            esil["trace"] = []
-    elif word == "aets-":
-        if esil["trace"] is None:
-            err("ERROR: No ESIL trace started\n")
-        esil["trace"] = None
-    elif word == "aes":
+    if word == "aes":
         for _ in range(int(rest) if rest.isdigit() else 1):
             if esil_step_one() != "ok":
                 break
@@ -463,27 +460,20 @@ def esil_command(word, rest, seek):
     elif word == "aess":
         # rizin 0.9.1 skips these (rz_core_esil_step's stepOver switch); an ircall it runs
         if op and op["type"] in ("call", "ucall", "rcall", "jmp", "cjmp", "ret"):
-            regs[ROLES["PC"]] = pc + op["size"]  # not run, so not recorded for aesb either
+            regs[ROLES["PC"]] = pc + op["size"]  # not run
             esil_stop_at_breakpoint()
         else:
             esil_step_one()
-    elif word == "aesb":
-        if os.environ.get("FAKE_RIZIN_AESB_NOOP"):
-            pass  # rizin 0.9.1 sometimes answers nothing and moves nothing
-        elif esil["trace"]:
-            esil["regs"] = dict(esil["trace"].pop())
-        elif esil["trace"] is not None:
-            err("ERROR: cannot step back\n")
     elif word in ("aesu", "aecu"):
         target = number(rest)
         if target is not None and os.environ.get("FAKE_RIZIN_ESIL_RUNAWAY"):
-            err("WARNING: core: esil: timeout exceeded.\n")
+            esil_timeout()
         elif target is not None:
             esil_run(until=target)
     elif word == "aecc":
         esil_run(stop_at_call=True)
     elif os.environ.get("FAKE_RIZIN_ESIL_RUNAWAY"):  # aec
-        err("WARNING: core: esil: timeout exceeded.\n")
+        esil_timeout()
     else:
         esil_run()
     return ""

@@ -2804,7 +2804,7 @@ def _started(rz, addr=None):
 
 def test_each_run_kind_sends_its_command(rz):
     sid = _started(rz)
-    for kind, command in (("step", "aes"), ("over", "aeso"), ("skip", "aess"), ("back", "aesb")):
+    for kind, command in (("step", "aes"), ("over", "aeso"), ("skip", "aess")):
         mark = len(rz.commands())
         rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": kind})
         assert command in _commands_since(rz, mark), kind
@@ -2874,10 +2874,11 @@ def test_cont_that_runs_away_stops_with_timeout_and_keeps_the_session(rz, monkey
 def test_run_refuses_an_unknown_kind(rz):
     sid = _started(rz)
     mark = len(rz.commands())
-    for kind in ("ood", "", None, 7, "aes; wci", "STEP", "aecc"):
+    # "back": rizin 0.9.1's aesb restores no memory and the step after it runs without moving the PC
+    for kind in ("ood", "", None, 7, "aes; wci", "STEP", "aecc", "back"):
         r = rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": kind})
         assert r.status_code == 400 and "kind" in r.get_json()["refused"], kind
-    assert not any(c.split(" ")[0] in ("aes", "aec", "aesu", "wci") for c in _commands_since(rz, mark))
+    assert not any(c.split(" ")[0] in ("aes", "aec", "aesu", "aesb", "aets+", "wci") for c in _commands_since(rz, mark))
 
 
 def test_run_is_refused_before_the_emulation_starts(rz):
@@ -2963,50 +2964,6 @@ def test_to_call_that_runs_into_the_timeout_says_so(rz, monkeypatch):
     assert state["stopped"] == "timeout" and state["pc"] == 0x140001494
 
 
-def test_step_back_returns_to_the_step_before_and_refuses_without_one(rz):
-    sid = _started(rz)
-    r = rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": "back"})
-    assert r.status_code == 400 and "step back" in r.get_json()["refused"]
-    _run(rz, sid, "step")
-    _run(rz, sid, "step")
-    assert _run(rz, sid, "back")["pc"] == 0x140001444
-    assert _run(rz, sid, "back")["pc"] == 0x140001440
-    r = rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": "back"})
-    assert r.status_code == 400 and "step back" in r.get_json()["refused"]
-    # only single steps are recorded: a back after any other run must not reach behind it
-    for kind in ("cont", "skip", "over"):
-        rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001499"})
-        _run(rz, sid, "step")
-        _run(rz, sid, kind)
-        r = rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": "back"})
-        assert r.status_code == 400 and "step back" in r.get_json()["refused"], kind
-
-
-def test_a_step_back_that_moves_nothing_is_refused_not_shown_as_a_step(rz, monkeypatch):
-    # rizin 0.9.1 (pipesim: step, step, back, step, step, back, back): the step after a back does not move,
-    # and the last back stayed where it was. Not a step back, whatever the state says.
-    monkeypatch.setenv("FAKE_RIZIN_AESB_NOOP", "1")
-    sid = _started(rz)
-    _run(rz, sid, "step")
-    r = rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": "back"})
-    assert r.status_code == 400 and "did not step back" in r.get_json()["refused"]
-
-
-def test_only_single_steps_are_recorded_for_step_back(rz):
-    # aets+ records every instruction: 5 s of aec took 880 MB of rizin's memory (measured)
-    sid = _started(rz)
-    _run(rz, sid, "step")
-    _run(rz, sid, "step")
-    assert rz.commands().count("aets+") == 1
-    mark = len(rz.commands())
-    _run(rz, sid, "cont")
-    since = _commands_since(rz, mark)
-    assert since.count("aets-") == 1 and since.index("aets-") < since.index("aec")
-    mark = len(rz.commands())
-    _run(rz, sid, "cont")
-    assert "aets-" not in _commands_since(rz, mark)
-
-
 def test_a_run_sets_the_guards_again_and_checks_what_the_console_may_have_changed(rz):
     import rizin_sessions
 
@@ -3035,7 +2992,7 @@ def test_a_run_is_refused_when_io_cache_does_not_hold(rz, monkeypatch):
     mark = len(rz.commands())
     r = rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": "step"})
     assert r.status_code == 400 and "io.cache" in r.get_json()["refused"]
-    assert not any(c.split(" ")[0] in ("aes", "aec", "aets+") for c in _commands_since(rz, mark))
+    assert not any(c.split(" ")[0] in ("aes", "aec") for c in _commands_since(rz, mark))
 
 
 def test_a_run_is_refused_when_the_console_unmapped_the_stack(rz):
@@ -3053,9 +3010,9 @@ def test_every_run_command_is_given_more_time_than_esil_timeout_but_less_than_th
     seen = []
     real = rizin_sessions.RizinPipe.console
 
-    def console(self, text, timeout=rizin_sessions.CONSOLE_TIMEOUT, limit=rizin_sessions.CONSOLE_LIMIT):
+    def console(self, text, timeout=rizin_sessions.CONSOLE_TIMEOUT, limit=rizin_sessions.CONSOLE_LIMIT, tail=False):
         seen.append((text, timeout))
-        return real(self, text, timeout, limit)
+        return real(self, text, timeout, limit, tail)
 
     monkeypatch.setattr(rizin_sessions.RizinPipe, "console", console)
     sid = _started(rz, "0x140001490")
@@ -3078,6 +3035,42 @@ def test_a_run_drops_the_cached_lists(rz):
     _run(rz, sid, "step")
     rz.read(f"/api/rizin/{sid}/strings")
     assert rz.commands().count("izj") == before + 1, "a run changes bytes, so the strings are read again"
+
+
+def test_a_flood_on_stderr_does_not_bury_the_reason(rz, monkeypatch):
+    # esil.verbose=1 makes every int3 print a line (148 000 in a second from a loop around one), and the
+    # timeout line comes last: the reason is read from the end of stderr
+    monkeypatch.setenv("FAKE_RIZIN_ESIL_RUNAWAY", "1")
+    monkeypatch.setenv("FAKE_RIZIN_ESIL_FLOOD", "20000")  # 440 KB: past the 64 KB cut and the pipe's 256 KB buffer
+    sid = _started(rz)
+    assert _run(rz, sid, "cont")["stopped"] == "timeout"
+    assert _run(rz, sid, "until", addr="0x140001444")["stopped"] == "timeout"
+    sid = _started(rz, "0x140001490")
+    assert _run(rz, sid, "to_call")["stopped"] == "timeout"
+
+
+def test_console_keeps_the_head_of_stderr_and_its_last_whole_lines_on_demand(fake, sample, monkeypatch):
+    """The reason a run stopped is the last line of a flood of warnings, so a run reads stderr from its end;
+    every other command keeps the head, where its own error is. A tail is cut back to whole lines: the slice
+    starts anywhere, and the pipe's buffer (256 KB) has dropped the start of the flood on top of that, so
+    without the trim the kept text begins in the middle of a warning, which matches nothing."""
+    import rizin_sessions
+
+    monkeypatch.setenv("FAKE_RIZIN_ESIL_RUNAWAY", "1")
+    monkeypatch.setenv("FAKE_RIZIN_ESIL_FLOOD", "20000")  # 440 KB, past the 64 KB cut and the 256 KB buffer
+    pipe = rizin_sessions.RizinPipe(fake.path, sample())
+    try:
+        pipe.cmd("aei")
+        _, head, _ = pipe.console("aec")
+        assert len(head) == 64 * 1024 and "timeout exceeded" not in head
+        _, tail, _ = pipe.console("aec", tail=True)
+        assert 63 * 1024 < len(tail) <= 64 * 1024
+        assert tail.rstrip().endswith("WARNING: core: esil: timeout exceeded.")
+        assert set(tail.splitlines()) == {"WARNING: $ returned 0",
+                                          "WARNING: core: esil: timeout exceeded."}
+        assert pipe.console("echo quiet")[1] == "", "a command that writes nothing keeps nothing"
+    finally:
+        pipe.close()
 
 
 def test_a_missing_stack_pointer_is_refused_not_a_server_error(rz, monkeypatch):
@@ -3128,14 +3121,6 @@ def test_real_rizin_runs_an_emulation(tmp_path, monkeypatch):
         state = session.emulation_run("step")
         assert state["pc"] == call["offset"] and register(state, "rcx") == 90000
         assert "rcx" in state["changed"]
-        # back: the registers go back one step (rizin restores no memory, but this step wrote none)
-        state = session.emulation_run("back")
-        assert state["pc"] == ops[1]["offset"] and register(state, "rcx") == 0 and state["stopped"] == "step"
-        session.emulation_run("cont")
-        with pytest.raises(rizin_sessions.RizinRefused) as refused:
-            session.emulation_run("back")  # a cont is not recorded: nothing to go back to
-        assert "step back" in refused.value.reason
-
         # to_call: stops before the call through the import table (aecc runs past it); until does as well
         session.emulation_start(watchdog)
         state = session.emulation_run("to_call")
@@ -3168,8 +3153,16 @@ def test_real_rizin_runs_an_emulation(tmp_path, monkeypatch):
         assert state["pc"] == call["offset"] and state["stopped"] == "breakpoint"
         state = session.emulation_run("cont")  # on into the call: nothing can execute there
         assert state["stopped"] == "trap" and state["pc"] != call["offset"]
-        session.console(f"db- @ {watchdog:#x}")
+        # dbd lists the breakpoint as disabled, and rizin 0.9.1 stops at it all the same: only db- removes
+        # one. The fake models this and Tasks 4 and 11 drop their on/off because of it.
+        session.emulation_start(watchdog)
+        session.console(f"dbd @ {call['offset']:#x}")
+        assert [b["enabled"] for b in session.json("dblj") if b["addr"] == call["offset"]] == [False]
+        state = session.emulation_run("cont")
+        assert state["pc"] == call["offset"] and state["stopped"] == "breakpoint"
         session.console(f"db- @ {call['offset']:#x}")
+        assert [b["addr"] for b in session.json("dblj")] == [watchdog]
+        session.console(f"db- @ {watchdog:#x}")
 
         # an endless loop (written into the cache): cont stops at esil.timeout, to_call at its own deadline;
         # the session goes on
@@ -3189,6 +3182,56 @@ def test_real_rizin_runs_an_emulation(tmp_path, monkeypatch):
     finally:
         mgr.shutdown()
     assert hashlib.sha256(exe.read_bytes()).hexdigest() == before, "the sample must never be written"
+
+
+@pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
+def test_real_rizin_flood_of_esil_warnings_does_not_hide_the_timeout(tmp_path, monkeypatch):
+    """`int3; jmp -3`: with esil.verbose=1 rizin 0.9.1 prints "WARNING: $ returned 0" for every int3, some
+    150 000 lines a second, and "esil: timeout exceeded" last. The pipe keeps the first 64 KB of stderr by
+    default, which is all flood; the tail is what holds the reason."""
+    import rizin_emulation
+    import rizin_sessions
+
+    blob = tmp_path / "loop.bin"
+    blob.write_bytes(bytes.fromhex("cceb" "fd") + bytes(61))
+    pipe = rizin_sessions.RizinPipe(REAL_RIZIN, str(blob), extra_args=("-a", "x86", "-b", "64"))
+    try:
+        for command in ("e io.cache=true esil.timeout=1 esil.breakoninvalid=true esil.verbose=1",
+                        "aei", "aeim", "aepc 0"):
+            pipe.cmd(command)
+        out, err, _ = pipe.console("aec")
+        assert len(err) == 64 * 1024 and "WARNING: $ returned 0" in err
+        assert rizin_emulation.stop_reason(out, err) == "step", "the first 64 KB are all flood"
+        pipe.cmd("aepc 0")
+        out, err, _ = pipe.console("aec", tail=True)
+        assert err.rstrip().endswith("WARNING: core: esil: timeout exceeded.")
+        # whole lines: the slice starts anywhere, and the pipe's buffer has dropped the first lines of the
+        # run altogether, so without a trim the kept text begins in the middle of a warning
+        assert err.startswith("WARNING: "), repr(err[:40])
+        assert set(err.splitlines()) == {"WARNING: $ returned 0",
+                                         "WARNING: core: esil: timeout exceeded."}
+        assert rizin_emulation.stop_reason(out, err) == "timeout"
+        assert pipe.cmd("ar PC").split("=")[1].strip() in ("0x0000000000000000", "0x0000000000000001")
+    finally:
+        pipe.close()
+
+    # and through the session: every run kind that reads stderr says "timeout", not "step"
+    monkeypatch.setattr(rizin_sessions, "ESIL_TIMEOUT", 1.0)
+    monkeypatch.setattr(rizin_sessions, "ESIL_SETTINGS", tuple(
+        "esil.timeout=1" if c.startswith("esil.timeout=") else c for c in rizin_sessions.ESIL_SETTINGS))
+    mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(tmp_path / "projects"))
+    try:
+        session = mgr.get(mgr.open(str(blob), "tab")["session"])
+        _wait_state(session, "done", timeout=60)
+        session.console("e asm.arch=x86")  # rizin takes a raw blob for arm64
+        session.console("e asm.bits=64")
+        session.bits = 64
+        session.emulation_start(0)
+        for kind, addr in (("cont", None), ("to_call", None), ("until", 0x20)):
+            state = session.emulation_run(kind, addr)
+            assert state["stopped"] == "timeout" and state["pc"] in (0, 1), kind
+    finally:
+        mgr.shutdown()
 
 
 def test_readable_takes_only_drive_paths_on_windows(tdc, monkeypatch):

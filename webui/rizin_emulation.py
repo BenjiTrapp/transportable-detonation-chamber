@@ -86,7 +86,7 @@ def flag_hint(flags, registers):
 # the import table (`call qword [rip+..]` is "ircall": they run into it) and ignore esil.timeout, because they
 # step one instruction per rz_core_esil_step, whose timer starts again each time. to_call is built on aesu
 # instead (see next_call_stop). aeso and aess handle only direct calls as well (see skip_call, over_call).
-STEP_COMMANDS = {"step": "aes", "over": "aeso", "skip": "aess", "back": "aesb", "to_call": "aesu",
+STEP_COMMANDS = {"step": "aes", "over": "aeso", "skip": "aess", "to_call": "aesu",
                  "cont": "aec", "until": "aesu"}
 
 # What rizin 0.9.1 prints when a run stops, checked with the binary. stdout: "[ESIL] hit breakpoint at 0x14".

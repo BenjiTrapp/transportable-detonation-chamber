@@ -123,6 +123,9 @@ MAX_CONSOLE_COMMAND = 2000
 MAX_COMMENT = 500
 NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.@$:-]{0,127}$")
 _STDERR_KEEP = 256 * 1024
+# How much of stderr one command's answer keeps (RizinPipe.console): its first bytes, or its last ones for
+# a run, whose reason for stopping comes after the warnings it floods stderr with.
+_STDERR_PER_COMMAND = 64 * 1024
 _MAX_MOVED = 256
 _CREATE_NO_WINDOW = 0x08000000
 _PROJECT_FAILED = "The saved project could not be loaded; it was kept as .rzdb.broken."
@@ -619,8 +622,11 @@ class RizinPipe:
         out = self.cmd(text, timeout, limit).strip()
         return json.loads(out) if out else None
 
-    def console(self, text, timeout=CONSOLE_TIMEOUT, limit=CONSOLE_LIMIT):
+    def console(self, text, timeout=CONSOLE_TIMEOUT, limit=CONSOLE_LIMIT, tail=False):
         """Run a console command; returns (stdout, stderr, truncated).
+
+        stderr is cut to _STDERR_PER_COMMAND (64 KB): its first bytes, or with ``tail`` its last whole
+        lines, which is where a command that floods stderr with warnings says why it stopped (an ESIL run).
 
         Its output may hold NUL bytes (``pr``), which would end the answer
         early, so an ``echo`` of a random marker ends it instead. stderr has
@@ -644,7 +650,7 @@ class RizinPipe:
             kept += data
             truncated = truncated or cut
         self._answer(deadline, 0)
-        return kept.decode("utf-8", "replace"), self._stderr_until(err_start, err_marker, 2.0), truncated
+        return kept.decode("utf-8", "replace"), self._stderr_until(err_start, err_marker, 2.0, tail), truncated
 
     def stderr_tail(self, size=2000):
         with self._err_cond:
@@ -780,10 +786,21 @@ class RizinPipe:
         with self._err_cond:
             return self._err_dropped + len(self._err)
 
-    def _stderr_until(self, start, marker, wait):
+    def _stderr_until(self, start, marker, wait, tail=False):
+        """What the command wrote to stderr, cut to _STDERR_PER_COMMAND: its first bytes, or with ``tail``
+        its last ones.
+
+        A tail begins from the first line boundary in it: a line cut in half matches nothing, and two things
+        cut it. The slice itself starts anywhere, and the pipe's own buffer keeps only _STDERR_KEEP, so a
+        command that wrote more than that has lost its first lines (``start`` is then before
+        ``_err_dropped``) and what is left begins mid-line as well. The end needs no trim: with the marker
+        found the text ends at a line boundary, and without it (the wait ran out) the unterminated last line
+        is all there is of it.
+        """
         deadline = time.monotonic() + wait
         with self._err_cond:
             while True:
+                rolled = start < self._err_dropped
                 text = bytes(self._err[max(0, start - self._err_dropped):])
                 at = text.find(marker.encode())
                 if at != -1:
@@ -793,7 +810,12 @@ class RizinPipe:
                 if remaining <= 0 or not self._threads[1].is_alive():
                     break
                 self._err_cond.wait(remaining)
-        return text[:64 * 1024].decode("utf-8", "replace")
+        if not tail:
+            return text[:_STDERR_PER_COMMAND].decode("utf-8", "replace")
+        if rolled or len(text) > _STDERR_PER_COMMAND:
+            text = text[max(0, len(text) - _STDERR_PER_COMMAND):]
+            text = text[text.find(b"\n") + 1:]  # no boundary at all: find gives -1, so the slice stays
+        return text.decode("utf-8", "replace")
 
 
 # --- Projects ---------------------------------------------------------------
@@ -1096,8 +1118,6 @@ class RizinSession:
         # the last change (for "changed"), the file's byte order for the stack words and aeim's stack map
         # as (from, to, name).
         self._emulation = None
-        # The pipe aets+ was sent on: the single steps are recorded for aesb from then on
-        self._emulation_traced = None
         self._emulation_before = self._emulation_after = None
         self._emulation_big_endian = False
         self._emulation_stack_map = None
@@ -1326,12 +1346,14 @@ class RizinSession:
 
         Before it runs, the settings of the start are set again (esil.* can be changed in the console, and
         esil.timeout=0 would make the run endless; set after aei, esil.exectrap takes effect, which at the
-        start it does not), and io.cache, the stack and, for "back", the record of steps are checked: a run
-        that would write nothing, or into nothing, or step back to nowhere, is refused.
+        start it does not), and io.cache and the stack are checked: a run that would write nothing, or into
+        nothing, is refused.
 
-        Only a single step is recorded for "back" (aets+): recording every instruction of an aec took 880 MB
-        in 3 s. Any other run ends the record (aets-), and rizin's aesb restores the registers but not the
-        memory a step wrote (measured), which the interface says.
+        There is no step back: rizin 0.9.1's aesb restores no memory, and the step after it runs the
+        instruction without moving the PC (a xor would be applied twice).
+
+        A run's stderr is read from its end: esil.verbose=1 makes every int3 print a line (148 000 in a
+        second), and the line that says why the run stopped comes last.
         """
         command = rizin_emulation.STEP_COMMANDS.get(kind) if isinstance(kind, str) else None
         if command is None:
@@ -1349,13 +1371,6 @@ class RizinSession:
             if not self._emulation_stack_mapped(maps):
                 raise RizinRefused("the emulation's stack is not mapped any more (aeim- in the console?): "
                                    "start the emulation again")
-            recorded = self._emulation_traced is pipe
-            if kind in ("step", "back") and not recorded:
-                pipe.cmd("aets+")
-                self._emulation_traced = pipe
-            elif kind not in ("step", "back") and recorded:
-                pipe.cmd("aets-")
-                self._emulation_traced = None
             if kind == "to_call":
                 stopped = self._emulation_to_call(pipe)
             else:
@@ -1381,13 +1396,7 @@ class RizinSession:
                 command = f"aesu {pc + op[1]:#x}"
             elif op and kind == "skip" and rizin_emulation.skip_call(op[0]):
                 command = f"aepc {pc + op[1]:#x}"
-        before = self._emulation_role(pipe, "PC") if kind == "back" else None
-        out, err, _ = pipe.console(command, timeout=ESIL_TIMEOUT + ESIL_GRACE)
-        if kind == "back" and "cannot step back" in err:
-            raise RizinRefused("there is no step to step back to: only single steps are recorded")
-        if kind == "back" and self._emulation_role(pipe, "PC") == before:
-            # rizin 0.9.1 does this: the second aesb in a row, say, answers nothing and moves nothing
-            raise RizinRefused("rizin did not step back")
+        out, err, _ = pipe.console(command, timeout=ESIL_TIMEOUT + ESIL_GRACE, tail=True)
         return rizin_emulation.stop_reason(out, err)
 
     def _emulation_to_call(self, pipe):
@@ -1397,7 +1406,7 @@ class RizinSession:
         which rizin bounds by esil.timeout, and the whole is bounded by ESIL_TIMEOUT too."""
         deadline = time.monotonic() + ESIL_TIMEOUT
         timeout = ESIL_TIMEOUT + ESIL_GRACE
-        out, err, _ = pipe.console("aes", timeout=timeout)
+        out, err, _ = pipe.console("aes", timeout=timeout, tail=True)
         while True:
             stopped = rizin_emulation.stop_reason(out, err)
             if stopped != "step":
@@ -1411,12 +1420,12 @@ class RizinSession:
             if where == "call" and target == pc:
                 return "step"
             if target != pc:
-                out, err, _ = pipe.console(f"aesu {target:#x}", timeout=timeout)
+                out, err, _ = pipe.console(f"aesu {target:#x}", timeout=timeout, tail=True)
                 if where == "call":
                     return rizin_emulation.stop_reason(out, err)
                 continue
             # at the jump that ends the straight code, or at bytes rizin cannot decode (it says why)
-            out, err, _ = pipe.console("aes", timeout=timeout)
+            out, err, _ = pipe.console("aes", timeout=timeout, tail=True)
 
     def _require_emulation(self, pipe):
         # A rizin that was restarted (a hung analysis step) has no emulation, whatever ran before.

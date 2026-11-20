@@ -74,9 +74,9 @@ def test_stack_map_without_a_stack_pointer_is_none():
     assert rizin_emulation.stack_map(MAPS, None, 0xF0000) is None
 
 
-def test_step_commands_name_the_seven_kinds():
+def test_step_commands_name_the_six_kinds_and_no_step_back():
     assert rizin_emulation.STEP_COMMANDS == {
-        "step": "aes", "over": "aeso", "skip": "aess", "back": "aesb", "to_call": "aesu", "cont": "aec",
+        "step": "aes", "over": "aeso", "skip": "aess", "to_call": "aesu", "cont": "aec",
         "until": "aesu"}
 
 
