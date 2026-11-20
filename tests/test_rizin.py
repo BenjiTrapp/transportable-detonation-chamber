@@ -832,6 +832,86 @@ def test_analysis_stops_at_the_limit_and_restarts_hanging_steps(sessions, sample
     assert _steps_in(second) == ["aa", "aac"]
 
 
+def test_a_restarted_rizin_gets_the_patches_back_and_does_not_erase_them(sessions, sample, fake, tmp_path,
+                                                                        monkeypatch):
+    """A step that hangs restarts rizin, whose write cache starts empty. The patches have to go back in
+    -- otherwise the mirror empties itself at the next read and the next save writes ``patches=`` over
+    the ones the project holds, so a hung step would *erase* the analyst's patches."""
+    import rizin_sessions
+
+    timers = Timers()
+    monkeypatch.setenv("FAKE_RIZIN_SLOW", "aar:60")
+    mgr = sessions(analysis_limit=1.0, step_grace=0.5, big_file=1, timer=timers)
+    path = sample("hang3.exe", b"MZ hang 3")
+    opened = mgr.open(path, "tab")
+    session = mgr.get(opened["session"])
+    _wait_state(session, "done")
+    session.patch(0x140001440, "9090")
+    session.breakpoint_set(0x1400014B7)
+    timers.fire()
+    project = tmp_path / "projects" / (opened["file"]["sha256"] + ".rzdb")
+    assert "\npatches=140001440:9090\n" in project.read_text()
+
+    session.analyze_full()  # its aar hangs, so rizin is killed and restarted
+    _wait_state(session, "stopped")
+    assert len(fake.by_process()) == 2
+    # back in the restarted rizin: the list and the bytes
+    assert [(r["addr"], r["after"], r["mine"]) for r in session.patches()] == [(0x140001440, "9090", True)]
+    assert session.json("pxj 2 @ 0x140001440") == [0x90, 0x90]
+    assert any(c.startswith("wx 9090 @ 0x140001440") for c in fake.by_process()[1])
+    # and the save that follows keeps them, instead of writing an empty line over them
+    session.comment(0x1400014B7, "after the restart")
+    timers.fire()
+    assert "\npatches=140001440:9090\n" in project.read_text()
+
+    # one that cannot go back (it was made into memory only the emulation had mapped) stays in the
+    # project all the same: a cache that died must not erase it
+    monkeypatch.setenv("FAKE_RIZIN_SLOW", "aar:60")
+    mgr2 = sessions(analysis_limit=1.0, step_grace=0.5, big_file=1, timer=timers)
+    second = mgr2.open(sample("hang4.exe", b"MZ hang 4"), "tab")
+    stacked = mgr2.get(second["session"])
+    _wait_state(stacked, "done")
+    stacked.emulation_start(0x140001440)
+    stacked.patch(rizin_sessions.ESIL_STACK_ADDR + 0x80, "41")
+    timers.fire()
+    saved = tmp_path / "projects" / (second["file"]["sha256"] + ".rzdb")
+    assert "\npatches=100080:41\n" in saved.read_text()
+    stacked.analyze_full()
+    _wait_state(stacked, "stopped")
+    assert stacked.patches() == []  # the emulation's memory is gone with its rizin
+    assert "could not be applied" in stacked.analysis["note"]
+    stacked.comment(0x1400014B7, "after the restart")
+    timers.fire()
+    assert "\npatches=100080:41\n" in saved.read_text(), "a lost cache must not erase the project"
+
+
+def test_a_patch_made_while_a_step_runs_is_announced_and_then_saved(sessions, sample, fake, tmp_path,
+                                                                   monkeypatch):
+    """A patch is not refused while the analysis runs -- a step changes no bytes -- but its project
+    cannot be written before the step lets go of rizin, and the project is the only place a patch
+    outlives the session. The session says so for as long as that is true, and a close waits for the
+    pipe, so the patch is written after all."""
+    timers = Timers()
+    monkeypatch.setenv("FAKE_RIZIN_SLOW", "aac:0.5,aaft:5")
+    mgr = sessions(big_file=1, timer=timers)
+    opened = mgr.open(sample("steps3.exe", b"MZ steps 3"), "tab")
+    session = mgr.get(opened["session"])
+    _wait_state(session, "done")  # aa, because the file counts as big
+    session.analyze_full()
+    assert wait_for(lambda: session.analysis["step"] == "aac")
+    session.patch(0x140001440, "90", wait=10.0)  # waits for the step; a rename would be refused
+    assert wait_for(lambda: session.analysis["step"] == "aaft")
+    note = session.analysis["note"]
+    assert "waiting to be saved" in note, note
+    project = tmp_path / "projects" / (opened["file"]["sha256"] + ".rzdb")
+    assert not project.exists(), "nothing could be written while the step holds rizin"
+
+    # closing waits for the pipe, so the patch is still written; the note goes with the session
+    mgr.close(opened["session"])
+    assert session.wait_closed(30)
+    assert "\npatches=140001440:90\n" in project.read_text()
+
+
 def test_no_renames_or_comments_while_the_analysis_runs(sessions, sample, fake, monkeypatch):
     from rizin_sessions import RizinBusy
 
@@ -995,6 +1075,25 @@ def test_console_runs_in_colour_and_follows_seeks(sessions, sample, fake):
         session.console("o C:\\x")
 
 
+def _plant_breakpoint_command(project, addr, data, cond):
+    """Arm a saved project's breakpoint with the command and the condition rizin runs when it hits
+    (``dbc``/``dbC``), as a project from somewhere else can carry them."""
+    text = project.read_text(encoding="utf-8", errors="surrogateescape")
+    namespace, line = None, None
+    for candidate in text.split("\n"):
+        if candidate.startswith("/"):
+            namespace = candidate
+        # the functions namespace has rows under the same keys, so the namespace has to match
+        elif namespace == "/core/debug/breakpoints" and candidate.startswith(f"{addr:#x}="):
+            line = candidate
+    assert line, f"no breakpoint at {addr:#x} in {project}"
+    key, value = line.split("=", 1)
+    saved = json.loads(value)
+    saved["data"], saved["cond"] = data, cond
+    project.write_text(text.replace(line, key + "=" + json.dumps(saved, separators=(",", ":"))),
+                       encoding="utf-8", errors="surrogateescape")
+
+
 def test_a_loaded_project_brings_back_no_assembler_hooks_or_hints(sessions, sample, fake, tmp_path):
     timers = Timers()
     mgr = sessions(timer=timers)
@@ -1032,6 +1131,48 @@ def test_a_loaded_project_brings_back_no_assembler_hooks_or_hints(sessions, samp
     assert "x86.nasm" not in hints and "#!" not in hints
     assert "arch='arm'" in hints and "esil='1,rax,='" in hints  # the safe hints stay
     assert session.json("aflj")[2]["name"] == "named"  # and so does the project
+
+
+def test_a_loaded_project_brings_back_no_breakpoint_command(sessions, sample, fake, tmp_path, monkeypatch):
+    """R24: a breakpoint carries a command (``dbc``) and a condition (``dbC``) that rizin runs when it
+    hits, and the project stores both verbatim (measured on 0.9.1). The console cannot set one, so a
+    project that came from somewhere else is the way in -- and ``GET /breakpoints`` answers ``addr`` and
+    ``enabled`` only, so nothing would show it. The boot takes both off, like the cmd.* hooks and the
+    "#!" ESIL hints."""
+    timers = Timers()
+    mgr = sessions(timer=timers)
+    path = sample()
+    opened = mgr.open(path, "tab")
+    session = mgr.get(opened["session"])
+    _wait_state(session, "done")
+    session.breakpoint_set(0x1400014B7)
+    timers.fire()
+    mgr.close(opened["session"])
+    assert wait_for(lambda: session.closed)
+    project = tmp_path / "projects" / (opened["file"]["sha256"] + ".rzdb")
+    _plant_breakpoint_command(project, 0x1400014B7, "CC pwned", "e asm.arch=x86.nasm")
+    open(fake.log_path, "w").close()
+
+    session = mgr.get(mgr.open(path, "tab")["session"])
+    assert session.analysis["note"] == "Restored from the saved project."
+    # the breakpoint is kept -- and what it would have run is gone, in rizin's own list, not just in
+    # the answer the API gives
+    assert session.breakpoints() == [{"addr": 0x1400014B7, "enabled": True}]
+    assert [(b["data"], b["cond"]) for b in json.loads(session.text("dblj"))] == [("", "")]
+    log = fake.commands()
+    assert 'dbc "" @ 0x1400014b7' in log and 'dbC "" @ 0x1400014b7' in log
+    assert session.text("e asm.arch") == "x86\n"  # the condition never ran
+
+    # a rizin that does not let the command go: the project is not used at all, like one whose arch
+    # cannot be made safe
+    mgr.close(session.id)
+    assert wait_for(lambda: session.closed)
+    monkeypatch.setenv("FAKE_RIZIN_BP_ARMED", "1")
+    session = mgr.get(mgr.open(path, "tab")["session"])
+    _wait_state(session, "done")
+    assert "could not be loaded" in session.analysis["note"]
+    assert (tmp_path / "projects" / (opened["file"]["sha256"] + ".rzdb.broken")).exists()
+    assert session.breakpoints() == []
 
 
 def test_a_failed_final_save_leaves_the_analysis_done(sessions, sample, fake, tmp_path, monkeypatch):
@@ -3451,6 +3592,27 @@ def test_a_patch_is_not_refused_while_the_analysis_runs(rz, monkeypatch):
     assert "\npatches=140001440:90\n" in rz.project().read_text(encoding="utf-8", errors="surrogateescape")
 
 
+def test_a_replay_that_rizin_does_not_survive_does_not_lock_the_file_out(rz, monkeypatch):
+    """The project decides how many commands the replay sends, so it must not be able to cost the
+    session: a rizin that stops over a saved patch leaves the file open, with a note, and the project
+    is kept (nothing is renamed .broken), so the next open works again."""
+    path = rz.write("pipesim.exe")
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    rz.send(f"/api/rizin/{sid}/patch", {"addr": "0x140001440", "bytes": "90"})
+    rz.close(sid)
+
+    monkeypatch.setenv("FAKE_RIZIN_CRASH", "wx")
+    described = rz.open(path)  # the open answers rather than failing
+    assert "could not be applied" in (described["analysis"]["note"] or "")
+    assert rz.project().exists() and not rz.project().with_suffix(".rzdb.broken").exists()
+    rz.mgr.close(described["session"])
+
+    monkeypatch.delenv("FAKE_RIZIN_CRASH")
+    sid = rz.open(path)["session"]
+    assert [r["addr"] for r in rz.read(f"/api/rizin/{sid}/patches")] == [0x140001440]
+
+
 def test_a_patch_and_a_breakpoint_come_back_when_the_file_is_opened_again(rz):
     path = rz.write("pipesim.exe")
     sid = rz.open(path)["session"]
@@ -3621,10 +3783,21 @@ def test_the_tdc_namespace_stays_inside_the_tail_that_is_read_back(tmp_path):
     big = [(0x140001000 + i * 0x2000, "90" * rizin_emulation.MAX_PATCH_BYTES) for i in range(10)]
     left_out = rizin_sessions._sanitize_project(str(src), str(dst), "aaa", "one", ["aaa"], big)
     meta = rizin_sessions._read_project_meta(str(dst))
-    assert meta["patches"] == big[:len(meta["patches"])]
-    assert len(meta["patches"]) + left_out == len(big) and left_out > 0
+    # an entry of 4096 bytes costs 9 + 1 + 8192 characters, so three of them fit into the 32 KB budget
+    assert meta["patches"] == big[:3] and left_out == 7
     # and what the tail is read for still comes back
     assert (meta["level"], meta["mode"], meta["done"]) == ("aaa", "one", ["aaa"])
+
+    # a line longer than the budget (a project edited by hand): the entry the slice cuts is dropped,
+    # not applied as the shorter patch its half still parses as
+    cut = tmp_path / "cut.rzdb"
+    entries = ",".join(f"{0x140001000 + i:x}:{'90' * 1000}" for i in range(20))
+    cut.write_text(f"/\nversion=25\n\n/tdc\nlevel=aa\nmode=one\ndone=aa\npatches={entries}\n")
+    read = rizin_sessions._read_project_meta(str(cut))["patches"]
+    assert len(entries) > rizin_sessions.PROJECT_PATCH_CHARS
+    # the slice ends in the middle of the 17th entry, on an even number of its hex digits
+    assert all(len(after) == 2000 for _, after in read), [len(after) for _, after in read]
+    assert len(read) == 16 and read[0] == (0x140001000, "90" * 1000)
 
 
 @pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
@@ -3876,7 +4049,15 @@ def test_real_rizin_keeps_a_patch_and_a_breakpoint_in_the_project(tdc, tmp_path,
         assert f"{stop:#x}=" in saved.split("\n/core/debug/breakpoints\n")[1].split("\n/")[0]
         assert '"before":' not in saved and '"after":' not in saved, "Ps saves no write cache"
 
+        # R24: arm the project's breakpoint with the command and the condition rizin runs when it hits
+        # (dbc/dbC, which Poo brings back and nothing in the API would show), and they must be gone
+        _plant_breakpoint_command(project, stop, "CC pwned", "e asm.arch=x86.nasm")
+
         sid = api.open(str(exe))["session"]
+        session = mgr.get(sid)
+        assert [(b["data"], b["cond"]) for b in session.json("dblj")] == [("", "")]
+        assert session.text("e asm.arch").strip() == "x86", "the condition never ran"
+        assert session.text(f"CC. @ {stop:#x}").strip() == "", "the command never ran"
         assert api.read(f"/api/rizin/{sid}/patches") == [
             {"addr": main, "size": size, "before": bytes(original).hex(), "after": nops, "mine": True}]
         # in effect, not merely listed: px reads through the cache again

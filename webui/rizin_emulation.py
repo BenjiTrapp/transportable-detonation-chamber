@@ -60,6 +60,18 @@ def is_mapped(value, maps):
                and m["from"] <= value < m["to"] for m in maps)
 
 
+def maps_hold(addr, size, maps):
+    """Whether one map of ``omlj`` holds all ``size`` bytes from ``addr``.
+
+    One map, not "every byte is mapped somewhere": a range that starts in one map and ends in the next
+    has no one place in the file, and both its ends can be mapped while the hole between them is not.
+    """
+    if not isinstance(maps, list) or size <= 0:
+        return False
+    return any(isinstance(m, dict) and isinstance(m.get("from"), int) and isinstance(m.get("to"), int)
+               and m["from"] <= addr and addr + size <= m["to"] for m in maps)
+
+
 def function_hint(value, functions):
     """``afij @ value``'s function as a hint for ``value``: its name at its entry, "name + delta" inside it
     (offset <= value < offset + size), None for none or a value outside the function it names."""

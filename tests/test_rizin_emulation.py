@@ -45,6 +45,22 @@ def test_is_mapped_follows_the_maps():
     assert not rizin_emulation.is_mapped(0x41, None)
 
 
+def test_maps_hold_asks_for_one_map_that_holds_the_whole_patch():
+    """What a saved patch is replayed against: one map has to hold all of it. Every byte "mapped
+    somewhere" is not enough -- a range can start in one map, end in the next and have nothing in
+    between, and a patch that is in two places at once has no one place in the file."""
+    assert rizin_emulation.maps_hold(0x140000000, 0x400, MAPS)
+    assert not rizin_emulation.maps_hold(0x140000000, 0x401, MAPS)  # one byte past the map's end
+    assert not rizin_emulation.maps_hold(0xFFFFE, 4, MAPS)  # runs into the stack map from below
+    neighbours = [{"map": 1, "from": 0x1000, "to": 0x2000, "perm": "r--", "name": "a"},
+                  {"map": 2, "from": 0x3000, "to": 0x4000, "perm": "r--", "name": "b"}]
+    # both ends mapped, the middle not: the endpoint check alone would let this through
+    assert rizin_emulation.maps_hold(0x1FFF, 1, neighbours)
+    assert rizin_emulation.maps_hold(0x3000, 1, neighbours)
+    assert not rizin_emulation.maps_hold(0x1FFF, 0x1002, neighbours)
+    assert not rizin_emulation.maps_hold(0x1000, 1, None) and not rizin_emulation.maps_hold(0x1000, 0, MAPS)
+
+
 def test_function_hint_names_only_the_function_the_value_is_in():
     entry0 = [{"offset": 0x140001440, "name": "entry0", "size": 29}]
     assert rizin_emulation.function_hint(0x140001440, entry0) == "entry0"

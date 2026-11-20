@@ -23,6 +23,7 @@ Environment:
   FAKE_RIZIN_BITS   32: an x86-32 file (``ij`` bits, the ESIL VM's registers); default 64
   FAKE_RIZIN_STACK  "<word>[,...]": the words ``aeim`` leaves at the stack pointer, upwards
   FAKE_RIZIN_NO_IO_CACHE  set: ``e io.cache=true`` does not take, ``e io.cache`` stays false
+  FAKE_RIZIN_BP_ARMED  set: ``dbc``/``dbC`` do not clear a breakpoint's command (a rizin that keeps it)
   FAKE_RIZIN_IO_CACHE_ONCE  set: only the first ``e io.cache=true`` takes (the console switched it off after)
   FAKE_RIZIN_ESIL_FLOOD  "<n>": a run that runs into esil.timeout first prints n lines of "WARNING: $ returned 0",
                     as every int3 does under esil.verbose=1 (148 000 a second measured), then the timeout line
@@ -57,7 +58,9 @@ stops at a breakpoint (also a disabled one) with
 "[ESIL] hit breakpoint at 0x..." on stdout, and a step at an address nothing is mapped at answers "Stopped
 execution in an invalid instruction" on stderr and stays. ``db @ addr`` (the one it already has there stays,
 with rizin's two ERROR lines; FAKE_RIZIN_BP_IGNORED sets none at all, as rizin does where another
-breakpoint's width covers the address), ``db- @ addr``, ``db-*``, ``dbd``, ``dbe``, ``dblj``.
+breakpoint's width covers the address), ``db- @ addr``, ``db-*``, ``dbd``, ``dbe``, ``dblj``,
+``dbc``/``dbC`` (the command and the condition rizin runs at a breakpoint, which ``dblj`` reports as
+``data`` and ``cond``, a project stores and ``dbc ""``/``dbC ""`` clear -- all measured).
 
 The views (afl, pdfj, afbj, pdj, axtj, axfj, afxj, izj, iij, flj, pxj, pdgj, ol.j, oml.j) answer
 from one model of the code: entry0 calls sym.main, whose blocks branch, run
@@ -556,14 +559,19 @@ def esil_command(word, rest, seek):
     return ""
 
 
-def esil_breakpoints(word, seek):
+def esil_breakpoints(word, rest, seek):
     """``db @ addr`` and friends: rizin's db takes no address argument. ``dblj`` answers them in the
-    order they were set, not sorted (measured) -- the server is the one that sorts."""
+    order they were set, not sorted (measured) -- the server is the one that sorts.
+
+    A breakpoint is {"enabled", "data", "cond"}: ``dbc <cmd>`` sets the command rizin runs when it hits
+    and ``dbC <expr>`` the condition, both reported by ``dblj`` and both emptied by an empty argument
+    (measured: ``dbc`` with no argument at all leaves them as they are).
+    """
     bps = state["bps"]
     if word == "dblj":
         return json.dumps([{"addr": addr, "size": 1, "perm": "--x", "hw": False, "trace": False,
-                            "enabled": enabled, "valid": esil_mapped(addr), "data": "", "cond": ""}
-                           for addr, enabled in bps.items()]) + "\n"
+                            "enabled": bp["enabled"], "valid": esil_mapped(addr), "data": bp["data"],
+                            "cond": bp["cond"]} for addr, bp in bps.items()]) + "\n"
     if word == "db":
         if seek in bps or os.environ.get("FAKE_RIZIN_BP_IGNORED"):
             # rizin keeps the breakpoint it has there, disabled or not; FAKE_RIZIN_BP_IGNORED stands for
@@ -571,14 +579,26 @@ def esil_breakpoints(word, seek):
             err("ERROR: Breakpoint already set at this address.\n")
             err(f"ERROR: Cannot set breakpoint at {seek:#x}\n")
         else:
-            bps[seek] = True
+            bps[seek] = {"enabled": True, "data": "", "cond": ""}
     elif word == "db-":
         if bps.pop(seek, None) is None:
             err(f"ERROR: Failed to delete breakpoint at {seek:#x}\n")
     elif word == "db-*":
         bps.clear()
     elif word in ("dbd", "dbe") and seek in bps:
-        bps[seek] = word == "dbe"
+        bps[seek]["enabled"] = word == "dbe"
+    elif word in ("dbc", "dbC") and seek in bps:
+        if not rest.strip():
+            err("ERROR: Wrong number of arguments passed to `dbc`, see its help with `dbc?`\n")
+        elif not os.environ.get("FAKE_RIZIN_BP_ARMED"):
+            # rizin's parser takes a surrounding pair of quotes off, so `dbc ""` empties the field
+            # (measured) while `dbc` without an argument at all leaves it as it is.
+            # FAKE_RIZIN_BP_ARMED stands for a rizin that does not let the command go, which is why
+            # the server reads the list back instead of trusting the command.
+            value = rest.strip()
+            if len(value) >= 2 and value[0] == value[-1] in "\"'":
+                value = value[1:-1]
+            bps[seek]["data" if word == "dbc" else "cond"] = value
     return ""
 
 
@@ -690,9 +710,10 @@ def save_project(path):
              "", "/core/analysis/functions"]
     lines += [f"{k}={json.dumps(v, separators=(',', ':'))}" for k, v in functions.items()]
     lines += ["", "/core/debug/breakpoints"]
-    lines += [f"{addr:#x}=" + json.dumps({"enabled": 1 if enabled else 0, "size": 1, "perm": 1,
-                                          "name": f"{addr:#010x}"}, separators=(",", ":"))
-              for addr, enabled in state["bps"].items()]
+    lines += [f"{addr:#x}=" + json.dumps({"data": bp["data"], "cond": bp["cond"], "size": 1, "perm": 1,
+                                          "enabled": 1 if bp["enabled"] else 0, "name": f"{addr:#010x}"},
+                                         separators=(",", ":"))
+              for addr, bp in state["bps"].items()]
     lines += ["", "/core/fake", "comments=" + json.dumps({hex(k): v for k, v in state["comments"].items()})]
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -711,8 +732,10 @@ def load_project(path):
                 if '"DWARF"' in value:
                     state["dwarf"] = True
             elif ns == "/core/debug/breakpoints" and "=" in line:  # like Poo: the breakpoints come back
-                key, value = line.split("=", 1)
-                state["bps"][int(key, 16)] = bool(json.loads(value).get("enabled"))
+                key, value = line.split("=", 1)                    # with their command and condition
+                saved = json.loads(value)
+                state["bps"][int(key, 16)] = {"enabled": bool(saved.get("enabled")),
+                                              "data": saved.get("data") or "", "cond": saved.get("cond") or ""}
             elif ns == "/core/fake" and line.startswith("comments="):
                 state["comments"] = {int(k, 16): v for k, v in json.loads(line[9:]).items()}
             elif ns == "/core" and line.startswith("offset="):
@@ -902,11 +925,11 @@ def answer(cmd):
     if word.startswith("Z") or word == "xyzzy":
         err(f"ERROR: Command '{word}' does not exist.\n")
         return ""
-    if word in ("db", "db-", "db-*", "dbd", "dbe", "dblj"):
+    if word in ("db", "db-", "db-*", "dbd", "dbe", "dblj", "dbc", "dbC"):
         if word not in ("dblj", "db-*") and at is None:
             err("ERROR: Wrong number of arguments passed to `db`, see its help with `db?`\n")
             return ""
-        return esil_breakpoints(word, seek)
+        return esil_breakpoints(word, rest, seek)
     if word in ("wx", "wcj", "wc-", "wc-*"):
         return write_cache(word, rest, seek)
     stepped = esil_command(word, rest, seek)

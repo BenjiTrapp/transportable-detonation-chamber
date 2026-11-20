@@ -44,12 +44,13 @@ Projects (``projects_dir/<sha256>.rzdb``) are written after a rename, a
 comment, a patch or a breakpoint, ``save_delay`` seconds after the last one,
 and at the latest when the session closes. They are loaded with ``Poo``,
 which keeps the file rizin has open, so the same file under another path
-finds its project too. ``Poo`` also brings back the saved settings and hints;
-those that could run a program or a command are set back afterwards
-(_make_safe). A project saved while a Full analysis had not finished opens
-stopped: the button goes on. What rizin's own project does not hold -- the
-write cache, measured -- goes into a ``/tdc`` namespace of its own and is
-written back with ``wx`` when the file is opened again (_replay_patches).
+finds its project too. ``Poo`` also brings back the saved settings, hints and
+breakpoints; those that could run a program or a command are set back
+afterwards (_make_safe), and a project that cannot be made safe is not used.
+A project saved while a Full analysis had not finished opens stopped: the
+button goes on. What rizin's own project does not hold -- the write cache,
+measured -- goes into a ``/tdc`` namespace of its own and is written back
+with ``wx`` when the file is opened again (_replay_patches).
 """
 
 import base64
@@ -144,6 +145,11 @@ _NOTE_ADDRESSES = 5
 _PATCHES_LOST = "{count} saved {patch} could not be applied to this file{where}."
 _PATCHES_DROPPED = ("{count} {patch} did not fit into the project ({chars} characters at most) and will "
                     "not come back when the file is opened again.")
+# While an analysis step holds rizin, a patch or a breakpoint goes through (it changes no bytes the step
+# reads) but its project cannot be written yet, and the project is the only place it outlives the
+# session. Said for as long as that is so (RizinSession.analysis), because closing the tab then loses it.
+_WAITING_NOTE = ("A patch or breakpoint is waiting to be saved; the project is written when the analysis "
+                 "has finished.")
 _FULL_NOTE = "Full analysis runs aaa's steps one by one; variables are analysed less than with aaa."
 # How long close() waits for the pipe to write a pending save: longer than the longest command.
 _FLUSH_WAIT = max(CONSOLE_TIMEOUT, DECOMPILE_TIMEOUT) + 5
@@ -950,10 +956,16 @@ def _read_patches(text):
     """The ``patches=`` line as [(addr, after_hex)], dropping every entry that is not one.
 
     Read at most as much of the line as a save would have written (PROJECT_PATCH_CHARS), so that a
-    project edited by hand cannot make the next boot send tens of thousands of ``wx`` commands.
+    project edited by hand cannot make the next boot send tens of thousands of ``wx`` commands. Where
+    that slice cuts, its last entry goes: half of ``140001000:909090`` is ``140001000:9090``, which
+    parses -- and would be applied as a different, shorter patch without a word about it.
     """
+    read = text[:PROJECT_PATCH_CHARS]
+    entries = read.split(",")
+    if len(read) < len(text):
+        entries.pop()
     found = []
-    for entry in text[:PROJECT_PATCH_CHARS].split(","):
+    for entry in entries:
         shape = _TDC_PATCH_RE.fullmatch(entry)
         if shape:
             found.append((int(shape.group(1), 16), shape.group(2)))
@@ -968,8 +980,10 @@ def _make_safe(pipe, arch):
 
     The settings come back as they were saved: an arch plugin or an assembler that hands its work to
     nasm or as, the command hooks (cmd.*), the pager, the editor. An arch hint switches asm.arch while
-    the disassembly passes it, and an ESIL hint with "#!" runs a rizin command. ``arch`` is the one
-    rizin chose for the file before Poo. False if the arch is not safe afterwards.
+    the disassembly passes it, and an ESIL hint with "#!" runs a rizin command. A breakpoint carries a
+    command (``dbc``) and a condition (``dbC``) that rizin runs when it hits, and the project stores
+    both verbatim (measured). ``arch`` is the one rizin chose for the file before Poo. False if the
+    project is not safe afterwards.
     """
     pipe.cmd("e " + " ".join(_LOAD_SETTINGS))
     if not _arch_is_safe(pipe) and arch in _SAFE_ARCHES:
@@ -986,7 +1000,46 @@ def _make_safe(pipe, arch):
             pipe.cmd(f"aha- @ {addr}")
         if " esil='" in hints and "#!" in hints:
             pipe.cmd(f"ahe- @ {addr}")
-    return _arch_is_safe(pipe)
+    return _arch_is_safe(pipe) and _disarm_breakpoints(pipe)
+
+
+def _disarm_breakpoints(pipe):
+    """Take the command and the condition off every breakpoint the project brought back; False if that
+    cannot be shown to have worked.
+
+    Measured with rizin 0.9.1: ``dbc CC pwned`` puts the command into ``dblj``'s ``data``, ``dbC`` its
+    expression into ``cond``, ``Ps`` writes both into /core/debug/breakpoints verbatim and ``Poo``
+    brings them back -- a rizin command out of a file, in a web UI that runs as SYSTEM. The console
+    cannot set one (dbc, dbC and dbx are refused there), so a project is the way in, which is what the
+    cmd.* hooks and the "#!" hints above are reset for as well. ``dbc ""`` and ``dbC ""`` empty the two
+    fields (measured; ``dbc`` without an argument leaves them as they are), and the list is read again
+    afterwards: a project whose breakpoints cannot be shown to be harmless is not used at all, like one
+    whose arch is not safe.
+    """
+    try:
+        armed = [addr for addr, command in _breakpoint_commands(pipe) if command]
+        for addr in armed:
+            pipe.cmd(f'dbc "" @ {addr:#x}')
+            pipe.cmd(f'dbC "" @ {addr:#x}')
+        return not armed or not any(command for _, command in _breakpoint_commands(pipe))
+    except ValueError:
+        return False
+
+
+def _breakpoint_commands(pipe):
+    """(addr, what rizin would run) for every breakpoint of ``dblj``; ValueError for an answer in a
+    shape nobody knows, which the caller treats as a project it cannot make safe."""
+    found = pipe.cmdj("dblj")
+    if found is None:
+        return []
+    if not isinstance(found, list):
+        raise ValueError("dblj did not answer a list of breakpoints")
+    rows = []
+    for row in found:
+        if not (isinstance(row, dict) and isinstance(row.get("addr"), int) and not isinstance(row["addr"], bool)):
+            raise ValueError("dblj did not answer a list of breakpoints")
+        rows.append((row["addr"], f"{row.get('data') or ''}{row.get('cond') or ''}"))
+    return rows
 
 
 def _arch_is_safe(pipe):
@@ -1186,8 +1239,10 @@ class RizinSession:
         self._emulation_stack_map = None
         # This session's own writes through patch/patch_op, in the order it made them (rizin_emulation.
         # cache_entry). rizin has one write cache, which holds an emulation run's writes too and cannot
-        # tell them apart; this mirror can, row by row (see patches).
+        # tell them apart; this mirror can, row by row (see patches). _lost: patches a restarted rizin
+        # could not take back, which the project keeps all the same (see _saved_patches).
         self._mine = []
+        self._lost = []
         # Notes from the boot (a project that could not be loaded, patches that could not be applied):
         # they say what the session starts with, so _start_analysis keeps them when it plans again.
         self._boot_notes = []
@@ -1236,6 +1291,11 @@ class RizinSession:
                 elapsed = round(end - self._run_started, 1)
             # The session's own notes first (why the analysis stopped): the toolbar shows the start of the note
             notes = self._notes + ([_FULL_NOTE] if self._mode == "steps" else [])
+            # Said while it is true, not stored: a patch or breakpoint made during an analysis step
+            # cannot be written before the step lets go of the pipe, and the project is the only place
+            # it would survive the session. The note goes as soon as the save is through.
+            if self._dirty and self._state == "running":
+                notes = notes + [_WAITING_NOTE]
             return {"state": self._state, "step": self._step, "done_steps": list(self._done),
                     "level": self.level, "elapsed": elapsed, "note": " ".join(notes) or None}
 
@@ -1647,6 +1707,7 @@ class RizinSession:
             addr = _address(addr)
 
         def run(pipe):
+            self._lost = []
             if addr is None:
                 pipe.cmd("wc-*")
                 self._mine = []
@@ -1670,6 +1731,7 @@ class RizinSession:
         self._require_io_cache(pipe, "the patch")
         pipe.cmd(f"wx {data.hex()} @ {addr:#x}")
         self._mine.append(rizin_emulation.cache_entry(addr, data))
+        self._lost = []  # the user is patching this cache: what a restart lost is not kept any more
         found = self._patch_list(pipe)
         if not any(r["addr"] <= addr < r["addr"] + r["size"] for r in found):
             raise RizinRefused(f"rizin wrote nothing at {addr:#x}")
@@ -1925,24 +1987,23 @@ class RizinSession:
 
         A project belongs to the file's SHA-256, so the bytes and the maps are the same ones the patches
         were made in -- except for a patch made into memory that only a running emulation had mapped
-        (``aeim``'s stack): that address is in none of ``oml.j``'s maps now, and it is a patch that never
-        had a place in the file (the export says the same, design section 8). rizin would take such a
-        write into its cache all the same (measured), so the check is the server's, and so is the one
-        against a project somebody edited by hand. What rizin then does not report in ``wcj`` is left
-        out as well, and the boot goes on either way: a project must not cost a session.
+        (``aeim``'s stack): no map of ``omlj`` holds that address now, and it is a patch that never had
+        a place in the file (the export says the same, design section 8). rizin would take such a write
+        into its cache all the same (measured), so the check is the server's, and so is the one against
+        a project somebody edited by hand. What rizin then does not report in ``wcj`` is left out as
+        well, and the boot goes on either way: a project must not cost a session.
         """
         if not patches:
             return None
         pipe = self._pipe
-        pipe.cmd("e io.cache=true")
         skipped, planned = [], []
         try:
+            pipe.cmd("e io.cache=true")
             cached = pipe.cmd("e io.cache").strip() == "true"
             maps = pipe.cmdj("omlj") if cached else None
             for addr, after in patches:
                 data = bytes.fromhex(after)
-                if not cached or not all(rizin_emulation.is_mapped(byte, maps)
-                                         for byte in (addr, addr + len(data) - 1)):
+                if not cached or not rizin_emulation.maps_hold(addr, len(data), maps):
                     skipped.append(addr)
                     continue
                 entry = rizin_emulation.cache_entry(addr, data)
@@ -1951,8 +2012,11 @@ class RizinSession:
                 pipe.cmd(f"wx {after} @ {addr:#x}")
             if planned:
                 self._patch_list(pipe)  # keeps of the mirror what rizin's cache really holds
-        except ValueError:
-            # rizin answered something no version of it should: nothing is trusted, nothing is claimed
+        except (ValueError, RizinTimeout, RizinDied):
+            # The project decides how many commands this sends, so it must not be able to cost the
+            # session: an answer in a shape nobody knows, or a rizin that stopped or hung over it,
+            # leaves the file open without its patches and with a note saying so. Nothing is claimed as
+            # this session's own either, so the next save does not write a patch that was never applied.
             self._mine = []
             return _PATCHES_LOST.format(where="", **_patch_words(len(patches)))
         applied = collections.Counter(self._mine)
@@ -2092,18 +2156,31 @@ class RizinSession:
         pipe.cmd("e analysis.calls=" + calls)
 
     def _recover(self, step, exc):
-        """A step hung or crashed rizin: restart it and replay the finished steps (gate held)."""
+        """A step hung or crashed rizin: restart it and replay the finished steps and the patches (gate
+        held).
+
+        The restarted rizin has an empty write cache, so the hand-made patches have to go in again --
+        and not only for this session: the mirror would be empty at the next save, which would write
+        ``patches=`` over the ones the project holds. What goes back in is the session's own mirror, not
+        the project's list: the mirror is what this rizin held (the project's can be older, and
+        replaying it would bring back a patch the user has taken away since). What cannot be put back
+        stays in ``self._lost``, which the next save keeps in the project rather than erasing.
+        """
         what = (f"did not finish within {self._limit + self._grace:g} s" if isinstance(exc, RizinTimeout)
                 else "stopped rizin")
         self._gate.relabel("restart")
         with self._lock:
             self._step = "restart"
         self._pipe.close()
-        replay = []
+        replay, patch_note = [], None
         try:
             pipe, contained, _, _, _, _ = self._boot()
             if not self._use(pipe):
                 return
+            wanted, self._mine = [(addr, after) for addr, _, after in self._mine], []
+            patch_note = self._replay_patches(wanted)
+            back = {(addr, after) for addr, _, after in self._mine}
+            self._lost = [patch for patch in wanted if patch not in back]
             if step == "aaa":
                 # aaa is one step; the session goes on with aa, Full analysis can take it further.
                 replay = [] if "aa" in contained else ["aa"]
@@ -2134,6 +2211,8 @@ class RizinSession:
         else:
             self._finish("stopped", f"Step {step} {what}; rizin was restarted and replayed "
                                     f"{', '.join(replay) or 'no steps'}.")
+        if patch_note:
+            self._finish("stopped", patch_note)
 
     def _finish(self, state, note):
         with self._lock:
@@ -2174,11 +2253,15 @@ class RizinSession:
         wrote: a patch the console took back with ``wc-`` has left the mirror by then, and what an
         emulation run wrote was never in it. That is the whole point -- a run's bytes never stood in the
         file, and a project that baked them in would lose track of where bytes come from.
+
+        ``self._lost`` are patches a restarted rizin could not take back (_recover): they are kept in
+        the project, because a cache that died must not erase what the project already held. The next
+        patch or take-back clears them -- from then on the live cache is the truth again.
         """
-        if not self._mine:
-            return []  # nothing of this session's own: no need to ask rizin for the cache at all
-        self._patch_list(pipe)
-        return [(addr, after) for addr, _, after in self._mine]
+        if self._mine:
+            self._patch_list(pipe)
+        kept = [(addr, after) for addr, _, after in self._mine]
+        return kept + [patch for patch in self._lost if patch not in kept]
 
     def _finish_save(self, snapshot):
         seq, tmp, level, mode, done, patches = snapshot
