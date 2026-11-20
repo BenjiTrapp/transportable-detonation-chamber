@@ -394,6 +394,7 @@ switch ($Target) {
             Copy-Item 'webui\log_store.py' -Destination 'C:\DetonationChamberUI\log_store.py' -ToSession $s -Force
             Copy-Item 'webui\dashboards.py' -Destination 'C:\DetonationChamberUI\dashboards.py' -ToSession $s -Force
             Copy-Item 'webui\rizin_sessions.py' -Destination 'C:\DetonationChamberUI\rizin_sessions.py' -ToSession $s -Force
+            Copy-Item 'webui\rizin_emulation.py' -Destination 'C:\DetonationChamberUI\rizin_emulation.py' -ToSession $s -Force
             Copy-Item 'webui\tool_updates.py' -Destination 'C:\DetonationChamberUI\tool_updates.py' -ToSession $s -Force
             Copy-Item 'webui\firewall.py' -Destination 'C:\DetonationChamberUI\firewall.py' -ToSession $s -Force
             Copy-Item 'webui\firewall_fetch.py' -Destination 'C:\DetonationChamberUI\firewall_fetch.py' -ToSession $s -Force
@@ -448,6 +449,7 @@ switch ($Target) {
             Copy-Item 'webui\log_store.py' -Destination 'C:\DetonationChamberUI\log_store.py' -ToSession $s -Force
             Copy-Item 'webui\dashboards.py' -Destination 'C:\DetonationChamberUI\dashboards.py' -ToSession $s -Force
             Copy-Item 'webui\rizin_sessions.py' -Destination 'C:\DetonationChamberUI\rizin_sessions.py' -ToSession $s -Force
+            Copy-Item 'webui\rizin_emulation.py' -Destination 'C:\DetonationChamberUI\rizin_emulation.py' -ToSession $s -Force
             Copy-Item 'webui\tool_updates.py' -Destination 'C:\DetonationChamberUI\tool_updates.py' -ToSession $s -Force
             Copy-Item 'webui\firewall.py' -Destination 'C:\DetonationChamberUI\firewall.py' -ToSession $s -Force
             Copy-Item 'webui\firewall_fetch.py' -Destination 'C:\DetonationChamberUI\firewall_fetch.py' -ToSession $s -Force

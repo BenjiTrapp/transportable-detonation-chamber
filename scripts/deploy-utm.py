@@ -48,6 +48,7 @@ FILES = {
     "webui/log_store.py": r"C:\DetonationChamberUI\log_store.py",
     "webui/dashboards.py": r"C:\DetonationChamberUI\dashboards.py",
     "webui/rizin_sessions.py": r"C:\DetonationChamberUI\rizin_sessions.py",
+    "webui/rizin_emulation.py": r"C:\DetonationChamberUI\rizin_emulation.py",
     "webui/tool_updates.py": r"C:\DetonationChamberUI\tool_updates.py",
     "webui/firewall.py": r"C:\DetonationChamberUI\firewall.py",
     "webui/firewall_fetch.py": r"C:\DetonationChamberUI\firewall_fetch.py",

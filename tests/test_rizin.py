@@ -377,7 +377,7 @@ ATTACKS = [
     "\u3000o x", "\to x", "pd 1\x1b", "pd 1\0",
     # Inside the allowed families: from `?*` and the help of each family.
     "agf interactive", "agf v", "agc interactive @ sym.main", "agf inter'active'",
-    "aep", "aeli C:\\x.dll", "aeli lib.dll", "aelir 3", "aek foo=bar", "aek-", "afco C:\\x.sdb",
+    "aep", "aepcj", "aepc.", "aeli C:\\x.dll", "aeli lib.dll", "aelir 3", "aek foo=bar", "aek-", "afco C:\\x.sdb",
     "afco x.sdb",
     "arpo profile.txt", "arpg gdb.txt", "afs!", "ascii",
     "pfo C:\\x.fdf", "pfo x", "pfw x 41", "pm C:\\x", "pm", "pmj x", "pkill rizin", "pwd", "p==v", "p==ev",
@@ -1642,6 +1642,15 @@ class _Api:
         """The commands of each rizin session process (not the status probe's runs)."""
         return [cmds for cmds in self.fake.by_process() if cmds[0].startswith("START ")]
 
+    def commands(self):
+        return self.fake.commands()
+
+    def session(self, name="pipesim.exe"):
+        """A sample opened and analysed: its session ID. The fake's FAKE_RIZIN_* variables set before apply."""
+        sid = self.open(self.write(name))["session"]
+        self.wait_done(sid)
+        return sid
+
 
 @pytest.fixture
 def rz(tdc, sessions, fake, tmp_path, monkeypatch):
@@ -2618,6 +2627,115 @@ def test_rizin_routes_answer_json_when_a_file_cannot_be_written(rz, sessions, mo
                        content_type="multipart/form-data")
     assert r.status_code == 500 and r.is_json and r.get_json()["error"].startswith("the upload could not be stored"), \
         r.data[:200]
+
+
+def _emulation_settings(rz):
+    """The settings of the last emulation start: its one ``e key=value ...`` command."""
+    line = [c for c in rz.commands() if c.startswith("e ") and "io.cache=" in c][-1]
+    return dict(token.split("=", 1) for token in line.split()[1:])
+
+
+def test_emulation_start_sets_the_guards_and_reports_the_pc(rz):
+    import rizin_sessions
+
+    sid = rz.session()
+    state = rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    assert state["running"] is True and state["pc"] == 0x140001440
+    assert {r["name"] for r in state["registers"]} >= {"rax", "rip", "rsp"}
+    settings = _emulation_settings(rz)
+    assert settings["io.cache"] == "true" and float(settings["esil.timeout"]) > 0
+    for key in ("esil.breakoninvalid", "esil.exectrap", "esil.iotrap", "esil.nonull"):
+        assert settings[key] == "true"
+    assert settings["esil.romem"] == "false"
+    # The run is bounded by rizin itself, well inside the console's time limit
+    assert 0 < float(settings["esil.timeout"]) == rizin_sessions.ESIL_TIMEOUT < rizin_sessions.CONSOLE_TIMEOUT / 4
+    # R12: the stack size is the server's, whatever the console set before
+    assert int(settings["esil.stack.size"], 0) == rizin_sessions.ESIL_STACK_SIZE <= 16 * 1024 * 1024
+    assert set(state) == {"running", "pc", "registers", "changed", "stack", "stopped", "arch", "bits"}
+    assert state["arch"] == "x86" and state["bits"] == 64 and state["stopped"] is None and state["changed"] == []
+    commands = rz.commands()
+    start = max(i for i, c in enumerate(commands) if "io.cache=" in c)
+    assert commands[start + 1:start + 5] == ["e io.cache", "aei", "aeim", "aepc 0x140001440"]
+
+
+def test_emulation_start_defaults_to_the_current_seek(rz):
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/seek", {"addr": "0x1400014b7"})
+    assert rz.send(f"/api/rizin/{sid}/emulation/start", {})["pc"] == 0x1400014B7
+
+
+def test_emulation_state_reads_the_stack_with_hints(rz, monkeypatch):
+    import rizin_sessions
+
+    monkeypatch.setenv("FAKE_RIZIN_STACK", "0x140001490")  # the address of sym.watchdog
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    state = rz.read(f"/api/rizin/{sid}/emulation")
+    stack = state["stack"]
+    assert len(stack) == rizin_sessions.RIZIN_STACK_ROWS
+    assert stack[0]["value"] == 0x140001490 and stack[0]["hint"] == "sym.watchdog"
+    assert stack[1]["hint"] is None
+    sp = next(r["value"] for r in state["registers"] if r["name"] == "rsp")
+    assert [row["addr"] for row in stack] == [sp + 8 * i for i in range(rizin_sessions.RIZIN_STACK_ROWS)]
+
+
+def test_emulation_reads_a_32_bit_stack_in_4_byte_words(rz, monkeypatch):
+    monkeypatch.setenv("FAKE_RIZIN_BITS", "32")
+    monkeypatch.setenv("FAKE_RIZIN_STACK", "0x41424344,0x41")
+    sid = rz.session()
+    state = rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x401000"})
+    assert state["bits"] == 32 and state["pc"] == 0x401000
+    assert {r["name"] for r in state["registers"]} >= {"eax", "eip", "esp"}
+    sp = next(r["value"] for r in state["registers"] if r["name"] == "esp")
+    assert [(row["addr"], row["value"]) for row in state["stack"][:3]] == [(sp, 0x41424344), (sp + 4, 0x41),
+                                                                           (sp + 8, 0)]
+
+
+def test_emulation_refuses_when_io_cache_did_not_take(rz, monkeypatch):
+    # Review Focus 5: without io.cache nothing the run writes is kept, and a decryption
+    # would silently do nothing. The start must fail loudly instead.
+    monkeypatch.setenv("FAKE_RIZIN_NO_IO_CACHE", "1")
+    sid = rz.session()
+    r = rz.post(f"/api/rizin/{sid}/emulation/start", {})
+    assert r.status_code == 400 and "io.cache" in r.get_json()["refused"]
+    assert "aei" not in rz.commands()
+    r = rz.get(f"/api/rizin/{sid}/emulation")
+    assert r.status_code == 400 and "not started" in r.get_json()["refused"]
+
+
+def test_emulation_state_is_refused_before_start(rz):
+    sid = rz.session()
+    r = rz.get(f"/api/rizin/{sid}/emulation")
+    assert r.status_code == 400 and "not started" in r.get_json()["refused"]
+    r = rz.post(f"/api/rizin/{sid}/emulation/register", {"name": "rax", "value": "0x1"})
+    assert r.status_code == 400 and "not started" in r.get_json()["refused"]
+
+
+def test_emulation_stop_leaves_the_emulation(rz):
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    assert rz.send(f"/api/rizin/{sid}/emulation/stop") == {"running": False}
+    assert rz.commands()[-1] == "aeim-"
+    r = rz.get(f"/api/rizin/{sid}/emulation")
+    assert r.status_code == 400 and "not started" in r.get_json()["refused"]
+    assert rz.send(f"/api/rizin/{sid}/emulation/stop") == {"running": False}  # stopping twice is no error
+    # A new start begins afresh: nothing counts as changed against the run before
+    assert rz.send(f"/api/rizin/{sid}/emulation/start", {})["changed"] == []
+
+
+def test_a_register_can_be_set_and_only_a_known_one(rz):
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    state = rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rax", "value": "0x41"})
+    assert next(r["value"] for r in state["registers"] if r["name"] == "rax") == 0x41
+    assert any(c.startswith("ar rax=0x41") for c in rz.commands())
+    assert state["changed"] == ["rax"]
+    for name in ("rax; wci", "nope", "rax rbx", "", None, 7):
+        r = rz.post(f"/api/rizin/{sid}/emulation/register", {"name": name, "value": "0x1"})
+        assert r.status_code == 400 and "register" in r.get_json()["refused"], name
+    assert not any(c.startswith(("ar rax;", "ar nope", "ar rax rbx", "ar =")) for c in rz.commands())
+    r = rz.post(f"/api/rizin/{sid}/emulation/register", {"name": "rax", "value": "-1"})
+    assert r.status_code == 400 and "value" in r.get_json()["refused"]
 
 
 def test_readable_takes_only_drive_paths_on_windows(tdc, monkeypatch):

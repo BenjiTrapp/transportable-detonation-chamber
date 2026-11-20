@@ -63,6 +63,8 @@ import tempfile
 import threading
 import time
 
+import rizin_emulation
+
 RIZIN_EXE = os.environ.get("TDC_RIZIN", r"C:\tools\cutter\rizin.exe")
 PROJECTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rizin_projects")
 BIG_FILE = 20 * 1024 * 1024
@@ -73,6 +75,23 @@ CONSOLE_TIMEOUT = 60.0
 DECOMPILE_TIMEOUT = 120.0
 PROJECT_TIMEOUT = 300.0
 STEP_GRACE = 120.0
+# The emulation (ESIL) stops itself after ESIL_TIMEOUT seconds: measured with rizin 0.9.1, esil.timeout=3
+# ended an endless `jmp $` after 3.02 s ("esil: timeout exceeded") and rizin went on. It stays well below
+# CONSOLE_TIMEOUT, after which the pipe kills rizin and the session ends.
+ESIL_TIMEOUT = 5.0
+# The stack that aeim maps (rizin's own defaults): set by the server at each start, so a size the console
+# set (esil.* is settable there) never becomes an allocation of gigabytes on the VM's 8 GB.
+ESIL_STACK_ADDR = 0x100000
+ESIL_STACK_SIZE = 0xF0000
+# Set in one `e` at the start of an emulation. Without io.cache every write of the run is lost (px keeps
+# the original bytes); with it the file on disk stays untouched. The traps stop the run at an invalid
+# instruction, a jump into memory that does not execute, an invalid read or write and a null pointer,
+# rather than emulating zeros there; romem stays off, so the run can decrypt in place.
+ESIL_SETTINGS = ("io.cache=true", f"esil.timeout={ESIL_TIMEOUT:g}", "esil.breakoninvalid=true",
+                 "esil.exectrap=true", "esil.iotrap=true", "esil.nonull=true", "esil.romem=false",
+                 f"esil.stack.addr={ESIL_STACK_ADDR:#x}", f"esil.stack.size={ESIL_STACK_SIZE:#x}")
+# Stack words the emulation state reads from the stack pointer upwards (one pxj and an fd per word).
+RIZIN_STACK_ROWS = 16
 # Full analysis: after a step, the next one waits STEP_GAP seconds, in which requests get the pipe, and
 # then as long as requests use or wait for it, STEP_GAP_LIMIT seconds after the step at most.
 STEP_GAP = 2.0
@@ -1067,6 +1086,11 @@ class RizinSession:
         self._thread = None
         self._state, self._step, self._notes = "running", None, []
         self._run_started = self._run_finished = None
+        # The emulation: the pipe it was started on (None: not started), the registers before and after
+        # the last change (for "changed") and the file's byte order for the stack words.
+        self._emulation = None
+        self._emulation_before = self._emulation_after = None
+        self._emulation_big_endian = False
         self._pipe, contained, level, mode, note = self._boot()
         try:
             self._read_file_info()
@@ -1217,6 +1241,107 @@ class RizinSession:
         result = self._call("comment", wait, run)
         self._schedule_save()
         return result
+
+    def emulation_start(self, addr=None, wait=2.0):
+        """Start the emulation (ESIL) at ``addr``, the current seek if None: io.cache and the guards
+        (ESIL_SETTINGS) in one ``e``, io.cache read back, then aei, aeim and aepc. Returns the state.
+
+        A start while one runs begins afresh: aeim without arguments drops the stack it mapped before.
+        """
+        if addr is not None:
+            addr = _address(addr)
+
+        def run(pipe):
+            self._emulation = None
+            pc = self.at if addr is None else addr
+            if pc is None:
+                raise RizinRefused("addr is missing: the session has no current address")
+            pipe.cmd("e " + " ".join(ESIL_SETTINGS))
+            self._require_io_cache(pipe)
+            pipe.cmd("aei")
+            pipe.cmd("aeim")
+            pipe.cmd(f"aepc {pc:#x}")
+            self._emulation_big_endian = pipe.cmd("e cfg.bigendian").strip() == "true"
+            self._emulation_before = self._emulation_after = None
+            self._emulation = pipe
+            return self._emulation_read(pipe)
+
+        return self._call("emulation", wait, run)
+
+    def emulation_stop(self, wait=2.0):
+        """Leave the emulation: aeim- unmaps its stack. The cache's writes stay (they are the patches)."""
+        def run(pipe):
+            if self._emulation is pipe:
+                pipe.cmd("aeim-")
+            self._emulation = None
+            return {"running": False}
+
+        return self._call("emulation", wait, run)
+
+    def emulation_state(self, wait=2.0):
+        """The emulation's registers, PC, stack and the registers that changed (see _emulation_read)."""
+        def run(pipe):
+            self._require_emulation(pipe)
+            return self._emulation_read(pipe)
+
+        return self._call("emulation", wait, run)
+
+    def emulation_register(self, name, value, wait=2.0):
+        """Set the register ``name`` (one of those ``ar`` lists) to ``value``; returns the state."""
+        if not isinstance(name, str):
+            raise RizinRefused("a register name is text")
+        value = _address(value)
+
+        def run(pipe):
+            self._require_emulation(pipe)
+            # Only a name rizin listed itself goes into the command: those are [A-Za-z0-9_.] words.
+            if name not in {r["name"] for r in rizin_emulation.parse_registers(pipe.cmd("ar"))}:
+                raise RizinRefused(f"'{_show(name)}' is not a register of this emulation")
+            pipe.cmd(f"ar {name}={value:#x}")
+            return self._emulation_read(pipe)
+
+        return self._call("emulation", wait, run)
+
+    def _require_emulation(self, pipe):
+        # A rizin that was restarted (a hung analysis step) has no emulation, whatever ran before.
+        if self._emulation is not pipe:
+            raise RizinRefused("the emulation is not started")
+
+    @staticmethod
+    def _require_io_cache(pipe):
+        if pipe.cmd("e io.cache").strip() != "true":
+            raise RizinRefused("io.cache could not be switched on: the emulation's writes would be lost")
+
+    def _emulation_read(self, pipe):
+        """The state (gate held). ``changed``: the registers that differ from before the last change of
+        any register, so reading the state again does not clear it."""
+        registers = rizin_emulation.parse_registers(pipe.cmd("ar"))
+        values = {r["name"]: r["value"] for r in registers}
+        if values != self._emulation_after:
+            self._emulation_before, self._emulation_after = self._emulation_after, values
+        return {"running": True, "pc": self._emulation_role(pipe, "PC"), "registers": registers,
+                "changed": rizin_emulation.changed_registers(self._emulation_before, registers),
+                "stack": self._emulation_stack(pipe, self._emulation_role(pipe, "SP")), "stopped": None,
+                "arch": self.arch, "bits": self.bits}
+
+    @staticmethod
+    def _emulation_role(pipe, role):
+        found = rizin_emulation.parse_registers(pipe.cmd("ar " + role))
+        return found[0]["value"] if found else None
+
+    def _emulation_stack(self, pipe, sp):
+        """RIZIN_STACK_ROWS words from the stack pointer upwards: addr, value and the flag it points to."""
+        size = {16: 2, 32: 4, 64: 8}.get(self.bits)
+        if sp is None or size is None:
+            return []
+        data = pipe.cmdj(f"pxj {RIZIN_STACK_ROWS * size} @ {sp:#x}")
+        if not isinstance(data, list) or not all(isinstance(b, int) and 0 <= b < 256 for b in data):
+            raise ValueError("pxj did not answer a list of bytes")
+        rows = []
+        for i, value in enumerate(rizin_emulation.stack_words(data, size, self._emulation_big_endian)):
+            hint = rizin_emulation.flag_hint(pipe.cmd(f"fd @ {value:#x}")) if value else None
+            rows.append({"addr": (sp + i * size) % 2 ** 64, "value": value, "hint": hint})
+        return rows
 
     def analyze_full(self):
         """Full analysis: aaa's sub-steps that are not done yet, one by one (see aaa_steps).

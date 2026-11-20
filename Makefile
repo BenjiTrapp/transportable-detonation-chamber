@@ -329,6 +329,7 @@ deploy:
 		vagrant upload webui/log_store.py C:\\DetonationChamberUI\\log_store.py; \
 		vagrant upload webui/dashboards.py C:\\DetonationChamberUI\\dashboards.py; \
 		vagrant upload webui/rizin_sessions.py C:\\DetonationChamberUI\\rizin_sessions.py; \
+		vagrant upload webui/rizin_emulation.py C:\\DetonationChamberUI\\rizin_emulation.py; \
 		vagrant upload webui/tool_updates.py C:\\DetonationChamberUI\\tool_updates.py; \
 		vagrant upload webui/firewall.py C:\\DetonationChamberUI\\firewall.py; \
 		vagrant upload webui/firewall_fetch.py C:\\DetonationChamberUI\\firewall_fetch.py; \
@@ -368,6 +369,7 @@ deploy-app:
 		vagrant upload webui/log_store.py C:\\DetonationChamberUI\\log_store.py; \
 		vagrant upload webui/dashboards.py C:\\DetonationChamberUI\\dashboards.py; \
 		vagrant upload webui/rizin_sessions.py C:\\DetonationChamberUI\\rizin_sessions.py; \
+		vagrant upload webui/rizin_emulation.py C:\\DetonationChamberUI\\rizin_emulation.py; \
 		vagrant upload webui/tool_updates.py C:\\DetonationChamberUI\\tool_updates.py; \
 		vagrant upload webui/firewall.py C:\\DetonationChamberUI\\firewall.py; \
 		vagrant upload webui/firewall_fetch.py C:\\DetonationChamberUI\\firewall_fetch.py; \

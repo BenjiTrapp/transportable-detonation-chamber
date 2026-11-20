@@ -151,6 +151,7 @@ transportable-detonation-chamber/
 │   ├── dashboards.py              # LOGS tab: the dashboards of your own and their tiles
 │   ├── dashboards.json            # Saved dashboards and tiles (git-ignored)
 │   ├── rizin_sessions.py          # RIZIN tab: rizin processes, console allowlist, analysis steps, projects
+│   ├── rizin_emulation.py         # RIZIN tab: the emulation's pure logic (registers, stack words, hints)
 │   ├── rizin_projects/            # Renames and comments per file, <sha256>.rzdb (git-ignored)
 │   ├── tool_updates.py            # Tool Updates: tool catalog and update checks
 │   ├── firewall.py                # FIREWALL tab: bundling and tagging of connections (pure, no I/O)

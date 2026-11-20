@@ -119,6 +119,11 @@ def test_every_deploy_path_uploads_the_web_ui_modules():
     local = {f[:-3] for f in os.listdir(os.path.join(ROOT, "webui")) if f.endswith(".py")}
     imported = set(re.findall(r"^import (\w+)", APP, re.M)) & local
     assert {"firewall", "firewall_fetch", "firewall_rules", "firewall_store", "geoip"} <= imported
+    # and the modules those import from webui/ in turn (rizin_sessions imports rizin_emulation)
+    for module in sorted(imported):
+        source = open(os.path.join(ROOT, "webui", module + ".py"), encoding="utf-8").read()
+        imported = imported | (set(re.findall(r"^import (\w+)", source, re.M)) & local)
+    assert "rizin_emulation" in imported
     assert {f"{m}.py" for m in imported} | {"firewall_rules.ps1"} <= modules
     make = open(os.path.join(ROOT, "Makefile"), encoding="utf-8").read()
     ps1 = open(os.path.join(ROOT, "make.ps1"), encoding="utf-8").read()

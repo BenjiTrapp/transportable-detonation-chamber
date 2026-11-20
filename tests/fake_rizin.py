@@ -20,11 +20,21 @@ Environment:
   FAKE_RIZIN_STRINGS  this many more strings (text 0, ...) in ``izj``, after the others
   FAKE_RIZIN_FUNCTIONS  this many more functions (fcn.00000, ...) in ``afl``, ``aflj`` and ``flj``
   FAKE_RIZIN_AFL_NOISE  set: ``afl`` also prints a line that is no function row
+  FAKE_RIZIN_BITS   32: an x86-32 file (``ij`` bits, the ESIL VM's registers); default 64
+  FAKE_RIZIN_STACK  "<word>[,...]": the words ``aeim`` leaves at the stack pointer, upwards
+  FAKE_RIZIN_NO_IO_CACHE  set: ``e io.cache=true`` does not take, ``e io.cache`` stays false
 
 Like rizin 0.9.1 it dies on ``aflj`` once a project with DWARF variable
 origins has been loaded (see rizin_sessions._sanitize_project), and ``Poo``
 brings back the settings (/core/config) and hints that a project holds.
 ``-v`` prints the version and ``-qc <cmd>`` runs one command, without a file.
+
+The ESIL VM: ``aei`` arms it, ``aeim`` too and maps a stack (esil.stack.addr
+and esil.stack.size, or its arguments) with the stack pointer in its middle
+and the PC at the seek, ``aeim-`` unmaps it, ``aepc`` sets the PC. ``ar``
+shows, reads (by name or the roles PC and SP) and sets the registers; before
+``aei`` the register commands answer that ESIL is not initialized. ``pxj``
+reads the stack, ``fd`` describes the closest flag below an address.
 
 The views (afl, pdfj, afbj, pdj, axtj, axfj, afxj, izj, iij, flj, pxj, pdgj, ol.j, oml.j) answer
 from one model of the code: entry0 calls sym.main, whose blocks branch, run
@@ -172,7 +182,20 @@ CODE = [
 state = {"seek": 0x140001440, "names": {}, "comments": {}, "prj": "", "dwarf": False, "hints": {},
          "config": {"asm.arch": "x86", "analysis.arch": "x86", "bin.lang": "c", "analysis.autoname": "false",
                     "analysis.apply.signature": "true", "analysis.calls": "false",
-                    "scr.color": "0", "scr.pager": "", "scr.interactive": "false"}}
+                    "scr.color": "0", "scr.pager": "", "scr.interactive": "false",
+                    "io.cache": "false", "esil.romem": "false", "esil.stack.addr": "0x100000",
+                    "esil.stack.size": "0xf0000"}}
+
+BITS = 32 if os.environ.get("FAKE_RIZIN_BITS") == "32" else 64
+if BITS == 64:
+    REG_NAMES = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp"] + [f"r{i}" for i in range(8, 16)] + \
+        ["rip", "rflags"]
+    ROLES = {"PC": "rip", "SP": "rsp", "BP": "rbp"}
+else:
+    REG_NAMES = ["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "eflags"]
+    ROLES = {"PC": "eip", "SP": "esp", "BP": "ebp"}
+# The ESIL VM: regs is None until aei; stack is (addr, bytearray) while aeim's map is there.
+esil = {"regs": None, "stack": None}
 
 
 def log(text):
@@ -259,10 +282,65 @@ def linear(addr, count):
 
 
 def byte_at(addr):
+    stack = esil["stack"]
+    if stack and stack[0] <= addr < stack[0] + len(stack[1]):
+        return stack[1][addr - stack[0]]
     if not BASE <= addr < MAPPED_END:
         return 0xFF  # like rizin's io.unalloc
     i = addr - BASE
     return IMAGE[i] if i < len(IMAGE) else 0
+
+
+def esil_map_stack(args):
+    """``aeim [addr [size [name]]]``: arm the VM, map the stack, SP and BP in its middle, PC at the seek."""
+    if esil["regs"] is None:
+        esil["regs"] = dict.fromkeys(REG_NAMES, 0)
+    addr = number(args[0]) if args else int(state["config"]["esil.stack.addr"], 0)
+    size = number(args[1]) if len(args) > 1 else int(state["config"]["esil.stack.size"], 0)
+    memory = bytearray(size)
+    sp = addr + size // 2
+    word = BITS // 8
+    for i, text in enumerate(filter(None, os.environ.get("FAKE_RIZIN_STACK", "").split(","))):
+        value = int(text, 0) & (2 ** BITS - 1)
+        memory[size // 2 + i * word:size // 2 + (i + 1) * word] = value.to_bytes(word, "little")
+    esil["stack"] = (addr, memory)
+    regs = esil["regs"]
+    regs[ROLES["SP"]] = regs[ROLES["BP"]] = sp
+    regs[ROLES["PC"]] = state["seek"]
+
+
+def esil_registers(rest):
+    """``ar``, ``ar <name|PC|SP>``, ``ar <name>=<value>``, like rizin 0.9.1's ``name = 0x%016x`` lines."""
+    regs = esil["regs"]
+    if regs is None:
+        err("ERROR: ESIL is not initialized. Use `aei` first.\n")
+        return ""
+    arg = rest.strip()
+    if "=" in arg:
+        name, _, value = arg.partition("=")
+        name = ROLES.get(name.strip(), name.strip())
+        if name not in regs or number(value) is None:
+            err(f"ERROR: core: Unknown register {name}\n")
+            return ""
+        regs[name] = number(value) & (2 ** BITS - 1)
+        return ""
+    if not arg:
+        return "".join(f"{name} = {value:#0{BITS // 4 + 2}x}\n" for name, value in regs.items())
+    name = ROLES.get(arg, arg)
+    if name not in regs:
+        err(f"ERROR: core: No such register '{arg}'\n")
+        return ""
+    return f"{name} = {regs[name]:#0{BITS // 4 + 2}x}\n\n"  # rizin ends the answer of a filter with an empty line
+
+
+def flag_describe(addr):
+    """``fd``: the closest flag at or below addr, as "name" or "name + delta" (nothing below: nothing)."""
+    flags = [(fn["offset"], name_of(fn)) for fn in FUNCTIONS] + [(a, n) for n, a in FLAGS.items()]
+    below = [(offset, name) for offset, name in flags if offset <= addr]
+    if not below:
+        return ""
+    offset, name = max(below)
+    return f"{name}\n" if offset == addr else f"{name} + {addr - offset}\n"
 
 
 def block_json(block):
@@ -365,7 +443,7 @@ def answer(cmd):
         fmt = os.environ.get("FAKE_RIZIN_FORMAT", "pe64")
         return json.dumps({"core": {"file": sys.argv[-1], "size": os.path.getsize(sys.argv[-1]),
                                     "format": fmt},
-                           "bin": {"arch": "x86", "bits": 64, "bintype": "pe", "lang": "c"}}) + "\n"
+                           "bin": {"arch": "x86", "bits": BITS, "bintype": "pe", "lang": "c"}}) + "\n"
     if word == "afl":
         # rizin 0.9.1: "<offset> <nbbs> <size>[ -> <realsz>]  <name>", by address; realsz where there are gaps
         lines = []
@@ -465,6 +543,8 @@ def answer(cmd):
         if tokens and all("=" in token for token in tokens):
             for token in tokens:
                 key, _, value = token.partition("=")
+                if key == "io.cache" and os.environ.get("FAKE_RIZIN_NO_IO_CACHE"):
+                    continue
                 state["config"][key] = value
                 if key in ("asm.arch", "analysis.arch"):  # like rizin, one sets the other
                     state["config"]["asm.arch"] = state["config"]["analysis.arch"] = value
@@ -507,6 +587,28 @@ def answer(cmd):
     if word.startswith("Z") or word == "xyzzy":
         err(f"ERROR: Command '{word}' does not exist.\n")
         return ""
+    if word == "aei":
+        # like rizin's reinit: a new VM, the registers stay, the PC goes to the seek
+        if esil["regs"] is None:
+            esil["regs"] = dict.fromkeys(REG_NAMES, 0)
+        esil["regs"][ROLES["PC"]] = seek
+        return ""
+    if word == "aeim":
+        esil_map_stack(rest.split())
+        return ""
+    if word == "aeim-":
+        esil["stack"] = None
+        return ""
+    if word == "aepc":
+        if esil["regs"] is None:
+            err("ERROR: ESIL is not initialized. Use `aei` first.\n")
+        elif number(rest) is not None:
+            esil["regs"][ROLES["PC"]] = number(rest)
+        return ""
+    if word == "ar":
+        return esil_registers(rest)
+    if word == "fd":
+        return flag_describe(seek)
     if word.startswith("a") or word in ("Fa",):
         return ""
     if word == "pd":

@@ -5729,6 +5729,16 @@ def _rizin_comment_at(session):
     return {"offset": addr, "comment": (op["comment"] or "") if op else ""}
 
 
+def _rizin_emulation_start(session):
+    addr = _rizin_body().get("addr")
+    return session.emulation_start(None if addr is None else _rizin_address(addr))
+
+
+def _rizin_emulation_register(session):
+    body = _rizin_body()
+    return session.emulation_register(body.get("name"), _rizin_address(body.get("value"), "value"))
+
+
 def _rizin_listable(path):
     try:
         return _readable(path) and os.path.isfile(path) and os.path.getsize(path) > 0
@@ -5985,6 +5995,26 @@ def api_rizin_comment(sid):
 def api_rizin_comment_at(sid):
     """The comment at addr ('' without one), for the right-click menu's Comment… field."""
     return _rizin_call(sid, _rizin_comment_at)
+
+
+@app.route("/api/rizin/<sid>/emulation/start", methods=["POST"])
+def api_rizin_emulation_start(sid):
+    return _rizin_call(sid, _rizin_emulation_start)
+
+
+@app.route("/api/rizin/<sid>/emulation")
+def api_rizin_emulation(sid):
+    return _rizin_call(sid, lambda session: session.emulation_state())
+
+
+@app.route("/api/rizin/<sid>/emulation/stop", methods=["POST"])
+def api_rizin_emulation_stop(sid):
+    return _rizin_call(sid, lambda session: session.emulation_stop())
+
+
+@app.route("/api/rizin/<sid>/emulation/register", methods=["POST"])
+def api_rizin_emulation_register(sid):
+    return _rizin_call(sid, _rizin_emulation_register)
 
 
 # --- ThreatCheck / DefenderCheck Integration ---
