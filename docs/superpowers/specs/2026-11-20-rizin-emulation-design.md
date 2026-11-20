@@ -62,12 +62,13 @@ x86-64-Blob mit einer XOR-Entschlüsselungsschleife und einem `call` ins Leere.
 | `aess` und `aeso` behandeln `ircall` ebenfalls falsch und laufen in den Aufgerufenen hinein | Bei einem `ircall` setzt der Server den PC selbst: `aepc` für SKIP, `aesu <pc+size>` für OVER |
 | `esil.exectrap` vor `aei` gesetzt wirkt nicht | Die Schutzschalter werden vor jedem Lauf erneut gesetzt |
 | Ohne `esil.verbose=1` hält ein I/O-Trap `aec` **stumm** an | `esil.verbose=1` gehört zu den Startwerten, sonst nennt kein Lauf diesen Grund |
-| `aesb` stellt Register wieder her, **aber nicht den Speicher**, und der nächste Schritt bewegt sich nicht | BACK ist unzuverlässig; die Oberfläche entscheidet, ob sie es anbietet |
+| `aesb` stellt Register wieder her, **aber nicht den Speicher**. Der Schritt danach **führt den Befehl aus, ohne den PC zu bewegen**: nach `aesb` auf 0x7 lief `aes` den `xor` erneut (rsi änderte sich, rip blieb 0x7), ein weiteres `aes` noch einmal | **BACK fällt ganz weg** (R20). Ein Rückwärtsschritt, der den Speicher nicht zurücknimmt und dessen Folgeschritt die Entschlüsselung doppelt anwendet, ist keine Funktion, sondern eine Falle |
 | `aess` übersprang den `call` (rip 0x1a → 0x1f) | So kommt man an einem API-Call vorbei |
 | `aes` *in* einen `call` auf nicht gemappten Speicher läuft **stumm weiter** und „emuliert" Nullen | Ohne Schutz lügt die Oberfläche; siehe die nächsten zwei Zeilen |
 | `esil.breakoninvalid`, `esil.exectrap`, `esil.iotrap`, `esil.nonull` | Damit **hält** die Emulation an, statt ins Nichts zu laufen |
 | `esil.timeout=3` beendete ein `jmp $` nach 3,02 s mit „esil: timeout exceeded", rizin lebte weiter | Native Endlosschleifen-Sicherung — der Server braucht keine eigene Schrittzähler-Schleife |
-| `aesb` (Schritt zurück) funktioniert nach `aets+` | Rückwärts gehen ist möglich |
+| `aets+` startet die Trace-Sitzung, die `aesb` braucht | Nur noch Hintergrund: BACK fällt weg (siehe die Zeile oben) |
+| **`esil.verbose=1` flutet stderr**: ein `int3`/`int N` druckt `WARNING: $ returned 0` je Ausführung — 148 025 Zeilen in einer Sekunde gemessen. `_stderr_until` behält die **ersten** 64 KB, also fiel die abschließende `timeout exceeded`-Zeile heraus und der Lauf meldete „step" | Der Haltegrund wird am **Ende** von stderr gesucht, nicht am Anfang. `int3`-Schleifen sind Standard-Anti-Debug in genau diesen Samples |
 | **`dbw` (Watchpoint) + `aec` hängt rizin endlos** (im `timeout` gestorben) | Watchpoints bleiben draußen |
 | **`Ps` speichert den Patch-Cache nicht** (nur `io.cache=true` landete im Projekt, keine Bytes) | TDC muss Patches selbst behalten |
 | **rizin 0.9.1 hat kein `wt`/`wtf`** (nur `wu`, `wf` — beide lesen Dateien) | Der Export entsteht in Python |
@@ -85,7 +86,7 @@ x86-64-Blob mit einer XOR-Entschlüsselungsschleife und einem `call` ins Leere.
   Er setzt `io.cache=true`, die `esil.*`-Schutzschalter, `aei`, `aeim` und
   `aepc` auf die aktuelle Adresse.
 - **Lauf-Zeile**, die *nur* im Emulationsmodus über dem Code erscheint:
-  - **CONT**, **STEP**, **OVER**, **SKIP**, **BACK**, **TO CALL**, **STOP**;
+  - **CONT**, **STEP**, **OVER**, **SKIP**, **TO CALL**, **STOP**;
   - der PC;
   - die Register, die der **letzte Schritt verändert hat** — beim Steppen
     zählt, was sich bewegt hat, nicht achtzehn unveränderte Werte.
@@ -93,10 +94,11 @@ x86-64-Blob mit einer XOR-Entschlüsselungsschleife und einem `call` ins Leere.
   Das kann rizin unter Windows nicht (siehe Befunde), und mit `esil.timeout`
   endet ein Lauf ohnehin nach wenigen Sekunden von selbst. Die Oberfläche darf
   deshalb kein Abbrechen versprechen.
-- **BACK ist unzuverlässig** (gemessen: `aesb` stellt Register wieder her,
-  aber nicht den Speicher, und der nächste Schritt bewegt sich nicht). Die
-  Oberfläche entscheidet, ob sie es überhaupt anbietet; tut sie es, sagt sie,
-  dass der Speicher nicht zurückgeht.
+- **Es gibt kein BACK.** `aesb` stellt den Speicher nicht zurück, und der
+  Schritt danach führt den Befehl erneut aus, ohne den PC zu bewegen — auf
+  einer Entschlüsselungsschleife würde das den `xor` doppelt anwenden und
+  dabei einen sauberen Zustand melden (beides gemessen). Die Lauf-Zeile trägt
+  also **CONT, STEP, OVER, SKIP, TO CALL, STOP** und keinen Rückwärtsschritt.
 - **Laufen bis hierher**: Im Rechtsklick-Menü der Disassembly, über
   `aesu <addr>` — der natürliche Partner der Breakpoints.
 - **PC-Markierung** in der Disassembly (eigene Markierung, deutlich von der
@@ -121,7 +123,8 @@ Neben CONSOLE, XREFS, STRINGS und IMPORTS, mit dem vollen Zustand:
 - **Stack**, ab dem Stackzeiger (`rsp` bzw. `esp`) abwärts, mit Adresse, Wert
   und — wo es passt — dem Hinweis, dass der Wert auf eine bekannte Funktion
   oder einen String zeigt.
-- **Breakpoints**, als Liste mit Adresse, Funktion, an/aus, löschen.
+- **Breakpoints**, als Liste mit Adresse, Funktion und Löschen — ohne „an/aus",
+  weil `dbd` das Anhalten nicht verhindert (gemessen, siehe Befunde).
 - **Patches**, als Liste mit Adresse, before/after, einzeln zurücknehmen,
   und den Knöpfen **Export** und **Alle zurücknehmen**.
 
