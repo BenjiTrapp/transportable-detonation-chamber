@@ -1087,10 +1087,12 @@ class RizinSession:
         self._state, self._step, self._notes = "running", None, []
         self._run_started = self._run_finished = None
         # The emulation: the pipe it was started on (None: not started), the registers before and after
-        # the last change (for "changed") and the file's byte order for the stack words.
+        # the last change (for "changed"), the file's byte order for the stack words and aeim's stack map
+        # as (from, to, name).
         self._emulation = None
         self._emulation_before = self._emulation_after = None
         self._emulation_big_endian = False
+        self._emulation_stack_map = None
         self._pipe, contained, level, mode, note = self._boot()
         try:
             self._read_file_info()
@@ -1246,7 +1248,9 @@ class RizinSession:
         """Start the emulation (ESIL) at ``addr``, the current seek if None: io.cache and the guards
         (ESIL_SETTINGS) in one ``e``, io.cache read back, then aei, aeim and aepc. Returns the state.
 
-        A start while one runs begins afresh: aeim without arguments drops the stack it mapped before.
+        A start while one runs maps a new stack (aeim without arguments drops the one it mapped before) and
+        sets the stack pointer, base pointer and PC again. The other registers keep their values: rizin
+        0.9.1's aei does not reset them (measured: rcx=0x1234 survived aeim-; aei; aeim).
         """
         if addr is not None:
             addr = _address(addr)
@@ -1261,6 +1265,11 @@ class RizinSession:
             pipe.cmd("aei")
             pipe.cmd("aeim")
             pipe.cmd(f"aepc {pc:#x}")
+            stack = rizin_emulation.stack_map(pipe.cmdj("omlj"), self._emulation_role(pipe, "SP"),
+                                              ESIL_STACK_SIZE)
+            if stack is None:
+                raise RizinRefused("rizin could not map the emulation's stack (aeim)")
+            self._emulation_stack_map = stack
             self._emulation_big_endian = pipe.cmd("e cfg.bigendian").strip() == "true"
             self._emulation_before = self._emulation_after = None
             self._emulation = pipe
@@ -1321,27 +1330,50 @@ class RizinSession:
             self._emulation_before, self._emulation_after = self._emulation_after, values
         return {"running": True, "pc": self._emulation_role(pipe, "PC"), "registers": registers,
                 "changed": rizin_emulation.changed_registers(self._emulation_before, registers),
-                "stack": self._emulation_stack(pipe, self._emulation_role(pipe, "SP")), "stopped": None,
-                "arch": self.arch, "bits": self.bits}
+                "stack": self._emulation_stack(pipe, self._emulation_role(pipe, "SP"), set(values)),
+                "stopped": None, "arch": self.arch, "bits": self.bits}
 
     @staticmethod
     def _emulation_role(pipe, role):
         found = rizin_emulation.parse_registers(pipe.cmd("ar " + role))
         return found[0]["value"] if found else None
 
-    def _emulation_stack(self, pipe, sp):
-        """RIZIN_STACK_ROWS words from the stack pointer upwards: addr, value and the flag it points to."""
+    def _emulation_stack(self, pipe, sp, registers):
+        """Up to RIZIN_STACK_ROWS words from the stack pointer upwards, those inside the stack that the start
+        mapped: addr, value and a hint. None at all when the stack pointer is not in that stack (it was
+        unmapped, or the code moved the stack pointer elsewhere): rizin reads 0xff where nothing is mapped,
+        which is no stack. Costs omlj and pxj, and for each non-zero word in a map afij, then fd.j if the
+        word is in no function."""
         size = {16: 2, 32: 4, 64: 8}.get(self.bits)
         if sp is None or size is None:
             return []
-        data = pipe.cmdj(f"pxj {RIZIN_STACK_ROWS * size} @ {sp:#x}")
+        maps = pipe.cmdj("omlj")
+        stack = self._emulation_stack_map
+        if not isinstance(maps, list) or stack is None or not any(
+                isinstance(m, dict) and (m.get("from"), m.get("to"), m.get("name")) == stack for m in maps):
+            return []
+        if not stack[0] <= sp < stack[1]:
+            return []
+        count = min(RIZIN_STACK_ROWS, (stack[1] - sp) // size)
+        if not count:
+            return []
+        data = pipe.cmdj(f"pxj {count * size} @ {sp:#x}")
         if not isinstance(data, list) or not all(isinstance(b, int) and 0 <= b < 256 for b in data):
             raise ValueError("pxj did not answer a list of bytes")
         rows = []
         for i, value in enumerate(rizin_emulation.stack_words(data, size, self._emulation_big_endian)):
-            hint = rizin_emulation.flag_hint(pipe.cmd(f"fd @ {value:#x}")) if value else None
-            rows.append({"addr": (sp + i * size) % 2 ** 64, "value": value, "hint": hint})
+            rows.append({"addr": (sp + i * size) % 2 ** self.bits, "value": value,
+                         "hint": self._emulation_hint(pipe, value, maps, registers)})
         return rows
+
+    @staticmethod
+    def _emulation_hint(pipe, value, maps, registers):
+        """The function the value points into, or a flag exactly at it that is not a register's; None
+        for a value outside every map (fd would name the closest flag below, however far)."""
+        if not value or not rizin_emulation.is_mapped(value, maps):
+            return None
+        hint = rizin_emulation.function_hint(value, pipe.cmdj(f"afij @ {value:#x}"))
+        return hint or rizin_emulation.flag_hint(pipe.cmdj(f"fd.j @ {value:#x}"), registers)
 
     def analyze_full(self):
         """Full analysis: aaa's sub-steps that are not done yet, one by one (see aaa_steps).

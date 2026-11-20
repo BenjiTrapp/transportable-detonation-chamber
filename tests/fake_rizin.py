@@ -34,7 +34,9 @@ and esil.stack.size, or its arguments) with the stack pointer in its middle
 and the PC at the seek, ``aeim-`` unmaps it, ``aepc`` sets the PC. ``ar``
 shows, reads (by name or the roles PC and SP) and sets the registers; before
 ``aei`` the register commands answer that ESIL is not initialized. ``pxj``
-reads the stack, ``fd`` describes the closest flag below an address.
+reads the stack, ``omlj`` lists it with the file's maps. ``fd`` describes the
+closest flag below an address, ``fd.j`` lists the flags at it; like rizin's
+aei, an armed VM has a flag per register at its value.
 
 The views (afl, pdfj, afbj, pdj, axtj, axfj, afxj, izj, iij, flj, pxj, pdgj, ol.j, oml.j) answer
 from one model of the code: entry0 calls sym.main, whose blocks branch, run
@@ -303,7 +305,8 @@ def esil_map_stack(args):
     for i, text in enumerate(filter(None, os.environ.get("FAKE_RIZIN_STACK", "").split(","))):
         value = int(text, 0) & (2 ** BITS - 1)
         memory[size // 2 + i * word:size // 2 + (i + 1) * word] = value.to_bytes(word, "little")
-    esil["stack"] = (addr, memory)
+    name = f"mem.{args[2]}" if len(args) > 2 else f"mem.{addr:#x}_{size:#x}"  # like get_esil_stack_name
+    esil["stack"] = (addr, memory, name)
     regs = esil["regs"]
     regs[ROLES["SP"]] = regs[ROLES["BP"]] = sp
     regs[ROLES["PC"]] = state["seek"]
@@ -333,14 +336,38 @@ def esil_registers(rest):
     return f"{name} = {regs[name]:#0{BITS // 4 + 2}x}\n\n"  # rizin ends the answer of a filter with an empty line
 
 
-def flag_describe(addr):
-    """``fd``: the closest flag at or below addr, as "name" or "name + delta" (nothing below: nothing)."""
+def all_flags():
+    """(offset, name) of every flag; once the VM is armed, like rizin's aei, also a flag per register at
+    its value (flagspace registers)."""
     flags = [(fn["offset"], name_of(fn)) for fn in FUNCTIONS] + [(a, n) for n, a in FLAGS.items()]
-    below = [(offset, name) for offset, name in flags if offset <= addr]
+    if esil["regs"] is not None:
+        flags += [(value, name) for name, value in esil["regs"].items()]
+    return flags
+
+
+def flag_describe(addr):
+    """``fd``: the closest flag at or below addr, however far, as "name" or "name + delta"."""
+    below = [(offset, name) for offset, name in all_flags() if offset <= addr]
     if not below:
         return ""
     offset, name = max(below)
     return f"{name}\n" if offset == addr else f"{name} + {addr - offset}\n"
+
+
+def flags_at(addr):
+    """``fd.j``: every flag exactly at addr (nothing at all where there is none)."""
+    found = [{"name": name, "realname": name} for offset, name in all_flags() if offset == addr]
+    return json.dumps(found) + "\n" if found else ""
+
+
+def maps_json():
+    """``omlj``: the file's maps and aeim's stack."""
+    maps = list(MAPS)
+    if esil["stack"]:
+        addr, memory, name = esil["stack"]
+        maps.append({"map": len(MAPS) + 1, "fd": 5, "delta": 0, "from": addr, "to": addr + len(memory),
+                     "perm": "rw-", "name": name})
+    return json.dumps(maps) + "\n"
 
 
 def block_json(block):
@@ -609,6 +636,10 @@ def answer(cmd):
         return esil_registers(rest)
     if word == "fd":
         return flag_describe(seek)
+    if word == "fd.j":
+        return flags_at(seek)
+    if word == "omlj":
+        return maps_json()
     if word.startswith("a") or word in ("Fa",):
         return ""
     if word == "pd":

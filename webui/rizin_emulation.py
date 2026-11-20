@@ -8,11 +8,6 @@ import re
 
 # One line of ``ar``: "rax = 0x0000000000000041" (rizin 0.9.1 pads the value to the register's width).
 _REGISTER_LINE = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_.]*) = (0x[0-9a-fA-F]+)\s*")
-# ``fd`` describes the closest flag below an address, however far below it is (and prints the distance as
-# an int, which wraps past 2^31). A stack word that far past a flag is a number, not a pointer into it:
-# 64 KiB is more than nearly any function or string, where return addresses and pointers point.
-HINT_DISTANCE = 0x10000
-_HINT_LINE = re.compile(r"(\S+)(?: \+ (-?[0-9]+))?")
 
 
 def parse_registers(text):
@@ -40,15 +35,45 @@ def stack_words(data, word_size, big_endian):
             for i in range(0, len(data) - word_size + 1, word_size)]
 
 
-def flag_hint(text):
-    """The flag that ``fd``'s answer names for a stack word ("name" or "name + delta"), or None when it
-    names none or one so far below that the word does not point into it (HINT_DISTANCE)."""
-    lines = text.strip().splitlines()
-    if not lines:
-        return None
-    m = _HINT_LINE.fullmatch(lines[0].strip())
-    if not m:
-        return None
-    if m.group(2) is not None and not 0 < int(m.group(2)) < HINT_DISTANCE:
-        return None
-    return m.group(0)
+def stack_map(maps, sp, size):
+    """The map that aeim made for the emulation's stack: of ``omlj``'s maps the one of ``size`` bytes that
+    holds the stack pointer and has aeim's name (mem.<addr>_<size>, rizin 0.9.1's get_esil_stack_name);
+    (from, to, name), or None."""
+    name = re.compile(r"mem\.0x[0-9a-f]+_0x%x" % size)
+    for m in maps if isinstance(maps, list) else []:
+        if (isinstance(m, dict) and isinstance(m.get("from"), int) and isinstance(m.get("to"), int)
+                and isinstance(m.get("name"), str) and name.fullmatch(m["name"])
+                and m["to"] - m["from"] == size and m["from"] <= sp < m["to"]):
+            return m["from"], m["to"], m["name"]
+    return None
+
+
+def is_mapped(value, maps):
+    """Whether ``value`` lies in one of ``omlj``'s maps (``to`` is the end, not in the map)."""
+    if not isinstance(maps, list):
+        return False
+    return any(isinstance(m, dict) and isinstance(m.get("from"), int) and isinstance(m.get("to"), int)
+               and m["from"] <= value < m["to"] for m in maps)
+
+
+def function_hint(value, functions):
+    """``afij @ value``'s function as a hint for ``value``: its name at its entry, "name + delta" inside it
+    (offset <= value < offset + size), None for none or a value outside the function it names."""
+    for fn in functions if isinstance(functions, list) else []:
+        if not isinstance(fn, dict):
+            continue
+        offset, size, name = fn.get("offset"), fn.get("size"), fn.get("name")
+        if (isinstance(offset, int) and isinstance(size, int) and isinstance(name, str) and name
+                and offset <= value < offset + size):
+            return name if value == offset else f"{name} + {value - offset}"
+    return None
+
+
+def flag_hint(flags, registers):
+    """The first of ``fd.j``'s flags at a value that is not one of the emulator's own register flags (aei
+    sets a flag per register at its value, flagspace registers: their names are those of ``registers``)."""
+    for flag in flags if isinstance(flags, list) else []:
+        name = flag.get("name") if isinstance(flag, dict) else None
+        if isinstance(name, str) and name and name not in registers:
+            return name
+    return None

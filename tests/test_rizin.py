@@ -2667,7 +2667,12 @@ def test_emulation_start_defaults_to_the_current_seek(rz):
 def test_emulation_state_reads_the_stack_with_hints(rz, monkeypatch):
     import rizin_sessions
 
-    monkeypatch.setenv("FAKE_RIZIN_STACK", "0x140001490")  # the address of sym.watchdog
+    # sym.watchdog; past the end of the image, 0xd50 after the last flag (fd: "...CreateNamedPipeA + 3408");
+    # inside entry0 (a return address); the stack pointer's own value, where aei put the flags rsp and rbp;
+    # 0x41, past which fd names the register flag at the PC ("rip + ..."); a flag; a byte past it in .rdata;
+    # entry0's start, which is also the PC (the flag rip).
+    words = [WATCHDOG, 0x14000A100, ENTRY + 9, 0x178000, 0x41, 0x140005014, 0x140005015, ENTRY]
+    monkeypatch.setenv("FAKE_RIZIN_STACK", ",".join(hex(w) for w in words))
     sid = rz.session()
     rz.send(f"/api/rizin/{sid}/emulation/start", {})
     state = rz.read(f"/api/rizin/{sid}/emulation")
@@ -2676,7 +2681,37 @@ def test_emulation_state_reads_the_stack_with_hints(rz, monkeypatch):
     assert stack[0]["value"] == 0x140001490 and stack[0]["hint"] == "sym.watchdog"
     assert stack[1]["hint"] is None
     sp = next(r["value"] for r in state["registers"] if r["name"] == "rsp")
+    assert sp == 0x178000
     assert [row["addr"] for row in stack] == [sp + 8 * i for i in range(rizin_sessions.RIZIN_STACK_ROWS)]
+    assert [(row["value"], row["hint"]) for row in stack[:len(words)]] == [
+        (WATCHDOG, "sym.watchdog"), (0x14000A100, None), (ENTRY + 9, "entry0 + 9"), (0x178000, None),
+        (0x41, None), (0x140005014, "str.child"), (0x140005015, None), (ENTRY, "entry0")]
+    # The fake's fd answers what rizin's does there: the closest flag, however far, a register's too
+    assert re.fullmatch(r"r\w+ \+ [0-9]+", rz.send(f"/api/rizin/{sid}/console", {"cmd": "fd @ 0x41"})["output"].strip())
+    assert rz.send(f"/api/rizin/{sid}/console", {"cmd": "fd @ 0x178000"})["output"].strip() in ("rsp", "rbp")
+    # A word outside every map is not even looked up
+    assert not any("0x14000a100" in c or c.endswith("@ 0x41") for c in rz.commands() if c.startswith(("afij", "fd.j")))
+
+
+def test_emulation_shows_no_stack_where_the_stack_pointer_is_not_in_it(rz):
+    import rizin_sessions
+
+    sid = rz.session()
+    state = rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    assert len(state["stack"]) == rizin_sessions.RIZIN_STACK_ROWS
+    end = 0x100000 + rizin_sessions.ESIL_STACK_SIZE
+    # Near the stack's end: only the words that are in it
+    state = rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rsp", "value": hex(end - 16)})
+    assert [row["addr"] for row in state["stack"]] == [end - 16, end - 8]
+    # Outside it (rizin would read 0xff there): no stack at all
+    state = rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rsp", "value": "0x41"})
+    assert state["running"] is True and state["stack"] == []
+    rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rsp", "value": hex(end - 16)})
+    # The console unmapped the stack: no stack either, though rsp points where it was
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "aeim-"})
+    state = rz.read(f"/api/rizin/{sid}/emulation")
+    assert state["running"] is True and state["stack"] == []
+    assert not any(c.startswith("pxj") for c in rz.commands()[-6:])
 
 
 def test_emulation_reads_a_32_bit_stack_in_4_byte_words(rz, monkeypatch):

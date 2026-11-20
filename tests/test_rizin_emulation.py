@@ -24,14 +24,42 @@ def test_stack_words_follow_the_word_size_and_byte_order():
     assert rizin_emulation.stack_words(data[:7], 4, big_endian=False) == [0x40001490]  # no half word
 
 
-def test_flag_hint_keeps_a_flag_and_a_near_offset_into_one():
-    assert rizin_emulation.flag_hint("sym.watchdog\n") == "sym.watchdog"
-    assert rizin_emulation.flag_hint("entry0 + 9\n") == "entry0 + 9"  # a return address
-    assert rizin_emulation.flag_hint("") is None
-    assert rizin_emulation.flag_hint("\n") is None
-    # fd describes the closest flag below, however far: a number far past one is no pointer to it
-    assert rizin_emulation.flag_hint(f"section..reloc + {rizin_emulation.HINT_DISTANCE}\n") is None
-    assert rizin_emulation.flag_hint("section..reloc + -12\n") is None
+STACK = {"map": 6, "fd": 5, "from": 0x100000, "to": 0x1F0000, "perm": "rw-", "name": "mem.0x100000_0xf0000"}
+MAPS = [{"map": 1, "fd": 3, "from": 0x140000000, "to": 0x140000400, "perm": "r--", "name": "fmap.header"}, STACK]
+
+
+def test_stack_map_is_the_one_aeim_made_around_the_stack_pointer():
+    assert rizin_emulation.stack_map(MAPS, 0x178000, 0xF0000) == (0x100000, 0x1F0000, "mem.0x100000_0xf0000")
+    assert rizin_emulation.stack_map(MAPS, 0x1F0000, 0xF0000) is None  # "to" is past the map
+    assert rizin_emulation.stack_map(MAPS, 0x178000, 0x1000) is None  # another size: not ours
+    renamed = [dict(STACK, name="mem.mystack")]  # a console aeim with a name of its own
+    assert rizin_emulation.stack_map(renamed, 0x178000, 0xF0000) is None
+    assert rizin_emulation.stack_map(None, 0x178000, 0xF0000) is None
+
+
+def test_is_mapped_follows_the_maps():
+    assert rizin_emulation.is_mapped(0x140000000, MAPS) and rizin_emulation.is_mapped(0x1EFFFF, MAPS)
+    assert not rizin_emulation.is_mapped(0x140000400, MAPS) and not rizin_emulation.is_mapped(0x41, MAPS)
+    assert not rizin_emulation.is_mapped(0x41, None)
+
+
+def test_function_hint_names_only_the_function_the_value_is_in():
+    entry0 = [{"offset": 0x140001440, "name": "entry0", "size": 29}]
+    assert rizin_emulation.function_hint(0x140001440, entry0) == "entry0"
+    assert rizin_emulation.function_hint(0x140001449, entry0) == "entry0 + 9"
+    assert rizin_emulation.function_hint(0x14000145D, entry0) is None  # just past its end
+    assert rizin_emulation.function_hint(0x140001400, entry0) is None
+    assert rizin_emulation.function_hint(0x140001449, []) is None
+    assert rizin_emulation.function_hint(0x140001449, None) is None
+
+
+def test_flag_hint_leaves_out_the_register_flags():
+    registers = {"rax", "rsp", "rbp", "rip"}
+    assert rizin_emulation.flag_hint([{"name": "str.child"}], registers) == "str.child"
+    assert rizin_emulation.flag_hint([{"name": "rsp"}, {"name": "rbp"}], registers) is None
+    assert rizin_emulation.flag_hint([{"name": "rip"}, {"name": "entry0"}], registers) == "entry0"
+    assert rizin_emulation.flag_hint(None, registers) is None
+    assert rizin_emulation.flag_hint([{"name": ""}, "x"], registers) is None
 
 
 def test_changed_registers_compares_with_the_state_before():
