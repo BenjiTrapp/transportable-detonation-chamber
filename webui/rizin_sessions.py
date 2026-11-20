@@ -113,6 +113,13 @@ SAVE_DELAY = 3.0
 # from nothing. Patches past the budget are left out of the save and the session says how many
 # (_finish_save), rather than costing the analysis progress in silence.
 PROJECT_PATCH_CHARS = 32 * 1024
+# The widest range one re-analysis covers, and the most functions it rebuilds in it. Both are backstops
+# on what a single request costs: the string search reads the range byte for byte (measured on rizin
+# 0.9.1: 1 MB of random bytes in 0.2 s, 12 500 hits and about 1 MB of JSON), and every function of the
+# range costs an af- and an af. A range a run decrypted is far smaller; a wider one is re-analysed in
+# parts, which the start and end of the request allow.
+MAX_REANALYZE_BYTES = 4 * 1024 * 1024
+MAX_REANALYZE_FUNCTIONS = 256
 CONSOLE_LIMIT = 1024 * 1024
 # The largest answer that the lists of strings, imports and flags keep: their JSON of a big dump (izj,
 # flj) runs to hundreds of MB, and the web UI filters and pages them from a copy of its own.
@@ -1744,6 +1751,101 @@ class RizinSession:
         rows, self._mine = rizin_emulation.patch_rows(rizin_emulation.parse_cache(pipe.cmd("wcj")),
                                                       self._mine)
         return rows
+
+    def run_range(self, wait=2.0):
+        """The range an emulation run wrote, as (lowest address, highest address), both in it; None when
+        the run wrote nothing.
+
+        The run's writes are the rows of the write cache that are not this session's patches (``mine``),
+        minus those in the stack that the start mapped: a word a call pushed is no code to analyse.
+        What is left is grouped (rizin_emulation.write_cluster), and the group that holds the most bytes
+        is the range -- a run that pushed a word here and decrypted a block there must not become one
+        span of everything in between.
+        """
+        return self._call("emulation", wait, self._run_range)
+
+    def reanalyze(self, start=None, end=None, wait=2.0):
+        """Analyse the range ``start``..``end`` again, both addresses in it, and return
+        {"start", "end", "functions", "strings"}: the range and what rizin now finds in it.
+
+        Without a range, the one the run wrote (``run_range``); a run that wrote nothing is refused
+        rather than analysed as an empty or invented range. HEX and DISASSEMBLY show a run's bytes by
+        themselves (px reads through the cache), but FUNCTIONS and STRINGS do not: rizin builds those
+        when it loads the file, from its sections. This is what makes the bytes a run decrypted readable
+        as code -- and it belongs to the run: a ``wc-*`` or a new session takes it away with the bytes.
+        """
+        if (start is None) != (end is None):
+            raise RizinRefused("a range takes start and end, or neither: then the run's own range is used")
+        if start is not None:
+            start, end = _address(start), _address(end)
+            if end < start:
+                raise RizinRefused(f"end ({end:#x}) is below start ({start:#x})")
+            self._reanalyze_width(start, end)  # before the pipe is waited for
+
+        def run(pipe):
+            found = (start, end) if start is not None else self._run_range(pipe)
+            if found is None:
+                raise RizinRefused("the run wrote nothing to analyse")
+            low, high = found
+            self._reanalyze_width(low, high)  # a run can have decrypted more than one request covers
+            return {"start": low, "end": high,
+                    "functions": self._reanalyze_functions(pipe, low, high),
+                    "strings": self._reanalyze_strings(pipe, low, high)}
+
+        return self._call("emulation", wait, run)
+
+    @staticmethod
+    def _reanalyze_width(low, high):
+        if high - low + 1 > MAX_REANALYZE_BYTES:
+            raise RizinRefused(f"at most {MAX_REANALYZE_BYTES} bytes are analysed at once, and this "
+                               f"range is {high - low + 1}: analyse it in parts")
+
+    def _run_range(self, pipe):
+        """The range the run wrote (gate held); see run_range."""
+        stack = self._emulation_stack_map
+        rows = [row for row in self._patch_list(pipe) if not row["mine"]
+                and not (stack is not None and row["addr"] < stack[1]
+                         and stack[0] < row["addr"] + row["size"])]
+        return rizin_emulation.write_cluster(rows)
+
+    def _reanalyze_functions(self, pipe, low, high):
+        """``af`` over the range (gate held): how many functions now begin in it.
+
+        The functions that begin in the range go first (``af-``): rizin's af leaves a function that is
+        there alone, so without that the stale function of the bytes the run overwrote would survive it
+        (measured on 0.9.1: after a decryption the 7-byte function of the encrypted bytes was still what
+        af answered). Then one af per address, bounded to the range by ``analysis.limits``, because af
+        follows the calls out of it -- measured, and with ``analysis.calls`` false as well: pointed into
+        freshly decrypted bytes it made a function at the target of their call, and 32 of them down a
+        chain. The settings ride on the command (``@e:``), so nothing is left changed behind it.
+        """
+        rows = pipe.cmd("afl", timeout=CONSOLE_TIMEOUT, limit=FUNCTION_ANSWER_MAX)
+        begins = sorted({addr for addr in rizin_emulation.function_entries(rows) if low <= addr <= high})
+        if len(begins) > MAX_REANALYZE_FUNCTIONS:
+            raise RizinRefused(f"the range holds {len(begins)} functions, more than "
+                               f"{MAX_REANALYZE_FUNCTIONS}: analyse it in parts")
+        for addr in begins:
+            pipe.cmd(f"af- @ {addr:#x}")
+        before = rizin_emulation.function_total(pipe.cmd("aflc"))
+        limits = f"@e:analysis.limits=true,analysis.from={low:#x},analysis.to={high + 1:#x}"
+        for addr in [low] + [addr for addr in begins if addr != low]:
+            pipe.cmd(f"af @ {addr:#x} {limits}", timeout=CONSOLE_TIMEOUT)
+        return max(0, rizin_emulation.function_total(pipe.cmd("aflc")) - before)
+
+    def _reanalyze_strings(self, pipe, low, high):
+        """``/zj`` over the range (gate held): how many strings it found.
+
+        rizin 0.9.1's /zj searches for a *pattern* and has no form that lists the strings of a range
+        (measured: without one it refuses), so the pattern is a run of printable bytes. The range is
+        search.from..search.to with search.in=range; the block (``@!``) does not bound the search
+        (measured: it searched the whole file all the same). Every hit gets a flag of its own
+        (hit.string.<encoding>.<n>, rizin's search.flags), which is how FLAGS and the console's Tab show
+        what the run decrypted.
+        """
+        found = pipe.cmdj(f"/zj {rizin_emulation.STRING_PATTERN} r ascii "
+                          f"@e:search.in=range,search.from={low:#x},search.to={high + 1:#x}",
+                          timeout=CONSOLE_TIMEOUT, limit=VIEW_ANSWER_MAX)
+        return rizin_emulation.string_hits(found)
 
     def _require_emulation(self, pipe):
         # A rizin that was restarted (a hung analysis step) has no emulation, whatever ran before.

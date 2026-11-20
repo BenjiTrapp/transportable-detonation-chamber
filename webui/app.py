@@ -5790,6 +5790,18 @@ def _rizin_unpatch(session):
         _rizin_forget(session)
 
 
+def _rizin_reanalyze(session):
+    """POST: start and end (both optional, both or neither; default the range the run wrote)."""
+    body = _rizin_body()
+    start, end = body.get("start"), body.get("end")
+    try:
+        return session.reanalyze(None if start is None else _rizin_address(start, "start"),
+                                 None if end is None else _rizin_address(end, "end"))
+    finally:
+        # the range now holds functions, strings and flags rizin did not have: the copies are stale
+        _rizin_forget(session)
+
+
 def _rizin_listable(path):
     try:
         return _readable(path) and os.path.isfile(path) and os.path.getsize(path) > 0
@@ -6103,6 +6115,12 @@ def api_rizin_patch(sid):
 @app.route("/api/rizin/<sid>/patch", methods=["DELETE"])
 def api_rizin_unpatch(sid):
     return _rizin_call(sid, _rizin_unpatch)
+
+
+@app.route("/api/rizin/<sid>/reanalyze", methods=["POST"])
+def api_rizin_reanalyze(sid):
+    """Analyse the range an emulation run wrote again, so FUNCTIONS and STRINGS see what it decrypted."""
+    return _rizin_call(sid, _rizin_reanalyze)
 
 
 # --- ThreatCheck / DefenderCheck Integration ---

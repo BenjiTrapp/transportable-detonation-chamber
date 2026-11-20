@@ -30,6 +30,9 @@ Environment:
   FAKE_RIZIN_NO_SP  set: ``ar SP`` answers nothing (a file whose profile has no SP role)
   FAKE_RIZIN_ESIL_RUNAWAY  set: ``aec`` and ``aesu`` run into esil.timeout (the warning on stderr, the PC where
                     it was)
+  FAKE_RIZIN_EXTRA_FUNCTION  "<addr>:<name>[,...]": functions rizin only knows once something has
+                    analysed the bytes there. ``af`` reveals them, and with analysis.limits on only
+                    those inside [analysis.from, analysis.to) -- the way rizin bounds af's recursion
 
 Like rizin 0.9.1 it dies on ``aflj`` once a project with DWARF variable
 origins has been loaded (see rizin_sessions._sanitize_project), and ``Poo``
@@ -51,7 +54,9 @@ every read of a byte goes through it. Without ``io.cache`` a write is lost.
 
 Stepping moves the PC through the code model below: a call pushes its return address and goes to its target
 (an indirect call goes to 0, where nothing is mapped: the callee is read from memory), a ret pops, a jmp
-follows, a conditional jmp falls through (no flags). ``aes`` is one op, ``aeso`` runs a call to its return,
+follows, a conditional jmp falls through (no flags), and a store (``xor byte [<addr>], <key>``, which pdj
+reports as type "xor" with the target in "ptr") writes that byte through the write cache.
+``aes`` is one op, ``aeso`` runs a call to its return,
 ``aess`` skips a call (but not an indirect one, like rizin: ``aeso`` neither), ``aesu``/``aecu`` run to an
 address, ``aecc`` to the next direct call (not before an indirect one), ``aec`` on. Like rizin 0.9.1 each
 stops at a breakpoint (also a disabled one) with
@@ -62,16 +67,22 @@ breakpoint's width covers the address), ``db- @ addr``, ``db-*``, ``dbd``, ``dbe
 ``dbc``/``dbC`` (the command and the condition rizin runs at a breakpoint, which ``dblj`` reports as
 ``data`` and ``cond``, a project stores and ``dbc ""``/``dbC ""`` clear -- all measured).
 
-The views (afl, pdfj, afbj, pdj, axtj, axfj, afxj, izj, iij, flj, pxj, pdgj, ol.j, oml.j) answer
+The views (afl, aflc, pdfj, afbj, pdj, axtj, axfj, afxj, izj, iij, flj, pxj, pdgj, ol.j, oml.j) answer
 from one model of the code: entry0 calls sym.main, whose blocks branch, run
 a long block, switch over two cases and leave by a tail call to
-sym.watchdog. ``cmd @@= a b ...`` runs cmd at each address and, like rizin,
-stops at an address ``pdj`` cannot read.
+sym.watchdog. ``af`` analyses the function at the seek (it answers nothing,
+and brings a function of the model that ``af-`` removed back), ``/zj``
+searches the bytes of the search range for strings. ``cmd @@= a b ...`` runs
+cmd at each address and, like rizin, stops at an address ``pdj`` cannot read.
+``cmd @e:k=v,...`` runs cmd with those settings and then puts the old ones
+back, as rizin's temporary eval does (the model takes it last, after any
+``~``, which is where the server writes it).
 """
 
 import base64
 import json
 import os
+import re
 import sys
 import time
 
@@ -92,6 +103,14 @@ FUNCTIONS = [] if os.environ.get("FAKE_RIZIN_NO_CODE") else [
 # A big dump: that many more functions, far from the ones above (a dump's thousands of fcn.*)
 FUNCTIONS += [{"offset": 0x140010000 + i * 0x20, "name": f"fcn.{i:05d}", "size": 16, "nbbs": 1}
               for i in range(int(os.environ.get("FAKE_RIZIN_FUNCTIONS") or 0))]
+# The functions of the model, by address: `af` brings one that `af-` removed back, the way rizin builds it
+# from the bytes again. HELD are the ones rizin does not know yet (FAKE_RIZIN_EXTRA_FUNCTION): `af` reveals
+# them, which is what a run's decrypted bytes do.
+TEMPLATES = {fn["offset"]: dict(fn) for fn in FUNCTIONS}
+HELD = {}
+for _part in filter(None, os.environ.get("FAKE_RIZIN_EXTRA_FUNCTION", "").split(",")):
+    _addr, _, _name = _part.partition(":")
+    HELD[int(_addr, 0)] = {"offset": int(_addr, 0), "name": _name, "size": 16, "nbbs": 1}
 SLEEP, PIPE, THREAD = 0x1400093A8, 0x1400093B0, 0x140009340
 FLAGS = {"sym.imp.KERNEL32.dll_Sleep": SLEEP, "sym.imp.KERNEL32.dll_CreateNamedPipeA": PIPE,
          "str.child": 0x140005014}
@@ -172,6 +191,16 @@ LOOSE_OPS = [_op(0x140003080, 3, "cmp eax, 0x01", "cmp", data="83f801"),
                  data="e800e4ffff"),
              _op(0x140003098, 6, "jmp qword [sym.imp.KERNEL32.dll_CreateNamedPipeA]", "ijmp", ptr=PIPE),
              _op(0x14000309E, 1, "int3", "trap")]
+# A decryption stub, also outside every function: eight unrolled stores over DECRYPT_TARGET.., then a
+# ret. Each one is a `xor byte [<abs>], 0x41`, which pdj reports as type "xor" with the target in "ptr",
+# and the step machine writes that byte through the write cache, as rizin's ESIL does. The bytes there are
+# zero, so the run leaves eight 0x41 ('A') -- a string where there was none, which is the point of the
+# whole feature. DECRYPT_END is the ret: a run `until` it writes the whole range and nothing else.
+DECRYPT_AT, DECRYPT_TARGET, DECRYPT_KEY, DECRYPT_SIZE = 0x140002800, 0x140002000, 0x41, 8
+DECRYPT_END = DECRYPT_AT + DECRYPT_SIZE * 7
+LOOSE_OPS += [_op(DECRYPT_AT + i * 7, 7, f"xor byte [{DECRYPT_TARGET + i:#x}], {DECRYPT_KEY:#x}", "xor",
+                  ptr=DECRYPT_TARGET + i) for i in range(DECRYPT_SIZE)]
+LOOSE_OPS.append(_op(DECRYPT_END, 1, "ret", "ret"))
 XREFS = [{"from": src, "to": dst, "type": kind} for src, dst, kind in (
     (0x140001444, 0x1400014B7, "CALL"),
     (0x140001499, SLEEP, "CALL"),
@@ -215,9 +244,12 @@ CODE = [
 ]
 
 state = {"seek": 0x140001440, "names": {}, "comments": {}, "prj": "", "dwarf": False, "hints": {}, "bps": {},
-         "cache": [],
+         "cache": [], "hits": {},
          "config": {"asm.arch": "x86", "analysis.arch": "x86", "bin.lang": "c", "analysis.autoname": "false",
                     "analysis.apply.signature": "true", "analysis.calls": "false",
+                    "analysis.limits": "false", "analysis.from": "0xffffffffffffffff",
+                    "analysis.to": "0xffffffffffffffff",
+                    "search.in": "io.maps", "search.from": "0", "search.to": "0xffffffffffffffff",
                     "scr.color": "0", "scr.pager": "", "scr.interactive": "false",
                     "io.cache": "false", "esil.romem": "false", "esil.breakoninvalid": "false", "esil.stack.addr": "0x100000",
                     "esil.stack.size": "0xf0000"}}
@@ -233,6 +265,7 @@ else:
 # The ESIL VM: regs is None until aei; stack is (addr, bytearray) while aeim's map is there.
 esil = {"regs": None, "stack": None}
 ESIL_CAP = 200000  # steps of one run: past it the fake's code has run into nothing it models
+SEARCH_MAX = 0x10000  # bytes of a search range the model reads (a test's range is far smaller)
 ESIL_INVALID = "ERROR: core: esil: Stopped execution in an invalid instruction (see e??esil.breakoninvalid)\n"
 
 
@@ -484,6 +517,9 @@ def esil_step_one(execute=True):
         nxt = esil_pop()
     elif kind == "ijmp":
         nxt = 0
+    elif kind == "xor" and op.get("ptr") is not None:
+        # a store (`xor byte [<addr>], <key>`): the byte goes through the write cache, as rizin's ESIL does
+        cache_write(op["ptr"], bytes([byte_at(op["ptr"]) ^ DECRYPT_KEY]))
     regs[ROLES["PC"]] = nxt % 2 ** BITS
     return esil_stop_at_breakpoint()
 
@@ -603,6 +639,75 @@ def esil_breakpoints(word, rest, seek):
 
 
 
+def analysis_function(word, rest, seek):
+    """``af``, ``af-`` and ``aflc``, as rizin 0.9.1 answers them.
+
+    ``af`` prints nothing. It analyses the function at the seek: a function of the model that ``af-``
+    removed comes back (rizin builds it from the bytes again), and the ones FAKE_RIZIN_EXTRA_FUNCTION
+    holds back are revealed -- a function rizin only knows once something has analysed the bytes there.
+    With ``analysis.limits`` on, only those inside [analysis.from, analysis.to) are, which is how rizin
+    bounds af's recursion: measured on rizin 0.9.1, without the limits ``af`` followed a call out of the
+    range and made a function at its target, and it did so with ``analysis.calls`` false as well.
+
+    ``af-`` removes the function the seek is **in**, not only one that starts there (measured), and
+    ``aflc`` answers the number of functions and nothing else.
+    """
+    if word == "aflc":
+        return f"{len(FUNCTIONS)}\n"
+    if word == "af-":
+        fn = function_at(seek)
+        if fn is not None:
+            FUNCTIONS.remove(fn)
+        return ""
+    cfg, low, high = state["config"], None, None
+    if cfg.get("analysis.limits") == "true":
+        low, high = number(cfg.get("analysis.from")), number(cfg.get("analysis.to"))
+    for fn in [fn for fn in (TEMPLATES.get(seek),) if fn] + list(HELD.values()):
+        if low is not None and not low <= fn["offset"] < high:
+            continue
+        if function_at(fn["offset"]) is None:
+            FUNCTIONS.append(dict(fn))
+    return ""
+
+
+def string_search(rest):
+    """``/zj <pattern> <regex_flags> <encoding>``: rizin 0.9.1's string search.
+
+    It takes a **pattern** -- there is no "list the strings here" form, and without one it refuses
+    (measured) -- and answers [{"address", "size", "flag", "detail"}], an empty array for no hit. With
+    ``search.flags`` (on by default) every hit gets a flag ``hit.string.<encoding>.<n>``, numbered from 0
+    at every search, so a second search writes over the first one's flags (measured).
+
+    The search covers [search.from, search.to) when ``search.in`` is "range", and the file's maps
+    otherwise; a hit is cut off at the end of the range (measured). Of the patterns rizin takes, the model
+    reads only the printable run the server searches for, ``[[:print:]]{N,}``: N is its least length.
+    """
+    args = rest.split()
+    if not args:
+        err("ERROR: Wrong number of arguments passed to `/zj`, see its help with `/zj?`\n")
+        return ""
+    least = re.search(r"\{(\d+),\}", args[0])
+    least = int(least.group(1)) if least else 1
+    encoding = args[2] if len(args) > 2 else "ascii"
+    cfg = state["config"]
+    if cfg.get("search.in") == "range":
+        start, end = number(cfg.get("search.from")) or 0, number(cfg.get("search.to")) or 0
+    else:
+        start, end = BASE, MAPPED_END
+    end = min(end, start + SEARCH_MAX)  # the model reads at most SEARCH_MAX bytes of a range
+    hits, run = [], 0
+    for at in range(start, end + 1):  # one past the end, so that a run reaching it is written down
+        if at < end and 0x20 <= byte_at(at) <= 0x7E:
+            run += 1
+            continue
+        if run >= least:
+            hits.append({"address": at - run, "size": run,
+                         "flag": f"hit.string.{encoding}.{len(hits)}", "detail": run})
+        run = 0
+    state["hits"] = {hit["flag"]: hit["address"] for hit in hits}
+    return json.dumps(hits) + "\n"
+
+
 def esil_registers(rest):
     """``ar``, ``ar <name|PC|SP>``, ``ar <name>=<value>``, like rizin 0.9.1's ``name = 0x%016x`` lines."""
     regs = esil["regs"]
@@ -631,8 +736,9 @@ def esil_registers(rest):
 
 def all_flags():
     """(offset, name) of every flag; once the VM is armed, like rizin's aei, also a flag per register at
-    its value (flagspace registers)."""
+    its value (flagspace registers), and the hits of the last string search (see string_search)."""
     flags = [(fn["offset"], name_of(fn)) for fn in FUNCTIONS] + [(a, n) for n, a in FLAGS.items()]
+    flags += [(addr, name) for name, addr in state["hits"].items()]
     if esil["regs"] is not None:
         flags += [(value, name) for name, value in esil["regs"].items()]
     return flags
@@ -750,6 +856,17 @@ def load_project(path):
 
 
 def answer(cmd):
+    head, temporary, settings = cmd.partition(" @e:")
+    if temporary:
+        # rizin's temporary eval: the settings hold for this command and the old ones come back after it
+        saved = dict(state["config"])
+        for token in settings.split(","):
+            key, _, value = token.partition("=")
+            state["config"][key.strip()] = value.strip()
+        try:
+            return answer(head)
+        finally:
+            state["config"] = saved
     cmd, _, grep = cmd.partition("~")
     if grep == "?":
         return f"{len(answer(cmd).splitlines())}\n"
@@ -835,6 +952,7 @@ def answer(cmd):
         extra = int(os.environ.get("FAKE_RIZIN_FLAGS") or 0)
         flags = [(name_of(fn), fn["offset"], fn["size"]) for fn in FUNCTIONS]
         flags += [(name, addr, 8) for name, addr in FLAGS.items()]
+        flags += [(name, addr, 1) for name, addr in state["hits"].items()]
         flags += [(f"str.extra_{i:04d}", 0x140007000 + i * 16, 16) for i in range(extra)]
         return json.dumps([{"name": name, "realname": name.split(".")[-1], "size": size, "offset": addr}
                            for name, addr, size in reversed(flags)]) + "\n"
@@ -932,6 +1050,10 @@ def answer(cmd):
         return esil_breakpoints(word, rest, seek)
     if word in ("wx", "wcj", "wc-", "wc-*"):
         return write_cache(word, rest, seek)
+    if word in ("af", "af-", "aflc"):
+        return analysis_function(word, rest, seek)
+    if word == "/zj":
+        return string_search(rest)
     stepped = esil_command(word, rest, seek)
     if stepped is not None:
         return stepped

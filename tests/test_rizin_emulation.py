@@ -338,3 +338,88 @@ def test_instruction_at_takes_the_op_pdj_decoded_there():
     assert rizin_emulation.instruction_at(None, 0x1000) is None
     # past its block rizin 0.9.1 answers a broken op whose address is not one
     assert rizin_emulation.instruction_at([{"offset": 2 ** 64 - 1, "size": 0, "type": "null"}], 0x1000) is None
+
+
+# --- Re-analysing the range a run decrypted ---------------------------------
+
+def _written(addr, size):
+    return {"addr": addr, "size": size, "before": "00" * size, "after": "41" * size}
+
+
+def test_write_cluster_takes_the_writes_that_belong_together():
+    """A decryption loop writes byte by byte: those rows are one range."""
+    rows = [_written(0x1000 + i, 1) for i in range(8)]
+    assert rizin_emulation.write_cluster(rows) == (0x1000, 0x1007)
+    # rizin's order is the order the writes were made, not by address
+    assert rizin_emulation.write_cluster(list(reversed(rows))) == (0x1000, 0x1007)
+    # one write, and a write of several bytes: the last byte is the end
+    assert rizin_emulation.write_cluster([_written(0x20, 1)]) == (0x20, 0x20)
+    assert rizin_emulation.write_cluster([_written(0x20, 16)]) == (0x20, 0x2F)
+    # overlapping writes (a byte written twice) do not reach past the range
+    assert rizin_emulation.write_cluster([_written(0x20, 16), _written(0x24, 2)]) == (0x20, 0x2F)
+    assert rizin_emulation.write_cluster([]) is None
+    assert rizin_emulation.write_cluster([{"addr": 0x10, "size": 0}]) is None
+
+
+def test_write_cluster_does_not_span_a_scattered_run():
+    """Two writes far apart are not one enormous range: the cluster with the most bytes wins."""
+    far = [_written(0x1000 + i, 1) for i in range(8)] + [_written(0x9000000, 1)]
+    assert rizin_emulation.write_cluster(far) == (0x1000, 0x1007)
+    # the other way round as well: the many bytes decide, not the order or the address
+    assert rizin_emulation.write_cluster([_written(0x10, 1)] + [_written(0x9000000 + i, 1)
+                                                               for i in range(8)]) == (0x9000000, 0x9000007)
+    # a hole of at most RUN_RANGE_GAP keeps the writes together, a larger one splits them
+    gap = rizin_emulation.RUN_RANGE_GAP
+    assert rizin_emulation.write_cluster([_written(0x1000, 4), _written(0x1000 + 3 + gap, 4)]) == \
+        (0x1000, 0x1006 + gap)
+    assert rizin_emulation.write_cluster([_written(0x1000, 4), _written(0x1000 + 4 + gap, 8)]) == \
+        (0x1004 + gap, 0x100B + gap)
+    # two clusters of the same size: the lower one
+    assert rizin_emulation.write_cluster([_written(0x900000, 2), _written(0x10, 2)]) == (0x10, 0x11)
+
+
+def test_function_entries_read_the_addresses_of_afls_rows():
+    text = ("0x140001440    1 29           entry0\n"
+            "0x1400014b7   30 1382 -> 1300  sym.main\n"
+            "WARN: a line that is no row\n"
+            "0x140004000 1\n0x1 1 4\nxx 1 4 name\n")
+    assert rizin_emulation.function_entries(text) == [0x140001440, 0x1400014B7]
+    assert rizin_emulation.function_entries("") == []
+
+
+def test_function_total_reads_the_number_aflc_answered():
+    assert rizin_emulation.function_total("3\n") == 3
+    assert rizin_emulation.function_total("\n  0 \n") == 0
+    for text in ("", "none\n", "WARN: nothing\n"):
+        with pytest.raises(ValueError, match="aflc"):
+            rizin_emulation.function_total(text)
+
+
+def test_string_hits_counts_what_the_search_answered():
+    hits = [{"address": 0x1000, "size": 8, "flag": "hit.string.ascii.0", "detail": 8},
+            {"address": 0x2000, "size": 4, "flag": "hit.string.ascii.1", "detail": 4}]
+    assert rizin_emulation.string_hits(hits) == 2
+    assert rizin_emulation.string_hits([]) == 0
+    assert rizin_emulation.string_hits(None) == 0      # an empty answer, as cmdj gives it
+    for found in ({"address": 1}, "none", [{"size": 8}], [{"address": "0x10", "size": 8}], [None]):
+        with pytest.raises(ValueError, match="/zj"):
+            rizin_emulation.string_hits(found)
+
+
+def test_the_string_pattern_searches_for_printable_runs():
+    """rizin 0.9.1's /zj takes a pattern, not a range to list the strings of (measured: without one it
+    refuses), so the search is for a run of printable bytes of rizin's own least string length. POSIX's
+    class is the one form of it that rizin's parser and the console's filter both take as it is."""
+    from rizin_sessions import check_console_command
+
+    assert rizin_emulation.STRING_MIN_LENGTH == 4
+    assert rizin_emulation.STRING_PATTERN == "[[:print:]]{4,}"
+    assert " " not in rizin_emulation.STRING_PATTERN, "one argument of /zj, without quoting"
+    assert "~" not in rizin_emulation.STRING_PATTERN, "a '~' would start rizin's grep"
+    assert check_console_command(f"/zj {rizin_emulation.STRING_PATTERN} r ascii") is None
+    assert check_console_command(r"/zj [\x20-\x7e]{4,} r ascii") is not None, "a backslash is refused"
+    # and the commands the re-analysis is built on pass the filter as they are, so none of this needed a
+    # change to it -- while a whole-program analysis stays refused
+    for allowed in ("af @ 0x1000", "af- @ 0x1000", "aflc"):
+        assert check_console_command(allowed) is None, allowed
+    assert check_console_command("aa") == "whole-program analysis runs from the Full analysis button"

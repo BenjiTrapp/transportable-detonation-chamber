@@ -364,3 +364,87 @@ def patch_rows(rows, mine):
         kept.append(mine[index])
         at = index + 1
     return sorted(marked, key=lambda row: row["addr"]), kept
+
+
+# --- Re-analysing the range an emulation run decrypted ---------------------
+
+# Writes no further apart than this belong to one range: a decryption loop writes byte by byte, and a
+# run that touched two far-apart places must not turn into one enormous span to analyse and search.
+RUN_RANGE_GAP = 0x1000
+# The least length of a run of printable bytes that counts as a string, as rizin's own string finder
+# uses. rizin 0.9.1's /zj is a *pattern* search (measured: without a pattern it refuses and prints its
+# help), and it has no form that lists the strings of a range, so the pattern is the run itself. POSIX's
+# class, not "[ -~]" or "[\x20-\x7e]", for three reasons that are all about rizin's own parser: no space,
+# so it is one argument without quotes; no "~", which starts rizin's grep; and no backslash, which the
+# console's filter refuses -- so the console can run the very same command (measured, all four forms).
+STRING_MIN_LENGTH = 4
+STRING_PATTERN = "[[:print:]]{%d,}" % STRING_MIN_LENGTH
+
+# One row of ``afl``: "<offset> <nbbs> <size>[ -> <realsz>]  <name>" (rizin 0.9.1). Only the address is
+# read here; the four columns are also what makes a row hard to forge with a function name that holds a
+# line separator (\x85, U+2028, U+2029), which rizin prints as it is.
+_AFL_ROW = re.compile(r"(?m)^[ \t]*(0x[0-9a-fA-F]{1,16})[ \t]+[0-9]{1,9}[ \t]+[0-9]{1,19}"
+                      r"(?:[ \t]*->[ \t]*[0-9]{1,19})?[ \t]")
+_COUNT_RE = re.compile(r"[0-9]{1,19}")
+
+
+def write_cluster(rows, gap=RUN_RANGE_GAP):
+    """The range of the writes that belong together, as (lowest address, highest address), both in it;
+    None where there is no write at all.
+
+    ``rows`` are cache rows ({"addr", "size"}), in any order. A write no more than ``gap`` bytes after
+    the one before it belongs to the same range; a larger hole starts another one, and of those the
+    range that holds the most written bytes wins (the lowest one where two hold the same). That is what
+    keeps a run which pushed a word here and decrypted a block there from becoming one span of
+    everything in between -- the block is the range, and it is the block that was decrypted.
+    """
+    spans = sorted((row["addr"], row["addr"] + row["size"] - 1, row["size"]) for row in rows
+                   if isinstance(row.get("addr"), int) and isinstance(row.get("size"), int)
+                   and row["size"] > 0)
+    clusters = []
+    for low, high, size in spans:
+        if clusters and low - clusters[-1][1] <= gap:
+            start, end, written = clusters[-1]
+            clusters[-1] = (start, max(end, high), written + size)
+        else:
+            clusters.append((low, high, size))
+    if not clusters:
+        return None
+    best = max(clusters, key=lambda cluster: (cluster[2], -cluster[0]))
+    return best[0], best[1]
+
+
+def function_entries(text):
+    """The addresses where rizin's ``afl`` says a function begins, in its order; a line that is no row
+    is left out.
+
+    afl's text, not aflj: rizin 0.9.1 dies on aflj once a project with DWARF variable origins has been
+    loaded, and its JSON of a function is about 80 times larger (see _rizin_functions in app.py).
+    """
+    return [int(row.group(1), 16) for row in _AFL_ROW.finditer(text)]
+
+
+def function_total(text):
+    """The number of functions ``aflc`` answered (its whole output is that number)."""
+    for line in text.split("\n"):
+        found = line.strip(" \t\r")
+        if found:
+            if _COUNT_RE.fullmatch(found):
+                return int(found)
+            break
+    raise ValueError("aflc did not answer the number of functions")
+
+
+def string_hits(found):
+    """How many strings ``/zj`` found: its answer is [{"address", "size", "flag", "detail"}], an empty
+    array for none (and nothing at all, which cmdj gives as None, for a command that printed none)."""
+    if found is None:
+        return 0
+    if not isinstance(found, list):
+        raise ValueError("/zj did not answer a list of string hits")
+    for hit in found:
+        if not (isinstance(hit, dict) and isinstance(hit.get("address"), int)
+                and not isinstance(hit["address"], bool) and isinstance(hit.get("size"), int)
+                and not isinstance(hit["size"], bool)):
+            raise ValueError("/zj did not answer a list of string hits")
+    return len(found)
