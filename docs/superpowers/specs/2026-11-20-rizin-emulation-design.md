@@ -56,8 +56,13 @@ x86-64-Blob mit einer XOR-Entschlüsselungsschleife und einem `call` ins Leere.
 | `wcj` liefert die Patch-Liste als JSON: `{idx, addr, size, before, after, written}` | Fertige Datenquelle für die Patch-Ansicht, mit before/after |
 | `wc- <addr>` nimmt einen Patch zurück, `wc-*` alle | Zurücknehmen ist nativ, einzeln und ganz |
 | `db @ <addr>` setzt, `dblj` listet als JSON (`addr`, `enabled`, `cond`, `hw`), `aec` hält an: `[ESIL] hit breakpoint at 0x14` | Echte Breakpoints, vom ESIL-Motor beachtet. `db` **ohne** `@` nimmt kein Argument |
-| `aec` auf einem Breakpoint stehend trifft **denselben wieder** | Der Server muss vorher einmal einzeln steppen |
-| `aecc` / `aesuo call` läuft **bis zum nächsten Call** | Die Assistenz-Schleife ist ein einziger Befehl |
+| `aec` von einem Breakpoint aus läuft **weiter**, er trifft ihn nicht erneut: Haltepunkt auf 0x19 (einmal erreicht), das erste `aec` hält dort, das zweite läuft bis `esil.timeout`. rizin prüft Breakpoints *nach* dem Befehl | **Kein Step-off nötig.** *(Korrektur einer früheren Messung, die den Haltepunkt mitten in eine vierfache Schleife setzte und die vier Durchläufe als vier Treffer derselben Stelle las.)* |
+| `dbd` verhindert das Anhalten **nicht** — nur `db-` entfernt einen Breakpoint wirksam | Ein ausgeschalteter Breakpoint hält trotzdem: die Oberfläche bietet kein „aus" an, oder löst es über `db-` |
+| `aecc` läuft über `call qword [import]` (Typ `ircall`) **hinweg** und ignoriert `esil.timeout`: ohne Call lief es über 15 s | `aecc` ist unbrauchbar. „Bis zum nächsten Call" baut der Server aus `aesu`-Sprüngen, begrenzt durch `ESIL_TIMEOUT` |
+| `aess` und `aeso` behandeln `ircall` ebenfalls falsch und laufen in den Aufgerufenen hinein | Bei einem `ircall` setzt der Server den PC selbst: `aepc` für SKIP, `aesu <pc+size>` für OVER |
+| `esil.exectrap` vor `aei` gesetzt wirkt nicht | Die Schutzschalter werden vor jedem Lauf erneut gesetzt |
+| Ohne `esil.verbose=1` hält ein I/O-Trap `aec` **stumm** an | `esil.verbose=1` gehört zu den Startwerten, sonst nennt kein Lauf diesen Grund |
+| `aesb` stellt Register wieder her, **aber nicht den Speicher**, und der nächste Schritt bewegt sich nicht | BACK ist unzuverlässig; die Oberfläche entscheidet, ob sie es anbietet |
 | `aess` übersprang den `call` (rip 0x1a → 0x1f) | So kommt man an einem API-Call vorbei |
 | `aes` *in* einen `call` auf nicht gemappten Speicher läuft **stumm weiter** und „emuliert" Nullen | Ohne Schutz lügt die Oberfläche; siehe die nächsten zwei Zeilen |
 | `esil.breakoninvalid`, `esil.exectrap`, `esil.iotrap`, `esil.nonull` | Damit **hält** die Emulation an, statt ins Nichts zu laufen |
@@ -88,6 +93,10 @@ x86-64-Blob mit einer XOR-Entschlüsselungsschleife und einem `call` ins Leere.
   Das kann rizin unter Windows nicht (siehe Befunde), und mit `esil.timeout`
   endet ein Lauf ohnehin nach wenigen Sekunden von selbst. Die Oberfläche darf
   deshalb kein Abbrechen versprechen.
+- **BACK ist unzuverlässig** (gemessen: `aesb` stellt Register wieder her,
+  aber nicht den Speicher, und der nächste Schritt bewegt sich nicht). Die
+  Oberfläche entscheidet, ob sie es überhaupt anbietet; tut sie es, sagt sie,
+  dass der Speicher nicht zurückgeht.
 - **Laufen bis hierher**: Im Rechtsklick-Menü der Disassembly, über
   `aesu <addr>` — der natürliche Partner der Breakpoints.
 - **PC-Markierung** in der Disassembly (eigene Markierung, deutlich von der
@@ -119,10 +128,18 @@ Neben CONSOLE, XREFS, STRINGS und IMPORTS, mit dem vollen Zustand:
 ### 3. Breakpoints
 
 - Ein Klick in die Randspalte der Disassembly setzt und entfernt einen.
-- Server: `db @ <addr>`, `db- @ <addr>`, `db-*`, `dbl`/`dblj` zum Lesen,
-  `dbd`/`dbe` für an/aus.
-- **CONT** steppt zuerst einmal einzeln (sonst trifft `aec` denselben
-  Breakpoint wieder) und läuft dann `aec`.
+- Server: `db @ <addr>`, `db- @ <addr>`, `db-*`, `dbl`/`dblj` zum Lesen.
+- **Kein An- und Ausschalten.** `dbd` verhindert das Anhalten nicht
+  (gemessen), also gibt es in der Oberfläche kein „aus": ein Breakpoint ist
+  gesetzt oder entfernt.
+- **CONT ist ein einfaches `aec`.** Ein Step-off davor braucht es nicht:
+  rizin prüft Breakpoints nach dem Befehl, also läuft `aec` von einem
+  Haltepunkt aus weiter (gemessen; eine frühere Messung hatte das Gegenteil
+  behauptet, weil ihr Haltepunkt in einer Schleife lag).
+- **TO CALL baut der Server selbst**, aus `aesu`-Sprüngen über `pdj`, begrenzt
+  durch `ESIL_TIMEOUT`. `aecc` ist unbrauchbar: es läuft über einen
+  `call qword [import]` hinweg und ignoriert `esil.timeout` (über 15 s
+  gemessen), was die Sitzung beenden würde.
 - Breakpoints **bleiben** wie die Patches (siehe 5).
 - **Keine Watchpoints** (`dbw` hängt rizin, gemessen).
 - **Kein** `dbc`, `dbC`, `dbx` — sie führen rizin-Befehle aus, wenn ein
@@ -285,7 +302,7 @@ das Hauptziel auf halbem Weg stehen bleiben.
 
 ### 9. Schutzschalter
 
-Beim Start der Emulation setzt der Server:
+Beim Start der Emulation **und vor jedem Lauf** setzt der Server:
 
 | Einstellung | Wert | Wofür |
 |-------------|------|-------|
@@ -295,10 +312,16 @@ Beim Start der Emulation setzt der Server:
 | `esil.exectrap` | `true` | Hält, wenn der PC in nicht ausführbaren Speicher läuft |
 | `esil.iotrap` | `true` | Hält bei ungültigem Lesen oder Schreiben |
 | `esil.nonull` | `true` | Hält beim Nullzeiger, statt weiterzulaufen |
+| `esil.verbose` | `1` | Ohne sie hält ein I/O-Trap `aec` **stumm** an (gemessen), und der Lauf könnte seinen Grund nicht nennen |
 | `esil.romem` | `false` | Sonst könnte die Emulation nichts entschlüsseln |
 
 `esil.mdev.range` bleibt unberührt: es hängt an `cmd.esil.mdev`, das
 rizin-Befehle ausführt und wie die übrigen `cmd.*`-Hooks leer bleibt.
+
+Vor **jedem** Lauf erneut, nicht nur beim Start: `esil.exectrap` wirkt nicht,
+wenn es vor `aei` gesetzt wurde (gemessen), und die Konsole kann `io.cache`
+jederzeit abschalten — ein Lauf ohne sie schreibt nichts und sähe aus, als
+täte die Entschlüsselung nichts.
 
 ### 10. Konsole und Allowlist
 
