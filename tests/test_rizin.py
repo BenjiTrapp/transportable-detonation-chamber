@@ -367,7 +367,7 @@ ATTACKS = [
     # From the brief.
     "!calc", "pd 1;!calc", "pd 1 | findstr x", "pd 1 > C:\\x", "pd 1 >> x",
     "?e `!calc`", "?e $(id)", ".!calc", "#!python", "(m;!calc)", ".(m)",
-    "o C:\\Windows\\win.ini", "wtf C:\\x 10", "w hi", "dc", "doo", "L", "Ps C:\\x",
+    "o C:\\Windows\\win.ini", "wtf C:\\x 10", "dc", "doo", "L", "Ps C:\\x",
     "e scr.pager=cmd.exe", "e cfg.editor=x", "to C:\\x.h", "agw dot x", '"!calc"',
     "pd 1\n!calc", "x" * 2001,
     # Refused families (rizin 0.9.1 `?`).
@@ -377,7 +377,7 @@ ATTACKS = [
     "\u3000o x", "\to x", "pd 1\x1b", "pd 1\0",
     # Inside the allowed families: from `?*` and the help of each family.
     "agf interactive", "agf v", "agc interactive @ sym.main", "agf inter'active'",
-    "aepc 0x1000", "aep", "aeli C:\\x.dll", "aeli lib.dll", "aelir 3", "aek foo=bar", "aek-", "afco C:\\x.sdb",
+    "aep", "aeli C:\\x.dll", "aeli lib.dll", "aelir 3", "aek foo=bar", "aek-", "afco C:\\x.sdb",
     "afco x.sdb",
     "arpo profile.txt", "arpg gdb.txt", "afs!", "ascii",
     "pfo C:\\x.fdf", "pfo x", "pfw x 41", "pm C:\\x", "pm", "pmj x", "pkill rizin", "pwd", "p==v", "p==ev",
@@ -389,9 +389,16 @@ ATTACKS = [
     "e-", "ee asm.bytes", "er asm.bytes", "eco theme", "eco.", "ecn", "ecp", "ecoo", "ec", "ecr", "ecs", "ecd",
     "ecH- ", "e! asm.bytes",
     "env PATH=x", "env", "exit", "echo hi",
-    "e asm.bytes=true scr.pager=x", "e cmd.hit=x", "e cmd.fcnrename=x", "e io.cache=true",
+    "e asm.bytes=true scr.pager=x", "e cmd.hit=x", "e cmd.fcnrename=x", "e io.cache.auto=true", "e io.pcache=true",
     "e asm.cpu=../../x", "e asm.cpu=a/b", "e asm.cpu=C:x", "e \"scr.pager=x\"", "e 'scr.pager'=x", "e scr\\.pager=x",
     "e bin.demangle.libs=true", "e scr.color=3", "e log.file=x", "e http.root=x",
+    # The write and debug families are open for the cache and the breakpoint list only: the rest is refused.
+    "wv 1", "wb 90", "wm ff", "wxf x", "wff x", "wf 0x10 4", "wfx 0x10 4", "wcp", "wcpi", "wci", "wao nop",
+    "waf x", "wA nop", "wD 8", "w6d aGk=", "wen 4", "wr 4", "ww hi", "ws hi", "w0 4", "wB 1",
+    "dbic 0 pdf", "dbix 0 rax", "dbH", "dbm lib 0x10", "dbf", "dbtd", "dbW x", "dbw r 4", "dr", "dx 90",
+    "dcu 0x10", "dsu 0x10", "de r reg rip", "dt", "di", "dl 1", "dg x", "do", "dw", "dkl", "ddl",
+    # Quoted pieces that rizin joins into a refused name (wci, wff, dc).
+    'w"c"i', "w'f'f x", 'd"c"',
     # Reads the source files that the sample's DWARF names.
     "agl", "agl json", "e asm.debuginfo.file=true",
     # Modifiers (`@?`, `@@?`).
@@ -460,6 +467,34 @@ def test_console_filter_refuses_shell_and_file_access():
         assert check_console_command(text) == "whole-program analysis runs from the Full analysis button", text
     for text in ALLOWED:
         assert check_console_command(text) is None, (text, check_console_command(text))
+
+
+def test_console_allows_emulation_and_cache_writes():
+    import rizin_sessions
+
+    for cmd in ("wx 9090", "wx 90 @ 0x401000", "wo x 41", "wz hi", "w text", "wc", "wcj", "wc- 0x401000",
+                "wc-*", "db", "db @ 0x401000", "db- @ 0x401000", "db-*", "dbl", "dblj", "dbd", "dbe",
+                "dbs", "dbn name", "aepc 0x401000", "e esil.timeout=5", "e io.cache=true",
+                "e esil.breakoninvalid=true"):
+        assert rizin_sessions.check_console_command(cmd) is None, cmd
+
+
+def test_console_still_refuses_what_writes_executes_or_hangs():
+    import rizin_sessions
+
+    cases = {
+        "wci": "the file", "wc+ 0x0 0x10": "the file", "wa nop": "assembl",
+        "wu /tmp/p": "file", "wff /tmp/x": "file", "wfs host 1": "file",
+        "dbc pdf": "run", "dbC pdf": "run", "dbx rax": "run", "dbw w 1": "hang",
+        "aep 0x10": "not allowed", "aepn": "not allowed",
+        "ood": "not allowed", "dc": "not allowed", "ds": "not allowed", "dm": "not allowed",
+        "dp": "not allowed", "dbt": "not allowed", "dk 9": "not allowed",
+        "aa": "Full analysis", "aaa": "Full analysis", "aav": "Full analysis",
+        "e esil.mdev.range=0x0": "cannot be set",
+    }
+    for cmd, fragment in cases.items():
+        reason = rizin_sessions.check_console_command(cmd)
+        assert reason and fragment in reason, (cmd, reason)
 
 
 def test_pipe_answers_and_times_out(fake, sample, monkeypatch):

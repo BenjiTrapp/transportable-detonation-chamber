@@ -17,11 +17,12 @@ ends it when the web UI's process ends, also when that is killed (_Job).
 check_console_command is the console filter. Fail-closed: a command has to
 start with one of the allowed families, and inside them every sub-command or
 modifier is refused that runs a program, runs stored or nested commands,
-reads or writes files, changes settings outside asm.*/analysis.*, waits for
-input or opens an interactive view. The lists come from rizin 0.9.1's own
-help (``?*``, ``@?``, ``@@?``, ``~?``) and its command sources. Nothing in the
-console assembles, and the arch settings only take built-in disassemblers:
-some assembler plugins hand their work to nasm or as.
+reads files, writes files (a write may only go to rizin's cache), changes
+settings outside asm.*/analysis.*/esil.*, waits for input or opens an
+interactive view. The lists come from rizin 0.9.1's own help (``?*``, ``@?``,
+``@@?``, ``~?``) and its command sources. Nothing in the console assembles,
+and the arch settings only take built-in disassemblers: some assembler
+plugins hand their work to nasm or as.
 
 RizinSessions keeps at most ``max_sessions`` sessions, one file per browser
 tab. A file (by SHA-256) has one session at most: opening it in another tab
@@ -160,7 +161,7 @@ class SessionSuperseded(SessionEnded):
 
 # --- Console filter ---------------------------------------------------------
 
-_FAMILIES = "apifCs/?xtbe"
+_FAMILIES = "apifCs/?xtbewd"
 # rizin-shell-parser's command-name scanner (is_mid_command), ASCII part. It
 # drops a backslash and joins the next character ("a\gw" is "agw").
 _NAME_RE = re.compile(r"[A-Za-z/?][A-Za-z0-9$?.+=/*&_%-]*")
@@ -174,12 +175,13 @@ _FORBIDDEN_CHARS = (
 )
 _SHELL = "shell commands are not allowed"
 _ASSEMBLE = "assembling is not available: rizin can hand it to an external assembler"
+_DEBUG = "'d' commands are not allowed: emulation runs from the EMULATION tab"
 # Refused inside the allowed families, matched at the start of the command name.
 _REFUSED = [(re.compile(pattern), reason) for pattern, reason in (
     (r"aa", "whole-program analysis runs from the Full analysis button"),
     (r"agw", "'agw' writes files"),
     (r"agl", "'agl' reads the source files that the debug info names"),
-    (r"aep", "'aep' commands are not allowed"),
+    (r"aep(?!c$)", "'aep' commands are not allowed"),
     (r"ael", "'ael' loads ESIL interrupt plugins from files"),
     (r"aek", "'aek' runs SDB queries"),
     (r"afco", "'afco' opens a file"),
@@ -209,7 +211,23 @@ _REFUSED = [(re.compile(pattern), reason) for pattern, reason in (
     (r"tp[vx]", "'tpv' and 'tpx' run a type's format as a command"),
     (r"time", _SHELL),
     (r"bm", "'bm' changes the block size limit"),
+    (r"wc[+i]|wcp", "'wc+', 'wci' and 'wcp...' commit the cache: they write into the file"),
+    (r"w[aA]", _ASSEMBLE),
+    (r"wu|wxf", "'wu' and 'wxf' read a file"),
+    (r"wf[fs]", "'wff' and 'wfs' read a file or a socket"),
+    (r"db[cCx]|dbi[cx]", "'dbc', 'dbC', 'dbx', 'dbic' and 'dbix' run rizin commands when a breakpoint hits"),
+    (r"db[wW]", "'dbw' and 'dbW' set watchpoints, which hang rizin"),
 )]
+# The only `w` and `d` commands: writes that stay in the cache, and the breakpoint list. Any other name
+# in these families is refused, the way `e` is.
+_WRITE_NAMES = {
+    "w", "wx", "wz", "wc", "wcj", "wc-", "wc-*",
+    "wo", "wo2", "wo4", "wo8", "woa", "woA", "wod", "wol", "wom", "woo", "wor", "wos", "wox", "woe", "woD", "woE",
+}
+_BP_NAMES = {
+    "db", "db-", "db-*", "db.", "dbl", "dblj", "dblq", "dbd", "dbe", "dbs", "dbn", "dbh",
+    "dbi", "dbil", "dbi-", "dbie", "dbid", "dbis", "dbite", "dbitd", "dbits",
+}
 _EVAL_NAMES = {"e", "el", "elj", "elq", "ell", "elJ", "es", "et"}
 _EVAL_REFUSED = [(re.compile(pattern), reason) for pattern, reason in (
     (r"ee", "'ee' opens an editor"),
@@ -219,12 +237,13 @@ _EVAL_REFUSED = [(re.compile(pattern), reason) for pattern, reason in (
     (r"ec", "colour themes (ec) are not available"),
 )]
 # rizin 0.9.1 names the analysis settings analysis.*; anal.* is their older name.
-_EVAL_SET_PREFIXES = ("asm.", "analysis.", "anal.")
-_EVAL_SET_KEYS = {"bin.demangle"}
+_EVAL_SET_PREFIXES = ("asm.", "analysis.", "anal.", "esil.")
+_EVAL_SET_KEYS = {"bin.demangle", "io.cache"}
 _EVAL_SET_REFUSED = {
     # With it, the disassembly reads the source files that a sample's debug info names.
     "asm.debuginfo.file": "it reads source files",
     "asm.assembler": "an assembler can run an external program",
+    "esil.mdev.range": "it is handled by a command hook",
 }
 _EVAL_KEY_RE = re.compile(r"[A-Za-z0-9_.-]+")
 # Names and numbers; no path separators, so arch, cpu or os cannot point into other folders.
@@ -335,6 +354,10 @@ def _check_name(name):
             if pattern.match(name):
                 return reason
         return f"'{_show(name)}' is not allowed"
+    if name[0] == "w" and name not in _WRITE_NAMES:
+        return f"'{_show(name)}' is not allowed: only writes that stay in the cache are available"
+    if name[0] == "d" and name not in _BP_NAMES:
+        return _DEBUG
     return None
 
 
@@ -401,7 +424,7 @@ def _check_eval(name, args):
             return f"'{_show(name)}' cannot set values"
         key, _, value = token.partition("=")
         if key not in _EVAL_SET_KEYS and not key.startswith(_EVAL_SET_PREFIXES):
-            return f"only asm.*, analysis.* and bin.demangle can be set, not '{_show(key)}'"
+            return f"only asm.*, analysis.*, esil.*, bin.demangle and io.cache can be set, not '{_show(key)}'"
         if key in _EVAL_SET_REFUSED:
             return f"'{key}' cannot be set: {_EVAL_SET_REFUSED[key]}"
         if not _EVAL_VALUE_RE.fullmatch(value) or ".." in value:
