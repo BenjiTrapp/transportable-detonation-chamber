@@ -557,12 +557,13 @@ def esil_command(word, rest, seek):
 
 
 def esil_breakpoints(word, seek):
-    """``db @ addr`` and friends: rizin's db takes no address argument."""
+    """``db @ addr`` and friends: rizin's db takes no address argument. ``dblj`` answers them in the
+    order they were set, not sorted (measured) -- the server is the one that sorts."""
     bps = state["bps"]
     if word == "dblj":
         return json.dumps([{"addr": addr, "size": 1, "perm": "--x", "hw": False, "trace": False,
                             "enabled": enabled, "valid": esil_mapped(addr), "data": "", "cond": ""}
-                           for addr, enabled in sorted(bps.items())]) + "\n"
+                           for addr, enabled in bps.items()]) + "\n"
     if word == "db":
         if seek in bps or os.environ.get("FAKE_RIZIN_BP_IGNORED"):
             # rizin keeps the breakpoint it has there, disabled or not; FAKE_RIZIN_BP_IGNORED stands for
@@ -672,6 +673,11 @@ def code_json():
 
 
 def save_project(path):
+    """``Ps``: what rizin 0.9.1 writes into a project of the parts the server cares about.
+
+    Its breakpoints are in it (/core/debug/breakpoints) and its **write cache is not** -- both measured,
+    and together they are the reason the server keeps the patches in a /tdc namespace of its own.
+    """
     functions = {}
     for fn in FUNCTIONS:
         functions[hex(fn["offset"])] = {"name": name_of(fn), "vars": [
@@ -683,6 +689,10 @@ def save_project(path):
     lines = ["/", "type=rizin rz-db project", "version=25", "", "/core", f"offset={state['seek']:#x}",
              "", "/core/analysis/functions"]
     lines += [f"{k}={json.dumps(v, separators=(',', ':'))}" for k, v in functions.items()]
+    lines += ["", "/core/debug/breakpoints"]
+    lines += [f"{addr:#x}=" + json.dumps({"enabled": 1 if enabled else 0, "size": 1, "perm": 1,
+                                          "name": f"{addr:#010x}"}, separators=(",", ":"))
+              for addr, enabled in state["bps"].items()]
     lines += ["", "/core/fake", "comments=" + json.dumps({hex(k): v for k, v in state["comments"].items()})]
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -700,6 +710,9 @@ def load_project(path):
                 state["names"][int(key, 16)] = json.loads(value)["name"]
                 if '"DWARF"' in value:
                     state["dwarf"] = True
+            elif ns == "/core/debug/breakpoints" and "=" in line:  # like Poo: the breakpoints come back
+                key, value = line.split("=", 1)
+                state["bps"][int(key, 16)] = bool(json.loads(value).get("enabled"))
             elif ns == "/core/fake" and line.startswith("comments="):
                 state["comments"] = {int(k, 16): v for k, v in json.loads(line[9:]).items()}
             elif ns == "/core" and line.startswith("offset="):

@@ -40,13 +40,16 @@ requests use or wait for the pipe, ``step_gap_limit`` seconds after the step
 at most: the tab stays usable between the steps. While an analysis runs,
 renames and comments are refused (RizinBusy): a later step could change them.
 
-Projects (``projects_dir/<sha256>.rzdb``) are written after a rename or a
-comment only, ``save_delay`` seconds after the last one, and at the latest
-when the session closes. They are loaded with ``Poo``, which keeps the file
-rizin has open, so the same file under another path finds its project too.
-``Poo`` also brings back the saved settings and hints; those that could run
-a program or a command are set back afterwards (_make_safe). A project saved
-while a Full analysis had not finished opens stopped: the button goes on.
+Projects (``projects_dir/<sha256>.rzdb``) are written after a rename, a
+comment, a patch or a breakpoint, ``save_delay`` seconds after the last one,
+and at the latest when the session closes. They are loaded with ``Poo``,
+which keeps the file rizin has open, so the same file under another path
+finds its project too. ``Poo`` also brings back the saved settings and hints;
+those that could run a program or a command are set back afterwards
+(_make_safe). A project saved while a Full analysis had not finished opens
+stopped: the button goes on. What rizin's own project does not hold -- the
+write cache, measured -- goes into a ``/tdc`` namespace of its own and is
+written back with ``wx`` when the file is opened again (_replay_patches).
 """
 
 import base64
@@ -103,6 +106,12 @@ RIZIN_STACK_ROWS = 16
 STEP_GAP = 2.0
 STEP_GAP_LIMIT = 10.0
 SAVE_DELAY = 3.0
+# What the project's /tdc namespace may spend on its patches line. _read_project_meta reads the last
+# 64 KB of a project, and a patch of MAX_PATCH_BYTES bytes is 8192 hex digits, so a few of them would push
+# /tdc out of that tail and take level, mode and done with it -- a file that would then be analysed again
+# from nothing. Patches past the budget are left out of the save and the session says how many
+# (_finish_save), rather than costing the analysis progress in silence.
+PROJECT_PATCH_CHARS = 32 * 1024
 CONSOLE_LIMIT = 1024 * 1024
 # The largest answer that the lists of strings, imports and flags keep: their JSON of a big dump (izj,
 # flj) runs to hundreds of MB, and the web UI filters and pages them from a copy of its own.
@@ -129,6 +138,12 @@ _STDERR_PER_COMMAND = 64 * 1024
 _MAX_MOVED = 256
 _CREATE_NO_WINDOW = 0x08000000
 _PROJECT_FAILED = "The saved project could not be loaded; it was kept as .rzdb.broken."
+# What the session says about saved patches it could not apply, and about patches it could not save.
+# Addresses the first note names before it says "...".
+_NOTE_ADDRESSES = 5
+_PATCHES_LOST = "{count} saved {patch} could not be applied to this file{where}."
+_PATCHES_DROPPED = ("{count} {patch} did not fit into the project ({chars} characters at most) and will "
+                    "not come back when the file is opened again.")
 _FULL_NOTE = "Full analysis runs aaa's steps one by one; variables are analysed less than with aaa."
 # How long close() waits for the pipe to write a pending save: longer than the longest command.
 _FLUSH_WAIT = max(CONSOLE_TIMEOUT, DECOMPILE_TIMEOUT) + 5
@@ -836,16 +851,27 @@ def _sdb_escape(value):
     return value.replace("\\", "\\\\").replace("\n", "\\n").replace("\r", "\\r")
 
 
-def _sanitize_project(src, dst, level, mode, done):
-    """Copy a project written by ``Ps`` so that rizin 0.9.1 can load it again.
+def _patch_words(count):
+    """``count`` and the word for it, for the two notes about patches (_PATCHES_LOST, _PATCHES_DROPPED)."""
+    return {"count": count, "patch": "patch" if count == 1 else "patches"}
+
+
+def _sanitize_project(src, dst, level, mode, done, patches):
+    """Copy a project written by ``Ps`` so that rizin 0.9.1 can load it again; how many patches did not fit.
 
     Loading a variable that came from DWARF looks up its DWARF entry, which
     the newly opened file does not have, and rizin then crashes on ``aflj``.
     Such variables become plain ones; those without a resolved location
     (shown as "@ ...") are left out. The analysis progress goes into an extra
     ``/tdc`` namespace, which rizin ignores.
+
+    ``patches`` are the hand-made patches as (addr, after_hex), in the order rizin's write cache holds
+    them, and they go into that namespace too: ``Ps`` saves the cache's bytes nowhere (measured, which
+    is why they are kept here), and what a run wrote is no patch and is never passed in. Breakpoints
+    need no line of their own: rizin's project holds them itself (/core/debug/breakpoints, measured).
     """
     namespace = None
+    line_of_patches, left_out = _patches_line(patches)
     with open(src, encoding="utf-8", errors="surrogateescape", newline="\n") as fin, \
             open(dst, "w", encoding="utf-8", errors="surrogateescape", newline="\n") as fout:
         for line in fin:
@@ -855,7 +881,23 @@ def _sanitize_project(src, dst, level, mode, done):
             elif namespace == "/core/analysis/functions" and '"DWARF"' in line and "=" in line:
                 line = _plain_vars(line)
             fout.write(line + "\n")
-        fout.write(f"\n/tdc\nlevel={level}\nmode={mode}\ndone={','.join(done)}\n")
+        fout.write(f"\n/tdc\nlevel={level}\nmode={mode}\ndone={','.join(done)}\n"
+                   f"patches={line_of_patches}\n")
+    return left_out
+
+
+def _patches_line(patches):
+    """The value of the ``patches=`` line ("<addr>:<hex>,..."), and how many patches did not fit into
+    PROJECT_PATCH_CHARS. The ones that fit are the first ones, so the list stays in the cache's order:
+    replaying it in another order could put a different byte where two writes overlap."""
+    kept, used = [], 0
+    for index, (addr, after) in enumerate(patches):
+        entry = f"{addr:x}:{after}"
+        if used + len(entry) + (1 if kept else 0) > PROJECT_PATCH_CHARS:
+            return ",".join(kept), len(patches) - index
+        used += len(entry) + (1 if kept else 0)
+        kept.append(entry)
+    return ",".join(kept), 0
 
 
 def _plain_vars(line):
@@ -884,7 +926,7 @@ def _read_project_meta(path):
             fh.seek(max(0, fh.tell() - 65536))
             tail = fh.read().decode("utf-8", "replace")
     except OSError:
-        return {"level": None, "mode": None, "done": []}
+        return {"level": None, "mode": None, "done": [], "patches": []}
     meta = {}
     at = tail.rfind("\n/tdc\n")
     if at != -1:
@@ -895,7 +937,27 @@ def _read_project_meta(path):
             meta[key] = value
     return {"level": meta.get("level") if meta.get("level") in ("aa", "aaa") else None,
             "mode": meta.get("mode") if meta.get("mode") in ("one", "steps") else None,
-            "done": [s for s in meta.get("done", "").split(",") if s in _ALL_STEPS]}
+            "done": [s for s in meta.get("done", "").split(",") if s in _ALL_STEPS],
+            "patches": _read_patches(meta.get("patches", ""))}
+
+
+# One patch of the /tdc namespace: the address in hex (up to 2^64-1) and the bytes it wrote, as the
+# write cache reports them. Anything else -- a line from a newer version, a half-written one -- is left out.
+_TDC_PATCH_RE = re.compile(r"([0-9a-f]{1,16}):((?:[0-9a-f]{2}){1,%d})" % rizin_emulation.MAX_PATCH_BYTES)
+
+
+def _read_patches(text):
+    """The ``patches=`` line as [(addr, after_hex)], dropping every entry that is not one.
+
+    Read at most as much of the line as a save would have written (PROJECT_PATCH_CHARS), so that a
+    project edited by hand cannot make the next boot send tens of thousands of ``wx`` commands.
+    """
+    found = []
+    for entry in text[:PROJECT_PATCH_CHARS].split(","):
+        shape = _TDC_PATCH_RE.fullmatch(entry)
+        if shape:
+            found.append((int(shape.group(1), 16), shape.group(2)))
+    return found
 
 
 _HINT_LINE_RE = re.compile(r"\s*(0x[0-9a-fA-F]+) =>(.*)")
@@ -1113,6 +1175,7 @@ class RizinSession:
         self._gone = threading.Event()
         self._thread = None
         self._state, self._step, self._notes = "running", None, []
+        self._dropped_noted = False
         self._run_started = self._run_finished = None
         # The emulation: the pipe it was started on (None: not started), the registers before and after
         # the last change (for "changed"), the file's byte order for the stack words and aeim's stack map
@@ -1125,18 +1188,26 @@ class RizinSession:
         # cache_entry). rizin has one write cache, which holds an emulation run's writes too and cannot
         # tell them apart; this mirror can, row by row (see patches).
         self._mine = []
-        self._pipe, contained, level, mode, note = self._boot()
+        # Notes from the boot (a project that could not be loaded, patches that could not be applied):
+        # they say what the session starts with, so _start_analysis keeps them when it plans again.
+        self._boot_notes = []
+        self._pipe, contained, level, mode, note, patches = self._boot()
         try:
             self._read_file_info()
             self._where(self._pipe)
+            # Before the analysis and before the first view: the patched bytes are what rizin reads from
+            # here on, so the first disassembly and the first hexdump already show them.
+            patch_note = self._replay_patches(patches)
         except BaseException:
             self._pipe.close()
             raise
         self._done = list(contained)
         self.level = level or self.level
         self._mode = mode or self._mode
-        if note:
-            self._notes.append(note)
+        for text in (note, patch_note):
+            if text:
+                self._boot_notes.append(text)
+        self._notes += self._boot_notes
         remaining = self._plan()
         if mode == "steps" and remaining:
             # The project was saved while a Full analysis had not finished (it stopped, or a step hung and
@@ -1462,7 +1533,9 @@ class RizinSession:
                 raise RizinRefused(f"rizin set no breakpoint at {addr:#x}: another one may cover it already")
             return {"breakpoints": found}
 
-        return self._call("emulation", wait, run)
+        result = self._call("emulation", wait, run)
+        self._schedule_save()  # rizin's own project keeps the breakpoints; this makes one be written
+        return result
 
     def breakpoint_clear(self, addr=None, wait=2.0):
         """Remove the breakpoint at ``addr`` (``db- @ addr``), or all of them when ``addr`` is None
@@ -1478,7 +1551,9 @@ class RizinSession:
                 raise RizinRefused(f"rizin kept the breakpoint at {addr:#x}")
             return {"breakpoints": found}
 
-        return self._call("emulation", wait, run)
+        result = self._call("emulation", wait, run)
+        self._schedule_save()
+        return result
 
     @staticmethod
     def _breakpoint_list(pipe):
@@ -1512,7 +1587,9 @@ class RizinSession:
         def run(pipe):
             return self._patch_write(pipe, addr, data)
 
-        return self._call("emulation", wait, run)
+        result = self._call("emulation", wait, run)
+        self._schedule_save()
+        return result
 
     def patch_op(self, addr, kind, wait=2.0):
         """Patch the instruction at ``addr`` one of rizin_emulation.PATCH_KINDS' ways (nop, flip, always,
@@ -1539,7 +1616,9 @@ class RizinSession:
                 raise RizinRefused(str(e)) from None
             return self._patch_write(pipe, addr, data)
 
-        return self._call("emulation", wait, run)
+        result = self._call("emulation", wait, run)
+        self._schedule_save()
+        return result
 
     def patches(self, wait=2.0):
         """What rizin's write cache holds (``wcj``), lowest address first: [{"addr", "size", "before",
@@ -1580,7 +1659,9 @@ class RizinSession:
                 raise RizinRefused(f"rizin kept the patch at {addr:#x}")
             return {"patches": found}
 
-        return self._call("emulation", wait, run)
+        result = self._call("emulation", wait, run)
+        self._schedule_save()
+        return result
 
     def _patch_write(self, pipe, addr, data):
         """``wx`` of ``data`` at ``addr`` through the cache (gate held); {"patches": the list}."""
@@ -1682,7 +1763,7 @@ class RizinSession:
         """Full analysis: aaa's sub-steps that are not done yet, one by one (see aaa_steps).
 
         For a file over big_file, or after aaa had to be killed; a finished aaa
-        already covers it. Pending renames and comments are saved first.
+        already covers it. A rename, comment or patch that waits is saved first.
         """
         with self._lock:
             busy = self._closed or (self._thread is not None and self._thread.is_alive())
@@ -1696,7 +1777,7 @@ class RizinSession:
         return self.analysis
 
     def flush(self, wait=_FLUSH_WAIT):
-        """Write the project now if a rename or comment is waiting for its save; True if it did.
+        """Write the project now if a change is waiting for its save; True if it did.
 
         ``wait`` bounds the wait for a save that runs already and the wait for the pipe (None: no limit).
         A save that fails, whatever the error, leaves the change waiting for the next save.
@@ -1762,7 +1843,7 @@ class RizinSession:
                 raise RizinBusy(self._step or "analysis")
 
     def _schedule_save(self):
-        """Save the project save_delay after the last rename or comment."""
+        """Save the project save_delay after the last rename, comment, patch or breakpoint."""
         with self._lock:
             if self._closed:
                 return
@@ -1777,7 +1858,7 @@ class RizinSession:
         try:
             self.flush(wait=None)
         except Exception as exc:
-            # The change stays to be saved: by the next rename or comment, or when the session closes
+            # The change stays to be saved: by the next change, or when the session closes
             if not self._closed:
                 print(f"[rizin] {self.sha256[:12]}: the project could not be saved ({type(exc).__name__}: {exc})")
 
@@ -1815,10 +1896,10 @@ class RizinSession:
         return False
 
     def _boot(self):
-        """Start rizin and load the project; returns (pipe, steps in the project, level, mode, note)."""
+        """Start rizin and load the project; returns (pipe, steps in the project, level, mode, note, patches)."""
         pipe = self._start_rizin()
         if not os.path.isfile(self._project):
-            return pipe, [], None, None, None
+            return pipe, [], None, None, None, []
         meta = _read_project_meta(self._project)
         try:
             arch = pipe.cmd("e asm.arch").strip()
@@ -1830,13 +1911,62 @@ class RizinSession:
         except (RizinTimeout, RizinDied):
             loaded = False
         if loaded:
-            return pipe, meta["done"], meta["level"], meta["mode"], None
+            return pipe, meta["done"], meta["level"], meta["mode"], None, meta["patches"]
         pipe.close()
         try:
             os.replace(self._project, self._project + ".broken")
         except OSError:
             pass
-        return self._start_rizin(), [], None, None, _PROJECT_FAILED
+        return self._start_rizin(), [], None, None, _PROJECT_FAILED, []
+
+    def _replay_patches(self, patches):
+        """Write the project's hand-made patches back into the cache (gate not held yet: the session is
+        starting); a note naming those that were left out, or None.
+
+        A project belongs to the file's SHA-256, so the bytes and the maps are the same ones the patches
+        were made in -- except for a patch made into memory that only a running emulation had mapped
+        (``aeim``'s stack): that address is in none of ``oml.j``'s maps now, and it is a patch that never
+        had a place in the file (the export says the same, design section 8). rizin would take such a
+        write into its cache all the same (measured), so the check is the server's, and so is the one
+        against a project somebody edited by hand. What rizin then does not report in ``wcj`` is left
+        out as well, and the boot goes on either way: a project must not cost a session.
+        """
+        if not patches:
+            return None
+        pipe = self._pipe
+        pipe.cmd("e io.cache=true")
+        skipped, planned = [], []
+        try:
+            cached = pipe.cmd("e io.cache").strip() == "true"
+            maps = pipe.cmdj("omlj") if cached else None
+            for addr, after in patches:
+                data = bytes.fromhex(after)
+                if not cached or not all(rizin_emulation.is_mapped(byte, maps)
+                                         for byte in (addr, addr + len(data) - 1)):
+                    skipped.append(addr)
+                    continue
+                entry = rizin_emulation.cache_entry(addr, data)
+                planned.append(entry)
+                self._mine.append(entry)
+                pipe.cmd(f"wx {after} @ {addr:#x}")
+            if planned:
+                self._patch_list(pipe)  # keeps of the mirror what rizin's cache really holds
+        except ValueError:
+            # rizin answered something no version of it should: nothing is trusted, nothing is claimed
+            self._mine = []
+            return _PATCHES_LOST.format(where="", **_patch_words(len(patches)))
+        applied = collections.Counter(self._mine)
+        for entry in planned:
+            if applied[entry]:
+                applied[entry] -= 1
+            else:
+                skipped.append(entry[0])
+        if not skipped:
+            return None
+        shown = ", ".join(f"{addr:#x}" for addr in sorted(skipped)[:_NOTE_ADDRESSES])
+        if len(skipped) > _NOTE_ADDRESSES:
+            shown += ", ..."
+        return _PATCHES_LOST.format(where=f": {shown}", **_patch_words(len(skipped)))
 
     def _start_rizin(self):
         return RizinPipe(self._exe, self.path, [arg for setting in _START_SETTINGS for arg in ("-e", setting)])
@@ -1880,7 +2010,7 @@ class RizinSession:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
-            self._notes = [n for n in self._notes if n == _PROJECT_FAILED]
+            self._notes = [n for n in self._notes if n in self._boot_notes]
             if not remaining:
                 self._state, self._step = "done", None
                 if restored:
@@ -1940,7 +2070,9 @@ class RizinSession:
         self._gate.relabel("save")
         try:
             return self._project_snapshot(self._pipe)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # ValueError: the write cache the snapshot reads came back in a shape nobody knows. The save
+            # is dropped, as an OSError drops it; the change stays and the next save takes it.
             print(f"[rizin] {self.sha256[:12]}: the project could not be saved after the analysis ({exc})")
         except (RizinTimeout, RizinDied) as exc:
             if not self._closed:
@@ -1969,7 +2101,7 @@ class RizinSession:
         self._pipe.close()
         replay = []
         try:
-            pipe, contained, _, _, _ = self._boot()
+            pipe, contained, _, _, _, _ = self._boot()
             if not self._use(pipe):
                 return
             if step == "aaa":
@@ -2019,6 +2151,7 @@ class RizinSession:
 
     def _project_snapshot(self, pipe):
         """``Ps`` to a temporary file (gate held); _finish_save then makes it the project."""
+        patches = self._saved_patches(pipe)
         self._save_seq += 1
         os.makedirs(self._projects_dir, exist_ok=True)
         tmp = f"{self._project}.{self._save_seq}.tmp"
@@ -2031,25 +2164,52 @@ class RizinSession:
                 pass
             raise
         with self._lock:
-            return self._save_seq, tmp, self.level, self._mode, list(self._done)
+            return self._save_seq, tmp, self.level, self._mode, list(self._done), patches
+
+    def _saved_patches(self, pipe):
+        """The patches to write into the project: this session's own writes as (addr, after_hex), in the
+        order rizin's cache holds them (gate held).
+
+        The cache is read back first, so the list is what rizin really holds *and* what this session
+        wrote: a patch the console took back with ``wc-`` has left the mirror by then, and what an
+        emulation run wrote was never in it. That is the whole point -- a run's bytes never stood in the
+        file, and a project that baked them in would lose track of where bytes come from.
+        """
+        if not self._mine:
+            return []  # nothing of this session's own: no need to ask rizin for the cache at all
+        self._patch_list(pipe)
+        return [(addr, after) for addr, _, after in self._mine]
 
     def _finish_save(self, snapshot):
-        seq, tmp, level, mode, done = snapshot
+        seq, tmp, level, mode, done, patches = snapshot
         part = f"{self._project}.{seq}.part"
         try:
             if not os.path.isfile(tmp):
                 raise OSError(f"rizin did not write {tmp}")
-            _sanitize_project(tmp, part, level, mode, done)
+            left_out = _sanitize_project(tmp, part, level, mode, done, patches)
             with self._replace_lock:
                 if seq > self._saved_seq:
                     os.replace(part, self._project)
                     self._saved_seq = seq
+            if left_out:
+                self._note_dropped_patches(left_out)
         finally:
             for leftover in (tmp, part):
                 try:
                     os.remove(leftover)
                 except OSError:
                     pass
+
+    def _note_dropped_patches(self, count):
+        """Say once that patches did not fit into the project: an analyst who patched must not find out
+        at the next open that what was written is not all of it."""
+        note = _PATCHES_DROPPED.format(chars=PROJECT_PATCH_CHARS, **_patch_words(count))
+        print(f"[rizin] {self.sha256[:12]}: {note}")
+        with self._lock:
+            if self._dropped_noted or self._closed:
+                return  # every save that follows would say it again
+            self._dropped_noted = True
+            self._notes.append(note)
 
 
 def _address(addr):

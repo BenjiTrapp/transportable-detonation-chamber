@@ -959,7 +959,7 @@ def test_rename_and_comment_cannot_form_commands(sessions, sample, fake, tmp_pat
     timers.fire()
     saved = project.read_text()
     assert '"DWARF"' not in saved and "eval_pending" not in saved and '"hDllHandle"' in saved
-    assert saved.rstrip().endswith("mode=one\ndone=aaa")
+    assert saved.rstrip().endswith("mode=one\ndone=aaa\npatches=")  # no patch: the line is there, empty
 
     # The console renames and comments too, and then saves the project; its answer says so (changed).
     project.unlink()
@@ -1628,6 +1628,14 @@ class _Api:
 
     def remove(self, url, body=None):
         return self.ok(self.delete(url, body))
+
+    def close(self, sid):
+        """End the session; a project save that is still waiting is written as it closes."""
+        return self.send(f"/api/rizin/{sid}/close", {})
+
+    def project(self, data=SAMPLE):
+        """Where the project of a sample with these bytes is written."""
+        return self.tmp / "projects" / (hashlib.sha256(data).hexdigest() + ".rzdb")
 
     def write(self, name, data=SAMPLE):
         path = self.allowed / name
@@ -3090,9 +3098,13 @@ def test_a_missing_stack_pointer_is_refused_not_a_server_error(rz, monkeypatch):
 def test_breakpoints_are_set_listed_and_cleared(rz):
     sid = rz.session()
     # POST and DELETE answer the list under "breakpoints"; GET answers it bare
-    assert rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001440"}) == {
-        "breakpoints": [{"addr": 0x140001440, "enabled": True}]}
-    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": 0x140001450})
+    assert rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001450"}) == {
+        "breakpoints": [{"addr": 0x140001450, "enabled": True}]}
+    # the lower address second: rizin lists them in the order they were set (measured), the server sorts
+    assert rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": 0x140001440}) == {
+        "breakpoints": [{"addr": 0x140001440, "enabled": True}, {"addr": 0x140001450, "enabled": True}]}
+    assert [b["addr"] for b in json.loads(
+        rz.send(f"/api/rizin/{sid}/console", {"cmd": "dblj"})["output"])] == [0x140001450, 0x140001440]
     assert rz.read(f"/api/rizin/{sid}/breakpoints") == [
         {"addr": 0x140001440, "enabled": True}, {"addr": 0x140001450, "enabled": True}]
     assert any(c.startswith("db @ 0x140001440") for c in rz.commands())
@@ -3155,6 +3167,9 @@ def test_the_api_offers_no_disabled_breakpoint(rz):
     rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001440"})
     rz.send(f"/api/rizin/{sid}/console", {"cmd": "dbd @ 0x140001440"})
     assert rz.read(f"/api/rizin/{sid}/breakpoints") == [{"addr": 0x140001440, "enabled": False}]
+    # and so is a POST on that address: rizin keeps the breakpoint it has, so the answer says disabled
+    assert rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001440"}) == {
+        "breakpoints": [{"addr": 0x140001440, "enabled": False}]}
     assert [c for c in rz.commands() if c.startswith(("dbd", "dbe"))] == ["dbd @ 0x140001440"]
 
 
@@ -3358,6 +3373,14 @@ def test_what_this_session_wrote_stays_its_own(rz):
     assert [(r["addr"], r["before"], r["after"], r["mine"]) for r in rows] == [
         (0x140001440, rows[0]["before"], "9090", True), (0x140001440, "9090", "cccc", True)]
 
+    # a foreign write of *the same bytes* at an address this session has taken back: the mirror keeps
+    # only what the cache still holds, so the entry that was dropped cannot claim this row
+    _patch(rz, sid, addr="0x140001470", bytes="41")
+    rz.delete(f"/api/rizin/{sid}/patch", {"addr": "0x140001470"})
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "wx 41 @ 0x140001470"})
+    assert [(r["addr"], r["after"], r["mine"]) for r in _patches(rz, sid)][-1:] == [
+        (0x140001470, "41", False)]
+
     # after wc-* nothing is claimed any more: what a run writes then is the run's
     rz.delete(f"/api/rizin/{sid}/patch", {})
     rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001444"})
@@ -3400,6 +3423,208 @@ def test_patches_say_the_session_ended_rather_than_fail(rz):
                      rz.post(f"/api/rizin/{sid}/patch", {"addr": "0x140001440", "bytes": "90"}),
                      rz.delete(f"/api/rizin/{sid}/patch", {})):
         assert response.status_code == 404 and response.get_json()["error"] == "session ended"
+
+
+# --- What stays: the /tdc namespace of the project (webui/rizin_sessions.py) -
+
+def _plant_patches(project, patches):
+    """Put a patch list into a saved project, as an older session or another build could leave it."""
+    line = "patches=" + ",".join(f"{addr:x}:{after}" for addr, after in patches)
+    text = project.read_text(encoding="utf-8", errors="surrogateescape")
+    planted = re.sub(r"(?m)^patches=.*$", line, text)
+    assert planted != text, "the project has no patches line to replace"
+    project.write_text(planted, encoding="utf-8", errors="surrogateescape")
+
+
+def test_a_patch_is_not_refused_while_the_analysis_runs(rz, monkeypatch):
+    # Unlike a rename or a comment: an analysis step changes no bytes, so a patch waits for the pipe
+    # (2 s) and goes through, and the project is written for it like any other.
+    monkeypatch.setenv("FAKE_RIZIN_SLOW", "aaa:1")
+    path = rz.write("pipesim.exe")
+    sid = rz.open(path)["session"]
+    assert rz.status(sid)["analysis"]["state"] == "running"
+    assert [r["addr"] for r in rz.send(f"/api/rizin/{sid}/patch",
+                                       {"addr": "0x140001440", "bytes": "90"})["patches"]] == [0x140001440]
+    assert rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})["breakpoints"]
+    rz.wait_done(sid)
+    rz.close(sid)
+    assert "\npatches=140001440:90\n" in rz.project().read_text(encoding="utf-8", errors="surrogateescape")
+
+
+def test_a_patch_and_a_breakpoint_come_back_when_the_file_is_opened_again(rz):
+    path = rz.write("pipesim.exe")
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    original = rz.read(f"/api/rizin/{sid}/hex?addr=0x140001440&len=2")["bytes"]
+    rz.send(f"/api/rizin/{sid}/patch", {"addr": "0x140001440", "bytes": "9090"})
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
+    rz.close(sid)
+
+    mark = len(rz.commands())
+    sid = rz.open(path)["session"]
+    # R2: one row per write operation, so a two-byte wx is one patch of size 2, not two patches
+    assert [r["addr"] for r in rz.read(f"/api/rizin/{sid}/patches")] == [0x140001440]
+    assert rz.read(f"/api/rizin/{sid}/patches") == [
+        {"addr": 0x140001440, "size": 2, "before": bytes(original).hex(), "after": "9090", "mine": True}]
+    assert rz.read(f"/api/rizin/{sid}/breakpoints") == [{"addr": 0x1400014B7, "enabled": True}]
+    # back in effect, not only in the list: the patch was written before the open answered, so the first
+    # disassembly and the first hexdump already show it
+    assert any(c.startswith("wx 9090 @ 0x140001440") for c in _commands_since(rz, mark))
+    assert rz.read(f"/api/rizin/{sid}/hex?addr=0x140001440&len=2")["bytes"] == [0x90, 0x90]
+    # and the breakpoint stops a run, as one set by hand does
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    state = _run(rz, sid, "cont")
+    assert (state["pc"], state["stopped"]) == (0x1400014B7, "breakpoint")
+
+
+def test_what_a_run_wrote_does_not_come_back(rz):
+    """A run's bytes never stood in the file; baking them in would lose track of where bytes come from
+    (design section 6), and the cache of an XOR run over a section would blow past the 64 KB that
+    _read_project_meta reads."""
+    path = rz.write("pipesim.exe")
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001444"})
+    _run(rz, sid, "step")
+    assert [r["mine"] for r in _patches(rz, sid)] == [False]
+    rz.close(sid)
+    assert not rz.project().exists(), "a run alone makes no project"
+
+    # and with a patch of its own beside it, the project holds the patch and nothing of the run
+    sid = rz.open(path)["session"]
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001444"})
+    _run(rz, sid, "step")
+    rz.send(f"/api/rizin/{sid}/patch", {"addr": "0x140001440", "bytes": "90"})
+    run = [r for r in _patches(rz, sid) if not r["mine"]]
+    assert run
+    rz.close(sid)
+    saved = rz.project().read_text(encoding="utf-8", errors="surrogateescape")
+    assert "\npatches=140001440:90\n" in saved
+    for row in run:
+        assert f"{row['addr']:x}:" not in saved and row["after"] not in saved.split("\n/tdc\n")[-1]
+
+    sid = rz.open(path)["session"]
+    assert [(r["addr"], r["mine"]) for r in _patches(rz, sid)] == [(0x140001440, True)]
+
+
+def test_only_the_patches_this_session_still_holds_go_into_the_project(rz):
+    """What the mirror and the cache disagree about at save time: the save reads the cache back, so a
+    patch the console took away is not written and a write that is not this session's never is."""
+    sid = rz.session()
+    _patch(rz, sid, addr="0x140001440", bytes="9090")
+    _patch(rz, sid, addr="0x140001460", bytes="41")
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "wx 42 @ 0x140001480"})
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "wc- 0x140001460 0x140001461"})
+    rz.close(sid)
+    saved = rz.project().read_text(encoding="utf-8", errors="surrogateescape")
+    assert "\npatches=140001440:9090\n" in saved
+
+
+def test_a_stale_patch_outside_the_file_is_skipped_with_a_note(rz):
+    # Review Focus 4: the saved list must not be applied blindly nor break the boot.
+    path = rz.write("pipesim.exe")
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    rz.send(f"/api/rizin/{sid}/patch", {"addr": "0x140001440", "bytes": "90"})
+    rz.close(sid)
+    _plant_patches(rz.project(), [(0xDEADBEEF0000, "90"), (0x140001440, "90")])
+    described = rz.open(path)
+    note = described["analysis"]["note"] or ""
+    assert "could not be applied" in note and "0xdeadbeef0000" in note
+    sid = described["session"]
+    assert [r["addr"] for r in rz.read(f"/api/rizin/{sid}/patches")] == [0x140001440]
+    assert rz.read(f"/api/rizin/{sid}/hex?addr=0x140001440&len=1")["bytes"] == [0x90]
+    # the note stays while the session lives, and the session is usable
+    assert "could not be applied" in rz.status(sid)["analysis"]["note"]
+
+
+def test_a_project_is_written_for_a_patch_alone(rz):
+    path = rz.write("pipesim.exe")
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    assert not rz.project().exists()  # the analysis alone writes none
+    rz.send(f"/api/rizin/{sid}/patch", {"addr": "0x140001440", "bytes": "90"})
+    rz.close(sid)
+    assert rz.project().exists()
+
+
+def test_a_project_is_written_for_a_breakpoint_alone(rz):
+    # rizin keeps breakpoints in its own project (/core/debug/breakpoints, measured), so all the server
+    # has to do for them is write a project at all
+    other = SAMPLE + b" two"
+    path = rz.write("second.exe", other)
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    assert not rz.project(other).exists()
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001450"})
+    rz.close(sid)
+    assert rz.project(other).exists()
+    sid = rz.open(path)["session"]
+    assert rz.read(f"/api/rizin/{sid}/breakpoints") == [{"addr": 0x140001450, "enabled": True}]
+
+
+def test_taking_a_patch_back_is_saved_too(rz):
+    path = rz.write("pipesim.exe")
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    rz.send(f"/api/rizin/{sid}/patch", {"addr": "0x140001440", "bytes": "90"})
+    rz.remove(f"/api/rizin/{sid}/patch", {"addr": "0x140001440"})
+    rz.close(sid)
+    assert "\npatches=\n" in rz.project().read_text(encoding="utf-8", errors="surrogateescape")
+    sid = rz.open(path)["session"]
+    assert _patches(rz, sid) == []
+    assert rz.read(f"/api/rizin/{sid}/hex?addr=0x140001440&len=1")["bytes"] != [0x90]
+
+
+def test_patches_that_do_not_fit_the_project_are_named_not_dropped_in_silence(rz):
+    # _read_project_meta reads the last 64 KB: patches that pushed /tdc out of it would take the
+    # analysis progress with them, so what does not fit is left out and the session says so
+    import rizin_emulation
+
+    path = rz.write("pipesim.exe")
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    for i in range(5):
+        _patch(rz, sid, addr=hex(0x140001000 + i * 0x2000), bytes="90" * rizin_emulation.MAX_PATCH_BYTES)
+    assert rz.mgr.get(sid).flush() is True
+    note = rz.status(sid)["analysis"]["note"]
+    assert note.startswith("2 patches did not fit into the project"), note
+    saved = rz.project().read_text(encoding="utf-8", errors="surrogateescape")
+    assert len(saved.split("\n/tdc\n")[-1]) < 64 * 1024
+    rz.close(sid)
+    sid = rz.open(path)["session"]
+    # three patches of 4096 bytes are what fits; the analysis progress comes back either way
+    assert len(_patches(rz, sid)) == 3 and rz.status(sid)["analysis"]["level"] == "aaa"
+    assert rz.status(sid)["analysis"]["done_steps"] == ["aaa"]
+
+
+def test_the_project_meta_reads_what_it_can_and_drops_the_rest(tmp_path):
+    import rizin_sessions
+
+    project = tmp_path / "x.rzdb"
+    project.write_text("/\nversion=25\n\n/tdc\nlevel=aaa\nmode=one\ndone=aaa,aa\n"
+                       "patches=140001440:9090,nope,1:zz,2:9,,3:90,10000000000000000:90\n")
+    meta = rizin_sessions._read_project_meta(str(project))
+    assert meta["patches"] == [(0x140001440, "9090"), (3, "90")]
+    assert (meta["level"], meta["mode"], meta["done"]) == ("aaa", "one", ["aaa", "aa"])
+    # a project from before this version has no patches line at all
+    project.write_text("/\nversion=25\n\n/tdc\nlevel=aa\nmode=steps\ndone=aa\n")
+    assert rizin_sessions._read_project_meta(str(project))["patches"] == []
+
+
+def test_the_tdc_namespace_stays_inside_the_tail_that_is_read_back(tmp_path):
+    import rizin_emulation
+    import rizin_sessions
+
+    src, dst = tmp_path / "in.rzdb", tmp_path / "out.rzdb"
+    src.write_text("/\nversion=25\n")
+    big = [(0x140001000 + i * 0x2000, "90" * rizin_emulation.MAX_PATCH_BYTES) for i in range(10)]
+    left_out = rizin_sessions._sanitize_project(str(src), str(dst), "aaa", "one", ["aaa"], big)
+    meta = rizin_sessions._read_project_meta(str(dst))
+    assert meta["patches"] == big[:len(meta["patches"])]
+    assert len(meta["patches"]) + left_out == len(big) and left_out > 0
+    # and what the tail is read for still comes back
+    assert (meta["level"], meta["mode"], meta["done"]) == ("aaa", "one", ["aaa"])
 
 
 @pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
@@ -3592,6 +3817,84 @@ def test_real_rizin_runs_an_emulation(tmp_path, monkeypatch):
         assert state["stopped"] == "timeout" and state["pc"] == watchdog
         assert session.emulation_state()["running"] is True
         assert session.json("ij")["core"]["file"] == str(exe)
+    finally:
+        mgr.shutdown()
+    assert hashlib.sha256(exe.read_bytes()).hexdigest() == before, "the sample must never be written"
+
+
+@pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
+@pytest.mark.skipif(not MINGW, reason="mingw (x86_64-w64-mingw32-gcc) not installed")
+def test_real_rizin_keeps_a_patch_and_a_breakpoint_in_the_project(tdc, tmp_path, monkeypatch):
+    """A patch and a breakpoint made in one rizin 0.9.1 session are in effect again in the next one.
+
+    Only the binary can show this: the project goes through rizin's own ``Ps`` and ``Poo``, and what the
+    project does and does not hold is the whole reason the /tdc namespace exists. Measured on 0.9.1:
+    ``Ps`` writes no cache row at all, so the patches live in /tdc, but it *does* write
+    /core/debug/breakpoints, so the breakpoints come back through rizin itself.
+    """
+    import rizin_sessions
+
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    exe = allowed / "pipesim.exe"
+    shutil.copy(_build_pipesim(tmp_path), exe)
+    before = hashlib.sha256(exe.read_bytes()).hexdigest()
+    monkeypatch.setattr(rizin_sessions, "RIZIN_EXE", REAL_RIZIN)
+    monkeypatch.setattr(tdc, "_readable_roots", lambda: [str(allowed)])
+    mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(tmp_path / "projects"))
+    monkeypatch.setattr(tdc, "_rizin_manager", mgr)
+    monkeypatch.setattr(tdc, "_rizin_install", {"key": None, "value": None})
+    api = _Api(tdc, None, mgr, tmp_path)
+    project = tmp_path / "projects" / (hashlib.sha256(exe.read_bytes()).hexdigest() + ".rzdb")
+    try:
+        sid = api.open(str(exe))["session"]
+        api.wait_done(sid, timeout=120)
+        main = next(f for f in api.read(f"/api/rizin/{sid}/functions") if f["name"] == "sym.main")["offset"]
+        ops = api.read(f"/api/rizin/{sid}/disasm?addr={main}&count=60")["ops"]
+        size, stop = ops[0]["size"], ops[1]["offset"]
+        nops = "90" * size
+        original = api.read(f"/api/rizin/{sid}/hex?addr={main}&len={size}")["bytes"]
+        api.send(f"/api/rizin/{sid}/patch", {"addr": main, "kind": "nop"})
+        api.send(f"/api/rizin/{sid}/breakpoints", {"addr": stop})
+        # a run's bytes land in the same cache, and they are the ones that must not be written: a step
+        # on a call pushes the return address, which is one row of the cache (measured)
+        call = next(op for op in ops if op["type"].endswith("call"))
+        api.send(f"/api/rizin/{sid}/emulation/start", {"addr": call["offset"]})
+        api.send(f"/api/rizin/{sid}/emulation/run", {"kind": "step"})
+        run = [r for r in api.read(f"/api/rizin/{sid}/patches") if not r["mine"]]
+        assert run, "the step wrote nothing into the cache"
+        api.close(sid)
+        assert wait_for(lambda: project.exists()), "the patch wrote no project"
+
+        saved = project.read_text(encoding="utf-8", errors="surrogateescape")
+        tdc_namespace = saved.split("\n/tdc\n")[-1]
+        assert f"\npatches={main:x}:{nops}\n" in saved
+        for row in run:
+            assert f"{row['addr']:x}:" not in tdc_namespace, "a run's bytes must not be saved"
+        assert len(tdc_namespace) < 1024, "the /tdc namespace holds the hand patches, not a run's cache"
+        # rizin keeps the breakpoints itself, which is why /tdc carries only the patches
+        assert f"{stop:#x}=" in saved.split("\n/core/debug/breakpoints\n")[1].split("\n/")[0]
+        assert '"before":' not in saved and '"after":' not in saved, "Ps saves no write cache"
+
+        sid = api.open(str(exe))["session"]
+        assert api.read(f"/api/rizin/{sid}/patches") == [
+            {"addr": main, "size": size, "before": bytes(original).hex(), "after": nops, "mine": True}]
+        # in effect, not merely listed: px reads through the cache again
+        assert api.read(f"/api/rizin/{sid}/hex?addr={main}&len={size}")["bytes"] == [0x90] * size
+        assert api.read(f"/api/rizin/{sid}/breakpoints") == [{"addr": stop, "enabled": True}]
+        # and the breakpoint stops a run: nops from main, then the breakpoint
+        api.send(f"/api/rizin/{sid}/emulation/start", {"addr": main})
+        state = api.send(f"/api/rizin/{sid}/emulation/run", {"kind": "cont"})
+        assert (state["pc"], state["stopped"]) == (stop, "breakpoint")
+
+        # taking it back is saved too: the next session starts with the file's own bytes
+        api.remove(f"/api/rizin/{sid}/patch", {"addr": main})
+        api.remove(f"/api/rizin/{sid}/breakpoints", {})
+        api.close(sid)
+        sid = api.open(str(exe))["session"]
+        assert api.read(f"/api/rizin/{sid}/patches") == []
+        assert api.read(f"/api/rizin/{sid}/breakpoints") == []
+        assert api.read(f"/api/rizin/{sid}/hex?addr={main}&len={size}")["bytes"] == original
     finally:
         mgr.shutdown()
     assert hashlib.sha256(exe.read_bytes()).hexdigest() == before, "the sample must never be written"
