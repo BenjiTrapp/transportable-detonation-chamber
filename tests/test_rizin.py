@@ -5733,10 +5733,10 @@ def test_real_rizin_routes(tdc, tmp_path, monkeypatch):
 EXPORT_SAMPLE = bytes(range(256)) * 48
 
 
-def _export_session(rz, name="pipesim.exe", data=EXPORT_SAMPLE):
+def _export_session(rz, name="pipesim.exe", data=EXPORT_SAMPLE, tab="tab1"):
     """A sample the fake's maps reach into, opened and analysed: (its session ID, its path)."""
     path = rz.write(name, data)
-    sid = rz.open(path)["session"]
+    sid = rz.open(path, tab)["session"]
     rz.wait_done(sid)
     return sid, path
 
@@ -5758,8 +5758,9 @@ def test_export_writes_a_copy_with_the_patches_applied(rz):
     assert data[:paddr] == original[:paddr] and data[paddr + 2:] == original[paddr + 2:]
     assert result["patched"] == 2 and result["skipped"] == []
     assert hashlib.sha256(data).hexdigest() == result["sha256"]
-    assert result["name"] == "pipesim.patched.exe" and result["path"] == os.path.join(
-        rz.tdc.RIZIN_UPLOAD_DIR, "pipesim.patched.exe")
+    digest = hashlib.sha256(original).hexdigest()[:16]
+    assert result["name"] == f"{digest}_pipesim.patched.exe" and result["path"] == os.path.join(
+        rz.tdc.RIZIN_UPLOAD_DIR, result["name"])
     note = open(result["path"] + ".patch.txt").read()
     assert note == result["note"]
     row = _patches(rz, sid)[0]
@@ -5799,20 +5800,65 @@ def test_export_names_patches_without_a_file_offset_and_writes_the_rest(rz):
         "a patch that is only partly in the file is skipped whole, not written in part"
 
 
-def test_a_patch_is_placed_only_where_its_bytes_are_consecutive_in_the_file(rz, monkeypatch):
-    """`_rizin_paddr` answers for one address, so the first and the last byte of a patch are both asked for
-    and must be as far apart in the file as in memory. The fake's maps have no gap under 2000 bytes (the
-    longest patch), so the answers are set here; the real PE has such a gap (the real test below)."""
-    offsets = {0x1000: 0x400, 0x1003: 0x403, 0x1ff0: 0x13f0, 0x200f: 0x140f, 0x300f: 0x140f}
-    monkeypatch.setattr(rz.tdc, "_rizin_paddr", lambda session, addr: offsets.get(addr))
+def _scrambled_session(rz, monkeypatch):
+    """The fake with three maps side by side in memory whose data are out of order in the file (see
+    FAKE_RIZIN_SCRAMBLED): .s1 at 0x14000c000 is file offset 0x400, .s2 at 0x14000c200 is 0xa00, .s3 at
+    0x14000c400 is 0x800 -- as a PE with SectionAlignment == FileAlignment and out-of-order raw pointers is
+    mapped by rizin 0.9.1 (measured)."""
+    monkeypatch.setenv("FAKE_RIZIN_SCRAMBLED", "1")
+    return _export_session(rz)
 
-    def placed(addr, size):
-        return rz.tdc._rizin_patch_paddr(None, {"addr": addr, "size": size})
 
-    assert placed(0x1000, 4) == 0x400 and placed(0x1000, 1) == 0x400
-    assert placed(0x1ff0, 0x20) == 0x13F0, "two maps that follow each other in memory and in the file"
-    assert placed(0x1ff0, 0x1020) is None, "0x1020 bytes of memory, 0x20 of the file: a gap in between"
-    assert placed(0x2fff, 1) is None and placed(0x1000, 0x3000) is None, "no byte of the file at one end"
+def test_a_patch_across_maps_whose_data_are_out_of_order_is_not_written(rz, monkeypatch):
+    """The first byte (file 0x400) and the last (0x9ff) of 0x600 bytes from .s1 are as far apart in the
+    file as in memory, yet .s3's data are in between and .s2's are not: written from the first offset on, the
+    copy would have .s3 overwritten, .s2 untouched, and the answer would say success."""
+    sid, path = _scrambled_session(rz, monkeypatch)
+    assert [_paddr(rz, sid, a) for a in (0xC000, 0xC1FF, 0xC200, 0xC3FF, 0xC400, 0xC5FF)] == [None] * 6
+    assert [_paddr(rz, sid, 0x140000000 + a) for a in (0xC000, 0xC1FF, 0xC200, 0xC3FF, 0xC400, 0xC5FF)] == [
+        0x400, 0x5FF, 0xA00, 0xBFF, 0x800, 0x9FF]
+    _patch(rz, sid, addr="0x14000c000", bytes="ff" * 0x600)
+    response = rz.post(f"/api/rizin/{sid}/export", {})
+    assert response.status_code == 400 and "0x14000c000" in response.get_json()["refused"]
+    # a patch that is in one map is written, and nowhere else
+    _patch(rz, sid, addr="0x14000c200", bytes="ee" * 0x200)
+    result = rz.send(f"/api/rizin/{sid}/export", {})
+    assert result["patched"] == 0x200 and result["skipped"] == [0x14000C000]
+    data, original = open(result["path"], "rb").read(), open(path, "rb").read()
+    assert [i for i in range(len(data)) if data[i] != original[i]] == [i for i in range(0xA00, 0xC00)
+                                                                       if original[i] != 0xEE]
+    assert data[0xA00:0xC00] == b"\xee" * 0x200
+
+
+def test_every_byte_of_an_exported_patch_lands_where_rizin_says_it_is(rz, monkeypatch):
+    """The property, not a rule for it: for each byte of each exported patch, the file offset rizin gives
+    for that byte's address holds the byte the patch wrote there."""
+    sid, path = _scrambled_session(rz, monkeypatch)
+    for addr, data in ((0x14000C000, "11" * 0x200), (0x14000C3F0, "22" * 0x10), (0x14000C5F0, "33" * 0x10),
+                       (0x140001440, "4455"), (0x14000C1F8, "6677" * 8)):
+        _patch(rz, sid, addr=f"{addr:#x}", bytes=data)
+    result = rz.send(f"/api/rizin/{sid}/export", {})
+    assert result["skipped"] == [0x14000C1F8]  # .s1's last 8 bytes and .s2's first 8: two maps
+    copy = open(result["path"], "rb").read()
+    for addr, data in ((0x14000C000, b"\x11" * 0x200), (0x14000C3F0, b"\x22" * 0x10),
+                       (0x14000C5F0, b"\x33" * 0x10), (0x140001440, b"\x44\x55")):
+        for i in range(0, len(data), 7):
+            assert copy[_paddr(rz, sid, addr + i)] == data[i], hex(addr + i)
+        assert copy[_paddr(rz, sid, addr + len(data) - 1)] == data[-1]
+    expected = bytearray(open(path, "rb").read())
+    for start, data in ((0x400, b"\x11" * 0x200), (0xBF0, b"\x22" * 0x10), (0x9F0, b"\x33" * 0x10), (0x840, b"\x44\x55")):
+        expected[start:start + len(data)] = data
+    assert copy == bytes(expected), "the copy is the original with these bytes changed and no others"
+
+
+def test_export_asks_rizin_a_fixed_number_of_times_however_many_patches_there_are(rz):
+    sid, _ = _export_session(rz)
+    for i in range(12):
+        _patch(rz, sid, addr=f"{0x140001440 + 4 * i:#x}", bytes="90")
+    mark = len(rz.commands())
+    assert rz.send(f"/api/rizin/{sid}/export", {})["patched"] == 12
+    sent = _commands_since(rz, mark)
+    assert [c for c in sent if c.startswith(("wcj", "ol", "oml"))] == ["wcj", "ol.j", "omlj"], sent
 
 
 def test_export_refuses_when_no_patch_has_a_place_in_the_file(rz):
@@ -5869,7 +5915,7 @@ def test_a_second_export_replaces_the_copy_and_its_note_together(rz):
     note = open(second["path"] + ".patch.txt").read()
     assert second["sha256"] in note and first["sha256"] not in note, "the note describes the copy beside it"
     assert "0x140001440" in note and "0x140001460" in note
-    assert sorted(os.listdir(rz.tdc.RIZIN_UPLOAD_DIR)) == ["pipesim.patched.exe", "pipesim.patched.exe.patch.txt"], \
+    assert sorted(os.listdir(rz.tdc.RIZIN_UPLOAD_DIR)) == [second["name"], second["name"] + ".patch.txt"], \
         "no temporary file is left"
 
 
@@ -5884,19 +5930,67 @@ def test_export_refuses_a_file_that_changed_since_it_was_opened(rz):
 
 
 def test_export_never_writes_where_the_original_is(rz):
-    """A long name is cut before the suffix is added, so the copy's name can be the original's own: a sample
-    that was exported (or uploaded) under it must not be copied onto itself."""
-    rz.uploads.mkdir()
-    name = "a" * 80 + ".patched.exe"
-    path = str(rz.uploads / name)
-    with open(path, "wb") as fh:
-        fh.write(EXPORT_SAMPLE)
-    sid = rz.open(path)["session"]
-    rz.wait_done(sid)
+    """The copy's name is made from the original's digest, so it is not the original's name; where the
+    path it would take already leads to the original (a link), it is refused rather than replaced."""
+    sid, path = _export_session(rz)
     _patch(rz, sid, addr="0x140001440", bytes="90")
+    name = f"{hashlib.sha256(EXPORT_SAMPLE).hexdigest()[:16]}_pipesim.patched.exe"
+    rz.uploads.mkdir()
+    os.symlink(path, rz.uploads / name)
     response = rz.post(f"/api/rizin/{sid}/export", {})
     assert response.status_code == 400 and "original" in response.get_json()["refused"]
     assert open(path, "rb").read() == EXPORT_SAMPLE and os.listdir(rz.uploads) == [name]
+
+
+def test_two_samples_of_one_name_do_not_replace_each_others_copy(rz):
+    one, path_one = _export_session(rz, "dir_a/evil.exe", EXPORT_SAMPLE)
+    two, path_two = _export_session(rz, "dir_b/evil.exe", EXPORT_SAMPLE[:-1] + b"!", tab="tab2")
+    _patch(rz, one, addr="0x140001440", bytes="90")
+    first = rz.send(f"/api/rizin/{one}/export", {})
+    _patch(rz, two, addr="0x140001440", bytes="cc")
+    second = rz.send(f"/api/rizin/{two}/export", {})
+    assert first["path"] != second["path"] and first["name"].endswith("_evil.patched.exe")
+    assert open(first["path"], "rb").read()[0x840] == 0x90 and open(second["path"], "rb").read()[0x840] == 0xCC
+    assert path_one in open(first["path"] + ".patch.txt").read() and path_two in open(second["path"] + ".patch.txt").read()
+
+
+def test_export_keeps_the_suffix_of_a_name_without_ascii(rz):
+    """secure_filename("пример.exe") is "exe": the copy would have had no suffix to be detonated by."""
+    sid, _ = _export_session(rz, "\u043f\u0440\u0438\u043c\u0435\u0440.exe")
+    _patch(rz, sid, addr="0x140001440", bytes="90")
+    name = rz.send(f"/api/rizin/{sid}/export", {})["name"]
+    assert name.endswith("_sample.patched.exe"), name
+    sid, _ = _export_session(rz, "noextension", EXPORT_SAMPLE[:-1] + b"?")
+    _patch(rz, sid, addr="0x140001440", bytes="90")
+    assert rz.send(f"/api/rizin/{sid}/export", {})["name"].endswith("_noextension.patched")
+
+
+def test_export_does_not_prune_the_original_it_copied(rz, monkeypatch):
+    """A sample that was uploaded is in the folder the prune empties: with 45 newer files, the original
+    the session has open must not go while the copy and the note stay."""
+    rz.uploads.mkdir()
+    path = str(rz.uploads / "0123456789abcdef_old.exe")
+    with open(path, "wb") as fh:
+        fh.write(EXPORT_SAMPLE)
+    os.utime(path, (1, 1))
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    for i in range(45):
+        (rz.uploads / f"newer_{i:02d}.bin").write_bytes(b"x")
+    _patch(rz, sid, addr="0x140001440", bytes="90")
+    result = rz.send(f"/api/rizin/{sid}/export", {})
+    left = set(os.listdir(rz.uploads))
+    assert {os.path.basename(path), result["name"], result["name"] + ".patch.txt"} <= left
+    assert len(left) == rz.tdc.RIZIN_UPLOADS_KEEP + 1, "the rest is pruned as for an upload, and the original is the one more"
+
+
+def test_the_note_shortens_a_long_patch_to_a_line_that_can_be_read(rz):
+    sid, _ = _export_session(rz)
+    _patch(rz, sid, addr="0x140001440", bytes="ab" * 1224)
+    result = rz.send(f"/api/rizin/{sid}/export", {})
+    lines = [l for l in result["note"].splitlines() if l.startswith("  0x")]
+    assert len(lines) == 1 and len(lines[0]) < 200 and "(1224 bytes)" in lines[0] and "ab" * 32 in lines[0]
+    assert result["patched"] == 1224
 
 
 def test_export_answers_500_when_the_copy_cannot_be_written(rz, monkeypatch):
@@ -6014,5 +6108,85 @@ def test_real_rizin_exports_the_patch_at_the_physical_offset(tdc, tmp_path, monk
         api.wait_done(other, timeout=120)
         assert api.read(f"/api/rizin/{other}/hex?addr={main}&len=2")["bytes"] == [0x90, 0x90]
         assert api.read(f"/api/rizin/{other}/patches") == []
+    finally:
+        mgr.shutdown()
+
+
+def _build_scrambled_pe(path):
+    """A minimal PE32+ with SectionAlignment == FileAlignment == 0x200 and three 0x200-byte sections whose raw
+    data are out of order: .s1 -> file 0x400, .s2 -> 0xa00, .s3 -> 0x800 (virtual 0x1000, 0x1200, 0x1400).
+    rizin 0.9.1 maps them side by side with no zero-filled room between them (measured). Each section's data
+    is its own name repeated, so a byte says where it came from."""
+    import struct
+
+    align, base = 0x200, 0x140000000
+    sections = [(b".s1", 0x1000, 0x400), (b".s2", 0x1200, 0xA00), (b".s3", 0x1400, 0x800)]
+    headers = b"MZ" + bytes(0x3A) + struct.pack("<I", 0x40)
+    headers += b"PE\x00\x00" + struct.pack("<HHIIIHH", 0x8664, len(sections), 0, 0, 0, 240, 0x22)
+    headers += struct.pack("<HBBIIIIIQ", 0x20B, 14, 0, 0x600, 0x600, 0, 0x1000, 0x1000, base)
+    headers += struct.pack("<IIHHHHHHIIIIHH", align, align, 6, 0, 0, 0, 6, 0, 0, 0x1600, 0x400, 0, 2, 0)
+    headers += struct.pack("<QQQQII", 0x100000, 0x1000, 0x100000, 0x1000, 0, 16) + bytes(16 * 8)
+    for name, va, raw in sections:
+        headers += name.ljust(8, b"\x00") + struct.pack("<IIIIIIHHI", align, va, align, raw, 0, 0, 0, 0, 0x60000020)
+    blob = bytearray(headers.ljust(0x400, b"\x00") + bytes(0x800))
+    for name, va, raw in sections:
+        blob[raw:raw + align] = (name.strip(b".") * align)[:align]
+    path.write_bytes(bytes(blob))
+    return path
+
+
+@pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
+def test_real_rizin_exports_only_what_one_map_of_the_file_holds(tdc, tmp_path, monkeypatch):
+    """A patch across side-by-side maps whose data are out of order in the file: its first and last byte are
+    as far apart in the file as in memory, and the sections between them are elsewhere. The copy has to be
+    what rizin shows through its cache, for every byte, which is what the two-endpoint check missed."""
+    import rizin_sessions
+
+    allowed, uploads = tmp_path / "allowed", tmp_path / "uploads"
+    allowed.mkdir()
+    exe = _build_scrambled_pe(allowed / "scrambled.exe")
+    original = exe.read_bytes()
+    monkeypatch.setattr(rizin_sessions, "RIZIN_EXE", REAL_RIZIN)
+    monkeypatch.setattr(tdc, "_readable_roots", lambda: [str(allowed), str(uploads)])
+    monkeypatch.setattr(tdc, "RIZIN_UPLOAD_DIR", str(uploads))
+    mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(tmp_path / "projects"))
+    monkeypatch.setattr(tdc, "_rizin_manager", mgr)
+    monkeypatch.setattr(tdc, "_rizin_install", {"key": None, "value": None})
+    api = _Api(tdc, None, mgr, tmp_path)
+    try:
+        sid = api.open(str(exe))["session"]
+        api.wait_done(sid, timeout=120)
+        session = mgr.get(sid)
+        side_by_side = [(m["from"], m["to"], m["delta"]) for m in session.json("omlj") if m["fd"] == 3 and
+                        m["name"].startswith("fmap..s")]
+        assert sorted(side_by_side) == [(0x140001000, 0x140001200, 0x400), (0x140001200, 0x140001400, 0xA00),
+                                        (0x140001400, 0x140001600, 0x800)], "the layout the test is about"
+
+        api.send(f"/api/rizin/{sid}/patch", {"addr": 0x140001000, "bytes": "ff" * 0x600})
+        refused = api.post(f"/api/rizin/{sid}/export", {})
+        assert refused.status_code == 400 and "0x140001000" in refused.get_json()["refused"], refused.get_json()
+        assert not uploads.exists() or not os.listdir(uploads)
+
+        api.remove(f"/api/rizin/{sid}/patch", {})
+        api.send(f"/api/rizin/{sid}/patch", {"addr": 0x140001200, "bytes": "ee" * 0x200})  # one map: file 0xa00
+        api.send(f"/api/rizin/{sid}/patch", {"addr": 0x1400013F0, "bytes": "dd" * 0x10})   # the end of it
+        api.send(f"/api/rizin/{sid}/patch", {"addr": 0x1400015F0, "bytes": "cc" * 0x10})   # the end of .s3: 0x9f0
+        api.send(f"/api/rizin/{sid}/patch", {"addr": 0x1400011F8, "bytes": "bb" * 0x10})   # two maps: not exported
+        result = api.send(f"/api/rizin/{sid}/export", {})
+        assert result["skipped"] == [0x1400011F8] and result["patched"] == 0x200 + 0x10 + 0x10
+        data = open(result["path"], "rb").read()
+        expected = bytearray(original)
+        expected[0xA00:0xC00] = b"\xee" * 0x200
+        expected[0xBF0:0xC00] = b"\xdd" * 0x10
+        expected[0x9F0:0xA00] = b"\xcc" * 0x10
+        assert data == bytes(expected)
+        assert data[0x400:0x600] == original[0x400:0x600], ".s1 was in the skipped patch's range and is untouched"
+
+        # what the copy shows once rizin has mapped it is what this session shows through its cache
+        api.remove(f"/api/rizin/{sid}/patch", {"addr": 0x1400011F8})
+        other = api.open(result["path"], "tab2")["session"]
+        api.wait_done(other, timeout=120)
+        assert mgr.get(other).text("p8 0x600 @ 0x140001000") == session.text("p8 0x600 @ 0x140001000")
+        assert hashlib.sha256(exe.read_bytes()).hexdigest() == hashlib.sha256(original).hexdigest()
     finally:
         mgr.shutdown()

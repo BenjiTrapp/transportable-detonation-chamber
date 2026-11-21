@@ -350,9 +350,12 @@ def cache_entry(addr, data):
     return addr, len(data), bytes(data).hex()
 
 
-def patch_rows(rows, mine):
+def patch_rows(rows, mine, ordered=False):
     """``parse_cache``'s rows as the patch list, and the mirror of this session's own writes as it
     stands afterwards: (rows lowest address first, the mirror entries the cache still holds).
+
+    ``ordered`` keeps the rows in rizin's order (the order the writes were made in) instead of sorting them
+    by address: where two writes overlap, the later one wins, and a list by address cannot say which it is.
 
     ``mine`` is this session's writes in the order it made them, each as ``cache_entry`` gives it.
     rizin's cache is append-only (a second write over the same address becomes another row *after* the
@@ -380,7 +383,7 @@ def patch_rows(rows, mine):
         marked.append(dict(row, mine=True))
         kept.append(mine[index])
         at = index + 1
-    return sorted(marked, key=lambda row: row["addr"]), kept
+    return (marked if ordered else sorted(marked, key=lambda row: row["addr"])), kept
 
 
 # --- Re-analysing the range an emulation run decrypted ---------------------

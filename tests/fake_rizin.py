@@ -20,6 +20,9 @@ Environment:
   FAKE_RIZIN_STRINGS  this many more strings (text 0, ...) in ``izj``, after the others
   FAKE_RIZIN_FUNCTIONS  this many more functions (fcn.00000, ...) in ``afl``, ``aflj`` and ``flj``
   FAKE_RIZIN_AFL_NOISE  set: ``afl`` also prints a line that is no function row
+  FAKE_RIZIN_SCRAMBLED  set: three more maps of the file, side by side in memory (0x14000c000..0x14000c600, no
+                    zero-filled room between them) whose data are **out of order** in the file (delta 0x400, 0xa00,
+                    0x800), as a PE with SectionAlignment == FileAlignment and out-of-order raw pointers is mapped
   FAKE_RIZIN_BITS   32: an x86-32 file (``ij`` bits, the ESIL VM's registers); default 64
   FAKE_RIZIN_STACK  "<word>[,...]": the words ``aeim`` leaves at the stack pointer, upwards
   FAKE_RIZIN_NO_IO_CACHE  set: ``e io.cache=true`` does not take, ``e io.cache`` stays false
@@ -148,7 +151,11 @@ BASE, MAPPED_END = 0x140000000, 0x14000A000
 BASE32, MAPPED32_END = 0x401000, 0x408000
 IMAGE = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00" + bytes(range(256)) * 4
 # The maps as "oml.j @ addr" shows them: parts of the opened file (fd 3, at delta) and a zero-filled part
-# past .text's data (fd 4, like rizin's null:// maps); nothing else is mapped to the file
+# past .text's data (fd 4, like rizin's null:// maps); nothing else is mapped to the file.
+# This is NOT rizin's model of the gaps: it leaves 0x140004000-0x140005000 (and the page after .header, and
+# the one after .rdata) unmapped, where rizin 0.9.1 covers every page of a section with an fmap or an mmap
+# (measured on pipesim.exe). That only makes the fake stricter -- an address there answers "no map" -- so
+# do not read it as the shape of a real PE's maps; the real tests build one.
 MAPS = [{"map": i + 1, "fd": fd, "delta": delta, "from": start, "to": end,
          "perm": "r-x" if ".text" in name else "r--", "name": name}
         for i, (fd, delta, start, end, name) in enumerate((
@@ -157,6 +164,10 @@ MAPS = [{"map": i + 1, "fd": fd, "delta": delta, "from": start, "to": end,
             (4, 0, 0x140003000, 0x140004000, "mmap..text"),
             (3, 0x2400, 0x140005000, 0x140006000, "fmap..rdata"),
             (3, 0x3400, 0x140009000, MAPPED_END, "fmap..idata")))]
+if os.environ.get("FAKE_RIZIN_SCRAMBLED"):
+    MAPS += [{"map": len(MAPS) + 1 + i, "fd": 3, "delta": delta, "from": 0x14000C000 + 0x200 * i,
+              "to": 0x14000C200 + 0x200 * i, "perm": "r--", "name": f"fmap..s{i + 1}"}
+             for i, delta in enumerate((0x400, 0xA00, 0x800))]
 if BITS == 32:
     # the island's own maps, as a PE32's are: its code executes, its import table does not
     MAPS += [{"map": len(MAPS) + 1, "fd": 3, "delta": 0x400, "from": BASE32, "to": 0x402000,

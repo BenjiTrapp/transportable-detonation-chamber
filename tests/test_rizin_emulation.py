@@ -279,6 +279,18 @@ def test_patch_rows_mark_only_what_this_session_wrote():
     assert [r["mine"] for r in rizin_emulation.patch_rows(rows, [])[0]] == [False] * 4
 
 
+def test_patch_rows_can_keep_the_order_the_writes_were_made_in():
+    """Where two writes overlap the later one wins; by address the later one can come first."""
+    rows = [_row(0x1001, 4, "11223344"), _row(0x1000, 2, "aabb")]
+    mine = [rizin_emulation.cache_entry(0x1001, bytes.fromhex("11223344")),
+            rizin_emulation.cache_entry(0x1000, bytes.fromhex("aabb"))]
+    by_address, _ = rizin_emulation.patch_rows(rows, mine)
+    in_order, kept = rizin_emulation.patch_rows(rows, mine, ordered=True)
+    assert [r["addr"] for r in by_address] == [0x1000, 0x1001]
+    assert [r["addr"] for r in in_order] == [0x1001, 0x1000] and all(r["mine"] for r in in_order)
+    assert kept == mine
+
+
 def test_patch_rows_do_not_claim_a_foreign_write_inside_a_patch():
     """The hole an address set cannot see: a run (or the console) writing into the range this session
     patched. Its row is another row of the cache, so it is matched against the mirror, not the range."""

@@ -1823,6 +1823,13 @@ class RizinSession:
         """
         return self._call("emulation", wait, self._patch_list)
 
+    def patches_made(self, wait=2.0):
+        """``patches()`` in the order the writes were made, not by address: [{"addr", "size", "before",
+        "after", "mine"}]. Where two rows overlap the later one wins, which a list by address cannot say
+        (a one-byte patch made after a longer one that starts a byte later is listed first, measured), so
+        whoever applies the patches to a file needs this order."""
+        return self._call("emulation", wait, lambda pipe: self._patch_list(pipe, ordered=True))
+
     def unpatch(self, addr=None, wait=2.0):
         """Take back every write that overlaps ``addr`` (``wc-``), or the whole cache (``wc-*``) when
         ``addr`` is None; returns {"patches": the list}. Taking back where there is nothing is no error.
@@ -1867,12 +1874,12 @@ class RizinSession:
             raise RizinRefused(f"rizin wrote nothing at {addr:#x}")
         return {"patches": found}
 
-    def _patch_list(self, pipe):
+    def _patch_list(self, pipe, ordered=False):
         """The write cache as the patch list (gate held), and the mirror of this session's own writes
         kept honest: a write no row of the cache holds any more (a console ``wc-``, a rizin that was
         restarted) is dropped from it, so that a later write there is not taken for a patch."""
         rows, self._mine = rizin_emulation.patch_rows(rizin_emulation.parse_cache(pipe.cmd("wcj")),
-                                                      self._mine)
+                                                      self._mine, ordered)
         return rows
 
     def run_range(self, wait=2.0):
