@@ -5830,6 +5830,33 @@ def test_a_patch_across_maps_whose_data_are_out_of_order_is_not_written(rz, monk
     assert data[0xA00:0xC00] == b"\xee" * 0x200
 
 
+def test_a_patch_over_two_maps_of_the_file_is_not_written_where_rizin_does_not_show_it(rz, monkeypatch):
+    """Two maps over the same addresses: rizin reads through the topmost (the fake's oml.j answers it as
+    rizin's does), and omlj lists both without saying which. The first one that holds the row is the wrong
+    one half of the time: the copy would have the patch where nothing shows it, and say it had it."""
+    monkeypatch.setenv("FAKE_RIZIN_OVERLAP", "1")
+    sid, path = _export_session(rz)
+    assert _paddr(rz, sid, 0x14000E000) == 0xA00, "rizin shows the later map there"
+    _patch(rz, sid, addr="0x14000e000", bytes="ab" * 16)
+    response = rz.post(f"/api/rizin/{sid}/export", {})
+    assert response.status_code == 400 and "0x14000e000" in response.get_json()["refused"]
+    _patch(rz, sid, addr="0x140001440", bytes="90")
+    result = rz.send(f"/api/rizin/{sid}/export", {})
+    assert result["skipped"] == [0x14000E000] and result["patched"] == 1
+    data, original = open(result["path"], "rb").read(), open(path, "rb").read()
+    assert [i for i in range(len(data)) if data[i] != original[i]] == [0x840], "neither .o1's data nor .o2's"
+
+
+def test_a_patch_is_never_placed_past_the_end_of_the_file(rz):
+    """Real rizin always says how long the file is (ol.j); where it does not, the session's size bounds."""
+    maps = [{"fd": 3, "from": 0x1000, "to": 0x3000, "delta": 0x400}]
+    place = rz.tdc._rizin_patch_paddr
+    assert place({"fd": 3}, maps, {"addr": 0x1000, "size": 16}, 0x500) == 0x400
+    assert place({"fd": 3}, maps, {"addr": 0x1000, "size": 16}, 0x40F) is None, "ends one byte past the file"
+    assert place({"fd": 3, "size": 0x40F}, maps, {"addr": 0x1000, "size": 16}, None) is None
+    assert place({"fd": 3}, maps, {"addr": 0x1000, "size": 16}, None) is None, "nothing says how long it is"
+
+
 def test_every_byte_of_an_exported_patch_lands_where_rizin_says_it_is(rz, monkeypatch):
     """The property, not a rule for it: for each byte of each exported patch, the file offset rizin gives
     for that byte's address holds the byte the patch wrote there."""
@@ -6112,15 +6139,17 @@ def test_real_rizin_exports_the_patch_at_the_physical_offset(tdc, tmp_path, monk
         mgr.shutdown()
 
 
-def _build_scrambled_pe(path):
+def _build_scrambled_pe(path, overlap=False):
     """A minimal PE32+ with SectionAlignment == FileAlignment == 0x200 and three 0x200-byte sections whose raw
     data are out of order: .s1 -> file 0x400, .s2 -> 0xa00, .s3 -> 0x800 (virtual 0x1000, 0x1200, 0x1400).
     rizin 0.9.1 maps them side by side with no zero-filled room between them (measured). Each section's data
-    is its own name repeated, so a byte says where it came from."""
+    is its own name repeated, so a byte says where it came from. With ``overlap`` .s2 is at virtual 0x1000 as
+    well, over .s1, and .s3 at 0x1200: rizin maps both over the same addresses and reads through .s2."""
     import struct
 
     align, base = 0x200, 0x140000000
-    sections = [(b".s1", 0x1000, 0x400), (b".s2", 0x1200, 0xA00), (b".s3", 0x1400, 0x800)]
+    sections = [(b".s1", 0x1000, 0x400), (b".s2", 0x1000 if overlap else 0x1200, 0xA00),
+                (b".s3", 0x1200 if overlap else 0x1400, 0x800)]
     headers = b"MZ" + bytes(0x3A) + struct.pack("<I", 0x40)
     headers += b"PE\x00\x00" + struct.pack("<HHIIIHH", 0x8664, len(sections), 0, 0, 0, 240, 0x22)
     headers += struct.pack("<HBBIIIIIQ", 0x20B, 14, 0, 0x600, 0x600, 0, 0x1000, 0x1000, base)
@@ -6187,6 +6216,50 @@ def test_real_rizin_exports_only_what_one_map_of_the_file_holds(tdc, tmp_path, m
         other = api.open(result["path"], "tab2")["session"]
         api.wait_done(other, timeout=120)
         assert mgr.get(other).text("p8 0x600 @ 0x140001000") == session.text("p8 0x600 @ 0x140001000")
+        assert hashlib.sha256(exe.read_bytes()).hexdigest() == hashlib.sha256(original).hexdigest()
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
+def test_real_rizin_does_not_export_into_a_map_it_does_not_show(tdc, tmp_path, monkeypatch):
+    """Sections that overlap in memory: rizin lists both maps and reads through the later one (`oml.j`,
+    `px`). A patch there goes into the cache and shows, but the first map that holds it is .s1's, whose data
+    rizin does not show at those addresses: written there, the copy would not have the patch at all."""
+    import rizin_sessions
+
+    allowed, uploads = tmp_path / "allowed", tmp_path / "uploads"
+    allowed.mkdir()
+    exe = _build_scrambled_pe(allowed / "overlap.exe", overlap=True)
+    original = exe.read_bytes()
+    monkeypatch.setattr(rizin_sessions, "RIZIN_EXE", REAL_RIZIN)
+    monkeypatch.setattr(tdc, "_readable_roots", lambda: [str(allowed), str(uploads)])
+    monkeypatch.setattr(tdc, "RIZIN_UPLOAD_DIR", str(uploads))
+    mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(tmp_path / "projects"))
+    monkeypatch.setattr(tdc, "_rizin_manager", mgr)
+    monkeypatch.setattr(tdc, "_rizin_install", {"key": None, "value": None})
+    api = _Api(tdc, None, mgr, tmp_path)
+    try:
+        sid = api.open(str(exe))["session"]
+        api.wait_done(sid, timeout=120)
+        session = mgr.get(sid)
+        maps = {m["name"]: m for m in session.json("omlj") if m["name"].startswith("fmap..s")}
+        assert (maps["fmap..s1"]["from"], maps["fmap..s1"]["delta"]) == (0x140001000, 0x400)
+        assert (maps["fmap..s2"]["from"], maps["fmap..s2"]["delta"]) == (0x140001000, 0xA00), "the layout"
+        assert api.read(f"/api/rizin/{sid}/hex?addr=0x140001000&len=1")["paddr"] == 0xA00, "rizin shows .s2 there"
+
+        api.send(f"/api/rizin/{sid}/patch", {"addr": 0x140001000, "bytes": "ab" * 16})
+        assert api.read(f"/api/rizin/{sid}/hex?addr=0x140001000&len=2")["bytes"] == [0xAB, 0xAB]
+        refused = api.post(f"/api/rizin/{sid}/export", {})
+        assert refused.status_code == 400 and "0x140001000" in refused.get_json()["refused"], refused.get_json()
+        assert not uploads.exists() or not os.listdir(uploads)
+
+        api.send(f"/api/rizin/{sid}/patch", {"addr": 0x140001200, "bytes": "cd" * 16})  # .s3: one map, file 0x800
+        result = api.send(f"/api/rizin/{sid}/export", {})
+        assert result["skipped"] == [0x140001000] and result["patched"] == 16
+        expected = bytearray(original)
+        expected[0x800:0x810] = b"\xcd" * 16
+        assert open(result["path"], "rb").read() == bytes(expected), "the skipped patch is in no part of the file"
         assert hashlib.sha256(exe.read_bytes()).hexdigest() == hashlib.sha256(original).hexdigest()
     finally:
         mgr.shutdown()

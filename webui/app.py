@@ -5884,31 +5884,41 @@ def _rizin_prune_uploads(keep):
 RIZIN_NOTE_SUFFIX = ".patch.txt"
 
 
-def _rizin_patch_paddr(opened, maps, row):
+def _rizin_patch_paddr(opened, maps, row, size):
     """The file offset of the patch `row`, or None where its bytes are not one run of the file.
 
-    `opened` is `ol.j` and `maps` `omlj`: one map of the opened file (its fd) has to hold **all** of the
-    row's bytes, and then the row's byte n is the file's byte at offset + n. Asking for the offsets of the
-    first byte and the last is not enough: a PE with SectionAlignment == FileAlignment and its raw data out
-    of order has side-by-side maps whose first and last byte are as far apart in the file as in memory
-    while the sections between them are somewhere else in the file (measured). A row that crosses into the
-    zero-filled room between two sections, into memory the emulation mapped, past the end of the map or of
-    the file, or that has no map at all, is None as well."""
+    `opened` is `ol.j`, `maps` `omlj` and `size` what the file is long: **exactly one map** of `maps` may
+    touch the row's bytes, it has to be a map of the opened file (its fd), and it has to hold all of them.
+    Then byte *n* of the row is the file's byte at the map's delta + (address - from) + *n*.
+
+    Two checks that look enough are not. The offsets of the first byte and of the last: a PE with
+    SectionAlignment == FileAlignment and its raw data out of order has side-by-side maps whose first and
+    last byte are as far apart in the file as in memory while the section between them is somewhere else.
+    And the first map that holds the row: where two maps cover the same addresses rizin reads through the
+    topmost (`oml.j` and `px` answer it), which `omlj` does not say, so the row would be written where
+    rizin does not show it (both measured). With only one map over the bytes, that is the topmost.
+
+    A row in the zero-filled room past a section's data, in memory the emulation mapped, in no map, across
+    two maps, or past the end of the map or of the file is None as well."""
     def number(value):
         return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
 
-    fd, size = number(opened.get("fd")), number(opened.get("size"))
     addr, end = row["addr"], row["addr"] + row["size"]
+    touching = []
     for m in maps:
-        if not isinstance(m, dict) or fd is None or number(m.get("fd")) != fd:
-            continue
-        start, stop, delta = number(m.get("from")), number(m.get("to")), number(m.get("delta"))
-        if start is None or stop is None or delta is None or not start <= addr or end > stop:
-            continue
-        paddr = delta + addr - start
-        if size is None or paddr + row["size"] <= size:
-            return paddr
-    return None
+        if isinstance(m, dict) and number(m.get("from")) is not None and number(m.get("to")) is not None \
+                and m["from"] < end and m["to"] > addr:
+            touching.append(m)
+    fd = number(opened.get("fd"))
+    if len(touching) != 1 or fd is None:
+        return None
+    m = touching[0]
+    delta = number(m.get("delta"))
+    if number(m.get("fd")) != fd or delta is None or m["from"] > addr or end > m["to"]:
+        return None
+    paddr = delta + addr - m["from"]
+    sizes = [n for n in (number(opened.get("size")), number(size)) if n is not None]
+    return paddr if sizes and paddr + row["size"] <= min(sizes) else None
 
 
 def _rizin_note_bytes(hexdigits, shown=32):
@@ -5961,7 +5971,7 @@ def _rizin_export(session):
         raise ValueError("ol.j or omlj did not answer what it should")
     placed, skipped = [], []
     for row in mine:
-        paddr = _rizin_patch_paddr(opened, maps, row)
+        paddr = _rizin_patch_paddr(opened, maps, row, session.size)
         if paddr is None:
             skipped.append(row)
         else:
