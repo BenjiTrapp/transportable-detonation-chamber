@@ -486,3 +486,237 @@ def string_hits(found):
                 and not isinstance(hit["size"], bool)):
             raise ValueError("/zj did not answer a list of string hits")
     return len(found)
+
+
+# --- The API-call assistant ------------------------------------------------
+#
+# ESIL emulates no Windows API: a `call` into VirtualAlloc runs into unmapped memory (measured). The
+# assistant names the API behind such a call, offers a value for the return register and knows what
+# else a skip has to do -- a buffer to map, a copy to make, and at 32-bit stdcall the stack the callee
+# would have cleared. Everything here is arithmetic over rizin's answers; rizin_sessions runs the
+# commands.
+
+# The one arch the assistant covers, as rizin names it (``bin.arch`` of ij, and the session's ``arch``).
+ASSIST_ARCH = "x86"
+# At most this many arguments a stack correction covers: the widest call in the table takes eight, and
+# a correction that comes from a request is held to the same number (an unbounded one would move the
+# stack pointer out of the stack and the state would show words that are no stack).
+ASSIST_MAX_ARGS = 16
+# Where the assistant's own memory goes. Clear of a PE's image (0x140000000 for a 64-bit one, 0x400000
+# for a 32-bit one) and of the stack aeim maps (0x100000), and inside 32 bits, so that a 32-bit register
+# can hold it. The address is searched for in omlj's maps rather than fixed (free_span): the file's
+# maps, the stack and a buffer an earlier call was given are all in there, and the second VirtualAlloc
+# of a run must not be handed the first one's memory.
+ASSIST_ADDR = 0x50000000
+ASSIST_STEP = 0x100000
+ASSIST_TRIES = 64
+# A buffer is the size the call asked for, rounded up to a page, between these two. The maximum bounds
+# what one aeim allocates on the VM's 8 GB; an unpacker's allocation is far below it, and a size above
+# it means the arguments were read wrong, so then nothing is offered.
+ASSIST_BUFFER_MIN = 0x1000
+ASSIST_BUFFER_MAX = 16 * 1024 * 1024
+# A pseudo handle and a pseudo address: recognisable at a glance in a register or a stack word, and in
+# no map, so a run that calls or reads one stops with a trap instead of running on through nothing.
+ASSIST_HANDLE = 0x6D000000
+ASSIST_PSEUDO = 0x6E000000
+ASSIST_SPACING = 0x10000
+# GetTickCount and friends: a machine that has been up for a while, and a step of one scheduler tick
+# (GetTickCount's own resolution is about 15.6 ms), so that a timing check sees time pass without a
+# jump that would look like a debugger.
+TICK_START = 0x100000
+TICK_STEP = 0x10
+# The most bytes one copy of the assistant moves: one ``wx``, as a patch is bounded to.
+ASSIST_COPY_MAX = MAX_PATCH_BYTES
+# The name aeim gives the assistant's buffers (``mem.assist`` in omlj).
+ASSIST_MAP_NAME = "assist"
+
+# What a row of API_TABLE answers in the return register:
+#   "buffer"   a freshly mapped buffer, its address in the return register; ``size_arg`` says which
+#              argument is its size
+#   "handle"   a recognisable pseudo handle (a module, a heap): nothing is ever read through it
+#   "address"  the address the file knows for the name the call asks for, else a pseudo address
+#   "copy"     the call really copies in the ESIL memory map and returns its destination
+#   "tick"     a rising millisecond counter
+#   "zero"     0: "not found", "not being watched"
+#   "success"  1: the call reports success, and writes nothing to its out-parameters
+#   "none"     the call has no return value; a skip only corrects the stack
+ANSWERS = ("buffer", "handle", "address", "copy", "tick", "zero", "success", "none")
+
+# The assistant's table: **data, not code**, so that it grows without a change here (the spec asks for
+# that). Per row: the convention (which 64 bits ignores, where everything is Microsoft x64), how many
+# arguments the call takes (the stack correction at 32-bit stdcall), what it answers, and for a buffer
+# which argument is the size. The groups are the spec's: memory, memory protection, loader, anti-debug,
+# time, environment, copying. The table answers like a clean, unobserved machine -- that is the
+# anti-VM bypass, and it needs no patch.
+API_TABLE = {
+    # Memory
+    "VirtualAlloc": {"conv": "stdcall", "args": 4, "ret": "buffer", "size_arg": 1},
+    "VirtualAllocEx": {"conv": "stdcall", "args": 5, "ret": "buffer", "size_arg": 2},
+    "HeapAlloc": {"conv": "stdcall", "args": 3, "ret": "buffer", "size_arg": 2},
+    "HeapCreate": {"conv": "stdcall", "args": 3, "ret": "handle"},
+    "LocalAlloc": {"conv": "stdcall", "args": 2, "ret": "buffer", "size_arg": 1},
+    "GlobalAlloc": {"conv": "stdcall", "args": 2, "ret": "buffer", "size_arg": 1},
+    "VirtualFree": {"conv": "stdcall", "args": 3, "ret": "success"},
+    "HeapFree": {"conv": "stdcall", "args": 3, "ret": "success"},
+    "malloc": {"conv": "cdecl", "args": 1, "ret": "buffer", "size_arg": 0},
+    "free": {"conv": "cdecl", "args": 1, "ret": "none"},
+    # Memory protection
+    "VirtualProtect": {"conv": "stdcall", "args": 4, "ret": "success"},
+    "VirtualProtectEx": {"conv": "stdcall", "args": 5, "ret": "success"},
+    "FlushInstructionCache": {"conv": "stdcall", "args": 3, "ret": "success"},
+    # Loader
+    "LoadLibrary": {"conv": "stdcall", "args": 1, "ret": "handle"},
+    "LoadLibraryEx": {"conv": "stdcall", "args": 3, "ret": "handle"},
+    "GetModuleHandle": {"conv": "stdcall", "args": 1, "ret": "handle"},
+    "GetModuleHandleEx": {"conv": "stdcall", "args": 3, "ret": "success"},
+    "GetProcAddress": {"conv": "stdcall", "args": 2, "ret": "address"},
+    # Anti-debug
+    "IsDebuggerPresent": {"conv": "stdcall", "args": 0, "ret": "zero"},
+    "CheckRemoteDebuggerPresent": {"conv": "stdcall", "args": 2, "ret": "zero"},
+    "NtQueryInformationProcess": {"conv": "stdcall", "args": 5, "ret": "zero"},
+    "OutputDebugString": {"conv": "stdcall", "args": 1, "ret": "none"},
+    # Time
+    "GetTickCount": {"conv": "stdcall", "args": 0, "ret": "tick"},
+    "GetTickCount64": {"conv": "stdcall", "args": 0, "ret": "tick"},
+    "timeGetTime": {"conv": "stdcall", "args": 0, "ret": "tick"},
+    "QueryPerformanceCounter": {"conv": "stdcall", "args": 1, "ret": "success"},
+    "QueryPerformanceFrequency": {"conv": "stdcall", "args": 1, "ret": "success"},
+    "GetSystemTimeAsFileTime": {"conv": "stdcall", "args": 1, "ret": "none"},
+    "Sleep": {"conv": "stdcall", "args": 1, "ret": "none"},
+    # Environment
+    "GetComputerName": {"conv": "stdcall", "args": 2, "ret": "success"},
+    "GetUserName": {"conv": "stdcall", "args": 2, "ret": "success"},
+    "GetVolumeInformation": {"conv": "stdcall", "args": 8, "ret": "success"},
+    "GetSystemInfo": {"conv": "stdcall", "args": 1, "ret": "none"},
+    "GetEnvironmentVariable": {"conv": "stdcall", "args": 3, "ret": "zero"},
+    # Copying
+    "memcpy": {"conv": "cdecl", "args": 3, "ret": "copy", "size_arg": 2},
+    "memmove": {"conv": "cdecl", "args": 3, "ret": "copy", "size_arg": 2},
+    "RtlMoveMemory": {"conv": "stdcall", "args": 3, "ret": "copy", "size_arg": 2},
+    "RtlCopyMemory": {"conv": "stdcall", "args": 3, "ret": "copy", "size_arg": 2},
+}
+_API_INDEX = {name.casefold(): dict(row, name=name) for name, row in API_TABLE.items()}
+# What stands in front of the name of an import as a file gives it, and what a 32-bit build decorates it
+# with: "sym.imp.KERNEL32.dll_Sleep" and "KERNEL32.dll_LoadLibraryW" (both measured on mingw builds),
+# rizin's "sym._memcpy" for a CRT function, and stdcall's "_Sleep@4".
+_API_PREFIX = re.compile(r"^(?:sym\.)?(?:imp\.)?")
+_API_MODULE = re.compile(r"^[A-Za-z0-9_.\-]{1,64}\.dll_", re.IGNORECASE)
+_API_DECORATION = re.compile(r"@[0-9]{1,3}$")
+
+
+def lookup_api(name):
+    """The row of API_TABLE for the name of a call's target, with its own ``name``, or None.
+
+    The flag prefix, the module prefix, one leading underscore and a stdcall decoration come off, and
+    the ANSI/Unicode pair (``...A``/``...W``) is one row -- but only where the full name is not a row
+    itself, so that a row whose own name ends in A or W would never be mangled.
+    """
+    if not isinstance(name, str):
+        return None
+    key = _API_MODULE.sub("", _API_PREFIX.sub("", name.strip()))
+    key = _API_DECORATION.sub("", key).lstrip("_").casefold()
+    for candidate in (key, key[:-1] if key[-1:] in ("a", "w") else key):
+        found = _API_INDEX.get(candidate)
+        if found is not None:
+            return dict(found)
+    return None
+
+
+def convention(arch, bits, api):
+    """How the call at hand takes its arguments and gives its answer, or **None** where the assistant
+    switches itself off: ``ret_reg``, ``arg_regs``, ``stack_args``, ``callee_pops``, ``word``, and
+    ``conv``, the convention in force (None at 32 bits where the table does not know the call).
+
+    None for anything but x86 at 32 or 64 bits (ARM, a dump of mixed code). There the assistant offers
+    nothing and says so; emulation, breakpoints and patching keep working. Guessing a return register
+    would be the "the surface lies" anti-goal.
+
+    At 64 bits every Win32 and CRT call is Microsoft x64: the first four arguments in rcx, rdx, r8 and
+    r9, the answer in rax, and the **caller** clears the stack. At 32 bits the arguments are on the
+    stack, and the convention says who clears it: the Win32 API is stdcall, where the callee does (see
+    stack_fix), while the CRT's memcpy and friends are cdecl, where the caller does. Without a row of
+    the table nothing is known to clear, so ``callee_pops`` is false.
+    """
+    if arch != ASSIST_ARCH or bits not in (32, 64):
+        return None
+    if bits == 64:
+        return {"conv": "win64", "ret_reg": "rax", "arg_regs": ("rcx", "rdx", "r8", "r9"),
+                "stack_args": False, "callee_pops": False, "word": 8}
+    conv = (api or {}).get("conv")
+    return {"conv": conv, "ret_reg": "eax", "arg_regs": (), "stack_args": True,
+            "callee_pops": conv == "stdcall", "word": 4}
+
+
+def stack_fix(conv, args):
+    """How many bytes to add to the stack pointer after a skipped call: the arguments the callee would
+    have cleared, and 0 where the caller clears them.
+
+    Review Focus 1: a 32-bit stdcall callee ends in ``ret <n>``, which takes its arguments off the
+    stack. Skipping the call takes nothing off, so without this the stack stays that much too deep and
+    every later step reads and writes beside the truth -- while the surface shows a stack that looks
+    fine. win64 and cdecl are the other way round, and there nothing may be added.
+    """
+    if not isinstance(conv, dict) or not conv.get("callee_pops"):
+        return 0
+    if not isinstance(args, int) or isinstance(args, bool) or not 0 <= args <= ASSIST_MAX_ARGS:
+        return 0
+    return args * conv["word"]
+
+
+def _map_rows(maps):
+    return [m for m in maps if isinstance(m, dict) and isinstance(m.get("from"), int)
+            and isinstance(m.get("to"), int)] if isinstance(maps, list) else []
+
+
+def span_is_free(maps, addr, size):
+    """Whether ``size`` bytes from ``addr`` lie in none of ``omlj``'s maps: there and only there may the
+    assistant map a buffer, so that it covers neither the file nor the emulation's stack."""
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        return False
+    return all(addr + size <= m["from"] or m["to"] <= addr for m in _map_rows(maps))
+
+
+def free_span(maps, size, base=ASSIST_ADDR, step=ASSIST_STEP, tries=ASSIST_TRIES):
+    """An address where ``size`` bytes collide with no map of ``omlj``, searched from ``base`` upwards
+    in steps of ``step``; None when ``tries`` of them are all taken or the search would leave 32 bits
+    (where a 32-bit register could not hold the answer)."""
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        return None
+    for i in range(max(tries, 0)):
+        addr = base + i * step
+        if addr + size > 2 ** 32:
+            return None
+        if span_is_free(maps, addr, size):
+            return addr
+    return None
+
+
+def buffer_size(value):
+    """The size to map for a buffer the call asked for: ``value`` rounded up to a page, at least
+    ASSIST_BUFFER_MIN; None for what is no size or is above ASSIST_BUFFER_MAX -- then nothing is
+    offered and the summary says so, rather than gigabytes being mapped on a size read wrong."""
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 < value <= ASSIST_BUFFER_MAX:
+        return None
+    pages = (value + ASSIST_BUFFER_MIN - 1) // ASSIST_BUFFER_MIN
+    return max(ASSIST_BUFFER_MIN, pages * ASSIST_BUFFER_MIN)
+
+
+_EXPORT_NAME = re.compile(r"[A-Za-z0-9_@?$.]{1,64}")
+
+
+def read_cstring(data):
+    """The name at a pointer, from ``pxj``'s bytes: what stands before the first NUL, if that is a name
+    a file may give an export (letters, digits and ``_ @ ? $ .``); None for anything else, a run of
+    bytes without a NUL in reach among it.
+
+    It is only ever compared with the file's own import names (GetProcAddress) and shown in the
+    summary; nothing of it ever goes into a rizin command.
+    """
+    if not isinstance(data, list) or not all(isinstance(b, int) and 0 <= b < 256 for b in data):
+        return None
+    try:
+        text = bytes(data[:data.index(0)]).decode("ascii")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return text if _EXPORT_NAME.fullmatch(text) else None
+

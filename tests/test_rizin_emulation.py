@@ -1,5 +1,7 @@
 """The emulation's pure logic (webui/rizin_emulation.py), without rizin."""
 
+import re
+
 import pytest
 
 import rizin_emulation
@@ -463,3 +465,125 @@ def test_the_string_pattern_searches_for_printable_runs():
     for allowed in ("af @ 0x1000", "af- @ 0x1000", "aflc"):
         assert check_console_command(allowed) is None, allowed
     assert check_console_command("aa") == "whole-program analysis runs from the Full analysis button"
+
+
+# --- The API-call assistant (the table, the conventions, the stack fix) -----
+
+def test_lookup_api_strips_prefixes_and_the_ansi_suffix():
+    for name in ("sym.imp.KERNEL32.dll_VirtualAlloc", "VirtualAlloc", "sym.imp.LoadLibraryA",
+                 "KERNEL32.dll_LoadLibraryW"):
+        assert rizin_emulation.lookup_api(name) is not None, name
+    assert rizin_emulation.lookup_api("sym.imp.nothing_like_this") is None
+    # the row names itself, so a summary can say which API it is
+    assert rizin_emulation.lookup_api("sym.imp.KERNEL32.dll_virtualalloc")["name"] == "VirtualAlloc"
+    assert rizin_emulation.lookup_api("KERNEL32.dll_LoadLibraryW")["name"] == "LoadLibrary"
+    # what rizin names an import on a 32-bit build: sym._memcpy, and stdcall's @<argument bytes>
+    assert rizin_emulation.lookup_api("sym._memcpy")["name"] == "memcpy"
+    assert rizin_emulation.lookup_api("sym.imp.KERNEL32.dll_Sleep@4")["name"] == "Sleep"
+    # a name that is only a prefix, a name that merely starts with one of the table's, and no name
+    for name in ("sym.imp.", "", "GetTickCount64_and_more", "myVirtualAlloc", None, 7, b"Sleep"):
+        assert rizin_emulation.lookup_api(name) is None, name
+    assert rizin_emulation.lookup_api("GetTickCount64")["ret"] == "tick"
+
+
+def test_convention_picks_the_return_register_per_arch():
+    assert rizin_emulation.convention("x86", 64, None)["ret_reg"] == "rax"
+    assert rizin_emulation.convention("x86", 32, None)["ret_reg"] == "eax"
+    assert rizin_emulation.convention("arm", 64, None) is None
+    # the assistant covers x86-32 and x86-64 and nothing else: everywhere else it switches off
+    for arch, bits in (("arm", 32), ("mips", 32), ("x86", 16), ("x86", None), (None, 64), ("X86", 64)):
+        assert rizin_emulation.convention(arch, bits, None) is None, (arch, bits)
+    win64 = rizin_emulation.convention("x86", 64, rizin_emulation.lookup_api("VirtualAlloc"))
+    assert win64["arg_regs"] == ("rcx", "rdx", "r8", "r9") and win64["word"] == 8
+    assert win64["stack_args"] is False and win64["callee_pops"] is False, "the caller clears the stack"
+    std32 = rizin_emulation.convention("x86", 32, rizin_emulation.lookup_api("VirtualAlloc"))
+    assert std32["stack_args"] is True and std32["callee_pops"] is True and std32["word"] == 4
+    assert std32["arg_regs"] == ()
+    # without a row of the table nothing is known to clear the stack, so nothing is cleared
+    assert rizin_emulation.convention("x86", 32, None)["callee_pops"] is False
+
+
+def test_stack_fix_only_applies_to_stdcall():
+    # Review Focus 1: a 32-bit stdcall callee pops its arguments. Skipping the call with
+    # aess pops nothing, so without this the stack stays too deep and every later step
+    # computes on a corrupt stack.
+    win64 = rizin_emulation.convention("x86", 64, rizin_emulation.lookup_api("VirtualAlloc"))
+    std32 = rizin_emulation.convention("x86", 32, rizin_emulation.lookup_api("VirtualAlloc"))
+    cdecl32 = rizin_emulation.convention("x86", 32, rizin_emulation.lookup_api("memcpy"))
+    assert rizin_emulation.stack_fix(win64, 4) == 0
+    assert rizin_emulation.stack_fix(std32, 4) == 16
+    assert rizin_emulation.stack_fix(cdecl32, 3) == 0
+    # a call without arguments corrects nothing, and no argument count is taken on trust
+    assert rizin_emulation.stack_fix(std32, 0) == 0
+    for args in (None, -1, True, 1.5, "4", rizin_emulation.ASSIST_MAX_ARGS + 1):
+        assert rizin_emulation.stack_fix(std32, args) == 0, args
+    assert rizin_emulation.stack_fix(None, 4) == 0
+
+
+def test_the_api_table_is_data_in_one_shape():
+    """The spec asks for a table that grows without a code change, so every row is a name and the same
+    four fields, and every answer is one the assistant can actually build."""
+    for name, api in rizin_emulation.API_TABLE.items():
+        assert re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name), name
+        assert set(api) <= {"conv", "args", "ret", "size_arg"}, name
+        assert api["conv"] in ("win64", "stdcall", "cdecl"), name
+        assert isinstance(api["args"], int) and 0 <= api["args"] <= rizin_emulation.ASSIST_MAX_ARGS, name
+        assert api["ret"] in rizin_emulation.ANSWERS, name
+        if api["ret"] in ("buffer", "copy"):
+            assert 0 <= api["size_arg"] < api["args"], name
+        else:
+            assert "size_arg" not in api, name
+        assert rizin_emulation.lookup_api(name)["name"] == name
+    # the seven groups of the spec's table are in it
+    for name in ("VirtualAlloc", "HeapAlloc", "malloc", "VirtualProtect", "LoadLibrary",
+                 "GetModuleHandle", "GetProcAddress", "IsDebuggerPresent", "GetTickCount",
+                 "GetComputerName", "GetUserName", "memcpy", "memmove", "RtlMoveMemory"):
+        assert name in rizin_emulation.API_TABLE, name
+    # the Win32 calls are stdcall (which 64 bits ignores) and the CRT ones cdecl
+    assert rizin_emulation.API_TABLE["VirtualAlloc"]["conv"] == "stdcall"
+    assert [rizin_emulation.API_TABLE[n]["conv"] for n in ("memcpy", "memmove", "malloc")] == ["cdecl"] * 3
+
+
+def test_free_span_keeps_clear_of_the_file_and_the_stack():
+    """A buffer the assistant hands out must collide with neither the file's maps nor the stack, and a
+    second allocation must not be handed the first one's memory -- which is why it is searched for in
+    omlj's maps rather than fixed."""
+    base, step = rizin_emulation.ASSIST_ADDR, rizin_emulation.ASSIST_STEP
+    assert rizin_emulation.free_span(MAPS, 0x1000) == base
+    assert rizin_emulation.free_span([], 0x1000) == base
+    assert rizin_emulation.free_span(None, 0x1000) == base
+    taken = [{"from": base, "to": base + 0x1000, "perm": "rw-", "name": "mem.assist"}]
+    assert rizin_emulation.free_span(taken, 0x1000) == base + step
+    assert rizin_emulation.free_span(taken + [{"from": base + step, "to": base + 2 * step}],
+                                     0x1000) == base + 2 * step
+    # a span that reaches into the next map is no free span
+    assert rizin_emulation.free_span([{"from": base + 0x800, "to": base + 0x900}], 0x1000) == base + step
+    # nothing free in reach, and a size that is no size
+    everything = [{"from": 0, "to": 2 ** 64 - 1}]
+    assert rizin_emulation.free_span(everything, 0x1000) is None
+    for size in (0, -1, None, True, 1.5, 2 ** 32):
+        assert rizin_emulation.free_span(MAPS, size) is None, size
+    assert rizin_emulation.span_is_free(MAPS, base, 0x1000) is True
+    assert rizin_emulation.span_is_free(MAPS, 0x140000000, 1) is False      # the file
+    assert rizin_emulation.span_is_free(MAPS, 0x1EFFFF, 1) is False         # the stack
+    assert rizin_emulation.span_is_free(MAPS, 0x13FFFFFFF, 2) is False      # reaches into the file
+
+
+def test_buffer_size_rounds_up_to_a_page_and_is_bounded():
+    page, most = rizin_emulation.ASSIST_BUFFER_MIN, rizin_emulation.ASSIST_BUFFER_MAX
+    assert rizin_emulation.buffer_size(1) == page and rizin_emulation.buffer_size(page) == page
+    assert rizin_emulation.buffer_size(page + 1) == 2 * page
+    assert rizin_emulation.buffer_size(most) == most
+    # what is no size, and a size above the maximum: nothing is offered rather than gigabytes mapped
+    for size in (0, -1, most + 1, 2 ** 64 - 1, None, True, 1.5, "0x1000"):
+        assert rizin_emulation.buffer_size(size) is None, size
+
+
+def test_read_cstring_takes_the_name_before_the_first_nul():
+    assert rizin_emulation.read_cstring(list(b"Sleep\0rest")) == "Sleep"
+    assert rizin_emulation.read_cstring(list(b"GetProcAddress")) is None, "no NUL in reach"
+    # only what a file may name an export; nothing of it ever goes into a command
+    for data in (b"", b"\0", b"a b\0", b"a;wci\0", b"\x80\x81\0", b"-" * 80 + b"\0"):
+        assert rizin_emulation.read_cstring(list(data)) is None, data
+    assert rizin_emulation.read_cstring("Sleep\0") is None and rizin_emulation.read_cstring(None) is None
+    assert rizin_emulation.read_cstring([0x41, 300, 0]) is None, "pxj answers bytes"

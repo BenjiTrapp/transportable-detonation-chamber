@@ -33,6 +33,11 @@ Environment:
   FAKE_RIZIN_EXTRA_FUNCTION  "<addr>:<name>[,...]": functions rizin only knows once something has
                     analysed the bytes there. ``af`` reveals them, and with analysis.limits on only
                     those inside [analysis.from, analysis.to) -- the way rizin bounds af's recursion
+  FAKE_RIZIN_ARCH   the arch ``ij`` and ``e asm.arch`` report (default x86); the API assistant covers
+                    x86 only and switches itself off for any other
+  FAKE_RIZIN_ASSIST  set: the calls into the imports the API assistant answers for (see ASSIST_OPS),
+                    with their flags and import entries. They are behind a variable of their own
+                    because the flag and import lists of the default model are counted in tests
 
 Like rizin 0.9.1 it dies on ``aflj`` once a project with DWARF variable
 origins has been loaded (see rizin_sessions._sanitize_project), and ``Poo``
@@ -47,6 +52,12 @@ shows, reads (by name or the roles PC and SP) and sets the registers; before
 reads the stack, ``omlj`` lists it with the file's maps. ``fd`` describes the
 closest flag below an address, ``fd.j`` lists the flags at it; like rizin's
 aei, an armed VM has a flag per register at its value.
+
+A second ``aeim`` with arguments maps that region **and moves the VM** into
+it: the PC goes to the seek and the stack and base pointer to the middle of
+the new map, while the map made before stays (all measured on rizin 0.9.1).
+That is why the API assistant reads those three registers before it maps a
+buffer and writes them back afterwards.
 
 The write cache (``wx``, ``wcj``, ``wc-``, ``wc-*``; see write_cache) holds
 the patches *and* what the emulation writes, as rizin's one cache does, and
@@ -94,6 +105,9 @@ for part in filter(None, os.environ.get("FAKE_RIZIN_SLOW", "").split(",")):
     SLOW[name] = float(seconds)
 CRASH = os.environ.get("FAKE_RIZIN_CRASH")
 GHIDRA = not os.environ.get("FAKE_RIZIN_NO_GHIDRA")
+BITS = 32 if os.environ.get("FAKE_RIZIN_BITS") == "32" else 64
+ARCH = os.environ.get("FAKE_RIZIN_ARCH") or "x86"
+ASSIST = bool(os.environ.get("FAKE_RIZIN_ASSIST"))
 
 FUNCTIONS = [] if os.environ.get("FAKE_RIZIN_NO_CODE") else [
     {"offset": 0x140001440, "name": "entry0", "size": 29, "nbbs": 1},
@@ -115,6 +129,11 @@ SLEEP, PIPE, THREAD = 0x1400093A8, 0x1400093B0, 0x140009340
 FLAGS = {"sym.imp.KERNEL32.dll_Sleep": SLEEP, "sym.imp.KERNEL32.dll_CreateNamedPipeA": PIPE,
          "str.child": 0x140005014}
 BASE, MAPPED_END = 0x140000000, 0x14000A000
+# A 32-bit island (FAKE_RIZIN_BITS=32): the model's addresses need 33 bits, which no 32-bit register
+# holds, so the x86-32 mode gets code and import slots of its own, at the addresses a PE32 uses. The
+# calls there are `call dword [<slot>]`, which rizin 0.9.1 types **ucall** (and skips with aess), while
+# the 64-bit `call qword [rip+..]` is an ircall -- both measured on mingw builds of tests/samples.
+BASE32, MAPPED32_END = 0x401000, 0x408000
 IMAGE = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00" + bytes(range(256)) * 4
 # The maps as "oml.j @ addr" shows them: parts of the opened file (fd 3, at delta) and a zero-filled part
 # past .text's data (fd 4, like rizin's null:// maps); nothing else is mapped to the file
@@ -126,6 +145,12 @@ MAPS = [{"map": i + 1, "fd": fd, "delta": delta, "from": start, "to": end,
             (4, 0, 0x140003000, 0x140004000, "mmap..text"),
             (3, 0x2400, 0x140005000, 0x140006000, "fmap..rdata"),
             (3, 0x3400, 0x140009000, MAPPED_END, "fmap..idata")))]
+if BITS == 32:
+    # the island's own maps, as a PE32's are: its code executes, its import table does not
+    MAPS += [{"map": len(MAPS) + 1, "fd": 3, "delta": 0x400, "from": BASE32, "to": 0x402000,
+              "perm": "r-x", "name": "fmap..text32"},
+             {"map": len(MAPS) + 2, "fd": 3, "delta": 0x1400, "from": 0x407000, "to": MAPPED32_END,
+              "perm": "r--", "name": "fmap..idata32"}]
 
 
 def _op(offset, size, text, kind, jump=None, fail=None, ptr=None, data=None):
@@ -201,6 +226,28 @@ DECRYPT_END = DECRYPT_AT + DECRYPT_SIZE * 7
 LOOSE_OPS += [_op(DECRYPT_AT + i * 7, 7, f"xor byte [{DECRYPT_TARGET + i:#x}], {DECRYPT_KEY:#x}", "xor",
                   ptr=DECRYPT_TARGET + i) for i in range(DECRYPT_SIZE)]
 LOOSE_OPS.append(_op(DECRYPT_END, 1, "ret", "ret"))
+# The calls the API assistant answers for. One import per answer its table can give, each with its flag
+# and its import entry, so that a session can be stepped onto the call and skipped. They are behind
+# FAKE_RIZIN_ASSIST because the flag and import lists of the default model are counted in tests.
+# At 64 bits (ASSIST_AT upwards, inside .text, where the PC may execute) they are `call qword [slot]`,
+# which rizin types ircall; at 32 bits (the island) `call dword [slot]`, which it types ucall.
+ASSIST_AT, ASSIST_SLOT = 0x140002900, 0x1400093C0
+ASSIST_IMPORTS = ("VirtualAlloc", "memcpy", "GetTickCount", "IsDebuggerPresent", "GetProcAddress")
+ASSIST32_AT, ASSIST32_SLOT = BASE32, 0x40723C
+ASSIST32_IMPORTS = ("Sleep", "VirtualAlloc", "CreateNamedPipeA", "LoadLibraryA", "VirtualProtect")
+ASSIST_OPS, ASSIST_TABLE = [], []
+if ASSIST or BITS == 32:
+    _at, _slot = (ASSIST32_AT, ASSIST32_SLOT) if BITS == 32 else (ASSIST_AT, ASSIST_SLOT)
+    _width, _kind = ("dword", "ucall") if BITS == 32 else ("qword", "ircall")
+    for _i, _name in enumerate(ASSIST32_IMPORTS if BITS == 32 else ASSIST_IMPORTS):
+        _lib = "msvcrt.dll" if _name == "memcpy" else "KERNEL32.dll"
+        _flag, _plt = f"sym.imp.{_lib}_{_name}", _slot + _i * 8
+        FLAGS[_flag] = _plt
+        ASSIST_TABLE.append((_name, _lib, _plt))
+        ASSIST_OPS.append(_op(_at + _i * 6, 6, f"call {_width} [{_flag}]", _kind, ptr=_plt))
+    ASSIST_OPS.append(_op(_at + len(ASSIST_TABLE) * 6, 1, "ret", "ret"))
+    LOOSE_OPS += ASSIST_OPS
+    del _at, _slot, _width, _kind, _i, _name, _lib, _flag, _plt
 XREFS = [{"from": src, "to": dst, "type": kind} for src, dst, kind in (
     (0x140001444, 0x1400014B7, "CALL"),
     (0x140001499, SLEEP, "CALL"),
@@ -231,6 +278,12 @@ IIJ = [{"ordinal": ordinal, "bind": "NONE", "type": "FUNC", "name": name, "libna
     (9, "Sleep", "KERNEL32.dll", SLEEP),
     (2, "strcmp", "msvcrt.dll", 0x1400094F0),
 )]
+# The imports the assistant's calls go to (see ASSIST_OPS), where the model has them: an import is in
+# the import table as well as in the flags, which is how GetProcAddress of a name the file imports can
+# be answered with the address the table gives for it.
+IIJ += [{"ordinal": 20 + i, "bind": "NONE", "type": "FUNC", "name": name, "libname": lib, "plt": plt}
+        for i, (name, lib, plt) in enumerate(ASSIST_TABLE)
+        if not any(entry["name"] == name for entry in IIJ)]
 # rz-ghidra's C for sym.main: (line, [(token, address)]) -> pdgj's code and offset annotations.
 CODE = [
     ("int sym.main(int argc, char **argv)", []),
@@ -245,7 +298,7 @@ CODE = [
 
 state = {"seek": 0x140001440, "names": {}, "comments": {}, "prj": "", "dwarf": False, "hints": {}, "bps": {},
          "cache": [], "hits": {},
-         "config": {"asm.arch": "x86", "analysis.arch": "x86", "bin.lang": "c", "analysis.autoname": "false",
+         "config": {"asm.arch": ARCH, "analysis.arch": ARCH, "bin.lang": "c", "analysis.autoname": "false",
                     "analysis.apply.signature": "true", "analysis.calls": "false",
                     "analysis.limits": "false", "analysis.from": "0xffffffffffffffff",
                     "analysis.to": "0xffffffffffffffff",
@@ -254,7 +307,6 @@ state = {"seek": 0x140001440, "names": {}, "comments": {}, "prj": "", "dwarf": F
                     "io.cache": "false", "esil.romem": "false", "esil.breakoninvalid": "false", "esil.stack.addr": "0x100000",
                     "esil.stack.size": "0xf0000"}}
 
-BITS = 32 if os.environ.get("FAKE_RIZIN_BITS") == "32" else 64
 if BITS == 64:
     REG_NAMES = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp"] + [f"r{i}" for i in range(8, 16)] + \
         ["rip", "rflags"]
@@ -262,8 +314,11 @@ if BITS == 64:
 else:
     REG_NAMES = ["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "eflags"]
     ROLES = {"PC": "eip", "SP": "esp", "BP": "ebp"}
-# The ESIL VM: regs is None until aei; stack is (addr, bytearray) while aeim's map is there.
-esil = {"regs": None, "stack": None}
+# The ESIL VM: regs is None until aei; stack is (addr, bytearray, name) while aeim's map is there, and
+# mapped holds the regions a later ``aeim <addr> <size> <name>`` added beside it (the API assistant's
+# buffers), newest last -- rizin 0.9.1 keeps the map it made before and ``aeim-`` drops the newest
+# (both measured).
+esil = {"regs": None, "stack": None, "mapped": []}
 ESIL_CAP = 200000  # steps of one run: past it the fake's code has run into nothing it models
 SEARCH_MAX = 0x10000  # bytes of a search range the model reads (a test's range is far smaller)
 ESIL_INVALID = "ERROR: core: esil: Stopped execution in an invalid instruction (see e??esil.breakoninvalid)\n"
@@ -344,7 +399,7 @@ def linear(addr, count):
     known = {op["offset"]: op for fn in FUNCTIONS for op in function_ops(fn)}
     known.update((op["offset"], with_comment(dict(op, fcn_addr=0, fcn_last=0))) for op in LOOSE_OPS)
     ops = []
-    while len(ops) < count and BASE <= addr < MAPPED_END:
+    while len(ops) < count and (BASE <= addr < MAPPED_END or (BITS == 32 and BASE32 <= addr < MAPPED32_END)):
         op = known.get(addr) or {"offset": addr, "size": 1, "opcode": "invalid", "disasm": "invalid",
                                  "bytes": f"{byte_at(addr):02x}", "type": "invalid", "fcn_addr": 0, "fcn_last": 0}
         ops.append(op)
@@ -356,9 +411,11 @@ def byte_at(addr):
     for entry in reversed(state["cache"]):  # the cache sits above every map: the newest write wins
         if entry["addr"] <= addr < entry["addr"] + entry["size"]:
             return bytes.fromhex(entry["after"])[addr - entry["addr"]]
-    stack = esil["stack"]
-    if stack and stack[0] <= addr < stack[0] + len(stack[1]):
-        return stack[1][addr - stack[0]]
+    for base, memory, _name in esil_maps():
+        if base <= addr < base + len(memory):
+            return memory[addr - base]
+    if BITS == 32 and BASE32 <= addr < MAPPED32_END:
+        return 0  # the 32-bit island: mapped and zero-filled, like a PE32's import table here
     if not BASE <= addr < MAPPED_END:
         return 0xFF  # like rizin's io.unalloc
     i = addr - BASE
@@ -421,8 +478,20 @@ def write_cache(word, rest, seek):
     return ""
 
 
+def esil_maps():
+    """Every region of the ESIL VM: the stack ``aeim`` mapped and the buffers a later one added."""
+    stack = esil["stack"]
+    return ([stack] if stack else []) + list(esil["mapped"])
+
+
 def esil_map_stack(args):
-    """``aeim [addr [size [name]]]``: arm the VM, map the stack, SP and BP in its middle, PC at the seek."""
+    """``aeim [addr [size [name]]]``: arm the VM and map a region.
+
+    Without arguments it is the stack: the one mapped before goes, the stack pointer and base pointer
+    sit in the middle of the new one and the PC at the seek. With arguments the region is mapped
+    **beside** the stack -- and rizin 0.9.1 moves the VM into it all the same: PC to the seek, SP and BP
+    into the middle of the new map (measured; it is why the assistant puts those three back itself).
+    """
     if esil["regs"] is None:
         esil["regs"] = dict.fromkeys(REG_NAMES, 0)
     addr = number(args[0]) if args else int(state["config"]["esil.stack.addr"], 0)
@@ -430,27 +499,29 @@ def esil_map_stack(args):
     memory = bytearray(size)
     sp = addr + size // 2
     word = BITS // 8
-    for i, text in enumerate(filter(None, os.environ.get("FAKE_RIZIN_STACK", "").split(","))):
-        value = int(text, 0) & (2 ** BITS - 1)
-        memory[size // 2 + i * word:size // 2 + (i + 1) * word] = value.to_bytes(word, "little")
+    if len(args) <= 2:  # the words of FAKE_RIZIN_STACK belong to the stack, not to a buffer
+        for i, text in enumerate(filter(None, os.environ.get("FAKE_RIZIN_STACK", "").split(","))):
+            value = int(text, 0) & (2 ** BITS - 1)
+            memory[size // 2 + i * word:size // 2 + (i + 1) * word] = value.to_bytes(word, "little")
     name = f"mem.{args[2]}" if len(args) > 2 else f"mem.{addr:#x}_{size:#x}"  # like get_esil_stack_name
-    esil["stack"] = (addr, memory, name)
+    if len(args) > 2:
+        esil["mapped"].append((addr, memory, name))
+    else:
+        esil["stack"] = (addr, memory, name)
     regs = esil["regs"]
     regs[ROLES["SP"]] = regs[ROLES["BP"]] = sp
     regs[ROLES["PC"]] = state["seek"]
 
 
 def esil_mapped(addr):
-    stack = esil["stack"]
-    if stack and stack[0] <= addr < stack[0] + len(stack[1]):
+    if any(base <= addr < base + len(memory) for base, memory, _name in esil_maps()):
         return True
     return any(m["from"] <= addr < m["to"] for m in MAPS)
 
 
 def esil_executable(addr):
-    stack = esil["stack"]
-    if stack and stack[0] <= addr < stack[0] + len(stack[1]):
-        return False  # aeim maps the stack rw-
+    if any(base <= addr < base + len(memory) for base, memory, _name in esil_maps()):
+        return False  # aeim maps rw-
     return any(m["from"] <= addr < m["to"] and "x" in m["perm"] for m in MAPS)
 
 
@@ -757,12 +828,11 @@ def flags_at(addr):
 
 
 def maps_json():
-    """``omlj``: the file's maps and aeim's stack."""
+    """``omlj``: the file's maps and the ESIL VM's (the stack, and the buffers mapped beside it)."""
     maps = list(MAPS)
-    if esil["stack"]:
-        addr, memory, name = esil["stack"]
-        maps.append({"map": len(MAPS) + 1, "fd": 5, "delta": 0, "from": addr, "to": addr + len(memory),
-                     "perm": "rw-", "name": name})
+    for addr, memory, name in esil_maps():
+        maps.append({"map": len(maps) + 1, "fd": 5 + len(maps) - len(MAPS), "delta": 0, "from": addr,
+                     "to": addr + len(memory), "perm": "rw-", "name": name})
     return json.dumps(maps) + "\n"
 
 
@@ -903,7 +973,7 @@ def answer(cmd):
         fmt = os.environ.get("FAKE_RIZIN_FORMAT", "pe64")
         return json.dumps({"core": {"file": sys.argv[-1], "size": os.path.getsize(sys.argv[-1]),
                                     "format": fmt},
-                           "bin": {"arch": "x86", "bits": BITS, "bintype": "pe", "lang": "c"}}) + "\n"
+                           "bin": {"arch": ARCH, "bits": BITS, "bintype": "pe", "lang": "c"}}) + "\n"
     if word == "afl":
         # rizin 0.9.1: "<offset> <nbbs> <size>[ -> <realsz>]  <name>", by address; realsz where there are gaps
         lines = []
@@ -1075,7 +1145,11 @@ def answer(cmd):
         esil_map_stack(rest.split())
         return ""
     if word == "aeim-":
-        esil["stack"] = None
+        # rizin 0.9.1 drops the region it mapped last, the stack only when it is the last one (measured)
+        if esil["mapped"]:
+            esil["mapped"].pop()
+        else:
+            esil["stack"] = None
         return ""
     if word == "aepc":
         if esil["regs"] is None:

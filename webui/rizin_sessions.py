@@ -1297,6 +1297,11 @@ class RizinSession:
         self._emulation_before = self._emulation_after = None
         self._emulation_big_endian = False
         self._emulation_stack_map = None
+        # The API assistant's own counters, which belong to the run: the clock it answers GetTickCount
+        # with (it has to rise, or a timing check sees no time pass) and how many pseudo handles and
+        # addresses it has given out, so that two of them can be told apart.
+        self._assist_tick = rizin_emulation.TICK_START
+        self._assist_handles = 0
         # This session's own writes through patch/patch_op, in the order it made them (rizin_emulation.
         # cache_entry). rizin has one write cache, which holds an emulation run's writes too and cannot
         # tell them apart; this mirror can, row by row (see patches). _lost: patches a restarted rizin
@@ -1559,13 +1564,7 @@ class RizinSession:
             addr = _address(addr)
 
         def run(pipe):
-            self._require_emulation(pipe)
-            pipe.cmd("e " + " ".join(ESIL_SETTINGS))
-            self._require_io_cache(pipe)
-            maps = pipe.cmdj("omlj")
-            if not self._emulation_stack_mapped(maps):
-                raise RizinRefused("the emulation's stack is not mapped any more (aeim- in the console?): "
-                                   "start the emulation again")
+            maps = self._emulation_prepare(pipe)
             if kind == "to_call":
                 stopped = self._emulation_to_call(pipe)
             else:
@@ -1577,6 +1576,23 @@ class RizinSession:
             return state
 
         return self._call("emulation", wait, run)
+
+    def _emulation_prepare(self, pipe):
+        """What every run does before it runs (gate held): the settings of the start again, io.cache read
+        back and the stack checked; ``omlj``'s maps, which the caller needs anyway.
+
+        The settings go again because esil.* can be changed in the console (esil.timeout=0 would make
+        the run endless) and because esil.exectrap takes effect only when it is set after aei. A run
+        that would write nothing, or into nothing, is refused.
+        """
+        self._require_emulation(pipe)
+        pipe.cmd("e " + " ".join(ESIL_SETTINGS))
+        self._require_io_cache(pipe)
+        maps = pipe.cmdj("omlj")
+        if not self._emulation_stack_mapped(maps):
+            raise RizinRefused("the emulation's stack is not mapped any more (aeim- in the console?): "
+                               "start the emulation again")
+        return maps
 
     def _emulation_command(self, pipe, kind, command, addr):
         """One run command (gate held); the reason it stopped."""
@@ -1913,6 +1929,346 @@ class RizinSession:
                           f"@e:search.in=range,search.from={low:#x},search.to={high + 1:#x}",
                           timeout=CONSOLE_TIMEOUT, limit=VIEW_ANSWER_MAX)
         return rizin_emulation.string_hits(found)
+
+    # --- The API-call assistant ---------------------------------------------
+
+    def call_assist(self, addr, wait=2.0):
+        """What a SKIP of the call at ``addr`` can answer: {"supported", "reason", "api", "ret_reg",
+        "value", "stack_fix", "summary"}.
+
+        ESIL emulates no Windows API: a step into a ``call qword [VirtualAlloc]`` runs into unmapped
+        memory (measured). This names the API behind the call, offers a value for the return register
+        and says in ``summary`` what SKIP would do with it. Every value is a proposal: call_skip takes
+        the value and the stack correction from the request, so the analyst can change either.
+
+        It needs **no** running emulation -- a call can be read before one starts -- but a value that
+        only the VM has (a buffer's size from a register or the stack, the tick counter, memcpy's
+        arguments) is then None and the summary says why.
+
+        On an arch other than x86-32 and x86-64 the assistant switches itself off: ``supported`` false
+        and a ``reason`` that names the arch. Emulation, breakpoints and patching keep working there;
+        offering a guessed register would be the "the surface lies" anti-goal.
+        """
+        addr = _address(addr)
+
+        def run(pipe):
+            conv = rizin_emulation.convention(self.arch, self.bits, None)
+            if conv is None:
+                return self._assist_off()
+            name = self._assist_call(pipe, addr)[1]
+            api = rizin_emulation.lookup_api(name)
+            conv = rizin_emulation.convention(self.arch, self.bits, api)
+            if api is None:
+                return dict(self._assist_answer(conv), api=name and _show(name, 120),
+                            summary=self._assist_unknown(conv, name))
+            value, note = self._assist_value(pipe, conv, api)
+            fix = rizin_emulation.stack_fix(conv, api["args"])
+            return dict(self._assist_answer(conv), api=api["name"], value=value, stack_fix=fix,
+                        summary=f"skip {api['name']}: {note}. {self._assist_stack_note(conv, api, fix)}")
+
+        return self._call("emulation", wait, run)
+
+    def call_skip(self, addr, value=None, stack_fix=0, wait=2.0):
+        """Skip the call at ``addr`` and apply the answer; the state, with ``summary``: what was applied.
+
+        ``value`` goes into the return register (None leaves it as it is), ``stack_fix`` is added to the
+        stack pointer. Both come from the request, not from the table: the analyst may have edited
+        them. A memory API's buffer is mapped and a copying one really copies, both at the addresses
+        the call's own arguments name.
+
+        The order follows what rizin does: the buffer is mapped **first**, because ``aeim`` sets the PC
+        and the stack and base pointer into the map it has just made (measured: the PC to the seek, SP
+        and BP to the middle of the new map), so those three are read before it and written back after
+        it. Then the call is skipped the way a SKIP run does -- which sets the PC itself for a call
+        through the import table, because rizin's ``aess`` runs into that one (R18) -- then the return
+        register, then the stack correction, then the copy.
+        """
+        addr = _address(addr)
+        if value is not None:
+            value = _address(value)
+        if isinstance(stack_fix, bool) or not isinstance(stack_fix, int) or stack_fix < 0:
+            raise RizinRefused("stack_fix must be a whole number of bytes, 0 or more")
+
+        def run(pipe):
+            maps = self._emulation_prepare(pipe)
+            conv = rizin_emulation.convention(self.arch, self.bits, None)
+            if conv is None:
+                raise RizinRefused(self._assist_off()["reason"])
+            pc = self._emulation_role(pipe, "PC")
+            if pc != addr:
+                raise RizinRefused(f"the emulation's PC is at {'nowhere' if pc is None else f'{pc:#x}'}, "
+                                   f"not at {addr:#x}: a skip applies to the call the PC stands on")
+            api = rizin_emulation.lookup_api(self._assist_call(pipe, addr)[1])
+            conv = rizin_emulation.convention(self.arch, self.bits, api)
+            fix = self._assist_fix(pipe, conv, stack_fix)
+            notes = []
+            # read before the skip: a copy's arguments are read from the stack the correction moves
+            plan = self._assist_copy(pipe, conv, api) if api and api["ret"] == "copy" else None
+            if api and api["ret"] == "buffer" and value is not None:
+                notes.append(self._assist_map(pipe, maps, conv, api, value))
+            stopped = self._emulation_command(pipe, "skip", rizin_emulation.STEP_COMMANDS["skip"], None)
+            if value is not None:
+                pipe.cmd(f"ar {conv['ret_reg']}={value:#x}")
+                notes.insert(0, f"{conv['ret_reg']} = {value:#x}")
+            if fix:
+                # `ar SP=<value>` takes the role name, as `ar SP` does for reading (measured)
+                sp = self._emulation_role(pipe, "SP")
+                pipe.cmd(f"ar SP={sp + fix:#x}")
+                notes.append(f"the stack pointer went up by {fix} bytes")
+            if plan is not None:
+                notes.append(self._assist_write(pipe, plan))
+            state = self._emulation_read(pipe)
+            if stopped == "step" and state["pc"] is not None and not rizin_emulation.is_executable(state["pc"], maps):
+                stopped = "trap"
+            state["stopped"] = stopped
+            state["summary"] = (f"skipped {api['name'] if api else 'the call'} at {addr:#x}: "
+                                + ("; ".join(notes) if notes else "the PC is after the call, and nothing "
+                                                                  "else was changed"))
+            return state
+
+        return self._call("emulation", wait, run)
+
+    def _assist_off(self):
+        """The answer on an arch the assistant does not cover: it offers nothing and says so."""
+        return {"supported": False,
+                "reason": f"the assistant covers x86-64 and x86-32, and this file is "
+                          f"{self.arch or 'of an arch rizin did not name'} at {self.bits or 'unknown'} bits",
+                "api": None, "ret_reg": None, "value": None, "stack_fix": 0,
+                "summary": "no value is offered here rather than a guessed one; emulation, breakpoints "
+                           "and patching work on this file all the same"}
+
+    @staticmethod
+    def _assist_answer(conv):
+        return {"supported": True, "reason": None, "api": None, "ret_reg": conv["ret_reg"],
+                "value": None, "stack_fix": 0, "summary": ""}
+
+    def _assist_unknown(self, conv, name):
+        """What the summary says for a call the table does not know: the import is named, no value is
+        offered, and at 32 bits that **the stack is not corrected**, because the argument count is the
+        one thing a correction needs (R31). Both fields are there to be filled in by hand."""
+        called = f"'{_show(name, 120)}'" if name else "the call's target"
+        if conv["stack_args"]:
+            return (f"the table does not know {called}, so no value is offered and the stack is not "
+                    f"corrected: its argument count is unknown, and at 32 bits a stdcall callee would "
+                    f"clear its arguments. Set the return register and the correction by hand")
+        return (f"the table does not know {called}, so no value is offered; under win64 the caller "
+                f"clears the stack, so nothing has to be corrected. Set {conv['ret_reg']} by hand")
+
+    @staticmethod
+    def _assist_stack_note(conv, api, fix):
+        if fix:
+            return (f"The stack pointer goes up by {fix} bytes, because a stdcall callee clears its "
+                    f"{api['args']} arguments")
+        if conv["stack_args"]:
+            return "The stack is not corrected: a cdecl caller clears the arguments itself"
+        return "The caller clears the stack under win64, so nothing is corrected"
+
+    def _assist_call(self, pipe, addr):
+        """(the op's type, the name of the call's target) at ``addr`` (gate held); refuses where rizin
+        decoded no call there.
+
+        The target: for a call through the import table rizin's ``ptr`` holds the table slot
+        (``call qword [rip+..]``, type ircall at 64 bits, ``call dword [slot]``, type ucall at 32 --
+        both measured), for a direct call ``jump`` holds the callee, and the flag at that address is the
+        import's name (measured: ``fd.j`` gives [{"name": "sym.imp.KERNEL32.dll_Sleep", ...}]). The
+        emulator's own register flags are left out, so a target that happens to be a register's value
+        is not taken for a name. The name is hostile: it is looked up and shown, never sent to rizin.
+        """
+        op = rizin_emulation.instruction_at(pipe.cmdj(f"pdj 1 @ {addr:#x}"), addr)
+        kind = op.get("type") if op else None
+        if not rizin_emulation.is_call(kind):
+            what = f"'{_show(str(kind))}'" if op else "nothing"
+            raise RizinRefused(f"rizin decoded {what} at {addr:#x}, not a call: the assistant answers "
+                               f"for a call whose target is an API")
+        target = op.get("jump") if kind == "call" else op.get("ptr")
+        if not isinstance(target, int) or isinstance(target, bool):
+            return kind, None
+        registers = {r["name"] for r in rizin_emulation.parse_registers(pipe.cmd("ar"))} \
+            if self._emulation is pipe else set()
+        return kind, rizin_emulation.flag_hint(pipe.cmdj(f"fd.j @ {target:#x}"), registers)
+
+    def _assist_value(self, pipe, conv, api):
+        """(the value for the return register or None, what the summary says about it) for the row
+        ``api`` of the table (gate held)."""
+        answer = api["ret"]
+        if answer == "zero":
+            return 0, f"{conv['ret_reg']} = 0, the answer of a machine that is not being watched"
+        if answer == "success":
+            return 1, (f"{conv['ret_reg']} = 1, the call reports success; nothing is written to its "
+                       f"out-parameters")
+        if answer == "none":
+            return None, "no register is set, because the call has no return value"
+        if answer == "handle":
+            return self._assist_next(rizin_emulation.ASSIST_HANDLE), \
+                f"{conv['ret_reg']} = a pseudo handle, in no map, so nothing is ever read through it"
+        if self._emulation is not pipe:
+            return None, ("no value yet: the emulation is not started, and this one is read from it "
+                          "(the arguments of the call, or the run's own clock)")
+        if answer == "tick":
+            self._assist_tick += rizin_emulation.TICK_STEP
+            return self._assist_tick, (f"{conv['ret_reg']} = {self._assist_tick} ms, a rising clock, so "
+                                       f"that a timing check sees time pass and no debugger")
+        if answer == "buffer":
+            return self._assist_buffer(pipe, conv, api)
+        if answer == "copy":
+            plan = self._assist_copy(pipe, conv, api)
+            return plan["dst"], plan["note"]
+        if answer == "address":
+            return self._assist_address(pipe, conv, api)
+        return None, f"no value: the table's answer '{_show(str(answer))}' is one this build cannot build"
+
+    def _assist_buffer(self, pipe, conv, api):
+        """(the address of a buffer for this call, the summary's words) (gate held): the size the call
+        asks for, rounded to pages, in memory that collides with neither the file's maps nor the stack
+        nor a buffer an earlier call was given."""
+        size = rizin_emulation.buffer_size(self._assist_arg(pipe, conv, api["size_arg"]))
+        if size is None:
+            return None, (f"no value: the size this call asks for (argument {api['size_arg'] + 1}) could "
+                          f"not be read, or is above {rizin_emulation.ASSIST_BUFFER_MAX} bytes")
+        at = rizin_emulation.free_span(pipe.cmdj("omlj"), size)
+        if at is None:
+            return None, f"no value: no free place for {size} bytes was found in the emulation's memory"
+        return at, (f"{conv['ret_reg']} = {at:#x}, a new buffer of {size} bytes that SKIP maps in the "
+                    f"emulation's memory (aeim), so the code after it can really write into it")
+
+    def _assist_copy(self, pipe, conv, api):
+        """The copy a copying API would make (gate held): {"dst", "src", "size", "note"}; ``size`` is 0
+        where nothing may be copied, and the note then says why.
+
+        Bounded to ASSIST_COPY_MAX bytes (one ``wx``), and both ends have to lie in one map each: where
+        nothing is mapped rizin reads 0xff, and copying that would put bytes nobody asked for into the
+        file's memory while the summary claimed an unpacking step.
+        """
+        dst, src, size = (self._assist_arg(pipe, conv, i) for i in range(3))
+        plan = {"dst": dst, "src": src, "size": 0}
+        if dst is None or src is None or size is None:
+            return dict(plan, note="nothing is copied: the arguments of the call could not be read")
+        if not 0 < size <= rizin_emulation.ASSIST_COPY_MAX:
+            return dict(plan, note=f"{size} bytes are not copied: at most "
+                                   f"{rizin_emulation.ASSIST_COPY_MAX} bytes are moved at once")
+        maps = pipe.cmdj("omlj")
+        if not (rizin_emulation.maps_hold(src, size, maps) and rizin_emulation.maps_hold(dst, size, maps)):
+            return dict(plan, note=f"{size} bytes are not copied: {src:#x} or {dst:#x} is not in one "
+                                   f"map of the emulation, and rizin reads 0xff where nothing is mapped")
+        return dict(plan, size=size,
+                    note=f"{conv['ret_reg']} = {dst:#x}, and {size} bytes are really copied from "
+                         f"{src:#x} to {dst:#x}, which is what the call returns")
+
+    def _assist_address(self, pipe, conv, api):
+        """(the address GetProcAddress answers, the summary's words) (gate held): the address the file's
+        import table gives for the name the call asks for, else a pseudo address.
+
+        The name is read from the argument's pointer (``pxj``), has to look like an export's name, and
+        is compared with ``iij``'s names in Python -- it never goes into a command. A pseudo address is
+        in no map, so a run that calls it stops with a trap instead of running on through nothing; the
+        real export address does not exist in an ESIL run (the import slot holds an RVA: measured,
+        [0x1400093a8:8]=0x96b8).
+        """
+        at = self._assist_arg(pipe, conv, 1)
+        name = None
+        if at is not None:
+            name = rizin_emulation.read_cstring(pipe.cmdj(f"pxj 64 @ {at:#x}"))
+        if name is not None:
+            for entry in pipe.cmdj("iij", limit=VIEW_ANSWER_MAX) or []:
+                if (isinstance(entry, dict) and entry.get("name") == name
+                        and isinstance(entry.get("plt"), int) and not isinstance(entry["plt"], bool)):
+                    return entry["plt"], (f"{conv['ret_reg']} = {entry['plt']:#x}, where this file "
+                                          f"imports '{_show(name, 120)}'")
+        pseudo = self._assist_next(rizin_emulation.ASSIST_PSEUDO)
+        asked = f"'{_show(name, 120)}'" if name else "the name"
+        return pseudo, (f"{conv['ret_reg']} = {pseudo:#x}, a pseudo address: {asked} is not an import of "
+                        f"this file, and an ESIL run has no loaded module to take a real one from")
+
+    def _assist_next(self, base):
+        """The next pseudo value from ``base``: one per call of this session, so that two handles or two
+        addresses can be told apart in a register and in the stack."""
+        self._assist_handles += 1
+        return base + (self._assist_handles - 1) * rizin_emulation.ASSIST_SPACING
+
+    def _assist_arg(self, pipe, conv, index):
+        """The ``index``-th argument of the call the PC stands on, or None (gate held).
+
+        At 64 bits from rcx, rdx, r8, r9 (Microsoft x64); past the fourth nothing is read, because no
+        row of the table needs it. At 32 bits from the stack -- and the word matters: the PC stands
+        **on** the call, so the return address is not pushed yet and argument i is at [sp + 4*i], not
+        at [sp + 4*(i+1)] (measured with rizin 0.9.1). Only inside the stack the start mapped: outside
+        it rizin reads 0xff, and that is no argument.
+        """
+        if not conv["stack_args"]:
+            names = conv["arg_regs"]
+            if index >= len(names):
+                return None
+            found = rizin_emulation.parse_registers(pipe.cmd(f"ar {names[index]}"))
+            return found[0]["value"] if found else None
+        sp, stack, word = self._emulation_role(pipe, "SP"), self._emulation_stack_map, conv["word"]
+        if sp is None or stack is None:
+            return None
+        at = sp + index * word
+        if not (stack[0] <= at and at + word <= stack[1]):
+            return None
+        data = pipe.cmdj(f"pxj {word} @ {at:#x}")
+        if not (isinstance(data, list) and len(data) == word
+                and all(isinstance(b, int) and 0 <= b < 256 for b in data)):
+            raise ValueError("pxj did not answer a list of bytes")
+        return rizin_emulation.stack_words(data, word, self._emulation_big_endian)[0]
+
+    def _assist_fix(self, pipe, conv, fix):
+        """The stack correction the request asked for, checked (gate held).
+
+        A whole number of words, at most ASSIST_MAX_ARGS of them, and only as far as the stack the
+        start mapped reaches: a correction that moved the stack pointer out of it would leave every
+        later state showing words that are no stack -- the hole the start's own stack check closed.
+        """
+        word, most = conv["word"], rizin_emulation.ASSIST_MAX_ARGS * conv["word"]
+        if fix % word:
+            raise RizinRefused(f"stack_fix must be a multiple of {word} bytes, this file's word")
+        if fix > most:
+            raise RizinRefused(f"stack_fix must be at most {rizin_emulation.ASSIST_MAX_ARGS} arguments "
+                               f"({most} bytes)")
+        if fix:
+            sp, stack = self._emulation_role(pipe, "SP"), self._emulation_stack_map
+            if sp is None or stack is None or not stack[0] <= sp + fix < stack[1]:
+                raise RizinRefused(f"a correction of {fix} bytes would move the stack pointer out of the "
+                                   f"emulation's stack: set it by hand, or start the emulation again")
+        return fix
+
+    def _assist_map(self, pipe, maps, conv, api, value):
+        """Map the buffer a memory API answers with, at ``value`` (gate held); the summary's words.
+
+        rizin's ``aeim`` moves the VM into the map it has just made -- the PC to the seek, the stack and
+        base pointer to the middle of the new map, while the map made before stays (all measured) -- so
+        the three registers are read first and written back afterwards. A buffer over something that is
+        mapped already is **not** mapped: it would shadow the file's bytes or the stack.
+        """
+        size = rizin_emulation.buffer_size(self._assist_arg(pipe, conv, api["size_arg"]))
+        if size is None:
+            return (f"no memory was mapped: the size this call asks for could not be read, or is above "
+                    f"{rizin_emulation.ASSIST_BUFFER_MAX} bytes")
+        if not rizin_emulation.span_is_free(maps, value, size):
+            return f"no memory was mapped at {value:#x}: something is mapped there already"
+        before = {role: self._emulation_role(pipe, role) for role in ("PC", "SP", "BP")}
+        pipe.cmd(f"aeim {value:#x} {size:#x} {rizin_emulation.ASSIST_MAP_NAME}")
+        for role, was in before.items():
+            if was is not None:
+                pipe.cmd(f"ar {role}={was:#x}")
+        return f"a buffer of {size} bytes was mapped at {value:#x}"
+
+    @staticmethod
+    def _assist_write(pipe, plan):
+        """Make the copy of ``_assist_copy``'s plan (gate held); the summary's words.
+
+        It goes through ``wx``, so the bytes land in rizin's write cache as every other byte a run
+        writes does -- they belong to the run, not to the file, and nothing of them goes into the
+        project (see patches).
+        """
+        if not plan["size"]:
+            return plan["note"]
+        data = pipe.cmdj(f"pxj {plan['size']} @ {plan['src']:#x}")
+        if not (isinstance(data, list) and len(data) == plan["size"]
+                and all(isinstance(b, int) and 0 <= b < 256 for b in data)):
+            raise ValueError("pxj did not answer a list of bytes")
+        pipe.cmd(f"wx {bytes(data).hex()} @ {plan['dst']:#x}")
+        return f"{plan['size']} bytes were copied from {plan['src']:#x} to {plan['dst']:#x}"
 
     def _require_emulation(self, pipe):
         # A rizin that was restarted (a hung analysis step) has no emulation, whatever ran before.

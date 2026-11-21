@@ -5803,6 +5803,25 @@ def _rizin_reanalyze(session):
         _rizin_forget(session)
 
 
+def _rizin_call_assist(session):
+    """GET: addr (without it the session's current address) -- the call the assistant answers for."""
+    return session.call_assist(_rizin_arg_address(session))
+
+
+def _rizin_call_skip(session):
+    """POST: addr, and what to apply -- value (optional: `null` or none leaves the return register as
+    it is, decimal or `0x…`) and stack_fix (optional, default 0, a whole number of bytes)."""
+    body = _rizin_body()
+    value = body.get("value")
+    try:
+        return session.call_skip(_rizin_address(body.get("addr")),
+                                 None if value is None else _rizin_address(value, "value"),
+                                 body.get("stack_fix", 0))
+    finally:
+        # a skip can map memory and copy bytes: the strings, imports, flags and functions are stale
+        _rizin_forget(session)
+
+
 def _rizin_listable(path):
     try:
         return _readable(path) and os.path.isfile(path) and os.path.getsize(path) > 0
@@ -6122,6 +6141,19 @@ def api_rizin_unpatch(sid):
 def api_rizin_reanalyze(sid):
     """Analyse the range an emulation run wrote again, so FUNCTIONS and STRINGS see what it decrypted."""
     return _rizin_call(sid, _rizin_reanalyze)
+
+
+@app.route("/api/rizin/<sid>/call")
+def api_rizin_call_assist(sid):
+    """What a SKIP of the call at addr can answer: the API behind it, a value and the stack correction."""
+    return _rizin_call(sid, _rizin_call_assist)
+
+
+@app.route("/api/rizin/<sid>/call", methods=["POST"])
+def api_rizin_call_skip(sid):
+    """Skip that call and apply the answer: the value in the return register, the stack correction, a
+    memory API's buffer and a copying one's copy."""
+    return _rizin_call(sid, _rizin_call_skip)
 
 
 # --- ThreatCheck / DefenderCheck Integration ---
