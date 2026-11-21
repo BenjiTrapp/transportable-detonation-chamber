@@ -3801,6 +3801,32 @@ def test_reanalyze_refuses_a_range_of_more_functions_than_it_rebuilds(rz, monkey
     assert _reanalyze(rz, sid, start="0x140010000", end=f"{many - 0x20:#x}")["start"] == 0x140010000
 
 
+def test_the_range_the_run_wrote_is_still_known_after_a_stop(rz):
+    """Finding 1 of fix round 1: a stop gives the emulation's memory back while the write cache keeps
+    its rows, so the live map list alone cannot tell afterwards that a pushed word was no code -- and
+    `af`/`/zj` would then run over the stack. Both sources are needed: the live maps and the record."""
+    sid = rz.session()
+    # a step on `call sym.main` pushes the return address: that write is a row of the cache
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001444"})
+    _run(rz, sid, "step")
+    pushed = [r for r in _patches(rz, sid) if not r["mine"]]
+    assert pushed and all(r["addr"] >= 0x100000 for r in pushed), pushed
+    assert rz.mgr.get(sid).run_range() is None, "while it is mapped"
+    assert rz.send(f"/api/rizin/{sid}/emulation/stop") == {"running": False}
+    assert not [m for m in rz.mgr.get(sid).json("omlj") if m["name"].startswith("mem.")]
+    assert [r for r in _patches(rz, sid) if not r["mine"]] == pushed, "the rows outlive the maps"
+    assert rz.mgr.get(sid).run_range() is None, "and the pushed word is still no code"
+    response = rz.post(f"/api/rizin/{sid}/reanalyze", {})
+    assert response.status_code == 400 and "nothing" in response.get_json()["refused"], \
+        response.get_json()
+    # the same for a buffer the assistant mapped: it is recorded when it is mapped, and a stop and
+    # even a new start cannot make its bytes look like the file's
+    assert rz.mgr.get(sid).run_range() is None
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": f"{DECRYPT_AT:#x}"})
+    _run(rz, sid, "until", addr=f"{DECRYPT_END:#x}")
+    assert rz.mgr.get(sid).run_range() == (DECRYPTED, DECRYPTED_END), "what the run really decrypted"
+
+
 def test_reanalyze_says_the_session_ended_rather_than_fail(rz):
     sid = _decrypted(rz)
     rz.send(f"/api/rizin/{sid}/close", {})
@@ -4200,11 +4226,14 @@ def test_a_skip_writes_the_out_parameters_of_the_time_and_environment_calls(rz, 
     later = int.from_bytes(bytes(rz.read(f"/api/rizin/{sid}/hex?addr={into:#x}&len=8")["bytes"]), "little")
     assert later > counter, (counter, later)
 
-    # GetComputerNameW: the name in UTF-16 at the first argument, its length at the second
+    # GetComputerNameW: the name in UTF-16 at the first argument, its length at the second -- and only
+    # as much as the caller said it had room for, which it passes a pointer to
     sid = _started(rz, f"{ASSIST_AT + 36:#x}")
     name_at, size_at = 0x177100, 0x177200
     for register, value in (("rcx", hex(name_at)), ("rdx", hex(size_at))):
         rz.send(f"/api/rizin/{sid}/emulation/register", {"name": register, "value": value})
+    room = len(rizin_emulation.ASSIST_COMPUTER) + 1
+    _patch(rz, sid, addr=hex(size_at), bytes=room.to_bytes(4, "little").hex())
     assist = _assist(rz, sid, ASSIST_AT + 36)
     assert assist["api"] == "GetComputerName" and assist["value"] == 1
     assert rizin_emulation.ASSIST_COMPUTER in assist["summary"], assist["summary"]
@@ -4214,6 +4243,36 @@ def test_a_skip_writes_the_out_parameters_of_the_time_and_environment_calls(rz, 
     assert int.from_bytes(bytes(rz.read(f"/api/rizin/{sid}/hex?addr={size_at:#x}&len=4")["bytes"]),
                           "little") == len(rizin_emulation.ASSIST_COMPUTER)
     assert "characters" in state["summary"], state["summary"]
+
+
+def test_a_name_is_not_written_past_the_buffer_the_caller_asked_for(rz, monkeypatch):
+    """Windows writes no more than the caller said it had room for, and a buffer inside a mapped page
+    still belongs to the sample: where the room is too small, or the call does not say, nothing is
+    written and the summary says so."""
+    import rizin_emulation
+
+    monkeypatch.setenv("FAKE_RIZIN_ASSIST", "1")
+    sid = _started(rz, f"{ASSIST_AT + 36:#x}")        # GetComputerNameW(lpBuffer, nSize)
+    name_at, size_at = 0x177100, 0x177200
+    for register, value in (("rcx", hex(name_at)), ("rdx", hex(size_at))):
+        rz.send(f"/api/rizin/{sid}/emulation/register", {"name": register, "value": value})
+    # the caller says it has room for four characters, and the name needs more
+    _patch(rz, sid, addr=hex(size_at), bytes=(4).to_bytes(4, "little").hex())
+    assist = _assist(rz, sid, ASSIST_AT + 36)
+    assert "is not written" in assist["summary"] and "4 characters" in assist["summary"], assist["summary"]
+    mark = len(rz.commands())
+    state = _skip(rz, sid, ASSIST_AT + 36, value="0x1")
+    assert "is not written" in state["summary"] and "not written either" in state["summary"]
+    assert not any(c.startswith("wx ") for c in _commands_since(rz, mark)), "nothing was written"
+    assert bytes(rz.read(f"/api/rizin/{sid}/hex?addr={name_at:#x}&len=2")["bytes"]) == b"\0\0"
+    # and where the size pointer is in no map, the call does not say how much room it has
+    rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rdx", "value": "0x41"})
+    assert "does not say how much room" in _assist(rz, sid, ASSIST_AT + 36)["summary"]
+    # the room the call does have is honoured: exactly the name and its terminator
+    rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rdx", "value": hex(size_at)})
+    _patch(rz, sid, addr=hex(size_at),
+           bytes=(len(rizin_emulation.ASSIST_COMPUTER) + 1).to_bytes(4, "little").hex())
+    assert rizin_emulation.ASSIST_COMPUTER in _assist(rz, sid, ASSIST_AT + 36)["summary"]
 
 
 def test_an_out_parameter_that_is_in_no_map_is_not_written(rz, monkeypatch):
@@ -4507,14 +4566,20 @@ def test_taking_a_patch_back_is_saved_too(rz):
     assert rz.read(f"/api/rizin/{sid}/hex?addr=0x140001440&len=1")["bytes"] != [0x90]
 
 
-def test_patches_that_do_not_fit_the_project_are_named_not_dropped_in_silence(rz):
+def test_patches_that_do_not_fit_the_project_are_named_not_dropped_in_silence(rz, monkeypatch):
     # _read_project_meta reads the last 64 KB: patches that pushed /tdc out of it would take the
     # analysis progress with them, so what does not fit is left out and the session says so
     import rizin_emulation
+    import rizin_sessions
 
     path = rz.write("pipesim.exe")
     sid = rz.open(path)["session"]
     rz.wait_done(sid)
+    # a budget for exactly three of the largest patch ("<addr>:<hex>", and a comma between two), so
+    # that this test is about the naming whatever MAX_PATCH_BYTES is; the budget's own arithmetic is
+    # covered by test_the_tdc_namespace_stays_inside_the_tail_that_is_read_back
+    entry = len("140001000") + 1 + 2 * rizin_emulation.MAX_PATCH_BYTES
+    monkeypatch.setattr(rizin_sessions, "PROJECT_PATCH_CHARS", 3 * entry + 2)
     for i in range(5):
         _patch(rz, sid, addr=hex(0x140001000 + i * 0x2000), bytes="90" * rizin_emulation.MAX_PATCH_BYTES)
     assert rz.mgr.get(sid).flush() is True
@@ -4524,7 +4589,7 @@ def test_patches_that_do_not_fit_the_project_are_named_not_dropped_in_silence(rz
     assert len(saved.split("\n/tdc\n")[-1]) < 64 * 1024
     rz.close(sid)
     sid = rz.open(path)["session"]
-    # three patches of 4096 bytes are what fits; the analysis progress comes back either way
+    # the three that fit come back; the analysis progress comes back either way
     assert len(_patches(rz, sid)) == 3 and rz.status(sid)["analysis"]["level"] == "aaa"
     assert rz.status(sid)["analysis"]["done_steps"] == ["aaa"]
 
@@ -4552,8 +4617,11 @@ def test_the_tdc_namespace_stays_inside_the_tail_that_is_read_back(tmp_path):
     big = [(0x140001000 + i * 0x2000, "90" * rizin_emulation.MAX_PATCH_BYTES) for i in range(10)]
     left_out = rizin_sessions._sanitize_project(str(src), str(dst), "aaa", "one", ["aaa"], big)
     meta = rizin_sessions._read_project_meta(str(dst))
-    # an entry of 4096 bytes costs 9 + 1 + 8192 characters, so three of them fit into the 32 KB budget
-    assert meta["patches"] == big[:3] and left_out == 7
+    # an entry costs 9 + 1 + 2 * MAX_PATCH_BYTES characters, and a comma between two of them
+    entry = len("140001000") + 1 + 2 * rizin_emulation.MAX_PATCH_BYTES
+    fits = (rizin_sessions.PROJECT_PATCH_CHARS + 1) // (entry + 1)
+    assert 0 < fits < len(big), fits
+    assert meta["patches"] == big[:fits] and left_out == len(big) - fits
     # and what the tail is read for still comes back
     assert (meta["level"], meta["mode"], meta["done"]) == ("aaa", "one", ["aaa"])
 
@@ -5331,6 +5399,57 @@ def test_real_rizin_copies_more_than_one_wx_can_carry(tmp_path):
         assert bytes(session.json(f"pxj 4 @ {0x50000000 + size:#x}")) != b"ABCD"
     finally:
         mgr.shutdown()
+
+
+@pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
+def test_real_rizin_cuts_a_command_line_at_the_wall(tmp_path):
+    """R39 against rizin 0.9.1 itself: this is why a patch is bounded the way it is, and it is the one
+    behaviour the fake newly models in this round.
+
+    rizin reads its stdin a line at a time and **cuts** a line of RIZIN_LINE_MAX + 1 characters: the
+    write then lands at the address of the cut line, with nothing on stdout and nothing on stderr. A
+    line one character shorter lands where it says. So `wx` is never chunked (one patch is one `wcj`
+    row, which a take-back needs) and MAX_PATCH_BYTES is what one line can carry instead.
+    """
+    import rizin_emulation
+    import rizin_sessions
+
+    blob = tmp_path / "wall.bin"
+    blob.write_bytes(bytes(0x10000))
+    pipe = rizin_sessions.RizinPipe(REAL_RIZIN, str(blob), extra_args=("-a", "x86", "-b", "64"))
+    try:
+        pipe.cmd("e io.cache=true")
+        assert pipe.cmd("e io.cache").strip() == "true"
+        # the largest patch the server will send: its command line is inside the wall, and it lands
+        at, most = 0x2000, rizin_emulation.MAX_PATCH_BYTES
+        command = f"wx {'41' * most} @ {at:#x}"
+        assert len(command) <= rizin_emulation.RIZIN_LINE_MAX, len(command)
+        pipe.cmd(command)
+        assert pipe.cmdj(f"pxj 2 @ {at:#x}") == [0x41, 0x41]
+        assert pipe.cmdj(f"pxj 2 @ {at + most - 2:#x}") == [0x41, 0x41], "all of it, not a prefix"
+
+        # a line of exactly one character over the wall: nothing lands where it says, and rizin says
+        # nothing at all about it -- the trap this bound exists for
+        at = 0x4000
+        padding = rizin_emulation.RIZIN_LINE_MAX + 1 - len(f"wx  @ {at:#x}")
+        assert padding % 2 == 0
+        over = f"wx {'42' * (padding // 2)} @ {at:#x}"
+        assert len(over) == rizin_emulation.RIZIN_LINE_MAX + 1
+        out, err, _ = pipe.console(over)
+        assert out.strip() == "" and err.strip() == "", (out, err)
+        assert pipe.cmdj(f"pxj 2 @ {at:#x}") == [0, 0], "the bytes did not go where they were asked to"
+        # they went somewhere: the row of the cut line is in the cache, at another address
+        rows = rizin_emulation.parse_cache(pipe.cmd("wcj"))
+        strays = [row for row in rows if row["after"].startswith("42")]
+        assert strays and all(row["addr"] != at for row in strays), rows
+        # the pipe is still in step, and one character less lands again
+        assert pipe.cmd("echo in-step").strip() == "in-step"
+        inside = f"wx {'43' * ((padding - 2) // 2)} @ {at:#x}"
+        assert len(inside) <= rizin_emulation.RIZIN_LINE_MAX
+        pipe.cmd(inside)
+        assert pipe.cmdj(f"pxj 2 @ {at:#x}") == [0x43, 0x43]
+    finally:
+        pipe.close()
 
 
 def test_readable_takes_only_drive_paths_on_windows(tdc, monkeypatch):

@@ -39,6 +39,10 @@ Environment:
                     with their flags and import entries. They are behind a variable of their own
                     because the flag and import lists of the default model are counted in tests
 
+A command line longer than RIZIN_LINE_MAX characters is **cut**, as rizin's
+own stdin reader cuts it (see main()): a write on such a line does not go
+where it says.
+
 Like rizin 0.9.1 it dies on ``aflj`` once a project with DWARF variable
 origins has been loaded (see rizin_sessions._sanitize_project), and ``Poo``
 brings back the settings (/core/config) and hints that a project holds.
@@ -330,6 +334,7 @@ else:
 # bookkeeping rizin 0.9.1 keeps, which is why ``aeim-`` works once and then cannot name anything
 # (see esil_drop_last, all measured).
 esil = {"regs": None, "stack": None, "mapped": [], "last": None}
+RIZIN_LINE_MAX = 4095  # characters of one command line that rizin reads; see main()
 ESIL_CAP = 200000  # steps of one run: past it the fake's code has run into nothing it models
 SEARCH_MAX = 0x10000  # bytes of a search range the model reads (a test's range is far smaller)
 ESIL_INVALID = "ERROR: core: esil: Stopped execution in an invalid instruction (see e??esil.breakoninvalid)\n"
@@ -1259,6 +1264,16 @@ def main():
         if not line:
             return
         cmd = line.decode("utf-8", "replace").rstrip("\r\n")
+        if len(cmd) > RIZIN_LINE_MAX:
+            # rizin 0.9.1 reads its stdin a line at a time and cuts one that is longer, without a word:
+            # measured, a `wx` of 2040 bytes on a line of exactly 4096 characters wrote them at the
+            # address of the **cut** line (0x500400 for a request at 0x50004000) and said nothing at
+            # all, and a longer line said only "Could not convert hexpair" on stderr. rizin's own cut
+            # is a character or two shorter than this one, so what lands where is not the same byte for
+            # byte; what is the same, and all a test here needs, is that a command line at or over the
+            # wall does not do what it says. The server keeps every command it builds well inside it
+            # (rizin_emulation.MAX_PATCH_BYTES, ASSIST_WRITE_CHUNK, MAX_CONSOLE_COMMAND).
+            cmd = cmd[:RIZIN_LINE_MAX]
         log(cmd)
         if CRASH and cmd.split(" ", 1)[0] == CRASH:
             os._exit(139)

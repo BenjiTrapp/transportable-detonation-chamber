@@ -191,7 +191,21 @@ def next_call_stop(ops, pc):
 
 # --- Patching: the bytes, and the write cache's list ------------------------
 
-MAX_PATCH_BYTES = 4096
+# What one command line may carry. rizin 0.9.1 reads its stdin a line at a time and **cuts** a line of
+# 4096 characters, with nothing on stdout and nothing on stderr: measured, a `wx` of 2040 bytes at
+# 0x50004000 (a line of exactly 4096 characters) put 2040 bytes at 0x500400 -- the address of the cut
+# line -- while the same write on a line of 4095 characters landed where it was asked to. A longer line
+# is cut the same way and then says "Could not convert hexpair" on stderr, because the hex itself was
+# cut; the remainder is not run as a command and the pipe stays in step. It is the pipe's own limit:
+# the same bytes go through as a -c argument.
+RIZIN_LINE_MAX = 4095
+# The most bytes one patch writes. A patch is **never** chunked: one write is one ``wcj`` row
+# (measured), and taking one back sends ``wc- <addr> <addr+1>``, which takes back a row -- so chunking
+# would turn one patch into several rows of which a take-back would only reach the first. The size is
+# therefore bounded by what one command line carries: "wx " + 2*N + " @ " + "0x" + 16 address digits
+# must stay inside RIZIN_LINE_MAX, which allows 2035; 2000 is that with room to spare, and far beyond
+# what a hand-written patch or one of the four patch kinds needs.
+MAX_PATCH_BYTES = 2000
 
 # x86's conditional jumps and their opposites, for "flip". Both forms: 7x rel8 (two bytes) and 0f 8x rel32
 # (six). In each pair the even opcode is the condition and the odd one its negation, which is why the table
@@ -572,6 +586,11 @@ ASSIST_FILETIME_BASE = 134116992000000000
 #   "none"     the call has no return value; a skip only corrects the stack
 ANSWERS = ("buffer", "handle", "address", "copy", "tick", "zero", "success", "none")
 
+# ``out_room`` goes with a row that writes a text: (the argument that says how much room the call's
+# buffer has, "at" for a pointer to that count or "value" for the count itself), in characters. Windows
+# writes no more than the caller asked for, so neither does this: where the room cannot be read, or is
+# less than the text and its terminator, **nothing** is written and the summary says so.
+#
 # What a row writes to an out-parameter, as (the argument that holds the pointer, what to write). The
 # spec's answer for the time and environment groups is the **value**, not just a return code -- a
 # QueryPerformanceCounter whose counter is never written lets a timing check see zero time pass, and a
@@ -587,6 +606,8 @@ ANSWERS = ("buffer", "handle", "address", "copy", "tick", "zero", "success", "no
 #                GetComputerName and GetUserName take a pointer to
 #   "serial"     ASSIST_SERIAL, 4 bytes
 OUT_WRITES = ("counter", "frequency", "filetime", "computer", "user", "volume", "chars", "serial")
+# The texts of OUT_WRITES, by their kind: how much room a call has to have for one of them.
+OUT_TEXTS = {"computer": ASSIST_COMPUTER, "user": ASSIST_USER, "volume": ASSIST_VOLUME}
 
 # The assistant's table: **data, not code**, so that it grows without a change here (the spec asks for
 # that). Per row: the convention (which 64 bits ignores, where everything is Microsoft x64), how many
@@ -633,10 +654,11 @@ API_TABLE = {
     "Sleep": {"conv": "stdcall", "args": 1, "ret": "none"},
     # Environment
     "GetComputerName": {"conv": "stdcall", "args": 2, "ret": "success",
-                        "out": ((0, "computer"), (1, "chars"))},
-    "GetUserName": {"conv": "stdcall", "args": 2, "ret": "success", "out": ((0, "user"), (1, "chars"))},
+                        "out": ((0, "computer"), (1, "chars")), "out_room": (1, "at")},
+    "GetUserName": {"conv": "stdcall", "args": 2, "ret": "success", "out": ((0, "user"), (1, "chars")),
+                    "out_room": (1, "at")},
     "GetVolumeInformation": {"conv": "stdcall", "args": 8, "ret": "success",
-                             "out": ((1, "volume"), (3, "serial"))},
+                             "out": ((1, "volume"), (3, "serial")), "out_room": (2, "value")},
     "GetSystemInfo": {"conv": "stdcall", "args": 1, "ret": "none"},
     "GetEnvironmentVariable": {"conv": "stdcall", "args": 3, "ret": "zero"},
     # Copying
@@ -844,7 +866,7 @@ def out_bytes(kind, api, clock):
     on 32-bit Windows too, and writing only four of them would leave the high half as it was and the
     counter could read as an enormous number.
     """
-    texts = {"computer": ASSIST_COMPUTER, "user": ASSIST_USER, "volume": ASSIST_VOLUME}
+    texts = OUT_TEXTS
     if kind in texts:
         text = texts[kind]
         data = (text.encode("utf-16-le") + b"\0\0") if api.get("wide") else (text.encode("ascii") + b"\0")

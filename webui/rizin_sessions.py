@@ -108,7 +108,7 @@ STEP_GAP = 2.0
 STEP_GAP_LIMIT = 10.0
 SAVE_DELAY = 3.0
 # What the project's /tdc namespace may spend on its patches line. _read_project_meta reads the last
-# 64 KB of a project, and a patch of MAX_PATCH_BYTES bytes is 8192 hex digits, so a few of them would push
+# 64 KB of a project, and a patch of MAX_PATCH_BYTES bytes is 4000 hex digits, so a few of them would push
 # /tdc out of that tail and take level, mode and done with it -- a file that would then be analysed again
 # from nothing. Patches past the budget are left out of the save and the session says how many
 # (_finish_save), rather than costing the analysis progress in silence.
@@ -1297,6 +1297,11 @@ class RizinSession:
         self._emulation_before = self._emulation_after = None
         self._emulation_big_endian = False
         self._emulation_stack_map = None
+        # Every range the ESIL VM has had memory in during this session, as (from, to): the stack of
+        # each start and every buffer the assistant mapped. The write cache keeps a run's rows after
+        # a stop, which unmaps the memory, so the live map list alone cannot tell afterwards that a
+        # pushed word was no code -- and that is what the range of a re-analysis rests on (_run_range).
+        self._emulation_ranges = []
         # The API assistant's own counters, which belong to the run: the clock it answers GetTickCount
         # and the performance counter with (it has to rise, or a timing check sees no time pass) and
         # how far each pseudo series has been used, so that two handles or two addresses can be told
@@ -1504,6 +1509,7 @@ class RizinSession:
             if stack is None:
                 raise RizinRefused("rizin could not map the emulation's stack (aeim)")
             self._emulation_stack_map = stack
+            self._emulation_remember(stack[0], stack[1])
             self._emulation_big_endian = pipe.cmd("e cfg.bigendian").strip() == "true"
             self._emulation_before = self._emulation_after = None
             self._emulation = pipe
@@ -1539,6 +1545,13 @@ class RizinSession:
         for fd in rizin_emulation.esil_fds(pipe.cmdj("omlj")):
             pipe.cmd(f"o- {fd}")
         self._emulation_stack_map = None
+
+    def _emulation_remember(self, low, high):
+        """Keep (low, high) as a range the ESIL VM had memory in; see _emulation_ranges. Each range is
+        kept once, and nothing is ever taken out: a byte that was in the emulation's own memory is no
+        byte of the file, whether or not the memory is still mapped."""
+        if (low, high) not in self._emulation_ranges:
+            self._emulation_ranges.append((low, high))
 
     def emulation_state(self, wait=2.0):
         """The emulation's registers, PC, stack and the registers that changed (see _emulation_read)."""
@@ -1907,14 +1920,15 @@ class RizinSession:
     def _run_range(self, pipe):
         """The range the run wrote (gate held); see run_range.
 
-        What is left out is every write inside one of the ESIL VM's own maps as ``omlj`` lists them
-        (``mem.*``: the stack aeim mapped and the buffers the assistant mapped), not only the stack
-        this session recorded at its start. R37(b): the recorded stack can be the *wrong* one -- rizin
-        maps a second stack at an address of its own when one is already there (measured) -- and then
-        the words the last run pushed would become "the range the run wrote", so `af` and `/zj` would
-        report stack words as decrypted functions and strings. The map list cannot go stale that way.
+        What is left out is every write inside the ESIL VM's own memory, from **both** sources: the
+        maps ``omlj`` lists now (``mem.*``: the stack and the assistant's buffers) and every range this
+        session's emulation has had memory in (_emulation_ranges). Both, because neither alone holds:
+        the map list catches memory nobody recorded, a console ``aeim`` included, but a stop unmaps it
+        all while the write cache keeps the rows -- and then the words a run pushed would become "the
+        range the run wrote", so ``af`` and ``/zj`` would report stack words as decrypted functions and
+        strings. The record catches that; the live list keeps it honest.
         """
-        esil = rizin_emulation.esil_ranges(pipe.cmdj("omlj"))
+        esil = rizin_emulation.esil_ranges(pipe.cmdj("omlj")) + self._emulation_ranges
         rows = [row for row in self._patch_list(pipe) if not row["mine"]
                 and not rizin_emulation.overlaps_any(row["addr"], row["size"], esil)]
         return rizin_emulation.write_cluster(rows)
@@ -2261,11 +2275,24 @@ class RizinSession:
         Spec §4 asks for the **values** here, not only a return code: a QueryPerformanceCounter whose
         counter is never written lets a timing check see no time pass at all, and a GetComputerName
         that writes nothing answers no name. A pointer that is in no map writes nothing and says so,
-        the way the buffer and the copy do.
+        the way the buffer and the copy do -- and so does a text that the caller's own buffer has no
+        room for (``out_room``): Windows writes no more than was asked for, and writing past a buffer
+        inside a mapped page is still writing over something the sample owns.
         """
+        room, text_note = self._assist_room(pipe, conv, api, maps), None
         for index, kind in api.get("out", ()):
             data, what = rizin_emulation.out_bytes(kind, api, plan["clock"])
             if data is None:
+                continue
+            if kind in rizin_emulation.OUT_TEXTS:
+                text_note = self._assist_text_room(room, rizin_emulation.OUT_TEXTS[kind], what)
+            if kind == "chars" and text_note is not None:
+                # the length belongs to the name: where the name did not go, it does not either
+                plan["out"].append({"addr": None, "data": None,
+                                    "note": f"{what} is not written either"})
+                continue
+            if text_note is not None and kind in rizin_emulation.OUT_TEXTS:
+                plan["out"].append({"addr": None, "data": None, "note": text_note})
                 continue
             at = self._assist_arg(pipe, conv, index)
             if at is None:
@@ -2282,6 +2309,37 @@ class RizinSession:
                 if kind in ("counter", "filetime"):
                     # the clock moves because this write used it, and only where it was really written
                     plan["advance"]["tick"] = True
+
+    def _assist_room(self, pipe, conv, api, maps):
+        """How many characters the call says its text buffer holds, or None where that cannot be read
+        (gate held): ``out_room`` names the argument and whether it is the count itself or a pointer to
+        it (GetComputerName and GetUserName pass a pointer, GetVolumeInformation the number)."""
+        found = api.get("out_room")
+        if not found:
+            return None
+        index, how = found
+        value = self._assist_arg(pipe, conv, index)
+        if value is None or how == "value":
+            return value
+        if not rizin_emulation.maps_hold(value, 4, maps):
+            return None
+        data = pipe.cmdj(f"pxj 4 @ {value:#x}")
+        if not (isinstance(data, list) and len(data) == 4
+                and all(isinstance(b, int) and 0 <= b < 256 for b in data)):
+            raise ValueError("pxj did not answer a list of bytes")
+        return int.from_bytes(bytes(data), "little")
+
+    @staticmethod
+    def _assist_text_room(room, text, what):
+        """Why a text cannot go into the caller's buffer, or None when it fits: the name and its
+        terminator have to fit in the characters the call said it had room for."""
+        if room is None:
+            return f"{what} is not written: the call does not say how much room its buffer has"
+        if room < len(text) + 1:
+            return (f"{what} is not written: the call's buffer holds {room} characters and the name "
+                    f"needs {len(text) + 1} with its terminator")
+        return None
+
 
     def _assist_apply(self, pipe, plan):
         """Write what the plan holds beside the register and the stack (gate held): the copy and the
@@ -2400,6 +2458,7 @@ class RizinSession:
         for role, was in before.items():
             if was is not None:
                 pipe.cmd(f"ar {role}={was:#x}")
+        self._emulation_remember(value, value + size)
         return f"a buffer of {size} bytes was mapped at {value:#x}"
 
     def _require_emulation(self, pipe):

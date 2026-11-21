@@ -323,8 +323,10 @@ def test_hex_data_takes_an_even_number_of_hex_digits():
     assert rizin_emulation.hex_data("9090") == b"\x90\x90"
     assert rizin_emulation.hex_data("0F84") == b"\x0f\x84"
     assert rizin_emulation.hex_data(b"\x90") == b"\x90"
-    assert len(rizin_emulation.hex_data("90" * rizin_emulation.MAX_PATCH_BYTES)) == 4096
-    for value in ("9", "zz", "90 90", "", "0x90", "90" * 4097, b"", b"\x90" * 4097, None, 144, True):
+    most = rizin_emulation.MAX_PATCH_BYTES
+    assert len(rizin_emulation.hex_data("90" * most)) == most
+    for value in ("9", "zz", "90 90", "", "0x90", "90" * (most + 1), b"", b"\x90" * (most + 1),
+                  None, 144, True):
         with pytest.raises(ValueError):
             rizin_emulation.hex_data(value)
     # the length is checked before the string is parsed, so a field of megabytes is refused by its size
@@ -525,7 +527,7 @@ def test_the_api_table_is_data_in_one_shape():
     four fields, and every answer is one the assistant can actually build."""
     for name, api in rizin_emulation.API_TABLE.items():
         assert re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name), name
-        assert set(api) <= {"conv", "args", "ret", "size_arg", "out"}, name
+        assert set(api) <= {"conv", "args", "ret", "size_arg", "out", "out_room"}, name
         assert api["conv"] in ("win64", "stdcall", "cdecl"), name
         assert isinstance(api["args"], int) and 0 <= api["args"] <= rizin_emulation.ASSIST_MAX_ARGS, name
         assert api["ret"] in rizin_emulation.ANSWERS, name
@@ -533,11 +535,19 @@ def test_the_api_table_is_data_in_one_shape():
             assert 0 <= api["size_arg"] < api["args"], name
         else:
             assert "size_arg" not in api, name
+        if "out_room" in api:
+            # a row that says how much room its buffer has writes a text, and names one of its own
+            # arguments for the room
+            index, how = api["out_room"]
+            assert 0 <= index < api["args"] and how in ("at", "value"), name
+            assert any(what in rizin_emulation.OUT_TEXTS for _, what in api["out"]), name
         for index, what in api.get("out", ()):
             # an out-parameter's pointer is one of the call's own arguments, and what goes there is
             # one of the kinds out_bytes can build
             assert 0 <= index < api["args"] and what in rizin_emulation.OUT_WRITES, name
             assert rizin_emulation.out_bytes(what, api, rizin_emulation.TICK_START)[0] is not None, name
+            # a text can only be written where the row says how much room the call has for it
+            assert what not in rizin_emulation.OUT_TEXTS or "out_room" in api, name
         assert rizin_emulation.lookup_api(name)["name"] == name
     # the seven groups of the spec's table are in it
     for name in ("VirtualAlloc", "HeapAlloc", "malloc", "VirtualProtect", "LoadLibrary",
@@ -694,3 +704,16 @@ def test_the_copy_bound_and_the_write_chunk_follow_what_rizin_does():
     assert rizin_emulation.ASSIST_COPY_MAX > rizin_emulation.MAX_PATCH_BYTES
     assert 2 * rizin_emulation.ASSIST_WRITE_CHUNK + 32 < 4096, "one wx stays inside rizin's command buffer"
     assert rizin_emulation.ASSIST_READ_CHUNK <= rizin_emulation.ASSIST_COPY_MAX
+
+
+def test_the_patch_bound_is_what_one_command_line_can_carry():
+    """R39: rizin 0.9.1 cuts a command line at RIZIN_LINE_MAX characters and the write then lands
+    somewhere else, without a word (measured). A patch is one write -- one `wcj` row, which is what a
+    take-back removes -- so it is never chunked, and its size is bounded by the line instead."""
+    longest = len("wx ") + 2 * rizin_emulation.MAX_PATCH_BYTES + len(" @ 0x") + 16
+    assert longest <= rizin_emulation.RIZIN_LINE_MAX, longest
+    # and the bound is not needlessly small: one byte more would still fit, but not many more
+    assert longest + 2 * 64 > rizin_emulation.RIZIN_LINE_MAX
+    # the assistant's chunk, which may be chunked because its bytes are the run's, fits as well
+    assert len("wx ") + 2 * rizin_emulation.ASSIST_WRITE_CHUNK + len(" @ 0x") + 16 \
+        <= rizin_emulation.RIZIN_LINE_MAX
