@@ -191,20 +191,23 @@ def next_call_stop(ops, pc):
 
 # --- Patching: the bytes, and the write cache's list ------------------------
 
-# What one command line may carry. rizin 0.9.1 reads its stdin a line at a time and **cuts** a line of
-# 4096 characters, with nothing on stdout and nothing on stderr: measured, a `wx` of 2040 bytes at
-# 0x50004000 (a line of exactly 4096 characters) put 2040 bytes at 0x500400 -- the address of the cut
-# line -- while the same write on a line of 4095 characters landed where it was asked to. A longer line
-# is cut the same way and then says "Could not convert hexpair" on stderr, because the hex itself was
-# cut; the remainder is not run as a command and the pipe stays in step. It is the pipe's own limit:
-# the same bytes go through as a -c argument.
-RIZIN_LINE_MAX = 4095
+# What one command line may carry. rizin 0.9.1 reads its stdin a line at a time and keeps **4094**
+# characters of it; a longer line is cut, and what is left is run as it stands -- so a write lands at
+# whatever address survives the cut, with nothing on stdout and nothing on stderr. Measured with a
+# process of its own per line, a `wx` padded to an exact length: at 0x50004000, 4094 characters wrote
+# 2039 bytes at 0x50004000, 4095 wrote 2039 at 0x5000400 and 4096 wrote 2040 at 0x500040; at 0x2000,
+# 4094 landed and 4096 wrote 2042 bytes at 0x20. Past about 4100 characters stderr says "Error while
+# parsing" or "Could not convert hexpair", because the cut falls inside the hex; the remainder of the
+# line is never run as a command and the pipe stays in step. It is the pipe's own limit: the same
+# bytes go through as a -c argument.
+RIZIN_LINE_MAX = 4094
 # The most bytes one patch writes. A patch is **never** chunked: one write is one ``wcj`` row
 # (measured), and taking one back sends ``wc- <addr> <addr+1>``, which takes back a row -- so chunking
 # would turn one patch into several rows of which a take-back would only reach the first. The size is
 # therefore bounded by what one command line carries: "wx " + 2*N + " @ " + "0x" + 16 address digits
-# must stay inside RIZIN_LINE_MAX, which allows 2035; 2000 is that with room to spare, and far beyond
-# what a hand-written patch or one of the four patch kinds needs.
+# must stay inside RIZIN_LINE_MAX, which allows 2035 (measured: 2035 bytes at a 16-digit address land,
+# on a line of 4094); 2000 is that with room to spare, and far beyond what a hand-written patch or one
+# of the four patch kinds needs.
 MAX_PATCH_BYTES = 2000
 
 # x86's conditional jumps and their opposites, for "flip". Both forms: 7x rel8 (two bytes) and 0f 8x rel32

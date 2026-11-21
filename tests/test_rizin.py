@@ -3827,6 +3827,22 @@ def test_the_range_the_run_wrote_is_still_known_after_a_stop(rz):
     assert rz.mgr.get(sid).run_range() == (DECRYPTED, DECRYPTED_END), "what the run really decrypted"
 
 
+def test_a_console_mapped_region_stays_out_of_the_range_after_a_stop(rz):
+    """Fix round 3: the console may map memory of its own (`aeim <addr> <size> <name>` passes the
+    filter), and the sweep closes it like the rest -- so the sweep records what it is about to close,
+    or a write into that region would become "the range the run wrote" once the map is gone."""
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": f"{DECRYPT_AT:#x}"})
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "aeim 0x60000000 0x1000 mine"})
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "wx 4142434445464748 @ 0x60000000"})
+    assert [(r["addr"], r["mine"]) for r in _patches(rz, sid)] == [(0x60000000, False)]
+    assert rz.mgr.get(sid).run_range() is None, "while the console's region is mapped"
+    rz.send(f"/api/rizin/{sid}/emulation/stop")
+    assert rz.mgr.get(sid).run_range() is None, "and after the stop closed it"
+    response = rz.post(f"/api/rizin/{sid}/reanalyze", {})
+    assert response.status_code == 400 and "nothing" in response.get_json()["refused"]
+
+
 def test_reanalyze_says_the_session_ended_rather_than_fail(rz):
     sid = _decrypted(rz)
     rz.send(f"/api/rizin/{sid}/close", {})
@@ -4526,6 +4542,30 @@ def test_a_stale_patch_outside_the_file_is_skipped_with_a_note(rz):
     assert rz.read(f"/api/rizin/{sid}/hex?addr=0x140001440&len=1")["bytes"] == [0x90]
     # the note stays while the session lives, and the session is usable
     assert "could not be applied" in rz.status(sid)["analysis"]["note"]
+
+
+def test_a_saved_patch_too_long_for_one_command_line_is_named_not_dropped(rz):
+    """Fix round 3: a project written before MAX_PATCH_BYTES was corrected can hold an entry of up to
+    2035 bytes, which rizin did take then (a line of 4094 characters lands, measured) and cannot take
+    now. It is skipped **with a note**, like a patch outside the file's maps -- Task 6's Review Focus 4
+    asks for exactly that: named, not applied blindly and not dropped in silence."""
+    import rizin_emulation
+
+    path = rz.write("pipesim.exe")
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    rz.send(f"/api/rizin/{sid}/patch", {"addr": "0x140001440", "bytes": "90"})
+    rz.close(sid)
+    over = rizin_emulation.MAX_PATCH_BYTES + 1
+    _plant_patches(rz.project(), [(0x140002000, "90" * over), (0x140001440, "90")])
+    described = rz.open(path)
+    note = described["analysis"]["note"] or ""
+    assert "could not be applied" in note and "0x140002000" in note, note
+    sid = described["session"]
+    # the patch that fits is back and the one that does not was never written
+    assert [r["addr"] for r in rz.read(f"/api/rizin/{sid}/patches")] == [0x140001440]
+    assert rz.read(f"/api/rizin/{sid}/hex?addr=0x140002000&len=1")["bytes"] != [0x90]
+    assert not any(c.startswith("wx " + "90" * over) for c in rz.commands()), "it was not even sent"
 
 
 def test_a_project_is_written_for_a_patch_alone(rz):
@@ -5401,21 +5441,29 @@ def test_real_rizin_copies_more_than_one_wx_can_carry(tmp_path):
         mgr.shutdown()
 
 
+def _wall_address(length):
+    """An address for a `wx` command line of exactly ``length`` characters: its length gives the hex an
+    even number of digits, and it is high enough that a write from the same address with its last digit
+    cut off (sixteen times lower) cannot reach it."""
+    return 0xA000 if (length - len("wx  @ 0xA000")) % 2 == 0 else 0xA0000
+
+
 @pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
 def test_real_rizin_cuts_a_command_line_at_the_wall(tmp_path):
     """R39 against rizin 0.9.1 itself: this is why a patch is bounded the way it is, and it is the one
     behaviour the fake newly models in this round.
 
-    rizin reads its stdin a line at a time and **cuts** a line of RIZIN_LINE_MAX + 1 characters: the
-    write then lands at the address of the cut line, with nothing on stdout and nothing on stderr. A
-    line one character shorter lands where it says. So `wx` is never chunked (one patch is one `wcj`
-    row, which a take-back needs) and MAX_PATCH_BYTES is what one line can carry instead.
+    rizin reads its stdin a line at a time and keeps RIZIN_LINE_MAX (4094) characters of it. One
+    character more and the line is cut, and what is left runs as it stands: the write lands at
+    whatever address survives the cut, with nothing on stdout and nothing on stderr. So `wx` is never
+    chunked (one patch is one `wcj` row, which a take-back needs) and MAX_PATCH_BYTES is what one line
+    can carry instead.
     """
     import rizin_emulation
     import rizin_sessions
 
     blob = tmp_path / "wall.bin"
-    blob.write_bytes(bytes(0x10000))
+    blob.write_bytes(bytes(0x100000))
     pipe = rizin_sessions.RizinPipe(REAL_RIZIN, str(blob), extra_args=("-a", "x86", "-b", "64"))
     try:
         pipe.cmd("e io.cache=true")
@@ -5428,20 +5476,36 @@ def test_real_rizin_cuts_a_command_line_at_the_wall(tmp_path):
         assert pipe.cmdj(f"pxj 2 @ {at:#x}") == [0x41, 0x41]
         assert pipe.cmdj(f"pxj 2 @ {at + most - 2:#x}") == [0x41, 0x41], "all of it, not a prefix"
 
+        # a line of exactly RIZIN_LINE_MAX characters still lands: that is what the constant claims,
+        # and one character more does not (below). A line's hex must be even, so the address is picked
+        # by the parity of the length under test, and far enough above its own cut (the same address
+        # with its last digit gone) that a write from there cannot reach it.
+        at = _wall_address(rizin_emulation.RIZIN_LINE_MAX)
+        padding = rizin_emulation.RIZIN_LINE_MAX - len(f"wx  @ {at:#x}")
+        assert padding % 2 == 0, padding
+        exactly = f"wx {'44' * (padding // 2)} @ {at:#x}"
+        assert len(exactly) == rizin_emulation.RIZIN_LINE_MAX
+        pipe.cmd(exactly)
+        assert pipe.cmdj(f"pxj 2 @ {at:#x}") == [0x44, 0x44], "the longest line that rizin keeps whole"
+        assert pipe.cmdj(f"pxj 2 @ {at + padding // 2 - 2:#x}") == [0x44, 0x44]
+
         # a line of exactly one character over the wall: nothing lands where it says, and rizin says
-        # nothing at all about it -- the trap this bound exists for
-        at = 0x4000
+        # nothing at all about it -- the trap this bound exists for. The address is chosen so that its
+        # command overhead leaves an even number of hex digits for that length, and so that the write
+        # from the **cut** address (one digit shorter, so sixteen times lower) cannot reach it.
+        at = _wall_address(rizin_emulation.RIZIN_LINE_MAX + 1)
         padding = rizin_emulation.RIZIN_LINE_MAX + 1 - len(f"wx  @ {at:#x}")
-        assert padding % 2 == 0
+        assert padding % 2 == 0, padding
         over = f"wx {'42' * (padding // 2)} @ {at:#x}"
         assert len(over) == rizin_emulation.RIZIN_LINE_MAX + 1
         out, err, _ = pipe.console(over)
         assert out.strip() == "" and err.strip() == "", (out, err)
         assert pipe.cmdj(f"pxj 2 @ {at:#x}") == [0, 0], "the bytes did not go where they were asked to"
-        # they went somewhere: the row of the cut line is in the cache, at another address
+        # they went somewhere: the row of the cut line is in the cache, at the cut address
         rows = rizin_emulation.parse_cache(pipe.cmd("wcj"))
         strays = [row for row in rows if row["after"].startswith("42")]
         assert strays and all(row["addr"] != at for row in strays), rows
+        assert [row["addr"] for row in strays] == [at >> 4], "the address with its last digit cut off"
         # the pipe is still in step, and one character less lands again
         assert pipe.cmd("echo in-step").strip() == "in-step"
         inside = f"wx {'43' * ((padding - 2) // 2)} @ {at:#x}"

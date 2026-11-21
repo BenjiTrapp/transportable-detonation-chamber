@@ -1009,7 +1009,12 @@ def _read_project_meta(path):
 
 # One patch of the /tdc namespace: the address in hex (up to 2^64-1) and the bytes it wrote, as the
 # write cache reports them. Anything else -- a line from a newer version, a half-written one -- is left out.
-_TDC_PATCH_RE = re.compile(r"([0-9a-f]{1,16}):((?:[0-9a-f]{2}){1,%d})" % rizin_emulation.MAX_PATCH_BYTES)
+# One ``addr:hex`` entry of the project's patches line. The hex is bounded only by the line's own
+# budget (PROJECT_PATCH_CHARS), not by MAX_PATCH_BYTES: an entry that is too long to write is still
+# read, so that _replay_patches can **name** it in the session's note instead of it disappearing. A
+# project from a build whose bound was higher holds such entries (2001 to 2035 bytes could be written
+# before the bound was corrected), and losing a patch without a word is what Task 6's note exists for.
+_TDC_PATCH_RE = re.compile(r"([0-9a-f]{1,16}):((?:[0-9a-f]{2})+)")
 
 
 def _read_patches(text):
@@ -1542,7 +1547,13 @@ class RizinSession:
         after that maps the stack at esil.stack.addr again, exactly like a first one. Only descriptors
         that no map outside ``mem.*`` uses are closed, so the sample's own descriptor is never touched.
         """
-        for fd in rizin_emulation.esil_fds(pipe.cmdj("omlj")):
+        maps = pipe.cmdj("omlj")
+        # the record is all that is left once these maps are closed, and a region the console mapped
+        # (``aeim`` is allowed there) is in the map list but in no record yet (measured: a write into
+        # one became "the range the run wrote" after a stop)
+        for low, high in rizin_emulation.esil_ranges(maps):
+            self._emulation_remember(low, high)
+        for fd in rizin_emulation.esil_fds(maps):
             pipe.cmd(f"o- {fd}")
         self._emulation_stack_map = None
 
@@ -1921,12 +1932,13 @@ class RizinSession:
         """The range the run wrote (gate held); see run_range.
 
         What is left out is every write inside the ESIL VM's own memory, from **both** sources: the
-        maps ``omlj`` lists now (``mem.*``: the stack and the assistant's buffers) and every range this
-        session's emulation has had memory in (_emulation_ranges). Both, because neither alone holds:
-        the map list catches memory nobody recorded, a console ``aeim`` included, but a stop unmaps it
-        all while the write cache keeps the rows -- and then the words a run pushed would become "the
-        range the run wrote", so ``af`` and ``/zj`` would report stack words as decrypted functions and
-        strings. The record catches that; the live list keeps it honest.
+        maps ``omlj`` lists now (``mem.*``: the stack, the assistant's buffers and whatever a console
+        ``aeim`` mapped) and every range this session's emulation has had memory in
+        (_emulation_ranges). Both, because neither alone holds: the live list catches memory nobody
+        recorded, but a stop gives it all back while the write cache keeps the rows -- and then the
+        words a run pushed would become "the range the run wrote", so ``af`` and ``/zj`` would report
+        stack words as decrypted functions and strings. The record catches that, and the sweep adds
+        the live maps to it before closing them, so nothing falls between the two.
         """
         esil = rizin_emulation.esil_ranges(pipe.cmdj("omlj")) + self._emulation_ranges
         rows = [row for row in self._patch_list(pipe) if not row["mine"]
@@ -2719,7 +2731,10 @@ class RizinSession:
             maps = pipe.cmdj("omlj") if cached else None
             for addr, after in patches:
                 data = bytes.fromhex(after)
-                if not cached or not rizin_emulation.maps_hold(addr, len(data), maps):
+                # over the bound: one ``wx`` of it would pass what rizin reads of a command line and
+                # land somewhere else (measured), so it is named in the note rather than written
+                if (not cached or len(data) > rizin_emulation.MAX_PATCH_BYTES
+                        or not rizin_emulation.maps_hold(addr, len(data), maps)):
                     skipped.append(addr)
                     continue
                 entry = rizin_emulation.cache_entry(addr, data)
