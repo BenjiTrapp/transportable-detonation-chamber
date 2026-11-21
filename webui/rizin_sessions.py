@@ -1298,10 +1298,12 @@ class RizinSession:
         self._emulation_big_endian = False
         self._emulation_stack_map = None
         # The API assistant's own counters, which belong to the run: the clock it answers GetTickCount
-        # with (it has to rise, or a timing check sees no time pass) and how many pseudo handles and
-        # addresses it has given out, so that two of them can be told apart.
+        # and the performance counter with (it has to rise, or a timing check sees no time pass) and
+        # how far each pseudo series has been used, so that two handles or two addresses can be told
+        # apart. All three move only where a skip **applies** a value (R38): asking what a call could
+        # answer must not change what it answers, because the run line asks on every step.
         self._assist_tick = rizin_emulation.TICK_START
-        self._assist_handles = 0
+        self._assist_handle = self._assist_pseudo = 0
         # This session's own writes through patch/patch_op, in the order it made them (rizin_emulation.
         # cache_entry). rizin has one write cache, which holds an emulation run's writes too and cannot
         # tell them apart; this mirror can, row by row (see patches). _lost: patches a restarted rizin
@@ -1476,9 +1478,12 @@ class RizinSession:
         """Start the emulation (ESIL) at ``addr``, the current seek if None: io.cache and the guards
         (ESIL_SETTINGS) in one ``e``, io.cache read back, then aei, aeim and aepc. Returns the state.
 
-        A start while one runs maps a new stack (aeim without arguments drops the one it mapped before) and
-        sets the stack pointer, base pointer and PC again. The other registers keep their values: rizin
-        0.9.1's aei does not reset them (measured: rcx=0x1234 survived aeim-; aei; aeim).
+        A start while one runs gives the ESIL memory of the run before it back first
+        (_emulation_unmap), so that the stack is mapped where ESIL_STACK_ADDR says and nothing of the
+        last run is left mapped. Without that sweep rizin 0.9.1 maps a **second** stack at an address
+        of its own once the assistant has mapped a buffer (measured: esp = 0x10078000 beside a live
+        mem.0x100000_0xf0000), and the orphan stays for the session. The other registers keep their
+        values: rizin's aei does not reset them (measured: rcx=0x1234 survived aeim-; aei; aeim).
         """
         if addr is not None:
             addr = _address(addr)
@@ -1490,6 +1495,7 @@ class RizinSession:
                 raise RizinRefused("addr is missing: the session has no current address")
             pipe.cmd("e " + " ".join(ESIL_SETTINGS))
             self._require_io_cache(pipe)
+            self._emulation_unmap(pipe)
             pipe.cmd("aei")
             pipe.cmd("aeim")
             pipe.cmd(f"aepc {pc:#x}")
@@ -1506,14 +1512,33 @@ class RizinSession:
         return self._call("emulation", wait, run)
 
     def emulation_stop(self, wait=2.0):
-        """Leave the emulation: aeim- unmaps its stack. The cache's writes stay (they are the patches)."""
+        """Leave the emulation: its memory is unmapped (_emulation_unmap). The cache's writes stay
+        (they are the patches)."""
         def run(pipe):
             if self._emulation is pipe:
-                pipe.cmd("aeim-")
+                self._emulation_unmap(pipe)
             self._emulation = None
             return {"running": False}
 
         return self._call("emulation", wait, run)
+
+    def _emulation_unmap(self, pipe):
+        """Give the ESIL VM's memory back (gate held): the assistant's buffers first, the stack last.
+
+        **Not** with rizin's own ``aeim-``, which cannot do it (all measured on 0.9.1): it drops the
+        map it made last, and once an ``aeim <addr> <size> <name>`` has existed it can never name the
+        stack map again -- it says "cannot deinitialize mem.0x10000000_0xf0000" and leaves the stack
+        mapped, whether the buffers went first with ``om-``, with ``o-`` or not at all. A plain
+        ``aeim`` then maps a *second* stack somewhere else and keeps the orphan.
+
+        Closing the file descriptor of each of those maps (``o- <fd>``) removes the map **and** frees
+        its memory (measured: ``ol`` loses the malloc:// entry, while ``om-`` keeps it), and a start
+        after that maps the stack at esil.stack.addr again, exactly like a first one. Only descriptors
+        that no map outside ``mem.*`` uses are closed, so the sample's own descriptor is never touched.
+        """
+        for fd in rizin_emulation.esil_fds(pipe.cmdj("omlj")):
+            pipe.cmd(f"o- {fd}")
+        self._emulation_stack_map = None
 
     def emulation_state(self, wait=2.0):
         """The emulation's registers, PC, stack and the registers that changed (see _emulation_read)."""
@@ -1569,13 +1594,18 @@ class RizinSession:
                 stopped = self._emulation_to_call(pipe)
             else:
                 stopped = self._emulation_command(pipe, kind, command, addr)
-            state = self._emulation_read(pipe)
-            if stopped == "step" and state["pc"] is not None and not rizin_emulation.is_executable(state["pc"], maps):
-                stopped = "trap"
-            state["stopped"] = stopped
-            return state
+            return self._emulation_finish(pipe, stopped, maps)
 
         return self._call("emulation", wait, run)
+
+    def _emulation_finish(self, pipe, stopped, maps):
+        """The state after a run (gate held), with ``stopped``: why it stopped. A PC where nothing can
+        execute is a trap even though rizin says so only at the next step."""
+        state = self._emulation_read(pipe)
+        if stopped == "step" and state["pc"] is not None and not rizin_emulation.is_executable(state["pc"], maps):
+            stopped = "trap"
+        state["stopped"] = stopped
+        return state
 
     def _emulation_prepare(self, pipe):
         """What every run does before it runs (gate held): the settings of the start again, io.cache read
@@ -1826,10 +1856,11 @@ class RizinSession:
         the run wrote nothing.
 
         The run's writes are the rows of the write cache that are not this session's patches (``mine``),
-        minus those in the stack that the start mapped: a word a call pushed is no code to analyse.
-        What is left is grouped (rizin_emulation.write_cluster), and the group that holds the most bytes
-        is the range -- a run that pushed a word here and decrypted a block there must not become one
-        span of everything in between.
+        minus those in the ESIL VM's own memory: a word a call pushed is no code to analyse, and neither
+        is a byte in a buffer the assistant mapped. What is left is grouped
+        (rizin_emulation.write_cluster), and the group that holds the most bytes is the range -- a run
+        that pushed a word here and decrypted a block there must not become one span of everything in
+        between.
         """
         return self._call("emulation", wait, self._run_range)
 
@@ -1874,11 +1905,18 @@ class RizinSession:
                                f"range is {high - low + 1}: analyse it in parts")
 
     def _run_range(self, pipe):
-        """The range the run wrote (gate held); see run_range."""
-        stack = self._emulation_stack_map
+        """The range the run wrote (gate held); see run_range.
+
+        What is left out is every write inside one of the ESIL VM's own maps as ``omlj`` lists them
+        (``mem.*``: the stack aeim mapped and the buffers the assistant mapped), not only the stack
+        this session recorded at its start. R37(b): the recorded stack can be the *wrong* one -- rizin
+        maps a second stack at an address of its own when one is already there (measured) -- and then
+        the words the last run pushed would become "the range the run wrote", so `af` and `/zj` would
+        report stack words as decrypted functions and strings. The map list cannot go stale that way.
+        """
+        esil = rizin_emulation.esil_ranges(pipe.cmdj("omlj"))
         rows = [row for row in self._patch_list(pipe) if not row["mine"]
-                and not (stack is not None and row["addr"] < stack[1]
-                         and stack[0] < row["addr"] + row["size"])]
+                and not rizin_emulation.overlaps_any(row["addr"], row["size"], esil)]
         return rizin_emulation.write_cluster(rows)
 
     def _reanalyze_functions(self, pipe, low, high):
@@ -1941,9 +1979,14 @@ class RizinSession:
         and says in ``summary`` what SKIP would do with it. Every value is a proposal: call_skip takes
         the value and the stack correction from the request, so the analyst can change either.
 
-        It needs **no** running emulation -- a call can be read before one starts -- but a value that
-        only the VM has (a buffer's size from a register or the stack, the tick counter, memcpy's
-        arguments) is then None and the summary says why.
+        It **changes nothing** (R38), not even the session's own clock or its pseudo-value series: the
+        run line asks for this on every step, so two answers for the same call are the same answer, and
+        the value cannot move between looking at it and applying it. The series move where a skip
+        applies them.
+
+        It needs no running emulation -- a call can be read before one starts -- but a value that only
+        the VM has (a buffer's size from a register or the stack, the tick counter, memcpy's arguments)
+        is then None and the summary says why.
 
         On an arch other than x86-32 and x86-64 the assistant switches itself off: ``supported`` false
         and a ``reason`` that names the arch. Emulation, breakpoints and patching keep working there;
@@ -1961,10 +2004,12 @@ class RizinSession:
             if api is None:
                 return dict(self._assist_answer(conv), api=name and _show(name, 120),
                             summary=self._assist_unknown(conv, name))
-            value, note = self._assist_value(pipe, conv, api)
+            plan = self._assist_plan(pipe, conv, api, pipe.cmdj("omlj"))
             fix = rizin_emulation.stack_fix(conv, api["args"])
-            return dict(self._assist_answer(conv), api=api["name"], value=value, stack_fix=fix,
-                        summary=f"skip {api['name']}: {note}. {self._assist_stack_note(conv, api, fix)}")
+            notes = [plan["note"]] + [write["note"] for write in plan["out"]]
+            return dict(self._assist_answer(conv), api=api["name"], value=plan["value"], stack_fix=fix,
+                        summary=f"skip {api['name']}: {'; '.join(n for n in notes if n)}. "
+                                f"{self._assist_stack_note(conv, api, fix)}")
 
         return self._call("emulation", wait, run)
 
@@ -1973,15 +2018,18 @@ class RizinSession:
 
         ``value`` goes into the return register (None leaves it as it is), ``stack_fix`` is added to the
         stack pointer. Both come from the request, not from the table: the analyst may have edited
-        them. A memory API's buffer is mapped and a copying one really copies, both at the addresses
-        the call's own arguments name.
+        them. A memory API's buffer is mapped, a copying one really copies and the time and environment
+        APIs write their out-parameter, all at the addresses the call's own arguments name.
 
         The order follows what rizin does: the buffer is mapped **first**, because ``aeim`` sets the PC
         and the stack and base pointer into the map it has just made (measured: the PC to the seek, SP
         and BP to the middle of the new map), so those three are read before it and written back after
         it. Then the call is skipped the way a SKIP run does -- which sets the PC itself for a call
         through the import table, because rizin's ``aess`` runs into that one (R18) -- then the return
-        register, then the stack correction, then the copy.
+        register, then the stack correction, then the copy and the out-parameters.
+
+        This is also the only place where the run's clock and the pseudo-value series move on, so that
+        asking what a call could answer never changes what it answers (R38).
         """
         addr = _address(addr)
         if value is not None:
@@ -2001,11 +2049,11 @@ class RizinSession:
             api = rizin_emulation.lookup_api(self._assist_call(pipe, addr)[1])
             conv = rizin_emulation.convention(self.arch, self.bits, api)
             fix = self._assist_fix(pipe, conv, stack_fix)
+            # planned before the skip: the arguments sit on the stack that the correction moves
+            plan = self._assist_plan(pipe, conv, api, maps) if api else None
             notes = []
-            # read before the skip: a copy's arguments are read from the stack the correction moves
-            plan = self._assist_copy(pipe, conv, api) if api and api["ret"] == "copy" else None
-            if api and api["ret"] == "buffer" and value is not None:
-                notes.append(self._assist_map(pipe, maps, conv, api, value))
+            if plan is not None and plan["buffer"] and value is not None:
+                notes.append(self._assist_map(pipe, maps, plan, value))
             stopped = self._emulation_command(pipe, "skip", rizin_emulation.STEP_COMMANDS["skip"], None)
             if value is not None:
                 pipe.cmd(f"ar {conv['ret_reg']}={value:#x}")
@@ -2016,11 +2064,9 @@ class RizinSession:
                 pipe.cmd(f"ar SP={sp + fix:#x}")
                 notes.append(f"the stack pointer went up by {fix} bytes")
             if plan is not None:
-                notes.append(self._assist_write(pipe, plan))
-            state = self._emulation_read(pipe)
-            if stopped == "step" and state["pc"] is not None and not rizin_emulation.is_executable(state["pc"], maps):
-                stopped = "trap"
-            state["stopped"] = stopped
+                notes += self._assist_apply(pipe, plan)
+                self._assist_advance(plan)
+            state = self._emulation_finish(pipe, stopped, maps)
             state["summary"] = (f"skipped {api['name'] if api else 'the call'} at {addr:#x}: "
                                 + ("; ".join(notes) if notes else "the PC is after the call, and nothing "
                                                                   "else was changed"))
@@ -2087,76 +2133,99 @@ class RizinSession:
             if self._emulation is pipe else set()
         return kind, rizin_emulation.flag_hint(pipe.cmdj(f"fd.j @ {target:#x}"), registers)
 
-    def _assist_value(self, pipe, conv, api):
-        """(the value for the return register or None, what the summary says about it) for the row
-        ``api`` of the table (gate held)."""
-        answer = api["ret"]
-        if answer == "zero":
-            return 0, f"{conv['ret_reg']} = 0, the answer of a machine that is not being watched"
-        if answer == "success":
-            return 1, (f"{conv['ret_reg']} = 1, the call reports success; nothing is written to its "
-                       f"out-parameters")
-        if answer == "none":
-            return None, "no register is set, because the call has no return value"
-        if answer == "handle":
-            return self._assist_next(rizin_emulation.ASSIST_HANDLE), \
-                f"{conv['ret_reg']} = a pseudo handle, in no map, so nothing is ever read through it"
-        if self._emulation is not pipe:
-            return None, ("no value yet: the emulation is not started, and this one is read from it "
-                          "(the arguments of the call, or the run's own clock)")
-        if answer == "tick":
-            self._assist_tick += rizin_emulation.TICK_STEP
-            return self._assist_tick, (f"{conv['ret_reg']} = {self._assist_tick} ms, a rising clock, so "
-                                       f"that a timing check sees time pass and no debugger")
-        if answer == "buffer":
-            return self._assist_buffer(pipe, conv, api)
-        if answer == "copy":
-            plan = self._assist_copy(pipe, conv, api)
-            return plan["dst"], plan["note"]
-        if answer == "address":
-            return self._assist_address(pipe, conv, api)
-        return None, f"no value: the table's answer '{_show(str(answer))}' is one this build cannot build"
+    def _assist_plan(self, pipe, conv, api, maps):
+        """What this call can answer and what applying it would do (gate held), as one plan:
 
-    def _assist_buffer(self, pipe, conv, api):
-        """(the address of a buffer for this call, the summary's words) (gate held): the size the call
-        asks for, rounded to pages, in memory that collides with neither the file's maps nor the stack
-        nor a buffer an earlier call was given."""
+        ``value`` and ``note`` for the return register, ``buffer`` the bytes a memory API's buffer
+        needs (0 for none), ``copy`` what a copying API would move, ``out`` the out-parameter writes
+        with the words for each, and ``advance`` the series a skip would move on (R38: this reads, it
+        never moves them).
+        """
+        plan = {"value": None, "note": "", "buffer": 0, "copy": None, "copy_note": "", "out": [],
+                "advance": {}, "clock": self._assist_tick + rizin_emulation.TICK_STEP}
+        answer, running = api["ret"], self._emulation is pipe
+        if answer == "zero":
+            plan.update(value=0, note=f"{conv['ret_reg']} = 0, the answer of a machine that is not "
+                                      f"being watched")
+        elif answer == "success":
+            plan.update(value=1, note=f"{conv['ret_reg']} = 1, the call reports success")
+        elif answer == "none":
+            plan["note"] = "no register is set, because the call has no return value"
+        elif answer == "handle":
+            value, step = rizin_emulation.pseudo_value(maps, rizin_emulation.ASSIST_HANDLE,
+                                                       self._assist_handle)
+            if value is None:
+                plan["note"] = "no value: this session's pseudo handles are used up; set one by hand"
+            else:
+                plan.update(value=value, advance={"handle": step},
+                            note=f"{conv['ret_reg']} = {value:#x}, a pseudo handle that lies in no map "
+                                 f"of this file, so nothing is ever read through it")
+        elif not running:
+            plan["note"] = ("no value yet: the emulation is not started, and this one is read from it "
+                            "(the arguments of the call, or the run's own clock)")
+        elif answer == "tick":
+            plan.update(value=plan["clock"], advance={"tick": True},
+                        note=f"{conv['ret_reg']} = {plan['clock']} ms, a clock that rises with every "
+                             f"skip, so that a timing check sees time pass and no debugger")
+        elif answer == "buffer":
+            self._assist_buffer(pipe, conv, api, maps, plan)
+        elif answer == "copy":
+            self._assist_copy(pipe, conv, api, maps, plan)
+        elif answer == "address":
+            self._assist_address(pipe, conv, maps, plan)
+        else:
+            plan["note"] = f"no value: the table's answer '{_show(str(answer))}' is one this build " \
+                           f"cannot build"
+        if running:
+            self._assist_out(pipe, conv, api, maps, plan)
+        elif api.get("out"):
+            plan["out"] = [{"addr": None, "data": None,
+                            "note": "nothing is written to the call's out-parameters: the emulation is "
+                                    "not started, so their pointers cannot be read"}]
+        return plan
+
+    def _assist_buffer(self, pipe, conv, api, maps, plan):
+        """Plan a buffer for a memory API (gate held): the size the call asks for, rounded to pages, in
+        memory that collides with neither the file's maps nor the stack nor a buffer an earlier call
+        was given."""
         size = rizin_emulation.buffer_size(self._assist_arg(pipe, conv, api["size_arg"]))
         if size is None:
-            return None, (f"no value: the size this call asks for (argument {api['size_arg'] + 1}) could "
-                          f"not be read, or is above {rizin_emulation.ASSIST_BUFFER_MAX} bytes")
-        at = rizin_emulation.free_span(pipe.cmdj("omlj"), size)
+            plan["note"] = (f"no value: the size this call asks for (argument {api['size_arg'] + 1}) "
+                            f"could not be read, or is above {rizin_emulation.ASSIST_BUFFER_MAX} bytes")
+            return
+        at = rizin_emulation.free_span(maps, size)
         if at is None:
-            return None, f"no value: no free place for {size} bytes was found in the emulation's memory"
-        return at, (f"{conv['ret_reg']} = {at:#x}, a new buffer of {size} bytes that SKIP maps in the "
-                    f"emulation's memory (aeim), so the code after it can really write into it")
+            plan["note"] = f"no value: no free place for {size} bytes was found in the emulation's memory"
+            return
+        plan.update(value=at, buffer=size,
+                    note=f"{conv['ret_reg']} = {at:#x}, a new buffer of {size} bytes that SKIP maps in "
+                         f"the emulation's memory (aeim), so the code after it can really write into it")
 
-    def _assist_copy(self, pipe, conv, api):
-        """The copy a copying API would make (gate held): {"dst", "src", "size", "note"}; ``size`` is 0
-        where nothing may be copied, and the note then says why.
-
-        Bounded to ASSIST_COPY_MAX bytes (one ``wx``), and both ends have to lie in one map each: where
-        nothing is mapped rizin reads 0xff, and copying that would put bytes nobody asked for into the
-        file's memory while the summary claimed an unpacking step.
-        """
+    def _assist_copy(self, pipe, conv, api, maps, plan):
+        """Plan the copy a copying API makes (gate held). Bounded to ASSIST_COPY_MAX bytes, and both
+        ends have to lie in one map each: where nothing is mapped rizin reads 0xff, and copying that
+        would put bytes nobody asked for into the file's memory while the summary claimed a step of an
+        unpacking."""
         dst, src, size = (self._assist_arg(pipe, conv, i) for i in range(3))
-        plan = {"dst": dst, "src": src, "size": 0}
+        plan["value"] = dst
         if dst is None or src is None or size is None:
-            return dict(plan, note="nothing is copied: the arguments of the call could not be read")
-        if not 0 < size <= rizin_emulation.ASSIST_COPY_MAX:
-            return dict(plan, note=f"{size} bytes are not copied: at most "
-                                   f"{rizin_emulation.ASSIST_COPY_MAX} bytes are moved at once")
-        maps = pipe.cmdj("omlj")
-        if not (rizin_emulation.maps_hold(src, size, maps) and rizin_emulation.maps_hold(dst, size, maps)):
-            return dict(plan, note=f"{size} bytes are not copied: {src:#x} or {dst:#x} is not in one "
-                                   f"map of the emulation, and rizin reads 0xff where nothing is mapped")
-        return dict(plan, size=size,
-                    note=f"{conv['ret_reg']} = {dst:#x}, and {size} bytes are really copied from "
-                         f"{src:#x} to {dst:#x}, which is what the call returns")
+            plan["copy_note"] = "nothing is copied: the arguments of the call could not be read"
+        elif not 0 < size <= rizin_emulation.ASSIST_COPY_MAX:
+            plan["copy_note"] = (f"{size} bytes are not copied: at most "
+                                 f"{rizin_emulation.ASSIST_COPY_MAX} bytes are moved at once")
+        elif not (rizin_emulation.maps_hold(src, size, maps)
+                  and rizin_emulation.maps_hold(dst, size, maps)):
+            plan["copy_note"] = (f"{size} bytes are not copied: {src:#x} or {dst:#x} is not in one map "
+                                 f"of the emulation, and rizin reads 0xff where nothing is mapped")
+        else:
+            plan["copy"] = (dst, src, size)
+            plan["copy_note"] = f"{size} bytes are copied from {src:#x} to {dst:#x}"
+        plan["note"] = (f"{conv['ret_reg']} = {dst:#x}, which is what the call returns, and "
+                        if dst is not None else "") + plan["copy_note"]
 
-    def _assist_address(self, pipe, conv, api):
-        """(the address GetProcAddress answers, the summary's words) (gate held): the address the file's
-        import table gives for the name the call asks for, else a pseudo address.
+    def _assist_address(self, pipe, conv, maps, plan):
+        """Plan what GetProcAddress answers (gate held): the address the file's import table gives for
+        the name the call asks for, else a pseudo address.
 
         The name is read from the argument's pointer (``pxj``), has to look like an export's name, and
         is compared with ``iij``'s names in Python -- it never goes into a command. A pseudo address is
@@ -2165,25 +2234,108 @@ class RizinSession:
         [0x1400093a8:8]=0x96b8).
         """
         at = self._assist_arg(pipe, conv, 1)
-        name = None
-        if at is not None:
-            name = rizin_emulation.read_cstring(pipe.cmdj(f"pxj 64 @ {at:#x}"))
+        name = rizin_emulation.read_cstring(pipe.cmdj(f"pxj 64 @ {at:#x}")) if at is not None else None
         if name is not None:
             for entry in pipe.cmdj("iij", limit=VIEW_ANSWER_MAX) or []:
                 if (isinstance(entry, dict) and entry.get("name") == name
                         and isinstance(entry.get("plt"), int) and not isinstance(entry["plt"], bool)):
-                    return entry["plt"], (f"{conv['ret_reg']} = {entry['plt']:#x}, where this file "
-                                          f"imports '{_show(name, 120)}'")
-        pseudo = self._assist_next(rizin_emulation.ASSIST_PSEUDO)
+                    plan.update(value=entry["plt"],
+                                note=f"{conv['ret_reg']} = {entry['plt']:#x}, where this file imports "
+                                     f"'{_show(name, 120)}'")
+                    return
+        value, step = rizin_emulation.pseudo_value(maps, rizin_emulation.ASSIST_PSEUDO,
+                                                   self._assist_pseudo)
         asked = f"'{_show(name, 120)}'" if name else "the name"
-        return pseudo, (f"{conv['ret_reg']} = {pseudo:#x}, a pseudo address: {asked} is not an import of "
-                        f"this file, and an ESIL run has no loaded module to take a real one from")
+        if value is None:
+            plan["note"] = "no value: this session's pseudo addresses are used up; set one by hand"
+            return
+        plan.update(value=value, advance={"pseudo": step},
+                    note=f"{conv['ret_reg']} = {value:#x}, a pseudo address in no map: {asked} is not "
+                         f"an import of this file, and an ESIL run has no loaded module to take a real "
+                         f"one from")
 
-    def _assist_next(self, base):
-        """The next pseudo value from ``base``: one per call of this session, so that two handles or two
-        addresses can be told apart in a register and in the stack."""
-        self._assist_handles += 1
-        return base + (self._assist_handles - 1) * rizin_emulation.ASSIST_SPACING
+    def _assist_out(self, pipe, conv, api, maps, plan):
+        """Plan the out-parameter writes of a row that has them (gate held): the pointer comes from the
+        argument the row names, the bytes from rizin_emulation.out_bytes.
+
+        Spec §4 asks for the **values** here, not only a return code: a QueryPerformanceCounter whose
+        counter is never written lets a timing check see no time pass at all, and a GetComputerName
+        that writes nothing answers no name. A pointer that is in no map writes nothing and says so,
+        the way the buffer and the copy do.
+        """
+        for index, kind in api.get("out", ()):
+            data, what = rizin_emulation.out_bytes(kind, api, plan["clock"])
+            if data is None:
+                continue
+            at = self._assist_arg(pipe, conv, index)
+            if at is None:
+                plan["out"].append({"addr": None, "data": None,
+                                    "note": f"{what} is not written: argument {index + 1}, which holds "
+                                            f"its pointer, could not be read"})
+            elif not rizin_emulation.maps_hold(at, len(data), maps):
+                plan["out"].append({"addr": at, "data": None,
+                                    "note": f"{what} is not written: {at:#x} is not in one map of the "
+                                            f"emulation"})
+            else:
+                plan["out"].append({"addr": at, "data": data,
+                                    "note": f"{what} goes to {at:#x} ({len(data)} bytes)"})
+                if kind in ("counter", "filetime"):
+                    # the clock moves because this write used it, and only where it was really written
+                    plan["advance"]["tick"] = True
+
+    def _assist_apply(self, pipe, plan):
+        """Write what the plan holds beside the register and the stack (gate held): the copy and the
+        out-parameters; the words for the summary, including for what was *not* written."""
+        notes = []
+        if plan["copy"] is not None:
+            dst, src, size = plan["copy"]
+            self._assist_write(pipe, dst, self._assist_read(pipe, src, size))
+            notes.append(f"{size} bytes were copied from {src:#x} to {dst:#x}")
+        elif plan["copy_note"]:
+            notes.append(plan["copy_note"])
+        for write in plan["out"]:
+            if write["data"] is not None:
+                self._assist_write(pipe, write["addr"], write["data"])
+            notes.append(write["note"])
+        return notes
+
+    def _assist_advance(self, plan):
+        """Move the series this skip has applied on (R38: only here, never when a value is offered), so
+        that the next clock reading is later and the next pseudo value is another one."""
+        advance = plan["advance"]
+        if advance.get("tick"):
+            self._assist_tick = plan["clock"]
+        if "handle" in advance:
+            self._assist_handle = advance["handle"] + 1
+        if "pseudo" in advance:
+            self._assist_pseudo = advance["pseudo"] + 1
+
+    @staticmethod
+    def _assist_read(pipe, addr, size):
+        """``size`` bytes from ``addr`` (gate held), read in ASSIST_READ_CHUNK pieces so that no one
+        ``pxj`` answer has to hold a megabyte of JSON numbers."""
+        data = bytearray()
+        while len(data) < size:
+            want = min(rizin_emulation.ASSIST_READ_CHUNK, size - len(data))
+            found = pipe.cmdj(f"pxj {want} @ {addr + len(data):#x}")
+            if not (isinstance(found, list) and len(found) == want
+                    and all(isinstance(b, int) and 0 <= b < 256 for b in found)):
+                raise ValueError("pxj did not answer a list of bytes")
+            data += bytes(found)
+        return bytes(data)
+
+    @staticmethod
+    def _assist_write(pipe, addr, data):
+        """Write ``data`` at ``addr`` through the write cache (gate held), in ASSIST_WRITE_CHUNK pieces.
+
+        The chunk is not tidiness: rizin 0.9.1 writes **nothing at all** for a ``wx`` whose command
+        line passes about 4 KB and says so on stderr only, which ``cmd`` never reads (measured: 0x500
+        bytes land, 0x7ff bytes do not). The bytes go through ``wx``, so they are the run's own, like
+        every other byte a run writes: they stay out of the project and end with the session.
+        """
+        step = rizin_emulation.ASSIST_WRITE_CHUNK
+        for at in range(0, len(data), step):
+            pipe.cmd(f"wx {data[at:at + step].hex()} @ {addr + at:#x}")
 
     def _assist_arg(self, pipe, conv, index):
         """The ``index``-th argument of the call the PC stands on, or None (gate held).
@@ -2232,7 +2384,7 @@ class RizinSession:
                                    f"emulation's stack: set it by hand, or start the emulation again")
         return fix
 
-    def _assist_map(self, pipe, maps, conv, api, value):
+    def _assist_map(self, pipe, maps, plan, value):
         """Map the buffer a memory API answers with, at ``value`` (gate held); the summary's words.
 
         rizin's ``aeim`` moves the VM into the map it has just made -- the PC to the seek, the stack and
@@ -2240,10 +2392,7 @@ class RizinSession:
         the three registers are read first and written back afterwards. A buffer over something that is
         mapped already is **not** mapped: it would shadow the file's bytes or the stack.
         """
-        size = rizin_emulation.buffer_size(self._assist_arg(pipe, conv, api["size_arg"]))
-        if size is None:
-            return (f"no memory was mapped: the size this call asks for could not be read, or is above "
-                    f"{rizin_emulation.ASSIST_BUFFER_MAX} bytes")
+        size = plan["buffer"]
         if not rizin_emulation.span_is_free(maps, value, size):
             return f"no memory was mapped at {value:#x}: something is mapped there already"
         before = {role: self._emulation_role(pipe, role) for role in ("PC", "SP", "BP")}
@@ -2252,23 +2401,6 @@ class RizinSession:
             if was is not None:
                 pipe.cmd(f"ar {role}={was:#x}")
         return f"a buffer of {size} bytes was mapped at {value:#x}"
-
-    @staticmethod
-    def _assist_write(pipe, plan):
-        """Make the copy of ``_assist_copy``'s plan (gate held); the summary's words.
-
-        It goes through ``wx``, so the bytes land in rizin's write cache as every other byte a run
-        writes does -- they belong to the run, not to the file, and nothing of them goes into the
-        project (see patches).
-        """
-        if not plan["size"]:
-            return plan["note"]
-        data = pipe.cmdj(f"pxj {plan['size']} @ {plan['src']:#x}")
-        if not (isinstance(data, list) and len(data) == plan["size"]
-                and all(isinstance(b, int) and 0 <= b < 256 for b in data)):
-            raise ValueError("pxj did not answer a list of bytes")
-        pipe.cmd(f"wx {bytes(data).hex()} @ {plan['dst']:#x}")
-        return f"{plan['size']} bytes were copied from {plan['src']:#x} to {plan['dst']:#x}"
 
     def _require_emulation(self, pipe):
         # A rizin that was restarted (a hung analysis step) has no emulation, whatever ran before.

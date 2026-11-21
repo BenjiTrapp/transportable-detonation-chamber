@@ -525,7 +525,7 @@ def test_the_api_table_is_data_in_one_shape():
     four fields, and every answer is one the assistant can actually build."""
     for name, api in rizin_emulation.API_TABLE.items():
         assert re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name), name
-        assert set(api) <= {"conv", "args", "ret", "size_arg"}, name
+        assert set(api) <= {"conv", "args", "ret", "size_arg", "out"}, name
         assert api["conv"] in ("win64", "stdcall", "cdecl"), name
         assert isinstance(api["args"], int) and 0 <= api["args"] <= rizin_emulation.ASSIST_MAX_ARGS, name
         assert api["ret"] in rizin_emulation.ANSWERS, name
@@ -533,6 +533,11 @@ def test_the_api_table_is_data_in_one_shape():
             assert 0 <= api["size_arg"] < api["args"], name
         else:
             assert "size_arg" not in api, name
+        for index, what in api.get("out", ()):
+            # an out-parameter's pointer is one of the call's own arguments, and what goes there is
+            # one of the kinds out_bytes can build
+            assert 0 <= index < api["args"] and what in rizin_emulation.OUT_WRITES, name
+            assert rizin_emulation.out_bytes(what, api, rizin_emulation.TICK_START)[0] is not None, name
         assert rizin_emulation.lookup_api(name)["name"] == name
     # the seven groups of the spec's table are in it
     for name in ("VirtualAlloc", "HeapAlloc", "malloc", "VirtualProtect", "LoadLibrary",
@@ -587,3 +592,105 @@ def test_read_cstring_takes_the_name_before_the_first_nul():
         assert rizin_emulation.read_cstring(list(data)) is None, data
     assert rizin_emulation.read_cstring("Sleep\0") is None and rizin_emulation.read_cstring(None) is None
     assert rizin_emulation.read_cstring([0x41, 300, 0]) is None, "pxj answers bytes"
+
+
+def test_esil_ranges_and_fds_name_the_vms_own_memory():
+    """R37: what the emulation's own memory is, told from the file's by the name aeim gives it. The
+    ranges keep a run's pushed words out of the range a re-analysis takes (a pushed word is no code),
+    and the descriptors are what a stop closes to give the memory back."""
+    maps = [{"map": 1, "fd": 3, "from": 0x140000000, "to": 0x140000400, "perm": "r-x", "name": "fmap..text"},
+            {"map": 2, "fd": 3, "from": 0x140001000, "to": 0x140002000, "perm": "r--", "name": "fmap..data"},
+            {"map": 3, "fd": 4, "from": 0x100000, "to": 0x1F0000, "perm": "rw-", "name": "mem.0x100000_0xf0000"},
+            {"map": 4, "fd": 5, "from": 0x50000000, "to": 0x50001000, "perm": "rw-", "name": "mem.assist"}]
+    assert rizin_emulation.esil_ranges(maps) == [(0x100000, 0x1F0000), (0x50000000, 0x50001000)]
+    assert rizin_emulation.esil_ranges([]) == [] and rizin_emulation.esil_ranges(None) == []
+    # the newest map first, so a stop gives the assistant's buffers back before the stack
+    assert rizin_emulation.esil_fds(maps) == [5, 4]
+    # a descriptor the file is mapped through is never closed, whatever a map of it is called
+    shared = maps + [{"map": 5, "fd": 5, "from": 0x200000, "to": 0x201000, "perm": "r--", "name": "fmap..x"}]
+    assert rizin_emulation.esil_fds(shared) == [4]
+    assert rizin_emulation.esil_fds([]) == [] and rizin_emulation.esil_fds(None) == []
+    # one descriptor is named once, however many maps of it there are
+    twice = maps + [{"map": 5, "fd": 5, "from": 0x51000000, "to": 0x51001000, "perm": "rw-",
+                     "name": "mem.assist"}]
+    assert rizin_emulation.esil_fds(twice) == [5, 4]
+
+
+def test_overlaps_any_finds_a_write_inside_the_vms_memory():
+    ranges = [(0x100000, 0x1F0000), (0x50000000, 0x50001000)]
+    assert rizin_emulation.overlaps_any(0x178000, 8, ranges)
+    assert rizin_emulation.overlaps_any(0x1EFFFF, 1, ranges)
+    assert rizin_emulation.overlaps_any(0xFFFFC, 8, ranges), "reaches into the stack from below"
+    assert not rizin_emulation.overlaps_any(0x1F0000, 8, ranges), "a range's end is not in it"
+    assert not rizin_emulation.overlaps_any(0x140002000, 8, ranges)
+    assert not rizin_emulation.overlaps_any(0x178000, 0, ranges) and not rizin_emulation.overlaps_any(
+        0x178000, None, ranges)
+    assert not rizin_emulation.overlaps_any(0x178000, 8, [])
+
+
+def test_pseudo_value_is_bounded_and_really_in_no_map():
+    """Important 4: these values are offered *because* nothing is mapped at them, so that a run which
+    calls or reads one traps instead of running on through nothing. A dump can have maps anywhere."""
+    base, step = rizin_emulation.ASSIST_HANDLE, rizin_emulation.ASSIST_SPACING
+    assert rizin_emulation.pseudo_value([], base, 0) == (base, 0)
+    assert rizin_emulation.pseudo_value(None, base, 3) == (base + 3 * step, 3)
+    # a map over the first two values moves the series on, and says which step it used
+    dump = [{"from": base, "to": base + 2 * step, "perm": "rw-", "name": "mmap.dump"}]
+    assert rizin_emulation.pseudo_value(dump, base, 0) == (base + 2 * step, 2)
+    # used up: nothing is offered rather than a value in someone else's map
+    whole = [{"from": base, "to": base + rizin_emulation.ASSIST_PSEUDO_TRIES * step, "name": "mmap.dump"}]
+    assert rizin_emulation.pseudo_value(whole, base, 0) == (None, 0)
+    assert rizin_emulation.pseudo_value([], base, rizin_emulation.ASSIST_PSEUDO_TRIES) == (None, rizin_emulation.ASSIST_PSEUDO_TRIES)
+    for index in (None, -1, True, 1.5):
+        assert rizin_emulation.pseudo_value([], base, index) == (None, 0), index
+    # the two series cannot reach into each other: 256 steps of 0x10000 fill the space between them
+    assert base + rizin_emulation.ASSIST_PSEUDO_TRIES * step <= rizin_emulation.ASSIST_PSEUDO
+
+
+def test_out_bytes_are_the_values_the_spec_asks_for():
+    """Important 3: the time and environment groups answer with the **value**, not just a return code.
+    A QueryPerformanceCounter whose counter is never written lets a timing check see no time pass."""
+    api = rizin_emulation.lookup_api("QueryPerformanceCounter")
+    data, what = rizin_emulation.out_bytes("counter", api, rizin_emulation.TICK_START)
+    assert len(data) == 8 and "performance counter" in what
+    # the same elapsed time as the tick clock: 10 MHz, so 10 000 counts per millisecond
+    assert int.from_bytes(data, "little") == rizin_emulation.TICK_START * 10000
+    later = rizin_emulation.out_bytes("counter", api, rizin_emulation.TICK_START + rizin_emulation.TICK_STEP)[0]
+    assert int.from_bytes(later, "little") > int.from_bytes(data, "little")
+    frequency = rizin_emulation.out_bytes("frequency", api, 0)[0]
+    assert len(frequency) == 8 and int.from_bytes(frequency, "little") == rizin_emulation.ASSIST_QPC_FREQUENCY
+    # a FILETIME is 100 ns units since 1601 and rises with the same clock
+    stamp = rizin_emulation.out_bytes("filetime", api, rizin_emulation.TICK_START)[0]
+    assert len(stamp) == 8 and int.from_bytes(stamp, "little") == \
+        rizin_emulation.ASSIST_FILETIME_BASE + rizin_emulation.TICK_START * 10000
+
+    # the ANSI and the Unicode form of a call write the name in their own encoding
+    ansi = rizin_emulation.lookup_api("sym.imp.KERNEL32.dll_GetComputerNameA")
+    wide = rizin_emulation.lookup_api("sym.imp.KERNEL32.dll_GetComputerNameW")
+    assert ansi["wide"] is False and wide["wide"] is True
+    assert rizin_emulation.out_bytes("computer", ansi, 0)[0] == \
+        rizin_emulation.ASSIST_COMPUTER.encode("ascii") + b"\0"
+    assert rizin_emulation.out_bytes("computer", wide, 0)[0] == \
+        rizin_emulation.ASSIST_COMPUTER.encode("utf-16-le") + b"\0\0"
+    # the in/out size that goes with the name is its length in characters, not in bytes
+    assert rizin_emulation.out_bytes("chars", wide, 0)[0] == \
+        len(rizin_emulation.ASSIST_COMPUTER).to_bytes(4, "little")
+    assert rizin_emulation.out_bytes("user", ansi, 0)[0] == rizin_emulation.ASSIST_USER.encode("ascii") + b"\0"
+    serial = rizin_emulation.out_bytes("serial", ansi, 0)[0]
+    assert int.from_bytes(serial, "little") == rizin_emulation.ASSIST_SERIAL and len(serial) == 4
+    # nothing of this names a VM
+    for value in (rizin_emulation.ASSIST_COMPUTER, rizin_emulation.ASSIST_USER, rizin_emulation.ASSIST_VOLUME):
+        assert not any(mark in value.lower() for mark in
+                       ("vbox", "vmware", "virtual", "qemu", "xen", "sandbox", "malware", "sample")), value
+    assert rizin_emulation.out_bytes("nothing_like_this", ansi, 0) == (None, None)
+
+
+def test_the_copy_bound_and_the_write_chunk_follow_what_rizin_does():
+    """R36: 4096 bytes made the common unpacker shape -- a section-sized memcpy -- copy nothing. The
+    new bound is a cost bound (measured: 1 MB through the pipe in 2.96 s), and the chunk is what rizin
+    needs: a `wx` whose command line passes about 4 KB writes **nothing** and says so on stderr only
+    (measured: 0x500 bytes land, 0x7ff bytes do not)."""
+    assert rizin_emulation.ASSIST_COPY_MAX == 0x100000
+    assert rizin_emulation.ASSIST_COPY_MAX > rizin_emulation.MAX_PATCH_BYTES
+    assert 2 * rizin_emulation.ASSIST_WRITE_CHUNK + 32 < 4096, "one wx stays inside rizin's command buffer"
+    assert rizin_emulation.ASSIST_READ_CHUNK <= rizin_emulation.ASSIST_COPY_MAX

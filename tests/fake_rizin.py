@@ -59,6 +59,14 @@ the new map, while the map made before stays (all measured on rizin 0.9.1).
 That is why the API assistant reads those three registers before it maps a
 buffer and writes them back afterwards.
 
+``aeim-`` and a plain ``aeim`` both go through the one piece of bookkeeping
+rizin keeps, the region the most recent ``aeim`` made: ``aeim-`` gives that
+one back and can then name nothing at all ("cannot deinitialize mem.…",
+measured), and a plain ``aeim`` gives it back and maps a stack at the next
+free address. So the emulation's memory is given back by closing the file
+descriptors of ``omlj``'s ``mem.*`` maps (``o- <fd>``, see esil_close_fd),
+which is what the server does.
+
 The write cache (``wx``, ``wcj``, ``wc-``, ``wc-*``; see write_cache) holds
 the patches *and* what the emulation writes, as rizin's one cache does, and
 every read of a byte goes through it. Without ``io.cache`` a write is lost.
@@ -232,9 +240,11 @@ LOOSE_OPS.append(_op(DECRYPT_END, 1, "ret", "ret"))
 # At 64 bits (ASSIST_AT upwards, inside .text, where the PC may execute) they are `call qword [slot]`,
 # which rizin types ircall; at 32 bits (the island) `call dword [slot]`, which it types ucall.
 ASSIST_AT, ASSIST_SLOT = 0x140002900, 0x1400093C0
-ASSIST_IMPORTS = ("VirtualAlloc", "memcpy", "GetTickCount", "IsDebuggerPresent", "GetProcAddress")
+ASSIST_IMPORTS = ("VirtualAlloc", "memcpy", "GetTickCount", "IsDebuggerPresent", "GetProcAddress",
+                  "QueryPerformanceCounter", "GetComputerNameW")
 ASSIST32_AT, ASSIST32_SLOT = BASE32, 0x40723C
-ASSIST32_IMPORTS = ("Sleep", "VirtualAlloc", "CreateNamedPipeA", "LoadLibraryA", "VirtualProtect")
+ASSIST32_IMPORTS = ("Sleep", "VirtualAlloc", "CreateNamedPipeA", "LoadLibraryA", "VirtualProtect",
+                    "GetVolumeInformationA")
 ASSIST_OPS, ASSIST_TABLE = [], []
 if ASSIST or BITS == 32:
     _at, _slot = (ASSIST32_AT, ASSIST32_SLOT) if BITS == 32 else (ASSIST_AT, ASSIST_SLOT)
@@ -316,9 +326,10 @@ else:
     ROLES = {"PC": "eip", "SP": "esp", "BP": "ebp"}
 # The ESIL VM: regs is None until aei; stack is (addr, bytearray, name) while aeim's map is there, and
 # mapped holds the regions a later ``aeim <addr> <size> <name>`` added beside it (the API assistant's
-# buffers), newest last -- rizin 0.9.1 keeps the map it made before and ``aeim-`` drops the newest
-# (both measured).
-esil = {"regs": None, "stack": None, "mapped": []}
+# buffers), newest last, and last is the region the most recent ``aeim`` made -- the one piece of
+# bookkeeping rizin 0.9.1 keeps, which is why ``aeim-`` works once and then cannot name anything
+# (see esil_drop_last, all measured).
+esil = {"regs": None, "stack": None, "mapped": [], "last": None}
 ESIL_CAP = 200000  # steps of one run: past it the fake's code has run into nothing it models
 SEARCH_MAX = 0x10000  # bytes of a search range the model reads (a test's range is far smaller)
 ESIL_INVALID = "ERROR: core: esil: Stopped execution in an invalid instruction (see e??esil.breakoninvalid)\n"
@@ -485,17 +496,27 @@ def esil_maps():
 
 
 def esil_map_stack(args):
-    """``aeim [addr [size [name]]]``: arm the VM and map a region.
+    """``aeim [addr [size [name]]]``: arm the VM and map a region, as rizin 0.9.1 does (all measured).
 
-    Without arguments it is the stack: the one mapped before goes, the stack pointer and base pointer
-    sit in the middle of the new one and the PC at the seek. With arguments the region is mapped
-    **beside** the stack -- and rizin 0.9.1 moves the VM into it all the same: PC to the seek, SP and BP
-    into the middle of the new map (measured; it is why the assistant puts those three back itself).
+    With arguments the region is mapped **beside** the one mapped before, and the VM moves into it: the
+    PC goes to the seek and the stack and base pointer to the middle of the new map.
+
+    Without arguments it is the stack -- and a plain ``aeim`` first **destroys the ESIL map made last**,
+    whatever it is: after ``aeim; aeim <a> <s> assist; aeim`` the buffer is gone and a stack is mapped
+    at the next free address (measured, which is also why two plain ``aeim`` in a row look like one).
+    Where esil.stack.addr is free again the new stack goes there; rizin's own choice of a *different*
+    address when it is not (measured once: 0x100000 -> 0x10000000) is not modelled, and nothing in the
+    server reaches that case, because a start gives the ESIL memory back first (_emulation_unmap).
     """
     if esil["regs"] is None:
         esil["regs"] = dict.fromkeys(REG_NAMES, 0)
     addr = number(args[0]) if args else int(state["config"]["esil.stack.addr"], 0)
     size = number(args[1]) if len(args) > 1 else int(state["config"]["esil.stack.size"], 0)
+    if not args:
+        if esil["last"] is not None:
+            esil_drop_last()
+        while any(base <= addr < base + len(memory) for base, memory, _name in esil_maps()):
+            addr += size
     memory = bytearray(size)
     sp = addr + size // 2
     word = BITS // 8
@@ -506,11 +527,55 @@ def esil_map_stack(args):
     name = f"mem.{args[2]}" if len(args) > 2 else f"mem.{addr:#x}_{size:#x}"  # like get_esil_stack_name
     if len(args) > 2:
         esil["mapped"].append((addr, memory, name))
+        esil["last"] = esil["mapped"][-1]
     else:
-        esil["stack"] = (addr, memory, name)
+        esil["stack"] = esil["last"] = (addr, memory, name)
     regs = esil["regs"]
     regs[ROLES["SP"]] = regs[ROLES["BP"]] = sp
     regs[ROLES["PC"]] = state["seek"]
+
+
+def esil_drop_last(what="aeim-"):
+    """Give the region of the most recent ``aeim`` back, with its memory; False when its bookkeeping
+    holds none any more.
+
+    rizin 0.9.1 keeps exactly one such entry: ``aeim-`` works once after each ``aeim`` and then says
+    "cannot deinitialize mem.<a name it computed>" and drops nothing -- measured, with one buffer and
+    with two, and whether or not the buffers were unmapped another way first. That is why the server
+    closes the ESIL memory's file descriptors instead (see esil_close_fd).
+    """
+    region = esil["last"]
+    if region is None:
+        addr = int(state["config"]["esil.stack.addr"], 0)
+        size = int(state["config"]["esil.stack.size"], 0)
+        while any(base <= addr < base + len(memory) for base, memory, _name in esil_maps()):
+            addr += size
+        err(f"ERROR: core: cannot deinitialize mem.{addr:#x}_{size:#x}\n")
+        return False
+    if esil["stack"] is region:
+        esil["stack"] = None
+    elif region in esil["mapped"]:
+        esil["mapped"].remove(region)
+    esil["last"] = None
+    return True
+
+
+def esil_close_fd(rest):
+    """``o- <fd>``: close a file descriptor. Only the ESIL VM's own are modelled, because they are the
+    only ones the server closes (the fds of ``omlj``'s mem.* rows); closing one removes its map **and**
+    frees its memory, which ``om-`` does not (measured: ``ol`` keeps the malloc:// entry after om-)."""
+    fd = number(rest)
+    for i, region in enumerate(esil_maps()):
+        if 5 + i == fd:
+            if esil["stack"] is region:
+                esil["stack"] = None
+            else:
+                esil["mapped"].remove(region)
+            if esil["last"] is region:
+                esil["last"] = None
+            return ""
+    err(f"ERROR: Could not close the file descriptor {rest.strip()}\n")
+    return ""
 
 
 def esil_mapped(addr):
@@ -1126,6 +1191,8 @@ def answer(cmd):
             err("ERROR: Wrong number of arguments passed to `db`, see its help with `db?`\n")
             return ""
         return esil_breakpoints(word, rest, seek)
+    if word == "o-":
+        return esil_close_fd(rest)
     if word in ("wx", "wcj", "wc-", "wc-*"):
         return write_cache(word, rest, seek)
     if word in ("af", "af-"):
@@ -1145,11 +1212,7 @@ def answer(cmd):
         esil_map_stack(rest.split())
         return ""
     if word == "aeim-":
-        # rizin 0.9.1 drops the region it mapped last, the stack only when it is the last one (measured)
-        if esil["mapped"]:
-            esil["mapped"].pop()
-        else:
-            esil["stack"] = None
+        esil_drop_last()
         return ""
     if word == "aepc":
         if esil["regs"] is None:

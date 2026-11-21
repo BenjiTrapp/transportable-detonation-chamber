@@ -515,20 +515,50 @@ ASSIST_TRIES = 64
 # it means the arguments were read wrong, so then nothing is offered.
 ASSIST_BUFFER_MIN = 0x1000
 ASSIST_BUFFER_MAX = 16 * 1024 * 1024
-# A pseudo handle and a pseudo address: recognisable at a glance in a register or a stack word, and in
-# no map, so a run that calls or reads one stops with a trap instead of running on through nothing.
+# A pseudo handle and a pseudo address: recognisable at a glance in a register or a stack word, and
+# checked against ``omlj`` before they are offered (pseudo_value), so that they really are in no map --
+# a run that calls or reads one then stops with a trap instead of running on through nothing. A dump of
+# a live process can have maps anywhere, which is why the check is made and not assumed.
 ASSIST_HANDLE = 0x6D000000
 ASSIST_PSEUDO = 0x6E000000
 ASSIST_SPACING = 0x10000
+# How many values each of the two series has room for: 256 steps of 0x10000 fill the 0x1000000 between
+# the two bases, so neither series can ever reach into the other's.
+ASSIST_PSEUDO_TRIES = 0x100
 # GetTickCount and friends: a machine that has been up for a while, and a step of one scheduler tick
 # (GetTickCount's own resolution is about 15.6 ms), so that a timing check sees time pass without a
-# jump that would look like a debugger.
+# jump that would look like a debugger. The clock moves when a skip **applies** a value, never when one
+# is offered: a run line that asks for the offer on every step must not move it (R38).
 TICK_START = 0x100000
 TICK_STEP = 0x10
-# The most bytes one copy of the assistant moves: one ``wx``, as a patch is bounded to.
-ASSIST_COPY_MAX = MAX_PATCH_BYTES
+# The most bytes one copy of the assistant moves, and how much goes into one command.
+#
+# The cap is a cost bound, measured through the pipe against rizin 0.9.1: 64 KB take 0.18 s, 256 KB
+# 0.73 s and 1 MB 2.96 s, so one request stays well inside the pipe's 30 s and in the order of an ESIL
+# run's own esil.timeout. 1 MB covers the shape this is for -- an unpacker that memcpys a section into
+# a fresh buffer.
+#
+# The chunk is **not** a tidiness choice: rizin 0.9.1 writes **nothing at all** for a ``wx`` whose
+# command line passes about 4 KB, and says so on stderr only ("Cannot convert '4141...' to bin data"),
+# which ``cmd`` never reads (measured: 0x500 bytes land, 0x7ff bytes do not). 0x400 bytes are 2048 hex
+# digits, half of that wall.
+ASSIST_COPY_MAX = 0x100000
+ASSIST_WRITE_CHUNK = 0x400
+# How many bytes one ``pxj`` reads: its answer is one JSON number per byte, so the read is chunked too.
+ASSIST_READ_CHUNK = 0x10000
 # The name aeim gives the assistant's buffers (``mem.assist`` in omlj).
 ASSIST_MAP_NAME = "assist"
+# What the environment group answers: unremarkable values, with no VM artefact in them (spec §4). Data,
+# like the table itself, so they can be changed without a code change.
+ASSIST_COMPUTER = "DESKTOP-7Q1M4KD"
+ASSIST_USER = "dmartin"
+ASSIST_VOLUME = "Windows"
+ASSIST_SERIAL = 0x9C4E1A37
+# The performance counter's frequency, as Windows 8 and later report it (10 MHz), and the FILETIME the
+# run's clock counts from: 2026-01-01 00:00 UTC in 100 ns units since 1601 ((unix + 11644473600) * 1e7).
+ASSIST_QPC_FREQUENCY = 10 * 1000 * 1000
+ASSIST_FILETIME_BASE = 134116992000000000
+
 
 # What a row of API_TABLE answers in the return register:
 #   "buffer"   a freshly mapped buffer, its address in the return register; ``size_arg`` says which
@@ -541,6 +571,22 @@ ASSIST_MAP_NAME = "assist"
 #   "success"  1: the call reports success, and writes nothing to its out-parameters
 #   "none"     the call has no return value; a skip only corrects the stack
 ANSWERS = ("buffer", "handle", "address", "copy", "tick", "zero", "success", "none")
+
+# What a row writes to an out-parameter, as (the argument that holds the pointer, what to write). The
+# spec's answer for the time and environment groups is the **value**, not just a return code -- a
+# QueryPerformanceCounter whose counter is never written lets a timing check see zero time pass, and a
+# GetComputerName that writes nothing answers no name at all. The writes go through ``wx``, as a run's
+# own writes do, and a pointer that is in no map writes nothing and says so.
+#   "counter"    the performance counter, word-wide, from the run's clock (rising)
+#   "frequency"  that counter's frequency (ASSIST_QPC_FREQUENCY), word-wide
+#   "filetime"   the system time as a FILETIME, 8 bytes, from the same clock
+#   "computer"   ASSIST_COMPUTER, NUL-terminated (UTF-16 for the ...W form of the call)
+#   "user"       ASSIST_USER, the same way
+#   "volume"     ASSIST_VOLUME, the same way
+#   "chars"      how many characters the name before it has, as a 4-byte count: the in/out size that
+#                GetComputerName and GetUserName take a pointer to
+#   "serial"     ASSIST_SERIAL, 4 bytes
+OUT_WRITES = ("counter", "frequency", "filetime", "computer", "user", "volume", "chars", "serial")
 
 # The assistant's table: **data, not code**, so that it grows without a change here (the spec asks for
 # that). Per row: the convention (which 64 bits ignores, where everything is Microsoft x64), how many
@@ -579,14 +625,18 @@ API_TABLE = {
     "GetTickCount": {"conv": "stdcall", "args": 0, "ret": "tick"},
     "GetTickCount64": {"conv": "stdcall", "args": 0, "ret": "tick"},
     "timeGetTime": {"conv": "stdcall", "args": 0, "ret": "tick"},
-    "QueryPerformanceCounter": {"conv": "stdcall", "args": 1, "ret": "success"},
-    "QueryPerformanceFrequency": {"conv": "stdcall", "args": 1, "ret": "success"},
-    "GetSystemTimeAsFileTime": {"conv": "stdcall", "args": 1, "ret": "none"},
+    "QueryPerformanceCounter": {"conv": "stdcall", "args": 1, "ret": "success",
+                                "out": ((0, "counter"),)},
+    "QueryPerformanceFrequency": {"conv": "stdcall", "args": 1, "ret": "success",
+                                  "out": ((0, "frequency"),)},
+    "GetSystemTimeAsFileTime": {"conv": "stdcall", "args": 1, "ret": "none", "out": ((0, "filetime"),)},
     "Sleep": {"conv": "stdcall", "args": 1, "ret": "none"},
     # Environment
-    "GetComputerName": {"conv": "stdcall", "args": 2, "ret": "success"},
-    "GetUserName": {"conv": "stdcall", "args": 2, "ret": "success"},
-    "GetVolumeInformation": {"conv": "stdcall", "args": 8, "ret": "success"},
+    "GetComputerName": {"conv": "stdcall", "args": 2, "ret": "success",
+                        "out": ((0, "computer"), (1, "chars"))},
+    "GetUserName": {"conv": "stdcall", "args": 2, "ret": "success", "out": ((0, "user"), (1, "chars"))},
+    "GetVolumeInformation": {"conv": "stdcall", "args": 8, "ret": "success",
+                             "out": ((1, "volume"), (3, "serial"))},
     "GetSystemInfo": {"conv": "stdcall", "args": 1, "ret": "none"},
     "GetEnvironmentVariable": {"conv": "stdcall", "args": 3, "ret": "zero"},
     # Copying
@@ -605,20 +655,25 @@ _API_DECORATION = re.compile(r"@[0-9]{1,3}$")
 
 
 def lookup_api(name):
-    """The row of API_TABLE for the name of a call's target, with its own ``name``, or None.
+    """The row of API_TABLE for the name of a call's target, with its own ``name`` and ``wide``, or None.
 
-    The flag prefix, the module prefix, one leading underscore and a stdcall decoration come off, and
-    the ANSI/Unicode pair (``...A``/``...W``) is one row -- but only where the full name is not a row
-    itself, so that a row whose own name ends in A or W would never be mangled.
+    The flag prefix, the module prefix, leading underscores and a stdcall decoration come off, and the
+    ANSI/Unicode pair (``...A``/``...W``) is one row -- but only where the full name is not a row
+    itself, so that a row whose own name ends in A or W would never be mangled. ``wide`` says that the
+    call site was the ``...W`` form, which is where the encoding of an out-parameter's text comes from:
+    the row cannot know it, the call can.
     """
     if not isinstance(name, str):
         return None
     key = _API_MODULE.sub("", _API_PREFIX.sub("", name.strip()))
     key = _API_DECORATION.sub("", key).lstrip("_").casefold()
-    for candidate in (key, key[:-1] if key[-1:] in ("a", "w") else key):
+    candidates = [(key, False)]
+    if key[-1:] in ("a", "w"):
+        candidates.append((key[:-1], key[-1:] == "w"))
+    for candidate, wide in candidates:
         found = _API_INDEX.get(candidate)
         if found is not None:
-            return dict(found)
+            return dict(found, wide=wide)
     return None
 
 
@@ -719,4 +774,95 @@ def read_cstring(data):
     except (ValueError, UnicodeDecodeError):
         return None
     return text if _EXPORT_NAME.fullmatch(text) else None
+
+
+def pseudo_value(maps, base, index, spacing=ASSIST_SPACING, tries=ASSIST_PSEUDO_TRIES):
+    """(the next value of a pseudo series, the step it came from): ``base`` plus ``index`` steps, moved
+    on while a map of ``omlj`` holds it; (None, index) once the series is used up.
+
+    The check is the point: these values are offered *because* they are in no map, so that a run which
+    calls or reads one stops with a trap instead of running on through nothing. A dump of a live
+    process -- a case the spec names -- can have maps anywhere, this region included, and then the
+    series has to move or say that it is out of values.
+    """
+    if not isinstance(index, int) or isinstance(index, bool) or index < 0:
+        return None, 0
+    for step in range(index, max(tries, 0)):
+        value = base + step * spacing
+        if not is_mapped(value, maps):
+            return value, step
+    return None, index
+
+
+def esil_ranges(maps):
+    """The ranges of the ESIL VM's own maps in ``omlj`` as (from, to), ``to`` not in them: those named
+    the way ``aeim`` names its maps (``mem.…``, rizin's get_esil_stack_name) -- the stack and the
+    buffers the assistant mapped. The file's maps are ``fmap.*``/``mmap.*`` and are not among them."""
+    return [(m["from"], m["to"]) for m in _map_rows(maps)
+            if str(m.get("name", "")).startswith("mem.")]
+
+
+def overlaps_any(addr, size, ranges):
+    """Whether ``size`` bytes from ``addr`` touch one of ``ranges`` as esil_ranges gives them."""
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        return False
+    return any(addr < high and low < addr + size for low, high in ranges)
+
+
+def esil_fds(maps):
+    """The file descriptors of the ESIL VM's own memory in ``omlj``, the newest map first: those whose
+    name is one ``aeim`` gives (``mem.…``, rizin's get_esil_stack_name), and of those only the ones no
+    other map uses -- the file's maps are ``fmap.*``/``mmap.*``, and closing a descriptor the file is
+    mapped through would close the sample.
+
+    Closing them (``o- <fd>``) is how the emulation's memory is given back: rizin 0.9.1's own ``aeim-``
+    can only ever drop the map it made last, and once an ``aeim <addr> <size> <name>`` has existed it
+    can never name the stack map again (measured), while ``om-`` unmaps without freeing the memory.
+    """
+    rows = _map_rows(maps)
+    theirs = {m.get("fd") for m in rows if not str(m.get("name", "")).startswith("mem.")}
+    fds, seen = [], set()
+    for m in rows:
+        fd = m.get("fd")
+        if (str(m.get("name", "")).startswith("mem.") and isinstance(fd, int)
+                and not isinstance(fd, bool) and fd not in theirs and fd not in seen):
+            seen.add(fd)
+            fds.append(fd)
+    return list(reversed(fds))
+
+
+def out_bytes(kind, api, clock):
+    """(the bytes an out-parameter write puts there, what to call them in the summary) for one entry of
+    a row's ``out``, or (None, None) for a kind this build does not know.
+
+    ``api`` is the row as ``lookup_api`` gives it (its ``wide`` decides whether a text goes as ANSI or
+    as UTF-16), and ``clock`` is the run's millisecond clock. The values are the spec's answer for the
+    time and environment groups: a counter that rises with the same clock the tick answers come from,
+    so that two ways of measuring time agree, and names with no VM artefact in them.
+
+    The counter and its frequency are 8 bytes whatever the file's word is: a LARGE_INTEGER is 64 bits
+    on 32-bit Windows too, and writing only four of them would leave the high half as it was and the
+    counter could read as an enormous number.
+    """
+    texts = {"computer": ASSIST_COMPUTER, "user": ASSIST_USER, "volume": ASSIST_VOLUME}
+    if kind in texts:
+        text = texts[kind]
+        data = (text.encode("utf-16-le") + b"\0\0") if api.get("wide") else (text.encode("ascii") + b"\0")
+        return data, f"'{text}'"
+    if kind == "chars":
+        written = next((texts[what] for _, what in api.get("out", ()) if what in texts), "")
+        return len(written).to_bytes(4, "little"), f"its length ({len(written)} characters)"
+    if kind == "counter":
+        value = clock * (ASSIST_QPC_FREQUENCY // 1000)   # the same elapsed time as the tick clock
+        return value.to_bytes(8, "little"), f"the performance counter ({value})"
+    if kind == "frequency":
+        return ASSIST_QPC_FREQUENCY.to_bytes(8, "little"), \
+            f"its frequency ({ASSIST_QPC_FREQUENCY} Hz, as Windows 8 and later report)"
+    if kind == "filetime":
+        value = ASSIST_FILETIME_BASE + clock * 10000     # 100 ns units per millisecond
+        return value.to_bytes(8, "little"), "the system time as a FILETIME"
+    if kind == "serial":
+        return ASSIST_SERIAL.to_bytes(4, "little"), f"a volume serial ({ASSIST_SERIAL:#x})"
+    return None, None
+
 
