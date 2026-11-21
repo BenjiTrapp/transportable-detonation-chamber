@@ -42,6 +42,7 @@ import pipe_proxy
 import minidump_analysis
 # rizin sessions for the RIZIN tab.
 import rizin_sessions
+import rizin_emulation
 # The own dashboards of the Dashboard tab (saved log searches as tiles).
 import dashboards
 # Tool update checks and installs (Tool Updates section of the dashboard).
@@ -5867,13 +5868,154 @@ def _rizin_folder_files(folder, recursive, limit):
 
 
 def _rizin_prune_uploads(keep):
-    # The oldest uploads go; one that rizin has open stays (Windows refuses to delete it).
+    """The oldest uploads go; `keep` (a path, or several) stays: one that rizin has open (Windows refuses to
+    delete it), or an exported copy and the note that says what was changed in it."""
+    keep = (keep,) if isinstance(keep, str) else tuple(keep)
     for old in _rizin_folder_files(RIZIN_UPLOAD_DIR, False, RIZIN_SCAN_MAX)[RIZIN_UPLOADS_KEEP:]:
-        if old["path"] != keep:
+        if old["path"] not in keep:
             try:
                 os.remove(old["path"])
             except OSError:
                 pass
+
+
+RIZIN_NOTE_SUFFIX = ".patch.txt"
+
+
+def _rizin_write_order(session, rows):
+    """`rows` (session.patches(): lowest address first) in the order rizin's cache got them.
+
+    The list is sorted by address and a later write wins where two overlap, so for a one-byte patch made
+    after a longer one that starts a byte later, the list has them the wrong way round (measured). wcj has
+    them in the order they were written; both sorts are stable, so the n-th row of the list is the row of
+    wcj that stands n-th when wcj is sorted by address. A list that does not match wcj row for row was
+    changed between the two commands: refused, not exported with the wrong order.
+    """
+    written = rizin_emulation.parse_cache(session.text("wcj"))
+    by_address = sorted(range(len(written)), key=lambda i: written[i]["addr"])
+    if len(written) != len(rows) or any(
+            (written[i]["addr"], written[i]["size"], written[i]["after"]) != (row["addr"], row["size"], row["after"])
+            for i, row in zip(by_address, rows)):
+        raise rizin_sessions.RizinRefused("the patches changed while they were being exported: try again")
+    return [rows[n] for n in sorted(range(len(rows)), key=lambda n: by_address[n])]
+
+
+def _rizin_patch_paddr(session, row):
+    """The file offset of the patch `row`, or None where its bytes do not lie at consecutive offsets of the
+    file. `_rizin_paddr` answers for one address and a row can be 2000 bytes: its first byte and its last
+    are both asked for, and they must be as far apart in the file as they are in memory. A row that
+    crosses the gap between two sections (the zero-filled room after a section's data is no part of the
+    file) or runs past the end of the file fails that, and would otherwise be written in part at a wrong
+    offset."""
+    first = _rizin_paddr(session, row["addr"])
+    last = _rizin_paddr(session, row["addr"] + row["size"] - 1)
+    if first is None or last is None or last - first != row["size"] - 1:
+        return None
+    return first
+
+
+def _rizin_export_note(session, original_sha, copy_name, copy_sha, placed, skipped):
+    lines = [
+        "Patched copy made by TDC (RIZIN tab). Only the patches set by hand are in it; what an emulation run",
+        "wrote is not.",
+        "",
+        f"Original:         {session.path}",
+        f"Original SHA-256: {original_sha}",
+        f"Copy:             {copy_name}",
+        f"Copy SHA-256:     {copy_sha}",
+        f"Time:             {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
+        "",
+        f"Patches in the copy ({len(placed)}): address, offset in the file, bytes before -> after",
+    ]
+    lines += [f"  {row['addr']:#x}  file {paddr:#x}  {row['before']} -> {row['after']}" for row, paddr in placed]
+    if skipped:
+        lines += ["", f"Patches that could not be placed in the file, so the copy does not have them ({len(skipped)}):",
+                  "(there is no byte of the file at such an address: memory the emulation created, a section's "
+                  "zero-filled room past its data, or a patch that runs out of the file or across two maps)"]
+        lines += [f"  {row['addr']:#x}  {row['before']} -> {row['after']}" for row in skipped]
+    return "\n".join(lines) + "\n"
+
+
+def _rizin_export(session):
+    """POST: the patched copy -- the original with the hand-made patches at their file offsets, built here
+    (rizin writes no file, and the original is only ever read) -- and a note beside it.
+
+    {path, name, sha256 (of the copy), patched (bytes written), skipped (addresses of the patches that have
+    no place in the file), note (the note's text)}. The copy is `<stem>.patched<suffix>` in RIZIN_UPLOAD_DIR
+    and the note `<that>.patch.txt`; a second export of the same file replaces both together, so the note
+    always describes the copy beside it.
+    """
+    rows = session.patches()
+    mine = [row for row in _rizin_write_order(session, rows) if row["mine"]]
+    if not mine:
+        raise rizin_sessions.RizinRefused(
+            "no patches to export: only patches set by hand go into the copy, and what an emulation run wrote "
+            "does not")
+    placed, skipped = [], []
+    for row in mine:
+        paddr = _rizin_patch_paddr(session, row)
+        if paddr is None:
+            skipped.append(row)
+        else:
+            placed.append((row, paddr))
+    if not placed:
+        addrs = ", ".join(f"{a:#x}" for a in sorted({row["addr"] for row in skipped}))
+        raise rizin_sessions.RizinRefused(f"none of the patches could be placed in the file: {addrs}")
+
+    source = session.path
+    stem, ext = os.path.splitext(secure_filename(os.path.basename(source)) or "sample")
+    name = f"{stem[:80]}.patched{ext[:16]}"
+    dest = os.path.join(RIZIN_UPLOAD_DIR, name)
+    note_dest = dest + RIZIN_NOTE_SUFFIX
+    if os.path.normcase(os.path.realpath(dest)) == os.path.normcase(os.path.realpath(source)):
+        raise rizin_sessions.RizinRefused("the copy would be written over the original: rename the original")
+    os.makedirs(RIZIN_UPLOAD_DIR, exist_ok=True)
+    tmps = []
+    try:
+        fd, copy_tmp = tempfile.mkstemp(dir=RIZIN_UPLOAD_DIR, prefix=".export-")
+        tmps.append(copy_tmp)
+        original_sha = hashlib.sha256()
+        with os.fdopen(fd, "wb") as out, open(source, "rb") as src:
+            for chunk in iter(lambda: src.read(1024 * 1024), b""):
+                original_sha.update(chunk)
+                out.write(chunk)
+        if original_sha.hexdigest() != session.sha256:
+            raise rizin_sessions.RizinRefused("the original changed on disk since it was opened: open it again")
+        with open(copy_tmp, "r+b") as out:
+            for row, paddr in placed:  # in the order they were written: a later patch wins where two overlap
+                out.seek(paddr)
+                out.write(bytes.fromhex(row["after"]))
+        copy_sha = hashlib.sha256()
+        with open(copy_tmp, "rb") as out:
+            for chunk in iter(lambda: out.read(1024 * 1024), b""):
+                copy_sha.update(chunk)
+        if os.path.getsize(copy_tmp) != session.size:
+            raise rizin_sessions.RizinRefused("the copy would not be as long as the original: nothing was written")
+        note = _rizin_export_note(session, original_sha.hexdigest(), name, copy_sha.hexdigest(), placed, skipped)
+        fd, note_tmp = tempfile.mkstemp(dir=RIZIN_UPLOAD_DIR, prefix=".export-")
+        tmps.append(note_tmp)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as out:
+            out.write(note)
+        os.replace(copy_tmp, dest)
+        try:
+            os.replace(note_tmp, note_dest)
+        except OSError:
+            # a copy with the old note beside it would say what was not changed in it
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            raise
+    finally:
+        for tmp in tmps:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    _rizin_prune_uploads(keep=(dest, note_dest))
+    return {"path": dest, "name": name, "sha256": copy_sha.hexdigest(),
+            "patched": sum(row["size"] for row, _ in placed),
+            "skipped": sorted({row["addr"] for row in skipped}), "note": note}
 
 
 @app.route("/api/rizin/status")
@@ -6135,6 +6277,12 @@ def api_rizin_patch(sid):
 @app.route("/api/rizin/<sid>/patch", methods=["DELETE"])
 def api_rizin_unpatch(sid):
     return _rizin_call(sid, _rizin_unpatch)
+
+
+@app.route("/api/rizin/<sid>/export", methods=["POST"])
+def api_rizin_export(sid):
+    """Build the patched copy (the hand-made patches at their file offsets) and the note beside it."""
+    return _rizin_call(sid, _rizin_export)
 
 
 @app.route("/api/rizin/<sid>/reanalyze", methods=["POST"])

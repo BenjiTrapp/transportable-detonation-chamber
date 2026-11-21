@@ -5726,3 +5726,293 @@ def test_real_rizin_routes(tdc, tmp_path, monkeypatch):
         assert api.read(f"/api/rizin/{sid}/hex?addr=0x0&len=4") == {"offset": 0, "bytes": list(b"just"), "paddr": 0}
     finally:
         mgr.shutdown()
+
+
+# --- Export of the patched copy --------------------------------------------------------------------------------
+# The fake's file maps need a file of at least 0x3000 bytes (the sample of the paddr test above is 12 KB too).
+EXPORT_SAMPLE = bytes(range(256)) * 48
+
+
+def _export_session(rz, name="pipesim.exe", data=EXPORT_SAMPLE):
+    """A sample the fake's maps reach into, opened and analysed: (its session ID, its path)."""
+    path = rz.write(name, data)
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    return sid, path
+
+
+def _paddr(rz, sid, addr):
+    return rz.read(f"/api/rizin/{sid}/hex?addr={addr:#x}&len=1")["paddr"]
+
+
+def test_export_writes_a_copy_with_the_patches_applied(rz):
+    sid, path = _export_session(rz)
+    _patch(rz, sid, addr="0x140001440", bytes="9090")
+    result = rz.send(f"/api/rizin/{sid}/export", {})
+    assert set(result) == {"path", "name", "sha256", "patched", "skipped", "note"}
+    data = open(result["path"], "rb").read()
+    original = open(path, "rb").read()
+    paddr = _paddr(rz, sid, 0x140001440)
+    assert paddr == 0x840, "the fake's .text is at file offset 0x400, so the address is not the offset"
+    assert data[paddr:paddr + 2] == b"\x90\x90" and original[paddr:paddr + 2] != b"\x90\x90"
+    assert data[:paddr] == original[:paddr] and data[paddr + 2:] == original[paddr + 2:]
+    assert result["patched"] == 2 and result["skipped"] == []
+    assert hashlib.sha256(data).hexdigest() == result["sha256"]
+    assert result["name"] == "pipesim.patched.exe" and result["path"] == os.path.join(
+        rz.tdc.RIZIN_UPLOAD_DIR, "pipesim.patched.exe")
+    note = open(result["path"] + ".patch.txt").read()
+    assert note == result["note"]
+    row = _patches(rz, sid)[0]
+    assert path in note and "0x140001440" in note
+    assert result["sha256"] in note and hashlib.sha256(original).hexdigest() in note
+    assert f"{row['before']} -> 9090" in note
+    assert "UTC" in note, "the time"
+
+
+def test_export_leaves_the_original_untouched(rz):
+    sid, path = _export_session(rz)
+    before = open(path, "rb").read()
+    stamp = os.stat(path).st_mtime_ns
+    _patch(rz, sid, addr="0x140001440", bytes="90")
+    result = rz.send(f"/api/rizin/{sid}/export", {})
+    # the export did write a patched byte somewhere, or the check below would hold for any code at all
+    assert open(result["path"], "rb").read()[0x840] == 0x90 and before[0x840] != 0x90
+    assert open(path, "rb").read() == before and os.stat(path).st_mtime_ns == stamp
+
+
+def test_export_names_patches_without_a_file_offset_and_writes_the_rest(rz):
+    # Review Focus 2: a patch set by hand where the file has no byte must be named, and the others written.
+    sid, path = _export_session(rz)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    _patch(rz, sid, addr="0x140001440", bytes="90")
+    _patch(rz, sid, addr="0xdead0000", bytes="90")  # no map
+    _patch(rz, sid, addr="0x140009000", bytes="90")  # a map of the file, but past the end of this 12 KB file
+    _patch(rz, sid, addr="0x140002ffe", bytes="aabbccdd")  # starts in the file's data, ends in the zero-filled room
+    _patch(rz, sid, addr="0x140005bfe", bytes="aabbccdd")  # starts in the file's data, ends past the file
+    result = rz.send(f"/api/rizin/{sid}/export", {})
+    assert result["skipped"] == [0xDEAD0000, 0x140002FFE, 0x140005BFE, 0x140009000] and result["patched"] == 1
+    assert "could not be placed in the file" in result["note"]
+    for addr in result["skipped"]:
+        assert f"{addr:#x}" in result["note"]
+    data, original = open(result["path"], "rb").read(), open(path, "rb").read()
+    assert [i for i in range(len(data)) if data[i] != original[i]] == [0x840], \
+        "a patch that is only partly in the file is skipped whole, not written in part"
+
+
+def test_a_patch_is_placed_only_where_its_bytes_are_consecutive_in_the_file(rz, monkeypatch):
+    """`_rizin_paddr` answers for one address, so the first and the last byte of a patch are both asked for
+    and must be as far apart in the file as in memory. The fake's maps have no gap under 2000 bytes (the
+    longest patch), so the answers are set here; the real PE has such a gap (the real test below)."""
+    offsets = {0x1000: 0x400, 0x1003: 0x403, 0x1ff0: 0x13f0, 0x200f: 0x140f, 0x300f: 0x140f}
+    monkeypatch.setattr(rz.tdc, "_rizin_paddr", lambda session, addr: offsets.get(addr))
+
+    def placed(addr, size):
+        return rz.tdc._rizin_patch_paddr(None, {"addr": addr, "size": size})
+
+    assert placed(0x1000, 4) == 0x400 and placed(0x1000, 1) == 0x400
+    assert placed(0x1ff0, 0x20) == 0x13F0, "two maps that follow each other in memory and in the file"
+    assert placed(0x1ff0, 0x1020) is None, "0x1020 bytes of memory, 0x20 of the file: a gap in between"
+    assert placed(0x2fff, 1) is None and placed(0x1000, 0x3000) is None, "no byte of the file at one end"
+
+
+def test_export_refuses_when_no_patch_has_a_place_in_the_file(rz):
+    sid, _ = _export_session(rz)
+    _patch(rz, sid, addr="0xdead0000", bytes="90")
+    response = rz.post(f"/api/rizin/{sid}/export", {})
+    assert response.status_code == 400 and "0xdead0000" in response.get_json()["refused"]
+    assert not os.path.exists(rz.tdc.RIZIN_UPLOAD_DIR) or not os.listdir(rz.tdc.RIZIN_UPLOAD_DIR)
+
+
+def test_export_does_not_write_what_a_run_wrote(rz):
+    sid, _ = _export_session(rz)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001444"})
+    _run(rz, sid, "step")
+    assert [r["mine"] for r in _patches(rz, sid)] == [False], "the step wrote a row, and it is the run's"
+    response = rz.post(f"/api/rizin/{sid}/export", {})
+    assert response.status_code == 400 and "no patches" in response.get_json()["refused"]
+    assert not os.path.exists(rz.tdc.RIZIN_UPLOAD_DIR) or not os.listdir(rz.tdc.RIZIN_UPLOAD_DIR)
+    # with a patch of the analyst's beside the run's row, only the patch is exported
+    _patch(rz, sid, addr="0x140001440", bytes="90")
+    result = rz.send(f"/api/rizin/{sid}/export", {})
+    data = open(result["path"], "rb").read()
+    assert result["patched"] == 1 and result["skipped"] == [] and data[0x840] == 0x90
+    assert [l for l in result["note"].splitlines() if l.startswith("  0x")] == [
+        "  0x140001440  file 0x840  00 -> 90"], "one line, for the one patch, and none for the run's row"
+
+
+def test_export_applies_overlapping_patches_in_the_order_they_were_made(rz):
+    """patches() lists by address, but a later write wins where two overlap: a one-byte fix before the start
+    of a longer patch, made afterwards, covers its first byte -- and sorted by address it would come first."""
+    sid, _ = _export_session(rz)
+    _patch(rz, sid, addr="0x140001451", bytes="11223344")
+    _patch(rz, sid, addr="0x140001450", bytes="aabb")
+    assert [(r["addr"], r["after"]) for r in _patches(rz, sid)] == [
+        (0x140001450, "aabb"), (0x140001451, "11223344")], "listed by address, not by when they were made"
+    paddr = _paddr(rz, sid, 0x140001450)
+    result = rz.send(f"/api/rizin/{sid}/export", {})
+    assert open(result["path"], "rb").read()[paddr:paddr + 5] == bytes.fromhex("aabb223344")
+    # and the same address twice: the second is the one that stays
+    _patch(rz, sid, addr="0x140001450", bytes="cc")
+    result = rz.send(f"/api/rizin/{sid}/export", {})
+    assert open(result["path"], "rb").read()[paddr:paddr + 5] == bytes.fromhex("ccbb223344")
+
+
+def test_a_second_export_replaces_the_copy_and_its_note_together(rz):
+    sid, _ = _export_session(rz)
+    _patch(rz, sid, addr="0x140001440", bytes="90")
+    first = rz.send(f"/api/rizin/{sid}/export", {})
+    _patch(rz, sid, addr="0x140001460", bytes="cc")
+    second = rz.send(f"/api/rizin/{sid}/export", {})
+    assert second["path"] == first["path"] and second["sha256"] != first["sha256"]
+    copy = open(second["path"], "rb").read()
+    assert hashlib.sha256(copy).hexdigest() == second["sha256"] and copy[0x860] == 0xCC
+    note = open(second["path"] + ".patch.txt").read()
+    assert second["sha256"] in note and first["sha256"] not in note, "the note describes the copy beside it"
+    assert "0x140001440" in note and "0x140001460" in note
+    assert sorted(os.listdir(rz.tdc.RIZIN_UPLOAD_DIR)) == ["pipesim.patched.exe", "pipesim.patched.exe.patch.txt"], \
+        "no temporary file is left"
+
+
+def test_export_refuses_a_file_that_changed_since_it_was_opened(rz):
+    sid, path = _export_session(rz)
+    _patch(rz, sid, addr="0x140001440", bytes="90")
+    with open(path, "ab") as fh:
+        fh.write(b"x")
+    response = rz.post(f"/api/rizin/{sid}/export", {})
+    assert response.status_code == 400 and "changed" in response.get_json()["refused"]
+    assert os.listdir(rz.tdc.RIZIN_UPLOAD_DIR) == [], "no copy, no temporary file"
+
+
+def test_export_never_writes_where_the_original_is(rz):
+    """A long name is cut before the suffix is added, so the copy's name can be the original's own: a sample
+    that was exported (or uploaded) under it must not be copied onto itself."""
+    rz.uploads.mkdir()
+    name = "a" * 80 + ".patched.exe"
+    path = str(rz.uploads / name)
+    with open(path, "wb") as fh:
+        fh.write(EXPORT_SAMPLE)
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    _patch(rz, sid, addr="0x140001440", bytes="90")
+    response = rz.post(f"/api/rizin/{sid}/export", {})
+    assert response.status_code == 400 and "original" in response.get_json()["refused"]
+    assert open(path, "rb").read() == EXPORT_SAMPLE and os.listdir(rz.uploads) == [name]
+
+
+def test_export_answers_500_when_the_copy_cannot_be_written(rz, monkeypatch):
+    sid, path = _export_session(rz)
+    _patch(rz, sid, addr="0x140001440", bytes="90")
+    blocked = rz.tmp / "not_a_folder"
+    blocked.write_bytes(b"")
+    monkeypatch.setattr(rz.tdc, "RIZIN_UPLOAD_DIR", str(blocked / "uploads"))
+    response = rz.post(f"/api/rizin/{sid}/export", {})
+    assert response.status_code == 500 and "could not be read or written" in response.get_json()["error"]
+    assert open(path, "rb").read() == EXPORT_SAMPLE
+
+
+def test_export_prunes_like_an_upload(rz, monkeypatch):
+    sid, _ = _export_session(rz, "pipesim.exe")
+    _patch(rz, sid, addr="0x140001440", bytes="90")
+    result = rz.send(f"/api/rizin/{sid}/export", {})
+    assert result["name"].endswith(".patched.exe")
+    assert os.path.dirname(result["path"]) == rz.tdc.RIZIN_UPLOAD_DIR
+    # with room for one file, the copy and its note both stay and the old upload goes
+    old = rz.uploads / "old_upload.bin"
+    old.write_bytes(b"old")
+    os.utime(old, (1, 1))
+    monkeypatch.setattr(rz.tdc, "RIZIN_UPLOADS_KEEP", 1)
+    result = rz.send(f"/api/rizin/{sid}/export", {})
+    assert sorted(os.listdir(rz.uploads)) == [result["name"], result["name"] + ".patch.txt"]
+
+
+def test_the_prune_keeps_every_file_it_is_told_to(rz, monkeypatch):
+    """The copy and its note are two files and `keep` names both: with room for one file, a prune that
+    knows only the copy deletes the note (a patched sample with nothing that says what was changed)."""
+    rz.uploads.mkdir()
+    names = ["old.bin", "copy.patched.exe", "copy.patched.exe.patch.txt"]
+    for age, name in enumerate(names):
+        (rz.uploads / name).write_bytes(b"x")
+        os.utime(rz.uploads / name, (1000 + age, 1000 + age))  # the note is the newest
+    monkeypatch.setattr(rz.tdc, "RIZIN_UPLOADS_KEEP", 1)
+    rz.tdc._rizin_prune_uploads((str(rz.uploads / names[1]), str(rz.uploads / names[2])))
+    assert sorted(os.listdir(rz.uploads)) == sorted(names[1:])
+    # one path, as the upload route passes it: the copy stays although it is outside the one file of room
+    (rz.uploads / names[0]).write_bytes(b"x")
+    os.utime(rz.uploads / names[0], (2000, 2000))  # now the newest
+    rz.tdc._rizin_prune_uploads(str(rz.uploads / names[1]))
+    assert sorted(os.listdir(rz.uploads)) == sorted(names[:2])
+
+
+@pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
+@pytest.mark.skipif(not MINGW, reason="mingw (x86_64-w64-mingw32-gcc) not installed")
+def test_real_rizin_exports_the_patch_at_the_physical_offset(tdc, tmp_path, monkeypatch):
+    """The copy against a real PE, whose sections are page-aligned in memory and not in the file, so that an
+    address and its file offset really differ; and against rizin's maps, which the fake only models."""
+    import rizin_sessions
+
+    allowed, uploads = tmp_path / "allowed", tmp_path / "uploads"
+    allowed.mkdir()
+    exe = allowed / "pipesim.exe"
+    shutil.copy(_build_pipesim(tmp_path), exe)
+    original = exe.read_bytes()
+    monkeypatch.setattr(rizin_sessions, "RIZIN_EXE", REAL_RIZIN)
+    monkeypatch.setattr(tdc, "_readable_roots", lambda: [str(allowed), str(uploads)])
+    monkeypatch.setattr(tdc, "RIZIN_UPLOAD_DIR", str(uploads))
+    mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(tmp_path / "projects"))
+    monkeypatch.setattr(tdc, "_rizin_manager", mgr)
+    monkeypatch.setattr(tdc, "_rizin_install", {"key": None, "value": None})
+    api = _Api(tdc, None, mgr, tmp_path)
+    try:
+        sid = api.open(str(exe))["session"]
+        api.wait_done(sid, timeout=120)
+        session = mgr.get(sid)
+        main = next(f for f in api.read(f"/api/rizin/{sid}/functions") if f["name"] == "sym.main")["offset"]
+        hexed = api.read(f"/api/rizin/{sid}/hex?addr={main}&len=4")
+        assert hexed["paddr"] is not None and hexed["paddr"] != main - 0x140000000, "a section is not at its address"
+        assert bytes(hexed["bytes"]) == original[hexed["paddr"]:hexed["paddr"] + 4]
+
+        # three patches: two apart, and a pair that overlaps and was made later than its neighbour
+        api.send(f"/api/rizin/{sid}/patch", {"addr": main, "bytes": "9090"})
+        api.send(f"/api/rizin/{sid}/patch", {"addr": main + 0x21, "bytes": "11223344"})
+        api.send(f"/api/rizin/{sid}/patch", {"addr": main + 0x20, "bytes": "aabb"})
+        # beyond the file: the zero-filled room after .text's data, and one that crosses into it
+        text_end = next(m["from"] for m in session.json("omlj") if m["name"] == "mmap..text")
+        api.send(f"/api/rizin/{sid}/patch", {"addr": text_end + 2, "bytes": "90"})
+        api.send(f"/api/rizin/{sid}/patch", {"addr": text_end - 2, "bytes": "aabbccdd"})
+        # across the zero-filled room between two sections whose data follow each other in the file: both ends
+        # are in the file, and a copy written from the first end's offset would put the bytes in the wrong place
+        maps = {m["name"]: m for m in session.json("omlj")}
+        rdata_end, room = maps["fmap..rdata"]["to"], maps["mmap..rdata"]
+        assert room["from"] == rdata_end and maps["fmap..pdata"]["from"] == room["to"] and \
+            maps["fmap..pdata"]["delta"] == maps["fmap..rdata"]["delta"] + (rdata_end - maps["fmap..rdata"]["from"])
+        crossing = rdata_end - 100
+        api.send(f"/api/rizin/{sid}/patch", {"addr": crossing, "bytes": "ab" * (100 + (room["to"] - room["from"]) + 100)})
+        # one in the memory an emulation maps: no byte of the file is there
+        api.send(f"/api/rizin/{sid}/emulation/start", {})
+        stack = rizin_sessions.ESIL_STACK_ADDR
+        api.send(f"/api/rizin/{sid}/patch", {"addr": stack + 0x10, "bytes": "90"})
+        api.send(f"/api/rizin/{sid}/patch", {"addr": 0xDEAD0000, "bytes": "90"})  # and one with no map at all
+
+        result = api.send(f"/api/rizin/{sid}/export", {})
+        assert result["skipped"] == sorted([text_end - 2, text_end + 2, crossing, stack + 0x10, 0xDEAD0000])
+        assert result["patched"] == 2 + 4 + 2
+        data = open(result["path"], "rb").read()
+        assert hashlib.sha256(data).hexdigest() == result["sha256"] and len(data) == len(original)
+        at = hexed["paddr"]
+        assert data[at:at + 2] == b"\x90\x90"
+        assert data[at + 0x20:at + 0x25] == bytes.fromhex("aabb223344"), "the later write is the one that stays"
+        changed = [i for i in range(len(data)) if data[i] != original[i]]
+        assert changed and all(at <= i < at + 0x25 for i in changed), "nothing else in the file was touched"
+        assert hashlib.sha256(exe.read_bytes()).hexdigest() == hashlib.sha256(original).hexdigest(), \
+            "the original is never written"
+        assert result["sha256"] in open(result["path"] + ".patch.txt").read()
+        # what rizin shows through its cache is what the copy holds there
+        assert bytes.fromhex(session.text(f"p8 0x25 @ {main:#x}").strip())[:2] == data[at:at + 2]
+
+        # the copy opens as a file of its own, with the patch in it and none of it in the cache
+        other = api.open(result["path"], "tab2")["session"]
+        api.wait_done(other, timeout=120)
+        assert api.read(f"/api/rizin/{other}/hex?addr={main}&len=2")["bytes"] == [0x90, 0x90]
+        assert api.read(f"/api/rizin/{other}/patches") == []
+    finally:
+        mgr.shutdown()
