@@ -4991,6 +4991,7 @@ def test_real_rizin_assists_a_32_bit_stdcall_call(tmp_path):
             assert session.emulation_run("step")["stopped"] == "step"
         state = session.emulation_state()
         sp = next(r["value"] for r in state["registers"] if r["name"] == "esp")
+        bp = next(r["value"] for r in state["registers"] if r["name"] == "ebp")
         assert state["pc"] == alloc_call
         assert [row["value"] for row in state["stack"][:4]] == [0, 0x200, 0x1000, 0x40], \
             "argument i sits at [esp + 4*i] while the PC is on the call"
@@ -5005,6 +5006,8 @@ def test_real_rizin_assists_a_32_bit_stdcall_call(tmp_path):
         assert state["pc"] == alloc_call + 6 and state["stopped"] == "step"
         assert next(r["value"] for r in state["registers"] if r["name"] == "eax") == assist["value"]
         assert next(r["value"] for r in state["registers"] if r["name"] == "esp") == sp + 16
+        assert next(r["value"] for r in state["registers"] if r["name"] == "ebp") == bp, \
+            "aeim put the base pointer into its new map; the skip put it back"
         # the buffer is there, the stack aeim mapped at the start is still the stack, and the PC did not
         # go to the seek -- all three of which a bare aeim would have broken
         maps = {m["name"]: (m["from"], m["to"]) for m in session.json("omlj")}
