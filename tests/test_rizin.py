@@ -3595,10 +3595,14 @@ def test_reanalyze_runs_af_and_a_string_search_over_the_range(rz):
     sent = _commands_since(rz, mark)
     assert any(c.startswith("af @ ") for c in sent)
     assert any(c.startswith("/zj") for c in sent)
+    # a request without a body at all is one without a range, as for DELETE /patch and /breakpoints
+    assert rz.ok(rz.client.post(f"/api/rizin/{sid}/reanalyze"))["start"] == DECRYPTED
     # the range is the run's own, and the search found the string the run wrote where there was none
     assert found == {"start": DECRYPTED, "end": DECRYPTED_END, "functions": 0, "strings": 1}
+    import rizin_sessions
+
     assert f"af @ {DECRYPTED:#x} @e:analysis.limits=true,analysis.from={DECRYPTED:#x}," \
-        f"analysis.to={DECRYPTED_END + 1:#x}" in sent, sent
+        f"analysis.to={DECRYPTED_END + 1 + rizin_sessions.REANALYZE_SLACK:#x}" in sent, sent
     assert f"/zj [[:print:]]{{4,}} r ascii @e:search.in=range,search.from={DECRYPTED:#x}," \
         f"search.to={DECRYPTED_END + 1:#x}" in sent, sent
     # a whole-program analysis is not what this does, and the sample is never written
@@ -3637,19 +3641,27 @@ def test_reanalyze_lets_the_lists_see_the_new_names(rz, monkeypatch):
     assert names == ["hit.string.ascii.0"], names
 
 
+FAR_FUNCTION = 0x140003500   # past the range and past REANALYZE_SLACK
+
+
 def test_reanalyze_stays_inside_the_range(rz, monkeypatch):
     """rizin's af follows the calls out of the range -- measured on 0.9.1, with analysis.calls false as
-    well: it made a function at the target of a call in freshly decrypted bytes. analysis.limits is what
-    holds it to the range."""
-    monkeypatch.setenv("FAKE_RIZIN_EXTRA_FUNCTION", f"{DECRYPTED:#x}:fcn.decrypted,0x140002900:fcn.far")
+    well: it made a function at the target of a call in freshly decrypted bytes, and 32 of them down a
+    chain. analysis.limits is what holds it to the range, and the answer counts only what begins in the
+    range, never what af made in the slack past it."""
+    import rizin_sessions
+
+    monkeypatch.setenv("FAKE_RIZIN_EXTRA_FUNCTION",
+                       f"{DECRYPTED:#x}:fcn.decrypted,{FAR_FUNCTION:#x}:fcn.far")
     sid = _decrypted(rz)
+    assert FAR_FUNCTION > DECRYPTED_END + rizin_sessions.REANALYZE_SLACK
     assert _reanalyze(rz, sid)["functions"] == 1
     assert [f["offset"] for f in rz.read(f"/api/rizin/{sid}/functions")
             if f["offset"] >= DECRYPTED] == [DECRYPTED]
     # and it is the limits that held the other one back, not the analysis missing it
-    assert _reanalyze(rz, sid, start=f"{DECRYPTED:#x}", end="0x140002900")["functions"] == 2
+    assert _reanalyze(rz, sid, start=f"{DECRYPTED:#x}", end=f"{FAR_FUNCTION:#x}")["functions"] == 2
     assert [f["offset"] for f in rz.read(f"/api/rizin/{sid}/functions")
-            if f["offset"] >= DECRYPTED] == [DECRYPTED, 0x140002900]
+            if f["offset"] >= DECRYPTED] == [DECRYPTED, FAR_FUNCTION]
 
 
 def test_the_range_is_the_runs_own_writes_not_the_stack_or_a_patch(rz):
@@ -3669,17 +3681,77 @@ def test_the_range_is_the_runs_own_writes_not_the_stack_or_a_patch(rz):
     assert (found["start"], found["end"]) == (DECRYPTED, DECRYPTED_END)
 
 
-def test_reanalyze_builds_the_function_the_overwritten_bytes_left_behind(rz):
-    """rizin's af leaves a function that is already there alone (measured: after a decryption the stale
-    7-byte function of the encrypted bytes survived an af at its address), so the functions of the range
-    go first and are then built from the bytes again."""
-    sid = rz.session()
+def test_reanalyze_builds_the_function_the_overwritten_bytes_left_behind(rz, monkeypatch):
+    """rizin's af leaves a function that is already there alone -- measured on 0.9.1: a 1-byte function
+    at an address with 7 decrypted bytes under it stayed 1 byte, and became 7 only after an af- there.
+    So the functions of the range go first and are then built from the bytes again."""
+    monkeypatch.setenv("FAKE_RIZIN_EXTRA_FUNCTION", f"{DECRYPTED:#x}:fcn.decrypted")
+    sid = _decrypted(rz)
+    assert _reanalyze(rz, sid)["functions"] == 1, "the bytes the run wrote now carry a function"
+
+    # again, over the very bytes the run overwrote: the function that is there goes first, and the
+    # answer is still one -- without the af- a second re-analysis would find nothing at all
     mark = len(rz.commands())
-    found = _reanalyze(rz, sid, start=f"{WATCHDOG:#x}", end=f"{WATCHDOG + 37:#x}")
-    assert f"af- @ {WATCHDOG:#x}" in _commands_since(rz, mark)
-    assert found["functions"] == 1
+    assert _reanalyze(rz, sid)["functions"] == 1
+    sent = _commands_since(rz, mark)
+    assert f"af- @ {DECRYPTED:#x}" in sent, sent
+    assert sent.index(f"af- @ {DECRYPTED:#x}") < next(i for i, c in enumerate(sent)
+                                                      if c.startswith("af @ ")), sent
+    assert [f["name"] for f in rz.read(f"/api/rizin/{sid}/functions") if f["offset"] == DECRYPTED] == \
+        ["fcn.decrypted"]
+
+    # and a function of the file, in a range given by hand, goes the same way
+    assert _reanalyze(rz, sid, start=f"{WATCHDOG:#x}", end=f"{WATCHDOG + 37:#x}")["functions"] == 1
+    assert f"af- @ {WATCHDOG:#x}" in rz.commands()
     assert [f["name"] for f in rz.read(f"/api/rizin/{sid}/functions") if f["offset"] == WATCHDOG] == \
         ["sym.watchdog"]
+
+
+def test_reanalyze_is_refused_when_io_cache_does_not_hold(rz, monkeypatch):
+    """Without io.cache rizin reads the file again while wcj still lists the run's rows (measured), so
+    the range would be right and the bytes analysed would not be the ones the run wrote."""
+    monkeypatch.setenv("FAKE_RIZIN_IO_CACHE_ONCE", "1")
+    sid = _decrypted(rz)
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "e io.cache=false"})
+    mark = len(rz.commands())
+    response = rz.post(f"/api/rizin/{sid}/reanalyze", {})
+    assert response.status_code == 400 and "io.cache" in response.get_json()["refused"]
+    assert not any(c.startswith(("af ", "af-", "/zj")) for c in _commands_since(rz, mark))
+
+
+def test_what_the_reanalysis_found_does_not_go_into_the_project(rz, monkeypatch):
+    """rizin's own Ps keeps the function and the flags a range re-analysis made (measured), and the next
+    session would list a function over bytes that are not in the file. The save drops what rests on
+    bytes only the run wrote -- and keeps what rests on bytes a patch of this session brings back."""
+    monkeypatch.setenv("FAKE_RIZIN_EXTRA_FUNCTION", f"{DECRYPTED:#x}:fcn.decrypted")
+    path = rz.write("pipesim.exe")
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": f"{DECRYPT_AT:#x}"})
+    _run(rz, sid, "until", addr=f"{DECRYPT_END:#x}")
+    assert _reanalyze(rz, sid) == {"start": DECRYPTED, "end": DECRYPTED_END,
+                                   "functions": 1, "strings": 1}
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": f"{MAIN:#x}"})  # what makes a project be written
+    rz.close(sid)
+    saved = rz.project().read_text(encoding="utf-8", errors="surrogateescape")
+    functions = _project_namespace(saved, "/core/analysis/functions")
+    assert hex(DECRYPTED) not in functions, sorted(functions)
+    assert hex(MAIN).lower() in functions, "the file's own functions stay"
+    assert "hit.string.ascii.0" not in _project_namespace(saved, "/core/flags/flags")
+    assert "sym.main" in _project_namespace(saved, "/core/flags/flags"), "the file's own flags stay"
+
+    # the same again with a patch of this session over the function's first byte: those bytes come
+    # back when the file is opened again, so what rests on them may stay
+    sid = rz.open(path, tab="tab2")["session"]
+    rz.wait_done(sid)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": f"{DECRYPT_AT:#x}"})
+    _run(rz, sid, "until", addr=f"{DECRYPT_END:#x}")
+    _reanalyze(rz, sid)
+    _patch(rz, sid, addr=f"{DECRYPTED:#x}", bytes="41")
+    rz.close(sid)
+    saved = rz.project().read_text(encoding="utf-8", errors="surrogateescape")
+    assert hex(DECRYPTED) in _project_namespace(saved, "/core/analysis/functions")
+    assert f"patches={DECRYPTED:x}:41" in saved
 
 
 def test_reanalyze_refuses_a_range_that_is_no_range(rz, monkeypatch):
@@ -3731,8 +3803,21 @@ def test_reanalyze_says_the_session_ended_rather_than_fail(rz):
 
 # --- What stays: the /tdc namespace of the project (webui/rizin_sessions.py) -
 
+def _project_namespace(text, name):
+    """The ``key=value`` lines of one namespace of a project, as {key: value}."""
+    found, inside = {}, False
+    for line in text.split("\n"):
+        if line.startswith("/"):
+            inside = line == name
+        elif inside and "=" in line:
+            key, _, value = line.partition("=")
+            found[key] = value
+    return found
+
+
 def _plant_patches(project, patches):
     """Put a patch list into a saved project, as an older session or another build could leave it."""
+
     line = "patches=" + ",".join(f"{addr:x}:{after}" for addr, after in patches)
     text = project.read_text(encoding="utf-8", errors="surrogateescape")
     planted = re.sub(r"(?m)^patches=.*$", line, text)
@@ -4256,23 +4341,31 @@ def _assemble(text, at):
 
 def _decryptor_blob(path):
     """A blob whose code at 0 decrypts 0x40 bytes at 0x1000 (one XOR with 0xff, byte by byte) and stops
-    at 0x19. Decrypted, those bytes are a function (`stc; push rbp; ...; call 0x2000; ...; ret`) and the
-    string "DecryptedSecretString"; encrypted, the first byte is 0x06, which x86-64 cannot decode, so
-    rizin finds neither a function nor a string there before the run. 0x2000 holds code of its own: the
-    call's target, outside the range, where af must not wander. Every byte assembled with rz-asm."""
-    plain = (_assemble("stc", 0x1000) + _assemble("push rbp", 0x1001) + _assemble("mov rbp, rsp", 0x1002)
-             + _assemble("call 0x2000", 0x1005) + _assemble("pop rbp", 0x100A)
-             + _assemble("ret", 0x100B))
+    at 0x19.
+
+    Decrypted, those bytes begin a function -- `stc; push rbp; mov rbp, rsp; call 0x8000; jmp 0x1040` --
+    and hold the string "DecryptedSecretString". Encrypted, the first byte is 0x06, which x86-64 cannot
+    decode, so rizin finds neither a function nor a string there before the run.
+
+    Two addresses outside the range make the bound measurable: the function's **tail** (`pop rbp; ret`)
+    sits at 0x1040, plaintext in the file and one byte past the range, so a re-analysis without slack
+    truncates the function; the call's target is at 0x8000, far past the slack, where af must not reach.
+    Every byte assembled with rz-asm.
+    """
+    plain = (_assemble("stc", 0x1000) + _assemble("push rbp", 0x1001)
+             + _assemble("mov rbp, rsp", 0x1002) + _assemble("call 0x8000", 0x1005)
+             + _assemble("jmp 0x1040", 0x100A))
     plain = plain.ljust(0x20, b"\x00") + b"DecryptedSecretString\x00"
     plain = plain.ljust(0x40, b"\x00")
     code = _assemble("mov rcx, 0x40", 0) + _assemble("mov rsi, 0x1000", 7)
     loop = _assemble("xor byte [rsi], 0xff", 0xE) + _assemble("inc rsi", 0x11)
     loop += _assemble("dec rcx", 0x14) + _assemble("jnz 0xe", 0x17)
-    blob = bytearray(b"\xcc" * 0x3000)
+    blob = bytearray(b"\xcc" * 0x9000)
     blob[0:len(code + loop)] = code + loop
     assert len(code + loop) == 0x19, (code + loop).hex()
     blob[0x1000:0x1040] = bytes(b ^ 0xFF for b in plain)
-    blob[0x2000:0x2003] = _assemble("xor eax, eax", 0x2000) + _assemble("ret", 0x2002)
+    blob[0x1040:0x1042] = _assemble("pop rbp", 0x1040) + _assemble("ret", 0x1041)
+    blob[0x8000:0x8003] = _assemble("xor eax, eax", 0x8000) + _assemble("ret", 0x8002)
     path.write_bytes(bytes(blob))
     return 0x19
 
@@ -4289,16 +4382,20 @@ def test_real_rizin_reanalyses_what_a_run_decrypted(tmp_path):
     blob = tmp_path / "decryptor.bin"
     stop = _decryptor_blob(blob)
     before_sha = hashlib.sha256(blob.read_bytes()).hexdigest()
+    project = tmp_path / "projects" / (before_sha + ".rzdb")
     mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(tmp_path / "projects"))
     try:
         session = mgr.get(mgr.open(str(blob), "tab")["session"])
         _wait_state(session, "done", timeout=60)
         # rizin takes a raw blob for the host's arch (avr here), so the arch is set as the flood test
-        # does, and its analysis of the wrong arch is dropped: the before/after below is then rizin's
-        # reading of these bytes and nothing else.
+        # does, and that wrong-arch analysis is dropped -- its functions *and* its references: a
+        # reference to an address with no function there makes af create one even outside
+        # analysis.limits (measured; on a real PE after a full aaa the limits hold, also measured).
+        # The before/after below is then rizin's reading of these bytes and nothing else.
         session.console("e asm.arch=x86")
         session.console("e asm.bits=64")
         session.console("af-*")
+        session.console("ax-*")
 
         # before: 0x1000 holds no instruction rizin can decode, no function and no string
         # (rizin 0.9.1's pdj leaves a byte it cannot decode without a "type": only opcode "invalid")
@@ -4318,18 +4415,63 @@ def test_real_rizin_reanalyses_what_a_run_decrypted(tmp_path):
         # and now rizin finds what the run wrote: a function, and a string
         assert session.reanalyze() == {"start": 0x1000, "end": 0x103F, "functions": 1, "strings": 1}
         assert "stc" in session.text("pd 1 @ 0x1000"), session.text("pd 1 @ 0x1000")
-        assert session.text("afl").split()[:3] == ["0x00001000", "1", "12"], session.text("afl")
+        # 66 bytes, not 12: the function's tail at 0x1040 is past the range, and analysis.limits
+        # truncates the function it cuts (measured), which is what REANALYZE_SLACK leaves room for
+        assert session.text("afl").split()[:4] == ["0x00001000", "2", "66", "->"], session.text("afl")
         # again, and it is still one: rizin's af leaves a function that is there alone (measured), so
         # without taking the range's functions out first a second re-analysis would find nothing at all
         assert session.reanalyze() == {"start": 0x1000, "end": 0x103F, "functions": 1, "strings": 1}
-        assert session.text("afl").split()[:3] == ["0x00001000", "1", "12"], session.text("afl")
-        # bounded: af follows the call at 0x1005 out of the range, and analysis.limits stops it there
-        assert "0x00002000" not in session.text("afl")
-        assert session.reanalyze(0x1000, 0x2002)["functions"] >= 2
-        assert "0x00002000" in session.text("afl"), "and with the range around it, af does make one"
+        assert session.text("afl").split()[:3] == ["0x00001000", "2", "66"], session.text("afl")
+        # bounded: af follows the call at 0x1005, and the limits stop it at the range plus the slack,
+        # well before its target at 0x8000
+        assert "0x00008000" not in session.text("afl")
+        assert session.reanalyze(0x1000, 0x8002)["functions"] >= 1
+        assert "0x00008000" in session.text("afl"), "and with the range around it, af does make one"
 
         # the string is a flag of its own, which is how STRINGS, FLAGS and the console's Tab see it
         assert session.text("fd @ 0x1020").strip() == "hit.string.ascii.0"
+
+        # R25: none of it may reach the project. rizin's Ps keeps the function and the flag (measured),
+        # so the save drops what rests on bytes only the run wrote. A breakpoint is what makes a
+        # project be written at all here -- exactly the later save that would carry the leak.
+        assert session.reanalyze(0x8000, 0x8002) == {"start": 0x8000, "end": 0x8002,
+                                                     "functions": 1, "strings": 0}
+        session.breakpoint_set(0x8000)
+        assert session.flush() is True
+        saved = project.read_text(encoding="utf-8", errors="surrogateescape")
+        functions = _project_namespace(saved, "/core/analysis/functions")
+        assert "0x1000" not in functions, sorted(functions)
+        assert "0x8000" in functions, "a function over bytes that are in the file is no leak"
+        assert "hit.string.ascii.0" not in _project_namespace(saved, "/core/flags/flags")
+        assert "patches=\n" in saved, "nothing was patched by hand"
+        clean = tmp_path / "clean.rzdb"
+        clean.write_bytes(project.read_bytes())  # the project as this leak-free save left it
+
+        # and the self-correcting half: a patch of this session over the function's first byte, so
+        # those bytes do come back when the file is opened again -- then the function may stay
+        session.patch(0x1000, b"\xf9")
+        assert session.flush() is True
+        saved = project.read_text(encoding="utf-8", errors="surrogateescape")
+        assert "0x1000" in _project_namespace(saved, "/core/analysis/functions")
+        assert "patches=1000:f9" in saved
+    finally:
+        mgr.shutdown()
+    assert hashlib.sha256(blob.read_bytes()).hexdigest() == before_sha, "the sample must never be written"
+
+    # the untouched sample opened again with that project: no function over the run's bytes
+    second = tmp_path / "projects2"
+    second.mkdir()
+    shutil.copy(str(clean), str(second / (before_sha + ".rzdb")))
+    mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(second))
+    try:
+        session = mgr.get(mgr.open(str(blob), "tab")["session"])
+        _wait_state(session, "done", timeout=60)
+        assert session.analysis["note"] == "Restored from the saved project."
+        listed = session.text("afl")
+        assert "0x00001000" not in listed, listed
+        assert "0x00008000" in listed, "and the one over the file's own bytes is still there"
+        assert session.text("fd @ 0x1020").strip() != "hit.string.ascii.0"
+        assert '"opcode":"invalid"' in session.text("pdj 1 @ 0x1000"), "the bytes are encrypted again"
     finally:
         mgr.shutdown()
     assert hashlib.sha256(blob.read_bytes()).hexdigest() == before_sha, "the sample must never be written"

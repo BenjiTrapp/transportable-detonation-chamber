@@ -387,12 +387,52 @@ def test_function_entries_read_the_addresses_of_afls_rows():
     assert rizin_emulation.function_entries("") == []
 
 
-def test_function_total_reads_the_number_aflc_answered():
-    assert rizin_emulation.function_total("3\n") == 3
-    assert rizin_emulation.function_total("\n  0 \n") == 0
-    for text in ("", "none\n", "WARN: nothing\n"):
-        with pytest.raises(ValueError, match="aflc"):
-            rizin_emulation.function_total(text)
+def test_written_ranges_merge_what_a_decryption_loop_wrote():
+    """A loop's thousands of one-byte rows are one range; what is not next to it is another."""
+    rows = [_written(0x1000 + i, 1) for i in range(8)]
+    assert rizin_emulation.written_ranges(rows) == [(0x1000, 0x1007)]
+    assert rizin_emulation.written_ranges(list(reversed(rows))) == [(0x1000, 0x1007)]
+    # touching and overlapping rows merge, a hole of one byte does not
+    assert rizin_emulation.written_ranges([_written(0x10, 4), _written(0x14, 4)]) == [(0x10, 0x17)]
+    assert rizin_emulation.written_ranges([_written(0x10, 4), _written(0x12, 1)]) == [(0x10, 0x13)]
+    assert rizin_emulation.written_ranges([_written(0x10, 4), _written(0x15, 1)]) == [(0x10, 0x13),
+                                                                                     (0x15, 0x15)]
+    assert rizin_emulation.written_ranges([]) == []
+    assert rizin_emulation.written_ranges([{"addr": 0x10, "size": 0}]) == []
+
+
+def test_run_only_ranges_leave_out_what_a_patch_of_this_session_covers():
+    """What the project may keep: a function or flag over bytes a patch holds comes back when the file
+    is opened again, so only what *nothing but the run* wrote is dropped."""
+    def row(addr, size, mine):
+        return dict(_written(addr, size), mine=mine)
+
+    rows = [row(0x1000, 8, False), row(0x1004, 2, True)]
+    assert rizin_emulation.run_only_ranges(rows) == [(0x1000, 0x1003), (0x1006, 0x1007)]
+    # a patch over the whole of it leaves nothing, one before or after it leaves all of it
+    assert rizin_emulation.run_only_ranges([row(0x1000, 4, False), row(0x1000, 4, True)]) == []
+    assert rizin_emulation.run_only_ranges([row(0x1000, 4, False), row(0x900, 4, True)]) == \
+        [(0x1000, 0x1003)]
+    # the ends, and two patches inside one run range
+    assert rizin_emulation.run_only_ranges([row(0x1000, 4, False), row(0x1000, 1, True)]) == \
+        [(0x1001, 0x1003)]
+    assert rizin_emulation.run_only_ranges([row(0x1000, 4, False), row(0x1003, 1, True)]) == \
+        [(0x1000, 0x1002)]
+    assert rizin_emulation.run_only_ranges([row(0x1000, 9, False), row(0x1002, 1, True),
+                                            row(0x1006, 1, True)]) == [(0x1000, 0x1001),
+                                                                       (0x1003, 0x1005),
+                                                                       (0x1007, 0x1008)]
+    assert rizin_emulation.run_only_ranges([row(0x1000, 4, True)]) == []
+    assert rizin_emulation.run_only_ranges([]) == []
+
+
+def test_in_ranges_finds_the_range_an_address_is_in():
+    ranges = [(0x10, 0x13), (0x1000, 0x1007), (0x9000000, 0x9000000)]
+    assert [addr for addr in (0xF, 0x10, 0x13, 0x14, 0x1007, 0x1008, 0x9000000, 0x9000001)
+            if rizin_emulation.in_ranges(addr, ranges)] == [0x10, 0x13, 0x1007, 0x9000000]
+    assert rizin_emulation.in_ranges(0x10, []) is False
+    for value in (None, "0x10", True, 1.5):
+        assert rizin_emulation.in_ranges(value, ranges) is False
 
 
 def test_string_hits_counts_what_the_search_answered():

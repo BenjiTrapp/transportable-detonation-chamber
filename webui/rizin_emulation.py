@@ -385,7 +385,6 @@ STRING_PATTERN = "[[:print:]]{%d,}" % STRING_MIN_LENGTH
 # line separator (\x85, U+2028, U+2029), which rizin prints as it is.
 _AFL_ROW = re.compile(r"(?m)^[ \t]*(0x[0-9a-fA-F]{1,16})[ \t]+[0-9]{1,9}[ \t]+[0-9]{1,19}"
                       r"(?:[ \t]*->[ \t]*[0-9]{1,19})?[ \t]")
-_COUNT_RE = re.compile(r"[0-9]{1,19}")
 
 
 def write_cluster(rows, gap=RUN_RANGE_GAP):
@@ -424,15 +423,54 @@ def function_entries(text):
     return [int(row.group(1), 16) for row in _AFL_ROW.finditer(text)]
 
 
-def function_total(text):
-    """The number of functions ``aflc`` answered (its whole output is that number)."""
-    for line in text.split("\n"):
-        found = line.strip(" \t\r")
-        if found:
-            if _COUNT_RE.fullmatch(found):
-                return int(found)
-            break
-    raise ValueError("aflc did not answer the number of functions")
+def written_ranges(rows):
+    """The addresses ``rows`` wrote, merged into the fewest (low, high) ranges, both in them, lowest
+    first: a decryption loop's thousands of one-byte rows become one range."""
+    spans = sorted((row["addr"], row["addr"] + row["size"] - 1) for row in rows
+                   if isinstance(row.get("addr"), int) and isinstance(row.get("size"), int)
+                   and row["size"] > 0)
+    merged = []
+    for low, high in spans:
+        if merged and low <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], high))
+        else:
+            merged.append((low, high))
+    return merged
+
+
+def run_only_ranges(rows):
+    """The addresses an emulation run wrote and no patch of this session covers, as ``written_ranges``
+    gives them: the run's rows, minus every byte a ``mine`` row holds.
+
+    What rests on those addresses belongs to the run and nothing else -- it is gone with the write cache,
+    so nothing about it may go into the project. A byte a patch covers as well is **not** in them: that
+    byte comes back when the file is opened again, so what rests on it may stay.
+    """
+    kept = []
+    held = written_ranges([row for row in rows if row.get("mine")])
+    for low, high in written_ranges([row for row in rows if not row.get("mine")]):
+        at = low
+        for hold_low, hold_high in held:
+            if hold_high < at:
+                continue
+            if hold_low > high:
+                break
+            if hold_low > at:
+                kept.append((at, hold_low - 1))
+            at = max(at, hold_high + 1)
+            if at > high:
+                break
+        if at <= high:
+            kept.append((at, high))
+    return kept
+
+
+def in_ranges(addr, ranges):
+    """Whether ``addr`` is in one of ``ranges`` as written_ranges gives them (lowest first, no overlap)."""
+    if not isinstance(addr, int) or isinstance(addr, bool):
+        return False
+    at = bisect.bisect_right(ranges, (addr, 2 ** 64)) - 1  # the last range that starts at or below addr
+    return at >= 0 and addr <= ranges[at][1]
 
 
 def string_hits(found):

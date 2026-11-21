@@ -67,7 +67,7 @@ breakpoint's width covers the address), ``db- @ addr``, ``db-*``, ``dbd``, ``dbe
 ``dbc``/``dbC`` (the command and the condition rizin runs at a breakpoint, which ``dblj`` reports as
 ``data`` and ``cond``, a project stores and ``dbc ""``/``dbC ""`` clear -- all measured).
 
-The views (afl, aflc, pdfj, afbj, pdj, axtj, axfj, afxj, izj, iij, flj, pxj, pdgj, ol.j, oml.j) answer
+The views (afl, pdfj, afbj, pdj, axtj, axfj, afxj, izj, iij, flj, pxj, pdgj, ol.j, oml.j) answer
 from one model of the code: entry0 calls sym.main, whose blocks branch, run
 a long block, switch over two cases and leave by a tail call to
 sym.watchdog. ``af`` analyses the function at the seek (it answers nothing,
@@ -640,7 +640,7 @@ def esil_breakpoints(word, rest, seek):
 
 
 def analysis_function(word, rest, seek):
-    """``af``, ``af-`` and ``aflc``, as rizin 0.9.1 answers them.
+    """``af`` and ``af-``, as rizin 0.9.1 answers them.
 
     ``af`` prints nothing. It analyses the function at the seek: a function of the model that ``af-``
     removed comes back (rizin builds it from the bytes again), and the ones FAKE_RIZIN_EXTRA_FUNCTION
@@ -649,11 +649,8 @@ def analysis_function(word, rest, seek):
     bounds af's recursion: measured on rizin 0.9.1, without the limits ``af`` followed a call out of the
     range and made a function at its target, and it did so with ``analysis.calls`` false as well.
 
-    ``af-`` removes the function the seek is **in**, not only one that starts there (measured), and
-    ``aflc`` answers the number of functions and nothing else.
+    ``af-`` removes the function the seek is **in**, not only one that starts there (measured).
     """
-    if word == "aflc":
-        return f"{len(FUNCTIONS)}\n"
     if word == "af-":
         fn = function_at(seek)
         if fn is not None:
@@ -803,6 +800,10 @@ def save_project(path):
 
     Its breakpoints are in it (/core/debug/breakpoints) and its **write cache is not** -- both measured,
     and together they are the reason the server keeps the patches in a /tdc namespace of its own.
+
+    Its functions (/core/analysis/functions) and flags (/core/flags/flags, each with the space it is in)
+    are in it as well, which is how what a range re-analysis found would come back in the next session
+    over bytes that are not in the file (measured; see rizin_sessions._run_only).
     """
     functions = {}
     for fn in FUNCTIONS:
@@ -820,6 +821,13 @@ def save_project(path):
                                           "enabled": 1 if bp["enabled"] else 0, "name": f"{addr:#010x}"},
                                          separators=(",", ":"))
               for addr, bp in state["bps"].items()]
+    lines += ["", "/core/flags/flags"]
+    flags = [(name_of(fn), fn["offset"], fn["size"], "functions") for fn in FUNCTIONS]
+    flags += [(name, addr, 8, "symbols") for name, addr in FLAGS.items()]
+    flags += [(name, addr, 1, "search") for name, addr in state["hits"].items()]
+    lines += [f"{name}=" + json.dumps({"realname": name, "offset": addr, "size": size, "space": space},
+                                      separators=(",", ":"))
+              for name, addr, size, space in flags]
     lines += ["", "/core/fake", "comments=" + json.dumps({hex(k): v for k, v in state["comments"].items()})]
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -1050,7 +1058,7 @@ def answer(cmd):
         return esil_breakpoints(word, rest, seek)
     if word in ("wx", "wcj", "wc-", "wc-*"):
         return write_cache(word, rest, seek)
-    if word in ("af", "af-", "aflc"):
+    if word in ("af", "af-"):
         return analysis_function(word, rest, seek)
     if word == "/zj":
         return string_search(rest)

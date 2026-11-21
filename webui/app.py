@@ -5791,8 +5791,9 @@ def _rizin_unpatch(session):
 
 
 def _rizin_reanalyze(session):
-    """POST: start and end (both optional, both or neither; default the range the run wrote)."""
-    body = _rizin_body()
+    """POST: start and end (both optional, both or neither; default the range the run wrote). A request
+    without a body at all is one without a range, as for DELETE /patch and DELETE /breakpoints."""
+    body = _rizin_body(optional=True)
     start, end = body.get("start"), body.get("end")
     try:
         return session.reanalyze(None if start is None else _rizin_address(start, "start"),

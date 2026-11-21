@@ -120,6 +120,15 @@ PROJECT_PATCH_CHARS = 32 * 1024
 # parts, which the start and end of the request allow.
 MAX_REANALYZE_BYTES = 4 * 1024 * 1024
 MAX_REANALYZE_FUNCTIONS = 256
+# How far past the range the analysis may reach. rizin's analysis.limits truncates the function it cuts
+# (measured: a 7-byte function at the range's start came out as 5 bytes with analysis.to at its 5th
+# byte), and the function at the start is the one the analyst came for, so the limit gets one page of
+# room -- the same distance that already counts as "the same range" when a run's writes are grouped
+# (RUN_RANGE_GAP). It is a bound, not a licence: without the limits af walked 32 functions down a chain
+# of calls, the last of them 0x2d00 bytes past the range (measured), and rizin's own cap on a function
+# is 256 KB, 64 times this.
+# A function reaching more than a page past the range is still truncated; docs/api.md says so.
+REANALYZE_SLACK = 0x1000
 CONSOLE_LIMIT = 1024 * 1024
 # The largest answer that the lists of strings, imports and flags keep: their JSON of a big dump (izj,
 # flj) runs to hundreds of MB, and the web UI filters and pages them from a copy of its own.
@@ -869,7 +878,7 @@ def _patch_words(count):
     return {"count": count, "patch": "patch" if count == 1 else "patches"}
 
 
-def _sanitize_project(src, dst, level, mode, done, patches):
+def _sanitize_project(src, dst, level, mode, done, patches, ranges=()):
     """Copy a project written by ``Ps`` so that rizin 0.9.1 can load it again; how many patches did not fit.
 
     Loading a variable that came from DWARF looks up its DWARF entry, which
@@ -882,6 +891,9 @@ def _sanitize_project(src, dst, level, mode, done, patches):
     them, and they go into that namespace too: ``Ps`` saves the cache's bytes nowhere (measured, which
     is why they are kept here), and what a run wrote is no patch and is never passed in. Breakpoints
     need no line of their own: rizin's project holds them itself (/core/debug/breakpoints, measured).
+
+    ``ranges`` are the addresses only an emulation run ever wrote (rizin_emulation.run_only_ranges);
+    what the project says about them is dropped, see _run_only.
     """
     namespace = None
     line_of_patches, left_out = _patches_line(patches)
@@ -891,12 +903,53 @@ def _sanitize_project(src, dst, level, mode, done, patches):
             line = line.rstrip("\n")
             if line.startswith("/"):
                 namespace = line
+            elif ranges and _run_only(namespace, line, ranges):
+                continue
             elif namespace == "/core/analysis/functions" and '"DWARF"' in line and "=" in line:
                 line = _plain_vars(line)
             fout.write(line + "\n")
         fout.write(f"\n/tdc\nlevel={level}\nmode={mode}\ndone={','.join(done)}\n"
                    f"patches={line_of_patches}\n")
     return left_out
+
+
+# The flag spaces rizin's own analysis and search fill: a function's flag and the string search's hits.
+# A flag of any other space at such an address (a symbol, a section, the emulator's register flags) is
+# the file's or the emulation's and is left as it is.
+_PROJECT_RUN_SPACES = ("functions", "search")
+_PROJECT_ADDR_RE = re.compile(r"0x[0-9a-fA-F]{1,16}")
+
+
+def _run_only(namespace, line, ranges):
+    """Whether this line of a project says something about bytes only an emulation run ever wrote.
+
+    rizin's ``Ps`` keeps what a range re-analysis found -- measured: after an ``af`` over decrypted
+    bytes the project holds the function in /core/analysis/functions, its name as a flag of the
+    "functions" space and the search's hits as flags of the "search" space, and reopening the
+    **untouched** sample with that project lists "0x00001000 1 12 fcn.00001000" while the bytes there
+    disassemble as "invalid". Those bytes are gone with the write cache, so the project must not carry
+    what was read from them.
+
+    Dropped are a function whose entry address is in ``ranges`` and a flag of rizin's analysis or
+    search spaces there. The rule needs nothing remembered between saves and corrects itself: an
+    address a patch of this session covers is not in ``ranges`` (run_only_ranges takes it out), because
+    those bytes do come back, so the function over them rightly stays. A basic block left in
+    /core/analysis/blocks is not dropped: no view shows it, dropping one could break a function that
+    begins outside the range, and a block without a function changes nothing rizin lists (measured).
+    """
+    key, sep, value = line.partition("=")
+    if not sep:
+        return False
+    if namespace == "/core/analysis/functions":
+        return bool(_PROJECT_ADDR_RE.fullmatch(key)) and rizin_emulation.in_ranges(int(key, 16), ranges)
+    if namespace == "/core/flags/flags":
+        try:
+            flag = json.loads(_sdb_unescape(value))
+        except ValueError:
+            return False
+        return (isinstance(flag, dict) and flag.get("space") in _PROJECT_RUN_SPACES
+                and rizin_emulation.in_ranges(flag.get("offset"), ranges))
+    return False
 
 
 def _patches_line(patches):
@@ -1247,7 +1300,7 @@ class RizinSession:
         # This session's own writes through patch/patch_op, in the order it made them (rizin_emulation.
         # cache_entry). rizin has one write cache, which holds an emulation run's writes too and cannot
         # tell them apart; this mirror can, row by row (see patches). _lost: patches a restarted rizin
-        # could not take back, which the project keeps all the same (see _saved_patches).
+        # could not take back, which the project keeps all the same (see _saved_cache).
         self._mine = []
         self._lost = []
         # Notes from the boot (a project that could not be loaded, patches that could not be applied):
@@ -1783,6 +1836,10 @@ class RizinSession:
             self._reanalyze_width(start, end)  # before the pipe is waited for
 
         def run(pipe):
+            # A console `e io.cache=false` leaves wcj listing the run's rows while rizin reads the file
+            # again (measured, Task 5), so af and /zj would analyse bytes the run never wrote.
+            pipe.cmd("e io.cache=true")
+            self._require_io_cache(pipe, "the bytes the run wrote")
             found = (start, end) if start is not None else self._run_range(pipe)
             if found is None:
                 raise RizinRefused("the run wrote nothing to analyse")
@@ -1809,28 +1866,38 @@ class RizinSession:
         return rizin_emulation.write_cluster(rows)
 
     def _reanalyze_functions(self, pipe, low, high):
-        """``af`` over the range (gate held): how many functions now begin in it.
+        """``af`` over the range (gate held): how many functions begin in it afterwards.
 
         The functions that begin in the range go first (``af-``): rizin's af leaves a function that is
         there alone, so without that the stale function of the bytes the run overwrote would survive it
-        (measured on 0.9.1: after a decryption the 7-byte function of the encrypted bytes was still what
-        af answered). Then one af per address, bounded to the range by ``analysis.limits``, because af
-        follows the calls out of it -- measured, and with ``analysis.calls`` false as well: pointed into
-        freshly decrypted bytes it made a function at the target of their call, and 32 of them down a
-        chain. The settings ride on the command (``@e:``), so nothing is left changed behind it.
+        (measured on 0.9.1: a 1-byte function at an address with 7 decrypted bytes under it stayed
+        1 byte, and became 7 only after an ``af-`` there). Then one af per address, bounded to the range
+        by ``analysis.limits``, because af follows the calls out of it -- measured, and with
+        ``analysis.calls`` false as well: pointed into freshly decrypted bytes it made a function at the
+        target of their call, and 32 of them down a chain. The limit gets REANALYZE_SLACK of room past
+        the range, because analysis.to truncates the function it cuts (measured). The settings ride on
+        the command (``@e:``), so nothing is left changed behind it.
+
+        The count is read from the list again rather than from a difference: af may also make a function
+        in the slack past the range, and the answer says how many begin *in* the range.
         """
-        rows = pipe.cmd("afl", timeout=CONSOLE_TIMEOUT, limit=FUNCTION_ANSWER_MAX)
-        begins = sorted({addr for addr in rizin_emulation.function_entries(rows) if low <= addr <= high})
+        begins = self._reanalyze_begins(pipe, low, high)
         if len(begins) > MAX_REANALYZE_FUNCTIONS:
             raise RizinRefused(f"the range holds {len(begins)} functions, more than "
                                f"{MAX_REANALYZE_FUNCTIONS}: analyse it in parts")
         for addr in begins:
             pipe.cmd(f"af- @ {addr:#x}")
-        before = rizin_emulation.function_total(pipe.cmd("aflc"))
-        limits = f"@e:analysis.limits=true,analysis.from={low:#x},analysis.to={high + 1:#x}"
+        limits = (f"@e:analysis.limits=true,analysis.from={low:#x},"
+                  f"analysis.to={high + 1 + REANALYZE_SLACK:#x}")
         for addr in [low] + [addr for addr in begins if addr != low]:
             pipe.cmd(f"af @ {addr:#x} {limits}", timeout=CONSOLE_TIMEOUT)
-        return max(0, rizin_emulation.function_total(pipe.cmd("aflc")) - before)
+        return len(self._reanalyze_begins(pipe, low, high))
+
+    @staticmethod
+    def _reanalyze_begins(pipe, low, high):
+        """The addresses in low..high where ``afl`` says a function begins, lowest first (gate held)."""
+        text = pipe.cmd("afl", timeout=CONSOLE_TIMEOUT, limit=FUNCTION_ANSWER_MAX)
+        return sorted({addr for addr in rizin_emulation.function_entries(text) if low <= addr <= high})
 
     def _reanalyze_strings(self, pipe, low, high):
         """``/zj`` over the range (gate held): how many strings it found.
@@ -2332,7 +2399,7 @@ class RizinSession:
 
     def _project_snapshot(self, pipe):
         """``Ps`` to a temporary file (gate held); _finish_save then makes it the project."""
-        patches = self._saved_patches(pipe)
+        patches, ranges = self._saved_cache(pipe)
         self._save_seq += 1
         os.makedirs(self._projects_dir, exist_ok=True)
         tmp = f"{self._project}.{self._save_seq}.tmp"
@@ -2345,33 +2412,39 @@ class RizinSession:
                 pass
             raise
         with self._lock:
-            return self._save_seq, tmp, self.level, self._mode, list(self._done), patches
+            return self._save_seq, tmp, self.level, self._mode, list(self._done), patches, ranges
 
-    def _saved_patches(self, pipe):
-        """The patches to write into the project: this session's own writes as (addr, after_hex), in the
-        order rizin's cache holds them (gate held).
+    def _saved_cache(self, pipe):
+        """What the write cache says about the project (gate held): the patches to write into it, and
+        the addresses only an emulation run ever wrote.
 
-        The cache is read back first, so the list is what rizin really holds *and* what this session
-        wrote: a patch the console took back with ``wc-`` has left the mirror by then, and what an
-        emulation run wrote was never in it. That is the whole point -- a run's bytes never stood in the
-        file, and a project that baked them in would lose track of where bytes come from.
+        The patches are this session's own writes as (addr, after_hex), in the order rizin's cache holds
+        them. The cache is read back first, so the list is what rizin really holds *and* what this
+        session wrote: a patch the console took back with ``wc-`` has left the mirror by then, and what
+        an emulation run wrote was never in it. That is the whole point -- a run's bytes never stood in
+        the file, and a project that baked them in would lose track of where bytes come from.
 
         ``self._lost`` are patches a restarted rizin could not take back (_recover): they are kept in
         the project, because a cache that died must not erase what the project already held. The next
         patch or take-back clears them -- from then on the live cache is the truth again.
+
+        The ranges are the other half of the same rule, for what rizin's own ``Ps`` keeps: what the
+        project says about bytes that are gone with the cache is dropped (see _run_only). An empty cache
+        gives no ranges, so a save after a lost cache leaves the project as it was rather than stripping
+        it by guesswork.
         """
-        if self._mine:
-            self._patch_list(pipe)
+        rows = self._patch_list(pipe)
         kept = [(addr, after) for addr, _, after in self._mine]
-        return kept + [patch for patch in self._lost if patch not in kept]
+        return (kept + [patch for patch in self._lost if patch not in kept],
+                rizin_emulation.run_only_ranges(rows))
 
     def _finish_save(self, snapshot):
-        seq, tmp, level, mode, done, patches = snapshot
+        seq, tmp, level, mode, done, patches, ranges = snapshot
         part = f"{self._project}.{seq}.part"
         try:
             if not os.path.isfile(tmp):
                 raise OSError(f"rizin did not write {tmp}")
-            left_out = _sanitize_project(tmp, part, level, mode, done, patches)
+            left_out = _sanitize_project(tmp, part, level, mode, done, patches, ranges)
             with self._replace_lock:
                 if seq > self._saved_seq:
                     os.replace(part, self._project)
