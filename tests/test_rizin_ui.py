@@ -5565,6 +5565,14 @@ def test_rizin_emulation_offers_a_call_return_and_lets_it_be_edited():
         const plainFrom = calls.length;
         await press(run('skip'));
         r.untouched = sent(plainFrom);
+        // A 64-bit offer (a memcpy returns a register's value): the field shows it exactly and SKIP posts it exactly
+        S.callAssist = offer({ value: '0x7ff7a1b2c3d4e5f6' });
+        await rizinEmuStop();
+        await startAt('0x140001499');
+        r.wide = field().value;
+        const wideFrom = calls.length;
+        await press(run('skip'));
+        r.widePosts = sent(wideFrom);
         // A value that is no number is not posted
         await rizinEmuStop();
         await startAt('0x140001499');
@@ -5652,6 +5660,8 @@ def test_rizin_emulation_offers_a_call_return_and_lets_it_be_edited():
     assert r["edited"]["hidden"] is True, "the offer of a call stayed once the PC left it"
     assert r["edited"]["why"].strip() and "skipped the call" in r["edited"]["why"], "what the skip applied is not said"
     assert r["untouched"] == [["/call", {"addr": "0x140001499", "value": "0x140008000", "stack_fix": 8}]]
+    assert r["wide"] == "0x7ff7a1b2c3d4e5f6", "an offered 64-bit value lost digits in the field"
+    assert r["widePosts"] == [["/call", {"addr": "0x140001499", "value": "0x7ff7a1b2c3d4e5f6", "stack_fix": 0}]]
     assert r["bad"]["posts"] == 0 and r["bad"]["value"] == "banana" and r["bad"]["pc"] == "0x140001499"
     assert "banana" in r["bad"]["why"], "no word on the value that is no number"
     assert r["unknown"]["value"] == "" and "Unknown" in r["unknown"]["text"]
