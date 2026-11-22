@@ -2011,7 +2011,8 @@ class RizinSession:
         ESIL emulates no Windows API: a step into a ``call qword [VirtualAlloc]`` runs into unmapped
         memory (measured). This names the API behind the call, offers a value for the return register
         and says in ``summary`` what SKIP would do with it. Every value is a proposal: call_skip takes
-        the value and the stack correction from the request, so the analyst can change either.
+        the value and the stack correction from the request, so a client can change either (the tab edits
+        only the value; it sends the stack correction as offered).
 
         It **changes nothing** (R38), not even the session's own clock or its pseudo-value series: the
         run line asks for this on every step, so two answers for the same call are the same answer, and
@@ -2051,8 +2052,8 @@ class RizinSession:
         """Skip the call at ``addr`` and apply the answer; the state, with ``summary``: what was applied.
 
         ``value`` goes into the return register (None leaves it as it is), ``stack_fix`` is added to the
-        stack pointer. Both come from the request, not from the table: the analyst may have edited
-        them. A memory API's buffer is mapped, a copying one really copies and the time and environment
+        stack pointer. Both come from the request, not from the table: a client may have changed
+        them (the tab edits only ``value``; it sends ``stack_fix`` as offered). A memory API's buffer is mapped, a copying one really copies and the time and environment
         APIs write their out-parameter, all at the addresses the call's own arguments name.
 
         The order follows what rizin does: the buffer is mapped **first**, because ``aeim`` sets the PC

@@ -336,8 +336,12 @@ def test_the_limits_the_rizin_page_names_are_the_code():
     # the gutter and the lines of DISASSEMBLY have no way in for the keyboard
     lines = APP_JS[APP_JS.index("function rizinDisasmHtml"):APP_JS.index("function rizinAnalysisText")]
     assert 'class="rizin-gutter' in lines and "tabindex" not in lines
-    # the 4094 of the page is the one the server's own comments name
-    assert "4094" in open(os.path.join(ROOT, "webui", "rizin_emulation.py"), encoding="utf-8").read()
+    # rizin keeps 4094 characters of a stdin line and cuts what is longer (measured: 4093 and 4094 land, 4095 does not).
+    # The page says "longer than", and the cap leaves the longest `wx` the server sends well inside the line
+    assert "longer than 4094" in _plain(HELP) and "cuts what is longer" in rizin and "reaches 4094" not in rizin
+    longest = "wx %s @ %s" % ("ab" * rizin_emulation.MAX_PATCH_BYTES, "0x%016x" % (2 ** 64 - 1))
+    assert len(longest) <= 4094 < len("wx %s @ %s" % ("ab" * (rizin_emulation.MAX_PATCH_BYTES * 2), "0x%016x" % (2 ** 64 - 1))), \
+        "the cap no longer separates a command line that fits from one that is cut"
 
 
 def test_the_rizin_page_quotes_the_filter_as_it_words_its_refusals():
@@ -360,6 +364,9 @@ def test_the_rizin_page_quotes_the_filter_as_it_words_its_refusals():
         assert check(command), "the page says %r is refused; the filter lets it through" % command
     for name in ("wci", "wc+", "wa", "dbc", "dbC", "dbx", "dbw"):
         assert "`%s`" % name in console, "the console section does not name the refused %s" % name
+    # what the user reads on screen is what the page quotes, word for word
+    for command in ("wci", "wc+", "wa nop", "dbc 0x10 x", "dbC 0x10 x", "dbx 0x10 x", "dbw 0x10", "wu x", "wxf x", "wff x", "wfs x"):
+        assert check(command) in console, "the page does not quote the refusal of %r: %s" % (command, check(command))
     for command in ("db @ 0x10", "db- @ 0x10", "db-*", "dblj", "dbd @ 0x10", "wx 9090 @ 0x10", "wc- 0x10 0x11", "wc-*", "wcj",
                     "e esil.timeout=3", "e io.cache=true", "aepc 0x10", "aei", "aeim", "aes", "aeso", "aess", "aesu 0x10",
                     "aec", "ar rax=1", "af @ 0x10", "/zj [[:print:]]{4,} r ascii"):
@@ -1399,3 +1406,50 @@ def test_the_documentation_map_shows_the_offline_wiki():
     assert shots == ["static/wiki.png"], \
         "the map shows %s; the wiki is the one picture of this section" % shots
     assert os.path.isfile(os.path.join(ROOT, shots[0])), shots[0]
+
+
+def test_the_help_and_the_guide_say_the_same_where_they_say_it_twice():
+    """Ruling R71. The in-tab help is what a reader on the VM has: the markdown guide is not served to them, so the help
+    repeats the guide and cannot just point at it. Repeated text drifts: the help kept saying a project is "made only
+    once something is renamed or commented" after a patch and a breakpoint began to make one. So the claims that stand
+    in both are pinned here, each as the words both of them use; a change to one side alone fails the test.
+
+    The claims are the load-bearing ones: what is written and what runs, what is kept and what ends with the session,
+    and the limits a reader would otherwise find out the hard way."""
+    import html as htmllib
+    guide = re.sub(r"\s+", " ", _doc("rizin.md").replace("`", ""))    # markdown: no tags to strip, `<addr>` is text
+    help_text = htmllib.unescape(_plain(HELP))
+    shared = [
+        "the original file is never written",
+        "renamed, commented, patched by hand or given a breakpoint",    # what makes a project (the sentence R71 began with)
+        "patches set by hand",                                        # what comes back with it
+        "ESIL does not emulate the Windows API",
+        "x86-64 and x86-32 only",
+        "STOP leaves the emulation",
+        "no step back",
+        "at most 2000 bytes",
+        "4094 characters",
+        "about 4 KB of slack",
+        "WRITTEN BY THE RUN",
+        "These bytes end with the session",
+        "Clear rizin's whole cache",
+        "nothing is submitted",
+        "cannot be reached with the keyboard",
+        "above 2^53",
+        "db- @ <addr>",
+        "wc- <addr> <addr+1>",
+        "'d' commands are not allowed: emulation runs from the EMULATION tab",
+        "esil.timeout",
+        "no watchpoint",
+    ]
+    for claim in shared:
+        assert claim.lower() in help_text.lower(), "the in-tab help no longer says %r" % claim
+        assert claim.lower() in guide.lower(), "docs/rizin.md no longer says %r" % claim
+    # the sentence that went stale, in either voice
+    for stale in ("made only once something is renamed or commented", "renamed or commented)", "reaches 4094",
+                  "the file is only read", "only reads the file"):
+        assert stale not in help_text and stale not in guide, "a stale claim is back: %r" % stale
+    # the project sentence also names what is saved: the four causes in the help, the four in the guide's Projects
+    projects = re.sub(r"\s+", " ", _section_of(_doc("rizin.md"), "Projects"))
+    assert "renamed, commented, patched by hand or given a breakpoint" in projects
+    assert "Names, comments, patches set by hand and breakpoints are saved" in help_text

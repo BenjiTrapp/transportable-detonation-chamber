@@ -9,7 +9,8 @@ The **Rizin** tab reverse engineers a file on the VM in the browser. rizin
 file; the tab draws its views itself, in both themes. The original file is
 never written, and nothing of it runs: **EMULATE** interprets its code in
 rizin's ESIL virtual machine, in memory, without starting a process. A copy
-with your patches in it exists only after an explicit export. Screenshot:
+with your patches in it exists only after an explicit export (why that is safe:
+[Security Notes](configuration.md#security-notes)). Screenshot:
 [Rizin (Reverse Engineering)](web-ui.md#rizin-reverse-engineering).
 
 ## Opening a file
@@ -143,13 +144,19 @@ zeros. So when the PC is on a call, the run strip names the API behind it and
 says what SKIP will do: it skips the call, puts an answer in the return
 register (`rax`, at 32 bits `eax`) and, where the API makes memory, maps it.
 The value is a field you can change before SKIP applies it, and every
-register can be set in the pane at any time. The answers are those of a clean machine that
-nobody is analysing, which is what gets past an anti-VM check without a
-patch:
+register can be set in the pane at any time. The answers are those of a clean
+machine that nobody is analysing, which is what gets past an anti-VM check
+without a patch. The groups below are the ones that matter when unpacking and against
+anti-VM checks, with the APIs the table names for them; it holds more (among
+others `HeapCreate`, `VirtualFree`, `HeapFree`, `free`, `VirtualProtectEx`,
+`FlushInstructionCache`, `LoadLibraryEx`, `GetModuleHandleEx`, `Sleep`,
+`GetSystemInfo`, `GetEnvironmentVariable` and `RtlCopyMemory`), and it is data
+(`API_TABLE` in `webui/rizin_emulation.py`), so it can grow without a code
+change:
 
 | Group | APIs | SKIP answers |
 |-------|------|--------------|
-| Memory | `VirtualAlloc`, `VirtualAllocEx`, `HeapAlloc`, `LocalAlloc`, `GlobalAlloc`, `malloc` | A new buffer of the size the call asks for, mapped for the run; its address in the return register |
+| Memory | `VirtualAlloc`, `VirtualAllocEx`, `HeapAlloc`, `LocalAlloc`, `GlobalAlloc`, `malloc` | A new buffer of the size the call asks for (rounded up to a page, at most 16 MB), mapped for the run; its address in the return register |
 | Memory protection | `VirtualProtect` | Success; the memory stays writable |
 | Loader | `LoadLibraryA/W`, `GetModuleHandleA/W`, `GetProcAddress` | A pseudo handle; for `GetProcAddress` the address of the import if the file has it, else a recognisable pseudo address |
 | Anti-debug | `IsDebuggerPresent`, `CheckRemoteDebuggerPresent`, `NtQueryInformationProcess` | "Not being watched" |
@@ -225,9 +232,10 @@ file, from its sections. **Re-analyse** in WRITTEN BY THE RUN analyses the
 range the run wrote again: `af` for the functions that begin there, and a
 search for ASCII strings of at least 4 characters (UTF-16 is not searched).
 The range is the cluster of the run's writes with the most bytes, leaving out
-the emulation's own stack and buffers; it takes at most 4 MB and rebuilds at
-most 256 functions, and nothing else is analysed (`aa*` stays behind the Full
-analysis button). What it finds belongs to the run and goes with it.
+the emulation's own stack and buffers. A range wider than 4 MB, or holding
+more than 256 functions, is refused with "analyse it in parts" and not cut to
+size; nothing else is analysed (`aa*` stays behind the Full analysis button).
+What it finds belongs to the run and goes with it.
 
 `af` is given about 4 KB of slack past the range, because a function that
 begins inside the range and reaches past its end would otherwise be reported
@@ -240,7 +248,7 @@ rename of it.
 ### Export and the Submit tab
 
 **Export** in SET BY HAND writes a copy of the file with its patches into
-`%TEMP%\rizin_uploads`, as `<16 hex digits of the SHA-256>_<name>.patched.<ext>`
+`%TEMP%\rizin_uploads`, as `<16 hex digits of the original's SHA-256>_<name>.patched.<ext>`
 (the name says what it is), with a note `….patch.txt` beside it: the original's
 path, the SHA-256 of the original and of the copy, the time in UTC and one line
 per patch (address, offset in the file, bytes before → after). The copy is
@@ -283,8 +291,8 @@ the console where the tab stops.
 |---------|-----|
 | `!`, `\|`, `>`, `<`, backticks, `$(…)`, `#!` | They run programs, or write output to files and read input from them |
 | Command families other than `a p i f C s / ? x t b e w d` (analysis, print, info, flags, comments, seek, search, help, hexdump, types, block size, settings, writes that stay in rizin's cache, breakpoints): among them `o` (open files, and with it `ood`, which would start a debugged process), `.` (scripts), `(` (macros) | Other files and stored scripts are not part of the analysis |
-| In `w`: everything but `w`, `wx`, `wz`, `wo…` (writes into the cache) and `wc`, `wcj`, `wc-`, `wc-*` (the cache's list and its removal). `wci` and `wc+` commit the cache to the file, `wa` assembles, `wu` and `wf…` read files | The original file is never written; assembling can reach nasm or as |
-| In `d`: everything but the breakpoint list (`db`, `db-`, `db-*`, `dbl`, `dblj`, `dbd`, `dbe` …). `dbc`, `dbC` and `dbx` make a breakpoint run a rizin command, `dbw` sets a watchpoint, which hangs rizin; the executing commands (`dp`, `dc`, `ds`, `dm`, `dk`, `dd`, `dbt`) answer `'d' commands are not allowed: emulation runs from the EMULATION tab` | No real debugging; emulation has its own tab. `dbd` is let through but does not keep a breakpoint from stopping a run: remove it with `db-` |
+| In `w`: everything but `w`, `wx`, `wz`, `wo…` (writes into the cache) and `wc`, `wcj`, `wc-`, `wc-*` (the cache's list and its removal). `wci` and `wc+` answer `'wc+', 'wci' and 'wcp...' commit the cache: they write into the file`; `wa` answers `assembling is not available: rizin can hand it to an external assembler`; `wu` and `wxf` answer `'wu' and 'wxf' read a file`, `wff` and `wfs` answer `'wff' and 'wfs' read a file or a socket`; any other name answers `'<name>' is not allowed: only writes that stay in the cache are available` | The original file is never written; assembling can reach nasm or as; reading files is not part of the analysis |
+| In `d`: everything but the breakpoint list (`db`, `db-`, `db-*`, `dbl`, `dblj`, `dbd`, `dbe` …). `dbc`, `dbC` and `dbx` answer `'dbc', 'dbC', 'dbx', 'dbic' and 'dbix' run rizin commands when a breakpoint hits`; `dbw` answers `'dbw' and 'dbW' set watchpoints, which hang rizin`; the executing commands (`dp`, `dc`, `ds`, `dm`, `dk`, `dd`, `dbt`) answer `'d' commands are not allowed: emulation runs from the EMULATION tab` | No real debugging; emulation has its own tab. `dbd` is let through but does not keep a breakpoint from stopping a run: remove it with `db-` |
 | Inside the other families: the sub-commands and `@` forms that read or write files, assemble (rizin can hand that to an external assembler), wait for input or open an interactive view, run stored or nested commands, or change the settings, arch or file for one command (`@e:`, `@a:`, `@f:` …) | The same reasons, one level down; the list comes from rizin 0.9.1's own help, and the tests check every entry |
 | Setting anything but `asm.*` (not `asm.assembler` and `asm.debuginfo.file`), `analysis.*` (also under its older name `anal.*`), `esil.*` (not `esil.mdev.range`, which a command hook handles), `bin.demangle` and `io.cache`; arch values other than rizin's built-in disassemblers | Some settings and arch plugins start programs or read files; reading a setting is fine |
 | `aa`, `aaa` and the other whole-program analyses | They outlast a console command's 60 s; **Full analysis** runs them in steps |
@@ -415,10 +423,10 @@ development; without rz-ghidra DECOMPILER says "Decompiler not available
   breakpoints and patching keep working there. A call the table does not know
   is named and skipped with the return register left as it is.
 - A patch typed into **Bytes…** is at most 2000 bytes. rizin reads its stdin a
-  line at a time and cuts any command line that reaches 4094 characters
-  without a word; the truncated line is still run, and writes at whatever
-  address survives the cut (measured three times). 2000 bytes are a `wx` line
-  of about 4000 characters.
+  line at a time, keeps 4094 characters of a command line and cuts what is
+  longer, without a word; the truncated line is still run, and writes at
+  whatever address survives the cut (measured three times). 2000 bytes are a
+  `wx` line of about 4000 characters.
 - The four patch buttons are x86 only: `0x90` is a `nop` there and nowhere
   else.
 - One stop reason covers two causes: an invalid memory access and a jump into

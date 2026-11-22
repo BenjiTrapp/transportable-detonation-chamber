@@ -7816,6 +7816,7 @@ def test_rizin_help_and_the_pane_name_the_toolbars_button_and_the_assets_are_rai
     """Task 14: the pane said START in a toolbar whose button says EMULATE, and the in-tab help told the reader the file
     "is only read" while the tab runs code. Both are corrected, and the asset version moved with them."""
     html = _read(INDEX_HTML)
+    assert "app.js?v=128" not in html, "the help of index.html changed again (the project sentence, the 4094 cut), its version did not"
     assert "app.js?v=127" not in html, "app.js and the help changed (the pane's words, the emulation's help), its version did not"
     help_text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html))
     for words in ("never writes the file", "EMULATE runs the code in rizin's ESIL emulator", "ESIL does not emulate the Windows API",
