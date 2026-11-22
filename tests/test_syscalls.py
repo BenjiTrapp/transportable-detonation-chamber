@@ -575,3 +575,67 @@ def test_an_unreadable_stub_carries_no_verdict_details():
     assert out["number_matches"] is None
     assert out["actual"] is None
     assert out["expected"] == "410700d4c0035fd6"
+
+
+def test_read_len_covers_the_longest_arm64_hook_the_prefix_does_not():
+    assert syscall_baseline.READ_LEN == {"arm64": 16, "x64": 32, "x86": 16}
+    assert syscall_baseline.READ_LEN["arm64"] >= 12 > syscall_baseline.PREFIX_LEN["arm64"]
+
+
+@pytest.mark.parametrize("view", ["arm64", "x64"])
+def test_a_longer_read_than_the_prefix_does_not_make_an_intact_stub_differ(view):
+    sc = _sc(view)
+    n = syscall_baseline.stub_prefix_len(sc, view)
+    live = sc.stub_bytes[:n] + b"\xaa" * (syscall_baseline.READ_LEN[view] - n)
+    out = syscall_baseline.classify_stub(sc, live, view, None)
+    assert out["state"] == "intact"
+    assert out["actual"] == out["expected"]
+
+
+@pytest.mark.parametrize("live_hex,base,pointer", [
+    ("ff25" "10000000", 0x1000, 0x1016),
+    ("ff25" "faffffff", 0x1000, 0x1000),
+    ("ff25" "00000000", 0x7FF800001000, 0x7FF800001006),
+])
+def test_x64_jump_pointer_is_the_rip_relative_address(live_hex, base, pointer):
+    live = bytes.fromhex(live_hex) + b"\x90" * 8
+    assert syscall_baseline.jump_pointer(live, base, "x64") == pointer
+    assert syscall_baseline.jump_target(live, base, "x64") is None
+
+
+@pytest.mark.parametrize("live,base,pointer", [
+    (_words(0x58000050, 0xD61F0200), 0x1000, 0x1008),
+    (_words(0x58FFFFF0, 0xD61F0200), 0x1000, 0xFFC),
+])
+def test_arm64_jump_pointer_is_the_literal_address(live, base, pointer):
+    assert syscall_baseline.jump_pointer(live, base, "arm64") == pointer
+    assert syscall_baseline.jump_target(live, base, "arm64") is None
+
+
+@pytest.mark.parametrize("view,live", [
+    ("x64", bytes.fromhex("e910000000") + b"\x90" * 8),
+    ("x64", bytes.fromhex("48b88877665544332211ffe0")),
+    ("x64", bytes.fromhex("4c8bd1b83a000000") + b"\x90" * 8),
+    ("x64", bytes.fromhex("ff2510")),
+    ("x64", b""),
+    ("arm64", _words(0x14000005, 0xD65F03C0)),
+    ("arm64", _words(0xD4000741, 0xD65F03C0)),
+    ("arm64", _words(_adrp(16, 2), _add(16, 16, 0x123), 0xD61F0200)),
+    ("arm64", _words(0x58000050, 0xD61F0220)),
+    ("arm64", _words(0x58000051, 0xD61F0200)),
+    ("arm64", _words(0x58000050)),
+    ("arm64", b"\x05\x00"),
+    ("x86", bytes.fromhex("ff2510000000")),
+])
+def test_jump_pointer_is_none_unless_the_hook_reads_its_target_from_memory(view, live):
+    assert syscall_baseline.jump_pointer(live, 0x1000, view) is None
+
+
+def test_the_indirect_hooks_are_named_by_classify():
+    sc = _sc("x64")
+    live = bytes.fromhex("ff251a4c0300") + sc.stub_bytes[6:]
+    assert syscall_baseline.classify_stub(sc, live, "x64", "edr.dll")["state"] == "hooked"
+    sc = _sc("arm64")
+    live = _words(0x58000050, 0xD61F0200)
+    out = syscall_baseline.classify_stub(sc, live, "arm64", "edr.dll")
+    assert (out["state"], out["pattern"]) == ("hooked", "LDR x16; BR x16")

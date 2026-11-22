@@ -208,6 +208,11 @@ def _item(sc: Syscall) -> dict:
 # `SVC; RET`. x64 is cut at its `syscall` instruction by `stub_prefix_len`.
 PREFIX_LEN = {"arm64": 8, "x64": 32, "x86": 16}
 
+# Bytes to read from the process: more than the prefix, so that a hook longer than the
+# stub it replaces is still recognisable (`ADRP; ADD; BR` is 12 bytes, the arm64 stub 8).
+# The prefix decides changed or not; patterns are recognised on everything read.
+READ_LEN = {"arm64": 16, "x64": 32, "x86": 16}
+
 _X64_SYSCALL = b"\x0f\x05"
 # `4C 8B D1 B8 <ssn:4>`: the syscall number can spell 0F 05 itself, so look past it
 _X64_AFTER_MOV = 8
@@ -245,22 +250,27 @@ def _word(live: bytes, offset: int = 0) -> int | None:
     return int.from_bytes(chunk, "little") if len(chunk) == 4 else None
 
 
-def _x64_hook(regex: bytes, target):
+def _x64_hook(regex: bytes, target=None, pointer=None):
     pattern = re.compile(regex, re.DOTALL)
 
     def match(live: bytes, base: int):
         m = pattern.match(live)
-        return _MISS if m is None else target(m.group(), base)
+        if m is None:
+            return _MISS
+        b = m.group()
+        return (target(b, base) if target else None, pointer(b, base) if pointer else None)
     return match
 
 
-# A hook whose target sits in memory (`FF 25`, `LDR`+`BR`) maps to None: the bytes of the
-# stub do not contain it, and a guessed address would send the owner lookup to the
-# wrong place.
+# A matcher yields `(target, pointer)`. A hook that reads its target from memory
+# (`FF 25`, `LDR`+`BR`) has no target the stub bytes could show, and a guessed one would
+# send the owner lookup to the wrong place; what the bytes do show is the address of the
+# pointer, which the reader can follow.
 _X64_HOOKS = (
     ("JMP rel32", _x64_hook(rb"\xe9.{4}", lambda b, base: base + 5 + _signed(
         int.from_bytes(b[1:5], "little"), 32))),
-    ("JMP [rip]", _x64_hook(rb"\xff\x25.{4}", lambda b, base: None)),
+    ("JMP [rip]", _x64_hook(rb"\xff\x25.{4}", pointer=lambda b, base: base + 6 + _signed(
+        int.from_bytes(b[2:6], "little"), 32))),
     ("MOV RAX; JMP RAX", _x64_hook(rb"\x48\xb8.{8}\xff\xe0", lambda b, base: int.from_bytes(
         b[2:10], "little"))),
     ("MOV R11; JMP R11", _x64_hook(rb"\x49\xbb.{8}\x41\xff\xe3", lambda b, base: int.from_bytes(
@@ -277,7 +287,7 @@ def _arm64_b(live: bytes, base: int):
     w = _word(live)
     if w is None or w & 0xFC000000 != 0x14000000:
         return _MISS
-    return (base + _signed(w & 0x03FFFFFF, 26) * 4) & 0xFFFFFFFFFFFFFFFF
+    return (base + _signed(w & 0x03FFFFFF, 26) * 4) & 0xFFFFFFFFFFFFFFFF, None
 
 
 def _arm64_ldr_br(live: bytes, base: int):
@@ -286,7 +296,7 @@ def _arm64_ldr_br(live: bytes, base: int):
         return _MISS
     if w & 0xFF000000 != 0x58000000 or w & 0x1F != 16 or nxt != _ARM64_BR_X16:
         return _MISS
-    return None
+    return None, (base + _signed((w >> 5) & 0x7FFFF, 19) * 4) & 0xFFFFFFFFFFFFFFFF
 
 
 def _arm64_adrp_add_br(live: bytes, base: int):
@@ -305,7 +315,7 @@ def _arm64_adrp_add_br(live: bytes, base: int):
     offset = (add >> 10) & 0xFFF
     if add & 0x00400000:
         offset <<= 12
-    return (((base & ~0xFFF) + (imm << 12)) + offset) & 0xFFFFFFFFFFFFFFFF
+    return (((base & ~0xFFF) + (imm << 12)) + offset) & 0xFFFFFFFFFFFFFFFF, None
 
 
 _ARM64_HOOKS = (
@@ -319,14 +329,14 @@ _HOOKS = {"x64": _X64_HOOKS, "arm64": _ARM64_HOOKS}
 
 
 def _find_hook(live: bytes, base: int, view: str):
-    """`(pattern, target)` of the hook jump at the start of `live`, or None.
+    """`(pattern, target, pointer)` of the hook jump at the start of `live`, or None.
 
     Hooks overwrite the start of the stub; a jump further in is not looked for, which is
-    also what `jump_target`, having no offset, can answer for."""
+    also what `jump_target` and `jump_pointer`, having no offset, can answer for."""
     for name, match in _HOOKS.get(view, ()):
-        target = match(live, base)
-        if target is not _MISS:
-            return name, target
+        found = match(live, base)
+        if found is not _MISS:
+            return (name,) + found
     return None
 
 
@@ -335,6 +345,13 @@ def jump_target(live: bytes, base: int, view: str) -> int | None:
     address of `live[0]`. None when there is no hook or its target is not in the bytes."""
     hit = _find_hook(live, base, view)
     return hit[1] if hit else None
+
+
+def jump_pointer(live: bytes, base: int, view: str) -> int | None:
+    """For a hook that reads its target from memory (`FF 25`, `LDR`+`BR`): the address of
+    that pointer, not the target. None for every other hook and for no hook."""
+    hit = _find_hook(live, base, view)
+    return hit[2] if hit else None
 
 
 def _live_number(live: bytes, view: str) -> int | None:
