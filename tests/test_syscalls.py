@@ -223,6 +223,18 @@ def test_load_baseline_rejects_unreadable_and_unnamed_files(tmp_path):
     with pytest.raises(syscall_baseline.BaselineError):
         syscall_baseline.load_baseline(str(tmp_path / "ntsleuth-1.0-x64.json"))
     other = tmp_path / "baseline.json"
-    other.write_text('{"syscalls": []}')
+    other.write_text(json.dumps(_fixture("x64")))
     with pytest.raises(syscall_baseline.BaselineError):
         syscall_baseline.load_baseline(str(other))
+
+
+@pytest.mark.parametrize("label, payload", [
+    ("bare empty list", []),
+    ("empty syscalls object", {"syscalls": []}),
+    ("every entry skipped", {"syscalls": [_entry(stub_bytes=""), _entry(name="NtBar", is_true_syscall=False)]}),
+])
+def test_load_baseline_rejects_a_payload_without_usable_syscalls(tmp_path, label, payload):
+    p = tmp_path / "ntsleuth-26220.5770-x64.json"
+    p.write_text(json.dumps(payload))
+    with pytest.raises(syscall_baseline.BaselineError, match="no usable syscalls"):
+        syscall_baseline.load_baseline(str(p))

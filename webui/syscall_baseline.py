@@ -110,7 +110,9 @@ def _parse_entry(entry) -> Syscall:
 
 
 def load_baseline(path: str) -> Baseline:
-    """Build and view come from the file name `ntsleuth-<build>-<view>.json`."""
+    """Build and view come from the file name `ntsleuth-<build>-<view>.json`.
+
+    A file that yields no usable syscall at all is an error, not an empty baseline."""
     m = _FILENAME_RE.match(os.path.basename(path))
     if not m:
         raise BaselineError(f"{path}: not named ntsleuth-<build>-<view>.json")
@@ -119,7 +121,11 @@ def load_baseline(path: str) -> Baseline:
             payload = json.load(fh)
     except (OSError, ValueError) as exc:
         raise BaselineError(f"cannot read baseline {path}: {exc}") from exc
-    return parse_baseline(payload, m.group("build"), m.group("view"))
+    bl = parse_baseline(payload, m.group("build"), m.group("view"))
+    # measuring against an empty baseline finds no deviation, which reads as "clean"
+    if not bl.syscalls:
+        raise BaselineError(f"baseline {path} has no usable syscalls ({len(bl.skipped)} skipped)")
+    return bl
 
 
 def find_baseline(directory: str, build: str, view: str) -> str | None:
