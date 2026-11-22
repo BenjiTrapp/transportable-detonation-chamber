@@ -10407,6 +10407,15 @@ table[data-sortable] > thead > tr > th:focus-visible {
     letter-spacing: .02em;
     color: var(--accent-pink);
 }
+/* The head of PATCHES holds the button that clears the whole cache */
+.rizin-emu-head-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.rizin-emu-head-row .rizin-tool {
+    letter-spacing: normal;
+}
 .rizin-emu-empty {
     padding: 4px 0;
 }
@@ -10432,6 +10441,10 @@ table[data-sortable] > thead > tr > th:focus-visible {
     color: var(--accent-orange);
 }
 .rizin-emu-reg-name {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
     color: var(--text-primary);
 }
 .rizin-emu-reg-input {

@@ -20929,7 +20929,9 @@ const RIZIN_VIEWS = {
     // The emulation's state: asked for only when forced (a run's answer is the state; see rizinLoadEmulation)
     emulation: force => rizinLoadEmulation(force),
     // The EMULATION pane's lists (patches and breakpoints; the pane draws the state from the entry above, it never asks
-    // for it): asked for while the pane is shown, wanted again after a run or a finished analysis step
+    // for it): asked for while the pane is shown, wanted again after a run or a finished analysis step. The entry is
+    // also what keeps a promise: a list that found rizin busy says "the patches and breakpoints follow", and only a view
+    // registered here is asked for again (rizinRetryViews, rizinReloadViews); without it that sentence would stay for good
     emuPane: force => rizinLoadEmuPane(force),
     hex: force => rizinLoadHex(force),
     strings: force => rizinLoadList('strings', force),
@@ -24693,7 +24695,7 @@ function rizinOnPageHide() {
 
 // --- The emulation: the run strip ---
 // START (the toolbar) enters the emulation; the strip between the toolbar and the work area shows while it
-// runs: the runs, the PC, the registers the last run changed, why it stood, and the offer for a call at the PC.
+// runs: the runs, the PC, the registers the last step or edit changed, why it stood, and the offer for a call at the PC.
 // The state (rizinState.emu) is the server's answer to the last start, run or skip: a run is one request, the
 // views follow the PC through rizinSeek, and nothing asks for the state again unless a view is forced (an
 // analysis step ended, a busy answer is retried). STOP leaves the emulation; it aborts nothing (rizin cannot
@@ -24759,7 +24761,7 @@ function rizinRunStripHtml(emu, options) {
     const changed = new Set(emu && Array.isArray(emu.changed) ? emu.changed.map(String) : []);
     const all = (emu && Array.isArray(emu.registers) ? emu.registers : []).filter(reg => reg && changed.has(String(reg.name)));
     const shown = all.slice(0, RIZIN_EMU.regs);
-    const regs = shown.map(reg => `<span class="rizin-run-reg" title="${escapeHtml(reg.name)} changed in the last run">`
+    const regs = shown.map(reg => `<span class="rizin-run-reg" title="${escapeHtml(reg.name)} changed by the last step or edit">`
         + `<span class="rizin-run-delta" aria-hidden="true">Δ</span><span class="rizin-run-reg-name">${escapeHtml(reg.name)}</span> `
         + `<span class="rizin-run-reg-value">${escapeHtml(rizinEmuHex(reg.value))}</span></span>`).join(' ');
     const rest = all.slice(shown.length);
@@ -24951,8 +24953,9 @@ async function rizinEmuPost(wait, path, body, ran) {
     if (pc) await rizinSeek(pc, 'emulation');
     else rizinRenderPcMarks();
     await rizinEmuAssist();
-    // What a run wrote is in the pane's patches (the registers and the stack are in the answer: not asked for)
-    await rizinLoadEmuPane(true);
+    // What a run wrote is in the pane's patches (a run cannot change the breakpoints, and the registers and the stack are
+    // in the answer: not asked for)
+    await rizinLoadEmuPane(true, 'patches');
     return true;
 }
 
@@ -25167,9 +25170,21 @@ function rizinEmuBreakpointsHtml(breakpoints, functions) {
     }).join('');
 }
 
+// The head of PATCHES: the one button that belongs to neither group. rizin has one write cache for what was set by hand
+// and for what a run wrote, so this clears all of it (wc-*): it is not "take back mine", and it is disabled only for an
+// empty cache, which its title says.
+function rizinEmuPatchesHeadHtml(patches, busy) {
+    const count = Array.isArray(patches) ? patches.filter(row => row && typeof row === 'object').length : 0;
+    const title = count ? "Clear everything in rizin's write cache: the patches set by hand and every write a run made. rizin has one cache for both."
+        : "rizin's write cache is empty: nothing to clear";
+    return `<div class="rizin-emu-head rizin-emu-head-row"><span>PATCHES</span><span class="rizin-emu-actions">`
+        + `<button type="button" class="rizin-tool" data-rizin-act="unpatch-all"${count && !busy ? '' : ' disabled'} title="${escapeHtml(title)}">`
+        + `Clear rizin's whole cache</button></span></div>`;
+}
+
 // The patches in two groups, apart on the page: what was set by hand (kept with the project, exported, taken back one
 // by one) and what a run wrote (it ends with the session: the group says so before it hurts, and carries Re-analyse).
-// rizin has one write cache for both, so Take all back takes the run's bytes too, and its title says so.
+// rizin has one write cache for both: the button that clears all of it is in the head of PATCHES, outside both groups.
 function rizinEmuPatchesHtml(patches, functions, options) {
     const { exported = null, busy = '' } = options || {};
     const rows = (Array.isArray(patches) ? patches : []).filter(row => row && typeof row === 'object');
@@ -25203,14 +25218,12 @@ function rizinEmuPatchesHtml(patches, functions, options) {
                 : '<div class="rizin-emu-note rizin-emu-note-error">The patches changed since this copy was made: export again.</div>')
             + `<pre>${escapeHtml(exported.note)}</pre></div>`;
     }
-    const all = run.length ? ` Also takes back the run's ${run.length} write${run.length === 1 ? '' : 's'}: rizin has one cache.` : '';
     const written = run.reduce((sum, patch) => sum + (Number.isSafeInteger(patch.size) ? patch.size : 0), 0);
     return `<div class="rizin-emu-group rizin-emu-hand" data-rizin-group="hand"><div class="rizin-emu-subhead">`
         + `<span class="rizin-emu-group-title">SET BY HAND · ${hand.length}</span><span class="rizin-emu-fate">kept with the project</span>`
         + `<span class="rizin-emu-actions"><button type="button" class="rizin-tool" data-rizin-act="export"${off(!hand.length || busy)} `
         + `title="Write a copy of the file with these patches in it, and a note beside it">Export</button>`
-        + `<button type="button" class="rizin-tool" data-rizin-act="unpatch-all"${off(!hand.length || busy)} title="${escapeHtml(`Take every patch back.${all}`)}">`
-        + `Take all back</button></span></div>${result}${list(hand, true, 'Nothing set by hand.')}</div>`
+        + `</span></div>${result}${list(hand, true, 'Nothing set by hand.')}</div>`
         + `<div class="rizin-emu-group rizin-emu-run" data-rizin-group="run"><div class="rizin-emu-subhead">`
         + `<span class="rizin-emu-group-title">WRITTEN BY THE RUN · ${run.length}${run.length ? ` · ${written} B` : ''}</span>`
         + `<span class="rizin-emu-fate">these end with the session</span>`
@@ -25239,7 +25252,7 @@ function rizinEmuPaneHtml(emu, patches, breakpoints, options) {
         + '</div><div class="rizin-emu-col">' + said + notes
         + (ready
             ? section('breakpoints', head('BREAKPOINTS', String(breakpoints.length)), rizinEmuBreakpointsHtml(breakpoints, functions))
-                + section('patches', head('PATCHES', ''), rizinEmuPatchesHtml(patches, functions, { exported, busy }))
+                + section('patches', rizinEmuPatchesHeadHtml(patches, busy), rizinEmuPatchesHtml(patches, functions, { exported, busy }))
             : rizinEmuEmpty(problem || 'Loading…'))
         + '</div>';
 }
@@ -25272,8 +25285,9 @@ function rizinRenderEmuPane() {
 
 // The lists of the pane (patches and breakpoints), only while the pane is shown, else when it is shown (stale); a
 // forced load is after a run, a patch or a take-back, a busy answer is retried by the poll like the other views. A late
-// answer (another one asked for since, or another file) is dropped.
-async function rizinLoadEmuPane(force) {
+// answer (another one asked for since, or another file) is dropped. what 'patches' asks for the patches alone, where the
+// breakpoints held cannot have changed (a run); anything not loaded yet or stale is asked for whole.
+async function rizinLoadEmuPane(force, what) {
     const sid = rizinState.session, pane = rizinState.emuPane;
     if (!rizinDockOnScreen('emulation')) {
         if (force) pane.stale = true;
@@ -25284,7 +25298,9 @@ async function rizinLoadEmuPane(force) {
         return true;
     }
     const seq = ++pane.seq, base = `/api/rizin/${encodeURIComponent(sid)}`;
-    const [patches, breakpoints] = await Promise.all([rizinApi(`${base}/patches`), rizinApi(`${base}/breakpoints`)]);
+    const only = what === 'patches' && pane.at === sid && !pane.stale && !pane.problem && Array.isArray(pane.breakpoints);
+    const [patches, breakpoints] = await Promise.all([rizinApi(`${base}/patches`),
+        only ? { ok: true, data: pane.breakpoints } : rizinApi(`${base}/breakpoints`)]);
     if (sid !== rizinState.session || seq !== pane.seq) return false;
     const failed = !patches.ok ? patches : !breakpoints.ok ? breakpoints : null;
     if (failed) {
@@ -25378,8 +25394,8 @@ async function rizinSetRegister(name, value) {
     return true;
 }
 
-// Take a patch back (addr, a "0x…" string: every write that overlaps it) or, called without one, every write in the
-// cache. rizin has one cache: the run's bytes go with the rest, so with some in it the user is asked first. A bad
+// Take a patch back (addr, a "0x…" string: every write that overlaps it) or, called without one, clear every write in
+// the cache. rizin has one cache: the run's bytes go with the hand-made patches, so the user is always asked first. A bad
 // address takes nothing back. The answer is the new list; what the views show (bytes, the stack's words, functions)
 // is asked for again.
 async function rizinUnpatch(addr) {
@@ -25388,10 +25404,14 @@ async function rizinUnpatch(addr) {
     if (!sid || pane.busy || (!all && !at)) return false;
     if (all) {
         const rows = (Array.isArray(pane.patches) ? pane.patches : []).filter(row => row && typeof row === 'object');
-        const run = rows.filter(row => row.mine !== true).length;
-        if (!rows.some(row => row.mine === true)) return false;
-        if (run && (typeof confirm !== 'function' || !confirm(`Take back every write in rizin's cache? That includes the ${run} write${run === 1 ? '' : 's'} `
-            + 'the run made: rizin has one cache, and what a run wrote is back only by running it again.'))) return false;
+        const hand = rows.filter(row => row.mine === true).length, run = rows.length - hand;
+        if (!rows.length) {
+            rizinEmuPaneSay("rizin's write cache is empty: there is nothing to clear.", 'error');
+            return false;
+        }
+        const plural = n => `${n} write${n === 1 ? '' : 's'}`;
+        if (typeof confirm !== 'function' || !confirm(`Clear rizin's whole cache? That drops ${plural(hand)} set by hand and ${plural(run)} the run made: `
+            + 'rizin has one cache, and what a run wrote is back only by running it again.')) return false;
     }
     pane.busy = 'unpatch';
     rizinRenderEmuPane();
@@ -25405,7 +25425,7 @@ async function rizinUnpatch(addr) {
         return false;
     }
     Object.assign(pane, { at: sid, patches: Array.isArray(r.data.patches) ? r.data.patches : pane.patches, problem: '', stale: false });
-    rizinEmuPaneSay(all ? 'Took every write back.' : `Took the patch at ${at} back.`);
+    rizinEmuPaneSay(all ? "Cleared rizin's whole cache." : `Took the patch at ${at} back.`);
     await rizinReloadViews(['emuPane']);
     return true;
 }
