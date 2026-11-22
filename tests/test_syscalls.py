@@ -256,6 +256,8 @@ def test_fixture_stub_windows_are_32_bytes(view):
     ("/tmp/x", "arm64"),
     ("26220.5770\\..", "arm64"),
     ("", "arm64"),
+    ("26220.5770", "arm64\n"),
+    ("26220.5770\n", "arm64"),
 ])
 def test_find_baseline_refuses_unsafe_names_without_touching_the_filesystem(
         tmp_path, monkeypatch, build, view):
@@ -284,6 +286,23 @@ def test_same_name_in_another_module_is_recorded_and_the_first_wins():
 def test_same_name_in_the_same_module_is_not_reported_as_shadowed():
     bl = syscall_baseline.parse_baseline({"syscalls": [_entry(), _entry(syscall_number=2)]}, "1.0", "x64")
     assert bl.shadowed == []
+
+
+def test_a_baseline_file_name_with_a_trailing_newline_is_not_a_baseline_name(tmp_path):
+    path = tmp_path / "ntsleuth-1.0-x64.json\n"
+    path.write_text(json.dumps({"syscalls": [_entry()]}))
+    with pytest.raises(syscall_baseline.BaselineError):
+        syscall_baseline.load_baseline(str(path))
+
+
+def test_a_name_shadowed_by_several_entries_is_recorded_once():
+    payload = {"syscalls": [
+        _entry(),
+        _entry(module="win32u.dll", syscall_number=0x1001),
+        _entry(module="win32u.dll", syscall_number=0x1002),
+    ]}
+    bl = syscall_baseline.parse_baseline(payload, "1.0", "x64")
+    assert bl.shadowed == ["NtFoo"]
 
 
 def _names(page):

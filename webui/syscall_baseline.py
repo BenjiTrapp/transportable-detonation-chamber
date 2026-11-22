@@ -12,9 +12,9 @@ from dataclasses import dataclass, field
 
 _BUILD = r"[0-9A-Za-z.]+"
 _VIEW = r"arm64|x64"
-_FILENAME_RE = re.compile(rf"^ntsleuth-(?P<build>{_BUILD})-(?P<view>{_VIEW})\.json$")
-_BUILD_RE = re.compile(rf"^{_BUILD}$")
-_VIEW_RE = re.compile(rf"^(?:{_VIEW})$")
+_FILENAME_RE = re.compile(rf"ntsleuth-(?P<build>{_BUILD})-(?P<view>{_VIEW})\.json")
+_BUILD_RE = re.compile(_BUILD)
+_VIEW_RE = re.compile(_VIEW)
 
 
 class BaselineError(Exception):
@@ -86,6 +86,7 @@ def parse_baseline(payload: list | dict, build: str, view: str) -> Baseline:
         bl.by_number[(sc.module, sc.number)] = sc
     # an entry skipped earlier may share its name with one accepted later, or the reverse
     bl.skipped = list(dict.fromkeys(n for n in bl.skipped if n not in bl.syscalls))
+    bl.shadowed = list(dict.fromkeys(bl.shadowed))
     return bl
 
 
@@ -125,7 +126,7 @@ def load_baseline(path: str) -> Baseline:
     """Build and view come from the file name `ntsleuth-<build>-<view>.json`.
 
     A file that yields no usable syscall at all is an error, not an empty baseline."""
-    m = _FILENAME_RE.match(os.path.basename(path))
+    m = _FILENAME_RE.fullmatch(os.path.basename(path))
     if not m:
         raise BaselineError(f"{path}: not named ntsleuth-<build>-<view>.json")
     try:
@@ -145,7 +146,7 @@ def find_baseline(directory: str, build: str, view: str) -> str | None:
 
     `view` can come from a request: anything but the plain name parts is refused before
     a path is built."""
-    if not _BUILD_RE.match(build) or not _VIEW_RE.match(view):
+    if not _BUILD_RE.fullmatch(build) or not _VIEW_RE.fullmatch(view):
         return None
     path = os.path.join(directory, f"ntsleuth-{build}-{view}.json")
     return path if os.path.isfile(path) else None
