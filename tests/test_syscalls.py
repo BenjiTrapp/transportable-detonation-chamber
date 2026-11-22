@@ -2893,6 +2893,10 @@ def test_check_draft_takes_only_what_draft_yara_writes():
     for bad in (None, [], "rule", {"name": d["name"]}, {"text": d["text"]}):
         with pytest.raises(ValueError):
             syscall_rules.check_draft(bad)
+    # a name and a text that agree, in the exact form, and too long for libyara: 18 + 150 characters
+    long_name = "TDC_DirectSyscall_" + "A" * 150
+    with pytest.raises(ValueError):
+        syscall_rules.check_draft({"name": long_name, "text": d["text"].replace(d["name"], long_name)})
 
 
 def test_apply_writes_one_file_that_is_the_drafted_text_byte_for_byte(tmp_path):
@@ -3244,8 +3248,6 @@ def test_apply_route_writes_nowhere_but_the_rules_directory(client, tdc, rules_d
 
 def test_the_rules_directory_is_the_one_writable_root_this_adds(tdc):
     assert tdc.YARA_RULES_DIR == r"C:\tools\detection-rules\yara-combined\tdc"
-    hex_write_roots = tdc.api_file_hex_write.__code__.co_consts
-    assert not any("detection-rules" in str(c) for c in hex_write_roots)
 
 
 def test_apply_route_says_so_when_the_detection_rules_are_not_installed(client, tdc, tmp_path, monkeypatch):
@@ -3387,3 +3389,137 @@ def test_a_view_or_build_of_the_wrong_type_is_a_refusal_not_a_crash(client, rule
                                          "build": BUILD, **over}):
         r = client.post("/api/syscalls/rule", json=body)
         assert r.status_code == 400 and "error" in r.get_json()
+
+
+# --- review fixes: the name libyara takes, the temporary file, what the catalog says of itself, the pin both ways --
+
+def _forged(length):
+    """A draft of the exact form with a name of `length` characters, as a forged request body would bring one."""
+    d = _draft()
+    name = "TDC_DirectSyscall_" + "A" * (length - len("TDC_DirectSyscall_"))
+    return {"name": name, "text": d["text"].replace(d["name"], name)}
+
+
+def test_the_name_of_a_rule_is_at_most_what_libyara_takes_and_the_generator_never_nears_it():
+    assert syscall_rules.RULE_NAME_MAX == 128
+    assert syscall_rules.check_draft(_forged(128))
+    for length in (129, 150, 178):
+        with pytest.raises(ValueError):
+            syscall_rules.check_draft(_forged(length))
+    # the longest the generator makes: a name of 64 characters, and the longest view
+    longest = syscall_rules.draft_yara(_hit(syscall="N" * 64, view="arm64", stub_hex="41070000c0035fd6"),
+                                       BUILD, "arm64", "s")
+    assert len(longest["name"]) <= 128 and len(longest["name"]) == 18 + 64 + 1 + 5 + 1 + 8
+
+
+def test_a_forged_apply_with_a_name_too_long_for_libyara_writes_nothing(client, rules_dir):
+    r = client.post("/api/syscalls/rule/apply", json=_forged(150))
+    assert r.status_code == 400
+    assert not rules_dir.exists()
+
+
+def test_a_link_planted_where_the_temporary_file_used_to_be_named_is_not_followed(tmp_path):
+    d = _draft()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("untouched")
+    try:
+        os.symlink(outside, tmp_path / ("." + d["name"] + ".tmp"))
+    except (OSError, NotImplementedError):
+        pytest.skip("no symlinks here")
+    rules = tmp_path
+    assert syscall_rules.apply_draft(d, str(rules))["status"] == "written"
+    assert outside.read_text() == "untouched"
+    assert (rules / (d["name"] + ".yar")).read_text() == d["text"]
+
+
+def test_the_temporary_file_has_a_name_nobody_can_foresee_and_two_applies_do_not_share_it(tmp_path, monkeypatch):
+    seen = []
+    real = syscall_rules.os.replace
+    monkeypatch.setattr(syscall_rules.os, "replace", lambda s, t: seen.append(os.path.basename(s)) or real(s, t))
+    for i in range(2):
+        d = _draft(_hit(stub_hex="4c8bd1b8180000000f05" + "90" * i))
+        syscall_rules.apply_draft(d, str(tmp_path))
+        assert seen[-1] != "." + d["name"] + ".tmp" and seen[-1].startswith(".") and seen[-1].endswith(".tmp")
+    assert seen[0] != seen[1]
+
+
+def test_the_signature_file_is_documented_as_advisory_where_it_cannot_say_so_itself():
+    raw = open(syscall_rules.DEFAULT_SIGNATURES_PATH, encoding="utf-8").read()
+    assert raw.lstrip().startswith("[")           # a bare array, as pipe_signatures.json is; JSON has no comment
+    module, loader = (" ".join(t.split()) for t in (syscall_rules.__doc__, syscall_rules.load_signatures.__doc__))
+    for text in (module, loader):
+        assert "advisory" in text and "not the score" in text and "memory_evidence.KINDS" in text
+    assert "in both directions" in module and "classify_stub" in module
+
+
+# Neutralised stubs, as bytes. The classifier does not know them as a jump, only as a stub that is not the baseline's
+_PATCH_BYTES = {
+    "x64": ["c3", "31c0c3", "33c0c3", "b800000000c3"],
+    "arm64": ["c0035fd6", "00008052c0035fd6", "000080d2c0035fd6"],
+}
+
+
+@pytest.mark.parametrize("view", ["x64", "arm64"])
+def test_every_entry_of_the_catalog_is_one_the_code_recognises(view):
+    """The pin in the other direction: each entry of this view must match an example the code itself classifies. An
+    entry that is added without one, or one that matches only bytes the classifier calls intact, fails here."""
+    baseline = syscall_baseline.parse_baseline(_fixture(view), BUILD, view)
+    sc = baseline.syscalls["NtAllocateVirtualMemory"]
+    read = syscall_baseline.READ_LEN[view]
+    pad = "90" * read
+    hooks = {n: h + "00" * 8 for n, h in _HOOK_BYTES[view].items()}
+    patches = {f"patch {i}": b for i, b in enumerate(_PATCH_BYTES[view])}
+    entries = [s for s in syscall_rules.default_signatures() if s.get("view") == view]
+    assert entries
+    for entry in entries:
+        proof = []
+        for label, live in {**hooks, **patches}.items():
+            if not syscall_rules.matching(live, view, [entry]):
+                continue
+            data = bytes.fromhex((live + pad)[:2 * read])
+            jump = syscall_baseline._find_hook(data, 0, view)
+            # the scanner names an owner only for a jump it can follow; a patch has none
+            owner = "edr.dll" if jump is not None else None
+            state = syscall_baseline.classify_stub(sc, data, view, owner)["state"]
+            if entry["family"] == "Inline hook":
+                ok = jump is not None and jump[0] == label and state == "hooked"
+            else:
+                ok = jump is None and state == "diverged"
+            proof.append((label, ok))
+        assert proof, f"no example the code classifies matches {entry}"
+        assert all(ok for _, ok in proof), (entry, proof)
+
+
+def test_an_entry_of_the_catalog_without_a_code_backed_example_is_caught(tmp_path):
+    """The check above has teeth: an entry for a form no example covers has no proof, and a patch pattern that
+    matches the baseline's own intact stub would be classified intact."""
+    view = "x64"
+    baseline = syscall_baseline.parse_baseline(_fixture(view), BUILD, view)
+    sc = baseline.syscalls["NtAllocateVirtualMemory"]
+    stray = {"family": "Stub patch", "pattern": "4c8bd1b8", "match": "prefix", "weight": 3.0, "view": view}
+    live = sc.stub_bytes[:syscall_baseline.READ_LEN[view]]
+    assert syscall_rules.matching(live.hex(), view, [stray])
+    assert syscall_baseline.classify_stub(sc, live, view, None)["state"] == "intact"
+    unknown = {"family": "Inline hook", "pattern": "cd2e", "match": "prefix", "weight": 1.0, "view": view}
+    assert not any(syscall_rules.matching(h + "00" * 8, view, [unknown]) for h in _HOOK_BYTES[view].values())
+
+
+def test_a_hex_write_into_the_rules_directory_is_refused(client, tdc, rules_dir):
+    rules_dir.mkdir()
+    rule = rules_dir / "TDC_DirectSyscall_x.yar"
+    rule.write_bytes(b"rule x { condition: true }\n")
+    r = client.post("/api/file/hex/write", json={"path": str(rule), "offset": 0, "bytes": [0x52]})
+    assert r.status_code == 403
+    assert rule.read_bytes() == b"rule x { condition: true }\n"
+
+
+@pytest.mark.skipif(shutil.which("yara") is None, reason="no yara binary here; CI has none")
+def test_the_real_yara_takes_the_longest_name_check_draft_lets_through(tmp_path):
+    forged = _forged(syscall_rules.RULE_NAME_MAX)
+    rule = tmp_path / "long.yar"
+    rule.write_text(syscall_rules.check_draft(forged)[1])
+    assert subprocess.run(["yara", str(rule), str(rule)], capture_output=True, text=True).returncode == 0
+    over = tmp_path / "over.yar"
+    over.write_text(_forged(129)["text"])
+    refused = subprocess.run(["yara", str(over), str(over)], capture_output=True, text=True)
+    assert refused.returncode != 0 and "identifier too long" in refused.stderr

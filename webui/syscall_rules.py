@@ -4,6 +4,13 @@ Two things leave this module. `syscall_signatures.json` holds the hook and patch
 `pipe_signatures.json` is. A YARA rule is drafted from a stub found outside ntdll; drafting only returns text,
 `apply_draft` is the one function that writes, and only on request.
 
+What the catalog is, and is not. Recognising a form stays in the code: `syscall_baseline.classify_stub` decodes the
+displacement, it does not compare bytes. The catalog gives the analyst the family name and the note of a form that
+has been recognised, and it lets a deviation be checked for being covered. Its `weight` is **advisory and not the
+score**: scoring lives in `memory_evidence.KINDS`, and nothing here feeds it. A test pins the patterns of the file
+against the code's, in both directions, so that the two cannot drift apart. The file is a bare JSON array, as
+`pipe_signatures.json` is, and cannot carry a comment: this is where it says so about itself.
+
 Malware chooses much of what a rule would say: a file name, a process name, a module. That text goes into a rule
 the detection engine hot-reloads, and a rule that does not parse takes every other rule of its directory down with
 it. So nothing a sample can influence is copied into a rule as it is: it is reduced to a short run of safe
@@ -19,6 +26,7 @@ import json
 import math
 import os
 import re
+import tempfile
 
 from memory_evidence import VERDICT_MALICIOUS
 
@@ -35,6 +43,9 @@ _HEX_ONLY = re.compile(r"(?:[0-9a-fA-F]{2})+")
 
 def load_signatures(path: str | None = None) -> list[dict]:
     """Load the catalog; malformed entries and invalid regexes are skipped.
+
+    The `weight` of an entry is advisory, a hint to a reader of how serious the form is: it is not the score, which
+    comes from `memory_evidence.KINDS`, and it is clamped below MALICIOUS so that it could never be mistaken for one.
 
     An entry is `{family, pattern, match, weight, note}` and optionally a `view`. The pattern is matched against
     the live bytes of a stub as lower-case hex, so a pattern of a kind other than `regex` must be hex. A view
@@ -146,7 +157,10 @@ RULE_MAX = 4096
 _STUB_MIN, _STUB_MAX = 8, 64
 _BUILD = re.compile(r"[A-Za-z0-9._-]{1,32}")
 _SYSCALL_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
-_RULE_NAME = re.compile(RULE_PREFIX + r"[A-Za-z0-9_]{1,160}")
+# libyara refuses an identifier longer than 128 characters; the longest name draft_yara makes is 97
+RULE_NAME_MAX = 128
+_NAME_TAIL = r"[A-Za-z0-9_]{1,%d}" % (RULE_NAME_MAX - len(RULE_PREFIX))
+_RULE_NAME = re.compile(RULE_PREFIX + _NAME_TAIL)
 
 _SEVERITIES = ("high", "medium")
 _TAGS = "attack.defense_evasion,attack.t1106"
@@ -155,7 +169,7 @@ _AUTHOR = "DetonationChamber"
 # One meta string: printable ASCII without the quote and the backslash
 _S = r'[ -!#-\[\]-~]{0,400}'
 _RULE_FORM = re.compile(
-    r"rule (?P<name>" + RULE_PREFIX + r"[A-Za-z0-9_]{1,160}) \{\n"
+    r"rule (?P<name>" + RULE_PREFIX + _NAME_TAIL + r") \{\n"
     r"    meta:\n"
     r'        description = "' + _S + r'"\n'
     r'        author      = "' + _AUTHOR + r'"\n'
@@ -291,12 +305,14 @@ def apply_draft(draft: dict, rules_dir: str) -> dict:
         os.mkdir(rules_dir)
     if os.path.lexists(target):
         return {"status": "exists", "name": name, "path": target}
-    tmp = os.path.join(rules_dir, "." + name + ".tmp")
+    # a name that is made on the spot and refused if it exists: a link planted at a name that could be foreseen
+    # (the digest is of bytes the sample carries) would send this write wherever the link points
+    handle, tmp = tempfile.mkstemp(dir=rules_dir, prefix=".", suffix=".tmp")
     try:
-        with open(tmp, "w", encoding="ascii", newline="\n") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
+        with os.fdopen(handle, "w", encoding="ascii", newline="\n") as out:
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
         os.replace(tmp, target)
     except OSError:
         try:
