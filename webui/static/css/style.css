@@ -9762,6 +9762,9 @@ table[data-sortable] > thead > tr > th:focus-visible {
     cursor: pointer;
     user-select: none;
 }
+.rizin-gutter-busy .rizin-gutter {
+    cursor: progress;
+}
 .rizin-gutter:not(.on):hover::before {
     content: "○";
     color: var(--text-dim);

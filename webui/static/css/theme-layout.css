@@ -2178,6 +2178,9 @@
 [data-theme] .rizin-gutter:not(.on):hover::before {
     color: var(--cp-text-dim);
 }
+[data-theme] .rizin-gutter-busy .rizin-gutter {
+    cursor: progress;
+}
 [data-theme] .rizin-gutter.on {
     text-shadow: 0 0 6px rgba(var(--cp-red-rgb), .6);
 }

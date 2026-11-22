@@ -6777,11 +6777,13 @@ def test_rizin_gutter_click_toggles_a_breakpoint_without_seeking():
         r.cells = [dis.querySelectorAll('.rizin-op').length, dis.querySelectorAll('[data-rizin-gutter]').map(e => e.getAttribute('data-rizin-gutter'))];
         r.rows = addrs(dis, '.rizin-op');
         r.before = { marked: addrs(dis, '.rizin-op.bp'), glyphs: dis.querySelectorAll('.rizin-gutter').map(e => e.textContent).join('') };
+        r.titles = { unset: gutter('0x1400014be').getAttribute('title') };
         await rizinSeek('0x1400014b9', 'test'); await quiet();
         const history = rizinState.history.slice();
         let f = calls.length;
         click(gutter('0x1400014be'));
         await until(() => line('0x1400014be').classList.contains('bp'), 'the breakpoint'); await quiet();
+        r.titles.set = gutter('0x1400014be').getAttribute('title');
         r.set = { sent: sent(f), all: calls.slice(f).length, seeks: posts(f, '/seek').length, seek: rizinState.seek, current: addrs(dis, '.rizin-op.current'),
                   history: JSON.stringify(rizinState.history) === JSON.stringify(history), marked: addrs(dis, '.rizin-op.bp'),
                   glyph: gutter('0x1400014be').textContent, on: gutter('0x1400014be').classList.contains('on'),
@@ -6817,9 +6819,10 @@ def test_rizin_gutter_click_toggles_a_breakpoint_without_seeking():
         // Two clicks at once are one request
         S.actDelay = 40;
         f = calls.length;
-        click(gutter('0x1400014be')); click(gutter('0x1400014be'));
+        click(gutter('0x1400014be')); click(gutter('0x1400014be')); click(gutter('0x1400014bc'));
+        r.cue = dis.classList.contains('rizin-gutter-busy');
         await until(() => line('0x1400014be').classList.contains('bp'), 'the breakpoint again'); await quiet();
-        r.twice = { sent: sent(f).map(c => c[0]), marked: addrs(dis, '.rizin-op.bp') };
+        r.twice = { sent: sent(f).map(c => c[0]), marked: addrs(dis, '.rizin-op.bp'), cue: dis.classList.contains('rizin-gutter-busy') };
         S.actDelay = 1;
     """)
     assert "error" not in r, r.get("error")
@@ -6837,7 +6840,12 @@ def test_rizin_gutter_click_toggles_a_breakpoint_without_seeking():
     assert r["target"] == {"seeks": ["0x140001521"], "bp": 0}, "a jump target did not take its click"
     assert r["refused"]["marked"] == [] and "the address is in no map" in r["refused"]["state"] and r["refused"]["requests"] == 1, r["refused"]
     assert r["busy"]["marked"] == [] and r["busy"]["ui"] == "busy" and "busy" in r["busy"]["state"], r["busy"]
-    assert r["twice"] == {"sent": ["POST"], "marked": ["0x1400014be"]}, "two clicks before the answer were not one request: " + str(r["twice"])
+    assert r["twice"] == {"sent": ["POST"], "marked": ["0x1400014be"], "cue": False}, \
+        "two clicks (or a click on another line) before the answer were not one request, or the pointer cue stayed: " + str(r["twice"])
+    assert r["cue"] is True, "a click that is dropped while one request is out says nothing (no cue on the gutter)"
+    assert r["titles"] == {"unset": "Click to set a breakpoint here", "set": "Breakpoint set: click to remove it"}, \
+        "the gutter's hover text, the only word that the cell takes a click, changed or is gone: " + str(r["titles"])
+    assert "cursor" in "".join(_rules(STYLE_CSS).get(".rizin-gutter-busy .rizin-gutter", ""))
 
 
 @needs_node
@@ -7162,7 +7170,7 @@ def test_rizin_patched_instruction_is_marked_in_the_disassembly():
     assert r["none"] == [[], "", 0], "a line is marked as patched before any patch: " + str(r["none"])
     assert r["bytes"]["marked"] == ["0x1400014b9", "0x1400014bc", "0x1400014be"], \
         "every instruction the bytes cover is marked, and no other: " + str(r["bytes"])
-    assert r["bytes"]["cells"] == r["bytes"]["marked"] and r["bytes"]["glyph"] == "≠" and "not the file" in r["bytes"]["title"]
+    assert r["bytes"]["cells"] == r["bytes"]["marked"] and r["bytes"]["glyph"] == "≠" and r["bytes"]["title"] == "Patched by hand: these bytes were written here"
     assert r["bytes"]["text"].startswith("≠") and not r["bytes"]["unmarked"].startswith("≠"), "the mark is not text of the line's own cell"
     assert r["bytes"]["state"] == "[[5305,8]]".replace("5305", str(0x1400014b9)), r["bytes"]["state"]
     assert r["run"] == r["bytes"]["marked"], "a write of a run was marked as a patch"
@@ -7349,7 +7357,7 @@ def test_rizin_menu_and_gutter_styles_and_assets():
         written = [f"{s}: {m.group(0)}" for s, b in rules.items() for m in LITERAL_COLOR.finditer(b)]
         assert rules and not written, f"colours written out in {path}:\n" + "\n".join(written)
     html = _read(INDEX_HTML)
-    assert "style.css?v=84" not in html and 'theme-layout.css?v=7"' not in html and "app.js?v=124" not in html, \
+    assert "style.css?v=85" not in html and 'theme-layout.css?v=8"' not in html and "app.js?v=125" not in html, \
         "asset versions not raised for the gutter and the patch menu"
 
 
@@ -7416,3 +7424,121 @@ def test_rizin_gutter_marks_take_the_newest_list_and_only_where_a_line_starts():
         "the lists the pane read did not mark the lines, or a breakpoint inside an instruction marked it: " + str(r["read"])
     assert r["answer"] == ["0x1400014bc"] and r["afterOld"] == [["0x1400014bc"], ["0x1400014bc"]], \
         "a pane list that was asked for before a patch's answer replaced it: " + str(r["afterOld"])
+
+
+@needs_node
+def test_rizin_gutter_marks_survive_a_slow_read_and_the_reads_are_not_doubled():
+    # INTENT (fix round 1): a read of both lists that was asked for first and answers last never erases a newer list. Through the
+    # production path (the poll's forced reload of every view, with the lists slow) and then a click in the gutter, and with the
+    # EMULATION pane open and a patch's answer: the gutter, the marks and the pane's rows all still match the server once the
+    # old read answers, and a second click removes what the first set. A read that was asked for for both lists keeps the one
+    # that was not replaced (the breakpoints of the first read stay when only the patches had a newer answer). And what a
+    # forced reload, taking a patch back and landing cost in requests (R66): the marks read the lists once, and not at all
+    # for a reload that the open pane makes already.
+    r = _scripted(GUTTER_SETUP + r"""
+        const lists = f => [gets(f, '/patches').length, gets(f, '/breakpoints').length];
+        // Pane closed, forced reload with slow lists, a click while it is out
+        S.listDelay = 120;
+        let f = calls.length;
+        const reload = rizinReloadViews();
+        await tick(15);
+        S.listDelay = 1;
+        click(gutter('0x1400014be'));
+        await until(() => line('0x1400014be').classList.contains('bp'), 'the breakpoint'); r.set = addrs(dis, '.rizin-op.bp');
+        await reload; await quiet();
+        r.afterStale = { marked: addrs(dis, '.rizin-op.bp'), state: JSON.stringify(rizinState.marks.breakpoints), server: S.breakpoints.map(b => b.addr) };
+        click(gutter('0x1400014be'));
+        await quiet();
+        r.second = { sent: sent(calls.length - 1).map(c => c[0]), marked: addrs(dis, '.rizin-op.bp'), server: S.breakpoints.length };
+        r.reload = lists(f);
+        // A patch's answer against a read that is out: the patches are the answer's, the breakpoints the read's
+        S.breakpoints = [{ addr: 0x1400014b7, enabled: true }];
+        S.listDelay = 120;
+        const read = rizinLoadMarks(true);
+        await tick(15);
+        S.listDelay = 1;
+        await rizinPatchBytes('0x1400014b9', '9090');
+        await read; await quiet();
+        r.mixed = { bp: addrs(dis, '.rizin-op.bp'), patched: addrs(dis, '.rizin-op.patched') };
+        // The pane open: a read of the marks that is out against a patch's answer: the pane's rows are the answer's
+        click(tab('emulation'));
+        await until(() => rizinState.views.dock === 'emulation' && $('rizin-emulation').querySelector('[data-rizin-section]'), 'the pane'); await quiet();
+        const rowsNow = () => addrs($('rizin-emulation'), '.rizin-emu-patch');
+        S.listDelay = 120;
+        const stale = rizinLoadMarks(true);
+        await tick(15);
+        S.listDelay = 1;
+        await rizinPatchBytes('0x1400014bc', '9090');
+        r.rightAfter = { gutter: addrs(dis, '.rizin-op.patched'), pane: rowsNow() };
+        await stale; await quiet();
+        r.afterStalePane = { gutter: addrs(dis, '.rizin-op.patched'), pane: rowsNow(), server: S.patches.map(p => p.addr) };
+        // Pane open: a forced reload reads each list once (the pane's), and taking a patch back none after its DELETE
+        f = calls.length;
+        await rizinReloadViews(); await quiet();
+        r.reloadOpen = lists(f);
+        f = calls.length;
+        click($('rizin-emulation').querySelector('.rizin-emu-patch [data-rizin-act="unpatch"]'));
+        await until(() => calls.slice(f).some(c => c[0] === 'DELETE'), 'the DELETE'); await quiet();
+        r.takeBack = lists(f);
+        click(tab('console'));
+        await quiet();
+        // The same take-back with the pane away (a call, not its button): no read of the marks after the answer either
+        f = calls.length;
+        await rizinUnpatch('0x1400014b9'); await quiet();
+        r.takeBackHidden = lists(f);
+        // Landing, pane closed: one read of each
+        const T = { analysis: 'done', done: ['aaa'], breakpoints: [{ addr: 0x1400014bc, enabled: true }] };
+        serve('S2', T);
+        opens['C:\\x\\f.exe'] = T;
+        f = calls.length;
+        await openInRizin('C:\\x\\f.exe');
+        await until(() => rizinState.landed && rizinState.session === 'S2', 'the other file'); await quiet();
+        r.landing = lists(f);
+    """)
+    assert "error" not in r, r.get("error")
+    assert r["set"] == ["0x1400014be"]
+    assert r["afterStale"] == {"marked": ["0x1400014be"], "state": "[%d]" % 0x1400014be, "server": [0x1400014be]}, \
+        "a read asked for before the click erased the breakpoint the click set: " + str(r["afterStale"])
+    assert r["second"] == {"sent": ["DELETE"], "marked": [], "server": 0}, "the breakpoint could not be removed from the gutter: " + str(r["second"])
+    assert r["mixed"]["bp"] == ["0x1400014b7"] and r["mixed"]["patched"] == ["0x1400014b9"], \
+        "a read replaced the patches' newer answer, or dropped its own breakpoints: " + str(r["mixed"])
+    assert r["rightAfter"] == {"gutter": ["0x1400014b9", "0x1400014bc"], "pane": ["0x1400014b9", "0x1400014bc"]}, r["rightAfter"]
+    assert r["afterStalePane"] == {"gutter": ["0x1400014b9", "0x1400014bc"], "pane": ["0x1400014b9", "0x1400014bc"],
+                                   "server": [0x1400014b9, 0x1400014bc]}, \
+        "an old read wiped a patch from the gutter and from the pane's list of what is the user's: " + str(r["afterStalePane"])
+    assert r["reload"] == [1, 1], "a forced reload with the pane closed reads each list once: " + str(r["reload"])
+    assert r["reloadOpen"] == [1, 1], "a forced reload with the pane open reads each list twice (the pane's and the marks'): " + str(r["reloadOpen"])
+    assert r["takeBack"] == [0, 0], "taking a patch back read the lists again after its answer carried them: " + str(r["takeBack"])
+    assert r["takeBackHidden"] == [0, 0], "a take-back with the pane closed read the marks' lists again: " + str(r["takeBackHidden"])
+    assert r["landing"] == [1, 1], "landing reads each list once: " + str(r["landing"])
+
+
+@needs_node
+def test_rizin_menu_patches_once_and_only_into_the_file_that_asked():
+    # INTENT (fix round 1): two clicks on one entry before the answer are one POST (not two identical rows in the write cache);
+    # the answer of a patch that comes after another file was opened marks nothing in that one and leaves its lists
+    # unread-for-now (null), not set to the other file's.
+    r = _scripted(GUTTER_SETUP + r"""
+        S.actDelay = 60;
+        rightAt('0x1400014b9');
+        const f = calls.length;
+        click($('rizin-menu-nop')); click($('rizin-menu-nop'));
+        await until(() => menu.hidden, 'the patch'); await quiet();
+        r.twice = { posts: posts(f, '/patch').length, rows: S.patches.length, marked: addrs(dis, '.rizin-op.patched') };
+        S.actDelay = 1;
+        // A patch whose answer comes after another file was opened
+        S.actDelay = 80;
+        const late = rizinPatchBytes('0x1400014bc', '9090');
+        await tick(10);
+        const T = { analysis: 'done', done: ['aaa'], listDelay: 400 };
+        serve('S2', T);
+        opens['C:\\x\\f.exe'] = T;
+        const opening = openInRizin('C:\\x\\f.exe');
+        await until(() => rizinState.session === 'S2', 'the other file');
+        await late; await tick(30);
+        r.late = { marks: JSON.stringify(rizinState.marks.patched), rows: addrs(dis, '.rizin-op.patched') };
+        await opening; await quiet();
+    """)
+    assert "error" not in r, r.get("error")
+    assert r["twice"] == {"posts": 1, "rows": 1, "marked": ["0x1400014b9"]}, "two clicks on one entry patched twice: " + str(r["twice"])
+    assert r["late"] == {"marks": "null", "rows": []}, "a patch's late answer marked the lines of the file open now: " + str(r["late"])

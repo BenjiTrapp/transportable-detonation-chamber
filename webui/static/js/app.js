@@ -20940,7 +20940,8 @@ const RIZIN_VIEWS = {
     emuPane: force => rizinLoadEmuPane(force),
     // The marks of the gutter and of the patched lines (rizinState.marks): asked for once for each file, and again
     // when forced; a click in the gutter or a patch of the menu brings the answer's list itself
-    marks: force => rizinLoadMarks(force),
+    // (not while the EMULATION pane is on screen: it reads the same two routes, and what it reads is the marks' too)
+    marks: force => (rizinDockOnScreen('emulation') ? Promise.resolve(true) : rizinLoadMarks(force)),
     hex: force => rizinLoadHex(force),
     strings: force => rizinLoadList('strings', force),
     imports: force => rizinLoadList('imports', force),
@@ -21062,7 +21063,9 @@ const rizinState = {
     // What DISASSEMBLY marks: the breakpoints (their addresses) and the ranges patched by hand ([addr, size]), integers
     // as the routes answer them (bounded by the file's layout), null until the file's lists are known; seq: the
     // newest request for both; busy: a click in the gutter waits for its answer
-    marks: { breakpoints: null, patched: null, seq: 0, busy: false },
+    // stamp: how many times each list was set, so that a read that was asked for before a newer list took its place
+    // does not put the older one back (rizinLoadMarks)
+    marks: { breakpoints: null, patched: null, seq: 0, busy: false, stamp: { patches: 0, breakpoints: 0 } },
 };
 
 // This browser tab's ID: random and kept in sessionStorage, so a reload of the
@@ -21265,7 +21268,7 @@ function rizinFunctionsHtml(funcs, options) {
 }
 
 // The lines of DISASSEMBLY: a gutter (a ● where a breakpoint is set, one click sets or removes it) and a cell for
-// the mark of a patch (≠: the bytes there are not the file's), then the address, the mnemonic in the colour of its
+// the mark of a patch by hand (≠: these bytes were written here by hand; what a run wrote is not marked), then the address, the mnemonic in the colour of its
 // kind, operands and comment. Each line carries its address in data-addr; the one that holds current (an address)
 // is marked, and the one that holds pc (the emulation's) with a mark of its own. breakpoints: the addresses of the
 // ones set, patched: [address, size] of each patch by hand (integers, as the routes answer them); a line that
@@ -21293,7 +21296,7 @@ function rizinDisasmHtml(ops, options) {
         html += `<div class="rizin-op${here ? ' current' : ''}${there ? ' pc' : ''}${stop ? ' bp' : ''}${edited ? ' patched' : ''}" data-addr="${addr}">`
             + `<span class="rizin-gutter${stop ? ' on' : ''}" data-rizin-gutter="${addr}" title="${stop ? 'Breakpoint set: click to remove it' : 'Click to set a breakpoint here'}"`
             + `${stop ? ' aria-label="breakpoint"' : ''}>${stop ? '●' : ''}</span>`
-            + `<span class="rz-pm${edited ? ' on' : ''}"${edited ? ' title="Patched: these bytes are not the file\'s"' : ''}>${edited ? '≠' : ''}</span>`
+            + `<span class="rz-pm${edited ? ' on' : ''}"${edited ? ' title="Patched by hand: these bytes were written here"' : ''}>${edited ? '≠' : ''}</span>`
             + `<span class="rz-addr">${addr}</span> `
             + `<span class="rz-mnem${kind ? ' ' + kind : ''}">${escapeHtml(mnemonic)}</span>`
             + (operands ? ' ' + rizinOperandsHtml(operands, rizinHex(op.jump)) : '')
@@ -25538,7 +25541,7 @@ async function rizinUnpatch(addr) {
     Object.assign(pane, { at: sid, patches: Array.isArray(r.data.patches) ? r.data.patches : pane.patches, problem: '', stale: false });
     rizinSetLists({ patches: r.data.patches });
     rizinEmuPaneSay(all ? "Cleared rizin's whole cache." : `Took the patch at ${at} back.`);
-    await rizinReloadViews(['emuPane']);
+    await rizinReloadViews(['emuPane', 'marks']);       // the answer carried the list; the pane and the marks took it
     return true;
 }
 
@@ -25634,10 +25637,12 @@ function rizinSetLists(lists) {
     if (!sid || !lists) return false;
     const safe = n => Number.isSafeInteger(n) && n >= 0;
     if (Array.isArray(lists.breakpoints)) {
+        marks.stamp.breakpoints++;
         marks.breakpoints = lists.breakpoints.filter(bp => bp && safe(bp.addr)).map(bp => bp.addr);
         if (pane.at === sid && Array.isArray(pane.breakpoints)) Object.assign(pane, { breakpoints: lists.breakpoints, seq: pane.seq + 1 });
     }
     if (Array.isArray(lists.patches)) {
+        marks.stamp.patches++;
         marks.patched = lists.patches.filter(p => p && p.mine === true && safe(p.addr) && Number.isSafeInteger(p.size) && p.size > 0)
             .map(p => [p.addr, p.size]);
         if (pane.at === sid && Array.isArray(pane.patches)) Object.assign(pane, { patches: lists.patches, seq: pane.seq + 1 });
@@ -25653,7 +25658,7 @@ function rizinSetLists(lists) {
 async function rizinLoadMarks(force) {
     const sid = rizinState.session, marks = rizinState.marks;
     if (!sid || (!force && marks.breakpoints !== null && marks.patched !== null)) return true;
-    const seq = ++marks.seq, base = `/api/rizin/${encodeURIComponent(sid)}`;
+    const seq = ++marks.seq, base = `/api/rizin/${encodeURIComponent(sid)}`, stamp = { ...marks.stamp };
     const [patches, breakpoints] = await Promise.all([rizinApi(`${base}/patches`), rizinApi(`${base}/breakpoints`)]);
     if (sid !== rizinState.session || seq !== marks.seq) return false;
     const failed = !patches.ok ? patches : !breakpoints.ok ? breakpoints : null;
@@ -25662,8 +25667,9 @@ async function rizinLoadMarks(force) {
         return false;
     }
     rizinState.retry.delete('marks');
-    return rizinSetLists({ patches: Array.isArray(patches.data) ? patches.data : [],
-                           breakpoints: Array.isArray(breakpoints.data) ? breakpoints.data : [] });
+    // A list that something newer set while these were on their way (an answer to a click, to a patch) stays
+    return rizinSetLists({ patches: stamp.patches === marks.stamp.patches ? (Array.isArray(patches.data) ? patches.data : []) : undefined,
+                           breakpoints: stamp.breakpoints === marks.stamp.breakpoints ? (Array.isArray(breakpoints.data) ? breakpoints.data : []) : undefined });
 }
 
 // A click in the gutter at addr ("0x…"): the breakpoint there is removed, or set where there is none. What is set is
@@ -25673,6 +25679,9 @@ async function rizinToggleBreakpoint(addr) {
     const sid = rizinState.session, at = rizinHex(addr), marks = rizinState.marks;
     if (!sid || !at || marks.busy) return false;
     marks.busy = true;
+    // One request at a time: while it is out a click in the gutter of any line is not taken, and the pointer says so
+    const pane = document.getElementById('rizin-disasm');
+    if (pane) pane.classList.add('rizin-gutter-busy');
     try {
         if (marks.breakpoints === null && !(await rizinLoadMarks(true))) {
             if (sid === rizinState.session && rizinState.ui.state !== 'busy') {
@@ -25697,6 +25706,7 @@ async function rizinToggleBreakpoint(addr) {
         return true;
     } finally {
         if (sid === rizinState.session) marks.busy = false;
+        if (pane && !marks.busy) pane.classList.remove('rizin-gutter-busy');
     }
 }
 
