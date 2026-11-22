@@ -67,7 +67,10 @@ A second ``aeim`` with arguments maps that region **and moves the VM** into
 it: the PC goes to the seek and the stack and base pointer to the middle of
 the new map, while the map made before stays (all measured on rizin 0.9.1).
 That is why the API assistant reads those three registers before it maps a
-buffer and writes them back afterwards.
+buffer and writes them back afterwards. Such a region is **rw-**, so code in
+it traps under esil.exectrap; ``omf rwx @ <addr>`` makes the region at the
+address executable, which is what the assistant sends after each ``aeim``
+(both measured).
 
 ``aeim-`` and a plain ``aeim`` both go through the one piece of bookkeeping
 rizin keeps, the region the most recent ``aeim`` made: ``aeim-`` gives that
@@ -349,9 +352,14 @@ else:
 # mapped holds the regions a later ``aeim <addr> <size> <name>`` added beside it (the API assistant's
 # buffers), newest last, and last is the region the most recent ``aeim`` made -- the one piece of
 # bookkeeping rizin 0.9.1 keeps, which is why ``aeim-`` works once and then cannot name anything
-# (see esil_drop_last, all measured).
-esil = {"regs": None, "stack": None, "mapped": [], "last": None}
-RIZIN_LINE_MAX = 4095  # characters of one command line that rizin reads; see main()
+# (see esil_drop_last, all measured). ``exec`` holds the base addresses of the regions an ``omf rwx``
+# has made executable: ``aeim`` maps rw-, and code in such a region traps under esil.exectrap until
+# then (measured, see esil_executable).
+esil = {"regs": None, "stack": None, "mapped": [], "last": None, "exec": set()}
+# Characters of one command line the fake keeps; see main(). rizin 0.9.1 itself keeps **4094** (measured:
+# a line of 4096 characters lost its last two), so this cut is deliberately one character later -- a test
+# only needs that a line at or over the wall does not do what it says.
+RIZIN_LINE_MAX = 4095
 ESIL_CAP = 200000  # steps of one run: past it the fake's code has run into nothing it models
 SEARCH_MAX = 0x10000  # bytes of a search range the model reads (a test's range is far smaller)
 ESIL_INVALID = "ERROR: core: esil: Stopped execution in an invalid instruction (see e??esil.breakoninvalid)\n"
@@ -547,6 +555,7 @@ def esil_map_stack(args):
             value = int(text, 0) & (2 ** BITS - 1)
             memory[size // 2 + i * word:size // 2 + (i + 1) * word] = value.to_bytes(word, "little")
     name = f"mem.{args[2]}" if len(args) > 2 else f"mem.{addr:#x}_{size:#x}"  # like get_esil_stack_name
+    esil["exec"].discard(addr)  # a fresh region is rw-, whatever an omf did to the one that was here
     if len(args) > 2:
         esil["mapped"].append((addr, memory, name))
         esil["last"] = esil["mapped"][-1]
@@ -578,6 +587,7 @@ def esil_drop_last(what="aeim-"):
         esil["stack"] = None
     elif region in esil["mapped"]:
         esil["mapped"].remove(region)
+    esil["exec"].discard(region[0])
     esil["last"] = None
     return True
 
@@ -593,6 +603,7 @@ def esil_close_fd(rest):
                 esil["stack"] = None
             else:
                 esil["mapped"].remove(region)
+            esil["exec"].discard(region[0])
             if esil["last"] is region:
                 esil["last"] = None
             return ""
@@ -607,9 +618,35 @@ def esil_mapped(addr):
 
 
 def esil_executable(addr):
-    if any(base <= addr < base + len(memory) for base, memory, _name in esil_maps()):
-        return False  # aeim maps rw-
+    for base, memory, _name in esil_maps():
+        if base <= addr < base + len(memory):
+            return base in esil["exec"]  # aeim maps rw-; an omf rwx on that map adds the x (measured)
     return any(m["from"] <= addr < m["to"] and "x" in m["perm"] for m in MAPS)
+
+
+def esil_perm(base):
+    """The permissions ``omlj`` reports for an ESIL region: ``aeim`` maps rw-, ``omf rwx`` adds the x."""
+    return "rwx" if base in esil["exec"] else "rw-"
+
+
+def esil_set_perm(flags, addr):
+    """``omf <flags> @ <addr>``: the permissions of the map at the address.
+
+    rizin's ``omf <flags>`` without a map id takes the map at the current offset, and the topmost one
+    where several cover it (measured). Only the ESIL VM's own regions are modelled: the server changes
+    no other map, and the console cannot reach the ``o`` family at all. Nothing but the ``x`` bit is
+    modelled either -- that is the one the server sets, so the assistant's buffers can run code.
+    """
+    for base, memory, _name in reversed(esil_maps()):
+        if base <= addr < base + len(memory):
+            if "x" in flags:
+                esil["exec"].add(base)
+            else:
+                esil["exec"].discard(base)
+            return ""
+    if not any(m["from"] <= addr < m["to"] for m in MAPS):
+        err(f"ERROR: Cannot find any map at the current address {addr:x}\n")
+    return ""
 
 
 def esil_ops():
@@ -919,7 +956,7 @@ def maps_json():
     maps = list(MAPS)
     for addr, memory, name in esil_maps():
         maps.append({"map": len(maps) + 1, "fd": 5 + len(maps) - len(MAPS), "delta": 0, "from": addr,
-                     "to": addr + len(memory), "perm": "rw-", "name": name})
+                     "to": addr + len(memory), "perm": esil_perm(addr), "name": name})
     return json.dumps(maps) + "\n"
 
 
@@ -1250,6 +1287,8 @@ def answer(cmd):
         return flags_at(seek)
     if word == "omlj":
         return maps_json()
+    if word == "omf":
+        return esil_set_perm(rest, seek)
     if word.startswith("a") or word in ("Fa",):
         return ""
     if word == "pd":
@@ -1284,8 +1323,9 @@ def main():
         if len(cmd) > RIZIN_LINE_MAX:
             # rizin 0.9.1 reads its stdin a line at a time and cuts one that is longer, without a word:
             # measured, a `wx` of 2040 bytes on a line of exactly 4096 characters wrote them at the
-            # address of the **cut** line (0x500400 for a request at 0x50004000) and said nothing at
-            # all, and a longer line said only "Could not convert hexpair" on stderr. rizin's own cut
+            # address of the **cut** line (0x500040 for a request at 0x50004000 -- rizin keeps 4094
+            # characters, so the two last ones of the address are gone) and said nothing at all, and a
+            # longer line said only "Could not convert hexpair" on stderr. rizin's own cut
             # is a character or two shorter than this one, so what lands where is not the same byte for
             # byte; what is the same, and all a test here needs, is that a command line at or over the
             # wall does not do what it says. The server keeps every command it builds well inside it

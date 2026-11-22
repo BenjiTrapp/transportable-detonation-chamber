@@ -360,16 +360,19 @@ def test_the_rizin_page_quotes_the_filter_as_it_words_its_refusals():
     row = next(line for line in console.splitlines() if said in line)
     assert check("ood") == "'o' commands are not allowed" and "`ood`" in console and "`ood`" not in row
     for command in ("wci", "wc+", "wa nop", "dbc 0x10 x", "dbC 0x10 x", "dbx 0x10 x", "dbw 0x10", "wu x", "wf x",
+                    "aecc", "aecs", "aesuo call",
                     "e esil.mdev.range=0x10", "e asm.assembler=x86.nasm"):
         assert check(command), "the page says %r is refused; the filter lets it through" % command
-    for name in ("wci", "wc+", "wa", "dbc", "dbC", "dbx", "dbw"):
+    for name in ("wci", "wc+", "wa", "dbc", "dbC", "dbx", "dbw", "aecc", "aecs", "aesuo"):
         assert "`%s`" % name in console, "the console section does not name the refused %s" % name
     # what the user reads on screen is what the page quotes, word for word
-    for command in ("wci", "wc+", "wa nop", "dbc 0x10 x", "dbC 0x10 x", "dbx 0x10 x", "dbw 0x10", "wu x", "wxf x", "wff x", "wfs x"):
+    for command in ("wci", "wc+", "wa nop", "dbc 0x10 x", "dbC 0x10 x", "dbx 0x10 x", "dbw 0x10", "wu x", "wxf x", "wff x", "wfs x",
+                    "aecc", "aecs", "aesuo call"):
         assert check(command) in console, "the page does not quote the refusal of %r: %s" % (command, check(command))
     for command in ("db @ 0x10", "db- @ 0x10", "db-*", "dblj", "dbd @ 0x10", "wx 9090 @ 0x10", "wc- 0x10 0x11", "wc-*", "wcj",
                     "e esil.timeout=3", "e io.cache=true", "aepc 0x10", "aei", "aeim", "aes", "aeso", "aess", "aesu 0x10",
-                    "aec", "ar rax=1", "af @ 0x10", "/zj [[:print:]]{4,} r ascii"):
+                    "aec", "aecu 0x10", "aecue rax,1,==", "aecb", "aesue rax,1,==", "aesou 0x10", "aesb",
+                    "ar rax=1", "af @ 0x10", "/zj [[:print:]]{4,} r ascii"):
         assert check(command) is None, "the page says %r is open; the filter refuses it: %s" % (command, check(command))
     assert rizin_sessions._FAMILIES.replace("", " ").split() == list("apifCs/?xtbewd")
     assert "`a p i f C s / ? x t b e w d`" in console
@@ -1441,6 +1444,8 @@ def test_the_help_and_the_guide_say_the_same_where_they_say_it_twice():
         "'d' commands are not allowed: emulation runs from the EMULATION tab",
         "esil.timeout",
         "no watchpoint",
+        "ignore esil.timeout",                                        # R74: the three unbounded ESIL commands
+        "over bytes a run changed",                                   # R72: a hand patch over run-written bytes
     ]
     for claim in shared:
         assert claim.lower() in help_text.lower(), "the in-tab help no longer says %r" % claim

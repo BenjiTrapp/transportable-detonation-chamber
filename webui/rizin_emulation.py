@@ -5,6 +5,7 @@ wrong value would silently show a wrong register, stack word or pointer.
 """
 
 import bisect
+import collections
 import json
 import re
 
@@ -375,22 +376,57 @@ def patch_rows(rows, mine, ordered=False):
 
     Two writes of the same bytes to the same address cannot be told apart; either of them exports and
     persists the same byte, which is why that case is left as it is.
+
+    ``over_run`` marks a ``mine`` row that lies over bytes a **foreign** row written before it changed --
+    a patch set by hand into code an emulation run decrypted, which is what this tab invites. It matters
+    because rizin's ``before`` for such a row is what the run wrote, **not** what the file holds
+    (measured: a run's ``wx 41 @ a`` and then a patch ``wx 90 @ a`` give a second row with
+    ``before: "41"`` while the file still has ``31``), so the export has to read the file itself and name
+    the row, and the pane has to mark it. It is false on every foreign row.
     """
     places = {}
     for index, entry in enumerate(mine):
         places.setdefault(entry, []).append(index)
-    marked, kept, at = [], [], 0
+    marked, kept, foreign, at = [], [], [], 0
     for row in rows:
         spots = places.get((row["addr"], row["size"], row["after"]), ())
         where = bisect.bisect_left(spots, at)  # the first of those writes at or after the last match
         index = spots[where] if where < len(spots) else None
+        end = row["addr"] + row["size"]
         if index is None:
-            marked.append(dict(row, mine=False))
+            foreign.append((row["addr"], end))
+            marked.append(dict(row, mine=False, over_run=False))
             continue
-        marked.append(dict(row, mine=True))
+        marked.append(dict(row, mine=True,
+                           over_run=any(start < end and row["addr"] < stop for start, stop in foreign)))
         kept.append(mine[index])
         at = index + 1
     return (marked if ordered else sorted(marked, key=lambda row: row["addr"])), kept
+
+
+def rows_gone(before, after):
+    """The rows of ``before`` that ``after`` does not hold any more: what a ``wc-`` took out, with the
+    marks they had.
+
+    Counted as a multiset over (addr, size, before, after), because rizin's cache can hold two rows
+    that nothing tells apart (the same bytes written twice to the same address), and because a removal
+    keeps the order of the rest. ``mine`` is left out of the key and read from ``before``'s own row:
+    where two such rows differ only in it, either answer names one of them, which is the ambiguity
+    ``patch_rows`` already records.
+
+    Why it is needed: ``wc- <addr> <addr+1>`` removes **every** write that overlaps the address, so
+    taking one hand-made patch back can take a run's row with it -- up to a whole copied stage
+    (measured: a 4-byte run row and a 1-byte patch over it, and `wc- 0x1 0x2` emptied the cache).
+    """
+    left = collections.Counter((r["addr"], r["size"], r["before"], r["after"]) for r in after)
+    gone = []
+    for row in before:
+        key = (row["addr"], row["size"], row["before"], row["after"])
+        if left[key]:
+            left[key] -= 1
+        else:
+            gone.append(row)
+    return gone
 
 
 # --- Re-analysing the range an emulation run decrypted ---------------------

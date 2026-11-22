@@ -10557,6 +10557,12 @@ table[data-sortable] > thead > tr > th:focus-visible {
 .rizin-emu-urgent::before {
     content: "⚠ ";
 }
+/* A patch set over bytes a run changed: its "before" is the run's byte, not the file's */
+.rizin-emu-over-mark {
+    margin-right: 3px;
+    font-weight: 600;
+    color: var(--accent-yellow);
+}
 .rizin-emu-note {
     margin: 2px 0;
     overflow-wrap: anywhere;

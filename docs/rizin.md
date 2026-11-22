@@ -85,11 +85,14 @@ Dump, open the dump here.
 
 Before every run the server sets rizin's guards again: `esil.timeout` (5 s,
 so an endless loop ends the run and not the session), and the traps
-`esil.breakoninvalid`, `esil.exectrap`, `esil.iotrap` and `esil.nonull`, which
-stop the emulation at an instruction rizin cannot decode, at a jump into
-memory that cannot execute, at an invalid read or write and at a null pointer,
-instead of letting it run on through zeros and show the result as if it were
-real. `esil.romem` is off, so a run can decrypt in place. The stack is 960 KB
+`esil.breakoninvalid`, `esil.exectrap` and `esil.iotrap`, which stop the
+emulation at an instruction rizin cannot decode, at a jump into memory that
+cannot execute and at an invalid read or write, instead of letting it run on
+through zeros and show the result as if it were real. `esil.nonull` is set as
+well but stops nothing in rizin 0.9.1 (measured: a read or a write at address
+0 is carried out silently and the run goes on to the timeout); in a PE, where
+address 0 is in no map, `esil.iotrap` is the guard that fires there.
+`esil.romem` is off, so a run can decrypt in place. The stack is 960 KB
 at `0x100000`.
 
 ### The run strip
@@ -156,8 +159,8 @@ change:
 
 | Group | APIs | SKIP answers |
 |-------|------|--------------|
-| Memory | `VirtualAlloc`, `VirtualAllocEx`, `HeapAlloc`, `LocalAlloc`, `GlobalAlloc`, `malloc` | A new buffer of the size the call asks for (rounded up to a page, at most 16 MB), mapped for the run; its address in the return register |
-| Memory protection | `VirtualProtect` | Success; the memory stays writable |
+| Memory | `VirtualAlloc`, `VirtualAllocEx`, `HeapAlloc`, `LocalAlloc`, `GlobalAlloc`, `malloc` | A new buffer of the size the call asks for (rounded up to a page, at most 16 MB), mapped for the run as readable, writable **and executable**; its address in the return register |
+| Memory protection | `VirtualProtect` | Success; the memory stays writable, and a buffer the assistant made is executable from the start |
 | Loader | `LoadLibraryA/W`, `GetModuleHandleA/W`, `GetProcAddress` | A pseudo handle; for `GetProcAddress` the address of the import if the file has it, else a recognisable pseudo address |
 | Anti-debug | `IsDebuggerPresent`, `CheckRemoteDebuggerPresent`, `NtQueryInformationProcess` | "Not being watched" |
 | Time | `GetTickCount`, `GetTickCount64`, `timeGetTime`, `QueryPerformanceCounter`, `QueryPerformanceFrequency`, `GetSystemTimeAsFileTime` | A clock that rises with every skip, so that a timing check sees time pass |
@@ -198,7 +201,12 @@ PATCHES lists what rizin's write cache holds, one row per write, in two groups
 that rizin itself does not tell apart (it has one cache):
 
 - **SET BY HAND** is what the menu wrote, kept with the project and the only
-  thing an export takes; each row has a ✕ that takes that write back.
+  thing an export takes; each row has a ✕ that takes that write back. A row
+  set over bytes a run changed carries a ⚠: rizin's "before" for it is the
+  run's byte and not the file's, the group says so, and the export's note
+  names the row with what the file really holds there. Taking such a row back
+  drops the run's whole write with it -- rizin removes a write whole -- and
+  the pane names the writes that went, with their byte total.
 - **WRITTEN BY THE RUN** is everything else in the cache: what the emulation
   wrote, and what you typed as `wx` in the console. These bytes end with the
   session, and the group says so ("These bytes end with the session: they are
@@ -251,7 +259,13 @@ rename of it.
 `%TEMP%\rizin_uploads`, as `<16 hex digits of the original's SHA-256>_<name>.patched.<ext>`
 (the name says what it is), with a note `….patch.txt` beside it: the original's
 path, the SHA-256 of the original and of the copy, the time in UTC and one line
-per patch (address, offset in the file, bytes before → after). The copy is
+per patch (address, offset in the file, the file's own bytes there → the copy's).
+Those bytes are read from the original, not from rizin's cache: where a patch
+was set over bytes a run had changed, rizin reports as "before" what the run
+wrote, and the note would otherwise say the file held it. Every such patch is
+named in a block of its own, with both bytes, because the copy carries the
+file's own bytes everywhere else -- so the patch sits in bytes that are still
+encrypted on disk. The copy is
 built in Python, not by rizin: the original is copied and each patch is written
 at its **offset in the file**, which is not its address, because sections are
 page-aligned in memory and not on disk. Only patches set by hand are exported.
@@ -285,7 +299,8 @@ commands`, and nothing moves. The console writes nothing to the file and
 debugs nothing for real: writes may only go into rizin's cache, `d` is only
 the breakpoint list, and the emulation's own commands (`aei`, `aes…`, `aec`,
 `ar`) and its `esil.*` and `io.cache` settings are open, so you can go on in
-the console where the tab stops.
+the console where the tab stops -- all but the three that ignore
+`esil.timeout` (see the table below).
 
 | Refused | Why |
 |---------|-----|
@@ -295,6 +310,7 @@ the console where the tab stops.
 | In `d`: everything but the breakpoint list (`db`, `db-`, `db-*`, `dbl`, `dblj`, `dbd`, `dbe` …). `dbc`, `dbC` and `dbx` answer `'dbc', 'dbC', 'dbx', 'dbic' and 'dbix' run rizin commands when a breakpoint hits`; `dbw` answers `'dbw' and 'dbW' set watchpoints, which hang rizin`; the executing commands (`dp`, `dc`, `ds`, `dm`, `dk`, `dd`, `dbt`) answer `'d' commands are not allowed: emulation runs from the EMULATION tab` | No real debugging; emulation has its own tab. `dbd` is let through but does not keep a breakpoint from stopping a run: remove it with `db-` |
 | Inside the other families: the sub-commands and `@` forms that read or write files, assemble (rizin can hand that to an external assembler), wait for input or open an interactive view, run stored or nested commands, or change the settings, arch or file for one command (`@e:`, `@a:`, `@f:` …) | The same reasons, one level down; the list comes from rizin 0.9.1's own help, and the tests check every entry |
 | Setting anything but `asm.*` (not `asm.assembler` and `asm.debuginfo.file`), `analysis.*` (also under its older name `anal.*`), `esil.*` (not `esil.mdev.range`, which a command hook handles), `bin.demangle` and `io.cache`; arch values other than rizin's built-in disassemblers | Some settings and arch plugins start programs or read files; reading a setting is fine |
+| `aecc`, `aecs` and `aesuo`, which answer `'aecc', 'aecs' and 'aesuo' ignore esil.timeout and run until rizin is killed: TO CALL does this` | They ignore `esil.timeout` (measured: all three past 15 s on a `jmp $` with `esil.timeout=2`), so the console's own 60 s would end the session and the run's bytes with it. `aec`, `aecu`, `aecue`, `aes`, `aesu`, `aesue`, `aess`, `aeso`, `aesou` and `aecb` all stop at the timeout and stay open |
 | `aa`, `aaa` and the other whole-program analyses | They outlast a console command's 60 s; **Full analysis** runs them in steps |
 | Backslashes, control characters, several lines, more than 2000 characters | rizin would read such input differently from the check |
 

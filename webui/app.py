@@ -5929,6 +5929,23 @@ def _rizin_note_bytes(hexdigits, shown=32):
 
 
 def _rizin_export_note(session, original_sha, copy_name, copy_sha, placed, skipped):
+    """The note beside the copy. ``placed`` is [(row, file offset, the **original's** bytes there, hex)].
+
+    A row's ``before`` is rizin's: what stood at the address when the patch was written, which is a
+    **run's** byte where the patch went over bytes an emulation run had changed (measured on rizin
+    0.9.1: a file holding 73317331, a run's `wx 41 @ 1` and then a patch `wx 90 @ 1` give a second row
+    with `before: "41"`, and the copy came out 73907331 against an original 73317331). The note is
+    about the copy on disk, so the bytes it shows as replaced are the file's own -- and every row where
+    the two differ is named, because the copy has the file's bytes around that patch: a patch inside
+    code a run decrypted therefore sits in bytes that are still encrypted on disk, and nothing else
+    would say so.
+
+    The comparison decides, not the row's ``over_run`` mark: the mark rests on the session's mirror of
+    its own writes, and a note that said nothing after a restart lost that mirror would be wrong about
+    the file. A row is named where either says so.
+    """
+    over = [(row, paddr, was) for row, paddr, was in placed
+            if was != row["before"].lower() or row.get("over_run")]
     lines = [
         "Patched copy made by TDC (RIZIN tab). Only the patches set by hand are in it; what an emulation run",
         "wrote is not.",
@@ -5939,10 +5956,17 @@ def _rizin_export_note(session, original_sha, copy_name, copy_sha, placed, skipp
         f"Copy SHA-256:     {copy_sha}",
         f"Time:             {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
         "",
-        f"Patches in the copy ({len(placed)}): address, offset in the file, bytes before -> after",
+        f"Patches in the copy ({len(placed)}): address, offset in the file, the file's bytes -> the copy's",
     ]
-    lines += [f"  {row['addr']:#x}  file {paddr:#x}  {_rizin_note_bytes(row['before'])} -> {_rizin_note_bytes(row['after'])}"
-              for row, paddr in placed]
+    lines += [f"  {row['addr']:#x}  file {paddr:#x}  {_rizin_note_bytes(was)} -> {_rizin_note_bytes(row['after'])}"
+              for row, paddr, was in placed]
+    if over:
+        lines += ["", f"The bytes these patches replaced are not the file's ({len(over)}): rizin's write cache held",
+                  "other bytes there when the patch was made -- a patch set over bytes an emulation run had",
+                  "changed. Everywhere else the copy has the file's own bytes, so such a patch sits in bytes that",
+                  "are still encrypted on disk:"]
+        lines += [f"  {row['addr']:#x}  file {paddr:#x}  the patch replaced {_rizin_note_bytes(row['before'])}; "
+                  f"in the file they are {_rizin_note_bytes(was)}" for row, paddr, was in over]
     if skipped:
         lines += ["", f"Patches that could not be placed in the file, so the copy does not have them ({len(skipped)}):",
                   "(there is no byte of the file at such an address: memory the emulation created, a section's "
@@ -5960,6 +5984,9 @@ def _rizin_export(session):
     no place in the file), note (the note's text)}. The copy is `<digest>_<stem>.patched<suffix>` in
     RIZIN_UPLOAD_DIR (the digest is the original's, as for an upload) and the note `<that>.patch.txt`; a
     second export of the same file replaces both together, so the note always describes the copy beside it.
+
+    The bytes the note shows as the ones a patch replaced are read from the **original**, not taken from
+    rizin's cache: see _rizin_export_note.
     """
     mine = [row for row in session.patches_made() if row["mine"]]
     if not mine:
@@ -6004,7 +6031,13 @@ def _rizin_export(session):
         if original_sha.hexdigest() != session.sha256:
             raise rizin_sessions.RizinRefused("the original changed on disk since it was opened: open it again")
         with open(copy_tmp, "r+b") as out:
-            for row, paddr in placed:  # in the order they were written: a later patch wins where two overlap
+            # the file's own bytes at every offset first, from the untouched copy: a row's `before` is
+            # what rizin had at the address, which is a run's byte where the patch went over one, and
+            # reading after the writes would give an earlier patch's bytes where two overlap
+            for i, (row, paddr) in enumerate(placed):
+                out.seek(paddr)
+                placed[i] = (row, paddr, out.read(row["size"]).hex())
+            for row, paddr, _was in placed:  # in the order they were written: a later patch wins
                 out.seek(paddr)
                 out.write(bytes.fromhex(row["after"]))
         copy_sha = hashlib.sha256()
@@ -6034,7 +6067,7 @@ def _rizin_export(session):
                 pass
     _rizin_prune_uploads(keep=(dest, note_dest, source))
     return {"path": dest, "name": name, "sha256": copy_sha.hexdigest(),
-            "patched": sum(row["size"] for row, _ in placed),
+            "patched": sum(row["size"] for row, *_ in placed),
             "skipped": sorted({row["addr"] for row in skipped}), "note": note}
 
 

@@ -20917,8 +20917,8 @@ const RIZIN_EMU_PANE = {
 };
 // The patches of the right-click menu: the kinds that act on one instruction (rizin_emulation.PATCH_KINDS), the
 // most bytes the field takes (rizin_emulation.MAX_PATCH_BYTES: a patch is one write, one command line, and rizin's
-// stdin reader cuts a line at 4094 characters without a word) and the arch whose bytes the kinds are (the server
-// refuses all others: 0x90 is a nop on x86 and nowhere else)
+// stdin reader keeps 4094 characters of a line and cuts what is longer, without a word) and the arch whose bytes
+// the kinds are (the server refuses all others: 0x90 is a nop on x86 and nowhere else)
 const RIZIN_PATCH = { kinds: ['nop', 'flip', 'always', 'nocall'], maxBytes: 2000, arch: 'x86' };
 // The views that follow the current place. load(force) brings a view to it:
 // it asks rizin when what the view shows is of another place, and always with
@@ -25305,10 +25305,12 @@ function rizinEmuPatchesHtml(patches, functions, options) {
         const addr = rizinEmuRowAddr(patch.addr), fn = rizinEmuFunctionAt(functions, patch.addr);
         const size = Number.isSafeInteger(patch.size) ? patch.size : 0;
         const before = rizinEmuBytes(patch.before), after = rizinEmuBytes(patch.after);
-        const title = `${addr || 'an address that cannot be shown exactly'} · ${size} byte${size === 1 ? '' : 's'}${fn ? ` · ${fn}` : ''} · ${before} → ${after}`;
+        const over = own && patch.over_run === true;
+        const title = `${addr || 'an address that cannot be shown exactly'} · ${size} byte${size === 1 ? '' : 's'}${fn ? ` · ${fn}` : ''} · ${before} → ${after}`
+            + (over ? ' · written over bytes a run changed: the bytes on the left are the run\'s, not the file\'s, and the export\'s note says what the file holds there' : '');
         return `<div class="rizin-row rizin-emu-row rizin-emu-patch${addr ? '' : ' rizin-row-none'}"${addr ? ` data-addr="${addr}"` : ''} title="${escapeHtml(title)}">`
             + `<span class="rz-addr">${escapeHtml(addr || '?')}</span><span class="rizin-emu-fn">${escapeHtml(fn || '—')}</span>`
-            + `<span class="rizin-emu-bytes">${size} B · ${escapeHtml(before)} → ${escapeHtml(after)}</span>`
+            + `<span class="rizin-emu-bytes">${size} B · ${over ? '<span class="rizin-emu-over-mark">⚠</span>' : ''}${escapeHtml(before)} → ${escapeHtml(after)}</span>`
             + (own && addr ? `<button type="button" class="rizin-tool rizin-emu-del" data-rizin-act="unpatch" title="Take this patch back" `
                 + `aria-label="Take back the patch at ${addr}">✕</button>` : '<span></span>')
             + '</div>';
@@ -25333,11 +25335,17 @@ function rizinEmuPatchesHtml(patches, functions, options) {
             + `<pre>${escapeHtml(exported.note)}</pre></div>`;
     }
     const written = run.reduce((sum, patch) => sum + (Number.isSafeInteger(patch.size) ? patch.size : 0), 0);
+    // A patch set over bytes a run changed: rizin's "before" for such a row is the run's byte, not the file's, so the
+    // row alone would read as if the file held it. The glyph marks the row, this line says what follows from it.
+    const over = hand.filter(patch => patch.over_run === true).length;
+    const overLine = over ? `<div class="rizin-emu-warn" role="note">${over === 1 ? 'One of these was' : `${over} of these were`}`
+        + ' set over bytes a run changed: in the file those bytes are different, and the export writes the file\'s own'
+        + ' bytes around the patch — so the copy has it inside bytes that are still encrypted. The note names them.</div>' : '';
     return `<div class="rizin-emu-group rizin-emu-hand" data-rizin-group="hand"><div class="rizin-emu-subhead">`
         + `<span class="rizin-emu-group-title">SET BY HAND · ${hand.length}</span><span class="rizin-emu-fate">kept with the project</span>`
         + `<span class="rizin-emu-actions"><button type="button" class="rizin-tool" data-rizin-act="export"${off(!hand.length || busy)} `
         + `title="Write a copy of the file with these patches in it, and a note beside it">Export</button>`
-        + `</span></div>${result}${list(hand, true, 'Nothing set by hand.')}</div>`
+        + `</span></div>${overLine}${result}${list(hand, true, 'Nothing set by hand.')}</div>`
         + `<div class="rizin-emu-group rizin-emu-run" data-rizin-group="run"><div class="rizin-emu-subhead">`
         + `<span class="rizin-emu-group-title">WRITTEN BY THE RUN · ${run.length}${run.length ? ` · ${written} B` : ''}</span>`
         + `<span class="rizin-emu-fate">these end with the session</span>`
@@ -25547,7 +25555,16 @@ async function rizinUnpatch(addr) {
     }
     Object.assign(pane, { at: sid, patches: Array.isArray(r.data.patches) ? r.data.patches : pane.patches, problem: '', stale: false });
     rizinSetLists({ patches: r.data.patches });
-    rizinEmuPaneSay(all ? "Cleared rizin's whole cache." : `Took the patch at ${at} back.`);
+    // wc- <addr> <addr+1> removes every write that overlaps the address, so a patch set over bytes a run wrote takes
+    // the run's whole row with it -- up to a copied or decrypted stage. The server names those rows; saying only
+    // "took the patch back" would leave the pane claiming less than happened.
+    const gone = (Array.isArray(r.data.run_removed) ? r.data.run_removed : []).filter(row => row && typeof row === 'object');
+    const bytes = gone.reduce((sum, row) => sum + (Number.isSafeInteger(row.size) ? row.size : 0), 0);
+    // Only for one patch: clearing the whole cache asked first and said how many of the run's writes go with it.
+    const also = all || !gone.length ? '' : ` ${gone.length} write${gone.length === 1 ? '' : 's'} the run made went with it`
+        + ` (${bytes} byte${bytes === 1 ? '' : 's'}, from ${gone.map(row => rizinEmuRowAddr(row.addr) || '?').slice(0, 4).join(', ')}${gone.length > 4 ? ', …' : ''}):`
+        + ' rizin removes a write whole, and those bytes are back only by running again.';
+    rizinEmuPaneSay((all ? "Cleared rizin's whole cache." : `Took the patch at ${at} back.`) + also, also ? 'error' : 'ok');
     await rizinReloadViews(['emuPane', 'marks']);       // the answer carried the list; the pane and the marks took it
     return true;
 }

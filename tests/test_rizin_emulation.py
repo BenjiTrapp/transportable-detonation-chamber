@@ -274,9 +274,58 @@ def test_patch_rows_mark_only_what_this_session_wrote():
         (0x1000, "9090", True),         # this session's patch
         (0x1000, "cc", True),           # and a write of this session over it
         (0x1001, "4142", False)]        # reaches past what this session wrote
-    assert all(set(r) == {"addr", "size", "before", "after", "mine"} for r in marked)
+    assert all(set(r) == {"addr", "size", "before", "after", "mine", "over_run"} for r in marked)
     assert kept == mine
     assert [r["mine"] for r in rizin_emulation.patch_rows(rows, [])[0]] == [False] * 4
+    assert [r["over_run"] for r in rizin_emulation.patch_rows(rows, [])[0]] == [False] * 4, \
+        "a foreign row is never marked as a patch over a run's bytes"
+
+
+def test_patch_rows_mark_a_patch_set_over_bytes_a_run_wrote():
+    """R72. rizin's ``before`` for such a row is the run's byte, not the file's -- measured on rizin
+    0.9.1: a file holding 73317331, a run's ``wx 41 @ 1`` and then ``wx 90 @ 1`` gave a second row with
+    ``before: "41"`` while the file still had ``31``, and ``p8`` showed 73907331. The pane marks the row
+    and the export reads the file, so the mark has to be on the row and nowhere else."""
+    # the run wrote four bytes, then a patch of one byte over the second of them
+    rows = [_row(0x1000, 4, "41424344"), _row(0x1001, 1, "90")]
+    mine = [rizin_emulation.cache_entry(0x1001, b"\x90")]
+    marked, _ = rizin_emulation.patch_rows(rows, mine)
+    assert [(r["addr"], r["mine"], r["over_run"]) for r in marked] == [
+        (0x1000, False, False), (0x1001, True, True)]
+    # the other way round: the run wrote over the patch afterwards, which is not this case
+    rows = [_row(0x1001, 1, "90"), _row(0x1000, 4, "41424344")]
+    marked, _ = rizin_emulation.patch_rows(rows, mine)
+    assert [(r["addr"], r["mine"], r["over_run"]) for r in marked] == [
+        (0x1000, False, False), (0x1001, True, False)]
+    # a patch next to the run's bytes, not over them: 0x1000..0x1003 written, the patch at 0x1004
+    rows = [_row(0x1000, 4, "41424344"), _row(0x1004, 1, "90")]
+    marked, _ = rizin_emulation.patch_rows(rows, [rizin_emulation.cache_entry(0x1004, b"\x90")])
+    assert [r["over_run"] for r in marked] == [False, False]
+    # and the last byte of the run's row is an overlap (the off-by-one the other way)
+    rows = [_row(0x1000, 4, "41424344"), _row(0x1003, 1, "90")]
+    marked, _ = rizin_emulation.patch_rows(rows, [rizin_emulation.cache_entry(0x1003, b"\x90")])
+    assert [r["over_run"] for r in marked] == [False, True]
+    # a patch over an earlier patch of this session is not over a run's bytes
+    rows = [_row(0x1000, 4, "41424344"), _row(0x1001, 1, "90")]
+    marked, _ = rizin_emulation.patch_rows(rows, [rizin_emulation.cache_entry(0x1000, bytes.fromhex("41424344")),
+                                                 rizin_emulation.cache_entry(0x1001, b"\x90")])
+    assert [(r["mine"], r["over_run"]) for r in marked] == [(True, False), (True, False)]
+
+
+def test_rows_gone_names_what_a_take_back_removed():
+    """``wc- <addr> <addr+1>`` removes every write that overlaps the address, so one ✕ can take a run's
+    whole row with it (measured: a 4-byte run row and a 1-byte patch over it, and ``wc- 0x1 0x2`` left
+    the cache empty). The answer names the foreign rows, which this computes."""
+    run, patch = dict(_row(0x1000, 4, "41424344"), mine=False), dict(_row(0x1001, 1, "90"), mine=True)
+    assert rizin_emulation.rows_gone([run, patch], []) == [run, patch]
+    assert rizin_emulation.rows_gone([run, patch], [run]) == [patch]
+    assert rizin_emulation.rows_gone([run, patch], [run, patch]) == []
+    # a multiset, not a set: two rows nothing tells apart, and only one of them went
+    same = dict(_row(0x20, 1, "90"), mine=False)
+    assert rizin_emulation.rows_gone([same, same], [same]) == [same]
+    assert rizin_emulation.rows_gone([same, same], [same, same]) == []
+    # a row that is new in `after` (a write made meanwhile) is not reported as gone
+    assert rizin_emulation.rows_gone([run], [run, same]) == []
 
 
 def test_patch_rows_can_keep_the_order_the_writes_were_made_in():

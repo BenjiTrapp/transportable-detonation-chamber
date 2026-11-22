@@ -85,7 +85,11 @@ STEP_GRACE = 120.0
 ESIL_TIMEOUT = 5.0
 # The pipe's time limit for one run command: esil.timeout plus this, so a run that rizin bounds never trips
 # it (past it the pipe kills rizin and the session ends). Every command a run sends is bounded by
-# esil.timeout: aecc and aesuo are not, which is why to_call does not use them (rizin_emulation.STEP_COMMANDS).
+# esil.timeout: aecc, aecs and aesuo are not, which is why to_call does not use them
+# (rizin_emulation.STEP_COMMANDS) and why the console refuses all three (_REFUSED). There the limit is
+# CONSOLE_TIMEOUT, so such a command would hold the session's gate for 60 s and then cost the session --
+# measured, all three ran past 15 s on a `jmp $` with esil.timeout=2, while aesu, aecu, aecue, aesue,
+# aess, aeso, aesou and aecb all stopped at the timeout.
 ESIL_GRACE = 10.0
 # The stack that aeim maps (rizin's own defaults): set by the server at each start, so a size the console
 # set (esil.* is settable there) never becomes an allocation of gigabytes on the VM's 8 GB.
@@ -93,10 +97,14 @@ ESIL_STACK_ADDR = 0x100000
 ESIL_STACK_SIZE = 0xF0000
 # Set in one `e` at the start of an emulation. Without io.cache every write of the run is lost (px keeps
 # the original bytes); with it the file on disk stays untouched. The traps stop the run at an invalid
-# instruction, a jump into memory that does not execute, an invalid read or write and a null pointer,
-# rather than emulating zeros there; romem stays off, so the run can decrypt in place. esil.verbose=1 makes an
+# instruction, a jump into memory that does not execute and an invalid read or write, rather than
+# emulating zeros there; romem stays off, so the run can decrypt in place. esil.verbose=1 makes an
 # invalid read or write say "WARNING: core: TRAP": without it aec stops there without a word. Set again before
 # each run (emulation_run): esil.exectrap takes effect only when it is set after aei.
+# esil.nonull stops **nothing** in rizin 0.9.1: measured, a read and a write at address 0 are carried out
+# silently and the run goes on to the timeout, exactly as with esil.nonull=false. It stays set because it
+# is what rizin offers for the case and costs nothing; on a PE, where 0 is in no map, it is esil.iotrap
+# that stops such an access ("WARNING: core: TRAP"), which is the right guard anyway (spec R75).
 ESIL_SETTINGS = ("io.cache=true", f"esil.timeout={ESIL_TIMEOUT:g}", "esil.breakoninvalid=true",
                  "esil.exectrap=true", "esil.iotrap=true", "esil.nonull=true", "esil.verbose=1", "esil.romem=false",
                  f"esil.stack.addr={ESIL_STACK_ADDR:#x}", f"esil.stack.size={ESIL_STACK_SIZE:#x}")
@@ -249,6 +257,8 @@ _REFUSED = [(re.compile(pattern), reason) for pattern, reason in (
     (r"aep(?!c$)", "'aep' commands are not allowed"),
     (r"ael", "'ael' loads ESIL interrupt plugins from files"),
     (r"aek", "'aek' runs SDB queries"),
+    (r"aec[cs]|aesuo", "'aecc', 'aecs' and 'aesuo' ignore esil.timeout and run until rizin is killed: "
+                       "TO CALL does this"),
     (r"afco", "'afco' opens a file"),
     (r"arp[og]", "'arpo' and 'arpg' load files"),
     (r"ascii", _SHELL),
@@ -1320,9 +1330,12 @@ class RizinSession:
         # could not take back, which the project keeps all the same (see _saved_cache).
         self._mine = []
         self._lost = []
-        # Notes from the boot (a project that could not be loaded, patches that could not be applied):
-        # they say what the session starts with, so _start_analysis keeps them when it plans again.
-        self._boot_notes = []
+        # Notes that outlive a re-plan: what the session starts with (a project that could not be
+        # loaded, patches that could not be applied) and the standing warning that patches did not fit
+        # into the project. _start_analysis plans again and drops the notes of the run before it; these
+        # are still true afterwards, and the budget warning is the only signal that what the pane calls
+        # "kept with the project" is not all of it.
+        self._kept_notes = []
         self._pipe, contained, level, mode, note, patches = self._boot()
         try:
             self._read_file_info()
@@ -1338,8 +1351,8 @@ class RizinSession:
         self._mode = mode or self._mode
         for text in (note, patch_note):
             if text:
-                self._boot_notes.append(text)
-        self._notes += self._boot_notes
+                self._kept_notes.append(text)
+        self._notes += self._kept_notes
         remaining = self._plan()
         if mode == "steps" and remaining:
             # The project was saved while a Full analysis had not finished (it stopped, or a step hung and
@@ -1813,30 +1826,41 @@ class RizinSession:
 
     def patches(self, wait=2.0):
         """What rizin's write cache holds (``wcj``), lowest address first: [{"addr", "size", "before",
-        "after", "mine"}].
+        "after", "mine", "over_run"}].
 
         One row per write operation, not per byte: a two-byte ``wx`` is one row of size 2, and a second
         write over the same address is another row whose ``before`` is what the first one wrote
         (measured). ``mine`` is this session's own patch, row by row, as against what an emulation run
         or the console wrote into the same cache -- also where that write lies inside a range this
-        session patched. rizin's own ``idx`` and ``written`` are left out: the index changes with every
-        removal, and nothing here ever commits the cache, so ``written`` is always false.
+        session patched. ``over_run`` is a ``mine`` row set over bytes such a foreign write changed
+        before it: rizin's ``before`` is then the run's byte and not the file's, so the pane marks the
+        row and the export reads the file itself (see rizin_emulation.patch_rows). rizin's own ``idx``
+        and ``written`` are left out: the index changes with every removal, and nothing here ever
+        commits the cache, so ``written`` is always false.
         """
         return self._call("emulation", wait, self._patch_list)
 
     def patches_made(self, wait=2.0):
         """``patches()`` in the order the writes were made, not by address: [{"addr", "size", "before",
-        "after", "mine"}]. Where two rows overlap the later one wins, which a list by address cannot say
-        (a one-byte patch made after a longer one that starts a byte later is listed first, measured), so
-        whoever applies the patches to a file needs this order."""
+        "after", "mine", "over_run"}]. Where two rows overlap the later one wins, which a list by
+        address cannot say (a one-byte patch made after a longer one that starts a byte later is listed
+        first, measured), so whoever applies the patches to a file needs this order."""
         return self._call("emulation", wait, lambda pipe: self._patch_list(pipe, ordered=True))
 
     def unpatch(self, addr=None, wait=2.0):
         """Take back every write that overlaps ``addr`` (``wc-``), or the whole cache (``wc-*``) when
-        ``addr`` is None; returns {"patches": the list}. Taking back where there is nothing is no error.
+        ``addr`` is None; returns {"patches": the list, "run_removed": the foreign rows that went}.
+        Taking back where there is nothing is no error.
 
         rizin removes a write operation whole, so taking back one byte of a longer ``wx`` takes all of
         it, and two writes at one address go together (measured); the list says what is left.
+
+        ``run_removed`` is the writes that were **not** this session's patches and went all the same,
+        each as {"addr", "size"}: ``wc- <addr> <addr+1>`` removes every write that overlaps the
+        address, so taking back a patch set over bytes an emulation run wrote takes the run's row with
+        it -- up to a whole copied or decrypted stage (measured: a 4-byte run row and a 1-byte patch
+        over it, and the range form emptied the cache). Those bytes are back only by running again, so
+        the answer names them instead of letting the interface say only that one patch went.
 
         ``wc-*`` takes an emulation run's bytes with it, because rizin has one cache for both; the list
         says which of them are this session's own.
@@ -1846,6 +1870,7 @@ class RizinSession:
 
         def run(pipe):
             self._lost = []
+            held = self._patch_list(pipe)  # what the cache holds before the removal, to say what went
             if addr is None:
                 pipe.cmd("wc-*")
                 self._mine = []
@@ -1856,7 +1881,9 @@ class RizinSession:
             found = self._patch_list(pipe)
             if addr is not None and any(r["addr"] <= addr < r["addr"] + r["size"] for r in found):
                 raise RizinRefused(f"rizin kept the patch at {addr:#x}")
-            return {"patches": found}
+            gone = [{"addr": r["addr"], "size": r["size"]}
+                    for r in rizin_emulation.rows_gone(held, found) if not r["mine"]]
+            return {"patches": found, "run_removed": sorted(gone, key=lambda r: r["addr"])}
 
         result = self._call("emulation", wait, run)
         self._schedule_save()
@@ -2470,12 +2497,26 @@ class RizinSession:
         base pointer to the middle of the new map, while the map made before stays (all measured) -- so
         the three registers are read first and written back afterwards. A buffer over something that is
         mapped already is **not** mapped: it would shadow the file's bytes or the stack.
+
+        Then ``omf rwx`` for that map, because ``aeim`` maps **rw-** and with ``esil.exectrap`` set
+        after ``aei`` -- which is how every run sets it -- the canonical unpacker (allocate, copy or
+        decrypt, jump into the buffer) traps at the buffer's first instruction: "Trap, trying to execute
+        on non-executable memory". Measured, and measured again with ``omf rwx``, which makes the same
+        code run. The console cannot work around it (``o`` and ``om`` are refused, the guards are set
+        again each run), and ``VirtualProtect`` answering success changes no permission. A real
+        ``VirtualAlloc(PAGE_EXECUTE_READWRITE)`` is executable from the start too, and ``esil.exectrap``
+        goes on guarding everything outside these buffers, which is what it is there for.
+
+        The address, not the map's id: ``omf <flags>`` without one takes the map at the current offset,
+        and ``@ <value>`` is that offset for one command (measured). Exactly one map covers ``value``
+        at this point -- span_is_free said nothing was there, and the ``aeim`` just made one.
         """
         size = plan["buffer"]
         if not rizin_emulation.span_is_free(maps, value, size):
             return f"no memory was mapped at {value:#x}: something is mapped there already"
         before = {role: self._emulation_role(pipe, role) for role in ("PC", "SP", "BP")}
         pipe.cmd(f"aeim {value:#x} {size:#x} {rizin_emulation.ASSIST_MAP_NAME}")
+        pipe.cmd(f"omf rwx @ {value:#x}")
         for role, was in before.items():
             if was is not None:
                 pipe.cmd(f"ar {role}={was:#x}")
@@ -2816,7 +2857,7 @@ class RizinSession:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return
-            self._notes = [n for n in self._notes if n in self._boot_notes]
+            self._notes = [n for n in self._notes if n in self._kept_notes]
             if not remaining:
                 self._state, self._step = "done", None
                 if restored:
@@ -3033,13 +3074,19 @@ class RizinSession:
 
     def _note_dropped_patches(self, count):
         """Say once that patches did not fit into the project: an analyst who patched must not find out
-        at the next open that what was written is not all of it."""
+        at the next open that what was written is not all of it.
+
+        It goes into the notes that outlive a re-plan as well: one Full analysis resets the notes, and
+        without that the only signal that the pane's "kept with the project" is not true of every patch
+        would disappear from a session where it still holds.
+        """
         note = _PATCHES_DROPPED.format(chars=PROJECT_PATCH_CHARS, **_patch_words(count))
         print(f"[rizin] {self.sha256[:12]}: {note}")
         with self._lock:
             if self._dropped_noted or self._closed:
                 return  # every save that follows would say it again
             self._dropped_noted = True
+            self._kept_notes.append(note)
             self._notes.append(note)
 
 

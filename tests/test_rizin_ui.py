@@ -1141,8 +1141,14 @@ function serve(sid, s) {
         const scripted = s.unpatch && s.unpatch(body, s);
         if (scripted) return scripted;
         const at = body && body.addr !== undefined ? parseInt(body.addr, 16) : null;
-        s.patches = at === null ? [] : (s.patches || []).filter(p => !(p.addr <= at && at < p.addr + p.size));
-        return [200, { patches: rows(s.patches) }, s.actDelay ?? 1];
+        // like the server: rizin removes every write that overlaps the address, whole, so the answer names the
+        // rows that were not patches set by hand and went with it (run_removed)
+        const held = s.patches || [];
+        const left = at === null ? [] : held.filter(p => !(p.addr <= at && at < p.addr + p.size));
+        const gone = held.filter(p => !left.includes(p) && p.mine !== true);
+        s.patches = left;
+        return [200, { patches: rows(s.patches), run_removed: gone.map(p => ({ addr: p.addr, size: p.size })) },
+                s.actDelay ?? 1];
     });
     on('DELETE', `/api/rizin/${sid}/breakpoints`, (url, body) => {
         if (s.ended) return ENDED;
@@ -6311,6 +6317,69 @@ def test_rizin_emulation_pane_edits_a_register_and_takes_a_patch_back():
 
 
 @needs_node
+def test_rizin_emulation_pane_marks_a_patch_set_over_bytes_a_run_wrote():
+    # R72: for such a row rizin's `before` is the run's byte and not the file's, so the row by itself reads as if the
+    # file held those bytes. The row carries a mark, the group says what follows for an export, and a ✕ that takes a
+    # run's whole row with it says so instead of only "Took the patch at X back".
+    r = _scripted(EMU_PANE_SETUP + r"""
+        await fill(); await showPane();
+        S.patches = [
+            { addr: 0x140001500, size: 4, before: '00000000', after: '41424344', mine: false, over_run: false },
+            { addr: 0x140001501, size: 1, before: '42', after: '90', mine: true, over_run: true },
+            { addr: 0x1400014d0, size: 1, before: '75', after: '74', mine: true, over_run: false },
+        ];
+        await rizinLoadEmuPane(true);
+        const row = at => pane.querySelector(`.rizin-emu-patch[data-addr="${at}"]`);
+        const mark = at => row(at).querySelector('.rizin-emu-over-mark');
+        r.marked = { over: !!mark('0x140001501'), plain: !!mark('0x1400014d0'), runRow: !!mark('0x140001500'),
+                     glyph: text(mark('0x140001501')), title: attr(row('0x140001501'), 'title'),
+                     plainTitle: attr(row('0x1400014d0'), 'title'),
+                     bytes: text(row('0x140001501').querySelector('.rizin-emu-bytes')) };
+        r.groupWarn = group('hand').querySelectorAll('.rizin-emu-warn').map(text);
+        // the ✕ on that patch: rizin drops the run's whole row with it, and the pane says so
+        click(row('0x140001501').querySelector('[data-rizin-act="unpatch"]'));
+        await until(() => !row('0x140001501'), 'the row goes'); await quiet();
+        r.took = { said: note(), kind: attr(pane.querySelector('.rizin-emu-notice'), 'class'),
+                   rows: pane.querySelectorAll('.rizin-emu-patch').map(e => attr(e, 'data-addr')),
+                   warn: group('hand').querySelectorAll('.rizin-emu-warn').length };
+        // and a patch with nothing of the run's under it says only that it went
+        click(row('0x1400014d0').querySelector('[data-rizin-act="unpatch"]'));
+        await until(() => !pane.querySelector('.rizin-emu-patch'), 'the last row goes'); await quiet();
+        r.plainTook = { said: note(), kind: attr(pane.querySelector('.rizin-emu-notice'), 'class') };
+        // anything but true is no mark, and a mark on a row of the run's is no warning in the hand group:
+        // the flag comes out of rizin's cache through the server, and the group speaks only for its own rows
+        S.patches = [{ addr: 0x1400014d0, size: 1, before: '75', after: '74', mine: true, over_run: 'yes' },
+                     { addr: 0x140001600, size: 1, before: '00', after: '41', mine: false, over_run: true }];
+        await rizinLoadEmuPane(true);
+        r.loose = { marks: pane.querySelectorAll('.rizin-emu-over-mark').length,
+                    warn: group('hand').querySelectorAll('.rizin-emu-warn').length };
+    """)
+    assert "error" not in r, r.get("error")
+    marked = r["marked"]
+    assert marked["over"] is True, "the patch over the run's bytes carries no mark"
+    assert marked["plain"] is False and marked["runRow"] is False, "every row is marked: " + str(marked)
+    assert marked["glyph"] == "⚠", marked["glyph"]
+    assert "written over bytes a run changed" in marked["title"], marked["title"]
+    assert "not the file's" in marked["title"] and "export" in marked["title"], marked["title"]
+    assert "written over" not in marked["plainTitle"], marked["plainTitle"]
+    assert marked["bytes"].startswith("1 B · ⚠42 → 90"), marked["bytes"]
+    assert len(r["groupWarn"]) == 1 and "One of these was set over bytes a run changed" in r["groupWarn"][0], r["groupWarn"]
+    assert "still encrypted" in r["groupWarn"][0] and "note names them" in r["groupWarn"][0], r["groupWarn"]
+    took = r["took"]
+    assert "Took the patch at 0x140001501 back" in took["said"], took["said"]
+    assert "1 write the run made went with it" in took["said"] and "4 bytes" in took["said"] \
+        and "0x140001500" in took["said"], \
+        "the run's row went with the patch and the pane did not say so: " + took["said"]
+    assert "back only by running again" in took["said"], took["said"]
+    assert "rizin-emu-note-error" in took["kind"], took["kind"]
+    assert took["rows"] == ["0x1400014d0"], took["rows"]
+    assert took["warn"] == 0, "the warning line stayed with no marked row left"
+    assert r["plainTook"]["said"] == "Took the patch at 0x1400014d0 back.", r["plainTook"]
+    assert "rizin-emu-note-ok" in r["plainTook"]["kind"], r["plainTook"]["kind"]
+    assert r["loose"] == {"marks": 0, "warn": 0}, r["loose"]
+
+
+@needs_node
 def test_rizin_emulation_pane_escapes_hostile_names():
     # a stack hint and a patch row whose function name is `</script><img onerror=…>`
     # produce no tag and no on* attribute in the pane
@@ -7775,7 +7844,7 @@ def test_rizin_gutter_marks_survive_a_slow_read_and_the_reads_are_not_doubled():
                                    "server": [0x1400014b9, 0x1400014bc]}, \
         "an old read wiped a patch from the gutter and from the pane's list of what is the user's: " + str(r["afterStalePane"])
     assert r["reload"] == [1, 1], "a forced reload with the pane closed reads each list once: " + str(r["reload"])
-    assert r["reloadOpen"] == [1, 1], "a forced reload with the pane open reads each list twice (the pane's and the marks'): " + str(r["reloadOpen"])
+    assert r["reloadOpen"] == [1, 1], "a forced reload with the pane open reads each list more than once (the pane's and the marks'): " + str(r["reloadOpen"])
     assert r["takeBack"] == [0, 0], "taking a patch back read the lists again after its answer carried them: " + str(r["takeBack"])
     assert r["takeBackHidden"] == [0, 0], "a take-back with the pane closed read the marks' lists again: " + str(r["takeBackHidden"])
     assert r["landing"] == [1, 1], "landing reads each list once: " + str(r["landing"])

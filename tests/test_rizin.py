@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 
 import pytest
 
@@ -379,6 +380,11 @@ ATTACKS = [
     "agf interactive", "agf v", "agc interactive @ sym.main", "agf inter'active'",
     "aep", "aepcj", "aepc.", "aeli C:\\x.dll", "aeli lib.dll", "aelir 3", "aek foo=bar", "aek-", "afco C:\\x.sdb",
     "afco x.sdb",
+    # R74: the three ESIL run commands that ignore esil.timeout (measured: all three past 15 s on a `jmp $`
+    # with esil.timeout=2, while aesu, aecu, aecue, aesue, aess, aeso, aesou and aecb all stop at it). In the
+    # console the limit is CONSOLE_TIMEOUT, after which the pipe kills rizin and the session goes with it.
+    "aecc", "aecs", "aesuo", "aesuo call", "aesuo call jmp", "aecc @ 0x140001440", "aec;aecc", "aecc~?",
+    'a"ec"c', "ae'cc'", "aes;aesuo call", 'Cf 4 "x;aecc" @ 0x140005000',
     "arpo profile.txt", "arpg gdb.txt", "afs!", "ascii",
     "pfo C:\\x.fdf", "pfo x", "pfw x 41", "pm C:\\x", "pm", "pmj x", "pkill rizin", "pwd", "p==v", "p==ev",
     "idp C:\\x.pdb", "idpi x.pdb", "idpd", "idpx x.pdb out", "ik foo=bar", "iO d/s 10", "inittime",
@@ -428,6 +434,12 @@ ATTACKS = [
     'Cf 4 "x;a"gw" dot g.png" @ 0x140005000', "Cf 4 'x;a'gw' dot g.png'", 'a"gw" dot x', "p'fo' x",
     'a"el"i lib.dll', 'i"dp"d', 'C"Ce"', 'e"c"o theme', "'a'a", 'a"a"a', 'Cf 4 "x;?e $"k"{x}"', 'Cf 4 "x;afl~".."',
 ]
+# The bounded neighbours of R74's three: every one of these stops at esil.timeout (measured), so the refusal
+# must not reach them. `aec` itself is what CONT sends and `aesu` what TO CALL is built from.
+BOUNDED_EMULATION = [
+    "aec", "aecb", "aecu 0x140001440", "aecue rax,0x999,==", "aes", "aes 4", "aesp 0 10", "aesb",
+    "aess", "aessu", "aeso", "aesou 0x140001440", "aesu 0x140001440", "aesue rax,0x999,==", "aeip",
+]
 # Whole-program analysis (every aa... command) runs from the Full analysis button, not the console.
 WHOLE_PROGRAM = [
     "aa", "aaa", "aaaa", "aac", "aaci", "aaC", "aad", "aae", "aae 64", "aaef", "aaf", "aafe", "aafr 64", "aaft",
@@ -452,6 +464,7 @@ ALLOWED = [
     "?", "?*afl", "pd?", "e?", "agw?", "afvl", "CC hello", "CCu base64:aGk=", "agf", "agf json", "agf dot",
     "axt", "iz", "ii", "x 64", "b 256", "t", "tf", "s sym.main", "s++", "pdg @ sym.main", "pdgj", "afl;pdf",
     "iS;afl", "afi", "ax", "/z hello", "f my_flag @ 0x1000", "C", "Cd 4 @ 0x1000", "pxj 16",
+    *BOUNDED_EMULATION,
 ]
 
 
@@ -487,6 +500,9 @@ def test_console_still_refuses_what_writes_executes_or_hangs():
         "wu /tmp/p": "file", "wff /tmp/x": "file", "wfs host 1": "file",
         "dbc pdf": "run", "dbC pdf": "run", "dbx rax": "run", "dbw w 1": "hang",
         "aep 0x10": "not allowed", "aepn": "not allowed",
+        # R74: unbounded by esil.timeout, so the console's own 60 s would kill rizin and the session
+        "aecc": "esil.timeout", "aecs": "esil.timeout", "aesuo call": "esil.timeout",
+        "aesuo": "TO CALL does this",
         "ood": "not allowed", "dc": "not allowed", "ds": "not allowed", "dm": "not allowed",
         "dp": "not allowed", "dbt": "not allowed", "dk 9": "not allowed",
         "aa": "Full analysis", "aaa": "Full analysis", "aav": "Full analysis",
@@ -3405,7 +3421,7 @@ def test_patch_writes_through_the_cache_and_lists_before_and_after(rz):
     rows = _patches(rz, sid)
     # one row per write operation, not per byte (measured: wx 9090 gives {"size": 2, "after": "9090"})
     assert rows == [{"addr": 0x140001440, "size": 2, "before": bytes(before).hex(),
-                     "after": "9090", "mine": True}]
+                     "after": "9090", "mine": True, "over_run": False}]
     assert all(r["mine"] is True for r in rows)
     # and the bytes rizin shows are the patched ones: HEX and DISASSEMBLY read through the cache
     assert rz.read(f"/api/rizin/{sid}/hex?addr=0x140001440&len=2")["bytes"] == [0x90, 0x90]
@@ -3436,6 +3452,38 @@ def test_unpatch_takes_one_back_and_all_back(rz):
     assert _patches(rz, sid) == []
     assert "wc-*" in rz.commands()
     assert rz.read(f"/api/rizin/{sid}/hex?addr=0x140001440&len=1")["bytes"] != [0x90]
+
+
+def test_unpatch_names_the_run_rows_it_took_with_the_patch(rz):
+    """R72. `wc- <addr> <addr+1>` removes every write that overlaps the address, so a ✕ on a patch set
+    over bytes a run wrote drops the run's whole row -- up to a copied stage. The answer has to name
+    them: "Took the patch at X back" alone would be the pane claiming less than happened."""
+    sid = rz.session()
+    # the "run" writes four bytes (a console wx is the same row to rizin), then a patch over the second.
+    # The start is what switches io.cache on, without which rizin loses a write and says so on stderr only.
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "wx 41424344 @ 0x140001440"})
+    _patch(rz, sid, addr="0x140001441", bytes="90")
+    rows = _patches(rz, sid)
+    assert [(r["addr"], r["mine"], r["over_run"]) for r in rows] == [
+        (0x140001440, False, False), (0x140001441, True, True)]
+
+    answer = rz.delete(f"/api/rizin/{sid}/patch", {"addr": "0x140001441"}).get_json()
+    assert answer == {"patches": [], "run_removed": [{"addr": 0x140001440, "size": 4}]}
+    assert rz.read(f"/api/rizin/{sid}/hex?addr=0x140001440&len=4")["bytes"] != [0x41, 0x42, 0x43, 0x44], \
+        "the run's bytes really went: that is what the answer names"
+
+    # a patch with nothing of the run's under it names nothing
+    _patch(rz, sid, addr="0x140001450", bytes="90")
+    assert rz.delete(f"/api/rizin/{sid}/patch", {"addr": "0x140001450"}).get_json() == {
+        "patches": [], "run_removed": []}
+
+    # wc-* names them too, but it is the button that asks first, and they come lowest address first
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "wx 4142 @ 0x140001460"})
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "wx 43 @ 0x140001455"})
+    _patch(rz, sid, addr="0x140001470", bytes="90")
+    assert rz.delete(f"/api/rizin/{sid}/patch", {}).get_json() == {
+        "patches": [], "run_removed": [{"addr": 0x140001455, "size": 1}, {"addr": 0x140001460, "size": 2}]}
 
 
 def test_patch_refuses_what_is_not_bytes(rz):
@@ -4056,6 +4104,14 @@ def test_the_assistant_offers_a_buffer_and_skip_maps_it(rz, monkeypatch):
     assert state["pc"] == hex(ASSIST_AT + 6) and state["stopped"] == "step"
     assert next(r["value"] for r in state["registers"] if r["name"] == "rax") == assist["value"]
     assert f"aeim {_word(assist['value']):#x} 0x8000 assist" in rz.commands()
+    # R73: aeim makes an rw- map, and esil.exectrap (set after aei, as every run does) then traps at the
+    # first instruction inside it -- so the server makes the map executable, by its address, because
+    # `omf <flags>` without a map id takes the map at the current offset (all measured)
+    assert f"omf rwx @ {_word(assist['value']):#x}" in rz.commands()
+    assert rz.commands().index(f"aeim {_word(assist['value']):#x} 0x8000 assist") \
+        < rz.commands().index(f"omf rwx @ {_word(assist['value']):#x}"), "the omf must follow the aeim"
+    buffer = next(m for m in rz.mgr.get(sid).json("omlj") if m["from"] == _word(assist["value"]))
+    assert buffer["perm"] == "rwx", buffer
     assert "buffer" in state["summary"], state["summary"]
     # rizin's aeim moves the PC and the stack and base pointer into the map it just made (measured),
     # so the three are put back: the stack is still the stack and the PC is after the call
@@ -4073,6 +4129,15 @@ def test_the_assistant_offers_a_buffer_and_skip_maps_it(rz, monkeypatch):
     assert _skip(rz, sid, ASSIST_AT, value=second["value"])["pc"] == hex(ASSIST_AT + 6)
     maps = [m["name"] for m in rz.mgr.get(sid).json("omlj")]
     assert maps.count("mem.assist") == 2, maps
+    # and the code in such a buffer really runs: the PC into it, one step, no trap (R73). The control is a
+    # region only `aeim` made, which is rw-: there the same step traps and the PC does not move.
+    rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rip", "value": second["value"]})
+    ran = _run(rz, sid, "step")
+    assert ran["stopped"] == "step" and _word(ran["pc"]) == _word(second["value"]) + 1, ran["stopped"]
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "aeim 0x70000000 0x1000 control"})
+    rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rip", "value": "0x70000000"})
+    trapped = _run(rz, sid, "step")
+    assert trapped["stopped"] == "trap" and _word(trapped["pc"]) == 0x70000000, trapped["stopped"]
 
 
 def test_a_buffer_is_not_offered_where_the_size_cannot_be_read(rz, monkeypatch):
@@ -4510,7 +4575,8 @@ def test_a_patch_and_a_breakpoint_come_back_when_the_file_is_opened_again(rz):
     # R2: one row per write operation, so a two-byte wx is one patch of size 2, not two patches
     assert [r["addr"] for r in rz.read(f"/api/rizin/{sid}/patches")] == [0x140001440]
     assert rz.read(f"/api/rizin/{sid}/patches") == [
-        {"addr": 0x140001440, "size": 2, "before": bytes(original).hex(), "after": "9090", "mine": True}]
+        {"addr": 0x140001440, "size": 2, "before": bytes(original).hex(), "after": "9090", "mine": True,
+         "over_run": False}]
     assert rz.read(f"/api/rizin/{sid}/breakpoints") == [{"addr": 0x1400014B7, "enabled": True}]
     # back in effect, not only in the list: the patch was written before the open answered, so the first
     # disassembly and the first hexdump already show it
@@ -4673,6 +4739,37 @@ def test_patches_that_do_not_fit_the_project_are_named_not_dropped_in_silence(rz
     assert rz.status(sid)["analysis"]["done_steps"] == ["aaa"]
 
 
+def test_the_budget_note_is_not_withdrawn_by_a_full_analysis(sessions, sample, monkeypatch):
+    """The pane says the patches set by hand are "kept with the project", and this note is the only
+    thing that says they are not all of them. _start_analysis drops the notes of the run before it when
+    it plans again, and _dropped_noted keeps the note from being added a second time -- so one Full
+    analysis used to take the only signal away while the pane went on promising the project."""
+    import rizin_emulation
+    import rizin_sessions
+
+    # over big_file the file is analysed with `aa`, so Full analysis still has steps to plan: with a
+    # finished `aaa` analyze_full returns at once and never reaches _start_analysis
+    mgr = sessions(big_file=1)
+    session = mgr.get(mgr.open(sample("big.bin", b"MZ", size=4096), "tab")["session"])
+    assert _wait_state(session, "done")["level"] == "aa"
+    entry = len("140001000") + 1 + 2 * rizin_emulation.MAX_PATCH_BYTES
+    monkeypatch.setattr(rizin_sessions, "PROJECT_PATCH_CHARS", entry)
+    for i in range(2):
+        session.patch(0x140001000 + i * 0x2000, "90" * rizin_emulation.MAX_PATCH_BYTES)
+    assert session.flush() is True
+    assert "did not fit into the project" in session.analysis["note"]
+
+    session.analyze_full()
+    state = _wait_state(session, "done")
+    assert state["level"] == "aaa" and state["done_steps"], "the analysis really planned again"
+    assert "did not fit into the project" in state["note"], \
+        "the note is still true, and nothing else says the project has only some of the patches"
+    # and it is still said only once, however many saves follow
+    session.patch(0x140005000, "90" * rizin_emulation.MAX_PATCH_BYTES)
+    assert session.flush() is True
+    assert session.analysis["note"].count("did not fit into the project") == 1
+
+
 def test_the_project_meta_reads_what_it_can_and_drops_the_rest(tmp_path):
     import rizin_sessions
 
@@ -4747,7 +4844,7 @@ def test_real_rizin_patches_through_the_cache(tdc, tmp_path, monkeypatch):
         assert api.read(f"/api/rizin/{sid}/patches") == []
         answer = api.send(f"/api/rizin/{sid}/patch", {"addr": main, "bytes": "9090"})
         assert answer["patches"] == [{"addr": main, "size": 2, "before": bytes(original).hex(),
-                                      "after": "9090", "mine": True}]
+                                      "after": "9090", "mine": True, "over_run": False}]
         # rizin 0.9.1 prints the rows without the [] of an array, so wcj is read as text, not as JSON
         assert session.text("wcj").strip().startswith('{"idx":0,')
         # and the patch shows through px: HEX and DISASSEMBLY need no plumbing of their own
@@ -4796,11 +4893,13 @@ def test_real_rizin_patches_through_the_cache(tdc, tmp_path, monkeypatch):
         assert refused.status_code == 400 and "0xffffffffffffffff" in refused.get_json()["refused"]
 
         # take one back: only that one goes, and the bytes under it are the file's again
-        api.remove(f"/api/rizin/{sid}/patch", {"addr": main})
+        taken = api.remove(f"/api/rizin/{sid}/patch", {"addr": main})
         assert [r["addr"] for r in api.read(f"/api/rizin/{sid}/patches") if r["mine"]] == [call["offset"]]
         assert api.read(f"/api/rizin/{sid}/hex?addr={main}&len=2")["bytes"] == original
-        # and all of them: the run's bytes too, because rizin has one cache
-        assert api.remove(f"/api/rizin/{sid}/patch", {}) == {"patches": []}
+        assert taken["run_removed"] == [], "nothing of the run's was at that address"
+        # and all of them: the run's bytes too, because rizin has one cache, and the answer names them
+        assert api.remove(f"/api/rizin/{sid}/patch", {}) == {
+            "patches": [], "run_removed": [{"addr": r["addr"], "size": r["size"]} for r in run]}
         assert session.text("wcj").strip() == ""
         assert api.read(f"/api/rizin/{sid}/hex?addr={call['offset']}&len={call['size']}")["bytes"] == call_bytes
     finally:
@@ -4975,7 +5074,8 @@ def test_real_rizin_keeps_a_patch_and_a_breakpoint_in_the_project(tdc, tmp_path,
         assert session.text("e asm.arch").strip() == "x86", "the condition never ran"
         assert session.text(f"CC. @ {stop:#x}").strip() == "", "the command never ran"
         assert api.read(f"/api/rizin/{sid}/patches") == [
-            {"addr": main, "size": size, "before": bytes(original).hex(), "after": nops, "mine": True}]
+            {"addr": main, "size": size, "before": bytes(original).hex(), "after": nops, "mine": True,
+             "over_run": False}]
         # in effect, not merely listed: px reads through the cache again
         assert api.read(f"/api/rizin/{sid}/hex?addr={main}&len={size}")["bytes"] == [0x90] * size
         assert api.read(f"/api/rizin/{sid}/breakpoints") == [{"addr": stop, "enabled": True}]
@@ -5480,6 +5580,65 @@ def test_real_rizin_copies_more_than_one_wx_can_carry(tmp_path):
         mgr.shutdown()
 
 
+@pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
+def test_real_rizin_runs_code_in_a_buffer_the_assistant_mapped(tmp_path):
+    """R73 against rizin 0.9.1 itself: the feature's first goal is to walk through unpacked code, and
+    without this it stopped at the unpacked code's first instruction.
+
+    Measured: ``aeim <addr> <size> assist`` makes an **rw-** map, and with ``esil.exectrap`` set *after*
+    ``aei`` -- which every run does, because set before it has no effect -- a step at an address in that
+    map prints "ERROR: core: esil: Trap, trying to execute on non-executable memory", leaves the PC
+    where it was and runs nothing. ``omf rwx @ <addr>`` makes the same map rwx and the same instruction
+    then runs. The control below is the rw- half, on the binary, so neither half is assumed.
+    """
+    import rizin_sessions
+
+    # mov rdx, 0x1000 (dwSize, the second argument under win64); call qword [0x2000]
+    code = bytes.fromhex("48ba") + (0x1000).to_bytes(8, "little")
+    code += bytes.fromhex("ff15") + (0x2000 - len(code) - 6).to_bytes(4, "little")
+    blob = tmp_path / "alloc.bin"
+    blob.write_bytes(code + bytes(0x3000 - len(code)))
+    mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(tmp_path / "projects"))
+    try:
+        session = mgr.get(mgr.open(str(blob), "tab")["session"])
+        _wait_state(session, "done", timeout=60)
+        session.text("e asm.arch=x86")
+        session.text("e asm.bits=64")
+        session.arch, session.bits = "x86", 64
+        session.text("f sym.imp.KERNEL32.dll_VirtualAlloc @ 0x2000")
+        call = len(code) - 6
+        session.emulation_start(0)
+        session.emulation_run("step")                       # the mov, so the size is in rdx
+        assist = session.call_assist(call)
+        assert assist["api"] == "VirtualAlloc" and assist["value"], assist
+        buffer = _word(assist["value"])
+        session.call_skip(call, buffer, 0)
+        mapped = next(m for m in session.json("omlj") if m["from"] == buffer)
+        assert mapped["perm"] == "rwx", f"aeim maps rw-; the server's omf has to add the x: {mapped}"
+
+        # stage 2: the bytes of the "unpacked" code, and the PC moved into the buffer as a jmp would
+        session.text(f"wx 48ffc0 @ {buffer:#x}")            # inc rax
+        session.emulation_register("rax", 0)
+        session.emulation_register("rip", buffer)
+        state = session.emulation_run("step")
+        assert state["stopped"] == "step", state["stopped"]
+        assert _word(state["pc"]) == buffer + 3, "the instruction in the buffer ran"
+        assert _word(next(r["value"] for r in state["registers"] if r["name"] == "rax")) == 1
+
+        # the control: a region that only aeim made is rw-, and the same instruction traps there
+        session.text("aeim 0x70000000 0x1000 control")
+        assert next(m["perm"] for m in session.json("omlj") if m["from"] == 0x70000000) == "rw-"
+        session.text("wx 48ffc0 @ 0x70000000")
+        session.emulation_register("rax", 0)
+        session.emulation_register("rip", 0x70000000)
+        state = session.emulation_run("step")
+        assert state["stopped"] == "trap" and _word(state["pc"]) == 0x70000000
+        assert _word(next(r["value"] for r in state["registers"] if r["name"] == "rax")) == 0, \
+            "rizin ran nothing there"
+    finally:
+        mgr.shutdown()
+
+
 def _wall_address(length):
     """An address for a `wx` command line of exactly ``length`` characters: its length gives the hex an
     even number of digits, and it is high enough that a write from the same address with its last digit
@@ -5805,8 +5964,15 @@ def test_export_writes_a_copy_with_the_patches_applied(rz):
     row = _patches(rz, sid)[0]
     assert path in note and "0x140001440" in note
     assert result["sha256"] in note and hashlib.sha256(original).hexdigest() in note
-    assert f"{row['before']} -> 9090" in note
+    # R72: the bytes the note calls replaced are the **file's** at the offset, not rizin's `before`
+    assert f"file {paddr:#x}  {original[paddr:paddr + 2].hex()} -> 9090" in note
     assert "UTC" in note, "the time"
+    # and where the two differ the row is named, because the copy carries the file's bytes around it.
+    # (The fake's byte model and the sample on disk are independent by construction -- the one case
+    # real rizin reaches is a patch over bytes a run changed, which the real-rizin test below pins.)
+    assert row["before"] != original[paddr:paddr + 2].hex()
+    assert "The bytes these patches replaced are not the file's (1)" in note
+    assert f"the patch replaced {row['before']}; in the file they are {original[paddr:paddr + 2].hex()}" in note
 
 
 def test_export_leaves_the_original_untouched(rz):
@@ -5948,8 +6114,11 @@ def test_export_does_not_write_what_a_run_wrote(rz):
     result = rz.send(f"/api/rizin/{sid}/export", {})
     data = open(result["path"], "rb").read()
     assert result["patched"] == 1 and result["skipped"] == [] and data[0x840] == 0x90
+    file_byte = EXPORT_SAMPLE[0x840:0x841].hex()
     assert [l for l in result["note"].splitlines() if l.startswith("  0x")] == [
-        "  0x140001440  file 0x840  00 -> 90"], "one line, for the one patch, and none for the run's row"
+        f"  0x140001440  file 0x840  {file_byte} -> 90",
+        f"  0x140001440  file 0x840  the patch replaced 00; in the file they are {file_byte}"], \
+        "one patch line, for the one patch and none for the run's row, and the row named once"
 
 
 def test_export_applies_overlapping_patches_in_the_order_they_were_made(rz):
@@ -5963,10 +6132,19 @@ def test_export_applies_overlapping_patches_in_the_order_they_were_made(rz):
     paddr = _paddr(rz, sid, 0x140001450)
     result = rz.send(f"/api/rizin/{sid}/export", {})
     assert open(result["path"], "rb").read()[paddr:paddr + 5] == bytes.fromhex("aabb223344")
+    # and the note's "before" is the **original's** bytes for both rows, not what the patch written just
+    # before it put there: the bytes are read from the untouched copy, all of them, before any is written
+    original = EXPORT_SAMPLE[paddr:paddr + 5]
+    lines = [l for l in result["note"].splitlines() if l.startswith("  0x")]
+    assert f"  0x140001451  file {paddr + 1:#x}  {original[1:5].hex()} -> 11223344" in lines, lines
+    assert f"  0x140001450  file {paddr:#x}  {original[0:2].hex()} -> aabb" in lines, lines
     # and the same address twice: the second is the one that stays
     _patch(rz, sid, addr="0x140001450", bytes="cc")
     result = rz.send(f"/api/rizin/{sid}/export", {})
     assert open(result["path"], "rb").read()[paddr:paddr + 5] == bytes.fromhex("ccbb223344")
+    lines = [l for l in result["note"].splitlines() if l.startswith("  0x")]
+    assert f"  0x140001450  file {paddr:#x}  {original[0:1].hex()} -> cc" in lines, \
+        "the third patch's line shows what the first one wrote, not the file's byte: " + str(lines)
 
 
 def test_a_second_export_replaces_the_copy_and_its_note_together(rz):
@@ -6050,12 +6228,35 @@ def test_export_does_not_prune_the_original_it_copied(rz, monkeypatch):
     assert len(left) == rz.tdc.RIZIN_UPLOADS_KEEP + 1, "the rest is pruned as for an upload, and the original is the one more"
 
 
+def test_the_note_names_a_row_the_mirror_says_was_over_a_runs_bytes(tdc):
+    """The note names a row where the file's bytes and rizin's ``before`` differ **or** where the cache's
+    own rows say a foreign write changed them (``over_run``). The second half matters on its own: the
+    mark rests on the session's mirror, and a note that fell silent when a run happened to write the
+    file's own byte back would be wrong about the copy for no good reason."""
+    session = types.SimpleNamespace(path="C:/samples/evil.exe")
+    row = {"addr": 0x140001001, "size": 1, "before": "31", "after": "90", "mine": True, "over_run": True}
+    note = tdc._rizin_export_note(session, "a" * 64, "copy.exe", "b" * 64, [(row, 0x401, "31")], [])
+    assert "  0x140001001  file 0x401  31 -> 90" in note
+    assert "The bytes these patches replaced are not the file's (1)" in note, note
+    assert "the patch replaced 31; in the file they are 31" in note, note
+    # the same row without the mark and with the same bytes is not named
+    plain = tdc._rizin_export_note(session, "a" * 64, "copy.exe", "b" * 64,
+                                   [(dict(row, over_run=False), 0x401, "31")], [])
+    assert "are not the file's" not in plain, plain
+    # and rizin's upper case, which 0.9.1 never writes, is no difference either
+    upper = tdc._rizin_export_note(session, "a" * 64, "copy.exe", "b" * 64,
+                                   [(dict(row, over_run=False, before="AB"), 0x401, "ab")], [])
+    assert "are not the file's" not in upper, upper
+
+
 def test_the_note_shortens_a_long_patch_to_a_line_that_can_be_read(rz):
     sid, _ = _export_session(rz)
     _patch(rz, sid, addr="0x140001440", bytes="ab" * 1224)
     result = rz.send(f"/api/rizin/{sid}/export", {})
     lines = [l for l in result["note"].splitlines() if l.startswith("  0x")]
-    assert len(lines) == 1 and len(lines[0]) < 200 and "(1224 bytes)" in lines[0] and "ab" * 32 in lines[0]
+    assert len(lines) == 2, lines      # the patch's own line, and the one naming the bytes it replaced
+    assert all(len(l) < 300 for l in lines) and all(l.count("(1224 bytes)") == 2 for l in lines)
+    assert "ab" * 32 in lines[0] and "ab" * 33 not in lines[0]
     assert result["patched"] == 1224
 
 
@@ -6174,6 +6375,84 @@ def test_real_rizin_exports_the_patch_at_the_physical_offset(tdc, tmp_path, monk
         api.wait_done(other, timeout=120)
         assert api.read(f"/api/rizin/{other}/hex?addr={main}&len=2")["bytes"] == [0x90, 0x90]
         assert api.read(f"/api/rizin/{other}/patches") == []
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
+@pytest.mark.skipif(not MINGW, reason="mingw (x86_64-w64-mingw32-gcc) not installed")
+def test_real_rizin_the_note_says_what_the_file_holds_under_a_patch(tdc, tmp_path, monkeypatch):
+    """R72 against rizin 0.9.1 itself: a patch set by hand over bytes a run had already changed, which is
+    what patching inside freshly decrypted code is.
+
+    Measured, and the whole reason the note is built the way it is: ``wcj`` gives as a row's ``before``
+    what stood at the address **when that write was made** -- the run's byte, not the file's. On a file
+    holding 73317331, a run's ``wx 41 @ 1`` and then a patch ``wx 90 @ 1`` give a second row with
+    ``before: "41"`` while the file still holds ``31``, and ``p8`` shows 73907331. The old note copied
+    that ``before`` and so said the file held 0x41. The bytes the run wrote are *not* in the copy, so
+    the patch really does sit in the file's own (still encrypted) bytes, and nothing but the note says so.
+
+    The bytes before the patch are written with ``wx`` rather than by a decryption routine on purpose:
+    rizin has one write cache for a run and for the console, and cannot tell them apart -- which is the
+    premise of the whole feature. The server counts the row as foreign either way (``mine: false``).
+    """
+    import rizin_sessions
+
+    allowed, uploads = tmp_path / "allowed", tmp_path / "uploads"
+    allowed.mkdir()
+    exe = allowed / "pipesim.exe"
+    shutil.copy(_build_pipesim(tmp_path), exe)
+    original = exe.read_bytes()
+    monkeypatch.setattr(rizin_sessions, "RIZIN_EXE", REAL_RIZIN)
+    monkeypatch.setattr(tdc, "_readable_roots", lambda: [str(allowed), str(uploads)])
+    monkeypatch.setattr(tdc, "RIZIN_UPLOAD_DIR", str(uploads))
+    mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(tmp_path / "projects"))
+    monkeypatch.setattr(tdc, "_rizin_manager", mgr)
+    monkeypatch.setattr(tdc, "_rizin_install", {"key": None, "value": None})
+    api = _Api(tdc, None, mgr, tmp_path)
+    try:
+        sid = api.open(str(exe))["session"]
+        api.wait_done(sid, timeout=120)
+        session = mgr.get(sid)
+        main = next(f for f in api.read(f"/api/rizin/{sid}/functions") if f["name"] == "sym.main")["offset"]
+        paddr = api.read(f"/api/rizin/{sid}/hex?addr={main}&len=4")["paddr"]
+        assert paddr is not None and bytes(api.read(
+            f"/api/rizin/{sid}/hex?addr={main}&len=4")["bytes"]) == original[paddr:paddr + 4]
+
+        # four bytes "decrypted" into .text, every one different from the file's, then a patch over the
+        # second of them -- the anti-VM check inside freshly decrypted code that this feature invites
+        api.send(f"/api/rizin/{sid}/emulation/start", {"addr": main})
+        decrypted = bytes(b ^ 0xFF for b in original[paddr:paddr + 4])
+        session.text(f"wx {decrypted.hex()} @ {main:#x}")
+        api.send(f"/api/rizin/{sid}/patch", {"addr": main + 1, "bytes": "90"})
+
+        rows = api.read(f"/api/rizin/{sid}/patches")
+        run_row = next(r for r in rows if r["addr"] == main)
+        patch_row = next(r for r in rows if r["addr"] == main + 1)
+        assert run_row["mine"] is False and run_row["over_run"] is False
+        assert patch_row["mine"] is True and patch_row["over_run"] is True, patch_row
+        assert patch_row["before"] == decrypted[1:2].hex(), "rizin's before is the run's byte"
+        assert patch_row["before"] != original[paddr + 1:paddr + 2].hex(), "and not the file's"
+
+        result = api.send(f"/api/rizin/{sid}/export", {})
+        note = result["note"]
+        was = original[paddr + 1:paddr + 2].hex()
+        assert result["patched"] == 1 and result["skipped"] == []
+        # the note says what the **file** held there, not what rizin's cache did
+        assert f"  {main + 1:#x}  file {paddr + 1:#x}  {was} -> 90" in note, note
+        assert f"{patch_row['before']} -> 90" not in note, "the run's byte is not called the file's"
+        # and it names the row, with both bytes, so the copy's state is knowable from the note alone
+        assert "The bytes these patches replaced are not the file's (1)" in note, note
+        assert f"  {main + 1:#x}  file {paddr + 1:#x}  the patch replaced {patch_row['before']}; " \
+               f"in the file they are {was}" in note, note
+
+        # the copy itself: the file's bytes everywhere but the one patched byte -- the run's three other
+        # bytes are not in it, which is why the patch sits in bytes that are still as the file has them
+        copy = open(result["path"], "rb").read()
+        assert [i for i in range(len(copy)) if copy[i] != original[i]] == [paddr + 1]
+        assert copy[paddr + 1] == 0x90
+        assert copy[paddr:paddr + 4] == original[paddr:paddr + 1] + b"\x90" + original[paddr + 2:paddr + 4]
+        assert exe.read_bytes() == original, "the original is never written"
     finally:
         mgr.shutdown()
 
