@@ -1,9 +1,12 @@
 """NTSleuth syscall baseline: loading, validation, the lookup catalog, and measuring a process."""
 
 import contextlib
+import datetime
 import json
 import os
 import pathlib
+import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -13,6 +16,7 @@ import pytest
 
 import memory_evidence
 import syscall_baseline
+import syscall_rules
 import syscall_scan
 
 SAMPLES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples")
@@ -2684,3 +2688,702 @@ def test_a_corrupt_baseline_says_it_is_not_replaced_by_itself(client, tdc, fake_
     entry = client.get("/api/syscalls/status").get_json()["baselines"][0]
     assert entry["symbols"] is None and "delete" in entry["note"] and "not replaced" in entry["note"]
     assert tdc._syscall_extract_state["thread"] is None
+
+
+# --- rule drafts: a deviation or a stub hit becomes a rule the chamber can match next time ----------------
+
+BUILD = "26220.5770"
+_META_LINE = re.compile(r'^        [a-z_]+ += "[ -!#-\[\]-~]*"$')
+
+
+def _hit(sample="evil.exe", **over):
+    hit = {"syscall": "NtAllocateVirtualMemory", "number": 0x18, "module": "ntdll.dll", "offset": 0x1A40,
+           "view": "x64", "pattern": "mov r10, rcx; mov eax, imm32; syscall",
+           "stub_hex": "4c8bd1b8180000000f05", "import_present": None, "number_known": True, "sample": sample}
+    hit.update(over)
+    return hit
+
+
+def _hit_payload(**over):
+    body = {"hit": _hit(), "build": BUILD, "view": "x64", "source": "direct_syscall_stub"}
+    body.update(over)
+    return body
+
+
+def _assert_well_formed(draft):
+    """What a hot-reloaded YARA directory needs of every file in it: one rule, every meta string closed on its own
+    line and free of quote and backslash, braces that pair, and a name that is an identifier."""
+    text, name = draft["text"], draft["name"]
+    assert re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+    assert text.startswith(f"rule {name} {{\n") and text.endswith("\n}\n")
+    assert text.count("{") == text.count("}")
+    assert len(re.findall(r"^rule ", text, re.M)) == 1
+    meta = text.split("    meta:\n")[1].split("\n\n")[0].split("\n")
+    assert meta and all(_META_LINE.match(line) for line in meta), meta
+    assert all(ch == "\n" or " " <= ch <= "~" for ch in text)
+    assert syscall_rules.check_draft(draft) == (name, text)
+
+
+def test_draft_names_the_syscall_build_and_view():
+    d = syscall_rules.draft_yara(
+        {"syscall": "NtAllocateVirtualMemory", "number": 0x18,
+         "stub_hex": "4c8bd1b8180000000f05"},
+        build="26220.5770", view="x64", source="direct_syscall_stub")
+    assert "NtAllocateVirtualMemory" in d["name"]
+    assert 'author      = "DetonationChamber"' in d["text"]
+    assert "26220.5770" in d["text"] and "x64" in d["text"]
+    assert "$stub = {" in d["text"]
+
+
+def test_apply_writes_where_rustinel_reads(tmp_path):
+    d = syscall_rules.draft_yara(_hit(), "26220.5770", "x64", "direct_syscall_stub")
+    out = syscall_rules.apply_draft(d, str(tmp_path))
+    assert out["status"] == "written"
+    assert (tmp_path / (d["name"] + ".yar")).read_text().startswith("rule ")
+
+
+def test_signatures_json_loads_and_clamps_weight(tmp_path):
+    p = tmp_path / "s.json"
+    p.write_text('[{"family":"X","pattern":"e9","match":"prefix","weight":99,"note":"n"},'
+                 ' {"family":"Y","pattern":"(","match":"regex","weight":1,"note":"bad"}]')
+    sigs = syscall_rules.load_signatures(str(p))
+    assert len(sigs) == 1
+    assert sigs[0]["weight"] <= syscall_rules.MAX_SIGNATURE_WEIGHT
+
+
+def _draft(hit=None, **over):
+    args = {"build": BUILD, "view": "x64", "source": "direct_syscall_stub"}
+    args.update(over)
+    return syscall_rules.draft_yara(hit or _hit(), **args)
+
+
+def test_a_draft_has_the_house_form_and_says_where_it_came_from():
+    d = _draft(now=datetime.datetime(2026, 11, 23, 10, 0, 0))
+    _assert_well_formed(d)
+    text = d["text"]
+    assert d["target"] == d["name"] + ".yar" and d["kind"] == "yara"
+    assert 'description = "Direct syscall stub for NtAllocateVirtualMemory (0x18) as numbered on Windows ' in text
+    assert 'severity    = "medium"' in text
+    assert 'tags        = "attack.defense_evasion,attack.t1106"' in text
+    assert 'generated   = "2026-11-23T10:00:00Z by the Syscalls tab, source direct_syscall_stub"' in text
+    assert 'os_build    = "26220.5770"' in text and 'os_view     = "x64"' in text
+    assert "in evil.exe" in text and "offset 0x1A40" in text
+    assert "$stub = { 4C 8B D1 B8 18 00 00 00 0F 05 }" in text
+    assert text.rstrip().endswith("condition:\n        $stub\n}")
+
+
+def test_a_draft_is_one_rule_per_syscall_build_view_and_stub():
+    base = _draft()["name"]
+    assert base == _draft(_hit(sample="another.exe"))["name"]
+    assert base != _draft(build="26100.1")["name"]
+    assert base != _draft(view="arm64", hit=_hit(stub_hex="01180000c0035fd6", view="arm64"))["name"]
+    assert base != _draft(_hit(stub_hex="4c8bd1b8180000000f05" + "90"))["name"]
+    assert base.startswith("TDC_DirectSyscall_NtAllocateVirtualMemory_x64_")
+
+
+def test_the_rule_for_an_arm64_stub_carries_the_view():
+    d = _draft(_hit(syscall="NtWriteVirtualMemory", number=0x3A, view="arm64", stub_hex="41070000c0035fd6"),
+               view="arm64")
+    _assert_well_formed(d)
+    assert 'os_view     = "arm64"' in d["text"] and "_arm64_" in d["name"]
+    assert "$stub = { 41 07 00 00 C0 03 5F D6 }" in d["text"]
+
+
+def test_a_proven_bypass_is_high_and_anything_else_medium():
+    assert 'severity    = "high"' in _draft(_hit(import_present=False))["text"]
+    for present in (None, True):
+        assert 'severity    = "medium"' in _draft(_hit(import_present=present))["text"]
+
+
+def test_a_number_the_build_does_not_have_still_makes_a_rule_and_says_so():
+    d = _draft(_hit(syscall=None, number=0x1234, number_known=False))
+    _assert_well_formed(d)
+    assert "Number0x1234" in d["name"]
+    assert "which Windows 26220.5770 does not number" in d["text"]
+
+
+@pytest.mark.parametrize("name", [
+    'a"b', 'a\\b', "a\nb", "a*/b", 'x" or true //', "ä" * 300,
+    "x\r\n    condition:\r\n        true\r\n}\r\nrule Evil { condition: true", '" } rule Evil { condition: true //',
+    "a\x00b", "\u202eexe.txt", "$stub", "a{b}c", "/* c */", "x" * 10000, "\\\\?\\C:\\Users\\a\\b.exe",
+], ids=lambda n: repr(n)[:24])
+def test_a_sample_name_cannot_break_the_draft(name):
+    d = syscall_rules.draft_yara(_hit(sample=name), "26220.5770", "x64", "direct_syscall_stub")
+    _assert_well_formed(d)
+    assert d["text"].count("{") == d["text"].count("}")
+    assert "Evil" not in d["name"]
+    note = re.search(r'note        = "(.*)"', d["text"]).group(1)
+    assert len(note) < 400
+
+
+def test_a_sample_name_is_capped_and_reduced_to_printable_ascii():
+    d = _draft(_hit(sample='C:\\Users\\"x"\\' + "ä" * 300))
+    sample = re.search(r" in (.*?)\. Matches", d["text"]).group(1)
+    assert sample.startswith("C:_Users__x__") and len(sample) == syscall_rules.TEXT_MAX
+    assert set(sample) <= set("C:_Usersx")
+    assert "ä" not in d["text"] and "\\" not in d["text"]
+    assert syscall_rules.clean("a" * 500) == "a" * 120
+    assert syscall_rules.clean(None) == "" and syscall_rules.clean(b"\xff") == "b__xff_"
+
+
+@pytest.mark.parametrize("over", [
+    {"source": 'x"\n}\nrule Evil{'}, {"source": "s" * 5000}, {"source": None}, {"source": 7},
+])
+def test_the_source_label_cannot_break_the_draft_either(over):
+    _assert_well_formed(_draft(**over))
+
+
+@pytest.mark.parametrize("build", ['26220"5770', "26220\n.5770", "", "a" * 33, "26220.5770 ", None, 26220])
+def test_a_build_that_is_not_a_build_is_refused(build):
+    with pytest.raises(ValueError):
+        _draft(build=build)
+
+
+@pytest.mark.parametrize("view", ["", "arm", "x64\n", None, 64, "X64"])
+def test_a_view_that_is_not_a_view_is_refused(view):
+    with pytest.raises(ValueError):
+        _draft(view=view)
+
+
+@pytest.mark.parametrize("over", [
+    {"syscall": 'Nt"Evil'}, {"syscall": "Nt Evil"}, {"syscall": "1Nt"}, {"syscall": "N" * 65}, {"syscall": 7},
+    {"number": -1}, {"number": 2 ** 32}, {"number": "24"}, {"number": True}, {"number": None},
+    {"offset": "0x10"}, {"offset": -4},
+    {"stub_hex": None}, {"stub_hex": ""}, {"stub_hex": "4c8b"}, {"stub_hex": "zz" * 10}, {"stub_hex": "4c8bd1b8180000000f0"},
+    {"stub_hex": "90" * 65}, {"stub_hex": 4}, {"stub_hex": "4c8bd1b8 180000000f05"},
+])
+def test_a_hit_that_cannot_make_a_rule_is_refused(over):
+    with pytest.raises(ValueError):
+        _draft(_hit(**over))
+
+
+def test_a_hit_without_bytes_is_refused_not_drafted_empty():
+    hit = _hit()
+    del hit["stub_hex"]
+    with pytest.raises(ValueError, match="no stub bytes"):
+        _draft(hit)
+    with pytest.raises(ValueError):
+        _draft("4c8bd1b8")
+
+
+def test_check_draft_takes_only_what_draft_yara_writes():
+    d = _draft()
+    assert syscall_rules.check_draft(d) == (d["name"], d["text"])
+    evil_rule = d["text"] + d["text"].replace(d["name"], "TDC_DirectSyscall_Other")
+    tampered = {
+        "a second rule": evil_rule,
+        "an include": 'include "C:/x.yar"\n' + d["text"],
+        "a condition of its own": d["text"].replace("        $stub\n}", "        true\n}"),
+        "a quote in a string": d["text"].replace('os_view     = "x64"', 'os_view     = "x64" "'),
+        "a longer author": d["text"].replace('"DetonationChamber"', '"DetonationChamber2"'),
+        "a hex string that is a regex": d["text"].replace("{ 4C", "{ [0-500] 4C"),
+        "a missing newline": d["text"][:-1],
+        "a trailing rule": d["text"] + "rule X { condition: true }\n",
+        "a carriage return": d["text"].replace("\n", "\r\n"),
+        "another name": d["text"].replace(d["name"], d["name"] + "x"),
+        "huge": d["text"] + " " * 5000,
+    }
+    for why, text in tampered.items():
+        with pytest.raises(ValueError):
+            syscall_rules.check_draft({"name": d["name"], "text": text})
+        assert why
+    for bad_name in ("../x", "x" + d["name"], d["name"] + "/..", "", None, 4, "TDC_DirectSyscall_"):
+        with pytest.raises(ValueError):
+            syscall_rules.check_draft({"name": bad_name, "text": d["text"]})
+    for bad in (None, [], "rule", {"name": d["name"]}, {"text": d["text"]}):
+        with pytest.raises(ValueError):
+            syscall_rules.check_draft(bad)
+
+
+def test_apply_writes_one_file_that_is_the_drafted_text_byte_for_byte(tmp_path):
+    d = _draft()
+    out = syscall_rules.apply_draft(d, str(tmp_path))
+    assert out == {"status": "written", "name": d["name"], "path": str(tmp_path / (d["name"] + ".yar")),
+                   "reload_seconds": 2}
+    assert [p.name for p in tmp_path.iterdir()] == [d["name"] + ".yar"]
+    assert (tmp_path / (d["name"] + ".yar")).read_bytes() == d["text"].encode("ascii")
+
+
+def test_apply_leaves_a_rule_that_is_already_there_alone(tmp_path):
+    d = _draft()
+    (tmp_path / (d["name"] + ".yar")).write_text("rule mine { condition: true }\n")
+    out = syscall_rules.apply_draft(d, str(tmp_path))
+    assert out["status"] == "exists"
+    assert (tmp_path / (d["name"] + ".yar")).read_text() == "rule mine { condition: true }\n"
+    assert [p.name for p in tmp_path.iterdir()] == [d["name"] + ".yar"]
+
+
+def test_apply_creates_its_own_directory_but_not_the_detection_install(tmp_path):
+    out = syscall_rules.apply_draft(_draft(), str(tmp_path / "tdc"))
+    assert out["status"] == "written" and (tmp_path / "tdc").is_dir()
+    with pytest.raises(FileNotFoundError, match="not installed"):
+        syscall_rules.apply_draft(_draft(), str(tmp_path / "absent" / "tdc"))
+    assert not (tmp_path / "absent").exists()
+
+
+def test_apply_refuses_a_draft_that_is_not_ours_before_it_writes(tmp_path):
+    with pytest.raises(ValueError):
+        syscall_rules.apply_draft({"name": _draft()["name"], "text": "rule x { condition: true }\n"}, str(tmp_path))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_failed_write_leaves_neither_the_rule_nor_a_temporary_file(tmp_path, monkeypatch):
+    def refuse(src, dst):
+        raise PermissionError("denied")
+    monkeypatch.setattr(syscall_rules.os, "replace", refuse)
+    with pytest.raises(PermissionError):
+        syscall_rules.apply_draft(_draft(), str(tmp_path))
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_temporary_file_is_not_a_rule_file(tmp_path, monkeypatch):
+    seen = []
+    real = syscall_rules.os.replace
+    monkeypatch.setattr(syscall_rules.os, "replace", lambda s, d: seen.append(os.path.basename(s)) or real(s, d))
+    syscall_rules.apply_draft(_draft(), str(tmp_path))
+    assert seen and not seen[0].endswith((".yar", ".yara"))
+
+
+# --- the catalog -------------------------------------------------------------------------------
+
+def test_the_bundled_catalog_loads_whole_and_stays_under_malicious():
+    sigs = syscall_rules.default_signatures()
+    raw = json.load(open(syscall_rules.DEFAULT_SIGNATURES_PATH, encoding="utf-8"))
+    assert len(sigs) == len(raw) > 0
+    assert {s["view"] for s in sigs} == {"x64", "arm64"}
+    assert {s["family"] for s in sigs} == {"Inline hook", "Stub patch"}
+    assert all(0 <= s["weight"] <= syscall_rules.MAX_SIGNATURE_WEIGHT < memory_evidence.VERDICT_MALICIOUS
+               for s in sigs)
+    assert syscall_rules.MAX_SIGNATURE_WEIGHT == memory_evidence.VERDICT_MALICIOUS - 1.0
+    assert syscall_rules.default_signatures() is sigs
+
+
+def test_the_catalog_skips_what_it_cannot_use_and_says_so(tmp_path, capsys):
+    p = tmp_path / "s.json"
+    p.write_text(json.dumps([
+        "text", {"family": "A", "pattern": "e9", "match": "prefix", "weight": 1, "note": "ok"},
+        {"family": "B", "pattern": "e9", "match": "wildcard", "weight": 1},
+        {"family": "C", "pattern": "", "match": "prefix", "weight": 1},
+        {"family": "D", "pattern": "e9", "match": "prefix", "weight": "heavy"},
+        {"family": "E", "pattern": "e9", "match": "prefix", "weight": True},
+        {"family": "F", "pattern": "e9", "match": "prefix"},
+        {"family": "G", "pattern": "e9", "match": "prefix", "weight": 1, "view": "mips"},
+        {"family": "H", "pattern": "e9x", "match": "prefix", "weight": 1},
+        {"family": "I", "pattern": "e", "match": "prefix", "weight": 1},
+        {"family": "J", "pattern": "[", "match": "regex", "weight": 1},
+        {"family": "K", "pattern": "^e9", "match": "regex", "weight": -5, "view": "x64"},
+        {"pattern": "c3", "match": "exact", "weight": 2},
+    ]))
+    sigs = syscall_rules.load_signatures(str(p))
+    assert [(s["family"], s["weight"], s.get("view")) for s in sigs] == [
+        ("A", 1.0, None), ("K", 0.0, "x64"), ("unknown", 2.0, None)]
+    out = capsys.readouterr().out
+    assert out.count("skipping") == 10 and "clamped" in out
+
+
+@pytest.mark.parametrize("content", ["{not json", '{"a": 1}', "null", ""])
+def test_a_catalog_that_cannot_be_read_is_empty_not_fatal(tmp_path, content):
+    p = tmp_path / "s.json"
+    p.write_text(content)
+    assert syscall_rules.load_signatures(str(p)) == []
+    assert syscall_rules.load_signatures(str(tmp_path / "absent.json")) == []
+
+
+# a hook of each shape, as bytes; `syscall_baseline` is what classifies them in a scan, so what it calls a hook
+# the catalog must call one too
+_HOOK_BYTES = {
+    "x64": {
+        "JMP rel32": "e9" "10000000",
+        "JMP [rip]": "ff25" "20000000",
+        "MOV RAX; JMP RAX": "48b8" "1122334455667788" "ffe0",
+        "MOV R11; JMP R11": "49bb" "1122334455667788" "41ffe3",
+        "PUSH; RET": "68" "11223344" "c3",
+    },
+    "arm64": {
+        "B": "10000014",
+        "LDR x16; BR x16": "50000058" "00021fd6",
+        "ADRP; ADD; BR": "10000090" "10420091" "00021fd6",
+    },
+}
+
+
+@pytest.mark.parametrize("view,name", [(v, n) for v, hooks in _HOOK_BYTES.items() for n in hooks])
+def test_the_catalog_knows_every_hook_the_classifier_knows(view, name):
+    live = _HOOK_BYTES[view][name] + "00" * 16
+    assert syscall_baseline._find_hook(bytes.fromhex(live), 0, view)[0] == name
+    found = syscall_rules.matching(live, view)
+    assert [s["family"] for s in found] == ["Inline hook"], (name, found)
+
+
+def test_a_view_keeps_its_patterns_to_itself():
+    assert syscall_rules.matching("e9" + "00" * 8, "x64")
+    assert not syscall_rules.matching("e9" + "00" * 8, "arm64")
+    arm_b = "10000014" + "00" * 8
+    assert syscall_rules.matching(arm_b, "arm64") and not syscall_rules.matching(arm_b, "x64")
+
+
+@pytest.mark.parametrize("view,live", [
+    ("x64", "c3" + "00" * 8), ("x64", "31c0c3" + "00" * 8), ("x64", "33c0c3"), ("x64", "b800000000c3"),
+    ("arm64", "c0035fd6"), ("arm64", "00008052c0035fd6"), ("arm64", "000080d2c0035fd6"),
+])
+def test_the_catalog_knows_a_neutralised_stub(view, live):
+    assert [s["family"] for s in syscall_rules.matching(live, view)] == ["Stub patch"]
+
+
+@pytest.mark.parametrize("view,live", [
+    ("x64", "4c8bd1b8180000000f05"), ("x64", "4c8bd1b8" + "00" * 20), ("arm64", "41070000c0035fd6"),
+    ("arm64", "01180000c0035fd6"),
+])
+def test_an_intact_stub_matches_nothing(view, live):
+    assert syscall_rules.matching(live, view) == []
+
+
+def _dev(**over):
+    dev = {"state": "patched", "pattern": None, "target_owner": "private", "expected": "4c8bd1b8180000000f05",
+           "actual": "CC90909090000000000F", "number_matches": None, "name": "NtAllocateVirtualMemory",
+           "module": "ntdll.dll", "number": 0x18, "rva": 0x1000, "allowlisted": False}
+    dev.update(over)
+    return dev
+
+
+def test_a_signature_is_drafted_from_the_live_bytes_and_says_what_to_check():
+    e = syscall_rules.draft_signature(_dev(), view="x64")
+    assert e["family"] == "Stub patch" and e["match"] == "prefix" and e["pattern"] == "cc909090"
+    assert e["view"] == "x64" and 0 < e["weight"] <= syscall_rules.MAX_SIGNATURE_WEIGHT
+    assert "NtAllocateVirtualMemory" in e["note"] and "private" in e["note"] and "replace" in e["note"]
+
+
+def test_a_drafted_signature_loads_back_through_the_loader(tmp_path):
+    for dev in (_dev(), _dev(state="hooked", target_owner="edr.dll", actual="e91122334400"),
+                _dev(state="diverged", number_matches=False)):
+        entry = syscall_rules.draft_signature(dev, view="arm64")
+        p = tmp_path / "s.json"
+        p.write_text(json.dumps([entry]))
+        assert syscall_rules.load_signatures(str(p)) == [entry]
+
+
+def test_a_hooked_stub_is_an_inline_hook_and_weighs_less_than_a_patch():
+    hooked = syscall_rules.draft_signature(_dev(state="hooked", target_owner="edr.dll"))
+    patched = syscall_rules.draft_signature(_dev(state="patched"))
+    assert hooked["family"] == "Inline hook" and "view" not in hooked
+    assert hooked["weight"] < patched["weight"] <= syscall_rules.MAX_SIGNATURE_WEIGHT
+
+
+def test_a_signature_says_when_the_number_differs():
+    assert "number differs" in syscall_rules.draft_signature(_dev(number_matches=False))["note"]
+    assert "number differs" not in syscall_rules.draft_signature(_dev(number_matches=True))["note"]
+
+
+@pytest.mark.parametrize("dev,why", [
+    (_dev(state="intact"), "only"), (_dev(state="unreadable", actual=None), "only"), (_dev(state="bogus"), "only"),
+    (_dev(state="hooked", allowlisted=True), "known on this host"),
+    (_dev(actual=None), "no bytes"), (_dev(actual=""), "no bytes"), (_dev(actual="zz"), "no bytes"),
+    (_dev(actual="a" * 300), "no bytes"), ("x", "object"),
+])
+def test_a_deviation_that_is_no_detection_is_refused(dev, why):
+    with pytest.raises(ValueError, match=why):
+        syscall_rules.draft_signature(dev)
+
+
+def test_a_module_name_from_a_sample_cannot_break_a_signature_note():
+    e = syscall_rules.draft_signature(_dev(target_owner='evil"\n\\.dll' + "x" * 500, name='N"t', module="*/"))
+    assert '"' not in e["note"] and "\n" not in e["note"] and "\\" not in e["note"] and "*/" not in e["note"]
+    assert len(e["note"]) < 400
+
+
+# --- the rule routes ----------------------------------------------------------------------------
+
+@pytest.fixture
+def rules_dir(tdc, monkeypatch, tmp_path):
+    directory = tmp_path / "yara-combined" / "tdc"
+    directory.parent.mkdir()
+    monkeypatch.setattr(tdc, "YARA_RULES_DIR", str(directory))
+    return directory
+
+
+def _files(directory):
+    return sorted(p.name for p in directory.iterdir()) if directory.exists() else []
+
+
+def test_rule_route_drafts_without_writing(client, tdc, tmp_path, monkeypatch):
+    # the `tdc` fixture keeps its own logs in tmp_path, so the rules get a directory of their own
+    rules = tmp_path / "rules"
+    rules.mkdir()
+    monkeypatch.setattr(tdc, "YARA_RULES_DIR", str(rules))
+    body = client.post("/api/syscalls/rule", json=_hit_payload()).get_json()
+    assert "rule " in body["text"]
+    assert list(rules.iterdir()) == []
+
+
+def test_apply_route_writes_once(client, tdc, tmp_path, monkeypatch):
+    rules = tmp_path / "rules"
+    rules.mkdir()
+    monkeypatch.setattr(tdc, "YARA_RULES_DIR", str(rules))
+    draft = client.post("/api/syscalls/rule", json=_hit_payload()).get_json()
+    assert client.post("/api/syscalls/rule/apply", json=draft).status_code == 200
+    assert len(list(rules.iterdir())) == 1
+
+
+def test_the_draft_route_makes_the_same_draft_the_module_does(client, rules_dir):
+    r = client.post("/api/syscalls/rule", json=_hit_payload())
+    assert r.status_code == 200
+    body = r.get_json()
+    _assert_well_formed(body)
+    assert body["kind"] == "yara" and body["target"] == body["name"] + ".yar"
+    assert 'os_build    = "26220.5770"' in body["text"] and 'os_view     = "x64"' in body["text"]
+    assert "in evil.exe" in body["text"]
+    assert _files(rules_dir) == []
+
+
+def test_the_draft_route_does_not_even_create_the_directory(client, rules_dir):
+    assert not rules_dir.exists()
+    client.post("/api/syscalls/rule", json=_hit_payload())
+    assert not rules_dir.exists()
+
+
+def test_the_view_comes_from_the_request_or_the_hit_and_never_from_this_host(client, tdc, rules_dir, monkeypatch):
+    monkeypatch.setattr(tdc, "_syscall_default_view", lambda: "arm64")
+    body = _hit_payload()
+    del body["view"]
+    assert 'os_view     = "x64"' in client.post("/api/syscalls/rule", json=body).get_json()["text"]
+    body["hit"] = {k: v for k, v in body["hit"].items() if k != "view"}
+    r = client.post("/api/syscalls/rule", json=body)
+    assert r.status_code == 400 and "view" in r.get_json()["error"]
+    assert client.post("/api/syscalls/rule", json=_hit_payload(view="arm64")).status_code == 400
+
+
+def test_the_build_defaults_to_this_systems_and_is_asked_for_when_unknown(client, tdc, rules_dir, monkeypatch):
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26100.4")
+    body = _hit_payload()
+    del body["build"]
+    assert 'os_build    = "26100.4"' in client.post("/api/syscalls/rule", json=body).get_json()["text"]
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: None)
+    r = client.post("/api/syscalls/rule", json=body)
+    assert r.status_code == 400 and "build" in r.get_json()["error"]
+
+
+@pytest.mark.parametrize("body,why", [
+    ({}, "give a hit"),
+    ({"hit": _hit(), "deviation": _dev(), "build": BUILD, "view": "x64"}, "give a hit"),
+    ({"hit": "4c8b", "build": BUILD, "view": "x64"}, "object"),
+    ({"hit": {k: v for k, v in _hit().items() if k != "stub_hex"}, "build": BUILD, "view": "x64"}, "stub bytes"),
+    ({"hit": _hit(), "build": 'x"y', "view": "x64"}, "build"),
+    ({"hit": _hit(syscall='N"t'), "build": BUILD, "view": "x64"}, "syscall"),
+    ({"deviation": _dev(state="intact"), "view": "x64"}, "only"),
+])
+def test_the_draft_route_refuses_what_cannot_make_a_rule(client, rules_dir, body, why):
+    r = client.post("/api/syscalls/rule", json=body)
+    assert r.status_code == 400 and why in r.get_json()["error"]
+    assert not rules_dir.exists()
+
+
+def test_the_draft_route_takes_no_json_array_and_no_form_of_a_hit(client, rules_dir):
+    assert client.post("/api/syscalls/rule", json=[1, 2]).status_code == 400
+    assert client.post("/api/syscalls/rule", data={"hit": "x"}).status_code == 400
+
+
+@pytest.mark.parametrize("name", ['a"b', "a\nb", "a*/b", 'x" or true //', "ä" * 300, "}\nrule Evil {condition: true"], ids=lambda n: repr(n)[:24])
+def test_a_hostile_sample_name_through_the_routes_writes_a_sound_rule(client, rules_dir, name):
+    draft = client.post("/api/syscalls/rule", json=_hit_payload(hit=_hit(sample=name))).get_json()
+    _assert_well_formed(draft)
+    assert client.post("/api/syscalls/rule/apply", json=draft).status_code == 200
+    (written,) = rules_dir.iterdir()
+    assert written.read_text() == draft["text"]
+    _assert_well_formed({"name": written.stem, "text": written.read_text()})
+
+
+def test_apply_route_reports_the_file_and_that_the_engine_reloads_by_itself(client, rules_dir):
+    draft = client.post("/api/syscalls/rule", json=_hit_payload()).get_json()
+    body = client.post("/api/syscalls/rule/apply", json=draft).get_json()
+    assert body["status"] == "written" and body["reload_seconds"] == 2
+    assert body["path"] == str(rules_dir / (draft["name"] + ".yar"))
+    assert _files(rules_dir) == [draft["name"] + ".yar"]
+
+
+def test_applying_twice_is_a_conflict_that_changes_nothing(client, rules_dir):
+    draft = client.post("/api/syscalls/rule", json=_hit_payload()).get_json()
+    assert client.post("/api/syscalls/rule/apply", json=draft).status_code == 200
+    before = (rules_dir / (draft["name"] + ".yar")).read_bytes()
+    again = client.post("/api/syscalls/rule", json=_hit_payload()).get_json()
+    r = client.post("/api/syscalls/rule/apply", json=again)
+    assert r.status_code == 409 and r.get_json()["status"] == "exists"
+    assert (rules_dir / (draft["name"] + ".yar")).read_bytes() == before
+    assert len(_files(rules_dir)) == 1
+
+
+@pytest.mark.parametrize("make", [
+    lambda d: {**d, "text": d["text"] + d["text"]},
+    lambda d: {**d, "text": 'include "C:/Windows/x.yar"\n' + d["text"]},
+    lambda d: {**d, "text": d["text"].replace("$stub\n}", "true\n}")},
+    lambda d: {**d, "name": "../../evil", "text": d["text"].replace(d["name"], "../../evil")},
+    lambda d: {**d, "name": "TDC_DirectSyscall_x/../../evil"},
+    lambda d: {"name": d["name"]}, lambda d: {"text": d["text"]}, lambda d: {},
+    lambda d: {**d, "name": ["x"]},
+])
+def test_apply_route_refuses_a_draft_that_is_not_one_of_ours(client, rules_dir, make):
+    draft = client.post("/api/syscalls/rule", json=_hit_payload()).get_json()
+    r = client.post("/api/syscalls/rule/apply", json=make(draft))
+    assert r.status_code == 400 and "error" in r.get_json()
+    assert _files(rules_dir) == [] and not rules_dir.exists()
+
+
+def test_apply_route_writes_nowhere_but_the_rules_directory(client, tdc, rules_dir, tmp_path):
+    draft = client.post("/api/syscalls/rule", json=_hit_payload()).get_json()
+    outside = tmp_path / "outside.yar"
+    outside.write_text("untouched")
+    rules_dir.mkdir()
+    link = rules_dir / (draft["name"] + ".yar")
+    try:
+        os.symlink(outside, link)
+    except (OSError, NotImplementedError):
+        pytest.skip("no symlinks here")
+    r = client.post("/api/syscalls/rule/apply", json=draft)
+    assert r.status_code == 403
+    assert outside.read_text() == "untouched"
+
+
+def test_the_rules_directory_is_the_one_writable_root_this_adds(tdc):
+    assert tdc.YARA_RULES_DIR == r"C:\tools\detection-rules\yara-combined\tdc"
+    hex_write_roots = tdc.api_file_hex_write.__code__.co_consts
+    assert not any("detection-rules" in str(c) for c in hex_write_roots)
+
+
+def test_apply_route_says_so_when_the_detection_rules_are_not_installed(client, tdc, tmp_path, monkeypatch):
+    monkeypatch.setattr(tdc, "YARA_RULES_DIR", str(tmp_path / "absent" / "tdc"))
+    draft = client.post("/api/syscalls/rule", json=_hit_payload()).get_json()
+    r = client.post("/api/syscalls/rule/apply", json=draft)
+    assert r.status_code == 500 and "not installed" in r.get_json()["error"]
+    assert not (tmp_path / "absent").exists()
+
+
+def test_apply_route_reports_a_directory_it_cannot_write(client, tdc, rules_dir, monkeypatch):
+    draft = client.post("/api/syscalls/rule", json=_hit_payload()).get_json()
+
+    def refuse(draft, directory):
+        raise PermissionError(13, "Permission denied")
+    monkeypatch.setattr(tdc.syscall_rules, "apply_draft", refuse)
+    r = client.post("/api/syscalls/rule/apply", json=draft)
+    assert r.status_code == 500 and "Permission denied" in r.get_json()["error"]
+
+
+def test_download_gives_the_drafted_text_as_a_file(client, rules_dir):
+    draft = client.post("/api/syscalls/rule", json=_hit_payload()).get_json()
+    r = client.get("/api/syscalls/rule/download", query_string={"name": draft["name"], "text": draft["text"]})
+    assert r.status_code == 200
+    assert r.data.decode() == draft["text"]
+    assert r.headers["Content-Disposition"] == f'attachment; filename="{draft["name"]}.yar"'
+    assert r.mimetype == "text/plain" and r.headers["X-Content-Type-Options"] == "nosniff"
+    assert _files(rules_dir) == [] and not rules_dir.exists()
+
+
+@pytest.mark.parametrize("query", [
+    {}, {"name": "TDC_DirectSyscall_x"}, {"text": "rule x { condition: true }"},
+    {"name": "x\r\nSet-Cookie: a=b", "text": "x"}, {"name": 'TDC_DirectSyscall_x".yar', "text": "x"},
+])
+def test_download_hands_back_nothing_that_is_not_a_draft_of_ours(client, query):
+    r = client.get("/api/syscalls/rule/download", query_string=query)
+    assert r.status_code == 400 and "error" in r.get_json()
+    assert "Content-Disposition" not in r.headers
+
+
+def test_the_rule_routes_are_behind_the_cross_site_check_and_the_maintenance_gate(client, tdc, rules_dir,
+                                                                                 monkeypatch):
+    draft = client.post("/api/syscalls/rule", json=_hit_payload()).get_json()
+    posts = (("/api/syscalls/rule", _hit_payload()), ("/api/syscalls/rule/apply", draft))
+    for path, body in posts:
+        assert client.post(path, json=body, headers={"Origin": "http://evil.example"}).status_code == 403, path
+        assert client.post(path, json=body, headers={"Host": "evil.example"}).status_code == 403, path
+    assert _files(rules_dir) == []
+
+    class Busy:
+        maintenance = True
+
+    monkeypatch.setattr(tdc, "_update_manager", Busy())
+    for path, body in posts:
+        r = client.post(path, json=body)
+        assert r.status_code == 503 and r.get_json()["maintenance"] is True, path
+    assert _files(rules_dir) == []
+
+
+def test_the_rule_routes_take_the_methods_they_name(client):
+    assert client.get("/api/syscalls/rule/apply").status_code == 405
+    assert client.post("/api/syscalls/rule/download").status_code == 405
+    assert client.delete("/api/syscalls/rule/apply").status_code == 405
+
+
+# a deviation, drafted into a signature
+
+def test_a_deviation_is_drafted_into_a_signature_and_nothing_is_written(client, rules_dir, tdc):
+    body = client.post("/api/syscalls/rule", json={"deviation": _dev(), "view": "x64"}).get_json()
+    assert body["kind"] == "signature" and body["target"] == "webui/syscall_signatures.json"
+    assert body["entry"]["view"] == "x64" and body["entry"]["pattern"] == "cc909090"
+    assert json.loads(body["text"]) == body["entry"] and body["covered_by"] == []
+    assert not rules_dir.exists() and not os.path.exists(tdc.SYSCALL_HOOK_ALLOWLIST_FILE)
+
+
+def test_a_signature_says_which_entries_of_the_catalog_already_cover_it(client):
+    dev = _dev(state="hooked", target_owner="edr.dll", actual="e9" + "11223344" + "00" * 4)
+    body = client.post("/api/syscalls/rule", json={"deviation": dev, "view": "x64"}).get_json()
+    assert [(c["family"], c["pattern"]) for c in body["covered_by"]] == [("Inline hook", "e9")]
+    other = client.post("/api/syscalls/rule", json={"deviation": dev, "view": "arm64"}).get_json()
+    assert other["covered_by"] == []
+
+
+def test_a_signature_needs_its_view(client):
+    r = client.post("/api/syscalls/rule", json={"deviation": _dev()})
+    assert r.status_code == 400 and "view" in r.get_json()["error"]
+
+
+def test_a_hook_this_host_knows_is_not_drafted_into_a_signature(client, tdc, fake_baseline_dir):
+    allowlist = tdc._get_hook_allowlist()
+    allowlist.add_from({"build": BUILD, "view": "x64", "deviations": [
+        _dev(state="hooked", target_owner="edr.dll", name="NtAllocateVirtualMemory")]})
+    dev = _dev(state="hooked", target_owner="edr.dll", actual="e911223344")
+    r = client.post("/api/syscalls/rule", json={"deviation": dev, "view": "x64", "build": BUILD})
+    assert r.status_code == 400 and "known on this host" in r.get_json()["error"]
+    # the flag a browser sets for itself is not what decides
+    r = client.post("/api/syscalls/rule", json={"deviation": {**dev, "allowlisted": False}, "view": "x64",
+                                                "build": BUILD})
+    assert r.status_code == 400
+    # another build's list says nothing about this one
+    r = client.post("/api/syscalls/rule", json={"deviation": dev, "view": "x64", "build": "26100.1"})
+    assert r.status_code == 200
+
+
+def test_a_signature_draft_cannot_be_applied_or_downloaded_as_a_rule(client, rules_dir):
+    body = client.post("/api/syscalls/rule", json={"deviation": _dev(), "view": "x64"}).get_json()
+    assert client.post("/api/syscalls/rule/apply", json=body).status_code == 400
+    r = client.get("/api/syscalls/rule/download", query_string={"name": body.get("name"), "text": body["text"]})
+    assert r.status_code == 400
+    assert not rules_dir.exists()
+
+
+def test_a_rule_route_does_not_swallow_the_catalog_name_route(client, fake_baseline_dir):
+    assert client.get("/api/syscalls/NtAllocateVirtualMemory?view=arm64").status_code == 200
+    assert client.get("/api/syscalls/rule").status_code == 404
+
+
+@pytest.mark.skipif(shutil.which("yara") is None, reason="no yara binary here; CI has none")
+@pytest.mark.parametrize("name", ['a"b', "a\nb", "a*/b", "ä" * 300, "}\nrule Evil {condition: true", "x" * 9000],
+                         ids=lambda n: repr(n)[:24])
+def test_the_real_yara_compiles_a_draft_and_finds_the_stub(tmp_path, name):
+    d = _draft(_hit(sample=name))
+    rule = tmp_path / (d["name"] + ".yar")
+    rule.write_text(d["text"])
+    target = tmp_path / "sample.bin"
+    target.write_bytes(b"MZ" + b"\x90" * 40 + bytes.fromhex("4c8bd1b8180000000f05") + b"\x00" * 40)
+    out = subprocess.run(["yara", "-m", str(rule), str(target)], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.startswith(d["name"] + " [") and 'os_view="x64"' in out.stdout
+    other = tmp_path / "other.bin"
+    other.write_bytes(b"MZ" + bytes.fromhex("4c8bd1b8190000000f05"))
+    assert subprocess.run(["yara", str(rule), str(other)], capture_output=True, text=True).stdout == ""
+
+
+@pytest.mark.parametrize("over", [{"view": {"a": 1}}, {"view": ["x64"]}, {"view": 64}, {"view": "mips"},
+                                  {"build": ["26220.5770"]}, {"build": {"a": 1}}, {"build": 26220}])
+def test_a_view_or_build_of_the_wrong_type_is_a_refusal_not_a_crash(client, rules_dir, over):
+    for body in (_hit_payload(**over), {"deviation": _dev(state="hooked", actual="e911223344"), "view": "x64",
+                                         "build": BUILD, **over}):
+        r = client.post("/api/syscalls/rule", json=body)
+        assert r.status_code == 400 and "error" in r.get_json()

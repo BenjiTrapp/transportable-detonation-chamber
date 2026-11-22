@@ -29,7 +29,7 @@ import subprocess
 import sys
 import weakref
 from pathlib import Path
-from flask import Flask, render_template, jsonify, request, send_from_directory, g, has_request_context
+from flask import Flask, render_template, jsonify, request, send_from_directory, g, has_request_context, Response
 from werkzeug.utils import secure_filename
 import requests
 
@@ -38,6 +38,7 @@ import requests
 import memory_evidence
 # Syscall baseline (NTSleuth) and the measurement of a process against it, for the SYSCALLS tab.
 import syscall_baseline
+import syscall_rules
 import syscall_scan
 import pipe_analysis
 import pipe_proxy
@@ -307,6 +308,10 @@ NTSLEUTH_DIR = r"C:\tools\ntsleuth"
 NTSLEUTH_BASELINE_DIR = os.path.join(NTSLEUTH_DIR, "baseline")
 # Hooks seen on this host while it was considered clean; see syscall_scan.HookAllowlist.
 SYSCALL_HOOK_ALLOWLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "syscall_hook_allowlist.json")
+# Rustinel reads its YARA rules from yara-combined (install-detection-rules.ps1) and reloads them when a file changes.
+# `tdc` is ours: the only directory a rule drafted in the SYSCALLS tab is written to. Not Aether's rules directory,
+# which the upstream clone replaces.
+YARA_RULES_DIR = r"C:\tools\detection-rules\yara-combined\tdc"
 
 
 def _decode_console(raw):
@@ -8349,6 +8354,91 @@ def api_syscalls_hook_baseline_clear():
     except OSError as exc:
         return jsonify({"error": f"cannot write the hook allowlist: {exc}"}), 500
     return jsonify({"ok": True, "entries": len(allowlist.entries())})
+
+
+def _draft_error(exc):
+    """A refusal of the rule module, as a route error. Its messages name what is wrong, never what the request held."""
+    return _SyscallRouteError(str(exc))
+
+
+@app.route("/api/syscalls/rule", methods=["POST"])
+def api_syscalls_rule():
+    """Draft a detection rule from what the tab observed, and write nothing.
+
+    Params: `hit` (a stub found outside ntdll, as /api/syscalls/stubs lists it; it may carry `sample`), with `build`
+    (default: this system's), `view` (this one or the hit's own, never guessed) and `source`: a YARA rule. Or
+    `deviation` (a stub measured in ntdll) with `view`: an entry for syscall_signatures.json, to be added by hand.
+    A rule is applied, or downloaded, as a second step."""
+    data = _syscall_body()
+    hit, deviation = data.get("hit"), data.get("deviation")
+    if (hit is None) == (deviation is None):
+        raise _SyscallRouteError("give a hit (a stub found outside ntdll) or a deviation (a stub measured in ntdll)")
+    subject = hit if hit is not None else deviation
+    if not isinstance(subject, dict):
+        raise _SyscallRouteError("the hit or deviation must be an object")
+    view = data.get("view") if data.get("view") not in (None, "") else subject.get("view")
+    if hit is not None and data.get("view") not in (None, "") and subject.get("view") not in (None, data.get("view")):
+        raise _SyscallRouteError("the view of the request and the view of the hit differ")
+    if view in (None, ""):
+        raise _SyscallRouteError("give the view the rule is for: arm64, x64 or x86")
+    if not isinstance(view, str) or view not in SYSCALL_VIEWS:
+        raise _SyscallRouteError("view must be one of " + ", ".join(SYSCALL_VIEWS))
+    build = data.get("build") if data.get("build") not in (None, "") else _current_os_build()
+    if build is not None and not isinstance(build, str):
+        raise _SyscallRouteError("build must be a string like 26220.5770")
+    try:
+        if hit is not None:
+            if not build:
+                raise _SyscallRouteError("the build of this system is unknown: give the build the rule is for")
+            return jsonify(syscall_rules.draft_yara(hit, build, view, data.get("source") or "direct_syscall_stub"))
+        if (deviation.get("state") == syscall_baseline.STATE_HOOKED and build
+                and _get_hook_allowlist().knows(str(deviation.get("name")), deviation.get("target_owner"), build, view)):
+            deviation = {**deviation, "allowlisted": True}
+        entry = syscall_rules.draft_signature(deviation, view)
+    except ValueError as exc:
+        raise _draft_error(exc) from None
+    covered = syscall_rules.matching(deviation["actual"], view)
+    return jsonify({"kind": "signature", "entry": entry, "text": json.dumps(entry, indent=2),
+                    "target": "webui/syscall_signatures.json",
+                    "covered_by": [{"family": c["family"], "pattern": c["pattern"], "match": c["match"]}
+                                   for c in covered]})
+
+
+@app.route("/api/syscalls/rule/apply", methods=["POST"])
+def api_syscalls_rule_apply():
+    """Write a drafted YARA rule where Rustinel reads its rules; it takes effect within about two seconds.
+
+    The body is the draft as /api/syscalls/rule returned it. Only a rule of exactly that form is written, one file
+    named after the rule, into YARA_RULES_DIR and nowhere else. A rule of that name already there is a 409."""
+    draft = _syscall_body()
+    try:
+        name, _ = syscall_rules.check_draft(draft)
+    except ValueError as exc:
+        raise _draft_error(exc) from None
+    if not _path_within(os.path.join(YARA_RULES_DIR, name + ".yar"), [YARA_RULES_DIR]):
+        return jsonify({"error": "Access denied: write not allowed to this path", "allowed": [YARA_RULES_DIR]}), 403
+    try:
+        result = syscall_rules.apply_draft(draft, YARA_RULES_DIR)
+    except ValueError as exc:
+        raise _draft_error(exc) from None
+    except OSError as exc:
+        return jsonify({"error": f"cannot write the rule into {YARA_RULES_DIR}: {exc.strerror or exc}"}), 500
+    if result["status"] == "exists":
+        return jsonify({**result, "error": "a rule of this name is already there: it is the same stub, build and "
+                                           "view, and was left alone"}), 409
+    return jsonify(result)
+
+
+@app.route("/api/syscalls/rule/download", methods=["GET"])
+def api_syscalls_rule_download():
+    """A drafted YARA rule as a file, to be committed under rules/yara/: the copy written by /apply is lost with
+    this VM. Params: `name` and `text`, as the draft route returned them (checked, then handed back as they are)."""
+    try:
+        name, text = syscall_rules.check_draft({"name": request.args.get("name"), "text": request.args.get("text")})
+    except ValueError as exc:
+        raise _draft_error(exc) from None
+    return Response(text, mimetype="text/plain",
+                    headers={"Content-Disposition": f'attachment; filename="{name}.yar"'})
 
 
 # --- Memory dumping: Process Dump ---

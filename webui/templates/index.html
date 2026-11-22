@@ -1600,6 +1600,9 @@
                             <tr><td class="api-post">POST</td><td><code>/api/syscalls/scan</code></td><td>Measure the syscall stubs of a PID against the baseline. Params: <code>pid</code>, <code>modules</code></td></tr>
                             <tr><td class="api-post">POST</td><td><code>/api/syscalls/stubs</code></td><td>Syscall stubs outside ntdll, in a PID or a file. Params: <code>pid</code> or <code>path</code> with <code>view</code></td></tr>
                             <tr><td class="api-get">GET</td><td><code>/api/syscalls/hook-baseline</code></td><td>Known hooks (also <code>POST</code> to record a PID's hooks on a clean host, <code>DELETE</code> to forget)</td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/syscalls/rule</code></td><td>Draft a YARA rule from a stub hit, or a signature from a deviation. Writes nothing. Params: <code>hit</code> or <code>deviation</code>, <code>view</code>, <code>build</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/syscalls/rule/apply</code></td><td>Write a YARA draft where Rustinel reads its rules; loaded within about two seconds</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/syscalls/rule/download</code></td><td>A YARA draft as a file for <code>rules/yara/</code>. Params: <code>name</code>, <code>text</code></td></tr>
                         </tbody>
                     </table>
 

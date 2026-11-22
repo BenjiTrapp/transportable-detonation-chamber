@@ -147,6 +147,8 @@ transportable-detonation-chamber/
 │   ├── pipe_sessions/             # Ended interception recordings (git-ignored)
 │   ├── syscall_baseline.py        # SYSCALLS tab: NTSleuth baseline (syscall numbers, RVAs, stubs) and its catalog
 │   ├── syscall_scan.py            # SYSCALLS tab: a process's live stubs read (read-only) and measured against the baseline
+│   ├── syscall_rules.py           # SYSCALLS tab: YARA rules and signature entries drafted from a stub or a deviation, applied on request
+│   ├── syscall_signatures.json    # Syscall hook and patch patterns (inline hooks, neutralised stubs), per view
 │   ├── log_search.py              # LOGS tab: SPL-like search language (parser, evaluator, pipes)
 │   ├── log_store.py               # LOGS tab: event ring buffer, source parsers, incremental collector
 │   ├── logs/                      # Persisted access and MCP logs, JSONL (git-ignored)
