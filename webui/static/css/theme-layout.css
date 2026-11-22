@@ -2335,6 +2335,71 @@
 [data-theme] .rizin-xref-fn {
     color: var(--cp-text);
 }
+/* The EMULATION pane in the colours of the run strip (orange: the PC and what changed), the dock's cyan heads and the
+   rows of the lists; the hand-made group in green, the run's in orange */
+[data-theme] .rizin-emu-pane {
+    font-family: var(--cp-font-label);
+}
+[data-theme] .rizin-emu-head {
+    font-family: var(--cp-font-label);
+    color: var(--cp-cyan);
+}
+[data-theme] .rizin-emu-head b {
+    color: var(--cp-magenta);
+}
+[data-theme] .rizin-emu-reg {
+    color: var(--cp-text-muted);
+}
+[data-theme] .rizin-emu-reg.changed {
+    border-left-color: var(--cp-orange);
+}
+[data-theme] .rizin-emu-reg-name,
+[data-theme] .rizin-emu-fn,
+[data-theme] .rizin-emu-subhead {
+    color: var(--cp-text);
+}
+[data-theme] .rizin-emu-delta {
+    color: var(--cp-orange);
+}
+[data-theme] .rizin-emu-reg-input {
+    font-family: var(--cp-font-label);
+    color: var(--cp-cyan);
+    border-color: rgba(var(--cp-magenta-rgb), .22);
+}
+[data-theme] .rizin-emu-hint,
+[data-theme] .rizin-emu-warn,
+[data-theme] .rizin-emu-urgent,
+[data-theme] .rizin-emu-note-wait {
+    color: var(--cp-amber);
+}
+[data-theme] .rizin-emu-bytes {
+    color: var(--cp-gold);
+}
+[data-theme] .rizin-emu-group {
+    border-left-color: var(--cp-line);
+}
+[data-theme] .rizin-emu-hand {
+    border-left-color: var(--cp-green);
+}
+[data-theme] .rizin-emu-run {
+    border-left-color: var(--cp-orange);
+}
+[data-theme] .rizin-emu-fate {
+    color: var(--cp-text-dim);
+}
+[data-theme] .rizin-emu-run .rizin-emu-fate {
+    color: var(--cp-orange);
+}
+[data-theme] .rizin-emu-note,
+[data-theme] .rizin-emu-export {
+    color: var(--cp-text-muted);
+}
+[data-theme] .rizin-emu-export {
+    border-color: var(--cp-line);
+}
+[data-theme] .rizin-emu-note-error {
+    color: var(--cp-red);
+}
 [data-theme] .rizin-menu {
     background: var(--cp-card);
     border: 1px solid rgba(var(--cp-magenta-rgb), .45);

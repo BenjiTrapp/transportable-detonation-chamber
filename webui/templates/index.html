@@ -19,8 +19,8 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=82">
-    <link rel="stylesheet" href="/static/css/theme-layout.css?v=6">
+    <link rel="stylesheet" href="/static/css/style.css?v=83">
+    <link rel="stylesheet" href="/static/css/theme-layout.css?v=7">
     <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=36">
 </head>
 <body>
@@ -1211,6 +1211,7 @@
                                 <button type="button" class="rizin-tab" role="tab" aria-selected="false" aria-controls="rizin-xrefs" data-rizin-tab="xrefs">XREFS</button>
                                 <button type="button" class="rizin-tab" role="tab" aria-selected="false" aria-controls="rizin-strings" data-rizin-tab="strings">STRINGS</button>
                                 <button type="button" class="rizin-tab" role="tab" aria-selected="false" aria-controls="rizin-imports" data-rizin-tab="imports">IMPORTS</button>
+                                <button type="button" class="rizin-tab" role="tab" aria-selected="false" aria-controls="rizin-emulation" data-rizin-tab="emulation">EMULATION</button>
                             </div>
                             <span class="rizin-dock-note" data-info="The console runs rizin commands where the views are and moves them when it seeks; ↑ ↓ walk the history and Tab completes commands and names. XREFS, STRINGS and IMPORTS list references, strings and imports: a click jumps there, and an import shows its references."><span id="rizin-dock-note">follows the views</span></span>
                             <div class="rizin-dock-tools rizin-quick" id="rizin-quick" data-rizin-tools="console" role="toolbar" aria-label="Quick commands" onclick="rizinOnQuickClick(event)">
@@ -1247,6 +1248,10 @@
                             <div class="rizin-view rizin-xrefs" id="rizin-xrefs" role="tabpanel" data-rizin-pane="xrefs" hidden onclick="rizinOnDockClick(event, 'xrefs')"></div>
                             <div class="rizin-view rizin-list" id="rizin-strings" role="tabpanel" data-rizin-pane="strings" hidden onclick="rizinOnDockClick(event, 'strings')"></div>
                             <div class="rizin-view rizin-list" id="rizin-imports" role="tabpanel" data-rizin-pane="imports" hidden onclick="rizinOnDockClick(event, 'imports')"></div>
+                            <!-- EMULATION: registers (each one editable), the stack, the breakpoints and the patches in the two groups
+                                 that decide what survives the session (rizinRenderEmuPane); one delegated handler each for clicks
+                                 and for a register field that was changed -->
+                            <div class="rizin-view rizin-emu-pane" id="rizin-emulation" role="tabpanel" data-rizin-pane="emulation" hidden onclick="rizinOnEmuPaneClick(event)" onchange="rizinOnEmuPaneChange(event)"></div>
                         </div>
                     </section>
                 </div>
@@ -1793,6 +1798,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
     </div>
 
-    <script src="/static/js/app.js?v=121"></script>
+    <script src="/static/js/app.js?v=122"></script>
 </body>
 </html>

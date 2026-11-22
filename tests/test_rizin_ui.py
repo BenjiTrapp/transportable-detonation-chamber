@@ -138,10 +138,15 @@ RIZIN_FUNCTIONS = [
     "rizinRenderPcMarks", "rizinMovePc", "rizinEmuAtCall", "rizinEmuAssist", "rizinEmuPost", "rizinEmuStart",
     "rizinEmuStop", "rizinEmuRun", "rizinEmuSkipCall", "rizinEmuGoToPc", "rizinEmuLeave", "rizinLoadEmulation",
     "rizinOnRunClick",
+    # The EMULATION pane (Task 11): the registers, the stack, the breakpoints and the patches in their two groups
+    "rizinEmuRowAddr", "rizinEmuFunctionAt", "rizinEmuBytes", "rizinEmuNotes", "rizinEmuRegistersHtml",
+    "rizinEmuStackHtml", "rizinEmuBreakpointsHtml", "rizinEmuPatchesHtml", "rizinEmuPaneHtml", "rizinRenderEmuPane",
+    "rizinLoadEmuPane", "rizinEmuPaneSay", "rizinOnEmuPaneClick", "rizinOnEmuPaneChange", "rizinSetRegister",
+    "rizinUnpatch", "rizinUnbreak", "rizinReanalyze", "rizinExportPatched", "rizinEmuEmpty", "rizinEmuHandSignature",
 ]
 RIZIN_CONSTS = ["rizinState", "RIZIN_POLL_MS", "RIZIN_HISTORY_MAX", "RIZIN_TAB_KEY", "RIZIN_VIEWS", "RIZIN_GRAPH",
                 "RIZIN_GRAPH_OVERVIEW", "RIZIN_NARROW_PX", "RIZIN_ANSI", "RIZIN_CONSOLE", "RIZIN_CONSOLE_COMMANDS",
-                "RIZIN_PAGE", "RIZIN_FILTER_MS", "RIZIN_DOCK", "RIZIN_HEX_LEN", "RIZIN_MORE", "RIZIN_C_WORDS", "RIZIN_EMU"]
+                "RIZIN_PAGE", "RIZIN_FILTER_MS", "RIZIN_DOCK", "RIZIN_HEX_LEN", "RIZIN_MORE", "RIZIN_C_WORDS", "RIZIN_EMU", "RIZIN_EMU_PANE"]
 RIZIN_LETS = []
 HELPERS = ["escapeHtml", "jsArg", "jsInt", "cssToken", "formatSize"]
 
@@ -793,7 +798,7 @@ def test_rizin_tab_layout_and_themes():
            "rizin-seek", "rizin-go", "rizin-back", "rizin-forward", "rizin-work", "rizin-functions", "rizin-fn-fold",
            "rizin-fn-filter", "rizin-fn-list", "rizin-fn-count", "rizin-center", "rizin-code", "rizin-code-title",
            "rizin-disasm", "rizin-decompiler", "rizin-hex", "rizin-split", "rizin-graph-half", "rizin-graph",
-           "rizin-dock", "rizin-console", "rizin-xrefs", "rizin-strings", "rizin-imports",
+           "rizin-dock", "rizin-console", "rizin-xrefs", "rizin-strings", "rizin-imports", "rizin-emulation",
            "rizin-emu-start", "rizin-run", "rizin-run-pc", "rizin-run-regs", "rizin-run-why", "rizin-run-assist",
            "rizin-run-stop", "rizin-run-gotopc"]
     at = [tab.find(f'id="{i}"') for i in ids]
@@ -813,9 +818,9 @@ def test_rizin_tab_layout_and_themes():
     assert re.findall(r'data-rizin-act="(\w+)"', tab) == ["gotopc", "stop"]
     assert not re.search(r'>\s*(BACK|UNTIL)\s*<', tab, re.I)
     assert re.findall(r'data-rizin-tab="(\w+)"', tab) == ["disasm", "decompiler", "hex", "graph", "console", "xrefs",
-                                                          "strings", "imports"]
+                                                          "strings", "imports", "emulation"]
     assert re.findall(r'data-rizin-tab="\w+"[^>]*>([^<]+)<', tab) == ["DISASSEMBLY", "DECOMPILER", "HEX", "GRAPH",
-                                                                     "CONSOLE", "XREFS", "STRINGS", "IMPORTS"]
+                                                                     "CONSOLE", "XREFS", "STRINGS", "IMPORTS", "EMULATION"]
     assert re.search(r'<h2 data-info="[^"]+">Rizin</h2>', tab)
     for handler in ('onclick="rizinOnFunctionClick(event)"', 'onclick="rizinOnDisasmClick(event)"'):
         assert handler in tab, "clicks in the lists go to one delegated handler"
@@ -1109,6 +1114,66 @@ function serve(sid, s) {
         if (body.value !== null) s.emu.rax = body.value;
         return [200, { ...emuRead(s.emu, 'step'), summary: `skipped the call at ${body.addr}` }, s.callDelay ?? 1];
     });
+    // Task 11: the EMULATION pane. s.patches [{addr, size, before, after, mine}] and s.breakpoints [{addr, enabled}] are
+    // rizin's (integers, as the routes answer them); s.emu.more are registers beyond the four, s.emu.stack the stack
+    // rows. Hooks patchesAnswer, breakpointsAnswer, unpatch, unbreak, setRegister, exportCopy and reanalyze answer instead; the
+    // delays listDelay and actDelay.
+    const rows = list => (list || []).map(row => ({ ...row }));
+    on('GET', `/api/rizin/${sid}/patches`, url => {
+        if (s.ended) return ENDED;
+        return (s.patchesAnswer && s.patchesAnswer(s)) || [200, rows(s.patches), s.listDelay ?? 1];
+    });
+    on('GET', `/api/rizin/${sid}/breakpoints`, url => {
+        if (s.ended) return ENDED;
+        return (s.breakpointsAnswer && s.breakpointsAnswer(s)) || [200, rows(s.breakpoints), s.listDelay ?? 1];
+    });
+    on('DELETE', `/api/rizin/${sid}/patch`, (url, body) => {
+        if (s.ended) return ENDED;
+        const scripted = s.unpatch && s.unpatch(body, s);
+        if (scripted) return scripted;
+        const at = body && body.addr !== undefined ? parseInt(body.addr, 16) : null;
+        s.patches = at === null ? [] : (s.patches || []).filter(p => !(p.addr <= at && at < p.addr + p.size));
+        return [200, { patches: rows(s.patches) }, s.actDelay ?? 1];
+    });
+    on('DELETE', `/api/rizin/${sid}/breakpoints`, (url, body) => {
+        if (s.ended) return ENDED;
+        const scripted = s.unbreak && s.unbreak(body, s);
+        if (scripted) return scripted;
+        const at = body && body.addr !== undefined ? parseInt(body.addr, 16) : null;
+        s.breakpoints = at === null ? [] : (s.breakpoints || []).filter(b => b.addr !== at);
+        return [200, { breakpoints: rows(s.breakpoints) }, s.actDelay ?? 1];
+    });
+    on('POST', `/api/rizin/${sid}/emulation/register`, (url, body) => {
+        if (s.ended) return ENDED;
+        const scripted = s.setRegister && s.setRegister(body, s);
+        if (scripted) return scripted;
+        if (!s.emu) return notStarted;
+        const extra = (s.emu.more || []).find(m => m.name === body.name);
+        if (!extra && !['rax', 'rbx', 'rcx', 'rip'].includes(body.name)) return [400, { refused: `no register named '${body.name}'` }];
+        if (!/^0x[0-9a-f]{1,16}$/i.test(String(body.value))) return [400, { refused: `'${body.value}' is no number` }];
+        if (extra) extra.value = body.value;
+        else if (body.name === 'rip') s.emu.pc = body.value.length <= 14 ? parseInt(body.value, 16) : body.value;
+        else s.emu[body.name] = body.value;
+        s.emu.changed = [body.name];
+        return [200, emuRead(s.emu), s.actDelay ?? 1];
+    });
+    on('POST', `/api/rizin/${sid}/export`, () => {
+        if (s.ended) return ENDED;
+        const scripted = s.exportCopy && s.exportCopy(s);
+        if (scripted) return scripted;
+        const mine = (s.patches || []).filter(p => p.mine);
+        if (!mine.length) return [400, { refused: 'no patches to export: only patches set by hand go into the copy' }];
+        return [200, { path: 'C:\\Temp\\rizin_uploads\\0123456789abcdef_e.patched.exe', name: '0123456789abcdef_e.patched.exe',
+                       sha256: 'ab'.repeat(32), patched: mine.reduce((n, p) => n + p.size, 0), skipped: s.skipped || [],
+                       note: 'Patched copy made by TDC (RIZIN tab).\nOriginal: C:\\x\\e.exe\n' }, s.actDelay ?? 1];
+    });
+    on('POST', `/api/rizin/${sid}/reanalyze`, (url, body) => {
+        if (s.ended) return ENDED;
+        const scripted = s.reanalyze && s.reanalyze(body, s);
+        if (scripted) return scripted;
+        if (!(s.patches || []).some(p => !p.mine)) return [400, { refused: 'the run wrote nothing to analyse' }];
+        return [200, { start: 0x140001521, end: 0x140001522, functions: 1, strings: 2 }, s.actDelay ?? 1];
+    });
 }
 // The emulation of serve(): the registers as the state lists them (rip is the PC), and a run's move over
 // the instructions of the function the PC is in
@@ -1117,8 +1182,9 @@ function serve(sid, s) {
 const word = v => (typeof v === 'string' || v === null ? v : '0x' + v.toString(16));
 const emuRead = (e, stopped = null) => ({
     running: true, pc: word(e.pc), registers: [{ name: 'rax', value: word(e.rax) }, { name: 'rbx', value: word(e.rbx) },
-                                               { name: 'rcx', value: word(e.rcx) }, { name: 'rip', value: word(e.pc) }],
-    changed: [...e.changed], stack: [], stopped, arch: 'x86', bits: 64 });
+                                               { name: 'rcx', value: word(e.rcx) }, { name: 'rip', value: word(e.pc) },
+                                               ...(e.more || [])],
+    changed: [...e.changed], stack: e.stack ?? [], stopped, arch: 'x86', bits: 64 });
 function emuMove(e, kind, addr) {
     const ops = OPS[fnAt(e.pc)?.name] || [], at = ops.findIndex(o => o.offset === e.pc);
     let to = ops[at + 1];
@@ -3681,7 +3747,8 @@ def test_rizin_console_completions_pass_the_allowlist():
 DOCK_THEMED = [".rizin-dock-grip", ".rizin-dock-note", ".rizin-console-out", ".rizin-console-line", ".rizin-prompt",
                ".rizin-console-input", ".rizin-console-cmd", ".rizin-console-typed", ".rizin-quick .rizin-tool", ".rizin-row",
                ".rizin-row.current", ".rizin-xrefs-head", ".rizin-xref", ".rizin-pager", ".rizin-menu", ".rizin-menu-item",
-               ".rizin-menu-head"]
+               ".rizin-menu-head", ".rizin-emu-pane", ".rizin-emu-head", ".rizin-emu-reg", ".rizin-emu-fn", ".rizin-emu-group",
+               ".rizin-emu-note"]
 ANSI_NAMES = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white", "gray", "bright-red", "bright-green",
               "bright-yellow", "bright-blue", "bright-magenta", "bright-cyan", "bright-white"]
 
@@ -3692,7 +3759,7 @@ def test_rizin_dock_layout_and_themes():
     ids = ["rizin-dock-grip", "rizin-dock-fold", "rizin-dock-note", "rizin-dock-body", "rizin-quick", "rizin-console-out",
            "rizin-prompt", "rizin-console-input", "rizin-strings-filter", "rizin-strings-pager", "rizin-strings-prev",
            "rizin-strings-next", "rizin-imports-filter", "rizin-imports-pager", "rizin-imports-prev", "rizin-imports-next",
-           "rizin-menu", "rizin-menu-head", "rizin-menu-items", "rizin-menu-rename", "rizin-menu-comment", "rizin-menu-form",
+           "rizin-emulation", "rizin-menu", "rizin-menu-head", "rizin-menu-items", "rizin-menu-rename", "rizin-menu-comment", "rizin-menu-form",
            "rizin-menu-label", "rizin-menu-input", "rizin-menu-save", "rizin-menu-note"]
     missing = [i for i in ids if f'id="{i}"' not in tab]
     assert not missing, missing
@@ -3704,6 +3771,7 @@ def test_rizin_dock_layout_and_themes():
                     'oncontextmenu="rizinOnContextMenu(event, \'graph\')"', 'onkeydown="rizinOnConsoleKey(event)"',
                     'onclick="rizinOnQuickClick(event)"', 'onclick="rizinOnDockClick(event, \'xrefs\')"',
                     'onclick="rizinOnDockClick(event, \'strings\')"', 'onclick="rizinOnDockClick(event, \'imports\')"',
+                    'onclick="rizinOnEmuPaneClick(event)"', 'onchange="rizinOnEmuPaneChange(event)"',
                     'onclick="rizinOnMenuClick(event)"', 'onkeydown="rizinOnMenuKey(event)"'):
         assert handler in tab, f"{handler}: one delegated handler per list"
     placeholder = re.search(r'id="rizin-console-input"[^>]*placeholder="([^"]+)"', tab).group(1)
@@ -5876,3 +5944,663 @@ def test_rizin_run_strip_styles():
     media = re.search(r"@media \(max-width: 1400px\)\s*\{\s*\.rizin-run\b", text)
     assert media, "no rule for the strip below 1400 px"
     assert "style.css?v=81" not in _read(INDEX_HTML)
+
+
+# --- Task 11: the EMULATION pane of the dock -------------------------------------------------------
+#
+# Registers (each one editable), the stack, the breakpoints and the patches, the patches in two groups that decide
+# what survives the session. The pane draws the registers, the stack and the PC from rizinState.emu (the state the run
+# strip draws from: it asks the route for nothing) and fetches only /patches and /breakpoints, itself.
+
+# The emulation started at 0x1400014bc with a stack and the lists filled, then one step; showPane() opens the tab.
+# The patches: two set by hand, two that the run wrote (the stack's words are no row of them: rizin's cache holds them,
+# but they are the run's all the same, and one is enough here)
+EMU_PANE_SETUP = EMU_SETUP + r"""
+    const pane = $('rizin-emulation');
+    const text = el => el.textContent.replace(/\s+/g, ' ').trim();
+    const attr = (el, name) => el.getAttribute(name);
+    const note = () => (pane.querySelector('.rizin-emu-notice') ? text(pane.querySelector('.rizin-emu-notice')) : '');
+    const group = name => pane.querySelector(`[data-rizin-group="${name}"]`);
+    const acts = el => el.querySelectorAll('button').map(b => attr(b, 'data-rizin-act'));
+    const PATCHES = () => [
+        { addr: 0x1400014c0, size: 2, before: '7405', after: '9090', mine: true },
+        { addr: 0x1400014d0, size: 1, before: '75', after: '74', mine: true },
+        { addr: 0x140001521, size: 1, before: '00', after: '41', mine: false },
+        { addr: 0x140001522, size: 1, before: '00', after: '42', mine: false },
+    ];
+    const BREAKPOINTS = () => [{ addr: 0x140001490, enabled: true }, { addr: 0x1400014b7, enabled: true }];
+    const STACK = () => [{ addr: '0x7ffc0000', value: '0x140001490', hint: 'sym.watchdog + 0x4' },
+                         { addr: '0x7ffc0008', value: '0x0', hint: null },
+                         { addr: '0x7ffc0010', value: '0x7ff7a1b2c3d4e5f6', hint: null }];
+    const fill = async () => {
+        S.patches = PATCHES(); S.breakpoints = BREAKPOINTS();
+        await startAt('0x1400014bc');
+        Object.assign(S.emu, { more: [{ name: 'rsp', value: '0x7ffc0000' }], stack: STACK() });
+        await press(run('step'));
+    };
+    const showPane = async () => {
+        click(tab('emulation'));
+        await until(() => rizinState.views.dock === 'emulation' && pane.querySelector('[data-rizin-section]'), 'the pane'); await quiet();
+    };
+    const reg = name => pane.querySelectorAll('[data-rizin-reg]').find(i => attr(i, 'data-rizin-reg') === name);
+    // A register field typed into, as a browser delivers it: the new value, then change
+    const typeInto = async (name, value) => { const input = reg(name); input.value = value; dispatch('change', input); await quiet(); };
+"""
+
+
+@needs_node
+def test_rizin_emulation_pane_shows_registers_stack_breakpoints_and_patches():
+    # all four sections render from one state; a click on a stack row, a breakpoint row
+    # or a patch row seeks to its data-addr
+    r = _scripted(EMU_PANE_SETUP + r"""
+        await fill();
+        const state = rizinState.emu, from = calls.length;
+        await showPane();
+        r.reads = { emulation: gets(from, '/emulation').length, patches: gets(from, '/patches').map(c => c[1]),
+                    breakpoints: gets(from, '/breakpoints').map(c => c[1]), sameState: rizinState.emu === state };
+        r.sections = pane.querySelectorAll('[data-rizin-section]').map(e => attr(e, 'data-rizin-section'));
+        r.heads = pane.querySelectorAll('.rizin-emu-head').map(text);
+        r.dockNote = $('rizin-dock-note').textContent;
+        r.registers = pane.querySelectorAll('[data-rizin-reg]').map(i => [attr(i, 'data-rizin-reg'), i.value]);
+        r.changed = pane.querySelectorAll('.rizin-emu-reg.changed').map(e => attr(e.querySelector('[data-rizin-reg]'), 'data-rizin-reg'));
+        r.deltas = pane.querySelectorAll('.rizin-emu-reg').map(e => [attr(e.querySelector('[data-rizin-reg]'), 'data-rizin-reg'),
+                                                                    e.querySelector('.rizin-emu-delta').textContent]);
+        r.stack = pane.querySelectorAll('.rizin-emu-stack').map(e => [attr(e, 'data-addr'), text(e)]);
+        r.breakpoints = pane.querySelectorAll('.rizin-emu-bp').map(e => [attr(e, 'data-addr'), text(e)]);
+        r.patches = pane.querySelectorAll('.rizin-emu-patch').map(e => [attr(e, 'data-addr'), text(e)]);
+        const seekOf = async (el, want) => {
+            const f = calls.length;
+            click(el);
+            await until(() => rizinState.seek === want, 'a seek to ' + want); await quiet();
+            return posts(f, '/seek').map(c => c[2].addr);
+        };
+        r.clicks = [
+            await seekOf(pane.querySelector('.rizin-emu-stack'), '0x7ffc0000'),
+            await seekOf(pane.querySelector('.rizin-emu-stack [data-addr="0x140001490"]'), '0x140001490'),
+            await seekOf(pane.querySelector('.rizin-emu-bp[data-addr="0x1400014b7"]'), '0x1400014b7'),
+            await seekOf(pane.querySelector('.rizin-emu-patch[data-addr="0x140001521"]'), '0x140001521'),
+        ];
+        // a click in a register field jumps nowhere
+        const f = calls.length;
+        click(reg('rax')); await tick(20);
+        r.regClick = posts(f, '/seek').length;
+        // the pane's rows after the clicks are the same rows (a seek draws the pane again, and asks for no list)
+        r.after = { patches: gets(from, '/patches').length, breakpoints: gets(from, '/breakpoints').length,
+                    emulation: gets(from, '/emulation').length };
+    """)
+    assert "error" not in r, r.get("error")
+    assert r["reads"] == {"emulation": 0, "patches": ["/api/rizin/S1/patches"], "breakpoints": ["/api/rizin/S1/breakpoints"],
+                          "sameState": True}, "the pane asked the emulation route (R57), or the lists twice: " + str(r["reads"])
+    assert r["sections"] == ["registers", "stack", "breakpoints", "patches"]
+    assert r["heads"] == ["REGISTERS 5 · Δ 2 changed", "STACK from rsp", "BREAKPOINTS 2", "PATCHES"], r["heads"]
+    assert "register" in r["dockNote"], "the dock's note says nothing of the pane's fields: " + r["dockNote"]
+    assert r["registers"] == [["rax", "0x1"], ["rbx", "0x0"], ["rcx", "0x0"], ["rip", "0x1400014be"], ["rsp", "0x7ffc0000"]], \
+        "every register of the state, in rizin's order, each in an editable field"
+    assert r["changed"] == ["rax", "rip"], "the registers the last step changed"
+    assert dict(r["deltas"]) == {"rax": "Δ", "rbx": "", "rcx": "", "rip": "Δ", "rsp": ""}, "the sign of a changed register"
+    assert [row[0] for row in r["stack"]] == ["0x7ffc0000", "0x7ffc0008", "0x7ffc0010"]
+    assert "0x140001490" in r["stack"][0][1] and "sym.watchdog + 0x4" in r["stack"][0][1], r["stack"][0]
+    assert "0x0" in r["stack"][1][1]
+    assert "0x7ff7a1b2c3d4e5f6" in r["stack"][2][1], "a 64-bit stack word came back inexact (a double holds 0x7ff7a1b2c3d4e400)"
+    assert [row[0] for row in r["breakpoints"]] == ["0x140001490", "0x1400014b7"]
+    assert "sym.watchdog" in r["breakpoints"][0][1] and "sym.main" in r["breakpoints"][1][1], r["breakpoints"]
+    assert [row[0] for row in r["patches"]] == ["0x1400014c0", "0x1400014d0", "0x140001521", "0x140001522"]
+    assert "7405" in r["patches"][0][1] and "9090" in r["patches"][0][1] and "sym.main" in r["patches"][0][1], r["patches"][0]
+    assert r["clicks"] == [["0x7ffc0000"], ["0x140001490"], ["0x1400014b7"], ["0x140001521"]], r["clicks"]
+    assert r["regClick"] == 0, "a click in a register field jumped"
+    assert r["after"] == {"patches": 1, "breakpoints": 1, "emulation": 0}, r["after"]
+
+
+@needs_node
+def test_rizin_emulation_pane_separates_my_patches_from_what_the_run_wrote():
+    # mine:true rows sit under the hand-made heading with Export and Take all back;
+    # mine:false rows sit under their own heading, which says they end with the session,
+    # and Export is not offered there
+    r = _scripted(EMU_PANE_SETUP + r"""
+        await fill(); await showPane();
+        const hand = group('hand'), runG = group('run');
+        r.order = pane.querySelectorAll('[data-rizin-group]').map(e => attr(e, 'data-rizin-group'));
+        r.apart = [hand !== runG, !hand.contains(runG), !runG.contains(hand), hand.className !== runG.className];
+        r.hand = { rows: addrs(hand, '.rizin-emu-patch'), acts: acts(hand), head: text(hand.querySelector('.rizin-emu-subhead')) };
+        r.run = { rows: addrs(runG, '.rizin-emu-patch'), acts: acts(runG), head: text(runG.querySelector('.rizin-emu-subhead')),
+                  warn: text(runG.querySelector('.rizin-emu-warn')) };
+        r.exports = pane.querySelectorAll('[data-rizin-act="export"]').map(b => hand.contains(b));
+        r.reanalyse = pane.querySelectorAll('[data-rizin-act="reanalyze"]').map(b => runG.contains(b));
+        r.takeAll = pane.querySelectorAll('[data-rizin-act="unpatch-all"]').map(b => hand.contains(b));
+        r.rowButtons = [hand, runG].map(g => g.querySelectorAll('.rizin-emu-patch [data-rizin-act="unpatch"]').length);
+        // Nothing by hand: Export and Take all back are off, the group says so; nothing from a run: Re-analyse is off
+        S.patches = PATCHES().filter(p => !p.mine);
+        await rizinLoadEmuPane(true);
+        r.noHand = { export: pane.querySelector('[data-rizin-act="export"]').hasAttribute('disabled'),
+                     takeAll: pane.querySelector('[data-rizin-act="unpatch-all"]').hasAttribute('disabled'),
+                     text: text(group('hand')), run: addrs(group('run'), '.rizin-emu-patch') };
+        S.patches = PATCHES().filter(p => p.mine);
+        await rizinLoadEmuPane(true);
+        r.noRun = { reanalyze: pane.querySelector('[data-rizin-act="reanalyze"]').hasAttribute('disabled'), text: text(group('run')),
+                    export: pane.querySelector('[data-rizin-act="export"]').hasAttribute('disabled') };
+        // A run that wrote a byte at a time (a decryption loop): the rows are capped, and the rest is counted, not hidden
+        const many = RIZIN_EMU_PANE.rows + 30;
+        S.patches = PATCHES().filter(p => p.mine).concat(Array.from({ length: many }, (_, i) => ({ addr: 0x140002000 + i, size: 1, before: '00', after: '41', mine: false })));
+        await rizinLoadEmuPane(true);
+        r.many = { rows: pane.querySelectorAll('[data-rizin-group="run"] .rizin-emu-patch').length, cap: RIZIN_EMU_PANE.rows,
+                  head: text(group('run').querySelector('.rizin-emu-subhead')), more: text(group('run').querySelector('.rizin-emu-empty')) };
+    """)
+    assert "error" not in r, r.get("error")
+    assert r["order"] == ["hand", "run"], "the hand-made group first"
+    assert r["apart"] == [True, True, True, True], "the two groups are one element, or look the same"
+    assert r["hand"]["rows"] == ["0x1400014c0", "0x1400014d0"], "only the rows with mine: true under the hand-made heading"
+    assert "by hand" in r["hand"]["head"].lower(), r["hand"]["head"]
+    assert r["hand"]["acts"] == ["export", "unpatch-all", "unpatch", "unpatch"], r["hand"]["acts"]
+    assert r["run"]["rows"] == ["0x140001521", "0x140001522"], "only the rows with mine: false under the run's heading"
+    assert "run" in r["run"]["head"].lower() and "end with the session" in r["run"]["head"].lower(), r["run"]["head"]
+    assert re.search(r"end with the session", r["run"]["warn"], re.I) and "not saved" in r["run"]["warn"], r["run"]["warn"]
+    assert r["run"]["acts"] == ["reanalyze"], "the run's group carries Re-analyse and nothing that exports or takes back"
+    assert r["exports"] == [True], "Export is offered once, and on the hand-made group"
+    assert r["reanalyse"] == [True] and r["takeAll"] == [True]
+    assert r["rowButtons"] == [2, 0], "a row of the hand-made group takes itself back, a row of the run's does not"
+    assert r["noHand"]["export"] is True and r["noHand"]["takeAll"] is True, "Export offered with nothing to export"
+    assert "nothing" in r["noHand"]["text"].lower() and r["noHand"]["run"] == ["0x140001521", "0x140001522"], r["noHand"]
+    assert r["many"]["rows"] == r["many"]["cap"] and f"{r['many']['cap'] + 30} B" in r["many"]["head"] \
+        and "+30 more" in r["many"]["more"], "the run's rows are not capped, or the cap is not said: " + str(r["many"])
+    assert r["noRun"]["reanalyze"] is True and r["noRun"]["export"] is False and "nothing" in r["noRun"]["text"].lower(), r["noRun"]
+
+
+@needs_node
+def test_rizin_emulation_pane_edits_a_register_and_takes_a_patch_back():
+    # typing into a register field posts /emulation/register, taking a patch back posts
+    # DELETE /patch with that addr, and both re-read the state afterwards
+    # (the register's POST answers with the state too, but it is the route's GET that fills rizinState.emu: R57)
+    r = _scripted(EMU_PANE_SETUP + r"""
+        await fill(); await showPane();
+        const asks = [];
+        let sure = true;
+        globalThis.confirm = question => { asks.push(question); return sure; };
+        // A bad address takes nothing back, and not everything: that is the call without an address
+        let f = calls.length;
+        await rizinUnpatch('banana'); await rizinUnpatch(null); await rizinUnpatch(''); await tick(20);
+        r.badAddr = [calls.slice(f).filter(c => c[0] === 'DELETE').length, asks.length];
+        // R52: a 64-bit word goes out as the string typed (normalised by rizinHex) and comes back exact: a double
+        // holds 0x7ff7a1b2c3d4e400 for it
+        f = calls.length;
+        await typeInto('rax', '0x7ff7a1b2c3d4e5f6');
+        r.exact = { posts: posts(f, '/emulation/register').map(c => c[2]), reads: gets(f, '/emulation').length,
+                    state: rizinState.emu.registers.find(x => x.name === 'rax').value, field: reg('rax').value,
+                    changed: pane.querySelectorAll('.rizin-emu-reg.changed').map(e => attr(e.querySelector('[data-rizin-reg]'), 'data-rizin-reg')) };
+        // A decimal word above 2^53 goes through BigInt, not Number
+        f = calls.length;
+        await typeInto('rbx', '18446744073709551615');
+        r.decimal = { posts: posts(f, '/emulation/register').map(c => c[2]), field: reg('rbx').value };
+        // What is no number is not sent, and is said
+        f = calls.length;
+        await typeInto('rcx', 'banana');
+        r.bad = { posts: posts(f, '/emulation/register').length, said: note() };
+        // A refusal of the server is said, and the state stays
+        S.setRegister = () => [400, { refused: "no register named 'rcx'" }];
+        await typeInto('rcx', '0x5');
+        S.setRegister = undefined;
+        r.refused = { said: note(), rcx: rizinState.emu.registers.find(x => x.name === 'rcx').value };
+        // A run in flight: nothing is set (the server answers one request at a time), and it is said
+        f = calls.length;
+        rizinState.emuWait = 'step';
+        await typeInto('rcx', '0x7');
+        rizinState.emuWait = '';
+        r.waiting = { posts: posts(f, '/emulation/register').length, said: note() };
+        // rip is the PC: the views follow it
+        f = calls.length;
+        await typeInto('rip', '0x140001521');
+        await until(() => rizinState.seek === '0x140001521', 'the views follow rip'); await quiet();
+        r.rip = { posts: posts(f, '/emulation/register').map(c => c[2]), seeks: posts(f, '/seek').map(c => c[2].addr), pc: rizinEmuPc() };
+        // A word the state cannot give is a "?" in the field, never an empty one
+        S.emuRun = () => [200, { ...emuRead(S.emu, 'step'), changed: [], registers: [{ name: 'rax', value: null }, { name: 'rbx', value: 'banana' }] }];
+        await press(run('step'));
+        S.emuRun = undefined;
+        r.unreadable = [reg('rax').value, reg('rbx').value];
+        await press(run('step'));
+        // Taking a patch back: DELETE /patch with that addr; the row goes, and the state is read again
+        f = calls.length;
+        click(pane.querySelector('.rizin-emu-patch[data-addr="0x1400014c0"] [data-rizin-act="unpatch"]'));
+        await until(() => !pane.querySelector('.rizin-emu-patch[data-addr="0x1400014c0"]'), 'the row goes'); await quiet();
+        const del = calls.slice(f).filter(c => c[0] === 'DELETE');
+        r.takeBack = { deletes: del.map(c => [c[1].replace('/api/rizin/S1', ''), c[2]]), reads: gets(f, '/emulation').length,
+                       hand: addrs(group('hand'), '.rizin-emu-patch'), run: addrs(group('run'), '.rizin-emu-patch'), asked: asks.length,
+                       said: note() };
+        // Take all back with the run's bytes in the cache asks first, and what was said no is no request
+        f = calls.length;
+        sure = false;
+        click(pane.querySelector('[data-rizin-act="unpatch-all"]')); await quiet();
+        r.declined = { deletes: calls.slice(f).filter(c => c[0] === 'DELETE').length, asked: asks.length, question: asks[0] || '',
+                       rows: pane.querySelectorAll('.rizin-emu-patch').length };
+        sure = true;
+        click(pane.querySelector('[data-rizin-act="unpatch-all"]'));
+        await until(() => !pane.querySelector('.rizin-emu-patch'), 'everything is taken back'); await quiet();
+        r.all = { deletes: calls.slice(f).filter(c => c[0] === 'DELETE').map(c => c[2]), rows: pane.querySelectorAll('.rizin-emu-patch').length,
+                  asked: asks.length };
+    """)
+    assert "error" not in r, r.get("error")
+    exact = r["exact"]
+    assert exact["posts"] == [{"name": "rax", "value": "0x7ff7a1b2c3d4e5f6"}], "the word was sent as a number or changed: " + str(exact)
+    assert exact["state"] == "0x7ff7a1b2c3d4e5f6" and exact["field"] == "0x7ff7a1b2c3d4e5f6", \
+        "the register came back inexact (a double holds 0x7ff7a1b2c3d4e400)"
+    assert exact["reads"] == 1, "the state was not read again after the register was set"
+    assert exact["changed"] == ["rax"], "the register just set is marked as changed"
+    assert r["decimal"] == {"posts": [{"name": "rbx", "value": "0xffffffffffffffff"}], "field": "0xffffffffffffffff"}, r["decimal"]
+    assert r["bad"]["posts"] == 0 and "banana" in r["bad"]["said"] and "no number" in r["bad"]["said"], r["bad"]
+    assert "no register named" in r["refused"]["said"] and r["refused"]["rcx"] == "0x0", r["refused"]
+    assert r["waiting"]["posts"] == 0 and "waits" in r["waiting"]["said"], r["waiting"]
+    assert r["unreadable"] == ["?", "?"], r["unreadable"]
+    assert r["rip"]["posts"] == [{"name": "rip", "value": "0x140001521"}] and r["rip"]["seeks"] == ["0x140001521"]
+    assert r["rip"]["pc"] == "0x140001521", "the PC did not move with rip"
+    take = r["takeBack"]
+    assert take["deletes"] == [["/patch", {"addr": "0x1400014c0"}]], take["deletes"]
+    assert take["reads"] == 1, "the state was not read again after the patch was taken back"
+    assert take["hand"] == ["0x1400014d0"] and take["run"] == ["0x140001521", "0x140001522"], "the other rows stayed"
+    assert take["asked"] == 0, "taking one patch back asked"
+    assert r["declined"]["deletes"] == 0 and r["declined"]["rows"] == 3, "a declined Take all back went out"
+    assert "run" in r["declined"]["question"] and "2" in r["declined"]["question"], \
+        "Take all back also drops what the run wrote (rizin has one cache): the question says so: " + r["declined"]["question"]
+    assert r["all"] == {"deletes": [{}], "rows": 0, "asked": 2}, r["all"]
+    assert r["badAddr"] == [0, 0], "a bad address took a patch (or all of them) back"
+
+
+@needs_node
+def test_rizin_emulation_pane_escapes_hostile_names():
+    # a stack hint and a patch row whose function name is `</script><img onerror=…>`
+    # produce no tag and no on* attribute in the pane
+    r = _scripted(EMU_PANE_SETUP + r"""
+        const HOSTILE = '</script><img src=x onerror=alert(1)>', QUOTE = 'x" onmouseover="alert(1)';
+        await fill();
+        S.emu.stack = [{ addr: '0x7ffc0000', value: '0x140001490', hint: HOSTILE }, { addr: '0x7ffc0008', value: '0x1', hint: QUOTE }];
+        S.emu.more = [{ name: HOSTILE, value: '0x1' }, { name: QUOTE, value: '0x2' }];
+        S.exportCopy = () => [200, { path: 'C:\\x\\' + HOSTILE, name: HOSTILE, sha256: 'ab'.repeat(32), patched: 3, skipped: [0x50000010],
+                                     note: HOSTILE + '\nOriginal: ' + QUOTE + '\n' }];
+        rizinState.functions = [{ name: HOSTILE, offset: 0x1400014b7, size: 0x600, nbbs: 1 },
+                                { name: QUOTE, offset: 0x140001490, size: 38, nbbs: 1 }];
+        rizinState.analysis = { ...rizinState.analysis, note: 'Restored: ' + HOSTILE };
+        await press(run('step'));
+        await showPane();
+        await rizinExportPatched(); await quiet();
+        const all = pane.querySelectorAll('*');
+        r.tags = all.map(e => e.tagName).filter(t => ['IMG', 'SCRIPT', 'IFRAME', 'SVG'].includes(t));
+        r.on = all.flatMap(e => Object.keys(e.attrs).filter(k => k.startsWith('on')));
+        r.attrNames = [...new Set(all.flatMap(e => Object.keys(e.attrs)))].sort();
+        r.shown = { hostile: text(pane).includes(HOSTILE), quote: text(pane).includes(QUOTE) };
+        r.where = {
+            stack: pane.querySelectorAll('.rizin-emu-stack').map(e => text(e).includes(HOSTILE) || text(e).includes(QUOTE)),
+            patch: text(pane.querySelector('.rizin-emu-patch')).includes(HOSTILE),
+            bp: text(pane.querySelector('.rizin-emu-bp')).includes(QUOTE),
+            reg: pane.querySelectorAll('[data-rizin-reg]').map(i => attr(i, 'data-rizin-reg')).filter(n => n === HOSTILE || n === QUOTE).length,
+            note: text(pane).includes('Restored: ' + HOSTILE),
+            exported: text(pane.querySelector('.rizin-emu-export')).includes(HOSTILE),
+        };
+        // the register field of a hostile name sends that name back as it is
+        const f = calls.length;
+        await typeInto(HOSTILE, '0x9');
+        r.sent = posts(f, '/emulation/register').map(c => c[2]);
+    """)
+    assert "error" not in r, r.get("error")
+    assert r["tags"] == [], "a name of the file became an element: " + str(r["tags"])
+    assert r["on"] == [], "an event handler attribute in the pane: " + str(r["on"])
+    assert r["attrNames"] == ["aria-hidden", "aria-label", "autocomplete", "class", "data-addr", "data-rizin-act", "data-rizin-group",
+                              "data-rizin-reg", "data-rizin-section", "role", "spellcheck", "title", "type", "value"], \
+        "a name of the file added an attribute: " + str(r["attrNames"])
+    assert r["shown"] == {"hostile": True, "quote": True}, "the names are not shown, as text"
+    assert r["where"] == {"stack": [True, True], "patch": True, "bp": True, "reg": 2, "note": True, "exported": True}, r["where"]
+    assert r["sent"] == [{"name": "</script><img src=x onerror=alert(1)>", "value": "0x9"}]
+
+
+@needs_node
+def test_rizin_emulation_pane_reanalyze_refreshes_functions_and_strings():
+    # Re-analyse posts /reanalyze and then re-reads /functions and the dock lists
+    r = _scripted(EMU_PANE_SETUP + r"""
+        await fill(); await showPane();
+        const f = calls.length;
+        click(pane.querySelector('[data-rizin-act="reanalyze"]'));
+        await until(() => posts(f, '/reanalyze').length === 1 && gets(f, '/functions').length >= 1 && !rizinState.emuPane.busy, 'Re-analyse');
+        await quiet();
+        r.posts = posts(f, '/reanalyze').map(c => [c[1].replace('/api/rizin/S1', ''), c[2]]);
+        r.functions = gets(f, '/functions').length;
+        r.said = note();
+        r.pending = { strings: rizinState.lists.strings.stale, imports: rizinState.lists.imports.stale, xrefs: rizinState.xrefsPending,
+                      emulation: gets(f, '/emulation').length };
+        // The lists come when they are shown
+        const g = calls.length;
+        click(tab('strings'));
+        await until(() => gets(g, '/strings').length === 1, 'STRINGS'); await quiet();
+        r.strings = gets(g, '/strings').length;
+        click(tab('emulation')); await quiet();
+        // A run that wrote nothing: the server's refusal is said, and nothing is reloaded
+        S.patches = PATCHES().filter(p => p.mine);
+        await rizinLoadEmuPane(true);
+        const h = calls.length;
+        await rizinReanalyze(); await quiet();
+        r.refused = { said: note(), functions: gets(h, '/functions').length, posts: posts(h, '/reanalyze').length };
+        // busy: said, not reloaded
+        S.patches = PATCHES();
+        await rizinLoadEmuPane(true);
+        S.reanalyze = () => [409, { busy: true, step: 'console' }];
+        const k = calls.length;
+        await rizinReanalyze();
+        r.busy = { said: note(), functions: gets(k, '/functions').length };
+        await until(() => rizinState.ui.state === '', 'the poll found rizin free');
+    """)
+    assert "error" not in r, r.get("error")
+    assert r["posts"] == [["/reanalyze", {}]], "Re-analyse posts the empty object: the range the run wrote"
+    assert r["functions"] >= 1, "FUNCTIONS was not read again"
+    assert r["pending"] == {"strings": True, "imports": True, "xrefs": True, "emulation": 0}, r["pending"]
+    assert "1 function" in r["said"] and "2 strings" in r["said"] and "0x140001521" in r["said"], r["said"]
+    assert r["strings"] == 1, "STRINGS was not asked for when shown"
+    assert "wrote nothing" in r["refused"]["said"], r["refused"]
+    assert r["refused"]["functions"] == 0 and r["refused"]["posts"] == 1
+    assert "busy" in r["busy"]["said"] and "console" in r["busy"]["said"] and r["busy"]["functions"] == 0, r["busy"]
+
+
+@needs_node
+def test_rizin_emulation_pane_says_why_it_has_no_stack_or_no_emulation():
+    # R58: never a blank section: not running, and running with a stack of no rows, say why
+    r = _scripted(EMU_PANE_SETUP + r"""
+        S.patches = PATCHES(); S.breakpoints = BREAKPOINTS();
+        await showPane();
+        const section = name => text(pane.querySelector(`[data-rizin-section="${name}"]`));
+        r.idle = { registers: section('registers'), stack: section('stack'), patches: addrs(pane, '.rizin-emu-patch').length,
+                   breakpoints: addrs(pane, '.rizin-emu-bp').length, inputs: pane.querySelectorAll('[data-rizin-reg]').length };
+        await startAt('0x1400014bc');
+        r.empty = { stack: section('stack'), rows: pane.querySelectorAll('.rizin-emu-stack').length };
+        S.emu.stack = STACK(); S.emu.more = [{ name: 'rsp', value: '0x7ffc0000' }];
+        await press(run('step'));
+        r.full = { stack: section('stack'), rows: pane.querySelectorAll('.rizin-emu-stack').length };
+        // STOP: the registers and the stack go, the lists stay
+        click(act('stop')); await until(() => strip.hidden, 'stopped'); await quiet();
+        r.stopped = { registers: section('registers'), stack: section('stack'), patches: addrs(pane, '.rizin-emu-patch').length,
+                      inputs: pane.querySelectorAll('[data-rizin-reg]').length };
+        // No file: one sentence for the whole pane
+        rizinState.session = null; rizinRenderEmuPane();
+        r.noFile = text(pane);
+    """)
+    assert "error" not in r, r.get("error")
+    idle = r["idle"]
+    assert "no emulation" in idle["registers"].lower() and "START" in idle["registers"] and idle["inputs"] == 0, idle
+    assert "no emulation" in idle["stack"].lower(), idle
+    assert idle["patches"] == 4 and idle["breakpoints"] == 2, "the lists need no emulation"
+    empty = r["empty"]["stack"]
+    assert r["empty"]["rows"] == 0
+    assert "stack pointer" in empty and "outside" in empty and "gone" in empty, "R58 names both: " + empty
+    assert "STOP" in empty and "START" in empty, "R58 says restarting maps it again: " + empty
+    assert r["full"]["rows"] == 3 and "outside" not in r["full"]["stack"]
+    assert "no emulation" in r["stopped"]["registers"].lower() and r["stopped"]["inputs"] == 0 and r["stopped"]["patches"] == 4
+    assert r["noFile"] == "No file open."
+
+
+@needs_node
+def test_rizin_emulation_pane_puts_the_note_that_cannot_wait_first():
+    # R59: the session's note has _WAITING_NOTE last (the server appends it); the pane shows it first
+    from rizin_sessions import _WAITING_NOTE
+    r = _scripted(EMU_PANE_SETUP + r"""
+        const WAITING = WAITING_JSON;
+        await fill(); await showPane();
+        const withNote = async note => {
+            rizinState.analysis = { ...rizinState.analysis, note };
+            rizinRenderEmuPane();
+            return pane.querySelectorAll('.rizin-emu-session-note').map(e => [e.className, text(e)]);
+        };
+        r.pinned = RIZIN_EMU_PANE.urgent === WAITING;
+        r.none = await withNote(null);
+        r.plain = await withNote('Restored from the saved project.');
+        r.waiting = await withNote('Restored from the saved project. A saved patch at 0x10 is in none of the maps. ' + WAITING);
+        r.only = await withNote(WAITING);
+        r.ordered = rizinEmuNotes('One. ' + WAITING + ' Two.');
+    """.replace("WAITING_JSON", json.dumps(_WAITING_NOTE)))
+    assert "error" not in r, r.get("error")
+    assert r["pinned"] is True, "RIZIN_EMU_PANE.urgent is not the sentence the server appends (rizin_sessions._WAITING_NOTE)"
+    assert r["none"] == []
+    assert [text for _, text in r["plain"]] == ["Restored from the saved project."]
+    assert [text for _, text in r["waiting"]] == [
+        _WAITING_NOTE, "Restored from the saved project. A saved patch at 0x10 is in none of the maps."], \
+        "the sentence that cannot wait is not first, or the rest changed"
+    assert "urgent" in r["waiting"][0][0] and "urgent" not in r["waiting"][1][0]
+    assert [text for _, text in r["only"]] == [_WAITING_NOTE]
+    assert r["ordered"] == [{"urgent": True, "text": _WAITING_NOTE}, {"urgent": False, "text": "One. Two."}]
+
+
+@needs_node
+def test_rizin_emulation_pane_exports_and_says_what_could_not_be_placed():
+    # R56: Export posts /export and shows its answer: the bytes patched, the addresses that have no place in the file,
+    # and the note; the download and the hand-off to the Submit tab are Task 13's, not here
+    r = _scripted(EMU_PANE_SETUP + r"""
+        await fill(); await showPane();
+        S.skipped = [0x50000010, 0x50000020];
+        S.actDelay = 30;
+        const f = calls.length;
+        click(pane.querySelector('[data-rizin-act="export"]'));
+        await until(() => rizinState.emuPane.busy === 'export', 'the export waits');
+        r.waiting = { said: note(), disabled: pane.querySelector('[data-rizin-act="export"]').hasAttribute('disabled'),
+                      again: await rizinExportPatched() };
+        await until(() => pane.querySelector('.rizin-emu-export'), 'the answer'); await quiet();
+        S.actDelay = undefined;
+        r.posts = posts(f, '/export').map(c => [c[1].replace('/api/rizin/S1', ''), c[2] ?? null]);
+        const box = pane.querySelector('.rizin-emu-export');
+        r.shown = { text: text(box), note: text(box.querySelector('pre')), group: group('hand').contains(box), run: group('run').contains(box) };
+        r.state = { name: rizinState.emuPane.exported.name, patched: rizinState.emuPane.exported.patched, busy: rizinState.emuPane.busy };
+        // Every patch placed: it says so
+        S.skipped = [];
+        const back = await rizinExportPatched(); await quiet();
+        r.placed = text(pane.querySelector('.rizin-emu-export'));
+        r.returned = back && back.name;
+        // The patches changed since: the copy is marked as out of date
+        const fresh = text(pane.querySelector('.rizin-emu-export'));
+        click(pane.querySelector('.rizin-emu-patch[data-addr="0x1400014d0"] [data-rizin-act="unpatch"]'));
+        await until(() => !pane.querySelector('.rizin-emu-patch[data-addr="0x1400014d0"]'), 'taken back'); await quiet();
+        r.stale = { before: /changed since/.test(fresh), after: /changed since/.test(text(pane.querySelector('.rizin-emu-export'))) };
+        // Nothing by hand: no request
+        S.patches = PATCHES().filter(p => !p.mine);
+        await rizinLoadEmuPane(true);
+        const g = calls.length;
+        r.none = await rizinExportPatched();
+        r.noneSent = posts(g, '/export').length;
+        // A refusal is said
+        S.patches = PATCHES();
+        await rizinLoadEmuPane(true);
+        S.exportCopy = () => [400, { refused: 'none of the patches could be placed in the file: 0x1400014c0' }];
+        r.refused = [await rizinExportPatched(), note()];
+    """)
+    assert "error" not in r, r.get("error")
+    assert r["waiting"]["disabled"] is True and "building" in r["waiting"]["said"].lower(), r["waiting"]
+    assert r["waiting"]["again"] is False, "a second Export while one is out"
+    assert r["posts"] == [["/export", None]], "Export posts nothing but the request (and only one)"
+    shown = r["shown"]
+    assert "3 bytes" in shown["text"] and "0123456789abcdef_e.patched.exe" in shown["text"], shown["text"]
+    assert "0x50000010" in shown["text"] and "0x50000020" in shown["text"] and "not placed" in shown["text"].lower(), shown["text"]
+    assert shown["note"].startswith("Patched copy made by TDC") and "Original:" in shown["note"], shown["note"]
+    assert shown["group"] is True and shown["run"] is False, "the result belongs to the hand-made group"
+    assert r["state"] == {"name": "0123456789abcdef_e.patched.exe", "patched": 3, "busy": ""}
+    assert "every patch" in r["placed"].lower() and "not placed" not in r["placed"].lower(), r["placed"]
+    assert r["returned"] == "0123456789abcdef_e.patched.exe"
+    assert r["stale"] == {"before": False, "after": True}, r["stale"]
+    assert r["none"] is False and r["noneSent"] == 0
+    assert r["refused"][0] is False and "none of the patches could be placed" in r["refused"][1], r["refused"]
+
+
+@needs_node
+def test_rizin_emulation_pane_fetches_its_lists_only_when_shown_and_after_what_changes_them():
+    # R57: the lists are fetched while the pane is on screen and wanted again after a run; a hidden pane asks for
+    # nothing and asks when it is shown; another file's rows never show in this one
+    r = _scripted(EMU_PANE_SETUP + r"""
+        S.patches = PATCHES(); S.breakpoints = BREAKPOINTS();
+        await startAt('0x1400014bc');
+        // Hidden: a step asks for nothing, the pane is stale
+        let f = calls.length;
+        await press(run('step'));
+        r.hidden = { lists: gets(f, '/patches').length + gets(f, '/breakpoints').length, stale: rizinState.emuPane.stale };
+        f = calls.length;
+        await showPane();
+        r.shown = { patches: gets(f, '/patches').length, breakpoints: gets(f, '/breakpoints').length, stale: rizinState.emuPane.stale };
+        // On screen: a step asks for both lists once, the state not at all; a seek asks for none
+        S.patches.push({ addr: 0x140001523, size: 1, before: '00', after: '43', mine: false });
+        f = calls.length;
+        await press(run('step'));
+        r.step = { patches: gets(f, '/patches').length, breakpoints: gets(f, '/breakpoints').length, emulation: gets(f, '/emulation').length,
+                   rows: addrs(group('run'), '.rizin-emu-patch') };
+        f = calls.length;
+        await rizinSeek('0x1400014b7', 'test'); await quiet();
+        r.seek = gets(f, '/patches').length + gets(f, '/breakpoints').length;
+        // A busy answer is asked for again once rizin is free
+        S.patchesAnswer = () => { S.patchesAnswer = undefined; return [409, { busy: true, step: 'console' }]; };
+        f = calls.length;
+        await rizinLoadEmuPane(true);
+        r.busy = { retry: rizinState.retry.has('emuPane'), said: text(pane).includes('busy') };
+        await until(() => !rizinState.retry.has('emuPane') && gets(f, '/patches').length >= 2, 'asked again'); await quiet();
+        r.retried = { rows: pane.querySelectorAll('.rizin-emu-patch').length, ui: rizinState.ui.state };
+        // A list that was asked for before another one is dropped when it comes late (the newer holds the newer rows)
+        S.listDelay = 120;
+        const slow = rizinLoadEmuPane(true);
+        await tick(10);
+        S.patches.push({ addr: 0x140001524, size: 1, before: '00', after: '44', mine: false });
+        S.listDelay = 1;
+        await rizinLoadEmuPane(true);
+        await slow; await quiet();
+        r.late = addrs(group('run'), '.rizin-emu-patch');
+        // Another file: its pane starts empty of this one's rows
+        const T = { analysis: 'done', done: ['aaa'], listDelay: 60, breakpoints: [],
+                    patches: [{ addr: 0x1400014c0, size: 1, before: '74', after: '75', mine: true }] };
+        serve('S2', T);
+        opens['C:\\x\\f.exe'] = T;
+        const opening = openInRizin('C:\\x\\f.exe');
+        await until(() => rizinState.session === 'S2', 'the other session');
+        r.reset = { patches: rizinState.emuPane.patches, at: rizinState.emuPane.at, emu: rizinState.emu,
+                    rows: pane.querySelectorAll('.rizin-emu-patch').length };
+        await opening;
+        await until(() => rizinState.landed && rizinState.emuPane.at === 'S2', 'the other file'); await quiet();
+        r.other = { hand: addrs(pane, '.rizin-emu-patch'), bp: pane.querySelectorAll('.rizin-emu-bp').length, said: text(pane.querySelector('[data-rizin-section="breakpoints"]')) };
+    """)
+    assert "error" not in r, r.get("error")
+    assert r["hidden"]["lists"] == 0 and r["hidden"]["stale"] is True, "a hidden pane fetched its lists, or did not want them again: " + str(r["hidden"])
+    assert r["shown"] == {"patches": 1, "breakpoints": 1, "stale": False}, r["shown"]
+    assert r["step"]["patches"] == 1 and r["step"]["breakpoints"] == 1 and r["step"]["emulation"] == 0, r["step"]
+    assert r["step"]["rows"] == ["0x140001521", "0x140001522", "0x140001523"], "the run's new write is not in the list"
+    assert r["seek"] == 0, "a jump asked for the lists"
+    assert r["busy"] == {"retry": True, "said": True}, r["busy"]
+    assert r["retried"]["rows"] == 5 and r["retried"]["ui"] == "", r["retried"]
+    assert r["late"] == ["0x140001521", "0x140001522", "0x140001523", "0x140001524"], "a late older list replaced a newer one: " + str(r["late"])
+    assert r["reset"] == {"patches": None, "at": "", "emu": None, "rows": 0}, "the other file's pane held the rows of this one: " + str(r["reset"])
+    assert r["other"]["hand"] == ["0x1400014c0"] and r["other"]["bp"] == 0 and "no breakpoints" in r["other"]["said"].lower(), r["other"]
+
+
+@needs_node
+def test_rizin_emulation_pane_removes_a_breakpoint_and_has_no_switch():
+    # R19: a breakpoint is set or removed; rizin 0.9.1 stops at one listed as disabled all the same, so the pane has
+    # no on/off, and a row that rizin lists as disabled says it still stops a run. ✕ removes, and does not jump.
+    r = _scripted(EMU_PANE_SETUP + r"""
+        await fill();
+        S.breakpoints = [{ addr: 0x140001490, enabled: false }, { addr: 0x1400014b7, enabled: true }, { addr: 2 ** 60, enabled: true }];
+        await showPane();
+        const rows = () => pane.querySelectorAll('.rizin-emu-bp');
+        r.rows = rows().map(e => [attr(e, 'data-addr'), text(e), e.querySelectorAll('button').length]);
+        r.controls = pane.querySelectorAll('input').filter(i => !i.hasAttribute('data-rizin-reg')).length;
+        r.toggles = pane.querySelectorAll('[data-rizin-act]').map(b => attr(b, 'data-rizin-act')).filter(a => /on|off|toggle|enable|disable/.test(a));
+        const f = calls.length;
+        click(pane.querySelector('.rizin-emu-bp[data-addr="0x140001490"] [data-rizin-act="unbreak"]'));
+        await until(() => rows().length === 2, 'the row goes'); await quiet();
+        r.removed = { deletes: calls.slice(f).filter(c => c[0] === 'DELETE').map(c => [c[1].replace('/api/rizin/S1', ''), c[2]]),
+                      seeks: posts(f, '/seek').length, rows: rows().map(e => attr(e, 'data-addr')), said: note() };
+        // A bad address removes nothing (and not all of them: that is the route's call without an address)
+        const g = calls.length;
+        await rizinUnbreak('banana'); await rizinUnbreak(null); await tick(20);
+        r.bad = calls.slice(g).filter(c => c[0] === 'DELETE').length;
+        // The server refuses: said, and the row stays
+        S.unbreak = () => [400, { refused: 'rizin kept the breakpoint at 0x1400014b7' }];
+        click(pane.querySelector('.rizin-emu-bp[data-addr="0x1400014b7"] [data-rizin-act="unbreak"]'));
+        await until(() => note().includes('kept the breakpoint'), 'the refusal'); await quiet();
+        r.refused = { said: note(), rows: rows().length };
+    """)
+    assert "error" not in r, r.get("error")
+    first, second, big = r["rows"]
+    assert first[0] == "0x140001490" and "still stops a run" in first[1] and first[2] == 1, first
+    assert second[0] == "0x1400014b7" and "still stops" not in second[1] and second[2] == 1, second
+    assert big[0] is None and "?" in big[1] and big[2] == 0, \
+        "an address a double cannot hold exactly was shown as another one, or could be removed: " + str(big)
+    assert r["controls"] == 0 and r["toggles"] == [], "the pane has a switch for a breakpoint: rizin ignores it"
+    assert r["removed"]["deletes"] == [["/breakpoints", {"addr": "0x140001490"}]] and r["removed"]["seeks"] == 0, r["removed"]
+    assert r["removed"]["rows"] == ["0x1400014b7", None] and "0x140001490" in r["removed"]["said"], r["removed"]
+    assert r["bad"] == 0
+    assert "kept the breakpoint" in r["refused"]["said"] and r["refused"]["rows"] == 2, r["refused"]
+
+
+@needs_node
+def test_rizin_emulation_pane_keeps_what_is_typed_and_where_it_is_scrolled():
+    # The pane is drawn again when the state moves; a register being typed into keeps its text and focus, a field that
+    # was only focused takes the new value, and each column keeps its scroll position
+    r = _scripted(EMU_PANE_SETUP + r"""
+        await fill(); await showPane();
+        const input = reg('rbx');
+        input.value = '0x12345';                  // typed, not yet sent
+        input.focus();
+        const cols = pane.querySelectorAll('.rizin-emu-col');
+        cols[0].scrollTop = 40; cols[1].scrollTop = 70;
+        // The state moved: rax and rbx now differ
+        S.emu.rax = 7; S.emu.rbx = 9;
+        rizinState.emu = { ...rizinState.emu, registers: rizinState.emu.registers.map(x => (x.name === 'rbx' ? { ...x, value: '0x9' } : x.name === 'rax' ? { ...x, value: '0x7' } : x)) };
+        rizinRenderEmuPane();
+        r.typed = { value: reg('rbx').value, focused: document.activeElement === reg('rbx'), rax: reg('rax').value };
+        r.scroll = pane.querySelectorAll('.rizin-emu-col').map(c => c.scrollTop);
+        // A field only focused (nothing typed) takes the state's value
+        reg('rax').focus();
+        rizinState.emu = { ...rizinState.emu, registers: rizinState.emu.registers.map(x => (x.name === 'rax' ? { ...x, value: '0x8' } : x)) };
+        rizinRenderEmuPane();
+        r.focusedOnly = reg('rax').value;
+        // The same state drawn again writes nothing
+        const before = pane.querySelector('.rizin-emu-col');
+        rizinRenderEmuPane();
+        r.same = pane.querySelector('.rizin-emu-col') === before;
+    """)
+    assert "error" not in r, r.get("error")
+    assert r["typed"] == {"value": "0x12345", "focused": True, "rax": "0x7"}, r["typed"]
+    assert r["scroll"] == [40, 70], "the columns lost their scroll position"
+    assert r["focusedOnly"] == "0x8"
+    assert r["same"] is True, "an unchanged pane was written again"
+
+
+# The rules of the pane in both themes
+EMU_PANE_THEMED = [".rizin-emu-pane", ".rizin-emu-head", ".rizin-emu-reg", ".rizin-emu-reg.changed", ".rizin-emu-delta",
+                   ".rizin-emu-reg-name", ".rizin-emu-reg-input", ".rizin-emu-fn", ".rizin-emu-hint", ".rizin-emu-bytes",
+                   ".rizin-emu-group", ".rizin-emu-hand", ".rizin-emu-run", ".rizin-emu-subhead", ".rizin-emu-fate",
+                   ".rizin-emu-warn", ".rizin-emu-note", ".rizin-emu-note-error", ".rizin-emu-urgent", ".rizin-emu-export"]
+
+
+def test_rizin_emulation_pane_styles_and_markup():
+    """The pane's markup and rules: a tab after IMPORTS and a pane of its own with one delegated click and one change
+    handler; a rule for each theme; the changed register and the run's group carry their meaning without colour; the
+    pane's columns scroll in themselves, so the dock keeps its height (the work area is not made narrower or shorter
+    at 1280 px); the asset versions are raised."""
+    tab = _tab_markup("rizin")
+    pane = re.search(r'<div[^>]*id="rizin-emulation"[^>]*>', tab).group(0)
+    assert re.search(r"\shidden[\s>]", pane) and 'role="tabpanel"' in pane and 'data-rizin-pane="emulation"' in pane, pane
+    assert 'onclick="rizinOnEmuPaneClick(event)"' in pane and 'onchange="rizinOnEmuPaneChange(event)"' in pane, pane
+    assert 'aria-controls="rizin-emulation"' in tab and tab.index('data-rizin-tab="imports"') < tab.index('data-rizin-tab="emulation"')
+    assert tab.index('id="rizin-imports"') < tab.index('id="rizin-emulation"') < tab.index('</section>', tab.index('id="rizin-dock"'))
+    assert 'data-rizin-tools="emulation"' not in tab, "the pane has no tools in the dock's head: its buttons are in its groups"
+
+    classic, cyberpunk = _rules(STYLE_CSS), _rules(THEME_CSS)
+    prefix = '[data-theme="cyberpunk"] '
+    missing = [s for s in EMU_PANE_THEMED if s not in classic] + [prefix + s for s in EMU_PANE_THEMED if prefix + s not in cyberpunk]
+    assert not missing, "parts of the pane without a rule in one theme:\n" + "\n".join(missing)
+    for path in (STYLE_CSS, THEME_CSS):
+        rules = {s: b for s, b in _rules(path).items() if "rizin-emu-" in s}
+        written = [f"{s}: {m.group(0)}" for s, b in rules.items() for m in LITERAL_COLOR.finditer(b)]
+        assert not written, f"colours written out in {path}:\n" + "\n".join(written)
+    # What is not colour: the sign and the bar of a changed register, a heavier name; a run's group with a dashed edge
+    # against the solid one of the hand-made group
+    assert _declared(classic.get(".rizin-emu-reg.changed"), "font-weight") in ("600", "700", "bold")
+    assert _declared(classic.get(".rizin-emu-reg"), "border-left") and _declared(classic.get(".rizin-emu-reg.changed"), "border-left-color")
+    assert "dashed" in (_declared(classic.get(".rizin-emu-run"), "border-left") or "")
+    assert "solid" in (_declared(classic.get(".rizin-emu-hand"), "border-left") or "")
+    # The columns scroll in themselves: neither the pane nor the dock grows with the rows
+    body = classic.get(".rizin-emu-pane", "")
+    assert _declared(body, "display") == "grid" and _declared(body, "overflow") == "hidden"
+    assert "minmax(0, 1fr)" in (_declared(body, "grid-template-columns") or "") and _declared(body, "grid-template-rows") == "minmax(0, 1fr)"
+    col = classic.get(".rizin-emu-col", "")
+    assert _declared(col, "overflow") == "auto" and _declared(col, "min-height") == "0" and _declared(col, "min-width") == "0"
+    assert _declared(classic.get(".rizin-emu-pane[hidden]"), "display") == "none"
+    assert "minmax(" in (_declared(classic.get(".rizin-emu-regs"), "grid-template-columns") or ""), "the registers wrap into the width"
+    assert _declared(classic.get(".rizin-emu-export"), "overflow-wrap") == "anywhere", "a long name widens the pane"
+    html = _read(INDEX_HTML)
+    assert "style.css?v=82" not in html and 'theme-layout.css?v=6"' not in html and "app.js?v=121" not in html, \
+        "asset versions not raised for the EMULATION pane"
