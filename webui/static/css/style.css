@@ -9748,9 +9748,10 @@ table[data-sortable] > thead > tr > th:focus-visible {
     font-size: 8px;
     color: var(--accent-orange);
 }
-/* The gutter, left of the address: a ● where a breakpoint is set (one click sets or removes it), a faint ○ under the
-   pointer where none is; then a cell for a line patched by hand (≠). Each is a fixed width, set apart from the
-   line's text, so that the columns stay in line whether a line has a mark or not; neither is text to copy.
+/* The gutter, left of the address: a ● where a breakpoint is set (one click sets or removes it), a faint ○ on every
+   other line so that the column can be seen and aimed at, the same ○ stronger under the pointer; then a cell for a
+   line patched by hand (≠). Each is a fixed width, set apart from the line's text, so that the columns stay in line
+   whether a line has a mark or not; neither is text to copy.
    The three marks of a line are three shapes, none of them colour alone: this ● in the gutter, the PC's ▶ and dashed
    edge, the current line's solid bar. */
 .rizin-gutter {
@@ -9765,9 +9766,12 @@ table[data-sortable] > thead > tr > th:focus-visible {
 .rizin-gutter-busy .rizin-gutter {
     cursor: progress;
 }
-.rizin-gutter:not(.on):hover::before {
+.rizin-gutter:not(.on)::before {
     content: "○";
     color: var(--text-dim);
+}
+.rizin-gutter:not(.on):hover::before {
+    color: var(--text-secondary);
 }
 .rizin-gutter.on {
     font-weight: 700;

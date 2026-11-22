@@ -132,7 +132,10 @@ Restarting the emulation (STOP, then EMULATE) maps it again."
 ### Breakpoints
 
 A click in the gutter left of an address in DISASSEMBLY sets a breakpoint (●)
-or removes it; the console does the same with `db @ <addr>` and
+or removes it. The gutter is the narrow column at the left edge of every line,
+a faint ○ where there is no breakpoint (stronger under the pointer); the cell
+between it and the address is for the ≠ of a line patched by hand, and is not
+a button. The console does the same with `db @ <addr>` and
 `db- @ <addr>`. BREAKPOINTS lists them with the function they are in and a ✕.
 A breakpoint is set or it is not: there is no "off", because `dbd` does not
 keep rizin from stopping there (measured), and a breakpoint that rizin lists

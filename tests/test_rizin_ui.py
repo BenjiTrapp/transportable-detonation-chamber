@@ -7315,6 +7315,37 @@ def test_rizin_gutter_breakpoint_pc_and_current_are_three_marks():
     assert _declared(classic.get(".rz-pm"), "width") == _declared(classic.get(".rizin-gutter"), "width") == "2ch"
 
 
+def test_rizin_gutter_shows_a_faint_resting_marker_that_is_not_a_breakpoint_in_both_themes():
+    # INTENT: the cell was empty at rest, with a ○ only under the pointer, and a user aimed two characters too far right (at
+    # the patch cell, also empty). Every line now carries a faint ○ in the gutter, drawn by the stylesheet (the markup stays
+    # empty, so a copied or counted line is unchanged), the same ○ is stronger under the pointer, and neither could be
+    # mistaken for the red bold ● of a set breakpoint (a hollow ring in a dim text colour against a solid red disc). A
+    # reviewer who removes the resting rule from either sheet fails here.
+    classic, layout = _rules(STYLE_CSS), _rules(THEME_CSS)
+    prefix = '[data-theme="cyberpunk"] '
+    rest, hover = ".rizin-gutter:not(.on)::before", ".rizin-gutter:not(.on):hover::before"
+    for rules, pre, dim, strong in ((classic, "", "var(--text-dim)", "var(--text-secondary)"),
+                                    (layout, prefix, "var(--cp-text-dim)", "var(--cp-text-muted)")):
+        resting, pointed = rules.get(pre + rest), rules.get(pre + hover)
+        assert resting, f"{pre + rest} has no rule: the gutter is empty at rest"
+        assert pre + rest in rules and pre + hover in rules
+        # the classic sheet declares the glyphs, Cyberpunk only recolours them
+        if not pre:
+            assert _declared(resting, "content") == '"○"' and _declared(pointed, "content") in (None, '"○"'), \
+                "the resting marker is not the hollow ○, or the pointer's is another glyph"
+            assert _declared(resting, "content") != "\"●\"", "the resting marker is the breakpoint's glyph"
+        assert _declared(resting, "color") == dim and _declared(pointed, "color") == strong, "the resting and hover colours"
+        assert "red" not in (_declared(resting, "color") or "") + (_declared(pointed, "color") or ""), "a resting marker in the breakpoint's red"
+        # a rule on the pseudo-element that took room would move the address, the mnemonic and the operands
+        for prop in ("position", "width", "min-width", "margin", "padding", "font-size", "display", "float", "letter-spacing"):
+            assert _declared(resting, prop) is None and _declared(pointed, prop) is None, f"the marker declares {prop}: the columns could shift"
+    # a set breakpoint stays the red, bold, glowing ●; the patch cell gets no marker
+    assert _declared(classic.get(".rizin-gutter.on"), "font-weight") == "700" and _declared(classic.get(".rizin-gutter"), "color") == "var(--accent-red)"
+    assert _declared(layout.get(prefix + ".rizin-gutter"), "color") == "var(--cp-red)" and "text-shadow" in (layout.get(prefix + ".rizin-gutter.on") or "")
+    assert _declared(classic.get(".rizin-gutter"), "width") == _declared(classic.get(".rz-pm"), "width") == "2ch"
+    assert ".rz-pm::before" not in classic and prefix + ".rz-pm::before" not in layout, "the patch cell is empty at rest"
+
+
 @needs_node
 def test_rizin_menu_patches_an_instruction_and_runs_to_here():
     # INTENT: from the right-click menu of a line, NOP out, Flip the jump, Always jump and Kill the call each POST /patch with
