@@ -145,6 +145,7 @@ transportable-detonation-chamber/
 │   ├── pipe_proxy.py              # Interception engine (sessions, hold queue, recording)
 │   ├── pipe_backends.py           # Win32 (ctypes) and in-memory fake pipe backends
 │   ├── pipe_sessions/             # Ended interception recordings (git-ignored)
+│   ├── syscall_baseline.py        # SYSCALLS tab: NTSleuth baseline (syscall numbers, RVAs, stubs) and its catalog
 │   ├── log_search.py              # LOGS tab: SPL-like search language (parser, evaluator, pipes)
 │   ├── log_store.py               # LOGS tab: event ring buffer, source parsers, incremental collector
 │   ├── logs/                      # Persisted access and MCP logs, JSONL (git-ignored)

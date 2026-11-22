@@ -1,0 +1,158 @@
+{
+  "syscalls": [
+    {
+      "name": "NtAllocateVirtualMemory",
+      "module": "ntdll.dll",
+      "syscall_number": 24,
+      "rva": 643488,
+      "return_type": "NTSTATUS",
+      "calling_convention": "__stdcall",
+      "parameters": [
+        {
+          "name": "ProcessHandle",
+          "type": "HANDLE",
+          "sal_annotation": "_In_"
+        },
+        {
+          "name": "BaseAddress",
+          "type": "PVOID*",
+          "sal_annotation": "_Inout_"
+        },
+        {
+          "name": "ZeroBits",
+          "type": "ULONG_PTR",
+          "sal_annotation": "_In_"
+        },
+        {
+          "name": "RegionSize",
+          "type": "PSIZE_T",
+          "sal_annotation": "_Inout_"
+        },
+        {
+          "name": "AllocationType",
+          "type": "ULONG",
+          "sal_annotation": "_In_"
+        },
+        {
+          "name": "Protect",
+          "type": "ULONG",
+          "sal_annotation": "_In_"
+        }
+      ],
+      "stub_bytes": "4c8bd1b818000000f604250803fe7f0175030f05c3cd2ec30f1f8400000000",
+      "is_true_syscall": true
+    },
+    {
+      "name": "NtWriteVirtualMemory",
+      "module": "ntdll.dll",
+      "syscall_number": 58,
+      "rva": 644032,
+      "return_type": "NTSTATUS",
+      "calling_convention": "__stdcall",
+      "parameters": [
+        {
+          "name": "ProcessHandle",
+          "type": "HANDLE",
+          "sal_annotation": "_In_"
+        },
+        {
+          "name": "BaseAddress",
+          "type": "PVOID",
+          "sal_annotation": "_In_"
+        },
+        {
+          "name": "Buffer",
+          "type": "PVOID",
+          "sal_annotation": "_In_reads_bytes_(NumberOfBytesToWrite)"
+        },
+        {
+          "name": "NumberOfBytesToWrite",
+          "type": "SIZE_T",
+          "sal_annotation": "_In_"
+        },
+        {
+          "name": "NumberOfBytesWritten",
+          "type": "PSIZE_T",
+          "sal_annotation": "_Out_opt_"
+        }
+      ],
+      "stub_bytes": "4c8bd1b83a000000f604250803fe7f0175030f05c3cd2ec30f1f8400000000",
+      "is_true_syscall": true
+    },
+    {
+      "name": "NtProtectVirtualMemory",
+      "module": "ntdll.dll",
+      "syscall_number": 80,
+      "rva": 644384,
+      "return_type": "NTSTATUS",
+      "calling_convention": "__stdcall",
+      "parameters": [
+        {
+          "name": "ProcessHandle",
+          "type": "HANDLE",
+          "sal_annotation": "_In_"
+        },
+        {
+          "name": "BaseAddress",
+          "type": "PVOID*",
+          "sal_annotation": "_Inout_"
+        },
+        {
+          "name": "RegionSize",
+          "type": "PSIZE_T",
+          "sal_annotation": "_Inout_"
+        },
+        {
+          "name": "NewProtect",
+          "type": "ULONG",
+          "sal_annotation": "_In_"
+        },
+        {
+          "name": "OldProtect",
+          "type": "PULONG",
+          "sal_annotation": "_Out_"
+        }
+      ],
+      "stub_bytes": "4c8bd1b850000000f604250803fe7f0175030f05c3cd2ec30f1f8400000000",
+      "is_true_syscall": true
+    },
+    {
+      "name": "NtUserGetForegroundWindow",
+      "module": "win32u.dll",
+      "syscall_number": 4148,
+      "rva": 6976,
+      "return_type": "HWND",
+      "calling_convention": "__stdcall",
+      "parameters": [],
+      "stub_bytes": "4c8bd1b834100000f604250803fe7f0175030f05c3cd2ec30f1f8400000000",
+      "is_true_syscall": true
+    },
+    {
+      "name": "NtNotASyscall",
+      "module": "ntdll.dll",
+      "syscall_number": 0,
+      "rva": 645376,
+      "return_type": "NTSTATUS",
+      "calling_convention": "__stdcall",
+      "parameters": [],
+      "stub_bytes": "4c8bd1b800000000f604250803fe7f0175030f05c3cd2ec30f1f8400000000",
+      "is_true_syscall": false
+    },
+    {
+      "name": "NtNoStub",
+      "module": "ntdll.dll",
+      "syscall_number": 15,
+      "rva": 643360,
+      "return_type": "NTSTATUS",
+      "calling_convention": "__stdcall",
+      "parameters": [
+        {
+          "name": "Handle",
+          "type": "HANDLE",
+          "sal_annotation": "_In_"
+        }
+      ],
+      "is_true_syscall": true
+    }
+  ]
+}
