@@ -1594,6 +1594,12 @@
                             <tr><td class="api-post">POST</td><td><code>/api/scan/beacons</code></td><td>Hunt-Sleeping-Beacons (also <code>beaconeye</code>)</td></tr>
                             <tr><td class="api-post">POST</td><td><code>/api/memory/sweep</code></td><td>Scan every process (or capture the baseline)</td></tr>
                             <tr><td class="api-get">GET</td><td><code>/api/memory/baseline</code></td><td>Host memory baseline status</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/syscalls/status</code></td><td>NTSleuth installed, baselines per build and view, background extraction</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/syscalls/baseline</code></td><td>Syscall catalog, paged. Params: <code>view</code>, <code>query</code>, <code>module</code>, <code>offset</code>, <code>limit</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/syscalls/&lt;name&gt;</code></td><td>One syscall with parameters and stub. Param: <code>view</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/syscalls/scan</code></td><td>Measure the syscall stubs of a PID against the baseline. Params: <code>pid</code>, <code>modules</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/syscalls/stubs</code></td><td>Syscall stubs outside ntdll, in a PID or a file. Params: <code>pid</code> or <code>path</code> with <code>view</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/syscalls/hook-baseline</code></td><td>Known hooks (also <code>POST</code> to record a PID's hooks on a clean host, <code>DELETE</code> to forget)</td></tr>
                         </tbody>
                     </table>
 

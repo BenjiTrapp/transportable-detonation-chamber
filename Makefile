@@ -311,6 +311,8 @@ deploy:
 		vagrant upload webui/static/js/app.js C:\\DetonationChamberUI\\static\\js\\app.js; \
 		vagrant upload webui/app.py C:\\DetonationChamberUI\\app.py; \
 		vagrant upload webui/memory_evidence.py C:\\DetonationChamberUI\\memory_evidence.py; \
+		vagrant upload webui/syscall_baseline.py C:\\DetonationChamberUI\\syscall_baseline.py; \
+		vagrant upload webui/syscall_scan.py C:\\DetonationChamberUI\\syscall_scan.py; \
 		vagrant upload webui/minidump_analysis.py C:\\DetonationChamberUI\\minidump_analysis.py; \
 		vagrant upload webui/pipe_analysis.py C:\\DetonationChamberUI\\pipe_analysis.py; \
 		vagrant upload webui/pipe_signatures.json C:\\DetonationChamberUI\\pipe_signatures.json; \
@@ -350,6 +352,8 @@ deploy-app:
 	else \
 		vagrant upload webui/app.py C:\\DetonationChamberUI\\app.py; \
 		vagrant upload webui/memory_evidence.py C:\\DetonationChamberUI\\memory_evidence.py; \
+		vagrant upload webui/syscall_baseline.py C:\\DetonationChamberUI\\syscall_baseline.py; \
+		vagrant upload webui/syscall_scan.py C:\\DetonationChamberUI\\syscall_scan.py; \
 		vagrant upload webui/minidump_analysis.py C:\\DetonationChamberUI\\minidump_analysis.py; \
 		vagrant upload webui/pipe_analysis.py C:\\DetonationChamberUI\\pipe_analysis.py; \
 		vagrant upload webui/pipe_signatures.json C:\\DetonationChamberUI\\pipe_signatures.json; \

@@ -48,6 +48,9 @@ class Baseline:
     # names of entries dropped because another module already owns the name; `syscalls`
     # is keyed by name alone, so each of these is a syscall the catalog cannot show
     shadowed: list = field(default_factory=list)
+    # False when the file says it was extracted without the symbol server: the parameters of
+    # such a baseline are incomplete, its numbers, RVAs and stub bytes are not
+    symbols: bool = True
 
 
 def parse_baseline(payload: list | dict, build: str, view: str) -> Baseline:
@@ -59,7 +62,8 @@ def parse_baseline(payload: list | dict, build: str, view: str) -> Baseline:
     raw = payload.get("syscalls") if isinstance(payload, dict) else payload
     if not isinstance(raw, list):
         raise BaselineError("baseline is neither a list of entries nor has a 'syscalls' list")
-    bl = Baseline(build=build, view=view)
+    bl = Baseline(build=build, view=view,
+                  symbols=not (isinstance(payload, dict) and payload.get("symbols") is False))
     for i, entry in enumerate(raw):
         label = entry.get("name") if isinstance(entry, dict) else None
         if not isinstance(label, str) or not label:
@@ -141,6 +145,12 @@ def load_baseline(path: str) -> Baseline:
     return bl
 
 
+def parse_baseline_name(filename: str) -> tuple[str, str] | None:
+    """`(build, view)` of a file named `ntsleuth-<build>-<view>.json`, None for any other name."""
+    m = _FILENAME_RE.fullmatch(filename)
+    return (m.group("build"), m.group("view")) if m else None
+
+
 def find_baseline(directory: str, build: str, view: str) -> str | None:
     """Path of `ntsleuth-<build>-<view>.json` in `directory`, or None.
 
@@ -187,6 +197,11 @@ def catalog(baseline: Baseline, query: str = "", module: str = "",
         "offset": offset,
         "limit": limit,
     }
+
+
+def describe(sc: Syscall) -> dict:
+    """One syscall as the catalog lists it."""
+    return _item(sc)
 
 
 def _item(sc: Syscall) -> dict:

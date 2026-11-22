@@ -5,7 +5,9 @@ test gets a clean in-memory store and its own result/baseline files, so tests
 never touch the files next to app.py or talk to the VM.
 """
 
+import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -58,6 +60,14 @@ def tdc(app_module, monkeypatch, tmp_path):
     monkeypatch.setattr(m, "_memory_baseline",
                         m.memory_evidence.MemoryBaseline(str(tmp_path / "baseline.json")))
     m._alerts_body_cache["entry"] = None
+    # the syscall baselines, NTSleuth and the hook allowlist are files of the test's own; no symbol server is asked
+    monkeypatch.setattr(m, "NTSLEUTH_DIR", str(tmp_path / "ntsleuth"))
+    monkeypatch.setattr(m, "NTSLEUTH_BASELINE_DIR", str(tmp_path / "ntsleuth" / "baseline"))
+    monkeypatch.setattr(m, "SYSCALL_HOOK_ALLOWLIST_FILE", str(tmp_path / "syscall_hook_allowlist.json"))
+    monkeypatch.setattr(m, "_hook_allowlist", None)
+    monkeypatch.setattr(m, "_syscall_baselines", {})
+    monkeypatch.setattr(m, "_syscall_extract_state", m._new_syscall_extract_state())
+    monkeypatch.setattr(m, "_symbol_server_reachable", lambda: False)
     m.set_log_store(m.log_store.LogStore(persist_dir=str(tmp_path / "logs")))
     # the own dashboards of a test are a file of its own, never webui/dashboards.json
     m.set_dashboard_store(m.dashboards.DashboardStore(str(tmp_path / "dashboards.json")))
@@ -69,6 +79,36 @@ def tdc(app_module, monkeypatch, tmp_path):
 @pytest.fixture
 def client(tdc):
     return tdc.app.test_client()
+
+
+def _baseline_dir(tdc, monkeypatch, tmp_path, symbols=None):
+    """The baselines of tests/samples in a directory of the test's own, which is the one the web UI reads; the
+    system it runs on has the build they were named for. `symbols` False marks them as extracted without symbols."""
+    directory = tmp_path / "ntsleuth-baselines"
+    directory.mkdir()
+    for view in ("arm64", "x64"):
+        name = f"ntsleuth-26220.5770-{view}.json"
+        source = os.path.join(ROOT, "tests", "samples", name)
+        if symbols is None:
+            shutil.copy(source, directory / name)
+            continue
+        with open(source, encoding="utf-8") as fh:
+            document = json.load(fh)
+        document["symbols"] = symbols
+        (directory / name).write_text(json.dumps(document), encoding="utf-8")
+    monkeypatch.setattr(tdc, "NTSLEUTH_BASELINE_DIR", str(directory))
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26220.5770")
+    return directory
+
+
+@pytest.fixture
+def fake_baseline_dir(tdc, monkeypatch, tmp_path):
+    return _baseline_dir(tdc, monkeypatch, tmp_path)
+
+
+@pytest.fixture
+def degraded_baseline_dir(tdc, monkeypatch, tmp_path):
+    return _baseline_dir(tdc, monkeypatch, tmp_path, symbols=False)
 
 
 def make_alert(i, pid, ts, image, ppid=None, parent_name="", engine="sigma",

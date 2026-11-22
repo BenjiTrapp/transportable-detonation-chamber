@@ -1,9 +1,13 @@
 """NTSleuth syscall baseline: loading, validation, the lookup catalog, and measuring a process."""
 
+import contextlib
 import json
 import os
+import pathlib
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
@@ -1768,3 +1772,820 @@ def test_collect_ignores_a_missing_or_malformed_syscall_scan():
     assert memory_evidence.collect({}, process="sample.exe") == []
     assert memory_evidence.collect({"syscall_scan": None}, process="sample.exe") == []
     assert memory_evidence.collect({"syscall_scan": "x"}, process="sample.exe") == []
+
+
+# --- the routes (app.py) ------------------------------------------------------------------
+
+def test_status_says_what_is_installed(client, tdc, tmp_path):
+    body = client.get("/api/syscalls/status").get_json()
+    assert body["installed"] is False
+    assert body["baselines"] == []
+
+
+def test_baseline_route_pages_and_filters(client, tdc, fake_baseline_dir):
+    body = client.get("/api/syscalls/baseline?view=arm64&query=virtual&limit=2").get_json()
+    assert len(body["items"]) == 2 and body["total"] >= 3
+
+
+def test_scan_refuses_without_a_matching_baseline(client, tdc):
+    r = client.post("/api/syscalls/scan", json={"pid": 4812})
+    assert r.status_code == 400
+    assert "baseline" in r.get_json()["error"].lower()
+
+
+def test_lookup_returns_parameters(client, tdc, fake_baseline_dir):
+    body = client.get("/api/syscalls/NtWriteVirtualMemory?view=arm64").get_json()
+    assert body["number"] == 0x3A
+    assert body["parameters"][0]["sal_annotation"] == "_In_"
+
+
+def test_unknown_syscall_is_404(client, tdc, fake_baseline_dir):
+    r = client.get("/api/syscalls/NtNope?view=arm64")
+    assert r.status_code == 404
+    # a 404 that only says "no such route" is not the answer to this question
+    assert "NtNope" in r.get_json()["error"]
+
+
+def test_a_baseline_file_name_gives_its_build_and_view():
+    assert syscall_baseline.parse_baseline_name("ntsleuth-26220.5770-arm64.json") == ("26220.5770", "arm64")
+    for name in ("ntsleuth-26220.5770-x86.json", "ntsleuth-26220.5770-arm64.json.tmp", "graph-cache.json",
+                 "ntsleuth-../x-arm64.json", "ntsleuth-26220.5770-arm64.json\n"):
+        assert syscall_baseline.parse_baseline_name(name) is None, name
+
+
+def test_describe_is_the_catalog_entry_of_one_syscall(arm64_baseline):
+    sc = arm64_baseline.syscalls["NtWriteVirtualMemory"]
+    page = syscall_baseline.catalog(arm64_baseline, query="NtWriteVirtualMemory")
+    assert syscall_baseline.describe(sc) == page["items"][0]
+
+
+def test_a_baseline_says_whether_it_was_extracted_with_symbols():
+    # NTSleuth's own output carries no such key: a baseline is taken to hold its parameters unless it says not
+    assert syscall_baseline.parse_baseline(_fixture("arm64"), "26220.5770", "arm64").symbols is True
+    assert syscall_baseline.parse_baseline([], "26220.5770", "arm64").symbols is True
+    marked = dict(_fixture("arm64"), symbols=False)
+    assert syscall_baseline.parse_baseline(marked, "26220.5770", "arm64").symbols is False
+    assert syscall_baseline.parse_baseline(dict(marked, symbols=True), "26220.5770", "arm64").symbols is True
+
+
+def test_the_status_names_the_installed_binaries_and_the_current_baseline(client, tdc, fake_baseline_dir, tmp_path):
+    ntsleuth = tmp_path / "ntsleuth"
+    ntsleuth.mkdir()
+    (ntsleuth / "ntsleuth-x64.exe").write_bytes(b"MZ")
+    (fake_baseline_dir / "graph-cache.json").write_text("{}")             # not a baseline: left out
+    body = client.get("/api/syscalls/status").get_json()
+    assert body["installed"] is True
+    assert body["executables"] == {"arm64": False, "x64": True}
+    assert body["build"] == "26220.5770"
+    assert [(b["build"], b["view"], b["current"], b["symbols"]) for b in body["baselines"]] == [
+        ("26220.5770", "arm64", True, True), ("26220.5770", "x64", True, True)]
+    assert "note" not in body["baselines"][0]
+
+
+def test_the_status_marks_a_baseline_of_another_build_as_not_current(client, tdc, fake_baseline_dir, monkeypatch):
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")
+    body = client.get("/api/syscalls/status").get_json()
+    assert [b["current"] for b in body["baselines"]] == [False, False]
+
+
+def test_the_status_reports_a_baseline_it_cannot_read(client, tdc, fake_baseline_dir):
+    (fake_baseline_dir / "ntsleuth-26220.5770-arm64.json").write_text("{not json")
+    arm64 = client.get("/api/syscalls/status").get_json()["baselines"][0]
+    assert arm64["symbols"] is None and "cannot read" in arm64["error"]
+
+
+@pytest.mark.parametrize("machine, view", [("x64", "x64"), ("ARM64", "arm64"), ("ARM64EC", "x64"),
+                                           ("x86", "x86"), ("ARM", None), (None, None)])
+def test_the_view_of_a_process_follows_its_image_not_the_host(tdc, monkeypatch, machine, view):
+    monkeypatch.setattr(tdc, "_process_machine", lambda pid: machine)
+    assert tdc._syscall_view_for_pid(4812) == view
+
+
+@pytest.mark.parametrize("view", ["../x64", "X64", "x64 ", "arm64\n", "ntdll", "'", "a" * 5000])
+def test_a_view_that_is_not_one_of_the_three_is_refused_before_anything_is_read(client, tdc, fake_baseline_dir, view):
+    for path in ("/api/syscalls/baseline", "/api/syscalls/NtWriteVirtualMemory"):
+        r = client.get(path, query_string={"view": view})
+        assert r.status_code == 400, (path, view)
+        assert "view must be one of" in r.get_json()["error"]
+
+
+def test_a_view_without_a_baseline_says_so(client, tdc, fake_baseline_dir):
+    r = client.get("/api/syscalls/baseline?view=x86")
+    assert r.status_code == 503 and "x86 view" in r.get_json()["error"]
+
+
+def test_the_catalog_page_is_bounded_and_says_which_baseline_it_is(client, tdc, fake_baseline_dir):
+    body = client.get("/api/syscalls/baseline?view=x64&limit=99999&offset=-5").get_json()
+    assert body["limit"] == tdc.SYSCALL_PAGE_MAX and body["offset"] == 0
+    assert (body["build"], body["view"], body["symbols"]) == ("26220.5770", "x64", True)
+    assert client.get("/api/syscalls/baseline?view=x64&limit=lots").status_code == 400
+
+
+def test_a_lookup_names_the_stub_prefix_that_is_compared(client, tdc, fake_baseline_dir):
+    body = client.get("/api/syscalls/NtWriteVirtualMemory?view=x64").get_json()
+    assert body["prefix_len"] == syscall_baseline.stub_prefix_len(
+        syscall_baseline.load_baseline(str(fake_baseline_dir / "ntsleuth-26220.5770-x64.json")).syscalls[
+            "NtWriteVirtualMemory"], "x64")
+    assert body["stub_hex"]
+
+
+# --- the baseline of a new build is extracted in the background --------------------------
+
+def test_a_build_change_triggers_a_fresh_extraction(client, tdc, monkeypatch,
+                                                    fake_baseline_dir):
+    calls = []
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")
+    monkeypatch.setattr(tdc, "_extract_baseline",
+                        lambda view, symbols: calls.append((view, symbols)) or True)
+    assert tdc._get_syscall_baseline("arm64") is None
+    tdc._syscall_extract_state["thread"].join(5)
+    assert calls and calls[0][0] == "arm64"
+
+
+def test_without_the_symbol_server_the_extraction_drops_symbols(client, tdc, monkeypatch):
+    monkeypatch.setattr(tdc, "_symbol_server_reachable", lambda: False)
+    args = tdc._ntsleuth_args("arm64")
+    assert "--no-symbols" in args
+
+
+def test_with_the_symbol_server_the_extraction_keeps_them(tdc, monkeypatch):
+    monkeypatch.setattr(tdc, "_symbol_server_reachable", lambda: True)
+    assert "--no-symbols" not in tdc._ntsleuth_args("arm64")
+    assert "--no-symbols" in tdc._ntsleuth_args("arm64", symbols=False)
+    assert tdc._ntsleuth_args("x64")[0].endswith("ntsleuth-x64.exe")
+
+
+def test_status_says_when_parameters_are_incomplete(client, tdc, monkeypatch,
+                                                    degraded_baseline_dir):
+    body = client.get("/api/syscalls/status").get_json()
+    assert body["baselines"][0]["symbols"] is False
+    assert "parameter" in body["baselines"][0]["note"].lower()
+
+
+def test_the_catalog_says_when_its_parameters_are_incomplete(client, tdc, degraded_baseline_dir):
+    assert client.get("/api/syscalls/baseline?view=arm64").get_json()["symbols"] is False
+
+
+def test_a_request_does_not_wait_for_the_extraction_and_two_start_one(client, tdc, monkeypatch, fake_baseline_dir):
+    started, release, calls = threading.Event(), threading.Event(), []
+
+    def slow(view, symbols):
+        calls.append(view)
+        started.set()
+        release.wait(10)
+        return True
+
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")
+    monkeypatch.setattr(tdc, "_extract_baseline", slow)
+    try:
+        first = client.get("/api/syscalls/baseline?view=arm64")      # returns while NTSleuth "runs"
+        assert started.wait(5)
+        second = client.get("/api/syscalls/baseline?view=arm64")
+        for r in (first, second):
+            assert r.status_code == 503 and "baseline" in r.get_json()["error"]
+        assert "background" in second.get_json()["error"]
+        running = client.get("/api/syscalls/status").get_json()["extraction"]["running"]
+        assert running == [{"build": "26300.1", "view": "arm64"}]
+    finally:
+        release.set()
+    tdc._syscall_extract_state["thread"].join(5)
+    assert calls == ["arm64"]
+
+
+def test_two_views_are_extracted_one_after_the_other(tdc, monkeypatch):
+    # NTSleuth writes to one output folder: a second run must not start inside the first
+    inside, overlap, entered, release = [], [], threading.Event(), threading.Event()
+
+    def slow(view, symbols):
+        inside.append(view)
+        overlap.append(len(inside))
+        entered.set()
+        release.wait(10)
+        inside.remove(view)
+        return True
+
+    monkeypatch.setattr(tdc, "_extract_baseline", slow)
+    assert tdc._start_baseline_extraction("26300.1", "arm64")
+    first = tdc._syscall_extract_state["thread"]
+    assert entered.wait(5)
+    assert tdc._start_baseline_extraction("26300.1", "x64")
+    second = tdc._syscall_extract_state["thread"]
+    time.sleep(0.2)                  # long enough for the second to have entered, were it not held back
+    assert inside == ["arm64"]
+    release.set()
+    first.join(5)
+    second.join(5)
+    assert overlap == [1, 1]
+
+
+def test_a_failed_extraction_is_not_retried_at_once_and_says_why(client, tdc, monkeypatch, fake_baseline_dir):
+    calls = []
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")
+    monkeypatch.setattr(tdc, "_extract_baseline", lambda view, symbols: calls.append(view) or False)
+    client.get("/api/syscalls/baseline?view=arm64")
+    tdc._syscall_extract_state["thread"].join(5)
+    again = client.get("/api/syscalls/baseline?view=arm64")
+    assert calls == ["arm64"]
+    assert "not installed" in again.get_json()["error"]
+    failed = client.get("/api/syscalls/status").get_json()["extraction"]["failed"]
+    assert failed[0]["build"] == "26300.1" and "not installed" in failed[0]["reason"]
+    monkeypatch.setattr(tdc, "SYSCALL_EXTRACT_RETRY", 0)
+    client.get("/api/syscalls/baseline?view=arm64")
+    tdc._syscall_extract_state["thread"].join(5)
+    assert calls == ["arm64", "arm64"]
+
+
+def test_an_extraction_that_raises_is_a_failure_with_its_reason(client, tdc, monkeypatch, fake_baseline_dir):
+    def boom(view, symbols):
+        raise RuntimeError("NTSleuth exited with 3: bad")
+
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")
+    monkeypatch.setattr(tdc, "_extract_baseline", boom)
+    client.get("/api/syscalls/baseline?view=arm64")
+    tdc._syscall_extract_state["thread"].join(5)
+    assert "exited with 3" in client.get("/api/syscalls/baseline?view=arm64").get_json()["error"]
+    assert tdc._syscall_extract_state["running"] == set()
+
+
+def test_an_x86_view_or_an_unknown_build_starts_no_extraction(tdc, monkeypatch):
+    monkeypatch.setattr(tdc, "_extract_baseline", lambda view, symbols: pytest.fail("extracted"))
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: None)
+    assert tdc._get_syscall_baseline("arm64") is None
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")
+    assert tdc._get_syscall_baseline("x86") is None
+    assert tdc._syscall_extract_state["thread"] is None
+
+
+def _fake_ntsleuth(tdc, monkeypatch, tmp_path, payload, returncode=0):
+    """NTSleuth as a program that writes `payload` to output/syscalls.json, as it does beside where it runs."""
+    exe = pathlib.Path(tdc.NTSLEUTH_DIR) / "ntsleuth-arm64.exe"
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    exe.write_bytes(b"MZ")
+    runs = []
+
+    def run(args, timeout=None, **kwargs):
+        runs.append((args, kwargs))
+        if payload is not None:
+            out = pathlib.Path(kwargs["cwd"]) / "output" / "syscalls.json"
+            out.parent.mkdir(exist_ok=True)
+            out.write_text(json.dumps(payload))
+        return subprocess.CompletedProcess(args, returncode, "", "boom\nlast line")
+
+    monkeypatch.setattr(tdc, "_run_cmd", run)
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")
+    return runs
+
+
+def test_the_extraction_stores_a_baseline_the_web_ui_then_loads(tdc, monkeypatch, tmp_path):
+    runs = _fake_ntsleuth(tdc, monkeypatch, tmp_path, _fixture("arm64"))
+    assert tdc._extract_baseline("arm64", False) is True
+    path = pathlib.Path(tdc.NTSLEUTH_BASELINE_DIR) / "ntsleuth-26300.1-arm64.json"
+    stored = syscall_baseline.load_baseline(str(path))
+    assert (stored.build, stored.view, stored.symbols) == ("26300.1", "arm64", False)
+    assert "--no-symbols" in runs[0][0] and runs[0][1]["cwd"] == tdc.NTSLEUTH_DIR
+    assert not list(path.parent.glob("*.tmp"))
+    assert tdc._get_syscall_baseline("arm64").build == "26300.1"
+
+
+def test_an_extraction_with_symbols_is_not_marked_degraded(tdc, monkeypatch, tmp_path):
+    _fake_ntsleuth(tdc, monkeypatch, tmp_path, _fixture("arm64")["syscalls"])        # a bare list also loads
+    assert tdc._extract_baseline("arm64", True) is True
+    assert tdc._get_syscall_baseline("arm64").symbols is True
+
+
+def test_an_extraction_without_ntsleuth_says_so_and_writes_nothing(tdc, tmp_path):
+    assert tdc._extract_baseline("arm64", True) is False
+    assert not os.path.exists(tdc.NTSLEUTH_BASELINE_DIR)
+
+
+@pytest.mark.parametrize("payload, returncode, why", [
+    (_fixture("arm64"), 3, "exited with 3: last line"),
+    (None, 0, "no usable JSON"),
+    ({"syscalls": []}, 0, "no usable syscall"),
+    ({"syscalls": "x"}, 0, "neither a list"),
+])
+def test_a_failed_extraction_stores_no_baseline(tdc, monkeypatch, tmp_path, payload, returncode, why):
+    _fake_ntsleuth(tdc, monkeypatch, tmp_path, payload, returncode)
+    with pytest.raises(RuntimeError) as err:
+        tdc._extract_baseline("arm64", True)
+    assert why in str(err.value)
+    assert not os.path.exists(tdc.NTSLEUTH_BASELINE_DIR)
+
+
+def test_an_output_left_by_an_earlier_run_is_not_taken_for_this_ones(tdc, monkeypatch, tmp_path):
+    _fake_ntsleuth(tdc, monkeypatch, tmp_path, None)
+    stale = pathlib.Path(tdc.NTSLEUTH_DIR) / "output" / "syscalls.json"
+    stale.parent.mkdir()
+    stale.write_text(json.dumps(_fixture("arm64")))
+    with pytest.raises(RuntimeError, match="no usable JSON"):
+        tdc._extract_baseline("arm64", True)
+
+
+def test_a_baseline_that_changed_on_disk_is_read_again(client, tdc, fake_baseline_dir):
+    assert client.get("/api/syscalls/baseline?view=arm64").get_json()["total"] > 1
+    path = fake_baseline_dir / "ntsleuth-26220.5770-arm64.json"
+    document = _fixture("arm64")
+    document["syscalls"] = document["syscalls"][:1]
+    path.write_text(json.dumps(document))
+    assert client.get("/api/syscalls/baseline?view=arm64").get_json()["total"] == 1
+
+
+# --- measuring a process through the routes --------------------------------------------------
+
+class _Target:
+    """The process a scan request is about: what the web UI is told of it, and the reader it opens."""
+
+    def __init__(self):
+        self.view, self.reader, self.opened, self.history = "arm64", None, [], []
+
+
+@pytest.fixture
+def target(tdc, monkeypatch, fake_baseline_dir):
+    t = _Target()
+
+    def opening(pid, view, build):
+        t.opened.append((pid, view, build))
+        if isinstance(t.reader, Exception):
+            raise t.reader
+        return contextlib.nullcontext(t.reader)
+
+    monkeypatch.setattr(tdc, "_syscall_view_for_pid", lambda pid: t.view)
+    monkeypatch.setattr(tdc, "_image_path_for_pid", lambda pid: "C:\\Samples\\sample.exe")
+    monkeypatch.setattr(tdc, "_open_syscall_reader", opening)
+    monkeypatch.setattr(tdc, "_record_scan",
+                        lambda tool, name, result, status="ok": t.history.append((tool, name, result, status)))
+    t.reader = _reader_from(syscall_baseline.load_baseline(str(fake_baseline_dir / "ntsleuth-26220.5770-arm64.json")),
+                            patched={})
+    return t
+
+
+def _patched_reader(tdc, fake_baseline_dir, owner, view="arm64", name="NtWriteVirtualMemory", live="0500001400000000"):
+    baseline = syscall_baseline.load_baseline(str(fake_baseline_dir / f"ntsleuth-26220.5770-{view}.json"))
+    return _reader_from(baseline, patched={name: (live, owner)})
+
+
+def test_a_scan_measures_the_process_and_scores_it(client, tdc, target, fake_baseline_dir):
+    target.reader = _patched_reader(tdc, fake_baseline_dir, "private")
+    body = client.post("/api/syscalls/scan", json={"pid": 4812}).get_json()
+    assert body["counts"]["patched"] == 1 and body["view"] == "arm64"
+    assert body["tool"] == "Syscalls" and body["pid"] == 4812 and body["modules"] == ["ntdll.dll"]
+    assert body["states"]["NtWriteVirtualMemory"]["state"] == "patched"
+    assert [f["kind"] for f in body["evidence"]["findings"]] == ["syscall_stub_patched"]
+    assert body["evidence"]["score"] > 0
+    # the reader is opened for the view and the build the route resolved, not for what the reader derives
+    assert target.opened == [(4812, "arm64", "26220.5770")]
+
+
+def test_a_scan_goes_to_the_history_without_the_state_of_every_stub(client, tdc, target, fake_baseline_dir):
+    target.reader = _patched_reader(tdc, fake_baseline_dir, "private")
+    client.post("/api/syscalls/scan", json={"pid": 4812})
+    [(tool, name, result, status)] = target.history
+    assert (tool, name, status) == ("Syscalls", "PID 4812", "ok")
+    assert "states" not in result and result["counts"]["patched"] == 1 and result["evidence"]["score"] > 0
+
+
+def test_a_scan_of_a_clean_process_scores_nothing(client, tdc, target):
+    body = client.post("/api/syscalls/scan", json={"pid": 4812}).get_json()
+    assert body["deviations"] == [] and body["evidence"]["score"] == 0 and body["evidence"]["label"] == "CLEAN"
+
+
+def test_a_scan_takes_the_view_from_the_image_and_the_baseline_of_that_view(client, tdc, target, fake_baseline_dir):
+    target.view = "x64"
+    target.reader = _patched_reader(tdc, fake_baseline_dir, "private", view="x64", name="NtProtectVirtualMemory",
+                                    live="e900000000" + "00" * 11)
+    body = client.post("/api/syscalls/scan", json={"pid": 4812, "view": "arm64"}).get_json()
+    assert body["view"] == "x64"                        # a view in the request is not a say in the matter
+    assert target.opened[0][1] == "x64"
+
+
+def test_a_scan_of_an_x86_process_has_no_baseline_to_use(client, tdc, target):
+    target.view = "x86"
+    r = client.post("/api/syscalls/scan", json={"pid": 4812})
+    assert r.status_code == 400 and "x86 view" in r.get_json()["error"]
+    assert target.opened == []
+
+
+def test_a_scan_of_a_process_whose_architecture_is_unknown_is_refused_unread(client, tdc, target):
+    target.view = None
+    r = client.post("/api/syscalls/scan", json={"pid": 4812})
+    assert r.status_code == 400 and "baseline" in r.get_json()["error"].lower()
+    assert target.opened == []
+
+
+@pytest.mark.parametrize("pid", ["abc", 0, -4, True, None, "", [4], 2 ** 40, "4812; calc"])
+def test_a_scan_wants_a_pid(client, tdc, target, pid):
+    r = client.post("/api/syscalls/scan", json={"pid": pid})
+    assert r.status_code == 400 and "pid" in r.get_json()["error"]
+    assert target.opened == []
+
+
+def test_a_scan_with_a_body_that_is_not_an_object_is_a_400_not_a_crash(client, tdc, target):
+    assert client.post("/api/syscalls/scan", json=[1, 2]).status_code == 400
+    assert client.post("/api/syscalls/scan", data="x").status_code == 400
+
+
+@pytest.mark.parametrize("modules, expected", [
+    (None, ["ntdll.dll"]), (["win32u.dll"], ["win32u.dll"]), ("ntdll.dll, WIN32U.DLL", ["ntdll.dll", "win32u.dll"]),
+    (["ntdll.dll", "NTDLL.dll"], ["ntdll.dll"])])
+def test_a_scan_measures_the_modules_it_is_asked_for(client, tdc, target, modules, expected):
+    body = client.post("/api/syscalls/scan", json={"pid": 4812, "modules": modules}).get_json()
+    assert body["modules"] == expected
+    assert {s["module"] for s in body["states"].values()} <= set(expected)
+
+
+@pytest.mark.parametrize("modules", [["kernel32.dll"], ["ntdll.dll", "..\\x.dll"], 7, [7], {"a": 1}])
+def test_a_scan_refuses_a_module_it_does_not_know(client, tdc, target, modules):
+    r = client.post("/api/syscalls/scan", json={"pid": 4812, "modules": modules})
+    assert r.status_code == 400 and "modules" in r.get_json()["error"]
+
+
+def test_a_process_that_cannot_be_opened_is_a_400_naming_why(client, tdc, target):
+    target.reader = PermissionError("Access is denied")
+    r = client.post("/api/syscalls/scan", json={"pid": 4812})
+    assert r.status_code == 400 and "cannot read process 4812" in r.get_json()["error"]
+    assert not tdc._syscall_scan_running()
+
+
+def test_a_scan_is_refused_when_the_build_of_the_system_is_not_the_baselines(client, tdc, target, monkeypatch):
+    # the reader and measure compare the build the route resolved with the baseline's: a build that moved under a
+    # running web UI is refused by the measurement, not by a second copy of the check here
+    calls = iter(["26220.5770", "26300.1"])
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: next(calls))
+    r = client.post("/api/syscalls/scan", json={"pid": 4812})
+    assert r.status_code == 400 and "does not match the baseline build" in r.get_json()["error"]
+
+
+class _Blocked(FakeReader):
+    """A process whose module list never comes back until `release` is set."""
+
+    def __init__(self, inner, release):
+        super().__init__(inner._m, inner._ranges, inner._regions, view=inner._view, build=inner._build)
+        self.release, self.entered = release, threading.Event()
+
+    def modules(self):
+        self.entered.set()
+        self.release.wait(10)
+        return self._m
+
+
+def _until(predicate, seconds=5):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end and not predicate():
+        time.sleep(0.01)
+    return predicate()
+
+
+def test_a_scan_that_hangs_is_a_504_and_is_still_counted_until_the_reader_returns(client, tdc, target, monkeypatch):
+    release = threading.Event()
+    target.reader = _Blocked(target.reader, release)
+    monkeypatch.setattr(tdc, "SYSCALL_SCAN_TIMEOUT", 0.05)
+    monkeypatch.setattr(tdc, "SYSCALL_SCAN_GRACE", 0.05)
+    try:
+        r = client.post("/api/syscalls/scan", json={"pid": 4812})
+        assert r.status_code == 504 and "timed out" in r.get_json()["error"]
+        assert target.reader.entered.is_set()
+        assert tdc._syscall_scan_running() is True       # the thread still holds the process: no update under it
+    finally:
+        release.set()
+    assert _until(lambda: not tdc._syscall_scan_running())
+    assert target.history == []                          # nothing timed out is a result
+
+
+def test_a_scan_that_runs_out_of_time_reads_no_more_and_is_a_504(client, tdc, target, monkeypatch):
+    monkeypatch.setattr(tdc, "SYSCALL_SCAN_TIMEOUT", 0)
+    r = client.post("/api/syscalls/scan", json={"pid": 4812})
+    assert r.status_code == 504 and target.reader.reads == 0
+    assert _until(lambda: not tdc._syscall_scan_running())
+
+
+def test_no_scan_is_counted_once_it_is_done(client, tdc, target):
+    assert tdc._syscall_scan_running() is False
+    client.post("/api/syscalls/scan", json={"pid": 4812})
+    assert tdc._syscall_scan_running() is False
+
+
+def test_scans_of_two_processes_run_side_by_side(client, tdc, target, monkeypatch):
+    # no scan locks another out: both readers are in `modules` at once
+    release, inside = threading.Event(), []
+    base = target.reader
+
+    class Waiting(_Blocked):
+        def modules(self):
+            inside.append(1)
+            return super().modules()
+
+    readers = iter([Waiting(base, release), Waiting(base, release)])
+    monkeypatch.setattr(tdc, "_open_syscall_reader", lambda pid, view, build: contextlib.nullcontext(next(readers)))
+    answers = []
+    threads = [threading.Thread(target=lambda: answers.append(
+        tdc.app.test_client().post("/api/syscalls/scan", json={"pid": 4812}).status_code)) for _ in range(2)]
+    for t in threads:
+        t.start()
+    assert _until(lambda: len(inside) == 2) and tdc._syscall_scan_running()
+    release.set()
+    for t in threads:
+        t.join(5)
+    assert answers == [200, 200]
+    assert not tdc._syscall_scan_running()
+
+
+def test_the_new_post_routes_are_behind_the_cross_site_check_and_the_maintenance_gate(client, tdc, target,
+                                                                                      monkeypatch):
+    writes = (("post", "/api/syscalls/scan", {"pid": 4812}), ("post", "/api/syscalls/stubs", {"pid": 4812}),
+              ("post", "/api/syscalls/hook-baseline", {"pid": 4812}), ("delete", "/api/syscalls/hook-baseline", None))
+    for method, path, body in writes:
+        r = getattr(client, method)(path, json=body, headers={"Origin": "http://evil.example"})
+        assert r.status_code == 403, path
+    assert target.opened == []
+    assert client.get("/api/syscalls/status", headers={"Host": "evil.example"}).status_code == 403
+
+    class Busy:
+        maintenance = True
+
+    monkeypatch.setattr(tdc, "_update_manager", Busy())
+    for method, path, body in writes:
+        r = getattr(client, method)(path, json=body)
+        assert r.status_code == 503 and r.get_json()["maintenance"] is True, path
+    assert target.opened == []
+    assert client.get("/api/syscalls/status").status_code == 200
+
+
+# --- stubs outside ntdll through the route -------------------------------------------------
+
+_X64_STUB_0x3A = bytes.fromhex("4c8bd1b8") + (0x3A).to_bytes(4, "little") + bytes.fromhex("f604250803fe7f017503" "0f05")
+_PRIVATE_BASE = 0x1F0000
+
+
+def _x64_space(data, protect=0x20, view="x64"):
+    """An x64 process whose only private executable memory holds `data`."""
+    free = syscall_scan.Region(0, 0, None, 0, 0, 0)
+    private = syscall_scan.Region(syscall_scan.MEM_COMMIT, syscall_scan.MEM_PRIVATE, None, 0, 0, protect)
+    size = (len(data) + 0xFFF) & ~0xFFF
+    regions = [(0, _PRIVATE_BASE, free), (_PRIVATE_BASE, size, private),
+               (_PRIVATE_BASE + size, syscall_scan._USER_SPACE_END - _PRIVATE_BASE - size, free)]
+    return FakeReader([], [(_PRIVATE_BASE, bytearray(data.ljust(size, b"\0")))], regions, view=view)
+
+
+def test_a_stub_in_a_process_is_found_and_the_search_says_how_far_it_went(client, tdc, target):
+    target.view = "x64"
+    target.reader = _x64_space(b"\x90" * 0x40 + _X64_STUB_0x3A + b"\xc3")
+    r = client.post("/api/syscalls/stubs", json={"pid": 4812})
+    body = r.get_json()
+    assert r.status_code == 200 and body["mode"] == "process" and body["view"] == "x64"
+    assert [h["syscall"] for h in body["hits"]] == ["NtWriteVirtualMemory"]
+    assert body["hits"][0]["address"] == _PRIVATE_BASE + 0x40
+    # StubScan's own attributes do not survive json.dumps: the route has to say them in keys
+    assert (body["partial"], body["regions_searched"], body["note"]) == (False, 1, "")
+    assert body["hits"][0]["import_present"] is None
+    assert [f["kind"] for f in body["evidence"]["findings"]] == ["direct_syscall_stub"]
+    # a hint, as no import table was expanded: it holds its weight only with a second source
+    finding = body["evidence"]["findings"][0]
+    assert finding["needs_corroboration"] is True and finding["factors"]["corroboration"] < 1
+
+
+def test_a_search_that_could_not_read_all_says_partial(client, tdc, target):
+    target.view = "x64"
+    reader = _x64_space(_X64_STUB_0x3A)
+    reader._cut = _PRIVATE_BASE                       # every read of that memory fails
+    target.reader = reader
+    body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
+    assert body["hits"] == [] and body["partial"] is True and "not read" in body["note"]
+
+
+def test_a_stub_search_of_a_process_of_another_view_than_the_reader_is_refused(client, tdc, target):
+    target.view = "x64"
+    target.reader = _x64_space(_X64_STUB_0x3A, view="arm64")
+    r = client.post("/api/syscalls/stubs", json={"pid": 4812})
+    assert r.status_code == 400 and "does not match the baseline view" in r.get_json()["error"]
+
+
+def test_a_stub_search_wants_a_pid_or_a_path_not_both_nor_neither(client, tdc, target):
+    for body in ({}, {"pid": 4812, "path": "C:\\x"}, {"pid": "", "path": ""}):
+        r = client.post("/api/syscalls/stubs", json=body)
+        assert r.status_code == 400 and "pid or a path" in r.get_json()["error"]
+
+
+@pytest.fixture
+def sample_dir(tdc, monkeypatch, tmp_path):
+    folder = tmp_path / "samples"
+    folder.mkdir()
+    monkeypatch.setattr(tdc, "_readable_roots", lambda: [str(folder)])
+    return folder
+
+
+def test_a_stub_in_a_file_is_found(client, tdc, target, sample_dir):
+    path = sample_dir / "loader.bin"
+    path.write_bytes(b"\x90" * 16 + _X64_STUB_0x3A + b"\xc3")
+    r = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"})
+    body = r.get_json()
+    assert r.status_code == 200 and body["mode"] == "file" and body["process"] == "loader.bin"
+    assert [(h["syscall"], h["offset"]) for h in body["hits"]] == [("NtWriteVirtualMemory", 16)]
+    assert body["imports_read"] is False and body["hits"][0]["import_present"] is None
+    assert body["partial"] is False and target.opened == []         # a file opens no process
+
+
+def test_a_file_that_imports_the_function_says_so_but_never_that_it_does_not(client, tdc, target, sample_dir,
+                                                                             monkeypatch):
+    path = sample_dir / "loader.bin"
+    path.write_bytes(_X64_STUB_0x3A)
+    monkeypatch.setattr(tdc, "_pe_import_names", lambda data: {"NtWriteVirtualMemory"})
+    hit = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()["hits"][0]
+    assert hit["import_present"] is True
+    # a table that was read and lacks the name is still no proof: only the expanded table can give that
+    monkeypatch.setattr(tdc, "_pe_import_names", lambda data: {"CreateFileW"})
+    hit = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()["hits"][0]
+    assert hit["import_present"] is None
+
+
+def _pe_importing(*names):
+    """A minimal PE32+ whose import table lists `names` from one DLL."""
+    import struct
+    base, ilt, dll = 0x1000, 0x1040, 0x1080
+    hints, at = b"", 0x10A0
+    thunks = b""
+    for name in names:
+        thunks += struct.pack("<Q", at)
+        entry = struct.pack("<H", 0) + name.encode() + b"\0"
+        entry += b"\0" * (len(entry) % 2)
+        hints, at = hints + entry, at + len(entry)
+    section = bytearray(0x200)
+    section[0:40] = struct.pack("<IIIII", ilt, 0, 0, dll, ilt) + bytes(20)
+    section[0x40:0x40 + len(thunks)] = thunks
+    section[0x80:0x80 + 10] = b"ntdll.dll\0"
+    section[0xA0:0xA0 + len(hints)] = hints
+    optional = struct.pack("<HBBIIIII", 0x20B, 14, 0, 0, 0x200, 0, 0, 0x1000)
+    optional += struct.pack("<QIIHHHHHHIIIIHH", 0x140000000, 0x1000, 0x200, 6, 0, 0, 0, 6, 0, 0, 0x2000, 0x200, 0, 3, 0)
+    optional += struct.pack("<QQQQII", 0x100000, 0x1000, 0x100000, 0x1000, 0, 16)
+    directories = bytearray(128)
+    directories[8:16] = struct.pack("<II", base, 40)
+    optional += bytes(directories)
+    assert len(optional) == 0xF0
+    coff = struct.pack("<HHIIIHH", 0x8664, 1, 0, 0, 0, 0xF0, 0x22)
+    header = b"MZ" + bytes(0x3A) + struct.pack("<I", 0x40) + b"PE\0\0" + coff + optional
+    header += struct.pack("<8sIIIIIIHHI", b".idata", 0x200, base, 0x200, 0x200, 0, 0, 0, 0, 0x40000040)
+    return header.ljust(0x200, b"\0") + bytes(section)
+
+
+def test_the_imports_of_a_pe_are_read_and_a_file_that_is_none_is_unread(tdc):
+    assert tdc._pe_import_names(_pe_importing("NtWriteVirtualMemory", "CreateFileW")) == {
+        "NtWriteVirtualMemory", "CreateFileW"}
+    assert tdc._pe_import_names(b"not a pe at all") is None
+    assert tdc._pe_import_names(b"") is None
+    assert tdc._pe_import_names(_pe_importing("NtClose")[:0x60]) is None
+
+
+def test_a_pe_that_carries_a_stub_and_imports_it_says_so(client, tdc, target,
+                                                                                         sample_dir):
+    path = sample_dir / "loader.exe"
+    path.write_bytes(_pe_importing("NtWriteVirtualMemory") + _X64_STUB_0x3A)
+    body = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()
+    assert body["imports_read"] is True and body["hits"][0]["import_present"] is True
+
+
+@pytest.mark.parametrize("name", ["../outside.bin", "sub/../../outside.bin"])
+def test_a_path_outside_the_readable_folders_is_refused(client, tdc, target, sample_dir, tmp_path, name):
+    (tmp_path / "outside.bin").write_bytes(_X64_STUB_0x3A)
+    r = client.post("/api/syscalls/stubs", json={"path": str(sample_dir / name), "view": "x64"})
+    assert r.status_code == 403
+
+
+def test_a_link_out_of_the_readable_folders_is_refused(client, tdc, target, sample_dir, tmp_path):
+    (tmp_path / "outside.bin").write_bytes(_X64_STUB_0x3A)
+    link = sample_dir / "link.bin"
+    os.symlink(tmp_path / "outside.bin", link)
+    assert client.post("/api/syscalls/stubs", json={"path": str(link), "view": "x64"}).status_code == 403
+
+
+@pytest.mark.parametrize("path", ["\\\\host\\share\\x.bin", "relative.bin", "C:x.bin", "nul\0byte", 7])
+def test_a_path_that_is_not_a_local_absolute_path_is_refused(client, tdc, target, sample_dir, path):
+    assert client.post("/api/syscalls/stubs", json={"path": path, "view": "x64"}).status_code in (400, 403)
+
+
+def test_a_file_search_wants_a_view_and_a_file_that_is_there_and_not_too_big(client, tdc, target, sample_dir,
+                                                                           monkeypatch):
+    path = sample_dir / "loader.bin"
+    path.write_bytes(_X64_STUB_0x3A)
+    assert client.post("/api/syscalls/stubs", json={"path": str(path)}).status_code == 400
+    assert client.post("/api/syscalls/stubs", json={"path": str(path), "view": "../x"}).status_code == 400
+    assert client.post("/api/syscalls/stubs", json={"path": str(sample_dir / "gone.bin"), "view": "x64"}
+                       ).status_code == 400
+    assert client.post("/api/syscalls/stubs", json={"path": str(sample_dir), "view": "x64"}).status_code == 400
+    monkeypatch.setattr(tdc, "SYSCALL_FILE_MAX", 4)
+    r = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"})
+    assert r.status_code == 400 and "larger than" in r.get_json()["error"]
+
+
+# --- the hook allowlist ---------------------------------------------------------------------
+
+def test_there_is_one_allowlist_in_the_process(tdc):
+    assert tdc._get_hook_allowlist() is tdc._get_hook_allowlist()
+    seen = []
+    threads = [threading.Thread(target=lambda: seen.append(tdc._get_hook_allowlist())) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert all(a is seen[0] for a in seen) and seen[0] is tdc._get_hook_allowlist()
+
+
+def test_the_hook_list_starts_empty_and_says_where_it_lives(client, tdc):
+    body = client.get("/api/syscalls/hook-baseline").get_json()
+    assert body["entries"] == [] and body["problem"] is None and body["path"] == tdc.SYSCALL_HOOK_ALLOWLIST_FILE
+
+
+def test_hooks_are_recorded_per_view_and_a_second_view_keeps_the_first(client, tdc, target, fake_baseline_dir):
+    target.reader = _patched_reader(tdc, fake_baseline_dir, "edr.dll")
+    first = client.post("/api/syscalls/hook-baseline", json={"pid": 4812}).get_json()
+    assert (first["added"], first["entries"], first["view"], first["build"]) == (1, 1, "arm64", "26220.5770")
+    target.view = "x64"
+    target.reader = _patched_reader(tdc, fake_baseline_dir, "edr.dll", view="x64", name="NtProtectVirtualMemory",
+                                    live="e900000000" + "00" * 11)
+    second = client.post("/api/syscalls/hook-baseline", json={"pid": 4812}).get_json()
+    assert (second["added"], second["entries"], second["view"]) == (1, 1, "x64")
+    entries = client.get("/api/syscalls/hook-baseline").get_json()["entries"]
+    assert sorted((e["view"], e["syscall"], e["owner"]) for e in entries) == [
+        ("arm64", "NtWriteVirtualMemory", "edr.dll"), ("x64", "NtProtectVirtualMemory", "edr.dll")]
+    only = client.get("/api/syscalls/hook-baseline?build=26220.5770&view=x64").get_json()["entries"]
+    assert [e["view"] for e in only] == ["x64"]
+    with open(tdc.SYSCALL_HOOK_ALLOWLIST_FILE, encoding="utf-8") as fh:
+        assert len(json.load(fh)["sets"]) == 2
+
+
+def test_a_recorded_hook_is_known_to_the_next_scan_and_no_longer_scores(client, tdc, target, fake_baseline_dir):
+    target.reader = _patched_reader(tdc, fake_baseline_dir, "edr.dll")
+    before = client.post("/api/syscalls/scan", json={"pid": 4812}).get_json()
+    assert before["states"]["NtWriteVirtualMemory"]["state"] == "hooked"
+    assert before["evidence"]["score"] > 0
+    client.post("/api/syscalls/hook-baseline", json={"pid": 4812})
+    after = client.post("/api/syscalls/scan", json={"pid": 4812}).get_json()
+    assert after["states"]["NtWriteVirtualMemory"]["allowlisted"] is True
+    assert after["counts"]["hooked"] == 1                       # still seen, no longer a finding
+    assert after["evidence"]["score"] == 0
+
+
+def test_a_patch_is_never_recorded_as_a_known_hook(client, tdc, target, fake_baseline_dir):
+    target.reader = _patched_reader(tdc, fake_baseline_dir, "private")
+    body = client.post("/api/syscalls/hook-baseline", json={"pid": 4812}).get_json()
+    assert body["added"] == 0 and client.get("/api/syscalls/hook-baseline").get_json()["entries"] == []
+
+
+def test_the_known_hooks_can_be_forgotten_for_one_view_or_all(client, tdc, target, fake_baseline_dir):
+    target.reader = _patched_reader(tdc, fake_baseline_dir, "edr.dll")
+    client.post("/api/syscalls/hook-baseline", json={"pid": 4812})
+    target.view = "x64"
+    target.reader = _patched_reader(tdc, fake_baseline_dir, "edr.dll", view="x64", name="NtProtectVirtualMemory",
+                                    live="e900000000" + "00" * 11)
+    client.post("/api/syscalls/hook-baseline", json={"pid": 4812})
+    assert client.delete("/api/syscalls/hook-baseline?build=26220.5770&view=arm64").get_json()["entries"] == 1
+    assert [e["view"] for e in client.get("/api/syscalls/hook-baseline").get_json()["entries"]] == ["x64"]
+    assert client.delete("/api/syscalls/hook-baseline").get_json() == {"ok": True, "entries": 0}
+
+
+@pytest.mark.parametrize("query", ["build=26220.5770", "view=arm64", "build=&view=arm64", "build=1&view=", "build=1&view=../x"])
+def test_one_of_build_and_view_alone_is_no_wildcard(client, tdc, target, fake_baseline_dir, query):
+    target.reader = _patched_reader(tdc, fake_baseline_dir, "edr.dll")
+    client.post("/api/syscalls/hook-baseline", json={"pid": 4812})
+    assert client.delete("/api/syscalls/hook-baseline?" + query).status_code == 400
+    assert client.get("/api/syscalls/hook-baseline?" + query).status_code == 400
+    assert len(client.get("/api/syscalls/hook-baseline").get_json()["entries"]) == 1
+
+
+def test_an_allowlist_that_cannot_be_written_is_a_500_and_stays_as_it_was(client, tdc, target, fake_baseline_dir,
+                                                                          monkeypatch):
+    target.reader = _patched_reader(tdc, fake_baseline_dir, "edr.dll")
+    allowlist = tdc._get_hook_allowlist()
+    monkeypatch.setattr(allowlist, "save", lambda: (_ for _ in ()).throw(OSError("disk full")))
+    r = client.post("/api/syscalls/hook-baseline", json={"pid": 4812})
+    assert r.status_code == 500 and "disk full" in r.get_json()["error"]
+    assert allowlist.entries() == []
+
+
+def test_a_scan_is_recorded_as_a_syscall_row_with_its_verdict(tdc):
+    verdict = tdc._normalize_scan("Syscalls", {"evidence": {"label": "MALICIOUS", "score": 6.5}})
+    assert verdict == ("detected", True, False, 6.5)
+    clean = tdc._normalize_scan("Syscalls", {"evidence": {"label": "CLEAN", "score": 0}})
+    assert clean[0] == "clean" and clean[2] is True
+
+
+def test_the_symbol_server_is_reachable_when_a_connection_opens(app_module, monkeypatch):
+    # not `tdc`: its stand-in for the probe is not what is under test
+    import socket
+    closed, asked = [], []
+
+    class Connection:
+        def close(self):
+            closed.append(1)
+
+    def connect(address, timeout=None):
+        asked.append((address, timeout))
+        return Connection()
+
+    monkeypatch.setattr(socket, "create_connection", connect)
+    assert app_module._symbol_server_reachable() is True and closed == [1]
+    assert asked[0][0] == ("msdl.microsoft.com", 443) and asked[0][1] == app_module.SYMBOL_SERVER_WAIT
+
+    def refuse(address, timeout=None):
+        raise OSError("network is unreachable")
+
+    monkeypatch.setattr(socket, "create_connection", refuse)
+    assert app_module._symbol_server_reachable() is False

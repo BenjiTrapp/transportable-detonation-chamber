@@ -39,6 +39,8 @@ WIKI_FILE = "webui/static/wiki.html"
 FILES = {
     "webui/app.py": r"C:\DetonationChamberUI\app.py",
     "webui/memory_evidence.py": r"C:\DetonationChamberUI\memory_evidence.py",
+    "webui/syscall_baseline.py": r"C:\DetonationChamberUI\syscall_baseline.py",
+    "webui/syscall_scan.py": r"C:\DetonationChamberUI\syscall_scan.py",
     "webui/minidump_analysis.py": r"C:\DetonationChamberUI\minidump_analysis.py",
     "webui/pipe_analysis.py": r"C:\DetonationChamberUI\pipe_analysis.py",
     "webui/pipe_signatures.json": r"C:\DetonationChamberUI\pipe_signatures.json",

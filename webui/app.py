@@ -36,6 +36,9 @@ import requests
 # Tool-agnostic scoring layer for live-memory findings. Scanners are plugged in
 # as normalizers there, so the verdict logic does not depend on any one tool.
 import memory_evidence
+# Syscall baseline (NTSleuth) and the measurement of a process against it, for the SYSCALLS tab.
+import syscall_baseline
+import syscall_scan
 import pipe_analysis
 import pipe_proxy
 # Offline analysis of exit-time minidumps (no scanner binary involved).
@@ -299,6 +302,12 @@ SCAN_HISTORY_MAX = 200
 # counterpart to Process Dump's clean-hash database.
 MEMORY_BASELINE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory_baseline.json")
 
+# NTSleuth and the syscall baselines it extracted (ntsleuth-<build>-<view>.json), written when it is provisioned.
+NTSLEUTH_DIR = r"C:\tools\ntsleuth"
+NTSLEUTH_BASELINE_DIR = os.path.join(NTSLEUTH_DIR, "baseline")
+# Hooks seen on this host while it was considered clean; see syscall_scan.HookAllowlist.
+SYSCALL_HOOK_ALLOWLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "syscall_hook_allowlist.json")
+
 
 def _decode_console(raw):
     """Decode output of a Windows console program.
@@ -471,7 +480,7 @@ def _normalize_scan(tool, result):
     elif tool and tool.lower() == "capa":  # capa reports capabilities, not a verdict
         cc = result.get("capability_count")
         verdict = "analyzed" if cc is not None else "unknown"
-    elif tool and tool.lower() == "aether":  # live-memory findings, not a file verdict
+    elif tool and tool.lower() in ("aether", "syscalls"):  # live-memory findings, not a file verdict
         # The evidence layer is authoritative: it already accounts for the host
         # baseline, persistence and corroboration.
         ev = result.get("evidence") or {}
@@ -7717,6 +7726,607 @@ def api_memory_evidence():
         "sources": sorted(cached.keys()),
         "evidence": memory_evidence.score(findings, baseline=_memory_baseline),
     })
+
+
+# --- Syscall map: baseline, measurement, stubs outside ntdll ---
+
+SYSCALL_VIEWS = ("arm64", "x64", "x86")
+# NTSleuth extracts a baseline for these two; an x86 process has none
+SYSCALL_BASELINE_VIEWS = ("arm64", "x64")
+SYSCALL_MODULES = ("ntdll.dll", "win32u.dll")
+# The longest a request waits for a process to be read (seconds), and how long a reader that is
+# stuck in one call gets to come back after that
+SYSCALL_SCAN_TIMEOUT = 120
+SYSCALL_SCAN_GRACE = 10
+SYSCALL_EXTRACT_TIMEOUT = 300
+# A failed extraction of a build and view is not tried again for this long (seconds)
+SYSCALL_EXTRACT_RETRY = 600
+SYSCALL_PAGE_MAX = 500
+SYSCALL_FILE_MAX = 32 * 1024 * 1024     # a file searched for stubs is read whole, and the search holds the GIL
+SYMBOL_SERVER = ("msdl.microsoft.com", 443)
+SYMBOL_SERVER_WAIT = 3.0
+# _process_machine's names for the machine of an image -> the view of its ntdll; ARM64EC code sees the x64 one
+_SYSCALL_MACHINE_VIEW = {"x64": "x64", "ARM64": "arm64", "ARM64EC": "x64", "x86": "x86"}
+_SYSCALL_PARAMETERS_NOTE = ("The parameter table is incomplete: this baseline was extracted without the symbol "
+                            "server. The measurement is not affected, numbers, RVAs and stub bytes come from "
+                            "the disassembly.")
+
+_syscall_baselines = {}                  # file path -> (stamp, Baseline)
+_syscall_baselines_lock = threading.Lock()
+_hook_allowlist = None
+_hook_allowlist_lock = threading.Lock()
+
+
+def _new_syscall_extract_state():
+    # running: (build, view) being extracted; failed: (build, view) -> (when, why); thread: the latest one
+    return {"running": set(), "failed": {}, "thread": None}
+
+
+_syscall_extract_state = _new_syscall_extract_state()
+_syscall_extract_lock = threading.Lock()
+# NTSleuth writes to one output folder: one run at a time
+_syscall_extract_serial = threading.Lock()
+
+_syscall_scans = 0
+_syscall_scans_lock = threading.Lock()
+
+
+def _get_hook_allowlist():
+    """The one hook allowlist of this process. A second instance would write its sets over the first's: each
+    commits what it holds in memory."""
+    global _hook_allowlist
+    with _hook_allowlist_lock:
+        if _hook_allowlist is None:
+            _hook_allowlist = syscall_scan.HookAllowlist(SYSCALL_HOOK_ALLOWLIST_FILE)
+        return _hook_allowlist
+
+
+def _syscall_view_for_pid(pid):
+    """'arm64', 'x64' or 'x86': the ntdll a process runs against, or None if unknown. From the image's PE header
+    (_process_machine), which tells an x64 process under emulation from a native one."""
+    return _SYSCALL_MACHINE_VIEW.get(_process_machine(pid))
+
+
+def _syscall_default_view():
+    return "arm64" if platform.machine().upper() in ("ARM64", "AARCH64") else "x64"
+
+
+def _current_os_build():
+    r"""`<build>.<revision>` of the running system, the form baseline files are named in, or None."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as key:
+            number = winreg.QueryValueEx(key, "CurrentBuildNumber")[0]
+            revision = winreg.QueryValueEx(key, "UBR")[0]
+    except (ImportError, OSError):
+        return None
+    return f"{number}.{revision}"
+
+
+def _symbol_server_reachable():
+    """Whether the Microsoft symbol server answers a connection; the chamber is usually cut off from it."""
+    import socket
+    try:
+        socket.create_connection(SYMBOL_SERVER, timeout=SYMBOL_SERVER_WAIT).close()
+        return True
+    except OSError:
+        return False
+
+
+def _ntsleuth_exe(view):
+    return os.path.join(NTSLEUTH_DIR, f"ntsleuth-{view}.exe")
+
+
+def _ntsleuth_args(view, symbols=None):
+    """The command line that extracts the baseline of `view`. Without the symbol server, `--no-symbols`:
+    NTSleuth would wait on downloads that never come. `symbols` None asks the server."""
+    if symbols is None:
+        symbols = _symbol_server_reachable()
+    args = [_ntsleuth_exe(view), "--auto-params", "--format", "json"]
+    return args if symbols else args + ["--no-symbols"]
+
+
+def _extract_baseline(view, symbols):
+    """Extract the baseline of `view` for this system's build with NTSleuth and store it where the web UI reads
+    it. True when it did; False when NTSleuth is not installed for that view. Raises RuntimeError with the
+    reason when the run fails: nothing is stored then."""
+    exe, build = _ntsleuth_exe(view), _current_os_build()
+    if not os.path.isfile(exe):
+        return False
+    if not build:
+        raise RuntimeError("the build of this system cannot be determined")
+    # NTSleuth writes output/syscalls.json beside where it runs; a file left by an earlier run must not pass
+    output = os.path.join(NTSLEUTH_DIR, "output", "syscalls.json")
+    try:
+        os.remove(output)
+    except OSError:
+        pass
+    try:
+        proc = _run_cmd(_ntsleuth_args(view, symbols), timeout=SYSCALL_EXTRACT_TIMEOUT, cwd=NTSLEUTH_DIR)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"NTSleuth timed out ({SYSCALL_EXTRACT_TIMEOUT}s)") from None
+    if proc.returncode != 0:
+        tail = ((proc.stderr or proc.stdout or "").strip().splitlines() or [""])[-1][:300]
+        raise RuntimeError(f"NTSleuth exited with {proc.returncode}: {tail}")
+    try:
+        with open(output, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"NTSleuth wrote no usable JSON: {exc}") from None
+    entries = payload.get("syscalls") if isinstance(payload, dict) else payload
+    document = {"symbols": bool(symbols), "syscalls": entries}
+    try:
+        parsed = syscall_baseline.parse_baseline(document, build, view)
+    except syscall_baseline.BaselineError as exc:
+        raise RuntimeError(str(exc)) from None
+    if not parsed.syscalls:
+        raise RuntimeError("NTSleuth's output holds no usable syscall")
+    os.makedirs(NTSLEUTH_BASELINE_DIR, exist_ok=True)
+    target = os.path.join(NTSLEUTH_BASELINE_DIR, f"ntsleuth-{build}-{view}.json")
+    with open(target + ".tmp", "w", encoding="utf-8") as fh:
+        json.dump(document, fh)
+    os.replace(target + ".tmp", target)
+    return True
+
+
+def _syscall_extract_job(build, view):
+    key = (build, view)
+    why = None
+    try:
+        with _syscall_extract_serial:
+            if not _extract_baseline(view, _symbol_server_reachable()):
+                why = f"NTSleuth is not installed for the {view} view ({_ntsleuth_exe(view)})"
+    except Exception as exc:
+        why = str(exc) or type(exc).__name__
+    with _syscall_extract_lock:
+        _syscall_extract_state["running"].discard(key)
+        if why is None:
+            _syscall_extract_state["failed"].pop(key, None)
+        else:
+            _syscall_extract_state["failed"][key] = (time.time(), why)
+
+
+def _start_baseline_extraction(build, view):
+    """Extract the baseline of `build` and `view` in a thread of its own, as a request must not wait for NTSleuth.
+    False when one is running for that pair already, or failed too recently to try again: any number of requests
+    that find the baseline missing start one run between them."""
+    key = (build, view)
+    with _syscall_extract_lock:
+        state = _syscall_extract_state
+        failed = state["failed"].get(key)
+        if key in state["running"] or (failed and time.time() - failed[0] < SYSCALL_EXTRACT_RETRY):
+            return False
+        state["running"].add(key)
+        state["thread"] = threading.Thread(target=_syscall_extract_job, args=(build, view),
+                                           name="syscall-baseline", daemon=True)
+        state["thread"].start()
+    return True
+
+
+def _load_syscall_baseline(path):
+    """The baseline in `path`, read again only when the file changed."""
+    try:
+        info = os.stat(path)
+    except OSError as exc:
+        raise syscall_baseline.BaselineError(f"cannot read baseline {path}: {exc}") from exc
+    stamp = (info.st_mtime_ns, info.st_size)
+    with _syscall_baselines_lock:
+        hit = _syscall_baselines.get(path)
+        if hit and hit[0] == stamp:
+            return hit[1]
+        loaded = syscall_baseline.load_baseline(path)
+        _syscall_baselines[path] = (stamp, loaded)
+        return loaded
+
+
+def _syscall_extraction_note(build, view):
+    with _syscall_extract_lock:
+        if (build, view) in _syscall_extract_state["running"]:
+            return " It is being extracted in the background, try again in a few seconds."
+        failed = _syscall_extract_state["failed"].get((build, view))
+    return f" The last extraction failed: {failed[1]}." if failed else ""
+
+
+def _syscall_baseline_for(view):
+    """`(baseline, None)` for `view` on this system's build, or `(None, why)`. A baseline of another build is no
+    baseline: its RVAs are about other bytes. When there is none for this build, one is extracted in the
+    background."""
+    if view not in SYSCALL_BASELINE_VIEWS:
+        return None, f"there is no syscall baseline for the {view or 'unknown'} view"
+    build = _current_os_build()
+    if not build:
+        return None, "no syscall baseline can be chosen: the build of this system cannot be determined"
+    path = syscall_baseline.find_baseline(NTSLEUTH_BASELINE_DIR, build, view)
+    if path is None:
+        _start_baseline_extraction(build, view)
+        return None, (f"no syscall baseline for build {build}, view {view}."
+                      + _syscall_extraction_note(build, view))
+    try:
+        return _load_syscall_baseline(path), None
+    except syscall_baseline.BaselineError as exc:
+        return None, f"the syscall baseline is unusable: {exc}"
+
+
+def _get_syscall_baseline(view):
+    """The baseline of `view` for this system's build, or None."""
+    return _syscall_baseline_for(view)[0]
+
+
+class _SyscallRouteError(Exception):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+@app.errorhandler(_SyscallRouteError)
+def _syscall_route_error(exc):
+    return jsonify({"error": str(exc)}), exc.status
+
+
+def _syscall_view_param(raw):
+    """The view of a request: one of SYSCALL_VIEWS, this host's own when none is given."""
+    if raw in (None, ""):
+        return _syscall_default_view()
+    if raw not in SYSCALL_VIEWS:
+        raise _SyscallRouteError("view must be one of " + ", ".join(SYSCALL_VIEWS))
+    return raw
+
+
+def _syscall_int_param(raw, name, default, low, high):
+    if raw in (None, ""):
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise _SyscallRouteError(f"{name} must be an integer") from None
+    return max(low, min(value, high))
+
+
+def _syscall_body():
+    data = request.get_json(silent=True) if request.is_json else request.form
+    return data if hasattr(data, "get") else {}
+
+
+def _syscall_pid(raw):
+    try:
+        pid = int(raw)
+    except (TypeError, ValueError):
+        pid = 0
+    if isinstance(raw, bool) or not 0 < pid < 2 ** 32:
+        raise _SyscallRouteError("pid must be a positive integer")
+    return pid
+
+
+def _syscall_modules(raw):
+    """The modules to measure, ntdll alone unless the request names more (a list, or names separated by commas)."""
+    if raw in (None, "", []):
+        return ("ntdll.dll",)
+    names = raw.split(",") if isinstance(raw, str) else raw
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise _SyscallRouteError("modules must be a list of module names")
+    modules = tuple(dict.fromkeys(n.strip().lower() for n in names))
+    if not modules or not set(modules) <= set(SYSCALL_MODULES):
+        raise _SyscallRouteError("modules must be among " + ", ".join(SYSCALL_MODULES))
+    return modules
+
+
+def _syscall_target(pid):
+    """`(view, baseline)` for the process `pid`, or a refusal naming what is missing."""
+    view = _syscall_view_for_pid(pid)
+    if view is None:
+        raise _SyscallRouteError(f"cannot choose a syscall baseline: the architecture of process {pid} is "
+                                 "unknown (it is gone, or its image cannot be read)")
+    baseline, why = _syscall_baseline_for(view)
+    if baseline is None:
+        raise _SyscallRouteError(why)
+    return view, baseline
+
+
+def _syscall_identity(pid):
+    """What findings of a process are keyed by: its image path, as for the other memory scanners."""
+    return _image_path_for_pid(pid) or _image_name_for_pid(pid)
+
+
+class _SyscallTimeout(Exception):
+    pass
+
+
+class _DeadlineReader(syscall_scan.ProcessReader):
+    """`reader` until `deadline` (time.monotonic), then a process that reads nothing. A read cannot be cancelled
+    from outside, so the scan stops by finding nothing more to read, and `expired` says that it did."""
+
+    def __init__(self, reader, deadline):
+        self._reader, self._deadline, self.expired = reader, deadline, False
+
+    def _live(self):
+        if time.monotonic() >= self._deadline:
+            self.expired = True
+        return not self.expired
+
+    def view(self):
+        return self._reader.view()
+
+    def build(self):
+        return self._reader.build()
+
+    def modules(self):
+        return self._reader.modules() if self._live() else None
+
+    def read(self, addr, size):
+        return self._reader.read(addr, size) if self._live() else None
+
+    def region(self, addr):
+        return self._reader.region(addr) if self._live() else None
+
+
+def _open_syscall_reader(pid, view, build):
+    return syscall_scan.Win32Reader(pid, view, build)
+
+
+def _syscall_scan_running():
+    """Whether a syscall scan is reading a process. Also one whose request has given up waiting: its thread
+    holds the process open until its reader returns."""
+    with _syscall_scans_lock:
+        return _syscall_scans > 0
+
+
+def _syscall_read_process(pid, view, build, work):
+    """`work(reader)` on a thread of its own, for the process `pid`, within SYSCALL_SCAN_TIMEOUT.
+
+    `measure` and the stub search have no clock, so the limit is kept here: the request waits for the thread
+    for that long, and a reader that is past its deadline reads nothing, which ends the work. Raises
+    _SyscallRouteError for a refusal, a process that cannot be opened, or a scan that ran out of time."""
+    global _syscall_scans
+    box = {}
+    deadline = time.monotonic() + SYSCALL_SCAN_TIMEOUT
+
+    def job():
+        global _syscall_scans
+        try:
+            with _open_syscall_reader(pid, view, build) as reader:
+                guard = box["guard"] = _DeadlineReader(reader, deadline)
+                box["result"] = work(guard)
+        except Exception as exc:
+            box["error"] = exc
+        finally:
+            with _syscall_scans_lock:
+                _syscall_scans -= 1
+
+    with _syscall_scans_lock:
+        _syscall_scans += 1
+    try:
+        thread = threading.Thread(target=job, name="syscall-scan", daemon=True)
+        thread.start()
+    except BaseException:
+        with _syscall_scans_lock:
+            _syscall_scans -= 1
+        raise
+    thread.join(SYSCALL_SCAN_TIMEOUT + SYSCALL_SCAN_GRACE)
+    error = box.get("error")
+    if isinstance(error, syscall_scan.ScanRefused):
+        raise _SyscallRouteError(error.reason)
+    if isinstance(error, OSError):
+        raise _SyscallRouteError(f"cannot read process {pid}: {error}")
+    if error is not None:
+        raise error
+    if thread.is_alive() or "result" not in box or box["guard"].expired:
+        raise _SyscallRouteError(f"the scan of process {pid} timed out ({SYSCALL_SCAN_TIMEOUT}s)", 504)
+    return box["result"]
+
+
+def _syscall_measure(pid, modules, allowlist=None):
+    """`(measurement, view, build, process)` of the stubs of `modules` in the process `pid`."""
+    view, baseline = _syscall_target(pid)
+    build = _current_os_build()
+    measured = _syscall_read_process(
+        pid, view, build,
+        lambda reader: syscall_scan.measure(baseline, reader, view, build, modules, allowlist))
+    return measured, view, build
+
+
+@app.route("/api/syscalls/status")
+def api_syscalls_status():
+    """Whether NTSleuth is installed, which baselines exist and whether one is being extracted."""
+    build = _current_os_build()
+    executables = {view: os.path.isfile(_ntsleuth_exe(view)) for view in SYSCALL_BASELINE_VIEWS}
+    try:
+        names = sorted(os.listdir(NTSLEUTH_BASELINE_DIR))
+    except OSError:
+        names = []
+    baselines = []
+    for name in names:
+        parsed = syscall_baseline.parse_baseline_name(name)
+        if parsed is None:
+            continue
+        entry = {"file": name, "build": parsed[0], "view": parsed[1], "current": parsed[0] == build}
+        try:
+            loaded = _load_syscall_baseline(os.path.join(NTSLEUTH_BASELINE_DIR, name))
+        except syscall_baseline.BaselineError as exc:
+            entry.update(symbols=None, error=str(exc))
+        else:
+            entry.update(symbols=loaded.symbols, syscalls=len(loaded.syscalls))
+            if not loaded.symbols:
+                entry["note"] = _SYSCALL_PARAMETERS_NOTE
+        baselines.append(entry)
+    with _syscall_extract_lock:
+        running = sorted(_syscall_extract_state["running"])
+        failed = sorted((k, v) for k, v in _syscall_extract_state["failed"].items())
+    return jsonify({
+        "installed": any(executables.values()),
+        "path": NTSLEUTH_DIR,
+        "executables": executables,
+        "build": build,
+        "machine": platform.machine(),
+        "default_view": _syscall_default_view(),
+        "baselines": baselines,
+        "extraction": {
+            "running": [{"build": b, "view": v} for b, v in running],
+            "failed": [{"build": b, "view": v, "reason": why} for (b, v), (_, why) in failed],
+        },
+    })
+
+
+@app.route("/api/syscalls/baseline")
+def api_syscalls_baseline():
+    """The syscall catalog of a view, filtered and in pages. Params: view, query, module, offset, limit."""
+    view = _syscall_view_param(request.args.get("view"))
+    baseline, why = _syscall_baseline_for(view)
+    if baseline is None:
+        return jsonify({"error": why, "view": view}), 503
+    page = syscall_baseline.catalog(
+        baseline, query=(request.args.get("query") or "")[:100], module=(request.args.get("module") or "")[:64],
+        offset=_syscall_int_param(request.args.get("offset"), "offset", 0, 0, 10 ** 9),
+        limit=_syscall_int_param(request.args.get("limit"), "limit", 200, 0, SYSCALL_PAGE_MAX))
+    page.update(build=baseline.build, view=baseline.view, symbols=baseline.symbols,
+                skipped=len(baseline.skipped), shadowed=len(baseline.shadowed))
+    return jsonify(page)
+
+
+@app.route("/api/syscalls/<name>")
+def api_syscalls_lookup(name):
+    """One syscall with its parameters and stub. Param: view."""
+    view = _syscall_view_param(request.args.get("view"))
+    baseline, why = _syscall_baseline_for(view)
+    if baseline is None:
+        return jsonify({"error": why, "view": view}), 503
+    sc = baseline.syscalls.get(name)
+    if sc is None:
+        return jsonify({"error": f"unknown syscall {name[:100]}", "view": view}), 404
+    return jsonify({**syscall_baseline.describe(sc), "build": baseline.build, "view": baseline.view,
+                    "prefix_len": syscall_baseline.stub_prefix_len(sc, baseline.view)})
+
+
+@app.route("/api/syscalls/scan", methods=["POST"])
+def api_syscalls_scan():
+    """Measure the syscall stubs of a process against the baseline. Params: pid, modules (ntdll.dll, win32u.dll).
+
+    The measurement, scored in the evidence model. A scan that takes longer than SYSCALL_SCAN_TIMEOUT is a 504."""
+    data = _syscall_body()
+    pid = _syscall_pid(data.get("pid"))
+    modules = _syscall_modules(data.get("modules"))
+    measured, view, build = _syscall_measure(pid, modules, _get_hook_allowlist())
+    process = _syscall_identity(pid)
+    findings = memory_evidence.collect({"syscall_scan": measured}, process=process)
+    result = {**measured, "tool": "Syscalls", "pid": pid, "process": process, "modules": list(modules),
+              "evidence": memory_evidence.score(findings, baseline=_memory_baseline)}
+    # the history keeps what a timeline row expands to, not the state of every one of 2,461 stubs
+    _record_scan("Syscalls", f"PID {pid}", {k: v for k, v in result.items() if k != "states"})
+    return jsonify(result)
+
+
+def _pe_import_names(data):
+    """The names a PE imports, None when `data` is not a PE that can be read. Delay-loaded imports are not
+    listed: the set is only ever used to say a function is imported, never that it is not."""
+    try:
+        import pefile
+        pe = pefile.PE(data=data, fast_load=True)
+        try:
+            pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
+            return {imp.name.decode("ascii", "replace")
+                    for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) for imp in entry.imports if imp.name}
+        finally:
+            pe.close()
+    except Exception:
+        return None
+
+
+@app.route("/api/syscalls/stubs", methods=["POST"])
+def api_syscalls_stubs():
+    """Search for syscall stubs outside ntdll: in a running process (pid) or in a file (path, with view).
+
+    Each hit names the syscall of its number. `import_present` is None: a raw import table cannot show that a
+    function is not imported (see syscall_scan.find_stubs_in_bytes)."""
+    data = _syscall_body()
+    pid_given, path_given = data.get("pid") not in (None, ""), data.get("path") not in (None, "")
+    if pid_given == path_given:
+        raise _SyscallRouteError("give a pid or a path")
+    if pid_given:
+        pid = _syscall_pid(data.get("pid"))
+        view, baseline = _syscall_target(pid)
+        build = _current_os_build()
+        found = _syscall_read_process(
+            pid, view, build, lambda reader: syscall_scan.find_stubs_in_process(reader, baseline))
+        process = _syscall_identity(pid)
+        result = {"mode": "process", "pid": pid, "process": process, "partial": found.partial,
+                  "regions_searched": found.regions_searched, "note": found.note}
+    else:
+        if data.get("view") in (None, ""):
+            raise _SyscallRouteError("a path needs the view to search it for: arm64, x64 or x86")
+        view = _syscall_view_param(data.get("view"))
+        real = _readable_path(data.get("path"))
+        if real is None:
+            raise _SyscallRouteError("Access denied: path outside allowed directories", 403)
+        if not os.path.isfile(real):
+            raise _SyscallRouteError("the file does not exist")
+        if os.path.getsize(real) > SYSCALL_FILE_MAX:
+            raise _SyscallRouteError(f"the file is larger than {SYSCALL_FILE_MAX // (1024 * 1024)} MB")
+        baseline, why = _syscall_baseline_for(view)
+        if baseline is None:
+            raise _SyscallRouteError(why)
+        try:
+            with open(real, "rb") as fh:
+                content = fh.read()
+        except OSError as exc:
+            raise _SyscallRouteError(f"the file cannot be read: {exc.strerror or exc}")
+        imports = _pe_import_names(content)
+        found = syscall_scan.find_stubs_in_bytes(content, baseline, imports)
+        process = os.path.basename(real)
+        result = {"mode": "file", "path": real, "size": len(content), "process": process,
+                  "imports_read": imports is not None, "partial": False, "note": ""}
+    hits = list(found)
+    findings = memory_evidence.from_direct_stubs(hits, process)
+    result.update(tool="Syscalls", view=baseline.view, build=baseline.build, hits=hits,
+                  evidence=memory_evidence.score(findings, baseline=_memory_baseline))
+    return jsonify(result)
+
+
+def _hook_scope():
+    """`(build, view)` from the query, or `(None, None)`: one of them alone is a mistake, not a wildcard."""
+    build, view = request.args.get("build"), request.args.get("view")
+    if build is None and view is None:
+        return None, None
+    if not build or not view:
+        raise _SyscallRouteError("build and view are given together, or neither")
+    return build, _syscall_view_param(view)
+
+
+@app.route("/api/syscalls/hook-baseline", methods=["GET"])
+def api_syscalls_hook_baseline():
+    """The hooks known on this host, as (syscall, owner) pairs per build and view. Params: build and view,
+    together, to list one set."""
+    build, view = _hook_scope()
+    allowlist = _get_hook_allowlist()
+    return jsonify({"entries": allowlist.entries(build, view), "problem": allowlist.problem,
+                    "path": SYSCALL_HOOK_ALLOWLIST_FILE})
+
+
+@app.route("/api/syscalls/hook-baseline", methods=["POST"])
+def api_syscalls_hook_baseline_capture():
+    """Record the hooks found in a process as known on this host. Params: pid.
+
+    Only on a host known to be clean: whatever hooks the process holds now stops counting as evidence. A patch
+    is never recorded, only a jump into a module."""
+    pid = _syscall_pid(_syscall_body().get("pid"))
+    measured, view, build = _syscall_measure(pid, ("ntdll.dll",))
+    allowlist = _get_hook_allowlist()
+    try:
+        added = allowlist.add_from(measured)
+    except OSError as exc:
+        return jsonify({"error": f"cannot write the hook allowlist: {exc}"}), 500
+    return jsonify({"pid": pid, "build": build, "view": view, "added": added,
+                    "entries": len(allowlist.entries(build, view)), "partial": measured["partial"]})
+
+
+@app.route("/api/syscalls/hook-baseline", methods=["DELETE"])
+def api_syscalls_hook_baseline_clear():
+    """Forget the known hooks: those of one build and view (params build and view, together), or all."""
+    build, view = _hook_scope()
+    allowlist = _get_hook_allowlist()
+    try:
+        allowlist.clear(build, view)
+    except OSError as exc:
+        return jsonify({"error": f"cannot write the hook allowlist: {exc}"}), 500
+    return jsonify({"ok": True, "entries": len(allowlist.entries())})
 
 
 # --- Memory dumping: Process Dump ---

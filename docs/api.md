@@ -136,6 +136,19 @@ One rizin session per opened file and browser tab (RIZIN tab). Addresses are int
 | GET | `/api/process/lookup` | Running PIDs by image name. Params: `name` |
 | GET | `/api/file/visualize` | File map planes + structure + import/export trees. Params: `path`, `cols`, `rows` |
 
+## Syscalls
+
+Read-only measurement of the syscall stubs of a process against a baseline NTSleuth extracted from this system's ntdll and win32u. `view` is `arm64`, `x64` or `x86` (default: this host's own); a baseline exists for the first two. A request without a baseline for this build answers `503` (`400` for a scan) and starts the extraction in the background: `--no-symbols` when the symbol server cannot be reached, which leaves the parameter table incomplete and the measurement as it was.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/syscalls/status` | `installed` and `path` of NTSleuth, `executables` per view, the system `build`, `baselines` (`build`, `view`, `current`, `symbols`, a `note` when the parameters are incomplete) and the background `extraction` (`running`, `failed` with `reason`) |
+| GET | `/api/syscalls/baseline` | The syscall catalog, paged. Params: `view`, `query` (name substring or number), `module`, `offset`, `limit` (max 500) |
+| GET | `/api/syscalls/<name>` | One syscall with parameters, stub bytes and the compared `prefix_len`. Param: `view`. `404` for an unknown name |
+| POST | `/api/syscalls/scan` | Measure a PID against the baseline of its view (read from the image, not from the request); scored in the evidence model and added to the scan history. Params: `pid`, `modules` (`ntdll.dll`, `win32u.dll`). `504` after 120 s |
+| POST | `/api/syscalls/stubs` | Search for syscall stubs outside ntdll: in a process's private executable memory (`pid`) or in a file (`path` inside the readable folders, with `view`). Each hit names its syscall; `import_present` is `null` until the Win32-to-Nt table exists. `partial` says the search did not cover all it set out to |
+| GET / POST / DELETE | `/api/syscalls/hook-baseline` | The hooks known on this host, as (syscall, owner) pairs per build and view / record the hooks of a PID (`pid`; only on a host known to be clean, and only a jump into a module, never a patch) / forget one set (`build` and `view` together) or all. Known hooks stay in the scan but no longer score |
+
 ## Proxy Endpoints
 
 | Method | Endpoint | Description |
