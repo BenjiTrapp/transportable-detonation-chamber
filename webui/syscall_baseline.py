@@ -201,3 +201,185 @@ def _item(sc: Syscall) -> dict:
         "stub_hex": sc.stub_bytes.hex(),
         "is_true_syscall": sc.is_true_syscall,
     }
+
+
+# Bytes of a stub that are compared, per view. A window read from a process runs on
+# into the next stub, which has nothing to do with this syscall; arm64 stubs are just
+# `SVC; RET`. x64 is cut at its `syscall` instruction by `stub_prefix_len`.
+PREFIX_LEN = {"arm64": 8, "x64": 32, "x86": 16}
+
+_X64_SYSCALL = b"\x0f\x05"
+# `4C 8B D1 B8 <ssn:4>`: the syscall number can spell 0F 05 itself, so look past it
+_X64_AFTER_MOV = 8
+
+
+def stub_prefix_len(sc: Syscall, view: str) -> int:
+    """How many bytes of the stub at `sc.rva` to read and compare."""
+    n = min(PREFIX_LEN[view], len(sc.stub_bytes))
+    if view == "x64":
+        i = sc.stub_bytes.find(_X64_SYSCALL, _X64_AFTER_MOV)
+        if i >= 0:
+            n = i + len(_X64_SYSCALL)
+    return n
+
+
+STATE_INTACT = "intact"
+STATE_HOOKED = "hooked"
+STATE_PATCHED = "patched"
+STATE_DIVERGED = "diverged"
+STATE_UNREADABLE = "unreadable"
+
+# Owner value for memory that no file backs; what malware leaves behind, as opposed to
+# the module of an EDR
+OWNER_PRIVATE = "private"
+
+_MISS = object()
+
+
+def _signed(value: int, bits: int) -> int:
+    return value - (1 << bits) if value >> (bits - 1) else value
+
+
+def _word(live: bytes, offset: int = 0) -> int | None:
+    chunk = live[offset:offset + 4]
+    return int.from_bytes(chunk, "little") if len(chunk) == 4 else None
+
+
+def _x64_hook(regex: bytes, target):
+    pattern = re.compile(regex, re.DOTALL)
+
+    def match(live: bytes, base: int):
+        m = pattern.match(live)
+        return _MISS if m is None else target(m.group(), base)
+    return match
+
+
+# A hook whose target sits in memory (`FF 25`, `LDR`+`BR`) maps to None: the bytes of the
+# stub do not contain it, and a guessed address would send the owner lookup to the
+# wrong place.
+_X64_HOOKS = (
+    ("JMP rel32", _x64_hook(rb"\xe9.{4}", lambda b, base: base + 5 + _signed(
+        int.from_bytes(b[1:5], "little"), 32))),
+    ("JMP [rip]", _x64_hook(rb"\xff\x25.{4}", lambda b, base: None)),
+    ("MOV RAX; JMP RAX", _x64_hook(rb"\x48\xb8.{8}\xff\xe0", lambda b, base: int.from_bytes(
+        b[2:10], "little"))),
+    ("MOV R11; JMP R11", _x64_hook(rb"\x49\xbb.{8}\x41\xff\xe3", lambda b, base: int.from_bytes(
+        b[2:10], "little"))),
+    # push sign-extends its imm32, and ret pops the result
+    ("PUSH; RET", _x64_hook(rb"\x68.{4}\xc3", lambda b, base: _signed(
+        int.from_bytes(b[1:5], "little"), 32) & 0xFFFFFFFFFFFFFFFF)),
+)
+
+_ARM64_BR_X16 = 0xD61F0200
+
+
+def _arm64_b(live: bytes, base: int):
+    w = _word(live)
+    if w is None or w & 0xFC000000 != 0x14000000:
+        return _MISS
+    return (base + _signed(w & 0x03FFFFFF, 26) * 4) & 0xFFFFFFFFFFFFFFFF
+
+
+def _arm64_ldr_br(live: bytes, base: int):
+    w, nxt = _word(live), _word(live, 4)
+    if w is None or nxt is None:
+        return _MISS
+    if w & 0xFF000000 != 0x58000000 or w & 0x1F != 16 or nxt != _ARM64_BR_X16:
+        return _MISS
+    return None
+
+
+def _arm64_adrp_add_br(live: bytes, base: int):
+    adrp, add, br = _word(live), _word(live, 4), _word(live, 8)
+    if adrp is None or add is None or br is None:
+        return _MISS
+    reg = adrp & 0x1F
+    if adrp & 0x9F000000 != 0x90000000:
+        return _MISS
+    # ADD <Xd>, <Xreg>, #imm12{, LSL #12}, then BR <Xd>
+    if add & 0xFF800000 != 0x91000000 or (add >> 5) & 0x1F != reg:
+        return _MISS
+    if br & 0xFFFFFC1F != 0xD61F0000 or (br >> 5) & 0x1F != add & 0x1F:
+        return _MISS
+    imm = _signed(((adrp >> 5) & 0x7FFFF) << 2 | (adrp >> 29) & 0x3, 21)
+    offset = (add >> 10) & 0xFFF
+    if add & 0x00400000:
+        offset <<= 12
+    return (((base & ~0xFFF) + (imm << 12)) + offset) & 0xFFFFFFFFFFFFFFFF
+
+
+_ARM64_HOOKS = (
+    ("B", _arm64_b),
+    ("LDR x16; BR x16", _arm64_ldr_br),
+    ("ADRP; ADD; BR", _arm64_adrp_add_br),
+)
+
+# x86 has a prefix length but no patterns: it is not a baseline view yet
+_HOOKS = {"x64": _X64_HOOKS, "arm64": _ARM64_HOOKS}
+
+
+def _find_hook(live: bytes, base: int, view: str):
+    """`(pattern, target)` of the hook jump at the start of `live`, or None.
+
+    Hooks overwrite the start of the stub; a jump further in is not looked for, which is
+    also what `jump_target`, having no offset, can answer for."""
+    for name, match in _HOOKS.get(view, ()):
+        target = match(live, base)
+        if target is not _MISS:
+            return name, target
+    return None
+
+
+def jump_target(live: bytes, base: int, view: str) -> int | None:
+    """Absolute address the hook at the start of `live` jumps to, `base` being the
+    address of `live[0]`. None when there is no hook or its target is not in the bytes."""
+    hit = _find_hook(live, base, view)
+    return hit[1] if hit else None
+
+
+def _live_number(live: bytes, view: str) -> int | None:
+    """The syscall number the live stub loads, None where the stub does not show it."""
+    if view == "x64":
+        if live[:4] == b"\x4c\x8b\xd1\xb8" and len(live) >= 8:
+            return int.from_bytes(live[4:8], "little")
+    elif view == "arm64":
+        w = _word(live)
+        if w is not None and w & 0xFFE0001F == 0xD4000001:
+            return (w >> 5) & 0xFFFF
+    return None
+
+
+def classify_stub(sc: Syscall, live: bytes | None, view: str, owner: str | None) -> dict:
+    """Compare the live stub with the baseline and decide its state.
+
+    Which of hooked, patched, diverged follows from `owner`, the module that holds the
+    jump target ("private" for memory no file backs, None if unresolved), not from the
+    instruction pattern: an EDR and malware use the same jumps."""
+    n = stub_prefix_len(sc, view)
+    expected = sc.stub_bytes[:n]
+    out = {
+        "state": STATE_UNREADABLE,
+        "pattern": None,
+        "target_owner": None,
+        "expected": expected.hex(),
+        "actual": None if live is None else live[:n].hex(),
+        "number_matches": None,
+    }
+    # a page that is not paged in reads as zeros, which says nothing about the stub
+    if live is None or len(live) < n or not any(live[:n]):
+        return out
+    number = _live_number(live, view)
+    out["number_matches"] = None if number is None else number == sc.number
+    if live[:n] == expected:
+        out["state"] = STATE_INTACT
+        return out
+    hit = _find_hook(live, 0, view)
+    out["pattern"] = hit[0] if hit else None
+    out["target_owner"] = owner
+    if owner is None or owner.lower() in ("ntdll.dll", sc.module.lower()):
+        out["state"] = STATE_DIVERGED
+    elif owner == OWNER_PRIVATE:
+        out["state"] = STATE_PATCHED
+    else:
+        out["state"] = STATE_HOOKED
+    return out

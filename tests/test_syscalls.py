@@ -339,3 +339,239 @@ def test_catalog_number_query_combines_with_the_module_filter():
 def test_catalog_module_match_ignores_the_case_of_the_stored_module_too():
     bl = syscall_baseline.parse_baseline({"syscalls": [_entry(module="NTDLL.dll")]}, "1.0", "x64")
     assert syscall_baseline.catalog(bl, module="ntdll.dll")["total"] == 1
+
+
+def test_prefix_length_stops_before_the_next_stub():
+    bl = syscall_baseline.parse_baseline(_fixture("arm64"), "26220.5770", "arm64")
+    sc = bl.syscalls["NtWriteVirtualMemory"]
+    assert syscall_baseline.stub_prefix_len(sc, "arm64") == 8
+
+
+def test_x64_prefix_ends_after_the_syscall_instruction():
+    bl = syscall_baseline.parse_baseline(_fixture("x64"), "26220.5770", "x64")
+    sc = bl.syscalls["NtWriteVirtualMemory"]
+    n = syscall_baseline.stub_prefix_len(sc, "x64")
+    assert sc.stub_bytes[n - 2:n] == b"\x0f\x05"
+    assert n < 32
+
+
+def test_x64_prefix_ignores_a_syscall_number_that_spells_0f05():
+    sc = syscall_baseline.parse_baseline(_fixture("x64"), "26220.5770", "x64").syscalls["NtWriteVirtualMemory"]
+    sc.stub_bytes = bytes.fromhex("4c8bd1b80f050000") + sc.stub_bytes[8:]
+    assert syscall_baseline.stub_prefix_len(sc, "x64") == 20
+
+
+def test_x64_prefix_without_a_syscall_instruction_falls_back_to_the_whole_window():
+    sc = syscall_baseline.parse_baseline(_fixture("x64"), "26220.5770", "x64").syscalls["NtWriteVirtualMemory"]
+    sc.stub_bytes = b"\x90" * 32
+    assert syscall_baseline.stub_prefix_len(sc, "x64") == 32
+
+
+def test_prefix_never_exceeds_the_stub_the_baseline_holds():
+    sc = syscall_baseline.parse_baseline(_fixture("arm64"), "26220.5770", "arm64").syscalls["NtWriteVirtualMemory"]
+    sc.stub_bytes = sc.stub_bytes[:6]
+    assert syscall_baseline.stub_prefix_len(sc, "arm64") == 6
+
+
+def _sc(view, name="NtWriteVirtualMemory"):
+    return syscall_baseline.parse_baseline(_fixture(view), "26220.5770", view).syscalls[name]
+
+
+@pytest.mark.parametrize("live_hex,owner,state,pattern", [
+    ("41 07 00 d4 c0 03 5f d6", None,        "intact",   None),
+    ("05 00 00 14 c0 03 5f d6", "edr.dll",   "hooked",   "B"),
+    ("05 00 00 14 c0 03 5f d6", "private",   "patched",  "B"),
+    ("05 00 00 14 c0 03 5f d6", None,        "diverged", "B"),
+    ("11 22 33 44 55 66 77 88", "private",   "patched",  None),
+    ("50 00 00 58 00 02 1f d6", "edr.dll",   "hooked",   "LDR x16; BR x16"),
+    ("01 18 00 d4 c0 03 5f d6", None,        "diverged", None),
+])
+def test_classify_arm64_states(live_hex, owner, state, pattern):
+    out = syscall_baseline.classify_stub(
+        _sc("arm64"), bytes.fromhex(live_hex.replace(" ", "")), "arm64", owner)
+    assert out["state"] == state
+    assert out["pattern"] == pattern
+
+
+def test_classify_x64_hook_patterns():
+    sc = _sc("x64")
+    live = bytes.fromhex("e92b170080") + sc.stub_bytes[5:]
+    assert syscall_baseline.classify_stub(sc, live, "x64", "private")["pattern"] == "JMP rel32"
+    live = bytes.fromhex("ff251a4c0300") + sc.stub_bytes[6:]
+    assert syscall_baseline.classify_stub(sc, live, "x64", "edr.dll")["pattern"] == "JMP [rip]"
+
+
+@pytest.mark.parametrize("head_hex,pattern", [
+    ("48b8" + "8877665544332211" + "ffe0", "MOV RAX; JMP RAX"),
+    ("49bb" + "8877665544332211" + "41ffe3", "MOV R11; JMP R11"),
+    ("68" + "44332211" + "c3", "PUSH; RET"),
+])
+def test_classify_x64_absolute_hook_patterns(head_hex, pattern):
+    sc = _sc("x64")
+    head = bytes.fromhex(head_hex)
+    out = syscall_baseline.classify_stub(sc, head + sc.stub_bytes[len(head):], "x64", "edr.dll")
+    assert (out["state"], out["pattern"]) == ("hooked", pattern)
+
+
+def test_a_changed_syscall_number_alone_is_reported():
+    sc = _sc("x64")
+    live = bytearray(sc.stub_bytes)
+    live[4] = (sc.number + 1) & 0xFF
+    out = syscall_baseline.classify_stub(sc, bytes(live), "x64", None)
+    assert out["number_matches"] is False
+    assert out["state"] == "diverged"
+
+
+def test_a_changed_arm64_syscall_number_alone_is_reported():
+    out = syscall_baseline.classify_stub(
+        _sc("arm64"), bytes.fromhex("01 18 00 d4 c0 03 5f d6".replace(" ", "")), "arm64", None)
+    assert out["number_matches"] is False
+
+
+def test_an_untouched_stub_has_a_matching_number_and_no_target():
+    for view in ("arm64", "x64"):
+        sc = _sc(view)
+        out = syscall_baseline.classify_stub(sc, sc.stub_bytes, view, "edr.dll")
+        assert out["state"] == "intact"
+        assert out["number_matches"] is True
+        assert out["target_owner"] is None
+        assert out["pattern"] is None
+
+
+def test_a_hook_that_overwrites_the_number_does_not_claim_a_mismatch():
+    sc = _sc("x64")
+    live = bytes.fromhex("e92b170080") + sc.stub_bytes[5:]
+    assert syscall_baseline.classify_stub(sc, live, "x64", "edr.dll")["number_matches"] is None
+
+
+def test_win32u_numbers_are_checked_against_the_full_number():
+    for view in ("arm64", "x64"):
+        sc = _sc(view, "NtUserGetForegroundWindow")
+        out = syscall_baseline.classify_stub(sc, sc.stub_bytes, view, None)
+        assert (out["state"], out["number_matches"]) == ("intact", True)
+
+
+def test_classify_reports_the_compared_bytes_and_the_owner():
+    sc = _sc("arm64")
+    live = bytes.fromhex("0500001411223344")
+    out = syscall_baseline.classify_stub(sc, live + b"\xff" * 24, "arm64", "edr.dll")
+    assert out["expected"] == "410700d4c0035fd6"
+    assert out["actual"] == "0500001411223344"
+    assert out["target_owner"] == "edr.dll"
+    assert set(out) == {"state", "pattern", "target_owner", "expected", "actual", "number_matches"}
+
+
+@pytest.mark.parametrize("owner", ["ntdll.dll", "NTDLL.DLL"])
+def test_a_jump_into_ntdll_itself_is_neither_hooked_nor_patched(owner):
+    live = bytes.fromhex("05 00 00 14 c0 03 5f d6".replace(" ", ""))
+    out = syscall_baseline.classify_stub(_sc("arm64"), live, "arm64", owner)
+    assert out["state"] == "diverged"
+
+
+def test_a_jump_into_the_stubs_own_module_is_diverged():
+    sc = _sc("arm64", "NtUserGetForegroundWindow")
+    live = bytes.fromhex("05 00 00 14 c0 03 5f d6".replace(" ", ""))
+    assert syscall_baseline.classify_stub(sc, live, "arm64", "win32u.dll")["state"] == "diverged"
+    assert syscall_baseline.classify_stub(sc, live, "arm64", "edr.dll")["state"] == "hooked"
+
+
+def _words(*words):
+    return b"".join(w.to_bytes(4, "little") for w in words)
+
+
+def _adrp(rd, pages):
+    imm = pages & 0x1FFFFF
+    return 0x90000000 | (imm & 3) << 29 | (imm >> 2) << 5 | rd
+
+
+def _add(rd, rn, imm12, shift12=False):
+    return 0x91000000 | shift12 << 22 | imm12 << 10 | rn << 5 | rd
+
+
+@pytest.mark.parametrize("live_hex,base,target", [
+    ("e910000000", 0x1000, 0x1015),
+    ("e9f6ffffff", 0x1000, 0xFFB),
+    ("48b88877665544332211ffe0", 0x1000, 0x1122334455667788),
+    ("49bb8877665544332211" "41ffe3", 0x1000, 0x1122334455667788),
+    ("6844332211c3", 0x1000, 0x11223344),
+    ("6800000080c3", 0x1000, 0xFFFFFFFF80000000),
+])
+def test_x64_jump_target_of_hooks_whose_target_is_in_the_bytes(live_hex, base, target):
+    live = bytes.fromhex(live_hex) + b"\x90" * 8
+    assert syscall_baseline.jump_target(live, base, "x64") == target
+
+
+@pytest.mark.parametrize("live", [
+    bytes.fromhex("ff251a4c0300") + b"\x90" * 8,
+    bytes.fromhex("4c8bd1b83a000000") + b"\x90" * 8,
+    bytes.fromhex("e91000"),
+    b"",
+])
+def test_x64_jump_target_is_none_when_it_is_not_in_the_bytes(live):
+    assert syscall_baseline.jump_target(live, 0x1000, "x64") is None
+
+
+@pytest.mark.parametrize("live,base,target", [
+    (_words(0x14000005, 0xD65F03C0), 0x1000, 0x1014),
+    (_words(0x17FFFFFF, 0xD65F03C0), 0x1000, 0xFFC),
+    (_words(_adrp(16, 2), _add(16, 16, 0x123), 0xD61F0200), 0x50000FF0, 0x50002123),
+    (_words(_adrp(16, -1), _add(16, 16, 0x7, shift12=True), 0xD61F0200), 0x50001000, 0x50007000),
+])
+def test_arm64_jump_target_of_hooks_whose_target_is_in_the_bytes(live, base, target):
+    assert syscall_baseline.jump_target(live, base, "arm64") == target
+
+
+@pytest.mark.parametrize("live", [
+    _words(0x58000050, 0xD61F0200),
+    _words(0xD4000741, 0xD65F03C0),
+    _words(_adrp(16, 2), _add(16, 16, 0x123)),
+    _words(_adrp(16, 2), _add(16, 16, 0x123), 0xD61F0220),
+    _words(_adrp(16, 2), _add(17, 16, 0x123), 0xD61F0200),
+    b"\x05\x00",
+])
+def test_arm64_jump_target_is_none_when_it_is_not_in_the_bytes(live):
+    assert syscall_baseline.jump_target(live, 0x1000, "arm64") is None
+
+
+def test_the_adrp_chain_needs_its_branch_to_count_as_a_hook():
+    sc = _sc("arm64")
+    chain = _words(_adrp(16, 2), _add(16, 16, 0x123), 0xD61F0200)
+    assert syscall_baseline.classify_stub(sc, chain, "arm64", "edr.dll")["pattern"] == "ADRP; ADD; BR"
+    assert syscall_baseline.classify_stub(sc, chain[:8], "arm64", "edr.dll")["pattern"] is None
+
+
+def test_x86_has_a_prefix_length_but_no_hook_patterns():
+    assert syscall_baseline.PREFIX_LEN["x86"] == 16
+    assert syscall_baseline.jump_target(bytes.fromhex("e910000000"), 0x1000, "x86") is None
+
+
+def test_all_zero_bytes_are_unreadable_not_patched():
+    out = syscall_baseline.classify_stub(_sc("arm64"), b"\x00" * 8, "arm64", "private")
+    assert out["state"] == "unreadable"
+
+
+def test_no_bytes_at_all_is_unreadable():
+    assert syscall_baseline.classify_stub(_sc("arm64"), None, "arm64", None)["state"] == "unreadable"
+
+
+@pytest.mark.parametrize("view", ["arm64", "x64"])
+def test_a_window_shorter_than_the_prefix_is_unreadable(view):
+    sc = _sc(view)
+    n = syscall_baseline.stub_prefix_len(sc, view)
+    out = syscall_baseline.classify_stub(sc, sc.stub_bytes[:n - 1], view, "private")
+    assert out["state"] == "unreadable"
+
+
+def test_zero_bytes_beyond_the_prefix_do_not_make_a_stub_unreadable():
+    sc = _sc("arm64")
+    out = syscall_baseline.classify_stub(sc, sc.stub_bytes[:8] + b"\x00" * 24, "arm64", None)
+    assert out["state"] == "intact"
+
+
+def test_an_unreadable_stub_carries_no_verdict_details():
+    out = syscall_baseline.classify_stub(_sc("arm64"), None, "arm64", "edr.dll")
+    assert out["pattern"] is None
+    assert out["target_owner"] is None
+    assert out["number_matches"] is None
+    assert out["actual"] is None
+    assert out["expected"] == "410700d4c0035fd6"
