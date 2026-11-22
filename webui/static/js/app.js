@@ -21024,9 +21024,10 @@ const rizinState = {
     // files (rizinReset leaves it), so DECOMPILER does not run them again on its own (rizinDecompileSlow)
     decompileSlow: [],
     // The emulation: null outside it, else the server's state (running, pc, registers [{name, value}] in rizin's
-    // order, changed [names], stack, stopped, arch, bits) with what only the tab knows: ran (the run that
-    // answered), summary (what a skipped call applied) and assist (the offer for the call at the PC, or null).
-    // The run strip and the EMULATION pane draw from this one state; neither asks the route again
+    // order, changed [names], stack [{addr, value, hint}], stopped, arch, bits; every word of it, the PC, the
+    // registers' values and the stack's addresses and values, a "0x…" string) with what only the tab knows: ran
+    // (the run that answered), summary (what a skipped call applied) and assist (the offer for the call at the
+    // PC, or null). The run strip and the EMULATION pane draw from this one state; neither asks the route again
     emu: null,
     emuWait: '',        // what waits for its answer: start, stop, or the kind of run; one at a time
     emuNote: '',        // why the last run did not happen (shown in the strip, until the next one)
@@ -21134,7 +21135,6 @@ function rizinSetUi(state, extra) {
         if (rizinState.emu || rizinState.emuWait) rizinEmuLeave();
     }
     rizinRenderState();
-    rizinRenderRunStrip();          // START follows the session's state (off once it moved or ended)
     // Without a session DISASSEMBLY says how rizin gets installed
     if (state === 'not-installed' && !rizinState.session) rizinRenderDisasm();
 }
@@ -21333,7 +21333,6 @@ function rizinReset(described) {
     rizinRenderXrefs();
     rizinRenderDecompiler();
     rizinRenderHex();
-    rizinRenderRunStrip();
     if (rizinState.file) rizinConsoleNote(`${rizinState.file.path ?? ''}`, 'file');
     rizinSetUi('');
 }
@@ -21715,7 +21714,10 @@ async function rizinSeek(addr, source = '') {
     // A newer jump draws the views itself. The place drawn is where rizin is now: this jump's, or (if it did
     // not happen) that of a jump it replaced whose answer moved rizin
     if (ticket === rizinState.seekSeq) {
-        if (source !== 'history' && rizinState.seek) rizinPushHistory(rizinState.seek);
+        // ◀ ▶ walk the places the user went to: the views following a run of the emulation ('emulation') are
+        // no navigation of theirs (the PC is where they are; GO TO PC is a jump and does push), and a push
+        // would evict their places from the list and cut off what ▶ holds
+        if (source !== 'history' && source !== 'emulation' && rizinState.seek) rizinPushHistory(rizinState.seek);
         await rizinRefreshViews();
     }
     return !!seek;
@@ -21731,9 +21733,12 @@ function rizinPushHistory(addr) {
 }
 
 // ◀ ▶: the next place in the history at once (so that another click goes on
-// from there); a step that did not happen (rizin busy) is taken back.
+// from there); a step that did not happen (rizin busy) is taken back. At a place that is no entry of the
+// history (the views followed the emulation's PC there) ◀ goes to the entry the user left, not past it.
 async function rizinHistoryStep(delta) {
-    const from = rizinState.historyAt, at = from + delta;
+    const from = rizinState.historyAt;
+    const off = !!rizinState.seek && rizinState.history[from] !== rizinState.seek;
+    const at = off && delta < 0 ? from : from + delta;
     if (!rizinState.session || at < 0 || at >= rizinState.history.length) return false;
     rizinState.historyAt = at;
     rizinRenderLocation();
@@ -21763,7 +21768,6 @@ function rizinRenderToolbar() {
     rizinRenderAnalysis();
     rizinRenderState();
     rizinRenderLocation();
-    rizinRenderRunStrip();
 }
 
 // The open file: its path, format, architecture and size, and its SHA256
@@ -21858,6 +21862,9 @@ function rizinRenderState() {
     // A state or its buttons need the room: the file's details give way (style.css .rizin-crowded)
     const bar = document.getElementById('rizin-toolbar');
     if (bar) bar.classList.toggle('rizin-crowded', !!text || !!again || (!!full && !full.hidden));
+    // The one place the run strip and START follow the session's state (opening, moved, ended, not installed)
+    // from: everything that changes them renders this
+    rizinRenderRunStrip();
 }
 
 // SEEK shows where the views are: the name of the function at its start, else
@@ -21886,7 +21893,8 @@ function rizinRenderLocation() {
     if (input) input.title = seek ? `${seek}${rizinState.func ? ' in ' + rizinState.func : ''}` : '';
     const back = document.getElementById('rizin-back');
     const forward = document.getElementById('rizin-forward');
-    if (back) back.disabled = !seek || rizinState.historyAt <= 0;
+    const off = !!seek && rizinState.history[rizinState.historyAt] !== seek;
+    if (back) back.disabled = !seek || (off ? rizinState.historyAt < 0 : rizinState.historyAt <= 0);
     if (forward) forward.disabled = !seek || rizinState.historyAt >= rizinState.history.length - 1;
     rizinRenderPrompt();
 }
@@ -24669,12 +24677,11 @@ function rizinOnPageHide() {
 // interrupt a command: a run ends by itself at esil.timeout). Addresses are "0x…" strings; rizin's register
 // names, the API behind a call and its summary come out of the file and are only ever set as text.
 
-// A number of the state as a hex string; "~" in front of a value above 2^53, which JSON gave the browser
-// as a double that cannot hold it exactly
+// A word of the state as it is shown: the server sends every machine word as an exact "0x…" string (a JSON
+// number would reach the browser as a double, which cannot hold a 64-bit register), so this only normalises it;
+// a value that is no word shows as "?", never as an empty cell
 function rizinEmuHex(value) {
-    if (!Number.isInteger(value) || value < 0) return '';
-    const hex = rizinHex(value) || '0x' + 'f'.repeat(16);
-    return Number.isSafeInteger(value) ? hex : '~' + hex;
+    return rizinHex(value) || '?';
 }
 
 // The emulation's PC as "0x…", or null outside the emulation
@@ -24699,7 +24706,7 @@ function rizinEmuWhy(emu, options) {
     if (stopped === 'step') return { kind: 'step', text: (RIZIN_EMU.done[emu.ran] || 'Stopped after the step asked for') + summary };
     if (RIZIN_EMU.stops[stopped]) return { kind: stopped, text: RIZIN_EMU.stops[stopped] + summary };
     if (stopped) return { kind: 'stopped', text: `Stopped: ${stopped}${summary}` };
-    return { kind: 'ready', text: `Ready at ${rizinHex(emu && emu.pc) || 'the PC'}: no run has stopped here yet${summary}` };
+    return { kind: 'ready', text: `Ready at ${rizinHex(emu && emu.pc) || 'the PC'}: no run has stopped here yet` };
 }
 
 // The offer for a call at the PC (rizinEmuAssist): the sentence of what SKIP will do, and the field for the
@@ -24712,7 +24719,7 @@ function rizinRunAssistHtml(assist) {
         return `<span class="rizin-run-assist-text" title="${escapeHtml(reason)}">; ${escapeHtml(reason)}</span>`;
     }
     const text = assist.summary || `skip ${assist.api || 'the call'}`;
-    const value = Number.isInteger(assist.value) && assist.value >= 0 ? rizinHex(assist.value) || '' : '';
+    const value = typeof assist.value === 'string' ? rizinHex(assist.value) || '' : '';
     const reg = assist.ret_reg || 'value';
     return `<span class="rizin-run-assist-text" title="${escapeHtml(text)}">; ${escapeHtml(text)}</span>`
         + `<label class="rizin-run-assist-label" for="rizin-run-assist-value">${escapeHtml(reg)} =</label>`
@@ -24831,7 +24838,7 @@ async function rizinEmuAssist() {
     emu.assist = {
         addr: pc, supported: d.supported === true, reason: typeof d.reason === 'string' ? d.reason : '',
         api: typeof d.api === 'string' ? d.api : '', ret_reg: typeof d.ret_reg === 'string' ? d.ret_reg : '',
-        value: Number.isInteger(d.value) ? d.value : null, stack_fix: Number.isInteger(d.stack_fix) ? d.stack_fix : 0,
+        value: typeof d.value === 'string' ? rizinHex(d.value) : null, stack_fix: Number.isInteger(d.stack_fix) ? d.stack_fix : 0,
         summary: typeof d.summary === 'string' ? d.summary : '',
     };
     rizinRenderRunStrip();
@@ -24915,8 +24922,9 @@ async function rizinEmuPost(wait, path, body, ran) {
     rizinState.emu = { ...r.data, ran, assist: null };
     rizinRenderRunStrip();
     const pc = rizinEmuPc();
+    // The jump draws every view, with the PC's marks (also where it found rizin busy); no PC: its marks go
     if (pc) await rizinSeek(pc, 'emulation');
-    rizinRenderPcMarks();
+    else rizinRenderPcMarks();
     await rizinEmuAssist();
     return true;
 }
@@ -24929,7 +24937,6 @@ async function rizinEmuStart() {
     const seq = ++rizinState.emuSeq;
     rizinState.emuWait = 'start';
     rizinState.note = '';
-    rizinRenderRunStrip();
     rizinRenderState();
     const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/emulation/start`,
                              { method: 'POST', body: rizinState.seek ? { addr: rizinState.seek } : {} });
@@ -24937,7 +24944,6 @@ async function rizinEmuStart() {
     rizinState.emuWait = '';
     if (!r.ok || r.data.running !== true) {
         if (r.state === 'refused' || r.state === 'error' || r.ok) rizinState.note = r.ok ? 'the server answered without a state' : r.error;
-        rizinRenderRunStrip();
         rizinRenderState();
         if (r.state === 'busy') rizinPollSoon();
         return false;
@@ -25007,16 +25013,19 @@ function rizinEmuSkipCall() {
     return rizinEmuPost('skip', 'call', { addr: pc, value, stack_fix: assist.stack_fix }, 'skip');
 }
 
-// GO TO PC: every view at the PC, after the user went elsewhere
+// GO TO PC: every view at the PC, after the user went elsewhere. A jump of the user's, so it enters the history
+// (the views following a run do not)
 function rizinEmuGoToPc() {
     const pc = rizinEmuPc();
-    return pc ? rizinSeek(pc, 'emulation') : Promise.resolve(false);
+    return pc && !rizinState.emuWait ? rizinSeek(pc, 'pc') : Promise.resolve(false);
 }
 
-// One click handler for the strip: a run (SKIP goes through the call assistant), GO TO PC or STOP
+// One click handler for the strip: a run (SKIP goes through the call assistant), GO TO PC or STOP. It does not
+// look at the button being off: every action refuses by itself while a run waits (a browser sends no click of an
+// off button anyway), so there is one rule, in the actions
 function rizinOnRunClick(event) {
     const button = event.target && event.target.closest ? event.target.closest('button') : null;
-    if (!button || button.disabled || button.hasAttribute('disabled')) return false;
+    if (!button) return false;
     const kind = button.getAttribute('data-rizin-run'), action = button.getAttribute('data-rizin-act');
     if (kind === 'skip') return rizinEmuSkipCall();
     if (kind) return rizinEmuRun(kind);

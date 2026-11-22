@@ -23,6 +23,13 @@ def parse_registers(text):
     return registers
 
 
+def word(value):
+    """A machine word or an address derived from one as the emulation routes send it: "0x…" in lower case, None
+    for None. Never a JSON number: the browser reads a number as a double, which cannot hold a 64-bit register
+    (measured: 0x7ff7a1b2c3d4e5f6 arrived as 0x7ff7a1b2c3d4e400), and a register is editable there."""
+    return None if value is None else f"{value:#x}"
+
+
 def changed_registers(before, registers):
     """The names of the registers whose value differs from ``before`` ({name: value}); none without one."""
     if before is None:

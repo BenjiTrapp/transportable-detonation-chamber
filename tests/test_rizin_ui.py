@@ -870,6 +870,7 @@ def test_rizin_tab_layout_and_themes():
     # The run strip changed all three sheets
     assert "style.css?v=81" not in html and 'theme-layout.css?v=5"' not in html and "app.js?v=119" not in html, \
         "asset versions not raised for the run strip"
+    assert "app.js?v=120" not in html, "app.js changed after the run strip's review (R52, R53), its version did not"
 
 
 # --- Fix round: polling, step boundaries, errors, quick clicks ----------------------
@@ -1096,7 +1097,7 @@ function serve(sid, s) {
         if (scripted) return scripted;
         const op = Object.values(OPS).flat().find(o => o.offset === parseInt(hex, 16));
         if (!op || !op.type.includes('call')) return [400, { refused: `rizin decoded no call at ${hex}` }];
-        return [200, { supported: true, reason: null, api: 'Sleep', ret_reg: 'rax', value: 0, stack_fix: 0,
+        return [200, { supported: true, reason: null, api: 'Sleep', ret_reg: 'rax', value: '0x0', stack_fix: 0,
                        summary: 'skip Sleep: rax = 0x0. The caller cleans the stack.' }, s.callDelay ?? 1];
     });
     on('POST', `/api/rizin/${sid}/call`, (url, body) => {
@@ -1105,15 +1106,18 @@ function serve(sid, s) {
         const scripted = s.callSkip && s.callSkip(body, s);
         if (scripted) return scripted;
         emuMove(s.emu, 'skip');
-        if (body.value !== null) s.emu.rax = parseInt(body.value, 16);
+        if (body.value !== null) s.emu.rax = body.value;
         return [200, { ...emuRead(s.emu, 'step'), summary: `skipped the call at ${body.addr}` }, s.callDelay ?? 1];
     });
 }
 // The emulation of serve(): the registers as the state lists them (rip is the PC), and a run's move over
 // the instructions of the function the PC is in
+// A machine word as the server sends it (R52): an exact "0x…" string, whatever the number of its digits; a
+// value a test sets as a string (a 64-bit register) goes through as it is
+const word = v => (typeof v === 'string' || v === null ? v : '0x' + v.toString(16));
 const emuRead = (e, stopped = null) => ({
-    running: true, pc: e.pc, registers: [{ name: 'rax', value: e.rax }, { name: 'rbx', value: e.rbx },
-                                         { name: 'rcx', value: e.rcx }, { name: 'rip', value: e.pc }],
+    running: true, pc: word(e.pc), registers: [{ name: 'rax', value: word(e.rax) }, { name: 'rbx', value: word(e.rbx) },
+                                               { name: 'rcx', value: word(e.rcx) }, { name: 'rip', value: word(e.pc) }],
     changed: [...e.changed], stack: [], stopped, arch: 'x86', bits: 64 });
 function emuMove(e, kind, addr) {
     const ops = OPS[fnAt(e.pc)?.name] || [], at = ops.findIndex(o => o.offset === e.pc);
@@ -5179,8 +5183,19 @@ def test_rizin_emulation_strip_appears_only_while_running():
         """ + EMU_SETUP + r"""
         r.pre = pre;
         r.opened = { hidden: strip.hidden, start: $('rizin-emu-start').disabled, emu: rizinState.emu };
+        // START waits while another OPEN does, and is back when that one failed
+        opens['C:\\x\\missing.exe'] = () => [400, { refused: 'the file does not exist' }, 60];
+        const opening = openInRizin('C:\\x\\missing.exe');
+        await until(() => rizinState.opening, 'the OPEN in flight');
+        r.whileOpening = $('rizin-emu-start').disabled;
+        await opening; await quiet();
+        r.afterOpen = $('rizin-emu-start').disabled;
         const from = calls.length;
-        await startAt('0x1400014bc');
+        await rizinSeek('0x1400014bc', 'test'); await quiet();
+        const clickFrom = calls.length;
+        click($('rizin-emu-start'));
+        await until(() => !strip.hidden, 'the strip'); await quiet();
+        r.startSent = calls.slice(clickFrom).filter(c => c[0] === 'POST').map(c => [c[1].replace('/api/rizin/S1', ''), c[2]]);
         r.started = {
             hidden: strip.hidden, emu: rizinState.emu && rizinState.emu.running, start: $('rizin-emu-start').disabled,
             kinds: strip.querySelectorAll('[data-rizin-run]').map(b => b.getAttribute('data-rizin-run')),
@@ -5215,6 +5230,9 @@ def test_rizin_emulation_strip_appears_only_while_running():
     assert started["disabled"] == 0 and started["start"] is True, "START stays on while the emulation runs"
     assert "0x1400014bc" in started["pc"] and started["why"].strip(), "the PC, and a word on why it stands"
     assert started["posts"] == [["/api/rizin/S1/emulation/start", {"addr": "0x1400014bc"}]]
+    assert r["whileOpening"] is True and r["afterOpen"] is False, "START was not off while an OPEN waited, or stayed off after it failed"
+    assert r["startSent"] == [["/emulation/start", {"addr": "0x1400014bc"}]], \
+        "START asked for a jump to the PC it started at, where the views were already"
     stopped = r["stopped"]
     assert stopped["hidden"] is True and stopped["emu"] is None and stopped["start"] is False
     assert stopped["stops"] == 1 and stopped["posts"] == 1, "STOP posts the stop, and only that"
@@ -5227,7 +5245,8 @@ def test_rizin_emulation_strip_appears_only_while_running():
 def test_rizin_emulation_step_moves_the_views_and_marks_the_pc():
     # one STEP posts /emulation/run {kind:"step"}, then /seek with the new pc, and
     # DISASSEMBLY, GRAPH, DECOMPILER and HEX all show the new address; the PC row
-    # carries the pc class while the row the user jumped to keeps its own
+    # carries the pc class while the row the user jumped to keeps its own (the breakpoint
+    # row's own mark arrives with Task 12: the gutter; there is no breakpoint row to assert yet)
     r = _scripted(EMU_SETUP + r"""
         await startAt('0x1400014bc');
         const pane = $('rizin-disasm'), graph = $('rizin-graph');
@@ -5264,6 +5283,13 @@ def test_rizin_emulation_step_moves_the_views_and_marks_the_pc():
         S.emuRun = undefined;
         r.other = { title: $('rizin-code-title').textContent, disasm: addrs(pane, '.rizin-op.pc'), current: addrs(pane, '.rizin-op.current'),
                     graph: addrs(graph, '.rizin-block.pc'), graphTitle: $('rizin-graph-title').textContent };
+        // The jump to the PC found rizin busy: the PC's marks still move (the current place stays where it was)
+        S.seekAnswer = () => [409, { busy: true, step: 'console' }];
+        S.emuRun = () => { S.emu.pc = 0x140001499; return [200, emuRead(S.emu, 'step')]; };
+        await press(run('step'));
+        S.seekAnswer = undefined; S.emuRun = undefined;
+        r.busySeek = { pc: addrs(pane, '.rizin-op.pc'), current: addrs(pane, '.rizin-op.current'), seek: rizinState.seek };
+        await until(() => rizinState.ui.state === '', 'the poll found rizin free'); await quiet();
         // The markup builders mark the PC apart from the current place (the marks above are moved, not drawn)
         const drawn = document.createElement('div');
         drawn.innerHTML = rizinGraphSvg(rizinState.graph.layout, rizinState.graph, { current: '0x140001490', pc: '0x140001494' });
@@ -5294,9 +5320,10 @@ def test_rizin_emulation_step_moves_the_views_and_marks_the_pc():
     assert r["away"]["graphPc"] == ["0x1400014be"] and r["away"]["graphCurrent"] == ["0x140001521"]
     assert "0x1400014be" in r["away"]["strip"]
     assert r["back"] == {"current": ["0x1400014be"], "pc": ["0x1400014be"]}
-    assert r["next"] == {"current": ["0x140001521"], "pc": ["0x140001521"], "state": 0x140001521}
+    assert r["next"] == {"current": ["0x140001521"], "pc": ["0x140001521"], "state": "0x140001521"}
     assert r["other"] == {"title": "sym.watchdog", "disasm": ["0x140001494"], "current": ["0x140001494"],
                           "graph": ["0x140001494"], "graphTitle": "GRAPH · sym.watchdog"}, r["other"]
+    assert r["busySeek"]["pc"] == ["0x140001499"] and r["busySeek"]["seek"] == "0x140001494", r["busySeek"]
     assert r["drawn"] == {"graph": [["0x140001494"], ["0x140001490"]], "disasm": [["0x140001494"], ["0x140001490"]]}
     assert r["until"] == [{"kind": "until", "addr": "0x140001521"}]
     assert r["refused"] == 0, "a run without an address, a BACK or another word than the six kinds went out"
@@ -5322,22 +5349,34 @@ def test_rizin_emulation_strip_shows_only_the_registers_that_changed():
         S.emuRun = () => [200, { ...emuRead(S.emu, 'step'), changed: [] }];
         await press(run('over'));
         r.none = { regs: regs(), text: $('rizin-run-regs').textContent.trim() };
-        // Registers' names come out of the file; a value above 2^53 is marked as approximate
+        // Registers' names come out of the file; a value above 2^53 shows exactly (the server sends words as strings)
         const hostile = '<img src=x onerror=alert(1)>';
         S.emuRun = () => [200, { ...emuRead(S.emu, 'step'), changed: [hostile, 'rax', 'rbx'],
-                                 registers: [{ name: hostile, value: 1 }, { name: 'rax', value: 0xfffffffffffffff0 },
-                                             { name: 'rbx', value: 4660 }] }];
+                                 registers: [{ name: hostile, value: '0x1' }, { name: 'rax', value: '0x7ff7a1b2c3d4e5f6' },
+                                             { name: 'rbx', value: '0x20000000000001' }] }];
         await press(run('step'));
-        r.hostile = { regs: regs(), values: $('rizin-run-regs').querySelectorAll('.rizin-run-reg-value').map(e => e.textContent),
+        r.hostile = { regs: regs(), text: $('rizin-run-regs').textContent,
+                      values: $('rizin-run-regs').querySelectorAll('.rizin-run-reg-value').map(e => e.textContent),
                       tags: [...$('rizin-run-regs').walk()].map(e => e.tagName).filter(t => t !== 'SPAN'),
                       handlers: [...$('rizin-run-regs').walk()].flatMap(e => Object.keys(e.attrs)).filter(a => a.startsWith('on')) };
         // Many changed registers: the strip keeps the first few and says how many more
         S.emuRun = () => {
             const names = Array.from({ length: 20 }, (_, i) => `r${i}`);
-            return [200, { ...emuRead(S.emu, 'step'), changed: names, registers: names.map((name, i) => ({ name, value: i })) }];
+            return [200, { ...emuRead(S.emu, 'step'), changed: names, registers: names.map((name, i) => ({ name, value: '0x' + i.toString(16) })) }];
         };
         await press(run('step'));
         r.many = { n: regs().length, more: $('rizin-run-regs').textContent, held: rizinState.emu.registers.length };
+        // A value that is no word shows as "?", never as an empty cell; a PC that rizin did not name says so, and
+        // the views are not asked to follow it
+        S.emuRun = () => [200, { ...emuRead(S.emu, 'step'), changed: ['rax', 'rbx'],
+                                 registers: [{ name: 'rax', value: null }, { name: 'rbx', value: 'banana' }] }];
+        await press(run('step'));
+        r.unreadable = $('rizin-run-regs').querySelectorAll('.rizin-run-reg-value').map(e => e.textContent);
+        S.emuRun = () => [200, { ...emuRead(S.emu, 'step'), pc: null }];
+        const nullFrom = calls.length;
+        await press(run('step'));
+        r.noPc = { text: $('rizin-run-pc').textContent, seeks: posts(nullFrom, '/seek').length, goto: act('gotopc').disabled,
+                   marks: $('rizin-disasm').querySelectorAll('.rizin-op.pc').length };
     """)
     assert "error" not in r, r.get("error")
     assert r["start"]["regs"] == [] and r["start"]["text"], "no register changed yet: the strip still says something"
@@ -5350,9 +5389,13 @@ def test_rizin_emulation_strip_shows_only_the_registers_that_changed():
     assert r["skip"] == {"regs": ["rip"], "changed": ["rip"]}
     assert r["none"]["regs"] == [] and r["none"]["text"] and "rax" not in r["none"]["text"]
     assert r["hostile"]["regs"] == [HOSTILE, "rax", "rbx"]
-    assert r["hostile"]["values"] == ["0x1", "~0xffffffffffffffff", "0x1234"], "a value the browser cannot hold exactly"
+    assert r["hostile"]["values"] == ["0x1", "0x7ff7a1b2c3d4e5f6", "0x20000000000001"], \
+        "a word above 2^53 lost digits or got a mark"
+    assert "~" not in r["hostile"]["text"], "an approximation mark where words are exact"
     assert r["hostile"]["tags"] == [] and r["hostile"]["handlers"] == [], "a register's name became markup"
     assert 1 <= r["many"]["n"] < 20 and "more" in r["many"]["more"] and r["many"]["held"] == 20
+    assert r["unreadable"] == ["?", "?"], "an unreadable register shows an empty cell"
+    assert "unknown" in r["noPc"]["text"] and r["noPc"]["seeks"] == 0 and r["noPc"]["goto"] is True and r["noPc"]["marks"] == 0, r["noPc"]
 
 
 @needs_node
@@ -5387,8 +5430,26 @@ def test_rizin_emulation_says_why_it_stopped():
         S.emuRun = () => [200, { ...emuRead(S.emu, '<img src=x onerror=alert(1)>') }];
         await press(run('step'));
         r.hostile = [why(), [...$('rizin-run-why').walk()].length];
+        // What a skipped call applied comes with the reason, whichever it is
+        const withSummary = {};
+        for (const reason of ['step', 'breakpoint', 'timeout', 'invalid', 'trap', 'gone-wrong']) {
+            S.emuRun = () => [200, { ...emuRead(S.emu, reason), summary: `SUMMARY-${reason}` }];
+            await press(run('skip'));
+            withSummary[reason] = why();
+        }
+        r.withSummary = withSummary;
+        // An answer that is no state is not taken for one
+        S.emuRun = () => [200, {}];
+        const emptyBefore = rizinState.emu;
+        click(run('step'));
+        await until(() => why().includes('without a state') && !rizinState.emuWait, 'the empty answer'); await quiet();
+        r.empty = rizinState.emu === emptyBefore;
         // A run the server refused says the reason, and the state stays
-        S.emuRun = () => [400, { refused: 'the emulation is not started' }];
+        S.emuRun = () => [400, { refused: 'io.cache does not hold' }];
+        const stateBefore = rizinState.emu;
+        click(run('step'));
+        await until(() => why().includes('io.cache does not hold') && !rizinState.emuWait, 'the refusal'); await quiet();
+        r.refused = { hidden: strip.hidden, same: rizinState.emu === stateBefore, off: strip.querySelectorAll('button').filter(b => b.disabled).length };
     """)
     assert "error" not in r, r.get("error")
     said = r["said"]
@@ -5408,6 +5469,10 @@ def test_rizin_emulation_says_why_it_stopped():
     assert r["moved"].strip() and "breakpoint" not in r["moved"].lower()
     assert "gone-wrong" in r["unknown"], "a reason the strip does not know is named, not dropped"
     assert HOSTILE in r["hostile"][0] and r["hostile"][1] == 0, "a reason became markup"
+    for reason, text in r["withSummary"].items():
+        assert f"SUMMARY-{reason}" in text, f"{reason}: the summary of the skipped call went from the line: {text!r}"
+    assert r["empty"] is True, "an answer without a state replaced the state"
+    assert r["refused"] == {"hidden": False, "same": True, "off": 0}, "a refused run changed the state or left the buttons off"
 
 
 @needs_node
@@ -5424,20 +5489,26 @@ def test_rizin_emulation_stop_leaves_the_mode_and_does_not_promise_an_abort():
         click(run('cont'));
         await until(() => rizinState.emuWait === 'cont', 'the run in flight');
         r.flying = { buttons: buttons(), words: words(), why: why(), start: $('rizin-emu-start').disabled };
-        // Another run and STOP, during the run: nothing goes out
-        click(run('step')); click(act('stop')); click(act('gotopc')); rizinEmuRun('over'); rizinEmuStop();
+        // Another run, STOP and GO TO PC, during the run: nothing goes out, of any kind (GO TO PC would post a seek)
+        click(run('step')); click(act('stop')); click(act('gotopc')); rizinEmuRun('over'); rizinEmuStop(); rizinEmuGoToPc();
+        rizinLoadEmulation(true);                  // a forced read (an analysis step ended) waits for the run too
         await tick(30);
-        r.during = posts(from, '/emulation/').map(c => [c[1].split('/emulation/')[1], c[2]]);
+        r.reads = gets(from, '/emulation').length;
+        r.during = calls.slice(from).filter(c => c[0] === 'POST').map(c => [c[1].replace('/api/rizin/S1', ''), c[2]]);
         r.stillRunning = [strip.hidden, !!rizinState.emu];
         await until(() => !rizinState.emuWait, 'the run ends'); await quiet();
         r.after = { buttons: buttons(), emuPc: rizinState.emu.pc };
+        // A STOP the server refuses: the mode stays, with the reason in the strip
+        S.emuStop = () => [400, { refused: 'rizin could not give the emulation back' }];
+        click(act('stop'));
+        await until(() => why().includes('give the emulation back') && !rizinState.emuWait, 'the refusal'); await quiet();
+        r.refused = { hidden: strip.hidden, running: !!rizinState.emu, buttons: buttons() };
         // STOP leaves the mode
+        S.emuStop = undefined;
         const stopFrom = calls.length;
         click(act('stop'));
         await until(() => strip.hidden, 'left'); await quiet();
         r.left = [posts(stopFrom, '/emulation/stop').length, rizinState.emu, strip.hidden];
-        // A STOP the server refuses (the session ended on the way) leaves the strip's state to the session's
-        S.runDelay = 1;
     """)
     assert "error" not in r, r.get("error")
     runs = ["CONT", "STEP", "OVER", "SKIP", "TO CALL"]
@@ -5449,9 +5520,12 @@ def test_rizin_emulation_stop_leaves_the_mode_and_does_not_promise_an_abort():
     assert "STOP" == r["flying"]["words"].split(" | ")[0].strip()
     assert re.search(r"cannot be interrupted", r["flying"]["why"]), r["flying"]["why"]
     assert r["flying"]["start"] is True
-    assert r["during"] == [["run", {"kind": "cont"}]], "a click during the run posted something: " + str(r["during"])
+    assert r["during"] == [["/emulation/run", {"kind": "cont"}]], "a click during the run posted something: " + str(r["during"])
     assert r["stillRunning"] == [False, True], "STOP during a run left the mode"
-    assert not any(r["after"]["buttons"].values()) and r["after"]["emuPc"] == 0x140001529
+    assert not any(r["after"]["buttons"].values()) and r["after"]["emuPc"] == "0x140001529"
+    assert r["reads"] == 0, "the state was read while a run was out: its answer would be older than the run's"
+    assert r["refused"]["hidden"] is False and r["refused"]["running"] is True, "a refused STOP left the mode"
+    assert not any(r["refused"]["buttons"].values()), "the strip stayed off after a refused STOP"
     assert r["left"] == [1, None, True]
 
 
@@ -5460,14 +5534,16 @@ def test_rizin_emulation_offers_a_call_return_and_lets_it_be_edited():
     # at a call to an import, #rizin-run-assist shows the offered value; editing the
     # field and pressing SKIP posts that edited value, not the offered one
     r = _scripted(EMU_SETUP + r"""
-        const hostile = '<img src=x onerror=alert(1)>';
+        const hostile = '"><img src=x onerror=alert(1)>';      // leaves an attribute and makes an element
         const offer = (over = {}) => (addr, s) => [200, { supported: true, reason: null, api: 'VirtualAlloc', ret_reg: 'rax',
-            value: 0x140008000, stack_fix: 0, summary: 'skip VirtualAlloc: rax = 0x140008000, a buffer of 65536 bytes', ...over }];
+            value: '0x140008000', stack_fix: 0, summary: 'skip VirtualAlloc: rax = 0x140008000, a buffer of 65536 bytes', ...over }];
         const box = $('rizin-run-assist'), field = () => $('rizin-run-assist-value');
         // The requests of a press but the jump to the PC it ends in
         const sent = from => calls.slice(from).filter(c => c[0] === 'POST' && !c[1].endsWith('/seek'))
             .map(c => [c[1].replace('/api/rizin/S1', ''), c[2]]);
         const shown = () => ({ hidden: box.hidden, text: box.textContent, value: field() ? field().value : null,
+                               aria: field() ? field().getAttribute('aria-label') : null,
+                               title: box.querySelectorAll('[title]').map(e => e.getAttribute('title')),
                                tags: [...box.walk()].map(e => e.tagName).filter(t => !['SPAN', 'LABEL', 'INPUT', 'B'].includes(t)),
                                handlers: [...box.walk()].flatMap(e => Object.keys(e.attrs)).filter(a => a.startsWith('on')) });
         S.callAssist = offer();
@@ -5523,11 +5599,44 @@ def test_rizin_emulation_offers_a_call_return_and_lets_it_be_edited():
         const pressFrom = calls.length;
         await press(run('skip'));
         r.noCallPosts = sent(pressFrom);
+        // An offer made for another call is not applied to this one: SKIP is the plain skip
+        S.callAssist = offer();
+        await rizinEmuStop();
+        await startAt('0x140001499');
+        rizinState.emu.assist = { ...rizinState.emu.assist, addr: '0x1' };
+        const staleFrom = calls.length;
+        await press(run('skip'));
+        r.stale = sent(staleFrom);
+        // The PC moved to another call behind the tab's back (the console): the state read again asks about it
+        await rizinEmuStop();
+        await startAt('0x140001499');
+        S.emu.pc = 0x1400014be;
+        const moveFrom = calls.length;
+        await rizinReloadViews(); await quiet();
+        r.moved = { asked: gets(moveFrom, '/call').map(c => c[1]), hidden: box.hidden, value: field() ? field().value : null };
+        // SKIP pressed while a run is in flight, with a value that is no number: nothing happens, not even a note
+        S.callAssist = offer();
+        await rizinEmuStop();
+        await startAt('0x140001499');
+        S.runDelay = 80;
+        click(run('step'));
+        await until(() => rizinState.emuWait === 'step', 'the run in flight');
+        field().value = 'banana';
+        const flightFrom = calls.length;
+        click(run('skip'));
+        await until(() => !rizinState.emuWait, 'the run ends'); await quiet();
+        S.runDelay = 1;
+        r.midRun = { why: why(), posts: posts(flightFrom, '/call').length };
         // What the file and the table name is text
-        S.callAssist = offer({ api: hostile, summary: `skip ${hostile}`, reason: hostile });
+        S.callAssist = offer({ api: hostile, summary: `skip ${hostile}`, reason: hostile, ret_reg: hostile });
         await rizinEmuStop();
         await startAt('0x140001499');
         r.hostile = shown();
+        // The table's name where no sentence came with it
+        S.callAssist = offer({ api: hostile, summary: '', ret_reg: hostile });
+        await rizinEmuStop();
+        await startAt('0x140001499');
+        r.hostileApi = shown();
         S.callAssist = () => [200, { supported: false, reason: hostile, api: hostile, ret_reg: null, value: null, stack_fix: 0, summary: hostile }];
         await rizinEmuStop();
         await startAt('0x140001499');
@@ -5539,19 +5648,25 @@ def test_rizin_emulation_offers_a_call_return_and_lets_it_be_edited():
     assert "VirtualAlloc" in r["offered"]["text"] and "65536" in r["offered"]["text"]
     assert r["edited"]["posts"] == [["/call", {"addr": "0x140001499", "value": "0x140009000", "stack_fix": 0}]], \
         "SKIP did not post the edited value to /call"
-    assert r["edited"]["pc"] == 0x14000149f and r["edited"]["rax"] == 0x140009000, "the offered value was applied, not the edited"
+    assert r["edited"]["pc"] == "0x14000149f" and r["edited"]["rax"] == "0x140009000", "the offered value was applied, not the edited"
     assert r["edited"]["hidden"] is True, "the offer of a call stayed once the PC left it"
     assert r["edited"]["why"].strip() and "skipped the call" in r["edited"]["why"], "what the skip applied is not said"
     assert r["untouched"] == [["/call", {"addr": "0x140001499", "value": "0x140008000", "stack_fix": 8}]]
-    assert r["bad"]["posts"] == 0 and r["bad"]["value"] == "banana" and r["bad"]["pc"] == 0x140001499
+    assert r["bad"]["posts"] == 0 and r["bad"]["value"] == "banana" and r["bad"]["pc"] == "0x140001499"
     assert "banana" in r["bad"]["why"], "no word on the value that is no number"
     assert r["unknown"]["value"] == "" and "Unknown" in r["unknown"]["text"]
     assert r["empty"] == [{"addr": "0x140001499", "value": None, "stack_fix": 0}]
     assert r["off"]["value"] is None and "arm at 64 bits" in r["off"]["text"] and r["off"]["hidden"] is False
     assert r["offPosts"] == [["/emulation/run", {"kind": "skip"}]], "SKIP did not fall back to the plain skip"
+    assert r["stale"] == [["/emulation/run", {"kind": "skip"}]], r["stale"]
+    assert r["moved"] == {"asked": ["/api/rizin/S1/call?addr=0x1400014be"], "hidden": False, "value": "0x140008000"}, r["moved"]
+    assert "banana" not in r["midRun"]["why"] and r["midRun"]["posts"] == 0, r["midRun"]
     assert r["noCall"] == [True, 0] and r["noCallPosts"] == [["/emulation/run", {"kind": "skip"}]]
-    for key in ("hostile", "hostileOff"):
+    for key in ("hostile", "hostileApi", "hostileOff"):
         assert HOSTILE in r[key]["text"] and r[key]["tags"] == [] and r[key]["handlers"] == [], f"{key}: markup"
+    for key in ("hostile", "hostileApi"):
+        assert r[key]["aria"] == "The value SKIP puts into " + '"><img src=x onerror=alert(1)>', f"{key}: the register's name in the field's label"
+        assert r[key]["title"] == ["skip " + '"><img src=x onerror=alert(1)>'], f"{key}: the sentence in its title"
 
 
 @needs_node
@@ -5573,6 +5688,16 @@ def test_rizin_emulation_busy_and_ended_sessions_behave_like_the_other_views():
         await quiet();
         r.retried = { asked: gets(busyFrom, '/emulation').length, ui: rizinState.ui.state, hidden: strip.hidden,
                       rax: rizinState.emu.registers.find(x => x.name === 'rax').value };
+        // A late answer of a run that was out when the session ended does not bring the emulation back
+        S.runDelay = 100;
+        click(run('step'));
+        await until(() => rizinState.emuWait === 'step', 'the run in flight');
+        rizinSetUi('ended', {});
+        await tick(160); await quiet();
+        r.late = { emu: rizinState.emu, hidden: strip.hidden, wait: rizinState.emuWait };
+        S.runDelay = 1;
+        rizinState.ui = { state: '', step: null, reason: null, path: null };
+        await rizinEmuStart(); await quiet();
         // A run that finds rizin busy did not run: the state stays, and the strip says so
         S.emuRun = () => [409, { busy: true, step: 'console' }];
         S.emuState = undefined;
@@ -5580,6 +5705,34 @@ def test_rizin_emulation_busy_and_ended_sessions_behave_like_the_other_views():
         click(run('step'));
         await until(() => rizinState.ui.state === 'busy' && !rizinState.emuWait, 'busy'); await quiet();
         r.runBusy = { pc: rizinState.emu.pc === pc, why: why(), buttons: strip.querySelectorAll('button').filter(b => b.disabled).length };
+        // The state read again once rizin is free takes the note of the run that did not happen away
+        await rizinReloadViews(); await quiet();
+        r.noteGone = why();
+        // The offer for a call that finds rizin busy is asked again by the poll
+        S.emuRun = undefined;
+        let asked = 0;
+        S.callAssist = () => (++asked === 1 ? [409, { busy: true, step: 'console' }] : undefined);
+        await rizinEmuStop();
+        await rizinSeek('0x140001499', 'test'); await quiet();
+        click($('rizin-emu-start'));
+        await until(() => rizinState.retry.has('emulation'), 'the offer found rizin busy');
+        r.assistBusy = { retry: rizinState.retry.get('emulation'), hidden: $('rizin-run-assist').hidden };
+        await until(() => !rizinState.retry.has('emulation') && !$('rizin-run-assist').hidden, 'the offer after the retry'); await quiet();
+        S.callAssist = undefined;
+        // The server lost the emulation, found out by a read: the mode is left, with the reason in the toolbar
+        S.emuState = () => [400, { refused: 'the emulation is not started' }];
+        await rizinReloadViews(); await quiet();
+        S.emuState = undefined;
+        r.lostByRead = { emu: rizinState.emu, hidden: strip.hidden, state: $('rizin-state').textContent };
+        await startAt('0x1400014bc');
+        // STOP that finds rizin busy: the mode stays, and the poll takes the toolbar's busy away once rizin is free
+        S.emuRun = undefined;
+        S.emuStop = () => [409, { busy: true, step: 'console' }];
+        click(act('stop'));
+        await until(() => rizinState.ui.state === 'busy' && !rizinState.emuWait, 'STOP found rizin busy');
+        r.stopBusy = { hidden: strip.hidden, why: why() };
+        await until(() => rizinState.ui.state === '', 'the poll found rizin free'); await quiet();
+        S.emuStop = undefined;
         // The server lost the emulation (a restarted rizin): the mode is left, with the reason in the toolbar
         S.emuRun = () => [400, { refused: 'the emulation is not started' }];
         click(run('step'));
@@ -5591,6 +5744,12 @@ def test_rizin_emulation_busy_and_ended_sessions_behave_like_the_other_views():
         click($('rizin-emu-start'));
         await until(() => $('rizin-state').textContent.includes('io.cache'), 'the refusal'); await quiet();
         r.refused = [strip.hidden, rizinState.emu, $('rizin-state').textContent];
+        // START that finds rizin busy: no strip, START back, and the poll takes the busy away
+        S.emuStart = () => [409, { busy: true, step: 'console' }];
+        click($('rizin-emu-start'));
+        await until(() => rizinState.ui.state === 'busy' && !rizinState.emuWait, 'START found rizin busy');
+        r.startBusy = { hidden: strip.hidden, start: $('rizin-emu-start').disabled };
+        await until(() => rizinState.ui.state === '', 'the poll found rizin free'); await quiet();
         S.emuStart = undefined;
         // The session ended while a run was out: 404 clears the state, the strip goes, nothing is polled
         await startAt('0x1400014bc');
@@ -5629,9 +5788,15 @@ def test_rizin_emulation_busy_and_ended_sessions_behave_like_the_other_views():
     assert "error" not in r, r.get("error")
     assert r["busy"] == {"retry": True, "ui": "busy", "hidden": False, "asked": 1}, r["busy"]
     assert r["retried"]["asked"] >= 2 and r["retried"]["ui"] == "" and r["retried"]["hidden"] is False
-    assert r["retried"]["rax"] == 41, "the state asked for again after the retry was not taken"
+    assert r["retried"]["rax"] == "0x29", "the state asked for again after the retry was not taken"
     assert r["runBusy"]["pc"] is True and "busy" in r["runBusy"]["why"] and "console" in r["runBusy"]["why"]
     assert "nothing ran" in r["runBusy"]["why"] and r["runBusy"]["buttons"] == 0, "the buttons stayed off after a busy answer"
+    assert r["stopBusy"]["hidden"] is False and "not left" in r["stopBusy"]["why"] and "console" in r["stopBusy"]["why"]
+    assert r["startBusy"] == {"hidden": True, "start": False}
+    assert r["late"] == {"emu": None, "hidden": True, "wait": ""}, "a late answer brought the emulation back: " + str(r["late"])
+    assert "nothing ran" not in r["noteGone"] and r["noteGone"].strip(), r["noteGone"]
+    assert r["assistBusy"] == {"retry": True, "hidden": True}, r["assistBusy"]
+    assert r["lostByRead"]["emu"] is None and r["lostByRead"]["hidden"] is True and "not started" in r["lostByRead"]["state"]
     assert r["lost"]["emu"] is None and r["lost"]["hidden"] is True and "not started" in r["lost"]["state"]
     assert r["lost"]["start"] is False
     assert r["refused"][0] is True and r["refused"][1] is None and "io.cache" in r["refused"][2]
@@ -5641,6 +5806,40 @@ def test_rizin_emulation_busy_and_ended_sessions_behave_like_the_other_views():
     assert r["restarted"] is True and r["endedByRead"] == [None, True, "ended"]
     assert r["beforeOther"] is True
     assert r["other"] == {"emu": None, "hidden": True, "wait": "", "note": "", "marks": 0}
+
+
+@needs_node
+def test_rizin_emulation_follow_is_no_navigation_of_the_user():
+    # R53: the views following a run are no jump of the user's: ◀ ▶ keep the places the user went to (a run
+    # neither adds to the list nor cuts off what ▶ holds), ◀ at the place of the PC returns to the entry the
+    # user left, and GO TO PC, which is a jump of theirs, does enter the history
+    r = _scripted(EMU_SETUP + r"""
+        const history = () => [rizinState.history.slice(), rizinState.historyAt];
+        const back = $('rizin-back'), forward = $('rizin-forward');
+        await rizinSeek('0x1400014be', 'test'); await quiet();
+        await rizinHistoryStep(-1); await quiet();
+        r.before = history();
+        click($('rizin-emu-start'));
+        await until(() => !strip.hidden, 'the strip'); await quiet();
+        await press(run('step')); await press(run('step'));
+        for (let i = 0; i < 3; i++) await press(run('over'));
+        r.afterRuns = [...history(), rizinState.seek, back.disabled, forward.disabled, rizinState.emu.pc];
+        click(back);
+        await until(() => rizinState.seek === '0x1400014b7', 'back to the entry the user left'); await quiet();
+        r.back = [...history(), rizinState.seek, forward.disabled];
+        click(act('gotopc'));
+        await until(() => rizinState.seek === rizinState.emu.pc, 'GO TO PC'); await quiet();
+        r.goto = [...history(), rizinState.seek === rizinState.emu.pc];
+    """)
+    assert "error" not in r, r.get("error")
+    assert r["before"] == [["0x1400014b7", "0x1400014be"], 0]
+    assert r["afterRuns"][:2] == [["0x1400014b7", "0x1400014be"], 0], \
+        "a run added to the history or cut off what ▶ holds: " + str(r["afterRuns"])
+    assert r["afterRuns"][2] == "0x140001529" and r["afterRuns"][3:5] == [False, False], \
+        "the views were not at the PC, or ◀ ▶ were off at a place that is no entry of the history"
+    assert r["back"] == [["0x1400014b7", "0x1400014be"], 0, "0x1400014b7", False], \
+        "◀ at the PC's place went past the entry the user left"
+    assert r["goto"] == [["0x1400014b7", "0x140001529"], 1, True], "GO TO PC did not enter the history"
 
 
 def test_rizin_run_strip_styles():

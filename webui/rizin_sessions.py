@@ -1626,7 +1626,8 @@ class RizinSession:
         """The state after a run (gate held), with ``stopped``: why it stopped. A PC where nothing can
         execute is a trap even though rizin says so only at the next step."""
         state = self._emulation_read(pipe)
-        if stopped == "step" and state["pc"] is not None and not rizin_emulation.is_executable(state["pc"], maps):
+        pc = None if state["pc"] is None else int(state["pc"], 16)
+        if stopped == "step" and pc is not None and not rizin_emulation.is_executable(pc, maps):
             stopped = "trap"
         state["stopped"] = stopped
         return state
@@ -2040,7 +2041,7 @@ class RizinSession:
             plan = self._assist_plan(pipe, conv, api, pipe.cmdj("omlj"))
             fix = rizin_emulation.stack_fix(conv, api["args"])
             notes = [plan["note"]] + [write["note"] for write in plan["out"]]
-            return dict(self._assist_answer(conv), api=api["name"], value=plan["value"], stack_fix=fix,
+            return dict(self._assist_answer(conv), api=api["name"], value=rizin_emulation.word(plan["value"]), stack_fix=fix,
                         summary=f"skip {api['name']}: {'; '.join(n for n in notes if n)}. "
                                 f"{self._assist_stack_note(conv, api, fix)}")
 
@@ -2497,7 +2498,8 @@ class RizinSession:
         values = {r["name"]: r["value"] for r in registers}
         if values != self._emulation_after:
             self._emulation_before, self._emulation_after = self._emulation_after, values
-        return {"running": True, "pc": self._emulation_role(pipe, "PC"), "registers": registers,
+        return {"running": True, "pc": rizin_emulation.word(self._emulation_role(pipe, "PC")),
+                "registers": [{"name": r["name"], "value": rizin_emulation.word(r["value"])} for r in registers],
                 "changed": rizin_emulation.changed_registers(self._emulation_before, registers),
                 "stack": self._emulation_stack(pipe, self._emulation_role(pipe, "SP"), set(values)),
                 "stopped": None, "arch": self.arch, "bits": self.bits}
@@ -2544,7 +2546,8 @@ class RizinSession:
                 hint = known[value]
             else:
                 hint = known[value] = self._emulation_hint(pipe, value, maps, registers)
-            rows.append({"addr": (sp + i * size) % 2 ** self.bits, "value": value, "hint": hint})
+            rows.append({"addr": rizin_emulation.word((sp + i * size) % 2 ** self.bits),
+                         "value": rizin_emulation.word(value), "hint": hint})
         return rows
 
     @staticmethod

@@ -2795,7 +2795,7 @@ def test_emulation_start_sets_the_guards_and_reports_the_pc(rz):
 
     sid = rz.session()
     state = rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
-    assert state["running"] is True and state["pc"] == 0x140001440
+    assert state["running"] is True and state["pc"] == "0x140001440"
     assert {r["name"] for r in state["registers"]} >= {"rax", "rip", "rsp"}
     settings = _emulation_settings(rz)
     assert settings["io.cache"] == "true" and float(settings["esil.timeout"]) > 0
@@ -2817,7 +2817,7 @@ def test_emulation_start_sets_the_guards_and_reports_the_pc(rz):
 def test_emulation_start_defaults_to_the_current_seek(rz):
     sid = rz.session()
     rz.send(f"/api/rizin/{sid}/seek", {"addr": "0x1400014b7"})
-    assert rz.send(f"/api/rizin/{sid}/emulation/start", {})["pc"] == 0x1400014B7
+    assert rz.send(f"/api/rizin/{sid}/emulation/start", {})["pc"] == hex(0x1400014B7)
 
 
 def test_emulation_state_reads_the_stack_with_hints(rz, monkeypatch):
@@ -2834,12 +2834,12 @@ def test_emulation_state_reads_the_stack_with_hints(rz, monkeypatch):
     state = rz.read(f"/api/rizin/{sid}/emulation")
     stack = state["stack"]
     assert len(stack) == rizin_sessions.RIZIN_STACK_ROWS
-    assert stack[0]["value"] == 0x140001490 and stack[0]["hint"] == "sym.watchdog"
+    assert _word(stack[0]["value"]) == 0x140001490 and stack[0]["hint"] == "sym.watchdog"
     assert stack[1]["hint"] is None
-    sp = next(r["value"] for r in state["registers"] if r["name"] == "rsp")
+    sp = _word(next(r["value"] for r in state["registers"] if r["name"] == "rsp"))
     assert sp == 0x178000
-    assert [row["addr"] for row in stack] == [sp + 8 * i for i in range(rizin_sessions.RIZIN_STACK_ROWS)]
-    assert [(row["value"], row["hint"]) for row in stack[:len(words)]] == [
+    assert [_word(row["addr"]) for row in stack] == [sp + 8 * i for i in range(rizin_sessions.RIZIN_STACK_ROWS)]
+    assert [(_word(row["value"]), row["hint"]) for row in stack[:len(words)]] == [
         (WATCHDOG, "sym.watchdog"), (0x14000A100, None), (ENTRY + 9, "entry0 + 9"), (0x178000, None),
         (0x41, None), (0x140005014, "str.child"), (0x140005015, None), (ENTRY, "entry0")]
     # The fake's fd answers what rizin's does there: the closest flag, however far, a register's too
@@ -2871,7 +2871,7 @@ def test_emulation_shows_no_stack_where_the_stack_pointer_is_not_in_it(rz):
     end = 0x100000 + rizin_sessions.ESIL_STACK_SIZE
     # Near the stack's end: only the words that are in it
     state = rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rsp", "value": hex(end - 16)})
-    assert [row["addr"] for row in state["stack"]] == [end - 16, end - 8]
+    assert [_word(row["addr"]) for row in state["stack"]] == [end - 16, end - 8]
     # Outside it (rizin would read 0xff there): no stack at all
     state = rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rsp", "value": "0x41"})
     assert state["running"] is True and state["stack"] == []
@@ -2888,10 +2888,10 @@ def test_emulation_reads_a_32_bit_stack_in_4_byte_words(rz, monkeypatch):
     monkeypatch.setenv("FAKE_RIZIN_STACK", "0x41424344,0x41")
     sid = rz.session()
     state = rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x401000"})
-    assert state["bits"] == 32 and state["pc"] == 0x401000
+    assert state["bits"] == 32 and state["pc"] == "0x401000"
     assert {r["name"] for r in state["registers"]} >= {"eax", "eip", "esp"}
-    sp = next(r["value"] for r in state["registers"] if r["name"] == "esp")
-    assert [(row["addr"], row["value"]) for row in state["stack"][:3]] == [(sp, 0x41424344), (sp + 4, 0x41),
+    sp = _word(next(r["value"] for r in state["registers"] if r["name"] == "esp"))
+    assert [(_word(row["addr"]), _word(row["value"])) for row in state["stack"][:3]] == [(sp, 0x41424344), (sp + 4, 0x41),
                                                                            (sp + 8, 0)]
 
 
@@ -2937,7 +2937,7 @@ def test_a_register_can_be_set_and_only_a_known_one(rz):
     sid = rz.session()
     rz.send(f"/api/rizin/{sid}/emulation/start", {})
     state = rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rax", "value": "0x41"})
-    assert next(r["value"] for r in state["registers"] if r["name"] == "rax") == 0x41
+    assert _word(next(r["value"] for r in state["registers"] if r["name"] == "rax")) == 0x41
     assert any(c.startswith("ar rax=0x41") for c in rz.commands())
     assert state["changed"] == ["rax"]
     for name in ("rax; wci", "nope", "rax rbx", "", None, 7):
@@ -2946,6 +2946,38 @@ def test_a_register_can_be_set_and_only_a_known_one(rz):
     assert not any(c.startswith(("ar rax;", "ar nope", "ar rax rbx", "ar =")) for c in rz.commands())
     r = rz.post(f"/api/rizin/{sid}/emulation/register", {"name": "rax", "value": "-1"})
     assert r.status_code == 400 and "value" in r.get_json()["refused"]
+
+
+def test_a_machine_word_crosses_the_wire_as_a_hex_string(rz, monkeypatch):
+    """R52: the browser reads a JSON number as a double, which cannot hold a 64-bit register (measured:
+    0x7ff7a1b2c3d4e5f6 arrived as 0x7ff7a1b2c3d4e400, and a register is editable there). In the emulation's
+    state every word -- the PC, the registers, the stack's addresses and values -- is an exact "0x…" string;
+    stack_fix is a count of bytes and stays a number, and a breakpoint's address stays a number too."""
+    monkeypatch.setenv("FAKE_RIZIN_ASSIST", "1")
+    sid = rz.session()
+    state = rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    big, odd = "0x7ff7a1b2c3d4e5f6", "0x20000000000001"        # above 2^53: a double cannot hold either
+    for name, value in (("rax", big), ("rbx", odd)):
+        state = rz.send(f"/api/rizin/{sid}/emulation/register", {"name": name, "value": value})
+    values = {r["name"]: r["value"] for r in state["registers"]}
+    assert values["rax"] == big and values["rbx"] == odd, "a word lost digits on the way"
+    assert isinstance(state["pc"], str) and re.fullmatch(r"0x[0-9a-f]+", state["pc"]), state["pc"]
+    assert all(isinstance(r["value"], str) and re.fullmatch(r"0x[0-9a-f]+", r["value"]) for r in state["registers"])
+    assert state["stack"], "the stack words are part of the answer"
+    for row in state["stack"]:
+        assert re.fullmatch(r"0x[0-9a-f]+", row["addr"]) and re.fullmatch(r"0x[0-9a-f]+", row["value"]), row
+    assert all(isinstance(name, str) for name in state["changed"])
+    # The assistant's offered value is a word as well, its stack correction is a count
+    rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rdx", "value": "0x8000"})
+    rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rip", "value": hex(ASSIST_AT)})
+    assist = _assist(rz, sid, ASSIST_AT)
+    assert re.fullmatch(r"0x[0-9a-f]+", assist["value"]) and isinstance(assist["stack_fix"], int), assist
+    # The breakpoints keep their numbers: they are bounded by the file's own layout
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001450"})
+    assert [b["addr"] for b in rz.read(f"/api/rizin/{sid}/breakpoints")] == [0x140001450]
+    # The words go in as the strings they came out as, so that an edit writes what was read
+    again = rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rax", "value": big})
+    assert {r["name"]: r["value"] for r in again["registers"]}["rax"] == big
 
 
 def _run(rz, sid, kind, **body):
@@ -2987,11 +3019,11 @@ def test_each_run_kind_sends_its_command(rz):
 def test_a_run_moves_the_pc_through_the_code_and_says_why_it_stopped(rz):
     sid = _started(rz)
     state = _run(rz, sid, "step")
-    assert state["pc"] == 0x140001444 and state["stopped"] == "step"
+    assert state["pc"] == hex(0x140001444) and state["stopped"] == "step"
     assert "rip" in state["changed"] and set(state) >= {"running", "pc", "registers", "stack", "stopped"}
     # at the call to sym.main: skip passes it
     state = _run(rz, sid, "skip")
-    assert state["pc"] == 0x140001449 and state["stopped"] == "step"
+    assert state["pc"] == hex(0x140001449) and state["stopped"] == "step"
     # a state read afterwards does not claim a stop
     assert rz.read(f"/api/rizin/{sid}/emulation")["stopped"] is None
 
@@ -2999,7 +3031,7 @@ def test_a_run_moves_the_pc_through_the_code_and_says_why_it_stopped(rz):
 def test_until_runs_to_the_address_and_is_refused_without_one(rz):
     sid = _started(rz)
     state = _run(rz, sid, "until", addr="0x140001444")
-    assert state["pc"] == 0x140001444 and state["stopped"] == "step"
+    assert state["pc"] == hex(0x140001444) and state["stopped"] == "step"
     assert "aesu 0x140001444" in rz.commands()
     mark = len(rz.commands())
     for body in ({"kind": "until"}, {"kind": "until", "addr": "-1"}, {"kind": "until", "addr": "main; wci"}):
@@ -3017,7 +3049,7 @@ def test_cont_on_a_breakpoint_runs_on_to_the_next_one(rz):
     rz.send(f"/api/rizin/{sid}/console", {"cmd": "db @ 0x1400014b7"})
     mark = len(rz.commands())
     state = _run(rz, sid, "cont")
-    assert state["pc"] == 0x1400014B7 and state["stopped"] == "breakpoint"
+    assert state["pc"] == hex(0x1400014B7) and state["stopped"] == "breakpoint"
     assert "aes" not in _commands_since(rz, mark) and "aec" in _commands_since(rz, mark)
     # and on from there, past the one it stands on, into code that ends where nothing can execute
     state = _run(rz, sid, "cont")
@@ -3028,7 +3060,7 @@ def test_cont_that_runs_away_stops_with_timeout_and_keeps_the_session(rz, monkey
     monkeypatch.setenv("FAKE_RIZIN_ESIL_RUNAWAY", "1")
     sid = _started(rz)
     state = _run(rz, sid, "cont")
-    assert state["stopped"] == "timeout" and state["pc"] == 0x140001440
+    assert state["stopped"] == "timeout" and state["pc"] == "0x140001440"
     assert rz.status(sid)["analysis"]["state"] in ("done", "stopped")
     assert rz.send(f"/api/rizin/{sid}/emulation/stop") == {"running": False}
 
@@ -3055,9 +3087,9 @@ def test_a_step_into_nothing_is_named_not_shown_as_a_result(rz):
     # nothing about that step, and says "Trap" only at the next one.
     sid = _started(rz, "0x140001499")
     state = _run(rz, sid, "step")
-    assert state["pc"] == 0 and state["stopped"] == "trap"
+    assert state["pc"] == hex(0) and state["stopped"] == "trap"
     state = _run(rz, sid, "step")
-    assert state["pc"] == 0 and state["stopped"] == "trap"
+    assert state["pc"] == hex(0) and state["stopped"] == "trap"
 
 
 def test_skip_passes_a_call_through_the_import_table_too(rz):
@@ -3066,11 +3098,11 @@ def test_skip_passes_a_call_through_the_import_table_too(rz):
     sid = _started(rz, "0x140001499")
     mark = len(rz.commands())
     state = _run(rz, sid, "skip")
-    assert state["pc"] == 0x14000149F and state["stopped"] == "step"
+    assert state["pc"] == hex(0x14000149F) and state["stopped"] == "step"
     since = _commands_since(rz, mark)
     assert "aepc 0x14000149f" in since and "aess" not in since
     # the stack was not touched: nothing was called
-    assert next(r["value"] for r in state["registers"] if r["name"] == "rsp") == 0x178000
+    assert _word(next(r["value"] for r in state["registers"] if r["name"] == "rsp")) == 0x178000
 
 
 def test_over_runs_a_call_through_the_import_table_to_its_return_address(rz):
@@ -3081,26 +3113,26 @@ def test_over_runs_a_call_through_the_import_table_to_its_return_address(rz):
     since = _commands_since(rz, mark)
     assert "aesu 0x14000149f" in since and "aeso" not in since
     # the fake's callee is nothing: the call ends where nothing can execute, and says so
-    assert state["pc"] == 0 and state["stopped"] == "trap"
+    assert state["pc"] == hex(0) and state["stopped"] == "trap"
 
 
 def test_to_call_stops_before_the_next_call_of_any_kind(rz):
     sid = _started(rz, "0x140001490")  # sub rsp; mov ecx; call qword [Sleep]
     mark = len(rz.commands())
     state = _run(rz, sid, "to_call")
-    assert state["pc"] == 0x140001499 and state["stopped"] == "step"
+    assert state["pc"] == hex(0x140001499) and state["stopped"] == "step"
     since = _commands_since(rz, mark)
     assert "aesu 0x140001499" in since and "aecc" not in since
     # standing before a call, it runs that call, as rizin's aecc does: the next one is the one after it
     state = _run(rz, sid, "to_call")
-    assert state["pc"] == 0 and state["stopped"] == "trap"
+    assert state["pc"] == hex(0) and state["stopped"] == "trap"
 
 
 def test_to_call_stands_still_when_one_step_reaches_a_call(rz):
     sid = _started(rz, "0x140001440")  # sub rsp; call sym.main
     mark = len(rz.commands())
     state = _run(rz, sid, "to_call")
-    assert state["pc"] == 0x140001444 and state["stopped"] == "step"
+    assert state["pc"] == hex(0x140001444) and state["stopped"] == "step"
     assert not any(c.startswith("aesu") for c in _commands_since(rz, mark))
 
 
@@ -3108,7 +3140,7 @@ def test_to_call_takes_the_jumps_on_the_way(rz):
     # cmp; jle (falls through in the fake); then a block of nops and the call qword [CreateNamedPipeA]
     sid = _started(rz, "0x1400014c5")
     state = _run(rz, sid, "to_call")
-    assert state["pc"] == 0x1400015B9 and state["stopped"] == "step"
+    assert state["pc"] == hex(0x1400015B9) and state["stopped"] == "step"
     assert rz.commands().count("aes") >= 2  # the first step and the jle
 
 
@@ -3116,14 +3148,14 @@ def test_to_call_stops_at_a_breakpoint_on_the_way(rz):
     sid = _started(rz, "0x140001490")
     rz.send(f"/api/rizin/{sid}/console", {"cmd": "db @ 0x140001499"})
     state = _run(rz, sid, "to_call")
-    assert state["pc"] == 0x140001499 and state["stopped"] == "breakpoint"
+    assert state["pc"] == hex(0x140001499) and state["stopped"] == "breakpoint"
 
 
 def test_to_call_that_runs_into_the_timeout_says_so(rz, monkeypatch):
     monkeypatch.setenv("FAKE_RIZIN_ESIL_RUNAWAY", "1")
     sid = _started(rz, "0x140001490")
     state = _run(rz, sid, "to_call")
-    assert state["stopped"] == "timeout" and state["pc"] == 0x140001494
+    assert state["stopped"] == "timeout" and state["pc"] == "0x140001494"
 
 
 def test_a_run_sets_the_guards_again_and_checks_what_the_console_may_have_changed(rz):
@@ -3279,7 +3311,7 @@ def test_a_breakpoint_set_before_the_start_stops_the_run(rz):
     rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
     assert rz.read(f"/api/rizin/{sid}/breakpoints") == [{"addr": 0x1400014B7, "enabled": True}]
     state = _run(rz, sid, "cont")
-    assert state["pc"] == 0x1400014B7 and state["stopped"] == "breakpoint"
+    assert state["pc"] == hex(0x1400014B7) and state["stopped"] == "breakpoint"
 
 
 def test_setting_a_breakpoint_twice_leaves_the_one(rz):
@@ -3864,6 +3896,13 @@ ASSIST32_AT = 0x401000
 COPY_FROM, COPY_TO = 0x140000020, 0x140002200
 
 
+def _word(text):
+    """A machine word of the emulation routes as a number: they send "0x…" strings, because a JSON number
+    cannot hold a 64-bit register in the browser (R52)."""
+    assert isinstance(text, str) and re.fullmatch(r"0x[0-9a-f]+", text), text
+    return int(text, 16)
+
+
 def _assist(rz, sid, addr):
     """GET the assistant's answer for the call at addr."""
     return rz.read(f"/api/rizin/{sid}/call?addr={addr:#x}")
@@ -3875,8 +3914,8 @@ def _skip(rz, sid, addr, **body):
 
 
 def _register(rz, sid, name):
-    return next(r["value"] for r in rz.read(f"/api/rizin/{sid}/emulation")["registers"]
-                if r["name"] == name)
+    return _word(next(r["value"] for r in rz.read(f"/api/rizin/{sid}/emulation")["registers"]
+                      if r["name"] == name))
 
 
 def test_the_assistant_names_the_api_behind_a_call(rz):
@@ -3890,7 +3929,7 @@ def test_the_assistant_names_the_api_behind_a_call(rz):
     assert "Sleep" in assist["summary"], assist["summary"]
     # and the skip passes the call through the import table, as a SKIP run does
     state = _skip(rz, sid, SLEEP_CALL)
-    assert state["pc"] == SLEEP_CALL + 6 and state["stopped"] == "step"
+    assert state["pc"] == hex(SLEEP_CALL + 6) and state["stopped"] == "step"
     assert f"aepc {SLEEP_CALL + 6:#x}" in rz.commands(), "the PC is set, because aess runs an ircall"
     assert _register(rz, sid, "rsp") == 0x178000, "nothing was called, so nothing was pushed"
 
@@ -3929,7 +3968,7 @@ def test_skip_a_32bit_stdcall_call_corrects_the_stack(rz, monkeypatch):
     assert assist["supported"] and assist["ret_reg"] == "eax" and assist["stack_fix"] > 0
     assert assist["api"] == "Sleep" and assist["stack_fix"] == 4, "Sleep takes one argument"
     state = _skip(rz, sid, ASSIST32_AT, value="0x1", stack_fix=assist["stack_fix"])
-    assert state["pc"] == ASSIST32_AT + 6 and state["stopped"] == "step"
+    assert state["pc"] == hex(ASSIST32_AT + 6) and state["stopped"] == "step"
     assert _register(rz, sid, "esp") == before + assist["stack_fix"]
     assert _register(rz, sid, "eax") == 1
     assert f"ar SP={before + assist['stack_fix']:#x}" in rz.commands()
@@ -3950,11 +3989,11 @@ def test_skip_at_32_bits_reads_the_arguments_from_the_stack(rz, monkeypatch):
     sid = _started(rz, f"{ASSIST32_AT + 6:#x}")
     assist = _assist(rz, sid, ASSIST32_AT + 6)
     assert assist["api"] == "VirtualAlloc" and assist["stack_fix"] == 16
-    assert assist["value"] == rizin_emulation.ASSIST_ADDR
+    assert _word(assist["value"]) == rizin_emulation.ASSIST_ADDR
     assert "12288 bytes" in assist["summary"], assist["summary"]
-    state = _skip(rz, sid, ASSIST32_AT + 6, value=hex(assist["value"]), stack_fix=assist["stack_fix"])
-    assert f"aeim {assist['value']:#x} 0x3000 assist" in rz.commands()
-    assert _register(rz, sid, "eax") == assist["value"]
+    state = _skip(rz, sid, ASSIST32_AT + 6, value=assist["value"], stack_fix=assist["stack_fix"])
+    assert f"aeim {_word(assist['value']):#x} 0x3000 assist" in rz.commands()
+    assert hex(_register(rz, sid, "eax")) == assist["value"]
     assert state["stack"], "the stack pointer is still in the emulation's stack"
 
 
@@ -3995,7 +4034,7 @@ def test_the_assistant_answers_before_the_emulation_starts(rz, monkeypatch):
     assert assist["supported"] is True and assist["api"] == "VirtualAlloc"
     assert assist["value"] is None and "not started" in assist["summary"], assist["summary"]
     # a value that needs no VM is offered all the same
-    assert _assist(rz, sid, ASSIST_AT + 18)["value"] == 0, "IsDebuggerPresent: not observed"
+    assert _assist(rz, sid, ASSIST_AT + 18)["value"] == "0x0", "IsDebuggerPresent: not observed"
     # the skip does need one
     response = rz.post(f"/api/rizin/{sid}/call", {"addr": f"{ASSIST_AT:#x}"})
     assert response.status_code == 400 and "not started" in response.get_json()["refused"]
@@ -4011,27 +4050,27 @@ def test_the_assistant_offers_a_buffer_and_skip_maps_it(rz, monkeypatch):
     rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rdx", "value": "0x8000"})  # dwSize
     assist = _assist(rz, sid, ASSIST_AT)
     assert assist["api"] == "VirtualAlloc" and assist["ret_reg"] == "rax"
-    assert assist["value"] == rizin_emulation.ASSIST_ADDR and assist["stack_fix"] == 0
+    assert _word(assist["value"]) == rizin_emulation.ASSIST_ADDR and assist["stack_fix"] == 0
     assert "32768 bytes" in assist["summary"], assist["summary"]
-    state = _skip(rz, sid, ASSIST_AT, value=hex(assist["value"]))
-    assert state["pc"] == ASSIST_AT + 6 and state["stopped"] == "step"
+    state = _skip(rz, sid, ASSIST_AT, value=assist["value"])
+    assert state["pc"] == hex(ASSIST_AT + 6) and state["stopped"] == "step"
     assert next(r["value"] for r in state["registers"] if r["name"] == "rax") == assist["value"]
-    assert f"aeim {assist['value']:#x} 0x8000 assist" in rz.commands()
+    assert f"aeim {_word(assist['value']):#x} 0x8000 assist" in rz.commands()
     assert "buffer" in state["summary"], state["summary"]
     # rizin's aeim moves the PC and the stack and base pointer into the map it just made (measured),
     # so the three are put back: the stack is still the stack and the PC is after the call
-    assert state["stack"] and next(r["value"] for r in state["registers"] if r["name"] == "rsp") == 0x178000
+    assert state["stack"] and _word(next(r["value"] for r in state["registers"] if r["name"] == "rsp")) == 0x178000
     maps = [m["name"] for m in rz.mgr.get(sid).json("omlj")]
     assert "mem.assist" in maps and "mem.0x100000_0xf0000" in maps, maps
     # the buffer is memory the run can write and read, which is what an unpacker does with it
-    _patch(rz, sid, addr=hex(assist["value"]), bytes="4142")
-    assert rz.read(f"/api/rizin/{sid}/hex?addr={assist['value']:#x}&len=2")["bytes"] == [0x41, 0x42]
+    _patch(rz, sid, addr=assist["value"], bytes="4142")
+    assert rz.read(f"/api/rizin/{sid}/hex?addr={assist['value']}&len=2")["bytes"] == [0x41, 0x42]
     # a second allocation in the same run is not handed the same memory: the PC goes back to the call
     # (no restart -- a start gives the ESIL memory back, the buffer included)
     rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rip", "value": hex(ASSIST_AT)})
     second = _assist(rz, sid, ASSIST_AT)
-    assert second["value"] == rizin_emulation.ASSIST_ADDR + rizin_emulation.ASSIST_STEP
-    assert _skip(rz, sid, ASSIST_AT, value=hex(second["value"]))["pc"] == ASSIST_AT + 6
+    assert _word(second["value"]) == rizin_emulation.ASSIST_ADDR + rizin_emulation.ASSIST_STEP
+    assert _skip(rz, sid, ASSIST_AT, value=second["value"])["pc"] == hex(ASSIST_AT + 6)
     maps = [m["name"] for m in rz.mgr.get(sid).json("omlj")]
     assert maps.count("mem.assist") == 2, maps
 
@@ -4063,7 +4102,7 @@ def test_skip_really_copies_what_memcpy_would_copy(rz, monkeypatch):
     for name, value in (("rcx", hex(COPY_TO)), ("rdx", hex(COPY_FROM)), ("r8", "0x8")):
         rz.send(f"/api/rizin/{sid}/emulation/register", {"name": name, "value": value})
     assist = _assist(rz, sid, ASSIST_AT + 6)
-    assert assist["api"] == "memcpy" and assist["value"] == COPY_TO, "memcpy returns its destination"
+    assert assist["api"] == "memcpy" and assist["value"] == hex(COPY_TO), "memcpy returns its destination"
     assert "8 bytes" in assist["summary"], assist["summary"]
     source = rz.read(f"/api/rizin/{sid}/hex?addr={COPY_FROM:#x}&len=8")["bytes"]
     assert rz.read(f"/api/rizin/{sid}/hex?addr={COPY_TO:#x}&len=8")["bytes"] != source
@@ -4104,16 +4143,16 @@ def test_the_clock_rises_with_every_applied_skip_and_not_with_a_look(rz, monkeyp
     monkeypatch.setenv("FAKE_RIZIN_ASSIST", "1")
     sid = _started(rz, f"{ASSIST_AT + 12:#x}")
     first = _assist(rz, sid, ASSIST_AT + 12)
-    assert first["api"] == "GetTickCount" and first["value"] > rizin_emulation.TICK_START
+    assert first["api"] == "GetTickCount" and _word(first["value"]) > rizin_emulation.TICK_START
     assert _assist(rz, sid, ASSIST_AT + 12)["value"] == first["value"], "a look does not move the clock"
     assert "rises with every skip" in first["summary"], first["summary"]
-    assert _skip(rz, sid, ASSIST_AT + 12, value=hex(first["value"]))["pc"] == ASSIST_AT + 18
-    assert _register(rz, sid, "rax") == first["value"]
+    assert _skip(rz, sid, ASSIST_AT + 12, value=first["value"])["pc"] == hex(ASSIST_AT + 18)
+    assert hex(_register(rz, sid, "rax")) == first["value"]
     # and now it has moved on, by the one step of a scheduler tick
     rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rip", "value": hex(ASSIST_AT + 12)})
-    assert _assist(rz, sid, ASSIST_AT + 12)["value"] == first["value"] + rizin_emulation.TICK_STEP
+    assert _assist(rz, sid, ASSIST_AT + 12)["value"] == hex(_word(first["value"]) + rizin_emulation.TICK_STEP)
     # IsDebuggerPresent: not observed
-    assert _assist(rz, sid, ASSIST_AT + 18)["value"] == 0
+    assert _assist(rz, sid, ASSIST_AT + 18)["value"] == "0x0"
 
 
 def test_get_proc_address_answers_what_the_file_imports(rz, monkeypatch):
@@ -4127,18 +4166,18 @@ def test_get_proc_address_answers_what_the_file_imports(rz, monkeypatch):
     _patch(rz, sid, addr=hex(name_at), bytes=b"Sleep\0".hex())
     rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rdx", "value": hex(name_at)})
     assist = _assist(rz, sid, ASSIST_AT + 24)
-    assert assist["api"] == "GetProcAddress" and assist["value"] == 0x1400093A8
+    assert assist["api"] == "GetProcAddress" and assist["value"] == "0x1400093a8"
     assert "Sleep" in assist["summary"], assist["summary"]
     # a name the file does not import: a pseudo address, and the summary says so
     _patch(rz, sid, addr=hex(name_at), bytes=b"NtNope\0".hex())
     other = _assist(rz, sid, ASSIST_AT + 24)
-    assert other["value"] == rizin_emulation.ASSIST_PSEUDO and "pseudo" in other["summary"]
+    assert _word(other["value"]) == rizin_emulation.ASSIST_PSEUDO and "pseudo" in other["summary"]
     assert "NtNope" in other["summary"], other["summary"]
     # R38: two looks give the same address, and only an applied skip moves the series on
     assert _assist(rz, sid, ASSIST_AT + 24)["value"] == other["value"]
-    _skip(rz, sid, ASSIST_AT + 24, value=hex(other["value"]))
+    _skip(rz, sid, ASSIST_AT + 24, value=other["value"])
     rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rip", "value": hex(ASSIST_AT + 24)})
-    assert _assist(rz, sid, ASSIST_AT + 24)["value"] == \
+    assert _word(_assist(rz, sid, ASSIST_AT + 24)["value"]) == \
         rizin_emulation.ASSIST_PSEUDO + rizin_emulation.ASSIST_SPACING
     # a name that cannot be read at all is a pseudo address too, and says which name it stands for
     rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rdx", "value": "0x41"})
@@ -4151,17 +4190,17 @@ def test_a_handle_and_a_success_are_recognisable_values(rz, monkeypatch):
     monkeypatch.setenv("FAKE_RIZIN_BITS", "32")
     sid = _started(rz, f"{ASSIST32_AT + 18:#x}")      # call dword [sym.imp...LoadLibraryA]
     handle = _assist(rz, sid, ASSIST32_AT + 18)
-    assert handle["api"] == "LoadLibrary" and handle["value"] == rizin_emulation.ASSIST_HANDLE
+    assert handle["api"] == "LoadLibrary" and _word(handle["value"]) == rizin_emulation.ASSIST_HANDLE
     assert handle["stack_fix"] == 4 and "handle" in handle["summary"]
     # a handle is offered again until one is applied (R38), and then the next one differs
     assert _assist(rz, sid, ASSIST32_AT + 18)["value"] == handle["value"]
-    _skip(rz, sid, ASSIST32_AT + 18, value=hex(handle["value"]), stack_fix=handle["stack_fix"])
+    _skip(rz, sid, ASSIST32_AT + 18, value=handle["value"], stack_fix=handle["stack_fix"])
     rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "eip", "value": hex(ASSIST32_AT + 18)})
-    assert _assist(rz, sid, ASSIST32_AT + 18)["value"] == \
+    assert _word(_assist(rz, sid, ASSIST32_AT + 18)["value"]) == \
         rizin_emulation.ASSIST_HANDLE + rizin_emulation.ASSIST_SPACING
     # VirtualProtect reports success: the memory the emulation holds is writable anyway
     done = _assist(rz, sid, ASSIST32_AT + 24)
-    assert done["api"] == "VirtualProtect" and done["value"] == 1 and done["stack_fix"] == 16
+    assert done["api"] == "VirtualProtect" and done["value"] == "0x1" and done["stack_fix"] == 16
     assert "reports success" in done["summary"], done["summary"]
 
 
@@ -4228,7 +4267,7 @@ def test_a_skip_writes_the_out_parameters_of_the_time_and_environment_calls(rz, 
     into = 0x177000                                   # inside the stack the start mapped
     rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rcx", "value": hex(into)})
     assist = _assist(rz, sid, ASSIST_AT + 30)
-    assert assist["api"] == "QueryPerformanceCounter" and assist["value"] == 1
+    assert assist["api"] == "QueryPerformanceCounter" and assist["value"] == "0x1"
     assert "performance counter" in assist["summary"] and hex(into) in assist["summary"], assist["summary"]
     state = _skip(rz, sid, ASSIST_AT + 30, value="0x1")
     assert "performance counter" in state["summary"], state["summary"]
@@ -4251,7 +4290,7 @@ def test_a_skip_writes_the_out_parameters_of_the_time_and_environment_calls(rz, 
     room = len(rizin_emulation.ASSIST_COMPUTER) + 1
     _patch(rz, sid, addr=hex(size_at), bytes=room.to_bytes(4, "little").hex())
     assist = _assist(rz, sid, ASSIST_AT + 36)
-    assert assist["api"] == "GetComputerName" and assist["value"] == 1
+    assert assist["api"] == "GetComputerName" and assist["value"] == "0x1"
     assert rizin_emulation.ASSIST_COMPUTER in assist["summary"], assist["summary"]
     state = _skip(rz, sid, ASSIST_AT + 36, value="0x1")
     expected = rizin_emulation.ASSIST_COMPUTER.encode("utf-16-le") + b"\0\0"
@@ -4320,7 +4359,7 @@ def test_a_32_bit_out_parameter_comes_from_the_stack(rz, monkeypatch):
     monkeypatch.setenv("FAKE_RIZIN_STACK", f"0,{label_at:#x},0x100,{serial_at:#x}")
     sid = _started(rz, f"{ASSIST32_AT + 30:#x}")
     assist = _assist(rz, sid, ASSIST32_AT + 30)
-    assert assist["api"] == "GetVolumeInformation" and assist["value"] == 1
+    assert assist["api"] == "GetVolumeInformation" and assist["value"] == "0x1"
     assert assist["stack_fix"] == 32, "eight stdcall arguments"
     assert rizin_emulation.ASSIST_VOLUME in assist["summary"], assist["summary"]
     _skip(rz, sid, ASSIST32_AT + 30, value="0x1", stack_fix=assist["stack_fix"])
@@ -4337,11 +4376,11 @@ def test_a_pseudo_value_is_never_offered_where_something_is_mapped(rz, monkeypat
 
     monkeypatch.setenv("FAKE_RIZIN_BITS", "32")
     sid = _started(rz, f"{ASSIST32_AT + 18:#x}")        # LoadLibraryA: a pseudo handle
-    assert _assist(rz, sid, ASSIST32_AT + 18)["value"] == rizin_emulation.ASSIST_HANDLE
+    assert _word(_assist(rz, sid, ASSIST32_AT + 18)["value"]) == rizin_emulation.ASSIST_HANDLE
     # the console maps memory over the first two values of the series (as a dump's own maps would)
     rz.send(f"/api/rizin/{sid}/console",
             {"cmd": f"aeim {rizin_emulation.ASSIST_HANDLE:#x} {2 * rizin_emulation.ASSIST_SPACING:#x} dump"})
-    assert _assist(rz, sid, ASSIST32_AT + 18)["value"] == \
+    assert _word(_assist(rz, sid, ASSIST32_AT + 18)["value"]) == \
         rizin_emulation.ASSIST_HANDLE + 2 * rizin_emulation.ASSIST_SPACING
 
 
@@ -4352,7 +4391,7 @@ def test_a_start_gives_the_memory_of_the_run_before_back(rz, monkeypatch):
     sid = _started(rz, f"{ASSIST_AT:#x}")
     rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rdx", "value": "0x8000"})
     assist = _assist(rz, sid, ASSIST_AT)
-    _skip(rz, sid, ASSIST_AT, value=hex(assist["value"]))
+    _skip(rz, sid, ASSIST_AT, value=assist["value"])
     assert [m["name"] for m in rz.mgr.get(sid).json("omlj")].count("mem.assist") == 1
     mark = len(rz.commands())
     state = rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": f"{ASSIST_AT:#x}"})
@@ -4480,7 +4519,7 @@ def test_a_patch_and_a_breakpoint_come_back_when_the_file_is_opened_again(rz):
     # and the breakpoint stops a run, as one set by hand does
     rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
     state = _run(rz, sid, "cont")
-    assert (state["pc"], state["stopped"]) == (0x1400014B7, "breakpoint")
+    assert (state["pc"], state["stopped"]) == ("0x1400014b7", "breakpoint")
 
 
 def test_what_a_run_wrote_does_not_come_back(rz):
@@ -4793,39 +4832,39 @@ def test_real_rizin_runs_an_emulation(tmp_path, monkeypatch):
         after_call = call["offset"] + call["size"]
 
         def register(state, name):
-            return next(r["value"] for r in state["registers"] if r["name"] == name)
+            return _word(next(r["value"] for r in state["registers"] if r["name"] == name))
 
         # start: the PC is where it was asked, the stack is mapped around rsp, nothing has stopped yet
         state = session.emulation_start(watchdog)
-        assert state["pc"] == watchdog and state["running"] is True and state["stopped"] is None
+        assert state["pc"] == hex(watchdog) and state["running"] is True and state["stopped"] is None
         assert len(state["stack"]) == rizin_sessions.RIZIN_STACK_ROWS
         sp = register(state, "rsp")
         assert rizin_sessions.ESIL_STACK_ADDR < sp < rizin_sessions.ESIL_STACK_ADDR + rizin_sessions.ESIL_STACK_SIZE
 
         # step: the PC moves as rizin moves it, and says why it stopped
         state = session.emulation_run("step")
-        assert state["pc"] == ops[1]["offset"] and state["stopped"] == "step" and "rip" in state["changed"]
+        assert state["pc"] == hex(ops[1]["offset"]) and state["stopped"] == "step" and "rip" in state["changed"]
         assert register(state, "rsp") == sp - 0x28
         state = session.emulation_run("step")
-        assert state["pc"] == call["offset"] and register(state, "rcx") == 90000
+        assert state["pc"] == hex(call["offset"]) and register(state, "rcx") == 90000
         assert "rcx" in state["changed"]
         # to_call: stops before the call through the import table (aecc runs past it); until does as well
         session.emulation_start(watchdog)
         state = session.emulation_run("to_call")
-        assert state["pc"] == call["offset"] and state["stopped"] == "step"
+        assert state["pc"] == hex(call["offset"]) and state["stopped"] == "step"
         session.emulation_start(watchdog)
-        assert session.emulation_run("until", call["offset"])["pc"] == call["offset"]
+        assert session.emulation_run("until", call["offset"])["pc"] == hex(call["offset"])
 
         # skip passes the call, which the server has to do itself for call qword [import]
         state = session.emulation_run("skip")
-        assert state["pc"] == after_call and state["stopped"] == "step"
+        assert state["pc"] == hex(after_call) and state["stopped"] == "step"
         assert register(state, "rsp") == sp - 0x28, "nothing was called, so nothing was pushed"
 
         # a step into the call ends where nothing is mapped: named, not shown as a result
         session.emulation_start(watchdog)
         session.emulation_run("until", call["offset"])
         state = session.emulation_run("step")
-        assert state["pc"] != after_call and state["pc"] < 0x100000 and state["stopped"] == "trap"
+        assert state["pc"] != hex(after_call) and _word(state["pc"]) < 0x100000 and state["stopped"] == "trap"
         state = session.emulation_run("step")  # rizin says it now, on stderr
         assert state["stopped"] == "trap"
         # over a call through the import table runs it (aeso would step into it: the same place)
@@ -4838,16 +4877,16 @@ def test_real_rizin_runs_an_emulation(tmp_path, monkeypatch):
         session.console(f"db @ {watchdog:#x}")
         session.console(f"db @ {call['offset']:#x}")
         state = session.emulation_run("cont")
-        assert state["pc"] == call["offset"] and state["stopped"] == "breakpoint"
+        assert state["pc"] == hex(call["offset"]) and state["stopped"] == "breakpoint"
         state = session.emulation_run("cont")  # on into the call: nothing can execute there
-        assert state["stopped"] == "trap" and state["pc"] != call["offset"]
+        assert state["stopped"] == "trap" and state["pc"] != hex(call["offset"])
         # dbd lists the breakpoint as disabled, and rizin 0.9.1 stops at it all the same: only db- removes
         # one. The fake models this and Tasks 4 and 11 drop their on/off because of it.
         session.emulation_start(watchdog)
         session.console(f"dbd @ {call['offset']:#x}")
         assert [b["enabled"] for b in session.json("dblj") if b["addr"] == call["offset"]] == [False]
         state = session.emulation_run("cont")
-        assert state["pc"] == call["offset"] and state["stopped"] == "breakpoint"
+        assert state["pc"] == hex(call["offset"]) and state["stopped"] == "breakpoint"
         session.console(f"db- @ {call['offset']:#x}")
         assert [b["addr"] for b in session.json("dblj")] == [watchdog]
         session.console(f"db- @ {watchdog:#x}")
@@ -4861,10 +4900,10 @@ def test_real_rizin_runs_an_emulation(tmp_path, monkeypatch):
         session.console(f"wx ebfe @ {watchdog:#x}")
         started = time.monotonic()
         state = session.emulation_run("cont")
-        assert state["stopped"] == "timeout" and state["pc"] == watchdog
+        assert state["stopped"] == "timeout" and state["pc"] == hex(watchdog)
         assert 0.9 < time.monotonic() - started < 10
         state = session.emulation_run("to_call")
-        assert state["stopped"] == "timeout" and state["pc"] == watchdog
+        assert state["stopped"] == "timeout" and state["pc"] == hex(watchdog)
         assert session.emulation_state()["running"] is True
         assert session.json("ij")["core"]["file"] == str(exe)
     finally:
@@ -4943,7 +4982,7 @@ def test_real_rizin_keeps_a_patch_and_a_breakpoint_in_the_project(tdc, tmp_path,
         # and the breakpoint stops a run: nops from main, then the breakpoint
         api.send(f"/api/rizin/{sid}/emulation/start", {"addr": main})
         state = api.send(f"/api/rizin/{sid}/emulation/run", {"kind": "cont"})
-        assert (state["pc"], state["stopped"]) == (stop, "breakpoint")
+        assert (state["pc"], state["stopped"]) == (hex(stop), "breakpoint")
 
         # taking it back is saved too: the next session starts with the file's own bytes
         api.remove(f"/api/rizin/{sid}/patch", {"addr": main})
@@ -5036,7 +5075,7 @@ def test_real_rizin_reanalyses_what_a_run_decrypted(tmp_path):
         # the decryption loop, in rizin's own ESIL
         session.emulation_start(0)
         state = session.emulation_run("until", stop)
-        assert (state["stopped"], state["pc"]) == ("step", stop)
+        assert (state["stopped"], state["pc"]) == ("step", hex(stop))
         rows = [r for r in session.patches() if not r["mine"]]
         assert len(rows) == 0x40 and {r["size"] for r in rows} == {1}, "one cache row per decrypted byte"
         assert session.run_range() == (0x1000, 0x103F), "the range comes from the cache, measured"
@@ -5151,7 +5190,7 @@ def test_real_rizin_flood_of_esil_warnings_does_not_hide_the_timeout(tmp_path, m
         session.emulation_start(0)
         for kind, addr in (("cont", None), ("to_call", None), ("until", 0x20)):
             state = session.emulation_run(kind, addr)
-            assert state["stopped"] == "timeout" and state["pc"] in (0, 1), kind
+            assert state["stopped"] == "timeout" and _word(state["pc"]) in (0, 1), kind
     finally:
         mgr.shutdown()
 
@@ -5188,11 +5227,11 @@ def test_real_rizin_assists_an_api_call(tmp_path):
         assert assist["supported"] is True and assist["api"] == "Sleep"
         assert assist["ret_reg"] == "rax" and assist["value"] is None and assist["stack_fix"] == 0
         # the skip lands after the call -- aess would run into the callee (R18) -- and sets the register
-        sp = next(r["value"] for r in session.emulation_state()["registers"] if r["name"] == "rsp")
+        sp = _word(next(r["value"] for r in session.emulation_state()["registers"] if r["name"] == "rsp"))
         state = session.call_skip(call["offset"], 0x41, 0)
-        assert state["pc"] == call["offset"] + call["size"] and state["stopped"] == "step"
-        assert next(r["value"] for r in state["registers"] if r["name"] == "rax") == 0x41
-        assert next(r["value"] for r in state["registers"] if r["name"] == "rsp") == sp, \
+        assert state["pc"] == hex(call["offset"] + call["size"]) and state["stopped"] == "step"
+        assert _word(next(r["value"] for r in state["registers"] if r["name"] == "rax")) == 0x41
+        assert _word(next(r["value"] for r in state["registers"] if r["name"] == "rsp")) == sp, \
             "nothing was called, so nothing was pushed and nothing is corrected"
 
         # a rising clock, where the file really calls GetTickCount
@@ -5202,13 +5241,13 @@ def test_real_rizin_assists_an_api_call(tmp_path):
                          and op["type"].endswith("call"))
         session.emulation_start(tick_call["offset"])
         first = session.call_assist(tick_call["offset"])
-        assert first["api"] == "GetTickCount" and first["value"] > rizin_emulation.TICK_START
+        assert first["api"] == "GetTickCount" and _word(first["value"]) > rizin_emulation.TICK_START
         assert session.call_assist(tick_call["offset"])["value"] == first["value"], \
             "R38: a look does not move the clock"
-        applied = session.call_skip(tick_call["offset"], first["value"], 0)
+        applied = session.call_skip(tick_call["offset"], _word(first["value"]), 0)
         assert next(r["value"] for r in applied["registers"] if r["name"] == "rax") == first["value"]
         session.emulation_register("rip", tick_call["offset"])
-        assert session.call_assist(tick_call["offset"])["value"] == first["value"] + rizin_emulation.TICK_STEP
+        assert session.call_assist(tick_call["offset"])["value"] == hex(_word(first["value"]) + rizin_emulation.TICK_STEP)
 
         # an import the table does not know is named all the same, with no value
         pipe_call = next(op for op in main_ops if "CreateNamedPipe" in op.get("disasm", "")
@@ -5269,41 +5308,41 @@ def test_real_rizin_assists_a_32_bit_stdcall_call(tmp_path):
         for _ in range(4):
             assert session.emulation_run("step")["stopped"] == "step"
         state = session.emulation_state()
-        sp = next(r["value"] for r in state["registers"] if r["name"] == "esp")
-        bp = next(r["value"] for r in state["registers"] if r["name"] == "ebp")
-        assert state["pc"] == alloc_call
-        assert [row["value"] for row in state["stack"][:4]] == [0, 0x200, 0x1000, 0x40], \
+        sp = _word(next(r["value"] for r in state["registers"] if r["name"] == "esp"))
+        bp = _word(next(r["value"] for r in state["registers"] if r["name"] == "ebp"))
+        assert state["pc"] == hex(alloc_call)
+        assert [_word(row["value"]) for row in state["stack"][:4]] == [0, 0x200, 0x1000, 0x40], \
             "argument i sits at [esp + 4*i] while the PC is on the call"
 
         assist = session.call_assist(alloc_call)
         assert assist["api"] == "VirtualAlloc" and assist["ret_reg"] == "eax"
         assert assist["stack_fix"] == 16, "a stdcall callee clears its four arguments"
-        assert assist["value"] == rizin_emulation.ASSIST_ADDR, "a buffer clear of the file and the stack"
+        assert _word(assist["value"]) == rizin_emulation.ASSIST_ADDR, "a buffer clear of the file and the stack"
         assert "4096 bytes" in assist["summary"], assist["summary"]
 
-        state = session.call_skip(alloc_call, assist["value"], assist["stack_fix"])
-        assert state["pc"] == alloc_call + 6 and state["stopped"] == "step"
+        state = session.call_skip(alloc_call, _word(assist["value"]), assist["stack_fix"])
+        assert state["pc"] == hex(alloc_call + 6) and state["stopped"] == "step"
         assert next(r["value"] for r in state["registers"] if r["name"] == "eax") == assist["value"]
-        assert next(r["value"] for r in state["registers"] if r["name"] == "esp") == sp + 16
-        assert next(r["value"] for r in state["registers"] if r["name"] == "ebp") == bp, \
+        assert _word(next(r["value"] for r in state["registers"] if r["name"] == "esp")) == sp + 16
+        assert _word(next(r["value"] for r in state["registers"] if r["name"] == "ebp")) == bp, \
             "aeim put the base pointer into its new map; the skip put it back"
         # the buffer is there, the stack aeim mapped at the start is still the stack, and the PC did not
         # go to the seek -- all three of which a bare aeim would have broken
         maps = {m["name"]: (m["from"], m["to"]) for m in session.json("omlj")}
-        assert maps["mem.assist"] == (assist["value"], assist["value"] + 0x1000), maps
+        assert maps["mem.assist"] == (_word(assist["value"]), _word(assist["value"]) + 0x1000), maps
         assert state["stack"] and any(name.startswith("mem.0x") for name in maps), maps
-        session.text(f"wx 41424344 @ {assist['value']:#x}")
-        assert session.json(f"pxj 4 @ {assist['value']:#x}") == [0x41, 0x42, 0x43, 0x44]
+        session.text(f"wx 41424344 @ {_word(assist['value']):#x}")
+        assert session.json(f"pxj 4 @ {_word(assist['value']):#x}") == [0x41, 0x42, 0x43, 0x44]
 
         # and the copy a cdecl memcpy stands for really happens, with no correction to the stack
         session.emulation_start(copy_start)
         for _ in range(3):
             session.emulation_run("step")
         copy = session.call_assist(copy_call)
-        assert copy["api"] == "memcpy" and copy["value"] == 0x1C0 and copy["stack_fix"] == 0
+        assert copy["api"] == "memcpy" and copy["value"] == "0x1c0" and copy["stack_fix"] == 0
         assert "8 bytes" in copy["summary"], copy["summary"]
-        state = session.call_skip(copy_call, copy["value"], 0)
-        assert state["pc"] == after_copy
+        state = session.call_skip(copy_call, _word(copy["value"]), 0)
+        assert state["pc"] == hex(after_copy)
         assert bytes(session.json("pxj 8 @ 0x1c0")) == b"unpacked", "the copy is really made"
         assert [row["mine"] for row in session.patches() if row["addr"] == 0x1C0] == [False], \
             "what the copy wrote belongs to the run, not to the patches"
@@ -5350,14 +5389,14 @@ def test_real_rizin_gives_the_emulations_memory_back(tmp_path):
         # memory **and** frees it
         session.text(f"aeim {rizin_emulation.ASSIST_ADDR:#x} 0x1000 assist")
         state = session.emulation_state()
-        sp = next(r["value"] for r in state["registers"] if r["name"] == "rsp")
+        sp = _word(next(r["value"] for r in state["registers"] if r["name"] == "rsp"))
         assert session.emulation_stop() == {"running": False}
         assert [m["name"] for m in session.json("omlj") if m["name"].startswith("mem.")] == []
         assert "malloc://" not in session.text("ol"), "the memory was freed, not only unmapped"
 
         # and a start after that is like a first one: one stack, where ESIL_STACK_ADDR says
         again = session.emulation_start(0)
-        at = next(r["value"] for r in again["registers"] if r["name"] == "rsp")
+        at = _word(next(r["value"] for r in again["registers"] if r["name"] == "rsp"))
         assert rizin_sessions.ESIL_STACK_ADDR < at < rizin_sessions.ESIL_STACK_ADDR + rizin_sessions.ESIL_STACK_SIZE
         assert again["stack"], "the stack the server knows about is the one that is mapped"
         assert len([m for m in session.json("omlj") if m["name"].startswith("mem.")]) == 1
@@ -5409,7 +5448,7 @@ def test_real_rizin_copies_more_than_one_wx_can_carry(tmp_path):
         session.text("f sym.imp.msvcrt.dll_memcpy @ 0x2000")
         call = len(code) - 6
         state = session.emulation_start(0)
-        sp = next(r["value"] for r in state["registers"] if r["name"] == "rsp")
+        sp = _word(next(r["value"] for r in state["registers"] if r["name"] == "rsp"))
         # two buffers of the emulation's own; each aeim moves the VM into its new map (measured), so
         # the PC and the stack pointer go back afterwards, the way call_skip does it
         session.text(f"aeim 0x50000000 {2 * size:#x} dst")
@@ -5423,14 +5462,14 @@ def test_real_rizin_copies_more_than_one_wx_can_carry(tmp_path):
                          f"@ {0x60000000 + at:#x}")
         for _ in range(3):
             session.emulation_run("step")
-        assert session.emulation_state()["pc"] == call
+        assert session.emulation_state()["pc"] == hex(call)
         assert bytes(session.json(f"pxj 4 @ {0x60000000 + size - 4:#x}")) == b"ABCD", "the source is filled"
         assert bytes(session.json("pxj 4 @ 0x50000000")) != b"ABCD", "and the destination is not"
 
         assist = session.call_assist(call)
-        assert assist["api"] == "memcpy" and assist["value"] == 0x50000000
+        assert assist["api"] == "memcpy" and assist["value"] == "0x50000000"
         assert f"{size} bytes are copied" in assist["summary"], assist["summary"]
-        state = session.call_skip(call, assist["value"], 0)
+        state = session.call_skip(call, _word(assist["value"]), 0)
         assert f"{size} bytes were copied" in state["summary"], state["summary"]
         # every chunk arrived: the first bytes, the last bytes and one in the middle
         for at in (0, size // 2, size - 4):
@@ -5586,7 +5625,7 @@ def test_real_rizin_breakpoint_routes(tdc, tmp_path, monkeypatch):
         # and the run honours the one that was set before the start
         api.send(f"/api/rizin/{sid}/emulation/start", {"addr": first})
         state = api.send(f"/api/rizin/{sid}/emulation/run", {"kind": "cont"})
-        assert state["pc"] == second and state["stopped"] == "breakpoint"
+        assert state["pc"] == hex(second) and state["stopped"] == "breakpoint"
         assert api.read(url) == [{"addr": first, "enabled": True}, {"addr": second, "enabled": True}]
 
         # clear one, then all
