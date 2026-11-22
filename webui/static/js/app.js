@@ -20889,6 +20889,25 @@ const RIZIN_C_WORDS = new Set([
     'uchar', 'ushort', 'uint', 'ulong', 'longlong', 'ulonglong', 'code', 'undefined', 'undefined1', 'undefined2',
     'undefined4', 'undefined8', 'wchar_t', 'size_t',
 ]);
+// The emulation's run line (the strip above the work area): the runs it offers (the server also knows until,
+// which needs an address: the right-click menu's, not a button; there is no step back, rizin's aesb restores no
+// memory), the words for a run that did what it was asked and for each reason the server gives for a stop,
+// and how many changed registers the strip shows (the EMULATION pane has them all)
+const RIZIN_EMU = {
+    kinds: ['cont', 'step', 'over', 'skip', 'to_call'],
+    labels: { cont: 'CONT', step: 'STEP', over: 'OVER', skip: 'SKIP', to_call: 'TO CALL' },
+    done: {
+        cont: 'Ran until it stopped', step: 'Stepped one instruction', over: 'Stepped over the instruction',
+        skip: 'Skipped the instruction', to_call: 'Ran to the next call and stopped before it', until: 'Ran to the address',
+    },
+    stops: {
+        breakpoint: 'Stopped at a breakpoint',
+        timeout: 'Stopped by esil.timeout: the run took too long',
+        invalid: 'Stopped: rizin cannot decode the instruction here',
+        trap: 'Stopped: an invalid memory access, or the PC is in memory that cannot be executed',
+    },
+    regs: 6,
+};
 // The views that follow the current place. load(force) brings a view to it:
 // it asks rizin when what the view shows is of another place, and always with
 // force (a finished analysis step may have changed it). The requests go out
@@ -20900,6 +20919,8 @@ const RIZIN_C_WORDS = new Set([
 const RIZIN_VIEWS = {
     disasm: force => rizinLoadDisasm(force),
     graph: force => rizinLoadGraph(force),
+    // The emulation's state: asked for only when forced (a run's answer is the state; see rizinLoadEmulation)
+    emulation: force => rizinLoadEmulation(force),
     hex: force => rizinLoadHex(force),
     strings: force => rizinLoadList('strings', force),
     imports: force => rizinLoadList('imports', force),
@@ -21002,6 +21023,15 @@ const rizinState = {
     // Decompiles that ended a session (rizin stopped during pdgj), {path, func}: kept over Reopen and other
     // files (rizinReset leaves it), so DECOMPILER does not run them again on its own (rizinDecompileSlow)
     decompileSlow: [],
+    // The emulation: null outside it, else the server's state (running, pc, registers [{name, value}] in rizin's
+    // order, changed [names], stack, stopped, arch, bits) with what only the tab knows: ran (the run that
+    // answered), summary (what a skipped call applied) and assist (the offer for the call at the PC, or null).
+    // The run strip and the EMULATION pane draw from this one state; neither asks the route again
+    emu: null,
+    emuWait: '',        // what waits for its answer: start, stop, or the kind of run; one at a time
+    emuNote: '',        // why the last run did not happen (shown in the strip, until the next one)
+    emuSeq: 0,          // the newest action on the state: a late answer of an older one is dropped
+    emuShown: {},       // what the strip's parts show (markup by id), so that only a change writes
 };
 
 // This browser tab's ID: random and kept in sessionStorage, so a reload of the
@@ -21100,8 +21130,11 @@ function rizinSetUi(state, extra) {
     if (state === 'moved' || state === 'ended') {
         rizinStopPoll();
         rizinState.retry.clear();
+        // The session is gone, and its emulation with it: the strip goes
+        if (rizinState.emu || rizinState.emuWait) rizinEmuLeave();
     }
     rizinRenderState();
+    rizinRenderRunStrip();          // START follows the session's state (off once it moved or ended)
     // Without a session DISASSEMBLY says how rizin gets installed
     if (state === 'not-installed' && !rizinState.session) rizinRenderDisasm();
 }
@@ -21203,11 +21236,12 @@ function rizinFunctionsHtml(funcs, options) {
 
 // The lines of DISASSEMBLY: address, the mnemonic in the colour of its kind,
 // operands and comment. Each line carries its address in data-addr; the one
-// that holds current (an address) is marked.
+// that holds current (an address) is marked, and the one that holds pc (the
+// emulation's) with a mark of its own.
 function rizinDisasmHtml(ops, options) {
-    const { current = null } = options || {};
-    const at = rizinNum(rizinHex(current));
-    let marked = false;
+    const { current = null, pc = null } = options || {};
+    const at = rizinNum(rizinHex(current)), pcAt = rizinNum(rizinHex(pc));
+    let marked = false, pcMarked = false;
     let html = '';
     for (const op of Array.isArray(ops) ? ops : []) {
         const addr = rizinHex(op && op.offset);
@@ -21215,9 +21249,11 @@ function rizinDisasmHtml(ops, options) {
         const size = Number.isInteger(op.size) && op.size > 0 ? op.size : 1;
         const here = !marked && at >= op.offset && at < op.offset + size;
         marked = marked || here;
+        const there = !pcMarked && pcAt >= op.offset && pcAt < op.offset + size;
+        pcMarked = pcMarked || there;
         const [, mnemonic, operands] = /^(\S*)\s*([\s\S]*)$/.exec(String(op.text ?? ''));
         const kind = rizinOpClass(op.type);
-        html += `<div class="rizin-op${here ? ' current' : ''}" data-addr="${addr}"><span class="rz-addr">${addr}</span> `
+        html += `<div class="rizin-op${here ? ' current' : ''}${there ? ' pc' : ''}" data-addr="${addr}"><span class="rz-addr">${addr}</span> `
             + `<span class="rz-mnem${kind ? ' ' + kind : ''}">${escapeHtml(mnemonic)}</span>`
             + (operands ? ' ' + rizinOperandsHtml(operands, rizinHex(op.jump)) : '')
             + (op.comment ? '  ' + rizinCommentHtml(op.comment) : '') + '</div>';
@@ -21279,7 +21315,9 @@ function rizinReset(described) {
         graphDrag: null, graphDragged: false, xrefs: null, xrefsPending: null, xrefsShown: '', placeName: null,
         decompiler: null, decompilerAsk: null, decompilerPending: null, decompilerShown: '', decompilerAt: '',
         decompilerClick: null, hex: null, hexAsk: null, hexPending: null, hexShown: '', backTo: null,
+        emu: null, emuWait: '', emuNote: '', emuShown: {},
     });
+    rizinState.emuSeq++;            // an answer of the old session's emulation is dropped
     for (const list of Object.values(rizinState.lists)) {
         if (list.timer !== null) clearTimeout(list.timer);
         Object.assign(list, { offset: 0, total: 0, items: null, truncated: false, at: '', stale: false, problem: '', shown: '', shownAt: '', timer: null });
@@ -21295,6 +21333,7 @@ function rizinReset(described) {
     rizinRenderXrefs();
     rizinRenderDecompiler();
     rizinRenderHex();
+    rizinRenderRunStrip();
     if (rizinState.file) rizinConsoleNote(`${rizinState.file.path ?? ''}`, 'file');
     rizinSetUi('');
 }
@@ -21724,6 +21763,7 @@ function rizinRenderToolbar() {
     rizinRenderAnalysis();
     rizinRenderState();
     rizinRenderLocation();
+    rizinRenderRunStrip();
 }
 
 // The open file: its path, format, architecture and size, and its SHA256
@@ -21930,7 +21970,8 @@ function rizinRenderDisasm(problem) {
         return;
     }
     if (title) title.textContent = page.function || rizinState.seek;
-    const at = JSON.stringify([rizinState.session, rizinState.seek]);
+    const pc = rizinEmuPc();
+    const at = JSON.stringify([rizinState.session, rizinState.seek, pc]);
     // The lines as JSON, once for each list of them (a page that loads on gets a new one)
     if (page.linesOf !== page.ops) Object.assign(page, { lines: JSON.stringify(page.ops), linesOf: page.ops });
     const shown = JSON.stringify([rizinState.session, page.function, page.more, !!page.capped]) + page.lines;
@@ -21941,9 +21982,13 @@ function rizinRenderDisasm(problem) {
     if (shown === rizinState.disasmShown) {
         if (at !== rizinState.disasmAt) {
             rizinState.disasmAt = at;
-            const seek = rizinNum(rizinState.seek);
-            const op = page.ops.find(o => seek >= o.offset && seek < o.offset + (Number.isInteger(o.size) && o.size > 0 ? o.size : 1));
+            const holder = place => {
+                const n = rizinNum(place);
+                return page.ops.find(o => n >= o.offset && n < o.offset + (Number.isInteger(o.size) && o.size > 0 ? o.size : 1));
+            };
+            const op = holder(rizinState.seek), pcOp = pc ? holder(pc) : null;
             rizinMoveMark(pane, '.rizin-op', op ? [rizinHex(op.offset)].filter(Boolean) : []);
+            rizinMovePc(pane, '.rizin-op', pcOp ? [rizinHex(pcOp.offset)].filter(Boolean) : []);
         } else if (jumped) {
             rizinReveal(pane, pane.querySelector('.rizin-op.current'));
         }
@@ -21953,7 +21998,7 @@ function rizinRenderDisasm(problem) {
     rizinState.disasmShown = shown;
     rizinState.disasmAt = at;
     const end = `The linear disassembly stops here, after ${RIZIN_MORE.linear} instructions: enter a later address in SEEK to read on.`;
-    pane.innerHTML = (page.ops.length ? rizinDisasmHtml(page.ops, { current: rizinState.seek })
+    pane.innerHTML = (page.ops.length ? rizinDisasmHtml(page.ops, { current: rizinState.seek, pc })
         : '<div class="rizin-empty">No instructions at this address.</div>')
         + (page.more ? `<div class="rizin-more" title="The instructions go on below">${escapeHtml(rizinMoreText(page))}</div>`
             : page.capped ? `<div class="rizin-disasm-end">${escapeHtml(end)}</div>` : '');
@@ -22045,6 +22090,15 @@ function rizinMoveMark(container, selector, addrs) {
     }
     for (const addr of addrs) container.querySelector(`${selector}[data-addr="${addr}"]`)?.classList.add('current');
     rizinReveal(container, container.querySelector(`${selector}.current`));
+}
+
+// The mark of the emulation's PC (.pc) of a list drawn already moves to its rows (selector) of the addresses
+// addrs (data-addr); unlike rizinMoveMark it scrolls nothing: the PC is where the user is not always looking
+function rizinMovePc(container, selector, addrs) {
+    for (const el of container.querySelectorAll(`${selector}.pc`)) {
+        if (!addrs.includes(el.getAttribute('data-addr'))) el.classList.remove('pc');
+    }
+    for (const addr of addrs) container.querySelector(`${selector}[data-addr="${addr}"]`)?.classList.add('pc');
 }
 
 // What a scrolled list shows at its top: the first row in sight (its
@@ -22538,17 +22592,18 @@ function rizinGraphBoxAt(layout, nodes, at) {
 
 // The graph as SVG: the edges in the colour of their kind (a class each),
 // then the blocks, each a group with its address in data-addr and a title;
-// the block of current (an address) is marked. overview: no instructions
+// the block of current (an address) is marked, and the block of pc (the emulation's) with a mark of its own. overview: no instructions
 // and no arrow heads; section {x, y, w, h}: only the blocks that reach into
 // it have their text. Every text of the file is escaped.
 function rizinGraphSvg(layout, graph, options) {
-    const { current = null, overview = false, section = null } = options || {};
+    const { current = null, pc = null, overview = false, section = null } = options || {};
     if (!layout || !Array.isArray(layout.boxes) || !layout.boxes.length) return '';
     const g = RIZIN_GRAPH;
     const nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
     const byOffset = new Map();
     for (const node of nodes) if (node && Number.isFinite(node.offset) && !byOffset.has(node.offset)) byOffset.set(node.offset, node);
     const here = rizinGraphBoxAt(layout, nodes, rizinNum(rizinHex(current)));
+    const there = rizinGraphBoxAt(layout, nodes, rizinNum(rizinHex(pc)));
     const c = v => String(Math.round(v * 10) / 10);
     const cut = line => {
         const text = String(line ?? '');
@@ -22571,7 +22626,7 @@ function rizinGraphSvg(layout, graph, options) {
         const lines = node && Array.isArray(node.lines) ? node.lines : [];
         const addr = rizinHex(box.offset);
         const count = `${addr} · ${lines.length} instruction${lines.length === 1 ? '' : 's'}`;
-        svg += `<g class="rizin-block${box === here ? ' current' : ''}" data-addr="${addr}"><title>${escapeHtml(count)}</title>`
+        svg += `<g class="rizin-block${box === here ? ' current' : ''}${box === there ? ' pc' : ''}" data-addr="${addr}"><title>${escapeHtml(count)}</title>`
             + `<rect class="rizin-block-box" x="${c(box.x)}" y="${c(box.y)}" width="${c(box.w)}" height="${c(box.h)}" rx="3"></rect>`;
         const reaches = !section || (box.x < section.x + section.w && box.x + box.w > section.x
             && box.y < section.y + section.h && box.y + box.h > section.y);
@@ -22759,6 +22814,8 @@ function rizinRenderGraph(problem) {
     if (title) title.textContent = graph.function ? `GRAPH · ${graph.function}` : 'GRAPH';
     const layout = graph.layout;
     const box = rizinGraphBoxAt(layout, graph.nodes, rizinNum(rizinState.seek));
+    const pc = rizinEmuPc();
+    const pcBox = pc ? rizinGraphBoxAt(layout, graph.nodes, rizinNum(pc)) : null;
     // The view is the function's, by its entry: a rename keeps it
     const place = JSON.stringify([graph.session, graph.entry ?? layout.boxes[0].offset]);
     if (place !== rizinState.graphPlace) {
@@ -22792,10 +22849,10 @@ function rizinRenderGraph(problem) {
     }
     const shown = JSON.stringify([graph.session, graph.gen, mode, section]);
     if (shown !== rizinState.graphShown) {
-        pane.innerHTML = rizinGraphSvg(layout, graph, { current: rizinState.seek, overview: mode === 'overview', section });
+        pane.innerHTML = rizinGraphSvg(layout, graph, { current: rizinState.seek, pc, overview: mode === 'overview', section });
         rizinState.graphShown = shown;
     } else {
-        rizinGraphMark(pane, box);
+        rizinGraphMark(pane, box, pcBox);
     }
     rizinState.graphMode = mode;
     rizinState.graphSection = section;
@@ -22810,13 +22867,17 @@ function rizinRenderGraph(problem) {
     }
 }
 
-// The mark on the block of the current address, without drawing the graph again
-function rizinGraphMark(pane, box) {
-    const addr = box ? rizinHex(box.offset) : null;
+// The marks on the block of the current address and of the emulation's PC, without drawing the graph again
+function rizinGraphMark(pane, box, pcBox) {
+    const addr = box ? rizinHex(box.offset) : null, pcAddr = pcBox ? rizinHex(pcBox.offset) : null;
     pane.querySelectorAll('.rizin-block.current').forEach(el => {
         if (el.getAttribute('data-addr') !== addr) el.classList.remove('current');
     });
     if (addr) pane.querySelector(`.rizin-block[data-addr="${addr}"]`)?.classList.add('current');
+    pane.querySelectorAll('.rizin-block.pc').forEach(el => {
+        if (el.getAttribute('data-addr') !== pcAddr) el.classList.remove('pc');
+    });
+    if (pcAddr) pane.querySelector(`.rizin-block[data-addr="${pcAddr}"]`)?.classList.add('pc');
 }
 
 // The view's zoom and place on the SVG (a CSS transform); lines and edges
@@ -24597,6 +24658,371 @@ function rizinOnPageHide() {
     const sent = navigator.sendBeacon(`/api/rizin/${encodeURIComponent(sid)}/close`, '');
     rizinSetUi('ended');
     return sent;
+}
+
+// --- The emulation: the run strip ---
+// START (the toolbar) enters the emulation; the strip between the toolbar and the work area shows while it
+// runs: the runs, the PC, the registers the last run changed, why it stood, and the offer for a call at the PC.
+// The state (rizinState.emu) is the server's answer to the last start, run or skip: a run is one request, the
+// views follow the PC through rizinSeek, and nothing asks for the state again unless a view is forced (an
+// analysis step ended, a busy answer is retried). STOP leaves the emulation; it aborts nothing (rizin cannot
+// interrupt a command: a run ends by itself at esil.timeout). Addresses are "0x…" strings; rizin's register
+// names, the API behind a call and its summary come out of the file and are only ever set as text.
+
+// A number of the state as a hex string; "~" in front of a value above 2^53, which JSON gave the browser
+// as a double that cannot hold it exactly
+function rizinEmuHex(value) {
+    if (!Number.isInteger(value) || value < 0) return '';
+    const hex = rizinHex(value) || '0x' + 'f'.repeat(16);
+    return Number.isSafeInteger(value) ? hex : '~' + hex;
+}
+
+// The emulation's PC as "0x…", or null outside the emulation
+function rizinEmuPc() {
+    const emu = rizinState.emu;
+    return emu && emu.running ? rizinHex(emu.pc) : null;
+}
+
+// Why the emulation stands, in words, never none: a run in flight (it cannot be interrupted), why the last one
+// did not happen, else the reason of the last stop (a run that did what was asked says which run it was).
+// {kind, text}: kind names the class of the line.
+function rizinEmuWhy(emu, options) {
+    const { wait = '', note = '' } = options || {};
+    if (wait) {
+        const label = RIZIN_EMU.labels[wait] || wait.toUpperCase();
+        return { kind: 'wait', text: wait === 'start' ? 'Starting the emulation…' : wait === 'stop' ? 'Leaving the emulation…'
+            : `Running ${label}: a run ends by itself (esil.timeout) and cannot be interrupted.` };
+    }
+    if (note) return { kind: 'note', text: note };
+    const stopped = emu && typeof emu.stopped === 'string' ? emu.stopped : '';
+    const summary = emu && typeof emu.summary === 'string' && emu.summary ? ` · ${emu.summary}` : '';
+    if (stopped === 'step') return { kind: 'step', text: (RIZIN_EMU.done[emu.ran] || 'Stopped after the step asked for') + summary };
+    if (RIZIN_EMU.stops[stopped]) return { kind: stopped, text: RIZIN_EMU.stops[stopped] + summary };
+    if (stopped) return { kind: 'stopped', text: `Stopped: ${stopped}${summary}` };
+    return { kind: 'ready', text: `Ready at ${rizinHex(emu && emu.pc) || 'the PC'}: no run has stopped here yet${summary}` };
+}
+
+// The offer for a call at the PC (rizinEmuAssist): the sentence of what SKIP will do, and the field for the
+// value that goes into the return register, with the offered one in it. Where the assistant is off, its reason
+// and no field: SKIP is the plain skip then.
+function rizinRunAssistHtml(assist) {
+    if (!assist || typeof assist !== 'object') return '';
+    if (!assist.supported) {
+        const reason = assist.reason || 'no answer is offered for this call';
+        return `<span class="rizin-run-assist-text" title="${escapeHtml(reason)}">; ${escapeHtml(reason)}</span>`;
+    }
+    const text = assist.summary || `skip ${assist.api || 'the call'}`;
+    const value = Number.isInteger(assist.value) && assist.value >= 0 ? rizinHex(assist.value) || '' : '';
+    const reg = assist.ret_reg || 'value';
+    return `<span class="rizin-run-assist-text" title="${escapeHtml(text)}">; ${escapeHtml(text)}</span>`
+        + `<label class="rizin-run-assist-label" for="rizin-run-assist-value">${escapeHtml(reg)} =</label>`
+        + `<input type="text" id="rizin-run-assist-value" class="filter-input rizin-run-value" value="${escapeHtml(value)}" `
+        + `placeholder="${value ? '' : 'keep'}" aria-label="The value SKIP puts into ${escapeHtml(reg)}" autocomplete="off" spellcheck="false">`;
+}
+
+// The strip's parts from the state: {pc, regs, assist} as markup and {why} as {kind, text}. The registers are
+// those in emu.changed, in rizin's order (all of them are in the state for the EMULATION pane), marked with a
+// delta and a bar, so that the colour does not carry it alone; at most RIZIN_EMU.regs, then "+n more".
+function rizinRunStripHtml(emu, options) {
+    const pc = emu && emu.running ? rizinHex(emu.pc) : null;
+    const changed = new Set(emu && Array.isArray(emu.changed) ? emu.changed.map(String) : []);
+    const all = (emu && Array.isArray(emu.registers) ? emu.registers : []).filter(reg => reg && changed.has(String(reg.name)));
+    const shown = all.slice(0, RIZIN_EMU.regs);
+    const regs = shown.map(reg => `<span class="rizin-run-reg" title="${escapeHtml(reg.name)} changed in the last run">`
+        + `<span class="rizin-run-delta" aria-hidden="true">Δ</span><span class="rizin-run-reg-name">${escapeHtml(reg.name)}</span> `
+        + `<span class="rizin-run-reg-value">${escapeHtml(rizinEmuHex(reg.value))}</span></span>`).join(' ');
+    const rest = all.slice(shown.length);
+    return {
+        pc: pc ? `<span class="rizin-run-pc-label">▶ PC</span> <span class="rizin-run-pc-value">${escapeHtml(pc)}</span>`
+            : '<span class="rizin-run-pc-label">▶ PC</span> <span class="rizin-run-pc-value">unknown</span>',
+        regs: (regs || '<span class="rizin-run-none">no register changed</span>')
+            + (rest.length ? ` <span class="rizin-run-more" title="${escapeHtml(rest.map(reg => reg.name).join(' '))}">+${rest.length} more</span>` : ''),
+        why: rizinEmuWhy(emu, options),
+        assist: rizinRunAssistHtml(emu && emu.assist),
+    };
+}
+
+// The strip, and START: the strip is there while the emulation runs; only a part that changed is written
+// (the offered value being edited stays while the rest moves). A run in flight puts the runs and STOP off.
+function rizinRenderRunStrip() {
+    const emu = rizinState.session ? rizinState.emu : null;
+    const running = !!emu && emu.running === true;
+    const start = document.getElementById('rizin-emu-start');
+    if (start) {
+        start.disabled = !rizinState.session || running || !!rizinState.emuWait || rizinState.opening
+            || ['moved', 'ended', 'not-installed'].includes(rizinState.ui.state);
+    }
+    const strip = document.getElementById('rizin-run');
+    if (!strip) return;
+    if (!running) {
+        if (!strip.hidden) strip.hidden = true;
+        rizinState.emuShown = {};
+        return;
+    }
+    if (strip.hidden) strip.hidden = false;
+    const wait = rizinState.emuWait, parts = rizinRunStripHtml(emu, { wait, note: rizinState.emuNote });
+    const shown = rizinState.emuShown;
+    for (const [id, html] of [['rizin-run-pc', parts.pc], ['rizin-run-regs', parts.regs], ['rizin-run-assist', parts.assist]]) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        if (shown[id] !== html) {
+            el.innerHTML = html;
+            shown[id] = html;
+        }
+        if (id === 'rizin-run-assist') el.hidden = !html;
+    }
+    const why = document.getElementById('rizin-run-why');
+    const key = JSON.stringify(parts.why);
+    if (why && shown['rizin-run-why'] !== key) {
+        why.textContent = parts.why.text;
+        why.title = parts.why.text;
+        why.className = `rizin-run-why rizin-run-why-${cssToken(parts.why.kind)}`;
+        shown['rizin-run-why'] = key;
+    }
+    const pc = rizinEmuPc();
+    for (const button of strip.querySelectorAll('button')) {
+        button.disabled = !!wait || (button.getAttribute('data-rizin-act') === 'gotopc' && !pc);
+    }
+    const stop = document.getElementById('rizin-run-stop');
+    if (stop) stop.title = wait ? 'A run in flight ends by itself; STOP is there again once it has' : 'Leave the emulation';
+}
+
+// The marks of the PC in DISASSEMBLY and GRAPH drawn again (the PC moved, or the emulation ended): only where
+// the view holds its place now, so that a message of the view (busy, loading) stays
+function rizinRenderPcMarks() {
+    if (rizinPageHolds(rizinState.disasm)) rizinRenderDisasm();
+    if (rizinGraphHolds(rizinState.graph)) rizinRenderGraph();
+}
+
+// Out of the emulation: the state, what waits and its note go, the strip and the marks of the PC with them
+function rizinEmuLeave() {
+    Object.assign(rizinState, { emu: null, emuWait: '', emuNote: '', emuShown: {} });
+    rizinState.emuSeq++;
+    rizinRenderRunStrip();
+    rizinRenderPcMarks();
+}
+
+// Whether the instruction at pc is a call, from the page DISASSEMBLY shows; true where the page does not
+// hold it (the offer is then asked for, and the server says whether there is a call)
+function rizinEmuAtCall(pc) {
+    const page = rizinState.disasm, at = rizinNum(pc);
+    const op = page && page.session === rizinState.session && Array.isArray(page.ops)
+        ? page.ops.find(o => o && o.offset === at) : null;
+    return op ? String(op.type || '').includes('call') : true;
+}
+
+// The offer for the call at the PC (GET call changes nothing, so it may be asked after every run): kept in
+// emu.assist for the strip. Not asked at an instruction that is no call, nor again at the PC it has been asked
+// at. A busy answer is retried with the other views; any other answer leaves no offer (SKIP is the plain skip).
+async function rizinEmuAssist() {
+    const sid = rizinState.session, emu = rizinState.emu, pc = rizinEmuPc();
+    if (!sid || !emu || !pc) return false;
+    if (!rizinEmuAtCall(pc)) return true;
+    if (emu.assist && emu.assist.addr === pc) return true;
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/call?addr=${encodeURIComponent(pc)}`);
+    if (sid !== rizinState.session || rizinState.emu !== emu || rizinEmuPc() !== pc) return false;
+    if (!r.ok) {
+        if (r.state === 'busy') rizinViewBusy('emulation', true);
+        emu.assist = null;
+        rizinRenderRunStrip();
+        return false;
+    }
+    const d = r.data;
+    emu.assist = {
+        addr: pc, supported: d.supported === true, reason: typeof d.reason === 'string' ? d.reason : '',
+        api: typeof d.api === 'string' ? d.api : '', ret_reg: typeof d.ret_reg === 'string' ? d.ret_reg : '',
+        value: Number.isInteger(d.value) ? d.value : null, stack_fix: Number.isInteger(d.stack_fix) ? d.stack_fix : 0,
+        summary: typeof d.summary === 'string' ? d.summary : '',
+    };
+    rizinRenderRunStrip();
+    return true;
+}
+
+// The emulation's state for the views registered in RIZIN_VIEWS: nothing outside the emulation, nothing unless
+// forced (the state of the last run is current, and a step must not cost another request), and forced (an
+// analysis step ended, the console changed something, a busy answer is retried) it is read again. Reading
+// gives no reason for a stop, so the one of the run stays while the PC does. A busy answer waits for the poll,
+// a refusal that the emulation is not started (rizin restarted) leaves the mode, and a 404 ends it with the session.
+async function rizinLoadEmulation(force) {
+    const sid = rizinState.session, emu = rizinState.emu;
+    if (!sid || !emu || !emu.running) {
+        rizinRenderRunStrip();
+        return true;
+    }
+    if (force && !rizinState.emuWait) {
+        const seq = ++rizinState.emuSeq;
+        const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/emulation`);
+        if (sid !== rizinState.session || seq !== rizinState.emuSeq || rizinState.emu !== emu) return false;
+        if (!r.ok) {
+            if (r.state === 'busy') {
+                rizinViewBusy('emulation', true);
+            } else if (r.state === 'refused' && /not started/.test(r.error)) {
+                rizinEmuLeave();
+                rizinState.note = r.error;
+                rizinRenderState();
+            } else {
+                rizinState.emuNote = `The emulation's state could not be read: ${r.error}`;
+            }
+            rizinRenderRunStrip();
+            return false;
+        }
+        rizinState.retry.delete('emulation');
+        if (r.data.running !== true) {
+            rizinEmuLeave();
+            return true;
+        }
+        const same = rizinHex(emu.pc) === rizinHex(r.data.pc);
+        const kept = same ? { stopped: emu.stopped, ran: emu.ran, summary: emu.summary, assist: emu.assist } : { ran: '', assist: null };
+        rizinState.emu = { ...kept, ...r.data, stopped: r.data.stopped || kept.stopped || null };
+        rizinState.emuNote = '';
+        rizinRenderRunStrip();
+        rizinRenderPcMarks();
+        await rizinEmuAssist();
+        return true;
+    }
+    rizinRenderRunStrip();
+    return true;
+}
+
+// One request that changes the state (a run, or a skip of a call): the answer is the new state, the views
+// follow its PC, and the offer for the call there is asked for. One at a time (rizin answers one request at a
+// time, a run blocks up to its timeout); a refusal or a busy answer leaves the state, with its reason in the
+// strip; the end of the session and a rizin that lost the emulation leave the mode.
+async function rizinEmuPost(wait, path, body, ran) {
+    const sid = rizinState.session, emu = rizinState.emu;
+    if (!sid || !emu || !emu.running || rizinState.emuWait) return false;
+    const seq = ++rizinState.emuSeq;
+    rizinState.emuWait = wait;
+    rizinState.emuNote = '';
+    rizinRenderRunStrip();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/${path}`, { method: 'POST', body });
+    // The session ended (rizinSetUi left the mode) or another one took the tab: nothing of it is left to change
+    if (sid !== rizinState.session || seq !== rizinState.emuSeq) return false;
+    rizinState.emuWait = '';
+    if (!r.ok || r.data.running !== true) {
+        if (r.state === 'refused' && /not started/.test(r.error)) {
+            rizinEmuLeave();
+            rizinState.note = r.error;
+            rizinRenderState();
+            return false;
+        }
+        rizinState.emuNote = r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); nothing ran. Try again once it is free.`
+            : r.ok ? 'the server answered without a state' : r.error;
+        rizinRenderRunStrip();
+        if (r.state === 'busy') rizinPollSoon();        // the toolbar's busy goes once rizin is free
+        return false;
+    }
+    rizinState.emu = { ...r.data, ran, assist: null };
+    rizinRenderRunStrip();
+    const pc = rizinEmuPc();
+    if (pc) await rizinSeek(pc, 'emulation');
+    rizinRenderPcMarks();
+    await rizinEmuAssist();
+    return true;
+}
+
+// START: the emulation at the current address (rizin sets io.cache and the guards, and maps its stack). Its
+// refusal shows in the toolbar's state, where the strip is not yet.
+async function rizinEmuStart() {
+    const sid = rizinState.session;
+    if (!sid || rizinState.emuWait || rizinState.opening || (rizinState.emu && rizinState.emu.running)) return false;
+    const seq = ++rizinState.emuSeq;
+    rizinState.emuWait = 'start';
+    rizinState.note = '';
+    rizinRenderRunStrip();
+    rizinRenderState();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/emulation/start`,
+                             { method: 'POST', body: rizinState.seek ? { addr: rizinState.seek } : {} });
+    if (sid !== rizinState.session || seq !== rizinState.emuSeq) return false;
+    rizinState.emuWait = '';
+    if (!r.ok || r.data.running !== true) {
+        if (r.state === 'refused' || r.state === 'error' || r.ok) rizinState.note = r.ok ? 'the server answered without a state' : r.error;
+        rizinRenderRunStrip();
+        rizinRenderState();
+        if (r.state === 'busy') rizinPollSoon();
+        return false;
+    }
+    rizinState.emu = { ...r.data, ran: '', assist: null };
+    rizinState.emuNote = '';
+    rizinRenderRunStrip();
+    const pc = rizinEmuPc();
+    if (pc && pc !== rizinState.seek) await rizinSeek(pc, 'emulation');
+    rizinRenderPcMarks();
+    await rizinEmuAssist();
+    return true;
+}
+
+// STOP: leaves the emulation mode (the patches stay). It is no abort: while a run is in flight nothing goes out.
+async function rizinEmuStop() {
+    const sid = rizinState.session;
+    if (!sid || !rizinState.emu || rizinState.emuWait) return false;
+    const seq = ++rizinState.emuSeq;
+    rizinState.emuWait = 'stop';
+    rizinState.emuNote = '';
+    rizinRenderRunStrip();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/emulation/stop`, { method: 'POST' });
+    if (sid !== rizinState.session || seq !== rizinState.emuSeq) return false;
+    rizinState.emuWait = '';
+    if (!r.ok) {
+        rizinState.emuNote = r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); the emulation was not left. Try again once it is free.`
+            : r.error;
+        rizinRenderRunStrip();
+        if (r.state === 'busy') rizinPollSoon();
+        return false;
+    }
+    rizinEmuLeave();
+    return true;
+}
+
+// A run: one of the strip's kinds, or until with the address that the right-click menu gives. Anything else
+// (there is no step back) goes nowhere.
+function rizinEmuRun(kind, addr) {
+    const body = { kind: String(kind) };
+    if (kind === 'until') {
+        const at = rizinHex(addr);
+        if (!at) return Promise.resolve(false);
+        body.addr = at;
+    } else if (!RIZIN_EMU.kinds.includes(kind)) {
+        return Promise.resolve(false);
+    }
+    return rizinEmuPost(body.kind, 'emulation/run', body, body.kind);
+}
+
+// SKIP at a call the assistant answers for: the call is skipped with the value in the field (the offered one
+// unless it was edited; none leaves the return register as it is) and the stack correction the offer named.
+// Anywhere else, and where the assistant is off, it is the plain skip.
+function rizinEmuSkipCall() {
+    const emu = rizinState.emu, pc = rizinEmuPc();
+    if (!rizinState.session || !emu || !emu.running || rizinState.emuWait || !pc) return Promise.resolve(false);
+    const assist = emu.assist;
+    if (!assist || assist.addr !== pc || !assist.supported) return rizinEmuRun('skip');
+    const field = document.getElementById('rizin-run-assist-value');
+    const typed = field ? String(field.value).trim() : '';
+    const value = typed ? rizinHex(typed) : null;
+    if (typed && !value) {
+        rizinState.emuNote = `"${typed}" is no number: the value is decimal or 0x…`;
+        rizinRenderRunStrip();
+        return Promise.resolve(false);
+    }
+    return rizinEmuPost('skip', 'call', { addr: pc, value, stack_fix: assist.stack_fix }, 'skip');
+}
+
+// GO TO PC: every view at the PC, after the user went elsewhere
+function rizinEmuGoToPc() {
+    const pc = rizinEmuPc();
+    return pc ? rizinSeek(pc, 'emulation') : Promise.resolve(false);
+}
+
+// One click handler for the strip: a run (SKIP goes through the call assistant), GO TO PC or STOP
+function rizinOnRunClick(event) {
+    const button = event.target && event.target.closest ? event.target.closest('button') : null;
+    if (!button || button.disabled || button.hasAttribute('disabled')) return false;
+    const kind = button.getAttribute('data-rizin-run'), action = button.getAttribute('data-rizin-act');
+    if (kind === 'skip') return rizinEmuSkipCall();
+    if (kind) return rizinEmuRun(kind);
+    if (action === 'gotopc') return rizinEmuGoToPc();
+    if (action === 'stop') return rizinEmuStop();
+    return false;
 }
 
 // Wired once at start-up: Upload, a file dropped on the tab, OPEN ▾ closing

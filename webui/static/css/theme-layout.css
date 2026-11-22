@@ -2008,6 +2008,48 @@
     font-family: var(--cp-font-label);
     letter-spacing: .04em;
 }
+[data-theme] .rizin-run {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-muted);
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-left: 3px solid var(--cp-orange);
+    border-radius: 6px;
+}
+[data-theme] .rizin-run-pc,
+[data-theme] .rizin-run-pc-value,
+[data-theme] .rizin-run-reg-name,
+[data-theme] .rizin-run-why {
+    color: var(--cp-text);
+}
+[data-theme] .rizin-run-pc-label,
+[data-theme] .rizin-run-delta {
+    color: var(--cp-orange);
+}
+[data-theme] .rizin-run-reg {
+    border-left-color: var(--cp-orange);
+}
+[data-theme] .rizin-run-reg-value {
+    color: var(--cp-cyan);
+}
+[data-theme] .rizin-run-none,
+[data-theme] .rizin-run-more,
+[data-theme] .rizin-run-assist-label {
+    color: var(--cp-text-dim);
+}
+[data-theme] .rizin-run-why-wait,
+[data-theme] .rizin-run-assist-text {
+    color: var(--cp-amber);
+}
+[data-theme] .rizin-run-why-note {
+    color: var(--cp-red);
+}
+[data-theme] .rizin-run-assist {
+    font-family: var(--cp-font-label);
+}
+[data-theme] .rizin-run-value {
+    font-family: var(--cp-font-label);
+}
 [data-theme] .rizin-seek-input {
     background-color: var(--cp-bg);
     border-color: rgba(var(--cp-magenta-rgb), .35);
@@ -2124,6 +2166,12 @@
     background: rgba(var(--cp-magenta-rgb), .12);
     box-shadow: inset 0 0 0 1px rgba(var(--cp-magenta-rgb), .35);
 }
+[data-theme] .rizin-op.pc {
+    outline-color: var(--cp-orange);
+}
+[data-theme] .rizin-op.pc::before {
+    color: var(--cp-orange);
+}
 [data-theme] .rizin-console {
     background: var(--c-navy-990);
     border-color: var(--cp-line);
@@ -2167,6 +2215,9 @@
 [data-theme] .rizin-block.current .rizin-block-box {
     fill: rgba(var(--cp-magenta-rgb), .08);
     stroke: var(--cp-magenta);
+}
+[data-theme] .rizin-block.pc .rizin-block-box {
+    stroke: var(--cp-orange);
 }
 [data-theme] .rizin-block-addr {
     fill: var(--cp-cyan);

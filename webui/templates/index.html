@@ -19,8 +19,8 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=81">
-    <link rel="stylesheet" href="/static/css/theme-layout.css?v=5">
+    <link rel="stylesheet" href="/static/css/style.css?v=82">
+    <link rel="stylesheet" href="/static/css/theme-layout.css?v=6">
     <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=36">
 </head>
 <body>
@@ -1133,11 +1133,29 @@
                     <span class="rizin-state" id="rizin-state" role="status" hidden></span>
                     <button type="button" class="btn btn-sm btn-primary rizin-state-btn" id="rizin-state-btn" onclick="rizinReopen()" hidden>Reopen</button>
                     <span class="rizin-toolbar-gap"></span>
+                    <button type="button" class="btn btn-sm rizin-emu-start" id="rizin-emu-start" title="Start the emulation (ESIL) at the current address; nothing of the file runs on the VM" onclick="rizinEmuStart()" disabled>EMULATE</button>
                     <label class="rizin-seek-label" for="rizin-seek">SEEK</label>
                     <input type="text" id="rizin-seek" class="filter-input rizin-seek-input" placeholder="address, function or flag" autocomplete="off" spellcheck="false" onkeydown="if (event.key === 'Enter') rizinGo()">
                     <button type="button" class="btn btn-sm btn-primary" id="rizin-go" onclick="rizinGo()">GO</button>
                     <button type="button" class="btn btn-sm rizin-history" id="rizin-back" title="Back" aria-label="Back" onclick="rizinHistoryStep(-1)" disabled>◀</button>
                     <button type="button" class="btn btn-sm rizin-history" id="rizin-forward" title="Forward" aria-label="Forward" onclick="rizinHistoryStep(1)" disabled>▶</button>
+                </div>
+                <!-- The emulation's run line: only while it runs (rizinRenderRunStrip). One delegated click handler;
+                     there is no BACK (rizin's aesb restores no memory) and no UNTIL (it needs an address) -->
+                <div class="rizin-run" id="rizin-run" role="toolbar" aria-label="Emulation" onclick="rizinOnRunClick(event)" hidden>
+                    <div class="rizin-run-buttons">
+                        <button type="button" class="btn btn-sm btn-primary rizin-run-btn" data-rizin-run="cont" title="Run until a breakpoint, a trap or esil.timeout">CONT</button>
+                        <button type="button" class="btn btn-sm btn-primary rizin-run-btn" data-rizin-run="step" title="Run one instruction">STEP</button>
+                        <button type="button" class="btn btn-sm btn-primary rizin-run-btn" data-rizin-run="over" title="Run one instruction, a call as a whole">OVER</button>
+                        <button type="button" class="btn btn-sm btn-primary rizin-run-btn" data-rizin-run="skip" title="Skip the instruction; at a call the offered answer is applied">SKIP</button>
+                        <button type="button" class="btn btn-sm btn-primary rizin-run-btn" data-rizin-run="to_call" title="Run to the next call and stop before it">TO CALL</button>
+                        <button type="button" class="btn btn-sm rizin-run-btn" id="rizin-run-gotopc" data-rizin-act="gotopc" title="Show the PC in every view">GO TO PC</button>
+                        <button type="button" class="btn btn-sm rizin-run-btn" id="rizin-run-stop" data-rizin-act="stop" title="Leave the emulation">STOP</button>
+                    </div>
+                    <span class="rizin-run-pc" id="rizin-run-pc"></span>
+                    <span class="rizin-run-regs" id="rizin-run-regs"></span>
+                    <span class="rizin-run-why" id="rizin-run-why" role="status"></span>
+                    <span class="rizin-run-assist" id="rizin-run-assist" hidden></span>
                 </div>
                 <div class="rizin-work" id="rizin-work">
                     <div class="rizin-main">
@@ -1775,6 +1793,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
     </div>
 
-    <script src="/static/js/app.js?v=119"></script>
+    <script src="/static/js/app.js?v=120"></script>
 </body>
 </html>
