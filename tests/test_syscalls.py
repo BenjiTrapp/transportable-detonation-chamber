@@ -396,9 +396,13 @@ def test_classify_arm64_states(live_hex, owner, state, pattern):
 def test_classify_x64_hook_patterns():
     sc = _sc("x64")
     live = bytes.fromhex("e92b170080") + sc.stub_bytes[5:]
-    assert syscall_baseline.classify_stub(sc, live, "x64", "private")["pattern"] == "JMP rel32"
+    out = syscall_baseline.classify_stub(sc, live, "x64", "private")
+    assert (out["state"], out["pattern"]) == ("patched", "JMP rel32")
     live = bytes.fromhex("ff251a4c0300") + sc.stub_bytes[6:]
-    assert syscall_baseline.classify_stub(sc, live, "x64", "edr.dll")["pattern"] == "JMP [rip]"
+    out = syscall_baseline.classify_stub(sc, live, "x64", "edr.dll")
+    assert (out["state"], out["pattern"]) == ("hooked", "JMP [rip]")
+    out = syscall_baseline.classify_stub(sc, live, "x64", None)
+    assert (out["state"], out["pattern"]) == ("diverged", "JMP [rip]")
 
 
 @pytest.mark.parametrize("head_hex,pattern", [
@@ -411,6 +415,14 @@ def test_classify_x64_absolute_hook_patterns(head_hex, pattern):
     head = bytes.fromhex(head_hex)
     out = syscall_baseline.classify_stub(sc, head + sc.stub_bytes[len(head):], "x64", "edr.dll")
     assert (out["state"], out["pattern"]) == ("hooked", pattern)
+
+
+def test_x64_garbage_over_the_stub_follows_the_owner_too():
+    sc = _sc("x64")
+    live = b"\x11\x22\x33\x44\x55\x66\x77\x88" + sc.stub_bytes[8:]
+    states = {owner: syscall_baseline.classify_stub(sc, live, "x64", owner)["state"]
+              for owner in ("private", "edr.dll", None)}
+    assert states == {"private": "patched", "edr.dll": "hooked", None: "diverged"}
 
 
 def test_a_changed_syscall_number_alone_is_reported():
@@ -461,10 +473,11 @@ def test_classify_reports_the_compared_bytes_and_the_owner():
     assert set(out) == {"state", "pattern", "target_owner", "expected", "actual", "number_matches"}
 
 
-@pytest.mark.parametrize("owner", ["ntdll.dll", "NTDLL.DLL"])
-def test_a_jump_into_ntdll_itself_is_neither_hooked_nor_patched(owner):
-    live = bytes.fromhex("05 00 00 14 c0 03 5f d6".replace(" ", ""))
-    out = syscall_baseline.classify_stub(_sc("arm64"), live, "arm64", owner)
+@pytest.mark.parametrize("view,head", [("arm64", "0500001400000000"), ("x64", "e92b170080")])
+def test_a_jump_into_ntdll_itself_is_neither_hooked_nor_patched(view, head):
+    sc = _sc(view)
+    live = bytes.fromhex(head) + sc.stub_bytes[len(head) // 2:]
+    out = syscall_baseline.classify_stub(sc, live, view, "ntdll.dll")
     assert out["state"] == "diverged"
 
 
@@ -499,6 +512,13 @@ def _add(rd, rn, imm12, shift12=False):
 def test_x64_jump_target_of_hooks_whose_target_is_in_the_bytes(live_hex, base, target):
     live = bytes.fromhex(live_hex) + b"\x90" * 8
     assert syscall_baseline.jump_target(live, base, "x64") == target
+
+
+def test_x64_relative_results_wrap_at_64_bits_like_the_arm64_ones():
+    top = 0xFFFFFFFFFFFFFFF0
+    assert syscall_baseline.jump_target(bytes.fromhex("e920000000"), top, "x64") == 0x15
+    assert syscall_baseline.jump_pointer(bytes.fromhex("ff2520000000"), top, "x64") == 0x16
+    assert syscall_baseline.jump_target(_words(0x14000008), top, "arm64") == 0x10
 
 
 @pytest.mark.parametrize("live", [

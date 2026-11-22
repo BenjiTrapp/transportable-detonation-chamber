@@ -219,7 +219,8 @@ _X64_AFTER_MOV = 8
 
 
 def stub_prefix_len(sc: Syscall, view: str) -> int:
-    """How many bytes of the stub at `sc.rva` to read and compare."""
+    """How many bytes of the stub at `sc.rva` to *compare*. What to read from the process
+    is `READ_LEN`, which is longer: hooks are recognised on everything read."""
     n = min(PREFIX_LEN[view], len(sc.stub_bytes))
     if view == "x64":
         i = sc.stub_bytes.find(_X64_SYSCALL, _X64_AFTER_MOV)
@@ -239,6 +240,7 @@ STATE_UNREADABLE = "unreadable"
 OWNER_PRIVATE = "private"
 
 _MISS = object()
+_ADDRESS_MASK = 0xFFFFFFFFFFFFFFFF
 
 
 def _signed(value: int, bits: int) -> int:
@@ -267,17 +269,17 @@ def _x64_hook(regex: bytes, target=None, pointer=None):
 # send the owner lookup to the wrong place; what the bytes do show is the address of the
 # pointer, which the reader can follow.
 _X64_HOOKS = (
-    ("JMP rel32", _x64_hook(rb"\xe9.{4}", lambda b, base: base + 5 + _signed(
-        int.from_bytes(b[1:5], "little"), 32))),
-    ("JMP [rip]", _x64_hook(rb"\xff\x25.{4}", pointer=lambda b, base: base + 6 + _signed(
-        int.from_bytes(b[2:6], "little"), 32))),
+    ("JMP rel32", _x64_hook(rb"\xe9.{4}", lambda b, base: (base + 5 + _signed(
+        int.from_bytes(b[1:5], "little"), 32)) & _ADDRESS_MASK)),
+    ("JMP [rip]", _x64_hook(rb"\xff\x25.{4}", pointer=lambda b, base: (base + 6 + _signed(
+        int.from_bytes(b[2:6], "little"), 32)) & _ADDRESS_MASK)),
     ("MOV RAX; JMP RAX", _x64_hook(rb"\x48\xb8.{8}\xff\xe0", lambda b, base: int.from_bytes(
         b[2:10], "little"))),
     ("MOV R11; JMP R11", _x64_hook(rb"\x49\xbb.{8}\x41\xff\xe3", lambda b, base: int.from_bytes(
         b[2:10], "little"))),
     # push sign-extends its imm32, and ret pops the result
     ("PUSH; RET", _x64_hook(rb"\x68.{4}\xc3", lambda b, base: _signed(
-        int.from_bytes(b[1:5], "little"), 32) & 0xFFFFFFFFFFFFFFFF)),
+        int.from_bytes(b[1:5], "little"), 32) & _ADDRESS_MASK)),
 )
 
 _ARM64_BR_X16 = 0xD61F0200
@@ -287,7 +289,7 @@ def _arm64_b(live: bytes, base: int):
     w = _word(live)
     if w is None or w & 0xFC000000 != 0x14000000:
         return _MISS
-    return (base + _signed(w & 0x03FFFFFF, 26) * 4) & 0xFFFFFFFFFFFFFFFF, None
+    return (base + _signed(w & 0x03FFFFFF, 26) * 4) & _ADDRESS_MASK, None
 
 
 def _arm64_ldr_br(live: bytes, base: int):
@@ -296,7 +298,7 @@ def _arm64_ldr_br(live: bytes, base: int):
         return _MISS
     if w & 0xFF000000 != 0x58000000 or w & 0x1F != 16 or nxt != _ARM64_BR_X16:
         return _MISS
-    return None, (base + _signed((w >> 5) & 0x7FFFF, 19) * 4) & 0xFFFFFFFFFFFFFFFF
+    return None, (base + _signed((w >> 5) & 0x7FFFF, 19) * 4) & _ADDRESS_MASK
 
 
 def _arm64_adrp_add_br(live: bytes, base: int):
@@ -315,7 +317,7 @@ def _arm64_adrp_add_br(live: bytes, base: int):
     offset = (add >> 10) & 0xFFF
     if add & 0x00400000:
         offset <<= 12
-    return (((base & ~0xFFF) + (imm << 12)) + offset) & 0xFFFFFFFFFFFFFFFF, None
+    return (((base & ~0xFFF) + (imm << 12)) + offset) & _ADDRESS_MASK, None
 
 
 _ARM64_HOOKS = (
@@ -371,7 +373,8 @@ def classify_stub(sc: Syscall, live: bytes | None, view: str, owner: str | None)
 
     Which of hooked, patched, diverged follows from `owner`, the module that holds the
     jump target ("private" for memory no file backs, None if unresolved), not from the
-    instruction pattern: an EDR and malware use the same jumps."""
+    instruction pattern: an EDR and malware use the same jumps. A module is named by its
+    lower-case basename, as `ntdll.dll`; the caller normalises, nothing here does."""
     n = stub_prefix_len(sc, view)
     expected = sc.stub_bytes[:n]
     out = {
@@ -393,7 +396,7 @@ def classify_stub(sc: Syscall, live: bytes | None, view: str, owner: str | None)
     hit = _find_hook(live, 0, view)
     out["pattern"] = hit[0] if hit else None
     out["target_owner"] = owner
-    if owner is None or owner.lower() in ("ntdll.dll", sc.module.lower()):
+    if owner is None or owner in ("ntdll.dll", sc.module.lower()):
         out["state"] = STATE_DIVERGED
     elif owner == OWNER_PRIVATE:
         out["state"] = STATE_PATCHED
