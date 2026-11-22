@@ -549,8 +549,10 @@ def from_direct_stubs(hits, process=""):
     """Normalize the hits of a stub search (``syscall_scan.find_stubs_in_bytes`` or
     ``find_stubs_in_process``) into findings, one per syscall.
 
-    A stub whose function the sample does not import is a proven bypass of the import
-    path and carries the kind's full weight. A stub whose function it imports as well, or
+    A stub whose function the sample does not import, judged against its import table
+    expanded through the Win32 to Nt table, is a proven bypass of the import path and
+    carries the kind's full weight. The scanner only says so for such a table
+    (``import_present`` False); against a raw one it says None. A stub whose function it imports as well, or
     whose import table is unknown, or whose number this build does not have, is a hint:
     the same kind of fact held with less certainty, so it asks for a second source and
     scores at ``UNCORROBORATED`` until one agrees. A second kind would not say that.

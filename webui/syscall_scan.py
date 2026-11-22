@@ -508,7 +508,24 @@ def _is_imported(sc: Syscall, imports) -> bool:
     return not names.isdisjoint(imports)
 
 
-def _scan_chunk(data: bytes, view: str, numbers: dict, imports,
+def _import_present(sc: Syscall | None, imports, expanded_imports) -> bool | None:
+    """Whether the sample imports the syscall of a stub: True, False, or None for unknown.
+
+    Only a presence can be read off a raw import table. An absence cannot: a sample that
+    calls the documented Win32 function never imports the `Nt` name behind it, so against
+    its raw table the stub of that very syscall looks unimported, and an ordinary program
+    would read as a proven bypass. An absence is claimed only against `expanded_imports`,
+    which the caller has run through the Win32 to Nt table. A number the build does not
+    have names no function to look for."""
+    if sc is None:
+        return None
+    if any(table is not None and _is_imported(sc, table)
+           for table in (imports, expanded_imports)):
+        return True
+    return False if expanded_imports is not None else None
+
+
+def _scan_chunk(data: bytes, view: str, numbers: dict, imports, expanded_imports,
                 starts_below: int | None = None) -> list[dict]:
     decode, align = _STUB_NUMBER[view], _STUB_ALIGN[view]
     hits = []
@@ -528,10 +545,7 @@ def _scan_chunk(data: bytes, view: str, numbers: dict, imports,
             "view": view,
             "pattern": _STUB_PATTERN[view],
             "stub_hex": data[at:m.end("body")].hex(),
-            # an unnamed number has no import to look for, and no import table is no
-            # evidence of absence: both are unknown, which is not False
-            "import_present": (_is_imported(sc, imports)
-                               if sc is not None and imports is not None else None),
+            "import_present": _import_present(sc, imports, expanded_imports),
             "number_known": sc is not None,
         })
     return hits
@@ -543,19 +557,23 @@ def _shape_of(view: str) -> str:
     return view
 
 
-def find_stubs_in_bytes(data: bytes, baseline: Baseline,
-                        imports: set[str] | None = None) -> list[dict]:
+def find_stubs_in_bytes(data: bytes, baseline: Baseline, imports: set[str] | None = None,
+                        *, expanded_imports: set[str] | None = None) -> list[dict]:
     """The syscall stubs in `data`, in the shape of the baseline's view.
 
     A number the baseline holds names its syscall. One it does not is still a hit, with
-    `number_known` False: a stub built for another Windows build. `imports` are the
-    function names the sample imports; with them, `import_present` says whether the
-    syscall of a stub is among them. A stub whose function is not imported is a bypass of
-    the import path, not just a possible one. Without them it is None. Pass the Win32 names
-    that lead down to the syscall as well, if the sample's chain is known: a bare table of
-    `Nt` imports misses a sample that calls the Win32 wrapper and carries a stub too."""
+    `number_known` False: a stub built for another Windows build.
+
+    `import_present` says whether the sample imports the syscall of a stub, and is tri-state.
+    `imports` is the sample's raw import table: it can show that the function is imported
+    (True) but never that it is not, because the documented path goes through a Win32
+    function whose `Nt` name the table does not hold. `expanded_imports` is that table after
+    the Win32 to Nt table has been applied to it; only a set passed there can give False, a
+    proven bypass of the import path. It is keyword-only so that a raw table cannot be passed
+    into it by position. With neither, or with only a raw table that lacks the name, the
+    answer is None."""
     view = _shape_of(baseline.view)
-    return _scan_chunk(data, view, _numbers(baseline), imports)
+    return _scan_chunk(data, view, _numbers(baseline), imports, expanded_imports)
 
 
 class StubScan(list):
@@ -607,9 +625,11 @@ def _walk(reader: ProcessReader, found: StubScan):
 
 
 def find_stubs_in_process(reader: ProcessReader, baseline: Baseline,
-                          imports: set[str] | None = None) -> StubScan:
+                          imports: set[str] | None = None, *,
+                          expanded_imports: set[str] | None = None) -> StubScan:
     """The syscall stubs in the private, executable memory of the process behind `reader`,
-    each hit with an `address` where `find_stubs_in_bytes` has an `offset`.
+    each hit with an `address` where `find_stubs_in_bytes` has an `offset`. `imports` and
+    `expanded_imports` mean what they mean there.
 
     A baseline of another view or build is refused before anything is read: its numbers
     would name the wrong syscalls."""
@@ -635,7 +655,8 @@ def find_stubs_in_process(reader: ProcessReader, baseline: Baseline,
             if data is None:
                 unread.append(addr)
                 continue
-            for hit in _scan_chunk(data, view, numbers, imports, starts_below=_CHUNK):
+            for hit in _scan_chunk(data, view, numbers, imports, expanded_imports,
+                                   starts_below=_CHUNK):
                 found.append({("address" if key == "offset" else key):
                               (addr + value if key == "offset" else value)
                               for key, value in hit.items()})

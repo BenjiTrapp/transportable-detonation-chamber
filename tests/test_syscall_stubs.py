@@ -183,7 +183,7 @@ def test_every_baseline_view_has_a_search_shape():
 def test_a_stub_without_the_matching_import_weighs_more(x64_baseline):
     sc = x64_baseline.syscalls["NtAllocateVirtualMemory"]
     blob = bytes.fromhex("4c8bd1b8") + sc.number.to_bytes(4, "little") + bytes.fromhex("0f05")
-    without = syscall_scan.find_stubs_in_bytes(blob, x64_baseline, imports=set())
+    without = syscall_scan.find_stubs_in_bytes(blob, x64_baseline, expanded_imports=set())
     with_imp = syscall_scan.find_stubs_in_bytes(
         blob, x64_baseline, imports={"NtAllocateVirtualMemory"})
     assert without[0]["import_present"] is False
@@ -199,26 +199,63 @@ def test_the_import_of_the_zw_name_counts_as_the_import(x64_baseline):
     assert hit["import_present"] is True
 
 
-def test_another_function_in_the_import_table_is_not_the_import(x64_baseline):
+def test_another_function_in_the_expanded_table_is_not_the_import(x64_baseline):
     (hit,) = syscall_scan.find_stubs_in_bytes(
-        _x64_stub(0x18), x64_baseline, imports={"NtWriteVirtualMemory", "VirtualAlloc"})
+        _x64_stub(0x18), x64_baseline, expanded_imports={"NtWriteVirtualMemory", "VirtualAlloc"})
     assert hit["import_present"] is False
 
 
 def test_without_an_import_table_the_import_is_unknown_not_absent(x64_baseline):
     (hit,) = syscall_scan.find_stubs_in_bytes(_x64_stub(0x18), x64_baseline)
     assert hit["import_present"] is None
-    (hit,) = syscall_scan.find_stubs_in_bytes(_x64_stub(0x7FE), x64_baseline, imports=set())
+    (hit,) = syscall_scan.find_stubs_in_bytes(
+        _x64_stub(0x7FE), x64_baseline, expanded_imports=set())
     assert hit["import_present"] is None
 
 
-def _stub_findings(x64_baseline, imports, number=0x18):
-    hits = syscall_scan.find_stubs_in_bytes(_x64_stub(number), x64_baseline, imports=imports)
+def test_a_raw_import_table_can_show_a_presence_but_never_an_absence(x64_baseline):
+    # a sample that calls the Win32 wrapper does not import the Nt name: against its raw
+    # table the stub looks unimported, while the documented path is right there
+    raw = {"VirtualAllocEx", "kernel32.dll"}
+    (hit,) = syscall_scan.find_stubs_in_bytes(_x64_stub(0x18), x64_baseline, imports=raw)
+    assert hit["import_present"] is None
+    (hit,) = syscall_scan.find_stubs_in_bytes(_x64_stub(0x18), x64_baseline, imports=set())
+    assert hit["import_present"] is None
+    (hit,) = syscall_scan.find_stubs_in_bytes(
+        _x64_stub(0x18), x64_baseline, imports={"NtAllocateVirtualMemory"})
+    assert hit["import_present"] is True
+
+
+def test_a_raw_table_never_unlocks_the_weight_of_a_proven_bypass(x64_baseline):
+    raw = {"VirtualAllocEx"}
+    hits = syscall_scan.find_stubs_in_bytes(_x64_stub(0x18), x64_baseline, imports=raw)
+    (finding,) = memory_evidence.from_direct_stubs(hits, "s.exe")
+    assert finding["needs_corroboration"] is True
+    assert memory_evidence.score([finding])["score"] < \
+        memory_evidence.KINDS["direct_syscall_stub"]["weight"]
+
+
+def test_the_wrapper_in_the_expanded_table_leads_down_to_the_stub(x64_baseline):
+    # the caller has run the table: VirtualAllocEx became NtAllocateVirtualMemory
+    (hit,) = syscall_scan.find_stubs_in_bytes(
+        _x64_stub(0x18), x64_baseline, expanded_imports={"VirtualAllocEx", "NtAllocateVirtualMemory"})
+    assert hit["import_present"] is True
+
+
+def test_the_expanded_table_cannot_be_passed_by_position(x64_baseline):
+    # a caller holding a raw set must not land in the strong slot by accident
+    with pytest.raises(TypeError):
+        syscall_scan.find_stubs_in_bytes(_x64_stub(0x18), x64_baseline, set(), set())
+
+
+def _stub_findings(x64_baseline, imports=None, number=0x18, expanded=None):
+    hits = syscall_scan.find_stubs_in_bytes(
+        _x64_stub(number), x64_baseline, imports=imports, expanded_imports=expanded)
     return memory_evidence.from_direct_stubs(hits, "s.exe")
 
 
 def test_a_proven_bypass_carries_the_full_weight_of_the_kind(x64_baseline):
-    (finding,) = _stub_findings(x64_baseline, set())
+    (finding,) = _stub_findings(x64_baseline, expanded=set())
     assert finding["kind"] == "direct_syscall_stub"
     assert finding["base_weight"] == memory_evidence.KINDS["direct_syscall_stub"]["weight"]
     scored = memory_evidence.score([finding])
@@ -234,18 +271,18 @@ def test_a_stub_that_is_also_imported_is_held_with_less_confidence(x64_baseline)
 
 
 def test_an_unknown_import_table_does_not_prove_the_bypass(x64_baseline):
-    (unknown,) = _stub_findings(x64_baseline, None)
-    (absent,) = _stub_findings(x64_baseline, set())
+    (unknown,) = _stub_findings(x64_baseline)
+    (absent,) = _stub_findings(x64_baseline, expanded=set())
     assert memory_evidence.score([unknown])["score"] < memory_evidence.score([absent])["score"]
 
 
 def test_a_number_of_another_build_scores_as_a_hint_and_says_so(x64_baseline):
-    (finding,) = _stub_findings(x64_baseline, set(), number=0x7FE)
+    (finding,) = _stub_findings(x64_baseline, number=0x7FE, expanded=set())
     assert finding["kind"] == "direct_syscall_stub"
     assert finding["number_known"] is False
     assert "0x7fe" in finding["detail"].lower()
     assert memory_evidence.score([finding])["score"] < \
-        memory_evidence.score(_stub_findings(x64_baseline, set()))["score"]
+        memory_evidence.score(_stub_findings(x64_baseline, expanded=set()))["score"]
 
 
 def test_a_second_source_lifts_a_hint_to_full_confidence(x64_baseline):
@@ -260,14 +297,14 @@ def test_a_second_source_lifts_a_hint_to_full_confidence(x64_baseline):
 def test_the_finding_key_holds_no_address(x64_baseline):
     def key(offset):
         blob = b"\x90" * offset + _x64_stub(0x18)
-        hits = syscall_scan.find_stubs_in_bytes(blob, x64_baseline, imports=set())
+        hits = syscall_scan.find_stubs_in_bytes(blob, x64_baseline, expanded_imports=set())
         return memory_evidence.from_direct_stubs(hits, "s.exe")[0]["key"]
     assert key(10) == key(900)
 
 
 def test_the_finding_key_names_the_syscall_and_the_process(x64_baseline):
     def key(number, process="s.exe"):
-        hits = syscall_scan.find_stubs_in_bytes(_x64_stub(number), x64_baseline, imports=set())
+        hits = syscall_scan.find_stubs_in_bytes(_x64_stub(number), x64_baseline, expanded_imports=set())
         return memory_evidence.from_direct_stubs(hits, process)[0]["key"]
     assert key(0x18) != key(0x3A)
     assert key(0x18) != key(0x18, "other.exe")
@@ -276,7 +313,7 @@ def test_the_finding_key_names_the_syscall_and_the_process(x64_baseline):
 
 def test_copies_of_one_stub_are_one_finding_that_counts_them(x64_baseline):
     blob = _x64_stub(0x50) + b"\x90" * 8 + _x64_stub(0x50) + _x64_stub(0x3A)
-    hits = syscall_scan.find_stubs_in_bytes(blob, x64_baseline, imports=set())
+    hits = syscall_scan.find_stubs_in_bytes(blob, x64_baseline, expanded_imports=set())
     findings = memory_evidence.from_direct_stubs(hits, "s.exe")
     by_syscall = {f["syscall"]: f for f in findings}
     assert set(by_syscall) == {"NtProtectVirtualMemory", "NtWriteVirtualMemory"}
@@ -298,7 +335,7 @@ def test_malformed_or_empty_hits_make_no_finding(hits):
 
 
 def test_a_stub_finding_is_suppressed_by_the_host_baseline(x64_baseline, tmp_path):
-    findings = _stub_findings(x64_baseline, set())
+    findings = _stub_findings(x64_baseline, expanded=set())
     baseline = memory_evidence.MemoryBaseline(str(tmp_path / "baseline.json"))
     baseline.add(findings)
     scored = memory_evidence.score(findings, baseline)
@@ -490,9 +527,11 @@ def test_a_clean_process_reports_what_it_searched(x64_baseline):
 
 def test_the_process_import_table_is_applied(x64_baseline):
     reader = _space((PRIVATE_BASE, _x64_stub(0x18), _private()))
-    (hit,) = syscall_scan.find_stubs_in_process(reader, x64_baseline, imports=set())
+    (hit,) = syscall_scan.find_stubs_in_process(reader, x64_baseline, expanded_imports=set())
     assert hit["import_present"] is False
     (hit,) = syscall_scan.find_stubs_in_process(reader, x64_baseline)
+    assert hit["import_present"] is None
+    (hit,) = syscall_scan.find_stubs_in_process(reader, x64_baseline, imports={"VirtualAllocEx"})
     assert hit["import_present"] is None
 
 
