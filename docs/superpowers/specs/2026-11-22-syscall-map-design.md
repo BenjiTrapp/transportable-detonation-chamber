@@ -127,7 +127,8 @@ Neues Modul `webui/syscall_scan.py`, reines ctypes, kein zusätzliches Binary.
 - `EnumProcessModulesEx(…, LIST_MODULES_ALL)` und `GetModuleFileNameExW` liefern
   die geladenen Module mit Basisadresse und Größe. Daraus die Basis von
   `ntdll.dll`, und, wenn vorhanden, `win32u.dll`.
-- Für jeden Syscall der Baseline die Bytes an `base + rva` lesen.
+- Für jeden Syscall der Baseline die Bytes an `base + rva` lesen, und zwar so viele, wie die Sicht zur Erkennung braucht — auf ARM64 mehr als zum Vergleich, weil ein Hook der Form `ADRP; ADD; BR` erst in 12 Byte erkennbar ist.
+- **Den Eigentümer des Sprungziels in zwei Schritten bestimmen.** Folgt die Zieladresse direkt aus den Bytes (relativer Sprung oder eingebettete absolute Adresse), wird sie damit erfragt. Liest die Hook-Form ihr Ziel erst aus dem Speicher (`FF 25` auf x64, `LDR`+`BR` auf ARM64), ist aus den Bytes nur die Adresse des **Zeigers** bestimmbar; dort wird das Zeigerwort gelesen und erst dessen Ziel nach dem Eigentümer gefragt. Ohne diesen zweiten Schritt käme die häufigste EDR-Hook-Form immer als `diverged` durch, und `hooked` wäre für den Normalfall unerreichbar — womit die Trennung aus Ziel 4 ihren Zweck verlöre.
 - **Nur das Stub-Präfix vergleichen, nicht NTSleuths ganzes Fenster.**
   `stub_bytes` ist ein festes 32-Byte-Fenster, das über die Funktion
   hinausläuft: NTSleuths eigenes Beispiel für `NtCreateProcessEx` enthält hinter
@@ -161,6 +162,10 @@ gehört**, nicht das Befehlsmuster:
   `ntdll` ist, heißt das `hooked`. Das ist der Normalfall bei installiertem EDR.
 - Zeigt es in privaten, nicht von einer Datei gedeckten Speicher, heißt das
   `patched`. Das ist das Signal.
+- Zeigt es in `ntdll` selbst oder in das Modul des Stubs, heißt das `diverged`:
+  `hooked` ist für ein fremdes, dateigedecktes Modul reserviert und `patched`
+  für privaten Speicher. Ein modulinterner Sprung ist keins von beidem und wird
+  nicht geraten.
 - Weichen die Bytes ab, ist das Ziel aber nicht auflösbar, heißt das `diverged`.
   Dieser Fall wird nie stumm als `intact` geführt.
 
