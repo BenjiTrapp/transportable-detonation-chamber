@@ -274,6 +274,160 @@ def test_rizin_page_rows_say_what_the_server_answers():
     assert "no 32 MB limit" in limits, limits
 
 
+APP_JS = open(os.path.join(ROOT, "webui", "static", "js", "app.js"), encoding="utf-8").read()
+
+
+def _plain(text):
+    """A page or the help as one line of words: markup and line breaks gone, so that a sentence that wraps in the
+    source is found like any other."""
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text))
+
+
+def test_the_rizin_page_says_what_emulation_can_and_cannot_do():
+    """Task 14. The page about the tab has a section for the emulator, and it says what the feature is (no
+    process, the cache, the original untouched), what it is not (the Windows API, a step back) and what ends with
+    the session. The sentence it used to carry ("Static analysis only: no debugging, no patching") is gone.
+    The README names no route (docs/api.md has the one row each, see above), so this is checked on the page."""
+    rizin = _doc("rizin.md")
+    section = _plain(_section_of(rizin, "Emulation and patching"))   # the source wraps its lines anywhere
+    assert "no process" in section and "io.cache" in section
+    assert "the original file is never written" in section
+    assert "ESIL does not emulate the Windows API" in section
+    assert "what a run wrote ends with the session" in section
+    for part in ("The run strip", "The EMULATION pane", "Breakpoints", "API calls", "Patching",
+                 "What stays and what does not", "Re-analysing a decrypted range", "Export and the Submit tab"):
+        assert "\n### %s\n" % part in _section_of(rizin, "Emulation and patching"), "the emulation section lost %r" % part
+    assert "Static analysis only: no debugging, no patching" not in rizin
+    assert "Static analysis only: no debugging, no patching" not in README
+    # the tab table and the blurb of the README say the tab runs code now, and where
+    assert "**EMULATE**" in README and "no process" in README and "never writes the original" in README
+    # the console is no longer "no writing, no debugging"
+    assert "no writing, no debugging" not in _doc("configuration.md")
+    assert "no debugging |" not in _doc("api.md")
+
+
+def test_the_limits_the_rizin_page_names_are_the_code():
+    """A limit named in prose and absent from the code, or the other way round. Every number is read from the source
+    (the pairs of QUOTED_NUMBERS above do the same for the page's other numbers), and every limit that names a
+    control is held against the markup that carries it."""
+    import rizin_emulation
+    import rizin_sessions
+    rizin = _plain(_doc("rizin.md"))
+    limits = _section_of(_doc("rizin.md"), "Limitations")
+    for phrase in ("No step back", "STOP leaves the emulation mode; it does not abort a running command",
+                   "No breakpoint on/off", "no watchpoints", "No assembling", "x86-64 and x86-32 only",
+                   "at most 2000 bytes", "4094", "x86 only", "One stop reason covers two causes",
+                   "do not leave the tab", "mine: false", "above 2^53", "cannot be reached with the keyboard"):
+        assert phrase in limits, "the limitations of docs/rizin.md lost %r" % phrase
+    # no step back: the strip has these buttons and the server these kinds, and no back
+    strip = HELP[HELP.index('id="rizin-run"'):HELP.index('id="rizin-run-pc"')]
+    assert re.findall(r'data-rizin-(?:run|act)="(\w+)"', strip) == ["cont", "step", "over", "skip", "to_call", "gotopc", "stop"]
+    assert sorted(rizin_emulation.STEP_COMMANDS) == ["cont", "over", "skip", "step", "to_call", "until"]
+    assert "aesb" not in " ".join(rizin_emulation.STEP_COMMANDS.values())
+    # no on/off: the pane's rows and the routes carry none, and no watchpoint or breakpoint command passes the console
+    rows = APP_JS[APP_JS.index("function rizinEmuBreakpointsHtml"):APP_JS.index("function rizinEmuPatchesHeadHtml")]
+    assert re.findall(r'data-rizin-act="([\w-]+)"', rows) == ["unbreak"], "a breakpoint row has a control besides its remove"
+    # the numbers of the page
+    assert rizin_emulation.MAX_PATCH_BYTES == 2000 and "RIZIN_PATCH = { kinds: ['nop', 'flip', 'always', 'nocall'], maxBytes: 2000," in APP_JS
+    assert rizin_emulation.ASSIST_ARCH == "x86" and "arch: 'x86' }" in APP_JS
+    assert rizin_emulation.PATCH_KINDS == ("nop", "flip", "always", "nocall")
+    assert "(4000 digits)" in HELP and "%d digits" % (2 * rizin_emulation.MAX_PATCH_BYTES) in _plain(HELP)
+    assert rizin_sessions.RIZIN_STACK_ROWS == 16 and "16 words from the stack pointer" in rizin
+    # the gutter and the lines of DISASSEMBLY have no way in for the keyboard
+    lines = APP_JS[APP_JS.index("function rizinDisasmHtml"):APP_JS.index("function rizinAnalysisText")]
+    assert 'class="rizin-gutter' in lines and "tabindex" not in lines
+    # the 4094 of the page is the one the server's own comments name
+    assert "4094" in open(os.path.join(ROOT, "webui", "rizin_emulation.py"), encoding="utf-8").read()
+
+
+def test_the_rizin_page_quotes_the_filter_as_it_words_its_refusals():
+    """The console section says which commands are open and which are refused, and quotes the one refusal a reader
+    meets most (the executing `d` commands). The page is held against check_console_command itself: what it calls
+    open is open, what it calls refused is, and the quoted sentence is the one the filter answers."""
+    import rizin_sessions
+    check = rizin_sessions.check_console_command
+    console = _section_of(_doc("rizin.md"), "Console without a shell")
+    said = "'d' commands are not allowed: emulation runs from the EMULATION tab"
+    assert said in console
+    for command in ("dp", "dc", "ds", "dm", "dk", "dd", "dbt"):
+        assert check(command) == said, command
+        assert "`%s`" % command in console
+    # ood is an `o` command: the family is refused, with its own words, and the page lists it under `o` rather than here
+    row = next(line for line in console.splitlines() if said in line)
+    assert check("ood") == "'o' commands are not allowed" and "`ood`" in console and "`ood`" not in row
+    for command in ("wci", "wc+", "wa nop", "dbc 0x10 x", "dbC 0x10 x", "dbx 0x10 x", "dbw 0x10", "wu x", "wf x",
+                    "e esil.mdev.range=0x10", "e asm.assembler=x86.nasm"):
+        assert check(command), "the page says %r is refused; the filter lets it through" % command
+    for name in ("wci", "wc+", "wa", "dbc", "dbC", "dbx", "dbw"):
+        assert "`%s`" % name in console, "the console section does not name the refused %s" % name
+    for command in ("db @ 0x10", "db- @ 0x10", "db-*", "dblj", "dbd @ 0x10", "wx 9090 @ 0x10", "wc- 0x10 0x11", "wc-*", "wcj",
+                    "e esil.timeout=3", "e io.cache=true", "aepc 0x10", "aei", "aeim", "aes", "aeso", "aess", "aesu 0x10",
+                    "aec", "ar rax=1", "af @ 0x10", "/zj [[:print:]]{4,} r ascii"):
+        assert check(command) is None, "the page says %r is open; the filter refuses it: %s" % (command, check(command))
+    assert rizin_sessions._FAMILIES.replace("", " ").split() == list("apifCs/?xtbewd")
+    assert "`a p i f C s / ? x t b e w d`" in console
+
+
+# What the tab shows and what the pages quote of it, word for word: the app, the in-tab help, the guide.
+UI_WORDS = [
+    ("Patched by hand: these bytes were written here", True),
+    ("Clear rizin's whole cache", True),
+    ("These bytes end with the session: they are not saved with the project and not in an export.", True),
+    ("rizin has one cache, and what a run wrote is back only by running it again.", False),
+    ("No stack words to show: the stack pointer is outside the stack the emulation mapped, or that map is gone. "
+     "Restarting the emulation (STOP, then EMULATE) maps it again.", True),
+    ("Stopped: an invalid memory access, or the PC is in memory that cannot be executed", True),
+    ("Stopped at a breakpoint", False),
+    ("Stopped by esil.timeout: the run took too long", False),
+    ("Stopped: rizin cannot decode the instruction here", False),
+    ("a run ends by itself (esil.timeout) and cannot be interrupted", False),
+]
+
+
+def test_the_pages_quote_the_tabs_words_as_the_tab_has_them():
+    """Where the guide or the help quotes a string the tab shows, it is that string: read from app.js, not copied from
+    a note. (Round 1 of Task 14 found the pane telling the reader to press START, in a toolbar whose button says
+    EMULATE; the words were corrected in the app and are held here.)"""
+    page, help_text = _plain(_doc("rizin.md")), _plain(HELP)
+    for words, in_help in UI_WORDS:
+        # the app joins long sentences from pieces: each sentence of the quote is one string of the source
+        for sentence in re.split(r"(?<=\.) ", words):
+            assert sentence in APP_JS, "the app no longer says %r" % sentence
+        assert words in page, "docs/rizin.md does not quote %r" % words
+        if in_help:
+            assert words in help_text, "the in-tab help does not quote %r" % words
+    # the button that begins an emulation is the one the sentences name
+    assert re.search(r'<button[^>]*id="rizin-emu-start"[^>]*>EMULATE</button>', HELP)
+    assert "START in the toolbar" not in APP_JS and "then START)" not in APP_JS
+    # the menu's entries, and the pane's buttons, as they read
+    for label in ("NOP out", "Flip the jump", "Always jump", "Kill the call", "Bytes…", "Run to here"):
+        assert ">%s</button>" % label in HELP and label in page and label in help_text, label
+    for label in ("Export", "Re-analyse", "To the Submit tab"):
+        assert label in APP_JS and label in page, label
+    for strip in ("CONT", "STEP", "OVER", "SKIP", "TO CALL", "GO TO PC", "STOP"):
+        assert ">%s</button>" % strip in HELP and strip in page, strip
+    assert "EMULATION</button>" in HELP and "SET BY HAND" in APP_JS and "WRITTEN BY THE RUN" in APP_JS
+    assert "SET BY HAND" in page and "WRITTEN BY THE RUN" in page
+    # the help is read on the VM: it says what the guide says about the file, and not "only reads" any more
+    assert "only reads the file" not in HELP and "the file is only read" not in HELP
+    assert "read-only)" not in HELP.split("RIZIN tab", 1)[-1][:200]
+
+
+def test_the_security_notes_say_why_the_original_is_never_written():
+    """Two guards that do not depend on each other, and what the export leaves behind: held against the code that
+    makes each one true."""
+    notes = _plain(_section_of(_doc("configuration.md"), "Security Notes"))
+    for promise in ("never written", "two guards", "wci", "wc+", "-w", "Error writing change at 0x", ".patch.txt",
+                    "both SHA-256 digests", "io.cache", "disarmed", "submits nothing"):
+        assert promise in notes, "the Security Notes do not say %r" % promise
+    sessions = open(os.path.join(ROOT, "webui", "rizin_sessions.py"), encoding="utf-8").read()
+    start = sessions[sessions.index('self.args = [exe, "-q0"'):]
+    assert '"-w"' not in start[:400], "rizin is started with -w: the second guard is gone"
+    assert 'RIZIN_NOTE_SUFFIX = ".patch.txt"' in APP
+    assert "wc[+i]" in sessions, "the allowlist no longer refuses wci and wc+"
+    assert "_disarm_breakpoints" in sessions
+
+
 def test_help_lists_every_pipe_interception_route():
     routes = set()
     for m in re.finditer(r'@app\.route\("(/api/pipes/intercept[^"]*)"(?:, methods=\[([^\]]*)\])?', APP):
@@ -825,6 +979,18 @@ QUOTED_NUMBERS = [
     ("webui/rizin_sessions.py", "BIG_FILE", lambda v: "%d MB" % (v // (1024 * 1024)),
      [("docs/rizin.md", "up to %s"),                  # prose and the state diagram
       ("README.md", "up to %s")]),
+    ("webui/rizin_emulation.py", "MAX_PATCH_BYTES", lambda v: "%d" % v,
+     [("docs/rizin.md", "at most %s bytes")]),
+    ("webui/rizin_sessions.py", "ESIL_TIMEOUT", lambda v: "%d" % v,
+     [("docs/rizin.md", "`esil.timeout` (%s s,")]),
+    ("webui/rizin_sessions.py", "REANALYZE_SLACK", lambda v: "%d KB" % (v // 1024),
+     [("docs/rizin.md", "about %s of slack")]),
+    ("webui/rizin_sessions.py", "PROJECT_PATCH_CHARS", lambda v: "%d KB" % (v // 1024),
+     [("docs/rizin.md", "At most %s of patches")]),
+    ("webui/rizin_sessions.py", "ESIL_STACK_SIZE", lambda v: "%d KB" % (v // 1024),
+     [("docs/rizin.md", "The stack is %s")]),
+    ("webui/rizin_sessions.py", "MAX_REANALYZE_FUNCTIONS", lambda v: "%d" % v,
+     [("docs/rizin.md", "%s functions")]),
     ("webui/pipe_proxy.py", "MAX_LIVE_SESSIONS", lambda v: "%d" % v,
      [("docs/pipes.md", "at most %s live sessions"),
       ("docs/api.md", "429 with %s live sessions")]),

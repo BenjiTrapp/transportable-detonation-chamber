@@ -143,8 +143,10 @@ analysis, ELF analysis and rizin one button away
 </p>
 
 **Rizin** — rizin and rz-ghidra on the VM, driven from the browser: functions,
-disassembly, decompiler and control-flow graph at one current address, and a
-console whose commands pass an allowlist on the server ([Rizin](docs/rizin.md)).
+disassembly, decompiler and control-flow graph at one current address, a
+console whose commands pass an allowlist on the server, and an emulator that
+runs no process and never writes the original, with breakpoints, byte patches
+and a patched copy for the Submit tab ([Rizin](docs/rizin.md)).
 
 <p align="center">
   <img src="static/rizin.png" alt="The Rizin tab with pipesim.exe: the function list, the disassembly at the instruction that loads the pipe name, the control flow graph of that function and a console session that found the string and followed its reference" width="88%">
@@ -249,7 +251,7 @@ each of them can see is in [the guide's index](docs/README.md#detection-engines)
 | **ETW** | Multi-channel Event Log browser with live threat highlighting (see [ETW Browser](docs/web-ui.md#etw-browser)) |
 | **Hex** | Hex editor with data inspector, structure minimap, PE/ELF analysis and section inspection |
 | **FileMap** | Byteplot / entropy / PE-ELF structure planes side by side, import/export trees, click-to-offset |
-| **Rizin** | Reverse engineering with rizin and rz-ghidra on the VM, one session per browser tab (see [Rizin](docs/rizin.md)): OPEN a submitted sample, a dump, an upload or a VM path; FUNCTIONS, DISASSEMBLY, DECOMPILER and HEX beside the control flow GRAPH (tabs below 1400 px), all at one current address that a click, SEEK + GO, ◀ ▶ or a seek in the console moves; below, a CONSOLE for rizin commands (an allowlist on the server: no programs, no files), XREFS, STRINGS and IMPORTS; a right-click renames a function or comments an address, kept in a project; `aaa` up to 20 MB, `aa` and a Full analysis button above; Rizin buttons in the Submit history, Process Dump, Exit Capture, ThreatScan (result and history) and the Hex tab open a file here |
+| **Rizin** | Reverse engineering with rizin and rz-ghidra on the VM, one session per browser tab (see [Rizin](docs/rizin.md)): OPEN a submitted sample, a dump, an upload or a VM path; FUNCTIONS, DISASSEMBLY, DECOMPILER and HEX beside the control flow GRAPH (tabs below 1400 px), all at one current address that a click, SEEK + GO, ◀ ▶ or a seek in the console moves; below, a CONSOLE for rizin commands (an allowlist on the server: no programs, no writing to the file, no real debugging), XREFS, STRINGS, IMPORTS and an EMULATION pane; **EMULATE** runs the code in rizin's ESIL emulator (no process, the file untouched) with a run strip, breakpoints in the gutter, an API-call assistant, byte patches from the right-click menu, re-analysis of what a run decrypted, and an export of the patched copy that can be handed to Submit; a right-click also renames a function or comments an address, kept in a project with the patches and breakpoints; `aaa` up to 20 MB, `aa` and a Full analysis button above; Rizin buttons in the Submit history, Process Dump, Exit Capture, ThreatScan (result and history) and the Hex tab open a file here |
 | **LitterBox** | Files in the LitterBox sandbox with their static/dynamic/EDR results |
 | **Submit** | Detonation with stage-by-stage progress and combined verdict (EDR alerts, live memory, exit capture, network beaconing, LitterBox) with its VERDICT FLOW; the submission history with VERDICT HISTORY |
 

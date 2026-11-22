@@ -6426,13 +6426,14 @@ def test_rizin_emulation_pane_says_why_it_has_no_stack_or_no_emulation():
     """)
     assert "error" not in r, r.get("error")
     idle = r["idle"]
-    assert "no emulation" in idle["registers"].lower() and "START" in idle["registers"] and idle["inputs"] == 0, idle
+    assert "no emulation" in idle["registers"].lower() and "EMULATE" in idle["registers"] and idle["inputs"] == 0, idle
     assert "no emulation" in idle["stack"].lower(), idle
     assert idle["patches"] == 4 and idle["breakpoints"] == 2, "the lists need no emulation"
     empty = r["empty"]["stack"]
     assert r["empty"]["rows"] == 0
     assert "stack pointer" in empty and "outside" in empty and "gone" in empty, "R58 names both: " + empty
-    assert "STOP" in empty and "START" in empty, "R58 says restarting maps it again: " + empty
+    assert "STOP" in empty and "EMULATE" in empty and "START" not in empty, "R58 says restarting maps it again, by the button's name: " + empty
+    assert 'id="rizin-emu-start"' in _tab_markup("rizin") and ">EMULATE</button>" in _tab_markup("rizin"), "the toolbar's button is the one the sentences name"
     assert r["full"]["rows"] == 3 and "outside" not in r["full"]["stack"]
     assert "no emulation" in r["stopped"]["registers"].lower() and r["stopped"]["inputs"] == 0 and r["stopped"]["patches"] == 4
     assert r["noFile"] == "No file open."
@@ -7809,3 +7810,16 @@ def test_rizin_menu_patches_once_and_only_into_the_file_that_asked():
     assert "error" not in r, r.get("error")
     assert r["twice"] == {"posts": 1, "rows": 1, "marked": ["0x1400014b9"]}, "two clicks on one entry patched twice: " + str(r["twice"])
     assert r["late"] == {"marks": "null", "rows": []}, "a patch's late answer marked the lines of the file open now: " + str(r["late"])
+
+
+def test_rizin_help_and_the_pane_name_the_toolbars_button_and_the_assets_are_raised():
+    """Task 14: the pane said START in a toolbar whose button says EMULATE, and the in-tab help told the reader the file
+    "is only read" while the tab runs code. Both are corrected, and the asset version moved with them."""
+    html = _read(INDEX_HTML)
+    assert "app.js?v=127" not in html, "app.js and the help changed (the pane's words, the emulation's help), its version did not"
+    help_text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html))
+    for words in ("never writes the file", "EMULATE runs the code in rizin's ESIL emulator", "ESIL does not emulate the Windows API",
+                  "There is no step back", "STOP leaves the emulation instead of aborting a running command",
+                  "at most 2000 bytes (4000 digits)", "4 KB of slack", "To the Submit tab", "nothing is submitted until you press Detonate there"):
+        assert words in help_text, f"the in-tab help does not say {words!r}"
+    assert "START in the toolbar" not in _read(os.path.join(ROOT, "webui", "static", "js", "app.js"))

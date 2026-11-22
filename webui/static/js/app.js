@@ -25228,7 +25228,7 @@ function rizinEmuHandSignature(patches) {
 // Every register of the state in an editable field, in rizin's order. A register the last step or edit changed has a
 // sign (Δ), a bar and a heavier name, and says so to assistive technology: the colour does not carry it alone.
 function rizinEmuRegistersHtml(emu) {
-    if (!emu || emu.running !== true) return rizinEmuEmpty('No emulation is running: START in the toolbar begins one at the current address.');
+    if (!emu || emu.running !== true) return rizinEmuEmpty('No emulation is running: EMULATE in the toolbar begins one at the current address.');
     const regs = (Array.isArray(emu.registers) ? emu.registers : []).filter(reg => reg && typeof reg === 'object' && reg.name !== undefined && reg.name !== null);
     if (!regs.length) return rizinEmuEmpty('rizin listed no registers.');
     const changed = new Set(Array.isArray(emu.changed) ? emu.changed.map(String) : []);
@@ -25250,7 +25250,7 @@ function rizinEmuStackHtml(emu) {
     const stack = (Array.isArray(emu.stack) ? emu.stack : []).filter(row => row && typeof row === 'object');
     if (!stack.length) {
         return rizinEmuEmpty('No stack words to show: the stack pointer is outside the stack the emulation mapped, or that map is gone. '
-            + 'Restarting the emulation (STOP, then START) maps it again.');
+            + 'Restarting the emulation (STOP, then EMULATE) maps it again.');
     }
     return stack.map(row => {
         const addr = rizinHex(row.addr), value = rizinHex(row.value);
