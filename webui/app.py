@@ -7826,15 +7826,13 @@ def _ntsleuth_args(view, symbols=None):
     return args if symbols else args + ["--no-symbols"]
 
 
-def _extract_baseline(view, symbols):
-    """Extract the baseline of `view` for this system's build with NTSleuth and store it where the web UI reads
-    it. True when it did; False when NTSleuth is not installed for that view. Raises RuntimeError with the
-    reason when the run fails: nothing is stored then."""
-    exe, build = _ntsleuth_exe(view), _current_os_build()
+def _extract_baseline(view, symbols, build):
+    """Extract the baseline of `view` with NTSleuth and store it as the one of `build`, the build the caller is
+    keyed by, where the web UI reads it. True when it did; False when NTSleuth is not installed for that view.
+    Raises RuntimeError with the reason when the run fails: nothing is stored then."""
+    exe = _ntsleuth_exe(view)
     if not os.path.isfile(exe):
         return False
-    if not build:
-        raise RuntimeError("the build of this system cannot be determined")
     # NTSleuth writes output/syscalls.json beside where it runs; a file left by an earlier run must not pass
     output = os.path.join(NTSLEUTH_DIR, "output", "syscalls.json")
     try:
@@ -7874,7 +7872,7 @@ def _syscall_extract_job(build, view):
     why = None
     try:
         with _syscall_extract_serial:
-            if not _extract_baseline(view, _symbol_server_reachable()):
+            if not _extract_baseline(view, _symbol_server_reachable(), build):
                 why = f"NTSleuth is not installed for the {view} view ({_ntsleuth_exe(view)})"
     except Exception as exc:
         why = str(exc) or type(exc).__name__
@@ -7889,8 +7887,11 @@ def _syscall_extract_job(build, view):
 def _start_baseline_extraction(build, view):
     """Extract the baseline of `build` and `view` in a thread of its own, as a request must not wait for NTSleuth.
     False when one is running for that pair already, or failed too recently to try again: any number of requests
-    that find the baseline missing start one run between them."""
+    that find the baseline missing start one run between them. Nothing starts while tools are being updated: the
+    update replaces the NTSleuth binary, and a GET, which the maintenance gate lets through, may not run it."""
     key = (build, view)
+    if _updating_tools():
+        return False
     with _syscall_extract_lock:
         state = _syscall_extract_state
         failed = state["failed"].get(key)
@@ -7912,14 +7913,32 @@ def _load_syscall_baseline(path):
     stamp = (info.st_mtime_ns, info.st_size)
     with _syscall_baselines_lock:
         hit = _syscall_baselines.get(path)
-        if hit and hit[0] == stamp:
-            return hit[1]
-        loaded = syscall_baseline.load_baseline(path)
-        _syscall_baselines[path] = (stamp, loaded)
-        return loaded
+        if not hit or hit[0] != stamp:
+            # a file that cannot be loaded is remembered too, or every request would parse it again
+            try:
+                hit = (stamp, syscall_baseline.load_baseline(path))
+            except syscall_baseline.BaselineError as exc:
+                hit = (stamp, exc)
+            _syscall_baselines[path] = hit
+        if isinstance(hit[1], syscall_baseline.BaselineError):
+            raise syscall_baseline.BaselineError(str(hit[1]))
+        return hit[1]
+
+
+def _syscall_extracting():
+    """Whether NTSleuth is being run for a baseline. A tool update must wait for it: it replaces the binary."""
+    with _syscall_extract_lock:
+        return bool(_syscall_extract_state["running"])
+
+
+def _updating_tools():
+    manager = _update_manager
+    return manager is not None and bool(manager.maintenance)
 
 
 def _syscall_extraction_note(build, view):
+    if _updating_tools():
+        return " Tool updates are running: no extraction is started while NTSleuth is being updated."
     with _syscall_extract_lock:
         if (build, view) in _syscall_extract_state["running"]:
             return " It is being extracted in the background, try again in a few seconds."
@@ -7944,7 +7963,8 @@ def _syscall_baseline_for(view):
     try:
         return _load_syscall_baseline(path), None
     except syscall_baseline.BaselineError as exc:
-        return None, f"the syscall baseline is unusable: {exc}"
+        return None, (f"the syscall baseline is unusable: {exc}. It is not extracted again by itself: delete "
+                      f"{os.path.basename(path)} in {NTSLEUTH_BASELINE_DIR} to have it extracted anew.")
 
 
 def _get_syscall_baseline(view):
@@ -8142,7 +8162,9 @@ def api_syscalls_status():
         try:
             loaded = _load_syscall_baseline(os.path.join(NTSLEUTH_BASELINE_DIR, name))
         except syscall_baseline.BaselineError as exc:
-            entry.update(symbols=None, error=str(exc))
+            entry.update(symbols=None, error=str(exc),
+                         note="This file is unusable and is not replaced automatically: delete it to have the "
+                              "baseline extracted again.")
         else:
             entry.update(symbols=loaded.symbols, syscalls=len(loaded.syscalls))
             if not loaded.symbols:

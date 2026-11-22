@@ -1896,7 +1896,7 @@ def test_a_build_change_triggers_a_fresh_extraction(client, tdc, monkeypatch,
     calls = []
     monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")
     monkeypatch.setattr(tdc, "_extract_baseline",
-                        lambda view, symbols: calls.append((view, symbols)) or True)
+                        lambda view, symbols, build: calls.append((view, symbols)) or True)
     assert tdc._get_syscall_baseline("arm64") is None
     tdc._syscall_extract_state["thread"].join(5)
     assert calls and calls[0][0] == "arm64"
@@ -1929,7 +1929,7 @@ def test_the_catalog_says_when_its_parameters_are_incomplete(client, tdc, degrad
 def test_a_request_does_not_wait_for_the_extraction_and_two_start_one(client, tdc, monkeypatch, fake_baseline_dir):
     started, release, calls = threading.Event(), threading.Event(), []
 
-    def slow(view, symbols):
+    def slow(view, symbols, build):
         calls.append(view)
         started.set()
         release.wait(10)
@@ -1956,7 +1956,7 @@ def test_two_views_are_extracted_one_after_the_other(tdc, monkeypatch):
     # NTSleuth writes to one output folder: a second run must not start inside the first
     inside, overlap, entered, release = [], [], threading.Event(), threading.Event()
 
-    def slow(view, symbols):
+    def slow(view, symbols, build):
         inside.append(view)
         overlap.append(len(inside))
         entered.set()
@@ -1981,7 +1981,7 @@ def test_two_views_are_extracted_one_after_the_other(tdc, monkeypatch):
 def test_a_failed_extraction_is_not_retried_at_once_and_says_why(client, tdc, monkeypatch, fake_baseline_dir):
     calls = []
     monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")
-    monkeypatch.setattr(tdc, "_extract_baseline", lambda view, symbols: calls.append(view) or False)
+    monkeypatch.setattr(tdc, "_extract_baseline", lambda view, symbols, build: calls.append(view) or False)
     client.get("/api/syscalls/baseline?view=arm64")
     tdc._syscall_extract_state["thread"].join(5)
     again = client.get("/api/syscalls/baseline?view=arm64")
@@ -1996,7 +1996,7 @@ def test_a_failed_extraction_is_not_retried_at_once_and_says_why(client, tdc, mo
 
 
 def test_an_extraction_that_raises_is_a_failure_with_its_reason(client, tdc, monkeypatch, fake_baseline_dir):
-    def boom(view, symbols):
+    def boom(view, symbols, build):
         raise RuntimeError("NTSleuth exited with 3: bad")
 
     monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")
@@ -2008,7 +2008,7 @@ def test_an_extraction_that_raises_is_a_failure_with_its_reason(client, tdc, mon
 
 
 def test_an_x86_view_or_an_unknown_build_starts_no_extraction(tdc, monkeypatch):
-    monkeypatch.setattr(tdc, "_extract_baseline", lambda view, symbols: pytest.fail("extracted"))
+    monkeypatch.setattr(tdc, "_extract_baseline", lambda view, symbols, build: pytest.fail("extracted"))
     monkeypatch.setattr(tdc, "_current_os_build", lambda: None)
     assert tdc._get_syscall_baseline("arm64") is None
     monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")
@@ -2038,7 +2038,7 @@ def _fake_ntsleuth(tdc, monkeypatch, tmp_path, payload, returncode=0):
 
 def test_the_extraction_stores_a_baseline_the_web_ui_then_loads(tdc, monkeypatch, tmp_path):
     runs = _fake_ntsleuth(tdc, monkeypatch, tmp_path, _fixture("arm64"))
-    assert tdc._extract_baseline("arm64", False) is True
+    assert tdc._extract_baseline("arm64", False, "26300.1") is True
     path = pathlib.Path(tdc.NTSLEUTH_BASELINE_DIR) / "ntsleuth-26300.1-arm64.json"
     stored = syscall_baseline.load_baseline(str(path))
     assert (stored.build, stored.view, stored.symbols) == ("26300.1", "arm64", False)
@@ -2049,12 +2049,12 @@ def test_the_extraction_stores_a_baseline_the_web_ui_then_loads(tdc, monkeypatch
 
 def test_an_extraction_with_symbols_is_not_marked_degraded(tdc, monkeypatch, tmp_path):
     _fake_ntsleuth(tdc, monkeypatch, tmp_path, _fixture("arm64")["syscalls"])        # a bare list also loads
-    assert tdc._extract_baseline("arm64", True) is True
+    assert tdc._extract_baseline("arm64", True, "26300.1") is True
     assert tdc._get_syscall_baseline("arm64").symbols is True
 
 
 def test_an_extraction_without_ntsleuth_says_so_and_writes_nothing(tdc, tmp_path):
-    assert tdc._extract_baseline("arm64", True) is False
+    assert tdc._extract_baseline("arm64", True, "26300.1") is False
     assert not os.path.exists(tdc.NTSLEUTH_BASELINE_DIR)
 
 
@@ -2067,7 +2067,7 @@ def test_an_extraction_without_ntsleuth_says_so_and_writes_nothing(tdc, tmp_path
 def test_a_failed_extraction_stores_no_baseline(tdc, monkeypatch, tmp_path, payload, returncode, why):
     _fake_ntsleuth(tdc, monkeypatch, tmp_path, payload, returncode)
     with pytest.raises(RuntimeError) as err:
-        tdc._extract_baseline("arm64", True)
+        tdc._extract_baseline("arm64", True, "26300.1")
     assert why in str(err.value)
     assert not os.path.exists(tdc.NTSLEUTH_BASELINE_DIR)
 
@@ -2078,7 +2078,7 @@ def test_an_output_left_by_an_earlier_run_is_not_taken_for_this_ones(tdc, monkey
     stale.parent.mkdir()
     stale.write_text(json.dumps(_fixture("arm64")))
     with pytest.raises(RuntimeError, match="no usable JSON"):
-        tdc._extract_baseline("arm64", True)
+        tdc._extract_baseline("arm64", True, "26300.1")
 
 
 def test_a_baseline_that_changed_on_disk_is_read_again(client, tdc, fake_baseline_dir):
@@ -2589,3 +2589,98 @@ def test_the_symbol_server_is_reachable_when_a_connection_opens(app_module, monk
 
     monkeypatch.setattr(socket, "create_connection", refuse)
     assert app_module._symbol_server_reachable() is False
+
+
+# --- review fixes: maintenance, the running extraction, the build of a job, a corrupt baseline ---
+
+class _Maintenance:
+    maintenance = True
+
+
+def test_no_extraction_starts_while_the_tools_are_being_updated(client, tdc, monkeypatch, fake_baseline_dir):
+    # a GET passes the maintenance gate; the extraction it would start must not, or an update could swap the
+    # NTSleuth binary out from under it
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")
+    monkeypatch.setattr(tdc, "_extract_baseline", lambda *a: pytest.fail("extracted during maintenance"))
+    monkeypatch.setattr(tdc, "_update_manager", _Maintenance())
+    for path in ("/api/syscalls/baseline?view=arm64", "/api/syscalls/NtClose?view=arm64"):
+        r = client.get(path)
+        assert r.status_code == 503 and "being updated" in r.get_json()["error"]
+    assert tdc._syscall_extract_state["thread"] is None and not tdc._syscall_extracting()
+    assert tdc._start_baseline_extraction("26300.1", "arm64") is False
+
+
+def test_the_extraction_starts_once_the_update_is_over(client, tdc, monkeypatch, fake_baseline_dir):
+    calls = []
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")
+    monkeypatch.setattr(tdc, "_extract_baseline", lambda view, symbols, build: calls.append(view) or True)
+    monkeypatch.setattr(tdc, "_update_manager", _Maintenance())
+    client.get("/api/syscalls/baseline?view=arm64")
+    monkeypatch.setattr(tdc, "_update_manager", type("Idle", (), {"maintenance": False})())
+    client.get("/api/syscalls/baseline?view=arm64")
+    tdc._syscall_extract_state["thread"].join(5)
+    assert calls == ["arm64"]
+
+
+def test_a_running_extraction_is_visible_to_the_update_preconditions(tdc, monkeypatch):
+    started, release = threading.Event(), threading.Event()
+
+    def slow(view, symbols, build):
+        started.set()
+        release.wait(10)
+        return True
+
+    monkeypatch.setattr(tdc, "_extract_baseline", slow)
+    assert tdc._syscall_extracting() is False
+    assert tdc._start_baseline_extraction("26300.1", "arm64")
+    try:
+        assert started.wait(5) and tdc._syscall_extracting() is True
+    finally:
+        release.set()
+    tdc._syscall_extract_state["thread"].join(5)
+    assert tdc._syscall_extracting() is False
+
+
+def test_the_job_extracts_the_build_it_is_keyed_by(tdc, monkeypatch):
+    seen = []
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26400.9")        # moved since the job was started
+    monkeypatch.setattr(tdc, "_extract_baseline", lambda view, symbols, build: seen.append(build) or True)
+    assert tdc._start_baseline_extraction("26300.1", "arm64")
+    tdc._syscall_extract_state["thread"].join(5)
+    assert seen == ["26300.1"]
+
+
+def test_the_extraction_files_the_baseline_under_the_build_it_was_asked_for(tdc, monkeypatch, tmp_path):
+    _fake_ntsleuth(tdc, monkeypatch, tmp_path, _fixture("arm64"))
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26400.9")
+    assert tdc._extract_baseline("arm64", True, "26300.1") is True
+    stored = sorted(p.name for p in pathlib.Path(tdc.NTSLEUTH_BASELINE_DIR).iterdir())
+    assert stored == ["ntsleuth-26300.1-arm64.json"]
+
+
+def test_a_corrupt_baseline_is_parsed_once_not_on_every_request(client, tdc, fake_baseline_dir, monkeypatch):
+    (fake_baseline_dir / "ntsleuth-26220.5770-arm64.json").write_text("{not json")
+    parsed = []
+    real = syscall_baseline.load_baseline
+    monkeypatch.setattr(syscall_baseline, "load_baseline",
+                        lambda path: (parsed.append(path) if "arm64" in path else None) or real(path))
+    for _ in range(3):
+        assert client.get("/api/syscalls/baseline?view=arm64").status_code == 503
+        client.get("/api/syscalls/status")
+    assert len(parsed) == 1
+    # a file written again is looked at again
+    document = _fixture("arm64")
+    (fake_baseline_dir / "ntsleuth-26220.5770-arm64.json").write_text(json.dumps(document))
+    assert client.get("/api/syscalls/baseline?view=arm64").status_code == 200
+    assert len(parsed) == 2
+
+
+def test_a_corrupt_baseline_says_it_is_not_replaced_by_itself(client, tdc, fake_baseline_dir, monkeypatch):
+    path = fake_baseline_dir / "ntsleuth-26220.5770-arm64.json"
+    path.write_text("{not json")
+    monkeypatch.setattr(tdc, "_extract_baseline", lambda *a: pytest.fail("a corrupt file is not re-extracted"))
+    error = client.get("/api/syscalls/baseline?view=arm64").get_json()["error"]
+    assert "unusable" in error and "delete" in error and path.name in error
+    entry = client.get("/api/syscalls/status").get_json()["baselines"][0]
+    assert entry["symbols"] is None and "delete" in entry["note"] and "not replaced" in entry["note"]
+    assert tdc._syscall_extract_state["thread"] is None
