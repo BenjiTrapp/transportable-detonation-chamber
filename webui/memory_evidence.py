@@ -29,6 +29,8 @@ import os
 import threading
 import time
 
+from syscall_baseline import STATE_HOOKED, STATE_PATCHED
+
 # --- Evidence classes -------------------------------------------------
 # Ordered by how hard the signal is to fake or to trip accidentally.
 EVIDENCE_STRUCTURAL = "structural"   # verifiable fact about memory layout
@@ -148,6 +150,27 @@ KINDS = {
         "weight": 0.8, "evidence": EVIDENCE_STRING, "corroborate": True,
         "baseline_exempt": True,
         "label": "Randomly named pipe",
+    },
+    # Syscall stubs. A stub that jumps into private memory has no benign
+    # explanation, so a patched stub weighs what a disk/memory diff weighs and
+    # needs no second opinion. A hook into a module is what EDR products do to
+    # every process they watch: it is weak evidence, kept below
+    # CORROBORATION_MIN_WEIGHT so it can never vouch for another source. Known
+    # EDR hooks never get this far: the hook allowlist marks them in the scan
+    # result. Not baseline_exempt: unlike the pipe catalog, nothing here may
+    # outlive a clean-host baseline.
+    "syscall_stub_patched": {
+        "weight": 4.0, "evidence": EVIDENCE_STRUCTURAL, "corroborate": False,
+        "label": "Syscall stub redirected into private memory",
+    },
+    "syscall_stub_hooked": {
+        "weight": 0.8, "evidence": EVIDENCE_BEHAVIORAL, "corroborate": True,
+        "label": "Syscall stub hooked by an unlisted module",
+    },
+    # A stub carried by the sample itself instead of calling ntdll.
+    "direct_syscall_stub": {
+        "weight": 4.0, "evidence": EVIDENCE_STRUCTURAL, "corroborate": False,
+        "label": "Syscall stub outside ntdll (direct syscall)",
     },
     # Extracted artifacts
     "dumped_hidden_module": {
@@ -471,6 +494,54 @@ def from_hsb(result, process=""):
                 # not proof: it needs a second source.
                 "needs_corroboration": True if (limited or not high) else KINDS["sleeping_beacon"].get("corroborate", True),
                 "limitation": result.get("limitation"),
+            },
+        ))
+    return out
+
+
+def from_syscall_scan(result, process=""):
+    """Normalize a syscall scan (``syscall_scan.measure``) into findings.
+
+    Only a patched stub and a hook not on the allowlist score. The allowlist
+    verdict is read from each deviation's ``allowlisted`` flag: only the scan
+    knows the build and view it was measured against. ``diverged`` stays out on
+    purpose: with no resolvable jump target a hook cannot be told from a patch,
+    and a guess is worse than a gap. It remains visible in the scan's own map.
+
+    Identity is the syscall and the module its jump lands in, never the RVA or
+    the target address, which move between builds and runs.
+    """
+    out = []
+    if not isinstance(result, dict):
+        return out
+    for dev in result.get("deviations") or []:
+        state = dev.get("state")
+        if state == STATE_PATCHED:
+            kind = "syscall_stub_patched"
+        elif state == STATE_HOOKED and not dev.get("allowlisted"):
+            kind = "syscall_stub_hooked"
+        else:
+            continue
+        name = dev.get("name") or ""
+        owner = (dev.get("target_owner") or "").lower()
+        pattern = dev.get("pattern")
+        out.append(MemoryFinding(
+            source="syscalls", kind=kind, process=process,
+            detail=f"{name} -> {owner or 'unresolved target'}"
+                   + (f" ({pattern})" if pattern else ""),
+            identity=(name.lower(), owner),
+            extra={
+                "syscall": name,
+                "module": dev.get("module"),
+                "number": dev.get("number"),
+                "rva": dev.get("rva"),
+                "pattern": pattern,
+                "target_owner": dev.get("target_owner"),
+                "expected": dev.get("expected"),
+                "actual": dev.get("actual"),
+                "number_matches": dev.get("number_matches"),
+                "build": result.get("build"),
+                "view": result.get("view"),
             },
         ))
     return out
@@ -884,6 +955,7 @@ def collect(results, process=""):
     findings += from_process_dump(results.get("process_dump") or {}, process)
     findings += from_hsb(results.get("hunt_sleeping_beacons") or {}, process)
     findings += from_beaconeye(results.get("beaconeye") or {}, process)
+    findings += from_syscall_scan(results.get("syscall_scan"), process)
 
     # Exit-time dump analysis already produces normalized findings.
     exit_res = results.get("exit_capture_result") or {}

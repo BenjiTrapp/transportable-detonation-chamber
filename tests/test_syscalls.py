@@ -5,6 +5,7 @@ import os
 
 import pytest
 
+import memory_evidence
 import syscall_baseline
 import syscall_scan
 
@@ -1647,3 +1648,107 @@ def test_the_set_count_in_the_result_is_that_of_the_scanned_pair(arm64_baseline,
     al.add_from(_result_with(view="x64", syscall="NtOpenFile"))
     out = syscall_scan.measure(arm64_baseline, _hooked_reader(arm64_baseline), allowlist=al)
     assert out["allowlist"]["entries"] == 2
+
+
+# --- scoring in the evidence model --------------------------------------------------------
+
+def test_a_patched_stub_reaches_suspicious_on_its_own():
+    findings = memory_evidence.from_syscall_scan(
+        _result_with(state="patched", syscall="NtWriteVirtualMemory", owner="private"),
+        "sample.exe")
+    scored = memory_evidence.score(findings)
+    assert scored["score"] >= memory_evidence.VERDICT_SUSPICIOUS
+    assert [f["kind"] for f in findings] == ["syscall_stub_patched"]
+    assert scored["label"] == "SUSPICIOUS"
+
+
+def test_an_allowlisted_hook_produces_no_finding():
+    findings = memory_evidence.from_syscall_scan(
+        _result_with(state="hooked", owner="edr.dll", allowlisted=True), "sample.exe")
+    assert findings == []
+
+
+def test_a_hook_that_is_not_allowlisted_produces_a_small_finding():
+    findings = memory_evidence.from_syscall_scan(
+        _result_with(state="hooked", owner="unknown.dll", allowlisted=False), "sample.exe")
+    assert [f["kind"] for f in findings] == ["syscall_stub_hooked"]
+    assert memory_evidence.score(findings)["score"] < memory_evidence.VERDICT_SUSPICIOUS
+
+
+def test_a_hook_without_the_flag_counts_as_not_allowlisted():
+    # a scan without an allowlist carries no flag at all
+    findings = memory_evidence.from_syscall_scan(
+        _result_with(state="hooked", owner="unknown.dll"), "sample.exe")
+    assert [f["kind"] for f in findings] == ["syscall_stub_hooked"]
+
+
+@pytest.mark.parametrize("state", ["intact", "diverged", "unreadable"])
+def test_intact_diverged_and_unreadable_produce_no_findings(state):
+    assert memory_evidence.from_syscall_scan(_result_with(state=state), "sample.exe") == []
+
+
+def test_a_result_without_deviations_or_not_a_result_produces_no_findings():
+    assert memory_evidence.from_syscall_scan({"deviations": []}, "sample.exe") == []
+    assert memory_evidence.from_syscall_scan({}, "sample.exe") == []
+    assert memory_evidence.from_syscall_scan(None, "sample.exe") == []
+
+
+def test_a_partial_result_still_scores_the_stubs_it_did_read():
+    result = _result_with(state="patched", owner="private")
+    result["partial"] = True
+    assert [f["kind"] for f in memory_evidence.from_syscall_scan(result, "sample.exe")] \
+        == ["syscall_stub_patched"]
+
+
+def test_none_of_the_new_kinds_is_baseline_exempt():
+    for kind in ("syscall_stub_patched", "syscall_stub_hooked", "direct_syscall_stub"):
+        assert not memory_evidence.KINDS[kind].get("baseline_exempt")
+
+
+def test_a_repeated_scan_matches_the_same_finding_whatever_moved():
+    first = _result_with(state="patched", owner="private", rva=0x1000, expected="aa",
+                         actual="bb")
+    second = _result_with(state="patched", owner="private", rva=0x2000, expected="cc",
+                          actual="dd")
+    key = lambda r: memory_evidence.from_syscall_scan(r, "sample.exe")[0]["key"]
+    assert key(first) == key(second)
+
+
+def test_the_key_names_the_syscall_the_owner_and_the_process():
+    def key(process="sample.exe", **kw):
+        return memory_evidence.from_syscall_scan(
+            _result_with(state="hooked", **kw), process)[0]["key"]
+    base = key(owner="a.dll")
+    assert key(owner="b.dll") != base
+    assert key(owner="a.dll", syscall="NtClose") != base
+    assert key(owner="a.dll", process="other.exe") != base
+    assert key(owner="A.DLL") == base
+
+
+def test_a_known_finding_is_suppressed_by_the_host_baseline(tmp_path):
+    # the new kinds take part in baseline suppression like every other source
+    findings = memory_evidence.from_syscall_scan(
+        _result_with(state="patched", owner="private"), "sample.exe")
+    baseline = memory_evidence.MemoryBaseline(str(tmp_path / "baseline.json"))
+    baseline.add(findings)
+    scored = memory_evidence.score(findings, baseline)
+    assert scored["score"] == 0 and scored["suppressed_count"] == 1
+
+
+def test_a_stub_without_an_owner_still_scores_as_patched():
+    result = _result_with(state="patched", owner=None)
+    findings = memory_evidence.from_syscall_scan(result, "sample.exe")
+    assert [f["kind"] for f in findings] == ["syscall_stub_patched"]
+
+
+def test_syscall_findings_flow_through_collect():
+    results = {"syscall_scan": _result_with(state="patched", owner="private")}
+    findings = memory_evidence.collect(results, process="sample.exe")
+    assert [f["kind"] for f in findings] == ["syscall_stub_patched"]
+    assert findings[0]["process"] == "sample.exe"
+
+
+def test_collect_ignores_a_missing_or_malformed_syscall_scan():
+    assert memory_evidence.collect({}, process="sample.exe") == []
+    assert memory_evidence.collect({"syscall_scan": None}, process="sample.exe") == []
+    assert memory_evidence.collect({"syscall_scan": "x"}, process="sample.exe") == []
