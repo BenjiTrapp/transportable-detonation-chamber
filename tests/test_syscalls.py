@@ -47,14 +47,6 @@ def test_catalog_filters_by_name_and_module_and_pages():
     assert all("Virtual" in i["name"] for i in page["items"])
 
 
-def test_catalog_accepts_a_number_as_decimal_or_hex():
-    bl = syscall_baseline.parse_baseline(_fixture("arm64"), "26220.5770", "arm64")
-    for query in ("0x3a", "0X3A", "58", "3a"):
-        page = syscall_baseline.catalog(bl, query=query)
-        assert [i["name"] for i in page["items"]] == ["NtWriteVirtualMemory"], query
-    assert syscall_baseline.catalog(bl, query="0x3")["total"] == 0
-
-
 def test_catalog_name_match_ignores_case_and_sorts_by_module_then_number():
     bl = syscall_baseline.parse_baseline(_fixture("arm64"), "26220.5770", "arm64")
     page = syscall_baseline.catalog(bl, query="NT")
@@ -133,15 +125,87 @@ def test_missing_optional_fields_default():
     assert (sc.return_type, sc.calling_convention, sc.parameters) == ("", "", [])
 
 
-def test_duplicate_name_or_number_keeps_the_first_entry():
-    payload = {"syscalls": [_entry(), _entry(syscall_number=2), _entry(name="NtBaz")]}
+def test_duplicate_name_keeps_the_first_entry_and_is_not_reported_as_skipped():
+    payload = {"syscalls": [_entry(), _entry(syscall_number=2, rva=32)]}
+    bl = syscall_baseline.parse_baseline(payload, "1.0", "x64")
+    assert bl.syscalls["NtFoo"].number == 1
+    assert bl.skipped == []
+
+
+def test_duplicate_number_under_another_name_is_skipped():
+    payload = {"syscalls": [_entry(), _entry(name="NtBaz")]}
     bl = syscall_baseline.parse_baseline(payload, "1.0", "x64")
     assert list(bl.syscalls) == ["NtFoo"]
     assert bl.by_number[("ntdll.dll", 1)].name == "NtFoo"
-    assert bl.skipped == ["NtFoo", "NtBaz"]
+    assert bl.skipped == ["NtBaz"]
 
 
-@pytest.mark.parametrize("payload", [[], {}, {"syscalls": "x"}, {"syscalls": None}])
+@pytest.mark.parametrize("bad_first", [True, False])
+def test_a_name_is_never_in_syscalls_and_skipped_at_once(bad_first):
+    bad, good = _entry(stub_bytes=""), _entry(syscall_number=2)
+    payload = {"syscalls": [bad, good] if bad_first else [good, bad]}
+    bl = syscall_baseline.parse_baseline(payload, "1.0", "x64")
+    assert "NtFoo" in bl.syscalls
+    assert not set(bl.skipped) & set(bl.syscalls)
+
+
+def test_the_fixtures_carry_ntsleuths_entry_schema():
+    entry_keys = {"calling_convention", "is_true_syscall", "module", "name", "return_type",
+                  "rva", "syscall_number", "stub_bytes", "parameters"}
+    param_keys = {"name", "type", "sal_annotation", "is_const", "is_input", "is_optional",
+                  "is_output", "is_pointer"}
+    for view in ("arm64", "x64"):
+        for entry in _fixture(view)["syscalls"]:
+            assert set(entry) - {"stub_bytes"} == entry_keys - {"stub_bytes"}, entry["name"]
+            assert isinstance(entry["rva"], int) and isinstance(entry["syscall_number"], int)
+            assert all(set(p) == param_keys for p in entry["parameters"]), entry["name"]
+
+
+def test_parameter_flags_survive_parsing():
+    bl = syscall_baseline.parse_baseline(_fixture("x64"), "26220.5770", "x64")
+    last = bl.syscalls["NtWriteVirtualMemory"].parameters[-1]
+    assert (last["is_output"], last["is_optional"], last["is_pointer"]) == (True, True, True)
+    assert bl.syscalls["NtWriteVirtualMemory"].parameters[0]["is_input"] is True
+
+
+def test_catalog_number_query_is_a_union_with_the_name_match():
+    payload = {"syscalls": [
+        _entry(name="NtAddAtom", syscall_number=0x11),
+        _entry(name="NtWriteVirtualMemory", syscall_number=0x3A),
+        _entry(name="NtOther", syscall_number=0xADD),
+    ]}
+    bl = syscall_baseline.parse_baseline(payload, "1.0", "x64")
+
+    def names(query):
+        return [i["name"] for i in syscall_baseline.catalog(bl, query=query)["items"]]
+
+    assert names("add") == ["NtAddAtom", "NtOther"]
+    assert names("0x3a") == ["NtWriteVirtualMemory"]
+    assert names("0X3A") == ["NtWriteVirtualMemory"]
+    assert names("58") == ["NtWriteVirtualMemory"]
+    assert names("3a") == ["NtWriteVirtualMemory"]
+    assert names("0x3") == []
+
+
+def test_catalog_clamps_negative_paging():
+    bl = syscall_baseline.parse_baseline(_fixture("arm64"), "26220.5770", "arm64")
+    page = syscall_baseline.catalog(bl, offset=-5, limit=-1)
+    assert (page["offset"], page["limit"], page["items"]) == (0, 0, [])
+
+
+def test_load_baseline_accepts_a_bare_list_and_the_syscalls_object(tmp_path):
+    entries = _fixture("x64")["syscalls"]
+    for label, payload in (("list", entries), ("object", {"syscalls": entries})):
+        d = tmp_path / label
+        d.mkdir()
+        p = d / "ntsleuth-26220.5770-x64.json"
+        p.write_text(json.dumps(payload))
+        bl = syscall_baseline.load_baseline(str(p))
+        assert bl.syscalls["NtWriteVirtualMemory"].number == 0x3A, label
+        assert bl.skipped == ["NtNotASyscall", "NtNoStub"], label
+
+
+@pytest.mark.parametrize("payload", [{}, {"syscalls": "x"}, {"syscalls": None}, "x", None, 7])
 def test_payload_without_a_syscall_list_raises(payload):
     with pytest.raises(syscall_baseline.BaselineError):
         syscall_baseline.parse_baseline(payload, "1.0", "x64")
@@ -162,9 +226,3 @@ def test_load_baseline_rejects_unreadable_and_unnamed_files(tmp_path):
     other.write_text('{"syscalls": []}')
     with pytest.raises(syscall_baseline.BaselineError):
         syscall_baseline.load_baseline(str(other))
-
-
-def test_catalog_clamps_negative_paging():
-    bl = syscall_baseline.parse_baseline(_fixture("arm64"), "26220.5770", "arm64")
-    page = syscall_baseline.catalog(bl, offset=-5, limit=-1)
-    assert (page["offset"], page["limit"], page["items"]) == (0, 0, [])

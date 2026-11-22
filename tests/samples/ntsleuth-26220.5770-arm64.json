@@ -6,40 +6,70 @@
       "syscall_number": 24,
       "rva": 651680,
       "return_type": "NTSTATUS",
-      "calling_convention": "__cdecl",
+      "calling_convention": "stdcall",
       "parameters": [
         {
           "name": "ProcessHandle",
           "type": "HANDLE",
-          "sal_annotation": "_In_"
+          "sal_annotation": "_In_",
+          "is_const": false,
+          "is_input": true,
+          "is_optional": false,
+          "is_output": false,
+          "is_pointer": false
         },
         {
           "name": "BaseAddress",
           "type": "PVOID*",
-          "sal_annotation": "_Inout_"
+          "sal_annotation": "_Inout_",
+          "is_const": false,
+          "is_input": true,
+          "is_optional": false,
+          "is_output": true,
+          "is_pointer": true
         },
         {
           "name": "ZeroBits",
           "type": "ULONG_PTR",
-          "sal_annotation": "_In_"
+          "sal_annotation": "_In_",
+          "is_const": false,
+          "is_input": true,
+          "is_optional": false,
+          "is_output": false,
+          "is_pointer": false
         },
         {
           "name": "RegionSize",
           "type": "PSIZE_T",
-          "sal_annotation": "_Inout_"
+          "sal_annotation": "_Inout_",
+          "is_const": false,
+          "is_input": true,
+          "is_optional": false,
+          "is_output": true,
+          "is_pointer": true
         },
         {
           "name": "AllocationType",
           "type": "ULONG",
-          "sal_annotation": "_In_"
+          "sal_annotation": "_In_",
+          "is_const": false,
+          "is_input": true,
+          "is_optional": false,
+          "is_output": false,
+          "is_pointer": false
         },
         {
           "name": "Protect",
           "type": "ULONG",
-          "sal_annotation": "_In_"
+          "sal_annotation": "_In_",
+          "is_const": false,
+          "is_input": true,
+          "is_optional": false,
+          "is_output": false,
+          "is_pointer": false
         }
       ],
-      "stub_bytes": "010300d4c0035fd6210300d4c0035fd6410300d4c0035fd6610300d4c0035fd6",
+      "stub_bytes": "010300d4c0035fd60000000000000000210300d4c0035fd60000000000000000",
       "is_true_syscall": true
     },
     {
@@ -48,35 +78,60 @@
       "syscall_number": 58,
       "rva": 652224,
       "return_type": "NTSTATUS",
-      "calling_convention": "__cdecl",
+      "calling_convention": "stdcall",
       "parameters": [
         {
           "name": "ProcessHandle",
           "type": "HANDLE",
-          "sal_annotation": "_In_"
+          "sal_annotation": "_In_",
+          "is_const": false,
+          "is_input": true,
+          "is_optional": false,
+          "is_output": false,
+          "is_pointer": false
         },
         {
           "name": "BaseAddress",
           "type": "PVOID",
-          "sal_annotation": "_In_"
+          "sal_annotation": "_In_",
+          "is_const": false,
+          "is_input": true,
+          "is_optional": false,
+          "is_output": false,
+          "is_pointer": true
         },
         {
           "name": "Buffer",
           "type": "PVOID",
-          "sal_annotation": "_In_reads_bytes_(NumberOfBytesToWrite)"
+          "sal_annotation": "_In_reads_bytes_(NumberOfBytesToWrite)",
+          "is_const": false,
+          "is_input": true,
+          "is_optional": false,
+          "is_output": false,
+          "is_pointer": true
         },
         {
           "name": "NumberOfBytesToWrite",
           "type": "SIZE_T",
-          "sal_annotation": "_In_"
+          "sal_annotation": "_In_",
+          "is_const": false,
+          "is_input": true,
+          "is_optional": false,
+          "is_output": false,
+          "is_pointer": false
         },
         {
           "name": "NumberOfBytesWritten",
           "type": "PSIZE_T",
-          "sal_annotation": "_Out_opt_"
+          "sal_annotation": "_Out_opt_",
+          "is_const": false,
+          "is_input": false,
+          "is_optional": true,
+          "is_output": true,
+          "is_pointer": true
         }
       ],
-      "stub_bytes": "410700d4c0035fd6610700d4c0035fd6810700d4c0035fd6a10700d4c0035fd6",
+      "stub_bytes": "410700d4c0035fd60000000000000000610700d4c0035fd60000000000000000",
       "is_true_syscall": true
     },
     {
@@ -85,35 +140,60 @@
       "syscall_number": 80,
       "rva": 652576,
       "return_type": "NTSTATUS",
-      "calling_convention": "__cdecl",
+      "calling_convention": "stdcall",
       "parameters": [
         {
           "name": "ProcessHandle",
           "type": "HANDLE",
-          "sal_annotation": "_In_"
+          "sal_annotation": "_In_",
+          "is_const": false,
+          "is_input": true,
+          "is_optional": false,
+          "is_output": false,
+          "is_pointer": false
         },
         {
           "name": "BaseAddress",
           "type": "PVOID*",
-          "sal_annotation": "_Inout_"
+          "sal_annotation": "_Inout_",
+          "is_const": false,
+          "is_input": true,
+          "is_optional": false,
+          "is_output": true,
+          "is_pointer": true
         },
         {
           "name": "RegionSize",
           "type": "PSIZE_T",
-          "sal_annotation": "_Inout_"
+          "sal_annotation": "_Inout_",
+          "is_const": false,
+          "is_input": true,
+          "is_optional": false,
+          "is_output": true,
+          "is_pointer": true
         },
         {
           "name": "NewProtect",
           "type": "ULONG",
-          "sal_annotation": "_In_"
+          "sal_annotation": "_In_",
+          "is_const": false,
+          "is_input": true,
+          "is_optional": false,
+          "is_output": false,
+          "is_pointer": false
         },
         {
           "name": "OldProtect",
           "type": "PULONG",
-          "sal_annotation": "_Out_"
+          "sal_annotation": "_Out_",
+          "is_const": false,
+          "is_input": false,
+          "is_optional": false,
+          "is_output": true,
+          "is_pointer": true
         }
       ],
-      "stub_bytes": "010a00d4c0035fd6210a00d4c0035fd6410a00d4c0035fd6610a00d4c0035fd6",
+      "stub_bytes": "010a00d4c0035fd60000000000000000210a00d4c0035fd60000000000000000",
       "is_true_syscall": true
     },
     {
@@ -122,9 +202,9 @@
       "syscall_number": 4148,
       "rva": 7296,
       "return_type": "HWND",
-      "calling_convention": "__cdecl",
+      "calling_convention": "stdcall",
       "parameters": [],
-      "stub_bytes": "810602d4c0035fd6a10602d4c0035fd6c10602d4c0035fd6e10602d4c0035fd6",
+      "stub_bytes": "810602d4c0035fd60000000000000000a10602d4c0035fd60000000000000000",
       "is_true_syscall": true
     },
     {
@@ -133,9 +213,9 @@
       "syscall_number": 0,
       "rva": 653568,
       "return_type": "NTSTATUS",
-      "calling_convention": "__cdecl",
+      "calling_convention": "stdcall",
       "parameters": [],
-      "stub_bytes": "010000d4c0035fd6210000d4c0035fd6410000d4c0035fd6610000d4c0035fd6",
+      "stub_bytes": "010000d4c0035fd60000000000000000210000d4c0035fd60000000000000000",
       "is_true_syscall": false
     },
     {
@@ -144,12 +224,17 @@
       "syscall_number": 15,
       "rva": 651552,
       "return_type": "NTSTATUS",
-      "calling_convention": "__cdecl",
+      "calling_convention": "stdcall",
       "parameters": [
         {
           "name": "Handle",
           "type": "HANDLE",
-          "sal_annotation": "_In_"
+          "sal_annotation": "_In_",
+          "is_const": false,
+          "is_input": true,
+          "is_optional": false,
+          "is_output": false,
+          "is_pointer": false
         }
       ],
       "is_true_syscall": true

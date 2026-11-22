@@ -43,12 +43,15 @@ class Baseline:
     skipped: list = field(default_factory=list)
 
 
-def parse_baseline(payload: dict, build: str, view: str) -> Baseline:
+def parse_baseline(payload: list | dict, build: str, view: str) -> Baseline:
     """Entries that cannot be measured are skipped (and named in `skipped`), never fatal:
-    one malformed entry must not take the whole baseline down."""
-    raw = payload.get("syscalls") if isinstance(payload, dict) else None
+    one malformed entry must not take the whole baseline down.
+
+    NTSleuth's README does not fix the top level, so both a bare list of entries and
+    `{"syscalls": [...]}` are accepted."""
+    raw = payload.get("syscalls") if isinstance(payload, dict) else payload
     if not isinstance(raw, list):
-        raise BaselineError("baseline has no 'syscalls' list")
+        raise BaselineError("baseline is neither a list of entries nor has a 'syscalls' list")
     bl = Baseline(build=build, view=view)
     for i, entry in enumerate(raw):
         label = entry.get("name") if isinstance(entry, dict) else None
@@ -60,12 +63,17 @@ def parse_baseline(payload: dict, build: str, view: str) -> Baseline:
             print(f"[syscall_baseline] skipping {label}: {why}")
             bl.skipped.append(label)
             continue
-        if sc.name in bl.syscalls or (sc.module, sc.number) in bl.by_number:
-            print(f"[syscall_baseline] skipping {label}: duplicate name or number")
+        if sc.name in bl.syscalls:
+            print(f"[syscall_baseline] ignoring duplicate {label}, keeping the first")
+            continue
+        if (sc.module, sc.number) in bl.by_number:
+            print(f"[syscall_baseline] skipping {label}: number already taken")
             bl.skipped.append(label)
             continue
         bl.syscalls[sc.name] = sc
         bl.by_number[(sc.module, sc.number)] = sc
+    # an entry skipped earlier may share its name with one accepted later, or the reverse
+    bl.skipped = list(dict.fromkeys(n for n in bl.skipped if n not in bl.syscalls))
     return bl
 
 
@@ -121,7 +129,7 @@ def find_baseline(directory: str, build: str, view: str) -> str | None:
 
 
 def _as_number(query: str) -> int | None:
-    """A query is a syscall number if it reads as decimal, or as hex with or without `0x`."""
+    """A query reads as a syscall number if it is decimal, or hex with or without `0x`."""
     for base in (10, 16):
         try:
             return int(query, base)
@@ -132,7 +140,10 @@ def _as_number(query: str) -> int | None:
 
 def catalog(baseline: Baseline, query: str = "", module: str = "",
             offset: int = 0, limit: int = 200) -> dict:
-    """One page of the syscalls matching `query` (name substring or exact number) and `module`."""
+    """One page of the syscalls matching `query` and `module`.
+
+    A query that reads as a number matches that number OR the name substring: hex
+    digits alone (`add`) are a number too, and must still find `NtAddAtom`."""
     query = query.strip()
     number = _as_number(query) if query else None
     needle = query.lower()
@@ -141,12 +152,8 @@ def catalog(baseline: Baseline, query: str = "", module: str = "",
     for sc in baseline.syscalls.values():
         if wanted_module and sc.module.lower() != wanted_module:
             continue
-        if query:
-            if number is not None:
-                if sc.number != number:
-                    continue
-            elif needle not in sc.name.lower():
-                continue
+        if query and needle not in sc.name.lower() and sc.number != number:
+            continue
         hits.append(sc)
     hits.sort(key=lambda sc: (sc.module.lower(), sc.number))
     offset, limit = max(offset, 0), max(limit, 0)
