@@ -7,9 +7,15 @@ Two things leave this module. `syscall_signatures.json` holds the hook and patch
 What the catalog is, and is not. Recognising a form stays in the code: `syscall_baseline.classify_stub` decodes the
 displacement, it does not compare bytes. The catalog gives the analyst the family name and the note of a form that
 has been recognised, and it lets a deviation be checked for being covered. Its `weight` is **advisory and not the
-score**: scoring lives in `memory_evidence.KINDS`, and nothing here feeds it. A test pins the patterns of the file
-against the code's, in both directions, so that the two cannot drift apart. The file is a bare JSON array, as
+score**: scoring lives in `memory_evidence.KINDS`, and nothing here feeds it. The file is a bare JSON array, as
 `pipe_signatures.json` is, and cannot carry a comment: this is where it says so about itself.
+
+What a test pins, and what it does not. For the **hook shapes** ("Inline hook") the code recognises and labels each
+one, so a test requires every such entry to match an example that `syscall_baseline._find_hook` decodes under the
+same name, and the file cannot grow a hook the code does not know. For the **patch shapes** ("Stub patch") the code
+recognises nothing: `classify_stub` calls any stub that differs and has no jump `diverged`, whether it holds `RET`,
+`XOR EAX, EAX; RET` or noise. Those entries are checked only against hand-written examples in the test, and this
+catalog is the one place that names them. Adding a patch pattern is therefore not validated by the code.
 
 Malware chooses much of what a rule would say: a file name, a process name, a module. That text goes into a rule
 the detection engine hot-reloads, and a rule that does not parse takes every other rule of its directory down with

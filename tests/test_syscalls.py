@@ -3449,7 +3449,9 @@ def test_the_signature_file_is_documented_as_advisory_where_it_cannot_say_so_its
     module, loader = (" ".join(t.split()) for t in (syscall_rules.__doc__, syscall_rules.load_signatures.__doc__))
     for text in (module, loader):
         assert "advisory" in text and "not the score" in text and "memory_evidence.KINDS" in text
-    assert "in both directions" in module and "classify_stub" in module
+    # and it does not claim more of the pin than it proves: patch shapes are named by the catalog alone
+    assert "in both directions" not in module
+    assert "hook shapes" in module and "patch shapes" in module and "not validated by the code" in module
 
 
 # Neutralised stubs, as bytes. The classifier does not know them as a jump, only as a stub that is not the baseline's
@@ -3459,49 +3461,77 @@ _PATCH_BYTES = {
 }
 
 
-@pytest.mark.parametrize("view", ["x64", "arm64"])
-def test_every_entry_of_the_catalog_is_one_the_code_recognises(view):
-    """The pin in the other direction: each entry of this view must match an example the code itself classifies. An
-    entry that is added without one, or one that matches only bytes the classifier calls intact, fails here."""
+def _pin_proof(view, entry):
+    """`[(label, ok)]` for each example (a hook or a patch, as bytes) that `entry` matches; empty when it matches none.
+
+    For an "Inline hook" entry `ok` means the code decodes the example: `_find_hook` returns the very label the
+    example is filed under, and `classify_stub` says `hooked`. For a "Stub patch" entry the code recognises nothing:
+    `ok` only means the example is not a jump and the stub is not intact, which `classify_stub` says of any bytes."""
     baseline = syscall_baseline.parse_baseline(_fixture(view), BUILD, view)
     sc = baseline.syscalls["NtAllocateVirtualMemory"]
     read = syscall_baseline.READ_LEN[view]
-    pad = "90" * read
-    hooks = {n: h + "00" * 8 for n, h in _HOOK_BYTES[view].items()}
-    patches = {f"patch {i}": b for i, b in enumerate(_PATCH_BYTES[view])}
-    entries = [s for s in syscall_rules.default_signatures() if s.get("view") == view]
+    examples = {n: h + "00" * 8 for n, h in _HOOK_BYTES[view].items()}
+    examples.update({f"patch {i}": b for i, b in enumerate(_PATCH_BYTES[view])})
+    proof = []
+    for label, live in examples.items():
+        if not syscall_rules.matching(live, view, [entry]):
+            continue
+        data = bytes.fromhex((live + "90" * read)[:2 * read])
+        jump = syscall_baseline._find_hook(data, 0, view)
+        # the scanner names an owner only for a jump it can follow; a patch has none
+        state = syscall_baseline.classify_stub(sc, data, view, "edr.dll" if jump else None)["state"]
+        if entry["family"] == "Inline hook":
+            ok = jump is not None and jump[0] == label and state == "hooked"
+        else:
+            ok = jump is None and state == "diverged"
+        proof.append((label, ok))
+    return proof
+
+
+@pytest.mark.parametrize("view", ["x64", "arm64"])
+def test_every_hook_entry_of_the_catalog_is_decoded_by_the_classifier(view):
+    """The pin that means something: the code recognises and labels each hook shape, and the catalog may name no
+    hook shape the code does not decode. An entry added without an example, or whose example the classifier labels
+    otherwise, fails here."""
+    entries = [s for s in syscall_rules.default_signatures() if s.get("view") == view and s["family"] == "Inline hook"]
     assert entries
     for entry in entries:
-        proof = []
-        for label, live in {**hooks, **patches}.items():
-            if not syscall_rules.matching(live, view, [entry]):
-                continue
-            data = bytes.fromhex((live + pad)[:2 * read])
-            jump = syscall_baseline._find_hook(data, 0, view)
-            # the scanner names an owner only for a jump it can follow; a patch has none
-            owner = "edr.dll" if jump is not None else None
-            state = syscall_baseline.classify_stub(sc, data, view, owner)["state"]
-            if entry["family"] == "Inline hook":
-                ok = jump is not None and jump[0] == label and state == "hooked"
-            else:
-                ok = jump is None and state == "diverged"
-            proof.append((label, ok))
-        assert proof, f"no example the code classifies matches {entry}"
+        proof = _pin_proof(view, entry)
+        assert proof, f"no example the classifier decodes matches {entry}"
         assert all(ok for _, ok in proof), (entry, proof)
 
 
-def test_an_entry_of_the_catalog_without_a_code_backed_example_is_caught(tmp_path):
-    """The check above has teeth: an entry for a form no example covers has no proof, and a patch pattern that
-    matches the baseline's own intact stub would be classified intact."""
-    view = "x64"
-    baseline = syscall_baseline.parse_baseline(_fixture(view), BUILD, view)
-    sc = baseline.syscalls["NtAllocateVirtualMemory"]
-    stray = {"family": "Stub patch", "pattern": "4c8bd1b8", "match": "prefix", "weight": 3.0, "view": view}
-    live = sc.stub_bytes[:syscall_baseline.READ_LEN[view]]
-    assert syscall_rules.matching(live.hex(), view, [stray])
-    assert syscall_baseline.classify_stub(sc, live, view, None)["state"] == "intact"
-    unknown = {"family": "Inline hook", "pattern": "cd2e", "match": "prefix", "weight": 1.0, "view": view}
-    assert not any(syscall_rules.matching(h + "00" * 8, view, [unknown]) for h in _HOOK_BYTES[view].values())
+@pytest.mark.parametrize("view", ["x64", "arm64"])
+def test_every_patch_entry_of_the_catalog_has_a_hand_written_example_and_the_code_does_not_validate_it(view):
+    """The weaker pin, and honestly so: the code has no notion of a neutralised stub, `classify_stub` calls any
+    differing stub without a jump `diverged`. These entries are checked against examples written in this test, and
+    the catalog is the only place that names them. This asserts the examples exist and are not jumps."""
+    entries = [s for s in syscall_rules.default_signatures() if s.get("view") == view and s["family"] == "Stub patch"]
+    assert entries
+    for entry in entries:
+        proof = _pin_proof(view, entry)
+        assert proof, f"no hand-written example matches {entry}"
+        assert all(ok for _, ok in proof), (entry, proof)
+    noise = {"family": "Stub patch", "pattern": "90", "match": "prefix", "weight": 3.0, "view": view}
+    assert _pin_proof(view, noise) == [], "an entry no example covers is not vouched for"
+    assert syscall_baseline.classify_stub(
+        syscall_baseline.parse_baseline(_fixture(view), BUILD, view).syscalls["NtAllocateVirtualMemory"],
+        bytes.fromhex("90" * syscall_baseline.READ_LEN[view]), view, None)["state"] == "diverged"
+
+
+@pytest.mark.parametrize("view,entry", [
+    ("x64", {"family": "Stub patch", "pattern": "4c8bd1b8", "match": "prefix"}),     # the baseline's own stub
+    ("x64", {"family": "Inline hook", "pattern": "cd2e", "match": "prefix"}),        # a hook the code does not know
+    ("x64", {"family": "Inline hook", "pattern": "c3", "match": "prefix"}),          # a patch filed as a hook
+    ("x64", {"family": "Stub patch", "pattern": "e9", "match": "prefix"}),           # a hook filed as a patch
+    ("arm64", {"family": "Inline hook", "pattern": "c0035fd6", "match": "prefix"}),
+    ("arm64", {"family": "Stub patch", "pattern": "^[0-9a-f]{6}(14|15|16|17)", "match": "regex"}),
+])
+def test_the_pin_fails_an_entry_the_code_does_not_back(view, entry):
+    """The pin's own path, `_pin_proof`, run on entries the real catalog does not hold: each has no example, or an
+    example the code reads the other way, so the tests above would fail on it."""
+    proof = _pin_proof(view, {**entry, "weight": 1.0, "view": view})
+    assert not proof or not all(ok for _, ok in proof), proof
 
 
 def test_a_hex_write_into_the_rules_directory_is_refused(client, tdc, rules_dir):
