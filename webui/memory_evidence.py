@@ -29,8 +29,6 @@ import os
 import threading
 import time
 
-from syscall_baseline import STATE_HOOKED, STATE_PATCHED
-
 # --- Evidence classes -------------------------------------------------
 # Ordered by how hard the signal is to fake or to trip accidentally.
 EVIDENCE_STRUCTURAL = "structural"   # verifiable fact about memory layout
@@ -516,9 +514,9 @@ def from_syscall_scan(result, process=""):
         return out
     for dev in result.get("deviations") or []:
         state = dev.get("state")
-        if state == STATE_PATCHED:
+        if state == "patched":
             kind = "syscall_stub_patched"
-        elif state == STATE_HOOKED and not dev.get("allowlisted"):
+        elif state == "hooked" and not dev.get("allowlisted"):
             kind = "syscall_stub_hooked"
         else:
             continue

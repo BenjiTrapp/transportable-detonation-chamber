@@ -2,6 +2,8 @@
 
 import json
 import os
+import subprocess
+import sys
 
 import pytest
 
@@ -1733,6 +1735,18 @@ def test_a_known_finding_is_suppressed_by_the_host_baseline(tmp_path):
     baseline.add(findings)
     scored = memory_evidence.score(findings, baseline)
     assert scored["score"] == 0 and scored["suppressed_count"] == 1
+
+
+def test_the_verdict_model_does_not_depend_on_the_syscall_modules():
+    # memory_evidence stays independent of any one scanner: it must import and score
+    # with the scanner modules unavailable, and its literals must match theirs
+    code = ("import sys; sys.modules['syscall_baseline'] = None; "
+            "sys.modules['syscall_scan'] = None; import memory_evidence")
+    webui = os.path.join(os.path.dirname(SAMPLES), "..", "webui")
+    run = subprocess.run([sys.executable, "-c", code], cwd=webui,
+                         capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+    assert (syscall_baseline.STATE_HOOKED, syscall_baseline.STATE_PATCHED) == ("hooked", "patched")
 
 
 def test_a_stub_without_an_owner_still_scores_as_patched():
