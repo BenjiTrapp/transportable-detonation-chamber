@@ -724,7 +724,9 @@ class FakeReader(syscall_scan.ProcessReader):
         self.region_queries += 1
         for start, size, region in self._regions:
             if start <= addr < start + size:
-                return region
+                # VirtualQueryEx rounds down to the page and answers from there
+                base = max(start, addr & ~0xFFF)
+                return region._replace(base=base, size=start + size - base)
         return None
 
 

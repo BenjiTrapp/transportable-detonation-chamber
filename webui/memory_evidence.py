@@ -545,6 +545,69 @@ def from_syscall_scan(result, process=""):
     return out
 
 
+def from_direct_stubs(hits, process=""):
+    """Normalize the hits of a stub search (``syscall_scan.find_stubs_in_bytes`` or
+    ``find_stubs_in_process``) into findings, one per syscall.
+
+    A stub whose function the sample does not import is a proven bypass of the import
+    path and carries the kind's full weight. A stub whose function it imports as well, or
+    whose import table is unknown, or whose number this build does not have, is a hint:
+    the same kind of fact held with less certainty, so it asks for a second source and
+    scores at ``UNCORROBORATED`` until one agrees. A second kind would not say that.
+
+    Identity is the syscall's name, or the number when the build does not know it, never
+    an address: a repeated scan must match the same finding.
+    """
+    if not isinstance(hits, (list, tuple)):
+        return []
+    groups = {}
+    for hit in hits:
+        number = hit.get("number") if isinstance(hit, dict) else None
+        if not isinstance(number, int) or isinstance(number, bool):
+            continue
+        name = hit.get("syscall") if hit.get("number_known") else None
+        key = ("name", name.lower()) if isinstance(name, str) and name else ("number", number)
+        groups.setdefault(key, []).append(hit)
+    out = []
+    for key, group in groups.items():
+        first = group[0]
+        named = key[0] == "name"
+        name = first["syscall"] if named else None
+        imported = first.get("import_present")
+        number = f"{first['number']:#x}"
+        proven = named and imported is False
+        if not named:
+            detail = (f"stub for syscall number {number}, which this build does not have: "
+                      "built for another Windows build")
+        elif imported is False:
+            detail = f"{name} stub carried by the sample, which does not import it"
+        elif imported:
+            detail = f"{name} stub carried by the sample, which imports it as well"
+        else:
+            detail = f"{name} stub carried by the sample, import table not checked"
+        places = [h.get("address", h.get("offset")) for h in group]
+        out.append(MemoryFinding(
+            source="syscalls", kind="direct_syscall_stub", process=process,
+            detail=detail,
+            address=first.get("address"),
+            identity=key,
+            extra={
+                "syscall": name,
+                "number": first["number"],
+                "module": first.get("module"),
+                "view": first.get("view"),
+                "pattern": first.get("pattern"),
+                "stub_hex": first.get("stub_hex"),
+                "import_present": imported,
+                "number_known": named,
+                "copies": len(group),
+                "places": places[:20],
+                "needs_corroboration": not proven,
+            },
+        ))
+    return out
+
+
 # --- Network behaviour ------------------------------------------------
 
 # A beacon needs enough check-ins to show a rhythm.

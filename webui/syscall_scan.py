@@ -11,6 +11,7 @@ import functools
 import json
 import ntpath
 import os
+import re
 import threading
 from typing import NamedTuple
 
@@ -30,10 +31,17 @@ _STATES = (STATE_INTACT, STATE_HOOKED, STATE_PATCHED, STATE_DIVERGED, STATE_UNRE
 
 
 class Region(NamedTuple):
-    """What VirtualQueryEx and GetMappedFileNameW say about the region around an address."""
+    """What VirtualQueryEx and GetMappedFileNameW say about the region around an address.
+
+    `base` and `size` are the run of pages from the queried address that share these
+    attributes, as VirtualQueryEx answers it; `protect` is its page protection. A reader
+    that does not fill them leaves 0, which no scan treats as executable."""
     state: int
     type: int
     path: str | None
+    base: int = 0
+    size: int = 0
+    protect: int = 0
 
 
 def owner_from_region(region: Region | None) -> str | None:
@@ -446,6 +454,198 @@ def measure(baseline: Baseline, reader: ProcessReader, view: str | None = None,
 
 
 # --------------------------------------------------------------------------
+# Stubs outside ntdll: a sample that carries its own copy of a syscall stub calls the
+# kernel without passing through any hook. Measuring ntdll cannot see it; searching the
+# bytes can, and the baseline turns a hit from "an SVC somewhere" into a named syscall.
+# --------------------------------------------------------------------------
+
+# One pattern per view, as a bytes regex; `ssn` is the number's placeholder. x64 is
+# `mov r10, rcx; mov eax, <number>`, then a syscall within sixteen bytes (Windows 11 puts
+# a test of KUSER_SHARED_DATA between them), with no second stub head in between, so a
+# head cannot borrow the syscall of the stub after it. ARM64 is `SVC #<number>; RET`,
+# the number being the SVC's immediate. Both are zero-width, so no hit hides another.
+STUB_SHAPES: dict[str, bytes] = {
+    "x64": (rb"(?s)\x4c\x8b\xd1\xb8(?=(?P<body>(?P<ssn>.{4})"
+            rb"(?:(?!\x4c\x8b\xd1\xb8).){0,16}?\x0f\x05))"),
+    "arm64": (rb"(?s)(?=(?P<body>(?P<ssn>[\x01\x21\x41\x61\x81\xa1\xc1\xe1].[\x00-\x1f]\xd4)"
+              rb"\xc0\x03\x5f\xd6))"),
+}
+_STUB_REGEX = {view: re.compile(shape) for view, shape in STUB_SHAPES.items()}
+_STUB_NUMBER = {
+    "x64": lambda word: int.from_bytes(word, "little"),
+    "arm64": lambda word: (int.from_bytes(word, "little") >> 5) & 0xFFFF,
+}
+_STUB_PATTERN = {"x64": "mov r10, rcx; mov eax, imm32; syscall", "arm64": "svc #imm16; ret"}
+_STUB_ALIGN = {"x64": 1, "arm64": 4}
+# no stub is longer than this; a read that continues this far past its own start cannot
+# cut one in two
+_STUB_SPAN = 32
+
+_PAGE_EXECUTABLE = 0xF0
+_PAGE_GUARD = 0x100
+# one read of a region; a larger region is read in steps of this
+_CHUNK = 0x100000
+# MmHighestUserAddress + 1; where the walk of a process's regions ends
+_USER_SPACE_END = 0x7FFFFFFF0000
+
+
+def _numbers(baseline: Baseline) -> dict[int, Syscall]:
+    """Each syscall number of the baseline with the syscall that owns it. ntdll and win32u
+    number apart in practice (the table is in the number's upper bits); were they not to,
+    ntdll is the one named."""
+    ordered = sorted(baseline.by_number.items(),
+                     key=lambda item: (item[0][0] != "ntdll.dll", item[0]))
+    out: dict[int, Syscall] = {}
+    for (_, number), sc in ordered:
+        out.setdefault(number, sc)
+    return out
+
+
+def _is_imported(sc: Syscall, imports) -> bool:
+    names = {sc.name}
+    if sc.name.startswith("Nt"):
+        names.add("Zw" + sc.name[2:])
+    return not names.isdisjoint(imports)
+
+
+def _scan_chunk(data: bytes, view: str, numbers: dict, imports,
+                starts_below: int | None = None) -> list[dict]:
+    decode, align = _STUB_NUMBER[view], _STUB_ALIGN[view]
+    hits = []
+    for m in _STUB_REGEX[view].finditer(data):
+        at = m.start()
+        if starts_below is not None and at >= starts_below:
+            break
+        if at % align:
+            continue
+        number = decode(m.group("ssn"))
+        sc = numbers.get(number)
+        hits.append({
+            "syscall": sc.name if sc else None,
+            "number": number,
+            "module": sc.module if sc else None,
+            "offset": at,
+            "view": view,
+            "pattern": _STUB_PATTERN[view],
+            "stub_hex": data[at:m.end("body")].hex(),
+            # an unnamed number has no import to look for, and no import table is no
+            # evidence of absence: both are unknown, which is not False
+            "import_present": (_is_imported(sc, imports)
+                               if sc is not None and imports is not None else None),
+            "number_known": sc is not None,
+        })
+    return hits
+
+
+def _shape_of(view: str) -> str:
+    if view not in STUB_SHAPES:
+        raise ValueError(f"no stub shape for view {view!r}")
+    return view
+
+
+def find_stubs_in_bytes(data: bytes, baseline: Baseline,
+                        imports: set[str] | None = None) -> list[dict]:
+    """The syscall stubs in `data`, in the shape of the baseline's view.
+
+    A number the baseline holds names its syscall. One it does not is still a hit, with
+    `number_known` False: a stub built for another Windows build. `imports` are the
+    function names the sample imports; with them, `import_present` says whether the
+    syscall of a stub is among them. A stub whose function is not imported is a bypass of
+    the import path, not just a possible one. Without them it is None. Pass the Win32 names
+    that lead down to the syscall as well, if the sample's chain is known: a bare table of
+    `Nt` imports misses a sample that calls the Win32 wrapper and carries a stub too."""
+    view = _shape_of(baseline.view)
+    return _scan_chunk(data, view, _numbers(baseline), imports)
+
+
+class StubScan(list):
+    """The hits of a process search, with whether the search covered what it set out to.
+
+    `partial` is True when memory could not be walked or read: no hit then is not a clean
+    process. `regions_searched` counts the regions that qualified."""
+
+    def __init__(self):
+        super().__init__()
+        self.partial = False
+        self.regions_searched = 0
+        self.notes: list[str] = []
+
+    @property
+    def note(self) -> str:
+        return "; ".join(self.notes)
+
+    def fail(self, why: str) -> None:
+        self.partial = True
+        self.notes.append(why)
+
+
+def _searchable(region: Region) -> bool:
+    """Memory that holds code no file on disk accounts for: private, or a mapped view that
+    has no file behind it. Not an image and not a mapped file: a legitimate DLL carries stubs
+    of its own, and ntdll's are measured by `measure`. Not a guard page: reading one
+    raises it, which would change the process being watched."""
+    if region.state != MEM_COMMIT:
+        return False
+    if not region.protect & _PAGE_EXECUTABLE or region.protect & _PAGE_GUARD:
+        return False
+    return region.type == MEM_PRIVATE or (region.type == MEM_MAPPED and not region.path)
+
+
+def _walk(reader: ProcessReader, found: StubScan):
+    addr = 0
+    while addr < _USER_SPACE_END:
+        region = reader.region(addr)
+        if region is None or region.size <= 0:
+            found.fail(f"the region query at {addr:#x} failed, memory above it not searched")
+            return
+        yield region
+        following = region.base + region.size
+        if following <= addr:
+            found.fail(f"the region at {addr:#x} does not advance, memory above it not searched")
+            return
+        addr = following
+
+
+def find_stubs_in_process(reader: ProcessReader, baseline: Baseline,
+                          imports: set[str] | None = None) -> StubScan:
+    """The syscall stubs in the private, executable memory of the process behind `reader`,
+    each hit with an `address` where `find_stubs_in_bytes` has an `offset`.
+
+    A baseline of another view or build is refused before anything is read: its numbers
+    would name the wrong syscalls."""
+    view = reader.view()
+    if view != baseline.view:
+        raise ScanRefused(f"process view {view or 'unknown'} does not match the baseline "
+                          f"view {baseline.view}")
+    build = reader.build()
+    if build != baseline.build:
+        raise ScanRefused(f"system build {build or 'unknown'} does not match the baseline "
+                          f"build {baseline.build}")
+    view = _shape_of(view)
+    numbers = _numbers(baseline)
+    found = StubScan()
+    unread: list[int] = []
+    for region in _walk(reader, found):
+        if not _searchable(region):
+            continue
+        found.regions_searched += 1
+        for off in range(0, region.size, _CHUNK):
+            addr = region.base + off
+            data = _read_exact(reader, addr, min(_CHUNK + _STUB_SPAN, region.size - off))
+            if data is None:
+                unread.append(addr)
+                continue
+            for hit in _scan_chunk(data, view, numbers, imports, starts_below=_CHUNK):
+                found.append({("address" if key == "offset" else key):
+                              (addr + value if key == "offset" else value)
+                              for key, value in hit.items()})
+    if unread:
+        found.fail(f"{len(unread)} stretch{'es' if len(unread) != 1 else ''} of executable "
+                   f"memory not read (first at {unread[0]:#x}), the result is partial")
+    return found
+
+
+# --------------------------------------------------------------------------
 # Win32 (ctypes). Untested in CI: it only fetches, and every decision on what it
 # fetched is made above. Checked by hand on the VM.
 # --------------------------------------------------------------------------
@@ -593,4 +793,5 @@ class Win32Reader(ProcessReader):
             return None
         buf = ctypes.create_unicode_buffer(_PATH_CHARS)
         named = self._psapi.GetMappedFileNameW(self._handle, addr, buf, _PATH_CHARS)
-        return Region(mbi.State, mbi.Type, buf.value if named else None)
+        return Region(mbi.State, mbi.Type, buf.value if named else None,
+                      mbi.BaseAddress or 0, mbi.RegionSize, mbi.Protect)
