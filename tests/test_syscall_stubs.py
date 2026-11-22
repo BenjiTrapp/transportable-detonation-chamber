@@ -294,6 +294,53 @@ def test_a_second_source_lifts_a_hint_to_full_confidence(x64_baseline):
     assert stub["confidence"] == 1.0
 
 
+def _lonely_finding():
+    """A finding of another scanner that needs a second opinion and has none."""
+    return memory_evidence.MemoryFinding(
+        source="aether", kind="thread_staged_rw", process="s.exe", identity=("x",))
+
+
+def _confidence_of(scored, kind):
+    return next(f for f in scored["findings"] if f["kind"] == kind)["confidence"]
+
+
+def test_a_stub_hint_does_not_lift_an_uncorroborated_finding_of_another_source(x64_baseline):
+    (hint,) = _stub_findings(x64_baseline, {"NtAllocateVirtualMemory"})
+    alone = memory_evidence.score([_lonely_finding()])
+    beside = memory_evidence.score([hint, _lonely_finding()])
+    assert _confidence_of(alone, "thread_staged_rw") == memory_evidence.UNCORROBORATED
+    assert _confidence_of(beside, "thread_staged_rw") == memory_evidence.UNCORROBORATED
+    other = next(f for f in beside["findings"] if f["kind"] == "thread_staged_rw")
+    assert "corroborated_by" not in other
+
+
+@pytest.mark.parametrize("imports, expanded, number", [
+    (None, None, 0x18),                        # import table unknown
+    ({"NtAllocateVirtualMemory"}, None, 0x18),  # imported as well
+    (None, set(), 0x7FE),                      # a number this build does not have
+])
+def test_no_kind_of_hint_vouches_for_another_source(x64_baseline, imports, expanded, number):
+    (hint,) = _stub_findings(x64_baseline, imports, number=number, expanded=expanded)
+    assert hint["needs_corroboration"] is True and hint["may_corroborate"] is False
+    beside = memory_evidence.score([hint, _lonely_finding()])
+    assert _confidence_of(beside, "thread_staged_rw") == memory_evidence.UNCORROBORATED
+
+
+def test_a_proven_bypass_still_vouches_for_another_source(x64_baseline):
+    (proven,) = _stub_findings(x64_baseline, expanded=set())
+    assert "may_corroborate" not in proven
+    beside = memory_evidence.score([proven, _lonely_finding()])
+    assert _confidence_of(beside, "thread_staged_rw") == 1.0
+
+
+def test_no_other_scanner_opts_out_of_corroborating():
+    results = {"syscall_scan": {"build": "b", "view": "x64", "deviations": [
+        {"state": "patched", "name": "NtClose", "target_owner": "private"}]}}
+    findings = memory_evidence.collect(results, process="s.exe")
+    findings.append(_lonely_finding())
+    assert findings and all("may_corroborate" not in f for f in findings)
+
+
 def test_the_finding_key_holds_no_address(x64_baseline):
     def key(offset):
         blob = b"\x90" * offset + _x64_stub(0x18)

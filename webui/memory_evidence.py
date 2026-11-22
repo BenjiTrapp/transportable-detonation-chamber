@@ -552,10 +552,12 @@ def from_direct_stubs(hits, process=""):
     A stub whose function the sample does not import, judged against its import table
     expanded through the Win32 to Nt table, is a proven bypass of the import path and
     carries the kind's full weight. The scanner only says so for such a table
-    (``import_present`` False); against a raw one it says None. A stub whose function it imports as well, or
-    whose import table is unknown, or whose number this build does not have, is a hint:
-    the same kind of fact held with less certainty, so it asks for a second source and
-    scores at ``UNCORROBORATED`` until one agrees. A second kind would not say that.
+    (``import_present`` False); against a raw one it says None. A stub whose function it
+    imports as well, or whose import table is unknown, or whose number this build does
+    not have, is a hint: the same kind of fact held with less certainty, so it asks for
+    a second source and scores at ``UNCORROBORATED`` until one agrees, and it does not
+    itself corroborate another source (``may_corroborate`` False). A second kind would
+    not say that.
 
     Identity is the syscall's name, or the number when the build does not know it, never
     an address: a repeated scan must match the same finding.
@@ -588,24 +590,29 @@ def from_direct_stubs(hits, process=""):
         else:
             detail = f"{name} stub carried by the sample, import table not checked"
         places = [h.get("address", h.get("offset")) for h in group]
+        extra = {
+            "syscall": name,
+            "number": first["number"],
+            "module": first.get("module"),
+            "view": first.get("view"),
+            "pattern": first.get("pattern"),
+            "stub_hex": first.get("stub_hex"),
+            "import_present": imported,
+            "number_known": named,
+            "copies": len(group),
+            "places": places[:20],
+            "needs_corroboration": not proven,
+        }
+        if not proven:
+            # a hint keeps the kind's weight, so the weight gate alone would let it lift
+            # the uncorroborated findings of every other source in the process
+            extra["may_corroborate"] = False
         out.append(MemoryFinding(
             source="syscalls", kind="direct_syscall_stub", process=process,
             detail=detail,
             address=first.get("address"),
             identity=key,
-            extra={
-                "syscall": name,
-                "number": first["number"],
-                "module": first.get("module"),
-                "view": first.get("view"),
-                "pattern": first.get("pattern"),
-                "stub_hex": first.get("stub_hex"),
-                "import_present": imported,
-                "number_known": named,
-                "copies": len(group),
-                "places": places[:20],
-                "needs_corroboration": not proven,
-            },
+            extra=extra,
         ))
     return out
 
@@ -890,6 +897,10 @@ def score(findings, baseline=None):
     sources_by_process = {}
     for f in findings:
         if f.get("base_weight", 0) < CORROBORATION_MIN_WEIGHT:
+            continue
+        # a hint holds its weight but asks for a second opinion itself: it must not
+        # give one. Only a finding that sets this opts out; none of the older scanners does.
+        if f.get("may_corroborate") is False:
             continue
         if known(f):
             continue
