@@ -183,6 +183,8 @@ def _stubs(n: int) -> str:
 
 
 KEY_VERSION = 1
+# the separator of a set's key in the file; a view never holds it, a build may
+_SET_SEP = "|"
 
 
 class HookAllowlist:
@@ -192,18 +194,20 @@ class HookAllowlist:
     recorded in explorer.exe could never cover the same hook in the sample, and an EDR
     hooks ntdll in every process it watches. The key here has no process in it, on purpose.
 
-    The list belongs to one build and view; `status` says whether it applies to a scan.
-    A list for another build says nothing about this one, and applying it would suppress
-    findings on no evidence. Only `hooked` stubs whose owner is a module are ever
-    recorded: a patch must never become suppressible, or capturing a dirty host would
-    whitelist the attacker's own."""
+    The pairs are kept in one set per `(build, view)`. A host has one build and two views,
+    native ARM64 and emulated x64, and an EDR hooks both: one set for the whole file would
+    lose the other view's hooks whenever one view is recorded, and every scan of it would
+    score the EDR again. A set for another pair says nothing about this one, so it is never
+    applied to it. Only `hooked` stubs whose owner is a module are ever recorded: a patch
+    must never become suppressible, or capturing a dirty host would whitelist the
+    attacker's own."""
 
     def __init__(self, path: str):
         self.path = path
         self._lock = threading.RLock()
         # why the file on disk is not in use, None if it is
         self.problem: str | None = None
-        self._build, self._view, self._pairs = "", "", set()
+        self._sets: dict[tuple[str, str], frozenset] = {}
         self.load()
 
     @staticmethod
@@ -220,37 +224,53 @@ class HookAllowlist:
             return None
         return name, owner
 
-    def knows(self, syscall_name: str, owner: str) -> bool:
-        """Whether this hook is recorded. Not a check of build and view: see `status`."""
+    @staticmethod
+    def _scope(build, view) -> tuple[str, str] | None:
+        """`(build, view)`, or None for neither. One of them alone is a mistake: read as a
+        wildcard it would let `clear(build)` empty both views."""
+        if build is None and view is None:
+            return None
+        if not (isinstance(build, str) and build and isinstance(view, str) and view):
+            raise ValueError("a build and a view are given together, or neither")
+        return build, view
+
+    def knows(self, syscall_name: str, owner: str, build: str, view: str) -> bool:
+        """Whether this hook is recorded for this build and view."""
         if not isinstance(owner, str):
             return False
         with self._lock:
-            return (syscall_name, owner.strip().lower()) in self._pairs
+            return (syscall_name, owner.strip().lower()) in self._sets.get((build, view), ())
 
     def status(self, build: str | None, view: str | None) -> dict:
         """Whether the list may be applied to a scan of `build` and `view`, and if not, why.
 
-        An empty list applies to anything: it has nothing to suppress."""
+        A list that holds nothing at all has nothing to refuse. One that holds sets, but
+        none for this pair, was recorded for another build or view and is not applied."""
         with self._lock:
+            have = self._sets.get((build, view), ())
             reason = self.problem or ""
-            if not reason and self._pairs and (self._build, self._view) != (build, view):
-                reason = (f"the hook allowlist was recorded for build {self._build or 'unknown'}, "
-                          f"view {self._view or 'unknown'}; this scan is build "
-                          f"{build or 'unknown'}, view {view or 'unknown'}: not applied")
-            return {"applied": not reason, "entries": len(self._pairs), "reason": reason}
+            if not reason and self._sets and not have:
+                held = ", ".join(f"build {b} view {v}" for b, v in sorted(self._sets))
+                reason = (f"the hook allowlist holds no set for build {build or 'unknown'}, "
+                          f"view {view or 'unknown'} (it has: {held}): not applied")
+            return {"applied": not reason, "entries": len(have), "reason": reason}
 
-    def entries(self) -> list[dict]:
+    def entries(self, build: str | None = None, view: str | None = None) -> list[dict]:
+        """Every set, or the one of a pair, each entry naming its own build and view."""
+        scope = self._scope(build, view)
         with self._lock:
-            return [{"syscall": name, "owner": owner} for name, owner in sorted(self._pairs)]
+            return [{"syscall": name, "owner": owner, "build": b, "view": v}
+                    for (b, v), pairs in sorted(self._sets.items())
+                    if scope in (None, (b, v)) for name, owner in sorted(pairs)]
 
     def add_from(self, result: dict) -> int:
-        """Record the hooks of a `measure` result; returns how many were new.
+        """Record the hooks of a `measure` result into the set of its build and view,
+        leaving every other set alone; returns how many were new.
 
-        A result of another build or view than the list starts the list afresh: its old
-        pairs are refused by `status` anyway. A result without hooks changes nothing.
         Raises OSError if the list cannot be written; the list is then as before."""
         build, view = result.get("build"), result.get("view")
-        if not (isinstance(build, str) and build and isinstance(view, str) and view):
+        if not (isinstance(build, str) and build and isinstance(view, str) and view
+                and _SET_SEP not in view):
             return 0
         found = set()
         for entry in result.get("deviations") or ():
@@ -258,26 +278,29 @@ class HookAllowlist:
                 pair = self._pair(entry)
                 if pair:
                     found.add(pair)
-        if not found:
-            return 0
         with self._lock:
-            kept = self._pairs if (self._build, self._view) == (build, view) else set()
-            added = len(found - kept)
-            if added or kept is not self._pairs:
-                self._commit(build, view, kept | found)
+            have = self._sets.get((build, view), frozenset())
+            added = len(found - have)
+            if added:
+                self._commit({**self._sets, (build, view): have | found})
             return added
 
-    def clear(self) -> None:
+    def clear(self, build: str | None = None, view: str | None = None) -> None:
+        """Forget the set of a pair, or every set when called bare."""
+        scope = self._scope(build, view)
         with self._lock:
-            self._commit("", "", set())
+            if scope is None:
+                self._commit({})
+            elif scope in self._sets:
+                self._commit({k: v for k, v in self._sets.items() if k != scope})
 
-    def _commit(self, build: str, view: str, pairs: set) -> None:
-        before = self._build, self._view, self._pairs
-        self._build, self._view, self._pairs = build, view, pairs
+    def _commit(self, sets: dict) -> None:
+        before = self._sets
+        self._sets = sets
         try:
             self.save()
         except OSError:
-            self._build, self._view, self._pairs = before
+            self._sets = before
             raise
         self.problem = None
 
@@ -285,8 +308,11 @@ class HookAllowlist:
         """Write beside the file, flush, then swap it in: a crash halfway leaves the old
         list, never half of one that would silently suppress the wrong hooks."""
         with self._lock:
-            payload = {"version": KEY_VERSION, "build": self._build, "view": self._view,
-                       "entries": self.entries()}
+            sets: dict[str, list] = {}
+            for (build, view), pairs in sorted(self._sets.items()):
+                sets[f"{build}{_SET_SEP}{view}"] = [{"syscall": n, "owner": o}
+                                                    for n, o in sorted(pairs)]
+            payload = {"version": KEY_VERSION, "sets": sets}
             parent = os.path.dirname(self.path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
@@ -305,10 +331,10 @@ class HookAllowlist:
                 raise
 
     def load(self) -> None:
-        """Read the file; what cannot be trusted leaves the list empty and sets `problem`,
-        so that nothing is suppressed on its say-so."""
+        """Read the file; what cannot be trusted is left out and, if it is the whole file,
+        sets `problem`, so that nothing is suppressed on its say-so."""
         with self._lock:
-            self._build, self._view, self._pairs = "", "", set()
+            self._sets = {}
             self.problem = None
             if not os.path.isfile(self.path):
                 return
@@ -326,12 +352,18 @@ class HookAllowlist:
                                 f"{data.get('version')!r}, this is version {KEY_VERSION}: "
                                 "not applied until the hooks are recorded again")
                 return
-            build, view, entries = data.get("build"), data.get("view"), data.get("entries")
-            if not (isinstance(build, str) and isinstance(view, str) and isinstance(entries, list)):
-                self._set_aside("build, view or entries missing")
+            sets = data.get("sets")
+            if not isinstance(sets, dict):
+                self._set_aside("sets missing")
                 return
-            self._build, self._view = build, view
-            self._pairs = {pair for pair in map(self._pair, entries) if pair}
+            for key, entries in sets.items():
+                # the view is last: a build may hold the separator, a view never does
+                build, sep, view = key.rpartition(_SET_SEP)
+                if not (sep and build and view and isinstance(entries, list)):
+                    continue
+                pairs = frozenset(pair for pair in map(self._pair, entries) if pair)
+                if pairs:
+                    self._sets[(build, view)] = pairs
 
     def _set_aside(self, why: str) -> None:
         """Keep an unreadable file for inspection rather than overwrite it on the next save."""
@@ -382,7 +414,7 @@ def measure(baseline: Baseline, reader: ProcessReader, view: str | None = None,
     if listed is not None:
         for s in states.values():
             s["allowlisted"] = (listed["applied"] and s["state"] == STATE_HOOKED
-                                and allowlist.knows(s["name"], s["target_owner"]))
+                                and allowlist.knows(s["name"], s["target_owner"], build, view))
     counts = dict.fromkeys(_STATES, 0)
     for s in states.values():
         counts[s["state"]] += 1

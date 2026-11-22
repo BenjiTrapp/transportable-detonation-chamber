@@ -1141,6 +1141,17 @@ def _result_with(state="hooked", syscall="NtProtectVirtualMemory", owner="edr.dl
     return {"build": build, "view": view, "states": {syscall: entry}, "deviations": [entry]}
 
 
+_PAIR = ("26220.5770", "arm64")
+
+
+def _e(syscall, owner, build=_PAIR[0], view=_PAIR[1]):
+    return {"syscall": syscall, "owner": owner, "build": build, "view": view}
+
+
+def _file(path, sets, version=1):
+    path.write_text(json.dumps({"version": version, "sets": sets}))
+
+
 def _allowlist(tmp_path, name="hooks.json"):
     return syscall_scan.HookAllowlist(str(tmp_path / name))
 
@@ -1182,23 +1193,23 @@ def test_every_state_dict_carries_the_flag_once_a_list_is_given(arm64_baseline, 
 def test_allowlist_is_independent_of_the_process(tmp_path):
     al = _allowlist(tmp_path)
     assert al.add_from(_result_with(process="explorer.exe")) == 1
-    assert al.knows("NtProtectVirtualMemory", "edr.dll") is True
+    assert al.knows("NtProtectVirtualMemory", "edr.dll", *_PAIR) is True
     # the same hook seen in another process is the same entry
     assert al.add_from(_result_with(process="sample.exe")) == 0
-    assert al.entries() == [{"syscall": "NtProtectVirtualMemory", "owner": "edr.dll"}]
+    assert al.entries() == [_e("NtProtectVirtualMemory", "edr.dll")]
 
 
 def test_a_hook_recorded_for_one_syscall_does_not_cover_another(tmp_path):
     al = _allowlist(tmp_path)
     al.add_from(_result_with())
-    assert al.knows("NtWriteVirtualMemory", "edr.dll") is False
-    assert al.knows("NtProtectVirtualMemory", "other.dll") is False
+    assert al.knows("NtWriteVirtualMemory", "edr.dll", *_PAIR) is False
+    assert al.knows("NtProtectVirtualMemory", "other.dll", *_PAIR) is False
 
 
 def test_the_owner_is_matched_by_its_lower_case_basename(tmp_path):
     al = _allowlist(tmp_path)
     al.add_from(_result_with(owner="EDR.dll"))
-    assert al.knows("NtProtectVirtualMemory", "edr.DLL") is True
+    assert al.knows("NtProtectVirtualMemory", "edr.DLL", *_PAIR) is True
 
 
 def test_allowlist_never_covers_a_patched_stub(tmp_path):
@@ -1266,7 +1277,7 @@ def test_entries_are_copies(tmp_path):
     al.add_from(_result_with())
     al.entries()[0]["owner"] = "evil.dll"
     al.entries().clear()
-    assert al.entries() == [{"syscall": "NtProtectVirtualMemory", "owner": "edr.dll"}]
+    assert al.entries() == [_e("NtProtectVirtualMemory", "edr.dll")]
 
 
 @pytest.mark.parametrize("build, view", [
@@ -1282,17 +1293,18 @@ def test_the_list_survives_a_restart(tmp_path):
     al = _allowlist(tmp_path)
     al.add_from(_result_with())
     again = _allowlist(tmp_path)
-    assert again.knows("NtProtectVirtualMemory", "edr.dll") is True
+    assert again.knows("NtProtectVirtualMemory", "edr.dll", *_PAIR) is True
     assert again.entries() == al.entries()
 
 
 def test_the_file_has_the_documented_format(tmp_path):
     al = _allowlist(tmp_path)
     al.add_from(_result_with())
+    al.add_from(_result_with(view="x64", syscall="NtClose", owner="av.dll"))
     with open(al.path) as f:
-        assert json.load(f) == {"version": 1, "build": "26220.5770", "view": "arm64",
-                                "entries": [{"syscall": "NtProtectVirtualMemory",
-                                             "owner": "edr.dll"}]}
+        assert json.load(f) == {"version": 1, "sets": {
+            "26220.5770|arm64": [{"syscall": "NtProtectVirtualMemory", "owner": "edr.dll"}],
+            "26220.5770|x64": [{"syscall": "NtClose", "owner": "av.dll"}]}}
     assert syscall_scan.KEY_VERSION == 1
 
 
@@ -1300,7 +1312,7 @@ def test_clear_empties_the_list_and_the_file(tmp_path):
     al = _allowlist(tmp_path)
     al.add_from(_result_with())
     al.clear()
-    assert al.entries() == [] and al.knows("NtProtectVirtualMemory", "edr.dll") is False
+    assert al.entries() == [] and al.knows("NtProtectVirtualMemory", "edr.dll", *_PAIR) is False
     assert _allowlist(tmp_path).entries() == []
 
 
@@ -1320,7 +1332,7 @@ def test_load_picks_up_what_another_writer_saved(tmp_path):
     a.add_from(_result_with())
     assert b.entries() == []
     b.load()
-    assert b.knows("NtProtectVirtualMemory", "edr.dll") is True
+    assert b.knows("NtProtectVirtualMemory", "edr.dll", *_PAIR) is True
 
 
 def test_a_save_leaves_no_temp_file_behind(tmp_path):
@@ -1341,7 +1353,7 @@ def test_a_failed_swap_keeps_the_old_file_and_the_old_list(tmp_path, monkeypatch
         al.add_from(_result_with(syscall="NtClose"))
     monkeypatch.undo()
     assert open(al.path).read() == before
-    assert al.knows("NtClose", "edr.dll") is False
+    assert al.knows("NtClose", "edr.dll", *_PAIR) is False
     assert os.listdir(tmp_path) == ["hooks.json"]
 
 
@@ -1354,12 +1366,14 @@ def test_a_failed_clear_keeps_the_list(tmp_path, monkeypatch):
     monkeypatch.setattr(syscall_scan.os, "replace", refuse)
     with pytest.raises(OSError):
         al.clear()
-    assert al.knows("NtProtectVirtualMemory", "edr.dll") is True
+    assert al.knows("NtProtectVirtualMemory", "edr.dll", *_PAIR) is True
 
 
 @pytest.mark.parametrize("text", ["{not json", "[]", '"x"', "7", "",
-                                  '{"version": 1, "build": 5, "view": "arm64", "entries": []}',
-                                  '{"version": 1, "build": "b", "view": "arm64", "entries": {}}'])
+                                  '{"version": 1}', '{"version": 1, "sets": []}',
+                                  '{"version": 1, "sets": null}',
+                                  # the layout of one pair for the whole file, as it once was
+                                  '{"version": 1, "build": "b", "view": "arm64", "entries": []}'])
 def test_a_corrupt_file_is_kept_aside_and_reported(tmp_path, text):
     path = tmp_path / "hooks.json"
     path.write_text(text)
@@ -1372,27 +1386,43 @@ def test_a_corrupt_file_is_kept_aside_and_reported(tmp_path, text):
 
 def test_a_file_of_another_version_is_ignored_and_reported_but_not_destroyed(tmp_path):
     path = tmp_path / "hooks.json"
-    text = json.dumps({"version": 2, "build": "26220.5770", "view": "arm64",
-                       "entries": [{"syscall": "NtClose", "owner": "edr.dll"}]})
-    path.write_text(text)
+    _file(path, {"26220.5770|arm64": [{"syscall": "NtClose", "owner": "edr.dll"}]}, version=2)
+    text = path.read_text()
     al = syscall_scan.HookAllowlist(str(path))
-    assert al.knows("NtClose", "edr.dll") is False
+    assert al.knows("NtClose", "edr.dll", *_PAIR) is False
     assert "version" in al.problem
     assert path.read_text() == text
 
 
 def test_malformed_entries_are_skipped_not_applied(tmp_path):
     path = tmp_path / "hooks.json"
-    path.write_text(json.dumps({"version": 1, "build": "b", "view": "arm64", "entries": [
+    _file(path, {"26220.5770|arm64": [
         {"syscall": "NtClose", "owner": "edr.dll"}, {"syscall": "NtOpenFile"},
         {"syscall": 3, "owner": "x.dll"}, "x", None,
         {"syscall": "NtCreateFile", "owner": "private"}, {"syscall": "", "owner": "x.dll"},
-        {"syscall": "NtRead", "owner": ""}]}))
+        {"syscall": "NtRead", "owner": ""}]})
     al = syscall_scan.HookAllowlist(str(path))
-    assert al.entries() == [{"syscall": "NtClose", "owner": "edr.dll"}]
+    assert al.entries() == [_e("NtClose", "edr.dll")]
 
 
-def test_a_list_of_another_build_is_refused_and_says_so(arm64_baseline, tmp_path):
+@pytest.mark.parametrize("key", ["", "26220.5770", "|arm64", "26220.5770|", "|"])
+def test_a_set_under_a_malformed_key_is_skipped(tmp_path, key):
+    path = tmp_path / "hooks.json"
+    _file(path, {key: [{"syscall": "NtClose", "owner": "edr.dll"}],
+                 "26220.5770|arm64": [{"syscall": "NtOpenFile", "owner": "av.dll"}]})
+    al = syscall_scan.HookAllowlist(str(path))
+    assert al.entries() == [_e("NtOpenFile", "av.dll")]
+
+
+def test_a_set_that_is_not_a_list_is_skipped(tmp_path):
+    path = tmp_path / "hooks.json"
+    _file(path, {"26220.5770|arm64": {"syscall": "NtClose", "owner": "edr.dll"},
+                 "26220.5770|x64": [{"syscall": "NtOpenFile", "owner": "av.dll"}]})
+    al = syscall_scan.HookAllowlist(str(path))
+    assert al.entries() == [_e("NtOpenFile", "av.dll", view="x64")]
+
+
+def test_a_list_without_a_set_for_this_build_is_refused_and_says_so(arm64_baseline, tmp_path):
     reader = _hooked_reader(arm64_baseline)
     al = _allowlist(tmp_path)
     al.add_from(_result_with(build="26100.1"))
@@ -1400,18 +1430,19 @@ def test_a_list_of_another_build_is_refused_and_says_so(arm64_baseline, tmp_path
     assert _protect(out)["state"] == "hooked"
     assert _protect(out)["allowlisted"] is False
     assert out["allowlist"]["applied"] is False
-    assert "26100.1" in out["allowlist"]["reason"]
+    assert out["allowlist"]["entries"] == 0
+    assert "26220.5770" in out["allowlist"]["reason"] and "26100.1" in out["allowlist"]["reason"]
     assert out["allowlist"]["reason"] in out["note"]
     assert out["partial"] is False
 
 
-def test_a_list_of_another_view_is_refused_and_says_so(arm64_baseline, tmp_path):
+def test_a_list_without_a_set_for_this_view_is_refused_and_says_so(arm64_baseline, tmp_path):
     al = _allowlist(tmp_path)
     al.add_from(_result_with(view="x64"))
     out = syscall_scan.measure(arm64_baseline, _hooked_reader(arm64_baseline), allowlist=al)
     assert _protect(out)["allowlisted"] is False
     assert out["allowlist"]["applied"] is False
-    assert "x64" in out["allowlist"]["reason"]
+    assert "arm64" in out["allowlist"]["reason"] and "x64" in out["allowlist"]["reason"]
 
 
 def test_a_list_that_matches_is_reported_as_applied(arm64_baseline, tmp_path):
@@ -1444,11 +1475,13 @@ def test_a_list_that_could_not_be_loaded_is_not_applied_and_says_so(arm64_baseli
     assert out["allowlist"]["reason"] in out["note"]
 
 
-def test_recording_on_another_build_starts_the_list_afresh(tmp_path):
+def test_recording_another_pair_leaves_the_sets_of_the_others_alone(tmp_path):
     al = _allowlist(tmp_path)
     al.add_from(_result_with(build="26100.1", syscall="NtClose"))
     assert al.add_from(_result_with()) == 1
-    assert al.entries() == [{"syscall": "NtProtectVirtualMemory", "owner": "edr.dll"}]
+    assert al.entries("26100.1", "arm64") == [_e("NtClose", "edr.dll", build="26100.1")]
+    assert al.entries(*_PAIR) == [_e("NtProtectVirtualMemory", "edr.dll")]
+    assert len(al.entries()) == 2
     assert _allowlist(tmp_path).entries() == al.entries()
 
 
@@ -1461,19 +1494,156 @@ def test_the_flagged_deviation_is_the_entry_of_the_state_map(arm64_baseline, tmp
     assert out["deviations"][0] is out["states"]["NtProtectVirtualMemory"]
 
 
-def test_a_result_without_hooks_does_not_wipe_a_list_of_another_build(tmp_path):
+def test_a_result_without_hooks_changes_no_set(tmp_path):
     al = _allowlist(tmp_path)
     al.add_from(_result_with(build="26100.1"))
     assert al.add_from(_result_with(state="intact", owner=None)) == 0
-    assert al.knows("NtProtectVirtualMemory", "edr.dll") is True
+    assert al.knows("NtProtectVirtualMemory", "edr.dll", "26100.1", "arm64") is True
+    assert len(al.entries()) == 1
 
 
 def test_only_a_hooked_stub_is_marked_even_if_a_file_names_its_pair(arm64_baseline, tmp_path):
     path = tmp_path / "hooks.json"
-    path.write_text(json.dumps({"version": 1, "build": "26220.5770", "view": "arm64",
-                                "entries": [{"syscall": "NtProtectVirtualMemory",
-                                             "owner": "ntdll.dll"}]}))
+    _file(path, {"26220.5770|arm64": [{"syscall": "NtProtectVirtualMemory",
+                                       "owner": "ntdll.dll"}]})
     out = syscall_scan.measure(arm64_baseline, _hooked_reader(arm64_baseline, owner="ntdll.dll"),
                                allowlist=syscall_scan.HookAllowlist(str(path)))
     assert _protect(out)["state"] == "diverged"
     assert _protect(out)["allowlisted"] is False
+
+
+# one build, two views: the EDR hooks the native ARM64 ntdll and the emulated x64 one, and
+# recording the clean host for one view must not cost the other its list
+
+_X64 = (_PAIR[0], "x64")
+
+
+def _both_views(tmp_path):
+    al = _allowlist(tmp_path)
+    assert al.add_from(_result_with()) == 1
+    assert al.add_from(_result_with(view="x64", syscall="NtWriteVirtualMemory")) == 1
+    return al
+
+
+def test_recording_a_second_view_keeps_the_first(tmp_path):
+    al = _both_views(tmp_path)
+    assert al.knows("NtProtectVirtualMemory", "edr.dll", *_PAIR) is True
+    assert al.knows("NtWriteVirtualMemory", "edr.dll", *_X64) is True
+    again = _allowlist(tmp_path)
+    assert again.knows("NtProtectVirtualMemory", "edr.dll", *_PAIR) is True
+    assert again.knows("NtWriteVirtualMemory", "edr.dll", *_X64) is True
+
+
+def test_a_hook_of_one_view_is_not_known_for_the_other(tmp_path):
+    al = _both_views(tmp_path)
+    assert al.knows("NtProtectVirtualMemory", "edr.dll", *_X64) is False
+    assert al.knows("NtWriteVirtualMemory", "edr.dll", *_PAIR) is False
+    assert al.knows("NtProtectVirtualMemory", "edr.dll", "26100.1", "arm64") is False
+
+
+def test_the_same_hook_in_two_views_is_two_entries(tmp_path):
+    al = _allowlist(tmp_path)
+    assert al.add_from(_result_with()) == 1
+    assert al.add_from(_result_with(view="x64")) == 1
+    assert al.add_from(_result_with(view="x64")) == 0
+    assert len(al.entries()) == 2
+
+
+def test_entries_bare_lists_every_set_in_a_stable_order(tmp_path):
+    al = _both_views(tmp_path)
+    al.add_from(_result_with(build="26100.1", syscall="NtClose"))
+    got = al.entries()
+    assert got == [_e("NtClose", "edr.dll", build="26100.1"),
+                   _e("NtProtectVirtualMemory", "edr.dll"),
+                   _e("NtWriteVirtualMemory", "edr.dll", view="x64")]
+    assert al.entries() == got
+
+
+def test_entries_given_a_pair_lists_that_set_only(tmp_path):
+    al = _both_views(tmp_path)
+    assert al.entries(*_X64) == [_e("NtWriteVirtualMemory", "edr.dll", view="x64")]
+    assert al.entries("26100.1", "x64") == []
+
+
+@pytest.mark.parametrize("call", [lambda al: al.entries("26220.5770"),
+                                  lambda al: al.entries(view="x64"),
+                                  lambda al: al.clear("26220.5770"),
+                                  lambda al: al.clear(view="x64")])
+def test_half_a_pair_is_a_mistake_not_a_wildcard(tmp_path, call):
+    al = _both_views(tmp_path)
+    with pytest.raises(ValueError):
+        call(al)
+    assert len(al.entries()) == 2
+
+
+def test_clear_given_a_pair_clears_that_set_only(tmp_path):
+    al = _both_views(tmp_path)
+    al.clear(*_PAIR)
+    assert al.entries(*_PAIR) == []
+    assert al.knows("NtWriteVirtualMemory", "edr.dll", *_X64) is True
+    again = _allowlist(tmp_path)
+    assert again.entries() == [_e("NtWriteVirtualMemory", "edr.dll", view="x64")]
+    with open(al.path) as f:
+        assert list(json.load(f)["sets"]) == ["26220.5770|x64"]
+
+
+def test_clear_of_a_pair_nobody_recorded_changes_nothing(tmp_path):
+    al = _both_views(tmp_path)
+    al.clear("26100.1", "arm64")
+    assert len(al.entries()) == 2
+
+
+def test_clear_bare_clears_every_set(tmp_path):
+    al = _both_views(tmp_path)
+    al.clear()
+    assert al.entries() == []
+    assert _allowlist(tmp_path).entries() == []
+
+
+def test_a_view_that_would_break_the_key_is_not_recorded(tmp_path):
+    al = _allowlist(tmp_path)
+    assert al.add_from(_result_with(view="x|64")) == 0
+    assert al.entries() == []
+
+
+def test_a_build_with_the_separator_in_it_survives_a_restart(tmp_path):
+    al = _allowlist(tmp_path)
+    al.add_from(_result_with(build="1|2"))
+    assert _allowlist(tmp_path).entries() == [_e("NtProtectVirtualMemory", "edr.dll", build="1|2")]
+
+
+def test_each_view_of_a_scan_finds_its_own_set(arm64_baseline, x64_baseline, tmp_path):
+    arm = _hooked_reader(arm64_baseline)
+    x64 = _reader_from(x64_baseline,
+                       patched={"NtWriteVirtualMemory": ("e92b170080", "edr.dll")})
+    al = _allowlist(tmp_path)
+    al.add_from(syscall_scan.measure(arm64_baseline, arm))
+    al.add_from(syscall_scan.measure(x64_baseline, x64))
+    arm_out = syscall_scan.measure(arm64_baseline, arm, allowlist=al)
+    x64_out = syscall_scan.measure(x64_baseline, x64, allowlist=al)
+    assert arm_out["states"]["NtProtectVirtualMemory"]["allowlisted"] is True
+    assert x64_out["states"]["NtWriteVirtualMemory"]["state"] == "hooked"
+    assert x64_out["states"]["NtWriteVirtualMemory"]["allowlisted"] is True
+    assert arm_out["allowlist"] == {"applied": True, "entries": 1, "reason": ""}
+    assert x64_out["allowlist"] == {"applied": True, "entries": 1, "reason": ""}
+
+
+def test_recording_the_x64_view_does_not_unsuppress_the_arm64_scan(arm64_baseline, x64_baseline,
+                                                                    tmp_path):
+    arm = _hooked_reader(arm64_baseline)
+    x64 = _reader_from(x64_baseline,
+                       patched={"NtWriteVirtualMemory": ("e92b170080", "edr.dll")})
+    al = _allowlist(tmp_path)
+    al.add_from(syscall_scan.measure(arm64_baseline, arm))
+    al.add_from(syscall_scan.measure(x64_baseline, x64))
+    out = syscall_scan.measure(arm64_baseline, arm, allowlist=al)
+    assert out["states"]["NtProtectVirtualMemory"]["allowlisted"] is True
+
+
+def test_the_set_count_in_the_result_is_that_of_the_scanned_pair(arm64_baseline, tmp_path):
+    al = _allowlist(tmp_path)
+    al.add_from(_result_with())
+    al.add_from(_result_with(syscall="NtClose"))
+    al.add_from(_result_with(view="x64", syscall="NtOpenFile"))
+    out = syscall_scan.measure(arm64_baseline, _hooked_reader(arm64_baseline), allowlist=al)
+    assert out["allowlist"]["entries"] == 2
