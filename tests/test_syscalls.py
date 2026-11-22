@@ -1058,11 +1058,17 @@ def test_the_win32_structures_have_the_64_bit_windows_layout():
 
 
 def test_the_scan_opens_the_process_for_reading_only():
-    assert syscall_scan.PROCESS_ACCESS == 0x1000 | 0x0010
+    query, limited, vm_read = 0x0400, 0x1000, 0x0010
+    assert syscall_scan.PROCESS_ACCESS == (query | vm_read, limited | vm_read)
+    for mask in syscall_scan.PROCESS_ACCESS:
+        assert mask & ~(query | limited | vm_read) == 0, hex(mask)
     with open(syscall_scan.__file__, encoding="utf-8") as fh:
         source = fh.read()
-    for call in ("WriteProcessMemory", "VirtualProtectEx", "DebugActiveProcess",
-                 "CreateRemoteThread", "SuspendThread", "SetThreadContext"):
+    for call in ("WriteProcessMemory", "VirtualProtectEx", "VirtualAllocEx", "DebugActiveProcess",
+                 "DebugSetProcessKillOnExit", "CreateRemoteThread", "OpenThread", "SuspendThread",
+                 "SetThreadContext", "NtSuspendProcess", "PROCESS_VM_WRITE", "PROCESS_VM_OPERATION",
+                 "PROCESS_CREATE_THREAD", "PROCESS_SUSPEND_RESUME", "PROCESS_ALL_ACCESS",
+                 "THREAD_"):
         assert call not in source, call
 
 
@@ -1071,3 +1077,53 @@ def test_the_win32_reader_is_only_built_on_windows():
         pytest.skip("on Windows it opens a real process")
     with pytest.raises(OSError):
         syscall_scan.Win32Reader(os.getpid(), "x64", "1.0")
+
+
+def test_a_zeroed_stub_makes_the_result_partial(arm64_baseline):
+    # the read succeeds, but image pages are paged in on read: zeros there were written
+    reader = _reader_from(arm64_baseline, patched={"NtWriteVirtualMemory": ("00" * 16, None)})
+    out = syscall_scan.measure(arm64_baseline, reader)
+    assert out["states"]["NtWriteVirtualMemory"]["state"] == "unreadable"
+    assert out["read_errors"] == 0
+    assert out["partial"] is True
+    assert "1 stub" in out["note"] and "unreadable" in out["note"]
+
+
+def test_a_failed_owner_lookup_is_counted_and_makes_the_result_partial(arm64_baseline):
+    reader = _reader_from(arm64_baseline,
+                          patched={"NtWriteVirtualMemory": ("0500001400000000", "private")})
+    reader._regions = []
+    out = syscall_scan.measure(arm64_baseline, reader)
+    assert out["states"]["NtWriteVirtualMemory"]["state"] == "diverged"
+    assert out["owner_errors"] == 1
+    assert out["partial"] is True
+    assert "owner" in out["note"]
+
+
+def test_an_unreadable_pointer_is_a_failed_owner_lookup(x64_baseline):
+    reader = _reader_from(x64_baseline, patched={"NtWriteVirtualMemory": ("ff2500001000", None)})
+    out = syscall_scan.measure(x64_baseline, reader)
+    assert out["owner_errors"] == 1 and out["partial"] is True
+
+
+def test_changed_bytes_without_a_jump_are_no_failed_lookup(arm64_baseline):
+    reader = _reader_from(arm64_baseline, patched={"NtWriteVirtualMemory": ("1122334455667788", None)})
+    out = syscall_scan.measure(arm64_baseline, reader)
+    assert out["states"]["NtWriteVirtualMemory"]["state"] == "diverged"
+    assert (out["owner_errors"], out["partial"], out["note"]) == (0, False, "")
+
+
+def test_a_resolved_owner_is_no_failed_lookup(arm64_baseline):
+    reader = _reader_from(arm64_baseline,
+                          patched={"NtWriteVirtualMemory": ("0500001400000000", "edr.dll")})
+    out = syscall_scan.measure(arm64_baseline, reader)
+    assert (out["owner_errors"], out["partial"]) == (0, False)
+
+
+def test_a_module_list_that_cannot_be_read_is_not_called_missing(arm64_baseline):
+    reader = _reader_from(arm64_baseline, patched={})
+    reader._m = None
+    out = syscall_scan.measure(arm64_baseline, reader)
+    assert out["states"] == {} and out["partial"] is True
+    assert "could not be listed" in out["note"]
+    assert "not loaded" not in out["note"]

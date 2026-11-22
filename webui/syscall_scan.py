@@ -59,8 +59,9 @@ class ProcessReader:
         """The OS build the process runs on, as baselines are named."""
         raise NotImplementedError
 
-    def modules(self) -> list[dict]:
-        """Loaded modules, each with `name`, `base`, `size`, `path`."""
+    def modules(self) -> list[dict] | None:
+        """Loaded modules, each with `name`, `base`, `size`, `path`; None if the list
+        cannot be had at all, which is not the same as a module missing from it."""
         raise NotImplementedError
 
     def read(self, addr: int, size: int) -> bytes | None:
@@ -122,28 +123,34 @@ class ScanRefused(Exception):
         self.reason = reason
 
 
-def _target_owner(reader: ProcessReader, live: bytes, addr: int, view: str) -> str | None:
+def _target_owner(reader: ProcessReader, live: bytes, addr: int,
+                  view: str) -> tuple[str | None, bool]:
+    """`(owner, failed)`. `failed` when there is a jump but its owner could not be
+    looked up: an unreadable pointer or a region query that failed. Changed bytes with
+    no jump have no target to ask about, which is no failure."""
     target = jump_target(live, addr, view)
     if target is None:
         pointer = jump_pointer(live, addr, view)
         if pointer is None:
-            return None
+            return None, False
         size = _POINTER_LEN[view]
         word = _read_exact(reader, pointer, size)
         if word is None:
-            return None
+            return None, True
         target = int.from_bytes(word, "little")
-    return reader.owner_of(target)
+    region = reader.region(target)
+    return owner_from_region(region), region is None
 
 
 def _state(reader: ProcessReader, sc: Syscall, live: bytes | None, addr: int,
-           view: str) -> dict:
+           view: str) -> tuple[dict, bool]:
     # the owner lookup costs a region query; an intact or unreadable stub needs none
-    out = classify_stub(sc, live, view, None)
+    out, failed = classify_stub(sc, live, view, None), False
     if out["state"] not in (STATE_INTACT, STATE_UNREADABLE):
-        out = classify_stub(sc, live, view, _target_owner(reader, live, addr, view))
+        owner, failed = _target_owner(reader, live, addr, view)
+        out = classify_stub(sc, live, view, owner)
     out.update(name=sc.name, module=sc.module, number=sc.number, rva=sc.rva)
-    return out
+    return out, failed
 
 
 def _module_bases(reader: ProcessReader, wanted: tuple[str, ...]):
@@ -151,8 +158,11 @@ def _module_bases(reader: ProcessReader, wanted: tuple[str, ...]):
 
     A name loaded twice (a WOW64 process holds two ntdll) is not guessed at: the wrong
     copy would make every stub look changed."""
+    listed = reader.modules()
+    if listed is None:
+        return {}, ["the modules of the process could not be listed, nothing measured"]
     found: dict[str, list[int]] = {}
-    for mod in reader.modules():
+    for mod in listed:
         found.setdefault(mod["name"].lower(), []).append(mod["base"])
     bases, notes = {}, []
     for name in dict.fromkeys(m.lower() for m in wanted):
@@ -166,13 +176,18 @@ def _module_bases(reader: ProcessReader, wanted: tuple[str, ...]):
     return bases, notes
 
 
+def _stubs(n: int) -> str:
+    return f"{n} stub{'s' if n != 1 else ''}"
+
+
 def measure(baseline: Baseline, reader: ProcessReader, view: str | None = None,
             build: str | None = None, modules: tuple[str, ...] = ("ntdll.dll",)) -> dict:
     """The state of each baseline stub of `modules` in the process behind `reader`.
 
     `view` and `build` default to what the reader says. A baseline of another view or
-    build is refused before anything is read. `partial` is True when a stub could not
-    be read or nothing was measured at all: such a result is never a clean process."""
+    build is refused before anything is read. `partial` is True when a stub is
+    unreadable, an owner lookup failed, or nothing was measured at all: such a result
+    is never a clean process."""
     view = view or reader.view()
     build = build or reader.build()
     # RVAs and bytes hold for one build and view; read with another's, a verdict would
@@ -187,17 +202,26 @@ def measure(baseline: Baseline, reader: ProcessReader, view: str | None = None,
     addrs = {sc.name: bases[sc.module.lower()] + sc.rva
              for sc in baseline.syscalls.values() if sc.module.lower() in bases}
     live = read_spans(reader, addrs.items(), lambda name: READ_LEN[view])
-    states = {name: _state(reader, baseline.syscalls[name], live[name], addr, view)
-              for name, addr in addrs.items()}
+    states, owner_errors = {}, 0
+    for name, addr in addrs.items():
+        states[name], failed = _state(reader, baseline.syscalls[name], live[name], addr, view)
+        owner_errors += failed
     counts = dict.fromkeys(_STATES, 0)
     for s in states.values():
         counts[s["state"]] += 1
     read_errors = sum(1 for data in live.values() if data is None)
-    if read_errors:
-        notes.append(f"{read_errors} stub{'s' if read_errors != 1 else ''} could not be "
-                     "read, the result is partial")
+    # a stub that reads as zeros is unreadable too; in an image, which is paged in on
+    # read, zeros were written there
+    unreadable = counts[STATE_UNREADABLE]
+    if unreadable:
+        notes.append(f"{_stubs(unreadable)} unreadable ({read_errors} not read at all), "
+                     "the result is partial")
+    # an owner that could not be looked up turns a hook or a patch into diverged
+    if owner_errors:
+        notes.append(f"the jump owner of {_stubs(owner_errors)} could not be looked up, "
+                     "the result is partial")
     # nothing measured is no finding, and must not read as a clean process
-    partial = bool(read_errors) or not states
+    partial = bool(unreadable or owner_errors) or not states
     return {
         "view": view,
         "build": build,
@@ -205,6 +229,7 @@ def measure(baseline: Baseline, reader: ProcessReader, view: str | None = None,
         "counts": counts,
         "deviations": [s for s in states.values() if s["state"] != STATE_INTACT],
         "read_errors": read_errors,
+        "owner_errors": owner_errors,
         "partial": partial,
         "note": "; ".join(notes),
     }
@@ -215,9 +240,15 @@ def measure(baseline: Baseline, reader: ProcessReader, view: str | None = None,
 # fetched is made above. Checked by hand on the VM.
 # --------------------------------------------------------------------------
 
+PROCESS_QUERY_INFORMATION = 0x0400
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 PROCESS_VM_READ = 0x0010
-PROCESS_ACCESS = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ
+# Tried in order. VirtualQueryEx and GetModuleInformation are documented to need
+# PROCESS_QUERY_INFORMATION; without it every owner lookup may fail. A protected process
+# refuses that right, so the limited one follows. Both are read-only.
+PROCESS_ACCESS = (PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                  PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)
+_ERROR_ACCESS_DENIED = 5
 LIST_MODULES_ALL = 0x03
 # in characters; device paths may exceed MAX_PATH
 _PATH_CHARS = 32768
@@ -278,9 +309,18 @@ class Win32Reader(ProcessReader):
             raise OSError("reading a process needs Windows")
         self._view, self._build = view, build
         self._k32, self._psapi = _win32_api()
-        self._handle = self._k32.OpenProcess(PROCESS_ACCESS, False, int(pid))
-        if not self._handle:
-            raise ctypes.WinError(ctypes.get_last_error())
+        self._handle = None
+        # the right the handle holds, for telling a limited open from a failed query
+        self.access = None
+        for access in PROCESS_ACCESS:
+            self._handle = self._k32.OpenProcess(access, False, int(pid))
+            if self._handle:
+                self.access = access
+                return
+            error = ctypes.get_last_error()
+            if error != _ERROR_ACCESS_DENIED:
+                break
+        raise ctypes.WinError(error)
 
     def close(self) -> None:
         if self._handle:
@@ -299,7 +339,7 @@ class Win32Reader(ProcessReader):
     def build(self) -> str | None:
         return self._build
 
-    def modules(self) -> list[dict]:
+    def modules(self) -> list[dict] | None:
         ptr = ctypes.sizeof(ctypes.c_void_p)
         needed = _DWORD(0)
         count = 512
@@ -307,7 +347,7 @@ class Win32Reader(ProcessReader):
             handles = (ctypes.c_void_p * count)()
             if not self._psapi.EnumProcessModulesEx(self._handle, handles, ctypes.sizeof(handles),
                                                     ctypes.byref(needed), LIST_MODULES_ALL):
-                return []
+                return None
             if needed.value <= ctypes.sizeof(handles):
                 break
             count = needed.value // ptr + 16
