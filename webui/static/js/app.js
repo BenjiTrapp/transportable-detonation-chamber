@@ -20915,6 +20915,11 @@ const RIZIN_EMU_PANE = {
     rows: 100,
     urgent: 'A patch or breakpoint is waiting to be saved; the project is written when the analysis has finished.',
 };
+// The patches of the right-click menu: the kinds that act on one instruction (rizin_emulation.PATCH_KINDS), the
+// most bytes the field takes (rizin_emulation.MAX_PATCH_BYTES: a patch is one write, one command line, and rizin's
+// stdin reader cuts a line at 4094 characters without a word) and the arch whose bytes the kinds are (the server
+// refuses all others: 0x90 is a nop on x86 and nowhere else)
+const RIZIN_PATCH = { kinds: ['nop', 'flip', 'always', 'nocall'], maxBytes: 2000, arch: 'x86' };
 // The views that follow the current place. load(force) brings a view to it:
 // it asks rizin when what the view shows is of another place, and always with
 // force (a finished analysis step may have changed it). The requests go out
@@ -20933,6 +20938,9 @@ const RIZIN_VIEWS = {
     // also what keeps a promise: a list that found rizin busy says "the patches and breakpoints follow", and only a view
     // registered here is asked for again (rizinRetryViews, rizinReloadViews); without it that sentence would stay for good
     emuPane: force => rizinLoadEmuPane(force),
+    // The marks of the gutter and of the patched lines (rizinState.marks): asked for once for each file, and again
+    // when forced; a click in the gutter or a patch of the menu brings the answer's list itself
+    marks: force => rizinLoadMarks(force),
     hex: force => rizinLoadHex(force),
     strings: force => rizinLoadList('strings', force),
     imports: force => rizinLoadList('imports', force),
@@ -21051,6 +21059,10 @@ const rizinState = {
     // the words of the last action ({kind, text}), the export's answer (exported) and what waits (busy)
     emuPane: { at: '', patches: null, breakpoints: null, problem: '', stale: false, seq: 0, notice: null, exported: null, busy: '' },
     emuPaneShown: '',   // the markup the pane shows, so that only a change writes
+    // What DISASSEMBLY marks: the breakpoints (their addresses) and the ranges patched by hand ([addr, size]), integers
+    // as the routes answer them (bounded by the file's layout), null until the file's lists are known; seq: the
+    // newest request for both; busy: a click in the gutter waits for its answer
+    marks: { breakpoints: null, patched: null, seq: 0, busy: false },
 };
 
 // This browser tab's ID: random and kept in sessionStorage, so a reload of the
@@ -21252,13 +21264,18 @@ function rizinFunctionsHtml(funcs, options) {
     return html;
 }
 
-// The lines of DISASSEMBLY: address, the mnemonic in the colour of its kind,
-// operands and comment. Each line carries its address in data-addr; the one
-// that holds current (an address) is marked, and the one that holds pc (the
-// emulation's) with a mark of its own.
+// The lines of DISASSEMBLY: a gutter (a ● where a breakpoint is set, one click sets or removes it) and a cell for
+// the mark of a patch (≠: the bytes there are not the file's), then the address, the mnemonic in the colour of its
+// kind, operands and comment. Each line carries its address in data-addr; the one that holds current (an address)
+// is marked, and the one that holds pc (the emulation's) with a mark of its own. breakpoints: the addresses of the
+// ones set, patched: [address, size] of each patch by hand (integers, as the routes answer them); a line that
+// starts at a breakpoint is .bp, one that overlaps a patch .patched. The three marks (the breakpoint's ● in
+// the gutter, the PC's ▶ and dashed edge, the current line's solid bar) are never one thing: a line may carry all.
 function rizinDisasmHtml(ops, options) {
-    const { current = null, pc = null } = options || {};
+    const { current = null, pc = null, breakpoints = [], patched = [] } = options || {};
     const at = rizinNum(rizinHex(current)), pcAt = rizinNum(rizinHex(pc));
+    const stops = new Set(Array.isArray(breakpoints) ? breakpoints : []);
+    const edits = Array.isArray(patched) ? patched.filter(p => Array.isArray(p) && Number.isSafeInteger(p[0]) && Number.isSafeInteger(p[1])) : [];
     let marked = false, pcMarked = false;
     let html = '';
     for (const op of Array.isArray(ops) ? ops : []) {
@@ -21269,9 +21286,15 @@ function rizinDisasmHtml(ops, options) {
         marked = marked || here;
         const there = !pcMarked && pcAt >= op.offset && pcAt < op.offset + size;
         pcMarked = pcMarked || there;
+        const stop = stops.has(op.offset);
+        const edited = edits.some(([from, length]) => op.offset < from + length && from < op.offset + size);
         const [, mnemonic, operands] = /^(\S*)\s*([\s\S]*)$/.exec(String(op.text ?? ''));
         const kind = rizinOpClass(op.type);
-        html += `<div class="rizin-op${here ? ' current' : ''}${there ? ' pc' : ''}" data-addr="${addr}"><span class="rz-addr">${addr}</span> `
+        html += `<div class="rizin-op${here ? ' current' : ''}${there ? ' pc' : ''}${stop ? ' bp' : ''}${edited ? ' patched' : ''}" data-addr="${addr}">`
+            + `<span class="rizin-gutter${stop ? ' on' : ''}" data-rizin-gutter="${addr}" title="${stop ? 'Breakpoint set: click to remove it' : 'Click to set a breakpoint here'}"`
+            + `${stop ? ' aria-label="breakpoint"' : ''}>${stop ? '●' : ''}</span>`
+            + `<span class="rz-pm${edited ? ' on' : ''}"${edited ? ' title="Patched: these bytes are not the file\'s"' : ''}>${edited ? '≠' : ''}</span>`
+            + `<span class="rz-addr">${addr}</span> `
             + `<span class="rz-mnem${kind ? ' ' + kind : ''}">${escapeHtml(mnemonic)}</span>`
             + (operands ? ' ' + rizinOperandsHtml(operands, rizinHex(op.jump)) : '')
             + (op.comment ? '  ' + rizinCommentHtml(op.comment) : '') + '</div>';
@@ -21339,6 +21362,8 @@ function rizinReset(described) {
     Object.assign(rizinState.emuPane, { at: '', patches: null, breakpoints: null, problem: '', stale: false, notice: null,
                                         exported: null, busy: '' });
     rizinState.emuPane.seq++;       // a late list of the old session is dropped
+    Object.assign(rizinState.marks, { breakpoints: null, patched: null, busy: false });
+    rizinState.marks.seq++;         // so is a late list of the marks
     for (const list of Object.values(rizinState.lists)) {
         if (list.timer !== null) clearTimeout(list.timer);
         Object.assign(list, { offset: 0, total: 0, items: null, truncated: false, at: '', stale: false, problem: '', shown: '', shownAt: '', timer: null });
@@ -22003,7 +22028,9 @@ function rizinRenderDisasm(problem) {
     const at = JSON.stringify([rizinState.session, rizinState.seek, pc]);
     // The lines as JSON, once for each list of them (a page that loads on gets a new one)
     if (page.linesOf !== page.ops) Object.assign(page, { lines: JSON.stringify(page.ops), linesOf: page.ops });
-    const shown = JSON.stringify([rizinState.session, page.function, page.more, !!page.capped]) + page.lines;
+    // The marks of the gutter and of the patched lines are part of what is shown: another list draws the lines again
+    const marks = rizinState.marks;
+    const shown = JSON.stringify([rizinState.session, page.function, page.more, !!page.capped, marks.breakpoints, marks.patched]) + page.lines;
     const jumped = rizinState.disasmJump !== rizinState.jumpSeq;
     // Without a size (another code view chosen, GRAPH below 1400 px, the RIZIN tab in the background) the
     // place cannot be scrolled into sight: rizinCodeShown does it once DISASSEMBLY is in sight again
@@ -22027,7 +22054,7 @@ function rizinRenderDisasm(problem) {
     rizinState.disasmShown = shown;
     rizinState.disasmAt = at;
     const end = `The linear disassembly stops here, after ${RIZIN_MORE.linear} instructions: enter a later address in SEEK to read on.`;
-    pane.innerHTML = (page.ops.length ? rizinDisasmHtml(page.ops, { current: rizinState.seek, pc })
+    pane.innerHTML = (page.ops.length ? rizinDisasmHtml(page.ops, { current: rizinState.seek, pc, breakpoints: marks.breakpoints || [], patched: marks.patched || [] })
         : '<div class="rizin-empty">No instructions at this address.</div>')
         + (page.more ? `<div class="rizin-more" title="The instructions go on below">${escapeHtml(rizinMoreText(page))}</div>`
             : page.capped ? `<div class="rizin-disasm-end">${escapeHtml(end)}</div>` : '');
@@ -22044,8 +22071,9 @@ function rizinOnFunctionClick(event) {
 }
 
 // A click on an instruction moves there, on a jump or call target jumps to it;
-// not when the click ends a selection of text. A click on the line under the
-// last one asks for the next page at once.
+// not when the click ends a selection of text. A click in the gutter, left of the
+// address, sets or removes the breakpoint there and moves nowhere. A click on the
+// line under the last one asks for the next page at once.
 function rizinOnDisasmClick(event) {
     const more = event.target && event.target.closest ? event.target.closest('.rizin-more') : null;
     if (more) {
@@ -22054,6 +22082,11 @@ function rizinOnDisasmClick(event) {
         return;
     }
     if (typeof window.getSelection === 'function' && String(window.getSelection())) return;
+    const gutter = event.target && event.target.closest ? event.target.closest('[data-rizin-gutter]') : null;
+    if (gutter) {
+        rizinToggleBreakpoint(gutter.getAttribute('data-rizin-gutter'));
+        return;
+    }
     const el = event.target && event.target.closest ? event.target.closest('[data-addr]') : null;
     if (el) rizinSeek(el.getAttribute('data-addr'), el.classList.contains('rz-target') ? 'target' : 'disasm');
 }
@@ -23573,11 +23606,11 @@ function rizinFunctionRenamed(addr, name) {
     return true;
 }
 
-// After a rename or a comment (the menu, or a console command that changed something): every view
-// again, also at the same place
-async function rizinAnnotated() {
+// After a rename, a comment or a patch (the menu, or a console command that changed something): every view
+// (but skip) again, also at the same place
+async function rizinAnnotated(skip) {
     rizinRenderToolbar();
-    await rizinReloadViews();
+    await rizinReloadViews(skip);
 }
 
 // --- XREFS, STRINGS and IMPORTS: the dock's lists ---
@@ -23939,11 +23972,15 @@ function rizinOnDockGripKey(event) {
     rizinSetDockHeight((rizinState.layout.dock ?? (Number(dock && dock.getBoundingClientRect().height) || 0)) + step);
 }
 
-// --- Rename and Comment: the right-click menu ---
+// --- The right-click menu: Rename, Comment, the patches and Run to here ---
 // A right-click on a function, a line of the disassembly or a block of the
 // graph opens it for that address; Rename names the function there (afn on
 // the server), Comment sets or, empty, removes the comment there. Both are
-// kept in the file's project, and every view is drawn again.
+// kept in the file's project, and every view is drawn again. On a line of the
+// disassembly it also holds what acts on that one instruction (DISASSEMBLY has
+// no selection): NOP out, Flip the jump, Always jump, Kill the call, Bytes… (as
+// many bytes as the field takes, over as many instructions as they cover) and,
+// while the emulation runs, Run to here.
 
 // source: functions, disasm or graph; elsewhere the browser's own menu shows
 function rizinOnContextMenu(event, source) {
@@ -23963,13 +24000,42 @@ function rizinOnContextMenu(event, source) {
     }
     const page = rizinState.disasm;
     const op = page && page.session === rizinState.session ? page.ops.find(o => o && rizinHex(o.offset) === addr) : null;
-    // The comment there, if the page shown has the address; else null: Comment… reads it first
-    rizinOpenMenu({ addr, source, name: name || null, comment: op ? (typeof op.comment === 'string' ? op.comment : '') : null },
+    // The comment there, if the page shown has the address; else null: Comment… reads it first. The type is what the
+    // patch entries are chosen from (rizin's op type, '' where the page does not have the address)
+    rizinOpenMenu({ addr, source, name: name || null, comment: op ? (typeof op.comment === 'string' ? op.comment : '') : null,
+                    type: op && typeof op.type === 'string' ? op.type : '' },
                   Number(event.clientX) || 0, Number(event.clientY) || 0);
 }
 
+// What the menu offers for info (see rizinOpenMenu): the patch entries only on a line of the disassembly, each
+// of the four only where its kind applies to the instruction's type (the ones that do not are hidden, as there is
+// nothing to say about them), and all four off, with the reason, where the file is not x86: the server refuses them
+// there, and Bytes… stays; Run to here only while the emulation runs, and off while a run is in flight.
+function rizinMenuEntries(info) {
+    const disasm = info.source === 'disasm';
+    const file = rizinState.file, arch = file && file.arch ? String(file.arch) : '';
+    const x86 = arch === RIZIN_PATCH.arch;
+    const kinds = disasm ? rizinPatchKinds(info.type) : [];
+    const reason = `The patch buttons write x86 bytes, and this file is ${arch || 'of an arch rizin did not name'}: use Bytes… to write the bytes by hand.`;
+    const entry = (name, hidden, off, why) => {
+        const el = document.getElementById(`rizin-menu-${name}`);
+        if (!el) return;
+        el.hidden = hidden;
+        el.disabled = !hidden && off;
+        if (!hidden && off) el.title = why;
+        else el.removeAttribute('title');
+    };
+    const sep = document.getElementById('rizin-menu-sep');
+    if (sep) sep.hidden = !disasm;
+    for (const kind of RIZIN_PATCH.kinds) entry(kind, !kinds.includes(kind), !x86, reason);
+    entry('bytes', !disasm, false, '');
+    const running = !!rizinState.emu && rizinState.emu.running === true;
+    entry('until', !(disasm && running), !!rizinState.emuWait, 'A run is in flight; it cannot be interrupted, and the next one waits for it.');
+    return !x86 && kinds.length ? reason : '';
+}
+
 // The menu at x, y (inside the window) for info (addr, source, name of the function, comment there or
-// null when it is not known here)
+// null when it is not known here, type: rizin's op type of the instruction there, for a line of the disassembly)
 function rizinOpenMenu(info, x, y) {
     const menu = document.getElementById('rizin-menu');
     if (!menu) return;
@@ -23984,9 +24050,13 @@ function rizinOpenMenu(info, x, y) {
     }
     const items = document.getElementById('rizin-menu-items'), form = document.getElementById('rizin-menu-form');
     const note = document.getElementById('rizin-menu-note');
+    const why = rizinMenuEntries(info);
     if (items) items.hidden = false;
     if (form) form.hidden = true;
-    if (note) note.textContent = '';
+    if (note) {
+        note.className = 'rizin-menu-note' + (why ? ' rizin-menu-hint' : '');
+        note.textContent = why;
+    }
     menu.hidden = false;
     rizinPlaceMenu();
     (rename && !rename.disabled ? rename : document.getElementById('rizin-menu-comment'))?.focus();
@@ -24033,12 +24103,13 @@ function rizinMenuNote(text, waiting) {
     rizinPlaceMenu();
 }
 
-// Rename…, Comment…, Save and Cancel in the menu
+// The menu's entries, Save and Cancel: Rename…, Comment… and Bytes… open the field, the four patches and Run to here act
 function rizinOnMenuClick(event) {
     const button = event.target && event.target.closest ? event.target.closest('[data-action]') : null;
     if (!button || button.disabled) return;
     const action = button.getAttribute('data-action');
-    if (action === 'rename' || action === 'comment') rizinMenuForm(action);
+    if (action === 'rename' || action === 'comment' || action === 'bytes') rizinMenuForm(action);
+    else if (RIZIN_PATCH.kinds.includes(action) || action === 'until') rizinMenuAct(action);
     else if (action === 'save') rizinMenuSubmit();
     else if (action === 'cancel') rizinCloseMenu(true);
 }
@@ -24053,7 +24124,7 @@ function rizinOnMenuKey(event) {
         event.preventDefault();
         rizinMenuSubmit();
     } else if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && document.getElementById('rizin-menu-items')?.hidden === false) {
-        const items = [...document.querySelectorAll('#rizin-menu .rizin-menu-item')].filter(b => !b.disabled);
+        const items = [...document.querySelectorAll('#rizin-menu .rizin-menu-item')].filter(b => !b.disabled && !b.hidden);
         if (!items.length) return;
         event.preventDefault();
         const at = items.indexOf(document.activeElement);
@@ -24061,8 +24132,9 @@ function rizinOnMenuKey(event) {
     }
 }
 
-// The menu's field for the new name (filled with the old one) or the comment (with the one there, read
-// from rizin first when the page shown does not have it); the menu stays inside the window
+// The menu's field for the new name (filled with the old one), the comment (with the one there, read
+// from rizin first when the page shown does not have it) or the bytes to write (empty, and it says how many
+// it takes); the menu stays inside the window
 function rizinMenuForm(action) {
     const menu = rizinState.menu;
     const input = document.getElementById('rizin-menu-input');
@@ -24071,10 +24143,15 @@ function rizinMenuForm(action) {
     document.getElementById('rizin-menu-items').hidden = true;
     document.getElementById('rizin-menu-form').hidden = false;
     document.getElementById('rizin-menu-label').textContent = action === 'rename' ? `New name for ${menu.name}`
+        : action === 'bytes' ? `Bytes to write at ${menu.addr}: hex digits, an even number, at most ${RIZIN_PATCH.maxBytes} bytes (${2 * RIZIN_PATCH.maxBytes} digits)`
         : `Comment at ${menu.addr} (empty removes it)`;
     document.getElementById('rizin-menu-note').textContent = '';
-    input.value = action === 'rename' ? menu.name || '' : menu.comment || '';
-    input.setAttribute('maxlength', action === 'rename' ? '128' : '500');
+    input.value = action === 'rename' ? menu.name || '' : action === 'bytes' ? '' : menu.comment || '';
+    // The bytes field has no maxlength: a value that is too long is said so, in words, not cut off by the field
+    if (action === 'bytes') input.removeAttribute('maxlength');
+    else input.setAttribute('maxlength', action === 'rename' ? '128' : '500');
+    if (action === 'bytes') input.setAttribute('placeholder', '90 90 eb 05');
+    else input.removeAttribute('placeholder');
     rizinMenuWaits(false);
     rizinPlaceMenu();
     if (action === 'comment' && menu.comment === null) {
@@ -24113,9 +24190,10 @@ async function rizinMenuReadComment(menu) {
     return !!r.ok;
 }
 
-// Save: the name or the comment goes to rizin; the menu closes and every view is drawn again, or it
+// Save: the name, the comment or the bytes go to rizin; the menu closes and every view is drawn again, or it
 // stays and says why (a name rizin does not take; renames and comments wait for the analysis; an empty
-// comment where the one there could not be read, which it would remove unseen)
+// comment where the one there could not be read, which it would remove unseen; bytes that are odd in number, too
+// many or no hex, which are said before anything goes out)
 async function rizinMenuSubmit() {
     const menu = rizinState.menu;
     const input = document.getElementById('rizin-menu-input');
@@ -24128,14 +24206,44 @@ async function rizinMenuSubmit() {
         rizinMenuNote('Not saved: the comment here could not be read, and an empty field would remove it.');
         return false;
     }
+    if (menu.action === 'bytes') {
+        const parsed = rizinPatchHex(input.value);
+        if (!parsed.bytes) {
+            rizinMenuNote(parsed.error);
+            return false;
+        }
+    }
     const sid = rizinState.session;
     menu.saving = true;
     rizinMenuNote('Saving…', true);
-    const r = menu.action === 'rename' ? await rizinRename(menu.addr, input.value.trim()) : await rizinComment(menu.addr, input.value);
+    const r = menu.action === 'rename' ? await rizinRename(menu.addr, input.value.trim())
+        : menu.action === 'bytes' ? await rizinPatchBytes(menu.addr, input.value) : await rizinComment(menu.addr, input.value);
+    return rizinMenuFinish(menu, sid, r);
+}
+
+// NOP out, Flip the jump, Always jump, Kill the call (the kind is the entry's data-action) patch the one instruction
+// at the menu's address and close the menu; Run to here closes it and starts the run. A patch that the server
+// refuses (no such jump there, no instruction decoded) says why in the menu, which stays.
+async function rizinMenuAct(action) {
+    const menu = rizinState.menu, sid = rizinState.session;
+    if (!menu || menu.saving || !sid) return false;
+    if (action === 'until') {
+        rizinCloseMenu();
+        return rizinRunToHere(menu.addr);
+    }
+    menu.saving = true;
+    rizinMenuNote('Patching…', true);
+    return rizinMenuFinish(menu, sid, await rizinPatchOp(menu.addr, action));
+}
+
+// The end of a menu action r (an answer of rizinApi): done, the menu closes and every view is drawn again (not the
+// marks: the answer of a patch brought its list, and a rename or a comment changes none); else the menu stays and
+// says why
+async function rizinMenuFinish(menu, sid, r) {
     if (sid !== rizinState.session) return false;
     if (r.ok) {
         if (rizinState.menu === menu) rizinCloseMenu();
-        await rizinAnnotated();
+        await rizinAnnotated(['marks']);
         return true;
     }
     if (rizinState.menu !== menu) return false;
@@ -25314,6 +25422,8 @@ async function rizinLoadEmuPane(force, what) {
     rizinState.retry.delete('emuPane');
     Object.assign(pane, { at: sid, patches: Array.isArray(patches.data) ? patches.data : [], problem: '', stale: false });
     if (breakpoints) pane.breakpoints = Array.isArray(breakpoints.data) ? breakpoints.data : [];
+    // The marks of DISASSEMBLY take what the pane read (the patches it holds are the same rows)
+    rizinSetLists({ patches: pane.patches, breakpoints: breakpoints ? pane.breakpoints : undefined });
     rizinRenderEmuPane();
     return true;
 }
@@ -25426,6 +25536,7 @@ async function rizinUnpatch(addr) {
         return false;
     }
     Object.assign(pane, { at: sid, patches: Array.isArray(r.data.patches) ? r.data.patches : pane.patches, problem: '', stale: false });
+    rizinSetLists({ patches: r.data.patches });
     rizinEmuPaneSay(all ? "Cleared rizin's whole cache." : `Took the patch at ${at} back.`);
     await rizinReloadViews(['emuPane']);
     return true;
@@ -25448,6 +25559,7 @@ async function rizinUnbreak(addr) {
         return false;
     }
     Object.assign(pane, { at: sid, breakpoints: Array.isArray(r.data.breakpoints) ? r.data.breakpoints : pane.breakpoints, problem: '' });
+    rizinSetLists({ breakpoints: r.data.breakpoints });
     rizinEmuPaneSay(`Removed the breakpoint at ${at}.`);
     return true;
 }
@@ -25504,6 +25616,143 @@ async function rizinExportPatched() {
                       note: String(d.note ?? ''), sig: rizinEmuHandSignature(hand) };
     rizinEmuPaneSay('');
     return pane.exported;
+}
+
+// --- Breakpoints and patches in DISASSEMBLY ---
+// The gutter (a click sets or removes a breakpoint) and the patch entries of the right-click menu (rizinMenuAct) act
+// on one address; what DISASSEMBLY marks (rizinState.marks) is the list each route answers: asked for once for each
+// file, again when forced, and taken from the answer of every change. A breakpoint is set or removed: rizin 0.9.1's
+// dbd does not stop a breakpoint from stopping a run, so there is no switch. Addresses go out as "0x…" strings; the
+// rows of /patches and /breakpoints carry integers, which the file's layout bounds (a row a double cannot hold exactly
+// marks nothing, rather than a wrong line).
+
+// The lists the tab has learned (an answer of /patches, /breakpoints, POST patch or breakpoints): DISASSEMBLY's marks
+// and, where the EMULATION pane holds the list already, its rows (a request of the pane that is still out is older
+// than this answer, so it is dropped). Either list may be missing: the other one stays.
+function rizinSetLists(lists) {
+    const sid = rizinState.session, marks = rizinState.marks, pane = rizinState.emuPane;
+    if (!sid || !lists) return false;
+    const safe = n => Number.isSafeInteger(n) && n >= 0;
+    if (Array.isArray(lists.breakpoints)) {
+        marks.breakpoints = lists.breakpoints.filter(bp => bp && safe(bp.addr)).map(bp => bp.addr);
+        if (pane.at === sid && Array.isArray(pane.breakpoints)) Object.assign(pane, { breakpoints: lists.breakpoints, seq: pane.seq + 1 });
+    }
+    if (Array.isArray(lists.patches)) {
+        marks.patched = lists.patches.filter(p => p && p.mine === true && safe(p.addr) && Number.isSafeInteger(p.size) && p.size > 0)
+            .map(p => [p.addr, p.size]);
+        if (pane.at === sid && Array.isArray(pane.patches)) Object.assign(pane, { patches: lists.patches, seq: pane.seq + 1 });
+    }
+    rizinRenderEmuPane();
+    if (rizinPageHolds(rizinState.disasm)) rizinRenderDisasm();
+    return true;
+}
+
+// Both lists, for the marks: once for each file (unforced asks only while they are not known), and again when
+// forced (an analysis step ended, the console changed something). A busy answer is asked for again once rizin is
+// free; any other failure leaves the marks as they were (a click in the gutter then says why it cannot decide).
+async function rizinLoadMarks(force) {
+    const sid = rizinState.session, marks = rizinState.marks;
+    if (!sid || (!force && marks.breakpoints !== null && marks.patched !== null)) return true;
+    const seq = ++marks.seq, base = `/api/rizin/${encodeURIComponent(sid)}`;
+    const [patches, breakpoints] = await Promise.all([rizinApi(`${base}/patches`), rizinApi(`${base}/breakpoints`)]);
+    if (sid !== rizinState.session || seq !== marks.seq) return false;
+    const failed = !patches.ok ? patches : !breakpoints.ok ? breakpoints : null;
+    if (failed) {
+        if (failed.state === 'busy') rizinViewBusy('marks', force);
+        return false;
+    }
+    rizinState.retry.delete('marks');
+    return rizinSetLists({ patches: Array.isArray(patches.data) ? patches.data : [],
+                           breakpoints: Array.isArray(breakpoints.data) ? breakpoints.data : [] });
+}
+
+// A click in the gutter at addr ("0x…"): the breakpoint there is removed, or set where there is none. What is set is
+// known from the list the marks hold (asked for first if it is not known yet); one request at a time. The answer is
+// the new list. A refusal says why in the toolbar, as a jump that did not happen does.
+async function rizinToggleBreakpoint(addr) {
+    const sid = rizinState.session, at = rizinHex(addr), marks = rizinState.marks;
+    if (!sid || !at || marks.busy) return false;
+    marks.busy = true;
+    try {
+        if (marks.breakpoints === null && !(await rizinLoadMarks(true))) {
+            if (sid === rizinState.session && rizinState.ui.state !== 'busy') {
+                rizinState.note = 'The breakpoints could not be read, so a click in the gutter cannot tell whether one is set.';
+                rizinRenderState();
+            }
+            return false;
+        }
+        if (sid !== rizinState.session) return false;
+        const set = marks.breakpoints.includes(rizinNum(at));
+        const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/breakpoints`, { method: set ? 'DELETE' : 'POST', body: { addr: at } });
+        if (sid !== rizinState.session) return false;
+        if (!r.ok) {
+            if (r.state === 'busy') rizinPollSoon();
+            else if (r.state === 'refused' || r.state === 'error') {
+                rizinState.note = `The breakpoint at ${at} was not ${set ? 'removed' : 'set'}: ${r.error}`;
+                rizinRenderState();
+            }
+            return false;
+        }
+        rizinSetLists({ breakpoints: r.data.breakpoints });
+        return true;
+    } finally {
+        if (sid === rizinState.session) marks.busy = false;
+    }
+}
+
+// The bytes of a patch by hand as the server takes them, from what was typed: the hex digits, an even number of
+// them, at most RIZIN_PATCH.maxBytes bytes. White space is dropped (90 90 eb 05 is fine); nothing else is (no 0x).
+// {bytes} or {error}: the field says why, rather than the server refusing a value that was long or odd.
+function rizinPatchHex(text) {
+    const typed = String(text ?? '').replace(/\s+/g, '');
+    if (!typed) return { error: 'Type the bytes to write: hex digits, like 90 90 eb 05.' };
+    if (!/^[0-9a-fA-F]+$/.test(typed)) return { error: 'Only the hex digits 0-9 and a-f: no 0x, no other characters.' };
+    if (typed.length > 2 * RIZIN_PATCH.maxBytes) {
+        return { error: `That is ${Math.ceil(typed.length / 2)} bytes: a patch is at most ${RIZIN_PATCH.maxBytes} bytes (${2 * RIZIN_PATCH.maxBytes} hex digits).` };
+    }
+    if (typed.length % 2) return { error: `${typed.length} hex digits is an odd number: bytes are two digits each, so type one more or one fewer.` };
+    return { bytes: typed.toLowerCase() };
+}
+
+// The kinds of patch that apply to an instruction of rizin's op type: NOP out to any, Flip the jump and Always jump
+// to a conditional jump (cjmp), Kill the call to any call: rizin_emulation.is_call is "ends with call", which takes
+// ircall (call qword [import], 64 bit) and ucall (call dword [slot], 32 bit), the import calls an analyst knocks out
+function rizinPatchKinds(type) {
+    const t = typeof type === 'string' ? type : '';
+    return RIZIN_PATCH.kinds.filter(kind => kind === 'nop' || (t === 'cjmp' && (kind === 'flip' || kind === 'always'))
+        || (kind === 'nocall' && t.endsWith('call')));
+}
+
+// POST patch at addr with the body ({kind} or {bytes}); the answer is the list of what rizin's write cache holds,
+// which DISASSEMBLY and the pane take at once. Returns the answer of rizinApi, as rizinRename does.
+async function rizinPatchPost(addr, body) {
+    const sid = rizinState.session, at = rizinHex(addr);
+    if (!sid) return { ok: false, status: 0, data: {}, error: 'no file is open', state: 'error' };
+    if (!at) return { ok: false, status: 0, data: {}, error: `${String(addr)} is no address`, state: 'refused' };
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/patch`, { method: 'POST', body: { addr: at, ...body } });
+    if (r.ok && sid === rizinState.session) rizinSetLists({ patches: r.data.patches });
+    return r;
+}
+
+// NOP out, Flip the jump, Always jump or Kill the call (kind: one of RIZIN_PATCH.kinds) for the instruction at addr:
+// the server computes the bytes from what rizin decoded there and writes them into the cache. It needs no emulation.
+function rizinPatchOp(addr, kind) {
+    if (!RIZIN_PATCH.kinds.includes(kind)) {
+        return Promise.resolve({ ok: false, status: 0, data: {}, error: `${String(kind)} is no kind of patch`, state: 'refused' });
+    }
+    return rizinPatchPost(addr, { kind });
+}
+
+// Bytes… : hex bytes written at addr (as rizinPatchHex takes them), over as many instructions as they cover
+function rizinPatchBytes(addr, text) {
+    const parsed = rizinPatchHex(text);
+    if (!parsed.bytes) return Promise.resolve({ ok: false, status: 0, data: {}, error: parsed.error, state: 'refused' });
+    return rizinPatchPost(addr, { bytes: parsed.bytes });
+}
+
+// Run to here: the emulation runs to the address (aesu), and stops at a breakpoint on the way
+function rizinRunToHere(addr) {
+    return rizinEmuRun('until', addr);
 }
 
 // Wired once at start-up: Upload, a file dropped on the tab, OPEN ▾ closing

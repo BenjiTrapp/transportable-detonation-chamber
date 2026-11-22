@@ -19,8 +19,8 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=84">
-    <link rel="stylesheet" href="/static/css/theme-layout.css?v=7">
+    <link rel="stylesheet" href="/static/css/style.css?v=85">
+    <link rel="stylesheet" href="/static/css/theme-layout.css?v=8">
     <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=36">
 </head>
 <body>
@@ -1255,12 +1255,21 @@
                         </div>
                     </section>
                 </div>
-                <!-- Rename and Comment for the function, line or block right-clicked (rizinOnContextMenu) -->
+                <!-- The right-click menu (rizinOnContextMenu): Rename and Comment for the function, line or block, and, on a line
+                     of the disassembly, the patches that act on its one instruction (what applies to its type is shown, rizinOpenMenu),
+                     Bytes… and, while the emulation runs, Run to here -->
                 <div class="rizin-menu" id="rizin-menu" hidden onclick="rizinOnMenuClick(event)" onkeydown="rizinOnMenuKey(event)">
                     <div class="rizin-menu-head" id="rizin-menu-head"></div>
-                    <div class="rizin-menu-items" id="rizin-menu-items" role="menu" aria-label="Rename and comment">
+                    <div class="rizin-menu-items" id="rizin-menu-items" role="menu" aria-label="Rename, comment, patch and run to here">
                         <button type="button" class="rizin-menu-item" role="menuitem" id="rizin-menu-rename" data-action="rename">Rename function…</button>
                         <button type="button" class="rizin-menu-item" role="menuitem" id="rizin-menu-comment" data-action="comment">Comment…</button>
+                        <div class="rizin-menu-sep" id="rizin-menu-sep" role="separator" hidden></div>
+                        <button type="button" class="rizin-menu-item" role="menuitem" id="rizin-menu-nop" data-action="nop" hidden>NOP out</button>
+                        <button type="button" class="rizin-menu-item" role="menuitem" id="rizin-menu-flip" data-action="flip" hidden>Flip the jump</button>
+                        <button type="button" class="rizin-menu-item" role="menuitem" id="rizin-menu-always" data-action="always" hidden>Always jump</button>
+                        <button type="button" class="rizin-menu-item" role="menuitem" id="rizin-menu-nocall" data-action="nocall" hidden>Kill the call</button>
+                        <button type="button" class="rizin-menu-item" role="menuitem" id="rizin-menu-bytes" data-action="bytes" hidden>Bytes…</button>
+                        <button type="button" class="rizin-menu-item" role="menuitem" id="rizin-menu-until" data-action="until" hidden>Run to here</button>
                     </div>
                     <div class="rizin-menu-form" id="rizin-menu-form" role="group" aria-labelledby="rizin-menu-label" hidden>
                         <label class="rizin-menu-label" id="rizin-menu-label" for="rizin-menu-input"></label>
@@ -1269,8 +1278,8 @@
                             <button type="button" class="btn btn-sm" data-action="cancel">Cancel</button>
                             <button type="button" class="btn btn-sm btn-primary" id="rizin-menu-save" data-action="save">Save</button>
                         </div>
-                        <div class="rizin-menu-note" id="rizin-menu-note" role="status"></div>
                     </div>
+                    <div class="rizin-menu-note" id="rizin-menu-note" role="status"></div>
                 </div>
             </div>
 
@@ -1798,6 +1807,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
     </div>
 
-    <script src="/static/js/app.js?v=124"></script>
+    <script src="/static/js/app.js?v=125"></script>
 </body>
 </html>

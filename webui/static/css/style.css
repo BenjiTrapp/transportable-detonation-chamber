@@ -9748,6 +9748,40 @@ table[data-sortable] > thead > tr > th:focus-visible {
     font-size: 8px;
     color: var(--accent-orange);
 }
+/* The gutter, left of the address: a ● where a breakpoint is set (one click sets or removes it), a faint ○ under the
+   pointer where none is; then a cell for a line patched by hand (≠). Each is a fixed width, set apart from the
+   line's text, so that the columns stay in line whether a line has a mark or not; neither is text to copy.
+   The three marks of a line are three shapes, none of them colour alone: this ● in the gutter, the PC's ▶ and dashed
+   edge, the current line's solid bar. */
+.rizin-gutter {
+    display: inline-block;
+    width: 2ch;
+    vertical-align: top;
+    text-align: center;
+    color: var(--accent-red);
+    cursor: pointer;
+    user-select: none;
+}
+.rizin-gutter:not(.on):hover::before {
+    content: "○";
+    color: var(--text-dim);
+}
+.rizin-gutter.on {
+    font-weight: 700;
+}
+.rz-pm {
+    display: inline-block;
+    width: 2ch;
+    margin-right: .5ch;
+    vertical-align: top;
+    text-align: center;
+    color: var(--accent-yellow);
+    user-select: none;
+}
+.rizin-op.patched .rz-mnem {
+    text-decoration: underline wavy;
+    text-underline-offset: 3px;
+}
 /* The colours of the instructions: addresses cyan, calls pink, jumps green,
    returns violet, symbols and strings yellow, comments dim */
 .rz-addr {
@@ -10580,6 +10614,14 @@ table[data-sortable] > thead > tr > th:focus-visible {
 .rizin-menu-items[hidden] {
     display: none;
 }
+.rizin-menu-item[hidden],
+.rizin-menu-sep[hidden] {
+    display: none;
+}
+.rizin-menu-sep {
+    margin: 3px 0;
+    border-top: 1px solid var(--border-primary);
+}
 .rizin-menu-item {
     display: block;
     width: 100%;
@@ -10640,6 +10682,13 @@ table[data-sortable] > thead > tr > th:focus-visible {
 }
 .rizin-menu-note.rizin-menu-wait {
     color: var(--accent-yellow);
+}
+/* Under the items, why some of them are off (not an error) */
+.rizin-menu-note.rizin-menu-hint {
+    color: var(--text-muted);
+}
+.rizin-menu > .rizin-menu-note {
+    padding: 3px 8px 2px;
 }
 /* A file dragged over the tab: dropped, it is uploaded and opened */
 #tab-rizin.rizin-dragover .rizin-work {

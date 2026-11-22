@@ -2172,6 +2172,21 @@
 [data-theme] .rizin-op.pc::before {
     color: var(--cp-orange);
 }
+[data-theme] .rizin-gutter {
+    color: var(--cp-red);
+}
+[data-theme] .rizin-gutter:not(.on):hover::before {
+    color: var(--cp-text-dim);
+}
+[data-theme] .rizin-gutter.on {
+    text-shadow: 0 0 6px rgba(var(--cp-red-rgb), .6);
+}
+[data-theme] .rz-pm {
+    color: var(--cp-gold);
+}
+[data-theme] .rizin-op.patched .rz-mnem {
+    text-decoration-color: var(--cp-gold);
+}
 [data-theme] .rizin-console {
     background: var(--c-navy-990);
     border-color: var(--cp-line);
@@ -2426,6 +2441,12 @@
     border-color: transparent;
 }
 [data-theme] .rizin-menu-label {
+    color: var(--cp-text-dim);
+}
+[data-theme] .rizin-menu-sep {
+    border-top-color: var(--cp-line);
+}
+[data-theme] .rizin-menu-note.rizin-menu-hint {
     color: var(--cp-text-dim);
 }
 /* DECOMPILER and HEX as the disassembly: on the panel, the lines in the
