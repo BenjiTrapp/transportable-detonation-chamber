@@ -1,4 +1,4 @@
-"""NTSleuth syscall baseline: loading, validation and the lookup catalog."""
+"""NTSleuth syscall baseline: loading, validation, the lookup catalog, and measuring a process."""
 
 import json
 import os
@@ -6,6 +6,7 @@ import os
 import pytest
 
 import syscall_baseline
+import syscall_scan
 
 SAMPLES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples")
 
@@ -659,3 +660,414 @@ def test_the_indirect_hooks_are_named_by_classify():
     live = _words(0x58000050, 0xD61F0200)
     out = syscall_baseline.classify_stub(sc, live, "arm64", "edr.dll")
     assert (out["state"], out["pattern"]) == ("hooked", "LDR x16; BR x16")
+
+
+# --- measuring a process (syscall_scan) ---------------------------------------------------
+
+_DEVICE = "\\Device\\HarddiskVolume3\\Windows\\System32\\"
+_MODULE_BASES = {"ntdll.dll": 0x7FF810000000, "win32u.dll": 0x7FF820000000}
+_IMAGE = syscall_scan.Region(syscall_scan.MEM_COMMIT, syscall_scan.MEM_IMAGE, None)
+_PRIVATE = syscall_scan.Region(syscall_scan.MEM_COMMIT, syscall_scan.MEM_PRIVATE, None)
+
+
+@pytest.fixture
+def arm64_baseline():
+    return syscall_baseline.parse_baseline(_fixture("arm64"), "26220.5770", "arm64")
+
+
+@pytest.fixture
+def x64_baseline():
+    return syscall_baseline.parse_baseline(_fixture("x64"), "26220.5770", "x64")
+
+
+@pytest.fixture
+def gui_baseline(x64_baseline):
+    # both fixtures carry a win32u stub; the x64 one keeps the other view measured too
+    return x64_baseline
+
+
+class FakeReader(syscall_scan.ProcessReader):
+    """A process as a few byte ranges and memory regions.
+
+    A read succeeds only when one range holds all of it, as ReadProcessMemory fails a
+    partial copy. Regions are found by containment, the first that holds an address
+    winning, as VirtualQueryEx answers for the region around an address."""
+
+    def __init__(self, mods, ranges, regions=(), view="arm64", build="26220.5770", cut=None):
+        self._m, self._ranges, self._regions = mods, ranges, list(regions)
+        self._view, self._build, self._cut = view, build, cut
+        self.reads = 0
+        self.region_queries = 0
+
+    def view(self):
+        return self._view
+
+    def build(self):
+        return self._build
+
+    def modules(self):
+        return self._m
+
+    def read(self, addr, size):
+        self.reads += 1
+        if self._cut is not None and addr + size > self._cut:
+            return None
+        for start, data in self._ranges:
+            if start <= addr and addr + size <= start + len(data):
+                return bytes(data[addr - start:addr - start + size])
+        return None
+
+    def region(self, addr):
+        self.region_queries += 1
+        for start, size, region in self._regions:
+            if start <= addr < start + size:
+                return region
+        return None
+
+
+def _owner_region(owner):
+    if owner == "private":
+        return _PRIVATE
+    return _IMAGE._replace(path=_DEVICE + owner.upper())
+
+
+def _reader_from(baseline, patched, drop=None, build=None, fail_after=None, view=None):
+    """A process whose modules hold the baseline's stubs at their RVAs.
+
+    `patched` maps a name to `(hex, owner)`: those bytes replace the stub, and the
+    address its jump goes to belongs to `owner`. `fail_after=n`: memory past the first
+    n stubs is gone, as when the process exits while the scan reads it."""
+    view = view or baseline.view
+    mods, ranges, regions = [], [], []
+    for name, base in _MODULE_BASES.items():
+        stubs = [sc for sc in baseline.syscalls.values() if sc.module == name]
+        if not stubs or name == drop:
+            continue
+        image = bytearray(max(sc.rva for sc in stubs) + 0x1000)
+        for sc in stubs:
+            image[sc.rva:sc.rva + len(sc.stub_bytes)] = sc.stub_bytes
+        mods.append({"name": name, "base": base, "size": len(image), "path": _DEVICE + name})
+        ranges.append((base, image))
+        regions.append((base, len(image), _IMAGE._replace(path=_DEVICE + name)))
+    for name, (live_hex, owner) in patched.items():
+        sc = baseline.syscalls[name]
+        live = bytes.fromhex(live_hex)
+        image = dict(ranges)[_MODULE_BASES[sc.module]]
+        image[sc.rva:sc.rva + len(live)] = live
+        target = syscall_baseline.jump_target(live, _MODULE_BASES[sc.module] + sc.rva, view)
+        if owner is not None and target is not None:
+            regions.insert(0, (target, 4, _owner_region(owner)))
+    cut = None
+    if fail_after is not None:
+        addrs = sorted(_MODULE_BASES[sc.module] + sc.rva for sc in baseline.syscalls.values())
+        cut = addrs[fail_after - 1] + syscall_baseline.READ_LEN[view]
+    return FakeReader(mods, ranges, regions, view=view, build=build or baseline.build, cut=cut)
+
+
+def test_measure_reports_intact_for_untouched_stubs(arm64_baseline):
+    reader = _reader_from(arm64_baseline, patched={})
+    out = syscall_scan.measure(arm64_baseline, reader)
+    assert out["counts"]["intact"] == len(out["states"])
+    assert out["deviations"] == []
+    assert out["view"] == "arm64"
+
+
+def test_measure_lists_a_patched_stub_with_its_owner(arm64_baseline):
+    reader = _reader_from(arm64_baseline,
+                          patched={"NtWriteVirtualMemory": ("0500001400000000", "private")})
+    out = syscall_scan.measure(arm64_baseline, reader)
+    dev = [d for d in out["deviations"] if d["name"] == "NtWriteVirtualMemory"]
+    assert dev and dev[0]["state"] == "patched"
+    assert dev[0]["target_owner"] == "private"
+    assert out["counts"]["patched"] == 1
+
+
+def test_read_spans_batches_adjacent_stubs(arm64_baseline):
+    reader = _reader_from(arm64_baseline, patched={})
+    syscall_scan.measure(arm64_baseline, reader)
+    assert reader.reads < len(arm64_baseline.syscalls)
+    # the three ntdll stubs lie within a few hundred bytes of each other
+    assert reader.reads == 1
+
+
+def _flat_reader(*ranges):
+    return FakeReader([], [(start, bytearray(data)) for start, data in ranges])
+
+
+def test_read_spans_hands_each_item_its_own_bytes():
+    reader = _flat_reader((0x1000, bytes(range(256))))
+    out = syscall_scan.read_spans(reader, [("b", 0x1040), ("a", 0x1010)], lambda key: 4)
+    assert out == {"a": bytes([0x10, 0x11, 0x12, 0x13]), "b": bytes([0x40, 0x41, 0x42, 0x43])}
+    assert reader.reads == 1
+
+
+def test_a_failed_span_is_retried_item_by_item():
+    # the gap between the two ranges is not mapped, so the span across it fails
+    reader = _flat_reader((0x1000, b"\x11" * 16), (0x1100, b"\x22" * 16))
+    out = syscall_scan.read_spans(reader, [("a", 0x1000), ("b", 0x1100), ("c", 0x1200)],
+                                  lambda key: 8)
+    assert out == {"a": b"\x11" * 8, "b": b"\x22" * 8, "c": None}
+
+
+def test_stubs_far_apart_are_not_read_as_one_span():
+    reader = _flat_reader((0x1000, b"\x11" * 8), (0x1000 + 0x100000, b"\x22" * 8))
+    out = syscall_scan.read_spans(reader, [("a", 0x1000), ("b", 0x101000)], lambda key: 8)
+    assert out == {"a": b"\x11" * 8, "b": b"\x22" * 8}
+    assert reader.reads == 2
+
+
+def test_a_span_is_capped_in_size():
+    step = 0x800
+    reader = _flat_reader((0x1000, bytes(step * 64)))
+    items = [(str(i), 0x1000 + i * step) for i in range(64)]
+    out = syscall_scan.read_spans(reader, items, lambda key: 8)
+    assert len(out) == 64
+    assert 1 < reader.reads < 64
+
+
+def test_read_spans_never_takes_a_short_read_for_bytes():
+    class Short(FakeReader):
+        def read(self, addr, size):
+            data = super().read(addr, size)
+            return data[:-1] if data else data
+    reader = Short([], [(0x1000, bytearray(b"\x11" * 64))])
+    assert syscall_scan.read_spans(reader, [("a", 0x1000)], lambda key: 8) == {"a": None}
+
+
+def test_win32u_is_only_measured_when_asked(gui_baseline):
+    reader = _reader_from(gui_baseline, patched={})
+    assert all(s["module"] == "ntdll.dll" for s in
+               syscall_scan.measure(gui_baseline, reader)["states"].values())
+    both = syscall_scan.measure(gui_baseline, reader,
+                                modules=("ntdll.dll", "win32u.dll"))
+    assert any(s["module"] == "win32u.dll" for s in both["states"].values())
+
+
+def test_a_module_the_process_never_loaded_is_noted_not_fatal(gui_baseline):
+    reader = _reader_from(gui_baseline, patched={}, drop="win32u.dll")
+    out = syscall_scan.measure(gui_baseline, reader,
+                               modules=("ntdll.dll", "win32u.dll"))
+    assert "win32u.dll" in out["note"]
+    assert out["counts"]["intact"] > 0
+
+
+def test_module_names_match_regardless_of_case(gui_baseline):
+    reader = _reader_from(gui_baseline, patched={})
+    for mod in reader.modules():
+        mod["name"] = mod["name"].upper()
+    out = syscall_scan.measure(gui_baseline, reader, modules=("NTDLL.DLL", "Win32u.dll"))
+    assert {s["module"] for s in out["states"].values()} == {"ntdll.dll", "win32u.dll"}
+    assert out["note"] == ""
+
+
+def test_a_module_loaded_twice_is_noted_and_not_guessed(arm64_baseline):
+    reader = _reader_from(arm64_baseline, patched={})
+    ntdll = dict(reader.modules()[0], base=0x10000, path="\\Device\\X\\SysWOW64\\ntdll.dll")
+    reader.modules().append(ntdll)
+    out = syscall_scan.measure(arm64_baseline, reader)
+    assert out["states"] == {}
+    assert "ntdll.dll" in out["note"]
+    assert out["partial"] is True
+
+
+def test_a_process_without_ntdll_is_partial_never_clean(arm64_baseline):
+    reader = _reader_from(arm64_baseline, patched={}, drop="ntdll.dll")
+    out = syscall_scan.measure(arm64_baseline, reader)
+    assert out["states"] == {} and out["deviations"] == []
+    assert out["partial"] is True
+    assert "ntdll.dll" in out["note"]
+
+
+def test_measure_refuses_a_baseline_of_another_view(arm64_baseline):
+    reader = _reader_from(arm64_baseline, patched={})
+    with pytest.raises(syscall_scan.ScanRefused) as e:
+        syscall_scan.measure(arm64_baseline, reader, view="x64")
+    assert "view" in e.value.reason
+
+
+def test_measure_refuses_a_baseline_of_another_build(arm64_baseline):
+    reader = _reader_from(arm64_baseline, patched={}, build="26100.1")
+    with pytest.raises(syscall_scan.ScanRefused) as e:
+        syscall_scan.measure(arm64_baseline, reader)
+    assert "build" in e.value.reason
+
+
+@pytest.mark.parametrize("kwargs", [{"view": "x64"}, {"build": "26100.1"}])
+def test_a_refused_scan_reads_nothing(arm64_baseline, kwargs):
+    reader = _reader_from(arm64_baseline, patched={})
+    with pytest.raises(syscall_scan.ScanRefused):
+        syscall_scan.measure(arm64_baseline, reader, **kwargs)
+    assert reader.reads == 0
+
+
+def test_the_view_the_reader_reports_is_checked_too(arm64_baseline):
+    reader = _reader_from(arm64_baseline, patched={}, view="x64")
+    with pytest.raises(syscall_scan.ScanRefused, match="view"):
+        syscall_scan.measure(arm64_baseline, reader)
+
+
+@pytest.mark.parametrize("field", ["view", "build"])
+def test_a_process_of_unknown_view_or_build_is_refused(arm64_baseline, field):
+    reader = _reader_from(arm64_baseline, patched={})
+    setattr(reader, "_" + field, None)
+    with pytest.raises(syscall_scan.ScanRefused, match=field):
+        syscall_scan.measure(arm64_baseline, reader)
+
+
+def test_a_process_that_vanishes_midway_yields_a_partial_result(arm64_baseline):
+    reader = _reader_from(arm64_baseline, patched={}, fail_after=2)
+    out = syscall_scan.measure(arm64_baseline, reader)
+    assert out["partial"] is True
+    assert out["read_errors"] > 0
+    assert out["counts"]["intact"] >= 1
+    assert out["counts"]["patched"] == 0
+
+
+def test_the_note_says_how_many_stubs_could_not_be_read(arm64_baseline):
+    out = syscall_scan.measure(arm64_baseline, _reader_from(arm64_baseline, patched={}, fail_after=2))
+    assert out["read_errors"] == 1 and out["counts"]["unreadable"] == 1
+    assert "1 stub" in out["note"] and "partial" in out["note"]
+
+
+def test_a_complete_scan_is_not_partial(arm64_baseline):
+    out = syscall_scan.measure(arm64_baseline, _reader_from(arm64_baseline, patched={}))
+    assert (out["partial"], out["read_errors"], out["note"]) == (False, 0, "")
+
+
+@pytest.mark.parametrize("region, owner", [
+    (_IMAGE._replace(path="\\Device\\HarddiskVolume3\\Windows\\System32\\NTDLL.DLL"), "ntdll.dll"),
+    (_IMAGE._replace(path="\\Device\\HarddiskVolume3\\Program Files\\Edr\\EdrHook.dll"), "edrhook.dll"),
+    (_PRIVATE, "private"),
+    (_IMAGE, None),
+    (_IMAGE._replace(path=""), None),
+    (_IMAGE._replace(path="\\Device\\HarddiskVolume3\\"), None),
+    (syscall_scan.Region(syscall_scan.MEM_COMMIT, syscall_scan.MEM_MAPPED, "\\Device\\X\\a.dat"), None),
+    (_PRIVATE._replace(state=0x2000), None),
+    (None, None),
+])
+def test_the_owner_is_a_lower_case_basename_private_or_none(region, owner):
+    assert syscall_scan.owner_from_region(region) == owner
+
+
+def test_a_jump_back_into_ntdll_named_by_its_device_path_is_diverged(arm64_baseline):
+    # the target region names ntdll the way GetMappedFileNameW does, upper-case at that
+    reader = _reader_from(arm64_baseline,
+                          patched={"NtWriteVirtualMemory": ("0500001400000000", "ntdll.dll")})
+    s = syscall_scan.measure(arm64_baseline, reader)["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["target_owner"]) == ("diverged", "ntdll.dll")
+
+
+def test_a_jump_into_ntdlls_own_image_is_diverged(arm64_baseline):
+    # no region of its own: the target lies in the ntdll image the module list maps
+    reader = _reader_from(arm64_baseline,
+                          patched={"NtWriteVirtualMemory": ("0500001400000000", None)})
+    s = syscall_scan.measure(arm64_baseline, reader)["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["target_owner"]) == ("diverged", "ntdll.dll")
+
+
+def test_a_jump_into_another_module_is_hooked(arm64_baseline):
+    reader = _reader_from(arm64_baseline,
+                          patched={"NtWriteVirtualMemory": ("0500001400000000", "edr.dll")})
+    s = syscall_scan.measure(arm64_baseline, reader)["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["target_owner"], s["pattern"]) == ("hooked", "edr.dll", "B")
+
+
+_EDR_TARGET = 0x7FFA00001230
+
+
+def _with_edr_at_target(reader):
+    reader._regions.insert(0, (_EDR_TARGET & ~0xFFF, 0x1000, _owner_region("edrhook.dll")))
+    return reader
+
+
+def test_an_x64_jmp_rip_hook_is_followed_through_its_pointer(x64_baseline):
+    sc = x64_baseline.syscalls["NtWriteVirtualMemory"]
+    stub = _MODULE_BASES["ntdll.dll"] + sc.rva
+    pointer = 0x7FF830000000
+    disp = (pointer - (stub + 6)) & 0xFFFFFFFF
+    assert disp < 0x80000000
+    reader = _reader_from(x64_baseline, patched={
+        "NtWriteVirtualMemory": ("ff25" + disp.to_bytes(4, "little").hex(), None)})
+    reader._ranges.append((pointer, bytearray(_EDR_TARGET.to_bytes(8, "little"))))
+    s = syscall_scan.measure(x64_baseline, _with_edr_at_target(reader))["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["pattern"], s["target_owner"]) == ("hooked", "JMP [rip]", "edrhook.dll")
+
+
+def test_an_unreadable_pointer_leaves_the_owner_unresolved(x64_baseline):
+    reader = _reader_from(x64_baseline, patched={"NtWriteVirtualMemory": ("ff2500001000", None)})
+    s = syscall_scan.measure(x64_baseline, _with_edr_at_target(reader))["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["target_owner"]) == ("diverged", None)
+
+
+def test_an_arm64_ldr_br_hook_is_followed_through_its_literal(arm64_baseline):
+    live = _words(0x58000050, 0xD61F0200) + _EDR_TARGET.to_bytes(8, "little")
+    reader = _reader_from(arm64_baseline, patched={"NtWriteVirtualMemory": (live.hex(), None)})
+    s = syscall_scan.measure(arm64_baseline, _with_edr_at_target(reader))["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["pattern"], s["target_owner"]) == ("hooked", "LDR x16; BR x16", "edrhook.dll")
+
+
+def test_the_owner_is_only_asked_for_a_stub_that_differs(arm64_baseline):
+    reader = _reader_from(arm64_baseline, patched={})
+    syscall_scan.measure(arm64_baseline, reader)
+    assert reader.region_queries == 0
+    reader = _reader_from(arm64_baseline,
+                          patched={"NtWriteVirtualMemory": ("0500001400000000", "private")})
+    syscall_scan.measure(arm64_baseline, reader)
+    assert reader.region_queries == 1
+
+
+def test_a_state_names_its_syscall(arm64_baseline):
+    out = syscall_scan.measure(arm64_baseline, _reader_from(arm64_baseline, patched={}))
+    s = out["states"]["NtWriteVirtualMemory"]
+    assert (s["name"], s["module"], s["number"], s["rva"]) == ("NtWriteVirtualMemory", "ntdll.dll", 0x3A, 652224)
+    assert set(s) == {"state", "pattern", "target_owner", "expected", "actual", "number_matches",
+                      "name", "module", "number", "rva"}
+
+
+def test_counts_name_all_five_states(arm64_baseline):
+    out = syscall_scan.measure(arm64_baseline, _reader_from(arm64_baseline, patched={}))
+    assert out["counts"] == {"intact": 3, "hooked": 0, "patched": 0, "diverged": 0, "unreadable": 0}
+
+
+def test_an_intact_stub_shaped_like_a_jump_costs_no_owner_lookup(x64_baseline):
+    # a clean stub that itself begins with a jump still matches the baseline
+    sc = x64_baseline.syscalls["NtWriteVirtualMemory"]
+    sc.stub_bytes = bytes.fromhex("e910000000") + sc.stub_bytes[5:]
+    reader = _reader_from(x64_baseline, patched={})
+    out = syscall_scan.measure(x64_baseline, reader)
+    assert out["states"]["NtWriteVirtualMemory"]["state"] == "intact"
+    assert reader.region_queries == 0
+
+
+def test_a_lone_unreadable_stub_costs_one_read():
+    reader = _flat_reader()
+    assert syscall_scan.read_spans(reader, [("a", 0x1000)], lambda key: 8) == {"a": None}
+    assert reader.reads == 1
+
+
+def test_the_win32_structures_have_the_64_bit_windows_layout():
+    import ctypes
+    if ctypes.sizeof(ctypes.c_void_p) != 8:
+        pytest.skip("the layout checked is the 64-bit one")
+    mbi = syscall_scan.MEMORY_BASIC_INFORMATION
+    assert ctypes.sizeof(mbi) == 48
+    assert (mbi.RegionSize.offset, mbi.State.offset, mbi.Protect.offset, mbi.Type.offset) == (24, 32, 36, 40)
+    mi = syscall_scan.MODULEINFO
+    assert ctypes.sizeof(mi) == 24
+    assert (mi.SizeOfImage.offset, mi.EntryPoint.offset) == (8, 16)
+
+
+def test_the_scan_opens_the_process_for_reading_only():
+    assert syscall_scan.PROCESS_ACCESS == 0x1000 | 0x0010
+    with open(syscall_scan.__file__, encoding="utf-8") as fh:
+        source = fh.read()
+    for call in ("WriteProcessMemory", "VirtualProtectEx", "DebugActiveProcess",
+                 "CreateRemoteThread", "SuspendThread", "SetThreadContext"):
+        assert call not in source, call
+
+
+def test_the_win32_reader_is_only_built_on_windows():
+    if os.name == "nt":
+        pytest.skip("on Windows it opens a real process")
+    with pytest.raises(OSError):
+        syscall_scan.Win32Reader(os.getpid(), "x64", "1.0")
