@@ -144,6 +144,8 @@ RIZIN_FUNCTIONS = [
     "rizinLoadEmuPane", "rizinEmuPaneSay", "rizinOnEmuPaneClick", "rizinOnEmuPaneChange", "rizinSetRegister",
     "rizinUnpatch", "rizinUnbreak", "rizinReanalyze", "rizinExportPatched", "rizinEmuEmpty", "rizinEmuHandSignature",
     "rizinEmuPatchesHeadHtml",
+    # The hand-off of the exported copy to the Submit tab (Task 13)
+    "rizinDetonatePatched",
     # The gutter and the patch menu (Task 12): the marks DISASSEMBLY draws and the lists they come from, a click in the
     # gutter, the four patches of one instruction, the bytes by hand, Run to here
     "rizinSetLists", "rizinLoadMarks", "rizinToggleBreakpoint", "rizinPatchHex", "rizinPatchKinds", "rizinPatchPost",
@@ -154,7 +156,7 @@ RIZIN_CONSTS = ["rizinState", "RIZIN_POLL_MS", "RIZIN_HISTORY_MAX", "RIZIN_TAB_K
                 "RIZIN_PAGE", "RIZIN_FILTER_MS", "RIZIN_DOCK", "RIZIN_HEX_LEN", "RIZIN_MORE", "RIZIN_C_WORDS", "RIZIN_EMU", "RIZIN_EMU_PANE",
                 "RIZIN_PATCH"]
 RIZIN_LETS = []
-HELPERS = ["escapeHtml", "jsArg", "jsInt", "cssToken", "formatSize"]
+HELPERS = ["escapeHtml", "jsArg", "jsInt", "cssToken", "formatSize", "handleFileSelect"]
 
 HOSTILE = "<img src=x onerror=alert(1)>"
 
@@ -913,7 +915,8 @@ globalThis.fetch = (url, init = {}) => {
     return new Promise(resolve => setTimeout(() => {
         inflight--;
         inFlight.set(url, inFlight.get(url) - 1);
-        resolve({ ok: status < 400, status, json: async () => data });
+        resolve({ ok: status < 400, status, json: async () => data,
+                  blob: async () => new Blob([data instanceof Uint8Array ? data : JSON.stringify(data)]) });
     }, delay));
 };
 const flying = prefix => [...inFlight].some(([url, n]) => n > 0 && url.startsWith(prefix));
@@ -1211,6 +1214,15 @@ function serve(sid, s) {
         return [200, { path: 'C:\\Temp\\rizin_uploads\\0123456789abcdef_e.patched.exe', name: '0123456789abcdef_e.patched.exe',
                        sha256: 'ab'.repeat(32), patched: mine.reduce((n, p) => n + p.size, 0), skipped: s.skipped || [],
                        note: 'Patched copy made by TDC (RIZIN tab).\nOriginal: C:\\x\\e.exe\n' }, s.actDelay ?? 1];
+    });
+    // Task 13: the copy the export wrote is fetched back through /api/file/download?path=…. s.copies {path: Uint8Array} is
+    // what the uploads folder holds; a path that is not in it is a 404, as on the server. Hook download answers instead.
+    on('GET', '/api/file/download', url => {
+        const path = new URLSearchParams(url.split('?')[1]).get('path');
+        const scripted = s.download && s.download(path, s);
+        if (scripted) return scripted;
+        const copy = (s.copies || {})[path];
+        return copy ? [200, copy, s.actDelay ?? 1] : [404, { error: 'File not found' }];
     });
     on('POST', `/api/rizin/${sid}/reanalyze`, (url, body) => {
         if (s.ended) return ENDED;
@@ -6522,6 +6534,261 @@ def test_rizin_emulation_pane_exports_and_says_what_could_not_be_placed():
     assert r["stale"] == {"before": False, "after": True}, r["stale"]
     assert r["none"] is False and r["noneSent"] == 0
     assert r["refused"][0] is False and "none of the patches could be placed" in r["refused"][1], r["refused"]
+
+
+# --- Task 13: the exported copy goes to the Submit tab ---------------------------------------------
+#
+# The copy is fetched through /api/file/download, put into #file-input and shown by the real handleFileSelect; the Submit tab
+# opens, and the user picks the target and presses Detonate there. The tests run the real markup of the Submit tab.
+# Added to the shim here: a DataTransfer (what assigns input.files in a browser), the Submit tab's markup, and a switchTab
+# that records the tab it opened and what the upload zone showed at that moment. File and Blob are Node's own.
+HANDOFF_SETUP = EMU_PANE_SETUP + r"""
+    class FakeDataTransfer {
+        constructor() { this.list = []; this.items = { add: file => { this.list.push(file); } }; }
+        get files() { return this.list.slice(); }
+    }
+    globalThis.DataTransfer = FakeDataTransfer;
+    const holder = document.createElement('div');
+    holder.innerHTML = SUBMIT_TAB_JSON;
+    document.body.appendChild(holder);
+    const zone = $('upload-zone'), input = $('file-input'), detonate = $('submit-btn'), submitResult = $('submit-result');
+    // handleFileSelect sets the property, the markup the attribute: the shim does not link them
+    const isOff = () => (detonate.disabled !== undefined ? detonate.disabled : detonate.hasAttribute('disabled'));
+    const zoneText = () => text(zone.querySelector('p'));
+    input.files = { length: 0 };
+    const switched = [];
+    globalThis.switchTab = name => switched.push([name, zoneText(), isOff()]);
+    const PATH = 'C:\\Temp\\rizin_uploads\\0123456789abcdef_e.patched.exe', NAME = '0123456789abcdef_e.patched.exe';
+    const COPY = new Uint8Array([0x4d, 0x5a, 0x90, 0x90, 0x00, 0x01]);
+    const handoff = () => pane.querySelector('[data-rizin-act="detonate"]');
+    const exportIt = async () => {
+        click(pane.querySelector('[data-rizin-act="export"]'));
+        await until(() => pane.querySelector('.rizin-emu-export'), 'the export'); await quiet();
+    };
+    const submitted = () => calls.filter(c => c[1].includes('/api/submit')).length;
+"""
+
+
+def _handoff(script):
+    return _scripted(HANDOFF_SETUP.replace("SUBMIT_TAB_JSON", json.dumps(_tab_markup("submit"))) + script)
+
+
+@needs_node
+def test_rizin_export_then_detonate_fills_the_submit_tab():
+    # the exported path is downloaded, put into #file-input, handleFileSelect is called,
+    # the tab switches to submit, and nothing is submitted on its own
+    r = _handoff(r"""
+        await fill(); await showPane();
+        S.copies = { [PATH]: COPY };
+        r.before = { zone: zoneText(), disabled: isOff(), files: input.files.length };
+        await exportIt();
+        // Exporting alone does not touch the Submit tab: the copy is handed on by its own button
+        r.exported = { zone: zoneText(), files: input.files.length, switched: switched.length,
+                       downloads: gets(0, '/api/file/download').length, button: text(handoff()) };
+        const f = calls.length;
+        click(handoff());
+        await until(() => switched.length, 'the Submit tab opens'); await quiet();
+        const file = input.files[0];
+        r.after = { files: input.files.length, name: file.name, size: file.size,
+                    bytes: Array.from(new Uint8Array(await file.arrayBuffer())), zone: zoneText(),
+                    disabled: isOff(), switched,
+                    downloads: gets(f, '/api/file/download').map(c => new URLSearchParams(c[1].split('?')[1]).get('path')),
+                    other: calls.slice(f).filter(c => c[0] !== 'GET').map(c => c[0] + ' ' + c[1]),
+                    submits: submitted(), busy: rizinState.emuPane.busy, said: note(),
+                    result: [submitResult.className, text(submitResult)] };
+        await tick(60); await quiet();
+        r.stillNothing = { submits: submitted(), other: calls.slice(f).filter(c => c[0] !== 'GET').length };
+    """)
+    assert "error" not in r, r.get("error")
+    assert r["before"] == {"zone": "Drop file here or click to browse", "disabled": True, "files": 0}, r["before"]
+    assert r["exported"]["zone"] == "Drop file here or click to browse" and r["exported"]["files"] == 0, \
+        "Export alone filled the Submit tab: " + str(r["exported"])
+    assert r["exported"]["switched"] == 0 and r["exported"]["downloads"] == 0, "Export alone fetched the copy or opened the tab"
+    assert "Submit" in r["exported"]["button"], r["exported"]
+    after = r["after"]
+    assert after["downloads"] == ["C:\\Temp\\rizin_uploads\\0123456789abcdef_e.patched.exe"], \
+        "the copy is fetched by the path the export answered, and once"
+    assert after["files"] == 1 and after["name"] == "0123456789abcdef_e.patched.exe", \
+        "the file in #file-input is not the patched copy under its patched name: " + str(after["name"])
+    assert after["bytes"] == [0x4d, 0x5a, 0x90, 0x90, 0x00, 0x01] and after["size"] == 6, "the bytes are not the ones downloaded"
+    assert after["zone"] == "0123456789abcdef_e.patched.exe (6 B)", \
+        "handleFileSelect was not called with the file (the upload zone shows it): " + after["zone"]
+    assert after["disabled"] is False, "Detonate stays disabled: handleFileSelect did not run"
+    assert after["switched"] == [["submit", "0123456789abcdef_e.patched.exe (6 B)", False]], \
+        "the tab is opened once, after the file was chosen: " + str(after["switched"])
+    assert after["other"] == [] and after["submits"] == 0 and r["stillNothing"] == {"submits": 0, "other": 0}, \
+        "the hand-off asked a route for more than the download: " + str(after["other"])
+    assert after["busy"] == "" and "nothing has been submitted" in after["said"].lower(), after["said"]
+    assert after["result"] == ["submit-result visible", "Patched copy from the RIZIN tab: 3 bytes patched. Nothing has been submitted yet."], after["result"]
+    assert "app.js?v=126" not in _read(INDEX_HTML), "app.js changed for the hand-off to the Submit tab, its version did not"
+
+
+@needs_node
+def test_rizin_export_reports_patches_it_could_not_place():
+    # R67: a copy whose patches could not all be placed still goes to the Submit tab, and the user is told which are
+    # missing from it BEFORE they press Detonate: beside the hand-off button (the count on it, the addresses as "0x…"
+    # strings above it) and, once the file is chosen, in the Submit tab itself, which a later clean copy does not leave
+    # standing. A copy that no longer matches the patches does not go. The pane already showed the skipped addresses
+    # (Task 11's test); what is proved here is that the hand-off carries them and that nothing is silent.
+    r = _handoff(r"""
+        await fill(); await showPane();
+        S.copies = { [PATH]: COPY };
+        S.skipped = [0x50000010, 0x50000020];
+        await exportIt();
+        const box = pane.querySelector('.rizin-emu-export');
+        r.pane = { text: text(box), button: text(handoff()), disabled: handoff().hasAttribute('disabled'),
+                   buttonInBox: box.contains(handoff()) };
+        r.paneBeforeHandoff = { files: input.files.length, switched: switched.length };
+        click(handoff());
+        await until(() => switched.length, 'the hand-off'); await quiet();
+        r.hand = { name: input.files[0].name, zone: zoneText(), result: [submitResult.className, text(submitResult)],
+                   switched: switched.map(s => s[0]), submits: submitted() };
+        // A clean copy next: the warning of the one before does not stay in front of it
+        S.skipped = [];
+        await exportIt();
+        r.clean = { button: text(handoff()), box: text(pane.querySelector('.rizin-emu-export')) };
+        click(handoff());
+        await until(() => switched.length === 2, 'the second hand-off'); await quiet();
+        r.cleanHand = { result: [submitResult.className, text(submitResult)], name: input.files[0].name };
+        // A patch taken back after the export: the copy is out of date, and the button does not offer it
+        const f = calls.length;
+        click(pane.querySelector('.rizin-emu-patch[data-addr="0x1400014d0"] [data-rizin-act="unpatch"]'));
+        await until(() => !pane.querySelector('.rizin-emu-patch[data-addr="0x1400014d0"]'), 'taken back'); await quiet();
+        r.stale = { disabled: handoff().hasAttribute('disabled'), said: /changed since/.test(text(pane.querySelector('.rizin-emu-export'))),
+                    downloads: gets(f, '/api/file/download').length };
+    """)
+    assert "error" not in r, r.get("error")
+    p = r["pane"]
+    assert "0x50000010" in p["text"] and "0x50000020" in p["text"] and "not placed" in p["text"].lower(), p
+    assert p["button"] == "To the Submit tab (2 patches not in it)" and p["disabled"] is False and p["buttonInBox"] is True, \
+        "the hand-off does not carry how many patches are missing: " + str(p)
+    assert r["paneBeforeHandoff"] == {"files": 0, "switched": 0}, "the copy went on before the user pressed the button"
+    h = r["hand"]
+    assert h["name"] == "0123456789abcdef_e.patched.exe" and h["zone"].startswith("0123456789abcdef_e.patched.exe"), \
+        "a copy with skipped patches did not go to the Submit tab under its patched name: " + str(h)
+    assert h["switched"] == ["submit"] and h["submits"] == 0
+    assert h["result"][0] == "submit-result visible warning", "the Submit tab shows no warning: " + str(h["result"])
+    assert "0x50000010" in h["result"][1] and "0x50000020" in h["result"][1] and "Not in the copy" in h["result"][1], \
+        "the Submit tab does not name the addresses that are not in the copy: " + h["result"][1]
+    assert "0x" not in r["cleanHand"]["result"][1] and r["cleanHand"]["result"][0] == "submit-result visible", \
+        "the warning of the copy before stayed in front of a clean copy: " + str(r["cleanHand"])
+    assert r["clean"]["button"] == "To the Submit tab" and "Every patch was placed" in r["clean"]["box"], r["clean"]
+    assert r["stale"] == {"disabled": True, "said": True, "downloads": 0}, r["stale"]
+
+
+@needs_node
+def test_rizin_detonate_hand_off_fails_loudly_and_leaves_the_submit_tab_alone():
+    # Every way the hand-off can break says why in the pane and leaves #file-input, the upload zone, the result and the
+    # tab as they were: a download that is refused or empty, a browser without a DataTransfer, a second press while one
+    # is out (one download), and a file opened meanwhile (the old copy does not arrive in the new file's Submit tab)
+    r = _handoff(r"""
+        await fill(); await showPane();
+        await exportIt();
+        const untouched = () => ({ files: input.files.length, zone: zoneText(), disabled: isOff(),
+                                   result: submitResult.className,
+                                   switched: switched.filter(s => s[0] === 'submit').length });
+        const handPress = async () => { click(handoff()); await until(() => !rizinState.emuPane.busy, 'the hand-off ends'); await quiet(); };
+        r.base = untouched();
+        // The folder holds no such file (a copy that was cleaned up): 404
+        await handPress();
+        r.notFound = { ...untouched(), said: note(), buttonOff: handoff().hasAttribute('disabled') };
+        // An empty answer
+        S.copies = { [PATH]: new Uint8Array([]) };
+        await handPress();
+        r.empty = { ...untouched(), said: note() };
+        // The web UI does not answer
+        const realFetch = globalThis.fetch;
+        globalThis.fetch = () => Promise.reject(new TypeError('Failed to fetch'));
+        await handPress();
+        r.network = { ...untouched(), said: note() };
+        globalThis.fetch = realFetch;
+        // A browser that cannot build a file list
+        S.copies = { [PATH]: COPY };
+        const Real = globalThis.DataTransfer;
+        globalThis.DataTransfer = function () { throw new TypeError('Illegal constructor'); };
+        await handPress();
+        r.noTransfer = { ...untouched(), said: note() };
+        // ...or one that takes the list and keeps none of it
+        globalThis.DataTransfer = class { constructor() { this.items = { add() {} }; this.files = []; } };
+        await handPress();
+        r.keptNone = { ...untouched(), said: note() };
+        // ...or one whose list holds another file than the one put in
+        globalThis.DataTransfer = class { constructor() { this.items = { add() {} }; this.files = [new File(['x'], 'other.exe')]; } };
+        await handPress();
+        r.otherFile = { ...untouched(), said: note() };
+        globalThis.DataTransfer = Real;
+        // A second press while the first one is out: one download
+        S.actDelay = 60;
+        const f = calls.length;
+        click(handoff());
+        await until(() => rizinState.emuPane.busy === 'detonate', 'the fetch waits');
+        r.waiting = { said: note(), disabled: handoff().hasAttribute('disabled'), again: await rizinDetonatePatched(PATH, NAME),
+                      exportAgain: await rizinExportPatched() };
+        await until(() => switched.length === 1, 'the hand-off'); await quiet();
+        S.actDelay = undefined;
+        r.once = { downloads: gets(f, '/api/file/download').length, posts: posts(f, '/export').length, switched: switched.length };
+        // A file opened while the copy is on its way: the old file's copy does not go to the Submit tab
+        input.files = { length: 0 }; switched.length = 0; submitResult.className = 'submit-result'; zone.querySelector('p').textContent = 'Drop file here or click to browse';
+        detonate.disabled = true;
+        S.actDelay = 80;
+        click(handoff());
+        await until(() => rizinState.emuPane.busy === 'detonate', 'the fetch waits again');
+        const T = { analysis: 'done', done: ['aaa'], patches: [], breakpoints: [] };
+        serve('S2', T);
+        opens['C:\\x\\f.exe'] = T;
+        await openInRizin('C:\\x\\f.exe');
+        await until(() => rizinState.landed, 'the other file'); await tick(120); await quiet();
+        S.actDelay = undefined;
+        r.moved = { ...untouched(), session: rizinState.session, busy: rizinState.emuPane.busy };
+    """)
+    assert "error" not in r, r.get("error")
+    base = r["base"]
+    assert base == {"files": 0, "zone": "Drop file here or click to browse", "disabled": True, "result": "submit-result", "switched": 0}, base
+    for key, why in (("notFound", "http 404"), ("empty", "empty"), ("network", "did not answer"),
+                     ("noTransfer", "did not take the file"), ("keptNone", "did not take the file"),
+                     ("otherFile", "did not take the file")):
+        got = r[key]
+        assert {k: got[k] for k in base} == base, f"{key}: the Submit tab was touched: {got}"
+        assert "not handed to the submit tab" in got["said"].lower() and why in got["said"].lower(), f"{key}: {got['said']}"
+    assert r["notFound"]["buttonOff"] is False, "a failed hand-off took the button away: the user cannot try again"
+    w = r["waiting"]
+    assert w["disabled"] is True and "fetching" in w["said"].lower() and w["again"] is False and w["exportAgain"] is False, w
+    assert r["once"] == {"downloads": 1, "posts": 0, "switched": 1}, "a second press fetched again: " + str(r["once"])
+    m = r["moved"]
+    assert m["session"] == "S2" and m["switched"] == 0 and m["files"] == 0 and m["disabled"] is True and m["busy"] == "", \
+        "the copy of the file before arrived in the Submit tab after another file was opened: " + str(m)
+
+
+@needs_node
+def test_rizin_detonate_hand_off_treats_the_name_and_path_as_text():
+    # The name of the copy comes from a filename the analyst uploaded: it reaches the upload zone, the Submit tab's
+    # result and the request as text (no element, no handler), and the path leaves in the query string encoded, whatever
+    # characters it holds
+    r = _handoff(r"""
+        const NASTY = '<img src=x onerror=alert(1)>', ODD = 'C:\\Temp\\rizin_uploads\\a&path=C:\\evil #1 100%.patched.exe';
+        await fill(); await showPane();
+        S.copies = { [ODD]: COPY };
+        S.exportCopy = () => [200, { path: ODD, name: NASTY, sha256: 'ab'.repeat(32), patched: 3, skipped: [0x50000010],
+                                     note: NASTY + '\n' }];
+        await exportIt();
+        const f = calls.length;
+        click(handoff());
+        await until(() => switched.length, 'the hand-off'); await quiet();
+        r.url = gets(f, '/api/file/download').map(c => c[1]);
+        r.got = new URLSearchParams(r.url[0].split('?')[1]).get('path');
+        r.name = input.files[0].name;
+        const mine = [pane, zone, submitResult].flatMap(el => [...el.walk()]);
+        r.tags = mine.filter(e => ['IMG', 'SCRIPT', 'IFRAME'].includes(e.tagName)).length;
+        r.on = mine.flatMap(e => Object.keys(e.attrs).filter(k => k.startsWith('on')));
+        r.zone = zoneText(); r.result = text(submitResult);
+    """)
+    assert "error" not in r, r.get("error")
+    assert r["got"] == "C:\\Temp\\rizin_uploads\\a&path=C:\\evil #1 100%.patched.exe", \
+        "the path did not survive the query string: " + str(r["url"])
+    assert len(r["url"]) == 1 and r["url"][0].count("path=") == 1, r["url"]
+    assert r["name"] == "<img src=x onerror=alert(1)>" and r["zone"].startswith("<img src=x onerror=alert(1)> ("), r["zone"]
+    assert r["tags"] == 0 and r["on"] == [], "the name of the copy became markup"
+    assert "0x50000010" in r["result"]
 
 
 @needs_node

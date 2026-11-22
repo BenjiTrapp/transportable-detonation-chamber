@@ -25322,11 +25322,14 @@ function rizinEmuPatchesHtml(patches, functions, options) {
     let result = '';
     if (exported) {
         const skipped = (Array.isArray(exported.skipped) ? exported.skipped : []).map(addr => rizinEmuRowAddr(addr) || '?');
+        const current = exported.sig === rizinEmuHandSignature(hand);
         result = `<div class="rizin-emu-export" role="status"><b>${escapeHtml(exported.name)}</b> · ${escapeHtml(exported.patched)} bytes patched`
             + (skipped.length ? `<div class="rizin-emu-note rizin-emu-note-error">Not placed in the file (no file offset there), so not in the copy: ${escapeHtml(skipped.join(', '))}</div>`
                 : '<div>Every patch was placed in the file.</div>')
-            + (exported.sig === rizinEmuHandSignature(hand) ? ''
-                : '<div class="rizin-emu-note rizin-emu-note-error">The patches changed since this copy was made: export again.</div>')
+            + (current ? '' : '<div class="rizin-emu-note rizin-emu-note-error">The patches changed since this copy was made: export again.</div>')
+            + `<div><button type="button" class="rizin-tool" data-rizin-act="detonate"${current && !busy ? '' : ' disabled'} `
+            + `title="Choose this copy in the Submit tab; nothing is submitted until Detonate is pressed there">To the Submit tab`
+            + `${skipped.length ? ` (${skipped.length} patch${skipped.length === 1 ? '' : 'es'} not in it)` : ''}</button></div>`
             + `<pre>${escapeHtml(exported.note)}</pre></div>`;
     }
     const written = run.reduce((sum, patch) => sum + (Number.isSafeInteger(patch.size) ? patch.size : 0), 0);
@@ -25448,6 +25451,10 @@ function rizinOnEmuPaneClick(event) {
         const row = button.closest('[data-addr]');
         const addr = row ? row.getAttribute('data-addr') : null;
         if (act === 'export') return rizinExportPatched();
+        if (act === 'detonate') {
+            const copy = rizinState.emuPane.exported;
+            return copy ? rizinDetonatePatched(copy.path, copy.name) : false;
+        }
         if (act === 'unpatch-all') return rizinUnpatch();
         if (act === 'unpatch') return rizinUnpatch(addr);
         if (act === 'unbreak') return rizinUnbreak(addr);
@@ -25619,6 +25626,60 @@ async function rizinExportPatched() {
                       note: String(d.note ?? ''), sig: rizinEmuHandSignature(hand) };
     rizinEmuPaneSay('');
     return pane.exported;
+}
+
+// The hand-off to the Submit tab: the copy at path (the server wrote it in the uploads folder) is fetched through
+// /api/file/download, wrapped in a File that carries the patched name, put into #file-input through a DataTransfer and
+// shown by handleFileSelect, and the Submit tab opens. NOTHING is submitted: the target and the press of Detonate are
+// the Submit tab's, and no route is asked to run a file by its path. Where patches had no place in the file the Submit
+// tab says so too, where the user is about to press Detonate. Returns true once the copy waits there, false (and says
+// why in the pane) when it does not: then the Submit tab is left as it was.
+async function rizinDetonatePatched(path, name) {
+    const sid = rizinState.session, pane = rizinState.emuPane;
+    if (!sid || pane.busy || typeof path !== 'string' || !path || typeof name !== 'string' || !name) return false;
+    const copy = pane.exported && pane.exported.path === path ? pane.exported : null;
+    const skipped = copy ? copy.skipped.map(addr => rizinEmuRowAddr(addr) || '?') : [];
+    const patched = copy ? copy.patched : 0;
+    pane.busy = 'detonate';
+    rizinEmuPaneSay('Fetching the patched copy…', 'wait');
+    let blob = null, why = '';
+    try {
+        const resp = await fetch(`/api/file/download?path=${encodeURIComponent(path)}`);
+        if (!resp.ok) why = `the web UI answered HTTP ${resp.status}`;
+        else blob = await resp.blob();
+    } catch (e) {
+        why = `the web UI did not answer (${e.message})`;
+    }
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (!why && !(blob && blob.size > 0)) why = 'the copy came back empty';
+    if (!why) {
+        try {
+            const input = document.getElementById('file-input'), chosen = input.files;
+            const transfer = new DataTransfer();
+            transfer.items.add(new File([blob], name, { type: blob.type || 'application/octet-stream' }));
+            input.files = transfer.files;
+            if (!input.files || input.files.length !== 1 || input.files[0].name !== name) {
+                why = 'the Submit tab did not take the file';
+                input.files = chosen;           // what was chosen there before stays chosen
+            } else {
+                handleFileSelect(input.files[0]);
+                const result = document.getElementById('submit-result');
+                result.className = `submit-result visible${skipped.length ? ' warning' : ''}`;
+                result.textContent = `Patched copy from the RIZIN tab: ${patched} byte${patched === 1 ? '' : 's'} patched. `
+                    + (skipped.length ? `Not in the copy (no place in the file): ${skipped.join(', ')}. ` : '') + 'Nothing has been submitted yet.';
+                switchTab('submit');
+            }
+        } catch (e) {
+            why = `the Submit tab did not take the file (${e.message})`;
+        }
+    }
+    if (why) {
+        rizinEmuPaneSay(`The copy was not handed to the Submit tab: ${why}.`, 'error');
+        return false;
+    }
+    rizinEmuPaneSay(`${name} waits in the Submit tab: nothing has been submitted yet.`);
+    return true;
 }
 
 // --- Breakpoints and patches in DISASSEMBLY ---
