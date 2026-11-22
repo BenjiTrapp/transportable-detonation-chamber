@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import ctypes
 import functools
+import json
 import ntpath
 import os
+import threading
 from typing import NamedTuple
 
 from syscall_baseline import (READ_LEN, STATE_DIVERGED, STATE_HOOKED, STATE_INTACT,
@@ -180,14 +182,182 @@ def _stubs(n: int) -> str:
     return f"{n} stub{'s' if n != 1 else ''}"
 
 
+KEY_VERSION = 1
+
+
+class HookAllowlist:
+    """Hooks seen on this host while it was considered clean, as `(syscall, owner)` pairs.
+
+    This is not `MemoryBaseline`: that folds the process into every key, so a hook
+    recorded in explorer.exe could never cover the same hook in the sample, and an EDR
+    hooks ntdll in every process it watches. The key here has no process in it, on purpose.
+
+    The list belongs to one build and view; `status` says whether it applies to a scan.
+    A list for another build says nothing about this one, and applying it would suppress
+    findings on no evidence. Only `hooked` stubs whose owner is a module are ever
+    recorded: a patch must never become suppressible, or capturing a dirty host would
+    whitelist the attacker's own."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.RLock()
+        # why the file on disk is not in use, None if it is
+        self.problem: str | None = None
+        self._build, self._view, self._pairs = "", "", set()
+        self.load()
+
+    @staticmethod
+    def _pair(entry) -> tuple[str, str] | None:
+        """The key of a deviation or stored entry, None if it must not be suppressible."""
+        if not isinstance(entry, dict):
+            return None
+        name = entry.get("name", entry.get("syscall"))
+        owner = entry.get("target_owner", entry.get("owner"))
+        if not isinstance(name, str) or not name or not isinstance(owner, str):
+            return None
+        owner = owner.strip().lower()
+        if not owner or owner == OWNER_PRIVATE:
+            return None
+        return name, owner
+
+    def knows(self, syscall_name: str, owner: str) -> bool:
+        """Whether this hook is recorded. Not a check of build and view: see `status`."""
+        if not isinstance(owner, str):
+            return False
+        with self._lock:
+            return (syscall_name, owner.strip().lower()) in self._pairs
+
+    def status(self, build: str | None, view: str | None) -> dict:
+        """Whether the list may be applied to a scan of `build` and `view`, and if not, why.
+
+        An empty list applies to anything: it has nothing to suppress."""
+        with self._lock:
+            reason = self.problem or ""
+            if not reason and self._pairs and (self._build, self._view) != (build, view):
+                reason = (f"the hook allowlist was recorded for build {self._build or 'unknown'}, "
+                          f"view {self._view or 'unknown'}; this scan is build "
+                          f"{build or 'unknown'}, view {view or 'unknown'}: not applied")
+            return {"applied": not reason, "entries": len(self._pairs), "reason": reason}
+
+    def entries(self) -> list[dict]:
+        with self._lock:
+            return [{"syscall": name, "owner": owner} for name, owner in sorted(self._pairs)]
+
+    def add_from(self, result: dict) -> int:
+        """Record the hooks of a `measure` result; returns how many were new.
+
+        A result of another build or view than the list starts the list afresh: its old
+        pairs are refused by `status` anyway. A result without hooks changes nothing.
+        Raises OSError if the list cannot be written; the list is then as before."""
+        build, view = result.get("build"), result.get("view")
+        if not (isinstance(build, str) and build and isinstance(view, str) and view):
+            return 0
+        found = set()
+        for entry in result.get("deviations") or ():
+            if isinstance(entry, dict) and entry.get("state") == STATE_HOOKED:
+                pair = self._pair(entry)
+                if pair:
+                    found.add(pair)
+        if not found:
+            return 0
+        with self._lock:
+            kept = self._pairs if (self._build, self._view) == (build, view) else set()
+            added = len(found - kept)
+            if added or kept is not self._pairs:
+                self._commit(build, view, kept | found)
+            return added
+
+    def clear(self) -> None:
+        with self._lock:
+            self._commit("", "", set())
+
+    def _commit(self, build: str, view: str, pairs: set) -> None:
+        before = self._build, self._view, self._pairs
+        self._build, self._view, self._pairs = build, view, pairs
+        try:
+            self.save()
+        except OSError:
+            self._build, self._view, self._pairs = before
+            raise
+        self.problem = None
+
+    def save(self) -> None:
+        """Write beside the file, flush, then swap it in: a crash halfway leaves the old
+        list, never half of one that would silently suppress the wrong hooks."""
+        with self._lock:
+            payload = {"version": KEY_VERSION, "build": self._build, "view": self._view,
+                       "entries": self.entries()}
+            parent = os.path.dirname(self.path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            tmp = self.path + ".tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, indent=2)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(tmp, self.path)
+            except OSError:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                raise
+
+    def load(self) -> None:
+        """Read the file; what cannot be trusted leaves the list empty and sets `problem`,
+        so that nothing is suppressed on its say-so."""
+        with self._lock:
+            self._build, self._view, self._pairs = "", "", set()
+            self.problem = None
+            if not os.path.isfile(self.path):
+                return
+            try:
+                with open(self.path, encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except (OSError, ValueError) as exc:
+                self._set_aside(str(exc))
+                return
+            if not isinstance(data, dict):
+                self._set_aside("not an object")
+                return
+            if data.get("version") != KEY_VERSION:
+                self.problem = (f"the hook allowlist {self.path} is of version "
+                                f"{data.get('version')!r}, this is version {KEY_VERSION}: "
+                                "not applied until the hooks are recorded again")
+                return
+            build, view, entries = data.get("build"), data.get("view"), data.get("entries")
+            if not (isinstance(build, str) and isinstance(view, str) and isinstance(entries, list)):
+                self._set_aside("build, view or entries missing")
+                return
+            self._build, self._view = build, view
+            self._pairs = {pair for pair in map(self._pair, entries) if pair}
+
+    def _set_aside(self, why: str) -> None:
+        """Keep an unreadable file for inspection rather than overwrite it on the next save."""
+        kept = ""
+        try:
+            os.replace(self.path, self.path + ".corrupt")
+            kept = f", kept as {self.path}.corrupt"
+        except OSError:
+            pass
+        self.problem = (f"the hook allowlist {self.path} is unreadable ({why}){kept}: "
+                        "not applied")
+
+
 def measure(baseline: Baseline, reader: ProcessReader, view: str | None = None,
-            build: str | None = None, modules: tuple[str, ...] = ("ntdll.dll",)) -> dict:
+            build: str | None = None, modules: tuple[str, ...] = ("ntdll.dll",),
+            allowlist: HookAllowlist | None = None) -> dict:
     """The state of each baseline stub of `modules` in the process behind `reader`.
 
     `view` and `build` default to what the reader says. A baseline of another view or
     build is refused before anything is read. `partial` is True when a stub is
     unreadable, an owner lookup failed, or nothing was measured at all: such a result
-    is never a clean process."""
+    is never a clean process.
+
+    With an `allowlist`, each state dict says whether its hook is a known one. Such a
+    stub stays in `states`, `counts` and `deviations`: an analyst must see that the EDR
+    hooks this process. Only a scorer's use of the stub is for the flag to change."""
     view = view or reader.view()
     build = build or reader.build()
     # RVAs and bytes hold for one build and view; read with another's, a verdict would
@@ -206,6 +376,13 @@ def measure(baseline: Baseline, reader: ProcessReader, view: str | None = None,
     for name, addr in addrs.items():
         states[name], failed = _state(reader, baseline.syscalls[name], live[name], addr, view)
         owner_errors += failed
+    listed = None if allowlist is None else allowlist.status(build, view)
+    if listed is not None and not listed["applied"]:
+        notes.append(listed["reason"])
+    if listed is not None:
+        for s in states.values():
+            s["allowlisted"] = (listed["applied"] and s["state"] == STATE_HOOKED
+                                and allowlist.knows(s["name"], s["target_owner"]))
     counts = dict.fromkeys(_STATES, 0)
     for s in states.values():
         counts[s["state"]] += 1
@@ -231,6 +408,7 @@ def measure(baseline: Baseline, reader: ProcessReader, view: str | None = None,
         "read_errors": read_errors,
         "owner_errors": owner_errors,
         "partial": partial,
+        "allowlist": listed,
         "note": "; ".join(notes),
     }
 

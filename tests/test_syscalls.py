@@ -1127,3 +1127,353 @@ def test_a_module_list_that_cannot_be_read_is_not_called_missing(arm64_baseline)
     assert out["states"] == {} and out["partial"] is True
     assert "could not be listed" in out["note"]
     assert "not loaded" not in out["note"]
+
+
+# --- the hook allowlist -------------------------------------------------------------------
+
+def _result_with(state="hooked", syscall="NtProtectVirtualMemory", owner="edr.dll",
+                 process=None, build="26220.5770", view="arm64", **extra):
+    """The slice of a `measure` result the allowlist reads, for one deviating stub."""
+    entry = dict(name=syscall, module="ntdll.dll", state=state, target_owner=owner, **extra)
+    if process is not None:
+        # a scan result does not name its process; the list must not care if one did
+        entry["process"] = process
+    return {"build": build, "view": view, "states": {syscall: entry}, "deviations": [entry]}
+
+
+def _allowlist(tmp_path, name="hooks.json"):
+    return syscall_scan.HookAllowlist(str(tmp_path / name))
+
+
+def _hooked_reader(baseline, owner="edr.dll"):
+    return _reader_from(baseline,
+                        patched={"NtProtectVirtualMemory": ("0500001400000000", owner)})
+
+
+def _protect(out):
+    return out["states"]["NtProtectVirtualMemory"]
+
+
+def test_allowlist_marks_a_known_hook_without_hiding_it(arm64_baseline, tmp_path):
+    reader = _hooked_reader(arm64_baseline)
+    al = _allowlist(tmp_path)
+    first = syscall_scan.measure(arm64_baseline, reader, allowlist=al)
+    assert al.add_from(first) == 1
+    second = syscall_scan.measure(arm64_baseline, reader, allowlist=al)
+    dev = [d for d in second["deviations"] if d["name"] == "NtProtectVirtualMemory"]
+    assert dev and dev[0]["state"] == "hooked"
+    assert dev[0]["allowlisted"] is True
+    assert second["counts"] == first["counts"]
+    assert second["counts"]["hooked"] == 1
+
+
+def test_a_hook_is_not_allowlisted_before_the_list_knows_it(arm64_baseline, tmp_path):
+    out = syscall_scan.measure(arm64_baseline, _hooked_reader(arm64_baseline),
+                               allowlist=_allowlist(tmp_path))
+    assert _protect(out)["allowlisted"] is False
+
+
+def test_every_state_dict_carries_the_flag_once_a_list_is_given(arm64_baseline, tmp_path):
+    out = syscall_scan.measure(arm64_baseline, _hooked_reader(arm64_baseline),
+                               allowlist=_allowlist(tmp_path))
+    assert all(s["allowlisted"] is False for s in out["states"].values())
+
+
+def test_allowlist_is_independent_of_the_process(tmp_path):
+    al = _allowlist(tmp_path)
+    assert al.add_from(_result_with(process="explorer.exe")) == 1
+    assert al.knows("NtProtectVirtualMemory", "edr.dll") is True
+    # the same hook seen in another process is the same entry
+    assert al.add_from(_result_with(process="sample.exe")) == 0
+    assert al.entries() == [{"syscall": "NtProtectVirtualMemory", "owner": "edr.dll"}]
+
+
+def test_a_hook_recorded_for_one_syscall_does_not_cover_another(tmp_path):
+    al = _allowlist(tmp_path)
+    al.add_from(_result_with())
+    assert al.knows("NtWriteVirtualMemory", "edr.dll") is False
+    assert al.knows("NtProtectVirtualMemory", "other.dll") is False
+
+
+def test_the_owner_is_matched_by_its_lower_case_basename(tmp_path):
+    al = _allowlist(tmp_path)
+    al.add_from(_result_with(owner="EDR.dll"))
+    assert al.knows("NtProtectVirtualMemory", "edr.DLL") is True
+
+
+def test_allowlist_never_covers_a_patched_stub(tmp_path):
+    al = _allowlist(tmp_path)
+    assert al.add_from(_result_with(state="patched", owner="private")) == 0
+    assert al.entries() == []
+
+
+@pytest.mark.parametrize("state, owner", [
+    ("patched", "edr.dll"),
+    ("patched", "private"),
+    ("diverged", "edr.dll"),
+    ("diverged", None),
+    ("unreadable", None),
+    ("intact", None),
+    ("hooked", "private"),
+    ("hooked", None),
+    ("hooked", ""),
+])
+def test_only_a_hook_owned_by_a_module_enters_the_list(tmp_path, state, owner):
+    al = _allowlist(tmp_path)
+    assert al.add_from(_result_with(state=state, owner=owner)) == 0
+    assert al.entries() == []
+
+
+def test_a_patched_stub_is_not_marked_even_if_the_list_names_its_pair(arm64_baseline, tmp_path):
+    al = _allowlist(tmp_path)
+    al.add_from(_result_with(owner="edr.dll"))
+    reader = _hooked_reader(arm64_baseline, owner="private")
+    out = syscall_scan.measure(arm64_baseline, reader, allowlist=al)
+    assert _protect(out)["state"] == "patched"
+    assert _protect(out)["allowlisted"] is False
+
+
+def test_add_from_reads_the_deviations_not_a_rescan(tmp_path):
+    al = _allowlist(tmp_path)
+    result = _result_with()
+    result["states"] = {}
+    assert al.add_from(result) == 1
+
+
+def test_add_from_takes_several_hooks_and_skips_the_rest(tmp_path):
+    al = _allowlist(tmp_path)
+    result = _result_with()
+    for name, state, owner in (("NtClose", "hooked", "edr.dll"), ("NtOpenFile", "patched", "private"),
+                               ("NtCreateFile", "hooked", "av.dll")):
+        result["deviations"].append(dict(name=name, state=state, target_owner=owner))
+    assert al.add_from(result) == 3
+    assert [(e["syscall"], e["owner"]) for e in al.entries()] == [
+        ("NtClose", "edr.dll"), ("NtCreateFile", "av.dll"), ("NtProtectVirtualMemory", "edr.dll")]
+
+
+def test_entries_come_back_in_a_stable_order(tmp_path):
+    al = _allowlist(tmp_path)
+    for name in ("NtZ", "NtA", "NtM"):
+        al.add_from(_result_with(syscall=name))
+    al.add_from(_result_with(syscall="NtA", owner="aa.dll"))
+    first = al.entries()
+    assert first == sorted(first, key=lambda e: (e["syscall"], e["owner"]))
+    assert al.entries() == first
+
+
+def test_entries_are_copies(tmp_path):
+    al = _allowlist(tmp_path)
+    al.add_from(_result_with())
+    al.entries()[0]["owner"] = "evil.dll"
+    al.entries().clear()
+    assert al.entries() == [{"syscall": "NtProtectVirtualMemory", "owner": "edr.dll"}]
+
+
+@pytest.mark.parametrize("build, view", [
+    ("", "arm64"), ("26220.5770", None), (None, "arm64"), ("26220.5770", ""), (None, None),
+])
+def test_a_result_without_build_and_view_cannot_be_recorded(tmp_path, build, view):
+    al = _allowlist(tmp_path)
+    assert al.add_from(_result_with(build=build, view=view)) == 0
+    assert al.entries() == []
+
+
+def test_the_list_survives_a_restart(tmp_path):
+    al = _allowlist(tmp_path)
+    al.add_from(_result_with())
+    again = _allowlist(tmp_path)
+    assert again.knows("NtProtectVirtualMemory", "edr.dll") is True
+    assert again.entries() == al.entries()
+
+
+def test_the_file_has_the_documented_format(tmp_path):
+    al = _allowlist(tmp_path)
+    al.add_from(_result_with())
+    with open(al.path) as f:
+        assert json.load(f) == {"version": 1, "build": "26220.5770", "view": "arm64",
+                                "entries": [{"syscall": "NtProtectVirtualMemory",
+                                             "owner": "edr.dll"}]}
+    assert syscall_scan.KEY_VERSION == 1
+
+
+def test_clear_empties_the_list_and_the_file(tmp_path):
+    al = _allowlist(tmp_path)
+    al.add_from(_result_with())
+    al.clear()
+    assert al.entries() == [] and al.knows("NtProtectVirtualMemory", "edr.dll") is False
+    assert _allowlist(tmp_path).entries() == []
+
+
+def test_a_missing_file_is_an_empty_list(tmp_path):
+    al = _allowlist(tmp_path, "sub/never.json")
+    assert al.entries() == [] and al.problem is None
+
+
+def test_save_creates_the_directory(tmp_path):
+    al = _allowlist(tmp_path, "sub/hooks.json")
+    al.add_from(_result_with())
+    assert os.path.isfile(al.path)
+
+
+def test_load_picks_up_what_another_writer_saved(tmp_path):
+    a, b = _allowlist(tmp_path), _allowlist(tmp_path)
+    a.add_from(_result_with())
+    assert b.entries() == []
+    b.load()
+    assert b.knows("NtProtectVirtualMemory", "edr.dll") is True
+
+
+def test_a_save_leaves_no_temp_file_behind(tmp_path):
+    al = _allowlist(tmp_path)
+    al.add_from(_result_with())
+    assert os.listdir(tmp_path) == ["hooks.json"]
+
+
+def test_a_failed_swap_keeps_the_old_file_and_the_old_list(tmp_path, monkeypatch):
+    al = _allowlist(tmp_path)
+    al.add_from(_result_with())
+    before = open(al.path).read()
+
+    def refuse(src, dst):
+        raise OSError("disk full")
+    monkeypatch.setattr(syscall_scan.os, "replace", refuse)
+    with pytest.raises(OSError):
+        al.add_from(_result_with(syscall="NtClose"))
+    monkeypatch.undo()
+    assert open(al.path).read() == before
+    assert al.knows("NtClose", "edr.dll") is False
+    assert os.listdir(tmp_path) == ["hooks.json"]
+
+
+def test_a_failed_clear_keeps_the_list(tmp_path, monkeypatch):
+    al = _allowlist(tmp_path)
+    al.add_from(_result_with())
+
+    def refuse(src, dst):
+        raise OSError("disk full")
+    monkeypatch.setattr(syscall_scan.os, "replace", refuse)
+    with pytest.raises(OSError):
+        al.clear()
+    assert al.knows("NtProtectVirtualMemory", "edr.dll") is True
+
+
+@pytest.mark.parametrize("text", ["{not json", "[]", '"x"', "7", "",
+                                  '{"version": 1, "build": 5, "view": "arm64", "entries": []}',
+                                  '{"version": 1, "build": "b", "view": "arm64", "entries": {}}'])
+def test_a_corrupt_file_is_kept_aside_and_reported(tmp_path, text):
+    path = tmp_path / "hooks.json"
+    path.write_text(text)
+    al = syscall_scan.HookAllowlist(str(path))
+    assert al.entries() == []
+    assert al.problem and "hooks.json" in al.problem
+    assert (tmp_path / "hooks.json.corrupt").read_text() == text
+    assert not path.exists()
+
+
+def test_a_file_of_another_version_is_ignored_and_reported_but_not_destroyed(tmp_path):
+    path = tmp_path / "hooks.json"
+    text = json.dumps({"version": 2, "build": "26220.5770", "view": "arm64",
+                       "entries": [{"syscall": "NtClose", "owner": "edr.dll"}]})
+    path.write_text(text)
+    al = syscall_scan.HookAllowlist(str(path))
+    assert al.knows("NtClose", "edr.dll") is False
+    assert "version" in al.problem
+    assert path.read_text() == text
+
+
+def test_malformed_entries_are_skipped_not_applied(tmp_path):
+    path = tmp_path / "hooks.json"
+    path.write_text(json.dumps({"version": 1, "build": "b", "view": "arm64", "entries": [
+        {"syscall": "NtClose", "owner": "edr.dll"}, {"syscall": "NtOpenFile"},
+        {"syscall": 3, "owner": "x.dll"}, "x", None,
+        {"syscall": "NtCreateFile", "owner": "private"}, {"syscall": "", "owner": "x.dll"},
+        {"syscall": "NtRead", "owner": ""}]}))
+    al = syscall_scan.HookAllowlist(str(path))
+    assert al.entries() == [{"syscall": "NtClose", "owner": "edr.dll"}]
+
+
+def test_a_list_of_another_build_is_refused_and_says_so(arm64_baseline, tmp_path):
+    reader = _hooked_reader(arm64_baseline)
+    al = _allowlist(tmp_path)
+    al.add_from(_result_with(build="26100.1"))
+    out = syscall_scan.measure(arm64_baseline, reader, allowlist=al)
+    assert _protect(out)["state"] == "hooked"
+    assert _protect(out)["allowlisted"] is False
+    assert out["allowlist"]["applied"] is False
+    assert "26100.1" in out["allowlist"]["reason"]
+    assert out["allowlist"]["reason"] in out["note"]
+    assert out["partial"] is False
+
+
+def test_a_list_of_another_view_is_refused_and_says_so(arm64_baseline, tmp_path):
+    al = _allowlist(tmp_path)
+    al.add_from(_result_with(view="x64"))
+    out = syscall_scan.measure(arm64_baseline, _hooked_reader(arm64_baseline), allowlist=al)
+    assert _protect(out)["allowlisted"] is False
+    assert out["allowlist"]["applied"] is False
+    assert "x64" in out["allowlist"]["reason"]
+
+
+def test_a_list_that_matches_is_reported_as_applied(arm64_baseline, tmp_path):
+    al = _allowlist(tmp_path)
+    al.add_from(_result_with())
+    out = syscall_scan.measure(arm64_baseline, _hooked_reader(arm64_baseline), allowlist=al)
+    assert out["allowlist"] == {"applied": True, "entries": 1, "reason": ""}
+    assert "allowlist" not in out["note"]
+
+
+def test_an_empty_list_has_nothing_to_refuse(arm64_baseline, tmp_path):
+    out = syscall_scan.measure(arm64_baseline, _hooked_reader(arm64_baseline),
+                               allowlist=_allowlist(tmp_path))
+    assert out["allowlist"] == {"applied": True, "entries": 0, "reason": ""}
+    assert out["note"] == ""
+
+
+def test_a_scan_without_a_list_carries_no_flag(arm64_baseline):
+    out = syscall_scan.measure(arm64_baseline, _hooked_reader(arm64_baseline))
+    assert out["allowlist"] is None
+    assert "allowlisted" not in _protect(out)
+
+
+def test_a_list_that_could_not_be_loaded_is_not_applied_and_says_so(arm64_baseline, tmp_path):
+    (tmp_path / "hooks.json").write_text("{broken")
+    al = _allowlist(tmp_path)
+    out = syscall_scan.measure(arm64_baseline, _hooked_reader(arm64_baseline), allowlist=al)
+    assert out["allowlist"]["applied"] is False
+    assert out["allowlist"]["reason"] == al.problem
+    assert out["allowlist"]["reason"] in out["note"]
+
+
+def test_recording_on_another_build_starts_the_list_afresh(tmp_path):
+    al = _allowlist(tmp_path)
+    al.add_from(_result_with(build="26100.1", syscall="NtClose"))
+    assert al.add_from(_result_with()) == 1
+    assert al.entries() == [{"syscall": "NtProtectVirtualMemory", "owner": "edr.dll"}]
+    assert _allowlist(tmp_path).entries() == al.entries()
+
+
+def test_the_flagged_deviation_is_the_entry_of_the_state_map(arm64_baseline, tmp_path):
+    al = _allowlist(tmp_path)
+    reader = _hooked_reader(arm64_baseline)
+    al.add_from(syscall_scan.measure(arm64_baseline, reader))
+    out = syscall_scan.measure(arm64_baseline, reader, allowlist=al)
+    assert [d["name"] for d in out["deviations"]] == ["NtProtectVirtualMemory"]
+    assert out["deviations"][0] is out["states"]["NtProtectVirtualMemory"]
+
+
+def test_a_result_without_hooks_does_not_wipe_a_list_of_another_build(tmp_path):
+    al = _allowlist(tmp_path)
+    al.add_from(_result_with(build="26100.1"))
+    assert al.add_from(_result_with(state="intact", owner=None)) == 0
+    assert al.knows("NtProtectVirtualMemory", "edr.dll") is True
+
+
+def test_only_a_hooked_stub_is_marked_even_if_a_file_names_its_pair(arm64_baseline, tmp_path):
+    path = tmp_path / "hooks.json"
+    path.write_text(json.dumps({"version": 1, "build": "26220.5770", "view": "arm64",
+                                "entries": [{"syscall": "NtProtectVirtualMemory",
+                                             "owner": "ntdll.dll"}]}))
+    out = syscall_scan.measure(arm64_baseline, _hooked_reader(arm64_baseline, owner="ntdll.dll"),
+                               allowlist=syscall_scan.HookAllowlist(str(path)))
+    assert _protect(out)["state"] == "diverged"
+    assert _protect(out)["allowlisted"] is False
