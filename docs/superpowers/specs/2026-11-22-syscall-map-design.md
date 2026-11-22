@@ -84,7 +84,9 @@ Oberfläche englisch. Aufbau von oben nach unten:
 
 - `ntsleuth.exe --auto-params` läuft **einmal beim Provisionieren** und legt
   seine JSON-Ausgabe unter `C:\tools\ntsleuth\baseline\` ab, benannt nach
-  Build-Nummer und Architektur, etwa `26220.5770-arm64.json`.
+  Build-Nummer und Sicht, als `ntsleuth-<build>-<view>.json`, etwa
+  `ntsleuth-26220.5770-arm64.json`. Der Präfix hält sie vom Binary-Graph-Cache
+  im selben Verzeichnis auseinander.
 - Das Web-UI lädt die passende Datei beim Start und hält sie im Speicher. Die
   Daten sind pro Build konstant; es gibt keinen Grund, sie je Anfrage neu zu
   ziehen.
