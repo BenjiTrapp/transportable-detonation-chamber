@@ -10,7 +10,11 @@ import os
 import re
 from dataclasses import dataclass, field
 
-_FILENAME_RE = re.compile(r"^ntsleuth-(?P<build>[^-]+)-(?P<view>arm64|x64)\.json$")
+_BUILD = r"[0-9A-Za-z.]+"
+_VIEW = r"arm64|x64"
+_FILENAME_RE = re.compile(rf"^ntsleuth-(?P<build>{_BUILD})-(?P<view>{_VIEW})\.json$")
+_BUILD_RE = re.compile(rf"^{_BUILD}$")
+_VIEW_RE = re.compile(rf"^(?:{_VIEW})$")
 
 
 class BaselineError(Exception):
@@ -41,6 +45,9 @@ class Baseline:
     syscalls: dict = field(default_factory=dict)
     by_number: dict = field(default_factory=dict)
     skipped: list = field(default_factory=list)
+    # names of entries dropped because another module already owns the name; `syscalls`
+    # is keyed by name alone, so each of these is a syscall the catalog cannot show
+    shadowed: list = field(default_factory=list)
 
 
 def parse_baseline(payload: list | dict, build: str, view: str) -> Baseline:
@@ -64,7 +71,12 @@ def parse_baseline(payload: list | dict, build: str, view: str) -> Baseline:
             bl.skipped.append(label)
             continue
         if sc.name in bl.syscalls:
-            print(f"[syscall_baseline] ignoring duplicate {label}, keeping the first")
+            if bl.syscalls[sc.name].module != sc.module:
+                print(f"[syscall_baseline] {label} of {sc.module} shadowed by the one of "
+                      f"{bl.syscalls[sc.name].module}")
+                bl.shadowed.append(label)
+            else:
+                print(f"[syscall_baseline] ignoring duplicate {label}, keeping the first")
             continue
         if (sc.module, sc.number) in bl.by_number:
             print(f"[syscall_baseline] skipping {label}: number already taken")
@@ -129,7 +141,12 @@ def load_baseline(path: str) -> Baseline:
 
 
 def find_baseline(directory: str, build: str, view: str) -> str | None:
-    """Path of `ntsleuth-<build>-<view>.json` in `directory`, or None."""
+    """Path of `ntsleuth-<build>-<view>.json` in `directory`, or None.
+
+    `view` can come from a request: anything but the plain name parts is refused before
+    a path is built."""
+    if not _BUILD_RE.match(build) or not _VIEW_RE.match(view):
+        return None
     path = os.path.join(directory, f"ntsleuth-{build}-{view}.json")
     return path if os.path.isfile(path) else None
 

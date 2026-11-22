@@ -69,7 +69,7 @@
           "is_pointer": false
         }
       ],
-      "stub_bytes": "4c8bd1b818000000f604250803fe7f0175030f05c3cd2ec30f1f8400000000",
+      "stub_bytes": "4c8bd1b818000000f604250803fe7f0175030f05c3cd2ec30f1f840000000000",
       "is_true_syscall": true
     },
     {
@@ -131,7 +131,7 @@
           "is_pointer": true
         }
       ],
-      "stub_bytes": "4c8bd1b83a000000f604250803fe7f0175030f05c3cd2ec30f1f8400000000",
+      "stub_bytes": "4c8bd1b83a000000f604250803fe7f0175030f05c3cd2ec30f1f840000000000",
       "is_true_syscall": true
     },
     {
@@ -193,7 +193,7 @@
           "is_pointer": true
         }
       ],
-      "stub_bytes": "4c8bd1b850000000f604250803fe7f0175030f05c3cd2ec30f1f8400000000",
+      "stub_bytes": "4c8bd1b850000000f604250803fe7f0175030f05c3cd2ec30f1f840000000000",
       "is_true_syscall": true
     },
     {
@@ -204,7 +204,7 @@
       "return_type": "HWND",
       "calling_convention": "stdcall",
       "parameters": [],
-      "stub_bytes": "4c8bd1b834100000f604250803fe7f0175030f05c3cd2ec30f1f8400000000",
+      "stub_bytes": "4c8bd1b834100000f604250803fe7f0175030f05c3cd2ec30f1f840000000000",
       "is_true_syscall": true
     },
     {
@@ -215,7 +215,7 @@
       "return_type": "NTSTATUS",
       "calling_convention": "stdcall",
       "parameters": [],
-      "stub_bytes": "4c8bd1b800000000f604250803fe7f0175030f05c3cd2ec30f1f8400000000",
+      "stub_bytes": "4c8bd1b800000000f604250803fe7f0175030f05c3cd2ec30f1f840000000000",
       "is_true_syscall": false
     },
     {

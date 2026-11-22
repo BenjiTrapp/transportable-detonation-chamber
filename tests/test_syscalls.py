@@ -238,3 +238,85 @@ def test_load_baseline_rejects_a_payload_without_usable_syscalls(tmp_path, label
     p.write_text(json.dumps(payload))
     with pytest.raises(syscall_baseline.BaselineError, match="no usable syscalls"):
         syscall_baseline.load_baseline(str(p))
+
+
+@pytest.mark.parametrize("view", ["arm64", "x64"])
+def test_fixture_stub_windows_are_32_bytes(view):
+    bl = syscall_baseline.parse_baseline(_fixture(view), "26220.5770", view)
+    assert {len(sc.stub_bytes) for sc in bl.syscalls.values()} == {32}
+
+
+@pytest.mark.parametrize("build, view", [
+    ("26220.5770", "../arm64"),
+    ("26220.5770", "/etc/passwd"),
+    ("26220.5770", "arm64/../x64"),
+    ("26220.5770", "sparc"),
+    ("26220.5770", ""),
+    ("../26220", "arm64"),
+    ("/tmp/x", "arm64"),
+    ("26220.5770\\..", "arm64"),
+    ("", "arm64"),
+])
+def test_find_baseline_refuses_unsafe_names_without_touching_the_filesystem(
+        tmp_path, monkeypatch, build, view):
+    (tmp_path / "ntsleuth-26220.5770-arm64.json").write_text("{}")
+
+    def boom(*args, **kwargs):
+        raise AssertionError("the filesystem was touched")
+
+    monkeypatch.setattr(syscall_baseline.os.path, "isfile", boom)
+    assert syscall_baseline.find_baseline(str(tmp_path), build, view) is None
+
+
+def test_same_name_in_another_module_is_recorded_and_the_first_wins():
+    payload = {"syscalls": [
+        _entry(),
+        _entry(module="win32u.dll", syscall_number=0x1001),
+        _entry(name="NtBar", module="win32u.dll", syscall_number=0x1002),
+    ]}
+    bl = syscall_baseline.parse_baseline(payload, "1.0", "x64")
+    assert bl.syscalls["NtFoo"].module == "ntdll.dll"
+    assert bl.shadowed == ["NtFoo"]
+    assert ("win32u.dll", 0x1001) not in bl.by_number
+    assert bl.skipped == []
+
+
+def test_same_name_in_the_same_module_is_not_reported_as_shadowed():
+    bl = syscall_baseline.parse_baseline({"syscalls": [_entry(), _entry(syscall_number=2)]}, "1.0", "x64")
+    assert bl.shadowed == []
+
+
+def _names(page):
+    return [i["name"] for i in page["items"]]
+
+
+def test_catalog_module_filter_alone_lists_that_module_in_number_order():
+    bl = syscall_baseline.parse_baseline(_fixture("arm64"), "26220.5770", "arm64")
+    page = syscall_baseline.catalog(bl, module="ntdll.dll")
+    assert _names(page) == ["NtAllocateVirtualMemory", "NtWriteVirtualMemory", "NtProtectVirtualMemory"]
+    assert page["total"] == 3
+
+
+def test_catalog_module_filter_selects_win32u():
+    bl = syscall_baseline.parse_baseline(_fixture("arm64"), "26220.5770", "arm64")
+    page = syscall_baseline.catalog(bl, module="win32u.dll")
+    assert _names(page) == ["NtUserGetForegroundWindow"] and page["total"] == 1
+
+
+def test_catalog_module_match_ignores_case_and_surrounding_space():
+    bl = syscall_baseline.parse_baseline(_fixture("arm64"), "26220.5770", "arm64")
+    assert syscall_baseline.catalog(bl, module=" NTDLL.DLL ")["total"] == 3
+    assert syscall_baseline.catalog(bl, module="Win32U.dll")["total"] == 1
+
+
+def test_catalog_number_query_combines_with_the_module_filter():
+    bl = syscall_baseline.parse_baseline(_fixture("arm64"), "26220.5770", "arm64")
+    assert _names(syscall_baseline.catalog(bl, query="0x3a", module="ntdll.dll")) == ["NtWriteVirtualMemory"]
+    assert syscall_baseline.catalog(bl, query="0x3a", module="win32u.dll")["items"] == []
+    assert _names(syscall_baseline.catalog(bl, query="0x1034", module="win32u.dll")) == ["NtUserGetForegroundWindow"]
+    assert syscall_baseline.catalog(bl, query="0x1034", module="ntdll.dll")["items"] == []
+
+
+def test_catalog_module_match_ignores_the_case_of_the_stored_module_too():
+    bl = syscall_baseline.parse_baseline({"syscalls": [_entry(module="NTDLL.dll")]}, "1.0", "x64")
+    assert syscall_baseline.catalog(bl, module="ntdll.dll")["total"] == 1
