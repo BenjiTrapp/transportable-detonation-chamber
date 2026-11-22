@@ -202,6 +202,19 @@ Drei Ziele, in dieser Rangfolge:
    Eintrag gegen ein Schema prüft, defekte Einträge überspringt und das Gewicht
    nach oben begrenzt, damit ein einzelner Treffer nie allein MALICIOUS erreicht.
    Hier leben die Hook- und Patch-Muster.
+
+   **Die Arbeitsteilung mit dem Code ist festgelegt, damit nichts doppelt lebt:**
+   Die Erkennung einer Form bleibt im Code (`classify_stub` muss das
+   Displacement *dekodieren*, nicht nur Bytes vergleichen). Die Datei liefert
+   **Familienname und Notiz** zu einer erkannten Form, also was der Analyst
+   liest. Ihr `weight` ist **beratend und nicht der Score** — der kommt aus
+   `memory_evidence.KINDS`. Ein Test pinnt die Muster der Datei gegen die des
+   Codes, damit die beiden nicht auseinanderlaufen; die Datei sagt das über sich
+   selbst, damit niemand sie für die Bewertungsquelle hält.
+
+   Ein Eintrag darf zusätzlich eine `view` nennen: ein x64-Opcode ist auf ARM64
+   eine andere Anweisung, ein Muster ohne Sicht wäre also mindestens zur Hälfte
+   falsch.
 2. **Generierte YARA-Regeln** nach `rules/yara/`. Der wertvolle Fall sind
    Samples, die **eigene** Syscall-Stubs mitbringen, statt ntdll zu rufen. Erst
    die Baseline macht so eine Regel benennbar: aus „hier steht ein Stub mit
