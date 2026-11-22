@@ -6088,6 +6088,18 @@ def test_rizin_emulation_pane_separates_my_patches_from_what_the_run_wrote():
         r.noRun = { reanalyze: pane.querySelector('[data-rizin-act="reanalyze"]').hasAttribute('disabled'), text: text(group('run')),
                     export: pane.querySelector('[data-rizin-act="export"]').hasAttribute('disabled'),
                     cache: pane.querySelector('[data-rizin-act="unpatch-all"]').hasAttribute('disabled') };
+        // The cache holds only what was set by hand: the button still asks first (this clear cannot be undone), and a
+        // declined question sends nothing
+        const asked = [];
+        globalThis.confirm = question => { asked.push(question); return false; };
+        const c = calls.length;
+        click(pane.querySelector('[data-rizin-act="unpatch-all"]')); await quiet();
+        r.handOnly = { asked, deletes: calls.slice(c).filter(x => x[0] === 'DELETE').length };
+        // An action in flight puts the button off
+        rizinState.emuPane.busy = 'export'; rizinRenderEmuPane();
+        r.busyOff = pane.querySelector('[data-rizin-act="unpatch-all"]').hasAttribute('disabled');
+        rizinState.emuPane.busy = ''; rizinRenderEmuPane();
+        r.busyBack = pane.querySelector('[data-rizin-act="unpatch-all"]').hasAttribute('disabled');
         // An empty cache: the button is off and its title says why; pressing it anyway says so and sends nothing
         S.patches = [];
         await rizinLoadEmuPane(true);
@@ -6125,6 +6137,10 @@ def test_rizin_emulation_pane_separates_my_patches_from_what_the_run_wrote():
         and "+30 more" in r["many"]["more"], "the run's rows are not capped, or the cap is not said: " + str(r["many"])
     assert r["noRun"]["reanalyze"] is True and r["noRun"]["export"] is False and "nothing" in r["noRun"]["text"].lower(), r["noRun"]
     assert r["noRun"]["cache"] is False, "the cache holds hand-made patches and the button is off"
+    assert len(r["handOnly"]["asked"]) == 1 and "2 writes set by hand and 0 writes the run made" in r["handOnly"]["asked"][0] \
+        and r["handOnly"]["deletes"] == 0, \
+        "the cache button cleared hand-made patches without asking, or asked a different question: " + str(r["handOnly"])
+    assert r["busyOff"] is True and r["busyBack"] is False, "the cache button stays on while an action of the pane is out"
     assert r["empty"]["off"] is True and "empty" in r["empty"]["title"] and r["empty"]["deletes"] == 0, r["empty"]
     assert "empty" in r["empty"]["said"] and "nothing to clear" in r["empty"]["said"], "pressing it on an empty cache was silent: " + str(r["empty"])
 
@@ -6567,6 +6583,20 @@ def test_rizin_emulation_pane_removes_a_breakpoint_and_has_no_switch():
         click(pane.querySelector('.rizin-emu-bp[data-addr="0x1400014b7"] [data-rizin-act="unbreak"]'));
         await until(() => note().includes('kept the breakpoint'), 'the refusal'); await quiet();
         r.refused = { said: note(), rows: rows().length };
+        // The patches alone are on their way (a run's refresh) while a breakpoint is removed with ✕: the list that lands does
+        // not bring it back
+        S.unbreak = undefined;
+        S.listDelay = 120;
+        const slow = rizinLoadEmuPane(true, 'patches');
+        await tick(10);
+        const k = calls.length;
+        click(pane.querySelector('.rizin-emu-bp[data-addr="0x1400014b6"] [data-rizin-act="unbreak"]'));
+        await until(() => rows().length === 2, 'the row goes while the patches are out');
+        const early = rows().map(e => attr(e, 'data-addr'));
+        S.listDelay = 1;
+        await slow; await quiet();
+        r.inFlight = { early, after: rows().map(e => attr(e, 'data-addr')), held: rizinState.emuPane.breakpoints.map(b => b.addr),
+                       patches: gets(k, '/patches').length, breakpointGets: gets(k, '/breakpoints').length };
     """)
     assert "error" not in r, r.get("error")
     first, past, second, big = r["rows"]
@@ -6581,6 +6611,9 @@ def test_rizin_emulation_pane_removes_a_breakpoint_and_has_no_switch():
     assert r["removed"]["rows"] == ["0x1400014b6", "0x1400014b7", None] and "0x140001490" in r["removed"]["said"], r["removed"]
     assert r["bad"] == 0
     assert "kept the breakpoint" in r["refused"]["said"] and r["refused"]["rows"] == 3, r["refused"]
+    assert r["inFlight"]["early"] == ["0x1400014b7", None] and r["inFlight"]["after"] == ["0x1400014b7", None], \
+        "a list of the patches that was on its way brought a removed breakpoint back: " + str(r["inFlight"])
+    assert r["inFlight"]["held"][0] == 0x1400014b7 and len(r["inFlight"]["held"]) == 2 and r["inFlight"]["breakpointGets"] == 0, r["inFlight"]
 
 
 @needs_node

@@ -25299,10 +25299,11 @@ async function rizinLoadEmuPane(force, what) {
     }
     const seq = ++pane.seq, base = `/api/rizin/${encodeURIComponent(sid)}`;
     const only = what === 'patches' && pane.at === sid && !pane.stale && !pane.problem && Array.isArray(pane.breakpoints);
-    const [patches, breakpoints] = await Promise.all([rizinApi(`${base}/patches`),
-        only ? { ok: true, data: pane.breakpoints } : rizinApi(`${base}/breakpoints`)]);
+    // Not asked for: the breakpoints held stay as they are when the patches land (read then, not now: a ✕ that removed one
+    // while the patches were on their way is newer than anything this request could say)
+    const [patches, breakpoints] = await Promise.all([rizinApi(`${base}/patches`), only ? null : rizinApi(`${base}/breakpoints`)]);
     if (sid !== rizinState.session || seq !== pane.seq) return false;
-    const failed = !patches.ok ? patches : !breakpoints.ok ? breakpoints : null;
+    const failed = !patches.ok ? patches : breakpoints && !breakpoints.ok ? breakpoints : null;
     if (failed) {
         if (failed.state === 'busy') rizinViewBusy('emuPane', force);
         pane.problem = failed.state === 'busy' ? `rizin is busy (${failed.data.step || 'rizin'}); the patches and breakpoints follow.`
@@ -25311,8 +25312,8 @@ async function rizinLoadEmuPane(force, what) {
         return false;
     }
     rizinState.retry.delete('emuPane');
-    Object.assign(pane, { at: sid, patches: Array.isArray(patches.data) ? patches.data : [],
-                          breakpoints: Array.isArray(breakpoints.data) ? breakpoints.data : [], problem: '', stale: false });
+    Object.assign(pane, { at: sid, patches: Array.isArray(patches.data) ? patches.data : [], problem: '', stale: false });
+    if (breakpoints) pane.breakpoints = Array.isArray(breakpoints.data) ? breakpoints.data : [];
     rizinRenderEmuPane();
     return true;
 }
