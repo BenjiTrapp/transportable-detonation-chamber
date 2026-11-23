@@ -82,7 +82,7 @@ import os
 import re
 
 from test_frontend import ROOT, SOURCE, _function_source, _run_node, needs_node
-from test_theme import (INDEX_HTML, LITERAL_COLOR, SORT_DOM, STYLE_CSS, THEME_CSS, _const_source, _css_blocks,
+from test_theme import (INDEX_HTML, LAYOUT_CSS, LITERAL_COLOR, SORT_DOM, STYLE_CSS, THEME_CSS, _const_source, _css_blocks,
                         _cyberpunk_palette, _read, _root_values, _rules, _selectors, _strip_comments, _tab_markup,
                         _unscoped_rules)
 
@@ -797,6 +797,25 @@ def _declared(body, prop):
 
 def _rizin_rules(path):
     return {s: b for s, b in _rules(path).items() if re.search(r"rizin|\.rz-", s)}
+
+
+def _gutter_glyphs():
+    """Every `content` declared on a pseudo-element of a gutter, in each sheet, as (sheet, selector, content).
+
+    The boot script of index.html always sets data-theme on <html>, so the [data-theme] rules of theme-layout.css
+    apply in BOTH themes and win over style.css (same properties, higher specificity): the glyph and the colours that
+    reach the screen are the layout sheet's, in Classic as well. style.css is the fallback for a page without the
+    attribute. A test of the glyph has to look at the sheet that draws it, hence the three sheets, and every rule of
+    them, not only the one rule the test happens to name."""
+    found = []
+    for sheet, path in (("style.css", STYLE_CSS), ("theme-cyberpunk.css + theme-layout.css", THEME_CSS)):
+        for selector, body in _rules(path).items():
+            if "gutter" in selector and re.search(r"::?(?:before|after)\b", selector):
+                found.append((sheet, selector, _declared(body, "content")))
+    for selector, body in _rules(LAYOUT_CSS).items():
+        if "gutter" in selector and re.search(r"::?(?:before|after)\b", selector):
+            found.append(("theme-layout.css", selector, _declared(body, "content")))
+    return found
 
 
 def test_rizin_tab_layout_and_themes():
@@ -7363,7 +7382,12 @@ def test_rizin_gutter_shows_a_faint_resting_marker_that_is_not_a_breakpoint_in_b
     # the patch cell, also empty). Every line now carries a faint ○ in the gutter, drawn by the stylesheet (the markup stays
     # empty, so a copied or counted line is unchanged), the same ○ is stronger under the pointer, and neither could be
     # mistaken for the red bold ● of a set breakpoint (a hollow ring in a dim text colour against a solid red disc). A
-    # reviewer who removes the resting rule from either sheet fails here.
+    # reviewer who removes the resting rule from either sheet fails here. Which sheet draws it: data-theme is always set on
+    # <html> (the boot script), so the [data-theme] rules of theme-layout.css apply in BOTH themes and their colours
+    # (--cp-text-dim, --cp-text-muted) are what reaches the screen, Classic included; the colours of style.css are the
+    # fallback of a page without the attribute. So the glyph is checked in the layout sheet too, and across every rule that
+    # gives a gutter's pseudo-element a `content`: a `content: ""` there is the empty gutter again, a `"●"` a dim
+    # breakpoint on every line.
     classic, layout = _rules(STYLE_CSS), _rules(THEME_CSS)
     prefix = '[data-theme="cyberpunk"] '
     rest, hover = ".rizin-gutter:not(.on)::before", ".rizin-gutter:not(.on):hover::before"
@@ -7372,16 +7396,23 @@ def test_rizin_gutter_shows_a_faint_resting_marker_that_is_not_a_breakpoint_in_b
         resting, pointed = rules.get(pre + rest), rules.get(pre + hover)
         assert resting, f"{pre + rest} has no rule: the gutter is empty at rest"
         assert pre + rest in rules and pre + hover in rules
-        # the classic sheet declares the glyphs, Cyberpunk only recolours them
+        # style.css declares the glyph; the layout sheet applies in BOTH themes (data-theme is always set), so it must
+        # either leave the glyph alone or say the same: a `content` of its own there is what the user sees
         if not pre:
             assert _declared(resting, "content") == '"○"' and _declared(pointed, "content") in (None, '"○"'), \
                 "the resting marker is not the hollow ○, or the pointer's is another glyph"
-            assert _declared(resting, "content") != "\"●\"", "the resting marker is the breakpoint's glyph"
+        assert _declared(resting, "content") in (None, '"○"') and _declared(pointed, "content") in (None, '"○"'), \
+            f"{pre + rest}: the sheet that draws the marker changes its glyph (an empty gutter, or the breakpoint's ●)"
         assert _declared(resting, "color") == dim and _declared(pointed, "color") == strong, "the resting and hover colours"
         assert "red" not in (_declared(resting, "color") or "") + (_declared(pointed, "color") or ""), "a resting marker in the breakpoint's red"
         # a rule on the pseudo-element that took room would move the address, the mnemonic and the operands
         for prop in ("position", "width", "min-width", "margin", "padding", "font-size", "display", "float", "letter-spacing"):
             assert _declared(resting, prop) is None and _declared(pointed, prop) is None, f"the marker declares {prop}: the columns could shift"
+    # whatever rule of whichever sheet gives a pseudo-element of a gutter a `content`, it is the hollow ○ (the layout
+    # sheet's rules apply in both themes, so none of them may blank it or turn it into the breakpoint's ●)
+    glyphs = _gutter_glyphs()
+    assert any(sheet == "theme-layout.css" for sheet, _, _ in glyphs), "the layout sheet's rules were not read"
+    assert [g for g in glyphs if g[2] not in (None, '"○"')] == [], "a gutter's marker is blanked or is not the hollow ○: " + str(glyphs)
     # a set breakpoint stays the red, bold, glowing ●; the patch cell gets no marker
     assert _declared(classic.get(".rizin-gutter.on"), "font-weight") == "700" and _declared(classic.get(".rizin-gutter"), "color") == "var(--accent-red)"
     assert _declared(layout.get(prefix + ".rizin-gutter"), "color") == "var(--cp-red)" and "text-shadow" in (layout.get(prefix + ".rizin-gutter.on") or "")
@@ -7546,6 +7577,7 @@ def test_rizin_decompiler_gutter_follows_the_disassembly_and_the_console():
             if (!m[1]) s.breakpoints.push({ addr: at, enabled: true });
             return [200, { output: '', seek: s.seek ?? 0x1400014b7, function: 'sym.main', truncated: false, changed: true }];
         };
+        r.beforeConsole = { decs: decs() - D, lists: lists() - L };
         const L2 = lists();
         await rizinConsoleRun('db @ 0x1400014b9'); await quiet();
         r.console = { on: on(), cell: cellAddr(2), lists: lists() - L2 };
@@ -7568,7 +7600,7 @@ def test_rizin_decompiler_gutter_follows_the_disassembly_and_the_console():
         click(cell(4));
         await until(() => on().length === 0, 'both lines are clear'); await quiet();
         r.sharedGone = { sent: sent(f), on: on(), server: server() };
-        r.requests = { lists: lists() - L2, decs: decs() };
+        r.requests = { lists: lists() - L2, decs: decs() - D };
     """)
     assert "error" not in r, r.get("error")
     assert r["fromDisasm"] == {"on": [2], "cell": "0x1400014bc", "title": "Breakpoint at 0x1400014bc: click to remove it",
@@ -7588,7 +7620,12 @@ def test_rizin_decompiler_gutter_follows_the_disassembly_and_the_console():
                            "titles": ["Breakpoint at 0x1400014be: click to remove it"] * 2}, \
         "an instruction that belongs to two lines of C marks only one: " + str(r["shared"])
     assert r["sharedGone"] == {"sent": [["DELETE", "/breakpoints", {"addr": "0x1400014be"}]], "on": [], "server": []}
-    assert r["requests"]["decs"] >= 1
+    # Up to the console: every click and each side's change reached the other without a request for the C or the list. The
+    # console is the one thing that asks, by design (a command that changed something draws the views again, and reads the
+    # list once for its answer): one C and one list for each of its two `db`, and none for any click that followed.
+    assert r["beforeConsole"] == {"decs": 0, "lists": 0}, "a click or a change in the other view asked for the C or the list again: " + str(r["beforeConsole"])
+    assert r["requests"] == {"lists": 2, "decs": 2}, \
+        "after the two console commands, a click asked for the C or the list again, or a command asked for more than its one: " + str(r["requests"])
 
 
 @needs_node
@@ -7598,7 +7635,8 @@ def test_rizin_decompiler_gutter_does_not_go_stale_on_a_toggle():
     # removed), and the same holds for a list that changed elsewhere (the pane, the console) while DECOMPILER is in sight
     # and while it is hidden (it catches up once shown). What was there stays: the scroll position (also when the line at
     # the top of the view is the second of two that share an address, which a lookup by address alone would take for the
-    # first: the view would creep up by a line with each click), the current line (the second of the two, the one that was
+    # first: the view would creep up by a line with each click; and when it is the FIRST of the two, which a lookup that
+    # takes the last match would take for the second: the view would creep down by one), the current line (the second of the two, the one that was
     # clicked), and the C itself, which is not asked for again. A message the pane shows instead of lines (the code could
     # not be loaded) is not written over by a list.
     r = _scripted(LAID_OUT + r"""
@@ -7636,6 +7674,17 @@ def test_rizin_decompiler_gutter_does_not_go_stale_on_a_toggle():
         click(cell(41));
         await until(() => on().length === 0, 'both lines clear'); await quiet();
         r.unset = { ...state(), glyphs: [cell(40).textContent, cell(41).textContent] };
+        // The same with the FIRST of the two lines at the top of the view: a restore that takes the last line of that address
+        // (not the one nearest where the view was) would move the view down by a line with each click
+        dec.scrollTop = 40 * 20 + 7;
+        r.firstAtTop = { start: state() };
+        click(cell(40));
+        await until(() => on().length === 2, 'both lines marked (first at the top)'); await quiet();
+        r.firstAtTop.set = state();
+        click(cell(40));
+        await until(() => on().length === 0, 'both lines clear (first at the top)'); await quiet();
+        r.firstAtTop.unset = state();
+        dec.scrollTop = 41 * 20 + 7;
         // A list that changed elsewhere, DECOMPILER in sight: another line (10), then a breakpoint of no line of the C
         S.breakpoints = [{ addr: DECOMPILED['sym.main'][10].offset, enabled: true }];
         await rizinLoadMarks(true); await quiet();
@@ -7666,6 +7715,10 @@ def test_rizin_decompiler_gutter_does_not_go_stale_on_a_toggle():
         "the mark is stale after a click: " + str(r["set"])
     assert r["set"]["redrawn"] is True, "the test does not draw the lines again, so it cannot tell a stale mark from a fresh one"
     assert r["unset"]["on"] == [] and r["unset"]["glyphs"] == ["", ""] and r["unset"]["server"] == [], "the mark is stale after the second click: " + str(r["unset"])
+    for step in ("start", "set", "unset"):
+        assert r["firstAtTop"][step]["top"] == 40 * 20 + 7 and r["firstAtTop"][step]["current"] == [41] and r["firstAtTop"][step]["decs"] == 0, \
+            f"with the first of two lines that share an address at the top, a click in the gutter moved the view ({step}): " + str(r["firstAtTop"])
+    assert r["firstAtTop"]["set"]["on"] == [40, 41] and r["firstAtTop"]["unset"]["on"] == []
     for step in ("set", "unset"):
         assert r[step]["top"] == top, f"a click in the gutter cost the scroll position ({step}): " + str(r[step])
         assert r[step]["current"] == [41], f"a click in the gutter moved the current line ({step}): " + str(r[step])
@@ -7745,7 +7798,8 @@ def test_rizin_decompiler_gutter_cell_shifts_nothing():
 
 
 def test_rizin_decompiler_gutter_looks_like_the_disassembly_gutter_in_both_themes():
-    # INTENT: DECOMPILER's cell has the glyphs and colours of DISASSEMBLY's in both sheets (a faint ○ at rest, stronger under
+    # INTENT: DECOMPILER's cell has the glyphs and colours of DISASSEMBLY's in both sheets (the layout sheet applies in both
+    # themes and wins; style.css is the fallback, so the glyph is checked in each of them, not in style.css alone) (a faint ○ at rest, stronger under
     # the pointer, a red bold ● when set with the glow of Cyberpunk, and the busy pointer), and its empty place is as wide as
     # the cell, so that the C of a line starts on the same column with or without an address or a mark. A reviewer who takes
     # the resting rule from either sheet, or the busy pointer, fails here; so does a rule of the pseudo-element that takes room.
@@ -7767,6 +7821,12 @@ def test_rizin_decompiler_gutter_looks_like_the_disassembly_gutter_in_both_theme
         for prop in ("position", "width", "min-width", "margin", "padding", "font-size", "display", "float", "letter-spacing"):
             assert _declared(resting, prop) is None and _declared(pointed, prop) is None, f"the marker declares {prop}: the columns could shift"
     assert _declared(classic[".rizin-dec-gutter:not(.on)::before"], "content") == '"○"'
+    # the layout sheet applies in both themes and wins over style.css: what it says about the glyph is what is drawn, in
+    # this gutter as in the disassembly's (the twin comparison above reads both from the same rule, so it cannot tell)
+    for rule in (".rizin-gutter:not(.on)::before", ".rizin-gutter:not(.on):hover::before",
+                 ".rizin-dec-gutter:not(.on)::before", ".rizin-dec-gutter:not(.on):hover::before"):
+        assert _declared(layout[prefix + rule], "content") in (None, '"○"'), f"theme-layout.css changes the glyph of {rule}"
+    assert [g for g in _gutter_glyphs() if g[2] not in (None, '"○"')] == [], "a gutter's marker is blanked or is not the hollow ○"
     assert _declared(classic[".rizin-dec-gutter.on"], "font-weight") == "700" and _declared(classic[".rizin-dec-gutter"], "color") == "var(--accent-red)"
     assert _declared(layout[prefix + ".rizin-dec-gutter"], "color") == "var(--cp-red)" and "text-shadow" in layout[prefix + ".rizin-dec-gutter.on"]
     # nothing of a mark takes room: the cell and the empty place are one width, and neither is text to copy
