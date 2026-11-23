@@ -100,6 +100,7 @@ x86_64 emulation, which is what the x64 samples do too.
 | Process Dump | Emulated (x86_64) | `-closemon` is **not used**: it writes x64 hook bytes into every process and cannot tell ARM64 processes apart (Exit Capture replaces it) |
 | Exit Capture | Native | OS feature (Silent Process Exit); emulator translation cache is recognized and not scored |
 | Hunt-Sleeping-Beacons / BeaconEye | Emulated (x86_64) | x64 builds; reliable for x64 (emulated) targets, results for native ARM64 processes are marked as limited |
+| NTSleuth | Native and emulated | Both `ntsleuth-arm64.exe` and `ntsleuth-x64.exe` are installed on ARM64, one baseline of the syscall stubs per view; the x64 one runs under emulation (see [memory.md](memory.md#syscall-integrity)) |
 | rizin + rz-ghidra | Emulated (x86_64) | Cutter's Windows package is x64 only; `aaa` of a 150 KB sample takes about 2 s, `aa` of a 31 MB exit dump about 3 s (see [rizin.md](rizin.md)) |
 
 What this costs in a memory verdict is in [memory.md](memory.md#arm64-hosts) under the

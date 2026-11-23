@@ -100,6 +100,16 @@ ls /opt/homebrew/share/qemu/edk2-aarch64-code.fd
 vagrant plugin list | grep qemu
 ```
 
+## SYSCALLS tab shows no baseline
+
+The notice over the map names the view. *No baseline for build …* means none has
+been extracted for this Windows build yet (the web UI starts one in the
+background, a few seconds; `C:\tools\ntsleuth\baseline\` holds the files) or
+NTSleuth is not installed (`python3 scripts/deploy-utm.py --install
+install-ntsleuth.ps1`, or the update button of [Tool updates](updates.md)).
+*Not distinguishable on this host* is not a fault: the x64 baseline was
+discarded on purpose, see [Live memory](memory.md#when-the-tab-says-it-cannot-measure).
+
 ## Local install fails
 
 ```bash
@@ -200,6 +210,7 @@ transportable-detonation-chamber/
 │   ├── build-aether.sh           # Cross-compile Aether on the host into prebuilt/
 │   ├── install-re-tools.ps1      # Detect It Easy, WinDbg, Ghidra
 │   ├── install-rizin.ps1         # rizin 0.9.1 + rz-ghidra from Cutter's Windows package (pinned SHA-256)
+│   ├── install-ntsleuth.ps1      # NTSleuth (SHA-256 checked) and the syscall baselines of this build, one per view
 │   ├── install-webui.ps1         # Web UI deployment
 │   ├── configure-logging.ps1     # PowerShell script block/module logging, Windows Firewall log, BITS log (LOGS, FIREWALL)
 │   ├── tdc-unisolate.ps1         # The way out of ISOLATED without the web UI (run as Administrator)
@@ -237,6 +248,7 @@ C:\tools\detection-rules\               Sigma + YARA + IOC rules
 C:\ProgramData\chocolatey\lib\die\      Detect It Easy (DiE 3.21)
 C:\ProgramData\chocolatey\lib\ghidra\   Ghidra 12.1.2
 C:\tools\cutter\                        rizin 0.9.1 + rz-ghidra (Cutter's Windows package; only rizin runs)
+C:\tools\ntsleuth\                      NTSleuth (ntsleuth-arm64.exe on ARM64, ntsleuth-x64.exe) + baseline\ntsleuth-<build>-<view>.json
 C:\Windows\Temp\rizin_uploads\          Files uploaded in the RIZIN tab (newest 40)
 C:\DetonationChamberUI\rizin_projects\  RIZIN projects (renames and comments)
 C:\tdc\samples\                         Samples the FIREWALL tab fetched (<sha256[:2]>\<sha256>; never executed, Defender-excluded)
