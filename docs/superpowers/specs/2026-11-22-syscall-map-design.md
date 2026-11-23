@@ -488,13 +488,29 @@ schlagen `test_readme_documents_every_api_route_and_nothing_else` und
     an emulierten Samples),
   - prüft jeden SHA-256 gegen `checksums.txt` der Release,
   - installiert nach `C:\tools\ntsleuth\`,
-  - schreibt einen Marker `tdc-release.txt` mit Tag und Prüfsummen,
-  - erzeugt je installiertem Binary eine Baseline und dazu den
-    Binary-Graph-Cache,
-  - prüft sich selbst (`ntsleuth.exe --lookup NtCreateProcess` liefert eine
-    Nummer).
+  - prüft sich selbst (`ntsleuth-<view>.exe --lookup NtCreateProcess` liefert
+    eine Nummer),
+  - schreibt **danach** einen Marker `tdc-release.txt` mit Tag und Prüfsummen,
+  - erzeugt je installiertem Binary eine Baseline,
+  - und prüft auf ARM64, dass die beiden Baselines sich **unterscheiden**:
+    wären sie byteweise gleich, läge die x64-Variante nicht die x64-Sicht vor,
+    und die Messung emulierter Samples wäre still wirkungslos.
+  - **Die Architektur wird aus der Registry bestimmt, nicht aus
+    `$env:PROCESSOR_ARCHITECTURE`.** Der Updater läuft als emuliertes
+    x64-Python, und die Umgebungsvariable meldete dort `AMD64` auch auf einer
+    ARM64-Maschine — die arm64-Baseline entstünde dann nie.
   - Nimmt `[switch]$Force` und `-Version`, wie die anderen.
   - Die Binaries sind statisch gelinkt; ein VC-Redist ist nicht nötig.
+- **Rückgabewerte:** Ein fehlgeschlagener Download oder eine nicht passende
+  Prüfsumme beenden das Skript mit einem Fehler — das Werkzeug läuft als SYSTEM
+  auf einer Maschine, auf der auch Malware läuft, und eine ungeprüfte Datei wird
+  nie installiert. Eine **fehlgeschlagene Baseline-Erzeugung nach geprüfter
+  Installation** ist dagegen nur eine Warnung mit Rückgabewert 0: die Kammer
+  provisioniert weiter, der Tab meldet „keine Baseline", und Tasks 7 und 9
+  behandeln genau diesen Fall schon. Die Stufe ist eine Ergänzung der Kammer,
+  keine neue Abhängigkeit — das ist ein Anti-Ziel dieses Dokuments.
+- **Der Binary-Graph-Cache gehört zu Plan 2** (Ziel 6) und wird hier nicht
+  gebaut.
 - **Native für ARM64 vorhanden.** Anders als Aether, Rizin und BeaconEye gibt es
   NTSleuth als ARM64-Binary. Nur die zweite, x64-Baseline entsteht unter
   Emulation.
