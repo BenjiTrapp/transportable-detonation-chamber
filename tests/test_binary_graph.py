@@ -2356,6 +2356,27 @@ def test_the_shared_dependencies_of_two_binaries_are_the_modules_both_import():
     assert _ids(got) == {"d.exe", "e.exe", "user32.dll"}
     assert _edges(got) == {("d.exe", "user32.dll", "imports"), ("e.exe", "user32.dll", "imports")}
     assert _node(got, "user32.dll").in_degree == 2
+    assert got.total == 1
+    _whole(got)
+
+
+def test_two_binaries_that_reach_one_module_through_different_api_sets_share_it():
+    # kernel32.dll imports the memory api set, c.exe the handle one: both are kernelbase.dll to the loader
+    graph = _system()
+    got = binary_graph_query.shared_dependencies(graph, "kernel32.dll", "c.exe")
+    assert _ids(got) == {"kernel32.dll", "c.exe", "kernelbase.dll", "api-ms-win-core-memory-l1-1-0.dll",
+                         "api-ms-win-core-handle-l1-1-0.dll"}
+    assert _edges(got) == {("kernel32.dll", "api-ms-win-core-memory-l1-1-0.dll", "imports"),
+                           ("api-ms-win-core-memory-l1-1-0.dll", "kernelbase.dll", "resolves_to"),
+                           ("c.exe", "api-ms-win-core-handle-l1-1-0.dll", "imports"),
+                           ("api-ms-win-core-handle-l1-1-0.dll", "kernelbase.dll", "resolves_to")}
+    assert "api-set resolution" in got.note
+    # one binary through an api set, the other directly: the same module too
+    direct = _query_graph(_q("kernelbase.dll"), _q("x.exe", "exe", imports={"kernelbase.dll": ("F",)}),
+                          _q("y.exe", "exe", imports={"api-ms-win-core-memory-l1-1-0.dll": ("F",)}),
+                          api_sets={"api-ms-win-core-memory-l1-1-0": ("kernelbase.dll",)})
+    both = binary_graph_query.shared_dependencies(direct, "x.exe", "y.exe")
+    assert ("x.exe", "kernelbase.dll", "imports") in _edges(both) and both.total == 1
     _whole(got)
 
 
@@ -2389,9 +2410,12 @@ def test_an_answer_over_max_nodes_is_cut_and_says_truncated():
     assert len(got.nodes) == binary_graph_query.MAX_NODES
     assert got.truncated is True
     assert "400" in got.note and "500" in got.note
+    # how many there were, for a view to show "399 of 500" without reading the prose
+    assert got.total == 500
     _whole(got)
     small = binary_graph_query.importers_of(_hub(binary_graph_query.MAX_NODES - 1), "hub.dll")
-    assert (len(small.nodes), small.truncated) == (binary_graph_query.MAX_NODES, False)
+    assert (len(small.nodes), small.truncated, small.total) == (binary_graph_query.MAX_NODES, False, 399)
+    assert binary_graph_query.imports_of(_hub(1), "nothere.dll").total == 0
 
 
 def test_a_truncated_answer_keeps_its_roots_so_the_view_still_has_a_starting_point():
@@ -2474,6 +2498,7 @@ def test_the_query_route_answers_each_query_name_and_refuses_an_unknown_one(clie
         assert body["nodes"] and body["roots"] and body["note"], name
         assert (body["build"], body["arch"], body["created"]) == ("26220.5770", "arm64", "2026-11-23T10:00:00Z")
         assert body["truncated"] is False
+        assert body["total"] >= 1
         assert set(body["nodes"][0]) == {"id", "label", "kind", "in_degree", "category"}
         assert set(body["edges"][0]) == {"source", "target", "kind", "origin", "label"}
     callers = client.get("/api/binary-graph/query?q=syscall-callers&syscall=NtClose").get_json()
@@ -2725,3 +2750,83 @@ def test_failed_builds_of_a_missing_cache_count_toward_the_cap_too(client, tdc, 
     assert len(calls) == 3
     body = client.get("/api/binary-graph/query?q=imports&module=b.exe").get_json()
     assert "3 attempts" in body["error"] and "OSError" in body["error"]
+
+
+def test_a_query_without_a_parameter_it_needs_is_refused_before_any_graph_is_fetched(client, tdc, graph_host):
+    path, builds, _ = graph_host
+    os.remove(path)
+    r = client.get("/api/binary-graph/query?q=shared&module=d.exe")
+    _join(tdc)
+    assert r.status_code == 400 and "other" in r.get_json()["error"]
+    assert builds == [] and tdc._binary_graph_build_state["thread"] is None
+
+
+def test_the_parameters_each_query_needs_are_the_ones_its_adapter_reads():
+    ctx = binary_graph_query.Context(_system())
+    given = {"module": "d.exe", "function": "", "syscall": "NtClose", "other": "e.exe", "metric": ""}
+    for name, run in binary_graph_query.QUERIES.items():
+        needs = binary_graph_query.NEEDS[name]
+        binary_graph_query.check_parameters(name, {key: given[key] for key in needs})
+        run(ctx, {key: given[key] for key in needs})
+        for left_out in needs:
+            params = {key: given[key] for key in needs if key != left_out}
+            with pytest.raises(binary_graph_query.MissingParameter):
+                binary_graph_query.check_parameters(name, params)
+            with pytest.raises(binary_graph_query.MissingParameter):
+                run(ctx, params)
+
+
+def test_a_cache_that_cannot_be_opened_right_now_is_tried_again_not_rebuilt(client, tdc, graph_host, monkeypatch):
+    # a scanner holding the freshly written file without read sharing: the file is fine, it only cannot be opened
+    _, builds, _ = graph_host
+    real = binary_graph.load_graph
+    loads = []
+
+    def flaky(*args):
+        loads.append(args)
+        if len(loads) == 1:
+            raise binary_graph.CacheMismatch("unreadable", "the cache file cannot be opened")
+        return real(*args)
+
+    monkeypatch.setattr(tdc.binary_graph, "load_graph", flaky)
+    r = client.get("/api/binary-graph/query?q=imports&module=b.exe")
+    _join(tdc)
+    assert r.status_code == 404 and r.get_json()["cache"] is None and "next request" in r.get_json()["error"]
+    assert builds == [] and tdc._binary_graph_build_state["failed"] == {}
+    assert client.get("/api/binary-graph/query?q=imports&module=b.exe").status_code == 200
+    assert len(loads) == 2
+
+
+def test_a_build_that_ends_well_but_leaves_no_cache_counts_as_a_failure(client, tdc, graph_host):
+    path, builds, _ = graph_host
+    os.remove(path)                                      # and the recorder that "builds" writes nothing
+    client.get("/api/binary-graph/query?q=imports&module=b.exe")
+    _join(tdc)
+    key = ("26220.5770", "arm64")
+    assert tdc._binary_graph_build_state["attempts"][key] == 1
+    body = client.get("/api/binary-graph/query?q=imports&module=b.exe").get_json()
+    _join(tdc)
+    assert len(builds) == 1 and "left no cache" in body["failed"]["reason"]
+
+
+def test_the_build_runs_below_normal_priority(tdc, monkeypatch):
+    seen = {}
+
+    def run(args, timeout=None, **kwargs):
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(tdc, "_run_cmd", run)
+    monkeypatch.setattr(tdc.subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x4000, raising=False)
+    tdc._build_binary_graph("26220.5770", "arm64")
+    assert seen["creationflags"] & 0x4000
+
+
+def test_a_deleted_cache_lets_go_of_the_graph_it_held(client, tdc, graph_host):
+    path, _, _ = graph_host
+    assert client.get("/api/binary-graph/query?q=imports&module=b.exe").status_code == 200
+    assert tdc._binary_graph_held
+    os.remove(path)
+    assert client.get("/api/binary-graph/query?q=imports&module=b.exe").status_code == 404
+    _join(tdc)
+    assert tdc._binary_graph_held == {}

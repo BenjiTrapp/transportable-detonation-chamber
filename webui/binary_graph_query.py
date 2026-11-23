@@ -46,6 +46,7 @@ class Answer:
     truncated: bool             # nodes were dropped to stay within MAX_NODES
     note: str                   # prose for the reader, English, whole sentences; not a token for code
     roots: tuple[str, ...]      # ids of the nodes the view starts from, always among `nodes`
+    total: int                  # how many parts (importers, chains, ...) the answer had before the cut; 0 when empty
 
 
 # function name -> its SUSPICIOUS_IMPORTS category; the web UI fills it (set_categories) so this module needs no app
@@ -126,7 +127,7 @@ class _Part:
 
 
 def _empty(note):
-    return Answer((), (), False, note, ())
+    return Answer((), (), False, note, (), 0)
 
 
 def _answer(fixed, parts, note, what):
@@ -156,7 +157,7 @@ def _answer(fixed, parts, note, what):
     if truncated:
         note += (f" Only the first {kept} of {len(parts)} {what} are drawn: an answer is cut at {MAX_NODES} "
                  f"nodes.")
-    return Answer(tuple(nodes.values()), tuple(edges.values()), truncated, note, tuple(roots))
+    return Answer(tuple(nodes.values()), tuple(edges.values()), truncated, note, tuple(roots), len(parts))
 
 
 def _plural(count, one, many):
@@ -351,20 +352,47 @@ def forwarder_chains(graph, module: str) -> Answer:
     return _answer(_Part([], [], []), parts, note, "forwarded exports")
 
 
+def _reached(graph, info):
+    """module -> the names `info` imports it by: itself, or the api sets that stand for it. An api set counts as its
+    first host in the map's order, the default the map gives at module level; one the map has no host for counts as
+    itself."""
+    reached = {}
+    for imported in info.imports:
+        module = imported
+        if _is_api_set(graph, imported):
+            hosts = binary_graph.api_set_hosts(graph.api_sets, imported)
+            if hosts:
+                module = hosts[0].lower()
+        reached.setdefault(module, []).append(imported)
+    return reached
+
+
 def shared_dependencies(graph, a: str, b: str) -> Answer:
-    """The modules both `a` and `b` import directly, each with an import edge from both."""
+    """The modules both `a` and `b` import, compared after api-set resolution: most of System32 imports through api
+    sets, and two binaries that reach kernelbase.dll through different api-set names do share it. Each binary is
+    drawn importing a shared module directly, or importing the alias that resolves to it."""
     first, second = _module_name(graph, a), _module_name(graph, b)
     for name in (first, second):
         if name not in graph.binaries:
             return _empty(f"{name or 'That name'} is not in the binary graph of this system.")
-    other = graph.binaries[second].imports
-    shared = sorted(module for module in graph.binaries[first].imports if module in other)
+    reached = {name: _reached(graph, graph.binaries[name]) for name in (first, second)}
+    shared = sorted(module for module in reached[first] if module in reached[second])
     if not shared:
-        return _empty(f"{first} and {second} import no module in common.")
+        return _empty(f"{first} and {second} import no module in common, compared after api-set resolution.")
     fixed = _Part([_module_node(graph, first), _module_node(graph, second)], [], [first, second])
-    parts = [_Part([_module_node(graph, module)],
-                   [_edge(first, module, "imports"), _edge(second, module, "imports")], []) for module in shared]
-    note = f"{first} and {second} both import {_plural(len(shared), 'module', 'modules')}."
+    parts = []
+    for module in shared:
+        part = _Part([_module_node(graph, module)], [], [])
+        for name in (first, second):
+            for imported in reached[name][module]:
+                if imported == module:
+                    part.edges.append(_edge(name, module, "imports"))
+                else:
+                    part.nodes.append(_module_node(graph, imported))
+                    part.edges += [_edge(name, imported, "imports"), _edge(imported, module, "resolves_to")]
+        parts.append(part)
+    note = (f"{first} and {second} both import {_plural(len(shared), 'module', 'modules')}, compared after api-set "
+            f"resolution: an api set counts as its first host.")
     return _answer(fixed, parts, note, "shared modules")
 
 
@@ -411,6 +439,23 @@ class MissingParameter(ValueError):
     def __init__(self, name):
         super().__init__(f"the parameter {name} is required for this query")
         self.name = name
+
+
+# query name -> the parameters it cannot do without, checked by the route before any graph is fetched: a malformed
+# request must not start minutes of building
+NEEDS = {
+    "importers": ("module",),
+    "imports": ("module",),
+    "syscall-callers": ("syscall",),
+    "forwarders": ("module",),
+    "shared": ("module", "other"),
+}
+
+
+def check_parameters(name: str, params: dict) -> None:
+    """Raise MissingParameter for the first parameter query `name` needs and `params` does not give."""
+    for needed in NEEDS[name]:
+        _need(params, needed)
 
 
 def _need(params, name):

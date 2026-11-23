@@ -8901,7 +8901,10 @@ def _build_binary_graph(build, arch):
     args = [sys.executable, os.path.join(APP_DIR, "binary_graph.py"), "--out", NTSLEUTH_BASELINE_DIR,
             "--build", build, "--arch", arch]
     try:
-        proc = _run_cmd(args, timeout=BINARY_GRAPH_BUILD_TIMEOUT, cwd=APP_DIR)
+        # below normal priority: the build must not take the CPU from a sample being observed
+        proc = _run_cmd(args, timeout=BINARY_GRAPH_BUILD_TIMEOUT, cwd=APP_DIR,
+                        creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+                        | getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"binary_graph.py timed out ({BINARY_GRAPH_BUILD_TIMEOUT}s)") from None
     except OSError as exc:
@@ -8944,10 +8947,12 @@ def _binary_graph_build_job(build, arch):
         state["built"].pop(key, None)
         if why is not None:
             _record_binary_graph_failure(key, why)
+        elif stamp is None:
+            # it said it wrote the cache and there is none: without a count, the next request would build again
+            _record_binary_graph_failure(key, "binary_graph.py ended well but left no cache")
         else:
             state["failed"].pop(key, None)
-            if stamp is not None:
-                state["built"][key] = stamp
+            state["built"][key] = stamp
 
 
 def _start_binary_graph_build(build, arch):
@@ -9043,6 +9048,8 @@ def _binary_graph_for():
     path = binary_graph.find_cache(NTSLEUTH_BASELINE_DIR, build, arch)
     stamp = _binary_graph_stat(path) if path else None
     if stamp is None:
+        with _binary_graph_held_lock:
+            _binary_graph_held.clear()          # its file is gone: no reason to keep 40-90 MB of it
         _start_binary_graph_build(build, arch)
         return None, _binary_graph_refusal(f"There is no binary graph for build {build} ({arch}) yet.", build, arch)
     with _binary_graph_held_lock:
@@ -9052,8 +9059,15 @@ def _binary_graph_for():
                 loaded = binary_graph.load_graph(path, build, arch)
             except binary_graph.CacheMismatch as exc:
                 loaded = exc
-            _binary_graph_held.update(path=path, stamp=stamp, graph=loaded)
-        loaded = _binary_graph_held["graph"]
+            # a file that cannot be opened right now (a scanner holding it without read sharing) is not a broken
+            # one: it is not held, and is read again on the next request rather than rebuilt
+            if not (isinstance(loaded, binary_graph.CacheMismatch) and loaded.reason == "unreadable"):
+                _binary_graph_held.update(path=path, stamp=stamp, graph=loaded)
+        else:
+            loaded = _binary_graph_held["graph"]
+    if isinstance(loaded, binary_graph.CacheMismatch) and loaded.reason == "unreadable":
+        return None, _binary_graph_refusal(f"The binary graph {os.path.basename(path)} cannot be opened right now; "
+                                           f"it is read again on the next request.", build, arch)
     if isinstance(loaded, binary_graph.CacheMismatch):
         _rebuild_did_not_help(build, arch, stamp, loaded.reason)
         _start_binary_graph_build(build, arch)
@@ -9083,6 +9097,10 @@ def api_binary_graph_query():
     if run is None:
         return jsonify({"error": "q must be one of " + ", ".join(binary_graph_query.QUERIES)}), 400
     params = {name: _binary_graph_param(name) for name in ("module", "function", "syscall", "other", "metric")}
+    try:
+        binary_graph_query.check_parameters(request.args.get("q"), params)
+    except binary_graph_query.MissingParameter as exc:
+        return jsonify({"error": str(exc)}), 400
     graph, refusal = _binary_graph_for()
     if graph is None:
         return jsonify(refusal), 404
