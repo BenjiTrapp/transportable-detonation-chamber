@@ -178,7 +178,7 @@ flowchart TB
         SYSMON["Sysmon"]
         SOURCES["Rustinel's NDJSON log files and<br/>Fibratus' events in the Windows event log"]
         EVTX["Sysmon's own event log"]
-        MEMORY["Live memory against the PID, in this order:<br/>Hunt-Sleeping-Beacons, BeaconEye,<br/>Aether, Process Dump"]
+        MEMORY["Live memory against the PID, in this order:<br/>Hunt-Sleeping-Beacons, BeaconEye,<br/>Aether, Syscalls, Process Dump"]
         EXIT["Exit Capture: Windows dumps<br/>the process as it exits"]
     end
     BROWSER -->|"HTTP :9000"| WEBUI

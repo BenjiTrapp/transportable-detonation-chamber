@@ -31,7 +31,7 @@ flowchart LR
     RUN -.->|"as it happens"| ENGINES["Rustinel, Fibratus and Sysmon record<br/>all the time; their output is matched<br/>to the PID afterwards"]
     API -->|"target litterbox or both"| LB["LitterBox: upload, then<br/>static, then dynamic analysis"]
     PID --> LB
-    PID --> SCANS["In the background, in order:<br/>Hunt-Sleeping-Beacons, BeaconEye,<br/>Aether 3 samples, Process Dump last"]
+    PID --> SCANS["In the background, in order:<br/>Hunt-Sleeping-Beacons, BeaconEye,<br/>Aether 3 samples, Syscalls, Process Dump last"]
     PID --> WATCH["Exit capture waits for the dump<br/>until that window closes, then reads it"]
     PID --> LOG["From the Sysmon log: beaconing<br/>and named pipes"]
     ENGINES --> RESULTS["/api/detonation/results"]

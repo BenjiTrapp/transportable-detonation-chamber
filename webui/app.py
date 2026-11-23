@@ -570,7 +570,7 @@ def _extract_sha256(hashes):
     return ""
 
 
-_PROCESS_SCAN_TOOLS = {"aether", "process dump", "exit capture", "hunt-sleeping-beacons", "beaconeye"}
+_PROCESS_SCAN_TOOLS = {"aether", "syscalls", "process dump", "exit capture", "hunt-sleeping-beacons", "beaconeye"}
 
 
 def _summarize_scan_entry(e):
@@ -4003,6 +4003,7 @@ def api_submit():
 
     # Submit to DetonatorAgent
     agent_pid = None
+    agent_file_path = None
     exit_capture_armed_at = None
     if target in ("agent", "both"):
         # Arm dump-on-exit before the sample starts: a sample that exits within
@@ -4025,6 +4026,7 @@ def api_submit():
                 agent_data = r.json() if r.ok else {}
                 if isinstance(agent_data, dict):
                     agent_pid = agent_data.get("pid")
+                    agent_file_path = agent_data.get("file_path") or agent_data.get("path")
         except Exception as e:
             results["agent"] = {"status": 502, "error": str(e)}
 
@@ -4108,9 +4110,10 @@ def api_submit():
     memory_tools_available = (os.path.isfile(HUNT_SLEEPING_BEACONS_EXE)
                               or os.path.isfile(BEACONEYE_EXE)
                               or os.path.isfile(AETHER_EXE)
-                              or os.path.isfile(PROCESSDUMP_EXE))
+                              or os.path.isfile(PROCESSDUMP_EXE)
+                              or _syscall_stage_available())
     if agent_pid and memory_tools_available:
-        _run_memory_scans_async(agent_pid, file_sha256)
+        _run_memory_scans_async(agent_pid, file_sha256, agent_file_path)
         results["beacon_scan"] = {
             "triggered": True,
             "tools": [],
@@ -4121,6 +4124,8 @@ def api_submit():
             results["beacon_scan"]["tools"].append("BeaconEye")
         if os.path.isfile(AETHER_EXE):
             results["beacon_scan"]["tools"].append("Aether")
+        if _syscall_stage_available():
+            results["beacon_scan"]["tools"].append("Syscalls")
         if os.path.isfile(PROCESSDUMP_EXE):
             results["beacon_scan"]["tools"].append("Process Dump")
     else:
@@ -4265,6 +4270,7 @@ def api_detonation_results():
     hsb_result = _rs.lookup("hsb", pid, sha256)
     beaconeye_result = _rs.lookup("beaconeye", pid, sha256)
     aether_result = _rs.lookup("aether", pid, sha256)
+    syscalls_result = _rs.lookup("syscalls", pid, sha256)
     processdump_result = _rs.lookup("processdump", pid, sha256)
     exitcapture_result = _rs.lookup("exitcapture", pid, sha256)
 
@@ -4274,6 +4280,8 @@ def api_detonation_results():
         results["beaconeye"] = beaconeye_result
     if aether_result:
         results["aether"] = aether_result
+    if syscalls_result:
+        results["syscalls"] = syscalls_result
     if processdump_result:
         results["process_dump"] = processdump_result
     if exitcapture_result:
@@ -4290,6 +4298,7 @@ def api_detonation_results():
         "hsb_installed": os.path.isfile(HUNT_SLEEPING_BEACONS_EXE),
         "beaconeye_installed": os.path.isfile(BEACONEYE_EXE),
         "aether_installed": os.path.isfile(AETHER_EXE),
+        "ntsleuth_installed": _syscall_stage_available(),
         "process_dump_installed": os.path.isfile(PROCESSDUMP_EXE),
     }
 
@@ -4750,8 +4759,11 @@ def _compute_verdict(results, matching_alerts):
         process_name = (results.get("file_info") or {}).get("name") or ""
 
     mem_findings = memory_evidence.collect(results, process=process_name)
+    mem_findings += _syscall_stage_findings(results.get("syscalls"))
     mem_sources = [k for k in ("aether", "process_dump", "hunt_sleeping_beacons",
                                "beaconeye", "exit_capture_result") if results.get(k)]
+    if _syscall_stage_entry(results.get("syscalls")):
+        mem_sources.append("syscalls")
     if (results.get("network_beaconing") or {}).get("evidence_findings"):
         mem_sources.append("network_beaconing")
     if (results.get("named_pipes") or {}).get("evidence_findings"):
@@ -7363,7 +7375,40 @@ def _sweep_entry(per_pid, pid, image):
     return entry
 
 
-def _run_sweep(use_aether, use_processdump, capture_baseline):
+def _sweep_syscalls(names, per_pid, errors, stats):
+    """The syscall scan of every process in `names` (pid -> image) that has a baseline and can be opened; the
+    others are counted. The findings go into `per_pid` like those of the other tools."""
+    scanned = skipped = 0
+    allowlist, build = _get_hook_allowlist(), _current_os_build()
+    baselines = {}
+    for pid, image in sorted(names.items()):
+        view = _syscall_view_for_pid(pid)
+        if view not in SYSCALL_BASELINE_VIEWS:
+            skipped += 1
+            continue
+        if view not in baselines:
+            baselines[view], why = _syscall_baseline_for(view, extract=False)
+            if baselines[view] is None:
+                errors.append(f"Syscall sweep of the {view} processes: {why}")
+        baseline = baselines[view]
+        if baseline is None:
+            skipped += 1
+            continue
+        try:
+            measured = _syscall_read_process(
+                pid, view, build,
+                lambda reader: syscall_scan.measure(baseline, reader, view, build, ("ntdll.dll",), allowlist))
+        except Exception:
+            skipped += 1
+            continue
+        scanned += 1
+        entry = _sweep_entry(per_pid, pid, image)
+        entry["findings"] += memory_evidence.collect({"syscall_scan": measured}, process=entry["identity"])
+    stats["syscall_processes"] = scanned
+    stats["syscall_skipped"] = skipped
+
+
+def _run_sweep(use_aether, use_processdump, capture_baseline, use_syscalls=False):
     started = time.time()
     names = _running_process_names()
     per_pid, errors, stats = {}, [], {}
@@ -7406,6 +7451,9 @@ def _run_sweep(use_aether, use_processdump, capture_baseline):
                 entry = _sweep_entry(per_pid, pid, image)
                 entry["findings"] += memory_evidence.from_process_dump(
                     {"dumps": dumps}, process=entry["identity"])
+
+    if use_syscalls and _syscall_stage_available():
+        _sweep_syscalls(names, per_pid, errors, stats)
 
     captured = 0
     pipe_captured = None
@@ -7472,7 +7520,7 @@ def _run_sweep(use_aether, use_processdump, capture_baseline):
 def api_memory_sweep_start():
     """Start a background sweep of every process.
 
-    Body: {"aether": true, "processdump": false, "baseline": false}
+    Body: {"aether": true, "processdump": false, "syscalls": true, "baseline": false}
     With "baseline": true the findings are recorded as the host baseline
     instead of being scored - run that on a clean box.
     """
@@ -7480,9 +7528,11 @@ def api_memory_sweep_start():
     truthy = lambda v, d: d if v is None else str(v).lower() in ("1", "true", "yes")
     use_aether = truthy(data.get("aether"), True)
     use_pd = truthy(data.get("processdump"), False)
+    use_syscalls = truthy(data.get("syscalls"), True)
     capture_baseline = truthy(data.get("baseline"), False)
 
-    if not (use_aether and os.path.isfile(AETHER_EXE)) and not (use_pd and os.path.isfile(PROCESSDUMP_EXE)):
+    if (not (use_aether and os.path.isfile(AETHER_EXE)) and not (use_pd and os.path.isfile(PROCESSDUMP_EXE))
+            and not (use_syscalls and _syscall_stage_available())):
         return jsonify({"error": "No selected sweep tool is installed"}), 400
 
     with _sweep_lock:
@@ -7492,13 +7542,13 @@ def api_memory_sweep_start():
         _sweep_state.clear()
         _sweep_state.update({
             "running": True, "started": time.time(),
-            "options": {"aether": use_aether, "processdump": use_pd,
+            "options": {"aether": use_aether, "processdump": use_pd, "syscalls": use_syscalls,
                         "baseline": capture_baseline},
         })
 
     def _job():
         try:
-            result = _run_sweep(use_aether, use_pd, capture_baseline)
+            result = _run_sweep(use_aether, use_pd, capture_baseline, use_syscalls)
             with _sweep_lock:
                 _sweep_state.update({"running": False, "result": result})
         except Exception as e:
@@ -7706,6 +7756,7 @@ def api_memory_evidence():
             "hunt_sleeping_beacons": _beacon_results_cache.lookup("hsb", pid),
             "beaconeye": _beacon_results_cache.lookup("beaconeye", pid),
             "exit_capture_result": _beacon_results_cache.lookup("exitcapture", pid),
+            "syscalls": _syscall_stage_entry(_beacon_results_cache.lookup("syscalls", pid)),
         }
     cached = {k: v for k, v in cached.items() if v}
     net = _network_beaconing_for_pid(pid)
@@ -7725,6 +7776,7 @@ def api_memory_evidence():
             break
     process_name = process_name or _image_name_for_pid(pid)
     findings = memory_evidence.collect(cached, process=process_name)
+    findings += _syscall_stage_findings(cached.get("syscalls"))
     return jsonify({
         "pid": pid,
         "process": process_name,
@@ -7951,10 +8003,10 @@ def _syscall_extraction_note(build, view):
     return f" The last extraction failed: {failed[1]}." if failed else ""
 
 
-def _syscall_baseline_for(view):
+def _syscall_baseline_for(view, extract=True):
     """`(baseline, None)` for `view` on this system's build, or `(None, why)`. A baseline of another build is no
     baseline: its RVAs are about other bytes. When there is none for this build, one is extracted in the
-    background."""
+    background, unless `extract` is False: a detonation does not start NTSleuth."""
     if view not in SYSCALL_BASELINE_VIEWS:
         return None, f"there is no syscall baseline for the {view or 'unknown'} view"
     build = _current_os_build()
@@ -7962,7 +8014,8 @@ def _syscall_baseline_for(view):
         return None, "no syscall baseline can be chosen: the build of this system cannot be determined"
     path = syscall_baseline.find_baseline(NTSLEUTH_BASELINE_DIR, build, view)
     if path is None:
-        _start_baseline_extraction(build, view)
+        if extract:
+            _start_baseline_extraction(build, view)
         return None, (f"no syscall baseline for build {build}, view {view}."
                       + _syscall_extraction_note(build, view))
     try:
@@ -8147,6 +8200,97 @@ def _syscall_measure(pid, modules, allowlist=None):
         pid, view, build,
         lambda reader: syscall_scan.measure(baseline, reader, view, build, modules, allowlist))
     return measured, view, build
+
+
+def _syscall_stage_available():
+    """Whether NTSleuth is installed for a view a baseline is kept for. A detonation runs its syscall stage only then."""
+    return any(os.path.isfile(_ntsleuth_exe(view)) for view in SYSCALL_BASELINE_VIEWS)
+
+
+def _syscall_stage_file(path, baseline):
+    """`(hits, info)`: the stubs the file at `path` carries and what is known of the search. A file that cannot be
+    searched is a note in `info`. The import table is not passed: only one expanded through the Win32 to Nt table
+    can prove a bypass, and a raw one would turn a hint into a proof."""
+    if not isinstance(path, str) or not path:
+        return [], {"skipped": "the path of the sample is not known"}
+    real = _readable_path(path)
+    if real is None:
+        return [], {"skipped": "the sample is outside the folders the web UI reads"}
+    try:
+        if os.path.getsize(real) > SYSCALL_FILE_MAX:
+            return [], {"skipped": f"the sample is larger than {SYSCALL_FILE_MAX // (1024 * 1024)} MB"}
+        with open(real, "rb") as fh:
+            content = fh.read()
+    except OSError as exc:
+        return [], {"skipped": f"the sample cannot be read: {exc.strerror or exc}"}
+    return syscall_scan.find_stubs_in_bytes(content, baseline), {"path": real, "size": len(content)}
+
+
+def _syscall_stage(pid, path):
+    """The syscall scan of a detonated process: its stubs measured against the baseline, the stubs it carries
+    outside ntdll, and the stubs the sample file carries. Raises _SyscallRouteError for what it cannot do."""
+    view = _syscall_view_for_pid(pid)
+    if view is None:
+        raise _SyscallRouteError(f"the architecture of process {pid} is unknown (it is gone, or its image cannot "
+                                 "be read)")
+    baseline, why = _syscall_baseline_for(view, extract=False)
+    if baseline is None:
+        raise _SyscallRouteError(why)
+    build = _current_os_build()
+    identity = _syscall_identity(pid)
+    modules = _syscall_modules(None)
+    measured = _syscall_read_process(
+        pid, view, build,
+        lambda reader: syscall_scan.measure(baseline, reader, view, build, modules, _get_hook_allowlist()))
+    try:
+        found = _syscall_read_process(
+            pid, view, build, lambda reader: syscall_scan.find_stubs_in_process(reader, baseline))
+        # StubScan's own attributes are lost to list() and json.dumps: they become keys here
+        in_process = {"hits": list(found), "partial": found.partial,
+                      "regions_searched": found.regions_searched, "note": found.note}
+    except Exception as exc:
+        in_process = {"hits": [], "error": str(exc)}
+    file_hits, in_file = _syscall_stage_file(path, baseline)
+    in_file["hits"] = list(file_hits)
+    findings = memory_evidence.collect({"syscall_scan": measured}, process=identity)
+    findings += memory_evidence.from_direct_stubs(in_process["hits"] + in_file["hits"], identity)
+    return {**{k: v for k, v in measured.items() if k != "states"},
+            "tool": "Syscalls", "pid": pid, "process": identity, "modules": list(modules),
+            "stubs": {"process": in_process, "file": in_file},
+            "evidence_findings": findings,
+            "evidence": memory_evidence.score(findings, baseline=_memory_baseline)}
+
+
+def _run_syscall_stage(pid, path, notes=None):
+    """The syscall stage of a detonation, or None when it skips itself, the reason appended to `notes`.
+
+    It never raises and starts no extraction: without NTSleuth, without a baseline of this build and view (one
+    being extracted is not one yet), for a process that is gone or cannot be read, or for a scan that runs out of
+    time, a detonation goes on without it. `path` is the sample's file, searched for stubs as well."""
+    def skip(why):
+        if notes is not None:
+            notes.append(why)
+        return None
+
+    if not _syscall_stage_available():
+        return skip("NTSleuth is not installed")
+    try:
+        return _syscall_stage(pid, path)
+    except _SyscallRouteError as exc:
+        return skip(str(exc))
+    except Exception as exc:
+        return skip(f"the syscall scan failed: {exc}")
+
+
+def _syscall_stage_entry(entry):
+    """`entry`, a stored result of the stage, when the scan ran; None for one that skipped or failed."""
+    return entry if isinstance(entry, dict) and "evidence_findings" in entry else None
+
+
+def _syscall_stage_findings(entry):
+    """The findings of a stored result of the stage."""
+    entry = _syscall_stage_entry(entry)
+    return list(entry["evidence_findings"] or []) if entry else []
 
 
 @app.route("/api/syscalls/status")
@@ -8714,11 +8858,12 @@ def _parse_beaconeye_output(output):
     return findings
 
 
-def _run_memory_scans_async(pid, sha256):
+def _run_memory_scans_async(pid, sha256, path=None):
     """Run every live-memory tool against a detonated process, in background.
 
     Order matters: the read-only scanners go first so their view of the process
-    is undisturbed, and Process Dump runs last because it writes files.
+    is undisturbed, and Process Dump runs last because it writes files. `path`
+    is the sample's file, which the syscall stage searches as well.
     """
     def _scan():
         try:
@@ -8755,6 +8900,21 @@ def _run_memory_scans_async(pid, sha256):
                     _record_scan("Aether", f"PID {pid}", aether_result)
             except Exception as e:
                 _beacon_results_cache.put("aether", {"tool": "Aether", "error": str(e)}, pid=pid, sha256=sha256)
+
+        # Syscalls: the stubs of the process against the NTSleuth baseline, and the stubs the sample carries
+        # itself. It only reads, and skips itself, with its reason kept, where it cannot run.
+        if _syscall_stage_available():
+            try:
+                notes = []
+                syscall_result = _run_syscall_stage(pid, path, notes)
+                if syscall_result:
+                    _beacon_results_cache.put("syscalls", syscall_result, pid=pid, sha256=sha256)
+                    _record_scan("Syscalls", f"PID {pid}", syscall_result)
+                else:
+                    _beacon_results_cache.put("syscalls", {"tool": "Syscalls", "skipped": "; ".join(notes) or "skipped"},
+                                              pid=pid, sha256=sha256)
+            except Exception as e:
+                _beacon_results_cache.put("syscalls", {"tool": "Syscalls", "error": str(e)}, pid=pid, sha256=sha256)
 
         # Process Dump last: it writes files, and running it after the scanners
         # keeps their view of the process undisturbed. The clean-hash database
@@ -11298,6 +11458,10 @@ def _update_preconditions():
         return "A process dump is running."
     if _scans_running() > 0:
         return "A scan is running. Wait until it finishes."
+    if _syscall_scan_running():
+        return "A syscall scan is running. Wait until it finishes."
+    if _syscall_extracting():
+        return "A syscall baseline is being extracted. Wait until it finishes."
     return None
 
 

@@ -2,6 +2,8 @@
 
 import contextlib
 import datetime
+import hashlib
+import io
 import json
 import os
 import pathlib
@@ -3553,3 +3555,570 @@ def test_the_real_yara_takes_the_longest_name_check_draft_lets_through(tmp_path)
     over.write_text(_forged(129)["text"])
     refused = subprocess.run(["yara", str(over), str(over)], capture_output=True, text=True)
     assert refused.returncode != 0 and "identifier too long" in refused.stderr
+
+
+# --- the scan as a stage of a detonation ----------------------------------------------------
+
+SHA_SAMPLE = "ab" * 32
+
+
+@pytest.fixture
+def ntsleuth(tdc):
+    folder = pathlib.Path(tdc.NTSLEUTH_DIR)
+    folder.mkdir(parents=True)
+    for view in ("arm64", "x64"):
+        (folder / f"ntsleuth-{view}.exe").write_bytes(b"MZ")
+    return folder
+
+
+def _run_stage(tdc, pid=4812, path=None):
+    notes = []
+    return tdc._run_syscall_stage(pid, path, notes), notes
+
+
+def test_the_stage_measures_the_process_and_scores_what_it_finds(tdc, target, ntsleuth, fake_baseline_dir):
+    target.reader = _patched_reader(tdc, fake_baseline_dir, "private")
+    result, notes = _run_stage(tdc)
+    assert notes == [] and result["tool"] == "Syscalls" and result["pid"] == 4812
+    assert result["process"] == "C:\\Samples\\sample.exe" and result["view"] == "arm64"
+    assert result["counts"]["patched"] == 1 and "states" not in result       # the state of 2,461 stubs is not kept
+    assert [f["kind"] for f in result["evidence"]["findings"]] == ["syscall_stub_patched"]
+    assert result["evidence"]["score"] > 0
+    assert target.opened and all(o == (4812, "arm64", "26220.5770") for o in target.opened)
+
+
+def test_the_stage_searches_the_process_and_the_file_and_one_stub_is_one_finding(tdc, target, ntsleuth, sample_dir):
+    target.view = "x64"
+    target.reader = _x64_space(b"\x90" * 0x40 + _X64_STUB_0x3A + b"\xc3")
+    path = sample_dir / "loader.bin"
+    path.write_bytes(b"\x90" * 16 + _X64_STUB_0x3A + b"\xc3")
+    result, _ = _run_stage(tdc, path=str(path))
+    stubs = result["stubs"]
+    assert [h["address"] for h in stubs["process"]["hits"]] == [_PRIVATE_BASE + 0x40]
+    assert [h["offset"] for h in stubs["file"]["hits"]] == [16]
+    # StubScan's attributes do not survive json.dumps, so they are plain keys
+    assert (stubs["process"]["partial"], stubs["process"]["regions_searched"], stubs["process"]["note"]) == (False, 1, "")
+    assert stubs["file"]["path"] == os.path.realpath(str(path)) and stubs["file"]["size"] == len(path.read_bytes())
+    [finding] = [f for f in result["evidence"]["findings"] if f["kind"] == "direct_syscall_stub"]
+    assert finding["copies"] == 2
+    json.dumps(result)
+
+
+def test_a_stub_only_the_file_carries_is_found(tdc, target, ntsleuth, sample_dir):
+    # a sample that unpacks itself into its own image section: the process search leaves the image out
+    target.view = "x64"
+    target.reader = _x64_space(b"\x90" * 8)
+    path = sample_dir / "packed.bin"
+    path.write_bytes(_X64_STUB_0x3A)
+    result, _ = _run_stage(tdc, path=str(path))
+    assert result["stubs"]["process"]["hits"] == [] and len(result["stubs"]["file"]["hits"]) == 1
+    assert [f["kind"] for f in result["evidence"]["findings"]] == ["direct_syscall_stub"]
+
+
+def test_the_stage_never_hands_the_import_table_to_the_search(tdc, target, ntsleuth, sample_dir, monkeypatch):
+    # only a table expanded through the Win32 to Nt chain can prove a bypass, and that table is not built yet; a
+    # raw one would turn a hint into a proof, and set() for "not read" would read as "imports nothing"
+    target.view = "x64"
+    target.reader = _x64_space(b"\x90" * 8)
+    path = sample_dir / "loader.bin"
+    path.write_bytes(_X64_STUB_0x3A)
+    calls = []
+    real = syscall_scan.find_stubs_in_bytes
+    monkeypatch.setattr(syscall_scan, "find_stubs_in_bytes",
+                        lambda *args, **kw: calls.append((len(args), kw)) or real(*args, **kw))
+    monkeypatch.setattr(tdc, "_pe_import_names", lambda data: pytest.fail("the import table was read"))
+    result, _ = _run_stage(tdc, path=str(path))
+    assert calls == [(2, {})]
+    [hit] = result["stubs"]["file"]["hits"]
+    assert hit["import_present"] is None
+    [finding] = result["evidence"]["findings"]
+    assert finding["needs_corroboration"] is True
+
+
+def test_the_stage_scores_a_hook_of_a_known_owner_as_nothing(client, tdc, target, ntsleuth, fake_baseline_dir):
+    target.reader = _patched_reader(tdc, fake_baseline_dir, "edr.dll")
+    client.post("/api/syscalls/hook-baseline", json={"pid": 4812})
+    result, _ = _run_stage(tdc)
+    assert result["counts"]["hooked"] == 1 and result["evidence"]["findings"] == []
+
+
+def test_a_file_that_is_not_there_does_not_end_the_stage(tdc, target, ntsleuth, sample_dir, fake_baseline_dir):
+    target.reader = _patched_reader(tdc, fake_baseline_dir, "private")
+    result, _ = _run_stage(tdc, path=str(sample_dir / "gone.exe"))
+    assert result["stubs"]["file"]["skipped"] and result["stubs"]["file"]["hits"] == []
+    assert result["counts"]["patched"] == 1
+
+
+@pytest.mark.parametrize("path", [None, "", "\\\\host\\share\\x.exe", "relative.exe", 7])
+def test_a_file_path_that_cannot_be_read_is_a_note_not_an_error(tdc, target, ntsleuth, sample_dir, path):
+    result, _ = _run_stage(tdc, path=path)
+    assert result["stubs"]["file"]["skipped"] and result["stubs"]["file"]["hits"] == []
+
+
+def test_a_file_outside_the_readable_folders_is_not_opened(tdc, target, ntsleuth, sample_dir, tmp_path):
+    outside = tmp_path / "elsewhere.bin"
+    outside.write_bytes(_X64_STUB_0x3A)
+    result, _ = _run_stage(tdc, path=str(outside))
+    assert "outside" in result["stubs"]["file"]["skipped"] and result["stubs"]["file"]["hits"] == []
+
+
+def test_a_file_too_big_is_not_read(tdc, target, ntsleuth, sample_dir, monkeypatch):
+    path = sample_dir / "big.bin"
+    path.write_bytes(b"\0" * 64)
+    monkeypatch.setattr(tdc, "SYSCALL_FILE_MAX", 32)
+    result, _ = _run_stage(tdc, path=str(path))
+    assert "larger" in result["stubs"]["file"]["skipped"]
+
+
+def test_a_file_that_is_no_pe_is_searched_all_the_same(tdc, target, ntsleuth, sample_dir):
+    path = sample_dir / "shellcode.bin"
+    path.write_bytes(b"not a pe at all " + _X64_STUB_0x3A)
+    target.view = "x64"
+    target.reader = _x64_space(b"\x90" * 8)
+    result, _ = _run_stage(tdc, path=str(path))
+    assert len(result["stubs"]["file"]["hits"]) == 1
+
+
+def test_a_search_of_the_process_that_fails_leaves_the_measurement(tdc, target, ntsleuth, fake_baseline_dir,
+                                                                    monkeypatch):
+    target.reader = _patched_reader(tdc, fake_baseline_dir, "private")
+
+    def refuse(reader, baseline):
+        raise OSError("access is denied")
+
+    monkeypatch.setattr(syscall_scan, "find_stubs_in_process", refuse)
+    result, _ = _run_stage(tdc)
+    assert result["counts"]["patched"] == 1 and "access is denied" in result["stubs"]["process"]["error"]
+    assert [f["kind"] for f in result["evidence"]["findings"]] == ["syscall_stub_patched"]
+
+
+# every way the stage skips itself returns None and says why; a detonation goes on (see the pipeline tests)
+
+def test_the_stage_skips_itself_without_ntsleuth(tdc, target, monkeypatch):
+    monkeypatch.setattr(tdc, "NTSLEUTH_DIR", "/nonexistent")
+    result, notes = _run_stage(tdc)
+    assert result is None and "NTSleuth" in notes[0]
+    assert target.opened == []                                   # nothing was read
+    assert tdc._run_syscall_stage(4812, None) is None            # the notes are optional
+
+
+def test_the_stage_skips_itself_without_a_baseline_and_does_not_extract_one(tdc, target, ntsleuth, monkeypatch):
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")
+    monkeypatch.setattr(tdc, "_extract_baseline", lambda *a: pytest.fail("a detonation started an extraction"))
+    result, notes = _run_stage(tdc)
+    assert result is None and "no syscall baseline for build 26300.1" in notes[0]
+    assert tdc._syscall_extract_state["thread"] is None and not tdc._syscall_extracting()
+    assert target.opened == []
+
+
+def test_the_stage_skips_itself_while_the_baseline_is_being_extracted(tdc, target, ntsleuth, monkeypatch):
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")
+    tdc._syscall_extract_state["running"].add(("26300.1", "arm64"))
+    result, notes = _run_stage(tdc)
+    assert result is None and "being extracted" in notes[0]
+    assert target.opened == []
+
+
+def test_the_stage_skips_itself_for_a_baseline_it_cannot_use(tdc, target, ntsleuth, fake_baseline_dir):
+    (fake_baseline_dir / "ntsleuth-26220.5770-arm64.json").write_text("{not json")
+    result, notes = _run_stage(tdc)
+    assert result is None and "unusable" in notes[0]
+
+
+@pytest.mark.parametrize("view", [None, "x86"])
+def test_the_stage_skips_itself_for_a_process_it_has_no_baseline_for(tdc, target, ntsleuth, view):
+    target.view = view
+    result, notes = _run_stage(tdc)
+    assert result is None and notes and target.opened == []
+
+
+def test_the_stage_skips_itself_for_a_process_that_cannot_be_opened(tdc, target, ntsleuth):
+    target.reader = OSError("access is denied")
+    result, notes = _run_stage(tdc)
+    assert result is None and "access is denied" in notes[0]
+
+
+def test_the_stage_skips_itself_for_a_scan_that_runs_out_of_time(tdc, target, ntsleuth, monkeypatch):
+    release = threading.Event()
+    target.reader = _Blocked(target.reader, release)
+    monkeypatch.setattr(tdc, "SYSCALL_SCAN_TIMEOUT", 0.05)
+    monkeypatch.setattr(tdc, "SYSCALL_SCAN_GRACE", 0.05)
+    try:
+        result, notes = _run_stage(tdc)
+        assert result is None and "timed out" in notes[0]
+    finally:
+        release.set()
+    assert _until(lambda: not tdc._syscall_scan_running())
+
+
+def test_the_stage_skips_itself_for_a_scan_that_raises(tdc, target, ntsleuth, monkeypatch):
+    monkeypatch.setattr(syscall_scan, "measure", lambda *a, **kw: 1 / 0)
+    result, notes = _run_stage(tdc)
+    assert result is None and "division by zero" in notes[0]
+
+
+def test_the_stage_is_not_counted_once_it_is_done(tdc, target, ntsleuth):
+    _run_stage(tdc)
+    assert tdc._syscall_scan_running() is False
+
+
+# the stage inside a detonation
+
+@pytest.fixture
+def pipeline(tdc, target, monkeypatch):
+    """The memory scans of a detonation with every other tool stubbed out; `ran` lists them in order."""
+    ran = []
+    monkeypatch.setattr(tdc.time, "sleep", lambda s: None)
+    monkeypatch.setattr(tdc, "_run_hsb", lambda pid: ran.append("hsb") or ({"tool": "hsb"}, None))
+    monkeypatch.setattr(tdc, "_run_beaconeye", lambda pid: (None, "not installed"))
+    monkeypatch.setattr(tdc, "_image_name_for_pid", lambda pid: "sample.exe")
+    aether = pathlib.Path(tdc.NTSLEUTH_DIR).parent / "aether.exe"
+    aether.parent.mkdir(parents=True, exist_ok=True)
+    aether.write_bytes(b"MZ")
+    monkeypatch.setattr(tdc, "AETHER_EXE", str(aether))
+    monkeypatch.setattr(tdc, "_run_aether",
+                        lambda **kw: ran.append("aether") or ({"tool": "Aether", "evidence_findings": []}, None))
+    monkeypatch.setattr(tdc, "PROCESSDUMP_EXE", str(aether))
+    monkeypatch.setattr(tdc, "_run_process_dump", lambda **kw: ran.append("processdump") or ({"dump_count": 0}, None))
+    return ran
+
+
+def _detonate(tdc, path=None):
+    tdc._run_memory_scans_async(4812, SHA_SAMPLE, path)
+    assert _until(lambda: tdc._scans_running() == 0)
+
+
+def test_a_detonation_runs_the_stage_after_aether_and_before_process_dump(tdc, pipeline, ntsleuth, monkeypatch,
+                                                                         fake_baseline_dir, target):
+    target.reader = _patched_reader(tdc, fake_baseline_dir, "private")
+    real = tdc._run_syscall_stage
+    monkeypatch.setattr(tdc, "_run_syscall_stage",
+                        lambda pid, path, notes=None: pipeline.append("syscalls") or real(pid, path, notes))
+    _detonate(tdc)
+    assert pipeline == ["hsb", "aether", "syscalls", "processdump"]
+    stored = tdc._beacon_results_cache.lookup("syscalls", 4812, SHA_SAMPLE)
+    assert stored["tool"] == "Syscalls" and stored["evidence"]["score"] > 0
+    assert [t for t, *_ in target.history] == ["Aether", "Syscalls", "Process Dump"]
+    assert target.history[1][1] == "PID 4812"
+
+
+def test_the_stage_is_given_the_path_of_the_sample(tdc, pipeline, ntsleuth, monkeypatch):
+    seen = []
+    monkeypatch.setattr(tdc, "_run_syscall_stage", lambda pid, path, notes=None: seen.append((pid, path)))
+    _detonate(tdc, "C:\\Users\\Public\\Downloads\\a.exe")
+    assert seen == [(4812, "C:\\Users\\Public\\Downloads\\a.exe")]
+
+
+def test_a_detonation_without_ntsleuth_runs_every_other_tool_and_stores_no_stage(tdc, pipeline, monkeypatch):
+    monkeypatch.setattr(tdc, "NTSLEUTH_DIR", "/nonexistent")
+    monkeypatch.setattr(tdc, "_run_syscall_stage", lambda *a, **kw: pytest.fail("the stage ran without NTSleuth"))
+    _detonate(tdc)
+    assert pipeline == ["hsb", "aether", "processdump"]
+    assert tdc._beacon_results_cache.lookup("syscalls", 4812, SHA_SAMPLE) is None
+    assert tdc._beacon_results_cache.lookup("processdump", 4812, SHA_SAMPLE)
+
+
+def test_a_detonation_survives_a_stage_that_skips_itself_and_keeps_the_note(tdc, pipeline, ntsleuth, monkeypatch):
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")                # no baseline for it
+    _detonate(tdc)
+    assert pipeline == ["hsb", "aether", "processdump"]
+    stored = tdc._beacon_results_cache.lookup("syscalls", 4812, SHA_SAMPLE)
+    assert stored["tool"] == "Syscalls" and "no syscall baseline" in stored["skipped"]
+    assert tdc._beacon_results_cache.lookup("processdump", 4812, SHA_SAMPLE)
+
+
+def test_a_detonation_survives_a_stage_that_raises(tdc, pipeline, ntsleuth, monkeypatch):
+    def boom(pid, path, notes=None):
+        raise RuntimeError("the stage broke")
+
+    monkeypatch.setattr(tdc, "_run_syscall_stage", boom)
+    _detonate(tdc)
+    assert pipeline == ["hsb", "aether", "processdump"]
+    assert "the stage broke" in tdc._beacon_results_cache.lookup("syscalls", 4812, SHA_SAMPLE)["error"]
+    assert tdc._scans_running() == 0
+
+
+def test_a_detonation_survives_a_baseline_that_is_being_extracted(tdc, pipeline, ntsleuth, monkeypatch):
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")
+    tdc._syscall_extract_state["running"].add(("26300.1", "arm64"))
+    _detonate(tdc)
+    assert pipeline == ["hsb", "aether", "processdump"]
+    assert "being extracted" in tdc._beacon_results_cache.lookup("syscalls", 4812, SHA_SAMPLE)["skipped"]
+
+
+def test_a_sample_that_exited_before_the_scan_is_a_skip_not_a_failure(tdc, pipeline, ntsleuth, target):
+    target.view = None                                                # the process is gone: no image to read
+    _detonate(tdc)
+    assert pipeline == ["hsb", "aether", "processdump"]
+    assert "architecture" in tdc._beacon_results_cache.lookup("syscalls", 4812, SHA_SAMPLE)["skipped"]
+
+
+def _submit(client, tdc, monkeypatch, installed=(), pid=4812, agent_path="C:\\Users\\Public\\Downloads\\a.exe"):
+    """A submission to the agent, which answers with a PID. `installed` maps the tools that are there (the names of
+    the constants of the web UI) to a file."""
+    class Agent:
+        ok, status_code = True, 200
+        text = ""
+
+        def json(self):
+            return {"pid": pid, "file_path": agent_path}
+
+    monkeypatch.setattr(tdc.requests, "post", lambda *a, **kw: Agent())
+    monkeypatch.setattr(tdc, "_exit_capture_arm", lambda name: (False, "not armed in tests"))
+    monkeypatch.setattr(tdc, "_add_hash_to_ioc", lambda *a, **kw: {"status": "test"})
+    monkeypatch.setattr(tdc, "_record_submission", lambda *a, **kw: None)
+    for name in ("HUNT_SLEEPING_BEACONS_EXE", "BEACONEYE_EXE", "AETHER_EXE", "PROCESSDUMP_EXE"):
+        monkeypatch.setattr(tdc, name, dict(installed).get(name, "/nonexistent/" + name))
+    return client.post("/api/submit", data={"file": (io.BytesIO(b"MZ"), "a.exe"), "target": "agent"},
+                       content_type="multipart/form-data")
+
+
+def test_submit_starts_the_stage_with_the_sample_it_ran(client, tdc, ntsleuth, monkeypatch):
+    seen = []
+    monkeypatch.setattr(tdc, "_run_memory_scans_async", lambda *a: seen.append(a))
+    r = _submit(client, tdc, monkeypatch)
+    body = r.get_json()
+    assert r.status_code == 200 and body["beacon_scan"] == {"triggered": True, "tools": ["Syscalls"]}
+    assert seen == [(4812, hashlib.sha256(b"MZ").hexdigest(), "C:\\Users\\Public\\Downloads\\a.exe")]
+
+
+def test_submit_names_the_stage_after_the_tools_it_runs_with(client, tdc, ntsleuth, monkeypatch, tmp_path):
+    exe = tmp_path / "hsb.exe"
+    exe.write_bytes(b"MZ")
+    monkeypatch.setattr(tdc, "_run_memory_scans_async", lambda *a: None)
+    r = _submit(client, tdc, monkeypatch, {"HUNT_SLEEPING_BEACONS_EXE": str(exe)})
+    assert r.get_json()["beacon_scan"]["tools"] == ["Hunt-Sleeping-Beacons", "Syscalls"]
+
+
+def test_submit_survives_a_missing_ntsleuth(client, tdc, monkeypatch):
+    monkeypatch.setattr(tdc, "NTSLEUTH_DIR", "/nonexistent")
+    monkeypatch.setattr(tdc, "_run_memory_scans_async", lambda *a: pytest.fail("scans were started for no tool"))
+    r = _submit(client, tdc, monkeypatch)
+    assert r.status_code == 200 and r.get_json()["agent"]["status"] == 200
+    assert r.get_json()["beacon_scan"]["triggered"] is False
+
+
+def test_a_submission_without_ntsleuth_goes_all_the_way_through_the_other_tools(client, tdc, monkeypatch, tmp_path):
+    # through the Flask client and the real pipeline: only the tools themselves are stubbed
+    exe = tmp_path / "hsb.exe"
+    exe.write_bytes(b"MZ")
+    monkeypatch.setattr(tdc, "NTSLEUTH_DIR", "/nonexistent")
+    monkeypatch.setattr(tdc.time, "sleep", lambda s: None)
+    monkeypatch.setattr(tdc, "_run_hsb", lambda pid: ({"tool": "hsb", "pid": pid}, None))
+    monkeypatch.setattr(tdc, "_run_beaconeye", lambda pid: (None, "not installed"))
+    monkeypatch.setattr(tdc, "_image_name_for_pid", lambda pid: "a.exe")
+    r = _submit(client, tdc, monkeypatch, {"HUNT_SLEEPING_BEACONS_EXE": str(exe)})
+    assert r.status_code == 200 and r.get_json()["beacon_scan"] == {"triggered": True,
+                                                                     "tools": ["Hunt-Sleeping-Beacons"]}
+    assert _until(lambda: tdc._scans_running() == 0)
+    sha = hashlib.sha256(b"MZ").hexdigest()
+    assert tdc._beacon_results_cache.lookup("hsb", 4812, sha) == {"tool": "hsb", "pid": 4812}
+    assert tdc._beacon_results_cache.lookup("syscalls", 4812, sha) is None
+
+
+def test_a_submission_with_ntsleuth_but_no_baseline_goes_all_the_way_through_and_says_why(client, tdc, ntsleuth,
+                                                                                         monkeypatch, target):
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")
+    monkeypatch.setattr(tdc.time, "sleep", lambda s: None)
+    monkeypatch.setattr(tdc, "_image_name_for_pid", lambda pid: "a.exe")
+    r = _submit(client, tdc, monkeypatch)
+    assert r.status_code == 200 and r.get_json()["beacon_scan"]["tools"] == ["Syscalls"]
+    assert _until(lambda: tdc._scans_running() == 0)
+    stored = tdc._beacon_results_cache.lookup("syscalls", 4812, hashlib.sha256(b"MZ").hexdigest())
+    assert "no syscall baseline" in stored["skipped"]
+
+
+# the stage in the verdict, the evidence, the history, the sweep and the updates
+
+def _stage_entry(tdc, target, fake_baseline_dir, owner="private"):
+    target.reader = _patched_reader(tdc, fake_baseline_dir, owner)
+    return tdc._run_syscall_stage(4812, None)
+
+
+def _quiet_results(tdc, monkeypatch):
+    monkeypatch.setattr(tdc, "_fetch_many", lambda specs: {})
+    monkeypatch.setattr(tdc, "_litterbox_online", lambda: False)
+    monkeypatch.setattr(tdc, "_is_fibratus_running", lambda: False)
+    monkeypatch.setattr(tdc, "_is_rustinel_running", lambda: False)
+    monkeypatch.setattr(tdc, "_network_beaconing_for_pid", lambda pid: {"available": False})
+    monkeypatch.setattr(tdc, "_pipe_activity_for", lambda pid, sha256=None, at=None: {"available": False})
+
+
+def test_the_stage_finding_reaches_the_verdict_and_its_evidence(tdc, target, ntsleuth, fake_baseline_dir):
+    entry = _stage_entry(tdc, target, fake_baseline_dir)
+    verdict = tdc._compute_verdict({"syscalls": entry}, [])
+    assert verdict["label"] != "CLEAN"
+    # the same findings, scored once in the one model that weighs every memory scanner
+    results = {"syscalls": entry}
+    tdc._compute_verdict(results, [])
+    evidence = results["memory_evidence"]
+    assert evidence["sources_present"] == ["syscalls"]
+    assert [f["kind"] for f in evidence["findings"]] == ["syscall_stub_patched"]
+
+
+def test_a_stage_that_found_nothing_is_a_source_that_ran(tdc, target, ntsleuth):
+    entry = tdc._run_syscall_stage(4812, None)
+    assert entry["evidence"]["label"] == "CLEAN"
+    results = {"syscalls": entry}
+    verdict = tdc._compute_verdict(results, [])
+    assert verdict["label"] == "CLEAN" and results["memory_evidence"]["sources_present"] == ["syscalls"]
+
+
+def test_a_stage_that_skipped_is_no_evidence_and_no_verdict(tdc):
+    results = {"syscalls": {"tool": "Syscalls", "skipped": "no syscall baseline for build 1"}}
+    assert tdc._compute_verdict(results, [])["label"] == "CLEAN"
+    assert "memory_evidence" not in results
+    results = {"syscalls": {"tool": "Syscalls", "error": "broke"}}
+    tdc._compute_verdict(results, [])
+    assert "memory_evidence" not in results
+
+
+def test_the_stage_corroborates_and_is_corroborated_by_another_source(tdc, target, ntsleuth, fake_baseline_dir):
+    # a hint (a stub the sample carries) asks for a second source; a patched stub is a source it may agree with
+    entry = _stage_entry(tdc, target, fake_baseline_dir)
+    process = entry["process"]
+    aether = {"tool": "Aether", "evidence_findings": memory_evidence.from_aether(
+        {"findings": [{"rule": "x", "severity": "high"}]}, process=process)}
+    results = {"syscalls": entry, "aether": aether}
+    tdc._compute_verdict(results, [])
+    assert set(results["memory_evidence"]["sources_present"]) == {"aether", "syscalls"}
+
+
+def test_a_detonation_hands_its_stage_to_the_result_and_the_verdict(client, tdc, target, ntsleuth, fake_baseline_dir,
+                                                                     monkeypatch):
+    _quiet_results(tdc, monkeypatch)
+    tdc._beacon_results_cache.put("syscalls", _stage_entry(tdc, target, fake_baseline_dir), pid=4812,
+                                  sha256=SHA_SAMPLE)
+    body = client.get(f"/api/detonation/results?sha256={SHA_SAMPLE}&pid=4812").get_json()
+    assert body["syscalls"]["tool"] == "Syscalls"
+    assert body["verdict"]["label"] != "CLEAN" and body["memory_evidence"]["sources_present"] == ["syscalls"]
+    assert body["beacon_tools"]["ntsleuth_installed"] is True
+
+
+def test_a_detonation_whose_stage_skipped_still_answers(client, tdc, monkeypatch):
+    _quiet_results(tdc, monkeypatch)
+    tdc._beacon_results_cache.put("syscalls", {"tool": "Syscalls", "skipped": "no baseline"}, pid=4812,
+                                  sha256=SHA_SAMPLE)
+    r = client.get(f"/api/detonation/results?sha256={SHA_SAMPLE}&pid=4812")
+    body = r.get_json()
+    assert r.status_code == 200 and body["syscalls"]["skipped"] == "no baseline"
+    assert body["verdict"]["label"] == "CLEAN" and body["beacon_tools"]["ntsleuth_installed"] is False
+
+
+def test_the_cached_stage_is_rescored_with_the_other_memory_results(client, tdc, target, ntsleuth, fake_baseline_dir):
+    tdc._beacon_results_cache.put("syscalls", _stage_entry(tdc, target, fake_baseline_dir), pid=4812)
+    body = client.post("/api/memory/evidence", json={"pid": 4812}).get_json()
+    assert body["sources"] == ["syscalls"]
+    assert [f["kind"] for f in body["evidence"]["findings"]] == ["syscall_stub_patched"]
+
+
+def test_a_cached_stage_that_skipped_is_no_cached_memory_result(client, tdc):
+    tdc._beacon_results_cache.put("syscalls", {"tool": "Syscalls", "skipped": "no baseline"}, pid=4812)
+    r = client.post("/api/memory/evidence", json={"pid": 4812})
+    assert r.status_code == 404
+
+
+def test_a_syscall_scan_is_a_scan_of_a_process_and_no_sample_of_its_own(tdc, monkeypatch):
+    # "PID 4812" is not a file: the history row must not open a sample of that name on the Samples rail
+    history = [{"tool": "Syscalls", "filename": "PID 4812", "sha256": "", "verdict": "clean"}]
+    monkeypatch.setattr(tdc, "_load_scan_history", lambda: history)
+    assert tdc._build_samples({}, {}, {}) == []
+
+
+def test_a_running_syscall_scan_blocks_a_tool_update(tdc, monkeypatch):
+    monkeypatch.setattr(tdc, "_probe_http", lambda url, timeout=2: None)
+    assert tdc._update_preconditions() is None
+    monkeypatch.setattr(tdc, "_syscall_scan_running", lambda: True)
+    assert "syscall scan" in tdc._update_preconditions()
+
+
+def test_a_running_extraction_blocks_a_tool_update(tdc, monkeypatch):
+    # the update replaces the ntsleuth-*.exe the extraction is executing
+    monkeypatch.setattr(tdc, "_probe_http", lambda url, timeout=2: None)
+    tdc._syscall_extract_state["running"].add(("26300.1", "arm64"))
+    assert "extracted" in tdc._update_preconditions()
+    tdc._syscall_extract_state["running"].clear()
+    assert tdc._update_preconditions() is None
+
+
+def test_both_syscall_reasons_are_read_when_the_other_is_not_there(tdc, monkeypatch):
+    monkeypatch.setattr(tdc, "_probe_http", lambda url, timeout=2: None)
+    monkeypatch.setattr(tdc, "_syscall_scan_running", lambda: False)
+    monkeypatch.setattr(tdc, "_syscall_extracting", lambda: True)
+    assert tdc._update_preconditions() is not None
+    monkeypatch.setattr(tdc, "_syscall_scan_running", lambda: True)
+    monkeypatch.setattr(tdc, "_syscall_extracting", lambda: False)
+    assert tdc._update_preconditions() is not None
+
+
+# the system sweep
+
+@pytest.fixture
+def sweep(tdc, target, ntsleuth, monkeypatch, fake_baseline_dir):
+    monkeypatch.setattr(tdc, "_running_process_names", lambda: {4: "System", 4812: "sample.exe", 900: "svchost.exe"})
+    monkeypatch.setattr(tdc, "_image_path_for_pid", lambda pid: f"C:\\Procs\\{pid}.exe")
+    readers = {}
+
+    def opening(pid, view, build):
+        if pid == 4:
+            raise OSError("access is denied")
+        return contextlib.nullcontext(readers[pid])
+
+    monkeypatch.setattr(tdc, "_open_syscall_reader", opening)
+    monkeypatch.setattr(tdc, "_syscall_view_for_pid", lambda pid: None if pid == 4 else "arm64")
+    readers[4812] = _patched_reader(tdc, fake_baseline_dir, "private")
+    readers[900] = _reader_from(syscall_baseline.load_baseline(str(fake_baseline_dir / "ntsleuth-26220.5770-arm64.json")),
+                                patched={})
+    return readers
+
+
+def test_the_sweep_scans_every_process_it_can_and_counts_the_rest(tdc, sweep):
+    result = tdc._run_sweep(use_aether=False, use_processdump=False, capture_baseline=False, use_syscalls=True)
+    assert result["stats"]["syscall_processes"] == 2 and result["stats"]["syscall_skipped"] == 1
+    assert result["errors"] == []
+    [flagged] = result["processes"]
+    assert flagged["pid"] == 4812 and flagged["findings"][0]["kind"] == "syscall_stub_patched"
+    assert flagged["findings"][0]["source"] == "syscalls"
+
+
+def test_the_sweep_leaves_the_scan_out_unless_asked_and_without_ntsleuth(tdc, sweep, monkeypatch):
+    off = tdc._run_sweep(use_aether=False, use_processdump=False, capture_baseline=False)
+    assert off["processes"] == [] and "syscall_processes" not in off["stats"]
+    monkeypatch.setattr(tdc, "NTSLEUTH_DIR", "/nonexistent")
+    absent = tdc._run_sweep(use_aether=False, use_processdump=False, capture_baseline=False, use_syscalls=True)
+    assert absent["processes"] == [] and absent["errors"] == [] and "syscall_processes" not in absent["stats"]
+
+
+def test_the_sweep_says_once_that_there_is_no_baseline_and_extracts_none(tdc, sweep, monkeypatch):
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")
+    monkeypatch.setattr(tdc, "_extract_baseline", lambda *a: pytest.fail("a sweep started an extraction"))
+    result = tdc._run_sweep(use_aether=False, use_processdump=False, capture_baseline=False, use_syscalls=True)
+    assert len(result["errors"]) == 1 and "no syscall baseline" in result["errors"][0]
+    assert result["processes"] == []
+
+
+def test_the_sweep_takes_a_hook_it_knows_as_nothing(client, tdc, sweep, fake_baseline_dir):
+    sweep[4812] = _patched_reader(tdc, fake_baseline_dir, "edr.dll")
+    client.post("/api/syscalls/hook-baseline", json={"pid": 4812})
+    result = tdc._run_sweep(use_aether=False, use_processdump=False, capture_baseline=False, use_syscalls=True)
+    assert result["processes"] == []
+
+
+def test_the_sweep_route_takes_the_scan_as_a_tool_of_its_own(client, tdc, ntsleuth, monkeypatch):
+    seen = []
+    monkeypatch.setattr(tdc, "AETHER_EXE", "/nonexistent/aether")
+    monkeypatch.setattr(tdc, "PROCESSDUMP_EXE", "/nonexistent/pd")
+    monkeypatch.setattr(tdc, "_run_sweep", lambda *a: seen.append(a) or {"processes": []})
+    monkeypatch.setattr(tdc, "_sweep_state", {})
+    r = client.post("/api/memory/sweep", json={"aether": False, "syscalls": True})
+    assert r.status_code == 200 and r.get_json()["options"]["syscalls"] is True
+    assert _until(lambda: seen == [(False, False, False, True)])
+
+
+def test_the_sweep_route_still_wants_one_tool_that_is_there(client, tdc, monkeypatch):
+    monkeypatch.setattr(tdc, "AETHER_EXE", "/nonexistent/aether")
+    monkeypatch.setattr(tdc, "PROCESSDUMP_EXE", "/nonexistent/pd")
+    monkeypatch.setattr(tdc, "NTSLEUTH_DIR", "/nonexistent")
+    monkeypatch.setattr(tdc, "_sweep_state", {})
+    r = client.post("/api/memory/sweep", json={"syscalls": True})
+    assert r.status_code == 400 and "No selected sweep tool" in r.get_json()["error"]
