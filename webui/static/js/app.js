@@ -24859,7 +24859,8 @@ function syscallCellAt(layout, x, y) {
 
 // How a cell is drawn. Without a measurement (state null or undefined) it is the baseline tone: the colour of an
 // intact stub, held back, so a map that was never scanned draws no eye. A measured intact stub is that colour in
-// full; every deviation is a colour of its own, and patched and diverged get a ring in the gap around the cell.
+// full; every deviation is a colour of its own, and patched, diverged and unreadable get a ring in the gap around
+// the cell (a stub that reads as zeros is tampering, not absence).
 // A state the server does not send counts as diverged, never as quiet. `dimmed`: the filter does not match.
 function syscallCellLook(state, dimmed) {
     let look;
@@ -24869,7 +24870,7 @@ function syscallCellLook(state, dimmed) {
         const known = Object.prototype.hasOwnProperty.call(SYSCALL_STATE_COLORS, state) ? state : 'diverged';
         look = {
             state: known, alpha: 1, loud: known !== 'intact',
-            halo: known === 'patched' || known === 'diverged' ? SYSCALL_MAP.halo : 0,
+            halo: known === 'patched' || known === 'diverged' || known === 'unreadable' ? SYSCALL_MAP.halo : 0,
             hollow: known === 'unreadable',
         };
     }
@@ -25109,7 +25110,8 @@ const syscallState = {
     ready: false,
     status: null, statusError: '',
     // The baseline of one view: { view, build, symbols, items: [{ name, module, number }] }
-    baseline: null, baselineError: '', loading: false, loadSeq: 0,
+    // loading counts the refreshes under way; loadSeq numbers the reads of the baseline, of which only the last counts
+    baseline: null, baselineError: '', loading: 0, loadSeq: 0,
     bands: [], bandsKey: 0, layouts: new Map(),
     // The last scan: its answer, the state of each measured syscall (name → state) and the line under the toolbar
     scan: null, states: null, scanning: false, note: null,
@@ -25169,25 +25171,46 @@ async function syscallLoadBaseline(view) {
     syscallState.bands = syscallBands(items);
     syscallState.bandsKey++;
     if (syscallState.selected && !items.some(item => item.name === syscallState.selected)) syscallState.selected = '';
+    syscallDropForeignScan();
     return { ok: true };
+}
+
+// The states of a scan belong to the view it measured. When the baseline on the map is another one (or none), the
+// measurement is cleared: a cell never shows what was measured against another reference.
+function syscallDropForeignScan() {
+    const scan = syscallState.scan, baseline = syscallState.baseline;
+    if (!scan || (baseline && baseline.view === scan.view)) return;
+    syscallState.scan = null;
+    syscallState.states = null;
+    syscallState.note = {
+        tone: 'warn',
+        text: `The scan of PID ${scan.pid} measured the ${scan.view} view, but the map shows ` +
+              `${baseline ? `the ${baseline.view} baseline` : 'no baseline'}: its measurement is cleared.`,
+    };
 }
 
 // The status always, the baseline when there is none yet or when `force`. While an extraction runs it looks again
 // every few seconds (not with force: the baseline is read again only when it is missing).
 async function syscallRefresh(force) {
-    syscallState.loading = true;
+    syscallState.loading++;
     syscallRenderAll();
-    const wanted = force === true || !syscallState.baseline;
-    const [, loaded] = await Promise.all([syscallLoadStatus(), wanted ? syscallLoadBaseline('') : { ok: true }]);
-    if (loaded.superseded) return;
-    syscallState.loading = false;
-    if (!loaded.ok) {
-        syscallState.baseline = null;
-        syscallState.bands = [];
-        syscallState.bandsKey++;
-        syscallState.baselineError = loaded.error;
-    } else {
-        syscallState.baselineError = '';
+    try {
+        const wanted = force === true || !syscallState.baseline;
+        const [, loaded] = await Promise.all([syscallLoadStatus(), wanted ? syscallLoadBaseline('') : { ok: true }]);
+        // a read that another one overtook says nothing about the baseline: the newer read decides
+        if (!loaded.superseded) {
+            if (loaded.ok) {
+                syscallState.baselineError = '';
+            } else {
+                syscallState.baseline = null;
+                syscallState.bands = [];
+                syscallState.bandsKey++;
+                syscallState.baselineError = loaded.error;
+                syscallDropForeignScan();
+            }
+        }
+    } finally {
+        syscallState.loading--;
     }
     syscallApplyFilter();
     syscallRenderAll();
@@ -25481,15 +25504,20 @@ async function runSyscallScan() {
     const r = await syscallApi('/api/syscalls/scan', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pid, modules }),
     });
-    if (r.ok && r.data.view && syscallState.baseline && r.data.view !== syscallState.baseline.view) {
-        // measured in another view: the cells are that view's, so is the catalog
-        await syscallLoadBaseline(r.data.view);
+    // measured in another view: the cells are that view's, so is the catalog; without its baseline the states are not drawn
+    let problem = '';
+    if (r.ok && syscallState.baseline && r.data.view !== syscallState.baseline.view) {
+        const loaded = await syscallLoadBaseline(r.data.view);
+        if (loaded.superseded) problem = 'reading its baseline was overtaken by another read; scan again.';
+        else if (!loaded.ok) problem = `its baseline could not be loaded: ${loaded.error}`;
     }
+    const fits = r.ok && syscallState.baseline && syscallState.baseline.view === r.data.view;
+    if (r.ok && !fits && !problem) problem = 'the baseline of that view is not loaded.';
     syscallState.scanning = false;
-    if (!r.ok) {
+    if (!fits) {
         syscallState.scan = null;
         syscallState.states = null;
-        syscallSetScanNote('error', syscallErrorText(r));
+        syscallSetScanNote('error', r.ok ? `The scan measured the ${r.data.view} view, but ${problem}` : syscallErrorText(r));
     } else {
         syscallState.scan = r.data;
         syscallState.states = new Map(Object.entries(r.data.states || {}).map(([name, s]) => [name, s && s.state]));

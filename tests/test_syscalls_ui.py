@@ -198,7 +198,8 @@ def test_one_patched_stub_among_2461_cells_is_the_only_loud_one_and_is_painted_l
     assert (core["x"], core["y"], core["w"], core["h"]) == (at["x"], at["y"], 10, 10) and core["alpha"] == 1
     assert ring["x"] < core["x"] and ring["y"] < core["y"]
     assert ring["x"] + ring["w"] > core["x"] + core["w"] and ring["y"] + ring["h"] > core["y"] + core["h"]
-    # and what is intact is held back: a measured stub is no louder than the baseline tone it replaces
+    # a measured intact stub is the baseline colour in full: a little more opaque than the baseline tone (0.75), and
+    # still the quietest colour on the map
     assert r["quietAlphas"] == [1]
 
 
@@ -213,7 +214,7 @@ def test_each_state_has_a_look_of_its_own_and_only_the_deviations_are_loud():
     looks = r["looks"]
     assert len({v["color"] for v in looks.values()}) == 5, "five states, five colours"
     assert [s for s, v in looks.items() if v["loud"]] == ["hooked", "patched", "diverged", "unreadable"]
-    assert looks["patched"]["halo"] > 0 and looks["diverged"]["halo"] > 0, "what must be looked at has a ring"
+    assert all(looks[s]["halo"] > 0 for s in ("patched", "diverged", "unreadable")), "what must be looked at has a ring"
     assert looks["intact"]["halo"] == 0 and looks["hooked"]["halo"] == 0
     assert looks["unreadable"]["hollow"] and not looks["patched"]["hollow"]
     assert r["baseline"] == r["unscanned"] and not r["baseline"]["loud"]
@@ -247,11 +248,16 @@ def test_a_hollow_cell_is_an_outline_and_the_selected_and_hovered_cells_are_ring
       const states = new Map([['Nt3', 'unreadable']]);
       const { ctx, calls } = record();
       syscallDrawBand(ctx, layout, cells, { ...quietModel, states, selected: 'Nt10', hover: 'Nt20' });
+      const ring = calls.find(c => c.op === 'fill' && c.w > 10), outline = calls.find(c => c.op === 'stroke');
       out({ strokes: calls.filter(c => c.op === 'stroke'), fills: calls.filter(c => c.op === 'fill').length,
+            ring: { color: ring.color, wider: ring.w > 10 && ring.x < syscallCellOrigin(layout, 3).x }, ringBeforeOutline: calls.indexOf(ring) < calls.indexOf(outline),
             a: syscallCellOrigin(layout, 10), b: syscallCellOrigin(layout, 20), c: syscallCellOrigin(layout, 3) });""")
     hollow, selected, hovered = r["strokes"]
-    assert hollow["color"] == "--syscall-unreadable" and r["fills"] == 2460, "unreadable is outlined, not filled"
-    assert (selected["color"], hovered["color"]) == ("--text-primary", "--text-secondary")
+    # unreadable is an outline, not a fill, and has the ring of the other deviations around it (a zeroed stub is
+    # tampering, not absence): 2,460 cells filled, one ring filled, the outline stroked on top of it
+    assert hollow["color"] == "--syscall-unreadable" and r["fills"] == 2461
+    assert r["ring"] == {"color": "--syscall-unreadable/0.35", "wider": True}
+    assert r["ringBeforeOutline"], "the outline is drawn over its ring"
     assert selected["x"] < r["a"]["x"] and hovered["x"] < r["b"]["x"], "a ring around the cell, not on it"
 
 
@@ -415,7 +421,7 @@ FLOW_FUNCTIONS = [
     "syscallDrawBand", "syscallHex", "syscallMapLegendHtml", "syscallRowHtml", "syscallNumberOf", "syscallMatches",
     "syscallMatchSet", "syscallViewStates", "syscallNotices", "syscallNoticesHtml", "syscallSubtitle",
     "syscallTargetsHtml", "syscallScanSummary", "syscallApi", "syscallErrorText", "syscallLoadStatus",
-    "syscallLoadBaseline", "syscallRefresh", "syscallSchedulePoll", "syscallLoadTargets", "syscallOnTarget",
+    "syscallLoadBaseline", "syscallDropForeignScan", "syscallRefresh", "syscallSchedulePoll", "syscallLoadTargets", "syscallOnTarget",
     "syscallEmptyText", "syscallEnsureBands", "syscallPaintCanvas", "renderSyscallMap", "renderSyscallLegend",
     "renderSyscallRows", "renderSyscallNotices", "renderSyscallToolbar", "renderSyscallTargets", "renderSyscallScan",
     "syscallRenderAll", "syscallApplyFilter", "syscallOnFilter", "syscallSelect", "syscallCellFromEvent",
@@ -672,6 +678,84 @@ def test_win32u_is_scanned_only_when_asked_for():
 
 
 @needs_node
+def test_a_refresh_after_a_scan_of_another_view_does_not_draw_its_states_on_this_views_baseline():
+    r = _flow(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        routes['/api/syscalls/scan'] = { body: { ...scanBody({ Nt7: 'patched' }), view: 'x64' } };
+        chooseTarget(4242);
+        await runSyscallScan();
+        const ntdll = () => canvases().find(c => c.dataset.module === 'ntdll.dll');
+        const shown = { subtitle: els['syscalls-subtitle'].textContent, loud: ntdll().calls.filter(c => c.color.includes('patched')).length };
+        await syscallRefresh(true); await settle();
+        out({ shown, subtitle: els['syscalls-subtitle'].textContent, colours: [...new Set(ntdll().calls.map(c => c.color))],
+              alphas: [...new Set(ntdll().calls.map(c => c.alpha))], legend: els['syscall-legend'].innerHTML,
+              note: els['syscall-scan-result'].textContent, tone: els['syscall-scan-result'].className, states: syscallState.states === null });
+      })();""")
+    assert r["shown"]["subtitle"].endswith("· x64") and r["shown"]["loud"] == 2, "the x64 scan is drawn on the x64 baseline"
+    assert r["subtitle"].endswith("· arm64")
+    assert r["colours"] == ["--syscall-intact"] and r["alphas"] == [0.75], "the map is the baseline again, in its quiet tone"
+    assert r["states"] and "–" in r["legend"] and "patched" not in r["legend"].split("syscall-legend-count")[3]
+    assert "x64" in r["note"] and "arm64" in r["note"] and "cleared" in r["note"] and "warn" in r["tone"]
+
+
+@needs_node
+def test_a_scan_whose_views_baseline_cannot_be_loaded_is_not_drawn_on_the_other_view():
+    r = _flow(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        const asked = baselineRoute;
+        routes['/api/syscalls/baseline'] = url => url.includes('view=x64') ? { status: 503, body: { error: 'no syscall baseline for build 26220.5770, view x64.' } } : asked(url);
+        routes['/api/syscalls/scan'] = { body: { ...scanBody({ Nt7: 'patched' }), view: 'x64' } };
+        chooseTarget(4242);
+        await runSyscallScan();
+        const ntdll = canvases().find(c => c.dataset.module === 'ntdll.dll');
+        out({ colours: [...new Set(ntdll.calls.map(c => c.color))], note: els['syscall-scan-result'].textContent,
+              tone: els['syscall-scan-result'].className, scan: syscallState.scan, subtitle: els['syscalls-subtitle'].textContent,
+              legend: els['syscall-legend'].innerHTML, button: els['syscall-scan'].disabled });
+      })();""")
+    assert r["colours"] == ["--syscall-intact"] and r["scan"] is None and r["subtitle"].endswith("· arm64")
+    assert "x64" in r["note"] and "no syscall baseline for build 26220.5770, view x64" in r["note"] and "error" in r["tone"]
+    assert "–" in r["legend"] and r["button"] is False
+
+
+@needs_node
+def test_a_scan_whose_views_baseline_load_is_overtaken_is_not_drawn_either():
+    r = _flow(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        const asked = baselineRoute;
+        let overtaken = false;
+        // while the x64 baseline is read, a refresh starts its own read of the baseline: the x64 read is superseded
+        routes['/api/syscalls/baseline'] = url => { if (url.includes('view=x64') && !overtaken) { overtaken = true; syscallLoadBaseline(''); } return asked(url); };
+        routes['/api/syscalls/scan'] = { body: { ...scanBody({ Nt7: 'patched' }), view: 'x64' } };
+        chooseTarget(4242);
+        await runSyscallScan(); await settle();
+        const ntdll = canvases().find(c => c.dataset.module === 'ntdll.dll');
+        out({ colours: [...new Set(ntdll.calls.map(c => c.color))], note: els['syscall-scan-result'].textContent,
+              scan: syscallState.scan, subtitle: els['syscalls-subtitle'].textContent });
+      })();""")
+    assert r["colours"] == ["--syscall-intact"] and r["scan"] is None and r["subtitle"].endswith("· arm64")
+    assert "scan again" in r["note"].lower()
+
+
+@needs_node
+def test_a_refresh_overtaken_by_another_read_of_the_baseline_still_ends_its_loading_and_its_polling():
+    r = _flow(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        routes['/api/syscalls/status'] = { body: { ...STATUS, extraction: { running: [{ build: '26220.5770', view: 'x64' }], failed: [] } } };
+        timers.length = 0;
+        const refreshing = syscallRefresh(true);
+        syscallLoadBaseline('x64');               // overtakes the refresh's read, as a scan's reload does
+        await refreshing; await settle();
+        out({ loading: syscallState.loading, timers: timers.map(t => t.ms), empty: els['syscall-map'].textContent.includes('Loading') });
+      })();""")
+    assert not r["loading"] and not r["empty"]
+    assert r["timers"] == [4000], "the extraction is still asked about"
+
+
+@needs_node
 def test_a_scan_that_is_refused_or_times_out_says_so_and_the_map_goes_back_to_the_baseline():
     r = _flow(r"""
       (async () => {
@@ -874,7 +958,7 @@ def test_every_element_the_block_reads_is_in_the_page():
 
 def test_the_assets_moved_on_and_the_switch_in_the_tab_bar_is_wired():
     html = _read(INDEX_HTML)
-    for asset, minimum in (("style.css", 82), ("theme-cyberpunk.css", 37), ("app.js", 120)):
+    for asset, minimum in (("style.css", 83), ("theme-cyberpunk.css", 37), ("app.js", 122)):
         version = int(re.search(rf"{re.escape(asset)}\?v=(\d+)", html).group(1))
         assert version >= minimum, f"{asset} was changed and kept its ?v="
     assert re.search(r"if \(tabName === 'syscalls'\)[^\n]*syscallsTabShown\(\)", SOURCE)
@@ -895,18 +979,30 @@ def test_five_state_colours_exist_in_both_themes_with_their_rgb_triplets():
     assert not [s for s in STATES if _same_value(classic[f"--syscall-{s}"], cyberpunk[f"--syscall-{s}"])]
 
 
+def _over(colour, surface, alpha):
+    """The colour a translucent `colour` gives over `surface`, as hex."""
+    from test_theme import _hex_rgb
+    mixed = [round(alpha * c + (1 - alpha) * s) for c, s in zip(_hex_rgb(colour), _hex_rgb(surface))]
+    return "#%02x%02x%02x" % tuple(mixed)
+
+
 def test_an_intact_stub_is_the_quietest_colour_and_every_deviation_is_louder_in_both_themes():
     """The map is quiet until something deviates: against the surface the map sits on, the intact colour has the
-    lowest contrast and each deviation has clearly more."""
+    lowest contrast and each deviation has clearly more. What is painted for a state is its colour (for unreadable
+    an outline of that colour, for patched, diverged and unreadable also a ring of it at the alpha of the ring)."""
     for name, values in (("Classic", _root_values()), ("Cyberpunk", _cyberpunk_palette())):
         surface = values["--bg-card"]
         contrast = {s: _contrast(values[f"--syscall-{s}"], surface) for s in STATES}
         for state in ("hooked", "patched", "diverged", "unreadable"):
             assert contrast[state] > contrast["intact"] * 1.5, (name, state, contrast)
         assert contrast["intact"] >= 1.3, f"{name}: the baseline tone is too dim to see the grid: {contrast['intact']}"
-        # and the deviations that must be looked at beat the surface by a wide margin
-        for state in ("hooked", "patched", "diverged"):
+        # every deviation, unreadable too, beats the surface by a wide margin
+        for state in ("hooked", "patched", "diverged", "unreadable"):
             assert contrast[state] >= 4.5, (name, state, contrast[state])
+        # and the ring of a state that has one is a visible mark of its own on the surface
+        for state in ("patched", "diverged", "unreadable"):
+            ring = _contrast(_over(values[f"--syscall-{state}"], surface, 0.35), surface)
+            assert ring >= 1.3 and ring > contrast["intact"] * 0.7, (name, state, ring)
 
 
 def test_each_state_has_its_class_for_the_dots_of_the_legend_and_the_rows():
@@ -915,6 +1011,8 @@ def test_each_state_has_its_class_for_the_dots_of_the_legend_and_the_rows():
         body = classic.get(f".syscall-state-{state}", "")
         assert f"--syscall-{'intact' if state == 'baseline' else state}" in body, state
     assert "transparent" in classic[".syscall-state-unreadable"], "unreadable is hollow, as on the map"
+    for state in ("patched", "diverged", "unreadable"):
+        assert f"--syscall-{state}-rgb" in classic[f".syscall-state-{state}"], f"{state} has its ring in the dots too"
     assert classic[".syscall-state-baseline"] != classic[".syscall-state-intact"], "the baseline tone is held back"
 
 

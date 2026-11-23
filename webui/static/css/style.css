@@ -12502,6 +12502,7 @@ button.logs-trunc:hover { color: var(--accent-orange); text-decoration: underlin
 .syscall-state-unreadable {
     background: transparent;
     border-color: var(--syscall-unreadable);
+    box-shadow: 0 0 0 2px rgba(var(--syscall-unreadable-rgb), 0.35);
 }
 .syscall-map {
     flex: 1 1 0;
