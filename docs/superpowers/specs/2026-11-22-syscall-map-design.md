@@ -233,7 +233,13 @@ nicht:** Module Stomping behält `MEM_IMAGE` und den Pfad, und
 `GetMappedFileNameW` nennt die Datei, nicht ihren Inhalt. `hooked` heißt darum
 nur „ein dateigedecktes Modul hält das Ziel" — ein EDR, aber ebenso eine vom
 Sample geladene oder eine überschriebene DLL — und wird so beschriftet, nicht
-als EDR-Hook. Ein Ziel in einem Windows-Kernmodul (`kernelbase.dll`,
+als EDR-Hook. **Ebenso wenig sieht sie ein Gadget:** Das Verfolgen der Relays
+endet am ersten dateigedeckten Modul. Springt ein privates Relay auf ein
+`BR Xn`- oder `JMP`-Gadget in irgendeiner geladenen, nicht zum Kern gehörenden
+DLL, heißt der Stub `hooked` mit dem Namen dieser DLL, während die Kontrolle in
+privaten Code zurückkehrt. Das galt schon für `B` und `FF 25` und gilt für jede
+Sprungform; der Code eines Moduls wird nicht weiter verfolgt, weil jeder Sprung
+eines legitimen Handlers sonst dieselbe Frage stellte. Ein Ziel in einem Windows-Kernmodul (`kernelbase.dll`,
 `kernel32.dll`, `win32u.dll` und wenige andere, in denen kein Hook-Produkt seinen
 Handler ablegt) ist eine Code-Cave und gilt als `patched`. Der für die Tests
 injizierte Leser muss diese Schicht mit abbilden.

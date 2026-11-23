@@ -160,6 +160,10 @@ name query fails easily under the limited access right.
 DLL in place and keeps its image type and path, so a hook into a stomped DLL
 reads as `hooked` with that DLL's name. The scan cannot tell that from an EDR,
 which is why the state is called hooked (file-backed module) and weighs little.
+Nor can it see a gadget: relays are followed only until the first file-backed
+module, so a private relay that jumps to a `BR Xn` or `JMP` gadget in any loaded
+non-core DLL reads as `hooked` with that DLL's name while control returns to
+private code. That holds for every jump form, `B` and `FF 25` included.
 
 Hooks the EDR installs everywhere are recorded once, on a host you believe is
 clean (RECORD THE HOOKS OF THIS RUN AS KNOWN, or `POST /api/syscalls/hook-baseline`): pairs of a
