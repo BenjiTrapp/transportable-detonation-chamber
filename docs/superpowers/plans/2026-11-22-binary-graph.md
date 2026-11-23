@@ -612,8 +612,9 @@ git commit -m "feat(binary-graph): build, stamp and load the import graph cache,
 - Produces:
   - `MAX_NODES = 400`
   - `@dataclass(frozen=True) class Node`: `id: str`, `label: str`, `kind: str` (`"dll"` | `"exe"` | `"function"` | `"syscall"` | `"api-set"`), `in_degree: int`, `category: str` (die `SUSPICIOUS_IMPORTS`-Kategorie oder `""`).
+  - **Ein Funktionsknoten trägt sein Modul in der `id`** (`kernel32.dll!WriteProcessMemory`), und es gibt **keine** Kante vom Modul zu seiner Funktion. Die Spec nennt vier Kantenarten — `imports`, `forwards_to`, `resolves_to`, `reaches_syscall` — und das ist Absicht: eine `defines`-Kante wäre erfundene Struktur. Eine `imports`-Kante geht vom importierenden Binary **zum Funktionsknoten**; wer von dort zum Modul will, klappt den Knoten über `node_detail` auf. `in_degree` eines Funktionsknotens ist 0, weil „wie viele Binaries importieren mich" eine Eigenschaft des Moduls ist. Tasks 8, 9 und 10 teilen diese Festlegung, statt sie je neu zu erfinden.
   - `@dataclass(frozen=True) class Edge`: `source: str`, `target: str`, `kind: str` (`"imports"` | `"forwards_to"` | `"resolves_to"` | `"reaches_syscall"`), `origin: str` (`"derived"` | `"curated"`), `label: str`.
-  - `@dataclass(frozen=True) class Answer`: `nodes: tuple[Node, ...]`, `edges: tuple[Edge, ...]`, `truncated: bool`, `note: str`, `roots: tuple[str, ...]`.
+  - `@dataclass(frozen=True) class Answer`: `nodes: tuple[Node, ...]`, `edges: tuple[Edge, ...]`, `truncated: bool`, `total: int` (wie viele Teile die Antwort ohne die Obergrenze hätte — strukturiert, nicht nur als Satz in `note`, sonst müssten Tasks 8 und 10 Prosa parsen, um „400 von 4.000" zu zeigen), `note: str`, `roots: tuple[str, ...]`.
   - `importers_of(graph, module, function=None) -> Answer`
   - `imports_of(graph, module) -> Answer`
   - `callers_of_syscall(graph, nt_name) -> Answer`
@@ -839,6 +840,9 @@ def test_a_path_answer_draws_one_layer_per_hop_in_the_order_the_answer_gives():
 def test_the_curated_edge_is_drawn_with_its_own_stroke_and_named_in_the_legend():
 def test_the_detail_of_a_curated_edge_says_the_mapping_comes_from_a_table():
 def test_a_note_from_the_answer_is_shown_instead_of_an_empty_canvas():
+def test_a_truncated_answer_says_so_in_the_view():
+    # the cap keeps the first parts in name order and never draws half a path, so a
+    # missing node means "not shown", never "does not import" — the view must say which
 ```
 
 Der dritte und vierte Test sind das Anti-Ziel: eine kuratierte Kante sieht anders aus, hat ihre eigene Legendenzeile, und das Detailpanel nennt sie als kuratiert.
@@ -877,9 +881,11 @@ def test_selecting_a_cell_in_the_map_marks_the_same_node_in_the_graph():
 
 ```python
 def test_a_module_name_from_an_import_table_reaches_the_graph_as_text_and_not_as_markup():
+def test_the_note_and_the_error_of_an_answer_are_escaped_like_any_node_label():
+    # both echo what the user typed for `module` or `name`: safe as JSON, not as HTML
 ```
 
-Ein Modulname aus einer Import-Tabelle ist von Malware bestimmt — das Anti-Ziel der Spec.
+Ein Modulname aus einer Import-Tabelle ist von Malware bestimmt — das Anti-Ziel der Spec. `note` und `error` tragen zusätzlich die Eingabe des Nutzers.
 
 - [ ] **Step 11: Farben in `style.css` und `theme-cyberpunk.css`, `tests/test_theme.py` erweitern**
 
