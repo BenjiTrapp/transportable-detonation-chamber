@@ -172,6 +172,11 @@ _PATCHES_LOST = "{count} saved {patch} could not be applied to this file{where}.
 # run's again, because a patch in the file's own (still encrypted) bytes is decrypted over by the next run.
 _PATCH_WAITING_REASON = ("set over bytes an emulation run wrote; held back, because written into the file's own "
                          "bytes it would be decrypted over by the next run")
+# Said as well where no map holds the address **now**. It is not "never": omlj at the open lists the file's
+# maps only, and the ESIL stack's mem.* map arrives when the emulation starts (measured, rizin 0.9.1), so
+# a patch in the stack's bytes can be held by a map later.
+_PATCH_UNMAPPED_REASON = (" No map holds this address now: the file's maps do not cover it, but an emulation "
+                          "maps memory of its own (its stack) when it starts, and the address may be in it then.")
 _PATCHES_HELD = ("Held back, not applied: {count} saved {patch} over bytes an emulation run wrote ({where}). "
                  "The file's own bytes there are still encrypted, and a patch written into them would be "
                  "decrypted over by the next run.")
@@ -1870,13 +1875,25 @@ class RizinSession:
 
         ``waiting`` is [{"addr", "after", "reason"}], lowest address first: the patches the project holds
         that were set over bytes a run had written and were **not** written into the cache when the
-        file was opened (_replay_patches). They are not in ``patches`` and so not in an export.
+        file was opened (_replay_patches). They are not in ``patches`` and so not in an export, and a
+        patch the cache holds since (the same address and bytes made again) is not waiting any more
+        (_waiting_left). The reason says in addition where no map holds the address at the moment.
         """
         def run(pipe):
             rows = self._patch_list(pipe)
-            waiting = [{"addr": addr, "after": after, "reason": _PATCH_WAITING_REASON}
-                       for addr, after, _ in sorted(self._waiting, key=lambda patch: patch[0])]
-            return {"patches": rows, "waiting": waiting}
+            waiting = sorted(self._waiting_left(self._own_patches()), key=lambda patch: patch[0])
+            maps = None
+            if waiting:
+                try:
+                    maps = pipe.cmdj("omlj")
+                except ValueError:
+                    pass  # what is mapped is not known, so the reason does not say
+            return {"patches": rows,
+                    "waiting": [{"addr": addr, "after": after,
+                                 "reason": _PATCH_WAITING_REASON + (
+                                     _PATCH_UNMAPPED_REASON if isinstance(maps, list)
+                                     and not rizin_emulation.maps_hold(addr, len(after) // 2, maps) else "")}
+                                for addr, after, _ in waiting]}
 
         return self._call("emulation", wait, run)
 
@@ -1953,6 +1970,15 @@ class RizinSession:
                                                       self._mine, True)
         self._mine_over = [row["over_run"] for row in rows if row["mine"]]
         return rows if ordered else sorted(rows, key=lambda row: row["addr"])
+
+    def _waiting_left(self, kept):
+        """The patches still waiting, given ``kept`` (this session's own writes, _own_patches): not those
+        whose address and bytes a write of the cache holds -- that one is applied, and a waiting entry
+        beside it would be one patch in two places. The same address with **other** bytes leaves it
+        waiting: its own bytes are still not applied. The answer of patches() and the project's patches
+        line (_saved_cache) both ask this, so what they say cannot differ."""
+        live = {(addr, after) for addr, after, _ in kept}
+        return [patch for patch in self._waiting if (patch[0], patch[1]) not in live]
 
     def _own_patches(self):
         """This session's own writes as [(addr, after_hex, over_run)], in the order it made them.
@@ -2847,6 +2873,9 @@ class RizinSession:
             if patch not in known:
                 known.add(patch)
                 self._waiting.append(patch)
+        # The note counts and names what **this** replay held back (the addresses it lists are that many),
+        # not how much the waiting list grew by: a patch that waited already is held back once more by a
+        # restart's replay of the mirror, and the user is told so.
         held_note = None
         if held:
             held_note = _PATCHES_HELD.format(where=_named_addresses(addr for addr, _, _ in held),
@@ -3114,8 +3143,9 @@ class RizinSession:
         The patches are this session's own writes as (addr, after_hex, over_run), in the order rizin's cache
         holds them; ``over_run`` is the mark the project keeps (see _read_patches). The cache is read back
         first, so the list is what rizin really holds *and* what this session wrote: a patch the console
-        took back with ``wc-`` has left the mirror by then, and what an emulation run wrote was never in it. That is the whole point -- a run's bytes never stood in
-        the file, and a project that baked them in would lose track of where bytes come from.
+        took back with ``wc-`` has left the mirror by then, and what an emulation run wrote was never in
+        it. That is the whole point -- a run's bytes never stood in the file, and a project that baked
+        them in would lose track of where bytes come from.
 
         ``self._lost`` are patches a restarted rizin could not take back (_recover): they are kept in
         the project, because a cache that died must not erase what the project already held. The next
@@ -3131,9 +3161,10 @@ class RizinSession:
         """
         rows = self._patch_list(pipe)
         kept = self._own_patches()
+        waiting = self._waiting_left(kept)
         known = set(kept)
         more = []
-        for patch in self._waiting + self._lost:
+        for patch in waiting + self._lost:
             if patch not in known:
                 known.add(patch)
                 more.append(patch)

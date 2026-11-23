@@ -283,6 +283,17 @@ def _plain(text):
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text))
 
 
+def test_the_patch_rows_say_what_a_waiting_patch_does_through_a_take_back():
+    """A patch that waits is no write of rizin's cache, so DELETE /patch (`wc-*` or an address) cannot take it;
+    the row that promises a taken-back patch does not come back must not leave out the one that stays."""
+    rows = {path: line for line in _doc("api.md").splitlines() if line.startswith("|")
+            for path in re.findall(r"`(/api/rizin/[^`]+)`", line)}
+    delete = _plain([line for line in _doc("api.md").splitlines()
+                     if line.startswith("| DELETE | `/api/rizin/<sid>/patch`")][0])
+    assert "waiting" in delete and "is not taken back" in delete and "stays in the project" in delete, delete
+    assert "waiting" in _plain(rows["/api/rizin/<sid>/patches"])
+
+
 def test_the_rizin_page_says_what_emulation_can_and_cannot_do():
     """Task 14. The page about the tab has a section for the emulator, and it says what the feature is (no
     process, the cache, the original untouched), what it is not (the Windows API, a step back) and what ends with

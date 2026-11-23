@@ -4780,6 +4780,146 @@ def test_the_same_patch_made_again_over_a_run_is_saved_once(rz):
     assert "\npatches=140001441:90:r\n" in rz.project().read_text(encoding="utf-8", errors="surrogateescape")
 
 
+def _reopened_with_a_waiting_patch(rz):
+    """_patched_over_a_run, saved and opened again: the patch 0x140001441:90 waits. Returns path and session ID."""
+    path, sid = _patched_over_a_run(rz)
+    rz.close(sid)
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    assert [(w["addr"], w["after"]) for w in _waiting(rz, sid)] == [(0x140001441, "90")]
+    return path, sid
+
+
+def _project_patches(rz):
+    return rz.project().read_text(encoding="utf-8", errors="surrogateescape").split("\npatches=")[1].split("\n")[0]
+
+
+def test_a_patch_made_again_over_the_run_is_not_in_both_lists_of_one_answer(rz):
+    # It waited; the user decrypts again and sets the same patch: it is a row of the cache now, and
+    # "a waiting patch is not in the cache" would be false of the entry the answer still listed.
+    path, sid = _reopened_with_a_waiting_patch(rz)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "wx 41424344 @ 0x140001440"})
+    _patch(rz, sid, addr="0x140001441", bytes="90")
+    answer = rz.read(f"/api/rizin/{sid}/patches")
+    assert [(r["addr"], r["after"], r["mine"], r["over_run"]) for r in answer["patches"]] == [
+        (0x140001440, "41424344", False, False), (0x140001441, "90", True, True)]
+    assert answer["waiting"] == []
+    rz.mgr.get(sid).flush()
+    assert _project_patches(rz) == "140001441:90:r", "and the project says what the answer does"
+
+
+def test_a_patch_made_again_without_a_run_under_it_does_not_wait_either(rz):
+    # The same address and bytes, set live and not over a run: the cache holds it and applied it, so the
+    # waiting entry says nothing more -- the answer and the project each hold it once
+    path, sid = _reopened_with_a_waiting_patch(rz)
+    _patch(rz, sid, addr="0x140001441", bytes="90")
+    answer = rz.read(f"/api/rizin/{sid}/patches")
+    assert [(r["addr"], r["mine"], r["over_run"]) for r in answer["patches"]] == [(0x140001441, True, False)]
+    assert answer["waiting"] == []
+    rz.mgr.get(sid).flush()
+    assert _project_patches(rz) == "140001441:90"
+
+
+def test_a_patch_made_again_with_other_bytes_leaves_the_waiting_one_waiting(rz):
+    # Same address, different bytes: the saved entry's bytes are still not applied, so it still waits,
+    # and the project holds both -- the answer and the project agree
+    path, sid = _reopened_with_a_waiting_patch(rz)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "wx 41424344 @ 0x140001440"})
+    _patch(rz, sid, addr="0x140001441", bytes="91")
+    answer = rz.read(f"/api/rizin/{sid}/patches")
+    assert [(r["addr"], r["after"]) for r in answer["patches"] if r["mine"]] == [(0x140001441, "91")]
+    assert [(w["addr"], w["after"]) for w in answer["waiting"]] == [(0x140001441, "90")]
+    rz.mgr.get(sid).flush()
+    assert _project_patches(rz) == "140001441:91:r,140001441:90:r"
+
+
+def test_the_hold_back_bound_is_the_bound_of_one_patch(rz):
+    # An entry of exactly MAX_PATCH_BYTES can be written, so it is held; one byte more can not, so it is
+    # named with the others that cannot be applied and is not listed as waiting for something that cannot come
+    import rizin_emulation
+
+    path, sid = _patched_over_a_run(rz)
+    rz.close(sid)
+    top = rizin_emulation.MAX_PATCH_BYTES
+    _plant_patches(rz.project(), [(0x140001441, "90" * top, True), (0x140002000, "90" * (top + 1), True)])
+    described = rz.open(path)
+    note = described["analysis"]["note"] or ""
+    assert "1 saved patch could not be applied to this file: 0x140002000" in note, note
+    assert "Held back, not applied: 1 saved patch over bytes an emulation run wrote (0x140001441)" in note, note
+    sid = described["session"]
+    assert [(w["addr"], len(w["after"])) for w in _waiting(rz, sid)] == [(0x140001441, 2 * top)]
+    assert not any(c.startswith("wx " + "90" * top) for c in rz.commands()), "neither was written"
+
+
+def test_the_held_note_counts_what_this_replay_held_back(sessions, sample):
+    # A restart replays the session's own patches into a session that may hold one back already. The note
+    # states what **this** replay held back (the addresses it names are that many), not how much the list
+    # of waiting patches grew by: an entry that waited already is held back again, and said so.
+    mgr = sessions()
+    session = mgr.get(mgr.open(sample("count.exe", b"MZ count"), "tab")["session"])
+    _wait_state(session, "done")
+    first = session._replay_patches([(0x140001441, "90", True)])
+    assert first.startswith("Held back, not applied: 1 saved patch over bytes an emulation run wrote (0x140001441).")
+    second = session._replay_patches([(0x140001441, "90", True), (0x140001450, "41", True)])
+    assert second.startswith("Held back, not applied: 2 saved patches over bytes an emulation run wrote "
+                             "(0x140001441, 0x140001450)."), second
+    assert len(session._waiting) == 2, "the waiting list grew by one, and the note says two: it names both"
+    again = session._replay_patches([(0x140001441, "90", True)])
+    assert again.startswith("Held back, not applied: 1 saved patch over bytes an emulation run wrote (0x140001441).")
+    assert len(session._waiting) == 2
+
+
+def test_a_waiting_patch_says_whether_a_map_holds_its_address(rz):
+    """The omlj at the start lists the file's maps; the ESIL stack's mem.* map arrives with the emulation
+    (measured, see the real-rizin test below). A marked patch at an address no map holds is **held**, not
+    dropped -- but its reason may only say what is true: that nothing is mapped there *now*."""
+    import rizin_sessions
+
+    path = rz.write("pipesim.exe")
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})  # what makes a project be written
+    rz.close(sid)
+    stack = rizin_sessions.ESIL_STACK_ADDR + 0x80
+    edge = rizin_sessions.ESIL_STACK_ADDR + rizin_sessions.ESIL_STACK_SIZE - 1  # the stack's last byte
+    _plant_patches(rz.project(), [(stack, "41", True), (0xDEADBEEF0000, "90", True), (0x140001441, "90", True),
+                                  (edge, "42", True), (edge, "4243", True)])
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    reasons = {(w["addr"], w["after"]): w["reason"] for w in _waiting(rz, sid)}
+    assert sorted(reasons) == [(stack, "41"), (edge, "42"), (edge, "4243"), (0x140001441, "90"),
+                               (0xDEADBEEF0000, "90")], "all are held, none dropped"
+    mapped = reasons[(0x140001441, "90")]
+    for key in ((stack, "41"), (edge, "42"), (0xDEADBEEF0000, "90")):
+        assert reasons[key].startswith(mapped) and reasons[key] != mapped, reasons[key]
+        assert "No map holds this address now" in reasons[key] and "when it starts" in reasons[key]
+    assert "No map" not in mapped
+    assert "never" not in reasons[(stack, "41")] and "cannot be applied" not in reasons[(stack, "41")]
+    # the emulation maps its stack: the address is held by a map now, and the reason says no more than the others'
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    reasons = {(w["addr"], w["after"]): w["reason"] for w in _waiting(rz, sid)}
+    assert reasons[(stack, "41")] == mapped, "the stack is mapped now"
+    assert reasons[(edge, "42")] == mapped, "its last byte is held by the map"
+    assert reasons[(edge, "4243")] != mapped, "two bytes there run past the map: one map has to hold them all"
+    assert "No map holds this address now" in reasons[(0xDEADBEEF0000, "90")]
+
+
+def test_taking_the_whole_cache_back_leaves_a_waiting_patch_and_the_project_keeps_it(rz):
+    # A waiting patch is no write of the cache, so `wc-*` cannot take it; it leaves by its own exit
+    path, sid = _reopened_with_a_waiting_patch(rz)
+    answer = rz.remove(f"/api/rizin/{sid}/patch", {})
+    assert answer["patches"] == []
+    assert [(w["addr"], w["after"]) for w in _waiting(rz, sid)] == [(0x140001441, "90")]
+    rz.remove(f"/api/rizin/{sid}/patch", {"addr": 0x140001441})
+    assert [(w["addr"], w["after"]) for w in _waiting(rz, sid)] == [(0x140001441, "90")]
+    rz.close(sid)
+    assert _project_patches(rz) == "140001441:90:r", "the project holds it after the take-back, as it did before"
+    sid = rz.open(path)["session"]
+    assert [(w["addr"], w["after"]) for w in _waiting(rz, sid)] == [(0x140001441, "90")]
+
+
 def test_a_patch_held_back_twice_waits_once(sessions, sample):
     # _recover replays the mirror into a session that may already hold the same patch back (made again, by
     # hand, over the same run's bytes); the list of what waits must not grow a second entry for it
@@ -5545,6 +5685,36 @@ def test_real_rizin_a_patch_over_a_runs_bytes_would_be_xored_again(tmp_path):
     finally:
         mgr.shutdown()
     assert hashlib.sha256(blob.read_bytes()).hexdigest() == sha, "the sample must never be written"
+
+
+@pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
+@pytest.mark.skipif(not RZ_ASM, reason="rz-asm not installed")
+def test_real_rizin_the_emulations_stack_is_mapped_only_once_the_emulation_starts(tmp_path):
+    """Why the reason of a waiting patch at an unmapped address may not say "never": ``omlj`` when the file
+    is opened lists the file's maps only, and the ``mem.*`` map of ``aeim`` arrives with the emulation
+    (measured on rizin 0.9.1). An address that no map holds at the open can be held by one later."""
+    import rizin_emulation
+    import rizin_sessions
+
+    blob = tmp_path / "decryptor.bin"
+    _decryptor_blob(blob)
+    mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(tmp_path / "projects"))
+    try:
+        session = mgr.get(mgr.open(str(blob), "tab")["session"])
+        _wait_state(session, "done", timeout=60)
+        stack = rizin_sessions.ESIL_STACK_ADDR + 0x80
+        before = session.json("omlj")
+        assert [m["name"] for m in before if m["name"].startswith("mem.")] == []
+        assert not rizin_emulation.maps_hold(stack, 1, before)
+        session.console("e asm.arch=x86")
+        session.console("e asm.bits=64")
+        session.emulation_start(0)
+        after = session.json("omlj")
+        assert [m["name"] for m in after if m["name"].startswith("mem.")] == [
+            f"mem.{rizin_sessions.ESIL_STACK_ADDR:#x}_{rizin_sessions.ESIL_STACK_SIZE:#x}"]
+        assert rizin_emulation.maps_hold(stack, 1, after)
+    finally:
+        mgr.shutdown()
 
 
 @pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
