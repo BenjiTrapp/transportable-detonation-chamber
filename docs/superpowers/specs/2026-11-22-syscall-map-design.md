@@ -430,16 +430,28 @@ mitgebrachten Stub daher nie sähe.
 
 Der Scan läuft nicht nur von Hand im Tab, sondern als Stufe einer Detonation.
 
-- Eine neue Stufe in der Stufenliste von `/api/submit`, mit Fortschritt wie die
-  übrigen, zwischen den Live-Memory-Werkzeugen eingeordnet.
+- Eine neue Stufe in der Liste der Live-Memory-Werkzeuge
+  (`_run_memory_scans_async`, **nicht** `api_submit` — das führt keine
+  Stufenliste und liefert kein `scans`), nach Aether und vor Process Dump.
 - Ihre Befunde gehen durch `memory_evidence.collect()` in den Gesamt-Score,
   erscheinen im VERDICT FLOW und in der Score-Historie.
 - Der System-Sweep (`/api/memory/sweep`) nimmt den Syscall-Scan als weiteres
   Werkzeug auf.
 - `_update_preconditions` in `webui/app.py` muss einen laufenden Syscall-Scan
-  kennen, damit ein Werkzeug-Update ihn nicht unterbricht.
-- Die Stufe ist abschaltbar. Fehlt NTSleuth oder die passende Baseline,
-  überspringt sie sich mit Hinweis statt die Detonation scheitern zu lassen.
+  **und eine laufende Baseline-Extraktion** kennen, damit ein Werkzeug-Update
+  keins von beiden unterbricht.
+- **Zum Messen genügt die Baseline-Datei.** NTSleuth selbst wird nur gebraucht,
+  um eine Baseline zu *erzeugen*. Die Stufe prüft daher auf die passende
+  Baseline, nicht auf die Anwesenheit des Binaries — ein System mit Baselines
+  und ohne NTSleuth kann messen.
+- **Die Stufe startet nie eine Extraktion**, sondern fragt die Baseline ohne
+  Erzeugungsauftrag: eine Detonation darf nicht auf einen externen
+  Extraktionslauf warten, und ein Werkzeug-Update, das mitten darin die
+  `ntsleuth-*.exe` tauscht, wäre das Gegenteil von hilfreich.
+- Die Stufe ist abschaltbar, über eine Umgebungsvariable wie
+  `TDC_NO_BACKGROUND` es vormacht, nicht je Einreichung. Fehlt die passende
+  Baseline, überspringt sie sich mit Hinweis statt die Detonation scheitern zu
+  lassen.
 
 ### 8. Routen
 
