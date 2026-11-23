@@ -7584,7 +7584,8 @@ def test_the_console_filter_agrees_with_the_lists_of_what_spoils(rz):
     for cmd in SPOILING:
         assert rizin_sessions.check_console_command(cmd) is None, cmd
         kind = ("_RESTORE_HAND_WRITE" if cmd.startswith(("w", "px 4; w")) else
-                "_RESTORE_HAND_SETTING" if cmd.startswith(("e ", "ah")) else "_RESTORE_HAND_EMULATION")
+                "_RESTORE_HAND_SETTING" if cmd.startswith(("e ", "ah")) else
+                "_RESTORE_HAND_SETUP" if cmd.replace('"', "").split()[0] in ("aei", "aeim", "aepc") else "_RESTORE_HAND_EMULATION")
         assert rizin_sessions._console_spoils(cmd) == getattr(rizin_sessions, kind), cmd
     for cmd in BREAKPOINT_COMMANDS:
         assert rizin_sessions.check_console_command(cmd) is None, cmd
@@ -7686,6 +7687,39 @@ def test_a_breakpoint_that_cannot_be_read_back_after_a_console_db_counts_as_chan
     monkeypatch.setattr(session, "_breakpoint_list", real)
     _run(rz, sid, "step")
     assert "breakpoint" in _state(rz, sid)["tainted"], "what the set is was not read, so it counts as changed"
+
+
+@pytest.mark.parametrize("error", [OSError, BrokenPipeError])
+def test_a_console_db_that_ran_and_then_failed_leaves_the_breakpoints_as_changed(rz, monkeypatch, error):
+    # what a command did before it failed is done: the db removed the breakpoint, and the answer never came
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    session = rz.mgr.get(sid)
+    real = session._pipe.console
+
+    def runs_then_fails(text, *args, **kwargs):
+        real(text, *args, **kwargs)
+        raise error("the pipe broke")
+
+    monkeypatch.setattr(session._pipe, "console", runs_then_fails)
+    with pytest.raises(error):
+        session.console("db- @ 0x1400014b7")
+    monkeypatch.setattr(session._pipe, "console", real)
+    assert rz.read(f"/api/rizin/{sid}/breakpoints") == [], "it really did remove it"
+    assert "breakpoint" in _offer(rz, sid)["reason"]
+    _run(rz, sid, "step")
+    assert "breakpoint" in _state(rz, sid)["tainted"]
+
+
+def test_a_console_db_that_changes_nothing_is_cleared_again_once_it_has_been_read_back(rz):
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    _console(rz, sid, "db @ 0x1400014b7")  # already there
+    assert rz.mgr.get(sid)._restore_bp_moved is False
+    _run(rz, sid, "step")
+    assert _state(rz, sid) == {"actions": 2, "tainted": None}
 
 
 def test_a_standing_breakpoint_change_does_not_follow_a_timeline_into_the_next(rz):
@@ -8009,11 +8043,35 @@ def test_the_fake_takes_a_register_before_aei_and_keeps_it_through_aei_like_rizi
                       if r["name"] == "rax")) == 0x1234
 
 
-@pytest.mark.parametrize("cmd", ["ar rax=0x1234", "aer rax=0x1234", "aepc 0x140001450", "aeim 0x300000 0x100 mine",
-                                 "aei"])
-def test_a_console_command_before_the_first_start_that_sets_the_emulation_up_spoils_the_timeline(rz, cmd):
-    # rizin keeps a register set before aei through aei, aeim and aepc (measured), so the run reads it, and the
-    # replay of a project does not have it
+# What a start does not undo: it closes every ESIL map, runs aei and aeim, and sets the PC (and aeim the stack
+# pointer and the base pointer) -- measured on rizin 0.9.1 -- so a register other than those, and the registers
+# and rows of a step, are still there when the run begins. (`aer` is no command of rizin 0.9.1: "Command 'aer'
+# does not exist". It is classified like `ar` so that a build that has it is safe.)
+SURVIVES_A_START = ["ar rax=0x1234", "ar rcx=0x5", "aer rax=0x1234", "aes", "aeso", "aess", "aesu 0x140001450"]
+# What it does undo: arming, mapping and the PC.
+GONE_AFTER_A_START = ["aei", "aei-", "aeim", "aeim 0x300000 0x100 mine", "aeim-", "aepc 0x140001450", "aeip"]
+
+
+@pytest.mark.parametrize("arm", ["aei", "aeim"])
+def test_the_fake_loses_the_pc_the_sp_and_the_bp_when_it_arms_but_keeps_the_rest(rz, arm):
+    # measured on rizin 0.9.1 and written into fake_rizin's contract: `aepc 0x3; aei; ar PC` is 0, `aepc 0x3; aeim`
+    # with no aei at all as well, `ar esp=0x1234; aei; aeim` leaves esp in the new stack and `ar ecx=…` stays
+    def held(sid, name):
+        return int(_console(rz, sid, f"ar {name}")["output"].split("=")[1], 16)
+
+    sid = rz.session()
+    for command in ("aepc 0x3", "ar rsp=0x1234", "ar rbp=0x1234", "ar rcx=0x1234"):
+        _console(rz, sid, command)
+    assert [held(sid, n) for n in ("PC", "rsp", "rbp", "rcx")] == [3, 0x1234, 0x1234, 0x1234]
+    _console(rz, sid, arm)
+    assert held(sid, "PC") == ENTRY
+    if arm == "aeim":
+        assert held(sid, "rsp") == held(sid, "rbp") == 0x178000, "in the middle of the stack it mapped"
+    assert held(sid, "rcx") == 0x1234
+
+
+@pytest.mark.parametrize("cmd", SURVIVES_A_START)
+def test_a_console_command_before_the_first_start_that_a_start_does_not_undo_spoils_the_timeline(rz, cmd):
     sid = rz.session()
     _console(rz, sid, cmd)
     rz.send(f"/api/rizin/{sid}/emulation/start", {})
@@ -8023,6 +8081,23 @@ def test_a_console_command_before_the_first_start_that_sets_the_emulation_up_spo
     sid = _another_file(rz, f"{cmd[:3]}.exe", SAMPLE + cmd.encode())
     rz.send(f"/api/rizin/{sid}/emulation/start", {})
     assert _state(rz, sid)["tainted"] is None
+
+
+@pytest.mark.parametrize("cmd", GONE_AFTER_A_START)
+def test_a_console_command_before_the_first_start_that_a_start_undoes_spoils_nothing(rz, cmd):
+    # the start gives the ESIL memory back, arms the VM again and sets the PC: a replay does the same
+    sid = rz.session()
+    _console(rz, sid, cmd)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    assert _state(rz, sid) == {"actions": 1, "tainted": None}, cmd
+    assert rz.mgr.get(sid)._restore_pending is None
+
+
+@pytest.mark.parametrize("cmd", GONE_AFTER_A_START)
+def test_but_in_the_middle_of_a_timeline_the_same_commands_still_spoil_it(rz, cmd):
+    sid = _started(rz)
+    _console(rz, sid, cmd)
+    assert _state(rz, sid)["tainted"], cmd
 
 
 @pytest.mark.parametrize("cmd", ["e asm.arch=x86", "e asm.syntax=intel", "e esil.timeout=9", "ahs 3 @ 0x140001440",
@@ -8274,6 +8349,8 @@ def test_real_rizin_the_recorded_skip_value_is_what_was_applied(tmp_path, monkey
     (tmp_path / "call32.bin").write_bytes(bytes(blob))
     (tmp_path / "loop32.bin").write_bytes(bytes.fromhex("ebfe") + bytes(62))  # jmp $
     (tmp_path / "nops32.bin").write_bytes(bytes.fromhex("90909090") + bytes(60))
+    for name in ("mov32.bin", "mov32b.bin"):  # a file of its own for each session: the same file is the same session
+        (tmp_path / name).write_bytes(bytes.fromhex("b905000000" "6a40") + bytes(60) + name.encode())  # mov ecx, 5; push
     monkeypatch.setattr(rizin_sessions, "ESIL_TIMEOUT", 1.0)
     monkeypatch.setattr(rizin_sessions, "ESIL_SETTINGS", tuple(
         "esil.timeout=1" if c.startswith("esil.timeout=") else c for c in rizin_sessions.ESIL_SETTINGS))
@@ -8336,6 +8413,36 @@ def test_real_rizin_the_recorded_skip_value_is_what_was_applied(tmp_path, monkey
         session.emulation_run("step")
         state = session.emulation_state()
         assert _word(next(r["value"] for r in state["registers"] if r["name"] == "eax")) == 0x1234
+        assert "emulation" in session._restore["tainted"]
+
+        # what a start undoes, so that a pre-start command of that kind spoils nothing: arming and the PC (`aepc 3;
+        # aei` and `aepc 3; aeim` both read PC 0), the stack pointer (aeim puts it in its stack), the ESIL maps
+        # (the start closes them) -- and what it does not: a register and what a step left
+        def held(session, name):  # the console answers in colour
+            return int(re.search(r"0x[0-9a-f]+", session.console(f"ar {name}")["output"]).group(), 16)
+
+        session = opened("mov32.bin")
+        session.console("aepc 0x3")
+        assert held(session, "PC") == 3, "taken before aei"
+        session.console("aei")
+        assert held(session, "PC") == 0, "aei put the PC at the seek"
+        session.console("aepc 0x3")
+        session.text("ar esp=0x1234")  # through a view: the console would taint, for the PC/SP/BP too (not told apart)
+        session.console("aeim 0x300000 0x100 mine")
+        before = [m["name"] for m in session.json("omlj")]
+        assert "mem.mine" in before, before
+        state = session.emulation_start(0)
+        names = [m["name"] for m in session.json("omlj")]
+        assert "mem.mine" not in names and any(n.startswith("mem.0x100000") for n in names), names
+        assert state["pc"] == "0x0" and held(session, "esp") == 0x178000, "the start set both again"
+        assert session._restore["tainted"] is None and session._restore_pending is None
+
+        session = opened("mov32b.bin")
+        session.console("e io.cache=true")
+        session.console("aes")  # mov ecx, 5
+        assert held(session, "ecx") == 5
+        session.emulation_start(0)
+        assert held(session, "ecx") == 5, "a step's register is still there after a start"
         assert "emulation" in session._restore["tainted"]
     finally:
         mgr.shutdown()

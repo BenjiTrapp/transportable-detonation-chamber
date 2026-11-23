@@ -187,14 +187,20 @@ _PATCHES_DROPPED = ("{count} {patch} did not fit into the project ({chars} chara
 # pane as they stand: a record that is tainted is never offered, whatever else is true of it.
 _RESTORE_HAND_REGISTER = "a register was set by hand, which the timeline does not record"
 _RESTORE_HAND_WRITE = "a console command wrote to the cache, which the timeline does not record"
-_RESTORE_HAND_EMULATION = "a console command set up or drove the emulation, which the timeline does not record"
+_RESTORE_HAND_EMULATION = ("a console command set a register or stepped the emulation, which the timeline does "
+                           "not record")
+_RESTORE_HAND_SETUP = ("a console command armed the emulation, mapped its memory or set its PC, which the "
+                       "timeline does not record")
 _RESTORE_HAND_SETTING = ("a setting or a hint was changed while the timeline ran, and the timeline does not "
                          "record it")
 _RESTORE_HAND_BREAKPOINT = "a breakpoint was changed, and a run stops at the breakpoints there are"
-# What a project does not keep of the emulation, so that a replay on a rizin of its own would not have it: a
-# register, and what drives the emulation. (A write is caught by what the cache holds when the timeline begins,
-# and the settings, the hints and the breakpoints are in the project.) Done by hand before the first start, it
-# is held for the timeline that begins (_restore_pending).
+# What a project does not keep of the emulation **and a start does not undo**, so that a replay on a rizin of its
+# own would not have it: a register and what a step left (measured on rizin 0.9.1: a start closes every ESIL map
+# and runs aei, aeim and aepc, which put the PC at the seek and, with aeim, the stack and base pointer in its
+# stack -- every other register is still there). Done by hand before the first start, it is held for the timeline
+# that begins (_restore_pending). A write is caught by what the cache holds when the timeline begins, the
+# settings, the hints and the breakpoints are in the project, and arming, mapping and the PC are done again by
+# the start itself; _RESTORE_HAND_SETUP spoils a timeline in the middle of it, and nothing before it.
 _RESTORE_BEFORE_START = (_RESTORE_HAND_REGISTER, _RESTORE_HAND_EMULATION)
 _RESTORE_TIMEOUT = "a run ended at the time limit, a result that hangs on the clock and cannot be repeated"
 _RESTORE_HALF = "an action failed half-way, after it had already changed the emulation or the cache"
@@ -208,6 +214,7 @@ _RESTORE_RESTARTED = ("rizin was restarted, which emptied the cache the run had 
 _RESTORE_NOTHING = "the run left nothing in the cache that a restore could bring back"
 # The console commands that read what the emulation or the cache holds and change nothing of it; every
 # other name of these families spoils the timeline (_console_spoils).
+_SETUP_COMMANDS = frozenset(("aei", "aei-", "aeim", "aeim-", "aepc", "aeip"))
 _READ_ONLY_COMMANDS = frozenset(("wc", "wcj", "ar", "arj", "ar*", "ar=", "arr", "arrj", "aer", "aerj", "aer*",
                                  "ahl", "dbl", "dblj", "dblq", "dbil"))
 # While an analysis step holds rizin, a patch or a breakpoint goes through (it changes no bytes the step
@@ -601,7 +608,7 @@ def _console_spoils(text):
         if name.startswith("w"):
             return _RESTORE_HAND_WRITE
         if name.startswith(("ae", "ar")):
-            return _RESTORE_HAND_EMULATION
+            return _RESTORE_HAND_SETUP if name in _SETUP_COMMANDS else _RESTORE_HAND_EMULATION
         if name.startswith("ah") or (name == "e" and "=" in args):
             return _RESTORE_HAND_SETTING
     return None
@@ -1532,6 +1539,8 @@ class RizinSession:
                 self._refuse_while_analysing()
             if spoils:
                 self._restore_taint(spoils)  # before it runs: what a command did before it failed is done
+            if moves and self._restore is not None:
+                self._restore_bp_moved = True  # likewise; what the set is is read back below, once it has run
             pipe.cmd("e scr.color=3")
             out, err, truncated = pipe.console(text)
             pipe.cmd("e scr.color=0")

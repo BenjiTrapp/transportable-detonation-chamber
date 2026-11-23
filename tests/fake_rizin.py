@@ -58,12 +58,26 @@ brings back the settings (/core/config) and hints that a project holds.
 The ESIL VM: ``aei`` arms it, ``aeim`` too and maps a stack (esil.stack.addr
 and esil.stack.size, or its arguments) with the stack pointer in its middle
 and the PC at the seek, ``aeim-`` unmaps it, ``aepc`` sets the PC. ``ar``
-shows, reads (by name or the roles PC and SP) and sets the registers. Before
-``aei`` rizin 0.9.1 takes ``ar`` and ``aepc`` all the same, and a register
-set then is still there after ``aei``, ``aeim`` and a step (measured, and
-pinned by test_real_rizin_the_recorded_skip_value_is_what_was_applied); the
-step commands answer that ESIL is not initialized. ``pxj``
-reads the stack, ``omlj`` lists it with the file's maps. ``fd`` describes the
+shows, reads (by name or the roles PC and SP) and sets the registers.
+
+Before ``aei`` rizin 0.9.1 takes ``ar`` and ``aepc`` all the same, and a
+register set then is still there after ``aei``, ``aeim`` and a step -- **but
+not the PC, the stack pointer and the base pointer**: ``aepc 0x3; aei; ar PC``
+reads 0 (the seek), and so does ``aepc 0x3; aeim; ar PC`` with no ``aei`` at
+all; ``ar esp=0x1234; aei; aeim`` leaves esp in the middle of the new stack
+(all measured, and pinned by test_real_rizin_the_recorded_skip_value_is_what_was_applied).
+The fake does the same: what is set before ``aei`` is kept in ``esil["pre"]``,
+and arming sets the PC (and ``aeim`` the SP and BP) over it.
+
+**Known divergence:** rizin 0.9.1 arms itself for the step commands. ``e io.cache=true;
+aes`` with no ``aei`` at all runs (measured on a ``push 0x40``: ``eip`` 0 -> 2, ``esp = 0xfffffffc``
+and two cache rows -- 1 byte over the code at 0 and 3 bytes at 0xfffffffffffffffc, in no map), and
+so do ``aeso`` and ``aesu``. The fake answers "ESIL is not initialized" to every step command
+before ``aei``. It is left so: arming from a step would need a stack the model does not have, and
+a push that wraps round to the code, and nothing in the server steps before a start, so it only
+differs for a console ``aes`` typed first, whose effect on the timeline is decided by its name
+(rizin_sessions._console_spoils), not by what the fake does. ``pxj`` reads the stack, ``omlj``
+lists it with the file's maps. ``fd`` describes the
 closest flag below an address, ``fd.j`` lists the flags at it; like rizin's
 aei, an armed VM has a flag per register at its value.
 
