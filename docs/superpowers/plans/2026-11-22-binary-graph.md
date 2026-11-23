@@ -168,18 +168,33 @@ Das ist die Zeile aus **Review Focus**. Eine Win32-Funktion ohne Eintrag darf `i
 
 ```python
 def test_a_sample_whose_api_the_table_does_not_know_is_a_hint_and_not_a_proven_bypass():
-    # imports: {"CreateService"} — no entry, so expand() adds nothing and the expansion
-    # cannot speak about NtCreateThreadEx: the hit stays import_present None, not False
+    # a stub for a syscall NO row leads to (not in Table.covered): the table cannot
+    # name the documented door, so the hit stays import_present None, never False
 def test_expand_keeps_none_as_none_and_adds_the_nt_name_of_a_hit():
 def test_a_sample_that_imports_the_documented_win32_path_is_not_a_proven_bypass():
     # imports {"VirtualAllocEx"}, stub for NtAllocateVirtualMemory -> import_present True
-def test_a_sample_that_imports_nothing_of_the_path_is_a_proven_bypass():
-    # imports {"GetLastError"} with the table applied -> import_present False
+def test_a_sample_that_imports_no_door_to_a_covered_syscall_is_a_proven_bypass():
+    # imports {"GetLastError"}, stub for NtAllocateVirtualMemory -> import_present False
 ```
 
 Der dritte und vierte Test sind der Kern: genau der Fall, den Plan 1 nicht entscheiden konnte.
 
-**Achtung — `expand` darf nicht alles einsammeln.** `Table.expand` fügt nur die `nt`-Namen der *getroffenen* Win32-Namen hinzu. Ein leerer oder fehlender Treffer darf nicht dazu führen, dass die ganze Tabelle in die Menge wandert: dann wäre nie etwas ein Beleg.
+**Der Unterschied wird am Ziel entschieden, nicht am Import.** `False` darf nur für
+einen Syscall fallen, zu dem **irgendeine** Zeile führt — `Table.covered`, die Menge
+der `nt`-Namen der Tabelle. Für jeden anderen Syscall kann die Tabelle die
+dokumentierte Tür nicht nennen, also bleibt es `None`. Prüfte man stattdessen, ob der
+*Import* des Samples eine Zeile hat, wäre `NtCreateFile` mit `CreateFileW`-Import eine
+belegte Umgehung — für ein gewöhnliches Programm.
+
+**Achtung — `expand` darf nicht alles einsammeln.** `Table.expand` fügt nur die
+`nt`-Namen der *getroffenen* Win32-Namen hinzu. Ein leerer oder fehlender Treffer darf
+nicht dazu führen, dass die ganze Tabelle in die Menge wandert: dann wäre nie etwas
+ein Beleg.
+
+**Und `covered` ohne Wahl gibt es nicht.** `expanded_imports` ohne `covered` ist ein
+`ValueError`, kein milder Vorgabewert: wer die erweiterte Menge hat, hat die Tabelle
+und kann `covered` nennen. Ein stiller Vorgabewert wäre die Zeile, an der ein späterer
+Aufrufer die falsche Beschuldigung zurückholt.
 
 - [ ] **Step 9: `expand` und `nt_for` so umsetzen, dass diese vier Tests grün sind**
 
