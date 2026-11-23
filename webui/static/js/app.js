@@ -25360,8 +25360,9 @@ function renderSyscallDeviations(list, options) {
 // A rule that was drafted, as the panel shows it. `draft` is what /api/syscalls/rule answers: a YARA rule ({ name,
 // text, target }, kind 'yara' or none) or a signature entry ({ kind: 'signature', entry, text, target, covered_by }).
 // The text is the one thing in it that a sample writes, and it is set as text, never as markup. A draft only drafts:
-// a YARA rule is applied (written where Rustinel reads, now, on this VM) or downloaded (handed back for the repo, where
-// it survives a rebuilt VM) by a press of its own button, and the two say what they do. options: busy (an apply is
+// a YARA rule is applied (written where Rustinel reads, now, on this VM) or downloaded (handed back for the repo, to
+// commit; that a committed rule is loaded again after a rebuild is not verified) by a press of its own button, and
+// the two say what they do. options: busy (an apply is
 // under way), note ({ tone, text }: what the last apply answered).
 function showSyscallRuleDraft(draft, options) {
     const d = draft && typeof draft === 'object' ? draft : {};
@@ -25390,7 +25391,7 @@ function showSyscallRuleDraft(draft, options) {
         if (!note) html += '<p class="syscall-draft-hint">Nothing has been written yet. Choose what happens to this rule:</p>';
         html += '<div class="syscall-draft-actions">' +
             '<div class="syscall-draft-action syscall-draft-vm"><div class="syscall-draft-action-title">ON THIS VM · now</div>' +
-            `<p>Writes <code>${escapeHtml(file)}</code> into the folder Rustinel reads its rules from. Rustinel loads it within about 2 seconds, without a restart. ` +
+            `<p>Writes <code>${escapeHtml(file)}</code> into the folder Rustinel reads its rules from. Rustinel should load it within about 2 seconds, without a restart; that is not yet verified on a VM, so check its log. ` +
             'A rebuilt VM does not have it.</p>' +
             `<button type="button" class="btn btn-sm btn-primary" onclick="applySyscallRule(${jsArg(name)})"${opts.busy ? ' disabled' : ''}>APPLY TO THIS VM</button></div>` +
             '<div class="syscall-draft-action syscall-draft-repo"><div class="syscall-draft-action-title">IN THE REPO · reviewable</div>' +
@@ -26355,8 +26356,10 @@ async function applySyscallRule(name) {
     const path = typeof r.data.path === 'string' ? r.data.path : '';
     if (r.ok) {
         const seconds = Number(r.data.reload_seconds) > 0 ? Number(r.data.reload_seconds) : 2;
-        st.note = { tone: 'ok', text: `Written${path ? ` to ${path}` : ''}. Rustinel loads it within about ${seconds} seconds. This copy lives on this VM only: ` +
-                    'a rebuilt VM does not have it. Download the rule as well and commit it under rules/yara/ to keep it in version control; whether a committed rule is loaded again after a rebuild is not yet verified.' };
+        st.note = { tone: 'ok', text: `Written${path ? ` to ${path}` : ''}. Rustinel should load it within about ${seconds} seconds, which is not yet verified on a VM: check its log. ` +
+                    'This copy lives on this VM only; a rebuilt VM does not have it. ' +
+                    'Download the rule as well and commit it under rules/yara/ to keep it in version control. ' +
+                    'Whether a committed rule is loaded again after a rebuild is not yet verified.' };
     } else if (r.status === 409 && r.data.status === 'exists') {
         st.note = { tone: 'info', text: `A rule of this name is there already${path ? ` (${path})` : ''}: it is the same stub, build and view. It was left alone. Nothing was written.` };
     } else {

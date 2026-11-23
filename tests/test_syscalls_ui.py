@@ -1523,7 +1523,7 @@ YARA_DRAFT = ("{ kind: 'yara', name: 'TDC_DirectSyscall_NtFoo_arm64_0123abcd', t
 
 
 @needs_node
-def test_applying_a_rule_writes_it_once_and_says_that_only_the_repo_copy_survives():
+def test_applying_a_rule_writes_it_once_and_says_the_applied_copy_is_lost_and_a_commit_is_not_yet_verified():
     r = _panels(r"""
       (async () => {
         initSyscalls(); syscallsTabShown(); await settle();
@@ -1540,7 +1540,7 @@ def test_applying_a_rule_writes_it_once_and_says_that_only_the_repo_copy_survive
     assert [u for u, _ in r["posts"]] == ["/api/syscalls/rule/apply"], "a second press while the first is under way asks nothing"
     body = r["posts"][0][1]
     assert body["name"] == "TDC_DirectSyscall_NtFoo_arm64_0123abcd" and "condition: true" in body["text"]
-    assert "C:\\rules\\tdc\\x.yar" in r["panel"] and "about 2 seconds" in r["panel"] and "rebuilt" in r["panel"]
+    assert "C:\\rules\\tdc\\x.yar" in r["panel"] and "about 2 seconds" in r["panel"] and "rebuilt" in r["panel"] and "not yet verified" in r["panel"]
     assert "syscall-draft-result-ok" in r["panel"]
 
 

@@ -8645,7 +8645,8 @@ def api_syscalls_rule():
 
 @app.route("/api/syscalls/rule/apply", methods=["POST"])
 def api_syscalls_rule_apply():
-    """Write a drafted YARA rule where Rustinel reads its rules; it takes effect within about two seconds.
+    """Write a drafted YARA rule where Rustinel reads its rules; it should take effect within about two seconds
+    (not verified on a VM).
 
     The body is the draft as /api/syscalls/rule returned it. Only a rule of exactly that form is written, one file
     named after the rule, into YARA_RULES_DIR and nowhere else. A rule of that name already there is a 409."""

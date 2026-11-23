@@ -251,7 +251,8 @@ def draft_yara(hit: dict, build: str, view: str, source: str, *, now: datetime.d
     sample = clean(hit.get("sample"))
     where += f" in {sample}" if sample else ""
     note = (f"Found{where}. Matches these stub bytes anywhere, the ntdll of this build included "
-            "(Rustinel does not scan the Windows directory). Review before keeping.")
+            "(by Rustinel's configuration as the scripts read, it does not scan the Windows directory; not verified on a VM). "
+            "Review before keeping.")
     stamp = (now or datetime.datetime.now(datetime.timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
     generated = f"{stamp} by the Syscalls tab, source {clean(source, 40) or 'unknown'}"
     severity = "high" if hit.get("import_present") is False else "medium"

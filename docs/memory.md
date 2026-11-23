@@ -159,19 +159,28 @@ syscall) has no stub shape of its own and is not found.
 
 Draft rule shows a rule and writes nothing. For a stub found by STUBS it is a
 YARA rule that names the syscall, the build and the view (a rule without the view
-would fall silent on the other one, and nobody would know why). APPLY TO THIS VM
-writes it into the folder Rustinel reads, `C:\tools\detection-rules\yara-combined\tdc`,
-and it is loaded within about two seconds, through hot reload. That copy is lost
-with the VM. DOWNLOAD FOR THE REPO gives the same rule as a file to commit under
-`rules/yara/`, so that it is version-controlled and reviewable; **whether a
-committed rule is loaded again after a rebuild is not yet verified**, because
-`install-detection-rules.ps1` points Rustinel at `yara-combined`, which links only
-the upstream pack and the Elastic rules, while the repository's own rules are
-copied elsewhere. Do not rely on it until that is settled. For a deviation in `ntdll` the draft is an entry for
+would fall silent on the other one, and nobody would know why).
+
+APPLY TO THIS VM writes it into the folder Rustinel reads,
+`C:\tools\detection-rules\yara-combined\tdc`. Rustinel is configured to reload
+its rules without a restart, so it should pick the rule up within about two
+seconds, **but that is not yet verified on a VM**: look in Rustinel's log for the
+reload before you trust the rule. The applied copy is lost with the VM.
+
+DOWNLOAD FOR THE REPO gives the same rule as a file to commit under `rules/yara/`,
+so that it is version-controlled and reviewable.
+**Whether a committed rule is loaded again after a rebuild is not yet verified.**
+As the scripts read, `install-detection-rules.ps1` points Rustinel at
+`yara-combined`, which links only the upstream pack and the Elastic rules, while
+`install-rustinel.ps1` copies the repository's own rules to another folder. Do not
+rely on a committed rule until that is settled.
+
+For a deviation in `ntdll` the draft is an entry for
 `webui/syscall_signatures.json`, to be added by hand. There are no Sigma rules
 for this: a patched stub raises no event. The YARA rule matches its bytes
-anywhere, the `ntdll` of the same build included, and Rustinel skips
-`C:\Windows\`; review a draft before keeping it.
+anywhere, the `ntdll` of the same build included. As Rustinel's configuration
+reads, it does not scan `C:\Windows\`; that is not yet verified on a VM either.
+Review a draft before keeping it.
 
 ### When the tab says it cannot measure
 
