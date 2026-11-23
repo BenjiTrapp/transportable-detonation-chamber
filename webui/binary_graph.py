@@ -14,6 +14,12 @@ from dataclasses import dataclass
 MACHINES = {0xAA64: "arm64", 0x8664: "x64", 0x14C: "x86"}
 MAX_BINARY_SIZE = 512 * 2**20          # System32's largest image is a fraction of this; a sample may not be
 
+# every reason a file is skipped for: fixed strings of our own, so they can be counted and grouped. Never a library's,
+# the OS's or its locale's wording, which drifts; the file name is in the pair for whoever opens that one by hand
+REASONS = ("not a PE", "empty file", "larger than the size cap", "cannot be opened", "pefile is not available",
+           "unreadable import directory", "unreadable delay-load directory", "unreadable export directory",
+           "malformed", "the same name in another case", "cannot be listed")
+
 
 class ExtractError(Exception):
     """A file that yields no record; the message is the short reason it was skipped."""
@@ -79,14 +85,10 @@ def _is_dll(pe):
     return None if characteristics is None else bool(characteristics & 0x2000)
 
 
-def _size_text(n):
-    return f"{n // 2**20} MiB" if n >= 2**20 else f"{n} bytes"
-
-
-# the directories the record is read from: pefile's index, the attribute it sets, the word a skip reason uses
-DIRECTORIES = (("IMAGE_DIRECTORY_ENTRY_IMPORT", "DIRECTORY_ENTRY_IMPORT", "import"),
-               ("IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT", "DIRECTORY_ENTRY_DELAY_IMPORT", "delay-load"),
-               ("IMAGE_DIRECTORY_ENTRY_EXPORT", "DIRECTORY_ENTRY_EXPORT", "export"))
+# the directories the record is read from: pefile's index, the attribute it sets, the reason a refusal is skipped for
+DIRECTORIES = (("IMAGE_DIRECTORY_ENTRY_IMPORT", "DIRECTORY_ENTRY_IMPORT", "unreadable import directory"),
+               ("IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT", "DIRECTORY_ENTRY_DELAY_IMPORT", "unreadable delay-load directory"),
+               ("IMAGE_DIRECTORY_ENTRY_EXPORT", "DIRECTORY_ENTRY_EXPORT", "unreadable export directory"))
 
 
 def _parse_directories(pefile, pe):
@@ -102,7 +104,7 @@ def _parse_directories(pefile, pe):
     # test_a_parse_that_warned_and_still_produced_entries_is_kept_and_marked_partial are the tripwire for that
     declared = pe.OPTIONAL_HEADER.DATA_DIRECTORY
     partial = False
-    for index_name, attribute, word in DIRECTORIES:
+    for index_name, attribute, reason in DIRECTORIES:
         index = pefile.DIRECTORY_ENTRY[index_name]
         before = len(pe.get_warnings())
         pe.parse_data_directories(directories=[index])
@@ -111,7 +113,7 @@ def _parse_directories(pefile, pe):
         if getattr(pe, attribute, None):
             partial = True
         elif index < len(declared) and declared[index].VirtualAddress:
-            raise ExtractError(f"unreadable {word} directory")
+            raise ExtractError(reason)
     return partial
 
 
@@ -124,29 +126,29 @@ def extract_binary(path: str) -> BinaryInfo:
     try:
         import pefile
     except ImportError:
-        raise ExtractError("cannot be parsed: pefile is not available") from None
+        raise ExtractError("pefile is not available") from None
     try:
         with open(path, "rb") as fh:
             size = os.fstat(fh.fileno()).st_size
             if size > MAX_BINARY_SIZE:
-                raise ExtractError(f"larger than {_size_text(MAX_BINARY_SIZE)}")
+                raise ExtractError("larger than the size cap")
             if size == 0:
-                raise ExtractError("not a PE: the file is empty")
+                raise ExtractError("empty file")
             with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as data:
                 return _record(pefile, name, data)
     except ExtractError:
         raise
-    except OSError as exc:
-        raise ExtractError(f"cannot be opened: {exc.strerror or type(exc).__name__}") from None
-    except Exception as exc:
-        raise ExtractError(f"malformed: {type(exc).__name__}") from None
+    except OSError:
+        raise ExtractError("cannot be opened") from None
+    except Exception:
+        raise ExtractError("malformed") from None
 
 
 def _record(pefile, name, data):
     try:
         pe = pefile.PE(data=data, fast_load=True)
-    except pefile.PEFormatError as exc:
-        raise ExtractError(f"not a PE: {str(exc.value).strip()}") from None
+    except pefile.PEFormatError:
+        raise ExtractError("not a PE") from None
     try:
         partial = _parse_directories(pefile, pe)
         exports, forwarders, ordinal_names = _exports(pe)
@@ -166,8 +168,8 @@ def extract_tree(directory: str) -> tuple[list[BinaryInfo], list[tuple[str, str]
     `(file name, reason)`. Nothing raises: a file that cannot be read is a skipped one."""
     try:
         names = sorted(os.listdir(directory), key=lambda n: (n.lower(), n))
-    except OSError as exc:
-        return [], [(directory, f"cannot be listed: {exc.strerror or type(exc).__name__}")]
+    except OSError:
+        return [], [(directory, "cannot be listed")]
     binaries, skipped, seen = [], [], set()
     for name in names:
         if not name.lower().endswith((".dll", ".exe")):
@@ -176,7 +178,7 @@ def extract_tree(directory: str) -> tuple[list[BinaryInfo], list[tuple[str, str]
         if not os.path.isfile(path):
             continue
         if name.lower() in seen:
-            skipped.append((name, f"the same name as {name.lower()} in another case"))
+            skipped.append((name, "the same name in another case"))
             continue
         seen.add(name.lower())
         try:

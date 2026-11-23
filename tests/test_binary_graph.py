@@ -650,7 +650,7 @@ def test_a_name_that_differs_only_in_case_is_one_binary(tmp_path, monkeypatch):
     assert [b.name for b in binaries] == ["kernel32.dll", "notepad.exe"]
     assert [b.kind for b in binaries] == ["dll", "exe"]
     # the second spelling is named, never silently dropped
-    assert skipped == [("kernel32.dll", "the same name as kernel32.dll in another case")]
+    assert skipped == [("kernel32.dll", "the same name in another case")]
 
 
 # --- a broken file among 4,000 -------------------------------------------------------------
@@ -663,9 +663,8 @@ def test_a_file_that_is_not_a_pe_is_skipped_with_a_reason_and_the_others_still_e
     binaries, skipped = binary_graph.extract_tree(str(tmp_path))
     assert [b.name for b in binaries] == ["a.dll", "d.dll"]
     assert [name for name, _ in skipped] == ["b.dll", "c.exe"]
-    for _, reason in skipped:
-        assert reason.startswith("not a PE: ") and "Error" not in reason and len(reason) < 120, reason
-    with pytest.raises(binary_graph.ExtractError, match="^not a PE"):
+    assert skipped == [("b.dll", "not a PE"), ("c.exe", "empty file")]
+    with pytest.raises(binary_graph.ExtractError, match="^not a PE$"):
         binary_graph.extract_binary(str(tmp_path / "b.dll"))
 
 
@@ -682,10 +681,10 @@ def test_a_file_that_cannot_be_opened_is_skipped_with_a_reason(tmp_path, monkeyp
     monkeypatch.setattr("builtins.open", refusing_open)
     binaries, skipped = binary_graph.extract_tree(str(tmp_path))
     assert [b.name for b in binaries] == ["fine.dll"]
-    assert skipped == [("locked.dll", "cannot be opened: Permission denied")]
+    assert skipped == [("locked.dll", "cannot be opened")]
     # and a directory that cannot be listed is one skipped entry, not an exception
     assert binary_graph.extract_tree(str(tmp_path / "gone")) == (
-        [], [(str(tmp_path / "gone"), "cannot be listed: No such file or directory")])
+        [], [(str(tmp_path / "gone"), "cannot be listed")])
 
 
 def test_a_pe_truncated_after_its_headers_is_skipped_and_does_not_raise(tmp_path):
@@ -718,7 +717,7 @@ def test_without_pefile_every_file_is_skipped_and_nothing_escapes(tmp_path, monk
     import sys
     (tmp_path / "a.dll").write_bytes(make_pe())
     monkeypatch.setitem(sys.modules, "pefile", None)             # `import pefile` raises ImportError
-    assert binary_graph.extract_tree(str(tmp_path)) == ([], [("a.dll", "cannot be parsed: pefile is not available")])
+    assert binary_graph.extract_tree(str(tmp_path)) == ([], [("a.dll", "pefile is not available")])
 
 
 def test_a_section_one_byte_past_the_end_of_the_file_is_read_as_pefile_reads_it(tmp_path):
@@ -749,7 +748,7 @@ def test_a_directory_pefile_cannot_read_skips_only_when_it_is_one_the_record_nee
 def test_a_file_larger_than_the_cap_is_skipped_unread(tmp_path, monkeypatch):
     (tmp_path / "huge.dll").write_bytes(make_pe())
     monkeypatch.setattr(binary_graph, "MAX_BINARY_SIZE", 0x200)
-    assert binary_graph.extract_tree(str(tmp_path)) == ([], [("huge.dll", "larger than 512 bytes")])
+    assert binary_graph.extract_tree(str(tmp_path)) == ([], [("huge.dll", "larger than the size cap")])
 
 
 def test_no_exception_of_the_parser_escapes_the_tree(tmp_path, monkeypatch):
@@ -765,4 +764,29 @@ def test_no_exception_of_the_parser_escapes_the_tree(tmp_path, monkeypatch):
     monkeypatch.setattr(binary_graph, "_exports", exports)
     binaries, skipped = binary_graph.extract_tree(str(tmp_path))
     assert [b.name for b in binaries] == ["fine.dll"]
-    assert skipped == [("odd.dll", "malformed: ValueError")]
+    assert skipped == [("odd.dll", "malformed")]
+
+
+def test_every_skip_reason_is_a_fixed_string_of_the_vocabulary():
+    # Task 10 counts and groups the reasons: one whose wording drifts with pefile, the OS or its locale cannot be
+    # counted. The file name is in the pair; the library's own message is for whoever opens that one file by hand
+    import ast
+    import inspect
+    assert len(set(binary_graph.REASONS)) == len(binary_graph.REASONS)
+    tree = ast.parse(inspect.getsource(binary_graph))
+    raised = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+              and getattr(node.func, "id", None) == "ExtractError"]
+    assert raised
+    for call in raised:
+        (arg,) = call.args
+        if isinstance(arg, ast.Name):                               # a refused directory: its row of DIRECTORIES
+            assert arg.id == "reason", ast.dump(arg)
+            continue
+        assert isinstance(arg, ast.Constant) and arg.value in binary_graph.REASONS, ast.dump(arg)
+    assert {reason for _, _, reason in binary_graph.DIRECTORIES} <= set(binary_graph.REASONS)
+    tree_fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "extract_tree")
+    assert not [n for n in ast.walk(tree_fn) if isinstance(n, ast.JoinedStr)]
+    literals = {n.value for n in ast.walk(tree_fn) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    literals.discard(ast.get_docstring(tree_fn, clean=False))
+    assert {"cannot be listed", "the same name in another case"} <= literals <= set(binary_graph.REASONS) | {
+        ".dll", ".exe"}
