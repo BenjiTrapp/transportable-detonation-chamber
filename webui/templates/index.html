@@ -19,7 +19,7 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=83">
+    <link rel="stylesheet" href="/static/css/style.css?v=85">
     <link rel="stylesheet" href="/static/css/theme-layout.css?v=5">
     <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=37">
 </head>
@@ -1255,7 +1255,9 @@
             <!-- SYSCALLS Tab: the map of every syscall of ntdll.dll and win32u.dll, one cell each, a band per
                  module (block SYSCALLS of app.js). The toolbar in one line that wraps, the notices (no baseline,
                  NTSleuth missing), the line a scan leaves, then the work area: the map with its legend and the
-                 catalog under it, each scrolling in itself. GRAPH is the binary graph's, switched off for now. -->
+                 catalog under it, each scrolling in itself. The detail panel stands to the right of them, the deviations
+                 and the known hooks under them; below 1400px the map and the detail panel take turns. GRAPH is the
+                 binary graph's, switched off for now. -->
             <div class="tab-content" id="tab-syscalls">
                 <div class="content-header">
                     <h2 data-info="Every syscall of ntdll.dll and win32u.dll as one cell, from the NTSleuth baseline of this build. Choose a process and SCAN to colour each cell with the state its stub is in.">Syscalls</h2>
@@ -1268,6 +1270,10 @@
                     <span class="chart-range syscall-switch" role="group" aria-label="Surface">
                         <button type="button" class="chart-range-btn" id="syscall-view-map" aria-pressed="true" onclick="syscallSetView('map')">MAP</button>
                         <button type="button" class="chart-range-btn" id="syscall-view-graph" aria-pressed="false" disabled title="comes with the binary graph" onclick="syscallSetView('graph')">GRAPH</button>
+                    </span>
+                    <span class="chart-range syscall-switch syscall-pane-switch" role="group" aria-label="Pane">
+                        <button type="button" class="chart-range-btn" id="syscall-pane-map" aria-pressed="true" onclick="syscallSetPane('map')">MAP</button>
+                        <button type="button" class="chart-range-btn" id="syscall-pane-detail" aria-pressed="false" onclick="syscallSetPane('detail')">DETAIL</button>
                     </span>
                     <div class="syscall-group syscall-target-group">
                         <select id="syscall-target" class="filter-select" aria-label="Process to scan" onchange="syscallOnTarget()">
@@ -1287,7 +1293,7 @@
                 </div>
                 <div class="syscall-notices" id="syscall-notices" hidden></div>
                 <div class="syscall-scan-result" id="syscall-scan-result" role="status" hidden></div>
-                <div class="syscall-work" id="syscall-work">
+                <div class="syscall-work" id="syscall-work" data-pane="map">
                     <div class="syscall-main" id="syscall-surface-map">
                         <div class="syscall-map-panel">
                             <div class="syscall-legend" id="syscall-legend"></div>
@@ -1298,6 +1304,29 @@
                             <div class="syscall-catalog-head" id="syscall-catalog-head">Catalog</div>
                             <div class="syscall-rows" id="syscall-rows"></div>
                         </div>
+                    </div>
+                    <section class="syscall-panel syscall-detail" id="syscall-detail" aria-label="Syscall detail">
+                        <div class="syscall-panel-head">
+                            <h3 class="syscall-panel-title" data-info="The syscall chosen on the map or in the catalog: number, address, signature and parameters from the baseline, and after a scan the stub bytes read with the differences marked, the state and who the jump goes to.">DETAIL</h3>
+                        </div>
+                        <div class="syscall-detail-body" id="syscall-detail-body"></div>
+                        <div class="syscall-draft" id="syscall-draft" hidden></div>
+                    </section>
+                    <div class="syscall-lower" id="syscall-lower">
+                        <section class="syscall-panel syscall-deviations" aria-label="Deviations">
+                            <div class="syscall-panel-head">
+                                <h3 class="syscall-panel-title" data-info="Every stub of the last scan that is not as the baseline has it, the loudest first, with the bytes expected and read, the jump target and what it added to the evidence score. Draft rule makes a signature entry from a stub and writes nothing.">DEVIATIONS</h3>
+                                <span class="syscall-panel-note" id="syscall-deviations-head"></span>
+                            </div>
+                            <div class="syscall-panel-body" id="syscall-deviations"></div>
+                        </section>
+                        <section class="syscall-panel syscall-hooks" aria-label="Known hooks">
+                            <div class="syscall-panel-head">
+                                <h3 class="syscall-panel-title" data-info="Hooks recorded as known, as pairs of syscall and owning module for one build and view; a known hook stays on the map and in the list but no longer counts as evidence. Record them only on a host you believe is clean.">KNOWN HOOKS</h3>
+                                <span class="syscall-panel-note" id="syscall-hooks-head"></span>
+                            </div>
+                            <div class="syscall-panel-body" id="syscall-hooks"></div>
+                        </section>
                     </div>
                 </div>
             </div>
@@ -1839,6 +1868,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
     </div>
 
-    <script src="/static/js/app.js?v=122"></script>
+    <script src="/static/js/app.js?v=123"></script>
 </body>
 </html>

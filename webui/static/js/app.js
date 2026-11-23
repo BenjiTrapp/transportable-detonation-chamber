@@ -24809,10 +24809,19 @@ const SYSCALL_STATE_HELP = {
     unreadable: 'No stub could be read.',
 };
 const SYSCALL_MODULES = ['ntdll.dll', 'win32u.dll'];
+// Where a syscall is documented, and where the modules are that Rizin opens
+const SYSCALL_DOC_URL = 'https://ntdoc.m417z.com/';
+const SYSCALL_SYSTEM_DIR = 'C:\\Windows\\System32\\';
+// Below this width the map and the detail panel share the room as two panes
+const SYSCALL_NARROW = '(max-width: 1399px)';
+const SYSCALL_PANE_NAMES = ['map', 'detail'];
+// The deviations list begins with the loudest; a state this tab does not know ranks as diverged
+const SYSCALL_SEVERITY_RANK = { patched: 0, hooked: 1, diverged: 2, unreadable: 3 };
 // The map in px: a cell and the gap between cells, the room around the grid for the ring of the outer
 // cells, the ring a patched or diverged cell gets and its alpha; the alpha of the baseline tone (no scan)
 // and of a cell the filter does not match
-const SYSCALL_MAP = { cell: 10, gap: 2, pad: 3, halo: 2, haloAlpha: 0.35, baseline: 0.75, dim: 0.18 };
+// `reach`: how far a ring of a cell reaches beyond it; what a repaint of one cell clears and draws again
+const SYSCALL_MAP = { cell: 10, gap: 2, pad: 3, halo: 2, haloAlpha: 0.35, baseline: 0.75, dim: 0.18, reach: 3 };
 // The catalog under the map lists this many rows of the filtered baseline; /baseline pages hold at most SYSCALL_PAGE
 const SYSCALL_ROWS_MAX = 300;
 const SYSCALL_PAGE = 500;
@@ -24888,40 +24897,69 @@ function syscallStateColor(state, alpha) {
 // One band onto its canvas context (in CSS px). model: states (Map name → state, or null without a scan), match
 // (Set of the names the filter matches, or null for all), selected and hover (names). The quiet cells first and
 // the deviations after them, so no neighbour paints over a ring.
-function syscallDrawBand(ctx, layout, cells, model) {
+// `only`: the indexes of the cells that changed (a hover moved). Then nothing but their surroundings is drawn
+// again: a cell's rings reach SYSCALL_MAP.reach px beyond it, so the square of that reach round the cell is
+// cleared and drawn again (clipped to it) from the cell and the eight round it, which are all that touch it.
+function syscallDrawBand(ctx, layout, cells, model, only) {
     const { states, match, selected, hover } = model;
     const size = layout.cell;
-    ctx.clearRect(0, 0, layout.width, layout.height);
-    const looks = cells.map(cell => syscallCellLook(states ? states.get(cell.name) : null,
-                                                     match !== null && match !== undefined && !match.has(cell.name)));
-    for (const pass of [false, true]) {
-        for (let i = 0; i < cells.length; i++) {
-            const look = looks[i];
-            if (look.loud !== pass) continue;
-            const { x, y } = syscallCellOrigin(layout, i);
-            ctx.globalAlpha = look.alpha;
-            if (look.halo) {
-                ctx.fillStyle = syscallStateColor(look.state, SYSCALL_MAP.haloAlpha);
-                ctx.fillRect(x - look.halo, y - look.halo, size + 2 * look.halo, size + 2 * look.halo);
-            }
-            if (look.hollow) {
-                ctx.strokeStyle = syscallStateColor(look.state);
-                ctx.lineWidth = 1;
-                ctx.strokeRect(x + 0.5, y + 0.5, size - 1, size - 1);
-            } else {
-                ctx.fillStyle = syscallStateColor(look.state);
-                ctx.fillRect(x, y, size, size);
+    const lookOf = i => syscallCellLook(states ? states.get(cells[i].name) : null,
+                                        match !== null && match !== undefined && !match.has(cells[i].name));
+    const paint = indexes => {
+        const looks = indexes.map(lookOf);
+        for (const pass of [false, true]) {
+            for (let k = 0; k < indexes.length; k++) {
+                const look = looks[k];
+                if (look.loud !== pass) continue;
+                const { x, y } = syscallCellOrigin(layout, indexes[k]);
+                ctx.globalAlpha = look.alpha;
+                if (look.halo) {
+                    ctx.fillStyle = syscallStateColor(look.state, SYSCALL_MAP.haloAlpha);
+                    ctx.fillRect(x - look.halo, y - look.halo, size + 2 * look.halo, size + 2 * look.halo);
+                }
+                if (look.hollow) {
+                    ctx.strokeStyle = syscallStateColor(look.state);
+                    ctx.lineWidth = 1;
+                    ctx.strokeRect(x + 0.5, y + 0.5, size - 1, size - 1);
+                } else {
+                    ctx.fillStyle = syscallStateColor(look.state);
+                    ctx.fillRect(x, y, size, size);
+                }
             }
         }
+        ctx.globalAlpha = 1;
+        for (const [name, color, width] of [[selected, '--text-primary', 2], [hover, '--text-secondary', 1]]) {
+            const index = name ? cells.findIndex(cell => cell.name === name) : -1;
+            if (index < 0 || (only !== undefined && !indexes.includes(index))) continue;
+            const { x, y } = syscallCellOrigin(layout, index);
+            ctx.strokeStyle = themeColor(color);
+            ctx.lineWidth = width;
+            ctx.strokeRect(x - 1.5, y - 1.5, size + 3, size + 3);
+        }
+    };
+    if (only === undefined) {
+        ctx.clearRect(0, 0, layout.width, layout.height);
+        paint(cells.map((_, i) => i));
+        return;
     }
-    ctx.globalAlpha = 1;
-    for (const [name, color, width] of [[selected, '--text-primary', 2], [hover, '--text-secondary', 1]]) {
-        const index = name ? cells.findIndex(cell => cell.name === name) : -1;
-        if (index < 0) continue;
+    const reach = SYSCALL_MAP.reach, side = size + 2 * reach;
+    for (const index of new Set(only)) {
+        if (!(index >= 0 && index < cells.length)) continue;
         const { x, y } = syscallCellOrigin(layout, index);
-        ctx.strokeStyle = themeColor(color);
-        ctx.lineWidth = width;
-        ctx.strokeRect(x - 1.5, y - 1.5, size + 3, size + 3);
+        const near = [], col = index % layout.cols, row = Math.floor(index / layout.cols);
+        for (let r = row - 1; r <= row + 1; r++) {
+            for (let c = col - 1; c <= col + 1; c++) {
+                const i = r * layout.cols + c;
+                if (r >= 0 && c >= 0 && c < layout.cols && i < cells.length) near.push(i);
+            }
+        }
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(x - reach, y - reach, side, side);
+        ctx.clip();
+        ctx.clearRect(x - reach, y - reach, side, side);
+        paint(near);
+        ctx.restore();
     }
 }
 
@@ -25105,6 +25143,316 @@ function syscallScanSummary(scan) {
     return text;
 }
 
+// --- The detail panel, the deviation list and the rule draft: markup from what the baseline, the target and a
+// drafted rule hold. Every string of them goes through escapeHtml; a rule is shown as text, never as markup. ---
+
+// A hex string as its bytes ('4c8b' → ['4c', '8b']); null for anything that is not whole bytes of hex
+function syscallBytesOf(hex) {
+    const text = typeof hex === 'string' ? hex.trim().toLowerCase() : '';
+    return /^(?:[0-9a-f]{2})+$/.test(text) ? text.match(/../g) : null;
+}
+
+// The bytes of `own` as markup, the runs that differ from `other` marked and the rest plain. Without an `other`
+// (null, or not hex) nothing is marked; a byte past the end of `other` differs. '' for what is not bytes.
+function syscallBytesHtml(own, other) {
+    const mine = syscallBytesOf(own);
+    if (!mine) return '';
+    const theirs = syscallBytesOf(other);
+    const runs = [];
+    mine.forEach((byte, i) => {
+        const differs = theirs !== null && byte !== theirs[i];
+        const last = runs[runs.length - 1];
+        if (last && last.differs === differs) last.text += byte;
+        else runs.push({ differs, text: byte });
+    });
+    return runs.map(r => `<span class="syscall-bytes-${r.differs ? 'diff' : 'same'}">${escapeHtml(r.text)}</span>`).join('');
+}
+
+// How many bytes of `a` and `b` differ, over the longer of the two; 0 when either is not bytes
+function syscallBytesDiffer(a, b) {
+    const left = syscallBytesOf(a), right = syscallBytesOf(b);
+    if (!left || !right) return 0;
+    let n = 0;
+    for (let i = 0; i < Math.max(left.length, right.length); i++) if (left[i] !== right[i]) n++;
+    return n;
+}
+
+// Who a jump goes to: a module by name, memory no file backs, or nobody that could be found out
+function syscallOwnerHtml(owner) {
+    if (owner === 'private') return '<span class="syscall-owner syscall-owner-private">private</span> memory, no file backs it';
+    if (typeof owner === 'string' && owner) return `<span class="syscall-owner">${escapeHtml(owner)}</span>`;
+    return '<span class="syscall-owner syscall-owner-unresolved">unresolved</span>';
+}
+
+// The signature as one text to copy: the return type, the name and each parameter with its SAL annotation. A baseline
+// extracted without the symbol server has no parameters to list, which is not the same as none.
+function syscallSignature(sc) {
+    const name = String(sc.name ?? '');
+    const ret = String(sc.return_type || '?');
+    const params = Array.isArray(sc.parameters) ? sc.parameters.filter(p => p && typeof p === 'object') : [];
+    if (!params.length) return `${ret} ${name}(${sc.symbols === false ? '/* parameters unknown */' : 'VOID'});`;
+    const lines = params.map(p => '    ' + [p.sal_annotation, p.type, p.name]
+        .filter(v => v !== undefined && v !== null && v !== '').map(String).join(' '));
+    return `${ret} ${name}(\n${lines.join(',\n')}\n);`;
+}
+
+// One syscall as the detail panel shows it. `sc` is what /api/syscalls/<name> returns, with what a scan measured
+// of it (state, pattern, target_owner, expected, actual, number_matches, allowlisted) and what the panel knows
+// (symbols: false when the baseline was extracted without the symbol server; scanned: false when a scan did not
+// cover this syscall; rizin: true when it can be opened in Rizin, rizin_note: why not). Nothing of it is markup.
+function renderSyscallDetail(sc) {
+    if (!sc || typeof sc !== 'object') return '<p class="syscall-empty">Choose a syscall on the map or in the catalog.</p>';
+    const name = String(sc.name ?? '');
+    const state = typeof sc.state === 'string' ? sc.state : '';
+    const known = Object.prototype.hasOwnProperty.call(SYSCALL_STATE_COLORS, state);
+    const fact = (label, value) => `<dt>${label}</dt><dd>${value}</dd>`;
+    const hasNumber = sc.number !== undefined && sc.number !== null && Number.isFinite(Number(sc.number));
+    const facts = [];
+    facts.push(fact('Number', hasNumber ? `${escapeHtml(syscallHex(sc.number))} (${escapeHtml(sc.number)})` : escapeHtml(sc.number)));
+    facts.push(fact('Module', escapeHtml(sc.module)));
+    if (sc.rva !== undefined && sc.rva !== null) facts.push(fact('RVA', escapeHtml(syscallHex(sc.rva))));
+    if (sc.return_type) facts.push(fact('Returns', escapeHtml(sc.return_type)));
+    if (sc.calling_convention) facts.push(fact('Convention', escapeHtml(sc.calling_convention)));
+    if (sc.build || sc.view) facts.push(fact('Baseline', escapeHtml([sc.build && `build ${sc.build}`, sc.view].filter(Boolean).join(' · '))));
+
+    let html = `<div class="syscall-detail-name"><span class="syscall-row-dot syscall-state-${cssToken(state || 'baseline')}"></span>` +
+               `<span class="syscall-detail-sc">${escapeHtml(name)}</span>` +
+               (state ? `<span class="syscall-detail-state">${escapeHtml(state)}</span>` : '') + '</div>' +
+               `<dl class="syscall-facts">${facts.join('')}</dl>`;
+
+    if (sc.scanned === false) {
+        html += '<p class="syscall-detail-note">This syscall is not part of the last scan (win32u is left out unless it is asked for).</p>';
+    }
+    const jumps = state === 'hooked' || state === 'patched' || state === 'diverged';
+    if (state) {
+        let finding = `<div class="syscall-finding-help">${escapeHtml(known ? SYSCALL_STATE_HELP[state]
+            : 'A state this tab does not know: it is read as diverged and never as quiet.')}</div>`;
+        const rows = [];
+        if (jumps) {
+            rows.push(fact('Jump target', syscallOwnerHtml(sc.target_owner)));
+            if (sc.pattern) rows.push(fact('Pattern', escapeHtml(sc.pattern)));
+            // number_matches is true, false or null: null is a jump over the prologue, which shows no number
+            if (sc.number_matches === true) rows.push(fact('Number', 'The live bytes carry the number of the baseline.'));
+            else if (sc.number_matches === false) rows.push(fact('Number', '<strong class="syscall-number-differs">The live bytes do NOT carry the number of the baseline: the stub names another syscall.</strong> That is a finding of its own.'));
+            else rows.push(fact('Number', 'The live bytes do not show a number: a jump overwrote the prologue.'));
+        }
+        if (rows.length) finding += `<dl class="syscall-facts">${rows.join('')}</dl>`;
+        if (state === 'hooked' && sc.allowlisted === true) {
+            finding += `<p class="syscall-known-hook">Known hook: ${syscallOwnerHtml(sc.target_owner)} is on the hook allowlist for this build and view, ` +
+                       'so this hook does not score. It stays listed on purpose: it is there, and an EDR that hooks ntdll in this process is worth knowing.</p>';
+        }
+        html += `<div class="syscall-finding syscall-finding-${cssToken(state)}">${finding}</div>`;
+    }
+
+    // the stub: the baseline's bytes as far as they are compared, and after a scan the bytes read, the differences marked
+    const baselineHex = typeof sc.expected === 'string' ? sc.expected : typeof sc.stub_hex === 'string' ? sc.stub_hex : '';
+    const baselineBytes = syscallBytesOf(baselineHex);
+    const prefix = Number(sc.prefix_len) > 0 && baselineBytes ? baselineBytes.slice(0, Number(sc.prefix_len)).join('') : baselineHex;
+    const measured = state !== '';
+    const readBytes = measured ? syscallBytesOf(sc.actual) : null;
+    const compared = syscallBytesOf(prefix) ? syscallBytesOf(prefix).length : 0;
+    if (compared) {
+        let stub = `<div class="syscall-stub-line"><span class="syscall-stub-label">baseline</span><code class="syscall-bytes" title="${escapeHtml(prefix)}">${syscallBytesHtml(prefix, readBytes ? sc.actual : null)}</code></div>`;
+        if (readBytes) {
+            stub += `<div class="syscall-stub-line"><span class="syscall-stub-label">read</span><code class="syscall-bytes" title="${escapeHtml(sc.actual)}">${syscallBytesHtml(sc.actual, prefix)}</code></div>`;
+        }
+        let note = `${compared} bytes compared`;
+        if (readBytes) {
+            const differ = syscallBytesDiffer(prefix, sc.actual);
+            note += differ ? `, ${differ} differ` : ', all alike';
+            if (state === 'unreadable') note += ' · the stub reads as zeros, or too short to compare: a page that is not paged in, or a wiped stub';
+        } else if (state === 'unreadable' || measured) {
+            note += ' · No bytes could be read.';
+        }
+        html += `<div class="syscall-section"><div class="syscall-section-title">STUB</div>${stub}<div class="syscall-stub-note">${escapeHtml(note)}</div></div>`;
+    } else if (measured && readBytes) {
+        html += `<div class="syscall-section"><div class="syscall-section-title">STUB</div><div class="syscall-stub-line"><span class="syscall-stub-label">read</span>` +
+                `<code class="syscall-bytes" title="${escapeHtml(sc.actual)}">${syscallBytesHtml(sc.actual, null)}</code></div></div>`;
+    }
+
+    const params = Array.isArray(sc.parameters) ? sc.parameters : [];
+    let rows = params.map((p, i) => {
+        const param = p && typeof p === 'object' ? p : {};
+        return `<tr><td class="view-table-num" data-sort-value="${i}">${i}</td><td>${escapeHtml(param.type)}</td>` +
+               `<td>${escapeHtml(param.name)}</td><td>${escapeHtml(param.sal_annotation)}</td></tr>`;
+    }).join('');
+    if (!params.length) {
+        const why = sc.symbols === false ? 'The parameter table of this baseline is incomplete: it was extracted without the symbol server.'
+                                         : 'This syscall takes no parameters.';
+        rows = `<tr data-sort-skip><td colspan="4" class="view-table-empty">${escapeHtml(why)}</td></tr>`;
+    }
+    html += '<div class="syscall-section"><div class="syscall-section-title">PARAMETERS</div><div class="view-table-wrap">' +
+            '<table class="view-table" data-sortable data-sort-id="syscall-params"><thead><tr><th>#</th><th>TYPE</th><th>NAME</th><th>SAL</th></tr></thead>' +
+            `<tbody>${rows}</tbody></table></div></div>`;
+    html += '<div class="syscall-section"><div class="syscall-section-title">SIGNATURE ' +
+            '<button type="button" class="btn btn-xs" onclick="syscallCopySignature()" title="Copy the signature">Copy</button></div>' +
+            `<pre class="syscall-signature">${escapeHtml(syscallSignature(sc))}</pre></div>`;
+
+    let links = '';
+    if (name) {
+        links += `<a class="btn btn-sm" href="${escapeHtml(SYSCALL_DOC_URL + encodeURIComponent(name).toLowerCase())}" target="_blank" ` +
+                 'rel="noopener noreferrer" title="Documentation on ntdoc.m417z.com (opens in a new tab, needs a network)">ntdoc</a> ';
+    }
+    if (sc.rizin === true) {
+        links += '<button type="button" class="btn btn-sm" onclick="syscallOpenRizin()" title="Open the module in the RIZIN tab and go to this syscall">Open in Rizin</button>';
+    } else if (sc.rizin_note) {
+        links += `<span class="syscall-detail-note">${escapeHtml(sc.rizin_note)}</span>`;
+    }
+    if (links) html += `<div class="syscall-links">${links}</div>`;
+    return html;
+}
+
+// The deviations of a scan as a table, the loudest first. `list` is what /scan holds under `deviations`: every state
+// but intact, unreadable and diverged included, so a row is not always a finding. options: scanned (false: no scan
+// yet), selected (a name), scores (name → what the stub added to the evidence score). A hook the allowlist knows
+// stays in the list, with its owner, and says that it does not score: an EDR that hooks ntdll in this process is
+// something to see, even though it is not evidence.
+function renderSyscallDeviations(list, options) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const scores = opts.scores && typeof opts.scores === 'object' ? opts.scores : {};
+    const rank = d => Object.prototype.hasOwnProperty.call(SYSCALL_SEVERITY_RANK, d.state)
+        ? SYSCALL_SEVERITY_RANK[d.state] : SYSCALL_SEVERITY_RANK.diverged;
+    const items = (Array.isArray(list) ? list : []).filter(d => d && typeof d === 'object')
+        .sort((a, b) => rank(a) - rank(b) || (Number(a.number) - Number(b.number)) || 0);
+    const drawable = d => (d.state === 'hooked' || d.state === 'patched' || d.state === 'diverged')
+        && d.allowlisted !== true && typeof d.actual === 'string' && d.actual !== '';
+    const rows = items.slice(0, SYSCALL_ROWS_MAX).map(d => {
+        const name = String(d.name ?? '');
+        const state = String(d.state ?? '');
+        const known = state === 'hooked' && d.allowlisted === true;
+        const own = Object.prototype.hasOwnProperty.call(scores, name) ? Number(scores[name]) : NaN;
+        let score;
+        if (known) {
+            score = '<td data-sort-value="0"><span class="syscall-known" title="This hook is on the hook allowlist for this build and view. ' +
+                    'It stays listed because it is there, but it does not score.">on the allowlist · not scored</span></td>';
+        } else if (Number.isFinite(own)) {
+            score = `<td class="view-table-num" data-sort-value="${own}">+${own.toFixed(2)}</td>`;
+        } else {
+            score = '<td class="view-table-num" data-sort-value="-1" title="Not scored: a patched stub and a hook that is not on the allowlist score, a diverged or unreadable stub does not">–</td>';
+        }
+        const bytes = (own, other) => (typeof own === 'string' && syscallBytesOf(own)
+            ? `<code class="syscall-bytes view-table-clip" title="${escapeHtml(own)}">${syscallBytesHtml(own, other)}</code>` : '<span class="syscall-muted">–</span>');
+        return `<tr${name === opts.selected ? ' class="selected"' : ''}>` +
+            `<td data-sort-value="${escapeHtml(name)}"><button type="button" class="syscall-link" onclick="syscallSelect(${jsArg(name)})">${escapeHtml(name)}</button>` +
+            (d.number_matches === false ? ' <span class="syscall-flag" title="The live bytes carry another syscall number than the baseline">number differs</span>' : '') + '</td>' +
+            `<td class="view-table-num" data-sort-value="${escapeHtml(d.number)}">${escapeHtml(syscallHex(d.number))}</td>` +
+            `<td data-sort-value="${rank(d)}"><span class="syscall-row-dot syscall-state-${cssToken(state)}"></span> ${escapeHtml(state)}</td>` +
+            `<td>${bytes(d.expected, d.actual)}</td><td>${bytes(d.actual, d.expected)}</td>` +
+            `<td title="${escapeHtml(d.pattern || '')}">${state === 'unreadable' ? '<span class="syscall-muted">–</span>' : syscallOwnerHtml(d.target_owner)}</td>` +
+            score +
+            `<td>${drawable(d) ? `<button type="button" class="btn btn-xs" onclick="syscallDraftRule(${jsArg(name)})" title="Draft a signature entry from this stub. Nothing is written.">Draft rule</button>` : ''}</td></tr>`;
+    });
+    if (!items.length) {
+        const why = opts.scanned === false ? 'Scan a process to list the stubs that deviate from the baseline.' : 'No deviations: every stub measured is as the baseline has it.';
+        rows.push(`<tr data-sort-skip><td colspan="8" class="view-table-empty">${escapeHtml(why)}</td></tr>`);
+    } else if (items.length > SYSCALL_ROWS_MAX) {
+        const more = `Showing the first ${SYSCALL_ROWS_MAX} of ${items.length.toLocaleString('en-US')}, the loudest first.`;
+        rows.push(`<tr data-sort-skip><td colspan="8" class="view-table-empty">${escapeHtml(more)}</td></tr>`);
+    }
+    return '<table class="view-table" data-sortable data-sort-id="syscall-deviations"><thead><tr><th>SYSCALL</th><th>NUMBER</th><th>STATE</th>' +
+           `<th>BASELINE</th><th>READ</th><th>JUMP TARGET</th><th>SCORE</th><th></th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
+}
+
+// A rule that was drafted, as the panel shows it. `draft` is what /api/syscalls/rule answers: a YARA rule ({ name,
+// text, target }, kind 'yara' or none) or a signature entry ({ kind: 'signature', entry, text, target, covered_by }).
+// The text is the one thing in it that a sample writes, and it is set as text, never as markup. A draft only drafts:
+// a YARA rule is applied (written where Rustinel reads, now, on this VM) or downloaded (handed back for the repo, where
+// it survives a rebuilt VM) by a press of its own button, and the two say what they do. options: busy (an apply is
+// under way), note ({ tone, text }: what the last apply answered).
+function showSyscallRuleDraft(draft, options) {
+    const d = draft && typeof draft === 'object' ? draft : {};
+    const opts = options && typeof options === 'object' ? options : {};
+    const signature = d.kind === 'signature';
+    const name = String(d.name ?? '');
+    const text = String(d.text ?? '');
+    const target = String(d.target ?? '');
+    const title = signature ? String(d.entry && d.entry.family || 'Signature entry') : name || 'Rule';
+    let html = '<section class="syscall-draft-card" aria-label="Rule draft"><div class="syscall-panel-head"><h3 class="syscall-panel-title">RULE DRAFT</h3>' +
+               '<button type="button" class="btn btn-xs" onclick="syscallCopyDraft()" title="Copy the text of the draft">Copy</button>' +
+               '<button type="button" class="btn btn-xs" onclick="syscallCloseDraft()" title="Close the draft">Close</button></div>' +
+               `<div class="syscall-draft-name">${escapeHtml(title)}</div>` +
+               `<div class="syscall-draft-meta">${signature ? 'Signature entry' : 'YARA rule'}${target ? ` · ${escapeHtml(target)}` : ''}</div>` +
+               `<pre class="syscall-draft-text">${escapeHtml(text)}</pre>`;
+    const note = opts.note && typeof opts.note === 'object' && opts.note.text ? opts.note : null;
+    if (signature) {
+        html += `<p class="syscall-draft-hint">Add this entry by hand to <code>${escapeHtml(target || 'webui/syscall_signatures.json')}</code> after replacing any address or displacement in the pattern. Nothing has been written.</p>`;
+        const covered = Array.isArray(d.covered_by) ? d.covered_by.filter(c => c && typeof c === 'object') : [];
+        if (covered.length) {
+            html += '<p class="syscall-draft-hint">Already covered by an entry of that file: ' +
+                    covered.map(c => `${escapeHtml(c.family)} (${escapeHtml(c.pattern)}, ${escapeHtml(c.match)})`).join('; ') + '.</p>';
+        }
+    } else if (name) {
+        const file = target || `${name}.yar`;
+        if (!note) html += '<p class="syscall-draft-hint">Nothing has been written yet. Choose what happens to this rule:</p>';
+        html += '<div class="syscall-draft-actions">' +
+            '<div class="syscall-draft-action syscall-draft-vm"><div class="syscall-draft-action-title">ON THIS VM · now</div>' +
+            `<p>Writes <code>${escapeHtml(file)}</code> into the folder Rustinel reads its rules from. Rustinel loads it within about 2 seconds, without a restart. ` +
+            'A rebuilt VM does not have it.</p>' +
+            `<button type="button" class="btn btn-sm btn-primary" onclick="applySyscallRule(${jsArg(name)})"${opts.busy ? ' disabled' : ''}>APPLY TO THIS VM</button></div>` +
+            '<div class="syscall-draft-action syscall-draft-repo"><div class="syscall-draft-action-title">IN THE REPO · permanent</div>' +
+            '<p>Saves the same rule as a file and writes nothing on this VM. Commit it under <code>rules/yara/</code>: only a committed copy survives a rebuilt VM.</p>' +
+            `<a class="btn btn-sm btn-outline" href="${escapeHtml(`/api/syscalls/rule/download?name=${encodeURIComponent(name)}&text=${encodeURIComponent(text)}`)}" ` +
+            `download="${escapeHtml(`${name}.yar`)}">DOWNLOAD FOR THE REPO</a></div></div>`;
+    }
+    if (note) html += `<div class="syscall-draft-result syscall-draft-result-${cssToken(note.tone)}" role="status">${escapeHtml(note.text)}</div>`;
+    return html + '</section>';
+}
+
+// The sentence under the warning of the hook control: what pressing it records, and what that costs when the host is not clean
+function syscallHookWarning(scan) {
+    const what = scan && scan.pid
+        ? `This records the hooks that PID ${scan.pid}${scan.name ? ` (${scan.name})` : ''} shows as known, whoever installed them: from then on they stop counting as evidence in every process on this host, `
+        : 'Scan a process first. This records the hooks of that run as known, whoever installed them, so that from then on they stop counting as evidence in every process on this host, ';
+    return what + 'and recording the hooks of an infected host hides real findings until the list is cleared. A patched stub is never recorded.';
+}
+
+function syscallCaptureQuestion(scan) {
+    const n = Number(scan && scan.hookable) || 0;
+    return 'Record the hooks of this run as known?\n\n' +
+           `PID ${scan && scan.pid}${scan && scan.name ? ` (${scan.name})` : ''} shows ${n} hooked stub${n === 1 ? '' : 's'} that ${n === 1 ? 'is' : 'are'} not known yet. ` +
+           'From then on they stop counting as evidence in every process on this host, whoever installed them.\n\n' +
+           'Only do this on a host you believe is clean: recording the hooks of an infected host hides real findings until the list is cleared.';
+}
+
+// The hooks that are known on this host, and the control that records more. state: entries ({ syscall, owner, build,
+// view }), loaded, problem (the file cannot be used), error (the list could not be read), note ({ tone, text }), busy,
+// scope ({ build, view } of the baseline on the map, or null) and scan ({ pid, name, hookable: hooked stubs of the last
+// scan that are not known yet, allowlist: what that scan says about the list }, or null before a scan). The control
+// records the hooks of THIS RUN and says that this is only for a host believed to be clean.
+function renderHookAllowlist(state) {
+    const st = state && typeof state === 'object' ? state : {};
+    const scan = st.scan && typeof st.scan === 'object' ? st.scan : null;
+    const entries = Array.isArray(st.entries) ? st.entries.filter(e => e && typeof e === 'object') : [];
+    const notices = [];
+    if (st.error) notices.push({ kind: 'hooks-error', tone: 'error', title: 'Known hooks unavailable', text: String(st.error) });
+    if (st.problem) notices.push({ kind: 'hooks-problem', tone: 'error', title: 'Hook allowlist unusable', text: String(st.problem) });
+    if (scan && scan.allowlist && scan.allowlist.applied === false && scan.allowlist.reason) {
+        notices.push({ kind: 'hooks-not-applied', tone: 'warn', title: 'Allowlist not applied to the last scan', text: String(scan.allowlist.reason) });
+    }
+    let rows = entries.map(e => `<tr><td>${escapeHtml(e.syscall)}</td><td>${escapeHtml(e.owner)}</td><td>${escapeHtml(e.build)}</td><td>${escapeHtml(e.view)}</td></tr>`).join('');
+    if (!entries.length) {
+        const why = st.loaded ? 'No hook is recorded as known: every hook a scan finds is scored.' : (st.error ? 'The list could not be read.' : 'Loading the known hooks…');
+        rows = `<tr data-sort-skip><td colspan="4" class="view-table-empty">${escapeHtml(why)}</td></tr>`;
+    }
+    const hookable = scan ? Number(scan.hookable) || 0 : 0;
+    const record = !scan || hookable === 0 || st.busy === true;
+    const recordTitle = !scan ? 'Scan a process first: the hooks of that run are what gets recorded'
+        : hookable === 0 ? 'The last scan found no hook that is not known already' : 'Record the hooks of the last scan as known (asks first)';
+    const forgetThis = !st.scope || !entries.length || st.busy === true;
+    const forgetAll = !entries.length || st.busy === true;
+    return syscallNoticesHtml(notices) +
+        '<div class="view-table-wrap"><table class="view-table" data-sortable data-sort-id="syscall-hooks"><thead><tr><th>SYSCALL</th><th>OWNER</th><th>BUILD</th><th>VIEW</th></tr></thead>' +
+        `<tbody>${rows}</tbody></table></div>` +
+        '<div class="syscall-hook-capture">' +
+        `<p class="syscall-hook-warning" role="note"><strong>Only on a host you believe is clean.</strong> ${escapeHtml(syscallHookWarning(scan))}</p>` +
+        '<div class="syscall-hook-actions">' +
+        `<button type="button" class="btn btn-sm syscall-hook-record" onclick="syscallCaptureHooks()"${record ? ' disabled' : ''} title="${escapeHtml(recordTitle)}">RECORD THE HOOKS OF THIS RUN AS KNOWN</button>` +
+        `<button type="button" class="btn btn-sm" onclick="syscallClearHooks('this')"${forgetThis ? ' disabled' : ''} title="Forget the known hooks of the build and view on the map">FORGET THIS BUILD AND VIEW</button>` +
+        `<button type="button" class="btn btn-sm" onclick="syscallClearHooks('all')"${forgetAll ? ' disabled' : ''} title="Forget every known hook, of every build and view">FORGET ALL</button>` +
+        '</div></div>' +
+        (st.note && st.note.text ? `<div class="syscall-draft-result syscall-draft-result-${cssToken(st.note.tone)}" role="status">${escapeHtml(st.note.text)}</div>` : '');
+}
+
 const SYSCALL_VIEW_NAMES = ['map', 'graph'];
 const syscallState = {
     ready: false,
@@ -25116,7 +25464,13 @@ const syscallState = {
     // The last scan: its answer, the state of each measured syscall (name → state) and the line under the toolbar
     scan: null, states: null, scanning: false, note: null,
     query: '', module: '', match: null,
-    selected: '', hover: '',
+    selected: '', hover: '', hoverAt: null,
+    // The syscall of the detail panel: its lookup, as the server answered it; the rule drafted last ({ draft, note,
+    // busy } or { error }); the known hooks and what the last recording or forgetting said
+    detail: { name: '', data: null, error: '', loading: false }, detailSeq: 0,
+    draft: null, draftSeq: 0,
+    hooks: { entries: [], loaded: false, problem: '', error: '', note: null, busy: false },
+    pane: 'map',
     view: 'map',
     targets: {}, target: '',
     timer: null,
@@ -25312,9 +25666,33 @@ function syscallPaintCanvas(canvas) {
     syscallState.layouts.set(band.module, layout);
     const ctx = canvas.getContext('2d');
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-    syscallDrawBand(ctx, layout, band.items, {
-        states: syscallState.states, match: syscallState.match, selected: syscallState.selected, hover: syscallState.hover,
-    });
+    syscallDrawBand(ctx, layout, band.items, syscallModel());
+}
+
+// What the map draws: the states of the scan, the filter, the cell chosen and the cell under the pointer
+function syscallModel() {
+    return { states: syscallState.states, match: syscallState.match, selected: syscallState.selected, hover: syscallState.hover };
+}
+
+// The cells that changed, as [{ module, index }] (a null is left out): only their own bands are drawn again, and in
+// them only the cells round those. A band that was not drawn yet is drawn whole.
+function syscallRepaintCells(at) {
+    const host = document.getElementById('syscall-map');
+    if (!host) return;
+    const byModule = new Map();
+    for (const cell of at) {
+        if (!cell) continue;
+        if (!byModule.has(cell.module)) byModule.set(cell.module, []);
+        byModule.get(cell.module).push(cell.index);
+    }
+    for (const canvas of host.querySelectorAll('canvas')) {
+        const indexes = byModule.get(canvas.dataset.module);
+        if (!indexes) continue;
+        const band = syscallState.bands.find(b => b.module === canvas.dataset.module);
+        const layout = syscallState.layouts.get(canvas.dataset.module);
+        if (!band || !layout) syscallPaintCanvas(canvas);
+        else syscallDrawBand(canvas.getContext('2d'), layout, band.items, syscallModel(), indexes);
+    }
 }
 
 function renderSyscallMap() {
@@ -25405,6 +25783,11 @@ function syscallRenderAll() {
     renderSyscallLegend();
     renderSyscallMap();
     renderSyscallRows();
+    syscallSyncDetail();
+    renderSyscallDetailPanel();
+    renderSyscallDeviationPanel();
+    renderSyscallDraft();
+    renderSyscallHooks();
 }
 
 // The filter changed (or the baseline did): which cells match, then the map and the catalog
@@ -25428,6 +25811,11 @@ function syscallSelect(name) {
     syscallState.selected = String(name || '');
     renderSyscallMap();
     renderSyscallRows();
+    renderSyscallDeviationPanel();
+    const body = document.getElementById('syscall-detail-body');
+    if (body) body.scrollTop = 0;
+    syscallLoadDetail(syscallState.selected);
+    if (syscallState.selected && typeof window.matchMedia === 'function' && window.matchMedia(SYSCALL_NARROW).matches) syscallSetPane('detail');
 }
 
 // The cell under a pointer event on the map: { band, item, index } or null
@@ -25470,15 +25858,19 @@ function syscallOnMapMove(event) {
     syscallShowTip(hit, event);
     const name = hit ? hit.item.name : '';
     if (name === syscallState.hover) return;
+    const previous = syscallState.hoverAt;
     syscallState.hover = name;
-    renderSyscallMap();
+    syscallState.hoverAt = hit ? { module: hit.band.module, index: hit.index } : null;
+    syscallRepaintCells([previous, syscallState.hoverAt]);
 }
 
 function syscallOnMapLeave() {
     syscallHideTip();
     if (!syscallState.hover) return;
+    const previous = syscallState.hoverAt;
     syscallState.hover = '';
-    renderSyscallMap();
+    syscallState.hoverAt = null;
+    syscallRepaintCells([previous]);
 }
 
 function syscallOnMapClick(event) {
@@ -25529,6 +25921,329 @@ async function runSyscallScan() {
     syscallRenderAll();
 }
 
+// --- The detail panel, the deviation list, the rule draft and the known hooks ---------------------------------
+
+// The syscall of the detail panel as renderSyscallDetail wants it: its lookup, and what the last scan measured of
+// it. A scan that did not cover it (win32u is left out unless asked for) is told apart from one that found nothing.
+function syscallDetailModel() {
+    const detail = syscallState.detail, baseline = syscallState.baseline, scan = syscallState.scan;
+    if (!detail.data) return null;
+    const model = { ...detail.data };
+    if (baseline) model.symbols = baseline.symbols;
+    if (scan) {
+        const measured = scan.states && Object.prototype.hasOwnProperty.call(scan.states, detail.name) ? scan.states[detail.name] : null;
+        if (measured && typeof measured === 'object') {
+            for (const key of ['state', 'pattern', 'target_owner', 'expected', 'actual', 'number_matches', 'allowlisted']) {
+                if (key in measured) model[key] = measured[key];
+            }
+        } else {
+            model.scanned = false;
+        }
+    }
+    const rizin = syscallRizinTarget();
+    if (rizin && rizin.path) model.rizin = true;
+    else if (rizin) model.rizin_note = rizin.note;
+    return model;
+}
+
+// Where Rizin can open the module of the chosen syscall: the module on this host, but only for the view that file
+// shows by itself. An ARM64X file is two views, and Rizin shows the native one: for the emulated x64 view of an
+// arm64 host it would show other bytes at other addresses, so it is not offered.
+function syscallRizinTarget() {
+    const data = syscallState.detail.data, baseline = syscallState.baseline, status = syscallState.status;
+    if (!data || !baseline || !status || !status.default_view || !/^[A-Za-z0-9_]+\.dll$/.test(String(data.module || ''))) return null;
+    if (baseline.view !== status.default_view) {
+        return { path: null, note: `Rizin shows the native view of ${data.module} (${status.default_view}), not the ${baseline.view} view of this syscall.` };
+    }
+    return { path: SYSCALL_SYSTEM_DIR + data.module, note: '' };
+}
+
+function renderSyscallDetailPanel() {
+    const host = document.getElementById('syscall-detail-body');
+    if (!host) return;
+    const detail = syscallState.detail;
+    let html;
+    if (!syscallState.selected || !detail.name) html = renderSyscallDetail(null);
+    else if (detail.loading) html = `<p class="syscall-empty">Loading ${escapeHtml(detail.name)}…</p>`;
+    else if (detail.error) html = `<p class="syscall-empty syscall-empty-error">${escapeHtml(detail.error)}</p>`;
+    else html = renderSyscallDetail(syscallDetailModel());
+    const top = host.scrollTop;
+    host.innerHTML = html;
+    host.scrollTop = top;
+}
+
+// The lookup of one syscall in the view of the map. A newer choice overtakes the answer of an older one.
+async function syscallLoadDetail(name) {
+    const seq = ++syscallState.detailSeq;
+    if (!name) {
+        syscallState.detail = { name: '', data: null, error: '', loading: false };
+        renderSyscallDetailPanel();
+        return false;
+    }
+    syscallState.detail = { name, data: null, error: '', loading: true };
+    renderSyscallDetailPanel();
+    const view = syscallState.baseline ? syscallState.baseline.view : '';
+    const r = await syscallApi(`/api/syscalls/${encodeURIComponent(name)}${view ? `?view=${encodeURIComponent(view)}` : ''}`);
+    if (seq !== syscallState.detailSeq) return false;
+    syscallState.detail = r.ok ? { name, data: r.data, error: '', loading: false } : { name, data: null, error: syscallErrorText(r), loading: false };
+    renderSyscallDetailPanel();
+    return r.ok;
+}
+
+// The panel follows the map: a syscall that is gone from the baseline leaves it, and one that was read in another
+// view than the baseline now shows is read again in this one (its address and its bytes are the view's)
+function syscallSyncDetail() {
+    const detail = syscallState.detail, baseline = syscallState.baseline;
+    if (!syscallState.selected) {
+        if (detail.name) {
+            syscallState.detailSeq++;
+            syscallState.detail = { name: '', data: null, error: '', loading: false };
+        }
+    } else if (detail.data && baseline && detail.data.view && detail.data.view !== baseline.view) {
+        syscallLoadDetail(syscallState.selected);
+    }
+}
+
+function syscallCopyText(text) {
+    if (typeof navigator === 'undefined' || !navigator.clipboard) return false;
+    const value = String(text ?? '');
+    navigator.clipboard.writeText(value).then(() => showToast('info', 'Copied', `${value.length.toLocaleString('en-US')} characters`),
+                                              () => showToast('error', 'Not copied', 'The browser refused the clipboard.'));
+    return true;
+}
+
+function syscallCopySignature() {
+    const model = syscallDetailModel();
+    return model ? syscallCopyText(syscallSignature(model)) : false;
+}
+
+function syscallCopyDraft() {
+    const st = syscallState.draft;
+    return st && st.draft ? syscallCopyText(st.draft.text) : false;
+}
+
+// Open in Rizin: the module of the syscall in the RIZIN tab, then the syscall's name as the place to go to. Rizin
+// resolves the name (or says it cannot, in its own note).
+async function syscallOpenRizin() {
+    const target = syscallRizinTarget(), name = syscallState.selected;
+    if (!target || !target.path || !name) return false;
+    if (!(await openInRizin(target.path))) return false;
+    return rizinSeek(name, 'syscalls');
+}
+
+// What each stub of the scan added to the evidence score, by syscall name (a syscall that is not in it was not scored)
+function syscallScores(scan) {
+    const scores = Object.create(null);
+    const findings = scan && scan.evidence && Array.isArray(scan.evidence.findings) ? scan.evidence.findings : [];
+    for (const f of findings) {
+        if (f && typeof f.kind === 'string' && f.kind.startsWith('syscall_stub_') && typeof f.syscall === 'string' && Number.isFinite(f.score)) {
+            scores[f.syscall] = (scores[f.syscall] || 0) + f.score;
+        }
+    }
+    return scores;
+}
+
+function renderSyscallDeviationPanel() {
+    const host = document.getElementById('syscall-deviations');
+    const head = document.getElementById('syscall-deviations-head');
+    const scan = syscallState.scan;
+    const list = scan && Array.isArray(scan.deviations) ? scan.deviations : [];
+    if (head) {
+        const total = scan ? SYSCALL_STATES.reduce((sum, s) => sum + (Number((scan.counts || {})[s]) || 0), 0) : 0;
+        head.textContent = scan ? `${list.length.toLocaleString('en-US')} of ${total.toLocaleString('en-US')} measured` : '';
+    }
+    if (!host) return;
+    const top = host.scrollTop;
+    host.innerHTML = renderSyscallDeviations(list, { scanned: !!scan, selected: syscallState.selected, scores: syscallScores(scan) });
+    host.scrollTop = top;
+}
+
+function renderSyscallDraft() {
+    const host = document.getElementById('syscall-draft');
+    if (!host) return;
+    const st = syscallState.draft;
+    if (!st) {
+        host.innerHTML = '';
+        host.hidden = true;
+        return;
+    }
+    host.hidden = false;
+    host.innerHTML = st.error
+        ? '<section class="syscall-draft-card" aria-label="Rule draft"><div class="syscall-panel-head"><h3 class="syscall-panel-title">RULE DRAFT</h3>' +
+          '<button type="button" class="btn btn-xs" onclick="syscallCloseDraft()" title="Close the draft">Close</button></div>' +
+          `<div class="syscall-draft-result syscall-draft-result-error" role="alert">${escapeHtml(st.error)}</div></section>`
+        : showSyscallRuleDraft(st.draft, { busy: st.busy, note: st.note });
+}
+
+// A draft is on the page: it replaces the one before, and where the panes are one at a time the detail comes up
+function syscallShowDraft(draft) {
+    syscallState.draft = { draft, note: null, busy: false };
+    renderSyscallDraft();
+    if (typeof window.matchMedia === 'function' && window.matchMedia(SYSCALL_NARROW).matches) syscallSetPane('detail');
+    const host = document.getElementById('syscall-draft');
+    if (host && typeof host.scrollIntoView === 'function') host.scrollIntoView({ block: 'nearest' });
+}
+
+function syscallCloseDraft() {
+    syscallState.draftSeq++;
+    syscallState.draft = null;
+    renderSyscallDraft();
+}
+
+// Regel erzeugen: the deviation as the scan returned it goes to the server, which drafts a signature entry and writes
+// nothing. A refusal (a hook the allowlist knows, a stub without bytes) is shown where the draft would be.
+async function syscallDraftRule(name) {
+    const scan = syscallState.scan;
+    const deviation = scan && Array.isArray(scan.deviations) ? scan.deviations.find(d => d && d.name === name) : null;
+    if (!deviation) return false;
+    const seq = ++syscallState.draftSeq;
+    const r = await syscallApi('/api/syscalls/rule', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deviation, view: scan.view, build: scan.build }),
+    });
+    if (seq !== syscallState.draftSeq) return false;
+    if (!r.ok) {
+        syscallState.draft = { error: syscallErrorText(r) };
+        renderSyscallDraft();
+        return false;
+    }
+    syscallShowDraft(r.data);
+    return true;
+}
+
+// APPLY TO THIS VM: the draft goes back to the server as it came, which writes it where Rustinel reads its rules. Only
+// the draft that is on the page, and only a YARA rule, and not while another apply is under way. A rule that is there
+// already is an answer, not a failure.
+async function applySyscallRule(name) {
+    const st = syscallState.draft;
+    if (!st || !st.draft || st.busy || st.draft.kind === 'signature' || st.draft.name !== name) return false;
+    st.busy = true;
+    st.note = null;
+    renderSyscallDraft();
+    const r = await syscallApi('/api/syscalls/rule/apply', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(st.draft),
+    });
+    st.busy = false;
+    const path = typeof r.data.path === 'string' ? r.data.path : '';
+    if (r.ok) {
+        const seconds = Number(r.data.reload_seconds) > 0 ? Number(r.data.reload_seconds) : 2;
+        st.note = { tone: 'ok', text: `Written${path ? ` to ${path}` : ''}. Rustinel loads it within about ${seconds} seconds. This copy lives on this VM only: ` +
+                    'a rebuilt VM does not have it, so download the rule as well and commit it under rules/yara/.' };
+    } else if (r.status === 409 && r.data.status === 'exists') {
+        st.note = { tone: 'info', text: `A rule of this name is there already${path ? ` (${path})` : ''}: it is the same stub, build and view. It was left alone. Nothing was written.` };
+    } else {
+        st.note = { tone: 'error', text: syscallErrorText(r) };
+    }
+    if (syscallState.draft === st) renderSyscallDraft();
+    return r.ok;
+}
+
+// The known hooks and the scan on the map, as renderHookAllowlist wants them. hookable counts the hooked stubs of the
+// scan that the list does not know yet and that a module owns: what recording would add.
+function syscallHooksModel() {
+    const h = syscallState.hooks, baseline = syscallState.baseline, scan = syscallState.scan;
+    const model = {
+        entries: h.entries, loaded: h.loaded, problem: h.problem, error: h.error, note: h.note, busy: h.busy, scan: null,
+        scope: baseline && baseline.build && baseline.view ? { build: String(baseline.build), view: String(baseline.view) } : null,
+    };
+    if (scan) {
+        const hooked = (Array.isArray(scan.deviations) ? scan.deviations : [])
+            .filter(d => d && d.state === 'hooked' && typeof d.target_owner === 'string' && d.target_owner && d.target_owner !== 'private');
+        const hookable = hooked.filter(d => d.allowlisted !== true).length;
+        model.scan = { pid: scan.pid, name: String(scan.process || '').split(/[\\/]/).pop(), hookable, known: hooked.length - hookable,
+                       allowlist: scan.allowlist || null };
+    }
+    return model;
+}
+
+function renderSyscallHooks() {
+    const host = document.getElementById('syscall-hooks');
+    const head = document.getElementById('syscall-hooks-head');
+    const h = syscallState.hooks;
+    if (head) head.textContent = h.loaded ? `${h.entries.length.toLocaleString('en-US')} known` : '';
+    if (!host) return;
+    const top = host.scrollTop;
+    host.innerHTML = renderHookAllowlist(syscallHooksModel());
+    host.scrollTop = top;
+}
+
+async function syscallLoadHooks() {
+    const r = await syscallApi('/api/syscalls/hook-baseline');
+    const h = syscallState.hooks;
+    if (r.ok) {
+        h.entries = Array.isArray(r.data.entries) ? r.data.entries : [];
+        h.problem = typeof r.data.problem === 'string' ? r.data.problem : '';
+        h.error = '';
+        h.loaded = true;
+    } else {
+        h.error = syscallErrorText(r);
+    }
+    renderSyscallHooks();
+    return r.ok;
+}
+
+// RECORD THE HOOKS OF THIS RUN AS KNOWN: the hooked stubs of the process the last scan was of become known hooks,
+// whoever installed them, so this asks first and says what it costs on a host that is not clean.
+async function syscallCaptureHooks() {
+    const h = syscallState.hooks, model = syscallHooksModel();
+    if (h.busy || !model.scan || !(model.scan.hookable > 0)) return false;
+    if (typeof confirm !== 'function' || !confirm(syscallCaptureQuestion(model.scan))) return false;
+    h.busy = true;
+    h.note = null;
+    renderSyscallHooks();
+    const r = await syscallApi('/api/syscalls/hook-baseline', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pid: model.scan.pid }),
+    });
+    h.busy = false;
+    if (r.ok) {
+        const added = Number(r.data.added) || 0;
+        h.note = { tone: 'ok', text: (added ? `Recorded ${added} new hook${added === 1 ? '' : 's'} of PID ${model.scan.pid} for build ${r.data.build}, ${r.data.view} view.`
+                                            : `No new hook: those of PID ${model.scan.pid} were known already.`) +
+                 ` The list holds ${Number(r.data.entries) || 0} for it. Scan again: the stubs on the map are not marked as known yet.` +
+                 (r.data.partial ? ' The measurement was partial.' : '') };
+    } else {
+        h.note = { tone: 'error', text: syscallErrorText(r) };
+    }
+    await syscallLoadHooks();
+    return r.ok;
+}
+
+// FORGET: the known hooks of the build and view on the map ('this') or all of them ('all'), after a question
+async function syscallClearHooks(scope) {
+    const h = syscallState.hooks, baseline = syscallState.baseline;
+    if ((scope !== 'this' && scope !== 'all') || h.busy) return false;
+    if (scope === 'this' && !(baseline && baseline.build && baseline.view)) return false;
+    const question = scope === 'this'
+        ? `Forget the known hooks of build ${baseline.build}, ${baseline.view} view?\n\nEvery hook of that set counts as evidence again.`
+        : 'Forget every known hook, of every build and view?\n\nEvery hook counts as evidence again.';
+    if (typeof confirm !== 'function' || !confirm(question)) return false;
+    h.busy = true;
+    h.note = null;
+    renderSyscallHooks();
+    const query = scope === 'this' ? `?build=${encodeURIComponent(baseline.build)}&view=${encodeURIComponent(baseline.view)}` : '';
+    const r = await syscallApi(`/api/syscalls/hook-baseline${query}`, { method: 'DELETE' });
+    h.busy = false;
+    h.note = r.ok ? { tone: 'ok', text: 'Forgotten. Scan again: the stubs on the map are marked as known by the list as it was.' }
+                  : { tone: 'error', text: syscallErrorText(r) };
+    await syscallLoadHooks();
+    return r.ok;
+}
+
+// MAP | DETAIL below SYSCALL_NARROW, where the map and the detail panel take turns on one place; above it both are
+// shown and this changes nothing. A map that was out of sight has no width and is drawn when it comes back.
+function syscallSetPane(name) {
+    if (!SYSCALL_PANE_NAMES.includes(name)) return false;
+    syscallState.pane = name;
+    const work = document.getElementById('syscall-work');
+    if (work) work.dataset.pane = name;
+    for (const other of SYSCALL_PANE_NAMES) {
+        const button = document.getElementById(`syscall-pane-${other}`);
+        if (button) button.setAttribute('aria-pressed', other === name ? 'true' : 'false');
+    }
+    if (name === 'map') renderSyscallMap();
+    return true;
+}
+
 // MAP / GRAPH: the surface that is on. GRAPH comes with the binary graph; until then its button is disabled and a
 // view that has no enabled button is not switched to.
 function syscallSetView(name) {
@@ -25568,5 +26283,6 @@ function syscallsTabShown() {
     initSyscalls();
     renderSyscallMap();
     syscallLoadTargets();
+    syscallLoadHooks();
     syscallRefresh();
 }

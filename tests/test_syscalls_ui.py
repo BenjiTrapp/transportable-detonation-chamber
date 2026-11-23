@@ -27,7 +27,8 @@ OUT = "const out = value => console.log(JSON.stringify(value));\n"
 
 # What every function of the block may call: the helpers of the page and the block's own small ones and constants
 HELPERS = ["escapeHtml", "jsArg", "jsInt", "cssToken", "syscallHex"]
-BLOCK_CONSTS = ["SYSCALL_STATES", "SYSCALL_STATE_COLORS", "SYSCALL_STATE_HELP", "SYSCALL_MODULES"]
+BLOCK_CONSTS = ["SYSCALL_STATES", "SYSCALL_STATE_COLORS", "SYSCALL_STATE_HELP", "SYSCALL_MODULES", "SYSCALL_DOC_URL",
+                "SYSCALL_SEVERITY_RANK", "SYSCALL_ROWS_MAX"]
 
 
 def _const(name):
@@ -427,9 +428,18 @@ FLOW_FUNCTIONS = [
     "syscallRenderAll", "syscallApplyFilter", "syscallOnFilter", "syscallSelect", "syscallCellFromEvent",
     "syscallShowTip", "syscallHideTip", "syscallOnMapMove", "syscallOnMapLeave", "syscallOnMapClick",
     "syscallSetScanNote", "runSyscallScan", "syscallSetView", "syscallResized", "initSyscalls", "syscallsTabShown",
+    # the detail panel, the deviation list, the rule draft and the known hooks
+    "syscallBytesOf", "syscallBytesHtml", "syscallBytesDiffer", "syscallOwnerHtml", "syscallSignature", "renderSyscallDetail",
+    "renderSyscallDeviations", "showSyscallRuleDraft", "syscallHookWarning", "syscallCaptureQuestion", "renderHookAllowlist",
+    "syscallDetailModel", "syscallRizinTarget", "renderSyscallDetailPanel", "syscallLoadDetail", "syscallSyncDetail",
+    "syscallOpenRizin", "syscallCopySignature", "syscallCopyDraft", "syscallCloseDraft", "syscallScores", "renderSyscallDeviationPanel",
+    "syscallDraftRule", "renderSyscallDraft", "applySyscallRule", "syscallHooksModel", "renderSyscallHooks", "syscallLoadHooks",
+    "syscallCaptureHooks", "syscallClearHooks", "syscallSetPane", "syscallModel", "syscallRepaintCells", "syscallShowDraft",
+    "syscallCopyText",
 ]
 FLOW_CONSTS = ["SYSCALL_STATES", "SYSCALL_STATE_COLORS", "SYSCALL_STATE_HELP", "SYSCALL_MODULES", "SYSCALL_MAP",
-               "SYSCALL_ROWS_MAX", "SYSCALL_PAGE", "SYSCALL_POLL_MS", "SYSCALL_VIEW_NAMES", "syscallState"]
+               "SYSCALL_ROWS_MAX", "SYSCALL_PAGE", "SYSCALL_POLL_MS", "SYSCALL_VIEW_NAMES", "syscallState",
+               "SYSCALL_DOC_URL", "SYSCALL_SYSTEM_DIR", "SYSCALL_NARROW", "SYSCALL_PANE_NAMES", "SYSCALL_SEVERITY_RANK"]
 
 # Just enough page for the tab: elements that hold children, attributes and listeners, a canvas that writes down
 # what is painted on it, a fetch that answers from a table of routes, and timers that wait to be fired
@@ -440,11 +450,12 @@ class Node {
     constructor(tag) {
         Object.assign(this, { tagName: tag.toUpperCase(), id: '', children: [], attrs: {}, dataset: {}, style: {},
             listeners: {}, parentElement: null, html: '', text: '', value: '', disabled: false, checked: false,
-            hidden: false, className: '', width: 300, height: 150, boxWidth: 0, scrollTop: 0, offsetWidth: 0, calls: [] });
+            hidden: false, className: '', width: 300, height: 150, boxWidth: 0, scrollTop: 0, offsetWidth: 0, calls: [], clears: [] });
         this.ctx = { globalAlpha: 1, fillStyle: '', strokeStyle: '', lineWidth: 1, transform: null,
             fillRect: (x, y, w, h) => this.calls.push({ op: 'fill', x, y, w, h, color: this.ctx.fillStyle, alpha: this.ctx.globalAlpha }),
             strokeRect: (x, y, w, h) => this.calls.push({ op: 'stroke', x, y, w, h, color: this.ctx.strokeStyle }),
-            clearRect: () => { this.calls = []; }, setTransform: (...t) => { this.ctx.transform = t; } };
+            clearRect: (...area) => { this.calls = []; this.clears.push(area); }, setTransform: (...t) => { this.ctx.transform = t; },
+            save() {}, restore() {}, beginPath() {}, rect() {}, clip() {} };
     }
     get classList() {
         const el = this, names = () => el.className.split(/\s+/).filter(Boolean);
@@ -471,11 +482,15 @@ class Node {
 }
 const ids = ['syscalls-subtitle', 'syscall-view-map', 'syscall-view-graph', 'syscall-surface-map', 'syscall-target',
              'syscall-win32u', 'syscall-scan', 'syscall-filter', 'syscall-module-filter', 'syscall-notices',
-             'syscall-scan-result', 'syscall-legend', 'syscall-map', 'syscall-tip', 'syscall-catalog-head', 'syscall-rows'];
+             'syscall-scan-result', 'syscall-legend', 'syscall-map', 'syscall-tip', 'syscall-catalog-head', 'syscall-rows',
+             'syscall-work', 'syscall-pane-map', 'syscall-pane-detail', 'syscall-detail-body', 'syscall-draft',
+             'syscall-deviations', 'syscall-deviations-head', 'syscall-hooks', 'syscall-hooks-head'];
 const els = Object.fromEntries(ids.map(id => [id, Object.assign(new Node('div'), { id })]));
 els['syscall-view-graph'].disabled = true;
 els['syscall-map'].parentElement = Object.assign(new Node('div'), { boxWidth: 800 });
 els['syscall-tip'].hidden = true;
+els['syscall-draft'].hidden = true;
+els['syscall-work'].dataset.pane = 'map';
 globalThis.window = globalThis;
 globalThis.devicePixelRatio = 2;
 globalThis.document = { getElementById: id => els[id] || null,
@@ -518,8 +533,15 @@ const scanBody = (deviations = {}) => {
         evidence: { label: 'SUSPICIOUS', score: 4 },
         states: Object.fromEntries(ALL.slice(0, 600).map(a => [a.name, { name: a.name, state: deviations[a.name] || 'intact' }])) };
 };
+const HOOKS = { entries: [{ syscall: 'NtBar', owner: 'MsMpEng.exe', build: '26220.5770', view: 'arm64' }], problem: null, path: 'C:\\hooks.json' };
+// What the server answers for one syscall of the baseline
+const lookupBody = (name, view = 'arm64') => { const a = ALL.find(x => x.name === name);
+    return { body: { ...a, return_type: 'NTSTATUS', calling_convention: 'stdcall', is_true_syscall: true, build: '26220.5770', view, prefix_len: 8,
+                     stub_hex: '010300d4c0035fd60000000000000000', parameters: [{ name: 'Handle', type: 'HANDLE', sal_annotation: '_In_' }] } }; };
 const freshRoutes = () => { routes = { '/api/syscalls/status': { body: STATUS }, '/api/syscalls/baseline': baselineRoute,
-                                      '/api/processes': { body: PROCESSES } }; };
+                                      '/api/processes': { body: PROCESSES }, '/api/syscalls/hook-baseline': { body: HOOKS } };
+                            for (const a of ALL) routes['/api/syscalls/' + a.name] = () => lookupBody(a.name, currentView()); };
+const currentView = () => (syscallState.baseline && syscallState.baseline.view) || 'arm64';
 freshRoutes();
 const canvases = () => els['syscall-map'].querySelectorAll('canvas');
 const chooseTarget = (pid) => { els['syscall-target'].value = String(pid); syscallOnTarget(); };
@@ -576,7 +598,7 @@ def test_showing_the_tab_again_asks_for_the_status_but_not_for_the_baseline_agai
         syscallRefresh(true); await settle();
         out({ again, forced: requests.slice(before + again.length).map(q => q.url.split('?')[0]) });
       })();""")
-    assert sorted(r["again"]) == ["/api/processes", "/api/syscalls/status"]
+    assert sorted(r["again"]) == ["/api/processes", "/api/syscalls/hook-baseline", "/api/syscalls/status"]
     assert r["forced"].count("/api/syscalls/baseline") == 3, "a forced refresh reads the baseline anew"
 
 
@@ -913,6 +935,915 @@ def test_a_theme_change_repaints_the_map_while_its_tab_is_open():
     assert "syscalls" in r["open"] and "syscalls" not in r["closed"] and r["cache"] == 0
 
 
+# --- The detail panel, the deviation list and the rule draft -----------------------
+
+# What the pure renderers of the panels call
+DETAIL_FUNCTIONS = ["renderSyscallDetail", "syscallBytesOf", "syscallBytesHtml", "syscallBytesDiffer", "syscallSignature",
+                    "syscallOwnerHtml"]
+DEVIATION_FUNCTIONS = ["renderSyscallDeviations", "syscallBytesOf", "syscallBytesHtml", "syscallOwnerHtml"]
+DRAFT_FUNCTIONS = ["showSyscallRuleDraft"]
+
+
+@needs_node
+def test_detail_marks_the_changed_bytes():
+    html = _run_node(["renderSyscallDetail"] + DETAIL_FUNCTIONS, """
+      out(renderSyscallDetail({name: "NtFoo", number: 58, module: "ntdll.dll",
+        expected: "4c8bd1b8", actual: "e92b1700", state: "patched",
+        target_owner: "private", parameters: []}));""")
+    assert "4c8bd1b8" in html and "e92b1700" in html
+    assert "private" in html
+
+
+@needs_node
+def test_only_the_bytes_that_differ_are_marked():
+    r = _run_node(DETAIL_FUNCTIONS, r"""
+      out({ part: syscallBytesHtml("4c8bd1b8", "4c8bd1e9"), all: syscallBytesHtml("aabb", "aabb"),
+            none: syscallBytesHtml("aabb", null), longer: syscallBytesHtml("aabbcc", "aabb"), bad: syscallBytesHtml("zz", "aa"),
+            count: [syscallBytesDiffer("4c8bd1b8", "4c8bd1e9"), syscallBytesDiffer("aabb", "aabb"), syscallBytesDiffer("aabbcc", "aabb")] });""")
+    assert r["part"] == '<span class="syscall-bytes-same">4c8bd1</span><span class="syscall-bytes-diff">b8</span>'
+    assert "syscall-bytes-diff" not in r["all"] and "syscall-bytes-diff" not in r["none"]
+    assert r["longer"].endswith('<span class="syscall-bytes-diff">cc</span>'), "a byte past the end of the other side differs"
+    assert r["bad"] == "", "anything that is not whole bytes of hex is not drawn as bytes"
+    assert r["count"] == [1, 0, 1]
+
+
+def _detail(sc):
+    return _run_node(DETAIL_FUNCTIONS, "out(renderSyscallDetail(%s));" % sc)
+
+
+@needs_node
+def test_detail_names_the_number_in_hex_and_decimal_and_the_stub_it_compares():
+    html = _detail('{name: "NtFoo", number: 58, module: "ntdll.dll", rva: 651680, return_type: "NTSTATUS", '
+                   'calling_convention: "stdcall", stub_hex: "010300d4c0035fd60000000000000000", prefix_len: 8, '
+                   'build: "26220.5770", view: "arm64", parameters: []}')
+    assert "0x3A" in html and "(58)" in html and "0x9F1A0" in html
+    assert "NTSTATUS" in html and "stdcall" in html and "26220.5770" in html
+    # no scan: the baseline's own bytes, only as far as they are compared
+    assert "010300d4c0035fd6" in html and "0000000000000000" not in html
+    assert "8 bytes" in html
+    assert "syscall-finding" not in html, "nothing was measured: there is no classification to show"
+
+
+@needs_node
+def test_a_syscall_that_nothing_is_chosen_for_says_so():
+    html = _run_node(DETAIL_FUNCTIONS, "out([renderSyscallDetail(null), renderSyscallDetail(undefined), renderSyscallDetail('x')]);")
+    assert all("Choose a syscall" in h for h in html)
+
+
+@needs_node
+def test_detail_tells_a_syscall_with_no_parameters_from_a_baseline_without_the_symbols():
+    r = _run_node(DETAIL_FUNCTIONS, r"""
+      const base = { name: "NtYield", number: 1, module: "ntdll.dll" };
+      out({ none: renderSyscallDetail({ ...base, parameters: [] }),
+            noSymbols: renderSyscallDetail({ ...base, parameters: [], symbols: false }),
+            some: renderSyscallDetail({ ...base, parameters: [{ name: "Handle", type: "HANDLE", sal_annotation: "_In_" },
+                                                               { name: "Size", type: "SIZE_T", sal_annotation: "_Out_" }] }) });""")
+    assert "takes no parameters" in r["none"].lower()
+    assert "without the symbol server" in r["noSymbols"] and "takes no parameters" not in r["noSymbols"].lower()
+    some = r["some"]
+    assert 'data-sortable' in some and 'data-sort-id="syscall-params"' in some
+    assert "HANDLE" in some and "_Out_" in some and "SIZE_T" in some
+    assert "NTSTATUS" not in some and "?" in some, "an unknown return type is not made up"
+    assert "_In_ HANDLE Handle," in some and "_Out_ SIZE_T Size" in some, "the signature is one text to copy"
+
+
+@needs_node
+def test_detail_reads_the_tri_state_number_and_never_renders_none_as_no():
+    r = _run_node(DETAIL_FUNCTIONS, r"""
+      const base = { name: "NtFoo", number: 58, module: "ntdll.dll", state: "hooked", expected: "4c8bd1b8", actual: "e9aabbcc",
+                     target_owner: "edr.dll", parameters: [] };
+      out({ yes: renderSyscallDetail({ ...base, number_matches: true }), no: renderSyscallDetail({ ...base, number_matches: false }),
+            unknown: renderSyscallDetail({ ...base, number_matches: null }), missing: renderSyscallDetail(base) });""")
+    assert "number of the baseline" in r["yes"] and "NOT" not in r["yes"]
+    assert "NOT" in r["no"] and "another syscall" in r["no"]
+    for key in ("unknown", "missing"):
+        assert "do not show a number" in r[key], key
+        assert "NOT" not in r[key], f"{key}: a jump over the prologue is not a different number"
+
+
+@needs_node
+def test_detail_says_who_the_jump_goes_to_and_that_an_unresolved_one_is_not_guessed():
+    r = _run_node(DETAIL_FUNCTIONS, r"""
+      const base = { name: "NtFoo", number: 58, module: "ntdll.dll", expected: "4c8bd1b8", actual: "e9aabbcc", parameters: [] };
+      out({ hooked: renderSyscallDetail({ ...base, state: "hooked", target_owner: "edr.dll", pattern: "JMP rel32" }),
+            patched: renderSyscallDetail({ ...base, state: "patched", target_owner: "private" }),
+            diverged: renderSyscallDetail({ ...base, state: "diverged", target_owner: null }),
+            intact: renderSyscallDetail({ ...base, state: "intact", actual: "4c8bd1b8" }) });""")
+    assert "edr.dll" in r["hooked"] and "JMP rel32" in r["hooked"] and "an EDR hook" in r["hooked"]
+    assert "private memory" in r["patched"] and "no file backs" in r["patched"]
+    assert "unresolved" in r["diverged"]
+    assert "Jump target" not in r["intact"], "an intact stub jumps nowhere"
+    assert r["intact"].count("syscall-bytes-diff") == 0
+
+
+@needs_node
+def test_an_unreadable_stub_is_not_shown_as_a_stub_that_matches():
+    r = _run_node(DETAIL_FUNCTIONS, r"""
+      const base = { name: "NtFoo", number: 58, module: "ntdll.dll", state: "unreadable", expected: "010300d4c0035fd6", parameters: [] };
+      out({ none: renderSyscallDetail({ ...base, actual: null }), zeros: renderSyscallDetail({ ...base, actual: "0000000000000000" }) });""")
+    assert "No bytes could be read" in r["none"] and "syscall-bytes-diff" not in r["none"]
+    assert "zeros" in r["zeros"] and "0000000000000000" in r["zeros"]
+
+
+@needs_node
+def test_a_syscall_the_scan_did_not_cover_says_so():
+    html = _run_node(DETAIL_FUNCTIONS, 'out(renderSyscallDetail({name: "NtUserFoo", number: 4100, module: "win32u.dll", scanned: false, parameters: []}));')
+    assert "not part of the last scan" in html
+
+
+@needs_node
+def test_a_known_hook_says_in_the_detail_that_it_does_not_score_and_stays_there():
+    html = _run_node(DETAIL_FUNCTIONS, r"""
+      out(renderSyscallDetail({name: "NtBar", number: 80, module: "ntdll.dll", state: "hooked", target_owner: "MsMpEng.exe",
+        allowlisted: true, expected: "4c8bd1b8", actual: "e9aabbcc", parameters: []}));""")
+    assert "MsMpEng.exe" in html and "allowlist" in html.lower() and "does not score" in html
+    assert "e9aabbcc" in html, "the hook is still shown"
+
+
+@needs_node
+def test_everything_the_baseline_and_the_target_hold_is_escaped_in_the_detail():
+    evil = '<img src=x onerror=alert(1)>'
+    html = _run_node(DETAIL_FUNCTIONS, r"""
+      const evil = '<img src=x onerror=alert(1)>';
+      out(renderSyscallDetail({ name: evil, number: evil, module: evil, rva: evil, return_type: evil, calling_convention: evil,
+        build: evil, view: evil, state: evil, pattern: evil, target_owner: evil, expected: evil, actual: evil, number_matches: false,
+        parameters: [{ name: evil, type: evil, sal_annotation: evil }, null, "x"], stub_hex: evil }));""")
+    assert "<img" not in html
+    assert "&lt;img" in html
+    # the state of a stub from the target leaves neither the class attribute nor the element
+    attrs = _Attributes(html).elements
+    assert "img" not in [tag for tag, _ in attrs]
+
+
+@needs_node
+def test_the_docs_link_is_made_of_the_encoded_name_and_opens_safely():
+    html = _run_node(DETAIL_FUNCTIONS, 'out(renderSyscallDetail({name: "Nt/Foo\\"x", number: 1, module: "ntdll.dll", parameters: []}));')
+    link = next(a for tag, a in _Attributes(html).elements if tag == "a")
+    assert link["href"] == "https://ntdoc.m417z.com/nt%2ffoo%22x"
+    assert link["target"] == "_blank" and "noopener" in link["rel"] and "noreferrer" in link["rel"]
+
+
+@needs_node
+def test_open_in_rizin_is_offered_only_when_the_view_can_be_opened():
+    r = _run_node(DETAIL_FUNCTIONS, r"""
+      const base = { name: "NtFoo", number: 1, module: "ntdll.dll", parameters: [] };
+      out({ yes: renderSyscallDetail({ ...base, rizin: true }), no: renderSyscallDetail(base),
+            why: renderSyscallDetail({ ...base, rizin_note: "Rizin opens the native view" }) });""")
+    assert 'onclick="syscallOpenRizin()"' in r["yes"]
+    assert "syscallOpenRizin" not in r["no"] and "syscallOpenRizin" not in r["why"] and "native view" in r["why"]
+
+
+@needs_node
+def test_an_allowlisted_hook_shows_that_it_does_not_score():
+    html = _run_node(DEVIATION_FUNCTIONS, """
+      out(renderSyscallDeviations([{name: "NtBar", number: 80, state: "hooked",
+        target_owner: "MsMpEng.exe", allowlisted: true}]));""")
+    assert "MsMpEng.exe" in html
+    assert "allowlist" in html.lower()
+
+
+@needs_node
+def test_the_deviation_table_is_sortable():
+    html = _run_node(DEVIATION_FUNCTIONS, "out(renderSyscallDeviations([]));")
+    assert "data-sortable" in html and "data-sort-id=" in html
+    assert "data-sort-skip" in html
+
+
+def _devs(script):
+    return _run_node(DEVIATION_FUNCTIONS, script)
+
+
+@needs_node
+def test_an_allowlisted_hook_stays_in_the_list_with_its_owner_and_says_why_it_has_no_score():
+    r = _devs(r"""
+      out(renderSyscallDeviations([
+        { name: "NtBar", number: 80, state: "hooked", target_owner: "MsMpEng.exe", allowlisted: true, expected: "4c8bd1b8", actual: "e9aabbcc" },
+        { name: "NtBaz", number: 81, state: "hooked", target_owner: "other.dll", allowlisted: false, expected: "4c8bd1b8", actual: "e9aabbcc" }],
+        { scanned: true, scores: { NtBaz: 0.8 } }));""")
+    rows = r.split("<tr")
+    known = next(row for row in rows if "NtBar" in row)
+    unlisted = next(row for row in rows if "NtBaz" in row)
+    assert "MsMpEng.exe" in known and "allowlist" in known and "not scored" in known and "+0" not in known
+    assert "+0.80" in unlisted and "allowlist" not in unlisted.lower()
+
+
+@needs_node
+def test_every_state_but_intact_is_listed_the_loudest_first_and_only_a_finding_gets_a_rule_button():
+    html = _devs(r"""
+      const row = (name, state, extra = {}) => ({ name, number: 5, state, expected: "aabb", actual: "ccdd", target_owner: "x.dll", ...extra });
+      out(renderSyscallDeviations([ row("NtUnreadable", "unreadable", { actual: null }), row("NtDiverged", "diverged"),
+        row("NtHooked", "hooked"), row("NtKnown", "hooked", { allowlisted: true }), row("NtPatched", "patched"),
+        row("NtNoBytes", "patched", { actual: null }) ]));""")
+    names = re.findall(r"syscallSelect\(&quot;(\w+)&quot;\)", html)
+    assert names == ["NtPatched", "NtNoBytes", "NtHooked", "NtKnown", "NtDiverged", "NtUnreadable"], names
+    drafted = re.findall(r"syscallDraftRule\(&quot;(\w+)&quot;\)", html)
+    assert drafted == ["NtPatched", "NtHooked", "NtDiverged"], drafted
+
+
+@needs_node
+def test_the_tri_state_number_is_not_read_as_no_in_the_list():
+    r = _devs(r"""
+      const row = (name, nm) => ({ name, number: 5, state: "hooked", expected: "aabb", actual: "ccdd", target_owner: "x.dll", number_matches: nm });
+      out({ no: renderSyscallDeviations([row("NtA", false)]), yes: renderSyscallDeviations([row("NtA", true)]),
+            unknown: renderSyscallDeviations([row("NtA", null)]), missing: renderSyscallDeviations([row("NtA", undefined)]) });""")
+    assert "number differs" in r["no"]
+    for key in ("yes", "unknown", "missing"):
+        assert "number differs" not in r[key], key
+
+
+@needs_node
+def test_the_deviation_list_says_why_it_is_empty():
+    r = _devs(r"""out({ clean: renderSyscallDeviations([], { scanned: true }), unscanned: renderSyscallDeviations([], { scanned: false }),
+                        bare: renderSyscallDeviations(undefined), junk: renderSyscallDeviations([null, 3, "x"]) });""")
+    assert "No deviations" in r["clean"] and "Scan a process" in r["unscanned"] and "No deviations" in r["bare"]
+    assert r["junk"].count("data-sort-skip") == 1 and "syscallSelect" not in r["junk"]
+
+
+@needs_node
+def test_the_deviation_list_is_capped_and_says_so():
+    html = _devs(r"""
+      const many = Array.from({ length: 450 }, (_, i) => ({ name: "Nt" + i, number: i, state: "unreadable", expected: "aabb", actual: null }));
+      out(renderSyscallDeviations(many, { scanned: true }));""")
+    assert html.count("syscallSelect(") == 300
+    assert "first 300 of 450" in html and html.count("data-sort-skip") == 1
+
+
+@needs_node
+def test_the_deviation_list_escapes_what_the_target_and_the_baseline_hold():
+    html = _devs(r"""
+      const evil = '<img src=x onerror=alert(1)>';
+      out(renderSyscallDeviations([{ name: evil, number: evil, module: evil, state: evil, pattern: evil, target_owner: evil,
+        expected: evil, actual: evil, number_matches: false }, { name: 'a"b', number: 1, state: "patched", expected: "aa", actual: "bb", target_owner: "private" }],
+        { scanned: true, selected: evil, scores: { [evil]: 1 } }));""")
+    assert "<img" not in html
+    assert "img" not in [tag for tag, _ in _Attributes(html).elements]
+    elements = _Attributes(html).elements
+    # a handler holds one quoted literal of the name and nothing else
+    handlers = [a["onclick"] for _, a in elements if "onclick" in a]
+    assert handlers and all(re.fullmatch(r'(?:syscallSelect|syscallDraftRule)\("(?:[^"\\]|\\.)*"\)', h) for h in handlers), handlers
+
+
+@needs_node
+def test_the_selected_deviation_is_marked_and_the_state_has_its_dot():
+    html = _devs(r"""
+      out(renderSyscallDeviations([{ name: "NtA", number: 1, state: "patched", expected: "aa", actual: "bb", target_owner: "private" },
+                                   { name: "NtB", number: 2, state: "hooked", expected: "aa", actual: "bb", target_owner: "x.dll" }],
+        { scanned: true, selected: "NtB" }));""")
+    rows = [a for tag, a in _Attributes(html).elements if tag == "tr" and "data-sort-skip" not in a]
+    assert [r.get("class", "") for r in rows[1:]] == ["", "selected"], "the first row is the head"
+    assert "syscall-state-patched" in html and "syscall-state-hooked" in html
+
+
+@needs_node
+def test_a_rule_draft_is_shown_as_text_not_html():
+    html = _run_node(DRAFT_FUNCTIONS, """
+      out(showSyscallRuleDraft({name: "TDC_X", text: "rule TDC_X { <b>x</b> }"}));""")
+    assert "<b>" not in html
+
+
+# as the JavaScript string literal it goes into
+YARA = r"rule TDC_DirectSyscall_NtFoo_arm64_0123abcd {\n    meta:\n        description = \"x\"\n    condition:\n        true\n}\n"
+
+
+def _draft(draft, options="undefined"):
+    return _run_node(DRAFT_FUNCTIONS, "out(showSyscallRuleDraft(%s, %s));" % (draft, options))
+
+
+@needs_node
+def test_a_drafted_rule_is_text_in_every_place_it_appears():
+    html = _draft(r"""{ kind: "signature", name: "<b>n</b>", text: "<script>alert(1)</script>", target: "<i>t</i>",
+      entry: { family: "<u>f</u>" }, covered_by: [{ family: "<em>x</em>", pattern: "<s>p</s>", match: "<a>m</a>" }] }""",
+                  '{ note: { tone: "ok", text: "<b>done</b>" } }')
+    assert "<b>" not in html and "<script" not in html and "<i>" not in html and "<u>" not in html
+    assert "<em>" not in html and "<s>" not in html and "<a>" not in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+    yara = _draft(r'{ name: "TDC_DirectSyscall_NtX_x64_aaaaaaaa", text: "<img src=x onerror=alert(1)>", target: "<b>x</b>" }')
+    assert "<img" not in yara and "<b>" not in yara
+    assert "img" not in [tag for tag, _ in _Attributes(yara).elements]
+
+
+@needs_node
+def test_apply_and_download_are_two_things_that_read_as_two_things():
+    html = _draft('{ kind: "yara", name: "TDC_DirectSyscall_NtFoo_arm64_0123abcd", text: "%s", target: "TDC_DirectSyscall_NtFoo_arm64_0123abcd.yar" }' % YARA)
+    elements = _Attributes(html).elements
+    vm = next(a for t, a in elements if "syscall-draft-vm" in a.get("class", "").split())
+    repo = next(a for t, a in elements if "syscall-draft-repo" in a.get("class", "").split())
+    assert vm is not repo
+    # the one acts on this VM, now; the other hands the rule back and writes nothing
+    vm_text, repo_text = (re.search(r'class="syscall-draft-action %s">(.*?)</div>\s*(?:<div class="syscall-draft-action|</section>|$)' % c, html, re.S).group(1)
+                          for c in ("syscall-draft-vm", "syscall-draft-repo"))
+    assert "APPLY TO THIS VM" in vm_text and "about 2 seconds" in vm_text and "rebuilt VM" in vm_text and "Writes" in vm_text
+    assert "DOWNLOAD FOR THE REPO" in repo_text and "rules/yara/" in repo_text and "writes nothing" in repo_text.lower()
+    assert "APPLY" not in repo_text and "DOWNLOAD" not in vm_text
+    apply = next(a for t, a in elements if t == "button" and a.get("onclick", "").startswith("applySyscallRule"))
+    download = next(a for t, a in elements if t == "a")
+    assert apply["onclick"] == 'applySyscallRule("TDC_DirectSyscall_NtFoo_arm64_0123abcd")'
+    assert "btn-primary" in apply["class"] and "btn-primary" not in download["class"]
+    assert "Nothing has been written" in html, "a draft only drafts"
+
+
+@needs_node
+def test_the_download_link_hands_back_exactly_the_draft():
+    from urllib.parse import urlsplit, parse_qs
+    html = _draft('{ name: "TDC_DirectSyscall_NtFoo_arm64_0123abcd", text: "%s" }' % YARA)
+    link = next(a for t, a in _Attributes(html).elements if t == "a")
+    parts = urlsplit(link["href"])
+    assert parts.path == "/api/syscalls/rule/download"
+    query = parse_qs(parts.query, keep_blank_values=True)
+    assert query["name"] == ["TDC_DirectSyscall_NtFoo_arm64_0123abcd"] and query["text"] == [YARA.replace('\\"', '"').replace("\\n", "\n")]
+    assert link["download"] == "TDC_DirectSyscall_NtFoo_arm64_0123abcd.yar"
+
+
+@needs_node
+def test_while_an_apply_is_under_way_it_cannot_be_pressed_again_and_its_answer_is_shown():
+    r = _run_node(DRAFT_FUNCTIONS, r"""
+      const d = { name: "TDC_DirectSyscall_NtFoo_arm64_0123abcd", text: "rule x { condition: true }" };
+      out({ busy: showSyscallRuleDraft(d, { busy: true }), done: showSyscallRuleDraft(d, { note: { tone: "ok", text: "Written to C:\\rules\\x.yar" } }),
+            idle: showSyscallRuleDraft(d) });""")
+    apply = lambda h: next(a for t, a in _Attributes(h).elements if t == "button" and "applySyscallRule" in a.get("onclick", ""))
+    assert "disabled" in apply(r["busy"]) and "disabled" not in apply(r["idle"])
+    assert "Written to C:\\rules\\x.yar" in r["done"] and 'role="status"' in r["done"] and "syscall-draft-result-ok" in r["done"]
+    assert "Nothing has been written" in r["idle"] and "Nothing has been written" not in r["done"]
+
+
+@needs_node
+def test_a_signature_draft_is_added_by_hand_and_offers_neither_apply_nor_download():
+    html = _draft(r"""{ kind: "signature", entry: { family: "Inline hook", pattern: "e92b1700", match: "prefix", weight: 1 },
+        text: '{\n  "family": "Inline hook"\n}', target: "webui/syscall_signatures.json",
+        covered_by: [{ family: "Inline hook", pattern: "e9", match: "prefix" }] }""")
+    assert "applySyscallRule" not in html and "<a " not in html and "DOWNLOAD" not in html
+    assert "by hand" in html and "webui/syscall_signatures.json" in html
+    assert "already covered" in html.lower() and "Inline hook" in html
+
+
+@needs_node
+def test_a_draft_without_a_usable_name_offers_nothing_to_write():
+    r = _run_node(DRAFT_FUNCTIONS, 'out([showSyscallRuleDraft({}), showSyscallRuleDraft(null), showSyscallRuleDraft({ text: "x" })]);')
+    for html in r:
+        assert "applySyscallRule" not in html and "<a " not in html
+
+
+HOOK_FUNCTIONS = ["renderHookAllowlist", "syscallNoticesHtml", "syscallCaptureQuestion", "syscallHookWarning"]
+
+
+def _hooks(state):
+    return _run_node(HOOK_FUNCTIONS, "out(renderHookAllowlist(%s));" % state)
+
+
+SCAN_OF_A_RUN = '{ pid: 4242, name: "sample.exe", hookable: 3, known: 1, allowlist: { applied: true, entries: 1, reason: "" } }'
+
+
+@needs_node
+def test_recording_hooks_names_its_precondition_instead_of_saying_record_hooks():
+    html = _hooks('{ entries: [], loaded: true, scan: %s, scope: { build: "26220.5770", view: "arm64" } }' % SCAN_OF_A_RUN)
+    button = next((a, t) for t, a in _Attributes(html).elements if t == "button" and "syscallCaptureHooks" in a.get("onclick", ""))[0]
+    assert "disabled" not in button
+    label = re.search(r'<button[^>]*syscallCaptureHooks[^>]*>(.*?)</button>', html, re.S).group(1)
+    assert label == "RECORD THE HOOKS OF THIS RUN AS KNOWN"
+    warning = re.search(r'<p class="syscall-hook-warning"[^>]*>(.*?)</p>', html, re.S).group(1)
+    assert warning.startswith("<strong>Only on a host you believe is clean.</strong>")
+    for phrase in ("PID 4242", "sample.exe", "whoever installed them", "every process", "hides real findings", "never recorded"):
+        assert phrase in warning, phrase
+    # the warning is on the page next to the button, not in a tooltip that nobody reads
+    assert html.index("syscall-hook-warning") < html.index("syscallCaptureHooks")
+
+
+@needs_node
+def test_the_confirmation_repeats_the_precondition_and_the_number_of_hooks():
+    q = _run_node(HOOK_FUNCTIONS, 'out(syscallCaptureQuestion({ pid: 4242, name: "sample.exe", hookable: 3 }));')
+    assert "PID 4242" in q and "3" in q and "believe is clean" in q and "hides real findings" in q
+
+
+@needs_node
+def test_without_a_scan_or_without_a_hook_there_is_nothing_to_record():
+    r = _run_node(HOOK_FUNCTIONS, r"""
+      const find = html => /<button[^>]*syscallCaptureHooks[^>]*>/.exec(html)[0];
+      out({ none: find(renderHookAllowlist({ entries: [], loaded: true, scan: null })),
+            zero: find(renderHookAllowlist({ entries: [], loaded: true, scan: { pid: 5, name: "a.exe", hookable: 0, known: 2 } })),
+            busy: find(renderHookAllowlist({ entries: [], loaded: true, busy: true, scan: { pid: 5, name: "a.exe", hookable: 2 } })),
+            ok: find(renderHookAllowlist({ entries: [], loaded: true, scan: { pid: 5, name: "a.exe", hookable: 2 } })) });""")
+    assert " disabled" in r["none"] and " disabled" in r["zero"] and " disabled" in r["busy"] and " disabled" not in r["ok"]
+
+
+@needs_node
+def test_the_known_hooks_are_listed_sortable_and_escaped_and_each_set_names_its_build_and_view():
+    html = _hooks(r"""{ loaded: true, entries: [{ syscall: "NtBar", owner: "MsMpEng.exe", build: "26220.5770", view: "arm64" },
+        { syscall: "<img src=x>", owner: "<b>x</b>", build: "<i>1</i>", view: "x64" }], scan: null, scope: null }""")
+    assert 'data-sortable' in html and 'data-sort-id="syscall-hooks"' in html
+    assert "MsMpEng.exe" in html and "26220.5770" in html and "arm64" in html and "x64" in html
+    assert "<img" not in html and "<b>" not in html and "<i>" not in html
+    empty = _hooks("{ loaded: true, entries: [] }")
+    assert "data-sort-skip" in empty and "No hook is recorded" in empty
+    assert "Loading" in _hooks("{ loaded: false, entries: [] }")
+
+
+@needs_node
+def test_an_unusable_list_and_an_allowlist_that_was_not_applied_are_said_not_skipped():
+    html = _hooks(r"""{ loaded: true, entries: [], problem: "the file is corrupt <b>", error: "",
+        scan: { pid: 5, name: "a.exe", hookable: 1, allowlist: { applied: false, entries: 3, reason: "no set for build 1, view x64" } } }""")
+    assert "the file is corrupt &lt;b&gt;" in html and "no set for build 1, view x64" in html
+    assert "not applied" in html.lower()
+    failed = _hooks('{ loaded: false, entries: [], error: "The server answered with status 500." }')
+    assert "status 500" in failed
+
+
+@needs_node
+def test_forgetting_hooks_asks_for_a_scope_and_has_nothing_to_forget_on_an_empty_list():
+    r = _run_node(HOOK_FUNCTIONS, r"""
+      const buttons = html => [...html.matchAll(/<button[^>]*onclick="(syscallClearHooks\('\w+'\))"([^>]*)>/g)].map(m => [m[1], / disabled/.test(m[2])]);
+      const entry = { syscall: "NtBar", owner: "x.dll", build: "1", view: "arm64" };
+      out({ empty: buttons(renderHookAllowlist({ loaded: true, entries: [], scope: { build: "1", view: "arm64" } })),
+            full: buttons(renderHookAllowlist({ loaded: true, entries: [entry], scope: { build: "1", view: "arm64" } })),
+            noScope: buttons(renderHookAllowlist({ loaded: true, entries: [entry], scope: null })) });""")
+    assert r["empty"] == [["syscallClearHooks('this')", True], ["syscallClearHooks('all')", True]]
+    assert r["full"] == [["syscallClearHooks('this')", False], ["syscallClearHooks('all')", False]]
+    assert r["noScope"] == [["syscallClearHooks('this')", True], ["syscallClearHooks('all')", False]]
+
+
+# --- The panels at work: choosing, drafting, applying, recording ------------------
+
+# A scan that found a patch, an EDR hook, a hook the allowlist knows and one stub that could not be read
+DEVIATIONS_SCAN = r"""
+const dev = (name, state, extra = {}) => ({ name, module: 'ntdll.dll', number: +name.slice(2), rva: 4096, state, pattern: null,
+    target_owner: null, expected: '010300d4c0035fd6', actual: 'e92b170000000000', number_matches: null, ...extra });
+const DEVS = [dev('Nt7', 'patched', { target_owner: 'private', pattern: 'B' }), dev('Nt9', 'hooked', { target_owner: 'edr.dll', pattern: 'B' }),
+              dev('Nt11', 'hooked', { target_owner: 'edr.dll', allowlisted: true }), dev('Nt13', 'unreadable', { actual: null })];
+const scanWithDeviations = () => ({ ...scanBody({ Nt7: 'patched', Nt9: 'hooked', Nt11: 'hooked', Nt13: 'unreadable' }),
+    states: { ...scanBody().states, ...Object.fromEntries(DEVS.map(d => [d.name, d])) }, deviations: DEVS,
+    allowlist: { applied: true, entries: 1, reason: '' },
+    evidence: { label: 'SUSPICIOUS', score: 4.8, findings: [{ kind: 'syscall_stub_patched', syscall: 'Nt7', score: 4 },
+                                                          { kind: 'syscall_stub_hooked', syscall: 'Nt9', score: 0.8 }] } });
+const scanned = async () => { initSyscalls(); syscallsTabShown(); await settle(); routes['/api/syscalls/scan'] = { body: scanWithDeviations() };
+                              chooseTarget(4242); await runSyscallScan(); };
+"""
+
+
+def _panels(script):
+    return _flow(DEVIATIONS_SCAN + script)
+
+
+@needs_node
+def test_choosing_a_syscall_reads_its_detail_for_the_view_of_the_map_and_shows_it():
+    r = _panels(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        const before = requests.length;
+        syscallSelect('Nt41');
+        const loading = els['syscall-detail-body'].innerHTML;
+        await settle();
+        out({ urls: requests.slice(before).map(q => q.url), loading, body: els['syscall-detail-body'].innerHTML,
+              empty: (syscallSelect(''), els['syscall-detail-body'].innerHTML) });
+      })();""")
+    assert r["urls"] == ["/api/syscalls/Nt41?view=arm64"]
+    assert "Loading" in r["loading"] and "Nt41" in r["loading"]
+    assert "0x29" in r["body"] and "HANDLE" in r["body"] and "010300d4c0035fd6" in r["body"]
+    assert "Choose a syscall" in r["empty"]
+
+
+@needs_node
+def test_a_late_answer_for_a_syscall_that_is_no_longer_chosen_is_dropped():
+    r = _panels(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        const original = globalThis.fetch; let release;
+        globalThis.fetch = (url, options) => url.includes('/Nt1?') ? new Promise(resolve => { release = () => resolve({ ok: true, status: 200, json: async () => lookupBody('Nt1').body }); })
+                                                                    : original(url, options);
+        syscallSelect('Nt1'); await settle();
+        syscallSelect('Nt2'); await settle();
+        release(); await settle();
+        out(els['syscall-detail-body'].innerHTML);
+      })();""")
+    assert ">Nt2<" in r and ">Nt1<" not in r
+
+
+@needs_node
+def test_a_syscall_that_cannot_be_read_says_so_instead_of_showing_the_last_one():
+    r = _panels(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        syscallSelect('Nt1'); await settle();
+        routes['/api/syscalls/Nt5'] = { status: 404, body: { error: 'unknown syscall Nt5' } };
+        syscallSelect('Nt5'); await settle();
+        const missing = els['syscall-detail-body'].innerHTML;
+        routes['/api/syscalls/Nt6'] = new Error('Connection lost');
+        syscallSelect('Nt6'); await settle();
+        out({ missing, lost: els['syscall-detail-body'].innerHTML });
+      })();""")
+    assert "unknown syscall Nt5" in r["missing"] and ">Nt1<" not in r["missing"] and "data-sortable" not in r["missing"]
+    assert "Connection lost" in r["lost"]
+
+
+@needs_node
+def test_a_scan_puts_what_was_measured_into_the_open_detail_and_the_deviation_list():
+    r = _panels(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        syscallSelect('Nt7'); await settle();
+        const before = els['syscall-detail-body'].innerHTML;
+        routes['/api/syscalls/scan'] = { body: scanWithDeviations() };
+        chooseTarget(4242); await runSyscallScan();
+        const after = els['syscall-detail-body'].innerHTML;
+        syscallSelect('NtUser3'); await settle();
+        const outside = els['syscall-detail-body'].innerHTML;
+        out({ before, after, outside, list: els['syscall-deviations'].innerHTML, head: els['syscall-deviations-head'].textContent });
+      })();""")
+    assert "Jump target" not in r["before"] and "patched" in r["after"] and "private memory" in r["after"] and "e92b170000000000" in r["after"]
+    assert "not part of the last scan" in r["outside"]
+    for name in ("Nt7", "Nt9", "Nt11", "Nt13"):
+        assert f"syscallSelect(&quot;{name}&quot;)" in r["list"], name
+    assert "+4.00" in r["list"] and "+0.80" in r["list"], "what each stub added to the score, from the evidence"
+    assert "allowlist" in r["list"].lower()
+    assert r["head"].startswith("4 of 600"), r["head"]
+
+
+@needs_node
+def test_without_a_scan_the_deviation_list_says_to_scan_and_a_scan_that_fails_empties_it():
+    r = _panels(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        const first = els['syscall-deviations'].innerHTML;
+        await scanned();
+        const full = els['syscall-deviations'].innerHTML;
+        routes['/api/syscalls/scan'] = { status: 504, body: { error: 'the scan took too long' } };
+        await runSyscallScan();
+        out({ first, full, failed: els['syscall-deviations'].innerHTML });
+      })();""")
+    assert "Scan a process" in r["first"] and "syscallSelect" not in r["first"]
+    assert "syscallSelect" in r["full"]
+    assert "Scan a process" in r["failed"] and "syscallSelect" not in r["failed"], "no row of a scan that did not happen"
+
+
+@needs_node
+def test_a_rule_is_drafted_from_the_deviation_as_the_scan_returned_it_and_nothing_is_written():
+    r = _panels(r"""
+      (async () => {
+        await scanned();
+        const draft = { kind: 'signature', entry: { family: 'Stub patch', pattern: 'e92b1700', match: 'prefix', weight: 3 },
+                        text: '{ "family": "Stub patch" }', target: 'webui/syscall_signatures.json', covered_by: [] };
+        routes['/api/syscalls/rule'] = { body: draft };
+        const before = requests.length;
+        const unknown = await syscallDraftRule('NtNope');
+        const done = await syscallDraftRule('Nt7');
+        out({ unknown, done, posts: requests.slice(before).map(q => [q.method, q.url, q.body]), panel: els['syscall-draft'].innerHTML,
+              hidden: els['syscall-draft'].hidden });
+      })();""")
+    assert r["unknown"] is False and r["done"] is True
+    assert len(r["posts"]) == 1, "an unknown syscall asks nothing, a draft asks once, and neither apply nor download is asked"
+    method, url, body = r["posts"][0]
+    assert (method, url) == ("POST", "/api/syscalls/rule")
+    assert body["view"] == "arm64" and body["build"] == "26220.5770" and body["deviation"]["name"] == "Nt7"
+    assert body["deviation"]["actual"] == "e92b170000000000" and body["deviation"]["state"] == "patched"
+    assert r["hidden"] is False and "RULE DRAFT" in r["panel"] and "Stub patch" in r["panel"] and "Nothing has been written" in r["panel"]
+
+
+@needs_node
+def test_a_draft_the_server_refuses_shows_its_reason_and_keeps_no_old_draft():
+    r = _panels(r"""
+      (async () => {
+        await scanned();
+        routes['/api/syscalls/rule'] = { body: { kind: 'signature', entry: { family: 'Old' }, text: 'OLD DRAFT', target: 't', covered_by: [] } };
+        await syscallDraftRule('Nt7');
+        routes['/api/syscalls/rule'] = { status: 400, body: { error: 'this hook is known on this host <b>x</b>' } };
+        const done = await syscallDraftRule('Nt9');
+        out({ done, panel: els['syscall-draft'].innerHTML, hidden: els['syscall-draft'].hidden });
+      })();""")
+    assert r["done"] is False and r["hidden"] is False
+    assert "this hook is known on this host &lt;b&gt;x&lt;/b&gt;" in r["panel"] and "OLD DRAFT" not in r["panel"]
+    assert "applySyscallRule" not in r["panel"]
+
+
+YARA_DRAFT = ("{ kind: 'yara', name: 'TDC_DirectSyscall_NtFoo_arm64_0123abcd', text: 'rule TDC_DirectSyscall_NtFoo_arm64_0123abcd { condition: true }', "
+              "target: 'TDC_DirectSyscall_NtFoo_arm64_0123abcd.yar' }")
+
+
+@needs_node
+def test_applying_a_rule_writes_it_once_and_says_that_only_the_repo_copy_survives():
+    r = _panels(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        const draft = %s;
+        syscallShowDraft(draft);
+        routes['/api/syscalls/rule/apply'] = { body: { status: 'written', name: draft.name, path: 'C:\\rules\\tdc\\x.yar', reload_seconds: 2 } };
+        const before = requests.length;
+        const wrong = await applySyscallRule('TDC_DirectSyscall_Other_x64_aaaaaaaa');
+        const both = [applySyscallRule(draft.name), applySyscallRule(draft.name)];
+        await Promise.all(both);
+        out({ wrong, posts: requests.slice(before).map(q => [q.url, q.body]), panel: els['syscall-draft'].innerHTML });
+      })();""" % YARA_DRAFT)
+    assert r["wrong"] is False
+    assert [u for u, _ in r["posts"]] == ["/api/syscalls/rule/apply"], "a second press while the first is under way asks nothing"
+    body = r["posts"][0][1]
+    assert body["name"] == "TDC_DirectSyscall_NtFoo_arm64_0123abcd" and "condition: true" in body["text"]
+    assert "C:\\rules\\tdc\\x.yar" in r["panel"] and "about 2 seconds" in r["panel"] and "rebuilt" in r["panel"]
+    assert "syscall-draft-result-ok" in r["panel"]
+
+
+@needs_node
+def test_a_rule_that_is_there_already_is_not_an_error_and_a_failed_write_is():
+    r = _panels(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        const draft = %s;
+        syscallShowDraft(draft);
+        routes['/api/syscalls/rule/apply'] = { status: 409, body: { status: 'exists', name: draft.name, path: 'C:\\rules\\tdc\\x.yar',
+            error: 'a rule of this name is already there' } };
+        await applySyscallRule(draft.name);
+        const exists = els['syscall-draft'].innerHTML;
+        routes['/api/syscalls/rule/apply'] = { status: 500, body: { error: 'cannot write the rule: Access is denied' } };
+        await applySyscallRule(draft.name);
+        const failed = els['syscall-draft'].innerHTML;
+        routes['/api/syscalls/rule/apply'] = new Error('Connection lost');
+        await applySyscallRule(draft.name);
+        out({ exists, failed, lost: els['syscall-draft'].innerHTML });
+      })();""" % YARA_DRAFT)
+    assert "syscall-draft-result-info" in r["exists"] and "left alone" in r["exists"] and "Nothing was written" in r["exists"]
+    assert "syscall-draft-result-error" in r["failed"] and "Access is denied" in r["failed"]
+    assert "syscall-draft-result-error" in r["lost"] and "Connection lost" in r["lost"]
+    assert "disabled" not in re.search(r"<button[^>]*applySyscallRule[^>]*>", r["lost"]).group(0), "a failed apply can be tried again"
+
+
+@needs_node
+def test_a_signature_draft_cannot_be_applied_and_a_closed_draft_is_gone():
+    r = _panels(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        syscallShowDraft({ kind: 'signature', entry: { family: 'x' }, text: 'x', target: 't', name: 'TDC_DirectSyscall_NtFoo_arm64_0123abcd' });
+        const before = requests.length;
+        const applied = await applySyscallRule('TDC_DirectSyscall_NtFoo_arm64_0123abcd');
+        const asked = requests.length - before;
+        syscallCloseDraft();
+        out({ applied, asked, hidden: els['syscall-draft'].hidden, panel: els['syscall-draft'].innerHTML });
+      })();""")
+    assert r["applied"] is False and r["asked"] == 0
+    assert r["hidden"] is True and r["panel"] == ""
+
+
+@needs_node
+def test_the_known_hooks_are_read_with_the_tab_and_listed():
+    r = _panels(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        out({ html: els['syscall-hooks'].innerHTML, head: els['syscall-hooks-head'].textContent,
+              urls: requests.map(q => q.url).filter(u => u.includes('hook-baseline')) });
+      })();""")
+    assert r["urls"] == ["/api/syscalls/hook-baseline"]
+    assert "MsMpEng.exe" in r["html"] and "NtBar" in r["html"]
+    assert r["head"] == "1 known"
+
+
+@needs_node
+def test_hooks_of_a_run_are_recorded_only_after_the_precondition_was_confirmed():
+    r = _panels(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        const beforeScan = requests.length;
+        const noScan = await syscallCaptureHooks();
+        const asksWithoutScan = requests.length - beforeScan;
+        await scanned();
+        const asked = []; let answer = false;
+        globalThis.confirm = question => { asked.push(question); return answer; };
+        routes['/api/syscalls/hook-baseline'] = (url, options) => options && options.method === 'POST'
+            ? { body: { pid: 4242, build: '26220.5770', view: 'arm64', added: 1, entries: 2, partial: false } } : { body: HOOKS };
+        const before = requests.length;
+        const declined = await syscallCaptureHooks();
+        const afterDecline = requests.slice(before).map(q => q.method);
+        answer = true;
+        const done = await syscallCaptureHooks();
+        out({ noScan, asksWithoutScan, declined, afterDecline, done, asked, requests: requests.slice(before).map(q => [q.method, q.url, q.body]),
+              html: els['syscall-hooks'].innerHTML });
+      })();""")
+    assert r["noScan"] is False and r["asksWithoutScan"] == 0, "without a scan there is no run to record"
+    assert r["declined"] is False and r["afterDecline"] == [], "a declined question records nothing"
+    assert r["done"] is True
+    assert [(m, u) for m, u, _ in r["requests"]] == [("POST", "/api/syscalls/hook-baseline"), ("GET", "/api/syscalls/hook-baseline")]
+    assert r["requests"][0][2] == {"pid": 4242}, "the process the last scan was of"
+    assert len(r["asked"]) == 2 and "believe is clean" in r["asked"][0] and "PID 4242" in r["asked"][0]
+    assert "1 hooked stub that is not known yet" in r["asked"][0], "the known hook is not counted again"
+    assert "Recorded 1 new hook" in r["html"] and "scan again" in r["html"].lower()
+
+
+@needs_node
+def test_a_failed_recording_says_so_and_can_be_tried_again():
+    r = _panels(r"""
+      (async () => {
+        await scanned();
+        globalThis.confirm = () => true;
+        routes['/api/syscalls/hook-baseline'] = (url, options) => options && options.method === 'POST'
+            ? { status: 500, body: { error: 'cannot write the hook allowlist: Access is denied' } } : { body: HOOKS };
+        await syscallCaptureHooks();
+        out({ html: els['syscall-hooks'].innerHTML });
+      })();""")
+    assert "syscall-draft-result-error" in r["html"] and "Access is denied" in r["html"]
+    assert " disabled" not in re.search(r"<button[^>]*syscallCaptureHooks[^>]*>", r["html"]).group(0)
+
+
+@needs_node
+def test_forgetting_known_hooks_asks_first_and_names_its_scope():
+    r = _panels(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        const asked = []; let answer = false;
+        globalThis.confirm = question => { asked.push(question); return answer; };
+        routes['/api/syscalls/hook-baseline'] = (url, options) => options && options.method === 'DELETE' ? { body: { ok: true, entries: 0 } } : { body: HOOKS };
+        const before = requests.length;
+        const declined = await syscallClearHooks('this');
+        const afterDecline = requests.length - before;
+        answer = true;
+        await syscallClearHooks('this'); await syscallClearHooks('all');
+        const unknown = await syscallClearHooks('everything');
+        out({ declined, afterDecline, asked: asked.length, unknown,
+              deletes: requests.slice(before).filter(q => q.method === 'DELETE').map(q => q.url) });
+      })();""")
+    assert r["declined"] is False and r["afterDecline"] == 0
+    assert r["deletes"] == ["/api/syscalls/hook-baseline?build=26220.5770&view=arm64", "/api/syscalls/hook-baseline"]
+    assert r["unknown"] is False
+
+
+@needs_node
+def test_the_panes_switch_below_the_narrow_width_and_a_choice_there_shows_the_detail():
+    r = _panels(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        const pressed = () => [els['syscall-pane-map'].attrs['aria-pressed'], els['syscall-pane-detail'].attrs['aria-pressed']];
+        const wide = (syscallSelect('Nt41'), els['syscall-work'].dataset.pane);
+        globalThis.matchMedia = query => ({ matches: query === SYSCALL_NARROW });
+        syscallSelect('Nt42');
+        const narrow = els['syscall-work'].dataset.pane, narrowPressed = pressed();
+        const back = syscallSetPane('map');
+        out({ wide, narrow, narrowPressed, back, after: [els['syscall-work'].dataset.pane, pressed()], unknown: syscallSetPane('__proto__'),
+              painted: canvases().every(c => c.calls.length > 0) });
+      })();""")
+    assert r["wide"] == "map" and r["narrow"] == "detail" and r["narrowPressed"] == ["false", "true"]
+    assert r["back"] is True and r["after"] == ["map", ["true", "false"]] and r["unknown"] is False and r["painted"]
+
+
+@needs_node
+def test_the_signature_and_the_draft_are_copied_as_text():
+    r = _panels(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        const copied = [], toasts = [];
+        // node has a navigator of its own, which an assignment does not replace
+        const setNavigator = value => Object.defineProperty(globalThis, 'navigator', { value, configurable: true, writable: true });
+        setNavigator({ clipboard: { writeText: text => { copied.push(text); return Promise.resolve(); } } });
+        globalThis.showToast = (type, title) => toasts.push(type + ':' + title);
+        syscallSelect('Nt41'); await settle();
+        syscallCopySignature();
+        syscallShowDraft({ kind: 'signature', entry: { family: 'x' }, text: 'THE TEXT <b>', target: 't' });
+        syscallCopyDraft(); await settle();
+        setNavigator({});
+        const without = [syscallCopySignature(), syscallCopyDraft()];
+        out({ copied, toasts, without });
+      })();""")
+    assert r["copied"][0].startswith("? Nt41(") or r["copied"][0].startswith("NTSTATUS Nt41(")
+    assert "_In_ HANDLE Handle" in r["copied"][0] and r["copied"][1] == "THE TEXT <b>"
+    assert r["without"] == [False, False], "no clipboard: it says no instead of throwing"
+
+
+@needs_node
+def test_open_in_rizin_opens_the_native_module_and_goes_to_the_syscall_and_is_not_offered_for_an_emulated_view():
+    r = _panels(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        const calls = [];
+        globalThis.openInRizin = path => { calls.push(['open', path]); return Promise.resolve(true); };
+        globalThis.rizinSeek = (addr, source) => { calls.push(['seek', addr, source]); return Promise.resolve(true); };
+        syscallSelect('Nt41'); await settle();
+        const native = els['syscall-detail-body'].innerHTML;
+        await syscallOpenRizin();
+        // an emulated x64 process on an arm64 host: the baseline of the map is the x64 view
+        routes['/api/syscalls/scan'] = { body: { ...scanBody(), view: 'x64' } };
+        chooseTarget(4242); await runSyscallScan(); await settle();
+        const emulated = els['syscall-detail-body'].innerHTML;
+        const none = await syscallOpenRizin();
+        out({ calls, native, emulated, none });
+      })();""")
+    assert 'onclick="syscallOpenRizin()"' in r["native"]
+    assert r["calls"] == [["open", "C:\\Windows\\System32\\ntdll.dll"], ["seek", "Nt41", "syscalls"]]
+    assert "syscallOpenRizin" not in r["emulated"] and "native view" in r["emulated"]
+    assert r["none"] is False and len(r["calls"]) == 2, "nothing is opened for a view Rizin would not show"
+
+
+@needs_node
+def test_the_detail_is_read_again_when_the_view_of_the_map_changes_and_dropped_when_its_syscall_goes():
+    r = _panels(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        syscallSelect('Nt41'); await settle();
+        const before = requests.length;
+        routes['/api/syscalls/scan'] = { body: { ...scanBody(), view: 'x64' } };
+        chooseTarget(4242); await runSyscallScan(); await settle();
+        const reread = requests.slice(before).map(q => q.url).filter(u => u.includes('/Nt41'));
+        syscallState.baseline = { ...syscallState.baseline, items: [] }; syscallState.selected = '';
+        syscallRenderAll();
+        out({ reread, cleared: els['syscall-detail-body'].innerHTML });
+      })();""")
+    assert r["reread"] == ["/api/syscalls/Nt41?view=x64"]
+    assert "Choose a syscall" in r["cleared"]
+
+
+# --- Hover: only the two cells that changed are drawn again -----------------------
+
+# A canvas that is a grid of pixels: each pixel remembers what was painted on it since it was last cleared, the
+# clip is honoured, and a stroke is the four bars it is made of. Two canvases that were painted by different routes
+# are alike when every pixel remembers the same.
+RASTER = r"""
+class Raster {
+    constructor(w, h) { this.w = w; this.h = h; this.px = new Map(); this.globalAlpha = 1; this.fillStyle = ''; this.strokeStyle = ''; this.lineWidth = 1;
+                        this.clipRect = null; this.stack = []; this.ops = 0; }
+    inClip(x, y) { const c = this.clipRect; return !c || (x >= c[0] && x < c[2] && y >= c[1] && y < c[3]); }
+    cover(x0, y0, x1, y1, fn) {
+        for (let y = Math.max(0, Math.floor(y0)); y < Math.min(this.h, Math.ceil(y1)); y++)
+            for (let x = Math.max(0, Math.floor(x0)); x < Math.min(this.w, Math.ceil(x1)); x++)
+                if (this.inClip(x, y) && Math.min(x + 1, x1) - Math.max(x, x0) > 0 && Math.min(y + 1, y1) - Math.max(y, y0) > 0) fn(x + ',' + y);
+    }
+    fillRect(x, y, w, h) { this.ops++; const tag = this.fillStyle + '@' + this.globalAlpha;
+        this.cover(x, y, x + w, y + h, k => this.px.set(k, (this.px.get(k) || '') + '|' + tag)); }
+    strokeRect(x, y, w, h) { this.ops++; const t = this.lineWidth / 2, tag = 'S' + this.strokeStyle + '@' + this.globalAlpha + 'w' + this.lineWidth;
+        for (const [a, b, c, d] of [[x - t, y - t, x + w + t, y + t], [x - t, y + h - t, x + w + t, y + h + t], [x - t, y - t, x + t, y + h + t], [x + w - t, y - t, x + w + t, y + h + t]])
+            this.cover(a, b, c, d, k => this.px.set(k, (this.px.get(k) || '') + '|' + tag)); }
+    clearRect(x, y, w, h) { this.cover(x, y, x + w, y + h, k => this.px.delete(k)); }
+    save() { this.stack.push(this.clipRect); }
+    restore() { this.clipRect = this.stack.pop(); }
+    beginPath() { this.path = null; }
+    rect(x, y, w, h) { this.path = [x, y, x + w, y + h]; }
+    clip() { const p = this.path, c = this.clipRect; this.clipRect = c ? [Math.max(c[0], p[0]), Math.max(c[1], p[1]), Math.min(c[2], p[2]), Math.min(c[3], p[3])] : p; }
+    snapshot() { return [...this.px.entries()].sort().map(([k, v]) => k + '=' + v).join('\n'); }
+}
+"""
+
+REPAINT_FUNCTIONS = ["syscallBands", "syscallBandLayout", "syscallCellOrigin", "syscallCellAt", "syscallCellLook", "syscallStateColor",
+                     "syscallDrawBand"]
+
+
+def _repaint(script):
+    return _run_node(REPAINT_FUNCTIONS, RASTER + RECORDER + script, _map_prelude())
+
+
+@needs_node
+def test_drawing_again_only_the_cells_that_changed_leaves_the_same_picture_as_drawing_them_all():
+    r = _repaint(r"""
+      const width = 140, grid = syscallBandLayout(60, width);     // 11 columns: rows of cells that touch each other's rings
+      const items = cells.slice(0, 60);
+      const states = new Map(items.map((c, i) => [c.name, i % 7 === 3 ? 'patched' : i % 11 === 5 ? 'hooked' : i % 13 === 2 ? 'unreadable' : i % 17 === 4 ? 'diverged' : 'intact']));
+      const match = new Set(items.filter((c, i) => i % 3 !== 0).map(c => c.name));
+      const mismatches = [];
+      // every pair of neighbours in a grid and some far apart, with and without a filter and a selected cell
+      for (const withMatch of [false, true]) for (const selected of [null, 'Nt14', 'Nt3']) for (const from of [0, 3, 10, 11, 12, 21, 43, 59]) for (const to of [0, 4, 11, 12, 22, 33, 58]) {
+        const model = hover => ({ states, match: withMatch ? match : null, selected, hover });
+        const partial = new Raster(width, grid.height);
+        syscallDrawBand(partial, grid, items, model(items[from].name));
+        syscallDrawBand(partial, grid, items, model(items[to].name), [from, to]);
+        const whole = new Raster(width, grid.height);
+        syscallDrawBand(whole, grid, items, model(items[to].name));
+        if (partial.snapshot() !== whole.snapshot()) mismatches.push([withMatch, selected, from, to]);
+      }
+      out({ mismatches: mismatches.slice(0, 5), count: mismatches.length });""")
+    assert r["count"] == 0, r["mismatches"]
+
+
+@needs_node
+def test_a_repaint_clears_and_draws_only_around_the_cells_it_is_given():
+    r = _repaint(r"""
+      const layout2 = syscallBandLayout(cells.length, 900);
+      const full = record(); syscallDrawBand(full.ctx, layout2, cells, quietModel);
+      const part = record(); part.ctx.save = part.ctx.restore = part.ctx.beginPath = part.ctx.clip = () => {};
+      const rects = []; part.ctx.rect = (...a) => rects.push(a);
+      syscallDrawBand(part.ctx, layout2, cells, { ...quietModel, hover: 'Nt500' }, [500]);
+      const o = syscallCellOrigin(layout2, 500);
+      out({ full: full.calls.length, part: part.calls.length, rects, origin: o,
+            inside: part.calls.every(c => c.x >= o.x - 12 - 3 && c.x <= o.x + 12 + 3 && c.y >= o.y - 12 - 3 && c.y <= o.y + 12 + 3) });""")
+    assert r["full"] == 2461 and r["part"] <= 10, "a cell and the neighbours its ring reaches, and the ring"
+    reach = 3
+    assert r["rects"] == [[r["origin"]["x"] - reach, r["origin"]["y"] - reach, 10 + 2 * reach, 10 + 2 * reach]]
+    assert r["inside"]
+
+
+@needs_node
+def test_a_hover_that_crosses_a_cell_paints_the_two_cells_of_its_own_band_and_nothing_else():
+    r = _panels(r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        const ntdll = canvases().find(c => c.dataset.module === 'ntdll.dll'), win32u = canvases().find(c => c.dataset.module === 'win32u.dll');
+        const layout = syscallBandLayout(600, 900), at = i => syscallCellOrigin(layout, i);
+        const event = i => ({ target: ntdll, clientX: 10 + at(i).x + 4, clientY: 20 + at(i).y + 4 });
+        els['syscall-map'].fire('pointermove', event(41));
+        ntdll.clears = []; win32u.clears = []; ntdll.calls.length = 0; const winBefore = win32u.calls.length;
+        els['syscall-map'].fire('pointermove', event(42));
+        const move = { clears: ntdll.clears.length, other: win32u.clears.length, otherCalls: win32u.calls.length === winBefore, drawn: ntdll.calls.length };
+        ntdll.clears = [];
+        els['syscall-map'].fire('pointermove', event(42));
+        const same = ntdll.clears.length;
+        els['syscall-map'].fire('pointerleave', {});
+        const leave = { clears: ntdll.clears.length, hover: syscallState.hover };
+        out({ move, same, leave });
+      })();""")
+    assert r["move"]["clears"] == 2 and r["move"]["other"] == 0 and r["move"]["otherCalls"], "the old and the new cell, in their own band"
+    assert r["move"]["drawn"] < 30, "a few cells, not 600"
+    assert r["same"] == 0, "a pointer that stays in its cell paints nothing"
+    assert r["leave"] == {"clears": 1, "hover": ""}, "leaving draws the one cell that was ringed"
+
+
 # --- The page: markup, styles and themes ------------------------------------------
 
 def _block():
@@ -958,7 +1889,7 @@ def test_every_element_the_block_reads_is_in_the_page():
 
 def test_the_assets_moved_on_and_the_switch_in_the_tab_bar_is_wired():
     html = _read(INDEX_HTML)
-    for asset, minimum in (("style.css", 83), ("theme-cyberpunk.css", 37), ("app.js", 122)):
+    for asset, minimum in (("style.css", 85), ("theme-cyberpunk.css", 37), ("app.js", 123)):
         version = int(re.search(rf"{re.escape(asset)}\?v=(\d+)", html).group(1))
         assert version >= minimum, f"{asset} was changed and kept its ?v="
     assert re.search(r"if \(tabName === 'syscalls'\)[^\n]*syscallsTabShown\(\)", SOURCE)
@@ -1059,3 +1990,21 @@ def test_the_lists_of_the_tests_cover_the_whole_block():
     assert sorted(functions) == sorted(FLOW_FUNCTIONS)
     consts = re.findall(r"^(?:const|let) (\w+) = ", block, re.M)
     assert sorted(consts) == sorted(FLOW_CONSTS)
+
+
+def test_the_detail_the_deviations_and_the_known_hooks_are_in_the_work_area_and_the_panes_switch_when_narrow():
+    tab = _tab_markup("syscalls")
+    work = tab[tab.index('id="syscall-work"'):]
+    for needle in ('id="syscall-detail"', 'id="syscall-detail-body"', 'id="syscall-draft"', 'id="syscall-lower"',
+                   'id="syscall-deviations"', 'id="syscall-hooks"'):
+        assert needle in work, needle
+    # panels in the manner of the Rizin tab: a section with a head and a title that explains itself
+    assert len(re.findall(r'<h3 class="syscall-panel-title" data-info="[^"<&]{1,300}">', tab)) == 3
+    assert "syscallSetPane('map')" in tab and "syscallSetPane('detail')" in tab
+    css = _read(STYLE_CSS)
+    media = css[css.index("@media (max-width: 1399px)"):]
+    assert 'data-pane="detail"] .syscall-main' in media and 'data-pane="map"] .syscall-detail' in media
+    assert _declared(_rules(STYLE_CSS)[".syscall-pane-switch"], "display") == "none", "one place on a wide screen: no tabs"
+    # apply (this VM, now) and download (the repo, for good) are told apart by their own accents
+    rules = _rules(STYLE_CSS)
+    assert _declared(rules[".syscall-draft-vm"], "border-left-color") != _declared(rules[".syscall-draft-repo"], "border-left-color")

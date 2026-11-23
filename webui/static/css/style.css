@@ -12417,21 +12417,61 @@ button.logs-trunc:hover { color: var(--accent-orange); text-decoration: underlin
     border-left-color: var(--severity-critical);
     color: var(--severity-critical);
 }
+/* The work area: the map and the catalog on the left, the detail panel on the right, the deviations and the
+   known hooks under the map. Below 1400px the map and the detail panel take turns (MAP | DETAIL in the toolbar). */
 .syscall-work {
     flex: 1;
     min-height: 0;
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(340px, 28%);
+    grid-template-rows: minmax(0, 1fr) auto;
     gap: 8px;
     padding: 8px 14px 12px;
 }
 .syscall-main {
-    flex: 1;
+    grid-column: 1;
+    grid-row: 1;
     min-height: 0;
     min-width: 0;
     display: flex;
     flex-direction: column;
     gap: 8px;
+}
+.syscall-detail {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+}
+.syscall-lower {
+    grid-column: 1;
+    grid-row: 2;
+    height: clamp(170px, 30vh, 320px);
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+    gap: 8px;
+}
+.syscall-pane-switch {
+    display: none;
+}
+@media (max-width: 1399px) {
+    .syscall-work {
+        grid-template-columns: minmax(0, 1fr);
+    }
+    .syscall-main,
+    .syscall-detail {
+        grid-column: 1;
+        grid-row: 1;
+    }
+    .syscall-lower {
+        grid-row: 2;
+    }
+    .syscall-work[data-pane="map"] .syscall-detail,
+    .syscall-work[data-pane="detail"] .syscall-main {
+        display: none;
+    }
+    .syscall-pane-switch {
+        display: inline-flex;
+    }
 }
 .syscall-map-panel,
 .syscall-catalog {
@@ -12605,4 +12645,369 @@ button.logs-trunc:hover { color: var(--accent-orange); text-decoration: underlin
 .syscall-row-num {
     text-align: right;
     font-variant-numeric: tabular-nums;
+}
+
+/* The detail panel, the deviations and the known hooks: panels as the Rizin tab has them */
+.syscall-panel {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    padding: 8px 10px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+}
+.syscall-panel-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    margin-bottom: 6px;
+}
+.syscall-panel-title {
+    display: flex;
+    align-items: center;
+    margin: 0;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: .1em;
+    white-space: nowrap;
+    color: var(--accent-cyan);
+}
+.syscall-panel-note {
+    min-width: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.syscall-panel-body {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow: auto;
+}
+.syscall-detail-body {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+.syscall-empty-error {
+    color: var(--severity-critical);
+}
+.syscall-muted {
+    color: var(--text-muted);
+}
+.syscall-detail-name {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    font-family: var(--font-mono);
+}
+.syscall-detail-sc {
+    min-width: 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+.syscall-detail-state {
+    padding: 1px 6px;
+    font-size: 10px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--text-primary);
+    border: 1px solid var(--border-accent);
+    border-radius: var(--radius);
+}
+.syscall-detail-note {
+    margin: 6px 0;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.syscall-facts {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: 2px 12px;
+    margin: 0 0 8px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+}
+.syscall-facts dt {
+    color: var(--text-muted);
+}
+.syscall-facts dd {
+    margin: 0;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+.syscall-owner {
+    font-weight: 600;
+}
+.syscall-owner-private {
+    color: var(--syscall-patched);
+}
+.syscall-owner-unresolved {
+    color: var(--syscall-diverged);
+}
+.syscall-finding {
+    margin: 0 0 10px;
+    padding: 6px 8px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-left: 3px solid var(--syscall-diverged);
+    border-radius: var(--radius);
+}
+.syscall-finding-intact {
+    border-left-color: var(--syscall-intact);
+}
+.syscall-finding-hooked {
+    border-left-color: var(--syscall-hooked);
+}
+.syscall-finding-patched {
+    border-left-color: var(--syscall-patched);
+}
+.syscall-finding-unreadable {
+    border-left-color: var(--syscall-unreadable);
+}
+.syscall-finding-help {
+    margin-bottom: 6px;
+    font-size: 11.5px;
+}
+.syscall-number-differs {
+    color: var(--syscall-patched);
+}
+.syscall-known-hook {
+    margin: 6px 0 0;
+    padding-top: 6px;
+    border-top: 1px dashed var(--border-primary);
+    font-size: 11.5px;
+    color: var(--text-primary);
+}
+.syscall-section {
+    margin: 0 0 10px;
+}
+.syscall-section-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: .1em;
+    color: var(--text-muted);
+}
+.syscall-stub-line {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 2px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+}
+.syscall-stub-label {
+    flex: 0 0 52px;
+    color: var(--text-muted);
+}
+.syscall-bytes {
+    min-width: 0;
+    letter-spacing: .06em;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+}
+/* A byte that differs is marked by more than its colour: heavier, and underlined */
+.syscall-bytes-diff {
+    padding: 0 1px;
+    font-weight: 700;
+    color: var(--text-primary);
+    text-decoration: underline;
+    background: rgba(var(--severity-medium-rgb), 0.25);
+}
+.syscall-stub-note {
+    margin-top: 2px;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.syscall-signature {
+    margin: 0;
+    padding: 6px 8px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-primary);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+}
+.syscall-links {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-top: 4px;
+}
+.syscall-links a.btn {
+    text-decoration: none;
+}
+.syscall-link {
+    padding: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent-cyan);
+    text-align: left;
+    background: none;
+    border: 0;
+    cursor: pointer;
+}
+.syscall-link:hover {
+    text-decoration: underline;
+}
+.syscall-deviations .view-table tr.selected td {
+    background: rgba(var(--accent-cyan-rgb), 0.12);
+}
+.syscall-deviations .syscall-bytes {
+    letter-spacing: 0;
+}
+/* the bytes of a row give way to the jump target and the score, the whole of them is in the title */
+.syscall-deviations .view-table-clip {
+    max-width: 9em;
+}
+.syscall-flag {
+    padding: 0 4px;
+    font-size: 10px;
+    color: var(--syscall-patched);
+    border: 1px solid var(--syscall-patched);
+    border-radius: var(--radius);
+}
+.syscall-known {
+    color: var(--syscall-hooked);
+    cursor: help;
+}
+.syscall-hooks .syscall-notice {
+    margin-bottom: 6px;
+}
+.syscall-hook-capture {
+    margin-top: 8px;
+    padding: 6px 8px;
+    background: rgba(var(--severity-medium-rgb), 0.08);
+    border-left: 3px solid var(--severity-medium);
+    border-radius: var(--radius);
+}
+.syscall-hook-warning {
+    margin: 0 0 6px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+}
+.syscall-hook-warning strong {
+    color: var(--text-primary);
+}
+.syscall-hook-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+.syscall-hook-actions .btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+/* The rule draft: shown as text; applying it (this VM, now) and downloading it (the repo, for good) are two blocks */
+.syscall-draft {
+    flex: 0 1 auto;
+    max-height: 60%;
+    margin-top: 8px;
+    overflow-y: auto;
+}
+.syscall-draft[hidden] {
+    display: none;
+}
+.syscall-draft-card {
+    padding-top: 8px;
+    border-top: 1px solid var(--border-primary);
+}
+.syscall-draft-name {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+.syscall-draft-meta {
+    margin-bottom: 4px;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.syscall-draft-text {
+    max-height: 200px;
+    margin: 0 0 6px;
+    padding: 6px 8px;
+    overflow: auto;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-primary);
+    white-space: pre;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+}
+.syscall-draft-hint {
+    margin: 0 0 6px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+}
+.syscall-draft-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.syscall-draft-action {
+    padding: 6px 8px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-left-width: 3px;
+    border-radius: var(--radius);
+}
+.syscall-draft-action p {
+    margin: 0 0 6px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+}
+.syscall-draft-action-title {
+    margin-bottom: 2px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: .1em;
+    color: var(--text-primary);
+}
+.syscall-draft-vm {
+    border-left-color: var(--severity-medium);
+}
+.syscall-draft-repo {
+    border-left-color: var(--accent-green);
+}
+.syscall-draft-action a.btn {
+    display: inline-block;
+    text-decoration: none;
+}
+.syscall-draft-result {
+    margin-top: 6px;
+    padding: 4px 8px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    border-left: 3px solid var(--border-accent);
+    overflow-wrap: anywhere;
+}
+.syscall-draft-result-ok {
+    border-left-color: var(--accent-green);
+}
+.syscall-draft-result-info {
+    border-left-color: var(--severity-info);
+}
+.syscall-draft-result-error {
+    border-left-color: var(--severity-critical);
+    color: var(--severity-critical);
 }
