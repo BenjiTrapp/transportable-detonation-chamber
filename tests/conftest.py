@@ -134,7 +134,7 @@ def make_alert(i, pid, ts, image, ppid=None, parent_name="", engine="sigma",
 
 
 def make_pe(*, imports=(), delay=(), exports=(), forwarders=(), code=b"",
-            export_rva=None, machine=0x8664, sections=()) -> bytes:
+            export_rva=None, machine=0x8664, sections=(), nameless=(), ordinal_base=1, dll=False) -> bytes:
     """A minimal PE whose directories pefile parses.
 
     imports, delay: (module, (function, ...)) pairs — several modules, not one; an int function is an ordinal
@@ -142,6 +142,9 @@ def make_pe(*, imports=(), delay=(), exports=(), forwarders=(), code=b"",
     forwarders:     (name, "MODULE.Function") pairs
     sections:       (name, bytes) pairs, for a section such as ".apiset"
     machine:        0x8664 x64, 0xAA64 arm64
+    nameless:       (ordinal, "MODULE.Function" or None) pairs: exports without a name, a forwarder or a definition
+    ordinal_base:   the export directory's Base; the named exports, then the forwarders, take Base, Base + 1, ...
+    dll:            sets IMAGE_FILE_DLL in the COFF characteristics (0x2022 instead of 0x22)
 
     A PE32+ whose first section starts at RVA 0x1000, file offset 0x200. `code` sits at RVA 0x11C0, file offset
     0x3C0, where the exports point unless `export_rva` says otherwise (without code, at 0x1000); the tables follow
@@ -182,11 +185,17 @@ def make_pe(*, imports=(), delay=(), exports=(), forwarders=(), code=b"",
 
     export_dir = None
     entries = [(name, None) for name in exports] + list(forwarders)
-    if entries:
+    if entries or nameless:
         align(4)
         start, n = base + len(body), len(entries)
+        slots = {ordinal_base + i: entry for i, entry in enumerate(entries)}
+        for ordinal, forwarder in nameless:
+            assert ordinal >= ordinal_base and ordinal not in slots, ordinal
+            slots[ordinal] = (None, forwarder)
+        count = max(slots) - ordinal_base + 1                       # an ordinal without an export is a zero slot
         functions_at = start + 40
-        names_at, ordinals_at = functions_at + 4 * n, functions_at + 8 * n
+        names_at = functions_at + 4 * count
+        ordinals_at = names_at + 4 * n
         strings = bytearray()
 
         def string(text):
@@ -197,9 +206,12 @@ def make_pe(*, imports=(), delay=(), exports=(), forwarders=(), code=b"",
         image_name = string("image.dll")
         name_rvas = [string(name) for name, _ in entries]
         target = export_rva if export_rva is not None else (base + code_at if code else base)
-        addresses = [target if forwarder is None else string(forwarder) for _, forwarder in entries]
-        block = struct.pack("<IIHHIIIIIII", 0, 0, 0, 0, image_name, 1, n, n, functions_at, names_at, ordinals_at)
-        block += struct.pack(f"<{n}I", *addresses) + struct.pack(f"<{n}I", *name_rvas)
+        addresses = [0] * count
+        for ordinal, (_, forwarder) in sorted(slots.items()):
+            addresses[ordinal - ordinal_base] = target if forwarder is None else string(forwarder)
+        block = struct.pack("<IIHHIIIIIII", 0, 0, 0, 0, image_name, ordinal_base, count, n,
+                            functions_at, names_at, ordinals_at)
+        block += struct.pack(f"<{count}I", *addresses) + struct.pack(f"<{n}I", *name_rvas)
         block += struct.pack(f"<{n}H", *range(n)) + bytes(strings)
         export_dir = (put(block, 1), len(block))
     align(0x200)
@@ -221,7 +233,7 @@ def make_pe(*, imports=(), delay=(), exports=(), forwarders=(), code=b"",
             directories[index * 8:index * 8 + 8] = struct.pack("<II", *entry)
     optional += bytes(directories)
     assert len(optional) == 0xF0
-    coff = struct.pack("<HHIIIHH", machine, len(layout), 0, 0, 0, 0xF0, 0x22)
+    coff = struct.pack("<HHIIIHH", machine, len(layout), 0, 0, 0, 0xF0, 0x2022 if dll else 0x22)
     header = b"MZ" + bytes(0x3A) + struct.pack("<I", 0x40) + b"PE\0\0" + coff + optional + headers
     out = header.ljust(0x200, b"\0")
     for _, data in layout:

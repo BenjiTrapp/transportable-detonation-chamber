@@ -543,6 +543,25 @@ def test_the_test_pe_builder_produces_an_image_pefile_reads_back():
     assert pefile.PE(data=make_pe()).FILE_HEADER.Machine == 0x8664
 
 
+def test_the_builder_places_nameless_exports_at_their_ordinals_after_a_base():
+    import pefile
+    data = make_pe(exports=("Named",), forwarders=(("Fwd", "NTDLL.RtlFwd"),), ordinal_base=5,
+                   nameless=((9, None), (12, "NTDLL.#8")), code=_X64_STUB_0x3A, dll=True)
+    pe = pefile.PE(data=data)
+    try:
+        assert [(s.ordinal, s.name, s.forwarder) for s in pe.DIRECTORY_ENTRY_EXPORT.symbols] == [
+            (5, b"Named", None), (6, b"Fwd", b"NTDLL.RtlFwd"), (9, None, None), (12, None, b"NTDLL.#8")]
+        assert pe.DIRECTORY_ENTRY_EXPORT.struct.Base == 5
+        assert pe.FILE_HEADER.Characteristics == 0x2022
+    finally:
+        pe.close()
+    pe = pefile.PE(data=make_pe())
+    try:
+        assert pe.FILE_HEADER.Characteristics == 0x22          # the header every existing caller has had
+    finally:
+        pe.close()
+
+
 def _binary(tmp_path, name="sample.dll", **pe):
     path = tmp_path / name
     path.write_bytes(make_pe(**pe))
@@ -552,7 +571,7 @@ def _binary(tmp_path, name="sample.dll", **pe):
 def test_imports_are_grouped_by_module_in_lower_case(tmp_path):
     info = _binary(tmp_path, "Sample.DLL", imports=(("NTDLL.dll", ("NtClose", "NtOpenFile")),
                                                     ("KernelBase.dll", ("CreateFileW",))),
-                   delay=(("USER32.dll", ("MessageBoxW",)),))
+                   delay=(("USER32.dll", ("MessageBoxW",)),), dll=True)
     assert info.name == "sample.dll" and info.kind == "dll"
     assert info.imports == {"ntdll.dll": ("NtClose", "NtOpenFile"), "kernelbase.dll": ("CreateFileW",),
                             "user32.dll": ("MessageBoxW",)}
@@ -587,6 +606,24 @@ def test_the_machine_of_an_arm64_image_is_arm64_and_of_an_amd64_image_x64(tmp_pa
     assert _binary(tmp_path, machine=0x1C4).machine == "other"
 
 
+def test_a_nameless_export_is_its_ordinal_and_every_named_export_has_its_ordinal(tmp_path):
+    info = _binary(tmp_path, exports=("RtlAllocateHeap", "NtClose"), forwarders=(("HeapAlloc", "NTDLL.#8"),),
+                   ordinal_base=8, nameless=((20, None), (21, "NTDLL.#9")))
+    assert info.exports == ("RtlAllocateHeap", "NtClose", "#20")
+    assert info.forwarders == {"HeapAlloc": "NTDLL.#8", "#21": "NTDLL.#9"}
+    # a forwarder naming "#8", or an import by ordinal, is turned into a name through this
+    assert info.ordinal_names == {8: "RtlAllocateHeap", 9: "NtClose", 10: "HeapAlloc"}
+
+
+def test_the_kind_is_what_the_header_says_and_the_extension_only_when_it_cannot(tmp_path, monkeypatch):
+    assert _binary(tmp_path, "renamed.exe", dll=True).kind == "dll"
+    assert _binary(tmp_path, "renamed.dll", dll=False).kind == "exe"
+    # the header always carries the flag; the extension is the fallback for a header that yields no characteristics
+    monkeypatch.setattr(binary_graph, "_is_dll", lambda pe: None)
+    assert _binary(tmp_path, "tool.exe", dll=True).kind == "exe"
+    assert _binary(tmp_path, "lib.DLL", dll=False).kind == "dll"
+
+
 # --- a directory of them ------------------------------------------------------------------
 
 def test_the_tree_holds_every_pe_of_the_directory_and_names_the_others_as_skipped(tmp_path):
@@ -603,8 +640,8 @@ def test_the_tree_holds_every_pe_of_the_directory_and_names_the_others_as_skippe
 
 
 def test_a_name_that_differs_only_in_case_is_one_binary(tmp_path, monkeypatch):
-    (tmp_path / "KERNEL32.DLL").write_bytes(make_pe(exports=("CreateFileW",)))
-    (tmp_path / "kernel32.dll").write_bytes(make_pe(exports=("CreateFileW",)))   # the same file where case folds
+    (tmp_path / "KERNEL32.DLL").write_bytes(make_pe(exports=("CreateFileW",), dll=True))
+    (tmp_path / "kernel32.dll").write_bytes(make_pe(exports=("CreateFileW",), dll=True))   # the same file where case folds
     (tmp_path / "Notepad.Exe").write_bytes(make_pe())
     # both spellings listed, as a case-sensitive file system lists them, on every platform the suite runs on
     real_listdir = os.listdir
@@ -660,7 +697,34 @@ def test_a_pe_truncated_after_its_headers_is_skipped_and_does_not_raise(tmp_path
     assert [b.name for b in binaries] == ["whole.dll"]
     assert [name for name, _ in skipped] == ["cut.dll", "half.dll"]
     for _, reason in skipped:
-        assert reason.startswith("truncated: "), reason
+        # pefile reads the headers and refuses the directory; the reason names which, and pefile's word for it
+        assert reason.startswith("unreadable import directory: "), reason
+        assert "Corrupt header" in reason and len(reason) < 160, reason
+
+
+def test_a_section_one_byte_past_the_end_of_the_file_is_read_as_pefile_reads_it(tmp_path):
+    # pefile warns ("SizeOfRawData is larger than file") and reads every directory: no reason to lose the binary
+    whole = make_pe(imports=(("ntdll.dll", ("NtClose",)),), exports=("A",),
+                    forwarders=(("HeapAlloc", "NTDLL.RtlAllocateHeap"),))
+    (tmp_path / "short.dll").write_bytes(whole[:-1])
+    info = binary_graph.extract_binary(str(tmp_path / "short.dll"))
+    assert info.imports == {"ntdll.dll": ("NtClose",)}
+    assert info.exports == ("A",) and info.forwarders == {"HeapAlloc": "NTDLL.RtlAllocateHeap"}
+
+
+def test_a_directory_pefile_cannot_read_skips_only_when_it_is_one_the_record_needs(tmp_path):
+    # an unrelated section cut short is no reason: only the import, delay-load and export directories count
+    whole = make_pe(imports=(("ntdll.dll", ("NtClose",)),), sections=((".rsrc", b"r" * 0x400),))
+    (tmp_path / "rsrc.dll").write_bytes(whole[:-0x300])
+    assert binary_graph.extract_binary(str(tmp_path / "rsrc.dll")).imports == {"ntdll.dll": ("NtClose",)}
+    cut = make_pe(delay=(("user32.dll", ("MessageBoxW",)),))[:0x200]
+    (tmp_path / "lazy.dll").write_bytes(cut)
+    with pytest.raises(binary_graph.ExtractError, match="^unreadable delay-load directory: "):
+        binary_graph.extract_binary(str(tmp_path / "lazy.dll"))
+    cut = make_pe(exports=("A",))[:0x200]
+    (tmp_path / "exp.dll").write_bytes(cut)
+    with pytest.raises(binary_graph.ExtractError, match="^unreadable export directory: "):
+        binary_graph.extract_binary(str(tmp_path / "exp.dll"))
 
 
 def test_a_file_larger_than_the_cap_is_skipped_unread(tmp_path, monkeypatch):

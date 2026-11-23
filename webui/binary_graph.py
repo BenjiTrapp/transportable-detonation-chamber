@@ -25,8 +25,9 @@ class BinaryInfo:
     kind: str                               # "dll" | "exe"
     machine: str                            # "arm64" | "x64" | "x86" | "other"
     imports: dict[str, tuple[str, ...]]     # module, lower case -> functions, an ordinal as "#<n>"
-    exports: tuple[str, ...]                # the names this image defines itself
-    forwarders: dict[str, str]              # export name -> the raw forwarder string, "NTDLL.RtlAllocateHeap"
+    exports: tuple[str, ...]                # what this image defines itself, a nameless export as "#<ordinal>"
+    forwarders: dict[str, str]              # export name or "#<ordinal>" -> the raw string, "NTDLL.RtlAllocateHeap"
+    ordinal_names: dict[int, str]           # ordinal -> name of every named export, forwarders included
 
 
 def _text(raw):
@@ -52,28 +53,54 @@ def _imports(pe):
 
 
 def _exports(pe):
-    exports, forwarders = {}, {}
+    """`(exports, forwarders, ordinal_names)`: a nameless export is named by its ordinal, "#<n>", as an import by
+    ordinal is; ordinal_names turns such a number back into a name where the image gives one."""
+    exports, forwarders, ordinal_names = {}, {}, {}
     for sym in getattr(getattr(pe, "DIRECTORY_ENTRY_EXPORT", None), "symbols", None) or []:
-        if not sym.name:
+        if sym.name:
+            name = _text(sym.name)
+            if sym.ordinal is not None:
+                ordinal_names[sym.ordinal] = name
+        elif sym.ordinal is not None:
+            name = f"#{sym.ordinal}"
+        else:
             continue
-        name = _text(sym.name)
         if sym.forwarder:
             forwarders[name] = _text(sym.forwarder)
         else:
             exports[name] = None
-    return tuple(exports), forwarders
+    return tuple(exports), forwarders, ordinal_names
+
+
+def _is_dll(pe):
+    """Whether IMAGE_FILE_DLL is set, None when the header yields no characteristics."""
+    characteristics = getattr(getattr(pe, "FILE_HEADER", None), "Characteristics", None)
+    return None if characteristics is None else bool(characteristics & 0x2000)
 
 
 def _size_text(n):
     return f"{n // 2**20} MiB" if n >= 2**20 else f"{n} bytes"
 
 
-def _truncated(pe, size):
-    """The first section whose raw data runs past the end of a file of `size` bytes, or None."""
-    for section in pe.sections:
-        if section.PointerToRawData + section.SizeOfRawData > size:
-            return _text(section.Name.rstrip(b"\0")) or "?"
-    return None
+# the directories the record is read from: pefile's index, the attribute it sets, the word a skip reason uses
+DIRECTORIES = (("IMAGE_DIRECTORY_ENTRY_IMPORT", "DIRECTORY_ENTRY_IMPORT", "import"),
+               ("IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT", "DIRECTORY_ENTRY_DELAY_IMPORT", "delay-load"),
+               ("IMAGE_DIRECTORY_ENTRY_EXPORT", "DIRECTORY_ENTRY_EXPORT", "export"))
+
+
+def _parse_directories(pefile, pe):
+    """Parse the import, delay-load and export directories one at a time, and raise ExtractError for one the header
+    declares and pefile refuses: no entry, and a warning of its own. An empty table is read as empty, not refused;
+    a fault elsewhere in the file (a section cut short, say) is pefile's to tolerate."""
+    declared = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+    for index_name, attribute, word in DIRECTORIES:
+        index = pefile.DIRECTORY_ENTRY[index_name]
+        before = len(pe.get_warnings())
+        pe.parse_data_directories(directories=[index])
+        new = pe.get_warnings()[before:]
+        entry = declared[index] if index < len(declared) else None
+        if entry is not None and entry.VirtualAddress and new and not getattr(pe, attribute, None):
+            raise ExtractError(f"unreadable {word} directory: {new[0][:120]}")
 
 
 def extract_binary(path: str) -> BinaryInfo:
@@ -91,7 +118,7 @@ def extract_binary(path: str) -> BinaryInfo:
             if size == 0:
                 raise ExtractError("not a PE: the file is empty")
             with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as data:
-                return _record(pefile, name, data, size)
+                return _record(pefile, name, data)
     except ExtractError:
         raise
     except OSError as exc:
@@ -100,22 +127,20 @@ def extract_binary(path: str) -> BinaryInfo:
         raise ExtractError(f"malformed: {type(exc).__name__}") from None
 
 
-def _record(pefile, name, data, size):
+def _record(pefile, name, data):
     try:
         pe = pefile.PE(data=data, fast_load=True)
     except pefile.PEFormatError as exc:
         raise ExtractError(f"not a PE: {str(exc.value).strip()}") from None
     try:
-        section = _truncated(pe, size)
-        if section is not None:
-            raise ExtractError(f"truncated: section {section} runs past the end of the file")
-        pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"],
-                                               pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT"],
-                                               pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"]])
-        exports, forwarders = _exports(pe)
-        return BinaryInfo(name=name, kind="exe" if name.endswith(".exe") else "dll",
-                          machine=MACHINES.get(pe.FILE_HEADER.Machine, "other"),
-                          imports=_imports(pe), exports=exports, forwarders=forwarders)
+        _parse_directories(pefile, pe)
+        exports, forwarders, ordinal_names = _exports(pe)
+        dll = _is_dll(pe)
+        if dll is None:
+            dll = not name.endswith(".exe")
+        return BinaryInfo(name=name, kind="dll" if dll else "exe",
+                          machine=MACHINES.get(pe.FILE_HEADER.Machine, "other"), imports=_imports(pe),
+                          exports=exports, forwarders=forwarders, ordinal_names=ordinal_names)
     finally:
         pe.close()
 
