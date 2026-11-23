@@ -563,7 +563,7 @@ def from_syscall_scan(result, process=""):
         owner = (dev.get("target_owner") or "").lower()
         pattern = dev.get("pattern")
         relay = dev.get("relay") if isinstance(dev.get("relay"), list) else []
-        via = f" via {len(relay)} private relay{'s' if len(relay) != 1 else ''}" if relay else ""
+        via = f" via {len(relay)} relay{'s' if len(relay) != 1 else ''}" if relay else ""
         out.append(MemoryFinding(
             source="syscalls", kind=kind, process=process,
             detail=f"{name} -> {owner or 'unresolved target'}"

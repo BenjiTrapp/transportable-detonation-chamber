@@ -24887,8 +24887,8 @@ const SYSCALL_STATE_HELP = {
     intact: 'The stub is as the baseline has it.',
     hooked: 'hooked (file-backed module): the jump ends in a loaded module other than ntdll that a file backs. An EDR does that, ' +
             'but so does a DLL the sample loaded, or a legitimate DLL it overwrote in place (module stomping), which this scan cannot tell apart.',
-    patched: 'The jump ends in memory no hooking product explains: private memory or a section no file backs, after any relay was followed, ' +
-             'or a core Windows module such as kernelbase.dll (a code cave).',
+    patched: 'The jump ends in memory no hooking product explains: private memory, a section no file backs or a mapped view of a file, ' +
+             'after any relay was followed, or a core Windows module such as kernelbase.dll (a code cave).',
     diverged: 'The bytes differ, but the jump is not into a foreign module and not into private memory, or its target cannot be resolved. Not guessed at.',
     unreadable: 'No stub could be read.',
 };
@@ -25263,9 +25263,10 @@ function syscallBytesDiffer(a, b) {
     return n;
 }
 
-// Who a jump goes to: a module by name, memory no file backs, or nobody that could be found out
+// Who a jump goes to: a module by name, memory no file backs, a mapped view of a file, or nobody that could be found out
 function syscallOwnerHtml(owner) {
     if (owner === 'private') return '<span class="syscall-owner syscall-owner-private">private</span> memory, no file backs it';
+    if (owner === 'mapped') return 'a <span class="syscall-owner syscall-owner-private">mapped view</span> of a file, no loaded module';
     if (typeof owner === 'string' && owner) return `<span class="syscall-owner">${escapeHtml(owner)}</span>`;
     return '<span class="syscall-owner syscall-owner-unresolved">unresolved</span>';
 }

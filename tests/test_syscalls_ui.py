@@ -2519,6 +2519,15 @@ def test_the_stage_block_has_the_counts_the_partial_note_and_the_deviations_esca
 
 
 @needs_node
+def test_a_jump_into_a_mapped_view_is_named_as_one_and_not_as_a_module():
+    r = _run_node(DETAIL_FUNCTIONS, r"""
+      out({ mapped: syscallOwnerHtml("mapped"), help: SYSCALL_STATE_HELP.patched });""")
+    assert "mapped view" in r["mapped"] and "no loaded module" in r["mapped"]
+    assert 'class="syscall-owner">mapped<' not in r["mapped"], "not drawn as a module called mapped"
+    assert "mapped view" in r["help"]
+
+
+@needs_node
 def test_a_hooked_stub_is_named_by_what_backs_its_target_and_not_called_an_edr_hook():
     r = _run_node([], "out(SYSCALL_STATE_HELP);")
     assert "file-backed module" in r["hooked"]

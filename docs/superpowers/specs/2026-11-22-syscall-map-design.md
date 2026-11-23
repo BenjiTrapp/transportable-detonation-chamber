@@ -161,7 +161,8 @@ gehört**, nicht das Befehlsmuster:
 
 - Zeigt es in ein geladenes, auf der Platte hinterlegtes Modul, das nicht
   `ntdll` ist, heißt das `hooked`. Das ist der Normalfall bei installiertem EDR.
-- Zeigt es in privaten, nicht von einer Datei gedeckten Speicher, heißt das
+- Zeigt es in privaten, nicht von einer Datei gedeckten Speicher oder in eine
+  gemappte Ansicht einer Datei, die kein geladenes Modul ist, heißt das
   `patched`. Das ist das Signal — gemeint ist der **letzte** Eigentümer nach dem
   folgenden Punkt, nicht der erste Sprung.
 - **Ein erster Sprung in privaten Speicher ist für sich noch kein Befund.**
@@ -208,7 +209,15 @@ klassische Ziel von `NtMapViewOfSection`) ist nicht dateigedeckt und zählt als
 privat. Ein `MEM_IMAGE`-Bereich ohne Namen ist eine **fehlgeschlagene**
 Abfrage — ein Image ist per Definition dateigedeckt, und unter dem
 eingeschränkten Zugriffsrecht scheitert `GetMappedFileNameW` leicht — und wird
-wie jede fehlgeschlagene Eigentümer-Abfrage gezählt.
+wie jede fehlgeschlagene Eigentümer-Abfrage gezählt. Ein `MEM_MAPPED`-Bereich
+**mit** Dateinamen ist eine Datenansicht und kein geladenes Modul — geladene
+Module sind `MEM_IMAGE` —, gleich welche Datei er abbildet, auch eine
+Datenkopie von `ntdll.dll`. Kein Hook-Produkt führt seinen Handler aus einer
+solchen Ansicht aus. Sein Eigentümer heißt `mapped`, nicht der Dateiname, und
+er wird wie privater Speicher behandelt: `patched`, und als Relay verfolgt.
+Sonst hinge der Zustand derselben Ansicht davon ab, ob `GetMappedFileNameW`
+ihren Namen liefern konnte — ohne Namen wäre sie privat, mit Namen ein
+Modulname, der keiner ist.
 
 Die Befehlsmuster sind **pro Architektur** zu prüfen:
 

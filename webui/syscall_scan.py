@@ -16,8 +16,9 @@ import threading
 from typing import NamedTuple
 
 from syscall_baseline import (READ_LEN, STATE_DIVERGED, STATE_HOOKED, STATE_INTACT,
-                              STATE_PATCHED, STATE_UNREADABLE, OWNER_PRIVATE, Baseline,
-                              Syscall, classify_stub, jump_pattern, jump_pointer, jump_target)
+                              STATE_PATCHED, STATE_UNREADABLE, NON_MODULE_OWNERS, OWNER_MAPPED,
+                              OWNER_PRIVATE, Baseline, Syscall, classify_stub, jump_pattern,
+                              jump_pointer, jump_target)
 
 MEM_COMMIT = 0x1000
 MEM_IMAGE = 0x1000000
@@ -45,10 +46,13 @@ class Region(NamedTuple):
 
 
 def owner_from_region(region: Region | None) -> str | None:
-    """The owner `classify_stub` expects: a lower-case basename, "private", or None.
+    """The owner `classify_stub` expects: a lower-case basename, "private", "mapped", or None.
 
     "private" is memory no file backs: a private allocation, or a mapped view with no file behind it (a
     pagefile-backed section, the classic target of NtMapViewOfSection), which `_searchable` treats alike.
+    "mapped" is a mapped view of a named file: file-backed, but no loaded module, which only an image is. Its
+    basename is not the owner, or a data copy of ntdll.dll would read as ntdll itself. Both are weighed alike, so
+    the state of a view does not hang on whether GetMappedFileNameW named its file.
 
     GetMappedFileNameW names a device path; passed on as is, a jump back into
     `\\Device\\...\\ntdll.dll` would not compare equal to `ntdll.dll` and read as hooked."""
@@ -56,6 +60,8 @@ def owner_from_region(region: Region | None) -> str | None:
         return None
     if region.type == MEM_PRIVATE or (region.type == MEM_MAPPED and not region.path):
         return OWNER_PRIVATE
+    if region.type == MEM_MAPPED:
+        return OWNER_MAPPED
     if region.type == MEM_IMAGE and region.path:
         return ntpath.basename(region.path).lower() or None
     return None
@@ -180,8 +186,8 @@ MAX_RELAY_HOPS = 2
 def _target_owner(reader: ProcessReader, live: bytes, addr: int,
                   view: str) -> tuple[str | None, bool, list[dict]]:
     """`(owner, failed, relay)`. `owner` is who holds the final target of the hook jump, following up to
-    MAX_RELAY_HOPS relays in private memory whose bytes are a jump themselves; `relay` lists each relay passed
-    (`address`, `owner`, the `pattern` of its jump). `failed` when there is a jump but an owner on the way could not
+    MAX_RELAY_HOPS relays in memory that is no module (private, or a mapped view) whose bytes are a jump themselves;
+    `relay` lists each relay passed (`address`, `owner`, the `pattern` of its jump). `failed` when there is a jump but an owner on the way could not
     be looked up: an unreadable pointer, an unreadable relay, or a region query that failed. A hop that fails is not
     guessed past: the owner is then None. Changed bytes with no jump have no target to ask about, which is no
     failure; private code that is no jump is the code that runs, and stays private."""
@@ -190,7 +196,7 @@ def _target_owner(reader: ProcessReader, live: bytes, addr: int,
     if target is None:
         return None, failed, relay
     owner, failed = _lookup_owner(reader, target)
-    while owner == OWNER_PRIVATE and not failed and len(relay) < MAX_RELAY_HOPS:
+    while owner in NON_MODULE_OWNERS and not failed and len(relay) < MAX_RELAY_HOPS:
         code = _read_exact(reader, target, READ_LEN[view])
         if code is None:
             relay.append({"address": target, "owner": owner, "pattern": None})
@@ -283,7 +289,7 @@ class HookAllowlist:
         if not isinstance(name, str) or not name or not isinstance(owner, str):
             return None
         owner = owner.strip().lower()
-        if not owner or owner == OWNER_PRIVATE:
+        if not owner or owner in NON_MODULE_OWNERS:
             return None
         return name, owner
 

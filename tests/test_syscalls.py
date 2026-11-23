@@ -1046,7 +1046,7 @@ def test_a_complete_scan_is_not_partial(arm64_baseline):
     (_IMAGE, None),
     (_IMAGE._replace(path=""), None),
     (_IMAGE._replace(path="\\Device\\HarddiskVolume3\\"), None),
-    (syscall_scan.Region(syscall_scan.MEM_COMMIT, syscall_scan.MEM_MAPPED, "\\Device\\X\\a.dat"), None),
+    (syscall_scan.Region(syscall_scan.MEM_COMMIT, syscall_scan.MEM_MAPPED, "\\Device\\X\\a.dat"), "mapped"),
     # a section no file backs (pagefile-backed): NtMapViewOfSection's classic target
     (syscall_scan.Region(syscall_scan.MEM_COMMIT, syscall_scan.MEM_MAPPED, None), "private"),
     (syscall_scan.Region(syscall_scan.MEM_COMMIT, syscall_scan.MEM_MAPPED, ""), "private"),
@@ -1295,6 +1295,39 @@ def test_a_jump_into_a_section_no_file_backs_is_patched(x64_baseline):
     s = out["states"]["NtWriteVirtualMemory"]
     assert (s["state"], s["target_owner"]) == ("patched", "private")
     assert out["owner_errors"] == 0
+
+
+@pytest.mark.parametrize("path", [None, "", "\\Device\\HarddiskVolume3\\Users\\Public\\blob.dat",
+                                  "\\Device\\HarddiskVolume3\\Windows\\System32\\ntdll.dll"])
+def test_a_jump_into_a_mapped_view_is_patched_whether_or_not_its_file_could_be_named(x64_baseline, path):
+    # a mapped view is no loaded module, whatever file it maps (a data copy of ntdll.dll among them): no hooking
+    # product runs its handler from one. Whether GetMappedFileNameW named the file must not change the state.
+    reader = _x64_relay_reader(x64_baseline, b"\x48\x31\xc0\xc3" + b"\xcc" * 28)
+    reader._regions[0] = (_RELAY, 0x40, syscall_scan.Region(syscall_scan.MEM_COMMIT, syscall_scan.MEM_MAPPED, path))
+    out = syscall_scan.measure(x64_baseline, reader)
+    s = out["states"]["NtWriteVirtualMemory"]
+    assert s["state"] == "patched" and s["target_owner"] in ("private", "mapped")
+    assert (out["owner_errors"], out["partial"]) == (0, False)
+
+
+def test_a_relay_in_a_named_mapped_view_is_followed_like_one_that_is_not_named(x64_baseline):
+    states = []
+    for path in (None, "\\Device\\HarddiskVolume3\\Users\\Public\\blob.dat"):
+        reader = _with_edr_at_target(_x64_relay_reader(x64_baseline, _x64_minhook_relay(_EDR_TARGET)))
+        reader._regions[1] = (_RELAY, 0x40, syscall_scan.Region(syscall_scan.MEM_COMMIT, syscall_scan.MEM_MAPPED, path))
+        s = syscall_scan.measure(x64_baseline, reader)["states"]["NtWriteVirtualMemory"]
+        states.append((s["state"], s["target_owner"], len(s["relay"])))
+    assert states == [("hooked", "edrhook.dll", 1)] * 2
+
+
+def test_a_mapped_view_is_never_recorded_as_a_known_hook(tmp_path):
+    allowlist = _allowlist(tmp_path)
+    assert allowlist.add_from(_result_with(owner="mapped")) == 0
+
+
+def test_classify_calls_a_jump_into_a_mapped_view_patched():
+    out = syscall_baseline.classify_stub(_sc("x64"), bytes.fromhex("e910000000") + b"\x90" * 27, "x64", "mapped")
+    assert (out["state"], out["target_owner"]) == ("patched", "mapped")
 
 
 @pytest.mark.parametrize("path", [None, "", "\\Device\\HarddiskVolume3\\"])

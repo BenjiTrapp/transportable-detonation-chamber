@@ -316,6 +316,12 @@ STATE_UNREADABLE = "unreadable"
 
 # Owner value for memory that no file backs: a private allocation, or a section with no file behind it
 OWNER_PRIVATE = "private"
+# Owner value for a mapped view of a file: file-backed, but no loaded module, whatever file it maps (a data copy of
+# ntdll.dll among them). No hooking product runs its handler from one, so it is weighed as private memory is: the
+# same view must not change its state with whether GetMappedFileNameW happened to name its file.
+OWNER_MAPPED = "mapped"
+# Owners that are no module: a jump that ends in one is a patch, and a jump that lands in one is followed as a relay
+NON_MODULE_OWNERS = frozenset((OWNER_PRIVATE, OWNER_MAPPED))
 
 # Core Windows modules that no hooking product puts its handler into. A jump from a syscall stub into one of them
 # lands in a code cave, or in a module somebody overwrote, and is weighed as a patch: it is not what an EDR does,
@@ -506,7 +512,8 @@ def classify_stub(sc: Syscall, live: bytes | None, view: str, owner: str | None)
     """Compare the live stub with the baseline and decide its state.
 
     Which of hooked, patched, diverged follows from `owner`, the module that holds the
-    jump target ("private" for memory no file backs, None if unresolved), not from the
+    jump target ("private" for memory no file backs, "mapped" for a mapped view of a file, which is no module either,
+    None if unresolved), not from the
     instruction pattern: an EDR and malware use the same jumps. A module is named by its
     lower-case basename, as `ntdll.dll`; the caller normalises, nothing here does.
 
@@ -538,7 +545,7 @@ def classify_stub(sc: Syscall, live: bytes | None, view: str, owner: str | None)
     out["target_owner"] = owner
     if owner is None or owner in ("ntdll.dll", sc.module.lower()):
         out["state"] = STATE_DIVERGED
-    elif owner == OWNER_PRIVATE or is_core_system_module(owner):
+    elif owner in NON_MODULE_OWNERS or is_core_system_module(owner):
         out["state"] = STATE_PATCHED
     else:
         out["state"] = STATE_HOOKED
