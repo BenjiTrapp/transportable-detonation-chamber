@@ -3316,6 +3316,8 @@ def test_a_file_says_whether_it_imports_the_function_through_the_win32_to_nt_tab
                              # no path the curated table knows to NtWriteVirtualMemory: a proven bypass
                              ({"CreateFileW"}, False)):
         monkeypatch.setattr(tdc, "_pe_import_names", lambda data, imports=imports: imports)
+        # the import table stands in for a PE's: none of it is by ordinal
+        monkeypatch.setattr(tdc, "_pe_ordinal_imports", lambda data: {})
         hit = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()["hits"][0]
         assert hit["import_present"] is present, imports
 
@@ -4646,6 +4648,7 @@ def test_the_stage_hands_the_search_the_raw_and_the_expanded_import_table(tdc, t
     assert finding["needs_corroboration"] is True
     calls.clear()
     monkeypatch.setattr(tdc, "_pe_import_names", lambda data: {"VirtualAllocEx"})
+    monkeypatch.setattr(tdc, "_pe_ordinal_imports", lambda data: {})
     _run_stage(tdc, path=str(path))
     [((raw,), kw)] = calls
     assert raw == {"VirtualAllocEx"}

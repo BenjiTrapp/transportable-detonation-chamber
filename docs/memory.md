@@ -226,11 +226,42 @@ directly from System32 that the graph holds contributes. The image's own imports
 are read from its file. A module the graph does not hold (the sample's own DLL, a
 runtime or hook engine outside System32, a DLL of a System32 name side-loaded from
 elsewhere, one whose table was cut short), a process in another view than the
-graph's, or a module list that changed during the search leaves the union
+graph's, or a module list that cannot be read again after the search leaves the union
 incomplete, and the stub stays a hint (`doors_complete` `false`, with the module
 named in `doors_note`): a missing module is a missing door. Without a graph,
 process mode says only whether the image imports the function as well, and the
-proof can come only from the sample file. And some covered syscalls almost never yield a
+proof can come only from the sample file. The image's imports are the very question
+asked: a sample that imports a door is no proven bypass. Any other module the graph
+does not hold contributes neither imports nor exports, or a sample would ship a DLL
+with a made-up table and switch the proof off for the whole process; malware that
+loads a DLL of its own therefore mostly gets `null` in process mode, and its proof
+comes from its file. The module list is read before and after the search, and the
+union is over both lists: a module loaded only for a while had its doors in the
+address space all the same. An import by ordinal (`kernel32.dll!#157`) is named
+through the exporting module's record in the graph, in process and in file mode; one
+the graph cannot name (its module or number unknown, no graph, a graph of another
+view) is an unknown door, and no absence is claimed.
+
+**An emulated x64 process on ARM64 never gets a proof from process memory.** On this
+chamber that is the normal case, not an edge: a 64-bit sample runs emulated on the
+ARM64 VM, which is why two syscall baselines exist. The graph reads the native side
+of System32's ARM64X binaries, whose x64 side may import otherwise, so a union built
+from it would be wrong. The file-mode proof still works there, and it is the
+attributable source.
+
+Further residuals of the process-mode proof. A module that unlinks itself from the
+loader's list is missing from the union, which pushes the answer toward `false`,
+toward a proof: that is against an attacker's interest (malware wants to be a hint,
+not a proof, and has no reason to hide a module that imports a door), so it threatens
+only a clean program that hides a module from its own loader, which clean software
+does not do; no cross-check against the file-backed regions is built, by that
+reasoning. An image file changed on disk after the process started makes the union
+describe the file, not the mapped image. A module unloaded before the search is in
+neither list, though it may have left the stub. A System32 file overwritten without
+a build change is not noticed: the graph describes the old file (that takes admin
+rights).
+
+And some covered syscalls almost never yield a
 proof: nearly every binary imports `FreeLibrary` (a door to
 `NtUnmapViewOfSection`) and `CreateThread` or `_beginthreadex` (doors to
 `NtCreateThreadEx`), so a carried stub for hollowing or remote thread creation is

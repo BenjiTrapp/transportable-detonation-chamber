@@ -509,11 +509,44 @@ def _windows_path(path):
     return ntpath.normcase(ntpath.normpath(path))
 
 
+def _add_ordinal(graph, importer, module, function, names):
+    """Add the names the import `function` ("#<n>") of `module` goes by to `names`; the reason it cannot be named, or
+    "". The record of the exporting module names it (`ordinal_names`), followed through its forwarders and api sets.
+    An ordinal the cache cannot name (its module is not in the graph, or no export of it has that number) may be a
+    door, so whoever asks must not claim an absence."""
+    resolution = binary_graph.resolve_export(graph.binaries, graph.api_sets, module, function)
+    if resolution.reason != "defined":
+        return f"{importer} imports {function} of {module}, which the binary graph cannot name"
+    names.update(hop.function for hop in resolution.hops)
+    names.add(resolution.function)
+    return ""
+
+
+def name_ordinal_imports(graph, imports, *, view, importer="the file") -> tuple[set[str] | None, str]:
+    """`(names, why)`: the names the imports by ordinal of `imports` (module -> functions, an ordinal as "#<n>", named
+    ones passed over) go by, or None and the reason when one of them cannot be named: there is no graph, it is of
+    another view than the importer's (the x64 side of an ARM64X binary may number its exports otherwise), or the
+    cache does not know the ordinal. A door imported by ordinal is a door all the same."""
+    ordinals = [(module, f) for module, functions in imports.items() for f in functions if f.startswith("#")]
+    names = set()
+    if not ordinals:
+        return names, ""
+    if graph is None:
+        return None, f"{importer} imports by ordinal, and there is no binary graph of this system to name them"
+    if graph.arch != view:
+        return None, (f"{importer} imports by ordinal, and the binary graph is of {graph.arch}, not of {view}")
+    for module, function in ordinals:
+        why = _add_ordinal(graph, importer, module.lower(), function, names)
+        if why:
+            return None, why
+    return names, ""
+
+
 def _record_doors(graph, info, names):
     """Add the names `info` imports to `names`; the reason the record cannot speak for its imports, or "".
 
-    An import by ordinal is named by the cache: the record of the module it is imported from, followed through its
-    forwarders and api sets. One the cache cannot name may be a door, so it leaves the union incomplete."""
+    An import by ordinal is named by the cache (_add_ordinal); one it cannot name may be a door, so it leaves the
+    union incomplete."""
     if info.partial:
         return f"the import table of {info.name} was cut short when it was read"
     for module, functions in info.imports.items():
@@ -521,11 +554,9 @@ def _record_doors(graph, info, names):
             if not function.startswith("#"):
                 names.add(function)
                 continue
-            resolution = binary_graph.resolve_export(graph.binaries, graph.api_sets, module, function)
-            if resolution.reason != "defined":
-                return f"{info.name} imports {function} of {module}, which the binary graph cannot name"
-            names.update(hop.function for hop in resolution.hops)
-            names.add(resolution.function)
+            why = _add_ordinal(graph, info.name, module, function, names)
+            if why:
+                return why
     return ""
 
 
@@ -535,15 +566,23 @@ def doors_of_process(graph, modules, table, *, view, image_path=None, image=None
     or None and the reason when that union is incomplete. Only a complete union may carry a proof that a stub in the
     process's private memory goes around every documented path.
 
-    `modules` is the reader's list (`name`, `base`, `size`, `path`). A module counts by its path, never its name: one
-    directly in `system32` is the file the cache read, and contributes the imports of its record there. The process
-    image counts by the record `image` read from the file at `image_path`. Any other module (a sample's own DLL, one
-    of a runtime or a hook engine outside System32, a DLL of System32's name side-loaded from elsewhere, one in
-    System32 the cache does not hold, or whose record was cut short) leaves the union incomplete, and so does a list
-    that cannot be had, a module without a path, an image not identified or not read, and a process of another view
-    than the cache's (an x64 process on ARM64 runs the x64 side of the ARM64X binaries the cache read the native side
-    of). A door is what a module imports; no module's exports count: the stub lies in private memory, which no
-    export resolves to, and ntdll exports every Nt name."""
+    `modules` is the reader's list (`name`, `base`, `size`, `path`); a caller that listed more than once passes every
+    module of every list. A module counts by its path, never its name: one directly in `system32` is the file the
+    cache read, and contributes the imports of its record there.
+
+    Two halves, both deliberate. The process image is the sample, and its own import table is the very question
+    asked: it counts by the record `image` read from the file at `image_path`, and a sample that imports a door is
+    no proven bypass. Every other module the cache does not hold (a DLL the sample brought, a runtime or a hook
+    engine outside System32, a DLL of System32's name side-loaded from elsewhere, one in System32 the cache does not
+    hold, or whose record was cut short) contributes neither imports nor exports and leaves the union incomplete:
+    were its table to count, a sample would ship a DLL with a made-up table and switch the proof off for the whole
+    process. Malware that loads a DLL of its own thus mostly gets None here; the proof then comes from its file.
+
+    The union is also incomplete for a list that cannot be had, a module without a path, an image not identified
+    or not read, an import by ordinal the cache cannot name, and a process of another view than the cache's: an x64
+    process on ARM64 runs the x64 side of the ARM64X binaries whose native side the cache read, and that side may
+    import otherwise. A door is what a module imports; no module's exports count: the stub lies in private memory,
+    which no export resolves to, and ntdll exports every Nt name."""
     if graph.arch != view:
         return None, f"the binary graph is of {graph.arch}, the process runs as {view}"
     if not modules:

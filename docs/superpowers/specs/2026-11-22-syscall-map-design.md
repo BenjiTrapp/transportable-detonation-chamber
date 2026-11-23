@@ -580,11 +580,47 @@ mitgebrachten Stub daher nie sähe.
   aus seiner Datei. Kennt der Cache ein geladenes Modul nicht (eine Sample-eigene
   DLL, eine Laufzeit oder Hook-Engine außerhalb System32, eine von anderswo geladene
   DLL mit System32-Namen, ein abgeschnittener Eintrag), läuft der Prozess in einer
-  anderen Sicht als der Cache, fehlt der Cache oder ändert sich die Modulliste
-  während der Suche, ist die Vereinigung **unvollständig**: `import_present` bleibt
+  anderen Sicht als der Cache, fehlt der Cache oder lässt sich die Modulliste
+  nach der Suche nicht mehr lesen, ist die Vereinigung **unvollständig**: `import_present` bleibt
   dann unbekannt, nie False. Ein fehlendes Modul ist eine fehlende Tür, und eine
   fehlende Tür wäre eine falsche Anklage. Exporte zählen in der Vereinigung nicht:
   kein Export löst auf privaten Speicher auf, und ntdll exportiert jeden Nt-Namen.
+  Das Image des Prozesses ist das Sample selbst: seine Importtabelle ist genau die
+  Frage, und ein Sample, das `VirtualAllocEx` importiert, ist keine belegte Umgehung.
+  Jedes **andere** Modul, das der Cache nicht hält, trägt weder Importe noch Exporte
+  bei und macht die Vereinigung unvollständig — sonst schaltete ein Sample mit einer
+  eigenen DLL und erfundener Tabelle den Beleg für den ganzen Prozess ab. Malware mit
+  eigener DLL bekommt im Prozessmodus daher meist `None`; der Beleg kommt dann aus
+  der Datei, der zuordenbaren Quelle. Die Modulliste wird vor **und** nach der Suche
+  gelesen, und der Nenner ist die Vereinigung beider Listen: auch ein Modul, das nur
+  zeitweise geladen war, hatte seine Türen im Adressraum.
+- **Ein Import per Ordinal ist eine Tür wie jede andere**, in beiden Modi. Er wird
+  über `ordinal_names` des exportierenden Moduls im Cache benannt
+  (`kernel32.dll!#157`). Lässt er sich nicht benennen — das Modul fehlt im Cache,
+  die Nummer in seiner Tabelle, es gibt keinen Cache, oder der Cache hat eine andere
+  Sicht als die Datei —, ist die Tür unbekannt: im Prozessmodus ist die Vereinigung
+  unvollständig, und auch im Dateimodus wird dann kein Fehlen behauptet.
+- **Grenzen des Belegs im Prozessspeicher.**
+  - **Ein emulierter x64-Prozess auf ARM64 bekommt nie einen Beleg aus dem
+    Prozessspeicher.** Das ist auf dieser Kammer der **Normalfall**, kein Rand: ein
+    64-Bit-Sample läuft auf der ARM64-VM emuliert, deshalb gibt es überhaupt zwei
+    Baselines. Der Cache liest die native Sicht der ARM64X-Binaries, und deren
+    EC-Sicht kann andere Importe haben; eine Vereinigung daraus wäre falsch. Es
+    bleibt der Beleg aus der Datei, der zuordenbaren Quelle.
+  - **Ein Modul, das sich aus der Modulliste des Loaders austrägt,** fehlt in der
+    Vereinigung und schiebt die Antwort **zu** `False`, also zum Beleg. Das liegt
+    gegen das Interesse eines Angreifers: Malware will Hinweis sein, nicht Beleg,
+    und hat keinen Grund, ein Modul mit einer Tür zu verstecken. Gefährdet wäre nur
+    ein sauberes Programm, das ein Modul vor seinem eigenen Loader verbirgt, und
+    saubere Software tut das nicht. Ein Abgleich mit den dateigedeckten Regionen
+    wird deshalb bewusst nicht gebaut; die Abwägung steht hier statt der Arbeit.
+  - **Die Datei des Images hat sich nach dem Start geändert** (ein Sample, das sich
+    ersetzt, ein Updater): die Vereinigung beschreibt dann die Datei, nicht das
+    gemappte Image.
+  - **Ein Modul, das vor der Suche wieder entladen wurde,** steht in keiner Liste,
+    auch wenn es den Stub hinterlassen hat.
+  - **Eine System32-Datei, die ohne Build-Wechsel überschrieben wurde,** wird nicht
+    bemerkt: der Cache beschreibt die alte Datei. Das setzt Adminrechte voraus.
 - **Eigene Route** `POST /api/syscalls/stubs` mit `pid` oder `path`.
 - Dieser Befund ist die Eingabe für die generierte YARA-Regel aus Ziel 5.2.
 

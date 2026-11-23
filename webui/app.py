@@ -8401,8 +8401,9 @@ def _syscall_stage_file(path, baseline):
             content = fh.read()
     except OSError as exc:
         return [], {"skipped": f"the sample cannot be read: {exc.strerror or exc}"}
-    hits, imports = _syscall_search_file(content, baseline)
-    return hits, {"path": real, "size": len(content), "imports_read": imports is not None}
+    hits, imports, doors_note = _syscall_search_file(content, baseline)
+    return hits, {"path": real, "size": len(content), "imports_read": imports is not None,
+                  "doors_complete": not doors_note, "doors_note": doors_note}
 
 
 def _syscall_stage(pid, path):
@@ -8611,14 +8612,25 @@ def _syscall_module_identity(listed):
     return None if listed is None else sorted((str(m.get("path")), m.get("base")) for m in listed)
 
 
+def _syscall_imported_by(hit, doors):
+    name = hit.get("syscall")
+    if not isinstance(name, str):
+        return False
+    return name in doors or (name.startswith("Nt") and "Zw" + name[2:] in doors)
+
+
 def _syscall_search_process(pid, view, build, baseline, image_path, imports):
     """`(found, doors_note)`: the stub search of the process `pid`, and why it could not prove, "" when it could.
 
     A stub in private memory is judged against the union of the doors every loaded module imports
     (binary_graph_query.doors_of_process), never against the image's table alone: the memory is not the image's
     alone. The union needs the binary graph of this system, which is taken as it is and never built from here, and
-    is taken from the module list of the reader that searches, just before the search. A module list that changed by
-    the end of the search takes every proof back: a module loaded meanwhile may be the stub's author."""
+    is taken from the module list of the reader that searches, before the search and again after it.
+
+    The denominator covers every module loaded at any point of the search, so it is the union over both lists: a
+    module loaded only for a while still had its doors in the address space, and may be the stub's author. A module
+    of either list the cache does not cover makes the union incomplete, and a list that cannot be had after the
+    search does too. Both calls are needed; one would miss what came or went while the search ran."""
     graph, _ = _binary_graph_for(start_build=False)
     table, why = None, ""
     if graph is None:
@@ -8638,11 +8650,22 @@ def _syscall_search_process(pid, view, build, baseline, image_path, imports):
                                                               image_path=image_path, image=image)
         keywords = {"expanded_imports": doors, "covered": table.covered} if doors is not None else {}
         found = syscall_scan.find_stubs_in_process(reader, baseline, imports, **keywords)
-        if doors is not None and _syscall_module_identity(reader.modules()) != _syscall_module_identity(listed):
-            note = "the modules of the process changed during the search"
-            for hit in found:
-                if hit.get("import_present") is False:
-                    hit["import_present"] = None
+        if doors is None:
+            return found, note
+        after = reader.modules()
+        if _syscall_module_identity(after) == _syscall_module_identity(listed):
+            return found, note
+        if after is None:
+            doors, note = None, "the modules of the process could not be listed again after the search"
+        else:
+            doors, note = binary_graph_query.doors_of_process(graph, listed + after, table, view=view,
+                                                              image_path=image_path, image=image)
+            if doors is None:
+                note = f"the modules of the process changed during the search: {note}"
+        # only ever weaker: a proof becomes a hint, or the door a module loaded meanwhile brought
+        for hit in found:
+            if hit.get("import_present") is False:
+                hit["import_present"] = None if doors is None else _syscall_imported_by(hit, doors)
         return found, note
 
     return _syscall_read_process(pid, view, build, work)
@@ -8662,14 +8685,32 @@ def _pe_import_names_of_file(path):
 
 
 def _syscall_search_file(content, baseline):
-    """`(hits, imports)`: the stub search of a file's bytes, judged against its import table run through the Win32 to
-    Nt table, and that table (None when the file is no PE that can be read).
+    """`(hits, imports, doors_note)`: the stub search of a file's bytes, judged against its import table run through
+    the Win32 to Nt table, that table (None when the file is no PE that can be read), and why no absence could be
+    claimed, "" when one could.
+
+    An import by ordinal is named through the binary graph (binary_graph_query.name_ordinal_imports), never built
+    from here. One it cannot name may be a door: the hits keep their True, and no stub becomes a proof.
 
     A stub that is the body of an export under its own Nt or Zw name is the documented path itself, a copy of ntdll,
     and is imported (True). Nothing else in the export table counts: the author of a sample writes it, so a door name
     or the Nt name pointing anywhere but at the stub would buy off the proof for one line."""
     imports = _pe_import_names(content)
-    hits = syscall_scan.find_stubs_in_bytes(content, baseline, imports, **_syscall_expanded_imports(imports))
+    doors_note = "" if imports is not None else "the file is no PE whose import table can be read"
+    named = set()
+    if imports is not None:
+        ordinals = _pe_ordinal_imports(content)
+        if ordinals is None:
+            named, doors_note = None, "the imports by ordinal of the file cannot be read"
+        elif ordinals:
+            graph, _ = _binary_graph_for(start_build=False)
+            named, doors_note = binary_graph_query.name_ordinal_imports(graph, ordinals, view=baseline.view)
+        if named:
+            imports = imports | named
+    keywords = _syscall_expanded_imports(imports)
+    if named is None and keywords["covered"] is not None:
+        keywords["covered"] = frozenset()
+    hits = syscall_scan.find_stubs_in_bytes(content, baseline, imports, **keywords)
     exported = _pe_export_offsets(content) if imports is not None else {}
     for hit in hits:
         name = hit.get("syscall")
@@ -8677,7 +8718,30 @@ def _syscall_search_file(content, baseline):
             continue
         if any(exported.get(alias) == hit.get("offset") for alias in (name, "Zw" + name[2:])):
             hit["import_present"] = True
-    return hits, imports
+    return hits, imports, doors_note
+
+
+def _pe_ordinal_imports(data):
+    """The imports by ordinal of a PE, delay-loaded ones included: module, lower case -> ("#<n>", ...); None when
+    `data` is not a PE that can be read."""
+    try:
+        import pefile
+        pe = pefile.PE(data=data, fast_load=True)
+        try:
+            pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"],
+                                                   pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT"]])
+            out = {}
+            for table in ("DIRECTORY_ENTRY_IMPORT", "DIRECTORY_ENTRY_DELAY_IMPORT"):
+                for entry in getattr(pe, table, []):
+                    for imp in entry.imports:
+                        if imp.import_by_ordinal and imp.ordinal is not None:
+                            module = (entry.dll or b"").decode("ascii", "replace").lower()
+                            out.setdefault(module, []).append(f"#{imp.ordinal}")
+            return {module: tuple(functions) for module, functions in out.items()}
+        finally:
+            pe.close()
+    except Exception:
+        return None
 
 
 def _pe_export_offsets(data):
@@ -8728,8 +8792,8 @@ def api_syscalls_stubs():
 
     Each hit names the syscall of its number. For a file `import_present` is tri-state: False for a syscall a curated
     Win32 to Nt row leads to and the file's imports and exports, expanded through that table, do not hold (a proven
-    bypass); True for one they hold; None where no row leads to the syscall or the file is no PE that can be read
-    (see syscall_scan.find_stubs_in_bytes). For a process it is judged against the doors every loaded module imports
+    bypass); True for one they hold; None where no row leads to the syscall, the file is no PE that can be read, or
+    it imports by an ordinal the binary graph cannot name (see syscall_scan.find_stubs_in_bytes). For a process it is judged against the doors every loaded module imports
     (_syscall_search_process): False only when the binary graph of this system holds every loaded module and none of
     them, the image included, imports a door to the syscall; True when one does, or the image imports the function;
     None otherwise. `doors_complete` says whether that union could be built, and `doors_note` why not."""
@@ -8768,10 +8832,11 @@ def api_syscalls_stubs():
                 content = fh.read()
         except OSError as exc:
             raise _SyscallRouteError(f"the file cannot be read: {exc.strerror or exc}")
-        found, imports = _syscall_search_file(content, baseline)
+        found, imports, doors_note = _syscall_search_file(content, baseline)
         process = os.path.basename(real)
         result = {"mode": "file", "path": real, "size": len(content), "process": process,
-                  "imports_read": imports is not None, "partial": False, "note": ""}
+                  "imports_read": imports is not None, "doors_complete": not doors_note, "doors_note": doors_note,
+                  "partial": False, "note": ""}
     hits = list(found)
     findings = memory_evidence.from_direct_stubs(hits, process)
     result.update(tool="Syscalls", view=baseline.view, build=baseline.build, hits=hits,

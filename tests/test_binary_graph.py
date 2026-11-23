@@ -2858,8 +2858,9 @@ def _doors_graph(*extra, arch="x64"):
     return _query_graph(
         _q("ntdll.dll", exports=["NtWriteVirtualMemory", "ZwWriteVirtualMemory", "NtClose", "ZwClose"]),
         _q("kernelbase.dll", imports={"ntdll.dll": ("NtClose",)}, exports=["WriteProcessMemory", "CloseHandle"]),
-        _q("kernel32.dll", imports={"kernelbase.dll": ("CloseHandle",)}, exports=["CloseHandle"],
-           forwarders={"WriteProcessMemory": "kernelbase.WriteProcessMemory"}),
+        _with_ordinals(_q("kernel32.dll", imports={"kernelbase.dll": ("CloseHandle",)}, exports=["CloseHandle"],
+                          forwarders={"WriteProcessMemory": "kernelbase.WriteProcessMemory"}),
+                       {157: "WriteProcessMemory", 158: "CloseHandle"}),
         *extra, arch=arch)
 
 
@@ -3024,7 +3025,9 @@ def doors_host(tdc, monkeypatch, target, sample_dir):
     builds = []
     monkeypatch.setattr(tdc, "_build_binary_graph", lambda build, arch: builds.append((build, arch)))
     os.makedirs(tdc.NTSLEUTH_BASELINE_DIR, exist_ok=True)
-    binary_graph.save_graph(_doors_graph(), os.path.join(tdc.NTSLEUTH_BASELINE_DIR,
+    extra = (_q("dbghelp.dll", imports={"kernel32.dll": ("WriteProcessMemory",)}),
+             _q("version.dll", imports={"kernel32.dll": ("CloseHandle",)}))
+    binary_graph.save_graph(_doors_graph(*extra), os.path.join(tdc.NTSLEUTH_BASELINE_DIR,
                                                          binary_graph.cache_name("26220.5770", "x64")))
     image = sample_dir / "sample.exe"
     image.write_bytes(make_pe(imports=(("kernel32.dll", ("GetLastError",)),)))
@@ -3091,3 +3094,116 @@ def test_the_detonation_stage_keeps_the_process_hint_when_the_union_is_incomplet
     process = result["stubs"]["process"]
     assert [h["import_present"] for h in process["hits"]] == [None]
     assert process["doors_complete"] is False and "clr.dll" in process["doors_note"]
+
+
+# --- Ruling 31: the denominator covers every module loaded at any point of the search ------------------------------
+
+def _changing(target, later):
+    first = target.reader._m
+    calls = []
+    target.reader.modules = lambda: calls.append(1) or (first if len(calls) == 1 else later(first))
+    return calls
+
+
+def test_a_cached_module_loaded_during_the_search_brings_its_doors_into_the_union(client, target, doors_host):
+    # dbghelp arrived while the search ran: its import of WriteProcessMemory was in the address space all the same
+    _changing(target, lambda first: first + _loaded(_SYS32 + "dbghelp.dll"))
+    body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
+    assert [h["import_present"] for h in body["hits"]] == [True]
+    assert body["doors_complete"] is True
+
+
+def test_a_cached_module_without_a_door_loaded_during_the_search_keeps_the_proof(client, target, doors_host):
+    _changing(target, lambda first: first + _loaded(_SYS32 + "version.dll"))
+    body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
+    assert [h["import_present"] for h in body["hits"]] == [False]
+    assert body["doors_complete"] is True
+
+
+def test_a_module_gone_by_the_end_of_the_search_still_counts(client, target, doors_host):
+    # listed before the search, unloaded by its end: the union is over both lists, not the last one
+    calls = []
+    first = target.reader._m + _loaded(_SYS32 + "dbghelp.dll")
+    target.reader.modules = lambda: calls.append(1) or (first if len(calls) == 1 else first[:-1])
+    body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
+    assert [h["import_present"] for h in body["hits"]] == [True]
+
+
+def test_a_module_list_that_cannot_be_had_after_the_search_takes_the_proof_back(client, target, doors_host):
+    _changing(target, lambda first: None)
+    body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
+    assert [h["import_present"] for h in body["hits"]] == [None]
+    assert body["doors_complete"] is False
+
+
+# --- Ruling 35: an import by ordinal is named through the cache, in both modes ------------------------------------
+
+def _ordinal_sample(sample_dir, *functions, name="ordinal.exe", module="kernel32.dll"):
+    path = sample_dir / name
+    path.write_bytes(make_pe(imports=((module, functions),)) + _X64_STUB_0x3A)
+    return path
+
+
+def _file_hit(client, path):
+    body = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()
+    [hit] = body["hits"]
+    return hit, body
+
+
+def test_a_sample_importing_its_door_by_ordinal_is_not_a_proven_bypass(client, doors_host, sample_dir):
+    # kernel32!#157 is WriteProcessMemory in the cache's record of kernel32: the sample holds the door
+    hit, body = _file_hit(client, _ordinal_sample(sample_dir, 157))
+    assert hit["import_present"] is True
+    assert body["doors_complete"] is True
+
+
+def test_an_import_by_ordinal_no_cache_can_name_allows_no_proof_in_a_file(client, tdc, doors_host, sample_dir):
+    for functions, module in (((999,), "kernel32.dll"), ((3,), "helper.dll")):
+        hit, body = _file_hit(client, _ordinal_sample(sample_dir, *functions, module=module))
+        assert hit["import_present"] is None, (functions, module)
+        assert body["doors_complete"] is False and module in body["doors_note"]
+    # without a cache, no ordinal can be named at all
+    for name in os.listdir(tdc.NTSLEUTH_BASELINE_DIR):
+        if name.startswith("binary-graph-"):
+            os.remove(os.path.join(tdc.NTSLEUTH_BASELINE_DIR, name))
+    hit, body = _file_hit(client, _ordinal_sample(sample_dir, 157, name="again.exe"))
+    assert hit["import_present"] is None and body["doors_complete"] is False
+
+
+def test_an_import_by_ordinal_of_no_door_keeps_the_proof_of_a_file(client, doors_host, sample_dir):
+    hit, _ = _file_hit(client, _ordinal_sample(sample_dir, 158))          # kernel32!#158 is CloseHandle
+    assert hit["import_present"] is False
+
+
+def test_a_file_without_imports_by_ordinal_proves_without_a_cache(client, target, sample_dir):
+    # nothing to name: the file's denominator is complete whether or not a graph exists
+    hit, body = _file_hit(client, _loader(sample_dir, "GetLastError"))
+    assert hit["import_present"] is False and body["doors_complete"] is True
+
+
+def test_the_detonation_stage_names_the_ordinals_of_the_sample_file_and_of_the_image(tdc, doors_host, sample_dir):
+    image, _ = doors_host
+    with open(image, "wb") as fh:
+        fh.write(make_pe(imports=(("kernel32.dll", (157,)),)) + _X64_STUB_0x3A)
+    result = tdc._run_syscall_stage(4812, image, [])
+    assert [h["import_present"] for h in result["stubs"]["file"]["hits"]] == [True]
+    assert [h["import_present"] for h in result["stubs"]["process"]["hits"]] == [True]
+    [finding] = [f for f in result["evidence"]["findings"] if f["kind"] == "direct_syscall_stub"]
+    assert finding["needs_corroboration"] is True
+
+
+def test_ordinals_are_named_only_by_a_graph_of_the_importers_view():
+    imports = {"kernel32.dll": ("#157", "GetLastError")}
+    assert binary_graph_query.name_ordinal_imports(_doors_graph(), imports, view="x64") == (
+        {"WriteProcessMemory"}, "")
+    for graph, view in ((_doors_graph(arch="arm64"), "x64"), (None, "x64")):
+        names, why = binary_graph_query.name_ordinal_imports(graph, imports, view=view)
+        assert names is None and why
+    # nothing by ordinal needs no graph
+    assert binary_graph_query.name_ordinal_imports(None, {"kernel32.dll": ("GetLastError",)}, view="x64") == (set(), "")
+
+
+def test_the_imports_by_ordinal_of_a_pe_are_read_delay_loaded_ones_included(tdc):
+    data = make_pe(imports=(("KERNEL32.dll", (157, "GetLastError")),), delay=(("ws2_32.dll", (115,)),))
+    assert tdc._pe_ordinal_imports(data) == {"kernel32.dll": ("#157",), "ws2_32.dll": ("#115",)}
+    assert tdc._pe_ordinal_imports(b"not a pe") is None
