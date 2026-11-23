@@ -47,15 +47,27 @@ class Region(NamedTuple):
 def owner_from_region(region: Region | None) -> str | None:
     """The owner `classify_stub` expects: a lower-case basename, "private", or None.
 
+    "private" is memory no file backs: a private allocation, or a mapped view with no file behind it (a
+    pagefile-backed section, the classic target of NtMapViewOfSection), which `_searchable` treats alike.
+
     GetMappedFileNameW names a device path; passed on as is, a jump back into
     `\\Device\\...\\ntdll.dll` would not compare equal to `ntdll.dll` and read as hooked."""
     if region is None or region.state != MEM_COMMIT:
         return None
-    if region.type == MEM_PRIVATE:
+    if region.type == MEM_PRIVATE or (region.type == MEM_MAPPED and not region.path):
         return OWNER_PRIVATE
     if region.type == MEM_IMAGE and region.path:
         return ntpath.basename(region.path).lower() or None
     return None
+
+
+def owner_lookup_failed(region: Region | None) -> bool:
+    """Whether a region query gave no answer about who owns it: it failed, or it names an image without its file.
+    An image is file-backed by definition, so a missing name (GetMappedFileNameW failed, which the limited access
+    right makes likely) is a lookup that failed, not an owner nobody has."""
+    if region is None:
+        return True
+    return region.state == MEM_COMMIT and region.type == MEM_IMAGE and owner_from_region(region) is None
 
 
 class ProcessReader:
@@ -151,9 +163,9 @@ def _resolve_jump(reader: ProcessReader, code: bytes, addr: int,
 
 
 def _lookup_owner(reader: ProcessReader, addr: int) -> tuple[str | None, bool]:
-    """`(owner, failed)` of the memory at `addr`; `failed` when the region query does not answer."""
+    """`(owner, failed)` of the memory at `addr`; `failed` when the region query gives no answer about it."""
     region = reader.region(addr)
-    return owner_from_region(region), region is None
+    return owner_from_region(region), owner_lookup_failed(region)
 
 
 # How many relays are followed from the first target on. MinHook and Microsoft Detours, the most common x64 hooking

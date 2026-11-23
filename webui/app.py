@@ -4705,6 +4705,19 @@ def _pipe_events_for(pids, sample_keys, resolve, since, until):
     return events, truncated
 
 
+def _syscall_verdict_reasons(stage, evidence, reasons):
+    """What the syscall stage of a detonation leaves unsaid by its score, said in the verdict: stubs that diverged,
+    which are not scored. Without it a result full of `diverged` reads as a clean process."""
+    if not stage:
+        return
+    renumbered = stage.get("renumbered") if isinstance(stage.get("renumbered"), int) else 0
+    diverged = max(0, int((stage.get("counts") or {}).get("diverged") or 0) - renumbered)
+    if diverged:
+        evidence["syscalls_diverged"] = diverged
+        reasons.append(f"{diverged} syscall stub{'s' if diverged != 1 else ''} diverged: the bytes changed, and no "
+                       "owner of a jump could be resolved - not scored, and not evidence of being clean")
+
+
 def _compute_verdict(results, matching_alerts):
     """Aggregate a single verdict from EDR alerts, LitterBox findings, and beacon scans.
     Mirrors the Detonator reference UI's edr_verdict concept."""
@@ -4790,6 +4803,7 @@ def _compute_verdict(results, matching_alerts):
             evidence["note"] = ("Process exited before the live scan; it was "
                                 "analyzed from its exit-time memory dump instead.")
         evidence["sources_present"] = mem_sources
+        _syscall_verdict_reasons(_syscall_stage_entry(results.get("syscalls")), evidence, reasons)
 
         # Emitted even when empty, so the UI can tell "tools ran, nothing
         # scored" apart from "tools never ran".

@@ -962,6 +962,9 @@ def test_a_complete_scan_is_not_partial(arm64_baseline):
     (_IMAGE._replace(path=""), None),
     (_IMAGE._replace(path="\\Device\\HarddiskVolume3\\"), None),
     (syscall_scan.Region(syscall_scan.MEM_COMMIT, syscall_scan.MEM_MAPPED, "\\Device\\X\\a.dat"), None),
+    # a section no file backs (pagefile-backed): NtMapViewOfSection's classic target
+    (syscall_scan.Region(syscall_scan.MEM_COMMIT, syscall_scan.MEM_MAPPED, None), "private"),
+    (syscall_scan.Region(syscall_scan.MEM_COMMIT, syscall_scan.MEM_MAPPED, ""), "private"),
     (_PRIVATE._replace(state=0x2000), None),
     (None, None),
 ])
@@ -1150,6 +1153,35 @@ def test_a_relayed_hook_scores_as_a_hook_and_says_through_what():
     assert [f["kind"] for f in findings] == ["syscall_stub_hooked"]
     assert "relay" in findings[0]["detail"]
     assert findings[0]["relay"] == [{"address": _RELAY, "owner": "private", "pattern": "JMP [rip]"}]
+
+
+def test_a_jump_into_a_section_no_file_backs_is_patched(x64_baseline):
+    reader = _x64_relay_reader(x64_baseline, b"\x48\x31\xc0\xc3" + b"\xcc" * 28)
+    reader._regions[0] = (_RELAY, 0x40, syscall_scan.Region(syscall_scan.MEM_COMMIT, syscall_scan.MEM_MAPPED, None))
+    out = syscall_scan.measure(x64_baseline, reader)
+    s = out["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["target_owner"]) == ("patched", "private")
+    assert out["owner_errors"] == 0
+
+
+@pytest.mark.parametrize("path", [None, "", "\\Device\\HarddiskVolume3\\"])
+def test_an_image_region_that_has_no_name_is_a_failed_lookup(x64_baseline, path):
+    # GetMappedFileNameW failed, likely under the limited access right: an image is file-backed by definition,
+    # so a missing name is a lookup that failed, not an answer
+    reader = _x64_relay_reader(x64_baseline, b"\xcc" * 32)
+    reader._regions[0] = (_RELAY, 0x40, _IMAGE._replace(path=path))
+    out = syscall_scan.measure(x64_baseline, reader)
+    assert out["states"]["NtWriteVirtualMemory"]["state"] == "diverged"
+    assert (out["owner_errors"], out["partial"]) == (1, True)
+    assert "owner" in out["note"]
+
+
+def test_a_relayed_hook_into_an_image_without_a_name_is_a_failed_lookup(x64_baseline):
+    reader = _x64_relay_reader(x64_baseline, _x64_minhook_relay(_EDR_TARGET))
+    reader._regions.insert(0, (_EDR_TARGET & ~0xFFF, 0x1000, _IMAGE))
+    out = syscall_scan.measure(x64_baseline, reader)
+    assert out["states"]["NtWriteVirtualMemory"]["state"] == "diverged"
+    assert (out["owner_errors"], out["partial"]) == (1, True)
 
 
 def test_the_owner_is_only_asked_for_a_stub_that_differs(arm64_baseline):
@@ -4418,6 +4450,22 @@ def test_a_stage_that_found_nothing_is_a_source_that_ran(tdc, target):
     results = {"syscalls": entry}
     verdict = tdc._compute_verdict(results, [])
     assert verdict["label"] == "CLEAN" and results["memory_evidence"]["sources_present"] == ["syscalls"]
+
+
+def test_diverged_stubs_are_named_in_the_verdict_and_do_not_read_as_clean(tdc, target, fake_baseline_dir):
+    # changed bytes with no jump, which nobody can tell a hook from a patch by: not scored, but never quiet
+    entry = _stage_entry(tdc, target, fake_baseline_dir, owner=None)
+    assert entry["counts"]["diverged"] == 1 and entry["evidence"]["score"] == 0
+    results = {"syscalls": entry}
+    verdict = tdc._compute_verdict(results, [])
+    [reason] = [r for r in verdict["reasons"] if "diverged" in r]
+    assert "1 syscall stub" in reason and "not evidence of being clean" in reason
+    assert results["memory_evidence"]["syscalls_diverged"] == 1
+
+
+def test_a_stage_with_nothing_diverged_adds_no_reason(tdc, target):
+    verdict = tdc._compute_verdict({"syscalls": tdc._run_syscall_stage(4812, None)}, [])
+    assert not [r for r in verdict["reasons"] if "syscall" in r.lower()]
 
 
 def test_a_stage_that_skipped_is_no_evidence_and_no_verdict(tdc):
