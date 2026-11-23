@@ -454,12 +454,20 @@ FLOW_FUNCTIONS = [
     "binaryGraphSvg", "binaryGraphLegend", "binaryGraphStatus", "binaryGraphModel", "renderBinaryGraph", "binaryGraphOnQuery",
     "binaryGraphSubmit", "binaryGraphRun", "binaryGraphItem", "binaryGraphSelect", "binaryGraphFollowMap", "binaryGraphDetailItem",
     "binaryGraphDetailHtml", "binaryGraphOwn", "binaryGraphOrigin",
+    # EXPLORE (tests/test_binary_graph_ui.py): the graph opened one node at a time on a canvas of its own
+    "binaryGraphNodeRadius", "binaryGraphGuessKind", "binaryGraphDetailKind", "binaryGraphTrimDetail", "binaryGraphNeighboursOf",
+    "binaryGraphExploreMerge", "binaryGraphExploreCut", "binaryGraphExploreStatus", "binaryGraphExploreInfo", "binaryGraphExploreLayout",
+    "binaryGraphExploreDetail", "binaryGraphExploreApply", "binaryGraphExploreFetch", "binaryGraphExploreStart", "binaryGraphExploreSubmit",
+    "binaryGraphExpand", "binaryGraphRelayout", "binaryGraphSetDepth", "binaryGraphSetMode", "binaryGraphExploreRender", "binaryGraphDraw",
+    "binaryGraphToWorld", "binaryGraphNodeAt", "binaryGraphFit", "binaryGraphZoom", "binaryGraphOnCanvasDown", "binaryGraphOnCanvasMove",
+    "binaryGraphOnCanvasUp", "binaryGraphOnCanvasLeave", "binaryGraphOnCanvasWheel", "binaryGraphOnCanvasClick",
+    "binaryGraphOnCanvasDblClick", "initBinaryGraphExplore",
 ]
 FLOW_CONSTS = ["SYSCALL_STATES", "SYSCALL_STATE_COLORS", "SYSCALL_STATE_HELP", "SYSCALL_MODULES", "SYSCALL_WIN32U_TITLE", "SYSCALL_MAP",
                "SYSCALL_ROWS_MAX", "SYSCALL_PAGE", "SYSCALL_POLL_MS", "SYSCALL_VIEW_NAMES", "syscallState",
                "SYSCALL_DOC_URL", "SYSCALL_WINGRAPH_URL", "SYSCALL_SYSTEM_DIR", "SYSCALL_NARROW", "SYSCALL_PANE_NAMES", "SYSCALL_SEVERITY_RANK",
                "BINARY_GRAPH", "BINARY_GRAPH_SYSCALL", "BINARY_GRAPH_KINDS", "BINARY_GRAPH_QUERIES", "BINARY_GRAPH_EDGE_WORDS",
-               "binaryGraphState", "binaryGraphRequests"]
+               "binaryGraphState", "binaryGraphRequests", "BINARY_GRAPH_EXPLORE", "binaryGraphExplore"]
 
 # Just enough page for the tab: elements that hold children, attributes and listeners, a canvas that writes down
 # what is painted on it, a fetch that answers from a table of routes, and timers that wait to be fired
@@ -2521,8 +2529,8 @@ def test_the_detail_the_deviations_and_the_known_hooks_are_in_the_work_area_and_
                    'id="syscall-deviations"', 'id="syscall-hooks"', 'id="syscall-stubs"', 'id="syscall-stubs-body"'):
         assert needle in work, needle
     # panels in the manner of the Rizin tab: a section with a head and a title that explains itself (the fifth is the
-    # query bar of the GRAPH surface)
-    assert len(re.findall(r'<h3 class="syscall-panel-title" data-info="[^"<&]{1,300}">', tab)) == 5
+    # query bar of the GRAPH surface, the sixth the bar of its explore view)
+    assert len(re.findall(r'<h3 class="syscall-panel-title" data-info="[^"<&]{1,300}">', tab)) == 6
     assert "syscallSetPane('map')" in tab and "syscallSetPane('detail')" in tab
     assert re.search(r'<button[^>]*id="syscall-stubs-run"[^>]*onclick="runSyscallStubs\(\)"', tab)
     assert re.search(r'id="syscall-stubs"[^>]*\shidden', tab), "the list of hits is there once a search was run"

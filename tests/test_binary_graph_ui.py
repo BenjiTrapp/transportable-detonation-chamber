@@ -11,13 +11,20 @@ Regressions covered:
     syscall that does not carry its tone
   * the map and the graph choosing different syscalls
   * a module name from an import table, or the note or error that echoes what the user typed, taken as markup
+
+EXPLORE, the same graph opened one node at a time on a canvas of its own (tests at the end of this file):
+  * the exploration drawing more than the binary that was asked for, an expansion that replaced what was drawn, a depth
+    outside 1 to 3 taken in silently, a canvas that outgrew its cap without saying so
+  * a node's size not following its in-degree, its colour not following its kind
+  * the edges of the chosen node drawn like all the others
+  * the process graph's state written by a render of the binary graph (both views share functions, never state)
 """
 
 import re
 from html.parser import HTMLParser
 
 from test_frontend import needs_node
-from test_syscalls_ui import _flow, _run_node
+from test_syscalls_ui import FLOW_CONSTS, FLOW_DOM, FLOW_FUNCTIONS, _const, _flow, _run_node
 from test_theme import INDEX_HTML, _const_source, _cyberpunk_palette, _hex_rgb, _read, _root_values, _tab_markup
 
 
@@ -559,6 +566,459 @@ def test_the_curated_edge_and_the_match_do_not_look_like_a_deviation():
 
 def test_the_assets_moved_on():
     html = _read(INDEX_HTML)
-    for asset, minimum in (("style.css", 88), ("theme-cyberpunk.css", 38), ("app.js", 140)):
+    for asset, minimum in (("style.css", 89), ("theme-cyberpunk.css", 38), ("app.js", 142)):
         version = int(re.search(rf"{re.escape(asset)}\?v=(\d+)", html).group(1))
         assert version >= minimum, f"{asset} was changed and kept its ?v="
+
+
+# === EXPLORE: the graph opened one node at a time ======================================================================
+
+# the functions and constants of the block are in the flow's lists (tests/test_syscalls_ui.py); the process graph's
+# layout and its state are not of the block
+EXPLORE_FUNCTIONS = ["applyForceLayout"]
+EXPLORE_CONSTS = ["graphState"]
+EXPLORE_IDS = ["binary-graph-path", "binary-explore", "binary-graph-mode-path", "binary-graph-mode-explore", "binary-explore-start",
+               "binary-explore-status", "binary-explore-stage", "binary-explore-canvas", "binary-explore-info",
+               "binary-explore-legend", "binary-explore-expand", "binary-explore-zoom", "binary-explore-depth-1",
+               "binary-explore-depth-2", "binary-explore-depth-3"]
+
+# The page of the explore view, a canvas that writes down what is drawn on it (the last frame: clearRect starts it
+# again), and a small graph of System32 behind /api/binary-graph/node as the server answers it
+EXPLORE_DOM = r"""
+for (const id of __IDS__) els[id] = Object.assign(new Node(id.endsWith('canvas') ? 'canvas' : 'div'), { id });
+els['binary-explore'].hidden = true;
+els['binary-explore-stage'].clientWidth = 600; els['binary-explore-stage'].clientHeight = 400;
+const seen = [];
+const realGet = document.getElementById;
+document.getElementById = id => { seen.push(id); return realGet(id); };
+const log = [];
+const ctx = { globalAlpha: 1, fillStyle: '', strokeStyle: '', lineWidth: 1, font: '', textAlign: '', textBaseline: '', dash: [],
+  save() {}, restore() {}, translate(x, y) { log.push({ op: 'translate', x, y }); }, scale(k) { log.push({ op: 'scale', k }); },
+  clearRect() { log.length = 0; }, beginPath() { log.push({ op: 'begin' }); }, closePath() {},
+  arc(x, y, r) { log.push({ op: 'arc', x, y, r }); }, moveTo(x, y) { log.push({ op: 'moveTo', x, y }); },
+  lineTo(x, y) { log.push({ op: 'lineTo', x, y }); }, setLineDash(d) { this.dash = d; },
+  fill() { log.push({ op: 'fill', color: this.fillStyle, alpha: this.globalAlpha }); },
+  stroke() { log.push({ op: 'stroke', color: this.strokeStyle, width: this.lineWidth, alpha: this.globalAlpha, dash: this.dash.join(' ') }); },
+  fillText(text, x, y) { log.push({ op: 'text', text: String(text), x, y, color: this.fillStyle }); },
+  fillRect() {}, measureText: t => ({ width: String(t).length * 6 }) };
+els['binary-explore-canvas'].ctx = ctx; els['binary-explore-canvas'].getContext = () => ctx;
+els['binary-explore-canvas'].width = 600; els['binary-explore-canvas'].height = 400;
+// the last frame: node discs (an arc that is filled), rings (an arc that is only stroked) and edges (a stroked line,
+// in the order of the edges that are drawn)
+const frame = () => {
+  const shapes = []; let cur = null;
+  for (const e of log) { if (e.op === 'begin') { cur = { ops: [] }; shapes.push(cur); } else if (cur && e.op !== 'text') cur.ops.push(e); }
+  const f = { discs: [], rings: [], lines: [], texts: log.filter(e => e.op === 'text').map(e => e.text) };
+  for (const s of shapes) {
+    const arc = s.ops.find(o => o.op === 'arc'), stroke = s.ops.find(o => o.op === 'stroke'), fill = s.ops.find(o => o.op === 'fill');
+    if (arc && fill) f.discs.push({ x: arc.x, y: arc.y, r: arc.r, fill: fill.color, stroke: stroke && stroke.color, dash: stroke && stroke.dash });
+    else if (arc && stroke) f.rings.push({ x: arc.x, y: arc.y, r: arc.r, color: stroke.color });
+    else if (stroke) f.lines.push({ color: stroke.color, width: stroke.width, alpha: stroke.alpha, dash: stroke.dash });
+  }
+  return f;
+};
+const st = binaryGraphExplore;
+const at = id => st.nodes.find(n => n.id === id);
+// the drawn disc of a node, found by where it is
+const discOf = (f, id) => { const n = at(id); const found = f.discs.filter(d => d.x === n.x && d.y === n.y); return found.length === 1 ? found[0] : null; };
+const screenOf = id => { const n = at(id), c = st.camera; return { offsetX: n.x * c.zoom + c.x, offsetY: n.y * c.zoom + c.y }; };
+const GRAPH = {
+  'app.exe': { kind: 'exe', in_degree: 0, imports: { 'kernel32.dll': ['CreateFileW', 'CloseHandle'], 'ntdll.dll': ['NtClose'], 'user32.dll': ['MessageBoxW'] } },
+  'kernel32.dll': { kind: 'dll', in_degree: 3900, machine: 'ARM64',
+    imports: { 'kernelbase.dll': ['CreateFileW'], 'ntdll.dll': ['NtClose', 'RtlFoo'], 'api-ms-win-core-handle-l1-1-0.dll': ['CloseHandle'] },
+    forwarders: { HeapAlloc: { raw: 'NTDLL.RtlAllocateHeap', reason: 'defined', module: 'ntdll.dll', function: 'RtlAllocateHeap', partial: false } } },
+  'ntdll.dll': { kind: 'dll', in_degree: 4000, imports: {} },
+  'kernelbase.dll': { kind: 'dll', in_degree: 3500, imports: { 'ntdll.dll': ['NtClose'] } },
+  'user32.dll': { kind: 'dll', in_degree: 2000, imports: { 'win32u.dll': ['NtUserFoo'], 'gdi32.dll': ['GetDC'] } },
+  'win32u.dll': { kind: 'dll', in_degree: 1500, imports: { 'ntdll.dll': ['NtClose'] } },
+  'gdi32.dll': { kind: 'dll', in_degree: 1800, imports: { 'gdi32full.dll': ['GdiFoo'] } },
+  'gdi32full.dll': { kind: 'dll', in_degree: 899, imports: {} },
+  'api-ms-win-core-handle-l1-1-0.dll': { is: 'api-set', kind: 'api-set', in_degree: 900, hosts: ['kernelbase.dll'] },
+};
+const nodeRoute = (url) => {
+  let name = new URL(url, 'http://x').searchParams.get('name').trim().toLowerCase();
+  if (!/[.](dll|exe)$/.test(name)) name += '.dll';
+  const g = GRAPH[name];
+  if (!g) return { status: 404, body: { error: name + ' is neither a binary nor an api set in the binary graph of this system.', in_degree: 0 } };
+  return { body: { name, is: g.is || 'binary', kind: g.kind || 'dll', machine: g.machine || '', in_degree: g.in_degree, partial: false,
+                   imports: g.imports || {}, exports: [], forwarders: g.forwarders || {}, hosts: g.hosts || [], build: '26220.5770' } };
+};
+routes['/api/binary-graph/node'] = nodeRoute;
+""".replace("__IDS__", "[" + ", ".join(f"'{i}'" for i in EXPLORE_IDS) + "]")
+
+
+def _explore_flow(script):
+    consts = "\n".join(_const(c) for c in FLOW_CONSTS + EXPLORE_CONSTS)
+    return _run_node(FLOW_FUNCTIONS + EXPLORE_FUNCTIONS, FLOW_DOM + EXPLORE_DOM + script,
+                     "const themeColor = (name, alpha) => alpha === undefined ? name : name + '/' + alpha;\n" + consts)
+
+
+def _explore_markup():
+    tab = _tab_markup("syscalls")
+    start = tab.index('id="binary-explore"')
+    return tab[tab.rindex("<div", 0, start):tab.index('id="syscall-detail"')]
+
+
+def _plain(html):
+    return " ".join(re.sub(r"<[^>]+>", " ", html).split())
+
+
+def test_the_explore_view_is_in_the_page_with_its_canvas_and_its_depth_control():
+    tab = _tab_markup("syscalls")
+    for needed in ("binary-graph-path", "binary-explore", "binary-explore-start", "binary-explore-status", "binary-explore-stage",
+                   "binary-explore-canvas", "binary-explore-info", "binary-explore-legend", "binary-explore-expand",
+                   "binary-explore-zoom", "binary-graph-mode-path", "binary-graph-mode-explore"):
+        assert f'id="{needed}"' in tab, needed
+    # the query bar, its status, canvas and legend sit in the path view; the explore view is hidden until it is chosen
+    path = re.search(r'<div[^>]*id="binary-graph-path"[^>]*>', tab).group(0)
+    explore = re.search(r'<div[^>]*id="binary-explore"[^>]*>', tab).group(0)
+    assert " hidden" in explore and " hidden" not in path
+    assert tab.index('id="binary-graph-path"') < tab.index('id="binary-graph-query"') < tab.index('id="binary-explore"')
+    canvas = re.search(r'<canvas[^>]*id="binary-explore-canvas"[^>]*>', tab).group(0)
+    assert "onclick" not in canvas, "the canvas is wired by the script, from the one place that owns its state"
+    info = re.findall(r'data-info="([^"]+)"', _explore_markup())
+    assert info, "the explore view explains itself"
+    for text in info:
+        assert len(text) <= 300 and text[-1] in ".!?" and not any(bad in text for bad in ("<", "&", "${")), text
+
+
+def test_the_depth_control_offers_one_to_three_and_nothing_outside():
+    markup = _explore_markup()
+    group = re.search(r'<span[^>]*id="binary-explore-depth"[^>]*>(.*?)</span>', markup, re.S).group(1)
+    buttons = [b for b in _Elements(group).elements if b["tag"] == "button"]
+    calls = [re.fullmatch(r"binaryGraphSetDepth\((\d+)\)", b["attrs"].get("onclick", "")) for b in buttons]
+    assert calls and all(calls), "every button of the control sets a depth"
+    assert [int(c.group(1)) for c in calls] == [1, 2, 3]
+    assert [b["attrs"]["id"] for b in buttons] == ["binary-explore-depth-1", "binary-explore-depth-2", "binary-explore-depth-3"]
+
+
+@needs_node
+def test_a_depth_outside_one_to_three_is_refused_and_not_clamped():
+    r = _explore_flow(r"""
+      const depth = () => binaryGraphState.depth;
+      const accepted = [1, 2, 3].map(n => [binaryGraphSetDepth(n), depth(), els['binary-explore-depth-' + n].attrs['aria-pressed']]);
+      binaryGraphSetDepth(2);
+      const refused = [0, 4, -1, 1.5, '2', NaN, null, undefined, Infinity, [2], true, 10].map(v => [binaryGraphSetDepth(v), depth()]);
+      out({ accepted, refused, pressed: [1, 2, 3].map(n => els['binary-explore-depth-' + n].attrs['aria-pressed']) });""")
+    assert r["accepted"] == [[True, 1, "true"], [True, 2, "true"], [True, 3, "true"]]
+    assert len(r["refused"]) == 12 and all(a is False and d == 2 for a, d in r["refused"]), r["refused"]
+    assert r["pressed"] == ["false", "true", "false"], "the control still shows the depth that is in force"
+
+
+@needs_node
+def test_the_explore_mode_starts_from_the_searched_binary_and_nothing_else():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls();
+        binaryGraphSetMode('explore');
+        const empty = frame();
+        await binaryGraphExploreStart('KERNEL32');
+        const first = { ids: st.nodes.map(n => n.id), edges: st.edges.length, urls: requests.map(q => q.url), selected: st.selected,
+                        frame: frame(), info: els['binary-explore-info'].innerHTML };
+        // a second search starts again from that binary alone; a name that is not in the graph keeps what is drawn
+        await binaryGraphExploreStart('app.exe');
+        const second = { ids: st.nodes.map(n => n.id), edges: st.edges.length };
+        await binaryGraphExploreStart('nowhere.dll');
+        const missing = { ids: st.nodes.map(n => n.id), note: st.note, status: els['binary-explore-status'].innerHTML };
+        // a function as the path view names it opens its module
+        await binaryGraphExploreStart('kernelbase.dll!CreateFileW');
+        out({ empty, first, second, missing, fromFunction: st.nodes.map(n => n.id), all: requests.map(q => q.url) });
+      })();""")
+    first = r["first"]
+    assert first["ids"] == ["kernel32.dll"] and first["edges"] == 0 and first["selected"] == "kernel32.dll"
+    assert len(first["urls"]) == 1 and first["urls"][0].startswith("/api/binary-graph/node?") and "name=KERNEL32" in first["urls"][0]
+    assert len(first["frame"]["discs"]) == 1 and first["frame"]["lines"] == [], "one disc, no edge: nothing else is drawn"
+    assert "kernel32.dll" in first["frame"]["texts"]
+    assert "kernel32.dll" in first["info"] and "3,900" in first["info"]
+    assert r["empty"]["discs"] == [] and any("START" in t for t in r["empty"]["texts"]), "before a search the canvas says how to begin"
+    assert r["second"] == {"ids": ["app.exe"], "edges": 0}
+    assert r["missing"]["ids"] == ["app.exe"], "a name that is not in the graph does not wipe the exploration"
+    assert "nowhere.dll is neither a binary nor an api set" in r["missing"]["note"] and "nowhere.dll" in r["missing"]["status"]
+    assert r["fromFunction"] == ["kernelbase.dll"]
+    assert not any("!" in u or "%21" in u for u in r["all"]), "only the module was asked for"
+
+
+@needs_node
+def test_the_mode_switch_shows_one_view_and_refuses_a_mode_it_does_not_have():
+    r = _explore_flow(r"""
+      initSyscalls();
+      const look = () => ({ path: els['binary-graph-path'].hidden, explore: els['binary-explore'].hidden,
+        pressed: [els['binary-graph-mode-path'].attrs['aria-pressed'], els['binary-graph-mode-explore'].attrs['aria-pressed']] });
+      const result = [binaryGraphSetMode('explore'), look(), binaryGraphSetMode('path'), look(), binaryGraphSetMode('globe'), look(), binaryGraphSetMode(undefined)];
+      out(result);""")
+    assert r == [True, {"path": True, "explore": False, "pressed": ["false", "true"]}, True,
+                 {"path": False, "explore": True, "pressed": ["true", "false"]}, False,
+                 {"path": False, "explore": True, "pressed": ["true", "false"]}, False]
+
+
+@needs_node
+def test_expanding_a_node_adds_its_neighbours_and_keeps_what_is_already_drawn():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        await binaryGraphExploreStart('app.exe');
+        const before = { x: at('app.exe').x, y: at('app.exe').y };
+        const one = await binaryGraphExpand('app.exe');
+        const afterOne = { ids: st.nodes.map(n => n.id).sort(), edges: st.edges.length, app: { x: at('app.exe').x, y: at('app.exe').y } };
+        const placed = Object.fromEntries(st.nodes.map(n => [n.id, [n.x, n.y]]));
+        const asked = requests.length;
+        const two = await binaryGraphExpand('kernel32.dll');
+        const moved = st.nodes.filter(n => placed[n.id] && (placed[n.id][0] !== n.x || placed[n.id][1] !== n.y)).map(n => n.id);
+        const edges = st.edges.map(e => [e.source, e.target, e.kind, e.origin]);
+        // the same node twice gives no node and no edge twice
+        await binaryGraphExpand('kernel32.dll');
+        out({ before, one, afterOne, two, moved, ids: st.nodes.map(n => n.id).sort(), edges, again: [st.nodes.length, st.edges.length],
+              askedForTheSecond: requests.slice(asked).map(q => new URL(q.url, 'http://x').searchParams.get('name')),
+              kinds: Object.fromEntries(st.nodes.map(n => [n.id, n.kind])), frame: frame() });
+      })();""")
+    assert r["one"] is True and r["two"] is True
+    assert r["afterOne"]["ids"] == ["app.exe", "kernel32.dll", "ntdll.dll", "user32.dll"] and r["afterOne"]["edges"] == 3
+    assert r["afterOne"]["app"] == r["before"], "the node that was opened stays where it was"
+    assert r["moved"] == [], "expanding a second node moves none of what was drawn"
+    assert r["ids"] == sorted(["api-ms-win-core-handle-l1-1-0.dll", "app.exe", "kernel32.dll", "kernelbase.dll", "ntdll.dll", "user32.dll"])
+    assert sorted(r["edges"]) == sorted([
+        ["app.exe", "kernel32.dll", "imports", "derived"], ["app.exe", "ntdll.dll", "imports", "derived"],
+        ["app.exe", "user32.dll", "imports", "derived"], ["kernel32.dll", "kernelbase.dll", "imports", "derived"],
+        ["kernel32.dll", "ntdll.dll", "imports", "derived"], ["kernel32.dll", "ntdll.dll", "forwards_to", "derived"],
+        ["kernel32.dll", "api-ms-win-core-handle-l1-1-0.dll", "imports", "derived"]])
+    assert r["again"] == [6, 7]
+    # kernel32 and ntdll were read already: only the two new neighbours are asked for, once each
+    assert sorted(r["askedForTheSecond"]) == ["api-ms-win-core-handle-l1-1-0.dll", "kernelbase.dll"]
+    assert r["kinds"]["api-ms-win-core-handle-l1-1-0.dll"] == "api-set" and r["kinds"]["app.exe"] == "exe"
+    assert len(r["frame"]["discs"]) == 6 and len(r["frame"]["lines"]) == 7
+
+
+@needs_node
+def test_the_depth_says_how_many_hops_an_expansion_opens():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        const seen = {};
+        for (const depth of [1, 2, 3]) {
+          binaryGraphSetDepth(depth);
+          await binaryGraphExploreStart('app.exe');
+          await binaryGraphExpand('app.exe');
+          seen[depth] = st.nodes.map(n => n.id).sort();
+        }
+        out(seen);
+      })();""")
+    base = ["app.exe", "kernel32.dll", "ntdll.dll", "user32.dll"]
+    assert r["1"] == base
+    assert r["2"] == sorted(base + ["api-ms-win-core-handle-l1-1-0.dll", "gdi32.dll", "kernelbase.dll", "win32u.dll"])
+    assert r["3"] == sorted(base + ["api-ms-win-core-handle-l1-1-0.dll", "gdi32.dll", "kernelbase.dll", "win32u.dll", "gdi32full.dll"])
+
+
+@needs_node
+def test_the_node_size_follows_the_in_degree_so_the_most_imported_dll_is_the_largest():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        binaryGraphSetDepth(2);
+        await binaryGraphExploreStart('app.exe'); await binaryGraphExpand('app.exe');
+        const f = frame();
+        out({ f: f.discs.length, rows: st.nodes.map(n => ({ id: n.id, degree: n.in_degree, disc: discOf(f, n.id) })) });
+      })();""")
+    rows = r["rows"]
+    # the shape first: every node has exactly one disc, and the in-degrees really differ
+    assert len(rows) == 8 and r["f"] == 8 and all(row["disc"] for row in rows)
+    assert len({row["degree"] for row in rows}) == len(rows), "a test of the size needs nodes of different in-degree"
+    by_degree = sorted(rows, key=lambda row: row["degree"])
+    radii = [row["disc"]["r"] for row in by_degree]
+    assert radii == sorted(radii) and len(set(radii)) == len(radii), "a node imported by more binaries is drawn larger"
+    largest = max(rows, key=lambda row: row["disc"]["r"])
+    assert largest["id"] == "ntdll.dll" and largest["degree"] == 4000
+    assert by_degree[0]["id"] == "app.exe" and by_degree[0]["disc"]["r"] == min(radii)
+
+
+@needs_node
+def test_the_node_colour_follows_the_kind_dll_exe_or_syscall():
+    r = _explore_flow(r"""
+      initSyscalls(); binaryGraphSetMode('explore');
+      const kinds = ['dll', 'exe', 'syscall', 'api-set', 'function', 'constructor'];
+      st.nodes = kinds.map((kind, i) => ({ id: kind + '-node', label: kind, kind, in_degree: 10, category: '', x: i * 90, y: 0, radius: 12, placed: true }));
+      st.edges = [];
+      binaryGraphDraw();
+      const f = frame();
+      out(kinds.map(k => { const d = f.discs.find(d => d.x === st.nodes.find(n => n.kind === k).x); return [k, d && d.stroke, d && d.fill]; }));""")
+    colours = {kind: stroke for kind, stroke, _ in r}
+    assert len(r) == 6 and all(stroke for _, stroke, _ in r), r
+    assert colours["dll"] == "--graph-node-dll" and colours["exe"] == "--graph-node-exe"
+    assert colours["syscall"] == "--graph-node-syscall" and colours["api-set"] == "--graph-node-apiset"
+    assert len({colours[k] for k in ("dll", "exe", "syscall", "api-set")}) == 4, "the four kinds are four colours"
+    assert colours["constructor"] == "--text-muted", "a kind named like an object member is no kind"
+
+
+@needs_node
+def test_an_answer_that_hit_the_node_cap_says_so_on_the_canvas():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        const name = i => 'm' + String(i).padStart(3, '0') + '.dll';
+        GRAPH['big.dll'] = { kind: 'dll', in_degree: 1, imports: Object.fromEntries([...Array(450)].map((_, i) => [name(i), ['F']])) };
+        for (let i = 0; i < 450; i++) GRAPH[name(i)] = { kind: 'dll', in_degree: i, imports: {} };
+        GRAPH['m010.dll'].imports = { 'z0.dll': ['F'], 'z1.dll': ['F'], 'z2.dll': ['F'], 'z3.dll': ['F'], 'z4.dll': ['F'] };
+        GRAPH['m011.dll'].imports = { 'm000.dll': ['F'] };
+        await binaryGraphExploreStart('big.dll');
+        const quiet = { texts: frame().texts, status: els['binary-explore-status'].innerHTML, hidden: els['binary-explore-status'].hidden };
+        await binaryGraphExpand('big.dll');
+        const cut = { count: st.nodes.length, edges: st.edges.length, texts: frame().texts, discs: frame().discs.length,
+                      status: els['binary-explore-status'].innerHTML, hidden: els['binary-explore-status'].hidden,
+                      last: st.nodes[st.nodes.length - 1].id, has399: !!at('m399.dll'), has398: !!at('m398.dll') };
+        // opening more of a canvas that is full draws no node, and says how many did not fit
+        await binaryGraphExpand('m010.dll');
+        const again = { count: st.nodes.length, z0: !!at('z0.dll'), status: els['binary-explore-status'].innerHTML, texts: frame().texts };
+        // an edge between two nodes that are drawn needs no new node, so it is drawn
+        await binaryGraphExpand('m011.dll');
+        const edge = { count: st.nodes.length, drawn: st.edges.some(e => e.source === 'm011.dll' && e.target === 'm000.dll') };
+        // starting over empties the cut
+        await binaryGraphExploreStart('app.exe');
+        out({ quiet, cut, again, edge, over: { texts: frame().texts, status: els['binary-explore-status'].innerHTML } });
+      })();""")
+    assert not any("not shown" in t for t in r["quiet"]["texts"]) and r["quiet"]["hidden"] is True, "a whole answer does not claim to be cut"
+    cut = r["cut"]
+    assert cut["count"] == 400 and cut["edges"] == 399 and cut["discs"] == 400
+    assert cut["has398"] and not cut["has399"] and cut["last"] == "m398.dll", "the first parts in name order are kept"
+    banner = [t for t in cut["texts"] if "not shown" in t]
+    assert len(banner) == 1 and "400" in banner[0] and "51" in banner[0], banner
+    status = _plain(cut["status"])
+    assert cut["hidden"] is False and "51" in status and "400" in status and "not shown" in status and "does not mean" in status, status
+    again = r["again"]
+    assert again["count"] == 400 and not again["z0"], "a full canvas stays at its cap"
+    assert any("56" in t for t in again["texts"] if "not shown" in t), "the nodes that did not fit are counted together: 51 and 5"
+    assert "2 nodes" in _plain(again["status"])
+    assert r["edge"] == {"count": 400, "drawn": True}
+    assert not any("not shown" in t for t in r["over"]["texts"]) and r["over"]["status"] == ""
+
+
+@needs_node
+def test_the_edges_of_the_selected_node_are_drawn_apart_from_the_others():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        await binaryGraphExploreStart('app.exe'); await binaryGraphExpand('app.exe'); await binaryGraphExpand('kernel32.dll');
+        // the lines of a frame are in the order of the edges
+        const near = st.edges.map(e => e.source === 'kernel32.dll' || e.target === 'kernel32.dll');
+        const split = f => ({ near: f.lines.filter((_, i) => near[i]), rest: f.lines.filter((_, i) => !near[i]) });
+        st.selected = null; binaryGraphDraw();
+        const none = split(frame());
+        // a click on the node chooses it; a click on nothing lets go
+        const clicked = binaryGraphOnCanvasClick(screenOf('kernel32.dll'));
+        const chosen = split(frame()), rings = frame().rings, info = [els['binary-explore-info'].innerHTML, els['binary-explore-expand'].disabled];
+        const cleared = binaryGraphOnCanvasClick({ offsetX: 599, offsetY: 399 });
+        out({ clicked, selected: st.selected, cleared, none, chosen, rings, after: frame().rings, info, lines: frame().lines.length });
+      })();""")
+    assert r["clicked"] is True and r["cleared"] is False and r["selected"] is None
+    none, chosen = r["none"], r["chosen"]
+    assert len(chosen["near"]) == 5 and len(chosen["rest"]) == 2, "the shape first: kernel32 has five edges, two others are not its"
+    assert len(none["near"]) == 5 and len(none["rest"]) == 2
+    assert len({(l["width"], l["alpha"]) for l in none["near"] + none["rest"]}) == 1, "with nothing chosen every edge is drawn alike"
+    assert min(l["width"] for l in chosen["near"]) > max(l["width"] for l in chosen["rest"])
+    assert all(l["alpha"] == 1 for l in chosen["near"]) and all(l["alpha"] < 1 for l in chosen["rest"])
+    assert len(r["rings"]) == 1 and r["after"] == [], "the chosen node has a ring, and only while it is chosen"
+    assert "kernel32.dll" in r["info"][0] and r["info"][1] is False
+    assert r["lines"] == 7
+
+
+@needs_node
+def test_the_dash_of_the_curated_and_the_unknown_edge_survives_on_the_explore_canvas():
+    r = _explore_flow(r"""
+      initSyscalls(); binaryGraphSetMode('explore');
+      st.nodes = ['a', 'b', 'c'].map((id, i) => ({ id, label: id, kind: 'dll', in_degree: 1, category: '', x: i * 100, y: 0, radius: 10, placed: true }));
+      st.edges = [{ source: 'a', target: 'b', kind: 'imports', origin: 'derived', label: '' },
+                  { source: 'b', target: 'c', kind: 'reaches_syscall', origin: 'curated', label: '' },
+                  { source: 'a', target: 'c', kind: 'imports', origin: 'mystery', label: '' }];
+      binaryGraphDraw();
+      out(frame().lines.map(l => [l.color, l.dash]));""")
+    assert len(r) == 3
+    derived, curated, unknown = r
+    assert derived[1] == "" and curated[1] != "" and unknown[1] != "" and curated[1] != unknown[1]
+    assert curated[0] == "--graph-edge-curated" and derived[0] != unknown[0]
+
+
+@needs_node
+def test_dragging_moves_one_node_or_the_view_and_the_click_that_ends_a_drag_selects_nothing():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        await binaryGraphExploreStart('app.exe'); await binaryGraphExpand('app.exe');
+        const was = Object.fromEntries(st.nodes.map(n => [n.id, [n.x, n.y]]));
+        st.selected = null;
+        const from = screenOf('user32.dll'), cam = { ...st.camera };
+        binaryGraphOnCanvasDown(from); binaryGraphOnCanvasMove({ offsetX: from.offsetX + 40, offsetY: from.offsetY + 20 });
+        binaryGraphOnCanvasUp(); const dragged = binaryGraphOnCanvasClick({ offsetX: from.offsetX + 40, offsetY: from.offsetY + 20 });
+        const moved = st.nodes.filter(n => n.x !== was[n.id][0] || n.y !== was[n.id][1]).map(n => n.id);
+        const afterDrag = { selected: st.selected, camera: { ...st.camera }, cam };
+        // empty ground pans the view: a point where no node is
+        const free = [[2, 2], [598, 2], [2, 398], [598, 398]].find(([x, y]) => { const w = binaryGraphToWorld(x, y); return !binaryGraphNodeAt(w.x, w.y); });
+        const still = { ...st.camera };
+        binaryGraphOnCanvasDown({ offsetX: free[0], offsetY: free[1] }); binaryGraphOnCanvasMove({ offsetX: free[0] + 30, offsetY: free[1] + 10 }); binaryGraphOnCanvasUp();
+        binaryGraphOnCanvasClick({ offsetX: free[0] + 30, offsetY: free[1] + 10 });
+        const panned = { x: st.camera.x - still.x, y: st.camera.y - still.y, zoom: st.camera.zoom - still.zoom };
+        // a wheel turn zooms, a button too, and FIT brings every node back
+        const z0 = st.camera.zoom;
+        binaryGraphOnCanvasWheel({ offsetX: 300, offsetY: 200, deltaY: -100, preventDefault() {} });
+        const zoomed = st.camera.zoom; binaryGraphZoom(0.5); const smaller = st.camera.zoom; binaryGraphFit();
+        out({ moved, dragged, afterDrag, panned, z0, zoomed, smaller, fitted: st.camera.zoom, label: els['binary-explore-zoom'].textContent });
+      })();""")
+    assert r["moved"] == ["user32.dll"] and r["dragged"] is False
+    assert r["afterDrag"]["selected"] is None and r["afterDrag"]["camera"] == r["afterDrag"]["cam"]
+    assert r["panned"] == {"x": 30, "y": 10, "zoom": 0}
+    assert r["zoomed"] > r["z0"] and r["smaller"] < r["zoomed"] and 0.1 <= r["fitted"] <= 2
+    assert r["label"].endswith("%")
+
+
+# --- The process graph is not touched --------------------------------------------------------------------------------
+
+@needs_node
+def test_the_process_graph_state_is_untouched_by_a_binary_graph_render():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls();
+        const pid = { id: 'pid:4', x: 5, y: 6, radius: 9, type: 'process' };
+        Object.assign(graphState, { nodes: [pid], edges: [{ source: 'pid:4', target: 'pid:4', type: 'spawn' }], focusPid: '4', layoutMode: 'force',
+                                    selectedNode: pid, isoCollapsed: new Set(['4']), camera: { x: 7, y: 8, zoom: 1.5 } });
+        const key = () => JSON.stringify(graphState, (k, v) => v instanceof Set ? ['Set', ...v] : v);
+        const camera = graphState.camera, nodes = graphState.nodes, before = key();
+        seen.length = 0;
+        binaryGraphSetMode('explore'); binaryGraphSetDepth(2);
+        await binaryGraphExploreStart('app.exe'); await binaryGraphExpand('app.exe');
+        binaryGraphOnCanvasClick(screenOf('kernel32.dll'));
+        binaryGraphOnCanvasDown(screenOf('user32.dll')); binaryGraphOnCanvasMove({ offsetX: 10, offsetY: 10 }); binaryGraphOnCanvasUp();
+        binaryGraphOnCanvasWheel({ offsetX: 300, offsetY: 200, deltaY: 100, preventDefault() {} });
+        binaryGraphZoom(1.25); binaryGraphFit(); binaryGraphRelayout(); binaryGraphDraw(); binaryGraphSetMode('path');
+        out({ same: key() === before, before, after: key(), sameCamera: graphState.camera === camera, sameNodes: graphState.nodes === nodes,
+              explored: st.nodes.length, drawn: frame().discs.length, touched: seen.filter(id => id.startsWith('graph-')) });
+      })();""")
+    # the guard is not vacuous: the exploration really ran, and the process graph really held something
+    assert r["explored"] == 8 and r["drawn"] == 8
+    assert '"zoom":1.5' in r["before"] and "pid:4" in r["before"] and r["before"].count('"Set"') == 1
+    assert r["same"] is True, r["after"]
+    assert r["sameCamera"] and r["sameNodes"]
+    assert r["touched"] == [], "the explore view reached for an element of the process graph"
+
+
+def test_the_explore_cap_is_the_cap_of_the_backend():
+    import binary_graph_query
+    assert int(re.search(r"cap:\s*(\d+)", _const_source("BINARY_GRAPH_EXPLORE")).group(1)) == binary_graph_query.MAX_NODES == 400
+
+
+@needs_node
+def test_a_binary_name_from_an_import_table_reaches_the_explore_view_as_text_and_not_as_markup():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        const evil = '<img src=x onerror=alert(1)>.dll';
+        GRAPH['app.exe'].imports[evil] = ['F'];
+        GRAPH[evil] = { kind: 'dll', in_degree: 3, imports: {} };
+        await binaryGraphExploreStart('app.exe'); await binaryGraphExpand('app.exe');
+        binaryGraphOnCanvasClick(screenOf(evil));
+        const chosen = els['binary-explore-info'].innerHTML + els['binary-explore-status'].innerHTML;
+        binaryGraphOnCanvasMove(screenOf(evil));
+        const title = els['binary-explore-canvas'].title;
+        await binaryGraphExploreStart('<img src=y onerror=alert(2)>');
+        out({ chosen, selected: st.selected, title, missing: els['binary-explore-status'].innerHTML + els['binary-explore-info'].innerHTML });
+      })();""")
+    assert r["selected"] == "<img src=x onerror=alert(1)>.dll"
+    for key in ("chosen", "missing"):
+        assert "<img" not in r[key] and "&lt;img" in r[key], key
+    assert "<img src=x" in r["title"], "the tooltip is a property of the canvas, not markup"

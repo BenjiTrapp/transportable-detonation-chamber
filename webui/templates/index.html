@@ -19,7 +19,7 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=88">
+    <link rel="stylesheet" href="/static/css/style.css?v=89">
     <link rel="stylesheet" href="/static/css/theme-layout.css?v=5">
     <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=38">
 </head>
@@ -1308,6 +1308,13 @@
                     </div>
                     <div class="syscall-main binary-graph" id="syscall-surface-graph" hidden>
                         <div class="binary-graph-panel">
+                            <div class="binary-graph-modes">
+                                <span class="chart-range syscall-switch" role="group" aria-label="Graph view">
+                                    <button type="button" class="chart-range-btn" id="binary-graph-mode-path" aria-pressed="true" title="One question, drawn as a path from left to right" onclick="binaryGraphSetMode('path')">PATH</button>
+                                    <button type="button" class="chart-range-btn" id="binary-graph-mode-explore" aria-pressed="false" title="Start from one binary and open its neighbours node by node" onclick="binaryGraphSetMode('explore')">EXPLORE</button>
+                                </span>
+                            </div>
+                            <div class="binary-graph-pathview" id="binary-graph-path">
                             <form class="binary-graph-bar" id="binary-graph-bar" onsubmit="binaryGraphSubmit(event)">
                                 <h3 class="syscall-panel-title" data-info="One question to the import graph of this system's System32, drawn left to right with one layer per hop. A solid edge is read from the binaries, a dashed one marked curated comes from the hand-curated Win32 to Nt table.">BINARY GRAPH</h3>
                                 <select id="binary-graph-query" class="filter-select" aria-label="Query" onchange="binaryGraphOnQuery()">
@@ -1325,6 +1332,34 @@
                             <div class="binary-graph-status" id="binary-graph-status" role="status" hidden></div>
                             <div class="binary-graph-canvas" id="binary-graph-canvas"></div>
                             <div class="syscall-legend binary-graph-legend" id="binary-graph-legend"></div>
+                            </div>
+                            <div class="binary-explore" id="binary-explore" hidden>
+                                <form class="binary-graph-bar" id="binary-explore-bar" onsubmit="binaryGraphExploreSubmit(event)">
+                                    <h3 class="syscall-panel-title" data-info="One binary of System32 drawn alone, then opened node by node: EXPAND draws the imports of the chosen node, as many hops deep as DEPTH says. A disc is larger the more binaries import it, and at most 400 nodes are drawn.">EXPLORE</h3>
+                                    <input type="text" id="binary-explore-start" class="filter-input" placeholder="Binary to start from, such as kernel32.dll" aria-label="Binary to start from" autocomplete="off" spellcheck="false">
+                                    <button type="submit" class="btn btn-sm btn-primary" id="binary-explore-run">START</button>
+                                    <span class="binary-explore-depth-label">DEPTH</span>
+                                    <span class="chart-range syscall-switch" id="binary-explore-depth" role="group" aria-label="Hops opened by one expansion">
+                                        <button type="button" class="chart-range-btn" id="binary-explore-depth-1" aria-pressed="true" onclick="binaryGraphSetDepth(1)">1</button>
+                                        <button type="button" class="chart-range-btn" id="binary-explore-depth-2" aria-pressed="false" onclick="binaryGraphSetDepth(2)">2</button>
+                                        <button type="button" class="chart-range-btn" id="binary-explore-depth-3" aria-pressed="false" onclick="binaryGraphSetDepth(3)">3</button>
+                                    </span>
+                                    <button type="button" class="btn btn-sm" id="binary-explore-expand" disabled title="Open the neighbours of the chosen node" onclick="binaryGraphExpand(binaryGraphExplore.selected)">EXPAND</button>
+                                    <span class="binary-explore-view">
+                                        <button type="button" class="btn btn-sm" title="Zoom in" onclick="binaryGraphZoom(1.25)">+</button>
+                                        <span class="binary-explore-zoom" id="binary-explore-zoom">100%</span>
+                                        <button type="button" class="btn btn-sm" title="Zoom out" onclick="binaryGraphZoom(0.8)">&minus;</button>
+                                        <button type="button" class="btn btn-sm" title="Bring every node into view" onclick="binaryGraphFit()">FIT</button>
+                                        <button type="button" class="btn btn-sm" title="Lay every node out again" onclick="binaryGraphRelayout()">LAYOUT</button>
+                                    </span>
+                                </form>
+                                <div class="binary-graph-status" id="binary-explore-status" role="status" hidden></div>
+                                <div class="binary-explore-stage" id="binary-explore-stage">
+                                    <canvas class="binary-explore-canvas" id="binary-explore-canvas" width="600" height="400" aria-label="The import graph, opened node by node"></canvas>
+                                </div>
+                                <div class="binary-explore-info" id="binary-explore-info"></div>
+                                <div class="syscall-legend binary-graph-legend" id="binary-explore-legend"></div>
+                            </div>
                         </div>
                     </div>
                     <section class="syscall-panel syscall-detail" id="syscall-detail" aria-label="Syscall detail">
@@ -1901,6 +1936,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
     </div>
 
-    <script src="/static/js/app.js?v=141"></script>
+    <script src="/static/js/app.js?v=142"></script>
 </body>
 </html>

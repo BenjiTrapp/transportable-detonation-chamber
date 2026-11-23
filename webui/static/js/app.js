@@ -27215,3 +27215,614 @@ function binaryGraphDetailHtml(item) {
     if (e.label) rows.push(['Label', e.label]);
     return title(binaryGraphOwn(BINARY_GRAPH_EDGE_WORDS, e.kind) || String(e.kind ?? '')) + facts(rows) + note;
 }
+
+// --- GRAPH, EXPLORE: the same graph, opened one node at a time -------------------------------------------------------
+// The whole stock (about 4,000 binaries) is never drawn. An entry point, one binary, is drawn alone; EXPAND opens the
+// imports, forwarders and api-set hosts of the chosen node and keeps what is drawn, as many hops as DEPTH says. The
+// canvas holds at most `cap` nodes: what an expansion could not draw is counted and said, never dropped quietly, and
+// the nodes that are kept are the first in name order, so a node that is missing is "not shown", not "not imported".
+// A node's size is how many binaries import it (the cache's in-degree), its colour is its kind.
+// The canvas machinery is the process graph's (applyForceLayout), driven with the state object below: both views
+// share functions and no state. The process graph's camera functions read graphState itself, so the few that this
+// view needs are written again over its own camera.
+// cap: the backend's MAX_NODES (tests/test_binary_graph_ui.py holds the two equal); batch: how many nodes are asked for
+// at once; drag: the px a press moves before it is a drag and no click
+const BINARY_GRAPH_EXPLORE = { cap: 400, depths: [1, 2, 3], radius: { min: 6, max: 38, step: 2.4 }, batch: 8, drag: 3 };
+const binaryGraphExplore = { mode: 'path', nodes: [], edges: [], camera: { x: 0, y: 0, zoom: 1 }, selected: null, hovered: null,
+    dragging: null, panning: false, panStart: { x: 0, y: 0 }, down: { x: 0, y: 0 }, moved: false, loading: false, note: '', seq: 0,
+    ready: false, cut: new Map(), details: new Map() };
+
+// The disc of a node: the larger the more binaries import it, on a log scale so 4,000 and 400 are both readable
+function binaryGraphNodeRadius(node) {
+    const r = BINARY_GRAPH_EXPLORE.radius;
+    const degree = Math.max(0, Number(node && node.in_degree) || 0);
+    return Math.min(r.max, r.min + r.step * Math.log2(1 + degree));
+}
+
+// What a module is called until it has been read: the loader's reading of the name
+function binaryGraphGuessKind(name) {
+    const lower = String(name || '').toLowerCase();
+    if (lower.startsWith('api-') || lower.startsWith('ext-')) return 'api-set';
+    return lower.endsWith('.exe') ? 'exe' : 'dll';
+}
+
+function binaryGraphDetailKind(detail, name) {
+    if (detail && detail.is === 'api-set') return 'api-set';
+    if (detail && detail.is === 'binary' && (detail.kind === 'dll' || detail.kind === 'exe')) return detail.kind;
+    return binaryGraphGuessKind(name);
+}
+
+// What of an answer of /api/binary-graph/node the exploration keeps: the modules a node imports and forwards to with
+// how many functions each, its api-set hosts, its in-degree and machine. The export list stays where it is.
+function binaryGraphTrimDetail(data) {
+    const d = data && typeof data === 'object' ? data : {};
+    const imports = Object.entries(d.imports && typeof d.imports === 'object' ? d.imports : {})
+        .map(([module, names]) => [module, Array.isArray(names) ? names.length : 0]);
+    const forwarded = new Map();
+    for (const f of Object.values(d.forwarders && typeof d.forwarders === 'object' ? d.forwarders : {})) {
+        const module = f && typeof f.module === 'string' ? f.module : '';
+        if (module) forwarded.set(module, (forwarded.get(module) || 0) + 1);
+    }
+    return {
+        name: typeof d.name === 'string' ? d.name : '', is: d.is === 'binary' || d.is === 'api-set' ? d.is : 'none', kind: String(d.kind || ''),
+        machine: String(d.machine || ''), in_degree: Math.max(0, Number(d.in_degree) || 0), partial: d.partial === true, imports,
+        forwarded: [...forwarded], hosts: Array.isArray(d.hosts) ? d.hosts.filter(h => typeof h === 'string') : [],
+    };
+}
+
+// The neighbours of a node as its trimmed detail names them, in name order: [{ id, edges: [{ kind, label }] }]. Every
+// edge is read from the binaries and points away from the node.
+function binaryGraphNeighboursOf(detail) {
+    const found = new Map();
+    const add = (module, kind, label) => {
+        const id = String(module || '').toLowerCase();
+        if (!id || id === detail.name) return;
+        if (!found.has(id)) found.set(id, { id, edges: [] });
+        found.get(id).edges.push({ kind, label });
+    };
+    for (const [module, n] of detail.imports) add(module, 'imports', `${n.toLocaleString('en-US')} function${n === 1 ? '' : 's'}`);
+    for (const [module, n] of detail.forwarded) add(module, 'forwards_to', `${n.toLocaleString('en-US')} forwarded export${n === 1 ? '' : 's'}`);
+    for (const host of detail.hosts) add(host, 'resolves_to', '');
+    return [...found.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+// The neighbours of `parentId` drawn, as many as the cap leaves room for: whole neighbours, in name order. A neighbour
+// that is drawn already only gains its edge. What did not fit is kept per parent: { added, dropped } (ids).
+function binaryGraphExploreMerge(st, parentId, found) {
+    const cap = BINARY_GRAPH_EXPLORE.cap;
+    const have = new Set(st.nodes.map(n => n.id));
+    const edgeKey = (s, t, k) => `${s}\n${t}\n${k}`;
+    const seen = new Set(st.edges.map(e => edgeKey(e.source, e.target, e.kind)));
+    const added = [], dropped = [];
+    for (const item of found) {
+        if (!have.has(item.id)) {
+            if (st.nodes.length >= cap) {
+                dropped.push(item.id);
+                continue;
+            }
+            st.nodes.push({ id: item.id, label: item.id, kind: binaryGraphGuessKind(item.id), in_degree: 0, category: '', x: 0, y: 0,
+                            radius: binaryGraphNodeRadius({ in_degree: 0 }), placed: false });
+            have.add(item.id);
+            added.push(item.id);
+        }
+        for (const e of item.edges) {
+            const key = edgeKey(parentId, item.id, e.kind);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            st.edges.push({ source: parentId, target: item.id, kind: e.kind, origin: 'derived', label: e.label });
+        }
+    }
+    if (dropped.length) st.cut.set(parentId, new Set(dropped));
+    else st.cut.delete(parentId);
+    return { added, dropped };
+}
+
+// What is cut now: how many distinct nodes did not fit and are still not drawn, of how many opened nodes, and per node
+function binaryGraphExploreCut(st) {
+    const drawn = new Set(st.nodes.map(n => n.id)), hidden = new Set(), of = new Map();
+    for (const [parent, ids] of st.cut) {
+        const left = [...ids].filter(id => !drawn.has(id));
+        if (!left.length) continue;
+        of.set(parent, left.length);
+        left.forEach(id => hidden.add(id));
+    }
+    return { hidden: hidden.size, parents: of.size, of };
+}
+
+// The line above the canvas: that the picture is cut, in words, and the note of the last step. { tone, html }
+function binaryGraphExploreStatus(st) {
+    if (st.loading) return { tone: 'info', html: '' };
+    const cut = binaryGraphExploreCut(st);
+    let html = '';
+    if (cut.hidden) {
+        html += `<strong class="binary-graph-cut">Not the whole neighbourhood: the canvas holds at most ${escapeHtml(String(BINARY_GRAPH_EXPLORE.cap))} nodes and `
+            + `${escapeHtml(cut.hidden.toLocaleString('en-US'))} more ${cut.hidden === 1 ? 'node' : 'nodes'} did not fit, from the neighbours of `
+            + `${escapeHtml(cut.parents.toLocaleString('en-US'))} ${cut.parents === 1 ? 'node' : 'nodes'}. Whole neighbours were dropped, in name order: `
+            + 'a node that is missing here is not shown, which does not mean it is not imported.</strong> ';
+    }
+    if (st.note) html += `<span class="binary-graph-note">${escapeHtml(st.note)}</span>`;
+    return { tone: cut.hidden ? 'warn' : 'info', html };
+}
+
+// The line under the canvas: the chosen node, or how much is drawn. Everything from a binary is escaped.
+function binaryGraphExploreInfo(st) {
+    const node = st.selected ? st.nodes.find(n => n.id === st.selected) : null;
+    if (!node) {
+        if (!st.nodes.length) return '';
+        return `${escapeHtml(st.nodes.length.toLocaleString('en-US'))} nodes, ${escapeHtml(st.edges.length.toLocaleString('en-US'))} edges. `
+            + 'Choose a node, then EXPAND opens its neighbours; a double click does both.';
+    }
+    const kind = (binaryGraphOwn(BINARY_GRAPH_KINDS, node.kind) || { name: String(node.kind || 'unknown') }).name;
+    let html = `<strong>${escapeHtml(node.label)}</strong> · ${escapeHtml(kind)}${node.machine ? ` · ${escapeHtml(node.machine)}` : ''}`
+        + ` · imported by ${escapeHtml((Number(node.in_degree) || 0).toLocaleString('en-US'))} binaries of System32`;
+    if (node.absent) html += ' · not a binary of this graph, so there is nothing to open';
+    const left = binaryGraphExploreCut(st).of.get(node.id);
+    if (left) html += ` · ${escapeHtml(left.toLocaleString('en-US'))} of its neighbours are not shown: the canvas is full`;
+    return html;
+}
+
+// New neighbours of `parentId` are laid out around it with the process graph's force layout, away from the rest of
+// the picture, so nothing that is drawn moves
+function binaryGraphExploreLayout(st, parentId, added) {
+    if (!added.length) return;
+    const byId = new Map(st.nodes.map(n => [n.id, n])), parent = byId.get(parentId);
+    const fresh = added.map(id => byId.get(id));
+    const copies = [{ id: parent.id, x: 0, y: 0 }, ...fresh.map(n => ({ id: n.id, x: 0, y: 0 }))];
+    const names = new Set(copies.map(c => c.id));
+    applyForceLayout(copies, st.edges.filter(e => names.has(e.source) && names.has(e.target)));
+    const dx = parent.x - copies[0].x, dy = parent.y - copies[0].y;
+    let reach = 0;
+    for (const c of copies.slice(1)) reach = Math.max(reach, Math.hypot(c.x - copies[0].x, c.y - copies[0].y));
+    const others = st.nodes.filter(n => n.placed && n !== parent);
+    let px = 0, py = 0;
+    if (others.length) {
+        const cx = others.reduce((sum, n) => sum + n.x, 0) / others.length, cy = others.reduce((sum, n) => sum + n.y, 0) / others.length;
+        const length = Math.hypot(parent.x - cx, parent.y - cy) || 1;
+        px = (parent.x - cx) / length * reach * 0.6;
+        py = (parent.y - cy) / length * reach * 0.6;
+    }
+    fresh.forEach((n, i) => {
+        n.x = copies[i + 1].x + dx + px;
+        n.y = copies[i + 1].y + dy + py;
+        n.placed = true;
+    });
+}
+
+// What the graph knows of one name, asked once and remembered: { ok: true, detail } or { ok: false, status, error,
+// in_degree } (a name that is no binary of the graph is a 404 that still says how many binaries import it)
+async function binaryGraphExploreDetail(name) {
+    const st = binaryGraphExplore, key = String(name).toLowerCase();
+    if (st.details.has(key)) return st.details.get(key);
+    const r = await syscallApi(`/api/binary-graph/node?${new URLSearchParams({ name: String(name) })}`);
+    const entry = r.ok ? { ok: true, detail: binaryGraphTrimDetail(r.data) }
+        : { ok: false, status: r.status, error: syscallErrorText(r), in_degree: Math.max(0, Number(r.data && r.data.in_degree) || 0) };
+    // an answer of the server is kept; a lost connection is asked again
+    if (r.ok || r.status === 404) st.details.set(key, entry);
+    return entry;
+}
+
+// Size and colour of a drawn node from what was read of it
+function binaryGraphExploreApply(st, name, entry) {
+    const node = st.nodes.find(n => n.id === name);
+    if (!node) return;
+    if (entry.ok) {
+        node.kind = binaryGraphDetailKind(entry.detail, name);
+        node.in_degree = entry.detail.in_degree;
+        node.machine = entry.detail.machine;
+        node.absent = false;
+    } else if (entry.status === 404) {
+        node.in_degree = entry.in_degree;
+        node.absent = true;
+    }
+    node.radius = binaryGraphNodeRadius(node);
+}
+
+// A level of nodes read, a few at a time; a node that is drawn takes its size and colour from what was read
+async function binaryGraphExploreFetch(names) {
+    const st = binaryGraphExplore, got = new Map(), todo = [...new Set(names)];
+    for (let i = 0; i < todo.length; i += BINARY_GRAPH_EXPLORE.batch) {
+        await Promise.all(todo.slice(i, i + BINARY_GRAPH_EXPLORE.batch).map(async name => {
+            const entry = await binaryGraphExploreDetail(name);
+            got.set(name, entry);
+            binaryGraphExploreApply(st, name, entry);
+        }));
+    }
+    return got;
+}
+
+// START: the binary asked for, drawn alone. A function as the path view names it (module!function) opens its module.
+// A name the graph does not have leaves the picture as it was.
+async function binaryGraphExploreStart(name) {
+    const st = binaryGraphExplore;
+    let text = String(name ?? '').trim();
+    const bang = text.indexOf('!');
+    if (bang > 0) text = text.slice(0, bang);
+    if (!text) {
+        st.note = 'Name a binary to start from, such as kernel32.dll.';
+        binaryGraphExploreRender();
+        return false;
+    }
+    const seq = ++st.seq;
+    st.loading = true;
+    st.note = '';
+    st.details.clear();
+    binaryGraphExploreRender();
+    const entry = await binaryGraphExploreDetail(text);
+    if (seq !== st.seq) return false;
+    st.loading = false;
+    if (!entry.ok || entry.detail.is === 'none') {
+        st.note = entry.ok ? `${text} is not in the binary graph of this system.` : entry.error;
+        binaryGraphExploreRender();
+        return false;
+    }
+    const d = entry.detail, id = (d.name || text).toLowerCase();
+    const node = { id, label: id, kind: binaryGraphDetailKind(d, id), in_degree: d.in_degree, category: '', machine: d.machine, x: 0, y: 0, placed: true };
+    node.radius = binaryGraphNodeRadius(node);
+    st.nodes = [node];
+    st.edges = [];
+    st.cut = new Map();
+    st.selected = id;
+    st.hovered = null;
+    st.dragging = null;
+    st.panning = false;
+    Object.assign(st.camera, { x: 0, y: 0, zoom: 1 });
+    if (!binaryGraphFit()) binaryGraphExploreRender();
+    return true;
+}
+
+function binaryGraphExploreSubmit(event) {
+    if (event && typeof event.preventDefault === 'function') event.preventDefault();
+    const input = document.getElementById('binary-explore-start');
+    return binaryGraphExploreStart(input ? input.value : '');
+}
+
+// EXPAND: the neighbours of a node, as many hops as DEPTH says, added to what is drawn. Each hop reads the nodes the
+// hop before added (which also gives their size and colour); the last ring is read for that alone. The cap decides
+// what fits. A newer start or expansion overtakes this one.
+async function binaryGraphExpand(id) {
+    const st = binaryGraphExplore, node = st.nodes.find(n => n.id === id);
+    if (!node || st.loading) return false;
+    const seq = ++st.seq, depth = binaryGraphState.depth, failed = [];
+    st.loading = true;
+    st.note = '';
+    binaryGraphExploreRender();
+    let level = [node.id], opened = false;
+    for (let hop = 0; hop < depth && level.length; hop++) {
+        const got = await binaryGraphExploreFetch(level);
+        if (seq !== st.seq) return false;
+        const next = [];
+        for (const from of level) {
+            const entry = got.get(from);
+            if (!entry.ok) {
+                if (hop === 0) st.note = entry.error;
+                else if (entry.status !== 404) failed.push(from);
+                continue;
+            }
+            if (hop === 0) opened = true;
+            const r = binaryGraphExploreMerge(st, from, binaryGraphNeighboursOf(entry.detail));
+            binaryGraphExploreLayout(st, from, r.added);
+            next.push(...r.added);
+        }
+        level = next;
+        binaryGraphExploreRender();
+    }
+    const last = await binaryGraphExploreFetch(level);
+    if (seq !== st.seq) return false;
+    for (const [name, entry] of last) if (!entry.ok && entry.status !== 404) failed.push(name);
+    if (failed.length) {
+        st.note = `${failed.length.toLocaleString('en-US')} ${failed.length === 1 ? 'node' : 'nodes'} could not be read just now, so ${failed.length === 1 ? 'its' : 'their'} size, colour and neighbours may be missing.`;
+    }
+    st.loading = false;
+    binaryGraphExploreRender();
+    return opened;
+}
+
+// Every node laid out again, and the view fitted
+function binaryGraphRelayout() {
+    const st = binaryGraphExplore;
+    if (!st.nodes.length) return false;
+    applyForceLayout(st.nodes, st.edges);
+    st.nodes.forEach(n => { n.placed = true; });
+    return binaryGraphFit();
+}
+
+// DEPTH: 1 to 3 hops, and no number outside them; nothing is rounded or clamped into range
+function binaryGraphSetDepth(n) {
+    if (typeof n !== 'number' || !BINARY_GRAPH_EXPLORE.depths.includes(n)) return false;
+    binaryGraphState.depth = n;
+    binaryGraphExploreRender();
+    return true;
+}
+
+// PATH / EXPLORE: the view that is on. The path's query bar and canvas and the explorer's are separate elements.
+function binaryGraphSetMode(mode) {
+    if (mode !== 'path' && mode !== 'explore') return false;
+    binaryGraphExplore.mode = mode;
+    const path = document.getElementById('binary-graph-path'), explore = document.getElementById('binary-explore');
+    if (path) path.hidden = mode !== 'path';
+    if (explore) explore.hidden = mode !== 'explore';
+    for (const name of ['path', 'explore']) {
+        const button = document.getElementById(`binary-graph-mode-${name}`);
+        if (button) button.setAttribute('aria-pressed', String(name === mode));
+    }
+    if (mode === 'explore') {
+        initBinaryGraphExplore();
+        binaryGraphExploreRender();
+    } else {
+        renderBinaryGraph();
+    }
+    return true;
+}
+
+// The elements around the canvas, then the canvas
+function binaryGraphExploreRender() {
+    const st = binaryGraphExplore, el = id => document.getElementById(id);
+    const status = el('binary-explore-status');
+    if (status) {
+        const s = binaryGraphExploreStatus(st);
+        status.innerHTML = s.html;
+        status.className = `binary-graph-status binary-graph-status-${cssToken(s.tone)}`;
+        status.hidden = !s.html;
+    }
+    const info = el('binary-explore-info');
+    if (info) info.innerHTML = binaryGraphExploreInfo(st);
+    const legend = el('binary-explore-legend');
+    if (legend) legend.innerHTML = binaryGraphLegend();
+    const expand = el('binary-explore-expand');
+    if (expand) expand.disabled = st.loading || !st.selected;
+    for (const n of BINARY_GRAPH_EXPLORE.depths) {
+        const button = el(`binary-explore-depth-${n}`);
+        if (button) button.setAttribute('aria-pressed', String(binaryGraphState.depth === n));
+    }
+    const zoom = el('binary-explore-zoom');
+    if (zoom) zoom.textContent = `${Math.round(st.camera.zoom * 100)}%`;
+    binaryGraphDraw();
+}
+
+function binaryGraphDraw() {
+    const st = binaryGraphExplore, canvas = document.getElementById('binary-explore-canvas');
+    if (!canvas || typeof canvas.getContext !== 'function') return false;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!st.nodes.length) {
+        ctx.save();
+        ctx.fillStyle = themeColor('--text-muted');
+        ctx.font = '14px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(st.loading ? 'Opening…' : st.note || 'Name a binary and START: it is drawn alone, and EXPAND opens its neighbours one node at a time.',
+                     canvas.width / 2, canvas.height / 2);
+        ctx.restore();
+        return true;
+    }
+    const camera = st.camera, byId = new Map(st.nodes.map(n => [n.id, n]));
+    ctx.save();
+    ctx.translate(camera.x, camera.y);
+    ctx.scale(camera.zoom, camera.zoom);
+    // an edge of the chosen node is drawn heavier and in full, the others step back. Edges between the same two nodes
+    // (an import and a forwarder) are drawn side by side.
+    const lanes = new Map();
+    for (const e of st.edges) {
+        const a = byId.get(e.source), b = byId.get(e.target);
+        if (!a || !b || a === b) continue;
+        const hot = !!st.selected && (e.source === st.selected || e.target === st.selected);
+        const look = binaryGraphEdgeLook(e);
+        const pair = e.source < e.target ? `${e.source}\n${e.target}` : `${e.target}\n${e.source}`;
+        const lane = lanes.get(pair) || 0;
+        lanes.set(pair, lane + 1);
+        const length = Math.hypot(b.x - a.x, b.y - a.y) || 1, ux = (b.x - a.x) / length, uy = (b.y - a.y) / length;
+        const ox = -uy * lane * 5, oy = ux * lane * 5;
+        ctx.globalAlpha = !st.selected || hot ? 1 : 0.25;
+        ctx.strokeStyle = look.color;
+        ctx.fillStyle = look.color;
+        ctx.lineWidth = hot ? look.width + 1.5 : look.width;
+        ctx.setLineDash(look.dash ? look.dash.split(' ').map(Number) : []);
+        ctx.beginPath();
+        ctx.moveTo(a.x + ox, a.y + oy);
+        ctx.lineTo(b.x + ox, b.y + oy);
+        ctx.stroke();
+        const tipX = b.x + ox - ux * b.radius, tipY = b.y + oy - uy * b.radius;
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.moveTo(tipX, tipY);
+        ctx.lineTo(tipX - ux * 9 - uy * 4, tipY - uy * 9 + ux * 4);
+        ctx.lineTo(tipX - ux * 9 + uy * 4, tipY - uy * 9 - ux * 4);
+        ctx.closePath();
+        ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    ctx.setLineDash([]);
+    for (const n of st.nodes) {
+        const look = binaryGraphNodeLook(n, '');
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
+        ctx.fillStyle = look.fill;
+        ctx.fill();
+        ctx.strokeStyle = look.stroke;
+        ctx.lineWidth = look.width;
+        ctx.setLineDash(n.absent ? [3, 3] : []);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        if (n.id === st.selected) {
+            ctx.beginPath();
+            ctx.arc(n.x, n.y, n.radius + 4, 0, Math.PI * 2);
+            ctx.strokeStyle = themeColor('--text-primary');
+            ctx.lineWidth = 2;
+            ctx.stroke();
+        }
+        if (camera.zoom >= 0.7 || n.radius >= 16 || n.id === st.selected || n === st.hovered) {
+            ctx.fillStyle = themeColor('--text-primary');
+            ctx.font = '11px monospace';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'alphabetic';
+            ctx.fillText(binaryGraphCut(n.label, 28), n.x, n.y + n.radius + 13);
+        }
+    }
+    ctx.restore();
+    const cut = binaryGraphExploreCut(st);
+    ctx.save();
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    if (cut.hidden) {
+        ctx.fillStyle = themeColor('--severity-medium');
+        ctx.fillText(`Cut at ${BINARY_GRAPH_EXPLORE.cap} nodes: ${cut.hidden.toLocaleString('en-US')} more not shown`, 12, 10);
+    }
+    if (st.loading) {
+        ctx.fillStyle = themeColor('--text-muted');
+        ctx.fillText('Opening…', 12, canvas.height - 22);
+    }
+    ctx.restore();
+    return true;
+}
+
+function binaryGraphToWorld(sx, sy) {
+    const c = binaryGraphExplore.camera;
+    return { x: (sx - c.x) / c.zoom, y: (sy - c.y) / c.zoom };
+}
+
+// The node under a point of the world; a small node on a zoomed-out canvas can still be hit
+function binaryGraphNodeAt(wx, wy) {
+    const st = binaryGraphExplore, reach = 8 / st.camera.zoom;
+    for (let i = st.nodes.length - 1; i >= 0; i--) {
+        const n = st.nodes[i], r = Math.max(n.radius, reach);
+        if ((wx - n.x) ** 2 + (wy - n.y) ** 2 < r * r) return n;
+    }
+    return null;
+}
+
+// Every node in view
+function binaryGraphFit() {
+    const st = binaryGraphExplore, canvas = document.getElementById('binary-explore-canvas');
+    if (!canvas || !st.nodes.length) return false;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const n of st.nodes) {
+        minX = Math.min(minX, n.x - n.radius);
+        maxX = Math.max(maxX, n.x + n.radius);
+        minY = Math.min(minY, n.y - n.radius);
+        maxY = Math.max(maxY, n.y + n.radius + 14);
+    }
+    const w = maxX - minX + 120, h = maxY - minY + 120;
+    const zoom = Math.max(0.1, Math.min(canvas.width / w, canvas.height / h, 2));
+    st.camera.zoom = zoom;
+    st.camera.x = canvas.width / 2 - (minX + maxX) / 2 * zoom;
+    st.camera.y = canvas.height / 2 - (minY + maxY) / 2 * zoom;
+    binaryGraphExploreRender();
+    return true;
+}
+
+// Zoom by a factor toward a point of the canvas (its middle without one)
+function binaryGraphZoom(factor, sx, sy) {
+    const st = binaryGraphExplore, canvas = document.getElementById('binary-explore-canvas');
+    if (!canvas || !(factor > 0)) return false;
+    const c = st.camera, old = c.zoom;
+    c.zoom = Math.max(0.1, Math.min(5, old * factor));
+    const x = sx === undefined ? canvas.width / 2 : sx, y = sy === undefined ? canvas.height / 2 : sy;
+    c.x = x - (x - c.x) * (c.zoom / old);
+    c.y = y - (y - c.y) * (c.zoom / old);
+    binaryGraphExploreRender();
+    return true;
+}
+
+function binaryGraphOnCanvasDown(ev) {
+    const st = binaryGraphExplore, w = binaryGraphToWorld(ev.offsetX, ev.offsetY), node = binaryGraphNodeAt(w.x, w.y);
+    st.moved = false;
+    st.down = { x: ev.offsetX, y: ev.offsetY };
+    if (node) {
+        st.dragging = node;
+    } else {
+        st.panning = true;
+        st.panStart = { x: ev.offsetX, y: ev.offsetY };
+    }
+}
+
+function binaryGraphOnCanvasMove(ev) {
+    const st = binaryGraphExplore;
+    if (st.dragging || st.panning) {
+        if (!st.moved && Math.hypot(ev.offsetX - st.down.x, ev.offsetY - st.down.y) < BINARY_GRAPH_EXPLORE.drag) return;
+        st.moved = true;
+        if (st.dragging) {
+            const w = binaryGraphToWorld(ev.offsetX, ev.offsetY);
+            st.dragging.x = w.x;
+            st.dragging.y = w.y;
+        } else {
+            st.camera.x += ev.offsetX - st.panStart.x;
+            st.camera.y += ev.offsetY - st.panStart.y;
+            st.panStart = { x: ev.offsetX, y: ev.offsetY };
+        }
+        binaryGraphDraw();
+        return;
+    }
+    const w = binaryGraphToWorld(ev.offsetX, ev.offsetY), node = binaryGraphNodeAt(w.x, w.y);
+    if (node === st.hovered) return;
+    st.hovered = node;
+    const canvas = document.getElementById('binary-explore-canvas');
+    if (canvas) canvas.title = node ? `${node.id} · imported by ${(Number(node.in_degree) || 0).toLocaleString('en-US')} binaries` : '';
+    binaryGraphDraw();
+}
+
+function binaryGraphOnCanvasUp() {
+    const st = binaryGraphExplore;
+    st.dragging = null;
+    st.panning = false;
+}
+
+function binaryGraphOnCanvasLeave() {
+    const st = binaryGraphExplore;
+    st.dragging = null;
+    st.panning = false;
+    if (st.hovered) {
+        st.hovered = null;
+        binaryGraphDraw();
+    }
+}
+
+function binaryGraphOnCanvasWheel(ev) {
+    if (typeof ev.preventDefault === 'function') ev.preventDefault();
+    binaryGraphZoom(ev.deltaY > 0 ? 0.9 : 1.1, ev.offsetX, ev.offsetY);
+}
+
+// A click chooses the node under it, or lets go of the choice on empty ground. The click that ends a drag is no choice.
+function binaryGraphOnCanvasClick(ev) {
+    const st = binaryGraphExplore;
+    if (st.moved) {
+        st.moved = false;
+        return false;
+    }
+    const w = binaryGraphToWorld(ev.offsetX, ev.offsetY), node = binaryGraphNodeAt(w.x, w.y);
+    st.selected = node ? node.id : null;
+    binaryGraphExploreRender();
+    return !!node;
+}
+
+// A double click chooses the node and opens its neighbours
+function binaryGraphOnCanvasDblClick(ev) {
+    const st = binaryGraphExplore, w = binaryGraphToWorld(ev.offsetX, ev.offsetY), node = binaryGraphNodeAt(w.x, w.y);
+    if (!node) return false;
+    st.selected = node.id;
+    return binaryGraphExpand(node.id);
+}
+
+// The canvas follows the box it is in, and the pointer is read from the canvas
+function initBinaryGraphExplore() {
+    const st = binaryGraphExplore, canvas = document.getElementById('binary-explore-canvas'), stage = document.getElementById('binary-explore-stage');
+    if (st.ready || !canvas || !stage) return;
+    st.ready = true;
+    const resize = () => {
+        const w = stage.clientWidth, h = stage.clientHeight;
+        if (!w || !h || (canvas.width === w && canvas.height === h)) return;
+        canvas.width = w;
+        canvas.height = h;
+        binaryGraphDraw();
+    };
+    resize();
+    if (typeof ResizeObserver !== 'undefined') new ResizeObserver(resize).observe(stage);
+    else window.addEventListener('resize', resize);
+    canvas.addEventListener('mousedown', binaryGraphOnCanvasDown);
+    canvas.addEventListener('mousemove', binaryGraphOnCanvasMove);
+    canvas.addEventListener('mouseup', binaryGraphOnCanvasUp);
+    canvas.addEventListener('mouseleave', binaryGraphOnCanvasLeave);
+    canvas.addEventListener('wheel', binaryGraphOnCanvasWheel, { passive: false });
+    canvas.addEventListener('click', binaryGraphOnCanvasClick);
+    canvas.addEventListener('dblclick', binaryGraphOnCanvasDblClick);
+}
