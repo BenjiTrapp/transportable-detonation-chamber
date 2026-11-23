@@ -127,10 +127,12 @@ def _parse_entry(entry) -> Syscall:
     )
 
 
-def load_baseline(path: str) -> Baseline:
+def load_baseline(path: str, check_shape: bool = True) -> Baseline:
     """Build and view come from the file name `ntsleuth-<build>-<view>.json`.
 
-    A file that yields no usable syscall at all is an error, not an empty baseline."""
+    A file that yields no usable syscall at all is an error, not an empty baseline, and so is one whose stubs do not
+    have the shape of its view (`check_view_shape`). `check_shape` False is for comparing a file with another, never
+    for measuring by it."""
     m = _FILENAME_RE.fullmatch(os.path.basename(path))
     if not m:
         raise BaselineError(f"{path}: not named ntsleuth-<build>-<view>.json")
@@ -143,7 +145,48 @@ def load_baseline(path: str) -> Baseline:
     # measuring against an empty baseline finds no deviation, which reads as "clean"
     if not bl.syscalls:
         raise BaselineError(f"baseline {path} has no usable syscalls ({len(bl.skipped)} skipped)")
+    if check_shape:
+        check_view_shape(bl)
     return bl
+
+
+# How many of the stubs of a baseline must have the shape of its view. Not all: an extraction may hold an odd entry.
+SHAPE_SHARE = 0.8
+_X64_STUB_HEAD = b"\x4c\x8b\xd1\xb8"
+
+
+def _has_shape(sc: Syscall, view: str) -> bool:
+    """Whether the stub of `sc` is the clean stub of `view`: `mov r10, rcx; mov eax, <ssn>` on x64, `SVC` on arm64."""
+    if view == "x64":
+        return sc.stub_bytes[:4] == _X64_STUB_HEAD
+    if view == "arm64":
+        w = _word(sc.stub_bytes)
+        return w is not None and w & 0xFFE0001F == 0xD4000001
+    return False
+
+
+def shape_share(baseline: Baseline, view: str | None = None) -> float:
+    """The share of the stubs of `baseline` that have the shape of `view`, its own view by default."""
+    if not baseline.syscalls:
+        return 0.0
+    view = view or baseline.view
+    return sum(_has_shape(sc, view) for sc in baseline.syscalls.values()) / len(baseline.syscalls)
+
+
+def check_view_shape(baseline: Baseline) -> None:
+    """Raises BaselineError unless most stubs of `baseline` have the shape of its view.
+
+    A baseline named for one view that holds the other's stubs is worse than none. On an ARM64 host the x64 binary
+    may extract the arm64 view; stored as x64, an emulated process would be measured at RVAs that hold ARM64 stubs in
+    the ARM64X image, and read as intact. Comparing with the other view's baseline needs that file to exist; this
+    needs nothing but the baseline itself, so it holds in any order and for a file that could not be removed."""
+    if baseline.view not in ("x64", "arm64"):
+        return
+    share = shape_share(baseline)
+    if share < SHAPE_SHARE:
+        what = "4C 8B D1 B8 (mov r10, rcx; mov eax)" if baseline.view == "x64" else "SVC"
+        raise BaselineError(f"the stubs of this {baseline.view} baseline do not have the {baseline.view} shape: "
+                            f"{share:.0%} begin with {what}, at least {SHAPE_SHARE:.0%} must")
 
 
 def view_fingerprint(baseline: Baseline) -> str:

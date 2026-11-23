@@ -7931,16 +7931,23 @@ def _same_view_baseline(parsed, build, other_view):
     if path is None:
         return None
     try:
-        other = _load_syscall_baseline(path)
+        # without the shape check: an x64 lookalike has the arm64 shape, which is what is being looked for
+        other = syscall_baseline.load_baseline(path, check_shape=False)
     except syscall_baseline.BaselineError:
         return None
     return path if syscall_baseline.view_fingerprint(other) == syscall_baseline.view_fingerprint(parsed) else None
 
 
 def _refuse_arm64_lookalike(parsed, build):
-    """Raises _ViewNotDistinguishable if `parsed`, an x64 extraction, has the fingerprint of the arm64 baseline of
-    `build`. Stored, it would be the arm64 baseline under another name: every emulated x64 sample would be measured
-    against the wrong reference."""
+    """Raises _ViewNotDistinguishable if `parsed`, an x64 extraction, is the arm64 view: it has the fingerprint of
+    the arm64 baseline of `build`, or, whether or not that file exists, the stubs of the arm64 view. Stored, it would
+    be the arm64 baseline under another name: every emulated x64 sample would be measured against the wrong
+    reference."""
+    if syscall_baseline.shape_share(parsed, "arm64") >= syscall_baseline.SHAPE_SHARE:
+        raise _ViewNotDistinguishable(
+            f"the x64 view is not distinguishable on this host: ntsleuth-x64.exe extracted ARM64 stubs (SVC) for "
+            f"build {build}, so it did not see the x64 ntdll.dll. No x64 baseline is stored; measuring emulated x64 "
+            f"samples against the ARM64 stubs would be wrong")
     if _same_view_baseline(parsed, build, "arm64"):
         raise _ViewNotDistinguishable(
             f"the x64 view is not distinguishable on this host: ntsleuth-x64.exe extracted the same RVAs and stub "
@@ -7964,8 +7971,8 @@ def _drop_x64_lookalike(parsed, build):
     why = (f"the x64 view is not distinguishable on this host: the x64 baseline of build {build} had the same RVAs "
            f"and stub bytes as the arm64 one, so ntsleuth-x64.exe had not seen the x64 ntdll.dll. "
            + ("It was removed; emulated x64 samples are not measured" if removed else
-              f"It could not be removed: delete {os.path.basename(path)} by hand, or emulated x64 samples are "
-              f"measured against the ARM64 stubs"))
+              f"It could not be removed: delete {os.path.basename(path)} by hand. It is not used meanwhile, its stubs "
+              f"do not have the x64 shape, so emulated x64 samples are not measured"))
     with _syscall_extract_lock:
         _syscall_extract_state["failed"][(build, "x64")] = (time.time(), why)
         _syscall_extract_state["indistinguishable"].add((build, "x64"))
@@ -8006,6 +8013,10 @@ def _extract_baseline(view, symbols, build):
         raise RuntimeError("NTSleuth's output holds no usable syscall")
     if view == "x64":
         _refuse_arm64_lookalike(parsed, build)
+    try:
+        syscall_baseline.check_view_shape(parsed)
+    except syscall_baseline.BaselineError as exc:
+        raise RuntimeError(f"NTSleuth's output is not stored: {exc}") from None
     os.makedirs(NTSLEUTH_BASELINE_DIR, exist_ok=True)
     target = os.path.join(NTSLEUTH_BASELINE_DIR, f"ntsleuth-{build}-{view}.json")
     with open(target + ".tmp", "w", encoding="utf-8") as fh:

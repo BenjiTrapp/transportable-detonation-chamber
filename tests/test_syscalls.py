@@ -2387,6 +2387,71 @@ def _x64_baseline_file(tdc):
     return pathlib.Path(tdc.NTSLEUTH_BASELINE_DIR) / "ntsleuth-26300.1-x64.json"
 
 
+# --- a baseline has the shape of its view, whatever else is on disk --------------------------------
+
+def _named(tmp_path, view, payload, build="26220.5770"):
+    path = tmp_path / f"ntsleuth-{build}-{view}.json"
+    path.write_text(json.dumps(payload))
+    return str(path)
+
+
+@pytest.mark.parametrize("view", ["arm64", "x64"])
+def test_a_baseline_of_its_own_shape_loads(tmp_path, view):
+    assert syscall_baseline.load_baseline(_named(tmp_path, view, _fixture(view))).view == view
+
+
+@pytest.mark.parametrize("named,stubs", [("x64", "arm64"), ("arm64", "x64")])
+def test_a_baseline_whose_stubs_have_the_other_views_shape_is_refused(tmp_path, named, stubs):
+    # the x64 lookalike, also when the arm64 file it could be compared with is missing or the lookalike could not
+    # be removed: measured against it, an emulated process would read the ARM64 stubs of the ARM64X image, intact
+    with pytest.raises(syscall_baseline.BaselineError, match="shape"):
+        syscall_baseline.load_baseline(_named(tmp_path, named, _fixture(stubs)))
+
+
+def test_a_baseline_is_judged_by_most_of_its_stubs_not_by_one():
+    stub = "4c8bd1b8{:02x}000000f604250803fe7f0175030f05c3cd2ec3"
+    entries = [_entry(name=f"Nt{i}", syscall_number=i, rva=16 * i, stub_bytes=stub.format(i)) for i in range(10)]
+    entries[0]["stub_bytes"] = "e9" + entries[0]["stub_bytes"][2:]
+    bl = syscall_baseline.parse_baseline({"syscalls": entries}, "26220.5770", "x64")
+    assert syscall_baseline.shape_share(bl) == 0.9
+    syscall_baseline.check_view_shape(bl)
+    for e in entries[1:3]:
+        e["stub_bytes"] = "e9" + e["stub_bytes"][2:]
+    with pytest.raises(syscall_baseline.BaselineError, match="shape"):
+        syscall_baseline.check_view_shape(syscall_baseline.parse_baseline({"syscalls": entries}, "26220.5770", "x64"))
+
+
+def test_the_shape_share_counts_the_stubs_of_the_view_asked_for():
+    arm64 = syscall_baseline.parse_baseline(_fixture("arm64"), "26220.5770", "arm64")
+    assert syscall_baseline.shape_share(arm64) == 1.0
+    assert syscall_baseline.shape_share(arm64, "x64") == 0.0
+
+
+def test_an_x64_extraction_with_arm64_stubs_is_not_stored_even_with_no_arm64_baseline_to_compare(
+        tdc, monkeypatch, tmp_path):
+    _fake_ntsleuth(tdc, monkeypatch, tmp_path, _fixture("arm64"))
+    (pathlib.Path(tdc.NTSLEUTH_DIR) / "ntsleuth-x64.exe").write_bytes(b"MZ")
+    with pytest.raises(tdc._ViewNotDistinguishable, match="ARM64"):
+        tdc._extract_baseline("x64", False, "26300.1")
+    assert not _x64_baseline_file(tdc).exists()
+
+
+def test_an_arm64_extraction_without_svc_stubs_is_not_stored(tdc, monkeypatch, tmp_path):
+    _fake_ntsleuth(tdc, monkeypatch, tmp_path, _fixture("x64"))
+    with pytest.raises(RuntimeError, match="shape"):
+        tdc._extract_baseline("arm64", False, "26300.1")
+    assert not (pathlib.Path(tdc.NTSLEUTH_BASELINE_DIR) / "ntsleuth-26300.1-arm64.json").exists()
+
+
+def test_an_x64_lookalike_that_stayed_on_disk_is_not_measured_by(client, tdc, target, fake_baseline_dir):
+    # the deferred case: the lookalike could not be deleted. It must not load, so no scan reads ARM64 stubs as x64
+    (fake_baseline_dir / "ntsleuth-26220.5770-x64.json").write_text(json.dumps(_fixture("arm64")))
+    target.view = "x64"
+    r = client.post("/api/syscalls/scan", json={"pid": 4812})
+    assert r.status_code == 400 and "shape" in r.get_json()["error"]
+    assert target.opened == []
+
+
 def test_view_fingerprint_tells_the_views_apart_and_ignores_the_metadata():
     arm64 = syscall_baseline.parse_baseline(_fixture("arm64"), "26220.5770", "arm64")
     again = _fixture("arm64")
@@ -2424,8 +2489,9 @@ def test_a_distinct_x64_extraction_is_stored_next_to_the_arm64_one(tdc, monkeypa
 
 @pytest.mark.parametrize("arm64_file", ["missing", "unreadable"])
 def test_without_a_usable_arm64_baseline_there_is_nothing_to_be_identical_to(tdc, monkeypatch, tmp_path, arm64_file):
-    # an x64 host, or a native-only one: the extraction goes on as it always did, even with the arm64 view's content
-    _fake_ntsleuth(tdc, monkeypatch, tmp_path, _fixture("arm64"))
+    # an x64 host, or a native-only one: an x64 extraction of x64 stubs is stored with nothing to compare it with.
+    # One of ARM64 stubs is not, whatever is beside it (see the shape tests)
+    _fake_ntsleuth(tdc, monkeypatch, tmp_path, _fixture("x64"))
     (pathlib.Path(tdc.NTSLEUTH_DIR) / "ntsleuth-x64.exe").write_bytes(b"MZ")
     if arm64_file == "unreadable":
         os.makedirs(tdc.NTSLEUTH_BASELINE_DIR)
@@ -2511,7 +2577,9 @@ def test_an_x64_baseline_of_another_build_is_not_the_one_compared_with(tdc, monk
 
 
 def test_an_x64_lookalike_that_cannot_be_removed_is_reported_with_what_to_do(tdc, monkeypatch, tmp_path):
-    _extract_view(tdc, monkeypatch, tmp_path, "x64", _fixture("arm64"))
+    # left by an older installer or web UI: the extraction no longer stores one
+    os.makedirs(tdc.NTSLEUTH_BASELINE_DIR, exist_ok=True)
+    _x64_baseline_file(tdc).write_text(json.dumps(_fixture("arm64")))
     real_remove = os.remove
 
     def locked(path, *a, **k):
@@ -2525,7 +2593,10 @@ def test_an_x64_lookalike_that_cannot_be_removed_is_reported_with_what_to_do(tdc
     assert "ntsleuth-26300.1-arm64.json" in _baseline_files(tdc)          # the good one is stored regardless
     reason = tdc._syscall_extract_state["failed"][("26300.1", "x64")][1]
     assert "could not be removed" in reason and "ntsleuth-26300.1-x64.json" in reason
+    assert "not used" in reason
     assert ("26300.1", "x64") in tdc._syscall_extract_state["indistinguishable"]
+    # and it is not measured by: its stubs do not have the x64 shape
+    assert tdc._get_syscall_baseline("x64") is None
 
 
 def test_a_later_good_extraction_clears_the_indistinguishable_note(tdc, monkeypatch, tmp_path):
