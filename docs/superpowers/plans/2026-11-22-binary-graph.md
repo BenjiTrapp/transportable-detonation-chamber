@@ -660,9 +660,35 @@ def test_an_update_is_refused_while_the_binary_graph_is_being_built():
 
 - [ ] **Step 13: Deploy-Wege, Dateibaum, API-Tabelle, Hilfe**
 
-Jetzt importiert `app.py` `binary_graph` und `binary_graph_query` zum ersten Mal, also greift `test_every_deploy_path_uploads_the_web_ui_modules`: beide Module in `scripts/deploy-utm.py` `FILES`, `Makefile`, `make.ps1`, und in den Dateibaum in `docs/troubleshooting.md`. Die zwei Routen je einmal in die API-Tabelle in `docs/api.md` und in `#help-api`.
+Jetzt importiert `app.py` `binary_graph` und `binary_graph_query` zum ersten Mal, also greift `test_every_deploy_path_uploads_the_web_ui_modules`: beide Module in `scripts/deploy-utm.py` `FILES`, `Makefile`, `make.ps1`. In den Dateibaum von `docs/troubleshooting.md` gehört nur `binary_graph_query.py` — `binary_graph.py` hat Task 2 schon eingetragen. Die zwei Routen je einmal in die API-Tabelle in `docs/api.md` und in `#help-api`.
 
-- [ ] **Step 14: Ganze Suite, Commit**
+- [ ] **Step 14: Der Prozessmodus darf wieder belegen — der richtige Nenner**
+
+Task 1 hat den Beleg im Prozessmodus abgeschaltet, weil privater, ausführbarer Speicher
+nicht zuordenbar ist: ein Stub dort kann vom Sample, von einer injizierten Hook-Engine
+oder von den Interception-Thunks eines Browser-Brokers stammen. Die Importtabelle eines
+einzelnen PE ist dafür die falsche Menge.
+
+Der richtige Nenner ist die Vereinigung der Türen, die **jedes geladene Modul des
+Prozesses** importiert — und der Graph-Cache hält diese Importtabellen schon. Also:
+`binary_graph_query.imported_doors(graph, module_names, table) -> set[str]` liefert die
+erweiterte Importmenge über alle geladenen Module, und `_syscall_stage` sowie der
+`pid`-Zweig von `/api/syscalls/stubs` übergeben sie samt `covered` wieder.
+
+Die Modulliste kommt aus dem Leser, der sie für die Messung schon aufzählt. Ein Modul,
+das der Cache nicht kennt (ein Sample-eigenes, eine DLL außerhalb System32), lässt den
+Nenner **unvollständig**: dann bleibt es bei `None`, nie bei `False`. Eine unvollständige
+Vereinigung darf keinen Beleg tragen.
+
+```python
+def test_the_doors_of_every_loaded_module_count_as_the_documented_path():
+def test_a_loaded_module_the_cache_does_not_know_keeps_the_answer_unknown():
+def test_a_process_whose_modules_import_no_door_still_proves_a_bypass():
+```
+
+- [ ] **Step 15: Umsetzen, lauf lassen — grün**
+
+- [ ] **Step 16: Ganze Suite, Commit**
 
 ```bash
 git commit -m "feat(binary-graph): five queries over the import graph behind two routes, cut at 400 nodes"
