@@ -258,37 +258,59 @@ git commit -m "feat(syscalls): a curated Win32-to-Nt table turns a carried stub 
   - `extract_tree(directory: str) -> tuple[list[BinaryInfo], list[tuple[str, str]]]` — die Binaries und die übersprungenen Dateien als `(Dateiname, Grund)`.
   - `class ExtractError(Exception)`.
 
-- [ ] **Step 1: Die PE-Werkstatt im Test, als Erstes**
+- [ ] **Step 1: Die vorhandene PE-Werkstatt teilen und erweitern, nicht eine zweite schreiben**
 
-Jede weitere Task baut darauf. Ihr Vertrag:
+**Sie existiert schon:** `_pe_importing(*names, delay=False, exports=(), code=b"", export_rva=None)`
+in `tests/test_syscalls.py` baut ein PE32+ mit Import-, Delay-Load- und
+Export-Verzeichnis, Code bei RVA 0x11C0 / Offset 0x3C0. Eine zweite Werkstatt wäre
+die Dopplung eines Logikblocks, und der Review liest das als Defekt.
+
+Also: nach `tests/conftest.py` verschieben — dort liegen die geteilten Helfer des
+Projekts schon (`make_alert`, `FirewallFake`) —, als `make_pe` benennen und um die
+vier Dinge erweitern, die Plan 2 braucht:
 
 ```python
-def _pe(*, exports=(), forwarders=(), imports=(), machine=0xAA64, dll=True) -> bytes:
-    """A minimal PE whose export and import directories pefile parses.
+def make_pe(*, imports=(), delay=(), exports=(), forwarders=(), code=b"",
+            export_rva=None, machine=0x8664, sections=()) -> bytes:
+    """A minimal PE whose directories pefile parses.
 
-    exports:    names this image defines itself
-    forwarders: (name, "MODULE.Function") pairs
-    imports:    (module, (function, ...)) pairs
+    imports, delay: (module, (function, ...)) pairs — several modules, not one
+    exports:        names this image defines itself
+    forwarders:     (name, "MODULE.Function") pairs
+    sections:       (name, bytes) pairs, for a section such as ".apiset"
+    machine:        0x8664 x64, 0xAA64 arm64
     """
 ```
 
-Zwei Dinge sind hier nicht offensichtlich und entscheiden, ob es funktioniert:
+**Jeder bestehende Aufruf behält sein Verhalten.** `tests/test_syscalls.py` ruft nur
+noch den neuen Namen; kein dortiger Test darf eine andere Zusicherung bekommen. Wird
+eine Signatur unbequem, ist das ein Grund zu berichten, nicht einen Test anzupassen.
 
-- **Ein Forwarder ist ein Export, dessen Adress-RVA innerhalb des Export-Daten-Verzeichnisses liegt.** So und nur so meldet `pefile` `exp.forwarder`. Die Forwarder-Zeichenketten müssen also in den Bereich gelegt werden, den `IMAGE_DIRECTORY_ENTRY_EXPORT` in `Size` angibt.
-- `pefile.PE(data=…)` braucht keine Datei. Für `extract_binary(path)` reicht ein `tmp_path`.
+Zwei Dinge sind nicht offensichtlich und entscheiden, ob die Erweiterung trägt:
 
-Dazu ein Test, der die Werkstatt selbst prüft, bevor irgendetwas sie benutzt:
+- **Ein Forwarder ist ein Export, dessen Adress-RVA innerhalb des
+  Export-Daten-Verzeichnisses liegt.** So und nur so meldet `pefile`
+  `exp.forwarder`. Die Forwarder-Zeichenketten müssen also in den Bereich gelegt
+  werden, den `IMAGE_DIRECTORY_ENTRY_EXPORT` in `Size` angibt — der heute 0x28 ist
+  und mitwachsen muss.
+- Der heutige Bauer legt `ntdll.dll` als einzigen Importnamen fest. Mehrere Module
+  brauchen je einen eigenen Import-Deskriptor; das Array endet mit einem Nulleintrag.
+
+`pefile.PE(data=…)` braucht keine Datei. Für `extract_binary(path)` reicht `tmp_path`.
+
+- [ ] **Step 2: Den Test schreiben, der die erweiterte Werkstatt prüft, bevor etwas sie benutzt**
 
 ```python
 def test_the_test_pe_builder_produces_an_image_pefile_reads_back():
-    # exports, one forwarder and one import directory round-trip through pefile
+    # two import modules, an export, a forwarder, a named section and arm64 machine,
+    # all read back through pefile
 ```
 
-- [ ] **Step 2: Lauf lassen — der Test darf nicht grün werden, solange die Werkstatt nicht stimmt**
+- [ ] **Step 3: Lauf lassen — FAIL; die Werkstatt verschieben und erweitern; grün**
 
-Run: `webui/.venv/bin/python -m pytest tests/test_binary_graph.py -k builder -v`
-
-- [ ] **Step 3: Die Werkstatt schreiben, bis dieser Test grün ist**
+Run: `webui/.venv/bin/python -m pytest tests/test_binary_graph.py -k builder tests/test_syscalls.py -v`
+Erwartet am Ende: der neue Test grün **und** jeder bestehende Test von
+`test_syscalls.py` unverändert grün.
 
 - [ ] **Step 4: Die Tests für `extract_binary` schreiben**
 
