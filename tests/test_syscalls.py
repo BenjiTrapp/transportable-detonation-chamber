@@ -4866,3 +4866,27 @@ def test_the_sweep_route_still_wants_one_tool_that_is_there(client, tdc, monkeyp
     monkeypatch.setattr(tdc, "_sweep_state", {})
     r = client.post("/api/memory/sweep", json={"syscalls": True})
     assert r.status_code == 400 and "No selected sweep tool" in r.get_json()["error"]
+
+
+@pytest.mark.parametrize("body", [{}, {"baseline": True}, {"aether": True}])
+def test_the_sweep_leaves_the_syscall_scan_out_unless_it_is_asked_for(client, tdc, fake_baseline_dir, monkeypatch,
+                                                                     tmp_path, body):
+    # the SWEEP button and "record a system-wide baseline" send no syscalls key: they keep the results they had,
+    # and no syscall finding goes into the host baseline, until a clean VM has been shown to sweep clean
+    aether = tmp_path / "aether.exe"
+    aether.write_bytes(b"MZ")
+    seen = []
+    monkeypatch.setattr(tdc, "AETHER_EXE", str(aether))
+    monkeypatch.setattr(tdc, "_run_sweep", lambda *a: seen.append(a) or {"processes": []})
+    monkeypatch.setattr(tdc, "_sweep_state", {})
+    r = client.post("/api/memory/sweep", json=body)
+    assert r.status_code == 200 and r.get_json()["options"]["syscalls"] is False
+    assert _until(lambda: len(seen) == 1) and seen[0][3] is False
+
+
+def test_the_sweep_alone_with_the_syscall_scan_unasked_has_no_tool(client, tdc, fake_baseline_dir, monkeypatch):
+    monkeypatch.setattr(tdc, "AETHER_EXE", "/nonexistent/aether")
+    monkeypatch.setattr(tdc, "PROCESSDUMP_EXE", "/nonexistent/pd")
+    monkeypatch.setattr(tdc, "_sweep_state", {})
+    r = client.post("/api/memory/sweep", json={})
+    assert r.status_code == 400

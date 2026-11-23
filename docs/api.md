@@ -131,7 +131,7 @@ One rizin session per opened file and browser tab (RIZIN tab). Addresses are int
 | POST | `/api/memory/evidence` | Re-score all cached memory results for a PID across sources. Params: `pid` |
 | GET / DELETE | `/api/memory/baseline` | Host memory baseline statistics / clear it. `stale: true` means it was built with an older key scheme and is ignored until captured again |
 | POST | `/api/memory/baseline/capture` | Record findings of named processes as baseline. Params: `names`, `samples` |
-| POST / GET | `/api/memory/sweep` | Background sweep of every process (`aether`, `processdump`, `syscalls`, `baseline`) / status + result |
+| POST / GET | `/api/memory/sweep` | Background sweep of every process (`aether`, `processdump`, `syscalls` (opt-in, off unless `true`), `baseline`) / status + result |
 | GET / POST | `/api/processdump/baseline` | Process Dump clean-hash database status / build it (`mode`: `gen`, `genquick`) |
 | GET | `/api/process/lookup` | Running PIDs by image name. Params: `name` |
 | GET | `/api/file/visualize` | File map planes + structure + import/export trees. Params: `path`, `cols`, `rows` |

@@ -7555,15 +7555,17 @@ def _run_sweep(use_aether, use_processdump, capture_baseline, use_syscalls=False
 def api_memory_sweep_start():
     """Start a background sweep of every process.
 
-    Body: {"aether": true, "processdump": false, "syscalls": true, "baseline": false}
+    Body: {"aether": true, "processdump": false, "syscalls": false, "baseline": false}
     With "baseline": true the findings are recorded as the host baseline
-    instead of being scored - run that on a clean box.
+    instead of being scored - run that on a clean box. The syscall scan is
+    opt-in: a body without "syscalls" leaves it out, so neither SWEEP nor a
+    recorded baseline changes until a clean VM is known to sweep clean.
     """
     data = request.get_json(force=True) if request.is_json else request.form
     truthy = lambda v, d: d if v is None else str(v).lower() in ("1", "true", "yes")
     use_aether = truthy(data.get("aether"), True)
     use_pd = truthy(data.get("processdump"), False)
-    use_syscalls = truthy(data.get("syscalls"), True)
+    use_syscalls = truthy(data.get("syscalls"), False)
     capture_baseline = truthy(data.get("baseline"), False)
 
     if (not (use_aether and os.path.isfile(AETHER_EXE)) and not (use_pd and os.path.isfile(PROCESSDUMP_EXE))

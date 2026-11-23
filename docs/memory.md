@@ -214,7 +214,15 @@ Two notices look alike and are not.
 The detonation stage (**Syscalls** in the table at the top) needs only the
 baseline file, not NTSleuth. It skips itself with its reason when there is no
 baseline of this build and view, when the process is gone, or when
-`TDC_NO_SYSCALL_STAGE=1` is set, and the detonation goes on.
+`TDC_NO_SYSCALL_STAGE=1` is set, and the detonation goes on. Its result, and the
+reason it skipped, are in the **Memory** tab of the detonation; a partial
+measurement and stubs that diverged are named in the verdict's reasons, so that
+neither reads as a clean process.
+
+The system-wide sweep (`POST /api/memory/sweep`) runs the syscall scan only when
+asked for with `"syscalls": true`. The SWEEP button and "Sweep as baseline" do
+not ask for it: a syscall finding does not go into the host baseline until a
+clean VM has been shown to sweep clean with it.
 
 ## Before the first detonation (clean box)
 
