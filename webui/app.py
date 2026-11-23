@@ -6318,7 +6318,8 @@ def api_rizin_breakpoint_clear(sid):
 
 @app.route("/api/rizin/<sid>/patches")
 def api_rizin_patches(sid):
-    """What rizin's write cache holds, lowest address first; `mine` tells a patch from a run's bytes."""
+    """What rizin's write cache holds, lowest address first (`mine` tells a patch from a run's bytes), and the
+    patches held back over a run's bytes, which are in the project and not in the cache."""
     return _rizin_call(sid, lambda session: session.patches())
 
 

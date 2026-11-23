@@ -167,6 +167,14 @@ _PROJECT_FAILED = "The saved project could not be loaded; it was kept as .rzdb.b
 # Addresses the first note names before it says "...".
 _NOTE_ADDRESSES = 5
 _PATCHES_LOST = "{count} saved {patch} could not be applied to this file{where}."
+# What a patch set over a run's bytes waits for, and the note that names it when the file is opened. The
+# project keeps it, so does every save; it is written into the cache only when the bytes under it are a
+# run's again, because a patch in the file's own (still encrypted) bytes is decrypted over by the next run.
+_PATCH_WAITING_REASON = ("set over bytes an emulation run wrote; held back, because written into the file's own "
+                         "bytes it would be decrypted over by the next run")
+_PATCHES_HELD = ("Held back, not applied: {count} saved {patch} over bytes an emulation run wrote ({where}). "
+                 "The file's own bytes there are still encrypted, and a patch written into them would be "
+                 "decrypted over by the next run.")
 _PATCHES_DROPPED = ("{count} {patch} did not fit into the project ({chars} characters at most) and will "
                     "not come back when the file is opened again.")
 # While an analysis step holds rizin, a patch or a breakpoint goes through (it changes no bytes the step
@@ -888,6 +896,13 @@ def _patch_words(count):
     return {"count": count, "patch": "patch" if count == 1 else "patches"}
 
 
+def _named_addresses(addrs):
+    """The addresses a note names, lowest first: the first _NOTE_ADDRESSES of them and "..." for the rest."""
+    addrs = sorted(addrs)
+    shown = ", ".join(f"{addr:#x}" for addr in addrs[:_NOTE_ADDRESSES])
+    return shown + (", ..." if len(addrs) > _NOTE_ADDRESSES else "")
+
+
 def _sanitize_project(src, dst, level, mode, done, patches, ranges=()):
     """Copy a project written by ``Ps`` so that rizin 0.9.1 can load it again; how many patches did not fit.
 
@@ -897,8 +912,8 @@ def _sanitize_project(src, dst, level, mode, done, patches, ranges=()):
     (shown as "@ ...") are left out. The analysis progress goes into an extra
     ``/tdc`` namespace, which rizin ignores.
 
-    ``patches`` are the hand-made patches as (addr, after_hex), in the order rizin's write cache holds
-    them, and they go into that namespace too: ``Ps`` saves the cache's bytes nowhere (measured, which
+    ``patches`` are the hand-made patches as (addr, after_hex, over_run), in the order rizin's write cache
+    holds them, and they go into that namespace too: ``Ps`` saves the cache's bytes nowhere (measured, which
     is why they are kept here), and what a run wrote is no patch and is never passed in. Breakpoints
     need no line of their own: rizin's project holds them itself (/core/debug/breakpoints, measured).
 
@@ -963,12 +978,15 @@ def _run_only(namespace, line, ranges):
 
 
 def _patches_line(patches):
-    """The value of the ``patches=`` line ("<addr>:<hex>,..."), and how many patches did not fit into
+    """The value of the ``patches=`` line ("<addr>:<hex>[:r],..."), and how many patches did not fit into
     PROJECT_PATCH_CHARS. The ones that fit are the first ones, so the list stays in the cache's order:
-    replaying it in another order could put a different byte where two writes overlap."""
+    replaying it in another order could put a different byte where two writes overlap.
+
+    ``patches`` are (addr, after_hex, over_run). ``:r`` marks a patch set over bytes a run had written
+    (see _read_patches); the budget counts the entry as it is written, mark included."""
     kept, used = [], 0
-    for index, (addr, after) in enumerate(patches):
-        entry = f"{addr:x}:{after}"
+    for index, (addr, after, over_run) in enumerate(patches):
+        entry = f"{addr:x}:{after}" + (":r" if over_run else "")
         if used + len(entry) + (1 if kept else 0) > PROJECT_PATCH_CHARS:
             return ",".join(kept), len(patches) - index
         used += len(entry) + (1 if kept else 0)
@@ -1019,16 +1037,19 @@ def _read_project_meta(path):
 
 # One patch of the /tdc namespace: the address in hex (up to 2^64-1) and the bytes it wrote, as the
 # write cache reports them. Anything else -- a line from a newer version, a half-written one -- is left out.
-# One ``addr:hex`` entry of the project's patches line. The hex is bounded only by the line's own
+# One ``addr:hex[:r]`` entry of the project's patches line. The hex is bounded only by the line's own
 # budget (PROJECT_PATCH_CHARS), not by MAX_PATCH_BYTES: an entry that is too long to write is still
 # read, so that _replay_patches can **name** it in the session's note instead of it disappearing. A
 # project from a build whose bound was higher holds such entries (2001 to 2035 bytes could be written
 # before the bound was corrected), and losing a patch without a word is what Task 6's note exists for.
-_TDC_PATCH_RE = re.compile(r"([0-9a-f]{1,16}):((?:[0-9a-f]{2})+)")
+# ``:r`` says the patch was set over bytes an emulation run had written. An entry without it comes from a
+# project written before the mark existed, and it is read as not over a run -- which is how it was applied
+# then, so such a project is not devalued by the mark.
+_TDC_PATCH_RE = re.compile(r"([0-9a-f]{1,16}):((?:[0-9a-f]{2})+)(:r)?")
 
 
 def _read_patches(text):
-    """The ``patches=`` line as [(addr, after_hex)], dropping every entry that is not one.
+    """The ``patches=`` line as [(addr, after_hex, over_run)], dropping every entry that is not one.
 
     Read at most as much of the line as a save would have written (PROJECT_PATCH_CHARS), so that a
     project edited by hand cannot make the next boot send tens of thousands of ``wx`` commands. Where
@@ -1043,7 +1064,7 @@ def _read_patches(text):
     for entry in entries:
         shape = _TDC_PATCH_RE.fullmatch(entry)
         if shape:
-            found.append((int(shape.group(1), 16), shape.group(2)))
+            found.append((int(shape.group(1), 16), shape.group(2), shape.group(3) is not None))
     return found
 
 
@@ -1329,7 +1350,14 @@ class RizinSession:
         # tell them apart; this mirror can, row by row (see patches). _lost: patches a restarted rizin
         # could not take back, which the project keeps all the same (see _saved_cache).
         self._mine = []
+        # _mine's entries again, as over_run: whether each was set over bytes a run had written, as the
+        # last read of the cache said (_patch_list). Kept beside the mirror because that is all there is
+        # of it once a rizin has stopped, and _recover must tell the patches it may write from those it may not.
+        self._mine_over = []
         self._lost = []
+        # Patches held back (_replay_patches), as (addr, after_hex, True): in the project and not in the
+        # cache, and every save keeps them as it keeps _lost.
+        self._waiting = []
         # Notes that outlive a re-plan: what the session starts with (a project that could not be
         # loaded, patches that could not be applied) and the standing warning that patches did not fit
         # into the project. _start_analysis plans again and drops the notes of the run before it; these
@@ -1825,8 +1853,10 @@ class RizinSession:
         return result
 
     def patches(self, wait=2.0):
-        """What rizin's write cache holds (``wcj``), lowest address first: [{"addr", "size", "before",
-        "after", "mine", "over_run"}].
+        """What rizin's write cache holds (``wcj``) and what waits: {"patches": [...], "waiting": [...]}.
+
+        ``patches`` is the cache lowest address first: [{"addr", "size", "before", "after", "mine",
+        "over_run"}].
 
         One row per write operation, not per byte: a two-byte ``wx`` is one row of size 2, and a second
         write over the same address is another row whose ``before`` is what the first one wrote
@@ -1837,8 +1867,18 @@ class RizinSession:
         row and the export reads the file itself (see rizin_emulation.patch_rows). rizin's own ``idx``
         and ``written`` are left out: the index changes with every removal, and nothing here ever
         commits the cache, so ``written`` is always false.
+
+        ``waiting`` is [{"addr", "after", "reason"}], lowest address first: the patches the project holds
+        that were set over bytes a run had written and were **not** written into the cache when the
+        file was opened (_replay_patches). They are not in ``patches`` and so not in an export.
         """
-        return self._call("emulation", wait, self._patch_list)
+        def run(pipe):
+            rows = self._patch_list(pipe)
+            waiting = [{"addr": addr, "after": after, "reason": _PATCH_WAITING_REASON}
+                       for addr, after, _ in sorted(self._waiting, key=lambda patch: patch[0])]
+            return {"patches": rows, "waiting": waiting}
+
+        return self._call("emulation", wait, run)
 
     def patches_made(self, wait=2.0):
         """``patches()`` in the order the writes were made, not by address: [{"addr", "size", "before",
@@ -1905,10 +1945,23 @@ class RizinSession:
     def _patch_list(self, pipe, ordered=False):
         """The write cache as the patch list (gate held), and the mirror of this session's own writes
         kept honest: a write no row of the cache holds any more (a console ``wc-``, a rizin that was
-        restarted) is dropped from it, so that a later write there is not taken for a patch."""
+        restarted) is dropped from it, so that a later write there is not taken for a patch.
+
+        The rows are read in rizin's order, which is the order of the mirror, so that what each of this
+        session's rows says about ``over_run`` can be kept beside the mirror's entries (``_mine_over``)."""
         rows, self._mine = rizin_emulation.patch_rows(rizin_emulation.parse_cache(pipe.cmd("wcj")),
-                                                      self._mine, ordered)
-        return rows
+                                                      self._mine, True)
+        self._mine_over = [row["over_run"] for row in rows if row["mine"]]
+        return rows if ordered else sorted(rows, key=lambda row: row["addr"])
+
+    def _own_patches(self):
+        """This session's own writes as [(addr, after_hex, over_run)], in the order it made them.
+
+        ``over_run`` is what the last read of the cache said (_patch_list); an entry the mirror gained
+        since (a write whose read of the cache failed) has nothing yet and is False, which is a patch
+        in the file's own bytes -- what a write by hand is until a run is known to lie under it."""
+        over = self._mine_over + [False] * (len(self._mine) - len(self._mine_over))
+        return [(addr, after, over_run) for (addr, _, after), over_run in zip(self._mine, over)]
 
     def run_range(self, wait=2.0):
         """The range an emulation run wrote, as (lowest address, highest address), both in it; None when
@@ -2763,7 +2816,14 @@ class RizinSession:
 
     def _replay_patches(self, patches):
         """Write the project's hand-made patches back into the cache (gate not held yet: the session is
-        starting); a note naming those that were left out, or None.
+        starting); a note naming those that were left out or held back, or None.
+
+        ``patches`` are (addr, after_hex, over_run). A patch **over bytes a run wrote** is not written: this
+        runs before any run, so it would land in the file's own, still encrypted bytes, and the next
+        decryption would XOR over it instead of over the file's -- the patch gone and the decrypted bytes
+        wrong, exactly where the analyst wanted to read. It goes into ``self._waiting``, the project keeps
+        it, and the note names it. An entry without the mark comes from a project written before it and is
+        applied as it always was.
 
         A project belongs to the file's SHA-256, so the bytes and the maps are the same ones the patches
         were made in -- except for a patch made into memory that only a running emulation had mapped
@@ -2775,13 +2835,31 @@ class RizinSession:
         """
         if not patches:
             return None
+        # Decided by the entry alone, before rizin is asked anything: a patch that is held back needs no
+        # command, so a rizin that fails over the others cannot take it with them. One too long to write
+        # is not held but named below, with the others that cannot be applied.
+        held, rest = [], []
+        for patch in patches:
+            over_run, long = patch[2], len(patch[1]) > 2 * rizin_emulation.MAX_PATCH_BYTES
+            (held if over_run and not long else rest).append(patch)
+        patches, held, known = rest, list(dict.fromkeys(held)), set(self._waiting)
+        for patch in held:
+            if patch not in known:
+                known.add(patch)
+                self._waiting.append(patch)
+        held_note = None
+        if held:
+            held_note = _PATCHES_HELD.format(where=_named_addresses(addr for addr, _, _ in held),
+                                             **_patch_words(len(held)))
+        if not patches:
+            return held_note
         pipe = self._pipe
         skipped, planned = [], []
         try:
             pipe.cmd("e io.cache=true")
             cached = pipe.cmd("e io.cache").strip() == "true"
             maps = pipe.cmdj("omlj") if cached else None
-            for addr, after in patches:
+            for addr, after, _ in patches:
                 data = bytes.fromhex(after)
                 # over the bound: one ``wx`` of it would pass what rizin reads of a command line and
                 # land somewhere else (measured), so it is named in the note rather than written
@@ -2800,8 +2878,9 @@ class RizinSession:
             # session: an answer in a shape nobody knows, or a rizin that stopped or hung over it,
             # leaves the file open without its patches and with a note saying so. Nothing is claimed as
             # this session's own either, so the next save does not write a patch that was never applied.
-            self._mine = []
-            return _PATCHES_LOST.format(where="", **_patch_words(len(patches)))
+            self._mine, self._mine_over = [], []
+            return " ".join(filter(None, [_PATCHES_LOST.format(where="", **_patch_words(len(patches))),
+                                          held_note]))
         applied = collections.Counter(self._mine)
         for entry in planned:
             if applied[entry]:
@@ -2809,11 +2888,9 @@ class RizinSession:
             else:
                 skipped.append(entry[0])
         if not skipped:
-            return None
-        shown = ", ".join(f"{addr:#x}" for addr in sorted(skipped)[:_NOTE_ADDRESSES])
-        if len(skipped) > _NOTE_ADDRESSES:
-            shown += ", ..."
-        return _PATCHES_LOST.format(where=f": {shown}", **_patch_words(len(skipped)))
+            return held_note
+        lost_note = _PATCHES_LOST.format(where=f": {_named_addresses(skipped)}", **_patch_words(len(skipped)))
+        return " ".join(filter(None, [lost_note, held_note]))
 
     def _start_rizin(self):
         return RizinPipe(self._exe, self.path, [arg for setting in _START_SETTINGS for arg in ("-e", setting)])
@@ -2960,10 +3037,12 @@ class RizinSession:
             pipe, contained, _, _, _, _ = self._boot()
             if not self._use(pipe):
                 return
-            wanted, self._mine = [(addr, after) for addr, _, after in self._mine], []
+            wanted, self._mine, self._mine_over = self._own_patches(), [], []
             patch_note = self._replay_patches(wanted)
-            back = {(addr, after) for addr, _, after in self._mine}
-            self._lost = [patch for patch in wanted if patch not in back]
+            # what went back is a patch in the file's own bytes; a held-back one is in self._waiting
+            back = {(addr, after, False) for addr, _, after in self._mine}
+            held = set(self._waiting)
+            self._lost = [patch for patch in wanted if patch not in back and patch not in held]
             if step == "aaa":
                 # aaa is one step; the session goes on with aa, Full analysis can take it further.
                 replay = [] if "aa" in contained else ["aa"]
@@ -3032,15 +3111,18 @@ class RizinSession:
         """What the write cache says about the project (gate held): the patches to write into it, and
         the addresses only an emulation run ever wrote.
 
-        The patches are this session's own writes as (addr, after_hex), in the order rizin's cache holds
-        them. The cache is read back first, so the list is what rizin really holds *and* what this
-        session wrote: a patch the console took back with ``wc-`` has left the mirror by then, and what
-        an emulation run wrote was never in it. That is the whole point -- a run's bytes never stood in
+        The patches are this session's own writes as (addr, after_hex, over_run), in the order rizin's cache
+        holds them; ``over_run`` is the mark the project keeps (see _read_patches). The cache is read back
+        first, so the list is what rizin really holds *and* what this session wrote: a patch the console
+        took back with ``wc-`` has left the mirror by then, and what an emulation run wrote was never in it. That is the whole point -- a run's bytes never stood in
         the file, and a project that baked them in would lose track of where bytes come from.
 
         ``self._lost`` are patches a restarted rizin could not take back (_recover): they are kept in
         the project, because a cache that died must not erase what the project already held. The next
         patch or take-back clears them -- from then on the live cache is the truth again.
+
+        ``self._waiting`` are the patches held back over a run's bytes (_replay_patches). They are not in
+        the cache and are kept in the project the same way, mark included, until they are taken out of it.
 
         The ranges are the other half of the same rule, for what rizin's own ``Ps`` keeps: what the
         project says about bytes that are gone with the cache is dropped (see _run_only). An empty cache
@@ -3048,9 +3130,14 @@ class RizinSession:
         it by guesswork.
         """
         rows = self._patch_list(pipe)
-        kept = [(addr, after) for addr, _, after in self._mine]
-        return (kept + [patch for patch in self._lost if patch not in kept],
-                rizin_emulation.run_only_ranges(rows))
+        kept = self._own_patches()
+        known = set(kept)
+        more = []
+        for patch in self._waiting + self._lost:
+            if patch not in known:
+                known.add(patch)
+                more.append(patch)
+        return kept + more, rizin_emulation.run_only_ranges(rows)
 
     def _finish_save(self, snapshot):
         seq, tmp, level, mode, done, patches, ranges = snapshot

@@ -872,7 +872,7 @@ def test_a_restarted_rizin_gets_the_patches_back_and_does_not_erase_them(session
     _wait_state(session, "stopped")
     assert len(fake.by_process()) == 2
     # back in the restarted rizin: the list and the bytes
-    assert [(r["addr"], r["after"], r["mine"]) for r in session.patches()] == [(0x140001440, "9090", True)]
+    assert [(r["addr"], r["after"], r["mine"]) for r in session.patches()["patches"]] == [(0x140001440, "9090", True)]
     assert session.json("pxj 2 @ 0x140001440") == [0x90, 0x90]
     assert any(c.startswith("wx 9090 @ 0x140001440") for c in fake.by_process()[1])
     # and the save that follows keeps them, instead of writing an empty line over them
@@ -894,7 +894,7 @@ def test_a_restarted_rizin_gets_the_patches_back_and_does_not_erase_them(session
     assert "\npatches=100080:41\n" in saved.read_text()
     stacked.analyze_full()
     _wait_state(stacked, "stopped")
-    assert stacked.patches() == []  # the emulation's memory is gone with its rizin
+    assert stacked.patches() == {"patches": [], "waiting": []}  # the emulation's memory is gone with its rizin
     assert "could not be applied" in stacked.analysis["note"]
     stacked.comment(0x1400014B7, "after the restart")
     timers.fire()
@@ -3410,7 +3410,11 @@ def _patch(rz, sid, **body):
 
 
 def _patches(rz, sid):
-    return rz.read(f"/api/rizin/{sid}/patches")
+    return rz.read(f"/api/rizin/{sid}/patches")["patches"]
+
+
+def _waiting(rz, sid):
+    return rz.read(f"/api/rizin/{sid}/patches")["waiting"]
 
 
 def test_patch_writes_through_the_cache_and_lists_before_and_after(rz):
@@ -3527,7 +3531,7 @@ def test_a_patch_is_refused_when_io_cache_did_not_take(rz, monkeypatch):
     response = rz.post(f"/api/rizin/{sid}/patch", {"addr": "0x140001440", "bytes": "90"})
     assert response.status_code == 400 and "io.cache" in response.get_json()["refused"]
     assert not any(c.startswith("wx") for c in _commands_since(rz, mark))
-    assert rz.get(f"/api/rizin/{sid}/patches").get_json() == []
+    assert rz.get(f"/api/rizin/{sid}/patches").get_json() == {"patches": [], "waiting": []}
 
 
 def test_the_patch_buttons_write_the_bytes_of_the_instruction(rz):
@@ -4516,9 +4520,11 @@ def _project_namespace(text, name):
 
 
 def _plant_patches(project, patches):
-    """Put a patch list into a saved project, as an older session or another build could leave it."""
+    """Put a patch list into a saved project, as an older session or another build could leave it: each patch is
+    (addr, hex), which is an entry without a provenance mark, or (addr, hex, True) for one set over a run's bytes."""
 
-    line = "patches=" + ",".join(f"{addr:x}:{after}" for addr, after in patches)
+    line = "patches=" + ",".join(f"{addr:x}:{after}" + (":r" if any(mark) else "")
+                                 for addr, after, *mark in patches)
     text = project.read_text(encoding="utf-8", errors="surrogateescape")
     planted = re.sub(r"(?m)^patches=.*$", line, text)
     assert planted != text, "the project has no patches line to replace"
@@ -4558,7 +4564,7 @@ def test_a_replay_that_rizin_does_not_survive_does_not_lock_the_file_out(rz, mon
 
     monkeypatch.delenv("FAKE_RIZIN_CRASH")
     sid = rz.open(path)["session"]
-    assert [r["addr"] for r in rz.read(f"/api/rizin/{sid}/patches")] == [0x140001440]
+    assert [r["addr"] for r in _patches(rz, sid)] == [0x140001440]
 
 
 def test_a_patch_and_a_breakpoint_come_back_when_the_file_is_opened_again(rz):
@@ -4573,8 +4579,8 @@ def test_a_patch_and_a_breakpoint_come_back_when_the_file_is_opened_again(rz):
     mark = len(rz.commands())
     sid = rz.open(path)["session"]
     # R2: one row per write operation, so a two-byte wx is one patch of size 2, not two patches
-    assert [r["addr"] for r in rz.read(f"/api/rizin/{sid}/patches")] == [0x140001440]
-    assert rz.read(f"/api/rizin/{sid}/patches") == [
+    assert [r["addr"] for r in _patches(rz, sid)] == [0x140001440]
+    assert _patches(rz, sid) == [
         {"addr": 0x140001440, "size": 2, "before": bytes(original).hex(), "after": "9090", "mine": True,
          "over_run": False}]
     assert rz.read(f"/api/rizin/{sid}/breakpoints") == [{"addr": 0x1400014B7, "enabled": True}]
@@ -4643,10 +4649,234 @@ def test_a_stale_patch_outside_the_file_is_skipped_with_a_note(rz):
     note = described["analysis"]["note"] or ""
     assert "could not be applied" in note and "0xdeadbeef0000" in note
     sid = described["session"]
-    assert [r["addr"] for r in rz.read(f"/api/rizin/{sid}/patches")] == [0x140001440]
+    assert [r["addr"] for r in _patches(rz, sid)] == [0x140001440]
     assert rz.read(f"/api/rizin/{sid}/hex?addr=0x140001440&len=1")["bytes"] == [0x90]
     # the note stays while the session lives, and the session is usable
     assert "could not be applied" in rz.status(sid)["analysis"]["note"]
+
+
+def _patched_over_a_run(rz, name="pipesim.exe"):
+    """A file opened, a "run" that wrote four bytes at 0x140001440 (a console wx is the same row to rizin and
+    the start is what switches io.cache on), and a patch of the session's own over the second of them:
+    what the tab invites -- the anti-VM check inside freshly decrypted code. Returns the path and the
+    session ID; the session is still open."""
+    path = rz.write(name)
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "wx 41424344 @ 0x140001440"})
+    _patch(rz, sid, addr="0x140001441", bytes="90")
+    assert [(r["addr"], r["mine"], r["over_run"]) for r in _patches(rz, sid)] == [
+        (0x140001440, False, False), (0x140001441, True, True)]
+    return path, sid
+
+
+def test_a_patch_over_a_runs_bytes_is_held_back_when_the_file_is_opened_again(rz):
+    # The damage: _replay_patches runs before any run, so the patch landed in the still encrypted
+    # bytes, and the next decryption XORed over it. It is not applied, it waits -- and says why.
+    path, sid = _patched_over_a_run(rz)
+    rz.close(sid)
+    saved = rz.project().read_text(encoding="utf-8", errors="surrogateescape")
+    assert "\npatches=140001441:90:r\n" in saved, "the project says where the patch was set"
+
+    mark = len(rz.commands())
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    assert not any(c.startswith("wx 90") for c in _commands_since(rz, mark)), "it was not even sent"
+    answer = rz.read(f"/api/rizin/{sid}/patches")
+    assert set(answer) == {"patches", "waiting"}
+    assert answer["patches"] == [], "not in the cache, so it is not exported either"
+    assert [(w["addr"], w["after"]) for w in answer["waiting"]] == [(0x140001441, "90")]
+    assert set(answer["waiting"][0]) == {"addr", "after", "reason"}
+    assert isinstance(answer["waiting"][0]["addr"], int) and answer["waiting"][0]["reason"]
+    assert rz.read(f"/api/rizin/{sid}/hex?addr=0x140001441&len=1")["bytes"] != [0x90]
+    response = rz.post(f"/api/rizin/{sid}/export", {})
+    assert response.status_code == 400 and "no patches" in response.get_json()["refused"]
+
+    # it stays in the project through a save that has nothing to do with it, and still waits
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
+    rz.close(sid)
+    assert "\npatches=140001441:90:r\n" in rz.project().read_text(encoding="utf-8", errors="surrogateescape")
+    sid = rz.open(path)["session"]
+    assert [(w["addr"], w["after"]) for w in _waiting(rz, sid)] == [(0x140001441, "90")]
+    assert _patches(rz, sid) == []
+
+
+def test_a_patch_without_a_provenance_mark_is_applied_as_before(rz):
+    # Review Focus 1: a project written before the mark has entries without one. Holding them back
+    # would silently devalue every project that exists, so they are applied, as they were.
+    path, sid = _patched_over_a_run(rz)  # the very patch that is held back, as a build of before saved it
+    rz.close(sid)
+    _plant_patches(rz.project(), [(0x140001441, "90")])
+    assert "\npatches=140001441:90\n" in rz.project().read_text(encoding="utf-8", errors="surrogateescape")
+
+    mark = len(rz.commands())
+    described = rz.open(path)
+    sid = described["session"]
+    assert any(c.startswith("wx 90 @ 0x140001441") for c in _commands_since(rz, mark))
+    assert [(r["addr"], r["mine"], r["over_run"]) for r in _patches(rz, sid)] == [(0x140001441, True, False)]
+    assert _waiting(rz, sid) == []
+    assert rz.read(f"/api/rizin/{sid}/hex?addr=0x140001441&len=1")["bytes"] == [0x90]
+    assert "Held back" not in (described["analysis"]["note"] or "")
+    # and saved again it keeps no mark it never had
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
+    rz.close(sid)
+    assert "\npatches=140001441:90\n" in rz.project().read_text(encoding="utf-8", errors="surrogateescape")
+
+
+def test_the_note_names_the_held_back_patches_once_when_the_file_is_opened(rz):
+    path, sid = _patched_over_a_run(rz)
+    rz.close(sid)
+    # a second one over a run, and one that has no place in the file at all, beside one made before the mark
+    _plant_patches(rz.project(), [(0x140001441, "90", True), (0x140001450, "9090", True),
+                                  (0xDEADBEEF0000, "90"), (0x140001460, "41")])
+    described = rz.open(path)
+    note = described["analysis"]["note"] or ""
+    assert "Held back, not applied: 2 saved patches" in note, note
+    assert "0x140001441" in note and "0x140001450" in note and "0x140001460" not in note, note
+    assert "could not be applied" in note and "0xdeadbeef0000" in note, "the older note is still said"
+    sid = described["session"]
+    rz.wait_done(sid)  # the start went on
+    assert [r["addr"] for r in _patches(rz, sid)] == [0x140001460]
+    assert [w["addr"] for w in _waiting(rz, sid)] == [0x140001441, 0x140001450]
+    # once: not again by a status, by an analysis that plans again, or by a save
+    rz.send(f"/api/rizin/{sid}/analyze")
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
+    rz.mgr.get(sid).flush()
+    assert (rz.status(sid)["analysis"]["note"] or "").count("Held back") == 1
+
+
+def test_a_marked_patch_too_long_to_write_is_named_and_one_entry_waits_once(rz):
+    # Too long for one command line, it cannot be restored by anything, so it is named as one that could
+    # not be applied rather than listed as waiting. And an entry the project holds twice waits once.
+    import rizin_emulation
+
+    path, sid = _patched_over_a_run(rz)
+    rz.close(sid)
+    over = rizin_emulation.MAX_PATCH_BYTES + 1
+    _plant_patches(rz.project(), [(0x140002000, "90" * over, True), (0x140001441, "90", True),
+                                  (0x140001441, "90", True)])
+    described = rz.open(path)
+    note = described["analysis"]["note"] or ""
+    assert "could not be applied" in note and "0x140002000" in note and "Held back" in note, note
+    assert "1 saved patch over bytes" in note, "the duplicate is one patch"
+    sid = described["session"]
+    assert [w["addr"] for w in _waiting(rz, sid)] == [0x140001441]
+    assert not any(c.startswith("wx " + "90" * over) for c in rz.commands())
+
+
+def test_the_same_patch_made_again_over_a_run_is_saved_once(rz):
+    # the patch waits; the user decrypts again and patches the same bytes over the run's: that patch is
+    # in the cache now, and the project must not hold it twice (once as itself, once as the one that waited)
+    path, sid = _patched_over_a_run(rz)
+    rz.close(sid)
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    assert [w["addr"] for w in _waiting(rz, sid)] == [0x140001441]
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "wx 41424344 @ 0x140001440"})
+    _patch(rz, sid, addr="0x140001441", bytes="90")
+    rz.close(sid)
+    assert "\npatches=140001441:90:r\n" in rz.project().read_text(encoding="utf-8", errors="surrogateescape")
+
+
+def test_a_patch_held_back_twice_waits_once(sessions, sample):
+    # _recover replays the mirror into a session that may already hold the same patch back (made again, by
+    # hand, over the same run's bytes); the list of what waits must not grow a second entry for it
+    mgr = sessions()
+    session = mgr.get(mgr.open(sample("twice.exe", b"MZ twice"), "tab")["session"])
+    _wait_state(session, "done")
+    note = session._replay_patches([(0x140001441, "90", True)])
+    assert "Held back" in note and "1 saved patch " in note
+    session._replay_patches([(0x140001441, "90", True), (0x140001450, "41", True)])
+    assert session._waiting == [(0x140001441, "90", True), (0x140001450, "41", True)]
+
+
+def test_a_patch_held_back_does_not_cost_the_session(rz, monkeypatch):
+    # "A project must not cost a session": the held-back patch is named and the rest goes on, even
+    # where the replay of the others fails
+    path, sid = _patched_over_a_run(rz)
+    _patch(rz, sid, addr="0x140001460", bytes="41")
+    rz.close(sid)
+    monkeypatch.setenv("FAKE_RIZIN_CRASH", "wx")
+    described = rz.open(path)
+    note = described["analysis"]["note"] or ""
+    assert "could not be applied" in note and "Held back" in note and "0x140001441" in note, note
+    assert rz.project().exists() and not rz.project().with_suffix(".rzdb.broken").exists()
+    rz.mgr.close(described["session"])
+    assert "\npatches=140001441:90:r,140001460:41\n" in rz.project().read_text(encoding="utf-8", errors="surrogateescape")
+
+    monkeypatch.delenv("FAKE_RIZIN_CRASH")  # and the next open has both: one applied, one waiting
+    sid = rz.open(path)["session"]
+    assert [w["addr"] for w in _waiting(rz, sid)] == [0x140001441]
+    assert [r["addr"] for r in _patches(rz, sid)] == [0x140001460]
+
+
+def test_a_held_back_patch_is_still_kept_by_a_restarted_rizin(sessions, sample, fake, tmp_path, monkeypatch):
+    """_recover replays the session's own mirror into a rizin whose cache is empty -- the run's bytes are
+    gone with the old one, so a patch that was set over them would land in the encrypted ones, exactly as
+    on open. It waits there as well, and the project keeps it."""
+    timers = Timers()
+    monkeypatch.setenv("FAKE_RIZIN_SLOW", "aar:60")
+    mgr = sessions(analysis_limit=1.0, step_grace=0.5, big_file=1, timer=timers)
+    opened = mgr.open(sample("hang5.exe", b"MZ hang 5"), "tab")
+    session = mgr.get(opened["session"])
+    _wait_state(session, "done")
+    session.emulation_start(0x140001440)
+    session.console("wx 41424344 @ 0x140001440")
+    # made in this order, which is not the order of the addresses: the mark has to stay with its patch
+    session.patch(0x140001460, "41")
+    session.patch(0x140001441, "90")
+    assert [(r["addr"], r["over_run"]) for r in session.patches()["patches"] if r["mine"]] == [
+        (0x140001441, True), (0x140001460, False)]
+    timers.fire()
+    project = tmp_path / "projects" / (opened["file"]["sha256"] + ".rzdb")
+    assert "\npatches=140001460:41,140001441:90:r\n" in project.read_text()
+
+    session.analyze_full()  # its aar hangs, so rizin is killed and restarted
+    _wait_state(session, "stopped")
+    assert len(fake.by_process()) == 2
+    answer = session.patches()
+    assert [(r["addr"], r["after"]) for r in answer["patches"]] == [(0x140001460, "41")]
+    assert [(w["addr"], w["after"]) for w in answer["waiting"]] == [(0x140001441, "90")]
+    assert not any(c.startswith("wx 90") for c in fake.by_process()[1]), "not written into the new rizin"
+    assert "Held back" in session.analysis["note"] and "0x140001441" in session.analysis["note"]
+    assert session._lost == [], "held back is not lost: a later patch clears what is lost and not what waits"
+    session.comment(0x1400014B7, "after the restart")
+    timers.fire()
+    assert "\npatches=140001460:41,140001441:90:r\n" in project.read_text(), "kept, with its mark"
+    session.patch(0x140001470, "42")  # the user patches again: what waits is not what a restart lost
+    timers.fire()
+    assert "\npatches=140001460:41,140001470:42,140001441:90:r\n" in project.read_text()
+
+
+def test_patches_line_counts_the_provenance_mark_against_the_budget(monkeypatch):
+    import rizin_sessions
+
+    patches = [(0x1000, "90", False), (0x2000, "90", True)]
+    assert rizin_sessions._patches_line(patches) == ("1000:90,2000:90:r", 0)
+    # a budget that fits the two entries without the mark and not with it: the longer form is what is written
+    monkeypatch.setattr(rizin_sessions, "PROJECT_PATCH_CHARS", len("1000:90,2000:90"))
+    assert rizin_sessions._patches_line(patches) == ("1000:90", 1)
+    monkeypatch.setattr(rizin_sessions, "PROJECT_PATCH_CHARS", len("1000:90,2000:90:r"))
+    assert rizin_sessions._patches_line(patches) == ("1000:90,2000:90:r", 0)
+
+
+def test_the_mark_goes_through_the_project_and_comes_back(tmp_path):
+    import rizin_sessions
+
+    src, dst = tmp_path / "in.rzdb", tmp_path / "out.rzdb"
+    src.write_text("/\nversion=25\n")
+    patches = [(0x140001000, "9090", False), (0x140002000, "41", True), (0x140003000, "42", False)]
+    assert rizin_sessions._sanitize_project(str(src), str(dst), "aaa", "one", ["aaa"], patches) == 0
+    assert "\npatches=140001000:9090,140002000:41:r,140003000:42\n" in dst.read_text()
+    assert rizin_sessions._read_project_meta(str(dst))["patches"] == patches
+    # the slice that cuts the line takes the entry it cuts, with its mark: "1:90:" is no entry either
+    cut = tmp_path / "cut.rzdb"
+    entries = ",".join(f"{0x140001000 + i:x}:{'90' * 1000}:r" for i in range(20))
+    cut.write_text(f"/\nversion=25\n\n/tdc\nlevel=aa\nmode=one\ndone=aa\npatches={entries}\n")
+    read = rizin_sessions._read_project_meta(str(cut))["patches"]
+    assert read and all(len(after) == 2000 and over for _, after, over in read), read
 
 
 def test_a_saved_patch_too_long_for_one_command_line_is_named_not_dropped(rz):
@@ -4668,7 +4898,7 @@ def test_a_saved_patch_too_long_for_one_command_line_is_named_not_dropped(rz):
     assert "could not be applied" in note and "0x140002000" in note, note
     sid = described["session"]
     # the patch that fits is back and the one that does not was never written
-    assert [r["addr"] for r in rz.read(f"/api/rizin/{sid}/patches")] == [0x140001440]
+    assert [r["addr"] for r in _patches(rz, sid)] == [0x140001440]
     assert rz.read(f"/api/rizin/{sid}/hex?addr=0x140002000&len=1")["bytes"] != [0x90]
     assert not any(c.startswith("wx " + "90" * over) for c in rz.commands()), "it was not even sent"
 
@@ -4777,7 +5007,7 @@ def test_the_project_meta_reads_what_it_can_and_drops_the_rest(tmp_path):
     project.write_text("/\nversion=25\n\n/tdc\nlevel=aaa\nmode=one\ndone=aaa,aa\n"
                        "patches=140001440:9090,nope,1:zz,2:9,,3:90,10000000000000000:90\n")
     meta = rizin_sessions._read_project_meta(str(project))
-    assert meta["patches"] == [(0x140001440, "9090"), (3, "90")]
+    assert meta["patches"] == [(0x140001440, "9090", False), (3, "90", False)]
     assert (meta["level"], meta["mode"], meta["done"]) == ("aaa", "one", ["aaa", "aa"])
     # a project from before this version has no patches line at all
     project.write_text("/\nversion=25\n\n/tdc\nlevel=aa\nmode=steps\ndone=aa\n")
@@ -4790,7 +5020,7 @@ def test_the_tdc_namespace_stays_inside_the_tail_that_is_read_back(tmp_path):
 
     src, dst = tmp_path / "in.rzdb", tmp_path / "out.rzdb"
     src.write_text("/\nversion=25\n")
-    big = [(0x140001000 + i * 0x2000, "90" * rizin_emulation.MAX_PATCH_BYTES) for i in range(10)]
+    big = [(0x140001000 + i * 0x2000, "90" * rizin_emulation.MAX_PATCH_BYTES, False) for i in range(10)]
     left_out = rizin_sessions._sanitize_project(str(src), str(dst), "aaa", "one", ["aaa"], big)
     meta = rizin_sessions._read_project_meta(str(dst))
     # an entry costs 9 + 1 + 2 * MAX_PATCH_BYTES characters, and a comma between two of them
@@ -4809,8 +5039,8 @@ def test_the_tdc_namespace_stays_inside_the_tail_that_is_read_back(tmp_path):
     read = rizin_sessions._read_project_meta(str(cut))["patches"]
     assert len(entries) > rizin_sessions.PROJECT_PATCH_CHARS
     # the slice ends in the middle of the 17th entry, on an even number of its hex digits
-    assert all(len(after) == 2000 for _, after in read), [len(after) for _, after in read]
-    assert len(read) == 16 and read[0] == (0x140001000, "90" * 1000)
+    assert all(len(after) == 2000 for _, after, _ in read), [len(after) for _, after, _ in read]
+    assert len(read) == 16 and read[0] == (0x140001000, "90" * 1000, False)
 
 
 @pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
@@ -4841,7 +5071,7 @@ def test_real_rizin_patches_through_the_cache(tdc, tmp_path, monkeypatch):
         original = api.read(f"/api/rizin/{sid}/hex?addr={main}&len=2")["bytes"]
 
         # one row per write operation, with the bytes that were there before it
-        assert api.read(f"/api/rizin/{sid}/patches") == []
+        assert api.read(f"/api/rizin/{sid}/patches") == {"patches": [], "waiting": []}
         answer = api.send(f"/api/rizin/{sid}/patch", {"addr": main, "bytes": "9090"})
         assert answer["patches"] == [{"addr": main, "size": 2, "before": bytes(original).hex(),
                                       "after": "9090", "mine": True, "over_run": False}]
@@ -4882,7 +5112,7 @@ def test_real_rizin_patches_through_the_cache(tdc, tmp_path, monkeypatch):
                     if op["type"].endswith("call"))
         api.send(f"/api/rizin/{sid}/emulation/start", {"addr": into["offset"]})
         api.send(f"/api/rizin/{sid}/emulation/run", {"kind": "step"})
-        rows = api.read(f"/api/rizin/{sid}/patches")
+        rows = api.read(f"/api/rizin/{sid}/patches")["patches"]
         assert [r["mine"] for r in rows if r["addr"] in (main, call["offset"])] == [True, True]
         run = [r for r in rows if not r["mine"]]
         assert run and all(r["addr"] >= rizin_sessions.ESIL_STACK_ADDR for r in run), rows
@@ -4894,7 +5124,7 @@ def test_real_rizin_patches_through_the_cache(tdc, tmp_path, monkeypatch):
 
         # take one back: only that one goes, and the bytes under it are the file's again
         taken = api.remove(f"/api/rizin/{sid}/patch", {"addr": main})
-        assert [r["addr"] for r in api.read(f"/api/rizin/{sid}/patches") if r["mine"]] == [call["offset"]]
+        assert [r["addr"] for r in api.read(f"/api/rizin/{sid}/patches")["patches"] if r["mine"]] == [call["offset"]]
         assert api.read(f"/api/rizin/{sid}/hex?addr={main}&len=2")["bytes"] == original
         assert taken["run_removed"] == [], "nothing of the run's was at that address"
         # and all of them: the run's bytes too, because rizin has one cache, and the answer names them
@@ -5049,7 +5279,7 @@ def test_real_rizin_keeps_a_patch_and_a_breakpoint_in_the_project(tdc, tmp_path,
         call = next(op for op in ops if op["type"].endswith("call"))
         api.send(f"/api/rizin/{sid}/emulation/start", {"addr": call["offset"]})
         api.send(f"/api/rizin/{sid}/emulation/run", {"kind": "step"})
-        run = [r for r in api.read(f"/api/rizin/{sid}/patches") if not r["mine"]]
+        run = [r for r in api.read(f"/api/rizin/{sid}/patches")["patches"] if not r["mine"]]
         assert run, "the step wrote nothing into the cache"
         api.close(sid)
         assert wait_for(lambda: project.exists()), "the patch wrote no project"
@@ -5073,7 +5303,7 @@ def test_real_rizin_keeps_a_patch_and_a_breakpoint_in_the_project(tdc, tmp_path,
         assert [(b["data"], b["cond"]) for b in session.json("dblj")] == [("", "")]
         assert session.text("e asm.arch").strip() == "x86", "the condition never ran"
         assert session.text(f"CC. @ {stop:#x}").strip() == "", "the command never ran"
-        assert api.read(f"/api/rizin/{sid}/patches") == [
+        assert api.read(f"/api/rizin/{sid}/patches")["patches"] == [
             {"addr": main, "size": size, "before": bytes(original).hex(), "after": nops, "mine": True,
              "over_run": False}]
         # in effect, not merely listed: px reads through the cache again
@@ -5089,7 +5319,7 @@ def test_real_rizin_keeps_a_patch_and_a_breakpoint_in_the_project(tdc, tmp_path,
         api.remove(f"/api/rizin/{sid}/breakpoints", {})
         api.close(sid)
         sid = api.open(str(exe))["session"]
-        assert api.read(f"/api/rizin/{sid}/patches") == []
+        assert api.read(f"/api/rizin/{sid}/patches")["patches"] == []
         assert api.read(f"/api/rizin/{sid}/breakpoints") == []
         assert api.read(f"/api/rizin/{sid}/hex?addr={main}&len={size}")["bytes"] == original
     finally:
@@ -5176,7 +5406,7 @@ def test_real_rizin_reanalyses_what_a_run_decrypted(tmp_path):
         session.emulation_start(0)
         state = session.emulation_run("until", stop)
         assert (state["stopped"], state["pc"]) == ("step", hex(stop))
-        rows = [r for r in session.patches() if not r["mine"]]
+        rows = [r for r in session.patches()["patches"] if not r["mine"]]
         assert len(rows) == 0x40 and {r["size"] for r in rows} == {1}, "one cache row per decrypted byte"
         assert session.run_range() == (0x1000, 0x103F), "the range comes from the cache, measured"
 
@@ -5243,6 +5473,78 @@ def test_real_rizin_reanalyses_what_a_run_decrypted(tmp_path):
     finally:
         mgr.shutdown()
     assert hashlib.sha256(blob.read_bytes()).hexdigest() == before_sha, "the sample must never be written"
+
+
+@pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
+@pytest.mark.skipif(not RZ_ASM, reason="rz-asm not installed")
+def test_real_rizin_a_patch_over_a_runs_bytes_would_be_xored_again(tmp_path):
+    """Why the patch is held back, measured on the binary: a patch written into the file's own (still
+    encrypted) bytes **before** the decryption runs is decrypted over -- it is neither there afterwards nor
+    is the byte what the file would have decrypted to. That is what _replay_patches did when it ran at the
+    start of a session; held back, the second run decrypts the file's own byte and the patch is not lost."""
+    import rizin_sessions
+
+    blob = tmp_path / "decryptor.bin"
+    stop = _decryptor_blob(blob)
+    sha = hashlib.sha256(blob.read_bytes()).hexdigest()
+    plain, encrypted, patch = 0xF9, 0x06, 0x90  # `stc` at 0x1000, the file's byte there, and a nop
+
+    def first_byte(session):
+        return session.json("pxj 1 @ 0x1000")[0]
+
+    def run_decryptor(session):
+        session.console("e asm.arch=x86")
+        session.console("e asm.bits=64")
+        session.emulation_start(0)
+        state = session.emulation_run("until", stop)
+        assert (state["stopped"], state["pc"]) == ("step", hex(stop))
+
+    # what the old replay did: the patch is in the cache before the run, and the run xors over it
+    before_dir = tmp_path / "before"
+    mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(before_dir))
+    try:
+        session = mgr.get(mgr.open(str(blob), "tab")["session"])
+        _wait_state(session, "done", timeout=60)
+        assert first_byte(session) == encrypted
+        session.patch(0x1000, bytes([patch]))
+        assert first_byte(session) == patch
+        run_decryptor(session)
+        assert first_byte(session) == patch ^ 0xFF, "the run xored over the patch's byte"
+        assert first_byte(session) not in (patch, plain), "the patch is gone and the decrypted byte is wrong"
+    finally:
+        mgr.shutdown()
+
+    # the real order, and the fix: run, then patch over what the run wrote, save, open again
+    projects = tmp_path / "projects"
+    mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(projects))
+    try:
+        session = mgr.get(mgr.open(str(blob), "tab")["session"])
+        _wait_state(session, "done", timeout=60)
+        run_decryptor(session)
+        assert first_byte(session) == plain
+        session.patch(0x1000, bytes([patch]))
+        row = next(r for r in session.patches()["patches"] if r["mine"])
+        assert (row["addr"], row["over_run"], row["before"]) == (0x1000, True, f"{plain:02x}")
+        assert session.flush() is True
+    finally:
+        mgr.shutdown()
+    saved = (projects / (sha + ".rzdb")).read_text(encoding="utf-8", errors="surrogateescape")
+    assert "\npatches=1000:90:r\n" in saved
+
+    mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(projects))
+    try:
+        session = mgr.get(mgr.open(str(blob), "tab")["session"])
+        _wait_state(session, "done", timeout=60)
+        answer = session.patches()
+        assert answer["patches"] == [], "not written into the file's bytes"
+        assert [(w["addr"], w["after"]) for w in answer["waiting"]] == [(0x1000, "90")]
+        assert "Held back" in session.analysis["note"] and "0x1000" in session.analysis["note"]
+        assert first_byte(session) == encrypted, "the file's own byte is still what rizin reads"
+        run_decryptor(session)
+        assert first_byte(session) == plain, "the decryption is right where the analyst wanted to read"
+    finally:
+        mgr.shutdown()
+    assert hashlib.sha256(blob.read_bytes()).hexdigest() == sha, "the sample must never be written"
 
 
 @pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
@@ -5444,7 +5746,7 @@ def test_real_rizin_assists_a_32_bit_stdcall_call(tmp_path):
         state = session.call_skip(copy_call, _word(copy["value"]), 0)
         assert state["pc"] == hex(after_copy)
         assert bytes(session.json("pxj 8 @ 0x1c0")) == b"unpacked", "the copy is really made"
-        assert [row["mine"] for row in session.patches() if row["addr"] == 0x1C0] == [False], \
+        assert [row["mine"] for row in session.patches()["patches"] if row["addr"] == 0x1C0] == [False], \
             "what the copy wrote belongs to the run, not to the patches"
     finally:
         mgr.shutdown()
@@ -6374,7 +6676,7 @@ def test_real_rizin_exports_the_patch_at_the_physical_offset(tdc, tmp_path, monk
         other = api.open(result["path"], "tab2")["session"]
         api.wait_done(other, timeout=120)
         assert api.read(f"/api/rizin/{other}/hex?addr={main}&len=2")["bytes"] == [0x90, 0x90]
-        assert api.read(f"/api/rizin/{other}/patches") == []
+        assert api.read(f"/api/rizin/{other}/patches")["patches"] == []
     finally:
         mgr.shutdown()
 
@@ -6426,7 +6728,7 @@ def test_real_rizin_the_note_says_what_the_file_holds_under_a_patch(tdc, tmp_pat
         session.text(f"wx {decrypted.hex()} @ {main:#x}")
         api.send(f"/api/rizin/{sid}/patch", {"addr": main + 1, "bytes": "90"})
 
-        rows = api.read(f"/api/rizin/{sid}/patches")
+        rows = api.read(f"/api/rizin/{sid}/patches")["patches"]
         run_row = next(r for r in rows if r["addr"] == main)
         patch_row = next(r for r in rows if r["addr"] == main + 1)
         assert run_row["mine"] is False and run_row["over_run"] is False

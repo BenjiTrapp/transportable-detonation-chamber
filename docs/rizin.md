@@ -241,6 +241,14 @@ At most 32 KB of patches fit into a project; what does not is left out of the
 save and the session's note says how many. A saved patch whose address is in
 none of the reopened file's maps is left out, and the note says which.
 
+A patch set over bytes a run wrote (marked ⚠ in SET BY HAND) is **not** written
+when the file is opened again: opening happens before any run, so it would land
+in the file's own, still encrypted bytes, and the next decryption would XOR over
+it. It stays in the project, the session's note names it once when the file is
+opened, and `GET /patches` lists it under `waiting`, not among the patches --
+so it is not exported either. A patch saved by an older version has no such
+mark and is written back as it always was.
+
 ### Re-analysing a decrypted range
 
 HEX and DISASSEMBLY show what a run decrypted, because rizin reads through

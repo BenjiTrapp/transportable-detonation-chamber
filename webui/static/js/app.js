@@ -25479,7 +25479,7 @@ async function rizinLoadEmuPane(force, what) {
         return false;
     }
     rizinState.retry.delete('emuPane');
-    Object.assign(pane, { at: sid, patches: Array.isArray(patches.data) ? patches.data : [], problem: '', stale: false });
+    Object.assign(pane, { at: sid, patches: Array.isArray(patches.data && patches.data.patches) ? patches.data.patches : [], problem: '', stale: false });
     if (breakpoints) pane.breakpoints = Array.isArray(breakpoints.data) ? breakpoints.data : [];
     // The marks of DISASSEMBLY take what the pane read (the patches it holds are the same rows)
     rizinSetLists({ patches: pane.patches, breakpoints: breakpoints ? pane.breakpoints : undefined });
@@ -25794,7 +25794,7 @@ async function rizinLoadMarks(force) {
     }
     rizinState.retry.delete('marks');
     // A list that something newer set while these were on their way (an answer to a click, to a patch) stays
-    return rizinSetLists({ patches: stamp.patches === marks.stamp.patches ? (Array.isArray(patches.data) ? patches.data : []) : undefined,
+    return rizinSetLists({ patches: stamp.patches === marks.stamp.patches ? (Array.isArray(patches.data && patches.data.patches) ? patches.data.patches : []) : undefined,
                            breakpoints: stamp.breakpoints === marks.stamp.breakpoints ? (Array.isArray(breakpoints.data) ? breakpoints.data : []) : undefined });
 }
 

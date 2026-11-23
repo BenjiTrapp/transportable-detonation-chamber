@@ -778,3 +778,18 @@ def test_the_patch_bound_is_what_one_command_line_can_carry():
     # the assistant's chunk, which may be chunked because its bytes are the run's, fits as well
     assert len("wx ") + 2 * rizin_emulation.ASSIST_WRITE_CHUNK + len(" @ 0x") + 16 \
         <= rizin_emulation.RIZIN_LINE_MAX
+
+
+def test_read_patches_takes_an_entry_with_and_without_a_provenance_mark():
+    import rizin_sessions
+
+    # Review Focus 1: ein Eintrag ohne Marke stammt aus einem Projekt von vorher und
+    # wird wie heute angewandt. Die Marke ist die einzige Quelle für over_run nach dem Öffnen.
+    assert rizin_sessions._read_patches("1000:90,2000:9090:r") == [(0x1000, "90", False), (0x2000, "9090", True)]
+    assert rizin_sessions._read_patches("1000:90:x,:90,1000:9") == []
+    # an entry that is malformed is left out; the ones around it are not
+    assert rizin_sessions._read_patches("1000:90:r,zz:90:r,2000:90:R,3000:90:r:r,4000:90") == [
+        (0x1000, "90", True), (0x4000, "90", False)]
+    # the mark does not shorten what is too long to write: the entry is still read, so that it can be named
+    over = rizin_emulation.MAX_PATCH_BYTES + 1
+    assert rizin_sessions._read_patches(f"1000:{'90' * over}:r") == [(0x1000, "90" * over, True)]

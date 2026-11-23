@@ -1151,7 +1151,7 @@ function serve(sid, s) {
     const rows = list => (list || []).map(row => ({ ...row }));
     on('GET', `/api/rizin/${sid}/patches`, url => {
         if (s.ended) return ENDED;
-        return (s.patchesAnswer && s.patchesAnswer(s)) || [200, rows(s.patches), s.listDelay ?? 1];
+        return (s.patchesAnswer && s.patchesAnswer(s)) || [200, { patches: rows(s.patches), waiting: s.waiting || [] }, s.listDelay ?? 1];
     });
     on('GET', `/api/rizin/${sid}/breakpoints`, url => {
         if (s.ended) return ENDED;
