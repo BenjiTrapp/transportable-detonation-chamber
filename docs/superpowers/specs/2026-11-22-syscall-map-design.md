@@ -169,7 +169,8 @@ Neues Modul `webui/syscall_scan.py`, reines ctypes, kein zusätzliches Binary.
 - **Standardmäßig nur ntdll.** `win32u`-Stubs gibt es nur in GUI-Prozessen; sie
   erzeugen sonst Rauschen. win32u ist im Tab zuschaltbar — sofern die geladene
   Baseline win32u-Einträge hat. Hat sie keine, ist der Schalter aus und sagt
-  warum. Das entscheiden die Daten, nicht die Sicht: Die x64-Sicht des Builds
+  warum; die Wahl des Nutzers bleibt erhalten und gilt wieder, sobald eine
+  Baseline mit win32u geladen ist. Das entscheiden die Daten, nicht die Sicht: Die x64-Sicht des Builds
   `26200.9974` auf ARM64 hat keine, ein anderer Build oder ein x64-Host kann
   sie haben.
 - **Zeitlimit** für den ganzen Scan, wie bei den Scan-Routen. Ein Scan darf das

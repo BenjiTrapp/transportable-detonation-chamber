@@ -25649,6 +25649,8 @@ function renderSyscallStubs(model) {
 const SYSCALL_VIEW_NAMES = ['map', 'graph'];
 const syscallState = {
     ready: false,
+    // whether the win32u box was ticked when a baseline without win32u switched it off, to tick it again after
+    win32uWanted: false,
     status: null, statusError: '',
     // The baseline of one view: { view, build, symbols, items: [{ name, module, number }] }
     // loading counts the refreshes under way; loadSeq numbers the reads of the baseline, of which only the last counts
@@ -25962,8 +25964,13 @@ function renderSyscallToolbar() {
     const win32u = document.getElementById('syscall-win32u');
     if (win32u) {
         const missing = syscallWin32uMissing(syscallState.baseline);
+        if (missing && !win32u.disabled) {
+            syscallState.win32uWanted = win32u.checked;
+            win32u.checked = false;
+        } else if (!missing && win32u.disabled) {
+            win32u.checked = syscallState.win32uWanted;
+        }
         win32u.disabled = !!missing;
-        if (missing) win32u.checked = false;
         win32u.title = missing || SYSCALL_WIN32U_TITLE;
         if (win32u.parentElement) win32u.parentElement.title = win32u.title;
     }

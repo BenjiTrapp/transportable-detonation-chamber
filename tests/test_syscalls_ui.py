@@ -737,7 +737,14 @@ def test_a_baseline_without_win32u_draws_no_band_for_it_and_switches_its_toggle_
                         body: requests.filter(q => q.method === 'POST')[0].body };
         routes['/api/syscalls/baseline'] = baselineRoute;
         await syscallRefresh(true); await settle();
-        out({ before, after, again: { disabled: els['syscall-win32u'].disabled, title: els['syscall-win32u'].title || '' } });
+        const again = { disabled: els['syscall-win32u'].disabled, title: els['syscall-win32u'].title || '', checked: els['syscall-win32u'].checked };
+        // an unticked box stays unticked across the same round trip
+        els['syscall-win32u'].checked = false;
+        routes['/api/syscalls/baseline'] = only;
+        await syscallRefresh(true); await settle();
+        routes['/api/syscalls/baseline'] = baselineRoute;
+        await syscallRefresh(true); await settle();
+        out({ before, after, again, unticked: els['syscall-win32u'].checked });
       })();""")
     assert r["before"]["disabled"] is False
     assert r["after"]["bands"] == ["ntdll.dll"], "no empty band for a module the baseline does not hold"
@@ -745,6 +752,8 @@ def test_a_baseline_without_win32u_draws_no_band_for_it_and_switches_its_toggle_
     assert "win32u.dll" in r["after"]["title"] and "x64" in r["after"]["title"] and "26200.9974" in r["after"]["title"]
     assert r["after"]["body"]["modules"] == ["ntdll.dll"], "nothing of win32u is asked for when there is none to measure"
     assert r["again"]["disabled"] is False and "GUI" in r["again"]["title"], "a baseline with win32u offers it again"
+    assert r["again"]["checked"] is True, "and the box is as the user left it before it was switched off"
+    assert r["unticked"] is False
 
 
 @needs_node
