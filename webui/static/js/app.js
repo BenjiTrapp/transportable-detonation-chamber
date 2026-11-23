@@ -24893,6 +24893,7 @@ const SYSCALL_STATE_HELP = {
     unreadable: 'No stub could be read.',
 };
 const SYSCALL_MODULES = ['ntdll.dll', 'win32u.dll'];
+const SYSCALL_WIN32U_TITLE = 'win32u stubs exist only in GUI processes, so a scan leaves them out unless asked for';
 // Where a syscall is documented, and where the modules are that Rizin opens
 const SYSCALL_DOC_URL = 'https://ntdoc.m417z.com/';
 // WinGraph, a dependency graph of the System32 binaries: only its root is linked, it has no address for one module
@@ -25955,6 +25956,22 @@ function renderSyscallToolbar() {
         const button = document.getElementById(`syscall-view-${name}`);
         if (button) button.setAttribute('aria-pressed', name === syscallState.view ? 'true' : 'false');
     }
+    const win32u = document.getElementById('syscall-win32u');
+    if (win32u) {
+        const missing = syscallWin32uMissing(syscallState.baseline);
+        win32u.disabled = !!missing;
+        if (missing) win32u.checked = false;
+        win32u.title = missing || SYSCALL_WIN32U_TITLE;
+        if (win32u.parentElement) win32u.parentElement.title = win32u.title;
+    }
+}
+
+// Why the loaded baseline offers no win32u to scan, '' when it does or none is loaded. Read off the baseline, not
+// off its view: the x64 view of an ARM64 host has held none, and another build or host may differ.
+function syscallWin32uMissing(baseline) {
+    if (!baseline || !Array.isArray(baseline.items) || !baseline.items.length) return '';
+    if (baseline.items.some(item => item.module === 'win32u.dll')) return '';
+    return `The ${baseline.view} baseline of build ${baseline.build} holds no win32u.dll syscalls: there is nothing of win32u to scan`;
 }
 
 // The line under the toolbar: what the last scan found, or why it did not
@@ -26088,7 +26105,7 @@ async function runSyscallScan() {
         return;
     }
     const win32u = document.getElementById('syscall-win32u');
-    const modules = win32u && win32u.checked ? ['ntdll.dll', 'win32u.dll'] : ['ntdll.dll'];
+    const modules = win32u && win32u.checked && !win32u.disabled ? ['ntdll.dll', 'win32u.dll'] : ['ntdll.dll'];
     syscallState.scanning = true;
     syscallSetScanNote('info', `Scanning PID ${pid}…`);
     renderSyscallToolbar();

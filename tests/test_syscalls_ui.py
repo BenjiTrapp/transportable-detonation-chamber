@@ -438,9 +438,9 @@ FLOW_FUNCTIONS = [
     "syscallCaptureHooks", "syscallClearHooks", "syscallSetPane", "syscallModel", "syscallRepaintCells", "syscallShowDraft",
     "syscallCopyText", "syscallTargetProcess", "syscallStubsModel", "renderSyscallStubs", "renderSyscallStubsPanel", "runSyscallStubs",
     "syscallRequestDraft", "syscallDraftStubRule",
-    "syscallHookKey", "syscallHookPairs", "syscallHookDifference", "syscallHookDrift",
+    "syscallHookKey", "syscallHookPairs", "syscallHookDifference", "syscallHookDrift", "syscallWin32uMissing",
 ]
-FLOW_CONSTS = ["SYSCALL_STATES", "SYSCALL_STATE_COLORS", "SYSCALL_STATE_HELP", "SYSCALL_MODULES", "SYSCALL_MAP",
+FLOW_CONSTS = ["SYSCALL_STATES", "SYSCALL_STATE_COLORS", "SYSCALL_STATE_HELP", "SYSCALL_MODULES", "SYSCALL_WIN32U_TITLE", "SYSCALL_MAP",
                "SYSCALL_ROWS_MAX", "SYSCALL_PAGE", "SYSCALL_POLL_MS", "SYSCALL_VIEW_NAMES", "syscallState",
                "SYSCALL_DOC_URL", "SYSCALL_WINGRAPH_URL", "SYSCALL_SYSTEM_DIR", "SYSCALL_NARROW", "SYSCALL_PANE_NAMES", "SYSCALL_SEVERITY_RANK"]
 
@@ -703,6 +703,38 @@ def test_win32u_is_scanned_only_when_asked_for():
         out(requests.filter(q => q.method === 'POST')[0].body);
       })();""")
     assert r == {"pid": 4242, "modules": ["ntdll.dll", "win32u.dll"]}
+
+
+@needs_node
+def test_a_baseline_without_win32u_draws_no_band_for_it_and_switches_its_toggle_off_with_the_reason():
+    # measured on the VM: the x64 view of build 26200.9974 holds 490 ntdll syscalls and no win32u one
+    r = _flow(r"""
+      (async () => {
+        const NTDLL = ALL.filter(a => a.module === 'ntdll.dll');
+        const only = url => { const q = new URL(url, 'http://x').searchParams, offset = +q.get('offset') || 0, limit = +q.get('limit') || 200;
+                              return { body: { items: NTDLL.slice(offset, offset + limit), total: NTDLL.length, offset, limit,
+                                               build: '26200.9974', view: 'x64', symbols: true } }; };
+        initSyscalls(); syscallsTabShown(); await settle();
+        const before = { disabled: els['syscall-win32u'].disabled, title: els['syscall-win32u'].title || '' };
+        els['syscall-win32u'].checked = true;
+        routes['/api/syscalls/baseline'] = only;
+        await syscallRefresh(true); await settle();
+        routes['/api/syscalls/scan'] = { body: { ...scanBody(), view: 'x64', build: '26200.9974' } };
+        chooseTarget(4242);
+        await runSyscallScan();
+        const after = { bands: els['syscall-map'].children.map(b => b.dataset.module), disabled: els['syscall-win32u'].disabled,
+                        checked: els['syscall-win32u'].checked, title: els['syscall-win32u'].title || '',
+                        body: requests.filter(q => q.method === 'POST')[0].body };
+        routes['/api/syscalls/baseline'] = baselineRoute;
+        await syscallRefresh(true); await settle();
+        out({ before, after, again: { disabled: els['syscall-win32u'].disabled, title: els['syscall-win32u'].title || '' } });
+      })();""")
+    assert r["before"]["disabled"] is False
+    assert r["after"]["bands"] == ["ntdll.dll"], "no empty band for a module the baseline does not hold"
+    assert r["after"]["disabled"] is True and r["after"]["checked"] is False
+    assert "win32u.dll" in r["after"]["title"] and "x64" in r["after"]["title"] and "26200.9974" in r["after"]["title"]
+    assert r["after"]["body"]["modules"] == ["ntdll.dll"], "nothing of win32u is asked for when there is none to measure"
+    assert r["again"]["disabled"] is False and "GUI" in r["again"]["title"], "a baseline with win32u offers it again"
 
 
 @needs_node

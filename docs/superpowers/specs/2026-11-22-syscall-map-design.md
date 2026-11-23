@@ -16,10 +16,13 @@ bleiben:
    noch bewerten.
 
 NTSleuth (`xaitax/NTSleuth`, BSD-3-Clause) schließt die erste Hälfte: Es zieht
-rund 2.461 Syscalls aus `ntdll.dll` und `win32u.dll` mit Nummer, RVA,
+die Syscalls aus `ntdll.dll` und `win32u.dll` mit Nummer, RVA,
 Rückgabetyp, Parametern samt SAL-Annotationen und den Stub-Bytes, und gibt das
 als JSON aus. Das ist die Referenz, gegen die sich ein laufender Prozess messen
-lässt.
+lässt. **Wie viele es sind, hängt von Build und Sicht ab.** Auf Build
+`26200.9974`, ARM64, hält die arm64-Sicht 1.991 (490 aus `ntdll.dll`, 1.501 aus
+`win32u.dll`), die x64-Sicht 490 und **keinen** aus `win32u.dll`. Jede Zahl in
+diesem Dokument ist ein Beispiel, keine Konstante.
 
 Der Nutzer will daraus drei Dinge, und einen vierten Teil dazu:
 
@@ -56,8 +59,10 @@ Oberfläche englisch. Aufbau von oben nach unten:
   - **Filter** (Name, Nummer, Modul) wirkt auf beide Ansichten.
   - **Modul-Umschalter** ntdll / win32u / beide.
 - **Hauptfläche links, Ansicht MAP:**
-  - Eine Zelle je Syscall, nach Syscall-Nummer sortiert, in zwei Bändern:
-    `ntdll.dll` und `win32u.dll`, jedes mit Überschrift und Anzahl.
+  - Eine Zelle je Syscall, nach Syscall-Nummer sortiert, in einem Band je
+    Modul — `ntdll.dll` und `win32u.dll` —, jedes mit Überschrift und Anzahl.
+    Ein Modul, für das die geladene Baseline keinen Eintrag hat, bekommt kein
+    leeres Band.
   - Farbe ist der Zustand: intakt, hooked (dateigedecktes Modul), gepatcht,
     abweichend, kein Stub lesbar.
     Ohne Scan sind alle Zellen im Baseline-Ton.
@@ -146,14 +151,19 @@ Neues Modul `webui/syscall_scan.py`, reines ctypes, kein zusätzliches Binary.
   tatsächlichen Stubs, der je nach WOW64-Prüfung variiert. Diese Länge erscheint
   im Detailpanel, bestimmt die Diff-Markierung und steht in den Tests.
 - **Gebündelt lesen.** Die RVAs werden sortiert und in zusammenhängenden Spannen
-  gelesen, nicht einzeln. 2.461 Einzelaufrufe von `ReadProcessMemory` sind
-  unnötig; die Stubs liegen dicht beieinander.
+  gelesen, nicht einzeln. Ein Aufruf von `ReadProcessMemory` je Stub, bei
+  einer arm64-Baseline rund 2.000, ist unnötig; die Stubs liegen dicht
+  beieinander.
 - Ein Lesefehler ist kein Abbruch: die betroffene Zelle wird „kein Stub lesbar".
 - **Nur lesen.** Kein `WriteProcessMemory`, kein Debugger-Attach, keine
   Injektion. Der Zielprozess bleibt unverändert, wie bei den übrigen
   Live-Memory-Werkzeugen.
 - **Standardmäßig nur ntdll.** `win32u`-Stubs gibt es nur in GUI-Prozessen; sie
-  erzeugen sonst Rauschen. win32u ist im Tab zuschaltbar.
+  erzeugen sonst Rauschen. win32u ist im Tab zuschaltbar — sofern die geladene
+  Baseline win32u-Einträge hat. Hat sie keine, ist der Schalter aus und sagt
+  warum. Das entscheiden die Daten, nicht die Sicht: Die x64-Sicht des Builds
+  `26200.9974` auf ARM64 hat keine, ein anderer Build oder ein x64-Host kann
+  sie haben.
 - **Zeitlimit** für den ganzen Scan, wie bei den Scan-Routen. Ein Scan darf das
   Web-UI nicht blockieren.
 
@@ -692,7 +702,7 @@ Node-Harness (`_function_source`, `_run_node`).
 - **Die Oberfläche gibt eine kuratierte Kante als abgeleitete aus.** Der letzte
   Sprung von Win32 zu Nt stammt aus einer Tabelle, nicht aus den Daten. Wer das
   verwechselt, zieht aus dem Graphen falsche Schlüsse.
-- Die Karte wird zur Tapete: 2.461 bunte Zellen ohne Aussage. Ohne Scan muss sie
+- Die Karte wird zur Tapete: rund 2.000 bunte Zellen ohne Aussage. Ohne Scan muss sie
   ruhig sein, und eine Abweichung muss auffallen.
 - Ein Scan oder eine Graph-Abfrage friert das Web-UI ein.
 - **Die Detonationsstufe lässt eine Detonation scheitern**, weil NTSleuth fehlt
@@ -802,13 +812,14 @@ hat so entschieden:
   Stub gedämpft. Sie kommen aus den Theme-Variablen, nicht aus neuen Werten.
 - **Dichte der Karte:** Ohne Scan ruhig und gedämpft, damit der Blick nichts
   sucht. Nach einem Scan heben sich Abweichungen deutlich ab, auch einzelne
-  Zellen unter 2.461.
+  Zellen unter rund 2.000.
 - **Classic/Telemetry** zeigt denselben Aufbau in den Classic-Variablen.
 
 ## Dem Builder überlassen
 
-- Die genaue Zellgröße und Spaltenzahl der Karte, solange 2.461 Zellen bei
-  1920 px lesbar bleiben und eine einzelne Abweichung auffällt.
+- Die genaue Zellgröße und Spaltenzahl der Karte, solange die Zellen einer
+  Baseline (auf ARM64 rund 2.000; die Tests nehmen 2.461) bei 1920 px lesbar
+  bleiben und eine einzelne Abweichung auffällt.
 - Wie die Spannen beim Lesen gebündelt werden und wie groß sie sind.
 - Das Anordnungsverfahren des Binary-Graphen, solange Pfade ohne Überlappung
   und mit wenigen Kreuzungen lesbar sind.

@@ -8537,7 +8537,7 @@ def api_syscalls_scan():
     findings = memory_evidence.collect({"syscall_scan": measured}, process=process)
     result = {**measured, "tool": "Syscalls", "pid": pid, "process": process, "modules": list(modules),
               "evidence": memory_evidence.score(findings, baseline=_memory_baseline)}
-    # the history keeps what a timeline row expands to, not the state of every one of 2,461 stubs
+    # the history keeps what a timeline row expands to, not the state of every one of some 2,000 stubs
     _record_scan("Syscalls", f"PID {pid}", {k: v for k, v in result.items() if k != "states"})
     return jsonify(result)
 

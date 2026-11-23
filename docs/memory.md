@@ -81,7 +81,9 @@ and with names and numbers for whatever differs.
 ### The baseline
 
 [NTSleuth](https://github.com/xaitax/NTSleuth) reads `ntdll.dll` and `win32u.dll`
-and writes out every syscall (about 2,461) with its number, its RVA, its
+and writes out every syscall (how many depends on the build and the view: on build
+26200.9974, ARM64, the arm64 view holds 1,991, the x64 view 490 and no win32u
+one) with its number, its RVA, its
 parameters and the bytes of its stub. `scripts/install-ntsleuth.ps1` runs it once
 during provisioning and keeps the result in
 `C:\tools\ntsleuth\baseline\ntsleuth-<build>-<view>.json`. A baseline belongs to
@@ -109,8 +111,8 @@ neighbour of every hook. Each stub comes out in one of five states:
 |-------|---------|
 | **intact** | As the baseline has it |
 | **hooked** (file-backed module) | The jump ends in a loaded module that a file backs and that is not `ntdll`. An EDR does that, but so does a DLL the sample dropped and loaded, or a legitimate DLL it overwrote in place (module stomping keeps the image and its path); the scan cannot tell these apart |
-| **patched** | The jump ends in memory no hooking product explains: private memory or a section no file backs (after any relay was followed, see below), or a core Windows module such as `kernelbase.dll` or `win32u.dll`, which means a code cave |
-| **diverged** | The bytes differ, but the jump is neither of the two or cannot be resolved. It is not guessed at, never reported as intact, and the verdict says how many there are |
+| **patched** | The jump ends in memory no hooking product explains: private memory, a section no file backs or a mapped view of a file (after any relay was followed, see below), a core Windows module such as `kernelbase.dll` or `win32u.dll`, which means a code cave, or `ntdll` itself reached through such a relay |
+| **diverged** | The bytes differ, but nothing tells a hook from a patch: there is no jump, its target cannot be resolved, or it goes straight into `ntdll` or the stub's own module. It is not guessed at, never reported as intact, and the verdict says how many there are |
 | **unreadable** | No stub could be read. A scan with any of these is marked partial |
 
 The difference between hooked and patched is the spine of the feature, and it is
@@ -118,8 +120,9 @@ decided by **who owns the jump target**, not by the instruction pattern. On a
 machine with an EDR, hooks in `ntdll` are normal: the product installs them in
 every process it watches. Counting them as evidence would make every clean host
 look malicious. So the owner of the target is looked up with a region query for
-each stub that differs, and a stub that merely jumps back into `ntdll` is
-`diverged`, because it is neither.
+each stub that differs, and a stub that merely jumps straight back into `ntdll`
+is `diverged`, because it may be ntdll's own jump or a baseline error. Through a
+private relay it is `patched`: that rules out both.
 
 **A first hop into private memory is not malice by itself.** MinHook and
 Microsoft Detours, the most common x64 hooking libraries, write `E9 rel32` into
@@ -129,7 +132,10 @@ DLL. ARM64 hookers relay by necessity, because a `B` reaches only 128 MB. EDRs,
 overlay and capture software and the browser sandboxes hook this way. So when the
 first target is private and its bytes are one of the known jump forms, the scan
 follows it, up to two hops, and judges the stub by the **final** owner; the
-relays it passed are listed with the stub. Private code that is no jump is the
+relays it passed are listed with the stub. The ARM64 forms take any register:
+`LDR Xn, literal; BR Xn`, `ADRP; ADD; BR` and `ADRP Xn; LDR Xt, [Xn, #imm];
+BR Xt`, which is what Detours writes, with x17. On x64 the 14-byte
+`PUSH imm32; MOV DWORD [RSP+4], imm32; RET` is known as well. Private code that is no jump is the
 code that runs, and stays `patched`; so does a chain that is still in private
 memory after two hops. A relay that cannot be read, or whose target cannot be
 looked up, is not guessed past: the stub is `diverged` and counts as a failed
@@ -137,7 +143,10 @@ owner lookup, which marks the scan partial.
 
 Memory no file backs is a private allocation or a mapped section with no file
 behind it (a pagefile-backed section, the classic target of
-`NtMapViewOfSection`). An image region whose file name cannot be had is a failed
+`NtMapViewOfSection`). A mapped view of a named file is no loaded module either,
+whatever file it maps, a data copy of `ntdll.dll` among them: its owner is
+`mapped`, and it is weighed and followed as private memory is, so its state does
+not depend on whether its name could be had. An image region whose file name cannot be had is a failed
 lookup, not an owner nobody has: an image is file-backed by definition, and the
 name query fails easily under the limited access right.
 
@@ -277,7 +286,8 @@ with x64 instructions in every process and decides the architecture from
   want to compare.
 - The memory baseline is per host. Rebuild it after installing software.
 - The syscall measurement covers the stubs of `ntdll.dll`, and of `win32u.dll`
-  when asked; a process that maps a module more than once is not measured for
+  when asked and when the baseline has any (the x64 view of build 26200.9974 on
+  ARM64 has none; the tab then switches the box off and says why); a process that maps a module more than once is not measured for
   it, and the scan says so. A scan is given 120 s.
 - The hook list is as clean as the host it was recorded on. Record it before
   the first detonation, from a process you trust, not after.
