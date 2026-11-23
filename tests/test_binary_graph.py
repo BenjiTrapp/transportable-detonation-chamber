@@ -3054,14 +3054,17 @@ def test_the_stubs_route_keeps_a_hint_when_a_loaded_module_is_unknown(client, ta
 
 
 def test_a_module_loaded_during_the_search_takes_the_proof_back(client, target, doors_host):
-    # the union was taken before the search; a module that arrived while it ran may be the stub's author
+    # the scenario the second list exists for (Ruling 36): engine.dll is in the list taken after the search only,
+    # loaded while it ran, and the cache does not hold it. The first list is complete and the search proved; only
+    # the second list can take that back
     first = target.reader._m
     later = first + _loaded("C:\\Program Files\\Hook\\engine.dll")
     calls = []
     target.reader.modules = lambda: calls.append(1) or (first if len(calls) == 1 else later)
     body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
+    assert len(calls) == 2, "the modules are listed before and after the search"
     assert [h["import_present"] for h in body["hits"]] == [None]
-    assert body["doors_complete"] is False and "changed" in body["doors_note"]
+    assert body["doors_complete"] is False and "changed" in body["doors_note"] and "engine.dll" in body["doors_note"]
 
 
 def test_without_a_cache_the_process_keeps_its_hint_and_no_build_starts(client, tdc, doors_host):

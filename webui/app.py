@@ -8655,6 +8655,8 @@ def _syscall_search_process(pid, view, build, baseline, image_path, imports):
         after = reader.modules()
         if _syscall_module_identity(after) == _syscall_module_identity(listed):
             return found, note
+        # the first list was found complete and its doors applied during the search, so over both lists the
+        # question left is the second one's; listed + after says the rule, and changes no answer beside after alone
         if after is None:
             doors, note = None, "the modules of the process could not be listed again after the search"
         else:
