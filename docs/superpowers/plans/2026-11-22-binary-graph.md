@@ -990,7 +990,8 @@ Deploy über `scripts/deploy-utm.py`, dann von Hand:
 1. `scripts/build-binary-graph.ps1` läuft durch und nennt Zahlen, die plausibel sind — rund 4.000 Binaries, und `api_sets_resolved` ist nicht 0.
 2. **`table.missing_from(baseline.syscalls)` gegen die echte Baseline ist leer.** Das ist die einzige Prüfung, die die kuratierten Nt-Namen wirklich beurteilt: in der CI kann nur die Form geprüft werden, hier die Namen. Jeder genannte Name ist entweder ein Tippfehler in der Tabelle oder eine Funktion, die dieser Build nicht hat — beides gehört in den Bericht, mit welcher der beiden Ursachen es war.
 3. `GET /api/binary-graph/query?q=path-to-syscall&module=kernel32.dll&function=WriteProcessMemory` endet bei `NtWriteVirtualMemory` mit der Nummer, die die Baseline nennt.
-4. Beide Themes, 1920 und 1280 px, echte Eingaben über CDP in eigenem Chrome mit frischem Profil.
-5. Ein Sample mit einem Direct-Syscall-Stub zeigt jetzt **einen Beleg** statt eines Hinweises — und ein gewöhnliches Programm, das die Win32-Funktion importiert, zeigt weiterhin keinen.
+4. **Eine echte `C:\Windows\System32\ntdll.dll` als Datei durch `POST /api/syscalls/stubs` schicken, in der x64-Sicht.** Jeder Treffer muss `import_present` `True` tragen, nicht `False`: die Datei exportiert ihre Stubs unter deren Nt-Namen, also hält sie jede Tür. Ist auf ARM64X eine x64-Sicht-Stub nur über EC-Metadaten exportiert, findet `pefile` ihn in der nativen Export-Tabelle nicht, und eine echte Systemdatei gälte als belegte Umgehung — die falsche Richtung auf der Hauptplattform dieser Kammer. In der CI nicht prüfbar, hier in einem Aufruf.
+5. Beide Themes, 1920 und 1280 px, echte Eingaben über CDP in eigenem Chrome mit frischem Profil.
+6. Ein Sample mit einem Direct-Syscall-Stub zeigt jetzt **einen Beleg** statt eines Hinweises — und ein gewöhnliches Programm, das die Win32-Funktion importiert, zeigt weiterhin keinen.
 
-Punkt 5 ist die Abnahme des ganzen Plans. Was dort gemessen wird, gehört in den Prüfbericht, nicht nur ins Protokoll.
+Punkt 6 ist die Abnahme des ganzen Plans. Was dort gemessen wird, gehört in den Prüfbericht, nicht nur ins Protokoll.
