@@ -3060,7 +3060,7 @@ def test_a_module_loaded_during_the_search_takes_the_proof_back(client, target, 
     first = target.reader._m
     later = first + _loaded("C:\\Program Files\\Hook\\engine.dll")
     calls = []
-    target.reader.modules = lambda: calls.append(1) or (first if len(calls) == 1 else later)
+    target.reader.modules_whole = lambda: calls.append(1) or (first if len(calls) == 1 else later)
     body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
     assert len(calls) == 2, "the modules are listed before and after the search"
     assert [h["import_present"] for h in body["hits"]] == [None]
@@ -3104,7 +3104,7 @@ def test_the_detonation_stage_keeps_the_process_hint_when_the_union_is_incomplet
 def _changing(target, later):
     first = target.reader._m
     calls = []
-    target.reader.modules = lambda: calls.append(1) or (first if len(calls) == 1 else later(first))
+    target.reader.modules_whole = lambda: calls.append(1) or (first if len(calls) == 1 else later(first))
     return calls
 
 
@@ -3127,7 +3127,7 @@ def test_a_module_gone_by_the_end_of_the_search_still_counts(client, target, doo
     # listed before the search, unloaded by its end: the union is over both lists, not the last one
     calls = []
     first = target.reader._m + _loaded(_SYS32 + "dbghelp.dll")
-    target.reader.modules = lambda: calls.append(1) or (first if len(calls) == 1 else first[:-1])
+    target.reader.modules_whole = lambda: calls.append(1) or (first if len(calls) == 1 else first[:-1])
     body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
     assert [h["import_present"] for h in body["hits"]] == [True]
 
@@ -3210,3 +3210,114 @@ def test_the_imports_by_ordinal_of_a_pe_are_read_delay_loaded_ones_included(tdc)
     data = make_pe(imports=(("KERNEL32.dll", (157, "GetLastError")),), delay=(("ws2_32.dll", (115,)),))
     assert tdc._pe_ordinal_imports(data) == {"kernel32.dll": ("#157",), "ws2_32.dll": ("#115",)}
     assert tdc._pe_ordinal_imports(b"not a pe") is None
+
+
+# --- Ruling 37: an empty or thinned module list is not a complete one ---------------------------------------------
+
+def test_a_module_list_that_comes_back_empty_after_the_search_takes_the_proof_back(client, target, doors_host):
+    # nothing is known of what loaded while the search ran: an empty list is no list, not a process of no modules
+    _changing(target, lambda first: [])
+    body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
+    assert [h["import_present"] for h in body["hits"]] == [None]
+    assert body["doors_complete"] is False
+
+
+def _thinned(target, when):
+    """The reader leaves a module out of the list (`when` is 1 for the list before the search, 2 for the one after),
+    as Win32Reader.modules() skips one whose information or file name cannot be read, and says so."""
+    whole = target.reader.modules_whole
+    calls = []
+    target.reader.modules_whole = lambda: calls.append(1) or (None if len(calls) == when else whole())
+
+
+def test_a_module_list_the_reader_thinned_is_no_complete_list(client, target, doors_host):
+    for when in (1, 2):
+        _thinned(target, when)
+        body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
+        assert [h["import_present"] for h in body["hits"]] == [None], when
+        assert body["doors_complete"] is False, when
+
+
+def test_a_reader_vouches_for_no_whole_module_list_unless_it_says_so():
+    # the seam's default is the safe one: a reader that does not know whether it left a module out cannot prove
+    class Plain(syscall_scan.ProcessReader):
+        def modules(self):
+            return [{"name": "ntdll.dll", "base": 1, "size": 1, "path": _SYS32 + "ntdll.dll"}]
+
+    assert Plain().modules_whole() is None
+    assert Plain().modules() is not None
+
+
+def test_the_deadline_reader_passes_the_whole_list_on_and_nothing_once_expired(tdc):
+    inner = _x64_space(b"\x90")
+    inner._m = _loaded(_IMAGE)
+    live = tdc._DeadlineReader(inner, float("inf"))
+    assert live.modules_whole() == inner._m
+    gone = tdc._DeadlineReader(inner, 0)
+    assert gone.modules_whole() is None and gone.expired
+
+
+def test_an_ordinal_keeps_the_name_its_own_module_gives_it(x64_baseline):
+    # kernel32!#160 is CreateRemoteThread there and forwards to another name: the importer imported the door by
+    # the first name, as a named import keeps it
+    graph = _doors_graph(_with_ordinals(
+        _q("k32.dll", forwarders={"CreateRemoteThread": "kernelbase.CloseHandle"}), {160: "CreateRemoteThread"}))
+    names, why = binary_graph_query.name_ordinal_imports(graph, {"k32.dll": ("#160",)}, view="x64")
+    assert why == "" and "CreateRemoteThread" in names and "CloseHandle" in names
+
+
+def test_an_ordinal_named_over_a_table_cut_short_allows_no_proof():
+    cut = _with_ordinals(_q("k32.dll", exports=["CloseHandle"], partial=True), {7: "CloseHandle"})
+    names, why = binary_graph_query.name_ordinal_imports(_doors_graph(cut), {"k32.dll": ("#7",)}, view="x64")
+    assert names is None and "cut short" in why
+
+
+def test_system32_is_taken_from_the_system_not_a_literal():
+    # a chamber whose Windows lives on another drive would otherwise never get a process-mode proof
+    assert binary_graph.system32_directory(environ={"SystemRoot": "D:\\WINNT"}, os_name="posix") == "D:\\WINNT\\System32"
+    assert binary_graph.system32_directory(environ={}, os_name="posix") == "C:\\Windows\\System32"
+    assert binary_graph.system32_directory(environ={"SystemRoot": "D:\\WINNT"}, os_name="nt",
+                                           ask=lambda: "E:\\Sys\\system32") == "E:\\Sys\\system32"
+    # the system asked and silent: the environment's answer
+    assert binary_graph.system32_directory(environ={"SystemRoot": "D:\\WINNT"}, os_name="nt",
+                                           ask=lambda: None) == "D:\\WINNT\\System32"
+
+
+def test_a_module_of_a_system32_elsewhere_counts_when_that_is_the_systems(x64_baseline):
+    doors = binary_graph_query.imported_doors(
+        _doors_graph(), _loaded(_IMAGE, *(m.replace("C:\\Windows", "D:\\WINNT") for m in _SYSTEM_MODULES)),
+        win32_to_nt.load_table(), view="x64", image_path=_IMAGE, image=_image(), system32="D:\\WINNT\\System32")
+    assert _process_hit(x64_baseline, doors)["import_present"] is False
+
+
+# --- Ruling 39: the proof's sentence says what the proof establishes -----------------------------------------------
+
+def test_the_detail_of_a_process_proof_says_no_loaded_module_imports_a_door(x64_baseline):
+    doors = _doors(_doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES))
+    (finding,) = memory_evidence.from_direct_stubs([_process_hit(x64_baseline, doors)], "sample.exe")
+    assert "no module loaded in the process imports a door" in finding["detail"]
+    assert "carried by the sample" not in finding["detail"]
+    dbghelp = _q("dbghelp.dll", imports={"kernel32.dll": ("WriteProcessMemory",)})
+    doors = _doors(_doors_graph(dbghelp), _loaded(_IMAGE, *_SYSTEM_MODULES, _SYS32 + "dbghelp.dll"))
+    (finding,) = memory_evidence.from_direct_stubs([_process_hit(x64_baseline, doors)], "sample.exe")
+    assert "a module loaded in the process imports a door" in finding["detail"]
+    assert "carried by the sample" not in finding["detail"]
+
+
+def test_the_detail_of_a_file_proof_still_speaks_of_the_sample(x64_baseline):
+    (finding,) = memory_evidence.from_direct_stubs([_hit(x64_baseline, "NtAllocateVirtualMemory", {"GetLastError"})],
+                                                   "s.exe")
+    assert finding["detail"] == "NtAllocateVirtualMemory stub carried by the sample, which does not import it"
+    (finding,) = memory_evidence.from_direct_stubs([_hit(x64_baseline, "NtAllocateVirtualMemory", {"VirtualAlloc"})],
+                                                   "s.exe")
+    assert finding["detail"] == "NtAllocateVirtualMemory stub carried by the sample, which imports it as well"
+
+
+def test_the_sentence_of_a_process_proof_changes_nothing_but_the_sentence(x64_baseline):
+    doors = _doors(_doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES))
+    process = _process_hit(x64_baseline, doors)
+    as_file = {k: v for k, v in process.items() if k != "address"}
+    as_file["offset"] = 0x40
+    (p,), (f,) = (memory_evidence.from_direct_stubs([h], "sample.exe") for h in (process, as_file))
+    differ = {k for k in set(p) | set(f) if p.get(k) != f.get(k)}
+    assert differ == {"detail", "address", "places"}

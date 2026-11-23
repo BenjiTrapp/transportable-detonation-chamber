@@ -8293,6 +8293,9 @@ class _DeadlineReader(syscall_scan.ProcessReader):
     def modules(self):
         return self._reader.modules() if self._live() else None
 
+    def modules_whole(self):
+        return self._reader.modules_whole() if self._live() else None
+
     def read(self, addr, size):
         return self._reader.read(addr, size) if self._live() else None
 
@@ -8625,7 +8628,9 @@ def _syscall_search_process(pid, view, build, baseline, image_path, imports):
     A stub in private memory is judged against the union of the doors every loaded module imports
     (binary_graph_query.doors_of_process), never against the image's table alone: the memory is not the image's
     alone. The union needs the binary graph of this system, which is taken as it is and never built from here, and
-    is taken from the module list of the reader that searches, before the search and again after it.
+    is taken from the module list of the reader that searches, before the search and again after it, as
+    `modules_whole`: a list the reader thinned (a module whose information or name it could not read) is no list,
+    and neither is an empty one.
 
     The denominator covers every module loaded at any point of the search, so it is the union over both lists: a
     module loaded only for a while still had its doors in the address space, and may be the stub's author. A module
@@ -8644,7 +8649,7 @@ def _syscall_search_process(pid, view, build, baseline, image_path, imports):
 
     def work(reader):
         doors, note = None, why
-        listed = reader.modules() if table is not None else None
+        listed = reader.modules_whole() if table is not None else None
         if table is not None:
             doors, note = binary_graph_query.doors_of_process(graph, listed, table, view=view,
                                                               image_path=image_path, image=image)
@@ -8652,12 +8657,13 @@ def _syscall_search_process(pid, view, build, baseline, image_path, imports):
         found = syscall_scan.find_stubs_in_process(reader, baseline, imports, **keywords)
         if doors is None:
             return found, note
-        after = reader.modules()
+        after = reader.modules_whole()
         if _syscall_module_identity(after) == _syscall_module_identity(listed):
             return found, note
         # the first list was found complete and its doors applied during the search, so over both lists the
         # question left is the second one's; listed + after says the rule, and changes no answer beside after alone
-        if after is None:
+        if not after:
+            # an empty list is no list: nothing is known of what loaded while the search ran
             doors, note = None, "the modules of the process could not be listed again after the search"
         else:
             doors, note = binary_graph_query.doors_of_process(graph, listed + after, table, view=view,

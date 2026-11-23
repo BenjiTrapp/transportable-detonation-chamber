@@ -623,11 +623,20 @@ def from_direct_stubs(hits, process=""):
         imported = first.get("import_present")
         number = f"{first['number']:#x}"
         proven = named and imported is False
+        # a process hit has an address, a file hit an offset: only the sentence follows from it
+        in_process = "address" in first and "offset" not in first
         if not named:
             detail = (f"stub for syscall number {number}, which this build does not have: "
                       "built for another Windows build")
+        elif imported is False and in_process:
+            # judged against the doors of every module loaded there: that is what the proof establishes, not
+            # what the sample alone imports
+            detail = (f"{name} stub in process memory, and no module loaded in the process imports a door "
+                      "to it")
         elif imported is False:
             detail = f"{name} stub carried by the sample, which does not import it"
+        elif imported and in_process:
+            detail = f"{name} stub in process memory; a module loaded in the process imports a door to it as well"
         elif imported:
             detail = f"{name} stub carried by the sample, which imports it as well"
         else:

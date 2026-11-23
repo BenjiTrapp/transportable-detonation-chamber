@@ -621,6 +621,29 @@ mitgebrachten Stub daher nie sähe.
     auch wenn es den Stub hinterlassen hat.
   - **Eine System32-Datei, die ohne Build-Wechsel überschrieben wurde,** wird nicht
     bemerkt: der Cache beschreibt die alte Datei. Das setzt Adminrechte voraus.
+  - **Ein Modul schreibt einen Stub, den seine Importe nicht erklären.** Eine
+    Hook-Engine kopiert die Stub-Bytes von ntdll in ein privates Trampolin, statt
+    `VirtualAllocEx` aufzurufen; ein Broker oder Injektor schreibt einen Stub von
+    außen in den Prozess. Liegt ein solches Modul direkt in System32 und hält der
+    Cache es, ist die Vereinigung vollständig, keine Tür wird gefunden, und ein
+    sauberer Host gilt als belegte Umgehung — „jeder EDR-Hook ist ein Befund", das
+    erste Anti-Ziel, eine Schicht höher. **Die Host-Baseline mildert das heute
+    nicht:** ein `direct_syscall_stub`-Befund ist nach dem Prozess geschlüsselt, in
+    dem er gefunden wurde (dessen Image-Pfad), ein Eintrag für ein Programm passt
+    also nie auf ein anderes; und kein Sweep nimmt einen solchen Befund auf, denn
+    die Syscall-Stufe des Sweeps misst Hooks und sucht keine mitgebrachten Stubs,
+    und „Sweep as baseline" führt sie nicht aus. Ein einmaliger Schreiber und ein
+    Host ohne Baseline sind aus demselben Grund nicht gedeckt. Engines außerhalb von
+    System32 (die meisten EDRs liegen unter `Program Files`) machen die Vereinigung
+    unvollständig und sind nicht betroffen. Die VM-Prüfung sucht ein solches Modul
+    auf dem Image der Kammer; wird eines gefunden, ist das ein Defekt, keine Grenze.
+  - **Viele gewöhnliche GUI-Samples bekommen keinen Beleg aus dem Prozessspeicher,**
+    und das ist erwartet: `comctl32` v6 und die Side-by-Side-Assemblies laden aus
+    `WinSxS`, eine app-lokale Visual-C++-Laufzeit (`vcruntime140.dll` neben der exe)
+    aus dem Ordner des Samples. Beide liegen nicht direkt in System32, der Cache hält
+    sie nicht, die Vereinigung ist unvollständig. Auch die Modulliste selbst muss
+    ganz sein: ein Modul, dessen Angaben oder Dateiname der Leser nicht lesen kann,
+    macht sie unvollständig, ebenso eine leere Liste.
 - **Eigene Route** `POST /api/syscalls/stubs` mit `pid` oder `path`.
 - Dieser Befund ist die Eingabe für die generierte YARA-Regel aus Ziel 5.2.
 

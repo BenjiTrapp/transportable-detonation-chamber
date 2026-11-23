@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import mmap
+import ntpath
 import os
 import re
 import struct
@@ -19,8 +20,30 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 MACHINES = {0xAA64: "arm64", 0x8664: "x64", 0x14C: "x86"}
-SYSTEM32 = r"C:\Windows\System32"
-API_SET_SCHEMA_PATH = SYSTEM32 + r"\apisetschema.dll"
+def _ask_windows():
+    """GetSystemDirectoryW, None when it cannot be asked or does not answer."""
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(32768)
+        n = ctypes.windll.kernel32.GetSystemDirectoryW(buf, len(buf))
+        return buf.value if 0 < n < len(buf) else None
+    except Exception:
+        return None
+
+
+def system32_directory(environ=os.environ, os_name=os.name, ask=_ask_windows) -> str:
+    """The system directory of this Windows: what Windows says (GetSystemDirectoryW), else SystemRoot's System32,
+    else C:\\Windows\\System32. Never a literal alone: a Windows on another drive would be read wrong."""
+    if os_name == "nt":
+        answer = ask()
+        if answer:
+            return answer
+    root = environ.get("SystemRoot")
+    return ntpath.join(root, "System32") if root else r"C:\Windows\System32"
+
+
+SYSTEM32 = system32_directory()
+API_SET_SCHEMA_PATH = ntpath.join(SYSTEM32, "apisetschema.dll")
 MAX_BINARY_SIZE = 512 * 2**20          # System32's largest image is a fraction of this; a sample may not be
 
 # every reason a file is skipped for: fixed strings of our own, so they can be counted and grouped. Never a library's,

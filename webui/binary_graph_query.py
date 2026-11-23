@@ -517,6 +517,15 @@ def _add_ordinal(graph, importer, module, function, names):
     resolution = binary_graph.resolve_export(graph.binaries, graph.api_sets, module, function)
     if resolution.reason != "defined":
         return f"{importer} imports {function} of {module}, which the binary graph cannot name"
+    if resolution.partial:
+        return f"{importer} imports {function} of {module}, named over a table that was cut short when it was read"
+    # the name the exporting module gives the number, as a named import keeps the name it was imported by
+    first = graph.binaries.get(module)
+    digits = function[1:]
+    if first is not None and digits.isascii() and digits.isdecimal():
+        own = first.ordinal_names.get(int(digits))
+        if own:
+            names.add(own)
     names.update(hop.function for hop in resolution.hops)
     names.add(resolution.function)
     return ""

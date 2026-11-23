@@ -92,6 +92,13 @@ class ProcessReader:
         cannot be had at all, which is not the same as a module missing from it."""
         raise NotImplementedError
 
+    def modules_whole(self) -> list[dict] | None:
+        """The loaded modules as `modules` gives them, but None unless the reader vouches that
+        it left none out. A caller that must know every module (the union of their doors that
+        proves a bypass) asks this; `modules` keeps its contract for `measure`, which can do
+        with a list a module is missing from. The default vouches for nothing."""
+        return None
+
     def read(self, addr: int, size: int) -> bytes | None:
         """Exactly `size` bytes at `addr`, or None."""
         raise NotImplementedError
@@ -881,6 +888,16 @@ class Win32Reader(ProcessReader):
         return self._build
 
     def modules(self) -> list[dict] | None:
+        listed = self._listing()
+        return None if listed is None else listed[0]
+
+    def modules_whole(self) -> list[dict] | None:
+        listed = self._listing()
+        return None if listed is None or listed[1] else listed[0]
+
+    def _listing(self) -> tuple[list[dict], int] | None:
+        """`(modules, left out)`: a module whose information or file name cannot be read is
+        left out and counted; None when the list cannot be had."""
         ptr = ctypes.sizeof(ctypes.c_void_p)
         needed = _DWORD(0)
         count = 512
@@ -892,18 +909,20 @@ class Win32Reader(ProcessReader):
             if needed.value <= ctypes.sizeof(handles):
                 break
             count = needed.value // ptr + 16
-        out = []
+        out, left_out = [], 0
         buf = ctypes.create_unicode_buffer(_PATH_CHARS)
         for hmod in handles[:needed.value // ptr]:
             info = MODULEINFO()
             if not hmod or not self._psapi.GetModuleInformation(
                     self._handle, hmod, ctypes.byref(info), ctypes.sizeof(info)):
+                left_out += 1
                 continue
             if not self._psapi.GetModuleFileNameExW(self._handle, hmod, buf, _PATH_CHARS):
+                left_out += 1
                 continue
             out.append({"name": ntpath.basename(buf.value), "base": info.lpBaseOfDll or 0,
                         "size": info.SizeOfImage, "path": buf.value})
-        return out
+        return out, left_out
 
     def read(self, addr: int, size: int) -> bytes | None:
         buf = ctypes.create_string_buffer(size)

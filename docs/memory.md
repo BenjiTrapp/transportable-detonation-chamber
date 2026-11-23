@@ -249,6 +249,14 @@ of System32's ARM64X binaries, whose x64 side may import otherwise, so a union b
 from it would be wrong. The file-mode proof still works there, and it is the
 attributable source.
 
+Many ordinary GUI samples get no process-mode proof either, and that is expected:
+`comctl32` v6 and the common-controls side-by-side assemblies load from `WinSxS`, and
+an app-local Visual C++ runtime (`vcruntime140.dll`, `msvcp140.dll` beside the
+exe) loads from the sample's folder. Neither is directly in System32, so the graph
+does not hold them and the union is incomplete. The module list itself must be
+whole: a module whose information or file name the reader cannot read makes the
+list incomplete, and so does an empty list.
+
 Further residuals of the process-mode proof. A module that unlinks itself from the
 loader's list is missing from the union, which pushes the answer toward `false`,
 toward a proof: that is against an attacker's interest (malware wants to be a hint,
@@ -259,7 +267,19 @@ reasoning. An image file changed on disk after the process started makes the uni
 describe the file, not the mapped image. A module unloaded before the search is in
 neither list, though it may have left the stub. A System32 file overwritten without
 a build change is not noticed: the graph describes the old file (that takes admin
-rights).
+rights). And a module may write a stub its imports do not explain: a hook engine
+copies `ntdll`'s stub bytes into a private trampoline instead of calling
+`VirtualAllocEx`, and a broker or injector writes a stub into the process from
+outside. If such a module sits directly in System32 and is in the graph, the union
+is complete, no door is found, and a clean host reads as a proven bypass: "every
+EDR hook is a finding", one layer up. The host memory baseline does **not** mitigate
+this today. A `direct_syscall_stub` finding is keyed by the process it was found in
+(its image path), so an entry recorded for one program never matches another, and
+no sweep records one at all: the sweep's syscall stage measures hooks and does not
+search for carried stubs, and "Sweep as baseline" does not run it. A one-off writer
+and a host without a baseline are not covered for the same reason. Engines that
+live outside System32 (most EDRs install under `Program Files`) leave the union
+incomplete and are not affected.
 
 And some covered syscalls almost never yield a
 proof: nearly every binary imports `FreeLibrary` (a door to

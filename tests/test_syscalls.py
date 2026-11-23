@@ -942,6 +942,10 @@ class FakeReader(syscall_scan.ProcessReader):
     def modules(self):
         return self._m
 
+    def modules_whole(self):
+        # a list of a few dicts leaves nothing out
+        return self._m
+
     def read(self, addr, size):
         self.reads += 1
         if self._cut is not None and addr + size > self._cut:
