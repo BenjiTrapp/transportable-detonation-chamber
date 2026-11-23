@@ -161,7 +161,7 @@ KINDS = {
     # outlive a clean-host baseline.
     "syscall_stub_patched": {
         "weight": 4.0, "evidence": EVIDENCE_STRUCTURAL, "corroborate": False,
-        "label": "Syscall stub redirected into private memory",
+        "label": "Syscall stub redirected into private memory or a core Windows module",
     },
     "syscall_stub_hooked": {
         "weight": 0.8, "evidence": EVIDENCE_BEHAVIORAL, "corroborate": True,

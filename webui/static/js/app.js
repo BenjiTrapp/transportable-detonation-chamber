@@ -24885,8 +24885,10 @@ const SYSCALL_STATE_COLORS = {
 };
 const SYSCALL_STATE_HELP = {
     intact: 'The stub is as the baseline has it.',
-    hooked: 'The stub jumps into a loaded module other than ntdll, which a file backs: an EDR hook.',
-    patched: 'The stub jumps into private memory that no file backs.',
+    hooked: 'hooked (file-backed module): the jump ends in a loaded module other than ntdll that a file backs. An EDR does that, ' +
+            'but so does a DLL the sample loaded, or a legitimate DLL it overwrote in place (module stomping), which this scan cannot tell apart.',
+    patched: 'The jump ends in memory no hooking product explains: private memory or a section no file backs, after any relay was followed, ' +
+             'or a core Windows module such as kernelbase.dll (a code cave).',
     diverged: 'The bytes differ, but the jump is not into a foreign module and not into private memory, or its target cannot be resolved. Not guessed at.',
     unreadable: 'No stub could be read.',
 };
@@ -25314,6 +25316,12 @@ function renderSyscallDetail(sc) {
         const rows = [];
         if (jumps) {
             rows.push(fact('Jump target', syscallOwnerHtml(sc.target_owner)));
+            const relay = Array.isArray(sc.relay) ? sc.relay.filter(h => h && typeof h === 'object') : [];
+            if (relay.length) {
+                rows.push(fact('Relay', relay.map(h => `${escapeHtml(syscallHex(h.address))} ${syscallOwnerHtml(h.owner)}` +
+                    (h.pattern ? ` (${escapeHtml(h.pattern)})` : ' (not read)')).join(' → ') +
+                    ' · the first jump lands here, and the owner above is where the relay leads'));
+            }
             if (sc.pattern) rows.push(fact('Pattern', escapeHtml(sc.pattern)));
             // number_matches is true, false or null: null is a jump over the prologue, which shows no number
             if (sc.number_matches === true) rows.push(fact('Number', 'The live bytes carry the number of the baseline.'));
@@ -25323,7 +25331,7 @@ function renderSyscallDetail(sc) {
         if (rows.length) finding += `<dl class="syscall-facts">${rows.join('')}</dl>`;
         if (state === 'hooked' && sc.allowlisted === true) {
             finding += `<p class="syscall-known-hook">Known hook: ${syscallOwnerHtml(sc.target_owner)} is on the hook allowlist for this build and view, ` +
-                       'so this hook does not score. It stays listed on purpose: it is there, and an EDR that hooks ntdll in this process is worth knowing.</p>';
+                       'so this hook does not score. It stays listed on purpose: it is there, and a module that hooks ntdll in this process is worth knowing.</p>';
         }
         html += `<div class="syscall-finding syscall-finding-${cssToken(state)}">${finding}</div>`;
     }

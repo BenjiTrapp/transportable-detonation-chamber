@@ -108,9 +108,9 @@ neighbour of every hook. Each stub comes out in one of five states:
 | State | Meaning |
 |-------|---------|
 | **intact** | As the baseline has it |
-| **hooked** | A jump into a loaded module that a file backs and that is not `ntdll`: what an EDR does |
-| **patched** | A jump into private memory that no file backs |
-| **diverged** | The bytes differ, but the jump is neither of the two or cannot be resolved. It is not guessed at, and never reported as intact |
+| **hooked** (file-backed module) | The jump ends in a loaded module that a file backs and that is not `ntdll`. An EDR does that, but so does a DLL the sample dropped and loaded, or a legitimate DLL it overwrote in place (module stomping keeps the image and its path); the scan cannot tell these apart |
+| **patched** | The jump ends in memory no hooking product explains: private memory or a section no file backs (after any relay was followed, see below), or a core Windows module such as `kernelbase.dll` or `win32u.dll`, which means a code cave |
+| **diverged** | The bytes differ, but the jump is neither of the two or cannot be resolved. It is not guessed at, never reported as intact, and the verdict says how many there are |
 | **unreadable** | No stub could be read. A scan with any of these is marked partial |
 
 The difference between hooked and patched is the spine of the feature, and it is

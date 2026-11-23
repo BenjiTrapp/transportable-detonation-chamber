@@ -1035,7 +1035,7 @@ def test_detail_says_who_the_jump_goes_to_and_that_an_unresolved_one_is_not_gues
             patched: renderSyscallDetail({ ...base, state: "patched", target_owner: "private" }),
             diverged: renderSyscallDetail({ ...base, state: "diverged", target_owner: null }),
             intact: renderSyscallDetail({ ...base, state: "intact", actual: "4c8bd1b8" }) });""")
-    assert "edr.dll" in r["hooked"] and "JMP rel32" in r["hooked"] and "an EDR hook" in r["hooked"]
+    assert "edr.dll" in r["hooked"] and "JMP rel32" in r["hooked"] and "file-backed module" in r["hooked"] and "EDR hook" not in r["hooked"]
     assert "private memory" in r["patched"] and "no file backs" in r["patched"]
     assert "unresolved" in r["diverged"]
     assert "Jump target" not in r["intact"], "an intact stub jumps nowhere"
@@ -2516,3 +2516,20 @@ def test_the_stage_block_has_the_counts_the_partial_note_and_the_deviations_esca
     assert "region query failed" in html and "path unknown" in html
     assert 'data-sortable data-sort-id="det-syscall-deviations"' in html
 
+
+
+@needs_node
+def test_a_hooked_stub_is_named_by_what_backs_its_target_and_not_called_an_edr_hook():
+    r = _run_node([], "out(SYSCALL_STATE_HELP);")
+    assert "file-backed module" in r["hooked"]
+    assert "EDR hook" not in r["hooked"]
+
+
+@needs_node
+def test_the_detail_names_the_relay_a_hook_went_through():
+    html = _run_node(DETAIL_FUNCTIONS, """
+      out(renderSyscallDetail({name: "NtFoo", number: 58, module: "ntdll.dll", expected: "4c8bd1b8", actual: "e92b1700",
+        state: "hooked", target_owner: "edr.dll", pattern: "JMP rel32", parameters: [],
+        relay: [{address: 140703380275200, owner: "private", pattern: "JMP [rip]<b>"}]}));""")
+    assert "Relay" in html and "0x7FF80F000000" in html and "JMP [rip]&lt;b&gt;" in html
+    assert "<b>" not in html

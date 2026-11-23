@@ -58,7 +58,8 @@ Oberfläche englisch. Aufbau von oben nach unten:
 - **Hauptfläche links, Ansicht MAP:**
   - Eine Zelle je Syscall, nach Syscall-Nummer sortiert, in zwei Bändern:
     `ntdll.dll` und `win32u.dll`, jedes mit Überschrift und Anzahl.
-  - Farbe ist der Zustand: intakt, EDR-Hook, gepatcht, kein Stub lesbar.
+  - Farbe ist der Zustand: intakt, hooked (dateigedecktes Modul), gepatcht,
+    abweichend, kein Stub lesbar.
     Ohne Scan sind alle Zellen im Baseline-Ton.
   - Eine Legende nennt jeden Zustand mit seiner Anzahl.
   - Hover zeigt Name und Nummer, Klick lädt das Detailpanel.
@@ -190,8 +191,24 @@ gehört**, nicht das Befehlsmuster:
 dafür nicht — sie können „privat, nicht dateigedeckt" nicht von „in einem Modul"
 unterscheiden. `webui/syscall_scan.py` braucht daher zusätzlich `VirtualQueryEx`
 und `GetMappedFileNameW`. Der Weg über die bloße Modulliste wäre kürzer, würde
-aber ein überschriebenes Modul fälschlich als `hooked` führen. Der für die Tests
+aber Speicher, den der Angreifer selbst angelegt hat, nicht von einem Modul
+unterscheiden. **Ein überschriebenes Modul erkennt auch die Region-Abfrage
+nicht:** Module Stomping behält `MEM_IMAGE` und den Pfad, und
+`GetMappedFileNameW` nennt die Datei, nicht ihren Inhalt. `hooked` heißt darum
+nur „ein dateigedecktes Modul hält das Ziel" — ein EDR, aber ebenso eine vom
+Sample geladene oder eine überschriebene DLL — und wird so beschriftet, nicht
+als EDR-Hook. Ein Ziel in einem Windows-Kernmodul (`kernelbase.dll`,
+`kernel32.dll`, `win32u.dll` und wenige andere, in denen kein Hook-Produkt seinen
+Handler ablegt) ist eine Code-Cave und gilt als `patched`. Der für die Tests
 injizierte Leser muss diese Schicht mit abbilden.
+
+**Was die Region-Abfrage zurückgibt, wird über dem Leser entschieden.** Ein
+`MEM_MAPPED`-Bereich ohne Dateinamen (ein vom Pagefile gedeckter Abschnitt, das
+klassische Ziel von `NtMapViewOfSection`) ist nicht dateigedeckt und zählt als
+privat. Ein `MEM_IMAGE`-Bereich ohne Namen ist eine **fehlgeschlagene**
+Abfrage — ein Image ist per Definition dateigedeckt, und unter dem
+eingeschränkten Zugriffsrecht scheitert `GetMappedFileNameW` leicht — und wird
+wie jede fehlgeschlagene Eigentümer-Abfrage gezählt.
 
 Die Befehlsmuster sind **pro Architektur** zu prüfen:
 
@@ -735,7 +752,7 @@ hat so entschieden:
   Nutzers hinzu, damit der Graph eine eigene Visualisierung neben der Heatmap
   ist und nicht in ihr aufgeht.
 - **Zustandsfarben** folgen den vorhandenen Bedeutungen: intakt in der Farbe für
-  „sauber", EDR-Hook in der Warnfarbe, gepatcht in der kritischen Farbe, kein
+  „sauber", hooked (dateigedecktes Modul) in der Warnfarbe, gepatcht in der kritischen Farbe, kein
   Stub gedämpft. Sie kommen aus den Theme-Variablen, nicht aus neuen Werten.
 - **Dichte der Karte:** Ohne Scan ruhig und gedämpft, damit der Blick nichts
   sucht. Nach einem Scan heben sich Abweichungen deutlich ab, auch einzelne
@@ -773,9 +790,11 @@ hat so entschieden:
 - Fünf Zustände statt vier: `diverged` für „Bytes weichen ab, Ziel nicht
   auflösbar", damit dieser Fall nicht stumm als `intact` durchgeht.
 - Der Live-Scan nimmt standardmäßig nur `ntdll`; `win32u` ist zuschaltbar.
-- `hooked` gegen `patched` wird am Besitzer des Sprungziels entschieden, und
-  dafür kommen `VirtualQueryEx` und `GetMappedFileNameW` dazu; die Modulliste
-  allein würde ein überschriebenes Modul als `hooked` ausgeben.
+- `hooked` gegen `patched` wird am **letzten** Besitzer des Sprungziels
+  entschieden, nach höchstens zwei privaten Relays, und dafür kommen
+  `VirtualQueryEx` und `GetMappedFileNameW` dazu. Ein überschriebenes Modul
+  (Module Stomping) sieht auch diese Abfrage nicht; `hooked` heißt darum
+  „dateigedecktes Modul", nicht „EDR-Hook".
 - Zwei neue `KINDS`-Einträge statt eines, weil Hook und Patch verschieden wiegen.
 - **Kein `baseline_exempt`** — das Flag macht einen Befund immun gegen die
   Baseline. EDR-Hooks werden stattdessen über eine eigene,

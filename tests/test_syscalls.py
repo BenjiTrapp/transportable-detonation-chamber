@@ -502,6 +502,31 @@ def test_a_jump_into_the_stubs_own_module_is_diverged():
     assert syscall_baseline.classify_stub(sc, live, "arm64", "edr.dll")["state"] == "hooked"
 
 
+@pytest.mark.parametrize("owner", ["kernelbase.dll", "kernel32.dll", "win32u.dll", "user32.dll", "ucrtbase.dll"])
+def test_a_jump_into_a_core_windows_module_is_a_code_cave_not_a_hook(owner):
+    # no hooking product puts its handler into kernelbase: a jump from ntdll into a core Windows module lands in
+    # a code cave, or in a module somebody overwrote
+    sc = _sc("arm64")
+    live = bytes.fromhex("0500001400000000")
+    assert syscall_baseline.classify_stub(sc, live, "arm64", owner)["state"] == "patched"
+
+
+def test_a_core_module_name_is_matched_whatever_its_case_and_a_foreign_module_stays_hooked():
+    assert syscall_baseline.is_core_system_module("KernelBase.dll")
+    assert not syscall_baseline.is_core_system_module("edrhook.dll")
+    assert not syscall_baseline.is_core_system_module(None)
+    sc = _sc("arm64")
+    assert syscall_baseline.classify_stub(sc, bytes.fromhex("0500001400000000"), "arm64", "edrhook.dll")["state"] \
+        == "hooked"
+
+
+def test_a_jump_into_a_core_windows_module_is_never_recorded_as_a_known_hook(arm64_baseline, tmp_path):
+    reader = _reader_from(arm64_baseline, patched={"NtProtectVirtualMemory": ("0500001400000000", "kernelbase.dll")})
+    out = syscall_scan.measure(arm64_baseline, reader)
+    assert out["states"]["NtProtectVirtualMemory"]["state"] == "patched"
+    assert _allowlist(tmp_path).add_from(out) == 0
+
+
 def _words(*words):
     return b"".join(w.to_bytes(4, "little") for w in words)
 

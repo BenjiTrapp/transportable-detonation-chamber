@@ -271,9 +271,25 @@ STATE_PATCHED = "patched"
 STATE_DIVERGED = "diverged"
 STATE_UNREADABLE = "unreadable"
 
-# Owner value for memory that no file backs; what malware leaves behind, as opposed to
-# the module of an EDR
+# Owner value for memory that no file backs: a private allocation, or a section with no file behind it
 OWNER_PRIVATE = "private"
+
+# Core Windows modules that no hooking product puts its handler into. A jump from a syscall stub into one of them
+# lands in a code cave, or in a module somebody overwrote, and is weighed as a patch: it is not what an EDR does,
+# and it must not become suppressible by the hook allowlist. The list is short on purpose: modules Microsoft uses to
+# hook (verifier.dll, the PayloadRestrictions.dll of Exploit Protection) are not on it, and a jump into one of those
+# stays `hooked`. The module of the stub itself is never judged by this list: a jump into it is `diverged`.
+CORE_SYSTEM_MODULES = frozenset((
+    "kernel32.dll", "kernelbase.dll", "win32u.dll", "user32.dll", "gdi32.dll", "gdi32full.dll",
+    "advapi32.dll", "sechost.dll", "rpcrt4.dll", "combase.dll", "ole32.dll", "oleaut32.dll",
+    "ucrtbase.dll", "msvcrt.dll", "msvcp_win.dll", "shell32.dll", "shlwapi.dll", "ws2_32.dll",
+    "bcrypt.dll", "bcryptprimitives.dll", "crypt32.dll",
+))
+
+
+def is_core_system_module(owner) -> bool:
+    """Whether `owner`, a module's basename, is one of CORE_SYSTEM_MODULES."""
+    return isinstance(owner, str) and owner.strip().lower() in CORE_SYSTEM_MODULES
 
 _MISS = object()
 _ADDRESS_MASK = 0xFFFFFFFFFFFFFFFF
@@ -416,7 +432,11 @@ def classify_stub(sc: Syscall, live: bytes | None, view: str, owner: str | None)
     Which of hooked, patched, diverged follows from `owner`, the module that holds the
     jump target ("private" for memory no file backs, None if unresolved), not from the
     instruction pattern: an EDR and malware use the same jumps. A module is named by its
-    lower-case basename, as `ntdll.dll`; the caller normalises, nothing here does."""
+    lower-case basename, as `ntdll.dll`; the caller normalises, nothing here does.
+
+    `hooked` says only that a module a file backs holds the target: an EDR's, but also a DLL the sample dropped and
+    loaded, or a legitimate DLL it overwrote in place (module stomping keeps the image and its path, and no region
+    query can see it). A core Windows module (CORE_SYSTEM_MODULES) is no hooker's: a jump into one is `patched`."""
     n = stub_prefix_len(sc, view)
     expected = sc.stub_bytes[:n]
     out = {
@@ -442,7 +462,7 @@ def classify_stub(sc: Syscall, live: bytes | None, view: str, owner: str | None)
     out["target_owner"] = owner
     if owner is None or owner in ("ntdll.dll", sc.module.lower()):
         out["state"] = STATE_DIVERGED
-    elif owner == OWNER_PRIVATE:
+    elif owner == OWNER_PRIVATE or is_core_system_module(owner):
         out["state"] = STATE_PATCHED
     else:
         out["state"] = STATE_HOOKED
