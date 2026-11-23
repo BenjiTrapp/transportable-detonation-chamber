@@ -8874,8 +8874,9 @@ _binary_graph_log = logging.getLogger("tdc.binary_graph")
 
 
 def _new_binary_graph_build_state():
-    # running: (build, arch) being built; failed: (build, arch) -> (when, why); thread: the latest one
-    return {"running": set(), "failed": {}, "thread": None}
+    # running: (build, arch) being built; failed: (build, arch) -> (when, why); built: (build, arch) -> the stamp of
+    # the cache the last build that ended well left behind, to tell a rebuild that did not help; thread: the latest one
+    return {"running": set(), "failed": {}, "built": {}, "thread": None}
 
 
 _binary_graph_build_state = _new_binary_graph_build_state()
@@ -8906,6 +8907,15 @@ def _build_binary_graph(build, arch):
         raise RuntimeError(f"binary_graph.py exited with {proc.returncode}: {tail}")
 
 
+def _binary_graph_stat(path):
+    """`(mtime_ns, size)` of `path`, None when it cannot be read."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return info.st_mtime_ns, info.st_size
+
+
 def _binary_graph_build_job(build, arch):
     key = (build, arch)
     why = None
@@ -8915,12 +8925,18 @@ def _binary_graph_build_job(build, arch):
     except Exception as exc:
         why = str(exc) or type(exc).__name__
         _binary_graph_log.warning("the binary graph of build %s (%s) was not built: %s", build, arch, why)
+    path = binary_graph.find_cache(NTSLEUTH_BASELINE_DIR, build, arch) if why is None else None
+    stamp = _binary_graph_stat(path) if path else None
     with _binary_graph_build_lock:
-        _binary_graph_build_state["running"].discard(key)
-        if why is None:
-            _binary_graph_build_state["failed"].pop(key, None)
+        state = _binary_graph_build_state
+        state["running"].discard(key)
+        state["built"].pop(key, None)
+        if why is not None:
+            state["failed"][key] = (time.time(), why)
         else:
-            _binary_graph_build_state["failed"][key] = (time.time(), why)
+            state["failed"].pop(key, None)
+            if stamp is not None:
+                state["built"][key] = stamp
 
 
 def _start_binary_graph_build(build, arch):
@@ -8948,47 +8964,69 @@ def _binary_graph_building():
         return bool(_binary_graph_build_state["running"])
 
 
-def _binary_graph_build_note(build, arch):
+def _forget_binary_graph_failure(build, arch):
+    """A usable cache of `build` and `arch` is there: an earlier failure to build it is refuted, whoever wrote the
+    file (build-binary-graph.ps1 writes it without the web UI). Kept, it would contradict the graph being served and
+    hold back the next build for nothing."""
     with _binary_graph_build_lock:
-        running = (build, arch) in _binary_graph_build_state["running"]
-        failed = _binary_graph_build_state["failed"].get((build, arch))
-    if running:
-        return " It is being built in the background; that takes a few minutes."
-    if failed:
-        return f" The last build failed: {failed[1]}."
-    if _updating_tools():
-        return " Tool updates are running: no graph is built while they are."
-    return ""
+        _binary_graph_build_state["failed"].pop((build, arch), None)
+        _binary_graph_build_state["built"].pop((build, arch), None)
+
+
+def _rebuild_did_not_help(build, arch, stamp, reason):
+    """The cache that does not load is the very file the last build left: record that as a failure, so the throttle
+    holds the next rebuild back instead of building on every request."""
+    key = (build, arch)
+    with _binary_graph_build_lock:
+        state = _binary_graph_build_state
+        if stamp is not None and state["built"].get(key) == stamp:
+            state["built"].pop(key)
+            state["failed"][key] = (time.time(), f"the cache the build wrote does not load either ({reason})")
+
+
+def _utc(seconds):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(seconds))
 
 
 def _binary_graph_refusal(error, build=None, arch=None):
+    """The body of a 404 without a graph: `cache` null, `building`, and `failed` (`reason`, `at`, `retry_at`, UTC) or
+    null. `error` gets a sentence on which of them it is."""
     with _binary_graph_build_lock:
         building = (build, arch) in _binary_graph_build_state["running"]
-    return {"error": error, "cache": None, "building": building}
+        failed = _binary_graph_build_state["failed"].get((build, arch))
+    record = None
+    if building:
+        error += " It is being built in the background; that takes a few minutes."
+    elif failed:
+        at, why = failed
+        retry = at + BINARY_GRAPH_BUILD_RETRY
+        record = {"reason": why, "at": _utc(at), "retry_at": _utc(retry)}
+        error += f" The last build failed at {_utc(at)}: {why}."
+        error += (f" It is tried again from {_utc(retry)} on." if retry > time.time() else
+                  " It is tried again on the next request.")
+    elif build and _updating_tools():
+        error += " Tool updates are running: no graph is built while they are."
+    return {"error": error, "cache": None, "building": building, "failed": record}
 
 
 def _binary_graph_for():
     """`(graph, None)` for this system's build and architecture, or `(None, refusal)`: the JSON body of a 404, with
     `cache` null, that says why. A cache of another build or architecture is no graph: there is exactly one per
     system, and the architecture is the registry's (binary_graph.host_arch), never `platform.machine()`, which an
-    emulated x64 Python on ARM64 answers with AMD64. When there is none, one is built in the background."""
+    emulated x64 Python on ARM64 answers with AMD64. A cache that is missing or does not load is built in the
+    background, as build-binary-graph.ps1 does at provisioning; a failed build is not tried again for
+    BINARY_GRAPH_BUILD_RETRY seconds, and a build that ended well but left a cache that still does not load counts as
+    failed."""
     build = _current_os_build()
     if not build:
         return None, _binary_graph_refusal("No binary graph can be chosen: the build of this system cannot be "
                                            "determined.")
     arch = binary_graph.host_arch()
     path = binary_graph.find_cache(NTSLEUTH_BASELINE_DIR, build, arch)
-    stamp = None
-    if path is not None:
-        try:
-            info = os.stat(path)
-            stamp = (info.st_mtime_ns, info.st_size)
-        except OSError:
-            path = None
-    if path is None:
+    stamp = _binary_graph_stat(path) if path else None
+    if stamp is None:
         _start_binary_graph_build(build, arch)
-        return None, _binary_graph_refusal(f"There is no binary graph for build {build} ({arch}) yet."
-                                           + _binary_graph_build_note(build, arch), build, arch)
+        return None, _binary_graph_refusal(f"There is no binary graph for build {build} ({arch}) yet.", build, arch)
     with _binary_graph_held_lock:
         if _binary_graph_held.get("path") != path or _binary_graph_held.get("stamp") != stamp:
             _binary_graph_held.clear()          # the old graph goes before the new one is read, not after
@@ -8999,9 +9037,11 @@ def _binary_graph_for():
             _binary_graph_held.update(path=path, stamp=stamp, graph=loaded)
         loaded = _binary_graph_held["graph"]
     if isinstance(loaded, binary_graph.CacheMismatch):
+        _rebuild_did_not_help(build, arch, stamp, loaded.reason)
+        _start_binary_graph_build(build, arch)
         return None, _binary_graph_refusal(
-            f"The binary graph {os.path.basename(path)} cannot be used ({loaded.reason}: {loaded}). It is not built "
-            f"again by itself: delete it in {NTSLEUTH_BASELINE_DIR} to have it built anew.", build, arch)
+            f"The binary graph {os.path.basename(path)} cannot be used ({loaded.reason}: {loaded}).", build, arch)
+    _forget_binary_graph_failure(build, arch)
     return loaded, None
 
 

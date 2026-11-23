@@ -168,7 +168,13 @@ def _plural(count, one, many):
 def importers_of(graph, module: str, function: str | None = None) -> Answer:
     """The binaries that import `module`, or only `function` of it: directly, and through an api set the loader
     resolves to `module`. An importer through an api set is drawn as importer -> alias -> module; with `function`,
-    an alias counts only where its first host to offer the function is `module`."""
+    an alias counts only where its first host to offer the function is `module`.
+
+    One step on purpose: "who imports this" is the reverse of an `imports` edge, and an import edge is one step by
+    definition. The api-set hop is not a second step but the loader's reading of the name the importer wrote (the
+    first host, in the map's order, that offers the function). A binary that imports a forwarder which ends here
+    does not import this; following forwarders transitively is callers_of_syscall's question, and must not be
+    added here."""
     target = _module_name(graph, module)
     function = function or None
     what = f"{function} from {target}" if function else target

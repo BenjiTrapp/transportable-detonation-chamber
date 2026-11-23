@@ -2603,7 +2603,66 @@ def test_a_build_that_fails_says_why_in_the_refusal_and_is_not_retried_at_once(c
     assert args[1].endswith("binary_graph.py")
     assert args[2:] == ["--out", tdc.NTSLEUTH_BASELINE_DIR, "--build", "26220.5770", "--arch", "arm64"]
     r = client.get("/api/binary-graph/query?q=imports&module=b.exe")
-    assert r.status_code == 404 and "PermissionError" in r.get_json()["error"]
-    assert r.get_json()["building"] is False
+    body = r.get_json()
+    assert r.status_code == 404 and "PermissionError" in body["error"]
+    assert body["building"] is False
+    # it says when, and when it is tried again
+    assert body["failed"]["reason"] == "binary_graph.py exited with 1: the cache cannot be written (PermissionError)"
+    assert body["failed"]["retry_at"] > body["failed"]["at"]
+    assert "tried again" in body["error"]
     _join(tdc)
     assert len(calls) == 1                                   # held back for a while, not run on every request
+
+
+_CUT = '{"format": 1, "build": "26220.5770", "arch": "arm64"'
+
+
+def test_a_cache_that_does_not_load_is_rebuilt_in_the_background_like_a_missing_one(client, tdc, graph_host,
+                                                                                     monkeypatch):
+    path, builds, _ = graph_host
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(_CUT)
+    release = threading.Event()
+    monkeypatch.setattr(tdc, "_build_binary_graph", lambda build, arch: builds.append((build, arch)) or release.wait(10))
+    try:
+        body = client.get("/api/binary-graph/query?q=imports&module=b.exe").get_json()
+        assert builds == [("26220.5770", "arm64")]
+        assert body["cache"] is None and body["building"] is True and body["failed"] is None
+        assert "malformed" in body["error"] and "being built" in body["error"]
+        assert "delete" not in body["error"]
+    finally:
+        release.set()
+    _join(tdc)
+
+
+def test_a_rebuild_that_leaves_a_cache_that_still_does_not_load_is_a_failure_not_a_loop(client, tdc, graph_host):
+    path, builds, _ = graph_host
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(_CUT)
+    client.get("/api/binary-graph/query?q=imports&module=b.exe")
+    _join(tdc)
+    assert len(builds) == 1                     # the recorder "built" and left the cut file where it was
+    for _ in range(3):
+        body = client.get("/api/binary-graph/query?q=imports&module=b.exe").get_json()
+        _join(tdc)
+        assert body["failed"] and "does not load" in body["failed"]["reason"] and body["building"] is False
+    assert len(builds) == 1
+
+
+def test_a_failure_record_vanishes_once_a_usable_cache_exists_whoever_wrote_it(client, tdc, graph_host):
+    path, builds, _ = graph_host
+    os.remove(path)
+    key = ("26220.5770", "arm64")
+    tdc._binary_graph_build_state["failed"][key] = (tdc.time.time(), "binary_graph.py exited with 1: boom")
+    body = client.get("/api/binary-graph/query?q=imports&module=b.exe").get_json()
+    assert body["failed"]["reason"].endswith("boom") and builds == []          # held back by the record
+    # the provisioning script writes the cache, without the web UI
+    binary_graph.save_graph(_system(), path)
+    r = client.get("/api/binary-graph/query?q=imports&module=b.exe")
+    assert r.status_code == 200
+    assert key not in tdc._binary_graph_build_state["failed"]
+    # and the record holds nothing back any more: the cache gone again, a build starts at once
+    os.remove(path)
+    body = client.get("/api/binary-graph/query?q=imports&module=b.exe").get_json()
+    _join(tdc)
+    assert builds == [key] and body["failed"] is None
