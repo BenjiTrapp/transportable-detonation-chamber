@@ -361,14 +361,21 @@ def path_to_syscall(graph, table, baseline, module: str, function: str) -> Answe
     Nt name that ntdll or win32u exports and the baseline holds), the same edge is "derived" and the path has no
     curated edge at all. A path has at most one curated edge, and it is the last.
 
-    `module` is the importer when the graph holds it and its import table holds `function` (an "imports" edge, derived,
-    labelled with the module it imports it from), else the module the function is looked up in; a module the graph does
-    not know is not drawn as importing anything: the function node is the root, with no edge, and the note says the
-    import could not be confirmed.
+    What `module` means depends on what the graph holds of it, in this order:
+      1. The importer: the graph holds `module`, its import table holds `function`, and it does not itself export or
+         forward that name. The path starts at `module`, with an "imports" edge (derived, labelled with the module it
+         imports `function` from; the first, if it imports it from several, and the note says so) to the function node.
+      2. The exporter: every other case where the graph holds `module`, or knows it as an api set or an imported name.
+         `function` is looked up in `module`, the function node is the root, and no edge claims an import.
+      3. A module the graph does not know: nothing is derived of it, so it is not drawn as importing anything. The
+         function node is the root, with no edge, and the note says the import could not be confirmed.
+    A binary that both imports and exports the same name is read as the exporter (2), never as the importer. What a
+    view or a later task passes in `module` is whatever the user typed, so the reading is decided here, by the graph.
 
     A path ends visibly, never by vanishing, and the note says which end it was: the chain reaches no definition at
     all, the table has no entry for the function it ends at, the table's Nt name is no syscall of the baseline, or
-    there is no table or baseline to ask; and, with any of them, that a table on the chain was cut short when it was
+    there is no baseline or table to ask (a missing baseline is named first: without it nothing can be numbered,
+    whatever the table holds); and, with any of them, that a table on the chain was cut short when it was
     read, so a negative end is not certain. `table` and `baseline` may be None."""
     name = _module_name(graph, module)
     function = (function or "").strip()
@@ -418,14 +425,24 @@ def path_to_syscall(graph, table, baseline, module: str, function: str) -> Answe
         return ended(f"{function} is defined at {end}, after {hops}, and that export is the stub of a syscall itself: "
                      f"no curated step is needed, and the baseline of this build gives {end_function} the number "
                      f"{stub.number:#x} ({stub.number}).", certain=True)
-    if table is None:
-        return ended(f"{end} defines it, but the curated Win32 to Nt table could not be read on this system, so the "
-                     f"step to a syscall cannot be followed.")
     rows = ()
-    for candidate in dict.fromkeys((function, end_function)):
+    for candidate in dict.fromkeys((function, end_function)) if table is not None else ():
         rows = table.entries_for(candidate)
         if rows:
             break
+    if baseline is None:
+        # whatever the table says, nothing can be numbered without a baseline: that is the end, not the table's
+        text = (f"The curated table leads {rows[0].win32} to {rows[0].nt}, but no" if rows else
+                f"{end} defines it, but no")
+        text += " syscall baseline is loaded for this system, so the number of the syscall cannot be given."
+        if table is None:
+            text += " The curated Win32 to Nt table could not be read either."
+        elif len(rows) > 1:
+            text += f" The table lists {_plural(len(rows) - 1, 'more syscall', 'more syscalls')} for it."
+        return ended(text)
+    if table is None:
+        return ended(f"{end} defines it, but the curated Win32 to Nt table could not be read on this system, so the "
+                     f"step to a syscall cannot be followed.")
     if not rows:
         return ended(f"The path ends at {end}, which defines it: no curated transition known from "
                      f"{end_function} to a syscall, so the path ends there.")
@@ -434,9 +451,6 @@ def path_to_syscall(graph, table, baseline, module: str, function: str) -> Answe
     if len(rows) > 1:
         more = (f" The table lists {_plural(len(rows) - 1, 'more syscall', 'more syscalls')} for it "
                 f"({', '.join(row.nt for row in rows[1:])}); this path follows the first.")
-    if baseline is None:
-        return ended(f"The curated table leads {entry.win32} to {entry.nt}, but no syscall baseline is loaded for "
-                     f"this system, so the number of the syscall cannot be given.{more}")
     if entry.nt in table.missing_from(baseline.syscalls):
         ntdll = graph.binaries.get("ntdll.dll")
         exported = ntdll is not None and entry.nt in ntdll.exports

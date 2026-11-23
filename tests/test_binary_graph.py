@@ -2701,9 +2701,25 @@ def test_an_nt_name_the_baseline_does_not_hold_is_no_syscall_by_data(descent_bas
     got = _descend(_descent_system(), "ntdll.dll", "NtCreateThreadEx", descent_baseline)
     assert got.edges == () and not any(node.kind == "syscall" for node in got.nodes)
     assert "no curated transition known" in got.note
-    none = binary_graph_query.path_to_syscall(_descent_system(), win32_to_nt.load_table(), None,
-                                              "ntdll.dll", "NtWriteVirtualMemory")
-    assert not any(node.kind == "syscall" for node in none.nodes)
+
+
+def test_a_missing_baseline_is_named_as_the_end_whether_or_not_a_curated_row_exists():
+    graph, table = _descent_system(), win32_to_nt.load_table()
+    for module, function in (("ntdll.dll", "NtWriteVirtualMemory"),      # an Nt stub: no row, and no baseline to name it
+                             ("user32.dll", "MessageBoxW"),               # no row either
+                             ("kernel32.dll", "WriteProcessMemory")):     # a row
+        got = binary_graph_query.path_to_syscall(graph, table, None, module, function)
+        assert "no syscall baseline is loaded" in got.note, (module, function, got.note)
+        assert "no curated transition known" not in got.note
+        assert not any(node.kind == "syscall" for node in got.nodes)
+        assert not any(edge.origin == "curated" for edge in got.edges)
+    # with a baseline, the end for a function without a row is the row's absence again
+    assert "no curated transition known" in binary_graph_query.path_to_syscall(
+        graph, table, syscall_baseline.parse_baseline(_fixture("arm64"), "26220.5770", "arm64"),
+        "user32.dll", "MessageBoxW").note
+    # both missing: both are said
+    both = binary_graph_query.path_to_syscall(graph, None, None, "user32.dll", "MessageBoxW")
+    assert "baseline" in both.note and "table" in both.note
 
 
 @pytest.mark.parametrize("module, function", [
