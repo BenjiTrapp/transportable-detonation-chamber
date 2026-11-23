@@ -24346,6 +24346,23 @@ function rizinDecompilerMark(lines, current, prefer) {
     return best;
 }
 
+// What a click in the gutter of each line of C acts on (null for a line without an address): the lowest
+// address of the line that carries a breakpoint, else its lowest address, and whether one sits there. The
+// lowest because a breakpoint on a line of C stops before the line, and its offset is only the first of
+// rizin's annotations (pdgo's address), which can be past the call the line is about; one that is set
+// already wins, so that a second click removes it instead of setting another. An instruction may belong to
+// several lines (unlike rizinDecompilerMark, which picks the one line that is "here"): each carries the
+// mark, and a click on any of them removes the same breakpoint.
+function rizinDecompilerStops(lines, breakpoints) {
+    const set = new Set(Array.isArray(breakpoints) ? breakpoints : []);
+    return (Array.isArray(lines) ? lines : []).map(line => {
+        const offsets = rizinLineOffsets(line).sort((a, b) => a - b);
+        if (!offsets.length) return null;
+        const at = offsets.find(o => set.has(o));
+        return { addr: rizinHex(at ?? offsets[0]), set: at !== undefined };
+    });
+}
+
 // A line of rz-ghidra's C as markup: keywords and types, the names of the functions it calls (rizin's names
 // have dots: sym.imp.KERNEL32.dll_Sleep), strings and comments in their colours, everything else as text.
 // Linear: every try at a quote or a comment matches (one that nothing closes takes the rest of the line),

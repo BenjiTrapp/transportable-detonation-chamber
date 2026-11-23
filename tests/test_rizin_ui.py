@@ -150,6 +150,8 @@ RIZIN_FUNCTIONS = [
     # gutter, the four patches of one instruction, the bytes by hand, Run to here
     "rizinSetLists", "rizinLoadMarks", "rizinToggleBreakpoint", "rizinPatchHex", "rizinPatchKinds", "rizinPatchPost",
     "rizinPatchOp", "rizinPatchBytes", "rizinRunToHere", "rizinMenuEntries", "rizinMenuAct", "rizinMenuFinish",
+    # The gutter in DECOMPILER: the address a click on a line of C acts on
+    "rizinDecompilerStops",
 ]
 RIZIN_CONSTS = ["rizinState", "RIZIN_POLL_MS", "RIZIN_HISTORY_MAX", "RIZIN_TAB_KEY", "RIZIN_VIEWS", "RIZIN_GRAPH",
                 "RIZIN_GRAPH_OVERVIEW", "RIZIN_NARROW_PX", "RIZIN_ANSI", "RIZIN_CONSOLE", "RIZIN_CONSOLE_COMMANDS",
@@ -4331,6 +4333,47 @@ def test_rizin_decompiler_marks_a_line_of_code_at_the_place():
                  "only": 0, "clicked": 2, "before": -1}, "a comment was marked although a line of code has the address"
     marked = re.findall(r'<div class="rizin-dec-line current[^"]*" data-line="(\d+)"', html)
     assert marked == ["4"], "the signature line is not the one marked at the function's entry"
+
+
+@needs_node
+def test_rizin_decompiler_stops_pick_the_address_a_click_acts_on():
+    """Review Focus 1, 2 und 3. `offset` ist die erste Annotation in rizins Reihenfolge, nicht die
+    niedrigste Adresse der Zeile (gemessen im Modell: 0x1400015BF steht vor 0x1400015B9), also nimmt
+    ein Klick die niedrigste: "vor dieser Zeile". Trägt irgendeine Adresse der Zeile schon einen
+    Breakpoint, wirkt der Klick auf diese, damit ein zweiter Klick nicht einen weiteren setzt.
+    Gehört ein Befehl zu mehreren C-Zeilen, tragen alle die Marke."""
+    r = _run(r"""
+        const brace = { text: '{', offset: null, offsets: [] };
+        const iff = { text: '    if (argc < 3) {', offset: 0x1400014c5, offsets: [0x1400014c5, 0x1400014c8] };
+        const pipe = { text: '    hPipe = CreateNamedPipeA(lpName);', offset: 0x1400015bf,
+                       offsets: [0x1400015b9, 0x1400015bf] };
+        const only = { text: '    y = 1;', offset: 0x1000 };
+        const appended = { text: '    z = 2;', offset: 0x9, offsets: [0x10, 0x20] };
+        const shared = [{ text: '    if (x) {', offset: 0x1000, offsets: [0x1000] },
+                        { text: '        y = 1;', offset: 0x1000, offsets: [0x1000, 0x1004] }];
+        console.log(JSON.stringify({
+            none: rizinDecompilerStops([brace, iff, pipe], []),
+            high: rizinDecompilerStops([pipe], [0x1400015bf]),
+            low: rizinDecompilerStops([pipe], [0x1400015b9]),
+            both: rizinDecompilerStops([pipe], [0x1400015b9, 0x1400015bf]),
+            elsewhere: rizinDecompilerStops([only], [0x9000]),
+            offsetOnly: rizinDecompilerStops([only], []),
+            appended: rizinDecompilerStops([appended], []),
+            shared: rizinDecompilerStops(shared, [0x1000]),
+        }));
+    """, SORT_DOM + _rizin_prelude())
+    assert r["none"] == [None, {"addr": "0x1400014c5", "set": False}, {"addr": "0x1400015b9", "set": False}], \
+        "a line without an address is clickable, or the click does not take the line's lowest address"
+    assert r["high"] == [{"addr": "0x1400015bf", "set": True}], "a breakpoint inside the line is not found"
+    assert r["low"] == [{"addr": "0x1400015b9", "set": True}]
+    assert r["both"] == [{"addr": "0x1400015b9", "set": True}], \
+        "with two set the lowest must win, or one stays behind after a click"
+    assert r["elsewhere"] == [{"addr": "0x1000", "set": False}], "a breakpoint of another function marks a line"
+    assert r["offsetOnly"] == [{"addr": "0x1000", "set": False}], "a line with only `offset` is skipped"
+    assert r["appended"] == [{"addr": "0x9", "set": False}], \
+        "an `offset` that `offsets` lacks and that is the lowest is not the one taken (or the sort is not numeric)"
+    assert r["shared"] == [{"addr": "0x1000", "set": True}, {"addr": "0x1000", "set": True}], \
+        "an instruction that belongs to two C lines marks only one of them"
 
 
 @needs_node
