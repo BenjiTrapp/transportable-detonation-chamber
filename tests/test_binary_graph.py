@@ -6,11 +6,13 @@ import re
 
 import pytest
 
+import binary_graph
 import memory_evidence
 import syscall_baseline
 import syscall_scan
 import win32_to_nt
-from test_syscalls import (_PRIVATE_BASE, _X64_STUB_0x3A, _fixture, _pe_importing, _x64_space,  # noqa: F401
+from conftest import make_pe
+from test_syscalls import (_PRIVATE_BASE, _X64_STUB_0x3A, _fixture, _x64_space,  # noqa: F401
                            sample_dir, target)
 
 
@@ -228,7 +230,7 @@ def test_without_an_import_table_the_table_changes_nothing(x64_baseline):
 def _loader(sample_dir, *imports, name="loader.exe"):
     """A PE in the readable folders that imports `imports` and carries a stub for NtWriteVirtualMemory."""
     path = sample_dir / name
-    path.write_bytes(_pe_importing(*imports) + _X64_STUB_0x3A)
+    path.write_bytes(make_pe(imports=(("ntdll.dll", imports),)) + _X64_STUB_0x3A)
     return path
 
 
@@ -328,7 +330,7 @@ def test_the_stage_searches_the_process_before_it_reads_the_sample_file(tdc, tar
 
 def _exported_stub_hit(client, sample_dir, exports, export_rva=None):
     path = sample_dir / "module.dll"
-    path.write_bytes(_pe_importing(exports=exports, code=_X64_STUB_0x3A, export_rva=export_rva))
+    path.write_bytes(make_pe(exports=exports, code=_X64_STUB_0x3A, export_rva=export_rva))
     body = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()
     [hit] = [h for h in body["hits"] if h["offset"] == 0x3C0]
     return hit
@@ -368,9 +370,9 @@ def test_a_sample_file_that_is_no_pe_keeps_import_present_unknown(tdc, target, s
 
 def test_a_delay_loaded_import_counts_as_an_import(tdc, client, target, sample_dir):
     # the import table now speaks for an absence: a function the sample delay-loads is still a path it has
-    assert tdc._pe_import_names(_pe_importing("WriteProcessMemory", delay=True)) == {"WriteProcessMemory"}
+    assert tdc._pe_import_names(make_pe(delay=(("ntdll.dll", ("WriteProcessMemory",)),))) == {"WriteProcessMemory"}
     path = sample_dir / "lazy.exe"
-    path.write_bytes(_pe_importing("WriteProcessMemory", delay=True) + _X64_STUB_0x3A)
+    path.write_bytes(make_pe(delay=(("ntdll.dll", ("WriteProcessMemory",)),)) + _X64_STUB_0x3A)
     body = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()
     assert body["hits"][0]["import_present"] is True
 
@@ -510,3 +512,174 @@ def test_the_detail_of_a_hint_does_not_attribute_what_it_says_cannot_be(x64_base
 def test_the_process_search_says_at_its_signature_who_may_pass_an_expanded_set():
     doc = syscall_scan.find_stubs_in_process.__doc__
     assert "every loaded module" in doc and "single image" in doc
+
+
+# --- one binary: what it imports, exports and forwards ------------------------------------
+
+def test_the_test_pe_builder_produces_an_image_pefile_reads_back():
+    # two import modules, an export, a forwarder, a named section and arm64 machine, all read back through pefile
+    import pefile
+    data = make_pe(imports=(("ntdll.dll", ("NtClose", 7)), ("KERNELBASE.dll", ("CreateFileW",))),
+                   delay=(("user32.dll", ("MessageBoxW",)),),
+                   exports=("OwnFunction",), forwarders=(("HeapAlloc", "NTDLL.RtlAllocateHeap"),),
+                   code=_X64_STUB_0x3A, machine=0xAA64, sections=((".apiset", b"apiset-bytes"),))
+    pe = pefile.PE(data=data)
+    try:
+        assert pe.FILE_HEADER.Machine == 0xAA64
+        assert [(e.dll, [i.name or i.ordinal for i in e.imports]) for e in pe.DIRECTORY_ENTRY_IMPORT] == [
+            (b"ntdll.dll", [b"NtClose", 7]), (b"KERNELBASE.dll", [b"CreateFileW"])]
+        assert [(e.dll, [i.name for i in e.imports]) for e in pe.DIRECTORY_ENTRY_DELAY_IMPORT] == [
+            (b"user32.dll", [b"MessageBoxW"])]
+        symbols = {s.name: s for s in pe.DIRECTORY_ENTRY_EXPORT.symbols}
+        assert set(symbols) == {b"OwnFunction", b"HeapAlloc"}
+        assert symbols[b"OwnFunction"].forwarder is None and symbols[b"OwnFunction"].address == 0x11C0
+        assert symbols[b"HeapAlloc"].forwarder == b"NTDLL.RtlAllocateHeap"
+        apiset = [s for s in pe.sections if s.Name.rstrip(b"\0") == b".apiset"]
+        assert [s.get_data()[:12] for s in apiset] == [b"apiset-bytes"]
+        # the code still sits at RVA 0x11C0, file offset 0x3C0
+        assert pe.get_offset_from_rva(0x11C0) == 0x3C0 and data[0x3C0:0x3C0 + len(_X64_STUB_0x3A)] == _X64_STUB_0x3A
+    finally:
+        pe.close()
+    assert pefile.PE(data=make_pe()).FILE_HEADER.Machine == 0x8664
+
+
+def _binary(tmp_path, name="sample.dll", **pe):
+    path = tmp_path / name
+    path.write_bytes(make_pe(**pe))
+    return binary_graph.extract_binary(str(path))
+
+
+def test_imports_are_grouped_by_module_in_lower_case(tmp_path):
+    info = _binary(tmp_path, "Sample.DLL", imports=(("NTDLL.dll", ("NtClose", "NtOpenFile")),
+                                                    ("KernelBase.dll", ("CreateFileW",))),
+                   delay=(("USER32.dll", ("MessageBoxW",)),))
+    assert info.name == "sample.dll" and info.kind == "dll"
+    assert info.imports == {"ntdll.dll": ("NtClose", "NtOpenFile"), "kernelbase.dll": ("CreateFileW",),
+                            "user32.dll": ("MessageBoxW",)}
+    assert _binary(tmp_path, "tool.exe").kind == "exe"
+
+
+def test_exports_this_image_defines_itself_are_listed_without_the_forwarders(tmp_path):
+    info = _binary(tmp_path, exports=("CreateFileW", "CloseHandle"),
+                   forwarders=(("HeapAlloc", "NTDLL.RtlAllocateHeap"),))
+    assert info.exports == ("CreateFileW", "CloseHandle")
+    assert set(info.forwarders) == {"HeapAlloc"}
+    assert _binary(tmp_path, imports=(("ntdll.dll", ("NtClose",)),)).exports == ()
+
+
+def test_a_forwarder_is_kept_as_the_raw_string_it_names(tmp_path):
+    info = _binary(tmp_path, forwarders=(("WriteProcessMemory", "api-ms-win-core-memory-l1-1-0.WriteProcessMemory"),
+                                         ("HeapAlloc", "NTDLL.RtlAllocateHeap")))
+    assert info.forwarders == {"WriteProcessMemory": "api-ms-win-core-memory-l1-1-0.WriteProcessMemory",
+                               "HeapAlloc": "NTDLL.RtlAllocateHeap"}
+    assert info.exports == ()
+
+
+def test_an_import_by_ordinal_is_named_hash_number(tmp_path):
+    info = _binary(tmp_path, imports=(("ws2_32.dll", (115, "connect")),))
+    assert info.imports == {"ws2_32.dll": ("#115", "connect")}
+
+
+def test_the_machine_of_an_arm64_image_is_arm64_and_of_an_amd64_image_x64(tmp_path):
+    assert _binary(tmp_path, machine=0xAA64).machine == "arm64"
+    assert _binary(tmp_path, machine=0x8664).machine == "x64"
+    assert _binary(tmp_path, machine=0x14C).machine == "x86"
+    assert _binary(tmp_path, machine=0x1C4).machine == "other"
+
+
+# --- a directory of them ------------------------------------------------------------------
+
+def test_the_tree_holds_every_pe_of_the_directory_and_names_the_others_as_skipped(tmp_path):
+    (tmp_path / "kernel32.dll").write_bytes(make_pe(forwarders=(("HeapAlloc", "NTDLL.RtlAllocateHeap"),)))
+    (tmp_path / "notepad.exe").write_bytes(make_pe(imports=(("kernel32.dll", ("HeapAlloc",)),)))
+    (tmp_path / "readme.dll").write_bytes(b"this is no PE")
+    (tmp_path / "notes.txt").write_bytes(make_pe())            # only .dll and .exe are read
+    (tmp_path / "en-US.dll").mkdir()                           # a directory, whatever its name
+    (tmp_path / "en-US.dll" / "inner.dll").write_bytes(make_pe())
+    binaries, skipped = binary_graph.extract_tree(str(tmp_path))
+    assert [b.name for b in binaries] == ["kernel32.dll", "notepad.exe"]
+    assert binaries[0].forwarders == {"HeapAlloc": "NTDLL.RtlAllocateHeap"}
+    assert [name for name, _ in skipped] == ["readme.dll"]
+
+
+def test_a_name_that_differs_only_in_case_is_one_binary(tmp_path, monkeypatch):
+    (tmp_path / "KERNEL32.DLL").write_bytes(make_pe(exports=("CreateFileW",)))
+    (tmp_path / "kernel32.dll").write_bytes(make_pe(exports=("CreateFileW",)))   # the same file where case folds
+    (tmp_path / "Notepad.Exe").write_bytes(make_pe())
+    # both spellings listed, as a case-sensitive file system lists them, on every platform the suite runs on
+    real_listdir = os.listdir
+    monkeypatch.setattr(os, "listdir", lambda d: sorted(set(real_listdir(d)) | {"KERNEL32.DLL", "kernel32.dll"}))
+    binaries, skipped = binary_graph.extract_tree(str(tmp_path))
+    assert [b.name for b in binaries] == ["kernel32.dll", "notepad.exe"]
+    assert [b.kind for b in binaries] == ["dll", "exe"]
+    # the second spelling is named, never silently dropped
+    assert skipped == [("kernel32.dll", "the same name as kernel32.dll in another case")]
+
+
+# --- a broken file among 4,000 -------------------------------------------------------------
+
+def test_a_file_that_is_not_a_pe_is_skipped_with_a_reason_and_the_others_still_extract(tmp_path):
+    (tmp_path / "a.dll").write_bytes(make_pe(exports=("A",)))
+    (tmp_path / "b.dll").write_bytes(b"MZ but nothing after it")
+    (tmp_path / "c.exe").write_bytes(b"")
+    (tmp_path / "d.dll").write_bytes(make_pe(exports=("D",)))
+    binaries, skipped = binary_graph.extract_tree(str(tmp_path))
+    assert [b.name for b in binaries] == ["a.dll", "d.dll"]
+    assert [name for name, _ in skipped] == ["b.dll", "c.exe"]
+    for _, reason in skipped:
+        assert reason.startswith("not a PE: ") and "Error" not in reason and len(reason) < 120, reason
+    with pytest.raises(binary_graph.ExtractError, match="^not a PE"):
+        binary_graph.extract_binary(str(tmp_path / "b.dll"))
+
+
+def test_a_file_that_cannot_be_opened_is_skipped_with_a_reason(tmp_path, monkeypatch):
+    (tmp_path / "locked.dll").write_bytes(make_pe())
+    (tmp_path / "fine.dll").write_bytes(make_pe())
+    real_open = open
+
+    def refusing_open(file, *args, **kwargs):
+        if str(file).endswith("locked.dll"):
+            raise PermissionError(13, "Permission denied")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", refusing_open)
+    binaries, skipped = binary_graph.extract_tree(str(tmp_path))
+    assert [b.name for b in binaries] == ["fine.dll"]
+    assert skipped == [("locked.dll", "cannot be opened: Permission denied")]
+    # and a directory that cannot be listed is one skipped entry, not an exception
+    assert binary_graph.extract_tree(str(tmp_path / "gone")) == (
+        [], [(str(tmp_path / "gone"), "cannot be listed: No such file or directory")])
+
+
+def test_a_pe_truncated_after_its_headers_is_skipped_and_does_not_raise(tmp_path):
+    whole = make_pe(imports=(("ntdll.dll", ("NtClose",)),), exports=("A",))
+    (tmp_path / "cut.dll").write_bytes(whole[:0x200])          # the headers, and not one byte of the section
+    (tmp_path / "half.dll").write_bytes(whole[:0x300])
+    (tmp_path / "whole.dll").write_bytes(whole)
+    binaries, skipped = binary_graph.extract_tree(str(tmp_path))
+    assert [b.name for b in binaries] == ["whole.dll"]
+    assert [name for name, _ in skipped] == ["cut.dll", "half.dll"]
+    for _, reason in skipped:
+        assert reason.startswith("truncated: "), reason
+
+
+def test_a_file_larger_than_the_cap_is_skipped_unread(tmp_path, monkeypatch):
+    (tmp_path / "huge.dll").write_bytes(make_pe())
+    monkeypatch.setattr(binary_graph, "MAX_BINARY_SIZE", 0x200)
+    assert binary_graph.extract_tree(str(tmp_path)) == ([], [("huge.dll", "larger than 512 bytes")])
+
+
+def test_no_exception_of_the_parser_escapes_the_tree(tmp_path, monkeypatch):
+    (tmp_path / "odd.dll").write_bytes(make_pe(machine=0x1C4))
+    (tmp_path / "fine.dll").write_bytes(make_pe())
+    real = binary_graph._exports
+
+    def exports(pe):
+        if pe.FILE_HEADER.Machine == 0x1C4:
+            raise ValueError("unpack requires a buffer of 4 bytes")
+        return real(pe)
+
+    monkeypatch.setattr(binary_graph, "_exports", exports)
+    binaries, skipped = binary_graph.extract_tree(str(tmp_path))
+    assert [b.name for b in binaries] == ["fine.dll"]
+    assert skipped == [("odd.dll", "malformed: ValueError")]

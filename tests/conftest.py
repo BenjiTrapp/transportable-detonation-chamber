@@ -133,6 +133,102 @@ def make_alert(i, pid, ts, image, ppid=None, parent_name="", engine="sigma",
     return alert
 
 
+def make_pe(*, imports=(), delay=(), exports=(), forwarders=(), code=b"",
+            export_rva=None, machine=0x8664, sections=()) -> bytes:
+    """A minimal PE whose directories pefile parses.
+
+    imports, delay: (module, (function, ...)) pairs — several modules, not one; an int function is an ordinal
+    exports:        names this image defines itself
+    forwarders:     (name, "MODULE.Function") pairs
+    sections:       (name, bytes) pairs, for a section such as ".apiset"
+    machine:        0x8664 x64, 0xAA64 arm64
+
+    A PE32+ whose first section starts at RVA 0x1000, file offset 0x200. `code` sits at RVA 0x11C0, file offset
+    0x3C0, where the exports point unless `export_rva` says otherwise (without code, at 0x1000); the tables follow
+    it. A forwarder's address is the RVA of its string inside the export directory's Size window: that, and only
+    that, is what makes pefile report `forwarder`. Without imports or delay there is no such directory at all."""
+    import struct
+    base, code_at = 0x1000, 0x1C0
+    body = bytearray(code_at) + code
+
+    def align(n):
+        body.extend(bytes(-len(body) % n))
+
+    def put(blob, n=8):
+        align(n)
+        rva = base + len(body)
+        body.extend(blob)
+        return rva
+
+    def name_table(functions):
+        entries = []
+        for function in functions:
+            if isinstance(function, int):
+                entries.append(1 << 63 | function)
+            else:
+                entries.append(put(struct.pack("<H", 0) + function.encode() + b"\0", 2))
+        return put(struct.pack(f"<{len(entries) + 1}Q", *entries, 0))
+
+    descriptors = b""
+    for module, functions in imports:
+        dll, table = put(module.encode() + b"\0", 2), name_table(functions)
+        descriptors += struct.pack("<IIIII", table, 0, 0, dll, table)
+    import_dir = (put(descriptors + bytes(20), 4), len(descriptors) + 20) if imports else None
+    descriptors = b""
+    for module, functions in delay:
+        dll, table, handle = put(module.encode() + b"\0", 2), name_table(functions), put(bytes(8))
+        descriptors += struct.pack("<IIIIIIII", 1, dll, handle, table, table, 0, 0, 0)
+    delay_dir = (put(descriptors + bytes(32), 4), len(descriptors) + 32) if delay else None
+
+    export_dir = None
+    entries = [(name, None) for name in exports] + list(forwarders)
+    if entries:
+        align(4)
+        start, n = base + len(body), len(entries)
+        functions_at = start + 40
+        names_at, ordinals_at = functions_at + 4 * n, functions_at + 8 * n
+        strings = bytearray()
+
+        def string(text):
+            rva = ordinals_at + 2 * n + len(strings)
+            strings.extend(text.encode() + b"\0")
+            return rva
+
+        image_name = string("image.dll")
+        name_rvas = [string(name) for name, _ in entries]
+        target = export_rva if export_rva is not None else (base + code_at if code else base)
+        addresses = [target if forwarder is None else string(forwarder) for _, forwarder in entries]
+        block = struct.pack("<IIHHIIIIIII", 0, 0, 0, 0, image_name, 1, n, n, functions_at, names_at, ordinals_at)
+        block += struct.pack(f"<{n}I", *addresses) + struct.pack(f"<{n}I", *name_rvas)
+        block += struct.pack(f"<{n}H", *range(n)) + bytes(strings)
+        export_dir = (put(block, 1), len(block))
+    align(0x200)
+
+    assert len(sections) <= 3, "the section headers must fit before file offset 0x200"
+    layout = [(b".idata", bytes(body))] + [(name.encode(), data) for name, data in sections]
+    headers, rva, offset = b"", base, 0x200
+    for name, data in layout:
+        raw = len(data) + (-len(data) % 0x200)
+        headers += struct.pack("<8sIIIIIIHHI", name, len(data), rva, raw, offset, 0, 0, 0, 0, 0x40000040)
+        rva += len(data) + (-len(data) % 0x1000)
+        offset += raw
+    optional = struct.pack("<HBBIIIII", 0x20B, 14, 0, 0, 0x200, 0, 0, 0x1000)
+    optional += struct.pack("<QIIHHHHHHIIIIHH", 0x140000000, 0x1000, 0x200, 6, 0, 0, 0, 6, 0, 0, rva, 0x200, 0, 3, 0)
+    optional += struct.pack("<QQQQII", 0x100000, 0x1000, 0x100000, 0x1000, 0, 16)
+    directories = bytearray(128)
+    for index, entry in ((0, export_dir), (1, import_dir), (13, delay_dir)):
+        if entry:
+            directories[index * 8:index * 8 + 8] = struct.pack("<II", *entry)
+    optional += bytes(directories)
+    assert len(optional) == 0xF0
+    coff = struct.pack("<HHIIIHH", machine, len(layout), 0, 0, 0, 0xF0, 0x22)
+    header = b"MZ" + bytes(0x3A) + struct.pack("<I", 0x40) + b"PE\0\0" + coff + optional + headers
+    out = header.ljust(0x200, b"\0")
+    for _, data in layout:
+        out += data + bytes(-len(data) % 0x200)
+    return out
+
+
 # --- FIREWALL tab -------------------------------------------------------------------------------
 
 

@@ -20,6 +20,7 @@ import memory_evidence
 import syscall_baseline
 import syscall_rules
 import syscall_scan
+from conftest import make_pe
 
 SAMPLES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples")
 
@@ -3319,71 +3320,18 @@ def test_a_file_says_whether_it_imports_the_function_through_the_win32_to_nt_tab
         assert hit["import_present"] is present, imports
 
 
-def _pe_importing(*names, delay=False, exports=(), code=b"", export_rva=None):
-    """A minimal PE32+ whose import table lists `names` from one DLL; with `delay`, its delay-load import table.
-    `exports` are names it exports; without `names` it has no import directory at all. `code` is placed in the
-    section at file offset 0x3C0 (RVA 0x11C0), where the exports point unless `export_rva` says otherwise."""
-    import struct
-    base, ilt, dll = 0x1000, 0x1040, 0x1080
-    hints, at = b"", 0x10A0
-    thunks = b""
-    for name in names:
-        thunks += struct.pack("<Q", at)
-        entry = struct.pack("<H", 0) + name.encode() + b"\0"
-        entry += b"\0" * (len(entry) % 2)
-        hints, at = hints + entry, at + len(entry)
-    section = bytearray(0x200)
-    if delay:
-        section[0:64] = struct.pack("<IIIIIIII", 1, dll, 0x1090, ilt, ilt, 0, 0, 0) + bytes(32)
-    else:
-        section[0:40] = struct.pack("<IIIII", ilt, 0, 0, dll, ilt) + bytes(20)
-    section[0x40:0x40 + len(thunks)] = thunks
-    section[0x80:0x80 + 10] = b"ntdll.dll\0"
-    section[0xA0:0xA0 + len(hints)] = hints
-    section[0x1C0:0x1C0 + len(code)] = code
-    if exports:
-        n, strings, at = len(exports), b"", 0x1160
-        name_rvas = []
-        for name in exports:
-            name_rvas.append(at)
-            strings += name.encode() + b"\0"
-            at += len(name) + 1
-        section[0x100:0x128] = struct.pack("<IIHHIIIIIII", 0, 0, 0, 0, dll, 1, n, n, 0x1128, 0x1140, 0x1158)
-        target = export_rva if export_rva is not None else (0x11C0 if code else base)
-        section[0x128:0x128 + 4 * n] = struct.pack(f"<{n}I", *([target] * n))
-        section[0x140:0x140 + 4 * n] = struct.pack(f"<{n}I", *name_rvas)
-        section[0x158:0x158 + 2 * n] = struct.pack(f"<{n}H", *range(n))
-        section[0x160:0x160 + len(strings)] = strings
-    optional = struct.pack("<HBBIIIII", 0x20B, 14, 0, 0, 0x200, 0, 0, 0x1000)
-    optional += struct.pack("<QIIHHHHHHIIIIHH", 0x140000000, 0x1000, 0x200, 6, 0, 0, 0, 6, 0, 0, 0x2000, 0x200, 0, 3, 0)
-    optional += struct.pack("<QQQQII", 0x100000, 0x1000, 0x100000, 0x1000, 0, 16)
-    directories = bytearray(128)
-    if exports:
-        directories[0:8] = struct.pack("<II", base + 0x100, 0x28)
-    if delay:
-        directories[13 * 8:14 * 8] = struct.pack("<II", base, 64)
-    elif names:
-        directories[8:16] = struct.pack("<II", base, 40)
-    optional += bytes(directories)
-    assert len(optional) == 0xF0
-    coff = struct.pack("<HHIIIHH", 0x8664, 1, 0, 0, 0, 0xF0, 0x22)
-    header = b"MZ" + bytes(0x3A) + struct.pack("<I", 0x40) + b"PE\0\0" + coff + optional
-    header += struct.pack("<8sIIIIIIHHI", b".idata", 0x200, base, 0x200, 0x200, 0, 0, 0, 0, 0x40000040)
-    return header.ljust(0x200, b"\0") + bytes(section)
-
-
 def test_the_imports_of_a_pe_are_read_and_a_file_that_is_none_is_unread(tdc):
-    assert tdc._pe_import_names(_pe_importing("NtWriteVirtualMemory", "CreateFileW")) == {
+    assert tdc._pe_import_names(make_pe(imports=(("ntdll.dll", ("NtWriteVirtualMemory", "CreateFileW")),))) == {
         "NtWriteVirtualMemory", "CreateFileW"}
     assert tdc._pe_import_names(b"not a pe at all") is None
     assert tdc._pe_import_names(b"") is None
-    assert tdc._pe_import_names(_pe_importing("NtClose")[:0x60]) is None
+    assert tdc._pe_import_names(make_pe(imports=(("ntdll.dll", ("NtClose",)),))[:0x60]) is None
 
 
 def test_a_pe_that_carries_a_stub_and_imports_it_says_so(client, tdc, target,
                                                                                          sample_dir):
     path = sample_dir / "loader.exe"
-    path.write_bytes(_pe_importing("NtWriteVirtualMemory") + _X64_STUB_0x3A)
+    path.write_bytes(make_pe(imports=(("ntdll.dll", ("NtWriteVirtualMemory",)),)) + _X64_STUB_0x3A)
     body = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()
     assert body["imports_read"] is True and body["hits"][0]["import_present"] is True
 
