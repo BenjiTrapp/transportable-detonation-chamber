@@ -27,7 +27,7 @@ OUT = "const out = value => console.log(JSON.stringify(value));\n"
 
 # What every function of the block may call: the helpers of the page and the block's own small ones and constants
 HELPERS = ["escapeHtml", "jsArg", "jsInt", "cssToken", "syscallHex"]
-BLOCK_CONSTS = ["SYSCALL_STATES", "SYSCALL_STATE_COLORS", "SYSCALL_STATE_HELP", "SYSCALL_MODULES", "SYSCALL_DOC_URL",
+BLOCK_CONSTS = ["SYSCALL_STATES", "SYSCALL_STATE_COLORS", "SYSCALL_STATE_HELP", "SYSCALL_MODULES", "SYSCALL_DOC_URL", "SYSCALL_WINGRAPH_URL",
                 "SYSCALL_SEVERITY_RANK", "SYSCALL_ROWS_MAX"]
 
 
@@ -435,11 +435,12 @@ FLOW_FUNCTIONS = [
     "syscallOpenRizin", "syscallCopySignature", "syscallCopyDraft", "syscallCloseDraft", "syscallScores", "renderSyscallDeviationPanel",
     "syscallDraftRule", "renderSyscallDraft", "applySyscallRule", "syscallHooksModel", "renderSyscallHooks", "syscallLoadHooks",
     "syscallCaptureHooks", "syscallClearHooks", "syscallSetPane", "syscallModel", "syscallRepaintCells", "syscallShowDraft",
-    "syscallCopyText",
+    "syscallCopyText", "syscallTargetProcess", "syscallStubsModel", "renderSyscallStubs", "renderSyscallStubsPanel", "runSyscallStubs",
+    "syscallRequestDraft", "syscallDraftStubRule",
 ]
 FLOW_CONSTS = ["SYSCALL_STATES", "SYSCALL_STATE_COLORS", "SYSCALL_STATE_HELP", "SYSCALL_MODULES", "SYSCALL_MAP",
                "SYSCALL_ROWS_MAX", "SYSCALL_PAGE", "SYSCALL_POLL_MS", "SYSCALL_VIEW_NAMES", "syscallState",
-               "SYSCALL_DOC_URL", "SYSCALL_SYSTEM_DIR", "SYSCALL_NARROW", "SYSCALL_PANE_NAMES", "SYSCALL_SEVERITY_RANK"]
+               "SYSCALL_DOC_URL", "SYSCALL_WINGRAPH_URL", "SYSCALL_SYSTEM_DIR", "SYSCALL_NARROW", "SYSCALL_PANE_NAMES", "SYSCALL_SEVERITY_RANK"]
 
 # Just enough page for the tab: elements that hold children, attributes and listeners, a canvas that writes down
 # what is painted on it, a fetch that answers from a table of routes, and timers that wait to be fired
@@ -484,12 +485,14 @@ const ids = ['syscalls-subtitle', 'syscall-view-map', 'syscall-view-graph', 'sys
              'syscall-win32u', 'syscall-scan', 'syscall-filter', 'syscall-module-filter', 'syscall-notices',
              'syscall-scan-result', 'syscall-legend', 'syscall-map', 'syscall-tip', 'syscall-catalog-head', 'syscall-rows',
              'syscall-work', 'syscall-pane-map', 'syscall-pane-detail', 'syscall-detail-body', 'syscall-draft',
-             'syscall-deviations', 'syscall-deviations-head', 'syscall-hooks', 'syscall-hooks-head'];
+             'syscall-deviations', 'syscall-deviations-head', 'syscall-hooks', 'syscall-hooks-head',
+             'syscall-stubs', 'syscall-stubs-body', 'syscall-stubs-head', 'syscall-stubs-run', 'syscall-lower'];
 const els = Object.fromEntries(ids.map(id => [id, Object.assign(new Node('div'), { id })]));
 els['syscall-view-graph'].disabled = true;
 els['syscall-map'].parentElement = Object.assign(new Node('div'), { boxWidth: 800 });
 els['syscall-tip'].hidden = true;
 els['syscall-draft'].hidden = true;
+els['syscall-stubs'].hidden = true;
 els['syscall-work'].dataset.pane = 'map';
 globalThis.window = globalThis;
 globalThis.devicePixelRatio = 2;
@@ -523,7 +526,8 @@ const baselineRoute = (url) => {
     return { body: { items: ALL.slice(offset, offset + limit), total: ALL.length, offset, limit, build: '26220.5770',
                      view: q.get('view') || 'arm64', symbols: true } };
 };
-const PROCESSES = { '4242': { pid: 4242, name: 'sample.exe', exit_time: null }, '12': { pid: 12, name: 'alpha.exe', exit_time: null } };
+const PROCESSES = { '4242': { pid: 4242, name: 'sample.exe', image: 'C:\\Users\\x\\sample.exe', exit_time: null },
+                    '12': { pid: 12, name: 'alpha.exe', exit_time: null } };
 // What the server answers to a scan of the 600 ntdll syscalls, the named ones in the state given
 const scanBody = (deviations = {}) => {
     const named = Object.keys(deviations).length;
@@ -1844,6 +1848,212 @@ def test_a_hover_that_crosses_a_cell_paints_the_two_cells_of_its_own_band_and_no
     assert r["leave"] == {"clears": 1, "hover": ""}, "leaving draws the one cell that was ringed"
 
 
+# --- The stub search: the sample's own syscall stubs --------------------------------
+
+STUB_FUNCTIONS = ["renderSyscallStubs", "syscallNoticesHtml", "syscallBytesOf", "syscallOwnerHtml"]
+HIT = ("{ syscall: 'NtWriteVirtualMemory', number: 58, module: 'ntdll.dll', address: 0x7ffa0000, view: 'arm64', pattern: 'SVC; RET',"
+       " stub_hex: '010300d4c0035fd6', import_present: null, number_known: true, source: 'process' }")
+
+
+def _stubs(model):
+    return _run_node(STUB_FUNCTIONS, "out(renderSyscallStubs(%s));" % model)
+
+
+@needs_node
+def test_a_hit_names_the_syscall_the_number_where_it_was_found_and_the_pattern():
+    html = _stubs("{ hits: [%s, { ...%s, source: 'file', address: undefined, offset: 0x400, syscall: 'NtOpenProcess', number: 38 }] }" % (HIT, HIT))
+    rows = html.split("<tr")
+    process, file = next(r for r in rows if "NtWriteVirtualMemory" in r), next(r for r in rows if "NtOpenProcess" in r)
+    assert "0x3A" in process and "process memory 0x7FFA0000" in process and "SVC; RET" in process
+    assert "file offset 0x400" in file and "0x26" in file
+    assert 'data-sortable' in html and 'data-sort-id="syscall-stubs"' in html
+
+
+@needs_node
+def test_a_number_this_build_does_not_have_is_its_own_thing():
+    html = _stubs("{ hits: [{ ...%s, syscall: null, number: 4000, number_known: false }, %s] }" % (HIT, HIT))
+    odd = next(r for r in html.split("<tr") if "0xFA0" in r)
+    assert "not in this build" in odd and "another Windows build" in odd
+    assert "null" not in odd and "NtWriteVirtualMemory" not in odd
+    known = next(r for r in html.split("<tr") if "NtWriteVirtualMemory" in r)
+    assert "not in this build" not in known and "in this build" in known
+
+
+@needs_node
+def test_an_unknown_import_table_is_never_read_as_not_imported():
+    r = _run_node(STUB_FUNCTIONS, r"""
+      const hit = (extra) => ({ syscall: 'NtFoo', number: 1, address: 4096, view: 'x64', pattern: 'p', stub_hex: '4c8bd1b8', number_known: true, source: 'process', ...extra });
+      out({ unknown: renderSyscallStubs({ hits: [hit({ import_present: null })] }), missing: renderSyscallStubs({ hits: [hit({})] }),
+            yes: renderSyscallStubs({ hits: [hit({ import_present: true })] }), no: renderSyscallStubs({ hits: [hit({ import_present: false })] }) });""")
+    for key in ("unknown", "missing"):
+        assert "unknown" in r[key] and "not imported" not in r[key].lower() and "never imported" not in r[key].lower(), key
+        assert "proves nothing" in r[key], "the table says why a missing import means nothing"
+    assert "imported too" in r["yes"] and "not imported" not in r["yes"].lower()
+    assert "not imported" in r["no"].lower()
+
+
+@needs_node
+def test_the_list_says_hint_and_does_not_claim_a_bypass():
+    html = _stubs("{ hits: [%s] }" % HIT)
+    low = html.lower()
+    assert "hints, not proof" in low and "hint" in low
+    assert "could prove a bypass" in low and "win32 to nt table" in low, "it says what would be needed to prove a bypass"
+    assert "bypass is proven" not in low and "proves a bypass" not in low
+
+
+@needs_node
+def test_an_empty_search_is_not_called_clean_when_it_was_partial():
+    r = _run_node(STUB_FUNCTIONS, r"""out({ none: renderSyscallStubs({ hits: [], partial: false }), partial: renderSyscallStubs({ hits: [], partial: true }) });""")
+    assert "No syscall stub of its own" in r["none"] and "not a clean result" not in r["none"]
+    assert "not a clean result" in r["partial"]
+    assert r["none"].count("data-sort-skip") == 1
+
+
+@needs_node
+def test_hits_and_notes_are_escaped_and_the_draft_button_names_the_hit_by_number_only():
+    html = _stubs(r"""{ hits: [{ syscall: '<img src=x onerror=alert(1)>', number: '<b>', address: '<i>', view: '<u>', pattern: '<s>', stub_hex: '4c8bd1b8',
+        number_known: true, source: 'process' }, %s, { ...%s, stub_hex: null }],
+        notes: [{ tone: 'warn', text: '<script>x</script>' }], summary: '<em>sum</em>' }""" % (HIT, HIT))
+    assert "<img" not in html and "<script" not in html and "<em>" not in html and "<b>" not in html
+    handlers = [a["onclick"] for t, a in _Attributes(html).elements if "onclick" in a]
+    assert handlers == ["syscallDraftStubRule(1)"], "a hit with no bytes or a number that is no number makes no rule; the others are named by index"
+
+
+# The tab at work: the search, its two ways in, the draft per hit and the chain to apply
+STUBS_FLOW = r"""
+const stubHit = (extra = {}) => ({ syscall: 'NtWriteVirtualMemory', number: 58, module: 'ntdll.dll', view: 'arm64', pattern: 'SVC; RET',
+    stub_hex: '3a0300d4c0035fd6', import_present: null, number_known: true, ...extra });
+const stubsRoute = (url, options) => { const body = JSON.parse(options.body);
+    if (body.pid) return { body: { mode: 'process', pid: body.pid, view: 'arm64', build: '26220.5770', partial: false, regions_searched: 3, note: '',
+                                   hits: [stubHit({ address: 0x7ffa1000 })], evidence: { label: 'SUSPICIOUS', score: 4 } } };
+    return { body: { mode: 'file', path: body.path, view: body.view, build: '26220.5770', imports_read: true, partial: false, note: '',
+                     hits: [stubHit({ offset: 0x400, syscall: null, number: 4000, number_known: false })], evidence: { label: 'CLEAN', score: 1 } } }; };
+const searchable = async () => { initSyscalls(); syscallsTabShown(); await settle(); routes['/api/syscalls/stubs'] = stubsRoute; chooseTarget(4242); };
+"""
+
+
+@needs_node
+def test_the_search_asks_the_process_and_then_its_image_file_in_the_view_the_process_has():
+    r = _panels(STUBS_FLOW + r"""
+      (async () => {
+        await searchable();
+        const before = requests.length;
+        await runSyscallStubs();
+        out({ posts: requests.slice(before).map(q => [q.url, q.body]), body: els['syscall-stubs-body'].innerHTML,
+              hidden: els['syscall-stubs'].hidden, head: els['syscall-stubs-head'].textContent });
+      })();""")
+    assert r["posts"] == [["/api/syscalls/stubs", {"pid": 4242}],
+                          ["/api/syscalls/stubs", {"path": "C:\\Users\\x\\sample.exe", "view": "arm64"}]]
+    assert r["hidden"] is False
+    assert "process memory 0x7FFA1000" in r["body"] and "file offset 0x400" in r["body"], "both hit lists, each where it was found"
+    assert "NtWriteVirtualMemory" in r["body"] and "not in this build" in r["body"]
+    assert "PID 4242" in r["head"] and "2 hits" in r["head"]
+
+
+@needs_node
+def test_the_search_that_cannot_find_an_image_or_reach_the_process_says_so_and_still_searches_what_it_can():
+    r = _panels(STUBS_FLOW + r"""
+      (async () => {
+        await searchable();
+        // no image path known: the process alone
+        PROCESSES['4242'].image = ''; syscallState.targets = PROCESSES; chooseTarget(4242);
+        let before = requests.length;
+        await runSyscallStubs();
+        const noImage = { posts: requests.slice(before).map(q => q.body), body: els['syscall-stubs-body'].innerHTML };
+        // the process is gone: its image is searched in the view of the map
+        PROCESSES['4242'].image = 'C:\\Users\\x\\sample.exe'; syscallState.targets = PROCESSES; chooseTarget(4242);
+        routes['/api/syscalls/stubs'] = (url, options) => JSON.parse(options.body).pid ? { status: 400, body: { error: 'cannot open process 4242' } } : stubsRoute(url, options);
+        before = requests.length;
+        await runSyscallStubs();
+        const gone = { posts: requests.slice(before).map(q => q.body), body: els['syscall-stubs-body'].innerHTML };
+        // the file is refused
+        routes['/api/syscalls/stubs'] = (url, options) => JSON.parse(options.body).pid ? stubsRoute(url, options) : { status: 403, body: { error: 'Access denied: path outside allowed directories' } };
+        await runSyscallStubs();
+        out({ noImage, gone, refused: els['syscall-stubs-body'].innerHTML });
+      })();""")
+    assert r["noImage"]["posts"] == [{"pid": 4242}] and "No image path" in r["noImage"]["body"] and "process memory" in r["noImage"]["body"]
+    assert r["gone"]["posts"][-1] == {"path": "C:\\Users\\x\\sample.exe", "view": "arm64"}
+    assert "cannot open process 4242" in r["gone"]["body"] and "file offset 0x400" in r["gone"]["body"]
+    assert "Access denied" in r["refused"] and "process memory 0x7FFA1000" in r["refused"]
+
+
+@needs_node
+def test_the_search_needs_a_target_and_runs_once_at_a_time():
+    r = _panels(STUBS_FLOW + r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        routes['/api/syscalls/stubs'] = stubsRoute;
+        const none = await runSyscallStubs(); const asked = requests.filter(q => q.url.includes('/stubs')).length;
+        const disabled = els['syscall-stubs-run'].disabled;
+        chooseTarget(4242);
+        const original = globalThis.fetch; let release;
+        globalThis.fetch = (url, options) => url.includes('/stubs') ? new Promise(resolve => { release = () => resolve({ ok: true, status: 200, json: async () => stubsRoute(url, options).body }); }) : original(url, options);
+        const running = runSyscallStubs(); await settle();
+        const during = { off: els['syscall-stubs-run'].disabled, text: els['syscall-stubs-run'].textContent };
+        const second = await runSyscallStubs();
+        release(); await settle(); release && release(); await running;
+        out({ none, asked, disabled, during, second, after: [els['syscall-stubs-run'].disabled, els['syscall-stubs-run'].textContent] });
+      })();""")
+    assert r["none"] is False and r["asked"] == 0 and r["disabled"] is True
+    assert r["during"]["off"] is True and "SEARCHING" in r["during"]["text"] and r["second"] is False
+    assert r["after"] == [False, "STUBS"]
+
+
+@needs_node
+def test_draft_rule_on_a_hit_leads_to_the_yara_draft_and_from_there_to_apply():
+    r = _panels(STUBS_FLOW + r"""
+      (async () => {
+        await searchable();
+        await runSyscallStubs();
+        const yara = { kind: 'yara', name: 'TDC_DirectSyscall_NtWriteVirtualMemory_arm64_0123abcd', target: 'TDC_DirectSyscall_NtWriteVirtualMemory_arm64_0123abcd.yar',
+                       text: 'rule TDC_DirectSyscall_NtWriteVirtualMemory_arm64_0123abcd { condition: true }' };
+        routes['/api/syscalls/rule'] = { body: yara };
+        routes['/api/syscalls/rule/apply'] = { body: { status: 'written', name: yara.name, path: 'C:\\rules\\x.yar', reload_seconds: 2 } };
+        const before = requests.length;
+        const unknown = await syscallDraftStubRule(99);
+        const drafted = await syscallDraftStubRule(0);
+        const draftPosts = requests.slice(before).map(q => [q.url, q.body]);
+        const panel = els['syscall-draft'].innerHTML;
+        const applied = await applySyscallRule(yara.name);
+        out({ unknown, drafted, draftPosts, panel, applied, last: requests[requests.length - 1].url });
+      })();""")
+    assert r["unknown"] is False and r["drafted"] is True
+    assert len(r["draftPosts"]) == 1
+    url, body = r["draftPosts"][0]
+    assert url == "/api/syscalls/rule" and "deviation" not in body
+    assert body["hit"]["syscall"] == "NtWriteVirtualMemory" and body["hit"]["stub_hex"] == "3a0300d4c0035fd6"
+    assert body["hit"]["sample"] == "sample.exe" and body["view"] == "arm64" and body["build"] == "26220.5770"
+    assert "APPLY TO THIS VM" in r["panel"] and "DOWNLOAD FOR THE REPO" in r["panel"]
+    assert r["applied"] is True and r["last"] == "/api/syscalls/rule/apply"
+
+
+@needs_node
+def test_a_hit_of_the_file_is_drafted_with_the_name_of_the_file_as_its_sample():
+    r = _panels(STUBS_FLOW + r"""
+      (async () => {
+        await searchable(); await runSyscallStubs();
+        routes['/api/syscalls/rule'] = { body: { kind: 'yara', name: 'TDC_DirectSyscall_Number0xFA0_arm64_aaaaaaaa', text: 'x', target: 't' } };
+        const before = requests.length;
+        await syscallDraftStubRule(1);
+        out(requests.slice(before)[0].body);
+      })();""")
+    assert r["hit"]["number"] == 4000 and r["hit"]["number_known"] is False and r["hit"]["sample"] == "sample.exe"
+    assert "source" in r and "file" in r["source"]
+
+
+@needs_node
+def test_the_detail_links_to_wingraph_at_its_root_and_says_so():
+    html = _run_node(DETAIL_FUNCTIONS, 'out(renderSyscallDetail({name: "NtFoo", number: 1, module: "ntdll.dll", parameters: []}));')
+    links = [a for t, a in _Attributes(html).elements if t == "a"]
+    wingraph = next(a for a in links if "wingraph" in a["href"])
+    assert wingraph["href"] == "https://wingraph.m0n1x90.dev/", "the site's root: it has no address for one module"
+    assert wingraph["target"] == "_blank" and "noopener" in wingraph["rel"] and "noreferrer" in wingraph["rel"]
+    assert "root" in wingraph["title"] or "not one module" in wingraph["title"]
+    assert any(a["href"].startswith("https://ntdoc.m417z.com/") for a in links), "beside the ntdoc link"
+    label = re.search(r'<a[^>]*wingraph[^>]*>(.*?)</a>', html).group(1)
+    assert label == "WinGraph"
+
+
 # --- The page: markup, styles and themes ------------------------------------------
 
 def _block():
@@ -1889,7 +2099,7 @@ def test_every_element_the_block_reads_is_in_the_page():
 
 def test_the_assets_moved_on_and_the_switch_in_the_tab_bar_is_wired():
     html = _read(INDEX_HTML)
-    for asset, minimum in (("style.css", 85), ("theme-cyberpunk.css", 37), ("app.js", 123)):
+    for asset, minimum in (("style.css", 86), ("theme-cyberpunk.css", 37), ("app.js", 124)):
         version = int(re.search(rf"{re.escape(asset)}\?v=(\d+)", html).group(1))
         assert version >= minimum, f"{asset} was changed and kept its ?v="
     assert re.search(r"if \(tabName === 'syscalls'\)[^\n]*syscallsTabShown\(\)", SOURCE)
@@ -1996,11 +2206,13 @@ def test_the_detail_the_deviations_and_the_known_hooks_are_in_the_work_area_and_
     tab = _tab_markup("syscalls")
     work = tab[tab.index('id="syscall-work"'):]
     for needle in ('id="syscall-detail"', 'id="syscall-detail-body"', 'id="syscall-draft"', 'id="syscall-lower"',
-                   'id="syscall-deviations"', 'id="syscall-hooks"'):
+                   'id="syscall-deviations"', 'id="syscall-hooks"', 'id="syscall-stubs"', 'id="syscall-stubs-body"'):
         assert needle in work, needle
     # panels in the manner of the Rizin tab: a section with a head and a title that explains itself
-    assert len(re.findall(r'<h3 class="syscall-panel-title" data-info="[^"<&]{1,300}">', tab)) == 3
+    assert len(re.findall(r'<h3 class="syscall-panel-title" data-info="[^"<&]{1,300}">', tab)) == 4
     assert "syscallSetPane('map')" in tab and "syscallSetPane('detail')" in tab
+    assert re.search(r'<button[^>]*id="syscall-stubs-run"[^>]*onclick="runSyscallStubs\(\)"', tab)
+    assert re.search(r'id="syscall-stubs"[^>]*\shidden', tab), "the list of hits is there once a search was run"
     css = _read(STYLE_CSS)
     media = css[css.index("@media (max-width: 1399px)"):]
     assert 'data-pane="detail"] .syscall-main' in media and 'data-pane="map"] .syscall-detail' in media

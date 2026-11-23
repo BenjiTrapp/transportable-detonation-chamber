@@ -24811,6 +24811,8 @@ const SYSCALL_STATE_HELP = {
 const SYSCALL_MODULES = ['ntdll.dll', 'win32u.dll'];
 // Where a syscall is documented, and where the modules are that Rizin opens
 const SYSCALL_DOC_URL = 'https://ntdoc.m417z.com/';
+// WinGraph, a dependency graph of the System32 binaries: only its root is linked, it has no address for one module
+const SYSCALL_WINGRAPH_URL = 'https://wingraph.m0n1x90.dev/';
 const SYSCALL_SYSTEM_DIR = 'C:\\Windows\\System32\\';
 // Below this width the map and the detail panel share the room as two panes
 const SYSCALL_NARROW = '(max-width: 1399px)';
@@ -25293,6 +25295,8 @@ function renderSyscallDetail(sc) {
         links += `<a class="btn btn-sm" href="${escapeHtml(SYSCALL_DOC_URL + encodeURIComponent(name).toLowerCase())}" target="_blank" ` +
                  'rel="noopener noreferrer" title="Documentation on ntdoc.m417z.com (opens in a new tab, needs a network)">ntdoc</a> ';
     }
+    links += `<a class="btn btn-sm" href="${escapeHtml(SYSCALL_WINGRAPH_URL)}" target="_blank" rel="noopener noreferrer" ` +
+             'title="WinGraph, a dependency graph of the System32 binaries. This opens the site at its root, not one module (it has no address for one); nothing is fetched from it.">WinGraph</a> ';
     if (sc.rizin === true) {
         links += '<button type="button" class="btn btn-sm" onclick="syscallOpenRizin()" title="Open the module in the RIZIN tab and go to this syscall">Open in Rizin</button>';
     } else if (sc.rizin_note) {
@@ -25453,6 +25457,52 @@ function renderHookAllowlist(state) {
         (st.note && st.note.text ? `<div class="syscall-draft-result syscall-draft-result-${cssToken(st.note.tone)}" role="status">${escapeHtml(st.note.text)}</div>` : '');
 }
 
+// The syscall stubs a sample carries itself, found in its process memory and in its file. These are hints, not proof,
+// and the list says so: whether the sample imports the function is mostly not known (import_present is true, false
+// or null), and a stub whose number this build does not have (number_known false) suggests a sample made for another
+// build. model: hits ({ ...hit, source: 'process' | 'file' }), notes ({ tone, title, text }), summary, partial.
+function renderSyscallStubs(model) {
+    const m = model && typeof model === 'object' ? model : {};
+    const all = Array.isArray(m.hits) ? m.hits : [];
+    const notes = (Array.isArray(m.notes) ? m.notes : []).filter(n => n && typeof n === 'object')
+        .map(n => ({ kind: 'stubs', tone: n.tone, title: n.title || 'Stub search', text: n.text }));
+    const rows = [];
+    all.forEach((h, i) => {
+        if (!h || typeof h !== 'object') return;
+        const known = h.number_known !== false;
+        const where = h.source === 'file' ? `file offset ${syscallHex(h.offset)}` : `process memory ${syscallHex(h.address)}`;
+        let imported;
+        if (h.import_present === true) {
+            imported = '<span title="The sample imports this function as well: a weaker hint.">imported too</span>';
+        } else if (h.import_present === false) {
+            imported = '<span title="Not imported, by an import set widened through the Win32 to Nt table.">not imported</span>';
+        } else {
+            imported = '<span class="syscall-muted" title="The import table is not known to be complete for this function: a Win32 function such as ' +
+                       'VirtualAllocEx reaches NtAllocateVirtualMemory without importing its Nt name, so a missing import proves nothing.">unknown</span>';
+        }
+        const drawable = typeof h.stub_hex === 'string' && h.stub_hex !== '' && Number.isInteger(h.number);
+        rows.push('<tr>' +
+            `<td data-sort-value="${escapeHtml(h.syscall || '')}">${known && h.syscall ? escapeHtml(h.syscall) : '<span class="syscall-muted">–</span>'}</td>` +
+            `<td class="view-table-num" data-sort-value="${escapeHtml(h.number)}">${escapeHtml(syscallHex(h.number))}</td>` +
+            (known ? '<td data-sort-value="1">in this build</td>'
+                   : '<td data-sort-value="0"><span class="syscall-flag" title="This build has no syscall with this number: the stub was probably made for another Windows build.">not in this build</span></td>') +
+            `<td>${escapeHtml(where)}</td><td>${escapeHtml(h.pattern)}</td><td>${imported}</td>` +
+            `<td>${drawable ? `<button type="button" class="btn btn-xs" onclick="syscallDraftStubRule(${jsInt(i)})" title="Draft a YARA rule for these bytes. Nothing is written.">Draft rule</button>` : ''}</td></tr>`);
+    });
+    if (!rows.length) {
+        const why = m.partial ? 'No hit, but what was searched was not all of it: this is not a clean result.'
+                              : 'No syscall stub of its own was found in what was searched.';
+        rows.push(`<tr data-sort-skip><td colspan="7" class="view-table-empty">${escapeHtml(why)}</td></tr>`);
+    }
+    return syscallNoticesHtml(notes) +
+        (m.summary ? `<div class="syscall-stubs-summary">${escapeHtml(m.summary)}</div>` : '') +
+        '<p class="syscall-draft-hint"><strong>Hints, not proof.</strong> A syscall stub in the sample\'s own memory or file may be a direct syscall that goes around ntdll, ' +
+        'but whether the sample also imports that function is not known: only an import set widened through the Win32 to Nt table could prove a bypass, ' +
+        'and that table is not part of this tab yet. Look at each hit before drafting a rule.</p>' +
+        '<div class="view-table-wrap"><table class="view-table" data-sortable data-sort-id="syscall-stubs"><thead><tr><th>SYSCALL</th><th>NUMBER</th><th>BUILD</th>' +
+        `<th>FOUND</th><th>PATTERN</th><th>IMPORTED</th><th></th></tr></thead><tbody>${rows.join('')}</tbody></table></div>`;
+}
+
 const SYSCALL_VIEW_NAMES = ['map', 'graph'];
 const syscallState = {
     ready: false,
@@ -25470,6 +25520,8 @@ const syscallState = {
     detail: { name: '', data: null, error: '', loading: false }, detailSeq: 0,
     draft: null, draftSeq: 0,
     hooks: { entries: [], loaded: false, problem: '', error: '', note: null, busy: false },
+    // The stub search: where it stands, and what each of its two ways in answered ({ ok, data, sample } or { ok, error } or { skipped })
+    stubs: { searched: false, running: false, pid: 0, name: '', sources: {} },
     pane: 'map',
     view: 'map',
     targets: {}, target: '',
@@ -25753,6 +25805,13 @@ function renderSyscallToolbar() {
         scan.title = syscallState.target ? 'Measure the syscall stubs of the chosen process against the baseline'
                                           : 'Choose a process first';
     }
+    const stubs = document.getElementById('syscall-stubs-run');
+    if (stubs) {
+        stubs.disabled = syscallState.stubs.running || syscallState.scanning || !syscallState.target;
+        stubs.textContent = syscallState.stubs.running ? 'SEARCHING…' : 'STUBS';
+        stubs.title = syscallState.target ? 'Search the process memory and the image file of the chosen process for syscall stubs of their own'
+                                          : 'Choose a process first';
+    }
     for (const name of SYSCALL_VIEW_NAMES) {
         const button = document.getElementById(`syscall-view-${name}`);
         if (button) button.setAttribute('aria-pressed', name === syscallState.view ? 'true' : 'false');
@@ -25788,6 +25847,7 @@ function syscallRenderAll() {
     renderSyscallDeviationPanel();
     renderSyscallDraft();
     renderSyscallHooks();
+    renderSyscallStubsPanel();
 }
 
 // The filter changed (or the baseline did): which cells match, then the map and the catalog
@@ -26096,10 +26156,15 @@ async function syscallDraftRule(name) {
     const scan = syscallState.scan;
     const deviation = scan && Array.isArray(scan.deviations) ? scan.deviations.find(d => d && d.name === name) : null;
     if (!deviation) return false;
+    return syscallRequestDraft({ deviation, view: scan.view, build: scan.build });
+}
+
+// The draft of a rule from `body` ({ deviation, view, build } or { hit, view, build, source }). A refusal is shown
+// where the draft would be, and replaces the draft before it; a newer request overtakes an older one.
+async function syscallRequestDraft(body) {
     const seq = ++syscallState.draftSeq;
     const r = await syscallApi('/api/syscalls/rule', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ deviation, view: scan.view, build: scan.build }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     });
     if (seq !== syscallState.draftSeq) return false;
     if (!r.ok) {
@@ -26109,6 +26174,115 @@ async function syscallDraftRule(name) {
     }
     syscallShowDraft(r.data);
     return true;
+}
+
+// STUBS: the process in `pid` (its private, executable memory) and then its image file, each by a request of its own.
+// The process search skips the sample's own mapped image, so a sample that unpacks in place is caught by the file
+// alone. The file is searched in the view the process search reports, or the view of the map when the process cannot
+// be searched (it is gone), and not at all without an image path.
+function syscallTargetProcess(pid) {
+    for (const proc of Object.values(syscallState.targets && typeof syscallState.targets === 'object' ? syscallState.targets : {})) {
+        if (proc && !proc.exit_time && !String(proc.key === undefined ? '' : proc.key).includes('@') && String(proc.pid) === String(pid)) {
+            return { name: String(proc.name || proc.image || ''), image: typeof proc.image === 'string' ? proc.image : '' };
+        }
+    }
+    return { name: '', image: '' };
+}
+
+// What the two searches found, as renderSyscallStubs wants it: the hits of both in one list (each with where it came
+// from, the sample it was found in and the build it was numbered for), what to tell besides, and whether the search
+// covered all it set out to
+function syscallStubsModel() {
+    const st = syscallState.stubs;
+    const hits = [], notes = [];
+    let partial = false;
+    const counts = {};
+    for (const source of ['process', 'file']) {
+        const part = st.sources[source];
+        if (!part) continue;
+        const label = source === 'process' ? 'Process memory' : 'File';
+        if (part.skipped) {
+            notes.push({ tone: 'info', title: `${label} not searched`, text: part.skipped });
+            partial = true;
+        } else if (!part.ok) {
+            notes.push({ tone: 'error', title: `${label} not searched`, text: part.error });
+            partial = true;
+        } else {
+            const found = Array.isArray(part.data.hits) ? part.data.hits : [];
+            counts[source] = found.length;
+            for (const h of found) hits.push({ ...h, view: h.view || part.data.view, source, sample: part.sample, build: part.data.build });
+            if (part.data.partial) {
+                partial = true;
+                notes.push({ tone: 'warn', title: `${label} search partial`, text: part.data.note || 'Not all of it could be searched.' });
+            } else if (part.data.note) {
+                notes.push({ tone: 'info', title: label, text: part.data.note });
+            }
+        }
+    }
+    const view = (st.sources.process && st.sources.process.ok && st.sources.process.data.view)
+        || (st.sources.file && st.sources.file.ok && st.sources.file.data.view) || '';
+    const where = Object.entries(counts).map(([source, n]) => `${n} in ${source === 'process' ? 'process memory' : 'the file'}`).join(', ');
+    const summary = `PID ${st.pid}${st.name ? ` (${st.name})` : ''}${view ? ` · ${view}` : ''} · ${hits.length} hit${hits.length === 1 ? '' : 's'}${where ? ` (${where})` : ''}`;
+    return { hits, notes, partial, summary };
+}
+
+function renderSyscallStubsPanel() {
+    const st = syscallState.stubs;
+    const panel = document.getElementById('syscall-stubs');
+    const body = document.getElementById('syscall-stubs-body');
+    const head = document.getElementById('syscall-stubs-head');
+    const lower = document.getElementById('syscall-lower');
+    if (lower && lower.classList) lower.classList.toggle('with-stubs', st.searched);
+    if (panel) panel.hidden = !st.searched;
+    if (!st.searched) return;
+    const model = syscallStubsModel();
+    if (head) head.textContent = st.running ? `Searching PID ${st.pid}…` : `PID ${st.pid} · ${model.hits.length} hit${model.hits.length === 1 ? '' : 's'}`;
+    if (!body) return;
+    const top = body.scrollTop;
+    body.innerHTML = st.running ? `<p class="syscall-empty">Searching PID ${escapeHtml(st.pid)}…</p>` : renderSyscallStubs(model);
+    body.scrollTop = top;
+}
+
+async function runSyscallStubs() {
+    const st = syscallState.stubs;
+    if (st.running) return false;
+    const select = document.getElementById('syscall-target');
+    const pid = parseInt(select ? select.value : syscallState.target, 10);
+    if (!(pid > 0)) {
+        syscallSetScanNote('warn', 'Choose a process to search first.');
+        return false;
+    }
+    const target = syscallTargetProcess(pid);
+    Object.assign(st, { searched: true, running: true, pid, name: target.name, sources: {} });
+    renderSyscallToolbar();
+    renderSyscallStubsPanel();
+    const post = body => syscallApi('/api/syscalls/stubs', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const proc = await post({ pid });
+    st.sources.process = proc.ok ? { ok: true, data: proc.data, sample: target.name } : { ok: false, error: syscallErrorText(proc) };
+    const view = (proc.ok && proc.data.view) || (syscallState.baseline && syscallState.baseline.view) || '';
+    if (!target.image) {
+        st.sources.file = { skipped: 'No image path is known for this process, so its file was not searched.' };
+    } else if (!view) {
+        st.sources.file = { skipped: 'The view to search the file in is not known, so its file was not searched.' };
+    } else {
+        const file = await post({ path: target.image, view });
+        st.sources.file = file.ok ? { ok: true, data: file.data, sample: target.image.split(/[\\/]/).pop() } : { ok: false, error: syscallErrorText(file) };
+    }
+    st.running = false;
+    renderSyscallToolbar();
+    renderSyscallStubsPanel();
+    return true;
+}
+
+// Draft rule on a hit: the stub goes to the server, which drafts a YARA rule for its bytes and writes nothing; apply
+// and download follow from the draft
+async function syscallDraftStubRule(index) {
+    const item = syscallStubsModel().hits[index];
+    if (!item) return false;
+    const { source, build, ...hit } = item;
+    return syscallRequestDraft({ hit, view: hit.view, build, source: source === 'file' ? 'stub search of a file' : 'stub search of a process' });
 }
 
 // APPLY TO THIS VM: the draft goes back to the server as it came, which writes it where Rustinel reads its rules. Only

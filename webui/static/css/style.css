@@ -12450,6 +12450,28 @@ button.logs-trunc:hover { color: var(--accent-orange); text-decoration: underlin
     grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
     gap: 8px;
 }
+.syscall-lower.with-stubs {
+    height: clamp(260px, 42vh, 440px);
+}
+.syscall-lower-left {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+    min-height: 0;
+}
+.syscall-lower-left > .syscall-panel {
+    flex: 1 1 0;
+}
+.syscall-stubs[hidden] {
+    display: none;
+}
+.syscall-stubs-summary {
+    margin-bottom: 4px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+}
 .syscall-pane-switch {
     display: none;
 }
