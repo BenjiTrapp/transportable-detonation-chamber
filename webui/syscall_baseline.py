@@ -508,7 +508,8 @@ def _live_number(live: bytes, view: str) -> int | None:
     return None
 
 
-def classify_stub(sc: Syscall, live: bytes | None, view: str, owner: str | None) -> dict:
+def classify_stub(sc: Syscall, live: bytes | None, view: str, owner: str | None,
+                  relayed: bool = False) -> dict:
     """Compare the live stub with the baseline and decide its state.
 
     Which of hooked, patched, diverged follows from `owner`, the module that holds the
@@ -519,7 +520,11 @@ def classify_stub(sc: Syscall, live: bytes | None, view: str, owner: str | None)
 
     `hooked` says only that a module a file backs holds the target: an EDR's, but also a DLL the sample dropped and
     loaded, or a legitimate DLL it overwrote in place (module stomping keeps the image and its path, and no region
-    query can see it). A core Windows module (CORE_SYSTEM_MODULES) is no hooker's: a jump into one is `patched`."""
+    query can see it). A core Windows module (CORE_SYSTEM_MODULES) is no hooker's: a jump into one is `patched`.
+
+    A jump into ntdll or the stub's own module is `diverged`: it may be the module's own jump, or the baseline may be
+    wrong. `relayed` says the jump got there through a relay in memory that is no module, which rules out both: no
+    module of its own jumps out to private memory and back. Such a stub is `patched`."""
     n = stub_prefix_len(sc, view)
     expected = sc.stub_bytes[:n]
     out = {
@@ -543,8 +548,10 @@ def classify_stub(sc: Syscall, live: bytes | None, view: str, owner: str | None)
     hit = _find_hook(live, 0, view)
     out["pattern"] = hit[0] if hit else None
     out["target_owner"] = owner
-    if owner is None or owner in ("ntdll.dll", sc.module.lower()):
+    if owner is None:
         out["state"] = STATE_DIVERGED
+    elif owner in ("ntdll.dll", sc.module.lower()):
+        out["state"] = STATE_PATCHED if relayed else STATE_DIVERGED
     elif owner in NON_MODULE_OWNERS or is_core_system_module(owner):
         out["state"] = STATE_PATCHED
     else:

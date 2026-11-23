@@ -218,7 +218,7 @@ def _state(reader: ProcessReader, sc: Syscall, live: bytes | None, addr: int,
     out, failed = classify_stub(sc, live, view, None), False
     if out["state"] not in (STATE_INTACT, STATE_UNREADABLE):
         owner, failed, relay = _target_owner(reader, live, addr, view)
-        out = classify_stub(sc, live, view, owner)
+        out = classify_stub(sc, live, view, owner, relayed=bool(relay))
         out["relay"] = relay
     out.update(name=sc.name, module=sc.module, number=sc.number, rva=sc.rva)
     return out, failed

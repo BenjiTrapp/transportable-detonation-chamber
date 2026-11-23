@@ -1267,12 +1267,28 @@ def test_a_relay_whose_target_region_cannot_be_queried_is_a_failed_lookup(x64_ba
     assert (out["owner_errors"], out["partial"]) == (1, True)
 
 
-def test_a_relay_back_into_ntdll_is_diverged_by_its_final_owner(x64_baseline):
+def test_a_relay_back_into_ntdll_is_patched_as_no_jump_of_ntdlls_own_needs_one(x64_baseline):
+    # a direct jump into ntdll may be its own or a baseline error, so it stays diverged; a private hop in between
+    # rules out both
     sc = x64_baseline.syscalls["NtAllocateVirtualMemory"]
     reader = _x64_relay_reader(x64_baseline, _x64_minhook_relay(_MODULE_BASES["ntdll.dll"] + sc.rva))
-    s = syscall_scan.measure(x64_baseline, reader)["states"]["NtWriteVirtualMemory"]
-    assert (s["state"], s["target_owner"]) == ("diverged", "ntdll.dll")
+    out = syscall_scan.measure(x64_baseline, reader)
+    s = out["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["target_owner"]) == ("patched", "ntdll.dll")
     assert len(s["relay"]) == 1
+    assert out["owner_errors"] == 0
+
+
+def test_a_relay_back_into_the_stubs_own_module_is_patched_too():
+    sc = _sc("x64")
+    live = bytes.fromhex("e910000000") + b"\x90" * 27
+    assert syscall_baseline.classify_stub(sc, live, "x64", "ntdll.dll")["state"] == "diverged"
+    assert syscall_baseline.classify_stub(sc, live, "x64", "ntdll.dll", relayed=True)["state"] == "patched"
+    gui = syscall_baseline.Syscall(**{**sc.__dict__, "module": "win32u.dll"})
+    assert syscall_baseline.classify_stub(gui, live, "x64", "win32u.dll", relayed=True)["state"] == "patched"
+    # a relay that ends in a foreign module is still a hook, and an unresolved end is still not guessed at
+    assert syscall_baseline.classify_stub(sc, live, "x64", "edr.dll", relayed=True)["state"] == "hooked"
+    assert syscall_baseline.classify_stub(sc, live, "x64", None, relayed=True)["state"] == "diverged"
 
 
 def test_a_hook_into_a_module_directly_has_no_relay(arm64_baseline):

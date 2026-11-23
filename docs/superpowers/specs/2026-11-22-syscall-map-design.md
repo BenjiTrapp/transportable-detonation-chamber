@@ -180,10 +180,12 @@ gehört**, nicht das Befehlsmuster:
   Speicher steht. Ist ein Relay nicht lesbar oder sein Ziel nicht erfragbar,
   wird nicht geraten: der Stub ist `diverged` und zählt als fehlgeschlagene
   Eigentümer-Abfrage.
-- Zeigt es in `ntdll` selbst oder in das Modul des Stubs, heißt das `diverged`:
-  `hooked` ist für ein fremdes, dateigedecktes Modul reserviert und `patched`
-  für privaten Speicher. Ein modulinterner Sprung ist keins von beidem und wird
-  nicht geraten.
+- Zeigt es **direkt** in `ntdll` selbst oder in das Modul des Stubs, heißt das
+  `diverged`: `hooked` ist für ein fremdes, dateigedecktes Modul reserviert und
+  `patched` für privaten Speicher. Ein modulinterner Sprung — oder ein Fehler
+  der Baseline — ist keins von beidem und wird nicht geraten. **Über ein Relay**
+  dorthin ist es `patched`: ein Sprung aus dem Modul in privaten Speicher und
+  zurück ist weder ein eigener Sprung des Moduls noch ein Fehler der Baseline.
 - Weichen die Bytes ab, ist das Ziel aber nicht auflösbar, heißt das `diverged`.
   Dieser Fall wird nie stumm als `intact` geführt.
 

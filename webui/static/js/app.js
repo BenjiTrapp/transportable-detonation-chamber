@@ -24888,7 +24888,7 @@ const SYSCALL_STATE_HELP = {
     hooked: 'hooked (file-backed module): the jump ends in a loaded module other than ntdll that a file backs. An EDR does that, ' +
             'but so does a DLL the sample loaded, or a legitimate DLL it overwrote in place (module stomping), which this scan cannot tell apart.',
     patched: 'The jump ends in memory no hooking product explains: private memory, a section no file backs or a mapped view of a file, ' +
-             'after any relay was followed, or a core Windows module such as kernelbase.dll (a code cave).',
+             'after any relay was followed, or a core Windows module such as kernelbase.dll (a code cave), or ntdll itself reached through such a relay.',
     diverged: 'The bytes differ, but the jump is not into a foreign module and not into private memory, or its target cannot be resolved. Not guessed at.',
     unreadable: 'No stub could be read.',
 };
