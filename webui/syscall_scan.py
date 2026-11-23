@@ -533,6 +533,17 @@ _STUB_NUMBER = {
     "arm64": lambda word: (int.from_bytes(word, "little") >> 5) & 0xFFFF,
 }
 _STUB_PATTERN = {"x64": "mov r10, rcx; mov eax, imm32; syscall", "arm64": "svc #imm16; ret"}
+
+
+def stub_number(data: bytes, view: str) -> int | None:
+    """The syscall number of `data` when it is exactly one stub of `view`'s shape, as a hit's `stub_hex` is: from
+    its first byte to the end of its stub, nothing before or after. None for any other bytes and for a view that
+    has no stub shape."""
+    regex = _STUB_REGEX.get(view)
+    m = regex.match(data) if regex is not None and isinstance(data, (bytes, bytearray)) else None
+    if m is None or m.end("body") != len(data):
+        return None
+    return _STUB_NUMBER[view](m.group("ssn"))
 _STUB_ALIGN = {"x64": 1, "arm64": 4}
 # no stub is longer than this; a read that continues this far past its own start cannot
 # cut one in two

@@ -32,8 +32,10 @@ import json
 import math
 import os
 import re
+import stat
 import tempfile
 
+import syscall_scan
 from memory_evidence import VERDICT_MALICIOUS
 
 MAX_SIGNATURE_WEIGHT = VERDICT_MALICIOUS - 1.0
@@ -174,24 +176,39 @@ _AUTHOR = "DetonationChamber"
 
 # One meta string: printable ASCII without the quote and the backslash
 _S = r'[ -!#-\[\]-~]{0,400}'
+_V = "(?:" + "|".join(VIEWS) + ")"
+_N = r"[0-9A-F]{1,8}"
+# The two descriptions draft_yara writes, with what they say parsed out: the syscall, its number, the build and view
+_DESCRIPTION = (r"Direct syscall stub (?:for (?P<syscall>" + _SYSCALL_NAME.pattern + r") \(0x(?P<n1>" + _N + r")\) "
+                r"as numbered on Windows (?P<b1>" + _BUILD.pattern + r"), (?P<v1>" + _V + r") view"
+                r"|with number 0x(?P<n2>" + _N + r"), which Windows (?P<b2>" + _BUILD.pattern + r") does not number, "
+                r"(?P<v2>" + _V + r") view)")
 _RULE_FORM = re.compile(
     r"rule (?P<name>" + RULE_PREFIX + _NAME_TAIL + r") \{\n"
     r"    meta:\n"
-    r'        description = "' + _S + r'"\n'
+    r'        description = "' + _DESCRIPTION + r'"\n'
     r'        author      = "' + _AUTHOR + r'"\n'
     r'        severity    = "(?:' + "|".join(_SEVERITIES) + r')"\n'
     r'        tags        = "' + re.escape(_TAGS) + r'"\n'
     r'        generated   = "' + _S + r'"\n'
-    r'        os_build    = "' + _BUILD.pattern + r'"\n'
-    r'        os_view     = "(?:' + "|".join(VIEWS) + r')"\n'
+    r'        os_build    = "(?P<build>' + _BUILD.pattern + r')"\n'
+    r'        os_view     = "(?P<view>' + _V + r')"\n'
     r'        note        = "' + _S + r'"\n'
     r"\n"
     r"    strings:\n"
-    r"        \$stub = \{ [0-9A-F]{2}(?: [0-9A-F]{2}){" + str(_STUB_MIN - 1) + "," + str(_STUB_MAX - 1) + r"} \}\n"
+    r"        \$stub = \{ (?P<stub>[0-9A-F]{2}(?: [0-9A-F]{2}){" + str(_STUB_MIN - 1) + "," + str(_STUB_MAX - 1) + r"}) \}\n"
     r"\n"
     r"    condition:\n"
     r"        \$stub\n"
     r"\}\n")
+
+# The most rule files the tab writes into the directory the detection engine reads. Any local process can call the
+# routes, so the bound is what stands between a sample and an alert flood or a reload that never settles.
+RULES_MAX = 200
+
+
+class RulesFull(Exception):
+    """The rules directory holds RULES_MAX rule files already: nothing more is written into it."""
 
 RULE_RELOAD_SECONDS = 2
 
@@ -204,6 +221,23 @@ def _stub_bytes(hit: dict) -> bytes:
     if len(data) < _STUB_MIN:
         raise ValueError(f"a stub of {len(data)} bytes is too short to make a rule from")
     return data
+
+
+def _rule_name(label: str, build: str, view: str, stub: str) -> str:
+    """The name of the rule for `stub` (upper-case hex, spaced): the syscall or its number, the view, and a digest of
+    build, view and bytes, so that the same stub always has the same name and another stub another."""
+    digest = hashlib.sha1(f"{build}|{view}|{stub}".encode("ascii")).hexdigest()[:8]
+    return f"{RULE_PREFIX}{label}_{view}_{digest}"
+
+
+def _check_stub(data: bytes, view: str, number: int) -> None:
+    """Raises ValueError unless `data` is exactly one syscall stub of `view`'s shape that loads `number`. A rule
+    made of any other bytes, eight zeros or an MZ header, would match far more than a stub."""
+    found = syscall_scan.stub_number(data, view)
+    if found is None:
+        raise ValueError(f"the bytes are not one syscall stub of the {view} view")
+    if found != number:
+        raise ValueError(f"the stub loads number 0x{found:X}, not the number 0x{number:X} it is named for")
 
 
 def _int_field(hit: dict, key: str, high: int, required: bool) -> int | None:
@@ -238,10 +272,10 @@ def draft_yara(hit: dict, build: str, view: str, source: str, *, now: datetime.d
     if syscall is not None and (not isinstance(syscall, str) or not _SYSCALL_NAME.fullmatch(syscall)):
         raise ValueError("the syscall must be a name like NtWriteVirtualMemory, or none")
 
+    _check_stub(data, view, number)
     stub = " ".join(f"{b:02X}" for b in data)
-    digest = hashlib.sha1(f"{build}|{view}|{stub}".encode("ascii")).hexdigest()[:8]
     label = syscall or f"Number0x{number:X}"
-    name = f"{RULE_PREFIX}{label}_{view}_{digest}"
+    name = _rule_name(label, build, view, stub)
     if syscall:
         description = f"Direct syscall stub for {syscall} (0x{number:X}) as numbered on Windows {build}, {view} view"
     else:
@@ -293,7 +327,28 @@ def check_draft(draft) -> tuple[str, str]:
     form = _RULE_FORM.fullmatch(text)
     if form is None or form.group("name") != name:
         raise ValueError("the text is not a rule this tab generates")
+    build, view = form.group("build"), form.group("view")
+    if (form.group("b1") or form.group("b2")) != build or (form.group("v1") or form.group("v2")) != view:
+        raise ValueError("the description and the build or view of the rule disagree")
+    number = int(form.group("n1") or form.group("n2"), 16)
+    # the form alone takes any bytes: the rule must be one draft_yara could have made, of a stub of its view
+    _check_stub(bytes.fromhex(form.group("stub").replace(" ", "")), view, number)
+    if name != _rule_name(form.group("syscall") or f"Number0x{number:X}", build, view, form.group("stub")):
+        raise ValueError("the rule name is not the one its syscall, view and bytes make")
     return name, text
+
+
+def _is_link(path: str) -> bool:
+    """Whether `path` itself is a symbolic link or, on Windows, any reparse point, a junction included: realpath
+    resolves a junction, so a check of where a path leads passes for one that leads somewhere else entirely."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & _FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
 
 def apply_draft(draft: dict, rules_dir: str) -> dict:
@@ -302,9 +357,11 @@ def apply_draft(draft: dict, rules_dir: str) -> dict:
     A rule of that name already there is left alone (`status` "exists"): the name holds the stub, build and view,
     so it is the same rule. The file appears whole or not at all, because the engine reloads on any change and a
     half-written rule would stop every rule beside it. Raises ValueError for a draft that is not ours and OSError
-    when the directory cannot be written."""
+    when the directory cannot be written or is a link, RulesFull when it holds RULES_MAX rule files."""
     name, text = check_draft(draft)
     target = os.path.join(rules_dir, name + ".yar")
+    if _is_link(rules_dir):
+        raise OSError(f"{rules_dir} is a link or a junction: no rule is written through it")
     if not os.path.isdir(rules_dir):
         parent = os.path.dirname(os.path.abspath(rules_dir))
         if not os.path.isdir(parent):
@@ -312,6 +369,12 @@ def apply_draft(draft: dict, rules_dir: str) -> dict:
         os.mkdir(rules_dir)
     if os.path.lexists(target):
         return {"status": "exists", "name": name, "path": target}
+    held = sum(1 for entry in os.listdir(rules_dir) if entry.lower().endswith(".yar"))
+    if held >= RULES_MAX:
+        raise RulesFull(f"the rules directory holds {held} rule files, the cap is {RULES_MAX}: remove some first")
+    # planted between the check above and now, a link would still send the write elsewhere
+    if _is_link(rules_dir):
+        raise OSError(f"{rules_dir} is a link or a junction: no rule is written through it")
     # a name that is made on the spot and refused if it exists: a link planted at a name that could be foreseen
     # (the digest is of bytes the sample carries) would send this write wherever the link points
     handle, tmp = tempfile.mkstemp(dir=rules_dir, prefix=".", suffix=".tmp")

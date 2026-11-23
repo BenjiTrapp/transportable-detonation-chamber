@@ -3328,17 +3328,17 @@ def test_a_draft_is_one_rule_per_syscall_build_view_and_stub():
     base = _draft()["name"]
     assert base == _draft(_hit(sample="another.exe"))["name"]
     assert base != _draft(build="26100.1")["name"]
-    assert base != _draft(view="arm64", hit=_hit(stub_hex="01180000c0035fd6", view="arm64"))["name"]
-    assert base != _draft(_hit(stub_hex="4c8bd1b8180000000f05" + "90"))["name"]
+    assert base != _draft(view="arm64", hit=_hit(stub_hex="010300d4c0035fd6", view="arm64"))["name"]
+    assert base != _draft(_hit(stub_hex="4c8bd1b818000000f604250803fe7f0175030f05"))["name"]
     assert base.startswith("TDC_DirectSyscall_NtAllocateVirtualMemory_x64_")
 
 
 def test_the_rule_for_an_arm64_stub_carries_the_view():
-    d = _draft(_hit(syscall="NtWriteVirtualMemory", number=0x3A, view="arm64", stub_hex="41070000c0035fd6"),
+    d = _draft(_hit(syscall="NtWriteVirtualMemory", number=0x3A, view="arm64", stub_hex="410700d4c0035fd6"),
                view="arm64")
     _assert_well_formed(d)
     assert 'os_view     = "arm64"' in d["text"] and "_arm64_" in d["name"]
-    assert "$stub = { 41 07 00 00 C0 03 5F D6 }" in d["text"]
+    assert "$stub = { 41 07 00 D4 C0 03 5F D6 }" in d["text"]
 
 
 def test_a_proven_bypass_is_high_and_anything_else_medium():
@@ -3348,7 +3348,7 @@ def test_a_proven_bypass_is_high_and_anything_else_medium():
 
 
 def test_a_number_the_build_does_not_have_still_makes_a_rule_and_says_so():
-    d = _draft(_hit(syscall=None, number=0x1234, number_known=False))
+    d = _draft(_hit(syscall=None, number=0x1234, number_known=False, stub_hex="4c8bd1b8341200000f05"))
     _assert_well_formed(d)
     assert "Number0x1234" in d["name"]
     assert "which Windows 26220.5770 does not number" in d["text"]
@@ -3475,6 +3475,95 @@ def test_apply_creates_its_own_directory_but_not_the_detection_install(tmp_path)
     with pytest.raises(FileNotFoundError, match="not installed"):
         syscall_rules.apply_draft(_draft(), str(tmp_path / "absent" / "tdc"))
     assert not (tmp_path / "absent").exists()
+
+
+# --- a rule is about a syscall stub, and there is only room for so many --------------------------------
+# The UI has no login and lets a client without the CSRF header through, so the sample in the VM can call these
+# routes. A rule for any eight bytes (zeros, an MZ header that every PE matches) would be an alert flood or worse.
+
+@pytest.mark.parametrize("view,stub_hex", [
+    ("x64", "0000000000000000"), ("x64", "4d5a900003000000"), ("arm64", "0000000000000000"),
+    ("arm64", "4d5a900003000000"), ("x64", "4c8bd1b818000000"),            # a head without its syscall
+    ("arm64", "410700d4"  "00000000"),                                      # an SVC without its RET
+    ("x64", "4c8bd1b8180000000f05" "90"),                                   # a stub and a byte more
+    ("arm64", "4c8bd1b8180000000f05"),                                      # a stub of the other view
+    ("x86", "4c8bd1b8180000000f05"),                                        # a view with no stub shape
+])
+def test_a_draft_is_only_made_of_bytes_that_are_one_stub_of_its_view(view, stub_hex):
+    with pytest.raises(ValueError, match="stub"):
+        _draft(_hit(stub_hex=stub_hex, view=view), view=view)
+
+
+def test_a_draft_is_refused_when_the_stub_loads_another_number_than_the_hit_says():
+    with pytest.raises(ValueError, match="number"):
+        _draft(_hit(number=0x3A))
+    with pytest.raises(ValueError, match="number"):
+        _draft(_hit(syscall="NtWriteVirtualMemory", number=0x50, view="arm64", stub_hex="410700d4c0035fd6"),
+               view="arm64")
+
+
+def _by_hand(stub, number=0x18, view="x64", label="NtAllocateVirtualMemory"):
+    """A rule in the exact form draft_yara writes, with a name that agrees with its bytes, made by hand."""
+    good = _draft()
+    spaced = " ".join(stub[i:i + 2].upper() for i in range(0, len(stub), 2))
+    digest = hashlib.sha1(f"{BUILD}|{view}|{spaced}".encode("ascii")).hexdigest()[:8]
+    name = f"{syscall_rules.RULE_PREFIX}{label}_{view}_{digest}"
+    text = good["text"].replace(good["name"], name).replace("{ 4C 8B D1 B8 18 00 00 00 0F 05 }", "{ " + spaced + " }")
+    text = text.replace("(0x18)", f"(0x{number:X})").replace('os_view     = "x64"', f'os_view     = "{view}"')
+    text = text.replace(", x64 view", f", {view} view")
+    return {"name": name, "text": text}
+
+
+def test_check_draft_takes_a_rule_made_by_hand_only_if_draft_yara_could_have_made_it():
+    assert syscall_rules.check_draft(_by_hand("4c8bd1b8180000000f05"))[0].startswith(syscall_rules.RULE_PREFIX)
+    for forged in (_by_hand("0000000000000000"), _by_hand("4d5a900003000000"),
+                   _by_hand("4c8bd1b83a0000000f05"),                     # names 0x18, loads 0x3A
+                   _by_hand("4c8bd1b8180000000f05", view="arm64")):     # an x64 stub called arm64
+        with pytest.raises(ValueError):
+            syscall_rules.check_draft(forged)
+
+
+def test_check_draft_refuses_a_name_that_is_not_the_digest_of_its_bytes():
+    good = _draft()
+    other = good["name"][:-8] + "00000000"
+    with pytest.raises(ValueError, match="name"):
+        syscall_rules.check_draft({"name": other, "text": good["text"].replace(good["name"], other)})
+
+
+def test_the_rules_directory_holds_no_more_than_its_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(syscall_rules, "RULES_MAX", 3)
+    target = tmp_path / "tdc"
+    target.mkdir()
+    for i in range(3):
+        (target / f"TDC_DirectSyscall_X{i}.yar").write_text("rule x {}\n")
+    with pytest.raises(syscall_rules.RulesFull, match="3"):
+        syscall_rules.apply_draft(_draft(), str(target))
+    assert len(list(target.iterdir())) == 3
+    # a rule that is there already is still told apart from a new one
+    (target / "TDC_DirectSyscall_X0.yar").unlink()
+    first = syscall_rules.apply_draft(_draft(), str(target))
+    assert first["status"] == "written"
+    assert syscall_rules.apply_draft(_draft(), str(target))["status"] == "exists"
+
+
+@pytest.mark.skipif(not hasattr(os, "symlink"), reason="needs links")
+def test_a_rules_directory_that_is_a_link_is_not_written_through(tmp_path):
+    elsewhere = tmp_path / "Windows"
+    elsewhere.mkdir()
+    link = tmp_path / "tdc"
+    try:
+        os.symlink(str(elsewhere), str(link), target_is_directory=True)
+    except OSError:
+        pytest.skip("links cannot be made here")
+    with pytest.raises(OSError, match="link"):
+        syscall_rules.apply_draft(_draft(), str(link))
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_the_apply_route_says_when_the_rules_directory_is_full(client, rules_dir, monkeypatch):
+    monkeypatch.setattr(syscall_rules, "RULES_MAX", 0)
+    r = client.post("/api/syscalls/rule/apply", json=_draft())
+    assert r.status_code == 507 and "cap" in r.get_json()["error"]
 
 
 def test_apply_refuses_a_draft_that_is_not_ours_before_it_writes(tmp_path):
@@ -3954,14 +4043,19 @@ def _forged(length):
 
 def test_the_name_of_a_rule_is_at_most_what_libyara_takes_and_the_generator_never_nears_it():
     assert syscall_rules.RULE_NAME_MAX == 128
-    assert syscall_rules.check_draft(_forged(128))
-    for length in (129, 150, 178):
+    # a name made by hand is refused whatever its length: it is not the one the syscall, view and bytes make
+    for length in (128, 129, 150, 178):
         with pytest.raises(ValueError):
             syscall_rules.check_draft(_forged(length))
     # the longest the generator makes: a name of 64 characters, and the longest view
-    longest = syscall_rules.draft_yara(_hit(syscall="N" * 64, view="arm64", stub_hex="41070000c0035fd6"),
-                                       BUILD, "arm64", "s")
+    longest = _longest_draft()
+    assert syscall_rules.check_draft(longest)
     assert len(longest["name"]) <= 128 and len(longest["name"]) == 18 + 64 + 1 + 5 + 1 + 8
+
+
+def _longest_draft():
+    return syscall_rules.draft_yara(_hit(syscall="N" * 64, view="arm64", stub_hex="010300d4c0035fd6"),
+                                    BUILD, "arm64", "s")
 
 
 def test_a_forged_apply_with_a_name_too_long_for_libyara_writes_nothing(client, rules_dir):
@@ -3989,7 +4083,7 @@ def test_the_temporary_file_has_a_name_nobody_can_foresee_and_two_applies_do_not
     real = syscall_rules.os.replace
     monkeypatch.setattr(syscall_rules.os, "replace", lambda s, t: seen.append(os.path.basename(s)) or real(s, t))
     for i in range(2):
-        d = _draft(_hit(stub_hex="4c8bd1b8180000000f05" + "90" * i))
+        d = _draft(_hit(stub_hex=("4c8bd1b8180000000f05", "4c8bd1b818000000f604250803fe7f0175030f05")[i]))
         syscall_rules.apply_draft(d, str(tmp_path))
         assert seen[-1] != "." + d["name"] + ".tmp" and seen[-1].startswith(".") and seen[-1].endswith(".tmp")
     assert seen[0] != seen[1]
@@ -4097,9 +4191,8 @@ def test_a_hex_write_into_the_rules_directory_is_refused(client, tdc, rules_dir)
 
 @pytest.mark.skipif(shutil.which("yara") is None, reason="no yara binary here; CI has none")
 def test_the_real_yara_takes_the_longest_name_check_draft_lets_through(tmp_path):
-    forged = _forged(syscall_rules.RULE_NAME_MAX)
     rule = tmp_path / "long.yar"
-    rule.write_text(syscall_rules.check_draft(forged)[1])
+    rule.write_text(syscall_rules.check_draft(_longest_draft())[1])
     assert subprocess.run(["yara", str(rule), str(rule)], capture_output=True, text=True).returncode == 0
     over = tmp_path / "over.yar"
     over.write_text(_forged(129)["text"])

@@ -8707,6 +8707,8 @@ def api_syscalls_rule_apply():
         result = syscall_rules.apply_draft(draft, YARA_RULES_DIR)
     except ValueError as exc:
         raise _draft_error(exc) from None
+    except syscall_rules.RulesFull as exc:
+        return jsonify({"error": f"{exc} (the cap keeps a flood of rules out of {YARA_RULES_DIR})"}), 507
     except OSError as exc:
         return jsonify({"error": f"cannot write the rule into {YARA_RULES_DIR}: {exc.strerror or exc}"}), 500
     if result["status"] == "exists":
