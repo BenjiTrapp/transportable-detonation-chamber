@@ -667,9 +667,15 @@ def test_the_detail_of_an_api_set_name_names_its_host_modules():
 - `GET /api/binary-graph/query` — Parameter `q` (ein Name aus `QUERIES`), dazu `module`, `function`, `syscall`, `other` je nach Abfrage. Antwort ist `Answer` als JSON plus `build`, `arch`, `created` des Graphen.
 - `GET /api/binary-graph/node` — Parameter `name`, Antwort ist `node_detail`.
 
-Build und Architektur dieses Systems kommen aus `_current_os_build()` und `_syscall_default_view()` — letzteres gibt `"arm64"` oder `"x64"` aus `platform.machine()` und ist genau die Hostarchitektur, die der Graph braucht. Nicht `_process_machine`: der Graph gehört zur Maschine, nicht zu einem Prozess.
+Build und Architektur dieses Systems kommen aus `_current_os_build()` und
+`binary_graph.host_arch()`. **Nicht `_syscall_default_view()`** und nicht
+`platform.machine()`: der Web-UI-Python kann auf ARM64 als emuliertes x64 laufen, und
+`platform.machine()` meldet dort `AMD64`. Plan 1 hat genau das auf der VM erlebt und
+liest die Architektur deshalb aus der Registry; `host_arch()` tut dasselbe. Es gibt nur
+einen Cache, also heißt eine falsche Architektur hier nicht „falsche Sicht", sondern
+„kein Graph".
 
-Beide Routen verweigern mit einer Begründung, wenn kein Cache dazu vorliegt — `404` mit `{"error": …, "cache": null}`, nie eine leere Antwort, die wie „keine Kanten" aussieht. Der Graph wird einmal geladen und gehalten, wie die Baseline; ein Lock schützt das Laden.
+Beide Routen verweigern mit einer Begründung, wenn kein Cache dazu vorliegt — `404` mit `{"error": …, "cache": null}`, nie eine leere Antwort, die wie „keine Kanten" aussieht. Der Graph wird **einmal je Prozess** geladen und gehalten, nie je Anfrage; ein Lock schützt das Laden. Task 5 hat gemessen: rund 38 MB JSON brauchen etwa 0,6 s und ein paar hundert MB Spitzen-RSS, und der echte Bestand wird auf 40–90 MB geschätzt.
 
 - [ ] **Step 10: Der Hintergrundbau und `_update_preconditions`**
 
@@ -1016,8 +1022,9 @@ git commit -m "docs(binary-graph): the GRAPH view in the README, the help and th
 
 Deploy über `scripts/deploy-utm.py`, dann von Hand:
 
-1. `scripts/build-binary-graph.ps1` läuft durch und nennt Zahlen, die plausibel sind — rund 4.000 Binaries, und `api_sets_resolved` ist nicht 0.
-2. **`load_api_set_map(binary_graph.API_SET_SCHEMA_PATH)` gibt mehrere hundert Einträge**, und ein bekannter Alias löst auf: `api-ms-win-core-memory-l1-1-0` muss auf `kernelbase.dll` oder `kernel32.dll` zeigen. Das ist die erste Prüfung des Version-6-Layouts gegen eine echte Datei — in der CI steht nur ein selbst gepackter Blob, und ein Packer, der sich mit seinem eigenen Parser einig ist, kann mit Windows trotzdem uneinig sein. Schlägt es fehl, endet jede Kette einen Sprung hinter `kernel32`, und der Graph ist fast wertlos. Drei Zusicherungen, die eine Fehldeutung auffliegen lassen, weil ein falscher Offset Müll-UTF-16 liefert und keinen Beinahetreffer:
+1. `scripts/build-binary-graph.ps1` läuft durch und nennt Zahlen, die plausibel sind — rund 4.000 Binaries, und `api_sets_resolved` ist nicht 0. **Unter Windows PowerShell 5.1**, die in der CI nie lief: dort wurde das Skript nur unter pwsh 7 auf macOS geprüft, mit ausgetauschten Registry-Lesungen.
+2. **Welches System32 sieht der Web-UI-Python?** Er kann auf ARM64 als emuliertes x64 laufen. Prüfen, ob `C:\Windows\System32` dann umgeleitet wird (wie WOW64 es für x86 tut) oder nicht — und ob `host_arch()` aus der Registry `arm64` liefert, während `platform.machine()` `AMD64` sagt. Stimmt die Architektur nicht, heißt das nicht „falsche Sicht", sondern **kein Graph**.
+3. **`load_api_set_map(binary_graph.API_SET_SCHEMA_PATH)` gibt mehrere hundert Einträge**, und ein bekannter Alias löst auf: `api-ms-win-core-memory-l1-1-0` muss auf `kernelbase.dll` oder `kernel32.dll` zeigen. Das ist die erste Prüfung des Version-6-Layouts gegen eine echte Datei — in der CI steht nur ein selbst gepackter Blob, und ein Packer, der sich mit seinem eigenen Parser einig ist, kann mit Windows trotzdem uneinig sein. Schlägt es fehl, endet jede Kette einen Sprung hinter `kernel32`, und der Graph ist fast wertlos. Drei Zusicherungen, die eine Fehldeutung auffliegen lassen, weil ein falscher Offset Müll-UTF-16 liefert und keinen Beinahetreffer:
    - jeder Alias passt auf `^(api|ext)-[a-z0-9-]+$`, jedes Hostmodul endet auf `.dll`;
    - `len(result)` gleicht dem `Count` des Headers — ein korrekter Leser verwirft aus einer echten Map nichts;
    - `Version` ist 6 und `EntryOffset` ist 28;
