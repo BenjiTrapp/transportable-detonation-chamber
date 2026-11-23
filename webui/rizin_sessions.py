@@ -1877,7 +1877,8 @@ class RizinSession:
         that were set over bytes a run had written and were **not** written into the cache when the
         file was opened (_replay_patches). They are not in ``patches`` and so not in an export, and a
         patch the cache holds since (the same address and bytes made again) is not waiting any more
-        (_waiting_left). The reason says in addition where no map holds the address at the moment.
+        (_waiting_left). The reason says in addition where no map holds the address at the moment. The
+        cache is read first, because that read is what lets the mirror forget a write the console took out.
         """
         def run(pipe):
             rows = self._patch_list(pipe)
@@ -1888,6 +1889,12 @@ class RizinSession:
                     maps = pipe.cmdj("omlj")
                 except ValueError:
                     pass  # what is mapped is not known, so the reason does not say
+                except (RizinTimeout, RizinDied):
+                    # The read is for one sentence of prose and must not cost the answer: the rows above were
+                    # read before it. But rizin is gone (a timeout kills it), so the session ends as _call
+                    # ends one, and the next request is told so rather than finding a live-looking session.
+                    if not self._closed:
+                        self._end()
             return {"patches": rows,
                     "waiting": [{"addr": addr, "after": after,
                                  "reason": _PATCH_WAITING_REASON + (
@@ -1976,7 +1983,8 @@ class RizinSession:
         whose address and bytes a write of the cache holds -- that one is applied, and a waiting entry
         beside it would be one patch in two places. The same address with **other** bytes leaves it
         waiting: its own bytes are still not applied. The answer of patches() and the project's patches
-        line (_saved_cache) both ask this, so what they say cannot differ."""
+        line (_saved_cache) both ask this, and the line leaves out a lost patch of the same address and
+        bytes as one of them (``self._lost``), so the line holds no entry the answer does not show."""
         live = {(addr, after) for addr, after, _ in kept}
         return [patch for patch in self._waiting if (patch[0], patch[1]) not in live]
 
@@ -3162,11 +3170,13 @@ class RizinSession:
         rows = self._patch_list(pipe)
         kept = self._own_patches()
         waiting = self._waiting_left(kept)
-        known = set(kept)
-        more = []
-        for patch in waiting + self._lost:
-            if patch not in known:
-                known.add(patch)
+        # one entry for one address and bytes, whichever mark: a patch that waits and one a restart lost are the
+        # same patch, and the one the answer of patches() shows (the waiting one) is the one that stays
+        known = {(addr, after) for addr, after, _ in kept + waiting}
+        more = list(waiting)
+        for patch in self._lost:
+            if (patch[0], patch[1]) not in known:
+                known.add((patch[0], patch[1]))
                 more.append(patch)
         return kept + more, rizin_emulation.run_only_ranges(rows)
 

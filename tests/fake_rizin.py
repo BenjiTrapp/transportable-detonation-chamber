@@ -33,6 +33,7 @@ Environment:
   FAKE_RIZIN_IO_CACHE_ONCE  set: only the first ``e io.cache=true`` takes (the console switched it off after)
   FAKE_RIZIN_ESIL_FLOOD  "<n>": a run that runs into esil.timeout first prints n lines of "WARNING: $ returned 0",
                     as every int3 does under esil.verbose=1 (148 000 a second measured), then the timeout line
+  FAKE_RIZIN_BAD_OMLJ  set: ``omlj`` answers text that is no JSON
   FAKE_RIZIN_NO_SP  set: ``ar SP`` answers nothing (a file whose profile has no SP role)
   FAKE_RIZIN_ESIL_RUNAWAY  set: ``aec`` and ``aesu`` run into esil.timeout (the warning on stderr, the PC where
                     it was)
@@ -1286,7 +1287,7 @@ def answer(cmd):
     if word == "fd.j":
         return flags_at(seek)
     if word == "omlj":
-        return maps_json()
+        return "no maps for you" if os.environ.get("FAKE_RIZIN_BAD_OMLJ") else maps_json()
     if word == "omf":
         return esil_set_perm(rest, seek)
     if word.startswith("a") or word in ("Fa",):

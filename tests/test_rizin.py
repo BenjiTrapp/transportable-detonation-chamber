@@ -4920,6 +4920,131 @@ def test_taking_the_whole_cache_back_leaves_a_waiting_patch_and_the_project_keep
     assert [(w["addr"], w["after"]) for w in _waiting(rz, sid)] == [(0x140001441, "90")]
 
 
+def test_a_patch_that_a_restart_lost_and_one_that_waits_are_one_entry_of_the_project(sessions, sample, fake,
+                                                                                     tmp_path, monkeypatch):
+    """The same address and bytes as one that waits, through ``self._lost`` (a patch a restarted rizin could not
+    take back): the project line held both (``100080:41:r,100080:41``), and a reopened file then named one patch
+    twice, as one that could not be applied and as one held back."""
+    import rizin_sessions
+
+    timers = Timers()
+    monkeypatch.setenv("FAKE_RIZIN_SLOW", "aar:60")
+    path = sample("hang6.exe", b"MZ hang 6")
+    stack = rizin_sessions.ESIL_STACK_ADDR + 0x80
+    first = sessions(analysis_limit=1.0, step_grace=0.5, big_file=1, timer=timers)
+    opened = first.open(path, "tab")
+    session = first.get(opened["session"])
+    _wait_state(session, "done")
+    session.patch(0x140001441, "90")
+    timers.fire()
+    project = tmp_path / "projects" / (opened["file"]["sha256"] + ".rzdb")
+    _plant_patches(project, [(stack, "41", True)])  # a patch that waits, in the emulation's stack
+    first.close(opened["session"])
+    assert session.wait_closed(30)
+
+    mgr = sessions(analysis_limit=1.0, step_grace=0.5, big_file=1, timer=timers)
+    session = mgr.get(mgr.open(path, "tab2")["session"])
+    _wait_state(session, "done")
+    assert session._waiting == [(stack, "41", True)]
+    session.emulation_start(0x140001440)
+    session.patch(stack, "41")  # made again, live: the cache holds it and it waits no more
+    timers.fire()
+    assert _project_patches_of(project) == f"{stack:x}:41"
+
+    session.analyze_full()  # its aar hangs, so rizin is restarted, and the stack is not mapped in the new one
+    _wait_state(session, "stopped")
+    assert session._lost == [(stack, "41", False)] and session._waiting == [(stack, "41", True)]
+    assert session.patches()["patches"] == [] and [w["addr"] for w in session.patches()["waiting"]] == [stack]
+    session.comment(0x1400014B7, "after the restart")
+    timers.fire()
+    assert _project_patches_of(project) == f"{stack:x}:41:r", "one entry, the one the answer shows"
+
+
+def _project_patches_of(project):
+    return project.read_text(encoding="utf-8", errors="surrogateescape").split("\npatches=")[1].split("\n")[0]
+
+
+def test_a_patch_hidden_by_a_live_one_waits_again_when_the_console_takes_the_live_one(rz):
+    # The cache is read **before** what waits is worked out: a `wc-` of the console has taken the live patch out
+    # of the cache, and the mirror only learns that when the cache is read. Worked out first, the patch would be
+    # in neither list while the project still holds it.
+    path, sid = _reopened_with_a_waiting_patch(rz)
+    _patch(rz, sid, addr="0x140001441", bytes="90")
+    assert rz.read(f"/api/rizin/{sid}/patches")["waiting"] == []
+    rz.send(f"/api/rizin/{sid}/console", {"cmd": "wc- 0x140001441 0x140001442"})
+    answer = rz.read(f"/api/rizin/{sid}/patches")
+    assert answer["patches"] == []
+    assert [(w["addr"], w["after"]) for w in answer["waiting"]] == [(0x140001441, "90")]
+    rz.mgr.get(sid).flush()
+    assert _project_patches(rz) == "140001441:90:r"
+
+
+def test_a_reason_does_not_claim_an_unmapped_address_where_the_maps_could_not_be_read(rz, monkeypatch):
+    # omlj answers what is no JSON: what is mapped is not known, so the reason says nothing about it -- for an
+    # address the file's map holds as much as for one it does not
+    path, sid = _patched_over_a_run(rz)
+    rz.close(sid)
+    _plant_patches(rz.project(), [(0x140001441, "90", True), (0xDEADBEEF0000, "90", True)])
+    monkeypatch.setenv("FAKE_RIZIN_BAD_OMLJ", "1")
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    answer = rz.read(f"/api/rizin/{sid}/patches")
+    assert [w["addr"] for w in answer["waiting"]] == [0x140001441, 0xDEADBEEF0000]
+    assert {w["reason"] for w in answer["waiting"]} == {rizin_sessions_reason()}
+
+
+def rizin_sessions_reason():
+    import rizin_sessions
+
+    return rizin_sessions._PATCH_WAITING_REASON
+
+
+def test_a_replay_that_fails_over_the_maps_still_keeps_what_it_held_back(rz, monkeypatch):
+    # omlj is no JSON when the other patches are replayed, so they are named as not applied and the session goes
+    # on -- and the patch held back, which needed no command, is still waiting and still in the answer
+    path, sid = _patched_over_a_run(rz)
+    rz.close(sid)
+    _plant_patches(rz.project(), [(0x140001441, "90", True), (0x140001460, "41")])
+    monkeypatch.setenv("FAKE_RIZIN_BAD_OMLJ", "1")
+    described = rz.open(path)
+    note = described["analysis"]["note"] or ""
+    assert "1 saved patch could not be applied to this file." in note and "Held back" in note, note
+    sid = described["session"]
+    rz.wait_done(sid)
+    assert [(w["addr"], w["after"]) for w in _waiting(rz, sid)] == [(0x140001441, "90")]
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})  # a save
+    rz.close(sid)
+    assert _project_patches(rz) == "140001441:90:r"
+
+
+def test_nothing_asks_for_the_maps_where_nothing_waits(rz):
+    sid = rz.session()
+    _patch(rz, sid, addr="0x140001440", bytes="90")
+    mark = len(rz.commands())
+    assert rz.read(f"/api/rizin/{sid}/patches")["waiting"] == []
+    assert "omlj" not in _commands_since(rz, mark), "the read is for the reason of a waiting patch only"
+
+
+def test_a_rizin_that_dies_over_the_maps_costs_no_answer_and_ends_the_session(rz, monkeypatch):
+    """The read of omlj is for one sentence of prose and must not cost the answer, but the pipe it died on is
+    dead: the session is ended as _call ends one -- the answer is what was read before, the next request says
+    "session ended", and the session is not reported as live in between."""
+    path, sid = _patched_over_a_run(rz)
+    rz.close(sid)
+    monkeypatch.setenv("FAKE_RIZIN_CRASH", "omlj")
+    sid = rz.open(path)["session"]  # a project that only holds a patch back sends no omlj
+    rz.wait_done(sid)
+    session = rz.mgr.get(sid)
+    response = rz.get(f"/api/rizin/{sid}/patches")
+    assert response.status_code == 200, response.get_json()
+    answer = response.get_json()
+    assert answer["patches"] == [] and [(w["addr"], w["after"]) for w in answer["waiting"]] == [(0x140001441, "90")]
+    assert answer["waiting"][0]["reason"] == rizin_sessions_reason(), "the sentence is not guessed at"
+    assert session.closed is True, "a dead pipe is not a live session"
+    again = rz.get(f"/api/rizin/{sid}/patches")
+    assert again.status_code == 404 and again.get_json()["error"] == "session ended"
+
+
 def test_a_patch_held_back_twice_waits_once(sessions, sample):
     # _recover replays the mirror into a session that may already hold the same patch back (made again, by
     # hand, over the same run's bytes); the list of what waits must not grow a second entry for it
