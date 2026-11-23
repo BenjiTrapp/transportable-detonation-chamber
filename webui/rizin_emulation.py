@@ -649,8 +649,9 @@ def restore_line(record, budget):
     did would replay to somewhere nobody named. The patches have the budget first, so ``budget`` is what is
     left of PROJECT_PATCH_CHARS after them, and the line is counted without its ``restore=``.
 
-    A record that is none (a wrong kind, an address that is no machine word, a start that is not first) is a
-    mistake of the caller and raises ValueError, so that it is found when it is made and not when the line
+    A record that is none (a wrong kind, an address that is no machine word, a start that is not first) and a
+    ``budget`` that is no whole number (a float, a bool, text, None) are mistakes of the caller and raise
+    ValueError, the same one for both, so that it is found when it is made and not when the line
     is read back and refused.
 
     The line is compact and holds only characters of [0-9a-f:,;-] and the kinds' words, so it has no
@@ -663,6 +664,8 @@ def restore_line(record, budget):
     that was cut short does not end in it, and a cut at a comma would otherwise read as a shorter record.
     The breakpoints are written sorted, once each.
     """
+    if isinstance(budget, bool) or not isinstance(budget, int):
+        raise ValueError("the budget of a restore line is a whole number of characters")
     try:
         points = sorted(set(record["breakpoints"]))
     except (TypeError, KeyError):

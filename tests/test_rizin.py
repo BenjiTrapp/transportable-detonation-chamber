@@ -5196,7 +5196,7 @@ def test_the_mark_goes_through_the_project_and_comes_back(tmp_path):
     src, dst = tmp_path / "in.rzdb", tmp_path / "out.rzdb"
     src.write_text("/\nversion=25\n")
     patches = [(0x140001000, "9090", False), (0x140002000, "41", True), (0x140003000, "42", False)]
-    assert rizin_sessions._sanitize_project(str(src), str(dst), "aaa", "one", ["aaa"], patches) == 0
+    assert rizin_sessions._sanitize_project(str(src), str(dst), "aaa", "one", ["aaa"], patches) == (0, True)
     assert "\npatches=140001000:9090,140002000:41:r,140003000:42\n" in dst.read_text()
     assert rizin_sessions._read_project_meta(str(dst))["patches"] == patches
     # the slice that cuts the line takes the entry it cuts, with its mark: "1:90:" is no entry either
@@ -5349,7 +5349,8 @@ def test_the_tdc_namespace_stays_inside_the_tail_that_is_read_back(tmp_path):
     src, dst = tmp_path / "in.rzdb", tmp_path / "out.rzdb"
     src.write_text("/\nversion=25\n")
     big = [(0x140001000 + i * 0x2000, "90" * rizin_emulation.MAX_PATCH_BYTES, False) for i in range(10)]
-    left_out = rizin_sessions._sanitize_project(str(src), str(dst), "aaa", "one", ["aaa"], big)
+    left_out, fitted = rizin_sessions._sanitize_project(str(src), str(dst), "aaa", "one", ["aaa"], big)
+    assert fitted, "there was no record to fit"
     meta = rizin_sessions._read_project_meta(str(dst))
     # an entry costs 9 + 1 + 2 * MAX_PATCH_BYTES characters, and a comma between two of them
     entry = len("140001000") + 1 + 2 * rizin_emulation.MAX_PATCH_BYTES
@@ -8446,3 +8447,485 @@ def test_real_rizin_the_recorded_skip_value_is_what_was_applied(tmp_path, monkey
         assert "emulation" in session._restore["tainted"]
     finally:
         mgr.shutdown()
+
+
+# --- The timeline in the project: the restore= line (webui/rizin_sessions.py) ----------------------
+
+def _project_text(project):
+    return project.read_text(encoding="utf-8", errors="surrogateescape")
+
+
+def _restore_value(project):
+    """The project's ``restore=`` line, or None where it has none."""
+    return _project_namespace(_project_text(project), "/tdc").get("restore")
+
+
+def _decrypted_and_patched(rz, name="pipesim.exe"):
+    """A file opened, the emulation started, four bytes a run left (written on the pipe, as a run does: a
+    console ``wx`` would spoil the timeline) and a patch of the session's own over the second of them -- the
+    anti-VM check inside freshly decrypted code. Returns the path and the session ID."""
+    path = rz.write(name)
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    _wrote(rz, sid, "0x140001440", "41424344")
+    _patch(rz, sid, addr="0x140001441", bytes="90")
+    return path, sid
+
+
+def _the_timeline():
+    """What _decrypted_and_patched leaves as the project's record."""
+    import hashlib
+    import rizin_emulation
+
+    return {"counters": {"tick": rizin_emulation.TICK_START, "handle": 0, "pseudo": 0}, "breakpoints": [],
+            "actions": [{"kind": "start", "addr": 0x140001440}, {"kind": "patch", "addr": 0x140001441, "data": "90"}],
+            "digests": [{"start": 0x140001440, "end": 0x140001443,
+                         "sha256": hashlib.sha256(bytes.fromhex("41424344")).hexdigest()}]}
+
+
+def _saved_with_a_record(rz, name="pipesim.exe"):
+    """_decrypted_and_patched and saved: the path, the session ID and the line the project holds."""
+    path, sid = _decrypted_and_patched(rz, name)
+    rz.mgr.get(sid).flush()
+    line = _restore_value(rz.project())
+    assert line, "the save wrote no record"
+    return path, sid, line
+
+
+def _mark_dirty(rz, sid):
+    """A change the timeline knows nothing of, so that a save is asked for."""
+    rz.send(f"/api/rizin/{sid}/comment", {"addr": "0x1400014b7", "text": "a save, please"})
+
+
+def test_the_timeline_survives_a_save_and_comes_back_on_open(rz):
+    import rizin_emulation
+    import rizin_sessions
+
+    path, sid, line = _saved_with_a_record(rz)
+    expected = _the_timeline()
+    assert rizin_emulation.read_restore(line) == expected
+    text = _project_text(rz.project())
+    assert text.index("\npatches=140001441:90:r\n") < text.index("\nrestore=" + line), "after the patches"
+    assert text.endswith("\nrestore=" + line + "\n")
+    meta = rizin_sessions._read_project_meta(str(rz.project()))
+    assert meta["restore"] == expected and meta["restore_refused"] is False
+    assert (meta["level"], meta["mode"]) == ("aaa", "one") and meta["patches"] == [(0x140001441, "90", True)]
+    rz.close(sid)
+
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    session = rz.mgr.get(sid)
+    assert session._restore_saved == expected, "it came back"
+    assert "timeline" not in (rz.status(sid)["analysis"]["note"] or ""), "and says nothing: it is in order"
+    assert [(w["addr"], w["after"]) for w in _waiting(rz, sid)] == [(0x140001441, "90")]
+    # a save of this session, which has done nothing to the emulation, carries it on as it was
+    _mark_dirty(rz, sid)
+    session.flush()
+    assert _restore_value(rz.project()) == line
+
+
+def test_a_project_from_before_the_record_reads_as_having_none(tmp_path):
+    import rizin_sessions
+
+    project = tmp_path / "old.rzdb"
+    project.write_text("/\nversion=25\n\n/tdc\nlevel=aa\nmode=one\ndone=aa\npatches=140001440:90\n")
+    meta = rizin_sessions._read_project_meta(str(project))
+    assert meta["restore"] is None and meta["restore_refused"] is False
+    assert rizin_sessions._read_project_meta(str(tmp_path / "gone.rzdb"))["restore"] is None
+    project.write_text("/\nversion=25\n\n/tdc\nlevel=aa\nmode=one\ndone=aa\npatches=\nrestore=\n")
+    assert rizin_sessions._read_project_meta(str(project))["restore_refused"] is False, "an empty line is no line"
+
+
+def test_the_timeline_is_hashed_over_the_rows_in_the_order_they_were_written_when_it_is_saved(rz):
+    # spec 5, at the file: by address the two rows swap places and the digest is of `aaeeccdd`, a plausible SHA-256
+    # nobody's bytes are. run_digests cannot tell the two orders apart, so what the save feeds it is pinned here
+    import hashlib
+
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    _wrote(rz, sid, "0x140002201", "ee")
+    _wrote(rz, sid, "0x140002200", "aabbccdd")
+    _mark_dirty(rz, sid)
+    rz.mgr.get(sid).flush()
+    import rizin_emulation
+
+    record = rizin_emulation.read_restore(_restore_value(rz.project()))
+    assert record["digests"] == [{"start": 0x140002200, "end": 0x140002203,
+                                  "sha256": hashlib.sha256(bytes.fromhex("aabbccdd")).hexdigest()}]
+    assert record["digests"][0]["sha256"] != hashlib.sha256(bytes.fromhex("aaeeccdd")).hexdigest()
+
+
+def test_the_patches_win_the_budget_and_the_record_falls_away_whole(rz, monkeypatch):
+    import rizin_sessions
+
+    path, sid, line = _saved_with_a_record(rz)
+    session = rz.mgr.get(sid)
+    patches = "140001441:90:r"
+    chars = rizin_sessions.PROJECT_PATCH_CHARS
+    # exactly the budget the two share: it fits ...
+    monkeypatch.setattr(rizin_sessions, "PROJECT_PATCH_CHARS", len(patches) + len(line))
+    _mark_dirty(rz, sid)
+    session.flush()
+    assert _restore_value(rz.project()) == line and "\npatches=" + patches + "\n" in _project_text(rz.project())
+    assert "did not fit" not in (rz.status(sid)["analysis"]["note"] or "")
+    # ... and one character less does not: the patches are whole, the record is not there at all, and the
+    # session says so -- not a half of it that would replay to somewhere nobody named
+    monkeypatch.setattr(rizin_sessions, "PROJECT_PATCH_CHARS", len(patches) + len(line) - 1)
+    _mark_dirty(rz, sid)
+    session.flush()
+    text = _project_text(rz.project())
+    assert "\npatches=" + patches + "\n" in text
+    assert "restore=" not in text
+    note = rz.status(sid)["analysis"]["note"]
+    assert "timeline" in note and "did not fit" in note and str(len(patches) + len(line) - 1) in note, note
+    # the record would have fitted alone: it is the patches that took the room
+    assert len(line) <= len(patches) + len(line) - 1
+    # said once, however many saves follow
+    _mark_dirty(rz, sid)
+    session.flush()
+    assert rz.status(sid)["analysis"]["note"].count("did not fit") == 1
+    # and a save with room again puts it back, and the note that said it was gone goes
+    monkeypatch.setattr(rizin_sessions, "PROJECT_PATCH_CHARS", chars)
+    _mark_dirty(rz, sid)
+    session.flush()
+    assert _restore_value(rz.project()) == line
+    assert "did not fit" not in (rz.status(sid)["analysis"]["note"] or "")
+
+
+def test_the_patches_alone_filling_the_budget_leave_the_record_nothing(rz, monkeypatch):
+    import rizin_sessions
+
+    path, sid, line = _saved_with_a_record(rz)
+    monkeypatch.setattr(rizin_sessions, "PROJECT_PATCH_CHARS", len("140001441:90:r"))
+    _mark_dirty(rz, sid)
+    rz.mgr.get(sid).flush()
+    text = _project_text(rz.project())
+    assert "\npatches=140001441:90:r\n" in text and "restore=" not in text
+
+
+def test_a_waiting_patch_that_the_budget_cuts_is_still_listed_and_the_note_counts_it(rz, monkeypatch):
+    # Task 1's residue, now that the record shares the budget: a waiting patch is the last the patches line
+    # takes, so it is the first the budget cuts. It stays in the session's list (this session still holds it),
+    # the note states the number and says it will not be there at the next open -- true, and said
+    import rizin_sessions
+
+    path, sid = _reopened_with_a_waiting_patch(rz)
+    session = rz.mgr.get(sid)
+    _patch(rz, sid, addr="0x140001460", bytes="41")
+    monkeypatch.setattr(rizin_sessions, "PROJECT_PATCH_CHARS", len("140001460:41"))
+    session.flush()
+    assert _project_patches(rz) == "140001460:41"
+    assert [(w["addr"], w["after"]) for w in _waiting(rz, sid)] == [(0x140001441, "90")]
+    assert "1 patch did not fit into the project" in rz.status(sid)["analysis"]["note"]
+
+
+@pytest.mark.parametrize("hostile", [
+    "nonsense",
+    "1;100000,0,0;;start:140001440;;",                     # a line cut where its terminator should be
+    "1;100000,0,0;;start:140001440;;end;and then more",     # one that goes on past it
+    "1;100000,0,0;;poke:140001440;;end",                    # a kind nobody knows
+    "1;100000,0,0;;run:step;;end",                          # a timeline that does not begin with a start
+    "1;100000,0,0;;start:zz;;end",                          # an address that is no number
+    "1;100000,0,0;;start:140001440,patch:1:9;;end",         # bytes that are no bytes
+    "1;100000,0,0;;start:140001440;1-2-ab;end",             # a hash that is no SHA-256
+    "2;100000,0,0;;start:140001440;;end",                   # another version
+    "1;100000,0,0;;" + ",".join(["start:1"] + ["run:step"] * 600) + ";;end",   # more than a record may hold
+    "a" * (40 * 1024),                                      # more than the budget a save could have spent, and still in the tail
+])
+def test_a_hand_edited_record_is_refused_and_the_session_still_starts(rz, hostile):
+    path, sid, line = _saved_with_a_record(rz)
+    rz.close(sid)
+    text = _project_text(rz.project())
+    planted = text.replace("\nrestore=" + line + "\n", "\nrestore=" + hostile + "\n")
+    assert planted != text
+    rz.project().write_text(planted, encoding="utf-8", errors="surrogateescape")
+
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)  # the session starts, and finishes its analysis
+    session = rz.mgr.get(sid)
+    assert session._restore_saved is None, "None means no record"
+    note = rz.status(sid)["analysis"]["note"]
+    assert "timeline" in note and "not used" in note, note
+    assert note.index("Held back") < note.index("timeline"), "the damage first, the convenience after: " + note
+    assert [(w["addr"], w["after"]) for w in _waiting(rz, sid)] == [(0x140001441, "90")], "the patches are not touched"
+    # nothing of it is carried into the next save: the nonsense is gone, the patches are not
+    _mark_dirty(rz, sid)
+    session.flush()
+    text = _project_text(rz.project())
+    assert "restore=" not in text and "\npatches=140001441:90:r\n" in text
+
+
+def test_a_record_over_the_reading_cap_is_refused_without_being_parsed(rz, monkeypatch):
+    # R-T2d: read_restore builds all its actions before the budget could apply, so the cap is in front of it
+    import rizin_emulation
+    import rizin_sessions
+
+    seen = []
+    real = rizin_emulation.read_restore
+    monkeypatch.setattr(rizin_emulation, "read_restore", lambda value: seen.append(len(value)) or real(value))
+    project = rz.project()
+    project.parent.mkdir(parents=True, exist_ok=True)
+    over = "1;0,0,0;;" + ",".join(["start:1"] * 4500) + ";;end"
+    assert len(over) > rizin_sessions.PROJECT_PATCH_CHARS
+    project.write_text(f"/\nversion=25\n\n/tdc\nlevel=aa\nmode=one\ndone=aa\npatches=\nrestore={over}\n")
+    meta = rizin_sessions._read_project_meta(str(project))
+    assert meta["restore"] is None and meta["restore_refused"] is True and seen == []
+    under = "1;0,0,0;;start:1;;end"
+    project.write_text(f"/\nversion=25\n\n/tdc\nlevel=aa\nmode=one\ndone=aa\npatches=\nrestore={under}\n")
+    assert rizin_sessions._read_project_meta(str(project))["restore"]["actions"] == [{"kind": "start", "addr": 1}]
+    assert seen == [len(under)]
+
+
+def _hand_set_a_register(rz, sid):
+    rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rax", "value": "0x5"})
+
+
+def _wrote_by_console(rz, sid):
+    _console(rz, sid, "wx 90 @ 0x140002000")
+
+
+def _moved_a_breakpoint(rz, sid):
+    # taints nothing yet (it is a reason until an action follows), and the save asks the reason
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
+
+
+_SPOILS = {"register": _hand_set_a_register, "console write": _wrote_by_console,
+           "standing breakpoint": _moved_a_breakpoint}
+
+
+@pytest.mark.parametrize("spoil", sorted(_SPOILS))
+def test_a_record_with_a_reason_is_not_written_and_does_not_erase_what_is_stored(rz, spoil):
+    # R-T3a and R-T3f together: a timeline that cannot be offered is never written (read_restore has no notion
+    # of taint, so it would come back clean), and it does not take the project's own line with it either
+    path, sid, line = _saved_with_a_record(rz)
+    rz.close(sid)
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    session = rz.mgr.get(sid)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    _wrote(rz, sid, "0x140009000", "ffeedd")  # a new timeline's bytes: not the stored ones
+    _SPOILS[spoil](rz, sid)
+    assert session._restore_reason(), "the timeline cannot be offered"
+    _mark_dirty(rz, sid)
+    session.flush()
+    assert _restore_value(rz.project()) == line, "the stored line, byte for byte"
+    assert "\npatches=140001441:90:r\n" in _project_text(rz.project())
+
+
+@pytest.mark.parametrize("spoil", sorted(_SPOILS))
+def test_a_record_with_a_reason_and_nothing_stored_writes_no_line_at_all(rz, spoil):
+    sid = rz.session()
+    session = rz.mgr.get(sid)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    _wrote(rz, sid, "0x140009000", "ffeedd")
+    _SPOILS[spoil](rz, sid)
+    assert session._restore_reason()
+    _mark_dirty(rz, sid)
+    session.flush()
+    assert rz.project().exists() and "restore=" not in _project_text(rz.project())
+
+
+def test_no_record_at_save_time_leaves_the_stored_one_alone(rz):
+    # a session that never emulated, a timeline an unpatch took out of the cache, and the other way round:
+    # none of them says anything about what the project holds, and none of them may erase it
+    path, sid, line = _saved_with_a_record(rz)
+    rz.close(sid)
+
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    session = rz.mgr.get(sid)
+    assert session._restore is None
+    _mark_dirty(rz, sid)
+    session.flush()
+    assert _restore_value(rz.project()) == line, "a session that never emulated"
+
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    _wrote(rz, sid, "0x140009000", "ffeedd")
+    session.unpatch()
+    assert session._restore is None and session._restore_gone
+    session.flush()
+    assert _restore_value(rz.project()) == line, "after an unpatch"
+
+
+def test_a_clean_record_replaces_the_stored_one(rz):
+    import rizin_emulation
+
+    path, sid, line = _saved_with_a_record(rz)
+    rz.close(sid)
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001450"})
+    _wrote(rz, sid, "0x140009000", "ffeedd")
+    _mark_dirty(rz, sid)
+    rz.mgr.get(sid).flush()
+    now = _restore_value(rz.project())
+    assert now != line
+    record = rizin_emulation.read_restore(now)
+    assert record["actions"] == [{"kind": "start", "addr": 0x140001450}]
+    assert [(d["start"], d["end"]) for d in record["digests"]] == [(0x140009000, 0x140009002)]
+
+
+def test_a_timeline_with_nothing_of_a_run_to_prove_writes_nothing_and_keeps_what_is_stored(rz):
+    # started, and the run left nothing in the cache: a record with no digest proves nothing, so it is not
+    # the one that replaces a record that does
+    path, sid, line = _saved_with_a_record(rz)
+    rz.close(sid)
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    _mark_dirty(rz, sid)
+    rz.mgr.get(sid).flush()
+    assert _restore_value(rz.project()) == line
+
+
+def test_a_cache_the_digests_cannot_be_made_from_costs_the_record_and_not_the_save(rz, monkeypatch):
+    # R-T2c: parse_cache guarantees the types of a row but not that its bytes are as many as its size
+    import rizin_emulation
+
+    path, sid, line = _saved_with_a_record(rz)
+    rz.close(sid)
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    _wrote(rz, sid, "0x140009000", "ffeedd")
+    real = rizin_emulation.parse_cache
+
+    def short(text):
+        rows = real(text)
+        for row in rows:
+            if row["addr"] == 0x140009000:
+                row["after"] = "ff"  # one byte of the three it says
+        return rows
+
+    monkeypatch.setattr(rizin_emulation, "parse_cache", short)
+    _mark_dirty(rz, sid)
+    rz.mgr.get(sid).flush()
+    text = _project_text(rz.project())
+    assert "\n/tdc\nlevel=aaa" in text and "\npatches=140001441:90:r\n" in text, "the project was written"
+    assert _restore_value(rz.project()) == line, "and what it held stays"
+
+
+def test_the_record_and_the_waiting_patches_survive_a_rizin_restart(sessions, sample, fake, tmp_path, monkeypatch):
+    # _recover gives the session a rizin with an empty cache and drops the live timeline (Task 3): the project's
+    # line is not that rizin's to erase. R-T3f at the place a hung step puts it
+    import rizin_sessions
+
+    timers = Timers()
+    monkeypatch.setenv("FAKE_RIZIN_SLOW", "aar:60")
+    mgr = sessions(analysis_limit=1.0, step_grace=0.5, big_file=1, timer=timers)
+    opened = mgr.open(sample("restart_record.exe", b"MZ restart record"), "tab")
+    session = mgr.get(opened["session"])
+    _wait_state(session, "done")
+    project = tmp_path / "projects" / (opened["file"]["sha256"] + ".rzdb")
+    session.emulation_start(0x140001440)
+    session._pipe.cmd("wx 41424344 @ 0x140001440")
+    session.patch(0x140001441, "90")
+    timers.fire()
+    line = _restore_value(project)
+    assert line and _project_patches_of(project) == "140001441:90:r"
+
+    session.analyze_full()  # its aar hangs, so rizin is killed and restarted
+    _wait_state(session, "stopped")
+    assert session._restore is None and session._restore_gone == rizin_sessions._RESTORE_RESTARTED
+    assert session._waiting == [(0x140001441, "90", True)]
+    session.comment(0x1400014B7, "after the restart")
+    timers.fire()
+    assert _restore_value(project) == line, "the record the project held is still there"
+    assert _project_patches_of(project) == "140001441:90:r", "and so is the patch that waits"
+
+
+def test_a_tainted_timeline_is_not_written_to_a_session_that_saves_it_first_either(rz):
+    # the first save of a tainted timeline: nothing stored, nothing written -- and a later clean one is written
+    sid = rz.session()
+    session = rz.mgr.get(sid)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    _wrote(rz, sid, "0x140009000", "ffeedd")
+    _hand_set_a_register(rz, sid)
+    _mark_dirty(rz, sid)
+    session.flush()
+    assert "restore=" not in _project_text(rz.project())
+    session.unpatch()  # taken out: the timeline goes, and a new one can begin
+    rz.send(f"/api/rizin/{sid}/emulation/stop")
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    _wrote(rz, sid, "0x140009000", "ffeedd")
+    _mark_dirty(rz, sid)
+    session.flush()
+    assert "restore=" in _project_text(rz.project())
+
+
+@pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
+@pytest.mark.skipif(not RZ_ASM, reason="rz-asm not installed")
+def test_real_rizin_the_project_round_trips_the_record(tmp_path):
+    """``Ps``, a reopen and ``Poo``: the record comes back unchanged and rizin still loads the project.
+
+    Only the binary can show it: the line goes into a /tdc namespace that rizin's own ``Ps`` and ``Poo`` read
+    around, and what rizin does with a ``;``, a ``:`` and a ``-`` in a value, and with a namespace it does not
+    know, is its own. The record is made of a real decryption (the digest is the SHA-256 of what rizin's ESIL
+    left), saved over a patch of the decrypted code, and read back by a session that has not run anything."""
+    import hashlib
+    import rizin_emulation
+    import rizin_sessions
+
+    blob = tmp_path / "decryptor.bin"
+    stop = _decryptor_blob(blob)
+    sha = hashlib.sha256(blob.read_bytes()).hexdigest()
+    project = tmp_path / "projects" / (sha + ".rzdb")
+    plain = bytes(b ^ 0xFF for b in blob.read_bytes()[0x1000:0x1040])
+    mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(tmp_path / "projects"))
+    try:
+        session = mgr.get(mgr.open(str(blob), "tab")["session"])
+        _wait_state(session, "done", timeout=60)
+        session.console("e asm.arch=x86")  # a raw blob is read for the host's arch (avr here)
+        session.console("e asm.bits=64")
+        session.emulation_start(0)
+        assert session.emulation_run("until", stop)["pc"] == hex(stop)
+        session.patch(0x1002, "9090")  # the check inside what was decrypted
+        assert session.flush() is True
+        saved = _project_text(project)
+        line = _restore_value(project)
+        expected = {"counters": {"tick": rizin_emulation.TICK_START, "handle": 0, "pseudo": 0}, "breakpoints": [],
+                    "actions": [{"kind": "start", "addr": 0}, {"kind": "run", "run": "until", "addr": stop},
+                                {"kind": "patch", "addr": 0x1002, "data": "9090"}],
+                    "digests": [{"start": 0x1000, "end": 0x103F, "sha256": hashlib.sha256(plain).hexdigest()}]}
+        assert rizin_emulation.read_restore(line) == expected
+        assert "\npatches=1002:9090:r\n" in saved and saved.endswith("\nrestore=" + line + "\n")
+        assert "\n/tdc\n" in saved and saved.count("\nrestore=") == 1
+    finally:
+        mgr.shutdown()
+
+    # the real Poo: a new session loads the project (e prj.file says so), the record is the one that was saved,
+    # and a save that does nothing to the emulation writes the same line again
+    mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(tmp_path / "projects"))
+    try:
+        session = mgr.get(mgr.open(str(blob), "tab")["session"])
+        _wait_state(session, "done", timeout=60)
+        assert session.text("e prj.file").strip() == str(project), "rizin loaded the project"
+        assert not project.with_suffix(".rzdb.broken").exists()
+        assert session._restore_saved == expected
+        assert "timeline" not in (session.analysis["note"] or "")
+        session.breakpoint_set(0x8000)
+        assert session.flush() is True
+        assert _restore_value(project) == line
+        assert _project_text(project).count("\n/tdc\n") == 1
+        # and once more over the file the second save wrote
+        session.breakpoint_set(0x8001)
+        assert session.flush() is True
+        assert _restore_value(project) == line
+    finally:
+        mgr.shutdown()
+
+
+def test_a_timeline_that_grows_and_is_then_spoiled_leaves_the_line_as_the_last_clean_save_made_it(rz):
+    # what was saved is a copy: the actions the live timeline gains afterwards are not in it, and a spoiled
+    # timeline does not rewrite it with half a growth and the digests of before
+    path, sid, line = _saved_with_a_record(rz)
+    session = rz.mgr.get(sid)
+    _run(rz, sid, "step")
+    _wrote(rz, sid, "0x140009000", "ffeedd")
+    _hand_set_a_register(rz, sid)
+    assert len(session._restore["actions"]) == 3 and session._restore_reason()
+    _mark_dirty(rz, sid)
+    session.flush()
+    assert _restore_value(rz.project()) == line
+    assert len(session._restore_saved["actions"]) == 2

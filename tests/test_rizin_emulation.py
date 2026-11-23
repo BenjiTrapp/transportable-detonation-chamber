@@ -1003,6 +1003,17 @@ def test_restore_line_says_when_it_does_not_fit():
     assert rizin_emulation.restore_line(dict(record, actions=[start] + runs + [runs[0]]), 10 ** 6) == ("", False)
 
 
+def test_restore_line_refuses_a_budget_that_is_no_whole_number_as_it_refuses_a_bad_record():
+    """R-T2e: the seam is symmetric. A float used to be taken silently and a text or None raised a bare
+    TypeError from inside the comparison; a bool is an int to Python and is no number of characters."""
+    record = _timeline()
+    whole = len(_TIMELINE_LINE)
+    for budget in (float(whole), whole + 0.5, float("inf"), True, False, None, "100", [], b"1"):
+        with pytest.raises(ValueError, match="budget"):
+            rizin_emulation.restore_line(record, budget)
+    assert rizin_emulation.restore_line(record, whole) == (_TIMELINE_LINE, True)
+
+
 def test_restore_line_refuses_a_record_that_read_restore_would_refuse():
     """The writer holds to what the reader accepts: a record the server built wrong is a mistake to find
     where it is made, not a line that cannot be read back at the next open."""
