@@ -153,6 +153,7 @@ function onThemeChange() {
     _themeColorCache.clear();
     if (state.activeTab === 'graph') renderGraph();
     if (state.activeTab === 'tracing') renderRtraceTimeline();
+    if (state.activeTab === 'syscalls') renderSyscallMap();
     renderDashboard();
     FileMapView.repaint();
 }
@@ -484,6 +485,7 @@ function switchTab(tabName) {
     if (tabName === 'rizin') {
         rizinTabShown();
     }
+    if (tabName === 'syscalls') syscallsTabShown();
 }
 
 // Fetch scanner/EMBER tool availability and update badges + dashboard state.
@@ -24782,4 +24784,761 @@ async function rizinCheckInstalled() {
         rizinSetUi('not-installed', { path: typeof r.data.path === 'string' ? r.data.path : null });
     }
     return !!r.data.installed;
+}
+
+// =============================================
+// SYSCALLS
+// =============================================
+// The map of every syscall of ntdll.dll and win32u.dll: one cell per syscall in
+// the order of its number, a band per module (/api/syscalls/...). Without a scan
+// the cells show the baseline and the map is the catalog; after a scan each
+// cell carries the state the stub was measured in. Names, owners and notes
+// come from the baseline and from the target process, so they are escaped or
+// set as text. The map is drawn on canvas, colours through themeColor(); the
+// cells keep their place whatever the filter says, which only dims them.
+const SYSCALL_STATES = ['intact', 'hooked', 'patched', 'diverged', 'unreadable'];
+const SYSCALL_STATE_COLORS = {
+    intact: '--syscall-intact', hooked: '--syscall-hooked', patched: '--syscall-patched',
+    diverged: '--syscall-diverged', unreadable: '--syscall-unreadable',
+};
+const SYSCALL_STATE_HELP = {
+    intact: 'The stub is as the baseline has it.',
+    hooked: 'The stub jumps into a loaded module other than ntdll, which a file backs: an EDR hook.',
+    patched: 'The stub jumps into private memory that no file backs.',
+    diverged: 'The bytes differ, but the jump is not into a foreign module and not into private memory, or its target cannot be resolved. Not guessed at.',
+    unreadable: 'No stub could be read.',
+};
+const SYSCALL_MODULES = ['ntdll.dll', 'win32u.dll'];
+// The map in px: a cell and the gap between cells, the room around the grid for the ring of the outer
+// cells, the ring a patched or diverged cell gets and its alpha; the alpha of the baseline tone (no scan)
+// and of a cell the filter does not match
+const SYSCALL_MAP = { cell: 10, gap: 2, pad: 3, halo: 2, haloAlpha: 0.35, baseline: 0.75, dim: 0.18 };
+// The catalog under the map lists this many rows of the filtered baseline; /baseline pages hold at most SYSCALL_PAGE
+const SYSCALL_ROWS_MAX = 300;
+const SYSCALL_PAGE = 500;
+const SYSCALL_POLL_MS = 4000;
+
+// The syscalls grouped by module, the modules in SYSCALL_MODULES order and the others after them, each band by number
+function syscallBands(items) {
+    const byModule = new Map();
+    for (const item of items) {
+        const key = String(item.module || '').toLowerCase();
+        if (!byModule.has(key)) byModule.set(key, []);
+        byModule.get(key).push(item);
+    }
+    const known = SYSCALL_MODULES.filter(m => byModule.has(m));
+    const others = [...byModule.keys()].filter(m => !SYSCALL_MODULES.includes(m)).sort();
+    return [...known, ...others].map(module => ({
+        module, items: byModule.get(module).slice().sort((a, b) => a.number - b.number),
+    }));
+}
+
+// Where the cells of a band of `count` go in a canvas `width` px wide: rows from the left, a whole number of columns
+function syscallBandLayout(count, width) {
+    const { cell, gap, pad } = SYSCALL_MAP;
+    const pitch = cell + gap;
+    const cols = Math.max(1, Math.floor((width - 2 * pad + gap) / pitch));
+    const rows = count > 0 ? Math.ceil(count / cols) : 0;
+    return { cols, rows, cell, pitch, pad, count, width, height: rows > 0 ? rows * pitch - gap + 2 * pad : 0 };
+}
+
+function syscallCellOrigin(layout, index) {
+    return { x: layout.pad + (index % layout.cols) * layout.pitch,
+             y: layout.pad + Math.floor(index / layout.cols) * layout.pitch };
+}
+
+// The index of the cell at a point of the canvas; -1 in a gap, outside the grid and past the last cell
+function syscallCellAt(layout, x, y) {
+    const dx = x - layout.pad, dy = y - layout.pad;
+    if (dx < 0 || dy < 0) return -1;
+    const col = Math.floor(dx / layout.pitch), row = Math.floor(dy / layout.pitch);
+    if (col >= layout.cols || dx - col * layout.pitch >= layout.cell || dy - row * layout.pitch >= layout.cell) return -1;
+    const index = row * layout.cols + col;
+    return index < layout.count ? index : -1;
+}
+
+// How a cell is drawn. Without a measurement (state null or undefined) it is the baseline tone: the colour of an
+// intact stub, held back, so a map that was never scanned draws no eye. A measured intact stub is that colour in
+// full; every deviation is a colour of its own, and patched and diverged get a ring in the gap around the cell.
+// A state the server does not send counts as diverged, never as quiet. `dimmed`: the filter does not match.
+function syscallCellLook(state, dimmed) {
+    let look;
+    if (state === null || state === undefined) {
+        look = { state: 'intact', alpha: SYSCALL_MAP.baseline, halo: 0, hollow: false, loud: false };
+    } else {
+        const known = Object.prototype.hasOwnProperty.call(SYSCALL_STATE_COLORS, state) ? state : 'diverged';
+        look = {
+            state: known, alpha: 1, loud: known !== 'intact',
+            halo: known === 'patched' || known === 'diverged' ? SYSCALL_MAP.halo : 0,
+            hollow: known === 'unreadable',
+        };
+    }
+    if (dimmed) look = { ...look, alpha: SYSCALL_MAP.dim, halo: 0, loud: false };
+    look.color = SYSCALL_STATE_COLORS[look.state];
+    return look;
+}
+
+// The colour of a state from the theme; a state the server does not send reads as diverged
+function syscallStateColor(state, alpha) {
+    const known = Object.prototype.hasOwnProperty.call(SYSCALL_STATE_COLORS, state) ? state : 'diverged';
+    return themeColor(SYSCALL_STATE_COLORS[known], alpha);
+}
+
+// One band onto its canvas context (in CSS px). model: states (Map name → state, or null without a scan), match
+// (Set of the names the filter matches, or null for all), selected and hover (names). The quiet cells first and
+// the deviations after them, so no neighbour paints over a ring.
+function syscallDrawBand(ctx, layout, cells, model) {
+    const { states, match, selected, hover } = model;
+    const size = layout.cell;
+    ctx.clearRect(0, 0, layout.width, layout.height);
+    const looks = cells.map(cell => syscallCellLook(states ? states.get(cell.name) : null,
+                                                     match !== null && match !== undefined && !match.has(cell.name)));
+    for (const pass of [false, true]) {
+        for (let i = 0; i < cells.length; i++) {
+            const look = looks[i];
+            if (look.loud !== pass) continue;
+            const { x, y } = syscallCellOrigin(layout, i);
+            ctx.globalAlpha = look.alpha;
+            if (look.halo) {
+                ctx.fillStyle = syscallStateColor(look.state, SYSCALL_MAP.haloAlpha);
+                ctx.fillRect(x - look.halo, y - look.halo, size + 2 * look.halo, size + 2 * look.halo);
+            }
+            if (look.hollow) {
+                ctx.strokeStyle = syscallStateColor(look.state);
+                ctx.lineWidth = 1;
+                ctx.strokeRect(x + 0.5, y + 0.5, size - 1, size - 1);
+            } else {
+                ctx.fillStyle = syscallStateColor(look.state);
+                ctx.fillRect(x, y, size, size);
+            }
+        }
+    }
+    ctx.globalAlpha = 1;
+    for (const [name, color, width] of [[selected, '--text-primary', 2], [hover, '--text-secondary', 1]]) {
+        const index = name ? cells.findIndex(cell => cell.name === name) : -1;
+        if (index < 0) continue;
+        const { x, y } = syscallCellOrigin(layout, index);
+        ctx.strokeStyle = themeColor(color);
+        ctx.lineWidth = width;
+        ctx.strokeRect(x - 1.5, y - 1.5, size + 3, size + 3);
+    }
+}
+
+// A syscall number as 0x3A
+function syscallHex(number) {
+    const n = Number(number);
+    return Number.isFinite(n) ? '0x' + Math.trunc(n).toString(16).toUpperCase().padStart(2, '0') : '?';
+}
+
+// The legend under the toolbar: each state with its count, `–` before a scan. `unscanned`: syscalls of the baseline
+// the measurement did not cover (win32u is left out unless asked for), which keep the baseline tone.
+function syscallMapLegendHtml(counts, unscanned) {
+    const measured = counts !== null && typeof counts === 'object';
+    let html = '';
+    for (const state of SYSCALL_STATES) {
+        const n = measured ? Number(counts[state]) : NaN;
+        html += `<span class="syscall-legend-item" title="${escapeHtml(SYSCALL_STATE_HELP[state])}">` +
+                `<span class="syscall-legend-dot syscall-state-${cssToken(state)}"></span>` +
+                `<span class="syscall-legend-name">${escapeHtml(state)}</span>` +
+                `<span class="syscall-legend-count">${Number.isFinite(n) ? n.toLocaleString('en-US') : '–'}</span></span>`;
+    }
+    if (measured && unscanned > 0) {
+        html += `<span class="syscall-legend-note">${Number(unscanned).toLocaleString('en-US')} not scanned</span>`;
+    }
+    return html;
+}
+
+// One row of the catalog under the map: the dot of its state, its name, its module and its number. `state` is
+// the measured state, absent without a scan; `selected` marks the chosen syscall.
+function syscallRowHtml(entry) {
+    const name = String(entry.name === null || entry.name === undefined ? '' : entry.name);
+    const state = entry.state ? String(entry.state) : '';
+    const module = String(entry.module || '').replace(/\.dll$/i, '');
+    return `<button type="button" class="syscall-row${entry.selected ? ' selected' : ''}"${entry.selected ? ' aria-current="true"' : ''} ` +
+           `data-name="${escapeHtml(name)}" ` +
+           `aria-label="${escapeHtml(`${name}, ${state || 'not scanned'}`)}" onclick="syscallSelect(${jsArg(name)})">` +
+           `<span class="syscall-row-dot syscall-state-${cssToken(state || 'baseline')}" title="${escapeHtml(state || 'not scanned')}"></span>` +
+           `<span class="syscall-row-name">${escapeHtml(name)}</span>` +
+           `<span class="syscall-row-module">${escapeHtml(module)}</span>` +
+           `<span class="syscall-row-num" title="${escapeHtml(entry.number)}">${escapeHtml(syscallHex(entry.number))}</span>` +
+           `</button>`;
+}
+
+// A query that reads as a number: decimal, or hex with or without 0x (the server's catalog reads it so too)
+function syscallNumberOf(query) {
+    if (/^[0-9]+$/.test(query)) return parseInt(query, 10);
+    if (/^(0x)?[0-9a-f]+$/i.test(query)) return parseInt(query.replace(/^0x/i, ''), 16);
+    return null;
+}
+
+// Whether the filter matches a syscall: its module, and its name or its number
+function syscallMatches(item, query, module) {
+    const wanted = String(module || '').trim().toLowerCase();
+    if (wanted && String(item.module || '').toLowerCase() !== wanted) return false;
+    const text = String(query || '').trim();
+    if (!text) return true;
+    return String(item.name).toLowerCase().includes(text.toLowerCase()) || item.number === syscallNumberOf(text);
+}
+
+// The names the filter matches, or null when there is no filter and every cell matches
+function syscallMatchSet(items, query, module) {
+    if (!String(query || '').trim() && !String(module || '').trim()) return null;
+    return new Set(items.filter(item => syscallMatches(item, query, module)).map(item => item.name));
+}
+
+// What each view the host needs stands at, from /api/syscalls/status. An arm64 host measures arm64 processes and
+// emulated x64 ones, each against its own view's baseline; an x64 host has the one. ready: the baseline of this
+// build is there; extracting; indistinguishable: the x64 binary under emulation saw the arm64 view, so that
+// extraction was discarded on purpose (not a failure of NTSleuth, and no baseline either); failed; stale: only
+// the baseline of another build; unusable: a file that cannot be read; missing.
+function syscallViewStates(status) {
+    const known = status && typeof status === 'object' ? status : {};
+    const views = known.default_view === 'arm64' ? ['arm64', 'x64'] : ['x64'];
+    const baselines = Array.isArray(known.baselines) ? known.baselines : [];
+    const extraction = known.extraction || {};
+    const running = Array.isArray(extraction.running) ? extraction.running : [];
+    const failed = Array.isArray(extraction.failed) ? extraction.failed : [];
+    return views.map(view => {
+        const ofView = baselines.filter(b => b.view === view);
+        const current = ofView.find(b => b.current);
+        if (current && current.error) {
+            return { view, state: 'unusable', text: `The baseline file ${current.file || ''} cannot be read: ${current.error}` };
+        }
+        if (current) return { view, state: 'ready', text: `Build ${current.build}` };
+        if (running.some(r => r.view === view)) {
+            return { view, state: 'extracting', text: 'NTSleuth is extracting the baseline; this takes a few seconds.' };
+        }
+        const failure = failed.find(f => f.view === view && (!known.build || f.build === known.build));
+        if (failure && failure.indistinguishable) {
+            return { view, state: 'indistinguishable',
+                     text: `ntsleuth-${view}.exe under emulation produced the same view as the native arm64 one, so the ${view} ` +
+                           `baseline was discarded instead of measuring against a wrong reference. Emulated ${view} processes ` +
+                           'cannot be measured on this host.' };
+        }
+        if (failure) return { view, state: 'failed', text: `The extraction failed: ${failure.reason}` };
+        if (ofView.length) {
+            return { view, state: 'stale',
+                     text: `The baseline is of build ${ofView[0].build}, this system is build ${known.build || 'unknown'}.` };
+        }
+        const exe = known.executables && known.executables[view] === false && known.installed
+            ? ` ntsleuth-${view}.exe is not installed.` : '';
+        return { view, state: 'missing',
+                 text: known.installed === false ? 'No baseline. Install NTSleuth to extract one.'
+                                                 : `No baseline for build ${known.build || 'unknown'} yet.${exe}` };
+    });
+}
+
+// The notices over the map: NTSleuth missing, each view that has no baseline (and why), an incomplete parameter table
+function syscallNotices(status, baseline) {
+    const notices = [];
+    if (status && status.installed === false) {
+        notices.push({ kind: 'not-installed', tone: 'warn', title: 'NTSleuth not installed',
+                       text: status.path ? `Expected in ${status.path}. Baselines that exist already still work.` : '' });
+    }
+    const titles = { extracting: 'extracting the baseline', indistinguishable: 'not distinguishable on this host',
+                     failed: 'extraction failed', stale: 'baseline of another build', unusable: 'baseline unusable',
+                     missing: 'no baseline' };
+    const tones = { extracting: 'info', failed: 'error', unusable: 'error' };
+    if (status) {
+        for (const v of syscallViewStates(status)) {
+            if (v.state === 'ready') continue;
+            notices.push({ kind: v.state, tone: tones[v.state] || 'warn', title: `${v.view}: ${titles[v.state]}`, text: v.text });
+        }
+    }
+    if (baseline && baseline.symbols === false) {
+        notices.push({ kind: 'symbols', tone: 'info', title: 'Parameter table incomplete',
+                       text: 'This baseline was extracted without the symbol server. Numbers, RVAs and stub bytes come ' +
+                             'from the disassembly, so the measurement is not affected.' });
+    }
+    return notices;
+}
+
+function syscallNoticesHtml(notices) {
+    return notices.map(n => `<div class="syscall-notice syscall-notice-${cssToken(n.tone)} syscall-notice-${cssToken(n.kind)}">` +
+        `<span class="syscall-notice-title">${escapeHtml(n.title)}</span>` +
+        (n.text ? `<span class="syscall-notice-text">${escapeHtml(n.text)}</span>` : '') + '</div>').join('');
+}
+
+// The line under the tab's title: the stock of the baseline
+function syscallSubtitle(baseline) {
+    if (!baseline || !baseline.items) return 'Syscall baseline and live stub measurement';
+    const total = baseline.items.length;
+    const parts = [`${total.toLocaleString('en-US')} syscall${total === 1 ? '' : 's'}`];
+    for (const band of syscallBands(baseline.items)) parts.push(`${band.module} ${band.items.length.toLocaleString('en-US')}`);
+    if (baseline.build) parts.push(`build ${baseline.build}`);
+    if (baseline.view) parts.push(baseline.view);
+    return parts.join(' · ');
+}
+
+// The <option>s of the target picker: the running processes the UI knows, by name and PID. An exited instance
+// (its PID may be reused) and anything whose PID is no number is left out.
+function syscallTargetsHtml(processes, selected) {
+    const targets = [];
+    for (const proc of Object.values(processes && typeof processes === 'object' ? processes : {})) {
+        if (!proc || proc.exit_time || String(proc.key === undefined ? '' : proc.key).includes('@')) continue;
+        const pid = /^[0-9]+$/.test(String(proc.pid)) ? parseInt(proc.pid, 10) : 0;
+        if (pid > 0) targets.push({ pid, name: String(proc.name || proc.image || 'unknown') });
+    }
+    targets.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()) || a.pid - b.pid);
+    return '<option value="">-- select a process --</option>' + targets.map(t =>
+        `<option value="${t.pid}"${String(t.pid) === String(selected) ? ' selected' : ''}>${escapeHtml(t.name)} (${t.pid})</option>`).join('');
+}
+
+// The line a scan leaves under the toolbar, as text
+function syscallScanSummary(scan) {
+    const counts = scan.counts || {};
+    const total = SYSCALL_STATES.reduce((sum, s) => sum + (Number(counts[s]) || 0), 0);
+    const deviations = total - (Number(counts.intact) || 0);
+    const name = String(scan.process || '').split(/[\\/]/).pop();
+    let text = `PID ${scan.pid}` + (name ? ` (${name})` : '');
+    if (scan.view) text += ` · ${scan.view}`;
+    if (scan.build) text += ` · build ${scan.build}`;
+    text += total === 0 ? ': no stub measured'
+        : `: ${deviations === 0 ? 'no deviations' : `${deviations} deviation${deviations === 1 ? '' : 's'}`} of ${total.toLocaleString('en-US')} stubs`;
+    const evidence = scan.evidence;
+    if (evidence && evidence.label) {
+        text += ` · ${evidence.label}` + (typeof evidence.score === 'number' ? ` ${evidence.score.toFixed(2)}` : '');
+    }
+    if (scan.note) text += ` · ${scan.note}`;
+    else if (scan.partial) text += ' · partial result';
+    return text;
+}
+
+const SYSCALL_VIEW_NAMES = ['map', 'graph'];
+const syscallState = {
+    ready: false,
+    status: null, statusError: '',
+    // The baseline of one view: { view, build, symbols, items: [{ name, module, number }] }
+    baseline: null, baselineError: '', loading: false, loadSeq: 0,
+    bands: [], bandsKey: 0, layouts: new Map(),
+    // The last scan: its answer, the state of each measured syscall (name → state) and the line under the toolbar
+    scan: null, states: null, scanning: false, note: null,
+    query: '', module: '', match: null,
+    selected: '', hover: '',
+    view: 'map',
+    targets: {}, target: '',
+    timer: null,
+};
+
+// A request to /api/syscalls/...: never throws, `data` is an object whatever the answer was
+async function syscallApi(url, options) {
+    try {
+        const resp = await fetch(url, options);
+        let data = null;
+        try { data = await resp.json(); } catch { data = null; }
+        return { ok: resp.ok, status: resp.status, data: data && typeof data === 'object' ? data : {} };
+    } catch (e) {
+        return { ok: false, status: 0, data: { error: e && e.message ? e.message : 'Connection lost' } };
+    }
+}
+
+function syscallErrorText(result) {
+    const text = result.data && typeof result.data.error === 'string' ? result.data.error : '';
+    return text || `The server answered with status ${result.status}.`;
+}
+
+async function syscallLoadStatus() {
+    const r = await syscallApi('/api/syscalls/status');
+    syscallState.statusError = r.ok ? '' : syscallErrorText(r);
+    if (r.ok) syscallState.status = r.data;
+    return r.ok;
+}
+
+// The whole baseline of `view` (this host's own when empty), read page by page. Only what the map needs is kept
+// of each syscall. On success it replaces the baseline: { ok: true }; otherwise { ok: false, error }, or
+// { ok: false, superseded: true } when a newer load started meanwhile.
+async function syscallLoadBaseline(view) {
+    const seq = ++syscallState.loadSeq;
+    const items = [];
+    let meta = null, total = Infinity;
+    while (items.length < total) {
+        const params = new URLSearchParams({ offset: String(items.length), limit: String(SYSCALL_PAGE) });
+        if (view) params.set('view', view);
+        const r = await syscallApi(`/api/syscalls/baseline?${params}`);
+        if (seq !== syscallState.loadSeq) return { ok: false, superseded: true };
+        if (!r.ok) return { ok: false, error: syscallErrorText(r) };
+        meta = r.data;
+        const page = Array.isArray(r.data.items) ? r.data.items : [];
+        total = Number.isFinite(r.data.total) ? r.data.total : 0;
+        for (const item of page) {
+            items.push({ name: String(item.name), module: String(item.module || '').toLowerCase(), number: Number(item.number) });
+        }
+        if (!page.length) break;
+    }
+    syscallState.baseline = { view: meta.view, build: meta.build, symbols: meta.symbols, items };
+    syscallState.bands = syscallBands(items);
+    syscallState.bandsKey++;
+    if (syscallState.selected && !items.some(item => item.name === syscallState.selected)) syscallState.selected = '';
+    return { ok: true };
+}
+
+// The status always, the baseline when there is none yet or when `force`. While an extraction runs it looks again
+// every few seconds (not with force: the baseline is read again only when it is missing).
+async function syscallRefresh(force) {
+    syscallState.loading = true;
+    syscallRenderAll();
+    const wanted = force === true || !syscallState.baseline;
+    const [, loaded] = await Promise.all([syscallLoadStatus(), wanted ? syscallLoadBaseline('') : { ok: true }]);
+    if (loaded.superseded) return;
+    syscallState.loading = false;
+    if (!loaded.ok) {
+        syscallState.baseline = null;
+        syscallState.bands = [];
+        syscallState.bandsKey++;
+        syscallState.baselineError = loaded.error;
+    } else {
+        syscallState.baselineError = '';
+    }
+    syscallApplyFilter();
+    syscallRenderAll();
+    syscallSchedulePoll();
+}
+
+function syscallSchedulePoll() {
+    clearTimeout(syscallState.timer);
+    syscallState.timer = null;
+    const extraction = syscallState.status && syscallState.status.extraction;
+    if (extraction && Array.isArray(extraction.running) && extraction.running.length && state.activeTab === 'syscalls') {
+        syscallState.timer = setTimeout(() => {
+            if (state.activeTab === 'syscalls') syscallRefresh();
+        }, SYSCALL_POLL_MS);
+    }
+}
+
+async function syscallLoadTargets() {
+    const r = await syscallApi('/api/processes?min_threats=0&max=0');
+    if (r.ok) syscallState.targets = r.data;
+    renderSyscallTargets();
+}
+
+function renderSyscallTargets() {
+    const select = document.getElementById('syscall-target');
+    if (!select) return;
+    select.innerHTML = syscallTargetsHtml(syscallState.targets, syscallState.target);
+    syscallState.target = select.value;
+    renderSyscallToolbar();
+}
+
+function syscallOnTarget() {
+    const select = document.getElementById('syscall-target');
+    syscallState.target = select ? select.value : '';
+    renderSyscallToolbar();
+}
+
+// What the map shows in place of cells
+function syscallEmptyText() {
+    if (syscallState.loading) return 'Loading the baseline…';
+    if (syscallState.baselineError) return syscallState.baselineError;
+    if (syscallState.baseline) return 'The baseline has no syscalls.';
+    return 'No baseline loaded.';
+}
+
+// The bands' markup: a heading and a canvas per module, built again only when the baseline (or what stands in
+// its place) changed
+function syscallEnsureBands(host) {
+    const key = syscallState.bands.length ? `bands:${syscallState.bandsKey}` : `empty:${syscallEmptyText()}`;
+    if (host.dataset.key === key) return;
+    host.dataset.key = key;
+    host.replaceChildren();
+    syscallState.layouts.clear();
+    if (!syscallState.bands.length) {
+        const empty = document.createElement('p');
+        empty.className = 'syscall-empty';
+        empty.textContent = syscallEmptyText();
+        host.appendChild(empty);
+        return;
+    }
+    for (const band of syscallState.bands) {
+        const section = document.createElement('section');
+        section.className = 'syscall-band';
+        section.dataset.module = band.module;
+        const head = document.createElement('h3');
+        head.className = 'syscall-band-head';
+        const name = document.createElement('span');
+        name.className = 'syscall-band-name';
+        name.textContent = band.module;
+        const count = document.createElement('span');
+        count.className = 'syscall-band-count';
+        count.textContent = band.items.length.toLocaleString('en-US');
+        head.appendChild(name);
+        head.appendChild(count);
+        const canvas = document.createElement('canvas');
+        canvas.className = 'syscall-canvas';
+        canvas.dataset.module = band.module;
+        canvas.setAttribute('role', 'img');
+        canvas.setAttribute('aria-label', `Map of the ${band.items.length} syscalls of ${band.module}, one cell each`);
+        section.appendChild(head);
+        section.appendChild(canvas);
+        host.appendChild(section);
+    }
+}
+
+// One band onto its canvas, at the density of the screen. A canvas with no width (its tab is not shown) is left
+// for when the tab is shown.
+function syscallPaintCanvas(canvas) {
+    const band = syscallState.bands.find(b => b.module === canvas.dataset.module);
+    if (!band) return;
+    const width = Math.floor(canvas.getBoundingClientRect().width);
+    if (width < 1) return;
+    const layout = syscallBandLayout(band.items.length, width);
+    const ratio = window.devicePixelRatio || 1;
+    const pixelsWide = Math.round(width * ratio), pixelsHigh = Math.round(layout.height * ratio);
+    if (canvas.width !== pixelsWide) canvas.width = pixelsWide;
+    if (canvas.height !== pixelsHigh) canvas.height = pixelsHigh;
+    canvas.style.height = `${layout.height}px`;
+    syscallState.layouts.set(band.module, layout);
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    syscallDrawBand(ctx, layout, band.items, {
+        states: syscallState.states, match: syscallState.match, selected: syscallState.selected, hover: syscallState.hover,
+    });
+}
+
+function renderSyscallMap() {
+    const host = document.getElementById('syscall-map');
+    if (!host) return;
+    syscallEnsureBands(host);
+    for (const canvas of host.querySelectorAll('canvas')) syscallPaintCanvas(canvas);
+}
+
+function renderSyscallLegend() {
+    const host = document.getElementById('syscall-legend');
+    if (!host) return;
+    const counts = syscallState.scan ? syscallState.scan.counts || {} : null;
+    const measured = counts ? SYSCALL_STATES.reduce((sum, s) => sum + (Number(counts[s]) || 0), 0) : 0;
+    const total = syscallState.baseline ? syscallState.baseline.items.length : 0;
+    host.innerHTML = syscallMapLegendHtml(counts, Math.max(total - measured, 0));
+}
+
+// The rows of the catalog under the map: the baseline as far as the filter matches, the first SYSCALL_ROWS_MAX
+function renderSyscallRows() {
+    const host = document.getElementById('syscall-rows');
+    const head = document.getElementById('syscall-catalog-head');
+    const items = syscallState.baseline ? syscallState.baseline.items : [];
+    const match = syscallState.match;
+    const matching = match ? items.filter(item => match.has(item.name)) : items;
+    const shown = matching.slice(0, SYSCALL_ROWS_MAX);
+    if (head) {
+        head.textContent = `Catalog · ${matching.length.toLocaleString('en-US')} of ${items.length.toLocaleString('en-US')} syscalls` +
+            (matching.length > shown.length ? ` · the first ${shown.length} listed, narrow the filter for the rest` : '');
+    }
+    if (!host) return;
+    const top = host.scrollTop;
+    host.innerHTML = shown.length
+        ? shown.map(item => syscallRowHtml({
+            ...item, state: syscallState.states ? syscallState.states.get(item.name) : '', selected: item.name === syscallState.selected,
+        })).join('')
+        : (items.length ? '<div class="syscall-empty">No syscall matches the filter.</div>' : '');
+    host.scrollTop = top;
+}
+
+function renderSyscallNotices() {
+    const host = document.getElementById('syscall-notices');
+    if (!host) return;
+    const notices = syscallNotices(syscallState.status, syscallState.baseline);
+    if (syscallState.statusError) {
+        notices.unshift({ kind: 'unreachable', tone: 'error', title: 'Status unavailable', text: syscallState.statusError });
+    }
+    host.innerHTML = syscallNoticesHtml(notices);
+    host.hidden = notices.length === 0;
+}
+
+// SCAN waits for a target and while a scan runs; the toggle shows the surface that is on
+function renderSyscallToolbar() {
+    const scan = document.getElementById('syscall-scan');
+    if (scan) {
+        scan.disabled = syscallState.scanning || !syscallState.target;
+        scan.textContent = syscallState.scanning ? 'SCANNING…' : 'SCAN';
+        scan.title = syscallState.target ? 'Measure the syscall stubs of the chosen process against the baseline'
+                                          : 'Choose a process first';
+    }
+    for (const name of SYSCALL_VIEW_NAMES) {
+        const button = document.getElementById(`syscall-view-${name}`);
+        if (button) button.setAttribute('aria-pressed', name === syscallState.view ? 'true' : 'false');
+    }
+}
+
+// The line under the toolbar: what the last scan found, or why it did not
+function renderSyscallScan() {
+    const host = document.getElementById('syscall-scan-result');
+    if (!host) return;
+    const note = syscallState.note;
+    host.textContent = note ? note.text : '';
+    host.className = note ? `syscall-scan-result syscall-scan-result-${cssToken(note.tone)}` : 'syscall-scan-result';
+    host.hidden = !note;
+}
+
+function syscallSetScanNote(tone, text) {
+    syscallState.note = text ? { tone, text } : null;
+    renderSyscallScan();
+}
+
+function syscallRenderAll() {
+    const subtitle = document.getElementById('syscalls-subtitle');
+    if (subtitle) subtitle.textContent = syscallSubtitle(syscallState.baseline);
+    renderSyscallToolbar();
+    renderSyscallNotices();
+    renderSyscallScan();
+    renderSyscallLegend();
+    renderSyscallMap();
+    renderSyscallRows();
+}
+
+// The filter changed (or the baseline did): which cells match, then the map and the catalog
+function syscallApplyFilter() {
+    const items = syscallState.baseline ? syscallState.baseline.items : [];
+    syscallState.match = syscallMatchSet(items, syscallState.query, syscallState.module);
+    renderSyscallMap();
+    renderSyscallRows();
+}
+
+function syscallOnFilter() {
+    const input = document.getElementById('syscall-filter');
+    const module = document.getElementById('syscall-module-filter');
+    syscallState.query = input ? input.value : '';
+    syscallState.module = module ? module.value : '';
+    syscallApplyFilter();
+}
+
+// A syscall is chosen, on the map or in the catalog. The map rings it and the catalog marks it.
+function syscallSelect(name) {
+    syscallState.selected = String(name || '');
+    renderSyscallMap();
+    renderSyscallRows();
+}
+
+// The cell under a pointer event on the map: { band, item, index } or null
+function syscallCellFromEvent(event) {
+    const canvas = event.target && event.target.closest ? event.target.closest('canvas.syscall-canvas') : null;
+    if (!canvas) return null;
+    const band = syscallState.bands.find(b => b.module === canvas.dataset.module);
+    const layout = syscallState.layouts.get(canvas.dataset.module);
+    if (!band || !layout) return null;
+    const rect = canvas.getBoundingClientRect();
+    const index = syscallCellAt(layout, event.clientX - rect.left, event.clientY - rect.top);
+    return index < 0 ? null : { band, item: band.items[index], index };
+}
+
+function syscallShowTip(hit, event) {
+    const tip = document.getElementById('syscall-tip');
+    if (!tip) return;
+    if (!hit) {
+        tip.hidden = true;
+        return;
+    }
+    const state = syscallState.states ? syscallState.states.get(hit.item.name) : '';
+    tip.textContent = `${hit.item.name} · ${syscallHex(hit.item.number)} (${hit.item.number}) · ${hit.band.module}` +
+        (state ? ` · ${state}` : '');
+    tip.hidden = false;
+    const panel = tip.parentElement;
+    const box = panel && panel.getBoundingClientRect ? panel.getBoundingClientRect() : { left: 0, top: 0, width: 0 };
+    let left = event.clientX - box.left + 14;
+    if (box.width && left + tip.offsetWidth > box.width) left = Math.max(event.clientX - box.left - tip.offsetWidth - 14, 0);
+    tip.style.left = `${left}px`;
+    tip.style.top = `${event.clientY - box.top + 16}px`;
+}
+
+function syscallHideTip() {
+    syscallShowTip(null);
+}
+
+function syscallOnMapMove(event) {
+    const hit = syscallCellFromEvent(event);
+    syscallShowTip(hit, event);
+    const name = hit ? hit.item.name : '';
+    if (name === syscallState.hover) return;
+    syscallState.hover = name;
+    renderSyscallMap();
+}
+
+function syscallOnMapLeave() {
+    syscallHideTip();
+    if (!syscallState.hover) return;
+    syscallState.hover = '';
+    renderSyscallMap();
+}
+
+function syscallOnMapClick(event) {
+    const hit = syscallCellFromEvent(event);
+    if (hit) syscallSelect(hit.item.name);
+}
+
+// SCAN: the chosen process, ntdll and, if asked for, win32u. A scan that fails clears the measurement: the map goes
+// back to the baseline, so no cell shows what was measured in another process or before.
+async function runSyscallScan() {
+    if (syscallState.scanning) return;
+    const select = document.getElementById('syscall-target');
+    const pid = parseInt(select ? select.value : syscallState.target, 10);
+    if (!(pid > 0)) {
+        syscallSetScanNote('warn', 'Choose a process to scan first.');
+        return;
+    }
+    const win32u = document.getElementById('syscall-win32u');
+    const modules = win32u && win32u.checked ? ['ntdll.dll', 'win32u.dll'] : ['ntdll.dll'];
+    syscallState.scanning = true;
+    syscallSetScanNote('info', `Scanning PID ${pid}…`);
+    renderSyscallToolbar();
+    const r = await syscallApi('/api/syscalls/scan', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pid, modules }),
+    });
+    if (r.ok && r.data.view && syscallState.baseline && r.data.view !== syscallState.baseline.view) {
+        // measured in another view: the cells are that view's, so is the catalog
+        await syscallLoadBaseline(r.data.view);
+    }
+    syscallState.scanning = false;
+    if (!r.ok) {
+        syscallState.scan = null;
+        syscallState.states = null;
+        syscallSetScanNote('error', syscallErrorText(r));
+    } else {
+        syscallState.scan = r.data;
+        syscallState.states = new Map(Object.entries(r.data.states || {}).map(([name, s]) => [name, s && s.state]));
+        const counts = r.data.counts || {};
+        const quiet = SYSCALL_STATES.every(s => s === 'intact' || !Number(counts[s]));
+        syscallSetScanNote(quiet && !r.data.partial ? 'ok' : 'warn', syscallScanSummary(r.data));
+    }
+    syscallApplyFilter();
+    syscallRenderAll();
+}
+
+// MAP / GRAPH: the surface that is on. GRAPH comes with the binary graph; until then its button is disabled and a
+// view that has no enabled button is not switched to.
+function syscallSetView(name) {
+    if (!SYSCALL_VIEW_NAMES.includes(name)) return false;
+    const button = document.getElementById(`syscall-view-${name}`);
+    if (!button || button.disabled) return false;
+    syscallState.view = name;
+    for (const other of SYSCALL_VIEW_NAMES) {
+        const surface = document.getElementById(`syscall-surface-${other}`);
+        if (surface) surface.hidden = other !== name;
+    }
+    renderSyscallToolbar();
+    return true;
+}
+
+// The map's box changed size: its cells are laid out again, but only while it is on screen
+function syscallResized() {
+    if (state.activeTab === 'syscalls') renderSyscallMap();
+}
+
+function initSyscalls() {
+    if (syscallState.ready) return;
+    syscallState.ready = true;
+    const host = document.getElementById('syscall-map');
+    if (host) {
+        host.addEventListener('pointermove', syscallOnMapMove);
+        host.addEventListener('pointerleave', syscallOnMapLeave);
+        host.addEventListener('click', syscallOnMapClick);
+        if (typeof ResizeObserver !== 'undefined') new ResizeObserver(() => requestAnimationFrame(syscallResized)).observe(host);
+    }
+    syscallRenderAll();
+}
+
+// The tab is shown: the targets and the status are asked for again (processes come and go, an extraction may be
+// done), the baseline only if there is none, and the map is drawn at the size it has now
+function syscallsTabShown() {
+    initSyscalls();
+    renderSyscallMap();
+    syscallLoadTargets();
+    syscallRefresh();
 }

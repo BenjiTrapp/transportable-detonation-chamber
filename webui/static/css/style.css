@@ -183,6 +183,20 @@
     --assess-protected-tint-rgb: 255, 191, 38;
     --assess-suspicious: #ffbf26;
     --assess-suspicious-rgb: 255, 191, 38;
+    /* The SYSCALLS map: the state each syscall stub was measured in. intact is held near the surface, so a map
+       without a deviation draws no eye; every deviation is bright and has a hue of its own: hooked amber (a
+       jump into another module, an EDR hook), patched red (a jump into private memory), diverged blue (the
+       bytes differ, nothing is guessed), unreadable a light grey (drawn as an outline) */
+    --syscall-intact: #323b75;
+    --syscall-intact-rgb: 50, 59, 117;
+    --syscall-hooked: #ffbf26;
+    --syscall-hooked-rgb: 255, 191, 38;
+    --syscall-patched: #ff2b4a;
+    --syscall-patched-rgb: 255, 43, 74;
+    --syscall-diverged: #3dbdff;
+    --syscall-diverged-rgb: 61, 189, 255;
+    --syscall-unreadable: #8089b8;
+    --syscall-unreadable-rgb: 128, 137, 184;
     --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
     --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     --radius: 4px;
@@ -12286,4 +12300,308 @@ button.logs-trunc:hover { color: var(--accent-orange); text-decoration: underlin
 /* Tab titles: the gradient (--cp-heading) with a cyan glow */
 :root[data-theme="classic"] .content-header h2 {
     filter: drop-shadow(0 0 22px rgba(var(--accent-cyan-rgb), .25));
+}
+
+/* =============================================
+   SYSCALLS tab (block SYSCALLS of app.js): the toolbar in one line that wraps in a narrow window, the notices
+   over the map, then the work area that fills the tab: the map (a canvas per module, drawn by app.js) and the
+   catalog under it, each scrolling in itself. The colours of the states are variables of both themes; the
+   canvas reads them through themeColor().
+   ============================================= */
+.syscall-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 16px;
+    margin: 10px 14px 0;
+    padding: 6px 10px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-secondary);
+}
+.syscall-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+}
+.syscall-filter-group {
+    margin-left: auto;
+}
+/* The MAP / GRAPH switch is the chart-range group of the other tabs, as tall as the buttons beside it */
+.syscall-toolbar .chart-range .chart-range-btn {
+    height: 22px;
+    padding: 0 12px;
+    font-size: 11px;
+}
+.syscall-switch .chart-range-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+.syscall-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+}
+.syscall-filter-group .filter-input {
+    width: 190px;
+}
+.syscall-notices {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 10px 14px 0;
+}
+.syscall-notices[hidden],
+.syscall-scan-result[hidden],
+.syscall-tip[hidden],
+.syscall-main[hidden] {
+    display: none;
+}
+.syscall-notice {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 10px;
+    padding: 6px 10px;
+    font-size: 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-left: 3px solid var(--border-accent);
+    border-radius: var(--radius);
+}
+.syscall-notice-title {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+.syscall-notice-text {
+    min-width: 0;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+}
+.syscall-notice-info {
+    border-left-color: var(--severity-info);
+}
+.syscall-notice-warn {
+    border-left-color: var(--severity-medium);
+    background: rgba(var(--severity-medium-rgb), 0.06);
+}
+.syscall-notice-error {
+    border-left-color: var(--severity-critical);
+    background: rgba(var(--severity-critical-rgb), 0.08);
+}
+/* A view that cannot be told from the other one is a decision of the extraction, not a missing file: own accent */
+.syscall-notice-indistinguishable {
+    border-left-color: var(--accent-purple);
+    background: rgba(var(--accent-purple-rgb), 0.08);
+}
+.syscall-scan-result {
+    margin: 8px 14px 0;
+    padding: 4px 10px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    border-left: 3px solid var(--border-accent);
+    overflow-wrap: anywhere;
+}
+.syscall-scan-result-ok {
+    border-left-color: var(--accent-green);
+}
+.syscall-scan-result-warn {
+    border-left-color: var(--severity-medium);
+}
+.syscall-scan-result-error {
+    border-left-color: var(--severity-critical);
+    color: var(--severity-critical);
+}
+.syscall-work {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 8px 14px 12px;
+}
+.syscall-main {
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.syscall-map-panel,
+.syscall-catalog {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+}
+.syscall-map-panel {
+    flex: 3 1 0;
+}
+.syscall-catalog {
+    flex: 2 1 0;
+}
+.syscall-legend {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 18px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border-primary);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+.syscall-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: help;
+}
+.syscall-legend-count {
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+}
+.syscall-legend-note {
+    color: var(--text-muted);
+}
+.syscall-legend-dot,
+.syscall-row-dot {
+    flex: 0 0 auto;
+    width: 10px;
+    height: 10px;
+    border: 1px solid transparent;
+    border-radius: 2px;
+}
+.syscall-state-intact {
+    background: var(--syscall-intact);
+}
+.syscall-state-baseline {
+    background: rgba(var(--syscall-intact-rgb), 0.75);
+}
+.syscall-state-hooked {
+    background: var(--syscall-hooked);
+}
+.syscall-state-patched {
+    background: var(--syscall-patched);
+    box-shadow: 0 0 0 2px rgba(var(--syscall-patched-rgb), 0.35);
+}
+.syscall-state-diverged {
+    background: var(--syscall-diverged);
+    box-shadow: 0 0 0 2px rgba(var(--syscall-diverged-rgb), 0.35);
+}
+.syscall-state-unreadable {
+    background: transparent;
+    border-color: var(--syscall-unreadable);
+}
+.syscall-map {
+    flex: 1 1 0;
+    min-height: 0;
+    padding: 10px 12px 12px;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-gutter: stable;
+}
+.syscall-band + .syscall-band {
+    margin-top: 14px;
+}
+.syscall-band-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin: 0 0 6px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    color: var(--text-secondary);
+}
+.syscall-band-count {
+    font-weight: 400;
+    color: var(--text-muted);
+}
+.syscall-canvas {
+    display: block;
+    width: 100%;
+}
+.syscall-empty {
+    padding: 16px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+}
+.syscall-tip {
+    position: absolute;
+    z-index: 5;
+    padding: 4px 8px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-primary);
+    white-space: nowrap;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-accent);
+    border-radius: var(--radius);
+    pointer-events: none;
+}
+.syscall-catalog-head {
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border-primary);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.syscall-rows {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+}
+.syscall-row {
+    display: grid;
+    grid-template-columns: 12px minmax(0, 1fr) 64px 64px;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 3px 12px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    text-align: left;
+    background: transparent;
+    border: 0;
+    border-bottom: 1px solid var(--border-primary);
+    cursor: pointer;
+}
+.syscall-row:hover {
+    background: var(--bg-card-hover);
+}
+.syscall-row:focus-visible {
+    outline: 1px solid var(--accent-cyan);
+    outline-offset: -1px;
+}
+.syscall-row.selected {
+    background: rgba(var(--accent-cyan-rgb), 0.12);
+}
+.syscall-row-name {
+    overflow: hidden;
+    color: var(--text-primary);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.syscall-row-module {
+    color: var(--text-muted);
+}
+.syscall-row-num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
 }
