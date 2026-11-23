@@ -1082,3 +1082,223 @@ def test_a_declared_size_of_zero_or_larger_than_the_data_falls_back_to_the_data(
     pointing_late = _patched(section, _ENTRY_0 + 4, late_at, late_len)
     assert set(binary_graph.parse_api_set_map(_patched(pointing_late, 4, size))) == {"api-late-l1-1-0", "api-second-l1-1-0"}
     assert len(binary_graph.parse_api_set_map(_patched(_two_aliases(), 4, size))) == 2
+
+
+# --- following a forwarder chain ----------------------------------------------------------
+
+def test_a_forwarder_is_split_at_its_last_dot_so_an_api_set_name_survives():
+    assert binary_graph.split_forwarder("api-ms-win-core-heap-l1-1-0.HeapAlloc") == (
+        "api-ms-win-core-heap-l1-1-0.dll", "HeapAlloc")
+
+
+def test_a_module_name_with_dots_of_its_own_survives_the_split():
+    # this is the case that tells the last dot from the first: api-set names are hyphenated and do not
+    assert binary_graph.split_forwarder("Windows.Storage.SomeFunction") == ("windows.storage.dll", "SomeFunction")
+
+
+@pytest.mark.parametrize("raw", ["", "NODOT", ".F", "B.", ".", ".."])
+def test_a_string_that_names_no_module_and_function_splits_to_nothing(raw):
+    assert binary_graph.split_forwarder(raw) == ("", "")
+
+
+def test_a_plain_module_forwarder_gains_the_dll_suffix_and_is_lower_cased():
+    assert binary_graph.split_forwarder("NTDLL.RtlAllocateHeap") == ("ntdll.dll", "RtlAllocateHeap")
+
+
+def test_a_forwarder_to_an_ordinal_keeps_the_hash_form():
+    assert binary_graph.split_forwarder("NTDLL.#8") == ("ntdll.dll", "#8")
+
+
+def _bi(name, exports=(), forwarders=None, ordinal_names=None, partial=False):
+    return binary_graph.BinaryInfo(name=name, kind="dll", machine="x64", imports={}, exports=tuple(exports),
+                                   forwarders=dict(forwarders or {}), ordinal_names=dict(ordinal_names or {}),
+                                   partial=partial)
+
+
+def _graph(*infos):
+    return {info.name: info for info in infos}
+
+
+def _heap_chain():
+    # kernel32!HeapAlloc -> api-ms-win-core-heap-l1-1-0 -> kernelbase -> ntdll!RtlAllocateHeap
+    binaries = _graph(
+        _bi("kernel32.dll", forwarders={"HeapAlloc": "api-ms-win-core-heap-l1-1-0.HeapAlloc"}),
+        _bi("kernelbase.dll", forwarders={"HeapAlloc": "NTDLL.RtlAllocateHeap"}),
+        _bi("ntdll.dll", exports=["RtlAllocateHeap"]))
+    return binaries, {"api-ms-win-core-heap-l1-1-0": ("kernelbase.dll",)}
+
+
+def test_a_chain_over_an_api_set_ends_at_the_module_that_defines_the_function():
+    binaries, api_sets = _heap_chain()
+    got = binary_graph.resolve_export(binaries, api_sets, "kernel32.dll", "HeapAlloc")
+    assert (got.reason, got.module, got.function) == ("defined", "ntdll.dll", "RtlAllocateHeap")
+
+
+def test_every_hop_says_whether_it_was_a_forwarder_or_an_api_set():
+    binaries, api_sets = _heap_chain()
+    got = binary_graph.resolve_export(binaries, api_sets, "kernel32.dll", "HeapAlloc")
+    assert got.hops == (
+        binary_graph.Hop("api-ms-win-core-heap-l1-1-0.dll", "HeapAlloc", "forwards_to"),
+        binary_graph.Hop("kernelbase.dll", "HeapAlloc", "resolves_to"),
+        binary_graph.Hop("ntdll.dll", "RtlAllocateHeap", "forwards_to"))
+
+
+def test_an_import_of_an_api_set_name_resolves_without_a_forwarder_to_start_from():
+    binaries, api_sets = _heap_chain()
+    got = binary_graph.resolve_export(binaries, api_sets, "API-MS-WIN-CORE-HEAP-L1-1-0.dll", "HeapAlloc")
+    assert (got.reason, got.module, got.function) == ("defined", "ntdll.dll", "RtlAllocateHeap")
+    assert got.hops[0] == binary_graph.Hop("kernelbase.dll", "HeapAlloc", "resolves_to")
+
+
+def test_a_function_that_is_defined_where_it_is_asked_for_has_no_hops():
+    got = binary_graph.resolve_export(_graph(_bi("ntdll.dll", exports=["NtClose"])), {}, "NTDLL.DLL", "NtClose")
+    assert got == binary_graph.Resolution(hops=(), module="ntdll.dll", function="NtClose", reason="defined")
+
+
+def test_an_api_set_tries_its_host_modules_in_order_until_one_defines_the_function():
+    binaries = _graph(_bi("first.dll", exports=["Other"]), _bi("gone-from-graph-is-skipped.dll"),
+                      _bi("second.dll", exports=["Wanted"]), _bi("third.dll", exports=["Wanted"]))
+    api_sets = {"api-x-l1-1-0": ("first.dll", "not-in-graph.dll", "second.dll", "third.dll")}
+    got = binary_graph.resolve_export(binaries, api_sets, "api-x-l1-1-0.dll", "Wanted")
+    assert (got.reason, got.module) == ("defined", "second.dll")
+    assert got.hops == (binary_graph.Hop("second.dll", "Wanted", "resolves_to"),)
+
+
+def test_a_function_no_module_defines_ends_as_missing():
+    binaries, api_sets = _heap_chain()
+    got = binary_graph.resolve_export(binaries, api_sets, "kernel32.dll", "NoSuchFunction")
+    assert (got.reason, got.module, got.function, got.hops) == ("missing", None, None, ())
+    # the chain walked as far as it went is kept: the last hop is where it died
+    broken = _graph(_bi("kernel32.dll", forwarders={"F": "GONE.F"}))
+    got = binary_graph.resolve_export(broken, {}, "kernel32.dll", "F")
+    assert (got.reason, got.module, got.function) == ("missing", None, None)
+    assert got.hops == (binary_graph.Hop("gone.dll", "F", "forwards_to"),)
+
+
+def test_a_module_that_is_not_in_the_graph_is_missing_not_an_error():
+    got = binary_graph.resolve_export({}, {}, "kernel32.dll", "F")
+    assert (got.reason, got.hops) == ("missing", ())
+
+
+def test_an_api_set_with_no_entry_in_the_map_ends_as_unresolved_api_set():
+    binaries = _graph(_bi("kernel32.dll", forwarders={"F": "api-ms-win-core-nowhere-l1-1-0.F"}))
+    got = binary_graph.resolve_export(binaries, {}, "kernel32.dll", "F")
+    assert (got.reason, got.module, got.function) == ("unresolved-api-set", None, None)
+    assert got.hops == (binary_graph.Hop("api-ms-win-core-nowhere-l1-1-0.dll", "F", "forwards_to"),)
+    # an ext-ms- name is an api set too, whatever the map holds
+    assert binary_graph.resolve_export(binaries, {"other": ("a.dll",)}, "ext-ms-win-x-l1-1-0.dll", "F"
+                                       ).reason == "unresolved-api-set"
+
+
+def test_an_api_set_whose_hosts_do_not_define_the_function_is_missing_not_unresolved():
+    # the map knew the alias: it is System32 that does not offer the function
+    binaries = _graph(_bi("host.dll", exports=["Other"]))
+    got = binary_graph.resolve_export(binaries, {"api-x-l1-1-0": ("host.dll",)}, "api-x-l1-1-0.dll", "Wanted")
+    assert got.reason == "missing"
+
+
+def test_a_forwarder_to_an_ordinal_resolves_through_the_target_ordinal_names():
+    binaries = _graph(_bi("a.dll", forwarders={"F": "NTDLL.#8"}),
+                      _bi("ntdll.dll", exports=["RtlFoo"], ordinal_names={8: "RtlFoo"}))
+    got = binary_graph.resolve_export(binaries, {}, "a.dll", "F")
+    assert (got.reason, got.module, got.function) == ("defined", "ntdll.dll", "RtlFoo")
+    assert got.hops == (binary_graph.Hop("ntdll.dll", "#8", "forwards_to"),)
+
+
+def test_a_forwarder_to_a_nameless_export_is_defined_under_its_hash_name():
+    binaries = _graph(_bi("a.dll", forwarders={"F": "B.#5"}), _bi("b.dll", exports=["#5"]))
+    got = binary_graph.resolve_export(binaries, {}, "a.dll", "F")
+    assert (got.reason, got.module, got.function) == ("defined", "b.dll", "#5")
+
+
+def test_a_forwarder_to_an_ordinal_the_target_does_not_offer_is_missing():
+    binaries = _graph(_bi("a.dll", forwarders={"F": "B.#9"}), _bi("b.dll", exports=["X"], ordinal_names={8: "X"}))
+    assert binary_graph.resolve_export(binaries, {}, "a.dll", "F").reason == "missing"
+
+
+def test_an_ordinal_that_names_a_forwarder_keeps_following_the_chain():
+    binaries = _graph(_bi("a.dll", forwarders={"F": "B.#3"}),
+                      _bi("b.dll", forwarders={"G": "C.H"}, ordinal_names={3: "G"}),
+                      _bi("c.dll", exports=["H"]))
+    got = binary_graph.resolve_export(binaries, {}, "a.dll", "F")
+    assert (got.reason, got.module, got.function) == ("defined", "c.dll", "H")
+    assert [h.function for h in got.hops] == ["#3", "H"]
+
+
+@pytest.mark.parametrize("raw", ["", "NODOT", ".F", "B.", ".", "..", "B.#x", "B.#", "B.#" + "9" * 5000])
+def test_a_malformed_forwarder_ends_as_missing_and_raises_nothing(raw):
+    binaries = _graph(_bi("a.dll", forwarders={"F": raw}), _bi("b.dll", exports=["X"]))
+    got = binary_graph.resolve_export(binaries, {}, "a.dll", "F")
+    assert (got.reason, got.module, got.function) == ("missing", None, None)
+
+
+def test_a_chain_that_dies_in_a_partial_binary_is_still_a_missing_one():
+    # pefile cut that binary's tables short: the vocabulary has no word for "perhaps it was there", so it is "missing"
+    binaries = _graph(_bi("a.dll", forwarders={"F": "B.F"}), _bi("b.dll", partial=True))
+    got = binary_graph.resolve_export(binaries, {}, "a.dll", "F")
+    assert got.reason == "missing"
+
+
+def test_resolving_all_forwarders_answers_each_module_and_function_once():
+    binaries, api_sets = _heap_chain()
+    binaries["kernel32.dll"] = _bi("kernel32.dll", exports=["Own"], forwarders={
+        "HeapAlloc": "api-ms-win-core-heap-l1-1-0.HeapAlloc", "Lost": "GONE.Lost"})
+    got = binary_graph.resolve_all(binaries, api_sets)
+    assert set(got) == {("kernel32.dll", "HeapAlloc"), ("kernel32.dll", "Lost"), ("kernelbase.dll", "HeapAlloc")}
+    assert got[("kernel32.dll", "HeapAlloc")] == binary_graph.resolve_export(binaries, api_sets, "kernel32.dll", "HeapAlloc")
+    assert got[("kernel32.dll", "Lost")].reason == "missing"
+    assert got[("kernelbase.dll", "HeapAlloc")].module == "ntdll.dll"
+
+
+def test_a_forwarder_that_points_back_to_itself_ends_as_a_cycle():
+    binaries = _graph(_bi("a.dll", forwarders={"F": "A.F"}))
+    got = binary_graph.resolve_export(binaries, {}, "a.dll", "F")
+    assert (got.reason, got.module, got.function) == ("cycle", None, None)
+    assert got.hops == (binary_graph.Hop("a.dll", "F", "forwards_to"),)
+
+
+def test_a_forwarder_ring_over_three_modules_ends_as_a_cycle_and_names_its_hops():
+    binaries = _graph(_bi("a.dll", forwarders={"F": "B.F"}), _bi("b.dll", forwarders={"F": "C.F"}),
+                      _bi("c.dll", forwarders={"F": "A.F"}))
+    got = binary_graph.resolve_export(binaries, {}, "a.dll", "F")
+    assert got.reason == "cycle"
+    assert [h.module for h in got.hops] == ["b.dll", "c.dll", "a.dll"]    # the last is the one that closes the ring
+
+
+def test_a_ring_through_an_api_set_is_a_cycle_too():
+    binaries = _graph(_bi("host.dll", forwarders={"F": "api-x-l1-1-0.F"}))
+    got = binary_graph.resolve_export(binaries, {"api-x-l1-1-0": ("host.dll",)}, "host.dll", "F")
+    assert got.reason == "cycle"
+    assert [h.via for h in got.hops] == ["forwards_to", "resolves_to"]
+
+
+def _long_chain(length):
+    # m0 -> m1 -> ... -> m<length>, every pair distinct: nothing repeats, so only the hop cap can stop it
+    infos = [_bi(f"m{i}.dll", forwarders={"F": f"M{i + 1}.F"}) for i in range(length)]
+    infos.append(_bi(f"m{length}.dll", exports=["F"]))
+    return _graph(*infos)
+
+
+def test_a_chain_longer_than_max_hops_ends_as_too_many_hops():
+    got = binary_graph.resolve_export(_long_chain(binary_graph.MAX_HOPS + 4), {}, "m0.dll", "F")
+    assert (got.reason, got.module, got.function) == ("too-many-hops", None, None)
+    assert len(got.hops) == binary_graph.MAX_HOPS
+
+
+def test_a_chain_of_exactly_max_hops_still_resolves():
+    got = binary_graph.resolve_export(_long_chain(binary_graph.MAX_HOPS), {}, "m0.dll", "F")
+    assert (got.reason, len(got.hops)) == ("defined", binary_graph.MAX_HOPS)
+
+
+def test_a_ring_longer_than_max_hops_is_still_named_a_cycle():
+    # the hop cap is a policy on chain length, not the ring detector: a ring that closes only after the cap is a ring
+    ring = binary_graph.MAX_HOPS * 2
+    infos = [_bi(f"m{i}.dll", forwarders={"F": f"M{(i + 1) % ring}.F"}) for i in range(ring)]
+    got = binary_graph.resolve_export(_graph(*infos), {}, "m0.dll", "F")
+    assert (got.reason, len(got.hops)) == ("cycle", ring)
+
+
+def test_resolving_never_raises_on_an_odd_start():
+    binaries = _graph(_bi("a.dll", forwarders={"F": "A.F"}))
+    for module, function in [("", ""), ("a.dll", ""), ("A.DLL", "#"), ("a.dll", "#" + "9" * 5000), ("nope", "F")]:
+        assert binary_graph.resolve_export(binaries, {}, module, function).reason in ("missing", "cycle")

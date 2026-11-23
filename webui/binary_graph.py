@@ -235,7 +235,7 @@ def parse_api_set_map(data: bytes) -> dict[str, tuple[str, ...]]:
     length is hostile: an entry that does not lie wholly inside the map is dropped and the others are kept. Nothing
     raises. The map ends where its header's Size says, or at the end of `data` when Size is zero or larger than `data`.
 
-    Two limits, both on purpose, both in the spec (Ziel 6). What is known of the map: value[0] of an entry is the
+    Three limits, all on purpose, all in the spec (Ziel 6). What is known of the map: value[0] of an entry is the
     default host, later values are overrides for particular importing modules. Not checked against a real loader: how
     it picks among them.
     - The resolution is importer-independent. A value's importer name is checked to lie inside the map and then
@@ -245,7 +245,8 @@ def parse_api_set_map(data: bytes) -> dict[str, tuple[str, ...]]:
       rearranged (a default put first would be made-up data).
     - One unreadable value, an empty host included, drops its whole entry, never only its host. With a value lost the
       default might be the one gone, or an override would move into the default's place: either way the chain would
-      resolve through the wrong module. Do not relax this into partial acceptance."""
+      resolve through the wrong module. Do not relax this into partial acceptance.
+    - The map is the window the header's Size gives (above), never a wider one."""
     if len(data) < _API_SET_HEADER.size:
         return {}
     version, size, _, count, entry_offset, _, _ = _API_SET_HEADER.unpack_from(data)
@@ -289,3 +290,137 @@ def load_api_set_map(path: str) -> dict[str, tuple[str, ...]]:
     except Exception:
         return {}
     return {}
+
+
+def split_forwarder(raw: str) -> tuple[str, str]:
+    """`"NTDLL.RtlAllocateHeap"` -> `("ntdll.dll", "RtlAllocateHeap")`; `("", "")` when the string names no module and
+    function (empty, no dot, or nothing on one side of it).
+
+    Split at the LAST dot, never the first: an api-set name has dots of its own ("api-ms-win-core-heap-l1-1-0")."""
+    module, dot, function = raw.rpartition(".")
+    if not dot or not module or not function:
+        return "", ""
+    module = module.lower()
+    return (module if module.endswith(".dll") else module + ".dll"), function
+
+
+MAX_HOPS = 16       # a chain longer than this is reported as such, however it ends
+
+
+@dataclass(frozen=True)
+class Hop:
+    module: str                             # lower case, with its extension; an api-set alias keeps its ".dll"
+    function: str                           # as the file that led here wrote it, an ordinal as "#<n>"
+    via: str                                # "forwards_to" (an export's forwarder) | "resolves_to" (an api-set host)
+
+
+@dataclass(frozen=True)
+class Resolution:
+    """Where a `(module, function)` ends up. `reason` is a machine token, not prose:
+    "defined"            module and function are set: that module defines the function itself. `function` is the
+                         key into its `exports` (a nameless export "#<n>"), which may differ from the last hop's
+                         when a forwarder named the ordinal of an export that has a name
+    "missing"            the chain led to a module not in the graph, or one that does not offer the function (a
+                         `partial` module, whose export table was cut short, is not told apart from a complete one)
+    "cycle"              the chain came back to a (module, function) it had been at; the last hop closes the ring
+    "unresolved-api-set" the chain reached an api-set name the map has no entry for: our map is missing or old
+    "too-many-hops"      the chain is longer than MAX_HOPS and neither ring nor dead end within it
+    `hops` are the steps taken, the start not among them; on any outcome but "defined" they are how far it got."""
+    hops: tuple[Hop, ...]
+    module: str | None
+    function: str | None
+    reason: str
+
+
+def _export_key(info, function):
+    """The key `function` has in `info.exports` or `info.forwarders`, None when the image offers no such export.
+
+    "#<n>" is the ordinal n, which is a key itself for a nameless export and otherwise names an export through
+    `ordinal_names`."""
+    keys = [function]
+    digits = function[1:]
+    if function.startswith("#") and digits.isascii() and digits.isdecimal():
+        try:
+            name = info.ordinal_names.get(int(digits))
+        except ValueError:                  # more digits than int() is willing to read
+            name = None
+        if name:
+            keys.append(name)
+    for key in keys:
+        if key in info.exports or key in info.forwarders:
+            return key
+    return None
+
+
+def _is_api_set(api_sets, module):
+    stem = module[:-len(".dll")] if module.endswith(".dll") else module
+    return stem, stem in api_sets or stem.startswith(("api-", "ext-"))
+
+
+def _step(binaries, api_sets, module, function):
+    """One step from `(module, function)`: `(Hop, None, None)` to go on, or `(None, reason, key)` to stop; `key` is
+    the export key of a "defined" end."""
+    stem, api_set = _is_api_set(api_sets, module)
+    if api_set:
+        hosts = api_sets.get(stem)
+        if not hosts:
+            return None, "unresolved-api-set", None
+        for host in hosts:
+            host = host.lower()
+            if host in binaries and _export_key(binaries[host], function) is not None:
+                return Hop(host, function, "resolves_to"), None, None
+        return None, "missing", None
+    info = binaries.get(module)
+    key = _export_key(info, function) if info is not None else None
+    if key is None:
+        return None, "missing", None
+    if key not in info.forwarders:
+        return None, "defined", key
+    target, target_function = split_forwarder(info.forwarders[key])
+    if not target:
+        return None, "missing", None
+    return Hop(target, target_function, "forwards_to"), None, None
+
+
+def resolve_export(binaries: dict[str, BinaryInfo], api_sets: dict[str, tuple[str, ...]],
+                   module: str, function: str) -> Resolution:
+    """Follow `function` of `module` through forwarders and api-set aliases to the module that defines it.
+
+    `binaries` is keyed by lower-case file name. An api set is resolved to the first of its hosts, in the map's order,
+    that is in the graph and offers the function (as a definition or as a forwarder): the importer-independent reading
+    parse_api_set_map describes. Nothing raises, whatever a forwarder string or a name looks like.
+
+    A ring is found by remembering every (module, function) the chain has stood at, so it ends as "cycle" however long
+    it is. MAX_HOPS is a limit on the chain, not the ring detector: the walk goes on past it, still stopped by that
+    memory, so that a ring longer than the limit is not called merely long."""
+    module = module.lower()
+    seen = {(module, function)}
+    hops = []
+    while True:
+        hop, reason, key = _step(binaries, api_sets, module, function)
+        if hop is None:
+            break
+        hops.append(hop)
+        module, function = hop.module, hop.function
+        if (module, function) in seen:
+            return Resolution(tuple(hops), None, None, "cycle")
+        seen.add((module, function))
+    if len(hops) > MAX_HOPS:
+        return Resolution(tuple(hops[:MAX_HOPS]), None, None, "too-many-hops")
+    if reason == "defined":
+        return Resolution(tuple(hops), module, key, "defined")
+    return Resolution(tuple(hops), None, None, reason)
+
+
+def resolve_all(binaries: dict[str, BinaryInfo],
+                api_sets: dict[str, tuple[str, ...]]) -> dict[tuple[str, str], Resolution]:
+    """`(module, export name)` -> its Resolution, for every forwarder export of every binary; one answer each.
+
+    The cache build asks the same chain through many importers; this is where that repetition is bundled."""
+    answers = {}
+    for module, info in binaries.items():
+        module = module.lower()
+        for name in info.forwarders:
+            if (module, name) not in answers:
+                answers[(module, name)] = resolve_export(binaries, api_sets, module, name)
+    return answers
