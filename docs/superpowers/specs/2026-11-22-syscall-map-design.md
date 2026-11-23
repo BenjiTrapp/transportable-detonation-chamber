@@ -494,7 +494,14 @@ schlagen `test_readme_documents_every_api_route_and_nothing_else` und
   - erzeugt je installiertem Binary eine Baseline,
   - und prüft auf ARM64, dass die beiden Baselines sich **unterscheiden**:
     wären sie byteweise gleich, läge die x64-Variante nicht die x64-Sicht vor,
-    und die Messung emulierter Samples wäre still wirkungslos.
+    und die Messung emulierter Samples wäre still wirkungslos. Sind sie gleich,
+    wird die x64-Baseline **gelöscht** — eine fehlende Baseline behandeln
+    Tasks 7 und 9 anständig, eine falsche nicht.
+  - **Derselbe Schutz muss zur Laufzeit gelten.** Die Extraktion auf Abruf
+    (Ziel 2) würde die gelöschte Datei sonst beim nächsten Tab-Besuch mit
+    demselben falschen Inhalt neu schreiben. Eine x64-Extraktion, deren
+    Fingerabdruck dem der arm64-Baseline gleicht, wird daher nicht gespeichert,
+    und der Tab sagt, warum.
   - **Die Architektur wird aus der Registry bestimmt, nicht aus
     `$env:PROCESSOR_ARCHITECTURE`.** Der Updater läuft als emuliertes
     x64-Python, und die Umgebungsvariable meldete dort `AMD64` auch auf einer
