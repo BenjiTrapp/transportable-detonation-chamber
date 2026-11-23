@@ -388,6 +388,14 @@ def _api_set_lookup(api_sets, stem):
     return hosts
 
 
+def api_set_hosts(api_sets: dict[str, tuple[str, ...]], module: str) -> tuple[str, ...] | None:
+    """The hosts of the api set `module` (with or without ".dll", any case) as the walk looks them up, its family
+    fallback included; None when the map has no entry for it. Whether a name the map does not hold is an api set
+    anyway is the "api-" or "ext-" prefix, as the walk decides it."""
+    module = module.lower()
+    return _api_set_lookup(api_sets, module[:-len(".dll")] if module.endswith(".dll") else module)
+
+
 def _step(binaries, api_sets, module, function, cut_short, exports):
     """One step from `(module, function)`: `(Hop, None, None)` to go on, or `(None, reason, key)` to stop; `key` is
     the export key of a "defined" end.

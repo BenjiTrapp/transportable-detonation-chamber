@@ -161,6 +161,7 @@ transportable-detonation-chamber/
 │   ├── syscall_signatures.json    # Syscall hook and patch patterns (inline hooks, neutralised stubs), per view
 │   ├── win32_to_nt.py             # SYSCALLS tab: the curated Win32 to Nt table that turns a carried stub into a proven bypass
 │   ├── binary_graph.py            # SYSCALLS tab: the import, export and forwarder tables of the System32 binaries
+│   ├── binary_graph_query.py      # SYSCALLS tab: the questions asked of that graph, as nodes and edges cut at 400
 │   ├── log_search.py              # LOGS tab: SPL-like search language (parser, evaluator, pipes)
 │   ├── log_store.py               # LOGS tab: event ring buffer, source parsers, incremental collector
 │   ├── logs/                      # Persisted access and MCP logs, JSONL (git-ignored)

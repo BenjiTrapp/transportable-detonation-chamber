@@ -317,6 +317,8 @@ deploy:
 		vagrant upload webui/syscall_signatures.json C:\\DetonationChamberUI\\syscall_signatures.json; \
 		vagrant upload webui/win32_to_nt.py C:\\DetonationChamberUI\\win32_to_nt.py; \
 		vagrant upload webui/win32_to_nt.json C:\\DetonationChamberUI\\win32_to_nt.json; \
+		vagrant upload webui/binary_graph.py C:\\DetonationChamberUI\\binary_graph.py; \
+		vagrant upload webui/binary_graph_query.py C:\\DetonationChamberUI\\binary_graph_query.py; \
 		vagrant upload webui/minidump_analysis.py C:\\DetonationChamberUI\\minidump_analysis.py; \
 		vagrant upload webui/pipe_analysis.py C:\\DetonationChamberUI\\pipe_analysis.py; \
 		vagrant upload webui/pipe_signatures.json C:\\DetonationChamberUI\\pipe_signatures.json; \
@@ -362,6 +364,8 @@ deploy-app:
 		vagrant upload webui/syscall_signatures.json C:\\DetonationChamberUI\\syscall_signatures.json; \
 		vagrant upload webui/win32_to_nt.py C:\\DetonationChamberUI\\win32_to_nt.py; \
 		vagrant upload webui/win32_to_nt.json C:\\DetonationChamberUI\\win32_to_nt.json; \
+		vagrant upload webui/binary_graph.py C:\\DetonationChamberUI\\binary_graph.py; \
+		vagrant upload webui/binary_graph_query.py C:\\DetonationChamberUI\\binary_graph_query.py; \
 		vagrant upload webui/minidump_analysis.py C:\\DetonationChamberUI\\minidump_analysis.py; \
 		vagrant upload webui/pipe_analysis.py C:\\DetonationChamberUI\\pipe_analysis.py; \
 		vagrant upload webui/pipe_signatures.json C:\\DetonationChamberUI\\pipe_signatures.json; \

@@ -344,6 +344,8 @@ switch ($Target) {
             Copy-Item 'webui\syscall_signatures.json' -Destination 'C:\DetonationChamberUI\syscall_signatures.json' -ToSession $s -Force
             Copy-Item 'webui\win32_to_nt.py' -Destination 'C:\DetonationChamberUI\win32_to_nt.py' -ToSession $s -Force
             Copy-Item 'webui\win32_to_nt.json' -Destination 'C:\DetonationChamberUI\win32_to_nt.json' -ToSession $s -Force
+            Copy-Item 'webui\binary_graph.py' -Destination 'C:\DetonationChamberUI\binary_graph.py' -ToSession $s -Force
+            Copy-Item 'webui\binary_graph_query.py' -Destination 'C:\DetonationChamberUI\binary_graph_query.py' -ToSession $s -Force
             Copy-Item 'webui\minidump_analysis.py' -Destination 'C:\DetonationChamberUI\minidump_analysis.py' -ToSession $s -Force
             Copy-Item 'webui\pipe_analysis.py' -Destination 'C:\DetonationChamberUI\pipe_analysis.py' -ToSession $s -Force
             Copy-Item 'webui\pipe_signatures.json' -Destination 'C:\DetonationChamberUI\pipe_signatures.json' -ToSession $s -Force
@@ -404,6 +406,8 @@ switch ($Target) {
             Copy-Item 'webui\syscall_signatures.json' -Destination 'C:\DetonationChamberUI\syscall_signatures.json' -ToSession $s -Force
             Copy-Item 'webui\win32_to_nt.py' -Destination 'C:\DetonationChamberUI\win32_to_nt.py' -ToSession $s -Force
             Copy-Item 'webui\win32_to_nt.json' -Destination 'C:\DetonationChamberUI\win32_to_nt.json' -ToSession $s -Force
+            Copy-Item 'webui\binary_graph.py' -Destination 'C:\DetonationChamberUI\binary_graph.py' -ToSession $s -Force
+            Copy-Item 'webui\binary_graph_query.py' -Destination 'C:\DetonationChamberUI\binary_graph_query.py' -ToSession $s -Force
             Copy-Item 'webui\minidump_analysis.py' -Destination 'C:\DetonationChamberUI\minidump_analysis.py' -ToSession $s -Force
             Copy-Item 'webui\pipe_analysis.py' -Destination 'C:\DetonationChamberUI\pipe_analysis.py' -ToSession $s -Force
             Copy-Item 'webui\pipe_signatures.json' -Destination 'C:\DetonationChamberUI\pipe_signatures.json' -ToSession $s -Force

@@ -42,6 +42,9 @@ import syscall_rules
 import syscall_scan
 # The curated Win32 to Nt table: what turns a stub the sample carries into a proven bypass.
 import win32_to_nt
+# The import graph of the System32 binaries and the questions the SYSCALLS tab asks of it.
+import binary_graph
+import binary_graph_query
 import pipe_analysis
 import pipe_proxy
 # Offline analysis of exit-time minidumps (no scanner binary involved).
@@ -8859,6 +8862,195 @@ def api_syscalls_rule_download():
                     headers={"Content-Disposition": f'attachment; filename="{name}.yar"'})
 
 
+# --- SYSCALLS tab: the import graph of the System32 binaries ---
+
+# binary_graph.py reads every PE of System32: minutes, and a few hundred MB, so it runs as a process of its own and
+# the web UI only ever holds the finished cache. build-binary-graph.ps1 waits as long for the same build.
+BINARY_GRAPH_BUILD_TIMEOUT = 1800
+# A failed build of a build and architecture is not tried again for this long (seconds)
+BINARY_GRAPH_BUILD_RETRY = 600
+BINARY_GRAPH_PARAM_MAX = 512
+_binary_graph_log = logging.getLogger("tdc.binary_graph")
+
+
+def _new_binary_graph_build_state():
+    # running: (build, arch) being built; failed: (build, arch) -> (when, why); thread: the latest one
+    return {"running": set(), "failed": {}, "thread": None}
+
+
+_binary_graph_build_state = _new_binary_graph_build_state()
+_binary_graph_build_lock = threading.Lock()
+# binary_graph.py writes one cache per build and architecture into one directory: one build at a time
+_binary_graph_build_serial = threading.Lock()
+# The one graph this process holds, loaded once and kept: "path", "stamp" (mtime and size of the file it was read
+# from) and "graph", the Graph or the CacheMismatch the file gave. A changed file is read once more; nothing else is.
+_binary_graph_held = {}
+_binary_graph_held_lock = threading.Lock()
+
+
+def _build_binary_graph(build, arch):
+    """Build the cache of `build` and `arch` into NTSLEUTH_BASELINE_DIR with binary_graph.py. Raises RuntimeError with
+    the reason when it fails; binary_graph.py then leaves an earlier cache as it was. A cache the web UI still holds
+    open on Windows makes its os.replace fail with PermissionError, which it reports as a non-zero exit: that is a
+    failure here like any other, named, never a silent end."""
+    args = [sys.executable, os.path.join(APP_DIR, "binary_graph.py"), "--out", NTSLEUTH_BASELINE_DIR,
+            "--build", build, "--arch", arch]
+    try:
+        proc = _run_cmd(args, timeout=BINARY_GRAPH_BUILD_TIMEOUT, cwd=APP_DIR)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"binary_graph.py timed out ({BINARY_GRAPH_BUILD_TIMEOUT}s)") from None
+    except OSError as exc:
+        raise RuntimeError(f"binary_graph.py could not be started ({exc.__class__.__name__})") from None
+    if proc.returncode != 0:
+        tail = ((proc.stderr or proc.stdout or "").strip().splitlines() or [""])[-1][:300]
+        raise RuntimeError(f"binary_graph.py exited with {proc.returncode}: {tail}")
+
+
+def _binary_graph_build_job(build, arch):
+    key = (build, arch)
+    why = None
+    try:
+        with _binary_graph_build_serial:
+            _build_binary_graph(build, arch)
+    except Exception as exc:
+        why = str(exc) or type(exc).__name__
+        _binary_graph_log.warning("the binary graph of build %s (%s) was not built: %s", build, arch, why)
+    with _binary_graph_build_lock:
+        _binary_graph_build_state["running"].discard(key)
+        if why is None:
+            _binary_graph_build_state["failed"].pop(key, None)
+        else:
+            _binary_graph_build_state["failed"][key] = (time.time(), why)
+
+
+def _start_binary_graph_build(build, arch):
+    """Build the graph of `build` and `arch` in a thread of its own. False when one is running already, one failed
+    too recently to try again, or tools are being updated: an update that swaps files in System32 or the web UI's
+    Python under a build is the opposite of help."""
+    key = (build, arch)
+    if _updating_tools():
+        return False
+    with _binary_graph_build_lock:
+        state = _binary_graph_build_state
+        failed = state["failed"].get(key)
+        if state["running"] or (failed and time.time() - failed[0] < BINARY_GRAPH_BUILD_RETRY):
+            return False
+        state["running"].add(key)
+        state["thread"] = threading.Thread(target=_binary_graph_build_job, args=(build, arch),
+                                           name="binary-graph", daemon=True)
+        state["thread"].start()
+    return True
+
+
+def _binary_graph_building():
+    """Whether a binary graph is being built. A tool update must wait for it."""
+    with _binary_graph_build_lock:
+        return bool(_binary_graph_build_state["running"])
+
+
+def _binary_graph_build_note(build, arch):
+    with _binary_graph_build_lock:
+        running = (build, arch) in _binary_graph_build_state["running"]
+        failed = _binary_graph_build_state["failed"].get((build, arch))
+    if running:
+        return " It is being built in the background; that takes a few minutes."
+    if failed:
+        return f" The last build failed: {failed[1]}."
+    if _updating_tools():
+        return " Tool updates are running: no graph is built while they are."
+    return ""
+
+
+def _binary_graph_refusal(error, build=None, arch=None):
+    with _binary_graph_build_lock:
+        building = (build, arch) in _binary_graph_build_state["running"]
+    return {"error": error, "cache": None, "building": building}
+
+
+def _binary_graph_for():
+    """`(graph, None)` for this system's build and architecture, or `(None, refusal)`: the JSON body of a 404, with
+    `cache` null, that says why. A cache of another build or architecture is no graph: there is exactly one per
+    system, and the architecture is the registry's (binary_graph.host_arch), never `platform.machine()`, which an
+    emulated x64 Python on ARM64 answers with AMD64. When there is none, one is built in the background."""
+    build = _current_os_build()
+    if not build:
+        return None, _binary_graph_refusal("No binary graph can be chosen: the build of this system cannot be "
+                                           "determined.")
+    arch = binary_graph.host_arch()
+    path = binary_graph.find_cache(NTSLEUTH_BASELINE_DIR, build, arch)
+    stamp = None
+    if path is not None:
+        try:
+            info = os.stat(path)
+            stamp = (info.st_mtime_ns, info.st_size)
+        except OSError:
+            path = None
+    if path is None:
+        _start_binary_graph_build(build, arch)
+        return None, _binary_graph_refusal(f"There is no binary graph for build {build} ({arch}) yet."
+                                           + _binary_graph_build_note(build, arch), build, arch)
+    with _binary_graph_held_lock:
+        if _binary_graph_held.get("path") != path or _binary_graph_held.get("stamp") != stamp:
+            _binary_graph_held.clear()          # the old graph goes before the new one is read, not after
+            try:
+                loaded = binary_graph.load_graph(path, build, arch)
+            except binary_graph.CacheMismatch as exc:
+                loaded = exc
+            _binary_graph_held.update(path=path, stamp=stamp, graph=loaded)
+        loaded = _binary_graph_held["graph"]
+    if isinstance(loaded, binary_graph.CacheMismatch):
+        return None, _binary_graph_refusal(
+            f"The binary graph {os.path.basename(path)} cannot be used ({loaded.reason}: {loaded}). It is not built "
+            f"again by itself: delete it in {NTSLEUTH_BASELINE_DIR} to have it built anew.", build, arch)
+    return loaded, None
+
+
+def _binary_graph_param(name):
+    value = request.args.get(name) or ""
+    if len(value) > BINARY_GRAPH_PARAM_MAX:
+        raise _SyscallRouteError(f"{name} is longer than {BINARY_GRAPH_PARAM_MAX} characters")
+    return value
+
+
+def _binary_graph_stamp(graph):
+    return {"build": graph.build, "arch": graph.arch, "created": graph.created,
+            "cache": binary_graph.cache_name(graph.build, graph.arch)}
+
+
+@app.route("/api/binary-graph/query")
+def api_binary_graph_query():
+    """One query over the import graph. Params: `q` (a name of binary_graph_query.QUERIES) and what it reads of
+    `module`, `function`, `syscall`, `other` and `metric`."""
+    run = binary_graph_query.QUERIES.get(request.args.get("q") or "")
+    if run is None:
+        return jsonify({"error": "q must be one of " + ", ".join(binary_graph_query.QUERIES)}), 400
+    params = {name: _binary_graph_param(name) for name in ("module", "function", "syscall", "other", "metric")}
+    graph, refusal = _binary_graph_for()
+    if graph is None:
+        return jsonify(refusal), 404
+    try:
+        answer = run(binary_graph_query.Context(graph), params)
+    except binary_graph_query.MissingParameter as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({**binary_graph_query.answer_json(answer), **_binary_graph_stamp(graph)})
+
+
+@app.route("/api/binary-graph/node")
+def api_binary_graph_node():
+    """What the import graph knows of one name. Param: `name`. `404` when it is neither a binary nor an api set."""
+    name = _binary_graph_param("name").strip()
+    if not name:
+        return jsonify({"error": "the parameter name is required"}), 400
+    graph, refusal = _binary_graph_for()
+    if graph is None:
+        return jsonify(refusal), 404
+    detail = binary_graph_query.node_detail(graph, name)
+    if detail["is"] == "none":
+        return jsonify({"error": f"{detail['name']} is neither a binary nor an api set in the binary graph of this "
+                                 f"system.", "in_degree": detail["in_degree"], **_binary_graph_stamp(graph)}), 404
+    return jsonify({**detail, **_binary_graph_stamp(graph)})
+
+
 # --- Memory dumping: Process Dump ---
 
 def _parse_processdump_filename(name):
@@ -9265,6 +9457,7 @@ SUSPICIOUS_IMPORTS = {
         "GetModuleHandle", "GetModuleHandleA",
     ],
 }
+binary_graph_query.set_categories(SUSPICIOUS_IMPORTS)
 
 # Known packer/protector section names
 PACKER_SECTIONS = {
@@ -11736,6 +11929,8 @@ def _update_preconditions():
         return "A syscall scan is running. Wait until it finishes."
     if _syscall_extracting():
         return "A syscall baseline is being extracted. Wait until it finishes."
+    if _binary_graph_building():
+        return "A binary graph is being built. Wait until it finishes."
     return None
 
 

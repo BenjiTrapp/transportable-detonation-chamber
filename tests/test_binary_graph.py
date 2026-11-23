@@ -3,10 +3,13 @@
 import json
 import os
 import re
+import subprocess
+import threading
 
 import pytest
 
 import binary_graph
+import binary_graph_query
 import memory_evidence
 import syscall_baseline
 import syscall_scan
@@ -2180,3 +2183,427 @@ def test_the_build_script_off_windows_finds_no_registry_and_still_exits_zero(tmp
                           capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "No graph was built" in proc.stdout
+
+
+# --- the queries over the graph (binary_graph_query) ---------------------------------------------
+
+def _q(name, kind="dll", imports=None, exports=(), forwarders=None, partial=False):
+    return binary_graph.BinaryInfo(name=name, kind=kind, machine="arm64", imports=dict(imports or {}),
+                                   exports=tuple(exports), forwarders=dict(forwarders or {}), ordinal_names={},
+                                   partial=partial)
+
+
+def _query_graph(*infos, api_sets=None, build="26220.5770", arch="arm64"):
+    """A Graph as build_graph makes one: resolved and in_degree are derived from the records, never written by hand."""
+    binaries = {info.name: info for info in infos}
+    api_sets = dict(api_sets or {})
+    in_degree = {}
+    for info in binaries.values():
+        for module in info.imports:
+            in_degree[module] = in_degree.get(module, 0) + 1
+    return binary_graph.Graph(build=build, arch=arch, created="2026-11-23T10:00:00Z", binaries=binaries,
+                              api_sets=api_sets, resolved=binary_graph.resolve_all(binaries, api_sets),
+                              in_degree=in_degree, skipped=())
+
+
+def _system():
+    """A small System32: direct, forwarded and api-set paths to NtClose, and binaries that take none of them."""
+    return _query_graph(
+        _q("ntdll.dll", exports=["NtClose", "ZwClose", "NtAllocateVirtualMemory", "ZwAllocateVirtualMemory",
+                                 "RtlAllocateHeap"]),
+        _q("kernelbase.dll", imports={"ntdll.dll": ("NtClose", "NtAllocateVirtualMemory")},
+           exports=["VirtualAlloc", "CloseHandle"],
+           forwarders={"NtClose": "NTDLL.NtClose", "HeapAlloc": "NTDLL.RtlAllocateHeap"}),
+        _q("kernel32.dll", imports={"api-ms-win-core-memory-l1-1-0.dll": ("VirtualAlloc",)},
+           exports=["CloseHandle"],
+           forwarders={"HeapAlloc": "api-ms-win-core-heap-l1-1-0.HeapAlloc", "CloseHandleNt": "NTDLL.ZwClose",
+                       "Gone": "MISSING.Gone"}),
+        _q("a.exe", "exe", imports={"ntdll.dll": ("NtClose",)}),
+        _q("b.exe", "exe", imports={"kernel32.dll": ("CloseHandleNt", "VirtualAllocEx")}),
+        _q("c.exe", "exe", imports={"api-ms-win-core-handle-l1-1-0.dll": ("NtClose",)}),
+        _q("d.exe", "exe", imports={"kernel32.dll": ("CloseHandle",), "user32.dll": ("MessageBoxW",),
+                                    "advapi32.dll": ("RegSetValueExW",)}),
+        _q("e.exe", "exe", imports={"api-ms-win-core-memory-l1-1-0.dll": ("VirtualAlloc",),
+                                    "user32.dll": ("MessageBoxW",)}),
+        api_sets={"api-ms-win-core-heap-l1-1-0": ("kernelbase.dll",),
+                  "api-ms-win-core-handle-l1-1-0": ("kernelbase.dll",),
+                  "api-ms-win-core-memory-l1-1-0": ("kernelbase.dll",)})
+
+
+def _ids(answer):
+    return {node.id for node in answer.nodes}
+
+
+def _node(answer, node_id):
+    return next(node for node in answer.nodes if node.id == node_id)
+
+
+def _edges(answer):
+    return {(edge.source, edge.target, edge.kind) for edge in answer.edges}
+
+
+def _whole(answer):
+    """Every edge joins two nodes of the answer, and every root is one of them."""
+    ids = _ids(answer)
+    assert all(edge.source in ids and edge.target in ids for edge in answer.edges)
+    assert set(answer.roots) <= ids
+
+
+def test_who_imports_this_names_every_binary_with_an_import_edge_to_it():
+    graph = _system()
+    got = binary_graph_query.importers_of(graph, "kernel32.dll")
+    assert _ids(got) == {"kernel32.dll", "b.exe", "d.exe"}
+    assert _edges(got) == {("b.exe", "kernel32.dll", "imports"), ("d.exe", "kernel32.dll", "imports")}
+    assert got.roots == ("kernel32.dll",)
+    assert (_node(got, "b.exe").kind, _node(got, "kernel32.dll").kind) == ("exe", "dll")
+    assert _node(got, "kernel32.dll").in_degree == graph.in_degree["kernel32.dll"] == 2
+    assert all(edge.origin == "derived" for edge in got.edges)
+    assert got.truncated is False and got.note
+    # the name as a user types it
+    assert binary_graph_query.importers_of(graph, "KERNEL32") == got
+    _whole(got)
+
+
+def test_who_imports_this_function_narrows_to_the_binaries_that_import_that_name():
+    graph = _system()
+    got = binary_graph_query.importers_of(graph, "kernel32.dll", "CloseHandle")
+    assert _ids(got) == {"kernel32.dll", "d.exe"}           # b.exe imports kernel32.dll, but not CloseHandle
+    assert [edge.label for edge in got.edges] == ["CloseHandle"]
+    # most of System32 imports through an api set: the alias is drawn, and the host it resolves to
+    via = binary_graph_query.importers_of(graph, "kernelbase.dll", "VirtualAlloc")
+    assert _ids(via) == {"kernelbase.dll", "api-ms-win-core-memory-l1-1-0.dll", "kernel32.dll", "e.exe"}
+    assert _edges(via) == {("kernel32.dll", "api-ms-win-core-memory-l1-1-0.dll", "imports"),
+                           ("e.exe", "api-ms-win-core-memory-l1-1-0.dll", "imports"),
+                           ("api-ms-win-core-memory-l1-1-0.dll", "kernelbase.dll", "resolves_to")}
+    assert _node(via, "api-ms-win-core-memory-l1-1-0.dll").kind == "api-set"
+    # an api set whose host does not offer the function is no importer of it, nor one that resolves elsewhere
+    assert binary_graph_query.importers_of(graph, "kernelbase.dll", "Nowhere").nodes == ()
+    assert binary_graph_query.importers_of(graph, "kernel32.dll", "VirtualAlloc").nodes == ()
+    _whole(via)
+
+
+def test_the_imports_of_a_binary_carry_the_suspicious_category_on_their_node(app_module):
+    graph = _system()
+    got = binary_graph_query.imports_of(graph, "b.exe")
+    assert got.roots == ("b.exe",)
+    assert _ids(got) == {"b.exe", "kernel32.dll!VirtualAllocEx", "kernel32.dll!CloseHandleNt"}
+    assert _edges(got) == {("b.exe", "kernel32.dll!VirtualAllocEx", "imports"),
+                           ("b.exe", "kernel32.dll!CloseHandleNt", "imports")}
+    alloc = _node(got, "kernel32.dll!VirtualAllocEx")
+    assert (alloc.kind, alloc.label) == ("function", "VirtualAllocEx")
+    assert "VirtualAllocEx" in app_module.SUSPICIOUS_IMPORTS[alloc.category]
+    assert _node(got, "kernel32.dll!CloseHandleNt").category == ""
+    # SUSPICIOUS_IMPORTS names the function without its A or W: System32 imports it with one
+    registry = _node(binary_graph_query.imports_of(graph, "d.exe"), "advapi32.dll!RegSetValueExW")
+    assert "RegSetValueEx" in app_module.SUSPICIOUS_IMPORTS[registry.category]
+    _whole(got)
+
+
+def test_the_normal_callers_of_a_syscall_are_the_modules_whose_chain_reaches_ntdll():
+    graph = _system()
+    got = binary_graph_query.callers_of_syscall(graph, "NtClose")
+    assert got.roots == ("syscall:NtClose",)
+    assert _node(got, "syscall:NtClose").kind == "syscall"
+    callers = {node.id for node in got.nodes if node.kind in ("dll", "exe")}
+    # direct, through a forwarder to the Zw name, through an api set and a forwarder; d.exe's CloseHandle is code,
+    # not a chain, and is no normal caller
+    assert callers == {"a.exe", "b.exe", "c.exe", "kernelbase.dll"}
+    assert {("c.exe", "api-ms-win-core-handle-l1-1-0.dll!NtClose", "imports"),
+            ("api-ms-win-core-handle-l1-1-0.dll!NtClose", "kernelbase.dll!NtClose", "resolves_to"),
+            ("kernelbase.dll!NtClose", "ntdll.dll!NtClose", "forwards_to"),
+            ("ntdll.dll!NtClose", "syscall:NtClose", "reaches_syscall"),
+            ("b.exe", "kernel32.dll!CloseHandleNt", "imports"),
+            ("kernel32.dll!CloseHandleNt", "ntdll.dll!ZwClose", "forwards_to"),
+            ("ntdll.dll!ZwClose", "syscall:NtClose", "reaches_syscall"),
+            ("a.exe", "ntdll.dll!NtClose", "imports")} <= _edges(got)
+    assert all(edge.origin == "derived" for edge in got.edges)
+    # the Zw name is the same syscall
+    assert binary_graph_query.callers_of_syscall(graph, "ZwClose") == got
+    _whole(got)
+
+
+def _follow(answer, start):
+    """The node ids from `start` along the one edge out of each."""
+    out = {}
+    for edge in answer.edges:
+        assert edge.source not in out, "a forwarder chain branches"
+        out[edge.source] = edge.target
+    path = [start]
+    while path[-1] in out:
+        path.append(out[path[-1]])
+    return path
+
+
+def test_the_forwarder_chains_of_a_module_draw_one_path_per_forwarded_export():
+    graph = _system()
+    got = binary_graph_query.forwarder_chains(graph, "kernel32.dll")
+    assert set(got.roots) == {"kernel32.dll!HeapAlloc", "kernel32.dll!CloseHandleNt", "kernel32.dll!Gone"}
+    assert _follow(got, "kernel32.dll!HeapAlloc") == [
+        "kernel32.dll!HeapAlloc", "api-ms-win-core-heap-l1-1-0.dll!HeapAlloc", "kernelbase.dll!HeapAlloc",
+        "ntdll.dll!RtlAllocateHeap"]
+    assert _follow(got, "kernel32.dll!CloseHandleNt") == ["kernel32.dll!CloseHandleNt", "ntdll.dll!ZwClose"]
+    # a chain into a module that is not there is drawn as far as it goes, and the note says so
+    assert _follow(got, "kernel32.dll!Gone") == ["kernel32.dll!Gone", "missing.dll!Gone"]
+    assert "missing" in got.note or "not in the graph" in got.note
+    assert {edge.kind for edge in got.edges} == {"forwards_to", "resolves_to"}
+    _whole(got)
+
+
+def test_the_shared_dependencies_of_two_binaries_are_the_modules_both_import():
+    graph = _system()
+    got = binary_graph_query.shared_dependencies(graph, "d.exe", "e.exe")
+    assert got.roots == ("d.exe", "e.exe")
+    assert _ids(got) == {"d.exe", "e.exe", "user32.dll"}
+    assert _edges(got) == {("d.exe", "user32.dll", "imports"), ("e.exe", "user32.dll", "imports")}
+    assert _node(got, "user32.dll").in_degree == 2
+    _whole(got)
+
+
+def _is_sentence(note):
+    # a module name opens many notes and is lower case: prose is words and a full stop
+    return len(note.split()) > 3 and note.endswith(".")
+
+
+def test_a_binary_that_is_not_in_the_graph_gives_an_empty_answer_with_a_note():
+    graph = _system()
+    for answer in (binary_graph_query.importers_of(graph, "nothere.dll"),
+                   binary_graph_query.importers_of(graph, "kernel32.dll", "NoSuchFunction"),
+                   binary_graph_query.imports_of(graph, "nothere.dll"),
+                   binary_graph_query.callers_of_syscall(graph, "NtNothing"),
+                   binary_graph_query.forwarder_chains(graph, "nothere.dll"),
+                   binary_graph_query.forwarder_chains(graph, "a.exe"),            # there, and forwards nothing
+                   binary_graph_query.shared_dependencies(graph, "d.exe", "nothere.dll")):
+        assert (answer.nodes, answer.edges, answer.roots, answer.truncated) == ((), (), (), False)
+        assert _is_sentence(answer.note), answer.note
+    assert "nothere.dll" in binary_graph_query.imports_of(graph, "nothere.dll").note
+
+
+def _hub(importers):
+    return _query_graph(_q("hub.dll", exports=["F"]),
+                        *(_q(f"user{n:04}.exe", "exe", imports={"hub.dll": ("F",)}) for n in range(importers)))
+
+
+def test_an_answer_over_max_nodes_is_cut_and_says_truncated():
+    assert binary_graph_query.MAX_NODES == 400
+    got = binary_graph_query.importers_of(_hub(500), "hub.dll")
+    assert len(got.nodes) == binary_graph_query.MAX_NODES
+    assert got.truncated is True
+    assert "400" in got.note and "500" in got.note
+    _whole(got)
+    small = binary_graph_query.importers_of(_hub(binary_graph_query.MAX_NODES - 1), "hub.dll")
+    assert (len(small.nodes), small.truncated) == (binary_graph_query.MAX_NODES, False)
+
+
+def test_a_truncated_answer_keeps_its_roots_so_the_view_still_has_a_starting_point():
+    got = binary_graph_query.importers_of(_hub(500), "hub.dll")
+    assert got.roots == ("hub.dll",) and "hub.dll" in _ids(got)
+    # a cut drops whole paths, never half of one: every chain that is kept still reaches its end
+    many = _query_graph(_q("ntdll.dll", exports=[f"F{n}" for n in range(300)]),
+                        _q("k.dll", forwarders={f"F{n}": f"NTDLL.F{n}" for n in range(300)}))
+    chains = binary_graph_query.forwarder_chains(many, "k.dll")
+    assert chains.truncated is True and len(chains.nodes) <= binary_graph_query.MAX_NODES
+    assert chains.roots
+    for root in chains.roots:
+        assert _follow(chains, root) == [root, "ntdll.dll!" + root.split("!", 1)[1]]
+    assert len(chains.nodes) == 2 * len(chains.roots)
+    _whole(chains)
+
+
+def test_the_detail_of_a_node_names_its_imports_exports_forwarders_and_in_degree():
+    graph = _system()
+    got = binary_graph_query.node_detail(graph, "kernel32.dll")
+    assert got["name"] == "kernel32.dll" and got["is"] == "binary"
+    assert (got["kind"], got["machine"], got["in_degree"], got["partial"]) == ("dll", "arm64", 2, False)
+    assert got["imports"] == {"api-ms-win-core-memory-l1-1-0.dll": ["VirtualAlloc"]}
+    assert got["exports"] == ["CloseHandle"]
+    assert got["forwarders"]["CloseHandleNt"] == {"raw": "NTDLL.ZwClose", "reason": "defined",
+                                                  "module": "ntdll.dll", "function": "ZwClose", "partial": False}
+    assert got["forwarders"]["Gone"]["reason"] == "missing"
+    assert binary_graph_query.node_detail(graph, "KERNEL32")["name"] == "kernel32.dll"
+    # imported, but not a file of the graph
+    missing = binary_graph_query.node_detail(graph, "user32.dll")
+    assert (missing["is"], missing["in_degree"]) == ("none", 2)
+    json.dumps(got)
+
+
+def test_the_detail_of_an_api_set_name_names_its_host_modules():
+    graph = _system()
+    got = binary_graph_query.node_detail(graph, "api-ms-win-core-memory-l1-1-0.dll")
+    assert got["is"] == "api-set" and got["kind"] == "api-set"
+    assert got["hosts"] == ["kernelbase.dll"]
+    assert got["in_degree"] == 2
+    assert binary_graph_query.node_detail(graph, "api-ms-win-core-memory-l1-1-0")["hosts"] == ["kernelbase.dll"]
+    json.dumps(got)
+
+
+# --- the two routes --------------------------------------------------------------------------------------------
+
+_PARAMS = {"importers": "module=kernel32.dll&function=CloseHandle", "imports": "module=b.exe",
+           "syscall-callers": "syscall=NtClose", "forwarders": "module=kernel32.dll", "shared": "module=d.exe&other=e.exe"}
+
+
+@pytest.fixture
+def graph_host(tdc, monkeypatch):
+    """This system is build 26220.5770 on ARM64, and the web UI's Python an emulated x64 one: platform.machine()
+    says AMD64, the registry (host_arch) says arm64. The cache of _system() lies where the web UI looks."""
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26220.5770")
+    monkeypatch.setattr(tdc.platform, "machine", lambda: "AMD64")
+    monkeypatch.setattr(tdc.binary_graph, "host_arch", lambda *a, **k: "arm64")
+    builds = []
+    real_build = tdc._build_binary_graph
+    monkeypatch.setattr(tdc, "_build_binary_graph", lambda build, arch: builds.append((build, arch)))
+    directory = tdc.NTSLEUTH_BASELINE_DIR
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, binary_graph.cache_name("26220.5770", "arm64"))
+    binary_graph.save_graph(_system(), path)
+    return path, builds, real_build
+
+
+def _join(tdc):
+    thread = tdc._binary_graph_build_state["thread"]
+    if thread is not None:
+        thread.join(5)
+
+
+def test_the_query_route_answers_each_query_name_and_refuses_an_unknown_one(client, graph_host):
+    assert set(_PARAMS) == set(binary_graph_query.QUERIES)
+    for name, params in _PARAMS.items():
+        r = client.get(f"/api/binary-graph/query?q={name}&{params}")
+        assert r.status_code == 200, (name, r.get_json())
+        body = r.get_json()
+        assert body["nodes"] and body["roots"] and body["note"], name
+        assert (body["build"], body["arch"], body["created"]) == ("26220.5770", "arm64", "2026-11-23T10:00:00Z")
+        assert body["truncated"] is False
+        assert set(body["nodes"][0]) == {"id", "label", "kind", "in_degree", "category"}
+        assert set(body["edges"][0]) == {"source", "target", "kind", "origin", "label"}
+    callers = client.get("/api/binary-graph/query?q=syscall-callers&syscall=NtClose").get_json()
+    assert callers["roots"] == ["syscall:NtClose"]
+    r = client.get("/api/binary-graph/query?q=everything&module=kernel32.dll")
+    assert r.status_code == 400 and "importers" in r.get_json()["error"]
+    assert client.get("/api/binary-graph/query?module=kernel32.dll").status_code == 400
+    # a query without the parameter it needs is refused, and says which
+    r = client.get("/api/binary-graph/query?q=shared&module=d.exe")
+    assert r.status_code == 400 and "other" in r.get_json()["error"]
+    # a name that finds nothing is an answer, with its note: not a refusal
+    r = client.get("/api/binary-graph/query?q=imports&module=nothere.dll")
+    assert r.status_code == 200 and r.get_json()["nodes"] == [] and "nothere.dll" in r.get_json()["note"]
+
+
+def test_the_query_route_says_so_when_no_cache_matches_this_build(client, tdc, graph_host, monkeypatch):
+    path, builds, _ = graph_host
+    os.replace(path, os.path.join(os.path.dirname(path), binary_graph.cache_name("26220.5770", "x64")))
+    r = client.get("/api/binary-graph/query?q=imports&module=b.exe")
+    assert r.status_code == 404
+    body = r.get_json()
+    assert body["cache"] is None and "nodes" not in body
+    assert "26220.5770" in body["error"] and "arm64" in body["error"]
+    _join(tdc)
+    # one is built in the background, for the architecture of the system, not the one of the interpreter
+    assert builds == [("26220.5770", "arm64")]
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26300.1")
+    r = client.get("/api/binary-graph/query?q=imports&module=b.exe")
+    assert r.status_code == 404 and r.get_json()["cache"] is None and "26300.1" in r.get_json()["error"]
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: None)
+    r = client.get("/api/binary-graph/node?name=b.exe")
+    assert r.status_code == 404 and r.get_json()["cache"] is None
+
+
+def test_the_node_route_answers_a_binary_and_four_oh_fours_an_unknown_name(client, graph_host):
+    r = client.get("/api/binary-graph/node?name=kernel32.dll")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert (body["is"], body["in_degree"], body["exports"]) == ("binary", 2, ["CloseHandle"])
+    assert body["build"] == "26220.5770" and body["arch"] == "arm64"
+    assert client.get("/api/binary-graph/node?name=api-ms-win-core-memory-l1-1-0").get_json()["hosts"] == ["kernelbase.dll"]
+    r = client.get("/api/binary-graph/node?name=nowhere.dll")
+    assert r.status_code == 404 and "nowhere.dll" in r.get_json()["error"]
+    assert r.get_json()["cache"] is not None            # the graph is there; it is the name it does not know
+    assert client.get("/api/binary-graph/node").status_code == 400
+
+
+def test_the_graph_is_loaded_once_and_held_across_requests(client, tdc, graph_host, monkeypatch):
+    loads = []
+    real = binary_graph.load_graph
+    monkeypatch.setattr(tdc.binary_graph, "load_graph", lambda *a: loads.append(a) or real(*a))
+    for _ in range(3):
+        assert client.get("/api/binary-graph/query?q=imports&module=b.exe").status_code == 200
+    assert client.get("/api/binary-graph/node?name=b.exe").status_code == 200
+    assert len(loads) == 1
+    # a rebuilt cache is a new file: that one is read, once
+    path, _, _ = graph_host
+    binary_graph.save_graph(_query_graph(_q("b.exe", "exe", imports={"x.dll": ("F",)})), path)
+    os.utime(path, ns=(1, 1))
+    assert client.get("/api/binary-graph/query?q=imports&module=b.exe").get_json()["nodes"][1]["id"] == "x.dll!F"
+    assert len(loads) == 2
+
+
+def test_an_unusable_cache_is_refused_with_its_reason_and_not_read_again(client, tdc, graph_host, monkeypatch):
+    path, builds, _ = graph_host
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write('{"format": 1, "build": "26220.5770", "arch": "arm64"')
+    loads = []
+    real = binary_graph.load_graph
+    monkeypatch.setattr(tdc.binary_graph, "load_graph", lambda *a: loads.append(a) or real(*a))
+    for _ in range(2):
+        r = client.get("/api/binary-graph/query?q=imports&module=b.exe")
+        assert r.status_code == 404 and r.get_json()["cache"] is None and "malformed" in r.get_json()["error"]
+    assert len(loads) == 1
+
+
+def test_an_update_is_refused_while_the_binary_graph_is_being_built(tdc, monkeypatch):
+    monkeypatch.setattr(tdc, "_probe_http", lambda url, timeout=2: None)
+    assert tdc._update_preconditions() is None
+    started, release = threading.Event(), threading.Event()
+
+    def slow(build, arch):
+        started.set()
+        release.wait(10)
+
+    monkeypatch.setattr(tdc, "_build_binary_graph", slow)
+    assert tdc._start_binary_graph_build("26220.5770", "arm64") is True
+    try:
+        assert started.wait(5)
+        assert tdc._update_preconditions() == "A binary graph is being built. Wait until it finishes."
+        assert tdc._start_binary_graph_build("26220.5770", "arm64") is False       # one at a time
+    finally:
+        release.set()
+    _join(tdc)
+    assert tdc._update_preconditions() is None
+
+
+class _Updating:
+    maintenance = True
+
+
+def test_no_binary_graph_is_built_while_the_tools_are_being_updated(client, tdc, graph_host, monkeypatch):
+    path, builds, _ = graph_host
+    os.remove(path)
+    monkeypatch.setattr(tdc, "_update_manager", _Updating())
+    r = client.get("/api/binary-graph/query?q=imports&module=b.exe")
+    assert r.status_code == 404 and "updat" in r.get_json()["error"]
+    assert tdc._binary_graph_build_state["thread"] is None and builds == []
+
+
+def test_a_build_that_fails_says_why_in_the_refusal_and_is_not_retried_at_once(client, tdc, graph_host, monkeypatch):
+    path, _, real_build = graph_host
+    os.remove(path)
+    calls = []
+
+    def run(args, timeout=None, **kwargs):
+        calls.append(args)
+        # what binary_graph.py says when the web UI holds the old cache open on Windows
+        return subprocess.CompletedProcess(args, 1, "binaries: 4012\n", "the cache cannot be written (PermissionError)\n")
+
+    monkeypatch.setattr(tdc, "_run_cmd", run)
+    monkeypatch.setattr(tdc, "_build_binary_graph", real_build)
+    client.get("/api/binary-graph/query?q=imports&module=b.exe")
+    _join(tdc)
+    assert len(calls) == 1
+    args = calls[0]
+    assert args[1].endswith("binary_graph.py")
+    assert args[2:] == ["--out", tdc.NTSLEUTH_BASELINE_DIR, "--build", "26220.5770", "--arch", "arm64"]
+    r = client.get("/api/binary-graph/query?q=imports&module=b.exe")
+    assert r.status_code == 404 and "PermissionError" in r.get_json()["error"]
+    assert r.get_json()["building"] is False
+    _join(tdc)
+    assert len(calls) == 1                                   # held back for a while, not run on every request

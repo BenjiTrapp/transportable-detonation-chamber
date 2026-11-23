@@ -67,6 +67,9 @@ def tdc(app_module, monkeypatch, tmp_path):
     monkeypatch.setattr(m, "_hook_allowlist", None)
     monkeypatch.setattr(m, "_syscall_baselines", {})
     monkeypatch.setattr(m, "_syscall_extract_state", m._new_syscall_extract_state())
+    # the binary graph: no build of an earlier test running, no graph of an earlier test held
+    monkeypatch.setattr(m, "_binary_graph_build_state", m._new_binary_graph_build_state())
+    monkeypatch.setattr(m, "_binary_graph_held", {})
     monkeypatch.setattr(m, "_symbol_server_reachable", lambda: False)
     m.set_log_store(m.log_store.LogStore(persist_dir=str(tmp_path / "logs")))
     # the own dashboards of a test are a file of its own, never webui/dashboards.json
