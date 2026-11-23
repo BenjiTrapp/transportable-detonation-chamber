@@ -266,7 +266,12 @@ Die Befehlsmuster sind **pro Architektur** zu prüfen:
   `MOVZ Xn` mit bis zu drei `MOVK Xn` + `BR Xn`. Statt `BR` darf jede dieser
   Formen mit einem Sprung mit Zeiger-Authentifizierung enden (`BRAA`, `BRAB`,
   `BRAAZ`, `BRABZ`), den Windows auf ARM64 verwendet; gefragt wird dann nach der
-  Adresse ohne die PAC-Bits darüber. `BLR` ist keine Sprungform: es ist ein
+  Adresse ohne die PAC-Bits darüber, also nach den unteren **47** Bits. Eine
+  Windows-Nutzeradresse endet bei `0x7FFF'FFFFFFFF`, 47 Bits tragen jede davon,
+  gleich ob der Nutzerbereich 47 oder 48 Bits hat. Mit 48 gehörte Bit 47 unter
+  47 Bits zur PAC, die der Signierende wählt: ein Zeiger, der es setzt, ergäbe
+  keine Adresse, eine fehlgeschlagene Abfrage, `diverged` — ungewertet, wo das
+  Relay vorher `patched` war. `BLR` ist keine Sprungform: es ist ein
   Aufruf, und ein Relay, das aufruft, kehrte nicht durch den Stub zurück.
   Das Register ist nicht fest: Der übliche EDR-Hook nimmt x16, Microsoft
   Detours x17 für beide Formen (`LDR x17, #8; BR x17` und

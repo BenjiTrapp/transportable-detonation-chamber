@@ -696,6 +696,26 @@ def test_a_relay_through_a_signed_pointer_is_followed_to_the_address_below_its_p
     assert s["relay"] == [{"address": _RELAY, "owner": "private", "pattern": "LDR; BRAA"}]
 
 
+def test_a_pac_that_sets_bit_47_is_stripped_with_the_rest_of_it():
+    # Windows user addresses end below 2^47; with a 47-bit user VA, bit 47 is PAC, and the signer chooses the PAC
+    assert syscall_baseline.strip_pointer_auth(0x0000FFFA12345678) == 0x7FFA12345678
+    assert syscall_baseline.strip_pointer_auth(0xFFFF_FFFF_FFFF_FFFF) == 0x7FFF_FFFF_FFFF
+    assert syscall_baseline.strip_pointer_auth(0x7FFF_FFFF_FFFF) == 0x7FFF_FFFF_FFFF, "no user address loses a bit"
+
+
+def test_a_relay_to_the_payload_through_a_pointer_signed_with_bit_47_set_is_patched_not_diverged(arm64_baseline):
+    # stub -> B private -> LDR x17; BRAA x17, xM -> the payload in private memory: a PAC chosen to set bit 47 must not
+    # turn the patch into a failed lookup that scores nothing
+    payload = 0x7FF80F300000
+    reader = _arm64_b_to_relay(arm64_baseline)
+    _private_code(reader, _RELAY, _words(_ldr_literal(17, 2), _braa(17)) + (payload | 1 << 47).to_bytes(8, "little"))
+    _private_code(reader, payload, _words(0xD503201F, 0xD503201F))
+    out = syscall_scan.measure(arm64_baseline, reader)
+    s = out["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["target_owner"]) == ("patched", "private")
+    assert (out["owner_errors"], out["partial"]) == (0, False)
+
+
 def test_a_relay_that_materialises_its_target_is_hooked(arm64_baseline):
     reader = _arm64_b_to_relay(arm64_baseline)
     _private_code(reader, _RELAY, _words(*_materialise(16, _EDR_TARGET), _br(16)))

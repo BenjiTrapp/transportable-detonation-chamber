@@ -397,8 +397,11 @@ _ARM64_BRANCHES = (
     (0xFFFFFC1F, 0xD61F081F, "BRAAZ"),
     (0xFFFFFC1F, 0xD61F0C1F, "BRABZ"),
 )
-# The address bits of a pointer whose PAC a branch strips: a user-mode address of Windows on ARM64 fits in 48
-_ARM64_VA_MASK = (1 << 48) - 1
+# The address bits of a pointer whose PAC a branch strips. A Windows user-mode address ends at 0x7FFF'FFFFFFFF, so 47
+# bits hold every one of them, whether the system gives user space 47 or 48 bits. 48 would be wrong under 47: bit 47
+# is then PAC, which the signer chooses, and a pointer signed to set it would strip to no address at all, a failed
+# lookup that scores nothing.
+_ARM64_VA_MASK = (1 << 47) - 1
 
 
 def _arm64_branch(word: int | None) -> tuple[int, str] | None:
