@@ -6,7 +6,11 @@ import re
 
 import pytest
 
+import memory_evidence
+import syscall_baseline
+import syscall_scan
 import win32_to_nt
+from test_syscalls import _fixture
 
 
 # --- the curated Win32 to Nt table --------------------------------------------------------
@@ -106,3 +110,73 @@ def test_missing_from_is_empty_for_a_set_that_holds_them_all():
     # any iterable of names: the keys of a baseline's syscalls are what the VM passes
     assert table.missing_from(dict.fromkeys(e.nt for e in table.entries)) == ()
 
+
+# --- the table under the stub search: a proof, or a hint ------------------------------------
+
+def _x64_stub(number):
+    return bytes.fromhex("4c8bd1b8") + number.to_bytes(4, "little") + bytes.fromhex("0f05")
+
+
+@pytest.fixture
+def x64_baseline():
+    """The x64 fixture, plus a syscall some row leads to (NtCreateThreadEx) and one no row does (NtCreateFile)."""
+    bl = syscall_baseline.parse_baseline(_fixture("x64"), "26220.5770", "x64")
+    for name, number in (("NtCreateThreadEx", 0xC1), ("NtCreateFile", 0x55)):
+        sc = syscall_baseline.Syscall(name, "ntdll.dll", number, 0, "NTSTATUS", "", [], _x64_stub(number), True)
+        bl.syscalls[name] = sc
+        bl.by_number[("ntdll.dll", number)] = sc
+    return bl
+
+
+def _hit(baseline, name, imports):
+    """The one hit of a stub for `name`, searched the way the web UI searches: the table applied to `imports`."""
+    table = win32_to_nt.load_table()
+    (hit,) = syscall_scan.find_stubs_in_bytes(
+        _x64_stub(baseline.syscalls[name].number), baseline, imports,
+        expanded_imports=table.expand(imports), covered=table.covered)
+    return hit
+
+
+def test_expand_keeps_none_as_none_and_adds_the_nt_name_of_a_hit():
+    table = win32_to_nt.load_table()
+    assert table.expand(None) is None
+    assert table.expand(set()) == set()
+    assert table.expand({"VirtualAllocEx", "GetLastError"}) == {
+        "VirtualAllocEx", "GetLastError", "NtAllocateVirtualMemory"}
+    assert table.expand({"zwunmapviewofsection"}) == {"zwunmapviewofsection", "NtUnmapViewOfSection"}
+    # only a matched name adds anything: a miss must not sweep the table in, or nothing would ever be a proof
+    assert table.expand({"GetLastError", "CreateService"}) == {"GetLastError", "CreateService"}
+
+
+def test_a_sample_whose_api_the_table_does_not_know_is_a_hint_and_not_a_proven_bypass(x64_baseline):
+    # imports {"CreateService"}: no row, so expand() adds nothing. For a stub of a syscall no row leads to, the
+    # expansion cannot speak: an ordinary program reaching NtCreateFile through CreateFileW stays None, not False
+    assert win32_to_nt.load_table().expand({"CreateService"}) == {"CreateService"}
+    assert _hit(x64_baseline, "NtCreateFile", {"CreateService"})["import_present"] is None
+    assert _hit(x64_baseline, "NtCreateFile", {"CreateFileW", "GetLastError"})["import_present"] is None
+    assert _hit(x64_baseline, "NtUserGetForegroundWindow", {"GetForegroundWindow"})["import_present"] is None
+
+
+def test_a_sample_that_imports_the_documented_win32_path_is_not_a_proven_bypass(x64_baseline):
+    assert _hit(x64_baseline, "NtAllocateVirtualMemory", {"VirtualAllocEx"})["import_present"] is True
+    assert _hit(x64_baseline, "NtCreateThreadEx", {"CreateThread"})["import_present"] is True
+    assert _hit(x64_baseline, "NtCreateThreadEx", {"_beginthreadex"})["import_present"] is True
+
+
+def test_a_sample_that_imports_nothing_of_the_path_is_a_proven_bypass(x64_baseline):
+    hit = _hit(x64_baseline, "NtAllocateVirtualMemory", {"GetLastError"})
+    assert hit["import_present"] is False
+    (finding,) = memory_evidence.from_direct_stubs([hit], "s.exe")
+    assert finding["needs_corroboration"] is False
+    assert finding["base_weight"] == memory_evidence.KINDS["direct_syscall_stub"]["weight"]
+
+
+def test_an_unknown_import_beside_does_not_shield_a_syscall_the_table_holds_every_known_path_to(x64_baseline):
+    # CreateService has no row because it reaches no syscall of this process directly (it goes over RPC): it is
+    # no path to NtCreateThreadEx, so a sample importing it and carrying that stub has gone around every path
+    # the table knows
+    assert _hit(x64_baseline, "NtCreateThreadEx", {"CreateService"})["import_present"] is False
+
+
+def test_without_an_import_table_the_table_changes_nothing(x64_baseline):
+    assert _hit(x64_baseline, "NtAllocateVirtualMemory", None)["import_present"] is None

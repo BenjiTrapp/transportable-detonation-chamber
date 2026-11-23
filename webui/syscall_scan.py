@@ -13,7 +13,7 @@ import ntpath
 import os
 import re
 import threading
-from typing import NamedTuple
+from typing import Iterable, NamedTuple
 
 from syscall_baseline import (READ_LEN, STATE_DIVERGED, STATE_HOOKED, STATE_INTACT,
                               STATE_PATCHED, STATE_UNREADABLE, NON_MODULE_OWNERS, OWNER_MAPPED,
@@ -590,24 +590,28 @@ def _is_imported(sc: Syscall, imports) -> bool:
     return not names.isdisjoint(imports)
 
 
-def _import_present(sc: Syscall | None, imports, expanded_imports) -> bool | None:
+def _import_present(sc: Syscall | None, imports, expanded_imports, covered=None) -> bool | None:
     """Whether the sample imports the syscall of a stub: True, False, or None for unknown.
 
     Only a presence can be read off a raw import table. An absence cannot: a sample that
     calls the documented Win32 function never imports the `Nt` name behind it, so against
     its raw table the stub of that very syscall looks unimported, and an ordinary program
     would read as a proven bypass. An absence is claimed only against `expanded_imports`,
-    which the caller has run through the Win32 to Nt table. A number the build does not
+    which the caller has run through the Win32 to Nt table, and, when `covered` names the
+    syscalls a row of that table leads to, only for one of them: for any other the table
+    knows no Win32 path, so a missing name proves nothing. A number the build does not
     have names no function to look for."""
     if sc is None:
         return None
     if any(table is not None and _is_imported(sc, table)
            for table in (imports, expanded_imports)):
         return True
-    return False if expanded_imports is not None else None
+    if expanded_imports is None or (covered is not None and sc.name not in covered):
+        return None
+    return False
 
 
-def _scan_chunk(data: bytes, view: str, numbers: dict, imports, expanded_imports,
+def _scan_chunk(data: bytes, view: str, numbers: dict, imports, expanded_imports, covered=None,
                 starts_below: int | None = None) -> list[dict]:
     decode, align = _STUB_NUMBER[view], _STUB_ALIGN[view]
     hits = []
@@ -627,7 +631,7 @@ def _scan_chunk(data: bytes, view: str, numbers: dict, imports, expanded_imports
             "view": view,
             "pattern": _STUB_PATTERN[view],
             "stub_hex": data[at:m.end("body")].hex(),
-            "import_present": _import_present(sc, imports, expanded_imports),
+            "import_present": _import_present(sc, imports, expanded_imports, covered),
             "number_known": sc is not None,
         })
     return hits
@@ -640,7 +644,8 @@ def _shape_of(view: str) -> str:
 
 
 def find_stubs_in_bytes(data: bytes, baseline: Baseline, imports: set[str] | None = None,
-                        *, expanded_imports: set[str] | None = None) -> list[dict]:
+                        *, expanded_imports: set[str] | None = None,
+                        covered: Iterable[str] | None = None) -> list[dict]:
     """The syscall stubs in `data`, in the shape of the baseline's view.
 
     A number the baseline holds names its syscall. One it does not is still a hit, with
@@ -652,10 +657,13 @@ def find_stubs_in_bytes(data: bytes, baseline: Baseline, imports: set[str] | Non
     function whose `Nt` name the table does not hold. `expanded_imports` is that table after
     the Win32 to Nt table has been applied to it; only a set passed there can give False, a
     proven bypass of the import path. It is keyword-only so that a raw table cannot be passed
-    into it by position. With neither, or with only a raw table that lacks the name, the
-    answer is None."""
+    into it by position. `covered` is the set of syscalls a row of that table leads to
+    (`win32_to_nt.Table.covered`): given, False is said only for one of them, and a stub of
+    any other syscall stays None, because the table knows no Win32 function that reaches it.
+    With neither, or with only a raw table that lacks the name, the answer is None."""
     view = _shape_of(baseline.view)
-    return _scan_chunk(data, view, _numbers(baseline), imports, expanded_imports)
+    covered = None if covered is None else frozenset(covered)
+    return _scan_chunk(data, view, _numbers(baseline), imports, expanded_imports, covered)
 
 
 class StubScan(list):
@@ -708,10 +716,11 @@ def _walk(reader: ProcessReader, found: StubScan):
 
 def find_stubs_in_process(reader: ProcessReader, baseline: Baseline,
                           imports: set[str] | None = None, *,
-                          expanded_imports: set[str] | None = None) -> StubScan:
+                          expanded_imports: set[str] | None = None,
+                          covered: Iterable[str] | None = None) -> StubScan:
     """The syscall stubs in the private, executable memory of the process behind `reader`,
-    each hit with an `address` where `find_stubs_in_bytes` has an `offset`. `imports` and
-    `expanded_imports` mean what they mean there.
+    each hit with an `address` where `find_stubs_in_bytes` has an `offset`. `imports`,
+    `expanded_imports` and `covered` mean what they mean there.
 
     A baseline of another view or build is refused before anything is read: its numbers
     would name the wrong syscalls."""
@@ -725,6 +734,7 @@ def find_stubs_in_process(reader: ProcessReader, baseline: Baseline,
                           f"build {baseline.build}")
     view = _shape_of(view)
     numbers = _numbers(baseline)
+    covered = None if covered is None else frozenset(covered)
     found = StubScan()
     unread: list[int] = []
     for region in _walk(reader, found):
@@ -737,7 +747,7 @@ def find_stubs_in_process(reader: ProcessReader, baseline: Baseline,
             if data is None:
                 unread.append(addr)
                 continue
-            for hit in _scan_chunk(data, view, numbers, imports, expanded_imports,
+            for hit in _scan_chunk(data, view, numbers, imports, expanded_imports, covered,
                                    starts_below=_CHUNK):
                 found.append({("address" if key == "offset" else key):
                               (addr + value if key == "offset" else value)
