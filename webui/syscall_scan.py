@@ -488,6 +488,8 @@ def measure(baseline: Baseline, reader: ProcessReader, view: str | None = None,
         "states": states,
         "counts": counts,
         "deviations": [s for s in states.values() if s["state"] != STATE_INTACT],
+        # stubs of intact shape that load another syscall's number: a finding whatever their state
+        "renumbered": sum(1 for s in states.values() if s["number_matches"] is False),
         "read_errors": read_errors,
         "owner_errors": owner_errors,
         "partial": partial,

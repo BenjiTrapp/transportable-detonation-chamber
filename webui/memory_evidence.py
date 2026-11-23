@@ -167,6 +167,13 @@ KINDS = {
         "weight": 0.8, "evidence": EVIDENCE_BEHAVIORAL, "corroborate": True,
         "label": "Syscall stub hooked by an unlisted module",
     },
+    # A stub of intact shape that loads another syscall's number: a call of
+    # this function enters the kernel as a different one. No jump, so no
+    # owner to ask about, and no hooking product does it.
+    "syscall_stub_renumbered": {
+        "weight": 4.0, "evidence": EVIDENCE_STRUCTURAL, "corroborate": False,
+        "label": "Syscall stub carries the number of another syscall",
+    },
     # A stub carried by the sample itself instead of calling ntdll.
     "direct_syscall_stub": {
         "weight": 4.0, "evidence": EVIDENCE_STRUCTURAL, "corroborate": False,
@@ -499,14 +506,23 @@ def from_hsb(result, process=""):
     return out
 
 
+def _hex(value):
+    return f"{value:#x}" if isinstance(value, int) and not isinstance(value, bool) else "an unknown number"
+
+
 def from_syscall_scan(result, process=""):
     """Normalize a syscall scan (``syscall_scan.measure``) into findings.
 
-    Only a patched stub and a hook not on the allowlist score. The allowlist
+    A patched stub and a hook not on the allowlist score. The allowlist
     verdict is read from each deviation's ``allowlisted`` flag: only the scan
     knows the build and view it was measured against. ``diverged`` stays out on
     purpose: with no resolvable jump target a hook cannot be told from a patch,
-    and a guess is worse than a gap. It remains visible in the scan's own map.
+    and a guess is worse than a gap. It remains visible in the scan's own map,
+    and the verdict names how many there are.
+
+    A stub that loads another syscall's number (``number_matches`` False)
+    scores on its own, whatever its state: it needs no jump target to be
+    understood and no hooking product does it, so no allowlist covers it.
 
     Identity is the syscall and the module its jump lands in, never the RVA or
     the target address, which move between builds and runs.
@@ -515,6 +531,28 @@ def from_syscall_scan(result, process=""):
     if not isinstance(result, dict):
         return out
     for dev in result.get("deviations") or []:
+        if not isinstance(dev, dict):
+            continue
+        name = dev.get("name") or ""
+        if dev.get("number_matches") is False:
+            out.append(MemoryFinding(
+                source="syscalls", kind="syscall_stub_renumbered", process=process,
+                detail=(f"{name} loads syscall number {_hex(dev.get('live_number'))}, "
+                        f"the baseline has {_hex(dev.get('number'))}"),
+                identity=(name.lower(),),
+                extra={
+                    "syscall": name,
+                    "module": dev.get("module"),
+                    "number": dev.get("number"),
+                    "live_number": dev.get("live_number"),
+                    "rva": dev.get("rva"),
+                    "expected": dev.get("expected"),
+                    "actual": dev.get("actual"),
+                    "number_matches": False,
+                    "build": result.get("build"),
+                    "view": result.get("view"),
+                },
+            ))
         state = dev.get("state")
         if state == "patched":
             kind = "syscall_stub_patched"
@@ -522,7 +560,6 @@ def from_syscall_scan(result, process=""):
             kind = "syscall_stub_hooked"
         else:
             continue
-        name = dev.get("name") or ""
         owner = (dev.get("target_owner") or "").lower()
         pattern = dev.get("pattern")
         relay = dev.get("relay") if isinstance(dev.get("relay"), list) else []

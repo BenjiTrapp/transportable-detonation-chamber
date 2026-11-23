@@ -244,6 +244,9 @@ Drei Ziele, in dieser Rangfolge:
    `syscall_stub_patched`, strukturell, Gewicht in der Größe von
    `disk_mem_diff` (4.0), ohne Korroborationspflicht;
    `syscall_stub_hooked`, behavioral, kleines Gewicht, korroborationspflichtig;
+   `syscall_stub_renumbered`, strukturell, 4.0, ohne Korroborationspflicht,
+   für einen Stub intakter Form mit fremder Nummer (Ziel 4) — er braucht kein
+   Sprungziel und hat keine harmlose Erklärung;
    und `direct_syscall_stub` aus Ziel 7a, strukturell, mit dem höheren Gewicht,
    wenn die zugehörige Import-Kette im Sample fehlt.
 

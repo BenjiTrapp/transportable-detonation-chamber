@@ -484,7 +484,7 @@ def test_classify_reports_the_compared_bytes_and_the_owner():
     assert out["expected"] == "410700d4c0035fd6"
     assert out["actual"] == "0500001411223344"
     assert out["target_owner"] == "edr.dll"
-    assert set(out) == {"state", "pattern", "target_owner", "expected", "actual", "number_matches"}
+    assert set(out) == {"state", "pattern", "target_owner", "expected", "actual", "number_matches", "live_number"}
 
 
 @pytest.mark.parametrize("view,head", [("arm64", "0500001400000000"), ("x64", "e92b170080")])
@@ -1166,7 +1166,7 @@ def test_a_state_names_its_syscall(arm64_baseline):
     out = syscall_scan.measure(arm64_baseline, _reader_from(arm64_baseline, patched={}))
     s = out["states"]["NtWriteVirtualMemory"]
     assert (s["name"], s["module"], s["number"], s["rva"]) == ("NtWriteVirtualMemory", "ntdll.dll", 0x3A, 652224)
-    assert set(s) == {"state", "pattern", "target_owner", "expected", "actual", "number_matches",
+    assert set(s) == {"state", "pattern", "target_owner", "expected", "actual", "number_matches", "live_number",
                       "name", "module", "number", "rva"}
 
 
@@ -1846,8 +1846,68 @@ def test_a_partial_result_still_scores_the_stubs_it_did_read():
 
 
 def test_none_of_the_new_kinds_is_baseline_exempt():
-    for kind in ("syscall_stub_patched", "syscall_stub_hooked", "direct_syscall_stub"):
+    for kind in ("syscall_stub_patched", "syscall_stub_hooked", "direct_syscall_stub", "syscall_stub_renumbered"):
         assert not memory_evidence.KINDS[kind].get("baseline_exempt")
+
+
+# --- a stub that carries another syscall's number ---------------------------------------------
+
+def test_a_renumbered_stub_is_a_structural_finding_that_needs_no_second_source():
+    spec = memory_evidence.KINDS["syscall_stub_renumbered"]
+    assert spec["evidence"] == memory_evidence.EVIDENCE_STRUCTURAL
+    assert spec["corroborate"] is False
+    assert 3.5 <= spec["weight"] <= 4.5
+
+
+def test_a_renumbered_stub_scores_on_its_own():
+    findings = memory_evidence.from_syscall_scan(_result_with(
+        state="diverged", syscall="NtWriteVirtualMemory", owner=None, number=0x3A, number_matches=False,
+        live_number=0x50), "sample.exe")
+    assert [f["kind"] for f in findings] == ["syscall_stub_renumbered"]
+    assert "0x50" in findings[0]["detail"] and "0x3a" in findings[0]["detail"].lower()
+    assert findings[0].get("may_corroborate") is None
+    scored = memory_evidence.score(findings)
+    assert scored["label"] == "SUSPICIOUS" and scored["score"] >= memory_evidence.VERDICT_SUSPICIOUS
+
+
+def test_a_renumbered_stub_scores_whatever_its_state_and_whatever_the_allowlist_says():
+    findings = memory_evidence.from_syscall_scan(_result_with(
+        state="hooked", owner="edr.dll", allowlisted=True, number_matches=False), "sample.exe")
+    assert [f["kind"] for f in findings] == ["syscall_stub_renumbered"]
+
+
+@pytest.mark.parametrize("matches", [True, None])
+def test_a_number_that_matches_or_cannot_be_seen_is_no_renumbering(matches):
+    findings = memory_evidence.from_syscall_scan(_result_with(state="diverged", number_matches=matches),
+                                                 "sample.exe")
+    assert findings == []
+
+
+def test_classify_names_the_number_the_live_stub_loads():
+    sc = _sc("x64")
+    live = bytearray(sc.stub_bytes)
+    live[4] = 0x50
+    assert syscall_baseline.classify_stub(sc, bytes(live), "x64", None)["live_number"] == 0x50
+    assert syscall_baseline.classify_stub(sc, sc.stub_bytes, "x64", None)["live_number"] == sc.number
+    hooked = bytes.fromhex("e92b170080") + sc.stub_bytes[5:]
+    assert syscall_baseline.classify_stub(sc, hooked, "x64", "edr.dll")["live_number"] is None
+
+
+@pytest.mark.parametrize("view,swap", [("x64", "4c8bd1b850000000"), ("arm64", "010a00d4c0035fd6")])
+def test_a_scan_of_a_renumbered_stub_counts_it_and_the_detonation_scores_it(view, swap):
+    baseline = syscall_baseline.parse_baseline(_fixture(view), "26220.5770", view)
+    sc = baseline.syscalls["NtWriteVirtualMemory"]
+    live = bytes.fromhex(swap) + sc.stub_bytes[8:]
+    out = syscall_scan.measure(baseline, _reader_from(baseline, patched={"NtWriteVirtualMemory": (live.hex(), None)}))
+    s = out["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["number_matches"], s["live_number"]) == ("diverged", False, 0x50)
+    assert out["renumbered"] == 1
+    kinds = [f["kind"] for f in memory_evidence.collect({"syscall_scan": out}, process="sample.exe")]
+    assert kinds == ["syscall_stub_renumbered"]
+
+
+def test_a_clean_scan_has_no_renumbered_stub(arm64_baseline):
+    assert syscall_scan.measure(arm64_baseline, _reader_from(arm64_baseline, patched={}))["renumbered"] == 0
 
 
 def test_a_repeated_scan_matches_the_same_finding_whatever_moved():

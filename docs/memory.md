@@ -148,9 +148,11 @@ hooks of a sample's process and the sample's own hooks stop counting.
 |---------|--------|-------|
 | Syscall stub redirected into private memory (`patched`) | 4.0 | Structural, needs no second source |
 | Syscall stub hooked by an unlisted module (`hooked`) | 0.8 | Behavioural, counts at 40 % until another source agrees on the process |
+| Syscall stub carries the number of another syscall (`syscall_stub_renumbered`) | 4.0 | Structural, needs no second source. A stub of intact shape whose number is not the baseline's: the call enters the kernel as another syscall. It needs no jump target and no allowlist covers it; its state is `diverged` |
 | Syscall stub outside `ntdll` (`direct_syscall_stub`) | 4.0 | Every hit is a hint for now and counts at 40 % until another source agrees, see below |
 
-`diverged` and `unreadable` stay on the map and out of the score. A scan goes
+`diverged` and `unreadable` stay on the map and out of the score, except a
+renumbered stub, which scores as above. A scan goes
 into the scan history like the others, and into the combined verdict through the
 same evidence model as everything else in this page.
 

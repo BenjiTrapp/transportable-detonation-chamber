@@ -426,11 +426,13 @@ def classify_stub(sc: Syscall, live: bytes | None, view: str, owner: str | None)
         "expected": expected.hex(),
         "actual": None if live is None else live[:n].hex(),
         "number_matches": None,
+        "live_number": None,
     }
     # a page that is not paged in reads as zeros, which says nothing about the stub
     if live is None or len(live) < n or not any(live[:n]):
         return out
     number = _live_number(live, view)
+    out["live_number"] = number
     out["number_matches"] = None if number is None else number == sc.number
     if live[:n] == expected:
         out["state"] = STATE_INTACT
