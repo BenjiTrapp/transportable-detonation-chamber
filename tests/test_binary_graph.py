@@ -916,7 +916,7 @@ def test_an_entry_whose_offsets_point_outside_the_map_is_dropped_and_the_rest_su
 
 
 def test_a_value_with_a_bad_host_takes_its_whole_entry_with_it_rather_than_shortening_the_chain():
-    # the loader tries the hosts in order: an entry without its first host would resolve to the wrong module
+    # a value lost might be the default (value[0]), or an override would move into its place: the wrong module either way
     data = _two_aliases()
     data = _patched(data, _VALUES + _API_SET_VALUE + 12, 0xFFFFFF00, 8)      # the second value of the second entry
     parsed = binary_graph.parse_api_set_map(data)
@@ -953,9 +953,11 @@ def test_a_name_that_is_not_valid_utf16_or_is_empty_drops_its_entry():
     assert set(binary_graph.parse_api_set_map(_patched(data, _ENTRY_1 + 8, 0))) == {"api-first-l1-1-0", "api-third-l1-1-0"}
 
 
-def test_an_empty_host_is_not_a_host():
-    data = _api_set_map({"ext-ms-win-gone-l1-1-0": ("",), "api-ms-win-part-l1-1-0": ("", "kernelbase.dll")})
-    assert binary_graph.parse_api_set_map(data) == {"api-ms-win-part-l1-1-0": ("kernelbase.dll",)}
+def test_an_empty_host_is_an_unreadable_value_and_takes_its_entry_with_it():
+    # value[0] is the default host: skipping an empty one would promote an override into the default's place
+    data = _api_set_map({"ext-ms-win-gone-l1-1-0": ("",), "api-ms-win-first-l1-1-0": ("", "kernelbase.dll"),
+                         "api-ms-win-last-l1-1-0": ("kernelbase.dll", ""), "api-ms-win-ok-l1-1-0": ("kernelbase.dll", "ntdll.dll")})
+    assert binary_graph.parse_api_set_map(data) == {"api-ms-win-ok-l1-1-0": ("kernelbase.dll", "ntdll.dll")}
 
 
 def test_an_alias_named_twice_keeps_the_first():

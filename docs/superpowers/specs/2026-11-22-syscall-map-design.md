@@ -419,21 +419,25 @@ ARM64-VM der falsche. Nach WinGraph wird nur verlinkt.
   Ohne Auflösung endet die Kette dort, nur einen Sprung später. Die Zuordnung
   kommt einmalig aus der ApiSetMap in `apisetschema.dll` und liegt als Tabelle
   im Cache. Das ist eine Extraktion, keine Analyse.
-- **Grenzen der API-Set-Auflösung.** Zwei davon sind Absicht und gehören hierher,
+- **Grenzen der API-Set-Auflösung.** Drei davon sind Absicht und gehören hierher,
   neben die übrigen Grenzen dieses Dokuments:
   - **Die Auflösung ist unabhängig vom Importeur.** Die echte Map kann einen
     Alias je nach importierendem Modul verschieden umleiten: ein Wert mit leerem
-    Importernamen ist der Standard, ein benannter eine Ausnahme. Die Tabelle
-    führt jeden Host der Map in der Reihenfolge der Map, ohne den Importernamen
-    auszuwerten. Eine Kette kann deshalb über einen Host laufen, den der Loader
-    für einen anderen Importeur nähme als den im Pfad. Eine solche falsche Kante
+    Importernamen ist der Standard (`value[0]`), ein benannter eine Ausnahme für
+    ein bestimmtes Modul. Wie der Loader unter ihnen wählt, ist hier nicht an
+    einem echten Loader geprüft. Die Tabelle führt jeden Host der Map in der
+    Reihenfolge der Map, ohne den Importernamen auszuwerten, und der Verbraucher
+    löst zum ersten Host auf, der die Funktion definiert. Eine Kette kann
+    deshalb über einen Host laufen, den der Loader für einen anderen Importeur
+    nähme als den im Pfad. Eine solche falsche Kante
     verbindet zwei echte Module, die die Map tatsächlich einander zuordnet; sie
     ist keine erfundene Beziehung. Die Reihenfolge wird nicht umgestellt — den
     Standard nach vorn zu ziehen wäre erfundene Information.
   - **Ein unlesbarer Wert verwirft den ganzen Eintrag.** Zeigt ein Wert eines
-    Eintrags aus der Map hinaus, fällt der Alias ganz aus der Tabelle, nicht nur
-    dieser Host. Der Loader probiert die Hosts der Reihe nach; eine Kette ohne
-    ihren ersten Host würde zum falschen Modul auflösen. Fehlt der Alias, endet
+    Eintrags aus der Map hinaus, oder ist sein Hostname leer, fällt der Alias
+    ganz aus der Tabelle, nicht nur dieser Host. Ginge ein Wert verloren, könnte
+    es der Standard sein, oder eine Ausnahme rückte an dessen Stelle; die Kette
+    löste in beiden Fällen über das falsche Modul auf. Fehlt der Alias, endet
     die Kette sichtbar an `api-ms-win-*` — das ist ehrlicher als ein falscher
     Sprung. Wer das später zu teilweiser Annahme „verbessert", macht den Graphen
     unzuverlässig.

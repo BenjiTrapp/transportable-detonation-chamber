@@ -209,8 +209,9 @@ def _api_set_text(data, offset, length):
 
 
 def _api_set_hosts(data, offset, count):
-    """The host modules of one entry in the map's order, or None when any value of it is unreadable: a chain with
-    a host left out would resolve to the wrong module, so the entry goes whole (never relax it to partial acceptance)."""
+    """The host modules of one entry in the map's order, or None when any value of it is unreadable, an empty host
+    included: with one value lost, the default (value[0]) might be it, or an override would move into the default's
+    place, and either way the chain resolves through the wrong module. Never relax this into partial acceptance."""
     end = offset + _API_SET_VALUE.size * count
     if not count or end > len(data):
         return None
@@ -221,11 +222,10 @@ def _api_set_hosts(data, offset, count):
         if name_len and _api_set_text(data, name_at, name_len) is None:
             return None
         host = _api_set_text(data, host_at, host_len)
-        if host is None:
+        if not host:
             return None
-        if host:
-            hosts.append(host)
-    return tuple(hosts) or None
+        hosts.append(host)
+    return tuple(hosts)
 
 
 def parse_api_set_map(data: bytes) -> dict[str, tuple[str, ...]]:
@@ -235,14 +235,17 @@ def parse_api_set_map(data: bytes) -> dict[str, tuple[str, ...]]:
     length is hostile: an entry that does not lie wholly inside the map is dropped and the others are kept. Nothing
     raises. The map ends where its header's Size says, or at the end of `data` when Size is zero or larger than `data`.
 
-    Two limits, both on purpose, both in the spec (Ziel 6):
-    - The resolution is importer-independent. A value's importer name (empty for the default, a module for an override)
-      is checked to lie inside the map and then ignored, and every value's host is returned in the map's order. A chain
-      may so pass a host the loader would use for a different importer than the one in the path: an edge between two
-      real modules the map does associate, never an invented one. The order is not rearranged (a default first would
-      be made-up data).
-    - One unreadable value drops its whole entry, never only its host. The loader tries the hosts in order, and a chain
-      without its first host would resolve to the wrong module. Do not relax this into partial acceptance."""
+    Two limits, both on purpose, both in the spec (Ziel 6). What is known of the map: value[0] of an entry is the
+    default host, later values are overrides for particular importing modules. Not checked against a real loader: how
+    it picks among them.
+    - The resolution is importer-independent. A value's importer name is checked to lie inside the map and then
+      ignored; every value's host is returned in the map's order, and the consumer resolves to the first host that
+      defines the function. A chain may so pass a host the loader would use for a different importer than the one in
+      the path: an edge between two real modules the map does associate, never an invented one. The order is not
+      rearranged (a default put first would be made-up data).
+    - One unreadable value, an empty host included, drops its whole entry, never only its host. With a value lost the
+      default might be the one gone, or an override would move into the default's place: either way the chain would
+      resolve through the wrong module. Do not relax this into partial acceptance."""
     if len(data) < _API_SET_HEADER.size:
         return {}
     version, size, _, count, entry_offset, _, _ = _API_SET_HEADER.unpack_from(data)
