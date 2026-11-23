@@ -26730,7 +26730,8 @@ function syscallsTabShown() {
 
 // The box of a node and the room between layers and rows, in px; the dash of a curated edge; how many characters of
 // a label fit in a box
-const BINARY_GRAPH = { boxW: 176, boxH: 40, gapX: 76, gapY: 14, pad: 16, curatedDash: '6 4', labelMax: 24, subMax: 28, max: 400 };
+// a dash for an edge whose origin the answer does not name as derived or curated
+const BINARY_GRAPH = { boxW: 176, boxH: 40, gapX: 76, gapY: 14, pad: 16, curatedDash: '6 4', unknownDash: '1 4', labelMax: 24, subMax: 28 };
 const BINARY_GRAPH_SYSCALL = 'syscall:';
 // node kind -> its colour and what the legend calls it; a function has no colour of its own and takes the text's
 const BINARY_GRAPH_KINDS = {
@@ -26753,6 +26754,18 @@ const BINARY_GRAPH_QUERIES = {
 const BINARY_GRAPH_EDGE_WORDS = {
     imports: 'imports', forwards_to: 'forwards to', resolves_to: 'resolves to', reaches_syscall: 'reaches syscall',
 };
+
+// An entry of one of the tables above by a key from the answer, never a member every object inherits ('constructor')
+function binaryGraphOwn(table, key) {
+    return typeof key === 'string' && Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
+}
+
+// What an edge claims: 'derived' only when the answer says exactly that, 'curated', and 'unknown' for anything else.
+// A missing or unexpected origin must never read as read from a binary.
+function binaryGraphOrigin(edge) {
+    const origin = edge && edge.origin;
+    return origin === 'derived' || origin === 'curated' ? origin : 'unknown';
+}
 
 // `module` is what the start field holds, whichever parameter the query sends it as; `function` the second field's
 const binaryGraphState = { answer: null, query: 'path-to-syscall', module: '', function: '', depth: 1, loading: false, selected: null, note: '', nodes: [], edges: [] };
@@ -26823,12 +26836,14 @@ function binaryGraphLayout(nodes, edges, roots) {
     };
 }
 
-// How an edge is drawn: a derived edge solid in the muted line colour, the curated one dashed in its own. A tone (the
-// state of a deviating syscall it leads to) takes the colour; the dash stays, the curated hop is still curated.
+// How an edge is drawn: a derived edge solid in the muted line colour, the curated one dashed in its own, one of an
+// unknown origin dotted in the secondary text colour. A tone (the state of a deviating syscall it leads to) takes the
+// colour; the dash stays, the curated hop is still curated.
 function binaryGraphEdgeLook(edge, tone) {
-    const curated = edge && edge.origin === 'curated';
-    const look = curated ? { color: themeColor('--graph-edge-curated'), width: 2, dash: BINARY_GRAPH.curatedDash }
-                         : { color: themeColor('--text-muted'), width: 1.5, dash: '' };
+    const origin = binaryGraphOrigin(edge);
+    const look = origin === 'curated' ? { color: themeColor('--graph-edge-curated'), width: 2, dash: BINARY_GRAPH.curatedDash }
+        : origin === 'derived' ? { color: themeColor('--text-muted'), width: 1.5, dash: '' }
+        : { color: themeColor('--text-secondary'), width: 1.5, dash: BINARY_GRAPH.unknownDash };
     if (tone && SYSCALL_STATE_COLORS[tone]) {
         look.color = themeColor(SYSCALL_STATE_COLORS[tone]);
         look.width += 0.5;
@@ -26838,7 +26853,7 @@ function binaryGraphEdgeLook(edge, tone) {
 
 // How a node's box is drawn: the colour of its kind, or of the state its stub deviated to
 function binaryGraphNodeLook(node, tone) {
-    const kind = BINARY_GRAPH_KINDS[node && node.kind];
+    const kind = binaryGraphOwn(BINARY_GRAPH_KINDS, node && node.kind);
     if (tone && SYSCALL_STATE_COLORS[tone]) {
         return { stroke: themeColor(SYSCALL_STATE_COLORS[tone]), fill: themeColor(SYSCALL_STATE_COLORS[tone], 0.18), width: 2.5 };
     }
@@ -26916,10 +26931,11 @@ function binaryGraphSvg(layout, model) {
         const x1 = from.x + from.w, y1 = from.y + from.h / 2, x2 = to.x, y2 = to.y + to.h / 2;
         const bend = Math.max(24, Math.abs(x2 - x1) / 2);
         const d = `M${c(x1)} ${c(y1)}C${c(x1 + bend)} ${c(y1)} ${c(x2 - bend)} ${c(y2)} ${c(x2)} ${c(y2)}`;
-        const origin = edge.origin === 'curated' ? 'curated' : 'derived';
+        const origin = binaryGraphOrigin(edge);
         const id = `edge:${index}`;
-        const words = `${edge.source} ${BINARY_GRAPH_EDGE_WORDS[edge.kind] || edge.kind} ${edge.target} · ${origin === 'curated'
-            ? 'curated: from the Win32 to Nt table, not read from any binary' : 'derived: read from the binaries'}${edge.label ? ` · ${edge.label}` : ''}`;
+        const claim = { curated: 'curated: from the Win32 to Nt table, not read from any binary', derived: 'derived: read from the binaries',
+                        unknown: 'origin unknown: the answer does not say where this edge comes from' }[origin];
+        const words = `${edge.source} ${binaryGraphOwn(BINARY_GRAPH_EDGE_WORDS, edge.kind) || edge.kind} ${edge.target} · ${claim}${edge.label ? ` · ${edge.label}` : ''}`;
         svg += `<g class="binary-graph-edge binary-graph-edge-${origin}${m.selected === id ? ' selected' : ''}" onclick="binaryGraphSelect(${jsArg(id)})">`
             + `<title>${escapeHtml(words)}</title>`
             + `<path class="binary-graph-edge-hit" d="${d}"></path>`
@@ -26942,7 +26958,7 @@ function binaryGraphSvg(layout, model) {
         let sub = '';
         if (node.kind === 'function' && bang > 0) sub = box.id.slice(0, bang);
         else if (Number(node.in_degree) > 0) sub = `imported by ${Number(node.in_degree).toLocaleString('en-US')}`;
-        else sub = (BINARY_GRAPH_KINDS[node.kind] || { name: node.kind || '' }).name;
+        else sub = (binaryGraphOwn(BINARY_GRAPH_KINDS, node.kind) || { name: String(node.kind || '') }).name;
         // a syscall's label is "NtClose (ntdll.dll, 0xf)": the name on the first line, the module and number under it
         let label = String(node.label ?? box.id);
         const paren = node.kind === 'syscall' ? label.indexOf(' (') : -1;
@@ -26987,6 +27003,8 @@ function binaryGraphLegend() {
     parts.push(item('edge-curated', line('curated', binaryGraphEdgeLook({ origin: 'curated' })),
         'curated: from the hand-curated Win32 to Nt table, not read from any binary',
         'The step from a Win32 function to its Nt syscall is the word of a hand-curated table. No binary of this system was read to draw it.'));
+    parts.push(item('edge-unknown', line('unknown', binaryGraphEdgeLook({ origin: '' })), 'origin unknown: neither derived nor curated',
+        'An edge whose answer names neither origin. It is not claimed to be read from a binary.'));
     parts.push(item('deviation', box(themeColor(SYSCALL_STATE_COLORS.patched), themeColor(SYSCALL_STATE_COLORS.patched, 0.18)),
         'deviated in the last scan, and the path to it, in the colour of its state on the map',
         'A syscall whose stub the last scan of this view did not find intact, coloured as on the map, and every edge on a path into it.'));
@@ -27000,15 +27018,17 @@ function binaryGraphLegend() {
 // { tone, html } with html '' when there is nothing to say.
 function binaryGraphStatus() {
     const st = binaryGraphState, a = st.answer;
-    if (st.loading || !a || !st.nodes.length) return { tone: 'info', html: '' };
+    // a cut answer says so whether or not it kept a node; the note stands in the canvas when it kept none
+    if (st.loading || !a || (!st.nodes.length && !a.truncated)) return { tone: 'info', html: '' };
     let html = '';
     if (a.truncated) {
-        const total = Number(a.total) || 0;
-        html += `<strong class="binary-graph-cut">Not the whole answer: it had ${escapeHtml(total.toLocaleString('en-US'))} parts and was cut at `
-            + `${escapeHtml(BINARY_GRAPH.max)} nodes, ${escapeHtml(st.nodes.length.toLocaleString('en-US'))} are drawn. Whole parts were dropped, never half a path: `
+        // the numbers are the answer's: the backend's cap is not copied here, where it could go stale
+        const total = Number(a.total) || 0, drawn = st.nodes.length;
+        html += `<strong class="binary-graph-cut">Not the whole answer: it had ${escapeHtml(total.toLocaleString('en-US'))} parts and was cut, `
+            + `${escapeHtml(drawn.toLocaleString('en-US'))} node${drawn === 1 ? ' is' : 's are'} drawn. Whole parts were dropped, never half a path: `
             + 'a node that is missing here is not shown, which does not mean it is not imported.</strong> ';
     }
-    if (st.note) html += `<span class="binary-graph-note">${escapeHtml(st.note)}</span>`;
+    if (st.note && st.nodes.length) html += `<span class="binary-graph-note">${escapeHtml(st.note)}</span>`;
     const stamp = [a.build ? `build ${a.build}` : '', a.arch || ''].filter(Boolean).join(' · ');
     if (stamp) html += ` <span class="syscall-muted">${escapeHtml(stamp)}</span>`;
     return { tone: a.truncated ? 'warn' : 'info', html };
@@ -27161,7 +27181,7 @@ function binaryGraphDetailHtml(item) {
     const title = text => `<div class="syscall-detail-name"><span class="syscall-detail-sc">${escapeHtml(text)}</span></div>`;
     if (item.node) {
         const n = item.node, bang = n.id.indexOf('!');
-        const rows = [['Kind', (BINARY_GRAPH_KINDS[n.kind] || { name: n.kind || 'unknown' }).name], ['Id', n.id]];
+        const rows = [['Kind', (binaryGraphOwn(BINARY_GRAPH_KINDS, n.kind) || { name: String(n.kind || 'unknown') }).name], ['Id', n.id]];
         let note = '';
         if (n.kind === 'function' && bang > 0) {
             rows.push(['Module', n.id.slice(0, bang)]);
@@ -27178,15 +27198,20 @@ function binaryGraphDetailHtml(item) {
     const rows = [['From', item.source ? `${name(item.source)} (${item.source.id})` : e.source],
                   ['To', item.target ? `${name(item.target)} (${item.target.id})` : e.target]];
     let note;
-    if (e.origin === 'curated') {
+    const origin = binaryGraphOrigin(e);
+    if (origin === 'curated') {
         rows.push(['Origin', 'curated, not derived']);
         note = '<p class="binary-graph-curated-note"><strong>Curated, not derived.</strong> This step is not read from any binary: the mapping from '
             + `${escapeHtml(name(item.source) || e.source)} to ${escapeHtml(name(item.target) || e.target)} comes from the hand-curated Win32 to Nt table. `
             + 'It is that table\'s word that the function ends in this syscall, not an import, export or forwarder of a file on this system.</p>';
-    } else {
+    } else if (origin === 'derived') {
         rows.push(['Origin', 'derived']);
         note = '<p class="syscall-detail-note">Derived: read from the binaries themselves, from their import and export tables and the api-set map of this system.</p>';
+    } else {
+        rows.push(['Origin', 'unknown']);
+        note = '<p class="syscall-detail-note">Origin unknown: the answer names this edge neither as read from a binary nor as taken from the curated table. '
+            + 'Treat it as unverified.</p>';
     }
     if (e.label) rows.push(['Label', e.label]);
-    return title(BINARY_GRAPH_EDGE_WORDS[e.kind] || e.kind) + facts(rows) + note;
+    return title(binaryGraphOwn(BINARY_GRAPH_EDGE_WORDS, e.kind) || String(e.kind ?? '')) + facts(rows) + note;
 }

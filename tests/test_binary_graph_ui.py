@@ -50,7 +50,7 @@ def _classes(element):
 
 # The functions the pure drawing calls, and a themeColor that returns the variable's name (and the alpha)
 DRAW = ["binaryGraphLayout", "binaryGraphSvg", "binaryGraphEdgeLook", "binaryGraphNodeLook", "binaryGraphTones",
-        "binaryGraphMatches", "binaryGraphCut", "binaryGraphLegend"]
+        "binaryGraphMatches", "binaryGraphCut", "binaryGraphLegend", "binaryGraphOwn", "binaryGraphOrigin"]
 def _draw_prelude():
     return ("const themeColor = (name, alpha) => alpha === undefined ? name : name + '/' + alpha;\n"
             + "\n".join(_const_source(c)
@@ -248,23 +248,87 @@ def test_a_truncated_answer_says_so_in_the_view():
     r = _graph_flow(r"""
       (async () => {
         initSyscalls(); syscallSetView('graph');
-        const many = [...Array(400)].map((_, i) => ({ id: 'b' + i + '.dll', label: 'b' + i + '.dll', kind: 'dll', in_degree: 0, category: '' }));
-        const cut = { nodes: [{ id: 'kernel32.dll', label: 'kernel32.dll', kind: 'dll', in_degree: 4000, category: '' }, ...many.slice(0, 399)],
-                      edges: many.slice(0, 399).map(n => ({ source: n.id, target: 'kernel32.dll', kind: 'imports', origin: 'derived', label: '' })),
+        const many = [...Array(249)].map((_, i) => ({ id: 'b' + i + '.dll', label: 'b' + i + '.dll', kind: 'dll', in_degree: 0, category: '' }));
+        const cut = { nodes: [{ id: 'kernel32.dll', label: 'kernel32.dll', kind: 'dll', in_degree: 4000, category: '' }, ...many],
+                      edges: many.map(n => ({ source: n.id, target: 'kernel32.dll', kind: 'imports', origin: 'derived', label: '' })),
                       truncated: true, total: 4000, roots: ['kernel32.dll'], build: '26220.5770', arch: 'arm64', created: '',
-                      note: '4000 binaries import kernel32.dll, directly or through an api set. Only the first 399 of 4000 binaries that import it are drawn.' };
+                      note: 'Only the first 249 of 4000 binaries that import it are drawn.' };
         await ask({ body: cut }, 'kernel32.dll', '');
         const truncated = els['binary-graph-status'].textContent || els['binary-graph-status'].innerHTML;
+        // a cut answer that kept no node still says it was cut
+        await ask({ body: { ...cut, nodes: [], edges: [], roots: [] } }, 'kernel32.dll', '');
+        const bare = [els['binary-graph-status'].innerHTML, els['binary-graph-status'].hidden, els['binary-graph-canvas'].innerHTML];
         await ask({ body: PATH() });
-        out({ truncated, whole: els['binary-graph-status'].textContent || els['binary-graph-status'].innerHTML,
+        out({ truncated, bare, whole: els['binary-graph-status'].textContent || els['binary-graph-status'].innerHTML,
               drawn: (els['binary-graph-canvas'].innerHTML.match(/class="binary-graph-node /g) || []).length });
       })();""")
     cut = " ".join(re.sub(r"<[^>]+>", " ", r["truncated"]).split())
-    assert "4,000" in cut and "400 nodes" in cut, cut
+    assert "4,000" in cut and "250 nodes" in cut, cut
+    # the count comes from the answer, not from a copy of the backend's cap that may go stale
+    line = re.search(r'<strong class="binary-graph-cut">(.*?)</strong>', r["truncated"]).group(1)
+    assert "400" not in line.replace("4,000", ""), line
     assert "not shown" in cut and "does not mean" in cut and "not imported" in cut, cut
+    bare = " ".join(re.sub(r"<[^>]+>", " ", r["bare"][0]).split())
+    assert r["bare"][1] is False and "4,000" in bare and "not shown" in bare, bare
+    assert "Only the first 249" in r["bare"][2], "the note still stands in the canvas"
     whole = " ".join(re.sub(r"<[^>]+>", " ", r["whole"]).split())
     assert "4,000" not in whole and "not shown" not in whole, "a whole answer does not claim to be cut"
     assert r["drawn"] == 4
+
+
+@needs_node
+def test_an_edge_of_an_unknown_origin_is_neither_drawn_nor_described_as_derived():
+    # Ruling 49: only origin "derived" may claim it was read from a binary; a missing, misspelled or future value
+    # must not round toward the generous reading
+    r = _graph_flow(r"""
+      (async () => {
+        initSyscalls(); syscallSetView('graph');
+        const a = PATH();
+        a.edges[0] = { ...a.edges[0], origin: undefined };
+        a.edges[1] = { ...a.edges[1], origin: 'Derived' };
+        a.edges.push({ source: 'sample.dll', target: 'kernelbase.dll!CloseHandle', kind: 'imports', origin: 'inferred', label: '' });
+        a.edges.push({ source: 'sample.dll', target: 'syscall:NtClose', kind: 'imports', origin: 'derived', label: '' });
+        await ask({ body: a });
+        const lines = els['binary-graph-canvas'].innerHTML.match(/<path class="binary-graph-edge-line[^>]*>/g) || [];
+        const details = [0, 1, 3, 4].map(i => { binaryGraphSelect('edge:' + i); return els['syscall-detail-body'].innerHTML; });
+        out({ lines, details, legend: els['binary-graph-legend'].innerHTML });
+      })();""")
+    lines = [_Elements(l).elements[0]["attrs"] for l in r["lines"]]
+    assert len(lines) == 5
+    by_edge = {l["data-edge"]: l for l in lines}
+    assert by_edge["4"]["data-origin"] == "derived" and by_edge["2"]["data-origin"] == "curated"
+    derived = by_edge["4"]
+    for key in ("0", "1", "3"):
+        unknown = by_edge[key]
+        assert unknown["data-origin"] == "unknown", unknown
+        assert "binary-graph-edge-derived" not in unknown["class"]
+        assert (unknown["stroke"], unknown.get("stroke-dasharray")) != (derived["stroke"], derived.get("stroke-dasharray"))
+        assert unknown.get("stroke-dasharray") != by_edge["2"].get("stroke-dasharray"), "nor does it pass for curated"
+    texts = [" ".join(re.sub(r"<[^>]+>", " ", d).split()).lower() for d in r["details"]]
+    for text in texts[:3]:
+        assert "unknown" in text and "derived" not in text and "read from the binaries" not in text, text
+    assert "derived" in texts[3] and "read from the binaries" in texts[3]
+    rows = {e["attrs"]["data-legend"]: e for e in _Elements(r["legend"]).elements if "data-legend" in e["attrs"]}
+    assert "edge-unknown" in rows and "unknown" in rows["edge-unknown"]["text"].lower()
+
+
+@needs_node
+def test_a_kind_named_like_an_object_member_is_not_read_off_the_prototype():
+    r = _graph_flow(r"""
+      (async () => {
+        initSyscalls(); syscallSetView('graph');
+        const a = PATH();
+        a.nodes[0] = { ...a.nodes[0], kind: 'constructor' };
+        a.edges[0] = { ...a.edges[0], kind: 'toString' };
+        await ask({ body: a });
+        const svg = els['binary-graph-canvas'].innerHTML;
+        binaryGraphSelect('sample.dll'); const node = els['syscall-detail-body'].innerHTML;
+        binaryGraphSelect('edge:0'); const edge = els['syscall-detail-body'].innerHTML;
+        out({ svg, node, edge });
+      })();""")
+    for key in ("svg", "node", "edge"):
+        assert "native code" not in r[key] and "function Object" not in r[key] and "function toString" not in r[key], key
+    assert "constructor" in r["node"] and "toString" in r["edge"]
 
 
 # --- A deviation and a filter match --------------------------------------------------------------------------------
@@ -355,6 +419,24 @@ def test_a_filter_match_is_highlighted_in_its_own_tone_and_not_in_the_deviation_
     assert all("binary-graph-match-ring" not in n for n in nodes if n is not match)
     by_module = [n for n in r["module"]["nodes"] if "binary-graph-match-ring" in n]
     assert len(by_module) == 1 and 'data-id="kernelbase.dll!CloseHandle"' in by_module[0]
+
+
+@needs_node
+def test_a_node_that_both_matches_and_deviated_keeps_the_ring_and_the_tone():
+    r = _graph_flow(SCANNED + r"""
+      (async () => {
+        await scanned({ Nt5: 'patched' });
+        await ask({ body: PATH('Nt5', 5) });
+        els['syscall-filter'].value = 'Nt5'; syscallOnFilter();
+        out(canvasParts());
+      })();""")
+    assert len(r["nodes"]) == 4
+    node = next(n for n in r["nodes"] if 'data-id="syscall:Nt5"' in n)
+    assert 'data-tone="patched"' in node
+    rings = [e["attrs"] for e in _Elements(node).elements if "binary-graph-match-ring" in _classes(e)]
+    assert len(rings) == 1 and rings[0]["stroke"] == "--graph-match"
+    box = _node_rect(node)
+    assert box["stroke"] == "--syscall-patched", "the match does not cover the tone"
 
 
 @needs_node

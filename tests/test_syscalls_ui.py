@@ -453,7 +453,7 @@ FLOW_FUNCTIONS = [
     "binaryGraphLayout", "binaryGraphEdgeLook", "binaryGraphNodeLook", "binaryGraphTones", "binaryGraphMatches", "binaryGraphCut",
     "binaryGraphSvg", "binaryGraphLegend", "binaryGraphStatus", "binaryGraphModel", "renderBinaryGraph", "binaryGraphOnQuery",
     "binaryGraphSubmit", "binaryGraphRun", "binaryGraphItem", "binaryGraphSelect", "binaryGraphFollowMap", "binaryGraphDetailItem",
-    "binaryGraphDetailHtml",
+    "binaryGraphDetailHtml", "binaryGraphOwn", "binaryGraphOrigin",
 ]
 FLOW_CONSTS = ["SYSCALL_STATES", "SYSCALL_STATE_COLORS", "SYSCALL_STATE_HELP", "SYSCALL_MODULES", "SYSCALL_WIN32U_TITLE", "SYSCALL_MAP",
                "SYSCALL_ROWS_MAX", "SYSCALL_PAGE", "SYSCALL_POLL_MS", "SYSCALL_VIEW_NAMES", "syscallState",
