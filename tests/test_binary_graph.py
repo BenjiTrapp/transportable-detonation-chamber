@@ -1571,6 +1571,80 @@ def test_a_save_that_fails_on_the_way_leaves_the_earlier_cache_whole(tmp_path, m
     assert path.read_text() == "old" and os.listdir(tmp_path) == ["cache.json"]
 
 
+def test_a_cache_is_flushed_to_disk_before_it_takes_its_name(tmp_path, monkeypatch):
+    # os.replace is atomic, but without an fsync first a power loss can leave the renamed file zero-filled or cut short
+    events = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(os, "fsync", lambda fd: (events.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(os, "replace", lambda a, b: (events.append("replace"), real_replace(a, b))[1])
+    binary_graph.save_graph(_strange_graph(), str(tmp_path / "cache.json"))
+    assert events == ["fsync", "replace"]
+
+
+def test_two_saves_at_once_write_beside_the_cache_under_names_of_their_own(tmp_path, monkeypatch):
+    sources = []
+    real_replace = os.replace
+    monkeypatch.setattr(os, "replace", lambda a, b: (sources.append(a), real_replace(a, b))[1])
+    path = str(tmp_path / "cache.json")
+    binary_graph.save_graph(_strange_graph(), path)
+    binary_graph.save_graph(_strange_graph(), path)
+    assert len(set(sources)) == 2 and all(src != path + ".tmp" for src in sources)
+    assert os.listdir(tmp_path) == ["cache.json"]
+
+
+def test_a_save_in_progress_is_left_alone_and_one_that_a_killed_build_left_behind_is_removed(tmp_path):
+    import time
+    path = tmp_path / "cache.json"
+    active = tmp_path / "cache.json.0123456789abcdef.tmp"
+    killed = tmp_path / "cache.json.fedcba9876543210.tmp"
+    unrelated = tmp_path / "other.json.0123456789abcdef.tmp"
+    for leftover in (active, killed, unrelated):
+        leftover.write_text("half")
+    long_ago = time.time() - 3 * 3600
+    os.utime(killed, (long_ago, long_ago))
+    os.utime(unrelated, (long_ago, long_ago))
+    binary_graph.save_graph(_strange_graph(), str(path))
+    assert sorted(os.listdir(tmp_path)) == sorted(["cache.json", active.name, unrelated.name])
+    assert active.read_text() == "half"             # a build that is writing right now is not this one's to delete
+
+
+def test_a_cache_that_is_valid_json_but_cut_short_is_refused_not_kept(tmp_path):
+    text = _saved(tmp_path, _strange_graph())
+    doc = json.loads(text)
+    for name, damaged in (("cut", text[:len(text) // 2]), ("zero-filled", "\0" * len(text)),
+                          ("stamp only", json.dumps({k: doc[k] for k in ("format", "build", "arch", "created")})),
+                          ("empty", "")):
+        path = tmp_path / "cache.json"
+        path.write_text(damaged, encoding="utf-8")
+        with pytest.raises(binary_graph.CacheMismatch) as e:
+            binary_graph.load_graph(str(path), "26220.5770", "arm64")
+        assert e.value.reason == "malformed", name
+
+
+def test_the_cli_check_accepts_a_whole_cache_and_refuses_a_cut_one(tmp_path, capsys):
+    root, _ = _system32(tmp_path)
+    out = tmp_path / "out"
+    args = ["--out", str(out), "--build", "1.1", "--arch", "x64"]
+    assert binary_graph.main(args + ["--system32", str(root)]) == 0
+    capsys.readouterr()
+    assert binary_graph.main(args + ["--check"]) == 0
+    assert "binaries: 6" in capsys.readouterr().out.splitlines()
+    cache = out / binary_graph.cache_name("1.1", "x64")
+    cache.write_bytes(cache.read_bytes()[:-40])
+    assert binary_graph.main(args + ["--check"]) == 1
+    assert "malformed" in capsys.readouterr().err
+    cache.unlink()
+    assert binary_graph.main(args + ["--check"]) == 1                    # no cache is not a good one either
+    assert binary_graph.main(["--out", str(out), "--build", "9.9", "--arch", "x64", "--check"]) == 1
+
+
+def test_the_cli_check_refuses_a_cache_stamped_for_another_build(tmp_path, capsys):
+    graph = _strange_graph()
+    binary_graph.save_graph(graph, str(tmp_path / binary_graph.cache_name("26220.9999", "arm64")))     # a stamp 5770 on a 9999 name
+    assert binary_graph.main(["--out", str(tmp_path), "--build", "26220.9999", "--arch", "arm64", "--check"]) == 1
+    assert "other build" in capsys.readouterr().err
+
+
 def test_loading_a_cache_of_another_build_is_refused_with_the_build_it_holds(tmp_path):
     path = str(tmp_path / "cache.json")
     binary_graph.save_graph(_strange_graph(), path)
@@ -1785,6 +1859,34 @@ def test_the_host_build_is_the_number_and_revision_of_the_registry(monkeypatch):
     assert binary_graph.host_build() is None
 
 
+def test_the_host_build_asks_the_one_registry_seam_for_the_number_and_the_revision():
+    asked = []
+    held = {"CurrentBuildNumber": "26220", "UBR": 5770}
+
+    def registry(subkey, name):
+        asked.append((subkey, name))
+        return held.get(name)
+
+    assert binary_graph.host_build(registry) == "26220.5770"
+    assert asked == [(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "CurrentBuildNumber"),
+                     (r"SOFTWARE\Microsoft\Windows NT\CurrentVersion", "UBR")]
+
+
+@pytest.mark.parametrize("missing", ["CurrentBuildNumber", "UBR"])
+def test_a_build_the_registry_cannot_give_whole_is_none(missing):
+    held = {"CurrentBuildNumber": "26220", "UBR": 5770}
+    held.pop(missing)
+    assert binary_graph.host_build(lambda subkey, name: held.get(name)) is None
+    assert binary_graph.host_build(lambda subkey, name: None) is None
+
+
+def test_a_registry_that_raises_gives_no_build():
+    def broken(subkey, name):
+        raise OSError("access denied")
+
+    assert binary_graph.host_build(broken) is None
+
+
 class _Key:
     def __enter__(self):
         return self
@@ -1942,7 +2044,7 @@ def _run_build_script(tmp_path, module_source, *, python=True, force=False, exis
     head = script[:script.index("# OS architecture from the registry")]
     tail = script[script.index('$cacheName = "binary-graph'):]
     web, baseline = tmp_path / "webui", tmp_path / "baseline"
-    web.mkdir()
+    web.mkdir(parents=True)
     baseline.mkdir()
     if module_source is not None:
         (web / "binary_graph.py").write_text(module_source)
@@ -1985,14 +2087,90 @@ def test_a_build_that_fails_is_a_warning_and_the_script_still_exits_zero(tmp_pat
     assert not list(baseline.glob("binary-graph-*")), what
 
 
-def test_a_cache_that_is_there_is_not_built_again_unless_forced(tmp_path):
-    proc, _ = _run_build_script(tmp_path, "raise SystemExit(1)", existing="{}")
-    assert proc.returncode == 0 and "already present" in proc.stdout
-    forced = tmp_path / "forced"
-    forced.mkdir()
-    proc, baseline = _run_build_script(forced, _FAKE_OK, force=True, existing="old")
-    assert proc.returncode == 0 and "[+] Binary graph" in proc.stdout
-    assert (baseline / "binary-graph-1.1-arm64.json").read_text() == "{}"
+def _delegating_module(rebuilt_created="rebuilt"):
+    """A stand-in module for the script: `--check` is the real module's, a build writes a whole cache (made recognisable by
+    its `created`)."""
+    return ("import sys, os\n"
+            f"sys.path.insert(0, {os.path.dirname(binary_graph.__file__)!r})\n"
+            "import binary_graph, dataclasses\n"
+            "if '--check' in sys.argv:\n"
+            "    sys.exit(binary_graph.main())\n"
+            "arg = lambda name: sys.argv[sys.argv.index(name) + 1]\n"
+            "import test_binary_graph\n"
+            "graph = dataclasses.replace(test_binary_graph._strange_graph(), build=arg('--build'), arch=arg('--arch'),"
+            f" created={rebuilt_created!r})\n"
+            "binary_graph.save_graph(graph, os.path.join(arg('--out'), binary_graph.cache_name(arg('--build'), arg('--arch'))))\n"
+            "print('binaries: 2')\n")
+
+
+def _whole_cache(build="1.1", arch="arm64", created="original"):
+    import dataclasses
+    return dataclasses.replace(_strange_graph(), build=build, arch=arch, created=created)
+
+
+def _created(baseline):
+    return json.loads((baseline / "binary-graph-1.1-arm64.json").read_text())["created"]
+
+
+def _run_with_cache(tmp_path, cache_bytes, force=False):
+    """The script, a delegating module and a cache with these bytes in place; a subprocess needs the tests directory on its
+    path to find _strange_graph."""
+    import sys
+    module = _delegating_module().replace("import test_binary_graph\n", f"sys.path.insert(0, {os.path.dirname(__file__)!r})\nimport test_binary_graph\n")
+    proc, baseline = _run_build_script(tmp_path, module, force=force, existing=cache_bytes)
+    return proc, baseline
+
+
+def test_a_cache_that_is_there_and_loads_is_not_built_again_unless_forced(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    binary_graph.save_graph(_whole_cache(), str(src / "c.json"))
+    whole = (src / "c.json").read_text()
+    proc, baseline = _run_with_cache(tmp_path / "keep", whole)
+    assert proc.returncode == 0 and "already present" in proc.stdout, proc.stdout + proc.stderr
+    assert _created(baseline) == "original"
+    proc, baseline = _run_with_cache(tmp_path / "forced", whole, force=True)
+    assert proc.returncode == 0 and "[+] Binary graph" in proc.stdout, proc.stdout + proc.stderr
+    assert _created(baseline) == "rebuilt"
+
+
+@pytest.mark.parametrize("damage", ["cut", "zero-filled", "stamp of another build", "not json"])
+def test_a_cache_that_is_there_but_does_not_load_is_built_again_not_kept_for_its_length(tmp_path, damage):
+    src = tmp_path / "src"
+    src.mkdir()
+    binary_graph.save_graph(_whole_cache(), str(src / "c.json"))
+    whole = (src / "c.json").read_text()
+    other = _whole_cache(build="9.9")
+    binary_graph.save_graph(other, str(src / "o.json"))
+    damaged = {"cut": whole[:len(whole) // 2], "zero-filled": "\0" * len(whole), "not json": "x" * len(whole),
+               "stamp of another build": (src / "o.json").read_text()}[damage]
+    assert len(damaged) > 0
+    proc, baseline = _run_with_cache(tmp_path / "run", damaged)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "does not load" in proc.stdout and "building it again" in proc.stdout, proc.stdout
+    assert _created(baseline) == "rebuilt"
+    binary_graph.load_graph(str(baseline / "binary-graph-1.1-arm64.json"), "1.1", "arm64")
+
+
+def test_a_cache_that_is_there_and_a_module_that_cannot_rebuild_it_is_a_warning_and_exit_zero(tmp_path):
+    proc, baseline = _run_build_script(tmp_path, "raise SystemExit(1)", existing="half")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "does not load" in proc.stdout and "No graph was built" in proc.stdout
+
+
+def test_setup_gives_the_graph_script_more_time_than_the_build_waits_for():
+    import subprocess
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "scripts", "setup-macos-utm.sh"), encoding="utf-8") as fh:
+        text = fh.read()
+    function = re.search(r"(?ms)^provision_timeout\(\) \{.*?^\}", text).group(0)
+    def timeout(name):
+        return int(subprocess.run(["bash", "-c", function + f'\nprovision_timeout "{name}"'], capture_output=True,
+                                  text=True, check=True).stdout)
+    build_wait = int(re.search(r"\$BuildTimeout = (\d+)", _build_script()).group(1))
+    assert timeout("build-binary-graph.ps1") > build_wait
+    assert timeout("install-webui.ps1") == 900                 # nothing else changed
+    assert 'run_provision_script "$script" "$(provision_timeout "$script")"' in text
 
 
 def test_the_build_script_off_windows_finds_no_registry_and_still_exits_zero(tmp_path):

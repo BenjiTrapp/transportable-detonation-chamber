@@ -13,6 +13,8 @@ import os
 import re
 import struct
 import sys
+import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -566,14 +568,43 @@ def _document(graph):
     }
 
 
+STALE_TEMPORARY_SECONDS = 3600      # a save writes for seconds; a temporary this old belongs to a build that was killed
+
+
+def _remove_stale_temporaries(path):
+    """Remove what killed saves of this cache left beside it: `<name>.<token>.tmp` files older than an hour. A younger one
+    may be a save in progress in another process, and is not ours to touch."""
+    directory, name = os.path.split(path)
+    try:
+        names = os.listdir(directory or ".")
+    except OSError:
+        return
+    now = time.time()
+    for other in names:
+        if other.startswith(name + ".") and other.endswith(".tmp"):
+            leftover = os.path.join(directory, other)
+            try:
+                if now - os.path.getmtime(leftover) > STALE_TEMPORARY_SECONDS:
+                    os.remove(leftover)
+            except OSError:
+                pass
+
+
 def save_graph(graph: Graph, path: str) -> None:
-    """Write the cache to `path`, whole or not at all: it is written beside its name and moved over it, so the web UI
-    never reads half a file and a failed write leaves the earlier cache alone."""
+    """Write the cache to `path`, whole or not at all.
+
+    It is written beside its name under a name of its own (two saves at once, provisioning and a build on demand, never
+    share a file), flushed and fsynced, and only then moved over `path`: the web UI never reads half a file, a failed
+    write leaves the earlier cache alone, and a power loss cannot leave a renamed file whose bytes never reached the disk
+    (os.replace is atomic, but is no promise about the data)."""
     text = json.dumps(_document(graph), separators=(",", ":"))
-    temporary = path + ".tmp"
+    _remove_stale_temporaries(path)
+    temporary = f"{path}.{uuid.uuid4().hex}.tmp"
     try:
         with open(temporary, "w", encoding="utf-8") as fh:
             fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(temporary, path)
     except BaseException:
         try:
@@ -692,29 +723,33 @@ def load_graph(path: str, build: str, arch: str) -> Graph:
 
 # --- the command line the provisioning script calls --------------------------------------------------------------
 
-def host_build() -> str | None:
-    r"""`<build>.<revision>` of the running system, the form the baselines are named in, or None off Windows."""
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as key:
-            number = winreg.QueryValueEx(key, "CurrentBuildNumber")[0]
-            revision = winreg.QueryValueEx(key, "UBR")[0]
-    except (ImportError, OSError):
-        return None
-    return f"{number}.{revision}"
-
-
 _ARCH_KEY = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
 
 
 def _registry_string(subkey, name):
-    r"""The REG_SZ `name` under `HKLM\<subkey>`, None when there is no registry (not Windows) or it cannot be read."""
+    r"""The value `name` under `HKLM\<subkey>`, None when there is no registry (not Windows) or it cannot be read."""
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, subkey) as key:
             return winreg.QueryValueEx(key, name)[0]
     except (ImportError, OSError):
         return None
+
+
+_BUILD_KEY = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+
+
+def host_build(read_registry=_registry_string) -> str | None:
+    r"""`<build>.<revision>` of the running system (CurrentBuildNumber and UBR of the registry), the form the baselines
+    are named in; None when either cannot be read, off Windows included. `read_registry` is the seam of host_arch."""
+    try:
+        number = read_registry(_BUILD_KEY, "CurrentBuildNumber")
+        revision = read_registry(_BUILD_KEY, "UBR")
+    except (ImportError, OSError):
+        return None
+    if number is None or revision is None:
+        return None
+    return f"{number}.{revision}"
 
 
 def host_arch(read_registry=_registry_string) -> str:
@@ -741,21 +776,52 @@ def host_arch(read_registry=_registry_string) -> str:
 
 
 def _arguments(argv):
-    """`{option: value}` of `--out`, `--system32`, `--build` and `--arch`, None for anything else."""
-    known = ("--out", "--system32", "--build", "--arch")
-    if len(argv) % 2 or any(option not in known for option in argv[::2]) or len(set(argv[::2])) != len(argv) // 2:
-        return None
-    return dict(zip(argv[::2], argv[1::2]))
+    """`{option: value}` of `--out`, `--system32`, `--build` and `--arch`, and `{"--check": True}` when that flag is
+    given; None for anything else."""
+    values = ("--out", "--system32", "--build", "--arch")
+    options, rest = {}, list(argv)
+    while rest:
+        option = rest.pop(0)
+        if option == "--check" and option not in options:
+            options[option] = True
+        elif option in values and option not in options and rest:
+            options[option] = rest.pop(0)
+        else:
+            return None
+    return options
+
+
+def _check_cache(options, build, arch):
+    """`--check`: whether the cache of this build and architecture in `--out` loads. 0 and the counts of what it holds,
+    or 1 and the reason on stderr. The provisioning script keeps a cache only when this says it is whole: a file's length
+    says nothing of it."""
+    path = find_cache(options["--out"], build, arch)
+    if path is None:
+        print("no cache of this build and architecture", file=sys.stderr)
+        return 1
+    try:
+        graph = load_graph(path, build, arch)
+    except CacheMismatch as exc:
+        print(f"{exc.reason}: {exc}", file=sys.stderr)
+        return 1
+    for label, count in (("binaries", len(graph.binaries)), ("skipped", len(graph.skipped)),
+                         ("api_sets", len(graph.api_sets)), ("resolved", len(graph.resolved)),
+                         ("modules", len(graph.in_degree))):
+        print(f"{label}: {count}")
+    print(f"cache: {path}")
+    return 0
 
 
 def main(argv=None) -> int:
-    """`binary_graph.py --out <dir> [--system32 <dir>] [--build <b>] [--arch <a>]`: build the cache and write it to
-    `<dir>`. One `name: number` line per count on stdout, then `cache: <path>`; the reason of a failure goes to stderr.
-    Returns 0 on success and 1 otherwise, a directory without a PE in it included: a graph of nothing is not written.
-    The api-set map is read from `apisetschema.dll` of the directory."""
+    """`binary_graph.py --out <dir> [--system32 <dir>] [--build <b>] [--arch <a>] [--check]`: build the cache and write
+    it to `<dir>`, or with `--check` only say whether the one there loads. One `name: number` line per count on stdout,
+    then `cache: <path>`; the reason of a failure goes to stderr. Returns 0 on success and 1 otherwise, a directory
+    without a PE in it included: a graph of nothing is not written. The api-set map is read from `apisetschema.dll` of
+    the directory."""
     options = _arguments(sys.argv[1:] if argv is None else list(argv))
     if options is None or "--out" not in options:
-        print("usage: binary_graph.py --out <dir> [--system32 <dir>] [--build <b>] [--arch <a>]", file=sys.stderr)
+        print("usage: binary_graph.py --out <dir> [--system32 <dir>] [--build <b>] [--arch <a>] [--check]",
+              file=sys.stderr)
         return 1
     system32 = options.get("--system32", SYSTEM32)
     build = options.get("--build") or host_build()
@@ -768,6 +834,8 @@ def main(argv=None) -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+    if "--check" in options:
+        return _check_cache(options, build, arch)
     graph = build_graph(system32, os.path.join(system32, "apisetschema.dll"), build, arch)
     for label, count in (("binaries", len(graph.binaries)), ("skipped", len(graph.skipped)),
                          ("api_sets", len(graph.api_sets)), ("resolved", len(graph.resolved)),

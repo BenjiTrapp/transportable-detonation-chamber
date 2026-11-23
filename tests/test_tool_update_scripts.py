@@ -92,6 +92,15 @@ def test_scripts_reach_the_vm():
     assert "SCRIPT_FILES" in _read("scripts", "deploy-utm.py")
     assert "C:\\\\tdc\\\\scripts" in _read("Makefile")
     assert "C:\\tdc\\scripts" in _read("make.ps1")
+    # build-binary-graph.ps1 is no install-*.ps1, so none of the install globs ships it: each deploy path names it, or
+    # an existing VM never gets it
+    assert 'os.path.join(REPO, "scripts", "build-binary-graph.ps1")' in _read("scripts", "deploy-utm.py")
+    assert "scripts/build-binary-graph.ps1" in _read("Makefile")
+    assert "'scripts\\build-binary-graph.ps1'" in _read("make.ps1")
+    # and where it is named is the loop that uploads to C:\tdc\scripts, not a comment
+    assert re.search(r"(?m)^[^#\n]*SCRIPT_FILES = \{.*?build-binary-graph\.ps1", _read("scripts", "deploy-utm.py"), re.S)
+    assert re.search(r"(?m)^[^#\n]*for f in [^\n]*scripts/build-binary-graph\.ps1[^\n]*; do", _read("Makefile"))
+    assert re.search(r"(?m)^[^#\n]*foreach \(\$installScript in [^\n]*scripts\\build-binary-graph\.ps1", _read("make.ps1"))
 
 
 @pytest.mark.parametrize("name", ["capa", "beaconeye", "process-dump", "scanner-tools"])
