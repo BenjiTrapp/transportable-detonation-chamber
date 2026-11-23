@@ -4463,9 +4463,59 @@ def test_diverged_stubs_are_named_in_the_verdict_and_do_not_read_as_clean(tdc, t
     assert results["memory_evidence"]["syscalls_diverged"] == 1
 
 
+def _walkable(reader):
+    """`reader` with free memory behind everything it maps, so that a walk of its regions covers user space."""
+    reader._regions.append((0, syscall_scan._USER_SPACE_END, syscall_scan.Region(0x10000, 0, None)))
+    return reader
+
+
 def test_a_stage_with_nothing_diverged_adds_no_reason(tdc, target):
+    _walkable(target.reader)
     verdict = tdc._compute_verdict({"syscalls": tdc._run_syscall_stage(4812, None)}, [])
     assert not [r for r in verdict["reasons"] if "syscall" in r.lower()]
+
+
+def test_a_partial_measurement_is_named_in_the_verdict_like_a_scan_that_observed_nothing(tdc, target,
+                                                                                         fake_baseline_dir):
+    baseline = syscall_baseline.load_baseline(str(fake_baseline_dir / "ntsleuth-26220.5770-arm64.json"))
+    target.reader = _reader_from(baseline, patched={}, fail_after=2)
+    entry = tdc._run_syscall_stage(4812, None)
+    assert entry["partial"] is True and entry["evidence"]["label"] == "CLEAN"
+    results = {"syscalls": entry}
+    verdict = tdc._compute_verdict(results, [])
+    [reason] = [r for r in verdict["reasons"] if "partial" in r]
+    assert reason.startswith("Syscall measurement is partial") and "not evidence of being clean" in reason
+    assert "unreadable" in reason
+    assert results["memory_evidence"]["partial_sources"] == ["syscalls"]
+
+
+def test_a_stub_search_that_failed_or_was_partial_is_named_in_the_verdict(tdc, target):
+    entry = tdc._run_syscall_stage(4812, None)
+    entry["stubs"]["process"] = {"hits": [], "partial": True, "note": "the region query at 0x0 failed"}
+    verdict = tdc._compute_verdict({"syscalls": entry}, [])
+    assert any("region query" in r and "partial" in r for r in verdict["reasons"])
+    entry["stubs"]["process"] = {"hits": [], "error": "cannot read process 4812"}
+    verdict = tdc._compute_verdict({"syscalls": entry}, [])
+    assert any("cannot read process" in r for r in verdict["reasons"])
+
+
+def test_a_stage_that_measured_nothing_is_not_observed_when_it_is_the_only_memory_source(tdc, target):
+    target.reader._m = None
+    entry = tdc._run_syscall_stage(4812, None)
+    assert entry["partial"] is True and not any(entry["counts"].values())
+    results = {"syscalls": entry}
+    tdc._compute_verdict(results, [])
+    assert results["memory_evidence"]["label"] == "NOT OBSERVED"
+    assert "could not be listed" in results["memory_evidence"]["note"]
+
+
+def test_a_complete_stage_adds_no_partial_reason(tdc, target):
+    _walkable(target.reader)
+    results = {"syscalls": tdc._run_syscall_stage(4812, None)}
+    verdict = tdc._compute_verdict(results, [])
+    assert not [r for r in verdict["reasons"] if "partial" in r]
+    assert "partial_sources" not in results["memory_evidence"]
+    assert results["memory_evidence"]["label"] == "CLEAN"
 
 
 def test_a_stage_that_skipped_is_no_evidence_and_no_verdict(tdc):

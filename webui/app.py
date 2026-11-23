@@ -4705,13 +4705,33 @@ def _pipe_events_for(pids, sample_keys, resolve, since, until):
     return events, truncated
 
 
-def _syscall_verdict_reasons(stage, evidence, reasons):
-    """What the syscall stage of a detonation leaves unsaid by its score, said in the verdict: stubs that diverged,
-    which are not scored. Without it a result full of `diverged` reads as a clean process."""
+def _syscall_verdict_reasons(stage, evidence, reasons, only_source=False):
+    """What the syscall stage of a detonation leaves unsaid by its score, said in the verdict, the way a live scan
+    that observed nothing is: a partial measurement, a stub search that did not cover the process, and stubs that
+    diverged, which are not scored. Without it a result full of `diverged` or of unread stubs reads as a clean
+    process. A stage that measured no stub at all, as the only memory source, is NOT OBSERVED."""
     if not stage:
         return
+    counts = stage.get("counts") if isinstance(stage.get("counts"), dict) else {}
+    gaps = []
+    if stage.get("partial"):
+        gaps.append(str(stage.get("note") or "not every stub could be measured"))
+    stubs = stage.get("stubs") if isinstance(stage.get("stubs"), dict) else {}
+    search = stubs.get("process") if isinstance(stubs.get("process"), dict) else {}
+    if search.get("error"):
+        gaps.append(f"the search of its memory for stubs failed: {search['error']}")
+    elif search.get("partial"):
+        gaps.append(f"the search of its memory for stubs is partial: {search.get('note') or 'not all of it was read'}")
+    if gaps:
+        evidence.setdefault("partial_sources", []).append("syscalls")
+        reasons.append(f"Syscall measurement is partial ({'; '.join(gaps)[:400]}) - what it did not read is not "
+                       "evidence of being clean")
+    measured = sum(v for v in counts.values() if isinstance(v, int))
+    if not measured and only_source and evidence.get("label") == "CLEAN":
+        evidence["label"] = "NOT OBSERVED"
+        evidence["note"] = f"The syscall stage measured no stub: {stage.get('note') or 'nothing was read'}"
     renumbered = stage.get("renumbered") if isinstance(stage.get("renumbered"), int) else 0
-    diverged = max(0, int((stage.get("counts") or {}).get("diverged") or 0) - renumbered)
+    diverged = max(0, int(counts.get("diverged") or 0) - renumbered)
     if diverged:
         evidence["syscalls_diverged"] = diverged
         reasons.append(f"{diverged} syscall stub{'s' if diverged != 1 else ''} diverged: the bytes changed, and no "
@@ -4803,7 +4823,8 @@ def _compute_verdict(results, matching_alerts):
             evidence["note"] = ("Process exited before the live scan; it was "
                                 "analyzed from its exit-time memory dump instead.")
         evidence["sources_present"] = mem_sources
-        _syscall_verdict_reasons(_syscall_stage_entry(results.get("syscalls")), evidence, reasons)
+        _syscall_verdict_reasons(_syscall_stage_entry(results.get("syscalls")), evidence, reasons,
+                                 only_source=mem_sources == ["syscalls"])
 
         # Emitted even when empty, so the UI can tell "tools ran, nothing
         # scored" apart from "tools never ran".

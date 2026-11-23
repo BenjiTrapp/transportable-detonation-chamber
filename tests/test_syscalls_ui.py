@@ -2458,3 +2458,61 @@ def test_every_tone_a_note_can_have_has_its_accent_in_both_themes():
         assert token.group(1) in classic and token.group(1) in cyberpunk, (tone, token.group(1))
     tones = set(re.findall(r"tone: '(\w+)'", _block())) - {"ok", "info", "warn", "error"}
     assert not tones, f"a tone with no accent: {tones}"
+
+
+# --- the syscall stage in the Memory tab of a detonation ---------------------------------------------
+
+STAGE_FUNCTIONS = ["renderSyscallStageBlock", "_detRawButton", "syscallOwnerHtml"]
+STAGE_PRELUDE = "const _detRawPayloads = [];\n"
+
+
+@needs_node
+def test_a_detonation_whose_only_memory_tool_is_the_syscall_stage_has_a_memory_tab():
+    r = _run_node(["detHasMemoryResults"], """
+      out([detHasMemoryResults({syscalls: {tool: 'Syscalls', skipped: 'no baseline'}}),
+           detHasMemoryResults({syscalls: {tool: 'Syscalls', counts: {intact: 3}}}),
+           detHasMemoryResults({}), detHasMemoryResults({aether: {report: {}}})]);""")
+    assert [bool(x) for x in r] == [True, True, False, True]
+
+
+def test_the_detonation_panels_take_the_memory_tab_from_one_place_and_draw_the_syscall_stage():
+    from test_frontend import _function_source
+    panels = _function_source("renderDetonationPanels")
+    assert "detHasMemoryResults(data)" in panels
+    assert "renderSyscallStageBlock(data.syscalls)" in panels
+
+
+@needs_node
+def test_a_stage_that_skipped_itself_says_why_and_that_it_is_no_clean_result():
+    html = _run_node(STAGE_FUNCTIONS, """
+      out([renderSyscallStageBlock({tool: 'Syscalls', skipped: '<img src=x onerror=alert(1)> no baseline'}),
+           renderSyscallStageBlock({tool: 'Syscalls', error: 'broke <b>'})]);""", STAGE_PRELUDE)
+    assert "<img" not in html[0] and "&lt;img" in html[0] and "Skipped" in html[0]
+    assert "not evidence of being clean" in html[0]
+    assert "<b>" not in html[1] and "broke &lt;b&gt;" in html[1]
+
+
+@needs_node
+def test_the_stage_block_has_the_counts_the_partial_note_and_the_deviations_escaped():
+    html = _run_node(STAGE_FUNCTIONS, """
+      out(renderSyscallStageBlock({tool: 'Syscalls', pid: 4812, build: '26220.5770', view: 'x64',
+          counts: {intact: 2400, hooked: 7, patched: 1, diverged: 2, unreadable: 3}, renumbered: 1,
+          partial: true, note: '3 stubs unreadable <script>, the result is partial',
+          deviations: [
+            {name: '<svg onload=alert(1)>', state: 'patched', target_owner: 'private', pattern: 'JMP rel32', relay: []},
+            {name: 'NtProtectVirtualMemory', state: 'hooked', target_owner: 'edr<x>.dll', pattern: 'JMP rel32',
+             relay: [{address: 140703380275200, owner: 'private', pattern: 'JMP [rip]'}], allowlisted: true},
+            {name: 'NtClose', state: 'diverged', target_owner: null, number_matches: false, live_number: 80, number: 15}],
+          stubs: {process: {hits: [{}], partial: true, note: 'region query failed'}, file: {hits: [], skipped: 'path unknown'}},
+          evidence_findings: []}));""", STAGE_PRELUDE)
+    for text in ("2400", "intact", "hooked", "patched", "diverged", "unreadable", "renumbered"):
+        assert text in html, text
+    assert "Partial" in html and "&lt;script&gt;" in html and "<script" not in html
+    assert "<svg" not in html and "&lt;svg" in html
+    assert "edr&lt;x&gt;.dll" in html
+    assert "relay" in html and "0x7FF80F000000" in html
+    assert "allowlist" in html
+    assert "another syscall" in html
+    assert "region query failed" in html and "path unknown" in html
+    assert 'data-sortable data-sort-id="det-syscall-deviations"' in html
+

@@ -9625,9 +9625,7 @@ function renderDetonationPanels(data) {
     }
 
     // Memory scanning tab (beacon scanners + live-memory forensics + dumps)
-    const hasBeaconResults = data.hunt_sleeping_beacons || data.beaconeye
-        || data.aether || data.process_dump || data.exit_capture_result
-        || (data.network_beaconing && (data.network_beaconing.evidence_findings || []).length);
+    const hasBeaconResults = detHasMemoryResults(data);
     if (hasBeaconResults) {
         let body = '';
         // The aggregated, cross-source verdict comes first: it is what the
@@ -9684,6 +9682,9 @@ function renderDetonationPanels(data) {
         }
         if (data.process_dump) {
             body += renderProcessDumpBlock(data.process_dump);
+        }
+        if (data.syscalls) {
+            body += renderSyscallStageBlock(data.syscalls);
         }
         if (data.exit_capture_result) {
             body += renderExitCaptureBlock(data.exit_capture_result);
@@ -9743,10 +9744,12 @@ function renderDetonationPanels(data) {
                 // No aggregated block yet: fall back to the raw tool counts.
                 const raw = (data.hunt_sleeping_beacons?.suspicious_count || 0)
                     + (data.beaconeye?.beacons_found || 0);
+                const sys = data.syscalls && typeof data.syscalls === 'object' ? data.syscalls : null;
                 icon.innerHTML = raw > 0 ? '&#x26A0;' : '&#x2705;';
-                detail.textContent = raw > 0
+                detail.textContent = (raw > 0
                     ? `${raw} beacon indicator(s) found`
-                    : 'Scan complete — no beacons detected';
+                    : 'Scan complete — no beacons detected')
+                    + (sys && (sys.skipped || sys.error) ? ' · syscall stage skipped, see the Memory tab' : '');
             }
         }
     }
@@ -19567,6 +19570,85 @@ function renderProcessDumpBlock(pd) {
     });
     html += `</tbody></table>`;
     return html + _detRawButton('View Process Dump raw', pd);
+}
+
+// Whether a detonation has anything for its Memory tab. The syscall stage counts on its own, a stage that skipped
+// itself too: its reason belongs where the analyst looks for the memory results.
+function detHasMemoryResults(data) {
+    const d = data && typeof data === 'object' ? data : {};
+    return Boolean(d.hunt_sleeping_beacons || d.beaconeye || d.aether || d.process_dump || d.exit_capture_result
+        || d.syscalls
+        || (d.network_beaconing && (d.network_beaconing.evidence_findings || []).length));
+}
+
+// The syscall stage of a detonation (app.py _run_syscall_stage): the ntdll stubs of the process measured against
+// the baseline, and the stubs the process and the sample file carry. A stage that skipped itself says why; a
+// partial one says what it did not read. Names, owners and notes come from the process: all of it is escaped.
+function renderSyscallStageBlock(sc) {
+    let html = '<div class="det-sub-title" data-info="The ntdll syscall stubs of the process measured against the NTSleuth baseline of this build and view, and the stubs the process memory and the sample file carry. Diverged and unreadable stubs are not scored.">Syscalls &mdash; ntdll stubs against the baseline</div>';
+    if (!sc || typeof sc !== 'object') return '';
+    if (sc.skipped || sc.error) {
+        return html + `<div class="det-sub-value det-warn">Skipped: ${escapeHtml(String(sc.skipped || sc.error))}</div>`
+            + '<div class="det-sub-value muted">Nothing was measured, which is not evidence of being clean.</div>';
+    }
+    const counts = sc.counts && typeof sc.counts === 'object' ? sc.counts : {};
+    const num = v => (Number.isFinite(Number(v)) ? Number(v) : 0);
+    const chip = (label, value, cls) =>
+        `<span class="mem-chip ${cls || ''}"><span class="mem-chip-val">${escapeHtml(String(value))}</span>${escapeHtml(label)}</span>`;
+    const where = [sc.pid !== undefined && `PID ${sc.pid}`, sc.build && `build ${sc.build}`, sc.view && `view ${sc.view}`].filter(Boolean);
+    if (where.length) html += `<div class="det-sub-value muted">${escapeHtml(where.join(' · '))}</div>`;
+    html += '<div class="mem-chips">';
+    html += chip('intact', num(counts.intact));
+    if (num(counts.hooked)) html += chip('hooked (file-backed module)', num(counts.hooked), 'sev-medium');
+    if (num(counts.patched)) html += chip('patched', num(counts.patched), 'sev-high');
+    if (num(sc.renumbered)) html += chip('renumbered', num(sc.renumbered), 'sev-high');
+    if (num(counts.diverged)) html += chip('diverged, not scored', num(counts.diverged), 'sev-medium');
+    if (num(counts.unreadable)) html += chip('unreadable', num(counts.unreadable), 'sev-medium');
+    html += '</div>';
+    if (sc.partial) {
+        html += `<div class="det-sub-value det-warn">Partial: ${escapeHtml(String(sc.note || 'not every stub could be measured'))}. `
+            + 'What was not read is not evidence of being clean.</div>';
+    } else if (sc.note) {
+        html += `<div class="det-sub-value muted">${escapeHtml(String(sc.note))}</div>`;
+    }
+    const stubs = sc.stubs && typeof sc.stubs === 'object' ? sc.stubs : {};
+    const search = (label, part) => {
+        if (!part || typeof part !== 'object') return '';
+        const hits = Array.isArray(part.hits) ? part.hits.length : 0;
+        let text = `${label}: ${hits} stub${hits === 1 ? '' : 's'} of its own`;
+        if (part.skipped) text += ` · not searched: ${part.skipped}`;
+        if (part.error) text += ` · failed: ${part.error}`;
+        else if (part.partial) text += ` · partial: ${part.note || 'not all of it could be read'}`;
+        return `<div class="det-sub-value ${hits || part.partial || part.error ? 'det-warn' : 'muted'}">${escapeHtml(text)}</div>`;
+    };
+    html += search('Process memory', stubs.process) + search('Sample file', stubs.file);
+
+    const devs = (Array.isArray(sc.deviations) ? sc.deviations : []).filter(d => d && typeof d === 'object');
+    if (devs.length) {
+        const rank = d => (Object.prototype.hasOwnProperty.call(SYSCALL_SEVERITY_RANK, d.state) ? SYSCALL_SEVERITY_RANK[d.state] : 2);
+        html += '<div class="mem-section-label">Deviations</div>';
+        html += '<table class="mem-dump-table" data-sortable data-sort-id="det-syscall-deviations"><thead><tr>'
+            + '<th>syscall</th><th>state</th><th>jump target</th><th>pattern</th><th>note</th></tr></thead><tbody>';
+        devs.slice().sort((a, b) => rank(a) - rank(b)).slice(0, 50).forEach(d => {
+            const state = String(d.state ?? '');
+            const cls = state === 'patched' ? 'sev-high' : state === 'unreadable' ? '' : 'sev-medium';
+            const notes = [];
+            const relay = Array.isArray(d.relay) ? d.relay.filter(h => h && typeof h === 'object') : [];
+            if (relay.length) {
+                notes.push('via relay ' + relay.map(h => `${syscallHex(h.address)} (${h.owner || 'unresolved'}${h.pattern ? ', ' + h.pattern : ''})`).join(' → '));
+            }
+            if (d.number_matches === false) notes.push(`loads number ${syscallHex(d.live_number)} of another syscall, the baseline has ${syscallHex(d.number)}`);
+            if (state === 'hooked' && d.allowlisted === true) notes.push('on the hook allowlist, not scored');
+            html += '<tr>'
+                + `<td>${escapeHtml(String(d.name ?? ''))}</td>`
+                + `<td><span class="mem-chip ${cls}">${escapeHtml(state)}</span></td>`
+                + `<td>${state === 'unreadable' ? '' : syscallOwnerHtml(d.target_owner)}</td>`
+                + `<td>${escapeHtml(String(d.pattern || ''))}</td>`
+                + `<td>${escapeHtml(notes.join('; '))}</td></tr>`;
+        });
+        html += '</tbody></table>';
+    }
+    return html + _detRawButton('View Syscalls raw', sc);
 }
 
 // --- On-demand scans from the process views ---
