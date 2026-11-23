@@ -566,7 +566,7 @@ def test_the_curated_edge_and_the_match_do_not_look_like_a_deviation():
 
 def test_the_assets_moved_on():
     html = _read(INDEX_HTML)
-    for asset, minimum in (("style.css", 89), ("theme-cyberpunk.css", 38), ("app.js", 142)):
+    for asset, minimum in (("style.css", 89), ("theme-cyberpunk.css", 38), ("app.js", 143)):
         version = int(re.search(rf"{re.escape(asset)}\?v=(\d+)", html).group(1))
         assert version >= minimum, f"{asset} was changed and kept its ?v="
 
@@ -580,10 +580,12 @@ EXPLORE_CONSTS = ["graphState"]
 EXPLORE_IDS = ["binary-graph-path", "binary-explore", "binary-graph-mode-path", "binary-graph-mode-explore", "binary-explore-start",
                "binary-explore-status", "binary-explore-stage", "binary-explore-canvas", "binary-explore-info",
                "binary-explore-legend", "binary-explore-expand", "binary-explore-zoom", "binary-explore-depth-1",
-               "binary-explore-depth-2", "binary-explore-depth-3"]
+               "binary-explore-depth-2", "binary-explore-depth-3", "binary-graph-legend", "binary-graph-status", "binary-graph-canvas"]
 
 # The page of the explore view, a canvas that writes down what is drawn on it (the last frame: clearRect starts it
-# again), and a small graph of System32 behind /api/binary-graph/node as the server answers it
+# again), and the binary graph behind /api/binary-graph/node and /api/binary-graph/query answering the way the server
+# does: an `imports` answer has the module and one function node per import, an `importers` answer the module and one
+# node per importer (with the api set it imports through), both cut whole at 400 nodes with `truncated` and `total`
 EXPLORE_DOM = r"""
 for (const id of __IDS__) els[id] = Object.assign(new Node(id.endsWith('canvas') ? 'canvas' : 'div'), { id });
 els['binary-explore'].hidden = true;
@@ -619,31 +621,86 @@ const frame = () => {
 };
 const st = binaryGraphExplore;
 const at = id => st.nodes.find(n => n.id === id);
+const drawnIds = () => st.nodes.map(n => n.id).sort();
 // the drawn disc of a node, found by where it is
 const discOf = (f, id) => { const n = at(id); const found = f.discs.filter(d => d.x === n.x && d.y === n.y); return found.length === 1 ? found[0] : null; };
 const screenOf = id => { const n = at(id), c = st.camera; return { offsetX: n.x * c.zoom + c.x, offsetY: n.y * c.zoom + c.y }; };
+const queries = (from = 0) => requests.slice(from).filter(q => q.url.startsWith('/api/binary-graph/query')).map(q => Object.fromEntries(new URL(q.url, 'http://x').searchParams));
 const GRAPH = {
-  'app.exe': { kind: 'exe', in_degree: 0, imports: { 'kernel32.dll': ['CreateFileW', 'CloseHandle'], 'ntdll.dll': ['NtClose'], 'user32.dll': ['MessageBoxW'] } },
-  'kernel32.dll': { kind: 'dll', in_degree: 3900, machine: 'ARM64',
-    imports: { 'kernelbase.dll': ['CreateFileW'], 'ntdll.dll': ['NtClose', 'RtlFoo'], 'api-ms-win-core-handle-l1-1-0.dll': ['CloseHandle'] },
-    forwarders: { HeapAlloc: { raw: 'NTDLL.RtlAllocateHeap', reason: 'defined', module: 'ntdll.dll', function: 'RtlAllocateHeap', partial: false } } },
-  'ntdll.dll': { kind: 'dll', in_degree: 4000, imports: {} },
-  'kernelbase.dll': { kind: 'dll', in_degree: 3500, imports: { 'ntdll.dll': ['NtClose'] } },
-  'user32.dll': { kind: 'dll', in_degree: 2000, imports: { 'win32u.dll': ['NtUserFoo'], 'gdi32.dll': ['GetDC'] } },
-  'win32u.dll': { kind: 'dll', in_degree: 1500, imports: { 'ntdll.dll': ['NtClose'] } },
-  'gdi32.dll': { kind: 'dll', in_degree: 1800, imports: { 'gdi32full.dll': ['GdiFoo'] } },
-  'gdi32full.dll': { kind: 'dll', in_degree: 899, imports: {} },
-  'api-ms-win-core-handle-l1-1-0.dll': { is: 'api-set', kind: 'api-set', in_degree: 900, hosts: ['kernelbase.dll'] },
+  'app.exe': { in_degree: 0, imports: { 'kernel32.dll': ['CreateFileW', 'CloseHandle'], 'ntdll.dll': ['NtClose'], 'user32.dll': ['MessageBoxW'] } },
+  'kernel32.dll': { in_degree: 3900, machine: 'ARM64',
+    imports: { 'kernelbase.dll': ['CreateFileW'], 'ntdll.dll': ['NtClose', 'RtlFoo'], 'api-ms-win-core-handle-l1-1-0.dll': ['CloseHandle'] } },
+  'ntdll.dll': { in_degree: 4000, imports: {} },
+  'kernelbase.dll': { in_degree: 3500, imports: { 'ntdll.dll': ['NtClose'] } },
+  'user32.dll': { in_degree: 2000, imports: { 'win32u.dll': ['NtUserFoo'], 'gdi32.dll': ['GetDC'] } },
+  'win32u.dll': { in_degree: 1500, imports: { 'ntdll.dll': ['NtClose'] } },
+  'gdi32.dll': { in_degree: 1800, imports: {} },
+  'api-ms-win-core-handle-l1-1-0.dll': { is: 'api-set', in_degree: 900, hosts: ['kernelbase.dll'] },
 };
 const nodeRoute = (url) => {
   let name = new URL(url, 'http://x').searchParams.get('name').trim().toLowerCase();
   if (!/[.](dll|exe)$/.test(name)) name += '.dll';
   const g = GRAPH[name];
   if (!g) return { status: 404, body: { error: name + ' is neither a binary nor an api set in the binary graph of this system.', in_degree: 0 } };
-  return { body: { name, is: g.is || 'binary', kind: g.kind || 'dll', machine: g.machine || '', in_degree: g.in_degree, partial: false,
-                   imports: g.imports || {}, exports: [], forwarders: g.forwarders || {}, hosts: g.hosts || [], build: '26220.5770' } };
+  return { body: { name, is: g.is || 'binary', kind: g.is === 'api-set' ? 'api-set' : /[.]exe$/.test(name) ? 'exe' : 'dll', machine: g.machine || '',
+                   in_degree: g.in_degree, partial: false, imports: g.imports || {}, exports: [], forwarders: {}, hosts: g.hosts || [] } };
+};
+const modNode = name => { const g = GRAPH[name] || {}; return { id: name, label: name, kind: g.is === 'api-set' ? 'api-set' : /[.]exe$/.test(name) ? 'exe' : 'dll', in_degree: g.in_degree || 0, category: '' }; };
+const STAMP = { build: '26220.5770', arch: 'arm64', created: '' };
+const cutAnswer = (fixed, parts, note, what) => {
+  const nodes = new Map(), edges = new Map(), roots = [];
+  const take = p => { for (const n of p.nodes) if (!nodes.has(n.id)) nodes.set(n.id, n);
+                      for (const e of p.edges) edges.set([e.source, e.target, e.kind, e.label].join('|'), e);
+                      for (const r of p.roots) if (!roots.includes(r)) roots.push(r); };
+  take(fixed); let kept = 0;
+  for (const p of parts) { if (nodes.size + p.nodes.filter(n => !nodes.has(n.id)).length > 400) break; take(p); kept++; }
+  const truncated = kept < parts.length;
+  if (truncated) note += ' Only the first ' + kept + ' of ' + parts.length + ' ' + what + ' are drawn: an answer is cut at 400 nodes.';
+  return { nodes: [...nodes.values()], edges: [...edges.values()], truncated, note, roots, total: parts.length, ...STAMP };
+};
+const none = note => ({ nodes: [], edges: [], truncated: false, note, roots: [], total: 0, ...STAMP });
+const derived = (source, target, kind, label) => ({ source, target, kind, origin: 'derived', label });
+const importsOf = name => {
+  const g = GRAPH[name];
+  if (!g || g.is === 'api-set') return none(name + ' is not in the binary graph of this system.');
+  const parts = [];
+  for (const [imported, names] of Object.entries(g.imports || {})) for (const fn of names) {
+    const id = imported + '!' + fn;
+    parts.push({ nodes: [{ id, label: fn, kind: 'function', in_degree: 0, category: '' }], edges: [derived(name, id, 'imports', imported)], roots: [] });
+  }
+  if (!parts.length) return none(name + ' imports nothing.');
+  return cutAnswer({ nodes: [modNode(name)], edges: [], roots: [name] }, parts, name + ' imports ' + parts.length + ' functions.', 'imported functions');
+};
+const importersOf = (target, fn) => {
+  const t = GRAPH[target];
+  if (!t) return none(target + ' is not in the binary graph of this system, and no binary in it imports it.');
+  const aliases = t.is === 'api-set' ? [] : Object.keys(GRAPH).filter(a => GRAPH[a].is === 'api-set' && (GRAPH[a].hosts || []).includes(target));
+  const parts = [];
+  for (const name of Object.keys(GRAPH).sort()) {
+    const g = GRAPH[name];
+    if (g.is === 'api-set') continue;
+    const part = { nodes: [modNode(name)], edges: [], roots: [] };
+    for (const [imported, names] of Object.entries(g.imports || {})) {
+      if (fn && !names.includes(fn)) continue;
+      if (imported === target) part.edges.push(derived(name, target, 'imports', fn || ''));
+      else if (aliases.includes(imported)) {
+        part.nodes.push(modNode(imported));
+        part.edges.push(derived(name, imported, 'imports', fn || ''), derived(imported, target, 'resolves_to', fn || ''));
+      }
+    }
+    if (part.edges.length) parts.push(part);
+  }
+  if (!parts.length) return none('No binary in the graph imports ' + (fn ? fn + ' from ' : '') + target + '.');
+  return cutAnswer({ nodes: [modNode(target)], edges: [], roots: [target] }, parts, parts.length + ' binaries import ' + target + '.', 'binaries that import it');
+};
+const queryRoute = url => {
+  const q = new URL(url, 'http://x').searchParams, module = (q.get('module') || '').toLowerCase();
+  if (q.get('q') === 'imports') return { body: importsOf(module) };
+  if (q.get('q') === 'importers') return { body: importersOf(module, q.get('function') || '') };
+  return { status: 400, body: { error: 'q must be one of importers, imports' } };
 };
 routes['/api/binary-graph/node'] = nodeRoute;
+routes['/api/binary-graph/query'] = queryRoute;
 """.replace("__IDS__", "[" + ", ".join(f"'{i}'" for i in EXPLORE_IDS) + "]")
 
 
@@ -752,40 +809,68 @@ def test_the_mode_switch_shows_one_view_and_refuses_a_mode_it_does_not_have():
 
 
 @needs_node
+def test_expanding_ntdll_draws_who_imports_it_where_a_forward_only_expansion_saw_nothing():
+    # ntdll imports nothing, and is the most interesting node of the graph: its neighbours are its importers
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        await binaryGraphExploreStart('ntdll.dll');
+        const asked = requests.length;
+        const outgoing = importsOf('ntdll.dll');
+        const opened = await binaryGraphExpand('ntdll.dll');
+        out({ opened, outgoing: { nodes: outgoing.nodes.length, note: outgoing.note }, queries: queries(asked), ids: drawnIds(),
+              edges: st.edges.map(e => [e.source, e.target, e.kind, e.origin]),
+              kinds: Object.fromEntries(st.nodes.map(n => [n.id, [n.kind, n.in_degree]])), status: els['binary-explore-status'].innerHTML });
+      })();""")
+    assert r["outgoing"] == {"nodes": 0, "note": "ntdll.dll imports nothing."}, "the case that was blind: nothing goes out of ntdll"
+    assert r["opened"] is True
+    assert r["queries"] == [{"q": "imports", "module": "ntdll.dll"}, {"q": "importers", "module": "ntdll.dll"}]
+    assert r["ids"] == ["app.exe", "kernel32.dll", "kernelbase.dll", "ntdll.dll", "win32u.dll"]
+    assert sorted(r["edges"]) == sorted([[i, "ntdll.dll", "imports", "derived"] for i in ("app.exe", "kernel32.dll", "kernelbase.dll", "win32u.dll")])
+    # size and colour came with the answer: no query asked for them
+    assert r["kinds"]["kernel32.dll"] == ["dll", 3900] and r["kinds"]["app.exe"] == ["exe", 0] and r["kinds"]["ntdll.dll"] == ["dll", 4000]
+    assert r["status"] == ""
+
+
+@needs_node
 def test_expanding_a_node_adds_its_neighbours_and_keeps_what_is_already_drawn():
     r = _explore_flow(r"""
       (async () => {
         initSyscalls(); binaryGraphSetMode('explore');
         await binaryGraphExploreStart('app.exe');
-        const before = { x: at('app.exe').x, y: at('app.exe').y };
+        const before = { x: at('app.exe').x, y: at('app.exe').y }, asked = requests.length;
         const one = await binaryGraphExpand('app.exe');
-        const afterOne = { ids: st.nodes.map(n => n.id).sort(), edges: st.edges.length, app: { x: at('app.exe').x, y: at('app.exe').y } };
-        const placed = Object.fromEntries(st.nodes.map(n => [n.id, [n.x, n.y]]));
-        const asked = requests.length;
-        const two = await binaryGraphExpand('kernel32.dll');
+        const afterOne = { ids: drawnIds(), edges: st.edges.map(e => [e.source, e.target, e.kind, e.label]), app: { x: at('app.exe').x, y: at('app.exe').y },
+                           queries: queries(asked), kinds: [...new Set(st.nodes.map(n => n.kind))].sort() };
+        const placed = Object.fromEntries(st.nodes.map(n => [n.id, [n.x, n.y]])), askedAgain = requests.length;
+        // a function is opened by who imports it: its edges end at the function, not at the module it is of
+        const two = await binaryGraphExpand('ntdll.dll!NtClose');
+        const askedTwo = queries(askedAgain);
         const moved = st.nodes.filter(n => placed[n.id] && (placed[n.id][0] !== n.x || placed[n.id][1] !== n.y)).map(n => n.id);
-        const edges = st.edges.map(e => [e.source, e.target, e.kind, e.origin]);
+        const edges = st.edges.map(e => [e.source, e.target, e.kind, e.label]);
         // the same node twice gives no node and no edge twice
-        await binaryGraphExpand('kernel32.dll');
-        out({ before, one, afterOne, two, moved, ids: st.nodes.map(n => n.id).sort(), edges, again: [st.nodes.length, st.edges.length],
-              askedForTheSecond: requests.slice(asked).map(q => new URL(q.url, 'http://x').searchParams.get('name')),
-              kinds: Object.fromEntries(st.nodes.map(n => [n.id, n.kind])), frame: frame() });
+        await binaryGraphExpand('ntdll.dll!NtClose');
+        out({ before, one, afterOne, two, moved, ids: drawnIds(), edges, again: [st.nodes.length, st.edges.length],
+              asked: askedTwo, frame: frame(), in_degree: at('kernel32.dll').in_degree });
       })();""")
+    one = r["afterOne"]
     assert r["one"] is True and r["two"] is True
-    assert r["afterOne"]["ids"] == ["app.exe", "kernel32.dll", "ntdll.dll", "user32.dll"] and r["afterOne"]["edges"] == 3
-    assert r["afterOne"]["app"] == r["before"], "the node that was opened stays where it was"
+    assert one["ids"] == ["app.exe", "kernel32.dll!CloseHandle", "kernel32.dll!CreateFileW", "ntdll.dll!NtClose", "user32.dll!MessageBoxW"]
+    assert sorted(one["edges"]) == sorted([["app.exe", "kernel32.dll!CloseHandle", "imports", "kernel32.dll"],
+                                           ["app.exe", "kernel32.dll!CreateFileW", "imports", "kernel32.dll"],
+                                           ["app.exe", "ntdll.dll!NtClose", "imports", "ntdll.dll"],
+                                           ["app.exe", "user32.dll!MessageBoxW", "imports", "user32.dll"]])
+    assert one["kinds"] == ["exe", "function"]
+    assert one["queries"] == [{"q": "imports", "module": "app.exe"}, {"q": "importers", "module": "app.exe"}], "two queries, both directions"
+    assert one["app"] == r["before"], "the node that was opened stays where it was"
     assert r["moved"] == [], "expanding a second node moves none of what was drawn"
-    assert r["ids"] == sorted(["api-ms-win-core-handle-l1-1-0.dll", "app.exe", "kernel32.dll", "kernelbase.dll", "ntdll.dll", "user32.dll"])
-    assert sorted(r["edges"]) == sorted([
-        ["app.exe", "kernel32.dll", "imports", "derived"], ["app.exe", "ntdll.dll", "imports", "derived"],
-        ["app.exe", "user32.dll", "imports", "derived"], ["kernel32.dll", "kernelbase.dll", "imports", "derived"],
-        ["kernel32.dll", "ntdll.dll", "imports", "derived"], ["kernel32.dll", "ntdll.dll", "forwards_to", "derived"],
-        ["kernel32.dll", "api-ms-win-core-handle-l1-1-0.dll", "imports", "derived"]])
-    assert r["again"] == [6, 7]
-    # kernel32 and ntdll were read already: only the two new neighbours are asked for, once each
-    assert sorted(r["askedForTheSecond"]) == ["api-ms-win-core-handle-l1-1-0.dll", "kernelbase.dll"]
-    assert r["kinds"]["api-ms-win-core-handle-l1-1-0.dll"] == "api-set" and r["kinds"]["app.exe"] == "exe"
-    assert len(r["frame"]["discs"]) == 6 and len(r["frame"]["lines"]) == 7
+    assert r["asked"] == [{"q": "importers", "module": "ntdll.dll", "function": "NtClose"}]
+    assert r["ids"] == sorted(one["ids"] + ["kernel32.dll", "kernelbase.dll", "win32u.dll"]), "the module of the function is not drawn, its importers are"
+    assert ["kernel32.dll", "ntdll.dll!NtClose", "imports", "NtClose"] in r["edges"]
+    assert r["edges"].count(["app.exe", "ntdll.dll!NtClose", "imports", "ntdll.dll"]) == 1 and len(r["edges"]) == 7
+    assert r["again"] == [8, 7]
+    assert r["in_degree"] == 3900
+    assert len(r["frame"]["discs"]) == 8 and len(r["frame"]["lines"]) == 7
 
 
 @needs_node
@@ -796,16 +881,71 @@ def test_the_depth_says_how_many_hops_an_expansion_opens():
         const seen = {};
         for (const depth of [1, 2, 3]) {
           binaryGraphSetDepth(depth);
-          await binaryGraphExploreStart('app.exe');
-          await binaryGraphExpand('app.exe');
-          seen[depth] = st.nodes.map(n => n.id).sort();
+          await binaryGraphExploreStart('kernelbase.dll');
+          const asked = requests.length;
+          await binaryGraphExpand('kernelbase.dll');
+          seen[depth] = { ids: drawnIds(), queries: queries(asked).length };
         }
         out(seen);
       })();""")
-    base = ["app.exe", "kernel32.dll", "ntdll.dll", "user32.dll"]
-    assert r["1"] == base
-    assert r["2"] == sorted(base + ["api-ms-win-core-handle-l1-1-0.dll", "gdi32.dll", "kernelbase.dll", "win32u.dll"])
-    assert r["3"] == sorted(base + ["api-ms-win-core-handle-l1-1-0.dll", "gdi32.dll", "kernelbase.dll", "win32u.dll", "gdi32full.dll"])
+    one = ["api-ms-win-core-handle-l1-1-0.dll", "kernel32.dll", "kernelbase.dll", "ntdll.dll!NtClose"]
+    two = sorted(one + ["app.exe", "ntdll.dll!RtlFoo", "kernelbase.dll!CreateFileW", "api-ms-win-core-handle-l1-1-0.dll!CloseHandle"])
+    three = sorted(two + ["kernel32.dll!CloseHandle", "kernel32.dll!CreateFileW", "user32.dll!MessageBoxW"])
+    assert r["1"]["ids"] == one
+    assert r["2"]["ids"] == two, "the second hop opens the modules the first drew, and only them"
+    assert r["3"]["ids"] == three
+    assert [r[d]["queries"] for d in "123"] == [2, 5, 7]
+
+
+@needs_node
+def test_a_deeper_expansion_stops_when_the_canvas_is_full_and_says_so():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        GRAPH['hub.dll'] = { in_degree: 450, imports: {} };
+        for (let i = 0; i < 450; i++) GRAPH['c' + String(i).padStart(3, '0') + '.dll'] = { in_degree: 1, imports: { 'hub.dll': ['F'] } };
+        binaryGraphSetDepth(2);
+        await binaryGraphExploreStart('hub.dll');
+        const asked = requests.length;
+        await binaryGraphExpand('hub.dll');
+        out({ count: st.nodes.length, queries: queries(asked), note: st.note });
+      })();""")
+    assert r["count"] == 400 and len(r["queries"]) == 2, "the second hop asked for nothing: there is no room to draw it"
+    assert "stopped because the canvas is full" in r["note"] and "399 nodes" in r["note"] and "not opened" in r["note"], r["note"]
+
+
+@needs_node
+def test_a_deep_walk_stops_after_its_budget_of_queries_and_says_how_much_it_left():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        GRAPH['pool.dll'] = { in_degree: 100, imports: {} };
+        for (let i = 0; i < 100; i++) GRAPH['p' + String(i).padStart(3, '0') + '.dll'] = { in_degree: 1, imports: { 'pool.dll': ['F'] } };
+        binaryGraphSetDepth(2);
+        await binaryGraphExploreStart('pool.dll');
+        const asked = requests.length;
+        await binaryGraphExpand('pool.dll');
+        out({ queries: queries(asked).length, note: st.note, status: els['binary-explore-status'].innerHTML });
+      })();""")
+    assert r["queries"] == 60, "two for the first hop, two for each of 29 modules of the second"
+    assert "after 60 queries" in r["note"] and "71 nodes" in r["note"] and "not opened" in r["note"], r["note"]
+    assert "71 nodes" in _plain(r["status"])
+
+
+@needs_node
+def test_a_canvas_with_room_for_only_some_of_both_directions_gives_each_its_share():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        GRAPH['mix.dll'] = { in_degree: 300, imports: { 'lib.dll': [...Array(300)].map((_, i) => 'F' + String(i).padStart(3, '0')) } };
+        for (let i = 0; i < 300; i++) GRAPH['i' + String(i).padStart(3, '0') + '.dll'] = { in_degree: 1, imports: { 'mix.dll': ['G'] } };
+        await binaryGraphExploreStart('mix.dll');
+        await binaryGraphExpand('mix.dll');
+        out({ count: st.nodes.length, functions: st.nodes.filter(n => n.kind === 'function').length,
+              importers: st.nodes.filter(n => n.id.startsWith('i')).length, status: _plain(els['binary-explore-status'].innerHTML) });
+      })();""".replace("_plain(", "(h => h.replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim())("))
+    assert r["count"] == 400 and r["functions"] == 199 and r["importers"] == 200, "neither direction starves the other"
+    assert "201 neighbours are not shown" in r["status"] and "of 1 opened node" in r["status"] and "400 nodes" in r["status"], r["status"]
 
 
 @needs_node
@@ -813,14 +953,13 @@ def test_the_node_size_follows_the_in_degree_so_the_most_imported_dll_is_the_lar
     r = _explore_flow(r"""
       (async () => {
         initSyscalls(); binaryGraphSetMode('explore');
-        binaryGraphSetDepth(2);
-        await binaryGraphExploreStart('app.exe'); await binaryGraphExpand('app.exe');
+        await binaryGraphExploreStart('ntdll.dll'); await binaryGraphExpand('ntdll.dll');
         const f = frame();
         out({ f: f.discs.length, rows: st.nodes.map(n => ({ id: n.id, degree: n.in_degree, disc: discOf(f, n.id) })) });
       })();""")
     rows = r["rows"]
     # the shape first: every node has exactly one disc, and the in-degrees really differ
-    assert len(rows) == 8 and r["f"] == 8 and all(row["disc"] for row in rows)
+    assert len(rows) == 5 and r["f"] == 5 and all(row["disc"] for row in rows)
     assert len({row["degree"] for row in rows}) == len(rows), "a test of the size needs nodes of different in-degree"
     by_degree = sorted(rows, key=lambda row: row["degree"])
     radii = [row["disc"]["r"] for row in by_degree]
@@ -853,23 +992,23 @@ def test_an_answer_that_hit_the_node_cap_says_so_on_the_canvas():
     r = _explore_flow(r"""
       (async () => {
         initSyscalls(); binaryGraphSetMode('explore');
-        const name = i => 'm' + String(i).padStart(3, '0') + '.dll';
-        GRAPH['big.dll'] = { kind: 'dll', in_degree: 1, imports: Object.fromEntries([...Array(450)].map((_, i) => [name(i), ['F']])) };
-        for (let i = 0; i < 450; i++) GRAPH[name(i)] = { kind: 'dll', in_degree: i, imports: {} };
-        GRAPH['m010.dll'].imports = { 'z0.dll': ['F'], 'z1.dll': ['F'], 'z2.dll': ['F'], 'z3.dll': ['F'], 'z4.dll': ['F'] };
-        GRAPH['m011.dll'].imports = { 'm000.dll': ['F'] };
-        await binaryGraphExploreStart('big.dll');
+        const name = i => 'c' + String(i).padStart(3, '0') + '.dll';
+        GRAPH['hub.dll'] = { in_degree: 450, imports: {} };
+        for (let i = 0; i < 450; i++) GRAPH[name(i)] = { in_degree: 1, imports: { 'hub.dll': ['F'] } };
+        GRAPH['c010.dll'].imports = { 'hub.dll': ['F'], 'z.dll': ['Z0', 'Z1', 'Z2', 'Z3', 'Z4'] };
+        GRAPH['c011.dll'].imports = { 'hub.dll': ['F'], 'c012.dll': ['G'] };
+        await binaryGraphExploreStart('hub.dll');
         const quiet = { texts: frame().texts, status: els['binary-explore-status'].innerHTML, hidden: els['binary-explore-status'].hidden };
-        await binaryGraphExpand('big.dll');
+        await binaryGraphExpand('hub.dll');
         const cut = { count: st.nodes.length, edges: st.edges.length, texts: frame().texts, discs: frame().discs.length,
                       status: els['binary-explore-status'].innerHTML, hidden: els['binary-explore-status'].hidden,
-                      last: st.nodes[st.nodes.length - 1].id, has399: !!at('m399.dll'), has398: !!at('m398.dll') };
-        // opening more of a canvas that is full draws no node, and says how many did not fit
-        await binaryGraphExpand('m010.dll');
-        const again = { count: st.nodes.length, z0: !!at('z0.dll'), status: els['binary-explore-status'].innerHTML, texts: frame().texts };
+                      last: st.nodes[st.nodes.length - 1].id, has399: !!at(name(399)), has398: !!at(name(398)) };
+        // opening more of a canvas that is full draws no node, and says how many did not fit, on top of the server's cut
+        await binaryGraphExpand('c010.dll');
+        const again = { count: st.nodes.length, z0: !!at('z.dll!Z0'), status: els['binary-explore-status'].innerHTML, texts: frame().texts };
         // an edge between two nodes that are drawn needs no new node, so it is drawn
-        await binaryGraphExpand('m011.dll');
-        const edge = { count: st.nodes.length, drawn: st.edges.some(e => e.source === 'm011.dll' && e.target === 'm000.dll') };
+        await binaryGraphExpand('c012.dll');
+        const edge = { count: st.nodes.length, drawn: st.edges.some(e => e.source === 'c011.dll' && e.target === 'c012.dll' && e.kind === 'imports') };
         // starting over empties the cut
         await binaryGraphExploreStart('app.exe');
         out({ quiet, cut, again, edge, over: { texts: frame().texts, status: els['binary-explore-status'].innerHTML } });
@@ -877,15 +1016,17 @@ def test_an_answer_that_hit_the_node_cap_says_so_on_the_canvas():
     assert not any("not shown" in t for t in r["quiet"]["texts"]) and r["quiet"]["hidden"] is True, "a whole answer does not claim to be cut"
     cut = r["cut"]
     assert cut["count"] == 400 and cut["edges"] == 399 and cut["discs"] == 400
-    assert cut["has398"] and not cut["has399"] and cut["last"] == "m398.dll", "the first parts in name order are kept"
+    assert cut["has398"] and not cut["has399"] and cut["last"] == "c398.dll", "the first parts in name order are kept"
     banner = [t for t in cut["texts"] if "not shown" in t]
     assert len(banner) == 1 and "400" in banner[0] and "51" in banner[0], banner
     status = _plain(cut["status"])
-    assert cut["hidden"] is False and "51" in status and "400" in status and "not shown" in status and "does not mean" in status, status
+    assert cut["hidden"] is False and "51 neighbours are not shown" in status and "cut by the server" in status, status
+    assert "does not mean" in status and "not shown" in status and "did not fit" not in status, "nothing of this canvas's own was dropped yet"
     again = r["again"]
     assert again["count"] == 400 and not again["z0"], "a full canvas stays at its cap"
-    assert any("56" in t for t in again["texts"] if "not shown" in t), "the nodes that did not fit are counted together: 51 and 5"
-    assert "2 nodes" in _plain(again["status"])
+    assert any("57" in t for t in again["texts"] if "not shown" in t), "the server's 51 and the 6 that did not fit are counted together"
+    text = _plain(again["status"])
+    assert "of 2 opened nodes" in text and "51 were cut by the server" in text and "6 did not fit on this canvas, which holds at most 400 nodes" in text, text
     assert r["edge"] == {"count": 400, "drawn": True}
     assert not any("not shown" in t for t in r["over"]["texts"]) and r["over"]["status"] == ""
 
@@ -895,28 +1036,28 @@ def test_the_edges_of_the_selected_node_are_drawn_apart_from_the_others():
     r = _explore_flow(r"""
       (async () => {
         initSyscalls(); binaryGraphSetMode('explore');
-        await binaryGraphExploreStart('app.exe'); await binaryGraphExpand('app.exe'); await binaryGraphExpand('kernel32.dll');
+        await binaryGraphExploreStart('ntdll.dll'); await binaryGraphExpand('ntdll.dll'); await binaryGraphExpand('app.exe');
         // the lines of a frame are in the order of the edges
-        const near = st.edges.map(e => e.source === 'kernel32.dll' || e.target === 'kernel32.dll');
+        const near = st.edges.map(e => e.source === 'ntdll.dll' || e.target === 'ntdll.dll');
         const split = f => ({ near: f.lines.filter((_, i) => near[i]), rest: f.lines.filter((_, i) => !near[i]) });
         st.selected = null; binaryGraphDraw();
-        const none = split(frame());
+        const alike = split(frame());
         // a click on the node chooses it; a click on nothing lets go
-        const clicked = binaryGraphOnCanvasClick(screenOf('kernel32.dll'));
+        const clicked = binaryGraphOnCanvasClick(screenOf('ntdll.dll'));
         const chosen = split(frame()), rings = frame().rings, info = [els['binary-explore-info'].innerHTML, els['binary-explore-expand'].disabled];
         const cleared = binaryGraphOnCanvasClick({ offsetX: 599, offsetY: 399 });
-        out({ clicked, selected: st.selected, cleared, none, chosen, rings, after: frame().rings, info, lines: frame().lines.length });
+        out({ clicked, selected: st.selected, cleared, alike, chosen, rings, after: frame().rings, info, lines: frame().lines.length });
       })();""")
     assert r["clicked"] is True and r["cleared"] is False and r["selected"] is None
-    none, chosen = r["none"], r["chosen"]
-    assert len(chosen["near"]) == 5 and len(chosen["rest"]) == 2, "the shape first: kernel32 has five edges, two others are not its"
-    assert len(none["near"]) == 5 and len(none["rest"]) == 2
-    assert len({(l["width"], l["alpha"]) for l in none["near"] + none["rest"]}) == 1, "with nothing chosen every edge is drawn alike"
+    alike, chosen = r["alike"], r["chosen"]
+    assert len(chosen["near"]) == 4 and len(chosen["rest"]) == 4, "the shape first: four importers of ntdll, four imports of app.exe"
+    assert len(alike["near"]) == 4 and len(alike["rest"]) == 4
+    assert len({(l["width"], l["alpha"]) for l in alike["near"] + alike["rest"]}) == 1, "with nothing chosen every edge is drawn alike"
     assert min(l["width"] for l in chosen["near"]) > max(l["width"] for l in chosen["rest"])
     assert all(l["alpha"] == 1 for l in chosen["near"]) and all(l["alpha"] < 1 for l in chosen["rest"])
     assert len(r["rings"]) == 1 and r["after"] == [], "the chosen node has a ring, and only while it is chosen"
-    assert "kernel32.dll" in r["info"][0] and r["info"][1] is False
-    assert r["lines"] == 7
+    assert "ntdll.dll" in r["info"][0] and r["info"][1] is False
+    assert r["lines"] == 8
 
 
 @needs_node
@@ -935,15 +1076,41 @@ def test_the_dash_of_the_curated_and_the_unknown_edge_survives_on_the_explore_ca
     assert curated[0] == "--graph-edge-curated" and derived[0] != unknown[0]
 
 
+def _legend_rows(html):
+    return {e["attrs"]["data-legend"] for e in _Elements(html).elements if "data-legend" in e["attrs"]}
+
+
+@needs_node
+def test_the_legend_of_the_explore_view_names_only_what_the_explore_canvas_can_draw():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls();
+        const edge = origin => ({ source: 'a', target: 'b', kind: 'imports', origin, label: '' });
+        binaryGraphSetMode('explore');
+        await binaryGraphExploreStart('ntdll.dll'); await binaryGraphExpand('ntdll.dll');
+        const onPage = els['binary-explore-legend'].innerHTML;
+        out({ path: binaryGraphLegend(), pathExplicit: binaryGraphLegend('path', []), onPage,
+              explore: binaryGraphLegend('explore', []), curated: binaryGraphLegend('explore', [edge('curated'), edge('derived')]),
+              unknown: binaryGraphLegend('explore', [edge('mystery')]), pathLegend: (binaryGraphSetMode('path'), els['binary-graph-legend'].innerHTML) });
+      })();""")
+    everything = {"node-dll", "node-exe", "node-api-set", "node-function", "node-syscall", "edge-derived", "edge-curated", "edge-unknown", "deviation", "match"}
+    assert _legend_rows(r["path"]) == everything and r["path"] == r["pathExplicit"], "the path view's legend is as it was"
+    assert _legend_rows(r["pathLegend"]) == everything
+    assert _legend_rows(r["explore"]) == {"node-dll", "node-exe", "node-api-set", "node-function", "edge-derived"}
+    assert _legend_rows(r["onPage"]) == _legend_rows(r["explore"]), "the page shows what the function says"
+    assert _legend_rows(r["curated"]) == _legend_rows(r["explore"]) | {"edge-curated"}, "an edge of the curated origin is explained where one is drawn"
+    assert _legend_rows(r["unknown"]) == _legend_rows(r["explore"]) | {"edge-unknown"}
+
+
 @needs_node
 def test_dragging_moves_one_node_or_the_view_and_the_click_that_ends_a_drag_selects_nothing():
     r = _explore_flow(r"""
       (async () => {
         initSyscalls(); binaryGraphSetMode('explore');
-        await binaryGraphExploreStart('app.exe'); await binaryGraphExpand('app.exe');
+        await binaryGraphExploreStart('ntdll.dll'); await binaryGraphExpand('ntdll.dll');
         const was = Object.fromEntries(st.nodes.map(n => [n.id, [n.x, n.y]]));
         st.selected = null;
-        const from = screenOf('user32.dll'), cam = { ...st.camera };
+        const from = screenOf('kernel32.dll'), cam = { ...st.camera };
         binaryGraphOnCanvasDown(from); binaryGraphOnCanvasMove({ offsetX: from.offsetX + 40, offsetY: from.offsetY + 20 });
         binaryGraphOnCanvasUp(); const dragged = binaryGraphOnCanvasClick({ offsetX: from.offsetX + 40, offsetY: from.offsetY + 20 });
         const moved = st.nodes.filter(n => n.x !== was[n.id][0] || n.y !== was[n.id][1]).map(n => n.id);
@@ -960,7 +1127,7 @@ def test_dragging_moves_one_node_or_the_view_and_the_click_that_ends_a_drag_sele
         const zoomed = st.camera.zoom; binaryGraphZoom(0.5); const smaller = st.camera.zoom; binaryGraphFit();
         out({ moved, dragged, afterDrag, panned, z0, zoomed, smaller, fitted: st.camera.zoom, label: els['binary-explore-zoom'].textContent });
       })();""")
-    assert r["moved"] == ["user32.dll"] and r["dragged"] is False
+    assert r["moved"] == ["kernel32.dll"] and r["dragged"] is False
     assert r["afterDrag"]["selected"] is None and r["afterDrag"]["camera"] == r["afterDrag"]["cam"]
     assert r["panned"] == {"x": 30, "y": 10, "zoom": 0}
     assert r["zoomed"] > r["z0"] and r["smaller"] < r["zoomed"] and 0.1 <= r["fitted"] <= 2
@@ -981,16 +1148,16 @@ def test_the_process_graph_state_is_untouched_by_a_binary_graph_render():
         const camera = graphState.camera, nodes = graphState.nodes, before = key();
         seen.length = 0;
         binaryGraphSetMode('explore'); binaryGraphSetDepth(2);
-        await binaryGraphExploreStart('app.exe'); await binaryGraphExpand('app.exe');
+        await binaryGraphExploreStart('ntdll.dll'); await binaryGraphExpand('ntdll.dll');
         binaryGraphOnCanvasClick(screenOf('kernel32.dll'));
-        binaryGraphOnCanvasDown(screenOf('user32.dll')); binaryGraphOnCanvasMove({ offsetX: 10, offsetY: 10 }); binaryGraphOnCanvasUp();
+        binaryGraphOnCanvasDown(screenOf('app.exe')); binaryGraphOnCanvasMove({ offsetX: 10, offsetY: 10 }); binaryGraphOnCanvasUp();
         binaryGraphOnCanvasWheel({ offsetX: 300, offsetY: 200, deltaY: 100, preventDefault() {} });
         binaryGraphZoom(1.25); binaryGraphFit(); binaryGraphRelayout(); binaryGraphDraw(); binaryGraphSetMode('path');
         out({ same: key() === before, before, after: key(), sameCamera: graphState.camera === camera, sameNodes: graphState.nodes === nodes,
               explored: st.nodes.length, drawn: frame().discs.length, touched: seen.filter(id => id.startsWith('graph-')) });
       })();""")
     # the guard is not vacuous: the exploration really ran, and the process graph really held something
-    assert r["explored"] == 8 and r["drawn"] == 8
+    assert r["explored"] > 5 and r["drawn"] == r["explored"]
     assert '"zoom":1.5' in r["before"] and "pid:4" in r["before"] and r["before"].count('"Set"') == 1
     assert r["same"] is True, r["after"]
     assert r["sameCamera"] and r["sameNodes"]
@@ -1008,17 +1175,20 @@ def test_a_binary_name_from_an_import_table_reaches_the_explore_view_as_text_and
       (async () => {
         initSyscalls(); binaryGraphSetMode('explore');
         const evil = '<img src=x onerror=alert(1)>.dll';
-        GRAPH['app.exe'].imports[evil] = ['F'];
-        GRAPH[evil] = { kind: 'dll', in_degree: 3, imports: {} };
-        await binaryGraphExploreStart('app.exe'); await binaryGraphExpand('app.exe');
+        GRAPH[evil] = { in_degree: 3, imports: { 'ntdll.dll': ['<b>F</b>'] } };
+        await binaryGraphExploreStart('ntdll.dll'); await binaryGraphExpand('ntdll.dll');
         binaryGraphOnCanvasClick(screenOf(evil));
-        const chosen = els['binary-explore-info'].innerHTML + els['binary-explore-status'].innerHTML;
+        const chosen = els['binary-explore-info'].innerHTML + els['binary-explore-status'].innerHTML, selected = st.selected;
         binaryGraphOnCanvasMove(screenOf(evil));
         const title = els['binary-explore-canvas'].title;
+        await binaryGraphExpand(evil);
+        binaryGraphOnCanvasClick(screenOf(st.nodes.find(n => n.kind === 'function').id));
+        const fn = els['binary-explore-info'].innerHTML;
         await binaryGraphExploreStart('<img src=y onerror=alert(2)>');
-        out({ chosen, selected: st.selected, title, missing: els['binary-explore-status'].innerHTML + els['binary-explore-info'].innerHTML });
+        out({ chosen, selected, title, fn, missing: els['binary-explore-status'].innerHTML + els['binary-explore-info'].innerHTML });
       })();""")
     assert r["selected"] == "<img src=x onerror=alert(1)>.dll"
-    for key in ("chosen", "missing"):
-        assert "<img" not in r[key] and "&lt;img" in r[key], key
+    for key in ("chosen", "missing", "fn"):
+        assert "<img" not in r[key] and "<b>" not in r[key], key
+    assert "&lt;img" in r["chosen"] and "&lt;img" in r["missing"] and "&lt;b&gt;F" in r["fn"]
     assert "<img src=x" in r["title"], "the tooltip is a property of the canvas, not markup"

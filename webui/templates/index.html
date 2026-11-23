@@ -1335,7 +1335,7 @@
                             </div>
                             <div class="binary-explore" id="binary-explore" hidden>
                                 <form class="binary-graph-bar" id="binary-explore-bar" onsubmit="binaryGraphExploreSubmit(event)">
-                                    <h3 class="syscall-panel-title" data-info="One binary of System32 drawn alone, then opened node by node: EXPAND draws the imports of the chosen node, as many hops deep as DEPTH says. A disc is larger the more binaries import it, and at most 400 nodes are drawn.">EXPLORE</h3>
+                                    <h3 class="syscall-panel-title" data-info="One binary of System32 drawn alone, then opened node by node: EXPAND draws what the chosen node imports and who imports it, as many hops deep as DEPTH says. A disc is larger the more binaries import it, and at most 400 nodes are drawn.">EXPLORE</h3>
                                     <input type="text" id="binary-explore-start" class="filter-input" placeholder="Binary to start from, such as kernel32.dll" aria-label="Binary to start from" autocomplete="off" spellcheck="false">
                                     <button type="submit" class="btn btn-sm btn-primary" id="binary-explore-run">START</button>
                                     <span class="binary-explore-depth-label">DEPTH</span>
@@ -1936,6 +1936,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
     </div>
 
-    <script src="/static/js/app.js?v=142"></script>
+    <script src="/static/js/app.js?v=143"></script>
 </body>
 </html>

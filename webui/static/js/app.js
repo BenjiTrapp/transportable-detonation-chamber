@@ -26988,23 +26988,32 @@ function binaryGraphSvg(layout, model) {
 }
 
 // The legend under the graph: the kinds of node, the two origins of an edge with the stroke each is drawn in, a
-// deviation and a filter match
-function binaryGraphLegend() {
+// deviation and a filter match. It names only what the drawing in front of the reader can show: the explore view
+// (mode 'explore', with the edges it draws) has no syscall, deviation or filter match, and a curated or unknown edge
+// only where one is drawn.
+function binaryGraphLegend(mode, edges) {
+    const explore = mode === 'explore';
+    const drawn = new Set((Array.isArray(edges) ? edges : []).map(e => binaryGraphOrigin(e)));
     const item = (key, mark, text, help) =>
         `<span class="syscall-legend-item binary-graph-legend-item" data-legend="${cssToken(key)}" title="${escapeHtml(help)}">${mark}<span>${escapeHtml(text)}</span></span>`;
     const box = (stroke, fill, extra) => `<svg class="binary-graph-legend-mark" width="18" height="12" viewBox="0 0 18 12" aria-hidden="true">${extra || ''}`
         + `<rect x="2" y="2" width="14" height="8" rx="2" fill="${fill}" stroke="${stroke}" stroke-width="1.5"></rect></svg>`;
     const line = (origin, look) => `<svg class="binary-graph-legend-mark" width="30" height="12" viewBox="0 0 30 12" aria-hidden="true">`
         + `<line data-origin="${origin}" x1="1" y1="6" x2="29" y2="6" stroke="${look.color}" stroke-width="${look.width}"${look.dash ? ` stroke-dasharray="${look.dash}"` : ''}></line></svg>`;
-    const parts = Object.entries(BINARY_GRAPH_KINDS).map(([kind, k]) =>
+    const parts = Object.entries(BINARY_GRAPH_KINDS).filter(([kind]) => !explore || kind !== 'syscall').map(([kind, k]) =>
         item(`node-${kind}`, box(themeColor(k.color), themeColor('--bg-secondary')), k.name, `A node of the kind ${k.name}.`));
     parts.push(item('edge-derived', line('derived', binaryGraphEdgeLook({ origin: 'derived' })), 'derived: read from the binaries',
         'An import, a forwarder or an api-set resolution that the import and export tables of the binaries themselves say.'));
-    parts.push(item('edge-curated', line('curated', binaryGraphEdgeLook({ origin: 'curated' })),
-        'curated: from the hand-curated Win32 to Nt table, not read from any binary',
-        'The step from a Win32 function to its Nt syscall is the word of a hand-curated table. No binary of this system was read to draw it.'));
-    parts.push(item('edge-unknown', line('unknown', binaryGraphEdgeLook({ origin: '' })), 'origin unknown: neither derived nor curated',
-        'An edge whose answer names neither origin. It is not claimed to be read from a binary.'));
+    if (!explore || drawn.has('curated')) {
+        parts.push(item('edge-curated', line('curated', binaryGraphEdgeLook({ origin: 'curated' })),
+            'curated: from the hand-curated Win32 to Nt table, not read from any binary',
+            'The step from a Win32 function to its Nt syscall is the word of a hand-curated table. No binary of this system was read to draw it.'));
+    }
+    if (!explore || drawn.has('unknown')) {
+        parts.push(item('edge-unknown', line('unknown', binaryGraphEdgeLook({ origin: '' })), 'origin unknown: neither derived nor curated',
+            'An edge whose answer names neither origin. It is not claimed to be read from a binary.'));
+    }
+    if (explore) return parts.join('');
     parts.push(item('deviation', box(themeColor(SYSCALL_STATE_COLORS.patched), themeColor(SYSCALL_STATE_COLORS.patched, 0.18)),
         'deviated in the last scan, and the path to it, in the colour of its state on the map',
         'A syscall whose stub the last scan of this view did not find intact, coloured as on the map, and every edge on a path into it.'));
@@ -27218,19 +27227,19 @@ function binaryGraphDetailHtml(item) {
 
 // --- GRAPH, EXPLORE: the same graph, opened one node at a time -------------------------------------------------------
 // The whole stock (about 4,000 binaries) is never drawn. An entry point, one binary, is drawn alone; EXPAND opens the
-// imports, forwarders and api-set hosts of the chosen node and keeps what is drawn, as many hops as DEPTH says. The
-// canvas holds at most `cap` nodes: what an expansion could not draw is counted and said, never dropped quietly, and
-// the nodes that are kept are the first in name order, so a node that is missing is "not shown", not "not imported".
+// neighbours of the chosen node in both directions and keeps what is drawn: what a module imports (q=imports: one
+// function node each) and who imports it (q=importers), or for a function who imports that function. Both are the
+// queries of the PATH view, so a node comes with its in-degree, kind and category and nothing is read per neighbour.
+// DEPTH is how many hops EXPAND walks; from the second hop on only modules are opened, a function is opened by
+// choosing it. The canvas holds at most `cap` nodes: what could not be drawn is counted and said, never dropped
+// quietly, and the neighbours that are kept are the first in name order, whole, as the server cuts its own answers.
 // A node's size is how many binaries import it (the cache's in-degree), its colour is its kind.
-// The canvas machinery is the process graph's (applyForceLayout), driven with the state object below: both views
-// share functions and no state. The process graph's camera functions read graphState itself, so the few that this
-// view needs are written again over its own camera.
-// cap: the backend's MAX_NODES (tests/test_binary_graph_ui.py holds the two equal); batch: how many nodes are asked for
-// at once; drag: the px a press moves before it is a drag and no click
-const BINARY_GRAPH_EXPLORE = { cap: 400, depths: [1, 2, 3], radius: { min: 6, max: 38, step: 2.4 }, batch: 8, drag: 3 };
+// cap: the backend's MAX_NODES (tests/test_binary_graph_ui.py holds the two equal); reads: the most queries one EXPAND
+// sends, so a deep walk over a busy module stops and says so; drag: the px a press moves before it is a drag, not a click
+const BINARY_GRAPH_EXPLORE = { cap: 400, depths: [1, 2, 3], radius: { min: 6, max: 38, step: 2.4 }, reads: 60, drag: 3 };
 const binaryGraphExplore = { mode: 'path', nodes: [], edges: [], camera: { x: 0, y: 0, zoom: 1 }, selected: null, hovered: null,
     dragging: null, panning: false, panStart: { x: 0, y: 0 }, down: { x: 0, y: 0 }, moved: false, loading: false, note: '', seq: 0,
-    ready: false, cut: new Map(), details: new Map() };
+    ready: false, cut: new Map() };
 
 // The disc of a node: the larger the more binaries import it, on a log scale so 4,000 and 400 are both readable
 function binaryGraphNodeRadius(node) {
@@ -27239,105 +27248,139 @@ function binaryGraphNodeRadius(node) {
     return Math.min(r.max, r.min + r.step * Math.log2(1 + degree));
 }
 
-// What a module is called until it has been read: the loader's reading of the name
+// What a module is called until the graph says: the loader's reading of the name
 function binaryGraphGuessKind(name) {
     const lower = String(name || '').toLowerCase();
     if (lower.startsWith('api-') || lower.startsWith('ext-')) return 'api-set';
     return lower.endsWith('.exe') ? 'exe' : 'dll';
 }
 
+// The kind of a binary as /api/binary-graph/node names it
 function binaryGraphDetailKind(detail, name) {
     if (detail && detail.is === 'api-set') return 'api-set';
     if (detail && detail.is === 'binary' && (detail.kind === 'dll' || detail.kind === 'exe')) return detail.kind;
     return binaryGraphGuessKind(name);
 }
 
-// What of an answer of /api/binary-graph/node the exploration keeps: the modules a node imports and forwards to with
-// how many functions each, its api-set hosts, its in-degree and machine. The export list stays where it is.
-function binaryGraphTrimDetail(data) {
-    const d = data && typeof data === 'object' ? data : {};
-    const imports = Object.entries(d.imports && typeof d.imports === 'object' ? d.imports : {})
-        .map(([module, names]) => [module, Array.isArray(names) ? names.length : 0]);
-    const forwarded = new Map();
-    for (const f of Object.values(d.forwarders && typeof d.forwarders === 'object' ? d.forwarders : {})) {
-        const module = f && typeof f.module === 'string' ? f.module : '';
-        if (module) forwarded.set(module, (forwarded.get(module) || 0) + 1);
+// The queries that open a node: [{ dir, params, module, via }]. A module is read both ways (an api set imports nothing
+// of its own); a function asks who imports it, and the edges of that answer end at the function (`via`). Anything else
+// has nothing to open.
+function binaryGraphExploreRequests(node) {
+    const id = node && typeof node.id === 'string' ? node.id : '';
+    if (!id) return [];
+    const into = { dir: 'in', params: { q: 'importers', module: id }, module: id, via: '' };
+    if (node.kind === 'api-set') return [into];
+    if (node.kind === 'dll' || node.kind === 'exe') return [{ dir: 'out', params: { q: 'imports', module: id }, module: id, via: '' }, into];
+    const bang = id.indexOf('!');
+    if (node.kind === 'function' && bang > 0) {
+        const module = id.slice(0, bang);
+        return [{ dir: 'in', params: { q: 'importers', module, function: id.slice(bang + 1) }, module, via: id }];
     }
-    return {
-        name: typeof d.name === 'string' ? d.name : '', is: d.is === 'binary' || d.is === 'api-set' ? d.is : 'none', kind: String(d.kind || ''),
-        machine: String(d.machine || ''), in_degree: Math.max(0, Number(d.in_degree) || 0), partial: d.partial === true, imports,
-        forwarded: [...forwarded], hosts: Array.isArray(d.hosts) ? d.hosts.filter(h => typeof h === 'string') : [],
-    };
+    return [];
 }
 
-// The neighbours of a node as its trimmed detail names them, in name order: [{ id, edges: [{ kind, label }] }]. Every
-// edge is read from the binaries and points away from the node.
-function binaryGraphNeighboursOf(detail) {
-    const found = new Map();
-    const add = (module, kind, label) => {
-        const id = String(module || '').toLowerCase();
-        if (!id || id === detail.name) return;
-        if (!found.has(id)) found.set(id, { id, edges: [] });
-        found.get(id).edges.push({ kind, label });
-    };
-    for (const [module, n] of detail.imports) add(module, 'imports', `${n.toLocaleString('en-US')} function${n === 1 ? '' : 's'}`);
-    for (const [module, n] of detail.forwarded) add(module, 'forwards_to', `${n.toLocaleString('en-US')} forwarded export${n === 1 ? '' : 's'}`);
-    for (const host of detail.hosts) add(host, 'resolves_to', '');
-    return [...found.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+// An answer as the parts the server cuts it in: one function of an `imports` answer, one importer of an `importers`
+// answer (with the api set it imports through). { parts: [{ head, nodes, edges }], server } where `server` is how many
+// parts the server dropped of its own answer (its total less the parts it kept).
+function binaryGraphExploreParts(request, answer) {
+    const a = answer && typeof answer === 'object' ? answer : {};
+    const known = new Map((Array.isArray(a.nodes) ? a.nodes : []).filter(n => n && typeof n.id === 'string').map(n => [n.id, n]));
+    const edges = (Array.isArray(a.edges) ? a.edges : []).filter(e => e && typeof e.source === 'string' && typeof e.target === 'string');
+    const root = request.module;
+    const end = e => (request.via && e.target === root ? { ...e, target: request.via } : e);
+    const grouped = new Map();
+    for (const e of edges) {
+        if (e.kind !== 'imports') continue;
+        const head = request.dir === 'out' ? (e.source === root ? e.target : '') : (e.source !== root ? e.source : '');
+        if (!head) continue;
+        if (!grouped.has(head)) grouped.set(head, { head, ids: new Set([head]), edges: [] });
+        const part = grouped.get(head);
+        part.edges.push(end(e));
+        if (request.dir === 'in' && e.target !== root) {
+            part.ids.add(e.target);
+            for (const hop of edges) if (hop.source === e.target && hop.target === root && hop.kind === 'resolves_to') part.edges.push(end(hop));
+        }
+    }
+    const parts = [...grouped.values()].filter(p => known.has(p.head))
+        .map(p => ({ head: p.head, nodes: [...p.ids].map(id => known.get(id)).filter(Boolean), edges: p.edges }));
+    const total = Math.max(0, Number(a.total) || 0);
+    return { parts, server: a.truncated === true ? Math.max(0, total - parts.length) : 0 };
 }
 
-// The neighbours of `parentId` drawn, as many as the cap leaves room for: whole neighbours, in name order. A neighbour
-// that is drawn already only gains its edge. What did not fit is kept per parent: { added, dropped } (ids).
-function binaryGraphExploreMerge(st, parentId, found) {
-    const cap = BINARY_GRAPH_EXPLORE.cap;
-    const have = new Set(st.nodes.map(n => n.id));
-    const edgeKey = (s, t, k) => `${s}\n${t}\n${k}`;
-    const seen = new Set(st.edges.map(e => edgeKey(e.source, e.target, e.kind)));
+// How many nodes of these parts are not drawn yet
+function binaryGraphExploreFresh(st, parts) {
+    const have = new Set(st.nodes.map(n => n.id)), fresh = new Set();
+    for (const p of parts) for (const n of p.nodes) if (!have.has(n.id)) fresh.add(n.id);
+    return fresh.size;
+}
+
+// The parts drawn, whole and in order, until one does not fit: the cap, or `limit` new nodes of this answer. That part
+// and every part after it is dropped (the drawn ones stay the first in name order). A node that is drawn already takes
+// the answer's in-degree and kind. { added, dropped } as ids of nodes and of the heads of dropped parts.
+function binaryGraphExploreMerge(st, parts, limit) {
+    const cap = BINARY_GRAPH_EXPLORE.cap, have = new Map(st.nodes.map(n => [n.id, n]));
+    const edgeKey = e => `${e.source}\n${e.target}\n${e.kind}`;
+    const seen = new Set(st.edges.map(edgeKey));
     const added = [], dropped = [];
-    for (const item of found) {
-        if (!have.has(item.id)) {
-            if (st.nodes.length >= cap) {
-                dropped.push(item.id);
-                continue;
+    let fresh = 0, full = false;
+    for (const part of parts) {
+        if (!full) {
+            const news = part.nodes.filter(n => !have.has(n.id));
+            if (st.nodes.length + news.length > cap || fresh + news.length > limit) full = true;
+            else {
+                for (const n of part.nodes) {
+                    let node = have.get(n.id);
+                    if (!node) {
+                        node = { id: n.id, label: typeof n.label === 'string' ? n.label : n.id, kind: n.kind, in_degree: 0, category: '', x: 0, y: 0, placed: false };
+                        st.nodes.push(node);
+                        have.set(n.id, node);
+                        added.push(n.id);
+                        fresh++;
+                    }
+                    node.kind = n.kind;
+                    node.in_degree = Math.max(0, Number(n.in_degree) || 0);
+                    node.category = typeof n.category === 'string' ? n.category : '';
+                    node.radius = binaryGraphNodeRadius(node);
+                }
+                for (const e of part.edges) {
+                    if (seen.has(edgeKey(e))) continue;
+                    seen.add(edgeKey(e));
+                    st.edges.push({ source: e.source, target: e.target, kind: e.kind, origin: e.origin, label: typeof e.label === 'string' ? e.label : '' });
+                }
             }
-            st.nodes.push({ id: item.id, label: item.id, kind: binaryGraphGuessKind(item.id), in_degree: 0, category: '', x: 0, y: 0,
-                            radius: binaryGraphNodeRadius({ in_degree: 0 }), placed: false });
-            have.add(item.id);
-            added.push(item.id);
         }
-        for (const e of item.edges) {
-            const key = edgeKey(parentId, item.id, e.kind);
-            if (seen.has(key)) continue;
-            seen.add(key);
-            st.edges.push({ source: parentId, target: item.id, kind: e.kind, origin: 'derived', label: e.label });
-        }
+        if (full) dropped.push(part.head);
     }
-    if (dropped.length) st.cut.set(parentId, new Set(dropped));
-    else st.cut.delete(parentId);
     return { added, dropped };
 }
 
-// What is cut now: how many distinct nodes did not fit and are still not drawn, of how many opened nodes, and per node
+// What is cut now, per opened node and direction: the parts the server dropped of its own answer, and the heads of the
+// parts that did not fit on the canvas and are still not drawn. { hidden, server, dropped, parents, of: node -> count }
 function binaryGraphExploreCut(st) {
-    const drawn = new Set(st.nodes.map(n => n.id)), hidden = new Set(), of = new Map();
-    for (const [parent, ids] of st.cut) {
-        const left = [...ids].filter(id => !drawn.has(id));
-        if (!left.length) continue;
-        of.set(parent, left.length);
-        left.forEach(id => hidden.add(id));
+    const drawn = new Set(st.nodes.map(n => n.id)), heads = new Set(), of = new Map();
+    let server = 0;
+    for (const record of st.cut.values()) {
+        const left = [...record.dropped].filter(id => !drawn.has(id));
+        if (!record.server && !left.length) continue;
+        server += record.server;
+        left.forEach(id => heads.add(id));
+        of.set(record.from, (of.get(record.from) || 0) + record.server + left.length);
     }
-    return { hidden: hidden.size, parents: of.size, of };
+    return { hidden: server + heads.size, server, dropped: heads.size, parents: of.size, of };
 }
 
 // The line above the canvas: that the picture is cut, in words, and the note of the last step. { tone, html }
 function binaryGraphExploreStatus(st) {
     if (st.loading) return { tone: 'info', html: '' };
     const cut = binaryGraphExploreCut(st);
+    const n = (count, one, many) => `${escapeHtml(count.toLocaleString('en-US'))} ${count === 1 ? one : many}`;
     let html = '';
     if (cut.hidden) {
-        html += `<strong class="binary-graph-cut">Not the whole neighbourhood: the canvas holds at most ${escapeHtml(String(BINARY_GRAPH_EXPLORE.cap))} nodes and `
-            + `${escapeHtml(cut.hidden.toLocaleString('en-US'))} more ${cut.hidden === 1 ? 'node' : 'nodes'} did not fit, from the neighbours of `
-            + `${escapeHtml(cut.parents.toLocaleString('en-US'))} ${cut.parents === 1 ? 'node' : 'nodes'}. Whole neighbours were dropped, in name order: `
+        const why = [];
+        if (cut.server) why.push(`${n(cut.server, 'was', 'were')} cut by the server from its own answer`);
+        if (cut.dropped) why.push(`${n(cut.dropped, 'did', 'did')} not fit on this canvas, which holds at most ${escapeHtml(String(BINARY_GRAPH_EXPLORE.cap))} nodes`);
+        html += `<strong class="binary-graph-cut">Not the whole neighbourhood: ${n(cut.hidden, 'neighbour is', 'neighbours are')} not shown, of ${n(cut.parents, 'opened node', 'opened nodes')}: `
+            + `${why.join(' and ')}. Whole neighbours were dropped, in name order: `
             + 'a node that is missing here is not shown, which does not mean it is not imported.</strong> ';
     }
     if (st.note) html += `<span class="binary-graph-note">${escapeHtml(st.note)}</span>`;
@@ -27353,16 +27396,17 @@ function binaryGraphExploreInfo(st) {
             + 'Choose a node, then EXPAND opens its neighbours; a double click does both.';
     }
     const kind = (binaryGraphOwn(BINARY_GRAPH_KINDS, node.kind) || { name: String(node.kind || 'unknown') }).name;
-    let html = `<strong>${escapeHtml(node.label)}</strong> · ${escapeHtml(kind)}${node.machine ? ` · ${escapeHtml(node.machine)}` : ''}`
-        + ` · imported by ${escapeHtml((Number(node.in_degree) || 0).toLocaleString('en-US'))} binaries of System32`;
-    if (node.absent) html += ' · not a binary of this graph, so there is nothing to open';
+    const bang = node.id.indexOf('!');
+    let html = `<strong>${escapeHtml(node.label)}</strong> · ${escapeHtml(kind)}${node.machine ? ` · ${escapeHtml(node.machine)}` : ''}`;
+    html += node.kind === 'function' && bang > 0 ? ` · of ${escapeHtml(node.id.slice(0, bang))}` : ` · imported by ${escapeHtml((Number(node.in_degree) || 0).toLocaleString('en-US'))} binaries of System32`;
     const left = binaryGraphExploreCut(st).of.get(node.id);
-    if (left) html += ` · ${escapeHtml(left.toLocaleString('en-US'))} of its neighbours are not shown: the canvas is full`;
+    if (left) html += ` · ${escapeHtml(left.toLocaleString('en-US'))} of its neighbours are not shown`;
     return html;
 }
 
-// New neighbours of `parentId` are laid out around it with the process graph's force layout, away from the rest of
-// the picture, so nothing that is drawn moves
+// New neighbours of `parentId` are laid out around it with the process graph's force layout (applyForceLayout, used as
+// it is: it takes its nodes and edges as arguments), on copies of the parent and the new nodes, then moved to the
+// parent and away from the rest of the picture, so nothing that is drawn moves
 function binaryGraphExploreLayout(st, parentId, added) {
     if (!added.length) return;
     const byId = new Map(st.nodes.map(n => [n.id, n])), parent = byId.get(parentId);
@@ -27388,46 +27432,10 @@ function binaryGraphExploreLayout(st, parentId, added) {
     });
 }
 
-// What the graph knows of one name, asked once and remembered: { ok: true, detail } or { ok: false, status, error,
-// in_degree } (a name that is no binary of the graph is a 404 that still says how many binaries import it)
-async function binaryGraphExploreDetail(name) {
-    const st = binaryGraphExplore, key = String(name).toLowerCase();
-    if (st.details.has(key)) return st.details.get(key);
-    const r = await syscallApi(`/api/binary-graph/node?${new URLSearchParams({ name: String(name) })}`);
-    const entry = r.ok ? { ok: true, detail: binaryGraphTrimDetail(r.data) }
-        : { ok: false, status: r.status, error: syscallErrorText(r), in_degree: Math.max(0, Number(r.data && r.data.in_degree) || 0) };
-    // an answer of the server is kept; a lost connection is asked again
-    if (r.ok || r.status === 404) st.details.set(key, entry);
-    return entry;
-}
-
-// Size and colour of a drawn node from what was read of it
-function binaryGraphExploreApply(st, name, entry) {
-    const node = st.nodes.find(n => n.id === name);
-    if (!node) return;
-    if (entry.ok) {
-        node.kind = binaryGraphDetailKind(entry.detail, name);
-        node.in_degree = entry.detail.in_degree;
-        node.machine = entry.detail.machine;
-        node.absent = false;
-    } else if (entry.status === 404) {
-        node.in_degree = entry.in_degree;
-        node.absent = true;
-    }
-    node.radius = binaryGraphNodeRadius(node);
-}
-
-// A level of nodes read, a few at a time; a node that is drawn takes its size and colour from what was read
-async function binaryGraphExploreFetch(names) {
-    const st = binaryGraphExplore, got = new Map(), todo = [...new Set(names)];
-    for (let i = 0; i < todo.length; i += BINARY_GRAPH_EXPLORE.batch) {
-        await Promise.all(todo.slice(i, i + BINARY_GRAPH_EXPLORE.batch).map(async name => {
-            const entry = await binaryGraphExploreDetail(name);
-            got.set(name, entry);
-            binaryGraphExploreApply(st, name, entry);
-        }));
-    }
-    return got;
+// One query of the binary graph: { ok, answer } or { ok: false, status, error }
+async function binaryGraphExploreAsk(params) {
+    const r = await syscallApi(`/api/binary-graph/query?${new URLSearchParams(params)}`);
+    return r.ok ? { ok: true, answer: r.data } : { ok: false, status: r.status, error: syscallErrorText(r) };
 }
 
 // START: the binary asked for, drawn alone. A function as the path view names it (module!function) opens its module.
@@ -27445,18 +27453,19 @@ async function binaryGraphExploreStart(name) {
     const seq = ++st.seq;
     st.loading = true;
     st.note = '';
-    st.details.clear();
     binaryGraphExploreRender();
-    const entry = await binaryGraphExploreDetail(text);
+    const r = await syscallApi(`/api/binary-graph/node?${new URLSearchParams({ name: text })}`);
     if (seq !== st.seq) return false;
     st.loading = false;
-    if (!entry.ok || entry.detail.is === 'none') {
-        st.note = entry.ok ? `${text} is not in the binary graph of this system.` : entry.error;
+    const d = r.data && typeof r.data === 'object' ? r.data : {};
+    if (!r.ok || typeof d.name !== 'string' || !d.name || (d.is !== 'binary' && d.is !== 'api-set')) {
+        st.note = r.ok ? `${text} is not in the binary graph of this system.` : syscallErrorText(r);
         binaryGraphExploreRender();
         return false;
     }
-    const d = entry.detail, id = (d.name || text).toLowerCase();
-    const node = { id, label: id, kind: binaryGraphDetailKind(d, id), in_degree: d.in_degree, category: '', machine: d.machine, x: 0, y: 0, placed: true };
+    const id = d.name.toLowerCase();
+    const node = { id, label: id, kind: binaryGraphDetailKind(d, id), in_degree: Math.max(0, Number(d.in_degree) || 0), category: '',
+                   machine: typeof d.machine === 'string' ? d.machine : '', x: 0, y: 0, placed: true };
     node.radius = binaryGraphNodeRadius(node);
     st.nodes = [node];
     st.edges = [];
@@ -27476,42 +27485,72 @@ function binaryGraphExploreSubmit(event) {
     return binaryGraphExploreStart(input ? input.value : '');
 }
 
-// EXPAND: the neighbours of a node, as many hops as DEPTH says, added to what is drawn. Each hop reads the nodes the
-// hop before added (which also gives their size and colour); the last ring is read for that alone. The cap decides
-// what fits. A newer start or expansion overtakes this one.
+// EXPAND: the neighbours of a node, in both directions, as many hops as DEPTH says, added to what is drawn. Where the
+// canvas has room for only some of both directions each gets its share. A walk stops where the canvas is full or after
+// `reads` queries, and says how many nodes of its last ring it did not open. A newer START or EXPAND overtakes it.
 async function binaryGraphExpand(id) {
-    const st = binaryGraphExplore, node = st.nodes.find(n => n.id === id);
+    const st = binaryGraphExplore, g = BINARY_GRAPH_EXPLORE, node = st.nodes.find(n => n.id === id);
     if (!node || st.loading) return false;
-    const seq = ++st.seq, depth = binaryGraphState.depth, failed = [];
+    const seq = ++st.seq, depth = binaryGraphState.depth, failed = [], notes = [];
     st.loading = true;
     st.note = '';
     binaryGraphExploreRender();
-    let level = [node.id], opened = false;
+    let level = [node.id], reads = 0, unopened = 0, opened = false, grew = false;
     for (let hop = 0; hop < depth && level.length; hop++) {
-        const got = await binaryGraphExploreFetch(level);
-        if (seq !== st.seq) return false;
         const next = [];
-        for (const from of level) {
-            const entry = got.get(from);
-            if (!entry.ok) {
-                if (hop === 0) st.note = entry.error;
-                else if (entry.status !== 404) failed.push(from);
-                continue;
+        for (let i = 0; i < level.length; i++) {
+            const from = st.nodes.find(n => n.id === level[i]), requests = from ? binaryGraphExploreRequests(from) : [];
+            if (!requests.length) continue;
+            if (hop > 0 && (st.nodes.length >= g.cap || reads + requests.length > g.reads)) {
+                unopened = level.length - i;
+                break;
             }
-            if (hop === 0) opened = true;
-            const r = binaryGraphExploreMerge(st, from, binaryGraphNeighboursOf(entry.detail));
-            binaryGraphExploreLayout(st, from, r.added);
-            next.push(...r.added);
+            reads += requests.length;
+            const answers = await Promise.all(requests.map(r => binaryGraphExploreAsk(r.params)));
+            if (seq !== st.seq) return false;
+            const results = [];
+            answers.forEach((a, k) => {
+                if (!a.ok) {
+                    if (hop === 0) notes.push(a.error);
+                    else failed.push(from.id);
+                    return;
+                }
+                if (hop === 0) opened = true;
+                const found = binaryGraphExploreParts(requests[k], a.answer);
+                results.push({ request: requests[k], found, note: typeof a.answer.note === 'string' ? a.answer.note : '' });
+            });
+            // the direction with fewer new nodes first, held to its share of the room
+            const room = g.cap - st.nodes.length;
+            results.forEach(r => { r.fresh = binaryGraphExploreFresh(st, r.found.parts); });
+            results.sort((a, b) => a.fresh - b.fresh);
+            const added = [];
+            results.forEach((r, k) => {
+                const other = results.length > 1 ? results[1 - k].fresh : 0;
+                const limit = results.length > 1 && k === 0 ? Math.min(r.fresh, Math.max(Math.floor(room / 2), room - other)) : Infinity;
+                const merged = binaryGraphExploreMerge(st, r.found.parts, limit);
+                const key = `${from.id}\n${r.request.dir}`;
+                if (r.found.server || merged.dropped.length) st.cut.set(key, { from: from.id, server: r.found.server, dropped: new Set(merged.dropped) });
+                else st.cut.delete(key);
+                binaryGraphExploreLayout(st, from.id, merged.added);
+                added.push(...merged.added);
+                if (hop === 0 && !merged.added.length && r.note) notes.push(r.note);
+            });
+            if (added.length) grew = true;
+            next.push(...added.filter(a => { const n = st.nodes.find(x => x.id === a); return n && (n.kind === 'dll' || n.kind === 'exe' || n.kind === 'api-set'); }));
         }
         level = next;
         binaryGraphExploreRender();
+        if (unopened) break;
     }
-    const last = await binaryGraphExploreFetch(level);
-    if (seq !== st.seq) return false;
-    for (const [name, entry] of last) if (!entry.ok && entry.status !== 404) failed.push(name);
+    const said = [];
+    if (unopened) {
+        said.push(`The walk of depth ${depth} stopped ${st.nodes.length >= g.cap ? 'because the canvas is full' : `after ${reads} queries`}: ${unopened.toLocaleString('en-US')} ${unopened === 1 ? 'node' : 'nodes'} of its last ring ${unopened === 1 ? 'was' : 'were'} not opened.`);
+    }
     if (failed.length) {
-        st.note = `${failed.length.toLocaleString('en-US')} ${failed.length === 1 ? 'node' : 'nodes'} could not be read just now, so ${failed.length === 1 ? 'its' : 'their'} size, colour and neighbours may be missing.`;
+        said.push(`${failed.length.toLocaleString('en-US')} ${failed.length === 1 ? 'node' : 'nodes'} could not be read just now, so ${failed.length === 1 ? 'its' : 'their'} neighbours may be missing.`);
     }
+    if (!grew) said.push(...notes);
+    st.note = said.join(' ');
     st.loading = false;
     binaryGraphExploreRender();
     return opened;
@@ -27567,7 +27606,7 @@ function binaryGraphExploreRender() {
     const info = el('binary-explore-info');
     if (info) info.innerHTML = binaryGraphExploreInfo(st);
     const legend = el('binary-explore-legend');
-    if (legend) legend.innerHTML = binaryGraphLegend();
+    if (legend) legend.innerHTML = binaryGraphLegend('explore', st.edges);
     const expand = el('binary-explore-expand');
     if (expand) expand.disabled = st.loading || !st.selected;
     for (const n of BINARY_GRAPH_EXPLORE.depths) {
@@ -27640,9 +27679,7 @@ function binaryGraphDraw() {
         ctx.fill();
         ctx.strokeStyle = look.stroke;
         ctx.lineWidth = look.width;
-        ctx.setLineDash(n.absent ? [3, 3] : []);
         ctx.stroke();
-        ctx.setLineDash([]);
         if (n.id === st.selected) {
             ctx.beginPath();
             ctx.arc(n.x, n.y, n.radius + 4, 0, Math.PI * 2);
@@ -27666,7 +27703,7 @@ function binaryGraphDraw() {
     ctx.textBaseline = 'top';
     if (cut.hidden) {
         ctx.fillStyle = themeColor('--severity-medium');
-        ctx.fillText(`Cut at ${BINARY_GRAPH_EXPLORE.cap} nodes: ${cut.hidden.toLocaleString('en-US')} more not shown`, 12, 10);
+        ctx.fillText(`Not the whole neighbourhood: ${cut.hidden.toLocaleString('en-US')} not shown (the canvas holds ${BINARY_GRAPH_EXPLORE.cap} nodes)`, 12, 10);
     }
     if (st.loading) {
         ctx.fillStyle = themeColor('--text-muted');
@@ -27676,6 +27713,10 @@ function binaryGraphDraw() {
     return true;
 }
 
+// The camera of this view: four small functions over `binaryGraphExplore.camera` and #binary-explore-canvas. They exist
+// because the process graph's own (screenToWorld, worldToScreen, findNodeAt, graphFitView, graphZoomIn, graphZoomOut)
+// bind `graphState` and #graph-canvas directly, and making them take a state would mean editing a working tab to serve
+// a second caller. Both views share applyForceLayout, which takes its data as arguments, and no state.
 function binaryGraphToWorld(sx, sy) {
     const c = binaryGraphExplore.camera;
     return { x: (sx - c.x) / c.zoom, y: (sy - c.y) / c.zoom };
