@@ -43,6 +43,8 @@ FILES = {
     "webui/syscall_scan.py": r"C:\DetonationChamberUI\syscall_scan.py",
     "webui/syscall_rules.py": r"C:\DetonationChamberUI\syscall_rules.py",
     "webui/syscall_signatures.json": r"C:\DetonationChamberUI\syscall_signatures.json",
+    "webui/win32_to_nt.py": r"C:\DetonationChamberUI\win32_to_nt.py",
+    "webui/win32_to_nt.json": r"C:\DetonationChamberUI\win32_to_nt.json",
     "webui/minidump_analysis.py": r"C:\DetonationChamberUI\minidump_analysis.py",
     "webui/pipe_analysis.py": r"C:\DetonationChamberUI\pipe_analysis.py",
     "webui/pipe_signatures.json": r"C:\DetonationChamberUI\pipe_signatures.json",

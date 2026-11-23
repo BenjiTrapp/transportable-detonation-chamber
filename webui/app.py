@@ -40,6 +40,8 @@ import memory_evidence
 import syscall_baseline
 import syscall_rules
 import syscall_scan
+# The curated Win32 to Nt table: what turns a stub the sample carries into a proven bypass.
+import win32_to_nt
 import pipe_analysis
 import pipe_proxy
 # Offline analysis of exit-time minidumps (no scanner binary involved).
@@ -8379,22 +8381,25 @@ def _syscall_stage_available():
 
 
 def _syscall_stage_file(path, baseline):
-    """`(hits, info)`: the stubs the file at `path` carries and what is known of the search. A file that cannot be
-    searched is a note in `info`. The import table is not passed: only one expanded through the Win32 to Nt table
-    can prove a bypass, and a raw one would turn a hint into a proof."""
+    """`(hits, info, imports)`: the stubs the file at `path` carries, what is known of the search, and the file's
+    import table (None when it is no PE that can be read). A file that cannot be searched is a note in `info`. The
+    table is passed raw and expanded through the Win32 to Nt table: only the expanded one can prove a bypass, and
+    only for a syscall a curated row leads to."""
     if not isinstance(path, str) or not path:
-        return [], {"skipped": "the path of the sample is not known"}
+        return [], {"skipped": "the path of the sample is not known"}, None
     real = _readable_path(path)
     if real is None:
-        return [], {"skipped": "the sample is outside the folders the web UI reads"}
+        return [], {"skipped": "the sample is outside the folders the web UI reads"}, None
     try:
         if os.path.getsize(real) > SYSCALL_FILE_MAX:
-            return [], {"skipped": f"the sample is larger than {SYSCALL_FILE_MAX // (1024 * 1024)} MB"}
+            return [], {"skipped": f"the sample is larger than {SYSCALL_FILE_MAX // (1024 * 1024)} MB"}, None
         with open(real, "rb") as fh:
             content = fh.read()
     except OSError as exc:
-        return [], {"skipped": f"the sample cannot be read: {exc.strerror or exc}"}
-    return syscall_scan.find_stubs_in_bytes(content, baseline), {"path": real, "size": len(content)}
+        return [], {"skipped": f"the sample cannot be read: {exc.strerror or exc}"}, None
+    imports = _pe_import_names(content)
+    hits = syscall_scan.find_stubs_in_bytes(content, baseline, imports, **_syscall_expanded_imports(imports))
+    return hits, {"path": real, "size": len(content), "imports_read": imports is not None}, imports
 
 
 def _syscall_stage(pid, path):
@@ -8413,16 +8418,18 @@ def _syscall_stage(pid, path):
     measured = _syscall_read_process(
         pid, view, build,
         lambda reader: syscall_scan.measure(baseline, reader, view, build, modules, _get_hook_allowlist()))
+    # the sample file is read first: its import table is the one of the process it became
+    file_hits, in_file, imports = _syscall_stage_file(path, baseline)
+    in_file["hits"] = list(file_hits)
     try:
         found = _syscall_read_process(
-            pid, view, build, lambda reader: syscall_scan.find_stubs_in_process(reader, baseline))
+            pid, view, build, lambda reader: syscall_scan.find_stubs_in_process(
+                reader, baseline, imports, **_syscall_expanded_imports(imports)))
         # StubScan's own attributes are lost to list() and json.dumps: they become keys here
         in_process = {"hits": list(found), "partial": found.partial,
                       "regions_searched": found.regions_searched, "note": found.note}
     except Exception as exc:
         in_process = {"hits": [], "error": str(exc)}
-    file_hits, in_file = _syscall_stage_file(path, baseline)
-    in_file["hits"] = list(file_hits)
     findings = memory_evidence.collect({"syscall_scan": measured}, process=identity)
     findings += memory_evidence.from_direct_stubs(in_process["hits"] + in_file["hits"], identity)
     return _syscall_mark_unobserved({
@@ -8566,16 +8573,46 @@ def api_syscalls_scan():
     return jsonify(result)
 
 
+def _syscall_expanded_imports(imports):
+    """The keywords of a stub search for the import table `imports`: the table expanded through the curated Win32
+    to Nt table, and the syscalls that table leads to. Without an import table, or without the curated table, both
+    are None and every hit stays a hint."""
+    if imports is None:
+        return {"expanded_imports": None, "covered": None}
+    try:
+        table = win32_to_nt.load_table()
+    except win32_to_nt.TableError as exc:
+        print(f"[syscalls] the Win32 to Nt table is unusable, every stub stays a hint: {exc}")
+        return {"expanded_imports": None, "covered": None}
+    return {"expanded_imports": table.expand(imports), "covered": table.covered}
+
+
+def _pe_import_names_of_file(path):
+    """The import table of the PE at `path` (a process image), None when it cannot be read or is too large."""
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        if os.path.getsize(path) > SYSCALL_FILE_MAX:
+            return None
+        with open(path, "rb") as fh:
+            return _pe_import_names(fh.read())
+    except OSError:
+        return None
+
+
 def _pe_import_names(data):
-    """The names a PE imports, None when `data` is not a PE that can be read. Delay-loaded imports are not
-    listed: the set is only ever used to say a function is imported, never that it is not."""
+    """The names a PE imports, delay-loaded ones included, None when `data` is not a PE that can be read. Expanded
+    through the Win32 to Nt table the set can say that a function is not imported, so a function the sample
+    delay-loads has to be in it: it is a path the sample has."""
     try:
         import pefile
         pe = pefile.PE(data=data, fast_load=True)
         try:
-            pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
+            pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"],
+                                                   pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT"]])
             return {imp.name.decode("ascii", "replace")
-                    for entry in getattr(pe, "DIRECTORY_ENTRY_IMPORT", []) for imp in entry.imports if imp.name}
+                    for table in ("DIRECTORY_ENTRY_IMPORT", "DIRECTORY_ENTRY_DELAY_IMPORT")
+                    for entry in getattr(pe, table, []) for imp in entry.imports if imp.name}
         finally:
             pe.close()
     except Exception:
@@ -8586,8 +8623,10 @@ def _pe_import_names(data):
 def api_syscalls_stubs():
     """Search for syscall stubs outside ntdll: in a running process (pid) or in a file (path, with view).
 
-    Each hit names the syscall of its number. `import_present` is None: a raw import table cannot show that a
-    function is not imported (see syscall_scan.find_stubs_in_bytes)."""
+    Each hit names the syscall of its number. `import_present` is tri-state: False for a syscall a curated Win32 to Nt
+    row leads to and the import table, expanded through that table, does not hold (a proven bypass); True for one it
+    holds; None where no row leads to the syscall or the import table cannot be read (see
+    syscall_scan.find_stubs_in_bytes). The table of a process is the one of its image."""
     data = _syscall_body()
     pid_given, path_given = data.get("pid") not in (None, ""), data.get("path") not in (None, "")
     if pid_given == path_given:
@@ -8596,11 +8635,13 @@ def api_syscalls_stubs():
         pid = _syscall_pid(data.get("pid"))
         view, baseline = _syscall_target(pid)
         build = _current_os_build()
+        imports = _pe_import_names_of_file(_image_path_for_pid(pid))
         found = _syscall_read_process(
-            pid, view, build, lambda reader: syscall_scan.find_stubs_in_process(reader, baseline))
+            pid, view, build, lambda reader: syscall_scan.find_stubs_in_process(
+                reader, baseline, imports, **_syscall_expanded_imports(imports)))
         process = _syscall_identity(pid)
-        result = {"mode": "process", "pid": pid, "process": process, "partial": found.partial,
-                  "regions_searched": found.regions_searched, "note": found.note}
+        result = {"mode": "process", "pid": pid, "process": process, "imports_read": imports is not None,
+                  "partial": found.partial, "regions_searched": found.regions_searched, "note": found.note}
     else:
         if data.get("view") in (None, ""):
             raise _SyscallRouteError("a path needs the view to search it for: arm64, x64 or x86")
@@ -8621,7 +8662,7 @@ def api_syscalls_stubs():
         except OSError as exc:
             raise _SyscallRouteError(f"the file cannot be read: {exc.strerror or exc}")
         imports = _pe_import_names(content)
-        found = syscall_scan.find_stubs_in_bytes(content, baseline, imports)
+        found = syscall_scan.find_stubs_in_bytes(content, baseline, imports, **_syscall_expanded_imports(imports))
         process = os.path.basename(real)
         result = {"mode": "file", "path": real, "size": len(content), "process": process,
                   "imports_read": imports is not None, "partial": False, "note": ""}

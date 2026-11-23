@@ -10,7 +10,8 @@ import memory_evidence
 import syscall_baseline
 import syscall_scan
 import win32_to_nt
-from test_syscalls import _fixture
+from test_syscalls import (_PRIVATE_BASE, _X64_STUB_0x3A, _fixture, _pe_importing, _x64_space,  # noqa: F401
+                           sample_dir, target)
 
 
 # --- the curated Win32 to Nt table --------------------------------------------------------
@@ -180,3 +181,89 @@ def test_an_unknown_import_beside_does_not_shield_a_syscall_the_table_holds_ever
 
 def test_without_an_import_table_the_table_changes_nothing(x64_baseline):
     assert _hit(x64_baseline, "NtAllocateVirtualMemory", None)["import_present"] is None
+
+
+# --- the table in the web UI: the stubs route and the detonation stage ------------------------
+
+def _loader(sample_dir, *imports, name="loader.exe"):
+    """A PE in the readable folders that imports `imports` and carries a stub for NtWriteVirtualMemory."""
+    path = sample_dir / name
+    path.write_bytes(_pe_importing(*imports) + _X64_STUB_0x3A)
+    return path
+
+
+def test_the_stubs_route_proves_a_bypass_for_a_file_that_does_not_import_the_path(client, tdc, target, sample_dir):
+    path = _loader(sample_dir, "GetLastError")
+    body = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()
+    assert body["imports_read"] is True
+    [hit] = body["hits"]
+    assert (hit["syscall"], hit["import_present"]) == ("NtWriteVirtualMemory", False)
+    [finding] = body["evidence"]["findings"]
+    assert finding["needs_corroboration"] is False
+    # the documented path imported: a hint, not a proof
+    path = _loader(sample_dir, "WriteProcessMemory")
+    body = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()
+    assert body["hits"][0]["import_present"] is True
+    assert body["evidence"]["findings"][0]["needs_corroboration"] is True
+
+
+def test_the_stubs_route_proves_a_bypass_in_a_process_whose_image_does_not_import_the_path(
+        client, tdc, target, sample_dir, monkeypatch):
+    target.view = "x64"
+    target.reader = _x64_space(b"\x90" * 0x40 + _X64_STUB_0x3A + b"\xc3")
+    image = _loader(sample_dir, "GetLastError")
+    monkeypatch.setattr(tdc, "_image_path_for_pid", lambda pid: str(image))
+    body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
+    assert body["imports_read"] is True
+    assert body["hits"][0]["import_present"] is False
+
+
+def test_a_process_whose_image_cannot_be_read_keeps_import_present_unknown(client, tdc, target, monkeypatch):
+    target.view = "x64"
+    target.reader = _x64_space(b"\x90" * 0x40 + _X64_STUB_0x3A + b"\xc3")
+    for image in ("", "C:\\Samples\\gone.exe"):
+        monkeypatch.setattr(tdc, "_image_path_for_pid", lambda pid, image=image: image)
+        body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
+        assert body["imports_read"] is False
+        assert body["hits"][0]["import_present"] is None
+        assert body["evidence"]["findings"][0]["needs_corroboration"] is True
+
+
+def test_the_detonation_stage_proves_a_bypass_for_the_sample_file(tdc, target, sample_dir):
+    target.view = "x64"
+    target.reader = _x64_space(b"\x90" * 0x40 + _X64_STUB_0x3A + b"\xc3")
+    path = _loader(sample_dir, "GetLastError")
+    result = tdc._run_syscall_stage(4812, str(path), [])
+    stubs = result["stubs"]
+    # the sample file's import table speaks for the process it became, too
+    assert [h["import_present"] for h in stubs["process"]["hits"]] == [False]
+    assert [h["import_present"] for h in stubs["file"]["hits"]] == [False]
+    assert stubs["file"]["imports_read"] is True
+    [finding] = [f for f in result["evidence"]["findings"] if f["kind"] == "direct_syscall_stub"]
+    assert finding["needs_corroboration"] is False
+
+
+def test_the_detonation_stage_without_a_sample_file_keeps_import_present_unknown(tdc, target):
+    target.view = "x64"
+    target.reader = _x64_space(b"\x90" * 0x40 + _X64_STUB_0x3A + b"\xc3")
+    result = tdc._run_syscall_stage(4812, None, [])
+    assert [h["import_present"] for h in result["stubs"]["process"]["hits"]] == [None]
+
+
+def test_a_sample_file_that_is_no_pe_keeps_import_present_unknown(tdc, target, sample_dir):
+    target.view = "x64"
+    target.reader = _x64_space(b"\x90" * 8)
+    path = sample_dir / "loader.bin"
+    path.write_bytes(_X64_STUB_0x3A)
+    result = tdc._run_syscall_stage(4812, str(path), [])
+    assert result["stubs"]["file"]["imports_read"] is False
+    assert [h["import_present"] for h in result["stubs"]["file"]["hits"]] == [None]
+
+
+def test_a_delay_loaded_import_counts_as_an_import(tdc, client, target, sample_dir):
+    # the import table now speaks for an absence: a function the sample delay-loads is still a path it has
+    assert tdc._pe_import_names(_pe_importing("WriteProcessMemory", delay=True)) == {"WriteProcessMemory"}
+    path = sample_dir / "lazy.exe"
+    path.write_bytes(_pe_importing("WriteProcessMemory", delay=True) + _X64_STUB_0x3A)
+    body = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()
+    assert body["hits"][0]["import_present"] is True

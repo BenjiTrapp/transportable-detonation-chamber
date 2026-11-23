@@ -3307,21 +3307,20 @@ def test_a_stub_in_a_file_is_found(client, tdc, target, sample_dir):
     assert body["partial"] is False and target.opened == []         # a file opens no process
 
 
-def test_a_file_that_imports_the_function_says_so_but_never_that_it_does_not(client, tdc, target, sample_dir,
-                                                                             monkeypatch):
+def test_a_file_says_whether_it_imports_the_function_through_the_win32_to_nt_table(client, tdc, target, sample_dir,
+                                                                                    monkeypatch):
     path = sample_dir / "loader.bin"
     path.write_bytes(_X64_STUB_0x3A)
-    monkeypatch.setattr(tdc, "_pe_import_names", lambda data: {"NtWriteVirtualMemory"})
-    hit = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()["hits"][0]
-    assert hit["import_present"] is True
-    # a table that was read and lacks the name is still no proof: only the expanded table can give that
-    monkeypatch.setattr(tdc, "_pe_import_names", lambda data: {"CreateFileW"})
-    hit = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()["hits"][0]
-    assert hit["import_present"] is None
+    for imports, present in (({"NtWriteVirtualMemory"}, True), ({"WriteProcessMemory"}, True),
+                             # no path the curated table knows to NtWriteVirtualMemory: a proven bypass
+                             ({"CreateFileW"}, False)):
+        monkeypatch.setattr(tdc, "_pe_import_names", lambda data, imports=imports: imports)
+        hit = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()["hits"][0]
+        assert hit["import_present"] is present, imports
 
 
-def _pe_importing(*names):
-    """A minimal PE32+ whose import table lists `names` from one DLL."""
+def _pe_importing(*names, delay=False):
+    """A minimal PE32+ whose import table lists `names` from one DLL; with `delay`, its delay-load import table."""
     import struct
     base, ilt, dll = 0x1000, 0x1040, 0x1080
     hints, at = b"", 0x10A0
@@ -3332,7 +3331,10 @@ def _pe_importing(*names):
         entry += b"\0" * (len(entry) % 2)
         hints, at = hints + entry, at + len(entry)
     section = bytearray(0x200)
-    section[0:40] = struct.pack("<IIIII", ilt, 0, 0, dll, ilt) + bytes(20)
+    if delay:
+        section[0:64] = struct.pack("<IIIIIIII", 1, dll, 0x1090, ilt, ilt, 0, 0, 0) + bytes(32)
+    else:
+        section[0:40] = struct.pack("<IIIII", ilt, 0, 0, dll, ilt) + bytes(20)
     section[0x40:0x40 + len(thunks)] = thunks
     section[0x80:0x80 + 10] = b"ntdll.dll\0"
     section[0xA0:0xA0 + len(hints)] = hints
@@ -3340,7 +3342,10 @@ def _pe_importing(*names):
     optional += struct.pack("<QIIHHHHHHIIIIHH", 0x140000000, 0x1000, 0x200, 6, 0, 0, 0, 6, 0, 0, 0x2000, 0x200, 0, 3, 0)
     optional += struct.pack("<QQQQII", 0x100000, 0x1000, 0x100000, 0x1000, 0, 16)
     directories = bytearray(128)
-    directories[8:16] = struct.pack("<II", base, 40)
+    if delay:
+        directories[13 * 8:14 * 8] = struct.pack("<II", base, 64)
+    else:
+        directories[8:16] = struct.pack("<II", base, 40)
     optional += bytes(directories)
     assert len(optional) == 0xF0
     coff = struct.pack("<HHIIIHH", 0x8664, 1, 0, 0, 0, 0xF0, 0x22)
@@ -4656,9 +4661,9 @@ def test_a_stub_only_the_file_carries_is_found(tdc, target, sample_dir):
     assert [f["kind"] for f in result["evidence"]["findings"]] == ["direct_syscall_stub"]
 
 
-def test_the_stage_never_hands_the_import_table_to_the_search(tdc, target, sample_dir, monkeypatch):
-    # only a table expanded through the Win32 to Nt chain can prove a bypass, and that table is not built yet; a
-    # raw one would turn a hint into a proof, and set() for "not read" would read as "imports nothing"
+def test_the_stage_hands_the_search_the_raw_and_the_expanded_import_table(tdc, target, sample_dir, monkeypatch):
+    # the raw table only in the raw slot, the expanded one only by keyword; a file whose table cannot be read
+    # passes None for both, as set() would read as "imports nothing" and turn every hit into a proof
     target.view = "x64"
     target.reader = _x64_space(b"\x90" * 8)
     path = sample_dir / "loader.bin"
@@ -4666,14 +4671,20 @@ def test_the_stage_never_hands_the_import_table_to_the_search(tdc, target, sampl
     calls = []
     real = syscall_scan.find_stubs_in_bytes
     monkeypatch.setattr(syscall_scan, "find_stubs_in_bytes",
-                        lambda *args, **kw: calls.append((len(args), kw)) or real(*args, **kw))
-    monkeypatch.setattr(tdc, "_pe_import_names", lambda data: pytest.fail("the import table was read"))
+                        lambda *args, **kw: calls.append((args[2:], kw)) or real(*args, **kw))
     result, _ = _run_stage(tdc, path=str(path))
-    assert calls == [(2, {})]
+    assert calls == [((None,), {"expanded_imports": None, "covered": None})]
     [hit] = result["stubs"]["file"]["hits"]
     assert hit["import_present"] is None
     [finding] = result["evidence"]["findings"]
     assert finding["needs_corroboration"] is True
+    calls.clear()
+    monkeypatch.setattr(tdc, "_pe_import_names", lambda data: {"VirtualAllocEx"})
+    _run_stage(tdc, path=str(path))
+    [((raw,), kw)] = calls
+    assert raw == {"VirtualAllocEx"}
+    assert kw["expanded_imports"] == {"VirtualAllocEx", "NtAllocateVirtualMemory"}
+    assert "NtWriteVirtualMemory" in kw["covered"]
 
 
 def test_the_stage_scores_a_hook_of_a_known_owner_as_nothing(client, tdc, target, fake_baseline_dir):
@@ -4724,7 +4735,7 @@ def test_a_search_of_the_process_that_fails_leaves_the_measurement(tdc, target, 
                                                                     monkeypatch):
     target.reader = _patched_reader(tdc, fake_baseline_dir, "private")
 
-    def refuse(reader, baseline):
+    def refuse(reader, baseline, *args, **kwargs):
         raise OSError("access is denied")
 
     monkeypatch.setattr(syscall_scan, "find_stubs_in_process", refuse)
