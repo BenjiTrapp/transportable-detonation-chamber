@@ -1039,3 +1039,44 @@ def test_the_schema_dll_is_closed_whatever_its_map_looks_like(tmp_path, monkeypa
     binary_graph.load_api_set_map(_schema_dll(tmp_path, b"garbage" * 40))
     binary_graph.load_api_set_map(_schema_dll(tmp_path, _api_set_map({"a-l1-1-0": ("x.dll",)})))
     assert len(closed) == 2
+
+
+def _past_the_declared_size():
+    """The two-alias map, then bytes behind its declared Size (the rest of a section): a valid name of the first
+    entry's own is out there, so only the declared Size can tell it from a name inside the map."""
+    data = _two_aliases()
+    late = "api-late-l1-1-0".encode("utf-16-le")
+    return data, data + late, len(data), len(late)
+
+
+def test_an_entry_that_sits_past_the_declared_size_but_inside_the_section_is_dropped():
+    _, section, late_at, late_len = _past_the_declared_size()
+    parsed = binary_graph.parse_api_set_map(_patched(section, _ENTRY_0 + 4, late_at, late_len))
+    assert parsed == {"api-second-l1-1-0": ("ntdll.dll", "kernel32.dll")}
+    # the same bytes with the entry pointing inside Size are the whole map: the window is what dropped it
+    assert set(binary_graph.parse_api_set_map(section)) == {"api-first-l1-1-0", "api-second-l1-1-0"}
+
+
+def test_a_value_array_or_a_host_past_the_declared_size_is_dropped_too():
+    _, section, late_at, late_len = _past_the_declared_size()
+    # the array begins inside Size and ends 10 bytes behind it
+    assert set(binary_graph.parse_api_set_map(_patched(section, _ENTRY_0 + 16, late_at - 10, 1))) == {"api-second-l1-1-0"}
+    assert set(binary_graph.parse_api_set_map(_patched(section, _VALUES + 12, late_at, late_len))) == {"api-second-l1-1-0"}
+
+
+def test_a_declared_size_smaller_than_the_data_narrows_the_window_to_it():
+    # the packed Size is the length of the map: a map that says it ends earlier loses what lies behind that point
+    import struct
+    data = _two_aliases()
+    second_name_at = struct.unpack_from("<I", data, _ENTRY_1 + 4)[0]
+    parsed = binary_graph.parse_api_set_map(_patched(data, 4, second_name_at))
+    assert parsed == {"api-first-l1-1-0": ("kernelbase.dll",)}
+
+
+@pytest.mark.parametrize("size", [0, 0xFFFFFFFF, 10_000_000])
+def test_a_declared_size_of_zero_or_larger_than_the_data_falls_back_to_the_data(size):
+    # a Size that cannot be right is no reason to read less than there is, but never to read more
+    _, section, late_at, late_len = _past_the_declared_size()
+    pointing_late = _patched(section, _ENTRY_0 + 4, late_at, late_len)
+    assert set(binary_graph.parse_api_set_map(_patched(pointing_late, 4, size))) == {"api-late-l1-1-0", "api-second-l1-1-0"}
+    assert len(binary_graph.parse_api_set_map(_patched(_two_aliases(), 4, size))) == 2

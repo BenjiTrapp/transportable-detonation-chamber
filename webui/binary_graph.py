@@ -210,13 +210,14 @@ def _api_set_text(data, offset, length):
 
 def _api_set_hosts(data, offset, count):
     """The host modules of one entry in the map's order, or None when any value of it is unreadable: a chain with
-    a host left out would resolve to the wrong module, so the entry goes whole."""
+    a host left out would resolve to the wrong module, so the entry goes whole (never relax it to partial acceptance)."""
     end = offset + _API_SET_VALUE.size * count
     if not count or end > len(data):
         return None
     hosts = []
     for _, name_at, name_len, host_at, host_len in _API_SET_VALUE.iter_unpack(bytes(data[offset:end])):
-        # the name of the importer this value is for (usually empty) is not used, but it must lie inside the map too
+        # the importer name is not used (the resolution is importer-independent, see parse_api_set_map), but must lie
+        # inside the map too
         if name_len and _api_set_text(data, name_at, name_len) is None:
             return None
         host = _api_set_text(data, host_at, host_len)
@@ -231,13 +232,23 @@ def parse_api_set_map(data: bytes) -> dict[str, tuple[str, ...]]:
     """alias (lower case, without ".dll") -> its host modules in the map's order, as the map names them.
 
     The hash table is not read: walking the entries is cheap. An unknown version gives an empty map. Every offset and
-    length is hostile: an entry that does not lie wholly inside `data` is dropped and the others are kept. Nothing
-    raises. Size from the header is not trusted either; the bounds are those of `data`."""
+    length is hostile: an entry that does not lie wholly inside the map is dropped and the others are kept. Nothing
+    raises. The map ends where its header's Size says, or at the end of `data` when Size is zero or larger than `data`.
+
+    Two limits, both on purpose, both in the spec (Ziel 6):
+    - The resolution is importer-independent. A value's importer name (empty for the default, a module for an override)
+      is checked to lie inside the map and then ignored, and every value's host is returned in the map's order. A chain
+      may so pass a host the loader would use for a different importer than the one in the path: an edge between two
+      real modules the map does associate, never an invented one. The order is not rearranged (a default first would
+      be made-up data).
+    - One unreadable value drops its whole entry, never only its host. The loader tries the hosts in order, and a chain
+      without its first host would resolve to the wrong module. Do not relax this into partial acceptance."""
     if len(data) < _API_SET_HEADER.size:
         return {}
-    version, _, _, count, entry_offset, _, _ = _API_SET_HEADER.unpack_from(data)
+    version, size, _, count, entry_offset, _, _ = _API_SET_HEADER.unpack_from(data)
     if version != _API_SET_VERSION:
         return {}
+    data = data[:size] if 0 < size <= len(data) else data       # a map that lies about its size gets no wider window
     count = min(count, max(0, len(data) - entry_offset) // _API_SET_ENTRY.size)
     aliases = {}
     for index in range(count):
