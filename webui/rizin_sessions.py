@@ -55,6 +55,7 @@ with ``wx`` when the file is opened again (_replay_patches).
 
 import base64
 import collections
+import contextlib
 import ctypes
 import hashlib
 import json
@@ -182,6 +183,26 @@ _PATCHES_HELD = ("Held back, not applied: {count} saved {patch} over bytes an em
                  "decrypted over by the next run.")
 _PATCHES_DROPPED = ("{count} {patch} did not fit into the project ({chars} characters at most) and will "
                     "not come back when the file is opened again.")
+# Why the timeline of an emulation session (RizinSession._restore) cannot be offered, or is gone. Said by the
+# pane as they stand: a record that is tainted is never offered, whatever else is true of it.
+_RESTORE_HAND_REGISTER = "a register was set by hand, which the timeline does not record"
+_RESTORE_HAND_CONSOLE = ("a console command wrote to the cache or set the emulation up, which the timeline does "
+                         "not record")
+_RESTORE_HAND_BREAKPOINT = "a breakpoint was changed, and a run stops at the breakpoints there are"
+_RESTORE_TIMEOUT = "a run ended at the time limit, a result that hangs on the clock and cannot be repeated"
+_RESTORE_HALF = "an action failed half-way, after it had already changed the emulation or the cache"
+_RESTORE_TOO_LONG = "the timeline is longer than a project keeps ({count} actions at most)"
+_RESTORE_UNREAD = "rizin did not say what the cache or the breakpoints held when the timeline began"
+_RESTORE_FOREIGN = "the cache already held writes of its own when the timeline began, which no replay makes"
+_RESTORE_GONE = ("something was taken out of the cache, so the way to the state it held is no longer "
+                 "kept")
+# The console commands that read what the emulation or the cache holds and change nothing of it; every
+# other name of these families spoils the timeline (_console_spoils).
+_READ_ONLY_COMMANDS = frozenset(("wc", "wcj", "ar", "arj", "ar*", "ar=", "arr", "arrj", "aer", "aerj", "aer*",
+                                 "ahl", "dbl", "dblj", "dblq", "dbil"))
+# The settings an emulation reads while it runs: setting one by hand is a change the timeline did not make.
+_EMULATION_SETTINGS = ("esil.", "io.cache", "asm.arch", "asm.bits", "asm.cpu", "asm.os", "analysis.arch",
+                       "analysis.bits", "analysis.cpu", "anal.arch", "anal.bits", "anal.cpu")
 # While an analysis step holds rizin, a patch or a breakpoint goes through (it changes no bytes the step
 # reads) but its project cannot be written yet, and the project is the only place it outlives the
 # session. Said for as long as that is so (RizinSession.analysis), because closing the tab then loses it.
@@ -543,6 +564,35 @@ def _temporary_seek(text):
     """The target of the last statement's ``@ <addr>``; the views (and rizin) go there."""
     found = re.findall(r"(?<!@)@ +([^@~]+)", text.split(";")[-1])
     return found[-1].strip() if found else None
+
+
+def _console_spoils(text):
+    """Why a console command spoils the timeline of the emulation (RizinSession._restore), or None.
+
+    The timeline holds what the emulation routes did and nothing else, so a console command that writes
+    into the cache (every ``w`` but the two that list it), sets or drives the emulation (``ae*``: ``aeim``,
+    ``aes``, ``aepc``), sets a register (``ar x=..``, ``aer x=..``) or a hint (``ah*``), changes a setting
+    the emulation reads (esil.*, io.cache, the arch) or a breakpoint (``db*`` but its lists) is a change no
+    replay makes. A name that is none of these reads, and spoils nothing: ``ar`` and ``ar rax`` show
+    registers, ``wcj`` the cache. The filter has run already, so every statement is one it let through.
+    """
+    for statement in text.split(";"):
+        bare = statement.strip(" ").replace('"', "").replace("'", "")
+        match = _NAME_RE.match(bare)
+        if not match or match.group().endswith("?"):
+            continue
+        name = match.group()
+        args = re.split(r"[@~]", bare[len(name):], maxsplit=1)[0]
+        if name in _READ_ONLY_COMMANDS and "=" not in args and (name[0] != "w" or not args.strip()):
+            continue
+        if name.startswith(("w", "ae", "ar", "ah")):
+            return _RESTORE_HAND_CONSOLE
+        if name == "e" and any(token.partition("=")[0].startswith(_EMULATION_SETTINGS)
+                               for token in args.split() if "=" in token):
+            return _RESTORE_HAND_CONSOLE
+        if name.startswith("db"):
+            return _RESTORE_HAND_BREAKPOINT
+    return None
 
 
 # --- Pipe -------------------------------------------------------------------
@@ -1363,6 +1413,11 @@ class RizinSession:
         # Patches held back (_replay_patches), as (addr, after_hex, True): in the project and not in the
         # cache, and every save keeps them as it keeps _lost.
         self._waiting = []
+        # The timeline of this session's emulation, which a project can keep as the way to the bytes a run
+        # decrypted (see _restore_start): None before the first start and after something was taken out of
+        # the cache, then why (_restore_gone).
+        self._restore = None
+        self._restore_gone = None
         # Notes that outlive a re-plan: what the session starts with (a project that could not be
         # loaded, patches that could not be applied) and the standing warning that patches did not fit
         # into the project. _start_analysis plans again and drops the notes of the run before it; these
@@ -1449,10 +1504,13 @@ class RizinSession:
         annotates = _annotates(text)
         if annotates:
             self._refuse_while_analysing()
+        spoils = _console_spoils(text)
 
         def run(pipe):
             if annotates:
                 self._refuse_while_analysing()
+            if spoils:
+                self._restore_taint(spoils)  # before it runs: what a command did before it failed is done
             pipe.cmd("e scr.color=3")
             out, err, truncated = pipe.console(text)
             pipe.cmd("e scr.color=0")
@@ -1564,6 +1622,7 @@ class RizinSession:
             self._emulation_big_endian = pipe.cmd("e cfg.bigendian").strip() == "true"
             self._emulation_before = self._emulation_after = None
             self._emulation = pipe
+            self._restore_start(pipe, pc)  # before the read: a read that fails leaves the emulation started
             return self._emulation_read(pipe)
 
         return self._call("emulation", wait, run)
@@ -1610,6 +1669,108 @@ class RizinSession:
         if (low, high) not in self._emulation_ranges:
             self._emulation_ranges.append((low, high))
 
+    # --- The timeline of the emulation --------------------------------------
+    #
+    # What the project can keep of a run is the way to its bytes (rizin_emulation: the timeline of a restorable
+    # session). It is written here while the user works, by the methods that run the emulation, and only by
+    # them: ``self._restore`` is None before the first start, or
+    #
+    #   {"counters": {"tick", "handle", "pseudo"},  the assistant's counters when the timeline began
+    #    "breakpoints": [addr, ...],                the breakpoints it began with, for all of it
+    #    "actions": [action, ...],                  as rizin_emulation describes them, in the order made
+    #    "tainted": str | None}                     why it cannot be offered, the first reason there was
+    #
+    # which is a record without its digests (made at save time, while the cache is alive). Everything is done
+    # with the gate held, so the order of the actions is the order of the requests.
+    #
+    # Recording is a side effect and never fails an action: it reads nothing but at the start of a timeline,
+    # and what it cannot read taints the timeline instead of raising.
+
+    def _restore_start(self, pipe, pc):
+        """The emulation started at ``pc`` (gate held): the first start of the session begins the timeline,
+        a later one is an action of it -- aei, aeim and aepc replay like any other."""
+        if self._restore is None:
+            self._restore = self._restore_begin(pipe)
+            self._restore_gone = None
+        self._restore_add({"kind": "start", "addr": pc})
+
+    def _restore_begin(self, pipe):
+        """A new timeline (gate held), at the state the replay will start from: the assistant's counters, the
+        breakpoints, and tainted when the cache already holds writes that no replay makes (a console ``wx``
+        before the start: they would be hashed as the run's)."""
+        tainted = None
+        try:
+            points = sorted({found["addr"] for found in self._breakpoint_list(pipe)})
+            foreign = any(not row["mine"] for row in self._patch_list(pipe))
+        except (ValueError, RizinTooLarge):
+            points, foreign, tainted = [], False, _RESTORE_UNREAD
+        return {"counters": {"tick": self._assist_tick, "handle": self._assist_handle,
+                             "pseudo": self._assist_pseudo},
+                "breakpoints": points, "actions": [],
+                "tainted": tainted or (_RESTORE_FOREIGN if foreign else None)}
+
+    def _restore_add(self, action, timed_out=False):
+        """Append ``action`` to the timeline (gate held), when there is one. A run that ended at the time
+        limit is on it all the same -- and spoils it: its result hangs on the clock."""
+        record = self._restore
+        if record is None:
+            return
+        if len(record["actions"]) >= rizin_emulation.RESTORE_MAX_ACTIONS:
+            self._restore_taint(_RESTORE_TOO_LONG.format(count=rizin_emulation.RESTORE_MAX_ACTIONS))
+        else:
+            record["actions"].append(action)
+        if timed_out:
+            self._restore_taint(_RESTORE_TIMEOUT)
+
+    def _restore_taint(self, reason):
+        """Say that the timeline cannot be offered (gate held); the first reason stays. With no timeline
+        there is nothing to spoil."""
+        record = self._restore
+        if record is not None and record["tainted"] is None:
+            record["tainted"] = reason
+
+    def _restore_discard(self):
+        """Drop the timeline (gate held): bytes were taken out of the cache, so the actions no longer make
+        the state it holds, and a recipe for a state that is gone is worse than none. A session that never had
+        a timeline has nothing to lose, and says nothing."""
+        if self._restore is not None:
+            self._restore, self._restore_gone = None, _RESTORE_GONE
+
+    @contextlib.contextmanager
+    def _restore_guard(self):
+        """Around the part of an action that changes the emulation or the cache (gate held): one that fails
+        in it has changed something the timeline will not name, so the timeline is spoiled and the failure
+        goes on."""
+        try:
+            yield
+        except BaseException:
+            self._restore_taint(_RESTORE_HALF)
+            raise
+
+    def _restore_breakpoints(self, found):
+        """``found`` are the breakpoints rizin holds now (gate held): not the ones the timeline began with
+        spoils it. A breakpoint set again is no change."""
+        record = self._restore
+        if record is not None and sorted({b["addr"] for b in found}) != record["breakpoints"]:
+            self._restore_taint(_RESTORE_HAND_BREAKPOINT)
+
+    def restore_offer(self):
+        """What the pane needs to offer the restore button, or to say why not: {"actions", "tainted",
+        "digests"}. It asks nothing of rizin and does not wait for the gate.
+
+        ``actions`` is how many the timeline holds. ``tainted`` is the reason it cannot be offered -- a hand-set
+        register, a console write, a breakpoint changed, a run that hit the time limit -- or that it was
+        dropped because something was taken out of the cache; None where there is a timeline that can be
+        offered, and also where there is none (``actions`` is 0 then). ``digests`` is how many digests the
+        record holds: **0 in a live session**, because they are made when the project is saved, while the
+        cache is alive (rizin_emulation.run_digests), and not before.
+        """
+        record = self._restore
+        if record is None:
+            return {"actions": 0, "tainted": self._restore_gone, "digests": 0}
+        return {"actions": len(record["actions"]), "tainted": record["tainted"],
+                "digests": len(record.get("digests") or ())}
+
     def emulation_state(self, wait=2.0):
         """The emulation's registers, PC, stack and the registers that changed (see _emulation_read)."""
         def run(pipe):
@@ -1629,6 +1790,7 @@ class RizinSession:
             # Only a name rizin listed itself goes into the command: those are [A-Za-z0-9_.] words.
             if name not in {r["name"] for r in rizin_emulation.parse_registers(pipe.cmd("ar"))}:
                 raise RizinRefused(f"'{_show(name)}' is not a register of this emulation")
+            self._restore_taint(_RESTORE_HAND_REGISTER)
             pipe.cmd(f"ar {name}={value:#x}")
             return self._emulation_read(pipe)
 
@@ -1660,10 +1822,13 @@ class RizinSession:
 
         def run(pipe):
             maps = self._emulation_prepare(pipe)
-            if kind == "to_call":
-                stopped = self._emulation_to_call(pipe)
-            else:
-                stopped = self._emulation_command(pipe, kind, command, addr)
+            with self._restore_guard():
+                if kind == "to_call":
+                    stopped = self._emulation_to_call(pipe)
+                else:
+                    stopped = self._emulation_command(pipe, kind, command, addr)
+            self._restore_add({"kind": "run", "run": kind, **({"addr": addr} if kind == "until" else {})},
+                              timed_out=stopped == "timeout")
             return self._emulation_finish(pipe, stopped, maps)
 
         return self._call("emulation", wait, run)
@@ -1768,6 +1933,7 @@ class RizinSession:
             found = self._breakpoint_list(pipe)
             if not any(b["addr"] == addr for b in found):
                 raise RizinRefused(f"rizin set no breakpoint at {addr:#x}: another one may cover it already")
+            self._restore_breakpoints(found)
             return {"breakpoints": found}
 
         result = self._call("emulation", wait, run)
@@ -1784,6 +1950,7 @@ class RizinSession:
         def run(pipe):
             pipe.cmd("db-*" if addr is None else f"db- @ {addr:#x}")
             found = self._breakpoint_list(pipe)
+            self._restore_breakpoints(found)  # also where it was kept: what is set is what runs stop at
             if addr is not None and any(b["addr"] == addr for b in found):
                 raise RizinRefused(f"rizin kept the breakpoint at {addr:#x}")
             return {"breakpoints": found}
@@ -1935,14 +2102,20 @@ class RizinSession:
         def run(pipe):
             self._lost = []
             held = self._patch_list(pipe)  # what the cache holds before the removal, to say what went
-            if addr is None:
-                pipe.cmd("wc-*")
-                self._mine = []
-            else:
-                # The range, not the address: `wc- <addr>` with no second argument drops every write in
-                # a whole block (0x100 bytes) from there, the neighbours' included (measured).
-                pipe.cmd(f"wc- {addr:#x} {addr + 1:#x}")
-            found = self._patch_list(pipe)
+            try:
+                if addr is None:
+                    pipe.cmd("wc-*")
+                    self._mine = []
+                else:
+                    # The range, not the address: `wc- <addr>` with no second argument drops every write in
+                    # a whole block (0x100 bytes) from there, the neighbours' included (measured).
+                    pipe.cmd(f"wc- {addr:#x} {addr + 1:#x}")
+                found = self._patch_list(pipe)
+            except BaseException:
+                self._restore_discard()  # what the command took out is not known
+                raise
+            if rizin_emulation.rows_gone(held, found):
+                self._restore_discard()
             if addr is not None and any(r["addr"] <= addr < r["addr"] + r["size"] for r in found):
                 raise RizinRefused(f"rizin kept the patch at {addr:#x}")
             gone = [{"addr": r["addr"], "size": r["size"]}
@@ -1958,12 +2131,14 @@ class RizinSession:
         if self._emulation is not pipe:
             pipe.cmd("e io.cache=true")  # the emulation's start sets it too, but a patch needs no start
         self._require_io_cache(pipe, "the patch")
-        pipe.cmd(f"wx {data.hex()} @ {addr:#x}")
-        self._mine.append(rizin_emulation.cache_entry(addr, data))
-        self._lost = []  # the user is patching this cache: what a restart lost is not kept any more
-        found = self._patch_list(pipe)
-        if not any(r["addr"] <= addr < r["addr"] + r["size"] for r in found):
-            raise RizinRefused(f"rizin wrote nothing at {addr:#x}")
+        with self._restore_guard():
+            pipe.cmd(f"wx {data.hex()} @ {addr:#x}")
+            self._mine.append(rizin_emulation.cache_entry(addr, data))
+            self._lost = []  # the user is patching this cache: what a restart lost is not kept any more
+            found = self._patch_list(pipe)
+            if not any(r["addr"] <= addr < r["addr"] + r["size"] for r in found):
+                raise RizinRefused(f"rizin wrote nothing at {addr:#x}")
+        self._restore_add({"kind": "patch", "addr": addr, "data": data.hex()})
         return {"patches": found}
 
     def _patch_list(self, pipe, ordered=False):
@@ -2201,20 +2376,25 @@ class RizinSession:
             # planned before the skip: the arguments sit on the stack that the correction moves
             plan = self._assist_plan(pipe, conv, api, maps) if api else None
             notes = []
-            if plan is not None and plan["buffer"] and value is not None:
-                notes.append(self._assist_map(pipe, maps, plan, value))
-            stopped = self._emulation_command(pipe, "skip", rizin_emulation.STEP_COMMANDS["skip"], None)
-            if value is not None:
-                pipe.cmd(f"ar {conv['ret_reg']}={value:#x}")
-                notes.insert(0, f"{conv['ret_reg']} = {value:#x}")
-            if fix:
-                # `ar SP=<value>` takes the role name, as `ar SP` does for reading (measured)
-                sp = self._emulation_role(pipe, "SP")
-                pipe.cmd(f"ar SP={sp + fix:#x}")
-                notes.append(f"the stack pointer went up by {fix} bytes")
-            if plan is not None:
-                notes += self._assist_apply(pipe, plan)
-                self._assist_advance(plan)
+            with self._restore_guard():
+                if plan is not None and plan["buffer"] and value is not None:
+                    notes.append(self._assist_map(pipe, maps, plan, value))
+                stopped = self._emulation_command(pipe, "skip", rizin_emulation.STEP_COMMANDS["skip"], None)
+                if value is not None:
+                    pipe.cmd(f"ar {conv['ret_reg']}={value:#x}")
+                    notes.insert(0, f"{conv['ret_reg']} = {value:#x}")
+                if fix:
+                    # `ar SP=<value>` takes the role name, as `ar SP` does for reading (measured)
+                    sp = self._emulation_role(pipe, "SP")
+                    pipe.cmd(f"ar SP={sp + fix:#x}")
+                    notes.append(f"the stack pointer went up by {fix} bytes")
+                if plan is not None:
+                    notes += self._assist_apply(pipe, plan)
+                    self._assist_advance(plan)
+            # what the register holds: rizin cuts the value to its width (measured: eax=0x100000041 is 0x41)
+            applied = None if value is None else value & ((1 << 8 * conv["word"]) - 1)
+            self._restore_add({"kind": "skip", "addr": addr, "value": applied, "fix": fix},
+                              timed_out=stopped == "timeout")
             state = self._emulation_finish(pipe, stopped, maps)
             state["summary"] = (f"skipped {api['name'] if api else 'the call'} at {addr:#x}: "
                                 + ("; ".join(notes) if notes else "the PC is after the call, and nothing "
