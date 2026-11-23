@@ -8869,14 +8869,18 @@ def api_syscalls_rule_download():
 BINARY_GRAPH_BUILD_TIMEOUT = 1800
 # A failed build of a build and architecture is not tried again for this long (seconds)
 BINARY_GRAPH_BUILD_RETRY = 600
+# and not at all after this many failures in a row: a build reads all of System32 for minutes, CPU taken from the
+# sample under analysis, and a failure that persists (a disk fault, a bug of our encoder) is not cured by trying again
+BINARY_GRAPH_BUILD_ATTEMPTS = 3
 BINARY_GRAPH_PARAM_MAX = 512
 _binary_graph_log = logging.getLogger("tdc.binary_graph")
 
 
 def _new_binary_graph_build_state():
     # running: (build, arch) being built; failed: (build, arch) -> (when, why); built: (build, arch) -> the stamp of
-    # the cache the last build that ended well left behind, to tell a rebuild that did not help; thread: the latest one
-    return {"running": set(), "failed": {}, "built": {}, "thread": None}
+    # the cache the last build that ended well left behind, to tell a rebuild that did not help; attempts:
+    # (build, arch) -> failures in a row, cleared only by a usable cache; thread: the latest one
+    return {"running": set(), "failed": {}, "built": {}, "attempts": {}, "thread": None}
 
 
 _binary_graph_build_state = _new_binary_graph_build_state()
@@ -8916,6 +8920,13 @@ def _binary_graph_stat(path):
     return info.st_mtime_ns, info.st_size
 
 
+def _record_binary_graph_failure(key, why):
+    """Record a failed build of `key` and count it. Called with _binary_graph_build_lock held."""
+    state = _binary_graph_build_state
+    state["failed"][key] = (time.time(), why)
+    state["attempts"][key] = state["attempts"].get(key, 0) + 1
+
+
 def _binary_graph_build_job(build, arch):
     key = (build, arch)
     why = None
@@ -8932,7 +8943,7 @@ def _binary_graph_build_job(build, arch):
         state["running"].discard(key)
         state["built"].pop(key, None)
         if why is not None:
-            state["failed"][key] = (time.time(), why)
+            _record_binary_graph_failure(key, why)
         else:
             state["failed"].pop(key, None)
             if stamp is not None:
@@ -8941,15 +8952,16 @@ def _binary_graph_build_job(build, arch):
 
 def _start_binary_graph_build(build, arch):
     """Build the graph of `build` and `arch` in a thread of its own. False when one is running already, one failed
-    too recently to try again, or tools are being updated: an update that swaps files in System32 or the web UI's
-    Python under a build is the opposite of help."""
+    too recently to try again, BINARY_GRAPH_BUILD_ATTEMPTS failed in a row, or tools are being updated: an update
+    that swaps files in System32 or the web UI's Python under a build is the opposite of help."""
     key = (build, arch)
     if _updating_tools():
         return False
     with _binary_graph_build_lock:
         state = _binary_graph_build_state
         failed = state["failed"].get(key)
-        if state["running"] or (failed and time.time() - failed[0] < BINARY_GRAPH_BUILD_RETRY):
+        if (state["running"] or state["attempts"].get(key, 0) >= BINARY_GRAPH_BUILD_ATTEMPTS
+                or (failed and time.time() - failed[0] < BINARY_GRAPH_BUILD_RETRY)):
             return False
         state["running"].add(key)
         state["thread"] = threading.Thread(target=_binary_graph_build_job, args=(build, arch),
@@ -8966,11 +8978,11 @@ def _binary_graph_building():
 
 def _forget_binary_graph_failure(build, arch):
     """A usable cache of `build` and `arch` is there: an earlier failure to build it is refuted, whoever wrote the
-    file (build-binary-graph.ps1 writes it without the web UI). Kept, it would contradict the graph being served and
-    hold back the next build for nothing."""
+    file (build-binary-graph.ps1 writes it without the web UI), and so is the count of attempts. Kept, it would
+    contradict the graph being served and hold back the next build for nothing."""
     with _binary_graph_build_lock:
-        _binary_graph_build_state["failed"].pop((build, arch), None)
-        _binary_graph_build_state["built"].pop((build, arch), None)
+        for field in ("failed", "built", "attempts"):
+            _binary_graph_build_state[field].pop((build, arch), None)
 
 
 def _rebuild_did_not_help(build, arch, stamp, reason):
@@ -8981,7 +8993,7 @@ def _rebuild_did_not_help(build, arch, stamp, reason):
         state = _binary_graph_build_state
         if stamp is not None and state["built"].get(key) == stamp:
             state["built"].pop(key)
-            state["failed"][key] = (time.time(), f"the cache the build wrote does not load either ({reason})")
+            _record_binary_graph_failure(key, f"the cache the build wrote does not load either ({reason})")
 
 
 def _utc(seconds):
@@ -8989,21 +9001,27 @@ def _utc(seconds):
 
 
 def _binary_graph_refusal(error, build=None, arch=None):
-    """The body of a 404 without a graph: `cache` null, `building`, and `failed` (`reason`, `at`, `retry_at`, UTC) or
-    null. `error` gets a sentence on which of them it is."""
+    """The body of a 404 without a graph: `cache` null, `building`, and `failed` (`reason`, `at`, `attempts` and
+    `retry_at`, UTC, null once no attempt is left) or null. `error` gets a sentence on which of them it is."""
     with _binary_graph_build_lock:
         building = (build, arch) in _binary_graph_build_state["running"]
         failed = _binary_graph_build_state["failed"].get((build, arch))
+        attempts = _binary_graph_build_state["attempts"].get((build, arch), 0)
     record = None
     if building:
         error += " It is being built in the background; that takes a few minutes."
     elif failed:
         at, why = failed
-        retry = at + BINARY_GRAPH_BUILD_RETRY
-        record = {"reason": why, "at": _utc(at), "retry_at": _utc(retry)}
-        error += f" The last build failed at {_utc(at)}: {why}."
-        error += (f" It is tried again from {_utc(retry)} on." if retry > time.time() else
-                  " It is tried again on the next request.")
+        retry = at + BINARY_GRAPH_BUILD_RETRY if attempts < BINARY_GRAPH_BUILD_ATTEMPTS else None
+        record = {"reason": why, "at": _utc(at), "attempts": attempts, "retry_at": _utc(retry) if retry else None}
+        if retry is None:
+            error += (f" Building it failed {attempts} attempts in a row, the last at {_utc(at)}: {why}. It is not "
+                      f"built again by itself: rebuild it by hand with scripts\\build-binary-graph.ps1 -Force, and "
+                      f"the tab takes the new graph without a restart.")
+        else:
+            error += f" The last build failed at {_utc(at)}: {why}."
+            error += (f" It is tried again from {_utc(retry)} on." if retry > time.time() else
+                      " It is tried again on the next request.")
     elif build and _updating_tools():
         error += " Tool updates are running: no graph is built while they are."
     return {"error": error, "cache": None, "building": building, "failed": record}

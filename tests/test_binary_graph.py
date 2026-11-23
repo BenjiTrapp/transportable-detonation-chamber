@@ -2666,3 +2666,62 @@ def test_a_failure_record_vanishes_once_a_usable_cache_exists_whoever_wrote_it(c
     body = client.get("/api/binary-graph/query?q=imports&module=b.exe").get_json()
     _join(tdc)
     assert builds == [key] and body["failed"] is None
+
+
+def _past_the_throttle(tdc, key):
+    """Move the last failure of `key` back past the throttle, as ten minutes passing would."""
+    at, why = tdc._binary_graph_build_state["failed"][key]
+    tdc._binary_graph_build_state["failed"][key] = (at - tdc.BINARY_GRAPH_BUILD_RETRY - 1, why)
+
+
+def test_a_cache_that_keeps_failing_is_rebuilt_three_times_and_then_left_to_a_rebuild_by_hand(client, tdc, graph_host):
+    path, builds, _ = graph_host
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(_CUT)
+    key = ("26220.5770", "arm64")
+    assert tdc.BINARY_GRAPH_BUILD_ATTEMPTS == 3
+    for attempt in range(1, 4):
+        client.get("/api/binary-graph/query?q=imports&module=b.exe")       # starts a build; the cut file stays
+        _join(tdc)
+        body = client.get("/api/binary-graph/query?q=imports&module=b.exe").get_json()     # which did not help
+        _join(tdc)
+        assert len(builds) == attempt and body["failed"]["attempts"] == attempt
+        _past_the_throttle(tdc, key)
+    # past the throttle, and still no fourth build: the refusal says how often and what to do
+    for _ in range(2):
+        body = client.get("/api/binary-graph/query?q=imports&module=b.exe").get_json()
+        _join(tdc)
+    assert len(builds) == 3
+    assert body["building"] is False and body["failed"]["attempts"] == 3 and body["failed"]["retry_at"] is None
+    assert "3 attempts" in body["error"] and "build-binary-graph.ps1 -Force" in body["error"]
+    assert "tried again" not in body["error"]
+    # a usable cache, written without the web UI, clears the record and its count: the tab is back without a restart
+    binary_graph.save_graph(_system(), path)
+    assert client.get("/api/binary-graph/query?q=imports&module=b.exe").status_code == 200
+    assert key not in tdc._binary_graph_build_state["failed"]
+    assert key not in tdc._binary_graph_build_state["attempts"]
+    os.remove(path)
+    client.get("/api/binary-graph/query?q=imports&module=b.exe")
+    _join(tdc)
+    assert len(builds) == 4
+
+
+def test_failed_builds_of_a_missing_cache_count_toward_the_cap_too(client, tdc, graph_host, monkeypatch):
+    path, _, _ = graph_host
+    os.remove(path)
+    key = ("26220.5770", "arm64")
+    calls = []
+
+    def failing(build, arch):
+        calls.append(build)
+        raise RuntimeError("binary_graph.py exited with 1: the cache cannot be written (OSError)")
+
+    monkeypatch.setattr(tdc, "_build_binary_graph", failing)
+    for _ in range(5):
+        client.get("/api/binary-graph/query?q=imports&module=b.exe")
+        _join(tdc)
+        if key in tdc._binary_graph_build_state["failed"]:
+            _past_the_throttle(tdc, key)
+    assert len(calls) == 3
+    body = client.get("/api/binary-graph/query?q=imports&module=b.exe").get_json()
+    assert "3 attempts" in body["error"] and "OSError" in body["error"]
