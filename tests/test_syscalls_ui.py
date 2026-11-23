@@ -2248,6 +2248,36 @@ def test_a_process_that_has_exited_is_not_searched_but_its_file_is_and_the_note_
 
 
 @needs_node
+def test_a_process_search_that_could_not_prove_says_which_module_it_could_not_account_for():
+    r = _panels(STUBS_FLOW + r"""
+      (async () => {
+        await searchable();
+        const original = stubsRoute;
+        routes['/api/syscalls/stubs'] = (url, options) => { const answer = original(url, options);
+            if (JSON.parse(options.body).pid) Object.assign(answer.body, { doors_complete: false,
+                doors_note: 'C:\\Program Files\\Hook\\engine.dll is a loaded module the binary graph does not hold' });
+            return answer; };
+        await runSyscallStubs();
+        const incomplete = els['syscall-stubs-body'].innerHTML;
+        routes['/api/syscalls/stubs'] = (url, options) => { const answer = original(url, options);
+            if (JSON.parse(options.body).pid) Object.assign(answer.body, { doors_complete: true, doors_note: '' });
+            return answer; };
+        await runSyscallStubs();
+        out({ incomplete, complete: els['syscall-stubs-body'].innerHTML });
+      })();""")
+    assert "engine.dll is a loaded module the binary graph does not hold" in r["incomplete"]
+    assert "no proof" in r["incomplete"].lower()
+    assert "no proof" not in r["complete"].lower()
+
+
+@needs_node
+def test_the_list_does_not_say_process_memory_can_never_prove():
+    low = _stubs("{ hits: [%s] }" % HIT).lower()
+    assert "always for a stub in process memory" not in low
+    assert "binary graph" in low, "it says what a stub in process memory needs to be a proof"
+
+
+@needs_node
 def test_the_search_needs_a_target_and_runs_once_at_a_time():
     r = _panels(STUBS_FLOW + r"""
       (async () => {

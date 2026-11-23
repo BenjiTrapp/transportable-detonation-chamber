@@ -569,6 +569,22 @@ mitgebrachten Stub daher nie sähe.
   kuratierte Zeile führt, bleibt `import_present` **unbekannt** und der Treffer ein
   Hinweis — ebenso, wenn die Importtabelle nicht lesbar ist. Ein Befund darf nie
   mehr behaupten, als die Daten tragen.
+- **Im Prozessspeicher ist der Nenner die Vereinigung aller geladenen Module.**
+  Privater, ausführbarer Speicher gehört nicht dem Sample allein: eine Hook-Engine,
+  die Interception-Thunks eines Browser-Brokers oder eine Laufzeit legen dort
+  ebenfalls Stubs an. Ein Stub dort wird daher gegen die Türen geprüft, die **jedes
+  geladene Modul** importiert, nie gegen die Importtabelle des Images allein. Die
+  Importtabellen der System32-Binaries hält der Binary-Graph-Cache; ein Modul zählt
+  nach seinem Pfad, nicht nach seinem Namen, und nur eines, das direkt aus System32
+  geladen ist und das der Cache hält, trägt bei. Die Importe des Images selbst kommen
+  aus seiner Datei. Kennt der Cache ein geladenes Modul nicht (eine Sample-eigene
+  DLL, eine Laufzeit oder Hook-Engine außerhalb System32, eine von anderswo geladene
+  DLL mit System32-Namen, ein abgeschnittener Eintrag), läuft der Prozess in einer
+  anderen Sicht als der Cache, fehlt der Cache oder ändert sich die Modulliste
+  während der Suche, ist die Vereinigung **unvollständig**: `import_present` bleibt
+  dann unbekannt, nie False. Ein fehlendes Modul ist eine fehlende Tür, und eine
+  fehlende Tür wäre eine falsche Anklage. Exporte zählen in der Vereinigung nicht:
+  kein Export löst auf privaten Speicher auf, und ntdll exportiert jeden Nt-Namen.
 - **Eigene Route** `POST /api/syscalls/stubs` mit `pid` oder `path`.
 - Dieser Befund ist die Eingabe für die generierte YARA-Regel aus Ziel 5.2.
 

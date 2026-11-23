@@ -11,6 +11,7 @@ A colon cannot be part of a Windows file name, so a syscall id never collides wi
 
 from __future__ import annotations
 
+import ntpath
 from dataclasses import asdict, dataclass
 
 import binary_graph
@@ -499,3 +500,83 @@ QUERIES = {
 def answer_json(answer: Answer) -> dict:
     """The answer as plain JSON data."""
     return asdict(answer)
+
+
+
+# --- the doors of a process -----------------------------------------------------------------------------------------
+
+def _windows_path(path):
+    return ntpath.normcase(ntpath.normpath(path))
+
+
+def _record_doors(graph, info, names):
+    """Add the names `info` imports to `names`; the reason the record cannot speak for its imports, or "".
+
+    An import by ordinal is named by the cache: the record of the module it is imported from, followed through its
+    forwarders and api sets. One the cache cannot name may be a door, so it leaves the union incomplete."""
+    if info.partial:
+        return f"the import table of {info.name} was cut short when it was read"
+    for module, functions in info.imports.items():
+        for function in functions:
+            if not function.startswith("#"):
+                names.add(function)
+                continue
+            resolution = binary_graph.resolve_export(graph.binaries, graph.api_sets, module, function)
+            if resolution.reason != "defined":
+                return f"{info.name} imports {function} of {module}, which the binary graph cannot name"
+            names.update(hop.function for hop in resolution.hops)
+            names.add(resolution.function)
+    return ""
+
+
+def doors_of_process(graph, modules, table, *, view, image_path=None, image=None,
+                     system32=binary_graph.SYSTEM32) -> tuple[set[str] | None, str]:
+    """`(doors, why)`: the names every loaded module of a process imports, expanded through the Win32 to Nt `table`,
+    or None and the reason when that union is incomplete. Only a complete union may carry a proof that a stub in the
+    process's private memory goes around every documented path.
+
+    `modules` is the reader's list (`name`, `base`, `size`, `path`). A module counts by its path, never its name: one
+    directly in `system32` is the file the cache read, and contributes the imports of its record there. The process
+    image counts by the record `image` read from the file at `image_path`. Any other module (a sample's own DLL, one
+    of a runtime or a hook engine outside System32, a DLL of System32's name side-loaded from elsewhere, one in
+    System32 the cache does not hold, or whose record was cut short) leaves the union incomplete, and so does a list
+    that cannot be had, a module without a path, an image not identified or not read, and a process of another view
+    than the cache's (an x64 process on ARM64 runs the x64 side of the ARM64X binaries the cache read the native side
+    of). A door is what a module imports; no module's exports count: the stub lies in private memory, which no
+    export resolves to, and ntdll exports every Nt name."""
+    if graph.arch != view:
+        return None, f"the binary graph is of {graph.arch}, the process runs as {view}"
+    if not modules:
+        return None, "the modules of the process could not be listed"
+    folder = _windows_path(system32)
+    image_at = _windows_path(image_path) if image_path else None
+    names, image_seen = set(), False
+    for module in modules:
+        path = module.get("path") if isinstance(module, dict) else None
+        if not isinstance(path, str) or not path:
+            return None, "a loaded module has no path"
+        at = _windows_path(path)
+        if at == image_at:
+            image_seen = True
+            if image is None:
+                return None, f"the import table of the process image {path} could not be read"
+            why = _record_doors(graph, image, names)
+        else:
+            directory, name = ntpath.split(at)
+            info = graph.binaries.get(name) if directory == folder else None
+            if info is None:
+                return None, f"{path} is a loaded module the binary graph does not hold"
+            why = _record_doors(graph, info, names)
+        if why:
+            return None, why
+    if not image_seen:
+        return None, "the process image is not among the loaded modules"
+    return table.expand(names), ""
+
+
+def imported_doors(graph, modules, table, *, view, image_path=None, image=None,
+                   system32=binary_graph.SYSTEM32) -> set[str] | None:
+    """The doors of `doors_of_process`, None when the union is incomplete: the expanded set to pass to
+    syscall_scan.find_stubs_in_process, with the table's `covered`, only when it is not None."""
+    return doors_of_process(graph, modules, table, view=view, image_path=image_path, image=image,
+                            system32=system32)[0]

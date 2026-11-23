@@ -8387,7 +8387,8 @@ def _syscall_stage_file(path, baseline):
     """`(hits, info)`: the stubs the file at `path` carries and what is known of the search. A file that cannot be
     searched is a note in `info`. The names the file holds (imports and exports) are passed raw and expanded through
     the Win32 to Nt table: only the expanded set can prove a bypass, and only for a syscall a curated row leads to.
-    This is where a detonation's proof comes from: the file is the sample's own, its process memory is not."""
+    The file speaks for the sample alone; its process memory, searched beside it, speaks for everything loaded there
+    and proves only when the binary graph holds every loaded module (_syscall_search_process)."""
     if not isinstance(path, str) or not path:
         return [], {"skipped": "the path of the sample is not known"}
     real = _readable_path(path)
@@ -8420,20 +8421,23 @@ def _syscall_stage(pid, path):
     measured = _syscall_read_process(
         pid, view, build,
         lambda reader: syscall_scan.measure(baseline, reader, view, build, modules, _get_hook_allowlist()))
-    # the process first, while it is as the detonation left it. Its private memory cannot be attributed to the
-    # sample, so the search proves nothing there: a stub in it is a hint, and a proof can only come from the file
+    # the process first, while it is as the detonation left it. Its private memory is not the sample's alone: a stub
+    # there proves a bypass only against the doors of every loaded module, and stays a hint while one is unknown
     try:
-        found = _syscall_read_process(
-            pid, view, build, lambda reader: syscall_scan.find_stubs_in_process(reader, baseline))
+        image_path = _image_path_for_pid(pid)
+        imports = _pe_import_names_of_file(image_path)
+        found, doors_note = _syscall_search_process(pid, view, build, baseline, image_path, imports)
         # StubScan's own attributes are lost to list() and json.dumps: they become keys here
-        in_process = {"hits": list(found), "partial": found.partial,
+        in_process = {"hits": list(found), "partial": found.partial, "imports_read": imports is not None,
+                      "doors_complete": not doors_note, "doors_note": doors_note,
                       "regions_searched": found.regions_searched, "note": found.note}
     except Exception as exc:
         in_process = {"hits": [], "error": str(exc)}
     file_hits, in_file = _syscall_stage_file(path, baseline)
     in_file["hits"] = list(file_hits)
     findings = memory_evidence.collect({"syscall_scan": measured}, process=identity)
-    # the file's hits go first: a finding takes its answer from its first copy, and only the file can prove
+    # the file's hits go first: a finding takes its answer from its first copy, and the file's speaks for the sample
+    # itself, where the process's speaks for everything loaded beside it
     findings += memory_evidence.from_direct_stubs(in_file["hits"] + in_process["hits"], identity)
     return _syscall_mark_unobserved({
         **{k: v for k, v in measured.items() if k != "states"},
@@ -8590,6 +8594,60 @@ def _syscall_expanded_imports(imports):
     return {"expanded_imports": table.expand(imports), "covered": table.covered}
 
 
+def _syscall_image_record(path):
+    """The record of the process image at `path`, read as binary_graph reads a System32 binary (imports by ordinal and
+    a table cut short kept as such); None when it cannot be read or is larger than SYSCALL_FILE_MAX."""
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        if os.path.getsize(path) > SYSCALL_FILE_MAX:
+            return None
+        return binary_graph.extract_binary(path)
+    except (OSError, binary_graph.ExtractError):
+        return None
+
+
+def _syscall_module_identity(listed):
+    return None if listed is None else sorted((str(m.get("path")), m.get("base")) for m in listed)
+
+
+def _syscall_search_process(pid, view, build, baseline, image_path, imports):
+    """`(found, doors_note)`: the stub search of the process `pid`, and why it could not prove, "" when it could.
+
+    A stub in private memory is judged against the union of the doors every loaded module imports
+    (binary_graph_query.doors_of_process), never against the image's table alone: the memory is not the image's
+    alone. The union needs the binary graph of this system, which is taken as it is and never built from here, and
+    is taken from the module list of the reader that searches, just before the search. A module list that changed by
+    the end of the search takes every proof back: a module loaded meanwhile may be the stub's author."""
+    graph, _ = _binary_graph_for(start_build=False)
+    table, why = None, ""
+    if graph is None:
+        why = "there is no binary graph of this system to read the imports of the loaded modules from"
+    else:
+        try:
+            table = win32_to_nt.load_table()
+        except win32_to_nt.TableError as exc:
+            why = f"the Win32 to Nt table is unusable: {exc}"
+    image = _syscall_image_record(image_path) if table is not None else None
+
+    def work(reader):
+        doors, note = None, why
+        listed = reader.modules() if table is not None else None
+        if table is not None:
+            doors, note = binary_graph_query.doors_of_process(graph, listed, table, view=view,
+                                                              image_path=image_path, image=image)
+        keywords = {"expanded_imports": doors, "covered": table.covered} if doors is not None else {}
+        found = syscall_scan.find_stubs_in_process(reader, baseline, imports, **keywords)
+        if doors is not None and _syscall_module_identity(reader.modules()) != _syscall_module_identity(listed):
+            note = "the modules of the process changed during the search"
+            for hit in found:
+                if hit.get("import_present") is False:
+                    hit["import_present"] = None
+        return found, note
+
+    return _syscall_read_process(pid, view, build, work)
+
+
 def _pe_import_names_of_file(path):
     """The import table of the PE at `path` (a process image), None when it cannot be read or is too large."""
     if not isinstance(path, str) or not path:
@@ -8671,8 +8729,10 @@ def api_syscalls_stubs():
     Each hit names the syscall of its number. For a file `import_present` is tri-state: False for a syscall a curated
     Win32 to Nt row leads to and the file's imports and exports, expanded through that table, do not hold (a proven
     bypass); True for one they hold; None where no row leads to the syscall or the file is no PE that can be read
-    (see syscall_scan.find_stubs_in_bytes). For a process it is True when the image imports the function and None
-    otherwise, never False: its private memory cannot be attributed to the image."""
+    (see syscall_scan.find_stubs_in_bytes). For a process it is judged against the doors every loaded module imports
+    (_syscall_search_process): False only when the binary graph of this system holds every loaded module and none of
+    them, the image included, imports a door to the syscall; True when one does, or the image imports the function;
+    None otherwise. `doors_complete` says whether that union could be built, and `doors_note` why not."""
     data = _syscall_body()
     pid_given, path_given = data.get("pid") not in (None, ""), data.get("path") not in (None, "")
     if pid_given == path_given:
@@ -8681,13 +8741,13 @@ def api_syscalls_stubs():
         pid = _syscall_pid(data.get("pid"))
         view, baseline = _syscall_target(pid)
         build = _current_os_build()
-        # the raw table of the image can say that the function is imported as well, never that it is not:
-        # private memory is not the image's alone (a hook engine, a sandbox broker, a runtime put stubs there)
-        imports = _pe_import_names_of_file(_image_path_for_pid(pid))
-        found = _syscall_read_process(
-            pid, view, build, lambda reader: syscall_scan.find_stubs_in_process(reader, baseline, imports))
+        # the raw table of the image can say that the function is imported as well, without the binary graph too
+        image_path = _image_path_for_pid(pid)
+        imports = _pe_import_names_of_file(image_path)
+        found, doors_note = _syscall_search_process(pid, view, build, baseline, image_path, imports)
         process = _syscall_identity(pid)
         result = {"mode": "process", "pid": pid, "process": process, "imports_read": imports is not None,
+                  "doors_complete": not doors_note, "doors_note": doors_note,
                   "partial": found.partial, "regions_searched": found.regions_searched, "note": found.note}
     else:
         if data.get("view") in (None, ""):
@@ -9032,14 +9092,15 @@ def _binary_graph_refusal(error, build=None, arch=None):
     return {"error": error, "cache": None, "building": building, "failed": record}
 
 
-def _binary_graph_for():
+def _binary_graph_for(start_build=True):
     """`(graph, None)` for this system's build and architecture, or `(None, refusal)`: the JSON body of a 404, with
     `cache` null, that says why. A cache of another build or architecture is no graph: there is exactly one per
     system, and the architecture is the registry's (binary_graph.host_arch), never `platform.machine()`, which an
     emulated x64 Python on ARM64 answers with AMD64. A cache that is missing or does not load is built in the
     background, as build-binary-graph.ps1 does at provisioning; a failed build is not tried again for
     BINARY_GRAPH_BUILD_RETRY seconds, and a build that ended well but left a cache that still does not load counts as
-    failed."""
+    failed. With `start_build` False nothing is built: a syscall scan takes the graph that is there, and does not start
+    minutes of reading System32 under a sample being observed."""
     build = _current_os_build()
     if not build:
         return None, _binary_graph_refusal("No binary graph can be chosen: the build of this system cannot be "
@@ -9050,7 +9111,8 @@ def _binary_graph_for():
     if stamp is None:
         with _binary_graph_held_lock:
             _binary_graph_held.clear()          # its file is gone: no reason to keep 40-90 MB of it
-        _start_binary_graph_build(build, arch)
+        if start_build:
+            _start_binary_graph_build(build, arch)
         return None, _binary_graph_refusal(f"There is no binary graph for build {build} ({arch}) yet.", build, arch)
     with _binary_graph_held_lock:
         if _binary_graph_held.get("path") != path or _binary_graph_held.get("stamp") != stamp:
@@ -9070,7 +9132,8 @@ def _binary_graph_for():
                                            f"it is read again on the next request.", build, arch)
     if isinstance(loaded, binary_graph.CacheMismatch):
         _rebuild_did_not_help(build, arch, stamp, loaded.reason)
-        _start_binary_graph_build(build, arch)
+        if start_build:
+            _start_binary_graph_build(build, arch)
         return None, _binary_graph_refusal(
             f"The binary graph {os.path.basename(path)} cannot be used ({loaded.reason}: {loaded}).", build, arch)
     _forget_binary_graph_failure(build, arch)

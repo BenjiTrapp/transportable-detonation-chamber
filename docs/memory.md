@@ -216,11 +216,21 @@ a sample that publishes its own stub that way escapes the proof, but a non-`ntdl
 PE exporting syscall stubs is a loud indicator in its own right, so a silent free
 escape becomes a noisy one.
 
-Two limits follow from the rule. A stub found in process memory is a hint even when
-no door is imported: private executable memory cannot be attributed (a hook
-engine, a browser sandbox's interception thunks or a runtime put stubs there too),
-so process mode says only whether the image imports the function as well, and the
-proof comes from the sample file. And some covered syscalls almost never yield a
+Two limits follow from the rule. Private executable memory is not the sample's
+alone (a hook engine, a browser sandbox's interception thunks or a runtime put
+stubs there too), so a stub found there is judged against the union of the doors
+every loaded module imports, never against the image's import table alone. The
+binary graph of the system holds the import table of every System32 binary, which
+makes that union cheap; a module is counted by its path, and only one loaded
+directly from System32 that the graph holds contributes. The image's own imports
+are read from its file. A module the graph does not hold (the sample's own DLL, a
+runtime or hook engine outside System32, a DLL of a System32 name side-loaded from
+elsewhere, one whose table was cut short), a process in another view than the
+graph's, or a module list that changed during the search leaves the union
+incomplete, and the stub stays a hint (`doors_complete` `false`, with the module
+named in `doors_note`): a missing module is a missing door. Without a graph,
+process mode says only whether the image imports the function as well, and the
+proof can come only from the sample file. And some covered syscalls almost never yield a
 proof: nearly every binary imports `FreeLibrary` (a door to
 `NtUnmapViewOfSection`) and `CreateThread` or `_beginthreadex` (doors to
 `NtCreateThreadEx`), so a carried stub for hollowing or remote thread creation is

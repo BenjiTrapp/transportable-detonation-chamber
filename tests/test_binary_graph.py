@@ -310,7 +310,8 @@ def test_the_detonation_stage_proves_a_bypass_for_the_sample_file(tdc, target, s
     path = _loader(sample_dir, "GetLastError")
     result = tdc._run_syscall_stage(4812, str(path), [])
     stubs = result["stubs"]
-    # the proof arrives through the file; the process copy is a hint, as its memory cannot be attributed
+    # the proof arrives through the file; without a binary graph the process copy is a hint, as the doors of the
+    # modules loaded beside the sample are not known
     assert [h["import_present"] for h in stubs["process"]["hits"]] == [None]
     assert [h["import_present"] for h in stubs["file"]["hits"]] == [False]
     assert stubs["file"]["imports_read"] is True
@@ -398,6 +399,19 @@ STALE_PHRASES = (
     "Plan 2 schaltet den Beleg frei",                       # the spec, goal 7a
 )
 
+# what Task 1 said while no union of a process's doors could be built; each became false the day the binary graph
+# could build it, and stays true only for a union that is incomplete
+STALE_PROCESS_PHRASES = (
+    "never `false`: private memory cannot be attributed",   # docs/api.md, the stubs route
+    "never False: its private memory cannot be attributed",  # app.py, api_syscalls_stubs
+    "so process mode says only whether the image imports",  # docs/memory.md, the limits of the rule
+    "the file is the sample's own, its process memory is not",  # app.py, _syscall_stage_file
+    "Until a caller can build that union",                  # syscall_scan.py, find_stubs_in_process
+    "so only the file can prove",                           # app.js, over renderSyscallStubs
+    "always for a stub in process memory",                  # app.js, the hint over the stub list
+    "the search proves nothing there",                      # app.py, _syscall_stage
+)
+
 
 def test_no_shipped_text_still_says_the_win32_to_nt_table_is_missing():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -410,7 +424,8 @@ def test_no_shipped_text_still_says_the_win32_to_nt_table_is_missing():
     for path in paths:
         with open(path, encoding="utf-8") as fh:
             text = " ".join(fh.read().split())
-        found += [(os.path.relpath(path, root), phrase) for phrase in STALE_PHRASES if phrase in text]
+        found += [(os.path.relpath(path, root), phrase) for phrase in STALE_PHRASES + STALE_PROCESS_PHRASES
+                  if phrase in text]
     assert found == []
 
 
@@ -418,7 +433,7 @@ def test_the_stub_list_changed_and_so_did_its_asset_version():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     with open(os.path.join(root, "webui", "templates", "index.html"), encoding="utf-8") as fh:
         html = fh.read()
-        assert "app.js?v=136" not in html and "app.js?v=137" not in html, "app.js changed, its version did not"
+        assert all(f"app.js?v={v}\"" not in html for v in (136, 137, 138)), "app.js changed, its version did not"
 
 
 def test_an_expanded_import_set_without_its_coverage_is_refused(x64_baseline):
@@ -2830,3 +2845,249 @@ def test_a_deleted_cache_lets_go_of_the_graph_it_held(client, tdc, graph_host):
     assert client.get("/api/binary-graph/query?q=imports&module=b.exe").status_code == 404
     _join(tdc)
     assert tdc._binary_graph_held == {}
+
+
+# --- the doors of a process: the union over every loaded module (binary_graph_query.imported_doors) -------------------
+
+_SYS32 = "C:\\Windows\\System32\\"
+_IMAGE = "C:\\Samples\\sample.exe"
+
+
+def _doors_graph(*extra, arch="x64"):
+    """A System32 in which no binary imports a door to NtWriteVirtualMemory, whatever ntdll and kernelbase export."""
+    return _query_graph(
+        _q("ntdll.dll", exports=["NtWriteVirtualMemory", "ZwWriteVirtualMemory", "NtClose", "ZwClose"]),
+        _q("kernelbase.dll", imports={"ntdll.dll": ("NtClose",)}, exports=["WriteProcessMemory", "CloseHandle"]),
+        _q("kernel32.dll", imports={"kernelbase.dll": ("CloseHandle",)}, exports=["CloseHandle"],
+           forwarders={"WriteProcessMemory": "kernelbase.WriteProcessMemory"}),
+        *extra, arch=arch)
+
+
+def _image(*functions):
+    """The record of the process image, read from its file as binary_graph reads a System32 binary."""
+    return _q("sample.exe", "exe", imports={"kernel32.dll": tuple(functions) or ("GetLastError",)})
+
+
+def _loaded(*paths):
+    """The reader's module list: the image first, as EnumProcessModulesEx gives it."""
+    return [{"name": path.rsplit("\\", 1)[-1], "base": 0x7FF000000000 + i * 0x100000, "size": 0x1000, "path": path}
+            for i, path in enumerate(paths)]
+
+
+_SYSTEM_MODULES = tuple(_SYS32 + name for name in ("ntdll.dll", "kernel32.dll", "kernelbase.dll"))
+
+
+def _doors(graph, modules, image=None, view="x64", image_path=_IMAGE):
+    return binary_graph_query.imported_doors(graph, modules, win32_to_nt.load_table(), view=view,
+                                             image_path=image_path, image=image if image is not None else _image())
+
+
+def _process_hit(baseline, doors):
+    """The one hit of a NtWriteVirtualMemory stub in private memory, searched as the web UI searches a process: with
+    the union and its coverage when there is one, with nothing that could prove when there is none."""
+    table = win32_to_nt.load_table()
+    keywords = {"expanded_imports": doors, "covered": table.covered} if doors is not None else {}
+    (hit,) = syscall_scan.find_stubs_in_process(_x64_space(b"\x90" * 0x40 + _X64_STUB_0x3A + b"\xc3"), baseline,
+                                                None, **keywords)
+    return hit
+
+
+def test_a_loaded_module_the_cache_does_not_know_keeps_the_answer_unknown(x64_baseline):
+    # a sample's own DLL, and a DLL in System32 the cache does not hold (dropped there after the build, or skipped):
+    # its imports are a door the union cannot see, and a missing door is a false accusation
+    for stranger in ("C:\\Samples\\helper.dll", _SYS32 + "dropped.dll"):
+        doors = _doors(_doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES, stranger))
+        assert _process_hit(x64_baseline, doors)["import_present"] is None, stranger
+        assert doors is None, stranger
+
+
+def test_a_process_whose_modules_import_no_door_still_proves_a_bypass(x64_baseline):
+    # ntdll exports NtWriteVirtualMemory and kernelbase WriteProcessMemory: a door is what a module imports, never
+    # what one exports, or ntdll alone would switch the proof off in every process
+    doors = _doors(_doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES))
+    assert "GetLastError" in doors and "CloseHandle" in doors and "NtClose" in doors
+    hit = _process_hit(x64_baseline, doors)
+    assert hit["import_present"] is False
+    (finding,) = memory_evidence.from_direct_stubs([hit], "sample.exe")
+    assert finding["needs_corroboration"] is False
+
+
+def test_the_doors_of_every_loaded_module_count_as_the_documented_path(x64_baseline):
+    # dbghelp, not the sample, imports WriteProcessMemory: the process holds a door, whoever's it is
+    dbghelp = _q("dbghelp.dll", imports={"kernel32.dll": ("WriteProcessMemory",)})
+    doors = _doors(_doors_graph(dbghelp), _loaded(_IMAGE, *_SYSTEM_MODULES, _SYS32 + "dbghelp.dll"))
+    assert "NtWriteVirtualMemory" in doors
+    assert _process_hit(x64_baseline, doors)["import_present"] is True
+    # and the image's own imports count as well, read from its file
+    doors = _doors(_doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES), image=_image("WriteProcessMemory"))
+    assert _process_hit(x64_baseline, doors)["import_present"] is True
+
+
+def test_a_module_outside_system32_contributes_no_exports_to_the_union(x64_baseline):
+    # a sample side-loads its own version.dll, or a kernel32.dll of its folder: the cache's record of the System32
+    # file of that name says nothing about the file loaded, its imports no more than its exports
+    version = _q("version.dll", imports={"kernel32.dll": ("CloseHandle",)}, exports=["GetFileVersionInfoW"])
+    for planted in ("C:\\Samples\\version.dll", "C:\\Samples\\kernel32.dll", _SYS32 + "downlevel\\version.dll",
+                    "C:\\Windows\\SysWOW64\\version.dll", "\\\\?\\C:\\Windows\\System32\\version.dll"):
+        modules = _loaded(_IMAGE, *[m for m in _SYSTEM_MODULES if not planted.endswith("kernel32.dll")
+                                    or "kernel32" not in m], planted)
+        doors = _doors(_doors_graph(version), modules)
+        assert _process_hit(x64_baseline, doors)["import_present"] is None, planted
+    # the same name loaded from System32 is the file the cache read
+    doors = _doors(_doors_graph(version), _loaded(_IMAGE, *_SYSTEM_MODULES, "c:\\windows\\system32\\VERSION.DLL"))
+    assert _process_hit(x64_baseline, doors)["import_present"] is False
+
+
+def test_a_record_cut_short_when_it_was_read_leaves_the_union_incomplete(x64_baseline):
+    # the door may be in the part of the import table pefile did not read
+    cut = _q("dbghelp.dll", imports={"kernel32.dll": ("CloseHandle",)}, partial=True)
+    doors = _doors(_doors_graph(cut), _loaded(_IMAGE, *_SYSTEM_MODULES, _SYS32 + "dbghelp.dll"))
+    assert _process_hit(x64_baseline, doors)["import_present"] is None
+    cut_image = _q("sample.exe", "exe", imports={"kernel32.dll": ("GetLastError",)}, partial=True)
+    doors = _doors(_doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES), image=cut_image)
+    assert _process_hit(x64_baseline, doors)["import_present"] is None
+
+
+def _with_ordinals(info, ordinal_names):
+    return binary_graph.BinaryInfo(**{**info.__dict__, "ordinal_names": dict(ordinal_names)})
+
+
+def test_an_import_by_ordinal_counts_by_the_name_the_cache_gives_it(x64_baseline):
+    kernelbase = _with_ordinals(_q("kernelbase.dll", imports={"ntdll.dll": ("NtClose",)},
+                                   exports=["WriteProcessMemory", "CloseHandle"]), {7: "WriteProcessMemory"})
+    graph = _doors_graph()
+    graph = _query_graph(*[kernelbase if name == "kernelbase.dll" else info for name, info in graph.binaries.items()],
+                         _q("dbghelp.dll", imports={"kernelbase.dll": ("#7",)}), arch="x64")
+    doors = _doors(graph, _loaded(_IMAGE, *_SYSTEM_MODULES, _SYS32 + "dbghelp.dll"))
+    assert _process_hit(x64_baseline, doors)["import_present"] is True
+    # the image imports by ordinal as well: its record is read like any other
+    image = _q("sample.exe", "exe", imports={"kernelbase.dll": ("#7",)})
+    doors = _doors(graph, _loaded(_IMAGE, *_SYSTEM_MODULES), image=image)
+    assert _process_hit(x64_baseline, doors)["import_present"] is True
+
+
+def test_an_import_by_ordinal_the_cache_cannot_name_leaves_the_union_incomplete(x64_baseline):
+    # an ordinal of a module the cache does not hold, or one no export of it answers to: it may be a door
+    for imports in ({"helper.dll": ("#3",)}, {"kernelbase.dll": ("#99",)}):
+        graph = _doors_graph(_q("dbghelp.dll", imports=imports))
+        doors = _doors(graph, _loaded(_IMAGE, *_SYSTEM_MODULES, _SYS32 + "dbghelp.dll"))
+        assert _process_hit(x64_baseline, doors)["import_present"] is None, imports
+
+
+def test_a_process_of_another_view_than_the_cache_is_not_judged_by_it(x64_baseline):
+    # an x64 process on ARM64 runs the x64 side of System32's ARM64X binaries, whose tables the cache did not read
+    doors = _doors(_doors_graph(arch="arm64"), _loaded(_IMAGE, *_SYSTEM_MODULES))
+    assert _process_hit(x64_baseline, doors)["import_present"] is None
+
+
+def test_an_image_that_cannot_be_read_or_identified_leaves_the_union_incomplete(x64_baseline):
+    table = win32_to_nt.load_table()
+    graph, modules = _doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES)
+    for image_path, image, listed in (
+            (_IMAGE, None, modules),                        # its file could not be read
+            ("", _image(), modules),                        # its path is not known: which module is it?
+            (_IMAGE, _image(), modules[1:]),                # the list does not hold it
+            (_IMAGE, _image(), None),                       # the modules could not be listed at all
+            (_IMAGE, _image(), []),
+            (_IMAGE, _image(), modules + [{"name": "x.dll", "base": 1, "size": 1}])):   # a module without a path
+        doors = binary_graph_query.imported_doors(graph, listed, table, view="x64", image_path=image_path,
+                                                  image=image)
+        assert _process_hit(x64_baseline, doors)["import_present"] is None, (image_path, image, listed)
+
+
+def test_the_image_is_matched_by_its_path_not_by_its_name(x64_baseline):
+    # a sample named kernel32.exe, or one whose path the reader writes in another case
+    doors = _doors(_doors_graph(), _loaded("c:\\samples\\SAMPLE.EXE", *_SYSTEM_MODULES))
+    assert _process_hit(x64_baseline, doors)["import_present"] is False
+
+
+def test_why_the_union_is_incomplete_names_the_module(x64_baseline):
+    doors, why = binary_graph_query.doors_of_process(
+        _doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES, "C:\\Samples\\helper.dll"), win32_to_nt.load_table(),
+        view="x64", image_path=_IMAGE, image=_image())
+    assert doors is None and "C:\\Samples\\helper.dll" in why
+    doors, why = binary_graph_query.doors_of_process(
+        _doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES), win32_to_nt.load_table(), view="x64",
+        image_path=_IMAGE, image=_image())
+    assert doors is not None and why == ""
+
+
+# --- the union in the web UI: the pid branch of the stubs route and the detonation stage --------------------------
+
+@pytest.fixture
+def doors_host(tdc, monkeypatch, target, sample_dir):
+    """An x64 host with the cache of _doors_graph(), and an x64 process of System32 modules and a sample image that
+    imports no door: a NtWriteVirtualMemory stub in its private memory. Returns the image path and the builds
+    started."""
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26220.5770")
+    monkeypatch.setattr(tdc.binary_graph, "host_arch", lambda *a, **k: "x64")
+    builds = []
+    monkeypatch.setattr(tdc, "_build_binary_graph", lambda build, arch: builds.append((build, arch)))
+    os.makedirs(tdc.NTSLEUTH_BASELINE_DIR, exist_ok=True)
+    binary_graph.save_graph(_doors_graph(), os.path.join(tdc.NTSLEUTH_BASELINE_DIR,
+                                                         binary_graph.cache_name("26220.5770", "x64")))
+    image = sample_dir / "sample.exe"
+    image.write_bytes(make_pe(imports=(("kernel32.dll", ("GetLastError",)),)))
+    monkeypatch.setattr(tdc, "_image_path_for_pid", lambda pid: str(image))
+    target.view = "x64"
+    target.reader = _x64_space(b"\x90" * 0x40 + _X64_STUB_0x3A + b"\xc3")
+    target.reader._m = _loaded(str(image), *_SYSTEM_MODULES)
+    return str(image), builds
+
+
+def test_the_stubs_route_proves_a_bypass_in_a_process_whose_every_module_the_cache_holds(client, doors_host):
+    body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
+    assert [h["import_present"] for h in body["hits"]] == [False]
+    assert body["doors_complete"] is True and body["doors_note"] == ""
+    assert body["evidence"]["findings"][0]["needs_corroboration"] is False
+
+
+def test_the_stubs_route_keeps_a_hint_when_a_loaded_module_is_unknown(client, target, doors_host):
+    target.reader._m = target.reader._m + _loaded("C:\\Program Files\\Hook\\engine.dll")
+    body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
+    assert [h["import_present"] for h in body["hits"]] == [None]
+    assert body["doors_complete"] is False and "engine.dll" in body["doors_note"]
+    assert body["evidence"]["findings"][0]["needs_corroboration"] is True
+
+
+def test_a_module_loaded_during_the_search_takes_the_proof_back(client, target, doors_host):
+    # the union was taken before the search; a module that arrived while it ran may be the stub's author
+    first = target.reader._m
+    later = first + _loaded("C:\\Program Files\\Hook\\engine.dll")
+    calls = []
+    target.reader.modules = lambda: calls.append(1) or (first if len(calls) == 1 else later)
+    body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
+    assert [h["import_present"] for h in body["hits"]] == [None]
+    assert body["doors_complete"] is False and "changed" in body["doors_note"]
+
+
+def test_without_a_cache_the_process_keeps_its_hint_and_no_build_starts(client, tdc, doors_host):
+    _, builds = doors_host
+    for name in os.listdir(tdc.NTSLEUTH_BASELINE_DIR):
+        if name.startswith("binary-graph-"):
+            os.remove(os.path.join(tdc.NTSLEUTH_BASELINE_DIR, name))
+    body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
+    assert [h["import_present"] for h in body["hits"]] == [None]
+    assert body["doors_complete"] is False and "binary graph" in body["doors_note"]
+    _join(tdc)
+    # a scan does not start minutes of reading System32 under a sample being observed
+    assert builds == []
+
+
+def test_the_detonation_stage_proves_a_bypass_in_the_process_when_the_union_is_complete(tdc, doors_host):
+    image, _ = doors_host
+    result = tdc._run_syscall_stage(4812, image, [])
+    process = result["stubs"]["process"]
+    assert [h["import_present"] for h in process["hits"]] == [False]
+    assert process["doors_complete"] is True
+    [finding] = [f for f in result["evidence"]["findings"] if f["kind"] == "direct_syscall_stub"]
+    assert finding["needs_corroboration"] is False
+
+
+def test_the_detonation_stage_keeps_the_process_hint_when_the_union_is_incomplete(tdc, target, doors_host):
+    image, _ = doors_host
+    target.reader._m = target.reader._m + _loaded("C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\clr.dll")
+    result = tdc._run_syscall_stage(4812, None, [])
+    process = result["stubs"]["process"]
+    assert [h["import_present"] for h in process["hits"]] == [None]
+    assert process["doors_complete"] is False and "clr.dll" in process["doors_note"]

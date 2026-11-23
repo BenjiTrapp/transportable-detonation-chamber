@@ -19619,6 +19619,7 @@ function renderSyscallStageBlock(sc) {
         if (part.skipped) text += ` · not searched: ${part.skipped}`;
         if (part.error) text += ` · failed: ${part.error}`;
         else if (part.partial) text += ` · partial: ${part.note || 'not all of it could be read'}`;
+        if (hits && part.doors_complete === false && part.doors_note) text += ` · no proof: ${part.doors_note}`;
         return `<div class="det-sub-value ${hits || part.partial || part.error ? 'det-warn' : 'muted'}">${escapeHtml(text)}</div>`;
     };
     html += search('Process memory', stubs.process) + search('Sample file', stubs.file);
@@ -25603,8 +25604,9 @@ function renderHookAllowlist(state) {
 // The syscall stubs a sample carries itself, found in its process memory and in its file. Whether the sample imports
 // the function is known as a rule, through its import set widened by the curated Win32 to Nt table: not imported
 // (import_present false) is a proven bypass, imported too (true) a hint. It is unknown (null) where no curated row
-// leads to the syscall or the import table could not be read, and for every stub in process memory that the image
-// does not import: that memory cannot be attributed to the sample, so only the file can prove. A stub whose number this build does not have
+// leads to the syscall or the import table could not be read, and for a stub in process memory whenever a module loaded
+// in the process is one the binary graph of this system does not hold: that memory is not the sample's alone, so it is
+// judged against the doors every loaded module imports, and only a complete union can prove. A stub whose number this build does not have
 // (number_known false) suggests a sample made for another build.
 // model: hits ({ ...hit, source: 'process' | 'file' }), notes ({ tone, title, text }), summary, partial.
 function renderSyscallStubs(model) {
@@ -25624,7 +25626,7 @@ function renderSyscallStubs(model) {
             imported = '<span title="Not imported, by an import set widened through the curated Win32 to Nt table: a proven bypass of the import path.">not imported</span>';
         } else {
             imported = '<span class="syscall-muted" title="No curated Win32 to Nt row leads to this syscall, the import table could not be read, or the stub ' +
-                       'is in process memory, which cannot be attributed to the sample: a missing import proves nothing.">unknown</span>';
+                       'is in process memory and a module loaded there is not in the binary graph of this system: a missing import proves nothing.">unknown</span>';
         }
         const drawable = typeof h.stub_hex === 'string' && h.stub_hex !== '' && Number.isInteger(h.number);
         rows.push('<tr>' +
@@ -25645,7 +25647,7 @@ function renderSyscallStubs(model) {
         '<p class="syscall-draft-hint"><strong>Proof or hint.</strong> A syscall stub in the sample\'s own memory or file whose function the sample does not import, ' +
         'judged by its import set widened through the curated Win32 to Nt table, is a proven bypass of ntdll. ' +
         'It stays a hint where the sample imports the function as well, where no curated row leads to the syscall, or where its import table could not be read, ' +
-        'and always for a stub in process memory, which cannot be attributed to the sample. Look at each hit before drafting a rule.</p>' +
+        'and for a stub in process memory unless every module loaded in the process is one the binary graph of this system holds: only then do their imports together name every door. Look at each hit before drafting a rule.</p>' +
         '<div class="view-table-wrap"><table class="view-table" data-sortable data-sort-id="syscall-stubs"><thead><tr><th>SYSCALL</th><th>NUMBER</th><th>BUILD</th>' +
         `<th>FOUND</th><th>PATTERN</th><th>IMPORTED</th><th></th></tr></thead><tbody>${rows.join('')}</tbody></table></div>`;
 }
@@ -26404,6 +26406,9 @@ function syscallStubsModel() {
                 notes.push({ tone: 'warn', title: `${label} search partial`, text: part.data.note || 'Not all of it could be searched.' });
             } else if (part.data.note) {
                 notes.push({ tone: 'info', title: label, text: part.data.note });
+            }
+            if (found.length && part.data.doors_complete === false && part.data.doors_note) {
+                notes.push({ tone: 'info', title: `${label}: no proof`, text: `A stub found here stays a hint, as not every door of the process is known: ${part.data.doors_note}.` });
             }
         }
     }
