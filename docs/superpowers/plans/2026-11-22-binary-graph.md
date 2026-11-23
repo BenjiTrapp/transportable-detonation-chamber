@@ -680,10 +680,18 @@ das der Cache nicht kennt (ein Sample-eigenes, eine DLL außerhalb System32), l�
 Nenner **unvollständig**: dann bleibt es bei `None`, nie bei `False`. Eine unvollständige
 Vereinigung darf keinen Beleg tragen.
 
+**Exporte zählen nur aus einem Modul, das der Cache kennt.** Nach Ruling 16 hält ein
+PE eine Tür über seine Exporte nur, wenn der Export genau den Nt- oder Zw-Namen des
+Stubs trägt *und* auf den Fundort auflöst. In der Vereinigung gilt zusätzlich: ein
+geladenes Modul, dessen Pfad nicht in System32 liegt oder das der Cache nicht hält,
+trägt **keine** Exporte bei — sonst lädt ein Sample eine eigene DLL mit erfundener
+Export-Tabelle und schaltet den Beleg für den ganzen Prozess ab.
+
 ```python
 def test_the_doors_of_every_loaded_module_count_as_the_documented_path():
 def test_a_loaded_module_the_cache_does_not_know_keeps_the_answer_unknown():
 def test_a_process_whose_modules_import_no_door_still_proves_a_bypass():
+def test_a_module_outside_system32_contributes_no_exports_to_the_union():
 ```
 
 - [ ] **Step 15: Umsetzen, lauf lassen — grün**
