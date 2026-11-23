@@ -430,19 +430,104 @@ def test_ntsleuth_keeps_the_release_names_and_installs_both_views_on_arm64():
     assert re.search(r"Session Manager\\Environment", script) and "PROCESSOR_ARCHITECTURE" in script
 
 
-def test_ntsleuth_stops_on_a_checksum_it_cannot_confirm_before_installing_anything():
+def test_ntsleuth_installs_nothing_before_the_checksums_are_verified():
     script = _script("ntsleuth")
     assert "exit 1" in _function_body(script, "Stop-Install")
+    assert "Remove-Item $Staging" in _function_body(script, "Stop-Install")
     copy = re.search(r"(?m)^[^#\n]*\bCopy-Item\b[^\n]*\$InstallDir[^\n]*$", script)
     assert copy and "-ErrorAction Stop" in copy.group(0)
-    for needle in ("SHA-256 mismatch", "no SHA-256 for"):
-        at = script.index(needle)
-        # the refusal is a call to Stop-Install, and it comes before the first byte reaches C:\tools\ntsleuth
-        assert "Stop-Install" in script[at - 200:at + 400], needle
-        assert at < copy.start(), needle
-    # nothing downloaded survives a refusal
+    # the verification is a block of its own, and all of it is in front of the first byte reaching C:\tools\ntsleuth
+    assert script.index("# --- Verify every binary") < script.index("# --- Install ---") < copy.start()
     assert re.search(r"Get-FileHash[^\n]*-Algorithm SHA256", script)
-    assert "Remove-Item $Staging" in _function_body(script, "Stop-Install")
+
+
+def _pwsh():
+    import shutil
+    pwsh = shutil.which("pwsh") or ("/opt/homebrew/bin/pwsh" if os.path.exists("/opt/homebrew/bin/pwsh") else None)
+    if not pwsh:
+        pytest.skip("pwsh not installed")
+    return pwsh
+
+
+def _verify_block(script):
+    """The verification of the real script, with its Windows path separators made portable for a pwsh on Unix."""
+    block = script[script.index("# --- Verify every binary"):script.index("# --- Install ---")]
+    return block.replace("$Staging\\", "$Staging/")
+
+
+def _run_verify(tmp_path, assets, files, checksums):
+    """Runs the script's own verification and Stop-Install on files in a staging dir.
+
+    Returns (exit code, output, whether the line after the block, where the install begins, was reached)."""
+    import subprocess
+    script = _script("ntsleuth")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    for name, data in files.items():
+        (staging / name).write_bytes(data)
+    (staging / "checksums.txt").write_bytes(checksums.encode("ascii"))
+    body = _function_body(script, "Stop-Install")
+    program = (
+        "Set-StrictMode -Version Latest\n"
+        f"$Staging = '{staging}'\n$Tag = 'v0'\n"
+        "$Assets = @(" + ", ".join(f"'{a}'" for a in assets) + ")\n"
+        "function Stop-Install([string]$Message) {\n" + body.replace("Remove-Item $Staging", "Write-Host \"STOPPED\"; Remove-Item $Staging") + "}\n"
+        + _verify_block(script) + "\nWrite-Host 'REACHED-INSTALL'\n")
+    path = tmp_path / "verify.ps1"
+    path.write_text(program)
+    proc = subprocess.run([_pwsh(), "-NoProfile", "-File", str(path)], capture_output=True, text=True, timeout=60)
+    return proc.returncode, proc.stdout + proc.stderr, "REACHED-INSTALL" in proc.stdout, staging.exists()
+
+
+def _sums(files, tamper=(), drop=()):
+    """checksums.txt as the release publishes it: upper-case hex, two spaces, CRLF."""
+    import hashlib
+    lines = []
+    for name, data in files.items():
+        if name in drop:
+            continue
+        digest = hashlib.sha256(b"tampered" if name in tamper else data).hexdigest().upper()
+        lines.append(f"{digest}  {name}\r\n")
+    return "".join(lines)
+
+
+NTSLEUTH_FILES = {"ntsleuth-arm64.exe": b"arm64 binary", "ntsleuth-x64.exe": b"x64 binary", "ntsleuth-x86.exe": b"x86 binary"}
+
+
+def test_ntsleuth_verification_passes_files_that_match_the_published_sums(tmp_path):
+    for n, assets in enumerate((["ntsleuth-x64.exe"], ["ntsleuth-arm64.exe", "ntsleuth-x64.exe"])):
+        (tmp_path / str(n)).mkdir()
+        code, out, reached, _ = _run_verify(tmp_path / str(n), assets, NTSLEUTH_FILES, _sums(NTSLEUTH_FILES))
+        assert code == 0 and reached and "STOPPED" not in out, out
+        for asset in assets:
+            assert f"SHA-256 verified: {asset}" in out
+
+
+@pytest.mark.parametrize("assets,tampered", [
+    (["ntsleuth-x64.exe"], "ntsleuth-x64.exe"),
+    (["ntsleuth-arm64.exe", "ntsleuth-x64.exe"], "ntsleuth-x64.exe"),
+    (["ntsleuth-arm64.exe", "ntsleuth-x64.exe"], "ntsleuth-arm64.exe"),
+])
+def test_ntsleuth_verification_refuses_a_binary_whose_hash_differs(tmp_path, assets, tampered):
+    # the sums say one thing, the file is another: whichever of the binaries it is, nothing goes on to the install
+    code, out, reached, staging_kept = _run_verify(tmp_path, assets, NTSLEUTH_FILES, _sums(NTSLEUTH_FILES, tamper=(tampered,)))
+    assert code == 1 and not reached, out
+    assert f"SHA-256 mismatch for {tampered}" in out
+    assert not staging_kept, "the download survived the refusal"
+
+
+def test_ntsleuth_verification_refuses_a_binary_the_sums_do_not_list(tmp_path):
+    code, out, reached, staging_kept = _run_verify(
+        tmp_path, ["ntsleuth-arm64.exe", "ntsleuth-x64.exe"], NTSLEUTH_FILES, _sums(NTSLEUTH_FILES, drop=("ntsleuth-x64.exe",)))
+    assert code == 1 and not reached and "has no SHA-256 for ntsleuth-x64.exe" in out, out
+    assert not staging_kept
+
+
+def test_ntsleuth_verification_refuses_an_unreadable_or_garbled_sums_file(tmp_path):
+    for n, text in enumerate(("", "not a checksum file\r\n", "abc123  ntsleuth-x64.exe\r\n")):
+        (tmp_path / str(n)).mkdir()
+        code, out, reached, _ = _run_verify(tmp_path / str(n), ["ntsleuth-x64.exe"], NTSLEUTH_FILES, text)
+        assert code == 1 and not reached, out
 
 
 def test_ntsleuth_marker_follows_the_self_test_and_precedes_the_baselines():
@@ -585,3 +670,55 @@ def test_ntsleuth_script_parses():
            f"'{path}', [ref]$null, [ref]$e); if ($e) {{ $e | ForEach-Object {{ $_.Message }}; exit 1 }}")
     proc = subprocess.run([pwsh, "-NoProfile", "-Command", cmd], capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_ntsleuth_reads_the_exit_code_through_a_cached_process_handle():
+    # Windows PowerShell 5.1 reads ExitCode as $null after WaitForExit(ms) unless Handle was taken first; a $null code
+    # fails every self-test of a working install, and a failing self-test now ends the script with exit 1
+    body = _function_body(_script("ntsleuth"), "Invoke-NtSleuth")
+    assert body.index("Start-Process") < body.index("$null = $proc.Handle") < body.index("$proc.WaitForExit(") < body.index("$proc.ExitCode")
+
+
+def _run_view_comparison(tmp_path, arm64_json, x64_json):
+    """Runs the script's comparison of the two ARM64 views on baseline files in a temp dir."""
+    import subprocess
+    script = _script("ntsleuth")
+    start = script.index("# On ARM64 the x64 binary has to see")
+    end = script.index('Write-Host "`n[+] NTSleuth installation complete!"')
+    block = script[start:end].replace("$BaselineDir\\", "$BaselineDir/")
+    baseline_dir = tmp_path / "baseline"
+    baseline_dir.mkdir()
+    for view in ("arm64", "x64"):
+        (baseline_dir / f"ntsleuth-26220.5770-{view}.json").write_text("{}")
+    program = (
+        "Set-StrictMode -Version Latest\n"
+        f"$BaselineDir = '{baseline_dir}'\n$build = '26220.5770'\n$isArm64 = $true\n$stored = @('arm64', 'x64')\n"
+        f"$extractions = @{{ arm64 = '{arm64_json}'; x64 = '{x64_json}' }}\n"
+        "function Get-ViewFingerprint([string]$Json) {\n" + _function_body(script, "Get-ViewFingerprint") + "}\n"
+        + block + "\nWrite-Host \"STORED=$($stored -join ',')\"\n")
+    path = tmp_path / "compare.ps1"
+    path.write_text(program)
+    proc = subprocess.run([_pwsh(), "-NoProfile", "-File", str(path)], capture_output=True, text=True, timeout=60)
+    files = sorted(f.name for f in baseline_dir.iterdir())
+    return proc.returncode, proc.stdout + proc.stderr, files
+
+
+def _view_json(stub):
+    return '{"syscalls":[{"name":"A","rva":5392,"stub_bytes":"%s"}]}' % stub
+
+
+def test_ntsleuth_identical_views_leave_no_x64_baseline_behind(tmp_path):
+    same = _view_json("a10900d4c0035fd6")
+    code, out, files = _run_view_comparison(tmp_path, same, same)
+    assert code == 0, out
+    assert "BASELINES IDENTICAL" in out
+    # the web UI finds a baseline by name: the one of the wrong view must not be there to be found
+    assert files == ["ntsleuth-26220.5770-arm64.json"], files
+    assert "STORED=arm64" in out
+
+
+def test_ntsleuth_different_views_keep_both_baselines(tmp_path):
+    code, out, files = _run_view_comparison(tmp_path, _view_json("a10900d4c0035fd6"), _view_json("4c8bd1b8c0000000"))
+    assert code == 0 and "BASELINES IDENTICAL" not in out, out
+    assert files == ["ntsleuth-26220.5770-arm64.json", "ntsleuth-26220.5770-x64.json"]
+    assert "STORED=arm64,x64" in out

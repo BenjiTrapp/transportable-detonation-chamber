@@ -43,7 +43,8 @@
 #
 # On ARM64 the two baselines are compared: ntsleuth-x64.exe has to see the x64
 # view of ntdll.dll, and if its extraction equals the ARM64 one the script says
-# so loudly.
+# so loudly and removes the x64 baseline: no baseline is a state the tab reports,
+# a wrong one would be measured against in silence.
 #
 # Run as Administrator
 #
@@ -191,6 +192,8 @@ foreach ($file in (@("checksums.txt") + $Assets)) {
 
 # --- Verify every binary against checksums.txt ---
 # The file is sha256sum text: "<64 hex digits>  <file name>", one line per asset.
+# checksums.txt and the binaries come from the same release: this catches a corrupt or truncated download,
+# not a release whose publisher account is compromised (integrity, not authenticity).
 $sums = @{}
 foreach ($line in (Get-Content -Path "$Staging\checksums.txt" -ErrorAction SilentlyContinue)) {
     if ($line -match '^\s*([0-9A-Fa-f]{64})\s+\*?(\S+)\s*$') { $sums[$Matches[2].ToLower()] = $Matches[1].ToLower() }
@@ -243,6 +246,9 @@ function Invoke-NtSleuth([string]$Exe, [string[]]$Arguments, [int]$TimeoutSec) {
     try {
         $proc = Start-Process -FilePath $Exe -ArgumentList $Arguments -WorkingDirectory $InstallDir -NoNewWindow `
             -PassThru -RedirectStandardOutput $out -RedirectStandardError $err -ErrorAction Stop
+        # Windows PowerShell 5.1 reads ExitCode as $null after WaitForExit(ms) unless the process handle has been
+        # taken first, and a $null code would fail every self-test of a working install
+        $null = $proc.Handle
         if ($proc.WaitForExit($TimeoutSec * 1000)) {
             $code = $proc.ExitCode
         } else {
@@ -383,6 +389,16 @@ if ($isArm64 -and $extractions.ContainsKey("arm64") -and $extractions.ContainsKe
         Write-Host "[!] BASELINES IDENTICAL: ntsleuth-x64.exe reports the same RVAs and stub bytes as ntsleuth-arm64.exe." -ForegroundColor Red
         Write-Host "    It did not see the x64 view of ntdll.dll. Do not trust the x64 baseline: syscall measurements" -ForegroundColor Red
         Write-Host "    of emulated x64 samples would run against the ARM64 stubs." -ForegroundColor Red
+        # The baseline of the wrong view must not stay where the web UI finds it: "no baseline" is a state the
+        # tab reports and measures nothing in, a wrong one is measured against in silence.
+        $wrong = "$BaselineDir\ntsleuth-$build-x64.json"
+        Remove-Item $wrong -Force -ErrorAction SilentlyContinue
+        if (Test-Path $wrong) {
+            Write-Host "[!] $wrong could not be removed: delete it by hand" -ForegroundColor Red
+        } else {
+            Write-Host "    The x64 baseline was removed: the SYSCALLS tab reports no baseline for the x64 view." -ForegroundColor Red
+        }
+        $stored = @($stored | Where-Object { $_ -ne "x64" })
     } else {
         Write-Host "[+] The arm64 and x64 views differ, as they must" -ForegroundColor Green
     }
