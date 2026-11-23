@@ -326,16 +326,27 @@ def test_the_stage_searches_the_process_before_it_reads_the_sample_file(tdc, tar
     assert order == ["process", "file"]
 
 
-def test_a_copy_of_the_module_that_exports_the_function_holds_its_door(client, tdc, target, sample_dir):
-    # a copy of ntdll has no import directory, but it is the documented path itself, not a bypass of it
-    path = sample_dir / "ntdll-copy.dll"
-    path.write_bytes(_pe_importing(exports=("NtWriteVirtualMemory", "NtClose")) + _X64_STUB_0x3A)
+def _exported_stub_hit(client, sample_dir, exports, export_rva=None):
+    path = sample_dir / "module.dll"
+    path.write_bytes(_pe_importing(exports=exports, code=_X64_STUB_0x3A, export_rva=export_rva))
     body = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()
-    assert body["imports_read"] is True and body["hits"][0]["import_present"] is True
-    # and a PE that neither imports nor exports a door is still a proof
-    path.write_bytes(_pe_importing(exports=("Unrelated",)) + _X64_STUB_0x3A)
-    body = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()
-    assert body["hits"][0]["import_present"] is False
+    [hit] = [h for h in body["hits"] if h["offset"] == 0x3C0]
+    return hit
+
+
+def test_a_module_that_exports_the_stub_under_its_own_name_holds_its_door(client, tdc, target, sample_dir):
+    # a copy of ntdll: the stub is the body of the export of its own Nt or Zw name, the documented path itself
+    assert _exported_stub_hit(client, sample_dir, ("NtWriteVirtualMemory",))["import_present"] is True
+    assert _exported_stub_hit(client, sample_dir, ("ZwWriteVirtualMemory",))["import_present"] is True
+
+
+def test_an_export_the_sample_wrote_for_itself_does_not_buy_off_the_proof(client, tdc, target, sample_dir):
+    # the author writes the export table: a door name, or the Nt name pointing anywhere but at the stub, is free
+    assert _exported_stub_hit(client, sample_dir, ("WriteProcessMemory",))["import_present"] is False
+    assert _exported_stub_hit(client, sample_dir, ("CreateThread",))["import_present"] is False
+    assert _exported_stub_hit(client, sample_dir, ("NtWriteVirtualMemory",), export_rva=0x1000)["import_present"] \
+        is False
+    assert _exported_stub_hit(client, sample_dir, ("NtAllocateVirtualMemory",))["import_present"] is False
 
 
 def test_the_detonation_stage_without_a_sample_file_keeps_import_present_unknown(tdc, target):
@@ -477,3 +488,25 @@ def test_a_hint_without_an_answer_says_why_it_has_none(x64_baseline):
     (finding,) = memory_evidence.from_direct_stubs([hit], "s.exe")
     assert "import table not checked" not in finding["detail"]
     assert "no curated door" in finding["detail"]
+
+
+def test_a_finding_takes_its_address_from_the_first_copy_that_has_one(tdc, target, sample_dir):
+    # the file's hits come first and carry an offset, not an address: the process copy still supplies one
+    target.view = "x64"
+    target.reader = _x64_space(b"\x90" * 0x40 + _X64_STUB_0x3A + b"\xc3")
+    result = tdc._run_syscall_stage(4812, str(_loader(sample_dir, "GetLastError")), [])
+    [finding] = [f for f in result["evidence"]["findings"] if f["kind"] == "direct_syscall_stub"]
+    assert finding["address"] == _PRIVATE_BASE + 0x40
+    assert finding["needs_corroboration"] is False
+
+
+def test_the_detail_of_a_hint_does_not_attribute_what_it_says_cannot_be(x64_baseline):
+    (hit,) = syscall_scan.find_stubs_in_bytes(_x64_stub(0x55), x64_baseline)
+    (finding,) = memory_evidence.from_direct_stubs([hit], "s.exe")
+    assert "carried by the sample" not in finding["detail"]
+    assert "cannot be attributed" in finding["detail"]
+
+
+def test_the_process_search_says_at_its_signature_who_may_pass_an_expanded_set():
+    doc = syscall_scan.find_stubs_in_process.__doc__
+    assert "every loaded module" in doc and "single image" in doc

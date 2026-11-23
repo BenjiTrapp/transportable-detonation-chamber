@@ -733,6 +733,12 @@ def find_stubs_in_process(reader: ProcessReader, baseline: Baseline,
     each hit with an `address` where `find_stubs_in_bytes` has an `offset`. `imports`,
     `expanded_imports` and `covered` mean what they mean there.
 
+    Contract for `expanded_imports`: private executable memory is not one image's alone (a hook
+    engine, a sandbox broker or a runtime put stubs there), so the expanded set passed here must
+    be the union of the doors imported by every loaded module of the process, never the expanded
+    table of a single image, which would prove a bypass against code that is not its own. Until
+    a caller can build that union, pass the raw imports only: True or None, never False.
+
     A baseline of another view or build is refused before anything is read: its numbers
     would name the wrong syscalls."""
     covered = _coverage(expanded_imports, covered)

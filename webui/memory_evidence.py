@@ -631,9 +631,9 @@ def from_direct_stubs(hits, process=""):
         elif imported:
             detail = f"{name} stub carried by the sample, which imports it as well"
         else:
-            detail = (f"{name} stub carried by the sample; whether it imports a door to it is unknown: "
-                      "no curated door covers the syscall, the import table was not read, or the stub was "
-                      "found in process memory, which cannot be attributed to the sample")
+            detail = (f"{name} stub outside ntdll; whether a door to it is imported is unknown: no curated "
+                      "door covers the syscall, the import table was not read, or the stub is in process "
+                      "memory, which cannot be attributed to the sample")
         places = [h.get("address", h.get("offset")) for h in group]
         extra = {
             "syscall": name,
@@ -655,7 +655,8 @@ def from_direct_stubs(hits, process=""):
         out.append(MemoryFinding(
             source="syscalls", kind="direct_syscall_stub", process=process,
             detail=detail,
-            address=first.get("address"),
+            # a file hit has an offset, not an address: the first copy that has one supplies it
+            address=next((h["address"] for h in group if h.get("address") is not None), None),
             identity=key,
             extra=extra,
         ))

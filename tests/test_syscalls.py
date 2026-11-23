@@ -3314,14 +3314,15 @@ def test_a_file_says_whether_it_imports_the_function_through_the_win32_to_nt_tab
     for imports, present in (({"NtWriteVirtualMemory"}, True), ({"WriteProcessMemory"}, True),
                              # no path the curated table knows to NtWriteVirtualMemory: a proven bypass
                              ({"CreateFileW"}, False)):
-        monkeypatch.setattr(tdc, "_pe_names_held", lambda data, imports=imports: imports)
+        monkeypatch.setattr(tdc, "_pe_import_names", lambda data, imports=imports: imports)
         hit = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()["hits"][0]
         assert hit["import_present"] is present, imports
 
 
-def _pe_importing(*names, delay=False, exports=()):
+def _pe_importing(*names, delay=False, exports=(), code=b"", export_rva=None):
     """A minimal PE32+ whose import table lists `names` from one DLL; with `delay`, its delay-load import table.
-    `exports` are names it exports; without `names` it has no import directory at all."""
+    `exports` are names it exports; without `names` it has no import directory at all. `code` is placed in the
+    section at file offset 0x3C0 (RVA 0x11C0), where the exports point unless `export_rva` says otherwise."""
     import struct
     base, ilt, dll = 0x1000, 0x1040, 0x1080
     hints, at = b"", 0x10A0
@@ -3339,6 +3340,7 @@ def _pe_importing(*names, delay=False, exports=()):
     section[0x40:0x40 + len(thunks)] = thunks
     section[0x80:0x80 + 10] = b"ntdll.dll\0"
     section[0xA0:0xA0 + len(hints)] = hints
+    section[0x1C0:0x1C0 + len(code)] = code
     if exports:
         n, strings, at = len(exports), b"", 0x1160
         name_rvas = []
@@ -3347,7 +3349,8 @@ def _pe_importing(*names, delay=False, exports=()):
             strings += name.encode() + b"\0"
             at += len(name) + 1
         section[0x100:0x128] = struct.pack("<IIHHIIIIIII", 0, 0, 0, 0, dll, 1, n, n, 0x1128, 0x1140, 0x1158)
-        section[0x128:0x128 + 4 * n] = struct.pack(f"<{n}I", *([base] * n))
+        target = export_rva if export_rva is not None else (0x11C0 if code else base)
+        section[0x128:0x128 + 4 * n] = struct.pack(f"<{n}I", *([target] * n))
         section[0x140:0x140 + 4 * n] = struct.pack(f"<{n}I", *name_rvas)
         section[0x158:0x158 + 2 * n] = struct.pack(f"<{n}H", *range(n))
         section[0x160:0x160 + len(strings)] = strings
@@ -4694,7 +4697,7 @@ def test_the_stage_hands_the_search_the_raw_and_the_expanded_import_table(tdc, t
     [finding] = result["evidence"]["findings"]
     assert finding["needs_corroboration"] is True
     calls.clear()
-    monkeypatch.setattr(tdc, "_pe_names_held", lambda data: {"VirtualAllocEx"})
+    monkeypatch.setattr(tdc, "_pe_import_names", lambda data: {"VirtualAllocEx"})
     _run_stage(tdc, path=str(path))
     [((raw,), kw)] = calls
     assert raw == {"VirtualAllocEx"}

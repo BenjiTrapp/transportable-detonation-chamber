@@ -8397,9 +8397,8 @@ def _syscall_stage_file(path, baseline):
             content = fh.read()
     except OSError as exc:
         return [], {"skipped": f"the sample cannot be read: {exc.strerror or exc}"}
-    names = _pe_names_held(content)
-    hits = syscall_scan.find_stubs_in_bytes(content, baseline, names, **_syscall_expanded_imports(names))
-    return hits, {"path": real, "size": len(content), "imports_read": names is not None}
+    hits, imports = _syscall_search_file(content, baseline)
+    return hits, {"path": real, "size": len(content), "imports_read": imports is not None}
 
 
 def _syscall_stage(pid, path):
@@ -8601,24 +8600,46 @@ def _pe_import_names_of_file(path):
         return None
 
 
-def _pe_names_held(data):
-    """The names a PE imports and the ones it exports, None when `data` is not a PE that can be read. A module that
-    exports a function is that function's documented path, not a bypass of it: a copy of ntdll holds every door."""
-    imports = _pe_import_names(data)
-    if imports is None:
-        return None
+def _syscall_search_file(content, baseline):
+    """`(hits, imports)`: the stub search of a file's bytes, judged against its import table run through the Win32 to
+    Nt table, and that table (None when the file is no PE that can be read).
+
+    A stub that is the body of an export under its own Nt or Zw name is the documented path itself, a copy of ntdll,
+    and is imported (True). Nothing else in the export table counts: the author of a sample writes it, so a door name
+    or the Nt name pointing anywhere but at the stub would buy off the proof for one line."""
+    imports = _pe_import_names(content)
+    hits = syscall_scan.find_stubs_in_bytes(content, baseline, imports, **_syscall_expanded_imports(imports))
+    exported = _pe_export_offsets(content) if imports is not None else {}
+    for hit in hits:
+        name = hit.get("syscall")
+        if hit.get("import_present") is True or not isinstance(name, str) or not name.startswith("Nt"):
+            continue
+        if any(exported.get(alias) == hit.get("offset") for alias in (name, "Zw" + name[2:])):
+            hit["import_present"] = True
+    return hits, imports
+
+
+def _pe_export_offsets(data):
+    """Each name a PE exports with the file offset its address resolves to; {} when there is none or the table cannot
+    be read. A forwarded export, or one outside the file, has no offset and is left out."""
     try:
         import pefile
         pe = pefile.PE(data=data, fast_load=True)
         try:
             pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"]])
-            exports = getattr(pe, "DIRECTORY_ENTRY_EXPORT", None)
-            return imports | {sym.name.decode("ascii", "replace") for sym in (exports.symbols if exports else [])
-                              if sym.name}
+            out = {}
+            for sym in getattr(getattr(pe, "DIRECTORY_ENTRY_EXPORT", None), "symbols", None) or []:
+                if not sym.name or sym.forwarder or not sym.address:
+                    continue
+                try:
+                    out[sym.name.decode("ascii", "replace")] = pe.get_offset_from_rva(sym.address)
+                except Exception:
+                    continue
+            return out
         finally:
             pe.close()
     except Exception:
-        return None             # exports not known: it may hold the door, so the table says nothing
+        return {}
 
 
 def _pe_import_names(data):
@@ -8684,8 +8705,7 @@ def api_syscalls_stubs():
                 content = fh.read()
         except OSError as exc:
             raise _SyscallRouteError(f"the file cannot be read: {exc.strerror or exc}")
-        imports = _pe_names_held(content)
-        found = syscall_scan.find_stubs_in_bytes(content, baseline, imports, **_syscall_expanded_imports(imports))
+        found, imports = _syscall_search_file(content, baseline)
         process = os.path.basename(real)
         result = {"mode": "file", "path": real, "size": len(content), "process": process,
                   "imports_read": imports is not None, "partial": False, "note": ""}
