@@ -2144,6 +2144,74 @@ def test_status_and_the_error_tell_an_indistinguishable_view_from_a_missing_base
     assert "last extraction failed: boom" in tdc._syscall_baseline_for("x64", extract=False)[1]
 
 
+def _extract_view(tdc, monkeypatch, tmp_path, view, payload):
+    """One extraction of `view` as the web UI runs it, NTSleuth being a program that writes `payload`."""
+    _fake_ntsleuth(tdc, monkeypatch, tmp_path, payload)
+    (pathlib.Path(tdc.NTSLEUTH_DIR) / "ntsleuth-x64.exe").write_bytes(b"MZ")
+    tdc._syscall_extract_state["running"].add(("26300.1", view))
+    tdc._syscall_extract_job("26300.1", view)
+
+
+def _baseline_files(tdc):
+    directory = pathlib.Path(tdc.NTSLEUTH_BASELINE_DIR)
+    return sorted(f.name for f in directory.iterdir()) if directory.exists() else []
+
+
+@pytest.mark.parametrize("order", [("arm64", "x64"), ("x64", "arm64")])
+def test_whichever_view_is_extracted_first_the_arm64_one_stays_and_the_x64_lookalike_goes(
+        client, tdc, monkeypatch, tmp_path, order):
+    # ntsleuth-x64.exe saw the arm64 view: both extractions are the same, in either order
+    for view in order:
+        _extract_view(tdc, monkeypatch, tmp_path, view, _fixture("arm64"))
+    assert _baseline_files(tdc) == ["ntsleuth-26300.1-arm64.json"]
+    failed = client.get("/api/syscalls/status").get_json()["extraction"]["failed"]
+    assert [(f["view"], f["indistinguishable"]) for f in failed] == [("x64", True)]
+    assert "x64 view is not distinguishable" in failed[0]["reason"]
+    baseline, why = tdc._syscall_baseline_for("x64", extract=False)
+    assert baseline is None and "not distinguishable" in why
+    assert tdc._syscall_baseline_for("arm64", extract=False)[0].view == "arm64"
+
+
+@pytest.mark.parametrize("order", [("arm64", "x64"), ("x64", "arm64")])
+def test_two_distinct_views_are_both_kept_in_either_order(tdc, monkeypatch, tmp_path, order):
+    for view in order:
+        _extract_view(tdc, monkeypatch, tmp_path, view, _fixture(view))
+    assert _baseline_files(tdc) == ["ntsleuth-26300.1-arm64.json", "ntsleuth-26300.1-x64.json"]
+    assert not tdc._syscall_extract_state["failed"] and not tdc._syscall_extract_state["indistinguishable"]
+
+
+def test_an_arm64_extraction_with_no_x64_baseline_beside_it_compares_with_nothing(tdc, monkeypatch, tmp_path):
+    _extract_view(tdc, monkeypatch, tmp_path, "arm64", _fixture("arm64"))
+    assert _baseline_files(tdc) == ["ntsleuth-26300.1-arm64.json"]
+    assert not tdc._syscall_extract_state["failed"] and not tdc._syscall_extract_state["indistinguishable"]
+
+
+def test_an_x64_baseline_of_another_build_is_not_the_one_compared_with(tdc, monkeypatch, tmp_path):
+    directory = pathlib.Path(tdc.NTSLEUTH_BASELINE_DIR)
+    directory.mkdir(parents=True)
+    (directory / "ntsleuth-26200.1-x64.json").write_text(json.dumps(_fixture("arm64")))
+    _extract_view(tdc, monkeypatch, tmp_path, "arm64", _fixture("arm64"))
+    assert _baseline_files(tdc) == ["ntsleuth-26200.1-x64.json", "ntsleuth-26300.1-arm64.json"]
+
+
+def test_an_x64_lookalike_that_cannot_be_removed_is_reported_with_what_to_do(tdc, monkeypatch, tmp_path):
+    _extract_view(tdc, monkeypatch, tmp_path, "x64", _fixture("arm64"))
+    real_remove = os.remove
+
+    def locked(path, *a, **k):
+        if str(path).endswith("-x64.json"):
+            raise PermissionError("in use")
+        return real_remove(path, *a, **k)
+
+    monkeypatch.setattr(os, "remove", locked)
+    _fake_ntsleuth(tdc, monkeypatch, tmp_path, _fixture("arm64"))
+    assert tdc._extract_baseline("arm64", False, "26300.1") is True
+    assert "ntsleuth-26300.1-arm64.json" in _baseline_files(tdc)          # the good one is stored regardless
+    reason = tdc._syscall_extract_state["failed"][("26300.1", "x64")][1]
+    assert "could not be removed" in reason and "ntsleuth-26300.1-x64.json" in reason
+    assert ("26300.1", "x64") in tdc._syscall_extract_state["indistinguishable"]
+
+
 def test_a_later_good_extraction_clears_the_indistinguishable_note(tdc, monkeypatch, tmp_path):
     _store_arm64_baseline(tdc, monkeypatch, tmp_path)
     _fake_ntsleuth(tdc, monkeypatch, tmp_path, _fixture("arm64"))

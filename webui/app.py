@@ -7888,22 +7888,52 @@ class _ViewNotDistinguishable(RuntimeError):
     """The x64 extraction is the arm64 one: ntsleuth-x64.exe did not see the x64 view of ntdll.dll."""
 
 
+def _same_view_baseline(parsed, build, other_view):
+    """The path of the baseline of `other_view` and `build` if it exists, loads and has the fingerprint of `parsed`,
+    else None. With no such baseline (an x64 host, a native-only one, an unreadable file) there is nothing to be
+    identical to."""
+    path = syscall_baseline.find_baseline(NTSLEUTH_BASELINE_DIR, build, other_view)
+    if path is None:
+        return None
+    try:
+        other = _load_syscall_baseline(path)
+    except syscall_baseline.BaselineError:
+        return None
+    return path if syscall_baseline.view_fingerprint(other) == syscall_baseline.view_fingerprint(parsed) else None
+
+
 def _refuse_arm64_lookalike(parsed, build):
     """Raises _ViewNotDistinguishable if `parsed`, an x64 extraction, has the fingerprint of the arm64 baseline of
     `build`. Stored, it would be the arm64 baseline under another name: every emulated x64 sample would be measured
-    against the wrong reference. With no arm64 baseline (an x64 host) there is nothing to be the same as."""
-    path = syscall_baseline.find_baseline(NTSLEUTH_BASELINE_DIR, build, "arm64")
-    if path is None:
-        return
-    try:
-        arm64 = _load_syscall_baseline(path)
-    except syscall_baseline.BaselineError:
-        return
-    if syscall_baseline.view_fingerprint(arm64) == syscall_baseline.view_fingerprint(parsed):
+    against the wrong reference."""
+    if _same_view_baseline(parsed, build, "arm64"):
         raise _ViewNotDistinguishable(
             f"the x64 view is not distinguishable on this host: ntsleuth-x64.exe extracted the same RVAs and stub "
             f"bytes as the arm64 baseline of build {build}, so it did not see the x64 ntdll.dll. No x64 baseline "
             f"is stored; measuring emulated x64 samples against the ARM64 stubs would be wrong")
+
+
+def _drop_x64_lookalike(parsed, build):
+    """The other order: `parsed`, an arm64 extraction about to be stored, equals an x64 baseline already there. The
+    x64 one is the wrong one, whichever came first: ntsleuth-arm64.exe gives the arm64 view by construction on an
+    ARM64 host, it is the emulated x64 binary that may not have seen its own. So the arm64 baseline stays and the x64
+    one goes, and the x64 view is recorded as not distinguishable, as the other order does."""
+    path = _same_view_baseline(parsed, build, "x64")
+    if path is None:
+        return
+    removed = True
+    try:
+        os.remove(path)
+    except OSError:
+        removed = False
+    why = (f"the x64 view is not distinguishable on this host: the x64 baseline of build {build} had the same RVAs "
+           f"and stub bytes as the arm64 one, so ntsleuth-x64.exe had not seen the x64 ntdll.dll. "
+           + ("It was removed; emulated x64 samples are not measured" if removed else
+              f"It could not be removed: delete {os.path.basename(path)} by hand, or emulated x64 samples are "
+              f"measured against the ARM64 stubs"))
+    with _syscall_extract_lock:
+        _syscall_extract_state["failed"][(build, "x64")] = (time.time(), why)
+        _syscall_extract_state["indistinguishable"].add((build, "x64"))
 
 
 def _extract_baseline(view, symbols, build):
@@ -7946,6 +7976,8 @@ def _extract_baseline(view, symbols, build):
     with open(target + ".tmp", "w", encoding="utf-8") as fh:
         json.dump(document, fh)
     os.replace(target + ".tmp", target)
+    if view == "arm64":
+        _drop_x64_lookalike(parsed, build)
     return True
 
 
