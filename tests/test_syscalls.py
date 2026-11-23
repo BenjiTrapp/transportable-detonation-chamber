@@ -397,7 +397,7 @@ def _sc(view, name="NtWriteVirtualMemory"):
     ("05 00 00 14 c0 03 5f d6", "private",   "patched",  "B"),
     ("05 00 00 14 c0 03 5f d6", None,        "diverged", "B"),
     ("11 22 33 44 55 66 77 88", "private",   "patched",  None),
-    ("50 00 00 58 00 02 1f d6", "edr.dll",   "hooked",   "LDR x16; BR x16"),
+    ("50 00 00 58 00 02 1f d6", "edr.dll",   "hooked",   "LDR; BR"),
     ("01 18 00 d4 c0 03 5f d6", None,        "diverged", None),
 ])
 def test_classify_arm64_states(live_hex, owner, state, pattern):
@@ -538,6 +538,66 @@ def _adrp(rd, pages):
 
 def _add(rd, rn, imm12, shift12=False):
     return 0x91000000 | shift12 << 22 | imm12 << 10 | rn << 5 | rd
+
+
+def _ldr_literal(rt, words):
+    """LDR <Xt>, <pc + 4 * words>"""
+    return 0x58000000 | (words & 0x7FFFF) << 5 | rt
+
+
+def _ldr_imm(rt, rn, offset):
+    """LDR <Xt>, [<Xn>, #offset], the unsigned offset form, a multiple of 8"""
+    return 0xF9400000 | (offset // 8) << 10 | rn << 5 | rt
+
+
+def _br(rn):
+    return 0xD61F0000 | rn << 5
+
+
+# Microsoft Detours on ARM64: `detour_gen_jmp_immediate` writes `LDR x17, #8; BR x17; .quad target`,
+# `detour_gen_jmp_indirect` writes `ADRP x17, page; LDR x17, [x17, #off]; BR x17`
+@pytest.mark.parametrize("live,base,pointer", [
+    (_words(_ldr_literal(17, 2), _br(17)), 0x1000, 0x1008),
+    (_words(_ldr_literal(9, 4), _br(9)), 0x1000, 0x1010),
+    (_words(_ldr_literal(0, -1), _br(0)), 0x1000, 0xFFC),
+    (_words(_adrp(17, 3), _ldr_imm(17, 17, 0x28), _br(17)), 0x50000FF0, 0x50003028),
+    (_words(_adrp(17, -1), _ldr_imm(17, 17, 0), _br(17)), 0x50001000, 0x50000000),
+    (_words(_adrp(8, 1), _ldr_imm(8, 8, 0x7FF8), _br(8)), 0x50000000, 0x50008FF8),
+])
+def test_arm64_jump_pointer_of_the_detours_forms_for_any_register(live, base, pointer):
+    assert syscall_baseline.jump_pointer(live, base, "arm64") == pointer
+    assert syscall_baseline.jump_target(live, base, "arm64") is None
+
+
+@pytest.mark.parametrize("live", [
+    _words(_ldr_literal(17, 2), _br(16)),                        # the branch takes another register
+    _words(_ldr_literal(17, 2)),                                 # no branch at all
+    _words(_adrp(17, 3), _ldr_imm(17, 16, 0x28), _br(17)),       # the load is not from the ADRP's page
+    _words(_adrp(17, 3), _ldr_imm(16, 17, 0x28), _br(17)),       # the branch is not to what was loaded
+    _words(_adrp(17, 3), _ldr_imm(17, 17, 0x28)),                # cut short
+    _words(_adrp(17, 3), 0xB9400231, _br(17)),                   # a 32-bit load is no pointer
+])
+def test_arm64_indirect_forms_need_their_registers_to_agree(live):
+    assert syscall_baseline.jump_pointer(live, 0x1000, "arm64") is None
+    assert syscall_baseline.jump_target(live, 0x1000, "arm64") is None
+
+
+@pytest.mark.parametrize("live,name", [
+    (_words(_ldr_literal(17, 2), _br(17)), "LDR; BR"),
+    (_words(_ldr_literal(16, 2), _br(16)), "LDR; BR"),
+    (_words(_adrp(17, 3), _ldr_imm(17, 17, 0x28), _br(17)), "ADRP; LDR; BR"),
+])
+def test_the_detours_forms_are_named(live, name):
+    assert syscall_baseline.jump_pattern(live, "arm64") == name
+
+
+def test_x64_push_mov_ret_jumps_to_the_address_its_two_halves_spell():
+    # push imm32 (sign-extended); mov dword [rsp+4], imm32 (the upper half); ret: the 14-byte absolute jump
+    live = bytes.fromhex("68" "44332211" "c7442404" "88776655" "c3") + b"\xcc" * 8
+    assert syscall_baseline.jump_target(live, 0x1000, "x64") == 0x5566778811223344
+    assert syscall_baseline.jump_pattern(live, "x64") == "PUSH; MOV [RSP+4]; RET"
+    high = bytes.fromhex("68" "00000080" "c7442404" "fa7f0000" "c3")
+    assert syscall_baseline.jump_target(high, 0x1000, "x64") == 0x00007FFA80000000
 
 
 @pytest.mark.parametrize("live_hex,base,target", [
@@ -697,7 +757,7 @@ def test_the_indirect_hooks_are_named_by_classify():
     sc = _sc("arm64")
     live = _words(0x58000050, 0xD61F0200)
     out = syscall_baseline.classify_stub(sc, live, "arm64", "edr.dll")
-    assert (out["state"], out["pattern"]) == ("hooked", "LDR x16; BR x16")
+    assert (out["state"], out["pattern"]) == ("hooked", "LDR; BR")
 
 
 # --- measuring a process (syscall_scan) ---------------------------------------------------
@@ -1051,7 +1111,7 @@ def test_an_arm64_ldr_br_hook_is_followed_through_its_literal(arm64_baseline):
     live = _words(0x58000050, 0xD61F0200) + _EDR_TARGET.to_bytes(8, "little")
     reader = _reader_from(arm64_baseline, patched={"NtWriteVirtualMemory": (live.hex(), None)})
     s = syscall_scan.measure(arm64_baseline, _with_edr_at_target(reader))["states"]["NtWriteVirtualMemory"]
-    assert (s["state"], s["pattern"], s["target_owner"]) == ("hooked", "LDR x16; BR x16", "edrhook.dll")
+    assert (s["state"], s["pattern"], s["target_owner"]) == ("hooked", "LDR; BR", "edrhook.dll")
 
 
 # MinHook and Detours do not jump from the stub into their DLL: they jump to a relay they allocated with
@@ -1106,7 +1166,55 @@ def test_an_arm64_hook_through_a_private_relay_is_owned_by_the_module_the_relay_
     _private_code(reader, _RELAY, _words(0x58000050, 0xD61F0200) + _EDR_TARGET.to_bytes(8, "little"))
     s = syscall_scan.measure(arm64_baseline, _with_edr_at_target(reader))["states"]["NtWriteVirtualMemory"]
     assert (s["state"], s["pattern"], s["target_owner"]) == ("hooked", "B", "edrhook.dll")
-    assert s["relay"] == [{"address": _RELAY, "owner": "private", "pattern": "LDR x16; BR x16"}]
+    assert s["relay"] == [{"address": _RELAY, "owner": "private", "pattern": "LDR; BR"}]
+
+
+def _arm64_b_to_relay(baseline, name="NtWriteVirtualMemory"):
+    sc = baseline.syscalls[name]
+    stub = _MODULE_BASES["ntdll.dll"] + sc.rva
+    b = 0x14000000 | ((_RELAY - stub) // 4) & 0x03FFFFFF
+    return _reader_from(baseline, patched={name: (_words(b, 0xD65F03C0).hex(), None)})
+
+
+def test_an_arm64_hook_through_a_detours_immediate_relay_is_hooked(arm64_baseline):
+    # LDR x17, #8; BR x17; .quad target: what Detours writes for a jump it cannot reach with B
+    reader = _arm64_b_to_relay(arm64_baseline)
+    _private_code(reader, _RELAY, _words(_ldr_literal(17, 2), _br(17)) + _EDR_TARGET.to_bytes(8, "little"))
+    out = syscall_scan.measure(arm64_baseline, _with_edr_at_target(reader))
+    s = out["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["pattern"], s["target_owner"]) == ("hooked", "B", "edrhook.dll")
+    assert s["relay"] == [{"address": _RELAY, "owner": "private", "pattern": "LDR; BR"}]
+    assert (out["owner_errors"], out["partial"]) == (0, False)
+
+
+def test_an_arm64_hook_through_a_detours_indirect_relay_is_hooked(arm64_baseline):
+    # ADRP x17, page; LDR x17, [x17, #off]; BR x17: the pointer lies in a page of its own
+    pointer = (_RELAY & ~0xFFF) + 0x2000 + 0x40
+    reader = _arm64_b_to_relay(arm64_baseline)
+    _private_code(reader, _RELAY, _words(_adrp(17, 2), _ldr_imm(17, 17, 0x40), _br(17)) + b"\x00" * 4)
+    reader._ranges.append((pointer, bytearray(_EDR_TARGET.to_bytes(8, "little"))))
+    out = syscall_scan.measure(arm64_baseline, _with_edr_at_target(reader))
+    s = out["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["target_owner"]) == ("hooked", "edrhook.dll")
+    assert s["relay"] == [{"address": _RELAY, "owner": "private", "pattern": "ADRP; LDR; BR"}]
+    assert (out["owner_errors"], out["partial"]) == (0, False)
+
+
+def test_an_arm64_detours_relay_whose_pointer_cannot_be_read_is_no_licence_to_guess(arm64_baseline):
+    reader = _arm64_b_to_relay(arm64_baseline)
+    _private_code(reader, _RELAY, _words(_adrp(17, 2), _ldr_imm(17, 17, 0x40), _br(17)) + b"\x00" * 4)
+    out = syscall_scan.measure(arm64_baseline, _with_edr_at_target(reader))
+    assert out["states"]["NtWriteVirtualMemory"]["state"] == "diverged"
+    assert (out["owner_errors"], out["partial"]) == (1, True)
+
+
+def test_an_x64_hook_through_a_push_mov_ret_relay_is_hooked(x64_baseline):
+    relay = (b"\x68" + (_EDR_TARGET & 0xFFFFFFFF).to_bytes(4, "little") + b"\xc7\x44\x24\x04"
+             + (_EDR_TARGET >> 32).to_bytes(4, "little") + b"\xc3" + b"\xcc" * 18)
+    reader = _with_edr_at_target(_x64_relay_reader(x64_baseline, relay))
+    s = syscall_scan.measure(x64_baseline, reader)["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["target_owner"]) == ("hooked", "edrhook.dll")
+    assert s["relay"] == [{"address": _RELAY, "owner": "private", "pattern": "PUSH; MOV [RSP+4]; RET"}]
 
 
 def test_a_relay_of_two_hops_is_followed_to_its_module(x64_baseline):
@@ -3643,11 +3751,13 @@ _HOOK_BYTES = {
         "MOV RAX; JMP RAX": "48b8" "1122334455667788" "ffe0",
         "MOV R11; JMP R11": "49bb" "1122334455667788" "41ffe3",
         "PUSH; RET": "68" "11223344" "c3",
+        "PUSH; MOV [RSP+4]; RET": "68" "11223344" "c7442404" "55667788" "c3",
     },
     "arm64": {
         "B": "10000014",
-        "LDR x16; BR x16": "50000058" "00021fd6",
+        "LDR; BR": "50000058" "00021fd6",
         "ADRP; ADD; BR": "10000090" "10420091" "00021fd6",
+        "ADRP; LDR; BR": "11000090" "312240f9" "20021fd6",
     },
 }
 

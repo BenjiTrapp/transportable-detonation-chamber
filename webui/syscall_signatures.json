@@ -4,12 +4,14 @@
   {"family": "Inline hook", "view": "x64", "pattern": "^48b8[0-9a-f]{16}ffe0", "match": "regex", "weight": 1.0, "note": "MOV RAX, imm64; JMP RAX"},
   {"family": "Inline hook", "view": "x64", "pattern": "^49bb[0-9a-f]{16}41ffe3", "match": "regex", "weight": 1.0, "note": "MOV R11, imm64; JMP R11"},
   {"family": "Inline hook", "view": "x64", "pattern": "^68[0-9a-f]{8}c3", "match": "regex", "weight": 1.0, "note": "PUSH imm32; RET"},
+  {"family": "Inline hook", "view": "x64", "pattern": "^68[0-9a-f]{8}c7442404[0-9a-f]{8}c3", "match": "regex", "weight": 1.0, "note": "PUSH imm32; MOV DWORD [RSP+4], imm32; RET: the 14-byte absolute jump"},
   {"family": "Stub patch", "view": "x64", "pattern": "c3", "match": "prefix", "weight": 3.0, "note": "RET as the first byte: the stub returns without making the syscall"},
   {"family": "Stub patch", "view": "x64", "pattern": "^(31|33)c0c3", "match": "regex", "weight": 3.0, "note": "XOR EAX, EAX; RET: the stub reports success without making the syscall"},
   {"family": "Stub patch", "view": "x64", "pattern": "^b800000000c3", "match": "regex", "weight": 3.0, "note": "MOV EAX, 0; RET: the stub reports success without making the syscall"},
   {"family": "Inline hook", "view": "arm64", "pattern": "^[0-9a-f]{6}(14|15|16|17)", "match": "regex", "weight": 1.0, "note": "unconditional B over the stub"},
-  {"family": "Inline hook", "view": "arm64", "pattern": "^[13579bdf]0[0-9a-f]{4}5800021fd6", "match": "regex", "weight": 1.0, "note": "LDR x16, literal; BR x16"},
+  {"family": "Inline hook", "view": "arm64", "pattern": "^[0-9a-f]{6}58[0-9a-f]{2}0[0-3]1fd6", "match": "regex", "weight": 1.0, "note": "LDR Xn, literal; BR Xn (x16 in the usual EDR hook, x17 in Detours)"},
   {"family": "Inline hook", "view": "arm64", "pattern": "^[0-9a-f]{6}[9bdf]0[0-9a-f]{4}[0-7][0-9a-f]91[02468ace]00[0-3]1fd6", "match": "regex", "weight": 1.0, "note": "ADRP; ADD; BR"},
+  {"family": "Inline hook", "view": "arm64", "pattern": "^[0-9a-f]{6}[9bdf]0[0-9a-f]{4}[4-7][0-9a-f]f9[0-9a-f]{2}0[0-3]1fd6", "match": "regex", "weight": 1.0, "note": "ADRP Xn; LDR Xt, [Xn, #imm]; BR Xt: an indirect jump through a pointer (Detours)"},
   {"family": "Stub patch", "view": "arm64", "pattern": "c0035fd6", "match": "prefix", "weight": 3.0, "note": "RET as the first instruction: the stub returns without making the syscall"},
   {"family": "Stub patch", "view": "arm64", "pattern": "^0000(80d2|8052)c0035fd6", "match": "regex", "weight": 3.0, "note": "MOV x0 or w0, #0; RET: the stub reports success without making the syscall"}
 ]

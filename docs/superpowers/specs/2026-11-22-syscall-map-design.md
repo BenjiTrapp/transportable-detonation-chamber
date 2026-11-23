@@ -129,7 +129,7 @@ Neues Modul `webui/syscall_scan.py`, reines ctypes, kein zusätzliches Binary.
   die geladenen Module mit Basisadresse und Größe. Daraus die Basis von
   `ntdll.dll`, und, wenn vorhanden, `win32u.dll`.
 - Für jeden Syscall der Baseline die Bytes an `base + rva` lesen, und zwar so viele, wie die Sicht zur Erkennung braucht — auf ARM64 mehr als zum Vergleich, weil ein Hook der Form `ADRP; ADD; BR` erst in 12 Byte erkennbar ist.
-- **Den Eigentümer des Sprungziels in zwei Schritten bestimmen.** Folgt die Zieladresse direkt aus den Bytes (relativer Sprung oder eingebettete absolute Adresse), wird sie damit erfragt. Liest die Hook-Form ihr Ziel erst aus dem Speicher (`FF 25` auf x64, `LDR`+`BR` auf ARM64), ist aus den Bytes nur die Adresse des **Zeigers** bestimmbar; dort wird das Zeigerwort gelesen und erst dessen Ziel nach dem Eigentümer gefragt. Ohne diesen zweiten Schritt käme die häufigste EDR-Hook-Form immer als `diverged` durch, und `hooked` wäre für den Normalfall unerreichbar — womit die Trennung aus Ziel 4 ihren Zweck verlöre.
+- **Den Eigentümer des Sprungziels in zwei Schritten bestimmen.** Folgt die Zieladresse direkt aus den Bytes (relativer Sprung oder eingebettete absolute Adresse), wird sie damit erfragt. Liest die Hook-Form ihr Ziel erst aus dem Speicher (`FF 25` auf x64, `LDR`+`BR` und `ADRP`+`LDR`+`BR` auf ARM64), ist aus den Bytes nur die Adresse des **Zeigers** bestimmbar; dort wird das Zeigerwort gelesen und erst dessen Ziel nach dem Eigentümer gefragt. Ohne diesen zweiten Schritt käme die häufigste EDR-Hook-Form immer als `diverged` durch, und `hooked` wäre für den Normalfall unerreichbar — womit die Trennung aus Ziel 4 ihren Zweck verlöre.
 - **Nur das Stub-Präfix vergleichen, nicht NTSleuths ganzes Fenster.**
   `stub_bytes` ist ein festes 32-Byte-Fenster, das über die Funktion
   hinausläuft: NTSleuths eigenes Beispiel für `NtCreateProcessEx` enthält hinter
@@ -214,10 +214,17 @@ Die Befehlsmuster sind **pro Architektur** zu prüfen:
 
 - **x64:** Der saubere Stub beginnt `4C 8B D1 B8 <ssn:4>` und endet mit `0F 05`.
   Hook-Muster: `E9` (JMP rel32), `FF 25` (JMP [rip+disp32]),
-  `48 B8 <imm64> FF E0`, `49 BB <imm64> 41 FF E3`, `68 <imm32> C3`.
+  `48 B8 <imm64> FF E0`, `49 BB <imm64> 41 FF E3`, `68 <imm32> C3` und der
+  14-Byte-Absolutsprung `68 <imm32> C7 44 24 04 <imm32> C3`.
 - **ARM64:** Der saubere Stub ist `SVC #imm` gefolgt von `RET`, in NTSleuths
   Ausgabe etwa `01 18 00 d4 c0 03 5f d6`. Hook-Muster: ein unbedingtes `B`
-  (Opcode-Maske `0x14000000`), `LDR x16, …` + `BR x16`, `ADRP` + `ADD` + `BR`.
+  (Opcode-Maske `0x14000000`), `LDR Xn, literal` + `BR Xn` für jedes Register
+  n, `ADRP` + `ADD` + `BR` und `ADRP Xn` + `LDR Xt, [Xn, #imm]` + `BR Xt`.
+  Das Register ist nicht fest: Der übliche EDR-Hook nimmt x16, Microsoft
+  Detours x17 für beide Formen (`LDR x17, #8; BR x17` und
+  `ADRP x17; LDR x17, [x17, #off]; BR x17`). Ein Relay in einer dieser Formen
+  nicht zu erkennen hieße, es als privaten Code ohne Sprung zu lesen und den
+  Hook `patched` zu nennen.
 - Die Syscall-Nummer im Stub muss zur Nummer der Baseline passen. Weicht nur
   die Nummer ab, ist das ein eigener, besonders deutlicher Befund.
 

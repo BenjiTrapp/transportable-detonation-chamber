@@ -360,7 +360,7 @@ def _x64_hook(regex: bytes, target=None, pointer=None):
 
 
 # A matcher yields `(target, pointer)`. A hook that reads its target from memory
-# (`FF 25`, `LDR`+`BR`) has no target the stub bytes could show, and a guessed one would
+# (`FF 25`, `LDR`+`BR`, `ADRP`+`LDR`+`BR`) has no target the stub bytes could show, and a guessed one would
 # send the owner lookup to the wrong place; what the bytes do show is the address of the
 # pointer, which the reader can follow.
 _X64_HOOKS = (
@@ -375,9 +375,19 @@ _X64_HOOKS = (
     # push sign-extends its imm32, and ret pops the result
     ("PUSH; RET", _x64_hook(rb"\x68.{4}\xc3", lambda b, base: _signed(
         int.from_bytes(b[1:5], "little"), 32) & _ADDRESS_MASK)),
+    # the 14-byte absolute jump: push the low half, write the high half over the sign extension, ret
+    ("PUSH; MOV [RSP+4]; RET", _x64_hook(rb"\x68.{4}\xc7\x44\x24\x04.{4}\xc3", lambda b, base: int.from_bytes(
+        b[1:5], "little") | int.from_bytes(b[9:13], "little") << 32)),
 )
 
-_ARM64_BR_X16 = 0xD61F0200
+_ARM64_BR = 0xD61F0000
+
+
+def _arm64_br_reg(word: int | None) -> int | None:
+    """The register of `BR <Xn>`, None for any other instruction."""
+    if word is None or word & 0xFFFFFC1F != _ARM64_BR:
+        return None
+    return (word >> 5) & 0x1F
 
 
 def _arm64_b(live: bytes, base: int):
@@ -388,12 +398,22 @@ def _arm64_b(live: bytes, base: int):
 
 
 def _arm64_ldr_br(live: bytes, base: int):
+    """`LDR <Xn>, literal; BR <Xn>`, for any n: x16 in the usual EDR hook, x17 in Detours' `detour_gen_jmp_immediate`."""
     w, nxt = _word(live), _word(live, 4)
     if w is None or nxt is None:
         return _MISS
-    if w & 0xFF000000 != 0x58000000 or w & 0x1F != 16 or nxt != _ARM64_BR_X16:
+    if w & 0xFF000000 != 0x58000000 or _arm64_br_reg(nxt) != w & 0x1F:
         return _MISS
     return None, (base + _signed((w >> 5) & 0x7FFFF, 19) * 4) & _ADDRESS_MASK
+
+
+def _arm64_adrp_page(adrp: int, base: int) -> int:
+    imm = _signed(((adrp >> 5) & 0x7FFFF) << 2 | (adrp >> 29) & 0x3, 21)
+    return ((base & ~0xFFF) + (imm << 12)) & _ADDRESS_MASK
+
+
+def _arm64_is_adrp(word: int) -> bool:
+    return word & 0x9F000000 == 0x90000000
 
 
 def _arm64_adrp_add_br(live: bytes, base: int):
@@ -401,24 +421,37 @@ def _arm64_adrp_add_br(live: bytes, base: int):
     if adrp is None or add is None or br is None:
         return _MISS
     reg = adrp & 0x1F
-    if adrp & 0x9F000000 != 0x90000000:
+    if not _arm64_is_adrp(adrp):
         return _MISS
     # ADD <Xd>, <Xreg>, #imm12{, LSL #12}, then BR <Xd>
     if add & 0xFF800000 != 0x91000000 or (add >> 5) & 0x1F != reg:
         return _MISS
-    if br & 0xFFFFFC1F != 0xD61F0000 or (br >> 5) & 0x1F != add & 0x1F:
+    if _arm64_br_reg(br) != add & 0x1F:
         return _MISS
-    imm = _signed(((adrp >> 5) & 0x7FFFF) << 2 | (adrp >> 29) & 0x3, 21)
     offset = (add >> 10) & 0xFFF
     if add & 0x00400000:
         offset <<= 12
-    return (((base & ~0xFFF) + (imm << 12)) + offset) & _ADDRESS_MASK, None
+    return (_arm64_adrp_page(adrp, base) + offset) & _ADDRESS_MASK, None
+
+
+def _arm64_adrp_ldr_br(live: bytes, base: int):
+    """`ADRP <Xn>, page; LDR <Xt>, [<Xn>, #imm]; BR <Xt>`: Detours' `detour_gen_jmp_indirect`, with x17. The 64-bit
+    load of the unsigned-offset form only: what it loads is the pointer, its address the ADRP page plus 8 * imm12."""
+    adrp, ldr, br = _word(live), _word(live, 4), _word(live, 8)
+    if adrp is None or ldr is None or br is None or not _arm64_is_adrp(adrp):
+        return _MISS
+    if ldr & 0xFFC00000 != 0xF9400000 or (ldr >> 5) & 0x1F != adrp & 0x1F:
+        return _MISS
+    if _arm64_br_reg(br) != ldr & 0x1F:
+        return _MISS
+    return None, (_arm64_adrp_page(adrp, base) + ((ldr >> 10) & 0xFFF) * 8) & _ADDRESS_MASK
 
 
 _ARM64_HOOKS = (
     ("B", _arm64_b),
-    ("LDR x16; BR x16", _arm64_ldr_br),
+    ("LDR; BR", _arm64_ldr_br),
     ("ADRP; ADD; BR", _arm64_adrp_add_br),
+    ("ADRP; LDR; BR", _arm64_adrp_ldr_br),
 )
 
 # x86 has a prefix length but no patterns: it is not a baseline view yet
@@ -445,7 +478,7 @@ def jump_target(live: bytes, base: int, view: str) -> int | None:
 
 
 def jump_pointer(live: bytes, base: int, view: str) -> int | None:
-    """For a hook that reads its target from memory (`FF 25`, `LDR`+`BR`): the address of
+    """For a hook that reads its target from memory (`FF 25`, `LDR`+`BR`, `ADRP`+`LDR`+`BR`): the address of
     that pointer, not the target. None for every other hook and for no hook."""
     hit = _find_hook(live, base, view)
     return hit[2] if hit else None
