@@ -284,9 +284,38 @@ Der schärfste Befund des Prüfers: `run_only_ranges` nimmt **jedes** Byte herau
 das eine `mine`-Zeile bedeckt — also genau die Bytes, um die es geht. Ein
 SHA-256 über diese Bereiche wäre dort stumm, wo der Nutzer hinschaut.
 
-Entscheidung: gehasht werden die Bytes, **wie der Lauf sie hinterlassen hat** —
-für eine später überschriebene Stelle also das `before` der Patch-Zeile, nicht
-der Patch. Der Hash entsteht beim Speichern, wo der Cache noch lebt, und wird
+Entscheidung: gehasht werden die Bytes, **wie der Lauf sie hinterlassen hat**.
+
+> **Korrektur, an rizin 0.9.1 nachgemessen (Task 2, 2026-11-23).** Dieser
+> Abschnitt sagte ursprünglich: „für eine später überschriebene Stelle also das
+> `before` der Patch-Zeile, nicht der Patch." **Das ist falsch.** rizins `before`
+> ist der Zustand des Caches **zum Zeitpunkt des Schreibens** — nicht die Datei
+> und nicht der Lauf. Es antwortet nur in dem einen Fall richtig, den dieser
+> Abschnitt sich vorgestellt hat. Zwei Messungen:
+>
+> - **Zwei Patches übereinander:** `wx 41424344 @ 0x1000`, dann `wx 90 @ 0x1002`,
+>   dann `wx cc @ 0x1002` gibt `before` = `43` (der Lauf) für den ersten Patch,
+>   aber `before` = `90` (**Patch 1**) für den zweiten. Der Lauf hinterließ `43`.
+> - **Ein Patch *vor* dem Lauf, über dieselbe Adresse:** `wx 90 @ 0x1002`, dann
+>   `wx 41424344 @ 0x1000` gibt für die Patch-Zeile `before` = `ff`, das Byte der
+>   **Datei**. `run_only_ranges` nimmt die Stelle trotzdem heraus (es ist
+>   reihenfolgenblind), und die Regel hätte das Datei-Byte in den Beweis gelegt,
+>   wo der Lauf `43` hinterließ.
+>
+> **Die richtige Regel, die implementiert ist:** das `after` der **letzten
+> nicht-`mine`-Zeile** über jedem Byte. Sie stimmt in beiden Fällen, in denen die
+> alte Regel falsch war, und in dem Fall, den dieser Abschnitt beschrieb, mit ihr
+> überein.
+>
+> **Folge, die Tasks 4 und 5 binden:** die Regel braucht die Zeilen in
+> **Schreibreihenfolge** (`patches_made()` / `ordered=True`), nicht nach Adresse.
+> `_saved_cache` liest heute `_patch_list(pipe)` mit `ordered=False`, also nach
+> Adresse sortiert — gemessen: `wx ee @ 0x1101`, dann `wx aabbccdd @ 0x1100`
+> liest als `aabbccdd`, nach Adresse sortiert ergäbe der Digest `aaeeccdd`, ein
+> falscher, aber plausibler SHA-256, **lautlos**. `run_digests` kann den Verstoß
+> nicht erkennen, also muss ein Test ihn abriegeln.
+
+Der Hash entsteht beim Speichern, wo der Cache noch lebt, und wird
 mit der Aufzeichnung aufgehoben; beim Öffnen wird er nicht neu berechnet, weil
 der Cache dann leer ist.
 
