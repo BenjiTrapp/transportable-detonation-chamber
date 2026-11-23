@@ -2129,12 +2129,12 @@ def test_an_unknown_import_table_is_never_read_as_not_imported():
 
 
 @needs_node
-def test_the_list_says_hint_and_does_not_claim_a_bypass():
+def test_the_list_says_when_a_stub_is_a_proof_and_when_a_hint():
     html = _stubs("{ hits: [%s] }" % HIT)
     low = html.lower()
-    assert "hints, not proof" in low and "hint" in low
-    assert "could prove a bypass" in low and "win32 to nt table" in low, "it says what would be needed to prove a bypass"
-    assert "bypass is proven" not in low and "proves a bypass" not in low
+    assert "hints, not proof" not in low, "the curated table exists: a stub without the import is a proof"
+    assert "proven bypass" in low and "win32 to nt table" in low, "it says what makes a proof"
+    assert "stays a hint" in low and "no curated row" in low, "and where a hit remains a hint"
 
 
 @needs_node

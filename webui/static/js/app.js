@@ -25600,10 +25600,12 @@ function renderHookAllowlist(state) {
         (st.note && st.note.text ? `<div class="syscall-draft-result syscall-draft-result-${cssToken(st.note.tone)}" role="status">${escapeHtml(st.note.text)}</div>` : '');
 }
 
-// The syscall stubs a sample carries itself, found in its process memory and in its file. These are hints, not proof,
-// and the list says so: whether the sample imports the function is mostly not known (import_present is true, false
-// or null), and a stub whose number this build does not have (number_known false) suggests a sample made for another
-// build. model: hits ({ ...hit, source: 'process' | 'file' }), notes ({ tone, title, text }), summary, partial.
+// The syscall stubs a sample carries itself, found in its process memory and in its file. Whether the sample imports
+// the function is known as a rule, through its import set widened by the curated Win32 to Nt table: not imported
+// (import_present false) is a proven bypass, imported too (true) a hint. It is unknown (null) only where no curated
+// row leads to the syscall or the import table could not be read. A stub whose number this build does not have
+// (number_known false) suggests a sample made for another build.
+// model: hits ({ ...hit, source: 'process' | 'file' }), notes ({ tone, title, text }), summary, partial.
 function renderSyscallStubs(model) {
     const m = model && typeof model === 'object' ? model : {};
     const all = Array.isArray(m.hits) ? m.hits : [];
@@ -25618,10 +25620,10 @@ function renderSyscallStubs(model) {
         if (h.import_present === true) {
             imported = '<span title="The sample imports this function as well: a weaker hint.">imported too</span>';
         } else if (h.import_present === false) {
-            imported = '<span title="Not imported, by an import set widened through the Win32 to Nt table.">not imported</span>';
+            imported = '<span title="Not imported, by an import set widened through the curated Win32 to Nt table: a proven bypass of the import path.">not imported</span>';
         } else {
-            imported = '<span class="syscall-muted" title="The import table is not known to be complete for this function: a Win32 function such as ' +
-                       'VirtualAllocEx reaches NtAllocateVirtualMemory without importing its Nt name, so a missing import proves nothing.">unknown</span>';
+            imported = '<span class="syscall-muted" title="No curated Win32 to Nt row leads to this syscall, or the import table could not be read: ' +
+                       'a Win32 function the table does not know may reach it, so a missing import proves nothing.">unknown</span>';
         }
         const drawable = typeof h.stub_hex === 'string' && h.stub_hex !== '' && Number.isInteger(h.number);
         rows.push('<tr>' +
@@ -25639,9 +25641,9 @@ function renderSyscallStubs(model) {
     }
     return syscallNoticesHtml(notes) +
         (m.summary ? `<div class="syscall-stubs-summary">${escapeHtml(m.summary)}</div>` : '') +
-        '<p class="syscall-draft-hint"><strong>Hints, not proof.</strong> A syscall stub in the sample\'s own memory or file may be a direct syscall that goes around ntdll, ' +
-        'but whether the sample also imports that function is not known: only an import set widened through the Win32 to Nt table could prove a bypass, ' +
-        'and that table is not part of this tab yet. Look at each hit before drafting a rule.</p>' +
+        '<p class="syscall-draft-hint"><strong>Proof or hint.</strong> A syscall stub in the sample\'s own memory or file whose function the sample does not import, ' +
+        'judged by its import set widened through the curated Win32 to Nt table, is a proven bypass of ntdll. ' +
+        'It stays a hint where the sample imports the function as well, or where no curated row leads to the syscall. Look at each hit before drafting a rule.</p>' +
         '<div class="view-table-wrap"><table class="view-table" data-sortable data-sort-id="syscall-stubs"><thead><tr><th>SYSCALL</th><th>NUMBER</th><th>BUILD</th>' +
         `<th>FOUND</th><th>PATTERN</th><th>IMPORTED</th><th></th></tr></thead><tbody>${rows.join('')}</tbody></table></div>`;
 }

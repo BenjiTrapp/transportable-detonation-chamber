@@ -267,3 +267,42 @@ def test_a_delay_loaded_import_counts_as_an_import(tdc, client, target, sample_d
     path.write_bytes(_pe_importing("WriteProcessMemory", delay=True) + _X64_STUB_0x3A)
     body = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()
     assert body["hits"][0]["import_present"] is True
+
+
+# what Plan 1 said while the table did not exist; each became false the day it did, and none may come back
+STALE_PHRASES = (
+    "The import table is not passed",                       # app.py, _syscall_stage_file
+    "`import_present` is None: a raw import table",         # app.py, api_syscalls_stubs
+    "the sample imports the function is mostly not known",  # app.js, over renderSyscallStubs
+    "that table is not part of this tab yet",               # app.js, the hint over the stub list
+    "They are hints, not proof",                            # index.html, the info of the stub panel
+    "not known to be complete for this function",           # app.js, the tooltip of "unknown"
+    "until the Win32-to-Nt table exists",                   # docs/api.md
+    "Every hit is a hint for now",                          # docs/memory.md, the table row
+    "Every hit is for now a hint",                          # docs/memory.md, the section
+    "which the chamber does not have yet",                  # docs/memory.md, the section
+    "wartet daher auf Plan 2",                              # the spec, goal 7a
+    "Solange die kuratierte Tabelle fehlt",                 # the spec, goal 7a
+    "Plan 2 schaltet den Beleg frei",                       # the spec, goal 7a
+)
+
+
+def test_no_shipped_text_still_says_the_win32_to_nt_table_is_missing():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    paths = [os.path.join(root, "webui", n) for n in sorted(os.listdir(os.path.join(root, "webui")))
+             if n.endswith(".py")]
+    paths += [os.path.join(root, *p.split("/")) for p in (
+        "webui/static/js/app.js", "webui/templates/index.html", "docs/api.md", "docs/memory.md",
+        "docs/superpowers/specs/2026-11-22-syscall-map-design.md")]
+    found = []
+    for path in paths:
+        with open(path, encoding="utf-8") as fh:
+            text = " ".join(fh.read().split())
+        found += [(os.path.relpath(path, root), phrase) for phrase in STALE_PHRASES if phrase in text]
+    assert found == []
+
+
+def test_the_stub_list_changed_and_so_did_its_asset_version():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "webui", "templates", "index.html"), encoding="utf-8") as fh:
+        assert "app.js?v=136" not in fh.read(), "app.js changed, its version did not"

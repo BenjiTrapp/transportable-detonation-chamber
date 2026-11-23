@@ -528,15 +528,17 @@ mitgebrachten Stub daher nie sähe.
   das Sample dieselbe Funktion **nicht** importiert, denn dann ist die Umgehung
   belegt und nicht nur möglich. Importiert es sie auch, ist es ein schwächerer
   Hinweis.
-- **Der starke Anspruch braucht die Win32→Nt-Kette und wartet daher auf Plan 2.**
-  Ein Sample, das `VirtualAllocEx` importiert und einen Stub für
-  `NtAllocateVirtualMemory` trägt, importiert den Nt-Namen nicht — gegen die rohe
-  Importtabelle geprüft sähe das wie eine belegte Umgehung aus, obwohl der
-  dokumentierte Weg vorhanden ist. Solange die kuratierte Tabelle fehlt, ist
-  `import_present` daher **unbekannt** und jeder Treffer gilt als Hinweis, nicht
-  als Beleg. Plan 2 schaltet den Beleg frei, indem er die Importmenge über
-  `win32_to_nt.json` erweitert. Ein Befund darf nie mehr behaupten, als die
-  Daten tragen.
+- **Der starke Anspruch braucht die Win32→Nt-Kette.** Ein Sample, das
+  `VirtualAllocEx` importiert und einen Stub für `NtAllocateVirtualMemory` trägt,
+  importiert den Nt-Namen nicht — gegen die rohe Importtabelle geprüft sähe das wie
+  eine belegte Umgehung aus, obwohl der dokumentierte Weg vorhanden ist. Deshalb
+  wird die Importmenge über die kuratierte Tabelle `win32_to_nt.json` erweitert,
+  bevor sie etwas über ein Fehlen sagen darf. Fehlt der Funktion eines Stubs dann
+  jeder Weg, ist die Umgehung belegt (`import_present` False). Die Tabelle hält nur
+  die APIs, die TDC schon als verdächtig führt; für einen Syscall, zu dem keine
+  kuratierte Zeile führt, bleibt `import_present` **unbekannt** und der Treffer ein
+  Hinweis — ebenso, wenn die Importtabelle nicht lesbar ist. Ein Befund darf nie
+  mehr behaupten, als die Daten tragen.
 - **Eigene Route** `POST /api/syscalls/stubs` mit `pid` oder `path`.
 - Dieser Befund ist die Eingabe für die generierte YARA-Regel aus Ziel 5.2.
 

@@ -594,7 +594,8 @@ def from_direct_stubs(hits, process=""):
     A stub whose function the sample does not import, judged against its import table
     expanded through the Win32 to Nt table, is a proven bypass of the import path and
     carries the kind's full weight. The scanner only says so for such a table
-    (``import_present`` False); against a raw one it says None. A stub whose function it
+    (``import_present`` False), and only for a syscall a curated row of that table leads
+    to; against a raw one, or for any other syscall, it says None. A stub whose function it
     imports as well, or whose import table is unknown, or whose number this build does
     not have, is a hint: the same kind of fact held with less certainty, so it asks for
     a second source and scores at ``UNCORROBORATED`` until one agrees, and it does not

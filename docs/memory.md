@@ -179,7 +179,7 @@ hooks of a sample's process and the sample's own hooks stop counting.
 | Syscall stub redirected into private memory (`patched`) | 4.0 | Structural, needs no second source |
 | Syscall stub hooked by an unlisted module (`hooked`) | 0.8 | Behavioural, counts at 40 % until another source agrees on the process |
 | Syscall stub carries the number of another syscall (`syscall_stub_renumbered`) | 4.0 | Structural, needs no second source. A stub of intact shape whose number is not the baseline's: the call enters the kernel as another syscall. It needs no jump target and no allowlist covers it; its state is `diverged` |
-| Syscall stub outside `ntdll` (`direct_syscall_stub`) | 4.0 | Every hit is a hint for now and counts at 40 % until another source agrees, see below |
+| Syscall stub outside `ntdll` (`direct_syscall_stub`) | 4.0 | Structural. A proven bypass carries the full weight; a hint counts at 40 % until another source agrees and corroborates nothing itself, see below |
 
 `diverged` and `unreadable` stay on the map and out of the score, except a
 renumbered stub, which scores as above. A scan goes
@@ -193,10 +193,16 @@ measurement above cannot see it. STUBS searches the chosen process's private
 executable memory and the sample file for the shape of a stub with a number that
 is valid for this build, which is what makes a hit specific: not "an `SVC`
 somewhere" but "a stub for `NtWriteVirtualMemory`". Guard pages are never read,
-because reading one would change the process. Every hit is for now a hint: telling
-a bypass from an ordinary call needs the chain from the Win32 function to its Nt
-counterpart, which the chamber does not have yet, so `import_present` stays
-`null`. A stub that jumps into `ntdll`'s own `syscall` instruction (an indirect
+because reading one would change the process. Telling a bypass from an ordinary
+call needs the chain from the Win32 function to its Nt counterpart: a sample that
+calls `VirtualAllocEx` never imports `NtAllocateVirtualMemory`. The chamber holds
+that chain in `webui/win32_to_nt.json` for the APIs it already calls suspicious,
+each row with the source it was read from. A stub whose function the sample does
+not import, by its import table widened through that table, is a proven bypass
+(`import_present` `false`); one it imports as well is a hint (`true`). Outside the
+table `import_present` stays `null`, and so does every hit when the import table
+cannot be read: a hint. That is a boundary, not a gap: for a syscall no curated row
+leads to, a missing import proves nothing. A stub that jumps into `ntdll`'s own `syscall` instruction (an indirect
 syscall) has no stub shape of its own and is not found.
 
 ### Rules

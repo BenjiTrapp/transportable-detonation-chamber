@@ -1324,7 +1324,7 @@
                             </section>
                             <section class="syscall-panel syscall-stubs" id="syscall-stubs" aria-label="Syscall stubs of the sample" hidden>
                                 <div class="syscall-panel-head">
-                                    <h3 class="syscall-panel-title" data-info="Syscall stubs that the chosen process carries itself, found in its private executable memory and in its image file. They are hints, not proof: Draft rule makes a YARA rule for the bytes of one and writes nothing.">DIRECT SYSCALL STUBS</h3>
+                                    <h3 class="syscall-panel-title" data-info="Syscall stubs the chosen process carries itself, in its private executable memory and its image file: one whose function the image does not import, by the curated Win32 to Nt table, is a proven bypass, the rest are hints. Draft rule makes a YARA rule for its bytes and writes nothing.">DIRECT SYSCALL STUBS</h3>
                                     <span class="syscall-panel-note" id="syscall-stubs-head"></span>
                                 </div>
                                 <div class="syscall-panel-body" id="syscall-stubs-body"></div>
@@ -1878,6 +1878,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
     </div>
 
-    <script src="/static/js/app.js?v=136"></script>
+    <script src="/static/js/app.js?v=137"></script>
 </body>
 </html>
