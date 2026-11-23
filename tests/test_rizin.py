@@ -7297,9 +7297,25 @@ def test_real_rizin_does_not_export_into_a_map_it_does_not_show(tdc, tmp_path, m
 
 # --- The timeline of the emulation (RizinSession._restore) ----------------------
 
-def _timeline(rz, sid):
-    """What the pane is told: how many actions, whether and why the timeline cannot be offered."""
+def _state(rz, sid):
+    """What the timeline holds, without asking rizin: how many actions and the record's own taint (after a
+    discard, the reason it is gone)."""
+    session = rz.mgr.get(sid)
+    record = session._restore
+    if record is None:
+        return {"actions": 0, "tainted": session._restore_gone}
+    return {"actions": len(record["actions"]), "tainted": record["tainted"]}
+
+
+def _offer(rz, sid):
+    """What the pane is told (it asks rizin, so it waits for the gate)."""
     return rz.mgr.get(sid).restore_offer()
+
+
+def _wrote(rz, sid, addr="0x140002200", data="41424344"):
+    """What an emulation run leaves in the cache: a write that is not a patch of the session's own. It is made
+    on the pipe, as the assistant's copies are, and not through the console, which would spoil the timeline."""
+    rz.mgr.get(sid)._pipe.cmd(f"wx {data} @ {addr}")
 
 
 def _record(rz, sid):
@@ -7331,7 +7347,7 @@ def test_the_timeline_records_what_the_emulation_routes_did(rz, monkeypatch):
 
     monkeypatch.setenv("FAKE_RIZIN_BITS", "32")
     sid = rz.session()
-    assert _timeline(rz, sid) == {"actions": 0, "tainted": None, "digests": 0}, "nothing has started"
+    assert _state(rz, sid) == {"actions": 0, "tainted": None}, "nothing has started"
     assert _record(rz, sid) is None
     rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": f"{ASSIST32_AT:#x}"})
     _skip(rz, sid, ASSIST32_AT, value="0x1", stack_fix=4)
@@ -7351,7 +7367,7 @@ def test_the_timeline_records_what_the_emulation_routes_did(rz, monkeypatch):
         {"kind": "patch", "addr": CHECK_JZ, "data": written}], "a patch by kind is the bytes it wrote"
     assert record["counters"] == {"tick": rizin_emulation.TICK_START, "handle": 0, "pseudo": 0}
     assert record["breakpoints"] == [] and record["tainted"] is None
-    assert _timeline(rz, sid) == {"actions": 6, "tainted": None, "digests": 0}
+    assert _state(rz, sid) == {"actions": 6, "tainted": None}
     # every one of them is one the writer takes: the timeline is a record without its digests
     line, fitted = rizin_emulation.restore_line(dict(record, digests=[]), 4096)
     assert fitted and rizin_emulation.read_restore(line)["actions"] == record["actions"]
@@ -7363,16 +7379,16 @@ def test_a_refusal_or_a_read_that_fails_does_not_spoil_or_lose_an_action(rz, mon
     # a run that is refused before it runs changed nothing: it is not on the timeline, and it spoils nothing
     assert rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": "step"}).status_code == 400
     assert rz.post(f"/api/rizin/{sid}/emulation/run", {"kind": "until"}).status_code == 400
-    assert _timeline(rz, sid) == {"actions": 1, "tainted": None, "digests": 0}
+    assert _state(rz, sid) == {"actions": 1, "tainted": None}
     rz.send(f"/api/rizin/{sid}/emulation/start", {})
-    assert _timeline(rz, sid)["actions"] == 2
+    assert _state(rz, sid)["actions"] == 2
 
     # a read after the run that fails: the run happened, so it is on the timeline -- and nothing is spoilt
     session = rz.mgr.get(sid)
     monkeypatch.setattr(session, "_emulation_read", lambda pipe: (_ for _ in ()).throw(ValueError("boom")))
     with pytest.raises(ValueError):
         session.emulation_run("step")
-    assert _timeline(rz, sid) == {"actions": 3, "tainted": None, "digests": 0}
+    assert _state(rz, sid) == {"actions": 3, "tainted": None}
     with pytest.raises(ValueError):
         session.emulation_start(0x140001440)
     assert [a["kind"] for a in _record(rz, sid)["actions"]] == ["start", "start", "run", "start"], \
@@ -7391,12 +7407,12 @@ def test_a_run_that_fails_after_it_changed_something_spoils_the_timeline(rz, mon
     monkeypatch.setattr(session, "_emulation_command", runs_then_fails)
     with pytest.raises(ValueError):
         session.emulation_run("step")
-    offer = _timeline(rz, sid)
+    offer = _state(rz, sid)
     assert offer["tainted"] and "half-way" in offer["tainted"]
     assert offer["actions"] == 1, "what failed is not an action: nobody knows what it did"
     # the reason that came first stays
     rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rax", "value": "0x1"})
-    assert "half-way" in _timeline(rz, sid)["tainted"]
+    assert "half-way" in _state(rz, sid)["tainted"]
 
 
 def test_a_skip_or_a_patch_that_fails_after_it_changed_something_spoils_the_timeline(rz, monkeypatch):
@@ -7406,7 +7422,7 @@ def test_a_skip_or_a_patch_that_fails_after_it_changed_something_spoils_the_time
     monkeypatch.setattr(session, "_assist_apply", lambda pipe, plan: (_ for _ in ()).throw(ValueError("boom")))
     with pytest.raises(ValueError):
         session.call_skip(ASSIST_AT + 12, 0x7, 0)
-    offer = _timeline(rz, sid)
+    offer = _state(rz, sid)
     assert offer["actions"] == 1 and "half-way" in offer["tainted"]
 
     sid = _started_another(rz, "patchfail.exe")
@@ -7414,7 +7430,7 @@ def test_a_skip_or_a_patch_that_fails_after_it_changed_something_spoils_the_time
     monkeypatch.setattr(session, "_patch_list", lambda pipe, ordered=False: (_ for _ in ()).throw(ValueError("x")))
     with pytest.raises(ValueError):
         session.patch(0x140001440, b"\x90")
-    assert _timeline(rz, sid)["actions"] == 1 and "half-way" in _timeline(rz, sid)["tainted"]
+    assert _state(rz, sid)["actions"] == 1 and "half-way" in _state(rz, sid)["tainted"]
 
 
 def test_a_skip_whose_read_fails_is_on_the_timeline_all_the_same(rz, monkeypatch):
@@ -7425,7 +7441,7 @@ def test_a_skip_whose_read_fails_is_on_the_timeline_all_the_same(rz, monkeypatch
     with pytest.raises(ValueError):
         session.call_skip(ASSIST_AT + 12, 0x7, 0)
     assert _record(rz, sid)["actions"][1:] == [{"kind": "skip", "addr": ASSIST_AT + 12, "value": 7, "fix": 0}]
-    assert _timeline(rz, sid)["tainted"] is None
+    assert _state(rz, sid)["tainted"] is None
 
 
 def test_a_skip_that_ended_at_the_time_limit_spoils_the_timeline(rz, monkeypatch):
@@ -7434,7 +7450,7 @@ def test_a_skip_that_ended_at_the_time_limit_spoils_the_timeline(rz, monkeypatch
     session = rz.mgr.get(sid)
     monkeypatch.setattr(session, "_emulation_command", lambda *args: "timeout")
     session.call_skip(ASSIST_AT + 12, None, 0)
-    offer = _timeline(rz, sid)
+    offer = _state(rz, sid)
     assert offer["actions"] == 2 and "time limit" in offer["tainted"]
     assert _record(rz, sid)["actions"][1] == {"kind": "skip", "addr": ASSIST_AT + 12, "value": None, "fix": 0}, \
         "a skip that leaves the register as it is is recorded with no value"
@@ -7446,7 +7462,7 @@ def test_a_register_that_is_set_and_then_not_read_back_still_taints(rz, monkeypa
     monkeypatch.setattr(session, "_emulation_read", lambda pipe: (_ for _ in ()).throw(ValueError("boom")))
     with pytest.raises(ValueError):
         session.emulation_register("rax", 5)
-    assert "register" in _timeline(rz, sid)["tainted"]
+    assert "register" in _state(rz, sid)["tainted"]
 
 
 def test_only_an_until_run_carries_an_address(rz):
@@ -7462,7 +7478,7 @@ def test_a_patch_refused_before_it_wrote_spoils_nothing(rz):
     sid = _started(rz)
     assert rz.post(f"/api/rizin/{sid}/patch", {"addr": "0x140001440", "bytes": "zz"}).status_code == 400
     assert rz.post(f"/api/rizin/{sid}/patch", {"addr": "0x140001440", "kind": "nonsense"}).status_code == 400
-    assert _timeline(rz, sid) == {"actions": 1, "tainted": None, "digests": 0}
+    assert _state(rz, sid) == {"actions": 1, "tainted": None}
 
 
 @pytest.mark.parametrize("error", [RuntimeError, KeyError, OSError, AssertionError])
@@ -7478,7 +7494,7 @@ def test_whatever_fails_inside_an_action_spoils_the_timeline(rz, monkeypatch, er
     monkeypatch.setattr(session, "_emulation_command", runs_then_fails)
     with pytest.raises(error):
         session.emulation_run("step")
-    assert "half-way" in _timeline(rz, sid)["tainted"]
+    assert "half-way" in _state(rz, sid)["tainted"]
 
 
 @pytest.mark.parametrize("kind", ["cont", "to_call", "until"])
@@ -7487,14 +7503,14 @@ def test_a_run_that_ended_in_a_timeout_taints_the_timeline(rz, monkeypatch, kind
     monkeypatch.setenv("FAKE_RIZIN_ESIL_RUNAWAY", "1")
     sid = _started(rz)
     _run(rz, sid, "step")
-    assert _timeline(rz, sid) == {"actions": 2, "tainted": None, "digests": 0}, "a step ended in time"
+    assert _state(rz, sid) == {"actions": 2, "tainted": None}, "a step ended in time"
     state = _run(rz, sid, kind, **({"addr": "0x140001500"} if kind == "until" else {}))
     assert state["stopped"] == "timeout"
-    offer = _timeline(rz, sid)
+    offer = _state(rz, sid)
     assert offer["actions"] == 3 and offer["tainted"] and "time limit" in offer["tainted"]
     # and it stays so: later actions do not make it a timeline again
     _run(rz, sid, "step")
-    assert "time limit" in _timeline(rz, sid)["tainted"] and _timeline(rz, sid)["actions"] == 4
+    assert "time limit" in _state(rz, sid)["tainted"] and _state(rz, sid)["actions"] == 4
 
 
 def test_a_timeout_that_is_followed_by_a_failure_keeps_its_reason(rz, monkeypatch):
@@ -7504,7 +7520,7 @@ def test_a_timeout_that_is_followed_by_a_failure_keeps_its_reason(rz, monkeypatc
     monkeypatch.setattr(session, "_emulation_read", lambda pipe: (_ for _ in ()).throw(ValueError("boom")))
     with pytest.raises(ValueError):
         session.emulation_run("cont")
-    offer = _timeline(rz, sid)
+    offer = _state(rz, sid)
     assert offer["actions"] == 2 and "time limit" in offer["tainted"], "the run is on it, and it is spoilt for that"
 
 
@@ -7514,30 +7530,33 @@ def test_a_run_that_stopped_for_another_reason_is_no_taint(rz):
     rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
     assert _run(rz, sid, "cont")["stopped"] == "breakpoint"
     assert _run(rz, sid, "cont")["stopped"] == "trap"  # a trap is a result, not the clock
-    assert _timeline(rz, sid) == {"actions": 3, "tainted": None, "digests": 0}
+    assert _state(rz, sid) == {"actions": 3, "tainted": None}
 
 
 def test_a_hand_set_register_taints_the_timeline(rz):
     sid = _started(rz)
     _run(rz, sid, "step")
-    assert _timeline(rz, sid)["tainted"] is None
+    assert _state(rz, sid)["tainted"] is None
     rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rax", "value": "0x5"})
-    offer = _timeline(rz, sid)
+    offer = _state(rz, sid)
     assert offer["tainted"] and "register" in offer["tainted"] and offer["actions"] == 2
     # a register that is refused changed nothing
     sid = _started_another(rz, "refused.exe")
     assert rz.post(f"/api/rizin/{sid}/emulation/register", {"name": "nonsense", "value": "0x5"}).status_code == 400
-    assert _timeline(rz, sid)["tainted"] is None
+    assert _state(rz, sid)["tainted"] is None
 
 
 SPOILING = [
     "wx 90 @ 0x140001440", "w hello @ 0x140001440", "wz hi @ 0x140001440", "wo4 @ 0x140001440", "wc-*",
     "wc- @ 0x140001440", "wc 0x140001440", "ar rax=1", "aer rax=1", "aeim 0x300000 0x100 mine", "aei", "aes", "aepc 0x140001450",
     "aecu 0x140001450", "e esil.timeout=0", "e io.cache=false", "e asm.arch=x86", "ahs 3 @ 0x140001440",
-    "ah- @ 0x140001440", "px 4; wx 90 @ 0x140001440", 'a"e"im 0x1000 0x100 x', "db @ 0x140001450",
-    "db- @ 0x140001450", "db-*", "dbd 0x140001450"]
+    "ah- @ 0x140001440", "px 4; wx 90 @ 0x140001440", 'a"e"im 0x1000 0x100 x',
+    # any setting that is set, not a list of the ones that matter: analysis.gp is ESIL's $gp on MIPS
+    "e asm.syntax=intel", "e analysis.gp=0x1000", "e anal.gp=0x1000", "e bin.demangle=true",
+    "e asm.syntax=intel analysis.nopskip=false"]
+BREAKPOINT_COMMANDS = ["db @ 0x140001450", "db- @ 0x140001450", "db-*", "dbd 0x140001450"]
 READING = [
-    "px 16", "pd 3", "ar", "ar rax", "arj", "aerj", "wcj", "wc", "e asm.syntax=intel", "e esil.timeout",
+    "px 16", "pd 3", "ar", "ar rax", "arj", "aerj", "wcj", "wc", "e esil.timeout", "e asm.syntax", "el", "elj",
     "e asm.arch", "pdj 2 @ 0x140001440", "ae?", "w?", "dbl", "dblj", "afl", "s 0x140001440", "iz", "ahl",
     "ar=", "e io.cache", "px 4 @ 0x140001440; ar", "e asm.bits"]
 
@@ -7545,18 +7564,18 @@ READING = [
 @pytest.mark.parametrize("cmd", SPOILING)
 def test_a_console_command_that_writes_or_sets_taints_the_timeline(rz, cmd):
     sid = _started(rz)
-    assert _timeline(rz, sid)["tainted"] is None
+    assert _state(rz, sid)["tainted"] is None
     _console(rz, sid, cmd)
-    offer = _timeline(rz, sid)
+    offer = _state(rz, sid)
     assert offer["tainted"] and offer["actions"] == 1, cmd
-    assert ("breakpoint" in offer["tainted"]) == cmd.startswith("db"), (cmd, offer["tainted"])
+    assert "breakpoint" not in offer["tainted"], (cmd, offer["tainted"])
 
 
 @pytest.mark.parametrize("cmd", READING)
 def test_a_console_command_that_only_reads_spoils_nothing(rz, cmd):
     sid = _started(rz)
     _console(rz, sid, cmd)
-    assert _timeline(rz, sid) == {"actions": 1, "tainted": None, "digests": 0}, cmd
+    assert _state(rz, sid) == {"actions": 1, "tainted": None}, cmd
 
 
 def test_the_console_filter_agrees_with_the_lists_of_what_spoils(rz):
@@ -7564,10 +7583,16 @@ def test_the_console_filter_agrees_with_the_lists_of_what_spoils(rz):
 
     for cmd in SPOILING:
         assert rizin_sessions.check_console_command(cmd) is None, cmd
-        assert rizin_sessions._console_spoils(cmd), cmd
+        kind = ("_RESTORE_HAND_WRITE" if cmd.startswith(("w", "px 4; w")) else
+                "_RESTORE_HAND_SETTING" if cmd.startswith(("e ", "ah")) else "_RESTORE_HAND_EMULATION")
+        assert rizin_sessions._console_spoils(cmd) == getattr(rizin_sessions, kind), cmd
+    for cmd in BREAKPOINT_COMMANDS:
+        assert rizin_sessions.check_console_command(cmd) is None, cmd
+        assert rizin_sessions._console_moves_breakpoints(cmd) and rizin_sessions._console_spoils(cmd) is None, cmd
     for cmd in READING:
         assert rizin_sessions.check_console_command(cmd) is None, cmd
         assert rizin_sessions._console_spoils(cmd) is None, cmd
+        assert not rizin_sessions._console_moves_breakpoints(cmd), cmd
 
 
 def test_a_console_command_taints_before_it_runs(rz, monkeypatch):
@@ -7577,10 +7602,10 @@ def test_a_console_command_taints_before_it_runs(rz, monkeypatch):
     monkeypatch.setattr(session._pipe, "console", lambda *a, **k: (_ for _ in ()).throw(ValueError("boom")))
     with pytest.raises(ValueError):
         session.console("wx 90 @ 0x140001440")
-    assert _timeline(rz, sid)["tainted"]
+    assert _state(rz, sid)["tainted"]
 
 
-def test_a_breakpoint_changed_during_the_timeline_taints_it(rz):
+def test_a_breakpoint_changed_between_two_actions_taints_the_timeline(rz):
     # the breakpoints the timeline began with are the ones it ran under; a run stops at the ones there are
     sid = rz.session()
     rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
@@ -7588,12 +7613,103 @@ def test_a_breakpoint_changed_during_the_timeline_taints_it(rz):
     assert _record(rz, sid)["breakpoints"] == [0x1400014B7], "the set it began with, once for all of it"
     rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})  # set again: no change
     _run(rz, sid, "cont")
-    assert _timeline(rz, sid) == {"actions": 2, "tainted": None, "digests": 0}
+    assert _state(rz, sid) == {"actions": 2, "tainted": None}
     rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001450"})
-    assert "breakpoint" in _timeline(rz, sid)["tainted"]
+    assert _state(rz, sid)["tainted"] is None, "nothing has run under it yet"
+    _run(rz, sid, "step")  # the change stood between two actions
+    assert "breakpoint" in _state(rz, sid)["tainted"] and _state(rz, sid)["actions"] == 3
+    rz.remove(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001450"})  # back where it began: it stays spoilt
     _run(rz, sid, "step")
-    rz.remove(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001450"})  # back where it began: still spoilt
-    assert "breakpoint" in _timeline(rz, sid)["tainted"] and _timeline(rz, sid)["actions"] == 3
+    assert "breakpoint" in _state(rz, sid)["tainted"]
+
+
+def test_a_breakpoint_that_is_put_back_before_the_next_action_changes_nothing(rz):
+    sid = rz.session()
+    for addr in ("0x1400014b7", "0x140001450"):
+        rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": addr})
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    rz.remove(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001450"})
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001450"})
+    _run(rz, sid, "step")
+    _patch(rz, sid, addr="0x140001440", bytes="90")
+    assert _state(rz, sid) == {"actions": 3, "tainted": None}, "the run was replayable: it ran under the same set"
+    # the same through the console, whose db is read back once it has run
+    _console(rz, sid, "db @ 0x140001480")
+    _console(rz, sid, "db- @ 0x140001480")
+    _run(rz, sid, "step")
+    assert _state(rz, sid) == {"actions": 4, "tainted": None}
+    _console(rz, sid, "db @ 0x140001480")
+    _run(rz, sid, "step")
+    assert "breakpoint" in _state(rz, sid)["tainted"]
+
+
+@pytest.mark.parametrize("action", ["run", "patch", "skip", "start"])
+def test_every_kind_of_action_sees_a_breakpoint_that_changed_before_it(rz, monkeypatch, action):
+    monkeypatch.setenv("FAKE_RIZIN_ASSIST", "1")
+    sid = _started(rz, f"{ASSIST_AT + 12:#x}")
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
+    assert _state(rz, sid)["tainted"] is None
+    {"run": lambda: _run(rz, sid, "step"),
+     "patch": lambda: _patch(rz, sid, addr="0x140001440", bytes="90"),
+     "skip": lambda: _skip(rz, sid, ASSIST_AT + 12),
+     "start": lambda: rz.send(f"/api/rizin/{sid}/emulation/start", {})}[action]()
+    assert "breakpoint" in _state(rz, sid)["tainted"], action
+
+
+def test_a_breakpoint_that_differs_now_is_said_by_the_offer_until_it_is_put_back(rz):
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    _wrote(rz, sid)
+    assert _offer(rz, sid) == {"actions": 1, "reason": None, "digests": 1}
+    rz.remove(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
+    offer = _offer(rz, sid)
+    assert "breakpoint" in offer["reason"] and offer["digests"] == 1, "a replay would run under another set"
+    assert _state(rz, sid)["tainted"] is None, "and it is not the record's: no action has run under it"
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
+    assert _offer(rz, sid) == {"actions": 1, "reason": None, "digests": 1}
+    _console(rz, sid, "db- @ 0x1400014b7")
+    assert "breakpoint" in _offer(rz, sid)["reason"], "a console db is read back too"
+
+
+@pytest.mark.parametrize("error", ["value", "large"])
+def test_a_breakpoint_that_cannot_be_read_back_after_a_console_db_counts_as_changed(rz, monkeypatch, error):
+    import rizin_sessions
+
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    session = rz.mgr.get(sid)
+    real = session._breakpoint_list
+    boom = ValueError("x") if error == "value" else rizin_sessions.RizinTooLarge("big")
+    monkeypatch.setattr(session, "_breakpoint_list", lambda pipe: (_ for _ in ()).throw(boom))
+    _console(rz, sid, "db @ 0x140001480")  # the console answers: reading the set back is the timeline's own
+    monkeypatch.setattr(session, "_breakpoint_list", real)
+    _run(rz, sid, "step")
+    assert "breakpoint" in _state(rz, sid)["tainted"], "what the set is was not read, so it counts as changed"
+
+
+def test_a_standing_breakpoint_change_does_not_follow_a_timeline_into_the_next(rz):
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    _wrote(rz, sid)
+    rz.remove(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
+    assert "breakpoint" in _offer(rz, sid)["reason"]
+    rz.remove(f"/api/rizin/{sid}/patch", {})  # gone, with the standing change
+    assert "no longer kept" in _offer(rz, sid)["reason"], "after a discard, why it is gone"
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})  # begins over no breakpoint at all
+    _run(rz, sid, "step")
+    assert _state(rz, sid) == {"actions": 2, "tainted": None}
+    assert _record(rz, sid)["breakpoints"] == []
+
+
+def test_a_record_that_is_tainted_says_its_taint_before_a_breakpoint_that_stands_other(rz):
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    _wrote(rz, sid)
+    rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rax", "value": "0x5"})
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
+    assert "register" in _offer(rz, sid)["reason"]
 
 
 def test_the_breakpoints_are_compared_as_a_set_whatever_order_they_were_set_in(rz):
@@ -7604,9 +7720,11 @@ def test_the_breakpoints_are_compared_as_a_set_whatever_order_they_were_set_in(r
     assert _record(rz, sid)["breakpoints"] == [0x140001450, 0x140001480, 0x1400014B7], "ascending, once each"
     for addr in ("0x140001480", "0x1400014b7", "0x140001450"):
         rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": addr})
-    assert _timeline(rz, sid)["tainted"] is None, "the same three, set again"
+    _run(rz, sid, "step")
+    assert _state(rz, sid)["tainted"] is None, "the same three, set again"
     rz.remove(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001480"})
-    assert "breakpoint" in _timeline(rz, sid)["tainted"]
+    _run(rz, sid, "step")
+    assert "breakpoint" in _state(rz, sid)["tainted"]
 
 
 def test_clearing_a_breakpoint_the_timeline_began_with_taints_it(rz):
@@ -7614,20 +7732,23 @@ def test_clearing_a_breakpoint_the_timeline_began_with_taints_it(rz):
     rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
     rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
     rz.remove(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
-    assert "breakpoint" in _timeline(rz, sid)["tainted"]
+    _run(rz, sid, "step")
+    assert "breakpoint" in _state(rz, sid)["tainted"]
     # all of them, with an empty body: the same
     sid = _another_file(rz, "again.exe", SAMPLE + b"1")
     rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
     rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
-    assert _timeline(rz, sid)["tainted"] is None
+    assert _state(rz, sid)["tainted"] is None
     rz.remove(f"/api/rizin/{sid}/breakpoints", {})
-    assert "breakpoint" in _timeline(rz, sid)["tainted"]
+    _run(rz, sid, "step")
+    assert "breakpoint" in _state(rz, sid)["tainted"]
     # clearing where there is none is no change
     sid = _another_file(rz, "none.exe", SAMPLE + b"2")
     rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
     rz.remove(f"/api/rizin/{sid}/breakpoints", {})
     rz.remove(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
-    assert _timeline(rz, sid)["tainted"] is None
+    _run(rz, sid, "step")
+    assert _state(rz, sid)["tainted"] is None
 
 
 def test_a_breakpoint_that_rizin_kept_but_that_changed_the_set_spoils_the_timeline(rz, monkeypatch):
@@ -7638,10 +7759,13 @@ def test_a_breakpoint_that_rizin_kept_but_that_changed_the_set_spoils_the_timeli
         rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": addr})
     rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
     session = rz.mgr.get(sid)
+    real = session._breakpoint_list
     monkeypatch.setattr(session, "_breakpoint_list", lambda pipe: [{"addr": 0x140001450, "enabled": True}])
     with pytest.raises(rizin_sessions.RizinRefused):
         session.breakpoint_clear(0x140001450)  # rizin kept this one, and the other one went
-    assert "breakpoint" in _timeline(rz, sid)["tainted"]
+    monkeypatch.setattr(session, "_breakpoint_list", real)
+    _run(rz, sid, "step")
+    assert "breakpoint" in _state(rz, sid)["tainted"]
 
 
 def test_a_breakpoint_before_the_timeline_began_is_part_of_it_not_a_change(rz):
@@ -7649,9 +7773,9 @@ def test_a_breakpoint_before_the_timeline_began_is_part_of_it_not_a_change(rz):
     rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001450"})
     rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
     rz.remove(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001450"})
-    assert _record(rz, sid) is None and _timeline(rz, sid)["tainted"] is None
+    assert _record(rz, sid) is None and _state(rz, sid)["tainted"] is None
     rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
-    assert _record(rz, sid)["breakpoints"] == [0x1400014B7] and _timeline(rz, sid)["tainted"] is None
+    assert _record(rz, sid)["breakpoints"] == [0x1400014B7] and _state(rz, sid)["tainted"] is None
 
 
 def test_a_cache_that_held_writes_before_the_timeline_began_taints_it_from_the_start(rz):
@@ -7660,13 +7784,13 @@ def test_a_cache_that_held_writes_before_the_timeline_began_taints_it_from_the_s
     _console(rz, sid, "e io.cache=true")
     _console(rz, sid, "wx 9090 @ 0x140001440")
     rz.send(f"/api/rizin/{sid}/emulation/start", {})
-    offer = _timeline(rz, sid)
+    offer = _state(rz, sid)
     assert offer["actions"] == 1 and offer["tainted"] and "cache" in offer["tainted"]
     # a patch of the session's own before the start is no such write: it is the project's, and replays at open
     sid = _another_file(rz, "clean.exe", SAMPLE + b"3")
     _patch(rz, sid, addr="0x140001440", bytes="9090")
     rz.send(f"/api/rizin/{sid}/emulation/start", {})
-    assert _timeline(rz, sid) == {"actions": 1, "tainted": None, "digests": 0}
+    assert _state(rz, sid) == {"actions": 1, "tainted": None}
     assert [a["kind"] for a in _record(rz, sid)["actions"]] == ["start"], "a patch before the start is not an action"
 
 
@@ -7685,7 +7809,7 @@ def test_a_read_that_fails_when_the_timeline_begins_does_not_cost_the_start(rz, 
     monkeypatch.setattr(session, which, fails)
     state = rz.send(f"/api/rizin/{sid}/emulation/start", {})
     assert state["pc"] == hex(ENTRY)
-    offer = _timeline(rz, sid)
+    offer = _state(rz, sid)
     assert offer["actions"] == 1 and offer["tainted"] and "did not say" in offer["tainted"]
 
 
@@ -7746,7 +7870,7 @@ def test_a_second_emulation_start_is_an_action_of_the_same_timeline(rz, monkeypa
     assert record["counters"] == {"tick": rizin_emulation.TICK_START, "handle": 0, "pseudo": 0}, \
         "the counters are those of the first start: the replay sets them back to it"
     assert record["breakpoints"] == [0x1400014B7]
-    assert _timeline(rz, sid) == {"actions": 3, "tainted": None, "digests": 0}
+    assert _state(rz, sid) == {"actions": 3, "tainted": None}
     # a start with no address is at the seek: it is the address that is recorded
     rz.send(f"/api/rizin/{sid}/emulation/start", {})
     assert record["actions"][3] == {"kind": "start", "addr": rz.mgr.get(sid).at}
@@ -7768,27 +7892,26 @@ def test_taking_something_out_of_the_cache_discards_the_timeline(rz):
         sid = _started_another(rz, f"discard{len(body)}.exe")
         _patch(rz, sid, addr="0x140001440", bytes="9090")
         _run(rz, sid, "step")
-        assert _timeline(rz, sid)["actions"] == 3
+        assert _state(rz, sid)["actions"] == 3
         rz.remove(f"/api/rizin/{sid}/patch", body)
-        offer = _timeline(rz, sid)
-        assert offer == {"actions": 0, "tainted": rizin_sessions._RESTORE_GONE, "digests": 0}, body
-        assert "no longer kept" in offer["tainted"]
+        assert _offer(rz, sid) == {"actions": 0, "reason": rizin_sessions._RESTORE_GONE, "digests": 0}, body
+        assert "no longer kept" in _offer(rz, sid)["reason"]
         assert _record(rz, sid) is None
         # nothing more is written to what is gone, and later taints have nothing to spoil
         _run(rz, sid, "step")
         rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rax", "value": "0x1"})
-        assert _record(rz, sid) is None and _timeline(rz, sid)["actions"] == 0
+        assert _record(rz, sid) is None and _state(rz, sid)["actions"] == 0
 
 
 def test_taking_back_where_there_is_nothing_keeps_the_timeline(rz):
     sid = _started(rz)
     _patch(rz, sid, addr="0x140001440", bytes="9090")
     rz.remove(f"/api/rizin/{sid}/patch", {"addr": "0x140009000"})  # no write there
-    assert _timeline(rz, sid) == {"actions": 2, "tainted": None, "digests": 0}
+    assert _state(rz, sid) == {"actions": 2, "tainted": None}
     sid = _another_file(rz, "empty.exe", SAMPLE + b"4")
     rz.send(f"/api/rizin/{sid}/emulation/start", {})
     rz.remove(f"/api/rizin/{sid}/patch", {})  # an empty cache stays empty
-    assert _timeline(rz, sid) == {"actions": 1, "tainted": None, "digests": 0}
+    assert _state(rz, sid) == {"actions": 1, "tainted": None}
 
 
 def test_a_taint_and_a_discard_end_in_the_discard_and_a_new_start_begins_a_new_timeline(rz):
@@ -7797,18 +7920,18 @@ def test_a_taint_and_a_discard_end_in_the_discard_and_a_new_start_begins_a_new_t
     sid = _started(rz)
     _patch(rz, sid, addr="0x140001440", bytes="9090")
     rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rax", "value": "0x1"})
-    assert "register" in _timeline(rz, sid)["tainted"]
+    assert "register" in _state(rz, sid)["tainted"]
     rz.remove(f"/api/rizin/{sid}/patch", {})
-    assert _timeline(rz, sid)["tainted"] == rizin_sessions._RESTORE_GONE, "the reason that is left is the discard"
+    assert _state(rz, sid)["tainted"] == rizin_sessions._RESTORE_GONE, "the reason that is left is the discard"
     session = rz.mgr.get(sid)
     rz.send(f"/api/rizin/{sid}/emulation/start", {})
-    assert _timeline(rz, sid) == {"actions": 1, "tainted": None, "digests": 0}, "a new timeline, a clean one"
+    assert _state(rz, sid) == {"actions": 1, "tainted": None}, "a new timeline, a clean one"
     assert session._restore_gone is None
     # and a discard of a timeline that never was says nothing
     sid = _another_file(rz, "nothing.exe", SAMPLE + b"5")
     _patch(rz, sid, addr="0x140001440", bytes="90")
     rz.remove(f"/api/rizin/{sid}/patch", {})
-    assert _timeline(rz, sid) == {"actions": 0, "tainted": None, "digests": 0}
+    assert _state(rz, sid) == {"actions": 0, "tainted": None}
 
 
 def test_an_unpatch_that_fails_after_the_command_discards_the_timeline(rz, monkeypatch):
@@ -7827,7 +7950,7 @@ def test_an_unpatch_that_fails_after_the_command_discards_the_timeline(rz, monke
     monkeypatch.setattr(session, "_patch_list", fails_the_second_read)
     with pytest.raises(ValueError):
         session.unpatch(0x140001440)
-    assert _record(rz, sid) is None and "no longer kept" in _timeline(rz, sid)["tainted"]
+    assert _record(rz, sid) is None and "no longer kept" in _state(rz, sid)["tainted"]
 
 
 def test_an_unpatch_that_is_refused_after_it_took_something_out_discards_the_timeline(rz, monkeypatch):
@@ -7861,17 +7984,272 @@ def test_the_timeline_stops_growing_where_a_project_would_not_keep_it(rz, monkey
     sid = _started(rz)
     for _ in range(3):
         _run(rz, sid, "step")
-    assert _timeline(rz, sid) == {"actions": 4, "tainted": None, "digests": 0}, "four is the most it keeps"
+    assert _state(rz, sid) == {"actions": 4, "tainted": None}, "four is the most it keeps"
     _run(rz, sid, "step")
-    offer = _timeline(rz, sid)
-    assert offer["actions"] == 4 and offer["tainted"] and "4 actions" in offer["tainted"]
+    state = _state(rz, sid)
+    assert state["actions"] == 4 and "dropped" in state["tainted"] and "4 actions" in state["tainted"]
+    assert "longer than" not in state["tainted"], "four are kept: what taints is the fifth that is not"
 
 
-def test_the_offer_counts_the_digests_a_record_holds(rz):
+def test_the_fake_takes_a_register_before_aei_and_keeps_it_through_aei_like_rizin(rz):
+    # measured on rizin 0.9.1 (test_real_rizin_the_recorded_skip_value_is_what_was_applied): `ar eax=0x1234` is
+    # accepted before aei, reads back, and is still there after aei, aeim and aepc. The fake used to refuse it.
+    def held(sid, name="rax"):
+        return int(_console(rz, sid, f"ar {name}")["output"].split("=")[1], 16)
+
+    sid = rz.session()
+    assert held(sid) == 0
+    assert _console(rz, sid, "ar rax=0x1234")["output"] == ""
+    assert held(sid) == 0x1234
+    _console(rz, sid, "aepc 0x140001450")
+    assert held(sid, "PC") == 0x140001450
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    assert held(sid) == 0x1234
+    assert _word(next(r["value"] for r in rz.read(f"/api/rizin/{sid}/emulation")["registers"]
+                      if r["name"] == "rax")) == 0x1234
+
+
+@pytest.mark.parametrize("cmd", ["ar rax=0x1234", "aer rax=0x1234", "aepc 0x140001450", "aeim 0x300000 0x100 mine",
+                                 "aei"])
+def test_a_console_command_before_the_first_start_that_sets_the_emulation_up_spoils_the_timeline(rz, cmd):
+    # rizin keeps a register set before aei through aei, aeim and aepc (measured), so the run reads it, and the
+    # replay of a project does not have it
+    sid = rz.session()
+    _console(rz, sid, cmd)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    state = _state(rz, sid)
+    assert state["actions"] == 1 and state["tainted"] and "emulation" in state["tainted"], cmd
+    # and it is said once: the next timeline begins from what is true then
+    sid = _another_file(rz, f"{cmd[:3]}.exe", SAMPLE + cmd.encode())
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    assert _state(rz, sid)["tainted"] is None
+
+
+@pytest.mark.parametrize("cmd", ["e asm.arch=x86", "e asm.syntax=intel", "e esil.timeout=9", "ahs 3 @ 0x140001440",
+                                 "db @ 0x140001480"])
+def test_a_setting_a_hint_or_a_breakpoint_before_the_first_start_is_part_of_where_it_began(rz, cmd):
+    # the project keeps the settings, the hints and the breakpoints, so a replay begins with them
+    sid = rz.session()
+    _console(rz, sid, cmd)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    assert _state(rz, sid) == {"actions": 1, "tainted": None}, cmd
+
+
+def test_a_write_that_was_taken_out_again_before_the_first_start_spoils_nothing(rz):
+    sid = rz.session()
+    _console(rz, sid, "e io.cache=true")
+    _console(rz, sid, "wx 9090 @ 0x140001440")
+    _console(rz, sid, "wc-*")
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    assert _state(rz, sid) == {"actions": 1, "tainted": None}
+
+
+def test_what_was_set_by_hand_before_a_start_spoils_that_timeline_only_and_comes_first(rz):
+    sid = rz.session()
+    _console(rz, sid, "e io.cache=true")
+    _console(rz, sid, "wx 9090 @ 0x140001440")  # a foreign row, which would name the cache
+    _console(rz, sid, "ar rax=0x5")
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    assert "emulation" in _state(rz, sid)["tainted"], "the register is the cause worth naming"
+    assert rz.mgr.get(sid)._restore_pending is None
+    _wrote(rz, sid)
+    rz.remove(f"/api/rizin/{sid}/patch", {})  # discarded: the next start begins a new one, which is clean
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    assert _state(rz, sid) == {"actions": 1, "tainted": None}
+
+
+def test_a_register_set_by_hand_after_a_discard_spoils_the_next_timeline(rz):
     sid = _started(rz)
-    assert _timeline(rz, sid)["digests"] == 0, "a live timeline has none: they are made when the project is saved"
-    _record(rz, sid)["digests"] = [{"start": 0x1000, "end": 0x103F, "sha256": "0" * 64}] * 2
-    assert _timeline(rz, sid)["digests"] == 2
+    _patch(rz, sid, addr="0x140001440", bytes="90")
+    rz.remove(f"/api/rizin/{sid}/patch", {})
+    assert _record(rz, sid) is None
+    rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rax", "value": "0x5"})
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})  # aei keeps the register
+    assert "register" in _state(rz, sid)["tainted"]
+
+
+@pytest.mark.parametrize("error", ["timeout", "died"])
+def test_a_pipe_that_stops_while_the_timeline_begins_ends_the_session_and_is_not_swallowed(rz, monkeypatch, error):
+    # RizinTimeout and RizinDied are Exceptions, and swallowing them here would let the start answer "done" on
+    # a rizin that has been killed: the session has to end, as it does for any other command (_call)
+    import rizin_sessions
+
+    sid = rz.session()
+    session = rz.mgr.get(sid)
+    boom = rizin_sessions.RizinTimeout("slow") if error == "timeout" else rizin_sessions.RizinDied("gone")
+
+    def stops(*args, **kwargs):
+        raise boom
+
+    monkeypatch.setattr(session, "_breakpoint_list", stops)
+    with pytest.raises(type(boom)):
+        session.emulation_start(0x140001440)
+    assert session.closed
+    assert session._restore is None
+
+
+def test_a_rizin_restart_drops_the_timeline_and_says_why(sessions, sample, fake, tmp_path, monkeypatch):
+    """_recover gives the session a rizin with an empty cache: the run's rows are gone, so the digests Task 4
+    would make are none, while the record would go on claiming it can be replayed. The timeline goes, with a
+    reason of its own, the way the project's own save (_saved_cache) leaves a project alone rather than
+    strip it by guesswork over a cache that died. The next start begins a new one, on a cache that is true."""
+    import rizin_sessions
+
+    timers = Timers()
+    monkeypatch.setenv("FAKE_RIZIN_SLOW", "aar:60")
+    mgr = sessions(analysis_limit=1.0, step_grace=0.5, big_file=1, timer=timers)
+    session = mgr.get(mgr.open(sample("restart.exe", b"MZ restart"), "tab")["session"])
+    _wait_state(session, "done")
+    session.emulation_start(0x140001440)
+    session.emulation_run("step")
+    session._pipe.cmd("wx 41424344 @ 0x140002200")  # what the run left
+    assert session.restore_offer() == {"actions": 2, "reason": None, "digests": 1}
+
+    session.analyze_full()  # its aar hangs, so rizin is killed and restarted
+    _wait_state(session, "stopped")
+    assert session._restore is None
+    offer = session.restore_offer()
+    assert offer["actions"] == 0 and offer["digests"] == 0
+    assert offer["reason"] == rizin_sessions._RESTORE_RESTARTED and "restarted" in offer["reason"]
+    session.emulation_start(0x140001440)
+    assert session.restore_offer()["actions"] == 1 and session._restore["tainted"] is None
+    assert session._restore_gone is None
+
+
+def test_a_rizin_restart_forgets_what_the_old_rizin_was_told_by_hand(sessions, sample, fake, tmp_path, monkeypatch):
+    # the new rizin's registers are its own: a register the old one was given does not spoil the next timeline
+    timers = Timers()
+    monkeypatch.setenv("FAKE_RIZIN_SLOW", "aar:60")
+    mgr = sessions(analysis_limit=1.0, step_grace=0.5, big_file=1, timer=timers)
+    session = mgr.get(mgr.open(sample("restart2.exe", b"MZ restart 2"), "tab")["session"])
+    _wait_state(session, "done")
+    session.emulation_start(0x140001440)
+    session.emulation_run("step")
+    session._pipe.cmd("wx 41424344 @ 0x140002200")
+    session.unpatch()  # the timeline is gone ...
+    assert session._restore is None
+    session.emulation_register("rax", 5)  # ... and the register that is set now would spoil the next one
+    assert session._restore_pending
+    session.analyze_full()
+    _wait_state(session, "stopped")
+    assert session._restore_pending is None
+    session.emulation_start(0x140001440)
+    assert session._restore["tainted"] is None
+
+
+def test_the_offer_says_how_many_ranges_the_record_would_prove_right_now(rz):
+    import rizin_emulation
+
+    sid = rz.session()
+    assert _offer(rz, sid) == {"actions": 0, "reason": None, "digests": 0}
+    mark = len(rz.commands())
+    _offer(rz, sid)
+    assert rz.commands()[mark:] == [], "with no timeline there is nothing to ask rizin"
+
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    assert _offer(rz, sid) == {"actions": 1, "reason": rizin_emulation_reason("nothing"), "digests": 0}
+    _wrote(rz, sid)
+    assert _offer(rz, sid) == {"actions": 1, "reason": None, "digests": 1}
+    _wrote(rz, sid, "0x140003000", "4142")
+    _wrote(rz, sid, "0x140002202", "ff")  # over the first: one range still
+    assert _offer(rz, sid) == {"actions": 1, "reason": None, "digests": 2}
+    # and it is the number run_digests makes from the cache, which is what the save will write
+    rows = rz.mgr.get(sid).patches_made()
+    assert len(rizin_emulation.run_digests(rows, rizin_emulation.run_only_ranges(rows))) == 2
+    # a patch over a run's byte does not take its range away from the proof
+    _patch(rz, sid, addr="0x140002201", bytes="90")
+    assert _offer(rz, sid)["digests"] == 2
+
+
+def rizin_emulation_reason(which):
+    import rizin_sessions
+
+    return {"nothing": rizin_sessions._RESTORE_NOTHING}[which]
+
+
+def test_the_offer_shows_the_proof_going_where_the_cache_lost_it(rz):
+    # the cache emptied behind the timeline's back (what a restart did): 1 range becomes 0, and the offer says so
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    _wrote(rz, sid)
+    assert _offer(rz, sid)["digests"] == 1
+    rz.mgr.get(sid)._pipe.cmd("wc-*")
+    offer = _offer(rz, sid)
+    assert offer["digests"] == 0 and offer["reason"] == rizin_emulation_reason("nothing")
+
+
+def test_the_offers_reason_is_the_records_taint_first_and_still_counts_the_ranges(rz):
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    _wrote(rz, sid)
+    rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rax", "value": "0x5"})
+    offer = _offer(rz, sid)
+    assert "register" in offer["reason"] and offer["digests"] == 1 and offer["actions"] == 1
+    # the field the pane reads is the offer's; the record keeps its own
+    assert _record(rz, sid)["tainted"] == offer["reason"]
+    assert set(offer) == {"actions", "reason", "digests"}
+
+
+def test_the_digests_are_made_from_the_rows_in_the_order_they_were_written(rz):
+    # spec 5: by address the two rows below change places, and the digest would be of `aaeeccdd`, a plausible
+    # SHA-256 that is nobody's bytes; run_digests cannot tell, so what feeds it is pinned here
+    import hashlib
+
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    session = rz.mgr.get(sid)
+    _wrote(rz, sid, "0x140002201", "ee")
+    _wrote(rz, sid, "0x140002200", "aabbccdd")
+    with _held(session) as pipe:
+        digests = session._restore_digests(pipe)
+    assert digests == [{"start": 0x140002200, "end": 0x140002203,
+                        "sha256": hashlib.sha256(bytes.fromhex("aabbccdd")).hexdigest()}]
+
+
+class _held:
+    """The gate and the pipe of a session, the way a request holds them."""
+
+    def __init__(self, session):
+        self.session = session
+
+    def __enter__(self):
+        self.session._gate.enter("test", 1.0)
+        return self.session._pipe
+
+    def __exit__(self, *exc):
+        self.session._gate.leave()
+
+
+def test_a_tainted_record_with_no_range_to_prove_says_its_taint_not_that_there_is_nothing(rz):
+    sid = _started(rz)
+    rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rax", "value": "0x5"})
+    assert _offer(rz, sid) == {"actions": 1, "reason": _record(rz, sid)["tainted"], "digests": 0}
+    assert "register" in _offer(rz, sid)["reason"]
+
+
+def test_the_offer_waits_for_the_gate_like_any_view(rz):
+    import threading
+    import rizin_sessions
+
+    sid = rz.session()
+    session = rz.mgr.get(sid)
+    session._gate.enter("test", 1.0)
+    try:
+        assert session.restore_offer(wait=0.05) == {"actions": 0, "reason": None, "digests": 0}, \
+            "with no timeline there is nothing to wait for"
+    finally:
+        session._gate.leave()
+    rz.send(f"/api/rizin/{sid}/emulation/start", {})
+    session._gate.enter("test", 1.0)
+    try:
+        with pytest.raises(rizin_sessions.RizinBusy):
+            session.restore_offer(wait=0.05)
+    finally:
+        session._gate.leave()
+    # and it waits as long as it is told to, not for ever and not for nothing
+    session._gate.enter("test", 1.0)
+    threading.Timer(0.3, session._gate.leave).start()
+    assert session.restore_offer(wait=5.0)["actions"] == 1
 
 
 @pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
@@ -7895,6 +8273,7 @@ def test_real_rizin_the_recorded_skip_value_is_what_was_applied(tmp_path, monkey
     blob[:len(code)] = code
     (tmp_path / "call32.bin").write_bytes(bytes(blob))
     (tmp_path / "loop32.bin").write_bytes(bytes.fromhex("ebfe") + bytes(62))  # jmp $
+    (tmp_path / "nops32.bin").write_bytes(bytes.fromhex("90909090") + bytes(60))
     monkeypatch.setattr(rizin_sessions, "ESIL_TIMEOUT", 1.0)
     monkeypatch.setattr(rizin_sessions, "ESIL_SETTINGS", tuple(
         "esil.timeout=1" if c.startswith("esil.timeout=") else c for c in rizin_sessions.ESIL_SETTINGS))
@@ -7923,7 +8302,13 @@ def test_real_rizin_the_recorded_skip_value_is_what_was_applied(tmp_path, monkey
             assert skip == {"kind": "skip", "addr": alloc_call, "value": held, "fix": 16}, (hex(asked), skip)
         assert session._restore["breakpoints"] == [0x20], "dblj's address, the one the timeline began with"
         assert session._restore["tainted"] is None
-        assert session.restore_offer() == {"actions": 3 * (1 + 4 + 1), "tainted": None, "digests": 0}
+        # the four pushes wrote into the emulation's stack, which is the run's too: one range to prove
+        offer = session.restore_offer()
+        assert offer == {"actions": 3 * (1 + 4 + 1), "reason": None, "digests": 1}, offer
+        stack = session._emulation_stack_map
+        assert [r["addr"] for r in session.patches()["patches"] if not r["mine"]] and stack
+        session._pipe.cmd("wx 4142 @ 0x30")  # and what a run leaves elsewhere
+        assert session.restore_offer()["digests"] == 2
 
         # a console write before the first start is a foreign row of the cache: the timeline begins spoilt
         session = opened("loop32.bin")
@@ -7931,15 +8316,26 @@ def test_real_rizin_the_recorded_skip_value_is_what_was_applied(tmp_path, monkey
         session.console("wx 90 @ 0x30")
         assert [row["mine"] for row in session.patches()["patches"]] == [False]
         session.emulation_start(0)
-        assert "cache" in session.restore_offer()["tainted"]
+        assert "cache" in session.restore_offer()["reason"]
 
         # and a run that ends at the time limit spoils one that began clean
         session.unpatch()
         assert session.restore_offer()["actions"] == 0, "taking it out of the cache dropped the timeline"
         session.emulation_start(0)
-        assert session.restore_offer() == {"actions": 1, "tainted": None, "digests": 0}
+        assert session._restore["tainted"] is None
         assert session.emulation_run("cont")["stopped"] == "timeout"
         offer = session.restore_offer()
-        assert offer["actions"] == 2 and "time limit" in offer["tainted"]
+        assert offer["actions"] == 2 and "time limit" in offer["reason"]
+
+        # a register set before the first start is read by the run: rizin takes `ar` before aei and keeps it
+        # through aei, aeim and aepc and a step (the fake does the same), so the timeline begins spoilt
+        session = opened("nops32.bin")
+        session.console("ar eax=0x1234")
+        assert "0x00001234" in session.console("ar eax")["output"], "taken before aei, no ESIL-not-initialized"
+        state = session.emulation_start(0)
+        session.emulation_run("step")
+        state = session.emulation_state()
+        assert _word(next(r["value"] for r in state["registers"] if r["name"] == "eax")) == 0x1234
+        assert "emulation" in session._restore["tainted"]
     finally:
         mgr.shutdown()

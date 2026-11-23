@@ -58,8 +58,11 @@ brings back the settings (/core/config) and hints that a project holds.
 The ESIL VM: ``aei`` arms it, ``aeim`` too and maps a stack (esil.stack.addr
 and esil.stack.size, or its arguments) with the stack pointer in its middle
 and the PC at the seek, ``aeim-`` unmaps it, ``aepc`` sets the PC. ``ar``
-shows, reads (by name or the roles PC and SP) and sets the registers; before
-``aei`` the register commands answer that ESIL is not initialized. ``pxj``
+shows, reads (by name or the roles PC and SP) and sets the registers. Before
+``aei`` rizin 0.9.1 takes ``ar`` and ``aepc`` all the same, and a register
+set then is still there after ``aei``, ``aeim`` and a step (measured, and
+pinned by test_real_rizin_the_recorded_skip_value_is_what_was_applied); the
+step commands answer that ESIL is not initialized. ``pxj``
 reads the stack, ``omlj`` lists it with the file's maps. ``fd`` describes the
 closest flag below an address, ``fd.j`` lists the flags at it; like rizin's
 aei, an armed VM has a flag per register at its value.
@@ -356,7 +359,15 @@ else:
 # (see esil_drop_last, all measured). ``exec`` holds the base addresses of the regions an ``omf rwx``
 # has made executable: ``aeim`` maps rw-, and code in such a region traps under esil.exectrap until
 # then (measured, see esil_executable).
-esil = {"regs": None, "stack": None, "mapped": [], "last": None, "exec": set()}
+esil = {"regs": None, "stack": None, "mapped": [], "last": None, "exec": set(), "pre": {}}
+
+
+def esil_new_regs():
+    """The registers of a VM that aei or aeim arms: zero, and what ``ar`` or ``aepc`` set before it (rizin
+    0.9.1 takes both before aei, and keeps them through it, aeim, aepc and a step -- measured)."""
+    regs = dict.fromkeys(REG_NAMES, 0)
+    regs.update(esil["pre"])
+    return regs
 # Characters of one command line the fake keeps; see main(). rizin 0.9.1 itself keeps **4094** (measured:
 # a line of 4096 characters lost its last two), so this cut is deliberately one character later -- a test
 # only needs that a line at or over the wall does not do what it says.
@@ -540,7 +551,7 @@ def esil_map_stack(args):
     server reaches that case, because a start gives the ESIL memory back first (_emulation_unmap).
     """
     if esil["regs"] is None:
-        esil["regs"] = dict.fromkeys(REG_NAMES, 0)
+        esil["regs"] = esil_new_regs()
     addr = number(args[0]) if args else int(state["config"]["esil.stack.addr"], 0)
     size = number(args[1]) if len(args) > 1 else int(state["config"]["esil.stack.size"], 0)
     if not args:
@@ -903,10 +914,8 @@ def string_search(rest):
 
 def esil_registers(rest):
     """``ar``, ``ar <name|PC|SP>``, ``ar <name>=<value>``, like rizin 0.9.1's ``name = 0x%016x`` lines."""
-    regs = esil["regs"]
-    if regs is None:
-        err("ERROR: ESIL is not initialized. Use `aei` first.\n")
-        return ""
+    armed = esil["regs"] is not None
+    regs = esil["regs"] if armed else esil_new_regs()  # before aei too, as rizin does (measured)
     arg = rest.strip()
     if "=" in arg:
         name, _, value = arg.partition("=")
@@ -915,6 +924,8 @@ def esil_registers(rest):
             err(f"ERROR: core: Unknown register {name}\n")
             return ""
         regs[name] = number(value) & (2 ** BITS - 1)
+        if not armed:
+            esil["pre"][name] = regs[name]
         return ""
     if not arg:
         return "".join(f"{name} = {value:#0{BITS // 4 + 2}x}\n" for name, value in regs.items())
@@ -1265,7 +1276,7 @@ def answer(cmd):
     if word == "aei":
         # like rizin's reinit: a new VM, the registers stay, the PC goes to the seek
         if esil["regs"] is None:
-            esil["regs"] = dict.fromkeys(REG_NAMES, 0)
+            esil["regs"] = esil_new_regs()
         esil["regs"][ROLES["PC"]] = seek
         return ""
     if word == "aeim":
@@ -1275,10 +1286,8 @@ def answer(cmd):
         esil_drop_last()
         return ""
     if word == "aepc":
-        if esil["regs"] is None:
-            err("ERROR: ESIL is not initialized. Use `aei` first.\n")
-        elif number(rest) is not None:
-            esil["regs"][ROLES["PC"]] = number(rest)
+        if number(rest) is not None:
+            (esil["pre"] if esil["regs"] is None else esil["regs"])[ROLES["PC"]] = number(rest)
         return ""
     if word == "ar":
         return esil_registers(rest)
