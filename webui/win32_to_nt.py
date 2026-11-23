@@ -10,6 +10,11 @@ suspicious, or whose Nt counterpart it does, and a function with no direct Nt co
 has no row. An absence is claimed only for a syscall some row leads to (`covered`): for
 any other the table does not know the Win32 functions that reach it.
 
+A proof assumes the table names the documented entry points to that syscall. An uncommon
+wrapper to a covered syscall reads as a bypass: a false positive on an unusual but clean
+program that carries a raw stub, never a false negative on malware. Each newly found entry
+point widens the table; it does not change the rule.
+
 Pure data logic, no Windows calls and no dependency on the rest of the web UI."""
 
 from __future__ import annotations

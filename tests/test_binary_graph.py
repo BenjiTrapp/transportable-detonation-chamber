@@ -318,3 +318,32 @@ def test_an_expanded_import_set_without_its_coverage_is_refused(x64_baseline):
     (hit,) = syscall_scan.find_stubs_in_bytes(_x64_stub(0x55), x64_baseline, covered=frozenset())
     assert hit["import_present"] is None
 
+
+# the entry points to each covered syscall, as far as the audit found them inside the SUSPICIOUS_IMPORTS boundary
+DOORS = {
+    "NtAllocateVirtualMemory": {"VirtualAlloc", "VirtualAllocEx"},
+    "NtWriteVirtualMemory": {"WriteProcessMemory"},
+    "NtProtectVirtualMemory": {"VirtualProtect", "VirtualProtectEx", "VirtualProtectFromApp"},
+    "NtCreateThreadEx": {"CreateThread", "CreateRemoteThread", "CreateRemoteThreadEx", "RtlCreateUserThread",
+                         "_beginthreadex", "_beginthread", "DbgUiIssueRemoteBreakin", "DebugBreakProcess"},
+    "NtQueueApcThread": {"QueueUserAPC"},
+    "NtSetContextThread": {"SetThreadContext"},
+    "NtUnmapViewOfSection": {"UnmapViewOfFile", "ZwUnmapViewOfSection", "FreeLibrary", "FreeLibraryAndExitThread"},
+    "NtAdjustPrivilegesToken": {"AdjustTokenPrivileges"},
+    "NtOpenProcessToken": {"OpenProcessToken"},
+}
+
+
+def test_every_door_the_audit_found_to_a_covered_syscall_is_in_the_table():
+    table = win32_to_nt.load_table()
+    assert set(DOORS) == set(table.covered)
+    for nt, doors in DOORS.items():
+        assert {e.win32 for e in table.entries if e.nt == nt} == doors, nt
+
+
+def test_a_wrapper_that_reaches_the_ex_syscall_is_no_door_to_the_plain_one():
+    # UnmapViewOfFileEx takes flags and VirtualAlloc2 extended parameters: they reach NtUnmapViewOfSectionEx and
+    # NtAllocateVirtualMemoryEx, other syscalls, which the boundary keeps out of the table
+    table = win32_to_nt.load_table()
+    for name in ("UnmapViewOfFileEx", "UnmapViewOfFile2", "VirtualAlloc2", "QueueUserAPC2"):
+        assert table.nt_for(name) is None, name
