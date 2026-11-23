@@ -22,6 +22,7 @@ your own.
 | `TDC_SCRIPTS_DIR` | `C:\tdc\scripts` | Where the web UI finds the install scripts it runs for [tool updates](updates.md) |
 | `TDC_UPDATE_LOG` | `C:\tools\logs\tool-updates.log` | Log of the tool updates (off Windows: `tool-updates.log` next to `app.py`) |
 | `TDC_UPDATE_CHECK_HOURS` | `24` | Hours between the automatic update checks; `0` turns them off |
+| `TDC_NO_SYSCALL_STAGE` | — | `1` switches the syscall stage of a detonation off for the whole Web UI (the manual scan and the sweep stay available). Unset, the stage runs whenever a baseline of this build exists |
 | `TDC_GITHUB_TOKEN` | — | Optional GitHub token for the update checks, to avoid the API rate limit |
 | `TDC_LOG_DIR` | `webui/logs` (next to `app.py`) | Where the access and MCP logs of the LOGS tab are kept (`access.jsonl`, `mcp.jsonl`; 10 MB each, one older file) |
 | `TDC_FIREWALL_DECIDE_SECONDS` | `30` | Seconds an open download decision waits before TDC blocks and fetches by itself; `0` fetches at once, without asking (held to one hour) |

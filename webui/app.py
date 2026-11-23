@@ -4298,7 +4298,7 @@ def api_detonation_results():
         "hsb_installed": os.path.isfile(HUNT_SLEEPING_BEACONS_EXE),
         "beaconeye_installed": os.path.isfile(BEACONEYE_EXE),
         "aether_installed": os.path.isfile(AETHER_EXE),
-        "ntsleuth_installed": _syscall_stage_available(),
+        "syscall_stage_available": _syscall_stage_available(),
         "process_dump_installed": os.path.isfile(PROCESSDUMP_EXE),
     }
 
@@ -7452,7 +7452,7 @@ def _run_sweep(use_aether, use_processdump, capture_baseline, use_syscalls=False
                 entry["findings"] += memory_evidence.from_process_dump(
                     {"dumps": dumps}, process=entry["identity"])
 
-    if use_syscalls and _syscall_stage_available():
+    if use_syscalls and _syscall_baseline_present():
         _sweep_syscalls(names, per_pid, errors, stats)
 
     captured = 0
@@ -7532,7 +7532,7 @@ def api_memory_sweep_start():
     capture_baseline = truthy(data.get("baseline"), False)
 
     if (not (use_aether and os.path.isfile(AETHER_EXE)) and not (use_pd and os.path.isfile(PROCESSDUMP_EXE))
-            and not (use_syscalls and _syscall_stage_available())):
+            and not (use_syscalls and _syscall_baseline_present())):
         return jsonify({"error": "No selected sweep tool is installed"}), 400
 
     with _sweep_lock:
@@ -8202,9 +8202,22 @@ def _syscall_measure(pid, modules, allowlist=None):
     return measured, view, build
 
 
+def _syscall_stage_enabled():
+    """False when the detonation's syscall stage is switched off for the whole web UI: TDC_NO_SYSCALL_STAGE=1."""
+    return os.environ.get("TDC_NO_SYSCALL_STAGE") != "1"
+
+
+def _syscall_baseline_present():
+    """Whether a baseline of this system's build exists for some view. Measuring needs the baseline file alone:
+    NTSleuth, the binary, is needed only to make one."""
+    build = _current_os_build()
+    return bool(build) and any(syscall_baseline.find_baseline(NTSLEUTH_BASELINE_DIR, build, view)
+                               for view in SYSCALL_BASELINE_VIEWS)
+
+
 def _syscall_stage_available():
-    """Whether NTSleuth is installed for a view a baseline is kept for. A detonation runs its syscall stage only then."""
-    return any(os.path.isfile(_ntsleuth_exe(view)) for view in SYSCALL_BASELINE_VIEWS)
+    """Whether a detonation has a syscall stage to run: it is not switched off and there is a baseline to measure by."""
+    return _syscall_stage_enabled() and _syscall_baseline_present()
 
 
 def _syscall_stage_file(path, baseline):
@@ -8264,16 +8277,17 @@ def _syscall_stage(pid, path):
 def _run_syscall_stage(pid, path, notes=None):
     """The syscall stage of a detonation, or None when it skips itself, the reason appended to `notes`.
 
-    It never raises and starts no extraction: without NTSleuth, without a baseline of this build and view (one
-    being extracted is not one yet), for a process that is gone or cannot be read, or for a scan that runs out of
-    time, a detonation goes on without it. `path` is the sample's file, searched for stubs as well."""
+    It never raises and starts no extraction: switched off, without a baseline of this build and view (one being
+    extracted is not one yet), for a process that is gone or cannot be read, or for a scan that runs out of time,
+    a detonation goes on without it. NTSleuth itself is not needed: only the baseline it once made. `path` is the
+    sample's file, searched for stubs as well."""
     def skip(why):
         if notes is not None:
             notes.append(why)
         return None
 
-    if not _syscall_stage_available():
-        return skip("NTSleuth is not installed")
+    if not _syscall_stage_enabled():
+        return skip("the syscall stage is switched off (TDC_NO_SYSCALL_STAGE)")
     try:
         return _syscall_stage(pid, path)
     except _SyscallRouteError as exc:
@@ -8903,7 +8917,7 @@ def _run_memory_scans_async(pid, sha256, path=None):
 
         # Syscalls: the stubs of the process against the NTSleuth baseline, and the stubs the sample carries
         # itself. It only reads, and skips itself, with its reason kept, where it cannot run.
-        if _syscall_stage_available():
+        if _syscall_stage_enabled():
             try:
                 notes = []
                 syscall_result = _run_syscall_stage(pid, path, notes)
