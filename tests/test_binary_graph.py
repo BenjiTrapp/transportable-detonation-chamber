@@ -1793,10 +1793,76 @@ class _Key:
         return False
 
 
-@pytest.mark.parametrize("machine,arch", [("ARM64", "arm64"), ("aarch64", "arm64"), ("AMD64", "x64"), ("x86_64", "x64")])
-def test_the_host_architecture_is_arm64_or_x64(monkeypatch, machine, arch):
+def _registry(value):
+    """A stand-in for the registry read: `value` is what PROCESSOR_ARCHITECTURE holds, None when it cannot be read."""
+    return lambda subkey, name: value
+
+
+def _machine(monkeypatch, machine):
     monkeypatch.setattr("platform.machine", lambda: machine)
-    assert binary_graph.host_arch() == arch
+
+
+@pytest.mark.parametrize("held,arch", [("ARM64", "arm64"), ("AMD64", "x64"), ("arm64", "arm64"), ("amd64", "x64")])
+def test_the_host_architecture_is_the_registrys_whatever_the_interpreter_reports(monkeypatch, held, arch):
+    # an x64 interpreter emulated on an ARM64 system says AMD64 (and the reverse is no better a witness): one cache, so
+    # a wrong answer is no graph at all
+    for machine in ("AMD64", "ARM64", "x86_64", "aarch64"):
+        _machine(monkeypatch, machine)
+        assert binary_graph.host_arch(_registry(held)) == arch, machine
+
+
+def test_the_registry_is_asked_for_the_system_architecture_not_the_one_of_the_process(monkeypatch):
+    asked = []
+
+    def registry(subkey, name):
+        asked.append((subkey, name))
+        return "ARM64"
+
+    _machine(monkeypatch, "AMD64")
+    assert binary_graph.host_arch(registry) == "arm64"
+    assert asked == [(r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment", "PROCESSOR_ARCHITECTURE")]
+
+
+@pytest.mark.parametrize("machine,arch", [("ARM64", "arm64"), ("aarch64", "arm64"), ("AMD64", "x64"), ("x86_64", "x64")])
+def test_without_a_registry_answer_the_architecture_is_the_interpreters(monkeypatch, machine, arch):
+    _machine(monkeypatch, machine)
+    for answer in (None, "", "x86", "IA64", "garbage", 5):
+        assert binary_graph.host_arch(_registry(answer)) == arch, answer
+
+
+def test_a_registry_that_raises_is_the_same_as_one_that_cannot_be_read(monkeypatch):
+    def broken(subkey, name):
+        raise OSError("access denied")
+
+    _machine(monkeypatch, "ARM64")
+    assert binary_graph.host_arch(broken) == "arm64"
+    _machine(monkeypatch, "AMD64")
+    assert binary_graph.host_arch(broken) == "x64"
+
+
+def test_the_default_registry_read_goes_through_winreg_and_gives_none_where_there_is_none(monkeypatch):
+    import sys
+    import types
+    seen = []
+
+    def query(key, name):
+        seen.append(name)
+        return ("ARM64", 1)
+
+    fake = types.SimpleNamespace(HKEY_LOCAL_MACHINE=0, OpenKey=lambda root, subkey: _Key(), QueryValueEx=query)
+    monkeypatch.setitem(sys.modules, "winreg", fake)
+    _machine(monkeypatch, "AMD64")
+    assert binary_graph.host_arch() == "arm64" and seen == ["PROCESSOR_ARCHITECTURE"]
+    monkeypatch.setitem(sys.modules, "winreg", None)                 # not Windows
+    assert binary_graph.host_arch() == "x64"
+    _machine(monkeypatch, "ARM64")
+    assert binary_graph.host_arch() == "arm64"
+
+    def unreadable(root, subkey):
+        raise OSError("no such key")
+
+    monkeypatch.setitem(sys.modules, "winreg", types.SimpleNamespace(HKEY_LOCAL_MACHINE=0, OpenKey=unreadable))
+    assert binary_graph.host_arch() == "arm64"
 
 
 def test_the_module_runs_as_a_script_from_its_own_directory_with_nothing_else_of_the_web_ui(tmp_path):

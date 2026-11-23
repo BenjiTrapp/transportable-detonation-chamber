@@ -704,9 +704,38 @@ def host_build() -> str | None:
     return f"{number}.{revision}"
 
 
-def host_arch() -> str:
-    """"arm64" or "x64", as the web UI's own default view reads it. An interpreter that runs under emulation says
-    "AMD64" on an ARM64 system: whoever knows better passes --arch."""
+_ARCH_KEY = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
+
+
+def _registry_string(subkey, name):
+    r"""The REG_SZ `name` under `HKLM\<subkey>`, None when there is no registry (not Windows) or it cannot be read."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, subkey) as key:
+            return winreg.QueryValueEx(key, name)[0]
+    except (ImportError, OSError):
+        return None
+
+
+def host_arch(read_registry=_registry_string) -> str:
+    r""""arm64" or "x64": the architecture of the system, not of the interpreter asking.
+
+    It comes from PROCESSOR_ARCHITECTURE under HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment,
+    never from `platform.machine()`: the web UI's Python can be an x64 build running under emulation on an ARM64
+    system, and there `platform.machine()` says "AMD64". install-ntsleuth.ps1 reads the registry for the same reason.
+    There is exactly one cache, named by this value, so a wrong answer is not a wrong default view that the user can
+    switch: it is no graph at all, with a good cache on disk under the other name. Callers that choose which cache to
+    load must use this, and not the syscall tab's `_syscall_default_view()`, which has the weaker reading.
+
+    `read_registry(subkey, name)` is the seam: it returns the value, or None when it cannot be read; a test drives it
+    without Windows. When the registry gives no answer this module knows (off Windows, the key missing, a value other
+    than ARM64 or AMD64), the interpreter's own `platform.machine()` stands in."""
+    try:
+        held = read_registry(_ARCH_KEY, "PROCESSOR_ARCHITECTURE")
+    except (ImportError, OSError):
+        held = None
+    if isinstance(held, str) and held.upper() in ("ARM64", "AMD64"):
+        return "arm64" if held.upper() == "ARM64" else "x64"
     import platform
     return "arm64" if platform.machine().upper() in ("ARM64", "AARCH64") else "x64"
 
