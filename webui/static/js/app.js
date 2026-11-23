@@ -27226,20 +27226,24 @@ function binaryGraphDetailHtml(item) {
 }
 
 // --- GRAPH, EXPLORE: the same graph, opened one node at a time -------------------------------------------------------
-// The whole stock (about 4,000 binaries) is never drawn. An entry point, one binary, is drawn alone; EXPAND opens the
-// neighbours of the chosen node in both directions and keeps what is drawn: what a module imports (q=imports: one
-// function node each) and who imports it (q=importers), or for a function who imports that function. Both are the
-// queries of the PATH view, so a node comes with its in-degree, kind and category and nothing is read per neighbour.
-// DEPTH is how many hops EXPAND walks; from the second hop on only modules are opened, a function is opened by
-// choosing it. The canvas holds at most `cap` nodes: what could not be drawn is counted and said, never dropped
-// quietly, and the neighbours that are kept are the first in name order, whole, as the server cuts its own answers.
-// A node's size is how many binaries import it (the cache's in-degree), its colour is its kind.
-// cap: the backend's MAX_NODES (tests/test_binary_graph_ui.py holds the two equal); reads: the most queries one EXPAND
-// sends, so a deep walk over a busy module stops and says so; drag: the px a press moves before it is a drag, not a click
-const BINARY_GRAPH_EXPLORE = { cap: 400, depths: [1, 2, 3], radius: { min: 6, max: 38, step: 2.4 }, reads: 60, drag: 3 };
+// The whole stock (about 4,000 binaries) is never drawn. This is the level of the binaries: the nodes are modules and
+// the number of functions one imports from another is carried on the edge between them. An entry point, one binary, is
+// drawn alone; EXPAND opens the neighbours of the chosen module in both directions and keeps what is drawn: the modules
+// it imports from (q=imports, grouped by module, see binaryGraphExploreParts) and the modules that import it
+// (q=importers). FUNCTIONS opens the level deeper: the functions the module imports, one node each, which is what the
+// PATH view draws. A function is opened by who imports it. Both are queries of the PATH view, so the importers come with
+// their in-degree and kind; an imported module is read once for its own (/api/binary-graph/node), as many reads as
+// there are new modules, never one per function.
+// DEPTH is how many hops EXPAND walks, over modules. The canvas holds at most `cap` nodes: what could not be drawn is
+// counted and said, never dropped quietly, and the neighbours that are kept are the first in name order, whole, as the
+// server cuts its own answers. A node's size is how many binaries import it (the cache's in-degree), its colour its kind.
+// cap: the backend's MAX_NODES (tests/test_binary_graph_ui.py holds the two equal); reads: the most requests one walk
+// sends, so a deep walk over a busy module stops and says so; batch: how many modules are read at once; drag: the px a
+// press moves before it is a drag, not a click
+const BINARY_GRAPH_EXPLORE = { cap: 400, depths: [1, 2, 3], radius: { min: 6, max: 38, step: 2.4 }, reads: 60, batch: 16, drag: 3 };
 const binaryGraphExplore = { mode: 'path', nodes: [], edges: [], camera: { x: 0, y: 0, zoom: 1 }, selected: null, hovered: null,
     dragging: null, panning: false, panStart: { x: 0, y: 0 }, down: { x: 0, y: 0 }, moved: false, loading: false, note: '', seq: 0,
-    ready: false, cut: new Map() };
+    ready: false, cut: new Map(), modules: new Map() };
 
 // The disc of a node: the larger the more binaries import it, on a log scale so 4,000 and 400 are both readable
 function binaryGraphNodeRadius(node) {
@@ -27262,31 +27266,70 @@ function binaryGraphDetailKind(detail, name) {
     return binaryGraphGuessKind(name);
 }
 
-// The queries that open a node: [{ dir, params, module, via }]. A module is read both ways (an api set imports nothing
-// of its own); a function asks who imports it, and the edges of that answer end at the function (`via`). Anything else
-// has nothing to open.
-function binaryGraphExploreRequests(node) {
+// The queries that open a node: [{ dir, params, module, via, level }]. A module is read both ways (an api set imports
+// nothing of its own): level 'modules' (EXPAND) asks what it imports, to be grouped by module, and who imports it;
+// level 'functions' (FUNCTIONS) asks only what it imports, to be drawn function by function. A function asks who imports
+// it, and the edges of that answer end at the function (`via`). Anything else has nothing to open.
+function binaryGraphExploreRequests(node, level) {
     const id = node && typeof node.id === 'string' ? node.id : '';
     if (!id) return [];
-    const into = { dir: 'in', params: { q: 'importers', module: id }, module: id, via: '' };
-    if (node.kind === 'api-set') return [into];
-    if (node.kind === 'dll' || node.kind === 'exe') return [{ dir: 'out', params: { q: 'imports', module: id }, module: id, via: '' }, into];
+    const into = { dir: 'in', params: { q: 'importers', module: id }, module: id, via: '', level: 'modules' };
+    const out = { dir: 'out', params: { q: 'imports', module: id }, module: id, via: '', level: level === 'functions' ? 'functions' : 'modules' };
+    if (node.kind === 'dll' || node.kind === 'exe') return level === 'functions' ? [out] : [out, into];
+    if (node.kind === 'api-set') return level === 'functions' ? [] : [into];
     const bang = id.indexOf('!');
-    if (node.kind === 'function' && bang > 0) {
+    if (node.kind === 'function' && bang > 0 && level !== 'functions') {
         const module = id.slice(0, bang);
-        return [{ dir: 'in', params: { q: 'importers', module, function: id.slice(bang + 1) }, module, via: id }];
+        return [{ dir: 'in', params: { q: 'importers', module, function: id.slice(bang + 1) }, module, via: id, level: 'modules' }];
     }
     return [];
 }
 
-// An answer as the parts the server cuts it in: one function of an `imports` answer, one importer of an `importers`
-// answer (with the api set it imports through). { parts: [{ head, nodes, edges }], server } where `server` is how many
-// parts the server dropped of its own answer (its total less the parts it kept).
+// An edge that stands for several is derived only if every one of them is: a missing, curated or unexpected origin among
+// them makes the whole unknown, so grouping never lends an edge a claim that one of its parts did not make.
+function binaryGraphCombineOrigin(a, b) {
+    const x = binaryGraphOrigin({ origin: a }), y = binaryGraphOrigin({ origin: b });
+    return x === y ? x : 'unknown';
+}
+
+// An answer as the parts the server cuts it in. { parts: [{ head, nodes, edges }], server, functions }: `server` is how
+// many parts the server dropped of its own answer (its total less the parts it kept), and `functions` how many imported
+// functions it dropped from a list that is grouped by module instead of kept as parts.
+// One part is one importer of an `importers` answer (with the api set it imports through) and, at level 'functions', one
+// function of an `imports` answer. At level 'modules' the functions of an `imports` answer are grouped by the module
+// each belongs to (the part of its id before "!"), and the part is that module with one edge from the opened one that
+// carries how many functions it imports from it. That is aggregation, not invention: an `imports` edge from app.exe to
+// kernel32.dll!CreateFileW *is* the datum that app.exe imports from kernel32.dll, and counting those reads the answer
+// without adding to it. The origin of the edge is derived only if every edge it stands for is (binaryGraphCombineOrigin).
+// When the server cut the list, the last module's count is a lower bound and the modules after it are missing: the edge
+// says "at least", and `functions` of the result says how many functions were cut.
 function binaryGraphExploreParts(request, answer) {
     const a = answer && typeof answer === 'object' ? answer : {};
     const known = new Map((Array.isArray(a.nodes) ? a.nodes : []).filter(n => n && typeof n.id === 'string').map(n => [n.id, n]));
     const edges = (Array.isArray(a.edges) ? a.edges : []).filter(e => e && typeof e.source === 'string' && typeof e.target === 'string');
-    const root = request.module;
+    const root = request.module, total = Math.max(0, Number(a.total) || 0), cutShort = a.truncated === true;
+    if (request.dir === 'out' && request.level === 'modules') {
+        const by = new Map();
+        let shown = 0;
+        for (const e of edges) {
+            if (e.kind !== 'imports' || e.source !== root) continue;
+            shown++;
+            const bang = e.target.indexOf('!'), module = bang > 0 ? e.target.slice(0, bang).toLowerCase() : '';
+            if (!module || module === root) continue;
+            if (!by.has(module)) by.set(module, { functions: new Set(), origin: 'derived' });
+            const group = by.get(module);
+            group.functions.add(e.target);
+            if (binaryGraphOrigin(e) !== 'derived') group.origin = 'unknown';
+        }
+        const last = cutShort && by.size ? [...by.keys()][by.size - 1] : '';
+        const parts = [...by.keys()].sort().map(module => {
+            const n = by.get(module).functions.size, partial = module === last;
+            const label = `${partial ? 'at least ' : ''}${n.toLocaleString('en-US')} function${n === 1 && !partial ? '' : 's'}`;
+            return { head: module, nodes: [{ id: module, label: module, kind: binaryGraphGuessKind(module), in_degree: 0, category: '', guess: true }],
+                     edges: [{ source: root, target: module, kind: 'imports', origin: by.get(module).origin, label, functions: n, partial }] };
+        });
+        return { parts, server: 0, functions: cutShort ? Math.max(0, total - shown) : 0 };
+    }
     const end = e => (request.via && e.target === root ? { ...e, target: request.via } : e);
     const grouped = new Map();
     for (const e of edges) {
@@ -27303,8 +27346,7 @@ function binaryGraphExploreParts(request, answer) {
     }
     const parts = [...grouped.values()].filter(p => known.has(p.head))
         .map(p => ({ head: p.head, nodes: [...p.ids].map(id => known.get(id)).filter(Boolean), edges: p.edges }));
-    const total = Math.max(0, Number(a.total) || 0);
-    return { parts, server: a.truncated === true ? Math.max(0, total - parts.length) : 0 };
+    return { parts, server: cutShort ? Math.max(0, total - parts.length) : 0, functions: 0 };
 }
 
 // How many nodes of these parts are not drawn yet
@@ -27316,11 +27358,13 @@ function binaryGraphExploreFresh(st, parts) {
 
 // The parts drawn, whole and in order, until one does not fit: the cap, or `limit` new nodes of this answer. That part
 // and every part after it is dropped (the drawn ones stay the first in name order). A node that is drawn already takes
-// the answer's in-degree and kind. { added, dropped } as ids of nodes and of the heads of dropped parts.
+// the answer's in-degree and kind, unless the answer only guessed them. An edge that is drawn already keeps its place and
+// gains a count it lacked; its origin stays only where both say the same. { added, dropped } as ids of nodes and of the
+// heads of dropped parts.
 function binaryGraphExploreMerge(st, parts, limit) {
     const cap = BINARY_GRAPH_EXPLORE.cap, have = new Map(st.nodes.map(n => [n.id, n]));
     const edgeKey = e => `${e.source}\n${e.target}\n${e.kind}`;
-    const seen = new Set(st.edges.map(edgeKey));
+    const seen = new Map(st.edges.map(e => [edgeKey(e), e]));
     const added = [], dropped = [];
     let fresh = 0, full = false;
     for (const part of parts) {
@@ -27330,22 +27374,33 @@ function binaryGraphExploreMerge(st, parts, limit) {
             else {
                 for (const n of part.nodes) {
                     let node = have.get(n.id);
-                    if (!node) {
+                    const isNew = !node;
+                    if (isNew) {
                         node = { id: n.id, label: typeof n.label === 'string' ? n.label : n.id, kind: n.kind, in_degree: 0, category: '', x: 0, y: 0, placed: false };
                         st.nodes.push(node);
                         have.set(n.id, node);
                         added.push(n.id);
                         fresh++;
                     }
-                    node.kind = n.kind;
-                    node.in_degree = Math.max(0, Number(n.in_degree) || 0);
-                    node.category = typeof n.category === 'string' ? n.category : '';
+                    if (isNew || !n.guess) {
+                        node.kind = n.kind;
+                        node.in_degree = Math.max(0, Number(n.in_degree) || 0);
+                        node.category = typeof n.category === 'string' ? n.category : '';
+                        if (typeof n.machine === 'string' && n.machine) node.machine = n.machine;
+                    }
                     node.radius = binaryGraphNodeRadius(node);
                 }
                 for (const e of part.edges) {
-                    if (seen.has(edgeKey(e))) continue;
-                    seen.add(edgeKey(e));
-                    st.edges.push({ source: e.source, target: e.target, kind: e.kind, origin: e.origin, label: typeof e.label === 'string' ? e.label : '' });
+                    const old = seen.get(edgeKey(e));
+                    if (old) {
+                        old.origin = binaryGraphCombineOrigin(old.origin, e.origin);
+                        if (old.functions === undefined && e.functions !== undefined) Object.assign(old, { functions: e.functions, label: e.label, partial: e.partial });
+                        continue;
+                    }
+                    const edge = { source: e.source, target: e.target, kind: e.kind, origin: e.origin, label: typeof e.label === 'string' ? e.label : '' };
+                    if (e.functions !== undefined) Object.assign(edge, { functions: e.functions, partial: e.partial === true });
+                    seen.set(edgeKey(e), edge);
+                    st.edges.push(edge);
                 }
             }
         }
@@ -27354,19 +27409,23 @@ function binaryGraphExploreMerge(st, parts, limit) {
     return { added, dropped };
 }
 
-// What is cut now, per opened node and direction: the parts the server dropped of its own answer, and the heads of the
-// parts that did not fit on the canvas and are still not drawn. { hidden, server, dropped, parents, of: node -> count }
+// What is cut now, per opened node and direction: the parts the server dropped of its own answer, the imported functions
+// it dropped from a list grouped by module, and the heads of the parts that did not fit on the canvas and are still not
+// drawn. { hidden (neighbours known to be missing), server, functions, dropped, any, parents, of, ofFunctions }
 function binaryGraphExploreCut(st) {
-    const drawn = new Set(st.nodes.map(n => n.id)), heads = new Set(), of = new Map();
-    let server = 0;
+    const drawn = new Set(st.nodes.map(n => n.id)), heads = new Set(), of = new Map(), ofFunctions = new Map();
+    let server = 0, functions = 0;
     for (const record of st.cut.values()) {
         const left = [...record.dropped].filter(id => !drawn.has(id));
-        if (!record.server && !left.length) continue;
+        if (!record.server && !record.functions && !left.length) continue;
         server += record.server;
+        functions += record.functions;
         left.forEach(id => heads.add(id));
         of.set(record.from, (of.get(record.from) || 0) + record.server + left.length);
+        if (record.functions) ofFunctions.set(record.from, (ofFunctions.get(record.from) || 0) + record.functions);
     }
-    return { hidden: server + heads.size, server, dropped: heads.size, parents: of.size, of };
+    const parents = new Set([...of.keys(), ...ofFunctions.keys()]);
+    return { hidden: server + heads.size, server, functions, dropped: heads.size, any: !!(server || functions || heads.size), parents: parents.size, of, ofFunctions };
 }
 
 // The line above the canvas: that the picture is cut, in words, and the note of the last step. { tone, html }
@@ -27375,16 +27434,20 @@ function binaryGraphExploreStatus(st) {
     const cut = binaryGraphExploreCut(st);
     const n = (count, one, many) => `${escapeHtml(count.toLocaleString('en-US'))} ${count === 1 ? one : many}`;
     let html = '';
-    if (cut.hidden) {
+    if (cut.any) {
         const why = [];
         if (cut.server) why.push(`${n(cut.server, 'was', 'were')} cut by the server from its own answer`);
+        if (cut.functions) {
+            why.push(`${n(cut.functions, 'imported function was', 'imported functions were')} cut by the server from a list of imports, so the modules after the last one drawn `
+                + 'are missing and the count on that edge is at least what it says');
+        }
         if (cut.dropped) why.push(`${n(cut.dropped, 'did', 'did')} not fit on this canvas, which holds at most ${escapeHtml(String(BINARY_GRAPH_EXPLORE.cap))} nodes`);
-        html += `<strong class="binary-graph-cut">Not the whole neighbourhood: ${n(cut.hidden, 'neighbour is', 'neighbours are')} not shown, of ${n(cut.parents, 'opened node', 'opened nodes')}: `
-            + `${why.join(' and ')}. Whole neighbours were dropped, in name order: `
+        html += `<strong class="binary-graph-cut">Not the whole neighbourhood${cut.hidden ? `: ${n(cut.hidden, 'neighbour is', 'neighbours are')} not shown, ` : ', '}`
+            + `of ${n(cut.parents, 'opened node', 'opened nodes')}: ${why.join(' and ')}. Whole neighbours were dropped, in name order: `
             + 'a node that is missing here is not shown, which does not mean it is not imported.</strong> ';
     }
     if (st.note) html += `<span class="binary-graph-note">${escapeHtml(st.note)}</span>`;
-    return { tone: cut.hidden ? 'warn' : 'info', html };
+    return { tone: cut.any ? 'warn' : 'info', html };
 }
 
 // The line under the canvas: the chosen node, or how much is drawn. Everything from a binary is escaped.
@@ -27393,14 +27456,15 @@ function binaryGraphExploreInfo(st) {
     if (!node) {
         if (!st.nodes.length) return '';
         return `${escapeHtml(st.nodes.length.toLocaleString('en-US'))} nodes, ${escapeHtml(st.edges.length.toLocaleString('en-US'))} edges. `
-            + 'Choose a node, then EXPAND opens its neighbours; a double click does both.';
+            + 'Choose a node, then EXPAND opens its neighbours (a double click does both) and FUNCTIONS the functions it imports.';
     }
     const kind = (binaryGraphOwn(BINARY_GRAPH_KINDS, node.kind) || { name: String(node.kind || 'unknown') }).name;
     const bang = node.id.indexOf('!');
     let html = `<strong>${escapeHtml(node.label)}</strong> · ${escapeHtml(kind)}${node.machine ? ` · ${escapeHtml(node.machine)}` : ''}`;
     html += node.kind === 'function' && bang > 0 ? ` · of ${escapeHtml(node.id.slice(0, bang))}` : ` · imported by ${escapeHtml((Number(node.in_degree) || 0).toLocaleString('en-US'))} binaries of System32`;
-    const left = binaryGraphExploreCut(st).of.get(node.id);
+    const cut = binaryGraphExploreCut(st), left = cut.of.get(node.id), lost = cut.ofFunctions.get(node.id);
     if (left) html += ` · ${escapeHtml(left.toLocaleString('en-US'))} of its neighbours are not shown`;
+    if (lost) html += ` · ${escapeHtml(lost.toLocaleString('en-US'))} of its imported functions are not shown`;
     return html;
 }
 
@@ -27470,6 +27534,7 @@ async function binaryGraphExploreStart(name) {
     st.nodes = [node];
     st.edges = [];
     st.cut = new Map();
+    st.modules = new Map([[id, { kind: node.kind, in_degree: node.in_degree, machine: node.machine }]]);
     st.selected = id;
     st.hovered = null;
     st.dragging = null;
@@ -27485,24 +27550,61 @@ function binaryGraphExploreSubmit(event) {
     return binaryGraphExploreStart(input ? input.value : '');
 }
 
+// The kind and in-degree of modules, read once each from /api/binary-graph/node and remembered until the next START:
+// `q=imports` names the functions a module imports, not the modules, so a module that EXPAND draws from it has no size
+// of its own yet. A name the graph does not have still says how many binaries import it. Returns how many were read.
+async function binaryGraphExploreModules(st, names) {
+    const todo = [...new Set(names)].filter(name => !st.modules.has(name));
+    for (let i = 0; i < todo.length; i += BINARY_GRAPH_EXPLORE.batch) {
+        await Promise.all(todo.slice(i, i + BINARY_GRAPH_EXPLORE.batch).map(async name => {
+            const r = await syscallApi(`/api/binary-graph/node?${new URLSearchParams({ name })}`);
+            const d = r.data && typeof r.data === 'object' ? r.data : {};
+            if (r.ok) st.modules.set(name, { kind: binaryGraphDetailKind(d, name), in_degree: Math.max(0, Number(d.in_degree) || 0), machine: typeof d.machine === 'string' ? d.machine : '' });
+            else if (r.status === 404) st.modules.set(name, { kind: binaryGraphGuessKind(name), in_degree: Math.max(0, Number(d.in_degree) || 0), machine: '' });
+        }));
+    }
+    return todo.length;
+}
+
+// The modules of these parts that were read take their kind and in-degree
+function binaryGraphExploreFill(st, parts) {
+    for (const part of parts) {
+        for (const n of part.nodes) {
+            const read = n.guess ? st.modules.get(n.id) : null;
+            if (!read) continue;
+            Object.assign(n, { kind: read.kind, in_degree: read.in_degree, machine: read.machine, guess: false });
+        }
+    }
+}
+
 // EXPAND: the neighbours of a node, in both directions, as many hops as DEPTH says, added to what is drawn. Where the
 // canvas has room for only some of both directions each gets its share. A walk stops where the canvas is full or after
-// `reads` queries, and says how many nodes of its last ring it did not open. A newer START or EXPAND overtakes it.
-async function binaryGraphExpand(id) {
+// `reads` requests, and says how many nodes of its last ring it did not open. A newer START or EXPAND overtakes it.
+function binaryGraphExpand(id) {
+    return binaryGraphExploreWalk(id, 'modules');
+}
+
+// FUNCTIONS: the functions a module imports, one node each, the level deeper. One hop, whatever DEPTH says: a function
+// has no neighbours of its own to walk on.
+function binaryGraphOpenFunctions(id) {
+    return binaryGraphExploreWalk(id, 'functions');
+}
+
+async function binaryGraphExploreWalk(id, level) {
     const st = binaryGraphExplore, g = BINARY_GRAPH_EXPLORE, node = st.nodes.find(n => n.id === id);
     if (!node || st.loading) return false;
-    const seq = ++st.seq, depth = binaryGraphState.depth, failed = [], notes = [];
+    const seq = ++st.seq, depth = level === 'functions' ? 1 : binaryGraphState.depth, failed = [], notes = [];
     st.loading = true;
     st.note = '';
     binaryGraphExploreRender();
-    let level = [node.id], reads = 0, unopened = 0, opened = false, grew = false;
-    for (let hop = 0; hop < depth && level.length; hop++) {
+    let current = [node.id], reads = 0, unopened = 0, opened = false, grew = false;
+    for (let hop = 0; hop < depth && current.length; hop++) {
         const next = [];
-        for (let i = 0; i < level.length; i++) {
-            const from = st.nodes.find(n => n.id === level[i]), requests = from ? binaryGraphExploreRequests(from) : [];
+        for (let i = 0; i < current.length; i++) {
+            const from = st.nodes.find(n => n.id === current[i]), requests = from ? binaryGraphExploreRequests(from, level) : [];
             if (!requests.length) continue;
             if (hop > 0 && (st.nodes.length >= g.cap || reads + requests.length > g.reads)) {
-                unopened = level.length - i;
+                unopened = current.length - i;
                 break;
             }
             reads += requests.length;
@@ -27524,27 +27626,38 @@ async function binaryGraphExpand(id) {
             results.forEach(r => { r.fresh = binaryGraphExploreFresh(st, r.found.parts); });
             results.sort((a, b) => a.fresh - b.fresh);
             const added = [];
-            results.forEach((r, k) => {
-                const other = results.length > 1 ? results[1 - k].fresh : 0;
+            for (let k = 0; k < results.length; k++) {
+                const r = results[k], other = results.length > 1 ? results[1 - k].fresh : 0;
                 const limit = results.length > 1 && k === 0 ? Math.min(r.fresh, Math.max(Math.floor(room / 2), room - other)) : Infinity;
+                if (r.request.dir === 'out' && r.request.level === 'modules') {
+                    // only the modules that will be drawn are read
+                    const drawn = new Set(st.nodes.map(n => n.id));
+                    const wanted = r.found.parts.filter(p => !drawn.has(p.head)).slice(0, Math.max(0, Math.min(limit, g.cap - st.nodes.length))).map(p => p.head);
+                    reads += await binaryGraphExploreModules(st, wanted);
+                    if (seq !== st.seq) return false;
+                    binaryGraphExploreFill(st, r.found.parts);
+                }
                 const merged = binaryGraphExploreMerge(st, r.found.parts, limit);
                 const key = `${from.id}\n${r.request.dir}`;
-                if (r.found.server || merged.dropped.length) st.cut.set(key, { from: from.id, server: r.found.server, dropped: new Set(merged.dropped) });
-                else st.cut.delete(key);
+                if (r.found.server || r.found.functions || merged.dropped.length) {
+                    st.cut.set(key, { from: from.id, server: r.found.server, functions: r.found.functions, dropped: new Set(merged.dropped) });
+                } else {
+                    st.cut.delete(key);
+                }
                 binaryGraphExploreLayout(st, from.id, merged.added);
                 added.push(...merged.added);
                 if (hop === 0 && !merged.added.length && r.note) notes.push(r.note);
-            });
+            }
             if (added.length) grew = true;
             next.push(...added.filter(a => { const n = st.nodes.find(x => x.id === a); return n && (n.kind === 'dll' || n.kind === 'exe' || n.kind === 'api-set'); }));
         }
-        level = next;
+        current = next;
         binaryGraphExploreRender();
         if (unopened) break;
     }
     const said = [];
     if (unopened) {
-        said.push(`The walk of depth ${depth} stopped ${st.nodes.length >= g.cap ? 'because the canvas is full' : `after ${reads} queries`}: ${unopened.toLocaleString('en-US')} ${unopened === 1 ? 'node' : 'nodes'} of its last ring ${unopened === 1 ? 'was' : 'were'} not opened.`);
+        said.push(`The walk of depth ${depth} stopped ${st.nodes.length >= g.cap ? 'because the canvas is full' : `after ${reads} requests`}: ${unopened.toLocaleString('en-US')} ${unopened === 1 ? 'node' : 'nodes'} of its last ring ${unopened === 1 ? 'was' : 'were'} not opened.`);
     }
     if (failed.length) {
         said.push(`${failed.length.toLocaleString('en-US')} ${failed.length === 1 ? 'node' : 'nodes'} could not be read just now, so ${failed.length === 1 ? 'its' : 'their'} neighbours may be missing.`);
@@ -27609,6 +27722,8 @@ function binaryGraphExploreRender() {
     if (legend) legend.innerHTML = binaryGraphLegend('explore', st.edges);
     const expand = el('binary-explore-expand');
     if (expand) expand.disabled = st.loading || !st.selected;
+    const functions = el('binary-explore-functions'), chosen = st.selected ? st.nodes.find(n => n.id === st.selected) : null;
+    if (functions) functions.disabled = st.loading || !chosen || (chosen.kind !== 'dll' && chosen.kind !== 'exe');
     for (const n of BINARY_GRAPH_EXPLORE.depths) {
         const button = el(`binary-explore-depth-${n}`);
         if (button) button.setAttribute('aria-pressed', String(binaryGraphState.depth === n));
@@ -27668,6 +27783,14 @@ function binaryGraphDraw() {
         ctx.lineTo(tipX - ux * 9 + uy * 4, tipY - uy * 9 - ux * 4);
         ctx.closePath();
         ctx.fill();
+        // the number of functions an edge stands for, on the edges of the chosen node, or on all of a small picture
+        if (e.functions !== undefined && camera.zoom >= 0.5 && (hot || (!st.selected && st.edges.length <= 40))) {
+            ctx.fillStyle = themeColor('--text-secondary');
+            ctx.font = '10px monospace';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'alphabetic';
+            ctx.fillText(e.label, (a.x + b.x) / 2 + ox, (a.y + b.y) / 2 + oy - 4);
+        }
     }
     ctx.globalAlpha = 1;
     ctx.setLineDash([]);
@@ -27701,9 +27824,12 @@ function binaryGraphDraw() {
     ctx.font = '12px monospace';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
-    if (cut.hidden) {
+    if (cut.any) {
+        const pieces = [];
+        if (cut.hidden) pieces.push(`${cut.hidden.toLocaleString('en-US')} not shown`);
+        if (cut.functions) pieces.push(`${cut.functions.toLocaleString('en-US')} imported functions not shown`);
         ctx.fillStyle = themeColor('--severity-medium');
-        ctx.fillText(`Not the whole neighbourhood: ${cut.hidden.toLocaleString('en-US')} not shown (the canvas holds ${BINARY_GRAPH_EXPLORE.cap} nodes)`, 12, 10);
+        ctx.fillText(`Not the whole neighbourhood: ${pieces.join(', ')} (the canvas holds ${BINARY_GRAPH_EXPLORE.cap} nodes)`, 12, 10);
     }
     if (st.loading) {
         ctx.fillStyle = themeColor('--text-muted');

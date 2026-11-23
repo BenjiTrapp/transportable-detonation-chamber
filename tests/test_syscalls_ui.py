@@ -455,7 +455,8 @@ FLOW_FUNCTIONS = [
     "binaryGraphSubmit", "binaryGraphRun", "binaryGraphItem", "binaryGraphSelect", "binaryGraphFollowMap", "binaryGraphDetailItem",
     "binaryGraphDetailHtml", "binaryGraphOwn", "binaryGraphOrigin",
     # EXPLORE (tests/test_binary_graph_ui.py): the graph opened one node at a time on a canvas of its own
-    "binaryGraphNodeRadius", "binaryGraphGuessKind", "binaryGraphDetailKind", "binaryGraphExploreRequests", "binaryGraphExploreParts",
+    "binaryGraphNodeRadius", "binaryGraphGuessKind", "binaryGraphDetailKind", "binaryGraphExploreRequests", "binaryGraphCombineOrigin",
+    "binaryGraphExploreParts", "binaryGraphExploreModules", "binaryGraphExploreFill", "binaryGraphOpenFunctions", "binaryGraphExploreWalk",
     "binaryGraphExploreFresh", "binaryGraphExploreMerge", "binaryGraphExploreCut", "binaryGraphExploreStatus", "binaryGraphExploreInfo",
     "binaryGraphExploreLayout", "binaryGraphExploreAsk", "binaryGraphExploreStart", "binaryGraphExploreSubmit",
     "binaryGraphExpand", "binaryGraphRelayout", "binaryGraphSetDepth", "binaryGraphSetMode", "binaryGraphExploreRender", "binaryGraphDraw",

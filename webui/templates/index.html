@@ -1335,7 +1335,7 @@
                             </div>
                             <div class="binary-explore" id="binary-explore" hidden>
                                 <form class="binary-graph-bar" id="binary-explore-bar" onsubmit="binaryGraphExploreSubmit(event)">
-                                    <h3 class="syscall-panel-title" data-info="One binary of System32 drawn alone, then opened node by node: EXPAND draws what the chosen node imports and who imports it, as many hops deep as DEPTH says. A disc is larger the more binaries import it, and at most 400 nodes are drawn.">EXPLORE</h3>
+                                    <h3 class="syscall-panel-title" data-info="One binary drawn alone, then opened node by node: EXPAND draws the modules it imports from, with the functions counted on each edge, and the modules that import it. FUNCTIONS draws the functions; a disc grows with its importers, and 400 nodes are the most drawn.">EXPLORE</h3>
                                     <input type="text" id="binary-explore-start" class="filter-input" placeholder="Binary to start from, such as kernel32.dll" aria-label="Binary to start from" autocomplete="off" spellcheck="false">
                                     <button type="submit" class="btn btn-sm btn-primary" id="binary-explore-run">START</button>
                                     <span class="binary-explore-depth-label">DEPTH</span>
@@ -1345,6 +1345,7 @@
                                         <button type="button" class="chart-range-btn" id="binary-explore-depth-3" aria-pressed="false" onclick="binaryGraphSetDepth(3)">3</button>
                                     </span>
                                     <button type="button" class="btn btn-sm" id="binary-explore-expand" disabled title="Open the neighbours of the chosen node" onclick="binaryGraphExpand(binaryGraphExplore.selected)">EXPAND</button>
+                                    <button type="button" class="btn btn-sm" id="binary-explore-functions" disabled title="Draw the functions the chosen module imports, one node each" onclick="binaryGraphOpenFunctions(binaryGraphExplore.selected)">FUNCTIONS</button>
                                     <span class="binary-explore-view">
                                         <button type="button" class="btn btn-sm" title="Zoom in" onclick="binaryGraphZoom(1.25)">+</button>
                                         <span class="binary-explore-zoom" id="binary-explore-zoom">100%</span>
@@ -1936,6 +1937,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
     </div>
 
-    <script src="/static/js/app.js?v=143"></script>
+    <script src="/static/js/app.js?v=144"></script>
 </body>
 </html>
