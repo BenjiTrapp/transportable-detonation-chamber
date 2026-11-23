@@ -210,7 +210,23 @@ leads to, a missing import proves nothing. A proof assumes the table names the
 documented entry points to that syscall. An uncommon wrapper to a covered syscall
 reads as a bypass: a false positive on an unusual but clean program that carries a
 raw stub, never a false negative on malware. Each newly found entry point widens
-the table; it does not change the rule. A stub that jumps into `ntdll`'s own `syscall` instruction (an indirect
+the table; it does not change the rule.
+
+Two limits follow from the rule. A stub found in process memory is a hint even when
+no door is imported: private executable memory cannot be attributed (a hook
+engine, a browser sandbox's interception thunks or a runtime put stubs there too),
+so process mode says only whether the image imports the function as well, and the
+proof comes from the sample file. And some covered syscalls almost never yield a
+proof: nearly every binary imports `FreeLibrary` (a door to
+`NtUnmapViewOfSection`) and `CreateThread` or `_beginthreadex` (doors to
+`NtCreateThreadEx`), so a carried stub for hollowing or remote thread creation is
+usually a hint. A missing proof is not reassurance. Where the target of a door is
+uncertain, the door is listed: for a door to a syscall the table already covers, a
+wrong `nt` costs a hint and a missing row a false accusation. That asymmetry holds
+for doors only; a wrong `nt` on a row that brings a syscall into coverage adds a
+syscall whose doors were never audited.
+
+A stub that jumps into `ntdll`'s own `syscall` instruction (an indirect
 syscall) has no stub shape of its own and is not found.
 
 ### Rules

@@ -25602,8 +25602,9 @@ function renderHookAllowlist(state) {
 
 // The syscall stubs a sample carries itself, found in its process memory and in its file. Whether the sample imports
 // the function is known as a rule, through its import set widened by the curated Win32 to Nt table: not imported
-// (import_present false) is a proven bypass, imported too (true) a hint. It is unknown (null) only where no curated
-// row leads to the syscall or the import table could not be read. A stub whose number this build does not have
+// (import_present false) is a proven bypass, imported too (true) a hint. It is unknown (null) where no curated row
+// leads to the syscall or the import table could not be read, and for every stub in process memory that the image
+// does not import: that memory cannot be attributed to the sample, so only the file can prove. A stub whose number this build does not have
 // (number_known false) suggests a sample made for another build.
 // model: hits ({ ...hit, source: 'process' | 'file' }), notes ({ tone, title, text }), summary, partial.
 function renderSyscallStubs(model) {
@@ -25622,8 +25623,8 @@ function renderSyscallStubs(model) {
         } else if (h.import_present === false) {
             imported = '<span title="Not imported, by an import set widened through the curated Win32 to Nt table: a proven bypass of the import path.">not imported</span>';
         } else {
-            imported = '<span class="syscall-muted" title="No curated Win32 to Nt row leads to this syscall, or the import table could not be read: ' +
-                       'a Win32 function the table does not know may reach it, so a missing import proves nothing.">unknown</span>';
+            imported = '<span class="syscall-muted" title="No curated Win32 to Nt row leads to this syscall, the import table could not be read, or the stub ' +
+                       'is in process memory, which cannot be attributed to the sample: a missing import proves nothing.">unknown</span>';
         }
         const drawable = typeof h.stub_hex === 'string' && h.stub_hex !== '' && Number.isInteger(h.number);
         rows.push('<tr>' +
@@ -25643,7 +25644,8 @@ function renderSyscallStubs(model) {
         (m.summary ? `<div class="syscall-stubs-summary">${escapeHtml(m.summary)}</div>` : '') +
         '<p class="syscall-draft-hint"><strong>Proof or hint.</strong> A syscall stub in the sample\'s own memory or file whose function the sample does not import, ' +
         'judged by its import set widened through the curated Win32 to Nt table, is a proven bypass of ntdll. ' +
-        'It stays a hint where the sample imports the function as well, or where no curated row leads to the syscall. Look at each hit before drafting a rule.</p>' +
+        'It stays a hint where the sample imports the function as well, where no curated row leads to the syscall, or where its import table could not be read, ' +
+        'and always for a stub in process memory, which cannot be attributed to the sample. Look at each hit before drafting a rule.</p>' +
         '<div class="view-table-wrap"><table class="view-table" data-sortable data-sort-id="syscall-stubs"><thead><tr><th>SYSCALL</th><th>NUMBER</th><th>BUILD</th>' +
         `<th>FOUND</th><th>PATTERN</th><th>IMPORTED</th><th></th></tr></thead><tbody>${rows.join('')}</tbody></table></div>`;
 }

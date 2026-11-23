@@ -247,15 +247,45 @@ def test_the_stubs_route_proves_a_bypass_for_a_file_that_does_not_import_the_pat
     assert body["evidence"]["findings"][0]["needs_corroboration"] is True
 
 
-def test_the_stubs_route_proves_a_bypass_in_a_process_whose_image_does_not_import_the_path(
+def test_a_process_search_never_proves_a_bypass_even_when_its_image_imports_no_door(
         client, tdc, target, sample_dir, monkeypatch):
+    # private executable memory belongs to nobody in particular: a hook engine's, a sandbox broker's or a
+    # runtime's thunk is judged against an image table that is not its own, so process mode cannot prove
     target.view = "x64"
     target.reader = _x64_space(b"\x90" * 0x40 + _X64_STUB_0x3A + b"\xc3")
-    image = _loader(sample_dir, "GetLastError")
+    image = _loader(sample_dir, "_CorExeMain")
     monkeypatch.setattr(tdc, "_image_path_for_pid", lambda pid: str(image))
     body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
     assert body["imports_read"] is True
-    assert body["hits"][0]["import_present"] is False
+    assert body["hits"][0]["import_present"] is None
+    [finding] = body["evidence"]["findings"]
+    assert finding["needs_corroboration"] is True and finding["may_corroborate"] is False
+
+
+def test_a_process_whose_image_imports_the_function_says_imported_too(client, tdc, target, sample_dir,
+                                                                       monkeypatch):
+    target.view = "x64"
+    target.reader = _x64_space(b"\x90" * 0x40 + _X64_STUB_0x3A + b"\xc3")
+    monkeypatch.setattr(tdc, "_image_path_for_pid", lambda pid: str(_loader(sample_dir, "NtWriteVirtualMemory")))
+    body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
+    assert body["hits"][0]["import_present"] is True
+    # a door alone is no import of the function in process mode: the raw table is all it uses
+    monkeypatch.setattr(tdc, "_image_path_for_pid", lambda pid: str(_loader(sample_dir, "WriteProcessMemory")))
+    body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
+    assert body["hits"][0]["import_present"] is None
+
+
+def test_a_process_image_larger_than_the_cap_is_not_read(client, tdc, target, sample_dir, monkeypatch):
+    target.view = "x64"
+    target.reader = _x64_space(b"\x90" * 0x40 + _X64_STUB_0x3A + b"\xc3")
+    image = _loader(sample_dir, "NtWriteVirtualMemory")
+    monkeypatch.setattr(tdc, "_image_path_for_pid", lambda pid: str(image))
+    monkeypatch.setattr(tdc, "SYSCALL_FILE_MAX", image.stat().st_size - 1)
+    opened = []
+    real_open = open
+    monkeypatch.setattr("builtins.open", lambda f, *a, **k: opened.append(str(f)) or real_open(f, *a, **k))
+    body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
+    assert body["imports_read"] is False and str(image) not in opened
 
 
 def test_a_process_whose_image_cannot_be_read_keeps_import_present_unknown(client, tdc, target, monkeypatch):
@@ -275,12 +305,37 @@ def test_the_detonation_stage_proves_a_bypass_for_the_sample_file(tdc, target, s
     path = _loader(sample_dir, "GetLastError")
     result = tdc._run_syscall_stage(4812, str(path), [])
     stubs = result["stubs"]
-    # the sample file's import table speaks for the process it became, too
-    assert [h["import_present"] for h in stubs["process"]["hits"]] == [False]
+    # the proof arrives through the file; the process copy is a hint, as its memory cannot be attributed
+    assert [h["import_present"] for h in stubs["process"]["hits"]] == [None]
     assert [h["import_present"] for h in stubs["file"]["hits"]] == [False]
     assert stubs["file"]["imports_read"] is True
     [finding] = [f for f in result["evidence"]["findings"] if f["kind"] == "direct_syscall_stub"]
-    assert finding["needs_corroboration"] is False
+    assert finding["needs_corroboration"] is False and finding["copies"] == 2
+
+
+def test_the_stage_searches_the_process_before_it_reads_the_sample_file(tdc, target, sample_dir, monkeypatch):
+    target.view = "x64"
+    target.reader = _x64_space(b"\x90" * 8)
+    path = _loader(sample_dir, "GetLastError")
+    order = []
+    real_process, real_file = syscall_scan.find_stubs_in_process, tdc._syscall_stage_file
+    monkeypatch.setattr(syscall_scan, "find_stubs_in_process",
+                        lambda *a, **k: order.append("process") or real_process(*a, **k))
+    monkeypatch.setattr(tdc, "_syscall_stage_file", lambda *a, **k: order.append("file") or real_file(*a, **k))
+    tdc._run_syscall_stage(4812, str(path), [])
+    assert order == ["process", "file"]
+
+
+def test_a_copy_of_the_module_that_exports_the_function_holds_its_door(client, tdc, target, sample_dir):
+    # a copy of ntdll has no import directory, but it is the documented path itself, not a bypass of it
+    path = sample_dir / "ntdll-copy.dll"
+    path.write_bytes(_pe_importing(exports=("NtWriteVirtualMemory", "NtClose")) + _X64_STUB_0x3A)
+    body = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()
+    assert body["imports_read"] is True and body["hits"][0]["import_present"] is True
+    # and a PE that neither imports nor exports a door is still a proof
+    path.write_bytes(_pe_importing(exports=("Unrelated",)) + _X64_STUB_0x3A)
+    body = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()
+    assert body["hits"][0]["import_present"] is False
 
 
 def test_the_detonation_stage_without_a_sample_file_keeps_import_present_unknown(tdc, target):
@@ -318,6 +373,7 @@ STALE_PHRASES = (
     "They are hints, not proof",                            # index.html, the info of the stub panel
     "not known to be complete for this function",           # app.js, the tooltip of "unknown"
     "until the Win32-to-Nt table exists",                   # docs/api.md
+    "import table not checked",                             # memory_evidence.py, the detail of a hint
     "Every hit is a hint for now",                          # docs/memory.md, the table row
     "Every hit is for now a hint",                          # docs/memory.md, the section
     "which the chamber does not have yet",                  # docs/memory.md, the section
@@ -345,7 +401,8 @@ def test_no_shipped_text_still_says_the_win32_to_nt_table_is_missing():
 def test_the_stub_list_changed_and_so_did_its_asset_version():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     with open(os.path.join(root, "webui", "templates", "index.html"), encoding="utf-8") as fh:
-        assert "app.js?v=136" not in fh.read(), "app.js changed, its version did not"
+        html = fh.read()
+        assert "app.js?v=136" not in html and "app.js?v=137" not in html, "app.js changed, its version did not"
 
 
 def test_an_expanded_import_set_without_its_coverage_is_refused(x64_baseline):
@@ -367,7 +424,8 @@ DOORS = {
     "NtWriteVirtualMemory": {"WriteProcessMemory"},
     "NtProtectVirtualMemory": {"VirtualProtect", "VirtualProtectEx", "VirtualProtectFromApp"},
     "NtCreateThreadEx": {"CreateThread", "CreateRemoteThread", "CreateRemoteThreadEx", "RtlCreateUserThread",
-                         "_beginthreadex", "_beginthread", "DbgUiIssueRemoteBreakin", "DebugBreakProcess"},
+                         "_beginthreadex", "_beginthread", "DbgUiIssueRemoteBreakin", "DebugBreakProcess",
+                         "SHCreateThread", "SHCreateThreadWithHandle"},
     "NtQueueApcThread": {"QueueUserAPC", "RtlQueueApcWow64Thread"},
     "NtSetContextThread": {"SetThreadContext", "RtlRemoteCall"},
     "NtUnmapViewOfSection": {"UnmapViewOfFile", "ZwUnmapViewOfSection", "FreeLibrary", "FreeLibraryAndExitThread",
@@ -404,3 +462,18 @@ def test_an_api_that_reaches_a_covered_syscall_only_on_its_own_behalf_is_no_door
     assert [e.nt for e in table.entries_for("WriteProcessMemory")] == ["NtWriteVirtualMemory"]
     assert [e.nt for e in table.entries_for("RtlRemoteCall")] == ["NtSetContextThread"]
     assert [e.nt for e in table.entries_for("RtlAdjustPrivilege")] == ["NtAdjustPrivilegesToken"]
+
+
+def test_the_internal_helpers_have_no_default_for_covered():
+    # a future internal caller must name the coverage, not fall into the rule it replaced
+    import inspect
+    for fn in (syscall_scan._import_present, syscall_scan._scan_chunk):
+        assert inspect.signature(fn).parameters["covered"].default is inspect.Parameter.empty, fn.__name__
+
+
+def test_a_hint_without_an_answer_says_why_it_has_none(x64_baseline):
+    (hit,) = syscall_scan.find_stubs_in_bytes(_x64_stub(0x55), x64_baseline, {"CreateFileW"},
+                                              expanded_imports={"CreateFileW"}, covered=frozenset())
+    (finding,) = memory_evidence.from_direct_stubs([hit], "s.exe")
+    assert "import table not checked" not in finding["detail"]
+    assert "no curated door" in finding["detail"]

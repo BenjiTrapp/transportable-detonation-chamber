@@ -590,28 +590,29 @@ def _is_imported(sc: Syscall, imports) -> bool:
     return not names.isdisjoint(imports)
 
 
-def _import_present(sc: Syscall | None, imports, expanded_imports, covered=None) -> bool | None:
+def _import_present(sc: Syscall | None, imports, expanded_imports, covered) -> bool | None:
     """Whether the sample imports the syscall of a stub: True, False, or None for unknown.
 
     Only a presence can be read off a raw import table. An absence cannot: a sample that
     calls the documented Win32 function never imports the `Nt` name behind it, so against
     its raw table the stub of that very syscall looks unimported, and an ordinary program
     would read as a proven bypass. An absence is claimed only against `expanded_imports`,
-    which the caller has run through the Win32 to Nt table, and, when `covered` names the
-    syscalls a row of that table leads to, only for one of them: for any other the table
-    knows no Win32 path, so a missing name proves nothing. A number the build does not
+    which the caller has run through the Win32 to Nt table, and only for a syscall in
+    `covered`, the syscalls a row of that table leads to: for any other the table knows no
+    Win32 path, so a missing name proves nothing. The public entries refuse an expanded set
+    without `covered`; here it has no default, so no caller falls back to the old rule. A number the build does not
     have names no function to look for."""
     if sc is None:
         return None
     if any(table is not None and _is_imported(sc, table)
            for table in (imports, expanded_imports)):
         return True
-    if expanded_imports is None or (covered is not None and sc.name not in covered):
+    if expanded_imports is None or covered is None or sc.name not in covered:
         return None
     return False
 
 
-def _scan_chunk(data: bytes, view: str, numbers: dict, imports, expanded_imports, covered=None,
+def _scan_chunk(data: bytes, view: str, numbers: dict, imports, expanded_imports, covered,
                 starts_below: int | None = None) -> list[dict]:
     decode, align = _STUB_NUMBER[view], _STUB_ALIGN[view]
     hits = []

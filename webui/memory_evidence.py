@@ -631,7 +631,9 @@ def from_direct_stubs(hits, process=""):
         elif imported:
             detail = f"{name} stub carried by the sample, which imports it as well"
         else:
-            detail = f"{name} stub carried by the sample, import table not checked"
+            detail = (f"{name} stub carried by the sample; whether it imports a door to it is unknown: "
+                      "no curated door covers the syscall, the import table was not read, or the stub was "
+                      "found in process memory, which cannot be attributed to the sample")
         places = [h.get("address", h.get("offset")) for h in group]
         extra = {
             "syscall": name,

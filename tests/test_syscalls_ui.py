@@ -2135,6 +2135,7 @@ def test_the_list_says_when_a_stub_is_a_proof_and_when_a_hint():
     assert "hints, not proof" not in low, "the curated table exists: a stub without the import is a proof"
     assert "proven bypass" in low and "win32 to nt table" in low, "it says what makes a proof"
     assert "stays a hint" in low and "no curated row" in low, "and where a hit remains a hint"
+    assert "could not be read" in low and "process memory" in low, "every reason a hit stays a hint"
 
 
 @needs_node

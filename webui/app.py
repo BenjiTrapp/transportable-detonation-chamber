@@ -8381,25 +8381,25 @@ def _syscall_stage_available():
 
 
 def _syscall_stage_file(path, baseline):
-    """`(hits, info, imports)`: the stubs the file at `path` carries, what is known of the search, and the file's
-    import table (None when it is no PE that can be read). A file that cannot be searched is a note in `info`. The
-    table is passed raw and expanded through the Win32 to Nt table: only the expanded one can prove a bypass, and
-    only for a syscall a curated row leads to."""
+    """`(hits, info)`: the stubs the file at `path` carries and what is known of the search. A file that cannot be
+    searched is a note in `info`. The names the file holds (imports and exports) are passed raw and expanded through
+    the Win32 to Nt table: only the expanded set can prove a bypass, and only for a syscall a curated row leads to.
+    This is where a detonation's proof comes from: the file is the sample's own, its process memory is not."""
     if not isinstance(path, str) or not path:
-        return [], {"skipped": "the path of the sample is not known"}, None
+        return [], {"skipped": "the path of the sample is not known"}
     real = _readable_path(path)
     if real is None:
-        return [], {"skipped": "the sample is outside the folders the web UI reads"}, None
+        return [], {"skipped": "the sample is outside the folders the web UI reads"}
     try:
         if os.path.getsize(real) > SYSCALL_FILE_MAX:
-            return [], {"skipped": f"the sample is larger than {SYSCALL_FILE_MAX // (1024 * 1024)} MB"}, None
+            return [], {"skipped": f"the sample is larger than {SYSCALL_FILE_MAX // (1024 * 1024)} MB"}
         with open(real, "rb") as fh:
             content = fh.read()
     except OSError as exc:
-        return [], {"skipped": f"the sample cannot be read: {exc.strerror or exc}"}, None
-    imports = _pe_import_names(content)
-    hits = syscall_scan.find_stubs_in_bytes(content, baseline, imports, **_syscall_expanded_imports(imports))
-    return hits, {"path": real, "size": len(content), "imports_read": imports is not None}, imports
+        return [], {"skipped": f"the sample cannot be read: {exc.strerror or exc}"}
+    names = _pe_names_held(content)
+    hits = syscall_scan.find_stubs_in_bytes(content, baseline, names, **_syscall_expanded_imports(names))
+    return hits, {"path": real, "size": len(content), "imports_read": names is not None}
 
 
 def _syscall_stage(pid, path):
@@ -8418,20 +8418,21 @@ def _syscall_stage(pid, path):
     measured = _syscall_read_process(
         pid, view, build,
         lambda reader: syscall_scan.measure(baseline, reader, view, build, modules, _get_hook_allowlist()))
-    # the sample file is read first: its import table is the one of the process it became
-    file_hits, in_file, imports = _syscall_stage_file(path, baseline)
-    in_file["hits"] = list(file_hits)
+    # the process first, while it is as the detonation left it. Its private memory cannot be attributed to the
+    # sample, so the search proves nothing there: a stub in it is a hint, and a proof can only come from the file
     try:
         found = _syscall_read_process(
-            pid, view, build, lambda reader: syscall_scan.find_stubs_in_process(
-                reader, baseline, imports, **_syscall_expanded_imports(imports)))
+            pid, view, build, lambda reader: syscall_scan.find_stubs_in_process(reader, baseline))
         # StubScan's own attributes are lost to list() and json.dumps: they become keys here
         in_process = {"hits": list(found), "partial": found.partial,
                       "regions_searched": found.regions_searched, "note": found.note}
     except Exception as exc:
         in_process = {"hits": [], "error": str(exc)}
+    file_hits, in_file = _syscall_stage_file(path, baseline)
+    in_file["hits"] = list(file_hits)
     findings = memory_evidence.collect({"syscall_scan": measured}, process=identity)
-    findings += memory_evidence.from_direct_stubs(in_process["hits"] + in_file["hits"], identity)
+    # the file's hits go first: a finding takes its answer from its first copy, and only the file can prove
+    findings += memory_evidence.from_direct_stubs(in_file["hits"] + in_process["hits"], identity)
     return _syscall_mark_unobserved({
         **{k: v for k, v in measured.items() if k != "states"},
         "tool": "Syscalls", "pid": pid, "process": identity, "modules": list(modules),
@@ -8600,6 +8601,26 @@ def _pe_import_names_of_file(path):
         return None
 
 
+def _pe_names_held(data):
+    """The names a PE imports and the ones it exports, None when `data` is not a PE that can be read. A module that
+    exports a function is that function's documented path, not a bypass of it: a copy of ntdll holds every door."""
+    imports = _pe_import_names(data)
+    if imports is None:
+        return None
+    try:
+        import pefile
+        pe = pefile.PE(data=data, fast_load=True)
+        try:
+            pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"]])
+            exports = getattr(pe, "DIRECTORY_ENTRY_EXPORT", None)
+            return imports | {sym.name.decode("ascii", "replace") for sym in (exports.symbols if exports else [])
+                              if sym.name}
+        finally:
+            pe.close()
+    except Exception:
+        return None             # exports not known: it may hold the door, so the table says nothing
+
+
 def _pe_import_names(data):
     """The names a PE imports, delay-loaded ones included, None when `data` is not a PE that can be read. Expanded
     through the Win32 to Nt table the set can say that a function is not imported, so a function the sample
@@ -8623,10 +8644,11 @@ def _pe_import_names(data):
 def api_syscalls_stubs():
     """Search for syscall stubs outside ntdll: in a running process (pid) or in a file (path, with view).
 
-    Each hit names the syscall of its number. `import_present` is tri-state: False for a syscall a curated Win32 to Nt
-    row leads to and the import table, expanded through that table, does not hold (a proven bypass); True for one it
-    holds; None where no row leads to the syscall or the import table cannot be read (see
-    syscall_scan.find_stubs_in_bytes). The table of a process is the one of its image."""
+    Each hit names the syscall of its number. For a file `import_present` is tri-state: False for a syscall a curated
+    Win32 to Nt row leads to and the file's imports and exports, expanded through that table, do not hold (a proven
+    bypass); True for one they hold; None where no row leads to the syscall or the file is no PE that can be read
+    (see syscall_scan.find_stubs_in_bytes). For a process it is True when the image imports the function and None
+    otherwise, never False: its private memory cannot be attributed to the image."""
     data = _syscall_body()
     pid_given, path_given = data.get("pid") not in (None, ""), data.get("path") not in (None, "")
     if pid_given == path_given:
@@ -8635,10 +8657,11 @@ def api_syscalls_stubs():
         pid = _syscall_pid(data.get("pid"))
         view, baseline = _syscall_target(pid)
         build = _current_os_build()
+        # the raw table of the image can say that the function is imported as well, never that it is not:
+        # private memory is not the image's alone (a hook engine, a sandbox broker, a runtime put stubs there)
         imports = _pe_import_names_of_file(_image_path_for_pid(pid))
         found = _syscall_read_process(
-            pid, view, build, lambda reader: syscall_scan.find_stubs_in_process(
-                reader, baseline, imports, **_syscall_expanded_imports(imports)))
+            pid, view, build, lambda reader: syscall_scan.find_stubs_in_process(reader, baseline, imports))
         process = _syscall_identity(pid)
         result = {"mode": "process", "pid": pid, "process": process, "imports_read": imports is not None,
                   "partial": found.partial, "regions_searched": found.regions_searched, "note": found.note}
@@ -8661,7 +8684,7 @@ def api_syscalls_stubs():
                 content = fh.read()
         except OSError as exc:
             raise _SyscallRouteError(f"the file cannot be read: {exc.strerror or exc}")
-        imports = _pe_import_names(content)
+        imports = _pe_names_held(content)
         found = syscall_scan.find_stubs_in_bytes(content, baseline, imports, **_syscall_expanded_imports(imports))
         process = os.path.basename(real)
         result = {"mode": "file", "path": real, "size": len(content), "process": process,
