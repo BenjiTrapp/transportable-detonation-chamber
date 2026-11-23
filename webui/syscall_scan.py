@@ -637,6 +637,14 @@ def _scan_chunk(data: bytes, view: str, numbers: dict, imports, expanded_imports
     return hits
 
 
+def _coverage(expanded_imports, covered) -> frozenset | None:
+    """`covered` as a frozenset. An expanded import set without it is refused: the expansion speaks only for the
+    syscalls a row leads to, and without knowing which, any other would read as a proven bypass."""
+    if expanded_imports is not None and covered is None:
+        raise ValueError("expanded_imports needs covered: the syscalls the Win32 to Nt table leads to")
+    return None if covered is None else frozenset(covered)
+
+
 def _shape_of(view: str) -> str:
     if view not in STUB_SHAPES:
         raise ValueError(f"no stub shape for view {view!r}")
@@ -658,11 +666,13 @@ def find_stubs_in_bytes(data: bytes, baseline: Baseline, imports: set[str] | Non
     the Win32 to Nt table has been applied to it; only a set passed there can give False, a
     proven bypass of the import path. It is keyword-only so that a raw table cannot be passed
     into it by position. `covered` is the set of syscalls a row of that table leads to
-    (`win32_to_nt.Table.covered`): given, False is said only for one of them, and a stub of
-    any other syscall stays None, because the table knows no Win32 function that reaches it.
-    With neither, or with only a raw table that lacks the name, the answer is None."""
+    (`win32_to_nt.Table.covered`): False is said only for one of them, and a stub of any
+    other syscall stays None, because the table knows no Win32 function that reaches it.
+    `expanded_imports` without `covered` is a ValueError: forgetting it must not bring back
+    the proof for every syscall. With neither, or with only a raw table that lacks the
+    name, the answer is None."""
+    covered = _coverage(expanded_imports, covered)
     view = _shape_of(baseline.view)
-    covered = None if covered is None else frozenset(covered)
     return _scan_chunk(data, view, _numbers(baseline), imports, expanded_imports, covered)
 
 
@@ -724,6 +734,7 @@ def find_stubs_in_process(reader: ProcessReader, baseline: Baseline,
 
     A baseline of another view or build is refused before anything is read: its numbers
     would name the wrong syscalls."""
+    covered = _coverage(expanded_imports, covered)
     view = reader.view()
     if view != baseline.view:
         raise ScanRefused(f"process view {view or 'unknown'} does not match the baseline "
@@ -734,7 +745,6 @@ def find_stubs_in_process(reader: ProcessReader, baseline: Baseline,
                           f"build {baseline.build}")
     view = _shape_of(view)
     numbers = _numbers(baseline)
-    covered = None if covered is None else frozenset(covered)
     found = StubScan()
     unread: list[int] = []
     for region in _walk(reader, found):

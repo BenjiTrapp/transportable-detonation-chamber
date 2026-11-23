@@ -149,9 +149,9 @@ def test_expand_keeps_none_as_none_and_adds_the_nt_name_of_a_hit():
     assert table.expand({"GetLastError", "CreateService"}) == {"GetLastError", "CreateService"}
 
 
-def test_a_sample_whose_api_the_table_does_not_know_is_a_hint_and_not_a_proven_bypass(x64_baseline):
-    # imports {"CreateService"}: no row, so expand() adds nothing. For a stub of a syscall no row leads to, the
-    # expansion cannot speak: an ordinary program reaching NtCreateFile through CreateFileW stays None, not False
+def test_a_stub_for_a_syscall_no_row_leads_to_stays_unknown(x64_baseline):
+    # the discriminator is the coverage of the stub's syscall: the table knows no door to NtCreateFile, so an
+    # ordinary program reaching it through CreateFileW stays None, never a proven bypass
     assert win32_to_nt.load_table().expand({"CreateService"}) == {"CreateService"}
     assert _hit(x64_baseline, "NtCreateFile", {"CreateService"})["import_present"] is None
     assert _hit(x64_baseline, "NtCreateFile", {"CreateFileW", "GetLastError"})["import_present"] is None
@@ -172,10 +172,9 @@ def test_a_sample_that_imports_nothing_of_the_path_is_a_proven_bypass(x64_baseli
     assert finding["base_weight"] == memory_evidence.KINDS["direct_syscall_stub"]["weight"]
 
 
-def test_an_unknown_import_beside_does_not_shield_a_syscall_the_table_holds_every_known_path_to(x64_baseline):
-    # CreateService has no row because it reaches no syscall of this process directly (it goes over RPC): it is
-    # no path to NtCreateThreadEx, so a sample importing it and carrying that stub has gone around every path
-    # the table knows
+def test_a_sample_that_imports_no_door_to_a_covered_syscall_is_a_proven_bypass(x64_baseline):
+    # the table knows the doors to NtCreateThreadEx and the sample takes none of them. CreateService having no
+    # row of its own changes nothing: whether the sample's import has a row is never the question
     assert _hit(x64_baseline, "NtCreateThreadEx", {"CreateService"})["import_present"] is False
 
 
@@ -306,3 +305,16 @@ def test_the_stub_list_changed_and_so_did_its_asset_version():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     with open(os.path.join(root, "webui", "templates", "index.html"), encoding="utf-8") as fh:
         assert "app.js?v=136" not in fh.read(), "app.js changed, its version did not"
+
+
+def test_an_expanded_import_set_without_its_coverage_is_refused(x64_baseline):
+    # forgetting `covered` would bring back the false proof for every syscall no row leads to
+    with pytest.raises(ValueError):
+        syscall_scan.find_stubs_in_bytes(_x64_stub(0x55), x64_baseline, expanded_imports={"CreateFileW"})
+    reader = _x64_space(_x64_stub(0x55))
+    with pytest.raises(ValueError):
+        syscall_scan.find_stubs_in_process(reader, x64_baseline, expanded_imports={"CreateFileW"})
+    # coverage alone, or neither, is no mistake
+    (hit,) = syscall_scan.find_stubs_in_bytes(_x64_stub(0x55), x64_baseline, covered=frozenset())
+    assert hit["import_present"] is None
+

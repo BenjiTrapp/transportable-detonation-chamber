@@ -8,6 +8,7 @@ import pytest
 import memory_evidence
 import syscall_baseline
 import syscall_scan
+import win32_to_nt
 from test_syscalls import FakeReader, _fixture
 
 MOV_R10_RCX_MOV_EAX = bytes.fromhex("4c8bd1b8")
@@ -25,6 +26,11 @@ def x64_baseline():
 @pytest.fixture
 def arm64_baseline():
     return syscall_baseline.parse_baseline(_fixture("arm64"), "26220.5770", "arm64")
+
+
+# the syscalls the curated Win32 to Nt table leads to: NtAllocateVirtualMemory (0x18), NtWriteVirtualMemory
+# (0x3A) and NtProtectVirtualMemory (0x50) of the fixture are among them
+COVERED = win32_to_nt.load_table().covered
 
 
 def _x64_stub(number, between=b""):
@@ -183,7 +189,7 @@ def test_every_baseline_view_has_a_search_shape():
 def test_a_stub_without_the_matching_import_weighs_more(x64_baseline):
     sc = x64_baseline.syscalls["NtAllocateVirtualMemory"]
     blob = bytes.fromhex("4c8bd1b8") + sc.number.to_bytes(4, "little") + bytes.fromhex("0f05")
-    without = syscall_scan.find_stubs_in_bytes(blob, x64_baseline, expanded_imports=set())
+    without = syscall_scan.find_stubs_in_bytes(blob, x64_baseline, expanded_imports=set(), covered=COVERED)
     with_imp = syscall_scan.find_stubs_in_bytes(
         blob, x64_baseline, imports={"NtAllocateVirtualMemory"})
     assert without[0]["import_present"] is False
@@ -201,15 +207,24 @@ def test_the_import_of_the_zw_name_counts_as_the_import(x64_baseline):
 
 def test_another_function_in_the_expanded_table_is_not_the_import(x64_baseline):
     (hit,) = syscall_scan.find_stubs_in_bytes(
-        _x64_stub(0x18), x64_baseline, expanded_imports={"NtWriteVirtualMemory", "VirtualAlloc"})
+        _x64_stub(0x18), x64_baseline, expanded_imports={"NtWriteVirtualMemory", "VirtualAlloc"},
+        covered=COVERED)
     assert hit["import_present"] is False
+
+
+def test_the_expanded_table_speaks_only_for_the_syscalls_it_covers(x64_baseline):
+    assert {"NtAllocateVirtualMemory", "NtWriteVirtualMemory", "NtProtectVirtualMemory"} <= COVERED
+    (hit,) = syscall_scan.find_stubs_in_bytes(
+        _x64_stub(0x18), x64_baseline, expanded_imports=set(),
+        covered={"NtWriteVirtualMemory"})
+    assert hit["import_present"] is None
 
 
 def test_without_an_import_table_the_import_is_unknown_not_absent(x64_baseline):
     (hit,) = syscall_scan.find_stubs_in_bytes(_x64_stub(0x18), x64_baseline)
     assert hit["import_present"] is None
     (hit,) = syscall_scan.find_stubs_in_bytes(
-        _x64_stub(0x7FE), x64_baseline, expanded_imports=set())
+        _x64_stub(0x7FE), x64_baseline, expanded_imports=set(), covered=COVERED)
     assert hit["import_present"] is None
 
 
@@ -238,7 +253,8 @@ def test_a_raw_table_never_unlocks_the_weight_of_a_proven_bypass(x64_baseline):
 def test_the_wrapper_in_the_expanded_table_leads_down_to_the_stub(x64_baseline):
     # the caller has run the table: VirtualAllocEx became NtAllocateVirtualMemory
     (hit,) = syscall_scan.find_stubs_in_bytes(
-        _x64_stub(0x18), x64_baseline, expanded_imports={"VirtualAllocEx", "NtAllocateVirtualMemory"})
+        _x64_stub(0x18), x64_baseline, expanded_imports={"VirtualAllocEx", "NtAllocateVirtualMemory"},
+        covered=COVERED)
     assert hit["import_present"] is True
 
 
@@ -250,7 +266,8 @@ def test_the_expanded_table_cannot_be_passed_by_position(x64_baseline):
 
 def _stub_findings(x64_baseline, imports=None, number=0x18, expanded=None):
     hits = syscall_scan.find_stubs_in_bytes(
-        _x64_stub(number), x64_baseline, imports=imports, expanded_imports=expanded)
+        _x64_stub(number), x64_baseline, imports=imports, expanded_imports=expanded,
+        covered=None if expanded is None else COVERED)
     return memory_evidence.from_direct_stubs(hits, "s.exe")
 
 
@@ -344,14 +361,15 @@ def test_no_other_scanner_opts_out_of_corroborating():
 def test_the_finding_key_holds_no_address(x64_baseline):
     def key(offset):
         blob = b"\x90" * offset + _x64_stub(0x18)
-        hits = syscall_scan.find_stubs_in_bytes(blob, x64_baseline, expanded_imports=set())
+        hits = syscall_scan.find_stubs_in_bytes(blob, x64_baseline, expanded_imports=set(), covered=COVERED)
         return memory_evidence.from_direct_stubs(hits, "s.exe")[0]["key"]
     assert key(10) == key(900)
 
 
 def test_the_finding_key_names_the_syscall_and_the_process(x64_baseline):
     def key(number, process="s.exe"):
-        hits = syscall_scan.find_stubs_in_bytes(_x64_stub(number), x64_baseline, expanded_imports=set())
+        hits = syscall_scan.find_stubs_in_bytes(_x64_stub(number), x64_baseline, expanded_imports=set(),
+                                                covered=COVERED)
         return memory_evidence.from_direct_stubs(hits, process)[0]["key"]
     assert key(0x18) != key(0x3A)
     assert key(0x18) != key(0x18, "other.exe")
@@ -360,7 +378,7 @@ def test_the_finding_key_names_the_syscall_and_the_process(x64_baseline):
 
 def test_copies_of_one_stub_are_one_finding_that_counts_them(x64_baseline):
     blob = _x64_stub(0x50) + b"\x90" * 8 + _x64_stub(0x50) + _x64_stub(0x3A)
-    hits = syscall_scan.find_stubs_in_bytes(blob, x64_baseline, expanded_imports=set())
+    hits = syscall_scan.find_stubs_in_bytes(blob, x64_baseline, expanded_imports=set(), covered=COVERED)
     findings = memory_evidence.from_direct_stubs(hits, "s.exe")
     by_syscall = {f["syscall"]: f for f in findings}
     assert set(by_syscall) == {"NtProtectVirtualMemory", "NtWriteVirtualMemory"}
@@ -574,7 +592,7 @@ def test_a_clean_process_reports_what_it_searched(x64_baseline):
 
 def test_the_process_import_table_is_applied(x64_baseline):
     reader = _space((PRIVATE_BASE, _x64_stub(0x18), _private()))
-    (hit,) = syscall_scan.find_stubs_in_process(reader, x64_baseline, expanded_imports=set())
+    (hit,) = syscall_scan.find_stubs_in_process(reader, x64_baseline, expanded_imports=set(), covered=COVERED)
     assert hit["import_present"] is False
     (hit,) = syscall_scan.find_stubs_in_process(reader, x64_baseline)
     assert hit["import_present"] is None
