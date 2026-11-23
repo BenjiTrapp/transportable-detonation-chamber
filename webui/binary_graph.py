@@ -28,6 +28,7 @@ class BinaryInfo:
     exports: tuple[str, ...]                # what this image defines itself, a nameless export as "#<ordinal>"
     forwarders: dict[str, str]              # export name or "#<ordinal>" -> the raw string, "NTDLL.RtlAllocateHeap"
     ordinal_names: dict[int, str]           # ordinal -> name of every named export, forwarders included
+    partial: bool                           # a directory warned and kept what it read: tables may be cut short
 
 
 def _text(raw):
@@ -89,18 +90,29 @@ DIRECTORIES = (("IMAGE_DIRECTORY_ENTRY_IMPORT", "DIRECTORY_ENTRY_IMPORT", "impor
 
 
 def _parse_directories(pefile, pe):
-    """Parse the import, delay-load and export directories one at a time, and raise ExtractError for one the header
-    declares and pefile refuses: no entry, and a warning of its own. An empty table is read as empty, not refused;
-    a fault elsewhere in the file (a section cut short, say) is pefile's to tolerate."""
+    """Parse the import, delay-load and export directories one at a time; True when one of them is partial.
+
+    Per directory, only whether its own parse warned counts, never what the warning says. A declared directory that
+    warned and yielded no entry is refused (ExtractError); one that warned and yielded entries is kept as partial,
+    since pefile stops early (at 120 repeated nameless exports, say) and keeps what it read. An empty table without
+    a warning is read as empty; a fault elsewhere in the file (a section cut short, say) is pefile's to tolerate."""
+    # pefile refuses a truncated directory by warning, not by raising. Should an upgrade stop warning, a truncated PE
+    # would read as one that imports nothing: test_a_pe_truncated_after_its_headers_is_skipped_and_does_not_raise,
+    # test_a_directory_pefile_cannot_read_skips_only_when_it_is_one_the_record_needs and
+    # test_a_parse_that_warned_and_still_produced_entries_is_kept_and_marked_partial are the tripwire for that
     declared = pe.OPTIONAL_HEADER.DATA_DIRECTORY
+    partial = False
     for index_name, attribute, word in DIRECTORIES:
         index = pefile.DIRECTORY_ENTRY[index_name]
         before = len(pe.get_warnings())
         pe.parse_data_directories(directories=[index])
-        new = pe.get_warnings()[before:]
-        entry = declared[index] if index < len(declared) else None
-        if entry is not None and entry.VirtualAddress and new and not getattr(pe, attribute, None):
-            raise ExtractError(f"unreadable {word} directory: {new[0][:120]}")
+        if len(pe.get_warnings()) == before:
+            continue
+        if getattr(pe, attribute, None):
+            partial = True
+        elif index < len(declared) and declared[index].VirtualAddress:
+            raise ExtractError(f"unreadable {word} directory")
+    return partial
 
 
 def extract_binary(path: str) -> BinaryInfo:
@@ -108,8 +120,11 @@ def extract_binary(path: str) -> BinaryInfo:
 
     The file is mapped, never read whole, and refused above MAX_BINARY_SIZE; only the headers and the import,
     delay-load and export directories are parsed."""
-    import pefile
     name = os.path.basename(path).lower()
+    try:
+        import pefile
+    except ImportError:
+        raise ExtractError("cannot be parsed: pefile is not available") from None
     try:
         with open(path, "rb") as fh:
             size = os.fstat(fh.fileno()).st_size
@@ -133,14 +148,15 @@ def _record(pefile, name, data):
     except pefile.PEFormatError as exc:
         raise ExtractError(f"not a PE: {str(exc.value).strip()}") from None
     try:
-        _parse_directories(pefile, pe)
+        partial = _parse_directories(pefile, pe)
         exports, forwarders, ordinal_names = _exports(pe)
         dll = _is_dll(pe)
         if dll is None:
             dll = not name.endswith(".exe")
         return BinaryInfo(name=name, kind="dll" if dll else "exe",
                           machine=MACHINES.get(pe.FILE_HEADER.Machine, "other"), imports=_imports(pe),
-                          exports=exports, forwarders=forwarders, ordinal_names=ordinal_names)
+                          exports=exports, forwarders=forwarders, ordinal_names=ordinal_names,
+                          partial=partial)
     finally:
         pe.close()
 

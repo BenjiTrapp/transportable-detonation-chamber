@@ -696,10 +696,29 @@ def test_a_pe_truncated_after_its_headers_is_skipped_and_does_not_raise(tmp_path
     binaries, skipped = binary_graph.extract_tree(str(tmp_path))
     assert [b.name for b in binaries] == ["whole.dll"]
     assert [name for name, _ in skipped] == ["cut.dll", "half.dll"]
-    for _, reason in skipped:
-        # pefile reads the headers and refuses the directory; the reason names which, and pefile's word for it
-        assert reason.startswith("unreadable import directory: "), reason
-        assert "Corrupt header" in reason and len(reason) < 160, reason
+    # pefile reads the headers and refuses the directory: the reason names which, never pefile's wording of it,
+    # which may change with any release
+    assert [reason for _, reason in skipped] == ["unreadable import directory"] * 2
+
+
+def test_a_parse_that_warned_and_still_produced_entries_is_kept_and_marked_partial(tmp_path):
+    # pefile gives up on an export table after 120 nameless exports at one address, and keeps what it read so far
+    whole = _binary(tmp_path, "whole.dll", exports=("A",), nameless=tuple((n, None) for n in range(2, 12)))
+    assert whole.partial is False and len(whole.exports) == 11
+    cut = _binary(tmp_path, "cut.dll", exports=("A",), nameless=tuple((n, None) for n in range(2, 132)))
+    assert cut.partial is True
+    assert cut.exports[0] == "A" and 1 < len(cut.exports) < 131        # kept, with fewer exports than it has
+    # a warning only about the headers, not from a directory the record is read from, is no partial parse
+    short = make_pe(imports=(("ntdll.dll", ("NtClose",)),))
+    (tmp_path / "short.dll").write_bytes(short[:-1])
+    assert binary_graph.extract_binary(str(tmp_path / "short.dll")).partial is False
+
+
+def test_without_pefile_every_file_is_skipped_and_nothing_escapes(tmp_path, monkeypatch):
+    import sys
+    (tmp_path / "a.dll").write_bytes(make_pe())
+    monkeypatch.setitem(sys.modules, "pefile", None)             # `import pefile` raises ImportError
+    assert binary_graph.extract_tree(str(tmp_path)) == ([], [("a.dll", "cannot be parsed: pefile is not available")])
 
 
 def test_a_section_one_byte_past_the_end_of_the_file_is_read_as_pefile_reads_it(tmp_path):
@@ -719,11 +738,11 @@ def test_a_directory_pefile_cannot_read_skips_only_when_it_is_one_the_record_nee
     assert binary_graph.extract_binary(str(tmp_path / "rsrc.dll")).imports == {"ntdll.dll": ("NtClose",)}
     cut = make_pe(delay=(("user32.dll", ("MessageBoxW",)),))[:0x200]
     (tmp_path / "lazy.dll").write_bytes(cut)
-    with pytest.raises(binary_graph.ExtractError, match="^unreadable delay-load directory: "):
+    with pytest.raises(binary_graph.ExtractError, match="^unreadable delay-load directory$"):
         binary_graph.extract_binary(str(tmp_path / "lazy.dll"))
     cut = make_pe(exports=("A",))[:0x200]
     (tmp_path / "exp.dll").write_bytes(cut)
-    with pytest.raises(binary_graph.ExtractError, match="^unreadable export directory: "):
+    with pytest.raises(binary_graph.ExtractError, match="^unreadable export directory$"):
         binary_graph.extract_binary(str(tmp_path / "exp.dll"))
 
 
