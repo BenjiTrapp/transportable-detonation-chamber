@@ -93,13 +93,15 @@ def test_every_entry_names_a_source_from_the_vocabulary_and_no_pair_twice():
 
 
 def test_a_win32_name_may_lead_to_several_syscalls_and_expand_adds_them_all():
-    table = win32_to_nt.load_table()
-    assert [e.nt for e in table.entries_for("writeprocessmemory")] == [
-        "NtWriteVirtualMemory", "NtProtectVirtualMemory", "NtUnmapViewOfSection"]
-    assert table.nt_for("WriteProcessMemory").nt == "NtWriteVirtualMemory"     # the first row is the headline
+    # the shipped table has no such name today (see the door rule); the model keeps the seat for one
+    row = {"win32": "SomeDoor", "source": "documented", "note": "x"}
+    table = win32_to_nt.parse_table({"version": 1, "entries": [
+        dict(row, nt="NtWriteVirtualMemory"), dict(row, win32="somedoor", nt="NtProtectVirtualMemory")]})
+    assert [e.nt for e in table.entries_for("SOMEDOOR")] == ["NtWriteVirtualMemory", "NtProtectVirtualMemory"]
+    assert table.nt_for("SomeDoor").nt == "NtWriteVirtualMemory"                # the first row is the headline
     assert table.entries_for("GetLastError") == ()
-    assert table.expand({"WriteProcessMemory"}) == {
-        "WriteProcessMemory", "NtWriteVirtualMemory", "NtProtectVirtualMemory", "NtUnmapViewOfSection"}
+    assert table.expand({"SomeDoor"}) == {"SomeDoor", "NtWriteVirtualMemory", "NtProtectVirtualMemory"}
+    assert table.covered == {"NtWriteVirtualMemory", "NtProtectVirtualMemory"}
 
 
 def test_a_pair_twice_is_refused():
@@ -358,20 +360,20 @@ def test_an_expanded_import_set_without_its_coverage_is_refused(x64_baseline):
     assert hit["import_present"] is None
 
 
-# the entry points to each covered syscall, second-order ones included, as far as the audit found them
+# the doors to each covered syscall: APIs whose contract performs that syscall's operation on operands the caller
+# supplies, not every API that reaches it on its way
 DOORS = {
     "NtAllocateVirtualMemory": {"VirtualAlloc", "VirtualAllocEx", "VirtualAllocFromApp", "VirtualAllocExNuma"},
-    "NtWriteVirtualMemory": {"WriteProcessMemory", "RtlRemoteCall"},
-    "NtProtectVirtualMemory": {"VirtualProtect", "VirtualProtectEx", "VirtualProtectFromApp", "WriteProcessMemory",
-                               "LoadLibraryA", "LoadLibraryW", "LoadLibraryExA", "LoadLibraryExW", "LdrLoadDll"},
+    "NtWriteVirtualMemory": {"WriteProcessMemory"},
+    "NtProtectVirtualMemory": {"VirtualProtect", "VirtualProtectEx", "VirtualProtectFromApp"},
     "NtCreateThreadEx": {"CreateThread", "CreateRemoteThread", "CreateRemoteThreadEx", "RtlCreateUserThread",
                          "_beginthreadex", "_beginthread", "DbgUiIssueRemoteBreakin", "DebugBreakProcess"},
-    "NtQueueApcThread": {"QueueUserAPC"},
+    "NtQueueApcThread": {"QueueUserAPC", "RtlQueueApcWow64Thread"},
     "NtSetContextThread": {"SetThreadContext", "RtlRemoteCall"},
     "NtUnmapViewOfSection": {"UnmapViewOfFile", "ZwUnmapViewOfSection", "FreeLibrary", "FreeLibraryAndExitThread",
-                             "LdrUnloadDll", "WriteProcessMemory"},
+                             "LdrUnloadDll"},
     "NtAdjustPrivilegesToken": {"AdjustTokenPrivileges", "RtlAdjustPrivilege"},
-    "NtOpenProcessToken": {"OpenProcessToken", "RtlAdjustPrivilege", "RtlImpersonateSelf", "ImpersonateSelf"},
+    "NtOpenProcessToken": {"OpenProcessToken"},
 }
 
 
@@ -388,3 +390,17 @@ def test_a_wrapper_that_reaches_the_ex_syscall_is_no_door_to_the_plain_one():
     table = win32_to_nt.load_table()
     for name in ("UnmapViewOfFileEx", "UnmapViewOfFile2", "VirtualAlloc2", "QueueUserAPC2"):
         assert table.nt_for(name) is None, name
+
+
+def test_an_api_that_reaches_a_covered_syscall_only_on_its_own_behalf_is_no_door():
+    # the heap commits through NtAllocateVirtualMemory and the loader reprotects the import table, but the caller
+    # names neither address, protection nor process: a door would erase the proof for nearly every program
+    table = win32_to_nt.load_table()
+    for name in ("HeapAlloc", "HeapCreate", "RtlAllocateHeap", "LocalAlloc", "GlobalAlloc", "malloc",
+                 "LoadLibraryA", "LoadLibraryW", "LoadLibraryExW", "LdrLoadDll",
+                 "ImpersonateSelf", "RtlImpersonateSelf", "CheckTokenMembership"):
+        assert table.entries_for(name) == (), name
+    # one row each: what the caller directs, not what the implementation touches on the way
+    assert [e.nt for e in table.entries_for("WriteProcessMemory")] == ["NtWriteVirtualMemory"]
+    assert [e.nt for e in table.entries_for("RtlRemoteCall")] == ["NtSetContextThread"]
+    assert [e.nt for e in table.entries_for("RtlAdjustPrivilege")] == ["NtAdjustPrivilegesToken"]

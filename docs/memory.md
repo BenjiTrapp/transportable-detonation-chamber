@@ -198,9 +198,10 @@ call needs the chain from the Win32 function to its Nt counterpart: a sample tha
 calls `VirtualAllocEx` never imports `NtAllocateVirtualMemory`. The chamber holds
 that chain in `webui/win32_to_nt.json`, each row with the source it was read from.
 The APIs it already calls suspicious decide which syscalls the table covers; for a
-covered syscall it lists every door, suspicious or not, and a function that issues
-several covered syscalls on its way (`WriteProcessMemory` also reprotects the page)
-has a row for each. A stub whose function the sample does
+covered syscall it lists every door, suspicious or not. A door is an API whose
+contract performs that syscall's operation on operands the caller supplies: the heap
+commits memory and the loader reprotects an import table, but their callers name no
+address, protection or process, so neither is a door. A stub whose function the sample does
 not import, by its import table widened through that table, is a proven bypass
 (`import_present` `false`); one it imports as well is a hint (`true`). Outside the
 table `import_present` stays `null`, and so does every hit when the import table

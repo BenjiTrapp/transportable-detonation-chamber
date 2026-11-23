@@ -536,8 +536,10 @@ mitgebrachten Stub daher nie sähe.
   bevor sie etwas über ein Fehlen sagen darf. Fehlt der Funktion eines Stubs dann
   jeder Weg, ist die Umgehung belegt (`import_present` False). Welche Syscalls die
   Tabelle abdeckt, begrenzen die APIs, die TDC schon als verdächtig führt; zu einem
-  abgedeckten Syscall nennt sie jede Tür, auch eine unverdächtige, und eine Funktion,
-  die unterwegs mehrere abgedeckte Syscalls absetzt, hat je eine Zeile. Für einen
+  abgedeckten Syscall nennt sie jede Tür, auch eine unverdächtige. Eine Tür ist eine
+  API, deren Vertrag die Operation dieses Syscalls auf Operanden des Aufrufers
+  ausführt, nicht jede API, die ihn unterwegs erreicht: der Heap und der Loader sind
+  keine Tür, denn ihr Aufrufer nennt weder Adresse noch Schutz noch Prozess. Für einen
   Syscall, zu dem keine
   kuratierte Zeile führt, bleibt `import_present` **unbekannt** und der Treffer ein
   Hinweis — ebenso, wenn die Importtabelle nicht lesbar ist. Ein Befund darf nie

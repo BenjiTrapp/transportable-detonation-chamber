@@ -9,9 +9,11 @@ The table is not a Win32 dictionary. Whether a syscall is covered at all is boun
 the functions TDC already calls suspicious: a syscall enters `covered` only through a row
 whose own Win32 function or Nt counterpart is one of them. Once a syscall is covered, every
 door to it is listed, suspicious or not, because a missing door would make the claim
-false. A function may lead to several syscalls, one row each: `WriteProcessMemory` issues
-`NtProtectVirtualMemory` on its way to `NtWriteVirtualMemory`. A function with no direct
-Nt counterpart has no row. An absence is claimed only for a syscall some row leads to
+false. A door is an API whose contract performs that syscall's operation on operands the
+caller supplies, not any API that reaches it on its way: the heap commits through
+`NtAllocateVirtualMemory` and the loader reprotects an import table, but their callers name
+no address, protection or process, so neither is a door. A door may lead to several
+syscalls, one row each. A function with no direct Nt counterpart has no row. An absence is claimed only for a syscall some row leads to
 (`covered`): for any other the table does not know the Win32 functions that reach it.
 
 A proof assumes the table names the documented entry points to that syscall. An uncommon
