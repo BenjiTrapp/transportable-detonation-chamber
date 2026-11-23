@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import mmap
 import os
+import struct
 from dataclasses import dataclass
 
 MACHINES = {0xAA64: "arm64", 0x8664: "x64", 0x14C: "x86"}
+API_SET_SCHEMA_PATH = r"C:\Windows\System32\apisetschema.dll"
 MAX_BINARY_SIZE = 512 * 2**20          # System32's largest image is a fraction of this; a sample may not be
 
 # every reason a file is skipped for: fixed strings of our own, so they can be counted and grouped. Never a library's,
@@ -186,3 +188,90 @@ def extract_tree(directory: str) -> tuple[list[BinaryInfo], list[tuple[str, str]
         except ExtractError as exc:
             skipped.append((name, str(exc)))
     return binaries, skipped
+
+
+# The ApiSetMap, version 6 (Windows 10 and 11), in the `.apiset` section of apisetschema.dll. Every offset counts from
+# the base of the map, every name is UTF-16LE and every length is in bytes; none of it is Microsoft-documented
+_API_SET_VERSION = 6
+_API_SET_HEADER = struct.Struct("<7I")      # Version, Size, Flags, Count, EntryOffset, HashOffset, HashFactor
+_API_SET_ENTRY = struct.Struct("<6I")       # Flags, NameOffset, NameLength, HashedLength, ValueOffset, ValueCount
+_API_SET_VALUE = struct.Struct("<5I")       # Flags, NameOffset, NameLength, ValueOffset, ValueLength
+
+
+def _api_set_text(data, offset, length):
+    """The UTF-16LE text at `offset`, or None when it is not wholly inside the map, not whole characters or not text."""
+    if length % 2 or offset + length > len(data):
+        return None
+    try:
+        return bytes(data[offset:offset + length]).decode("utf-16-le")
+    except UnicodeDecodeError:
+        return None
+
+
+def _api_set_hosts(data, offset, count):
+    """The host modules of one entry in the map's order, or None when any value of it is unreadable: a chain with
+    a host left out would resolve to the wrong module, so the entry goes whole."""
+    end = offset + _API_SET_VALUE.size * count
+    if not count or end > len(data):
+        return None
+    hosts = []
+    for _, name_at, name_len, host_at, host_len in _API_SET_VALUE.iter_unpack(bytes(data[offset:end])):
+        # the name of the importer this value is for (usually empty) is not used, but it must lie inside the map too
+        if name_len and _api_set_text(data, name_at, name_len) is None:
+            return None
+        host = _api_set_text(data, host_at, host_len)
+        if host is None:
+            return None
+        if host:
+            hosts.append(host)
+    return tuple(hosts) or None
+
+
+def parse_api_set_map(data: bytes) -> dict[str, tuple[str, ...]]:
+    """alias (lower case, without ".dll") -> its host modules in the map's order, as the map names them.
+
+    The hash table is not read: walking the entries is cheap. An unknown version gives an empty map. Every offset and
+    length is hostile: an entry that does not lie wholly inside `data` is dropped and the others are kept. Nothing
+    raises. Size from the header is not trusted either; the bounds are those of `data`."""
+    if len(data) < _API_SET_HEADER.size:
+        return {}
+    version, _, _, count, entry_offset, _, _ = _API_SET_HEADER.unpack_from(data)
+    if version != _API_SET_VERSION:
+        return {}
+    count = min(count, max(0, len(data) - entry_offset) // _API_SET_ENTRY.size)
+    aliases = {}
+    for index in range(count):
+        _, name_at, name_len, _, value_at, value_count = _API_SET_ENTRY.unpack_from(
+            data, entry_offset + _API_SET_ENTRY.size * index)
+        alias = _api_set_text(data, name_at, name_len)
+        hosts = _api_set_hosts(data, value_at, value_count)
+        if alias is None or hosts is None:
+            continue
+        alias = alias.lower()
+        if alias.endswith(".dll"):
+            alias = alias[:-len(".dll")]
+        if alias:
+            aliases.setdefault(alias, hosts)
+    return aliases
+
+
+def load_api_set_map(path: str) -> dict[str, tuple[str, ...]]:
+    """The map in the `.apiset` section of the schema DLL at `path`; empty when the file, pefile or the section is
+    missing, or the file is not one this can read. A graph without api-set resolution is degraded, not broken."""
+    try:
+        import pefile
+        with open(path, "rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
+            if not 0 < size <= MAX_BINARY_SIZE:
+                return {}
+            with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as image:
+                pe = pefile.PE(data=image, fast_load=True)
+                try:
+                    for section in pe.sections:
+                        if section.Name.rstrip(b"\0") == b".apiset":
+                            return parse_api_set_map(section.get_data())
+                finally:
+                    pe.close()
+    except Exception:
+        return {}
+    return {}

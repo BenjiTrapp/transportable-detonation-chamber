@@ -790,3 +790,252 @@ def test_every_skip_reason_is_a_fixed_string_of_the_vocabulary():
     literals.discard(ast.get_docstring(tree_fn, clean=False))
     assert {"cannot be listed", "the same name in another case"} <= literals <= set(binary_graph.REASONS) | {
         ".dll", ".exe"}
+
+
+# --- the ApiSetMap: api-ms-win-* names, which no file on disk carries ---------------------------
+
+_API_SET_HEADER, _API_SET_ENTRY, _API_SET_VALUE = 28, 24, 20     # bytes; the entries start right behind the header
+
+
+def _api_set_map(mapping, version=6):
+    """A version-6 ApiSetMap: alias -> hosts. A host is a module name, or an (importing module, host) pair.
+
+    Header (u32 x 7): Version, Size, Flags, Count, EntryOffset, HashOffset, HashFactor.
+    Entry  (u32 x 6, from EntryOffset): Flags, NameOffset, NameLength, HashedLength, ValueOffset, ValueCount.
+    Value  (u32 x 5, from the entry's ValueOffset): Flags, NameOffset, NameLength, ValueOffset, ValueLength.
+    Every offset counts from the base of the map, every name is UTF-16LE and every length is in bytes. Behind the
+    header come the entries, then the hash table (8 bytes an entry, never read), then the value arrays, then the
+    names; entry i sits at _API_SET_HEADER + _API_SET_ENTRY * i."""
+    import struct
+    n = len(mapping)
+    hash_at = _API_SET_HEADER + _API_SET_ENTRY * n
+    values_at = hash_at + 8 * n
+    names_at = values_at + _API_SET_VALUE * sum(len(hosts) for hosts in mapping.values())
+    names = bytearray()
+
+    def name(text):
+        raw = text.encode("utf-16-le")
+        offset = names_at + len(names)
+        names.extend(raw)
+        return offset, len(raw)
+
+    entries, values, hashes = b"", b"", b""
+    for index, (alias, hosts) in enumerate(mapping.items()):
+        alias_at, alias_len = name(alias)
+        entries += struct.pack("<6I", 0, alias_at, alias_len, alias_len - 2 * len("-1-0"),
+                               values_at + len(values), len(hosts))
+        hashes += struct.pack("<2I", 0, index)
+        for host in hosts:
+            importer, module = host if isinstance(host, tuple) else ("", host)
+            (importer_at, importer_len), (module_at, module_len) = name(importer), name(module)
+            values += struct.pack("<5I", 0, importer_at, importer_len, module_at, module_len)
+    size = names_at + len(names)
+    return struct.pack("<7I", version, size, 0, n, _API_SET_HEADER, hash_at, 31) + entries + hashes + values + bytes(names)
+
+
+def test_an_api_set_alias_resolves_to_its_host_modules_in_order():
+    data = _api_set_map({"api-ms-win-core-memory-l1-1-0": ("kernelbase.dll", "kernel32.dll")})
+    assert binary_graph.parse_api_set_map(data)["api-ms-win-core-memory-l1-1-0"] == ("kernelbase.dll", "kernel32.dll")
+
+
+def test_the_packer_lays_the_map_out_as_the_version_6_table_says():
+    # the packer is what every other test of the map stands on: pin its bytes once, field by field
+    import struct
+    data = _api_set_map({"api-x-1-0": ("a.dll",), "api-y-1-0": ("b.dll", "c.dll")})
+    assert struct.unpack_from("<7I", data) == (6, len(data), 0, 2, 28, 28 + 2 * 24, 31)
+    flags, name_at, name_len, hashed_len, value_at, value_count = struct.unpack_from("<6I", data, 28 + 24)
+    assert (flags, name_len, hashed_len, value_count) == (0, 2 * len("api-y-1-0"), 2 * len("api-y"), 2)
+    assert data[name_at:name_at + name_len].decode("utf-16-le") == "api-y-1-0"
+    _, _, _, host_at, host_len = struct.unpack_from("<5I", data, value_at + 20)
+    assert data[host_at:host_at + host_len].decode("utf-16-le") == "c.dll"
+
+
+def test_several_aliases_and_a_host_that_is_the_same_for_all_come_back_whole():
+    mapping = {"api-ms-win-core-file-l1-1-0": ("kernelbase.dll",), "api-ms-win-core-heap-l1-1-0": ("kernelbase.dll",),
+               "ext-ms-win-gdi-dc-l1-1-0": ("gdi32full.dll", "win32u.dll")}
+    assert binary_graph.parse_api_set_map(_api_set_map(mapping)) == mapping
+
+
+def test_the_name_an_importer_is_matched_by_does_not_become_a_host():
+    data = _api_set_map({"api-ms-win-x-l1-1-0": (("kernel32.dll", "kernelbase.dll"), "ntdll.dll")})
+    assert binary_graph.parse_api_set_map(data) == {"api-ms-win-x-l1-1-0": ("kernelbase.dll", "ntdll.dll")}
+
+
+def _schema_dll(tmp_path, data, section=".apiset", name="apisetschema.dll"):
+    path = tmp_path / name
+    path.write_bytes(make_pe(dll=True, sections=((section, data),)))
+    return str(path)
+
+
+def test_the_map_is_read_from_the_apiset_section_of_the_schema_dll(tmp_path):
+    mapping = {"api-ms-win-core-memory-l1-1-0": ("kernelbase.dll", "kernel32.dll"),
+               "api-ms-win-core-heap-l1-1-0": ("kernelbase.dll",)}
+    assert binary_graph.load_api_set_map(_schema_dll(tmp_path, _api_set_map(mapping))) == mapping
+    assert binary_graph.API_SET_SCHEMA_PATH == r"C:\Windows\System32\apisetschema.dll"
+
+
+def test_an_alias_is_stored_without_its_dll_suffix_and_in_lower_case():
+    data = _api_set_map({"API-MS-Win-Core-Memory-L1-1-0.DLL": ("KernelBase.dll",), "api-ms-win-core-heap-l1-1-0": ("kernelbase.dll",)})
+    parsed = binary_graph.parse_api_set_map(data)
+    assert set(parsed) == {"api-ms-win-core-memory-l1-1-0", "api-ms-win-core-heap-l1-1-0"}
+    assert parsed["api-ms-win-core-memory-l1-1-0"] == ("KernelBase.dll",)          # a host is what the map says
+
+
+def _patched(data, at, *values):
+    import struct
+    out = bytearray(data)
+    struct.pack_into(f"<{len(values)}I", out, at, *values)
+    return bytes(out)
+
+
+_ENTRY_0 = _API_SET_HEADER                                      # where the packer puts the first entry
+_ENTRY_1 = _API_SET_HEADER + _API_SET_ENTRY
+_VALUES = _API_SET_HEADER + 2 * (_API_SET_ENTRY + 8)           # past two entries and their hash rows: the value arrays
+
+
+def _two_aliases():
+    return _api_set_map({"api-first-l1-1-0": ("kernelbase.dll",), "api-second-l1-1-0": ("ntdll.dll", "kernel32.dll")})
+
+
+@pytest.mark.parametrize("what, at, values", [
+    ("a name before the map", _ENTRY_0 + 4, (0xFFFFFFF0,)),
+    ("a name that begins inside the map and ends outside it", _ENTRY_0 + 8, (0x7FFFFFFF,)),
+    ("a name length past the end", _ENTRY_0 + 4, (10_000, 4)),
+    ("a value array outside the map", _ENTRY_0 + 16, (0xFFFFFFFF, 1)),
+    ("more values than fit in the map", _ENTRY_0 + 20, (0x10000000,)),
+    ("a value array that begins in the map and runs out of it", _ENTRY_0 + 20, (400,)),
+    ("a name length that is not whole UTF-16 characters", _ENTRY_0 + 8, (7,)),
+    ("an entry with no value at all", _ENTRY_0 + 20, (0,)),
+    ("a host past the end of the map", _VALUES + 12, (0xFFFFFF00, 8)),
+])
+def test_an_entry_whose_offsets_point_outside_the_map_is_dropped_and_the_rest_survives(what, at, values):
+    data = _patched(_two_aliases(), at, *values)
+    parsed = binary_graph.parse_api_set_map(data)
+    assert parsed.get("api-second-l1-1-0") == ("ntdll.dll", "kernel32.dll"), what
+    assert "api-first-l1-1-0" not in parsed, what
+
+
+def test_a_value_with_a_bad_host_takes_its_whole_entry_with_it_rather_than_shortening_the_chain():
+    # the loader tries the hosts in order: an entry without its first host would resolve to the wrong module
+    data = _two_aliases()
+    data = _patched(data, _VALUES + _API_SET_VALUE + 12, 0xFFFFFF00, 8)      # the second value of the second entry
+    parsed = binary_graph.parse_api_set_map(data)
+    assert "api-second-l1-1-0" not in parsed and parsed["api-first-l1-1-0"] == ("kernelbase.dll",)
+
+
+def test_an_importer_name_that_points_outside_the_map_drops_its_entry_too():
+    data = _two_aliases()
+    parsed = binary_graph.parse_api_set_map(_patched(data, _VALUES + 4, 0xFFFFFF00, 8))
+    assert set(parsed) == {"api-second-l1-1-0"}
+
+
+def test_an_entry_count_larger_than_the_map_can_hold_reads_what_is_there_and_does_not_hang():
+    import time
+    data = _patched(_two_aliases(), 12, 0xFFFFFFFF)                     # Count
+    started = time.monotonic()
+    parsed = binary_graph.parse_api_set_map(data)
+    assert time.monotonic() - started < 1
+    assert parsed["api-second-l1-1-0"] == ("ntdll.dll", "kernel32.dll")
+
+
+def test_an_entry_table_that_starts_outside_the_map_gives_an_empty_map():
+    assert binary_graph.parse_api_set_map(_patched(_two_aliases(), 16, 0xFFFFFFFF)) == {}
+
+
+def test_a_name_that_is_not_valid_utf16_or_is_empty_drops_its_entry():
+    data = _api_set_map({"api-first-l1-1-0": ("kernelbase.dll",), "api-second-l1-1-0": ("ntdll.dll",),
+                         "api-third-l1-1-0": ("kernel32.dll",)})
+    import struct
+    name_at = struct.unpack_from("<I", data, _ENTRY_0 + 4)[0]
+    broken = bytearray(data)
+    broken[name_at:name_at + 2] = b"\x00\xd8"                           # a lone high surrogate
+    assert set(binary_graph.parse_api_set_map(bytes(broken))) == {"api-second-l1-1-0", "api-third-l1-1-0"}
+    assert set(binary_graph.parse_api_set_map(_patched(data, _ENTRY_1 + 8, 0))) == {"api-first-l1-1-0", "api-third-l1-1-0"}
+
+
+def test_an_empty_host_is_not_a_host():
+    data = _api_set_map({"ext-ms-win-gone-l1-1-0": ("",), "api-ms-win-part-l1-1-0": ("", "kernelbase.dll")})
+    assert binary_graph.parse_api_set_map(data) == {"api-ms-win-part-l1-1-0": ("kernelbase.dll",)}
+
+
+def test_an_alias_named_twice_keeps_the_first():
+    data = _api_set_map({"api-a-l1-1-0": ("one.dll",), "API-A-L1-1-0.dll": ("two.dll",)})
+    assert binary_graph.parse_api_set_map(data) == {"api-a-l1-1-0": ("one.dll",)}
+
+
+@pytest.mark.parametrize("version", [0, 1, 2, 3, 4, 5, 7, 0xFFFFFFFF])
+def test_an_unknown_api_set_version_gives_an_empty_map_instead_of_raising(version):
+    assert binary_graph.parse_api_set_map(_api_set_map({"api-a-l1-1-0": ("one.dll",)}, version=version)) == {}
+
+
+@pytest.mark.parametrize("data", [b"", b"\x06", b"\x06\x00\x00\x00", bytes(27), bytes(28), b"MZ" + bytes(100)])
+def test_bytes_too_short_or_empty_to_be_a_map_give_an_empty_map(data):
+    assert binary_graph.parse_api_set_map(data) == {}
+
+
+def test_a_map_cut_off_in_the_middle_keeps_the_aliases_before_the_cut():
+    data = _api_set_map({"api-first-l1-1-0": ("kernelbase.dll",), "api-second-l1-1-0": ("ntdll.dll",)})
+    for cut in range(len(data)):
+        parsed = binary_graph.parse_api_set_map(data[:cut])               # never raises, whatever the cut
+        assert set(parsed) <= {"api-first-l1-1-0", "api-second-l1-1-0"}
+    assert binary_graph.parse_api_set_map(data[:-2]) == {"api-first-l1-1-0": ("kernelbase.dll",)}
+
+
+def test_every_single_byte_of_the_map_overwritten_never_raises():
+    data = _api_set_map({"api-first-l1-1-0": ("kernelbase.dll",), "api-second-l1-1-0": ("ntdll.dll", "kernel32.dll")})
+    for at in range(len(data)):
+        for byte in (0x00, 0xFF, 0x80, 0x01):
+            result = binary_graph.parse_api_set_map(data[:at] + bytes([byte]) + data[at + 1:])
+            assert isinstance(result, dict)
+            assert all(isinstance(hosts, tuple) and hosts for hosts in result.values())
+
+
+def test_a_missing_schema_dll_gives_an_empty_map(tmp_path):
+    assert binary_graph.load_api_set_map(str(tmp_path / "apisetschema.dll")) == {}
+    assert binary_graph.load_api_set_map(str(tmp_path)) == {}                      # a directory is not a file either
+
+
+def test_a_schema_dll_without_an_apiset_section_gives_an_empty_map(tmp_path):
+    path = tmp_path / "apisetschema.dll"
+    path.write_bytes(make_pe(dll=True, imports=(("ntdll.dll", ("NtClose",)),)))
+    assert binary_graph.load_api_set_map(str(path)) == {}
+    assert binary_graph.load_api_set_map(_schema_dll(tmp_path, _api_set_map({"api-a-l1-1-0": ("one.dll",)}), section=".rdata")) == {}
+
+
+def test_a_schema_dll_that_is_not_a_pe_or_is_empty_gives_an_empty_map(tmp_path):
+    for content in (b"", b"not a pe at all", b"MZ" + bytes(20)):
+        (tmp_path / "apisetschema.dll").write_bytes(content)
+        assert binary_graph.load_api_set_map(str(tmp_path / "apisetschema.dll")) == {}
+
+
+def test_a_schema_dll_whose_apiset_section_is_not_a_map_gives_an_empty_map(tmp_path):
+    assert binary_graph.load_api_set_map(_schema_dll(tmp_path, b"garbage" * 40)) == {}
+    assert binary_graph.load_api_set_map(_schema_dll(tmp_path, _api_set_map({"a-l1-1-0": ("x.dll",)}, version=4))) == {}
+
+
+def test_a_schema_dll_without_pefile_gives_an_empty_map(tmp_path, monkeypatch):
+    import builtins
+    real = builtins.__import__
+
+    def refuse(name, *args, **kwargs):
+        if name == "pefile":
+            raise ImportError(name)
+        return real(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", refuse)
+    assert binary_graph.load_api_set_map(_schema_dll(tmp_path, _api_set_map({"a-l1-1-0": ("x.dll",)}))) == {}
+
+
+def test_a_schema_dll_that_is_larger_than_the_cap_is_not_read(tmp_path, monkeypatch):
+    path = _schema_dll(tmp_path, _api_set_map({"a-l1-1-0": ("x.dll",)}))
+    monkeypatch.setattr(binary_graph, "MAX_BINARY_SIZE", 100)
+    assert binary_graph.load_api_set_map(path) == {}
+
+
+def test_the_schema_dll_is_closed_whatever_its_map_looks_like(tmp_path, monkeypatch):
+    import pefile
+    closed = []
+    real_close = pefile.PE.close
+    monkeypatch.setattr(pefile.PE, "close", lambda self: (closed.append(1), real_close(self))[1])
+    binary_graph.load_api_set_map(_schema_dll(tmp_path, b"garbage" * 40))
+    binary_graph.load_api_set_map(_schema_dll(tmp_path, _api_set_map({"a-l1-1-0": ("x.dll",)})))
+    assert len(closed) == 2
