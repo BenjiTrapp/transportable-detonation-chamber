@@ -134,8 +134,14 @@ first target is private and its bytes are one of the known jump forms, the scan
 follows it, up to two hops, and judges the stub by the **final** owner; the
 relays it passed are listed with the stub. The ARM64 forms take any register:
 `LDR Xn, literal; BR Xn`, `ADRP; ADD; BR` and `ADRP Xn; LDR Xt, [Xn, #imm];
-BR Xt`, which is what Detours writes, with x17. On x64 the 14-byte
-`PUSH imm32; MOV DWORD [RSP+4], imm32; RET` is known as well. Private code that is no jump is the
+BR Xt`, which is what Detours writes, with x17, and `MOVZ` with up to three
+`MOVK` and a branch; each may end in a pointer-authenticated branch (`BRAA`,
+`BRAB`, `BRAAZ`, `BRABZ`), followed to the address below its PAC. On x64 the
+14-byte `PUSH imm32; MOV DWORD [RSP+4], imm32; RET` is known as well. The
+decoder is not exhaustive: a private relay in a form it does not know is read as
+code that is no jump, so `patched`. That is deliberate, since the other way round
+any code the decoder does not know would score nothing; what remains is a false
+positive on an unknown hooking form, never a false negative on malware. Private code that is no jump is the
 code that runs, and stays `patched`; so does a chain that is still in private
 memory after two hops. A relay that cannot be read, or whose target cannot be
 looked up, is not guessed past: the stub is `diverged` and counts as a failed

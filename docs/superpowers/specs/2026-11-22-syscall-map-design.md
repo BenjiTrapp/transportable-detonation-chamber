@@ -141,7 +141,7 @@ Neues Modul `webui/syscall_scan.py`, reines ctypes, kein zusätzliches Binary.
 - `EnumProcessModulesEx(…, LIST_MODULES_ALL)` und `GetModuleFileNameExW` liefern
   die geladenen Module mit Basisadresse und Größe. Daraus die Basis von
   `ntdll.dll`, und, wenn vorhanden, `win32u.dll`.
-- Für jeden Syscall der Baseline die Bytes an `base + rva` lesen, und zwar so viele, wie die Sicht zur Erkennung braucht — auf ARM64 mehr als zum Vergleich, weil ein Hook der Form `ADRP; ADD; BR` erst in 12 Byte erkennbar ist.
+- Für jeden Syscall der Baseline die Bytes an `base + rva` lesen, und zwar so viele, wie die Sicht zur Erkennung braucht — auf ARM64 mehr als zum Vergleich, weil ein Hook der Form `ADRP; ADD; BR` erst in 12 Byte und `MOVZ` mit drei `MOVK` und Sprung erst in 20 Byte erkennbar ist.
 - **Den Eigentümer des Sprungziels in zwei Schritten bestimmen.** Folgt die Zieladresse direkt aus den Bytes (relativer Sprung oder eingebettete absolute Adresse), wird sie damit erfragt. Liest die Hook-Form ihr Ziel erst aus dem Speicher (`FF 25` auf x64, `LDR`+`BR` und `ADRP`+`LDR`+`BR` auf ARM64), ist aus den Bytes nur die Adresse des **Zeigers** bestimmbar; dort wird das Zeigerwort gelesen und erst dessen Ziel nach dem Eigentümer gefragt. Ohne diesen zweiten Schritt käme die häufigste EDR-Hook-Form immer als `diverged` durch, und `hooked` wäre für den Normalfall unerreichbar — womit die Trennung aus Ziel 4 ihren Zweck verlöre.
 - **Nur das Stub-Präfix vergleichen, nicht NTSleuths ganzes Fenster.**
   `stub_bytes` ist ein festes 32-Byte-Fenster, das über die Funktion
@@ -204,6 +204,14 @@ gehört**, nicht das Befehlsmuster:
   Speicher steht. Ist ein Relay nicht lesbar oder sein Ziel nicht erfragbar,
   wird nicht geraten: der Stub ist `diverged` und zählt als fehlgeschlagene
   Eigentümer-Abfrage.
+- **Der Decoder ist nicht vollständig.** Ein privates Relay, dessen Sprungform
+  er nicht kennt, gilt als „privater Code, der kein Sprung ist", also
+  `patched`. Diese Richtung ist gewollt und wird hier ausgesprochen: Unbekannten
+  privaten Code stattdessen nicht zu werten, gäbe Malware einen freien Ausgang
+  — sie schriebe Code, den der Decoder nicht kennt, und nichts zählte. Der Rest
+  ist daher ein **falsch positiver Befund bei einer unbekannten Hook-Form, nie
+  ein falsch negativer bei Malware.** Jede neue, in der Praxis gesehene Form
+  erweitert den Decoder; die Regel ändert sie nicht.
 - Zeigt es **direkt** in `ntdll` selbst oder in das Modul des Stubs, heißt das
   `diverged`: `hooked` ist für ein fremdes, dateigedecktes Modul reserviert und
   `patched` für privaten Speicher. Ein modulinterner Sprung — oder ein Fehler
@@ -254,7 +262,12 @@ Die Befehlsmuster sind **pro Architektur** zu prüfen:
 - **ARM64:** Der saubere Stub ist `SVC #imm` gefolgt von `RET`, in NTSleuths
   Ausgabe etwa `01 18 00 d4 c0 03 5f d6`. Hook-Muster: ein unbedingtes `B`
   (Opcode-Maske `0x14000000`), `LDR Xn, literal` + `BR Xn` für jedes Register
-  n, `ADRP` + `ADD` + `BR` und `ADRP Xn` + `LDR Xt, [Xn, #imm]` + `BR Xt`.
+  n, `ADRP` + `ADD` + `BR`, `ADRP Xn` + `LDR Xt, [Xn, #imm]` + `BR Xt` und
+  `MOVZ Xn` mit bis zu drei `MOVK Xn` + `BR Xn`. Statt `BR` darf jede dieser
+  Formen mit einem Sprung mit Zeiger-Authentifizierung enden (`BRAA`, `BRAB`,
+  `BRAAZ`, `BRABZ`), den Windows auf ARM64 verwendet; gefragt wird dann nach der
+  Adresse ohne die PAC-Bits darüber. `BLR` ist keine Sprungform: es ist ein
+  Aufruf, und ein Relay, das aufruft, kehrte nicht durch den Stub zurück.
   Das Register ist nicht fest: Der übliche EDR-Hook nimmt x16, Microsoft
   Detours x17 für beide Formen (`LDR x17, #8; BR x17` und
   `ADRP x17; LDR x17, [x17, #off]; BR x17`). Ein Relay in einer dieser Formen

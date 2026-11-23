@@ -17,8 +17,8 @@ from typing import NamedTuple
 
 from syscall_baseline import (READ_LEN, STATE_DIVERGED, STATE_HOOKED, STATE_INTACT,
                               STATE_PATCHED, STATE_UNREADABLE, NON_MODULE_OWNERS, OWNER_MAPPED,
-                              OWNER_PRIVATE, Baseline, Syscall, classify_stub, jump_pattern,
-                              jump_pointer, jump_target)
+                              OWNER_PRIVATE, Baseline, Syscall, classify_stub, jump_authenticated,
+                              jump_pattern, jump_pointer, jump_target, strip_pointer_auth)
 
 MEM_COMMIT = 0x1000
 MEM_IMAGE = 0x1000000
@@ -165,7 +165,9 @@ def _resolve_jump(reader: ProcessReader, code: bytes, addr: int,
     word = _read_exact(reader, pointer, _POINTER_LEN[view])
     if word is None:
         return None, True
-    return int.from_bytes(word, "little"), False
+    value = int.from_bytes(word, "little")
+    # a pointer-authenticated branch goes to the address below the PAC, not to the signed value
+    return (strip_pointer_auth(value) if jump_authenticated(code, view) else value), False
 
 
 def _lookup_owner(reader: ProcessReader, addr: int) -> tuple[str | None, bool]:
@@ -180,6 +182,12 @@ def _lookup_owner(reader: ProcessReader, addr: int) -> tuple[str | None, bool]:
 # necessity, a `B` reaching no further than 128 MB. Judged by its first hop, every EDR, overlay and browser sandbox
 # that hooks this way would read as patched. Two hops cover a relay and a relay of a relay; a chain that is still in
 # private memory after them has no module to explain it.
+#
+# The decoder is not exhaustive. An undecodable private relay is read as private code that is not a jump and classified
+# patched. That direction is deliberate: read as unscored instead, undecodable private code would hand malware a free
+# exit, any code the decoder does not know scoring nothing. So what remains is a false positive on a hooking form not
+# yet known, never a false negative on malware. A new real-world form widens the decoder (`_X64_HOOKS`, `_ARM64_HOOKS`
+# in syscall_baseline); it does not change this rule.
 MAX_RELAY_HOPS = 2
 
 

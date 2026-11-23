@@ -591,6 +591,119 @@ def test_the_detours_forms_are_named(live, name):
     assert syscall_baseline.jump_pattern(live, "arm64") == name
 
 
+def _movz(rd, imm16, hw=0):
+    return 0xD2800000 | hw << 21 | imm16 << 5 | rd
+
+
+def _movk(rd, imm16, hw):
+    return 0xF2800000 | hw << 21 | imm16 << 5 | rd
+
+
+def _braa(rn, rm=16):
+    return 0xD71F0800 | rn << 5 | rm
+
+
+def _brab(rn, rm=16):
+    return 0xD71F0C00 | rn << 5 | rm
+
+
+def _braaz(rn):
+    return 0xD61F081F | rn << 5
+
+
+def _brabz(rn):
+    return 0xD61F0C1F | rn << 5
+
+
+_ADDR = 0x00007FFA12345678
+
+
+def _materialise(rd, value, halves=4):
+    """MOVZ <Xd> with the low half of `value`, then MOVK of the next `halves - 1` halves"""
+    return [_movz(rd, value & 0xFFFF)] + [_movk(rd, (value >> 16 * hw) & 0xFFFF, hw) for hw in range(1, halves)]
+
+
+@pytest.mark.parametrize("live,target", [
+    (_words(*_materialise(16, _ADDR), _br(16)), _ADDR),
+    (_words(*_materialise(9, _ADDR & 0xFFFFFFFFFFFF, 3), _br(9)), _ADDR & 0xFFFFFFFFFFFF),
+    (_words(*_materialise(17, 0x1234, 1), _br(17)), 0x1234),
+    # the halves may come in any order; each MOVK keeps the rest
+    (_words(_movz(16, 0x7FFA, 2), _movk(16, 0x5678, 0), _movk(16, 0x1234, 1), _br(16)), _ADDR),
+])
+def test_arm64_movz_movk_br_jumps_to_the_value_it_materialises(live, target):
+    assert syscall_baseline.jump_target(live, 0x1000, "arm64") == target
+    assert syscall_baseline.jump_pointer(live, 0x1000, "arm64") is None
+    assert syscall_baseline.jump_pattern(live, "arm64") == "MOVZ/MOVK; BR"
+
+
+@pytest.mark.parametrize("live", [
+    _words(*_materialise(16, _ADDR), _br(17)),                       # the branch takes another register
+    _words(_movz(16, 0x5678), _movk(17, 0x1234, 1), _br(16)),         # a MOVK of another register
+    _words(*_materialise(16, _ADDR)),                                # no branch within the read
+    _words(_movk(16, 0x5678, 0), _br(16)),                           # no MOVZ: the rest of the register is unknown
+    _words(0x52800010 | 0x5678 << 5, _br(16)),                       # MOVZ of a W register is no address
+])
+def test_arm64_movz_movk_needs_one_register_from_movz_to_branch(live):
+    assert syscall_baseline.jump_target(live, 0x1000, "arm64") is None
+    assert syscall_baseline.jump_pointer(live, 0x1000, "arm64") is None
+
+
+def test_the_read_covers_movz_three_movk_and_the_branch():
+    assert syscall_baseline.READ_LEN["arm64"] >= 20
+    live = _words(*_materialise(16, _ADDR), _br(16))
+    assert len(live) == 20 and syscall_baseline.jump_target(live[:syscall_baseline.READ_LEN["arm64"]], 0, "arm64") == _ADDR
+
+
+# Pointer authentication: the branch checks the PAC in the top bits of the register and branches to the address
+# below it, so what the owner is asked about is the pointer with those bits stripped
+_SIGNED = 0x003A_7FFA_1234_5678
+
+
+@pytest.mark.parametrize("branch,name", [
+    (_braa(17), "BRAA"), (_brab(17), "BRAB"), (_braaz(17), "BRAAZ"), (_brabz(17), "BRABZ"),
+])
+def test_arm64_pointer_authenticated_branches_end_every_form(branch, name):
+    ldr = _words(_ldr_literal(17, 2), branch)
+    adrp_ldr = _words(_adrp(17, 3), _ldr_imm(17, 17, 0x28), branch)
+    adrp_add = _words(_adrp(17, 2), _add(17, 17, 0x123), branch)
+    movz = _words(*_materialise(17, _SIGNED), branch)
+    assert syscall_baseline.jump_pattern(ldr, "arm64") == "LDR; " + name
+    assert syscall_baseline.jump_pointer(ldr, 0x1000, "arm64") == 0x1008
+    assert syscall_baseline.jump_pattern(adrp_ldr, "arm64") == "ADRP; LDR; " + name
+    assert syscall_baseline.jump_pointer(adrp_ldr, 0x50000FF0, "arm64") == 0x50003028
+    assert syscall_baseline.jump_pattern(adrp_add, "arm64") == "ADRP; ADD; " + name
+    assert syscall_baseline.jump_target(adrp_add, 0x50000FF0, "arm64") == 0x50002123
+    assert syscall_baseline.jump_pattern(movz, "arm64") == "MOVZ/MOVK; " + name
+    assert syscall_baseline.jump_target(movz, 0x1000, "arm64") == 0x7FFA12345678
+    for live in (ldr, adrp_ldr, adrp_add, movz):
+        assert syscall_baseline.jump_authenticated(live, "arm64") is True
+    assert syscall_baseline.jump_authenticated(_words(_ldr_literal(17, 2), _br(17)), "arm64") is False
+
+
+def test_the_plain_branch_strips_nothing_and_blr_is_no_jump():
+    assert syscall_baseline.jump_target(_words(*_materialise(16, _SIGNED), _br(16)), 0, "arm64") == _SIGNED
+    blr = 0xD63F0000 | 17 << 5
+    assert syscall_baseline.jump_pattern(_words(_ldr_literal(17, 2), blr), "arm64") is None
+
+
+def test_a_relay_through_a_signed_pointer_is_followed_to_the_address_below_its_pac(arm64_baseline):
+    reader = _arm64_b_to_relay(arm64_baseline)
+    signed = _EDR_TARGET | 0x0015 << 48
+    _private_code(reader, _RELAY, _words(_ldr_literal(17, 2), _braa(17)) + signed.to_bytes(8, "little"))
+    out = syscall_scan.measure(arm64_baseline, _with_edr_at_target(reader))
+    s = out["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["target_owner"]) == ("hooked", "edrhook.dll")
+    assert s["relay"] == [{"address": _RELAY, "owner": "private", "pattern": "LDR; BRAA"}]
+
+
+def test_a_relay_that_materialises_its_target_is_hooked(arm64_baseline):
+    reader = _arm64_b_to_relay(arm64_baseline)
+    _private_code(reader, _RELAY, _words(*_materialise(16, _EDR_TARGET), _br(16)))
+    s = syscall_scan.measure(arm64_baseline, _with_edr_at_target(reader))["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["target_owner"]) == ("hooked", "edrhook.dll")
+    assert s["relay"][0]["pattern"] == "MOVZ/MOVK; BR"
+
+
 def test_x64_push_mov_ret_jumps_to_the_address_its_two_halves_spell():
     # push imm32 (sign-extended); mov dword [rsp+4], imm32 (the upper half); ret: the 14-byte absolute jump
     live = bytes.fromhex("68" "44332211" "c7442404" "88776655" "c3") + b"\xcc" * 8
@@ -697,7 +810,7 @@ def test_an_unreadable_stub_carries_no_verdict_details():
 
 
 def test_read_len_covers_the_longest_arm64_hook_the_prefix_does_not():
-    assert syscall_baseline.READ_LEN == {"arm64": 16, "x64": 32, "x86": 16}
+    assert syscall_baseline.READ_LEN == {"arm64": 20, "x64": 32, "x86": 16}
     assert syscall_baseline.READ_LEN["arm64"] >= 12 > syscall_baseline.PREFIX_LEN["arm64"]
 
 
@@ -1123,7 +1236,8 @@ _RELAY2 = 0x7FF80F100000
 
 def _private_code(reader, addr, code):
     """`code` at `addr` in private memory of `reader`, found before any other range or region there."""
-    reader._ranges.insert(0, (addr, bytearray(code)))
+    # what follows the code is mapped too, as it is in a real allocation: a read of READ_LEN never runs off its end
+    reader._ranges.insert(0, (addr, bytearray(code) + bytearray(max(0, 0x40 - len(code)))))
     reader._regions.insert(0, (addr, max(len(code), 0x40), _PRIVATE))
     return reader
 
@@ -3881,6 +3995,8 @@ _HOOK_BYTES = {
         "LDR; BR": "50000058" "00021fd6",
         "ADRP; ADD; BR": "10000090" "10420091" "00021fd6",
         "ADRP; LDR; BR": "11000090" "312240f9" "20021fd6",
+        "MOVZ/MOVK; BR": "306488d2" "10cfaaf2" "00021fd6",
+        "LDR; BRAA": "51000058" "300a1fd7",
     },
 }
 

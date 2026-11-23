@@ -288,9 +288,10 @@ def _item(sc: Syscall) -> dict:
 PREFIX_LEN = {"arm64": 8, "x64": 32, "x86": 16}
 
 # Bytes to read from the process: more than the prefix, so that a hook longer than the
-# stub it replaces is still recognisable (`ADRP; ADD; BR` is 12 bytes, the arm64 stub 8).
-# The prefix decides changed or not; patterns are recognised on everything read.
-READ_LEN = {"arm64": 16, "x64": 32, "x86": 16}
+# stub it replaces is still recognisable (`ADRP; ADD; BR` is 12 bytes, `MOVZ` with three
+# `MOVK` and a branch 20, the arm64 stub 8). The prefix decides changed or not; patterns
+# are recognised on everything read.
+READ_LEN = {"arm64": 20, "x64": 32, "x86": 16}
 
 _X64_SYSCALL = b"\x0f\x05"
 # `4C 8B D1 B8 <ssn:4>`: the syscall number can spell 0F 05 itself, so look past it
@@ -386,14 +387,34 @@ _X64_HOOKS = (
         b[1:5], "little") | int.from_bytes(b[9:13], "little") << 32)),
 )
 
-_ARM64_BR = 0xD61F0000
+# The branch a relay ends in: `BR <Xn>`, or a pointer-authenticated one (`BRAA`, `BRAB` with a modifier register,
+# `BRAAZ`, `BRABZ` with a zero one), which checks the PAC in the top bits of the register and branches to the address
+# below it. `BLR` is not among them: it is a call, and a relay that calls would not return through the stub.
+_ARM64_BRANCHES = (
+    (0xFFFFFC1F, 0xD61F0000, "BR"),
+    (0xFFFFFC00, 0xD71F0800, "BRAA"),
+    (0xFFFFFC00, 0xD71F0C00, "BRAB"),
+    (0xFFFFFC1F, 0xD61F081F, "BRAAZ"),
+    (0xFFFFFC1F, 0xD61F0C1F, "BRABZ"),
+)
+# The address bits of a pointer whose PAC a branch strips: a user-mode address of Windows on ARM64 fits in 48
+_ARM64_VA_MASK = (1 << 48) - 1
 
 
-def _arm64_br_reg(word: int | None) -> int | None:
-    """The register of `BR <Xn>`, None for any other instruction."""
-    if word is None or word & 0xFFFFFC1F != _ARM64_BR:
+def _arm64_branch(word: int | None) -> tuple[int, str] | None:
+    """`(register, name)` of the branch `word` is, None for any other instruction."""
+    if word is None:
         return None
-    return (word >> 5) & 0x1F
+    for mask, value, name in _ARM64_BRANCHES:
+        if word & mask == value:
+            return (word >> 5) & 0x1F, name
+    return None
+
+
+def _arm64_branch_to(word: int | None, reg: int) -> str | None:
+    """The name of `word` when it is a branch to `reg`, None otherwise."""
+    branch = _arm64_branch(word)
+    return branch[1] if branch and branch[0] == reg else None
 
 
 def _arm64_b(live: bytes, base: int):
@@ -405,12 +426,13 @@ def _arm64_b(live: bytes, base: int):
 
 def _arm64_ldr_br(live: bytes, base: int):
     """`LDR <Xn>, literal; BR <Xn>`, for any n: x16 in the usual EDR hook, x17 in Detours' `detour_gen_jmp_immediate`."""
-    w, nxt = _word(live), _word(live, 4)
-    if w is None or nxt is None:
+    w = _word(live)
+    if w is None or w & 0xFF000000 != 0x58000000:
         return _MISS
-    if w & 0xFF000000 != 0x58000000 or _arm64_br_reg(nxt) != w & 0x1F:
+    branch = _arm64_branch_to(_word(live, 4), w & 0x1F)
+    if branch is None:
         return _MISS
-    return None, (base + _signed((w >> 5) & 0x7FFFF, 19) * 4) & _ADDRESS_MASK
+    return None, (base + _signed((w >> 5) & 0x7FFFF, 19) * 4) & _ADDRESS_MASK, branch
 
 
 def _arm64_adrp_page(adrp: int, base: int) -> int:
@@ -418,39 +440,64 @@ def _arm64_adrp_page(adrp: int, base: int) -> int:
     return ((base & ~0xFFF) + (imm << 12)) & _ADDRESS_MASK
 
 
-def _arm64_is_adrp(word: int) -> bool:
-    return word & 0x9F000000 == 0x90000000
+def _arm64_is_adrp(word: int | None) -> bool:
+    return word is not None and word & 0x9F000000 == 0x90000000
 
 
 def _arm64_adrp_add_br(live: bytes, base: int):
-    adrp, add, br = _word(live), _word(live, 4), _word(live, 8)
-    if adrp is None or add is None or br is None:
-        return _MISS
-    reg = adrp & 0x1F
-    if not _arm64_is_adrp(adrp):
+    adrp, add = _word(live), _word(live, 4)
+    if not _arm64_is_adrp(adrp) or add is None:
         return _MISS
     # ADD <Xd>, <Xreg>, #imm12{, LSL #12}, then BR <Xd>
-    if add & 0xFF800000 != 0x91000000 or (add >> 5) & 0x1F != reg:
+    if add & 0xFF800000 != 0x91000000 or (add >> 5) & 0x1F != adrp & 0x1F:
         return _MISS
-    if _arm64_br_reg(br) != add & 0x1F:
+    branch = _arm64_branch_to(_word(live, 8), add & 0x1F)
+    if branch is None:
         return _MISS
     offset = (add >> 10) & 0xFFF
     if add & 0x00400000:
         offset <<= 12
-    return (_arm64_adrp_page(adrp, base) + offset) & _ADDRESS_MASK, None
+    return (_arm64_adrp_page(adrp, base) + offset) & _ADDRESS_MASK, None, branch
 
 
 def _arm64_adrp_ldr_br(live: bytes, base: int):
     """`ADRP <Xn>, page; LDR <Xt>, [<Xn>, #imm]; BR <Xt>`: Detours' `detour_gen_jmp_indirect`, with x17. The 64-bit
     load of the unsigned-offset form only: what it loads is the pointer, its address the ADRP page plus 8 * imm12."""
-    adrp, ldr, br = _word(live), _word(live, 4), _word(live, 8)
-    if adrp is None or ldr is None or br is None or not _arm64_is_adrp(adrp):
+    adrp, ldr = _word(live), _word(live, 4)
+    if not _arm64_is_adrp(adrp) or ldr is None:
         return _MISS
     if ldr & 0xFFC00000 != 0xF9400000 or (ldr >> 5) & 0x1F != adrp & 0x1F:
         return _MISS
-    if _arm64_br_reg(br) != ldr & 0x1F:
+    branch = _arm64_branch_to(_word(live, 8), ldr & 0x1F)
+    if branch is None:
         return _MISS
-    return None, (_arm64_adrp_page(adrp, base) + ((ldr >> 10) & 0xFFF) * 8) & _ADDRESS_MASK
+    return None, (_arm64_adrp_page(adrp, base) + ((ldr >> 10) & 0xFFF) * 8) & _ADDRESS_MASK, branch
+
+
+# MOVZ and MOVK of a 64-bit register; the shift is the `hw` field, 16 bits per step
+_ARM64_MOVZ_X, _ARM64_MOVK_X, _ARM64_MOVE_MASK = 0xD2800000, 0xF2800000, 0xFF800000
+_ARM64_MOVKS = 3
+
+
+def _arm64_movz_movk_br(live: bytes, base: int):
+    """`MOVZ <Xn>, #imm16{, LSL #s}`, up to three `MOVK <Xn>` and a branch to `<Xn>`: the target is the value the
+    moves build, in the bytes themselves. Every instruction names the same register; a MOVZ comes first, since
+    without it the bits no MOVK sets are whatever the register held."""
+    w = _word(live)
+    if w is None or w & _ARM64_MOVE_MASK != _ARM64_MOVZ_X:
+        return _MISS
+    reg = w & 0x1F
+    value = ((w >> 5) & 0xFFFF) << 16 * ((w >> 21) & 0x3)
+    for i in range(1, _ARM64_MOVKS + 2):
+        nxt = _word(live, 4 * i)
+        branch = _arm64_branch_to(nxt, reg)
+        if branch is not None:
+            return value, None, branch
+        if nxt is None or i > _ARM64_MOVKS or nxt & _ARM64_MOVE_MASK != _ARM64_MOVK_X or nxt & 0x1F != reg:
+            return _MISS
+        shift = 16 * ((nxt >> 21) & 0x3)
+        value = value & ~(0xFFFF << shift) | ((nxt >> 5) & 0xFFFF) << shift
+    return _MISS
 
 
 _ARM64_HOOKS = (
@@ -458,22 +505,49 @@ _ARM64_HOOKS = (
     ("LDR; BR", _arm64_ldr_br),
     ("ADRP; ADD; BR", _arm64_adrp_add_br),
     ("ADRP; LDR; BR", _arm64_adrp_ldr_br),
+    ("MOVZ/MOVK; BR", _arm64_movz_movk_br),
 )
 
 # x86 has a prefix length but no patterns: it is not a baseline view yet
 _HOOKS = {"x64": _X64_HOOKS, "arm64": _ARM64_HOOKS}
 
 
+def strip_pointer_auth(value: int) -> int:
+    """The address an authenticated branch goes to: `value` without the PAC in its top bits."""
+    return value & _ARM64_VA_MASK
+
+
 def _find_hook(live: bytes, base: int, view: str):
-    """`(pattern, target, pointer)` of the hook jump at the start of `live`, or None.
+    """`(pattern, target, pointer, authenticated)` of the hook jump at the start of `live`, or None.
+
+    A form that ends in a branch names it: `LDR; BRAA` is `LDR; BR` with a pointer-authenticated branch. Such a
+    branch is `authenticated`, and a target the bytes show is given without its PAC; a pointer read from memory is
+    stripped by whoever reads it (`strip_pointer_auth`).
 
     Hooks overwrite the start of the stub; a jump further in is not looked for, which is
-    also what `jump_target` and `jump_pointer`, having no offset, can answer for."""
+    also what `jump_target` and `jump_pointer`, having no offset, can answer for.
+
+    The decoder is not exhaustive, on purpose read as such: bytes it does not know are no jump, and a relay in private
+    memory that is no jump it knows is the code that runs there, `patched`. See `syscall_scan._target_owner`."""
     for name, match in _HOOKS.get(view, ()):
         found = match(live, base)
-        if found is not _MISS:
-            return (name,) + found
+        if found is _MISS:
+            continue
+        target, pointer = found[0], found[1]
+        branch = found[2] if len(found) > 2 else None
+        authenticated = branch is not None and branch != "BR"
+        if branch is not None and name.endswith("BR"):
+            name = name[:-2] + branch
+        if authenticated and target is not None:
+            target = strip_pointer_auth(target)
+        return name, target, pointer, authenticated
     return None
+
+
+def jump_authenticated(live: bytes, view: str) -> bool:
+    """Whether the hook jump at the start of `live` ends in a pointer-authenticated branch."""
+    hit = _find_hook(live, 0, view)
+    return bool(hit and hit[3])
 
 
 def jump_target(live: bytes, base: int, view: str) -> int | None:

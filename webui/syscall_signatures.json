@@ -12,6 +12,8 @@
   {"family": "Inline hook", "view": "arm64", "pattern": "^[0-9a-f]{6}58[0-9a-f]{2}0[0-3]1fd6", "match": "regex", "weight": 1.0, "note": "LDR Xn, literal; BR Xn (x16 in the usual EDR hook, x17 in Detours)"},
   {"family": "Inline hook", "view": "arm64", "pattern": "^[0-9a-f]{6}[9bdf]0[0-9a-f]{4}[0-7][0-9a-f]91[02468ace]00[0-3]1fd6", "match": "regex", "weight": 1.0, "note": "ADRP; ADD; BR"},
   {"family": "Inline hook", "view": "arm64", "pattern": "^[0-9a-f]{6}[9bdf]0[0-9a-f]{4}[4-7][0-9a-f]f9[0-9a-f]{2}0[0-3]1fd6", "match": "regex", "weight": 1.0, "note": "ADRP Xn; LDR Xt, [Xn, #imm]; BR Xt: an indirect jump through a pointer (Detours)"},
+  {"family": "Inline hook", "view": "arm64", "pattern": "^[0-9a-f]{4}[89a-f][0-9a-f]d2([0-9a-f]{4}[89a-f][0-9a-f]f2){0,3}[0-9a-f]{2}0[0-3]1fd6", "match": "regex", "weight": 1.0, "note": "MOVZ Xn; up to three MOVK Xn; BR Xn: the target built in the bytes"},
+  {"family": "Inline hook", "view": "arm64", "pattern": "^([0-9a-f]{6}58|[0-9a-f]{6}[9bdf]0[0-9a-f]{4}[0-7][0-9a-f]91|[0-9a-f]{6}[9bdf]0[0-9a-f]{4}[4-7][0-9a-f]f9|[0-9a-f]{4}[89a-f][0-9a-f]d2([0-9a-f]{4}[89a-f][0-9a-f]f2){0,3})([0-9a-f]{2}0[89a-f]1fd7|[13579bdf]f0[89a-f]1fd6)", "match": "regex", "weight": 1.0, "note": "LDR, ADRP; ADD, ADRP; LDR or MOVZ/MOVK, then a pointer-authenticated branch (BRAA, BRAB, BRAAZ, BRABZ)"},
   {"family": "Stub patch", "view": "arm64", "pattern": "c0035fd6", "match": "prefix", "weight": 3.0, "note": "RET as the first instruction: the stub returns without making the syscall"},
   {"family": "Stub patch", "view": "arm64", "pattern": "^0000(80d2|8052)c0035fd6", "match": "regex", "weight": 3.0, "note": "MOV x0 or w0, #0; RET: the stub reports success without making the syscall"}
 ]
