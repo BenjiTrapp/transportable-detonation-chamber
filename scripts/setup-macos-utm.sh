@@ -333,6 +333,7 @@ SCRIPTS=(
     "install-rizin.ps1"
     "install-ntsleuth.ps1"
     "install-webui.ps1"
+    "build-binary-graph.ps1"
     "configure-logging.ps1"
     "configure-services.ps1"
 )

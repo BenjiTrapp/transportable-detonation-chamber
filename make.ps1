@@ -383,7 +383,7 @@ switch ($Target) {
             }
             # Install scripts for the tool updates, the logging set-up and the way out of ISOLATED
             Invoke-Command -Session $s -ScriptBlock { New-Item -ItemType Directory -Path 'C:\tdc\scripts' -Force | Out-Null }
-            foreach ($installScript in @(Get-ChildItem 'scripts' -Filter 'install-*.ps1') + @(Get-Item 'scripts\configure-logging.ps1', 'scripts\tdc-unisolate.ps1')) {
+            foreach ($installScript in @(Get-ChildItem 'scripts' -Filter 'install-*.ps1') + @(Get-Item 'scripts\configure-logging.ps1', 'scripts\tdc-unisolate.ps1', 'scripts\build-binary-graph.ps1')) {
                 Copy-Item $installScript.FullName -Destination "C:\tdc\scripts\$($installScript.Name)" -ToSession $s -Force
             }
             Write-Host "[deploy] Files synced successfully." -ForegroundColor Green

@@ -341,7 +341,7 @@ deploy:
 		if [ -f webui/static/wiki.html ]; then \
 			vagrant upload webui/static/wiki.html C:\\DetonationChamberUI\\static\\wiki.html || echo "[deploy] the wiki did not upload; the rest is synced"; \
 		else echo "[deploy] no webui/static/wiki.html - build the wiki with: make docs"; fi; \
-		for f in scripts/install-*.ps1 scripts/configure-logging.ps1 scripts/tdc-unisolate.ps1; do \
+		for f in scripts/install-*.ps1 scripts/configure-logging.ps1 scripts/tdc-unisolate.ps1 scripts/build-binary-graph.ps1; do \
 			vagrant upload $$f C:\\tdc\\scripts\\$$(basename $$f); \
 		done; \
 		echo "[deploy] Done."; \

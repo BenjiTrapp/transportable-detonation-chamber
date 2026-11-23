@@ -1410,3 +1410,529 @@ def test_the_exports_of_a_binary_are_scanned_once_however_many_chains_end_in_it(
     got = binary_graph.resolve_all(_graph(definer, importer), {})
     assert {r.reason for r in got.values()} == {"defined"}
     assert _CountingTuple.scans == 1
+
+
+# --- the cache: build, stamp, load -----------------------------------------------------------
+
+def _system32(tmp_path):
+    """A small System32: kernel32 forwards HeapAlloc over an api set to kernelbase, which forwards it to ntdll."""
+    root = tmp_path / "System32"
+    root.mkdir()
+    ntdll = ("ntdll.dll", dict(dll=True, exports=("RtlAllocateHeap", "NtClose")))
+    kernelbase = ("kernelbase.dll", dict(dll=True, exports=("CreateFileW",), imports=(("ntdll.dll", ("NtClose",)),),
+                                         forwarders=(("HeapAlloc", "NTDLL.RtlAllocateHeap"),)))
+    kernel32 = ("kernel32.dll", dict(dll=True, imports=(("ntdll.dll", ("NtClose", "RtlAllocateHeap")),
+                                                         ("kernelbase.dll", ("CreateFileW",))),
+                                     forwarders=(("HeapAlloc", "api-ms-win-core-heap-l1-1-0.HeapAlloc"),)))
+    tool = ("tool.exe", dict(imports=(("kernel32.dll", ("CreateFileW", "HeapAlloc", "CloseHandle")),
+                                      ("ntdll.dll", ("NtClose",)))))
+    other = ("other.exe", dict(imports=(("kernel32.dll", ("CreateFileW",)),)))
+    for name, pe in (ntdll, kernelbase, kernel32, tool, other):
+        (root / name).write_bytes(make_pe(**pe))
+    (root / "readme.dll").write_bytes(b"not a pe at all")
+    mapping = {"api-ms-win-core-heap-l1-1-0": ("kernelbase.dll",)}
+    (root / "apisetschema.dll").write_bytes(make_pe(dll=True, sections=((".apiset", _api_set_map(mapping)),)))
+    return root, mapping
+
+
+def _build(tmp_path, build="26220.5770", arch="arm64"):
+    root, mapping = _system32(tmp_path)
+    graph = binary_graph.build_graph(str(root), str(root / "apisetschema.dll"), build, arch)
+    return graph, mapping
+
+
+def test_the_graph_holds_every_binary_its_api_sets_and_the_resolved_forwarders(tmp_path):
+    graph, mapping = _build(tmp_path)
+    assert (graph.build, graph.arch) == ("26220.5770", "arm64")
+    assert set(graph.binaries) == {"ntdll.dll", "kernelbase.dll", "kernel32.dll", "tool.exe", "other.exe",
+                                   "apisetschema.dll"}
+    assert all(key == info.name for key, info in graph.binaries.items())
+    assert graph.binaries["kernelbase.dll"].forwarders == {"HeapAlloc": "NTDLL.RtlAllocateHeap"}
+    assert graph.api_sets == mapping
+    heap = graph.resolved[("kernel32.dll", "HeapAlloc")]
+    assert (heap.reason, heap.module, heap.function) == ("defined", "ntdll.dll", "RtlAllocateHeap")
+    assert [h.module for h in heap.hops] == ["api-ms-win-core-heap-l1-1-0.dll", "kernelbase.dll", "ntdll.dll"]
+    assert set(graph.resolved) == {("kernel32.dll", "HeapAlloc"), ("kernelbase.dll", "HeapAlloc")}
+    assert graph.skipped == (("readme.dll", "not a PE"),)
+    assert isinstance(graph.skipped, tuple)
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", graph.created)
+
+
+def test_a_graph_without_a_schema_dll_is_degraded_not_broken(tmp_path):
+    root, _ = _system32(tmp_path)
+    graph = binary_graph.build_graph(str(root), str(root / "missing.dll"), "1.1", "x64")
+    assert graph.api_sets == {}
+    assert graph.resolved[("kernel32.dll", "HeapAlloc")].reason == "unresolved-api-set"
+    assert "ntdll.dll" in graph.binaries
+
+
+def test_the_in_degree_of_a_module_counts_the_binaries_that_import_it_not_the_functions(tmp_path):
+    graph, _ = _build(tmp_path)
+    # tool.exe imports three functions of kernel32 and other.exe one: two binaries, not four functions
+    assert graph.in_degree["kernel32.dll"] == 2
+    assert graph.in_degree["ntdll.dll"] == 3            # kernelbase, kernel32, tool
+    assert graph.in_degree["kernelbase.dll"] == 1
+    assert "tool.exe" not in graph.in_degree            # nothing imports it
+
+
+def test_a_module_that_is_not_in_the_graph_still_counts_its_importers(tmp_path):
+    root = tmp_path / "System32"
+    root.mkdir()
+    for name in ("a.exe", "b.exe"):
+        (root / name).write_bytes(make_pe(imports=(("vanished.dll", ("One", "Two")),), delay=(("vanished.dll", ("Three",)),)))
+    graph = binary_graph.build_graph(str(root), str(root / "none.dll"), "1.1", "x64")
+    assert graph.in_degree == {"vanished.dll": 2}       # a delay-load of the same module is not a third importer
+
+
+def _strange_graph():
+    """Every field of every record set to something a careless round trip would lose."""
+    info = binary_graph.BinaryInfo(
+        name="odd.dll", kind="dll", machine="other", imports={"a.dll": ("#7", 'Q"uote\\', "\ufffd"), "b.dll": ()},
+        exports=("#3", "Zed", "alpha"), forwarders={"#3": "NTDLL.#9", "Fwd": "api-ms-win-x-l1-1-0.Fn"},
+        ordinal_names={1: "alpha", 65535: "Zed"}, partial=True)
+    plain = binary_graph.BinaryInfo(name="plain.exe", kind="exe", machine="x64", imports={}, exports=(),
+                                    forwarders={}, ordinal_names={}, partial=False)
+    hops = (binary_graph.Hop("api-ms-win-x-l1-1-0.dll", "Fn", "resolves_to"), binary_graph.Hop("b.dll", "Fn", "forwards_to"))
+    resolved = {("odd.dll", "Fwd"): binary_graph.Resolution(hops, "b.dll", "Fn", "defined", True),
+                ("odd.dll", "#3"): binary_graph.Resolution((), None, None, "missing", False),
+                ("odd.dll", "x"): binary_graph.Resolution(hops[:1], None, None, "cycle", True)}
+    return binary_graph.Graph(
+        build="26220.5770", arch="arm64", created="2026-11-23T10:00:00Z",
+        binaries={"odd.dll": info, "plain.exe": plain}, api_sets={"api-ms-win-x-l1-1-0": ("b.dll", "c.dll"), "e": ()},
+        resolved=resolved, in_degree={"a.dll": 1, "b.dll": 0, "gone.dll": 12},
+        skipped=(("x.dll", "not a PE"), ("y.exe", "malformed")))
+
+
+def _assert_same_graph(got, want):
+    for field in ("build", "arch", "created", "api_sets", "in_degree", "skipped"):
+        assert getattr(got, field) == getattr(want, field), field
+        assert type(getattr(got, field)) is type(getattr(want, field)), field
+    assert list(got.binaries) == list(want.binaries)
+    for key, info in want.binaries.items():
+        loaded = got.binaries[key]
+        for field in ("name", "kind", "machine", "imports", "exports", "forwarders", "ordinal_names", "partial"):
+            assert getattr(loaded, field) == getattr(info, field), (key, field)
+            assert type(getattr(loaded, field)) is type(getattr(info, field)), (key, field)
+        assert all(type(k) is int for k in loaded.ordinal_names)
+        assert all(type(v) is tuple for v in loaded.imports.values())
+    assert set(got.resolved) == set(want.resolved)
+    for key, res in want.resolved.items():
+        loaded = got.resolved[key]
+        assert (loaded.module, loaded.function, loaded.reason, loaded.partial) == (res.module, res.function, res.reason, res.partial), key
+        assert type(loaded.hops) is tuple and loaded.hops == res.hops, key
+        assert all(type(h) is binary_graph.Hop for h in loaded.hops)
+    assert got == want
+
+
+def test_a_graph_survives_save_and_load_unchanged(tmp_path):
+    want = _strange_graph()
+    path = str(tmp_path / "cache.json")
+    binary_graph.save_graph(want, path)
+    _assert_same_graph(binary_graph.load_graph(path, "26220.5770", "arm64"), want)
+
+
+def test_a_built_graph_survives_save_and_load_unchanged(tmp_path):
+    want, _ = _build(tmp_path)
+    path = str(tmp_path / "cache.json")
+    binary_graph.save_graph(want, path)
+    _assert_same_graph(binary_graph.load_graph(path, want.build, want.arch), want)
+
+
+def test_the_stamp_is_the_head_of_the_file(tmp_path):
+    path = tmp_path / "cache.json"
+    binary_graph.save_graph(_strange_graph(), str(path))
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    assert list(doc)[:4] == ["format", "build", "arch", "created"]
+    assert (doc["build"], doc["arch"], doc["created"]) == ("26220.5770", "arm64", "2026-11-23T10:00:00Z")
+
+
+def test_saving_leaves_no_half_written_file_beside_the_cache(tmp_path):
+    path = tmp_path / "cache.json"
+    binary_graph.save_graph(_strange_graph(), str(path))
+    assert os.listdir(tmp_path) == ["cache.json"]
+    path.write_text("old")
+    unwritable = _strange_graph()
+    object.__setattr__(unwritable, "in_degree", {"x": object()})        # json cannot encode this
+    with pytest.raises(TypeError):
+        binary_graph.save_graph(unwritable, str(path))
+    assert path.read_text() == "old" and os.listdir(tmp_path) == ["cache.json"]
+
+
+def test_a_save_that_fails_on_the_way_leaves_the_earlier_cache_whole(tmp_path, monkeypatch):
+    path = tmp_path / "cache.json"
+    path.write_text("old")
+
+    def refuse(*args):
+        raise OSError("the disk went away")
+
+    monkeypatch.setattr(os, "replace", refuse)
+    with pytest.raises(OSError):
+        binary_graph.save_graph(_strange_graph(), str(path))
+    assert path.read_text() == "old" and os.listdir(tmp_path) == ["cache.json"]
+
+
+def test_loading_a_cache_of_another_build_is_refused_with_the_build_it_holds(tmp_path):
+    path = str(tmp_path / "cache.json")
+    binary_graph.save_graph(_strange_graph(), path)
+    with pytest.raises(binary_graph.CacheMismatch) as e:
+        binary_graph.load_graph(path, "26220.9999", "arm64")
+    assert "26220.5770" in str(e.value) and "26220.9999" in str(e.value)
+    assert (e.value.reason, e.value.held_build, e.value.held_arch) == ("other build", "26220.5770", "arm64")
+
+
+def test_loading_a_cache_of_another_architecture_is_refused(tmp_path):
+    path = str(tmp_path / "cache.json")
+    binary_graph.save_graph(_strange_graph(), path)
+    with pytest.raises(binary_graph.CacheMismatch) as e:
+        binary_graph.load_graph(path, "26220.5770", "x64")
+    assert e.value.reason == "other architecture" and e.value.held_arch == "arm64" and "arm64" in str(e.value)
+
+
+def test_a_cache_of_another_build_is_refused_before_its_body_is_read(tmp_path):
+    path = tmp_path / "cache.json"
+    doc = json.loads(_saved(tmp_path, _strange_graph()))
+    doc["binaries"] = "this would not decode"
+    path.write_text(json.dumps(doc))
+    with pytest.raises(binary_graph.CacheMismatch) as e:
+        binary_graph.load_graph(str(path), "1.1", "arm64")
+    assert e.value.reason == "other build"
+
+
+def _saved(tmp_path, graph, name="saved.json"):
+    path = tmp_path / name
+    binary_graph.save_graph(graph, str(path))
+    return path.read_text(encoding="utf-8")
+
+
+def test_a_cache_whose_json_is_truncated_is_refused_and_does_not_raise_json_errors(tmp_path):
+    text = _saved(tmp_path, _strange_graph())
+    for cut in sorted({0, 1, 10, len(text) // 3, len(text) // 2, len(text) - 2, len(text) - 1}):
+        path = tmp_path / "cut.json"
+        path.write_text(text[:cut], encoding="utf-8")
+        with pytest.raises(binary_graph.CacheMismatch) as e:
+            binary_graph.load_graph(str(path), "26220.5770", "arm64")
+        assert e.value.reason == "malformed", cut
+
+
+@pytest.mark.parametrize("content", [b"", b"not json", b"\xff\xfe\x00garbage", b"[]", b"null", b"42", b'"text"',
+                                     b"[" * 100000, b"{}", b'{"format": 1}', b'{"format": 2, "build": "26220.5770", "arch": "arm64"}'])
+def test_a_file_that_is_not_a_cache_is_refused_with_a_reason(tmp_path, content):
+    path = tmp_path / "cache.json"
+    path.write_bytes(content)
+    with pytest.raises(binary_graph.CacheMismatch) as e:
+        binary_graph.load_graph(str(path), "26220.5770", "arm64")
+    assert e.value.reason in ("malformed", "unknown format")
+
+
+def test_a_cache_of_a_format_this_code_does_not_know_is_refused(tmp_path):
+    doc = json.loads(_saved(tmp_path, _strange_graph()))
+    doc["format"] = 99
+    path = tmp_path / "cache.json"
+    path.write_text(json.dumps(doc))
+    with pytest.raises(binary_graph.CacheMismatch) as e:
+        binary_graph.load_graph(str(path), "26220.5770", "arm64")
+    assert e.value.reason == "unknown format"
+
+
+def _damaged(tmp_path, damage):
+    doc = json.loads(_saved(tmp_path, _strange_graph()))
+    damage(doc)
+    path = tmp_path / "damaged.json"
+    path.write_text(json.dumps(doc))
+    return str(path)
+
+
+@pytest.mark.parametrize("damage", [
+    lambda d: d.pop("binaries"), lambda d: d.pop("api_sets"), lambda d: d.pop("resolved"),
+    lambda d: d.pop("in_degree"), lambda d: d.pop("skipped"), lambda d: d.pop("created"),
+    lambda d: d.update(binaries=[]), lambda d: d.update(binaries=7), lambda d: d.update(api_sets=["x"]),
+    lambda d: d.update(resolved={}), lambda d: d.update(resolved=[1]), lambda d: d.update(skipped=[["only one"]]),
+    lambda d: d.update(in_degree={"a.dll": "three"}), lambda d: d.update(in_degree={"a.dll": True}),
+    lambda d: d.update(created=5), lambda d: d["binaries"]["odd.dll"].pop("partial"),
+    lambda d: d["binaries"]["odd.dll"].update(partial="yes"), lambda d: d["binaries"]["odd.dll"].update(imports={"a.dll": "abc"}),
+    lambda d: d["binaries"]["odd.dll"].update(exports="abc"), lambda d: d["binaries"]["odd.dll"].update(ordinal_names={"x": "y"}),
+    lambda d: d["binaries"]["odd.dll"].update(forwarders={"a": 1}), lambda d: d["resolved"][0].update(hops=[["a", "b"]]),
+    lambda d: d["resolved"][0].pop("reason"), lambda d: d["resolved"][0].update(partial=None),
+], ids=range(24))
+def test_a_cache_of_the_right_stamp_but_the_wrong_shape_is_refused_as_malformed(tmp_path, damage):
+    with pytest.raises(binary_graph.CacheMismatch) as e:
+        binary_graph.load_graph(_damaged(tmp_path, damage), "26220.5770", "arm64")
+    assert e.value.reason == "malformed"
+
+
+def test_a_missing_cache_is_refused_not_raised_as_an_os_error(tmp_path):
+    with pytest.raises(binary_graph.CacheMismatch) as e:
+        binary_graph.load_graph(str(tmp_path / "none.json"), "1.1", "x64")
+    assert e.value.reason == "unreadable"
+    with pytest.raises(binary_graph.CacheMismatch):
+        binary_graph.load_graph(str(tmp_path), "1.1", "x64")                   # a directory is not a cache
+
+
+def test_the_cache_name_keeps_it_apart_from_a_syscall_baseline_in_the_same_directory(tmp_path):
+    assert binary_graph.cache_name("26220.5770", "arm64") == "binary-graph-26220.5770-arm64.json"
+    assert syscall_baseline.parse_baseline_name(binary_graph.cache_name("26220.5770", "arm64")) is None
+    assert syscall_baseline.parse_baseline_name(binary_graph.cache_name("26220.5770", "x64")) is None
+    (tmp_path / "ntsleuth-26220.5770-arm64.json").write_text("{}")
+    assert binary_graph.find_cache(str(tmp_path), "26220.5770", "arm64") is None      # a baseline is no cache
+    (tmp_path / binary_graph.cache_name("26220.5770", "arm64")).write_text("{}")
+    only_cache = tmp_path / "only-cache"
+    only_cache.mkdir()
+    (only_cache / binary_graph.cache_name("26220.5770", "arm64")).write_text("{}")
+    assert syscall_baseline.find_baseline(str(only_cache), "26220.5770", "arm64") is None     # nor a cache a baseline
+    assert binary_graph.find_cache(str(tmp_path), "26220.5770", "arm64") == str(
+        tmp_path / "binary-graph-26220.5770-arm64.json")
+    assert binary_graph.find_cache(str(tmp_path), "26220.5770", "x64") is None
+    assert binary_graph.find_cache(str(tmp_path), "26220.0000", "arm64") is None
+    assert binary_graph.find_cache(str(tmp_path / "nowhere"), "26220.5770", "arm64") is None
+
+
+@pytest.mark.parametrize("build,arch", [("../x", "arm64"), ("1.1", "../arm64"), ("", "x64"), ("1.1", ""),
+                                        ("1/1", "x64"), ("1.1", "x64\n"), ("1.1\n", "x64"), ("a b", "x64")])
+def test_a_build_or_architecture_that_could_name_another_path_gives_no_cache_name(tmp_path, build, arch):
+    with pytest.raises(ValueError):
+        binary_graph.cache_name(build, arch)
+    assert binary_graph.find_cache(str(tmp_path), build, arch) is None
+
+
+# --- the command line the provisioning script calls --------------------------------------------
+
+def test_the_cli_writes_a_cache_and_reports_the_counts(tmp_path, capsys):
+    root, _ = _system32(tmp_path)
+    out = tmp_path / "baseline"
+    out.mkdir()
+    code = binary_graph.main(["--out", str(out), "--system32", str(root), "--build", "26220.5770", "--arch", "arm64"])
+    assert code == 0
+    lines = dict(line.split(": ", 1) for line in capsys.readouterr().out.splitlines())
+    assert {k: lines[k] for k in ("binaries", "skipped", "api_sets", "resolved")} == {
+        "binaries": "6", "skipped": "1", "api_sets": "1", "resolved": "2"}
+    path = binary_graph.find_cache(str(out), "26220.5770", "arm64")
+    assert path and lines["cache"] == path
+    graph = binary_graph.load_graph(path, "26220.5770", "arm64")
+    assert graph.resolved[("kernel32.dll", "HeapAlloc")].reason == "defined"      # the api-set map came from the tree
+
+
+def test_the_cli_creates_the_output_directory(tmp_path, capsys):
+    root, _ = _system32(tmp_path)
+    out = tmp_path / "not" / "yet"
+    assert binary_graph.main(["--out", str(out), "--system32", str(root), "--build", "1.1", "--arch", "x64"]) == 0
+    assert binary_graph.find_cache(str(out), "1.1", "x64")
+
+
+def test_the_cli_returns_one_when_the_directory_holds_no_pe(tmp_path, capsys):
+    empty = tmp_path / "System32"
+    empty.mkdir()
+    (empty / "readme.dll").write_bytes(b"not a pe")
+    out = tmp_path / "out"
+    out.mkdir()
+    assert binary_graph.main(["--out", str(out), "--system32", str(empty), "--build", "1.1", "--arch", "x64"]) == 1
+    assert os.listdir(out) == []                                    # no graph of nothing is left behind
+    assert binary_graph.main(["--out", str(out), "--system32", str(tmp_path / "gone"), "--build", "1.1", "--arch", "x64"]) == 1
+    assert os.listdir(out) == []
+
+
+def test_a_failed_cli_run_leaves_the_cache_of_an_earlier_run_alone(tmp_path, capsys):
+    root, _ = _system32(tmp_path)
+    out = tmp_path / "out"
+    args = ["--out", str(out), "--build", "1.1", "--arch", "x64"]
+    assert binary_graph.main(args + ["--system32", str(root)]) == 0
+    before = (out / binary_graph.cache_name("1.1", "x64")).read_bytes()
+    assert binary_graph.main(args + ["--system32", str(tmp_path / "gone")]) == 1
+    assert (out / binary_graph.cache_name("1.1", "x64")).read_bytes() == before
+
+
+def test_the_cli_returns_one_for_a_build_or_architecture_it_cannot_name_a_file_by(tmp_path, capsys):
+    root, _ = _system32(tmp_path)
+    for build, arch in (("../x", "x64"), ("1.1", "a/b")):
+        assert binary_graph.main(["--out", str(tmp_path / "o"), "--system32", str(root), "--build", build, "--arch", arch]) == 1
+    assert not (tmp_path / "o").exists() or os.listdir(tmp_path / "o") == []
+
+
+def test_the_cli_returns_one_when_the_output_cannot_be_written(tmp_path, capsys):
+    root, _ = _system32(tmp_path)
+    blocker = tmp_path / "file"
+    blocker.write_text("a file, not a directory")
+    assert binary_graph.main(["--out", str(blocker), "--system32", str(root), "--build", "1.1", "--arch", "x64"]) == 1
+
+
+def test_the_cli_returns_one_on_arguments_it_does_not_know_instead_of_exiting_the_interpreter(tmp_path, capsys):
+    assert binary_graph.main([]) == 1
+    assert binary_graph.main(["--out"]) == 1
+    assert binary_graph.main(["--nonsense", "x"]) == 1
+
+
+def test_the_build_and_architecture_default_to_the_ones_of_the_host(tmp_path, monkeypatch, capsys):
+    root, _ = _system32(tmp_path)
+    monkeypatch.setattr(binary_graph, "host_build", lambda: "26100.1")
+    monkeypatch.setattr(binary_graph, "host_arch", lambda: "x64")
+    assert binary_graph.main(["--out", str(tmp_path / "o"), "--system32", str(root)]) == 0
+    assert binary_graph.find_cache(str(tmp_path / "o"), "26100.1", "x64")
+
+
+def test_without_a_build_to_name_the_cache_by_the_cli_returns_one(tmp_path, monkeypatch, capsys):
+    root, _ = _system32(tmp_path)
+    monkeypatch.setattr(binary_graph, "host_build", lambda: None)
+    assert binary_graph.main(["--out", str(tmp_path / "o"), "--system32", str(root), "--arch", "x64"]) == 1
+
+
+def test_the_host_build_is_the_number_and_revision_of_the_registry(monkeypatch):
+    import sys
+    import types
+    values = {"CurrentBuildNumber": ("26220", 1), "UBR": (5770, 4)}
+    fake = types.SimpleNamespace(HKEY_LOCAL_MACHINE=0, OpenKey=lambda *a: _Key(), QueryValueEx=lambda key, name: values[name])
+    monkeypatch.setitem(sys.modules, "winreg", fake)
+    assert binary_graph.host_build() == "26220.5770"
+    monkeypatch.setitem(sys.modules, "winreg", None)                 # not Windows
+    assert binary_graph.host_build() is None
+
+
+class _Key:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+@pytest.mark.parametrize("machine,arch", [("ARM64", "arm64"), ("aarch64", "arm64"), ("AMD64", "x64"), ("x86_64", "x64")])
+def test_the_host_architecture_is_arm64_or_x64(monkeypatch, machine, arch):
+    monkeypatch.setattr("platform.machine", lambda: machine)
+    assert binary_graph.host_arch() == arch
+
+
+def test_the_module_runs_as_a_script_from_its_own_directory_with_nothing_else_of_the_web_ui(tmp_path):
+    import subprocess
+    import sys
+    root, _ = _system32(tmp_path)
+    lone = tmp_path / "lone"
+    lone.mkdir()
+    (lone / "binary_graph.py").write_bytes(open(binary_graph.__file__, "rb").read())      # as it sits on the VM, alone
+    out = tmp_path / "out"
+    proc = subprocess.run([sys.executable, "binary_graph.py", "--out", str(out), "--system32", str(root),
+                           "--build", "1.1", "--arch", "x64"], cwd=str(lone), capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    assert "binaries: 6" in proc.stdout.splitlines()
+    assert os.path.isfile(out / "binary-graph-1.1-x64.json")
+
+
+# --- scripts/build-binary-graph.ps1 -------------------------------------------------------------
+
+def _build_script():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "scripts", "build-binary-graph.ps1"), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_the_build_script_parses():
+    import shutil
+    import subprocess
+    pwsh = shutil.which("pwsh") or ("/opt/homebrew/bin/pwsh" if os.path.exists("/opt/homebrew/bin/pwsh") else None)
+    if not pwsh:
+        pytest.skip("pwsh not installed")
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "build-binary-graph.ps1")
+    cmd = ("$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile("
+           f"'{path}', [ref]$null, [ref]$e); if ($e) {{ $e | ForEach-Object {{ $_.Message }}; exit 1 }}")
+    proc = subprocess.run([pwsh, "-NoProfile", "-Command", cmd], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_the_build_script_never_ends_provisioning_with_an_error():
+    script = _build_script()
+    assert not re.search(r"(?m)(?:^|[;{])\s*exit\s+(?!0\b)\S", script), "a missing graph is a state the tab reports"
+    assert not re.search(r"(?m)^[^#\n]*\bthrow\b", script)
+    assert re.search(r"(?m)^\s*\[switch\]\$Force", script)
+    assert "--out" in script and "$BaselineDir" in script and r"C:\tools\ntsleuth\baseline" in script
+    assert r'$WebUiDir     = "C:\DetonationChamberUI"' in script and r'"$WebUiDir\venv\Scripts\python.exe"' in script
+    # PowerShell 5.1 has none of these
+    assert "??" not in script and not re.search(r"\$\w+\s*\?\s*[^\s]+\s*:", script) and "?." not in script
+
+
+def test_the_build_script_is_provisioned_in_all_three_places_after_ntsleuth_and_the_web_ui():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for name, ntsleuth, webui, mine in (
+            ("Vagrantfile", "scripts/install-ntsleuth.ps1", "scripts/install-webui.ps1", "scripts/build-binary-graph.ps1"),
+            ("Vagrantfile.utm", "scripts/install-ntsleuth.ps1", "scripts/install-webui.ps1", "scripts/build-binary-graph.ps1"),
+            ("scripts/setup-macos-utm.sh", '"install-ntsleuth.ps1"', '"install-webui.ps1"', '"build-binary-graph.ps1"')):
+        with open(os.path.join(root, *name.split("/")), encoding="utf-8") as fh:
+            text = fh.read()
+        assert text.count(mine) == 1, name
+        assert text.index(ntsleuth) < text.index(mine) and text.index(webui) < text.index(mine), name
+        assert text.index(mine) < text.index("configure-logging.ps1"), name
+
+
+def _pwsh():
+    import shutil
+    pwsh = shutil.which("pwsh") or ("/opt/homebrew/bin/pwsh" if os.path.exists("/opt/homebrew/bin/pwsh") else None)
+    if not pwsh:
+        pytest.skip("pwsh not installed")
+    return pwsh
+
+
+def _run_build_script(tmp_path, module_source, *, python=True, force=False, existing=None):
+    """Runs the script's own text with the registry reads replaced by an arm64 system of build 1.1, the paths moved into
+    `tmp_path` and a stand-in for binary_graph.py: what it does with an interpreter, a module and a cache."""
+    import subprocess
+    import sys
+    script = _build_script()
+    head = script[:script.index("# OS architecture from the registry")]
+    tail = script[script.index('$cacheName = "binary-graph'):]
+    web, baseline = tmp_path / "webui", tmp_path / "baseline"
+    web.mkdir()
+    baseline.mkdir()
+    if module_source is not None:
+        (web / "binary_graph.py").write_text(module_source)
+    if existing is not None:
+        (baseline / "binary-graph-1.1-arm64.json").write_text(existing)
+    program = (head.replace("[switch]$Force", "[switch]$Force = $" + ("true" if force else "false"))
+               + f"$BaselineDir = '{baseline}'; $WebUiDir = '{web}'; $Python = '{sys.executable if python else web / 'none'}'; "
+                 f"$Module = '{web}/binary_graph.py'\n$arch = 'arm64'; $build = '1.1'\n"
+               + tail.replace("$BaselineDir\\", "$BaselineDir/").replace("$env:TEMP\\", f"{tmp_path}/"))
+    path = tmp_path / "run.ps1"
+    path.write_text(program)
+    proc = subprocess.run([_pwsh(), "-NoProfile", "-File", str(path)], capture_output=True, text=True, timeout=120)
+    return proc, baseline
+
+
+_FAKE_OK = ("import sys, os\n"
+            "out = sys.argv[sys.argv.index('--out') + 1]\n"
+            "open(os.path.join(out, 'binary-graph-' + sys.argv[sys.argv.index('--build') + 1] + '-' + sys.argv[sys.argv.index('--arch') + 1] + '.json'), 'w').write('{}')\n"
+            "print('binaries: 12'); print('skipped: 2'); print('api_sets: 0'); print('resolved: 5'); print('modules: 7')\n")
+
+
+def test_the_build_script_reports_the_numbers_of_a_build_that_worked(tmp_path):
+    proc, baseline = _run_build_script(tmp_path, _FAKE_OK)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "binaries: 12" in proc.stdout and "resolved: 5" in proc.stdout and "[+] Binary graph" in proc.stdout
+    assert "api-set map could not be read" in proc.stdout            # api_sets: 0 is a degraded graph, said so
+    assert (baseline / "binary-graph-1.1-arm64.json").is_file()
+
+
+@pytest.mark.parametrize("what,module,python", [
+    ("the module exits 1", "import sys; print('binaries: 0'); sys.exit(1)", True),
+    ("the module raises", "raise RuntimeError('boom')", True),
+    ("the module exits 0 and writes nothing", "print('binaries: 3')", True),
+    ("the module is not there", None, True),
+    ("the interpreter is not there", "print('x')", False)])
+def test_a_build_that_fails_is_a_warning_and_the_script_still_exits_zero(tmp_path, what, module, python):
+    proc, baseline = _run_build_script(tmp_path, module, python=python)
+    assert proc.returncode == 0, what + "\n" + proc.stdout + proc.stderr
+    assert "[!]" in proc.stdout and "No graph was built" in proc.stdout, what
+    assert not list(baseline.glob("binary-graph-*")), what
+
+
+def test_a_cache_that_is_there_is_not_built_again_unless_forced(tmp_path):
+    proc, _ = _run_build_script(tmp_path, "raise SystemExit(1)", existing="{}")
+    assert proc.returncode == 0 and "already present" in proc.stdout
+    forced = tmp_path / "forced"
+    forced.mkdir()
+    proc, baseline = _run_build_script(forced, _FAKE_OK, force=True, existing="old")
+    assert proc.returncode == 0 and "[+] Binary graph" in proc.stdout
+    assert (baseline / "binary-graph-1.1-arm64.json").read_text() == "{}"
+
+
+def test_the_build_script_off_windows_finds_no_registry_and_still_exits_zero(tmp_path):
+    import subprocess
+    proc = subprocess.run([_pwsh(), "-NoProfile", "-File", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                                                       "scripts", "build-binary-graph.ps1")],
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "No graph was built" in proc.stdout

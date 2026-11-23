@@ -7,13 +7,18 @@ above, which need the strings as the file wrote them.
 
 from __future__ import annotations
 
+import json
 import mmap
 import os
+import re
 import struct
+import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 MACHINES = {0xAA64: "arm64", 0x8664: "x64", 0x14C: "x86"}
-API_SET_SCHEMA_PATH = r"C:\Windows\System32\apisetschema.dll"
+SYSTEM32 = r"C:\Windows\System32"
+API_SET_SCHEMA_PATH = SYSTEM32 + r"\apisetschema.dll"
 MAX_BINARY_SIZE = 512 * 2**20          # System32's largest image is a fraction of this; a sample may not be
 
 # every reason a file is skipped for: fixed strings of our own, so they can be counted and grouped. Never a library's,
@@ -469,3 +474,289 @@ def resolve_all(binaries: dict[str, BinaryInfo],
             if (module, name) not in answers:
                 answers[(module, name)] = _resolve(binaries, api_sets, module, name, exports)
     return answers
+
+
+# --- the cache: one JSON file per build and architecture, beside the syscall baselines --------------------------------
+
+CACHE_FORMAT = 1
+_CACHE_BUILD_RE = re.compile(r"[0-9A-Za-z.]+")
+_CACHE_ARCH_RE = re.compile(r"[0-9A-Za-z]+")
+
+
+class CacheMismatch(Exception):
+    """A cache this system cannot use. `reason` is a fixed token, never prose of a library or the OS:
+    "other build" and "other architecture" (the cache is sound, but drawn for another system: `held_build` and
+    `held_arch` say which), "unknown format", "malformed" (not JSON, cut short, or of a shape that cannot be read)
+    and "unreadable" (the file cannot be opened). Nothing else escapes load_graph for a damaged file."""
+
+    def __init__(self, reason, message, held_build=None, held_arch=None):
+        super().__init__(message)
+        self.reason = reason
+        self.held_build = held_build
+        self.held_arch = held_arch
+
+
+@dataclass(frozen=True)
+class Graph:
+    build: str                                          # CurrentBuildNumber.UBR of the system it was built on
+    arch: str                                           # "arm64" | "x64": the host's, not one process's view of it
+    created: str                                        # ISO-8601, UTC
+    binaries: dict[str, BinaryInfo]                     # lower-case file name -> record
+    api_sets: dict[str, tuple[str, ...]]
+    resolved: dict[tuple[str, str], Resolution]         # (module, forwarder export) -> where it ends up
+    in_degree: dict[str, int]                           # imported module -> how many binaries import it
+    skipped: tuple[tuple[str, str], ...]                # (file name, reason) of what extract_tree could not read
+
+
+def cache_name(build: str, arch: str) -> str:
+    """`binary-graph-<build>-<arch>.json`. The prefix keeps it from `ntsleuth-<build>-<view>.json`, which sits in the
+    same directory. A build or architecture that is more than plain name characters raises ValueError: both can come
+    from a command line, and neither may name another path."""
+    if not (_CACHE_BUILD_RE.fullmatch(build) and _CACHE_ARCH_RE.fullmatch(arch)):
+        raise ValueError("a cache is named by a build and an architecture of plain name characters")
+    return f"binary-graph-{build}-{arch}.json"
+
+
+def find_cache(directory: str, build: str, arch: str) -> str | None:
+    """Path of the cache of this build and architecture in `directory`, or None."""
+    try:
+        path = os.path.join(directory, cache_name(build, arch))
+    except (ValueError, TypeError):
+        return None
+    return path if os.path.isfile(path) else None
+
+
+def build_graph(directory: str, api_set_path: str, build: str, arch: str) -> Graph:
+    """The graph of every PE directly in `directory`, with the forwarders resolved through the api-set map at
+    `api_set_path` (an empty map when it cannot be read: a degraded graph, not a broken one).
+
+    `in_degree` counts binaries, not import entries: a module's value is how many binaries import it, whether by one
+    function or by a hundred, and delay-loaded imports count as imports. It is keyed by the module name as the
+    importers wrote it, an api-set alias included, whether or not the graph holds that module."""
+    found, skipped = extract_tree(directory)
+    binaries = {info.name: info for info in found}
+    api_sets = load_api_set_map(api_set_path)
+    in_degree = {}
+    for info in binaries.values():
+        for module in info.imports:
+            in_degree[module] = in_degree.get(module, 0) + 1
+    return Graph(build=build, arch=arch, created=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                 binaries=binaries, api_sets=api_sets, resolved=resolve_all(binaries, api_sets),
+                 in_degree=in_degree, skipped=tuple(skipped))
+
+
+def _document(graph):
+    """The JSON object of a graph. The stamp comes first and the tuple keys of `resolved` become a list of records;
+    the file's keys are `ordinal_names`' integers as text, which load_graph turns back."""
+    return {
+        "format": CACHE_FORMAT, "build": graph.build, "arch": graph.arch, "created": graph.created,
+        "binaries": {key: {"name": info.name, "kind": info.kind, "machine": info.machine,
+                           "imports": {module: list(names) for module, names in info.imports.items()},
+                           "exports": list(info.exports), "forwarders": dict(info.forwarders),
+                           "ordinal_names": {str(ordinal): name for ordinal, name in info.ordinal_names.items()},
+                           "partial": info.partial}
+                     for key, info in graph.binaries.items()},
+        "api_sets": {alias: list(hosts) for alias, hosts in graph.api_sets.items()},
+        "resolved": [{"module": module, "name": name, "reason": res.reason, "target_module": res.module,
+                      "target_function": res.function, "partial": res.partial,
+                      "hops": [[hop.module, hop.function, hop.via] for hop in res.hops]}
+                     for (module, name), res in graph.resolved.items()],
+        "in_degree": dict(graph.in_degree),
+        "skipped": [list(pair) for pair in graph.skipped],
+    }
+
+
+def save_graph(graph: Graph, path: str) -> None:
+    """Write the cache to `path`, whole or not at all: it is written beside its name and moved over it, so the web UI
+    never reads half a file and a failed write leaves the earlier cache alone."""
+    text = json.dumps(_document(graph), separators=(",", ":"))
+    temporary = path + ".tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def _malformed():
+    return CacheMismatch("malformed", "the cache file is not a graph this code can read")
+
+
+def _check(condition):
+    if not condition:
+        raise ValueError
+
+
+def _decode(doc):
+    """The Graph a document describes; ValueError, KeyError or TypeError for anything that is not one. Strings are
+    shared (a function name is imported by thousands of binaries), which keeps a 4,000-binary graph's memory down."""
+    pool = {}
+
+    def text(value):
+        _check(type(value) is str)
+        return pool.setdefault(value, value)
+
+    def texts(value):
+        _check(type(value) is list)
+        return tuple(text(item) for item in value)
+
+    def mapping(value):
+        _check(type(value) is dict)
+        return value
+
+    def flag(value):
+        _check(type(value) is bool)
+        return value
+
+    def optional(value):
+        return None if value is None else text(value)
+
+    binaries = {}
+    for key, entry in mapping(doc["binaries"]).items():
+        entry = mapping(entry)
+        ordinals = {}
+        for ordinal, name in mapping(entry["ordinal_names"]).items():
+            _check(ordinal.isascii() and ordinal.isdecimal())
+            ordinals[int(ordinal)] = text(name)
+        binaries[text(key)] = BinaryInfo(
+            name=text(entry["name"]), kind=text(entry["kind"]), machine=text(entry["machine"]),
+            imports={text(module): texts(names) for module, names in mapping(entry["imports"]).items()},
+            exports=texts(entry["exports"]),
+            forwarders={text(name): text(raw) for name, raw in mapping(entry["forwarders"]).items()},
+            ordinal_names=ordinals, partial=flag(entry["partial"]))
+    resolved = {}
+    _check(type(doc["resolved"]) is list)
+    for entry in doc["resolved"]:
+        entry = mapping(entry)
+        hops = []
+        _check(type(entry["hops"]) is list)
+        for hop in entry["hops"]:
+            _check(type(hop) is list and len(hop) == 3)
+            hops.append(Hop(text(hop[0]), text(hop[1]), text(hop[2])))
+        resolved[(text(entry["module"]), text(entry["name"]))] = Resolution(
+            tuple(hops), optional(entry["target_module"]), optional(entry["target_function"]),
+            text(entry["reason"]), flag(entry["partial"]))
+    in_degree = {}
+    for module, count in mapping(doc["in_degree"]).items():
+        _check(type(count) is int and count >= 0)
+        in_degree[text(module)] = count
+    skipped = []
+    _check(type(doc["skipped"]) is list)
+    for pair in doc["skipped"]:
+        _check(type(pair) is list and len(pair) == 2)
+        skipped.append((text(pair[0]), text(pair[1])))
+    return Graph(build=text(doc["build"]), arch=text(doc["arch"]), created=text(doc["created"]), binaries=binaries,
+                 api_sets={text(alias): texts(hosts) for alias, hosts in mapping(doc["api_sets"]).items()},
+                 resolved=resolved, in_degree=in_degree, skipped=tuple(skipped))
+
+
+def load_graph(path: str, build: str, arch: str) -> Graph:
+    """The graph at `path`, for this `build` and `arch` only; anything else raises CacheMismatch, and nothing else.
+
+    The stamp is read before the body: a cache of another build or architecture is refused as such, naming the build
+    and architecture it holds, even when its body would not have decoded. An x64 graph shown on an ARM64 VM would be
+    worse than none, so a stamp that is not exactly this system's is never "close enough". A file that is cut short,
+    not JSON or of the wrong shape is "malformed"."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        raise CacheMismatch("unreadable", "the cache file cannot be opened") from None
+    try:
+        doc = json.loads(raw)
+        _check(type(doc) is dict)
+        stamp = (doc["format"], doc["build"], doc["arch"])
+    except Exception:
+        raise _malformed() from None
+    if stamp[0] != CACHE_FORMAT or type(stamp[0]) is not int:
+        raise CacheMismatch("unknown format", "the cache file is of a format this code does not know")
+    held_build, held_arch = stamp[1], stamp[2]
+    if type(held_build) is not str or type(held_arch) is not str:
+        raise _malformed()
+    if held_build != build:
+        raise CacheMismatch("other build", f"the cache holds build {held_build} ({held_arch}), not {build} ({arch})",
+                            held_build, held_arch)
+    if held_arch != arch:
+        raise CacheMismatch("other architecture",
+                            f"the cache holds build {held_build} for {held_arch}, not for {arch}", held_build, held_arch)
+    try:
+        return _decode(doc)
+    except Exception:
+        raise _malformed() from None
+
+
+# --- the command line the provisioning script calls --------------------------------------------------------------
+
+def host_build() -> str | None:
+    r"""`<build>.<revision>` of the running system, the form the baselines are named in, or None off Windows."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as key:
+            number = winreg.QueryValueEx(key, "CurrentBuildNumber")[0]
+            revision = winreg.QueryValueEx(key, "UBR")[0]
+    except (ImportError, OSError):
+        return None
+    return f"{number}.{revision}"
+
+
+def host_arch() -> str:
+    """"arm64" or "x64", as the web UI's own default view reads it. An interpreter that runs under emulation says
+    "AMD64" on an ARM64 system: whoever knows better passes --arch."""
+    import platform
+    return "arm64" if platform.machine().upper() in ("ARM64", "AARCH64") else "x64"
+
+
+def _arguments(argv):
+    """`{option: value}` of `--out`, `--system32`, `--build` and `--arch`, None for anything else."""
+    known = ("--out", "--system32", "--build", "--arch")
+    if len(argv) % 2 or any(option not in known for option in argv[::2]) or len(set(argv[::2])) != len(argv) // 2:
+        return None
+    return dict(zip(argv[::2], argv[1::2]))
+
+
+def main(argv=None) -> int:
+    """`binary_graph.py --out <dir> [--system32 <dir>] [--build <b>] [--arch <a>]`: build the cache and write it to
+    `<dir>`. One `name: number` line per count on stdout, then `cache: <path>`; the reason of a failure goes to stderr.
+    Returns 0 on success and 1 otherwise, a directory without a PE in it included: a graph of nothing is not written.
+    The api-set map is read from `apisetschema.dll` of the directory."""
+    options = _arguments(sys.argv[1:] if argv is None else list(argv))
+    if options is None or "--out" not in options:
+        print("usage: binary_graph.py --out <dir> [--system32 <dir>] [--build <b>] [--arch <a>]", file=sys.stderr)
+        return 1
+    system32 = options.get("--system32", SYSTEM32)
+    build = options.get("--build") or host_build()
+    arch = options.get("--arch") or host_arch()
+    if not build:
+        print("the build of this system cannot be read: pass --build", file=sys.stderr)
+        return 1
+    try:
+        name = cache_name(build, arch)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    graph = build_graph(system32, os.path.join(system32, "apisetschema.dll"), build, arch)
+    for label, count in (("binaries", len(graph.binaries)), ("skipped", len(graph.skipped)),
+                         ("api_sets", len(graph.api_sets)), ("resolved", len(graph.resolved)),
+                         ("modules", len(graph.in_degree))):
+        print(f"{label}: {count}")
+    if not graph.binaries:
+        print("no PE could be read in " + system32, file=sys.stderr)
+        return 1
+    target = os.path.join(options["--out"], name)
+    try:
+        os.makedirs(options["--out"], exist_ok=True)
+        save_graph(graph, target)
+    except OSError as exc:
+        print(f"the cache cannot be written ({exc.__class__.__name__})", file=sys.stderr)
+        return 1
+    print(f"cache: {target}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
