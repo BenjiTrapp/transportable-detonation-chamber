@@ -1,5 +1,6 @@
 """The emulation's pure logic (webui/rizin_emulation.py), without rizin."""
 
+import hashlib
 import re
 
 import pytest
@@ -793,3 +794,401 @@ def test_read_patches_takes_an_entry_with_and_without_a_provenance_mark():
     # the mark does not shorten what is too long to write: the entry is still read, so that it can be named
     over = rizin_emulation.MAX_PATCH_BYTES + 1
     assert rizin_sessions._read_patches(f"1000:{'90' * over}:r") == [(0x1000, "90" * over, True)]
+
+
+# --- The timeline of a restorable session ------------------------------------
+
+SHA_A = "a" * 64
+SHA_B = "0123456789abcdef" * 4
+
+
+def _timeline():
+    """A record holding every kind of action, a second start in the middle, a skip with and without a
+    value, an until with its address, and words at both ends of what a machine word can be."""
+    return {
+        "counters": {"tick": 0x100000, "handle": 0x6D000000, "pseudo": 0x6E000000},
+        "breakpoints": [0x1010, 0x140001450],
+        "actions": [
+            {"kind": "start", "addr": 0x14000144f},
+            {"kind": "run", "run": "cont"},
+            {"kind": "skip", "addr": 0x140001460, "value": 0x1234, "fix": 0x20},
+            {"kind": "patch", "addr": 0x140001470, "data": "9090"},
+            {"kind": "run", "run": "until", "addr": 0x1400014A0},
+            {"kind": "start", "addr": 0x140001500},
+            {"kind": "skip", "addr": 0x140001510, "value": None, "fix": 0},
+            {"kind": "run", "run": "to_call"},
+            {"kind": "skip", "addr": 2 ** 64 - 1, "value": 2 ** 64 - 1, "fix": 2 ** 64 - 1},
+        ],
+        "digests": [{"start": 0x1000, "end": 0x103F, "sha256": SHA_A},
+                    {"start": 0x2000, "end": 0x2000, "sha256": SHA_B}],
+    }
+
+
+_TIMELINE_LINE = (
+    "1;100000,6d000000,6e000000;1010,140001450;"
+    "start:14000144f,run:cont,skip:140001460:1234:20,patch:140001470:9090,run:until:1400014a0,"
+    "start:140001500,skip:140001510:-:0,run:to_call,skip:ffffffffffffffff:ffffffffffffffff:ffffffffffffffff;"
+    f"1000-103f-{SHA_A},2000-2000-{SHA_B};end")
+
+
+def test_restore_line_and_read_restore_round_trip_a_timeline():
+    """The timeline is one line of the project's /tdc namespace, and it comes back as it went in -- the
+    actions in the order they were made in, which is what makes a patch land after the run that decrypted
+    what it patches and before the run that goes on."""
+    record = _timeline()
+    line, fitted = rizin_emulation.restore_line(record, 32 * 1024)
+    assert (line, fitted) == (_TIMELINE_LINE, True)
+    assert "\n" not in line and "\r" not in line
+    assert rizin_emulation.read_restore(line) == record
+    assert rizin_emulation.read_restore(line)["actions"] == record["actions"]
+
+    # the order is the record's and nothing sorts it: the same actions the other way round are another line
+    backwards = dict(record, actions=[record["actions"][0]] + record["actions"][:0:-1])
+    other, _ = rizin_emulation.restore_line(backwards, 32 * 1024)
+    assert other != line
+    assert rizin_emulation.read_restore(other)["actions"] == backwards["actions"]
+    assert [a["kind"] for a in rizin_emulation.read_restore(line)["actions"]][:4] == [
+        "start", "run", "skip", "patch"]
+
+    # the breakpoints ride along once, as a set: written sorted, without a repeat, whatever order they come in
+    shuffled = dict(record, breakpoints=[0x140001450, 0x1010, 0x1010])
+    assert rizin_emulation.restore_line(shuffled, 32 * 1024)[0] == line
+    quiet, _ = rizin_emulation.restore_line(dict(record, breakpoints=[]), 32 * 1024)
+    assert quiet.split(";")[2] == ""
+    assert rizin_emulation.read_restore(quiet)["breakpoints"] == []
+    # no digest is no digest, not a refusal: a run that wrote nothing has nothing to prove
+    bare, _ = rizin_emulation.restore_line(dict(record, digests=[]), 32 * 1024)
+    assert bare.split(";")[4] == ""
+    assert rizin_emulation.read_restore(bare)["digests"] == []
+
+    # every action kind the record may hold is a kind of RESTORE_KINDS, and a run's kind one of STEP_COMMANDS
+    assert rizin_emulation.RESTORE_KINDS == ("start", "run", "skip", "patch")
+    for run in rizin_emulation.STEP_COMMANDS:
+        action = {"kind": "run", "run": run}
+        if run == "until":
+            action["addr"] = 0x10
+        again = rizin_emulation.read_restore(rizin_emulation.restore_line(
+            dict(record, actions=[record["actions"][0], action]), 32 * 1024)[0])
+        assert again["actions"][1] == action
+
+    # nothing read back can become part of a command: every text is one of a fixed set or hex
+    for action in rizin_emulation.read_restore(line)["actions"]:
+        assert action["kind"] in rizin_emulation.RESTORE_KINDS
+        assert action.get("run", "cont") in rizin_emulation.STEP_COMMANDS
+        assert re.fullmatch(r"(?:[0-9a-f]{2})*", action.get("data", ""))
+
+
+def _swap(line, old, new):
+    assert line.count(old) == 1, (old, line)
+    return line.replace(old, new)
+
+
+def test_read_restore_refuses_a_hand_edited_record():
+    """Review Focus 3, on the pure level. The project is a file a user can edit, so a record is believed
+    only whole: each of these changes one thing in a record that reads, and none of them gives a record --
+    never one that is half read."""
+    line = _TIMELINE_LINE
+    assert rizin_emulation.read_restore(line) is not None, "the line these edits start from reads"
+    bad = {
+        "not a string": None,
+        "bytes": line.encode(),
+        "a number": 1,
+        "empty": "",
+        "another version": "2" + line[1:],
+        "no version": line[2:],
+        "a newline at the end": line + "\n",
+        "a line that ends in the middle of the digests": line[:line.rindex(";")],
+        "cut inside the last digest": line[:line.rindex(";") - 10] + ";end",
+        "an extra section": line + ";x",
+        "a section less": line.replace(";" + f"1000-103f-{SHA_A},2000-2000-{SHA_B}", ""),
+        "an unknown kind": _swap(line, "run:cont", "jump:cont"),
+        "a kind with a capital": _swap(line, "patch:", "Patch:"),
+        "an empty kind": _swap(line, ",run:cont", ",:cont"),
+        "an empty action": _swap(line, "run:cont,skip", "run:cont,,skip"),
+        "a start with no address": _swap(line, "start:14000144f", "start:"),
+        "a start address that is no hex": _swap(line, "start:14000144f", "start:14000144g"),
+        "a start address with 0x": _swap(line, "start:14000144f", "start:0x14000144f"),
+        "a start address with a sign": _swap(line, "start:14000144f", "start:+14000144f"),
+        "a negative address": _swap(line, "start:14000144f", "start:-1"),
+        "an address in capitals": _swap(line, "start:14000144f", "start:14000144A"),
+        "an address of 17 digits": _swap(line, "start:14000144f", "start:10000000000000000"),
+        "an address of 17 digits that is small": _swap(line, "start:14000144f", "start:00000000000000001"),
+        "an address with a space": _swap(line, "start:14000144f", "start: 14000144f"),
+        "an address with an underscore": _swap(line, "start:14000144f", "start:1400_01440"),
+        "an address with a newline in it": _swap(line, "start:14000144f", "start:14000144f\n"),
+        "an address in other digits": _swap(line, "start:14000144f", "start:\u0661\u0660\u0660\u0660"),
+        "an address in full width digits": _swap(line, "start:14000144f", "start:\uff11\uff10\uff10\uff10"),
+        "a start that says more": _swap(line, "start:14000144f", "start:14000144f:1"),
+        "a run kind that is none of STEP_COMMANDS": _swap(line, "run:cont", "run:fly"),
+        "a run kind that is a python name": _swap(line, "run:cont", "run:__class__"),
+        "a run with no kind": _swap(line, "run:cont", "run:"),
+        "an until with no address": _swap(line, "run:until:1400014a0", "run:until"),
+        "an until with a bad address": _swap(line, "run:until:1400014a0", "run:until:zz"),
+        "a run that takes an address it has no use for": _swap(line, "run:cont", "run:cont:1000"),
+        "a skip with no fix": _swap(line, "skip:140001460:1234:20", "skip:140001460:1234"),
+        "a skip with a value that is no number": _swap(line, "skip:140001460:1234:20", "skip:140001460:xyz:20"),
+        "a skip with a value of 0x": _swap(line, "skip:140001460:1234:20", "skip:140001460:0x1234:20"),
+        "a skip with a fix that is no number": _swap(line, "skip:140001460:1234:20", "skip:140001460:1234:-1"),
+        "a skip with an empty value": _swap(line, "skip:140001460:1234:20", "skip:140001460::20"),
+        "a skip with an address that is none": _swap(line, "skip:140001460:1234:20", "skip:-:1234:20"),
+        "a patch with no bytes": _swap(line, "patch:140001470:9090", "patch:140001470:"),
+        "a patch with a half byte": _swap(line, "patch:140001470:9090", "patch:140001470:909"),
+        "a patch with bytes that are no hex": _swap(line, "patch:140001470:9090", "patch:140001470:90zz"),
+        "a patch in capitals": _swap(line, "patch:140001470:9090", "patch:140001470:90AB"),
+        "a patch with a command in it": _swap(line, "patch:140001470:9090", "patch:140001470:90;wx 90"),
+        "a patch longer than a patch can be": _swap(line, "patch:140001470:9090",
+                                                   "patch:140001470:" + "90" * (rizin_emulation.MAX_PATCH_BYTES + 1)),
+        "a patch with no address": _swap(line, "patch:140001470:9090", "patch:9090"),
+        "counters of two": _swap(line, "100000,6d000000,6e000000", "100000,6d000000"),
+        "counters of four": _swap(line, "100000,6d000000,6e000000", "100000,6d000000,6e000000,1"),
+        "a counter that is no hex": _swap(line, "100000,6d000000,6e000000", "100000,6d00000q,6e000000"),
+        "a counter of none": _swap(line, "100000,6d000000,6e000000", "100000,,6e000000"),
+        "a breakpoint that is no hex": _swap(line, "1010,140001450", "1010,14000145g"),
+        "breakpoints out of order": _swap(line, "1010,140001450", "140001450,1010"),
+        "a breakpoint twice": _swap(line, "1010,140001450", "1010,1010"),
+        "an empty breakpoint": _swap(line, "1010,140001450", "1010,"),
+        "a digest with no hash": _swap(line, f"1000-103f-{SHA_A}", "1000-103f"),
+        "a hash of 63 digits": _swap(line, SHA_A, SHA_A[1:]),
+        "a hash of 65 digits": _swap(line, SHA_A, SHA_A + "a"),
+        "a hash that is no hex": _swap(line, SHA_A, "g" + SHA_A[1:]),
+        "a hash in capitals": _swap(line, SHA_A, "A" * 64),
+        "a digest that ends before it starts": _swap(line, f"1000-103f-{SHA_A}", f"1040-103f-{SHA_A}"),
+        "digests out of order": _swap(line, f"1000-103f-{SHA_A},2000-2000-{SHA_B}",
+                                      f"2000-2000-{SHA_B},1000-103f-{SHA_A}"),
+        "digests that overlap": _swap(line, f"2000-2000-{SHA_B}", f"103f-2000-{SHA_B}"),
+        "a digest with a bad address": _swap(line, f"2000-2000-{SHA_B}", f"2000-z-{SHA_B}"),
+        "a digest with a fourth part": _swap(line, f"2000-2000-{SHA_B}", f"2000-2000-{SHA_B}-1"),
+    }
+    for what, value in bad.items():
+        assert rizin_emulation.read_restore(value) is None, what
+
+    # a sequence that does not begin with a start is no sequence, whatever else is right about it
+    def with_actions(actions):
+        return _swap(line, line.split(";")[3], actions)
+
+    for what, actions in {
+        "it begins with a run": "run:cont,start:14000144f",
+        "it begins with a patch": "patch:140001470:9090,start:14000144f",
+        "it begins with a skip": "skip:140001460:1234:20,start:14000144f",
+        "it has no action at all": "",
+    }.items():
+        assert rizin_emulation.read_restore(with_actions(actions)) is None, what
+    assert rizin_emulation.read_restore(with_actions("start:1")) is not None, "one start is a timeline"
+
+    # as long as a timeline may be, and one action longer
+    longest = rizin_emulation.RESTORE_MAX_ACTIONS
+    assert rizin_emulation.read_restore(with_actions(",".join(["start:1"] + ["run:cont"] * (longest - 1)))) is not None
+    assert rizin_emulation.read_restore(with_actions(",".join(["start:1"] + ["run:cont"] * longest))) is None
+
+
+def test_restore_line_says_when_it_does_not_fit():
+    """Review Focus 2: past the budget the value is "" and False -- a record is written whole or not at
+    all, never as a line that stops where the budget did."""
+    record = _timeline()
+    whole = len(_TIMELINE_LINE)
+    assert rizin_emulation.restore_line(record, whole) == (_TIMELINE_LINE, True), "the budget is a limit it may reach"
+    assert rizin_emulation.restore_line(record, whole - 1) == ("", False)
+    assert rizin_emulation.restore_line(record, 0) == ("", False)
+    assert rizin_emulation.restore_line(record, -5) == ("", False)
+    for budget in range(0, whole, 7):
+        value, fitted = rizin_emulation.restore_line(record, budget)
+        assert (value, fitted) == ("", False), budget
+
+    # a timeline with more actions than a replay may take does not fit either, however large the budget
+    longest = rizin_emulation.RESTORE_MAX_ACTIONS
+    runs = [{"kind": "run", "run": "cont"}] * (longest - 1)
+    start = {"kind": "start", "addr": 1}
+    value, fitted = rizin_emulation.restore_line(dict(record, actions=[start] + runs), 10 ** 6)
+    assert fitted is True and rizin_emulation.read_restore(value)["actions"] == [start] + runs
+    assert rizin_emulation.restore_line(dict(record, actions=[start] + runs + [runs[0]]), 10 ** 6) == ("", False)
+
+
+def test_restore_line_refuses_a_record_that_read_restore_would_refuse():
+    """The writer holds to what the reader accepts: a record the server built wrong is a mistake to find
+    where it is made, not a line that cannot be read back at the next open."""
+    good = _timeline()
+    start = {"kind": "start", "addr": 1}
+    bad = {
+        "no counters": dict(good, counters=None),
+        "a counter missing": dict(good, counters={"tick": 1, "handle": 2}),
+        "a counter that is a string": dict(good, counters={"tick": "1", "handle": 2, "pseudo": 3}),
+        "no actions": dict(good, actions=[]),
+        "first not a start": dict(good, actions=[{"kind": "run", "run": "cont"}, start]),
+        "an unknown kind": dict(good, actions=[start, {"kind": "jump"}]),
+        "an unknown run": dict(good, actions=[start, {"kind": "run", "run": "fly"}]),
+        "until with no address": dict(good, actions=[start, {"kind": "run", "run": "until"}]),
+        "cont with an address": dict(good, actions=[start, {"kind": "run", "run": "cont", "addr": 1}]),
+        "an address that is a bool": dict(good, actions=[{"kind": "start", "addr": True}]),
+        "an address that is negative": dict(good, actions=[{"kind": "start", "addr": -1}]),
+        "an address of 2^64": dict(good, actions=[{"kind": "start", "addr": 2 ** 64}]),
+        "an address that is text": dict(good, actions=[{"kind": "start", "addr": "0x10"}]),
+        "an address that is a float": dict(good, actions=[{"kind": "start", "addr": 1.0}]),
+        "a start with another field": dict(good, actions=[{"kind": "start", "addr": 1, "x": 1}]),
+        "an until with an address that is a bool": dict(good, actions=[start, {"kind": "run", "run": "until", "addr": True}]),
+        "an until with an address of 2^64": dict(good, actions=[start, {"kind": "run", "run": "until", "addr": 2 ** 64}]),
+        "a skip with a negative value": dict(good, actions=[start, {"kind": "skip", "addr": 1, "value": -1, "fix": 0}]),
+        "a skip with a value of 2^64": dict(good, actions=[start, {"kind": "skip", "addr": 1, "value": 2 ** 64, "fix": 0}]),
+        "a skip with a value that is a bool": dict(good, actions=[start, {"kind": "skip", "addr": 1, "value": True, "fix": 0}]),
+        "a skip with a fix of 2^64": dict(good, actions=[start, {"kind": "skip", "addr": 1, "value": None, "fix": 2 ** 64}]),
+        "a negative counter": dict(good, counters={"tick": -1, "handle": 2, "pseudo": 3}),
+        "a counter of 2^64": dict(good, counters={"tick": 2 ** 64, "handle": 2, "pseudo": 3}),
+        "a counter more": dict(good, counters={"tick": 1, "handle": 2, "pseudo": 3, "other": 4}),
+        "digests that are none": dict(good, digests=None),
+        "a digest with an extra key": dict(good, digests=[{"start": 1, "end": 2, "sha256": SHA_A, "x": 1}]),
+        "a digest with no hash": dict(good, digests=[{"start": 1, "end": 2}]),
+        "a digest that is no dict": dict(good, digests=[(1, 2, SHA_A)]),
+        "digests that overlap": dict(good, digests=[{"start": 1, "end": 5, "sha256": SHA_A},
+                                                    {"start": 5, "end": 6, "sha256": SHA_A}]),
+        "a skip with no value key": dict(good, actions=[start, {"kind": "skip", "addr": 1, "fix": 0}]),
+        "a negative fix": dict(good, actions=[start, {"kind": "skip", "addr": 1, "value": None, "fix": -1}]),
+        "patch bytes that are no hex": dict(good, actions=[start, {"kind": "patch", "addr": 1, "data": "9"}]),
+        "patch bytes as bytes": dict(good, actions=[start, {"kind": "patch", "addr": 1, "data": b"\x90"}]),
+        "a hash that is short": dict(good, digests=[{"start": 1, "end": 2, "sha256": "ab"}]),
+        "a digest backwards": dict(good, digests=[{"start": 2, "end": 1, "sha256": SHA_A}]),
+        "a breakpoint that is text": dict(good, breakpoints=["0x10"]),
+        "a breakpoint that is a bool": dict(good, breakpoints=[True]),
+        "breakpoints that are no list": dict(good, breakpoints=None),
+        "a record that is no dict": [start],
+    }
+    for what, record in bad.items():
+        try:
+            rizin_emulation.restore_line(record, 10 ** 6)
+        except ValueError:
+            continue
+        pytest.fail(f"written although it is {what}")
+
+
+def _cache_row(addr, after, mine=False, before=None):
+    size = len(after) // 2
+    return {"addr": addr, "size": size, "before": before if before is not None else "00" * size,
+            "after": after, "mine": mine, "over_run": False}
+
+
+def _sha(data):
+    return hashlib.sha256(bytes.fromhex(data)).hexdigest()
+
+
+def _digests_of(rows):
+    return rizin_emulation.run_digests(rows, rizin_emulation.run_only_ranges(rows))
+
+
+def test_run_digests_hash_the_bytes_the_run_left_not_the_patch():
+    """The sharpest finding of the builder check: run_only_ranges takes out every byte a patch covers --
+    the very bytes the analyst patched -- so a hash over its ranges would be silent exactly where the
+    proof matters. The digest covers the run's range whole, and what it hashes there is what the run
+    wrote, not the patch.
+
+    rizin's ``before`` for a patch over a run's byte is that byte (measured, docs/api.md GET /patches),
+    and the row of the run says the same in its ``after``: the second is what is read, because a second
+    patch over the same byte has the first one's bytes in its ``before``."""
+    run = _cache_row(0x1000, "4142434445464748")  # the decryption wrote eight bytes
+    patch = _cache_row(0x1002, "90", mine=True, before="43")  # and the analyst NOPped the third
+    rows = [run, patch]
+    assert rizin_emulation.run_only_ranges(rows) == [(0x1000, 0x1001), (0x1003, 0x1007)], \
+        "what the digest must not be taken from"
+
+    assert rizin_emulation.run_digests(rows, rizin_emulation.run_only_ranges(rows)) == [
+        {"start": 0x1000, "end": 0x1007, "sha256": _sha("4142434445464748")}]
+
+    # the patch's bytes are not in it: other patch bytes, the same proof
+    for other in ("00", "ff", "43"):
+        assert _digests_of([run, _cache_row(0x1002, other, mine=True, before="43")]) == _digests_of(rows)
+    # and the run's bytes are: one of them changed, another proof
+    changed = _digests_of([_cache_row(0x1000, "4142444445464748"), patch])
+    assert changed[0]["sha256"] != _digests_of(rows)[0]["sha256"]
+    assert changed[0]["sha256"] == _sha("4142444445464748")
+
+    # a patch over the first byte and one over the last: the range does not lose its ends
+    ends = [run, _cache_row(0x1000, "90", mine=True, before="41"), _cache_row(0x1007, "90", mine=True, before="48")]
+    assert rizin_emulation.run_only_ranges(ends) == [(0x1001, 0x1006)]
+    assert _digests_of(ends) == [{"start": 0x1000, "end": 0x1007, "sha256": _sha("4142434445464748")}]
+
+    # a patch that is the whole of what the run wrote leaves run_only_ranges nothing, and the proof still stands
+    lone = [_cache_row(0x2000, "41"), _cache_row(0x2000, "90", mine=True, before="41")]
+    assert rizin_emulation.run_only_ranges(lone) == []
+    assert _digests_of(lone) == [{"start": 0x2000, "end": 0x2000, "sha256": _sha("41")}]
+
+    # a second patch over the same byte has the first one's bytes as its before: still the run's byte
+    twice = [run, _cache_row(0x1002, "90", mine=True, before="43"), _cache_row(0x1002, "cc", mine=True, before="90")]
+    assert _digests_of(twice) == _digests_of(rows)
+
+    # a patch before the run, which the run then wrote over, is the run's byte too
+    first = [_cache_row(0x1002, "90", mine=True, before="ff"), run]
+    assert _digests_of(first) == _digests_of(rows)
+
+
+def test_run_digests_follow_the_order_the_run_wrote_in():
+    """The bytes a run left are the last it wrote to each address, so the order of the rows is part of the
+    proof: a write over an earlier one wins, and rizin lists them in the order they were made in."""
+    wide, narrow = _cache_row(0x10, "aabbccdd"), _cache_row(0x11, "ee")
+    assert _digests_of([wide, narrow]) == [{"start": 0x10, "end": 0x13, "sha256": _sha("aaeeccdd")}]
+    assert _digests_of([narrow, wide]) == [{"start": 0x10, "end": 0x13, "sha256": _sha("aabbccdd")}]
+    # the same address written twice, as a decryption loop does it: the later write is what stays
+    assert _digests_of([_cache_row(0x10, "01"), _cache_row(0x10, "02")])[0]["sha256"] == _sha("02")
+    assert _digests_of([_cache_row(0x10, "02"), _cache_row(0x10, "01")])[0]["sha256"] == _sha("01")
+    # a run that wrote over a patch left its own byte, a patch over the run's byte did not change it
+    assert _digests_of([_cache_row(0x10, "01", mine=True, before="ff"), _cache_row(0x10, "02")])[0]["sha256"] == _sha("02")
+    assert _digests_of([_cache_row(0x10, "02"), _cache_row(0x10, "01", mine=True, before="02")])[0]["sha256"] == _sha("02")
+    # a byte hashes where it is, not where it was written first: the bytes go in by address
+    assert _digests_of([_cache_row(0x11, "bb"), _cache_row(0x10, "aa")])[0]["sha256"] == _sha("aabb")
+    assert _digests_of([_cache_row(0x10, "aa"), _cache_row(0x11, "bb")])[0]["sha256"] == _sha("aabb")
+    assert _digests_of([_cache_row(0x10, "bb"), _cache_row(0x11, "aa")])[0]["sha256"] == _sha("bbaa")
+
+
+def test_run_digests_have_one_range_for_each_stretch_of_written_bytes():
+    """Where the ranges are: a stretch the run wrote is one range, whatever patches lie in it; two stretches
+    with a byte between them the run did not write are two, lowest first, each with its own hash."""
+    low, high = _cache_row(0x1000, "0102"), _cache_row(0x1003, "0304")
+    assert _digests_of([high, low]) == [{"start": 0x1000, "end": 0x1001, "sha256": _sha("0102")},
+                                        {"start": 0x1003, "end": 0x1004, "sha256": _sha("0304")}]
+    # the byte between is the file's (or a patch's), not the run's: it is no part of either hash
+    gap = [low, high, _cache_row(0x1002, "90", mine=True, before="00")]
+    assert _digests_of(gap) == [{"start": 0x1000, "end": 0x1001, "sha256": _sha("0102")},
+                                {"start": 0x1003, "end": 0x1004, "sha256": _sha("0304")}]
+    # touching writes are one range
+    assert _digests_of([low, _cache_row(0x1002, "05")]) == [{"start": 0x1000, "end": 0x1002, "sha256": _sha("010205")}]
+    # a patch over bytes the run never wrote proves nothing about the run, and a patch alone is no range
+    assert _digests_of([low, _cache_row(0x500, "90", mine=True, before="cc")]) == [
+        {"start": 0x1000, "end": 0x1001, "sha256": _sha("0102")}]
+    assert _digests_of([_cache_row(0x500, "90", mine=True, before="cc")]) == []
+    assert _digests_of([]) == []
+    assert rizin_emulation.run_digests([], []) == []
+    # a patch that reaches over the end of the run's bytes covers only the run's part of its own
+    reach = [low, _cache_row(0x1001, "9090", mine=True, before="02" + "00")]
+    assert _digests_of(reach) == [{"start": 0x1000, "end": 0x1001, "sha256": _sha("0102")}]
+    # two ranges a patch of the one spans both ends of: the hole in the middle splits them
+    spans = [_cache_row(0x10, "01"), _cache_row(0x12, "03"), _cache_row(0x10, "90909090", mine=True, before="01000300")]
+    assert _digests_of(spans) == [{"start": 0x10, "end": 0x10, "sha256": _sha("01")},
+                                  {"start": 0x12, "end": 0x12, "sha256": _sha("03")}]
+
+
+def test_run_digests_take_the_territory_from_the_ranges_they_are_given():
+    """``ranges`` say where the run's bytes are that a proof is wanted for; a patch's spot inside the run's
+    own bytes is added back to them. What is asked for outside what the run wrote cannot be proved from the
+    rows, and is left out rather than hashed from nothing."""
+    rows = [_cache_row(0x1000, "01020304"), _cache_row(0x2000, "0506")]
+    both = rizin_emulation.run_only_ranges(rows)
+    assert rizin_emulation.run_digests(rows, both) == [
+        {"start": 0x1000, "end": 0x1003, "sha256": _sha("01020304")},
+        {"start": 0x2000, "end": 0x2001, "sha256": _sha("0506")}]
+    assert rizin_emulation.run_digests(rows, [(0x2000, 0x2001)]) == [
+        {"start": 0x2000, "end": 0x2001, "sha256": _sha("0506")}]
+    assert rizin_emulation.run_digests(rows, [(0x1001, 0x1002)]) == [
+        {"start": 0x1001, "end": 0x1002, "sha256": _sha("0203")}]
+    assert rizin_emulation.run_digests(rows, []) == []
+    # outside the run's bytes: nothing, and the part inside is kept
+    assert rizin_emulation.run_digests(rows, [(0x9000, 0x9010)]) == []
+    assert rizin_emulation.run_digests(rows, [(0x0FF0, 0x1001)]) == [
+        {"start": 0x1000, "end": 0x1001, "sha256": _sha("0102")}]
+    # ranges that touch or lie out of order are one range, and the result is lowest first
+    assert rizin_emulation.run_digests(rows, [(0x2000, 0x2001), (0x1002, 0x1003), (0x1000, 0x1001)]) == \
+        rizin_emulation.run_digests(rows, both)
+    # a patch inside the run, with a range that leaves the patch out: the spot is added back
+    patched = rows + [_cache_row(0x1001, "90", mine=True, before="02")]
+    assert rizin_emulation.run_digests(patched, [(0x1000, 0x1000), (0x1002, 0x1003)]) == [
+        {"start": 0x1000, "end": 0x1003, "sha256": _sha("01020304")}]
+    # the rows' own bytes are checked: a row whose bytes are not its size is not read
+    with pytest.raises(ValueError):
+        rizin_emulation.run_digests([dict(_cache_row(0x10, "0102"), size=3)], [(0x10, 0x12)])
+    with pytest.raises(ValueError):
+        rizin_emulation.run_digests([dict(_cache_row(0x10, "0102"), after="zz01")], [(0x10, 0x11)])

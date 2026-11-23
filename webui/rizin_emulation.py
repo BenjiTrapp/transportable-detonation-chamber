@@ -6,6 +6,7 @@ wrong value would silently show a wrong register, stack word or pointer.
 
 import bisect
 import collections
+import hashlib
 import json
 import re
 
@@ -534,6 +535,278 @@ def in_ranges(addr, ranges):
         return False
     at = bisect.bisect_right(ranges, (addr, 2 ** 64)) - 1  # the last range that starts at or below addr
     return at >= 0 and addr <= ranges[at][1]
+
+
+# --- The timeline of a restorable session -----------------------------------
+
+# The project cannot hold the bytes a run decrypted (a 64 KB read window, a 32 KB budget), so it holds the
+# way there: one ordered timeline of what the emulation did, and a SHA-256 per decrypted range as the proof
+# that replaying it gave the same bytes. A *record* is
+#
+#   {"counters": {"tick", "handle", "pseudo"},   the assistant's counters when the timeline began
+#    "breakpoints": [addr, ...],                 the set the timeline ran under, once for all of it
+#    "actions": [action, ...],                   in the order they were made in; the first is a start
+#    "digests": [{"start", "end", "sha256"}]}    what the run left, lowest range first
+#
+# and an action is one of these (RESTORE_KINDS), every number an int:
+#
+#   {"kind": "start", "addr"}                     emulation_start at addr
+#   {"kind": "run", "run"[, "addr"]}              emulation_run: "run" is a key of STEP_COMMANDS, and "addr"
+#                                                 is there for "until" and only for it
+#   {"kind": "skip", "addr", "value", "fix"}      call_skip: the value applied (None: none) and the stack
+#                                                 correction applied
+#   {"kind": "patch", "addr", "data"}             a patch, "data" its bytes as lower case hex
+RESTORE_KINDS = ("start", "run", "skip", "patch")
+# The most actions a record may hold. Every action is a request the replay makes while it holds the gate,
+# so this bounds how long a restore can take -- and what a hand-edited project can ask of the server.
+RESTORE_MAX_ACTIONS = 500
+
+_RESTORE_VERSION = "1"
+_RESTORE_END = "end"
+_RESTORE_WORD = re.compile(r"[0-9a-f]{1,16}")
+_RESTORE_BYTES = re.compile(r"(?:[0-9a-f]{2}){1,%d}" % MAX_PATCH_BYTES)
+_RESTORE_SHA = re.compile(r"[0-9a-f]{64}")
+_RESTORE_COUNTERS = ("tick", "handle", "pseudo")
+_RESTORE_ACTION_KEYS = {"start": {"kind", "addr"}, "skip": {"kind", "addr", "value", "fix"},
+                        "patch": {"kind", "addr", "data"}}
+
+
+def _is_word(value):
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 2 ** 64
+
+
+def _action_is_valid(action):
+    if not (isinstance(action, dict) and action.get("kind") in RESTORE_KINDS):
+        return False
+    kind = action["kind"]
+    if kind == "run":
+        run = action.get("run")
+        if not (isinstance(run, str) and run in STEP_COMMANDS):
+            return False
+        if run == "until":
+            return set(action) == {"kind", "run", "addr"} and _is_word(action["addr"])
+        return set(action) == {"kind", "run"}
+    if set(action) != _RESTORE_ACTION_KEYS[kind] or not _is_word(action["addr"]):
+        return False
+    if kind == "skip":
+        return (action["value"] is None or _is_word(action["value"])) and _is_word(action["fix"])
+    if kind == "patch":
+        return isinstance(action["data"], str) and _RESTORE_BYTES.fullmatch(action["data"]) is not None
+    return True
+
+
+def _record_is_valid(record):
+    """Whether ``record`` is one the reader and the writer agree on (the length of the actions is the
+    caller's to bound, see RESTORE_MAX_ACTIONS).
+
+    The same rules for both ends, so that a line the writer makes is a line the reader takes and a
+    hand-edited one is refused by what the writer would never have made: the breakpoints are a set in
+    ascending order, the digests are ranges in ascending order that do not overlap, and the actions begin
+    with a start. Nothing in a valid record is text that could become part of a command: the kinds and the
+    runs come from fixed sets and the rest is numbers, hex bytes and hashes.
+    """
+    if not isinstance(record, dict):
+        return False
+    counters, points, actions, digests = (record.get(key) for key in ("counters", "breakpoints", "actions", "digests"))
+    if not (isinstance(counters, dict) and set(counters) == set(_RESTORE_COUNTERS)
+            and all(_is_word(value) for value in counters.values())):
+        return False
+    if not (isinstance(points, list) and all(_is_word(addr) for addr in points)
+            and all(low < high for low, high in zip(points, points[1:]))):
+        return False
+    if not (isinstance(actions, list) and actions and all(_action_is_valid(action) for action in actions)
+            and actions[0]["kind"] == "start"):
+        return False
+    if not isinstance(digests, list):
+        return False
+    after = -1
+    for digest in digests:
+        if not (isinstance(digest, dict) and set(digest) == {"start", "end", "sha256"}
+                and _is_word(digest["start"]) and _is_word(digest["end"])
+                and isinstance(digest["sha256"], str) and _RESTORE_SHA.fullmatch(digest["sha256"])
+                and after < digest["start"] <= digest["end"]):
+            return False
+        after = digest["end"]
+    return True
+
+
+def _action_token(action):
+    kind = action["kind"]
+    if kind == "start":
+        return f"start:{action['addr']:x}"
+    if kind == "run":
+        return f"run:{action['run']}" + (f":{action['addr']:x}" if action["run"] == "until" else "")
+    if kind == "skip":
+        value = "-" if action["value"] is None else f"{action['value']:x}"
+        return f"skip:{action['addr']:x}:{value}:{action['fix']:x}"
+    return f"patch:{action['addr']:x}:{action['data']}"
+
+
+def restore_line(record, budget):
+    """The record as the value of one ``/tdc`` line, and whether it fitted: (value, True), or ("", False)
+    when the line is longer than ``budget`` characters or the record has more than RESTORE_MAX_ACTIONS
+    actions. A record that does not fit is **not** written in part: a timeline that ends where the budget
+    did would replay to somewhere nobody named. The patches have the budget first, so ``budget`` is what is
+    left of PROJECT_PATCH_CHARS after them, and the line is counted without its ``restore=``.
+
+    A record that is none (a wrong kind, an address that is no machine word, a start that is not first) is a
+    mistake of the caller and raises ValueError, so that it is found when it is made and not when the line
+    is read back and refused.
+
+    The line is compact and holds only characters of [0-9a-f:,;-] and the kinds' words, so it has no
+    newline and survives the project's line-based reading:
+
+        1;<tick>,<handle>,<pseudo>;<breakpoint>,...;<action>,...;<start>-<end>-<sha256>,...;end
+
+    with the numbers in lower case hex and each action as ``start:<addr>``, ``run:<run>`` (``run:until:<addr>``),
+    ``skip:<addr>:<value or ->:<fix>`` or ``patch:<addr>:<hex>``. The last section is a terminator: a line
+    that was cut short does not end in it, and a cut at a comma would otherwise read as a shorter record.
+    The breakpoints are written sorted, once each.
+    """
+    try:
+        points = sorted(set(record["breakpoints"]))
+    except (TypeError, KeyError):
+        raise ValueError("not a record of a restorable timeline") from None
+    record = dict(record, breakpoints=points)
+    if not _record_is_valid(record):
+        raise ValueError("not a record of a restorable timeline")
+    if len(record["actions"]) > RESTORE_MAX_ACTIONS:
+        return "", False
+    counters = record["counters"]
+    line = ";".join((
+        _RESTORE_VERSION,
+        ",".join(f"{counters[name]:x}" for name in _RESTORE_COUNTERS),
+        ",".join(f"{addr:x}" for addr in points),
+        ",".join(_action_token(action) for action in record["actions"]),
+        ",".join(f"{d['start']:x}-{d['end']:x}-{d['sha256']}" for d in record["digests"]),
+        _RESTORE_END))
+    return (line, True) if len(line) <= budget else ("", False)
+
+
+def _read_word(text):
+    if not _RESTORE_WORD.fullmatch(text):
+        raise ValueError(text)
+    return int(text, 16)
+
+
+def _read_action(token):
+    kind, *rest = token.split(":")
+    if kind == "start" and len(rest) == 1:
+        return {"kind": "start", "addr": _read_word(rest[0])}
+    if kind == "run" and len(rest) == 1:
+        return {"kind": "run", "run": rest[0]}
+    if kind == "run" and len(rest) == 2 and rest[0] == "until":
+        return {"kind": "run", "run": "until", "addr": _read_word(rest[1])}
+    if kind == "skip" and len(rest) == 3:
+        return {"kind": "skip", "addr": _read_word(rest[0]),
+                "value": None if rest[1] == "-" else _read_word(rest[1]), "fix": _read_word(rest[2])}
+    if kind == "patch" and len(rest) == 2:
+        return {"kind": "patch", "addr": _read_word(rest[0]), "data": rest[1]}
+    raise ValueError(token)
+
+
+def _read_digest(token):
+    start, end, sha = token.split("-")
+    return {"start": _read_word(start), "end": _read_word(end), "sha256": sha}
+
+
+def read_restore(value):
+    """The record that ``restore_line`` wrote, or None as soon as anything about ``value`` is wrong: not
+    text, another version, a line that does not end where a whole one does, a kind or a run nobody knows,
+    an address or a value that is no hex number, bytes that are no bytes, a hash that is no SHA-256, more
+    actions than RESTORE_MAX_ACTIONS, an order the writer would not have made (breakpoints not ascending,
+    digests overlapping, a first action that is no start).
+
+    The project is a file a user can edit, so the line is hostile input: it is read only whole and only by
+    the grammar above, and a record is never half of one. What it returns holds no text that could become
+    part of a command (see _record_is_valid); the server builds every command a replay sends itself.
+    """
+    if not isinstance(value, str):
+        return None
+    sections = value.split(";")
+    if len(sections) != 6 or sections[0] != _RESTORE_VERSION or sections[5] != _RESTORE_END:
+        return None
+    try:
+        counters = [_read_word(text) for text in sections[1].split(",")]
+        record = {"counters": dict(zip(_RESTORE_COUNTERS, counters)),
+                  "breakpoints": [_read_word(text) for text in sections[2].split(",")] if sections[2] else [],
+                  "actions": [_read_action(token) for token in sections[3].split(",")],
+                  "digests": [_read_digest(token) for token in sections[4].split(",")] if sections[4] else []}
+    except ValueError:
+        return None
+    if len(counters) != len(_RESTORE_COUNTERS) or len(record["actions"]) > RESTORE_MAX_ACTIONS:
+        return None
+    return record if _record_is_valid(record) else None
+
+
+def _merged(spans):
+    """``spans`` as (low, high) pairs, both in them, in any order, merged where they overlap or touch."""
+    merged = []
+    for low, high in sorted(spans):
+        if merged and low <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], high))
+        else:
+            merged.append((low, high))
+    return merged
+
+
+def _common(first, second):
+    """The addresses in both of two lists of ranges as ``written_ranges`` gives them (lowest first, no overlap)."""
+    common, a, b = [], 0, 0
+    while a < len(first) and b < len(second):
+        low, high = max(first[a][0], second[b][0]), min(first[a][1], second[b][1])
+        if low <= high:
+            common.append((low, high))
+        if first[a][1] < second[b][1]:
+            a += 1
+        else:
+            b += 1
+    return common
+
+
+def run_digests(rows, ranges):
+    """The SHA-256 of what a run left in each range: [{"start", "end", "sha256"}], lowest first, both ends
+    in the range. It is what a replay has to give the same bytes for, and it is made while the cache is
+    alive -- an opened project has no cache to make it from.
+
+    ``rows`` are the cache's rows in **rizin's order**, the order the writes were made in
+    (``patch_rows(..., ordered=True)``, ``patches_made``): where two writes overlap the later one wins, and a
+    list by address cannot say which it is. ``ranges`` are ``run_only_ranges(rows)``.
+
+    The ranges are **not** the digests' boundaries as they come. ``run_only_ranges`` takes out every byte a
+    ``mine`` row covers, and those are the very bytes the analyst patched in the decrypted code: a hash over
+    its ranges would say nothing about them, and where the proof matters most it would be silent. So the
+    digest ranges are those ranges with the run's bytes under a patch put back (the part of each patch that
+    lies over bytes a run wrote; one over the file's own bytes is no part of the run), and merged where they
+    then touch -- a run of 0x40 bytes with a patch in the middle is one range of 0x40, not two of 0x1F.
+    A range asked for where the run wrote nothing is left out: the rows cannot tell what is there.
+
+    What is hashed there is what the run left, which is the ``after`` of the **last non-``mine`` row** over
+    each byte -- not the patch's bytes, and not a patch row's ``before`` either (that is the run's byte for
+    the first patch over it, measured, but a second patch over the same byte has the first one's bytes in
+    its ``before``, and a patch the run later wrote over has the file's). The run's rows carry the answer
+    whatever was patched around them, and what a patch changes does not change the proof.
+    """
+    foreign = [row for row in rows if not row.get("mine")]
+    owned = written_ranges(foreign)
+    spans = _merged(_common(owned, _merged(ranges)) + _common(owned, written_ranges(
+        [row for row in rows if row.get("mine")])))
+    held = [bytearray(high - low + 1) for low, high in spans]
+    starts = [low for low, _ in spans]
+    for row in foreign:  # in rizin's order: a later write over an earlier one is what the run left
+        data = bytes.fromhex(row["after"])
+        if len(data) != row["size"]:
+            raise ValueError("a row of the cache does not hold as many bytes as it says")
+        end = row["addr"] + row["size"]
+        at = max(bisect.bisect_right(starts, row["addr"]) - 1, 0)
+        while at < len(spans) and starts[at] < end:
+            low, high = spans[at]
+            first, last = max(low, row["addr"]), min(high + 1, end)
+            if first < last:
+                held[at][first - low:last - low] = data[first - row["addr"]:last - row["addr"]]
+            at += 1
+    return [{"start": low, "end": high, "sha256": hashlib.sha256(bytes(data)).hexdigest()}
+            for (low, high), data in zip(spans, held)]
 
 
 def string_hits(found):

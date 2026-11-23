@@ -5877,6 +5877,58 @@ def test_real_rizin_a_patch_over_a_runs_bytes_would_be_xored_again(tmp_path):
 
 @pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
 @pytest.mark.skipif(not RZ_ASM, reason="rz-asm not installed")
+def test_real_rizin_the_digest_covers_the_bytes_a_patch_sits_on(tmp_path):
+    """The facts run_digests rests on, measured on the binary: ``run_only_ranges`` loses the bytes under a
+    patch, the cache lists the writes in the order they were made in (``patches_made``; the list by
+    address does not), and a patch over a run's byte leaves the run's byte in its row's ``before`` while
+    the cache reads the patch. The digest must be the SHA-256 of the bytes the run decrypted -- worked out
+    here from the file and the key, not from rizin -- patch or no patch."""
+    import rizin_emulation
+    import rizin_sessions
+
+    blob = tmp_path / "decryptor.bin"
+    stop = _decryptor_blob(blob)
+    plain = bytes(b ^ 0xFF for b in blob.read_bytes()[0x1000:0x1040])
+    mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(tmp_path / "projects"))
+    try:
+        session = mgr.get(mgr.open(str(blob), "tab")["session"])
+        _wait_state(session, "done", timeout=60)
+        session.console("e asm.arch=x86")
+        session.console("e asm.bits=64")
+        session.emulation_start(0)
+        assert session.emulation_run("until", stop)["stopped"] == "step"
+        session.patch(0x1010, b"\x90\x90")
+        assert session.json("pxj 2 @ 0x1010") == [0x90, 0x90], "the cache reads the patch"
+
+        rows = session.patches_made()
+        mine = [row for row in rows if row["mine"]]
+        assert [(r["addr"], r["after"], r["before"]) for r in mine] == [(0x1010, "9090", plain[0x10:0x12].hex())]
+        ranges = rizin_emulation.run_only_ranges(rows)
+        assert ranges == [(0x1000, 0x100F), (0x1012, 0x103F)], "the patched bytes are not in them"
+        assert rizin_emulation.run_digests(rows, ranges) == [
+            {"start": 0x1000, "end": 0x103F, "sha256": hashlib.sha256(plain).hexdigest()}]
+
+        # the order of the rows is the order of the writes, and the digest is what is left of them
+        session.console("wx ee @ 0x1101")
+        session.console("wx aabbccdd @ 0x1100")
+        session.console("wx 11223344 @ 0x1200")
+        session.console("wx 99 @ 0x1201")
+        rows = session.patches_made()
+        assert [r["addr"] for r in rows if not r["mine"]][-4:] == [0x1101, 0x1100, 0x1200, 0x1201]
+        assert [r["addr"] for r in session.patches()["patches"] if not r["mine"]][-4:] == [
+            0x1100, 0x1101, 0x1200, 0x1201], "by address, the first two have changed places"
+        digests = {d["start"]: d["sha256"] for d in rizin_emulation.run_digests(
+            rows, rizin_emulation.run_only_ranges(rows))}
+        assert digests[0x1100] == hashlib.sha256(bytes.fromhex("aabbccdd")).hexdigest()
+        assert digests[0x1200] == hashlib.sha256(bytes.fromhex("11993344")).hexdigest()
+        assert session.json("pxj 4 @ 0x1100") == [0xAA, 0xBB, 0xCC, 0xDD], "and that is what rizin reads"
+        assert session.json("pxj 4 @ 0x1200") == [0x11, 0x99, 0x33, 0x44]
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
+@pytest.mark.skipif(not RZ_ASM, reason="rz-asm not installed")
 def test_real_rizin_the_emulations_stack_is_mapped_only_once_the_emulation_starts(tmp_path):
     """Why the reason of a waiting patch at an unmapped address may not say "never": ``omlj`` when the file
     is opened lists the file's maps only, and the ``mem.*`` map of ``aeim`` arrives with the emulation
