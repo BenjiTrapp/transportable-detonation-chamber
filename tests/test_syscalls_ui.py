@@ -541,6 +541,8 @@ def test_the_tab_loads_the_whole_baseline_page_by_page_and_draws_a_band_per_modu
     baseline = [u for u in r["requests"] if "/api/syscalls/baseline" in u]
     assert [re.search(r"offset=(\d+)", u).group(1) for u in baseline] == ["0", "500", "1000"]
     assert all("limit=500" in u for u in baseline)
+    # the map draws a name, a number and a module: it does not ask for parameters and stub bytes
+    assert all("lean=1" in u for u in baseline)
     assert sum("/api/syscalls/status" in u for u in r["requests"]) == 1 and any("/api/processes" in u for u in r["requests"])
     assert [b[1] for b in r["bands"]] == ["ntdll.dll", "win32u.dll"]
     assert [[c.split(":")[0] for c in b[2]] for b in r["bands"]] == [["H3", "CANVAS"], ["H3", "CANVAS"]]
@@ -726,6 +728,7 @@ def test_a_scan_of_another_view_shows_that_views_baseline():
         out({ urls: requests.map(q => q.url).filter(u => u.includes('view=x64')), subtitle: els['syscalls-subtitle'].textContent });
       })();""")
     assert len(r["urls"]) == 3 and r["subtitle"].endswith("· x64")
+    assert all("lean=1" in u for u in r["urls"]), "the other view's baseline is read lean as well"
 
 
 @needs_node

@@ -8125,6 +8125,15 @@ def _syscall_int_param(raw, name, default, low, high):
     return max(low, min(value, high))
 
 
+def _syscall_flag_param(raw, name):
+    """A request flag: 1 or true, 0 or false; absent is false. Anything else is refused, not guessed at."""
+    if raw in (None, "", "0", "false"):
+        return False
+    if raw in ("1", "true"):
+        return True
+    raise _SyscallRouteError(f"{name} must be 0 or 1")
+
+
 def _syscall_body():
     data = request.get_json(silent=True) if request.is_json else request.form
     return data if hasattr(data, "get") else {}
@@ -8421,15 +8430,19 @@ def api_syscalls_status():
 
 @app.route("/api/syscalls/baseline")
 def api_syscalls_baseline():
-    """The syscall catalog of a view, filtered and in pages. Params: view, query, module, offset, limit."""
+    """The syscall catalog of a view, filtered and in pages. Params: view, query, module, offset, limit, lean.
+
+    With `lean=1` each item is its name, module and number: what a map of all of them draws, without the
+    parameters and stub bytes, which `/api/syscalls/<name>` gives for one syscall."""
     view = _syscall_view_param(request.args.get("view"))
+    lean = _syscall_flag_param(request.args.get("lean"), "lean")
     baseline, why = _syscall_baseline_for(view)
     if baseline is None:
         return jsonify({"error": why, "view": view}), 503
     page = syscall_baseline.catalog(
         baseline, query=(request.args.get("query") or "")[:100], module=(request.args.get("module") or "")[:64],
         offset=_syscall_int_param(request.args.get("offset"), "offset", 0, 0, 10 ** 9),
-        limit=_syscall_int_param(request.args.get("limit"), "limit", 200, 0, SYSCALL_PAGE_MAX))
+        limit=_syscall_int_param(request.args.get("limit"), "limit", 200, 0, SYSCALL_PAGE_MAX), lean=lean)
     page.update(build=baseline.build, view=baseline.view, symbols=baseline.symbols,
                 skipped=len(baseline.skipped), shadowed=len(baseline.shadowed))
     return jsonify(page)

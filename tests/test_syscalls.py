@@ -1793,6 +1793,74 @@ def test_baseline_route_pages_and_filters(client, tdc, fake_baseline_dir):
     assert len(body["items"]) == 2 and body["total"] >= 3
 
 
+FULL_ITEM_KEYS = {"name", "module", "number", "rva", "return_type", "calling_convention", "parameters", "stub_hex",
+                  "is_true_syscall"}
+
+
+def test_the_full_catalog_stays_the_default_and_keeps_its_shape(client, tdc, fake_baseline_dir):
+    for query in ("", "&lean=0", "&lean=false"):
+        body = client.get("/api/syscalls/baseline?view=arm64" + query).get_json()
+        assert body["items"] and all(set(item) == FULL_ITEM_KEYS for item in body["items"]), query
+
+
+def test_the_lean_catalog_has_what_the_map_draws_and_nothing_else(client, tdc, fake_baseline_dir):
+    full = client.get("/api/syscalls/baseline?view=arm64").get_json()
+    for flag in ("1", "true"):
+        lean = client.get(f"/api/syscalls/baseline?view=arm64&lean={flag}").get_json()
+        assert all(set(item) == {"name", "module", "number"} for item in lean["items"]), flag
+        # the same syscalls in the same order, and the same page around them
+        assert lean["items"] == [{k: item[k] for k in ("name", "module", "number")} for item in full["items"]]
+        assert {k: v for k, v in lean.items() if k != "items"} == {k: v for k, v in full.items() if k != "items"}
+
+
+def test_the_lean_catalog_pages_and_filters_like_the_full_one(client, tdc, fake_baseline_dir):
+    for query in ("&query=virtual&limit=2", "&module=win32u.dll", "&offset=1&limit=2", "&query=0x3a"):
+        full = client.get("/api/syscalls/baseline?view=arm64" + query).get_json()
+        lean = client.get("/api/syscalls/baseline?view=arm64&lean=1" + query).get_json()
+        assert [i["name"] for i in lean["items"]] == [i["name"] for i in full["items"]], query
+        assert (lean["total"], lean["offset"], lean["limit"]) == (full["total"], full["offset"], full["limit"]), query
+
+
+@pytest.mark.parametrize("value", ["yes", "2", "lean", "1 ", "-1"])
+def test_a_lean_that_is_no_flag_is_refused(client, tdc, fake_baseline_dir, value):
+    r = client.get("/api/syscalls/baseline", query_string={"view": "arm64", "lean": value})
+    assert r.status_code == 400 and "lean must be" in r.get_json()["error"]
+
+
+def test_the_lean_catalog_of_a_whole_system_is_a_small_part_of_the_full_one(client, tdc, monkeypatch, tmp_path):
+    """The map reads the whole baseline, page by page: 2,461 syscalls (480 of ntdll, the rest of win32u), each with
+    the parameters of the sample entries (four on average). Built from the real entries of tests/samples."""
+    document = _fixture("arm64")
+    entries = [e for e in document["syscalls"] if e.get("is_true_syscall") and e.get("stub_bytes")]
+    syscalls = []
+    for i in range(2461):
+        entry = json.loads(json.dumps(entries[i % len(entries)]))
+        ntdll = i < 480
+        entry.update(module="ntdll.dll" if ntdll else "win32u.dll", rva=4096 + i * 32, syscall_number=i if ntdll else 4096 + i,
+                     name=f"NtSyntheticCall{i}" if ntdll else f"NtUserSyntheticCall{i}")
+        syscalls.append(entry)
+    document["syscalls"] = syscalls
+    directory = tmp_path / "whole-system"
+    directory.mkdir()
+    (directory / "ntsleuth-26220.5770-arm64.json").write_text(json.dumps(document), encoding="utf-8")
+    monkeypatch.setattr(tdc, "NTSLEUTH_BASELINE_DIR", str(directory))
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26220.5770")
+
+    def read(flag):
+        total, items = 0, []
+        for offset in range(0, 2461, tdc.SYSCALL_PAGE_MAX):
+            r = client.get(f"/api/syscalls/baseline?view=arm64&offset={offset}&limit={tdc.SYSCALL_PAGE_MAX}{flag}")
+            total += len(r.data)
+            items += r.get_json()["items"]
+        return total, items
+
+    full_size, full_items = read("")
+    lean_size, lean_items = read("&lean=1")
+    assert len(full_items) == len(lean_items) == 2461
+    assert [i["name"] for i in lean_items] == [i["name"] for i in full_items]
+    assert lean_size < full_size / 10 and lean_size < 250_000, (lean_size, full_size)
+
+
 def test_scan_refuses_without_a_matching_baseline(client, tdc):
     r = client.post("/api/syscalls/scan", json={"pid": 4812})
     assert r.status_code == 400

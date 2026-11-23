@@ -25144,15 +25144,15 @@ async function syscallLoadStatus() {
     return r.ok;
 }
 
-// The whole baseline of `view` (this host's own when empty), read page by page. Only what the map needs is kept
-// of each syscall. On success it replaces the baseline: { ok: true }; otherwise { ok: false, error }, or
+// The whole baseline of `view` (this host's own when empty), read page by page and lean: a name, a module and a
+// number of each syscall, which is all the map draws (the parameters and stub bytes of one come from its lookup). On success it replaces the baseline: { ok: true }; otherwise { ok: false, error }, or
 // { ok: false, superseded: true } when a newer load started meanwhile.
 async function syscallLoadBaseline(view) {
     const seq = ++syscallState.loadSeq;
     const items = [];
     let meta = null, total = Infinity;
     while (items.length < total) {
-        const params = new URLSearchParams({ offset: String(items.length), limit: String(SYSCALL_PAGE) });
+        const params = new URLSearchParams({ offset: String(items.length), limit: String(SYSCALL_PAGE), lean: '1' });
         if (view) params.set('view', view);
         const r = await syscallApi(`/api/syscalls/baseline?${params}`);
         if (seq !== syscallState.loadSeq) return { ok: false, superseded: true };

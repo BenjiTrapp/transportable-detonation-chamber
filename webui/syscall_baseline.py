@@ -184,9 +184,14 @@ def _as_number(query: str) -> int | None:
     return None
 
 
+# What a map of the syscalls draws of each: with `lean`, a catalog page carries these and not the parameters, the
+# stub bytes and the rest, which one syscall's lookup gives
+LEAN_FIELDS = ("name", "module", "number")
+
+
 def catalog(baseline: Baseline, query: str = "", module: str = "",
-            offset: int = 0, limit: int = 200) -> dict:
-    """One page of the syscalls matching `query` and `module`.
+            offset: int = 0, limit: int = 200, lean: bool = False) -> dict:
+    """One page of the syscalls matching `query` and `module`; `lean` lists LEAN_FIELDS of each.
 
     A query that reads as a number matches that number OR the name substring: hex
     digits alone (`add`) are a number too, and must still find `NtAddAtom`."""
@@ -204,7 +209,7 @@ def catalog(baseline: Baseline, query: str = "", module: str = "",
     hits.sort(key=lambda sc: (sc.module.lower(), sc.number))
     offset, limit = max(offset, 0), max(limit, 0)
     return {
-        "items": [_item(sc) for sc in hits[offset:offset + limit]],
+        "items": [_lean_item(sc) if lean else _item(sc) for sc in hits[offset:offset + limit]],
         "total": len(hits),
         "offset": offset,
         "limit": limit,
@@ -214,6 +219,10 @@ def catalog(baseline: Baseline, query: str = "", module: str = "",
 def describe(sc: Syscall) -> dict:
     """One syscall as the catalog lists it."""
     return _item(sc)
+
+
+def _lean_item(sc: Syscall) -> dict:
+    return {"name": sc.name, "module": sc.module, "number": sc.number}
 
 
 def _item(sc: Syscall) -> dict:
