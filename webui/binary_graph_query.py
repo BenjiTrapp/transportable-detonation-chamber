@@ -7,6 +7,9 @@ MAX_NODES is cut and says so; a cut drops whole paths, never half of one, and ke
 Node ids: a module is its lower-case file name ("kernel32.dll"), a function is "<module>!<function>" with the module
 as the importer or forwarder wrote it ("api-ms-win-core-heap-l1-1-0.dll!HeapAlloc"), a syscall is "syscall:<Nt name>".
 A colon cannot be part of a Windows file name, so a syscall id never collides with a module's.
+
+An edge's `origin` is its claim: "derived" is read from the binaries, "curated" is the Win32 to Nt table's word. The one
+curated edge of a path to a syscall is its last, and no other edge of any answer is.
 """
 
 from __future__ import annotations
@@ -15,6 +18,8 @@ import ntpath
 from dataclasses import asdict, dataclass
 
 import binary_graph
+import syscall_baseline
+import win32_to_nt
 
 MAX_NODES = 400
 
@@ -316,6 +321,109 @@ def callers_of_syscall(graph, nt_name: str) -> Answer:
     return _answer(fixed, parts, note, "import chains")
 
 
+# --- the descent from an import to a syscall number --------------------------------------------------------------
+
+def _stop_reason(graph, resolution, module, function):
+    """Why a chain that did not reach a definition stopped at `module`!`function`, as a clause that follows
+    "because". Never a claim that the function exists nowhere: only that this graph has no such export."""
+    reason = resolution.reason
+    if reason == "missing":
+        if _is_api_set(graph, module):
+            return f"no host of the api set {module} in the binary graph exports {function}"
+        if module not in graph.binaries:
+            return f"{module} is not in the binary graph of this system"
+        return f"{module} has no export {function} in the binary graph"
+    if reason == "cycle":
+        return "it comes back to an export it had already passed, a cycle"
+    if reason == "unresolved-api-set":
+        return f"the api-set map of this system has no entry for {module}"
+    if reason == "too-many-hops":
+        return f"it is longer than {binary_graph.MAX_HOPS} hops"
+    return "it ends for a reason this view does not know"
+
+
+_CUT_SHORT_NEGATIVE = (" A table on this chain was cut short when it was read, so this end is not certain: what is "
+                       "missing here may lie in the part that was not read, and it is not proof that the chain really "
+                       "ends here.")
+_CUT_SHORT_POSITIVE = (" A table on this chain was cut short when it was read, so a complete one might have led "
+                       "elsewhere.")
+
+
+def path_to_syscall(graph, table, baseline, module: str, function: str) -> Answer:
+    """The import of `function` from `module` followed down to a syscall number: over the forwarders and api sets the
+    binaries describe (edges "derived"), to the export that defines it, and from there, by the curated Win32 to Nt
+    `table`, to the syscall `baseline` holds under that Nt name (one edge "reaches_syscall", origin "curated", the
+    only curated edge and the last). The Win32 to Nt step is not read from any binary: it would take disassembly, so
+    the answer says it is the table's word.
+
+    A path ends visibly, never by vanishing, and the note says which end it was: the chain does not reach a
+    definition (so not ntdll), the table has no entry for the function it ends at, the table's Nt name is no syscall
+    of the baseline, or there is no table or baseline to ask; and, with any of them, that a table on the chain was cut
+    short when it was read, so a negative end is not certain. A `module` the graph does not know is the root of the
+    path as a file ("exe"), the sample whose import this is. `table` and `baseline` may be None."""
+    name = _module_name(graph, module)
+    function = (function or "").strip()
+    if not name or not function:
+        return _empty("A module and a function are needed to follow an import down to a syscall.")
+    unknown = name not in graph.binaries and name not in graph.in_degree and not _is_api_set(graph, name)
+    if unknown:
+        name = (module or "").strip().lower()
+    resolution = binary_graph.resolve_export(graph.binaries, graph.api_sets, name, function)
+    pairs = _chain((name, function), resolution)
+    head = Node(name, name, "exe", 0, "") if unknown else None
+    part = _chain_part(pairs, resolution, head=head,
+                       roots=[head.id if head else _function_id(*pairs[0])])
+
+    def ended(note, certain=False):
+        if resolution.partial:
+            note += _CUT_SHORT_POSITIVE if certain else _CUT_SHORT_NEGATIVE
+        return _answer(_Part([], [], []), [part], note, "paths")
+
+    end_module, end_function = pairs[-1]
+    end = _function_id(end_module, end_function)
+    if resolution.reason != "defined":
+        note = (f"The chain does not reach ntdll: it stops at {end}, because "
+                f"{_stop_reason(graph, resolution, end_module, end_function)}.")
+        if resolution.hops:
+            note += " The hops it did take are drawn."
+        return ended(note)
+    if table is None:
+        return ended(f"{end} defines it, but the curated Win32 to Nt table could not be read on this system, so the "
+                     f"step to a syscall cannot be followed.")
+    rows = ()
+    for candidate in dict.fromkeys((function, end_function)):
+        rows = table.entries_for(candidate)
+        if rows:
+            break
+    if not rows:
+        return ended(f"The path ends at {end}, which defines it: no curated transition known from "
+                     f"{end_function} to a syscall, so the path ends there.")
+    entry = rows[0]
+    more = ""
+    if len(rows) > 1:
+        more = (f" The table lists {_plural(len(rows) - 1, 'more syscall', 'more syscalls')} for it "
+                f"({', '.join(row.nt for row in rows[1:])}); this path follows the first.")
+    if baseline is None:
+        return ended(f"The curated table leads {entry.win32} to {entry.nt}, but no syscall baseline is loaded for "
+                     f"this system, so the number of the syscall cannot be given.{more}")
+    if entry.nt in table.missing_from(baseline.syscalls):
+        ntdll = graph.binaries.get("ntdll.dll")
+        exported = ntdll is not None and entry.nt in ntdll.exports
+        clause = ("ntdll exports it, but no syscall of this build has that name" if exported else
+                  "ntdll in the binary graph does not export it either, and no syscall of this build has that name")
+        return ended(f"The path ends at {end}. The curated table leads {entry.win32} to {entry.nt}: {clause}, so no "
+                     f"syscall number can be given. The baseline may be of another build, or incomplete.{more}")
+    number = baseline.syscalls[entry.nt].number
+    syscall = Node(f"syscall:{entry.nt}", f"{entry.nt} (0x{number:x})", "syscall", 0, "")
+    part.nodes.append(syscall)
+    part.edges.append(Edge(end, syscall.id, "reaches_syscall", "curated", f"curated: {entry.source}"))
+    source = f"{entry.source}: {entry.note}" if entry.note else entry.source
+    return ended(f"{name}!{function} is defined at {end}, after {_plural(len(resolution.hops), 'hop', 'hops')}. "
+                 f"The last step is not read from any binary: the curated Win32 to Nt table ({source}) leads "
+                 f"{entry.win32} to {entry.nt}, which is syscall number {number:#x} ({number}) in the baseline of "
+                 f"this build.{more}", certain=True)
+
+
 # the outcome of a forwarder chain, as prose: Resolution.reason is the token the code reads
 _OUTCOMES = {
     "defined": "reach the module that defines them",
@@ -429,9 +537,12 @@ def node_detail(graph, name: str) -> dict:
 
 @dataclass(frozen=True)
 class Context:
-    """What a query may read besides its parameters. A later query (the path to a syscall) adds the curated table
-    and the syscall baseline here; the queries keep their own signatures and only the adapters unpack."""
+    """What a query may read besides its parameters: the graph, and for the path to a syscall the curated Win32 to Nt
+    table and the syscall baseline of this build, None where there is none. The queries keep their own signatures and
+    only the adapters unpack."""
     graph: binary_graph.Graph
+    table: win32_to_nt.Table | None = None
+    baseline: syscall_baseline.Baseline | None = None
 
 
 class MissingParameter(ValueError):
@@ -450,6 +561,7 @@ NEEDS = {
     "syscall-callers": ("syscall",),
     "forwarders": ("module",),
     "shared": ("module", "other"),
+    "path-to-syscall": ("module", "function"),
 }
 
 
@@ -486,6 +598,10 @@ def _shared(ctx, params):
     return shared_dependencies(ctx.graph, _need(params, "module"), _need(params, "other"))
 
 
+def _path(ctx, params):
+    return path_to_syscall(ctx.graph, ctx.table, ctx.baseline, _need(params, "module"), _need(params, "function"))
+
+
 # query name -> adapter `(Context, params) -> Answer`; `params` is the request's strings (module, function, syscall,
 # other, metric), and an adapter raises MissingParameter for one it needs and was not given
 QUERIES = {
@@ -494,6 +610,7 @@ QUERIES = {
     "syscall-callers": _callers,
     "forwarders": _forwarders,
     "shared": _shared,
+    "path-to-syscall": _path,
 }
 
 

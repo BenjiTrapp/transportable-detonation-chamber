@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 
@@ -2475,10 +2476,208 @@ def test_the_detail_of_an_api_set_name_names_its_host_modules():
     json.dumps(got)
 
 
+# --- the descent from an import to a syscall number -----------------------------------------------
+
+def _descent_system(*, cut_short=False):
+    """The Win32 layer as System32 has it: kernel32 forwards through an api set to kernelbase, which holds the code of
+    WriteProcessMemory itself (no forwarder to ntdll), and ntdll exports the Nt names the curated table leads to.
+    `cut_short` marks kernelbase's table as cut short when it was read."""
+    return _query_graph(
+        _q("ntdll.dll", exports=["NtWriteVirtualMemory", "NtAllocateVirtualMemory", "NtCreateThreadEx",
+                                 "RtlAllocateHeap"]),
+        _q("kernelbase.dll", exports=["WriteProcessMemory", "VirtualAllocEx", "CreateRemoteThread"],
+           partial=cut_short),
+        _q("kernel32.dll", exports=["MessageBoxLike"],
+           forwarders={"WriteProcessMemory": "api-ms-win-core-memory-l1-1-0.WriteProcessMemory",
+                       "VirtualAllocEx": "KERNELBASE.VirtualAllocEx",
+                       "CreateRemoteThread": "KERNELBASE.CreateRemoteThread",
+                       "Gone": "MISSING.Gone",
+                       "Lost": "KERNELBASE.Lost"}),
+        _q("user32.dll", exports=["MessageBoxW"]),
+        _q("evil.exe", "exe", imports={"kernel32.dll": ("WriteProcessMemory",)}),
+        api_sets={"api-ms-win-core-memory-l1-1-0": ("kernelbase.dll",)})
+
+
+@pytest.fixture(scope="module")
+def descent_baseline():
+    """The baseline of the sample files: NtWriteVirtualMemory is number 58 (0x3a); NtCreateThreadEx is not in it."""
+    return syscall_baseline.parse_baseline(_fixture("arm64"), "26220.5770", "arm64")
+
+
+def _descend(graph, module, function, baseline, table=None):
+    return binary_graph_query.path_to_syscall(graph, table or win32_to_nt.load_table(), baseline, module, function)
+
+
+def test_the_path_of_write_process_memory_ends_at_the_syscall_number_of_the_baseline(descent_baseline):
+    got = _descend(_descent_system(), "kernel32.dll", "WriteProcessMemory", descent_baseline)
+    assert got.roots == ("kernel32.dll!WriteProcessMemory",)
+    assert _follow(got, "kernel32.dll!WriteProcessMemory") == [
+        "kernel32.dll!WriteProcessMemory",
+        "api-ms-win-core-memory-l1-1-0.dll!WriteProcessMemory",
+        "kernelbase.dll!WriteProcessMemory",
+        "syscall:NtWriteVirtualMemory"]
+    syscall = _node(got, "syscall:NtWriteVirtualMemory")
+    assert (syscall.kind, syscall.label) == ("syscall", "NtWriteVirtualMemory (0x3a)")
+    assert descent_baseline.syscalls["NtWriteVirtualMemory"].number == 0x3a
+    assert (got.truncated, got.total) == (False, 1)
+    assert "0x3a" in got.note and "NtWriteVirtualMemory" in got.note
+    _whole(got)
+
+
+def test_every_edge_before_the_last_one_is_derived(descent_baseline):
+    got = _descend(_descent_system(), "kernel32.dll", "WriteProcessMemory", descent_baseline)
+    *earlier, last = got.edges
+    assert earlier and last.kind == "reaches_syscall"
+    assert all(edge.origin == "derived" for edge in earlier), earlier
+    # the same for a path that starts at a sample's import
+    sample = _descend(_descent_system(), "evil.exe", "WriteProcessMemory", descent_baseline)
+    assert all(edge.origin == "derived" for edge in sample.edges if edge.kind != "reaches_syscall")
+
+
+def test_the_last_edge_is_the_only_curated_one_and_the_syscall_node_names_its_number(descent_baseline):
+    got = _descend(_descent_system(), "kernel32.dll", "WriteProcessMemory", descent_baseline)
+    curated = [edge for edge in got.edges if edge.origin == "curated"]
+    assert [(edge.source, edge.target, edge.kind) for edge in curated] == [
+        ("kernelbase.dll!WriteProcessMemory", "syscall:NtWriteVirtualMemory", "reaches_syscall")]
+    assert "documented" in curated[0].label            # where the table has the row from
+    assert [edge for edge in got.edges if edge.kind == "reaches_syscall"] == curated
+    assert got.edges[-1] == curated[0]
+    assert "0x3a" in _node(got, "syscall:NtWriteVirtualMemory").label
+    # the note says the last step is not read from a binary
+    assert "curated" in got.note and "not read from" in got.note
+
+
+def test_a_hop_is_a_function_node_so_the_path_says_which_export_carries_it(descent_baseline):
+    got = _descend(_descent_system(), "kernel32.dll", "VirtualAllocEx", descent_baseline)
+    hops = [node for node in got.nodes if node.kind != "syscall"]
+    assert [(node.id, node.label, node.kind) for node in hops] == [
+        ("kernel32.dll!VirtualAllocEx", "VirtualAllocEx", "function"),
+        ("kernelbase.dll!VirtualAllocEx", "VirtualAllocEx", "function")]
+    # a module is not drawn on the way: it would join the path to nothing, there is no module-to-function edge
+    assert not any(node.kind in ("dll", "exe", "api-set") for node in got.nodes)
+    assert _follow(got, "kernel32.dll!VirtualAllocEx")[-1] == "syscall:NtAllocateVirtualMemory"
+    assert _edges(got) == {("kernel32.dll!VirtualAllocEx", "kernelbase.dll!VirtualAllocEx", "forwards_to"),
+                           ("kernelbase.dll!VirtualAllocEx", "syscall:NtAllocateVirtualMemory", "reaches_syscall")}
+
+
+def test_a_hop_over_an_api_set_is_an_edge_of_kind_resolves_to(descent_baseline):
+    got = _descend(_descent_system(), "kernel32.dll", "WriteProcessMemory", descent_baseline)
+    assert _edges(got) >= {
+        ("kernel32.dll!WriteProcessMemory", "api-ms-win-core-memory-l1-1-0.dll!WriteProcessMemory", "forwards_to"),
+        ("api-ms-win-core-memory-l1-1-0.dll!WriteProcessMemory", "kernelbase.dll!WriteProcessMemory",
+         "resolves_to")}
+    assert "forwards_to" not in {edge.kind for edge in got.edges
+                                 if edge.target == "kernelbase.dll!WriteProcessMemory"}
+
+
+def test_a_win32_function_without_a_curated_entry_ends_with_no_curated_transition_known(descent_baseline):
+    got = _descend(_descent_system(), "user32.dll", "MessageBoxW", descent_baseline)
+    assert [node.id for node in got.nodes] == ["user32.dll!MessageBoxW"]
+    assert got.edges == () and got.roots == ("user32.dll!MessageBoxW",)
+    assert "no curated transition known" in got.note and "MessageBoxW" in got.note
+    assert _is_sentence(got.note), got.note
+    assert not any(node.kind == "syscall" for node in got.nodes)
+
+
+def test_a_chain_that_never_reaches_ntdll_says_so_and_keeps_the_hops_it_has(descent_baseline):
+    got = _descend(_descent_system(), "kernel32.dll", "Gone", descent_baseline)
+    assert _follow(got, "kernel32.dll!Gone") == ["kernel32.dll!Gone", "missing.dll!Gone"]
+    assert "the chain does not reach ntdll" in got.note.lower() and "missing.dll" in got.note
+    assert _is_sentence(got.note), got.note
+    assert not any(edge.origin == "curated" for edge in got.edges)
+    # a module the graph holds that does not export it is another end than a module it does not hold
+    lost = _descend(_descent_system(), "kernel32.dll", "Lost", descent_baseline)
+    assert "kernelbase.dll" in lost.note and "no export" in lost.note
+    assert lost.note != got.note
+
+
+def test_a_curated_nt_name_the_baseline_does_not_hold_says_so_instead_of_dropping_the_path(descent_baseline):
+    # CreateRemoteThread leads to NtCreateThreadEx; ntdll exports it, the baseline has no syscall of that name
+    got = _descend(_descent_system(), "kernel32.dll", "CreateRemoteThread", descent_baseline)
+    assert _follow(got, "kernel32.dll!CreateRemoteThread") == ["kernel32.dll!CreateRemoteThread",
+                                                              "kernelbase.dll!CreateRemoteThread"]
+    assert "ntdll exports it, but no syscall of this build has that name" in got.note
+    assert "NtCreateThreadEx" in got.note
+    # no node claims a syscall that this build does not have
+    assert not any(node.kind == "syscall" for node in got.nodes)
+    assert not any(edge.origin == "curated" for edge in got.edges)
+    assert _is_sentence(got.note), got.note
+
+
+def test_a_chain_cut_short_by_a_partial_table_does_not_claim_that_nothing_defines_it(descent_baseline):
+    whole = _descend(_descent_system(), "kernel32.dll", "Lost", descent_baseline)
+    cut = _descend(_descent_system(cut_short=True), "kernel32.dll", "Lost", descent_baseline)
+    assert "cut short" in cut.note and "not proof" in cut.note
+    assert "cut short" not in whole.note
+    assert "nothing defines" not in cut.note
+    # the fourth end can come with the second and the third: both are said
+    both = _descend(_descent_system(cut_short=True), "kernel32.dll", "CreateRemoteThread", descent_baseline)
+    assert "no syscall of this build has that name" in both.note and "cut short" in both.note
+    unreached = _descend(_query_graph(_q("kernel32.dll", forwarders={"F": "MISSING.F"}, partial=True)),
+                         "kernel32.dll", "F", descent_baseline)
+    assert "does not reach ntdll" in unreached.note.lower() and "cut short" in unreached.note
+    # and a path that did end well says its table was cut short, too
+    done = _descend(_descent_system(cut_short=True), "kernel32.dll", "WriteProcessMemory", descent_baseline)
+    assert any(edge.origin == "curated" for edge in done.edges) and "cut short" in done.note
+
+
+def test_a_path_without_a_baseline_or_a_table_says_which_it_misses(descent_baseline):
+    graph = _descent_system()
+    no_baseline = binary_graph_query.path_to_syscall(graph, win32_to_nt.load_table(), None,
+                                                     "kernel32.dll", "WriteProcessMemory")
+    assert "baseline" in no_baseline.note and "kernelbase.dll!WriteProcessMemory" in _ids(no_baseline)
+    assert not any(node.kind == "syscall" for node in no_baseline.nodes)
+    no_table = binary_graph_query.path_to_syscall(graph, None, descent_baseline,
+                                                  "kernel32.dll", "WriteProcessMemory")
+    assert "table" in no_table.note and "kernelbase.dll!WriteProcessMemory" in _ids(no_table)
+    assert not any(edge.origin == "curated" for edge in no_table.edges)
+
+
+def test_a_start_module_the_graph_does_not_know_is_still_the_root_of_the_path(descent_baseline):
+    got = _descend(_descent_system(), "Sample.EXE", "WriteProcessMemory", descent_baseline)
+    assert got.roots == ("sample.exe",)
+    root = _node(got, "sample.exe")
+    assert (root.kind, root.in_degree) == ("exe", 0)
+    assert _edges(got) == {("sample.exe", "sample.exe!WriteProcessMemory", "imports")}
+    assert "sample.exe" in got.note and "not in the binary graph" in got.note
+    _whole(got)
+    # a module the graph knows is not drawn as a root of its own
+    assert _descend(_descent_system(), "kernel32", "WriteProcessMemory", descent_baseline).roots == (
+        "kernel32.dll!WriteProcessMemory",)
+
+
+@pytest.mark.parametrize("module, function", [
+    ("", ""), ("kernel32.dll", ""), ("", "WriteProcessMemory"), ("nodot", "nodot"), ("   ", "  "),
+    ("kernel32.dll", "#1"), ("kernel32.dll", "#99999999999999999999999"), ("kernel32.dll", "#"),
+    ("api-ms-win-core-memory-l1-1-0.dll", "WriteProcessMemory"), ("api-ms-nowhere-l1-1-0.dll", "X"),
+    ("<img src=x onerror=alert(1)>.dll", "<script>"), ("ntdll.dll", "NtWriteVirtualMemory"),
+    ("a" * 5000, "b" * 5000), ("kernel32.dll", "writeprocessmemory"), (None, None)],
+    ids=lambda value: repr(value)[:24])
+def test_nothing_raises_out_of_the_descent_for_any_input(descent_baseline, module, function):
+    got = _descend(_descent_system(), module, function, descent_baseline)
+    assert isinstance(got, binary_graph_query.Answer) and got.note
+    _whole(got)
+    json.dumps(binary_graph_query.answer_json(got))
+    if not got.nodes:
+        assert (got.edges, got.roots, got.total, got.truncated) == ((), (), 0, False)
+
+
+def test_an_import_by_ordinal_descends_from_the_name_the_ordinal_stands_for(descent_baseline):
+    graph = _query_graph(
+        _q("ntdll.dll", exports=["NtWriteVirtualMemory"]),
+        binary_graph.BinaryInfo(name="kernelbase.dll", kind="dll", machine="arm64", imports={},
+                               exports=("WriteProcessMemory",), forwarders={}, ordinal_names={7: "WriteProcessMemory"},
+                               partial=False))
+    got = _descend(graph, "kernelbase.dll", "#7", descent_baseline)
+    assert got.edges[-1].origin == "curated" and got.edges[-1].target == "syscall:NtWriteVirtualMemory"
+    assert not any(node.label.startswith("#") for node in got.nodes if node.kind == "function")
+
+
 # --- the two routes --------------------------------------------------------------------------------------------
 
 _PARAMS = {"importers": "module=kernel32.dll&function=CloseHandle", "imports": "module=b.exe",
-           "syscall-callers": "syscall=NtClose", "forwarders": "module=kernel32.dll", "shared": "module=d.exe&other=e.exe"}
+           "syscall-callers": "syscall=NtClose", "forwarders": "module=kernel32.dll", "shared": "module=d.exe&other=e.exe",
+           "path-to-syscall": "module=kernelbase.dll&function=NtClose"}
 
 
 @pytest.fixture
@@ -2527,6 +2726,33 @@ def test_the_query_route_answers_each_query_name_and_refuses_an_unknown_one(clie
     # a name that finds nothing is an answer, with its note: not a refusal
     r = client.get("/api/binary-graph/query?q=imports&module=nothere.dll")
     assert r.status_code == 200 and r.get_json()["nodes"] == [] and "nothere.dll" in r.get_json()["note"]
+
+
+def test_the_query_route_answers_a_path_to_syscall_with_the_curated_edge_marked(client, tdc, graph_host):
+    path, _, _ = graph_host
+    binary_graph.save_graph(_descent_system(), path)
+    url = "/api/binary-graph/query?q=path-to-syscall&module=kernel32.dll&function=WriteProcessMemory"
+    # this build has no baseline yet: the path is drawn as far as the graph goes, and the note says what is missing
+    body = client.get(url).get_json()
+    assert "baseline" in body["note"] and not any(node["kind"] == "syscall" for node in body["nodes"])
+    assert not any(edge["origin"] == "curated" for edge in body["edges"])
+    shutil.copy(os.path.join(os.path.dirname(__file__), "samples", "ntsleuth-26220.5770-arm64.json"),
+                os.path.join(tdc.NTSLEUTH_BASELINE_DIR, "ntsleuth-26220.5770-arm64.json"))
+    r = client.get(url)
+    assert r.status_code == 200, r.get_json()
+    body = r.get_json()
+    assert [(edge["kind"], edge["origin"]) for edge in body["edges"]] == [
+        ("forwards_to", "derived"), ("resolves_to", "derived"), ("reaches_syscall", "curated")]
+    assert body["edges"][-1]["target"] == "syscall:NtWriteVirtualMemory"
+    assert [node["label"] for node in body["nodes"] if node["kind"] == "syscall"] == ["NtWriteVirtualMemory (0x3a)"]
+    assert body["roots"] == ["kernel32.dll!WriteProcessMemory"] and body["total"] == 1
+    assert (body["build"], body["arch"]) == ("26220.5770", "arm64")
+    # the function is needed, and is refused before any graph is fetched
+    r = client.get("/api/binary-graph/query?q=path-to-syscall&module=kernel32.dll")
+    assert r.status_code == 400 and "function" in r.get_json()["error"]
+    # a name no graph holds is an answer, with the end said in prose
+    body = client.get("/api/binary-graph/query?q=path-to-syscall&module=nothere.dll&function=X").get_json()
+    assert body["roots"] == ["nothere.dll"] and "not in the binary graph" in body["note"]
 
 
 def test_the_query_route_says_so_when_no_cache_matches_this_build(client, tdc, graph_host, monkeypatch):
@@ -2778,7 +3004,7 @@ def test_a_query_without_a_parameter_it_needs_is_refused_before_any_graph_is_fet
 
 def test_the_parameters_each_query_needs_are_the_ones_its_adapter_reads():
     ctx = binary_graph_query.Context(_system())
-    given = {"module": "d.exe", "function": "", "syscall": "NtClose", "other": "e.exe", "metric": ""}
+    given = {"module": "d.exe", "function": "CloseHandle", "syscall": "NtClose", "other": "e.exe", "metric": ""}
     for name, run in binary_graph_query.QUERIES.items():
         needs = binary_graph_query.NEEDS[name]
         binary_graph_query.check_parameters(name, {key: given[key] for key in needs})

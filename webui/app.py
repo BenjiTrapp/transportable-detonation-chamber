@@ -9225,6 +9225,20 @@ def _binary_graph_stamp(graph):
             "cache": binary_graph.cache_name(graph.build, graph.arch)}
 
 
+def _binary_graph_context(graph, query):
+    """What query `query` reads besides its parameters. Only the path to a syscall reads the curated Win32 to Nt table
+    and the syscall baseline, each None where it cannot be had (the answer then says so); no baseline is extracted for
+    a question about the graph."""
+    if query != "path-to-syscall":
+        return binary_graph_query.Context(graph)
+    try:
+        table = win32_to_nt.load_table()
+    except win32_to_nt.TableError as exc:
+        print(f"[binary graph] the Win32 to Nt table is unusable, no path can reach a syscall: {exc}")
+        table = None
+    return binary_graph_query.Context(graph, table, _syscall_baseline_for(graph.arch, extract=False)[0])
+
+
 @app.route("/api/binary-graph/query")
 def api_binary_graph_query():
     """One query over the import graph. Params: `q` (a name of binary_graph_query.QUERIES) and what it reads of
@@ -9241,7 +9255,7 @@ def api_binary_graph_query():
     if graph is None:
         return jsonify(refusal), 404
     try:
-        answer = run(binary_graph_query.Context(graph), params)
+        answer = run(_binary_graph_context(graph, request.args.get("q")), params)
     except binary_graph_query.MissingParameter as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({**binary_graph_query.answer_json(answer), **_binary_graph_stamp(graph)})
