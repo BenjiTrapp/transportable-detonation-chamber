@@ -325,11 +325,19 @@ class Resolution:
     "cycle"              the chain came back to a (module, function) it had been at; the last hop closes the ring
     "unresolved-api-set" the chain reached an api-set name the map has no entry for: our map is missing or old
     "too-many-hops"      the chain is longer than MAX_HOPS and neither ring nor dead end within it
-    `hops` are the steps taken, the start not among them; on any outcome but "defined" they are how far it got."""
+    `hops` are the steps taken, the start not among them; on any outcome but "defined" they are how far it got.
+
+    `partial` is not an outcome but a caveat on it: True when a table on this chain was cut short, that is, when any
+    binary the walk examined (the start, every module it passed, every api-set host it tried and passed over) has
+    `BinaryInfo.partial` set. A negative answer ("missing", "unresolved-api-set", "cycle", "too-many-hops") is then
+    NOT certain, since the export or forwarder that would have changed it may be in the part pefile did not read; a
+    "defined" one only says the host chosen may not be the one a complete table would have given. It does not mean
+    "partially resolved". The same fact makes no difference to which `reason` is given."""
     hops: tuple[Hop, ...]
     module: str | None
     function: str | None
     reason: str
+    partial: bool = False
 
 
 def _export_key(info, function):
@@ -357,9 +365,9 @@ def _is_api_set(api_sets, module):
     return stem, stem in api_sets or stem.startswith(("api-", "ext-"))
 
 
-def _step(binaries, api_sets, module, function):
+def _step(binaries, api_sets, module, function, cut_short):
     """One step from `(module, function)`: `(Hop, None, None)` to go on, or `(None, reason, key)` to stop; `key` is
-    the export key of a "defined" end."""
+    the export key of a "defined" end. `cut_short` is set to True when a binary examined has `partial`."""
     stem, api_set = _is_api_set(api_sets, module)
     if api_set:
         hosts = api_sets.get(stem)
@@ -367,10 +375,15 @@ def _step(binaries, api_sets, module, function):
             return None, "unresolved-api-set", None
         for host in hosts:
             host = host.lower()
-            if host in binaries and _export_key(binaries[host], function) is not None:
+            if host not in binaries:
+                continue
+            cut_short.append(binaries[host].partial)
+            if _export_key(binaries[host], function) is not None:
                 return Hop(host, function, "resolves_to"), None, None
         return None, "missing", None
     info = binaries.get(module)
+    if info is not None:
+        cut_short.append(info.partial)
     key = _export_key(info, function) if info is not None else None
     if key is None:
         return None, "missing", None
@@ -392,24 +405,27 @@ def resolve_export(binaries: dict[str, BinaryInfo], api_sets: dict[str, tuple[st
 
     A ring is found by remembering every (module, function) the chain has stood at, so it ends as "cycle" however long
     it is. MAX_HOPS is a limit on the chain, not the ring detector: the walk goes on past it, still stopped by that
-    memory, so that a ring longer than the limit is not called merely long."""
+    memory, so that a ring longer than the limit is not called merely long. `Resolution.partial` is set when any binary
+    the walk examined has `BinaryInfo.partial`, the walk past MAX_HOPS included."""
     module = module.lower()
     seen = {(module, function)}
     hops = []
+    cut_short = []
     while True:
-        hop, reason, key = _step(binaries, api_sets, module, function)
+        hop, reason, key = _step(binaries, api_sets, module, function, cut_short)
         if hop is None:
             break
         hops.append(hop)
         module, function = hop.module, hop.function
         if (module, function) in seen:
-            return Resolution(tuple(hops), None, None, "cycle")
+            return Resolution(tuple(hops), None, None, "cycle", any(cut_short))
         seen.add((module, function))
+    partial = any(cut_short)
     if len(hops) > MAX_HOPS:
-        return Resolution(tuple(hops[:MAX_HOPS]), None, None, "too-many-hops")
+        return Resolution(tuple(hops[:MAX_HOPS]), None, None, "too-many-hops", partial)
     if reason == "defined":
-        return Resolution(tuple(hops), module, key, "defined")
-    return Resolution(tuple(hops), None, None, reason)
+        return Resolution(tuple(hops), module, key, "defined", partial)
+    return Resolution(tuple(hops), None, None, reason, partial)
 
 
 def resolve_all(binaries: dict[str, BinaryInfo],

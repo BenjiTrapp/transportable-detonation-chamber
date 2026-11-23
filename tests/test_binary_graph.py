@@ -1232,11 +1232,57 @@ def test_a_malformed_forwarder_ends_as_missing_and_raises_nothing(raw):
     assert (got.reason, got.module, got.function) == ("missing", None, None)
 
 
-def test_a_chain_that_dies_in_a_partial_binary_is_still_a_missing_one():
-    # pefile cut that binary's tables short: the vocabulary has no word for "perhaps it was there", so it is "missing"
+def test_a_chain_that_dies_in_a_partial_binary_is_missing_and_says_its_answer_is_not_certain():
+    # pefile cut that binary's tables short: "missing" stays the reason, `partial` is what says it may be wrong
     binaries = _graph(_bi("a.dll", forwarders={"F": "B.F"}), _bi("b.dll", partial=True))
     got = binary_graph.resolve_export(binaries, {}, "a.dll", "F")
-    assert got.reason == "missing"
+    assert (got.reason, got.partial) == ("missing", True)
+
+
+def test_a_chain_through_complete_binaries_is_not_marked_partial():
+    binaries, api_sets = _heap_chain()
+    for start in ("kernel32.dll", "api-ms-win-core-heap-l1-1-0.dll"):
+        assert binary_graph.resolve_export(binaries, api_sets, start, "HeapAlloc").partial is False
+    assert binary_graph.resolve_export(binaries, api_sets, "kernel32.dll", "Nope").partial is False
+    assert binary_graph.resolve_export({}, {}, "x.dll", "F").partial is False
+
+
+def test_a_partial_binary_anywhere_on_the_chain_marks_it_not_only_the_one_it_died_in():
+    # the cut-short table is the middle one, the chain still ends cleanly in a complete module
+    binaries = _graph(_bi("a.dll", forwarders={"F": "B.F"}), _bi("b.dll", forwarders={"F": "C.F"}, partial=True),
+                      _bi("c.dll", exports=["F"]))
+    got = binary_graph.resolve_export(binaries, {}, "a.dll", "F")
+    assert (got.reason, got.partial) == ("defined", True)
+    # and the other way round: the chain starts in the partial one
+    assert binary_graph.resolve_export(_graph(_bi("a.dll", exports=["F"], partial=True)), {}, "a.dll", "F").partial
+
+
+def test_an_api_set_host_that_was_passed_over_and_is_partial_marks_the_chain():
+    # first.dll might have defined it had its export table not been cut short: the host chosen is not certain
+    binaries = _graph(_bi("first.dll", partial=True), _bi("second.dll", exports=["Wanted"]))
+    got = binary_graph.resolve_export(binaries, {"api-x-l1-1-0": ("first.dll", "second.dll")}, "api-x-l1-1-0.dll", "Wanted")
+    assert (got.reason, got.module, got.partial) == ("defined", "second.dll", True)
+    # a host that is never reached does not
+    binaries = _graph(_bi("first.dll", exports=["Wanted"]), _bi("second.dll", partial=True))
+    got = binary_graph.resolve_export(binaries, {"api-x-l1-1-0": ("first.dll", "second.dll")}, "api-x-l1-1-0.dll", "Wanted")
+    assert (got.reason, got.partial) == ("defined", False)
+
+
+def test_every_negative_reason_carries_the_partial_flag_of_its_chain():
+    ring = _graph(_bi("a.dll", forwarders={"F": "B.F"}, partial=True), _bi("b.dll", forwarders={"F": "A.F"}))
+    assert binary_graph.resolve_export(ring, {}, "a.dll", "F").partial is True
+    lost = _graph(_bi("a.dll", forwarders={"F": "api-nowhere-l1-1-0.F"}, partial=True))
+    got = binary_graph.resolve_export(lost, {}, "a.dll", "F")
+    assert (got.reason, got.partial) == ("unresolved-api-set", True)
+    long = _long_chain(binary_graph.MAX_HOPS + 4)
+    long["m3.dll"] = _bi("m3.dll", forwarders={"F": "M4.F"}, partial=True)
+    got = binary_graph.resolve_export(long, {}, "m0.dll", "F")
+    assert (got.reason, got.partial) == ("too-many-hops", True)
+
+
+def test_resolve_all_carries_the_partial_flag_too():
+    binaries = _graph(_bi("a.dll", forwarders={"F": "B.F"}), _bi("b.dll", partial=True))
+    assert binary_graph.resolve_all(binaries, {})[("a.dll", "F")].partial is True
 
 
 def test_resolving_all_forwarders_answers_each_module_and_function_once():
