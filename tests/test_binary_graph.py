@@ -2679,6 +2679,30 @@ def test_an_import_the_graph_holds_is_an_imports_edge_and_derived(descent_baseli
                                                                 "WriteProcessMemory", descent_baseline).edges)
 
 
+def test_a_module_that_both_imports_and_exports_a_name_is_read_as_the_exporter(descent_baseline):
+    # one defines the name itself, one forwards it; both also import it from kernelbase, as a DLL may
+    graph = _query_graph(
+        _q("ntdll.dll", exports=["NtWriteVirtualMemory"]),
+        _q("kernelbase.dll", exports=["WriteProcessMemory"]),
+        _q("defines.dll", imports={"kernelbase.dll": ("WriteProcessMemory",)}, exports=["WriteProcessMemory"]),
+        _q("forwards.dll", imports={"kernelbase.dll": ("WriteProcessMemory",)},
+           forwarders={"WriteProcessMemory": "KERNELBASE.WriteProcessMemory"}),
+        _q("imports.dll", imports={"kernelbase.dll": ("WriteProcessMemory",)}))
+    defines = _descend(graph, "defines.dll", "WriteProcessMemory", descent_baseline)
+    forwards = _descend(graph, "forwards.dll", "WriteProcessMemory", descent_baseline)
+    for got, module in ((defines, "defines.dll"), (forwards, "forwards.dll")):
+        assert got.roots == (f"{module}!WriteProcessMemory",), got.roots
+        assert not any(edge.kind == "imports" for edge in got.edges), got.edges
+        assert not any(node.id == module for node in got.nodes)
+    assert _edges(defines) == {("defines.dll!WriteProcessMemory", "syscall:NtWriteVirtualMemory", "reaches_syscall")}
+    assert _follow(forwards, "forwards.dll!WriteProcessMemory") == [
+        "forwards.dll!WriteProcessMemory", "kernelbase.dll!WriteProcessMemory", "syscall:NtWriteVirtualMemory"]
+    # the same table, without the export of its own, is the importer
+    plain = _descend(graph, "imports.dll", "WriteProcessMemory", descent_baseline)
+    assert plain.roots == ("imports.dll",)
+    assert [edge.kind for edge in plain.edges][0] == "imports"
+
+
 def test_an_import_of_an_nt_name_reaches_its_number_with_no_curated_edge(descent_baseline):
     got = _descend(_descent_system(), "direct.exe", "NtWriteVirtualMemory", descent_baseline)
     assert [(edge.source, edge.target, edge.kind, edge.origin) for edge in got.edges] == [
