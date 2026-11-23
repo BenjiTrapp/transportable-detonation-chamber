@@ -5,10 +5,14 @@ import table cannot show that a syscall stub it carries goes around the document
 Run through this table, it can: the import set gains the Nt name of each Win32 function
 the table knows.
 
-The table is not a Win32 dictionary. It holds only the functions TDC already calls
-suspicious, or whose Nt counterpart it does, and a function with no direct Nt counterpart
-has no row. An absence is claimed only for a syscall some row leads to (`covered`): for
-any other the table does not know the Win32 functions that reach it.
+The table is not a Win32 dictionary. Whether a syscall is covered at all is bounded by
+the functions TDC already calls suspicious: a syscall enters `covered` only through a row
+whose own Win32 function or Nt counterpart is one of them. Once a syscall is covered, every
+door to it is listed, suspicious or not, because a missing door would make the claim
+false. A function may lead to several syscalls, one row each: `WriteProcessMemory` issues
+`NtProtectVirtualMemory` on its way to `NtWriteVirtualMemory`. A function with no direct
+Nt counterpart has no row. An absence is claimed only for a syscall some row leads to
+(`covered`): for any other the table does not know the Win32 functions that reach it.
 
 A proof assumes the table names the documented entry points to that syscall. An uncommon
 wrapper to a covered syscall reads as a bypass: a false positive on an unusual but clean
@@ -44,26 +48,31 @@ class Entry:
 class Table:
     def __init__(self, entries: Iterable[Entry]):
         self.entries: tuple[Entry, ...] = tuple(entries)
-        self._by_win32 = {e.win32.lower(): e for e in self.entries}
+        self._by_win32: dict[str, tuple[Entry, ...]] = {}
+        for e in self.entries:
+            self._by_win32[e.win32.lower()] = self._by_win32.get(e.win32.lower(), ()) + (e,)
         # the syscalls whose absence the table can speak for: those a row leads to
         self.covered: frozenset[str] = frozenset(e.nt for e in self.entries)
 
-    def nt_for(self, win32: str) -> Entry | None:
-        """The row of `win32`, matched without regard to case, or None."""
+    def entries_for(self, win32: str) -> tuple[Entry, ...]:
+        """Every row of `win32`, matched without regard to case, in table order; () for a name it does not know."""
         if not isinstance(win32, str):
-            return None
-        return self._by_win32.get(win32.lower())
+            return ()
+        return self._by_win32.get(win32.lower(), ())
+
+    def nt_for(self, win32: str) -> Entry | None:
+        """The first row of `win32`, its headline syscall, or None."""
+        rows = self.entries_for(win32)
+        return rows[0] if rows else None
 
     def expand(self, names: set[str] | None) -> set[str] | None:
-        """`names` plus the Nt name of every Win32 function among them the table knows. Only a matched name adds
-        anything: a set the table knows nothing of comes back as it went in. None (no import table) stays None."""
+        """`names` plus every Nt name a Win32 function among them leads to. Only a matched name adds anything: a
+        set the table knows nothing of comes back as it went in. None (no import table) stays None."""
         if names is None:
             return None
         out = set(names)
         for name in names:
-            entry = self.nt_for(name)
-            if entry is not None:
-                out.add(entry.nt)
+            out.update(e.nt for e in self.entries_for(name))
         return out
 
     def missing_from(self, syscall_names: Iterable[str]) -> tuple[str, ...]:
@@ -80,7 +89,7 @@ def parse_table(payload) -> Table:
     raw = payload.get("entries")
     if not isinstance(raw, list):
         raise TableError("the table has no list of entries")
-    entries = []
+    entries, pairs = [], set()
     for i, item in enumerate(raw):
         if not isinstance(item, dict):
             raise TableError(f"entry #{i} is not an object")
@@ -90,6 +99,9 @@ def parse_table(payload) -> Table:
             raise TableError(f"entry #{i} needs a win32 and an nt name, a source and a note as strings")
         if source not in SOURCES:
             raise TableError(f"entry #{i} ({win32}) has the source {source!r}, not one of {', '.join(SOURCES)}")
+        if (win32.lower(), nt) in pairs:
+            raise TableError(f"entry #{i} repeats the row {win32} -> {nt}")
+        pairs.add((win32.lower(), nt))
         entries.append(Entry(win32, nt, source, note))
     return Table(entries)
 

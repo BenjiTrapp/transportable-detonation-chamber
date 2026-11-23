@@ -534,8 +534,11 @@ mitgebrachten Stub daher nie sähe.
   eine belegte Umgehung aus, obwohl der dokumentierte Weg vorhanden ist. Deshalb
   wird die Importmenge über die kuratierte Tabelle `win32_to_nt.json` erweitert,
   bevor sie etwas über ein Fehlen sagen darf. Fehlt der Funktion eines Stubs dann
-  jeder Weg, ist die Umgehung belegt (`import_present` False). Die Tabelle hält nur
-  die APIs, die TDC schon als verdächtig führt; für einen Syscall, zu dem keine
+  jeder Weg, ist die Umgehung belegt (`import_present` False). Welche Syscalls die
+  Tabelle abdeckt, begrenzen die APIs, die TDC schon als verdächtig führt; zu einem
+  abgedeckten Syscall nennt sie jede Tür, auch eine unverdächtige, und eine Funktion,
+  die unterwegs mehrere abgedeckte Syscalls absetzt, hat je eine Zeile. Für einen
+  Syscall, zu dem keine
   kuratierte Zeile führt, bleibt `import_present` **unbekannt** und der Treffer ein
   Hinweis — ebenso, wenn die Importtabelle nicht lesbar ist. Ein Befund darf nie
   mehr behaupten, als die Daten tragen.

@@ -38,11 +38,34 @@ def test_every_nt_name_has_the_shape_of_a_syscall_name():
         assert NT_NAME.fullmatch(entry.nt), entry
 
 
-def test_every_win32_name_is_one_tdc_already_calls_suspicious(app_module):
-    # the table is not a Win32 dictionary: the function or its Nt counterpart is one TDC already flags
+def _boundary_tiers(entries, suspicious):
+    """`(own, door, lexicon)`: rows that pass on their own (their win32 or nt is in SUSPICIOUS_IMPORTS), rows that
+    are a further door to a syscall an own row covers, and rows that are neither."""
+    own = [e for e in entries if e.win32.lower() in suspicious or e.nt.lower() in suspicious]
+    covered = {e.nt for e in own}
+    door = [e for e in entries if e not in own and e.nt in covered]
+    lexicon = [e for e in entries if e not in own and e not in door]
+    return own, door, lexicon
+
+
+def test_every_row_is_inside_the_two_tier_boundary(app_module):
+    # whether a syscall is covered at all is bounded by SUSPICIOUS_IMPORTS: a row whose own win32 or nt is there.
+    # once it is covered, every door to it belongs in the table, suspicious or not: a missing door makes the
+    # claim false. A row that is neither is a lexicon row, and the table is not a Win32 dictionary
     suspicious = _suspicious_names(app_module)
-    for entry in win32_to_nt.load_table().entries:
-        assert entry.win32.lower() in suspicious or entry.nt.lower() in suspicious, entry
+    own, door, lexicon = _boundary_tiers(win32_to_nt.load_table().entries, suspicious)
+    assert lexicon == []
+    assert door, "the second tier is in use"
+
+
+def test_the_second_tier_never_covers_a_syscall_of_its_own(app_module):
+    suspicious = _suspicious_names(app_module)
+    table = win32_to_nt.load_table()
+    own, _, _ = _boundary_tiers(table.entries, suspicious)
+    assert table.covered == {e.nt for e in own}
+    # a lexicon row is caught: a door to a syscall no own row covers
+    stray = win32_to_nt.Entry("CreateFileW", "NtCreateFile", "documented", "x")
+    assert _boundary_tiers(table.entries + (stray,), suspicious)[2] == [stray]
 
 
 def test_a_zw_alias_entry_is_exactly_that_rename():
@@ -57,7 +80,7 @@ def test_a_zw_alias_entry_is_exactly_that_rename():
             assert entry.source == "zw-alias", entry
 
 
-def test_every_entry_names_a_source_from_the_vocabulary_and_no_win32_name_twice():
+def test_every_entry_names_a_source_from_the_vocabulary_and_no_pair_twice():
     # "documented" and "observed" carry the citation a human can check: the only real guard on a name
     entries = win32_to_nt.load_table().entries
     assert win32_to_nt.SOURCES == ("zw-alias", "documented", "observed")
@@ -65,8 +88,24 @@ def test_every_entry_names_a_source_from_the_vocabulary_and_no_win32_name_twice(
         assert entry.source in win32_to_nt.SOURCES, entry
         if entry.source != "zw-alias":
             assert entry.note.strip(), entry
-    names = [e.win32.lower() for e in entries]
-    assert len(names) == len(set(names))
+    pairs = [(e.win32.lower(), e.nt) for e in entries]
+    assert len(pairs) == len(set(pairs))
+
+
+def test_a_win32_name_may_lead_to_several_syscalls_and_expand_adds_them_all():
+    table = win32_to_nt.load_table()
+    assert [e.nt for e in table.entries_for("writeprocessmemory")] == [
+        "NtWriteVirtualMemory", "NtProtectVirtualMemory", "NtUnmapViewOfSection"]
+    assert table.nt_for("WriteProcessMemory").nt == "NtWriteVirtualMemory"     # the first row is the headline
+    assert table.entries_for("GetLastError") == ()
+    assert table.expand({"WriteProcessMemory"}) == {
+        "WriteProcessMemory", "NtWriteVirtualMemory", "NtProtectVirtualMemory", "NtUnmapViewOfSection"}
+
+
+def test_a_pair_twice_is_refused():
+    row = {"win32": "VirtualAlloc", "nt": "NtAllocateVirtualMemory", "source": "documented", "note": "x"}
+    with pytest.raises(win32_to_nt.TableError):
+        win32_to_nt.parse_table({"version": 1, "entries": [row, dict(row, win32="virtualalloc")]})
 
 
 def test_a_row_without_a_source_of_the_vocabulary_is_refused():
@@ -319,18 +358,20 @@ def test_an_expanded_import_set_without_its_coverage_is_refused(x64_baseline):
     assert hit["import_present"] is None
 
 
-# the entry points to each covered syscall, as far as the audit found them inside the SUSPICIOUS_IMPORTS boundary
+# the entry points to each covered syscall, second-order ones included, as far as the audit found them
 DOORS = {
-    "NtAllocateVirtualMemory": {"VirtualAlloc", "VirtualAllocEx"},
-    "NtWriteVirtualMemory": {"WriteProcessMemory"},
-    "NtProtectVirtualMemory": {"VirtualProtect", "VirtualProtectEx", "VirtualProtectFromApp"},
+    "NtAllocateVirtualMemory": {"VirtualAlloc", "VirtualAllocEx", "VirtualAllocFromApp", "VirtualAllocExNuma"},
+    "NtWriteVirtualMemory": {"WriteProcessMemory", "RtlRemoteCall"},
+    "NtProtectVirtualMemory": {"VirtualProtect", "VirtualProtectEx", "VirtualProtectFromApp", "WriteProcessMemory",
+                               "LoadLibraryA", "LoadLibraryW", "LoadLibraryExA", "LoadLibraryExW", "LdrLoadDll"},
     "NtCreateThreadEx": {"CreateThread", "CreateRemoteThread", "CreateRemoteThreadEx", "RtlCreateUserThread",
                          "_beginthreadex", "_beginthread", "DbgUiIssueRemoteBreakin", "DebugBreakProcess"},
     "NtQueueApcThread": {"QueueUserAPC"},
-    "NtSetContextThread": {"SetThreadContext"},
-    "NtUnmapViewOfSection": {"UnmapViewOfFile", "ZwUnmapViewOfSection", "FreeLibrary", "FreeLibraryAndExitThread"},
-    "NtAdjustPrivilegesToken": {"AdjustTokenPrivileges"},
-    "NtOpenProcessToken": {"OpenProcessToken"},
+    "NtSetContextThread": {"SetThreadContext", "RtlRemoteCall"},
+    "NtUnmapViewOfSection": {"UnmapViewOfFile", "ZwUnmapViewOfSection", "FreeLibrary", "FreeLibraryAndExitThread",
+                             "LdrUnloadDll", "WriteProcessMemory"},
+    "NtAdjustPrivilegesToken": {"AdjustTokenPrivileges", "RtlAdjustPrivilege"},
+    "NtOpenProcessToken": {"OpenProcessToken", "RtlAdjustPrivilege", "RtlImpersonateSelf", "ImpersonateSelf"},
 }
 
 

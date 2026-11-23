@@ -196,8 +196,11 @@ somewhere" but "a stub for `NtWriteVirtualMemory`". Guard pages are never read,
 because reading one would change the process. Telling a bypass from an ordinary
 call needs the chain from the Win32 function to its Nt counterpart: a sample that
 calls `VirtualAllocEx` never imports `NtAllocateVirtualMemory`. The chamber holds
-that chain in `webui/win32_to_nt.json` for the APIs it already calls suspicious,
-each row with the source it was read from. A stub whose function the sample does
+that chain in `webui/win32_to_nt.json`, each row with the source it was read from.
+The APIs it already calls suspicious decide which syscalls the table covers; for a
+covered syscall it lists every door, suspicious or not, and a function that issues
+several covered syscalls on its way (`WriteProcessMemory` also reprotects the page)
+has a row for each. A stub whose function the sample does
 not import, by its import table widened through that table, is a proven bypass
 (`import_present` `false`); one it imports as well is a hint (`true`). Outside the
 table `import_present` stays `null`, and so does every hit when the import table
