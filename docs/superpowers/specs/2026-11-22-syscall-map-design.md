@@ -94,6 +94,12 @@ Oberfläche englisch. Aufbau von oben nach unten:
 - **Ungültig** wird die Baseline, wenn die Build-Nummer des laufenden Systems
   nicht mehr zur Datei passt. Dann zieht TDC sie im Hintergrund neu und sagt es
   im Tab. NTSleuth braucht dafür unter 4 Sekunden.
+- **Ein Fehlschlag gilt nur, bis ihn eine Baseline widerlegt.** Sobald eine
+  brauchbare Baseline für Build und Sicht eines fehlgeschlagenen Versuchs
+  vorliegt, ist dessen Eintrag gelöscht — gleich, wer die Datei geschrieben hat;
+  der Installer schreibt sie ohne das Web-UI. Sonst meldete
+  `/api/syscalls/status` in einer Antwort eine geladene Baseline und den
+  Fehlschlag, sie zu erzeugen, und hielte einen neuen Versuch zurück.
 - **Eine Baseline je Sicht, nicht je Prozess-Architektur.** Auf einer ARM64-VM
   bildet `System32\ntdll.dll` als ARM64X-Datei zwei Sichten ab: die native
   ARM64- und die x64/EC-Sicht. Beide haben eigene RVAs und eigene Stub-Bytes.

@@ -8073,8 +8073,18 @@ def _start_baseline_extraction(build, view):
     return True
 
 
+def _forget_extraction_failure(build, view):
+    """A usable baseline of `build` and `view` is there: an earlier failure to extract it is refuted, whoever wrote
+    the file (the installer writes it without the web UI). Kept, it would contradict the baseline in the status,
+    hold back a retry and name a reason that no longer holds."""
+    with _syscall_extract_lock:
+        _syscall_extract_state["failed"].pop((build, view), None)
+        _syscall_extract_state["indistinguishable"].discard((build, view))
+
+
 def _load_syscall_baseline(path):
-    """The baseline in `path`, read again only when the file changed."""
+    """The baseline in `path`, read again only when the file changed. One that loads clears the failure record of
+    its build and view."""
     try:
         info = os.stat(path)
     except OSError as exc:
@@ -8089,9 +8099,11 @@ def _load_syscall_baseline(path):
             except syscall_baseline.BaselineError as exc:
                 hit = (stamp, exc)
             _syscall_baselines[path] = hit
-        if isinstance(hit[1], syscall_baseline.BaselineError):
-            raise syscall_baseline.BaselineError(str(hit[1]))
-        return hit[1]
+        loaded = hit[1]
+    if isinstance(loaded, syscall_baseline.BaselineError):
+        raise syscall_baseline.BaselineError(str(loaded))
+    _forget_extraction_failure(loaded.build, loaded.view)
+    return loaded
 
 
 def _syscall_extracting():

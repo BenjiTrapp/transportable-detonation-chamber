@@ -2474,6 +2474,36 @@ def test_a_failed_extraction_is_not_retried_at_once_and_says_why(client, tdc, mo
     assert calls == ["arm64", "arm64"]
 
 
+def test_a_failure_record_goes_once_a_usable_baseline_of_its_build_and_view_is_there(client, tdc, fake_baseline_dir):
+    # what the VM showed: the installer wrote the baselines itself, and the record of an earlier attempt stayed
+    why = "NTSleuth is not installed for the arm64 view (C:\\tools\\ntsleuth\\ntsleuth-arm64.exe)"
+    tdc._syscall_extract_state["failed"][("26220.5770", "arm64")] = (time.time(), why)
+    body = client.get("/api/syscalls/status").get_json()
+    assert any(b["view"] == "arm64" and b["current"] and b.get("syscalls") for b in body["baselines"])
+    assert body["extraction"]["failed"] == []
+    assert ("26220.5770", "arm64") not in tdc._syscall_extract_state["failed"]
+
+
+def test_a_failure_record_goes_when_a_request_finds_the_baseline_usable(client, tdc, fake_baseline_dir):
+    tdc._syscall_extract_state["failed"][("26220.5770", "x64")] = (time.time(), "the x64 view is not distinguishable")
+    tdc._syscall_extract_state["indistinguishable"].add(("26220.5770", "x64"))
+    assert client.get("/api/syscalls/baseline?view=x64").status_code == 200
+    assert ("26220.5770", "x64") not in tdc._syscall_extract_state["failed"]
+    assert ("26220.5770", "x64") not in tdc._syscall_extract_state["indistinguishable"]
+
+
+def test_a_failure_record_stays_while_no_usable_baseline_refutes_it(client, tdc, fake_baseline_dir):
+    # another build, and a file of this build that cannot be used, say nothing against the failure
+    (fake_baseline_dir / "ntsleuth-26220.5770-x64.json").write_text("{", encoding="utf-8")
+    tdc._syscall_extract_state["failed"][("26220.5770", "x64")] = (time.time(), "NTSleuth exited with 1")
+    tdc._syscall_extract_state["failed"][("26300.1", "arm64")] = (time.time(), "NTSleuth exited with 2")
+    body = client.get("/api/syscalls/status").get_json()
+    assert client.get("/api/syscalls/baseline?view=x64").status_code == 503
+    failed = {(f["build"], f["view"]) for f in client.get("/api/syscalls/status").get_json()["extraction"]["failed"]}
+    assert failed == {("26220.5770", "x64"), ("26300.1", "arm64")}
+    assert {(f["build"], f["view"]) for f in body["extraction"]["failed"]} == failed
+
+
 def test_an_extraction_that_raises_is_a_failure_with_its_reason(client, tdc, monkeypatch, fake_baseline_dir):
     def boom(view, symbols, build):
         raise RuntimeError("NTSleuth exited with 3: bad")
