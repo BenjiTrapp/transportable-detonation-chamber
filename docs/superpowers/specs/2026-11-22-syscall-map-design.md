@@ -523,10 +523,19 @@ Graphen.
 Der eigentliche Gewinn liegt im Zusammenspiel:
 
 - **Der Weg nach unten:** Ein Sample importiert `WriteProcessMemory`. Der Graph
-  führt über `kernel32` und `kernelbase` zu `ntdll`, die kuratierte Tabelle
-  nennt `NtWriteVirtualMemory`, und die Baseline nennt dessen Nummer. Aus einer
-  Import-Tabelle wird so ein Pfad bis zur Syscall-Nummer — mit dem letzten
-  Sprung als kuratiert markiert, nach Ziel 6.
+  führt über Weiterleitungen und API-Sets bis zu der Funktion, die den Code
+  enthält, hier `kernelbase!WriteProcessMemory`. Dort endet, was die Tabellen
+  beweisen: `kernelbase` leitet nicht an `ntdll` weiter, es ruft
+  `NtWriteVirtualMemory` im eigenen Code (siehe Ziel 6). Der Schritt zum
+  Nt-Gegenstück ist der kuratierte: die Tabelle nennt `NtWriteVirtualMemory`,
+  und die Baseline nennt dessen Nummer und Modul (`ntdll.dll`). Aus einer
+  Import-Tabelle wird so ein Pfad bis zur Syscall-Nummer — mit genau diesem
+  letzten Sprung als kuratiert markiert, nach Ziel 6. Zwischen `kernelbase` und
+  dem Syscall steht kein Knoten von `ntdll`, denn keine Kantenart verbindet ihn
+  ehrlich. Importiert ein Sample dagegen `ntdll!NtClose` unmittelbar, ist der
+  Export schon der Stub: Dann ist der ganze Weg abgeleitet und hat keine
+  kuratierte Kante. Ein Pfad hat also höchstens eine kuratierte Kante, und sie
+  ist die letzte.
 - **Der Weg über die Abwesenheit:** Fehlt diese Import-Kette, und liegt im
   Sample trotzdem ein Stub mit genau dieser Nummer, hat es die Kette
   übersprungen. Das ist Direct-Syscall-Umgehung, sichtbar gemacht dadurch, dass

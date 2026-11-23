@@ -258,14 +258,15 @@ def _chain(start, resolution):
     return pairs
 
 
-def _chain_part(pairs, resolution, head=None, roots=()):
-    """The nodes and edges of a chain, with `head` (an importer's id and node) importing its first function."""
+def _chain_part(pairs, resolution, head=None, roots=(), label=""):
+    """The nodes and edges of a chain, with `head` (an importer's id and node) importing its first function, the edge
+    labelled `label` (the module it imports it from)."""
     nodes = [_function_node(module, function) for module, function in pairs]
     ids = [node.id for node in nodes]
     edges = [_edge(ids[i], ids[i + 1], hop.via) for i, hop in enumerate(resolution.hops)]
     if head is not None:
         nodes.insert(0, head)
-        edges.insert(0, _edge(head.id, ids[0], "imports"))
+        edges.insert(0, _edge(head.id, ids[0], "imports", label))
     return _Part(nodes, edges, list(roots))
 
 
@@ -350,31 +351,52 @@ _CUT_SHORT_POSITIVE = (" A table on this chain was cut short when it was read, s
 
 
 def path_to_syscall(graph, table, baseline, module: str, function: str) -> Answer:
-    """The import of `function` from `module` followed down to a syscall number: over the forwarders and api sets the
-    binaries describe (edges "derived"), to the export that defines it, and from there, by the curated Win32 to Nt
-    `table`, to the syscall `baseline` holds under that Nt name (one edge "reaches_syscall", origin "curated", the
-    only curated edge and the last). The Win32 to Nt step is not read from any binary: it would take disassembly, so
-    the answer says it is the table's word.
+    """The import of `function` followed down to a syscall number: over the forwarders and api sets the binaries
+    describe (edges "derived") to the export that defines it, and from there to the syscall `baseline` holds.
 
-    A path ends visibly, never by vanishing, and the note says which end it was: the chain does not reach a
-    definition (so not ntdll), the table has no entry for the function it ends at, the table's Nt name is no syscall
-    of the baseline, or there is no table or baseline to ask; and, with any of them, that a table on the chain was cut
-    short when it was read, so a negative end is not certain. A `module` the graph does not know is the root of the
-    path as a file ("exe"), the sample whose import this is. `table` and `baseline` may be None."""
+    The tables prove no more than that: `kernelbase!WriteProcessMemory` defines it, it does not forward to ntdll, it
+    calls `NtWriteVirtualMemory` in its own code. So where the chain ends in a Win32 function, one edge
+    "reaches_syscall" with origin "curated", the word of the Win32 to Nt `table`, goes from there to the syscall; no
+    node of ntdll stands between, as no kind of edge honestly joins it. Where the chain ends in the stub itself (an
+    Nt name that ntdll or win32u exports and the baseline holds), the same edge is "derived" and the path has no
+    curated edge at all. A path has at most one curated edge, and it is the last.
+
+    `module` is the importer when the graph holds it and its import table holds `function` (an "imports" edge, derived,
+    labelled with the module it imports it from), else the module the function is looked up in; a module the graph does
+    not know is not drawn as importing anything: the function node is the root, with no edge, and the note says the
+    import could not be confirmed.
+
+    A path ends visibly, never by vanishing, and the note says which end it was: the chain reaches no definition at
+    all, the table has no entry for the function it ends at, the table's Nt name is no syscall of the baseline, or
+    there is no table or baseline to ask; and, with any of them, that a table on the chain was cut short when it was
+    read, so a negative end is not certain. `table` and `baseline` may be None."""
     name = _module_name(graph, module)
     function = (function or "").strip()
     if not name or not function:
         return _empty("A module and a function are needed to follow an import down to a syscall.")
-    unknown = name not in graph.binaries and name not in graph.in_degree and not _is_api_set(graph, name)
-    if unknown:
-        name = (module or "").strip().lower()
-    resolution = binary_graph.resolve_export(graph.binaries, graph.api_sets, name, function)
-    pairs = _chain((name, function), resolution)
-    head = Node(name, name, "exe", 0, "") if unknown else None
-    part = _chain_part(pairs, resolution, head=head,
+    info = graph.binaries.get(name)
+    imported = []
+    if info is not None and function not in info.exports and function not in info.forwarders:
+        imported = [source for source, names in info.imports.items() if function in names]
+    head, label, extra = None, "", ""
+    if imported:
+        head, label = _module_node(graph, name), imported[0]
+        start = (imported[0], function)
+        if len(imported) > 1:
+            extra = (f" It imports it from {len(imported)} modules ({', '.join(imported)}); this path follows the "
+                     f"first.")
+    else:
+        unknown = info is None and name not in graph.in_degree and not _is_api_set(graph, name)
+        start = ((module or "").strip().lower() if unknown else name, function)
+        if unknown:
+            extra = " The module is not known to the graph, so the import itself could not be confirmed."
+    resolution = binary_graph.resolve_export(graph.binaries, graph.api_sets, *start)
+    pairs = _chain(start, resolution)
+    part = _chain_part(pairs, resolution, head=head, label=label,
                        roots=[head.id if head else _function_id(*pairs[0])])
 
     def ended(note, certain=False):
+        note += extra
         if resolution.partial:
             note += _CUT_SHORT_POSITIVE if certain else _CUT_SHORT_NEGATIVE
         return _answer(_Part([], [], []), [part], note, "paths")
@@ -382,11 +404,20 @@ def path_to_syscall(graph, table, baseline, module: str, function: str) -> Answe
     end_module, end_function = pairs[-1]
     end = _function_id(end_module, end_function)
     if resolution.reason != "defined":
-        note = (f"The chain does not reach ntdll: it stops at {end}, because "
+        note = (f"The chain reaches no definition at all: it stops at {end}, because "
                 f"{_stop_reason(graph, resolution, end_module, end_function)}.")
         if resolution.hops:
             note += " The hops it did take are drawn."
         return ended(note)
+    hops = _plural(len(resolution.hops), "hop", "hops")
+    stub = baseline.syscalls.get(end_function) if baseline is not None else None
+    if stub is not None and stub.module.lower() == end_module:
+        syscall = Node(f"syscall:{end_function}", f"{end_function} ({stub.module}, 0x{stub.number:x})", "syscall", 0, "")
+        part.nodes.append(syscall)
+        part.edges.append(_edge(end, syscall.id, "reaches_syscall"))
+        return ended(f"{function} is defined at {end}, after {hops}, and that export is the stub of a syscall itself: "
+                     f"no curated step is needed, and the baseline of this build gives {end_function} the number "
+                     f"{stub.number:#x} ({stub.number}).", certain=True)
     if table is None:
         return ended(f"{end} defines it, but the curated Win32 to Nt table could not be read on this system, so the "
                      f"step to a syscall cannot be followed.")
@@ -413,15 +444,14 @@ def path_to_syscall(graph, table, baseline, module: str, function: str) -> Answe
                   "ntdll in the binary graph does not export it either, and no syscall of this build has that name")
         return ended(f"The path ends at {end}. The curated table leads {entry.win32} to {entry.nt}: {clause}, so no "
                      f"syscall number can be given. The baseline may be of another build, or incomplete.{more}")
-    number = baseline.syscalls[entry.nt].number
-    syscall = Node(f"syscall:{entry.nt}", f"{entry.nt} (0x{number:x})", "syscall", 0, "")
+    target = baseline.syscalls[entry.nt]
+    syscall = Node(f"syscall:{entry.nt}", f"{entry.nt} ({target.module}, 0x{target.number:x})", "syscall", 0, "")
     part.nodes.append(syscall)
     part.edges.append(Edge(end, syscall.id, "reaches_syscall", "curated", f"curated: {entry.source}"))
     source = f"{entry.source}: {entry.note}" if entry.note else entry.source
-    return ended(f"{name}!{function} is defined at {end}, after {_plural(len(resolution.hops), 'hop', 'hops')}. "
-                 f"The last step is not read from any binary: the curated Win32 to Nt table ({source}) leads "
-                 f"{entry.win32} to {entry.nt}, which is syscall number {number:#x} ({number}) in the baseline of "
-                 f"this build.{more}", certain=True)
+    return ended(f"{function} is defined at {end}, after {hops}. The last step is not read from any binary: the "
+                 f"curated Win32 to Nt table ({source}) leads {entry.win32} to {entry.nt}, which is syscall number "
+                 f"{target.number:#x} ({target.number}) in the baseline of this build.{more}", certain=True)
 
 
 # the outcome of a forwarder chain, as prose: Resolution.reason is the token the code reads
