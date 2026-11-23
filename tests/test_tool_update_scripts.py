@@ -450,7 +450,7 @@ def test_ntsleuth_marker_follows_the_self_test_and_precedes_the_baselines():
     marker = script.index('Set-Content -Path "$InstallDir\\tdc-release.txt"')
     # a failed self-test leaves no marker, so the updater keeps offering the update
     assert script.index('"--lookup", "NtCreateProcess"') < marker
-    assert re.search(r"if \(\$selfTestOk\) \{\s*\$markerLines", script[marker - 200:marker + 50])
+    assert script.index("if (-not $selfTestOk) {") < marker
     # the baselines do not gate it: they are stored after it, and nothing of them is in front of it
     assert marker < script.index("[IO.File]::WriteAllText") and marker < script.index("Move-Item -Path \"$target.tmp\"")
     assert "Test-Baseline $view" not in script[:marker].split("function Test-Baseline")[-1].split("# --- Self-test")[-1]
@@ -461,17 +461,24 @@ def test_ntsleuth_marker_follows_the_self_test_and_precedes_the_baselines():
     assert "sha256:" in script
 
 
-def test_ntsleuth_only_a_download_a_checksum_or_the_copy_end_the_script_with_an_error():
+def test_ntsleuth_only_the_baseline_steps_after_the_self_test_may_warn_instead_of_fail():
     script = _script("ntsleuth")
     installed = script.index("installed to $InstallDir")
-    before, after = script[:installed], script[installed:]
-    # what runs after the verified install can only warn
-    assert "Stop-Install" not in after and not re.search(r"(?m)^[^#\n]*\bexit 1\b", after)
-    assert after.rstrip().endswith("exit 0")
-    # and everything that ends in error is in front of it
+    before = script[:installed]
+    # what ends in error before the install: download, checksum, copy
     for needle in ("Download of $file failed", "SHA-256 mismatch for", "has no SHA-256 for", "Copying to $InstallDir failed"):
         assert needle in before, needle
     assert "exit 1" in _function_body(script, "Stop-Install")
+    # a verified binary that will not extract or look a syscall up is an install failure, with or without -Force
+    verdict = script.index("if (-not $selfTestOk) {")
+    marker = script.index('Set-Content -Path "$InstallDir\\tdc-release.txt"')
+    block = script[verdict:script.index("\n}\n", verdict)]
+    assert "exit 1" in block and "no marker is written" in block
+    assert installed < verdict < marker and "$Force" not in block
+    # the baseline steps after the marker can only warn, and the script ends in 0
+    after = script[marker:]
+    assert "Stop-Install" not in after and not re.search(r"(?m)^[^#\n]*\bexit 1\b", after)
+    assert after.rstrip().endswith("exit 0")
 
 
 def _powershell_function(name):

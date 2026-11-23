@@ -31,16 +31,15 @@
 #       first line the release tag, then one "<file> sha256:<hash>" line per binary
 #
 # Each view is then self-tested (extract, then --lookup NtCreateProcess has to
-# print a syscall number). The marker is written when that worked, so the tool
-# updates keep offering the update until it does. The baselines are stored after
-# the marker and do not gate it.
+# print a syscall number); a failure stops the script with exit code 1 and no
+# marker. The marker is written when that worked, and the baselines are stored
+# after it and do not gate it.
 #
 # Exit codes: 1 for what must never leave a bad install behind (a failed
 # download, a missing or mismatching checksum, a binary that cannot be copied,
-# an unsupported architecture). Everything after the verified install, the
-# self-test and the baselines, only warns and exits 0: NTSleuth is an addition
-# to the chamber, so provisioning goes on and the SYSCALLS tab reports what is
-# missing.
+# a binary that will not extract or look NtCreateProcess up, an unsupported
+# architecture). Only the baseline steps after the self-test warn and exit 0:
+# a missing baseline is a state the SYSCALLS tab reports, so provisioning goes on.
 #
 # On ARM64 the two baselines are compared: ntsleuth-x64.exe has to see the x64
 # view of ntdll.dll, and if its extraction equals the ARM64 one the script says
@@ -314,20 +313,27 @@ foreach ($view in $Views) {
 }
 Remove-Item "$InstallDir\output" -Recurse -Force -ErrorAction SilentlyContinue
 
+# --- Self-test verdict ---
+# A binary that downloaded and verified but will not extract is an install failure, not a degraded feature: the
+# baselines below are a state the web UI handles ("no baseline"), a binary that does not run is not. Exiting 0
+# without a marker would be the worst outcome: the updater would report "updated" and offer the update again at
+# its next check, forever. So this stops loudly, whether or not -Force is given. Whoever does not want the
+# feature leaves this script out of the provisioning.
+if (-not $selfTestOk) {
+    Write-Host "[!] NTSleuth is installed, but the self-test failed (see above): no marker is written, so the update stays on offer" -ForegroundColor Red
+    exit 1
+}
+
 # --- Marker: the tag first, as the tool updates read the first line only ---
 # Written when the binaries are verified, installed and work. The baselines below do not gate it: a baseline
-# that fails leaves a good install, and the update must not stay on offer for that.
-if ($selfTestOk) {
-    $markerLines = @($Tag)
-    foreach ($asset in $Assets) { $markerLines += "$asset sha256:$($hashes[$asset])" }
-    Set-Content -Path "$InstallDir\tdc-release.txt" -Value $markerLines -Encoding ASCII
-} else {
-    Write-Host "[!] NTSleuth is installed, but the self-test failed (see above): no marker is written, so the update stays on offer" -ForegroundColor Red
-}
+# that fails to be stored leaves a good install, and the update must not stay on offer for that.
+$markerLines = @($Tag)
+foreach ($asset in $Assets) { $markerLines += "$asset sha256:$($hashes[$asset])" }
+Set-Content -Path "$InstallDir\tdc-release.txt" -Value $markerLines -Encoding ASCII
 
 # --- Baselines ---
 # From here on nothing ends the script with an error: the chamber is provisioned without them, the tab says
-# "no baseline", and the web UI extracts one on demand.
+# "no baseline", and the web UI extracts one on demand. Every view extracted, or the script stopped above.
 # A fingerprint of what tells the views apart: the RVA and stub bytes of every entry. The extraction's
 # metadata (times, order of keys) is no part of it.
 function Get-ViewFingerprint([string]$Json) {
