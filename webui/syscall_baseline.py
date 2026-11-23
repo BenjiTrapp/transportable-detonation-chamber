@@ -5,6 +5,7 @@ Pure Python; later measured against the stubs of a running process.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -143,6 +144,17 @@ def load_baseline(path: str) -> Baseline:
     if not bl.syscalls:
         raise BaselineError(f"baseline {path} has no usable syscalls ({len(bl.skipped)} skipped)")
     return bl
+
+
+def view_fingerprint(baseline: Baseline) -> str:
+    """What makes two extractions the same view of ntdll.dll: the RVA and stub bytes of every entry, in order.
+
+    Times and other metadata of the extraction are no part of it. `Get-ViewFingerprint` of install-ntsleuth.ps1
+    means the same, so the installer and the web UI agree about when the x64 binary has not seen the x64 view."""
+    digest = hashlib.sha256()
+    for sc in baseline.syscalls.values():
+        digest.update(f"{sc.rva}:{sc.stub_bytes.hex()}\n".encode())
+    return digest.hexdigest()
 
 
 def parse_baseline_name(filename: str) -> tuple[str, str] | None:

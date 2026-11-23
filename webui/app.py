@@ -7815,8 +7815,9 @@ _hook_allowlist_lock = threading.Lock()
 
 
 def _new_syscall_extract_state():
-    # running: (build, view) being extracted; failed: (build, view) -> (when, why); thread: the latest one
-    return {"running": set(), "failed": {}, "thread": None}
+    # running: (build, view) being extracted; failed: (build, view) -> (when, why); thread: the latest one;
+    # indistinguishable: the failed ones whose reason is that the x64 extraction was the arm64 view
+    return {"running": set(), "failed": {}, "indistinguishable": set(), "thread": None}
 
 
 _syscall_extract_state = _new_syscall_extract_state()
@@ -7883,6 +7884,28 @@ def _ntsleuth_args(view, symbols=None):
     return args if symbols else args + ["--no-symbols"]
 
 
+class _ViewNotDistinguishable(RuntimeError):
+    """The x64 extraction is the arm64 one: ntsleuth-x64.exe did not see the x64 view of ntdll.dll."""
+
+
+def _refuse_arm64_lookalike(parsed, build):
+    """Raises _ViewNotDistinguishable if `parsed`, an x64 extraction, has the fingerprint of the arm64 baseline of
+    `build`. Stored, it would be the arm64 baseline under another name: every emulated x64 sample would be measured
+    against the wrong reference. With no arm64 baseline (an x64 host) there is nothing to be the same as."""
+    path = syscall_baseline.find_baseline(NTSLEUTH_BASELINE_DIR, build, "arm64")
+    if path is None:
+        return
+    try:
+        arm64 = _load_syscall_baseline(path)
+    except syscall_baseline.BaselineError:
+        return
+    if syscall_baseline.view_fingerprint(arm64) == syscall_baseline.view_fingerprint(parsed):
+        raise _ViewNotDistinguishable(
+            f"the x64 view is not distinguishable on this host: ntsleuth-x64.exe extracted the same RVAs and stub "
+            f"bytes as the arm64 baseline of build {build}, so it did not see the x64 ntdll.dll. No x64 baseline "
+            f"is stored; measuring emulated x64 samples against the ARM64 stubs would be wrong")
+
+
 def _extract_baseline(view, symbols, build):
     """Extract the baseline of `view` with NTSleuth and store it as the one of `build`, the build the caller is
     keyed by, where the web UI reads it. True when it did; False when NTSleuth is not installed for that view.
@@ -7916,6 +7939,8 @@ def _extract_baseline(view, symbols, build):
         raise RuntimeError(str(exc)) from None
     if not parsed.syscalls:
         raise RuntimeError("NTSleuth's output holds no usable syscall")
+    if view == "x64":
+        _refuse_arm64_lookalike(parsed, build)
     os.makedirs(NTSLEUTH_BASELINE_DIR, exist_ok=True)
     target = os.path.join(NTSLEUTH_BASELINE_DIR, f"ntsleuth-{build}-{view}.json")
     with open(target + ".tmp", "w", encoding="utf-8") as fh:
@@ -7927,18 +7952,23 @@ def _extract_baseline(view, symbols, build):
 def _syscall_extract_job(build, view):
     key = (build, view)
     why = None
+    same_view = False
     try:
         with _syscall_extract_serial:
             if not _extract_baseline(view, _symbol_server_reachable(), build):
                 why = f"NTSleuth is not installed for the {view} view ({_ntsleuth_exe(view)})"
     except Exception as exc:
         why = str(exc) or type(exc).__name__
+        same_view = isinstance(exc, _ViewNotDistinguishable)
     with _syscall_extract_lock:
         _syscall_extract_state["running"].discard(key)
+        _syscall_extract_state["indistinguishable"].discard(key)
         if why is None:
             _syscall_extract_state["failed"].pop(key, None)
         else:
             _syscall_extract_state["failed"][key] = (time.time(), why)
+            if same_view:
+                _syscall_extract_state["indistinguishable"].add(key)
 
 
 def _start_baseline_extraction(build, view):
@@ -8000,6 +8030,9 @@ def _syscall_extraction_note(build, view):
         if (build, view) in _syscall_extract_state["running"]:
             return " It is being extracted in the background, try again in a few seconds."
         failed = _syscall_extract_state["failed"].get((build, view))
+        same_view = (build, view) in _syscall_extract_state["indistinguishable"]
+    if failed and same_view:
+        return f" {failed[1][:1].upper()}{failed[1][1:]}."
     return f" The last extraction failed: {failed[1]}." if failed else ""
 
 
@@ -8336,6 +8369,7 @@ def api_syscalls_status():
     with _syscall_extract_lock:
         running = sorted(_syscall_extract_state["running"])
         failed = sorted((k, v) for k, v in _syscall_extract_state["failed"].items())
+        same_view = set(_syscall_extract_state["indistinguishable"])
     return jsonify({
         "installed": any(executables.values()),
         "path": NTSLEUTH_DIR,
@@ -8346,7 +8380,9 @@ def api_syscalls_status():
         "baselines": baselines,
         "extraction": {
             "running": [{"build": b, "view": v} for b, v in running],
-            "failed": [{"build": b, "view": v, "reason": why} for (b, v), (_, why) in failed],
+            # indistinguishable: not a failed run but the x64 binary seeing the arm64 view, so no x64 baseline
+            "failed": [{"build": b, "view": v, "reason": why, "indistinguishable": (b, v) in same_view}
+                       for (b, v), (_, why) in failed],
         },
     })
 

@@ -722,3 +722,31 @@ def test_ntsleuth_different_views_keep_both_baselines(tmp_path):
     assert code == 0 and "BASELINES IDENTICAL" not in out, out
     assert files == ["ntsleuth-26220.5770-arm64.json", "ntsleuth-26220.5770-x64.json"]
     assert "STORED=arm64,x64" in out
+
+
+def test_ntsleuth_and_the_web_ui_agree_which_extractions_are_the_same_view():
+    import subprocess
+    import syscall_baseline
+    pwsh, body = _powershell_function("Get-ViewFingerprint")
+
+    def doc(rva, stub, ms=402):
+        return {"metadata": {"extraction_time_ms": ms},
+                "syscalls": [{"name": "NtA", "module": "ntdll.dll", "syscall_number": 1, "rva": rva, "stub_bytes": stub,
+                              "is_true_syscall": True},
+                             {"name": "NtB", "module": "ntdll.dll", "syscall_number": 2, "rva": rva + 16, "stub_bytes": stub,
+                              "is_true_syscall": True}]}
+
+    base = doc(5392, "a10900d4c0035fd6")
+    cases = {"same": doc(5392, "a10900d4c0035fd6", 977), "stub": doc(5392, "4c8bd1b8c0000000"), "rva": doc(5400, "a10900d4c0035fd6")}
+
+    def python_print(d):
+        return syscall_baseline.view_fingerprint(syscall_baseline.parse_baseline(d, "1.1", "x64"))
+
+    def pwsh_print(d):
+        cmd = ("function Get-ViewFingerprint([string]$Json) {\n" + body + "}\n"
+               "[Console]::Out.Write((Get-ViewFingerprint ([Console]::In.ReadToEnd())))")
+        return subprocess.run([pwsh, "-NoProfile", "-Command", cmd], input=json.dumps(d, indent=2, sort_keys=True),
+                              capture_output=True, text=True, timeout=60).stdout
+
+    for name, other in cases.items():
+        assert (python_print(base) == python_print(other)) == (pwsh_print(base) == pwsh_print(other)) == (name == "same"), name

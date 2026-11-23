@@ -138,11 +138,11 @@ One rizin session per opened file and browser tab (RIZIN tab). Addresses are int
 
 ## Syscalls
 
-Read-only measurement of the syscall stubs of a process against a baseline NTSleuth extracted from this system's ntdll and win32u. `view` is `arm64`, `x64` or `x86` (default: this host's own); a baseline exists for the first two. A request without a baseline for this build answers `503` (`400` for a scan) and starts the extraction in the background: `--no-symbols` when the symbol server cannot be reached, which leaves the parameter table incomplete and the measurement as it was.
+Read-only measurement of the syscall stubs of a process against a baseline NTSleuth extracted from this system's ntdll and win32u. `view` is `arm64`, `x64` or `x86` (default: this host's own); a baseline exists for the first two. A request without a baseline for this build answers `503` (`400` for a scan) and starts the extraction in the background: `--no-symbols` when the symbol server cannot be reached, which leaves the parameter table incomplete and the measurement as it was. An x64 extraction whose RVAs and stub bytes equal the arm64 baseline's is not stored.
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| GET | `/api/syscalls/status` | `installed` and `path` of NTSleuth, `executables` per view, the system `build`, `baselines` (`build`, `view`, `current`, `symbols`, a `note` when the parameters are incomplete) and the background `extraction` (`running`, `failed` with `reason`) |
+| GET | `/api/syscalls/status` | `installed` and `path` of NTSleuth, `executables` per view, the system `build`, `baselines` (`build`, `view`, `current`, `symbols`, a `note` when the parameters are incomplete) and the background `extraction` (`running`, `failed` with `reason` and `indistinguishable`: true when the x64 extraction was the arm64 view, so no x64 baseline is stored and the host cannot measure emulated x64 samples) |
 | GET | `/api/syscalls/baseline` | The syscall catalog, paged. Params: `view`, `query` (name substring or number), `module`, `offset`, `limit` (max 500) |
 | GET | `/api/syscalls/<name>` | One syscall with parameters, stub bytes and the compared `prefix_len`. Param: `view`. `404` for an unknown name |
 | POST | `/api/syscalls/scan` | Measure a PID against the baseline of its view (read from the image, not from the request); scored in the evidence model and added to the scan history. Params: `pid`, `modules` (`ntdll.dll`, `win32u.dll`). `504` after 120 s |

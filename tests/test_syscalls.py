@@ -2059,6 +2059,101 @@ def test_an_extraction_with_symbols_is_not_marked_degraded(tdc, monkeypatch, tmp
     assert tdc._get_syscall_baseline("arm64").symbols is True
 
 
+def _store_arm64_baseline(tdc, monkeypatch, tmp_path):
+    """The arm64 baseline of build 26300.1 as the web UI extracted it, and an x64 binary to extract with."""
+    runs = _fake_ntsleuth(tdc, monkeypatch, tmp_path, _fixture("arm64"))
+    (pathlib.Path(tdc.NTSLEUTH_DIR) / "ntsleuth-x64.exe").write_bytes(b"MZ")
+    assert tdc._extract_baseline("arm64", False, "26300.1") is True
+    return runs
+
+
+def _x64_baseline_file(tdc):
+    return pathlib.Path(tdc.NTSLEUTH_BASELINE_DIR) / "ntsleuth-26300.1-x64.json"
+
+
+def test_view_fingerprint_tells_the_views_apart_and_ignores_the_metadata():
+    arm64 = syscall_baseline.parse_baseline(_fixture("arm64"), "26220.5770", "arm64")
+    again = _fixture("arm64")
+    again["metadata"] = {"extraction_time_ms": 977}
+    assert syscall_baseline.view_fingerprint(arm64) == syscall_baseline.view_fingerprint(
+        syscall_baseline.parse_baseline(again, "26300.1", "x64"))
+    assert syscall_baseline.view_fingerprint(arm64) != syscall_baseline.view_fingerprint(
+        syscall_baseline.parse_baseline(_fixture("x64"), "26220.5770", "x64"))
+    # the same RVAs with other stub bytes, and the same stub bytes at another RVA, are other views
+    other_stub, other_rva = _fixture("arm64"), _fixture("arm64")
+    other_stub["syscalls"][0]["stub_bytes"] = "00" * 8
+    other_rva["syscalls"][0]["rva"] += 16
+    for other in (other_stub, other_rva):
+        assert syscall_baseline.view_fingerprint(arm64) != syscall_baseline.view_fingerprint(
+            syscall_baseline.parse_baseline(other, "26220.5770", "x64"))
+
+
+def test_an_x64_extraction_that_is_the_arm64_view_is_not_stored(tdc, monkeypatch, tmp_path):
+    _store_arm64_baseline(tdc, monkeypatch, tmp_path)
+    again = _fixture("arm64")
+    again["metadata"] = {"extraction_time_ms": 977}
+    _fake_ntsleuth(tdc, monkeypatch, tmp_path, again)
+    with pytest.raises(tdc._ViewNotDistinguishable, match="not distinguishable"):
+        tdc._extract_baseline("x64", False, "26300.1")
+    assert not _x64_baseline_file(tdc).exists() and not list(_x64_baseline_file(tdc).parent.glob("*.tmp"))
+    assert (_x64_baseline_file(tdc).parent / "ntsleuth-26300.1-arm64.json").exists()
+
+
+def test_a_distinct_x64_extraction_is_stored_next_to_the_arm64_one(tdc, monkeypatch, tmp_path):
+    _store_arm64_baseline(tdc, monkeypatch, tmp_path)
+    _fake_ntsleuth(tdc, monkeypatch, tmp_path, _fixture("x64"))
+    assert tdc._extract_baseline("x64", False, "26300.1") is True
+    assert tdc._get_syscall_baseline("x64").view == "x64"
+
+
+@pytest.mark.parametrize("arm64_file", ["missing", "unreadable"])
+def test_without_a_usable_arm64_baseline_there_is_nothing_to_be_identical_to(tdc, monkeypatch, tmp_path, arm64_file):
+    # an x64 host, or a native-only one: the extraction goes on as it always did, even with the arm64 view's content
+    _fake_ntsleuth(tdc, monkeypatch, tmp_path, _fixture("arm64"))
+    (pathlib.Path(tdc.NTSLEUTH_DIR) / "ntsleuth-x64.exe").write_bytes(b"MZ")
+    if arm64_file == "unreadable":
+        os.makedirs(tdc.NTSLEUTH_BASELINE_DIR)
+        (pathlib.Path(tdc.NTSLEUTH_BASELINE_DIR) / "ntsleuth-26300.1-arm64.json").write_text("{not json")
+    assert tdc._extract_baseline("x64", False, "26300.1") is True
+    assert _x64_baseline_file(tdc).exists()
+
+
+def test_the_arm64_view_is_never_refused_for_looking_like_itself(tdc, monkeypatch, tmp_path):
+    _store_arm64_baseline(tdc, monkeypatch, tmp_path)
+    assert tdc._extract_baseline("arm64", False, "26300.1") is True
+
+
+def test_status_and_the_error_tell_an_indistinguishable_view_from_a_missing_baseline(client, tdc, monkeypatch, tmp_path):
+    _store_arm64_baseline(tdc, monkeypatch, tmp_path)
+    _fake_ntsleuth(tdc, monkeypatch, tmp_path, _fixture("arm64"))
+    tdc._syscall_extract_state["running"].add(("26300.1", "x64"))
+    tdc._syscall_extract_job("26300.1", "x64")
+    failed = client.get("/api/syscalls/status").get_json()["extraction"]["failed"]
+    assert len(failed) == 1 and failed[0]["view"] == "x64" and failed[0]["indistinguishable"] is True
+    assert "x64 view is not distinguishable" in failed[0]["reason"]
+    baseline, why = tdc._syscall_baseline_for("x64", extract=False)
+    assert baseline is None and "not distinguishable" in why and "last extraction failed" not in why
+    # an ordinary failure is a failure, and says it is not this
+    tdc._syscall_extract_state["failed"].clear()
+    tdc._syscall_extract_state["indistinguishable"].clear()
+    monkeypatch.setattr(tdc, "_extract_baseline", lambda view, symbols, build: (_ for _ in ()).throw(RuntimeError("boom")))
+    tdc._syscall_extract_state["running"].add(("26300.1", "x64"))
+    tdc._syscall_extract_job("26300.1", "x64")
+    failed = client.get("/api/syscalls/status").get_json()["extraction"]["failed"]
+    assert failed[0]["indistinguishable"] is False and failed[0]["reason"] == "boom"
+    assert "last extraction failed: boom" in tdc._syscall_baseline_for("x64", extract=False)[1]
+
+
+def test_a_later_good_extraction_clears_the_indistinguishable_note(tdc, monkeypatch, tmp_path):
+    _store_arm64_baseline(tdc, monkeypatch, tmp_path)
+    _fake_ntsleuth(tdc, monkeypatch, tmp_path, _fixture("arm64"))
+    tdc._syscall_extract_job("26300.1", "x64")
+    assert ("26300.1", "x64") in tdc._syscall_extract_state["indistinguishable"]
+    _fake_ntsleuth(tdc, monkeypatch, tmp_path, _fixture("x64"))
+    tdc._syscall_extract_job("26300.1", "x64")
+    assert not tdc._syscall_extract_state["indistinguishable"] and not tdc._syscall_extract_state["failed"]
+
+
 def test_an_extraction_without_ntsleuth_says_so_and_writes_nothing(tdc, tmp_path):
     assert tdc._extract_baseline("arm64", True, "26300.1") is False
     assert not os.path.exists(tdc.NTSLEUTH_BASELINE_DIR)
