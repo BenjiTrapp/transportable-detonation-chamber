@@ -25215,11 +25215,14 @@ function syscallScanSummary(scan) {
     const counts = scan.counts || {};
     const total = SYSCALL_STATES.reduce((sum, s) => sum + (Number(counts[s]) || 0), 0);
     const deviations = total - (Number(counts.intact) || 0);
+    const unreadable = Number(counts.unreadable) || 0;
     const name = String(scan.process || '').split(/[\\/]/).pop();
     let text = `PID ${scan.pid}` + (name ? ` (${name})` : '');
     if (scan.view) text += ` · ${scan.view}`;
     if (scan.build) text += ` · build ${scan.build}`;
+    // an unreadable stub is one nobody read: a scan of nothing else measured nothing and found no deviation
     text += total === 0 ? ': no stub measured'
+        : total === unreadable ? `: no stub could be read (${unreadable.toLocaleString('en-US')} unreadable)`
         : `: ${deviations === 0 ? 'no deviations' : `${deviations} deviation${deviations === 1 ? '' : 's'}`} of ${total.toLocaleString('en-US')} stubs`;
     const evidence = scan.evidence;
     if (evidence && evidence.label) {

@@ -2892,6 +2892,50 @@ def test_a_scan_of_a_clean_process_scores_nothing(client, tdc, target):
     assert body["deviations"] == [] and body["evidence"]["score"] == 0 and body["evidence"]["label"] == "CLEAN"
 
 
+def _zeroed(reader):
+    """`reader` with every stub reading as zeros: each one unreadable, none measured."""
+    reader._ranges = [(start, bytearray(len(data))) for start, data in reader._ranges]
+    return reader
+
+
+def test_a_manual_scan_that_read_no_stub_is_not_observed_and_not_recorded_as_clean(client, tdc, target):
+    _zeroed(target.reader)
+    body = client.post("/api/syscalls/scan", json={"pid": 4812}).get_json()
+    assert body["counts"]["unreadable"] > 0 and body["counts"]["intact"] == 0 and body["partial"] is True
+    assert body["evidence"]["label"] == "NOT OBSERVED"
+    assert "no stub" in body["evidence"]["note"] and "unreadable" in body["evidence"]["note"]
+    [(_, _, recorded, _)] = target.history
+    assert tdc._normalize_scan("Syscalls", recorded)[0] != "clean"
+
+
+def test_a_manual_scan_of_a_process_without_ntdll_is_not_observed(client, tdc, target, fake_baseline_dir):
+    baseline = syscall_baseline.load_baseline(str(fake_baseline_dir / "ntsleuth-26220.5770-arm64.json"))
+    target.reader = _reader_from(baseline, patched={}, drop="ntdll.dll")
+    body = client.post("/api/syscalls/scan", json={"pid": 4812}).get_json()
+    assert body["evidence"]["label"] == "NOT OBSERVED" and "ntdll.dll" in body["evidence"]["note"]
+
+
+def test_a_manual_scan_that_read_one_stub_keeps_its_label(client, tdc, target, fake_baseline_dir):
+    baseline = syscall_baseline.load_baseline(str(fake_baseline_dir / "ntsleuth-26220.5770-arm64.json"))
+    target.reader = _reader_from(baseline, patched={}, fail_after=1)
+    body = client.post("/api/syscalls/scan", json={"pid": 4812}).get_json()
+    assert body["counts"]["intact"] >= 1 and body["counts"]["unreadable"] >= 1
+    assert body["evidence"]["label"] == "CLEAN" and body["partial"] is True
+
+
+def test_the_stages_own_label_is_not_observed_when_it_read_no_stub(tdc, target):
+    _zeroed(target.reader)
+    entry = tdc._run_syscall_stage(4812, None)
+    assert entry["evidence"]["label"] == "NOT OBSERVED"
+
+
+def test_a_sweep_does_not_count_a_process_it_read_no_stub_of_as_scanned(tdc, sweep):
+    _zeroed(sweep[900])
+    result = tdc._run_sweep(use_aether=False, use_processdump=False, capture_baseline=False, use_syscalls=True)
+    assert result["stats"]["syscall_processes"] == 1 and result["stats"]["syscall_skipped"] == 2
+    assert [p["pid"] for p in result["processes"]] == [4812]
+
+
 def test_a_scan_takes_the_view_from_the_image_and_the_baseline_of_that_view(client, tdc, target, fake_baseline_dir):
     target.view = "x64"
     target.reader = _patched_reader(tdc, fake_baseline_dir, "private", view="x64", name="NtProtectVirtualMemory",

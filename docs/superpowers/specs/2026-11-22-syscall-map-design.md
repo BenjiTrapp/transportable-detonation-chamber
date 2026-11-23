@@ -155,6 +155,12 @@ Neues Modul `webui/syscall_scan.py`, reines ctypes, kein zusätzliches Binary.
   einer arm64-Baseline rund 2.000, ist unnötig; die Stubs liegen dicht
   beieinander.
 - Ein Lesefehler ist kein Abbruch: die betroffene Zelle wird „kein Stub lesbar".
+- **Ein Scan, der keinen Stub messen konnte, ist nie `CLEAN`.** Ein Stub
+  `unreadable` ist keiner, der gemessen wurde. Hat ein Scan nur solche (oder gar
+  keinen), heißt sein Urteil NOT OBSERVED — beim Knopf SCAN, in der
+  Detonationsstufe, im Verlauf und im Urteil der Detonation —, und der Sweep
+  zählt den Prozess nicht als gescannt. Ein Befund aus der Stub-Suche hebt das
+  Urteil trotzdem.
 - **Nur lesen.** Kein `WriteProcessMemory`, kein Debugger-Attach, keine
   Injektion. Der Zielprozess bleibt unverändert, wie bei den übrigen
   Live-Memory-Werkzeugen.

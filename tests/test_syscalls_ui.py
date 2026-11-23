@@ -415,6 +415,16 @@ def test_the_scan_summary_names_the_process_the_counts_and_the_score():
     assert "PID 5" in r["bare"]
 
 
+@needs_node
+def test_the_scan_summary_of_a_scan_that_read_no_stub_says_so_and_counts_no_deviation():
+    r = _run_node(["syscallScanSummary"], r"""
+      out(syscallScanSummary({ pid: 7, partial: true, note: '490 stubs unreadable',
+        counts: { intact: 0, hooked: 0, patched: 0, diverged: 0, unreadable: 490 },
+        evidence: { label: 'NOT OBSERVED', score: 0 } }));""")
+    assert "no stub could be read" in r and "490 unreadable" in r and "NOT OBSERVED" in r
+    assert "deviation" not in r and "CLEAN" not in r
+
+
 # --- The tab at work: loading, the map on its canvases, scanning ------------------
 
 # Every function, constant and `let` of the block that the flow reaches, so a test hands it to node

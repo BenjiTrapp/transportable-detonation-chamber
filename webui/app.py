@@ -4705,6 +4705,23 @@ def _pipe_events_for(pids, sample_keys, resolve, since, until):
     return events, truncated
 
 
+def _syscall_stubs_measured(counts):
+    """How many stubs a syscall scan measured: every state but `unreadable`, which is a stub nobody read."""
+    counts = counts if isinstance(counts, dict) else {}
+    return sum(v for k, v in counts.items() if k != "unreadable" and isinstance(v, int) and not isinstance(v, bool))
+
+
+def _syscall_mark_unobserved(result):
+    """A syscall scan `result` that measured no stub is NOT OBSERVED, not CLEAN: what it did not read is not evidence
+    of being clean. A label another finding raised (a stub the sample carries) is left as it is."""
+    evidence = result.get("evidence")
+    if (isinstance(evidence, dict) and evidence.get("label") == "CLEAN"
+            and not _syscall_stubs_measured(result.get("counts"))):
+        evidence["label"] = "NOT OBSERVED"
+        evidence["note"] = f"The syscall scan measured no stub: {result.get('note') or 'nothing was read'}"
+    return result
+
+
 def _syscall_verdict_reasons(stage, evidence, reasons, only_source=False):
     """What the syscall stage of a detonation leaves unsaid by its score, said in the verdict, the way a live scan
     that observed nothing is: a partial measurement, a stub search that did not cover the process, and stubs that
@@ -4727,8 +4744,7 @@ def _syscall_verdict_reasons(stage, evidence, reasons, only_source=False):
         reasons.append(f"Syscall measurement is partial ({'; '.join(gaps)[:400]}) - what it did not read is not "
                        "evidence of being clean")
     # an unreadable stub was not measured: a stage that read none is a stage that observed nothing
-    measured = sum(v for k, v in counts.items() if k != "unreadable" and isinstance(v, int))
-    if not measured and only_source and evidence.get("label") == "CLEAN":
+    if not _syscall_stubs_measured(counts) and only_source and evidence.get("label") == "CLEAN":
         evidence["label"] = "NOT OBSERVED"
         evidence["note"] = f"The syscall stage measured no stub: {stage.get('note') or 'nothing was read'}"
     renumbered = stage.get("renumbered") if isinstance(stage.get("renumbered"), int) else 0
@@ -7438,6 +7454,10 @@ def _sweep_syscalls(names, per_pid, errors, stats):
         except Exception:
             skipped += 1
             continue
+        # a process none of whose stubs could be read was not scanned, whatever else the sweep says of it
+        if not _syscall_stubs_measured(measured.get("counts")):
+            skipped += 1
+            continue
         scanned += 1
         entry = _sweep_entry(per_pid, pid, image)
         entry["findings"] += memory_evidence.collect({"syscall_scan": measured}, process=entry["identity"])
@@ -8403,11 +8423,12 @@ def _syscall_stage(pid, path):
     in_file["hits"] = list(file_hits)
     findings = memory_evidence.collect({"syscall_scan": measured}, process=identity)
     findings += memory_evidence.from_direct_stubs(in_process["hits"] + in_file["hits"], identity)
-    return {**{k: v for k, v in measured.items() if k != "states"},
-            "tool": "Syscalls", "pid": pid, "process": identity, "modules": list(modules),
-            "stubs": {"process": in_process, "file": in_file},
-            "evidence_findings": findings,
-            "evidence": memory_evidence.score(findings, baseline=_memory_baseline)}
+    return _syscall_mark_unobserved({
+        **{k: v for k, v in measured.items() if k != "states"},
+        "tool": "Syscalls", "pid": pid, "process": identity, "modules": list(modules),
+        "stubs": {"process": in_process, "file": in_file},
+        "evidence_findings": findings,
+        "evidence": memory_evidence.score(findings, baseline=_memory_baseline)})
 
 
 def _run_syscall_stage(pid, path, notes=None):
@@ -8535,8 +8556,9 @@ def api_syscalls_scan():
     measured, view, build = _syscall_measure(pid, modules, _get_hook_allowlist())
     process = _syscall_identity(pid)
     findings = memory_evidence.collect({"syscall_scan": measured}, process=process)
-    result = {**measured, "tool": "Syscalls", "pid": pid, "process": process, "modules": list(modules),
-              "evidence": memory_evidence.score(findings, baseline=_memory_baseline)}
+    result = _syscall_mark_unobserved({**measured, "tool": "Syscalls", "pid": pid, "process": process,
+                                       "modules": list(modules),
+                                       "evidence": memory_evidence.score(findings, baseline=_memory_baseline)})
     # the history keeps what a timeline row expands to, not the state of every one of some 2,000 stubs
     _record_scan("Syscalls", f"PID {pid}", {k: v for k, v in result.items() if k != "states"})
     return jsonify(result)
