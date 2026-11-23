@@ -346,6 +346,8 @@ def _stop_reason(graph, resolution, module, function):
 _CUT_SHORT_NEGATIVE = (" A table on this chain was cut short when it was read, so this end is not certain: what is "
                        "missing here may lie in the part that was not read, and it is not proof that the chain really "
                        "ends here.")
+_CUT_SHORT_REACHED = (" A table on this chain was cut short when it was read, so the definition named here may not be "
+                      "the one a complete table would give.")
 _CUT_SHORT_POSITIVE = (" A table on this chain was cut short when it was read, so a complete one might have led "
                        "elsewhere.")
 
@@ -398,14 +400,19 @@ def path_to_syscall(graph, table, baseline, module: str, function: str) -> Answe
         if unknown:
             extra = " The module is not known to the graph, so the import itself could not be confirmed."
     resolution = binary_graph.resolve_export(graph.binaries, graph.api_sets, *start)
+    if info is not None and not imported and resolution.reason == "missing" and not resolution.hops:
+        # a binary the graph holds that has no such function in its tables: there is nothing to draw, not a function
+        # node for something that exists nowhere
+        return _empty(f"{name} neither imports nor exports {function} in the binary graph."
+                      + (_CUT_SHORT_NEGATIVE if resolution.partial else ""))
     pairs = _chain(start, resolution)
     part = _chain_part(pairs, resolution, head=head, label=label,
                        roots=[head.id if head else _function_id(*pairs[0])])
 
-    def ended(note, certain=False):
+    def ended(note, caveat=_CUT_SHORT_REACHED):
         note += extra
         if resolution.partial:
-            note += _CUT_SHORT_POSITIVE if certain else _CUT_SHORT_NEGATIVE
+            note += caveat
         return _answer(_Part([], [], []), [part], note, "paths")
 
     end_module, end_function = pairs[-1]
@@ -415,20 +422,27 @@ def path_to_syscall(graph, table, baseline, module: str, function: str) -> Answe
                 f"{_stop_reason(graph, resolution, end_module, end_function)}.")
         if resolution.hops:
             note += " The hops it did take are drawn."
-        return ended(note)
+        return ended(note, _CUT_SHORT_NEGATIVE)
     hops = _plural(len(resolution.hops), "hop", "hops")
-    stub = baseline.syscalls.get(end_function) if baseline is not None else None
+    # the stub itself: the baseline keys a syscall by its Nt name, and ntdll exports each also as Zw
+    nt_name = "Nt" + end_function[2:] if end_function.startswith("Zw") and len(end_function) > 2 else end_function
+    stub = baseline.syscalls.get(nt_name) if baseline is not None else None
     if stub is not None and stub.module.lower() == end_module:
-        syscall = Node(f"syscall:{end_function}", f"{end_function} ({stub.module}, 0x{stub.number:x})", "syscall", 0, "")
+        syscall = Node(f"syscall:{nt_name}", f"{nt_name} ({stub.module}, 0x{stub.number:x})", "syscall", 0, "")
         part.nodes.append(syscall)
         part.edges.append(_edge(end, syscall.id, "reaches_syscall"))
-        return ended(f"{function} is defined at {end}, after {hops}, and that export is the stub of a syscall itself: "
-                     f"no curated step is needed, and the baseline of this build gives {end_function} the number "
-                     f"{stub.number:#x} ({stub.number}).", certain=True)
-    rows = ()
+        alias = f" ({end_function} is the Zw name of {nt_name})" if nt_name != end_function else ""
+        return ended(f"{function} is defined at {end}, after {hops}, and that export is the stub of a syscall "
+                     f"itself{alias}: no curated step is needed, and the baseline of this build gives {nt_name} the "
+                     f"number {stub.number:#x} ({stub.number}).", _CUT_SHORT_POSITIVE)
+    rows, via = (), ""
     for candidate in dict.fromkeys((function, end_function)) if table is not None else ():
         rows = table.entries_for(candidate)
         if rows:
+            if function != end_function:
+                via = (f" The row is for the imported name {function}, not for the name that defines it, "
+                       f"{end_function}." if candidate == function else
+                       f" The row is for the defining name {end_function}, not for the imported name {function}.")
             break
     if baseline is None:
         # whatever the table says, nothing can be numbered without a baseline: that is the end, not the table's
@@ -439,7 +453,7 @@ def path_to_syscall(graph, table, baseline, module: str, function: str) -> Answe
             text += " The curated Win32 to Nt table could not be read either."
         elif len(rows) > 1:
             text += f" The table lists {_plural(len(rows) - 1, 'more syscall', 'more syscalls')} for it."
-        return ended(text)
+        return ended(text + via)
     if table is None:
         return ended(f"{end} defines it, but the curated Win32 to Nt table could not be read on this system, so the "
                      f"step to a syscall cannot be followed.")
@@ -451,6 +465,7 @@ def path_to_syscall(graph, table, baseline, module: str, function: str) -> Answe
     if len(rows) > 1:
         more = (f" The table lists {_plural(len(rows) - 1, 'more syscall', 'more syscalls')} for it "
                 f"({', '.join(row.nt for row in rows[1:])}); this path follows the first.")
+    more += via
     if entry.nt in table.missing_from(baseline.syscalls):
         ntdll = graph.binaries.get("ntdll.dll")
         exported = ntdll is not None and entry.nt in ntdll.exports
@@ -465,7 +480,7 @@ def path_to_syscall(graph, table, baseline, module: str, function: str) -> Answe
     source = f"{entry.source}: {entry.note}" if entry.note else entry.source
     return ended(f"{function} is defined at {end}, after {hops}. The last step is not read from any binary: the "
                  f"curated Win32 to Nt table ({source}) leads {entry.win32} to {entry.nt}, which is syscall number "
-                 f"{target.number:#x} ({target.number}) in the baseline of this build.{more}", certain=True)
+                 f"{target.number:#x} ({target.number}) in the baseline of this build.{more}", _CUT_SHORT_POSITIVE)
 
 
 # the outcome of a forwarder chain, as prose: Resolution.reason is the token the code reads
