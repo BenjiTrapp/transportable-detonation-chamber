@@ -484,7 +484,9 @@ def test_classify_reports_the_compared_bytes_and_the_owner():
     assert out["expected"] == "410700d4c0035fd6"
     assert out["actual"] == "0500001411223344"
     assert out["target_owner"] == "edr.dll"
-    assert set(out) == {"state", "pattern", "target_owner", "expected", "actual", "number_matches", "live_number"}
+    assert out["read"] == (live + b"\xff" * 24).hex(), "all that was read, which the catalog is matched against"
+    assert set(out) == {"state", "pattern", "target_owner", "expected", "actual", "number_matches", "live_number",
+                        "read"}
 
 
 @pytest.mark.parametrize("view,head", [("arm64", "0500001400000000"), ("x64", "e92b170080")])
@@ -4339,6 +4341,42 @@ def test_a_signature_says_which_entries_of_the_catalog_already_cover_it(client):
     assert [(c["family"], c["pattern"]) for c in body["covered_by"]] == [("Inline hook", "e9")]
     other = client.post("/api/syscalls/rule", json={"deviation": dev, "view": "arm64"}).get_json()
     assert other["covered_by"] == []
+
+
+@pytest.mark.parametrize("name", sorted(_HOOK_BYTES["arm64"]))
+def test_the_catalog_is_matched_on_what_was_read_not_on_the_compared_prefix(client, name):
+    # an arm64 deviation compares 8 bytes; ADRP; LDR; BR needs 12, MOVZ/MOVK; BR up to 20
+    read = (_HOOK_BYTES["arm64"][name] + "00" * 20)[:2 * syscall_baseline.READ_LEN["arm64"]]
+    dev = _dev(state="hooked", target_owner="edr.dll", actual=read[:16], read=read, expected="410700d4c0035fd6")
+    body = client.post("/api/syscalls/rule", json={"deviation": dev, "view": "arm64"}).get_json()
+    assert [c["family"] for c in body["covered_by"]] == ["Inline hook"], body["covered_by"]
+
+
+@pytest.mark.parametrize("read", ["zz" * 20, "aa" * 300, 7, None])
+def test_bytes_read_that_are_no_hex_or_too_many_fall_back_to_the_compared_prefix(client, read):
+    dev = _dev(state="hooked", target_owner="edr.dll", actual="e9" + "11223344" + "00" * 4, read=read)
+    r = client.post("/api/syscalls/rule", json={"deviation": dev, "view": "x64"})
+    assert r.status_code == 200 and [c["pattern"] for c in r.get_json()["covered_by"]] == ["e9"]
+
+
+def test_a_deviation_carries_the_bytes_that_were_read_and_an_intact_stub_does_not(arm64_baseline):
+    live = _words(_adrp(17, 3), _ldr_imm(17, 17, 0x28), _br(17))
+    reader = _reader_from(arm64_baseline, patched={"NtWriteVirtualMemory": (live.hex(), None)})
+    out = syscall_scan.measure(arm64_baseline, reader)
+    s = out["states"]["NtWriteVirtualMemory"]
+    assert s["read"].startswith(live.hex()) and len(s["read"]) == 2 * syscall_baseline.READ_LEN["arm64"]
+    assert len(s["actual"]) == 16
+    assert all("read" not in t for t in out["states"].values() if t["state"] == "intact")
+
+
+def test_a_scanned_detours_hook_is_found_in_the_catalog(client, tdc, target, fake_baseline_dir):
+    live = _words(_adrp(17, 3), _ldr_imm(17, 17, 0x28), _br(17)) + b"\x00" * 8
+    target.reader = _patched_reader(tdc, fake_baseline_dir, None, live=live.hex())
+    scan = client.post("/api/syscalls/scan", json={"pid": 4812}).get_json()
+    [dev] = [d for d in scan["deviations"] if d["name"] == "NtWriteVirtualMemory"]
+    body = client.post("/api/syscalls/rule", json={"deviation": dev, "view": scan["view"]}).get_json()
+    expected = [e["pattern"] for e in syscall_rules.default_signatures() if e["note"].startswith("ADRP Xn; LDR Xt")]
+    assert [c["pattern"] for c in body["covered_by"]] == expected and len(expected) == 1
 
 
 def test_a_signature_needs_its_view(client):

@@ -7862,6 +7862,8 @@ SYSCALL_FILE_MAX = 32 * 1024 * 1024     # a file searched for stubs is read whol
 SYMBOL_SERVER = ("msdl.microsoft.com", 443)
 SYMBOL_SERVER_WAIT = 3.0
 # _process_machine's names for the machine of an image -> the view of its ntdll; ARM64EC code sees the x64 one
+# the most bytes of a stub a scan reads, of any view (syscall_baseline.READ_LEN)
+SYSCALL_READ_HEX_MAX = max(syscall_baseline.READ_LEN.values())
 _SYSCALL_MACHINE_VIEW = {"x64": "x64", "ARM64": "arm64", "ARM64EC": "x64", "x86": "x86"}
 _SYSCALL_PARAMETERS_NOTE = ("The parameter table is incomplete: this baseline was extracted without the symbol "
                             "server. The measurement is not affected, numbers, RVAs and stub bytes come from "
@@ -8720,7 +8722,13 @@ def api_syscalls_rule():
         entry = syscall_rules.draft_signature(deviation, view)
     except ValueError as exc:
         raise _draft_error(exc) from None
-    covered = syscall_rules.matching(deviation["actual"], view)
+    # the catalog names forms longer than the compared prefix (ADRP; LDR; BR, MOVZ/MOVK; BR): it is asked about
+    # every byte the scan read, where the deviation has them, and about the prefix otherwise
+    read = deviation.get("read")
+    if not (isinstance(read, str) and 0 < len(read) <= 2 * SYSCALL_READ_HEX_MAX and len(read) % 2 == 0
+            and re.fullmatch(r"[0-9a-fA-F]+", read)):
+        read = deviation["actual"]
+    covered = syscall_rules.matching(read, view)
     return jsonify({"kind": "signature", "entry": entry, "text": json.dumps(entry, indent=2),
                     "target": "webui/syscall_signatures.json",
                     "covered_by": [{"family": c["family"], "pattern": c["pattern"], "match": c["match"]}

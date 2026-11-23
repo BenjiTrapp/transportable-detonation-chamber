@@ -303,7 +303,10 @@ Drei Ziele, in dieser Rangfolge:
    liest. Ihr `weight` ist **beratend und nicht der Score** — der kommt aus
    `memory_evidence.KINDS`. Ein Test pinnt die Muster der Datei gegen die des
    Codes, damit die beiden nicht auseinanderlaufen; die Datei sagt das über sich
-   selbst, damit niemand sie für die Bewertungsquelle hält.
+   selbst, damit niemand sie für die Bewertungsquelle hält. Ob ein Eintrag eine
+   Abweichung schon abdeckt, wird an **allen gelesenen Bytes** geprüft
+   (`read`, `READ_LEN`), nicht am verglichenen Präfix: auf ARM64 sind das 8
+   Bytes, und `ADRP; LDR; BR` braucht 12, `MOVZ/MOVK; BR` bis zu 20.
 
    Ein Eintrag darf zusätzlich eine `view` nennen: ein x64-Opcode ist auf ARM64
    eine andere Anweisung, ein Muster ohne Sicht wäre also mindestens zur Hälfte

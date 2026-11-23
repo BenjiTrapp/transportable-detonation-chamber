@@ -622,6 +622,8 @@ def classify_stub(sc: Syscall, live: bytes | None, view: str, owner: str | None,
     if live[:n] == expected:
         out["state"] = STATE_INTACT
         return out
+    # what was read, not only what is compared: a hook longer than the compared prefix is told by all of it
+    out["read"] = live.hex()
     hit = _find_hook(live, 0, view)
     out["pattern"] = hit[0] if hit else None
     out["target_owner"] = owner
