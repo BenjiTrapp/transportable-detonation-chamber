@@ -1348,3 +1348,63 @@ def test_resolving_never_raises_on_an_odd_start():
     binaries = _graph(_bi("a.dll", forwarders={"F": "A.F"}))
     for module, function in [("", ""), ("a.dll", ""), ("A.DLL", "#"), ("a.dll", "#" + "9" * 5000), ("nope", "F")]:
         assert binary_graph.resolve_export(binaries, {}, module, function).reason in ("missing", "cycle")
+
+
+def test_the_same_module_visited_for_another_function_is_not_a_cycle():
+    # a!F -> b!X -> a!G: `a` twice, never the same (module, function) twice
+    binaries = _graph(_bi("a.dll", exports=["G"], forwarders={"F": "B.X"}), _bi("b.dll", forwarders={"X": "A.G"}))
+    got = binary_graph.resolve_export(binaries, {}, "a.dll", "F")
+    assert (got.reason, got.module, got.function) == ("defined", "a.dll", "G")
+    assert [h.module for h in got.hops] == ["b.dll", "a.dll"]
+
+
+# the loader hashes an api-set name up to but not including its last hyphen, so ...-l1-1-0 and ...-l1-1-1 are one entry
+def test_an_api_set_version_the_map_lacks_resolves_through_its_family():
+    binaries = _graph(_bi("kernel32.dll", forwarders={"F": "api-ms-win-core-heap-l1-1-1.F"}),
+                      _bi("kernelbase.dll", exports=["F"]))
+    api_sets = {"api-ms-win-core-heap-l1-1-0": ("kernelbase.dll",)}
+    got = binary_graph.resolve_export(binaries, api_sets, "kernel32.dll", "F")
+    assert (got.reason, got.module) == ("defined", "kernelbase.dll")
+    assert got.hops[0] == binary_graph.Hop("api-ms-win-core-heap-l1-1-1.dll", "F", "forwards_to")
+
+
+def test_an_api_set_name_the_map_holds_exactly_is_not_taken_from_a_neighbouring_version():
+    binaries = _graph(_bi("old.dll", exports=["F"]), _bi("new.dll", exports=["F"]))
+    api_sets = {"api-x-l1-1-0": ("old.dll",), "api-x-l1-1-1": ("new.dll",)}
+    assert binary_graph.resolve_export(binaries, api_sets, "api-x-l1-1-1.dll", "F").module == "new.dll"
+    assert binary_graph.resolve_export(binaries, api_sets, "api-x-l1-1-0.dll", "F").module == "old.dll"
+
+
+def test_an_api_set_of_another_family_does_not_fall_back_to_a_neighbour():
+    api_sets = {"api-x-l1-1-0": ("old.dll",)}
+    binaries = _graph(_bi("old.dll", exports=["F"]))
+    for name in ("api-x-l1-2-0.dll", "api-y-l1-1-0.dll", "api-x.dll", "api-.dll"):
+        assert binary_graph.resolve_export(binaries, api_sets, name, "F").reason == "unresolved-api-set", name
+
+
+def test_a_module_that_is_not_an_api_set_never_falls_back_to_a_family():
+    binaries = _graph(_bi("old.dll", exports=["F"]))
+    got = binary_graph.resolve_export(binaries, {"foo-1-0": ("old.dll",)}, "foo-1-1.dll", "F")
+    assert got.reason == "missing"
+
+
+class _CountingTuple(tuple):
+    scans = 0
+
+    def __iter__(self):
+        type(self).scans += 1
+        return super().__iter__()
+
+    def __contains__(self, item):
+        type(self).scans += 1
+        return super().__contains__(item)
+
+
+def test_the_exports_of_a_binary_are_scanned_once_however_many_chains_end_in_it():
+    _CountingTuple.scans = 0
+    definer = _bi("ntdll.dll")
+    definer = binary_graph.BinaryInfo(**{**definer.__dict__, "exports": _CountingTuple(f"Rtl{i}" for i in range(50))})
+    importer = _bi("kernelbase.dll", forwarders={f"F{i}": f"NTDLL.Rtl{i}" for i in range(50)})
+    got = binary_graph.resolve_all(_graph(definer, importer), {})
+    assert {r.reason for r in got.values()} == {"defined"}
+    assert _CountingTuple.scans == 1

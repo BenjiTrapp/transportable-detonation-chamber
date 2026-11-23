@@ -320,8 +320,8 @@ class Resolution:
     "defined"            module and function are set: that module defines the function itself. `function` is the
                          key into its `exports` (a nameless export "#<n>"), which may differ from the last hop's
                          when a forwarder named the ordinal of an export that has a name
-    "missing"            the chain led to a module not in the graph, or one that does not offer the function (a
-                         `partial` module, whose export table was cut short, is not told apart from a complete one)
+    "missing"            the chain led to a module not in the graph, or one that does not offer the function (see
+                         `partial`: where a table was cut short, that is not certain)
     "cycle"              the chain came back to a (module, function) it had been at; the last hop closes the ring
     "unresolved-api-set" the chain reached an api-set name the map has no entry for: our map is missing or old
     "too-many-hops"      the chain is longer than MAX_HOPS and neither ring nor dead end within it
@@ -332,7 +332,7 @@ class Resolution:
     `BinaryInfo.partial` set. A negative answer ("missing", "unresolved-api-set", "cycle", "too-many-hops") is then
     NOT certain, since the export or forwarder that would have changed it may be in the part pefile did not read; a
     "defined" one only says the host chosen may not be the one a complete table would have given. It does not mean
-    "partially resolved". The same fact makes no difference to which `reason` is given."""
+    "partially resolved"; `reason` is the same with or without it."""
     hops: tuple[Hop, ...]
     module: str | None
     function: str | None
@@ -340,8 +340,9 @@ class Resolution:
     partial: bool = False
 
 
-def _export_key(info, function):
+def _export_key(info, exports, function):
     """The key `function` has in `info.exports` or `info.forwarders`, None when the image offers no such export.
+    `exports` is `frozenset(info.exports)`, which spares a scan of the tuple per question.
 
     "#<n>" is the ordinal n, which is a key itself for a nameless export and otherwise names an export through
     `ordinal_names`."""
@@ -355,22 +356,45 @@ def _export_key(info, function):
         if name:
             keys.append(name)
     for key in keys:
-        if key in info.exports or key in info.forwarders:
+        if key in exports or key in info.forwarders:
             return key
     return None
 
 
-def _is_api_set(api_sets, module):
-    stem = module[:-len(".dll")] if module.endswith(".dll") else module
-    return stem, stem in api_sets or stem.startswith(("api-", "ext-"))
+def _api_set_lookup(api_sets, stem):
+    """The hosts of the api set `stem` (lower case, without ".dll"), None when the map has none for it.
+
+    The exact name first. Failing that, the first entry of the same family: the loader hashes an api-set name up to but
+    not including its last hyphen (the entry's `HashedLength`), so "...-l1-1-0" and "...-l1-1-1" are one entry for it,
+    and a forwarder may name a version the map does not hold by that name. We compare the truncated names directly
+    instead of reading the hash table, since the entries are walked anyway; the scan only runs on a miss, and only for
+    a name the loader would treat as an api set. The error direction is chosen: an exact-only lookup fails toward a
+    dead chain (a false "unresolved-api-set"), this one toward a neighbouring version of the same family, whose hosts
+    are the same module in practice; the second is the better failure."""
+    hosts = api_sets.get(stem)
+    if hosts is None and stem.startswith(("api-", "ext-")):
+        family = stem.rpartition("-")[0]
+        if family:
+            for alias, candidate in api_sets.items():
+                if alias.rpartition("-")[0] == family:
+                    return candidate
+    return hosts
 
 
-def _step(binaries, api_sets, module, function, cut_short):
+def _step(binaries, api_sets, module, function, cut_short, exports):
     """One step from `(module, function)`: `(Hop, None, None)` to go on, or `(None, reason, key)` to stop; `key` is
-    the export key of a "defined" end. `cut_short` is set to True when a binary examined has `partial`."""
-    stem, api_set = _is_api_set(api_sets, module)
-    if api_set:
-        hosts = api_sets.get(stem)
+    the export key of a "defined" end.
+
+    `cut_short` is a list this appends the `partial` of every binary it examines to, an api-set host passed over
+    included. `exports` is a dict, file name -> frozenset of that binary's `exports`, filled as binaries are met."""
+    def exported(name, info):
+        if name not in exports:
+            exports[name] = frozenset(info.exports)
+        return exports[name]
+
+    stem = module[:-len(".dll")] if module.endswith(".dll") else module
+    hosts = _api_set_lookup(api_sets, stem)
+    if hosts is not None or stem.startswith(("api-", "ext-")):
         if not hosts:
             return None, "unresolved-api-set", None
         for host in hosts:
@@ -378,13 +402,14 @@ def _step(binaries, api_sets, module, function, cut_short):
             if host not in binaries:
                 continue
             cut_short.append(binaries[host].partial)
-            if _export_key(binaries[host], function) is not None:
+            if _export_key(binaries[host], exported(host, binaries[host]), function) is not None:
                 return Hop(host, function, "resolves_to"), None, None
         return None, "missing", None
     info = binaries.get(module)
+    key = None
     if info is not None:
         cut_short.append(info.partial)
-    key = _export_key(info, function) if info is not None else None
+        key = _export_key(info, exported(module, info), function)
     if key is None:
         return None, "missing", None
     if key not in info.forwarders:
@@ -407,12 +432,16 @@ def resolve_export(binaries: dict[str, BinaryInfo], api_sets: dict[str, tuple[st
     it is. MAX_HOPS is a limit on the chain, not the ring detector: the walk goes on past it, still stopped by that
     memory, so that a ring longer than the limit is not called merely long. `Resolution.partial` is set when any binary
     the walk examined has `BinaryInfo.partial`, the walk past MAX_HOPS included."""
+    return _resolve(binaries, api_sets, module, function, {})
+
+
+def _resolve(binaries, api_sets, module, function, exports):
     module = module.lower()
     seen = {(module, function)}
     hops = []
     cut_short = []
     while True:
-        hop, reason, key = _step(binaries, api_sets, module, function, cut_short)
+        hop, reason, key = _step(binaries, api_sets, module, function, cut_short, exports)
         if hop is None:
             break
         hops.append(hop)
@@ -433,10 +462,10 @@ def resolve_all(binaries: dict[str, BinaryInfo],
     """`(module, export name)` -> its Resolution, for every forwarder export of every binary; one answer each.
 
     The cache build asks the same chain through many importers; this is where that repetition is bundled."""
-    answers = {}
+    answers, exports = {}, {}
     for module, info in binaries.items():
         module = module.lower()
         for name in info.forwarders:
             if (module, name) not in answers:
-                answers[(module, name)] = resolve_export(binaries, api_sets, module, name)
+                answers[(module, name)] = _resolve(binaries, api_sets, module, name, exports)
     return answers
