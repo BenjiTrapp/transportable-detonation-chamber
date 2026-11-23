@@ -4726,7 +4726,8 @@ def _syscall_verdict_reasons(stage, evidence, reasons, only_source=False):
         evidence.setdefault("partial_sources", []).append("syscalls")
         reasons.append(f"Syscall measurement is partial ({'; '.join(gaps)[:400]}) - what it did not read is not "
                        "evidence of being clean")
-    measured = sum(v for v in counts.values() if isinstance(v, int))
+    # an unreadable stub was not measured: a stage that read none is a stage that observed nothing
+    measured = sum(v for k, v in counts.items() if k != "unreadable" and isinstance(v, int))
     if not measured and only_source and evidence.get("label") == "CLEAN":
         evidence["label"] = "NOT OBSERVED"
         evidence["note"] = f"The syscall stage measured no stub: {stage.get('note') or 'nothing was read'}"

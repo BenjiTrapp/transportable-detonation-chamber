@@ -4698,6 +4698,36 @@ def test_a_stage_that_measured_nothing_is_not_observed_when_it_is_the_only_memor
     assert "could not be listed" in results["memory_evidence"]["note"]
 
 
+def test_a_stage_whose_every_stub_was_unreadable_measured_nothing_and_is_not_clean(tdc):
+    # an unreadable stub is a stub nobody read: a sole source that read none of them observed nothing
+    stage = {"counts": {"intact": 0, "hooked": 0, "patched": 0, "diverged": 0, "unreadable": 2461},
+             "partial": True, "note": "2461 stubs unreadable"}
+    evidence, reasons = {"label": "CLEAN"}, []
+    tdc._syscall_verdict_reasons(stage, evidence, reasons, only_source=True)
+    assert evidence["label"] == "NOT OBSERVED"
+    assert "2461 stubs unreadable" in evidence["note"]
+
+
+def test_a_stage_that_read_one_stub_among_unreadable_ones_measured_something(tdc):
+    stage = {"counts": {"intact": 1, "hooked": 0, "patched": 0, "diverged": 0, "unreadable": 2460},
+             "partial": True, "note": "2460 stubs unreadable"}
+    evidence, reasons = {"label": "CLEAN"}, []
+    tdc._syscall_verdict_reasons(stage, evidence, reasons, only_source=True)
+    assert evidence["label"] == "CLEAN" and any("partial" in r for r in reasons)
+
+
+def test_a_scan_of_a_process_whose_stubs_all_read_as_zeros_is_not_observed(tdc, target, fake_baseline_dir):
+    baseline = syscall_baseline.load_baseline(str(fake_baseline_dir / "ntsleuth-26220.5770-arm64.json"))
+    reader = _reader_from(baseline, patched={})
+    reader._ranges = [(start, bytearray(len(data))) for start, data in reader._ranges]
+    target.reader = reader
+    entry = tdc._run_syscall_stage(4812, None)
+    assert entry["counts"]["unreadable"] > 0 and entry["counts"]["intact"] == 0
+    results = {"syscalls": entry}
+    tdc._compute_verdict(results, [])
+    assert results["memory_evidence"]["label"] == "NOT OBSERVED"
+
+
 def test_a_complete_stage_adds_no_partial_reason(tdc, target):
     _walkable(target.reader)
     results = {"syscalls": tdc._run_syscall_stage(4812, None)}
